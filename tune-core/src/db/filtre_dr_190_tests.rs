@@ -120,6 +120,27 @@ pub(super) fn pages_lues_a_froid(chemin: &str, sql: &str) -> (i64, Duration) {
     let c = rusqlite::Connection::open(chemin).unwrap();
     c.execute_batch("PRAGMA mmap_size=0; PRAGMA cache_size=-65536;")
         .unwrap();
+    // Le SCHÉMA d'abord, compteur remis à zéro ensuite : sinon chaque table
+    // ajoutée à la base (une page de `sqlite_master` de plus) compte dans
+    // les DEUX mesures et rogne le rapport « avec / sans index », qui ne
+    // parle que des pages de la requête. Mesuré le 10/11 à la fusion de
+    // `suggestions_ecartees` (web#916) : 177 contre 707, rapport 3,99.
+    c.query_row("SELECT count(*) FROM sqlite_master", [], |_| Ok(()))
+        .unwrap();
+    {
+        let (mut cur, mut hi) = (0i32, 0i32);
+        // SAFETY: poignée valide le temps de l'appel ; remise à zéro d'un
+        // compteur (dernier argument non nul).
+        unsafe {
+            rusqlite::ffi::sqlite3_db_status(
+                c.handle(),
+                rusqlite::ffi::SQLITE_DBSTATUS_CACHE_MISS,
+                &mut cur,
+                &mut hi,
+                1,
+            );
+        }
+    }
     let t0 = Instant::now();
     let mut st = c.prepare(sql).unwrap();
     let n = st.query_map([], |_| Ok(())).unwrap().count();

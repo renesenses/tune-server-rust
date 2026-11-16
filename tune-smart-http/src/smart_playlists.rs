@@ -516,6 +516,16 @@ pub(crate) fn build_smart_query_rapport(
                 refusees.push(format!("{field} {op}"));
             }
             c
+        } else if let Some(r) = regles_sql::condition_classique(field, op, value_raw) {
+            // #8325 — chef, ensemble, œuvre : crédits, balises, fiche d'album.
+            match r {
+                Some((c, false)) => c,
+                Some((c, true)) => format!("NOT {c}"),
+                None => {
+                    refusees.push(format!("{field} {op}"));
+                    regles_sql::FAUX.to_string()
+                }
+            }
         } else if field == "play_count" {
             // 🔴 #7769 — le compte de la Bibliothèque (titre + interprète),
             // pas `listen_history.track_id`, toujours NULL : « = 0 » rendait
@@ -562,6 +572,10 @@ pub(crate) fn build_smart_query_rapport(
         format!("WHERE {}", conditions.join(joiner))
     };
 
+    // #7769, #8416 — le tri par nombre d'écoutes compte comme la
+    // Bibliothèque (historique + écoutes importées), et non par la colonne
+    // morte `tracks.play_count`.
+    let ecoutes = tune_core::db::history_repo::sql::ecoutes_de_la_piste("t");
     let order = if sort_by == "random" {
         "ORDER BY RANDOM()".to_string()
     } else {
@@ -570,10 +584,10 @@ pub(crate) fn build_smart_query_rapport(
             match sort_by {
                 "artist" => "ar.name",
                 "album" => "al.title",
-                "year" => "t.year",
+                "year" => tune_core::db::annee_de_la_piste::ANNEE_DE_LA_PISTE,
                 "duration" => "t.duration_ms",
                 "added_at" => "t.id",
-                "play_count" => "t.play_count",
+                "play_count" => ecoutes.as_str(),
                 _ => "t.title",
             },
             if sort_order == "desc" { "DESC" } else { "ASC" }
@@ -636,13 +650,19 @@ fn condition_hors_colonne(
     // (titre + interprète), et non par `listen_history.track_id` seul, toujours
     // NULL : ces règles ne retenaient aucune piste, « jamais » les retenait
     // toutes.
+    // 🔴 #8416 — et les écoutes IMPORTÉES (`imported_plays`, #7763), que la
+    // Bibliothèque compte : une piste écoutée seulement dans Roon ou Plex
+    // était « jamais écoutée » pour ces règles.
     let ecoute = tune_core::db::history_repo::sql::ecoute_de_la_piste("t", "he");
     let ecoutee_depuis = |seuil: String| {
         format!(
-            "EXISTS (SELECT 1 FROM listen_history he WHERE {ecoute} AND he.listened_at {seuil})"
+            "(EXISTS (SELECT 1 FROM listen_history he WHERE {ecoute} AND he.listened_at {seuil}) \
+             OR EXISTS (SELECT 1 FROM imported_plays ip \
+                        WHERE ip.track_id = t.id AND ip.last_played_at {seuil}))"
         )
     };
     let derniere = tune_core::db::history_repo::sql::derniere_ecoute_de_la_piste("t");
+    let compte = tune_core::db::history_repo::sql::ecoutes_de_la_piste("t");
     Some(match (field, op) {
         // #6143 — la date du fichier se compare en SECONDES à une borne
         // calculée en Rust : `DATETIME(t.file_mtime, 'unixepoch')` et
@@ -683,7 +703,9 @@ fn condition_hors_colonne(
             Some((lo, hi)) => format!("{derniere} BETWEEN {lo} AND {hi}"),
             None => regles_sql::FAUX.to_string(),
         },
-        ("last_played_at", "is_null") => format!("{derniere} IS NULL"),
+        // « jamais » : ni date ni écoute. Une piste importée avec un nombre
+        // d'écoutes mais sans date (liste m3u) a été écoutée (#8416).
+        ("last_played_at", "is_null") => format!("({derniere} IS NULL AND {compte} = 0)"),
         ("credit", "has") => {
             let sous = value_raw
                 .and_then(|v| v.as_object())
@@ -730,23 +752,23 @@ pub(crate) fn execute_smart_track_query(
     limit_clause: &str,
 ) -> Result<Vec<Value>, AppError> {
     let where_clause = avec_le_socle_des_bannis(where_clause, profile_id);
-    // #7769 — le tri par nombre d'écoutes compte comme la Bibliothèque ; la
-    // jointure par `listen_history.track_id` (toujours NULL) rangeait toutes
-    // les pistes à zéro.
-    let order = order.replace(
-        "t.play_count",
-        &tune_core::db::history_repo::sql::ecoutes_de_la_piste("t"),
-    );
+    // Le tri par nombre d'écoutes est déjà écrit avec le compte de la
+    // Bibliothèque par `build_smart_query_rapport` (#7769, #8416).
     let sql = format!(
         // `al.is_compilation` en 10 (#1957) : la ligne porte déjà quatre
         // colonnes d'album (`al.title`, `al.id`, `al.cover_path`, l'année),
         // et c'est d'elles que `smart_collection_albums` bâtit ses albums.
-        "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.format, t.genre, t.year, al.id, al.cover_path, al.is_compilation \
+        // Go du 13/11 — l'année affichée : celle de la piste, à défaut celle
+        // de son album, comme la règle `year` qui l'a peut-être retenue.
+        "SELECT t.id, t.title, ar.name, al.title, t.duration_ms, t.format, t.genre, {}, al.id, al.cover_path, al.is_compilation \
          FROM tracks t \
          LEFT JOIN albums al ON t.album_id = al.id \
          LEFT JOIN artists ar ON t.artist_id = ar.id \
          {} {} {}",
-        where_clause, order, limit_clause
+        tune_core::db::annee_de_la_piste::ANNEE_DE_LA_PISTE_AVEC_AL,
+        where_clause,
+        order,
+        limit_clause
     );
 
     let rows = state
@@ -1519,15 +1541,19 @@ mod tests {
         assert!(a.contains("ar.name"), "{a}");
     }
 
-    /// « Jamais écoutée » : un compte nul des écoutes rattachées à la piste
-    /// par titre + interprète (#7769), ou par `track_id` quand il est
-    /// renseigné — jamais par `track_id` seul, toujours NULL en production.
-    /// Le comportement est tenu par `ecoutes_7769_tests`.
+    /// « Jamais écoutée » suit track_id en priorité (#8714), puis les
+    /// replis de l'ancien historique sans identifiant. Le comportement est
+    /// tenu par criteres_ecoutes_7769_tests, y compris les homonymes du même album.
     #[test]
     fn jamais_ecoutee_compte_les_ecoutes_de_la_piste() {
         let w = where_of(r#"[{"field":"play_count","op":"equals","value":"0"}]"#);
         assert!(w.contains("FROM listen_history he"), "{w}");
-        assert!(w.contains("OR (he.title = t.title"), "{w}");
+        assert!(w.contains("he.track_id = t.id"), "{w}");
+        assert!(
+            w.contains("OR ((he.track_id IS NULL OR NOT EXISTS (SELECT 1 FROM tracks tr_ecoute WHERE tr_ecoute.id = he.track_id)) AND he.title = t.title"),
+            "{w}"
+        );
+        assert!(w.contains("he.album_id = t.album_id"), "{w}");
         assert!(w.ends_with("= 0"), "{w}");
     }
 
@@ -1556,7 +1582,13 @@ mod tests {
     #[test]
     fn year_contains_builds_condition() {
         let w = where_of(r#"[{"field":"year","op":"contains","value":"2025"}]"#);
-        assert!(w.contains("CAST(t.year AS TEXT) LIKE '%2025%'"), "got: {w}");
+        assert!(
+            w.contains(&format!(
+                "CAST({} AS TEXT) LIKE '%2025%'",
+                tune_core::db::annee_de_la_piste::ANNEE_DE_LA_PISTE
+            )),
+            "got: {w}"
+        );
     }
 
     #[test]

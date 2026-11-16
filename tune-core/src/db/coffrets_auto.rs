@@ -124,7 +124,7 @@ pub const ORIGINE_AUTO: &str = "auto";
 pub const ORIGINE_MANUEL: &str = "manuel";
 
 /// Un disque d'un coffret automatique, tel qu'il était AVANT la réunion.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DisqueRetenu {
     pub n: u32,
     /// Le titre d'album d'origine (« Early Works, Disc 2 »).
@@ -132,6 +132,16 @@ pub struct DisqueRetenu {
     /// Le dossier de ses pistes.
     pub dossier: String,
     pub artiste_id: Option<i64>,
+    /// #8463 — coffret manuel : le RANG de l'album réuni d'où vient ce
+    /// disque (`0` = l'album cible). Un album déjà à plusieurs disques en
+    /// donne plusieurs, tous du même rang : « Défaire » les rend ENSEMBLE à
+    /// un seul album. Absent d'un marqueur d'avant #8463.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub membre: Option<u32>,
+    /// #8463 — coffret manuel : le numéro de disque que ce disque portait
+    /// dans son album d'origine (`NULL` compté `1`). « Défaire » le lui rend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disque_origine: Option<u32>,
 }
 
 /// Le marqueur posé sur l'album-coffret.
@@ -386,6 +396,7 @@ pub fn reunir(db: &Arc<dyn DbBackend>, c: &Coffret, inv: &Inventaire) -> Result<
                         titre: a.titre.clone(),
                         dossier: a.dossier.clone(),
                         artiste_id: a.artiste_id,
+                        ..Default::default()
                     });
                 }
             }
@@ -745,6 +756,7 @@ fn rattraper_par_les_balises(
                 titre,
                 dossier: dossier_de(&chemin).unwrap_or_default().to_string(),
                 artiste_id: None,
+                ..Default::default()
             }),
             None => {
                 tracing::debug!(album = id, disque = n, chemin = %chemin, "coffret_balise_album_illisible");

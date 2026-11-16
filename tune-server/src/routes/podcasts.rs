@@ -300,6 +300,29 @@ pub fn router() -> Router<AppState> {
         .route("/episodes/{podcast_id}", get(podcast_episodes))
         .route("/episodes", get(episodes_by_feed_url))
         .route("/play/{zone_id}", post(play_episode_en_tete_du_groupe))
+        // #8170 — la position de chaque épisode commencé, pour la fiche.
+        .route("/positions", get(positions_des_episodes))
+}
+
+#[derive(Deserialize)]
+struct PositionsQuery {
+    /// La zone dont la reprise prime ; sans elle, la plus récente.
+    zone_id: Option<i64>,
+}
+
+/// `GET /podcasts/positions?zone_id=` — #8170 : la position enregistrée de
+/// chaque épisode commencé (`audio_url`, `position_ms`, `duration_ms`,
+/// `updated_at`), un par épisode. La fiche d'un podcast y retrouve ses
+/// épisodes par leur adresse et les relance là où on les a laissés (le recul
+/// de reprise reste l'affaire de la fiche, comme pour web#2730).
+async fn positions_des_episodes(
+    State(state): State<AppState>,
+    Query(q): Query<PositionsQuery>,
+) -> Result<Json<Value>, AppError> {
+    let positions =
+        tune_core::db::listening_resume::positions_des_episodes(&state.backend, q.zone_id)
+            .map_err(AppError::internal)?;
+    Ok(Json(json!({ "positions": positions })))
 }
 async fn search_podcasts(
     State(state): State<AppState>,
@@ -340,7 +363,45 @@ async fn search_podcasts(
         }
     }
 }
+/// #6925 — un abonnement pris depuis la sélection éditoriale a gardé l'adresse
+/// FAUSSE qu'elle portait (« Banzzaï » ouvrait « Les polars de l'histoire » et
+/// ne jouait que le message d'accueil de l'appli Radio France). La liste des
+/// abonnements la remplace par la vraie ; si la vraie est déjà suivie, la
+/// ligne fausse, en double, s'efface. Idempotent : sans adresse fausse en
+/// base, aucune ligne n'est écrite.
+fn corriger_les_adresses_de_la_selection_6925(state: &AppState) {
+    use tune_core::db::backend::ToSqlValue;
+    for (fausse, vraie) in PodcastService::ADRESSES_CORRIGEES_6925 {
+        let deja_suivie = state
+            .backend
+            .query_one(
+                "SELECT id FROM podcast_subscriptions WHERE feed_url = ?",
+                &[vraie as &dyn ToSqlValue],
+            )
+            .ok()
+            .flatten()
+            .is_some();
+        let resultat = if deja_suivie {
+            state.backend.execute(
+                "DELETE FROM podcast_subscriptions WHERE feed_url = ?",
+                &[fausse as &dyn ToSqlValue],
+            )
+        } else {
+            state.backend.execute(
+                "UPDATE podcast_subscriptions SET feed_url = ? WHERE feed_url = ?",
+                &[vraie as &dyn ToSqlValue, fausse as &dyn ToSqlValue],
+            )
+        };
+        match resultat {
+            Ok(0) => {}
+            Ok(_) => info!(fausse, vraie, "podcast_adresse_de_la_selection_corrigee"),
+            Err(e) => warn!(fausse, error = %e, "podcast_adresse_de_la_selection_non_corrigee"),
+        }
+    }
+}
+
 async fn list_subscriptions(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    corriger_les_adresses_de_la_selection_6925(&state);
     let rows = state.backend.query_many("SELECT id, feed_url, title, author, image_url, description, source_id FROM podcast_subscriptions ORDER BY title", &[]).map_err(AppError::internal)?;
     let cache = crate::routes::library::artwork_cache_dir();
     let items: Vec<Value> = rows
@@ -831,8 +892,22 @@ pub(super) async fn play_episode(
     Path(zone_id): Path<i64>,
     headers: axum::http::HeaderMap,
     profile: crate::routes::active_profile::ActiveProfile,
-    Json(body): Json<PlayEpisodeRequest>,
+    Json(mut body): Json<PlayEpisodeRequest>,
 ) -> impl IntoResponse {
+    // Sécurité — l'épisode part tel quel vers la sortie (une sortie
+    // locale ou AirPlay ouvre un chemin nu comme un fichier de la machine) :
+    // seule une adresse http(s) est acceptée, et c'est la valeur rognée,
+    // celle qu'on vient de vérifier, qui sert ensuite.
+    if !tune_core::chemin_sur::est_une_adresse_http(&body.audio_url) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "audio_url must be an http(s) address",
+                "code": "podcast_adresse_refusee",
+            })),
+        );
+    }
+    body.audio_url = body.audio_url.trim().to_string();
     // #7974 — l'épisode sur une sortie réseau ne passe pas par `play()` : le
     // bail d'écoute du profil qui le lance est demandé ici.
     state
@@ -1054,10 +1129,29 @@ pub(super) async fn play_episode(
         "podcast_episode_play"
     );
     if echec.is_none() {
-        if let Some(seek_ms) = body.seek_ms.filter(|v| *v > 0) {
+        // #8152 — un épisode terminé, ou une position nulle, repart du début.
+        let reprise = body.seek_ms.filter(|v| {
+            *v > 0
+                && !tune_core::db::listening_resume::episode_fini(
+                    (*v).min(i64::MAX as u64) as i64,
+                    body.duration_ms.unwrap_or(0).min(i64::MAX as u64) as i64,
+                )
+        });
+        if let Some(seek_ms) = reprise {
+            info!(
+                zone_id,
+                position_ms = seek_ms,
+                reseau,
+                "podcast_reprise_position"
+            );
+            // #8152 — sur un renderer réseau, le Seek envoyé dans la foulée du
+            // Play partait avant que l'appareil ouvre le flux (Eversolo, .18) :
+            // il l'acquittait puis lisait depuis l'octet 0. L'orchestrateur
+            // l'envoie désormais une fois le transport en lecture ; la sortie
+            // locale garde `seek` (recréation du flux à la position).
             if let Err(e) = state
                 .orchestrator
-                .seek(zone_id, seek_ms, device_id.as_deref())
+                .reprendre_l_episode_a_sa_position(zone_id, device_id.as_deref(), seek_ms)
                 .await
             {
                 state.playback.stop(zone_id).await;
@@ -1620,6 +1714,15 @@ mod reprise_navigateur_7354_tests;
 #[path = "podcasts/historique_7965_tests.rs"]
 mod historique_7965_tests;
 
+#[cfg(test)]
+#[path = "podcasts/adresses_de_la_selection_6925_tests.rs"]
+mod adresses_de_la_selection_6925_tests;
+#[cfg(test)]
+#[path = "podcasts/positions_des_episodes_8170_tests.rs"]
+mod positions_des_episodes_8170_tests;
+#[cfg(test)]
+#[path = "podcasts/reprise_dlna_8152_tests.rs"]
+mod reprise_dlna_8152_tests;
 #[cfg(test)]
 #[path = "podcasts/reprise_par_adresse_8085_tests.rs"]
 mod reprise_par_adresse_8085_tests;

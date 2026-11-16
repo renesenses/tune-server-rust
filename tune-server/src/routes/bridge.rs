@@ -173,7 +173,10 @@ async fn handle_bridge(mut socket: WebSocket, state: AppState) {
                         if let Ok(lost) = serde_json::from_value::<BridgeDeviceLost>(msg) {
                             let full_id = format!("bridge:{}:{}", bridge_id, lost.device_id);
                             let mut reg = state.outputs.lock().await;
-                            reg.remove(&full_id);
+                            // #8029 — retirée, la sortie est aussi arrêtée.
+                            tune_core::outputs::registry::arreter_les_sorties_retirees_en_tache(
+                                reg.remove(&full_id),
+                            );
                             registered_devices.lock().await.retain(|d| d != &full_id);
 
                             let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(
@@ -231,7 +234,8 @@ async fn handle_bridge(mut socket: WebSocket, state: AppState) {
     let mut reg = state.outputs.lock().await;
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     for device_id in devices.iter() {
-        reg.remove(device_id);
+        // #8029 — retirée, la sortie est aussi arrêtée.
+        tune_core::outputs::registry::arreter_les_sorties_retirees_en_tache(reg.remove(device_id));
         let _ = zone_repo.set_online_by_device(device_id, false);
     }
 

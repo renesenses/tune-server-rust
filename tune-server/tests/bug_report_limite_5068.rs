@@ -13,7 +13,9 @@
 //!    et réémet l'en-tête `Retry-After` ;
 //! 2. sur 429 SANS en-tête exploitable, `retry_after` est absent : aucun délai
 //!    inventé ;
-//! 3. hors 429, rien ne change : 502, et le code du site sous `status`.
+//! 3. hors 429 et 422, 502 et le code du site sous `status` (#8627 : plus la
+//!    phrase du site sous `site_message`) ;
+//! 4. #8627 : sur 422, le relais rend 422, `site_rejected` et la phrase.
 //!
 //! ⚠️ `tune-server` porte `autotests = false` : ce fichier n'est compilé que
 //! parce qu'il est déclaré en cible `[[test]]` dans `tune-server/Cargo.toml`.
@@ -28,12 +30,22 @@ use tune_server::state::AppState;
 /// Un faux site qui refuse chaque envoi avec `statut`, et pose `Retry-After`
 /// si on le lui donne. Il rend ce que Laravel rend sur `throttle`.
 async fn faux_site(statut: u16, retry_after: Option<&'static str>) -> String {
+    faux_site_avec(
+        statut,
+        retry_after,
+        json!({ "message": "Too Many Attempts." }),
+    )
+    .await
+}
+
+/// Le même faux site, avec le corps JSON de refus donné.
+async fn faux_site_avec(statut: u16, retry_after: Option<&'static str>, corps: Value) -> String {
     let app = axum::Router::new().route(
         "/api/v1/community/bug-report",
         axum::routing::post(move || async move {
             let mut resp = axum::response::IntoResponse::into_response((
                 StatusCode::from_u16(statut).unwrap(),
-                axum::Json(json!({ "message": "Too Many Attempts." })),
+                axum::Json(corps.clone()),
             ));
             if let Some(v) = retry_after {
                 resp.headers_mut()
@@ -124,13 +136,46 @@ async fn limite_sans_retry_after_n_invente_aucun_delai() {
 
 #[tokio::test]
 async fn autre_refus_garde_son_code_http() {
-    let base = faux_site(422, None).await;
+    // #8627 : hors 429 et 422, le refus reste un 502 avec le code du site, et
+    // porte la phrase du site (`message` Laravel) sous `site_message`.
+    for statut in [400u16, 403] {
+        let base = faux_site(statut, None).await;
+        let (code, _headers, corps) = envoyer(&base).await;
+
+        assert_eq!(code, StatusCode::BAD_GATEWAY, "{statut} : corps : {corps}");
+        assert_eq!(
+            corps,
+            json!({
+                "error": "cloud rejected the report",
+                "status": statut,
+                "site_message": "Too Many Attempts.",
+            }),
+            "hors 429 et 422, le refus garde sa forme et le code HTTP du site"
+        );
+    }
+}
+
+/// #8627 — le 422 de site-mozaiklabs#529, de bout en bout : le relais rend
+/// 422, le code stable `site_rejected` et la phrase de `errors.body[0]`.
+#[tokio::test]
+async fn refus_422_du_site_rend_son_motif() {
+    let phrase = "Le rapport n'a pas été publié : sa mise en forme aurait effacé votre texte.";
+    let base = faux_site_avec(
+        422,
+        None,
+        json!({ "message": "invalide", "errors": { "body": [phrase] } }),
+    )
+    .await;
     let (code, _headers, corps) = envoyer(&base).await;
 
-    assert_eq!(code, StatusCode::BAD_GATEWAY, "corps : {corps}");
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "corps : {corps}");
     assert_eq!(
         corps,
-        json!({ "error": "cloud rejected the report", "status": 422 }),
-        "hors 429, le refus garde sa forme et le code HTTP du site"
+        json!({
+            "error": "site_rejected",
+            "code": "site_rejected",
+            "status": 422,
+            "site_message": phrase,
+        })
     );
 }

@@ -174,6 +174,9 @@ pub struct FavoriMiroir {
     pub created_at: Option<String>,
     /// Année et qualité d'un favori album, quand le service les donne (#6482).
     pub annee_qualite: AnneeQualite,
+    /// L'identifiant de l'album d'une piste chez le service, quand il le
+    /// donne (tune-web-client#2759).
+    pub album_ref: Option<String>,
 }
 
 impl From<Entree> for FavoriMiroir {
@@ -189,6 +192,7 @@ impl From<Entree> for FavoriMiroir {
             isrc: e.isrc,
             created_at: e.created_at,
             annee_qualite: e.annee_qualite,
+            album_ref: e.album_ref,
         }
     }
 }
@@ -498,6 +502,19 @@ fn ecrire_partout(
             &fav.annee_qualite,
         ) {
             warn!(service = %service, erreur = %e, "favori_miroir_annee_qualite_impossible");
+        }
+        // tune-web-client#2759 — l'album de la piste chez le service, pour
+        // « Aller à l'album » depuis les Favoris.
+        if let Some(album) = fav.album_ref.as_deref()
+            && let Err(e) = repo.completer_album_du_service(
+                pid,
+                &fav.item_type,
+                service,
+                &fav.service_id,
+                album,
+            )
+        {
+            warn!(service = %service, erreur = %e, "favori_miroir_album_impossible");
         }
     }
     poser_etat(
@@ -911,6 +928,7 @@ fn trier_les_playlists(
                 ai_generated: None,
                 isrc: None,
                 annee_qualite: AnneeQualite::default(),
+                album_ref: None,
             }),
             Some(true) => {
                 reserves

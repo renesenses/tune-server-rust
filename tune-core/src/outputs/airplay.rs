@@ -721,11 +721,26 @@ impl AirplayOutput {
     /// session. Un refus ne fait pas échouer la lecture : il est dit, et la
     /// consigne est rendue à l'attente pour le prochain geste ou la
     /// prochaine session.
+    ///
+    /// #8151 — une sortie en sourdine la repose à chaque session, consigne en
+    /// attente ou non : sans cela, la piste suivante partait au niveau de
+    /// l'enceinte.
     async fn appliquer_le_volume_en_attente(&self, session: &mut RtspSession) {
-        let Some(volume) = self.volume_en_attente.lock().await.take() else {
+        let en_attente = self.volume_en_attente.lock().await.take();
+        let muet = self.muted.load(Ordering::SeqCst);
+        if muet && en_attente.is_none() {
+            match session.set_volume_rtsp(-144.0).await {
+                Ok(()) => info!(device = %self.name, "airplay_mute_reimpose_a_la_session"),
+                Err(error) => {
+                    warn!(device = %self.name, error = %error, "airplay_mute_reimpose_refuse")
+                }
+            }
+            return;
+        }
+        let Some(volume) = en_attente else {
             return;
         };
-        let db = if self.muted.load(Ordering::SeqCst) {
+        let db = if muet {
             -144.0
         } else {
             linear_to_airplay_db(volume)
@@ -1063,12 +1078,17 @@ impl OutputTarget for AirplayOutput {
             linear_to_airplay_db(volume)
         };
         let mut session = self.rtsp_session.lock().await;
-        session
-            .as_mut()
-            .ok_or("AirPlay mute requires an active RTSP session")?
-            .set_volume_rtsp(db)
-            .await?;
+        let Some(session) = session.as_mut() else {
+            // #8151 — sans session, la sourdine attend la suivante, comme le
+            // volume (fil 2553) : `appliquer_le_volume_en_attente` la pose
+            // juste après RECORD.
+            self.muted.store(muted, Ordering::SeqCst);
+            info!(device = %self.name, muted, "airplay_mute_en_attente_de_session");
+            return Ok(());
+        };
+        session.set_volume_rtsp(db).await?;
         self.muted.store(muted, Ordering::SeqCst);
+        info!(device = %self.name, muted, "airplay_set_mute_ok");
         Ok(())
     }
 
@@ -2250,3 +2270,7 @@ mod fermeture_tests_7259;
 #[cfg(test)]
 #[path = "airplay_volume_hors_session_tests_2553.rs"]
 mod volume_hors_session_tests_2553;
+
+#[cfg(test)]
+#[path = "airplay_sourdine_hors_session_tests_8151.rs"]
+mod sourdine_hors_session_tests_8151;

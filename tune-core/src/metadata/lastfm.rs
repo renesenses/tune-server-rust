@@ -141,6 +141,14 @@ impl LastfmEnricher {
 /// #7107 — `artist.getTopTracks` : les titres les plus écoutés d'un artiste
 /// sur Last.fm, du plus au moins populaire (l'ordre de la réponse).
 ///
+/// #8350 — DidLyon (fil 2394) : les titres phares d'« Ange » et de
+/// « Barbara » étaient ceux d'un homonyme. Last.fm était interrogé par NOM
+/// avec `autocorrect=1`, jamais par MBID. Désormais :
+/// - avec `mbid`, Last.fm est interrogé par MBID seul ; une réponse dont les
+///   pistes portent le MBID d'un AUTRE artiste est refusée ;
+/// - sans `mbid`, par nom SANS autocorrect ; une réponse qui désigne un autre
+///   nom que celui demandé (redirection) est refusée.
+///
 /// Rend les NOMS seuls : Last.fm ne donne ni durée ni ISRC dans cette
 /// réponse. `base` est l'URL de l'API (celle de Last.fm en production, un
 /// faux site dans les tests). `Err` pour tout échec réseau, HTTP ou de
@@ -150,21 +158,27 @@ pub async fn top_tracks_artiste(
     client: &reqwest::Client,
     base: &str,
     artist: &str,
+    mbid: Option<&str>,
     api_key: &str,
     limit: usize,
 ) -> Result<Vec<String>, String> {
-    if api_key.trim().is_empty() || artist.trim().is_empty() {
+    let mbid = mbid.map(str::trim).filter(|m| !m.is_empty());
+    if api_key.trim().is_empty() || (artist.trim().is_empty() && mbid.is_none()) {
         return Err("clé ou artiste absent".into());
     }
     let limit = limit.to_string();
+    let qui = match mbid {
+        Some(m) => ("mbid", m),
+        None => ("artist", artist),
+    };
     let resp = client
         .get(base)
         .query(&[
             ("method", "artist.getTopTracks"),
-            ("artist", artist),
+            qui,
             ("api_key", api_key),
             ("limit", limit.as_str()),
-            ("autocorrect", "1"),
+            ("autocorrect", "0"),
             ("format", "json"),
         ])
         .timeout(std::time::Duration::from_secs(8))
@@ -177,6 +191,32 @@ pub async fn top_tracks_artiste(
     let data: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
     if let Some(e) = data.get("error") {
         return Err(format!("erreur Last.fm {e}"));
+    }
+    if let Some(attendu) = mbid {
+        let autre = data
+            .pointer("/toptracks/track")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|t| t.pointer("/artist/mbid").and_then(|m| m.as_str()))
+            .map(str::trim)
+            .find(|m| !m.is_empty() && !m.eq_ignore_ascii_case(attendu));
+        if let Some(autre) = autre {
+            return Err(format!("homonyme : MBID {autre} au lieu de {attendu}"));
+        }
+    } else if let Some(rendu) = data
+        .pointer("/toptracks/@attr/artist")
+        .and_then(|v| v.as_str())
+    {
+        let cle = |t: &str| -> String {
+            t.to_lowercase()
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .collect()
+        };
+        if cle(rendu) != cle(artist) {
+            return Err(format!("homonyme : « {rendu} » au lieu de « {artist} »"));
+        }
     }
     Ok(data
         .pointer("/toptracks/track")

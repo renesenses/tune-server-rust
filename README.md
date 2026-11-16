@@ -83,13 +83,25 @@ VPS): network zones (DLNA, AirPlay, Chromecast...) do not need them. The image
 also keeps the host's own group of `/dev/snd` when it is not `audio` (29), as on
 Fedora (63).
 
+To rip audio CDs from a drive of this machine, also pass it with
+`--device /dev/sr0` (compose: `devices: [/dev/sr0:/dev/sr0]`). The image ships
+`cdparanoia`, and keeps the host's group of `/dev/sr*` whatever its number
+(11 on ZimaOS, 24 `cdrom` on Debian, as on Synology and Unraid), so nothing
+else is needed. Only a container started with `--user` must be given that
+group itself: `--group-add 11`, the number being the 4th column of
+`ls -ln /dev/sr0` on the host. When the drive is passed but cannot be opened,
+`GET /api/v1/cd-rip/drives` says so (`readable: false`, `reason:
+"permission_denied"`) and names the group to add.
+
 On Synology, also prepare a writable, persistent model cache before enabling
 acoustic analysis: [Synology model-cache setup](docs/INSTALL-SYNOLOGY.md).
 
 Tune cannot mount an SMB share itself inside the container. Mount the share on
 the host (your NAS), then bind it with `rslave` propagation
 (`-v /volume1/music:/music:ro,rslave`) so that a share mounted after the
-container started shows up in it:
+container started shows up in it. Adding or changing a volume takes a new
+container (`docker rm` then `docker run`, or `docker compose up -d`); a restart
+keeps the old volumes:
 [SMB share in Docker](docs/DOCKER-PARTAGE-SMB.md).
 
 ### Podman (Fedora)

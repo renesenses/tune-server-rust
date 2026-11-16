@@ -22,9 +22,12 @@ pub mod channels;
 /// crête (jamais d'écrêtage).
 pub mod compensation_reseau;
 pub mod convolver;
+pub mod coupure_connue_8483;
 pub mod crete_de_sortie;
 pub mod crete_vraie;
 pub mod crossfeed;
+/// #8701 — les fMP4 DASH des pistes en cours, gardés pour un saut.
+pub mod dash_epingles;
 pub mod dash_growth;
 pub mod decode;
 /// Balise d'avancement du décodage (#3140) — le débit réel de l'hôte, mesuré
@@ -54,6 +57,11 @@ mod dsd_brut_tests_5643;
 mod dsd_ordre_canaux_et_phase;
 pub mod dsd_to_dop;
 pub mod dsd_to_pcm;
+/// #8248 — le DSD natif ALSA (`DSD_U32_BE`/`DSD_U32_LE`) de la sortie locale Linux.
+pub mod dsd_u32_alsa;
+#[cfg(test)]
+#[path = "dsd_u32_alsa_tests_8248.rs"]
+mod dsd_u32_alsa_tests_8248;
 pub mod dsf;
 pub mod dsf_depuis_dst;
 #[cfg(test)]
@@ -94,6 +102,7 @@ pub mod fondu_de_zone;
 /// de sortie n'est touché : c'est tout le sujet du ticket.
 pub mod fondu_enchaine;
 pub mod formats;
+pub mod frequence_fixe;
 /// #6721 — garde générale contre les montées brusques du volume.
 pub mod garde_de_hausse;
 pub mod http_range;
@@ -107,6 +116,11 @@ pub mod m4a;
 /// Matroska (`.mkv`/`.mka`/`.webm`) : la sonde de la piste audio — admis si
 /// un décodeur livré la lit, compté-nommé sinon (#3633).
 pub mod matroska;
+// #8513 — traitements de zone contournés pendant une mesure de pièce.
+/// La forme d'onde d'une piste (crêtes, RMS, écrêtage) pour sa fiche
+/// technique (fil du forum 2793).
+pub mod forme_onde;
+pub mod mesure_nue;
 pub mod mixer;
 /// Le repli mono dit quand il n'agit pas (#3254) — la disponibilité par zone du
 /// réglage `zone_{id}_mono_downmix` (#2362).
@@ -167,6 +181,8 @@ pub mod volume_limites;
 /// Conversion volume linéaire ↔ décibels — le seul endroit (#1274).
 pub mod volume_scale;
 pub mod wav;
+/// #8082 — plusieurs pistes de même format servies en un seul WAV continu.
+pub mod wav_continu;
 pub mod wavpack;
 
 /// Linear (2-tap) resampler over interleaved f32 samples.
@@ -215,3 +231,6 @@ pub(crate) fn simple_resample(
 pub mod premium_plugins;
 
 pub mod sdk_observation;
+
+// #8722 — octets réseau L16, après quantification PCM16.
+pub(crate) mod l16_depuis_wav;

@@ -11,17 +11,51 @@
 //! d'elle-même, et le RSS reste haut alors que presque tout est libre.
 
 use tune_server::memoire_a_froid::{
-    purge_permise, rendre_la_memoire_liberee, rss_mb, une_sortie_locale_joue,
+    DecisionDePurge, SEUIL_LIBRE_PENDANT_LECTURE_MB, decider_la_purge, rendre_la_memoire_liberee,
+    rss_mb, une_sortie_locale_joue,
 };
 
-#[test]
-fn la_purge_n_a_lieu_qu_a_froid() {
-    assert!(purge_permise(false));
-    assert!(!purge_permise(true));
+fn purge_permise(une_sortie_locale_joue: bool) -> bool {
+    // Assez de mémoire libre gardée pour que la purge vaille la peine.
+    decider_la_purge(une_sortie_locale_joue, Some(SEUIL_LIBRE_PENDANT_LECTURE_MB)).purge()
 }
 
-/// Fil 2167 — TÉMOIN : une zone RÉSEAU qui joue ne retient plus la purge ;
-/// une sortie LOCALE, oui, même suiveuse d'un groupe mené par une zone réseau.
+/// #8609 — TÉMOIN : une sortie LOCALE qui joue ne retient plus la purge.
+///
+/// Avant le correctif, `purge_permise(true)` valait `false` : un serveur qui
+/// écoute toute la journée sur sa carte son ne rendait jamais rien
+/// (505 Mo → 5 Go en dix heures, fil 2167).
+#[test]
+fn la_purge_a_lieu_meme_pendant_une_lecture_locale() {
+    assert_eq!(decider_la_purge(false, None), DecisionDePurge::AFroid);
+    assert_eq!(decider_la_purge(false, Some(0)), DecisionDePurge::AFroid);
+    assert_eq!(
+        decider_la_purge(true, Some(SEUIL_LIBRE_PENDANT_LECTURE_MB)),
+        DecisionDePurge::PendantLectureLocale
+    );
+    assert_eq!(
+        decider_la_purge(true, Some(4_500)),
+        DecisionDePurge::PendantLectureLocale,
+        "4,5 Go libres gardés pendant l'écoute locale : la purge doit avoir lieu (fil 2167)"
+    );
+    // Hors glibc, l'état du tas est inconnu : la purge (qui n'y fait rien)
+    // n'est pas retenue pour autant.
+    assert_eq!(
+        decider_la_purge(true, None),
+        DecisionDePurge::PendantLectureLocale
+    );
+    // Pendant la lecture, peu de mémoire libre : rien à gagner, on attend.
+    assert_eq!(
+        decider_la_purge(true, Some(SEUIL_LIBRE_PENDANT_LECTURE_MB - 1)),
+        DecisionDePurge::Retenue
+    );
+    assert!(purge_permise(true));
+    assert!(purge_permise(false));
+}
+
+/// Fil 2167 — la requête qui reconnaît une sortie LOCALE en lecture (même
+/// suiveuse d'un groupe mené par une zone réseau). Depuis #8609 elle ne
+/// retient plus la purge que si peu de mémoire libre est gardée.
 ///
 /// Avant le correctif, la garde était « une zone joue » : le premier cas
 /// (une zone DLNA seule en lecture) refusait la purge, et un serveur qui
@@ -38,7 +72,7 @@ fn seule_une_sortie_locale_en_lecture_retient_la_purge() {
     // Table absente : la requête échoue, dans le doute on ne purge pas.
     assert!(
         une_sortie_locale_joue(&backend),
-        "une requête en échec doit retenir la purge"
+        "une requête en échec doit compter comme une sortie locale en lecture"
     );
 
     db.execute_batch(
@@ -57,7 +91,7 @@ fn seule_une_sortie_locale_en_lecture_retient_la_purge() {
     );
     assert!(purge_permise(une_sortie_locale_joue(&backend)));
 
-    // La sortie locale joue : la purge attend.
+    // La sortie locale joue.
     db.execute_batch("UPDATE zones SET last_play_state = 'playing' WHERE id = 2;")
         .unwrap();
     assert!(
@@ -65,7 +99,7 @@ fn seule_une_sortie_locale_en_lecture_retient_la_purge() {
         "une sortie locale joue : pas de purge"
     );
 
-    // Suiveuse locale d'un groupe mené par la zone DLNA : la purge attend aussi.
+    // Suiveuse locale d'un groupe mené par la zone DLNA : comptée comme locale.
     db.execute_batch(
         "UPDATE zones SET last_play_state = 'stopped' WHERE id = 2;
          UPDATE zones SET group_id = 7 WHERE id IN (1, 2);",
@@ -76,7 +110,7 @@ fn seule_une_sortie_locale_en_lecture_retient_la_purge() {
         "une sortie locale groupée avec une zone qui joue doit retenir la purge"
     );
 
-    // Type inconnu en lecture : dans le doute, la purge attend.
+    // Type inconnu en lecture : dans le doute, compté comme local.
     db.execute_batch(
         "UPDATE zones SET group_id = NULL, last_play_state = 'stopped';
          INSERT INTO zones (id, name, output_type, last_play_state) VALUES (4, '?', NULL, 'playing');",

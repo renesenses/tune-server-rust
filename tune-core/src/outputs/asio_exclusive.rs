@@ -29,6 +29,7 @@ use crate::audio::volume_scale::gain_des_unites;
 use super::canaux_de_carte_6171::{CanauxDeCarte, Dispersion, PlanDeCanaux, remplir_le_tampon};
 use super::local::gain_au_rendu_7264::GainAuRendu;
 use super::local::{NativePcmRing, RingBuf};
+use super::quantification_au_rendu_7703::QuantificationAuRendu;
 use super::silence_avant_liberation_6133::{
     BORNE_SILENCE_AVANT_LIBERATION, SilenceAvantLiberation, remplir_le_bloc_dsd_natif,
 };
@@ -797,6 +798,7 @@ impl AsioExclusiveOutput {
         // tôt (`bras_asio.rs` monte l'étage à l'unité). Au repos à la
         // consigne courante : ni fondu d'ouverture, ni mot pondéré à 100 %.
         let mut gain = GainAuRendu::nouveau(volume.clone(), rendu.cadence, rendu.voies);
+        let mut dop = crate::audio::dop_continu::SuiviDoP::new(rendu.voies as u16);
         match transport {
             AsioTransport::NativeI32 => {
                 info!("asio_exclusive_building_i32_stream");
@@ -806,13 +808,22 @@ impl AsioExclusiveOutput {
                     .build_output_stream(
                         config,
                         move |data: &mut [i32], _: &cpal::OutputCallbackInfo| {
-                            if silence.doit_se_taire(paused.load(Ordering::Relaxed)) {
-                                data.fill(0);
-                                return;
-                            }
-                            if remplir_le_tampon(data, &mut dispersion, 0, |d| {
-                                native_ring.pop_mapped_au_gain(d, rendu.bits, &mut gain, |m| m)
-                            }) {
+                            let muet = silence.doit_se_taire(paused.load(Ordering::Relaxed));
+                            let mut famine = false;
+                            remplir_le_tampon(data, &mut dispersion, 0, |d| {
+                                famine |= super::dop_au_rendu_7704::rendre_natif(
+                                    &native_ring,
+                                    d,
+                                    rendu.bits,
+                                    &mut gain,
+                                    &mut dop,
+                                    muet,
+                                    0,
+                                    |m| m,
+                                );
+                                d.len()
+                            });
+                            if famine {
                                 counters.underruns.fetch_add(1, Ordering::Relaxed);
                             }
                         },
@@ -831,18 +842,22 @@ impl AsioExclusiveOutput {
                     .build_output_stream(
                         config,
                         move |data: &mut [cpal::I24], _: &cpal::OutputCallbackInfo| {
-                            if silence.doit_se_taire(paused.load(Ordering::Relaxed)) {
-                                data.fill(I24_ZERO);
-                                return;
-                            }
-                            if remplir_le_tampon(data, &mut dispersion, I24_ZERO, |d| {
-                                native_ring.pop_mapped_au_gain(
+                            let muet = silence.doit_se_taire(paused.load(Ordering::Relaxed));
+                            let mut famine = false;
+                            remplir_le_tampon(data, &mut dispersion, I24_ZERO, |d| {
+                                famine |= super::dop_au_rendu_7704::rendre_natif(
+                                    &native_ring,
                                     d,
                                     rendu.bits.min(24),
                                     &mut gain,
-                                    |sample| i24_borne(sample >> 8),
-                                )
-                            }) {
+                                    &mut dop,
+                                    muet,
+                                    I24_ZERO,
+                                    |m| i24_borne(m >> 8),
+                                );
+                                d.len()
+                            });
+                            if famine {
                                 counters.underruns.fetch_add(1, Ordering::Relaxed);
                             }
                         },
@@ -882,6 +897,7 @@ impl AsioExclusiveOutput {
             }
             AsioTransport::ProcessedI32(_) => {
                 let errors = counters.clone();
+                let mut quantification = QuantificationAuRendu::new(32);
                 let mut dispersion = plan.cloned().map(|p| Dispersion::new(p, 0i32));
                 device
                     .build_output_stream(
@@ -893,12 +909,8 @@ impl AsioExclusiveOutput {
                             }
                             let volume = gain_des_unites(volume.load(Ordering::Relaxed));
                             if remplir_le_tampon(data, &mut dispersion, 0, |d| {
-                                float_ring.pop_mapped(d, |sample| {
-                                    let scaled = (f64::from(sample) * volume * 2_147_483_648.0)
-                                        .round()
-                                        .clamp(i32::MIN as f64, i32::MAX as f64);
-                                    scaled as i32
-                                })
+                                float_ring
+                                    .pop_mapped(d, |sample| quantification.rendre(sample, volume))
                             }) {
                                 counters.underruns.fetch_add(1, Ordering::Relaxed);
                             }
@@ -912,26 +924,30 @@ impl AsioExclusiveOutput {
             }
             AsioTransport::ProcessedI24(_) => {
                 let errors = counters.clone();
+                let mut quantification = QuantificationAuRendu::new(24);
                 let mut dispersion = plan.cloned().map(|p| Dispersion::new(p, I24_ZERO));
                 device
                     .build_output_stream(
                         config,
                         move |data: &mut [cpal::I24], _: &cpal::OutputCallbackInfo| {
-                            let zero = I24_ZERO;
-                            if silence.doit_se_taire(paused.load(Ordering::Relaxed)) {
-                                data.fill(zero);
-                                return;
-                            }
+                            let muet = silence.doit_se_taire(paused.load(Ordering::Relaxed));
                             let volume = gain_des_unites(volume.load(Ordering::Relaxed));
-                            if remplir_le_tampon(data, &mut dispersion, zero, |d| {
-                                float_ring.pop_mapped(d, |sample| {
-                                    let scaled = (f64::from(sample) * volume * 8_388_608.0)
-                                        .round()
-                                        .clamp(-8_388_608.0, 8_388_607.0)
-                                        as i32;
-                                    i24_borne(scaled)
-                                })
-                            }) {
+                            let mut famine = false;
+                            remplir_le_tampon(data, &mut dispersion, I24_ZERO, |d| {
+                                famine |= super::dop_au_rendu_7704::rendre_flottant(
+                                    &float_ring,
+                                    d,
+                                    volume,
+                                    &mut dop,
+                                    muet,
+                                    I24_ZERO,
+                                    |sample, volume| {
+                                        i24_borne(quantification.rendre(sample, volume))
+                                    },
+                                );
+                                d.len()
+                            });
+                            if famine {
                                 counters.underruns.fetch_add(1, Ordering::Relaxed);
                             }
                         },
@@ -944,6 +960,7 @@ impl AsioExclusiveOutput {
             }
             AsioTransport::ProcessedI16(_) => {
                 let errors = counters.clone();
+                let mut quantification = QuantificationAuRendu::new(16);
                 let mut dispersion = plan.cloned().map(|p| Dispersion::new(p, 0i16));
                 device
                     .build_output_stream(
@@ -956,10 +973,7 @@ impl AsioExclusiveOutput {
                             let volume = gain_des_unites(volume.load(Ordering::Relaxed));
                             if remplir_le_tampon(data, &mut dispersion, 0, |d| {
                                 float_ring.pop_mapped(d, |sample| {
-                                    let scaled = (f64::from(sample) * volume * 32_768.0)
-                                        .round()
-                                        .clamp(i16::MIN as f64, i16::MAX as f64);
-                                    scaled as i16
+                                    quantification.rendre(sample, volume) as i16
                                 })
                             }) {
                                 counters.underruns.fetch_add(1, Ordering::Relaxed);
@@ -979,19 +993,23 @@ impl AsioExclusiveOutput {
                     .build_output_stream(
                         config,
                         move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                            if silence.doit_se_taire(paused.load(Ordering::Relaxed)) {
-                                data.fill(0.0);
-                                return;
-                            }
-                            if remplir_le_tampon(data, &mut dispersion, 0.0, |d| float_ring.pop(d))
-                            {
+                            let muet = silence.doit_se_taire(paused.load(Ordering::Relaxed));
+                            let volume = gain_des_unites(volume.load(Ordering::Relaxed));
+                            let mut famine = false;
+                            remplir_le_tampon(data, &mut dispersion, 0.0, |d| {
+                                famine |= super::dop_au_rendu_7704::rendre_flottant(
+                                    &float_ring,
+                                    d,
+                                    volume,
+                                    &mut dop,
+                                    muet,
+                                    0.0,
+                                    |sample, volume| (f64::from(sample) * volume) as f32,
+                                );
+                                d.len()
+                            });
+                            if famine {
                                 counters.underruns.fetch_add(1, Ordering::Relaxed);
-                            }
-                            // Les zéros (fin de famine, canaux non visés)
-                            // restent des zéros.
-                            let v = gain_des_unites(volume.load(Ordering::Relaxed)) as f32;
-                            for sample in data.iter_mut() {
-                                *sample *= v;
                             }
                         },
                         move |_| {

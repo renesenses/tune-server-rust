@@ -37,6 +37,7 @@ pub mod lecture;
 pub mod messagerie;
 pub mod notifications;
 pub mod playlists;
+pub mod pochettes_de_mes_sources;
 pub mod rayons;
 pub mod references;
 pub mod relais;
@@ -191,7 +192,14 @@ impl TunePlugin for CirclePlugin {
                 .merge(rayons::router(pousseur.clone()))
                 .merge(playlists::router(collaboratif))
                 .merge(suivi::router(suivi.clone()))
-                .merge(ecoute::router(ecoute)),
+                .merge(ecoute::router(ecoute))
+                // web#3001 : la pochette d'un album de contact, prise dans mes sources.
+                .merge(pochettes_de_mes_sources::router(Arc::new(
+                    pochettes_de_mes_sources::PochettesDeMesSources::new(
+                        self.services.backend.clone(),
+                        self.services.services.clone(),
+                    ),
+                ))),
         );
         // T3 (#5326) : tenir à jour les rayons cochés.
         self.tache = Some(tokio::spawn(pousseur.clone().tourner()));

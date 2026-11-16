@@ -739,6 +739,61 @@ pub fn position_reset(last_position_ms: u64, position_ms: u64, gapless_armed: bo
     last_position_ms > 30_000 && position_ms < 5_000 && gapless_armed
 }
 
+/// #7293 — marge (ms) sous laquelle une position est « près du début » quand
+/// le relevé précédent date d'un tick ordinaire : `RelTime` à la seconde,
+/// sondeur à 1 Hz, phase du renderer inconnue.
+pub const PRES_DU_DEBUT_MS: u64 = 5_000;
+
+/// #7293 (fil 2502, DirettaRenderer, 28/10) — la position est-elle « près du
+/// début » COMPTE TENU de l'âge du relevé précédent ?
+///
+/// Les deux détecteurs d'enchaînement (`position_reset`,
+/// `position_confirms_transition`) demandaient une position sous 5 s. Cela
+/// suppose un sondage par seconde. Or le sondeur est UNE tâche pour toutes
+/// les zones : un seul appareil lent sur une autre zone (5 s de délai de
+/// relevé, #8006) suffit à sauter la fenêtre. Journal de Tades : `SetNext`
+/// acquitté à 11:16:23, le renderer enchaîne vers 11:16:48, et Tune ne voit
+/// le passage qu'à 11:20:56 — 248 s plus tard, quand la position de la
+/// NOUVELLE piste atteint « durée de l'ancienne − 30 s ». Entre-temps l'écran
+/// affiche la piste finie en lecture, et la suivante n'est préparée qu'au
+/// dernier moment.
+///
+/// Une piste qui a démarré depuis le relevé précédent ne peut pas être plus
+/// loin que cet écart : la marge devient `5 s + (écart − relevé nominal)`.
+/// Le relevé nominal ([`RELEVE_NOMINAL_MS`]) est ce qu'un tick ordinaire
+/// coûte déjà, et il est DÉJÀ compris dans les 5 s : à 1 Hz la marge ne
+/// bouge pas d'un millième. Après un relevé manqué de 10 s, elle vaut 13 s et
+/// une position à 8 s est reconnue. Un relevé jamais pris (`écart = 0`)
+/// garde la marge nue.
+pub fn pres_du_debut_apres_le_releve(position_ms: u64, ecart_depuis_le_releve_ms: u64) -> bool {
+    let releve_manque_ms = ecart_depuis_le_releve_ms.saturating_sub(RELEVE_NOMINAL_MS);
+    position_ms < PRES_DU_DEBUT_MS.saturating_add(releve_manque_ms)
+}
+
+/// #7293 — l'écart entre deux relevés qu'un tick ordinaire explique à lui
+/// seul : l'intervalle du sondeur, plus autant de latence de relevé. En deçà,
+/// rien n'a été manqué et la marge reste celle de [`PRES_DU_DEBUT_MS`].
+pub const RELEVE_NOMINAL_MS: u64 = 2 * POLL_INTERVAL_MS;
+
+/// #7293 — [`position_reset`], avec la marge de
+/// [`pres_du_debut_apres_le_releve`] au lieu des 5 s nus.
+///
+/// La chute doit rester une CHUTE (`position_ms < last_position_ms`) : après
+/// un long écart, une position plus haute que la précédente est une lecture
+/// qui a continué, pas une piste qui a redémarré.
+pub fn position_reset_apres_le_releve(
+    last_position_ms: u64,
+    position_ms: u64,
+    gapless_armed: bool,
+    ecart_depuis_le_releve_ms: u64,
+) -> bool {
+    position_reset(last_position_ms, position_ms, gapless_armed)
+        || (gapless_armed
+            && last_position_ms > 30_000
+            && position_ms < last_position_ms
+            && pres_du_debut_apres_le_releve(position_ms, ecart_depuis_le_releve_ms))
+}
+
 /// #3967 — une chute de position (`position_reset`) observée alors que le
 /// transport ne JOUE pas doit-elle être différée au sondage suivant ?
 ///
@@ -1224,6 +1279,20 @@ pub fn position_confirms_transition(
         && (position_ms < 5000
             || (track_duration_ms > 0
                 && position_ms >= track_duration_ms.saturating_sub(GAPLESS_WINDOW_MS)))
+}
+
+/// #7293 — [`position_confirms_transition`], avec la marge de
+/// [`pres_du_debut_apres_le_releve`] pour « reset au début » : après un
+/// relevé manqué, la nouvelle piste a déjà quelques secondes quand Tune la
+/// voit pour la première fois. La branche « près de la fin » est inchangée.
+pub fn position_confirms_transition_apres_le_releve(
+    played_enough: bool,
+    position_ms: u64,
+    track_duration_ms: u64,
+    ecart_depuis_le_releve_ms: u64,
+) -> bool {
+    position_confirms_transition(played_enough, position_ms, track_duration_ms)
+        || (played_enough && pres_du_debut_apres_le_releve(position_ms, ecart_depuis_le_releve_ms))
 }
 
 /// Fil 2062 / #5550 — la durée que la sortie RAPPORTE doit-elle devenir celle

@@ -16,7 +16,7 @@ mod volume_7333_tests;
 #[cfg(feature = "oaat")]
 use super::helpers::{
     BaseDeTempsOaat, StreamInfo, detect_and_parse, dsd_rate_from_sample_rate, duree_audio_envoyee,
-    extraire_payloads_fin_flux, format_rate_display,
+    extraire_payloads_fin_flux, format_rate_display, refus_dsd_natif,
 };
 
 #[cfg(feature = "oaat")]
@@ -139,6 +139,7 @@ struct NextTrackPrefetch {
 /// Observable OAAT diagnostics — safe to read from any thread.
 #[derive(Default)]
 pub struct OaatDiagnostics {
+    pub dsd: Arc<std::sync::Mutex<crate::outputs::repli_dsd_oaat_8486::Observation>>,
     pub packets_sent: AtomicU64,
     pub bytes_sent: AtomicU64,
     pub reconnects: AtomicU32,
@@ -445,6 +446,16 @@ impl OaatOutput {
         self.native_dsd_active.load(Ordering::Relaxed)
     }
 
+    /// #8647 — publie le drapeau « DSD natif » de CETTE sortie pour le chemin
+    /// du signal. Appelé par `play_media`, jamais par `new()` : la découverte
+    /// construit une sortie neuve à chaque ré-annonce mDNS puis la jette en
+    /// gardant celle qui joue, et une inscription au constructeur aurait
+    /// remplacé le drapeau vivant par une référence morte.
+    pub(crate) fn publier_le_drapeau_dsd_natif(&self) {
+        crate::outputs::dsd_natif_oaat_8647::inscrire(&self.device_id, &self.native_dsd_active);
+        crate::outputs::repli_dsd_oaat_8486::inscrire(&self.device_id, &self.diag.dsd);
+    }
+
     // These three exist only for `integration_test`, which is gated on
     // `all(test, feature = "oaat")`. Gating them on `test` alone — or not at
     // all — leaves them compiled but unused in a plain `cargo test`, which is
@@ -472,6 +483,13 @@ impl OaatOutput {
     }
 
     pub fn diagnostics_snapshot(&self) -> serde_json::Value {
+        let dsd = self
+            .diag
+            .dsd
+            .lock()
+            .ok()
+            .map(|e| e.clone())
+            .unwrap_or_default();
         let playing = self.playing.load(Ordering::Relaxed);
         let last_pkt = self.diag.last_packet_epoch_ms.load(Ordering::Relaxed);
         let now_ms = std::time::SystemTime::now()
@@ -490,6 +508,9 @@ impl OaatOutput {
             "host": self.host,
             "port": self.port,
             "controller_id": self.controller_id,
+            "dsd_capabilities_received": dsd.annonce_recue,
+            "dsd_max_rate": dsd.dsd_max_rate,
+            "dsd_pcm_fallback": dsd.repli,
             "connected": self.diag.connected.load(Ordering::Relaxed),
             "playing": playing,
             "paused": self.paused.load(Ordering::Relaxed),
@@ -514,6 +535,25 @@ impl OaatOutput {
 
     fn endpoint_addr(&self) -> std::net::SocketAddr {
         format!("{}:{}", self.host, self.port).parse().unwrap()
+    }
+}
+
+#[cfg(feature = "oaat")]
+fn constater_repli_dsd(
+    diag: &OaatDiagnostics,
+    appareil: &str,
+    raison: crate::outputs::repli_dsd_oaat_8486::Raison,
+    cadence: Option<u32>,
+    maximum: Option<u16>,
+) {
+    let repli = crate::outputs::repli_dsd_oaat_8486::Repli {
+        raison,
+        dsd_rate: cadence.and_then(dsd_rate_from_sample_rate),
+        dsd_max_rate: maximum,
+    };
+    info!(device = appareil, ?raison, dsd_rate = ?repli.dsd_rate, dsd_max_rate = ?maximum, "oaat: native DSD fallback to PCM");
+    if let Ok(mut dsd) = diag.dsd.lock() {
+        dsd.repli = Some(repli);
     }
 }
 
@@ -746,6 +786,8 @@ impl OutputTarget for OaatOutput {
         use oaat_core::wire::PacketFlags;
 
         self.stop().await.ok();
+        // #8647 — la sortie qui joue est celle que le chemin du signal lit.
+        self.publier_le_drapeau_dsd_natif();
 
         let url = media.url.to_owned();
         let file_path = media.file_path.map(|s| s.to_owned());
@@ -900,6 +942,9 @@ impl OutputTarget for OaatOutput {
                             *place = None;
                         }
                         annoncer_volume(&volume_annonce, &ep);
+                        if let Ok(mut dsd) = diag.dsd.lock() {
+                            dsd.annoncer(ep.info.capabilities.dsd_max_rate);
+                        }
                         endpoint = Some(ep);
                         break;
                     }
@@ -991,6 +1036,9 @@ impl OutputTarget for OaatOutput {
             let mesure = endpoint.clock_measurement().await;
             let avance_pts_ns =
                 avance_demarrage_7331(mesure.as_ref().map(|m| (m.rtt_ns, m.jitter_ns)));
+            // #7330 — PTS du dernier paquet envoyé : la fin naturelle attend
+            // son échéance avant `stop` (qui purge la file du récepteur).
+            let mut fin_jouee = super::fin_jouee_7330::FinJouee::default();
 
             let http_client = crate::http::client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
@@ -1013,7 +1061,34 @@ impl OutputTarget for OaatOutput {
                         .extension()
                         .and_then(|e| e.to_str())
                         .is_some_and(|e| e.eq_ignore_ascii_case("dsf"));
-                    if is_dsf && endpoint.info.capabilities.dsd_max_rate.is_some() {
+                    let maximum = endpoint.info.capabilities.dsd_max_rate;
+                    if is_dsf && maximum.is_none() {
+                        let cadence = crate::audio::dsf::parse_dsf(fp).ok().map(|i| i.sample_rate);
+                        constater_repli_dsd(
+                            &diag,
+                            &device_name,
+                            crate::outputs::repli_dsd_oaat_8486::Raison::SansDsd,
+                            cadence,
+                            maximum,
+                        );
+                        break 'direct false;
+                    }
+                    if std::path::Path::new(fp)
+                        .extension()
+                        .and_then(|e| e.to_str())
+                        .is_some_and(|e| e.eq_ignore_ascii_case("dff"))
+                        && let Ok(entete) = crate::audio::dff::parse_dff(fp)
+                    {
+                        constater_repli_dsd(
+                            &diag,
+                            &device_name,
+                            crate::outputs::repli_dsd_oaat_8486::Raison::Conteneur,
+                            Some(entete.sample_rate),
+                            maximum,
+                        );
+                        break 'direct false;
+                    }
+                    if is_dsf && maximum.is_some() {
                         let dsf_info = match crate::audio::dsf::parse_dsf(fp) {
                             Ok(i) => i,
                             Err(e) => {
@@ -1022,13 +1097,24 @@ impl OutputTarget for OaatOutput {
                             }
                         };
                         let dsd_mult = dsd_rate_from_sample_rate(dsf_info.sample_rate);
-                        if let (Some(m), Some(max)) =
-                            (dsd_mult, endpoint.info.capabilities.dsd_max_rate)
-                            && m > max
-                        {
-                            debug!(
-                                dsd = m,
-                                max, "DSD rate exceeds endpoint max, falling back to PCM"
+                        if let Some(refus) = refus_dsd_natif(
+                            dsf_info.sample_rate,
+                            endpoint.info.capabilities.dsd_max_rate,
+                        ) {
+                            let raison = match refus {
+                                super::helpers::RefusDsdNatif::AuDelaDuMax { .. } => {
+                                    crate::outputs::repli_dsd_oaat_8486::Raison::Plafond
+                                }
+                                super::helpers::RefusDsdNatif::CadenceInconnue => {
+                                    crate::outputs::repli_dsd_oaat_8486::Raison::Cadence
+                                }
+                            };
+                            constater_repli_dsd(
+                                &diag,
+                                &device_name,
+                                raison,
+                                Some(dsf_info.sample_rate),
+                                maximum,
                             );
                             break 'direct false;
                         }
@@ -1086,6 +1172,8 @@ impl OutputTarget for OaatOutput {
                             .await
                         {
                             error!(device = %device_name, error = %e, "oaat: DSD format propose failed");
+                            // #8647 — rien ne part en DSD : ne pas l'annoncer.
+                            native_dsd_active.store(false, Ordering::SeqCst);
                             playing.store(false, Ordering::SeqCst);
                             return;
                         }
@@ -1121,6 +1209,8 @@ impl OutputTarget for OaatOutput {
                             // n'avait rien refuse (#2758).
                             error!(device = %device_name, raison = %refus.raison, "oaat: negociation de format DSD echouee, on ne joue pas");
                             signaler_refus_negociation(&refus_negociation, &refus);
+                            // #8647 — DSD refusé : ne pas l'annoncer natif.
+                            native_dsd_active.store(false, Ordering::SeqCst);
                             playing.store(false, Ordering::SeqCst);
                             return;
                         }
@@ -1509,6 +1599,7 @@ impl OutputTarget for OaatOutput {
                                 {
                                     break;
                                 }
+                                fin_jouee.observer(pts_ns);
 
                                 sample_offset += bits_this as u64;
                                 diag.packets_sent.fetch_add(1, Ordering::Relaxed);
@@ -1602,6 +1693,7 @@ impl OutputTarget for OaatOutput {
                                 position_ms.store(0, Ordering::SeqCst);
                                 duration_ms_arc.store(next.duration_ms, Ordering::SeqCst);
 
+                                crate::outputs::repli_dsd_oaat_8486::effacer_repli(&diag.dsd);
                                 *current_title.lock().await = Some(next.title.clone());
                                 *current_artist.lock().await = Some(next.artist.clone());
 
@@ -1634,6 +1726,7 @@ impl OutputTarget for OaatOutput {
                             )
                             .await
                             .ok();
+                        fin_jouee.attendre_avant_stop(&device_name).await;
                         endpoint.send_stop(&stream_id).await.ok();
                         playing.store(false, Ordering::SeqCst);
                         diag.connected.store(false, Ordering::SeqCst);
@@ -1935,6 +2028,12 @@ impl OutputTarget for OaatOutput {
                         tokio::sync::oneshot::Receiver<Option<super::helpers::StagedDirectTrack>>,
                     > = None;
 
+                    // #7330 — rien à enchaîner : le poller ne l'apprend
+                    // qu'APRÈS l'attente de fin jouée. Levé avant, il voyait
+                    // une sortie « en lecture » figée à la durée sans gapless
+                    // interne (`reached_end_exclusive`), avançait la file et
+                    // interrompait l'attente : fin coupée, sans `stop`.
+                    let mut chaine_epuisee_7330 = false;
                     'direct_tracks: loop {
                         if !playing.load(Ordering::Relaxed) {
                             break 'direct_tracks;
@@ -2039,6 +2138,7 @@ impl OutputTarget for OaatOutput {
                                     *current_uri.lock().await = Some(String::new());
                                     position_ms.store(0, Ordering::SeqCst);
                                     duration_ms_arc.store(next.duration_ms, Ordering::SeqCst);
+                                    crate::outputs::repli_dsd_oaat_8486::effacer_repli(&diag.dsd);
                                     *current_title.lock().await = Some(next.title.clone());
                                     *current_artist.lock().await = Some(next.artist.clone());
                                     continue 'direct_tracks;
@@ -2048,7 +2148,9 @@ impl OutputTarget for OaatOutput {
                                     // advances on its next tick (it re-reads
                                     // supports_internal_gapless while waiting)
                                     // instead of sitting out its guard.
-                                    chain_exhausted.store(true, Ordering::SeqCst);
+                                    // #7330 — signalé après l'attente de fin
+                                    // jouée, juste avant `stop`.
+                                    chaine_epuisee_7330 = true;
                                     break 'direct_tracks;
                                 }
                             }
@@ -2240,6 +2342,7 @@ impl OutputTarget for OaatOutput {
                         {
                             break;
                         }
+                        fin_jouee.observer(pts_ns);
 
                         offset += chunk_bytes;
                         sample_offset += chunk_samples as u64;
@@ -2283,6 +2386,10 @@ impl OutputTarget for OaatOutput {
                         )
                         .await
                         .ok();
+                    fin_jouee.attendre_avant_stop(&device_name).await;
+                    if chaine_epuisee_7330 {
+                        chain_exhausted.store(true, Ordering::SeqCst);
+                    }
                     endpoint.send_stop(&stream_id).await.ok();
                     playing.store(false, Ordering::SeqCst);
                     diag.connected.store(false, Ordering::SeqCst);
@@ -2445,6 +2552,9 @@ impl OutputTarget for OaatOutput {
                 match ConnectedEndpoint::connect(&config, endpoint_addr).await {
                     Ok(ep) => {
                         annoncer_volume(&volume_annonce, &ep);
+                        if let Ok(mut dsd) = diag.dsd.lock() {
+                            dsd.annoncer(ep.info.capabilities.dsd_max_rate);
+                        }
                         endpoint = ep;
                         surveiller_liberation(
                             &mut endpoint,
@@ -2670,6 +2780,7 @@ impl OutputTarget for OaatOutput {
                                     &volume_annonce,
                                 ).await {
                                     Some(new_ep) => {
+                                        if let Ok(mut dsd) = diag.dsd.lock() { dsd.annoncer(new_ep.info.capabilities.dsd_max_rate); }
                                         endpoint = new_ep;
                                         surveiller_liberation(&mut endpoint, &device_name, &liberation, &commandes_liberation);
                                         diag.connected.store(true, Ordering::SeqCst);
@@ -3075,7 +3186,9 @@ impl OutputTarget for OaatOutput {
                                     if paquet.dernier {
                                         flags |= PacketFlags::LAST_PACKET;
                                     }
-                                    let _ = endpoint.send_audio(stream_num, cur_format, pts_ns, sample_offset, &payload, flags).await;
+                                    if endpoint.send_audio(stream_num, cur_format, pts_ns, sample_offset, &payload, flags).await.is_ok() {
+                                        fin_jouee.observer(pts_ns);
+                                    }
                                     if uses_byte_offset { byte_offset += payload.len() as u64; }
                                     else { sample_offset += (payload.len() / bytes_per_frame) as u64; }
                                     position_ms.store(
@@ -3230,6 +3343,7 @@ impl OutputTarget for OaatOutput {
                                         data_offset: source_data_offset,
                                     };
 
+                                    crate::outputs::repli_dsd_oaat_8486::effacer_repli(&diag.dsd);
                                     *current_title.lock().await = Some(next.title.clone());
                                     *current_artist.lock().await = Some(next.artist.clone());
                                     *current_uri.lock().await = Some(String::new());
@@ -3320,6 +3434,7 @@ impl OutputTarget for OaatOutput {
 
                             match endpoint.send_audio(stream_num, cur_format, pts_ns, sample_offset, &payload, flags).await {
                                 Ok(()) => {
+                                    fin_jouee.observer(pts_ns);
                                     reconnect_attempts = 0;
                                     diag.packets_sent.fetch_add(1, Ordering::Relaxed);
                                     diag.bytes_sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
@@ -3356,6 +3471,7 @@ impl OutputTarget for OaatOutput {
                                     &volume_annonce,
                                     ).await {
                                         Some(new_ep) => {
+                                            if let Ok(mut dsd) = diag.dsd.lock() { dsd.annoncer(new_ep.info.capabilities.dsd_max_rate); }
                                             endpoint = new_ep;
                                             surveiller_liberation(&mut endpoint, &device_name, &liberation, &commandes_liberation);
                                             info!(device = %device_name, "oaat: reconnected, resuming stream");
@@ -3446,6 +3562,14 @@ impl OutputTarget for OaatOutput {
             // end-of-track detection alone would not have closed that gap: ANY
             // exit without a transition opens it.
             if !exited_on_stop {
+                // #7330 — fin naturelle : laisser jouer la file du récepteur
+                // jusqu'au dernier échantillon avant de la purger. La chaîne
+                // n'est dite épuisée qu'APRÈS : levé avant l'attente, le drapeau
+                // faisait conclure au poller une fin « exclusive »
+                // (`reached_end_exclusive` : en lecture, figée à la durée, sans
+                // gapless interne). Il avançait la file au bout de trois sondes
+                // et interrompait l'attente : fin coupée, `stop` jamais envoyé.
+                fin_jouee.attendre_avant_stop(&device_name).await;
                 chain_exhausted.store(true, Ordering::SeqCst);
             }
 
@@ -3535,6 +3659,7 @@ impl OutputTarget for OaatOutput {
         // next track, so this resets the flag between tracks; the native DSD
         // path re-sets it if the next track is also native DSD.
         self.native_dsd_active.store(false, Ordering::SeqCst);
+        crate::outputs::repli_dsd_oaat_8486::effacer_repli(&self.diag.dsd);
         self.direct_pcm_active.store(false, Ordering::SeqCst);
         self.chain_exhausted.store(false, Ordering::SeqCst);
         *self.current_uri.lock().await = None;

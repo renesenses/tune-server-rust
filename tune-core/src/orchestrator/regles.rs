@@ -777,14 +777,23 @@ pub(super) fn cible_encodable(
 /// annonçait « 192 → 96 kHz ». Rééchantillonner demande de décoder, donc de
 /// pré-transcoder : c'est ce bras-ci, celui qui décode déjà.
 ///
+/// Une QUATRIÈME raison depuis le silence de Sevy Tabroc (#8188, fil 2714) :
+/// le plafond 16 bits de la zone (`dlna_cap_16bit` ou quirk `force_16bit`).
+/// Un Ruark R3 ou un Roberts Stream 94i+ (Frontier Silicon) annoncent
+/// `audio/flac` mais ne décodent que 16 bits : le FLAC 24/96 de Qobuz relayé
+/// verbatim y jouait du SILENCE, réglage coché. Réduire la profondeur demande
+/// de décoder, donc de pré-transcoder. #6909 ne l'avait branché que sur le
+/// bras DASH.
+///
 /// Fonction pure : la matrice de décision se teste sans orchestrateur, comme
 /// `use_file_transcode_for`.
 pub(super) fn streaming_needs_pretranscode(
     renderer_supports_mime: bool,
     dsp_active: bool,
     plafond_de_zone: bool,
+    plafond_16_bits: bool,
 ) -> bool {
-    !renderer_supports_mime || dsp_active || plafond_de_zone
+    !renderer_supports_mime || dsp_active || plafond_de_zone || plafond_16_bits
 }
 
 /// Le plafond de fréquence de la zone appliqué à un flux de SERVICE (Qobuz,
@@ -1124,6 +1133,10 @@ pub enum TransportDsd {
     /// #5643 — DSD natif : la sortie locale ASIO reçoit les octets DSD
     /// eux-mêmes (`DsdU8`), sans DoP, sans volume ni DSP. Seule
     /// [`decider_dsd_natif_local`] y mène, jamais [`transport_dsd`] seul.
+    ///
+    /// #8248 — même chose sur une sortie locale ALSA `hw:` dont le pilote
+    /// offre `DSD_U32_BE`/`DSD_U32_LE` : la sortie range les octets en mots
+    /// de 32 bits (`audio::dsd_u32_alsa`), sans toucher un bit.
     Natif,
 }
 
@@ -1177,8 +1190,9 @@ pub fn transport_dsd(is_local: bool, is_network: bool, dsd_mode: &str) -> Transp
 /// « natif », au moment de résoudre une piste DSD.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SortieDsdLocale {
-    /// La sortie ne passe pas par le bras ASIO exclusif (WASAPI, partagé,
-    /// macOS, Linux/ALSA — ce dernier reste hors périmètre de #5643).
+    /// La sortie n'a pas de bras DSD natif : ni ASIO exclusif, ni PCM ALSA
+    /// `hw:` (WASAPI, partagé, macOS, PCM ALSA logiciel `plughw:`/`default`/
+    /// `dmix:`/PipeWire).
     NonAsio,
     /// Bras ASIO, capacité pas encore sondée et impossible à sonder
     /// maintenant : le verrou de périphérique est tenu par un flux en cours.
@@ -1186,6 +1200,14 @@ pub enum SortieDsdLocale {
     /// Bras ASIO, pilote sondé : les cadences DSD qu'il a déclarées (vide =
     /// pilote PCM seulement).
     Asio { cadences: Vec<u32> },
+    /// #8248 — PCM ALSA `hw:`, capacité pas encore sondée et impossible à
+    /// sonder maintenant : le PCM est tenu (par un autre flux ou un autre
+    /// programme). Même règle qu'ASIO : on ne force pas le pilote.
+    AlsaNonSondee,
+    /// #8248 — PCM ALSA `hw:` sondé : les cadences DSD qu'il accepte en
+    /// `DSD_U32` (vide = pilote sans DSD natif, le cas d'un DAC sans quirk
+    /// dans le noyau), et le nombre de voies sondé.
+    Alsa { cadences: Vec<u32>, voies: u16 },
 }
 
 /// #5643 — pourquoi une zone « natif » part quand même en DoP. Chaque motif
@@ -1208,6 +1230,9 @@ pub enum MotifDsdServiEnDop {
     /// catalogue) interdit cette cadence — la même règle que le DoP : le
     /// débit DoP équivalent (cadence / 16) doit tenir sous le plafond.
     PlafondDeZone,
+    /// #8248 — le pilote ALSA offre le DSD natif, mais pas sur le nombre de
+    /// voies du fichier (un multicanal sur un DAC stéréo).
+    VoiesNonDeclarees,
 }
 
 impl MotifDsdServiEnDop {
@@ -1220,6 +1245,7 @@ impl MotifDsdServiEnDop {
             Self::CadenceInconnue => "cadence_du_fichier_inconnue",
             Self::CadenceNonDeclaree => "cadence_non_declaree_par_le_pilote",
             Self::PlafondDeZone => "plafond_de_cadence_de_la_zone",
+            Self::VoiesNonDeclarees => "voies_non_declarees_par_le_pilote",
         }
     }
 }
@@ -1233,9 +1259,9 @@ impl MotifDsdServiEnDop {
 ///
 /// - `cadence_fichier` : la cadence DSD lue dans l'en-tête du fichier ;
 /// - `plafond_zone` : le plafond de cadence de la zone, déjà combiné avec le
-///   catalogue (`zone_max_sample_rate`). Il s'applique comme au DoP, sur le
-///   débit équivalent `cadence / 16` : une zone que le DoP n'a pas le droit de
-///   servir à cette cadence ne la reçoit pas non plus en natif ;
+///   catalogue (`zone_max_sample_rate`). Sur ASIO, il s'applique comme au
+///   DoP, sur le débit équivalent `cadence / 16` ; sur ALSA `DSD_U32`, sur la
+///   cadence réellement ouverte, `cadence / 32` (#8248) ;
 /// - `strict` : « bit-perfect strict ». Le DSD natif est bit-perfect par
 ///   construction, le mode strict ne l'empêche donc pas ; sur repli, c'est le
 ///   chemin DoP qui applique le strict comme avant (refus si le plafond
@@ -1249,8 +1275,10 @@ pub fn decider_dsd_natif_local(
     let _ = strict;
     let cadences = match sortie {
         SortieDsdLocale::NonAsio => return Err(MotifDsdServiEnDop::SortieNonAsio),
-        SortieDsdLocale::AsioNonSondee => return Err(MotifDsdServiEnDop::CapaciteNonSondee),
-        SortieDsdLocale::Asio { cadences } => cadences,
+        SortieDsdLocale::AsioNonSondee | SortieDsdLocale::AlsaNonSondee => {
+            return Err(MotifDsdServiEnDop::CapaciteNonSondee);
+        }
+        SortieDsdLocale::Asio { cadences } | SortieDsdLocale::Alsa { cadences, .. } => cadences,
     };
     if cadences.is_empty() {
         return Err(MotifDsdServiEnDop::PiloteSansDsd);
@@ -1261,8 +1289,35 @@ pub fn decider_dsd_natif_local(
     if !cadences.contains(&cadence) {
         return Err(MotifDsdServiEnDop::CadenceNonDeclaree);
     }
-    if plafond_zone.is_some_and(|max| cadence / 16 > max) {
+    // #8248 (décision de Bertrand du 12/11) — en `DSD_U32`, le PCM ALSA
+    // s'ouvre à cadence / 32 (DSD512 : 705,6 ou 768 kHz) : c'est cette
+    // cadence-là que le plafond de la zone doit borner, pas le débit DoP
+    // équivalent. ASIO natif et DoP gardent la règle de #5643 (cadence / 16).
+    let cadence_bornee = match sortie {
+        SortieDsdLocale::Alsa { .. } => crate::audio::dsd_u32_alsa::cadence_de_trame(cadence),
+        _ => cadence / 16,
+    };
+    if plafond_zone.is_some_and(|max| cadence_bornee > max) {
         return Err(MotifDsdServiEnDop::PlafondDeZone);
+    }
+    Ok(())
+}
+
+/// #8248 — [`decider_dsd_natif_local`], plus le nombre de voies du fichier :
+/// une sortie ALSA a été sondée sur un nombre de voies précis, et le pilote
+/// refuserait les autres. ASIO ouvre les voies du fichier : inchangé.
+pub fn decider_dsd_natif_local_voies(
+    sortie: &SortieDsdLocale,
+    cadence_fichier: Option<u32>,
+    canaux_fichier: Option<u32>,
+    plafond_zone: Option<u32>,
+    strict: bool,
+) -> Result<(), MotifDsdServiEnDop> {
+    decider_dsd_natif_local(sortie, cadence_fichier, plafond_zone, strict)?;
+    if let SortieDsdLocale::Alsa { voies, .. } = sortie
+        && canaux_fichier != Some(u32::from(*voies))
+    {
+        return Err(MotifDsdServiEnDop::VoiesNonDeclarees);
     }
     Ok(())
 }
@@ -1414,6 +1469,27 @@ pub(super) fn agent_relance_a_la_position(
 ) -> bool {
     output_device_id.is_some_and(|id| id.starts_with(PREFIXE_SORTIE_AGENT_TUNE))
         && seek_ms.is_some_and(|ms| ms > 0)
+}
+
+/// `output_type` d'une zone AirPlay 2 (`tune-server/src/discovery_setup.rs`).
+pub const TYPE_SORTIE_AIRPLAY2: &str = "airplay2";
+
+/// #7972 — faut-il servir à une zone AirPlay 2 un flux DÉCODÉ qui commence à
+/// la position demandée ?
+///
+/// Le démon AirPlay 2 lit un fichier d'un bout à l'autre et ne sait pas s'y
+/// déplacer (`Airplay2Output::seek` refuse). Quand le récepteur a fermé sa
+/// connexion pendant une pause, la reprise rejoue la piste à la position
+/// (`retablir_a_la_position`, #7921). Mais une piste de la bibliothèque en
+/// passthrough part dans une session FICHIER servie depuis l'octet 0 : la
+/// musique repartait à 0:00. Même cas, même remède que l'agent (#6370) : une
+/// relance à une position non nulle prend le bras qui décode à partir de
+/// `seek_ms`. Une lecture depuis le début ne change pas de bras.
+pub(super) fn airplay2_relance_a_la_position(
+    zone_output_type: Option<&str>,
+    seek_ms: Option<u64>,
+) -> bool {
+    zone_output_type == Some(TYPE_SORTIE_AIRPLAY2) && seek_ms.is_some_and(|ms| ms > 0)
 }
 
 /// Une zone navigateur doit-elle recevoir la source décodée en WAV ? Oui pour
@@ -1726,6 +1802,25 @@ mod lecture_locale_tests {
             Some(2_000)
         ));
         assert!(!agent_relance_a_la_position(None, Some(2_000)));
+    }
+
+    #[test]
+    fn seule_une_relance_a_une_position_non_nulle_decode_pour_airplay2_7972() {
+        assert!(airplay2_relance_a_la_position(
+            Some("airplay2"),
+            Some(139_000)
+        ));
+        assert!(
+            !airplay2_relance_a_la_position(Some("airplay2"), Some(0)),
+            "une lecture depuis le début garde son bras"
+        );
+        assert!(!airplay2_relance_a_la_position(Some("airplay2"), None));
+        assert!(
+            !airplay2_relance_a_la_position(Some("airplay"), Some(139_000)),
+            "AirPlay 1 n'est pas concerné"
+        );
+        assert!(!airplay2_relance_a_la_position(Some("dlna"), Some(139_000)));
+        assert!(!airplay2_relance_a_la_position(None, Some(139_000)));
     }
 
     #[test]

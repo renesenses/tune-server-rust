@@ -432,3 +432,210 @@ fn sans_titre_du_service_rien_n_est_ajoute() {
     ajouter_mes_plus_ecoutes(&b, "qobuz", &mut items);
     assert!(items.is_empty(), "l'artiste n'est nommé par aucun titre");
 }
+
+// ---------------------------------------------------------------------------
+// Recette du .18, rc12 (13/11/2026) — un CD sorti du lecteur ne désigne
+// jamais un titre phare.
+// ---------------------------------------------------------------------------
+
+const GENESIS: &str = "Genesis";
+
+/// Le top Qobuz de Genesis : rien de « A Trick of the Tail ».
+fn top_qobuz_genesis() -> Vec<Value> {
+    vec![
+        json!({"source_id": "453676644", "title": "The Serpent (2026 Mix)",
+               "artist_name": GENESIS, "duration_ms": 280_000}),
+        json!({"source_id": "360752992", "title": "The Lamb Lies Down on Broadway",
+               "artist_name": GENESIS, "duration_ms": 290_000}),
+    ]
+}
+
+/// L'historique du .18 : « Dance on a Volcano » 11 fois sur le CD, 10 fois
+/// en fichier (le CD extrait, piste retrouvée dans la bibliothèque) ;
+/// « Squonk » seulement sur le CD et sur un serveur UPnP — aucun catalogue,
+/// aucun fichier.
+fn historique_genesis(b: &Arc<dyn DbBackend>) -> i64 {
+    for _ in 0..11 {
+        ecouter(
+            b,
+            "cd",
+            Some("xA6kQVeYfzh._3s2lYEibSII2pg-/1"),
+            "Dance on a Volcano",
+            GENESIS,
+            357_626,
+        );
+    }
+    b.execute("INSERT INTO artists (name) VALUES (?1)", &[&GENESIS])
+        .unwrap();
+    b.execute(
+        "INSERT INTO tracks (title, artist_id, duration_ms) \
+         VALUES ('Dance on a Volcano', (SELECT id FROM artists WHERE name = ?1), 357625)",
+        &[&GENESIS],
+    )
+    .unwrap();
+    let fichier = b
+        .query_one(
+            "SELECT id FROM tracks WHERE title = 'Dance on a Volcano'",
+            &[],
+        )
+        .unwrap()
+        .unwrap()[0]
+        .as_i64()
+        .unwrap();
+    for _ in 0..10 {
+        ecouter(b, "local", None, "Dance on a Volcano", GENESIS, 357_625);
+    }
+    for _ in 0..4 {
+        ecouter(
+            b,
+            "cd",
+            Some("xA6kQVeYfzh._3s2lYEibSII2pg-/3"),
+            "Squonk",
+            GENESIS,
+            390_440,
+        );
+    }
+    for _ in 0..3 {
+        ecouter(
+            b,
+            "upnp",
+            Some("66386d382482aabf"),
+            "Squonk",
+            GENESIS,
+            390_440,
+        );
+    }
+    fichier
+}
+
+#[test]
+fn un_titre_ecoute_sur_cd_se_designe_par_son_fichier_jamais_par_le_cd() {
+    let b = base();
+    let fichier = historique_genesis(&b);
+    let mut items = top_qobuz_genesis();
+    ajouter_mes_plus_ecoutes(&b, "qobuz", &mut items);
+
+    assert!(
+        items
+            .iter()
+            .all(|v| v["source"] != json!("cd") && v["source"] != json!("upnp")),
+        "aucun titre phare ne désigne le CD ni un serveur UPnP : {items:?}"
+    );
+    let volcano = items
+        .iter()
+        .find(|v| v["title"] == json!("Dance on a Volcano"))
+        .expect("le titre écouté reste dans la liste, par son fichier");
+    assert_eq!(volcano["source"], json!("local"));
+    assert_eq!(
+        volcano["id"],
+        json!(fichier),
+        "désigné par la piste extraite"
+    );
+    assert!(
+        !titres(&items).contains(&"Squonk"),
+        "écouté seulement sur le CD et en UPnP : rien ne le rejoue, pas ajouté"
+    );
+}
+
+#[test]
+fn seules_les_sources_de_catalogue_designent_un_titre() {
+    for s in [
+        "qobuz", "tidal", "deezer", "spotify", "youtube", "amazon", "bandcamp", " Qobuz ",
+    ] {
+        assert!(est_une_source_de_catalogue(s), "{s}");
+    }
+    for s in [
+        "cd",
+        "upnp",
+        "radio",
+        "podcast",
+        "upload",
+        "entree-audio",
+        "circle",
+        "local",
+        "",
+    ] {
+        assert!(!est_une_source_de_catalogue(s), "{s}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// web#3045 (fil 2822, rc11) — page artiste de Supertramp : deux ajouts
+// désignaient le même enregistrement, et la liste du client se figeait.
+// ---------------------------------------------------------------------------
+
+const SUPERTRAMP: &str = "Supertramp";
+
+fn top_qobuz_supertramp() -> Vec<Value> {
+    vec![
+        json!({"source_id": "q-30", "title": "Breakfast in America",
+               "artist_name": SUPERTRAMP, "duration_ms": 158_000}),
+        json!({"source_id": "q-31", "title": "Goodbye Stranger",
+               "artist_name": SUPERTRAMP, "duration_ms": 350_000}),
+    ]
+}
+
+/// La clé de la désignation, comme le client l'indexe.
+fn cle(v: &Value) -> String {
+    let source = v["source"].as_str().unwrap_or("qobuz");
+    let id = if v["id"].is_null() {
+        v["source_id"].to_string()
+    } else {
+        v["id"].to_string()
+    };
+    format!("{source}:{id}")
+}
+
+#[test]
+fn deux_ecoutes_d_un_meme_enregistrement_a_des_durees_ecartees_ne_l_ajoutent_qu_une_fois() {
+    let b = base();
+    b.execute("INSERT INTO artists (name) VALUES (?1)", &[&SUPERTRAMP])
+        .unwrap();
+    b.execute(
+        "INSERT INTO tracks (title, artist_id, duration_ms) \
+         VALUES ('The Logical Song', (SELECT id FROM artists WHERE name = ?1), 248000)",
+        &[&SUPERTRAMP],
+    )
+    .unwrap();
+    // Le même fichier, écouté à deux durées écartées de plus de 3 s (une
+    // tranche CUE, puis le fichier entier) : deux morceaux, une seule piste.
+    for _ in 0..4 {
+        ecouter(&b, "local", None, "The Logical Song", SUPERTRAMP, 248_000);
+    }
+    for _ in 0..3 {
+        ecouter(&b, "local", None, "The Logical Song", SUPERTRAMP, 262_000);
+    }
+    // Le même titre Qobuz, sous deux durées : le même enregistrement.
+    for _ in 0..2 {
+        ecouter(&b, "tidal", Some("t-7"), "Dreamer", SUPERTRAMP, 211_000);
+    }
+    ecouter(&b, "tidal", Some("t-7"), "Dreamer", SUPERTRAMP, 230_000);
+    // Le titre phare du service, réécouté sous une autre durée : déjà là.
+    ecouter(
+        &b,
+        "qobuz",
+        Some("q-31"),
+        "Goodbye Stranger (Live)",
+        SUPERTRAMP,
+        400_000,
+    );
+
+    let mut items = top_qobuz_supertramp();
+    ajouter_mes_plus_ecoutes(&b, "qobuz", &mut items);
+
+    let mut cles: Vec<String> = items.iter().map(cle).collect();
+    let n = cles.len();
+    cles.sort();
+    cles.dedup();
+    assert_eq!(cles.len(), n, "aucune désignation en double : {items:?}");
+    assert_eq!(
+        titres(&items),
+        [
+            "Breakfast in America",
+            "Goodbye Stranger",
+            "The Logical Song",
+            "Dreamer"
+        ],
+        "chaque enregistrement une seule fois, le plus écouté d'abord"
+    );
+}

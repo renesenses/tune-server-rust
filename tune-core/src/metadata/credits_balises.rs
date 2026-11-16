@@ -19,6 +19,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::balises_classique::ModeBand;
 use super::credits_mb::{LigneCredit, role_canonique};
 use super::instruments::canoniser_instrument;
 use super::source_des_credits::BALISES;
@@ -55,10 +56,13 @@ pub const CLES_DE_CREDIT: [(&str, &str); 12] = [
 
 /// Les clés brutes d'un ensemble ou d'un orchestre (Vorbis, `TXXX:` ID3,
 /// atome MP4 libre) : lofty n'en connaît aucune.
-pub const CLES_ENSEMBLE: [&str; 2] = ["ENSEMBLE", "ORCHESTRA"];
+///
+/// #8325 — CHOIR (Vorbis, `TXXX:CHOIR`, `----:com.apple.iTunes:CHOIR`) :
+/// le chœur, rangé avec l'orchestre (testeur HCFR, %choir%).
+pub const CLES_ENSEMBLE: [&str; 3] = ["ENSEMBLE", "ORCHESTRA", "CHOIR"];
 
 /// Ajoute `valeur` à la clé `cle` de `meta`, jointe par « ; », sans doublon.
-fn ajouter(meta: &mut HashMap<String, String>, cle: &str, valeur: &str) {
+pub(crate) fn ajouter(meta: &mut HashMap<String, String>, cle: &str, valeur: &str) {
     let valeur = valeur.trim();
     if valeur.is_empty() {
         return;
@@ -79,7 +83,7 @@ fn ajouter(meta: &mut HashMap<String, String>, cle: &str, valeur: &str) {
 /// Complète les métadonnées étendues par les clés brutes du fichier
 /// (`balises_brutes`) que lofty ne range sous aucun `ItemKey` :
 ///
-/// - ENSEMBLE / ORCHESTRA → `ensemble` ;
+/// - ENSEMBLE / ORCHESTRA / CHOIR → `ensemble` ;
 /// - la trame ID3v2.4 TMCL, « instrument: nom ; instrument: nom », → une
 ///   entrée « nom (instrument) » de `performer`, la forme Vorbis ;
 /// - l'atome MP4 `----:com.apple.iTunes:ARRANGER` → `arranger`.
@@ -87,14 +91,31 @@ pub fn completer_par_les_cles_brutes(
     meta: &mut HashMap<String, String>,
     brutes: &[(String, String)],
 ) {
+    let defaut: Vec<String> = CLES_ENSEMBLE.iter().map(|s| s.to_string()).collect();
+    completer_par_les_cles_brutes_selon(meta, brutes, &defaut);
+}
+
+/// [`completer_par_les_cles_brutes`], l'ensemble lu sous les clés
+/// `cles_ensemble` du réglage « Balises du classique »
+/// ([`super::balises_classique`]) au lieu de [`CLES_ENSEMBLE`].
+pub fn completer_par_les_cles_brutes_selon(
+    meta: &mut HashMap<String, String>,
+    brutes: &[(String, String)],
+    cles_ensemble: &[String],
+) {
+    let ensemble: Vec<String> = cles_ensemble
+        .iter()
+        .map(|c| super::balises_brutes::nom_de_cle(c))
+        .collect();
     for (cle, valeur) in brutes {
         let nom = super::balises_brutes::nom_de_cle(cle);
-        match nom.as_str() {
-            "ENSEMBLE" | "ORCHESTRA" => {
-                for v in valeur.split(';') {
-                    ajouter(meta, "ensemble", v);
-                }
+        if ensemble.contains(&nom) {
+            for v in valeur.split(';') {
+                ajouter(meta, "ensemble", v);
             }
+            continue;
+        }
+        match nom.as_str() {
             "TMCL" => {
                 for paire in valeur.split(" ; ") {
                     let Some((instrument, personne)) = paire.split_once(':') else {
@@ -118,6 +139,71 @@ pub fn completer_par_les_cles_brutes(
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// #8325 — la clé brute BAND (Vorbis, APE, `TXXX:BAND`, atome MP4 libre).
+///
+/// foobar2000 et Mp3tag appellent « band » la trame ID3 TPE2, c'est-à-dire
+/// l'ARTISTE D'ALBUM ; un classique range au contraire son orchestre sous
+/// BAND (« %band% » à côté de « %conductor% »). BAND n'est donc lu comme
+/// ensemble que s'il DIFFÈRE de l'artiste d'album ET de l'artiste de la piste
+/// du fichier : égal à l'un d'eux, c'est un artiste sous un autre nom (le
+/// groupe d'un disque de rock), et il n'entre pas dans la facette.
+/// L'artiste d'album n'est jamais touché ici.
+pub const CLE_BAND: &str = "BAND";
+
+/// Ajoute à `ensemble` les valeurs BAND de `brutes` qui ne sont aucun des
+/// `artistes` (album, piste ; casse ignorée). Voir [`CLE_BAND`].
+///
+/// Exception CLASSIQUE (testeur HCFR : chez lui %band% est TOUJOURS
+/// l'orchestre ou l'ensemble, et vaut souvent l'artiste d'album) : quand la
+/// piste porte un compositeur ET (un chef OU une œuvre), BAND est l'ensemble
+/// même s'il égale un artiste. L'artiste d'album n'est jamais écrit ici.
+pub fn completer_par_band(
+    meta: &mut HashMap<String, String>,
+    brutes: &[(String, String)],
+    artistes: &[Option<&str>],
+) {
+    completer_par_band_selon(meta, brutes, artistes, ModeBand::Classical);
+}
+
+/// [`completer_par_band`] selon le choix BAND du réglage « Balises du
+/// classique » : `Classical` est le comportement ci-dessus (défaut),
+/// `IfDifferent` retire l'exception classique, `Ignored` ne lit jamais BAND.
+pub fn completer_par_band_selon(
+    meta: &mut HashMap<String, String>,
+    brutes: &[(String, String)],
+    artistes: &[Option<&str>],
+    mode: ModeBand,
+) {
+    if mode == ModeBand::Ignored {
+        return;
+    }
+    let present = |k: &str| meta.get(k).is_some_and(|v| !v.trim().is_empty());
+    let classique = mode == ModeBand::Classical
+        && present("composer")
+        && (present("conductor") || present("work"));
+    let artistes: Vec<String> = if classique {
+        Vec::new()
+    } else {
+        artistes
+            .iter()
+            .flatten()
+            .map(|a| a.trim().to_lowercase())
+            .filter(|a| !a.is_empty())
+            .collect()
+    };
+    for (cle, valeur) in brutes {
+        if super::balises_brutes::nom_de_cle(cle) != CLE_BAND {
+            continue;
+        }
+        if artistes.contains(&valeur.trim().to_lowercase()) {
+            continue;
+        }
+        for v in valeur.split(';') {
+            ajouter(meta, "ensemble", v);
         }
     }
 }

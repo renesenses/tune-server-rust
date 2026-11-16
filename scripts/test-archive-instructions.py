@@ -59,6 +59,9 @@ class ArchiveInstructions(unittest.TestCase):
                     # #6872 : librespot et sa licence MIT, à côté du serveur.
                     "runner/lrs/bin/librespot": b"librespot fixture\n",
                     "runner/lrs/LIBRESPOT-LICENSE.txt": b"mit fixture\n",
+                    "runner/lrs/LIBRESPOT-THIRD-PARTY.txt": b"third-party fixture\n",
+                    # #8466 : fpcalc (Chromaprint), à côté du serveur.
+                    "runner/fpcalc/fpcalc": b"fpcalc fixture\n",
                 })
                 expected.update({
                     "airplay-daemon": b"daemon fixture\n",
@@ -66,6 +69,8 @@ class ArchiveInstructions(unittest.TestCase):
                     "FFMPEG-LICENSE.txt": b"license fixture\n",
                     "librespot": b"librespot fixture\n",
                     "LIBRESPOT-LICENSE.txt": b"mit fixture\n",
+                    "LIBRESPOT-THIRD-PARTY.txt": b"third-party fixture\n",
+                    "fpcalc": b"fpcalc fixture\n",
                 })
             for name, data in inputs.items():
                 path = root / name

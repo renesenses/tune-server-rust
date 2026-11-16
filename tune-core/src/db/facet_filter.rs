@@ -50,16 +50,21 @@ use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 
 /// Les facettes dont une piste peut porter plusieurs valeurs à la fois, et
 /// qui acceptent donc l'opérateur « Et » (#2108) — par leur nom de paramètre
-/// de requête.
+/// de requête. Le genre est conservé pour les URL enregistrées : depuis
+/// #5638, deux genres principaux distincts en ET ne rendent aucune piste.
 ///
 /// Les autres (année, format, fréquence, profondeur, artiste de la piste,
 /// note, DR, année d'enregistrement, provenance) n'ont qu'UNE valeur par
 /// piste : deux valeurs en ET n'y rendraient jamais rien. `?all_of=year` est
 /// donc IGNORÉ, et la facette reste en « Ou » — un filtre qui vide la liste à
 /// coup sûr serait un piège, pas une option.
-pub const FACETTES_COMBINABLES_EN_ET: [&str; 10] = [
+pub const FACETTES_COMBINABLES_EN_ET: [&str; 12] = [
     "genre",
     "composer",
+    // #8325 — deux chefs (chef et chef de chœur), un chœur et un orchestre :
+    // une piste peut en porter plusieurs.
+    "conductor",
+    "ensemble",
     "label",
     "instrument",
     "country",
@@ -110,16 +115,14 @@ pub fn combiner<T>(
     }
 }
 
-/// Genre : la colonne `t.genre` OU le tableau JSON `t.genres` (#1821 : sans
-/// la casse des DEUX côtés). Les valeurs sont empilées dans l'ordre de sortie
-/// des marqueurs : les N du `IN`, puis les N motifs `LIKE`.
+/// #5638 : seul le genre principal classe une piste dans la facette Genre.
+/// Les genres secondaires restent des métadonnées, sans élargir le filtre.
 pub fn bloc_genres(ph: &mut Placeholders, valeurs: &[String]) -> Option<Predicat> {
-    let n = valeurs.len();
-    let in_part = ph.in_list_ci("t.genre", n)?;
-    let like_part = ph.or_like_ci("t.genres", n)?;
-    let mut p: Vec<SqlValue> = valeurs.iter().map(|g| SqlValue::Text(g.clone())).collect();
-    p.extend(valeurs.iter().map(|g| SqlValue::Text(format!("%\"{g}\"%"))));
-    Some((format!("({in_part} OR {like_part})"), p))
+    let condition = ph.in_list_ci("t.genre", valeurs.len())?;
+    Some((
+        condition,
+        valeurs.iter().map(|g| SqlValue::Text(g.clone())).collect(),
+    ))
 }
 
 /// Facette « contient » (label, compositeur) : `LIKE '%v%'` sans la casse.
@@ -164,6 +167,63 @@ pub fn bloc_metadonnee(
             valeurs.iter().map(|v| SqlValue::Text(v.clone())).collect(),
         ))
     }
+}
+
+/// #8090 — le pays d'un artiste n'est LU que s'il vient de son MBID courant
+/// (`artists.country_mbid`), et s'il n'est pas vide (`''` : MusicBrainz n'en
+/// donne aucun). Un MBID changé ou retiré rend le pays caduc. `pa_ar` est
+/// l'alias de `artists` dans les requêtes des facettes et du filtre.
+pub const PAYS_ARTISTE_VALIDE: &str = "pa_ar.country_mbid IS NOT NULL \
+     AND pa_ar.country_mbid = LOWER(TRIM(pa_ar.musicbrainz_id)) \
+     AND pa_ar.country IS NOT NULL AND pa_ar.country <> ''";
+
+/// #8090 — pays de l'ARTISTE PRINCIPAL de l'album (`albums.artist_id`), sans
+/// la casse : la piste appartient à un album dont l'artiste est de l'un des
+/// pays choisis. Une piste sans album n'a pas de pays d'artiste.
+pub fn bloc_pays_artiste(ph: &mut Placeholders, valeurs: &[String]) -> Option<Predicat> {
+    let c = ph.in_list_ci("pa_ar.country", valeurs.len())?;
+    Some((
+        format!(
+            "t.album_id IN (SELECT pa_al.id FROM albums pa_al \
+             JOIN artists pa_ar ON pa_ar.id = pa_al.artist_id \
+             WHERE {PAYS_ARTISTE_VALIDE} AND {c})"
+        ),
+        valeurs.iter().map(|v| SqlValue::Text(v.clone())).collect(),
+    ))
+}
+
+/// #8668 — le pays d'ÉDITION qu'une passe de fond a lu sur la release
+/// MusicBrainz de l'album (`albums.release_country`), valable seulement s'il
+/// vient de son identifiant de release COURANT et n'est pas vide. `pe_al` est
+/// l'alias de `albums`. Un identifiant changé ou retiré le rend caduc.
+pub const PAYS_EDITION_MB_VALIDE: &str = "pe_al.release_country_mbid IS NOT NULL \
+     AND pe_al.release_country_mbid = LOWER(TRIM(pe_al.musicbrainz_release_id)) \
+     AND pe_al.release_country IS NOT NULL AND pe_al.release_country <> ''";
+
+/// #8668 — la BALISE prime : aucune piste de l'album `pe_al` ne porte de
+/// RELEASECOUNTRY. Le pays lu sur MusicBrainz ne sert qu'à ces albums-là ;
+/// un album balisé n'est jamais compté sous deux pays.
+pub const SANS_PAYS_DE_BALISE: &str = "NOT EXISTS (SELECT 1 FROM tracks pe_t \
+     JOIN track_metadata pe_tm ON pe_tm.track_id = pe_t.id \
+     WHERE pe_t.album_id = pe_al.id AND pe_tm.key = 'release_country' AND pe_tm.value <> '')";
+
+/// #8668 — le filtre « pays d'édition » (`?country=`) : la balise
+/// RELEASECOUNTRY de la piste, telle qu'écrite (comme avant), OU, pour un
+/// album sans balise, le pays de sa release MusicBrainz, sans la casse.
+pub fn bloc_pays_edition(ph: &mut Placeholders, valeurs: &[String]) -> Option<Predicat> {
+    let balise = ph.in_list("tm.value", valeurs.len())?;
+    let mb = ph.in_list_ci("pe_al.release_country", valeurs.len())?;
+    let mut liees: Vec<SqlValue> = valeurs.iter().map(|v| SqlValue::Text(v.clone())).collect();
+    liees.extend(valeurs.iter().map(|v| SqlValue::Text(v.clone())));
+    Some((
+        format!(
+            "(EXISTS (SELECT 1 FROM track_metadata tm \
+             WHERE tm.track_id = t.id AND tm.key = 'release_country' AND {balise}) \
+             OR t.album_id IN (SELECT pe_al.id FROM albums pe_al \
+             WHERE {PAYS_EDITION_MB_VALIDE} AND {mb} AND {SANS_PAYS_DE_BALISE}))"
+        ),
+        liees,
+    ))
 }
 
 /// Liste de lecture, par son nom, sans la casse.
@@ -523,7 +583,7 @@ impl Placeholders {
 /// changer — la règle de liaison de SQLite (voir le piège n°2) est intacte.
 ///
 /// Pour `n <= 2` le résultat est mot pour mot celui d'avant.
-fn ou_equilibre(mut parts: Vec<String>) -> String {
+pub(crate) fn ou_equilibre(mut parts: Vec<String>) -> String {
     debug_assert!(!parts.is_empty(), "appelé sur une liste non vide seulement");
     while parts.len() > 1 {
         let mut etage = Vec::with_capacity(parts.len().div_ceil(2));
@@ -1282,8 +1342,17 @@ pub struct TrackFilter {
     /// (CRD-6). Une facette de jointure : le prédicat vit dans
     /// [`instrument_exists`], jumeau de `dr_album_in`.
     pub instruments: Vec<String>,
+    /// #8325 — chefs d'orchestre, ensembles / orchestres et œuvres, lus dans
+    /// les magasins ouverts (`track_credits`, `track_metadata`,
+    /// `album_metadata`) : voir [`super::facettes_classiques`].
+    pub conductors: Vec<String>,
+    pub ensembles: Vec<String>,
+    pub works: Vec<String>,
     pub artists: Vec<String>,
     pub countries: Vec<String>,
+    /// #8090 — pays de l'artiste principal de l'album (`?artist_country=FR`),
+    /// lu sur MusicBrainz : voir [`bloc_pays_artiste`].
+    pub artist_countries: Vec<String>,
     pub moods: Vec<String>,
     pub source_medias: Vec<String>,
     pub ratings: Vec<i64>,
@@ -1372,8 +1441,12 @@ impl TrackFilter {
             || !self.labels.is_empty()
             || !self.composers.is_empty()
             || !self.instruments.is_empty()
+            || !self.conductors.is_empty()
+            || !self.ensembles.is_empty()
+            || !self.works.is_empty()
             || !self.artists.is_empty()
             || !self.countries.is_empty()
+            || !self.artist_countries.is_empty()
             || !self.moods.is_empty()
             || !self.source_medias.is_empty()
             || !self.ratings.is_empty()

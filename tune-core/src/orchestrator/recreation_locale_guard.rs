@@ -48,6 +48,12 @@ fn la_sortie_recreee_ne_code_pas_les_reglages_en_dur() {
          point 3 de #1770. Passer par `with_options` avec les valeurs lues."
     );
     assert!(
+        corps.contains("self.exclusif_de_la_sortie_recreee(device_id,"),
+        "`recreate_local_and_play` ne consulte plus le réglage de la ZONE : \
+         une zone réglée « partagé » repartirait en exclusif à chaque \
+         recréation de sa sortie, sur la foi du réglage de machine (#3245)."
+    );
+    assert!(
         corps.contains("exclusive_mode,") && corps.contains("&audio_backend,"),
         "les valeurs lues ne sont plus celles remises au constructeur : \
          les lire pour ne pas s'en servir ne corrige rien (#1770)."

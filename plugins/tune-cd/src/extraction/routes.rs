@@ -10,6 +10,16 @@
 //! * `GET    /extractions/{id}`     — suivre une extraction ;
 //! * `DELETE /extractions/{id}`     — l'annuler.
 //!
+//! #8514 — `POST /extractions` avec `"depuis_memoire": true` : « Enregistrer
+//! dans la bibliothèque » le disque ENTIER déjà chargé en mémoire (#6043),
+//! sans relire le lecteur. Même plan, même encodeur, mêmes balises, même
+//! pochette, même nommage, même scan ciblé ; la lecture d'une zone continue
+//! (elle se sert dans la même mémoire) et la mémoire reste chargée. Refus
+//! `409 memoire_incomplete` si aucun disque n'est entier en mémoire, et
+//! `409 memoire_secteurs_perdus` (avec `secteurs_perdus`) si des secteurs
+//! sont restés illisibles au chargement : la mémoire y tient du silence,
+//! l'extraction depuis le lecteur les relira.
+//!
 //! Le disque (`GET /disque`) et l'éjection (`POST /ejecter`) sont ceux du
 //! greffon ; l'éjection et la lecture refusent pendant une extraction.
 
@@ -38,7 +48,8 @@ use super::{
     StatutPiste, StatutTravail, Travail, Verification,
 };
 use crate::discid::disc_id;
-use crate::lecteur::{Presence, plateforme_prise_en_charge};
+use crate::lecteur::{LecteurDisque, Presence, plateforme_prise_en_charge};
+use crate::memoire::{Chargement, LecteurMemoire};
 use crate::routes::{EtatRoutes, Refus, refus, toc_ou_refus, zones_qui_jouent_le_disque};
 
 /// Longueur maximale d'un texte fourni (artiste, album, titre).
@@ -181,6 +192,9 @@ fn etat_des_reglages(ex: &Extractions) -> Value {
         "destination": destination,
         "destination_source": source,
         "emplacements": destination::emplacements(ex.backend.as_ref()),
+        // #8522 — en échantillons stéréo, pour la vérification AccurateRip.
+        "decalage_lecteur": crate::accuraterip_base::decalage_regle(ex.backend.clone()),
+        "decalage_max": crate::accuraterip_base::DECALAGE_MAX,
     })
 }
 
@@ -194,6 +208,8 @@ struct DemandeReglages {
     format: Option<String>,
     /// `""` revient au défaut (le premier emplacement).
     destination: Option<String>,
+    /// #8522 — le décalage du lecteur, `±DECALAGE_MAX` échantillons.
+    decalage_lecteur: Option<i32>,
 }
 
 async fn regler(State(e): State<EtatExtraction>, corps: Bytes) -> Response {
@@ -208,6 +224,18 @@ async fn regler(State(e): State<EtatExtraction>, corps: Bytes) -> Response {
             return reponse(format_refuse(f));
         };
         if let Err(m) = repo.set(CLE_FORMAT, f.extension()) {
+            return reponse((StatusCode::INTERNAL_SERVER_ERROR, "reglage", m));
+        }
+    }
+    if let Some(o) = d.decalage_lecteur {
+        let max = crate::accuraterip_base::DECALAGE_MAX;
+        if !(-max..=max).contains(&o) {
+            return reponse(mauvaise(
+                "decalage_invalide",
+                format!("Le décalage du lecteur va de -{max} à +{max} échantillons."),
+            ));
+        }
+        if let Err(m) = repo.set(crate::accuraterip_base::CLE_DECALAGE, &o.to_string()) {
             return reponse((StatusCode::INTERNAL_SERVER_ERROR, "reglage", m));
         }
     }
@@ -263,6 +291,10 @@ pub struct DemandeExtraction {
     /// Remplacer des fichiers existants (défaut : refuser).
     #[serde(default)]
     pub ecraser: bool,
+    /// #8514 — verser le disque déjà chargé en mémoire, sans relire le
+    /// lecteur (défaut : extraire depuis le lecteur).
+    #[serde(default)]
+    pub depuis_memoire: bool,
     /// Corrections, prioritaires sur MusicBrainz.
     pub artiste: Option<String>,
     pub album: Option<String>,
@@ -305,24 +337,66 @@ async fn lancer(State(e): State<EtatExtraction>, corps: Bytes) -> Response {
     if let Some(t) = e.ex.en_cours() {
         return conflit_extraction(&t.id);
     }
-    let zones = zones_qui_jouent_le_disque(&e.routes).await;
-    if !zones.is_empty() {
-        return conflit(
-            "lecture_en_cours",
-            "Le disque est en lecture : arrêtez la lecture avant de l'extraire.",
-            json!({ "zones": zones }),
-        );
-    }
-    // #6043 — l'extraction lit le lecteur : le chargement en mémoire s'arrête.
-    crate::routes::liberer_memoire(&e.routes).await;
-    match preparer(&e, d).await {
+    // #8514 — depuis la mémoire : le disque entier déjà chargé. Ni le
+    // lecteur ni la lecture d'une zone ne sont touchés, la mémoire reste.
+    // La retenue est prise AVANT la vérification et vit jusqu'à la fin du
+    // déroulé (ou tombe avec un refus).
+    let mut retenue = None;
+    let memoire = if d.depuis_memoire {
+        let incomplete = || {
+            conflit(
+                "memoire_incomplete",
+                "Le disque n'est pas entièrement chargé en mémoire : \
+                 chargez-le d'abord, ou extrayez-le depuis le lecteur.",
+                json!({}),
+            )
+        };
+        let Some(m) = e.routes.memoire.clone() else {
+            return incomplete();
+        };
+        let r = m.retenir_pour_enregistrement();
+        let Some(c) = m.disque_complet() else {
+            return incomplete();
+        };
+        let perdus = c.progression().secteurs_perdus;
+        if perdus > 0 {
+            return conflit(
+                "memoire_secteurs_perdus",
+                format!(
+                    "{perdus} secteur(s) sont restés illisibles au chargement : la mémoire \
+                     y tient du silence. Extrayez le disque depuis le lecteur."
+                ),
+                json!({ "secteurs_perdus": perdus }),
+            );
+        }
+        retenue = Some(r);
+        Some(c)
+    } else {
+        let zones = zones_qui_jouent_le_disque(&e.routes).await;
+        if !zones.is_empty() {
+            return conflit(
+                "lecture_en_cours",
+                "Le disque est en lecture : arrêtez la lecture avant de l'extraire.",
+                json!({ "zones": zones }),
+            );
+        }
+        // #6043 — l'extraction lit le lecteur : le chargement en mémoire s'arrête.
+        crate::routes::liberer_memoire(&e.routes).await;
+        None
+    };
+    match preparer(&e, d, memoire).await {
         Ok((travail, plan, pochette)) => {
             if let Err(autre) = e.ex.inscrire(travail.clone()) {
                 return conflit_extraction(&autre.id);
             }
             let etat = travail.etat();
             e.ex.publier(EVT_DEMARREE, &etat);
-            tokio::spawn(derouler(e.ex.clone(), travail, plan, pochette));
+            let ex = e.ex.clone();
+            tokio::spawn(async move {
+                // #8514 — la retenue tombe avec la tâche, même sur panique.
+                let _retenue = retenue;
+                derouler(ex, travail, plan, pochette).await;
+            });
             (StatusCode::ACCEPTED, Json(etat)).into_response()
         }
         Err(r) => r,
@@ -335,6 +409,7 @@ async fn lancer(State(e): State<EtatExtraction>, corps: Bytes) -> Response {
 async fn preparer(
     e: &EtatExtraction,
     d: DemandeExtraction,
+    memoire: Option<Arc<Chargement>>,
 ) -> Result<(Arc<Travail>, Plan, Option<String>), Response> {
     let format = match &d.format {
         Some(f) => Format::depuis(f).ok_or_else(|| reponse(format_refuse(f)))?,
@@ -380,13 +455,26 @@ async fn preparer(
         }
     };
 
-    let toc = toc_ou_refus(&e.routes).await.map_err(reponse)?;
-    let Some(lecteur) = e.routes.lecteur.clone() else {
-        return Err(reponse((
-            StatusCode::NOT_FOUND,
-            "aucun_lecteur",
-            "Aucun lecteur de CD.".into(),
-        )));
+    let (toc, lecteur): (_, Arc<dyn LecteurDisque>) = match &memoire {
+        // #8514 — la TOC du disque chargé (le lecteur peut être vide : disque
+        // éjecté mais gardé, #6410), et la mémoire comme lecteur.
+        Some(c) => (
+            c.toc().clone(),
+            Arc::new(LecteurMemoire {
+                chargement: c.clone(),
+            }),
+        ),
+        None => {
+            let toc = toc_ou_refus(&e.routes).await.map_err(reponse)?;
+            let Some(lecteur) = e.routes.lecteur.clone() else {
+                return Err(reponse((
+                    StatusCode::NOT_FOUND,
+                    "aucun_lecteur",
+                    "Aucun lecteur de CD.".into(),
+                )));
+            };
+            (toc, lecteur)
+        }
     };
     let generation = lecteur.generation_lecteur();
     let audio: Vec<u8> = toc.pistes_audio().map(|p| p.numero).collect();
@@ -489,6 +577,8 @@ async fn preparer(
             piste_id: mb.and_then(|m| m.piste_id.clone()),
             artiste_ids: mb_ids(mb.map(|m| m.artiste_ids.as_slice()).unwrap_or(&[])),
             artiste_album_ids: mb_ids(&[]),
+            accuraterip: None,
+            accuraterip_disque: None,
         };
         pistes_etat.push(EtatPiste {
             numero: n,
@@ -501,6 +591,7 @@ async fn preparer(
             secteurs_illisibles: 0,
             accuraterip_v1: None,
             accuraterip_v2: None,
+            verification: None,
             fichier: None,
             erreur: None,
         });
@@ -512,6 +603,7 @@ async fn preparer(
             balises,
             premiere_audio: Some(n) == premiere,
             derniere_audio: Some(n) == derniere,
+            index_ar: audio.iter().position(|a| *a == n).unwrap_or(0),
         });
     }
     if !d.ecraser {
@@ -551,12 +643,40 @@ async fn preparer(
         ));
     }
     let verification = d.verification.unwrap_or_default();
+    // #8522 — la vérification AccurateRip : le décalage détecté sur le
+    // disque en mémoire s'il l'a été, sinon le réglage. La base est
+    // consultée par le déroulé, pas ici : la réponse 202 n'attend pas.
+    let identifiant = crate::accuraterip_base::IdentifiantAr::depuis_toc(&toc);
+    let (decalage, decalage_detecte) = memoire
+        .as_ref()
+        .and_then(|c| c.progression().verification_accuraterip)
+        .filter(|v| v.decalage_detecte && v.base == "trouvee")
+        .map(|v| (v.decalage, true))
+        .unwrap_or_else(|| {
+            (
+                crate::accuraterip_base::decalage_regle(e.ex.backend.clone()),
+                false,
+            )
+        });
+    let plan_ar = crate::accuraterip_base::VerificationAr {
+        identifiant: identifiant.nom(),
+        base: "en_cours",
+        decalage,
+        decalage_detecte,
+        pistes: Vec::new(),
+    };
+    let audio_debut = toc.pistes_audio().next().map(|p| p.debut).unwrap_or(0);
     let mut etat = EtatTravail {
         id: uuid::Uuid::new_v4().simple().to_string()[..12].to_string(),
         statut: StatutTravail::EnCours,
         format,
         verification,
         lecteur: lecteur.chemin(),
+        source: if memoire.is_some() {
+            "memoire"
+        } else {
+            "lecteur"
+        },
         disc_id: disc,
         metadonnees: if infos.is_some() {
             "musicbrainz"
@@ -575,6 +695,7 @@ async fn preparer(
         debut: maintenant(),
         fin: None,
         erreur: None,
+        accuraterip: Some(plan_ar),
         scan: None,
     };
     etat.recalculer();
@@ -587,6 +708,13 @@ async fn preparer(
         dossier,
         pistes: pistes_plan,
         pochette: None,
+        ar: Some(super::travail::PlanAr {
+            identifiant,
+            base: crate::accuraterip_base::Base::Injoignable("pas encore consultée".into()),
+            decalage,
+            decalage_detecte,
+            audio: (audio_debut, toc.fin_audio().1),
+        }),
     };
     let pochette = infos.and_then(|i| i.pochette);
     Ok((Arc::new(Travail::new(etat)), plan, pochette))
@@ -609,6 +737,17 @@ pub(crate) async fn derouler(
 ) {
     if let Some(url) = pochette {
         plan.pochette = ex.pochettes.telecharger(&url).await;
+    }
+    // #8522 — un seul appel à la base par disque ; injoignable : les pistes
+    // seront « non vérifiées », l'extraction continue.
+    if let Some(a) = plan.ar.as_mut() {
+        a.base = ex.base_ar.consulter(&a.identifiant).await;
+        let etat_base = a.base.etat();
+        travail.modifier(|e| {
+            if let Some(v) = e.accuraterip.as_mut() {
+                v.base = etat_base;
+            }
+        });
     }
     let (ex2, t2) = (ex.clone(), travail.clone());
     let resultat = tokio::task::spawn_blocking(move || {

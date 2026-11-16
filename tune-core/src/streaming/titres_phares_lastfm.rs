@@ -27,6 +27,13 @@
 //! qu'à ne pas ajouter deux fois la même piste. Les versions live, remaster,
 //! mono, démo… sont écartées quand une version d'origine existe.
 //!
+//! #8350 — jamais d'homonyme (DidLyon, fil 2394 : « Ange », « Barbara ») :
+//! Last.fm est interrogé par le MBID de l'artiste quand la bibliothèque le
+//! connaît ; sans MBID, par nom sans autocorrect, et sa liste n'est retenue
+//! que si elle recoupe le catalogue de l'artiste chez le service. Une piste
+//! ajoutée par recherche doit porter l'identifiant de l'artiste de la page
+//! chez le service : un même nom ne suffit jamais.
+//!
 //! Sans clé, ou si Last.fm échoue (réseau, quota, réponse vide) : la liste
 //! sort INCHANGÉE, sans erreur. Un échec est mémorisé 15 minutes, un succès
 //! 12 heures ; le cache est borné. Les recherches sont séquentielles, en
@@ -119,6 +126,42 @@ impl<'a> Reglages<'a> {
             recherches_max: RECHERCHES_MAX,
         }
     }
+}
+
+/// L'artiste dont on complète les titres phares.
+pub struct ArtisteDeLaPage<'a> {
+    /// Son identifiant chez le service (celui de la page). Vide : inconnu.
+    pub id: &'a str,
+    /// Son MBID, quand la bibliothèque le connaît.
+    pub mbid: Option<&'a str>,
+}
+
+/// #8350 — le MBID de l'artiste de ce nom dans la bibliothèque, s'il en a un
+/// et s'il est le SEUL artiste de ce nom : deux « Ange » en bibliothèque, et
+/// le nom ne dit plus lequel est celui de la page (pas de MBID, donc le
+/// garde-fou du recoupement s'applique).
+pub fn mbid_de_la_bibliotheque(
+    backend: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    nom: &str,
+) -> Option<String> {
+    use crate::db::backend::ToSqlValue;
+    if nom.trim().is_empty() {
+        return None;
+    }
+    let lignes = backend
+        .query_many(
+            "SELECT musicbrainz_id FROM artists WHERE LOWER(name) = LOWER(?)",
+            &[&nom as &dyn ToSqlValue],
+        )
+        .ok()?;
+    if lignes.len() != 1 {
+        return None;
+    }
+    lignes[0]
+        .first()
+        .and_then(|v| v.as_string())
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
 }
 
 /// La clé Last.fm de l'application : le réglage saisi dans Tune d'abord,
@@ -226,8 +269,9 @@ async fn titres_lastfm(
     client: &reqwest::Client,
     cfg: &Reglages<'_>,
     artiste: &str,
+    mbid: Option<&str>,
 ) -> Option<Vec<String>> {
-    let cle_cache = format!("{}|{}", cfg.base, alphanum(artiste));
+    let cle_cache = format!("{}|{}|{}", cfg.base, alphanum(artiste), mbid.unwrap_or(""));
     if let Some(v) = TOPS.lock().ok().and_then(|c| c.get(&cle_cache)) {
         return v.filter(|t| !t.is_empty());
     }
@@ -235,6 +279,7 @@ async fn titres_lastfm(
         client,
         cfg.base,
         artiste,
+        mbid,
         cfg.cle,
         TITRES_DEMANDES,
     )
@@ -260,6 +305,7 @@ pub async fn completer<F, Fut>(
     client: &reqwest::Client,
     cfg: &Reglages<'_>,
     service: &str,
+    page: &ArtisteDeLaPage<'_>,
     items: &mut Vec<Value>,
     mut chercher: F,
 ) where
@@ -270,10 +316,24 @@ pub async fn completer<F, Fut>(
         return;
     }
     let artiste = texte(&items[0], "artist_name").to_string();
-    let Some(titres) = titres_lastfm(client, cfg, &artiste).await else {
+    let mbid = page.mbid.map(str::trim).filter(|m| !m.is_empty());
+    let Some(titres) = titres_lastfm(client, cfg, &artiste, mbid).await else {
         return;
     };
     let titres: Vec<&String> = titres.iter().take(TITRES_RETENUS).collect();
+
+    // #8350 — sans MBID, le nom peut désigner un homonyme : la liste Last.fm
+    // n'est retenue que si elle recoupe le catalogue de l'artiste.
+    if mbid.is_none() {
+        let recoupe = titres.iter().any(|t| {
+            let cle = cle_titre(t);
+            !cle.is_empty() && items.iter().any(|v| cle_titre(texte(v, "title")) == cle)
+        });
+        if !recoupe {
+            tracing::debug!(artiste, "titres_phares_lastfm_homonyme_probable");
+            return;
+        }
+    }
 
     // Une version alternative s'efface devant l'originale de la liste.
     let originales: Vec<String> = items
@@ -317,7 +377,12 @@ pub async fn completer<F, Fut>(
             break;
         }
         let cle = cle_titre(titre);
-        let cle_resolu = format!("{}|{service}|{}|{cle}", cfg.base, alphanum(&artiste));
+        let cle_resolu = format!(
+            "{}|{service}|{}|{}|{cle}",
+            cfg.base,
+            alphanum(&artiste),
+            page.id
+        );
         let en_cache = RESOLUS.lock().ok().and_then(|c| c.get(&cle_resolu));
         let piste = match en_cache {
             Some(p) => p,
@@ -327,7 +392,7 @@ pub async fn completer<F, Fut>(
                 }
                 cherches += 1;
                 let trouvees = chercher(format!("{artiste} {titre}")).await;
-                let choisie = choisir(&trouvees, &artiste, &cle);
+                let choisie = choisir(&trouvees, &artiste, page.id, &cle);
                 if let Ok(mut c) = RESOLUS.lock() {
                     c.put(cle_resolu, choisie.clone(), DUREE_SUCCES);
                 }
@@ -354,11 +419,31 @@ pub async fn completer<F, Fut>(
 }
 
 /// Parmi les résultats d'une recherche : même interprète, même titre
-/// normalisé, la version d'origine d'abord.
-fn choisir(trouvees: &[StreamTrack], artiste: &str, cle: &str) -> Option<StreamTrack> {
+/// normalisé, la version d'origine d'abord. #8350 — quand l'identifiant de
+/// l'artiste de la page est connu, la piste doit le porter : un homonyme
+/// (même nom, autre artiste) ou une piste sans identifiant n'entre pas —
+/// sauf chez un service qui n'en donne jamais (YouTube), où le nom reste le
+/// seul critère.
+fn choisir(
+    trouvees: &[StreamTrack],
+    artiste: &str,
+    artiste_id: &str,
+    cle: &str,
+) -> Option<StreamTrack> {
+    let artiste_id = artiste_id.trim();
+    // Un service qui ne donne AUCUN identifiant d'artiste dans ses résultats
+    // (YouTube) : seul le nom peut servir, comme avant.
+    let sans_identifiants = trouvees.iter().all(|t| t.artist_id.is_none());
     let candidats: Vec<&StreamTrack> = trouvees
         .iter()
-        .filter(|t| meme_artiste(&t.artist, artiste) && cle_titre(&t.title) == cle)
+        .filter(|t| {
+            let bon_artiste = if artiste_id.is_empty() || sans_identifiants {
+                meme_artiste(&t.artist, artiste)
+            } else {
+                t.artist_id.as_deref().map(str::trim) == Some(artiste_id)
+            };
+            bon_artiste && cle_titre(&t.title) == cle
+        })
         .collect();
     candidats
         .iter()

@@ -349,6 +349,10 @@ pub enum LocalDeviceFallback {
     /// C'est le cas historique de #2207 — on ouvre le périphérique système et
     /// on le DIT.
     NotFoundFellBackToDefault,
+    /// Le nom vient bien de cet hôte mais aucune sortie ne le porte plus, et
+    /// la plateforme interdit de le remplacer par la sortie système : sous
+    /// Windows, c'étaient les haut-parleurs du PC (#8171). Rien n'est ouvert.
+    NotFoundRefused,
 }
 
 impl LocalDeviceFallback {
@@ -362,6 +366,7 @@ impl LocalDeviceFallback {
         match self {
             Self::ForeignHost => "foreign_host",
             Self::NotFoundFellBackToDefault => "not_found_fell_back_to_default",
+            Self::NotFoundRefused => "not_found_refused",
         }
     }
 
@@ -377,12 +382,21 @@ impl LocalDeviceFallback {
                 "le périphérique enregistré par la zone est introuvable \
                  (débranché, renommé) — lecture sur la sortie système"
             }
+            Self::NotFoundRefused => {
+                "le périphérique enregistré par la zone est introuvable \
+                 (éteint, débranché, renommé, renuméroté) — rien n'a été ouvert \
+                 plutôt que de jouer sur la sortie système"
+            }
         }
     }
 
     /// Toutes les variantes. Sert la contre-épreuve permanente : un motif
     /// ajouté sans être câblé fait tomber le test qui parcourt cette liste.
-    pub const ALL: [Self; 2] = [Self::ForeignHost, Self::NotFoundFellBackToDefault];
+    pub const ALL: [Self; 3] = [
+        Self::ForeignHost,
+        Self::NotFoundFellBackToDefault,
+        Self::NotFoundRefused,
+    ];
 }
 
 /// Ce que la sortie locale fait vraiment, à côté de ce qu'on lui a demandé.

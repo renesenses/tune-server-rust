@@ -245,6 +245,12 @@ impl PositionPoller {
                 status.muted,
                 etat_de_zone.last_mute_set_at,
             );
+            // #8137 — le volume relu, repère de la bascule PURE (aucune
+            // commande quand l'appareil est déjà à la valeur visée).
+            if !in_startup_grace && !in_volume_grace && !sourdine && !volume_illisible {
+                self.orchestrator
+                    .noter_le_volume_relu(zone_id, status.volume);
+            }
             // #5662 — le seuil < 0,999 ci-dessous écarte un renderer à 100 % :
             // le dire au journal, une fois par épisode.
             if !zone.fixed_volume
@@ -313,9 +319,10 @@ impl PositionPoller {
             // initial states read and the device poll response.
             let fresh_states = self.playback.all_states().await;
             // #7418 — l'appareil qui avait mis la zone en pause rejoue notre
-            // flux (Play à la télécommande) : la zone reprend avec lui.
+            // flux (Play à la télécommande) : la zone reprend avec lui. Passé
+            // à autre chose, ou resté en pause trop longtemps : arrêt complet.
             if self
-                .suivre_la_reprise_de_l_appareil(zone_id, &device_id, &status, &fresh_states)
+                .suivre_l_appareil_apres_sa_pause(zone_id, &device_id, &status, &fresh_states)
                 .await
             {
                 continue;
@@ -920,6 +927,8 @@ impl PositionPoller {
                         );
                     }
                     poll_states.remove(&zone_id);
+                    // Fil 2694 — fin sur ERREUR : pas de radio de fin de file.
+                    crate::playback::radio_fin_de_file::noter_fin_sur_erreur(zone_id);
                     self.handle_track_end(zone_id, zone_state).await;
                     continue;
                 }
@@ -1427,6 +1436,18 @@ impl PositionPoller {
                     let in_vol_grace = zone_state
                         .last_volume_set_at
                         .is_some_and(|t| t.elapsed().as_secs() < VOLUME_GRACE_SECS);
+                    // #8137 — le volume relu, repère de la bascule PURE.
+                    if !in_vol_grace
+                        && !volume_illisible
+                        && !sourdine_8031::sourdine_en_jeu(
+                            zone_state.muted,
+                            status.muted,
+                            zone_state.last_mute_set_at,
+                        )
+                    {
+                        self.orchestrator
+                            .noter_le_volume_relu(zone_id, status.volume);
+                    }
                     // #5662 — un renderer à 100 % ignoré est dit une fois.
                     if !zone_fixed_volume && !in_vol_grace {
                         self.volume_100_ignore_constate(zone_id, zone_state.volume, status.volume);
@@ -1823,6 +1844,18 @@ impl PositionPoller {
             let in_vol_grace2 = zone_state
                 .last_volume_set_at
                 .is_some_and(|t| t.elapsed().as_secs() < VOLUME_GRACE_SECS);
+            // #8137 — le volume relu, repère de la bascule PURE.
+            if !in_vol_grace2
+                && !volume_illisible
+                && !sourdine_8031::sourdine_en_jeu(
+                    zone_state.muted,
+                    status.muted,
+                    zone_state.last_mute_set_at,
+                )
+            {
+                self.orchestrator
+                    .noter_le_volume_relu(zone_id, status.volume);
+            }
             // #5662 — un renderer à 100 % ignoré est dit une fois.
             if !zone_fixed_volume && !in_vol_grace2 {
                 self.volume_100_ignore_constate(zone_id, zone_state.volume, status.volume);
@@ -2023,6 +2056,57 @@ impl PositionPoller {
             }
             ps.transition(fsm::Transition::PremierEchantillonPlausible);
 
+            // #8082 — flux continu : le renderer a franchi la frontière d'une
+            // piste DANS le flux (`outputs::dlna_flux_continu`, qui rapporte
+            // déjà la position à la nouvelle piste). Rien n'est envoyé au
+            // renderer : la file avance, l'écran, l'historique et le
+            // préchargement suivent, comme pour un enchaînement adopté.
+            if let Some((zone_du_plan, piste)) =
+                crate::outputs::dlna_flux_continu::prendre_le_passage(&device_id)
+                && zone_du_plan == zone_id
+            {
+                info!(
+                    zone_id,
+                    position = piste.position,
+                    track_id = piste.track_id,
+                    position_ms = status.position_ms,
+                    "flux_continu_passage_de_piste"
+                );
+                match self
+                    .orchestrator
+                    .avancer_dans_le_flux_continu(zone_id, &device_id, &piste)
+                    .await
+                {
+                    Ok(()) => {
+                        ps.gapless_sent = false;
+                        ps.gapless_sent_at = None;
+                        ps.gapless_armed = None;
+                        ps.stopped_ticks = 0;
+                        ps.past_end_ticks = 0;
+                        ps.peak_position_ms = status.position_ms;
+                        ps.last_position_ms = status.position_ms;
+                        ps.dernier_releve_de_position_at = Some(Instant::now());
+                        ps.last_bytes_sent = 0;
+                        ps.playing_stall_ticks = 0;
+                        ps.stall_declines = 0;
+                        ps.track_started_at = Some(Instant::now());
+                        ps.gapless_advance_pending = false;
+                        ps.gapless_stuck_ticks = 0;
+                        ps.transition(fsm::Transition::TransitionDetectee);
+                        ps.gapless_cooldown = 4;
+                        ps.scrobbled_key = None;
+                    }
+                    Err(e) => {
+                        // La file n'a pas suivi : le plan ne dit plus ce que
+                        // Tune affiche. On le quitte ; la fin du flux reprend
+                        // la file par le chemin normal.
+                        warn!(zone_id, error = %e, "flux_continu_passage_non_suivi");
+                        crate::outputs::dlna_flux_continu::oublier(&device_id);
+                    }
+                }
+                continue;
+            }
+
             // enough of the track was actually played before accepting a
             // gapless transition.  We update this BEFORE checking for resets
             // so the peak reflects the last known good position.
@@ -2133,8 +2217,19 @@ impl PositionPoller {
             // sondage suivant tranche — `Playing` près de zéro, c'était un
             // passage (adopté sans relance) ; toujours arrêté, la branche
             // `Stopped` retombe sur l'enchaînement par `Play`.
-            let chute_brute =
-                decisions::position_reset(ps.last_position_ms, status.position_ms, ps.gapless_sent);
+            // #7293 — l'âge du relevé précédent : un relevé manqué (appareil
+            // lent sur une autre zone) élargit d'autant la fenêtre « près du
+            // début ». Sans relevé daté, la fenêtre reste celle d'un tick.
+            let ecart_depuis_le_releve_ms = ps
+                .dernier_releve_de_position_at
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+            let chute_brute = decisions::position_reset_apres_le_releve(
+                ps.last_position_ms,
+                status.position_ms,
+                ps.gapless_sent,
+                ecart_depuis_le_releve_ms,
+            );
             let chute_differee =
                 decisions::chute_a_differer_hors_lecture(chute_brute, status.state);
             if chute_differee {
@@ -2157,8 +2252,9 @@ impl PositionPoller {
             // (rare: end of track). Env-guarded for rollback.
             if position_reset && std::env::var("TUNE_DISABLE_CAST_ADVANCE_FIX").is_err() {
                 let can_internal_gapless = {
-                    let outputs = self.outputs.lock().await;
-                    match outputs.get(&device_id) {
+                    // #8006 — registre relâché avant d'attendre la sortie.
+                    let enregistree = self.outputs.lock().await.get(&device_id);
+                    match enregistree {
                         Some(arc) => arc.lock().await.supports_internal_gapless(),
                         None => false,
                     }
@@ -2181,6 +2277,7 @@ impl PositionPoller {
             }
             if !chute_differee {
                 ps.last_position_ms = status.position_ms;
+                ps.dernier_releve_de_position_at = Some(Instant::now());
             }
             // #7922 — le temps rendu, hors grâce de déplacement et hors chute :
             // une chute de position est la piste suivante ou un recul.
@@ -2224,8 +2321,9 @@ impl PositionPoller {
                     )
                 {
                     let est_dlna = {
-                        let outputs = self.outputs.lock().await;
-                        match outputs.get(&device_id) {
+                        // #8006 — registre relâché avant d'attendre la sortie.
+                        let enregistree = self.outputs.lock().await.get(&device_id);
+                        match enregistree {
                             Some(arc) => arc.lock().await.output_type() == "dlna",
                             None => false,
                         }
@@ -2403,6 +2501,54 @@ impl PositionPoller {
                 ps.pause_appareil_ticks = 0;
             }
             let mut pause_de_l_appareil = false;
+
+            // #8483 — fichier abîmé (go de Bertrand, rc12) : la zone s'est
+            // figée sur la coupure que le décodage de Tune a déjà vue. C'est la
+            // fin de la piste : suivante de la file (ou fin de file), avec un
+            // avis traduit, au lieu d'un silence « en lecture » que la garde
+            // #2116/#6702 finissait par ARRÊTER. Hors des grâces et de tout
+            // enchaînement en cours ; registre vide = aucune lecture en base.
+            if zone_state.state == PlayState::Playing
+                && !in_seek_grace
+                && !ps.gapless_sent
+                && !ps.gapless_advance_pending
+                && !crate::audio::coupure_connue_8483::aucune_coupure_connue()
+            {
+                let position_figee = match status.state {
+                    TransportState::Playing => fichier_abime_8483::gel_etabli(
+                        &mut ps.gel_sur_coupure,
+                        status.position_ms,
+                        Instant::now(),
+                    )
+                    .then_some(status.position_ms),
+                    TransportState::Stopped => {
+                        ps.gel_sur_coupure = None;
+                        // Pic nul : rien n'a encore joué, aucune lecture en base.
+                        Some(ps.peak_position_ms).filter(|pic| *pic > 0)
+                    }
+                    _ => {
+                        ps.gel_sur_coupure = None;
+                        None
+                    }
+                };
+                // Hors ligne et en boîte : `tick` est un futur déjà énorme, et
+                // chaque bras ajouté ici grossit la pile de son appelant.
+                if let Some(position) = position_figee
+                    && Box::pin(self.passer_le_fichier_abime(
+                        zone_id,
+                        zone_state,
+                        &device_id,
+                        position,
+                        status.state,
+                    ))
+                    .await
+                {
+                    poll_states.remove(&zone_id);
+                    continue;
+                }
+            } else {
+                ps.gel_sur_coupure = None;
+            }
 
             match status.state {
                 TransportState::Stopped if !tune_is_playing || !tune_has_track => {
@@ -2815,8 +2961,9 @@ impl PositionPoller {
                                 // Only wait when the output can actually
                                 // transition internally; otherwise end normally.
                                 let can_internal_gapless = {
-                                    let outputs = self.outputs.lock().await;
-                                    match outputs.get(&device_id) {
+                                    // #8006 — registre relâché avant d'attendre la sortie.
+                                    let enregistree = self.outputs.lock().await.get(&device_id);
+                                    match enregistree {
                                         Some(arc) => arc.lock().await.supports_internal_gapless(),
                                         None => false,
                                     }
@@ -3449,11 +3596,15 @@ impl PositionPoller {
                     // start of the next track.  The played_enough guard
                     // prevents false transitions when a renderer (DMP-A8)
                     // reports position < 5s immediately after SetNext.
-                    let position_confirms_transition = decisions::position_confirms_transition(
-                        played_enough,
-                        status.position_ms,
-                        track_duration_ms,
-                    );
+                    // #7293 — même marge que la retombée de position : un
+                    // relevé manqué ne cache plus un passage déjà fait.
+                    let position_confirms_transition =
+                        decisions::position_confirms_transition_apres_le_releve(
+                            played_enough,
+                            status.position_ms,
+                            track_duration_ms,
+                            ecart_depuis_le_releve_ms,
+                        );
                     fsm_pact.transition_detected = duration_changed && position_confirms_transition;
                     if duration_changed && position_confirms_transition {
                         let arm_to_advance_ms = ps
@@ -3519,7 +3670,10 @@ impl PositionPoller {
                         // flux a expire cote serveur. On la jette pour que la
                         // condition ci-dessous rearme proprement, plutot que de
                         // laisser le renderer chercher une adresse morte.
-                        if !self.orchestrator.fichier_suivant_en_preparation(zone_id)
+                        // #6718 — seule une préparation qui arme tôt (HQPlayer)
+                        // vieillit au-delà de la fenêtre ; celle d'un renderer
+                        // réseau arme dans sa fenêtre habituelle.
+                        if !self.orchestrator.preparation_fichier_arme_tot(zone_id)
                             && decisions::gapless_stage_expired(
                                 ps.gapless_sent,
                                 ps.gapless_sent_at.map(|t| t.elapsed().as_secs()),
@@ -3587,7 +3741,7 @@ impl PositionPoller {
                             }
                         }
                         (!ps.gapless_sent
-                            && self.orchestrator.fichier_suivant_en_preparation(zone_id))
+                            && self.orchestrator.preparation_fichier_arme_tot(zone_id))
                             || decisions::should_arm_gapless(
                                 ps.gapless_sent,
                                 status.duration_ms,
@@ -3628,8 +3782,9 @@ impl PositionPoller {
                             // gapless_sent so we stop retrying; the natural-end
                             // fallback advances/repeats the queue.
                             let (can_internal_gapless, annonce) = {
-                                let outputs = self.outputs.lock().await;
-                                match outputs.get(&device_id) {
+                                // #8006 — registre relâché avant d'attendre la sortie.
+                                let enregistree = self.outputs.lock().await.get(&device_id);
+                                match enregistree {
                                     Some(arc) => {
                                         let sortie = arc.lock().await;
                                         (
@@ -3779,8 +3934,9 @@ impl PositionPoller {
                         && played_enough
                         && status.position_ms + 250 >= track_duration_ms
                         && {
-                            let outputs = self.outputs.lock().await;
-                            match outputs.get(&device_id) {
+                            // #8006 — registre relâché avant d'attendre la sortie.
+                            let enregistree = self.outputs.lock().await.get(&device_id);
+                            match enregistree {
                                 Some(arc) => !arc.lock().await.supports_internal_gapless(),
                                 None => false,
                             }
@@ -4307,7 +4463,9 @@ impl PositionPoller {
 
             if demarrage_fige != demarrage_fige_5522::Verdict::Attendre {
                 poll_states.remove(&zone_id);
-                self.agir_sur_un_demarrage_fige(zone_id, zone_state, demarrage_fige)
+                // Cette relance rare ouvre toute la chaîne de lecture. Ne pas
+                // conserver son gros futur dans celui du sondeur.
+                Box::pin(self.agir_sur_un_demarrage_fige(zone_id, zone_state, demarrage_fige))
                     .await;
             } else if force_stop {
                 self.noter_tune_tested(zone_state, &device_id, false).await;

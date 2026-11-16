@@ -389,7 +389,7 @@ fn semer_une_bibliotheque(backend: &Arc<dyn DbBackend>) -> (i64, i64) {
             rg = RELEASE_GROUP,
         ))
         .unwrap();
-    library_sync::populate_changelog_after_scan(backend);
+    library_sync::tout_remettre_dans_le_journal(backend);
     (10, 1)
 }
 

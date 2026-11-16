@@ -365,6 +365,12 @@ pub(super) async fn get_artist(
                     json!(provenance.map(|p| p.as_str())),
                 );
             }
+            // #8668 — le pays de l'artiste (MusicBrainz, #8090), code ISO en
+            // majuscules, null s'il est inconnu ou lu d'un ancien MBID : la
+            // fiche l'affiche dans son en-tête, lien vers la carte des pays.
+            if let Some(obj) = j.as_object_mut() {
+                obj.insert("country".into(), json!(pays_de_l_artiste(&state, id)));
+            }
             // #6738 — le total des écoutes de la communauté, absent sous le seuil.
             ecoutes_communaute::annoter_un(
                 &state.backend,
@@ -378,6 +384,24 @@ pub(super) async fn get_artist(
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// #8668 — le pays VALIDE de l'artiste (même règle que la facette
+/// `artist_country`, [`tune_core::db::facet_filter::PAYS_ARTISTE_VALIDE`]).
+fn pays_de_l_artiste(state: &AppState, id: i64) -> Option<String> {
+    use tune_core::db::backend::ToSqlValue;
+    let valide = tune_core::db::facet_filter::PAYS_ARTISTE_VALIDE;
+    state
+        .backend
+        .query_one(
+            &format!(
+                "SELECT UPPER(pa_ar.country) FROM artists pa_ar WHERE pa_ar.id = ? AND {valide}"
+            ),
+            &[&id as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten()
+        .and_then(|l| l.first()?.as_string())
 }
 
 pub(super) async fn artist_bio(
@@ -1022,6 +1046,54 @@ pub(super) struct ArtistAlbumsQuery {
     /// client web, les clients natifs et le serveur média, et changer la
     /// forme pour tout le monde casserait ce qui marche.
     sections: Option<String>,
+    folder: Option<String>,
+}
+
+/// Portée de répertoire de la fiche et de ses gestes de lecture (#8715).
+/// Même sous-arbre NFC et même échappement des jokers que la Bibliothèque.
+#[derive(Default)]
+struct PorteeDossierArtiste {
+    albums: std::collections::HashSet<i64>,
+    pistes: std::collections::HashSet<i64>,
+}
+impl PorteeDossierArtiste {
+    fn charger(state: &AppState, dossier: Option<&str>) -> Option<Self> {
+        let dossier = dossier.filter(|d| !d.is_empty())?;
+        let mut ph = tune_core::db::facet_filter::Placeholders::new(state.backend.engine());
+        let sql = format!(
+            "SELECT id, album_id FROM tracks WHERE file_path LIKE {}{}",
+            ph.take(),
+            tune_core::db::track_repo::like_escape_clause()
+        );
+        let motif = tune_core::db::track_repo::folder_like_pattern(dossier);
+        let mut portee = Self::default();
+        match state.backend.query_many(&sql, &[&motif]) {
+            Ok(lignes) => {
+                for ligne in lignes {
+                    if let Some(id) = ligne[0].as_i64() {
+                        portee.pistes.insert(id);
+                    }
+                    if let Some(id) = ligne[1].as_i64() {
+                        portee.albums.insert(id);
+                    }
+                }
+            }
+            // Une lecture impossible ne doit jamais élargir la portée demandée.
+            Err(error) => {
+                tracing::warn!(%error, "lecture de la portée de répertoire de l'artiste impossible")
+            }
+        }
+        Some(portee)
+    }
+}
+
+fn garder_albums_du_dossier(
+    albums: &mut Vec<tune_core::db::models::Album>,
+    portee: Option<&PorteeDossierArtiste>,
+) {
+    if let Some(portee) = portee {
+        albums.retain(|a| a.id.is_some_and(|id| portee.albums.contains(&id)));
+    }
 }
 
 use tune_core::metadata::release_type;
@@ -1033,6 +1105,8 @@ pub(super) async fn artist_albums(
 ) -> Json<Value> {
     let repo = AlbumRepo::with_backend(state.backend.clone());
     let mut items = repo.list_by_artist(id).unwrap_or_default();
+    let portee = PorteeDossierArtiste::charger(&state, q.folder.as_deref());
+    garder_albums_du_dossier(&mut items, portee.as_ref());
     // La fiche artiste trie ses albums par date d'ajout (Bertrand,
     // 16/09/2026) ; `select_album()` ne porte pas la colonne.
     repo.attacher_added_at(&mut items);
@@ -1050,7 +1124,7 @@ pub(super) async fn artist_albums(
         Default::default()
     });
     // #7725 — `max_channels` de chaque album, pour le filtre Multicanal.
-    let canaux = super::albums::canaux_max_par_album(&repo, &ids);
+    let canaux = super::albums::canaux_par_album(&repo, &ids);
     let items: Vec<(bool, Value)> = items
         .iter()
         .map(|a| {
@@ -1130,9 +1204,13 @@ pub(super) async fn artist_albums(
             continue;
         }
         let mut albums = albums;
+        garder_albums_du_dossier(&mut albums, portee.as_ref());
+        if albums.is_empty() {
+            continue;
+        }
         repo.attacher_added_at(&mut albums);
         let ids: Vec<i64> = albums.iter().filter_map(|a| a.id).collect();
-        let canaux = super::albums::canaux_max_par_album(&repo, &ids);
+        let canaux = super::albums::canaux_par_album(&repo, &ids);
         let albums: Vec<Value> = albums
             .iter()
             .map(|a| {
@@ -1145,36 +1223,65 @@ pub(super) async fn artist_albums(
             .collect();
         obj.insert(cle.to_string(), json!(albums));
     }
-    inserer_sections_de_credits(&repo, &state, id, obj);
+    inserer_sections_de_credits(&repo, &state, id, obj, portee.as_ref());
     Json(reponse)
 }
 
-/// #4767 — « Collaborations » et « Reprises », lues dans `track_credits`
-/// (rempli par `POST /system/enrich-credits`).
+/// #4767 / #7767 — « Apparaît sur », « Reprises », « Écriture et
+/// production » et les compteurs de l'en-tête, lus dans `track_credits`
+/// (rempli par `POST /system/enrich-credits` et, depuis #7766, par le scan).
+/// Le contrat exact est `coordination/seb-lot2/contrat-route-artiste.md`,
+/// contre lequel le client web (tune-web-client#2788) est écrit.
 ///
-/// Ne regarde que les disques d'AUTRUI où l'artiste n'est l'artiste d'aucune
-/// piste : ceux-là sont déjà dans la discographie, « Compilations » ou
-/// « Apparitions », et un album ne s'affiche jamais deux fois.
+/// Ne regarde que les disques d'AUTRUI (l'artiste d'album n'est pas lui).
+/// `collaborations` et `covers` écartent en plus ceux où il est l'artiste
+/// d'une piste — déjà dans « Compilations » ou « Apparitions » — ;
+/// `writing` les garde : y jouer n'efface pas l'avoir produit.
 ///
 /// Forme, pour chaque album : l'objet album habituel, plus
 /// - `focus_track_ids` : les pistes où l'artiste est crédité au titre de la
-///   section (musicien pour « Collaborations », auteur pour « Reprises ») —
-///   c'est le FOCUS : `tracks.artist_id` n'y désigne pas l'artiste, le client
-///   filtre donc sur ces identifiants ;
-/// - `credit_roles` : ce qu'il y fait (instruments, `vocals`, `composer`,
-///   `writer`…), sans doublon.
+///   section — c'est le FOCUS : `tracks.artist_id` n'y désigne pas
+///   l'artiste, le client filtre donc sur ces identifiants ;
+/// - `credit_roles` : ce qu'il y fait (instruments ou rôles pour
+///   « Apparaît sur », vocabulaire canonique pour les deux autres), sans
+///   doublon.
 ///
 /// `collaborations` est groupée par ARTISTE PRINCIPAL de l'album :
 /// `[{artist_id, artist_name, albums: [...]}]`, groupes par nom, albums par
-/// année. `covers` est une liste d'albums par année. Chaque clé est ABSENTE
-/// quand sa section est vide, comme `compilations` et `appearances`.
+/// année. `covers` et `writing` sont des listes d'albums par année puis
+/// titre. Chaque section est ABSENTE quand elle est vide, comme
+/// `compilations` et `appearances`.
+///
+/// `credit_counts` est la SEULE clé toujours présente, zéros compris : sa
+/// présence dit au client que le serveur sait compter (un serveur antérieur
+/// ne la rend pas), et un compteur ne répond pas à une question plus étroite
+/// que son libellé — toute la bibliothèque, discographie comprise.
 fn inserer_sections_de_credits(
     repo: &AlbumRepo,
     state: &AppState,
     artist_id: i64,
     obj: &mut serde_json::Map<String, Value>,
+    portee: Option<&PorteeDossierArtiste>,
 ) {
-    use tune_core::metadata::credits_release::{AlbumCredite, classer, credits_hors_discographie};
+    use tune_core::metadata::credits_release::{
+        AlbumCredite, classer, compteurs_de_credits, credits_hors_discographie,
+    };
+
+    obj.insert(
+        "credit_counts".into(),
+        compteurs_de_credits(&state.backend, artist_id).to_json(),
+    );
+
+    // #7768 — « joue avec » : absente quand personne n'est audible avec lui
+    // (contrat § 3.3). Avant le retour anticipé : l'artiste de ses propres
+    // pistes peut n'avoir aucun crédit et des musiciens crédités à côté.
+    let joue_avec = tune_core::metadata::credits_joue_avec::joue_avec(&state.backend, artist_id);
+    if !joue_avec.is_empty() {
+        obj.insert(
+            "played_with".into(),
+            Value::Array(joue_avec.iter().map(|j| j.to_json()).collect()),
+        );
+    }
 
     let (credits, disques) = credits_hors_discographie(&state.backend, artist_id);
     if credits.is_empty() {
@@ -1187,6 +1294,7 @@ fn inserer_sections_de_credits(
         let (mut seuls, trouvees): (Vec<tune_core::db::models::Album>, Vec<&AlbumCredite>) =
             entrees
                 .iter()
+                .filter(|e| portee.is_none_or(|p| p.albums.contains(&e.album_id)))
                 .filter_map(|e| repo.get(e.album_id).ok().flatten().map(|a| (a, e)))
                 .unzip();
         repo.attacher_added_at(&mut seuls);
@@ -1233,12 +1341,14 @@ fn inserer_sections_de_credits(
         obj.insert("collaborations".into(), json!(groupes));
     }
 
-    let reprises: Vec<Value> = charger(&classement.reprises)
-        .into_iter()
-        .map(|(_, v)| v)
-        .collect();
-    if !reprises.is_empty() {
-        obj.insert("covers".into(), json!(reprises));
+    for (cle, entrees) in [
+        ("covers", &classement.reprises),
+        ("writing", &classement.ecriture),
+    ] {
+        let albums: Vec<Value> = charger(entrees).into_iter().map(|(_, v)| v).collect();
+        if !albums.is_empty() {
+            obj.insert(cle.into(), json!(albums));
+        }
     }
 }
 
@@ -1246,9 +1356,15 @@ pub(super) async fn artist_tracks(
     State(state): State<AppState>,
     profile: crate::routes::active_profile::ActiveProfile,
     Path(id): Path<i64>,
+    Query(q): Query<ArtistAlbumsQuery>,
 ) -> Json<Value> {
     let repo = TrackRepo::with_backend(state.backend.clone());
-    let items = dedup_display_tracks(repo.list_by_artist(id).unwrap_or_default());
+    let mut items = repo.list_by_artist(id).unwrap_or_default();
+    if let Some(portee) = PorteeDossierArtiste::charger(&state, q.folder.as_deref()) {
+        items.retain(|p| p.id.is_some_and(|id| portee.pistes.contains(&id)));
+    }
+    // Le meilleur exemplaire doit être choisi DANS le dossier demandé.
+    let items = dedup_display_tracks(items);
     // #4806 — `banned` ici aussi : la liste ne change pas, elle s'annote.
     // Passer par `Vec<Value>` lui donne au passage `channel_badge` (additif).
     let mut items: Vec<Value> = items.iter().map(|t| t.to_json()).collect();
@@ -2308,3 +2424,7 @@ mod tests_absorption;
 #[cfg(test)]
 #[path = "identite_artiste_tests_6463.rs"]
 mod identite_artiste_tests_6463;
+
+#[cfg(test)]
+#[path = "dossier_artiste_8715_tests.rs"]
+mod dossier_artiste_8715_tests;

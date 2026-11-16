@@ -376,13 +376,15 @@ async fn sso_callback(
     // nouveau venu : exactement ce qu'elle est là pour empêcher.
     tune_core::cloud::proprietaire::adopter_le_compte_lie(&settings, &state.backend);
 
-    // Store cloud tokens in settings
-    settings
-        .set("mozaik_access_token", &token.access_token)
-        .ok();
-    if let Some(ref rt) = token.refresh_token {
-        settings.set("mozaik_refresh_token", rt).ok();
-    }
+    // Store cloud tokens in settings. #8238 : une session neuve lève
+    // « reconnexion requise » et le recul, sous le verrou des renouvellements
+    // — un renouvellement de l'ancien jeton encore en vol ne la reprend pas.
+    tune_core::cloud::sso::ouvrir_la_session(
+        &settings,
+        &token.access_token,
+        token.refresh_token.as_deref(),
+    )
+    .await;
     settings
         .set(
             "mozaik_user",
@@ -566,10 +568,15 @@ async fn sso_status(State(state): State<AppState>) -> Json<Value> {
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok());
+    // #8238 : le site a refusé le renouvellement de la session. Les jetons
+    // sont encore en base mais ne valent plus rien : le serveur n'est PAS
+    // connecté, et l'interface propose la connexion au compte.
+    let reconnect_required = connected && tune_core::cloud::sso::reconnexion_requise(&settings);
 
     Json(json!({
         "configured": configured,
-        "connected": connected,
+        "connected": connected && !reconnect_required,
+        "reconnect_required": reconnect_required,
         "user": user,
     }))
 }
@@ -613,6 +620,7 @@ async fn sso_disconnect(
     ] {
         settings.delete(key).ok();
     }
+    tune_core::cloud::sso::oublier_le_refus_de_session(&settings);
     state.license.clear_account_premium().await;
     // Founder endpoint order came from this account — revert to direct-first.
     state.license.set_qobuz_proxy_first(false).await;
@@ -699,14 +707,48 @@ async fn marketplace_list(State(state): State<AppState>) -> Json<Value> {
     Json(json!(plugins))
 }
 
+/// Un nom de greffon tel que la boutique les forme : `^[a-z0-9][a-z0-9_-]{0,63}$`.
+/// Rien d'autre n'entre dans un chemin sous le dossier des greffons.
+fn nom_de_greffon_valide(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
+        _ => return false,
+    }
+    name.len() <= 64
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
 async fn marketplace_install(
+    // Sécurité : même garde que `/marketplace/plugins/{slug}/install`.
+    _garde: crate::auth::AdminOuCetteMachine,
     Path(name): Path<String>,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    if !nom_de_greffon_valide(&name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_plugin_name",
+                "message": "plugin name must match ^[a-z0-9][a-z0-9_-]{0,63}$",
+            })),
+        )
+            .into_response();
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let base_url = settings.get("mozaik_base_url").ok().flatten();
     let mp = PluginMarketplace::new(base_url.as_deref());
+
+    // Sécurité — `name` vient du chemin de l'URL, décodé, et
+    // devient un dossier sous `TUNE_PLUGINS_DIR` : un seul segment, sans `..`.
+    if let Err(refus) = crate::routes::confinement::segment_sous(std::path::Path::new("."), &name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": crate::routes::confinement::message("name", refus)})),
+        )
+            .into_response();
+    }
 
     match mp.download(&name).await {
         Ok(data) => {
@@ -1054,9 +1096,27 @@ async fn bridge_status(State(state): State<AppState>) -> Json<Value> {
         }
     };
 
+    // Pourquoi « Déconnecté » (#7714) : le client tourne-t-il, et qu'a dit
+    // sa dernière tentative ? Les Réglages le montrent au lieu de
+    // « Redémarrez le serveur ».
+    #[cfg(feature = "cloud-relay")]
+    let (client_lance, derniere_erreur) = match state.relay_client.get() {
+        Some(c) => (true, c.derniere_erreur()),
+        None => (false, None),
+    };
+    #[cfg(not(feature = "cloud-relay"))]
+    let (client_lance, derniere_erreur): (bool, Option<String>) = (false, None);
+    let premium = state
+        .license
+        .check_feature(tune_core::license::Feature::CloudRelay)
+        .await;
+
     Json(json!({
         "enabled": enabled,
         "connected": connected,
+        "client_lance": client_lance,
+        "premium": premium,
+        "derniere_erreur": derniere_erreur,
         "server_id": server_id,
         "relay_url": bridge_url,
         "has_token": bridge_token.is_some(),
@@ -1235,11 +1295,13 @@ async fn bridge_enable(
     let server_id = TelemetryReporter::get_or_create_server_id(&settings);
     info!(server_id = %server_id, "bridge enabled");
 
+    // Plus de redémarrage (#7714) : la surveillance lancée au démarrage
+    // (`background::spawn_relay_client`) démarre le client dans la minute.
     let mut reponse = json!({
         "enabled": true,
         "server_id": server_id,
         "access_url": format!("https://bridge.mozaiklabs.fr/{server_id}/"),
-        "note": "restart server to activate the relay connection"
+        "note": "the relay connection starts within a minute",
     });
     // #6603 — le jeton du pont ne sert plus qu'à l'ancien lien. Une fois ce
     // lien coupé par le relais, il n'a plus à sortir d'ici.
@@ -1924,7 +1986,8 @@ mod tests_licence_proprietaire {
             .find("proprietaire::adopter_le_compte_lie(&settings, &state.backend)")
             .expect("la reprise des installations existantes a disparu");
         let ecrasement = source
-            .find(".set(\"mozaik_access_token\"")
+            // #8238 : le jeton s'ecrit par `sso::ouvrir_la_session`.
+            .find("sso::ouvrir_la_session(")
             .expect("l'ecriture du jeton a disparu");
         assert!(
             adoption < ecrasement,
@@ -2660,5 +2723,33 @@ mod tests_page_connexion_b209sso {
     fn valeur_repetee_premiere_retenue() {
         let p = page_connexion_demandee(&q(&[("theme", "brown"), ("theme", "evil")]));
         assert_eq!(p.theme.as_deref(), Some("brown"));
+    }
+}
+
+/// Sécurité — le nom d'un greffon est un seul segment.
+#[cfg(test)]
+mod confinement_chemins_tests {
+    use super::*;
+    use crate::routes::confinement::banc;
+
+    #[tokio::test]
+    async fn un_nom_de_greffon_qui_remonte_est_refuse() {
+        let b = banc();
+        // Aucun réseau : si la garde manquait, le téléchargement échouerait
+        // sur ce port fermé — par une autre erreur qu'un 400.
+        tune_core::db::settings_repo::SettingsRepo::with_backend(b.state.backend.clone())
+            .set("mozaik_base_url", "http://127.0.0.1:9")
+            .unwrap();
+        for nom in ["../../dehors", "..", r"..\x", "a/b"] {
+            let r = marketplace_install(
+                crate::auth::AdminOuCetteMachine,
+                Path(nom.to_string()),
+                State(b.state.clone()),
+                HeaderMap::new(),
+            )
+            .await
+            .into_response();
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{nom} accepté");
+        }
     }
 }

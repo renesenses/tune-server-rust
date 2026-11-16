@@ -139,16 +139,18 @@ pub(crate) async fn dynamic_range_analyze(State(state): State<AppState>) -> impl
     let registre = state.background_tasks.clone();
     let sur_avancement = Box::new(move |r: &Releve| {
         let _garde = &guard;
+        // #8282 — un code stable par état, que le client traduit.
+        use crate::background_tasks::Phase;
         let detail = match (r.actif, r.attente) {
-            (false, _) => "terminé",
-            (true, Some(Attente::Lecture)) => "en attente : lecture en cours",
-            (true, Some(Attente::Chaleur)) => "en attente : machine trop chaude",
-            (true, Some(Attente::Creneau)) => "en attente : une autre analyse décode",
+            (false, _) => Phase::Done,
+            (true, Some(Attente::Lecture)) => Phase::WaitingPlayback,
+            (true, Some(Attente::Chaleur)) => Phase::WaitingHeat,
+            (true, Some(Attente::Creneau)) => Phase::WaitingSlot,
             // #4574 — suspendue à la main depuis l'écran « État du serveur ».
             // Le passage reste OUVERT : sa jauge ne bouge pas et il repartira
             // au même point, d'où « en pause » et non « terminé ».
-            (true, Some(Attente::Pause)) => "en pause",
-            (true, None) => "Plage dynamique",
+            (true, Some(Attente::Pause)) => Phase::Paused,
+            (true, None) => Phase::DynamicRange,
         };
         registre.update_progress(
             TASK_ID,

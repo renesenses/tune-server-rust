@@ -388,7 +388,12 @@ async fn pg_7288_creer_une_sauvegarde_sur_postgresql() {
         ..Default::default()
     };
     let state = AppState::new(&db_path, 0, config).expect("AppState sur PostgreSQL");
-    let app: Router = tune_server::routes::router(state);
+    // Sécurité — sans authentification, la restauration ne se fait
+    // que depuis cette machine : le pair simulé est 127.0.0.1.
+    let app: Router =
+        tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+        ));
 
     let reponse = app
         .clone()

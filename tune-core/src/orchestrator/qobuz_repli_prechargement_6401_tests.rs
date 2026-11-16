@@ -23,7 +23,7 @@ use super::queue::flux_de_la_sonde_de_niveaux;
 async fn prechargement_hr_en_erreur_http_precharge_le_format_6() {
     let (etat, mut svc) = faux_qobuz(Cdn::Erreur500, Cdn::Sert).await;
 
-    let flux = resoudre_le_flux_a_precharger(&mut svc, "qobuz", "6401")
+    let flux = resoudre_le_flux_a_precharger(&mut svc, "qobuz", "6401", None)
         .await
         .expect("le préchargement doit retenir le format 6");
 
@@ -45,7 +45,7 @@ async fn prechargement_hr_en_erreur_http_precharge_le_format_6() {
 async fn prechargement_hr_coupe_au_demarrage_precharge_le_format_6() {
     let (_etat, mut svc) = faux_qobuz(Cdn::Coupe, Cdn::Sert).await;
 
-    let flux = resoudre_le_flux_a_precharger(&mut svc, "qobuz", "6401")
+    let flux = resoudre_le_flux_a_precharger(&mut svc, "qobuz", "6401", None)
         .await
         .expect("le préchargement doit retenir le format 6");
 
@@ -63,7 +63,7 @@ async fn prechargement_hr_coupe_au_demarrage_precharge_le_format_6() {
 async fn prechargement_hr_coupe_apres_un_octet_precharge_le_format_6_6658() {
     let (etat, mut svc) = faux_qobuz(Cdn::CoupeApres(1), Cdn::Sert).await;
 
-    let flux = resoudre_le_flux_a_precharger(&mut svc, "qobuz", "6401")
+    let flux = resoudre_le_flux_a_precharger(&mut svc, "qobuz", "6401", None)
         .await
         .expect("le préchargement doit retenir le format 6");
 
@@ -81,7 +81,7 @@ async fn prechargement_hr_coupe_apres_un_octet_precharge_le_format_6_6658() {
 async fn prechargement_hr_lent_reste_en_haute_resolution_6658() {
     let (etat, mut svc) = faux_qobuz(Cdn::Lent, Cdn::Sert).await;
 
-    let flux = resoudre_le_flux_a_precharger(&mut svc, "qobuz", "6401")
+    let flux = resoudre_le_flux_a_precharger(&mut svc, "qobuz", "6401", None)
         .await
         .expect("le flux HR lent doit être préchargé");
 
@@ -93,7 +93,7 @@ async fn prechargement_hr_lent_reste_en_haute_resolution_6658() {
 async fn prechargement_hr_sain_reste_en_haute_resolution() {
     let (etat, mut svc) = faux_qobuz(Cdn::Sert, Cdn::Sert).await;
 
-    let flux = resoudre_le_flux_a_precharger(&mut svc, "qobuz", "6401")
+    let flux = resoudre_le_flux_a_precharger(&mut svc, "qobuz", "6401", None)
         .await
         .expect("le flux HR sain doit être préchargé");
 

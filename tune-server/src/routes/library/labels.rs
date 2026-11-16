@@ -624,7 +624,12 @@ pub(crate) fn lancer_passes_logos(
             (n as u64).min(total)
         }
     };
-    taches.update_progress(TACHE_LOGOS_LABELS, 0, total, "labels");
+    taches.update_progress(
+        TACHE_LOGOS_LABELS,
+        0,
+        total,
+        crate::background_tasks::Phase::Labels,
+    );
     tokio::spawn(async move {
         let _garde = garde;
         let mut toutes = Box::pin(futures_util::future::join_all(passes));
@@ -632,12 +637,17 @@ pub(crate) fn lancer_passes_logos(
             tokio::select! {
                 fins = &mut toutes => break fins.into_iter().map(|r| r.unwrap_or(0)).sum(),
                 _ = tokio::time::sleep(PERIODE_AVANCEMENT) => {
-                    taches.update_progress(TACHE_LOGOS_LABELS, traites(), total, "labels");
+                    taches.update_progress(TACHE_LOGOS_LABELS, traites(), total, crate::background_tasks::Phase::Labels);
                 }
             }
         };
         let traites = traites();
-        taches.update_progress(TACHE_LOGOS_LABELS, traites, total, "labels");
+        taches.update_progress(
+            TACHE_LOGOS_LABELS,
+            traites,
+            total,
+            crate::background_tasks::Phase::Labels,
+        );
         let bilan = json!({
             "started_at": debut,
             "finished_at": maintenant(),
@@ -2273,11 +2283,18 @@ mod passe_explicite_des_logos {
         assert_eq!(web.entree(&label).unwrap().statut, Statut::Absent);
 
         // « Lancer la passe » : elle part, et le dit. Une passe d'un autre
-        // banc peut tenir l'index du web : on relance tant que le logo n'est
-        // pas inscrit.
+        // banc peut tenir l'index du web (la nôtre rend alors la main sans
+        // rien demander) : on relance tant que le logo n'est pas inscrit.
+        //
+        // Une relance ne part qu'une fois NOTRE passe finie (plus inscrite au
+        // registre), et l'état du label se relit APRÈS cette fin : avant, le
+        // banc lisait l'état, puis relançait. Si la passe inscrivait le logo
+        // et se terminait entre les deux, la relance trouvait le label résolu
+        // et répondait, à bon droit, 200 « nothing_to_do » — le banc y voyait
+        // le défaut (échec intermittent du 08/11, job « Test (PostgreSQL) »).
         let debut = std::time::Instant::now();
         let mut premiere = None;
-        while web.entree(&label).unwrap().statut != Statut::Trouve {
+        loop {
             let (code, corps) = requete(&app, "POST", "/api/v1/library/labels/logos/enrich").await;
             if code != StatusCode::CONFLICT {
                 assert_eq!(
@@ -2287,6 +2304,17 @@ mod passe_explicite_des_logos {
                      pause et que le label est noté « sans logo » (#7414) : {corps}"
                 );
                 premiere.get_or_insert(corps);
+            }
+            // La passe (la nôtre, ou celle qui tenait le registre) se termine.
+            while state.background_tasks.get(TACHE_LOGOS_LABELS).is_some() {
+                assert!(
+                    debut.elapsed() < Duration::from_secs(60),
+                    "🔴 la passe demandée ne se termine pas (#7414)"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            if web.entree(&label).unwrap().statut == Statut::Trouve {
+                break;
             }
             assert!(
                 debut.elapsed() < Duration::from_secs(60),

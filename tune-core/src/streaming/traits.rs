@@ -265,6 +265,18 @@ pub struct SearchPage {
     pub truncated: bool,
 }
 
+/// UNE page des favoris d'un type, lue chez le service (#8040).
+///
+/// `items` : les favoris de la page, sérialisés comme ceux de
+/// [`StreamingService::get_user_favorites_dated`] (même forme, même
+/// `created_at`). `total` : ce que le service annonce en tout, `None` s'il
+/// ne le dit pas.
+#[derive(Debug, Clone, Default)]
+pub struct PageFavoris {
+    pub items: Vec<serde_json::Value>,
+    pub total: Option<usize>,
+}
+
 /// Ce qu'un service SANS pagination peut réellement recevoir en `limit`
 /// (#2160).
 ///
@@ -716,6 +728,38 @@ pub struct AnneeEtGenre {
     pub genre: Option<String>,
 }
 
+/// Les rubriques qu'un service peut retirer à Tune (voir
+/// [`StreamingService::rubrique_retiree`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RubriqueRetirable {
+    /// Playlists mises en avant (`/featured`).
+    Selection,
+    /// Nouveautés (`/new-releases`).
+    Nouveautes,
+    /// Genres et leurs albums (`/genres`, `/genres/{id}/albums`).
+    Genres,
+    /// Titres phares d'un artiste (`/artists/{id}/top-tracks`).
+    TitresPhares,
+}
+
+/// L'en-tête posé sur la réponse d'une rubrique que le service a retirée à
+/// Tune : la liste est vide parce que le service ne la fournit plus, pas par
+/// panne. Valeur : `1`.
+pub const ENTETE_RUBRIQUE_RETIREE: &str = "x-tune-rubrique-retiree";
+
+/// #8481 — le pays dont le service sert le catalogue.
+///
+/// `du_compte` est celui que le compte annonce ; `choisi`, celui que
+/// l'utilisateur impose dans les Réglages (comme « PL » dans LMS) ; `effectif`,
+/// celui qui part réellement dans les requêtes (`choisi`, à défaut
+/// `du_compte`, à défaut le repli du service).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PaysDuCatalogue {
+    pub du_compte: Option<String>,
+    pub choisi: Option<String>,
+    pub effectif: String,
+}
+
 #[async_trait::async_trait]
 pub trait StreamingService: Send + Sync {
     fn as_any(&self) -> &dyn std::any::Any;
@@ -723,6 +767,23 @@ pub trait StreamingService: Send + Sync {
     fn name(&self) -> &str;
     fn enabled(&self) -> bool;
     fn set_enabled(&mut self, enabled: bool);
+
+    /// #8481 — le pays du catalogue, pour les services qui le laissent
+    /// choisir. `None` : le service ne le permet pas (Qobuz, par exemple, sert
+    /// toujours le magasin du compte, aucune requête n'accepte de pays).
+    fn pays_du_catalogue(&self) -> Option<PaysDuCatalogue> {
+        None
+    }
+
+    /// #8481 — imposer (`Some("PL")`) ou rendre au compte (`None`) le pays du
+    /// catalogue. Refuse un code qui n'est pas ISO 3166-1 alpha-2, et tout
+    /// service qui ne le permet pas.
+    fn choisir_le_pays_du_catalogue(&mut self, _pays: Option<&str>) -> Result<(), String> {
+        Err(format!(
+            "{} : le pays du catalogue ne se choisit pas",
+            self.name()
+        ))
+    }
 
     async fn authenticate(
         &mut self,
@@ -885,6 +946,19 @@ pub trait StreamingService: Send + Sync {
     fn propose_des_artistes_similaires(&self) -> bool {
         false
     }
+    /// Fil 2694 (Ilan, « comme Roon ») — la radio d'UN titre telle que le
+    /// service la compose (TIDAL : `GET /tracks/{id}/radio`). Sert la radio de
+    /// fin de file, qui la préfère aux artistes similaires quand la piste qui
+    /// s'achève vient de ce service. Défaut vide : un service sans radio de
+    /// titre laisse la main au chemin des artistes similaires.
+    async fn get_track_radio(
+        &self,
+        track_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StreamTrack>, TuneError> {
+        let _ = (track_id, limit);
+        Ok(vec![])
+    }
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError>;
     async fn get_playlist_tracks(&self, playlist_id: &str) -> Result<Vec<StreamTrack>, TuneError>;
     /// Les pistes d'une playlist, chacune avec son année et son genre quand le
@@ -990,6 +1064,16 @@ pub trait StreamingService: Send + Sync {
     /// tous les services et le clic rendrait un 501. On le laisse à `false` et
     /// chaque service qui sait vraiment le faire le relève.
     fn supports_playlist_delete(&self) -> bool {
+        false
+    }
+
+    /// Le service a-t-il RETIRÉ cette rubrique à Tune (et non : elle est
+    /// vide, ou en panne) ? Spotify ferme des points d'accès aux applications
+    /// personnelles (#8399, #8485, février 2026) : la route le dit à l'écran
+    /// par l'en-tête [`ENTETE_RUBRIQUE_RETIREE`], qui affiche une phrase au
+    /// lieu d'une rubrique vide. Lu APRÈS l'appel de la rubrique.
+    fn rubrique_retiree(&self, rubrique: RubriqueRetirable) -> bool {
+        let _ = rubrique;
         false
     }
 
@@ -1296,6 +1380,28 @@ pub trait StreamingService: Send + Sync {
         fav_type: &str,
     ) -> Result<Option<Vec<serde_json::Value>>, TuneError> {
         self.get_user_favorites_dated(fav_type).await
+    }
+
+    /// #8040 — UNE page des favoris d'un type, lue chez le service, pour que
+    /// l'écran affiche la première page tout de suite au lieu d'attendre
+    /// toutes les pages.
+    ///
+    /// `Ok(None)` — le défaut — signifie « ce connecteur ne sait pas lire une
+    /// page seule » : l'appelant lit alors la liste entière et la découpe
+    /// lui-même. Un connecteur qui ne surcharge rien se comporte donc comme
+    /// avant, et le contrat de la route tient pour tous.
+    ///
+    /// Une surcharge ne fait QU'UNE requête au service et rend les favoris
+    /// dans la forme de [`Self::get_user_favorites_dated`]. Elle ne doit pas
+    /// être lue par le miroir (#5997), qui exige la liste complète.
+    async fn get_user_favorites_page(
+        &self,
+        fav_type: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Option<PageFavoris>, TuneError> {
+        let _ = (fav_type, limit, offset);
+        Ok(None)
     }
     /// #4577 — ce service accepte-t-il qu'on ÉCRIVE ses favoris ?
     ///

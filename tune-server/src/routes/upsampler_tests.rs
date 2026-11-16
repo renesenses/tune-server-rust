@@ -106,3 +106,60 @@ async fn premier_usage_mesure_la_machine_puis_le_reglage_s_applique() {
     // `admitted_filters`, la cadence est écartée à l'ouverture).
     assert!(v["constraint"].is_null(), "{v}");
 }
+
+/// #8149 (GgB, fil 2742) — une zone prête à suréchantillonner (Premium,
+/// greffon actif, réglage activé, machine mesurée), sur `peripherique`.
+async fn zone_prete(peripherique: &str) -> (AppState, i64) {
+    let state = etat();
+    state.license.set_account_premium(true, None).await;
+    let s = settings(&state);
+    s.set(tune_core::audio::premium_plugins::MIGRATION, "complete")
+        .unwrap();
+    s.set(&format!("plugin_{}_installed", su::ID), "true")
+        .unwrap();
+    s.set(&format!("plugin_{}_enabled", su::ID), "true")
+        .unwrap();
+    su::enregistrer_le_verdict(
+        &s,
+        &su::VerdictMachine {
+            simd_path: "essai".into(),
+            margin: 3.0,
+            results: Vec::new(),
+            measured_at: 0,
+        },
+    )
+    .unwrap();
+    let type_de_sortie = peripherique.split(':').next().unwrap();
+    let id = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .create("Salon", Some(type_de_sortie), Some(peripherique))
+        .unwrap();
+    su::enregistrer_les_reglages(&s, id, &json!({"enabled": true})).unwrap();
+    (state, id)
+}
+
+/// #8149 — le « bit-perfect strict » de la zone refuse toute conversion de
+/// cadence : l'écran du suréchantillonnage doit le dire (GgB l'a trouvé seul,
+/// le journal était le seul à le savoir). Sans le strict, aucune contrainte.
+#[tokio::test]
+async fn le_bit_perfect_strict_de_la_zone_est_dit_a_l_ecran_8149() {
+    let (state, id) = zone_prete("local:hw:CARD=0,DEV=0").await;
+    let Json(v) = lire_zone(State(state.clone()), Path(id)).await;
+    assert!(v["constraint"].is_null(), "témoin sans strict : {v}");
+    settings(&state)
+        .set(
+            &tune_core::audio::bitperfect_strict::cle_de_zone(id),
+            "true",
+        )
+        .unwrap();
+    let Json(v) = lire_zone(State(state), Path(id)).await;
+    assert_eq!(v["constraint"], "strict_bitperfect", "{v}");
+}
+
+/// #8149 — une zone réseau ne reçoit pas le suréchantillonneur : l'écran le
+/// dit, avec le même code que le chemin du signal.
+#[tokio::test]
+async fn une_zone_reseau_est_dite_non_prise_en_charge_8149() {
+    let (state, id) = zone_prete("dlna:uuid:eversolo-dmp-a8").await;
+    let Json(v) = lire_zone(State(state), Path(id)).await;
+    assert_eq!(v["constraint"], "output_not_supported", "{v}");
+}

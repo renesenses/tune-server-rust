@@ -127,3 +127,161 @@ fn un_fil_local_a_une_autre_cadence_reste_une_conversion_6166() {
         "44,1 → 48 kHz n'est pas un simple conteneur : {sp}"
     );
 }
+
+// ── #8629 (fil 2789) — radio FLAC 96/24 vers une sortie locale ALSA ──────
+
+fn radio_playing() -> ZoneState {
+    ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            title: "High-Res Live Radio".into(),
+            source: "radio".into(),
+            format: Some("wav".into()),
+            sample_rate: Some(96_000),
+            bit_depth: Some(24),
+            stream_id: Some("sid-8629".into()),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    }
+}
+
+/// Le fil d'une radio : décodé en WAV, avec ce que le flux annonçait.
+fn fil_radio(
+    codec: &'static str,
+    source_rate: u32,
+    source_bits: Option<u16>,
+    wire_rate: u32,
+    wire_bits: u16,
+) -> StreamInfo {
+    use tune_core::http::streamer::RadioSourceInfo;
+    StreamInfo {
+        radio_source: Some(RadioSourceInfo {
+            channels: Some(2),
+            format: Some(codec),
+            sample_rate: Some(source_rate),
+            bit_depth: source_bits,
+            ..Default::default()
+        }),
+        ..fil_a(wire_rate, wire_bits)
+    }
+}
+
+/// ⭐ Le cas du signalement : FLAC 96/24 décodé en WAV 24/96 pour la sortie
+/// locale. Aucun échantillon touché : pas d'étape Transcoder, badge global
+/// bit-perfect.
+#[test]
+fn une_radio_flac_24_bits_sur_sortie_locale_n_a_pas_d_etape_fantome_8629() {
+    let (backend, zone) = zone("local", "local:alsa:ADI-2");
+    let sp = build_signal_path(
+        &radio_playing(),
+        &zone,
+        &backend,
+        Some("ADI-2"),
+        "ALSA",
+        Some(&fil_radio("flac", 96_000, Some(24), 96_000, 24)),
+    )
+    .unwrap();
+    assert!(
+        transcoder(&sp).is_none(),
+        "WAV 24/96 interne pour une source 24/96 : pas de transcodage : {sp}"
+    );
+    assert_eq!(sp["bit_perfect"], true, "fil intact : {sp}");
+    assert_eq!(sp["lossless"], true, "{sp}");
+}
+
+/// Même règle pour un fichier FLAC 24 bits servi en WAV 24 bits localement.
+#[test]
+fn un_fil_local_wav_de_meme_profondeur_n_est_pas_une_conversion_8629() {
+    for bd in [16u16, 24] {
+        let (backend, zone) = zone("local", "local:alsa:SMSL USB");
+        let sp = build_signal_path(
+            &flac_playing(i32::from(bd)),
+            &zone,
+            &backend,
+            Some("SMSL USB"),
+            "ALSA",
+            Some(&fil(bd)),
+        )
+        .unwrap();
+        assert!(transcoder(&sp).is_none(), "FLAC {bd} → WAV {bd} : {sp}");
+    }
+}
+
+/// Contre-épreuve DLNA : FLAC 24 bits servi en WAV sans `dlna_wav24` garde
+/// son verdict (règle du plafond LPCM 16 bits), même pour une radio.
+#[test]
+fn la_regle_lpcm_16_bits_reste_celle_du_dlna_8629() {
+    let (backend, zone) = zone("dlna", "dev-1");
+    let flac = build_signal_path(
+        &flac_playing(24),
+        &zone,
+        &backend,
+        Some("Wiim Pro"),
+        "none",
+        Some(&fil(24)),
+    )
+    .unwrap();
+    let etape = transcoder(&flac).expect("FLAC → WAV vers un renderer transcode");
+    assert_eq!(etape["bit_perfect"], false, "sans dlna_wav24 : {etape}");
+
+    let radio = build_signal_path(
+        &radio_playing(),
+        &zone,
+        &backend,
+        Some("Wiim Pro"),
+        "none",
+        Some(&fil_radio("flac", 96_000, Some(24), 96_000, 24)),
+    )
+    .unwrap();
+    let etape = transcoder(&radio).expect("radio FLAC servie en WAV à un renderer");
+    assert_eq!(etape["bit_perfect"], false, "sans dlna_wav24 : {etape}");
+}
+
+/// Les vraies conversions sur sortie locale restent signalées : fil plus
+/// étroit que la source, rééchantillonnage, source avec perte.
+#[test]
+fn les_vraies_conversions_locales_restent_signalees_8629() {
+    let (backend, zone) = zone("local", "local:alsa:ADI-2");
+    // 24 → 16 bits : troncature.
+    let sp = build_signal_path(
+        &radio_playing(),
+        &zone,
+        &backend,
+        Some("ADI-2"),
+        "ALSA",
+        Some(&fil_radio("flac", 96_000, Some(24), 96_000, 16)),
+    )
+    .unwrap();
+    let etape = transcoder(&sp).expect("24 → 16 bits est une conversion");
+    assert_eq!(etape["bit_perfect"], false, "{etape}");
+    assert_eq!(sp["bit_perfect"], false, "{sp}");
+
+    // 96 → 48 kHz : rééchantillonnage.
+    let sp = build_signal_path(
+        &radio_playing(),
+        &zone,
+        &backend,
+        Some("ADI-2"),
+        "ALSA",
+        Some(&fil_radio("flac", 96_000, Some(24), 48_000, 24)),
+    )
+    .unwrap();
+    assert!(transcoder(&sp).is_some(), "96 → 48 kHz : {sp}");
+    assert_eq!(sp["bit_perfect"], false, "{sp}");
+
+    // MP3 décodé en WAV 16 bits : avec perte, jamais bit-perfect.
+    let sp = build_signal_path(
+        &radio_playing(),
+        &zone,
+        &backend,
+        Some("ADI-2"),
+        "ALSA",
+        Some(&fil_radio("mp3", 44_100, None, 44_100, 16)),
+    )
+    .unwrap();
+    assert!(transcoder(&sp).is_some(), "MP3 → WAV 16 bits : {sp}");
+    assert_eq!(sp["bit_perfect"], false, "{sp}");
+    assert_eq!(sp["lossless"], false, "{sp}");
+}

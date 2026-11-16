@@ -168,7 +168,7 @@ pub(crate) fn injecter_sortie_absente(
 /// Les sorties locales enregistrées qui s'ouvrent en ASIO : `(device_id,
 /// nom du pilote)`.
 #[cfg(feature = "local-audio")]
-async fn sorties_asio(state: &AppState) -> Vec<(String, String)> {
+pub(super) async fn sorties_asio(state: &AppState) -> Vec<(String, String)> {
     let ids = state.outputs.lock().await.list();
     let mut asio = Vec::new();
     for id in ids.into_iter().filter(|id| id.starts_with("local:")) {
@@ -185,7 +185,7 @@ async fn sorties_asio(state: &AppState) -> Vec<(String, String)> {
 }
 
 #[cfg(not(feature = "local-audio"))]
-async fn sorties_asio(_state: &AppState) -> Vec<(String, String)> {
+pub(super) async fn sorties_asio(_state: &AppState) -> Vec<(String, String)> {
     Vec::new()
 }
 

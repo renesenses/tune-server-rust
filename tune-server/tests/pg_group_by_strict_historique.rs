@@ -362,3 +362,108 @@ async fn pg_ecoutes_importees_comptees_partout_7777() {
     let ecarts = scenario_ecoutes_importees(&state).await;
     assert!(ecarts.is_empty(), "PostgreSQL : {ecarts:#?}");
 }
+
+/// #8140 — la piste d'une écoute se retrouve par titre ET interprète (casse et
+/// accents ignorés), jamais par le titre seul ; `source`, `source_id` et
+/// l'album du service viennent de la même ligne. Ici pour PostgreSQL :
+/// `unaccent` y vient de l'extension, et la requête ajoute un `LEFT JOIN` de
+/// la ligne représentative que seul PostgreSQL type strictement.
+async fn scenario_homonymes_8140(state: &AppState) -> Vec<String> {
+    let menage = [
+        "DELETE FROM listen_history",
+        "DELETE FROM imported_plays",
+        "DELETE FROM tracks WHERE id IN (814001, 814002)",
+        "DELETE FROM albums WHERE id IN (814001, 814002)",
+        "DELETE FROM artists WHERE id IN (814001, 814002)",
+    ];
+    for sql in menage {
+        executer(state, sql);
+    }
+    for sql in [
+        "INSERT INTO artists (id, name) VALUES (814001, 'Léo Ferré')",
+        "INSERT INTO artists (id, name) VALUES (814002, 'Brassens')",
+        "INSERT INTO albums (id, title, artist_id, cover_path) VALUES (814001, 'Album LF', 814001, 'lf.jpg')",
+        "INSERT INTO albums (id, title, artist_id, cover_path) VALUES (814002, 'Album GB', 814002, 'gb.jpg')",
+        "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format) \
+         VALUES (814001, 'Marianne', 814001, 814001, '/m/8140/1.flac', 'flac')",
+        "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format) \
+         VALUES (814002, 'Marianne', 814002, 814002, '/m/8140/2.flac', 'flac')",
+        "INSERT INTO listen_history (title, artist_name, album_title, source, source_id, album_ref) \
+         VALUES ('Marianne', 'Quelqu''un', 'Album Deezer', 'deezer', 'dz-1', 'dz-alb-9')",
+        "INSERT INTO listen_history (title, artist_name, album_title, source, source_id, album_ref) \
+         VALUES ('Marianne', 'LEO FERRE', 'Ferré chez Deezer', 'deezer', 'dz-2', 'dz-alb-7')",
+        "INSERT INTO listen_history (title, artist_name, album_title, source) \
+         VALUES ('Marianne', 'Brassens', 'Album GB', 'local')",
+    ] {
+        executer(state, sql);
+    }
+
+    let top = corps(state, "/api/v1/history/top-tracks?limit=10").await;
+    let lignes = top.as_array().cloned().unwrap_or_default();
+    let de = |artiste: &str| {
+        lignes
+            .iter()
+            .find(|l| l["artist_name"] == artiste)
+            .cloned()
+            .unwrap_or(Value::Null)
+    };
+    let mut ecarts = Vec::new();
+    let attendus: [(&str, Option<i64>, &str, Option<&str>, &str); 3] = [
+        ("Quelqu'un", None, "deezer", Some("dz-1"), "Album Deezer"),
+        (
+            "LEO FERRE",
+            Some(814001),
+            "deezer",
+            Some("dz-2"),
+            "Ferré chez Deezer",
+        ),
+        ("Brassens", Some(814002), "local", None, "Album GB"),
+    ];
+    for (artiste, tid, source, sid, album) in attendus {
+        let l = de(artiste);
+        let obtenu = (
+            l["track_id"].as_i64(),
+            l["source"].as_str().unwrap_or_default().to_string(),
+            l["source_id"].as_str().map(str::to_string),
+            l["album_title"].as_str().unwrap_or_default().to_string(),
+        );
+        let attendu = (
+            tid,
+            source.to_string(),
+            sid.map(str::to_string),
+            album.to_string(),
+        );
+        if obtenu != attendu {
+            ecarts.push(format!(
+                "top-tracks {artiste} : {obtenu:?}, attendu {attendu:?} ({l})"
+            ));
+        }
+    }
+    for sql in menage {
+        executer(state, sql);
+    }
+    ecarts
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn top_tracks_par_titre_et_interprete_sur_sqlite_8140() {
+    let state = AppState::new(":memory:", 0, Default::default()).expect("AppState SQLite");
+    let ecarts = scenario_homonymes_8140(&state).await;
+    assert!(ecarts.is_empty(), "SQLite : {ecarts:#?}");
+}
+
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_top_tracks_par_titre_et_interprete_8140() {
+    let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+        eprintln!("TUNE_TEST_PG_URL absente — épreuve PostgreSQL sautée");
+        return;
+    };
+    let config = tune_server::config::TuneConfig {
+        database_url: Some(url),
+        ..Default::default()
+    };
+    let state = AppState::new("", 0, config).expect("AppState sur PostgreSQL");
+    let ecarts = scenario_homonymes_8140(&state).await;
+    assert!(ecarts.is_empty(), "PostgreSQL : {ecarts:#?}");
+}

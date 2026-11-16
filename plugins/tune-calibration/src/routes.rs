@@ -19,7 +19,8 @@
 //!   rectangulaire sans micro (C5) : dimensions, surfaces, positions ;
 //!   modes, réponse estimée à la place d'écoute (201, `{ "id", … }`) ;
 //! * `POST /simulations/{id}/correction` — proposition C2 sur la réponse
-//!   estimée, plus prudente que sur mesure, marquée estimation ;
+//!   estimée, plus prudente que sur mesure, marquée estimation ; avec
+//!   `"expert": true` (#8332), maxima d'une mesure, défauts inchangés ;
 //! * `POST /simulations/{id}/correction/profil` — la même, enregistrée comme
 //!   profil de pièce de la zone (`zone_id` de la simulation ou du corps).
 //!
@@ -519,6 +520,7 @@ fn proposition_estimee(
     etat: &EtatRoutes,
     id: &str,
     demande: &DemandeCorrection,
+    expert: bool,
 ) -> Result<(Option<i64>, Proposition), Response> {
     let Some(sim) = etat.controleur.simulations.simulation(id) else {
         return Err(refus(
@@ -527,23 +529,34 @@ fn proposition_estimee(
             format!("aucune simulation « {id} »"),
         ));
     };
-    let p = proposer_estimation(&sim, demande)
+    let p = proposer_estimation(&sim, demande, expert)
         .map_err(|e| refus(StatusCode::UNPROCESSABLE_ENTITY, "correction_refusee", e))?;
     Ok((sim.entree.zone_id, p))
+}
+
+/// La demande de correction d'une estimation : celle de C2, plus le mode
+/// expert (#8332), faux par défaut.
+#[derive(Deserialize)]
+struct DemandeEstimee {
+    #[serde(flatten)]
+    demande: DemandeCorrection,
+    #[serde(default)]
+    expert: bool,
 }
 
 async fn simulation_correction(
     State(etat): State<EtatRoutes>,
     Path(id): Path<String>,
-    Json(d): Json<DemandeCorrection>,
+    Json(d): Json<DemandeEstimee>,
 ) -> Response {
-    match proposition_estimee(&etat, &id, &d) {
+    match proposition_estimee(&etat, &id, &d.demande, d.expert) {
         Ok((zone_id, p)) => {
             let mut v = serde_json::to_value(&p).unwrap_or(Value::Null);
             if let Some(o) = v.as_object_mut() {
                 o.insert("id".into(), json!(id));
                 o.insert("zone_id".into(), json!(zone_id));
                 o.insert("estimation".into(), json!(true));
+                o.insert("expert".into(), json!(d.expert));
             }
             Json(v).into_response()
         }
@@ -558,6 +571,9 @@ struct DemandeProfilEstime {
     nom: Option<String>,
     /// Remplace la zone donnée à la simulation.
     zone_id: Option<i64>,
+    /// Bornes relevées à celles d'une mesure (#8332).
+    #[serde(default)]
+    expert: bool,
 }
 
 async fn simulation_correction_profil(
@@ -565,7 +581,7 @@ async fn simulation_correction_profil(
     Path(id): Path<String>,
     Json(d): Json<DemandeProfilEstime>,
 ) -> Response {
-    let (zone_sim, p) = match proposition_estimee(&etat, &id, &d.demande) {
+    let (zone_sim, p) = match proposition_estimee(&etat, &id, &d.demande, d.expert) {
         Ok(x) => x,
         Err(r) => return r,
     };

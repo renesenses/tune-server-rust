@@ -52,7 +52,7 @@ RUN cargo install cargo-about --version 0.9.3 --locked && \
 # touch a placeholder so a local build still succeeds (AirPlay 2 then falls back
 # to legacy AirPlay 1). The release path (Dockerfile.dist) requires it.
 RUN cargo install --git https://github.com/renesenses/airplay2-rs \
-      --rev 83a7def6ab39d3709fa47a40eb90993b64afe9b4 airplay-daemon --locked \
+      --rev d58df6265ac9137e92e3c4d8093f12d0360f1a15 airplay-daemon --locked \
     || touch /usr/local/cargo/bin/airplay-daemon
 
 # Build real source — clean dummy artifacts to force recompilation
@@ -108,10 +108,15 @@ FROM debian:bookworm-slim
 
 # `upgrade` : base à jour au moment de la construction.
 # curl sert au HEALTHCHECK ; libstdc++6 et libgcc-s1 à fpcalc (arm64).
+# cdparanoia : extracteur du CD audio (#8141), cherché dans le PATH par
+# Bibliothèque › Extraction CD ; sans lui, « aucun outil d'extraction ».
+# smbclient : énumération des partages SMB (Emplacements › Partage SMB, #8628,
+# fil 2788) ; sans lui, la recherche répond « smbclient absent ».
 RUN apt-get update && \
     apt-get upgrade -y --no-install-recommends && \
     apt-get install -y --no-install-recommends \
-      ca-certificates curl libasound2 python3-pip libstdc++6 libgcc-s1 && \
+      ca-certificates curl libasound2 python3-pip libstdc++6 libgcc-s1 \
+      cdparanoia smbclient && \
     pip3 install --break-system-packages yt-dlp && \
     rm -rf /var/lib/apt/lists/*
 
@@ -143,7 +148,10 @@ COPY --from=web /web/dist/ /app/web/
 RUN chown -R root:root /app && chmod -R 755 /app
 
 # Create data + artwork_cache directories owned by tune
-RUN mkdir -p /data/artwork_cache && chown -R tune:tune /data
+# #8675 — the acoustic-analysis models (audio, text, onnxruntime) go under
+# /data too: the server runs as `tune` in a root-owned /app, where the former
+# relative default (/app/embedding_models) could never be created.
+RUN mkdir -p /data/artwork_cache /data/embedding_models && chown -R tune:tune /data
 
 # Plugins the user installs live under /data (owned by `tune`, kept across
 # image upgrades). The ones shipped in /app/plugins stay read-only: uninstalling
@@ -152,6 +160,7 @@ ENV TUNE_PORT=8888 \
     TUNE_DB_PATH=/data/tune.db \
     TUNE_LIBRESPOT=/usr/local/bin/librespot \
     TUNE_ARTWORK_DIR=/data/artwork_cache \
+    TUNE_EMBEDDING_MODELS_DIR=/data/embedding_models \
     TUNE_PLUGINS_USER_DIR=/data/plugins \
     TUNE_WEB_DIR=/app/web \
     TUNE_MUSIC_DIRS='["/music"]' \

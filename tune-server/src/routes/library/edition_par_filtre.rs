@@ -411,10 +411,20 @@ fn lancer_la_passe(
         let (mut ecrits, mut sautes, mut erreurs) = (0usize, 0usize, 0usize);
         let mut refus: Vec<Value> = Vec::new();
         let mut fin = "done";
-        taches.update_progress(TACHE_FICHIERS, 0, total as u64, "Fichiers");
+        taches.update_progress(
+            TACHE_FICHIERS,
+            0,
+            total as u64,
+            crate::background_tasks::Phase::Files,
+        );
         for (i, f) in fichiers.iter().enumerate() {
             if i % 25 == 0 {
-                taches.update_progress(TACHE_FICHIERS, i as u64, total as u64, "Fichiers");
+                taches.update_progress(
+                    TACHE_FICHIERS,
+                    i as u64,
+                    total as u64,
+                    crate::background_tasks::Phase::Files,
+                );
                 publier_statut(
                     &state2,
                     &json!({"status": "running", "task_id": id2, "field": champ.nom(),

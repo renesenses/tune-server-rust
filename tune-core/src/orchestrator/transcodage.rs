@@ -424,6 +424,24 @@ pub(super) struct TrancheSource {
     pub(super) duree_s: f64,
 }
 
+/// **Tests seulement** (#8558) : [`transcode_source_to_file`] sans aucun
+/// traitement, pour que `tests/transcodage_memoire_bornee_8558.rs` mesure le
+/// pic de mémoire du bras fichier dans son propre binaire.
+#[doc(hidden)]
+pub async fn transcoder_vers_un_fichier_8558(
+    source: String,
+    out_sr: u32,
+    channels: u16,
+    target_bd: u16,
+    target_fmt: String,
+    dest: String,
+) -> Result<(u64, Vec<u8>, u16), String> {
+    transcode_source_to_file(
+        source, out_sr, channels, target_bd, target_fmt, None, None, None, dest, None, None, None,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn transcode_source_to_file(
     source: String,
@@ -517,6 +535,11 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
 
     let mut pcm_bytes = decoded.pcm_bytes();
     let mut actual_bd = decoded.bit_depth;
+    // #8558 — les échantillons `i32` de la piste entière sont libérés dès
+    // que leurs octets existent : ils restaient vivants jusqu'à la fin, à côté
+    // du PCM, de l'encodeur et du fichier encodé (forum, fil 2777).
+    let (decoded_sample_rate, decoded_channels) = (decoded.sample_rate, decoded.channels);
+    drop(decoded);
     // #4455 — ce que la ligne de synthèse doit DIRE de la chaîne : la
     // profondeur décodée, le gain appliqué, les étages actifs. Le rapport
     // de Sevy Tabroc ne permettait pas de savoir si le WAV 24 bits servi au
@@ -600,7 +623,7 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
     // 1e. Le crossfeed EN DERNIER, comme `StreamingDsp::process` et la sortie
     // locale : il élargit ou resserre l'image d'un signal déjà corrigé (#2742).
     if let Some(mut cf) = crossfeed {
-        cf.process_pcm(&mut pcm_bytes, actual_bd, decoded.channels as u16);
+        cf.process_pcm(&mut pcm_bytes, actual_bd, decoded_channels as u16);
     }
 
     // 1f. #5071 — la compensation de niveau APRÈS tous les étages. Le PCM de
@@ -615,20 +638,28 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
     // 2. Encode to the target format.
     let mut encoder = crate::audio::encoder::AudioEncoder::new(
         &target_fmt,
-        decoded.sample_rate,
+        decoded_sample_rate,
         actual_bd as u32,
-        decoded.channels,
+        decoded_channels,
     );
     encoder.start().await?;
-    encoder.write(&pcm_bytes).await?;
+    // #8558 — par tranches : l'encodeur FLAC convertit chaque `write` en
+    // `i32` puis le répartit par canal AVANT d'encoder. Un seul `write` de la
+    // piste entière en faisait deux copies complètes de plus. Les blocs FLAC
+    // se forment aux mêmes frontières : le fichier écrit est identique.
+    let octets_par_trame = (actual_bd as usize).div_ceil(8) * (decoded_channels as usize).max(1);
+    for tranche in pcm_bytes.chunks(octets_par_trame * 64 * 1024) {
+        encoder.write(tranche).await?;
+    }
     let encoded_data = encoder.finish().await?;
     let encode_ms = chrono.elapsed().as_millis() as u64 - decode_ms - traitement_ms;
 
     // 3. Write to `dest` (blocking I/O).
     let file_size = encoded_data.len() as u64;
-    let encoded_clone = encoded_data.clone();
+    // #8558 — le fichier encodé part tel quel dans la tâche d'écriture, et y
+    // meurt : il était cloné, et l'original survivait jusqu'au retour.
     tokio::task::spawn_blocking(move || {
-        ecrire_sauf_si_abandonne(&dest, &encoded_clone, abandon.as_deref())
+        ecrire_sauf_si_abandonne(&dest, &encoded_data, abandon.as_deref())
     })
     .await
     .map_err(|e| format!("write task panic: {e}"))??;
@@ -641,8 +672,8 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
         ecriture_ms = total_ms - decode_ms - traitement_ms - encode_ms,
         total_ms,
         octets = file_size,
-        sample_rate = decoded.sample_rate,
-        channels = decoded.channels,
+        sample_rate = decoded_sample_rate,
+        channels = decoded_channels,
         source_bd,
         cible_bd = actual_bd,
         replaygain_db = ?replaygain_db,

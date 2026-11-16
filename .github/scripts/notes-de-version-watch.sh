@@ -36,8 +36,12 @@
 #   FENETRE_HEURES          profondeur d'examen en arriere (72)
 #   MAINTENANT_ISO          instant de reference UTC — pour les tests uniquement
 #   SANS_ISSUE              a 1, n'ouvre aucune issue : diagnostic seul
-#   ITEMS_MINIMUM           items attendus d'une note, forme A (5)
-#   FORME_DEPUIS            date a partir de laquelle la forme A est exigee
+#   ITEMS_MINIMUM           items attendus d'une note, forme A (5) — seuil du
+#                           mode `--forme`, AVANT publication
+#   ITEMS_MINIMUM_VEILLE    items en dessous desquels la sonde horaire crie
+#                           sur une note deja publiee (1 : le panneau ne rend
+#                           RIEN — voir « deux seuils » plus bas, #7861)
+#   FORME_DEPUIS           date a partir de laquelle la forme A est exigee
 #                           (2026-09-23 — decision de Bertrand ; les notes
 #                           publiees avant ne sont PAS reecrites)
 #   FORME_COMBIEN           nombre de notes recentes examinees au plus (5)
@@ -79,19 +83,36 @@
 #
 # C'est la le vrai usage : constater apres coup vaut mieux que rien, refuser
 # avant de publier vaut mieux que constater.
+#
+# Deux seuils, pas un (#7861). La forme A demande 5 a 8 puces : c'est une
+# regle de REDACTION, et elle se tient la ou elle se tient — en `--forme`,
+# avant `gh release edit`. Le panneau, lui, n'a qu'un seuil : a ZERO item il
+# rend « Release x.y.z » (`changelog`, update.rs) ; a un item il affiche cet
+# item. La sonde horaire juge des notes deja publiees, qu'on s'est interdit de
+# reecrire : elle ne crie donc que sur ce que le testeur ne verra PAS
+# (`ITEMS_MINIMUM_VEILLE`, 1), et se contente de DIRE qu'une note est courte.
+#
+# Le 27/10/2026, la v1.0.0-rc8.1 — un correctif, une seule correction, un seul
+# item que le panneau affichait tres bien — a fait crier la sonde toutes les
+# heures pendant deux semaines, sous un texte faux (« le panneau n'en tire
+# rien »), et rouvrir le jour meme une issue que Bertrand venait de fermer en
+# admettant l'alerte (#7162 → #7861). Un correctif n'a pas cinq choses a dire.
 
 set -u
 
 ICI="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LECTEUR_DE_FORME="$ICI/forme-des-notes.awk"
 ITEMS_MINIMUM="${ITEMS_MINIMUM:-5}"
+ITEMS_MINIMUM_VEILLE="${ITEMS_MINIMUM_VEILLE:-1}"
 FORME_DEPUIS="${FORME_DEPUIS:-2026-09-23}"
 
-# `verifier_la_forme <etiquette> <fichier>` — 0 si la note rend assez d'items,
-# 1 sinon. Ecrit son verdict sur la sortie standard, dans les deux cas : un
-# controle qui ne dit rien quand il passe n'apprend a personne ce qu'il mesure.
+# `verifier_la_forme <etiquette> <fichier> [seuil]` — 0 si la note rend au
+# moins `seuil` items (`ITEMS_MINIMUM` par defaut), 1 sinon. Ecrit son verdict
+# sur la sortie standard, dans les deux cas : un controle qui ne dit rien quand
+# il passe n'apprend a personne ce qu'il mesure. Sous le seuil de la forme A
+# mais au-dessus du sien, la note passe en se faisant dire courte.
 verifier_la_forme() {
-  local etiquette="$1" fichier="$2"
+  local etiquette="$1" fichier="$2" seuil="${3:-$ITEMS_MINIMUM}"
   local sortie f a c total langues
   if ! sortie=$(awk -f "$LECTEUR_DE_FORME" < "$fichier" 2>&1); then
     printf '%s : lecture impossible — %s\n' "$etiquette" "$sortie"
@@ -112,11 +133,16 @@ verifier_la_forme() {
       "$etiquette"
   fi
 
-  if [ "$total" -lt "$ITEMS_MINIMUM" ]; then
+  if [ "$total" -lt "$seuil" ]; then
     printf '%s : %d item(s) pour le panneau (%d nouveautes, %d ameliorations, %d corrections)' \
       "$etiquette" "$total" "$f" "$a" "$c"
-    printf ' — il en faut au moins %d.\n' "$ITEMS_MINIMUM"
+    printf ' — il en faut au moins %d.\n' "$seuil"
     return 1
+  fi
+  if [ "$total" -lt "$ITEMS_MINIMUM" ]; then
+    printf '%s : note courte, %d item(s) (%d nouveautes, %d ameliorations, %d corrections) — la forme A en demande %d, le panneau les affichera ; langues : %s\n' \
+      "$etiquette" "$total" "$f" "$a" "$c" "$ITEMS_MINIMUM" "$langues"
+    return 0
   fi
   printf '%s : %d items (%d nouveautes, %d ameliorations, %d corrections) — langues : %s\n' \
     "$etiquette" "$total" "$f" "$a" "$c" "$langues"
@@ -412,6 +438,11 @@ fi
 # `FORME_DEPUIS` borne le controle aux notes ecrites sous la regle : les notes
 # anterieures ne sont pas reecrites (decision du 23/09/2026), donc crier
 # dessus n'apprendrait rien et rendrait la sonde rouge a perpetuite.
+#
+# Le seuil est celui de la VEILLE (`ITEMS_MINIMUM_VEILLE`), pas celui de la
+# forme A : une note publiee ne se reecrit pas non plus, et le panneau affiche
+# tout item qu'il trouve. Un correctif a une correction (la rc8.1) est court,
+# pas illisible — voir « deux seuils » en tete (#7861).
 FORME_KO=""
 CANDIDATES=$(jq -r --arg depuis "$FORME_DEPUIS" '
   .[]
@@ -430,7 +461,7 @@ if [ -n "$CANDIDATES" ]; then
       echo "  $tag : corps illisible — non juge."
       continue
     fi
-    if ! verifier_la_forme "  $tag" "$TRAVAIL/corps-$tag.md"; then
+    if ! verifier_la_forme "  $tag" "$TRAVAIL/corps-$tag.md" "$ITEMS_MINIMUM_VEILLE"; then
       FORME_KO="${FORME_KO}${tag}"$'\n'
     fi
   done <<< "$CANDIDATES"
@@ -459,7 +490,7 @@ fi
   fi
   if [ -n "$FORME_KO" ]; then
     printf 'Ces notes existent mais le **panneau de mise a jour n en tire rien** :\n'
-    printf 'moins de %s items apres le decoupage de `parse_release_body`, donc\n' "$ITEMS_MINIMUM"
+    printf 'moins de %s item(s) apres le decoupage de `parse_release_body`, donc\n' "$ITEMS_MINIMUM_VEILLE"
     printf 'une entree reduite a « Release x.y.z » chez le testeur (#4190).\n\n'
     printf '%s\n' "$FORME_KO" | while IFS= read -r tag; do
       [ -n "$tag" ] && printf -- '- `%s`\n' "$tag"

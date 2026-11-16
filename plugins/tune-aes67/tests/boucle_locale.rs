@@ -52,6 +52,32 @@ async fn attendre_la_fin(sortie: &SortieAes67, limite: Duration) {
     }
 }
 
+// #8551 : cette horloge ne progresse qu'après la réception du paquet précédent.
+struct HorlogeDuTest(std::sync::atomic::AtomicU64);
+impl HorlogeDuTest {
+    fn avancer(&self, ns: u64) {
+        self.0.fetch_add(ns, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+impl tune_aes67::horloge::SourceHorloge for HorlogeDuTest {
+    fn maintenant_ns(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Acquire)
+    }
+    fn reference(&self) -> tune_aes67::horloge::ReferenceHorloge {
+        tune_aes67::horloge::ReferenceHorloge::Locale
+    }
+}
+async fn attendre_fait(quoi: &str, condition: impl Fn() -> bool) {
+    let debut = Instant::now();
+    while !condition() {
+        assert!(
+            debut.elapsed() < Duration::from_secs(10),
+            "{quoi} non observé"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn un_fichier_44_1_khz_arrive_intact_en_l24_48_khz_annonce_par_sap() {
     let dossier = tempfile::tempdir().unwrap();
@@ -231,9 +257,12 @@ async fn pause_reprise_et_volume_logiciel() {
     let sap_ecoute = RecepteurDeTest::ecouter(locale()).unwrap();
     let mut flux = flux_vers(rtp.adresse());
     flux.volume_logiciel = true;
+    let horloge = Arc::new(HorlogeDuTest(std::sync::atomic::AtomicU64::new(
+        1_793_000_000_000_000_000,
+    )));
     let sortie = SortieAes67::new(
         flux,
-        Arc::new(HorlogeSysteme::new()),
+        horloge.clone(),
         Arc::new(DroitDuBanc),
         ReglagesEmission {
             destination_sap: sap_ecoute.adresse(),
@@ -257,18 +286,52 @@ async fn pause_reprise_et_volume_logiciel() {
         })
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    attendre_fait("premier paquet reçu", || rtp.nombre_recus() == 1).await;
+    for n in 2..=150 {
+        horloge.avancer(1_000_000);
+        attendre_fait("paquet reçu", || rtp.nombre_recus() == n).await;
+    }
     sortie.pause().await.unwrap();
     assert_eq!(
         sortie.get_status().await.unwrap().state,
         TransportState::Paused
     );
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Le paquet déjà tiré peut encore partir ; l'horloge lui donne son échéance.
+    horloge.avancer(1_000_000);
+    attendre_fait("pause prise par le fil RTP", || {
+        sortie.diagnostics_json().unwrap()["emission"]["pauses_observees"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    })
+    .await;
+    let emis = sortie.diagnostics_json().unwrap()["emission"]["paquets"]
+        .as_u64()
+        .unwrap() as usize;
+    attendre_fait("fin des paquets antérieurs à la pause", || {
+        rtp.nombre_recus() == emis
+    })
+    .await;
+    // En dessous du seuil de retard : une reprise marquée doit venir de la
+    // pause elle-même, pas d'une resynchronisation pour retard du processeur.
+    horloge.avancer(5_000_000);
+    assert_eq!(rtp.nombre_recus(), emis, "rien n'est émis en pause");
     sortie.resume().await.unwrap();
+    attendre_fait("premier paquet de reprise", || rtp.nombre_recus() > emis).await;
+    assert!(
+        sortie.diagnostics_json().unwrap()["emission"]["resynchronisations"]
+            .as_u64()
+            .unwrap()
+            >= 1,
+        "la pause observée doit renouveler l’origine RTP à la reprise"
+    );
+    for n in (emis + 2)..=600 {
+        horloge.avancer(1_000_000);
+        attendre_fait("paquet reçu après reprise", || rtp.nombre_recus() == n).await;
+    }
     attendre_la_fin(&sortie, Duration::from_secs(10)).await;
     let diagnostic = sortie.diagnostics_json().unwrap();
     sortie.fermer();
-    std::thread::sleep(Duration::from_millis(50));
     let capture = rtp.terminer();
     let _ = sap_ecoute.terminer();
     let analyse = capture.analyser(48, Duration::from_millis(1));

@@ -327,6 +327,9 @@ async fn get_plugin_detail(
 // ---------------------------------------------------------------------------
 
 async fn install_plugin(
+    // Sécurité : administrateur, ou cette machine si l'authentification est
+    // coupée. La garde décide avant tout appel à la boutique.
+    _garde: crate::auth::AdminOuCetteMachine,
     Path(slug): Path<String>,
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -639,6 +642,8 @@ async fn list_installed_plugins(State(state): State<AppState>) -> axum::response
 // ---------------------------------------------------------------------------
 
 async fn update_plugin(
+    // Sécurité : même garde que l'installation.
+    _garde: crate::auth::AdminOuCetteMachine,
     Path(slug): Path<String>,
     State(state): State<AppState>,
     headers: HeaderMap,

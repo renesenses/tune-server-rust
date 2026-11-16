@@ -355,6 +355,69 @@ impl LecteurDisque for LecteurBranchable {
     }
 }
 
+/// #8141 — un lecteur BRANCHÉ que le compte de Tune n'a pas le droit
+/// d'ouvrir. Dans un conteneur, `/dev/sr0` garde le groupe de l'hôte (gid 11
+/// sous ZimaOS) : l'ouverture est refusée et [`Presence`] dit
+/// `aucun_lecteur`, ce qui envoie l'utilisateur chercher un câble.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AccesRefuse {
+    /// Le périphérique (`/dev/sr0`).
+    pub lecteur: String,
+    /// Le groupe propriétaire, quand il a pu être lu.
+    pub groupe: Option<u32>,
+    /// La phrase lue par l'utilisateur, qui nomme le geste à faire.
+    pub message: String,
+}
+
+/// Le refus d'accès d'une ouverture, en fonction PURE de son résultat.
+///
+/// Seul un refus de DROITS compte : un lecteur vide ou occupé s'est ouvert,
+/// ou a été atteint, et n'est pas le cas de #8141.
+pub fn acces_refuse(
+    lecteur: &str,
+    ouverture: Result<(), std::io::ErrorKind>,
+    groupe: Option<u32>,
+) -> Option<AccesRefuse> {
+    if ouverture != Err(std::io::ErrorKind::PermissionDenied) {
+        return None;
+    }
+    let message = match groupe {
+        Some(gid) => format!(
+            "Le lecteur {lecteur} est branché, mais Tune n'a pas le droit de l'ouvrir : \
+             il appartient au groupe {gid}, dont le compte de Tune n'est pas membre. \
+             Avec Docker, démarrez le conteneur en root (par défaut : l'image rejoint \
+             alors ce groupe d'elle-même) ou ajoutez-lui ce groupe \
+             (compose : group_add: [\"{gid}\"] ; docker run : --group-add {gid}), \
+             puis redémarrez-le."
+        ),
+        None => format!(
+            "Le lecteur {lecteur} est branché, mais Tune n'a pas le droit de l'ouvrir. \
+             Ajoutez le compte de Tune au groupe propriétaire de {lecteur} \
+             (avec Docker : group_add, le numéro que donne `ls -ln {lecteur}` sur l'hôte), \
+             puis redémarrez-le."
+        ),
+    };
+    Some(AccesRefuse {
+        lecteur: lecteur.to_string(),
+        groupe,
+        message,
+    })
+}
+
+/// Le premier lecteur du système que Tune n'a pas le droit d'ouvrir.
+///
+/// Linux seulement : ailleurs, aucun `/dev/sr*`.
+pub fn lecteur_refuse_du_systeme() -> Option<AccesRefuse> {
+    #[cfg(target_os = "linux")]
+    {
+        crate::linux::premier_lecteur_refuse(std::path::Path::new("/dev"))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
 /// La plateforme a-t-elle une implémentation ?
 pub const fn plateforme_prise_en_charge() -> bool {
     cfg!(any(
@@ -372,6 +435,51 @@ pub(crate) mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::*;
+
+    /// #8141 — le `/dev/sr0` du testeur ZimaOS : groupe 11 de l'hôte, refusé.
+    /// La phrase nomme le lecteur, le groupe et le geste.
+    #[test]
+    fn un_refus_de_droits_nomme_le_lecteur_et_le_groupe() {
+        let refus = acces_refuse(
+            "/dev/sr0",
+            Err(std::io::ErrorKind::PermissionDenied),
+            Some(11),
+        )
+        .expect("refus de droits attendu");
+        assert_eq!(refus.lecteur, "/dev/sr0");
+        assert_eq!(refus.groupe, Some(11));
+        for attendu in ["/dev/sr0", "groupe 11", "group_add", "--group-add 11"] {
+            assert!(
+                refus.message.contains(attendu),
+                "{attendu} : {}",
+                refus.message
+            );
+        }
+        let sans_groupe =
+            acces_refuse("/dev/sr0", Err(std::io::ErrorKind::PermissionDenied), None).unwrap();
+        assert!(
+            sans_groupe.message.contains("ls -ln /dev/sr0"),
+            "{}",
+            sans_groupe.message
+        );
+    }
+
+    /// Ouvert, vide (`ENOMEDIUM`) ou occupé : rien à voir avec les droits.
+    #[test]
+    fn le_temoin_une_ouverture_permise_n_est_pas_un_refus() {
+        for ouverture in [
+            Ok(()),
+            Err(std::io::ErrorKind::Other),
+            Err(std::io::ErrorKind::ResourceBusy),
+            Err(std::io::ErrorKind::NotFound),
+        ] {
+            assert_eq!(
+                acces_refuse("/dev/sr0", ouverture, Some(11)),
+                None,
+                "{ouverture:?}"
+            );
+        }
+    }
     use crate::discid::tests::toc_du_vecteur;
     use crate::simule::LecteurSimule;
 

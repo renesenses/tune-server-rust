@@ -67,6 +67,18 @@ pub struct StreamingFavorite {
     /// succès.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub miroir_erreur: Option<String>,
+    /// L'identifiant de l'album CHEZ SON SERVICE d'une piste favorite
+    /// (renesenses/tune-web-client#2759) : ce que le client passe à « Aller à
+    /// l'album », sans une requête par piste. Lu dans la colonne `album_ref`
+    /// (migration 114 / PG 078) — pour Bandcamp, l'adresse de la page album
+    /// (fil 2121) ; pour Qobuz, TIDAL et Spotify, l'identifiant d'album que le
+    /// service donne avec la piste.
+    ///
+    /// `null` pour un favori album, artiste ou playlist, et quand le service
+    /// ne le donne pas (YouTube) : rien n'est deviné. Toujours présent dans le
+    /// JSON, même nom que la file et l'historique.
+    #[serde(default)]
+    pub album_id_service: Option<String>,
 }
 
 /// L'année de sortie et la qualité d'un album de service, telles que le
@@ -320,7 +332,10 @@ pub mod sql {
     //
     // #5997 — `miroir_etat` et `miroir_erreur` suivent `ai_generated`, aux
     // indices 12 et 13 dans les DEUX listes ; `position` passe donc en 14.
-    const SELECT_COLS: &str = "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at, first_seen_at, ai_generated, miroir_etat, miroir_erreur \
+    //
+    // tune-web-client#2759 — `album_ref` suit `miroir_erreur`, à l'indice 14
+    // dans les DEUX listes ; `position` passe donc en 15.
+    const SELECT_COLS: &str = "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at, first_seen_at, ai_generated, miroir_etat, miroir_erreur, album_ref \
          FROM streaming_favorites";
 
     /// #5997 — un retrait demandé dans Tune et pas encore confirmé par le
@@ -349,7 +364,7 @@ pub mod sql {
     /// Requête séparée, et non `position` ajouté à `SELECT_COLS` : la colonne
     /// n'est lue que par le tri manuel et n'entre JAMAIS dans
     /// `StreamingFavorite`, donc la forme du JSON rendu au client ne bouge pas.
-    const SELECT_COLS_POUR_RANG: &str = "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at, first_seen_at, ai_generated, miroir_etat, miroir_erreur, position \
+    const SELECT_COLS_POUR_RANG: &str = "SELECT id, profile_id, item_type, service, service_id, title, artist, album, cover_url, created_at, first_seen_at, ai_generated, miroir_etat, miroir_erreur, album_ref, position \
          FROM streaming_favorites";
 
     pub fn list_all_pour_rang<D: SqlDialect>(d: &D) -> String {
@@ -489,6 +504,31 @@ impl StreamingFavoritesRepo {
         let service_id: &str = cle.as_ref();
         let params: [&dyn ToSqlValue; 5] = [&page, &profile_id, &item_type, &service, &service_id];
         let _ = self.db.execute(&sql, &params);
+    }
+
+    /// Range l'identifiant d'album que le SERVICE donne avec une piste
+    /// favorite (tune-web-client#2759), là où la ligne n'en a pas encore :
+    /// même garde que la référence Bandcamp (fil 2121). Sans effet sur un
+    /// favori qui n'est pas une piste, sur un identifiant vide, ou si le
+    /// favori n'existe pas.
+    pub fn completer_album_du_service(
+        &self,
+        profile_id: i64,
+        item_type: &str,
+        service: &str,
+        service_id: &str,
+        album_id: &str,
+    ) -> Result<(), String> {
+        let album_id = album_id.trim();
+        if item_type != "track" || album_id.is_empty() {
+            return Ok(());
+        }
+        let sql = self.dialect_sql(sql::completer_album_ref, sql::completer_album_ref);
+        let cle = identite_de_favori(service_id);
+        let service_id: &str = cle.as_ref();
+        let params: [&dyn ToSqlValue; 5] =
+            [&album_id, &profile_id, &item_type, &service, &service_id];
+        self.db.execute(&sql, &params).map(|_| ())
     }
 
     /// Pose le marquage IA d'un favori (#5530). Sans effet si le favori
@@ -749,10 +789,11 @@ impl StreamingFavoritesRepo {
                 self.db.query_many(&sql, &params)?
             };
             favorites_sort::trier_par_rang(&mut rows, tri.sens, |r| {
-                // 14 et non 10 : `first_seen_at`, `ai_generated` (#5530) puis
-                // `miroir_etat` et `miroir_erreur` (#5997) se sont glissés
-                // entre `created_at` et `position` dans SELECT_COLS_POUR_RANG.
-                r.get(14).and_then(|v| v.as_i64())
+                // 15 et non 10 : `first_seen_at`, `ai_generated` (#5530),
+                // `miroir_etat` et `miroir_erreur` (#5997) puis `album_ref`
+                // (tune-web-client#2759) se sont glissés entre `created_at` et
+                // `position` dans SELECT_COLS_POUR_RANG.
+                r.get(15).and_then(|v| v.as_i64())
             });
             return Ok(rows
                 .iter()
@@ -842,7 +883,20 @@ fn row_to_streaming_favorite(cols: &[SqlValue]) -> StreamingFavorite {
             .and_then(|v| marquage_ia_lu(&v)),
         miroir_etat: cols.get(12).and_then(|v| v.as_string()),
         miroir_erreur: cols.get(13).and_then(|v| v.as_string()),
+        album_id_service: album_id_service_de_ligne(cols),
     }
+}
+
+/// L'identifiant d'album du service d'une ligne (colonne 2 `item_type`,
+/// colonne 14 `album_ref`) : seulement pour une PISTE, et jamais vide.
+fn album_id_service_de_ligne(cols: &[SqlValue]) -> Option<String> {
+    if cols.get(2).and_then(|v| v.as_string()).as_deref() != Some("track") {
+        return None;
+    }
+    cols.get(14)
+        .and_then(|v| v.as_string())
+        .map(|r| r.trim().to_string())
+        .filter(|r| !r.is_empty())
 }
 
 /// La valeur rangée dans `streaming_favorites.ai_generated` (#5530).
@@ -860,6 +914,10 @@ fn marquage_ia_lu(v: &str) -> Option<bool> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+#[path = "streaming_favorites_album_id_service_2759_tests.rs"]
+mod album_id_service_2759_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1143,7 +1201,7 @@ mod tests {
         // Le rang doit etre LU, et seulement par la requete dediee : la
         // requete ordinaire ne le nomme pas, donc la forme du JSON ne bouge pas.
         assert!(sql::list_by_type_pour_rang(&SqliteDialect).contains(
-            "created_at, first_seen_at, ai_generated, miroir_etat, miroir_erreur, position"
+            "created_at, first_seen_at, ai_generated, miroir_etat, miroir_erreur, album_ref, position"
         ));
         assert!(!sql::list_by_type(&SqliteDialect).contains("position"));
     }

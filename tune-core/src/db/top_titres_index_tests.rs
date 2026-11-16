@@ -102,13 +102,23 @@ fn plan(db: &SqliteDb, sql: &str) -> String {
 
 /// Les lignes de `top_tracks`, triées : l'ordre des ex aequo de `plays` n'est
 /// pas garanti par la requête, ni avant ni après.
+///
+/// Seuls les sept champs d'avant #8140 sont comparés : `source_id` et
+/// `album_id_service` n'existaient pas dans l'ancienne requête.
 fn lignes(db: &Arc<SqliteDb>) -> Vec<String> {
     let backend: Arc<dyn DbBackend> = db.clone();
     let mut v: Vec<String> = HistoryRepo::with_backend(backend)
         .top_tracks(100_000)
         .unwrap()
         .iter()
-        .map(|l| l.to_string())
+        .map(|l| {
+            let mut l = l.clone();
+            if let Some(o) = l.as_object_mut() {
+                o.remove("source_id");
+                o.remove("album_id_service");
+            }
+            l.to_string()
+        })
         .collect();
     v.sort();
     v
@@ -235,7 +245,14 @@ fn les_plus_ecoutes_comptent_une_ecoute_par_ligne_malgre_les_homonymes() {
     assert_eq!(t.len(), 2, "la radio est exclue : {t:?}");
     assert_eq!((t[0].0.as_str(), t[0].1), ("Intro", 4), "{t:?}");
     assert_eq!((t[1].0.as_str(), t[1].1), ("Solo", 2), "{t:?}");
-    assert_eq!(t[1].2, Some(13), "la piste se résout toujours par le titre");
+    assert_eq!(
+        t[1].2,
+        Some(13),
+        "la piste se résout par le titre et l'interprète"
+    );
+    // « Intro » de A écoutée sur « Disque » : la piste 10 (album écouté),
+    // ni 11 (homonyme de B), ni 12 (autre album de A).
+    assert_eq!(t[0].2, Some(10), "{t:?}");
 
     // Contre-épreuve : l'ancienne requête gonfle bien ce même jeu (4 écoutes
     // d'« Intro » x 3 pistes homonymes x 2 albums à pochette = 24).
@@ -312,4 +329,86 @@ fn les_plus_ecoutes_sans_doublon_rendent_les_memes_lignes_et_le_meme_ordre() {
         nouveau, ancien,
         "les lignes diffèrent de l'ancienne requête"
     );
+}
+
+// ── #8140 : la piste se retrouve par titre ET interprète, jamais l'homonyme ──
+
+fn top_json(b: &Banc) -> Vec<serde_json::Value> {
+    let backend: Arc<dyn DbBackend> = b.db.clone();
+    HistoryRepo::with_backend(backend).top_tracks(100).unwrap()
+}
+
+fn ligne<'a>(t: &'a [serde_json::Value], titre: &str, artiste: &str) -> &'a serde_json::Value {
+    t.iter()
+        .find(|l| l["title"] == titre && l["artist_name"] == artiste)
+        .unwrap_or_else(|| panic!("{titre} / {artiste} absent : {t:?}"))
+}
+
+/// Deux « Marianne » locales d'artistes différents ; une écoute Deezer de la
+/// « Marianne » d'un TROISIÈME artiste, absent de la bibliothèque, et une
+/// écoute Deezer de celle de « Léo Ferré » écrit autrement (casse, accents).
+#[test]
+fn une_ecoute_de_service_ne_rend_jamais_l_homonyme_d_un_autre_artiste_8140() {
+    let b = base_vide("homonyme-8140");
+    b.db.execute_batch(
+        "INSERT INTO artists (id, name) VALUES (1, 'Léo Ferré'), (2, 'Brassens');
+         INSERT INTO albums (id, title, artist_id, cover_path) VALUES
+           (1, 'Album LF', 1, 'lf.jpg'), (2, 'Album GB', 2, 'gb.jpg');
+         INSERT INTO tracks (id, title, album_id, artist_id, track_number, file_path, format) VALUES
+           (21, 'Marianne', 1, 1, 1, '/m/lf.flac', 'flac'),
+           (22, 'Marianne', 2, 2, 1, '/m/gb.flac', 'flac');
+         INSERT INTO listen_history (title, artist_name, album_title, source, source_id, cover_url, album_ref) VALUES
+           ('Marianne', 'Quelqu''un', 'Album Deezer', 'deezer', 'dz-1', 'http://c/dz.jpg', 'dz-alb-9'),
+           ('Marianne', 'Quelqu''un', 'Album Deezer', 'deezer', 'dz-1', 'http://c/dz.jpg', 'dz-alb-9'),
+           ('Marianne', 'LEO FERRE', 'Ferré chez Deezer', 'deezer', 'dz-2', NULL, 'dz-alb-7');",
+    )
+    .unwrap();
+    let t = top_json(&b);
+
+    let inconnu = ligne(&t, "Marianne", "Quelqu'un");
+    assert_eq!(
+        inconnu["track_id"],
+        serde_json::Value::Null,
+        "l'écoute d'un artiste absent rend l'homonyme local : {inconnu}"
+    );
+    assert_eq!(inconnu["source"], "deezer", "{inconnu}");
+    assert_eq!(inconnu["source_id"], "dz-1", "{inconnu}");
+    assert_eq!(inconnu["album_title"], "Album Deezer", "{inconnu}");
+    assert_eq!(inconnu["album_id_service"], "dz-alb-9", "{inconnu}");
+    assert_eq!(inconnu["cover_path"], "http://c/dz.jpg", "{inconnu}");
+
+    let ferre = ligne(&t, "Marianne", "LEO FERRE");
+    assert_eq!(
+        ferre["track_id"].as_i64(),
+        Some(21),
+        "casse et accents : la piste de Léo Ferré, jamais celle de Brassens : {ferre}"
+    );
+    assert_eq!(ferre["source_id"], "dz-2", "{ferre}");
+    assert_eq!(ferre["album_title"], "Ferré chez Deezer", "{ferre}");
+}
+
+/// Une écoute locale : le bon identifiant, l'album de la bibliothèque, ni
+/// `source_id` ni `album_id_service`.
+#[test]
+fn une_ecoute_locale_rend_sa_piste_8140() {
+    let b = base_vide("locale-8140");
+    b.db.execute_batch(
+        "INSERT INTO artists (id, name) VALUES (1, 'Léo Ferré'), (2, 'Brassens');
+         INSERT INTO albums (id, title, artist_id, cover_path) VALUES
+           (1, 'Album LF', 1, 'lf.jpg'), (2, 'Album GB', 2, 'gb.jpg');
+         INSERT INTO tracks (id, title, album_id, artist_id, track_number, file_path, format) VALUES
+           (21, 'Marianne', 1, 1, 1, '/m/lf.flac', 'flac'),
+           (22, 'Marianne', 2, 2, 1, '/m/gb.flac', 'flac');
+         INSERT INTO listen_history (title, artist_name, album_title, source) VALUES
+           ('Marianne', 'Léo Ferré', 'Album LF', 'local');",
+    )
+    .unwrap();
+    let t = top_json(&b);
+    let l = ligne(&t, "Marianne", "Léo Ferré");
+    assert_eq!(l["track_id"].as_i64(), Some(21), "{l}");
+    assert_eq!(l["album_title"], "Album LF", "{l}");
+    assert_eq!(l["cover_path"], "lf.jpg", "{l}");
+    assert_eq!(l["source"], "local", "{l}");
+    assert_eq!(l["source_id"], serde_json::Value::Null, "{l}");
+    assert_eq!(l["album_id_service"], serde_json::Value::Null, "{l}");
 }

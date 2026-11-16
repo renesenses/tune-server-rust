@@ -1,5 +1,48 @@
 use super::*;
 
+/// #8006 — ce qu'une commande attend une sortie occupée avant de rendre la
+/// main. Le démarrage d'un ampli Devialet peut tenir sa sortie une trentaine
+/// de secondes (#6911) ; Pause et Arrêt ne l'attendent plus.
+///
+/// Les témoins unitaires la ramènent à 400 ms (`cfg!(test)` et non un
+/// attribut : plusieurs gardes de texte coupent ce fichier au premier
+/// attribut de test).
+pub(crate) const ATTENTE_DE_LA_SORTIE: std::time::Duration = if cfg!(test) {
+    std::time::Duration::from_millis(400)
+} else {
+    std::time::Duration::from_secs(5)
+};
+
+/// #8006 — la phrase qui nomme l'appareil qui ne répond pas.
+pub(crate) fn appareil_ne_repond_pas(device_id: &str) -> String {
+    format!("The device {device_id} does not respond: it is still busy with a previous command")
+}
+
+/// #8006 — le verrou d'une sortie, attendu au plus [`ATTENTE_DE_LA_SORTIE`].
+/// Rien n'est envoyé à l'appareil quand l'attente échoue.
+pub(crate) async fn attendre_la_sortie<'a>(
+    output: &'a Arc<Mutex<Box<dyn crate::outputs::traits::OutputTarget>>>,
+    device_id: &str,
+    command: OutputCommand,
+) -> OutputCommandResult<tokio::sync::MutexGuard<'a, Box<dyn crate::outputs::traits::OutputTarget>>>
+{
+    match tokio::time::timeout(ATTENTE_DE_LA_SORTIE, output.lock()).await {
+        Ok(sortie) => Ok(sortie),
+        Err(_) => {
+            warn!(
+                device_id,
+                %command,
+                attente_ms = ATTENTE_DE_LA_SORTIE.as_millis() as u64,
+                "output_busy_command_refused"
+            );
+            Err(OutputCommandError::failed(
+                command,
+                appareil_ne_repond_pas(device_id),
+            ))
+        }
+    }
+}
+
 /// Issue du deuxième temps de `play_inner` : un flux résolu à envoyer, ou
 /// une lecture déjà close (reprise par une plus récente, renvoi coalescé)
 /// dont le résultat remonte tel quel.
@@ -320,6 +363,9 @@ impl PlaybackOrchestrator {
         // #8088 — un contenu marqué explicite, pour un profil dont la
         // politique parentale le masque : rien ne part.
         self.verifier_le_contenu_explicite(&req).await?;
+        // #8611 — une piste d'un artiste bloqué par la politique parentale
+        // du profil : rien ne part.
+        self.verifier_l_artiste_bloque(&req).await?;
 
         // Re-tap dedup (#1271): a controller (Flutter/web) can emit `play` TWICE
         // for the SAME track a few seconds apart. The first play already sent
@@ -790,6 +836,8 @@ impl PlaybackOrchestrator {
         // #5050 — une lecture part : la pose « en pause sans lancer » d'un
         // transfert ne vaut plus.
         self.prendre_le_transfert_en_pause(req.zone_id);
+        // #7418 — de même pour la pause venue de l'appareil.
+        self.prendre_la_pause_de_l_appareil(req.zone_id);
         // Zone navigateur : la sortie est l'onglet, pas un appareil. Relevé ici
         // parce que la ligne de zone est déjà lue juste en dessous, et qu'il
         // faudra le savoir bien plus bas, au moment d'annoncer l'écoute
@@ -1286,10 +1334,17 @@ impl PlaybackOrchestrator {
             cover_path: habillage.cover_path.clone(),
             // #7360/#6059 — la durée restante du flux PCM ou natif ne
             // raccourcit pas la piste annoncée aux clients après déplacement.
-            duration_ms: super::resolve_local::duree_piste_pcm_decodee(
-                resolved.duration_ms.unwrap_or(0),
+            // #8082 — un flux continu porte plusieurs pistes : la durée résolue
+            // est celle du flux, l'écran parle de la première piste.
+            duration_ms: crate::outputs::dlna_flux_continu::duree_de_la_premiere_piste(
                 resolved.stream_id.as_deref(),
             )
+            .or_else(|| {
+                super::resolve_local::duree_piste_pcm_decodee(
+                    resolved.duration_ms.unwrap_or(0),
+                    resolved.stream_id.as_deref(),
+                )
+            })
             .unwrap_or_else(|| {
                 crate::outputs::dlna_depart_natif::duree_de_la_piste(
                     resolved.duration_ms.unwrap_or(0),
@@ -1353,7 +1408,9 @@ impl PlaybackOrchestrator {
                 resolved.source == "local",
             ),
             genre: track_meta.as_ref().and_then(|t| t.genre.clone()),
-            year: track_meta.as_ref().and_then(|t| t.year),
+            year: track_meta
+                .as_ref()
+                .and_then(|t| crate::db::annee_de_la_piste::pour_affichage(t, &self.db)),
             // L'album et l'artiste par IDENTIFIANT. Sans eux, le client devait
             // deviner l'album depuis son TITRE : cliquer sur « Entreat (2010) »
             // ouvrait la page de The Cure (FabienM, v0.9.102). `track_meta` les
@@ -1649,12 +1706,20 @@ impl PlaybackOrchestrator {
                     req.seek_ms,
                     zone_audiophile,
                     req.zone_id,
-                    req.track_id,
+                    req.piste_rg(),
                 )
                 .await;
             let result = self
                 .session_morte_pendant_l_envoi(req, resolved, device_id, result)
                 .await;
+            if result.0 {
+                self.noter_le_depart_airplay2_si_le_flux_y_commence(
+                    device_id,
+                    resolved.stream_id.as_deref(),
+                    req.seek_ms,
+                )
+                .await;
+            }
             let total_ms = play_start.elapsed().as_millis();
             // `output_ms` ne compte plus l'attente de pré-tampon : les trois
             // termes s'additionnent maintenant pour donner `total_ms`, et un
@@ -1909,7 +1974,11 @@ impl PlaybackOrchestrator {
                         .flatten()
                         .and_then(|t| t.album_id)
                 }),
-                resolved.duration_ms.unwrap_or(0),
+                // #8082 — la piste, pas le flux continu entier.
+                crate::outputs::dlna_flux_continu::duree_de_la_premiere_piste(
+                    resolved.stream_id.as_deref(),
+                )
+                .unwrap_or(resolved.duration_ms.unwrap_or(0)),
                 req.zone_id,
                 habillage.cover_path.as_deref(),
                 session_profile_id,
@@ -1922,6 +1991,7 @@ impl PlaybackOrchestrator {
                     pochette: context.4.as_deref(),
                 },
                 req.album_ref.as_deref(),
+                req.track_id,
             );
         }
     }
@@ -2013,6 +2083,9 @@ impl PlaybackOrchestrator {
         crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
             .save_play_state(req.zone_id, "stopped")
             .ok();
+        // #8701 — la résolution vient d'épingler le fMP4 : la zone arrêtée
+        // ne le retient plus.
+        crate::audio::dash_epingles::liberer_la_zone(req.zone_id);
     }
 
     /// Donne au crête-mètre de la zone le gain que la sortie applique
@@ -2085,6 +2158,7 @@ impl PlaybackOrchestrator {
     #[cfg(feature = "local-audio")]
     pub(super) async fn recreate_local_and_play(
         &self,
+        zone_id: i64,
         device_id: &str,
         media: &crate::outputs::traits::PlayMedia<'_>,
         start_position_ms: Option<u64>,
@@ -2109,12 +2183,19 @@ impl PlaybackOrchestrator {
         //
         // `origin_host`, lui, reste absent : rien ne le persiste, et l'inventer
         // serait pire que de le laisser vide.
-        let (exclusive_mode, audio_backend) = self.reglages_sortie_locale();
+        let (exclusif_machine, audio_backend) = self.reglages_sortie_locale();
+        // #3245 — la zone de cet appareil décide (#8348), la machine en repli :
+        // sans cette ligne, la sortie recréée reprenait le mode de MACHINE, et
+        // une zone réglée « partagé » repartait en exclusif.
+        let exclusif_de_zone =
+            self.exclusif_de_la_sortie_recreee(device_id, &audio_backend, exclusif_machine);
+        let exclusive_mode = exclusif_de_zone.demande;
         let endpoint_id = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
             .endpoint_id_de_la_sortie(device_id);
         info!(
             device_id,
             exclusive_mode,
+            exclusif_par_la_zone = exclusif_de_zone.par_la_zone,
             audio_backend = %audio_backend,
             endpoint_id = endpoint_id.as_deref().unwrap_or("<aucun>"),
             "output_not_found_recreating_local_output"
@@ -2138,12 +2219,24 @@ impl PlaybackOrchestrator {
         // à 1.0, jamais au-delà de l'unité.
         // #8074 — sans zone en base, elle part BAS, jamais à pleine échelle.
         ensemencer_la_sortie_locale_neuve(&self.db, device_id, &local_out).await;
+        // #8437 — la sortie recréée observe aussi le retard du groupe mixte.
+        local_out.set_retard_de_depart_ms(
+            crate::zones::retard_groupe_mixte_8437::retard_de_depart_de_la_zone(&self.db, zone_id),
+        );
         {
             let mut outputs = self.outputs.lock().await;
             outputs.register(Box::new(local_out));
         }
         let arc = { self.outputs.lock().await.get(device_id) };
         if let Some(arc) = arc {
+            // #8151 — la sortie NAÎT sans sourdine : celle de la zone lui est
+            // donnée avant la piste.
+            self.reimposer_la_sourdine_de_la_zone(
+                zone_id,
+                &arc,
+                super::sourdine_a_la_piste_8151::MomentDeLaSourdine::AvantLaPiste,
+            )
+            .await;
             let output = arc.lock().await;
             match output.play_media(media).await {
                 Ok(()) => {
@@ -2165,6 +2258,7 @@ impl PlaybackOrchestrator {
     #[cfg(not(feature = "local-audio"))]
     pub(super) async fn recreate_local_and_play(
         &self,
+        _zone_id: i64,
         device_id: &str,
         _media: &crate::outputs::traits::PlayMedia<'_>,
         _start_position_ms: Option<u64>,
@@ -2191,8 +2285,9 @@ impl PlaybackOrchestrator {
         start_position_ms: Option<u64>,
         zone_audiophile: bool,
         zone_id: i64,
-        track_id: Option<i64>,
+        piste: crate::audio::replaygain::PisteRg<'_>,
     ) -> (bool, Option<String>) {
+        let track_id = piste.track_id;
         let lock_start = std::time::Instant::now();
         let (output_arc, used_device_id) = {
             let outputs = self.outputs.lock().await;
@@ -2274,12 +2369,21 @@ impl PlaybackOrchestrator {
                 // locale), résolue AVANT de verrouiller la sortie de A : elle
                 // lit la sortie de B dans le registre.
                 let secondes_sorties = self.demandes_de_secondes_sorties(zone_id, device_id).await;
+                // #8437 — groupée avec une zone réseau, la sortie locale part
+                // `sync_delay_ms` plus tard (tampon AirPlay compensé à la main).
+                let retard_de_depart_ms =
+                    crate::zones::retard_groupe_mixte_8437::retard_de_depart_de_la_zone(
+                        &self.db, zone_id,
+                    );
                 let output = output_arc.lock().await;
                 if let Some(local_output) = output
                     .as_any()
                     .downcast_ref::<crate::outputs::local::LocalOutput>()
                 {
                     local_output.set_pure_bypass(zone_audiophile);
+                    local_output.set_fixed_sample_rate(crate::audio::frequence_fixe::active(
+                        &self.db, zone_id,
+                    ));
                     // #3973 — « bit-perfect strict » de la zone, posé à chaque
                     // lecture comme PURE : c'est lui que `play_url` transmet à
                     // l'ouverture cpal (`DemandeDOuverture::strict_bitperfect`).
@@ -2289,6 +2393,7 @@ impl PlaybackOrchestrator {
                     // #6132 — la sortie double de la zone, posée à chaque
                     // lecture comme le strict : `play_url` la lit une fois.
                     local_output.set_secondes_sorties(secondes_sorties);
+                    local_output.set_retard_de_depart_ms(retard_de_depart_ms);
                     // #6522, #6524 — ce que PURE contourne, lu dans les
                     // réglages : la chaîne posée plus bas sera vide en PURE.
                     self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);
@@ -2296,11 +2401,12 @@ impl PlaybackOrchestrator {
                     // A PURE zone is left strictly alone: applying a gain would
                     // multiply every sample and the path would no longer be
                     // bit-perfect, which is the one thing PURE promises.
-                    let rg = match (zone_audiophile, track_id) {
-                        (false, Some(tid)) => {
-                            crate::audio::replaygain::playback_factor(&self.db, tid)
-                        }
-                        _ => 1.0,
+                    // #8689 — un titre Qobuz / TIDAL reçoit le gain que le
+                    // service publie, au même calcul qu'une piste locale.
+                    let rg = if zone_audiophile {
+                        1.0
+                    } else {
+                        crate::audio::replaygain::facteur_de_zone(&self.db, zone_id, piste)
                     };
                     // #4685 — posé AVANT le facteur et les processeurs : chacun
                     // recompose le gain de rendu à son installation.
@@ -2311,14 +2417,15 @@ impl PlaybackOrchestrator {
                     // zone has crossfeed disabled OR is in PURE mode, so a PURE
                     // zone stays bit-perfect. Rebuilt per-play at the resolved
                     // stream sample rate so the delay line matches the DAC clock.
-                    let cf_sr = media.sample_rate.unwrap_or(44100);
+                    let cf_sr = crate::audio::frequence_fixe::active(&self.db, zone_id)
+                        .unwrap_or_else(|| media.sample_rate.unwrap_or(44100));
                     local_output.set_crossfeed(self.load_crossfeed_processor(zone_id, cf_sr));
                     // #7614 — le greffon de suréchantillonnage de la zone :
                     // `None` sous PURE, sans Premium, sans greffon installé,
                     // désactivé (défaut) ou sans test de la machine. La sortie
                     // le lit à l'ouverture de CETTE piste, jamais pendant.
-                    local_output.set_surechantillonnage(
-                        self.choix_du_surechantillonneur(zone_id, zone_audiophile),
+                    local_output.set_decision_surechantillonnage(
+                        self.decision_du_surechantillonneur(zone_id, zone_audiophile),
                     );
                     // Zone equalizer, applied by the output itself for a local
                     // DAC — exactly like the crossfeed above, and for the same
@@ -2392,11 +2499,27 @@ impl PlaybackOrchestrator {
                 }
                 drop(output);
             }
+            // #8151 — la sortie connaît la sourdine de la zone avant la piste.
+            self.reimposer_la_sourdine_de_la_zone(
+                zone_id,
+                &output_arc,
+                super::sourdine_a_la_piste_8151::MomentDeLaSourdine::AvantLaPiste,
+            )
+            .await;
             let output = output_arc.lock().await;
+            // #8402 (11/11) — AirPlay 2 : la zone est-elle en PURE verrouillé ?
+            self.dire_a_l_airplay2_si_la_zone_tient_le_volume(zone_id, &**output);
             match output.play_media(media).await {
                 Ok(()) => {
+                    self.dire_le_depart_muet_d_airplay2(zone_id, &**output);
                     drop(output);
                     info!(device_id = %used_device_id, "output_play_sent");
+                    self.reimposer_la_sourdine_de_la_zone(
+                        zone_id,
+                        &output_arc,
+                        super::sourdine_a_la_piste_8151::MomentDeLaSourdine::ApresLeDemarrage,
+                    )
+                    .await;
                     (true, None)
                 }
                 Err(e) => {
@@ -2421,7 +2544,7 @@ impl PlaybackOrchestrator {
             }
         } else if device_id.starts_with("local:") {
             let issue = self
-                .recreate_local_and_play(device_id, media, start_position_ms)
+                .recreate_local_and_play(zone_id, device_id, media, start_position_ms)
                 .await;
             // La sortie vient de NAÎTRE : le branchement fait plus haut n'avait
             // rien trouvé à brancher (#4384).
@@ -2444,7 +2567,9 @@ impl PlaybackOrchestrator {
     /// convolver (in the local output). Bertrand: "PURE doit désactiver toutes
     /// les modifs".
     pub(super) fn zone_audiophile(&self, zone_id: i64) -> bool {
-        crate::audio::audiophile::zone_enabled(&self.db, zone_id)
+        // #8513 — PURE, ou une mesure de pièce qui tient la zone : même
+        // chemin, aucun traitement.
+        crate::audio::audiophile::traitements_contournes(&self.db, zone_id)
     }
 
     /// Rejouer la piste en cours d'une zone **à sa position courante**, en
@@ -2551,6 +2676,43 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// #7972 — une zone AirPlay 2 jouée à une position non nulle, quel que soit
+    /// le chemin du geste (rétablissement après une pause, reprise d'une
+    /// file…) : si le flux servi COMMENCE réellement à cette position (session
+    /// décodée en canal, non « range-seekable » — même critère que
+    /// [`Self::seek_output_after_replay`]), la sortie l'apprend, sinon elle
+    /// afficherait 0:00. Une session fichier ou mandataire, servie depuis
+    /// l'octet 0 (épisode de podcast par `resolve_direct`, qui ignore
+    /// `seek_ms`), ne note RIEN : l'écran dirait 12:00 sur un son à 0:00.
+    /// Rend `true` quand le départ a été noté.
+    pub(super) async fn noter_le_depart_airplay2_si_le_flux_y_commence(
+        &self,
+        device_id: &str,
+        stream_id: Option<&str>,
+        seek_ms: Option<u64>,
+    ) -> bool {
+        let (Some(depart_ms), Some(sid)) = (seek_ms.filter(|ms| *ms > 0), stream_id) else {
+            return false;
+        };
+        let Some(output) = ({ self.outputs.lock().await.get(device_id) }) else {
+            return false;
+        };
+        if self.streamer.is_seekable_session(sid).await
+            || crate::outputs::dlna_depart_natif::depart_de_session(sid).is_some()
+        {
+            return false;
+        }
+        let sortie = output.lock().await;
+        let Some(airplay2) = sortie
+            .as_any()
+            .downcast_ref::<crate::outputs::airplay2::Airplay2Output>()
+        else {
+            return false;
+        };
+        airplay2.noter_le_depart_du_flux(depart_ms);
+        true
+    }
+
     /// Envoyer à la sortie le `Seek` qui manque après une recréation de flux
     /// (#2893). Voir [`replay_needs_output_seek`] pour la règle de décision et
     /// la raison pour laquelle elle n'est ni « toujours », ni « jamais ».
@@ -2608,6 +2770,26 @@ impl PlaybackOrchestrator {
                 && let Err(e) = output.lock().await.seek(position_ms).await
             {
                 warn!(zone_id, position_ms, error = %e, "agent_depart_du_flux_non_note");
+            }
+            return;
+        }
+        // #7972 — même contrat pour une zone AirPlay 2 rétablie à la position
+        // après une pause : le flux décodé commence à `position_ms`
+        // ([`airplay2_relance_a_la_position`]) et le démon compte depuis le
+        // début de son fichier. Sa sortie ne sait pas chercher : on lui dit
+        // seulement où ce flux commence.
+        if output_type == Some(TYPE_SORTIE_AIRPLAY2)
+            && !session_is_range_seekable
+            && position_ms > 0
+        {
+            if let Some(output) = { self.outputs.lock().await.get(did) } {
+                let sortie = output.lock().await;
+                if let Some(airplay2) = sortie
+                    .as_any()
+                    .downcast_ref::<crate::outputs::airplay2::Airplay2Output>()
+                {
+                    airplay2.noter_le_depart_du_flux(position_ms);
+                }
             }
             return;
         }
@@ -2978,7 +3160,8 @@ impl PlaybackOrchestrator {
     ) -> u32 {
         use crate::audio::soft_mute::{SOFT_MUTE_DEFAULT_MS, SOFT_MUTE_MAX_MS};
         // PURE : le PCM atteint la sortie intact, aucune rampe n'est appliquée.
-        if crate::audio::audiophile::zone_enabled(db, zone_id) {
+        // #8513 — ni pendant une mesure de pièce.
+        if crate::audio::audiophile::traitements_contournes(db, zone_id) {
             return 0;
         }
         crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
@@ -3018,7 +3201,9 @@ impl PlaybackOrchestrator {
                 )
             })?;
             let rien_ne_jouait = {
-                let sortie = output.lock().await;
+                // #8006 — une sortie occupée (démarrage d'un titre qui traîne)
+                // ne retient plus la pause sans limite.
+                let sortie = attendre_la_sortie(&output, did, OutputCommand::Pause).await?;
                 sortie.checked_pause().await?;
                 sortie.take_nothing_playing_on_pause()
             };
@@ -3098,6 +3283,31 @@ impl PlaybackOrchestrator {
             return format!(
                 "Impossible de lire la piste {geste} : contenu marqué explicite, \
                  interdit par le contrôle parental de ce profil"
+            );
+        }
+        // #8611 — la politique du profil ne se relit pas : la file s'arrête.
+        if cause.contains(crate::db::politique_parentale::CODE_POLITIQUE_ILLISIBLE) {
+            return format!(
+                "Impossible de lire la piste {geste} : la politique de contrôle \
+                 parental de ce profil est illisible"
+            );
+        }
+        // #8611 — de même pour un artiste bloqué.
+        if cause.contains(crate::db::politique_parentale::CODE_REFUS_CONTENU_BLOQUE) {
+            return format!(
+                "Impossible de lire la piste {geste} : artiste bloqué par le \
+                 contrôle parental de ce profil"
+            );
+        }
+        // #8227 — fil 2723 : « Suivant » a enjambé les 8 titres restants d'un
+        // album, tous refusés par le service, et l'auditeur lisait « ce titre
+        // n'est pas disponible », comme si un seul titre manquait. La file
+        // entière, dans ce sens, est injouable : on le dit.
+        if let Some(refuses) = super::enjamber_les_refus::titres_refuses_sans_titre_jouable(cause) {
+            return format!(
+                "Impossible de lire la piste {geste} : aucun titre de la file n'est \
+                 disponible à la lecture chez le service dans ce sens ({refuses} titre(s) \
+                 refusé(s) : droits, région ou abonnement)"
             );
         }
         if crate::poller::refus_propre_a_la_piste(cause) {
@@ -3393,9 +3603,19 @@ impl PlaybackOrchestrator {
             if transfert_en_pause {
                 info!(zone_id, position_ms, "resume_apres_transfert_en_pause");
             }
+            // #7418 — en pause parce que l'APPAREIL s'y est mis (télécommande,
+            // autre entrée) : il a pu passer à autre chose, un `Play` « sur
+            // place » y restait sans effet. On rétablit notre flux.
+            let pause_de_l_appareil = self.prendre_la_pause_de_l_appareil(zone_id);
+            if pause_de_l_appareil {
+                info!(zone_id, position_ms, "resume_apres_pause_de_l_appareil");
+            }
             #[allow(clippy::blocks_in_conditions)]
             let peripherique_rendu = apres_refus_de_la_sortie
                 || transfert_en_pause
+                // Une écoute qu'on ne sait pas redemander garde le `Play` sur
+                // place, plutôt qu'un « impossible de reprendre ».
+                || (pause_de_l_appareil && rejouable)
                 || match device_id {
                     Some(did) => match { self.outputs.lock().await.get(did) } {
                         Some(sortie) => sortie.lock().await.device_released_on_pause(),
@@ -3670,6 +3890,8 @@ impl PlaybackOrchestrator {
         self.playback.marquer_commande_de_transport(zone_id).await;
         // #5050 — arrêtée : la pose d'un transfert en pause ne vaut plus.
         self.prendre_le_transfert_en_pause(zone_id);
+        // #7418 — de même pour la pause venue de l'appareil.
+        self.prendre_la_pause_de_l_appareil(zone_id);
         self.persist_position(zone_id).await;
         crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
             .save_play_state(zone_id, "stopped")
@@ -3677,6 +3899,12 @@ impl PlaybackOrchestrator {
         self.annuler_preparation_fichier(zone_id).await;
         self.cleanup_gapless_session(zone_id).await;
         self.prefetch.clear().await;
+        // #8701 — zone arrêtée : `stop` (geste, fin de file, file vidée,
+        // suppression), une pause qui ne trouve rien à mettre en pause, une
+        // zone cédée à un tiers. Ses fMP4 DASH redeviennent nettoyables. Une
+        // pause ordinaire ne passe pas ici et garde le fichier pour la
+        // reprise.
+        crate::audio::dash_epingles::liberer_la_zone(zone_id);
         // Forget the last network-play record so a stop→replay of the SAME track
         // is not mistaken for the duplicate-send it guards against (play_inner).
         self.last_net_play.lock().await.remove(&zone_id);
@@ -3693,6 +3921,50 @@ impl PlaybackOrchestrator {
         old_stream_id
     }
 
+    /// #8006 — l'arrêt de l'appareil, borné pour l'appelant.
+    ///
+    /// La zone est déjà arrêtée. L'ordre part dans une tâche : si l'appareil
+    /// est occupé (démarrage d'un titre qui traîne, ampli qui ne répond
+    /// pas), l'appelant rend la main après [`ATTENTE_DE_LA_SORTIE`] et la
+    /// tâche continue — l'appareil s'arrêtera dès qu'il sera libre, au lieu
+    /// de jouer derrière une zone qui se dit arrêtée. Le journal et
+    /// `zone.playback_error` nomment l'appareil.
+    async fn arreter_la_sortie_sans_attendre_plus(
+        &self,
+        zone_id: i64,
+        did: &str,
+        output: Arc<Mutex<Box<dyn crate::outputs::traits::OutputTarget>>>,
+    ) {
+        let appareil = did.to_string();
+        let tache = tokio::spawn(async move {
+            if let Err(e) = output.lock().await.stop().await {
+                warn!(zone_id, device_id = %appareil, error = %e, "device_stop_failed");
+            }
+        });
+        if tokio::time::timeout(ATTENTE_DE_LA_SORTIE, tache)
+            .await
+            .is_err()
+        {
+            warn!(
+                zone_id,
+                device_id = did,
+                attente_ms = ATTENTE_DE_LA_SORTIE.as_millis() as u64,
+                "device_stop_not_responding"
+            );
+            if let Some(ref bus) = self.event_bus {
+                bus.emit(
+                    "zone.playback_error",
+                    serde_json::json!({
+                        "zone_id": zone_id,
+                        "device_id": did,
+                        "code": "device_not_responding",
+                        "error": appareil_ne_repond_pas(did),
+                    }),
+                );
+            }
+        }
+    }
+
     pub async fn stop(&self, zone_id: i64, device_id: Option<&str>) {
         let old_stream_id = self.arreter_l_etat_de_la_zone(zone_id).await;
 
@@ -3707,10 +3979,9 @@ impl PlaybackOrchestrator {
         };
         if let Some(ref did) = resolved_did {
             let arc = { self.outputs.lock().await.get(did) };
-            if let Some(output) = arc
-                && let Err(e) = output.lock().await.stop().await
-            {
-                warn!(zone_id, error = %e, "device_stop_failed");
+            if let Some(output) = arc {
+                self.arreter_la_sortie_sans_attendre_plus(zone_id, did, output)
+                    .await;
             }
         } else {
             // Aucun appareil résolu. L'ancien repli arrêtait TOUTES les sorties
@@ -3932,6 +4203,21 @@ impl PlaybackOrchestrator {
         state: &crate::playback::ZoneState,
         seek_start: std::time::Instant,
     ) -> OutputCommandResult<()> {
+        // #8082 — un flux continu porte plusieurs pistes : un `Seek` du
+        // renderer viserait la position dans le FLUX, pas dans la piste. Le
+        // flux est relancé depuis la piste en cours, à la position voulue.
+        if let Some(sid) = state
+            .now_playing
+            .as_ref()
+            .and_then(|np| np.stream_id.as_deref())
+            && crate::outputs::dlna_flux_continu::est_un_flux_continu(sid)
+        {
+            info!(zone_id, position_ms, "flux_continu_deplacement_par_relance");
+            return self
+                .replay_zone_at_position(zone_id, position_ms, "flux_continu")
+                .await
+                .map_err(|e| OutputCommandError::failed(OutputCommand::Seek, e));
+        }
         let original_position_ms = state.position_ms;
         // For streaming tracks on network outputs (DLNA, OpenHome, etc.),
         // the seek strategy depends on whether the stream session supports

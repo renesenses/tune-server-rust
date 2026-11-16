@@ -343,6 +343,11 @@ pub(super) async fn pas_de_volume(
     {
         return crate::routes::playback::output_command_error_response(error);
     }
+    // #8165 — un pas + / − est un geste de volume : il lève la sourdine.
+    state
+        .orchestrator
+        .lever_la_sourdine_au_geste_de_volume(id, zone.output_device_id.as_deref())
+        .await;
     let retenu = state.playback.get_state(id).await.volume;
     let mut obj = serde_json::Map::new();
     obj.insert("zone_id".into(), json!(id));

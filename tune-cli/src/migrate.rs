@@ -396,8 +396,10 @@ mod inner {
             .map_err(|e| format!("prepare {table}: {e}"))?;
         let mut rows = stmt.query([]).map_err(|e| format!("query {table}: {e}"))?;
 
-        let mut batch: Vec<Vec<sqlx::types::Json<serde_json::Value>>> =
-            Vec::with_capacity(batch_size);
+        // #8196 : `serde_json::Value` nu, et non `sqlx::types::Json` — ce
+        // wrapper n'etait qu'un emballage (`bind_json_value` lit `.0`), et il
+        // exige la feature `json` de sqlx, qui tire sqlx-sqlite dans le verrou.
+        let mut batch: Vec<Vec<serde_json::Value>> = Vec::with_capacity(batch_size);
         let mut inserted = 0u64;
         let started = Instant::now();
 
@@ -406,7 +408,7 @@ mod inner {
             for (i, col) in cols.iter().enumerate() {
                 let v: rusqlite::types::Value =
                     row.get(i).map_err(|e| format!("{table}.{}: {e}", col))?;
-                values.push(sqlx::types::Json(sqlite_to_json(v)));
+                values.push(sqlite_to_json(v));
             }
             batch.push(values);
             if batch.len() >= batch_size {
@@ -426,7 +428,7 @@ mod inner {
     async fn flush(
         pool: &PgPool,
         sql: &str,
-        batch: &[Vec<sqlx::types::Json<serde_json::Value>>],
+        batch: &[Vec<serde_json::Value>],
     ) -> Result<u64, String> {
         // We rebind each row one at a time (sqlx doesn't support
         // multi-row binding in a single statement nicely). The batch
@@ -437,7 +439,7 @@ mod inner {
         for row in batch {
             let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
             for v in row {
-                q = bind_json_value(q, &v.0);
+                q = bind_json_value(q, v);
             }
             let res = q
                 .execute(&mut *tx)

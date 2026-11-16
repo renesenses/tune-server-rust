@@ -31,6 +31,7 @@ pub mod registry;
 pub mod remplacement_indisponibles;
 pub mod spotify;
 pub mod spotify_connect;
+pub mod spotify_connect_session;
 /// #6018 — la lecture d'un titre Spotify par librespot, comme source PCM.
 pub mod spotify_lecture;
 pub mod tidal;

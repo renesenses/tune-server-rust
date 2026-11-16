@@ -383,6 +383,28 @@ fn member_ids(tx: &dyn DbTxHandle, key: &str) -> Result<Vec<i64>, String> {
         .collect())
 }
 
+/// #4201 — « ce favori désigne l'élément `colonne` », quel que soit le type de
+/// `favorites.item_id`.
+///
+/// Ce type varie selon la base : INTEGER sur SQLite, TEXT sur une base
+/// PostgreSQL posée par `PG_FULL_SCHEMA`, BIGINT sur une base PostgreSQL 18
+/// migrée (mesuré le 29/10). L'ancienne forme `f.item_id = CAST(x AS TEXT)`
+/// rendait « operator does not exist: bigint = text » sur cette dernière, et le
+/// premier import complet finissait `partial`. Les deux côtés passent donc en
+/// texte, ce que SQLite et PostgreSQL savent comparer tous les deux.
+pub(crate) fn favori_designe(colonne: &str) -> String {
+    format!("CAST(f.item_id AS TEXT) = CAST({colonne} AS TEXT)")
+}
+
+/// L'album distant vidé par `remove_missing`, sauf s'il est en favori.
+fn sql_retrait_d_un_album_distant_vide() -> String {
+    format!(
+        "DELETE FROM albums WHERE id = ? AND source = 'upnp' AND NOT EXISTS \
+         (SELECT 1 FROM favorites f WHERE f.item_type = 'album' AND {})",
+        favori_designe("albums.id")
+    )
+}
+
 /// Every candidate is scoped by both membership and the track's source/UDN.
 /// A second subscription still owning the track prevents its deletion.
 fn liens_utilisateur_sql(ids: &str) -> String {
@@ -391,8 +413,10 @@ fn liens_utilisateur_sql(ids: &str) -> String {
         "SELECT t.id FROM tracks t WHERE t.id IN ({ids}) AND (
         EXISTS (SELECT 1 FROM playlist_tracks pt WHERE pt.track_id = t.id)
         OR EXISTS (SELECT 1 FROM favorites f WHERE
-            (f.item_type = 'track' AND f.item_id = CAST(t.id AS TEXT))
-            OR (f.item_type = 'album' AND f.item_id = CAST(t.album_id AS TEXT)))) LIMIT 1"
+            (f.item_type = 'track' AND {piste})
+            OR (f.item_type = 'album' AND {album}))) LIMIT 1",
+        piste = favori_designe("t.id"),
+        album = favori_designe("t.album_id"),
     )
 }
 
@@ -440,7 +464,7 @@ fn remove_missing(db: &dyn DbBackend, source: &Source, confirme: bool) -> Result
         for row in albums {
             if row[1].as_str().is_some_and(|s| s.starts_with(&prefixe)) {
                 let id = row[0].as_i64().ok_or("album sans identifiant")?;
-                tx.execute("DELETE FROM albums WHERE id = ? AND source = 'upnp' AND NOT EXISTS (SELECT 1 FROM favorites f WHERE f.item_type = 'album' AND f.item_id = CAST(albums.id AS TEXT))", &[&id])?;
+                tx.execute(&sql_retrait_d_un_album_distant_vide(), &[&id])?;
             }
         }
         Ok(())
@@ -692,6 +716,12 @@ pub fn start(state: AppState) {
 #[cfg(test)]
 #[path = "synchronisation_upnp_tests_4924.rs"]
 mod synchronisation_upnp_tests_4924;
+
+// #4201 — les liens utilisateur sur une VRAIE base PostgreSQL dont
+// `favorites.item_id` est BIGINT (PostgreSQL 18 migrée).
+#[cfg(all(test, feature = "postgres"))]
+#[path = "pg_4201_favoris_bigint_tests.rs"]
+mod pg_4201_favoris_bigint_tests;
 
 #[cfg(test)]
 mod identites_upnp_tests {

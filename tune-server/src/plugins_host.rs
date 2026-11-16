@@ -443,7 +443,25 @@ impl HostContext for AppStateHost {
             duration_ms: req.get("duration_ms").and_then(Value::as_i64),
             ..Default::default()
         };
-        let result = block_on(self.orchestrator.play(orch_req))?;
+        // #8021 — un greffon qui lance une lecture sur une zone d'un groupe la
+        // fait partir sur tout le groupe, comme depuis Tune (#7717). Refusée
+        // (erreur ou refus de la sortie), la tête revient à la meneuse d'avant.
+        let remplacees = crate::routes::zones::relais_de_groupe_6155::prendre_la_tete_du_groupe_sur(
+            &self.backend,
+            zone,
+        );
+        let lancement = block_on(self.orchestrator.play(orch_req));
+        if !lancement
+            .as_ref()
+            .is_ok_and(|result| result.sortie_refusee().is_none())
+        {
+            crate::routes::zones::relais_de_groupe_6155::rendre_la_tete_du_groupe_sur(
+                &self.backend,
+                zone,
+                &remplacees,
+            );
+        }
+        let result = lancement?;
         Ok(json!({
             "output_sent": result.output_sent,
             "source": result.source,

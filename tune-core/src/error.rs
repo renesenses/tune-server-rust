@@ -75,6 +75,19 @@ pub enum TuneError {
     #[error("{0}")]
     AppRefused(String),
 
+    /// Une demande de connexion refusée, avec un CODE stable que le client
+    /// traduit (renesenses/tune-server-rust#8142).
+    ///
+    /// Mesuré sur un rc10 en Docker (ZimaOS) : coller l'adresse de retour
+    /// Spotify sans son `?code=…` sortait en 400 texte brut, sans code, et
+    /// l'écran affichait « Le serveur n'a pas pu traiter la demande ». Le
+    /// refus était pourtant précis ; seul le texte libre le portait.
+    ///
+    /// `code` est un identifiant stable (`spotify_callback_sans_code`…) ; le
+    /// texte affiché reste celui du refus, sans préfixe.
+    #[error("{message}")]
+    Refused { code: &'static str, message: String },
+
     #[error("{0}")]
     Other(String),
 }

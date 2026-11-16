@@ -1,5 +1,7 @@
 mod boucle_locale_5639;
+mod diagnostic_surechantillonnage_8259;
 mod lecture_http;
+mod retard_de_depart_8437;
 use lecture_http::LecteurHttpAnnulable;
 
 use std::cell::UnsafeCell;
@@ -357,6 +359,44 @@ pub(crate) fn decider_la_relache_du_peripherique(
     }
 }
 
+/// #3245 — ce qu'une demande de changement de mode exclusif a donné.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangementDExclusif {
+    /// La sortie était déjà dans ce mode.
+    Inchange,
+    /// Le mode est changé : la prochaine ouverture du périphérique le suit.
+    Applique,
+    /// Un fil de lecture tient le périphérique : rien n'a changé.
+    DiffereEnLecture,
+}
+
+impl ChangementDExclusif {
+    /// Code stable, pour le journal et les réponses de l'API.
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::Inchange => "inchange",
+            Self::Applique => "applique",
+            Self::DiffereEnLecture => "differe_en_lecture",
+        }
+    }
+}
+
+/// #3245 — la règle de [`LocalOutput::changer_de_mode_exclusif_au_repos`],
+/// sans périphérique.
+pub fn decider_le_changement_d_exclusif(
+    actuel: bool,
+    voulu: bool,
+    peripherique_tenu: bool,
+) -> ChangementDExclusif {
+    if actuel == voulu {
+        ChangementDExclusif::Inchange
+    } else if peripherique_tenu {
+        ChangementDExclusif::DiffereEnLecture
+    } else {
+        ChangementDExclusif::Applique
+    }
+}
+
 /// Dit « ce fil vit encore » aussi longtemps qu'il existe.
 ///
 /// Déclarée en PREMIER dans le fil de lecture, elle est donc détruite en
@@ -503,6 +543,9 @@ mod bras_wasapi;
 // la chaîne des bras Windows exclusifs.
 #[cfg(target_os = "linux")]
 mod bras_alsa_natif;
+// #8248 — le DSD natif de Linux : PCM `hw:` ouvert en `DSD_U32_BE`/`_LE`.
+#[cfg(target_os = "linux")]
+mod bras_alsa_dsd;
 
 // REF-8 (#2219) : l'étage natif des bras Windows exclusifs — octets source
 // → mots `i32` alignés à gauche → `PuitsNatif` — et le puits de tout
@@ -678,7 +721,14 @@ pub struct LocalOutput {
     sentinelle_du_fil: std::sync::Mutex<Option<Arc<AtomicBool>>>,
     /// When true (and on macOS), use CoreAudio exclusive/hog mode for
     /// bit-perfect output, bypassing the system mixer.
-    exclusive_mode: bool,
+    ///
+    /// #3245 — atomique, et non plus figé à la construction : le mode
+    /// exclusif se règle désormais PAR ZONE, et un changement de réglage doit
+    /// atteindre la sortie déjà enregistrée sans la reconstruire (volume, EQ,
+    /// crossfeed et DSP installés y vivent). Il ne change qu'AU REPOS
+    /// ([`Self::changer_de_mode_exclusif_au_repos`]) : chaque lecture le relit à
+    /// son ouverture, jamais pendant qu'un flux tient le périphérique.
+    exclusive_mode: AtomicBool,
     /// Audio backend preference: "auto", "wasapi", or "asio" (Windows only).
     audio_backend: String,
     /// Set by stop() to immediately silence the cpal callback, even if
@@ -819,10 +869,15 @@ pub struct LocalOutput {
     /// cadence en cours de flux) est REFUSÉE au lieu d'être jouée. Posé par
     /// piste par l'orchestrateur, comme `pure_bypass`. Défaut désarmé.
     strict_bitperfect: Arc<AtomicBool>,
+    fixed_sample_rate: AtomicU32,
     /// #6132 — la seconde sortie de la zone qui joue ici (nom du périphérique
     /// B), ou `None`. Posée par piste par l'orchestrateur depuis
     /// `zone_{id}_sortie_double`, lue une fois par `play_url`.
     seconde_sortie: std::sync::Mutex<Vec<crate::outputs::sortie_double::SecondeSortieDemandee>>,
+    /// #8437 — retard de départ (ms) de la zone qui va jouer : son
+    /// `sync_delay_ms` quand elle est groupée avec une zone réseau, sinon 0.
+    /// Posé par l'orchestrateur à chaque lecture, lu une fois par `play_url`.
+    retard_de_depart_ms: AtomicU64,
     /// Optional headphone crossfeed effect, applied AFTER the convolver on the
     /// local (DAC) output only. Gated by the same `pure_bypass` (skipped in
     /// PURE) and only when the stream is stereo. Set per-play by the
@@ -836,6 +891,9 @@ pub struct LocalOutput {
     surechantillonnage: Arc<
         std::sync::Mutex<Option<super::super::audio::surechantillonnage::ChoixSurechantillonnage>>,
     >,
+
+    /// #8259 — la cause de refus de la piste ouverte, distincte du réglage.
+    diagnostic_surechantillonnage: Arc<diagnostic_surechantillonnage_8259::Diagnostic>,
     /// Repli mono de la zone en cours de lecture sur cette sortie (#2362).
     ///
     /// Quand il est armé, la chaîne somme `M = (L + R) / 2` et réémet `M` sur
@@ -1349,6 +1407,38 @@ impl LocalOutput {
         self.origin_host.as_deref()
     }
 
+    /// #3245 — le mode exclusif sous lequel la PROCHAINE ouverture du
+    /// périphérique se fera.
+    pub fn mode_exclusif(&self) -> bool {
+        self.exclusive_mode.load(Ordering::Acquire)
+    }
+
+    /// #3245 — applique un nouveau mode exclusif, seulement si aucun fil de
+    /// lecture ne tient le périphérique.
+    ///
+    /// Le mode est lu à l'ouverture du flux (choix du bras WASAPI, ASIO,
+    /// CoreAudio ou partagé) et par des questions posées en cours de lecture
+    /// (« ce bras sait-il enchaîner, fondre ? »). Le changer sous un flux
+    /// ouvert ferait répondre ces questions pour un bras qui ne joue pas.
+    /// Pendant une lecture, rien ne change et l'appelant réessaie plus tard.
+    pub fn changer_de_mode_exclusif_au_repos(&self, voulu: bool) -> ChangementDExclusif {
+        let fil_vivant = self
+            .sentinelle_du_fil
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|s| s.load(Ordering::SeqCst));
+        let changement = decider_le_changement_d_exclusif(
+            self.mode_exclusif(),
+            voulu,
+            fil_vivant || self.playing.load(Ordering::SeqCst),
+        );
+        if changement == ChangementDExclusif::Applique {
+            self.exclusive_mode.store(voulu, Ordering::Release);
+        }
+        changement
+    }
+
     /// Create a local output bound to the stable backend endpoint discovered
     /// alongside its display name.
     pub fn with_options_and_endpoint(
@@ -1387,7 +1477,7 @@ impl LocalOutput {
             stop_tx: std::sync::Mutex::new(None),
             play_thread: std::sync::Mutex::new(None),
             sentinelle_du_fil: std::sync::Mutex::new(None),
-            exclusive_mode,
+            exclusive_mode: AtomicBool::new(exclusive_mode),
             audio_backend: audio_backend.to_string(),
             play_generation: Arc::new(AtomicU64::new(0)),
             force_silent: std::sync::Mutex::new(Arc::new(AtomicBool::new(false))),
@@ -1408,7 +1498,9 @@ impl LocalOutput {
             pure_contourne_un_reglage: Arc::new(AtomicBool::new(false)),
             pure_contourne_un_gain_garde: Arc::new(AtomicBool::new(false)),
             strict_bitperfect: Arc::new(AtomicBool::new(false)),
+            fixed_sample_rate: AtomicU32::new(0),
             seconde_sortie: std::sync::Mutex::new(Vec::new()),
+            retard_de_depart_ms: AtomicU64::new(0),
             mono_downmix: Arc::new(AtomicBool::new(false)),
             reaffectation: Arc::new(CreneauReaffectation::vide()),
             disposition: Arc::new(std::sync::Mutex::new(None)),
@@ -1418,6 +1510,7 @@ impl LocalOutput {
             // exactement comme avant #1590.
             soft_mute_ms: Arc::new(AtomicU32::new(0)),
             crossfeed: Arc::new(std::sync::Mutex::new(None)),
+            diagnostic_surechantillonnage: Arc::default(),
             surechantillonnage: Arc::new(std::sync::Mutex::new(None)),
             dop_active: Arc::new(AtomicBool::new(false)),
             signal_path_status: Arc::new(std::sync::Mutex::new(None)),
@@ -1959,6 +2052,17 @@ impl LocalOutput {
             .collect();
     }
 
+    /// #8437 — le retard de départ de la prochaine ouverture du flux (ms),
+    /// voir [`crate::zones::retard_groupe_mixte_8437`]. `0` : départ immédiat.
+    pub fn set_retard_de_depart_ms(&self, ms: u64) {
+        self.retard_de_depart_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// #8437 — le retard que la prochaine ouverture du flux observera.
+    pub(crate) fn retard_de_depart_ms(&self) -> u64 {
+        self.retard_de_depart_ms.load(Ordering::Relaxed)
+    }
+
     /// #6132 — le curseur de volume de cette sortie (millièmes), celui que
     /// `set_volume` et la sourdine écrivent. Partagé avec la sortie double
     /// d'une AUTRE zone qui recopie vers ce périphérique : chaque membre d'un
@@ -2009,6 +2113,11 @@ impl LocalOutput {
             .clone()
     }
 
+    pub fn set_fixed_sample_rate(&self, rate: Option<u32>) {
+        self.fixed_sample_rate
+            .store(rate.unwrap_or(0), Ordering::Relaxed);
+    }
+
     pub fn set_strict_bitperfect(&self, strict: bool) {
         self.strict_bitperfect.store(strict, Ordering::Relaxed);
     }
@@ -2018,7 +2127,7 @@ impl LocalOutput {
     /// l'orchestrateur ne peut pas promettre du DSD natif à une sortie qui
     /// ouvrirait WASAPI ou le chemin partagé. Toujours faux hors Windows.
     pub fn sort_par_asio_exclusif(&self) -> bool {
-        enchainement_exclusif::bras_de_cette_plateforme(self.exclusive_mode, &self.audio_backend)
+        enchainement_exclusif::bras_de_cette_plateforme(self.mode_exclusif(), &self.audio_backend)
             == enchainement_exclusif::BrasDeLecture::AsioExclusif
     }
 
@@ -2034,7 +2143,7 @@ impl LocalOutput {
         #[cfg(target_os = "windows")]
         {
             let exclusif = match enchainement_exclusif::bras_de_cette_plateforme(
-                self.exclusive_mode,
+                self.mode_exclusif(),
                 &self.audio_backend,
             ) {
                 enchainement_exclusif::BrasDeLecture::WasapiExclusif => true,
@@ -2056,6 +2165,17 @@ impl LocalOutput {
         {
             None
         }
+    }
+
+    /// #8248 — de quoi sonder le DSD natif ALSA de cette sortie. `None` hors
+    /// Linux : le DSD natif n'y passe que par ASIO.
+    pub fn sonde_dsd_alsa(&self) -> Option<SondeDsdAlsa> {
+        cfg!(target_os = "linux").then(|| SondeDsdAlsa {
+            device_name: self.device_name.clone(),
+            endpoint_id: self.endpoint_id.clone(),
+            origin_host: self.origin_host.clone(),
+            audio_backend: self.audio_backend.clone(),
+        })
     }
 
     /// #5643 — le nom du périphérique, tel que la sortie l'ouvrira (la clé de
@@ -2219,7 +2339,7 @@ impl LocalOutput {
     /// partagé porte le puits de fondu ; les bras exclusifs (WASAPI, ASIO,
     /// CoreAudio) enchaînent en gapless et ne fondent pas.
     pub fn sait_fondre(&self) -> bool {
-        enchainement_exclusif::bras_de_cette_plateforme(self.exclusive_mode, &self.audio_backend)
+        enchainement_exclusif::bras_de_cette_plateforme(self.mode_exclusif(), &self.audio_backend)
             == enchainement_exclusif::BrasDeLecture::CpalPartage
     }
 
@@ -2230,7 +2350,7 @@ impl LocalOutput {
             self.soft_mute_ms.load(Ordering::Relaxed),
             self.dop_active.load(Ordering::Relaxed),
             self.pure_bypass.load(Ordering::Relaxed),
-            self.exclusive_mode,
+            self.mode_exclusif(),
         )
     }
 
@@ -2240,7 +2360,7 @@ impl LocalOutput {
             self.soft_mute_ms.clone(),
             self.dop_active.clone(),
             self.pure_bypass.clone(),
-            self.exclusive_mode,
+            self.mode_exclusif(),
         )
     }
 
@@ -2262,8 +2382,23 @@ impl LocalOutput {
         &self,
         choix: Option<super::super::audio::surechantillonnage::ChoixSurechantillonnage>,
     ) {
+        self.set_decision_surechantillonnage(
+            choix.ok_or(crate::audio::surechantillonnage::Ecarte::Desactive),
+        );
+    }
+
+    /// Le refus suit le choix, sans réécrire le diagnostic de la piste en cours.
+    pub fn set_decision_surechantillonnage(
+        &self,
+        choix: Result<
+            crate::audio::surechantillonnage::ChoixSurechantillonnage,
+            crate::audio::surechantillonnage::Ecarte,
+        >,
+    ) {
         if let Ok(mut slot) = self.surechantillonnage.lock() {
-            *slot = choix;
+            self.diagnostic_surechantillonnage
+                .demander(choix.as_ref().err().map(|e| e.code()));
+            *slot = choix.ok();
         }
     }
 
@@ -2456,6 +2591,72 @@ impl SondeDuDop {
     }
 }
 
+/// #8248 — le nombre de voies sur lequel le DSD natif ALSA est sondé pour la
+/// table de capacité : le DSD natif des DAC USB est stéréo. Un fichier
+/// multicanal part en DoP (`MotifDsdServiEnDop::VoiesNonDeclarees`).
+pub const VOIES_SONDEES_DSD_ALSA: u16 = 2;
+
+/// #8248 — ce qu'a rendu le sondage DSD natif d'une sortie ALSA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResultatSondeDsdAlsa {
+    /// La sortie n'ouvre pas un PCM ALSA matériel (`hw:`) : pas de DSD natif.
+    PasUnPcmMateriel,
+    /// PCM tenu (ou illisible) : capacité non sondée, rien n'est retenu.
+    Occupe,
+    /// PCM sondé : les cadences DSD acceptées en `DSD_U32` (vide = aucune).
+    Sonde { cadences: Vec<u32>, voies: u16 },
+}
+
+/// #8248 — une question « ce PCM offre-t-il le DSD natif ? », détachée de la
+/// sortie (voir [`LocalOutput::sonde_dsd_alsa`]) : le sondage ouvre le PCM,
+/// il se fait hors du verrou de la sortie et hors du fil asynchrone.
+#[derive(Debug, Clone)]
+pub struct SondeDsdAlsa {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    device_name: String,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    endpoint_id: Option<String>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    origin_host: Option<String>,
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    audio_backend: String,
+}
+
+impl SondeDsdAlsa {
+    /// Bloquant. Une réponse (PCM matériel ou non, cadences) est retenue dans
+    /// `capacite_dsd_natif` ; un PCM occupé ne retient rien.
+    pub fn sonder_et_retenir(&self) -> ResultatSondeDsdAlsa {
+        #[cfg(target_os = "linux")]
+        {
+            use crate::outputs::capacite_dsd_natif::{self as capacite, CapaciteConnue};
+            let r = bras_alsa_dsd::sonder_la_sortie(
+                &self.device_name,
+                self.endpoint_id.as_deref(),
+                self.origin_host.as_deref(),
+                &self.audio_backend,
+                VOIES_SONDEES_DSD_ALSA,
+            );
+            match &r {
+                ResultatSondeDsdAlsa::Sonde { cadences, .. } => capacite::retenir(
+                    &self.device_name,
+                    CapaciteConnue::AlsaDsdU32 {
+                        cadences: cadences.clone(),
+                    },
+                ),
+                ResultatSondeDsdAlsa::PasUnPcmMateriel => {
+                    capacite::retenir(&self.device_name, CapaciteConnue::SortieNonAsio);
+                }
+                ResultatSondeDsdAlsa::Occupe => {}
+            }
+            r
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            ResultatSondeDsdAlsa::PasUnPcmMateriel
+        }
+    }
+}
+
 /// Integer SPSC ring used by Windows exclusive backends when the source must
 /// cross the callback boundary without touching floating point.
 ///
@@ -2612,6 +2813,10 @@ impl NativePcmRing {
 
     pub(crate) fn pop(&self, out: &mut [i32]) -> usize {
         self.pop_mapped(out, |sample| sample)
+    }
+
+    pub(crate) fn starvation(&self) -> Arc<RingStarvation> {
+        self.starvation.clone()
     }
 
     /// #7704 — le prochain mot à tirer, SANS le consommer (consommateur seul).
@@ -3045,6 +3250,10 @@ mod retrait_du_registre_7949;
 // #8074 — le premier morceau après le démarrage ne part jamais à pleine échelle.
 #[cfg(test)]
 mod premier_play_au_gain_de_zone_8074;
+
+// #8609 — banc de mesure : `malloc_trim` pendant une lecture locale.
+#[cfg(all(test, target_os = "linux", target_env = "gnu"))]
+mod banc_trim_8609;
 
 /// Pourquoi le décodage d'un flux compressé n'a rien rendu (#3270).
 ///
@@ -3707,12 +3916,13 @@ fn record_exclusive_open_failure(
 
 /// Pourquoi le chemin cpal PARTAGÉ n'a ouvert aucun périphérique.
 ///
-/// `find_device_with_fallback` ne rend `None` que dans UN cas : le
-/// périphérique réglé sur la zone est introuvable ET l'hôte n'expose aucune
-/// sortie par défaut sur laquelle se rabattre — c'est
-/// `audio_device_not_found_no_default_available`, la seule des quatre issues
-/// de cette fonction qui n'ouvre rien. Dès qu'un repli existe on passe par
-/// `audio_device_not_found_falling_back_to_default` et la lecture continue.
+/// `find_device_with_fallback` rend `None` quand le périphérique réglé sur la
+/// zone est introuvable et que rien ne doit le remplacer : sous Windows, par
+/// décision (#8171, `audio_device_not_found_refused`) ; ailleurs, quand l'hôte
+/// n'expose aucune sortie par défaut sur laquelle se rabattre
+/// (`audio_device_not_found_no_default_available`). Hors Windows, dès qu'un
+/// repli existe on passe par `audio_device_not_found_falling_back_to_default`
+/// et la lecture continue.
 ///
 /// Les deux consommateurs de ce `None` — le flux WAV, donc la bibliothèque
 /// locale, et le flux compressé décodé — s'arrêtaient sans rien dire, alors
@@ -3746,9 +3956,10 @@ impl SharedDeviceResolution {
             Self::WavStreamNotFound => "le flux PCM",
             Self::CompressedStreamNotFound => "le flux décodé",
         };
-        format!(
-            "Sortie « {device} » : le périphérique est introuvable et le système n'expose aucune sortie par défaut sur laquelle se rabattre ; {flux} n'a été envoyé nulle part. Rebranchez le périphérique ou choisissez une autre sortie pour cette zone"
-        )
+        // #8171 — un seul message pour les deux refus : sous Windows (aucun
+        // repli, par décision) et ailleurs quand le système n'expose aucune
+        // sortie par défaut.
+        crate::outputs::peripherique_introuvable::message_peripherique_introuvable(device, flux)
     }
 }
 
@@ -3877,6 +4088,7 @@ where
     T: Copy,
     f32: symphonia::core::audio::conv::IntoSample<T>,
 {
+    use crate::audio::dop_continu::{haut_f32, repos_f32};
     use symphonia::core::audio::conv::IntoSample;
     // Rampe anti-« ploc » (#1590). Ce chemin sert les DAC qui refusent le
     // flottant : la rampe y est armée par la même porte, donc toujours
@@ -3884,19 +4096,50 @@ where
     ramp.arm(armed_ms);
     let silence = paused.load(Ordering::Relaxed) || silent.load(Ordering::Relaxed);
     if ramp.begin(silence) == crate::audio::soft_mute::Rendering::Silent {
-        periode_muette(ring, output, zero);
+        ramp.dop
+            .combler(output, zero, |m| repos_f32(m).into_sample());
+        ring.starvation().record_silent_period(output.len());
         return 0;
     }
     if !data_started.load(Ordering::Acquire) {
         if ring.available() < min_buffer_samples {
-            periode_muette(ring, output, zero);
+            ramp.dop
+                .combler(output, zero, |m| repos_f32(m).into_sample());
+            ring.starvation().record_silent_period(output.len());
             return 0;
         }
         data_started.store(true, Ordering::Release);
     }
+    let ch = ramp.dop.canaux();
+    let mut debut = 0;
+    if ramp.dop.actif()
+        && output.len() >= ch
+        && ring.premier_en_attente().map(haut_f32) == ramp.dop.dernier_marqueur()
+    {
+        ramp.dop
+            .combler(&mut output[..ch], zero, |m| repos_f32(m).into_sample());
+        debut = ch;
+    }
+    let mut dop = std::mem::replace(
+        &mut ramp.dop,
+        crate::audio::dop_continu::SuiviDoP::new(ch as u16),
+    );
     let v = volume.load(Ordering::Relaxed) as f32 / UNITE_DU_GAIN_DE_RENDU as f32;
-    let read = ramp.apply_mapped(v, |s| s.into_sample(), |map| ring.pop_mapped(output, map));
-    output[read..].fill(zero);
+    ring.starvation().record_silent_period(debut);
+    let read = ramp.apply_mapped(
+        v,
+        |s| s.into_sample(),
+        |map| {
+            ring.pop_mapped(&mut output[debut..], |s| {
+                dop.observer_marqueur(haut_f32(s));
+                map(s)
+            })
+        },
+    );
+    dop.combler(&mut output[debut + read..], zero, |m| {
+        repos_f32(m).into_sample()
+    });
+    ramp.dop = dop;
     read
 }
 
@@ -5102,27 +5345,37 @@ impl SurechDeLEtage<'_> {
     }
 }
 
+/// #8428 — la cadence fixe de la zone que l'ouverture du périphérique a
+/// RAMENÉE à la cadence que la sortie accepte : `Some((demandée, ouverte))`.
+/// `None` quand rien n'est demandé, que la cadence est tenue, ou que le flux
+/// est un porteur DoP, sous PURE ou bit-perfect strict (aucune conversion).
+///
+/// Décision de Bertrand du 12/11 : ce n'est JAMAIS un refus. La piste joue à
+/// la cadence ouverte, convertie comme toute autre ; le chemin du signal le
+/// dit (`fixed_rate_limit`, lu sur la cadence ouverte que la sortie déclare).
+pub(super) fn cadence_fixe_ramenee(
+    demandee: u32,
+    ouverte: u32,
+    dop: bool,
+    pure: bool,
+    strict: bool,
+) -> Option<(u32, u32)> {
+    (demandee != 0 && ouverte != 0 && demandee != ouverte && !dop && !pure && !strict)
+        .then_some((demandee, ouverte))
+}
+
 /// #7614 — le greffon peut-il s'ouvrir sur ce flux ? Jamais sous PURE, jamais
 /// sur un porteur DoP : un flux 24 bits dont l'amorce est un porteur, ou trop
 /// courte pour l'écarter, garde son chemin.
+#[cfg(test)]
 pub(super) fn surechantillonneur_admis_a_l_ouverture(
     spec: AudioSpec,
     amorce: &[u8],
     pure: bool,
     dop: bool,
 ) -> bool {
-    if pure || dop {
-        return false;
-    }
-    let canaux = spec.canaux();
-    let bits = spec.profondeur().bits_declares();
-    if bits == 24 {
-        let sonde = DOP_DETECT_FRAMES * usize::from(canaux) * 3;
-        if amorce.len() < sonde || is_dop_pcm(amorce, bits, canaux) {
-            return false;
-        }
-    }
-    true
+    diagnostic_surechantillonnage_8259::refus_a_l_ouverture(spec, amorce, pure, dop, false)
+        .is_none()
 }
 
 /// Ce qu'une poussée vers le puits a produit.
@@ -6190,7 +6443,7 @@ impl OutputTarget for LocalOutput {
     /// poller attend une transition d'un fil qui n'existe plus (`#1323` sur
     /// OAAT, `#1919` ici). Voir [`LocalOutput::chain_exhausted`].
     fn supports_internal_gapless(&self) -> bool {
-        enchainement_exclusif::bras_de_cette_plateforme(self.exclusive_mode, &self.audio_backend)
+        enchainement_exclusif::bras_de_cette_plateforme(self.mode_exclusif(), &self.audio_backend)
             .sait_enchainer()
             && !self.chain_exhausted.load(Ordering::Relaxed)
     }
@@ -6364,6 +6617,18 @@ impl OutputTarget for LocalOutput {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
 
+        // #8248 — le PCM vient d'être rendu : c'est le moment de sonder son
+        // DSD natif s'il est encore inconnu. L'orchestrateur ne peut pas le
+        // faire pendant qu'une piste PCM tient le PCM `hw:` (EBUSY) ; sans ce
+        // relevé, la première piste DSD qui suit une piste PCM partirait en
+        // DoP. Une fois par périphérique : la réponse est retenue.
+        #[cfg(target_os = "linux")]
+        if crate::outputs::capacite_dsd_natif::connue(&self.device_name).is_none()
+            && let Some(sonde) = self.sonde_dsd_alsa()
+        {
+            let _ = tokio::task::spawn_blocking(move || sonde.sonder_et_retenir()).await;
+        }
+
         // Create a FRESH force_silent flag for the new stream.
         // The old stream's callback keeps its clone of the previous Arc
         // (which was set to true by stop()), so it stays silent.
@@ -6440,7 +6705,7 @@ impl OutputTarget for LocalOutput {
         let seek_offset_arc = self.seek_offset_ms.clone();
         let pre_seeked = self.stream_pre_seeked.load(Ordering::SeqCst);
         let duration_ms_arc = self.duration_ms.clone();
-        let exclusive_mode = self.exclusive_mode;
+        let exclusive_mode = self.mode_exclusif();
         let audio_backend = self.audio_backend.clone();
         let eq = self.eq.clone();
         let current_format = self.current_format.clone();
@@ -6451,8 +6716,12 @@ impl OutputTarget for LocalOutput {
         // #3973 — lu UNE fois par piste, comme le reste de ce que
         // l'orchestrateur pose avant `play_url`.
         let strict_bitperfect = self.strict_bitperfect.load(Ordering::Relaxed);
+        let fixed_sample_rate = self.fixed_sample_rate.load(Ordering::Relaxed);
         // #6132 — lue UNE fois par piste, comme `strict_bitperfect`.
         let seconde_sortie = self.secondes_sorties();
+        // #8437 — lu UNE fois par piste : une transition gapless ne repasse
+        // pas par `play_url` et garde l'avance prise au départ.
+        let retard_de_depart_ms = self.retard_de_depart_ms();
         let mono_downmix = self.mono_downmix.clone();
         let reaffectation = self.reaffectation.clone();
         let disposition = self.disposition.clone();
@@ -6461,6 +6730,10 @@ impl OutputTarget for LocalOutput {
         let canaux_de_carte = self.canaux_de_carte();
         let crossfeed = self.crossfeed.clone();
         let surechantillonnage = self.surechantillonnage.clone();
+        let diagnostic_surechantillonnage = self.diagnostic_surechantillonnage.clone();
+        if let Ok(choix) = surechantillonnage.lock() {
+            diagnostic_surechantillonnage.ouvrir(choix.is_some());
+        }
         let dop_active = self.dop_active.clone();
         // Porte de la rampe anti-« ploc » (#1590). Une seule valeur clonable
         // plutôt que trois atomiques de plus dans des fermetures qui en portent
@@ -6506,6 +6779,21 @@ impl OutputTarget for LocalOutput {
             // sentinelle ne retombe qu'après le `Drop` du flux cpal, c'est-à-
             // dire après la fermeture effective du PCM (#3575).
             let _sentinelle_du_fil = SentinelleDuFilDeLecture(sentinelle_vivante);
+            // #8437 — groupe mixte (sortie locale + enceintes réseau) : la
+            // sortie locale attend le tampon des enceintes. Avant toute
+            // ouverture (flux, périphérique), interrompu par un Stop.
+            if retard_de_depart_ms > 0 {
+                info!(
+                    retard_ms = retard_de_depart_ms,
+                    "local_audio_retard_de_depart_groupe_mixte"
+                );
+                if !retard_de_depart_8437::attendre(retard_de_depart_ms, &force_silent, |ms| {
+                    std::thread::sleep(std::time::Duration::from_millis(ms))
+                }) {
+                    debug!("local_audio_retard_de_depart_interrompu");
+                    return;
+                }
+            }
             // ------- HTTP fetch the audio stream -------
             // Pas de delai total pour les longues pistes, mais Stop doit
             // interrompre aussi une attente HTTP, pas seulement l'alimentation
@@ -6615,21 +6903,53 @@ impl OutputTarget for LocalOutput {
                     });
                     return;
                 }
-                warn!(
-                    device = %device_name,
-                    cadence = entete.cadence,
-                    canaux = entete.canaux,
-                    "local_audio_dsd_natif_recu_sans_bras_asio"
-                );
-                if let Ok(mut slot) = open_failure.lock() {
-                    *slot = Some(format!(
-                        "« {device_name} » : flux DSD natif reçu, mais cette sortie n'est pas \
-                         un pilote ASIO exclusif."
-                    ));
+                // #8248 — Linux : PCM ALSA `hw:` ouvert en `DSD_U32`.
+                #[cfg(target_os = "linux")]
+                {
+                    bras_alsa_dsd::jouer_dsd_natif_via_alsa(bras_alsa_dsd::EntreesDsdNatifAlsa {
+                        device_name,
+                        endpoint_id,
+                        origin_host,
+                        audio_backend,
+                        url,
+                        entete,
+                        header_buf,
+                        reader,
+                        seek_offset,
+                        my_generation,
+                        paused,
+                        playing,
+                        force_silent,
+                        stop_rx,
+                        open_failure,
+                        position_ms,
+                        play_generation,
+                        track_ended_naturally,
+                        track_ended_generation,
+                        dop_active,
+                        chain_exhausted: chain_exhausted_ref,
+                        device_gone,
+                    });
+                    return;
                 }
-                force_silent.store(true, Ordering::SeqCst);
-                playing.store(false, Ordering::SeqCst);
-                return;
+                #[cfg(not(target_os = "linux"))]
+                {
+                    warn!(
+                        device = %device_name,
+                        cadence = entete.cadence,
+                        canaux = entete.canaux,
+                        "local_audio_dsd_natif_recu_sans_bras_asio"
+                    );
+                    if let Ok(mut slot) = open_failure.lock() {
+                        *slot = Some(format!(
+                            "« {device_name} » : flux DSD natif reçu, mais cette sortie n'est pas \
+                             un pilote ASIO exclusif."
+                        ));
+                    }
+                    force_silent.store(true, Ordering::SeqCst);
+                    playing.store(false, Ordering::SeqCst);
+                    return;
+                }
             }
 
             // #5439 — un flux décodé en continu repart du début de la piste :
@@ -7757,15 +8077,20 @@ impl OutputTarget for LocalOutput {
             let choix_du_surechantillonneur = surechantillonnage
                 .lock()
                 .ok()
-                .and_then(|c| c.clone())
-                .filter(|_| seconde_sortie.is_empty())
+                .and_then(|c| {
+                    diagnostic_surechantillonnage.ouvrir(c.is_some());
+                    c.clone()
+                })
                 .filter(|_| {
-                    surechantillonneur_admis_a_l_ouverture(
+                    let refus = diagnostic_surechantillonnage_8259::refus_a_l_ouverture(
                         spec,
                         header_buf.get(data_offset..).unwrap_or_default(),
                         pure_bypass.load(Ordering::Relaxed),
                         dop_active.load(Ordering::Relaxed),
-                    )
+                        !seconde_sortie.is_empty(),
+                    );
+                    diagnostic_surechantillonnage.noter(refus);
+                    refus.is_none()
                 });
             let ouverture = match choix_du_surechantillonneur.as_ref() {
                 Some(choix) => {
@@ -7803,6 +8128,32 @@ impl OutputTarget for LocalOutput {
             let peripherique_suit_la_source = backend.suit_la_cadence_source();
 
             let output_sr = sortie.cadence;
+            // #8428 — décision de Bertrand du 12/11 : RAMENER AU PLAFOND. Le
+            // système a ouvert une autre cadence que la cadence fixe (WASAPI
+            // partagé, mixeur à 48 kHz) : la piste joue à la cadence ouverte,
+            // convertie comme toute autre, et le chemin du signal le dit
+            // (`fixed_rate_limit` : « 96 kHz demandé, 48 kHz appliqué », lu sur
+            // la cadence OUVERTE que la sortie déclare). Le DoP garde sa
+            // cadence de transport et n'est jamais rééchantillonné.
+            if let Some((demandee, ouverte)) = cadence_fixe_ramenee(
+                fixed_sample_rate,
+                output_sr,
+                dop_active.load(Ordering::Relaxed)
+                    || is_dop_pcm(
+                        header_buf.get(data_offset..).unwrap_or_default(),
+                        bit_depth,
+                        channels,
+                    ),
+                pure_bypass.load(Ordering::Relaxed),
+                strict_bitperfect,
+            ) {
+                warn!(
+                    device = %device_name,
+                    cadence_fixe_demandee = demandee,
+                    cadence_ouverte = ouverte,
+                    "frequence_fixe_ramenee_a_la_cadence_de_la_sortie"
+                );
+            }
             let output_ch = sortie.canaux;
             reaffectation.constater_l_ouverture(voies_de_la_matrice, output_ch, &device_name);
 
@@ -7872,6 +8223,11 @@ impl OutputTarget for LocalOutput {
                     }
                 });
             if choix_du_surechantillonneur.is_some() && etage_du_surechantillonneur.is_none() {
+                diagnostic_surechantillonnage.noter(Some(
+                    backend
+                        .refus_du_surechantillonneur()
+                        .unwrap_or("filter_initialization_failed"),
+                ));
                 info!(
                     device = %device_name,
                     source_sr = sample_rate,
@@ -8645,7 +9001,7 @@ impl OutputTarget for LocalOutput {
         // (`RepriseDeSession::RetablirALaPosition`).
         if la_pause_rend_le_peripherique(
             cfg!(target_os = "windows"),
-            self.exclusive_mode,
+            self.mode_exclusif(),
             self.playing.load(Ordering::SeqCst),
         ) {
             let position_ms = self.position_ms.load(Ordering::SeqCst);
@@ -8783,6 +9139,7 @@ impl OutputTarget for LocalOutput {
         if let Ok(mut slot) = self.signal_path_status.lock() {
             *slot = None;
         }
+        self.diagnostic_surechantillonnage.noter(None);
         if let Ok(mut slot) = self.transformations_reelles.lock() {
             *slot = None;
         }
@@ -8961,7 +9318,10 @@ impl OutputTarget for LocalOutput {
         // le voyant nomme ce gain au lieu d'un « DSP appliqué » ambigu.
         let garde = self.preampli_garde();
         mesure.map(|t| {
-            let t = t.avec_fondu_enchaine(fondu);
+            let t = self
+                .diagnostic_surechantillonnage
+                .declarer(t)
+                .avec_fondu_enchaine(fondu);
             match garde {
                 Some(g) => t.avec_preampli_garde(g.db, g.en_retour),
                 None => t,
@@ -8984,27 +9344,35 @@ impl OutputTarget for LocalOutput {
         })
     }
 
+    /// #8173 — le même appariement que l'ouverture, et rien d'autre.
+    ///
+    /// La zone est disponible quand [`resolve_device`] la retrouverait sur
+    /// l'hôte que `select_host` ouvrira : par identifiant d'endpoint d'abord
+    /// (un DAC renommé par son pilote reste disponible), puis par nom avec la
+    /// convention des rangs `(n)` de la découverte, enfin par sous-chaîne
+    /// univoque. Une zone dont le nom vient d'un autre hôte (#3230), ou que
+    /// deux candidates contiennent, est indisponible : la lecture y serait
+    /// refusée. Décision et scènes : [`zone_locale_disponible`].
     async fn is_available(&self) -> bool {
         let name = self.device_name.clone();
         let backend = self.audio_backend.clone();
+        let endpoint_id = self.endpoint_id.clone();
+        let origin_host = self.origin_host.clone();
         // Probe on a blocking thread to avoid cpal blocking the async runtime
         tokio::task::spawn_blocking(move || {
             let host = select_host(&backend);
             if name == "default" {
                 return host.default_output_device().is_some();
             }
-            host.output_devices()
-                .map(|devs| {
-                    devs.into_iter().any(|d| {
-                        d.description()
-                            .map(|desc| {
-                                let n = desc.name().to_string();
-                                n == name || n.contains(&name)
-                            })
-                            .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false)
+            let open_host: &'static str = host.id().name();
+            let (_, identities) = enumerer_les_candidates(&host);
+            zone_locale_disponible(
+                &name,
+                endpoint_id.as_deref(),
+                origin_host.as_deref(),
+                open_host,
+                &identities,
+            )
         })
         .await
         .unwrap_or(false)
@@ -9405,6 +9773,16 @@ mod backend_display_tests;
 #[cfg(test)]
 mod backend_fallback_tests;
 
+/// #8171 — DAC introuvable sous Windows : re-liaison par identifiant, sinon
+/// refus, jamais la sortie par défaut. Listes de périphériques fictives.
+#[cfg(test)]
+mod peripherique_introuvable_8171_tests;
+
+/// #8173 — la disponibilité d'une zone locale suit la règle d'ouverture :
+/// scènes sur listes fictives, et garde de site sur `is_available`.
+#[cfg(test)]
+mod disponibilite_8173_tests;
+
 #[cfg(test)]
 mod backends_supportes_tests;
 
@@ -9623,3 +10001,6 @@ mod voies_exclusives_6230;
     test
 ))]
 mod etage_exclusif_observe_7093;
+
+#[cfg(test)]
+mod exclusif_par_zone_3245_tests;

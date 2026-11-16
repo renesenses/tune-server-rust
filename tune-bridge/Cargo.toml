@@ -41,3 +41,7 @@ tune-laissez-passer = { path = "../tune-laissez-passer", features = ["fabrique"]
 # base64, dans les tests de bout en bout du pont. #6603 : aussi un vrai
 # client WebSocket pour verifier la fermeture d'une session coupee.
 tokio-tungstenite = "0.26"
+# Bout en bout de l'ecoute a distance (#7714) : le VRAI client de relais du
+# serveur, sa cle et l'inscription de la cle sur le compte, face au vrai
+# relais. Dev seulement : le binaire du pont n'en depend pas.
+tune-core = { path = "../tune-core", default-features = false, features = ["cloud-relay"] }

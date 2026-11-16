@@ -69,8 +69,9 @@ pub(crate) enum DeviceResolution {
         open_host: String,
     },
     /// Le bon hôte, mais plus aucun périphérique de ce nom : débranché,
-    /// renommé, routage macOS changé. L'appelant retombe sur la sortie
-    /// système — en le disant (#2207).
+    /// renommé, routage macOS changé. Hors Windows, l'appelant retombe sur la
+    /// sortie système — en le disant (#2207) ; sous Windows il refuse (#8171,
+    /// [`crate::outputs::peripherique_introuvable`]).
     NotFound,
 }
 
@@ -321,6 +322,92 @@ pub(super) fn looks_disambiguated(requested: &str) -> bool {
         .is_some_and(|rank| rank >= 2)
 }
 
+/// La liste des périphériques de sortie de `host`, telle que la découverte
+/// la voit : puits nuls écartés, chaque identité étiquetée de l'hôte qui l'a
+/// énumérée.
+///
+/// #8173 — cette liste est construite en UN seul endroit, parce que deux
+/// consommateurs doivent la lire à l'identique : l'ouverture
+/// ([`find_device_with_fallback`]) et le contrôle de disponibilité
+/// (`LocalOutput::is_available`). Un périphérique que l'un voit et que l'autre
+/// ignore (un puits nul, par exemple) fait diverger les rangs `(n)` et, avec
+/// eux, le verdict.
+///
+/// Une énumération qui échoue rend deux listes vides : l'appelant conclut à
+/// « introuvable », jamais à autre chose.
+pub(super) fn enumerer_les_candidates(
+    host: &cpal::Host,
+) -> (Vec<cpal::Device>, Vec<DeviceIdentity>) {
+    let open_host: &'static str = host.id().name();
+    host.output_devices()
+        .map(|devs| devs.collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .map(|device| {
+            let identity = DeviceIdentity {
+                endpoint_id: device.id().map(|id| id.to_string()).unwrap_or_default(),
+                raw_name: device
+                    .description()
+                    .map(|desc| desc.name().to_string())
+                    .unwrap_or_else(|_| "Unknown".into()),
+                host: open_host.to_string(),
+            };
+            (device, identity)
+        })
+        .filter(|(_, identity)| !is_null_sink(&identity.endpoint_id, &identity.raw_name))
+        .unzip()
+}
+
+/// #8173 — une zone locale est disponible EXACTEMENT quand l'ouverture
+/// retrouverait son périphérique, et indisponible sinon.
+///
+/// Avant ce correctif, `LocalOutput::is_available` appliquait sa propre règle
+/// (`n == name || n.contains(&name)`) : sensible à la casse, dans un seul
+/// sens, sans l'identifiant d'endpoint, sans l'hôte d'origine et sans la
+/// convention des rangs `(n)`. Deux verdicts pour une même zone :
+///
+/// - un DAC renommé par son pilote mais retrouvé par son identifiant d'endpoint
+///   JOUAIT (re-liaison de #2269) et s'affichait pourtant « indisponible » ;
+/// - la zone sur le second homonyme, « Haut-Parleurs (2) », s'affichait
+///   « indisponible » alors que la découverte la lui avait donnée ainsi et que
+///   l'ouverture la retrouve ;
+/// - à l'inverse, un nom que deux candidates contiennent (sous-chaîne
+///   ambiguë) ou un nom venu d'un autre hôte (#3230) s'affichait
+///   « disponible », et la lecture était refusée — l'auditeur ne découvrait le
+///   problème qu'en appuyant sur lecture (#8171).
+///
+/// Il n'y a qu'une règle d'appariement, celle de [`resolve_device`] ; la
+/// disponibilité en est la lecture booléenne. `ForeignHost` compte comme
+/// indisponible : l'ouverture refuse sans repli, et une zone qui ne peut pas
+/// jouer n'est pas disponible. `NotFound` aussi : hors Windows l'ouverture
+/// retombe sur la sortie système, mais ce n'est pas « retrouver son appareil »
+/// — c'est le repli de #2207, qui se dit à l'écran, et `is_available` rendait
+/// déjà `false` dans ce cas.
+///
+/// Hors champ : le chemin ASIO exclusif (`asio_exclusive.rs`) apparie par
+/// égalité ou sous-chaîne sans passer par [`resolve_device`]. Une zone ASIO
+/// exclusive dont le nom serait contenu dans DEUX pilotes ASIO jouerait sur le
+/// premier et s'afficherait ici indisponible ; les noms de pilotes ASIO sont
+/// uniques en pratique, et le mode partagé est le cas de l'issue.
+pub(super) fn zone_locale_disponible(
+    requested: &str,
+    requested_endpoint_id: Option<&str>,
+    requested_host: Option<&str>,
+    open_host: &str,
+    candidates: &[DeviceIdentity],
+) -> bool {
+    matches!(
+        resolve_device(
+            requested,
+            requested_endpoint_id,
+            requested_host,
+            open_host,
+            candidates
+        ),
+        DeviceResolution::Matched(_)
+    )
+}
+
 /// Find an audio output device by name, falling back to the default device if
 /// the requested device is not found.
 ///
@@ -332,6 +419,10 @@ pub(super) fn looks_disambiguated(requested: &str) -> bool {
 ///
 /// Returns `(device, fell_back)` where `fell_back` is `true` if the default
 /// device was used instead of the requested one.
+///
+/// #8171 — sous Windows, ce repli n'a plus lieu : un périphérique nommé et
+/// introuvable rend `None`, et l'appelant refuse la lecture avec un message
+/// ([`crate::outputs::peripherique_introuvable`]).
 ///
 /// `origin_host` est l'hôte qui a ÉNUMÉRÉ le nom que porte la zone
 /// (`AudioDevice::backend`). Quand il est connu et qu'il diffère de l'hôte
@@ -367,24 +458,8 @@ pub(super) fn find_device_with_fallback(
     // « porte », et c'est cette étiquette-là que la résolution apparie.
     let open_host: &'static str = host.id().name();
 
-    let (devices, identities): (Vec<cpal::Device>, Vec<DeviceIdentity>) = host
-        .output_devices()
-        .map(|devs| devs.collect::<Vec<_>>())
-        .unwrap_or_default()
-        .into_iter()
-        .map(|device| {
-            let identity = DeviceIdentity {
-                endpoint_id: device.id().map(|id| id.to_string()).unwrap_or_default(),
-                raw_name: device
-                    .description()
-                    .map(|desc| desc.name().to_string())
-                    .unwrap_or_else(|_| "Unknown".into()),
-                host: open_host.to_string(),
-            };
-            (device, identity)
-        })
-        .filter(|(_, identity)| !is_null_sink(&identity.endpoint_id, &identity.raw_name))
-        .unzip();
+    // #8173 — la même liste que `is_available`, et que la découverte.
+    let (devices, identities) = enumerer_les_candidates(host);
 
     let resolution = resolve_device(
         device_name,
@@ -435,10 +510,14 @@ pub(super) fn find_device_with_fallback(
                 "local_audio_alsa_hardware_pcm_preferred_at_resolve"
             );
         }
-        debug!(
+        // #8171 — `info!` et non plus `debug!` : le périphérique réellement
+        // ouvert est la première chose qu'un journal de testeur doit montrer,
+        // et le niveau par défaut ne gardait pas cette ligne.
+        info!(
             requested = %device_name,
             resolved = %identities[index].raw_name,
             endpoint_id = %identities[index].endpoint_id,
+            open_host = %open_host,
             matched_by = ?matched,
             "audio_device_resolved"
         );
@@ -462,6 +541,33 @@ pub(super) fn find_device_with_fallback(
         .iter()
         .map(|identity| format!("{} [{}]", identity.raw_name, identity.endpoint_id))
         .collect();
+
+    // #8171 — sous Windows, la sortie par défaut est celle des haut-parleurs
+    // du PC : y envoyer une zone « DAC » est exactement le défaut signalé. On
+    // refuse, comme les chemins exclusifs WASAPI et ASIO le font déjà ; le
+    // message à l'écran part de `record_shared_device_not_found`.
+    if crate::outputs::peripherique_introuvable::conduite_si_introuvable(std::env::consts::OS)
+        == crate::outputs::peripherique_introuvable::ConduiteSiIntrouvable::Refuser
+    {
+        warn!(
+            requested = %device_name,
+            requested_endpoint_id = endpoint_id.unwrap_or("<aucun>"),
+            open_host = %open_host,
+            available = ?available,
+            fallback_reason = LocalDeviceFallback::NotFoundRefused.code(),
+            "audio_device_not_found_refused — \
+             the configured device is unavailable (off, unplugged, renamed or \
+             renumbered); refusing to play on the system default output instead"
+        );
+        note_device_outcome(
+            observed_backend_name(),
+            device_name,
+            "",
+            None,
+            Some(LocalDeviceFallback::NotFoundRefused),
+        );
+        return None;
+    }
 
     if let Some(default_device) = host.default_output_device() {
         let default_name = default_device

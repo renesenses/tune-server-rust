@@ -100,6 +100,14 @@ async fn reprise_8085_depuis_l_accueil_titre_podcast_pochette_et_position_moins_
     assert_eq!(r["current_track"]["title"], TITRE, "{r}");
     assert_eq!(r["current_track"]["artist_name"], PODCAST, "{r}");
     assert_eq!(r["current_track"]["cover_path"], POCHETTE, "{r}");
+    // #8152 — sur un renderer réseau, le Seek de reprise part d'une tâche
+    // détachée, une fois le transport en lecture.
+    for _ in 0..40 {
+        if !recu_par_la_sortie(&state).await.1.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     let (duree, seeks) = recu_par_la_sortie(&state).await;
     assert_eq!(duree, Some(DUREE_MS as u64), "le renderer reçoit l'épisode");
     assert_eq!(

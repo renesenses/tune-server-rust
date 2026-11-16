@@ -145,6 +145,7 @@ fn zones_exportees(
     for (cle, brut) in reglages {
         if let Some((id, gabarit)) = gabarit_de_cle_de_zone(cle)
             && visibles.contains(&id)
+            && !crate::playback::radio_fin_de_file::cle_de_marques(cle)
         {
             par_zone
                 .entry(id)
@@ -474,6 +475,7 @@ fn zone_actuelle(
     for (cle, brut) in reglages {
         if let Some((zid, gabarit)) = gabarit_de_cle_de_zone(cle)
             && zid == id
+            && !crate::playback::radio_fin_de_file::cle_de_marques(cle)
         {
             leurs.insert(gabarit, valeur_exportee(brut));
         }
@@ -497,7 +499,15 @@ fn volume_restaurable(zone: &Map<String, Value>) -> bool {
 fn cle_de_zone_valide(gabarit: &str, id: i64) -> Option<String> {
     let cle = gabarit.replace("{id}", &id.to_string());
     match gabarit_de_cle_de_zone(&cle) {
-        Some((zid, g)) if zid == id && g == gabarit && !est_secret(&cle) => Some(cle),
+        // Fil 2694 — les marques de la radio de fin de file ne s'importent pas.
+        Some((zid, g))
+            if zid == id
+                && g == gabarit
+                && !est_secret(&cle)
+                && !crate::playback::radio_fin_de_file::cle_de_marques(&cle) =>
+        {
+            Some(cle)
+        }
         _ => None,
     }
 }

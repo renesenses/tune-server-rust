@@ -2797,7 +2797,185 @@ CREATE TABLE IF NOT EXISTS imported_plays (
     // (`apports_service`), en base seulement, réversibles. Jumelle PG : 108.
     // Numérotée 142 / PG 108 après #8093 (141 / PG 107, contenus explicites).
     Migration { version: 142, name: "apports_service", up: include_str!("../../migrations/apports_service.sql") },
+    // #8119 — la station semée « PureClassic Radio » (France, Jazz) est
+    // « Pure Classix Radio » (Pays-Bas, Oldies) : seule la fiche semée restée
+    // telle quelle est corrigée. Même texte que la jumelle PG 109.
+    // Numérotée 143 / PG 109 au 09/11 ; la PR de #8160 (spectrogrammes)
+    // réclame aussi 143 / 109 : celle qui fusionne après l'autre se renumérote.
+    Migration {
+        version: 143,
+        name: "correction_pure_classix",
+        up: include_str!("../../migrations/radios/correction_pure_classix_8119.sql"),
+    },
+    // #8239 — le relevé de la synchro cloud (`sync_releve_*`) : la fin d'un
+    // scan ne journalise que la différence avec lui, plus toute la
+    // bibliothèque. Jumelle PG : 110.
+    // Numérotée 144 / PG 110, après #8240 (radios, 143 / PG 109) fusionnée
+    // dans le lot le 10/11.
+    Migration { version: 144, name: "sync_releve", up: include_str!("../../migrations/sync_releve.sql") },
+    // renesenses/tune-web-client#916 (FabienM, fil forum 1527) — « Pas pour
+    // moi » sur une suggestion de l'accueil : `suggestions_ecartees`, PAR
+    // PROFIL, écrite ET lue. Un album (local ou de service), une playlist de
+    // service, ou un artiste désigné par son nom normalisé. Les rangées de
+    // recommandation de `/home/*` ne proposent plus ce que le profil a
+    // écarté ; un autre profil le voit toujours. Go de Bertrand du 12/10.
+    //
+    // Table à part, pas un `item_type` de plus dans `hidden_items` : écarter
+    // une suggestion ne retire RIEN de la bibliothèque (voir
+    // `suggestions_ecartees.rs`).
+    //
+    // Patron `hidden_items` (89) : PAS de colonne `id`, la clé naturelle est
+    // la clé primaire — pas de divergence AUTOINCREMENT / BIGSERIAL à la
+    // bascule (#1706). `item_id` en TEXT : un identifiant de service n'est pas
+    // un entier, un nom d'artiste non plus.
+    //
+    // Numérotée 144 / PG 110 à sa jonction avec `batch/bugs-rc12-20261108`
+    // (10/11) : le chantier la tenait en 125 / 089, prises depuis le 12/10
+    // par `playlist_tracks_orphelines` (#6179). Renumérotée 145 / PG 111 le
+    // 11/11, ordre du lot : #8243 144/110, #8334 145/111, #8090 146/112,
+    // #8429 147/113.
+    // Idempotent : IF NOT EXISTS. Aussi dans le CORE_SCHEMA (base neuve),
+    // `PG_FULL_SCHEMA` (bascule) et `ENSURE_TABLES` (bases PG converties).
+    Migration {
+        version: 145,
+        name: "suggestions_ecartees",
+        up: SQL_SUGGESTIONS_ECARTEES,
+    },
+    // #8090 — le pays de l'ARTISTE, lu sur sa fiche MusicBrainz :
+    // `artists.country` (code ISO 3166-1 alpha-2, '' quand MusicBrainz n'en
+    // donne aucun) et `artists.country_mbid`, le MBID dont il a été lu — un
+    // MBID changé ou retiré rend le pays caduc sans autre écriture. Colonnes
+    // posées dans le bloc de version et dans la passe finale (même règle qu'à
+    // la 133). Jumelle PG : 112. Renumérotée 146 / PG 112 le 11/11, ordre du lot :
+    // #8243 144/110, #8334 145/111, puis #8090 146/112.
+    Migration {
+        version: 146,
+        name: "artists_country",
+        up: "",
+    },
+    // web#2795 (décision de Bertrand, 11/11) — la SURCHARGE LOCALE d'une
+    // station de l'annuaire : `radio_stations.surcharge_locale`, la date à
+    // laquelle l'utilisateur a changé chez lui le nom, le logo ou le flux ;
+    // NULL : la station suit sa fiche. Le relevé de l'annuaire ne la touche
+    // plus ; « Revenir à la fiche de l'annuaire » la remet à NULL.
+    //
+    // Colonne posée dans le bloc de version et dans la passe finale, PAS dans
+    // `up` : même règle qu'à la 126. Jumelle PG : 113. Renumérotée 147 / PG 113
+    // le 11/11, ordre du lot : #8243 144/110, #8334 145/111, #8090 146/112,
+    // puis #8429 147/113.
+    Migration {
+        version: 147,
+        name: "radio_stations_surcharge_locale",
+        up: "",
+    },
+    // #8160 — la fiche technique d'une piste : la trace DATÉE du spectrogramme
+    // conservé (nom du PNG du cache, taille, date et durée du calcul) et la
+    // signature du fichier audio au moment du calcul, qui dit s'il faut le
+    // recalculer. Numérotée 148 / PG 114 le 11/11 : 143 / PG 109 sont pris
+    // par #8119 dans le lot, 144 à 147 / PG 110 à 113 sont réservés à
+    // d'autres PR qui fusionnent avant celle-ci.
+    // Jumelle PG : 114.
+    Migration { version: 148, name: "spectrogrammes", up: include_str!("../../migrations/spectrogrammes.sql") },
+    // #8189 — les sources réseau lues sans montage (socle « source
+    // distante », étape 2). Numérotée 149 / PG 115 le 11/11 : 143 / PG 109
+    // sont pris par #8119 dans le lot, 144 à 148 / PG 110 à 114 sont
+    // réservés à d'autres PR (dont #8160, spectrogrammes, en 148 / PG 114)
+    // qui fusionnent avant celle-ci.
+    Migration { version: 149, name: "sources_reseau", up: include_str!("../../migrations/sources_reseau.sql") },
+    // #8170 (suite de #8152 et de tune-web-client#2730) — la position de
+    // CHAQUE épisode de podcast commencé : `podcast_episode_positions`, une
+    // ligne par épisode et par zone. `listening_resumes` n'en garde qu'une par
+    // podcast et par zone (clé `(zone, contexte, source)`) : lancer un autre
+    // épisode du même podcast écrasait la reprise du précédent, et la fiche
+    // du podcast ne savait reprendre que le dernier. Naît vide. Jumelle PG :
+    // 116. Renumérotée 150 / PG 116 le 12/11 : 148 / PG 114 sont pris par
+    // #8160 dans le lot, 149 / PG 115 par #8202 (`sources_reseau`), qui
+    // fusionne avant celle-ci (garde de contiguïté).
+    // Patron `listening_resumes` (135 / PG 100).
+    Migration {
+        version: 150,
+        name: "podcast_episode_positions",
+        up: include_str!("../../migrations/podcast_episode_positions.sql"),
+    },
+    // #8615 (fil 2784, décision de Bertrand du 13/11) — l'option de réveil
+    // « Interrompre la lecture en cours » : `alarms.interrupt_playback`,
+    // COCHÉE par défaut, y compris pour les réveils existants (DEFAULT 1).
+    // Colonne posée dans le bloc de version et dans la passe finale, PAS dans
+    // `up` : même règle qu'à la 126. Jumelle PG : 117.
+    Migration {
+        version: 151,
+        name: "alarms_interrupt_playback",
+        up: "",
+    },
+    // Forum, fil 2694 (Ilan) ; décision de Bertrand du 13/11 — la radio de fin
+    // de file est ACTIVÉE par défaut, comme Roon. Bascule unique des zones
+    // « désactivé » (défaut historique depuis la 46) vers « titres
+    // similaires » ; les modes nommés (#2271) ne bougent pas. Les zones
+    // créées ensuite naissent à 1 (`ZoneRepo::create`). Jumelle PG : 118.
+    // Numérotée 152 / PG 118 le 13/11 : 151 / PG 117 sont pris par #8615.
+    Migration {
+        version: 152,
+        name: "radio_fin_de_file_par_defaut",
+        up: SQL_RADIO_FIN_DE_FILE_PAR_DEFAUT,
+    },
+    // #8672 (décision de Bertrand du 13/11) — « Ma collection physique » :
+    // un disque « nulle part » associé À LA MAIN à un album de la
+    // bibliothèque, une ligne par release Discogs. Prime sur le rapprochement
+    // automatique, survit aux synchronisations (hors de `collection.json`).
+    // Naît vide. Jumelle PG : 119. Numérotée 153 / PG 119 le 13/11 : 152 /
+    // PG 118 sont pris par #8656 (radio de fin de file), en PR, qui DOIT
+    // fusionner avant celle-ci (garde de contiguïté) — sinon, renuméroter.
+    Migration {
+        version: 153,
+        name: "collection_physique_associations",
+        up: include_str!("../../migrations/collection_physique_associations.sql"),
+    },
+    // #8668 — le pays d'ÉDITION lu sur la release MusicBrainz de l'album :
+    // `albums.release_country` (code ISO 3166-1 alpha-2, '' quand MusicBrainz
+    // n'en donne aucun) et `albums.release_country_mbid`, l'identifiant de
+    // release dont il a été lu. Seuls ~50 albums sur 9 490 portaient la
+    // balise RELEASECOUNTRY au .18, 858 ont un `musicbrainz_release_id`.
+    // Colonnes posées dans le bloc de version et dans la passe finale (même
+    // règle qu'à la 133). Jumelle PG : 120. Numérotée 154 / PG 120 le 13/11 :
+    // 152 / PG 118 sont pris par #8656 et 153 / PG 119 par #8678, qui
+    // fusionnent AVANT celle-ci (ordre #8656 → #8678 → #8687) ; la garde de
+    // contiguïté ne passe qu'une fois les deux fusionnées.
+    Migration {
+        version: 154,
+        name: "albums_release_country",
+        up: "",
+    },
 ];
+
+/// Pose `albums.release_country` et `albums.release_country_mbid` (#8668) —
+/// bloc de version de la 154 et passe finale.
+fn pays_des_editions(db: &SqliteDb) {
+    add_column_if_missing(db, "albums", "release_country", "TEXT");
+    add_column_if_missing(db, "albums", "release_country_mbid", "TEXT");
+}
+
+/// Pose `alarms.interrupt_playback` (#8615) — bloc de version de la 151 et
+/// passe finale. 1 pour l'existant : l'option est cochée par défaut.
+pub(crate) fn interruption_par_le_reveil(db: &SqliteDb) {
+    add_column_if_missing(
+        db,
+        "alarms",
+        "interrupt_playback",
+        "INTEGER NOT NULL DEFAULT 1",
+    );
+}
+
+/// SQL de la migration 152 (fil 2694). SQLite range `'0'` en entier (affinité
+/// INTEGER) : la comparaison à 0 couvre les deux écritures.
+pub(crate) const SQL_RADIO_FIN_DE_FILE_PAR_DEFAUT: &str = "UPDATE zones SET autoplay_enabled = 1 \
+     WHERE autoplay_enabled IS NULL OR autoplay_enabled = 0 OR autoplay_enabled = 'off'";
+
+/// Pose `artists.country` et `artists.country_mbid` (#8090) — bloc de version
+/// de la 146 et passe finale.
+fn pays_des_artistes(db: &SqliteDb) {
+    add_column_if_missing(db, "artists", "country", "TEXT");
+    add_column_if_missing(db, "artists", "country_mbid", "TEXT");
+}
 
 /// L'index partiel des pistes marquées explicites (#8088), commun aux deux
 /// moteurs. Posé APRÈS la colonne qu'il nomme.
@@ -2936,6 +3114,22 @@ fn playlist_tracks_garde_les_orphelines(db: &SqliteDb) -> Result<(), String> {
     Ok(())
 }
 
+/// SQL de la migration 145 (web#916) — voir son entrée dans `MIGRATIONS`.
+/// Jumelle PG : `111_suggestions_ecartees.sql`.
+pub(crate) const SQL_SUGGESTIONS_ECARTEES: &str = "
+CREATE TABLE IF NOT EXISTS suggestions_ecartees (
+    profile_id INTEGER NOT NULL DEFAULT 1,
+    item_type TEXT NOT NULL,
+    source TEXT NOT NULL,
+    item_id TEXT NOT NULL,
+    title TEXT,
+    subtitle TEXT,
+    cover_url TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    PRIMARY KEY (profile_id, item_type, source, item_id)
+);
+";
+
 /// SQL de la migration 121 (#2713) — voir son entrée dans `MIGRATIONS`. Le
 /// même texte que la jumelle PG 085, à la transaction près.
 const SQL_ETIQUETTE_CRETES_VRAIES: &str = "
@@ -3014,6 +3208,12 @@ fn date_de_creation_des_fichiers(db: &SqliteDb) {
 /// L'index de la migration 126 (#6516). `IF NOT EXISTS` : rejouable.
 const SQL_INDEX_RADIO_EXTERNAL_ID: &str =
     "CREATE INDEX IF NOT EXISTS idx_radio_stations_external_id ON radio_stations(external_id)";
+
+/// Garantit `radio_stations.surcharge_locale` (web#2795) — bloc de version de
+/// la 147 et passe finale. NULL pour l'existant : aucune station surchargée.
+fn surcharge_locale_des_radios(db: &SqliteDb) {
+    add_column_if_missing(db, "radio_stations", "surcharge_locale", "TEXT");
+}
 
 /// Garantit `radio_stations.external_id` puis pose son index (#6516). Un échec
 /// de l'index est JOURNALISÉ : sans lui, le rapprochement est lent, pas faux.
@@ -3989,6 +4189,44 @@ pub(crate) const DR_ALBUM_INDEX: &str = "CREATE INDEX IF NOT EXISTS idx_track_me
 pub(crate) const TRACKS_ALBUM_GENRE_INDEX: &str =
     "CREATE INDEX IF NOT EXISTS idx_tracks_album_genre ON tracks(album_id, genre)";
 
+/// Recette du 13/11/2026 (n° 73), puis du 14/11 — « Collections intelligentes
+/// très, trop lent » sur le .18 (9 488 albums, 96 438 pistes), malgré web#2972.
+///
+/// Même cause que #2149, pour les AUTRES colonnes de piste que lisent les
+/// règles : format (« SACD / DSD »), fréquence et résolution (« Audiophile »),
+/// année (`COALESCE(al.year, t.year)`, « 2025 », « 2026 »), date d'ajout
+/// (`file_mtime`, « Récents ») et répertoire (`file_path`). Les requêtes d'une
+/// collection joignent `tracks` par l'album ; aucun index ne portait ces
+/// colonnes à côté de `album_id`, et chaque piste de chaque album était relue
+/// dans la TABLE, dans le désordre — `LOWER()` et `CAST()` n'y sont pour
+/// rien : la colonne est lue, pas cherchée, et l'index n'a qu'à la PORTER.
+///
+/// Mesuré sur la copie de la base du .18 (Shrek, même SQL, mêmes résultats) :
+///
+/// | règle | avant | après |
+/// |---|---|---|
+/// | format = dsd | 368 ms | 39 ms |
+/// | fréquence ≥ 96 kHz et genre = Jazz | 344 ms | 26 ms |
+/// | répertoire commence par … | 363 ms | 74 ms |
+/// | année = 2026 | 195 ms | 22 ms |
+/// | ajoutés depuis 90 jours | 258 ms | 26 ms |
+///
+/// `genre` est repris dans le premier index pour qu'une règle qui le croise
+/// avec une colonne audio (« Audiophile ») reste couvrante ; une règle de
+/// genre seule garde `idx_tracks_album_genre`, plus étroit. Le répertoire a son
+/// propre index : un chemin est long, et l'ajouter au premier l'alourdirait
+/// pour toutes les autres règles.
+///
+/// SQLite seulement, dans la passe rejouée à chaque démarrage, comme
+/// [`TRACKS_ALBUM_GENRE_INDEX`] : pas de numéro de migration (aucune collision
+/// avec les PR ouvertes du lot), et PostgreSQL, dont le planificateur joint
+/// par hachage, n'en a pas l'usage. Les résultats ne changent pas : un index
+/// ne change que le chemin de lecture.
+pub(crate) const TRACKS_ALBUM_COLLECTIONS_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS idx_tracks_album_audio \
+     ON tracks(album_id, format, sample_rate, bit_depth, year, genre, file_mtime);
+     CREATE INDEX IF NOT EXISTS idx_tracks_album_path ON tracks(album_id, file_path);";
+
 pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     db.execute_batch(
         "CREATE TABLE IF NOT EXISTS _migrations (
@@ -4268,6 +4506,24 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         if migration.version == 141 {
             // #8088 — le marquage explicite de la balise, et son index.
             marquage_explicite_des_pistes(db);
+        }
+        if migration.version == 146 {
+            // #8090 — le pays de l'artiste. NULL pour l'existant : la passe
+            // de fond le lit sur MusicBrainz.
+            pays_des_artistes(db);
+        }
+        if migration.version == 147 {
+            // web#2795 — la surcharge locale des stations de l'annuaire.
+            surcharge_locale_des_radios(db);
+        }
+        if migration.version == 151 {
+            // #8615 — « Interrompre la lecture en cours », cochée par défaut.
+            interruption_par_le_reveil(db);
+        }
+        if migration.version == 154 {
+            // #8668 — le pays d'édition MusicBrainz. NULL pour l'existant :
+            // la passe de fond le lit.
+            pays_des_editions(db);
         }
         if migration.version == 137 {
             // #7765 — la source des crédits, puis l'attribution UNE fois des
@@ -4881,6 +5137,16 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // Le lien des radios avec l'annuaire (migration 126, #6516) — posé ICI
     // aussi : le rapprochement le NOMME. PG : migration 090.
     lien_des_radios_avec_l_annuaire(db);
+    // La surcharge locale des radios (migration 147, web#2795) — posée ICI
+    // aussi : la liste et le relevé de l'annuaire la NOMMENT. PG : 113.
+    surcharge_locale_des_radios(db);
+    // L'interruption de la lecture par le réveil (migration 151, #8615) —
+    // posée ICI aussi : le planificateur et les routes des réveils la
+    // NOMMENT. PG : 117.
+    interruption_par_le_reveil(db);
+    // Le pays d'édition MusicBrainz (migration 154, #8668) — posé ICI aussi :
+    // les facettes, le filtre Pays et la passe de fond le NOMMENT. PG : 120.
+    pays_des_editions(db);
     // L'ordre des etiquettes (migration 127, #6257) — pose ICI aussi :
     // l'INSERT des etiquettes le NOMME. Sans rangement : toutes a 0, la liste
     // reste rangee par nom (le nom departage). PG : migration 091.
@@ -4891,6 +5157,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // La provenance du MBID d'artiste (migration 133, #6463) — posée ICI
     // aussi : le scan, l'enrichissement et la fiche la NOMMENT. PG : 097.
     add_column_if_missing(db, "artists", "musicbrainz_id_source", "TEXT");
+    // Le pays de l'artiste (migration 146, #8090) — posé ICI aussi : les
+    // facettes et la passe de fond le NOMMENT. PG : 112.
+    pays_des_artistes(db);
     // L'ordre des rayons (migration 134, #6779) — posé ICI aussi : toute
     // lecture des dossiers de collections la NOMME. PG : 098.
     add_column_if_missing(
@@ -5035,6 +5304,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // #2149 — collections à règle de genre : même passe — voir la constante.
     if let Err(e) = db.execute_batch(TRACKS_ALBUM_GENRE_INDEX) {
         warn!(error = %e, "sqlite_tracks_album_genre_index_failed");
+    }
+    // Recette du 13/11 (n° 73) — les autres colonnes de piste des règles :
+    // même passe, même raison — voir la constante.
+    if let Err(e) = db.execute_batch(TRACKS_ALBUM_COLLECTIONS_INDEX) {
+        warn!(error = %e, "sqlite_tracks_album_collections_index_failed");
     }
     // b209 — numéros 0 des pistes UPnP : même passe — voir la constante.
     if let Err(e) = db.execute_batch(UPNP_NUMEROS_ZERO_A_NULL) {
@@ -5945,6 +6219,94 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         108,
         "apports_service",
         include_str!("../../migrations/postgres/108_apports_service.sql"),
+    ),
+    // Jumelle de la SQLite 143 (#8119) : même texte, plus sa marque de version.
+    (
+        109,
+        "correction_pure_classix",
+        concat!(
+            include_str!("../../migrations/radios/correction_pure_classix_8119.sql"),
+            "\nINSERT INTO schema_version (version, name) \
+             VALUES (109, 'correction_pure_classix') \
+             ON CONFLICT (version) DO NOTHING;\n"
+        ),
+    ),
+    // Jumelle de la SQLite 144 (#8239) : le relevé de la synchro cloud, même
+    // DDL (`migrations/sync_releve.sql`).
+    (
+        110,
+        "sync_releve",
+        include_str!("../../migrations/postgres/110_sync_releve.sql"),
+    ),
+    // Jumelle de la SQLite 145 (web#916) : `suggestions_ecartees`, le « Pas
+    // pour moi » de l'accueil, par profil.
+    (
+        111,
+        "suggestions_ecartees",
+        include_str!("../../migrations/postgres/111_suggestions_ecartees.sql"),
+    ),
+    // Jumelle de la SQLite 146 (#8090) : `artists.country` et
+    // `artists.country_mbid`, le pays de l'artiste lu sur MusicBrainz.
+    (
+        112,
+        "artists_country",
+        include_str!("../../migrations/postgres/112_artists_country.sql"),
+    ),
+    // Jumelle de la SQLite 147 (web#2795) : `radio_stations.surcharge_locale`,
+    // la surcharge locale d'une station de l'annuaire, NULL pour l'existant.
+    (
+        113,
+        "radio_stations_surcharge_locale",
+        include_str!("../../migrations/postgres/113_radio_stations_surcharge_locale.sql"),
+    ),
+    // Jumelle de la SQLite 148 (#8160) : la trace datée du spectrogramme
+    // conservé d'une piste et la signature de son fichier.
+    (
+        114,
+        "spectrogrammes",
+        include_str!("../../migrations/postgres/114_spectrogrammes.sql"),
+    ),
+    // Jumelle de la SQLite 149 (#8189) : les sources réseau, même DDL
+    // (`migrations/sources_reseau.sql`).
+    (
+        115,
+        "sources_reseau",
+        include_str!("../../migrations/postgres/115_sources_reseau.sql"),
+    ),
+    // Jumelle de la SQLite 150 (#8170) : `podcast_episode_positions`, la
+    // position de chaque épisode de podcast commencé. Naît vide.
+    (
+        116,
+        "podcast_episode_positions",
+        include_str!("../../migrations/postgres/116_podcast_episode_positions.sql"),
+    ),
+    // Jumelle de la SQLite 151 (#8615) : `alarms.interrupt_playback`,
+    // « Interrompre la lecture en cours », 1 pour l'existant.
+    (
+        117,
+        "alarms_interrupt_playback",
+        include_str!("../../migrations/postgres/117_alarms_interrupt_playback.sql"),
+    ),
+    // Jumelle de la SQLite 152 (fil 2694) : radio de fin de file activée par
+    // défaut — bascule unique des zones « désactivé », DEFAULT '1'.
+    (
+        118,
+        "radio_fin_de_file_par_defaut",
+        include_str!("../../migrations/postgres/118_radio_fin_de_file_par_defaut.sql"),
+    ),
+    // Jumelle de la SQLite 153 (#8672) : `collection_physique_associations`,
+    // les disques associés à la main à un album. Naît vide. (118 : #8656.)
+    (
+        119,
+        "collection_physique_associations",
+        include_str!("../../migrations/postgres/119_collection_physique_associations.sql"),
+    ),
+    // Jumelle de la SQLite 154 (#8668) : `albums.release_country` et
+    // `albums.release_country_mbid`, le pays d'édition lu sur MusicBrainz.
+    (
+        120,
+        "albums_release_country",
+        include_str!("../../migrations/postgres/120_albums_release_country.sql"),
     ),
 ];
 
@@ -8399,6 +8761,238 @@ mod tests {
         );
     }
 
+    /// #8672 — la migration 153 pose `collection_physique_associations` (les
+    /// disques associés à la main), sur une base NEUVE comme sur une base
+    /// MONTÉE juste avant ; la clé primaire est la release ; la jumelle PG 119
+    /// existe, marque son numéro, et la bascule copie la table.
+    #[test]
+    fn la_migration_153_pose_les_associations_manuelles_8672() {
+        let colonnes = |db: &SqliteDb| -> Vec<(String, i64)> {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(collection_physique_associations)")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(5)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let attendues = vec![
+            ("release_id".to_string(), 1),
+            ("album_id".to_string(), 0),
+            ("associe_le".to_string(), 0),
+        ];
+
+        let neuve = SqliteDb::open_in_memory().unwrap();
+        neuve.init_schema().unwrap();
+        run_migrations(&neuve).unwrap();
+        assert_eq!(colonnes(&neuve), attendues, "base neuve");
+
+        let montee = SqliteDb::open_in_memory().unwrap();
+        montee.init_schema().unwrap();
+        run_migrations(&montee).unwrap();
+        montee
+            .execute_batch(
+                "DROP TABLE collection_physique_associations;
+                 DELETE FROM _migrations WHERE version >= 153;",
+            )
+            .unwrap();
+        assert!(colonnes(&montee).is_empty(), "préparation : table retirée");
+        run_migrations(&montee).unwrap();
+        assert_eq!(current_version(&montee).unwrap(), latest_version());
+        assert_eq!(colonnes(&montee), attendues, "base montée sous la 153");
+        montee
+            .execute_batch(
+                "INSERT INTO collection_physique_associations \
+                 (release_id, album_id, associe_le) VALUES (249504, 7, 1);",
+            )
+            .unwrap();
+        assert!(
+            montee
+                .execute_batch(
+                    "INSERT INTO collection_physique_associations \
+                     (release_id, album_id, associe_le) VALUES (249504, 8, 2);",
+                )
+                .is_err(),
+            "une seule association par release"
+        );
+
+        let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fichier = "119_collection_physique_associations.sql";
+        let sql_pg =
+            std::fs::read_to_string(racine.join("migrations/postgres").join(fichier)).unwrap();
+        assert!(sql_pg.contains("VALUES (119, 'collection_physique_associations')"));
+        assert!(sql_pg.contains("release_id BIGINT NOT NULL PRIMARY KEY"));
+        assert!(include_str!("migrations.rs").contains(fichier));
+        let bascule = include_str!("pg_migrate.rs");
+        assert!(bascule.contains("\"collection_physique_associations\","));
+        assert!(bascule.contains("ON CONFLICT (release_id) DO NOTHING"));
+    }
+
+    /// #8170 — la migration 150 pose `podcast_episode_positions` (la position
+    /// de chaque épisode de podcast commencé), sur une base NEUVE comme sur une
+    /// base MONTÉE juste avant ; la clé primaire est (zone, épisode) ; la
+    /// jumelle PG 116 existe, marque son numéro, et la bascule copie la table.
+    #[test]
+    fn la_migration_150_pose_les_positions_d_episodes_8170() {
+        let cle = |db: &SqliteDb| -> Vec<String> {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(podcast_episode_positions)")
+                .unwrap();
+            let mut k: Vec<(i64, String)> = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(5)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .filter(|(pk, _)| *pk > 0)
+                .collect();
+            k.sort();
+            k.into_iter().map(|(_, n)| n).collect()
+        };
+        let attendue = vec!["zone_id".to_string(), "episode_key".to_string()];
+
+        let neuve = SqliteDb::open_in_memory().unwrap();
+        neuve.init_schema().unwrap();
+        run_migrations(&neuve).unwrap();
+        assert_eq!(cle(&neuve), attendue, "base neuve");
+
+        let montee = SqliteDb::open_in_memory().unwrap();
+        montee.init_schema().unwrap();
+        run_migrations(&montee).unwrap();
+        montee
+            .execute_batch(
+                "DROP TABLE podcast_episode_positions;
+                 DELETE FROM _migrations WHERE version >= 150;",
+            )
+            .unwrap();
+        assert!(cle(&montee).is_empty(), "préparation : table retirée");
+        run_migrations(&montee).unwrap();
+        assert_eq!(current_version(&montee).unwrap(), latest_version());
+        assert_eq!(cle(&montee), attendue, "base montée sous la 150");
+        montee
+            .execute_batch(
+                "INSERT INTO podcast_episode_positions \
+                 (zone_id, episode_key, audio_url, position_ms, duration_ms, updated_at) \
+                 VALUES (1, 'u', 'u', 5, 0, 't'), (2, 'u', 'u', 5, 0, 't');",
+            )
+            .expect("deux zones, même épisode : deux lignes");
+
+        let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fichier = "116_podcast_episode_positions.sql";
+        let sql_pg =
+            std::fs::read_to_string(racine.join("migrations/postgres").join(fichier)).unwrap();
+        assert!(sql_pg.contains("VALUES (116, 'podcast_episode_positions')"));
+        assert!(sql_pg.contains("PRIMARY KEY (zone_id, episode_key)"));
+        assert!(include_str!("migrations.rs").contains(fichier));
+        let bascule = include_str!("pg_migrate.rs");
+        assert!(bascule.contains("\"podcast_episode_positions\","));
+        assert!(bascule.contains("ON CONFLICT (zone_id, episode_key) DO NOTHING"));
+    }
+
+    /// web#916 — la migration 145 pose `suggestions_ecartees` (le « Pas pour
+    /// moi » de l'accueil, par profil), sur une base NEUVE comme sur une base
+    /// MONTÉE juste avant ; la clé primaire est le quadruplet (profil, type,
+    /// source, identifiant) ; la jumelle PG 111 existe, est enregistrée, marque
+    /// le bon numéro, et le schéma de bascule (avec sa table de copie et sa
+    /// clause de conflit) comme `ENSURE_TABLES` la portent.
+    #[test]
+    fn la_migration_145_pose_les_suggestions_ecartees_916() {
+        let colonnes = |db: &SqliteDb| -> Vec<(String, i64)> {
+            let conn = db.connection().lock().unwrap();
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(suggestions_ecartees)")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, i64>(5)?)))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let cle_attendue = vec![
+            ("profile_id".to_string(), 1),
+            ("item_type".to_string(), 2),
+            ("source".to_string(), 3),
+            ("item_id".to_string(), 4),
+        ];
+        let cle = |c: Vec<(String, i64)>| -> Vec<(String, i64)> {
+            let mut k: Vec<_> = c.into_iter().filter(|(_, pk)| *pk > 0).collect();
+            k.sort_by_key(|(_, pk)| *pk);
+            k
+        };
+
+        let neuve = SqliteDb::open_in_memory().unwrap();
+        neuve.init_schema().unwrap();
+        run_migrations(&neuve).unwrap();
+        assert_eq!(cle(colonnes(&neuve)), cle_attendue, "base neuve");
+
+        let montee = SqliteDb::open_in_memory().unwrap();
+        montee.init_schema().unwrap();
+        run_migrations(&montee).unwrap();
+        montee
+            .execute_batch(
+                "DROP TABLE suggestions_ecartees;
+                 DELETE FROM _migrations WHERE version >= 145;",
+            )
+            .unwrap();
+        assert!(colonnes(&montee).is_empty(), "préparation : table retirée");
+        // 144 (#8243) une fois fusionnée, 143 avant : seul l'en-deçà compte.
+        assert!(current_version(&montee).unwrap() < 145);
+        run_migrations(&montee).unwrap();
+        assert_eq!(current_version(&montee).unwrap(), latest_version());
+        assert!(latest_version() >= 145);
+        assert_eq!(
+            cle(colonnes(&montee)),
+            cle_attendue,
+            "base montée sous la 145"
+        );
+        montee
+            .execute_batch(
+                "INSERT INTO suggestions_ecartees (profile_id, item_type, source, item_id) \
+                 VALUES (1, 'album', 'local', '7'), (2, 'album', 'local', '7');",
+            )
+            .expect("deux profils, même album : deux lignes distinctes");
+        assert!(
+            montee
+                .execute_batch(
+                    "INSERT INTO suggestions_ecartees (profile_id, item_type, source, item_id) \
+                     VALUES (1, 'album', 'local', '7');",
+                )
+                .is_err(),
+            "le même écart deux fois pour un profil doit heurter la clé primaire"
+        );
+
+        let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let fichier = "111_suggestions_ecartees.sql";
+        let sql_pg =
+            std::fs::read_to_string(racine.join("migrations/postgres").join(fichier)).unwrap();
+        assert!(
+            sql_pg.contains("VALUES (111, 'suggestions_ecartees')"),
+            "le script PG marque un autre numéro dans schema_version"
+        );
+        assert!(
+            sql_pg.contains("CREATE TABLE IF NOT EXISTS suggestions_ecartees")
+                && sql_pg.contains("profile_id BIGINT NOT NULL")
+                && sql_pg.contains("PRIMARY KEY (profile_id, item_type, source, item_id)"),
+            "la jumelle PG ne pose pas la table, ou pas avec la même clé"
+        );
+        assert!(
+            include_str!("migrations.rs").contains(fichier),
+            "{fichier} n'est pas enregistrée"
+        );
+        let bascule = include_str!("pg_migrate.rs");
+        assert!(
+            bascule.contains("CREATE TABLE IF NOT EXISTS suggestions_ecartees")
+                && bascule.contains("\"suggestions_ecartees\",")
+                && bascule
+                    .contains("ON CONFLICT (profile_id, item_type, source, item_id) DO NOTHING"),
+            "pg_migrate.rs : table, copie ou clause de conflit manquante — les écarts \
+             seraient perdus à la bascule SQLite -> PostgreSQL"
+        );
+        assert!(
+            include_str!("postgres.rs").contains("CREATE TABLE IF NOT EXISTS suggestions_ecartees"),
+            "ENSURE_TABLES ne pose pas `suggestions_ecartees`"
+        );
+    }
+
     /// #6123 — la migration 124 pose `tracks.rating` (la note de la piste lue
     /// dans ses balises), sur une base NEUVE comme sur une base MONTÉE en 123
     /// avec une piste ; la colonne est NULLABLE et l'existant reste NULL ; la
@@ -9626,7 +10220,39 @@ mod tests {
         // `tracks.explicit`, que l'INSERT et l'UPDATE des pistes NOMMENT.
         // 108 : `apports_service` (#8077), jumelle de la SQLite 142. Crée les
         // tables des apports Qobuz, que la fiche album NOMME.
-        assert_eq!(pg_latest_version(), 108, "latest PG migration must be 108");
+        // 109 : `correction_pure_classix` (#8119), jumelle de la SQLite 143.
+        // Migration de DONNÉES : le nom, le pays et le genre de la station
+        // semée sous « PureClassic Radio ».
+        // 110 : `sync_releve` (#8239), jumelle de la SQLite 144. Crée le
+        // relevé de la synchro cloud, que la fin de chaque scan NOMME.
+        // 112 : `artists_country` (#8090), jumelle de la SQLite 146. Pose
+        // `artists.country` et `artists.country_mbid`, que les facettes et la
+        // passe de fond NOMMENT.
+        // 113 : `radio_stations_surcharge_locale` (web#2795), jumelle de la
+        // SQLite 147. Pose la surcharge locale d'une station de l'annuaire, que
+        // la liste et le relevé NOMMENT.
+        // 114 : `spectrogrammes` (#8160), jumelle de la SQLite 148. Crée la
+        // trace datée des spectrogrammes conservés, que la fiche technique NOMME.
+        // 115 : `sources_reseau` (#8189), jumelle de la SQLite 149. Crée la
+        // table des sources réseau lues sans montage.
+        // 116 : `podcast_episode_positions` (#8170), jumelle de la SQLite 150
+        // (115 = `sources_reseau`, #8202, fusionnée avant).
+        // Crée la position de chaque épisode de podcast commencé, que la
+        // reprise des podcasts NOMME.
+        // 117 : `alarms_interrupt_playback` (#8615), jumelle de la SQLite
+        // 151. Pose l'option de réveil « Interrompre la lecture en cours »,
+        // que le planificateur et les routes des réveils NOMMENT.
+        // 118 : `radio_fin_de_file_par_defaut` (fil 2694), jumelle de la
+        // SQLite 152. Migration de DONNÉES : la radio de fin de file activée
+        // par défaut, et le DEFAULT de `zones.autoplay_enabled` à '1'.
+        // 119 : `collection_physique_associations` (#8672), jumelle de la
+        // SQLite 153 (118 = #8656, fusionnée avant). Crée les associations
+        // manuelles de « Ma collection physique », que le greffon NOMME.
+        // 120 : `albums_release_country` (#8668), jumelle de la SQLite 154
+        // (118 = #8656, 119 = #8678, fusionnées avant).
+        // Pose le pays d'édition MusicBrainz, que les facettes, le filtre
+        // Pays et la passe de fond NOMMENT.
+        assert_eq!(pg_latest_version(), 120, "latest PG migration must be 120");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
@@ -10909,3 +11535,65 @@ mod tests_playlist_titres_de_service_4889 {
 #[cfg(test)]
 #[path = "radio_external_id_6516_tests.rs"]
 mod tests_radio_external_id_6516;
+
+#[cfg(test)]
+mod tests_pure_classix_8119 {
+    use super::*;
+
+    const FLUX: &str = "http://mscp4.live-streams.nl:8140/flac.ogg";
+
+    fn fiche(db: &SqliteDb) -> Vec<(String, Option<String>, Option<String>)> {
+        let conn = db.connection().lock().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name, country, genre FROM radio_stations WHERE url = ?1")
+            .unwrap();
+        stmt.query_map([FLUX], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// #8119 — une installation neuve (semis du 30/08 puis migrations) a la
+    /// station sous son vrai nom, avec son pays et son genre.
+    #[test]
+    fn une_base_neuve_a_pure_classix_avec_un_x_8119() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        assert_eq!(
+            fiche(&db),
+            vec![(
+                "Pure Classix Radio".to_string(),
+                Some("Pays-Bas".to_string()),
+                Some("Oldies".to_string())
+            )],
+            "🔴 la station semée garde le nom « PureClassic Radio » (France, Jazz) au \
+             lieu de « Pure Classix Radio » (Pays-Bas, Oldies) (#8119)"
+        );
+    }
+
+    /// Une station renommée à la main, ou dont seul le genre a été changé,
+    /// garde ce que l'utilisateur a écrit ; la correction se rejoue sans effet.
+    #[test]
+    fn une_fiche_retouchee_par_l_utilisateur_n_est_pas_reecrite_8119() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+        db.execute_batch(&format!(
+            "UPDATE radio_stations SET name = 'Ma radio du matin', country = 'France', \
+             genre = 'Jazz' WHERE url = '{FLUX}';"
+        ))
+        .unwrap();
+        let sql = include_str!("../../migrations/radios/correction_pure_classix_8119.sql");
+        db.execute_batch(sql).unwrap();
+        db.execute_batch(sql).unwrap();
+        assert_eq!(
+            fiche(&db),
+            vec![(
+                "Ma radio du matin".to_string(),
+                Some("France".to_string()),
+                Some("Jazz".to_string())
+            )]
+        );
+    }
+}

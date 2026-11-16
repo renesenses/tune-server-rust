@@ -8,6 +8,8 @@ pub mod airplay2;
 pub mod asio_blocage_4556;
 #[cfg(all(target_os = "windows", feature = "asio"))]
 pub mod asio_exclusive;
+#[cfg(any(all(target_os = "windows", feature = "asio"), test))]
+pub(crate) mod quantification_au_rendu_7703;
 // #6133 — silence ASIO avant libération ; sans Windows+asio, seul le banc s'en sert.
 pub mod bluos;
 pub mod bridge;
@@ -30,6 +32,8 @@ pub mod dlna_buffer_stats;
 pub(crate) mod dlna_contact;
 /// #6059 — position d'un flux natif relancé au milieu de la piste.
 pub mod dlna_depart_natif;
+/// #8082 — suivi de piste d'un flux continu servi à un renderer DLNA.
+pub mod dlna_flux_continu;
 pub(crate) mod dlna_journal_volume;
 pub mod dlna_profil_volume;
 /// Repli conservateur sur un refus de `SetAVTransportURI` (501/714/716),
@@ -41,6 +45,15 @@ mod dlna_repli_set_uri_tests;
 mod dlna_test;
 #[cfg(test)]
 mod dlna_volume_apres_uri_tests_6008;
+/// #8647 — la sortie OAAT publie si elle sert un DSD natif. Hors `cfg` :
+/// le chemin du signal le lit partout ; sans OAAT, rien n'est inscrit.
+pub mod dsd_natif_oaat_8647;
+pub mod repli_dsd_oaat_8486;
+// #8151 — la sourdine tient à chaque nouvelle piste.
+#[cfg(test)]
+pub(crate) mod dlna_sourdine_8151_tests;
+#[cfg(feature = "local-audio")]
+pub(crate) mod dop_au_rendu_7704;
 pub mod hqplayer;
 pub mod identite_de_sortie;
 #[cfg(feature = "local-audio")]
@@ -63,11 +76,19 @@ pub mod openhome;
 pub mod openhome_pins;
 #[cfg(any(target_os = "windows", test))]
 pub(crate) mod periode_exclusive_4357;
+/// #8171 — la conduite du chemin partagé quand le périphérique d'une zone est
+/// introuvable. Hors de `local-audio`, même raison que le module suivant.
+pub mod peripherique_introuvable;
 /// Les pseudo-périphériques ALSA (le PCM `null`, la carte `snd-dummy`). Hors
 /// de `local-audio` à dessein : la porte `test` de la CI ne compile pas cette
 /// feature pour `tune-core`, et cette décision-ci doit pouvoir y être jugée.
 pub mod pseudo_peripherique_alsa;
 pub mod registry;
+/// #8696 — le fil de rendu WASAPI exclusif refuse le bridage d'énergie
+/// (EcoQoS) ; retards persistants et relevé de la session en cours pour le
+/// rapport de bogue. Public sur toutes les plateformes : le rapport le lit
+/// (relevé vide hors Windows).
+pub mod rendu_sans_bridage_8696;
 /// #4357 — les réveils EN RETARD de cette même boucle, et la tâche MMCSS du
 /// fil. Hors FFI pour la même raison : le seuil se juge par `cargo test`.
 #[cfg(any(target_os = "windows", test))]

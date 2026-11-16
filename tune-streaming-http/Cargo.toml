@@ -20,6 +20,12 @@ bytes = { workspace = true }
 # Le service simulé des essais implémente le trait `StreamingService`,
 # annoté `#[async_trait]` dans tune-core.
 async-trait = { workspace = true }
+# #8142 : `SpotifyService::avec_doublure`, pour éprouver la route de connexion
+# sans joindre Spotify. Fonction de dev seulement : aucun binaire publié ne
+# la compile.
+tune-core = { path = "../tune-core", default-features = false, features = [
+    "services-factices",
+] }
 
 tracing-subscriber = { workspace = true }
 tower = { version = "0.5", features = ["util"] }

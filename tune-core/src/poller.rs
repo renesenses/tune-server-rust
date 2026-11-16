@@ -95,6 +95,9 @@ async fn get_status_with_signal_path_bounded(
         // #6059 — un flux natif relancé à la position : le renderer compte
         // depuis le début de CE flux, on le rapporte à la piste.
         crate::outputs::dlna_depart_natif::corriger_le_statut(output.device_id(), &mut status);
+        // #8082 — un flux continu : la position rapportée à la piste en cours
+        // (après le départ de #6059, qui la ramène au début de la première).
+        crate::outputs::dlna_flux_continu::corriger_le_statut(output.device_id(), &mut status);
         let progress = if status.realtime {
             None
         } else {
@@ -615,8 +618,11 @@ pub struct PositionPoller {
     zones_masquees_signalees: std::sync::Mutex<std::collections::HashSet<i64>>,
     /// #7418 — zones mises en pause parce que leur APPAREIL s'est mis en pause
     /// (télécommande, changement d'entrée). Seules celles-là suivent une
-    /// reprise faite sur l'appareil. Hors de ZonePollState : la pause le jette.
-    pauses_de_l_appareil: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// reprise faite sur l'appareil, et seules celles-là deviennent un arrêt
+    /// complet quand l'appareil passe à autre chose ou reste en pause.
+    /// Hors de ZonePollState : la pause le jette.
+    pauses_de_l_appareil:
+        std::sync::Mutex<std::collections::HashMap<i64, pause_de_l_appareil_7418::SuiviDeLaPause>>,
     /// #5522 — la relance automatique d'un démarrage figé à 0, par zone : la
     /// ligne de file relancée et l'instant. Vit HORS de ZonePollState pour la
     /// même raison que `relances_demarrage_mort` : la relance recrée l'état de
@@ -674,7 +680,7 @@ impl PositionPoller {
             relances_demarrage_mort: Mutex::new(std::collections::HashMap::new()),
             reprises_renderer_cale: Mutex::new(std::collections::HashMap::new()),
             zones_masquees_signalees: std::sync::Mutex::new(std::collections::HashSet::new()),
-            pauses_de_l_appareil: std::sync::Mutex::new(std::collections::HashSet::new()),
+            pauses_de_l_appareil: std::sync::Mutex::new(std::collections::HashMap::new()),
             relances_demarrage_fige: std::sync::Mutex::new(std::collections::HashMap::new()),
             zones_a_position_prouvee: std::sync::Mutex::new(std::collections::HashSet::new()),
             volumes_plafonnes: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1121,6 +1127,9 @@ mod radio;
 /// #2991 — le titre radio relayé par DIDL vers un renderer DLNA (opt-in par zone).
 mod titre_radio_didl_2991;
 
+/// #8480 — le `next` du lecteur d'une zone navigateur en fin de file joue la
+/// fin de file du sondeur (lecture automatique).
+mod fin_de_file_du_lecteur_8480;
 mod fin_de_piste;
 // #6932 — la zone navigateur dont la piste est finie enchaîne sans son lecteur.
 mod fin_navigateur_6932;
@@ -1132,6 +1141,12 @@ pub use refus_de_piste::{MESSAGE_TITRE_INDISPONIBLE, refus_propre_a_la_piste};
 mod sondage_accelere_4382;
 
 mod tick;
+
+/// #8483 — fichier abîmé : la zone figée sur la coupure connue passe à la
+/// piste suivante, avec un avis traduit.
+mod fichier_abime_8483;
+#[cfg(test)]
+mod fichier_abime_8483_tests;
 
 /// #5522 — piste « en lecture » dont la position reste à 0 : une relance,
 /// puis l'arrêt avec bandeau.
@@ -1245,6 +1260,9 @@ mod radio_metadata_deviceless_tests;
 /// bibliotheque garnie.
 #[cfg(test)]
 mod autoplay_source_tests;
+// Fil 2694 — la radio de fin de file activée par défaut, ses gardes, sa marque.
+#[cfg(test)]
+mod radio_fin_de_file_2694_tests;
 
 #[cfg(all(test, feature = "oaat"))]
 mod bascule_des_niveaux_tests {
@@ -1593,6 +1611,9 @@ mod reprise_apres_pause_4666;
 
 #[cfg(test)]
 mod fin_hors_temps_reel_tests;
+// #7330 — le sondeur pendant l'attente de fin jouée d'une sortie OAAT.
+#[cfg(all(test, feature = "oaat"))]
+mod fin_oaat_jouee_7330_tests;
 
 /// #4661 — un fichier servi EN ENTIER se finit à l'HORLOGE DE PISTE, pas au
 /// bout d'un forfait de deux minutes.

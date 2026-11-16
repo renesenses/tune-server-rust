@@ -413,6 +413,21 @@ pub(super) fn comparer_alphabetique(a: &str, b: &str) -> Ordering {
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct CleAlphabetique(Vec<Morceau>, String);
 
+impl CleAlphabetique {
+    /// Initiale du rail A–Z, issue de la même clé repliée que le tri.
+    pub(crate) fn initiale(&self) -> char {
+        match self.0.first() {
+            Some(Morceau::Texte(texte)) => texte
+                .chars()
+                .next()
+                .filter(char::is_ascii_alphabetic)
+                .map(|c| c.to_ascii_uppercase())
+                .unwrap_or('#'),
+            _ => '#',
+        }
+    }
+}
+
 pub(crate) fn cle_alphabetique(s: &str) -> CleAlphabetique {
     CleAlphabetique(cle_naturelle(sans_signes_de_tete(s)), s.to_owned())
 }

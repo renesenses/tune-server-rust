@@ -547,10 +547,11 @@ mod tests {
         assert!(bras.contains("regler_le_volume_au_rendu(demande.volume.clone())"));
         let rendu = include_str!("../wasapi_exclusive.rs");
         assert_eq!(
-            rendu.matches("pop_pcm_bytes_au_gain(").count(),
+            rendu.matches("dop_au_rendu_7704::rendre_octets(").count(),
             2,
             "l'amorce et la boucle de rendu passent par le gain au rendu"
         );
+        assert!(include_str!("../dop_au_rendu_7704.rs").contains("ring.pop_pcm_bytes_au_gain("));
         assert!(
             !rendu.contains(".pop_pcm_bytes(out"),
             "plus de resérialisation sans gain"

@@ -35,6 +35,7 @@
 //! demande un scan ciblé. Il vit ICI, pas dans un greffon voisin : voir
 //! l'en-tête du module.
 
+pub mod accuraterip_base;
 pub mod cddafs;
 pub mod discid;
 pub mod ejection;
@@ -135,11 +136,17 @@ impl TunePlugin for CdPlugin {
         });
         let zones: ZonesDuDisque = Arc::default();
         let reveil = Arc::new(tokio::sync::Notify::new());
-        let extractions = Arc::new(extraction::Extractions::new(
-            self.services.backend.clone(),
-            ctx.event_bus.clone(),
-            self.services.scan.clone(),
-        ));
+        // #8522 — UNE base AccurateRip (et sa mémoire) pour l'extraction et
+        // le CD en mémoire : un seul appel par disque.
+        let base_ar = Arc::new(accuraterip_base::BaseAr::production());
+        let extractions = Arc::new(
+            extraction::Extractions::new(
+                self.services.backend.clone(),
+                ctx.event_bus.clone(),
+                self.services.scan.clone(),
+            )
+            .avec_base_ar(base_ar.clone()),
+        );
         self.extractions = Some(extractions.clone());
         // #6043 — « Charger le CD en mémoire » : les réglages rangés, à
         // défaut ceux que la RAM disponible permet.
@@ -155,6 +162,14 @@ impl TunePlugin for CdPlugin {
         if let Some(bus) = ctx.event_bus.clone() {
             memoire.observer(memoire::observateur_du_bus(bus));
         }
+        // #8522 — le disque entier en mémoire est vérifié contre la base.
+        let backend = self.services.backend.clone();
+        memoire.verifier_avec(memoire::VerifieurAr {
+            base: base_ar,
+            decalage: Arc::new(move || accuraterip_base::decalage_regle(backend.clone())),
+            bus: ctx.event_bus.clone(),
+            moteur: tokio::runtime::Handle::current(),
+        });
         self.memoire = Some(memoire.clone());
         let etat_routes = routes::EtatRoutes {
             lecteur: lecteur.clone(),

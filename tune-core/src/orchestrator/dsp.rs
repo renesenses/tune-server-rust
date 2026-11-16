@@ -30,6 +30,68 @@ pub enum PorteeDuReglage {
     RienNeJoue,
 }
 
+/// #8422 — qui demande une relance du flux réseau.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RaisonDeRelance {
+    /// Un réglage (égaliseur, crossfeed, compensation…) : `eq_change`.
+    Reglage,
+    /// Une bascule du mode PURE, annoncée aux télécommandes.
+    BasculePure,
+}
+
+impl RaisonDeRelance {
+    /// La raison écrite dans `zone_replayed_at_position`.
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Self::Reglage => "eq_change",
+            Self::BasculePure => "pure_bascule",
+        }
+    }
+}
+
+/// #8422 — au-delà, le dernier relevé du sondeur est trop vieux pour qu'on
+/// en déduise la position : on reprend à la valeur mesurée, comme avant.
+pub(crate) const EXTRAPOLATION_MAX_MS: u64 = 3_000;
+
+/// #8422 — la position EN COURS d'une zone qui joue : le dernier relevé du
+/// sondeur (une fois par seconde environ), plus le temps joué depuis qu'il a
+/// avancé. Sans cela la relance reprenait jusqu'à une seconde et demie en
+/// arrière (relevé + anti-rebond de 500 ms). Pas d'extrapolation hors
+/// lecture, sans relevé, après un `seek` (qui l'efface) ni au-delà de
+/// [`EXTRAPOLATION_MAX_MS`] ; jamais au-delà de la fin de la piste.
+pub(crate) fn position_a_reprendre(etat: &crate::playback::ZoneState) -> u64 {
+    let mesuree = etat.position_ms.max(0) as u64;
+    if etat.state != crate::playback::PlayState::Playing {
+        return mesuree;
+    }
+    let Some(avance) = etat.derniere_avance_de_position else {
+        return mesuree;
+    };
+    let ecoule = avance.elapsed().as_millis() as u64;
+    if ecoule > EXTRAPOLATION_MAX_MS {
+        return mesuree;
+    }
+    let estimee = mesuree + ecoule;
+    match etat.now_playing.as_ref().map(|np| np.duration_ms) {
+        Some(duree) if duree > 0 => estimee.min((duree as u64).saturating_sub(1_000).max(mesuree)),
+        _ => estimee,
+    }
+}
+
+/// #8422 — `2:31`, `1:02:05` : la position telle que l'écran l'affiche.
+pub(crate) fn position_lisible(position_ms: u64) -> String {
+    let s = position_ms / 1000;
+    let (h, m, s) = (s / 3600, (s / 60) % 60, s % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
+}
+
+/// #8422 — le code stable de l'avis « bascule PURE, reprise à … ».
+pub(crate) const AVIS_REPRISE_PURE: &str = "pure_resumed_at_position";
+
 impl PorteeDuReglage {
     /// Le mot publié dans les réponses (`portee`).
     pub fn code(self) -> &'static str {
@@ -184,6 +246,12 @@ pub(crate) fn famille_de_sortie(device_id: &str, output_type: Option<&str>) -> &
     }
     "inconnue"
 }
+
+/// #8229 (relecture) — délai accordé au service pour compléter la fiche d'un
+/// titre préchargé. Au-delà, le titre est servi avec ce qu'il a : la lecture
+/// n'attend pas un service lent.
+pub(super) const DELAI_FICHE_DU_PRECHARGEMENT: std::time::Duration =
+    std::time::Duration::from_secs(5);
 
 impl PlaybackOrchestrator {
     /// Marque la zone en résolution gapless jusqu'au drop du garde.
@@ -367,20 +435,63 @@ impl PlaybackOrchestrator {
         // orchestrator_play/Now Playing go blank). When that (or a missing
         // duration) happens, refetch the real metadata from the service so Now
         // Playing is never blanked and end detection has a duration.
-        if title.is_empty() || duration_ms == 0 {
-            let registry = self.services.lock().await;
-            if let Some(svc) = registry.get_actif(&prefetched.source).await {
-                let svc = svc.read().await;
-                if let Ok(track) = svc.get_track(&prefetched.source_id).await {
-                    if title.is_empty() {
-                        title = track.title;
-                        artist = artist.or(Some(track.artist));
-                        album = album.or(track.album);
-                        cover_url = cover_url.or(track.cover_path);
+        //
+        // #8229 — même règle que la résolution directe (#7738) : un titre
+        // Qobuz importé d'un M3U arrive avec son titre, sans artiste, album
+        // ni pochette, et le tampon qui le précharge n'en sait pas plus. Le
+        // titre atteint par l'enchaînement passe par ici : sans ce second
+        // cas, le lecteur restait sans pochette ni artiste, alors que le même
+        // titre lancé au clic (résolution directe) les avait.
+        let vide = |s: &Option<String>| s.as_deref().is_none_or(|s| s.trim().is_empty());
+        let fiche_incomplete = super::resolve_stream::fiche_qobuz_incomplete(
+            &prefetched.source,
+            &artist,
+            &album,
+            &cover_url,
+        );
+        if title.is_empty() || duration_ms == 0 || fiche_incomplete {
+            // #8229 (relecture) — le registre des services n'est tenu que le
+            // temps de cloner l'`Arc` du service : l'appel réseau `get_track`
+            // se fait registre relâché, et il est borné. Tenu pendant l'appel,
+            // le registre bloquait tous les services (recherche, lecture,
+            // préchargement) aussi longtemps que Qobuz tardait à répondre, et
+            // cette consultation part désormais à chaque enchaînement d'un
+            // titre Qobuz à fiche incomplète.
+            let service = self
+                .services
+                .lock()
+                .await
+                .get_actif(&prefetched.source)
+                .await;
+            let fiche = match service {
+                Some(svc) => tokio::time::timeout(DELAI_FICHE_DU_PRECHARGEMENT, async {
+                    svc.read().await.get_track(&prefetched.source_id).await
+                })
+                .await
+                .ok(),
+                None => None,
+            };
+            if let Some(Ok(track)) = fiche {
+                if title.is_empty() {
+                    title = track.title;
+                    artist = artist.or(Some(track.artist));
+                    album = album.or(track.album);
+                    cover_url = cover_url.or(track.cover_path);
+                } else if fiche_incomplete {
+                    // Le titre importé est gardé ; seuls les champs vides
+                    // sont complétés.
+                    if vide(&artist) && !track.artist.trim().is_empty() {
+                        artist = Some(track.artist);
                     }
-                    if duration_ms == 0 && track.duration_ms > 0 {
-                        duration_ms = track.duration_ms;
+                    if vide(&album) && track.album.is_some() {
+                        album = track.album;
                     }
+                    if vide(&cover_url) && track.cover_path.is_some() {
+                        cover_url = track.cover_path;
+                    }
+                }
+                if duration_ms == 0 && track.duration_ms > 0 {
+                    duration_ms = track.duration_ms;
                 }
             }
         }
@@ -408,9 +519,9 @@ impl PlaybackOrchestrator {
         let Etiquettes {
             title,
             artist,
+            album,
             cover_url,
             duration_ms,
-            ..
         } = etiquettes;
         let sr = prefetched.sample_rate;
         let bd = prefetched.bit_depth;
@@ -546,7 +657,8 @@ impl PlaybackOrchestrator {
             stream_id: Some(session_id),
             title: title.clone(),
             artist: artist.clone(),
-            album: None,
+            // #8229 — l'album complété par l'étiquetage n'était pas transmis.
+            album: album.clone(),
             duration_ms: Some(duration_ms as i64),
             source: prefetched.source,
             mime_type: out_mime.into(),
@@ -695,17 +807,13 @@ impl PlaybackOrchestrator {
     pub(super) fn zone_replaygain_changes_audio(
         &self,
         zone_id: i64,
-        track_id: Option<i64>,
+        piste: crate::audio::replaygain::PisteRg<'_>,
     ) -> bool {
-        if self.zone_audiophile(zone_id) {
+        if self.zone_audiophile(zone_id) || !piste.est_identifiee() {
             return false;
         }
-        match track_id {
-            Some(tid) => {
-                (crate::audio::replaygain::playback_factor(&self.db, tid) - 1.0).abs() > 1e-6
-            }
-            None => false,
-        }
+        // #8689 — un titre Qobuz / TIDAL compte aussi : son gain publié.
+        (crate::audio::replaygain::facteur_de_zone(&self.db, zone_id, piste) - 1.0).abs() > 1e-6
     }
 
     /// Réappliquer l'égaliseur d'une zone à la sortie locale qui joue, sans
@@ -971,7 +1079,11 @@ impl PlaybackOrchestrator {
     /// Approximation dans le sens sûr : la radio ne cuit que l'égaliseur, le
     /// bras fichier ne cuit pas le crossfeed — une empreinte qui bouge sur ces
     /// étages relance un flux qui n'en avait pas besoin, jamais l'inverse.
-    pub(super) fn empreinte_du_traitement(&self, zone_id: i64, track_id: Option<i64>) -> String {
+    pub(super) fn empreinte_du_traitement(
+        &self,
+        zone_id: i64,
+        piste: crate::audio::replaygain::PisteRg<'_>,
+    ) -> String {
         if self.zone_audiophile(zone_id) {
             return "pure".to_string();
         }
@@ -997,8 +1109,9 @@ impl PlaybackOrchestrator {
                 },
             )
             .unwrap_or_default();
-        let replaygain = track_id
-            .map(|tid| crate::audio::replaygain::playback_factor(&self.db, tid))
+        let replaygain = piste
+            .est_identifiee()
+            .then(|| crate::audio::replaygain::facteur_de_zone(&self.db, zone_id, piste))
             .filter(|f| (f - 1.0).abs() > 1e-6)
             .map(|f| f.to_bits().to_string())
             .unwrap_or_default();
@@ -1114,7 +1227,7 @@ impl PlaybackOrchestrator {
         let profil = self
             .load_eq_profile(zone_id)
             .filter(|p| crate::audio::eq::EqProcessor::new(p, 44_100, 2).is_enabled());
-        let voulu = self.empreinte_du_traitement(zone_id, np.track_id);
+        let voulu = self.empreinte_du_traitement(zone_id, np.piste_rg());
         if !poste.cuit_seulement_l_egaliseur {
             if poste.compensation_cuite
                 || (profil.is_some() && self.zone_compensation_de_niveau(zone_id))
@@ -1143,6 +1256,75 @@ impl PlaybackOrchestrator {
             stream_id = sid,
             depots = poste.poses(),
             "eq_en_vol_depose"
+        );
+        Ok(())
+    }
+
+    /// #8422 — appliquer une bascule PURE DANS le flux réseau qui joue, sans
+    /// refaire la session UPnP (`dlna_stop` + `dlna_play`, la coupure du
+    /// Marantz ND8006, fil 1771). `Err(raison)` quand c'est impossible :
+    /// l'appelant retombe alors sur la relance, comme avant.
+    ///
+    /// Possible seulement sur une RADIO décodée par Tune dont le format ne
+    /// dépend d'aucun traitement : ce porteur ne cuit que l'égaliseur (le
+    /// crossfeed, la correction de pièce, les greffons tiers et le
+    /// ReplayGain n'y entrent jamais), et son format est celui de la
+    /// station, PURE ou non. Basculer PURE n'y change donc QUE l'égaliseur :
+    /// - entrée en PURE : l'égaliseur est coupé et le préampli gardé remonte
+    ///   jusqu'au signal sec ([`super::eq_en_vol::EqEnVol::poser_vers_le_sec`]) :
+    ///   au bout de la rampe (fondu de 300 ms, puis remontée à 2 dB/s, soit
+    ///   quelques secondes pour une réserve de plusieurs dB), plus aucun étage
+    ///   ne touche les échantillons ; avant, aucune marche de niveau ;
+    /// - sortie de PURE : l'égaliseur enregistré revient par le fondu de #5215.
+    ///
+    /// Impossible :
+    /// - `flux_sans_poste_de_releve` / `porteur_termine` : comme
+    ///   [`Self::poser_l_eq_en_vol`] ;
+    /// - `porteur_cuit_d_autres_etages` : relais DSP progressif d'un fichier,
+    ///   qui cuit aussi crossfeed, correction et compensation, à un format que
+    ///   PURE ne garderait pas ;
+    /// - `format_depend_du_traitement` : radio que Tune ne décode que pour son
+    ///   égaliseur ; en PURE, une lecture fraîche la passerait telle quelle.
+    pub(super) fn basculer_pure_en_vol(
+        &self,
+        zone_id: i64,
+        np: &crate::playback::NowPlaying,
+    ) -> Result<(), &'static str> {
+        let Some(sid) = np.stream_id.as_deref() else {
+            return Err("flux_sans_poste_de_releve");
+        };
+        let Some(poste) = self.poste_eq_en_vol(zone_id, sid) else {
+            return Err("flux_sans_poste_de_releve");
+        };
+        if std::sync::Arc::strong_count(&poste) < 2 {
+            return Err("porteur_termine");
+        }
+        if !poste.cuit_seulement_l_egaliseur {
+            return Err("porteur_cuit_d_autres_etages");
+        }
+        if !poste.format_independant_du_traitement {
+            return Err("format_depend_du_traitement");
+        }
+        let pure = self.zone_audiophile(zone_id);
+        if pure {
+            poste.poser_vers_le_sec();
+        } else {
+            poste.poser(
+                self.load_eq_profile(zone_id)
+                    .filter(|p| crate::audio::eq::EqProcessor::new(p, 44_100, 2).is_enabled()),
+            );
+        }
+        self.noter_traitement_du_flux(
+            zone_id,
+            sid,
+            self.empreinte_du_traitement(zone_id, np.piste_rg()),
+        );
+        info!(
+            zone_id,
+            stream_id = sid,
+            pure,
+            depots = poste.poses(),
+            "pure_en_vol_depose"
         );
         Ok(())
     }
@@ -1191,7 +1373,7 @@ impl PlaybackOrchestrator {
             .unwrap()
             .get(&zone_id)
             .and_then(|notes| notes.iter().find(|(s, _)| s == sid).map(|(_, e)| e.clone()));
-        servi.is_some_and(|e| e == self.empreinte_du_traitement(zone_id, np.track_id))
+        servi.is_some_and(|e| e == self.empreinte_du_traitement(zone_id, np.piste_rg()))
     }
 
     /// LA trace qui tranche, à l'activation de l'égaliseur (#3479).
@@ -1326,6 +1508,16 @@ impl PlaybackOrchestrator {
     /// **Ne programme rien quand la position de la zone n'est pas mesurée**
     /// (#2595) : voir `Self::position_entretenue_par_le_sondeur`.
     pub fn schedule_eq_replay(self: &std::sync::Arc<Self>, zone_id: i64) -> bool {
+        self.schedule_replay_pour(zone_id, RaisonDeRelance::Reglage)
+    }
+
+    /// #8422 — [`Self::schedule_eq_replay`], en disant QUI relance : une
+    /// bascule PURE annonce aux télécommandes la position de reprise.
+    pub(super) fn schedule_replay_pour(
+        self: &std::sync::Arc<Self>,
+        zone_id: i64,
+        raison: RaisonDeRelance,
+    ) -> bool {
         // #2595 — ne pas rejouer à une position INCONNUE.
         //
         // Ce redémarrage ne vaut que par sa promesse : reprendre là où on en
@@ -1386,9 +1578,11 @@ impl PlaybackOrchestrator {
                 info!(zone_id, etat = ?etat.state, "eq_replay_skipped_zone_pas_en_lecture");
                 return;
             }
-            let position_ms = etat.position_ms.max(0) as u64;
+            // #8422 — la position EN COURS, pas celle du dernier relevé du
+            // sondeur : le temps joué depuis compte.
+            let position_ms = position_a_reprendre(&etat);
             match moi
-                .replay_zone_at_position(zone_id, position_ms, "eq_change")
+                .replay_zone_at_position(zone_id, position_ms, raison.code())
                 .await
             {
                 Ok(()) => {
@@ -1396,12 +1590,47 @@ impl PlaybackOrchestrator {
                         .lock()
                         .unwrap()
                         .insert(zone_id, std::time::Instant::now());
-                    info!(zone_id, position_ms, "eq_replay_done");
+                    info!(
+                        zone_id,
+                        position_ms,
+                        mesuree_ms = etat.position_ms,
+                        "eq_replay_done"
+                    );
+                    // Une radio n'a pas de position : rien à annoncer.
+                    let piste = etat
+                        .now_playing
+                        .as_ref()
+                        .is_some_and(|np| np.duration_ms > 0);
+                    if raison == RaisonDeRelance::BasculePure && piste {
+                        moi.annoncer_la_reprise_pure(zone_id, position_ms);
+                    }
                 }
                 Err(e) => warn!(zone_id, error = %e, "eq_replay_failed"),
             }
         });
         true
+    }
+
+    /// #8422 — dire aux télécommandes qu'une bascule PURE a relancé le flux,
+    /// et à quelle position : un avis, pas une erreur (`fatal: false`), émis
+    /// UNE fois par relance réussie. `code` est stable ; `message` est le
+    /// repli en anglais des clients qui ne le traduisent pas.
+    pub(super) fn annoncer_la_reprise_pure(&self, zone_id: i64, position_ms: u64) {
+        let position = position_lisible(position_ms);
+        info!(zone_id, position_ms, %position, "pure_bascule_reprise_annoncee");
+        if let Some(ref bus) = self.event_bus {
+            bus.emit_typed(
+                crate::event_types::EventType::ZoneNotice,
+                serde_json::json!({
+                    "zone_id": zone_id,
+                    "code": AVIS_REPRISE_PURE,
+                    "position_ms": position_ms,
+                    "position": position,
+                    "message": format!("PURE switch: resumed at {position}"),
+                    "fatal": false,
+                }),
+            );
+        }
     }
 
     /// Réappliquer le crossfeed d'une zone à la sortie locale qui joue, sans
@@ -1615,12 +1844,8 @@ impl PlaybackOrchestrator {
             };
             // Le track_id est lu AVANT de prendre le verrou de la sortie : le
             // ReplayGain en dépend, et `get_state` prend ses propres verrous.
-            let track_id = self
-                .playback
-                .get_state(zone_id)
-                .await
-                .now_playing
-                .and_then(|np| np.track_id);
+            let en_cours = self.playback.get_state(zone_id).await.now_playing;
+            let track_id = en_cours.as_ref().and_then(|np| np.track_id);
             let output = output_arc.lock().await;
             let Some(local_output) = output
                 .as_any()
@@ -1656,8 +1881,10 @@ impl PlaybackOrchestrator {
             // Mêmes expressions que le bloc du chemin de lecture, à dessein :
             // toutes trois rendent `None`/1.0 en PURE, donc l'état repoussé est
             // celui qu'une lecture démarrée maintenant produirait.
-            let rg = match (pure, track_id) {
-                (false, Some(tid)) => crate::audio::replaygain::playback_factor(&self.db, tid),
+            let rg = match (pure, en_cours.as_ref()) {
+                (false, Some(np)) => {
+                    crate::audio::replaygain::facteur_de_zone(&self.db, zone_id, np.piste_rg())
+                }
                 _ => 1.0,
             };
             local_output.set_compensation_de_niveau(self.zone_compensation_de_niveau(zone_id));
@@ -1750,16 +1977,16 @@ impl PlaybackOrchestrator {
     pub(super) fn load_streaming_dsp(
         &self,
         zone_id: i64,
-        track_id: Option<i64>,
+        piste: crate::audio::replaygain::PisteRg<'_>,
         sample_rate: u32,
         channels: u16,
     ) -> StreamingDsp {
         let _tout = EtapeDePreparation::debut(zone_id, "dsp_flux_reseau");
         let replaygain = {
             let _e = EtapeDePreparation::debut(zone_id, "dsp_replaygain");
-            match track_id {
-                Some(tid) if !self.zone_audiophile(zone_id) => {
-                    let f = crate::audio::replaygain::playback_factor(&self.db, tid);
+            match piste {
+                p if p.est_identifiee() && !self.zone_audiophile(zone_id) => {
+                    let f = crate::audio::replaygain::facteur_de_zone(&self.db, zone_id, p);
                     if (f - 1.0).abs() > 1e-6 {
                         Some(f)
                     } else {
@@ -1957,7 +2184,7 @@ impl PlaybackOrchestrator {
     pub(super) fn traitement_que_pure_gouverne(
         &self,
         zone_id: i64,
-        track_id: Option<i64>,
+        piste: crate::audio::replaygain::PisteRg<'_>,
     ) -> Option<&'static str> {
         if self
             .eq_profile_configure(zone_id)
@@ -1977,9 +2204,10 @@ impl PlaybackOrchestrator {
         if !self.etages_tiers_configures(zone_id).is_empty() {
             return Some("greffon_natif_tiers");
         }
-        if track_id.is_some_and(|tid| {
-            (crate::audio::replaygain::playback_factor(&self.db, tid) - 1.0).abs() > 1e-6
-        }) {
+        if piste.est_identifiee()
+            && (crate::audio::replaygain::facteur_de_zone(&self.db, zone_id, piste) - 1.0).abs()
+                > 1e-6
+        {
             return Some("replaygain");
         }
         None
@@ -2011,7 +2239,8 @@ impl PlaybackOrchestrator {
     /// ASIO). Sans piste connue, seule la règle de zone est lue.
     #[cfg(feature = "local-audio")]
     pub(super) fn pure_contourne_un_reglage(&self, zone_id: i64, track_id: Option<i64>) -> bool {
-        self.traitement_que_pure_gouverne(zone_id, None).is_some()
+        self.traitement_que_pure_gouverne(zone_id, crate::audio::replaygain::PisteRg::AUCUNE)
+            .is_some()
             || Self::zone_mono_downmix_configure_with(&self.db, zone_id)
             || Self::reaffectation_de_zone_armee_with(&self.db, zone_id)
             || track_id.is_some_and(|tid| Self::reaffectation_d_album_armee_with(&self.db, tid))
@@ -2243,6 +2472,22 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         pure: bool,
     ) -> Option<crate::audio::surechantillonnage::ChoixSurechantillonnage> {
+        self.decision_du_surechantillonneur(zone_id, pure).ok()
+    }
+
+    /// #8259 — conserver le refus pour le chemin du signal de la piste ouverte.
+    pub fn decision_du_surechantillonneur(
+        &self,
+        zone_id: i64,
+        pure: bool,
+    ) -> Result<
+        crate::audio::surechantillonnage::ChoixSurechantillonnage,
+        crate::audio::surechantillonnage::Ecarte,
+    > {
+        // #8428 — la cadence fixe porte déjà le flux décodé : ne pas la multiplier.
+        if crate::audio::frequence_fixe::active(&self.db, zone_id).is_some() {
+            return Err(crate::audio::surechantillonnage::Ecarte::FrequenceFixe);
+        }
         let premium = self
             .license
             .as_ref()
@@ -2250,12 +2495,12 @@ impl PlaybackOrchestrator {
         let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
         match crate::audio::surechantillonnage::choix_de_la_zone(&settings, premium, pure, zone_id)
         {
-            Ok(choix) => Some(choix),
+            Ok(choix) => Ok(choix),
             Err(ecarte) => {
                 if ecarte != crate::audio::surechantillonnage::Ecarte::Desactive {
                     tracing::info!(zone_id, reason = ecarte.code(), "upsampler_not_engaged");
                 }
-                None
+                Err(ecarte)
             }
         }
     }
@@ -2273,7 +2518,7 @@ impl PlaybackOrchestrator {
                 return;
             }
             let pure = self.zone_audiophile(zone_id);
-            let choix = self.choix_du_surechantillonneur(zone_id, pure);
+            let choix = self.decision_du_surechantillonneur(zone_id, pure);
             let Some(output_arc) = ({ self.outputs.lock().await.get(&device_id) }) else {
                 return;
             };
@@ -2282,7 +2527,9 @@ impl PlaybackOrchestrator {
                 .as_any()
                 .downcast_ref::<crate::outputs::local::LocalOutput>()
             {
-                local.set_surechantillonnage(choix);
+                local.set_decision_surechantillonnage(choix);
+                local
+                    .set_fixed_sample_rate(crate::audio::frequence_fixe::active(&self.db, zone_id));
             }
         }
     }
@@ -2583,12 +2830,7 @@ impl PlaybackOrchestrator {
             };
             // Lu AVANT le verrou de la sortie, comme dans
             // `refresh_zone_pure_dsp` : `get_state` prend ses propres verrous.
-            let track_id = self
-                .playback
-                .get_state(zone_id)
-                .await
-                .now_playing
-                .and_then(|np| np.track_id);
+            let en_cours = self.playback.get_state(zone_id).await.now_playing;
             let pure = self.zone_audiophile(zone_id);
             let output = output_arc.lock().await;
             let Some(local_output) = output
@@ -2597,8 +2839,10 @@ impl PlaybackOrchestrator {
             else {
                 return false;
             };
-            let rg = match (pure, track_id) {
-                (false, Some(tid)) => crate::audio::replaygain::playback_factor(&self.db, tid),
+            let rg = match (pure, en_cours.as_ref()) {
+                (false, Some(np)) => {
+                    crate::audio::replaygain::facteur_de_zone(&self.db, zone_id, np.piste_rg())
+                }
                 _ => 1.0,
             };
             local_output.set_replaygain_factor(rg);
@@ -2685,7 +2929,8 @@ impl PlaybackOrchestrator {
         zone_id: i64,
     ) -> bool {
         // PURE : le PCM atteint la sortie intact, aucun repli n'est appliqué.
-        if crate::audio::audiophile::zone_enabled(db, zone_id) {
+        // #8513 — pendant une mesure de pièce non plus.
+        if crate::audio::audiophile::traitements_contournes(db, zone_id) {
             return false;
         }
         Self::zone_mono_downmix_configure_with(db, zone_id)
@@ -3035,6 +3280,7 @@ impl PlaybackOrchestrator {
             pure_force,
             crate::audio::volume_limites::OrigineDuVolume::Absolue,
             crate::audio::garde_de_hausse::Hausse::Gardee,
+            None,
         )
         .await
         .map(|_| ())
@@ -3063,8 +3309,10 @@ impl PlaybackOrchestrator {
             pure_force,
             crate::audio::volume_limites::OrigineDuVolume::Absolue,
             hausse,
+            None,
         )
         .await
+        .map(|(retenu, _)| retenu)
     }
 
     /// #6541 — une consigne venue des boutons + / − : la limite de CONFORT
@@ -3108,8 +3356,10 @@ impl PlaybackOrchestrator {
             pure_force,
             crate::audio::volume_limites::OrigineDuVolume::Pas,
             hausse,
+            None,
         )
         .await
+        .map(|(retenu, _)| retenu)
     }
 
     /// #5695 — commande le plein volume d'une zone PURE verrouillée, SANS
@@ -3118,11 +3368,14 @@ impl PlaybackOrchestrator {
     /// Pour la route qui arme PURE : elle commande le 100 % AVANT d'écrire le
     /// réglage (un refus de l'appareil ne doit rien persister), donc
     /// [`Self::set_volume`] ne peut pas encore lire le verrou en base.
+    ///
+    /// #8137 — rend ce qui est parti vers l'appareil : rien sur une zone en
+    /// volume fixe, ni quand l'appareil a été relu à 100 %.
     pub async fn set_volume_pure_force(
         &self,
         zone_id: i64,
         device_id: Option<&str>,
-    ) -> OutputCommandResult<()> {
+    ) -> OutputCommandResult<super::EnvoiDeVolume> {
         // #6721 — l'armement de PURE est confirmé par l'utilisateur : c'est
         // l'action explicite qui autorise le 100 % (la garde ne mord pas sous
         // `pure_force`).
@@ -3133,12 +3386,14 @@ impl PlaybackOrchestrator {
             true,
             crate::audio::volume_limites::OrigineDuVolume::Absolue,
             crate::audio::garde_de_hausse::Hausse::Confirmee,
+            Some(super::BasculePure::Entree),
         )
         .await
-        .map(|_| ())
+        .map(|(_, envoi)| envoi)
     }
 
-    async fn appliquer_volume(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn appliquer_volume(
         &self,
         zone_id: i64,
         volume: f64,
@@ -3146,7 +3401,12 @@ impl PlaybackOrchestrator {
         pure_force: bool,
         origine: crate::audio::volume_limites::OrigineDuVolume,
         hausse: crate::audio::garde_de_hausse::Hausse,
-    ) -> OutputCommandResult<crate::audio::garde_de_hausse::VolumeRetenu> {
+        bascule: Option<super::BasculePure>,
+    ) -> OutputCommandResult<(
+        crate::audio::garde_de_hausse::VolumeRetenu,
+        super::EnvoiDeVolume,
+    )> {
+        use super::EnvoiDeVolume;
         let demande = volume;
         // When fixed_volume is enabled, pin volume to 1.0 (bit-perfect) and
         // skip sending to the device — the DAC/renderer handles volume.
@@ -3159,11 +3419,23 @@ impl PlaybackOrchestrator {
             ZoneRepo::with_backend(self.db.clone())
                 .update_volume(zone_id, 100.0)
                 .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
-            return Ok(crate::audio::garde_de_hausse::VolumeRetenu {
-                demande,
-                retenu: 1.0,
-                hausse_plafonnee: false,
-            });
+            // #8137 — dit au journal : aucune commande n'est partie.
+            if let Some(bascule) = bascule {
+                info!(
+                    zone_id,
+                    bascule = bascule.code(),
+                    device_id = device_id.unwrap_or(""),
+                    "bascule_pure_volume_fixe_aucun_envoi"
+                );
+            }
+            return Ok((
+                crate::audio::garde_de_hausse::VolumeRetenu {
+                    demande,
+                    retenu: 1.0,
+                    hausse_plafonnee: false,
+                },
+                EnvoiDeVolume::AucunVolumeFixe,
+            ));
         }
 
         // Trim de gain par renderer (setting `zone_{id}_gain_trim_db`, ±12 dB) :
@@ -3261,7 +3533,7 @@ impl PlaybackOrchestrator {
                 // -37 dB et COUPAIT le son sous 0,005 lineaire (-46,0205999133 dB).
                 .update_volume(zone_id, volume.clamp(0.0, 1.0) * 100.0)
                 .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
-            return Ok(retenu_final);
+            return Ok((retenu_final, EnvoiDeVolume::AucunSansAppareil));
         };
         // #7633 — un renderer OpenHome reçoit son volume sans le verrou de
         // la sortie : le sondeur le tient pendant ses relevés SOAP (jusqu'à
@@ -3286,35 +3558,32 @@ impl PlaybackOrchestrator {
         // Un envoi direct OpenHome n'existe que si le renderer publie son
         // service Volume : la capacité est acquise.
         if envoi_direct.is_none() && !file.etat.lock().await.en_vol {
-            output
-                .lock()
-                .await
-                .capabilities()
-                .require(OutputCommand::SetVolume)?;
-        }
-        // La demande prend son numéro, et l'état en mémoire comme l'évènement
-        // suivent tout de suite, dans l'ordre d'arrivée.
-        let ticket = {
-            let mut etat = file.etat.lock().await;
-            if etat.confirme.is_none() {
-                etat.confirme = Some(self.playback.get_state(zone_id).await.volume);
+            let capacites = output.lock().await.capabilities();
+            // #5575 — une sortie sans volume réglable (volume décoratif,
+            // OAAT fixe) joue déjà à plein niveau : une consigne à 100 %
+            // (PURE forcé, restauration, réveil) est tenue sans commande,
+            // comme avant que la capacité ne soit annoncée. Seule une
+            // consigne plus basse, que l'appareil ne peut pas tenir, est
+            // refusée.
+            if !capacites.can_set_volume && (pure_force || volume >= 1.0 - 1e-6) {
+                info!(
+                    zone_id,
+                    device_id = did,
+                    volume,
+                    pure_force,
+                    "volume_plein_sans_commande_sortie_non_reglable"
+                );
+                self.noter_le_volume_aux_postes(zone_id, volume);
+                self.playback.set_volume(zone_id, volume).await;
+                self.playback.mark_volume_changed(zone_id).await;
+                ZoneRepo::with_backend(self.db.clone())
+                    .update_volume(zone_id, volume.clamp(0.0, 1.0) * 100.0)
+                    .map_err(|message| {
+                        OutputCommandError::failed(OutputCommand::SetVolume, message)
+                    })?;
+                return Ok((retenu_final, EnvoiDeVolume::AucunVolumeFixe));
             }
-            etat.dernier_ticket += 1;
-            self.noter_le_volume_aux_postes(zone_id, volume);
-            self.playback.set_volume(zone_id, volume).await;
-            self.playback.mark_volume_changed(zone_id).await;
-            etat.dernier_ticket
-        };
-        // Les demandes plus anciennes qui attendent se savent remplacées.
-        file.reveil.notify_waiters();
-        if !file.attendre_son_tour(ticket).await {
-            debug!(
-                zone_id,
-                volume,
-                device_id = did,
-                "device_set_volume_coalesced"
-            );
-            return Ok(retenu_final);
+            capacites.require(OutputCommand::SetVolume)?;
         }
         let consigne_appareil = |output_type: &str| {
             if pure_force {
@@ -3339,9 +3608,73 @@ impl PlaybackOrchestrator {
             // Un trim positif ne fait pas passer la limite de sécurité.
             limites.borner_appareil(volume_appareil_avec_trim(volume, trim_db, volume_materiel))
         };
+        // #8137 — à la bascule PURE, l'appareil relu à la valeur visée ne
+        // reçoit rien : la commande ne changerait pas le volume, et certains
+        // renderers coupent leur signal en la traitant. Jamais quand une
+        // commande est en vol : la relecture ne dit plus ce qu'il jouera.
+        if let Some(bascule) = bascule
+            && !file.etat.lock().await.en_vol
+        {
+            let output_type = match envoi_direct {
+                Some(_) => "openhome".to_string(),
+                None => output.lock().await.output_type().to_string(),
+            };
+            let cible = consigne_appareil(&output_type);
+            if let Some(relu) =
+                super::bascule_pure_8137::deja_a_la_cible(self.volumes_relus.connu(zone_id), cible)
+            {
+                info!(
+                    zone_id,
+                    bascule = bascule.code(),
+                    device_id = did,
+                    volume,
+                    device_volume = cible,
+                    relu,
+                    "bascule_pure_volume_deja_a_la_cible_aucun_envoi"
+                );
+                self.noter_le_volume_aux_postes(zone_id, volume);
+                self.playback.set_volume(zone_id, volume).await;
+                self.playback.mark_volume_changed(zone_id).await;
+                ZoneRepo::with_backend(self.db.clone())
+                    .update_volume(zone_id, volume.clamp(0.0, 1.0) * 100.0)
+                    .map_err(|message| {
+                        OutputCommandError::failed(OutputCommand::SetVolume, message)
+                    })?;
+                return Ok((retenu_final, EnvoiDeVolume::AucunDejaALaCible(relu)));
+            }
+        }
+        // La demande prend son numéro, et l'état en mémoire comme l'évènement
+        // suivent tout de suite, dans l'ordre d'arrivée.
+        let ticket = {
+            let mut etat = file.etat.lock().await;
+            if etat.confirme.is_none() {
+                etat.confirme = Some(self.playback.get_state(zone_id).await.volume);
+            }
+            etat.dernier_ticket += 1;
+            self.noter_le_volume_aux_postes(zone_id, volume);
+            self.playback.set_volume(zone_id, volume).await;
+            self.playback.mark_volume_changed(zone_id).await;
+            etat.dernier_ticket
+        };
+        // Les demandes plus anciennes qui attendent se savent remplacées.
+        file.reveil.notify_waiters();
+        if !file.attendre_son_tour(ticket).await {
+            debug!(
+                zone_id,
+                volume,
+                device_id = did,
+                "device_set_volume_coalesced"
+            );
+            return Ok((retenu_final, EnvoiDeVolume::Remplace));
+        }
+        // #8137 — la relecture d'avant ne dit plus ce que l'appareil joue.
+        self.volumes_relus.oublier(zone_id);
+        let debut_de_l_envoi = std::time::Instant::now();
+        let valeur_envoyee: f64;
         let resultat = match envoi_direct {
             Some(envoi) => {
                 let device_volume = consigne_appareil("openhome");
+                valeur_envoyee = device_volume;
                 info!(
                     zone_id,
                     volume,
@@ -3357,6 +3690,7 @@ impl PlaybackOrchestrator {
             None => {
                 let sortie = output.lock().await;
                 let device_volume = consigne_appareil(sortie.output_type());
+                valeur_envoyee = device_volume;
                 info!(
                     zone_id,
                     volume,
@@ -3368,6 +3702,18 @@ impl PlaybackOrchestrator {
                 sortie.checked_set_volume(device_volume).await
             }
         };
+        self.volumes_relus.oublier(zone_id);
+        if let Some(bascule) = bascule {
+            info!(
+                zone_id,
+                bascule = bascule.code(),
+                device_id = did,
+                device_volume = valeur_envoyee,
+                duree_ms = debut_de_l_envoi.elapsed().as_millis() as u64,
+                ok = resultat.is_ok(),
+                "bascule_pure_set_volume_envoye"
+            );
+        }
         let issue = {
             let mut etat = file.etat.lock().await;
             etat.en_vol = false;
@@ -3388,7 +3734,7 @@ impl PlaybackOrchestrator {
                         // #2886 — plus d'arrondi a l'entier : il coutait 3 dB vers
                         // -37 dB et COUPAIT le son sous 0,005 lineaire (-46,0205999133 dB).
                         .update_volume(zone_id, volume.clamp(0.0, 1.0) * 100.0)
-                        .map(|_| retenu_final)
+                        .map(|_| (retenu_final, EnvoiDeVolume::Envoye(valeur_envoyee)))
                         .map_err(|message| {
                             OutputCommandError::failed(OutputCommand::SetVolume, message)
                         })
@@ -3448,10 +3794,18 @@ impl PlaybackOrchestrator {
                 Some(output) => {
                     // #6541 — aucune limite ici (décision du 21/10) : sur
                     // une zone à volume fixe, elles n'ont pas cours.
-                    info!(zone_id, device_id = did, "fixed_volume_arm_sending");
-                    if let Err(error) = output.lock().await.checked_set_volume(1.0).await {
-                        warn!(zone_id, error = %error, "fixed_volume_arm_failed");
-                        return Err(error);
+                    let sortie = output.lock().await;
+                    // #5575 — une sortie qui ne règle pas le volume (volume
+                    // décoratif, OAAT fixe) est déjà à son niveau fixe : rien
+                    // à commander, et surtout rien à refuser.
+                    if !sortie.capabilities().can_set_volume {
+                        info!(zone_id, device_id = did, "fixed_volume_arm_sans_commande");
+                    } else {
+                        info!(zone_id, device_id = did, "fixed_volume_arm_sending");
+                        if let Err(error) = sortie.checked_set_volume(1.0).await {
+                            warn!(zone_id, error = %error, "fixed_volume_arm_failed");
+                            return Err(error);
+                        }
                     }
                 }
                 // Sortie déclarée mais pas encore enregistrée : rien à

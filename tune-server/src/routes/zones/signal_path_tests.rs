@@ -639,7 +639,12 @@ fn sur_une_sortie_reseau_l_etape_volume_reste_lineaire_7762() {
     let zone = repo.get(id).unwrap().unwrap();
     let ps = alac_hires_playing();
     let sp = build_signal_path(&ps, &zone, &backend, Some("Node"), "none", None).unwrap();
-    assert_eq!(step_desc(&sp, "Volume").as_deref(), Some("Volume 50%"));
+    // #8462 — sur une sortie réseau, l'étape dit que c'est le volume du
+    // renderer (une commande), pas un traitement du flux.
+    assert_eq!(
+        step_desc(&sp, "Volume").as_deref(),
+        Some("Volume du renderer 50%")
+    );
 }
 
 /// Contre-épreuve : l'exemption ne vaut QUE pour le volume seul. Dès qu'une
@@ -1158,7 +1163,10 @@ fn volume_step_reads_persisted_zone_volume_not_stale_memory() {
     ps.volume = 0.5;
 
     let sp = build_signal_path(&ps, &zone, &backend, Some("Node"), "none", None).unwrap();
-    assert_eq!(step_desc(&sp, "Volume").as_deref(), Some("Volume 20%"));
+    assert_eq!(
+        step_desc(&sp, "Volume").as_deref(),
+        Some("Volume du renderer 20%")
+    );
 }
 
 // Réciproque : curseur de la page à 100 % → pas d'étape Volume, même si la
@@ -1551,7 +1559,10 @@ fn l_etape_replaygain_suit_pure_et_jamais_le_curseur_de_volume_5683() {
         attendu,
         "volume 35 % : {bas}"
     );
-    assert_eq!(step_desc(&bas, "Volume").as_deref(), Some("Volume 35%"));
+    assert_eq!(
+        step_desc(&bas, "Volume").as_deref(),
+        Some("Volume du renderer 35%")
+    );
     let retour = chemin_au_volume_5683(&backend, zone_id, &ps, 100.0);
     assert_eq!(
         step_desc(&retour, "ReplayGain"),
@@ -3292,6 +3303,116 @@ fn radio_hls_6357_le_chemin_du_signal_nomme_hls_et_le_profil() {
             sp["lossless"],
             json!(false),
             "un HLS AAC ou MP3 est avec perte"
+        );
+    }
+}
+
+/// #7802 — une radio HLS repliée sur une variante plus basse, parce que le
+/// diffuseur a refusé la plus haute (403 hors Royaume-Uni pour la BBC) :
+/// l'étape Source porte le débit MESURÉ (97, et non les 101 kbit/s que la
+/// liste déclare, conteneur compris), et son détail nomme la qualité
+/// refusée et le statut, dans la langue demandée. Sans repli, aucun détail ;
+/// sans mesure (MP3), la bande déclarée sert de débit.
+#[test]
+fn radio_hls_7802_le_repli_de_variante_est_explique() {
+    use tune_core::http::streamer::{RadioSourceInfo, VarianteRefusee};
+    let (backend, mut zone) = dlna_zone();
+    zone.output_type = Some("dlna".into());
+    let ps = ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            source: "radio".into(),
+            format: Some("wav".into()),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    };
+    let refus = Some(VarianteRefusee {
+        bande_kbps: 339,
+        statut: 403,
+    });
+    for (lang, profil, format, mesure, declare, refus, desc, detail) in [
+        (
+            "fr",
+            Some("HE-AAC"),
+            Some("aac"),
+            Some(97),
+            Some(101),
+            refus,
+            "HLS · HE-AAC 97 kbit/s 48kHz",
+            Some(
+                "La qualité 339 kbit/s est refusée par le diffuseur (HTTP 403), souvent une \
+                 restriction géographique : Tune joue la qualité suivante",
+            ),
+        ),
+        (
+            "en",
+            Some("HE-AAC"),
+            Some("aac"),
+            Some(97),
+            Some(101),
+            refus,
+            "HLS · HE-AAC 97 kbit/s 48kHz",
+            Some(
+                "The 339 kbit/s quality is refused by the broadcaster (HTTP 403), often a \
+                 geographic restriction: Tune plays the next quality down",
+            ),
+        ),
+        (
+            "fr",
+            Some("AAC-LC"),
+            Some("aac"),
+            Some(318),
+            Some(339),
+            None,
+            "HLS · AAC-LC 318 kbit/s 48kHz",
+            None,
+        ),
+        (
+            "fr",
+            None,
+            Some("mp3"),
+            None,
+            Some(128),
+            None,
+            "HLS · MP3 128 kbit/s 48kHz",
+            None,
+        ),
+    ] {
+        let stream = StreamInfo {
+            radio_source: Some(RadioSourceInfo {
+                channels: Some(2),
+                format,
+                sample_rate: Some(48_000),
+                transport: Some("hls"),
+                profil,
+                debit_kbps: mesure,
+                bitrate_kbps: declare,
+                variante_refusee: refus,
+                ..Default::default()
+            }),
+            ..wire("wav", 48_000, 16)
+        };
+        let sp = build_signal_path_lang(
+            lang,
+            &ps,
+            &zone,
+            &backend,
+            Some("Renderer"),
+            "none",
+            Some(&stream),
+        )
+        .unwrap();
+        assert_eq!(
+            step_desc(&sp, "Source").as_deref(),
+            Some(desc),
+            "{lang} : le débit mesuré prime sur la bande déclarée"
+        );
+        assert_eq!(
+            step_detail(&sp, "Source").as_deref(),
+            detail,
+            "{lang} : le détail de l'étape Source explique le repli, et lui seul"
         );
     }
 }
@@ -5479,4 +5600,356 @@ fn l_etape_se_nomme_crosstalk_quand_crosstalk_est_en_service_7616() {
             "{lang} : la description parle encore de crossfeed : {description}"
         );
     }
+}
+
+#[test]
+fn frequence_fixe_8428_chemin_de_signal_decrit_le_pcm_servi() {
+    let (backend, zone) = dlna_zone();
+    SettingsRepo::with_backend(backend.clone())
+        .set(
+            &tune_core::audio::frequence_fixe::cle_de_zone(zone.id.unwrap()),
+            "48000",
+        )
+        .unwrap();
+    let ps = en_lecture(1, "flac", 44_100, 24);
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("DAC"),
+        "",
+        Some(&wire("wav", 48_000, 24)),
+    )
+    .unwrap();
+    assert_eq!(
+        resampler_to_hz(&sp),
+        Some(48_000),
+        "le chemin doit annoncer la conversion 44,1 → 48 kHz : {sp}"
+    );
+    assert_eq!(verdict(&sp), Some(false));
+    assert!(step_desc(&sp, "Resampler").unwrap().contains("44.1"));
+}
+
+#[test]
+fn frequence_fixe_8428_absente_ou_contournee_ne_cree_pas_d_etape() {
+    let (backend, zone) = dlna_zone();
+    let ps = en_lecture(1, "flac", 44_100, 24);
+    let settings = SettingsRepo::with_backend(backend.clone());
+    let id = zone.id.unwrap();
+    for mode in ["absente", "pure", "strict"] {
+        let cle = if mode == "pure" {
+            format!("zone_{id}_audiophile")
+        } else {
+            tune_core::audio::bitperfect_strict::cle_de_zone(id)
+        };
+        if mode != "absente" {
+            settings
+                .set(&tune_core::audio::frequence_fixe::cle_de_zone(id), "48000")
+                .unwrap();
+            settings
+                .set(
+                    &cle,
+                    if mode == "pure" {
+                        r#"{"enabled":true}"#
+                    } else {
+                        "true"
+                    },
+                )
+                .unwrap();
+        }
+        let sp = build_signal_path(
+            &ps,
+            &zone,
+            &backend,
+            Some("DAC"),
+            "",
+            Some(&wire("wav", 48_000, 24)),
+        )
+        .unwrap();
+        assert_eq!(
+            resampler_to_hz(&sp),
+            None,
+            "sans réglage actif, le fil seul ne doit pas inventer une étape de cadence fixe ({mode}) : {sp}"
+        );
+        assert!(
+            !sp["steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|s| s["code"] == "fixed_rate_limit")
+        );
+        if mode != "absente" {
+            settings.delete(&cle).unwrap();
+        }
+    }
+}
+
+#[test]
+fn frequence_fixe_8428_demande_et_cadence_plafonnee_sont_expliquees() {
+    let (backend, mut zone) = dlna_zone();
+    let id = zone.id.unwrap();
+    zone.max_sample_rate = Some(96_000);
+    backend
+        .execute(
+            "UPDATE zones SET max_sample_rate = 96000 WHERE id = ?",
+            &[&id],
+        )
+        .unwrap();
+    SettingsRepo::with_backend(backend.clone())
+        .set(&tune_core::audio::frequence_fixe::cle_de_zone(id), "192000")
+        .unwrap();
+    let ps = en_lecture(1, "flac", 44_100, 24);
+    for lang in [
+        "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "vi", "hu", "nb", "pl", "el",
+    ] {
+        let sp = build_signal_path_lang(
+            lang,
+            &ps,
+            &zone,
+            &backend,
+            Some("DAC"),
+            "",
+            Some(&wire("wav", 96_000, 24)),
+        )
+        .unwrap();
+        let steps = sp["steps"].as_array().unwrap();
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|s| s["code"] == "rate_conversion")
+                .count(),
+            1,
+            "{sp}"
+        );
+        assert_eq!(resampler_to_hz(&sp), Some(96_000));
+        let notice = steps
+            .iter()
+            .find(|s| s["code"] == "fixed_rate_limit")
+            .expect("le plafond doit être expliqué");
+        assert_eq!(notice["requested_hz"], 192_000);
+        assert_eq!(notice["applied_hz"], 96_000);
+        let texte = notice["description"].as_str().unwrap();
+        assert!(
+            texte.contains("192") && texte.contains("96") && !texte.contains('{'),
+            "{lang}: {texte}"
+        );
+    }
+}
+
+#[test]
+fn frequence_fixe_8428_ne_double_pas_la_conversion_mesuree() {
+    use tune_core::outputs::traits::{AudioSpec, FormatOuvert, ProfondeurPcm};
+    let (backend, zone) = local_zone_migrated();
+    SettingsRepo::with_backend(backend.clone())
+        .set(
+            &tune_core::audio::frequence_fixe::cle_de_zone(zone.id.unwrap()),
+            "48000",
+        )
+        .unwrap();
+    let mut ps = en_lecture(1, "flac", 44_100, 16);
+    ps.transformations_reelles = Some(TransformationsReelles::nouvelles(
+        AudioSpec::nouvelle(44_100, ProfondeurPcm::Entier16, 2).unwrap(),
+        FormatOuvert::new(48_000, 2),
+        false,
+    ));
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("DAC"),
+        "CPAL",
+        Some(&wire("wav", 48_000, 16)),
+    )
+    .unwrap();
+    assert_eq!(
+        sp["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|s| s["code"] == "rate_conversion")
+            .count(),
+        1,
+        "la session et la mesure décrivent une seule conversion 44,1 → 48 kHz : {sp}"
+    );
+}
+
+/// #8428 — décision du 12/11 : un DSD64 vers une cadence fixe HORS FAMILLE
+/// (48 kHz) est décimé dans sa famille (88,2 kHz) puis rééchantillonné. Le
+/// chemin du signal montre les deux étapes.
+#[test]
+fn frequence_fixe_8428_dsd_hors_famille_montre_decimation_puis_reechantillonnage() {
+    let (backend, zone) = dlna_zone();
+    SettingsRepo::with_backend(backend.clone())
+        .set(
+            &tune_core::audio::frequence_fixe::cle_de_zone(zone.id.unwrap()),
+            "48000",
+        )
+        .unwrap();
+    let ps = en_lecture(1, "dsf", 2_822_400, 1);
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("DAC"),
+        "",
+        Some(&wire("wav", 48_000, 24)),
+    )
+    .unwrap();
+    let transcodeur = step_desc(&sp, "Transcoder").unwrap_or_else(|| panic!("{sp}"));
+    assert!(
+        transcodeur.starts_with("DSD64") && transcodeur.contains("PCM 88kHz"),
+        "la décimation doit viser 88,2 kHz : {transcodeur}"
+    );
+    let steps = sp["steps"].as_array().unwrap();
+    let conversions: Vec<&Value> = steps
+        .iter()
+        .filter(|s| s["code"] == "rate_conversion")
+        .collect();
+    assert_eq!(conversions.len(), 1, "{sp}");
+    assert_eq!(conversions[0]["from_hz"], 88_200);
+    assert_eq!(conversions[0]["to_hz"], 48_000);
+    let i_transcodeur = steps
+        .iter()
+        .position(|s| s["name"] == "Transcoder")
+        .unwrap();
+    let i_conversion = steps
+        .iter()
+        .position(|s| s["code"] == "rate_conversion")
+        .unwrap();
+    assert!(
+        i_transcodeur < i_conversion,
+        "décimation puis rééchantillonnage : {sp}"
+    );
+}
+
+/// Contre-épreuve : un DSD décimé DANS sa famille (176,4 kHz) garde une
+/// seule étape, sans rééchantillonnage.
+#[test]
+fn frequence_fixe_8428_dsd_dans_la_famille_garde_une_seule_etape() {
+    let (backend, zone) = dlna_zone();
+    let ps = en_lecture(1, "dsf", 2_822_400, 1);
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("DAC"),
+        "",
+        Some(&wire("wav", 176_400, 24)),
+    )
+    .unwrap();
+    assert!(
+        !sp["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["code"] == "rate_conversion"),
+        "{sp}"
+    );
+    assert!(!step_desc(&sp, "Transcoder").unwrap().contains("PCM 88kHz"));
+}
+
+/// #8428 — décision du 12/11 (« ramener au plafond ») côté sortie locale :
+/// WASAPI partagé ouvre 48 kHz sous une cadence fixe de 96 kHz. La lecture
+/// n'est plus refusée ; le chemin du signal dit « 96 kHz demandé, 48 kHz
+/// appliqué » d'après la cadence OUVERTE que la sortie déclare.
+#[test]
+fn frequence_fixe_8428_sortie_locale_ramenee_a_la_cadence_ouverte() {
+    use tune_core::outputs::traits::{AudioSpec, FormatOuvert, ProfondeurPcm};
+    let (backend, zone) = local_zone_migrated();
+    SettingsRepo::with_backend(backend.clone())
+        .set(
+            &tune_core::audio::frequence_fixe::cle_de_zone(zone.id.unwrap()),
+            "96000",
+        )
+        .unwrap();
+    let mut ps = en_lecture(1, "flac", 44_100, 16);
+    ps.transformations_reelles = Some(TransformationsReelles::nouvelles(
+        AudioSpec::nouvelle(96_000, ProfondeurPcm::Entier16, 2).unwrap(),
+        FormatOuvert::new(48_000, 2),
+        false,
+    ));
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("DAC"),
+        "CPAL",
+        Some(&wire("wav", 96_000, 16)),
+    )
+    .unwrap();
+    let notice = sp["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["code"] == "fixed_rate_limit")
+        .unwrap_or_else(|| panic!("la cadence ramenée doit être dite : {sp}"));
+    assert_eq!(notice["requested_hz"], 96_000);
+    assert_eq!(notice["applied_hz"], 48_000);
+}
+
+// ---- #8248 : DSD natif ALSA de la sortie locale ---------------------------
+
+fn etape_par_code<'a>(v: &'a Value, code: &str) -> Option<&'a Value> {
+    v.get("steps")?
+        .as_array()?
+        .iter()
+        .find(|s| s.get("code").and_then(Value::as_str) == Some(code))
+}
+
+/// Le fil porte le flux DSD brut de la sortie native : le chemin du signal
+/// dit « DSD128 natif (ALSA) », bit-perfect, sans étape DoP ; le volume
+/// logiciel n'y est pas appliqué et l'étape le dit.
+#[test]
+fn le_dsd_natif_local_se_dit_natif_et_non_dop_8248() {
+    let (backend, mut zone) = local_zone_migrated();
+    zone.volume = 40.0;
+    let fil = wire_mime("dsd", tune_core::audio::dsd_brut::MIME, 5_644_800, 1);
+    let sp = build_signal_path_lang(
+        "fr",
+        &dsd128_playing(),
+        &zone,
+        &backend,
+        None,
+        "ALSA",
+        Some(&fil),
+    )
+    .unwrap();
+    let natif = etape_par_code(&sp, "dsd_natif").expect("étape DSD natif absente");
+    let attendu = format!("DSD128 natif ({})", pilote_du_dsd_natif_local());
+    assert_eq!(natif["description"], attendu.as_str(), "{sp}");
+    assert_eq!(natif["bit_perfect"], true);
+    assert!(
+        etape_par_code(&sp, "dop").is_none(),
+        "un natif n'est pas un DoP : {sp}"
+    );
+    assert_eq!(
+        step_desc(&sp, "Volume").as_deref(),
+        Some("Volume non appliqué (DSD natif)"),
+        "le volume n'est pas appliqué sur du DSD natif : {sp}"
+    );
+}
+
+/// Contre-témoin : le même DSD servi en DoP (fil WAV, `dop_active`) garde
+/// son étape DoP et n'est jamais annoncé natif.
+#[test]
+fn le_dop_local_ne_se_dit_pas_natif_8248() {
+    let (backend, zone) = local_zone_migrated();
+    let mut ps = dsd128_playing();
+    ps.dop_active = true;
+    let fil = wire_mime("wav", "audio/wav", 352_800, 24);
+    let sp = build_signal_path_lang("fr", &ps, &zone, &backend, None, "ALSA", Some(&fil)).unwrap();
+    assert!(etape_par_code(&sp, "dsd_natif").is_none(), "{sp}");
+    assert!(
+        etape_par_code(&sp, "dop").is_some(),
+        "le DoP doit rester dit : {sp}"
+    );
+}
+
+/// DSD1024 se dit DSD1024 (il se disait DSD512, fil 2730).
+#[test]
+fn dsd1024_se_dit_dsd1024_8248() {
+    assert_eq!(dsd_family_name(45_158_400), "DSD1024");
+    assert_eq!(dsd_family_name(49_152_000), "DSD1024");
+    assert_eq!(dsd_family_name(22_579_200), "DSD512");
+    assert_eq!(dsd_family_name(24_576_000), "DSD512");
 }

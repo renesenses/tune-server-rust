@@ -333,3 +333,96 @@ fn le_plafond_de_relances_arrete_la_boucle_mais_pas_le_bouton() {
         );
     });
 }
+
+/// Une trace de travail de la passe des métadonnées, datée de maintenant :
+/// ce que la boucle écrit pour chaque piste qu'elle quitte (#7983).
+fn une_piste_tentee(state: &AppState) {
+    let maintenant = chrono::Utc::now().timestamp();
+    state
+        .backend
+        .execute_batch(&format!(
+            "INSERT INTO enrich_tentatives (track_id, issue, echecs, tente_le, reessai_apres) \
+             VALUES (10, 'introuvable', 0, {maintenant}, 0);"
+        ))
+        .expect("trace de tentative");
+}
+
+/// 🔴 #7983 — Tades, fil 2726, 563 257 pistes : `reprise_passe_abandonnee …
+/// relances=3 max=3`. Le compteur montait à chaque redémarrage, même quand la
+/// passe avait travaillé entre deux ; une passe de plusieurs semaines était
+/// abandonnée après trois mises à jour. Une passe qui a progressé depuis son
+/// ouverture repart, avec un compteur neuf.
+#[test]
+fn une_passe_qui_a_progresse_n_est_pas_abandonnee_au_plafond() {
+    let _un = UN_ESSAI_A_LA_FOIS.lock().unwrap_or_else(|e| e.into_inner());
+    let (_dir, base) = base_neuve("progres-7983");
+
+    lancer_puis_arreter(&base);
+    for _ in 1..=RELANCES_MAX {
+        processus(&base, async |state| {
+            reprise_des_passes::relancer_si_absente(&state, Passe::Metadonnees, Origine::Demarrage)
+                .await;
+        });
+    }
+
+    processus(&base, async |state| {
+        assert_eq!(
+            reprise_des_passes::lire(&state.backend, Passe::Metadonnees)
+                .expect("repère")
+                .relances,
+            RELANCES_MAX,
+            "le compteur est au plafond"
+        );
+        // La dernière passe relancée a travaillé avant l'arrêt.
+        une_piste_tentee(&state);
+        let issue =
+            reprise_des_passes::relancer_si_absente(&state, Passe::Metadonnees, Origine::Demarrage)
+                .await;
+        assert_eq!(
+            issue,
+            Relance::Relancee,
+            "une passe qui a progressé n'est pas « morte à chaque démarrage »"
+        );
+        assert_eq!(
+            reprise_des_passes::lire(&state.backend, Passe::Metadonnees)
+                .expect("repère")
+                .relances,
+            1,
+            "compteur neuf : cette relance est la première"
+        );
+    });
+}
+
+/// #7983 — le repère laissé par une rc11 n'a pas d'instant d'ouverture. Chez
+/// Tades il est déjà au plafond : la trace de travail suffit à le relancer.
+#[test]
+fn un_repere_ancien_au_plafond_repart_si_la_passe_a_travaille() {
+    let _un = UN_ESSAI_A_LA_FOIS.lock().unwrap_or_else(|e| e.into_inner());
+    let (_dir, base) = base_neuve("ancien-7983");
+
+    processus(&base, async |state| {
+        un_candidat(&state);
+        taches_de_fond::mettre_en_pause(&state.backend, Tache::Enrichissement).expect("pause");
+        SettingsRepo::with_backend(state.backend.clone())
+            .set(
+                Passe::Metadonnees.cle_reglage(),
+                &serde_json::json!({"portee": null, "jeton": "ancien", "relances": RELANCES_MAX})
+                    .to_string(),
+            )
+            .expect("repère d'avant #7983");
+        // Témoin : sans trace de travail, le plafond tient.
+        assert_eq!(
+            reprise_des_passes::relancer_si_absente(&state, Passe::Metadonnees, Origine::Demarrage)
+                .await,
+            Relance::Abandonnee {
+                relances: RELANCES_MAX
+            }
+        );
+        une_piste_tentee(&state);
+        assert_eq!(
+            reprise_des_passes::relancer_si_absente(&state, Passe::Metadonnees, Origine::Demarrage)
+                .await,
+            Relance::Relancee
+        );
+    });
+}

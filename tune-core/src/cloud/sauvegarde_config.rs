@@ -1160,31 +1160,11 @@ fn reseau(e: reqwest::Error) -> ErreurSite {
 
 /// Rafraîchit le jeton du compte après un 401, une fois. Rend le compte à
 /// jour, ou `None` si rien n'a pu être rafraîchi.
-pub(crate) async fn rafraichir(settings: &SettingsRepo) -> Option<Compte> {
-    use super::sso::{DEFAULT_CLIENT_ID, MozaikAuth};
-    let rt = settings
-        .get("mozaik_refresh_token")
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty())?;
-    let client_id = settings
-        .get("mozaik_client_id")
-        .ok()
-        .flatten()
-        .or_else(|| std::env::var("TUNE_MOZAIK_CLIENT_ID").ok())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_CLIENT_ID.to_string());
-    let base = settings.get("mozaik_base_url").ok().flatten();
-    let tok = MozaikAuth::new(client_id, base.as_deref())
-        .refresh_token(&rt)
-        .await
-        .ok()?;
-    settings
-        .set("mozaik_access_token", &tok.access_token)
-        .ok()?;
-    if let Some(n) = &tok.refresh_token {
-        settings.set("mozaik_refresh_token", n).ok();
-    }
+///
+/// `refuse` : le jeton d'accès que le site vient de refuser. Passe par le
+/// renouvellement unique du serveur (#8238), jamais par un appel direct.
+pub(crate) async fn rafraichir(settings: &SettingsRepo, refuse: &str) -> Option<Compte> {
+    super::sso::renouveler_la_session(settings, refuse).await?;
     compte(settings).ok()
 }
 
@@ -1204,7 +1184,7 @@ where
     }
     // Un 401 `server_token_invalid` porte sur le jeton de LIAISON, pas sur la
     // session : rafraîchir la session n'y changerait rien.
-    let Some(c) = rafraichir(settings).await else {
+    let Some(c) = rafraichir(settings, &c.acces).await else {
         return Ok(r);
     };
     faire(&c).send().await.map_err(reseau)

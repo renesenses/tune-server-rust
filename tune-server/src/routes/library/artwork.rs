@@ -846,7 +846,12 @@ pub(crate) async fn demarrer_pochettes_albums(
         let _task_guard = task_guard; // ends the task when this future completes
         let avancement: tune_core::library::artwork::AvancementPochettes =
             std::sync::Arc::new(move |fait, total| {
-                taches.update_progress(TACHE_POCHETTES_ALBUMS, fait, total, "albums");
+                taches.update_progress(
+                    TACHE_POCHETTES_ALBUMS,
+                    fait,
+                    total,
+                    crate::background_tasks::Phase::Albums,
+                );
             });
         tune_core::library::artwork::batch_enrich_artwork_suivi(
             db.clone(),
@@ -1143,11 +1148,14 @@ pub(super) fn compter_artistes_sans_image(
 /// s'annonçait « MusicBrainz » — la seule des trois qui n'interroge justement
 /// pas MusicBrainz. Le nom de la passe vient de `tune-core`, pas d'une chaîne
 /// recopiée ici.
-pub(super) fn libelle_phase(phase: Option<&str>) -> &'static str {
+pub(super) fn libelle_phase(phase: Option<&str>) -> crate::background_tasks::Phase {
+    use crate::background_tasks::Phase;
     match phase {
-        Some("images") => "Images",
-        Some(p) if p == tune_core::library::artwork::PHASE_PAR_NOM => "Discogs / Last.fm",
-        _ => "MusicBrainz",
+        Some("images") => Phase::Images,
+        Some(p) if p == tune_core::library::artwork::PHASE_PAR_NOM => {
+            Phase::Source("Discogs / Last.fm")
+        }
+        _ => Phase::Source("MusicBrainz"),
     }
 }
 
@@ -3323,19 +3331,22 @@ mod tests {
     /// quand la recherche échoue (#2227, #2257).
     #[test]
     fn chaque_passe_porte_son_propre_libelle() {
-        assert_eq!(libelle_phase(Some("mbid")), "MusicBrainz");
-        assert_eq!(libelle_phase(Some("images")), "Images");
+        assert_eq!(libelle_phase(Some("mbid")).texte(), "MusicBrainz");
+        assert_eq!(libelle_phase(Some("images")).texte(), "Images");
         assert_eq!(
-            libelle_phase(Some(tune_core::library::artwork::PHASE_PAR_NOM)),
+            libelle_phase(Some(tune_core::library::artwork::PHASE_PAR_NOM)).texte(),
             "Discogs / Last.fm"
         );
         assert_ne!(
-            libelle_phase(Some(tune_core::library::artwork::PHASE_PAR_NOM)),
+            libelle_phase(Some(tune_core::library::artwork::PHASE_PAR_NOM)).texte(),
             "MusicBrainz",
             "la passe par nom n'interroge pas MusicBrainz"
         );
         // Une passe inconnue garde le repli historique.
-        assert_eq!(libelle_phase(None), "MusicBrainz");
+        assert_eq!(libelle_phase(None).texte(), "MusicBrainz");
+        // #8282 — les noms de services passent en paramètre du code `source`.
+        assert_eq!(libelle_phase(None).code(), "source");
+        assert_eq!(libelle_phase(Some("images")).code(), "images");
     }
 }
 
@@ -3673,8 +3684,12 @@ mod pochettes_albums_etat_du_serveur {
             .background_tasks
             .try_begin(TACHE_POCHETTES_ALBUMS, "…", "enrichment")
             .unwrap();
-        etat.background_tasks
-            .update_progress(TACHE_POCHETTES_ALBUMS, 1, 2, "albums");
+        etat.background_tasks.update_progress(
+            TACHE_POCHETTES_ALBUMS,
+            1,
+            2,
+            crate::background_tasks::Phase::Albums,
+        );
         let (_, en_cours) = appel(&etat, "GET", "/artwork/enrich/status").await;
         assert_eq!(en_cours["running"], true, "{en_cours}");
         assert_eq!(en_cours["progress"], json!({"processed": 1, "total": 2}));

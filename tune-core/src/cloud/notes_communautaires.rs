@@ -147,7 +147,7 @@ impl Session<'_> {
                         }
                     } else if statut == 401 && !self.session_rafraichie {
                         self.session_rafraichie = true;
-                        if let Some(c) = sc::rafraichir(&self.settings).await {
+                        if let Some(c) = sc::rafraichir(&self.settings, &self.compte.acces).await {
                             self.compte = c;
                             continue;
                         }

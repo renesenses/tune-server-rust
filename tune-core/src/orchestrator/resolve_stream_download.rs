@@ -83,6 +83,84 @@ pub(super) async fn telecharger_pour_session(
     }
 }
 
+/// #8444 — l'Opus de YouTube vers une sortie locale ou OAAT : comme
+/// [`telecharger_pour_session`], mais rend le fichier DÈS la réponse amont
+/// acceptée. Le corps continue d'arriver en tâche de fond
+/// (`copier_en_croissance`, #8228) et le décodeur Opus le lit au fil de l'eau
+/// par la poignée `dash_growth` inscrite sous son chemin.
+///
+/// Sans cela, le premier octet WAV attendait le DERNIER octet amont ; or
+/// `googlevideo` ne débite qu'environ deux fois le temps réel, et le chien de
+/// garde #5522 arrête la zone restée à 0:00 au bout de 8 s, relance comprise
+/// (fil 2761).
+///
+/// Même contrat d'annulation que le téléchargement complet (#4234) : une
+/// session retirée pendant l'attente des en-têtes rend `Ok(None)` ; retirée
+/// pendant la copie, la poignée est close en échec, le décodeur rend la main
+/// et la copie s'arrête. Le fichier temporaire est supprimé par son garde.
+pub(super) async fn telecharger_en_croissance_pour_session(
+    streamer: &std::sync::Arc<AudioStreamer>,
+    session_id: &str,
+    upstream: &str,
+    entetes: &[(String, String)],
+    codec: &str,
+    directory: &Path,
+) -> Result<Option<NamedTempFile>, String> {
+    let cancelled = async {
+        while streamer.session_alive(session_id).await {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    };
+    let url = upstream.to_string();
+    let en_tetes = entetes.to_vec();
+    let ouverture = tokio::task::spawn_blocking(move || super::ouvrir_amont(&url, &en_tetes));
+    let reponse = tokio::select! {
+        biased;
+        () = cancelled => return Ok(None),
+        r = ouverture => r.map_err(|e| format!("download task panic: {e}"))??,
+    };
+    if !streamer.session_alive(session_id).await {
+        return Ok(None);
+    }
+    let temporary = tempfile::Builder::new()
+        .prefix(&format!("tune-stream-{session_id}-"))
+        .suffix(&format!(".{codec}"))
+        .tempfile_in(directory)
+        .map_err(|e| format!("tmp create: {e}"))?;
+    let fichier = temporary.reopen().map_err(|e| format!("tmp open: {e}"))?;
+    let chemin = temporary.path().to_string_lossy().into_owned();
+    let growth = crate::audio::dash_growth::DashGrowth::new(0);
+    crate::audio::dash_growth::register(&chemin, growth.clone());
+    // Le veilleur ne tient qu'une référence faible : `copier_en_croissance`
+    // s'arrête quand plus personne d'autre ne tient la poignée.
+    let veille = std::sync::Arc::downgrade(&growth);
+    tokio::task::spawn_blocking(move || super::copier_en_croissance(reponse, fichier, growth));
+    let streamer = streamer.clone();
+    let sid = session_id.to_string();
+    let chemin_veille = chemin.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let Some(g) = veille.upgrade() else {
+                return;
+            };
+            if !streamer.session_alive(&sid).await {
+                // Retirée du registre si aucun décodeur ne l'a prise, puis
+                // close en échec : un décodeur bloqué à la frontière rend la
+                // main au lieu d'attendre la fin d'un téléchargement inutile.
+                drop(crate::audio::dash_growth::take_for(&chemin_veille));
+                g.fail();
+                return;
+            }
+        }
+    });
+    Ok(Some(temporary))
+}
+
+#[cfg(test)]
+#[path = "youtube_local_opus_8444_tests.rs"]
+mod youtube_local_opus_8444_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

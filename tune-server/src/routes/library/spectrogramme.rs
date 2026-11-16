@@ -16,6 +16,20 @@
 //!
 //! L'en-tête `X-Tune-Cache` dit si l'image vient du cache (`hit`) ou vient
 //! d'être générée (`miss`).
+//!
+//! #8160 — l'image calculée est CONSERVÉE pour la fiche technique de la piste :
+//! chaque génération écrit sa trace datée dans `spectrogrammes` (nom du PNG,
+//! taille, date et durée du calcul, signature du fichier audio,
+//! `tune_core::db::spectrogrammes`). L'image précédente d'une piste part du
+//! cache quand une nouvelle la remplace ; une image évincée emporte sa ligne.
+//! `POST /library/tracks/{id}/spectrogramme` recalcule sans lire le cache et
+//! rend la section `spectrogramme` de la fiche.
+//!
+//! Go du 13/11 — une piste QOBUZ ou TIDAL a aussi son spectrogramme : l'audio
+//! est téléchargé pour le calcul puis effacé (`audio_de_service`), seule
+//! l'image reste en cache, sous une clé qui porte le service, l'identifiant
+//! chez lui et la qualité au lieu de l'empreinte du fichier. Pas de trace
+//! datée en base pour elle (aucun fichier dont suivre les changements).
 
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
@@ -28,9 +42,11 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use tune_core::audio::spectrogramme::{self, HAUTEUR_DEFAUT, LARGEUR_DEFAUT};
+use tune_core::db::spectrogrammes;
 use tune_core::db::track_repo::TrackRepo;
 use tune_core::taches_de_fond::priorite;
 
+use super::audio_de_service::{self as service, AudioTemporaire, Limites, PisteDeService, Refus};
 use crate::state::AppState;
 
 /// Plafond du cache par défaut : 256 Mo (environ 2 000 images 1200 × 400).
@@ -69,20 +85,24 @@ pub(crate) async fn png(
     servir(&state, id, taille, &dossier_du_cache(), plafond()).await
 }
 
-/// Une génération à la fois par piste.
+/// Une génération à la fois par piste (spectrogramme et forme d'onde : un
+/// seul décodage lourd par piste à la fois).
 static VERROUS: LazyLock<Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// Deux générations au plus en même temps, toutes pistes confondues.
-static GENERATIONS: LazyLock<tokio::sync::Semaphore> =
-    LazyLock::new(|| tokio::sync::Semaphore::new(2));
+/// Deux générations au plus en même temps, toutes pistes confondues (la
+/// forme d'onde, fil 2793, partage cette limite).
+/// Dans un `Arc` pour `acquire_owned` (la forme d'onde déplace sa place dans
+/// le travail bloquant).
+pub(super) static GENERATIONS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(2)));
 
-fn verrou_de(id: i64) -> Arc<tokio::sync::Mutex<()>> {
+pub(super) fn verrou_de(id: i64) -> Arc<tokio::sync::Mutex<()>> {
     let mut verrous = VERROUS.lock().unwrap_or_else(|e| e.into_inner());
     verrous.entry(id).or_default().clone()
 }
 
-fn liberer(id: i64, verrou: Arc<tokio::sync::Mutex<()>>) {
+pub(super) fn liberer(id: i64, verrou: Arc<tokio::sync::Mutex<()>>) {
     let mut verrous = VERROUS.lock().unwrap_or_else(|e| e.into_inner());
     // La table et nous : personne d'autre n'attend, l'entrée peut partir.
     if Arc::strong_count(&verrou) <= 2 {
@@ -97,63 +117,355 @@ pub(crate) async fn servir(
     dossier: &CheminFs,
     plafond: u64,
 ) -> Response {
+    match obtenir(state, id, taille, dossier, plafond, false).await {
+        Ok((octets, cache)) => reponse(octets, cache),
+        Err(r) => r,
+    }
+}
+
+/// `POST /library/tracks/{id}/spectrogramme` (#8160) : recalcule l'image sans
+/// lire le cache, puis rend la section `spectrogramme` de la fiche technique.
+pub(crate) async fn recalculer(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    Query(taille): Query<Taille>,
+) -> Response {
+    recalculer_dans(&state, id, taille, &dossier_du_cache(), plafond()).await
+}
+
+pub(crate) async fn recalculer_dans(
+    state: &AppState,
+    id: i64,
+    taille: Taille,
+    dossier: &CheminFs,
+    plafond: u64,
+) -> Response {
+    if let Err(r) = obtenir(state, id, taille, dossier, plafond, true).await {
+        return r;
+    }
+    let section = TrackRepo::with_backend(state.backend.clone())
+        .get(id)
+        .ok()
+        .flatten()
+        .and_then(|t| match super::fiche_technique::fichier_de_la_piste(&t) {
+            Some((_, meta)) => section(state.backend.as_ref(), id, &meta, dossier),
+            None => PisteDeService::de(&t).map(|p| section_service(id, &p, dossier)),
+        });
+    axum::Json(section.unwrap_or(serde_json::Value::Null)).into_response()
+}
+
+/// Le nom en cache de l'image d'une piste de service : la clé du service,
+/// de l'identifiant et de la qualité remplace l'empreinte du fichier.
+pub(crate) fn nom_en_cache_service(
+    id: i64,
+    piste: &PisteDeService,
+    largeur: u32,
+    hauteur: u32,
+) -> String {
+    format!("{id}-{}-{largeur}x{hauteur}.png", piste.cle())
+}
+
+/// La section `spectrogramme` de la fiche d'une piste Qobuz ou TIDAL :
+/// `a_jour` quand l'image à la taille par défaut est en cache, `absent`
+/// sinon ; `service` dit qu'elle se calcule par téléchargement.
+pub(crate) fn section_service(
+    id: i64,
+    piste: &PisteDeService,
+    dossier: &CheminFs,
+) -> serde_json::Value {
+    let presente = dossier
+        .join(nom_en_cache_service(
+            id,
+            piste,
+            LARGEUR_DEFAUT,
+            HAUTEUR_DEFAUT,
+        ))
+        .is_file();
+    serde_json::json!({
+        "etat": if presente { "a_jour" } else { "absent" },
+        "url": format!(
+            "/api/v1/library/tracks/{id}/spectrogramme.png?largeur={LARGEUR_DEFAUT}&hauteur={HAUTEUR_DEFAUT}"
+        ),
+        "largeur": LARGEUR_DEFAUT,
+        "hauteur": HAUTEUR_DEFAUT,
+        "service": piste.service,
+    })
+}
+
+/// L'image de la piste : depuis le cache, ou générée (`forcer` : toujours
+/// générée). Rend les octets et `hit` / `miss`, ou la réponse d'erreur.
+async fn obtenir(
+    state: &AppState,
+    id: i64,
+    taille: Taille,
+    dossier: &CheminFs,
+    plafond: u64,
+    forcer: bool,
+) -> Result<(Vec<u8>, &'static str), Response> {
     let (largeur, hauteur) = spectrogramme::borner(
         taille.largeur.unwrap_or(LARGEUR_DEFAUT),
         taille.hauteur.unwrap_or(HAUTEUR_DEFAUT),
     );
     let track = match TrackRepo::with_backend(state.backend.clone()).get(id) {
         Ok(Some(t)) => t,
-        Ok(None) => return (StatusCode::NOT_FOUND, "track not found").into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(None) => return Err((StatusCode::NOT_FOUND, "track not found").into_response()),
+        Err(e) => {
+            return Err((StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response());
+        }
     };
-    let Some(chemin) = track.file_path.as_deref() else {
-        return (StatusCode::UNPROCESSABLE_ENTITY, "track has no local file").into_response();
+    let Some(chemin) = track.file_path.as_deref().filter(|c| !c.is_empty()) else {
+        // Recette du 14/11 — une piste d'un serveur multimédia (UPnP) n'a
+        // pas de fichier ici : un refus que l'écran sait dire.
+        if track.source == "upnp" {
+            return Err(Refus::SourceReseau.reponse());
+        }
+        let Some(piste) = PisteDeService::de(&track) else {
+            return Err(Refus::NonPrisEnCharge.reponse());
+        };
+        return obtenir_service(
+            state,
+            id,
+            &piste,
+            (largeur, hauteur),
+            track.duration_ms,
+            dossier,
+            plafond,
+            forcer,
+        )
+        .await;
     };
     // La graphie du disque, pas celle de la base (#1865).
     let chemin = tune_core::library::local_path::resolve_existing_local_path(chemin)
         .unwrap_or_else(|| chemin.to_string());
     let Ok(meta) = std::fs::metadata(&chemin) else {
-        return (StatusCode::UNPROCESSABLE_ENTITY, "track file not found").into_response();
+        return Err((StatusCode::UNPROCESSABLE_ENTITY, "track file not found").into_response());
     };
-    let cible = dossier.join(nom_en_cache(id, &chemin, &meta, largeur, hauteur));
+    let nom = nom_en_cache(id, &chemin, &meta, largeur, hauteur);
+    let cible = dossier.join(&nom);
 
-    if let Some(octets) = lire_le_cache(&cible) {
-        return reponse(octets, "hit");
+    if !forcer && let Some(octets) = lire_le_cache(&cible) {
+        return Ok((octets, "hit"));
     }
 
     let verrou = verrou_de(id);
     let garde = verrou.clone().lock_owned().await;
     // Pendant notre attente, un autre appel a pu la générer.
-    if let Some(octets) = lire_le_cache(&cible) {
+    if !forcer && let Some(octets) = lire_le_cache(&cible) {
         drop(garde);
         liberer(id, verrou);
-        return reponse(octets, "hit");
+        return Ok((octets, "hit"));
     }
-    let resultat = generer(chemin, largeur, hauteur, track.duration_ms).await;
-    let reponse = match resultat {
+    let debut = std::time::Instant::now();
+    let resultat = generer(chemin, None, largeur, hauteur, track.duration_ms).await;
+    let duree_ms = debut.elapsed().as_millis() as i64;
+    let issue = match resultat {
         Ok(octets) => {
             if let Err(e) = ecrire(&cible, &octets) {
                 tracing::warn!(track_id = id, error = %e, "spectrogramme_cache_non_ecrit");
+            } else {
+                conserver(
+                    state, id, &nom, &octets, &meta, largeur, hauteur, duree_ms, dossier,
+                );
             }
-            evincer(dossier, plafond, &cible);
-            reponse(octets, "miss")
+            let evincees = evincer(dossier, plafond, &cible);
+            if !evincees.is_empty()
+                && let Err(e) =
+                    spectrogrammes::oublier_les_fichiers(state.backend.as_ref(), &evincees)
+            {
+                tracing::warn!(error = %e, "spectrogramme_oubli_des_evincees");
+            }
+            Ok((octets, "miss"))
         }
         Err(e) => {
             tracing::info!(track_id = id, error = %e, "spectrogramme_impossible");
-            (
+            Err((
                 StatusCode::UNPROCESSABLE_ENTITY,
                 format!("spectrogram failed: {e}"),
             )
-                .into_response()
+                .into_response())
         }
     };
     drop(garde);
     liberer(id, verrou);
-    reponse
+    issue
 }
 
+/// #8160 — la trace datée de l'image qui vient d'être écrite. L'image
+/// précédente de la piste, si elle porte un autre nom (fichier changé, autre
+/// taille), quitte le cache : elle ne sert plus. Un échec n'empêche pas de
+/// servir l'image : il se journalise.
+#[allow(clippy::too_many_arguments)]
+fn conserver(
+    state: &AppState,
+    id: i64,
+    nom: &str,
+    octets: &[u8],
+    meta: &std::fs::Metadata,
+    largeur: u32,
+    hauteur: u32,
+    duree_ms: i64,
+    dossier: &CheminFs,
+) {
+    let trace = spectrogrammes::Spectrogramme {
+        track_id: id,
+        fichier: nom.to_string(),
+        largeur: i64::from(largeur),
+        hauteur: i64::from(hauteur),
+        octets: octets.len() as i64,
+        signature: spectrogrammes::signature(meta),
+        taille_fichier: Some(meta.len() as i64),
+        mtime_fichier: spectrogrammes::mtime_secondes(meta),
+        duree_calcul_ms: Some(duree_ms),
+        calcule_le: spectrogrammes::maintenant(),
+    };
+    match spectrogrammes::enregistrer(state.backend.as_ref(), &trace) {
+        Ok(Some(ancienne)) => {
+            let _ = std::fs::remove_file(dossier.join(ancienne));
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!(track_id = id, error = %e, "spectrogramme_trace_non_ecrite"),
+    }
+}
+
+/// #8160 — la section `spectrogramme` de la fiche technique d'une piste qui a
+/// un fichier (`meta` : son état d'aujourd'hui).
+///
+/// * `etat` : `a_jour` (l'image vaut pour le fichier d'aujourd'hui), `perime`
+///   (le fichier a changé depuis le calcul), `absent` (jamais calculée, ou
+///   évincée du cache : sa ligne s'efface alors ici) ;
+/// * `url` : l'image à demander, à la taille de la dernière image calculée
+///   (servie depuis le cache quand elle est à jour) ;
+/// * la date et la durée du calcul, la taille de l'image.
+pub(crate) fn section(
+    db: &dyn tune_core::db::backend::DbBackend,
+    id: i64,
+    meta: &std::fs::Metadata,
+    dossier: &CheminFs,
+) -> Option<serde_json::Value> {
+    let trace = match spectrogrammes::lire(db, id) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(track_id = id, error = %e, "spectrogramme_trace_illisible");
+            None
+        }
+    };
+    let trace = trace.filter(|t| {
+        let presente = dossier.join(&t.fichier).is_file();
+        if !presente {
+            // Évincée du cache, ou cache effacé : la ligne ne dit plus rien.
+            let _ = spectrogrammes::oublier(db, id);
+        }
+        presente
+    });
+    let (largeur, hauteur) = trace
+        .as_ref()
+        .map(|t| (t.largeur, t.hauteur))
+        .unwrap_or((i64::from(LARGEUR_DEFAUT), i64::from(HAUTEUR_DEFAUT)));
+    let url = format!(
+        "/api/v1/library/tracks/{id}/spectrogramme.png?largeur={largeur}&hauteur={hauteur}"
+    );
+    Some(match trace {
+        None => serde_json::json!({
+            "etat": "absent",
+            "url": url,
+            "largeur": largeur,
+            "hauteur": hauteur,
+        }),
+        Some(t) => {
+            let etat = if t.signature == spectrogrammes::signature(meta) {
+                "a_jour"
+            } else {
+                "perime"
+            };
+            serde_json::json!({
+                "etat": etat,
+                "url": url,
+                "largeur": t.largeur,
+                "hauteur": t.hauteur,
+                "octets": t.octets,
+                "calcule_le": t.calcule_le,
+                "duree_calcul_ms": t.duree_calcul_ms,
+            })
+        }
+    })
+}
+
+/// L'image d'une piste Qobuz ou TIDAL : depuis le cache, ou téléchargée,
+/// calculée, puis l'audio effacé. Un seul calcul par piste à la fois,
+/// téléchargement compris.
+#[allow(clippy::too_many_arguments)]
+async fn obtenir_service(
+    state: &AppState,
+    id: i64,
+    piste: &PisteDeService,
+    (largeur, hauteur): (u32, u32),
+    duree_ms: i64,
+    dossier: &CheminFs,
+    plafond: u64,
+    forcer: bool,
+) -> Result<(Vec<u8>, &'static str), Response> {
+    // Une image par piste de service, à la taille de l'écran : une autre
+    // taille retéléchargerait la piste et ferait pousser le cache.
+    if (largeur, hauteur) != (LARGEUR_DEFAUT, HAUTEUR_DEFAUT) {
+        return Err(Refus::ZoomNonDisponible.reponse());
+    }
+    let cible = dossier.join(nom_en_cache_service(id, piste, largeur, hauteur));
+    if !forcer && let Some(octets) = lire_le_cache(&cible) {
+        return Ok((octets, "hit"));
+    }
+    let verrou = verrou_de(id);
+    let garde = verrou.clone().lock_owned().await;
+    if !forcer && let Some(octets) = lire_le_cache(&cible) {
+        drop(garde);
+        liberer(id, verrou);
+        return Ok((octets, "hit"));
+    }
+    let issue = match service::telecharger(
+        state,
+        piste,
+        &service::dossier_temporaire(dossier),
+        Limites::de_l_environnement(),
+    )
+    .await
+    {
+        Err(refus) => Err(refus.reponse()),
+        Ok(audio) => {
+            let chemin = audio.chemin().to_string_lossy().into_owned();
+            match generer(chemin, Some(audio), largeur, hauteur, duree_ms).await {
+                Ok(octets) => {
+                    if let Err(e) = ecrire(&cible, &octets) {
+                        tracing::warn!(track_id = id, error = %e, "spectrogramme_cache_non_ecrit");
+                    }
+                    let evincees = evincer(dossier, plafond, &cible);
+                    if !evincees.is_empty()
+                        && let Err(e) =
+                            spectrogrammes::oublier_les_fichiers(state.backend.as_ref(), &evincees)
+                    {
+                        tracing::warn!(error = %e, "spectrogramme_oubli_des_evincees");
+                    }
+                    Ok((octets, "miss"))
+                }
+                Err(e) => {
+                    tracing::info!(track_id = id, error = %e, "spectrogramme_impossible");
+                    Err((
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        format!("spectrogram failed: {e}"),
+                    )
+                        .into_response())
+                }
+            }
+        }
+    };
+    drop(garde);
+    liberer(id, verrou);
+    issue
+}
+
+/// `audio` : le fichier téléchargé d'une piste de service, qui part (et
+/// s'efface) avec le travail bloquant.
 async fn generer(
     chemin: String,
+    audio: Option<AudioTemporaire>,
     largeur: u32,
     hauteur: u32,
     duree_ms: i64,
@@ -168,6 +480,7 @@ async fn generer(
     // la lecture entre deux fenêtres (#8086), une seule génération à la fois
     // par piste et deux au plus au total, un nice modéré.
     let resultat = priorite::hors_du_fil_async_pour(ORIGINE, TACHE, move || {
+        let _audio = audio;
         spectrogramme::generer_png(&chemin, largeur, hauteur, duree_s, &|| {
             priorite::ceder_pour_bloquant(ORIGINE, TACHE);
         })
@@ -191,6 +504,15 @@ pub(crate) fn nom_en_cache(
     largeur: u32,
     hauteur: u32,
 ) -> String {
+    format!(
+        "{id}-{:016x}-{largeur}x{hauteur}.png",
+        empreinte_du_fichier(chemin, meta)
+    )
+}
+
+/// Une empreinte du chemin, de la taille et de la date du fichier : elle
+/// change dès que le fichier est remplacé (forme d'onde comprise, fil 2793).
+pub(super) fn empreinte_du_fichier(chemin: &str, meta: &std::fs::Metadata) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     chemin.hash(&mut h);
     meta.len().hash(&mut h);
@@ -199,11 +521,11 @@ pub(crate) fn nom_en_cache(
         .and_then(|m| m.duration_since(SystemTime::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos())
         .hash(&mut h);
-    format!("{id}-{:016x}-{largeur}x{hauteur}.png", h.finish())
+    h.finish()
 }
 
 /// Lit une image en cache et la marque servie (sa date), pour l'éviction.
-fn lire_le_cache(cible: &CheminFs) -> Option<Vec<u8>> {
+pub(super) fn lire_le_cache(cible: &CheminFs) -> Option<Vec<u8>> {
     let octets = std::fs::read(cible).ok()?;
     if let Ok(f) = std::fs::File::options().write(true).open(cible) {
         let _ = f.set_modified(SystemTime::now());
@@ -223,13 +545,26 @@ fn ecrire(cible: &CheminFs, octets: &[u8]) -> std::io::Result<()> {
 
 /// Ramène le cache sous `plafond` octets, les images servies le moins
 /// récemment d'abord. `garder` (l'image qui vient d'être écrite) ne part pas.
-pub(crate) fn evincer(dossier: &CheminFs, plafond: u64, garder: &CheminFs) {
+/// Rend les noms des images retirées (#8160 : leurs lignes s'effacent).
+pub(crate) fn evincer(dossier: &CheminFs, plafond: u64, garder: &CheminFs) -> Vec<String> {
+    evincer_selon(dossier, plafond, garder, "png")
+}
+
+/// [`evincer`] pour les fichiers d'extension `extension` (la forme d'onde,
+/// fil 2793, garde du JSON).
+pub(super) fn evincer_selon(
+    dossier: &CheminFs,
+    plafond: u64,
+    garder: &CheminFs,
+    extension: &str,
+) -> Vec<String> {
+    let mut retirees = Vec::new();
     let Ok(entrees) = std::fs::read_dir(dossier) else {
-        return;
+        return retirees;
     };
     let mut fichiers: Vec<(PathBuf, u64, SystemTime)> = entrees
         .flatten()
-        .filter(|e| e.path().extension().is_some_and(|x| x == "png"))
+        .filter(|e| e.path().extension().is_some_and(|x| x == extension))
         .filter_map(|e| {
             let m = e.metadata().ok()?;
             m.is_file().then(|| {
@@ -243,7 +578,7 @@ pub(crate) fn evincer(dossier: &CheminFs, plafond: u64, garder: &CheminFs) {
         .collect();
     let mut total: u64 = fichiers.iter().map(|(_, l, _)| l).sum();
     if total <= plafond {
-        return;
+        return retirees;
     }
     fichiers.sort_by_key(|(_, _, quand)| *quand);
     for (chemin, longueur, _) in fichiers {
@@ -255,8 +590,12 @@ pub(crate) fn evincer(dossier: &CheminFs, plafond: u64, garder: &CheminFs) {
         }
         if std::fs::remove_file(&chemin).is_ok() {
             total -= longueur;
+            if let Some(nom) = chemin.file_name() {
+                retirees.push(nom.to_string_lossy().into_owned());
+            }
         }
     }
+    retirees
 }
 
 fn reponse(octets: Vec<u8>, cache: &'static str) -> Response {
@@ -274,3 +613,7 @@ fn reponse(octets: Vec<u8>, cache: &'static str) -> Response {
 #[cfg(test)]
 #[path = "spectrogramme_tests_7857.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "spectrogramme_conserve_tests_8160.rs"]
+mod tests_8160;

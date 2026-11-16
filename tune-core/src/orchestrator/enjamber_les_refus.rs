@@ -57,6 +57,23 @@ impl SensDuGeste {
 /// entièrement refusée.
 pub const PLAFOND_REFUS_ENJAMBES_PAR_GESTE: usize = 500;
 
+/// Tête du motif rendu quand le geste n'a trouvé AUCUN titre jouable :
+/// tous les titres de la file dans ce sens sont refusés par le service.
+pub const MOTIF_AUCUN_TITRE_JOUABLE: &str = "aucun titre jouable";
+
+/// #8227 — le nombre de titres refusés quand le geste n'a trouvé aucun titre
+/// jouable (motif de [`PlaybackOrchestrator::jouer_en_enjambant_les_refus`]),
+/// `None` pour toute autre cause.
+pub fn titres_refuses_sans_titre_jouable(cause: &str) -> Option<usize> {
+    cause
+        .strip_prefix(MOTIF_AUCUN_TITRE_JOUABLE)?
+        .strip_prefix(", ")?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
 /// Un titre sauté, tel qu'on le dit à l'utilisateur.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TitreSaute {
@@ -67,6 +84,13 @@ pub struct TitreSaute {
 
 /// La raison lisible d'un refus propre au titre.
 pub fn raison_du_refus(cause: &str) -> &'static str {
+    // #8088, #8611 — un refus du contrôle parental se dit comme tel.
+    if cause.contains(crate::db::politique_parentale::CODE_REFUS_CONTENU_BLOQUE) {
+        return "artiste bloqué par le contrôle parental";
+    }
+    if cause.contains(crate::db::politique_parentale::CODE_REFUS_EXPLICITE) {
+        return "contenu explicite interdit par le contrôle parental";
+    }
     if cause
         .to_lowercase()
         .contains(crate::source_url::MOTIF_PISTE_REFUSEE)
@@ -181,7 +205,7 @@ impl PlaybackOrchestrator {
 
             let aucun_jouable = || {
                 format!(
-                    "aucun titre jouable, {} titre(s) refusé(s) par le service \
+                    "{MOTIF_AUCUN_TITRE_JOUABLE}, {} titre(s) refusé(s) par le service \
                      ({cause})",
                     sautes.len()
                 )

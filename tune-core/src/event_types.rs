@@ -154,6 +154,11 @@ declarer_evenements! {
     /// (`actif: false`). Charge : `zone_id`, `renderer_volume`, `tune_volume`
     /// (fractions 0–1), `actif`.
     ZoneVolumeExterne => "zone.volume_externe", Emis;
+    /// #8422 — un AVIS pour l'auditeur, jamais une erreur : `zone_id`,
+    /// `code` stable (`pure_resumed_at_position` : une bascule PURE a dû
+    /// relancer le flux, repris à `position_ms` / `position`), `message` en
+    /// anglais (garde #7077) pour les clients qui ne traduisent pas le code, `fatal: false`.
+    ZoneNotice => "zone.notice", Emis;
     GroupCreated => "group.created", Emis;
     GroupUpdated => "group.updated", Emis;
     GroupDeleted => "group.deleted", Emis;
@@ -379,7 +384,7 @@ mod tests {
     fn toutes_couvre_l_enumeration_entiere() {
         assert_eq!(
             EventType::TOUTES.len(),
-            41,
+            42,
             "une variante a ete ajoutee ou retiree : mettre ce compte a jour APRES \
              avoir verifie son statut d'emission"
         );

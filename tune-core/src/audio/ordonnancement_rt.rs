@@ -415,14 +415,18 @@ mod linux {
         unsafe { libc::geteuid() == 0 }
     }
 
+    /// Les drapeaux de `mlockall` : UNE seule source, pour le verrouillage
+    /// initial ET pour son rétablissement après une purge (#8609).
+    pub const DRAPEAUX: libc::c_int = libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT;
+    pub const DRAPEAUX_NOMMES: &str = "MCL_CURRENT|MCL_FUTURE|MCL_ONFAULT";
+
     /// `mlockall(MCL_CURRENT | MCL_FUTURE | MCL_ONFAULT)`.
     pub fn verrouiller() -> VerrouillageMemoire {
         // SAFETY : appel sans pointeur ; au pire le noyau refuse.
-        let rc =
-            unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE | libc::MCL_ONFAULT) };
+        let rc = unsafe { libc::mlockall(DRAPEAUX) };
         if rc == 0 {
             VerrouillageMemoire::Verrouille {
-                flags: "MCL_CURRENT|MCL_FUTURE|MCL_ONFAULT",
+                flags: DRAPEAUX_NOMMES,
             }
         } else {
             VerrouillageMemoire::Refuse {
@@ -517,6 +521,129 @@ pub fn verrouiller_la_memoire_une_fois() -> &'static VerrouillageMemoire {
             VerrouillageMemoire::SansObjet
         }
     })
+}
+
+/// Banc et test seulement : pose le verrouillage de production SANS la
+/// décision (qui l'écarte sous une `RLIMIT_MEMLOCK` finie, même très grande).
+#[doc(hidden)]
+pub fn verrouiller_sans_decision_pour_un_banc() -> &'static VerrouillageMemoire {
+    VERROUILLAGE.get_or_init(|| {
+        #[cfg(target_os = "linux")]
+        {
+            linux::verrouiller()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            VerrouillageMemoire::SansObjet
+        }
+    })
+}
+
+// ---------------------------------------------------------------------------
+// #8609 — la purge mémoire sous `mlockall`.
+// ---------------------------------------------------------------------------
+//
+// Sous `MCL_CURRENT|MCL_FUTURE|MCL_ONFAULT` (Tune OS et `.deb` posent
+// `LimitMEMLOCK=infinity`), le noyau refuse `MADV_DONTNEED` sur les pages
+// verrouillées : `malloc_trim` ne rend RIEN (banc Shrek : 524 → 524 Mo).
+// Décision de Bertrand du 12/11 : le temps de la purge, et seulement
+// pendant, le verrou est levé (`munlockall`) puis reposé avec EXACTEMENT les
+// mêmes drapeaux. Banc : 525 → 144 Mo, purge de 94 à 172 ms, rappel de
+// rendu au pire 580 µs, aucune famine — le rappel ne fait pas de faute de
+// page (ses pages restent résidentes), il n'attend donc pas le verrou
+// `mmap` que prennent `munlockall`/`mlockall`.
+//
+// Un rétablissement qui échoue n'est jamais tu : ligne d'erreur, et nouvel
+// essai au relevé suivant ([`reverrouiller_si_en_attente`]) comme à la purge
+// suivante.
+
+/// Le rétablissement du verrou a échoué : à retenter.
+static REVERROUILLAGE_EN_ATTENTE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Ce que la purge a fait du verrou.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VerrouAutourDeLaPurge {
+    /// Le verrou de Tune a été levé le temps de la purge.
+    pub leve: bool,
+    /// Rétablissement refusé par le noyau (la cause) ; `None` s'il a réussi
+    /// ou s'il n'y avait rien à rétablir.
+    pub echec_du_retablissement: Option<String>,
+}
+
+/// `true` si c'est TUNE qui a verrouillé la mémoire (et pas une bibliothèque
+/// ou l'exploitant) : seul ce verrou-là se lève et se repose.
+pub fn verrou_pose_par_tune() -> bool {
+    matches!(
+        VERROUILLAGE.get(),
+        Some(VerrouillageMemoire::Verrouille { .. })
+    )
+}
+
+/// Joue `purge` en levant le verrou de Tune autour d'elle, s'il est posé et
+/// que `memoire_verrouillee` (VmLck > 0) le confirme. À appeler depuis la
+/// purge SEULEMENT, qui garantit qu'une seule tourne à la fois.
+pub fn purger_en_levant_le_verrou<T>(
+    memoire_verrouillee: bool,
+    purge: impl FnOnce() -> T,
+) -> (T, VerrouAutourDeLaPurge) {
+    #[cfg(target_os = "linux")]
+    {
+        if memoire_verrouillee && verrou_pose_par_tune() {
+            // SAFETY : appel sans pointeur.
+            unsafe { libc::munlockall() };
+            let resultat = purge();
+            let echec = retablir();
+            return (
+                resultat,
+                VerrouAutourDeLaPurge {
+                    leve: true,
+                    echec_du_retablissement: echec,
+                },
+            );
+        }
+    }
+    let _ = memoire_verrouillee;
+    (purge(), VerrouAutourDeLaPurge::default())
+}
+
+/// Repose le verrou avec les drapeaux de production. `Some(cause)` en cas
+/// d'échec — journalisé en erreur, et retenté au prochain passage.
+#[cfg(target_os = "linux")]
+fn retablir() -> Option<String> {
+    use std::sync::atomic::Ordering;
+    // SAFETY : appel sans pointeur ; au pire le noyau refuse.
+    if unsafe { libc::mlockall(linux::DRAPEAUX) } == 0 {
+        if REVERROUILLAGE_EN_ATTENTE.swap(false, Ordering::AcqRel) {
+            tracing::info!(
+                flags = linux::DRAPEAUX_NOMMES,
+                "local_audio_memory_lock — verrou rétabli après un échec (#8609)"
+            );
+        }
+        return None;
+    }
+    let cause = std::io::Error::last_os_error().to_string();
+    REVERROUILLAGE_EN_ATTENTE.store(true, Ordering::Release);
+    tracing::error!(
+        cause = %cause,
+        flags = linux::DRAPEAUX_NOMMES,
+        "local_audio_memory_lock — verrou NON rétabli après la purge mémoire, \
+         nouvel essai au prochain relevé (#8609)"
+    );
+    Some(cause)
+}
+
+/// Retente le rétablissement du verrou s'il a échoué à la dernière purge.
+/// Appelé à chaque relevé mémoire (cinq minutes) et à chaque purge. `true`
+/// s'il fallait le retenter ET qu'il a réussi.
+pub fn reverrouiller_si_en_attente() -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        if REVERROUILLAGE_EN_ATTENTE.load(std::sync::atomic::Ordering::Acquire) {
+            return retablir().is_none();
+        }
+    }
+    false
 }
 
 /// Lance [`verrouiller_la_memoire_une_fois`] sur un fil à part, une seule fois

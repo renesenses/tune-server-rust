@@ -591,6 +591,11 @@ pub fn gain_units_en_db(units: u32) -> f32 {
     to_db(units as f64 / 1000.0)
 }
 
+/// #8058 — un gain linéaire (1,0 = unité) en dB, plancher à −96 dB.
+pub fn gain_en_db(gain: f64) -> f32 {
+    to_db(gain)
+}
+
 fn to_db(linear: f64) -> f32 {
     if linear <= 0.0 {
         -96.0

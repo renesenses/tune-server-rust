@@ -495,7 +495,28 @@ async fn avtransport_control(
                     // lui sur la zone (ni son bail d'écoute) ; le profil actif
                     // du serveur s'applique.
                     state.playback.set_session_profile(zone_id, None).await;
-                    match state.orchestrator.play(req).await {
+                    // #8021 — une lecture envoyée par un point de contrôle sur
+                    // une zone d'un groupe part sur tout le groupe, comme
+                    // depuis Tune (#7717) : la zone prend la tête, le relais
+                    // fait suivre les autres au `started`. Refusée, la tête
+                    // revient à la meneuse d'avant. La reprise (au-dessus) et
+                    // l'enchaînement (`enchainer_la_suivante`) n'y comptent pas.
+                    let remplacees =
+                        crate::routes::zones::relais_de_groupe_6155::prendre_la_tete_du_groupe(
+                            &state, zone_id,
+                        );
+                    let lancement = state.orchestrator.play(req).await;
+                    if !lancement
+                        .as_ref()
+                        .is_ok_and(|result| result.sortie_refusee().is_none())
+                    {
+                        crate::routes::zones::relais_de_groupe_6155::rendre_la_tete_du_groupe(
+                            &state,
+                            zone_id,
+                            &remplacees,
+                        );
+                    }
+                    match lancement {
                         // #5574 — la sortie a REFUSÉ (renderer qui acquitte
                         // Play et garde l'ancien flux, URL injoignable…) :
                         // `play()` rend `Ok` avec l'erreur dans le résultat.
@@ -716,7 +737,15 @@ async fn renderingcontrol_control(
                     .set_volume(zone_id, f64::from(v) / 100.0, device_id.as_deref())
                     .await
                 {
-                    Ok(()) => upnp_renderer::empty_response("SetVolume"),
+                    Ok(()) => {
+                        // #8165 — le volume d'un point de contrôle est un
+                        // geste : il lève la sourdine de la zone.
+                        state
+                            .orchestrator
+                            .lever_la_sourdine_au_geste_de_volume(zone_id, device_id.as_deref())
+                            .await;
+                        upnp_renderer::empty_response("SetVolume")
+                    }
                     Err(error) => tune_core::upnp_server::soap_fault(701, &error.to_string()),
                 }
             }
@@ -1481,6 +1510,8 @@ async fn enchainer_la_suivante(state: &AppState, zone_id: i64) -> Option<Result<
 /// alimente le registre lu par le répondeur M-SEARCH.
 pub fn spawn_renderer_advertiser(state: AppState) {
     tokio::spawn(async move {
+        // #8189 — rien ne part avant l'ouverture de la découverte (iOS).
+        tune_core::discovery::porte_multicast::attendre().await;
         use std::net::{Ipv4Addr, SocketAddrV4};
         use tokio::net::UdpSocket;
         let bind = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
@@ -2048,6 +2079,10 @@ mod enchainement_par_la_zone_6335_tests;
 #[cfg(test)]
 #[path = "upnp_media_renderer_tests_8052.rs"]
 mod sink_dsd_de_la_zone_8052_tests;
+
+#[cfg(test)]
+#[path = "upnp_media_renderer_tests_8021.rs"]
+mod groupe_suit_le_point_de_controle_8021_tests;
 
 #[cfg(test)]
 mod publication_de_zone_4626_tests {

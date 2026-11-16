@@ -48,6 +48,17 @@ pub(crate) struct EqEnVol {
     /// le niveau d'avant l'égaliseur sans le dépasser (#6741 ; décision du
     /// 21/10, `EqProcessor::eteindre_le_preampli_garde`).
     pub(crate) flux_sans_fin: bool,
+    /// #8422 — le FORMAT du flux servi ne dépend d'aucun traitement : une
+    /// radio qu'on décode en WAV de toute façon (renderer désigné,
+    /// navigateur, codec ambigu, ou chemin OAAT de `decoder_la_radio_en_wav`). Faux pour une radio que Tune ne
+    /// décode QUE parce qu'un égaliseur est actif : sans lui (PURE), une
+    /// lecture fraîche passerait la station telle quelle, autre format.
+    pub(crate) format_independant_du_traitement: bool,
+    /// #8422 — le dernier dépôt vient d'une entrée en PURE : le préampli que
+    /// garde l'égaliseur coupé remonte jusqu'au signal SEC, sans la borne de
+    /// volume de #6741, pour que la chaîne se vide et rende les octets
+    /// décodés tels quels.
+    vers_le_sec: std::sync::atomic::AtomicBool,
     /// #6741 — volume de la zone (millièmes, sans trim), tenu à jour par
     /// l'orchestrateur à chaque consigne ; `u32::MAX` : inconnu.
     volume_zone: AtomicU32,
@@ -68,6 +79,8 @@ impl Default for EqEnVol {
             cuit_seulement_l_egaliseur: false,
             compensation_cuite: false,
             flux_sans_fin: false,
+            format_independant_du_traitement: false,
+            vers_le_sec: std::sync::atomic::AtomicBool::new(false),
             volume_zone: AtomicU32::new(VOLUME_INCONNU),
             volume_avant: AtomicU32::new(VOLUME_INCONNU),
         }
@@ -126,11 +139,20 @@ impl EqEnVol {
         }
     }
 
-    /// Le poste d'un flux radio décodé par Tune.
+    /// Le poste d'un flux radio décodé par Tune, quel que soit le réglage.
     pub(crate) fn pour_la_radio() -> std::sync::Arc<Self> {
+        Self::pour_la_radio_servie(true)
+    }
+
+    /// #8422 — le poste d'un flux radio, en disant si Tune le décoderait
+    /// encore sans égaliseur (`format_independant_du_traitement`).
+    pub(crate) fn pour_la_radio_servie(
+        format_independant_du_traitement: bool,
+    ) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {
             cuit_seulement_l_egaliseur: true,
             flux_sans_fin: true,
+            format_independant_du_traitement,
             ..Default::default()
         })
     }
@@ -147,7 +169,21 @@ impl EqEnVol {
     /// plus récent remplace celui qui n'a pas encore été relevé : seul le
     /// dernier réglage compte.
     pub(crate) fn poser(&self, profil: Option<EqProfile>) {
-        *self.attente.lock().unwrap_or_else(|e| e.into_inner()) = Some(profil);
+        let mut attente = self.attente.lock().unwrap_or_else(|e| e.into_inner());
+        self.vers_le_sec.store(false, Ordering::SeqCst);
+        *attente = Some(profil);
+        self.poses.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// #8422 — l'entrée en PURE, déposée en vol : couper l'égaliseur ET
+    /// rendre le signal sec. Le fondu de #5215 efface la courbe, puis le
+    /// préampli gardé remonte jusqu'à 0 dB à la vitesse de #6741 (aucune
+    /// marche), sans la borne de volume ; revenu à 0 dB, le neutre quitte la
+    /// chaîne et le flux redevient les octets décodés, à l'échantillon près.
+    pub(crate) fn poser_vers_le_sec(&self) {
+        let mut attente = self.attente.lock().unwrap_or_else(|e| e.into_inner());
+        self.vers_le_sec.store(true, Ordering::SeqCst);
+        *attente = Some(None);
         self.poses.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -168,9 +204,13 @@ impl EqEnVol {
         {
             *courant = None;
         }
-        let depose = match self.attente.try_lock() {
-            Ok(mut g) => g.take(),
-            Err(_) => None,
+        let (depose, vers_le_sec) = match self.attente.try_lock() {
+            Ok(mut g) => {
+                let depose = g.take();
+                let sec = depose.is_some() && self.vers_le_sec.swap(false, Ordering::SeqCst);
+                (depose, sec)
+            }
+            Err(_) => (None, false),
         };
         let Some(profil) = depose else {
             self.suivre_le_niveau_d_avant(courant);
@@ -181,6 +221,10 @@ impl EqEnVol {
             .filter(EqProcessor::is_enabled);
         let actif = neuf.is_some();
         *courant = EqProcessor::prendre_la_releve(neuf, courant.take());
+        if vers_le_sec && let Some(eq) = courant.as_mut() {
+            // Avant l'extinction ci-dessous : sa cible est alors le sec.
+            eq.liberer_le_gain_garde();
+        }
         self.suivre_le_niveau_d_avant(courant);
         if self.flux_sans_fin
             && let Some(eq) = courant.as_mut()
@@ -542,6 +586,62 @@ mod tests {
         assert!(
             (garde.db - preampli).abs() < 0.3,
             "gardé {garde:?}, attendu {preampli:.2} dB : sans consigne connue, rien ne remonte"
+        );
+    }
+
+    /// #8422 — l'entrée en PURE déposée en vol rend le signal SEC, à
+    /// l'échantillon près, même quand la consigne de volume est inconnue (là
+    /// où une simple coupure garde le préampli, #6708) : la chaîne se vide,
+    /// sans marche, et rien ne dépasse le niveau d'avant l'égaliseur.
+    #[test]
+    fn entree_en_pure_en_vol_rend_le_signal_sec_a_l_echantillon_pres_8422() {
+        let mut radio = RadioFactice::new();
+        let avant = rms_f32(&radio.passer(8));
+        radio.poste.poser(Some(profil()));
+        radio.passer(20);
+        assert!(
+            radio.eq.as_ref().and_then(|e| e.preamp_db(0)).unwrap() < -1.0,
+            "prémisse : l'égaliseur porte une réserve"
+        );
+        radio.poste.poser_vers_le_sec();
+        // 300 ms de fondu, puis la remontée du préampli à 2 dB/s : 8 s jouées.
+        for n in 0..350 {
+            let bloc_db = 20.0 * (rms_f32(&radio.passer(1)) / avant).log10();
+            assert!(bloc_db < 0.1, "{bloc_db:+.2} dB au bloc {n} : dépassement");
+        }
+        assert!(radio.eq.is_none(), "PURE : plus aucun étage dans la chaîne");
+        let debut = radio.position;
+        let servi = radio.passer(4);
+        let sec: Vec<f32> = (debut..debut + 4 * RadioFactice::BLOC)
+            .map(|i| {
+                (0.25 * (2.0 * std::f64::consts::PI * 1000.0 * i as f64 / f64::from(SR)).sin())
+                    as f32
+            })
+            .collect();
+        assert_eq!(servi, sec, "PURE : les échantillons décodés, tels quels");
+        let saut_sinus = 0.25 * 2.0 * std::f32::consts::PI * 1000.0 / SR as f32;
+        assert!(
+            radio.plus_grand_saut() < 1.5 * saut_sinus * 10f32.powf(9.0 / 20.0),
+            "marche audible pendant l'entrée en PURE"
+        );
+    }
+
+    /// #8422 — un dépôt ordinaire qui arrive avant la relève remplace une
+    /// entrée en PURE : une simple coupure (ici, consigne de volume inconnue)
+    /// garde le préampli comme avant (#6708), sans hériter de la remontée
+    /// vers le sec.
+    #[test]
+    fn un_depot_ordinaire_efface_la_demande_de_signal_sec_8422() {
+        let mut radio = RadioFactice::new();
+        radio.passer(8);
+        radio.poste.poser(Some(profil()));
+        radio.passer(20);
+        radio.poste.poser_vers_le_sec();
+        radio.poste.poser(None);
+        radio.passer(350);
+        assert!(
+            radio.eq.as_ref().and_then(|e| e.preampli_garde()).is_some(),
+            "coupure ordinaire : le préampli reste gardé, la demande de sec est oubliée"
         );
     }
 

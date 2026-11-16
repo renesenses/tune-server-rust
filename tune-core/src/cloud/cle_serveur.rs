@@ -188,6 +188,27 @@ pub async fn inscrire_si_besoin(
     if !laissez_passer_actif(&reglages) {
         return Ok(false);
     }
+    inscrire(backend, site, false).await
+}
+
+/// Réinscrit la clé du serveur sur le compte, même si elle est notée
+/// inscrite et même si le relais n'a encore rien annoncé : le relais vient de
+/// refuser le serveur parce que le site connaît une AUTRE clé pour ce
+/// `server_id` (#7714). `Ok(false)` : serveur non relié (pas de session SSO
+/// ou pas de jeton de liaison), rien n'est envoyé.
+pub async fn reinscrire(
+    backend: &Arc<dyn DbBackend>,
+    site: &dyn InscriptionDeCle,
+) -> Result<bool, String> {
+    inscrire(backend, site, true).await
+}
+
+async fn inscrire(
+    backend: &Arc<dyn DbBackend>,
+    site: &dyn InscriptionDeCle,
+    forcer: bool,
+) -> Result<bool, String> {
+    let reglages = SettingsRepo::with_backend(backend.clone());
     let Some(cle) = cle_existante(backend)? else {
         return Ok(false);
     };
@@ -206,7 +227,7 @@ pub async fn inscrire_si_besoin(
         return Ok(false);
     };
     let public_key = cle.cle_publique();
-    if lire(CLE_INSCRITE).as_deref() == Some(public_key.as_str()) {
+    if !forcer && lire(CLE_INSCRITE).as_deref() == Some(public_key.as_str()) {
         return Ok(false);
     }
     let preuve = cle.signer(&tune_laissez_passer::message_inscription_serveur(

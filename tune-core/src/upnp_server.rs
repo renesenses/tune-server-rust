@@ -42,6 +42,112 @@ pub(crate) use dossiers::{CleAlphabetique, cle_alphabetique};
 pub use dossiers::comparer_naturel;
 
 // ---------------------------------------------------------------------------
+// Annonce du serveur multimédia : réglage en base, variable en repli (#8374)
+// ---------------------------------------------------------------------------
+
+/// Variable d'environnement qui fixe la VALEUR PAR DÉFAUT de l'annonce du
+/// serveur multimédia (`true`/`1`/`yes` = annoncé, tout le reste = tu).
+///
+/// #8374 — elle était lue par `tune_core::config::TuneConfig::from_env`,
+/// que le serveur n'appelle jamais : la poser ne coupait rien. Elle ne
+/// vaut QUE lorsque la clé `upnp_enabled` est absente de la base ; posée
+/// depuis l'interface (POST /api/v1/upnp/config), la clé l'emporte.
+pub const VARIABLE_ANNONCE: &str = "TUNE_UPNP_SERVER_ENABLED";
+
+/// Variable d'environnement qui fixe le nom publié PAR DÉFAUT du serveur
+/// multimédia. Même règle : la clé `upnp_friendly_name` en base l'emporte.
+pub const VARIABLE_NOM: &str = "TUNE_UPNP_SERVER_NAME";
+
+/// Nom publié quand ni la base ni l'environnement n'en donnent un.
+///
+/// #8189 — ce n'est plus la constante « Tune Server », identique sur toutes
+/// les machines (quatre Tune d'un réseau s'affichaient sous ce même nom) :
+/// c'est `Tune (<nom>)`, avec `server_name` s'il est réglé, sinon le nom de
+/// l'appareil, suffixé par l'UDN s'il est générique.
+pub fn nom_par_defaut(server_name: Option<&str>, udn: &str) -> String {
+    crate::discovery::nom_annonce::nom_de_service(&crate::discovery::nom_annonce::nom_annonce(
+        server_name,
+        udn,
+    ))
+}
+
+/// L'annonce SSDP du serveur multimédia est-elle voulue ?
+///
+/// Clé `upnp_enabled` en base d'abord ; sinon `TUNE_UPNP_SERVER_ENABLED` ;
+/// sinon oui.
+pub fn annonce_voulue(settings: &crate::db::settings_repo::SettingsRepo) -> bool {
+    annonce_voulue_avec(settings, std::env::var(VARIABLE_ANNONCE).ok().as_deref())
+}
+
+/// Même décision, la variable d'environnement passée en paramètre — c'est la
+/// forme que les épreuves exercent : `std::env::set_var` dans un test casse
+/// la suite entière.
+pub fn annonce_voulue_avec(
+    settings: &crate::db::settings_repo::SettingsRepo,
+    variable: Option<&str>,
+) -> bool {
+    annonce_voulue_selon(
+        settings.get("upnp_enabled").ok().flatten().as_deref(),
+        variable,
+    )
+}
+
+/// La règle pure : la clé en base l'emporte, la variable est le repli, et
+/// sans l'une ni l'autre le serveur s'annonce.
+pub fn annonce_voulue_selon(cle_en_base: Option<&str>, variable: Option<&str>) -> bool {
+    match cle_en_base.map(str::trim).filter(|v| !v.is_empty()) {
+        // Sémantique historique de la clé (POST /api/v1/upnp/config écrit
+        // `true` ou `false`) : seuls `false` et `0` coupent.
+        Some(v) => v != "false" && v != "0",
+        // Sémantique de `config::env_bool` : seuls `true`, `1` et `yes`
+        // allument ; une variable posée à autre chose coupe.
+        None => match variable.map(str::trim).filter(|v| !v.is_empty()) {
+            Some(v) => matches!(v.to_lowercase().as_str(), "true" | "1" | "yes"),
+            None => true,
+        },
+    }
+}
+
+/// Le nom publié du serveur multimédia.
+///
+/// Clé `upnp_friendly_name` en base d'abord ; sinon `TUNE_UPNP_SERVER_NAME` ;
+/// sinon `Tune (<nom>)` ([`nom_par_defaut`], #8189). Un nom vide ou blanc
+/// ne compte pas.
+pub fn nom_publie(settings: &crate::db::settings_repo::SettingsRepo) -> String {
+    nom_publie_avec(settings, std::env::var(VARIABLE_NOM).ok().as_deref())
+}
+
+/// Même décision, la variable d'environnement passée en paramètre.
+pub fn nom_publie_avec(
+    settings: &crate::db::settings_repo::SettingsRepo,
+    variable: Option<&str>,
+) -> String {
+    nom_publie_selon(
+        settings.get("upnp_friendly_name").ok().flatten().as_deref(),
+        variable,
+        || {
+            let udn = settings.get("upnp_udn").ok().flatten().unwrap_or_default();
+            let reglage = settings.get("server_name").ok().flatten();
+            nom_par_defaut(reglage.as_deref(), &udn)
+        },
+    )
+}
+
+/// La règle pure du nom : clé en base, puis variable, puis nom par défaut —
+/// celui-ci n'est calculé que si ni la clé ni la variable ne donnent un nom.
+pub fn nom_publie_selon(
+    cle_en_base: Option<&str>,
+    variable: Option<&str>,
+    defaut: impl FnOnce() -> String,
+) -> String {
+    cle_en_base
+        .filter(|v| !v.trim().is_empty())
+        .or_else(|| variable.filter(|v| !v.trim().is_empty()))
+        .map(str::to_string)
+        .unwrap_or_else(defaut)
+}
+
+// ---------------------------------------------------------------------------
 // Shared state for UPnP routes
 // ---------------------------------------------------------------------------
 
@@ -231,13 +337,11 @@ impl UpnpState {
         };
         // Le nom publié suit le réglage `upnp_friendly_name` (POST
         // /api/v1/upnp/config) — il était écrit mais jamais lu, renommer le
-        // serveur depuis l'interface n'avait aucun effet.
-        let friendly_name = settings
-            .get("upnp_friendly_name")
-            .ok()
-            .flatten()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "Tune Server".into());
+        // serveur depuis l'interface n'avait aucun effet. Sans clé en base,
+        // `TUNE_UPNP_SERVER_NAME` donne le nom par défaut (#8374), et sans
+        // l'une ni l'autre c'est `Tune (<nom>)` (#8189) : `server_name`, sinon
+        // le nom de l'appareil, suffixé par l'UDN posé juste au-dessus.
+        let friendly_name = nom_publie(&settings);
         Self {
             backend,
             server_port,
@@ -3950,6 +4054,8 @@ pub async fn spawn_ssdp_advertiser(uuid: String, port: u16, advertised_ip: Optio
     use tokio::net::UdpSocket;
 
     tokio::spawn(async move {
+        // #8189 — rien ne part avant l'ouverture de la découverte (iOS).
+        crate::discovery::porte_multicast::attendre().await;
         let bind_addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
         let socket = match UdpSocket::bind(bind_addr).await {
             Ok(s) => s,
@@ -6046,6 +6152,26 @@ mod tests {
         }
     }
 
+    /// #8189 × #8374 — l'ordre du nom publié : clé en base, puis
+    /// `TUNE_UPNP_SERVER_NAME`, puis le défaut `Tune (<nom>)`, qui n'est
+    /// calculé qu'en dernier recours.
+    #[test]
+    fn le_nom_publie_suit_la_cle_puis_la_variable_puis_tune_nom() {
+        let defaut = || nom_par_defaut(Some("Salon"), "uuid:abcd");
+        assert_eq!(
+            nom_publie_selon(Some("Cuisine"), Some("Env"), defaut),
+            "Cuisine"
+        );
+        assert_eq!(nom_publie_selon(Some("  "), Some("Env"), defaut), "Env");
+        assert_eq!(nom_publie_selon(None, Some("Env"), defaut), "Env");
+        assert_eq!(nom_publie_selon(None, Some(" "), defaut), "Tune (Salon)");
+        assert_eq!(nom_publie_selon(None, None, defaut), "Tune (Salon)");
+        assert_eq!(
+            nom_publie_selon(Some("Cuisine"), None, || panic!("défaut calculé pour rien")),
+            "Cuisine"
+        );
+    }
+
     /// Le nom du serveur est reglable — il n'etait pas echappe dans
     /// `description.xml`.
     ///
@@ -6054,6 +6180,38 @@ mod tests {
     /// illegal. Or #2183 tient sur cette etape : « le MediaServer est vu,
     /// DECRIT et appaire » — un point de controle qui ne parse pas le
     /// descriptif ne voit pas le serveur du tout.
+    /// #8189 — sans `upnp_friendly_name`, le nom publié n'est plus la
+    /// constante « Tune Server » (quatre Tune d'un réseau s'affichaient sous
+    /// ce même nom) : c'est `Tune (<server_name>)`, sinon le nom de
+    /// l'appareil ; le réglage explicite garde la priorité.
+    #[test]
+    fn le_nom_publie_par_defaut_distingue_les_serveurs() {
+        use crate::db::sqlite::SqliteDb;
+        let neuf = || {
+            let db = SqliteDb::open_in_memory().unwrap();
+            db.init_schema().unwrap();
+            crate::db::migrations::run_migrations(&db).unwrap();
+            let backend: Arc<dyn DbBackend> = Arc::new(db);
+            backend
+        };
+        let b = neuf();
+        crate::db::settings_repo::SettingsRepo::with_backend(b.clone())
+            .set("server_name", "Salon")
+            .unwrap();
+        assert_eq!(
+            UpnpState::new(b.clone(), 8888, None).friendly_name,
+            "Tune (Salon)"
+        );
+        crate::db::settings_repo::SettingsRepo::with_backend(b.clone())
+            .set("upnp_friendly_name", "Mon DLNA")
+            .unwrap();
+        assert_eq!(UpnpState::new(b, 8888, None).friendly_name, "Mon DLNA");
+
+        let sans_reglage = UpnpState::new(neuf(), 8888, None).friendly_name;
+        assert_ne!(sans_reglage, "Tune Server");
+        assert!(sans_reglage.starts_with("Tune ("), "{sans_reglage}");
+    }
+
     #[test]
     fn le_nom_du_serveur_ne_casse_plus_son_descriptif() {
         use crate::db::sqlite::SqliteDb;
@@ -6078,10 +6236,17 @@ mod tests {
         let db2 = SqliteDb::open_in_memory().unwrap();
         db2.init_schema().unwrap();
         crate::db::migrations::run_migrations(&db2).unwrap();
-        let state2 = UpnpState::new(Arc::new(db2), 8888, Some("192.168.1.18".into()));
+        // #8189 — le défaut n'est plus la constante « Tune Server » (voir
+        // `le_nom_publie_par_defaut_distingue_les_serveurs`) : le témoin pose
+        // un nom ordinaire.
+        let backend2: Arc<dyn DbBackend> = Arc::new(db2);
+        crate::db::settings_repo::SettingsRepo::with_backend(backend2.clone())
+            .set("upnp_friendly_name", "Salon")
+            .unwrap();
+        let state2 = UpnpState::new(backend2, 8888, Some("192.168.1.18".into()));
         assert!(
-            build_device_description(&state2).contains("<friendlyName>Tune Server</friendlyName>"),
-            "le nom par defaut a bouge"
+            build_device_description(&state2).contains("<friendlyName>Salon</friendlyName>"),
+            "un nom ordinaire doit traverser inchangé"
         );
     }
 

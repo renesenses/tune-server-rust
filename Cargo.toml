@@ -56,8 +56,23 @@ async-trait = "0.1"
 bytes = "1"
 axum = { version = "0.8", features = ["ws", "multipart"] }
 tower-http = { version = "0.6", features = ["cors", "compression-gzip", "trace", "fs"] }
-sqlx = { version = "0.9", features = ["runtime-tokio", "sqlite", "postgres"] }
-rusqlite = { version = "0.39", features = ["bundled", "functions"] }
+# #8196 (RUSTSEC-2026-0459 / CVE-2026-119375) : rusqlite 0.41 embarque SQLite
+# 3.54.0 par libsqlite3-sys 0.39. Un seul libsqlite3-sys peut exister dans le
+# verrou (`links = "sqlite3"`), et sqlx-sqlite 0.9.0 exige `< 0.38` : les deux
+# ne se resolvent pas ensemble, et aucun sqlx publie ne lit 0.39 (main l'admet,
+# sans publication). Aucun code ne lit SQLite par sqlx (seul le cote PostgreSQL
+# de la migration et du moteur l'emploie), donc la feature `sqlite` est RETIREE.
+#
+# `default-features = false` n'est pas du zele : les features par defaut de
+# sqlx (`any`, `macros`, `migrate`, `json`) nomment `sqlx-sqlite?/...` en
+# dependance faible, et cargo inscrit QUAND MEME la caisse dans le verrou
+# (limite connue du resolveur) — donc le meme conflit `links`. Mesure sur
+# Shrek le 10/11/2026 : seul `["runtime-tokio", "postgres"]` se resout. Le
+# code n'emploie ni macro `query!`, ni `migrate!`, ni `Any`, ni
+# `sqlx::types::Json` (retire de tune-cli/src/migrate.rs). Un test de
+# `tune-core` (sqlite.rs) rougit si la version embarquee retombe sous 3.54.0.
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres"] }
+rusqlite = { version = "0.41", features = ["bundled", "functions"] }
 urlencoding = "2"
 toml = "0.8"
 cpal = "0.17"

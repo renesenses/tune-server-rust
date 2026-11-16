@@ -1048,74 +1048,66 @@ async fn la_recherche_libre_narrow_le_rail_comme_la_liste() {
     }
 }
 
-/// #1821 — le rail « Genre » d'Oxygen doit annoncer les genres SECONDAIRES.
-///
-/// DEvir, ambassadeur : « songs purchased from different platforms or labels
-/// end up being categorized under different genres ». La cause mesurée est
-/// l'encodage du tag, pas le vocabulaire des marchands : « ce disque est du
-/// Jazz ET de la Fusion » s'écrit soit en plusieurs valeurs (Vorbis, MP4,
-/// ID3v2.4), soit en une chaîne séparée (ID3v2.3), et Tune ne rangeait le
-/// disque sous ses deux genres que dans le second cas.
-///
-/// Côté serveur, le rail groupait sur la seule colonne `t.genre` tandis que son
-/// filtre jumeau testait AUSSI le tableau `t.genres` : « Fusion » n'était donc
-/// proposé par aucune carte, alors que le cocher aurait bien rendu des pistes.
+/// #5638 : un genre secondaire ne classe plus une piste ni son album.
 #[tokio::test]
-async fn le_rail_genre_annonce_les_genres_secondaires() {
+async fn genre_principal_5638_rail_exclut_les_secondaires() {
     let app = bibliotheque_contrat_facettes();
-
     let (status, facettes) = get(&app, "/api/v1/library/facets?fields=genre&limit=0").await;
     assert_eq!(status, StatusCode::OK);
     let rail = effectifs(&facettes, "genre");
-
-    // « Fusion » n'est le genre PRINCIPAL d'aucune piste : il ne vit que dans
-    // le tableau multivalué. Il doit malgré tout être proposé.
-    let fusion = rail
-        .iter()
-        .find(|(v, _)| v.eq_ignore_ascii_case("Fusion"))
-        .unwrap_or_else(|| panic!("« Fusion » absent du rail : {rail:?}"));
-
-    // Les DEUX pistes qui le portent, quelle que soit la casse écrite dans le
-    // tableau : c'est la même intention, gravée par deux logiciels différents.
-    assert_eq!(
-        fusion.1, 2,
-        "« Fusion » doit compter les deux gravures : {rail:?}"
+    assert!(
+        rail.iter()
+            .all(|(v, _)| !v.eq_ignore_ascii_case("Fusion") && !v.eq_ignore_ascii_case("Jazzy")),
+        "un genre secondaire ne doit pas apparaître dans le rail : {rail:?}"
     );
-
-    // Et le compteur ne ment pas : cocher la carte rend exactement ce nombre.
-    let encodee = urlencoding::encode(&fusion.0);
-    let (status, pistes) = get(
-        &app,
-        &format!("/api/v1/library/tracks?limit=1000&genre={encodee}"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        total(&pistes),
-        fusion.1,
-        "le rail annonce {} pour « {} », la liste en rend {}",
-        fusion.1,
-        fusion.0,
-        total(&pistes)
-    );
-
-    // La piste 91008 porte « Jazz » ET « Fusion » : elle compte une fois dans
-    // chaque carte, jamais deux fois dans la même.
     let jazz = rail
         .iter()
         .find(|(v, _)| v.eq_ignore_ascii_case("Jazz"))
-        .unwrap_or_else(|| panic!("« Jazz » absent du rail : {rail:?}"));
-    let encodee = urlencoding::encode(&jazz.0);
-    let (_, pistes) = get(
-        &app,
-        &format!("/api/v1/library/tracks?limit=1000&genre={encodee}"),
-    )
-    .await;
+        .expect("genre principal Jazz");
+    let (_, pistes) = get(&app, "/api/v1/library/tracks?limit=1000&genre=jazz").await;
+    assert_eq!(
+        jazz.1, 4,
+        "la casse ne doit pas dédoubler le genre principal"
+    );
     assert_eq!(
         total(&pistes),
         jazz.1,
-        "« Jazz » : rail {} contre liste {}",
-        jazz.1,
-        total(&pistes)
+        "compteur et liste doivent rester identiques"
     );
+}
+
+/// Un filtre enregistré ne doit pas retrouver les anciens genres secondaires.
+#[tokio::test]
+async fn genre_principal_5638_liste_et_albums_excluent_les_secondaires() {
+    let app = bibliotheque_contrat_facettes();
+    for genre in ["Fusion", "FUSION", "Jazzy"] {
+        let (_, pistes) = get(
+            &app,
+            &format!("/api/v1/library/tracks?limit=1000&genre={genre}"),
+        )
+        .await;
+        assert_eq!(
+            total(&pistes),
+            0,
+            "genre secondaire {genre} retenu dans la liste"
+        );
+        let (_, albums) = get(
+            &app,
+            &format!("/api/v1/library/albums-detailed?genre={genre}"),
+        )
+        .await;
+        assert_eq!(
+            albums["total"], 0,
+            "genre secondaire {genre} retenu dans les albums : {albums}"
+        );
+        let (_, autres) = get(
+            &app,
+            &format!("/api/v1/library/facets?fields=format&genre={genre}"),
+        )
+        .await;
+        assert!(
+            effectifs(&autres, "format").is_empty(),
+            "les compteurs des autres facettes doivent suivre : {autres}"
+        );
+    }
 }

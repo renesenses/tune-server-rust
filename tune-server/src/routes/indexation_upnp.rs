@@ -1242,6 +1242,19 @@ fn ecrire(
     retirer_les_albums_vides(state, udn, bilan);
 }
 
+/// La requête de [`retirer_les_albums_vides`], `param` étant le marqueur du
+/// filtre `LIKE` propre au moteur (`?` ou `$1`).
+pub(crate) fn sql_retrait_des_albums_vides(param: &str) -> String {
+    format!(
+        "DELETE FROM albums WHERE source = '{SOURCE_UPNP}' \
+         AND source_id LIKE {param} ESCAPE '!' \
+         AND NOT EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = albums.id) \
+         AND NOT EXISTS (SELECT 1 FROM favorites f WHERE f.item_type = 'album' \
+         AND {favori})",
+        favori = super::synchronisation_upnp::favori_designe("albums.id"),
+    )
+}
+
 /// 🔴 #4581 — les coquilles que les passes précédentes ont laissées.
 ///
 /// Un album distant SANS AUCUNE PISTE n'est rien : pas de pochette, pas de
@@ -1269,13 +1282,7 @@ fn retirer_les_albums_vides(state: &AppState, udn: &str, bilan: &mut Bilan) {
         tune_core::db::engine::Engine::Sqlite => "?",
         tune_core::db::engine::Engine::Postgres => "$1",
     };
-    let sql = format!(
-        "DELETE FROM albums WHERE source = '{SOURCE_UPNP}' \
-         AND source_id LIKE {param} ESCAPE '!' \
-         AND NOT EXISTS (SELECT 1 FROM tracks t WHERE t.album_id = albums.id) \
-         AND NOT EXISTS (SELECT 1 FROM favorites f WHERE f.item_type = 'album' \
-         AND f.item_id = CAST(albums.id AS TEXT))"
-    );
+    let sql = sql_retrait_des_albums_vides(param);
     match state.backend.execute(&sql, &[&filtre as &dyn ToSqlValue]) {
         Ok(retires) => bilan.albums_vides_retires = retires,
         Err(e) => bilan

@@ -248,9 +248,9 @@ mod tests {
         (obtenu as f64 - attendu).abs() <= attendu * 0.002 + 512.0
     }
 
-    /// Contre-épreuve incluse : le décodage DIRECT à 192 kHz — ce que faisait
-    /// le convertisseur — rend 5 % d'échantillons de trop. Le nouveau chemin
-    /// rend la bonne durée.
+    /// Le décodage DIRECT à 192 kHz rendait 5 % d'échantillons de trop (rapport
+    /// tronqué) ; depuis #8428, `decode_to_pcm` décime lui-même dans la
+    /// famille puis rééchantillonne : les deux chemins rendent la bonne durée.
     #[test]
     fn un_dsd64_converti_en_192_khz_garde_sa_duree() {
         let dir = tempfile::tempdir().unwrap();
@@ -261,11 +261,11 @@ mod tests {
 
         let direct = decode_to_pcm(entree, Some(192_000), None, 0.0, f64::MAX).unwrap();
         let par_canal_direct = direct.samples_i32.len() / direct.channels as usize;
+        assert_eq!(direct.sample_rate, 192_000);
         assert!(
-            !assez_proche(par_canal_direct, 192_000.0),
-            "contre-épreuve : le décodage direct à 192 kHz devait être faux, il rend {par_canal_direct}"
+            assez_proche(par_canal_direct, 192_000.0),
+            "#8428 : le décodage direct à 192 kHz doit garder la durée, il rend {par_canal_direct}"
         );
-        assert!(assez_proche(par_canal_direct, 201_600.0));
 
         let d = decoder_un_dsd(entree, DSD64, Some(192_000)).unwrap();
         assert_eq!(d.sample_rate, 192_000);

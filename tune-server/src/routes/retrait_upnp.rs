@@ -86,11 +86,13 @@ fn borne(alias: &str, prefixe: &str) -> String {
 
 /// La même expression de liens utilisateur que `synchronisation_upnp`, mais
 /// pour COMPTER au lieu d'interdire.
-fn lien_favori(alias: &str) -> String {
+pub(crate) fn lien_favori(alias: &str) -> String {
     format!(
         "EXISTS (SELECT 1 FROM favorites f WHERE
-            (f.item_type = 'track' AND f.item_id = CAST({alias}.id AS TEXT))
-            OR (f.item_type = 'album' AND f.item_id = CAST({alias}.album_id AS TEXT)))"
+            (f.item_type = 'track' AND {piste})
+            OR (f.item_type = 'album' AND {album}))",
+        piste = super::synchronisation_upnp::favori_designe(&format!("{alias}.id")),
+        album = super::synchronisation_upnp::favori_designe(&format!("{alias}.album_id")),
     )
 }
 fn lien_playlist(alias: &str) -> String {

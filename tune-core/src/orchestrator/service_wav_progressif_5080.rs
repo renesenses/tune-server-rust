@@ -41,7 +41,7 @@ use tokio::sync::Mutex;
 
 const FIXTURE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac");
 
-fn orchestrateur() -> PlaybackOrchestrator {
+pub(super) fn orchestrateur() -> PlaybackOrchestrator {
     let db = SqliteDb::open_in_memory().unwrap();
     db.init_schema().unwrap();
     run_migrations(&db).unwrap();
@@ -163,7 +163,7 @@ pub(super) async fn cdn_muet() -> (String, tokio::sync::watch::Sender<bool>) {
 }
 
 /// Un CDN qui sert le FLAC de test en `Range`, comme Qobuz.
-async fn cdn_par_range() -> String {
+pub(super) async fn cdn_par_range() -> String {
     let octets: Arc<Vec<u8>> = Arc::new(std::fs::read(FIXTURE).unwrap());
     let app = Router::new().route(
         "/piste.flac",
@@ -309,7 +309,7 @@ async fn le_wav_progressif_d_un_service_porte_l_egaliseur_de_la_zone_5080() {
 
     let attendu_brut = brut.pcm_bytes();
     let mut attendu = attendu_brut.clone();
-    orch.load_streaming_dsp(zone_id, None, sr, 2)
+    orch.load_streaming_dsp(zone_id, crate::audio::replaygain::PisteRg::AUCUNE, sr, 2)
         .process(&mut attendu, bd);
     assert_ne!(
         attendu, attendu_brut,

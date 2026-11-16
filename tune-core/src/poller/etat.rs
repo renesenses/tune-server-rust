@@ -54,6 +54,12 @@ pub(super) struct ZonePollState {
     /// Last polled position in milliseconds — used to detect position
     /// resets (jumps from >30s to <5s) that signal a gapless transition.
     pub(super) last_position_ms: u64,
+    /// #7293 — l'instant où `last_position_ms` a été relevé. Le sondeur est
+    /// une tâche pour toutes les zones : un appareil lent ailleurs écarte
+    /// deux relevés de bien plus qu'une seconde, et la fenêtre « position
+    /// sous 5 s » d'un enchaînement se saute. L'écart depuis ce relevé
+    /// élargit cette fenêtre d'autant (`decisions::pres_du_debut_apres_le_releve`).
+    pub(super) dernier_releve_de_position_at: Option<Instant>,
     /// Peak position reached in the current track — high-water mark used
     /// to verify that enough of the track was actually played before
     /// accepting a gapless transition.
@@ -274,6 +280,9 @@ pub(super) struct ZonePollState {
     /// #7922 — la position et l'instant du dernier relevé compté ; `None`
     /// après un déplacement, une pause ou un changement de piste.
     pub(super) tune_tested_releve: Option<(u64, Instant)>,
+    /// #8483 — la position d'une sortie `Playing` qui ne bouge plus, pour
+    /// reconnaître le gel sur la coupure connue d'un fichier abîmé.
+    pub(super) gel_sur_coupure: Option<super::fichier_abime_8483::SuiviDuGel>,
 }
 
 impl ZonePollState {
@@ -301,6 +310,7 @@ impl ZonePollState {
             last_radio_poll: Instant::now(),
             gapless_sent_at: None,
             last_position_ms: 0,
+            dernier_releve_de_position_at: None,
             peak_position_ms: 0,
             scrobbled_key: None,
             ticks_since_db_save: 0,
@@ -339,6 +349,7 @@ impl ZonePollState {
             octets_du_demarrage: None,
             tune_tested_rendu_ms: 0,
             tune_tested_releve: None,
+            gel_sur_coupure: None,
         }
     }
 

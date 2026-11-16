@@ -260,6 +260,10 @@ pub struct Journal {
     pub volumes: Vec<f64>,
     pub joues: Vec<ElementBalayage>,
     pub arrets: usize,
+    /// #8513 — les traitements de la zone étaient-ils contournés à chaque
+    /// `jouer`, et encore à chaque `arreter` ?
+    pub contournes_au_jeu: Vec<bool>,
+    pub contournes_a_l_arret: Vec<bool>,
     pub erreurs_ouverture: Vec<String>,
     /// Les profils de pièce enregistrés (C2).
     pub profils: Vec<tune_core::room_correction::RoomProfile>,
@@ -281,11 +285,21 @@ impl HoteSimule {
         boucle: Arc<Boucle>,
         volume: Option<f64>,
     ) -> Arc<Self> {
+        Self::avec_traitements(fournisseur, boucle, volume, TraitementsDeZone::default())
+    }
+
+    /// #8513 — une zone dont l'égaliseur ou la correction IR est actif.
+    pub fn avec_traitements(
+        fournisseur: Arc<FournisseurBalayage>,
+        boucle: Arc<Boucle>,
+        volume: Option<f64>,
+        traitements: TraitementsDeZone,
+    ) -> Arc<Self> {
         Arc::new(Self {
             fournisseur,
             boucle,
             volume: Mutex::new(volume),
-            traitements: TraitementsDeZone::default(),
+            traitements,
             journal: Mutex::new(Journal::default()),
             pompe_vivante: Arc::new(AtomicBool::new(false)),
         })
@@ -307,7 +321,10 @@ impl HoteZone for HoteSimule {
         Ok(())
     }
 
-    fn jouer(&self, _zone_id: i64, element: ElementBalayage) -> Result<(), String> {
+    fn jouer(&self, zone_id: i64, element: ElementBalayage) -> Result<(), String> {
+        self.journal()
+            .contournes_au_jeu
+            .push(tune_core::audio::mesure_nue::active(zone_id));
         self.journal().joues.push(element.clone());
         let flux = match self.fournisseur.ouvrir(&element.mesure_id, 0) {
             Ok(f) => f,
@@ -346,7 +363,10 @@ impl HoteZone for HoteSimule {
         Ok(())
     }
 
-    fn arreter(&self, _zone_id: i64) {
+    fn arreter(&self, zone_id: i64) {
+        self.journal()
+            .contournes_a_l_arret
+            .push(tune_core::audio::mesure_nue::active(zone_id));
         self.journal().arrets += 1;
         self.pompe_vivante.store(false, Ordering::SeqCst);
     }

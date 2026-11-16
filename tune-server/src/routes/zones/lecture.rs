@@ -22,10 +22,15 @@ fn diagnostic_transport_dsd(zone: &Zone, dsd_mode: &str) -> (Value, Value) {
             Some(CapaciteConnue::SortieNonAsio) => {
                 (json!("natif_servi_en_dop"), json!("sortie_non_asio"))
             }
-            Some(CapaciteConnue::Asio { cadences }) if cadences.is_empty() => {
+            Some(CapaciteConnue::Asio { cadences } | CapaciteConnue::AlsaDsdU32 { cadences })
+                if cadences.is_empty() =>
+            {
                 (json!("natif_servi_en_dop"), json!("pilote_sans_dsd"))
             }
-            Some(CapaciteConnue::Asio { .. }) => (json!("natif"), Value::Null),
+            // #8248 — un PCM ALSA `hw:` qui offre `DSD_U32` : natif, comme ASIO.
+            Some(CapaciteConnue::Asio { .. } | CapaciteConnue::AlsaDsdU32 { .. }) => {
+                (json!("natif"), Value::Null)
+            }
         };
     }
     (
@@ -517,7 +522,17 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 ),
             )
             .await;
+            // #8569 — sortie au volume non réglable : pas d'étape Volume.
+            let signal_path = super::signal_path_selon_la_sortie(
+                &state,
+                z.output_device_id.as_deref(),
+                signal_path,
+            )
+            .await;
             obj.insert("signal_path".into(), json!(signal_path));
+            // #8419 — en lecture groupée, chaque sortie et son étage final.
+            super::signal_path_groupe_8419::injecter_les_sorties_du_groupe(&state, zone_id, obj)
+                .await;
             // #1395 — quel backend local tourne VRAIMENT sur cette zone, face à
             // celui qui est réglé. Absent des zones non locales.
             if let Some(status) =
@@ -650,6 +665,14 @@ pub(crate) async fn get_zone(
                     }),
                 );
                 obj.insert("current_track".into(), json!(ps.now_playing));
+                // #3245 — le mode sous lequel la sortie locale de la zone
+                // ouvrira le périphérique. Il diffère de `exclusive_mode`
+                // tant qu'une lecture retient le changement, ou quand la
+                // plateforme impose sa règle (ASIO). `null` hors sortie locale.
+                obj.insert(
+                    "exclusive_mode_applique".into(),
+                    json!(mode_exclusif_applique(&state, zone.output_device_id.as_deref()).await),
+                );
                 inject_metadata_anchor(obj, &ps);
                 inject_session_context(obj, &ps);
                 obj.insert(
@@ -750,7 +773,17 @@ pub(crate) async fn get_zone(
                     ),
                 )
                 .await;
+                // #8569 — voir la note au site jumeau (`list_zones`).
+                let signal_path = super::signal_path_selon_la_sortie(
+                    &state,
+                    zone.output_device_id.as_deref(),
+                    signal_path,
+                )
+                .await;
                 obj.insert("signal_path".into(), json!(signal_path));
+                // #8419 — en lecture groupée, chaque sortie et son étage final.
+                super::signal_path_groupe_8419::injecter_les_sorties_du_groupe(&state, id, obj)
+                    .await;
                 // #1395 — voir la note au site jumeau (`list_zones`).
                 if let Some(status) =
                     local_backend_status_value(zone.output_type.as_deref(), &audio_backend_pref)
@@ -901,6 +934,20 @@ mod asio_7372 {
                 json!("natif"),
                 Value::Null,
             ),
+            (
+                "8248-api-alsa-natif",
+                Some(CapaciteConnue::AlsaDsdU32 {
+                    cadences: vec![2_822_400],
+                }),
+                json!("natif"),
+                Value::Null,
+            ),
+            (
+                "8248-api-alsa-sans-dsd",
+                Some(CapaciteConnue::AlsaDsdU32 { cadences: vec![] }),
+                json!("natif_servi_en_dop"),
+                json!("pilote_sans_dsd"),
+            ),
         ];
         for (nom, capacite, transport, motif) in cas {
             if let Some(c) = capacite.clone() {
@@ -961,5 +1008,25 @@ mod asio_7372 {
                 "GET ne doit pas sonder ni altérer le pilote"
             );
         }
+    }
+}
+
+/// #3245 — le mode exclusif que porte la sortie locale `device_id`, s'il y en
+/// a une d'enregistrée.
+async fn mode_exclusif_applique(state: &AppState, device_id: Option<&str>) -> Option<bool> {
+    #[cfg(feature = "local-audio")]
+    {
+        let device_id = device_id.filter(|d| d.starts_with("local:"))?;
+        let sortie = state.outputs.lock().await.get(device_id)?;
+        let sortie = sortie.lock().await;
+        sortie
+            .as_any()
+            .downcast_ref::<tune_core::outputs::local::LocalOutput>()
+            .map(|l| l.mode_exclusif())
+    }
+    #[cfg(not(feature = "local-audio"))]
+    {
+        let _ = (state, device_id);
+        None
     }
 }

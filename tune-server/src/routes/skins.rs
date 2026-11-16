@@ -148,6 +148,8 @@ async fn set_active_skin(
 }
 
 async fn install_skin(
+    // Sécurité : installer un thème, c'est poser des fichiers servis à tous.
+    _garde: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> impl IntoResponse {

@@ -3,7 +3,11 @@ pub mod mac;
 pub mod mdns;
 pub mod mdns_reprise;
 pub mod minimal_dmr;
+/// Nom annoncé sur le réseau (#8189).
+pub mod nom_annonce;
 mod oui_audio;
+/// Découverte réseau différée jusqu'au premier usage (#8189, iOS).
+pub mod porte_multicast;
 /// Fraîcheur du registre des serveurs multimédia (#2219, phase 1) — le verdict
 /// PUR « présent / absent », sans horloge ni réseau.
 pub mod presence_serveur;
@@ -82,4 +86,12 @@ mod hostname_tests {
         assert_eq!(mdns_host_label(""), "tune-server");
         assert_eq!(mdns_host_label(".local"), "tune-server");
     }
+}
+
+/// Les adresses IP propres de cette machine, toutes interfaces confondues
+/// (bouclage compris). Vide si le système ne les donne pas.
+pub fn adresses_de_la_machine() -> Vec<std::net::IpAddr> {
+    if_addrs::get_if_addrs()
+        .map(|interfaces| interfaces.into_iter().map(|i| i.ip()).collect())
+        .unwrap_or_default()
 }

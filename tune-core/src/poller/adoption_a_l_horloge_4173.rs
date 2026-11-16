@@ -733,6 +733,12 @@ mod rejeu_de_la_piste_finie_5411;
 #[cfg(test)]
 mod gapless_verifie_3967;
 
+/// #7293 (fil 2502) — un relevé manqué à l'instant de l'enchaînement : ce
+/// même banc, la suivante déjà à 8 s quand le sondeur la voit pour la
+/// première fois.
+#[cfg(test)]
+mod releve_manque_7293;
+
 // #5970 — la préparation de la suivante, bornée : le tick continue, et une
 // suivante prête trop tard part par `Play`, jamais en `SetNext`.
 #[cfg(test)]

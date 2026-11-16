@@ -143,15 +143,13 @@ fn resolve_dest_root(
     // Refuse to write outside the library: the destination has to be a
     // configured music directory (or inside one), otherwise the album lands
     // somewhere the scanner will never look.
+    //
+    // Sécurité — l'ancien test (`sous_le_dossier`, préfixe de
+    // texte) laissait passer `/musique/../etc`, et l'ingest ÉCRIVAIT hors de
+    // la bibliothèque ; sans dossier de musique, il acceptait tout. Les deux
+    // séparateurs restent reconnus (`D:\data\music`, .42).
     let dirs = music_dirs(state);
-    // Même défaut de séparateur que dans `scan.rs` : `{d}/` code `/` en dur,
-    // donc sous Windows AUCUNE destination n'était jamais jugée « dedans » et
-    // tout import était refusé. Constaté sur .42 (`D:\data\music`).
-    let inside = dirs.iter().any(|d| {
-        let d = tune_core::scanner::walker::normalize_path(d);
-        crate::routes::system::scan::sous_le_dossier(&root, &d)
-    });
-    if !dirs.is_empty() && !inside {
+    if crate::routes::confinement::sous_les_racines(&root, &dirs).is_err() {
         return Err(AppError::bad_request(format!(
             "destination {root} is outside the configured music directories"
         )));
@@ -254,7 +252,16 @@ pub(super) struct AnalyzeBody {
 
 /// Read the source folder: audio files with their tags, plus the sidecar files
 /// (cover, cue, log) worth carrying along.
-async fn read_source(source: &str) -> Result<(Vec<SourceTrack>, Vec<String>), AppError> {
+async fn read_source(
+    state: &AppState,
+    source: &str,
+) -> Result<(Vec<SourceTrack>, Vec<String>), AppError> {
+    // Sécurité — le dossier source est LU (puis déplacé ou copié) :
+    // il doit être dans un dossier de musique, ou dans le dossier de dépôt de
+    // l'ingest (`staging_dir`, où atterrissent les dossiers téléversés).
+    let mut racines = music_dirs(state);
+    racines.push(crate::routes::confinement::texte(&staging_dir()));
+    crate::routes::confinement::exiger("source_path", source, &racines)?;
     let dir = tune_core::scanner::walker::normalize_path(source);
     let path = PathBuf::from(&dir);
 
@@ -362,7 +369,7 @@ pub(super) async fn analyze(
     State(state): State<AppState>,
     Json(body): Json<AnalyzeBody>,
 ) -> Result<impl IntoResponse, AppError> {
-    let (tracks, extras) = read_source(&body.source_path).await?;
+    let (tracks, extras) = read_source(&state, &body.source_path).await?;
     let album = ingest::summarize(&tracks);
 
     // Warn about re-importing something already in the library — a very common
@@ -422,9 +429,10 @@ pub(super) struct ReleaseTracksBody {
 /// client shows the difference and sends back only what the user accepted, as
 /// `track_overrides` on `plan`/`apply`. Nothing is written here.
 pub(super) async fn release_tracks(
+    State(state): State<AppState>,
     Json(body): Json<ReleaseTracksBody>,
 ) -> Result<impl IntoResponse, AppError> {
-    let (tracks, _extras) = read_source(&body.source_path).await?;
+    let (tracks, _extras) = read_source(&state, &body.source_path).await?;
     if tracks.is_empty() {
         return Err(AppError::bad_request(
             "no supported audio files found in that folder",
@@ -526,7 +534,7 @@ async fn build(state: &AppState, params: &IngestParams) -> Result<Built, AppErro
     let settings = load_settings(state);
     let root = resolve_dest_root(state, params.dest_root.as_deref(), &settings)?;
 
-    let (mut tracks, extras) = read_source(&params.source_path).await?;
+    let (mut tracks, extras) = read_source(state, &params.source_path).await?;
     if tracks.is_empty() {
         return Err(AppError::bad_request(
             "no supported audio files found in that folder",
@@ -1099,5 +1107,33 @@ mod tests {
             "l'identifiant retenu n'a pas ete inscrit dans le fichier pose"
         );
         assert_eq!(relu.title.as_deref(), Some("Intro"), "le reste est intact");
+    }
+}
+
+/// Sécurité — l'ingest ne lit ni n'écrit hors de ses dossiers.
+#[cfg(test)]
+mod confinement_chemins_tests {
+    use super::*;
+    use crate::routes::confinement::banc;
+
+    #[tokio::test]
+    async fn la_source_et_la_destination_restent_dans_leurs_dossiers() {
+        let b = banc();
+        for chemin in [b.remontee(""), b.dehors.to_string_lossy().into_owned()] {
+            assert!(
+                read_source(&b.state, &chemin).await.is_err(),
+                "{chemin} : source lue hors des dossiers autorisés"
+            );
+        }
+        assert!(read_source(&b.state, &b.dedans("/Album")).await.is_ok());
+
+        let reglages = load_settings(&b.state);
+        for chemin in [b.remontee(""), b.remontee("/Nouveaux")] {
+            assert!(
+                resolve_dest_root(&b.state, Some(&chemin), &reglages).is_err(),
+                "{chemin} : destination d'écriture hors bibliothèque acceptée"
+            );
+        }
+        assert!(resolve_dest_root(&b.state, Some(&b.dedans("/Nouveaux")), &reglages).is_ok());
     }
 }

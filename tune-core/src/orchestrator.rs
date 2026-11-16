@@ -8,7 +8,11 @@ use tracing::{debug, info, warn};
 use crate::library::local_path::resolve_existing_local_path;
 
 mod transcodage;
+#[doc(hidden)]
+pub use transcodage::transcoder_vers_un_fichier_8558;
 use transcodage::*;
+/// #8558 (volet B) — piste trop lourde pour le bras fichier : WAV progressif.
+mod bascule_progressive_8558;
 
 /// A second play of the SAME track pushed to a NETWORK renderer within this
 /// window is treated as a redundant re-trigger (a slow pre-transcode resolve
@@ -25,6 +29,10 @@ mod radio;
 /// verdict que la lecture (#3578). Le reste de ce module reste interne.
 pub use radio::non_audio_content_type;
 pub(crate) use radio::*;
+/// #8110 — les flux de repli d'une station, retenus par la route au
+/// lancement : la lecture y passe quand le diffuseur refuse le flux joué.
+mod radio_replis_8110;
+pub use radio_replis_8110::retenir_les_replis_radio;
 
 /// re-resolve or re-send. The `superseded` play_seq guard in `play_inner` only
 /// catches an OVERLAPPING second play; when the second play arrives just AFTER
@@ -88,7 +96,7 @@ async fn request_stream_at_quality(
 /// `settings` sous `zone_<id>_quality`. Lue par les trois chemins qui
 /// résolvent une URL de service : lecture explicite, préchauffage DASH et
 /// avance sans blanc.
-fn preference_de_qualite(
+pub(crate) fn preference_de_qualite(
     db: &Arc<dyn crate::db::backend::DbBackend>,
     zone_id: i64,
 ) -> StreamingQualityPreference {
@@ -456,12 +464,13 @@ fn spawn_paced_levels_forwarder_complet(
             // l'aiguille sans attendre la piste suivante. `1000` — soit ×1,0 —
             // sur tous les chemins qui n'en déclarent pas, ce qui laisse leur
             // mesure inchangée.
-            let gain_units = playback.gain_de_sortie_units(zone_id);
+            // #8058 — en facteur EXACT, pas en millièmes : sous 0,0005 (curseur
+            // `db60` sous ~2,5 %) l'arrondi valait 0 alors que le son sortait.
+            let gain = playback.gain_de_sortie(zone_id);
             // #4384 — ce que la sortie locale DEMANDAIT avant le rabot à
             // l'unité (volume × ReplayGain, préampli compris). `None` hors
             // sortie locale et en DoP : rien n'y est raboté.
-            let gain_demande_units = playback.gain_demande_units(zone_id);
-            let gain = gain_units as f64 / 1000.0;
+            let gain_demande = playback.gain_demande(zone_id);
             // #4969 — la carte des canaux de la sortie locale : les niveaux
             // par canal décrivent alors les voies qui SORTENT (réaffectation
             // #6044, disposition déclarée #6057), pas l'ordre du fichier.
@@ -498,7 +507,7 @@ fn spawn_paced_levels_forwarder_complet(
             let mut ecrete_gauche = lvl.depasse_left;
             let mut ecrete_droite = lvl.depasse_right;
             if let Some((gauche, droite)) = playback.crete_de_sortie(zone_id, debut_ms, fin_ms) {
-                let rendu = f64::from(playback.gain_de_rendu_units(zone_id)) / 1000.0;
+                let rendu = playback.gain_de_rendu(zone_id);
                 ecrete_gauche = gauche * rendu > 1.0;
                 ecrete_droite = droite * rendu > 1.0;
                 lvl.peak_left = (gauche * rendu).min(1.0);
@@ -516,7 +525,7 @@ fn spawn_paced_levels_forwarder_complet(
                 avec_les_niveaux_par_canal(
                     &lvl,
                     avec_le_gain_demande(
-                        gain_demande_units,
+                        gain_demande,
                         serde_json::json!({
                             "zone_id": zone_id,
                             "play_seq": play_seq,
@@ -552,10 +561,10 @@ fn spawn_paced_levels_forwarder_complet(
                             // fichier, et voir qu'un préampli positif à plein volume
                             // ne monte pas (clamp à l'unité, voir
                             // `outputs::local::effective_volume_units`).
-                            "output_gain_db": if gain_units == 1000 {
+                            "output_gain_db": if gain == 1.0 {
                                 0.0_f32
                             } else {
-                                crate::audio::levels::gain_units_en_db(gain_units)
+                                crate::audio::levels::gain_en_db(gain)
                             },
                             // #7100 — surcharge = écrêtage RÉEL après traitement
                             // (volume, gain, égaliseur, ReplayGain compris). Ce
@@ -646,13 +655,15 @@ fn spawn_paced_levels_forwarder_complet(
 /// dans le flux, et chez un serveur d'avant : un client s'en garde par leur
 /// présence.
 fn avec_le_gain_demande(
-    gain_demande_units: Option<u32>,
+    gain_demande: Option<f64>,
     mut niveaux: serde_json::Value,
 ) -> serde_json::Value {
-    if let Some(demande) = gain_demande_units {
+    if let Some(demande) = gain_demande {
         niveaux["output_gain_requested_db"] =
-            serde_json::json!(crate::audio::levels::gain_units_en_db(demande));
-        niveaux["output_gain_limited"] = serde_json::json!(demande > 1000);
+            serde_json::json!(crate::audio::levels::gain_en_db(demande));
+        // Au millième près, comme avant (#4384) : un produit qui vaut l'unité
+        // à l'arrondi près n'est pas « raboté ».
+        niveaux["output_gain_limited"] = serde_json::json!(demande > 1.0005);
     }
     niveaux
 }
@@ -1297,6 +1308,12 @@ pub struct PlaybackOrchestrator {
     /// à la position (voir `transfert_en_pause_5050`). Verrou std : accès
     /// courts.
     transferts_en_pause: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// #7418 — zones mises en pause parce que leur APPAREIL s'est mis en
+    /// pause (télécommande, autre entrée) : leur reprise depuis Tune rétablit
+    /// la piste à la position, au lieu d'un `Play` « sur place » envoyé à un
+    /// appareil qui peut être passé à autre chose. Voir
+    /// `pause_de_l_appareil_7418`. Verrou std : accès courts.
+    pauses_de_l_appareil: std::sync::Mutex<std::collections::HashSet<i64>>,
     /// #6612 — la dernière reprise SUR PLACE d'un renderer réseau, par zone :
     /// (position, instant). Voir `plage_hors_fichier_6612`. Verrou std :
     /// accès courts.
@@ -1359,6 +1376,10 @@ pub struct PlaybackOrchestrator {
     ///
     /// Verrou std : accès très courts, jamais tenus à travers un await.
     ecoutes_en_attente: std::sync::Mutex<HashMap<i64, ecoute_validee_7852::EcouteEnAttente>>,
+    /// #8107 — la dernière écoute écrite par chaque zone, pour qu'un groupe
+    /// de zones (`zone_groups`) ne compte qu'une écoute par titre. Voir
+    /// `ecoute_validee_7852`.
+    ecoutes_ecrites: std::sync::Mutex<HashMap<i64, ecoute_validee_7852::EcouteEcrite>>,
     /// #7974 — le suivi du bail d'écoute de chaque zone en lecture. Voir
     /// `bail_parental_7974`.
     ///
@@ -1429,6 +1450,9 @@ pub struct PlaybackOrchestrator {
     /// repère de la garde contre les montées brusques ne le dépasse jamais.
     /// Voir `repere_de_hausse_6721`.
     pub(crate) niveaux_des_appareils: repere_de_hausse_6721::NiveauxDesAppareils,
+    /// #8137 — le dernier volume relu sur l'appareil de chaque zone, effacé
+    /// à chaque commande. Voir `bascule_pure_8137`.
+    pub(crate) volumes_relus: bascule_pure_8137::VolumesRelus,
     /// #2264 — la mémoire de la règle de version : choix explicites en
     /// attente, réponses des services. Voir `version_de_lecture`.
     pub(crate) versions: version_de_lecture::EtatDesVersions,
@@ -1476,6 +1500,18 @@ impl Drop for LevelsPrewarmScope<'_> {
                 comptes.remove(&self.zone_id);
             }
         }
+    }
+}
+
+impl PlayRequest {
+    /// #8689 — la piste dont le ReplayGain s'applique : bibliothèque, ou
+    /// titre Qobuz / TIDAL par son identifiant de service.
+    pub fn piste_rg(&self) -> crate::audio::replaygain::PisteRg<'_> {
+        crate::audio::replaygain::PisteRg::new(
+            self.track_id,
+            self.source.as_deref(),
+            self.source_id.as_deref(),
+        )
     }
 }
 
@@ -1962,6 +1998,7 @@ impl PlaybackOrchestrator {
             dlna_canaux_max: Mutex::new(HashMap::new()),
             levels_prewarm: std::sync::Mutex::new(std::collections::HashMap::new()),
             transferts_en_pause: std::sync::Mutex::new(std::collections::HashSet::new()),
+            pauses_de_l_appareil: std::sync::Mutex::new(std::collections::HashSet::new()),
             reprises_sur_place: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_gen: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -1970,6 +2007,7 @@ impl PlaybackOrchestrator {
             last_net_play: Mutex::new(HashMap::new()),
             annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
             ecoutes_en_attente: std::sync::Mutex::new(HashMap::new()),
+            ecoutes_ecrites: std::sync::Mutex::new(HashMap::new()),
             suivis_de_bail: std::sync::Mutex::new(HashMap::new()),
             confirmations_du_lecteur: std::sync::Mutex::new(Default::default()),
             #[cfg(feature = "local-audio")]
@@ -1981,6 +2019,7 @@ impl PlaybackOrchestrator {
             sources_physiques: Arc::default(),
             volume_coalesceur: volume_coalescent::CoalesceurDeVolume::default(),
             niveaux_des_appareils: Default::default(),
+            volumes_relus: Default::default(),
             versions: Default::default(),
         }
     }
@@ -2041,6 +2080,10 @@ impl PlaybackOrchestrator {
     const EQ_REPLAY_FLOOR_MS: u64 = 5_000;
 }
 
+// #8611 — contrôle parental : refus de lecture des artistes bloqués.
+pub mod artiste_bloque_8611;
+#[cfg(test)]
+mod artiste_bloque_8611_tests;
 pub mod bail_parental_7974;
 #[cfg(test)]
 mod bail_parental_7974_tests;
@@ -2064,6 +2107,8 @@ pub use confirmation_navigateur_6066::SignalDuLecteur;
 
 /// #4598 — ré-énumérer le parc local avant de refuser une zone locale.
 mod reenumeration_avant_refus;
+// #8152 — l'épisode repris sur un renderer réseau : Seek une fois en lecture.
+mod reprise_d_episode_8152;
 mod transport;
 pub use transport::IssueDePause;
 #[cfg(test)]
@@ -2084,6 +2129,9 @@ mod relance_ytdlp_4366;
 // Lot L3b (rc3) — un `Seek` refusé par un renderer DLNA (701/710/711).
 #[cfg(test)]
 mod seek_refuse_par_le_renderer;
+// #5575 — un volume décoratif (Diretta UPnP) s'annonce non réglable.
+#[cfg(test)]
+mod volume_decoratif_5575_tests;
 
 mod resolve_local;
 // #6059 — Seek ignoré par le renderer : le flux natif relancé à la position.
@@ -2125,9 +2173,16 @@ mod service_wav_progressif_openhome_6718;
 
 mod dsp;
 // #5662 — une commande de volume à la fois par sortie, la dernière valeur gagne.
+/// #8082 — flux continu entre les pistes pour les renderers DLNA.
+mod flux_continu_8082;
 mod repere_de_hausse_6721;
 #[cfg(test)]
 mod repere_de_hausse_6721_tests;
+// #8137 — la bascule PURE ne commande le volume que si elle change quelque chose.
+mod bascule_pure_8137;
+pub use bascule_pure_8137::{BasculePure, EnvoiDeVolume};
+#[cfg(test)]
+mod bascule_pure_8137_tests;
 mod volume_coalescent;
 #[cfg(test)]
 mod volume_coalescent_5662_tests;
@@ -2137,6 +2192,19 @@ mod volume_openhome_sans_attendre_7633_tests;
 // #7841 — l'échelle de volume OpenHome lue, la sourdine sans le verrou.
 #[cfg(test)]
 mod volume_openhome_echelle_7841_tests;
+// #8151 — la sourdine de la zone tient au démarrage de chaque piste.
+mod sourdine_a_la_piste_8151;
+// #8402 (11/11) — AirPlay 2 en PURE verrouillé : départ à 0 %, dit.
+mod depart_muet_airplay2_8402;
+#[cfg(test)]
+mod sourdine_a_la_piste_8151_tests;
+// #8165 — un geste de volume lève la sourdine de la zone, sur toutes les sorties.
+mod volume_leve_la_sourdine_8165;
+#[cfg(test)]
+mod volume_leve_la_sourdine_8165_tests;
+// #8437 — groupe mixte : la sortie locale part `sync_delay_ms` plus tard.
+#[cfg(all(test, feature = "local-audio"))]
+mod retard_groupe_mixte_8437_tests;
 pub use dsp::PorteeDuReglage;
 // #5695 — PURE forcé : 100 % à l'appareil, sans trim, sur tous les chemins.
 #[cfg(test)]
@@ -2183,11 +2251,16 @@ mod convolution_sous_licence_7632_tests;
 // #7986 — une RI que le convolveur refusera ne force pas le transcodage.
 #[cfg(test)]
 mod passthrough_sans_traitement_7986_tests;
+// #8006 — Pause et Arrêt n'attendent plus sans limite un appareil occupé.
+#[cfg(test)]
+mod sortie_occupee_8006_tests;
 
 /// Fil 2062 / #5550 — durée d'une piste UPnP lue dans les en-têtes du flux.
 mod duree_du_flux_2062;
 #[cfg(test)]
 mod duree_du_flux_2062_tests;
+#[cfg(test)]
+mod prefetch_fiche_qobuz_m3u_8229_tests;
 #[cfg(test)]
 mod prefetch_wav_annonce_6990_tests;
 mod resolve_direct;
@@ -2395,6 +2468,14 @@ mod tidal_aac_annonce_6334_tests;
 /// un faux renderer DLNA : durée de chaque étape et borne du démarrage.
 #[cfg(test)]
 mod tidal_cd_dash_jusqu_au_play_7266;
+/// #7266 — sortie locale ou OAAT : la première note sans attendre la fin du
+/// téléchargement DASH.
+#[cfg(test)]
+mod tidal_premiere_note_7266_tests;
+/// #8701 — un saut dans une piste TIDAL DASH reprend le fichier (après le TTL
+/// du cache d'URL) ou le téléchargement en cours (sans en attendre la fin).
+#[cfg(test)]
+mod tidal_saut_8701_tests;
 
 /// #6401 — le préchargement sans blanc et la sonde de niveaux après une
 /// avance sans blanc passent par le même repli Qobuz en 16/44,1 que la
@@ -2405,6 +2486,9 @@ mod qobuz_repli_prechargement_6401_tests;
 /// #4384 — la crête d'une zone locale se lit après son DSP.
 #[cfg(test)]
 mod crete_apres_dsp_4384;
+/// #8058 — en bas de course du curseur, l'aiguille suit le son qui sort.
+#[cfg(test)]
+mod crete_bas_de_course_8058;
 /// #7100 — `over_*` dit l'écrêtage réel après traitement, pas la source.
 #[cfg(test)]
 mod ecretage_reel_7100_tests;
@@ -2498,6 +2582,9 @@ mod dop_routing_tests;
 /// #5643 — la règle du DSD natif local (ASIO) et la valeur publiée par l'API.
 #[cfg(test)]
 mod dsd_natif_5643_tests;
+/// #8248 — le DSD natif local ALSA (`DSD_U32`) : la même règle, ses voies.
+#[cfg(test)]
+mod dsd_natif_alsa_8248_tests;
 
 /// Garde-fou #1998 : ce que la sortie a refusé n'est annoncé nulle part.
 ///
@@ -2582,6 +2669,9 @@ mod historique_conteneurs_tests_6466;
 mod sortie_de_radio_dlna_6130_tests;
 mod transfert_en_pause_5050;
 pub use transfert_en_pause_5050::ErreurDeTransfert;
+/// #7418 — une pause faite sur l'appareil devient un arrêt complet, et la
+/// lecture repart normalement depuis Tune.
+mod pause_de_l_appareil_7418;
 
 /// La profondeur ANNONCÉE au renderer et celle réellement ÉCRITE dans le flux
 /// doivent être le même nombre (#1437).
@@ -2620,6 +2710,10 @@ mod profondeur_annoncee_egale_profondeur_ecrite;
 #[cfg(test)]
 mod recreation_locale_guard;
 
+// #3245 — la sortie recréée à la volée suit le réglage de sa zone.
+#[cfg(test)]
+mod recreation_exclusif_zone_3245_tests;
+
 #[cfg(test)]
 mod adoption_du_flux_pre_arme_3442;
 
@@ -2644,6 +2738,16 @@ mod refus_asio_bloque_4556;
 mod refus_amont_4366;
 
 mod preparation_fichier_7247;
+// #6718 — un pré-transcodage abandonné ne laisse plus son fichier.
+mod pretranscode_abandonne_6718;
 
 #[cfg(test)]
 mod deplacement_qobuz_6982_tests;
+// #8188 — plafond 16 bits de la zone sur le bras HTTPS des services (Qobuz).
+#[cfg(test)]
+mod plafond_16_bits_service_8188_tests;
+
+#[cfg(test)]
+mod format_m4a_sink_8722_tests;
+#[cfg(test)]
+mod reprise_dlna_701_8738_tests;

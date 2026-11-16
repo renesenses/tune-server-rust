@@ -124,6 +124,27 @@ fn protocoles_compatibles(a: &str, b: Option<&str>) -> bool {
     a.is_empty() || b.is_empty() || a.eq_ignore_ascii_case(b)
 }
 
+/// #6155 — la famille d'un protocole, pour la règle hôte + nom.
+///
+/// DLNA et OpenHome sont deux visages SSDP d'un même renderer UPnP (le
+/// Marantz, le Sonos sous deux UDN) : ils restent une seule famille. Tout
+/// autre protocole (Chromecast, AirPlay, BluOS…) est sa propre famille.
+fn famille_de_protocole(protocole: &str) -> String {
+    let p = protocole.trim().to_ascii_lowercase();
+    match p.as_str() {
+        "dlna" | "openhome" | "upnp" => "upnp".to_string(),
+        _ => p,
+    }
+}
+
+/// #6155 — deux protocoles sont-ils de la même famille ? Oui si l'un des deux
+/// est inconnu (vide) : on ne perd rien de l'ancienne règle quand on ne sait
+/// pas.
+pub fn protocoles_de_meme_famille(a: &str, b: Option<&str>) -> bool {
+    let (a, b) = (a.trim(), b.unwrap_or("").trim());
+    a.is_empty() || b.is_empty() || famille_de_protocole(a) == famille_de_protocole(b)
+}
+
 /// #4957 — une ZONE appartient-elle à l'appareil qu'on vient d'ignorer ?
 ///
 /// Trois preuves, et l'adresse IP seule n'en est jamais une : un boîtier
@@ -208,9 +229,14 @@ pub fn identity_matches(entry: &IgnoredDevice, live: DeviceIdentity<'_>) -> bool
 
     // 3. Hôte + nom. Le nom est EXIGÉ : sans lui, un appareil DIFFÉRENT
     //    héritant de l'adresse par le DHCP serait ignoré à tort.
+    //    #6155 — et le protocole doit être de la même famille : la KEF LS50
+    //    Wireless II s'annonce en DLNA ET en Chromecast sous le même nom, à
+    //    la même adresse. Ignorer l'entrée Chromecast ne fait taire que le
+    //    Chromecast (décision de Bertrand du 12/11 : chaque protocole à part).
     if !entry.host.is_empty()
         && entry.host.eq_ignore_ascii_case(live.host)
         && noms_equivalents(&entry.name, live.name)
+        && protocoles_de_meme_famille(&entry.device_type, live.protocole)
     {
         return true;
     }
@@ -580,6 +606,111 @@ mod tests {
         assert_eq!(
             restant[0].device_id, "uuid:cabasse",
             "le voisin reste bloqué"
+        );
+    }
+
+    fn entree_de_type(device_id: &str, host: &str, name: &str, device_type: &str) -> IgnoredDevice {
+        IgnoredDevice {
+            device_type: device_type.into(),
+            ..entree(device_id, "", host, name)
+        }
+    }
+
+    /// #6155 — la KEF LS50 Wireless II : DLNA et Chromecast sous le même nom,
+    /// à la même adresse. Ignorer le Chromecast ne fait pas taire le DLNA.
+    #[test]
+    fn ignorer_le_chromecast_ne_fait_pas_taire_le_dlna_de_meme_nom_6155() {
+        let repo = repo();
+        repo.ignore(&entree_de_type(
+            "kef-cast-1",
+            "192.168.1.60",
+            "LS50 Wireless II-Living Room",
+            "chromecast",
+        ))
+        .unwrap();
+        assert!(
+            !repo.is_ignored(
+                DeviceIdentity::new(
+                    "uuid:kef-dlna",
+                    "192.168.1.60",
+                    "LS50 Wireless II-Living Room"
+                )
+                .with_protocol(Some("dlna"))
+            ),
+            "l'entrée DLNA de la KEF doit rester proposée (#6155)"
+        );
+        // Le Chromecast lui-même, sous une autre identité, reste ignoré.
+        assert!(
+            repo.is_ignored(
+                DeviceIdentity::new("kef-cast-2", "192.168.1.60", "LS50 Wireless II-Living Room")
+                    .with_protocol(Some("chromecast"))
+            ),
+            "une seconde identité Chromecast du même boîtier reste ignorée"
+        );
+    }
+
+    /// #6155 — l'inverse : ignorer le DLNA ne fait pas taire le Chromecast.
+    #[test]
+    fn ignorer_le_dlna_ne_fait_pas_taire_le_chromecast_de_meme_nom_6155() {
+        let repo = repo();
+        repo.ignore(&entree_de_type(
+            "uuid:kef-dlna",
+            "192.168.1.60",
+            "LS50 Wireless II-Living Room",
+            "dlna",
+        ))
+        .unwrap();
+        assert!(
+            !repo.is_ignored(
+                DeviceIdentity::new("kef-cast", "192.168.1.60", "LS50 Wireless II-Living Room")
+                    .with_protocol(Some("chromecast"))
+            )
+        );
+    }
+
+    /// #6155 — DLNA et OpenHome restent UNE famille : les jumelles SSDP d'un
+    /// même renderer (#1280) tombent toujours ensemble.
+    #[test]
+    fn dlna_et_openhome_de_meme_nom_restent_jumelles_6155() {
+        let repo = repo();
+        repo.ignore(&entree_de_type(
+            "uuid:marantz-dlna",
+            "192.168.1.70",
+            "Salon - Marantz",
+            "dlna",
+        ))
+        .unwrap();
+        assert!(
+            repo.is_ignored(
+                DeviceIdentity::new("uuid:marantz-oh", "192.168.1.70", "Salon - Marantz")
+                    .with_protocol(Some("openhome"))
+            ),
+            "la jumelle OpenHome du renderer ignoré doit rester ignorée"
+        );
+    }
+
+    /// #6155 — CONTRE-ÉPREUVE PERMANENTE : sans la borne de famille, la règle
+    /// hôte + nom ferait taire le DLNA de la KEF.
+    #[test]
+    fn sans_la_borne_de_famille_le_dlna_de_la_kef_serait_ignore_6155() {
+        let figee = entree_de_type(
+            "kef-cast",
+            "192.168.1.60",
+            "LS50 Wireless II-Living Room",
+            "chromecast",
+        );
+        let dlna = DeviceIdentity::new(
+            "uuid:kef-dlna",
+            "192.168.1.60",
+            "LS50 Wireless II-Living Room",
+        )
+        .with_protocol(Some("dlna"));
+        assert!(!identity_matches(&figee, dlna));
+        let amputee =
+            figee.host.eq_ignore_ascii_case(dlna.host) && noms_equivalents(&figee.name, dlna.name);
+        assert!(
+            amputee,
+            "le scénario est discriminant : hôte et nom concordent"
         );
     }
 

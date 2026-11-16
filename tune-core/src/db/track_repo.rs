@@ -2947,10 +2947,7 @@ impl TrackRepo {
         let mut conditions: Vec<String> = Vec::new();
         let mut owned_params: Vec<SqlValue> = Vec::new();
 
-        // Genre : la colonne `t.genre` OU le tableau JSON `t.genres`. Avec
-        // plusieurs genres sélectionnés, les deux tests s'étendent ensemble —
-        // et les valeurs sont empilées dans l'ordre où les marqueurs sortent :
-        // d'abord les N du `IN`, puis les N motifs `LIKE`.
+        // #5638 : genre principal seul, comme les compteurs du rail.
         //
         // #2108 : chaque facette « combinable » passe par
         // `facet_filter::combiner`, qui rend le SQL d'avant en « Ou » (défaut)
@@ -2966,7 +2963,11 @@ impl TrackRepo {
             owned_params.extend(p);
         }
 
-        if let Some(c) = ph.in_list("t.year", f.years.len()) {
+        // Go du 13/11 — l'année de la piste, à défaut celle de son album.
+        if let Some(c) = ph.in_list(
+            crate::db::annee_de_la_piste::ANNEE_DE_LA_PISTE,
+            f.years.len(),
+        ) {
             conditions.push(c);
             for y in &f.years {
                 owned_params.push(SqlValue::Int(*y));
@@ -3033,6 +3034,27 @@ impl TrackRepo {
             owned_params.extend(p);
         }
 
+        // #8325 — chef, ensemble, œuvre : les magasins ouverts, pas une
+        // colonne ; le prédicat jumeau du rail vit dans `facettes_classiques`.
+        for (valeurs, champ) in [
+            (&f.conductors, crate::db::facettes_classiques::Champ::Chef),
+            (
+                &f.ensembles,
+                crate::db::facettes_classiques::Champ::Ensemble,
+            ),
+            (&f.works, crate::db::facettes_classiques::Champ::Oeuvre),
+        ] {
+            if let Some((c, p)) = combiner(
+                ph,
+                valeurs,
+                f.est_en_et(champ.nom()),
+                crate::db::facettes_classiques::bloc(engine, champ),
+            ) {
+                conditions.push(c);
+                owned_params.extend(p);
+            }
+        }
+
         // The artist name lives on the joined `artists` table (tracks stores
         // only artist_id) — `tracks` has no artist_name column, so the old
         // `t.artist_name` predicate raised a SQL error that list_tracks
@@ -3048,8 +3070,18 @@ impl TrackRepo {
 
         // Extended-tag filters via the open `track_metadata` k/v store. The key
         // is a fixed literal; only the values are bound parameters.
+        // #8668 — le pays d'édition : balise RELEASECOUNTRY, ou pays de la
+        // release MusicBrainz d'un album sans balise.
+        if let Some((c, p)) = combiner(
+            ph,
+            &f.countries,
+            f.est_en_et("country"),
+            crate::db::facet_filter::bloc_pays_edition,
+        ) {
+            conditions.push(c);
+            owned_params.extend(p);
+        }
         for (values, key, param) in [
-            (&f.countries, "release_country", "country"),
             (&f.moods, "mood", "mood"),
             (&f.source_medias, "source_media", "source_media"),
         ] {
@@ -3057,6 +3089,12 @@ impl TrackRepo {
                 conditions.push(c);
                 owned_params.extend(p);
             }
+        }
+
+        // #8090 — pays de l'artiste principal de l'album (MusicBrainz).
+        if let Some((c, p)) = crate::db::facet_filter::bloc_pays_artiste(ph, &f.artist_countries) {
+            conditions.push(c);
+            owned_params.extend(p);
         }
 
         // Folder facet (Oxygen drill-down): restrict to tracks whose file lives
@@ -3532,6 +3570,10 @@ impl TrackRepo {
         // #7725 : sous « Multicanal », seules les pistes de plus de deux canaux.
         if quality == Some(super::models::Album::QUALITE_MULTICANAL) {
             let pred = super::models::Album::multicanal_sql_piste("t");
+            extra.push_str(&format!(" AND {pred}"));
+        } else if quality == Some(super::models::Album::QUALITE_STEREO) {
+            // #8560 : sous « Stéréo », seules les pistes d'un ou deux canaux.
+            let pred = super::models::Album::stereo_sql_piste("t");
             extra.push_str(&format!(" AND {pred}"));
         } else if let Some(pred) = quality.and_then(|q| super::models::Album::quality_sql(q, "t")) {
             extra.push_str(&format!(" AND {pred}"));
@@ -7722,8 +7764,7 @@ pub(crate) mod tests_b209_ordre_dans_l_album {
 }
 
 /// #2108 — l'opérateur « Et » entre les valeurs d'une même facette, sur la
-/// liste filtrée : compositeurs (facette « contient ») et genres (colonne OU
-/// tableau JSON, deux marqueurs par valeur).
+/// liste filtrée : compositeurs multivalués et genre principal seul (#5638).
 #[cfg(test)]
 mod tests_facettes_en_et_2108 {
     use crate::db::facet_filter::TrackFilter;
@@ -7792,7 +7833,8 @@ mod tests_facettes_en_et_2108 {
                 en_et: vec!["genre".into()],
                 ..Default::default()
             }),
-            ["Deux"]
+            Vec::<String>::new(),
+            "#5638 : une piste ne porte qu'un genre principal ; son secondaire ne satisfait pas ET"
         );
     }
 }

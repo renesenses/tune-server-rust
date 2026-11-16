@@ -112,6 +112,10 @@ pub struct MockOutput {
     /// #6932 — tant qu'il reste positif, `get_status` PANIQUE et le décompte :
     /// la panique d'un tour du sondeur, rejouée sans vraie sortie.
     paniques_au_statut: Arc<AtomicU64>,
+    /// #8152 — armé, `play_media` laisse l'appareil en `Transitioning` : le
+    /// renderer qui n'a pas encore ouvert le flux (Eversolo DMP-A8, 700 ms
+    /// sur le .18). `set_state(Playing)` le fait démarrer.
+    lecture_en_transition: Arc<AtomicBool>,
 }
 
 /// #6658 — (entrée dans `play_media`, feu vert pour en sortir).
@@ -156,7 +160,14 @@ impl MockOutput {
             session_perdue: Arc::new(AtomicBool::new(false)),
             barriere_de_lecture: Arc::new(std::sync::Mutex::new(None)),
             paniques_au_statut: Arc::new(AtomicU64::new(0)),
+            lecture_en_transition: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// #8152 — un renderer qui reste en `Transitioning` après `play_media`.
+    pub fn with_lecture_en_transition(self) -> Self {
+        self.lecture_en_transition.store(true, Ordering::Relaxed);
+        self
     }
 
     /// #6932 — les `n` prochains `get_status` paniqueront.
@@ -494,7 +505,11 @@ impl OutputTarget for MockOutput {
             entree.notify_one();
             feu_vert.notified().await;
         }
-        *self.state.lock().await = TransportState::Playing;
+        *self.state.lock().await = if self.lecture_en_transition.load(Ordering::Relaxed) {
+            TransportState::Transitioning
+        } else {
+            TransportState::Playing
+        };
         *self.current_uri.lock().await = Some(media.url.to_string());
         self.position_ms.store(0, Ordering::Relaxed);
         self.play_calls.lock().await.push(PlayCall {

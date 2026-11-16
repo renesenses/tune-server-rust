@@ -46,6 +46,19 @@
 //! [`RELANCES_MAX`] relances automatiques consécutives. Au-delà, le démarrage
 //! renonce et le journalise (`reprise_passe_abandonnee`). « Reprendre », qui
 //! est un geste de l'utilisateur, reste possible et remet le compteur à zéro.
+//!
+//! ## Le plafond compte les morts SANS PROGRÈS (#7983)
+//!
+//! Le compteur ne mesurait que des redémarrages : il montait d'un cran à
+//! chaque reprise et ne redescendait qu'au clic. Or une passe de métadonnées
+//! sur 563 000 pistes, à ~1,1 s l'aller-retour MusicBrainz, dure plusieurs
+//! semaines ; trois mises à jour ou redémarrages pendant ce temps suffisaient
+//! à la déclarer « morte à chaque démarrage » et à l'abandonner, alors qu'elle
+//! avait travaillé entre deux (Tades, fil 2726, rc11). Le repère porte donc
+//! l'instant de son ouverture (`ouvert_le`), et une passe qui a laissé une
+//! trace de travail depuis ([`a_progresse`]) repart avec un compteur neuf. Le
+//! plafond ne garde plus que ce pour quoi il existe : la passe qui meurt avant
+//! d'avoir rien fait.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -153,6 +166,10 @@ pub struct Repere {
     pub jeton: String,
     /// Relances automatiques déjà faites depuis le dernier geste.
     pub relances: u32,
+    /// #7983 — instant d'ouverture de la passe (secondes depuis l'époque).
+    /// 0 pour un repère écrit avant ce champ : tout travail noté compte alors
+    /// comme un progrès.
+    pub ouvert_le: i64,
 }
 
 /// Lire le repère d'une passe. `None` si la passe s'est terminée normalement
@@ -168,6 +185,7 @@ pub fn lire(backend: &Arc<dyn DbBackend>, passe: Passe) -> Option<Repere> {
         portee: v.get("portee").and_then(Value::as_str).map(str::to_string),
         jeton: v.get("jeton").and_then(Value::as_str)?.to_string(),
         relances: v.get("relances").and_then(Value::as_u64).unwrap_or(0) as u32,
+        ouvert_le: v.get("ouvert_le").and_then(Value::as_i64).unwrap_or(0),
     })
 }
 
@@ -184,6 +202,7 @@ pub(crate) fn noter_ouverture(
         "portee": portee,
         "jeton": jeton,
         "relances": declencheur.relances(),
+        "ouvert_le": chrono::Utc::now().timestamp(),
     });
     if let Err(e) =
         SettingsRepo::with_backend(backend.clone()).set(passe.cle_reglage(), &corps.to_string())
@@ -207,6 +226,25 @@ pub(crate) fn noter_fin(backend: &Arc<dyn DbBackend>, passe: Passe, jeton: &str)
 fn effacer(backend: &Arc<dyn DbBackend>, passe: Passe) {
     if let Err(e) = SettingsRepo::with_backend(backend.clone()).delete(passe.cle_reglage()) {
         warn!(passe = passe.id(), error = %e, "reprise_passe_repere_non_efface");
+    }
+}
+
+/// #7983 — la passe décrite par `repere` a-t-elle travaillé depuis son
+/// ouverture ? Seule la passe des métadonnées tient une trace datée de son
+/// travail (`enrich_tentatives.tente_le`) ; pour les autres, la réponse reste
+/// « non » et le plafond garde son comportement d'avant. Une base illisible
+/// répond « non » : dans le doute, le plafond s'applique.
+pub fn a_progresse(backend: &Arc<dyn DbBackend>, passe: Passe, repere: &Repere) -> bool {
+    match passe {
+        Passe::Metadonnees => backend
+            .query_one(
+                "SELECT 1 FROM enrich_tentatives WHERE tente_le >= ? LIMIT 1",
+                &[&repere.ouvert_le as &dyn tune_core::db::backend::ToSqlValue],
+            )
+            .ok()
+            .flatten()
+            .is_some(),
+        Passe::PochettesAlbums | Passe::ImagesArtistes => false,
     }
 }
 
@@ -262,7 +300,19 @@ pub async fn relancer_si_absente(state: &AppState, passe: Passe, origine: Origin
     };
     let relances = match origine {
         Origine::Demarrage => {
-            if repere.relances >= RELANCES_MAX {
+            // #7983 — une passe qui a travaillé depuis son ouverture n'est pas
+            // « morte à chaque démarrage » : elle a été coupée en route. Elle
+            // repart avec un compteur neuf (cette relance est la première).
+            if a_progresse(&state.backend, passe, &repere) {
+                if repere.relances > 0 {
+                    info!(
+                        passe = passe.id(),
+                        relances_precedentes = repere.relances,
+                        "reprise_passe_compteur_remis_a_zero — la passe avait progressé depuis son ouverture"
+                    );
+                }
+                1
+            } else if repere.relances >= RELANCES_MAX {
                 warn!(
                     passe = passe.id(),
                     relances = repere.relances,
@@ -272,8 +322,9 @@ pub async fn relancer_si_absente(state: &AppState, passe: Passe, origine: Origin
                 return Relance::Abandonnee {
                     relances: repere.relances,
                 };
+            } else {
+                repere.relances + 1
             }
-            repere.relances + 1
         }
         Origine::Reprendre => 0,
     };

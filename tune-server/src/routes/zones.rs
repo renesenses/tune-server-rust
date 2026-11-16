@@ -102,6 +102,9 @@ struct PatchZone {
     /// `null` → `Some(None)` (effacer), valeur → `Some(Some(v))`.
     #[serde(default, deserialize_with = "double_option")]
     max_sample_rate: Option<Option<u32>>,
+    /// #8428 — cadence fixe PCM ; null désactive, absence conserve.
+    #[serde(default, deserialize_with = "double_option")]
+    fixed_sample_rate: Option<Option<u32>>,
     /// When enabled, sends audio at 100% volume (bit-perfect) and disables volume sync from device.
     fixed_volume: Option<bool>,
     /// Accord ponctuel de l'utilisateur pour une activation qui porte
@@ -190,6 +193,12 @@ struct PatchZone {
     /// Sans abonnement tenu, l'option ne fait rien : la sortie retombe sur le
     /// sondage complet plutôt que de servir un état inventé.
     upnp_silence: Option<bool>,
+    /// #8082 — « Flux continu entre les pistes » (zones DLNA) : une suite de
+    /// pistes de la bibliothèque de même format part en UN seul WAV, pour les
+    /// renderers qui raccordent mal deux pistes (Eversolo DMP-A8). Persisté en
+    /// setting `zone_{id}_dlna_flux_continu` ; défaut off, clé supprimée à la
+    /// désactivation. Pris à la lecture suivante.
+    dlna_flux_continu: Option<bool>,
     /// #2991 — « Envoyer le titre radio par DLNA (pour les lecteurs qui
     /// ignorent l'ICY) ». `"off"` (défaut), `"next"` (`SetNextAVTransportURI`,
     /// sans coupure) ou `"reload"` (`SetAVTransportURI` sur la même URI,
@@ -257,6 +266,14 @@ struct PatchZone {
     /// défaut off — sans lui Tune convertit et le DIT dans le chemin du
     /// signal. Pris en compte à la lecture suivante.
     strict_bitperfect: Option<bool>,
+
+    /// #3245 — mode exclusif de CETTE zone, pour l'appareil local qu'elle
+    /// joue. Persisté en setting `zone_{id}_exclusive_mode`. `null` efface :
+    /// la zone suit à nouveau le réglage de machine `local_exclusive_mode`.
+    /// Appliqué tout de suite si rien ne joue, sinon dès que la lecture rend
+    /// le périphérique (`exclusive_mode_applique` dans la fiche de zone).
+    #[serde(default, deserialize_with = "double_option")]
+    exclusive_mode: Option<Option<bool>>,
 }
 
 /// Une transition vers le volume fixe est une commande de volume à 100 %, pas
@@ -367,6 +384,14 @@ fn inject_device_identity(
         .as_deref()
         == Some("true");
     obj.insert("upnp_silence".into(), json!(upnp_silence));
+    // #8082 — toujours publié : sa présence dit au client que ce serveur
+    // connaît le réglage.
+    obj.insert(
+        "dlna_flux_continu".into(),
+        json!(tune_core::outputs::dlna_flux_continu::active(
+            backend, zone_id
+        )),
+    );
     // #2991 — le titre radio par DIDL. TOUJOURS publié : sa présence dit au
     // client que ce serveur connaît le réglage.
     obj.insert(
@@ -392,6 +417,24 @@ fn inject_device_identity(
         .as_deref()
         == Some("true");
     obj.insert("mono_downmix".into(), json!(mono_downmix));
+    // #3245 — le mode exclusif réglé sur la zone. TOUJOURS publié : `null`
+    // dit « la zone suit le réglage de machine ».
+    obj.insert(
+        "exclusive_mode".into(),
+        json!(
+            settings
+                .get(&tune_core::config::cle_exclusif_de_zone(zone_id))
+                .ok()
+                .flatten()
+                .map(|v| tune_core::config::demande_d_exclusif_de_la_zone(Some(&v), false))
+                .filter(|d| d.par_la_zone)
+                .map(|d| d.demande)
+        ),
+    );
+    obj.insert(
+        "fixed_sample_rate".into(),
+        json!(tune_core::audio::frequence_fixe::lire(backend, zone_id)),
+    );
     // #3973 — « bit-perfect strict ». TOUJOURS publié : sa présence est ce qui
     // dit au client que ce serveur connaît le réglage (un vieux serveur ne
     // l'a pas, et l'interrupteur n'apparaît pas).
@@ -517,6 +560,17 @@ pub fn router() -> Router<AppState> {
             get(list_zones).post(create_zone).delete(delete_all_zones),
         )
         .route("/{id}", get(get_zone).patch(patch_zone).delete(delete_zone))
+        // #7836 — « Zones supprimées (n) » et leur bouton Restaurer.
+        .route("/supprimees", get(zones_supprimees_7836::lister))
+        .route(
+            "/{id}/restaurer",
+            axum::routing::post(zones_supprimees_7836::restaurer),
+        )
+        // #7806 — les sorties ASIO présentes qu'aucune zone visible ne porte.
+        .route(
+            "/asio-sans-zone",
+            get(pilote_local_7806::sorties_asio_sans_zone_route),
+        )
         // DUP-1 (phase 1) : fusion explicite de deux zones du même appareil.
         .route("/{id}/fusionner-dans/{cible}", post(fusionner_zones))
         // #6120 — rattacher à la main une zone orpheline à une sortie ASIO
@@ -637,15 +691,23 @@ mod lecture;
 pub use lecture::*;
 mod presence;
 mod rattacher_asio_6120;
+// #7806 — le pilote effectif (WASAPI / ASIO) d'une zone locale Windows, et
+// les sorties ASIO présentes sans zone.
+mod pilote_local_7806;
 mod sortie_reseau_absente_7279;
 mod tune_tested;
 // #7084 — zone AirPlay 2 servie sans son composant `airplay-daemon`.
 mod composant_airplay2_7084;
 // #6541 — boutons + / − et limites de volume d'une zone.
 mod limites_de_volume_6541;
+// #7836 — les zones supprimées, listées et restaurables.
+mod zones_supprimees_7836;
 // #6721 — la garde contre les montées brusques, par le routeur public.
 #[cfg(test)]
 mod garde_de_hausse_6721_tests;
+// #8165 — un geste de volume lève la sourdine, par le routeur public.
+#[cfg(test)]
+mod volume_leve_la_sourdine_8165_tests;
 
 // #5353 — le backend nommé par le chemin du signal est celui de LA sortie.
 mod backend_de_la_sortie_5353;
@@ -945,7 +1007,8 @@ pub(super) async fn album_en_cours(
         && let Some(album) = c.id.as_deref().filter(|s| !s.trim().is_empty())
     {
         let service = c.service.as_deref().unwrap_or("local");
-        return Json(reponse(id, service, album, None, "queue_context")).into_response();
+        let album = album_plutot_que_sa_piste(service, album.to_string()).await;
+        return Json(reponse(id, service, &album, None, "queue_context")).into_response();
     }
 
     // 1. Le geste — seulement pour une ligne sans conteneur propre.
@@ -960,7 +1023,8 @@ pub(super) async fn album_en_cours(
         // #1361 ; la bibliothèque est le seul autre espace de noms possible,
         // et c'est le mot que `contexte_de_lecture` y écrit.
         let service = ps.session_context_source.as_deref().unwrap_or("local");
-        return Json(reponse(id, service, album, None, "session_context")).into_response();
+        let album = album_plutot_que_sa_piste(service, album.to_string()).await;
+        return Json(reponse(id, service, &album, None, "session_context")).into_response();
     }
 
     let Some(np) = ps.now_playing.as_ref() else {
@@ -1038,10 +1102,34 @@ pub(super) async fn album_en_cours(
     //    ne savait donc rien. La référence que Tune a déjà rangée pour cette
     //    piste (file, favoris, historique : `reference_d_album_bandcamp`, la
     //    même recherche que la resignature du flux) prend alors le relais.
+    drop(svc);
+    drop(registre);
     match album_de_la_file {
-        Some((album, origine)) => Json(reponse(id, source, &album, None, origine)).into_response(),
+        Some((album, origine)) => {
+            let album = album_plutot_que_sa_piste(source, album).await;
+            Json(reponse(id, source, &album, None, origine)).into_response()
+        }
         None => rien(id, raison),
     }
+}
+
+/// #7591 (FabienM, fil 2559 point 12) — une référence Bandcamp rangée peut
+/// être la page de la PISTE (`/track/…`) : un titre acheté ou mis en favori
+/// seul n'en a pas d'autre. Servie telle quelle, la vignette ouvrait une
+/// fiche d'une seule piste, au titre du morceau. La page de piste nomme son
+/// album : on ouvre celui-là. Sans album (un single), page muette ou autre
+/// service : la référence reste celle d'avant.
+async fn album_plutot_que_sa_piste(source: &str, album: String) -> String {
+    #[cfg(feature = "bandcamp")]
+    if source == "bandcamp"
+        && tune_bandcamp::est_une_page_de_piste(&album)
+        && let Some(parent) = tune_bandcamp::page_d_album_d_une_piste(&album).await
+    {
+        return parent;
+    }
+    #[cfg(not(feature = "bandcamp"))]
+    let _ = source;
+    album
 }
 
 /// La référence d'album qu'une piste Bandcamp a déjà laissée dans la base
@@ -1649,6 +1737,8 @@ fn output_reach_of(
 }
 
 mod signal_path;
+// #8419 — le chemin du signal d'une lecture groupée dit chaque sortie.
+pub(crate) mod signal_path_groupe_8419;
 pub(crate) mod textes_signal;
 pub use signal_path::*;
 
@@ -1693,6 +1783,9 @@ mod signal_path_reaffectation_6044_tests;
 // #5633 — PURE ignore le ReplayGain, et le chemin du signal le dit.
 #[cfg(test)]
 mod signal_path_pure_replaygain_5633_tests;
+// #8689 — le ReplayGain publié par Qobuz / TIDAL dans le chemin du signal.
+#[cfg(test)]
+mod signal_path_replaygain_services_8689_tests;
 // #7632 — l'étape « Correction de pièce » dit si la RI de la zone est appliquée.
 #[cfg(test)]
 mod signal_path_correction_piece_7632_tests;
@@ -1708,6 +1801,9 @@ mod signal_path_gain_sortie_4384_tests;
 // #6166 — le WAV 32 bits interne d'une sortie locale n'est pas une conversion.
 #[cfg(test)]
 mod signal_path_conteneur_local_6166_tests;
+// #8149 — zone réseau : le suréchantillonnage ne s'applique pas, et le dit.
+#[cfg(test)]
+mod signal_path_surechantillonnage_reseau_8149_tests;
 // #6334 — un AAC Tidal servi en WAV se dit AAC, sans profondeur de bits.
 #[cfg(test)]
 mod signal_path_aac_tidal_6334_tests;
@@ -1717,6 +1813,12 @@ mod signal_path_spotify_6946_tests;
 // #2029 — un DSD qui part en DoP se dit « over PCM (DoP) ».
 #[cfg(test)]
 mod signal_path_dop_2029_tests;
+// #8569 — sortie au volume non réglable : pas d'étape Volume.
+#[cfg(test)]
+mod signal_path_volume_non_reglable_8569_tests;
+// #8647 — un DSD servi en natif par OAAT se dit « DSD256 natif (OAAT) ».
+#[cfg(test)]
+mod signal_path_dsd_natif_oaat_8647_tests;
 
 /// #1499 — une zone qui « joue » sans destination doit le dire.
 ///
@@ -1733,6 +1835,12 @@ mod patch_zone_deserialize_tests;
 
 #[cfg(test)]
 mod zone_group_tests;
+
+#[cfg(test)]
+mod groupe_asio_refuse_7759_tests;
+
+#[cfg(test)]
+mod groupes_chevauchants_8680_tests;
 
 #[cfg(test)]
 mod aac_passthrough_tests;

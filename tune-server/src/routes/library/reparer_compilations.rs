@@ -391,7 +391,12 @@ pub(crate) async fn lancer(State(state): State<AppState>) -> impl IntoResponse {
         let bilan = tokio::task::spawn_blocking(move || {
             let taches = etat2.background_tasks.clone();
             reparer(&etat2, &|fait, total| {
-                taches.update_progress(TACHE, fait as u64, total as u64, "Compilations");
+                taches.update_progress(
+                    TACHE,
+                    fait as u64,
+                    total as u64,
+                    crate::background_tasks::Phase::Compilations,
+                );
             })
         })
         .await

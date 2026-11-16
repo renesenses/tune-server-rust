@@ -21,12 +21,25 @@
 # server keeps, besides the groups of `tune` in the image (`audio` among
 # them), the group owning /dev/snd and every `--group-add` of the container.
 # `setpriv --init-groups` alone would drop the last two.
+#
+# CD drive (#8141): an optical drive passed with `--device /dev/sr0` keeps
+# its HOST group too (11 on ZimaOS, 24 `cdrom` on Debian...), unknown to the
+# image. The group owning each /dev/sr* block device is kept the same way,
+# so that the extractor (cdparanoia) can open it. No named group is needed:
+# setpriv takes numeric gids.
+#
+# Acoustic-analysis models (#8675): the image puts them under
+# /data/embedding_models (TUNE_EMBEDDING_MODELS_DIR). An installation that
+# already mounts a volume on /app/embedding_models (the workaround documented
+# by #7028) keeps it: the model it holds is not downloaded again.
 set -eu
 
 TUNE_BIN="${TUNE_ENTRYPOINT_BIN:-/app/tune-server}"
+LEGACY_MODELS_DIR="${TUNE_ENTRYPOINT_LEGACY_MODELS_DIR:-/app/embedding_models}"
 TUNE_USER=tune
 DATA_DIR="${TUNE_ENTRYPOINT_DATA_DIR:-/data}"
 SND_DIR="${TUNE_ENTRYPOINT_SND_DIR:-/dev/snd}"
+CD_DIR="${TUNE_ENTRYPOINT_CD_DIR:-/dev}"
 
 die() {
     echo "FATAL: $*" >&2
@@ -39,6 +52,14 @@ is_uint() {
         *) return 0 ;;
     esac
 }
+
+# The image never creates /app/embedding_models: if it exists, it was mounted.
+# Only the image's own value is replaced, never a path chosen by the user.
+if [ -d "$LEGACY_MODELS_DIR" ] && [ "${TUNE_EMBEDDING_MODELS_DIR:-}" = /data/embedding_models ]; then
+    TUNE_EMBEDDING_MODELS_DIR="$LEGACY_MODELS_DIR"
+    export TUNE_EMBEDDING_MODELS_DIR
+    echo "tune entrypoint: keeping the models volume mounted on $LEGACY_MODELS_DIR." >&2
+fi
 
 if [ "$(id -u)" != 0 ]; then
     if [ -n "${PUID:-}${PGID:-}" ]; then
@@ -83,8 +104,9 @@ fi
 HOME="$(getent passwd "$TUNE_USER" | cut -d: -f6)"
 export HOME
 
-# Supplementary groups (#5968): those of `tune`, then the owner of the sound
-# devices and the container's `--group-add` (root's own 0 and the unmapped
+# Supplementary groups (#5968, #8141): those of `tune`, then the owner of the
+# sound devices and of the CD drives, and the container's `--group-add`
+# (root's own 0 and the unmapped
 # 65534 of a rootless user namespace excluded: neither can be granted).
 groups=""
 add_group() {
@@ -97,6 +119,11 @@ for g in $(id -G "$TUNE_USER"); do
 done
 for node in "$SND_DIR"/*; do
     if [ -c "$node" ]; then
+        add_group "$(stat -L -c %g "$node")"
+    fi
+done
+for node in "$CD_DIR"/sr*; do
+    if [ -b "$node" ]; then
         add_group "$(stat -L -c %g "$node")"
     fi
 done

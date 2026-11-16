@@ -508,7 +508,7 @@ struct MountVolumeBody {
 /// musique — le client enchaîne ensuite sur POST /system/music-dirs/add avec
 /// le mount_path retourné (validation + scan immédiat déjà en place là-bas).
 async fn mount_volume(
-    _admin: crate::auth::RequireAdmin,
+    _garde: crate::auth::AdminOuCetteMachine,
     Json(body): Json<MountVolumeBody>,
 ) -> Result<Json<Value>, AppError> {
     require_appliance()?;
@@ -593,7 +593,9 @@ async fn install_status() -> Result<Json<Value>, AppError> {
 }
 
 async fn install_to_disk(
-    _admin: crate::auth::RequireAdmin,
+    // Sécurité : administrateur, ou cette machine si l'authentification est
+    // coupée — on n'efface pas un disque depuis le réseau sans se nommer.
+    _garde: crate::auth::AdminOuCetteMachine,
     Json(body): Json<InstallBody>,
 ) -> Result<Json<Value>, AppError> {
     require_appliance()?;
@@ -745,7 +747,7 @@ struct RelocateBody {
 }
 
 async fn relocate(
-    _admin: crate::auth::RequireAdmin,
+    _garde: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     Json(body): Json<RelocateBody>,
 ) -> Result<Json<Value>, AppError> {

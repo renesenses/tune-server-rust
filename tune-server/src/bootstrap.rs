@@ -475,6 +475,10 @@ pub async fn run_with(opts: RunOptions) {
     crate::boot_status::set_phase("partages réseau");
     crate::startup::remount_network_shares(&state).await;
 
+    // #8325 / ESL63P — le réglage « Balises du classique » dans son miroir en
+    // mémoire AVANT le premier scan : le scan le lit à chaque fichier.
+    tune_core::metadata::balises_classique::charger(&state.backend);
+
     // Auto-scan music directories at startup — et, même sans `auto_scan`,
     // la reprise d'un scan qu'une mise à jour forcée a arrêté (#5531).
     let scan_done = if crate::auto_scan::scan_au_demarrage(config.auto_scan, &state.backend) {
@@ -602,6 +606,7 @@ pub async fn run_with(opts: RunOptions) {
     // leur nom : un démarrage resté sur la page d'attente ne laissait voir
     // que « découverte réseau », qui n'était plus l'étape en cours.
     crate::boot_status::set_phase("Spotify Connect");
+    routes::spotify_connect::brancher_les_sessions(&state);
     routes::spotify_connect::auto_start(&state).await;
 
     // Clone before `state` is moved into the router — used to auto-resume local

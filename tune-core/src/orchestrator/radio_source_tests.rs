@@ -70,6 +70,7 @@ async fn preparer_contre_la_station(
             levels_tx: &None,
             rt: &rt,
             strict_bitperfect,
+            frequence_fixe: None,
             sortie_locale: false,
         };
         match preparer_la_sortie(&mut etat, &url, &canaux, &sonde) {
@@ -252,6 +253,7 @@ async fn radio_5716_la_sonde_retient_le_codec_de_la_station() {
                 en_vol: &None,
                 levels_tx: &None,
                 rt: &rt,
+                frequence_fixe: None,
                 strict_bitperfect: false,
                 sortie_locale: false,
             };

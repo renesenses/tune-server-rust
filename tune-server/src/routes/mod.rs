@@ -1,3 +1,5 @@
+/// web#916 — la raison de chaque suggestion d'accueil et « Pas pour moi ».
+pub mod accueil_justifie;
 pub mod active_profile;
 /// #4626 — appairage maître / agent et ordres entre serveurs Tune.
 pub mod agent_tune;
@@ -29,6 +31,8 @@ pub mod reaffectation_canaux;
 /// #7614 — le greffon de suréchantillonnage (`/upsampler`).
 pub mod upsampler;
 pub use tune_streaming_http::deezer_proxy_handler;
+/// Sécurité — chemins clients confinés (lecture et écriture).
+pub(crate) mod confinement;
 pub mod developer_api;
 pub mod devialet_air;
 pub mod devices;
@@ -118,6 +122,8 @@ pub use tune_stream_http as stream_handler;
 // chemin historique `routes::streaming` pour les appelants.
 pub use tune_streaming_http as streaming;
 pub mod sources_physiques;
+// #8189 — sources réseau lues sans montage (socle « source distante »).
+pub mod sources_reseau;
 pub mod support;
 pub mod system;
 pub mod tagger;
@@ -512,6 +518,7 @@ pub fn router_with_plugins(
         .nest("/library/smart-collections", smart_collections::router())
         .nest("/export", export::router())
         .nest("/network", network::router())
+        .nest("/sources-reseau", sources_reseau::router())
         .nest(
             "/appliance",
             appliance::router().merge(appliance_storage::router()),

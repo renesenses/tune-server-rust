@@ -162,7 +162,11 @@ fn concurrence_depuis_reglage(reglage: Option<&str>) -> usize {
     {
         return n;
     }
-    concurrence_pour_stockage(mountinfo().as_deref(), &racine_scannee(), disque_rotatif())
+    concurrence_pour_stockage(
+        mountinfo().as_deref(),
+        &racine_scannee(),
+        verdict_du_disque(),
+    )
 }
 
 /// La décision complète, une fois le réglage manuel écarté : type de disque ET
@@ -342,12 +346,57 @@ fn mountinfo() -> Option<String> {
 /// fichiers sur un disque USB : **5,8 fichiers/s**, contre 44 000 en une
 /// trentaine de secondes sur SSD dans notre propre README (#1948).
 ///
-/// `None` — type inconnu, ou pas Linux — garde la valeur d'origine : on ne
-/// dégrade pas un SSD par prudence mal placée.
+/// `None` — la sonde a CHERCHÉ et n'a rien trouvé — part d'un pool PRUDENT,
+/// `min(4, processeurs)` (#8805). Avant, ce cas gardait 32, « pour ne pas
+/// dégrader un SSD par prudence mal placée ». Le fil 2841 a montré ce que coûte
+/// l'autre erreur : un conteneur Docker (montage lié, overlay, FUSE : pas de
+/// `/sys/dev/block/<maj:min>/queue/rotational` lisible) sur 4 processeurs,
+/// 120 448 pistes, 32 fils `scan-io` tous en état D, iowait de 90 à 95 %,
+/// charge de 35, et un `COUNT(*) FROM tracks_fts` de 115 s qui figeait toute
+/// l'API. Un SSD bridé à 4 scanne plus lentement ; un disque saturé à 32 rend
+/// le serveur injoignable. Le premier se corrige par
+/// `TUNE_SCAN_IO_CONCURRENCY`, le second non.
+///
+/// Un SSD RECONNU (`Some(false)`) garde 32, un disque à plateaux reconnu
+/// (`Some(true)`) garde 4 : rien ne change pour eux. Hors Linux, il n'y a pas
+/// de sonde du tout, et [`verdict_du_disque`] ne fait pas passer cette absence
+/// pour un « inconnu ».
 pub(crate) fn concurrence_pour_disque(rotatif: Option<bool>) -> usize {
     match rotatif {
-        Some(true) => 4,
-        _ => SCAN_IO_CONCURRENCY,
+        Some(true) => SCAN_IO_CONCURRENCY_PLATEAUX,
+        Some(false) => SCAN_IO_CONCURRENCY,
+        None => concurrence_prudente(
+            std::thread::available_parallelism()
+                .map(std::num::NonZeroUsize::get)
+                .unwrap_or(1),
+        ),
+    }
+}
+
+/// Concurrence d'un disque à plateaux reconnu (#1948, mesuré chez Yacine).
+const SCAN_IO_CONCURRENCY_PLATEAUX: usize = 4;
+
+/// Le pool d'un disque de type INCONNU (#8805) : pas plus que les plateaux,
+/// et pas plus de fils que de processeurs — `available_parallelism` suit le
+/// quota de processeurs d'un conteneur. Jamais zéro. Pure, pour l'éprouver
+/// sans dépendre de la machine de test.
+fn concurrence_prudente(processeurs: usize) -> usize {
+    processeurs.clamp(1, SCAN_IO_CONCURRENCY_PLATEAUX)
+}
+
+/// Ce que la décision reçoit comme verdict de disque.
+///
+/// Sous Linux : la sonde `/sys`, et son `None` veut dire « cherché, pas
+/// trouvé » — le conteneur de #8805 — d'où la concurrence prudente. Ailleurs
+/// (macOS, Windows), il n'y a PAS de sonde : son absence n'apprend rien sur le
+/// disque, et ces machines gardent le comportement d'avant (32), qu'aucun
+/// signalement ne met en cause. Un Docker Desktop sur Mac ou Windows fait
+/// tourner un noyau Linux : il passe par la première branche.
+fn verdict_du_disque() -> Option<bool> {
+    if cfg!(target_os = "linux") {
+        disque_rotatif()
+    } else {
+        Some(false)
     }
 }
 
@@ -364,8 +413,8 @@ pub(crate) fn concurrence_pour_disque(rotatif: Option<bool>) -> usize {
 ///
 /// AVEUGLE AUX MONTAGES RÉSEAU, par construction : un partage CIFS ou NFS n'a
 /// pas de périphérique bloc, `/sys/dev/block/<maj>:<min>` n'existe donc pas et
-/// cette sonde rend `None` — c'est-à-dire « garde 32 », sur le lien réseau d'un
-/// NAS grand public (Pierre M, fil 1043 : time-outs en rafale). C'est
+/// cette sonde rend `None` — qui gardait 32 jusqu'à #8805, sur le lien réseau
+/// d'un NAS grand public (Pierre M, fil 1043 : time-outs en rafale). C'est
 /// `systeme_de_fichiers_du_chemin` qui couvre ce cas, en parallèle.
 pub(crate) fn disque_rotatif() -> Option<bool> {
     #[cfg(target_os = "linux")]
@@ -1351,6 +1400,29 @@ pub fn dedoublonner_racines(dirs: &[String]) -> RacinesDedoublonnees {
     verdict
 }
 
+/// Un fichier d'une source distante entre-t-il au parcours ? Les formats lus
+/// seulement, ni feuille CUE ni image ISO (pas encore lues à distance), ni
+/// fichier écarté par un motif d'exclusion.
+fn fichier_distant_retenu(nom: &str, excludes: &[String]) -> bool {
+    let p = Path::new(nom);
+    let ext = p
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if ext == "cue" || ext == "iso" {
+        return false;
+    }
+    let nom_l = nom.to_lowercase();
+    if excludes.iter().any(|x| nom_l.contains(x.as_str())) {
+        return false;
+    }
+    matches!(
+        crate::audio::support::library_audio_support_by_extension(p),
+        crate::audio::support::LibraryAudioSupport::Supported
+    )
+}
+
 pub fn list_audio_files(dirs: &[String]) -> ListAudioResult {
     list_audio_files_with_excludes(dirs, &[])
 }
@@ -1461,6 +1533,39 @@ pub fn list_audio_files_avec_arret(
 
     for dir in &racines.retenues {
         let normalized = normalize_path(dir);
+        // #8189 — une racine sur une source distante (`tune-src://…`) : le
+        // parcours passe par le protocole, et reprend un parcours interrompu.
+        // Illisible, elle est NOMMÉE et protégée de la purge comme un NAS
+        // démonté (`missing_dirs`), jamais rendue en liste partielle.
+        if crate::sources_reseau::est_chemin_distant(&normalized) {
+            let garder = |nom: &str| fichier_distant_retenu(nom, &excludes);
+            match crate::sources_reseau::parcourir_la_racine(
+                &normalized,
+                &garder,
+                arret,
+                std::time::Duration::from_millis(500),
+            ) {
+                Ok(trouves) => files.extend(trouves.into_iter().map(PathBuf::from)),
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted && arret() => {
+                    info!(racine = %normalized, "scan_listing_interrompu — arrêt demandé");
+                    return None;
+                }
+                Err(e) => {
+                    warn!(
+                        dir = %normalized,
+                        error = %e,
+                        code = crate::sources_reseau::systeme::code_d_erreur(&e),
+                        "scan_source_distante_illisible — racine protégée"
+                    );
+                    missing_dir_reasons.push(format!(
+                        "{normalized} : source réseau injoignable ({})",
+                        crate::sources_reseau::systeme::code_d_erreur(&e)
+                    ));
+                    missing_dirs.push(normalized);
+                }
+            }
+            continue;
+        }
         let dir_path = std::path::Path::new(&normalized);
 
         // Probe with read_dir instead of a bare exists(): on Windows a NAS path
@@ -2692,13 +2797,57 @@ mod tests {
         assert_eq!(concurrence_pour_disque(Some(true)), 4);
     }
 
-    /// Un SSD garde la valeur d'origine, et surtout un type INCONNU aussi :
-    /// hors Linux, ou si `/sys` est illisible, on ne dégrade pas tout le monde
-    /// par prudence mal placée.
+    /// Un SSD reconnu garde la valeur d'origine (#8805 n'y change rien).
     #[test]
-    fn un_ssd_ou_un_type_inconnu_garde_la_valeur_d_origine() {
+    fn un_ssd_reconnu_garde_la_valeur_d_origine() {
         assert_eq!(concurrence_pour_disque(Some(false)), SCAN_IO_CONCURRENCY);
-        assert_eq!(concurrence_pour_disque(None), SCAN_IO_CONCURRENCY);
+        assert_eq!(SCAN_IO_CONCURRENCY, 32);
+    }
+
+    /// #8805 (fil 2841) — un disque de type INCONNU ne doit plus être lu à 32
+    /// en parallèle : c'est le conteneur Docker à 4 processeurs dont les 32
+    /// fils `scan-io` saturaient le disque (iowait 95 %) et figeaient l'API.
+    #[test]
+    fn un_disque_de_type_inconnu_part_d_un_pool_prudent() {
+        let n = concurrence_pour_disque(None);
+        let processeurs = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1);
+        assert_eq!(n, processeurs.min(4), "min(4, processeurs)");
+        assert!((1..=4).contains(&n), "pool prudent hors bornes : {n}");
+        assert!(n < SCAN_IO_CONCURRENCY);
+        // Et la règle elle-même, indépendamment de la machine de test.
+        assert_eq!(concurrence_prudente(0), 1, "jamais zéro fil");
+        assert_eq!(concurrence_prudente(1), 1);
+        assert_eq!(concurrence_prudente(2), 2);
+        assert_eq!(concurrence_prudente(4), 4, "le conteneur de #8805");
+        assert_eq!(concurrence_prudente(64), 4);
+    }
+
+    /// Le reste de la décision ne bouge pas : plateaux reconnus à 4, montage
+    /// réseau à 8, et un SSD local reconnu à 32. Un type inconnu sur un partage
+    /// réseau prend le plus étroit des deux verdicts.
+    #[test]
+    fn la_decision_par_stockage_garde_ses_autres_verdicts() {
+        let racine = std::path::Path::new("/mnt/nvme/musique");
+        assert_eq!(concurrence_pour_stockage(None, racine, Some(false)), 32);
+        assert_eq!(concurrence_pour_stockage(None, racine, Some(true)), 4);
+        assert_eq!(
+            concurrence_pour_stockage(None, racine, None),
+            concurrence_pour_disque(None)
+        );
+        assert!(
+            concurrence_pour_stockage(Some(MOUNTINFO), std::path::Path::new("/mnt/nas/a"), None)
+                <= 4
+        );
+    }
+
+    /// Hors Linux il n'y a pas de sonde : l'absence n'est pas un « inconnu »,
+    /// le comportement d'avant (32 sur un disque local) reste.
+    #[test]
+    #[cfg(not(target_os = "linux"))]
+    fn hors_linux_le_verdict_reste_celui_d_avant() {
+        assert_eq!(verdict_du_disque(), Some(false));
     }
 
     /// La sonde ne doit jamais paniquer ni bloquer : ce n'est qu'une heuristique
@@ -2886,11 +3035,17 @@ mod tests {
         // Sans variable, c'est le TYPE DE DISQUE qui décide (#1948) — plus la
         // constante. Comparer à la constante ferait passer ce test par chance
         // sur un runner à SSD, et échouer sur une machine à plateaux.
-        let sans_variable =
-            concurrence_pour_stockage(mountinfo().as_deref(), &racine_scannee(), disque_rotatif());
+        let sans_variable = concurrence_pour_stockage(
+            mountinfo().as_deref(),
+            &racine_scannee(),
+            verdict_du_disque(),
+        );
         assert_eq!(concurrence_depuis_reglage(None), sans_variable);
 
         assert_eq!(concurrence_depuis_reglage(Some("8")), 8);
+        // #8805 — le réglage passe AU-DESSUS du pool prudent d'un disque
+        // inconnu : c'est le moyen de forcer 32 sur un conteneur à SSD.
+        assert_eq!(concurrence_depuis_reglage(Some("32")), 32);
         // Les espaces autour du nombre sont tolérés : un réglage recopié dans
         // un fichier d'unité systemd en traîne souvent.
         assert_eq!(concurrence_depuis_reglage(Some(" 8 ")), 8);

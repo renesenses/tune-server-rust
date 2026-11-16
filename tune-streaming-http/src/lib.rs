@@ -25,6 +25,7 @@ pub mod deezer_proxy_handler;
 pub mod etiquettes_langue;
 /// #8066 — remplacer un titre indisponible dans une playlist du service.
 mod remplacement_indisponibles_8066;
+mod spotify_relais;
 
 /// Sous-ensemble de l'état serveur nécessaire aux routes des services de
 /// streaming. Cette frontière empêche ces routes de dépendre de tout le
@@ -223,6 +224,21 @@ struct StreamingFailure {
 fn svc_response<R: serde::Serialize>(result: Result<R, tune_core::TuneError>) -> Response {
     match result {
         Ok(data) => Json(json!(data)).into_response(),
+        // #8579 — un refus qui porte un code stable (Spotify :
+        // `spotify_reconnexion_favoris`, liaison sans la portée d'écriture
+        // des favoris) : 409 JSON `{code, error, message}`, que l'écran
+        // traduit et accompagne de « Reconnecter ». Aucune route de ce
+        // convertisseur ne rendait `Refused` jusqu'ici (les refus de
+        // connexion passent par `reponse_echec_auth`).
+        Err(tune_core::TuneError::Refused { code, message }) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "code": code,
+                "error": code,
+                "message": message,
+            })),
+        )
+            .into_response(),
         Err(e) => {
             let status = statut_porte_par_l_erreur(&e).unwrap_or(StatusCode::BAD_GATEWAY);
             let error_kind = match &e {
@@ -237,6 +253,7 @@ fn svc_response<R: serde::Serialize>(result: Result<R, tune_core::TuneError>) ->
                 tune_core::TuneError::Unsupported(_) => "unsupported",
                 tune_core::TuneError::Credentials(_) => "credentials",
                 tune_core::TuneError::AppRefused(_) => "app_refused",
+                tune_core::TuneError::Refused { .. } => "refused",
                 tune_core::TuneError::Other(_) => "other",
             };
             let message = e.to_string();
@@ -247,6 +264,35 @@ fn svc_response<R: serde::Serialize>(result: Result<R, tune_core::TuneError>) ->
             });
             response
         }
+    }
+}
+
+#[cfg(test)]
+mod tests_refus_code_8579 {
+    //! #8579 — un refus au code stable devient un 409 JSON que l'écran
+    //! traduit (« Reconnectez Spotify une fois pour gérer vos favoris »).
+    use super::*;
+
+    #[tokio::test]
+    async fn un_refus_au_code_stable_rend_un_409_json() {
+        let r = svc_response::<()>(Err(tune_core::TuneError::Refused {
+            code: tune_core::streaming::spotify::CODE_RECONNEXION_FAVORIS,
+            message: "portee manquante".into(),
+        }));
+        assert_eq!(r.status(), StatusCode::CONFLICT);
+        let octets = axum::body::to_bytes(r.into_body(), 1 << 16).await.unwrap();
+        let corps: Value = serde_json::from_slice(&octets).expect("corps JSON");
+        assert_eq!(corps["code"], "spotify_reconnexion_favoris");
+        assert_eq!(corps["error"], "spotify_reconnexion_favoris");
+    }
+
+    /// Contre-épreuve : une panne ordinaire garde son 502 en texte.
+    #[tokio::test]
+    async fn une_panne_garde_son_502() {
+        let r = svc_response::<()>(Err(tune_core::TuneError::Streaming(
+            "spotify PUT /me/library: 500".into(),
+        )));
+        assert_eq!(r.status(), StatusCode::BAD_GATEWAY);
     }
 }
 
@@ -442,6 +488,34 @@ macro_rules! with_svc_editorial {
         svc_response_editorial($body)
     }};
 }
+/// Une rubrique éditoriale qui peut être RETIRÉE par le service : la réponse
+/// porte `x-tune-rubrique-retiree` quand le service le dit, pour que l'écran
+/// affiche « ne fournit plus cette rubrique » au lieu d'une rubrique vide.
+/// Le corps est inchangé (liste vide) : les clients qui ignorent l'en-tête
+/// voient ce qu'ils voyaient.
+macro_rules! with_svc_editorial_retirable {
+    ($state:expr, $service:expr, $rubrique:expr, |$svc:ident| $body:expr) => {{
+        let arc = match get_svc_actif($state, $service).await {
+            Ok(s) => s,
+            Err(e) => return e.into_response(),
+        };
+        let $svc = arc.read().await;
+        let reponse = svc_response_editorial($body);
+        marquer_si_retiree(reponse, $svc.rubrique_retiree($rubrique))
+    }};
+}
+
+/// Pose `x-tune-rubrique-retiree` sur une réponse réussie si `retiree`.
+fn marquer_si_retiree(mut reponse: Response, retiree: bool) -> Response {
+    if retiree && reponse.status().is_success() {
+        reponse.headers_mut().insert(
+            tune_core::streaming::ENTETE_RUBRIQUE_RETIREE,
+            axum::http::HeaderValue::from_static("1"),
+        );
+    }
+    reponse
+}
+
 macro_rules! with_svc_mut {
     ($state:expr, $service:expr, |$svc:ident| $body:expr) => {{
         let arc = match get_svc_actif($state, $service).await {
@@ -633,6 +707,11 @@ where
             "/{service}/favorites/{fav_type}/{item_id}",
             post(service_add_favorite).delete(service_remove_favorite),
         )
+        // #8481 — le pays du catalogue (TIDAL ; Qobuz répond 422).
+        .route(
+            "/{service}/catalog-country",
+            get(service_catalog_country).put(service_set_catalog_country),
+        )
         .route("/{service}/enable", post(service_enable))
         .route("/{service}/disable", post(service_disable))
         .route("/{service}/auth/url", get(service_auth_url))
@@ -642,6 +721,17 @@ where
         .route("/youtube/moods/{params}", get(youtube_mood))
         .route("/youtube/library", get(youtube_library))
         .route("/spotify/callback", get(spotify_callback))
+        // #8198 — le verificateur de configuration Spotify.
+        .route("/spotify/diagnostic", get(spotify_diagnostic))
+        // #8198, volet 3 — retour par le relais HTTPS (désactivé par défaut).
+        .route(
+            "/spotify/relais",
+            get(spotify_relais::lire).put(spotify_relais::regler),
+        )
+        .route(
+            "/spotify/retour",
+            get(spotify_relais::retour_get).post(spotify_relais::retour_post),
+        )
         // #6784 — finir la connexion Spotify depuis un téléphone.
         .route(
             "/spotify/connect",
@@ -885,12 +975,17 @@ async fn service_artist_top_tracks(
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let pistes = arc
-        .read()
-        .await
-        .get_artist_top_tracks(&artist_id)
-        .await
-        .map(dedoublonner_titres_phares);
+    let (pistes, retiree) = {
+        let svc = arc.read().await;
+        let pistes = svc
+            .get_artist_top_tracks(&artist_id)
+            .await
+            .map(dedoublonner_titres_phares);
+        (
+            pistes,
+            svc.rubrique_retiree(tune_core::streaming::RubriqueRetirable::TitresPhares),
+        )
+    };
     let pistes = match pistes {
         Ok(p) => p,
         Err(e) => return svc_response::<()>(Err(e)),
@@ -899,10 +994,24 @@ async fn service_artist_top_tracks(
     // #7107 — la popularité Last.fm complète la liste du service (qui n'est
     // que l'ordre d'un album) ; sans clé ou en échec, la liste ne change pas.
     let cle = tune_core::streaming::titres_phares_lastfm::cle_lastfm(&state.backend);
+    // #8350 — le MBID de la bibliothèque d'abord ; l'identifiant de la page
+    // écarte les homonymes trouvés par recherche.
+    let nom = items
+        .first()
+        .and_then(|v| v.get("artist_name"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let mbid =
+        tune_core::streaming::titres_phares_lastfm::mbid_de_la_bibliotheque(&state.backend, &nom);
     tune_core::streaming::titres_phares_lastfm::completer(
         &state.http,
         &tune_core::streaming::titres_phares_lastfm::Reglages::production(&cle),
         &service,
+        &tune_core::streaming::titres_phares_lastfm::ArtisteDeLaPage {
+            id: &artist_id,
+            mbid: mbid.as_deref(),
+        },
         &mut items,
         |requete| {
             let arc = arc.clone();
@@ -931,7 +1040,9 @@ async fn service_artist_top_tracks(
         &mut items,
     )
     .await;
-    Json(Value::Array(items)).into_response()
+    // Titres phares retirés par le service : l'écran le dit, même si les
+    // écoutes de ce serveur ou Last.fm ont complété la liste.
+    marquer_si_retiree(Json(Value::Array(items)).into_response(), retiree)
 }
 
 /// Écart de durée sous lequel deux titres phares de même nom et de même
@@ -1152,7 +1263,12 @@ async fn service_featured(
     State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
 ) -> Response {
-    with_svc_editorial!(&state, &service, |svc| svc.get_featured().await)
+    with_svc_editorial_retirable!(
+        &state,
+        &service,
+        tune_core::streaming::RubriqueRetirable::Selection,
+        |svc| svc.get_featured().await
+    )
 }
 
 /// #7822 — `GET /streaming/{service}/mixes` : les mixes du compte, liste
@@ -1169,7 +1285,12 @@ async fn service_new_releases(
     State(state): State<StreamingHttpState>,
     Path(service): Path<String>,
 ) -> Response {
-    with_svc_editorial!(&state, &service, |svc| svc.get_new_releases().await)
+    with_svc_editorial_retirable!(
+        &state,
+        &service,
+        tune_core::streaming::RubriqueRetirable::Nouveautes,
+        |svc| svc.get_new_releases().await
+    )
 }
 
 #[derive(Deserialize)]
@@ -1183,7 +1304,12 @@ async fn service_genres(
     Query(q): Query<GenreQuery>,
 ) -> Response {
     let pid = q.parent_id.as_deref();
-    with_svc_editorial!(&state, &service, |svc| svc.get_genres(pid).await)
+    with_svc_editorial_retirable!(
+        &state,
+        &service,
+        tune_core::streaming::RubriqueRetirable::Genres,
+        |svc| svc.get_genres(pid).await
+    )
 }
 
 #[derive(Deserialize)]
@@ -1203,9 +1329,12 @@ async fn service_genre_albums(
 ) -> Response {
     let limit = q.limit.unwrap_or(50);
     match q.section.as_deref() {
-        None => with_svc_editorial!(&state, &service, |svc| svc
-            .get_genre_albums(&genre_id, limit)
-            .await),
+        None => with_svc_editorial_retirable!(
+            &state,
+            &service,
+            tune_core::streaming::RubriqueRetirable::Genres,
+            |svc| svc.get_genre_albums(&genre_id, limit).await
+        ),
         Some(section) => with_svc_editorial!(&state, &service, |svc| svc
             .get_genre_section(&genre_id, section, limit)
             .await),
@@ -1690,6 +1819,11 @@ async fn service_auth(
         serde_json::from_slice(&raw_body).ok()
     };
 
+    // #8198 — Spotify : réglage du relais appliqué, autorisations
+    // persistées reprises (serveur redémarré entre le clic et le retour).
+    if service == "spotify" {
+        spotify_relais::preparer(&state).await;
+    }
     let svc = match get_svc(&state, &service).await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
@@ -1698,9 +1832,13 @@ async fn service_auth(
     let mut svc = svc.write().await;
     let credentials = identifiants_pour_le_client(&service, body, &headers);
 
-    match svc.authenticate(&credentials).await {
+    let issue = svc.authenticate(&credentials).await;
+    drop(svc);
+    if service == "spotify" {
+        spotify_relais::persister(&state).await;
+    }
+    match issue {
         Ok(status) => {
-            drop(svc);
             state.save_tokens().await;
             // Nouveau compte possible : les listes de l'ancien ne valent plus.
             purge_contenu_utilisateur(&service);
@@ -1762,6 +1900,16 @@ pub const CODE_APPLICATION_REFUSEE: &str = "service_app_refused";
 /// `qobuz login: 401 {"status":"error",…}`). Le statut reste 400, comme avant :
 /// 401 serait lu par le client comme une session perdue. Toute autre erreur
 /// garde le texte brut, comme avant.
+/// #8198 — le code stable d'un refus, s'il en porte un.
+pub(crate) fn reponse_code_de(e: &tune_core::TuneError) -> Option<&'static str> {
+    match e {
+        tune_core::TuneError::Refused { code, .. } => Some(code),
+        tune_core::TuneError::Credentials(_) => Some(CODE_IDENTIFIANTS_REFUSES),
+        tune_core::TuneError::AppRefused(_) => Some(CODE_APPLICATION_REFUSEE),
+        _ => None,
+    }
+}
+
 fn reponse_echec_auth(service: &str, e: &tune_core::TuneError) -> Response {
     match e {
         tune_core::TuneError::Credentials(message) => (
@@ -1777,6 +1925,18 @@ fn reponse_echec_auth(service: &str, e: &tune_core::TuneError) -> Response {
             StatusCode::BAD_REQUEST,
             Json(json!({
                 "code": CODE_APPLICATION_REFUSEE,
+                "service": service,
+                "error": message,
+            })),
+        )
+            .into_response(),
+        // #8142 — un refus qui porte son propre code (`spotify_callback_sans_code`,
+        // `spotify_autorisation_refusee`, `spotify_state_inconnu`) : sans lui,
+        // le client n'avait qu'un texte brut et affichait son message générique.
+        tune_core::TuneError::Refused { code, message } => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "code": code,
                 "service": service,
                 "error": message,
             })),
@@ -2045,10 +2205,72 @@ async fn lire_favoris(
 ///
 /// Facultatifs : absents, la réponse est celle d'avant, dans l'ordre du
 /// service.
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
 struct TriQuery {
     sort: Option<String>,
     order: Option<String>,
+    /// #8040 — page demandée, facultative. Absents tous les deux, la réponse
+    /// est la liste entière d'avant.
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+impl TriQuery {
+    fn sans_tri(&self) -> bool {
+        TriFavoris::depuis(self.sort.as_deref(), self.order.as_deref()).is_none()
+    }
+}
+
+/// #8040 — la page demandée sur la route des favoris (`?limit=&offset=`).
+///
+/// `None` sans aucun des deux paramètres : la réponse reste la liste entière,
+/// octet pour octet, pour les applications qui la demandent ainsi.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PageDemandee {
+    limit: usize,
+    offset: usize,
+}
+
+impl PageDemandee {
+    /// Taille de page quand le client ne donne qu'`offset`.
+    const LIMITE_DEFAUT: usize = 50;
+    /// Au-delà, c'est une liste entière qui se demande sans paramètres.
+    const LIMITE_MAX: usize = 1000;
+
+    fn depuis(q: &TriQuery) -> Option<Self> {
+        if q.limit.is_none() && q.offset.is_none() {
+            return None;
+        }
+        Some(Self {
+            limit: q
+                .limit
+                .unwrap_or(Self::LIMITE_DEFAUT)
+                .clamp(1, Self::LIMITE_MAX),
+            offset: q.offset.unwrap_or(0),
+        })
+    }
+
+    /// Découpe la liste `{cle: [...]}` en `{cle: [page], total, limit,
+    /// offset}` — après le tri, qui porte sur la liste entière.
+    fn decouper(self, mut donnees: Value, cle: &str) -> Value {
+        let liste = donnees
+            .get_mut(cle)
+            .and_then(Value::as_array_mut)
+            .map(std::mem::take)
+            .unwrap_or_default();
+        let total = liste.len();
+        let page: Vec<Value> = liste
+            .into_iter()
+            .skip(self.offset)
+            .take(self.limit)
+            .collect();
+        json!({
+            cle: page,
+            "total": total,
+            "limit": self.limit,
+            "offset": self.offset,
+        })
+    }
 }
 
 /// Pose le tri demandé sur une réponse de favoris, **après** le cache.
@@ -2063,6 +2285,67 @@ fn poser_le_tri(mut donnees: Value, q: &TriQuery) -> Value {
         tune_core::favorites_sort::trier_liste_json(&mut donnees, tri);
     }
     donnees
+}
+
+/// Ce qui part au client depuis une liste ENTIÈRE (du cache ou du service) :
+/// le tri (#2001), puis la page demandée (#8040), s'il y en a une.
+fn presenter(donnees: Value, fav_type: &str, q: &TriQuery) -> Value {
+    let donnees = poser_le_tri(donnees, q);
+    match (PageDemandee::depuis(q), TypeFavori::parse(fav_type)) {
+        (Some(page), Some(t)) => page.decouper(donnees, t.cle()),
+        _ => donnees,
+    }
+}
+
+/// #8040 — une page lue CHEZ LE SERVICE, en une requête, quand le connecteur
+/// sait le faire. `None` sinon : l'appelant lit la liste entière.
+async fn lire_une_page(
+    svc: &dyn StreamingService,
+    fav_type: &str,
+    page: PageDemandee,
+) -> Result<Option<Value>, tune_core::TuneError> {
+    let Some(cle) = TypeFavori::parse(fav_type).map(TypeFavori::cle) else {
+        return Ok(None);
+    };
+    Ok(svc
+        .get_user_favorites_page(fav_type, page.limit, page.offset)
+        .await?
+        .map(|p| {
+            json!({
+                cle: p.items,
+                "total": p.total,
+                "limit": page.limit,
+                "offset": page.offset,
+            })
+        }))
+}
+
+/// La lecture de la route, partagée entre l'aller et la reprise après
+/// rafraîchissement du jeton.
+///
+/// Une page demandée SANS tri part chez le service si le connecteur sait la
+/// servir : c'est la première page affichée tout de suite (#8040). Elle ne
+/// remplit pas le cache, qui ne mémorise que des listes entières. Dans tous
+/// les autres cas, la liste entière est lue, mise en cache, puis triée et
+/// découpée pour le client.
+async fn lire_favoris_pour_la_route(
+    svc: &dyn StreamingService,
+    service: &str,
+    ressource: &str,
+    fav_type: &str,
+    q: &TriQuery,
+) -> Result<Value, tune_core::TuneError> {
+    if let Some(page) = PageDemandee::depuis(q)
+        && q.sans_tri()
+        && let Some(reponse) = lire_une_page(svc, fav_type, page).await?
+    {
+        return Ok(reponse);
+    }
+    let data = lire_favoris(svc, fav_type).await?;
+    // Le cache reçoit la réponse BRUTE ; le tri et la page ne portent que
+    // sur la copie rendue au client.
+    memoriser_contenu_utilisateur(service, ressource, data.clone());
+    Ok(presenter(data, fav_type, q))
 }
 
 /// #7729 — attente maximale de la route des favoris pour les VERROUS : celui
@@ -2135,7 +2418,7 @@ async fn service_favorites(
     };
     let ressource = format!("favorites/{fav_type}");
     if let Some(donnees) = contenu_utilisateur_frais(&service, &ressource) {
-        return Json(poser_le_tri(donnees, &tri)).into_response();
+        return Json(presenter(donnees, &fav_type, &tri)).into_response();
     }
     // Verrou de LECTURE pour l'aller : le client web demande les trois types
     // de favoris en parallèle (`Promise.all`), et le verrou d'écriture que ce
@@ -2146,15 +2429,10 @@ async fn service_favorites(
         let Some(svc) = verrou_borne(echeance, arc.read()).await else {
             return favoris_service_occupe(&service, &fav_type);
         };
-        lire_favoris(&**svc, &fav_type).await
+        lire_favoris_pour_la_route(&**svc, &service, &ressource, &fav_type, &tri).await
     };
     match result {
-        Ok(data) => {
-            // Le cache reçoit la réponse BRUTE ; le tri ne porte que sur la
-            // copie rendue au client.
-            memoriser_contenu_utilisateur(&service, &ressource, data.clone());
-            Json(poser_le_tri(data, &tri)).into_response()
-        }
+        Ok(data) => Json(data).into_response(),
         Err(ref e)
             if {
                 let msg = e.to_string();
@@ -2184,11 +2462,10 @@ async fn service_favorites(
                 let Some(svc) = verrou_borne(echeance, arc.read()).await else {
                     return favoris_service_occupe(&service, &fav_type);
                 };
-                match lire_favoris(&**svc, &fav_type).await {
-                    Ok(data) => {
-                        memoriser_contenu_utilisateur(&service, &ressource, data.clone());
-                        Json(poser_le_tri(data, &tri)).into_response()
-                    }
+                match lire_favoris_pour_la_route(&**svc, &service, &ressource, &fav_type, &tri)
+                    .await
+                {
+                    Ok(data) => Json(data).into_response(),
                     Err(e) => (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
                 }
             } else {
@@ -2231,6 +2508,93 @@ async fn service_disable(
         .ok();
     // #6173 — `disableStreamingService` (web) lit `status`.
     Json(json!({"service": service, "enabled": false, "status": "disabled"})).into_response()
+}
+
+/// #8481 — la clé de réglage qui garde le pays du catalogue choisi.
+pub fn cle_pays_du_catalogue(service: &str) -> String {
+    format!("streaming_{service}_catalog_country")
+}
+
+/// #8481 — `GET /streaming/{service}/catalog-country` : le pays du compte, le
+/// pays choisi et celui qui part réellement. 422 pour un service qui ne le
+/// laisse pas choisir.
+async fn service_catalog_country(
+    State(state): State<StreamingHttpState>,
+    Path(service): Path<String>,
+) -> Response {
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let svc = svc.read().await;
+    match svc.pays_du_catalogue() {
+        Some(pays) => Json(json!({
+            "service": service,
+            "supported": true,
+            "account_country": pays.du_compte,
+            "chosen_country": pays.choisi,
+            "effective_country": pays.effectif,
+        }))
+        .into_response(),
+        None => (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"service": service, "supported": false})),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct CorpsPaysDuCatalogue {
+    /// `"PL"` pour imposer, `null` ou `""` pour revenir au pays du compte.
+    country: Option<String>,
+}
+
+/// #8481 — `PUT /streaming/{service}/catalog-country` `{"country": "PL"}`.
+/// Le choix est gardé en réglage et remis au démarrage.
+async fn service_set_catalog_country(
+    State(state): State<StreamingHttpState>,
+    Path(service): Path<String>,
+    Json(corps): Json<CorpsPaysDuCatalogue>,
+) -> Response {
+    let svc = match get_svc(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let mut svc = svc.write().await;
+    if svc.pays_du_catalogue().is_none() {
+        return (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            Json(json!({"service": service, "supported": false})),
+        )
+            .into_response();
+    }
+    if let Err(e) = svc.choisir_le_pays_du_catalogue(corps.country.as_deref()) {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+    }
+    // Favoris et playlists mémorisés ont été lus sous l'ancien pays : leurs
+    // disponibilités ne valent plus.
+    purge_contenu_utilisateur(&service);
+    let Some(pays) = svc.pays_du_catalogue() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let cle = cle_pays_du_catalogue(&service);
+    let ecrit = match &pays.choisi {
+        Some(p) => settings.set(&cle, p),
+        None => settings.delete(&cle),
+    };
+    if let Err(e) = ecrit {
+        tracing::warn!(service, error = %e, "pays_du_catalogue_non_garde");
+    }
+    Json(json!({
+        "service": service,
+        "supported": true,
+        "account_country": pays.du_compte,
+        "chosen_country": pays.choisi,
+        "effective_country": pays.effectif,
+    }))
+    .into_response()
 }
 
 async fn service_auth_url(
@@ -2362,6 +2726,33 @@ async fn youtube_library(State(state): State<StreamingHttpState>) -> Response {
 // OAuth callbacks
 // ---------------------------------------------------------------------------
 
+/// `GET /streaming/spotify/diagnostic` — #8198 : ce qui ne va pas dans la
+/// configuration Spotify, champ par champ (voir
+/// `SpotifyService::diagnostic`). Fonctionne service desactive.
+async fn spotify_diagnostic(State(state): State<StreamingHttpState>) -> Response {
+    spotify_relais::preparer(&state).await;
+    let svc = match get_svc(&state, "spotify").await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    // #8198 — copie sous le verrou, sondes de Spotify verrou relache : une
+    // page de diagnostic ne doit bloquer ni l'ecoute ni une connexion.
+    let instantane = {
+        let svc = svc.read().await;
+        svc.as_any()
+            .downcast_ref::<tune_core::streaming::spotify::SpotifyService>()
+            .map(|spotify| spotify.instantane_diagnostic())
+    };
+    match instantane {
+        Some(instantane) => Json(instantane.rapport().await).into_response(),
+        None => (
+            StatusCode::NOT_IMPLEMENTED,
+            Json(json!({"code": "spotify_diagnostic_indisponible", "service": "spotify"})),
+        )
+            .into_response(),
+    }
+}
+
 #[derive(Deserialize)]
 struct SpotifyCallbackQuery {
     code: Option<String>,
@@ -2379,17 +2770,19 @@ async fn spotify_callback(
     let Some(code) = q.code else {
         return (StatusCode::BAD_REQUEST, "missing code parameter").into_response();
     };
+    spotify_relais::preparer(&state).await;
     let svc = match get_svc(&state, "spotify").await {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
-    let mut svc = svc.write().await;
-    match svc
-        .authenticate(&json!({"code": code, "state": q.state}))
+    let issue = svc
+        .write()
         .await
-    {
+        .authenticate(&json!({"code": code, "state": q.state}))
+        .await;
+    spotify_relais::persister(&state).await;
+    match issue {
         Ok(status) => {
-            drop(svc);
             state.save_tokens().await;
             purge_contenu_utilisateur("spotify");
             Json(json!({
@@ -2398,7 +2791,7 @@ async fn spotify_callback(
             }))
             .into_response()
         }
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => reponse_echec_auth("spotify", &e),
     }
 }
 
@@ -3092,10 +3485,7 @@ mod tests_cache_utilisateur {
 
     /// Aucun tri demandé — le cas de tous les appels d'avant #2001.
     fn sans_tri() -> Query<TriQuery> {
-        Query(TriQuery {
-            sort: None,
-            order: None,
-        })
+        Query(TriQuery::default())
     }
 
     /// Lot 5 : dans le TTL, la deuxième lecture ne repart PAS vers le service.
@@ -3276,6 +3666,7 @@ mod tests_cache_utilisateur {
             Query(TriQuery {
                 sort: sort.map(str::to_string),
                 order: order.map(str::to_string),
+                ..TriQuery::default()
             }),
         )
         .await;
@@ -3465,10 +3856,7 @@ mod tests_favoris_dates {
     }
 
     fn sans_tri() -> Query<TriQuery> {
-        Query(TriQuery {
-            sort: None,
-            order: None,
-        })
+        Query(TriQuery::default())
     }
 
     /// #3489, le site d'appel. `get_user_favorites_dated` peut être parfaite
@@ -4293,7 +4681,14 @@ mod temoin_rubriques_dans_la_langue_demandee {
 mod service_desactive_jamais_appele_tests;
 
 #[cfg(test)]
+#[path = "pays_du_catalogue_8481_tests.rs"]
+mod pays_du_catalogue_8481_tests;
+
+#[cfg(test)]
 mod favoris_sans_gel_7729_tests;
+
+#[cfg(test)]
+mod favoris_pagines_8040_tests;
 
 #[cfg(test)]
 mod mixes_du_compte_7822_tests;
@@ -4983,4 +5378,190 @@ mod tests_echec_de_connexion_7068 {
 }
 
 #[cfg(test)]
+mod spotify_messages_clairs_8198_tests;
+#[cfg(test)]
+mod spotify_rappel_colle_8142_tests;
+#[cfg(test)]
+mod spotify_relais_8198_tests;
+
+#[cfg(test)]
 mod bio_qobuz_8129_tests;
+
+#[cfg(test)]
+mod tests_rubrique_retiree_2026 {
+    //! Spotify retire des rubriques aux applications personnelles (#8399,
+    //! #8485, février 2026). La route garde son corps (liste vide) et pose
+    //! `x-tune-rubrique-retiree: 1` : l'écran dit « ne fournit plus cette
+    //! rubrique » au lieu d'une rubrique vide. Une rubrique simplement vide
+    //! ne porte pas l'en-tête.
+    use super::*;
+    use tower::ServiceExt;
+    use tune_core::TuneError;
+    use tune_core::db::sqlite::SqliteDb;
+    use tune_core::streaming::RubriqueRetirable;
+    use tune_core::streaming::traits::{
+        AuthStatus, SearchResults, StreamAlbum, StreamArtist, StreamGenre, StreamPlaylist,
+        StreamTrack, StreamUrl,
+    };
+
+    struct ServiceRetrait {
+        nom: String,
+        retirees: Vec<RubriqueRetirable>,
+    }
+
+    const PANNE: &str = "hors sujet";
+
+    #[async_trait::async_trait]
+    impl StreamingService for ServiceRetrait {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
+        fn name(&self) -> &str {
+            &self.nom
+        }
+        fn enabled(&self) -> bool {
+            true
+        }
+        fn set_enabled(&mut self, _e: bool) {}
+        async fn authenticate(&mut self, _c: &Value) -> Result<AuthStatus, TuneError> {
+            Ok(AuthStatus::default())
+        }
+        async fn auth_status(&self) -> AuthStatus {
+            AuthStatus::default()
+        }
+        async fn logout(&mut self) -> Result<(), TuneError> {
+            Ok(())
+        }
+        fn rubrique_retiree(&self, rubrique: RubriqueRetirable) -> bool {
+            self.retirees.contains(&rubrique)
+        }
+        async fn get_new_releases(&self) -> Result<Vec<StreamAlbum>, TuneError> {
+            Ok(vec![])
+        }
+        async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+            Ok(vec![])
+        }
+        async fn get_genres(&self, _p: Option<&str>) -> Result<Vec<StreamGenre>, TuneError> {
+            Ok(vec![])
+        }
+        async fn get_artist_top_tracks(&self, _a: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Ok(vec![])
+        }
+        async fn search(&self, _q: &str, _l: usize) -> Result<SearchResults, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_track(&self, _t: &str) -> Result<StreamTrack, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_track_url(&self, _t: &str, _q: Option<&str>) -> Result<StreamUrl, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_album(&self, _a: &str) -> Result<StreamAlbum, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_album_tracks(&self, _a: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_artist(&self, _a: &str) -> Result<StreamArtist, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_playlist(&self, _p: &str) -> Result<StreamPlaylist, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_playlist_tracks(&self, _p: &str) -> Result<Vec<StreamTrack>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_user_playlists(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_user_albums(&self) -> Result<Vec<StreamAlbum>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+        async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
+            Err(TuneError::Streaming(PANNE.into()))
+        }
+    }
+
+    async fn entete(
+        nom: &str,
+        retirees: Vec<RubriqueRetirable>,
+        chemin: &str,
+    ) -> (StatusCode, Option<String>, String) {
+        let backend: Arc<dyn DbBackend> =
+            Arc::new(SqliteDb::open_in_memory().expect("sqlite en memoire"));
+        let mut registre = ServiceRegistry::new();
+        registre.register(Box::new(ServiceRetrait {
+            nom: nom.to_string(),
+            retirees,
+        }));
+        let etat = StreamingHttpState::new(
+            backend,
+            Arc::new(Mutex::new(registre)),
+            Arc::new(EventBus::new()),
+        );
+        let app = Router::new().nest("/api/v1/streaming", router().with_state(etat));
+        let r = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/api/v1/streaming/{nom}/{chemin}"))
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let statut = r.status();
+        let valeur = r
+            .headers()
+            .get(tune_core::streaming::ENTETE_RUBRIQUE_RETIREE)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let octets = axum::body::to_bytes(r.into_body(), 1 << 20).await.unwrap();
+        (
+            statut,
+            valeur,
+            String::from_utf8_lossy(&octets).into_owned(),
+        )
+    }
+
+    #[tokio::test]
+    async fn une_rubrique_retiree_porte_l_entete_et_garde_sa_liste_vide() {
+        for (i, (rubrique, chemin)) in [
+            (RubriqueRetirable::Nouveautes, "new-releases"),
+            (RubriqueRetirable::Selection, "featured"),
+            (RubriqueRetirable::Genres, "genres"),
+            (RubriqueRetirable::TitresPhares, "artists/a-1/top-tracks"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let nom = format!("retrait-oui-{i}");
+            let (statut, valeur, corps) = entete(&nom, vec![rubrique], chemin).await;
+            assert_eq!(statut, StatusCode::OK, "{chemin} : {corps}");
+            assert_eq!(valeur.as_deref(), Some("1"), "{chemin} : en-tête absent");
+            assert_eq!(corps.trim(), "[]", "{chemin} : le corps change");
+        }
+    }
+
+    /// Contre-épreuve : une rubrique vide que le service n'a pas retirée ne
+    /// porte pas l'en-tête (l'écran ne doit pas accuser Spotify à tort).
+    #[tokio::test]
+    async fn une_rubrique_simplement_vide_ne_porte_pas_l_entete() {
+        for (i, chemin) in [
+            "new-releases",
+            "featured",
+            "genres",
+            "artists/a-1/top-tracks",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let nom = format!("retrait-non-{i}");
+            let (statut, valeur, _) = entete(&nom, Vec::new(), chemin).await;
+            assert_eq!(statut, StatusCode::OK, "{chemin}");
+            assert!(valeur.is_none(), "{chemin} : en-tête posé à tort");
+        }
+    }
+}
