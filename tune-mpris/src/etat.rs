@@ -51,6 +51,9 @@ pub struct Piste {
     pub cover_path: Option<String>,
     pub track_id: Option<i64>,
     pub source_id: Option<String>,
+    /// `track_generation` du serveur : change à chaque morceau lancé, même
+    /// quand c'est le même titre rejoué. Absent d'un serveur plus ancien.
+    pub generation: Option<i64>,
 }
 
 fn texte(v: &Value, cle: &str) -> Option<String> {
@@ -87,12 +90,18 @@ impl Piste {
             cover_path: texte(v, "cover_path"),
             track_id,
             source_id: texte(v, "source_id"),
+            generation: v.get("track_generation").and_then(Value::as_i64),
         })
     }
 
-    /// Même morceau ? Une radio change de titre sans changer d'identifiant,
-    /// une durée découverte en cours (#5550) ne change pas le morceau.
+    /// Même morceau ? Par `track_generation` quand le serveur la publie des
+    /// deux côtés. Sinon : une radio change de titre sans changer
+    /// d'identifiant, une durée découverte en cours (#5550) ne change pas le
+    /// morceau.
     fn meme_morceau(&self, autre: &Piste) -> bool {
+        if let (Some(a), Some(b)) = (self.generation, autre.generation) {
+            return a == b;
+        }
         self.track_id == autre.track_id
             && self.source_id == autre.source_id
             && self.titre == autre.titre
@@ -162,7 +171,8 @@ impl Etat {
     pub fn position_ms(&self, maintenant: Instant) -> i64 {
         let mut p = self.position_ms;
         if self.statut == Statut::Lecture {
-            p += maintenant.saturating_duration_since(self.ancre).as_millis() as i64;
+            let ecoule = maintenant.saturating_duration_since(self.ancre).as_millis();
+            p = p.saturating_add(i64::try_from(ecoule).unwrap_or(i64::MAX));
         }
         match &self.piste {
             Some(piste) if piste.duree_ms > 0 => p.clamp(0, piste.duree_ms),
@@ -187,6 +197,8 @@ impl Etat {
     }
 
     /// Rend `true` si les métadonnées publiées changent.
+    /// Le morceau change-t-il ? Alors `numero` avance et la position repart
+    /// de zéro.
     fn poser_piste(&mut self, piste: Option<Piste>, maintenant: Instant) -> bool {
         if self.piste == piste {
             return false;
@@ -227,7 +239,12 @@ impl Etat {
             self.nom_de_zone = nom;
         }
         self.courbe = Courbe::depuis(zone.get("volume_curve").and_then(Value::as_str));
-        let piste = zone.get("current_track").and_then(Piste::depuis_json);
+        let mut piste = zone.get("current_track").and_then(Piste::depuis_json);
+        if let Some(p) = piste.as_mut()
+            && p.generation.is_none()
+        {
+            p.generation = zone.get("track_generation").and_then(Value::as_i64);
+        }
         c.metadonnees = self.poser_piste(piste, maintenant);
         let statut = Statut::depuis(zone.get("state").and_then(Value::as_str));
         c.statut = self.poser_statut(statut, maintenant);
@@ -257,9 +274,11 @@ impl Etat {
         let mut c = Changements::default();
         match genre {
             "playback.started" => {
+                // La position ne repart de zéro que pour un AUTRE morceau
+                // (`poser_piste`) : le serveur réémet `started` en recréant
+                // le flux après un saut, sur le même morceau.
                 c.metadonnees = self.poser_piste(Piste::depuis_json(data), maintenant);
                 c.statut = self.poser_statut(Statut::Lecture, maintenant);
-                self.poser_position(0, maintenant);
             }
             "playback.track_changed" => {
                 c.metadonnees = self.poser_piste(Piste::depuis_json(data), maintenant);
@@ -280,7 +299,7 @@ impl Etat {
             "playback.seek" => {
                 let p = data.get("position_ms")?.as_i64()?;
                 self.poser_position(p, maintenant);
-                c.saut = Some(self.position_ms(maintenant) * 1000);
+                c.saut = Some(self.position_ms(maintenant).saturating_mul(1000));
             }
             "playback.volume" => {
                 let g = data.get("volume")?.as_f64()?;
@@ -304,6 +323,10 @@ impl Etat {
 
     pub fn trackid(&self) -> String {
         match &self.piste {
+            Some(Piste {
+                generation: Some(g),
+                ..
+            }) if *g >= 0 => format!("/org/tune/zone{}/generation/{g}", self.zone_id),
             Some(_) => format!("/org/tune/zone{}/piste/{}", self.zone_id, self.numero),
             None => PAS_DE_PISTE.to_string(),
         }
@@ -316,7 +339,10 @@ impl Etat {
             return m;
         };
         if p.duree_ms > 0 {
-            m.push(("mpris:length", Meta::Entier(p.duree_ms * 1000)));
+            m.push((
+                "mpris:length",
+                Meta::Entier(p.duree_ms.saturating_mul(1000)),
+            ));
         }
         if !p.titre.is_empty() {
             m.push(("xesam:title", Meta::Texte(p.titre.clone())));
@@ -334,6 +360,11 @@ impl Etat {
             m.push(("mpris:artUrl", Meta::Texte(u.clone())));
         }
         m
+    }
+
+    /// `CanSeek` : une piste de durée connue (pas une radio).
+    pub fn peut_sauter(&self) -> bool {
+        self.piste.as_ref().is_some_and(|p| p.duree_ms > 0)
     }
 
     /// `Volume` MPRIS : la position du curseur.
@@ -611,6 +642,102 @@ mod tests {
             .unwrap();
         assert!(c.rien());
         assert_eq!(e.position_ms(t0), 121_000);
+    }
+
+    #[test]
+    fn started_sur_le_meme_morceau_garde_la_position() {
+        // Après un saut, le serveur recrée le flux et réémet `started`.
+        let t0 = Instant::now();
+        let mut e = Etat::new(2, "", t0);
+        let data = json!({"zone_id": 2, "track_id": 7, "title": "So What", "duration_ms": 545_000, "track_generation": 11});
+        e.appliquer_evenement(&ev("playback.started", data.clone()), t0);
+        e.appliquer_evenement(
+            &ev(
+                "playback.seek",
+                json!({"zone_id": 2, "position_ms": 200_000}),
+            ),
+            t0,
+        );
+        let id = e.trackid();
+        assert_eq!(id, "/org/tune/zone2/generation/11");
+        e.appliquer_evenement(&ev("playback.started", data), t0);
+        assert_eq!(e.position_ms(t0), 200_000);
+        assert_eq!(e.trackid(), id);
+    }
+
+    #[test]
+    fn la_generation_tranche_le_meme_titre_rejoue() {
+        let t0 = Instant::now();
+        let mut e = Etat::new(2, "", t0);
+        let piste = |g: i64| json!({"zone_id": 2, "track_id": 7, "title": "So What", "duration_ms": 545_000, "track_generation": g});
+        e.appliquer_evenement(&ev("playback.started", piste(11)), t0);
+        e.appliquer_evenement(
+            &ev(
+                "playback.position",
+                json!({"zone_id": 2, "position_ms": 300_000}),
+            ),
+            t0,
+        );
+        let c = e
+            .appliquer_evenement(&ev("playback.started", piste(12)), t0)
+            .unwrap();
+        assert!(c.metadonnees, "nouveau trackid");
+        assert_eq!(e.trackid(), "/org/tune/zone2/generation/12");
+        assert_eq!(e.position_ms(t0), 0, "rejoué depuis le début");
+    }
+
+    #[test]
+    fn la_generation_se_lit_aussi_a_la_racine_de_la_zone() {
+        let t0 = Instant::now();
+        let mut e = Etat::new(2, "", t0);
+        let mut z = zone("playing");
+        z["track_generation"] = json!(5);
+        e.appliquer_zone(&z, t0);
+        assert_eq!(e.trackid(), "/org/tune/zone2/generation/5");
+    }
+
+    #[test]
+    fn durees_et_positions_enormes_ne_debordent_pas() {
+        let t0 = Instant::now();
+        let mut e = Etat::new(2, "", t0);
+        e.appliquer_evenement(
+            &ev(
+                "playback.started",
+                json!({"zone_id": 2, "title": "x", "duration_ms": i64::MAX}),
+            ),
+            t0,
+        );
+        assert!(
+            e.metadonnees()
+                .contains(&("mpris:length", Meta::Entier(i64::MAX)))
+        );
+        let c = e
+            .appliquer_evenement(
+                &ev(
+                    "playback.seek",
+                    json!({"zone_id": 2, "position_ms": i64::MAX / 10}),
+                ),
+                t0,
+            )
+            .unwrap();
+        assert_eq!(c.saut, Some(i64::MAX));
+    }
+
+    #[test]
+    fn peut_sauter_seulement_sur_une_duree_connue() {
+        let t0 = Instant::now();
+        let mut e = Etat::new(2, "", t0);
+        assert!(!e.peut_sauter());
+        e.appliquer_zone(&zone("playing"), t0);
+        assert!(e.peut_sauter());
+        e.appliquer_evenement(
+            &ev(
+                "playback.started",
+                json!({"zone_id": 2, "title": "FIP", "duration_ms": 0}),
+            ),
+            t0,
+        );
+        assert!(!e.peut_sauter());
     }
 
     #[test]

@@ -292,12 +292,18 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
+      # #8824 — l'essai `tune-mpris/tests/bus_prive.rs` lance un `dbus-daemon`
+      # prive. Avec cette variable, son absence le fait ECHOUER au lieu de le
+      # sauter : il ne peut pas passer a vide.
+      TUNE_MPRIS_DBUS_REQUIS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           rustflags: ""
           cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
+      - name: dbus-daemon pour tune-mpris (#8824)
+        run: command -v dbus-daemon || (timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y dbus-daemon)
       # `-p tune-bridge` et `cloud-relay` : le chemin de l'ecoute distante
       # n'etait couvert par AUCUNE porte. Le relais (`tune-bridge`) n'etait ni
       # teste ni compile ici, et `tune-core/src/cloud/relay.rs` vit derriere

@@ -25,4 +25,4 @@ tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 # MPRIS vit sur le bus D-Bus de la session : Linux seulement. Le reste de la
 # caisse (etat, metadonnees, volume, requetes) compile et se teste partout.
 [target.'cfg(target_os = "linux")'.dependencies]
-zbus = { version = "5", default-features = false, features = ["tokio"] }
+zbus = { version = "6", default-features = false, features = ["tokio", "service", "proxy"] }

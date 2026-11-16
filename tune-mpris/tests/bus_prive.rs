@@ -1,6 +1,7 @@
 //! Bout en bout sur un VRAI `dbus-daemon`, mais privé : lancé par l'essai
 //! dans un dossier temporaire, jamais le bus de la session. Sauté (avec un
-//! message) si `dbus-daemon` n'est pas installé.
+//! message) si `dbus-daemon` n'est pas installé, sauf avec
+//! `TUNE_MPRIS_DBUS_REQUIS=1` (la CI) : son absence fait alors échouer l'essai.
 
 #![cfg(target_os = "linux")]
 
@@ -18,7 +19,7 @@ use tune_mpris::requetes::{Action, Commandes};
 use tune_mpris::synchro::Notifieur;
 use zbus::connection::Builder;
 use zbus::proxy::CacheProperties;
-use zbus::zvariant::{ObjectPath, OwnedValue};
+use zbus::{ObjectPath, OwnedVariant};
 
 struct BusPrive {
     processus: Child,
@@ -114,7 +115,7 @@ async fn servir(
     adresse: &str,
     zone_id: i64,
 ) -> (zbus::Connection, String, Arc<Mutex<Etat>>, Arc<FauxServeur>) {
-    let connexion = Builder::address(adresse).unwrap().build().await.unwrap();
+    let connexion = Builder::address(adresse).build().await.unwrap();
     let e = etat(zone_id);
     let faux = Arc::new(FauxServeur::default());
     let nom = publier(
@@ -136,33 +137,33 @@ async fn servir(
 
 #[tokio::test]
 async fn un_client_mpris_lit_et_pilote_la_zone_sur_un_bus_prive() {
-    let Some(bus) = lancer_bus() else { return };
+    let Some(bus) = lancer_bus() else {
+        assert_ne!(
+            std::env::var("TUNE_MPRIS_DBUS_REQUIS").as_deref(),
+            Ok("1"),
+            "dbus-daemon introuvable alors que TUNE_MPRIS_DBUS_REQUIS=1 : l'essai ne doit pas passer à vide"
+        );
+        return;
+    };
     let (connexion, nom, etat, faux) = servir(&bus.adresse, 4).await;
     assert_eq!(nom, NOM);
 
     let client = Builder::address(bus.adresse.as_str())
-        .unwrap()
         .build()
         .await
         .unwrap();
     let lecteur = zbus::proxy::Builder::<zbus::Proxy>::new(&client)
         .destination(NOM)
-        .unwrap()
         .path(CHEMIN)
-        .unwrap()
         .interface("org.mpris.MediaPlayer2.Player")
-        .unwrap()
         .cache_properties(CacheProperties::No)
         .build()
         .await
         .unwrap();
     let racine = zbus::proxy::Builder::<zbus::Proxy>::new(&client)
         .destination(NOM)
-        .unwrap()
         .path(CHEMIN)
-        .unwrap()
         .interface("org.mpris.MediaPlayer2")
-        .unwrap()
         .cache_properties(CacheProperties::No)
         .build()
         .await
@@ -173,7 +174,7 @@ async fn un_client_mpris_lit_et_pilote_la_zone_sur_un_bus_prive() {
     assert_eq!(identite, "Tune (Salon)");
     let statut: String = lecteur.get_property("PlaybackStatus").await.unwrap();
     assert_eq!(statut, "Paused");
-    let meta: HashMap<String, OwnedValue> = lecteur.get_property("Metadata").await.unwrap();
+    let meta: HashMap<String, OwnedVariant> = lecteur.get_property("Metadata").await.unwrap();
     assert_eq!(
         String::try_from(meta["xesam:title"].clone()).unwrap(),
         "All Blues"
@@ -216,9 +217,7 @@ async fn un_client_mpris_lit_et_pilote_la_zone_sur_un_bus_prive() {
     // Un évènement du serveur devient `PropertiesChanged` puis `Seeked`.
     let proprietes = zbus::fdo::PropertiesProxy::builder(&client)
         .destination(NOM)
-        .unwrap()
         .path(CHEMIN)
-        .unwrap()
         .build()
         .await
         .unwrap();

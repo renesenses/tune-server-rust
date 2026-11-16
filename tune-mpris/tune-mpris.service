@@ -12,6 +12,8 @@ PartOf=graphical-session.target
 ExecStart=%h/.local/bin/tune-mpris
 Restart=on-failure
 RestartSec=5
+# 3 = jeton refuse (401) : relancer n'y changerait rien.
+RestartPreventExitStatus=3
 
 [Install]
 WantedBy=graphical-session.target

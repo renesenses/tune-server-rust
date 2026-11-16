@@ -11,6 +11,21 @@ pub const SERVEUR_PAR_DEFAUT: &str = "http://localhost:8888";
 pub const JETON_REQUIS: &str =
     "le serveur exige un jeton valide : --token ou TUNE_TOKEN (HTTP 401)";
 
+/// Code de sortie du compagnon quand le jeton est refusé : le service
+/// systemd ne le relance pas (`RestartPreventExitStatus`).
+pub const SORTIE_JETON: i32 = 3;
+
+/// Taille maximale d'une pochette téléchargée.
+pub const POCHETTE_MAX: usize = 10 * 1024 * 1024;
+
+/// L'URL vise-t-elle le serveur Tune lui-même (même schéma, hôte et port) ?
+/// Un préfixe sans `/` final laisserait passer `http://nas:8888.ailleurs/`.
+pub fn vers_le_serveur(serveur: &str, url: &str) -> bool {
+    url.len() > serveur.len()
+        && url[..serveur.len()].eq_ignore_ascii_case(serveur)
+        && url.as_bytes()[serveur.len()] == b'/'
+}
+
 /// `192.168.1.20:8888` → `http://192.168.1.20:8888`, sans `/` final.
 pub fn normaliser_serveur(saisie: &str) -> String {
     let brut = saisie.trim().trim_end_matches('/');
@@ -146,14 +161,15 @@ impl ClientTune {
         Ok(liste_de_zones(&corps))
     }
 
-    /// Les octets et le type d'une pochette. Le jeton ne part que vers le
-    /// serveur Tune lui-même, jamais vers une URL distante (Qobuz, TIDAL).
-    pub async fn telecharger(&self, url: &str) -> Result<(Vec<u8>, Option<String>), String> {
+    /// Les octets et le type d'une pochette, au plus [`POCHETTE_MAX`] octets.
+    /// Le jeton ne part que vers le serveur Tune lui-même, jamais vers une
+    /// URL distante (Qobuz, TIDAL) : voir [`vers_le_serveur`].
+    pub async fn telecharger(&self, url: &str) -> Result<(Vec<u8>, String), String> {
         let mut r = self.http.get(url);
-        if url.starts_with(&format!("{}/", self.serveur)) {
+        if vers_le_serveur(&self.serveur, url) {
             r = self.avec_jeton(r);
         }
-        let r = r.send().await.map_err(|e| e.to_string())?;
+        let mut r = r.send().await.map_err(|e| e.to_string())?;
         if !r.status().is_success() {
             return Err(format!("HTTP {}", r.status()));
         }
@@ -161,14 +177,24 @@ impl ClientTune {
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|v| v.to_str().ok())
-            .map(str::to_string);
-        if let Some(t) = &type_mime
-            && !t.starts_with("image/")
-        {
-            return Err(format!("pas une image : {t}"));
+            .map(str::to_string)
+            .ok_or_else(|| "pas de Content-Type".to_string())?;
+        if !type_mime.starts_with("image/") {
+            return Err(format!("pas une image : {type_mime}"));
         }
-        let octets = r.bytes().await.map_err(|e| e.to_string())?;
-        Ok((octets.to_vec(), type_mime))
+        if r.content_length().is_some_and(|n| n > POCHETTE_MAX as u64) {
+            return Err(format!("pochette de plus de {POCHETTE_MAX} octets"));
+        }
+        // Lue par morceaux : un serveur qui ment sur la longueur, ou n'en
+        // donne pas, est coupé au plafond.
+        let mut octets = Vec::new();
+        while let Some(morceau) = r.chunk().await.map_err(|e| e.to_string())? {
+            if octets.len() + morceau.len() > POCHETTE_MAX {
+                return Err(format!("pochette de plus de {POCHETTE_MAX} octets"));
+            }
+            octets.extend_from_slice(&morceau);
+        }
+        Ok((octets, type_mime))
     }
 }
 
@@ -214,6 +240,20 @@ mod tests {
             url_du_websocket("https://tune.example"),
             "wss://tune.example/ws"
         );
+    }
+
+    #[test]
+    fn le_jeton_ne_vise_que_le_serveur_lui_meme() {
+        let s = "http://nas:8888";
+        assert!(vers_le_serveur(
+            s,
+            "http://nas:8888/api/v1/library/artwork/x"
+        ));
+        assert!(vers_le_serveur(s, "HTTP://NAS:8888/api/x"));
+        assert!(!vers_le_serveur(s, "http://nas:8888.ailleurs.example/x"));
+        assert!(!vers_le_serveur(s, "http://nas:88880/x"));
+        assert!(!vers_le_serveur(s, "https://static.qobuz.com/x.jpg"));
+        assert!(!vers_le_serveur(s, "http://nas:8888"));
     }
 
     #[test]

@@ -12,8 +12,7 @@ use std::time::Instant;
 use zbus::fdo::RequestNameFlags;
 use zbus::fdo::RequestNameReply;
 use zbus::object_server::SignalEmitter;
-use zbus::zvariant::{ObjectPath, OwnedValue, Value};
-use zbus::{Connection, interface};
+use zbus::{Connection, ObjectPath, OwnedVariant, Variant, interface};
 
 use crate::etat::{Changements, Meta};
 use crate::requetes::{Action, Commandes};
@@ -100,6 +99,10 @@ pub struct Lecteur {
 }
 
 impl Lecteur {
+    fn a_une_piste(&self) -> bool {
+        self.etat.lock().expect("etat").piste.is_some()
+    }
+
     async fn executer(&self, action: Option<Action>) -> zbus::fdo::Result<()> {
         match action {
             Some(a) => self.commandes.envoyer(a).await.map_err(erreur),
@@ -108,16 +111,17 @@ impl Lecteur {
     }
 }
 
-fn en_variant(meta: &Meta) -> OwnedValue {
-    let valeur =
-        match meta {
-            Meta::Texte(t) => Value::from(t.clone()),
-            Meta::Textes(t) => Value::from(t.clone()),
-            Meta::Entier(n) => Value::from(*n),
-            Meta::Chemin(c) => Value::from(ObjectPath::try_from(c.clone()).unwrap_or_else(|_| {
+fn en_variant(meta: &Meta) -> OwnedVariant {
+    let valeur = match meta {
+        Meta::Texte(t) => Variant::from(t.clone()),
+        Meta::Textes(t) => Variant::from(t.clone()),
+        Meta::Entier(n) => Variant::from(*n),
+        Meta::Chemin(c) => {
+            Variant::from(ObjectPath::try_from(c.clone()).unwrap_or_else(|_| {
                 ObjectPath::from_static_str_unchecked(crate::etat::PAS_DE_PISTE)
-            })),
-        };
+            }))
+        }
+    };
     valeur
         .try_to_owned()
         .expect("aucun descripteur de fichier dans les métadonnées")
@@ -189,7 +193,7 @@ impl Lecteur {
 
     /// `Rate` est en écriture dans la spec ; seule la vitesse 1 existe.
     #[zbus(property)]
-    fn set_rate(&mut self, _rate: f64) {}
+    fn set_rate(&self, _rate: f64) {}
 
     #[zbus(property)]
     fn minimum_rate(&self) -> f64 {
@@ -202,7 +206,7 @@ impl Lecteur {
     }
 
     #[zbus(property)]
-    fn metadata(&self) -> HashMap<String, OwnedValue> {
+    fn metadata(&self) -> HashMap<String, OwnedVariant> {
         self.etat
             .lock()
             .expect("etat")
@@ -217,8 +221,11 @@ impl Lecteur {
         self.etat.lock().expect("etat").volume_mpris()
     }
 
+    /// `&self` : zbus n'y prend que le verrou en LECTURE de l'interface. En
+    /// `&mut self`, le verrou en écriture restait tenu pendant la requête HTTP
+    /// (jusqu'à 10 s) et bloquait les lectures de propriétés et `signaler`.
     #[zbus(property)]
-    async fn set_volume(&mut self, volume: f64) -> zbus::fdo::Result<()> {
+    async fn set_volume(&self, volume: f64) -> zbus::fdo::Result<()> {
         let action = self.etat.lock().expect("etat").action_de_volume(volume);
         self.executer(Some(action.clone())).await?;
         // Publié tout de suite (le `PropertiesChanged` part au retour du
@@ -233,32 +240,39 @@ impl Lecteur {
     /// sauts passent par `Seeked`.
     #[zbus(property(emits_changed_signal = "false"))]
     fn position(&self) -> i64 {
-        self.etat.lock().expect("etat").position_ms(Instant::now()) * 1000
+        self.etat
+            .lock()
+            .expect("etat")
+            .position_ms(Instant::now())
+            .saturating_mul(1000)
     }
 
+    /// Sans piste en cours, ni lecture, ni pause, ni piste voisine : les
+    /// applets grisent leurs boutons au lieu d'envoyer une commande sans effet.
     #[zbus(property)]
     fn can_go_next(&self) -> bool {
-        true
+        self.a_une_piste()
     }
 
     #[zbus(property)]
     fn can_go_previous(&self) -> bool {
-        true
+        self.a_une_piste()
     }
 
     #[zbus(property)]
     fn can_play(&self) -> bool {
-        true
+        self.a_une_piste()
     }
 
     #[zbus(property)]
     fn can_pause(&self) -> bool {
-        true
+        self.a_une_piste()
     }
 
+    /// Faux sans piste ou sur une durée inconnue (radio).
     #[zbus(property)]
     fn can_seek(&self) -> bool {
-        true
+        self.etat.lock().expect("etat").peut_sauter()
     }
 
     #[zbus(property(emits_changed_signal = "const"))]
@@ -295,7 +309,7 @@ pub async fn publier(
 /// rend alors l'erreur `NameTaken`).
 async fn prendre(connexion: &Connection, nom: &str) -> zbus::Result<bool> {
     match connexion
-        .request_name_with_flags(nom, RequestNameFlags::DoNotQueue.into())
+        .request_name_with_flags(nom, RequestNameFlags::DO_NOT_QUEUE)
         .await
     {
         Ok(RequestNameReply::PrimaryOwner | RequestNameReply::AlreadyOwner) => Ok(true),
@@ -330,6 +344,12 @@ async fn signaler(connexion: &Connection, c: &Changements) -> zbus::Result<()> {
     }
     if c.metadonnees {
         l.metadata_changed(emetteur).await?;
+        // Les capacités suivent la piste : présente ou non, durée connue ou non.
+        l.can_play_changed(emetteur).await?;
+        l.can_pause_changed(emetteur).await?;
+        l.can_go_next_changed(emetteur).await?;
+        l.can_go_previous_changed(emetteur).await?;
+        l.can_seek_changed(emetteur).await?;
         // `Identity` suit le nom de la zone, relu avec la liste des zones.
         let racine = connexion
             .object_server()
@@ -417,7 +437,7 @@ mod tests {
 
     #[tokio::test]
     async fn seek_set_position_et_volume() {
-        let (mut l, faux) = lecteur();
+        let (l, faux) = lecteur();
         l.seek(15_000_000).await.unwrap();
         let id = l.etat.lock().unwrap().trackid();
         l.set_position(ObjectPath::try_from(id).unwrap(), 5_000_000)
@@ -463,12 +483,30 @@ mod tests {
         );
         let id = ObjectPath::try_from(m["mpris:trackid"].clone()).unwrap();
         assert_eq!(id.as_str(), "/org/tune/zone4/piste/1");
+        assert!(l.can_play() && l.can_pause() && l.can_go_next() && l.can_seek());
         let r = Racine {
             etat: l.etat.clone(),
             serveur: "http://localhost:8888".into(),
         };
         assert_eq!(r.identity(), "Tune (Salon)");
         assert!(!r.can_quit());
+    }
+
+    #[test]
+    fn sans_piste_ou_sur_une_radio_les_capacites_tombent() {
+        let (l, _) = lecteur();
+        let t0 = Instant::now();
+        l.etat.lock().unwrap().appliquer_evenement(
+            &json!({"type": "playback.started", "data": {"zone_id": 4, "title": "FIP", "duration_ms": 0}}),
+            t0,
+        );
+        assert!(
+            l.can_play() && !l.can_seek(),
+            "radio : lecture oui, saut non"
+        );
+        l.etat.lock().unwrap().deconnecte(t0);
+        assert!(!l.can_play() && !l.can_pause() && !l.can_go_next() && !l.can_go_previous());
+        assert!(!l.can_seek());
     }
 
     #[test]

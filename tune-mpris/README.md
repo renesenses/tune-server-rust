@@ -21,6 +21,10 @@ Il tourne sur le poste de l'utilisateur ; le serveur Tune peut être ailleurs
 | `--zone` (identifiant ou nom) | `TUNE_ZONE` | la zone qui joue, sinon une en pause, sinon la première |
 | `--token` (JWT des clients, ou `ApiKey <clé>`) | `TUNE_TOKEN` | aucun (authentification coupée) |
 
+Avec l'authentification active, préférez une clé d'API (`ApiKey <clé>`,
+réglages du serveur) : un JWT de session expire, et le compagnon s'arrête
+alors (code de sortie 3, que le service systemd ne relance pas).
+
 Un second compagnon pour une autre zone prend le nom
 `org.mpris.MediaPlayer2.Tune.zone<id>`.
 

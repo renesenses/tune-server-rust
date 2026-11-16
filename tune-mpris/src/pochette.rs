@@ -103,13 +103,21 @@ pub fn ranger(dossier: &Path, nom: &str, octets: &[u8]) -> std::io::Result<PathB
     std::fs::create_dir_all(dossier)?;
     let chemin = dossier.join(nom);
     let provisoire = dossier.join(format!(".{nom}.part"));
-    std::fs::write(&provisoire, octets)?;
-    std::fs::rename(&provisoire, &chemin)?;
+    let ecrit =
+        std::fs::write(&provisoire, octets).and_then(|()| std::fs::rename(&provisoire, &chemin));
+    if let Err(e) = ecrit {
+        let _ = std::fs::remove_file(&provisoire);
+        return Err(e);
+    }
     elaguer(dossier, POCHETTES_GARDEES);
     Ok(chemin)
 }
 
+/// Un `.part` plus vieux que ça est le reste d'une écriture interrompue.
+const PART_ABANDONNE: std::time::Duration = std::time::Duration::from_secs(60);
+
 fn elaguer(dossier: &Path, garder: usize) {
+    retirer_les_part_abandonnes(dossier, PART_ABANDONNE);
     let Ok(lecture) = std::fs::read_dir(dossier) else {
         return;
     };
@@ -125,6 +133,28 @@ fn elaguer(dossier: &Path, garder: usize) {
     fichiers.sort_by_key(|f| std::cmp::Reverse(f.0));
     for (_, chemin) in fichiers.into_iter().skip(garder) {
         let _ = std::fs::remove_file(chemin);
+    }
+}
+
+fn retirer_les_part_abandonnes(dossier: &Path, age: std::time::Duration) {
+    let Ok(lecture) = std::fs::read_dir(dossier) else {
+        return;
+    };
+    let maintenant = std::time::SystemTime::now();
+    for entree in lecture.filter_map(Result::ok) {
+        let nom = entree.file_name().to_string_lossy().to_string();
+        if !(nom.starts_with('.') && nom.ends_with(".part")) {
+            continue;
+        }
+        let vieux = entree
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|t| maintenant.duration_since(t).ok())
+            .is_some_and(|d| d >= age);
+        if vieux {
+            let _ = std::fs::remove_file(entree.path());
+        }
     }
 }
 
@@ -186,6 +216,27 @@ mod tests {
         .unwrap();
         assert_eq!(deja_en_cache(&dossier, "http://x/p"), Some(ecrit));
         assert_eq!(deja_en_cache(&dossier, "http://x/autre"), None);
+        let _ = std::fs::remove_dir_all(&dossier);
+    }
+
+    #[test]
+    fn un_part_abandonne_est_retire_un_part_frais_garde() {
+        let dossier = std::env::temp_dir().join(format!("tune-mpris-part-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dossier);
+        std::fs::create_dir_all(&dossier).unwrap();
+        let vieux = dossier.join(".a.jpg.part");
+        let frais = dossier.join(".b.jpg.part");
+        std::fs::write(&vieux, b"x").unwrap();
+        std::fs::write(&frais, b"x").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&vieux)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600))
+            .unwrap();
+        retirer_les_part_abandonnes(&dossier, PART_ABANDONNE);
+        assert!(!vieux.exists());
+        assert!(frais.exists());
         let _ = std::fs::remove_dir_all(&dossier);
     }
 

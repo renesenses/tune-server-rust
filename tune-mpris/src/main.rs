@@ -2,7 +2,9 @@
 
 use clap::Parser;
 
-use tune_mpris::client::{ClientTune, JETON_REQUIS, SERVEUR_PAR_DEFAUT, choisir_zone};
+use tune_mpris::client::{
+    ClientTune, JETON_REQUIS, SERVEUR_PAR_DEFAUT, SORTIE_JETON, choisir_zone,
+};
 
 #[derive(Parser)]
 #[command(
@@ -45,7 +47,11 @@ async fn main() {
     let zones = loop {
         match client.zones().await {
             Ok(z) => break z,
-            Err(e) if options.list_zones || e == JETON_REQUIS => {
+            Err(e) if e == JETON_REQUIS => {
+                eprintln!("{} : {e}", client.serveur);
+                std::process::exit(SORTIE_JETON);
+            }
+            Err(e) if options.list_zones => {
                 eprintln!("{} : {e}", client.serveur);
                 std::process::exit(1);
             }
@@ -124,7 +130,10 @@ async fn lancer(client: ClientTune, nom_de_zone: String) {
         }
     }
     let notifieur = Arc::new(NotifieurBus { connexion });
-    tune_mpris::synchro::suivre(client, etat, notifieur).await;
+    // Ne revient que sur un jeton refusé en cours de route (JWT expiré).
+    let fin = tune_mpris::synchro::suivre(client, etat, notifieur).await;
+    eprintln!("{fin}");
+    std::process::exit(SORTIE_JETON);
 }
 
 #[cfg(not(target_os = "linux"))]
