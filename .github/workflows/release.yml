@@ -943,6 +943,7 @@ jobs:
           copy "tune-server\tests\fixtures\plugins\playlists-converter\manifest.json" "plugins\playlists-converter\"
           @"
           !include "MUI2.nsh"
+          !include "Sections.nsh"
           Name "Tune Server"
           OutFile "${{ env.ARTIFACT }}-setup.exe"
           ; Per-user install (like VS Code / Discord): a writable location so
@@ -952,10 +953,18 @@ jobs:
           RequestExecutionLevel user
 
           !insertmacro MUI_PAGE_DIRECTORY
+          ; #8054 - page des composants : la case "Demarrer Tune avec
+          ; Windows", cochee par defaut.
+          !insertmacro MUI_PAGE_COMPONENTS
           !insertmacro MUI_PAGE_INSTFILES
           !insertmacro MUI_LANGUAGE "French"
 
           Section "Install"
+            ; Le serveur lui-meme : toujours installe (case grisee).
+            SectionIn RO
+            ; #8054 - la case decochee doit RETIRER un demarrage automatique
+            ; deja pose ; cochee, la section SecDemarrage le repose juste apres.
+            DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Tune Server"
             ; Kill any running tune-server.exe so Windows releases the file lock
             nsExec::ExecToLog 'taskkill /F /IM tune-server.exe'
             Sleep 1500
@@ -1066,6 +1075,33 @@ jobs:
             WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer" "Publisher" "Mozaik Labs"
           SectionEnd
 
+          ; #8054 - demarrer Tune a l'ouverture de session (fil forum 2850 :
+          ; apres le premier redemarrage de Windows, "serveur hors ligne").
+          ; Une valeur HKCU\...\Run, pas un service ni une tache planifiee :
+          ; sans droits administrateur (installeur par utilisateur), et dans la
+          ; session de l'utilisateur, ou WASAPI et les pilotes ASIO sont
+          ; disponibles. Meme valeur, meme nom que l'interrupteur des Reglages
+          ; (tune-server/src/routes/system/demarrage_avec_windows.rs).
+          ; --sans-console : pas de fenetre, pas de navigateur ouvert.
+          Section "Demarrer Tune avec Windows" SecDemarrage
+            WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Tune Server" '"`$INSTDIR\tune-server.exe" --sans-console'
+            ; Case cochee = choix explicite : on efface un eventuel
+            ; "desactivee" pose par le Gestionnaire des taches.
+            DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" "Tune Server"
+          SectionEnd
+
+          ; Mise a jour : ne pas reactiver ce que l'utilisateur a coupe dans
+          ; les Reglages. Tune deja installe SANS la valeur Run => case
+          ; decochee. Premiere installation => cochee.
+          Function .onInit
+            ReadRegStr `$0 HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer" "UninstallString"
+            StrCmp `$0 "" demarrage_init_fin
+            ReadRegStr `$1 HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Tune Server"
+            StrCmp `$1 "" 0 demarrage_init_fin
+            !insertmacro UnselectSection `${SecDemarrage}
+          demarrage_init_fin:
+          FunctionEnd
+
           Section "Uninstall"
             ; Kill running process before removing files
             nsExec::ExecToLog 'taskkill /F /IM tune-server.exe'
@@ -1074,6 +1110,9 @@ jobs:
             Delete "`$DESKTOP\Tune Server.lnk"
             RMDir /r "`$SMPROGRAMS\Tune Server"
             DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\TuneServer"
+            ; #8054 - plus de demarrage automatique vers un dossier efface.
+            DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "Tune Server"
+            DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run" "Tune Server"
             ; #7371 - retirer la regle de pare-feu "Tune" posee a l'installation
             ; (elevation demandee seulement si elle existe).
             nsExec::ExecToStack '"`$SYSDIR\netsh.exe" advfirewall firewall show rule name="Tune"'
