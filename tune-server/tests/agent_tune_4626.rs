@@ -1369,6 +1369,10 @@ async fn une_zone_d_agent_compte_dans_le_plafond_du_maitre_pas_chez_l_agent() {
     //    d'agent est refusée comme n'importe quelle nouvelle zone.
     let (agent_1, _) = agent().await;
     let plein = Serveur::demarrer_avec(une_zone()).await;
+    // La cible existe : ce témoin mesure le contrat suivant, pas une piste disparue.
+    plein.state.backend.execute_batch(
+        "INSERT INTO tracks (id, title, file_path, source, duration_ms, format) VALUES (1, 'Piste synthétique 1', '/fixture-8832/1.flac', 'local', 300000, 'flac');"
+    ).expect("pistes synthétiques sans fichier audio");
     let repo = ZoneRepo::with_backend(plein.state.backend.clone());
     let deja = repo
         .create("Salon", Some("dlna"), Some("uuid:salon"))
