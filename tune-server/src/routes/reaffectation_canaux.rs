@@ -11,6 +11,11 @@
 //! - `GET|PUT|DELETE /albums/{id}` : la règle d'un album
 //!   (`album_{id}_channel_remap`, #5279), prioritaire sur celle de la zone.
 //!
+//! Les réponses d'une zone portent aussi `applies_to_output` (#8740) : `true`
+//! si sa sortie applique la matrice (sortie locale), `false` sinon (lecteur
+//! réseau : DLNA, Squeezebox, AirPlay, OAAT…), `null` si la zone n'a pas de
+//! sortie connue. Le réglage s'enregistre dans tous les cas.
+//!
 //! Chaque réponse porte `effective` : ce que vaut la matrice (gains linéaires
 //! après normalisation, atténuation par sortie, recopie au bit près ou
 //! mélange). L'écran l'affiche tel quel.
@@ -151,11 +156,32 @@ fn settings(state: &AppState) -> SettingsRepo {
     SettingsRepo::with_backend(state.backend.clone())
 }
 
+/// #8740 — la sortie de la zone applique-t-elle la réaffectation ?
+///
+/// Seule une sortie locale la pose (`LocalOutput::set_reaffectation`, et
+/// `refresh_zone_reaffectation` sort aussitôt sur un appareil qui n'est pas
+/// `local:`) ; le traitement des flux réseau n'a aucun étage de matrice. Sur
+/// une zone DLNA (DrUPnP) ou Squeezebox (slim2diretta), l'écran annonçait
+/// « s'entendra à la prochaine lecture » pour un réglage qui ne s'entend
+/// jamais. `None` : zone inconnue ou sans sortie, rien à affirmer.
+fn s_applique_a_la_sortie(state: &AppState, zone_id: i64) -> Option<bool> {
+    tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_device_id)
+        .filter(|id| !id.is_empty())
+        .map(|id| id.starts_with("local:"))
+}
+fn forme_de_zone(state: &AppState, id: i64, reglage: Option<rc::ChannelRemapSettings>) -> Value {
+    let mut v = forme(&rc::cle_de_zone(id), reglage);
+    v["zone_id"] = json!(id);
+    v["applies_to_output"] = json!(s_applique_a_la_sortie(state, id));
+    v
+}
 async fn lire_zone(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     let cle = rc::cle_de_zone(id);
-    let mut v = forme(&cle, rc::lire(&settings(&state), &cle));
-    v["zone_id"] = json!(id);
-    Json(v)
+    Json(forme_de_zone(&state, id, rc::lire(&settings(&state), &cle)))
 }
 
 async fn ecrire_zone(
@@ -185,8 +211,7 @@ async fn ecrire_zone(
             .into_response();
     }
     let a_chaud = state.orchestrator.refresh_zone_reaffectation(id).await;
-    let mut v = forme(&cle, Some(reglage));
-    v["zone_id"] = json!(id);
+    let mut v = forme_de_zone(&state, id, Some(reglage));
     v["applied_live"] = json!(a_chaud);
     Json(v).into_response()
 }
@@ -195,8 +220,7 @@ async fn effacer_zone(State(state): State<AppState>, Path(id): Path<i64>) -> Res
     let cle = rc::cle_de_zone(id);
     let _ = settings(&state).delete(&cle);
     let a_chaud = state.orchestrator.refresh_zone_reaffectation(id).await;
-    let mut v = forme(&cle, None);
-    v["zone_id"] = json!(id);
+    let mut v = forme_de_zone(&state, id, None);
     v["applied_live"] = json!(a_chaud);
     Json(v).into_response()
 }
@@ -359,6 +383,62 @@ mod tests {
         let v: Value = serde_json::from_slice(&octets).unwrap();
         assert_eq!(v["applied_live"], true);
         assert!(!matrice_posee().await, "règle effacée : matrice retirée");
+    }
+
+    /// #8740 — balance réglée sur une zone DLNA (DrUPnP) : la réponse dit
+    /// que la sortie n'applique pas la matrice, au lieu de laisser l'écran
+    /// annoncer « à la prochaine lecture ». Contre-épreuve : la même requête
+    /// sur une zone locale dit `true`, et une zone sans sortie ne dit rien.
+    #[tokio::test]
+    async fn une_zone_reseau_dit_que_sa_sortie_n_applique_pas_la_matrice_8740() {
+        use tune_core::db::zone_repo::ZoneRepo;
+        let state = AppState::new(":memory:", 0, Default::default()).expect("état");
+        settings(&state)
+            .set("plugin_channel-remap_installed", "true")
+            .unwrap();
+        let zones = ZoneRepo::with_backend(state.backend.clone());
+        let dlna = zones
+            .create("Salon DrUPnP", Some("dlna"), Some("dlna:uuid-drupnp"))
+            .unwrap();
+        let locale = zones
+            .create("Bureau", Some("local"), Some("local:DAC"))
+            .unwrap();
+        let sans_sortie = zones.create("Vide", None, None).unwrap();
+        // Balance : la droite baissée de 2 dB.
+        let balance = json!({"enabled": true, "inputs": 2, "outputs": 2,
+            "gains_db": [[0.0, null], [null, -2.0]]});
+        let ecrire = |zone: i64| {
+            let state = state.clone();
+            let balance = balance.clone();
+            async move {
+                let r = ecrire_zone(
+                    State(state),
+                    Path(zone),
+                    axum::http::HeaderMap::new(),
+                    Json(balance),
+                )
+                .await;
+                assert_eq!(r.status(), StatusCode::OK);
+                let octets = axum::body::to_bytes(r.into_body(), usize::MAX)
+                    .await
+                    .unwrap();
+                serde_json::from_slice::<Value>(&octets).unwrap()
+            }
+        };
+        let v = ecrire(dlna).await;
+        assert_eq!(v["saved"], true, "le réglage reste enregistré");
+        assert_eq!(v["applied_live"], false);
+        assert_eq!(
+            v["applies_to_output"], false,
+            "une sortie DLNA n'applique pas la réaffectation"
+        );
+        let Json(lu) = lire_zone(State(state.clone()), Path(dlna)).await;
+        assert_eq!(lu["applies_to_output"], false);
+        // Contre-épreuve.
+        let v = ecrire(locale).await;
+        assert_eq!(v["applies_to_output"], true);
+        let Json(lu) = lire_zone(State(state.clone()), Path(sans_sortie)).await;
+        assert!(lu["applies_to_output"].is_null(), "{lu}");
     }
 
     #[test]
