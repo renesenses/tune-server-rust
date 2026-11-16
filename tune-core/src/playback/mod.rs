@@ -180,6 +180,16 @@ pub struct VersionJouee {
 }
 
 impl NowPlaying {
+    /// #8689 — la piste dont le ReplayGain s'applique : bibliothèque, ou
+    /// titre Qobuz / TIDAL par son identifiant de service.
+    pub fn piste_rg(&self) -> crate::audio::replaygain::PisteRg<'_> {
+        crate::audio::replaygain::PisteRg::new(
+            self.track_id,
+            Some(self.source.as_str()),
+            self.source_id.as_deref(),
+        )
+    }
+
     /// Canonical mapping from a library [`Track`](crate::db::models::Track) row
     /// to a local `NowPlaying`.
     ///

@@ -1911,6 +1911,12 @@ path = "tests/playlists_pistes_de_service.rs"
 name = "playlist_retrait_par_ligne_6687"
 path = "tests/playlist_retrait_par_ligne_6687.rs"
 
+# Recette rc12 du 15/11 : « # écoutes » et « Dernière écoute » des lignes
+# d'une playlist (`GET /playlists/{id}/tracks`).
+[[test]]
+name = "playlist_ecoutes_par_ligne"
+path = "tests/playlist_ecoutes_par_ligne.rs"
+
 # Favoris LOCAUX sur PostgreSQL (chasse PG du 25/09/2026) : `ProfileRepo` liait
 # `favorites.profile_id`/`item_id` en chaine alors que ces colonnes sont BIGINT
 # sur les deux naissances d'une base PG. PAS de `required-features` : la

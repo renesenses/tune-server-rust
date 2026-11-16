@@ -231,3 +231,6 @@ pub(crate) fn simple_resample(
 pub mod premium_plugins;
 
 pub mod sdk_observation;
+
+// #8722 — octets réseau L16, après quantification PCM16.
+pub(crate) mod l16_depuis_wav;

@@ -346,7 +346,9 @@ async fn sans_dsp_la_piste_part_telle_quelle_5071() {
 #[tokio::test]
 async fn le_relais_progressif_porte_la_compensation_sans_ecreter_5071() {
     let m = monter(0.9, DEVICE, true).await;
-    let mut chaine = m.orch.load_streaming_dsp(m.zone_id, None, SR, 2);
+    let mut chaine =
+        m.orch
+            .load_streaming_dsp(m.zone_id, crate::audio::replaygain::PisteRg::AUCUNE, SR, 2);
     assert!(chaine.compensation.is_some(), "zone DLNA + égaliseur");
     let mut etalon = pcm_source(0.9);
     let mut eq_seul = crate::audio::eq::EqProcessor::new(&profil(), SR, 2);
@@ -373,7 +375,12 @@ async fn le_relais_progressif_porte_la_compensation_sans_ecreter_5071() {
     assert!(
         local
             .orch
-            .load_streaming_dsp(local.zone_id, None, SR, 2)
+            .load_streaming_dsp(
+                local.zone_id,
+                crate::audio::replaygain::PisteRg::AUCUNE,
+                SR,
+                2
+            )
             .compensation
             .is_none()
     );
@@ -385,7 +392,9 @@ async fn le_relais_progressif_porte_la_compensation_sans_ecreter_5071() {
             r#"{"enabled":true}"#,
         )
         .unwrap();
-    let pure = m.orch.load_streaming_dsp(m.zone_id, None, SR, 2);
+    let pure =
+        m.orch
+            .load_streaming_dsp(m.zone_id, crate::audio::replaygain::PisteRg::AUCUNE, SR, 2);
     assert!(pure.compensation.is_none() && !pure.is_active());
 }
 
@@ -401,7 +410,9 @@ async fn basculer_la_compensation_refabrique_le_flux_seulement_s_il_change_5071(
     };
 
     let m = monter(0.5, DEVICE, true).await;
-    let avant = m.orch.empreinte_du_traitement(m.zone_id, None);
+    let avant = m
+        .orch
+        .empreinte_du_traitement(m.zone_id, crate::audio::replaygain::PisteRg::AUCUNE);
     m.orch
         .noter_traitement_du_flux(m.zone_id, "sid-5071", avant);
     assert!(m.orch.flux_porte_deja_ce_traitement(m.zone_id, &np));
@@ -412,7 +423,9 @@ async fn basculer_la_compensation_refabrique_le_flux_seulement_s_il_change_5071(
     );
 
     let sans = monter(0.5, DEVICE, false).await;
-    let avant = sans.orch.empreinte_du_traitement(sans.zone_id, None);
+    let avant = sans
+        .orch
+        .empreinte_du_traitement(sans.zone_id, crate::audio::replaygain::PisteRg::AUCUNE);
     sans.orch
         .noter_traitement_du_flux(sans.zone_id, "sid-5071", avant);
     couper_la_compensation(&sans);

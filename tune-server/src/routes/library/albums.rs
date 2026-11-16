@@ -950,7 +950,7 @@ pub(super) fn provenance_du_dr(
 /// favoris.
 ///
 /// Une seule requête pour toute la page, et aucune du tout sur une page vide.
-pub(super) fn attacher_ecoutes(state: &AppState, items: &mut [Value]) {
+pub(crate) fn attacher_ecoutes(state: &AppState, items: &mut [Value]) {
     let ids: Vec<i64> = items
         .iter()
         .filter_map(|v| v.get("id").and_then(Value::as_i64))
