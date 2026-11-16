@@ -760,6 +760,9 @@ mod dsd_suivant_dlna_6910;
 
 /// Budget du cadre de sondage du banc : il est emboîté plusieurs fois dans
 /// les scénarios d'adoption, sur la petite pile des threads de test macOS.
+/// Le cadre doit rester léger (4 Kio au plus), sans embarquer les quelque
+/// 25 Kio de la future tick mesurés sans allocation sur Shrek.
+/// Cette garde de taille ne reproduit pas à elle seule le crash macOS.
 #[tokio::test]
 async fn le_sondage_du_banc_garde_un_cadre_borne_8785() {
     let mut banc = Banc::monter().await;
@@ -767,7 +770,7 @@ async fn le_sondage_du_banc_garde_un_cadre_borne_8785() {
     let taille = std::mem::size_of_val(&sondage);
     eprintln!("#8785 : cadre du sondage = {taille} octets");
     assert!(
-        taille <= 32 * 1024,
+        taille <= 4 * 1024,
         "cadre du sondage trop gros : {taille} octets"
     );
 }
