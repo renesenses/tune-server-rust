@@ -409,6 +409,21 @@ impl Budget429 {
 
 /// #8766 — le début du message d'un `429` abandonné.
 const LIMITE_429: &str = "Spotify limite temporairement les demandes";
+
+/// #8154 — le texte d'un `401` de l'API Web (jeton refusé), tel que
+/// [`requete_api`] le rend.
+pub const JETON_EXPIRE: &str = "token expired";
+
+/// #8154 — le message d'action d'un jeton que Spotify refuse encore après un
+/// renouvellement : seule une reconnexion peut le lever.
+pub const MOTIF_JETON_REFUSE: &str =
+    "Spotify a refusé le jeton : reconnecter Spotify dans les Réglages.";
+
+/// #8154 — l'échec vient-il d'un jeton refusé (`401`) ? Vrai pour le texte
+/// brut de l'API Web comme pour le message d'action.
+pub fn est_un_refus_de_jeton(erreur: &str) -> bool {
+    erreur == JETON_EXPIRE || erreur == MOTIF_JETON_REFUSE
+}
 /// #8766 — plafond d'une attente demandée par `Retry-After`, en secondes.
 const RETRY_AFTER_MAX_SECS: u64 = 60;
 
@@ -1272,7 +1287,7 @@ impl SpotifyService {
                     derniere_erreur = None;
                     appareil = trouve;
                 }
-                Err(e) if e == "token expired" => return Err(e),
+                Err(e) if e == JETON_EXPIRE => return Err(e),
                 // #8766 — `api_get` a déjà réessayé le 429 jusqu'au bout
                 // (`ESSAIS_429`, `Retry-After`) : redemander 20 fois de plus
                 // prolongerait la pénalité de Spotify.
@@ -1311,7 +1326,7 @@ impl SpotifyService {
             }
             401 => {
                 self.note_token_rejected();
-                Err("Spotify a refusé le jeton : reconnecter Spotify dans les Réglages.".into())
+                Err(MOTIF_JETON_REFUSE.into())
             }
             _ => {
                 let detail = resp.text().await.unwrap_or_default();
