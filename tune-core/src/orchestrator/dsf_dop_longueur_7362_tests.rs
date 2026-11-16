@@ -601,3 +601,129 @@ async fn le_preampli_garde_apres_coupure_de_l_eq_protege_aussi_le_dop_8813() {
 async fn politique_dop_trim_ignore_en_volume_fixe_8813() {
     verifier_politique_dop_8813("trim_fixe", true).await;
 }
+#[cfg(feature = "local-audio")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn baisser_le_volume_d_un_dop_upnp_sans_extension_garde_le_format_8813() {
+    let en_pause = false;
+    let orch = orchestrateur();
+    let dir = tempfile::tempdir().unwrap();
+    let fichier = dir.path().join("dop-en-cours.dsf");
+    ecrire_dsf_temoin_7362(&fichier, 441);
+    let octets_http = std::fs::read(&fichier).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/ressource", listener.local_addr().unwrap());
+    let app = axum::Router::new().route(
+        "/ressource",
+        axum::routing::get(move || {
+            let octets = octets_http.clone();
+            async move { axum::body::Body::from(octets) }
+        }),
+    );
+    let serveur = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    let appareil = "local:dop-en-cours-8813";
+    let zones = crate::db::zone_repo::ZoneRepo::with_backend(orch.db.clone());
+    let zone = zones
+        .create("DoP en cours", Some("local"), Some(appareil))
+        .unwrap();
+    zones.update_dsd_mode(zone, "dop").unwrap();
+    zones.update_volume(zone, 100.0).unwrap();
+    orch.playback.set_volume(zone, 1.0).await;
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new(appareil, "Sans carte son").with_type("local"),
+    ));
+    orch.play(PlayRequest {
+        zone_id: zone,
+        output_device_id: Some(appareil.into()),
+        track_id: None,
+        source: Some("upnp".into()),
+        source_id: Some(url),
+        media_format: Some("dsf".into()),
+        sample_rate: Some(2_822_400),
+        bit_depth: Some(1),
+        duration_ms: Some(5120),
+        title: Some("DSF distant sans extension".into()),
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let sortie = orch.outputs.lock().await.get(appareil).unwrap();
+    {
+        let garde = sortie.lock().await;
+        let factice = garde.as_any().downcast_ref::<MockOutput>().unwrap();
+        factice.poser_dop_actif(true);
+        factice.set_position(2000);
+    }
+    orch.playback.seek(zone, 2000).await;
+    if en_pause {
+        orch.pause(zone, Some(appareil)).await.unwrap();
+    }
+    orch.set_volume(zone, 0.06, Some(appareil))
+        .await
+        .expect("#8813 : la relecture du DSF UPnP perd son format après baisse du volume");
+    if en_pause {
+        assert_eq!(
+            orch.playback.get_state(zone).await.state,
+            crate::playback::PlayState::Paused,
+            "#8813 : régler le volume ne doit pas quitter la pause"
+        );
+        let appels = sortie
+            .lock()
+            .await
+            .as_any()
+            .downcast_ref::<MockOutput>()
+            .unwrap()
+            .play_call_count()
+            .await;
+        assert_eq!(appels, 1, "aucune relecture pendant la pause");
+        orch.resume(zone, Some(appareil)).await.unwrap();
+    }
+    let appels = sortie
+        .lock()
+        .await
+        .as_any()
+        .downcast_ref::<MockOutput>()
+        .unwrap()
+        .play_call_count()
+        .await;
+    assert_eq!(
+        appels, 2,
+        "#8813 : le DoP reste ouvert malgré la baisse du volume (pause={en_pause})"
+    );
+    let etat = orch.playback.get_state(zone).await;
+    assert!((etat.volume - 0.06).abs() < 1e-6);
+    assert!(etat.position_ms >= 2000, "la reprise garde la position");
+    let np = etat.now_playing.unwrap();
+    let session = orch
+        .streamer
+        .sessions_state()
+        .lock()
+        .await
+        .get(
+            np.stream_id
+                .as_deref()
+                .expect("#8813 : la relecture UPnP ne recrée pas de PCM"),
+        )
+        .cloned()
+        .unwrap();
+    let octets = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut v = Vec::new();
+        while v.len() < 140 {
+            v.extend(session.recv_chunk().await.expect("PCM disponible"));
+        }
+        v
+    })
+    .await
+    .unwrap();
+    assert_eq!(&octets[..4], b"RIFF");
+    let dop = octets[44..140].chunks_exact(6).enumerate().all(|(i, t)| {
+        let m = if i % 2 == 0 { 0x05 } else { 0xfa };
+        t[2] == m && t[5] == m
+    });
+    assert!(
+        !dop,
+        "#8813 : le flux de remplacement contient encore du DoP"
+    );
+    serveur.abort();
+}
