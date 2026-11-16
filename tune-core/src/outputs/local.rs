@@ -2077,10 +2077,14 @@ impl LocalOutput {
     }
 
     /// #8869 — ce que le fil de lecture d'une piste emporte : le réglage lu
-    /// maintenant et la mémoire du format de cette sortie.
-    pub(crate) fn silence_de_verrouillage(
+    /// maintenant et la mémoire du format de cette sortie, OUBLIÉE : chaque
+    /// `play_url` rouvre le périphérique (un nouveau fil, un nouveau flux),
+    /// et un DAC se reverrouille à chaque ouverture, même au même format.
+    /// L'enchaînement sans blanc ne repasse pas par ici.
+    pub(crate) fn silence_pour_une_ouverture(
         &self,
     ) -> crate::audio::silence_de_verrouillage::SilenceDeVerrouillage {
+        self.memoire_du_format.oublier();
         crate::audio::silence_de_verrouillage::SilenceDeVerrouillage::new(
             self.silence_de_verrouillage_ms.load(Ordering::Relaxed),
             self.memoire_du_format.clone(),
@@ -6752,7 +6756,7 @@ impl OutputTarget for LocalOutput {
         // pas par `play_url` et garde l'avance prise au départ.
         let retard_de_depart_ms = self.retard_de_depart_ms();
         // #8869 — lu UNE fois par piste, comme le retard de départ.
-        let silence_de_verrouillage = self.silence_de_verrouillage();
+        let silence_de_verrouillage = self.silence_pour_une_ouverture();
         let mono_downmix = self.mono_downmix.clone();
         let reaffectation = self.reaffectation.clone();
         let disposition = self.disposition.clone();

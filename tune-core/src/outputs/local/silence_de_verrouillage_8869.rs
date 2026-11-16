@@ -1,5 +1,5 @@
 //! #8869 — le silence de verrouillage, inséré devant le flux d'une sortie
-//! locale quand son format change (règle et réglage :
+//! locale à chaque ouverture du périphérique (règle et réglage :
 //! [`crate::audio::silence_de_verrouillage`]).
 //!
 //! **Où.** À la frontière producteur → puits, que tous les bras PCM et DoP

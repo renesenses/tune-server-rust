@@ -7,10 +7,15 @@
 //!
 //! Le réglage de zone `zone_{id}_silence_verrouillage_ms` (0 à
 //! [`SILENCE_MAX_MS`], **0 par défaut** : aucune zone existante ne change)
-//! fait précéder la piste d'autant de silence, **seulement** quand le format
-//! envoyé au DAC change par rapport au flux précédent de la même sortie, ou
-//! au premier flux de cette sortie. Une piste au même format part comme
-//! avant, sans un échantillon de plus.
+//! fait précéder le flux d'autant de silence à chaque **ouverture** du
+//! périphérique (départ, reprise après un arrêt ou une pause qui l'a rendu,
+//! piste suivante non enchaînée, changement de zone), même au même format :
+//! un DAC qui se reverrouille à chaque ouverture est couvert. Une piste
+//! enchaînée sans blanc sur le périphérique resté ouvert, au même format, ne
+//! reçoit rien : le gapless reste intact.
+//!
+//! Hors champ : un passage PCM ↔ DoP à l'intérieur d'un même flux enchaîné
+//! sans blanc (le périphérique n'est pas rouvert) n'insère rien.
 //!
 //! Ce module tient la partie pure : la clé, la lecture bornée du réglage, la
 //! signature du format envoyé au DAC et la mémoire du dernier format, par
@@ -112,8 +117,9 @@ pub fn trames_pour_ms(cadence: u32, ms: u32) -> usize {
     (u64::from(cadence) * u64::from(ms) / 1000) as usize
 }
 
-/// Le dernier format envoyé au DAC par une sortie. Partagé entre la sortie et
-/// le fil de lecture de chaque piste ; vit aussi longtemps que la sortie.
+/// Le dernier format envoyé au DAC pendant l'ouverture COURANTE du
+/// périphérique. Oubliée à chaque ouverture ([`MemoireDuFormat::oublier`]) :
+/// une ouverture est toujours un « premier flux ».
 #[derive(Debug, Clone, Default)]
 pub struct MemoireDuFormat(Arc<Mutex<Option<SignatureDuFormat>>>);
 
@@ -129,6 +135,11 @@ impl MemoireDuFormat {
     /// Le dernier format retenu.
     pub fn dernier(&self) -> Option<SignatureDuFormat> {
         *self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Le périphérique va être (r)ouvert : plus rien n'est retenu.
+    pub fn oublier(&self) {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).take();
     }
 }
 

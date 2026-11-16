@@ -57,6 +57,8 @@ fn musique(trames: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Dans une MÊME ouverture (mémoire non oubliée), le même format ne reçoit
+/// rien de plus.
 #[test]
 fn format_inchange_aucun_silence() {
     let memoire = MemoireDuFormat::default();
@@ -233,4 +235,80 @@ fn le_plafond_du_chemin_partage_borne_le_silence() {
         assert!(puits.ecrire(&musique(10)));
     }
     assert_eq!(recu.len(), 1_000 * 2 + 20);
+}
+
+/// Gapless : une piste enchaînée sur le périphérique resté ouvert passe par le
+/// MÊME puits ; seul le premier bloc de l'ouverture est précédé.
+#[test]
+fn enchainement_sans_fermeture_aucun_silence_entre_les_pistes() {
+    let memoire = MemoireDuFormat::default();
+    let piste = musique(400);
+    let mut recu = Vec::new();
+    {
+        let mut puits = PuitsFlottantVerrouille::nouveau(
+            Box::new(Enregistreur(&mut recu)),
+            FormatOuvert::new(CADENCE, 2),
+            SilenceDeVerrouillage::new(100, memoire),
+            None,
+        );
+        for _ in 0..3 {
+            assert!(puits.ecrire(&piste));
+        }
+    }
+    assert_eq!(recu.len(), 4_800 * 2 + 3 * piste.len(), "un seul silence");
+}
+
+/// Rouverte après fermeture (arrêt, pause qui rend le périphérique, piste non
+/// enchaînée, changement de zone) : silence même au MÊME format.
+#[test]
+fn reouverture_au_meme_format_silence_regle() {
+    let sortie = LocalOutput::new("DAC test 8869".to_string());
+    sortie.set_silence_de_verrouillage_ms(100);
+    let piste = musique(400);
+    for ouverture in 0..2 {
+        let mut recu = Vec::new();
+        {
+            let mut puits = PuitsFlottantVerrouille::nouveau(
+                Box::new(Enregistreur(&mut recu)),
+                FormatOuvert::new(CADENCE, 2),
+                sortie.silence_pour_une_ouverture(),
+                None,
+            );
+            assert!(puits.ecrire(&piste));
+        }
+        assert_eq!(
+            recu.len(),
+            4_800 * 2 + piste.len(),
+            "ouverture {ouverture} : le DAC se reverrouille, silence attendu"
+        );
+    }
+    // Réglage nul : rien, même à l'ouverture.
+    sortie.set_silence_de_verrouillage_ms(0);
+    let mut recu = Vec::new();
+    {
+        let mut puits = PuitsFlottantVerrouille::nouveau(
+            Box::new(Enregistreur(&mut recu)),
+            FormatOuvert::new(CADENCE, 2),
+            sortie.silence_pour_une_ouverture(),
+            None,
+        );
+        assert!(puits.ecrire(&piste));
+    }
+    assert_eq!(recu, piste);
+}
+
+/// `play_url` (chaque ouverture du périphérique) prend le silence par
+/// `silence_pour_une_ouverture`, qui oublie le format précédent.
+#[test]
+fn play_url_prend_le_silence_d_une_ouverture() {
+    let src: String = include_str!("../local.rs")
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    assert_eq!(
+        src.matches("letsilence_de_verrouillage=self.silence_pour_une_ouverture();")
+            .count(),
+        1,
+        "play_url doit lire le silence d'une OUVERTURE"
+    );
 }
