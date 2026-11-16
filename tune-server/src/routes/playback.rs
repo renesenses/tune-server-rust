@@ -227,7 +227,25 @@ pub(crate) const MOTIF_CD_DISQUE_ABSENT: &str = "aucun disque dans le lecteur";
 /// Le code stable de ce refus, lu par le client web.
 pub(crate) const CODE_CD_DISQUE_ABSENT: &str = "cd_disc_absent";
 
+fn piste_absente_de_la_bibliotheque(lang: &str) -> axum::response::Response {
+    (
+        StatusCode::NOT_FOUND,
+        Json(crate::message_api::avec_message_en(
+            json!({"error": "track_missing", "code": "track_missing"}),
+            lang,
+            "api.playback.trackMissing",
+            &[],
+        )),
+    )
+        .into_response()
+}
+
 fn play_error_response(e: String, lang: &str) -> axum::response::Response {
+    // Une synchronisation peut retirer la piste après la vérification initiale.
+    if e == "track not found" {
+        return piste_absente_de_la_bibliotheque(lang);
+    }
+
     if let Some(reponse) = refus_du_bail_parental(&e, lang) {
         return reponse;
     }
@@ -4101,6 +4119,29 @@ async fn play_sans_conteneur_de_file(
         return (StatusCode::BAD_REQUEST, "no track source specified").into_response();
     };
 
+    // When a container (album/playlist) is requested alongside a track_id,
+    // infer start_index from the position of that track in the resolved list.
+    let start = body.start_index.unwrap_or_else(|| {
+        body.track_id
+            .and_then(|tid| track_ids.iter().position(|&id| id == tid))
+            .map(|pos| pos as i64)
+            .unwrap_or(0)
+    });
+    // #8832 — une vue périmée ne doit pas remplacer une file encore valide.
+    // Une erreur de lecture SQL reste une panne de base, jamais une absence.
+    let cible_demandee = body
+        .track_id
+        .filter(|_| body.start_index.is_none())
+        .or_else(|| track_ids.get(start as usize).copied())
+        .or_else(|| track_ids.first().copied());
+    if let Some(cible) = cible_demandee {
+        match track_repo.get(cible) {
+            Ok(Some(_)) => {}
+            Ok(None) => return piste_absente_de_la_bibliotheque(&lang),
+            Err(e) => return lecture_base_echouee("play_piste_demandee", zone_id, e.to_string()),
+        }
+    }
+
     if track_ids.is_empty() {
         // #3733 — le refus cesse d'être muet. Le CORPS de la réponse ne bouge
         // pas d'un octet : les clients déjà livrés le comparent tel quel, et
@@ -4178,14 +4219,6 @@ async fn play_sans_conteneur_de_file(
         }
     }
 
-    // When a container (album/playlist) is requested alongside a track_id,
-    // infer start_index from the position of that track in the resolved list.
-    let start = body.start_index.unwrap_or_else(|| {
-        body.track_id
-            .and_then(|tid| track_ids.iter().position(|&id| id == tid))
-            .map(|pos| pos as i64)
-            .unwrap_or(0)
-    });
     // La position dans la demande nue (0) n'est pas celle de la file
     // conservée, qui peut aussi contenir des pistes de services.
     let queue_position = file_conservee.map_or(start, |(position, _)| position);

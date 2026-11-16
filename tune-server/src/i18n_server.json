@@ -1,4 +1,21 @@
 {
+  "api.playback.trackMissing": {
+    "fr": "Cette piste n’est plus dans la bibliothèque. Actualisez la vue.",
+    "en": "This track is no longer in the library. Refresh the view.",
+    "de": "Dieser Titel ist nicht mehr in der Bibliothek. Aktualisiere die Ansicht.",
+    "es": "Esta pista ya no está en la biblioteca. Actualiza la vista.",
+    "it": "Questo brano non è più nella libreria. Aggiorna la vista.",
+    "zh": "此曲目已不在音乐库中。请刷新视图。",
+    "ja": "この曲はライブラリにありません。表示を更新してください。",
+    "ko": "이 트랙은 더 이상 라이브러리에 없습니다. 화면을 새로 고침하세요.",
+    "ro": "Această piesă nu mai este în bibliotecă. Reîmprospătați afișarea.",
+    "sv": "Det här spåret finns inte längre i biblioteket. Uppdatera vyn.",
+    "hu": "Ez a szám már nincs a könyvtárban. Frissítse a nézetet.",
+    "vi": "Bản nhạc này không còn trong thư viện. Hãy làm mới chế độ xem.",
+    "nb": "Dette sporet finnes ikke lenger i biblioteket. Oppdater visningen.",
+    "pl": "Tego utworu nie ma już w bibliotece. Odśwież widok.",
+    "el": "Αυτό το κομμάτι δεν υπάρχει πλέον στη βιβλιοθήκη. Ανανεώστε την προβολή."
+  },
   "parental.explicit.refused": {
     "fr": "Ce contenu est marqué explicite : le contrôle parental de ce profil en interdit l'affichage et la lecture.",
     "en": "This content is marked explicit: this profile's parental controls do not allow it to be shown or played.",
