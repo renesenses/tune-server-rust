@@ -497,8 +497,14 @@ fn le_wav_http_s_arrete_a_data_apres_plusieurs_lectures_8788() {
                 socket
                     .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                     .unwrap();
-                let mut demande = [0; 4096];
-                socket.read(&mut demande).unwrap();
+                // Une requête TCP peut arriver en plusieurs lectures.
+                let mut demande = Vec::new();
+                while !demande.ends_with(b"\r\n\r\n") {
+                    let mut octet = [0];
+                    socket.read_exact(&mut octet).unwrap();
+                    demande.push(octet[0]);
+                    assert!(demande.len() <= 4096, "requête HTTP factice trop longue");
+                }
                 let mut reponse = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: audio/wav\r\nConnection: close\r\n\r\n", fichier.len()).into_bytes();
                 reponse.extend(fichier);
                 socket.write_all(&reponse).unwrap();
