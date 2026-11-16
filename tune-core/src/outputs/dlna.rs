@@ -2670,66 +2670,83 @@ impl OutputTarget for DlnaOutput {
         // chaque lecture en empilerait deux de plus dans le récepteur, tous
         // renouvelés toutes les 250 s pour un flux mort.
         self.unsubscribe_events().await;
-        // Fire-and-forget Stop with a tight deadline: give the renderer up to
-        // 500ms to acknowledge Stop, then proceed regardless.  Most renderers
-        // accept SetAVTransportURI while playing (implicit stop), but we still
-        // send Stop for renderers like DMP-A8 that need it.  The short deadline
-        // ensures we don't block 2-10s waiting for a slow SOAP response.
-        let url_stop = self.url_de(VoieSoap::AvTransport);
-        let stop_fut = self.soap_action_fast(
-            &url_stop,
-            AV_TRANSPORT_URN,
-            "Stop",
-            "<InstanceID>0</InstanceID>",
-        );
-        tokio::select! {
-            result = stop_fut => {
-                match result {
-                    Ok(()) => debug!(device = %self.name, "dlna_play_pre_stop_ok"),
-                    Err(e) => debug!(device = %self.name, error = %e, "dlna_play_pre_stop_ignored"),
+        // #8834 — pour le Musicbook, tenter la nouvelle URI en lecture. Le
+        // pré-Stop peut couper sa sortie (relais), puis ajoute l'attente
+        // d'arrêt. Liste volontairement étroite, fondée sur modelName UPnP :
+        // un nom de zone ou d'appareil renommé ne suffit pas. DMP-A8 et modèles
+        // inconnus gardent la séquence d'arrêt confirmé ci-dessous.
+        let sans_pre_stop = self.modele.as_deref().is_some_and(|modele| {
+            let normalise: String = modele
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .map(|c| c.to_ascii_lowercase())
+                .collect();
+            normalise == "musicbooksource"
+        });
+        if sans_pre_stop {
+            debug!(device = %self.name, modele = ?self.modele, "dlna_saut_sans_pre_stop");
+        } else {
+            // Fire-and-forget Stop with a tight deadline: give the renderer up to
+            // 500ms to acknowledge Stop, then proceed regardless.  Most renderers
+            // accept SetAVTransportURI while playing (implicit stop), but we still
+            // send Stop for renderers like DMP-A8 that need it.  The short deadline
+            // ensures we don't block 2-10s waiting for a slow SOAP response.
+            let url_stop = self.url_de(VoieSoap::AvTransport);
+            let stop_fut = self.soap_action_fast(
+                &url_stop,
+                AV_TRANSPORT_URN,
+                "Stop",
+                "<InstanceID>0</InstanceID>",
+            );
+            tokio::select! {
+                result = stop_fut => {
+                    match result {
+                        Ok(()) => debug!(device = %self.name, "dlna_play_pre_stop_ok"),
+                        Err(e) => debug!(device = %self.name, error = %e, "dlna_play_pre_stop_ignored"),
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                    debug!(device = %self.name, "dlna_play_pre_stop_timeout_proceeding");
                 }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                debug!(device = %self.name, "dlna_play_pre_stop_timeout_proceeding");
-            }
-        }
 
-        // Un Stop ACQUITTÉ n'est pas un Stop APPLIQUÉ. L'Eversolo répond OK
-        // puis met ~1-2 s à s'arrêter ; un SetAVTransportURI envoyé 5 ms plus
-        // tard est acquitté… et ignoré — il continue son flux précédent (la
-        // course des 5 ms, .42, 24/08 ; la même séquence espacée de 2 s est
-        // acceptée). On attend l'arrêt réel, borné à ~2 s, et on continue quoi
-        // qu'il arrive : c'est une politesse, jamais une barrière. Le renderer
-        // déjà arrêté — le cas nominal — coûte UN GetTransportInfo.
-        for attente in 0..8u32 {
-            match self
-                .av_action("GetTransportInfo", "<InstanceID>0</InstanceID>")
-                .await
-            {
-                Ok(resp) if arret_effectif(&resp) => {
-                    if attente > 0 {
-                        debug!(device = %self.name, polls = attente + 1, "dlna_pre_stop_arret_confirme");
+            // Un Stop ACQUITTÉ n'est pas un Stop APPLIQUÉ. L'Eversolo répond OK
+            // puis met ~1-2 s à s'arrêter ; un SetAVTransportURI envoyé 5 ms plus
+            // tard est acquitté… et ignoré — il continue son flux précédent (la
+            // course des 5 ms, .42, 24/08 ; la même séquence espacée de 2 s est
+            // acceptée). On attend l'arrêt réel, borné à ~2 s, et on continue quoi
+            // qu'il arrive : c'est une politesse, jamais une barrière. Le renderer
+            // déjà arrêté — le cas nominal — coûte UN GetTransportInfo.
+            for attente in 0..8u32 {
+                match self
+                    .av_action("GetTransportInfo", "<InstanceID>0</InstanceID>")
+                    .await
+                {
+                    Ok(resp) if arret_effectif(&resp) => {
+                        if attente > 0 {
+                            debug!(device = %self.name, polls = attente + 1, "dlna_pre_stop_arret_confirme");
+                        }
+                        break;
                     }
-                    break;
-                }
-                // Un renderer sans GetTransportInfo ne doit rien bloquer.
-                Err(_) => break,
-                Ok(_) if attente == 7 => {
-                    warn!(device = %self.name, "dlna_pre_stop_jamais_applique_on_continue");
-                }
-                Ok(_) => {
-                    // À mi-parcours, escalader : l'Eversolo coincé en
-                    // TRANSITIONING (flux mort qu'il ressasse) ACQUITTE les
-                    // Stop sans les exécuter — seul Pause→Stop le libère
-                    // (constaté par SOAP direct sur le DMP-A8, 25/08 : Stop →
-                    // toujours PLAYING ; Pause → PAUSED_PLAYBACK ; Stop →
-                    // STOPPED).
-                    if attente == 3 {
-                        debug!(device = %self.name, "dlna_pre_stop_escalade_pause_puis_stop");
-                        let _ = self.av_action("Pause", "<InstanceID>0</InstanceID>").await;
-                        let _ = self.av_action("Stop", "<InstanceID>0</InstanceID>").await;
+                    // Un renderer sans GetTransportInfo ne doit rien bloquer.
+                    Err(_) => break,
+                    Ok(_) if attente == 7 => {
+                        warn!(device = %self.name, "dlna_pre_stop_jamais_applique_on_continue");
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    Ok(_) => {
+                        // À mi-parcours, escalader : l'Eversolo coincé en
+                        // TRANSITIONING (flux mort qu'il ressasse) ACQUITTE les
+                        // Stop sans les exécuter — seul Pause→Stop le libère
+                        // (constaté par SOAP direct sur le DMP-A8, 25/08 : Stop →
+                        // toujours PLAYING ; Pause → PAUSED_PLAYBACK ; Stop →
+                        // STOPPED).
+                        if attente == 3 {
+                            debug!(device = %self.name, "dlna_pre_stop_escalade_pause_puis_stop");
+                            let _ = self.av_action("Pause", "<InstanceID>0</InstanceID>").await;
+                            let _ = self.av_action("Stop", "<InstanceID>0</InstanceID>").await;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
                 }
             }
         }
