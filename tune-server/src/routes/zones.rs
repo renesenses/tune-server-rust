@@ -267,6 +267,10 @@ struct PatchZone {
     /// signal. Pris en compte à la lecture suivante.
     strict_bitperfect: Option<bool>,
 
+    /// #8813 — convertir le DoP local en PCM si le niveau logiciel doit
+    /// être atténué. Activé par défaut, sans effet sous PURE ou strict.
+    dsd_volume_protection: Option<bool>,
+
     /// #3245 — mode exclusif de CETTE zone, pour l'appareil local qu'elle
     /// joue. Persisté en setting `zone_{id}_exclusive_mode`. `null` efface :
     /// la zone suit à nouveau le réglage de machine `local_exclusive_mode`.
@@ -443,6 +447,10 @@ fn inject_device_identity(
         json!(tune_core::audio::bitperfect_strict::zone_enabled(
             backend, zone_id
         )),
+    );
+    obj.insert(
+        "dsd_volume_protection".into(),
+        json!(tune_core::audio::dop_ecarte_7265::protection_du_niveau_active(backend, zone_id)),
     );
     // #3254 — …et ce que ce réglage VAUT sur cette zone-ci. Le champ ci-dessus
     // était accepté et relu pour n'importe quelle zone, alors que les trois

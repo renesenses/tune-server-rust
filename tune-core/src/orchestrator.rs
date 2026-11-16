@@ -2171,6 +2171,7 @@ mod service_wav_progressif_5080;
 #[cfg(test)]
 mod service_wav_progressif_openhome_6718;
 
+mod dop_niveau_8813;
 mod dsp;
 // #5662 — une commande de volume à la fois par sortie, la dernière valeur gagne.
 /// #8082 — flux continu entre les pistes pour les renderers DLNA.

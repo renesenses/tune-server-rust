@@ -8170,6 +8170,8 @@ async fn le_dop_d_une_piste_iso_ne_sert_que_la_piste_depuis_le_deplacement() {
         .create("DAC DoP", Some("local"), Some("local:dac-5297"))
         .unwrap();
     zones.update_dsd_mode(zone_id, "dop").unwrap();
+    // Transport DoP demandé sans atténuation logicielle (#8813).
+    orch.playback.set_volume(zone_id, 1.0).await;
     let mut req = requete_locale_3234(zone_id, piste.id.unwrap());
     req.output_device_id = Some("local:dac-5297".into());
     // Un déplacement d'une trame dans la piste.
@@ -8252,6 +8254,8 @@ async fn le_dop_d_une_piste_iso_entamee_annonce_la_longueur_servie_6630() {
         .create("DAC DoP", Some("local"), Some("local:dac-6630"))
         .unwrap();
     zones.update_dsd_mode(zone_id, "dop").unwrap();
+    // Transport DoP demandé sans atténuation logicielle (#8813).
+    orch.playback.set_volume(zone_id, 1.0).await;
     let mut req = requete_locale_3234(zone_id, piste.id.unwrap());
     req.output_device_id = Some("local:dac-6630".into());
     req.seek_ms = Some(crate::audio::sacd::trames_en_ms(debut + 1) as u64);
@@ -10294,6 +10298,8 @@ async fn dop_au_dela_du_plafond_3973_strict_refuse() {
         .unwrap();
     zones.update_max_sample_rate(zone_id, Some(88_200)).unwrap();
     zones.update_dsd_mode(zone_id, "dop").unwrap();
+    // Transport DoP demandé sans atténuation logicielle (#8813).
+    orch.playback.set_volume(zone_id, 1.0).await;
     let chemin = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/dsd/ref_dsd64_stereo.dsf"

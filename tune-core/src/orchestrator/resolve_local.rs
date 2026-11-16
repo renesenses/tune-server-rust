@@ -1348,6 +1348,24 @@ impl PlaybackOrchestrator {
                 }
             }
         }
+        // #8813 — un porteur DoP ne sait pas appliquer le niveau logiciel.
+        // Décider avant de créer la session, sans toucher aux marqueurs.
+        if source_format == Some(AudioFormat::Dsd)
+            && is_local_output
+            && transport != TransportDsd::Pcm
+            && self
+                .attenuation_logicielle_demandee_pour_dop(req.zone_id, req.piste_rg())
+                .await
+        {
+            let ecart = crate::audio::dop_ecarte_7265::DopEcarte::AttenuationLogicielle;
+            warn!(
+                zone_id = req.zone_id,
+                motif = ecart.code(),
+                "dsd_dop_ecarte_converti_en_pcm"
+            );
+            crate::audio::dop_ecarte_7265::enregistrer(req.zone_id, ecart);
+            transport = TransportDsd::Pcm;
+        }
         let dop_requested = transport != TransportDsd::Pcm;
 
         // #2369 — « natif » sur une sortie locale N'EST PAS natif.

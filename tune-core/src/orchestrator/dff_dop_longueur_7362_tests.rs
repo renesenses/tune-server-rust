@@ -87,6 +87,8 @@ async fn verifier_dff_dop(zone: i64, depart_ms: u64) {
     crate::db::zone_repo::ZoneRepo::with_backend(orch.db.clone())
         .update_dsd_mode(zone, "dop")
         .unwrap();
+    // Ce témoin vérifie le transport DoP intact, donc à gain unité (#8813).
+    orch.playback.set_volume(zone, 1.0).await;
     orch.outputs.lock().await.register(Box::new(
         MockOutput::new(&appareil, "DoP factice").with_type("local"),
     ));

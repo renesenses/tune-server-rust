@@ -49,6 +49,7 @@ pub struct MockOutput {
     /// #7379 — armé, `get_status` rend le repli de #5662 (0,5) comme un DLNA
     /// dont la réponse de volume est illisible.
     volume_illisible: Arc<AtomicBool>,
+    dop_actif: Arc<AtomicBool>,
     /// Le comportement du Devialet (renderer Rygel, fil 1780) : un Seek reçu
     /// en pause laisse l'appareil EN PAUSE — contrat UPnP. Armé, `seek`
     /// repasse l'état à `Paused`.
@@ -140,6 +141,7 @@ impl MockOutput {
             set_next_calls: Arc::new(Mutex::new(Vec::new())),
             volume_calls: Arc::new(Mutex::new(Vec::new())),
             volume_illisible: Arc::new(AtomicBool::new(false)),
+            dop_actif: Arc::new(AtomicBool::new(false)),
             seek_laisse_en_pause: Arc::new(AtomicBool::new(false)),
             sans_media: Arc::new(AtomicBool::new(false)),
             rien_ne_jouait: Arc::new(AtomicBool::new(false)),
@@ -254,6 +256,11 @@ impl MockOutput {
 
     pub async fn set_state(&self, state: TransportState) {
         *self.state.lock().await = state;
+    }
+
+    /// #8813 — constat du détecteur DoP, sans ouvrir de carte son.
+    pub fn poser_dop_actif(&self, actif: bool) {
+        self.dop_actif.store(actif, Ordering::SeqCst);
     }
 
     pub fn set_position(&self, ms: u64) {
@@ -551,6 +558,7 @@ impl OutputTarget for MockOutput {
     }
 
     async fn stop(&self) -> Result<(), String> {
+        self.dop_actif.store(false, Ordering::SeqCst);
         *self.state.lock().await = TransportState::Stopped;
         self.position_ms.store(0, Ordering::Relaxed);
         self.stop_calls.fetch_add(1, Ordering::Relaxed);
@@ -608,9 +616,7 @@ impl OutputTarget for MockOutput {
             ended_naturally: false,
             // A renderer plays at 1x: keep the poller's wall-clock guards.
             realtime: true,
-            // Aucune sortie hors la locale ne produit du DoP : le DSD y part
-            // tel quel ou transcode, jamais empaquete dans du PCM 24 bits.
-            dop_active: false,
+            dop_active: self.dop_actif.load(Ordering::SeqCst),
         })
     }
 
