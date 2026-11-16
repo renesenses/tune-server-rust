@@ -586,3 +586,97 @@ async fn une_pause_puis_une_reprise_gardent_le_fichier_8701() {
     assert!(!crate::audio::dash_epingles::est_epingle(&chemin));
     let _ = std::fs::remove_file(&chemin);
 }
+
+/// #8785 — une pause qui ne trouve plus de média arrête la zone :
+/// contrairement à une pause ordinaire, elle doit libérer son fichier DASH.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn une_pause_sans_media_libere_le_fichier_dash_8785() {
+    let pcm = pcm_cd();
+    let cdn = faux_tidal(Arc::new(decouper(&flac_cd(&pcm).await)), usize::MAX).await;
+    let (orch, req, chemin) = zone_sur_sortie_factice(&cdn, 8_785_100, false).await;
+    let appareil = req.output_device_id.clone().unwrap();
+    assert!(orch.play(req.clone()).await.expect("lecture").output_sent);
+    assert!(crate::audio::dash_epingles::est_epingle(&chemin));
+
+    // Le renderer a perdu son média, mais Tune annonce encore la lecture.
+    // La nouvelle sortie factice signale réellement RienNeJouait à la pause.
+    orch.outputs.lock().await.register(Box::new(
+        crate::outputs::mock::MockOutput::new(&appareil, "Casque sans média")
+            .with_type("local")
+            .with_sans_media(),
+    ));
+    let issue = orch
+        .pause_avec_issue(req.zone_id, Some(&appareil))
+        .await
+        .expect("pause sans média");
+    assert_eq!(issue, super::IssueDePause::RienNeJouait);
+    assert_eq!(
+        orch.playback.get_state(req.zone_id).await.state,
+        crate::playback::PlayState::Stopped
+    );
+    assert!(
+        !crate::audio::dash_epingles::est_epingle(&chemin),
+        "#8785 : pause sans média, le fMP4 reste épinglé alors que la zone est arrêtée"
+    );
+    let sortie = orch.outputs.lock().await.get(&appareil).unwrap();
+    let sortie = sortie.lock().await;
+    let mock = sortie
+        .as_any()
+        .downcast_ref::<crate::outputs::mock::MockOutput>()
+        .unwrap();
+    assert_eq!(
+        mock.stop_call_count(),
+        0,
+        "aucun Stop à envoyer à un appareil sans média"
+    );
+    let _ = std::fs::remove_file(&chemin);
+}
+
+/// #8785 — céder la zone arrête seulement l'état Tune. Le renderer tiers
+/// ne reçoit ni Stop ni nouvelle lecture, et le fMP4 de Tune est libéré.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn une_zone_cedee_a_un_tiers_libere_le_fichier_dash_8785() {
+    let pcm = pcm_cd();
+    let cdn = faux_tidal(Arc::new(decouper(&flac_cd(&pcm).await)), usize::MAX).await;
+    let (orch, req, chemin) = zone_sur_sortie_factice(&cdn, 8_785_200, false).await;
+    let appareil = req.output_device_id.clone().unwrap();
+    assert!(orch.play(req.clone()).await.expect("lecture").output_sent);
+    assert!(crate::audio::dash_epingles::est_epingle(&chemin));
+    let sortie = orch.outputs.lock().await.get(&appareil).unwrap();
+    let lectures_avant = {
+        let sortie = sortie.lock().await;
+        sortie
+            .as_any()
+            .downcast_ref::<crate::outputs::mock::MockOutput>()
+            .unwrap()
+            .play_titles()
+            .await
+    };
+    assert_eq!(lectures_avant.len(), 1);
+
+    orch.ceder_la_zone_a_un_tiers(req.zone_id).await;
+    assert_eq!(
+        orch.playback.get_state(req.zone_id).await.state,
+        crate::playback::PlayState::Stopped
+    );
+    assert!(
+        !crate::audio::dash_epingles::est_epingle(&chemin),
+        "#8785 : zone cédée à un tiers, le fMP4 reste épinglé"
+    );
+    let sortie = sortie.lock().await;
+    let mock = sortie
+        .as_any()
+        .downcast_ref::<crate::outputs::mock::MockOutput>()
+        .unwrap();
+    assert_eq!(
+        mock.stop_call_count(),
+        0,
+        "la cession ne doit pas arrêter la lecture du tiers"
+    );
+    assert_eq!(
+        mock.play_titles().await,
+        lectures_avant,
+        "la cession ne doit pas relancer Tune"
+    );
+    let _ = std::fs::remove_file(&chemin);
+}
