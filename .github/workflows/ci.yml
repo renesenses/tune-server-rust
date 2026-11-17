@@ -292,10 +292,6 @@ jobs:
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_BUILD_JOBS: "2"
       CARGO_INCREMENTAL: "0"
-      # #8824 — l'essai `tune-mpris/tests/bus_prive.rs` lance un `dbus-daemon`
-      # prive. Avec cette variable, son absence le fait ECHOUER au lieu de le
-      # sauter : il ne peut pas passer a vide.
-      TUNE_MPRIS_DBUS_REQUIS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -383,6 +379,12 @@ jobs:
       # avec un message si le runner n'en a pas ; le reste se teste partout.
       # plugin-catalog: {"features":"fast","base":["oaat","cloud-relay"],"packages":"workspace"}
       - run: cargo test --no-fail-fast -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-laissez-passer -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon -p tune-cd -p tune-entree-audio -p tune-playlists-converter -p tune-circle -p tune-assistant-ia -p tune-collection-physique -p tune-mon-theme -p tune-aes67 -p tune-calibration -p tune-calibration-greffon -p tune-mpris --no-default-features --features oaat,cloud-relay,bandcamp,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,mon-theme
+        # #8824 — `tune-mpris/tests/bus_prive.rs` lance un `dbus-daemon` prive
+        # (installe par l'etape « dbus-daemon pour tune-mpris »). Posee sur
+        # CETTE etape, la variable fait ECHOUER l'essai si le demon manque, au
+        # lieu de le sauter en vert (garde `tout_temoin_sous_variable_d_environnement_est_recense`).
+        env:
+          TUNE_MPRIS_DBUS_REQUIS: "1"
 
   # La CI validait `--features oaat` alors que les binaires publies embarquent
   # six fonctionnalites. Neuf tests de greffons echouaient donc en silence
