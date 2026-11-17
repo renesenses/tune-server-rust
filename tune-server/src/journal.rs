@@ -303,9 +303,63 @@ pub fn la_console_ecrit_deja_dans(_chemin: &std::path::Path) -> bool {
     false
 }
 
+/// #8946 — ouvre le premier journal possible parmi `candidats`, dans l'ordre.
+///
+/// Rend le journal ouvert et son chemin, plus chaque emplacement refusé avec
+/// son erreur : l'appelant doit pouvoir DIRE pourquoi le journal n'est pas là
+/// où on l'attend. Chaque candidat est préparé comme l'était le seul chemin
+/// d'avant : dossier parent créé, rotation de démarrage
+/// ([`crate::config::rotate_log_file`]).
+pub fn ouvrir_le_premier_journal(
+    candidats: impl IntoIterator<Item = PathBuf>,
+    plafond: u64,
+) -> (Option<(JournalBorne, PathBuf)>, Vec<(PathBuf, io::Error)>) {
+    let mut refus = Vec::new();
+    for chemin in candidats {
+        if let Some(dossier) = chemin.parent() {
+            let _ = std::fs::create_dir_all(dossier);
+        }
+        crate::config::rotate_log_file(&chemin, plafond);
+        match JournalBorne::ouvrir(chemin.clone(), plafond) {
+            Ok(j) => return (Some((j, chemin)), refus),
+            Err(e) => refus.push((chemin, e)),
+        }
+    }
+    (None, refus)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #8946 (fil 2882, Tune OS) — l'emplacement par défaut refusé, le journal
+    /// s'ouvre au repli, et le refus est rendu avec son chemin.
+    ///
+    /// Le parent du premier candidat est un FICHIER : ni `create_dir_all` ni
+    /// `open` ne passent, compte root compris (un `chmod 000` ne refuse rien à
+    /// root), comme `ProtectHome=yes` refuse `$HOME` au service.
+    ///
+    /// Contre-épreuve : ne tenter que le premier candidat (le comportement
+    /// d'avant, un seul chemin) rend `None` et fait tomber ce test.
+    #[test]
+    fn un_emplacement_refuse_laisse_place_au_repli_8946() {
+        let d = dossier("8946");
+        let home_protege = d.path().join("home-protege");
+        std::fs::write(&home_protege, b"").expect("bouchon");
+        let refuse = home_protege.join(".local/state/tune/tune-server.log");
+        let repli = d.path().join("data/logs/tune-server.log");
+
+        let (ouvert, refus) = ouvrir_le_premier_journal([refuse.clone(), repli.clone()], 1024);
+        let (mut journal, chemin) = ouvert.expect("le repli doit s'ouvrir");
+        assert_eq!(chemin, repli);
+        io::Write::write_all(&mut journal, b"ligne 8946\n").expect("écriture");
+        assert_eq!(
+            std::fs::read_to_string(&repli).expect("relu"),
+            "ligne 8946\n"
+        );
+        assert_eq!(refus.len(), 1, "{refus:?}");
+        assert_eq!(refus[0].0, refuse);
+    }
 
     /// Un dossier temporaire à soi, sans dépendance : deux tests qui
     /// partageraient un chemin se voleraient leur `.1`.

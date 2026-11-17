@@ -554,6 +554,12 @@ pub fn resolve_web_dir() -> std::path::PathBuf {
 /// Creates the parent directory. Note: append-only, no rotation (same as the
 /// pre-existing macOS/Windows behavior); rotation is a separate follow-up.
 pub fn default_log_file_path() -> std::path::PathBuf {
+    // #8946 — le fichier que l'écrivain a RÉELLEMENT ouvert, s'il a dû se
+    // replier : le lecteur (« Exporter le journal », rapport de bogue) doit
+    // lire celui-là, pas l'emplacement refusé.
+    if let Some(retenu) = JOURNAL_RETENU.get() {
+        return retenu.clone();
+    }
     let lire = |nom: &str| std::env::var(nom).ok();
     let path = chemin_du_journal(
         &lire,
@@ -566,6 +572,59 @@ pub fn default_log_file_path() -> std::path::PathBuf {
         let _ = std::fs::create_dir_all(dir);
     }
     path
+}
+
+/// #8946 — le journal effectivement ouvert par [`crate::bootstrap::installer_le_journal`]
+/// quand ce n'est pas l'emplacement par défaut. Posé une fois, au démarrage.
+static JOURNAL_RETENU: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Retient le fichier que l'écrivain a ouvert : [`default_log_file_path`] le
+/// rendra désormais, lecteur compris.
+pub(crate) fn retenir_le_journal(chemin: PathBuf) {
+    let _ = JOURNAL_RETENU.set(chemin);
+}
+
+/// #8946 — où écrire le journal quand l'emplacement par défaut est refusé.
+///
+/// Tune OS (fil 2882, rc12) : `tune.service` tourne avec `ProtectHome=yes`, et
+/// le chemin par défaut est sous `$HOME` (`~/.local/state/tune`). Le service
+/// ne peut ni y créer le dossier ni y ouvrir le fichier : AUCUN fichier de
+/// journal n'était écrit, et chaque export relevait `Permission denied`
+/// (`log_export_fichier_illisible_replis_tentes`) avant de retomber sur
+/// journalctl. Les droits ne sont pas élargis : on écrit là où le service a
+/// déjà le droit d'écrire.
+///
+/// Dans l'ordre :
+///   1. `$TUNE_DATA_DIR/logs/tune-server.log` — le dossier de données, que
+///      l'unité ouvre en écriture (`ReadWritePaths=/opt/tune/data` sur Tune
+///      OS) ;
+///   2. `temp_dir()/tune-<uid>/tune-server.log` — le dossier de travail du
+///      compte (#4770), jamais un `/tmp` partagé.
+pub(crate) fn replis_du_journal(
+    lire: &dyn Fn(&str) -> Option<String>,
+    temp: &Path,
+    uid: u32,
+) -> Vec<PathBuf> {
+    let mut replis = Vec::new();
+    if let Some(donnees) = lire("TUNE_DATA_DIR").filter(|s| !s.is_empty()) {
+        replis.push(PathBuf::from(donnees).join("logs").join("tune-server.log"));
+    }
+    replis.push(
+        tune_core::chemins_de_travail::racine_de_travail_sous(temp, "tune", uid)
+            .join("tune-server.log"),
+    );
+    replis
+}
+
+/// [`replis_du_journal`] pour ce processus.
+pub(crate) fn replis_du_journal_courants() -> Vec<PathBuf> {
+    let lire = |nom: &str| std::env::var(nom).ok();
+    replis_du_journal(
+        &lire,
+        // tmp-autorise: base seule : replis_du_journal y joint l'UID du compte (#4770).
+        &std::env::temp_dir(),
+        tune_core::chemins_de_travail::uid_courant(),
+    )
 }
 
 /// L'emplacement **par défaut** du journal, `TUNE_LOG_FILE` mis de côté.
@@ -967,6 +1026,33 @@ pub fn appliquer_plan_base_macos(config: &mut TuneConfig, plan: PlanBaseMacos) {
 #[cfg(test)]
 mod listen_socket_tests {
     use super::*;
+
+    /// #8946 — les replis du journal : le dossier de données d'abord (ouvert
+    /// en écriture par l'unité de Tune OS), puis le dossier de travail du
+    /// compte ; jamais un `/tmp` partagé.
+    #[test]
+    fn les_replis_du_journal_commencent_par_le_dossier_de_donnees_8946() {
+        let temp = Path::new("/t");
+        let avec = |nom: &str| (nom == "TUNE_DATA_DIR").then(|| "/opt/tune/data".to_string());
+        let replis = replis_du_journal(&avec, temp, 1000);
+        assert_eq!(
+            replis[0],
+            PathBuf::from("/opt/tune/data/logs/tune-server.log")
+        );
+        assert_eq!(
+            replis[1],
+            tune_core::chemins_de_travail::racine_de_travail_sous(temp, "tune", 1000)
+                .join("tune-server.log")
+        );
+        assert_eq!(replis.len(), 2);
+
+        let vide = |nom: &str| (nom == "TUNE_DATA_DIR").then(String::new);
+        assert_eq!(
+            replis_du_journal(&vide, temp, 1000).len(),
+            1,
+            "TUNE_DATA_DIR vide ignoré"
+        );
+    }
 
     /// L'hôte sait-il vraiment JOINDRE `::1` ?
     ///
