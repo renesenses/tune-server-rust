@@ -17,7 +17,15 @@ fn sans_filtres() -> Filtres {
         bannis_services: HashSet::new(),
         parental: None,
         explicites_locaux: HashSet::new(),
+        pistes_bloquees: HashSet::new(),
+        noms_bloques_par_id: HashSet::new(),
     }
+}
+
+fn poser_politique(db: &Arc<dyn DbBackend>, profil: i64, politique: Value) {
+    let p: tune_core::db::politique_parentale::PolitiqueParentale =
+        serde_json::from_value(politique).unwrap();
+    tune_core::db::politique_parentale::poser(db, profil, 1, 0, &p).unwrap();
 }
 
 /// Un état dont l'enrichissement ne part jamais sur le réseau : un port
@@ -560,14 +568,104 @@ fn la_duree_de_vie_suit_la_qualite() {
         periode: "2026-11-16".into(),
         playlists: Arc::new(Vec::new()),
         expire,
+        supervise: false,
     };
-    assert!(e(None).valide("2026-11-16", t0 + Duration::from_secs(86_400)));
+    assert!(e(None).valide("2026-11-16", t0 + Duration::from_secs(86_400), false));
     assert!(
-        !e(None).valide("2026-11-19", t0),
+        !e(None).valide("2026-11-19", t0, false),
         "période suivante : recalcul"
     );
+    assert!(
+        !e(None).valide("2026-11-16", t0, true),
+        "politique posée depuis : recalcul"
+    );
     let degradee = e(Some(t0 + DUREE_DEGRADE));
-    assert!(degradee.valide("2026-11-16", t0 + Duration::from_secs(60)));
-    assert!(!degradee.valide("2026-11-16", t0 + DUREE_DEGRADE + Duration::from_secs(1)));
+    assert!(degradee.valide("2026-11-16", t0 + Duration::from_secs(60), false));
+    assert!(!degradee.valide(
+        "2026-11-16",
+        t0 + DUREE_DEGRADE + Duration::from_secs(1),
+        false
+    ));
     assert!(DUREE_VIDE < DUREE_DEGRADE);
+}
+
+/// Artiste bloqué par son seul identifiant, et artiste d'ALBUM bloqué : ni
+/// graine, ni titres — même ceux d'un autre interprète sur son album.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn un_artiste_bloque_par_id_ou_comme_artiste_d_album_ne_passe_pas() {
+    let state = etat_hors_ligne();
+    let db = &state.backend;
+    bibliotheque(db);
+    // « Sideman » joue sur un album de Bill Evans.
+    db.execute("INSERT INTO artists (id, name) VALUES (6, 'Sideman')", &[])
+        .unwrap();
+    db.execute(
+        "INSERT INTO albums (id, title, artist_id, cover_path) \
+         VALUES (700, 'Evans sessions', 3, '/covers/700.jpg')",
+        &[],
+    )
+    .unwrap();
+    for n in 0..8i64 {
+        let id = 70_000 + n;
+        let titre = format!("Sideman {n}");
+        db.execute(
+            "INSERT INTO tracks (id, title, artist_id, album_id, genre, duration_ms) \
+             VALUES (?1, ?2, 6, 700, 'Jazz', 200000)",
+            &[&id, &titre.as_str()],
+        )
+        .unwrap();
+    }
+    poser_politique(
+        db,
+        3,
+        json!({"artistes_bloques": [{"id": 2}, {"nom": "Bill Evans"}]}),
+    );
+    ecouter(db, "John Coltrane", 40, Some(3), "local");
+    ecouter(db, "Miles Davis", 6, Some(3), "local");
+
+    let f = charger_filtres(db, 3, &[]);
+    assert_eq!(
+        graines(db, 3, &f, 5),
+        vec![("Miles Davis".to_string(), 6)],
+        "bloqué par identifiant seul : pas une graine"
+    );
+    let r = appel(&state, 3, None).await;
+    let listes = r["playlists"].as_array().unwrap();
+    assert_eq!(listes.len(), 1, "{r}");
+    let arts = artistes_de(&listes[0]);
+    assert!(
+        !arts.contains("John Coltrane"),
+        "bloqué par identifiant : {arts:?}"
+    );
+    assert!(!arts.contains("Bill Evans"), "{arts:?}");
+    assert!(
+        !arts.contains("Sideman"),
+        "titres d'un album de l'artiste bloqué : {arts:?}"
+    );
+}
+
+/// Une politique posée après le calcul invalide le cache : les graines du
+/// profil deviennent strictes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn une_politique_posee_apres_le_calcul_le_refait() {
+    let state = etat_hors_ligne();
+    let db = &state.backend;
+    bibliotheque(db);
+    ecouter(db, "Metallica", 50, None, "local");
+    ecouter(db, "Miles Davis", 6, Some(4), "local");
+    let artistes = |r: &Value| -> Vec<Value> {
+        r["playlists"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| p["artist"].clone())
+            .collect()
+    };
+
+    let avant = appel(&state, 4, None).await;
+    assert!(artistes(&avant).contains(&json!("Metallica")), "{avant}");
+
+    poser_politique(db, 4, json!({}));
+    let apres = appel(&state, 4, None).await;
+    assert_eq!(artistes(&apres), vec![json!("Miles Davis")], "{apres}");
 }

@@ -48,7 +48,8 @@
 //! fois en même temps ; deux profils ne s'attendent pas. Les recherches par
 //! nom passent par `idx_artists_name` (`COLLATE NOCASE`), les autres par
 //! `tracks.artist_id` et les clés primaires, sauf la recherche des voisins de
-//! même genre, qui ne tourne qu'au calcul.
+//! même genre, qui ne tourne qu'au calcul (PostgreSQL : index
+//! `LOWER(artists.name)` et `tracks.genre`, migration 121).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -100,8 +101,9 @@ const BUDGET_SERVICES: Duration = Duration::from_secs(30);
 /// Délai global d'un calcul : au-delà, la réponse est vide et brève.
 const DELAI_CALCUL: Duration = Duration::from_secs(120);
 /// Ce qu'une requête attend le calcul avant de répondre « en cours » ; le
-/// calcul continue et le prochain affichage le lit.
-const DELAI_REPONSE: Duration = Duration::from_secs(45);
+/// calcul continue et le prochain affichage le lit. Sous le délai de garde
+/// des widgets du client web (8 s), pour que la réponse arrive.
+const DELAI_REPONSE: Duration = Duration::from_secs(5);
 /// Durée de vie d'un résultat calculé en mode dégradé.
 pub const DUREE_DEGRADE: Duration = Duration::from_secs(3600);
 /// Durée de vie d'un résultat vide (aucune écoute, ou tout filtré).
@@ -154,11 +156,16 @@ struct EntreeCache {
     playlists: Arc<Vec<Value>>,
     /// `None` : jusqu'à la fin de la période.
     expire: Option<Instant>,
+    /// Le profil était-il supervisé au calcul ? Ses graines n'en dépendent :
+    /// une politique posée ou retirée depuis invalide l'entrée.
+    supervise: bool,
 }
 
 impl EntreeCache {
-    fn valide(&self, periode: &str, maintenant: Instant) -> bool {
-        self.periode == periode && self.expire.is_none_or(|e| maintenant < e)
+    fn valide(&self, periode: &str, maintenant: Instant, supervise: bool) -> bool {
+        self.periode == periode
+            && self.supervise == supervise
+            && self.expire.is_none_or(|e| maintenant < e)
     }
 }
 
@@ -259,6 +266,9 @@ fn nom_egal(engine: Engine, colonne: &str, marque: &str) -> String {
 pub(crate) struct Parental {
     filtre: Filtre,
     masquer_explicite: bool,
+    /// Les artistes bloqués PAR IDENTIFIANT seul : leur nom se lit dans la
+    /// bibliothèque (voir [`charger_filtres`]).
+    ids_bloques: Vec<i64>,
 }
 
 fn parental(db: &Arc<dyn DbBackend>, profil: i64) -> Option<Parental> {
@@ -266,6 +276,12 @@ fn parental(db: &Arc<dyn DbBackend>, profil: i64) -> Option<Parental> {
         Ok(Some(p)) => Some(Parental {
             filtre: Filtre::depuis(&p.politique),
             masquer_explicite: p.politique.masquer_explicite,
+            ids_bloques: p
+                .politique
+                .artistes_bloques
+                .iter()
+                .filter_map(|a| a.id)
+                .collect(),
         }),
         Ok(None) => None,
         Err(e) if politique_parentale::table_absente(&e) => None,
@@ -276,6 +292,7 @@ fn parental(db: &Arc<dyn DbBackend>, profil: i64) -> Option<Parental> {
             Some(Parental {
                 filtre: Filtre::depuis(&Default::default()),
                 masquer_explicite: true,
+                ids_bloques: Vec::new(),
             })
         }
     }
@@ -289,6 +306,13 @@ pub(crate) struct Filtres {
     bannis_services: HashSet<(String, String)>,
     parental: Option<Parental>,
     explicites_locaux: HashSet<i64>,
+    /// Pistes locales d'un artiste bloqué : artiste de la piste, de l'album ou
+    /// balise `ALBUMARTIST`, par identifiant comme par nom
+    /// (`politique_parentale::pistes_locales_bloquees`).
+    pistes_bloquees: HashSet<i64>,
+    /// Noms (normalisés) des artistes bloqués par identifiant seul : couvrent
+    /// les graines, les voisins et les titres de service, qui n'ont qu'un nom.
+    noms_bloques_par_id: HashSet<String>,
 }
 
 fn ids_locaux(playlists: &[Value]) -> Vec<i64> {
@@ -339,22 +363,57 @@ fn charger_filtres(db: &Arc<dyn DbBackend>, profil: i64, playlists: &[Value]) ->
         }
         _ => HashSet::new(),
     };
+    let (pistes_bloquees, noms_bloques_par_id) = match &parental {
+        Some(p) if p.filtre.bloque_des_artistes() => {
+            let pistes = politique_parentale::pistes_locales_bloquees(db, &p.filtre, &ids)
+                .unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "parce_que_vous_aimez_pistes_bloquees_illisibles");
+                    HashSet::new()
+                });
+            let noms = if p.ids_bloques.is_empty() {
+                HashSet::new()
+            } else {
+                let liste = p
+                    .ids_bloques
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                db.query_many(
+                    &format!("SELECT name FROM artists WHERE id IN ({liste})"),
+                    &[],
+                )
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|r| r.first().and_then(|v| v.as_string()))
+                .map(|n| politique_parentale::normaliser(&n))
+                .filter(|n| !n.is_empty())
+                .collect()
+            };
+            (pistes, noms)
+        }
+        _ => (HashSet::new(), HashSet::new()),
+    };
     Filtres {
         ecartees: SuggestionsEcarteesRepo::with_backend(db.clone()).ensemble(profil),
         bannis_locaux,
         bannis_services,
         parental,
         explicites_locaux,
+        pistes_bloquees,
+        noms_bloques_par_id,
     }
 }
 
 impl Filtres {
     fn artiste_refuse(&self, nom: &str) -> bool {
         self.ecartees.artiste(nom)
-            || self
-                .parental
-                .as_ref()
-                .is_some_and(|p| p.filtre.artiste_bloque(None, Some(nom)))
+            || self.parental.as_ref().is_some_and(|p| {
+                p.filtre.artiste_bloque(None, Some(nom))
+                    || self
+                        .noms_bloques_par_id
+                        .contains(&politique_parentale::normaliser(nom))
+            })
     }
 
     fn titre_refuse(&self, t: &Value) -> bool {
@@ -368,6 +427,7 @@ impl Filtres {
         match t["source"].as_str().unwrap_or("local") {
             "local" => t["track_id"].as_i64().is_some_and(|id| {
                 self.bannis_locaux.contains(&id)
+                    || self.pistes_bloquees.contains(&id)
                     || (explicite_masque && self.explicites_locaux.contains(&id))
             }),
             source => {
@@ -1141,11 +1201,12 @@ fn en_playlist(db: &Arc<dyn DbBackend>, artiste: &str, plays: i64, lot: &[Candid
 
 /// Le calcul complet, pour un profil et une période. Tourne sur un fil
 /// bloquant. Les playlists rendues sont déjà filtrées pour le profil.
-async fn calculer(state: &AppState, profil: i64, jour: &str) -> (Vec<Value>, Qualite) {
+async fn calculer(state: &AppState, profil: i64, jour: &str) -> (Vec<Value>, Qualite, bool) {
     let filtres = Arc::new(charger_filtres(&state.backend, profil, &[]));
+    let supervise = filtres.parental.is_some();
     let graines = graines(&state.backend, profil, &filtres, MAX_PLAYLISTS);
     if graines.is_empty() {
-        return (Vec::new(), Qualite::Vide);
+        return (Vec::new(), Qualite::Vide, supervise);
     }
     let (voisins, cloud_degrade) = voisins_du_cloud(&state.backend, &graines).await;
     let services = sources_services(state, profil).await;
@@ -1175,7 +1236,7 @@ async fn calculer(state: &AppState, profil: i64, jour: &str) -> (Vec<Value>, Qua
         ?qualite,
         "parce_que_vous_aimez_compose"
     );
-    (playlists, qualite)
+    (playlists, qualite, supervise)
 }
 
 /// Retire de la table des réglages les clés qu'une version antérieure de
@@ -1190,8 +1251,12 @@ fn retirer_les_anciennes_cles(state: &AppState) {
         return;
     }
     let mut ph = Placeholders::new(state.backend.engine());
-    let sql = format!("DELETE FROM settings WHERE key LIKE {}", ph.take());
-    let motif = format!("{ANCIEN_PREFIXE_REGLAGES}%");
+    // `_` est un joker de LIKE : échappé, le motif ne vise que ce préfixe.
+    let sql = format!(
+        "DELETE FROM settings WHERE key LIKE {} ESCAPE '\\'",
+        ph.take()
+    );
+    let motif = format!("{}%", ANCIEN_PREFIXE_REGLAGES.replace('_', "\\_"));
     if let Err(e) = state.backend.execute(&sql, &[&motif as &dyn ToSqlValue]) {
         tracing::warn!(error = %e, "parce_que_vous_aimez_anciennes_cles");
     }
@@ -1202,8 +1267,13 @@ fn retirer_les_anciennes_cles(state: &AppState) {
 async fn obtenir(state: AppState, profil: i64, jour: String) -> Arc<Vec<Value>> {
     let case = state.parce_que_vous_aimez.case(profil);
     let mut garde = case.lock().await;
+    // Une lecture par clé primaire, hors de l'exécuteur comme le reste.
+    let db = state.backend.clone();
+    let supervise_maintenant = tokio::task::spawn_blocking(move || parental(&db, profil).is_some())
+        .await
+        .unwrap_or(true);
     if let Some(e) = garde.as_ref()
-        && e.valide(&jour, Instant::now())
+        && e.valide(&jour, Instant::now(), supervise_maintenant)
     {
         return e.playlists.clone();
     }
@@ -1213,15 +1283,15 @@ async fn obtenir(state: AppState, profil: i64, jour: String) -> Arc<Vec<Value>> 
         retirer_les_anciennes_cles(&etat);
         handle.block_on(calculer(&etat, profil, &j))
     });
-    let (playlists, qualite) = match tokio::time::timeout(DELAI_CALCUL, calcul).await {
+    let (playlists, qualite, supervise) = match tokio::time::timeout(DELAI_CALCUL, calcul).await {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => {
             tracing::error!(profil, error = %e, "parce_que_vous_aimez_calcul_interrompu");
-            (Vec::new(), Qualite::Vide)
+            (Vec::new(), Qualite::Vide, supervise_maintenant)
         }
         Err(_) => {
             tracing::warn!(profil, "parce_que_vous_aimez_calcul_hors_delai");
-            (Vec::new(), Qualite::Vide)
+            (Vec::new(), Qualite::Vide, supervise_maintenant)
         }
     };
     let maintenant = Instant::now();
@@ -1235,6 +1305,7 @@ async fn obtenir(state: AppState, profil: i64, jour: String) -> Arc<Vec<Value>> 
         periode: jour,
         playlists: playlists.clone(),
         expire,
+        supervise,
     });
     playlists
 }
