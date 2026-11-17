@@ -109,7 +109,7 @@ fn fiche_a_memoriser(ligne: &Value, piste: &StreamTrack) -> Option<FicheDeServic
     };
     let duree = i64::try_from(piste.duration_ms).ok().filter(|d| *d > 0);
     let fiche = FicheDeService {
-        artist: nouveau("artist_name", Some(&piste.artist)),
+        artist: nouveau("artist_name", Some(piste.artist.as_str())),
         album: nouveau("album_title", piste.album.as_deref()),
         album_source_id: nouveau("album_id", piste.album_id.as_deref()),
         cover_url: nouveau("cover_path", piste.cover_path.as_deref()),
