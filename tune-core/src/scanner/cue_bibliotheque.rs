@@ -2530,7 +2530,12 @@ mod tests {
 
         fs::write(
             dossier.join("album.cue"),
-            FEUILLE.replace("INDEX 01 00:01:00", "INDEX 01 00:02:00"),
+            // La piste 2 devient la 3 : une AUTRE piste, que rien ne permet
+            // d'apparier à l'ancienne tranche. (Un simple début déplacé, même
+            // numéro, est recalé en place depuis #9014, plus retiré.)
+            FEUILLE
+                .replace("INDEX 01 00:01:00", "INDEX 01 00:02:00")
+                .replace("TRACK 02", "TRACK 03"),
         )
         .unwrap();
         let vus = vec![image.clone()];
@@ -2733,7 +2738,12 @@ mod tests {
     #[test]
     fn le_rescan_recale_la_tranche_et_garde_son_historique_9014() {
         let d = tempfile::TempDir::new().unwrap();
-        let db = base_fichier(d.path());
+        // Les migrations complètes : `favorites`, `playlist_tracks` et
+        // `listen_history` n'existent pas sous le seul `init_schema`.
+        let sqlite = SqliteDb::open(&d.path().join("tune-9014.db").to_string_lossy()).unwrap();
+        sqlite.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&sqlite).unwrap();
+        let db: Arc<dyn DbBackend> = Arc::new(sqlite);
         temoin_rescan_garde_l_historique_9014(db, d.path());
     }
 
