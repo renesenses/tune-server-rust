@@ -5230,6 +5230,12 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             tracing::warn!(error = %e, "enrich_tentatives_table_failed");
         }
     }
+    // Alertes de « Albums douteux » marquées normales (#8958) — même régime,
+    // sans numéro : SQLite 155 et PG 121/122 sont disputés dans le lot rc13.
+    // PG : `ENSURE_TABLES` et `PG_FULL_SCHEMA`.
+    if let Err(e) = db.execute_batch(super::alertes_douteuses_ignorees::SQL_TABLE) {
+        tracing::warn!(error = %e, "alertes_douteuses_ignorees_table_failed");
+    }
 
     // Registre DURABLE des serveurs multimedia (migration v101, #2219 phase 1) ;
     // re-creee inconditionnellement pour la meme raison que les tables

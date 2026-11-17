@@ -223,6 +223,9 @@ const MIGRATION_TABLES: &[&str] = &[
     // Contrôle parental (#7856) : sans cette ligne, un profil supervisé
     // retrouverait des listes sans filtre après la bascule.
     "politiques_parentales",
+    // Alertes de « Albums douteux » marquées normales (#8958) : sans cette
+    // ligne, toutes reviendraient à la bascule SQLite → PostgreSQL.
+    "alertes_douteuses_ignorees",
 ];
 
 /// Tables copiees APRES `run_pg_migrations` : elles ne sont creees que par
@@ -1233,6 +1236,16 @@ CREATE TABLE IF NOT EXISTS enrich_tentatives (
  mtime_vu TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_enrich_tentatives_issue ON enrich_tentatives(issue, reessai_apres);
+-- Alertes de « Albums douteux » marquées normales (#8958). Sans script
+-- numéroté : présente ici (bascule) ET dans `ENSURE_TABLES`, mêmes types
+-- (migrations/alertes_douteuses_ignorees.sql). Copiée.
+CREATE TABLE IF NOT EXISTS alertes_douteuses_ignorees (
+ portee TEXT NOT NULL,
+ cible_id BIGINT NOT NULL,
+ raison TEXT NOT NULL,
+ ignoree_le BIGINT NOT NULL,
+ PRIMARY KEY (portee, cible_id, raison)
+);
 -- « Pas pour moi » de l'accueil (web#916, SQLite 145 / PG 111), par profil.
 CREATE TABLE IF NOT EXISTS suggestions_ecartees (
     profile_id BIGINT NOT NULL DEFAULT 1,
@@ -1936,6 +1949,7 @@ fn conflict_clause(table: &str) -> &'static str {
         "podcast_episode_positions" => "ON CONFLICT (zone_id, episode_key) DO NOTHING",
         "collection_physique_associations" => "ON CONFLICT (release_id) DO NOTHING",
         "politiques_parentales" => "ON CONFLICT (profile_id) DO NOTHING",
+        "alertes_douteuses_ignorees" => "ON CONFLICT (portee, cible_id, raison) DO NOTHING",
         "notes_personnelles" => "ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
         "apports_service_albums" => "ON CONFLICT (album_id, source) DO NOTHING",
         "apports_service" => "ON CONFLICT (album_id, track_id, champ, source) DO NOTHING",

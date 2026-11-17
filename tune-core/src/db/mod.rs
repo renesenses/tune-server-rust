@@ -1,6 +1,8 @@
 /// « Ces deux albums ne sont pas des doublons » (#1276) — paires arbitrées par
 /// l'utilisateur, réconciliées sur le modèle des favoris et des masquages.
 pub(crate) mod absorption;
+/// #8958 — les alertes de « Albums douteux » marquées normales.
+pub mod alertes_douteuses_ignorees;
 pub mod album_distinct_repo;
 /// La fusion des albums en double, commune au manuel, au scan et au nettoyage.
 pub mod album_doublons;

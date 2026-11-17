@@ -129,7 +129,14 @@ pub(crate) fn candidats(
             toutes
         }
     };
-    Ok(pistes.iter().filter_map(candidat).collect())
+    // #8958 — une piste dont l'alerte « artiste manquant » est marquée
+    // normale n'est plus à réparer, même si une autre alerte la garde listée.
+    let ignorees = super::alertes_ignorees::Ignorees::charger(backend);
+    Ok(pistes
+        .iter()
+        .filter(|t| !ignorees.contient(t, "missing_artist"))
+        .filter_map(candidat)
+        .collect())
 }
 
 /// Ce que l'écriture en base a fait.

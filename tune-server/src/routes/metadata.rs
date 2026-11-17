@@ -135,6 +135,15 @@ pub fn router() -> Router<AppState> {
             "/doubtful/artist-from-folder",
             post(artiste_du_dossier::ecrire_artiste_du_dossier),
         )
+        // #8958 — marquer une alerte comme normale, revoir, annuler.
+        .route(
+            "/doubtful/ignored",
+            get(alertes_ignorees::lister).post(alertes_ignorees::ignorer),
+        )
+        .route(
+            "/doubtful/ignored/{scope}/{target_id}/{reason}",
+            axum::routing::delete(alertes_ignorees::retablir),
+        )
         // Lookup (MusicBrainz)
         .route("/lookup/track", get(lookup_track))
         .route("/lookup/album", get(lookup_album))
@@ -1167,6 +1176,10 @@ async fn list_doubtful_metadata(
     let track_repo = TrackRepo::with_backend(state.backend.clone());
     let total = track_repo.count_doubtful().unwrap_or(0);
     let tracks = track_repo.list_doubtful(limit, offset).unwrap_or_default();
+    // #8958 — une piste reste listée tant qu'UNE de ses alertes n'est pas
+    // marquée normale (filtre SQL) ; les alertes ignorées sont retirées de
+    // ses raisons ici.
+    let ignorees = alertes_ignorees::Ignorees::charger(&state.backend);
     let items: Vec<serde_json::Value> = tracks
         .iter()
         .map(|t| {
@@ -1184,6 +1197,13 @@ async fn list_doubtful_metadata(
             if t.album_title.as_ref().map(|a| a.is_empty()).unwrap_or(true) {
                 reasons.push("missing_album");
             }
+            reasons.retain(|r| !ignorees.contient(t, r));
+            // #8958 — où « Marquer comme normale » mémoriserait chaque
+            // alerte : l'écran le dit sur le bouton.
+            let ignore_scopes: serde_json::Map<String, serde_json::Value> = reasons
+                .iter()
+                .map(|r| (r.to_string(), json!(alertes_ignorees::portee_de(t, r).as_str())))
+                .collect();
             json!({
                 "id": t.id,
                 "title": t.title,
@@ -1202,6 +1222,8 @@ async fn list_doubtful_metadata(
                 // #8679 — l'artiste que le dossier donne, par la règle du
                 // scan : « artiste absent des balises (dossier : …) ».
                 "folder_artist": artiste_du_dossier::artiste_du_dossier_de(t),
+                "album_id": t.album_id,
+                "ignore_scopes": ignore_scopes,
             })
         })
         .collect();
@@ -3122,6 +3144,9 @@ async fn merge_albums(
 mod tests_fusion_compilation;
 
 mod artiste_du_dossier;
+mod alertes_ignorees;
+#[cfg(test)]
+mod alertes_ignorees_tests_8958;
 
 #[cfg(test)]
 mod year_path_tests {
