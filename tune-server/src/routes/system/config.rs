@@ -3180,11 +3180,20 @@ pub(super) async fn set_default_zone(
 /// #8909 — permise sur Tune OS et, hors conteneur, sur un hôte Linux, macOS
 /// ou Windows : `poweroff_mode` dit lequel (`"tune_os"`, `"host"`, `null`).
 /// `last_poweroff_error` rend le dernier échec d'extinction programmée
-/// (polkit qui refuse…), `null` sinon.
+/// (polkit qui refuse…), `null` sinon : complet (`at`, `code`, `error` avec la
+/// sortie d'erreur) pour l'administrateur, `at` et `code` seulement aux autres.
 fn reponse_arret_programme(
     reglage: Option<tune_core::arret_programme::ArretProgramme>,
     echec: Option<tune_core::arret_programme::EchecExtinction>,
+    admin: bool,
 ) -> Json<Value> {
+    let echec = echec.map(|e| {
+        if admin {
+            json!(e)
+        } else {
+            json!({ "at": e.at, "code": e.code })
+        }
+    });
     let prochain = reglage.as_ref().and_then(|r| {
         r.prochaine_echeance(chrono::Local::now().naive_local())
             .map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string())
@@ -3199,10 +3208,14 @@ fn reponse_arret_programme(
     }))
 }
 
-pub(super) async fn get_scheduled_stop(State(state): State<AppState>) -> Json<Value> {
+pub(super) async fn get_scheduled_stop(
+    admin: Result<crate::auth::RequireAdmin, (StatusCode, Json<Value>)>,
+    State(state): State<AppState>,
+) -> Json<Value> {
     reponse_arret_programme(
         tune_core::arret_programme::lire(&state.backend),
         tune_core::arret_programme::lire_echec_extinction(&state.backend),
+        admin.is_ok(),
     )
 }
 
@@ -3215,19 +3228,17 @@ pub(super) async fn set_scheduled_stop(
     // (programmer un simple arrêt de la lecture reste ouvert).
     garde_machine: Result<crate::auth::AdminOuCetteMachine, (StatusCode, Json<Value>)>,
     State(state): State<AppState>,
-    Json(body): Json<tune_core::arret_programme::ArretProgramme>,
+    Json(mut body): Json<tune_core::arret_programme::ArretProgramme>,
 ) -> axum::response::Response {
-    if body.action == tune_core::arret_programme::ActionArret::Poweroff
-        && let Err(refus) = garde_machine
-    {
+    let eteindre = body.action == tune_core::arret_programme::ActionArret::Poweroff;
+    if eteindre && let Err(refus) = garde_machine {
         return refus.into_response();
     }
     // Éteindre la machine : Tune OS, ou hôte Linux/macOS/Windows hors
     // conteneur (#8909). Refusé à l'enregistrement, pas découvert à l'heure
     // dite (l'extinction relit le mode à l'échéance et refuse aussi).
-    if body.action == tune_core::arret_programme::ActionArret::Poweroff
-        && crate::extinction_hote::mode().is_none()
-    {
+    let mode = crate::extinction_hote::mode();
+    if eteindre && mode.is_none() {
         let refus = crate::extinction_hote::refus_indisponible();
         return (
             StatusCode::BAD_REQUEST,
@@ -3239,12 +3250,32 @@ pub(super) async fn set_scheduled_stop(
         )
             .into_response();
     }
+    // #8909 — éteindre un hôte ordinaire exige l'authentification active :
+    // sans elle, « depuis cette machine » ne distingue pas un appel relayé
+    // par un mandataire local. Tune OS garde son comportement (#8213).
+    if eteindre
+        && mode == Some(crate::extinction_hote::Mode::Hote)
+        && !crate::auth::authentification_active(&state)
+    {
+        let (status, Json(mut corps)) = crate::auth::refus_sans_authentification(
+            crate::extinction_hote::REFUS_SANS_AUTHENTIFICATION,
+        );
+        corps["code"] = json!("auth_required");
+        return (status, Json(corps)).into_response();
+    }
+    // Le mode validé ici est rangé avec le réglage ; celui du client est
+    // ignoré. L'échéance n'éteint que si le mode courant est le même.
+    body.poweroff_mode = if eteindre {
+        mode.map(|m| m.code().to_string())
+    } else {
+        None
+    };
     match tune_core::arret_programme::ecrire(&state.backend, body) {
         // Un réglage reposé par l'administrateur vaut accusé de lecture du
         // dernier échec d'extinction.
         Ok(r) => {
             tune_core::arret_programme::effacer_echec_extinction(&state.backend);
-            reponse_arret_programme(Some(r), None).into_response()
+            reponse_arret_programme(Some(r), None, true).into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
     }
@@ -3257,7 +3288,7 @@ pub(super) async fn delete_scheduled_stop(
     match tune_core::arret_programme::effacer(&state.backend) {
         Ok(()) => {
             tune_core::arret_programme::effacer_echec_extinction(&state.backend);
-            reponse_arret_programme(None, None).into_response()
+            reponse_arret_programme(None, None, true).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,

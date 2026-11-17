@@ -385,7 +385,8 @@ async fn arret_programme_poweroff_hote_tune_os_et_conteneur() {
     }
 
     // 2) Hôte ordinaire hors conteneur (la machine de test : Linux ou macOS) :
-    //    désactivé par défaut, proposé, accepté.
+    //    désactivé par défaut, proposé ; mais SANS authentification active,
+    //    refusé même depuis le bouclage (#8909) — accepté plus bas, en 4).
     unsafe {
         std::env::set_var("TUNE_CONTENEUR_FORCE", "aucun");
         std::env::set_var("TUNE_APPLIANCE", "0");
@@ -404,8 +405,21 @@ async fn arret_programme_poweroff_hote_tune_os_et_conteneur() {
         "sans `action`, l'option reste désactivée"
     );
     let (status, body) = put(&app, eteindre.clone(), None).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["scheduled_stop"]["action"], json!("poweroff"));
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], json!("auth_required"), "{body}");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("enable authentication"),
+        "{body}"
+    );
+    let (_, body) = get(&app, ROUTE).await;
+    assert_eq!(
+        body["scheduled_stop"]["action"],
+        json!("stop_playback"),
+        "un refus ne pose rien"
+    );
 
     // 3) Tune OS : l'action est proposée et acceptée, en mode « tune_os ».
     unsafe { std::env::set_var("TUNE_APPLIANCE", "1") };
@@ -413,9 +427,17 @@ async fn arret_programme_poweroff_hote_tune_os_et_conteneur() {
     let (_, body) = get(&app, ROUTE).await;
     assert_eq!(body["poweroff_available"], json!(true), "{body}");
     assert_eq!(body["poweroff_mode"], json!("tune_os"), "{body}");
-    let (status, body) = put(&app, eteindre.clone(), None).await;
+    // Le mode rangé est celui du serveur, jamais celui du client.
+    let mut avec_mode_client = eteindre.clone();
+    avec_mode_client["poweroff_mode"] = json!("host");
+    let (status, body) = put(&app, avec_mode_client, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["scheduled_stop"]["action"], json!("poweroff"));
+    assert_eq!(
+        body["scheduled_stop"]["poweroff_mode"],
+        json!("tune_os"),
+        "{body}"
+    );
 
     // 4) Authentification active : un compte ordinaire ne pose pas l'option,
     //    l'administrateur si (même garde que les autres réglages système).
@@ -425,6 +447,7 @@ async fn arret_programme_poweroff_hote_tune_os_et_conteneur() {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     settings.set("auth_enabled", "true").unwrap();
     settings.set("jwt_secret", SECRET).unwrap();
+    let etat = state.clone();
     let app =
         tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
             std::net::SocketAddr::from(([192, 168, 1, 50], 50000)),
@@ -442,4 +465,46 @@ async fn arret_programme_poweroff_hote_tune_os_et_conteneur() {
         "l'administrateur pose l'option : {body}"
     );
     assert_eq!(body["scheduled_stop"]["action"], json!("poweroff"));
+    assert_eq!(
+        body["scheduled_stop"]["poweroff_mode"],
+        json!("host"),
+        "{body}"
+    );
+
+    // 5) Le dernier échec : complet pour l'administrateur, code seul aux autres.
+    tune_core::db::settings_repo::SettingsRepo::with_backend(etat.backend.clone())
+        .set(
+            "scheduled_stop_poweroff_error",
+            r#"{"at":"2026-11-16T23:00:00","code":"polkit_denied","error":"Access denied"}"#,
+        )
+        .unwrap();
+    async fn lire(app: &axum::Router, jeton: &str) -> Value {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(ROUTE)
+                    .header("authorization", format!("Bearer {jeton}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let octets = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice::<Value>(&octets).unwrap()
+    }
+    let vu = lire(&app, &jeton_admin).await;
+    assert_eq!(
+        vu["last_poweroff_error"]["error"],
+        json!("Access denied"),
+        "{vu}"
+    );
+    let vu = lire(&app, &jeton_user).await;
+    assert_eq!(
+        vu["last_poweroff_error"]["code"],
+        json!("polkit_denied"),
+        "{vu}"
+    );
+    assert_eq!(vu["last_poweroff_error"].get("error"), None, "{vu}");
 }

@@ -246,3 +246,61 @@ fn aucune_commande_ne_passe_par_un_shell_ou_sudo() {
         }
     }
 }
+
+// ─── À l'échéance : mode rangé et authentification ────────────────────
+
+#[test]
+fn hote_sans_authentification_active_rien_ne_part() {
+    assert_eq!(
+        decider(Some(Mode::Hote), Some("host"), false),
+        Err(Refus::AuthentificationRequise)
+    );
+    assert_eq!(
+        decider(Some(Mode::Hote), Some("host"), true),
+        Ok(Mode::Hote)
+    );
+    // Tune OS garde son comportement : l'authentification n'y est pas exigée.
+    assert_eq!(
+        decider(Some(Mode::TuneOs), Some("tune_os"), false),
+        Ok(Mode::TuneOs)
+    );
+    assert_eq!(Refus::AuthentificationRequise.code(), "auth_required");
+    assert!(
+        Refus::AuthentificationRequise
+            .message()
+            .contains("enable authentication")
+    );
+}
+
+/// Un réglage restauré ou importé : sans mode rangé, ou avec le mode d'une
+/// autre machine, l'échéance n'éteint rien.
+#[test]
+fn un_mode_range_different_du_mode_courant_refuse() {
+    for (courant, range) in [
+        (Some(Mode::Hote), None),
+        (Some(Mode::Hote), Some("tune_os")),
+        (Some(Mode::TuneOs), Some("host")),
+        (Some(Mode::TuneOs), None),
+        (None, Some("host")),
+    ] {
+        let refus = decider(courant, range, true).unwrap_err();
+        assert_eq!(refus.code(), "mode_mismatch", "{courant:?} / {range:?}");
+    }
+    // Conteneur et réglage sans mode : indisponible, pas d'extinction.
+    assert!(decider(None, None, true).is_err());
+}
+
+/// La porte réelle, avec un réglage importé SANS mode rangé : elle refuse
+/// avant de lancer quoi que ce soit, quelle que soit la machine de test
+/// (hôte, Tune OS ou conteneur).
+#[tokio::test]
+async fn la_porte_refuse_un_reglage_importe_sans_mode() {
+    let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    let refus = extinction_programmee(state.backend.clone(), None)
+        .await
+        .unwrap_err();
+    assert!(
+        ["mode_mismatch", "container", "unsupported"].contains(&refus.code.as_str()),
+        "{refus:?}"
+    );
+}

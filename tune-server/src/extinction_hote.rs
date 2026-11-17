@@ -10,6 +10,13 @@
 //!   rien d'autre. Aucune route HTTP n'éteint l'hôte : la route du réglage
 //!   (`PUT /system/settings/scheduled-stop`, administrateur) ne fait que POSER
 //!   l'option, désactivée par défaut (`action: "stop_playback"`) ;
+//! - **authentification exigée sur un hôte** : sur un hôte ordinaire, l'option
+//!   ne se pose que si l'authentification est active (administrateur), et
+//!   l'extinction refuse encore à l'échéance si elle a été coupée depuis.
+//!   Tune OS garde son comportement (#8213) ;
+//! - **mode revalidé à l'échéance** : la route range avec le réglage le mode
+//!   validé à la pose (`poweroff_mode`) ; à l'échéance, rien ne part si le mode
+//!   courant de la machine diffère (réglage restauré ou importé d'ailleurs) ;
 //! - **aucune commande construite** : chaque commande est un chemin ABSOLU et
 //!   des arguments CONSTANTS ([`Commande`], `&'static str` seulement), lancée
 //!   sans shell, sans sudo, sans variable d'environnement qui choisisse le
@@ -166,9 +173,19 @@ pub enum Refus {
     AutorisationMacos(String),
     /// Windows : le compte n'a pas le privilège d'arrêt.
     PrivilegeWindows(String),
+    /// Hôte ordinaire sans authentification active.
+    AuthentificationRequise,
+    /// Le mode rangé avec le réglage n'est pas le mode courant.
+    ModeDifferent {
+        range: Option<String>,
+        courant: Option<&'static str>,
+    },
     /// Autre échec de la commande.
     Echec(String),
 }
+
+pub const REFUS_SANS_AUTHENTIFICATION: &str = "Powering off this computer on a schedule \
+requires authentication: enable authentication and sign in as an administrator.";
 
 pub const REFUS_CONTENEUR: &str = "Tune is running in a container: it does not power off the \
 host machine. Schedule the host's shutdown on the host itself.";
@@ -185,6 +202,8 @@ impl Refus {
             Refus::Polkit(_) => "polkit_denied",
             Refus::AutorisationMacos(_) => "macos_not_authorized",
             Refus::PrivilegeWindows(_) => "windows_privilege",
+            Refus::AuthentificationRequise => "auth_required",
+            Refus::ModeDifferent { .. } => "mode_mismatch",
             Refus::Echec(_) => "failed",
         }
     }
@@ -208,7 +227,22 @@ impl Refus {
                 "Windows refused to shut down the computer: the account running Tune does not \
                  have the \"Shut down the system\" right. ({detail})"
             ),
+            Refus::AuthentificationRequise => REFUS_SANS_AUTHENTIFICATION.to_string(),
+            Refus::ModeDifferent { range, courant } => format!(
+                "The scheduled power-off was not validated on this machine (saved mode: {}, \
+                 current mode: {}). Save the scheduled stop again in the settings.",
+                range.as_deref().unwrap_or("none"),
+                courant.unwrap_or("none"),
+            ),
             Refus::Echec(detail) => format!("Powering off the machine failed: {detail}"),
+        }
+    }
+
+    /// Pour le planificateur (tune-core).
+    pub fn vers_refus_extinction(&self) -> tune_core::arret_programme::RefusExtinction {
+        tune_core::arret_programme::RefusExtinction {
+            code: self.code().to_string(),
+            message: self.message(),
         }
     }
 }
@@ -373,21 +407,58 @@ pub fn refus_indisponible() -> Refus {
     }
 }
 
+/// La décision à l'échéance, paramètres explicites (essais) : le mode
+/// courant doit être celui qu'a validé la route à la pose, et un hôte
+/// ordinaire exige l'authentification active. Rend le mode à exécuter.
+pub fn decider(
+    courant: Option<Mode>,
+    range: Option<&str>,
+    authentification_active: bool,
+) -> Result<Mode, Refus> {
+    let code_courant = courant.map(Mode::code);
+    if code_courant != range {
+        return Err(Refus::ModeDifferent {
+            range: range.map(str::to_string),
+            courant: code_courant,
+        });
+    }
+    match courant {
+        Some(Mode::Hote) if !authentification_active => Err(Refus::AuthentificationRequise),
+        Some(mode) => Ok(mode),
+        None => Err(refus_indisponible()),
+    }
+}
+
 /// LA porte de l'extinction programmée : appelée par le crochet du
-/// planificateur de l'arrêt programmé, et par lui seul. Tune OS garde sa
-/// fonction d'extinction ([`crate::routes::appliance::ordonner`]) ; un hôte
-/// ordinaire passe par [`eteindre_avec`]. Le mode est relu À L'ÉCHÉANCE : un
-/// réglage importé ou recopié dans un conteneur ne passe pas.
-pub async fn extinction_programmee() -> Result<(), String> {
-    match mode() {
-        Some(Mode::TuneOs) => {
+/// planificateur de l'arrêt programmé, et par lui seul, avec le mode rangé
+/// dans le réglage. Le mode et l'authentification sont relus À L'ÉCHÉANCE
+/// ([`decider`]) ; Tune OS garde sa fonction d'extinction
+/// ([`crate::routes::appliance::ordonner`]) ; un hôte ordinaire passe par
+/// [`eteindre_avec`]. Un refus ne lance rien.
+pub async fn extinction_programmee(
+    db: std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    mode_range: Option<String>,
+) -> Result<(), tune_core::arret_programme::RefusExtinction> {
+    let mode = decider(
+        mode(),
+        mode_range.as_deref(),
+        crate::auth::authentification_active_db(&db),
+    )
+    .map_err(|refus| {
+        if let Refus::ModeDifferent { range, courant } = &refus {
+            tracing::warn!(?range, ?courant, "scheduled_poweroff_mode_mismatch");
+        }
+        refus.vers_refus_extinction()
+    })?;
+    match mode {
+        Mode::TuneOs => {
             crate::routes::appliance::ordonner(crate::routes::appliance::OrdreMachine::Eteindre)
                 .await
+                .map_err(|e| Refus::Echec(e).vers_refus_extinction())
         }
-        Some(Mode::Hote) => eteindre_avec(Contexte::courant(), &ExecuteurSysteme)
+        Mode::Hote => eteindre_avec(Contexte::courant(), &ExecuteurSysteme)
             .await
-            .map_err(|r| r.message()),
-        None => Err(refus_indisponible().message()),
+            .map_err(|r| r.vers_refus_extinction()),
     }
 }
 

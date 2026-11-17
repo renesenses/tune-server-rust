@@ -28,6 +28,7 @@ fn reglage(time: &str, jours: &str, zones: Option<Vec<i64>>) -> ArretProgramme {
         days_of_week: jours.into(),
         zone_ids: zones,
         action: ActionArret::StopPlayback,
+        poweroff_mode: None,
     }
 }
 
@@ -199,11 +200,11 @@ impl Banc {
     /// lieu d'éteindre quoi que ce soit.
     fn avec_extinction_comptee(
         self,
-        resultat: Result<(), String>,
+        resultat: Result<(), RefusExtinction>,
     ) -> (Self, Arc<std::sync::atomic::AtomicUsize>) {
         let appels = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let compteur = appels.clone();
-        let extinction: Extinction = Arc::new(move || {
+        let extinction: Extinction = Arc::new(move |_mode| {
             compteur.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let r = resultat.clone();
             Box::pin(async move { r })
@@ -484,6 +485,7 @@ async fn un_refus_d_extinction_est_garde_puis_efface_par_une_extinction_reussie(
         lire_echec_extinction(&banc.db),
         Some(EchecExtinction {
             at: mardi(23, 0).format("%Y-%m-%dT%H:%M:%S").to_string(),
+            code: "failed".into(),
             error: POLKIT.into(),
         }),
         "le refus est gardé, avec l'heure de l'échéance"
@@ -511,6 +513,7 @@ async fn stop_playback_ne_touche_pas_au_dernier_echec() {
     let (banc, _) = Banc::monter().await.avec_extinction_comptee(Ok(()));
     let echec = EchecExtinction {
         at: "2026-11-09T23:00:00".into(),
+        code: "polkit_denied".into(),
         error: "refus".into(),
     };
     noter_echec_extinction(&banc.db, &echec);
@@ -522,4 +525,63 @@ async fn stop_playback_ne_touche_pas_au_dernier_echec() {
     assert_eq!(lire_echec_extinction(&banc.db), Some(echec));
     effacer_echec_extinction(&banc.db);
     assert_eq!(lire_echec_extinction(&banc.db), None);
+}
+
+/// #8909 — le crochet reçoit le mode RANGÉ avec le réglage (validé à la
+/// pose), pour que le serveur le compare au mode courant à l'échéance.
+#[tokio::test]
+async fn le_crochet_recoit_le_mode_range_et_le_code_du_refus_est_garde() {
+    let banc = Banc::monter().await;
+    let recus = Arc::new(std::sync::Mutex::new(Vec::<Option<String>>::new()));
+    let r2 = recus.clone();
+    let extinction: Extinction = Arc::new(move |mode| {
+        r2.lock().unwrap().push(mode);
+        Box::pin(async {
+            Err(RefusExtinction {
+                code: "mode_mismatch".into(),
+                message: "mode differs".into(),
+            })
+        })
+    });
+    let Banc {
+        db,
+        playback,
+        planificateur,
+        salon,
+        chambre,
+    } = banc;
+    let banc = Banc {
+        planificateur: planificateur.avec_extinction(extinction),
+        db,
+        playback,
+        salon,
+        chambre,
+    };
+    let mut r = reglage("23:00", "1111111", None);
+    r.action = ActionArret::Poweroff;
+    r.poweroff_mode = Some("host".into());
+    ecrire(&banc.db, r.clone()).unwrap();
+    assert_eq!(
+        lire(&banc.db).unwrap().poweroff_mode.as_deref(),
+        Some("host")
+    );
+    let mut derniere = None;
+    banc.planificateur
+        .passage(mardi(23, 0), &mut derniere)
+        .await;
+    assert_eq!(*recus.lock().unwrap(), vec![Some("host".to_string())]);
+    assert_eq!(
+        lire_echec_extinction(&banc.db).unwrap().code,
+        "mode_mismatch"
+    );
+
+    // Réglage sans mode rangé (import d'avant #8909, ou d'ailleurs) : le
+    // crochet reçoit `None`, et c'est au serveur de refuser.
+    r.poweroff_mode = None;
+    ecrire(&banc.db, r).unwrap();
+    let mut derniere = None;
+    banc.planificateur
+        .passage(mardi(23, 0), &mut derniere)
+        .await;
+    assert_eq!(recus.lock().unwrap().last().unwrap(), &None);
 }

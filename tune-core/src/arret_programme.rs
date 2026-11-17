@@ -42,7 +42,10 @@ pub const CLE_ECHEC: &str = "scheduled_stop_poweroff_error";
 pub struct EchecExtinction {
     /// Heure locale du serveur de l'échéance, `AAAA-MM-JJTHH:MM:SS`.
     pub at: String,
-    /// Le message du refus, en clair.
+    /// Code stable du refus (`polkit_denied`…).
+    #[serde(default)]
+    pub code: String,
+    /// Le message du refus, en clair (sortie d'erreur comprise).
     pub error: String,
 }
 
@@ -85,10 +88,32 @@ pub enum ActionArret {
     Poweroff,
 }
 
-/// Le crochet d'extinction de la machine, fourni par le serveur. Rend
-/// l'erreur telle quelle (refus hors Tune OS, `systemctl` qui échoue).
-pub type Extinction =
-    Arc<dyn Fn() -> futures_util::future::BoxFuture<'static, Result<(), String>> + Send + Sync>;
+/// Le refus du crochet d'extinction : un code stable (`polkit_denied`,
+/// `auth_required`, `mode_mismatch`…) et le message en clair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusExtinction {
+    pub code: String,
+    pub message: String,
+}
+
+impl From<&str> for RefusExtinction {
+    /// Un refus sans code particulier (`failed`).
+    fn from(message: &str) -> Self {
+        RefusExtinction {
+            code: "failed".into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Le crochet d'extinction de la machine, fourni par le serveur. Il reçoit
+/// le mode d'extinction RANGÉ avec le réglage ([`ArretProgramme::poweroff_mode`],
+/// validé par la route à la pose) et rend le refus tel quel.
+pub type Extinction = Arc<
+    dyn Fn(Option<String>) -> futures_util::future::BoxFuture<'static, Result<(), RefusExtinction>>
+        + Send
+        + Sync,
+>;
 
 /// Le réglage tel qu'il est rangé et tel que l'API le rend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,6 +132,12 @@ pub struct ArretProgramme {
     /// d'avant l'option).
     #[serde(default)]
     pub action: ActionArret,
+    /// #8909 — le mode d'extinction validé à la pose (`"tune_os"`, `"host"`),
+    /// écrit par la route seule, jamais repris du client. À l'échéance,
+    /// l'extinction n'a lieu que si le mode courant de la machine est le
+    /// même : un réglage restauré ou importé d'ailleurs n'éteint rien.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poweroff_mode: Option<String>,
 }
 
 fn tous_les_jours() -> String {
@@ -281,7 +312,8 @@ impl PlanificateurArretProgramme {
         *derniere = Some(minute);
         let arretees = self.arreter(&reglage).await;
         if reglage.action == ActionArret::Poweroff {
-            self.eteindre(maintenant).await;
+            self.eteindre(maintenant, reglage.poweroff_mode.clone())
+                .await;
         }
         arretees
     }
@@ -289,21 +321,22 @@ impl PlanificateurArretProgramme {
     /// Éteint la machine par le crochet du serveur. Un refus (conteneur,
     /// polkit…) ou un échec est journalisé ET gardé pour l'écran (#8909) ;
     /// une extinction partie efface l'échec précédent.
-    async fn eteindre(&self, maintenant: NaiveDateTime) {
+    async fn eteindre(&self, maintenant: NaiveDateTime, mode_range: Option<String>) {
         let Some(extinction) = &self.extinction else {
             warn!("scheduled_poweroff_unavailable: no power-off hook");
             return;
         };
         info!("scheduled_poweroff_requested");
-        match extinction().await {
+        match extinction(mode_range).await {
             Ok(()) => effacer_echec_extinction(&self.db),
             Err(e) => {
-                warn!(error = %e, "scheduled_poweroff_failed");
+                warn!(code = %e.code, error = %e.message, "scheduled_poweroff_failed");
                 noter_echec_extinction(
                     &self.db,
                     &EchecExtinction {
                         at: maintenant.format("%Y-%m-%dT%H:%M:%S").to_string(),
-                        error: e,
+                        code: e.code,
+                        error: e.message,
                     },
                 );
             }

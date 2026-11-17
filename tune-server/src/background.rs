@@ -1816,8 +1816,13 @@ fn spawn_alarm_scheduler(state: &AppState) {
     // d'extinction, hôte ordinaire par `extinction_hote` (#8909), jamais dans
     // un conteneur. Ce crochet est le SEUL appelant de
     // `extinction_hote::extinction_programmee`.
-    let extinction: tune_core::arret_programme::Extinction =
-        Arc::new(|| Box::pin(crate::extinction_hote::extinction_programmee()));
+    let db_extinction = state.backend.clone();
+    let extinction: tune_core::arret_programme::Extinction = Arc::new(move |mode_range| {
+        Box::pin(crate::extinction_hote::extinction_programmee(
+            db_extinction.clone(),
+            mode_range,
+        ))
+    });
     Arc::new(
         tune_core::arret_programme::PlanificateurArretProgramme::new(
             state.backend.clone(),

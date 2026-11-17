@@ -44,7 +44,15 @@ pub fn router() -> Router<AppState> {
 /// Le binaire d'extinction, surchargeable pour les tests et les images
 /// atypiques.
 fn systemctl_bin() -> String {
-    std::env::var("TUNE_SYSTEMCTL_BIN").unwrap_or_else(|_| "systemctl".into())
+    // Chemin absolu : `/usr/bin` (Fedora, Debian fusionnée), sinon `/bin`
+    // (images Debian historiques non fusionnées).
+    std::env::var("TUNE_SYSTEMCTL_BIN").unwrap_or_else(|_| {
+        if std::path::Path::new("/usr/bin/systemctl").is_file() {
+            "/usr/bin/systemctl".into()
+        } else {
+            "/bin/systemctl".into()
+        }
+    })
 }
 
 /// Les deux ordres que Tune donne à la machine (#1511, #8213).
