@@ -1041,7 +1041,7 @@ mod listen_socket_tests {
         let rien = |_: &str| None;
         assert!(
             replis_du_journal(&rien).is_empty(),
-            "aucun repli sous temp_dir()"
+            "aucun repli dans le dossier temporaire du système"
         );
     }
 
