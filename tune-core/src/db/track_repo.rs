@@ -3355,6 +3355,32 @@ impl TrackRepo {
         mtime: f64,
         file_size: i64,
     ) -> Result<(), TuneError> {
+        self.update_file_stats(file_path, mtime, file_size, false)
+    }
+
+    /// Remet en phase une écriture de balises faite par Tune (#8864).
+    ///
+    /// L'appelant a vérifié que le fichier correspondait à sa ligne AVANT
+    /// l'écriture. Taille, date et marque d'enrichissement encore valide
+    /// avancent ensemble ; l'issue et le délai des 503 restent intacts.
+    /// Réservé à une base migrée et aux réécritures internes : un scan qui
+    /// importe une modification extérieure ne doit pas employer ce chemin.
+    pub fn update_mtime_and_size_after_tag_write(
+        &self,
+        file_path: &str,
+        mtime: f64,
+        file_size: i64,
+    ) -> Result<(), TuneError> {
+        self.update_file_stats(file_path, mtime, file_size, true)
+    }
+
+    fn update_file_stats(
+        &self,
+        file_path: &str,
+        mtime: f64,
+        file_size: i64,
+        preserve_enrichment: bool,
+    ) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::update_mtime_and_size, sql::update_mtime_and_size);
         // #4546 : c'est ici que la retouche d'étiquettes avance le `mtime`.
         if let Some(chemin) = chemin_local(Some(file_path)) {
@@ -3365,7 +3391,32 @@ impl TrackRepo {
             );
         }
         let params: [&dyn ToSqlValue; 3] = [&mtime, &file_size, &file_path];
-        self.db.execute(&sql, &params)?;
+        if !preserve_enrichment {
+            self.db.execute(&sql, &params)?;
+            return Ok(());
+        }
+        let (p1, p2) = self.marqueurs2();
+        // Seule une marque encore valable avant la réécriture suit la date.
+        // Un scan extérieur qui l'avait déjà périmée reste visible.
+        let suivre = format!(
+            "UPDATE enrich_tentatives SET mtime_vu = CAST(CAST({p1} AS DOUBLE PRECISION) AS TEXT) \
+             WHERE track_id IN (SELECT t.id FROM tracks t WHERE t.file_path = {p2} \
+             AND COALESCE(enrich_tentatives.mtime_vu, '') = \
+                 COALESCE(CAST(t.file_mtime AS TEXT), ''))"
+        );
+        self.db.write_tx(&mut |tx| {
+            // SQLite sérialise déjà les écritures ; PostgreSQL doit empêcher
+            // un scan de modifier ces lignes entre la marque et leur date.
+            if self.db.engine() == Engine::Postgres {
+                tx.query_many(
+                    "SELECT id FROM tracks WHERE file_path = $1 FOR UPDATE",
+                    &[&file_path],
+                )?;
+            }
+            tx.execute(&suivre, &[&mtime, &file_path])?;
+            tx.execute(&sql, &params)?;
+            Ok(())
+        })?;
         Ok(())
     }
 

@@ -16,7 +16,8 @@ fn selection(s: &AppState, now: i64) -> Vec<(i64, bool)> {
 }
 
 async fn eprouver_gravure(s: AppState, issue: Issue) {
-    let dir = tune_core::test_scratch::scratch_dir_in(std::env::current_dir().unwrap(), "enrich-8864");
+    let dir =
+        tune_core::test_scratch::scratch_dir_in(std::env::current_dir().unwrap(), "enrich-8864");
     let path = dir.path().join("enrichie.flac");
     std::fs::copy(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -67,21 +68,37 @@ async fn eprouver_gravure(s: AppState, issue: Issue) {
         selection(&s, T0)
     );
     if issue == Issue::EchecTemporaire {
-        assert_eq!(selection(&s, T0 + 3600), vec![(1, true)],
-            "le 503 doit redevenir un réessai, pas une nouvelle piste");
+        assert_eq!(
+            selection(&s, T0 + 3600),
+            vec![(1, true)],
+            "le 503 doit redevenir un réessai, pas une nouvelle piste"
+        );
         let rows = selection(&s, T0 + 3600);
         let total = rows.iter().filter(|(_, retry)| !retry).count();
-        assert_eq!(releve_enrichissement("running", "8864", 0, 0, total, 0, 0, 1)["remaining"], 0);
+        assert_eq!(
+            releve_enrichissement("running", "8864", 0, 0, total, 0, 0, 1)["remaining"],
+            0
+        );
     }
     // Changement extérieur : le vrai scan doit relire cette nouvelle date.
     tune_core::db::settings_repo::SettingsRepo::with_backend(s.backend.clone())
-        .set("music_dirs", &serde_json::to_string(&[dir.to_string_lossy()]).unwrap()).unwrap();
-    std::fs::File::options().write(true).open(&path).unwrap()
-        .set_modified(UNIX_EPOCH + Duration::from_secs(1_750_000_000)).unwrap();
+        .set(
+            "music_dirs",
+            &serde_json::to_string(&[dir.to_string_lossy()]).unwrap(),
+        )
+        .unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(UNIX_EPOCH + Duration::from_secs(1_750_000_000))
+        .unwrap();
     scanner(&s).await;
-    assert_eq!(selection(&s, T0), vec![(1, false)],
-        "une modification extérieure relue par le scan doit redevenir candidate");
-
+    assert_eq!(
+        selection(&s, T0),
+        vec![(1, false)],
+        "une modification extérieure relue par le scan doit redevenir candidate"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -143,6 +160,8 @@ async fn scanner(s: &AppState) {
                 Err(e) => panic!("bus fermé : {e}"),
             }
         }
-    }).await.expect("le vrai scan doit finir");
+    })
+    .await
+    .expect("le vrai scan doit finir");
     crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
 }
