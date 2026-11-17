@@ -156,7 +156,9 @@ pub(crate) async fn restaurer(State(state): State<AppState>, Path(id): Path<i64>
     state
         .event_bus
         .emit("zone.updated", json!({ "zone_id": id }));
-    let v = crate::routes::playback::build_zone_json(&state, id).await;
+    let mut v = crate::routes::playback::build_zone_json(&state, id).await;
+    // #8987 — une zone ASIO restaurée sous WASAPI (ou l'inverse) : dit.
+    super::zone_appareil_8987::signaler_la_restauration_hors_hote(&state, id, &mut v).await;
     (StatusCode::OK, Json(v)).into_response()
 }
 

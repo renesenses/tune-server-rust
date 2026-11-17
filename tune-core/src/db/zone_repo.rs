@@ -3187,6 +3187,31 @@ impl ZoneRepo {
         Ok(touchees)
     }
 
+    /// #8987 — détache la sortie d'une zone MASQUÉE (supprimée), pour qu'une
+    /// zone visible puisse la prendre.
+    ///
+    /// L'index unique partiel `idx_zones_output_device_id` ne distingue pas
+    /// les zones masquées : une zone supprimée garde son `output_device_id`
+    /// et refusait à toute autre zone de prendre l'appareil (500 « UNIQUE
+    /// constraint failed », fil 2708). La ligne masquée reste — réglages,
+    /// historique et place dans « Zones supprimées » — mais sans sortie.
+    ///
+    /// La condition « encore masquée » est relue DANS l'écriture : une zone
+    /// restaurée entre-temps n'est pas dépouillée. Rend le nombre de lignes
+    /// touchées (`0` = la zone n'était plus masquée, ou n'existe pas).
+    pub fn liberer_la_sortie_d_une_zone_masquee(&self, id: i64) -> Result<usize, String> {
+        let p = match self.db.engine() {
+            Engine::Sqlite => SqliteDialect.placeholder(1),
+            Engine::Postgres => PostgresDialect.placeholder(1),
+        };
+        let sql = format!(
+            "UPDATE zones SET output_device_id = NULL \
+             WHERE id = {p} AND COALESCE(is_hidden, 0) = 1"
+        );
+        let params: [&dyn ToSqlValue; 1] = [&id];
+        self.db.execute(&sql, &params)
+    }
+
     /// Démasque la zone, et efface son motif et sa date de masquage.
     pub fn unhide(&self, id: i64) -> Result<(), String> {
         let sql = self.dialect_sql(sql::unhide, sql::unhide);
@@ -5689,6 +5714,114 @@ mod collision_de_sortie_5464_tests {
             "ALTER TABLE zones ADD COLUMN IF NOT EXISTS is_hidden SMALLINT DEFAULT 0",
             "ALTER TABLE zones ADD COLUMN IF NOT EXISTS host TEXT",
             "ALTER TABLE zones ADD COLUMN IF NOT EXISTS mac TEXT",
+            INDEX,
+        ] {
+            db.execute(ddl, &[]).unwrap();
+        }
+        epreuve(&ZoneRepo::with_backend(db));
+        pool.close().await;
+    }
+}
+
+/// #8987 (fil 2708) — une zone SUPPRIMÉE (masquée) tient encore sa sortie :
+/// changer l'appareil d'une zone visible vers cette sortie heurtait l'index
+/// unique partiel et ressortait en 500 « UNIQUE constraint failed ».
+/// `liberer_la_sortie_d_une_zone_masquee` la détache, sous les DEUX moteurs,
+/// et ne touche jamais une zone visible.
+#[cfg(test)]
+mod liberer_la_sortie_8987_tests {
+    use super::*;
+
+    const INDEX: &str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_zones_output_device_id_8987 \
+                         ON zones(output_device_id) WHERE output_device_id IS NOT NULL";
+
+    fn epreuve(repo: &ZoneRepo) {
+        let supprimee = repo
+            .create(
+                "DENAFRIPS (ancienne)",
+                Some("local"),
+                Some("local:DAC 8987"),
+            )
+            .unwrap();
+        repo.delete(supprimee).unwrap();
+        let visible = repo
+            .create("Bureau", Some("local"), Some("local:Haut-parleurs 8987"))
+            .unwrap();
+
+        // Témoin : sans libération, l'index refuse bien le changement
+        // d'appareil — c'est le 500 du fil 2708.
+        repo.update_output_device(visible, "local:DAC 8987")
+            .expect_err("l'index unique doit refuser la sortie tenue par la zone supprimée");
+
+        // Une zone VISIBLE n'est jamais dépouillée.
+        assert_eq!(
+            repo.liberer_la_sortie_d_une_zone_masquee(visible).unwrap(),
+            0,
+            "une zone visible garde sa sortie"
+        );
+        assert_eq!(
+            repo.get(visible)
+                .unwrap()
+                .unwrap()
+                .output_device_id
+                .as_deref(),
+            Some("local:Haut-parleurs 8987")
+        );
+
+        assert_eq!(
+            repo.liberer_la_sortie_d_une_zone_masquee(supprimee)
+                .unwrap(),
+            1,
+            "la zone supprimée lâche sa sortie"
+        );
+        repo.update_output_device(visible, "local:DAC 8987")
+            .expect("la sortie libérée se prend sans heurter l'index");
+        assert_eq!(
+            repo.get(visible)
+                .unwrap()
+                .unwrap()
+                .output_device_id
+                .as_deref(),
+            Some("local:DAC 8987")
+        );
+        // La zone supprimée reste supprimée, sans sortie.
+        let etat = repo.etat_de_masquage(supprimee).unwrap().unwrap();
+        assert!(etat.masquee, "la ligne supprimée reste masquée");
+        assert_eq!(repo.get(supprimee).unwrap().unwrap().output_device_id, None);
+    }
+
+    #[test]
+    fn sqlite_8987_une_zone_supprimee_lache_sa_sortie() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        db.execute_batch(INDEX).unwrap();
+        epreuve(&ZoneRepo::new(db));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_8987_une_zone_supprimee_lache_sa_sortie() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT: TUNE_TEST_PG_URL absent");
+            return;
+        };
+        // Connexion unique : la table TEMPORAIRE masque `public.zones` pour
+        // elle seule, rien n'est écrit dans la base partagée (même montage
+        // que `pg_5464`).
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&url)
+            .await
+            .unwrap();
+        let db: Arc<dyn DbBackend> =
+            Arc::new(crate::db::backend::PostgresBackend::new(pool.clone()));
+        for ddl in [
+            "CREATE TEMP TABLE zones (LIKE public.zones INCLUDING ALL)",
+            "ALTER TABLE zones ADD COLUMN IF NOT EXISTS is_hidden SMALLINT DEFAULT 0",
+            "ALTER TABLE zones ADD COLUMN IF NOT EXISTS host TEXT",
+            "ALTER TABLE zones ADD COLUMN IF NOT EXISTS mac TEXT",
+            "ALTER TABLE zones ADD COLUMN IF NOT EXISTS motif_masquage TEXT",
+            "ALTER TABLE zones ADD COLUMN IF NOT EXISTS masquee_le TEXT",
             INDEX,
         ] {
             db.execute(ddl, &[]).unwrap();
