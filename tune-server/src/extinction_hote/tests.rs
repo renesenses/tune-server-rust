@@ -290,17 +290,45 @@ fn un_mode_range_different_du_mode_courant_refuse() {
     assert!(decider(None, None, true).is_err());
 }
 
-/// La porte réelle, avec un réglage importé SANS mode rangé : elle refuse
-/// avant de lancer quoi que ce soit, quelle que soit la machine de test
-/// (hôte, Tune OS ou conteneur).
+/// La porte de l'échéance, avec un exécuteur qui n'éteint RIEN (jamais
+/// l'exécuteur réel en essai) : réglage importé sans mode, hôte sans
+/// authentification → aucune commande ; hôte authentifié au mode rangé → la
+/// commande part (dans le faux).
 #[tokio::test]
-async fn la_porte_refuse_un_reglage_importe_sans_mode() {
+async fn la_porte_de_l_echeance_ne_lance_rien_sans_mode_ni_authentification() {
     let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
-    let refus = extinction_programmee(state.backend.clone(), None)
+    let db = state.backend.clone();
+    let linux = hote(Plateforme::Linux);
+
+    let faux = Faux::new(&["/usr/bin/systemctl"]);
+    let refus = extinction_programmee_avec(db.clone(), None, Some(Mode::Hote), linux, &faux)
         .await
         .unwrap_err();
-    assert!(
-        ["mode_mismatch", "container", "unsupported"].contains(&refus.code.as_str()),
-        "{refus:?}"
+    assert_eq!(refus.code, "mode_mismatch");
+    assert!(faux.lances().is_empty(), "réglage importé sans mode : rien");
+
+    let refus = extinction_programmee_avec(
+        db.clone(),
+        Some("host".into()),
+        Some(Mode::Hote),
+        linux,
+        &faux,
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(refus.code, "auth_required");
+    assert!(faux.lances().is_empty(), "sans authentification : rien");
+
+    tune_core::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .set("auth_enabled", "true")
+        .unwrap();
+    assert_eq!(
+        extinction_programmee_avec(db, Some("host".into()), Some(Mode::Hote), linux, &faux).await,
+        Ok(())
+    );
+    assert_eq!(
+        faux.lances().len(),
+        1,
+        "authentifié, mode identique : la commande part"
     );
 }

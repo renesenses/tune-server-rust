@@ -439,8 +439,28 @@ pub async fn extinction_programmee(
     db: std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     mode_range: Option<String>,
 ) -> Result<(), tune_core::arret_programme::RefusExtinction> {
-    let mode = decider(
+    extinction_programmee_avec(
+        db,
+        mode_range,
         mode(),
+        Contexte::courant(),
+        &ExecuteurSysteme,
+    )
+    .await
+}
+
+/// [`extinction_programmee`], mode courant, contexte et exécuteur explicites :
+/// les essais passent un exécuteur qui n'éteint rien, même si la décision
+/// venait à laisser passer à tort.
+pub async fn extinction_programmee_avec(
+    db: std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    mode_range: Option<String>,
+    courant: Option<Mode>,
+    contexte: Contexte,
+    executeur: &dyn Executeur,
+) -> Result<(), tune_core::arret_programme::RefusExtinction> {
+    let mode = decider(
+        courant,
         mode_range.as_deref(),
         crate::auth::authentification_active_db(&db),
     )
@@ -456,7 +476,7 @@ pub async fn extinction_programmee(
                 .await
                 .map_err(|e| Refus::Echec(e).vers_refus_extinction())
         }
-        Mode::Hote => eteindre_avec(Contexte::courant(), &ExecuteurSysteme)
+        Mode::Hote => eteindre_avec(contexte, executeur)
             .await
             .map_err(|r| r.vers_refus_extinction()),
     }
