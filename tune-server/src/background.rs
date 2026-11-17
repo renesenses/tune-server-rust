@@ -1068,7 +1068,7 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                             name = %d.name,
                             device_id = %d.id,
                             host = %d.host,
-                            location,
+                            location = %tune_core::confidentialite::masquer_url(&location),
                             error = %e,
                             "ssdp_startup_description_injoignable"
                         );
@@ -6086,4 +6086,4 @@ mod relance_du_client_de_relais_7714 {
              reste Deconnecte jusqu'au redemarrage"
         );
     }
-}
+})

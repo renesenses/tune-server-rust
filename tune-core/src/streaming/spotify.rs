@@ -757,7 +757,7 @@ impl SpotifyService {
         let redirect_uri = effective_redirect_uri(redirect_uri, api_port);
         if let Some(refus) = refus_redirection(&redirect_uri) {
             warn!(
-                redirect_uri = %redirect_uri,
+                redirect_uri = %crate::confidentialite::masquer_url(&redirect_uri),
                 refus = refus.code(),
                 "spotify_redirect_uri_refusee: Spotify n'accepte en http:// que \
                  http://127.0.0.1:<port> ou http://[::1]:<port> ; sinon HTTPS"

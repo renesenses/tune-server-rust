@@ -631,7 +631,7 @@ impl PlaybackOrchestrator {
             info!(
                 track_id = ?req.track_id,
                 zone_id = req.zone_id,
-                url = %raw_url,
+                url = %crate::confidentialite::masquer_url(&raw_url),
                 "upnp_url_de_lecture_lue_dans_l_instantane"
             );
         }
@@ -656,7 +656,7 @@ impl PlaybackOrchestrator {
             warn!(
                 track_id,
                 zone_id = req.zone_id,
-                url = %raw_url,
+                url = %crate::confidentialite::masquer_url(&raw_url),
                 raison = absent.raison.code(),
                 depuis_secs = absent.depuis_secs,
                 "upnp_refus_serveur_source_absent"
@@ -697,11 +697,11 @@ impl PlaybackOrchestrator {
                 .await
             {
                 Ok(flux) => {
-                    info!(zone_id = req.zone_id, page = %audio_url, "bandcamp_page_de_piste_resolue");
+                    info!(zone_id = req.zone_id, page = %crate::confidentialite::masquer_url(&audio_url), "bandcamp_page_de_piste_resolue");
                     Some((flux, audio_url.to_string()))
                 }
                 Err(e) => {
-                    warn!(zone_id = req.zone_id, page = %audio_url, error = %e, "bandcamp_page_de_piste_illisible");
+                    warn!(zone_id = req.zone_id, page = %crate::confidentialite::masquer_url(&audio_url), error = %e, "bandcamp_page_de_piste_illisible");
                     return Err(format!(
                         "Lecture impossible : la page Bandcamp {audio_url} ne donne pas de flux jouable ({e})"
                     ));
@@ -891,7 +891,7 @@ impl PlaybackOrchestrator {
             info!(
                 zone_id = req.zone_id,
                 track_id = ?req.track_id,
-                url = %audio_url,
+                url = %crate::confidentialite::masquer_url(&audio_url),
                 mime = mime_type,
                 politique = politique.as_str(),
                 "dsd_upnp_politique_de_zone"
@@ -977,7 +977,7 @@ impl PlaybackOrchestrator {
         if opus && crate::audio::frequence_fixe::cible(&self.db, req.zone_id, plafond)?.is_some() {
             info!(
                 zone_id = req.zone_id,
-                url = %audio_url,
+                url = %crate::confidentialite::masquer_url(&audio_url),
                 mime = mime_type,
                 "frequence_fixe_ecartee_pour_l_opus_d_une_url_directe"
             );
@@ -1448,7 +1448,7 @@ impl PlaybackOrchestrator {
                     .get_stream_url(&session_id, &server_ip, conteneur);
                 info!(
                     zone_id = req.zone_id,
-                    url = %audio_url,
+                    url = %crate::confidentialite::masquer_url(&audio_url),
                     conteneur,
                     "dsd_upnp_brut_relaye_par_tune"
                 );
@@ -1588,7 +1588,7 @@ impl PlaybackOrchestrator {
         }
         info!(
             zone_id = req.zone_id,
-            url = %audio_url,
+            url = %crate::confidentialite::masquer_url(&audio_url),
             sample_rate = sr,
             bit_depth = bd,
             "dsd_upnp_decodage_progressif_en_wav"
@@ -1623,9 +1623,11 @@ impl PlaybackOrchestrator {
             })
             .await;
             match result {
-                Ok(Ok(_)) => debug!(url = %url, "dsd_upnp_wav_channel_complete"),
+                Ok(Ok(_)) => {
+                    debug!(url = %crate::confidentialite::masquer_url(&url), "dsd_upnp_wav_channel_complete")
+                }
                 Ok(Err(e)) => {
-                    warn!(url = %url, error = %e, "dsd_upnp_wav_channel_decode_failed");
+                    warn!(url = %crate::confidentialite::masquer_url(&url), error = %e, "dsd_upnp_wav_channel_decode_failed");
                     if let Some(ref bus) = err_bus {
                         bus.emit(
                             "zone.playback_error",
@@ -1640,7 +1642,9 @@ impl PlaybackOrchestrator {
                         );
                     }
                 }
-                Err(e) => warn!(url = %url, error = %e, "dsd_upnp_wav_channel_task_panic"),
+                Err(e) => {
+                    warn!(url = %crate::confidentialite::masquer_url(&url), error = %e, "dsd_upnp_wav_channel_task_panic")
+                }
             }
         });
 
@@ -1670,7 +1674,7 @@ impl PlaybackOrchestrator {
         }) else {
             warn!(
                 zone_id = req.zone_id,
-                url = %audio_url,
+                url = %crate::confidentialite::masquer_url(&audio_url),
                 "dsd_upnp_dop_sans_ligne_en_base_repli_pcm"
             );
             return Ok(None);
@@ -1708,7 +1712,7 @@ impl PlaybackOrchestrator {
                 }
                 resolu.source = "upnp".into();
                 resolu.origin_url = Some(audio_url.to_string());
-                info!(zone_id = req.zone_id, url = %audio_url, "dsd_upnp_dop");
+                info!(zone_id = req.zone_id, url = %crate::confidentialite::masquer_url(&audio_url), "dsd_upnp_dop");
                 Ok(Some(resolu))
             }
             autre => {
@@ -1809,22 +1813,22 @@ impl PlaybackOrchestrator {
         let source_range = match sonde {
             Ok(Ok(Ok(source))) => Some(source),
             Ok(Ok(Err(e))) => {
-                debug!(url = %audio_url, error = %e, "frequence_fixe_url_directe_sans_range");
+                debug!(url = %crate::confidentialite::masquer_url(&audio_url), error = %e, "frequence_fixe_url_directe_sans_range");
                 None
             }
             Ok(Err(e)) => {
-                warn!(url = %audio_url, error = %e, "frequence_fixe_url_directe_sonde_paniquee");
+                warn!(url = %crate::confidentialite::masquer_url(&audio_url), error = %e, "frequence_fixe_url_directe_sonde_paniquee");
                 None
             }
             Err(_) => {
-                warn!(url = %audio_url, "frequence_fixe_url_directe_sonde_range_trop_longue");
+                warn!(url = %crate::confidentialite::masquer_url(&audio_url), "frequence_fixe_url_directe_sonde_range_trop_longue");
                 None
             }
         };
         if source_range.is_none() && seek_s > 0.0 {
             warn!(
                 zone_id = req.zone_id,
-                url = %audio_url,
+                url = %crate::confidentialite::masquer_url(&audio_url),
                 seek_s,
                 "frequence_fixe_url_directe_saut_ignore_sans_range"
             );
@@ -1832,7 +1836,7 @@ impl PlaybackOrchestrator {
         }
         info!(
             zone_id = req.zone_id,
-            url = %audio_url,
+            url = %crate::confidentialite::masquer_url(&audio_url),
             conteneur = %conteneur,
             cadence,
             bit_depth = bd,
@@ -1876,9 +1880,11 @@ impl PlaybackOrchestrator {
             })
             .await;
             match result {
-                Ok(Ok(_)) => debug!(url = %url, "frequence_fixe_url_directe_terminee"),
+                Ok(Ok(_)) => {
+                    debug!(url = %crate::confidentialite::masquer_url(&url), "frequence_fixe_url_directe_terminee")
+                }
                 Ok(Err(e)) => {
-                    warn!(url = %url, error = %e, "frequence_fixe_url_directe_decodage_echoue");
+                    warn!(url = %crate::confidentialite::masquer_url(&url), error = %e, "frequence_fixe_url_directe_decodage_echoue");
                     if let Some(ref bus) = err_bus {
                         bus.emit(
                             "zone.playback_error",
@@ -1892,7 +1898,7 @@ impl PlaybackOrchestrator {
                     }
                 }
                 Err(e) => {
-                    warn!(url = %url, error = %e, "frequence_fixe_url_directe_tache_paniquee")
+                    warn!(url = %crate::confidentialite::masquer_url(&url), error = %e, "frequence_fixe_url_directe_tache_paniquee")
                 }
             }
         });
@@ -1952,7 +1958,7 @@ impl PlaybackOrchestrator {
         if entete.is_none() {
             warn!(
                 zone_id = req.zone_id,
-                url = %audio_url,
+                url = %crate::confidentialite::masquer_url(&audio_url),
                 "dsd_upnp_sortie_locale_entete_illisible"
             );
         }
@@ -2000,7 +2006,7 @@ impl PlaybackOrchestrator {
                 resolu.origin_url = Some(audio_url.to_string());
                 info!(
                     zone_id = req.zone_id,
-                    url = %audio_url,
+                    url = %crate::confidentialite::masquer_url(&audio_url),
                     entete_lue = entete.is_some(),
                     mime = %resolu.mime_type,
                     sample_rate = ?resolu.sample_rate,

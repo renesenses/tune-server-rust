@@ -1344,7 +1344,7 @@ async fn ensure_file_inner(
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
     }
-    info!(url, dest = %dest.display(), what, "asset_downloading");
+    info!(url = %crate::confidentialite::masquer_url(&url), dest = %dest.display(), what, "asset_downloading");
     // Client partagé et non `reqwest::get` : le client par défaut de reqwest
     // s'en remet à `rustls-platform-verifier`, que la build FFI Android
     // n'initialise jamais. Voir `crate::http::client`.

@@ -318,7 +318,7 @@ pub async fn run_with(opts: RunOptions) {
                                 config.port
                             );
                             eprintln!("{phrase}");
-                            info!(%url, port = config.port, "instance_existante_ouverte — {phrase}");
+                            info!(url = %tune_core::confidentialite::masquer_url(&url), port = config.port, "instance_existante_ouverte — {phrase}");
                             ie::ouvrir_le_navigateur(&url);
                             std::process::exit(0);
                         }
@@ -697,7 +697,7 @@ pub async fn run_with(opts: RunOptions) {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             let url = format!("http://localhost:{port}");
-            info!(url = %url, "opening_browser");
+            info!(url = %tune_core::confidentialite::masquer_url(&url), "opening_browser");
             crate::instance_existante::ouvrir_le_navigateur(&url);
         });
     }
@@ -1032,7 +1032,11 @@ pub fn installer_le_journal(niveau_journal: &str) -> Option<std::path::PathBuf> 
         let file_layer = tracing_subscriber::fmt::layer()
             .with_timer(file_timer)
             .with_ansi(false)
-            .with_writer(std::sync::Mutex::new(file));
+            // Aucun identifiant d'une URL (`user:pass@`, `?pass=…`) n'entre
+            // dans le fichier, quelle que soit la ligne qui la cite.
+            .with_writer(std::sync::Mutex::new(
+                tune_core::confidentialite::EcrivainMasque(file),
+            ));
 
         // La sortie de la console pointe-t-elle déjà sur CE fichier ? Alors la
         // couche console n'ajouterait rien qu'un doublon : on ne la pose pas.
@@ -1046,7 +1050,11 @@ pub fn installer_le_journal(niveau_journal: &str) -> Option<std::path::PathBuf> 
         // vrai.
         let console_ferait_doublon = crate::journal::la_console_ecrit_deja_dans(&chemin);
         let console_layer =
-            (!console_ferait_doublon).then(|| tracing_subscriber::fmt::layer().with_timer(timer));
+            (!console_ferait_doublon).then(|| {
+                tracing_subscriber::fmt::layer()
+                    .with_timer(timer)
+                    .with_writer(|| tune_core::confidentialite::EcrivainMasque(std::io::stdout()))
+            });
 
         tracing_subscriber::registry()
             .with(env_filter)
@@ -1071,6 +1079,7 @@ pub fn installer_le_journal(niveau_journal: &str) -> Option<std::path::PathBuf> 
     tracing_subscriber::fmt()
         .with_timer(timer)
         .with_env_filter(env_filter)
+        .with_writer(|| tune_core::confidentialite::EcrivainMasque(std::io::stdout()))
         .init();
     None
 }

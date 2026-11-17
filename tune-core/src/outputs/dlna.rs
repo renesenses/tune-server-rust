@@ -1040,7 +1040,7 @@ impl DlnaOutput {
             id = %self.device_id,
             motif,
             action,
-            url = url_en_echec,
+            url = %crate::confidentialite::masquer_url(&url_en_echec),
             ip = %ip,
             "dlna_redecouverte_ciblee"
         );
@@ -1067,7 +1067,7 @@ impl DlnaOutput {
                     info!(
                         device = %self.name,
                         id = %self.device_id,
-                        url = %nouvelle,
+                        url = %crate::confidentialite::masquer_url(&nouvelle),
                         "dlna_redecouverte_urls_inchangees_rejeu"
                     );
                 }
@@ -1166,7 +1166,7 @@ impl DlnaOutput {
                 warn!(
                     device = %self.name,
                     device_id = %self.device_id,
-                    url = %url,
+                    url = %crate::confidentialite::masquer_url(&url),
                     raison = %raison,
                     "dlna_scpd_avtransport_illisible — suivante armée comme avant"
                 );
@@ -1227,7 +1227,7 @@ impl DlnaOutput {
                 warn!(
                     device = %self.name,
                     device_id = %self.device_id,
-                    url = %url,
+                    url = %crate::confidentialite::masquer_url(&url),
                     raison = %raison,
                     "dlna_profil_volume_illisible — volume en 0–100 sur Master"
                 );
@@ -2128,7 +2128,7 @@ impl DlnaOutput {
         match self.redecouvrir_les_urls(&url, motif, action).await {
             Ok(()) => {
                 let url = self.url_de(voie);
-                debug!(device = %self.name, action, url = %url, "dlna_redecouverte_rejeu");
+                debug!(device = %self.name, action, url = %crate::confidentialite::masquer_url(&url), "dlna_redecouverte_rejeu");
                 let rejeu = self.envoyer_soap(&url, &soap_action, &soap, action).await;
                 self.conclure(rejeu, action)
             }
@@ -2291,7 +2291,7 @@ impl DlnaOutput {
                     warn!(
                         device = %self.name,
                         action,
-                        url,
+                        url = %crate::confidentialite::masquer_url(&url),
                         error = %motif,
                         "dlna_soap_erreur_definitive"
                     );
@@ -2882,7 +2882,7 @@ impl OutputTarget for DlnaOutput {
                 // premier refus de Play sans une seule trace de la sortie.
                 info!(
                     device = %self.name,
-                    url = media.url,
+                    url = %crate::confidentialite::masquer_url(&media.url),
                     niveau_didl,
                     advertised_mime = %attempt_mime,
                     protocol_info = protocol_info.as_deref().unwrap_or("-"),
@@ -3193,7 +3193,7 @@ impl OutputTarget for DlnaOutput {
             std::time::Duration::from_millis(self.budget_reveil_ms.load(Ordering::Relaxed)),
             || async move { moi.uri_tenue_par_le_renderer(url_verif).await },
             || async move {
-                warn!(device = %moi.name, url = media_verif.url, ctrl = %moi.url_av_transport(), "dlna_play_acquitte_mais_pas_applique_relance");
+                warn!(device = %moi.name, url = %crate::confidentialite::masquer_url(&media_verif.url), ctrl = %moi.url_av_transport(), "dlna_play_acquitte_mais_pas_applique_relance");
                 let _ = moi
                     .reposer_uri(media_verif, item_id, mime_relance, niveau_didl)
                     .await;
@@ -3223,7 +3223,7 @@ impl OutputTarget for DlnaOutput {
             if applique == UriVerdict::PasEncore {
                 warn!(
                     device = %self.name,
-                    url = media.url,
+                    url = %crate::confidentialite::masquer_url(&media.url),
                     ctrl = %self.url_av_transport(),
                     attente_ms = verif.attente_ms,
                     relances = verif.relances,
@@ -3233,9 +3233,9 @@ impl OutputTarget for DlnaOutput {
             } else {
                 warn!(
                     device = %self.name,
-                    url = media.url,
+                    url = %crate::confidentialite::masquer_url(&media.url),
                     ctrl = %self.url_av_transport(),
-                    tenue = uri_tenue.as_deref().unwrap_or("-"),
+                    tenue = %crate::confidentialite::masquer_url(&uri_tenue.as_deref().unwrap_or("-")),
                     attente_ms = verif.attente_ms,
                     relances = verif.relances,
                     "dlna_play_jamais_applique"
@@ -3315,7 +3315,7 @@ impl OutputTarget for DlnaOutput {
             ));
         }
 
-        info!(device = %self.name, url = media.url, ctrl = %self.url_av_transport(), delay_ms = play_delay, "dlna_play");
+        info!(device = %self.name, url = %crate::confidentialite::masquer_url(&media.url), ctrl = %self.url_av_transport(), delay_ms = play_delay, "dlna_play");
         // La piste tourne : on s'abonne, et l'ancre repart de zéro sur cette
         // URI. Même moment que `OpenHomeOutput::play_media` — un abonnement
         // pris avant que le renderer ait la piste ne décrirait rien.
@@ -3915,7 +3915,7 @@ impl OutputTarget for DlnaOutput {
         // Sans cette ligne, le mode silence retomberait à zéro sur la durée dès
         // la deuxième piste d'une file.
         self.annoncer_duree(media.url, media.duration_ms).await;
-        info!(device = %self.name, url = media.url, "dlna_set_next");
+        info!(device = %self.name, url = %crate::confidentialite::masquer_url(&media.url), "dlna_set_next");
         Ok(())
     }
 
@@ -3939,18 +3939,18 @@ impl OutputTarget for DlnaOutput {
             // ne porte que l'INFO et au-dessus. Muet ici, le verdict
             // `Inconnue` ne laissait aucune trace, et le rapport du testeur
             // ne permettait pas de dire si ce chemin s'était armé.
-            info!(device = %self.name, url, "dlna_suivante_get_media_info_muet");
+            info!(device = %self.name, url = %crate::confidentialite::masquer_url(&url), "dlna_suivante_get_media_info_muet");
             return SuivantePreparee::Inconnue;
         };
         let Some(retenue) = extract_tag(&xml, "NextURI") else {
             // Le champ n'est pas publié du tout : on ne conclut rien.
-            info!(device = %self.name, url, "dlna_suivante_nexturi_non_publie");
+            info!(device = %self.name, url = %crate::confidentialite::masquer_url(&url), "dlna_suivante_nexturi_non_publie");
             return SuivantePreparee::Inconnue;
         };
         if !meme_url(&retenue, url) {
             warn!(
                 device = %self.name,
-                posee = url,
+                posee = %crate::confidentialite::masquer_url(&url),
                 retenue = %retenue.trim(),
                 "dlna_suivante_non_retenue"
             );
@@ -3964,7 +3964,7 @@ impl OutputTarget for DlnaOutput {
             .av_action("GetCurrentTransportActions", "<InstanceID>0</InstanceID>")
             .await
         else {
-            info!(device = %self.name, url, "dlna_suivante_actions_muettes");
+            info!(device = %self.name, url = %crate::confidentialite::masquer_url(&url), "dlna_suivante_actions_muettes");
             return SuivantePreparee::Inconnue;
         };
         let Some(actions) = extract_tag(&xml, "Actions") else {
@@ -3972,7 +3972,7 @@ impl OutputTarget for DlnaOutput {
             // l'appareil répond à `GetCurrentTransportActions` mais sans la
             // balise `Actions`. Indiscernable, au journal, d'un armement qui
             // n'aurait jamais eu lieu.
-            info!(device = %self.name, url, "dlna_suivante_actions_non_publiees");
+            info!(device = %self.name, url = %crate::confidentialite::masquer_url(&url), "dlna_suivante_actions_non_publiees");
             return SuivantePreparee::Inconnue;
         };
         if actions
@@ -3981,7 +3981,7 @@ impl OutputTarget for DlnaOutput {
         {
             info!(
                 device = %self.name,
-                url,
+                url = %crate::confidentialite::masquer_url(&url),
                 actions = %actions.trim(),
                 "dlna_suivante_tenue"
             );

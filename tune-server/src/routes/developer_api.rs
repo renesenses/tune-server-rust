@@ -483,7 +483,7 @@ async fn test_webhooks(
     for hook in &hooks {
         let result = match juger_destination_webhook(&hook.url, MomentWebhook::Envoi).await {
             Err(motif) => {
-                warn!(url = %hook.url, motif, "webhook_destination_refusee");
+                warn!(url = %tune_core::confidentialite::masquer_url(&hook.url), motif, "webhook_destination_refusee");
                 errors.push(json!({
                     "webhook_id": hook.id,
                     "url": hook.url,
@@ -831,7 +831,7 @@ pub fn spawn_webhook_dispatcher(state: &AppState) {
                                 match juger_destination_webhook(&url, MomentWebhook::Envoi).await {
                                     Ok(d) => d,
                                     Err(motif) => {
-                                        warn!(%url, motif, "webhook_destination_refusee");
+                                        warn!(url = %tune_core::confidentialite::masquer_url(&url), motif, "webhook_destination_refusee");
                                         return;
                                     }
                                 };
@@ -896,7 +896,7 @@ pub fn spawn_webhook_dispatcher(state: &AppState) {
                                 match juger_destination_webhook(&url, MomentWebhook::Envoi).await {
                                     Ok(d) => d,
                                     Err(motif) => {
-                                        warn!(%url, motif, "webhook_destination_refusee");
+                                        warn!(url = %tune_core::confidentialite::masquer_url(&url), motif, "webhook_destination_refusee");
                                         return;
                                     }
                                 };

@@ -272,7 +272,7 @@ pub(crate) fn ouvrir_la_piste_suivante(
         Ok(r) => {
             warn!(
                 status = %r.status(),
-                url = %url,
+                url = %crate::confidentialite::masquer_url(&url),
                 "local_audio_gapless_http_error"
             );
             None
@@ -283,7 +283,7 @@ pub(crate) fn ouvrir_la_piste_suivante(
             } else {
                 warn!(
                     error = %e,
-                    url = %url,
+                    url = %crate::confidentialite::masquer_url(&url),
                     "local_audio_gapless_http_fetch_failed"
                 );
             }

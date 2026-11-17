@@ -3033,11 +3033,11 @@ async fn send_with_reresolve(
         // Decide whether this attempt needs a fresh URL.
         let needs_reresolve = match &outcome {
             Err(e) => {
-                warn!(error = %e, url = %url, "proxy_upstream_error");
+                warn!(error = %e, url = %tune_core::confidentialite::masquer_url(&url), "proxy_upstream_error");
                 true
             }
             Ok(r) if is_expired_url_status(r.status()) => {
-                warn!(status = %r.status(), url = %url, "proxy_upstream_expired_status");
+                warn!(status = %r.status(), url = %tune_core::confidentialite::masquer_url(&url), "proxy_upstream_expired_status");
                 true
             }
             Ok(_) => false,
@@ -3062,7 +3062,7 @@ async fn send_with_reresolve(
                 warn!(
                     status = %r.status(),
                     amont = %r.url().host_str().unwrap_or("?"),
-                    url = %url,
+                    url = %tune_core::confidentialite::masquer_url(&url),
                     start = ?start,
                     "proxy_upstream_expired_no_reresolver"
                 );
@@ -3070,7 +3070,7 @@ async fn send_with_reresolve(
             return Err(());
         };
         if attempts >= PROXY_MAX_RERESOLVES {
-            warn!(url = %url, "proxy_reresolve_giveup");
+            warn!(url = %tune_core::confidentialite::masquer_url(&url), "proxy_reresolve_giveup");
             return Err(());
         }
         attempts += 1;
@@ -3381,7 +3381,7 @@ async fn proxy_stream(
 
     if let Some(start) = resume_start {
         info!(
-            url = upstream_url,
+            url = %tune_core::confidentialite::masquer_url(&upstream_url),
             start, is_lavf, "proxy_forward_resume_range"
         );
     }
@@ -3593,7 +3593,7 @@ async fn proxy_stream(
         if let Some(cl) = content_length {
             headers.insert("Content-Length", HeaderValue::from(cl));
         }
-        info!(url = upstream_url, start, "proxy_resume_206_from_cdn");
+        info!(url = %tune_core::confidentialite::masquer_url(&upstream_url), start, "proxy_resume_206_from_cdn");
 
         let body = resumable_proxy_body(
             client,
@@ -3635,7 +3635,7 @@ async fn proxy_stream(
             HeaderValue::from_str(&format!("bytes {n}-{}/{}", cl - 1, cl)).unwrap(),
         );
         info!(
-            url = upstream_url,
+            url = %tune_core::confidentialite::masquer_url(&upstream_url),
             start = n,
             total = cl,
             "proxy_206_par_saut_local"
@@ -3665,7 +3665,7 @@ async fn proxy_stream(
         headers.insert("Content-Range", HeaderValue::from_static("bytes 0-*/*"));
         headers.insert("Transfer-Encoding", HeaderValue::from_static("chunked"));
 
-        info!(url = upstream_url, "proxy_radio_206_open_ended");
+        info!(url = %tune_core::confidentialite::masquer_url(&upstream_url), "proxy_radio_206_open_ended");
 
         let flux = async_stream::stream! {
             let mut stream = upstream_resp.bytes_stream();

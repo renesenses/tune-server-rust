@@ -268,7 +268,7 @@ impl RelayClient {
             let mut attempt: u32 = 0;
             loop {
                 info!(
-                    relay_url = %client.relay_url,
+                    relay_url = %crate::confidentialite::masquer_url(&client.relay_url),
                     server_id = %client.server_id,
                     attempt = attempt,
                     "connecting to relay"

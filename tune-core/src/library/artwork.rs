@@ -1794,11 +1794,11 @@ async fn download_image(client: &reqwest::Client, url: &str) -> Option<Vec<u8>> 
         crate::http::fetch::FetchOutcome::RateLimited => {
             // Counter read per-run by the enrichment batch to report throttling.
             ARTWORK_RATE_LIMIT_HITS.fetch_add(1, Ordering::Relaxed);
-            warn!(url, "artwork_download_rate_limited");
+            warn!(url = %crate::confidentialite::masquer_url(&url), "artwork_download_rate_limited");
             None
         }
         other => {
-            debug!(url, reason = other.reason(), "artwork_download_failed");
+            debug!(url = %crate::confidentialite::masquer_url(&url), reason = other.reason(), "artwork_download_failed");
             None
         }
     }

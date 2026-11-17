@@ -994,7 +994,7 @@ impl OutputTarget for AirplayOutput {
             info!(device = %name, "airplay_stream_ended");
         });
 
-        info!(device = %self.name, url = media.url, "airplay_play");
+        info!(device = %self.name, url = %crate::confidentialite::masquer_url(&media.url), "airplay_play");
         Ok(())
     }
 

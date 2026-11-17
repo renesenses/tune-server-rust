@@ -258,9 +258,9 @@ pub(crate) fn retenir_le_codec_de_la_station(
         let repo = crate::db::radio_repo::RadioRepo::with_backend(db);
         match repo.remplir_le_codec_observe(&station_url, codec) {
             Ok(0) => {}
-            Ok(_) => tracing::info!(url = %station_url, codec, "radio_codec_observe_retenu"),
+            Ok(_) => tracing::info!(url = %crate::confidentialite::masquer_url(&station_url), codec, "radio_codec_observe_retenu"),
             Err(error) => {
-                tracing::warn!(url = %station_url, codec, %error, "radio_codec_observe_non_retenu")
+                tracing::warn!(url = %crate::confidentialite::masquer_url(&station_url), codec, %error, "radio_codec_observe_non_retenu")
             }
         }
     }));
@@ -520,7 +520,7 @@ pub(super) fn decode_radio_stream_to_pcm_avec_cadence(
                 match replis.next() {
                     Some(suivant) => {
                         tracing::warn!(
-                            refuse = %url,
+                            refuse = %crate::confidentialite::masquer_url(&url),
                             suivant = %suivant,
                             error = %e,
                             "radio_flux_refuse_repli_8110"
@@ -603,10 +603,10 @@ fn se_connecter_et_sonder(etat: &mut EtatRadio, url: &str) -> Result<Sonde, Suit
             }
             etat.reconnects += 1;
             if etat.reconnects > MAX_RECONNECTS {
-                warn!(url = %url, error = %e, "radio_reconnect_giving_up");
+                warn!(url = %crate::confidentialite::masquer_url(&url), error = %e, "radio_reconnect_giving_up");
                 return Err(SuiteRadio::Rendre(Ok(())));
             }
-            warn!(url = %url, error = %e, attempt = etat.reconnects, "radio_reconnect_setup_failed_retrying");
+            warn!(url = %crate::confidentialite::masquer_url(&url), error = %e, attempt = etat.reconnects, "radio_reconnect_setup_failed_retrying");
             std::thread::sleep(std::time::Duration::from_millis(500));
             Err(SuiteRadio::Reconnecter)
         }
@@ -647,11 +647,13 @@ fn sonder_la_station(url: &str) -> Result<Sonde, String> {
         // #8008 — la cause, pas seulement « error sending request » : le
         // rapport du 06/11 ne disait pas pourquoi la station ne répondait
         // pas (refus, nom introuvable, délai, TLS).
+        // Le texte d'une erreur `reqwest` reprend l'URL demandée : elle est
+        // masquée avant de remonter vers le journal et l'écran.
         .map_err(|e| {
-            format!(
+            crate::confidentialite::masquer_url(&format!(
                 "radio HTTP fetch failed: {e} ({})",
                 crate::http::client::decrire_erreur_http(&e)
-            )
+            ))
         })?;
     if !response.status().is_success() {
         return Err(format!("radio HTTP error: {}", response.status()));
@@ -681,7 +683,7 @@ fn sonder_la_station(url: &str) -> Result<Sonde, String> {
         .get("icy-br")
         .and_then(|v| v.to_str().ok())
         .and_then(debit_icy);
-    info!(url = %url, content_type = %content_type, "radio_local_decode_stream_connected");
+    info!(url = %crate::confidentialite::masquer_url(&url), content_type = %content_type, "radio_local_decode_stream_connected");
 
     // #6357 — une URL sans extension peut servir une liste HLS : sous son
     // type enregistré, ou sous un type `mpegurl` que les serveurs donnent
@@ -918,7 +920,7 @@ fn sonder_hls(url: &str, deja_lue: Option<(String, String)>) -> Result<Sonde, St
             Err(e) => {
                 // Repli : symphonia décode au moins le cœur AAC-LC. Moins
                 // bien (sans SBR), mais du son plutôt que rien.
-                warn!(url = %url, error = %e, "hls_aac_repli_symphonia");
+                warn!(url = %crate::confidentialite::masquer_url(&url), error = %e, "hls_aac_repli_symphonia");
             }
         }
     }
@@ -955,7 +957,7 @@ fn sonder_hls(url: &str, deja_lue: Option<(String, String)>) -> Result<Sonde, St
     source_info.sample_rate = Some(source_sample_rate);
     source_info.channels = Some(source_channels).filter(|n| *n > 0);
     info!(
-        url = %url,
+        url = %crate::confidentialite::masquer_url(&url),
         profil = ?source_info.profil,
         coeur_hz = coeur_cadence,
         sortie_hz = source_sample_rate,
@@ -1034,7 +1036,7 @@ fn preparer_la_sortie(
             if (ch, sr, bd) != (source_channels, source_sample_rate, output_bit_depth) =>
         {
             warn!(
-                url = %url,
+                url = %crate::confidentialite::masquer_url(&url),
                 expected_ch = ch, expected_sr = sr,
                 got_ch = source_channels, got_sr = source_sample_rate,
                 expected_bits = bd, got_bits = output_bit_depth,
@@ -1061,7 +1063,7 @@ fn preparer_la_sortie(
     .refus()
     {
         warn!(
-            url = %url,
+            url = %crate::confidentialite::masquer_url(&url),
             requested_sr = refus.demandee_hz,
             output_sr = refus.sortie_hz,
             "radio_bitperfect_strict_refused"
@@ -1317,11 +1319,11 @@ fn reprendre_apres_coupure(
     }
     etat.reconnects += 1;
     if etat.reconnects > MAX_RECONNECTS {
-        warn!(url = %url, reconnects = etat.reconnects, "radio_reconnect_giving_up");
+        warn!(url = %crate::confidentialite::masquer_url(&url), reconnects = etat.reconnects, "radio_reconnect_giving_up");
         return SuiteRadio::Rendre(Ok(()));
     }
     etat.dropped_at = Some(std::time::Instant::now());
-    info!(url = %url, attempt = etat.reconnects, "radio_upstream_dropped_reconnecting");
+    info!(url = %crate::confidentialite::masquer_url(&url), attempt = etat.reconnects, "radio_upstream_dropped_reconnecting");
     std::thread::sleep(std::time::Duration::from_millis(500));
     SuiteRadio::Reconnecter
 }
@@ -1351,3 +1353,7 @@ mod radio_cause_8008_tests;
 #[cfg(test)]
 #[path = "radio_repli_8110_tests.rs"]
 mod radio_repli_8110_tests;
+
+#[cfg(test)]
+#[path = "radio_journal_sans_identifiants_tests.rs"]
+mod radio_journal_sans_identifiants_tests;

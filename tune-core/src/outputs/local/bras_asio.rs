@@ -902,7 +902,7 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
         );
     }
 
-    info!(device = %device_name, url = %url, "local_audio_asio_exclusive_playing");
+    info!(device = %device_name, url = %crate::confidentialite::masquer_url(&url), "local_audio_asio_exclusive_playing");
     // ASIO exclusif : résolution par sous-chaîne, et `"default"`
     // prend le premier pilote listé. `opened_id` reste `None` :
     // ASIO n'expose aucun identifiant d'endpoint.
@@ -1334,7 +1334,7 @@ pub(super) fn jouer_dsd_natif_via_asio(entrees: EntreesDsdNatif) {
     }
     info!(
         device = %device_name,
-        url = %url,
+        url = %crate::confidentialite::masquer_url(&url),
         cadence = entete.cadence,
         canaux,
         "local_audio_asio_dsd_natif_playing"

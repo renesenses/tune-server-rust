@@ -4498,7 +4498,7 @@ pub fn decode_dsf_http_to_pcm_streaming(
     }
     data_ready.notify_one();
     debug!(
-        url,
+        url = %crate::confidentialite::masquer_url(&url),
         dsd_rate,
         output_rate,
         output_bd,

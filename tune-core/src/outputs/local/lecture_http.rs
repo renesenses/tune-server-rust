@@ -95,7 +95,7 @@ impl LecteurHttpAnnulable {
         // par l'adresse LAN qu'un autre programme peut tenir sur le même port.
         let cible = super::boucle_locale_5639::adresse_de_lecture(url);
         if cible.url != url {
-            debug!(url_demandee = %url, url_jointe = %cible.url, "local_flux_interne_par_la_boucle");
+            debug!(url_demandee = %crate::confidentialite::masquer_url(&url), url_jointe = %crate::confidentialite::masquer_url(&cible.url), "local_flux_interne_par_la_boucle");
         }
         let moteur = Moteur(Some(
             tokio::runtime::Builder::new_current_thread()
@@ -117,8 +117,8 @@ impl LecteurHttpAnnulable {
             // autre programme qui a répondu. On nomme l'adresse jointe.
             warn!(
                 adresse_jointe = %super::boucle_locale_5639::adresse_jointe(&cible.url),
-                url_demandee = %url,
-                url_jointe = %cible.url,
+                url_demandee = %crate::confidentialite::masquer_url(&url),
+                url_jointe = %crate::confidentialite::masquer_url(&cible.url),
                 "local_flux_interne_refuse_403 — le flux interne de Tune a été refusé (403) : \
                  un autre programme répond probablement à cette adresse"
             );

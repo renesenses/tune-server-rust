@@ -1427,7 +1427,7 @@ impl YouTubeService {
         let expires_in = data["expires_in"].as_u64().unwrap_or(1800);
         let interval = data["interval"].as_u64().unwrap_or(5);
 
-        info!(user_code = %user_code, url = %verification_url, "youtube_device_code_started");
+        info!(user_code = %user_code, url = %crate::confidentialite::masquer_url(&verification_url), "youtube_device_code_started");
 
         self.pending_device_auth = Some(PendingDeviceAuth {
             device_code: device_code.clone(),
