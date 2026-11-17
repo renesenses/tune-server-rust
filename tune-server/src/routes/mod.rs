@@ -67,6 +67,7 @@ pub mod multi_server;
 pub mod network;
 pub mod offline;
 pub mod onboarding;
+pub mod parce_que_vous_aimez;
 mod pochettes_upnp;
 // Retrait d'une bibliotheque UPnP par serveur media (#4624).
 pub mod retrait_upnp;
