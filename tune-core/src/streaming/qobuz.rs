@@ -250,11 +250,28 @@ fn endpoint_order(proxy_first: bool) -> (&'static str, &'static str) {
 ///
 /// Tout le reste garde la variante d'avant (`Other`, via `From<String>`) et
 /// donc son 502 : une vraie panne d'amont reste une panne d'amont.
+///
+/// #8892 — seul un 404 dont le corps est le JSON d'erreur de l'API Qobuz
+/// (`"code": 404`) vaut « introuvable » : un 404 HTML d'un relais ou de la
+/// périphérie Akamai reste une panne. Un titre ainsi « introuvable » est
+/// grisé dans les playlists : il ne faut pas griser sur une panne.
 fn erreur_de_fiche((statut, message): (Option<u16>, String)) -> TuneError {
     match statut {
-        Some(404) => TuneError::NotFound(message),
+        Some(404) if introuvable_selon_l_api(&message) => TuneError::NotFound(message),
         _ => TuneError::from(message),
     }
+}
+
+/// Le message d'échec (`qobuz {path}: 404 {corps}`) porte-t-il le JSON
+/// d'erreur de l'API Qobuz, `{"status":"error","code":404,…}` ? (#8892)
+fn introuvable_selon_l_api(message: &str) -> bool {
+    let Some(debut) = message.find('{') else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&message[debut..])
+        .ok()
+        .and_then(|corps| corps.get("code").and_then(serde_json::Value::as_i64))
+        == Some(404)
 }
 
 /// Error from a single API attempt against one base URL.
@@ -3660,9 +3677,13 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_track(&self, track_id: &str) -> Result<StreamTrack, TuneError> {
+        // #8892 — un titre que Qobuz ne connaît plus (404) est `NotFound`,
+        // comme la fiche d'un artiste (#992) : la playlist le montre
+        // indisponible, avec la fiche qu'elle avait mémorisée.
         let data = self
-            .api_get("/track/get", &[("track_id", track_id)])
-            .await?;
+            .api_get_avec_statut("/track/get", &[("track_id", track_id)])
+            .await
+            .map_err(erreur_de_fiche)?;
         Ok(Self::map_track(&data))
     }
 
@@ -5896,6 +5917,63 @@ mod tests {
         assert!(
             !matches!(refus, TuneError::NotFound(_)),
             "un 400 n'est pas « introuvable » : {refus:?}"
+        );
+    }
+
+    /// #8892 — un titre retiré du catalogue Qobuz (404 sur `/track/get`) est
+    /// `NotFound` : la playlist le grise avec sa fiche mémorisée. Un 400
+    /// reste une erreur ordinaire (ne pas conclure « indisponible »).
+    #[tokio::test]
+    async fn titre_retire_de_qobuz_est_un_not_found_8892() {
+        use axum::Router;
+        use axum::extract::Query;
+        use axum::http::StatusCode;
+        use axum::routing::get;
+        use std::collections::HashMap;
+
+        let app = Router::new().route(
+            "/track/get",
+            get(|Query(q): Query<HashMap<String, String>>| async move {
+                match q.get("track_id").map(String::as_str) {
+                    Some("retire") => (
+                        StatusCode::NOT_FOUND,
+                        r#"{"status":"error","code":404,"message":"No result matching given argument"}"#,
+                    ),
+                    // Un 404 HTML (relais, périphérie Akamai) : une panne.
+                    Some("relais") => (
+                        StatusCode::NOT_FOUND,
+                        "<html><body><h1>404 Not Found</h1>nginx</body></html>",
+                    ),
+                    _ => (
+                        StatusCode::BAD_REQUEST,
+                        r#"{"status":"error","code":400,"message":"Invalid argument"}"#,
+                    ),
+                }
+            }),
+        );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        let svc = QobuzService::avec_base_forcee(format!("http://{adresse}"));
+
+        let retire = svc.get_track("retire").await.unwrap_err();
+        assert!(
+            matches!(retire, TuneError::NotFound(_)),
+            "un titre retiré de Qobuz : {retire:?}"
+        );
+        let refus = svc.get_track("mal-forme").await.unwrap_err();
+        assert!(
+            !matches!(refus, TuneError::NotFound(_)),
+            "un 400 n'est pas « introuvable » : {refus:?}"
+        );
+        let relais = svc.get_track("relais").await.unwrap_err();
+        assert!(
+            !matches!(relais, TuneError::NotFound(_)),
+            "un 404 HTML n'est pas « introuvable » : {relais:?}"
         );
     }
 
