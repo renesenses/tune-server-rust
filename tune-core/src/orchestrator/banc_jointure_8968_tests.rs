@@ -763,40 +763,22 @@ fn banc_8968_flac_decodage_complet() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn banc_8968_aac_itunsmpb_piste_a_piste() {
-    paire_piste_a_piste(
-        "m4a-itunsmpb",
-        SEUIL_AVEC_PERTE,
-        Attendu::EchecConnu("PR 1 de #8968 : retrait de l'amorce AAC"),
-    )
-    .await;
+    paire_piste_a_piste("m4a-itunsmpb", SEUIL_AVEC_PERTE, Attendu::SansBlanc).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn banc_8968_aac_elst_piste_a_piste() {
-    paire_piste_a_piste(
-        "m4a-elst",
-        SEUIL_AVEC_PERTE,
-        Attendu::EchecConnu("PR 1 de #8968 : retrait de l'amorce AAC"),
-    )
-    .await;
+    paire_piste_a_piste("m4a-elst", SEUIL_AVEC_PERTE, Attendu::SansBlanc).await;
 }
 
 #[test]
 fn banc_8968_aac_itunsmpb_decodage_complet() {
-    paire_decodage_complet(
-        "m4a-itunsmpb",
-        SEUIL_AVEC_PERTE,
-        Attendu::EchecConnu("PR 1 de #8968 : retrait de l'amorce AAC"),
-    );
+    paire_decodage_complet("m4a-itunsmpb", SEUIL_AVEC_PERTE, Attendu::SansBlanc);
 }
 
 #[test]
 fn banc_8968_aac_elst_decodage_complet() {
-    paire_decodage_complet(
-        "m4a-elst",
-        SEUIL_AVEC_PERTE,
-        Attendu::EchecConnu("PR 1 de #8968 : retrait de l'amorce AAC"),
-    );
+    paire_decodage_complet("m4a-elst", SEUIL_AVEC_PERTE, Attendu::SansBlanc);
 }
 
 /// Opus : contrairement à ce que supposait l'étude de #8968, le décodeur de
@@ -927,24 +909,14 @@ async fn banc_8968_mp3_lame_longueur() {
 /// `test.m4a` (ffmpeg) : `elst` à 1 024 trames d'amorce, 1 s utile.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn banc_8968_m4a_elst_ffmpeg_longueur() {
-    longueur_decodee(
-        "test.m4a",
-        44_100,
-        Attendu::EchecConnu("PR 1 de #8968 : retrait de l'amorce AAC"),
-    )
-    .await;
+    longueur_decodee("test.m4a", 44_100, Attendu::SansBlanc).await;
 }
 
 /// `aac320.m4a` (encodeur Apple) : `iTunSMPB` = amorce 0x840 (2 112),
 /// remplissage 0x228 (552), 0x40998 (264 600) trames utiles.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn banc_8968_m4a_itunsmpb_apple_longueur() {
-    longueur_decodee(
-        "aac320.m4a",
-        264_600,
-        Attendu::EchecConnu("PR 1 de #8968 : retrait de l'amorce AAC"),
-    )
-    .await;
+    longueur_decodee("aac320.m4a", 264_600, Attendu::SansBlanc).await;
 }
 
 // ---------------------------------------------------------------------------

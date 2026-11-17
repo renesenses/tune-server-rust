@@ -11,7 +11,7 @@ use symphonia::core::formats::probe::Hint;
 use symphonia::core::formats::{FormatOptions, FormatReader, SeekMode, SeekTo, TrackType};
 use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
-use symphonia::core::units::Time;
+use symphonia::core::units::{Time, Timestamp};
 use tokio::sync::mpsc;
 use tracing::{debug, error};
 
@@ -2757,11 +2757,16 @@ fn decode_to_pcm_streaming_inner(
     // feuilles CUE n'a pas besoin d'exclusion — `borner_la_fin` ferme le
     // canal, l'envoi suivant échoue, et la fonction sort par un `return`
     // anticipé bien avant le point de contrôle.
+    // #8968 — amorce et remplissage AAC (voir `rognage_aac`).
+    let rognage = rognage_aac(file_path, &audio_params, decode_le_fichier);
     let trames_annoncees = if seek_s <= 0.0 {
-        track.num_frames
+        rognage.and_then(|r| r.utiles).or(track.num_frames)
     } else {
         None
     };
+    let mut rogneur = rognage
+        .as_ref()
+        .map(super::amorce_aac::Rogneur::depuis_le_debut);
     let mut track_id = track.id;
     let source_channels = audio_params
         .channels
@@ -2820,17 +2825,11 @@ fn decode_to_pcm_streaming_inner(
     // seeks appeared to overshoot the clicked position (DEvir, v0.9.50, ASIO).
     let mut frames_to_skip: u64 = 0;
     if seek_s > 0.0 {
-        let seconds = seek_s as i64;
-        let nanos = ((seek_s - seconds as f64) * 1_000_000_000.0) as u32;
-        let time = Time::try_new(seconds, nanos).unwrap_or(Time::ZERO);
-        match format.seek(
-            SeekMode::Accurate,
-            SeekTo::Time {
-                time,
-                track_id: Some(track_id),
-            },
-        ) {
+        let (cible, rogneur_apres) =
+            cible_de_recherche(seek_s, track_id, source_rate, rognage.as_ref());
+        match format.seek(SeekMode::Accurate, cible) {
             Ok(seeked) => {
+                rogneur = rogneur_apres;
                 // Symphonia 0.6 `Timestamp` is a newtype over i64; `.get()`
                 // yields the raw frame index. Accurate seek guarantees
                 // actual <= required, but clamp defensively.
@@ -2957,6 +2956,17 @@ fn decode_to_pcm_streaming_inner(
                 .min(packet_samples.len());
             packet_samples.drain(..skip_samples);
             frames_to_skip -= (skip_samples / ch) as u64;
+            if packet_samples.is_empty() {
+                continue;
+            }
+        }
+
+        // #8968 — amorce et remplissage AAC retirés à la trame près.
+        if let Some(r) = rogneur.as_mut() {
+            let ch = source_channels.max(1) as usize;
+            let garde = r.garder(packet_samples.len() / ch, ch);
+            packet_samples.truncate(garde.end);
+            packet_samples.drain(..garde.start);
             if packet_samples.is_empty() {
                 continue;
             }
@@ -3976,6 +3986,70 @@ pub fn remux_flac_dash_stream(input_path: &str, tx: mpsc::Sender<Vec<u8>>) -> Re
 }
 
 /// Symphonia-based decoder for standard formats (FLAC, MP3, WAV, M4A, OGG, etc).
+/// #8968 — l'amorce et le remplissage AAC à retirer de CE décodage, lus dans
+/// le conteneur MP4 du fichier (`iTunSMPB`, `elst` : `audio::amorce_aac`).
+/// symphonia ne les applique pas (constaté au banc
+/// `orchestrator/banc_jointure_8968_tests.rs`) : sans ce rognage, chaque
+/// piste AAC commence par 1 024 à 2 112 trames d'amorce et finit par son
+/// remplissage, soit un blanc de 50 ms et plus entre deux pistes enchaînées.
+///
+/// `None` pour tout autre codec, et quand le fichier lui-même n'est pas lu
+/// (corps HTTP, image de CD) : le décodage reste alors celui d'avant.
+fn rognage_aac(
+    file_path: &str,
+    params: &AudioCodecParameters,
+    lit_le_fichier: bool,
+) -> Option<super::amorce_aac::RognageAac> {
+    use symphonia::core::codecs::audio::well_known::CODEC_ID_AAC;
+    if !lit_le_fichier || params.codec != CODEC_ID_AAC {
+        return None;
+    }
+    let r = super::amorce_aac::lire(Path::new(file_path), params.sample_rate?)?;
+    debug!(
+        file = file_path,
+        amorce = r.amorce,
+        utiles = ?r.utiles,
+        "aac_amorce_retiree"
+    );
+    Some(r)
+}
+
+/// La cible d'un déplacement à `seek_s`. Avec une amorce AAC, la position
+/// demandée se compte en trames UTILES : l'horodatage du conteneur, lui,
+/// compte l'amorce (#8968). Rend aussi le rogneur qui s'applique ensuite.
+fn cible_de_recherche(
+    seek_s: f64,
+    track_id: u32,
+    cadence: u32,
+    rognage: Option<&super::amorce_aac::RognageAac>,
+) -> (SeekTo, Option<super::amorce_aac::Rogneur>) {
+    use super::amorce_aac::Rogneur;
+    match rognage {
+        Some(r) => {
+            let trame = (seek_s * f64::from(cadence)).round().max(0.0) as u64;
+            (
+                SeekTo::Timestamp {
+                    ts: Timestamp::new(Rogneur::horodatage_de(r, trame) as i64),
+                    track_id,
+                },
+                Some(Rogneur::apres_recherche(r, trame)),
+            )
+        }
+        None => {
+            let seconds = seek_s as i64;
+            let nanos = ((seek_s - seconds as f64) * 1_000_000_000.0) as u32;
+            let time = Time::try_new(seconds, nanos).unwrap_or(Time::ZERO);
+            (
+                SeekTo::Time {
+                    time,
+                    track_id: Some(track_id),
+                },
+                None,
+            )
+        }
+    }
+}
+
 fn decode_symphonia(
     file_path: &str,
     _target_sample_rate: Option<u32>,
@@ -4067,11 +4141,17 @@ fn decode_symphonia(
     //
     // `None` dès que le décodage est borné ou décalé : comparer une fenêtre à
     // la longueur totale de la piste ne voudrait rien dire.
+    // #8968 — amorce et remplissage AAC : la longueur annoncée est alors
+    // celle des trames UTILES, pas celle du conteneur.
+    let rognage = rognage_aac(file_path, &audio_params, !image_cdda);
     let trames_annoncees = if seek_s <= 0.0 && max_duration_s <= 0.0 {
-        track.num_frames
+        rognage.and_then(|r| r.utiles).or(track.num_frames)
     } else {
         None
     };
+    let mut rogneur = rognage
+        .as_ref()
+        .map(super::amorce_aac::Rogneur::depuis_le_debut);
     let mut track_id = track.id;
     let source_rate = audio_params.sample_rate.unwrap_or(44100);
     let source_channels = audio_params
@@ -4111,18 +4191,12 @@ fn decode_symphonia(
     // de lecture en continu (`decode_to_pcm_streaming_inner`).
     let mut trames_a_sauter: u64 = 0;
     if seek_s > 0.0 {
-        let seconds = seek_s as i64;
-        let nanos = ((seek_s - seconds as f64) * 1_000_000_000.0) as u32;
-        let time = Time::try_new(seconds, nanos).unwrap_or(Time::ZERO);
-        match format.seek(
-            SeekMode::Accurate,
-            SeekTo::Time {
-                time,
-                track_id: Some(track_id),
-            },
-        ) {
+        let (cible, rogneur_apres) =
+            cible_de_recherche(seek_s, track_id, source_rate, rognage.as_ref());
+        match format.seek(SeekMode::Accurate, cible) {
             Ok(seeked) => {
                 trames_a_sauter = (seeked.required_ts.get() - seeked.actual_ts.get()).max(0) as u64;
+                rogneur = rogneur_apres;
                 decoder.reset();
             }
             Err(_) => {
@@ -4232,7 +4306,18 @@ fn decode_symphonia(
             trames_a_sauter -= rognees;
             debut = rognees as usize * ch;
         }
-        all_samples.extend_from_slice(&packet_samples[debut..]);
+        // #8968 — amorce et remplissage AAC retirés à la trame près.
+        let fin = match rogneur.as_mut() {
+            Some(r) => {
+                let ch = source_channels.max(1) as usize;
+                let garde = r.garder((packet_samples.len() - debut) / ch, ch);
+                let fin = debut + garde.end;
+                debut += garde.start;
+                fin
+            }
+            None => packet_samples.len(),
+        };
+        all_samples.extend_from_slice(&packet_samples[debut..fin]);
         // Débit de décodage observable sans coût (#3140) : un paquet FLAC vaut
         // quelques dizaines de millisecondes d'audio. Inerte sans balise.
         super::decode_progress::publier(
