@@ -1433,6 +1433,14 @@ pub trait StreamingService: Send + Sync {
         false
     }
 
+    /// #8766 — le service refuse-t-il encore les demandes (HTTP `429`,
+    /// `Retry-After`) ? Le temps qui reste, en secondes du service. `None` :
+    /// aucune limite en cours. La reprise des favoris au démarrage s'en sert
+    /// pour se reprogrammer au lieu d'abandonner.
+    fn limite_de_debit_restante_s(&self) -> Option<u64> {
+        None
+    }
+
     /// Les playlists de la bibliothèque du compte, possédées ET suivies, lues
     /// EN ENTIER, chacune avec `editable` (`Some(false)` : suivie).
     ///
