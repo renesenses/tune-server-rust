@@ -1704,9 +1704,15 @@ async fn service_status(
     // playlists) et retenait toutes les lectures arrivées après lui : les
     // widgets de l'accueil tombaient en « délai ». L'écriture n'est prise que
     // pour une connexion par interrogation, que Qobuz n'a pas.
-    let mut status = svc.read().await.auth_status().await;
+    let (mut status, a_reconnecter) = {
+        let lecture = svc.read().await;
+        (
+            lecture.auth_status().await,
+            raison_de_reconnexion(&**lecture),
+        )
+    };
     if status.authenticated || !connexion_par_interrogation(&service) {
-        return reponse_etat_du_service(&service, &status);
+        return reponse_etat_du_service(&service, &status, a_reconnecter);
     }
     let mut svc = svc.write().await;
     status = svc.auth_status().await;
@@ -1718,8 +1724,19 @@ async fn service_status(
         drop(svc);
         state.save_tokens().await;
         purge_contenu_utilisateur(&service);
+        return reponse_etat_du_service(&service, &status, None);
     }
-    reponse_etat_du_service(&service, &status)
+    reponse_etat_du_service(&service, &status, a_reconnecter)
+}
+
+/// #8904 — pourquoi le compte d'un service est « à reconnecter », s'il l'est.
+/// Aujourd'hui YouTube seul : jetons du client de repli retiré, effacés.
+fn raison_de_reconnexion(
+    svc: &dyn tune_core::streaming::traits::StreamingService,
+) -> Option<&'static str> {
+    svc.as_any()
+        .downcast_ref::<tune_core::streaming::youtube::YouTubeService>()
+        .and_then(|yt| yt.raison_de_reconnexion())
 }
 
 /// Le service sait-il se connecter par interrogation (`{"poll": true}`) ?
@@ -1734,15 +1751,22 @@ fn connexion_par_interrogation(service: &str) -> bool {
 fn reponse_etat_du_service(
     service: &str,
     status: &tune_core::streaming::traits::AuthStatus,
+    a_reconnecter: Option<&str>,
 ) -> Response {
-    Json(json!({
+    let mut corps = json!({
         "service": service,
         "enabled": true,
         "authenticated": status.authenticated,
         "username": status.username,
         "subscription": status.subscription,
-    }))
-    .into_response()
+    });
+    // #8904 — seulement quand le compte est à reconnecter : la forme
+    // habituelle de la réponse ne change pas.
+    if let Some(raison) = a_reconnecter.filter(|_| !status.authenticated) {
+        corps["reconnect_required"] = json!(true);
+        corps["reconnect_reason"] = json!(raison);
+    }
+    Json(corps).into_response()
 }
 
 /// L'hôte par lequel le CLIENT a joint le serveur : `X-Forwarded-Host`

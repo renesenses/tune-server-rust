@@ -882,3 +882,9 @@ path = "tests/pochettes_compilations_6077.rs"
 [[test]]
 name = "journal_apres_scan_pg_8239"
 path = "tests/journal_apres_scan_pg_8239.rs"
+
+# #8904 : yt-dlp n'hérite pas des variables du client OAuth de Tune. Binaire
+# à part : l'essai pose ces variables dans l'environnement du processus.
+[[test]]
+name = "ytdlp_sans_oauth_8904"
+path = "tests/ytdlp_sans_oauth_8904.rs"
