@@ -1241,10 +1241,13 @@ CREATE INDEX IF NOT EXISTS idx_enrich_tentatives_issue ON enrich_tentatives(issu
 -- (migrations/alertes_douteuses_ignorees.sql). Copiée.
 CREATE TABLE IF NOT EXISTS alertes_douteuses_ignorees (
  portee TEXT NOT NULL,
- cible_id BIGINT NOT NULL,
+ cle TEXT NOT NULL,
+ titre TEXT NOT NULL DEFAULT '',
  raison TEXT NOT NULL,
+ cible_id BIGINT,
+ libelle TEXT,
  ignoree_le BIGINT NOT NULL,
- PRIMARY KEY (portee, cible_id, raison)
+ PRIMARY KEY (portee, cle, titre, raison)
 );
 -- « Pas pour moi » de l'accueil (web#916, SQLite 145 / PG 111), par profil.
 CREATE TABLE IF NOT EXISTS suggestions_ecartees (
@@ -1949,7 +1952,7 @@ fn conflict_clause(table: &str) -> &'static str {
         "podcast_episode_positions" => "ON CONFLICT (zone_id, episode_key) DO NOTHING",
         "collection_physique_associations" => "ON CONFLICT (release_id) DO NOTHING",
         "politiques_parentales" => "ON CONFLICT (profile_id) DO NOTHING",
-        "alertes_douteuses_ignorees" => "ON CONFLICT (portee, cible_id, raison) DO NOTHING",
+        "alertes_douteuses_ignorees" => "ON CONFLICT (portee, cle, titre, raison) DO NOTHING",
         "notes_personnelles" => "ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
         "apports_service_albums" => "ON CONFLICT (album_id, source) DO NOTHING",
         "apports_service" => "ON CONFLICT (album_id, track_id, champ, source) DO NOTHING",

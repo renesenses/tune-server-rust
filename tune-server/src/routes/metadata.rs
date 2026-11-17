@@ -138,11 +138,9 @@ pub fn router() -> Router<AppState> {
         // #8958 — marquer une alerte comme normale, revoir, annuler.
         .route(
             "/doubtful/ignored",
-            get(alertes_ignorees::lister).post(alertes_ignorees::ignorer),
-        )
-        .route(
-            "/doubtful/ignored/{scope}/{target_id}/{reason}",
-            axum::routing::delete(alertes_ignorees::retablir),
+            get(alertes_ignorees::lister)
+                .post(alertes_ignorees::ignorer)
+                .delete(alertes_ignorees::retablir),
         )
         // Lookup (MusicBrainz)
         .route("/lookup/track", get(lookup_track))
@@ -1168,6 +1166,8 @@ async fn batch_rename_artist(
 }
 
 async fn list_doubtful_metadata(
+    // #8958 — l'écran n'offre « C'est normal » qu'à qui peut l'écrire.
+    admin: Result<crate::auth::RequireAdmin, (StatusCode, Json<serde_json::Value>)>,
     State(state): State<AppState>,
     Query(p): Query<PaginationParams>,
 ) -> impl IntoResponse {
@@ -1183,20 +1183,8 @@ async fn list_doubtful_metadata(
     let items: Vec<serde_json::Value> = tracks
         .iter()
         .map(|t| {
-            let mut reasons = Vec::new();
-            if t.artist_name
-                .as_ref()
-                .map(|a| a.is_empty() || a == "Unknown Artist")
-                .unwrap_or(true)
-            {
-                reasons.push("missing_artist");
-            }
-            if t.duration_ms > 0 && t.duration_ms < 5000 {
-                reasons.push("very_short");
-            }
-            if t.album_title.as_ref().map(|a| a.is_empty()).unwrap_or(true) {
-                reasons.push("missing_album");
-            }
+            // La règle de `where_doubtful`, partagée avec le POST de #8958.
+            let mut reasons = tune_core::db::alertes_douteuses_ignorees::raisons_de(t);
             reasons.retain(|r| !ignorees.contient(t, r));
             // #8958 — où « Marquer comme normale » mémoriserait chaque
             // alerte : l'écran le dit sur le bouton.
@@ -1234,6 +1222,7 @@ async fn list_doubtful_metadata(
         .collect();
     Json(json!({
         "items": items,
+        "can_ignore": admin.is_ok(),
         "total": total,
         "limit": limit,
         "offset": offset,
