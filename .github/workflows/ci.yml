@@ -298,6 +298,8 @@ jobs:
         with:
           rustflags: ""
           cache-save-if: ${{ github.ref == 'refs/heads/main' || github.ref == 'refs/heads/release/v0.9' }}
+      - name: dbus-daemon pour tune-mpris (#8824)
+        run: command -v dbus-daemon || (timeout 100 sudo apt-get update && timeout 200 sudo apt-get install -y dbus-daemon)
       # `-p tune-bridge` et `cloud-relay` : le chemin de l'ecoute distante
       # n'etait couvert par AUCUNE porte. Le relais (`tune-bridge`) n'etait ni
       # teste ni compile ici, et `tune-core/src/cloud/relay.rs` vit derriere
@@ -371,8 +373,18 @@ jobs:
       # que les cinq caisses HTTP extraites restent CONTIGUES jusqu'a
       # `-p tune-server`. L'inserer au milieu de ce bloc fait rougir cette
       # garde-la — mesure sur Shrek avant de la deplacer ici.
+      #
+      # #8824 — `tune-mpris` (compagnon MPRIS pour Linux) : zbus est du Rust
+      # pur, rien a installer. Son essai sur un `dbus-daemon` prive se saute
+      # avec un message si le runner n'en a pas ; le reste se teste partout.
       # plugin-catalog: {"features":"fast","base":["oaat","cloud-relay"],"packages":"workspace"}
-      - run: cargo test --no-fail-fast -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-laissez-passer -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon -p tune-cd -p tune-entree-audio -p tune-playlists-converter -p tune-circle -p tune-assistant-ia -p tune-collection-physique -p tune-mon-theme -p tune-aes67 -p tune-calibration -p tune-calibration-greffon --no-default-features --features oaat,cloud-relay,bandcamp,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,mon-theme
+      - run: cargo test --no-fail-fast -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-laissez-passer -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon -p tune-cd -p tune-entree-audio -p tune-playlists-converter -p tune-circle -p tune-assistant-ia -p tune-collection-physique -p tune-mon-theme -p tune-aes67 -p tune-calibration -p tune-calibration-greffon -p tune-mpris --no-default-features --features oaat,cloud-relay,bandcamp,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,mon-theme
+        # #8824 — `tune-mpris/tests/bus_prive.rs` lance un `dbus-daemon` prive
+        # (installe par l'etape « dbus-daemon pour tune-mpris »). Posee sur
+        # CETTE etape, la variable fait ECHOUER l'essai si le demon manque, au
+        # lieu de le sauter en vert (garde `tout_temoin_sous_variable_d_environnement_est_recense`).
+        env:
+          TUNE_MPRIS_DBUS_REQUIS: "1"
 
   # La CI validait `--features oaat` alors que les binaires publies embarquent
   # six fonctionnalites. Neuf tests de greffons echouaient donc en silence
@@ -898,7 +910,7 @@ jobs:
       # #6785 : `ecoute-directe` (tune-core, tune-server), HORS défaut : le P2P n'est
       # dans aucun binaire livré ; nommé ici pour que la porte lise son code.
       # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","audio-embedding","plugins-wasm","dst","journal-de-test","isolement-disque-de-test","services-factices","ecoute-directe"],"packages":"workspace"}
-      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-laissez-passer -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon -p tune-cd -p tune-entree-audio -p tune-playlists-converter -p tune-circle -p tune-assistant-ia -p tune-collection-physique -p tune-mon-theme -p tune-aes67 -p tune-calibration -p tune-calibration-greffon --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,plugins-wasm,dst,journal-de-test,isolement-disque-de-test,services-factices,ecoute-directe,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme -- -D clippy::correctness
+      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-laissez-passer -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon -p tune-cd -p tune-entree-audio -p tune-playlists-converter -p tune-circle -p tune-assistant-ia -p tune-collection-physique -p tune-mon-theme -p tune-aes67 -p tune-calibration -p tune-calibration-greffon -p tune-mpris --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,plugins-wasm,dst,journal-de-test,isolement-disque-de-test,services-factices,ecoute-directe,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme -- -D clippy::correctness
 
   audit:
     name: Security Audit
