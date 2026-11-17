@@ -124,9 +124,6 @@ fn ligne_de_zone_masquee(r: &[SqlValue]) -> Option<ZoneMasquee> {
     })
 }
 
-/// Drapeau, motif et date du masquage d'une zone (#5077). `motif` NUL =
-/// inconnu : masquage d'avant la migration 112, ou zone visible.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
 /// #8987 — l'issue de [`ZoneRepo::prendre_la_sortie`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PriseDeSortie {
@@ -137,6 +134,9 @@ pub enum PriseDeSortie {
     ZoneSupprimeeRestauree,
 }
 
+/// Drapeau, motif et date du masquage d'une zone (#5077). `motif` NUL =
+/// inconnu : masquage d'avant la migration 112, ou zone visible.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EtatDeMasquage {
     pub masquee: bool,
     pub motif: Option<String>,
