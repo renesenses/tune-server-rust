@@ -410,6 +410,11 @@ pub async fn run_with(opts: RunOptions) {
     // `AppState::new` et d'une boucle de redémarrage muette.
     crate::dossiers_inscriptibles::verifier_ou_sortir(&config);
 
+    // #8747 — `/data` sans volume (ou sur un volume anonyme) : la base serait
+    // perdue à la recréation du conteneur, mise à jour de l'image comprise.
+    // On le dit au journal ; `GET /system/env` le publie pour le bandeau.
+    crate::persistance_donnees::journaliser_au_demarrage(&config.db_path);
+
     crate::boot_status::set_phase("base de données");
     // Le coffre des clés d'API personnelles (#4805, lot 1) : sa clé maîtresse
     // vit à côté de la base. Posé AVANT tout service qui lirait une clé.
@@ -448,6 +453,14 @@ pub async fn run_with(opts: RunOptions) {
     // écritures de `init_state`.
     crate::startup::journaliser_les_consentements(&state);
 
+    // Les profils de commande `SetAVTransportURI` appris par appareil après
+    // un refus (501/714/716), et les règles apprises (#6477 : pas de `SetNext`
+    // au FiiO K17), survivent au redémarrage : la mémoire est branchée sur la
+    // base AVANT toute découverte. #8868 — `init_state` lance la resonde des
+    // renderers connus, qui rattache le K17 en quelques millisecondes : la
+    // brancher après, à l'étape « découverte réseau », la laissait passer
+    // avant la base, et la règle n'était plus relue.
+    tune_core::outputs::dlna_repli_set_uri::installer_persistance(state.backend.clone());
     // Restore zone volumes, persist music_dirs/discogs_token to DB
     crate::startup::init_state(&state, &config).await;
 
@@ -538,11 +551,6 @@ pub async fn run_with(opts: RunOptions) {
     // Create shared OpenHome event listener
     crate::boot_status::set_phase("découverte réseau");
     let oh_event_listener = crate::startup::create_oh_listener().await;
-
-    // Les profils de commande `SetAVTransportURI` appris par appareil après
-    // un refus (501/714/716) survivent au redémarrage : la mémoire est
-    // branchée sur la base AVANT la découverte, qui les relit.
-    tune_core::outputs::dlna_repli_set_uri::installer_persistance(state.backend.clone());
 
     // SSDP discovery (DLNA / OpenHome)
     crate::discovery_setup::spawn_ssdp_handler(&state, &config, oh_event_listener);

@@ -368,9 +368,14 @@ mod tests {
             .map(String::as_str)
             .filter(|l| l.starts_with("2: "))
             .collect();
+        // #8855 — le démon reçoit le niveau de la courbe commune pour 10 %.
+        let volume = format!(
+            "2: SET_PARAMETER volume={}",
+            crate::outputs::volume_airplay_8855::niveau_pour_le_demon(0.1)
+        );
         assert_eq!(
             suite,
-            ["2: SET_PARAMETER volume=0.1", "2: SETUP RECORD"],
+            [volume.as_str(), "2: SETUP RECORD"],
             "le volume réglé pendant la pause part avant la lecture : {journal:?}"
         );
     }

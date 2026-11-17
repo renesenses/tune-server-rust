@@ -26,11 +26,28 @@ const STREAM_URL_TTL_SECS: u64 = 18_000;
 const YTDLP_TIMEOUT_SECS: u64 = 90;
 
 // InnerTube is periodically closed to unauthenticated clients. Do not pay the
-// same two known failures for every track when yt-dlp is available, but keep
-// probing periodically so a temporary YouTube outage does not become a
-// permanent session-wide fallback.
+// same two known failures for every track, but keep probing periodically so
+// a temporary YouTube outage does not become a permanent session-wide
+// fallback. #8913 — this holds without yt-dlp too: the refusal then comes
+// at once, named (`CODE_LECTURE_YOUTUBE_INACTIVE`).
 const NATIVE_FAILURE_THRESHOLD: u32 = 2;
 const NATIVE_CIRCUIT_COOLDOWN_SECS: u64 = 15 * 60;
+
+/// #8913 — le code stable du refus « lecture YouTube non activée » : yt-dlp
+/// n'est pas installé, et les voies natives ne servent pas la piste. La route
+/// de lecture le reconnaît dans le message (`TuneError::Streaming`) et rend un
+/// 409 traduit (`message_key`), avec l'action qui active la lecture YouTube,
+/// au lieu du 502 `upstream_error` brut.
+pub const CODE_LECTURE_YOUTUBE_INACTIVE: &str = "youtube_playback_disabled";
+
+/// Le message de ce refus : le code stable en tête, puis la phrase technique
+/// (anglaise) qui reste lisible dans le journal.
+fn erreur_lecture_youtube_inactive() -> String {
+    format!(
+        "{CODE_LECTURE_YOUTUBE_INACTIVE}: YouTube playback is not enabled — turn it on in \
+         Settings (downloads the yt-dlp helper)"
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Google OAuth 2.0 — Device Code Flow
@@ -1237,46 +1254,43 @@ impl YouTubeService {
     // yt-dlp stream URL extraction (fallback)
     // ------------------------------------------------------------------
 
-    /// Extract audio stream URL via yt-dlp subprocess (fallback).
-    ///
-    /// Used when native `/player` API extraction fails (e.g., geo-restricted
-    /// content, age-gated videos). Requires `yt-dlp` installed on PATH.
-    /// Ce que yt-dlp rend : l'URL, et les en-têtes qui vont avec.
-    ///
-    /// #4366 — `--get-url` ne rendait que l'URL. Le format choisi porte aussi
-    /// un `http_headers` (User-Agent en tête), et l'URL `googlevideo` est
-    /// servie à qui les rejoue. Les demander coûte un `--print` de plus, sur
-    /// le même appel.
-    async fn extract_audio_url_ytdlp(&self, track_id: &str) -> Result<FluxYoutube, String> {
-        // Managed yt-dlp binary (auto-provisioned via the "Enable YouTube
-        // playback" button). None means the user hasn't enabled it yet.
-        let ytdlp = crate::ytdlp::binary().ok_or_else(|| {
-            "YouTube playback is not enabled — turn it on in Settings \
-             (downloads the yt-dlp helper)"
-                .to_string()
-        })?;
-        extraire_par_ytdlp(&ytdlp, track_id).await
-    }
-
     /// Extract audio stream URL with native API as primary + yt-dlp fallback.
     async fn extract_audio_url(&self, track_id: &str) -> Result<FluxYoutube, String> {
-        // Bypass is useful only when the fallback actually exists. Without the
-        // managed helper, always retain the chance that this particular track
-        // still works through InnerTube.
-        let ytdlp_available = crate::ytdlp::binary().is_some();
-        let native_decision = if ytdlp_available {
-            self.native_extraction_circuit
-                .lock()
-                .await
-                .decide(Instant::now())
-        } else {
-            NativeAttemptDecision::Attempt
-        };
+        // Managed yt-dlp binary (auto-provisioned via the "Enable YouTube
+        // playback" button). None means the user hasn't enabled it yet.
+        self.extraire_flux(track_id, crate::ytdlp::binary()).await
+    }
+
+    /// La résolution d'une piste, yt-dlp désigné par l'appelant (`None` :
+    /// lecture YouTube non activée). Séparée de [`Self::extract_audio_url`]
+    /// pour que les essais n'aient pas à toucher au binaire global.
+    ///
+    /// #8913 — le disjoncteur des voies natives (`NativeExtractionCircuit`)
+    /// vaut AUSSI sans yt-dlp. Avant, sans lui, chaque piste refaisait les
+    /// deux appels `/player` que Google refuse depuis août (#2162 : 48 sur
+    /// 48), pour finir sur le même refus. Désormais, après
+    /// `NATIVE_FAILURE_THRESHOLD` refus de suite, les voies natives sont
+    /// sautées et une seule sonde les réessaie toutes les
+    /// `NATIVE_CIRCUIT_COOLDOWN_SECS` : si Google en rouvre une, la sonde
+    /// réussit et referme le disjoncteur. Sans yt-dlp, le refus porte le
+    /// code stable [`CODE_LECTURE_YOUTUBE_INACTIVE`], que la route de lecture
+    /// rend en 409 traduit avec de quoi activer la lecture YouTube.
+    pub(crate) async fn extraire_flux(
+        &self,
+        track_id: &str,
+        ytdlp: Option<std::path::PathBuf>,
+    ) -> Result<FluxYoutube, String> {
+        let native_decision = self
+            .native_extraction_circuit
+            .lock()
+            .await
+            .decide(Instant::now());
 
         if native_decision == NativeAttemptDecision::Probe {
             info!(track_id, "ytm_native_circuit_probe_started");
         }
 
+        let mut echec_natif = None;
         if matches!(
             native_decision,
             NativeAttemptDecision::Attempt | NativeAttemptDecision::Probe
@@ -1300,14 +1314,30 @@ impl YouTubeService {
                         .await
                         .record_failure(Instant::now());
                     info!(track_id, error = %e, "ytm_native_extraction_failed_trying_ytdlp");
+                    echec_natif = Some(e);
                 }
             }
         } else {
-            info!(track_id, "ytm_native_circuit_open_using_ytdlp");
+            info!(
+                track_id,
+                ytdlp = ytdlp.is_some(),
+                "ytm_native_circuit_open_skipping_native"
+            );
         }
 
-        // Fallback: yt-dlp subprocess
-        match self.extract_audio_url_ytdlp(track_id).await {
+        let Some(ytdlp) = ytdlp else {
+            warn!(
+                track_id,
+                native_error = echec_natif.as_deref().unwrap_or("skipped (circuit open)"),
+                "youtube_playback_not_enabled"
+            );
+            return Err(erreur_lecture_youtube_inactive());
+        };
+
+        // Fallback: yt-dlp subprocess. #4366 — il rend l'URL ET les en-têtes
+        // du format choisi (User-Agent en tête) : `googlevideo` ne sert l'URL
+        // qu'à qui les rejoue.
+        match extraire_par_ytdlp(&ytdlp, track_id).await {
             Ok(url) => Ok(url),
             Err(ytdlp_err) => {
                 warn!(track_id, error = %ytdlp_err, "youtube_all_extraction_methods_failed");
@@ -4827,3 +4857,7 @@ mod playlist_vl_8426_tests;
 #[cfg(test)]
 #[path = "youtube_client_oauth_8904_tests.rs"]
 mod client_oauth_8904_tests;
+
+#[cfg(test)]
+#[path = "youtube_lecture_inactive_8913_tests.rs"]
+mod lecture_inactive_8913_tests;

@@ -755,14 +755,12 @@ impl AirplayOutput {
     }
 }
 
+/// #8855 — la courbe commune à AirPlay 1 et AirPlay 2 : -30..0 dB linéaire,
+/// -144 en sourdine (voir `volume_airplay_8855`). L'ancien `30·log10` faisait
+/// partir une enceinte AirPlay 1 plus fort que le curseur, et pas au même
+/// niveau qu'en AirPlay 2.
 fn linear_to_airplay_db(volume: f64) -> f64 {
-    if volume <= 0.0 {
-        -144.0
-    } else if volume >= 1.0 {
-        0.0
-    } else {
-        30.0 * (volume.ln() / std::f64::consts::LN_10)
-    }
+    super::volume_airplay_8855::curseur_vers_db(volume)
 }
 
 fn build_rtp_packet(seq: u16, timestamp: u32, ssrc: u32, audio: &[u8], marqueur: bool) -> Vec<u8> {
@@ -1868,8 +1866,10 @@ mod tests {
     fn volume_conversion() {
         assert_eq!(linear_to_airplay_db(0.0), -144.0);
         assert_eq!(linear_to_airplay_db(1.0), 0.0);
-        let half = linear_to_airplay_db(0.5);
-        assert!(half < -5.0 && half > -15.0);
+        // #8855 : -30..0 dB linéaire, plancher à -30 dB.
+        assert_eq!(linear_to_airplay_db(0.5), -15.0);
+        assert_eq!(linear_to_airplay_db(0.65), -10.5);
+        assert!(linear_to_airplay_db(1e-6) >= -30.0);
     }
 
     #[test]

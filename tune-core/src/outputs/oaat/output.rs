@@ -13,6 +13,11 @@ use crate::outputs::traits::{
 #[path = "volume_7333_tests.rs"]
 mod volume_7333_tests;
 
+// #8726 — une reprise sans session de lecture rouvre la session.
+#[cfg(all(test, feature = "oaat"))]
+#[path = "reprise_sans_session_8726_tests.rs"]
+mod reprise_sans_session_8726_tests;
+
 #[cfg(feature = "oaat")]
 use super::helpers::{
     BaseDeTempsOaat, StreamInfo, detect_and_parse, dsd_rate_from_sample_rate, duree_audio_envoyee,
@@ -414,6 +419,18 @@ impl OaatOutput {
         }
     }
 
+    /// #8726 — vrai quand aucune tâche de lecture ne lit plus les commandes :
+    /// jamais lancée, arrêtée (`stop` a vidé le canal) ou terminée d'elle-même
+    /// (récepteur du canal détruit). Un verrou occupé vaut « session en
+    /// cours » : `play_media` ou `stop` y travaille.
+    #[cfg(feature = "oaat")]
+    fn sans_session_de_lecture(&self) -> bool {
+        match self.command_tx.try_lock() {
+            Ok(tx) => tx.as_ref().is_none_or(|tx| tx.is_closed()),
+            Err(_) => false,
+        }
+    }
+
     /// Le TXT ne contient que le type ; hello_ack précisera plage et pas.
     pub fn avec_volume_annonce(self, annonce: Option<&str>) -> Self {
         self.actualiser_volume_annonce(annonce);
@@ -770,6 +787,22 @@ impl OutputTarget for OaatOutput {
     /// Returning true tells the poller's `prepare_gapless` to resolve the next
     /// track as a LOCAL FILE and stage it via `set_next_media(file_path=..)`.
     /// False for the HTTP-stream path, which keeps the URL-prefetch gapless.
+    /// #8726 — plus aucune session de lecture à reprendre : la tâche de
+    /// lecture s'est terminée (appareil disparu puis réapparu, ce qui
+    /// remplace même la sortie dans le registre) ou n'a jamais existé.
+    /// L'orchestrateur rétablit alors la piste à la position conservée
+    /// (`play_media`), au lieu d'un `resume` qui ne partait vers personne.
+    fn device_released_on_pause(&self) -> bool {
+        #[cfg(feature = "oaat")]
+        {
+            self.sans_session_de_lecture()
+        }
+        #[cfg(not(feature = "oaat"))]
+        {
+            false
+        }
+    }
+
     fn prefers_local_file_gapless(&self) -> bool {
         self.native_dsd_active.load(Ordering::Relaxed)
             || self.direct_pcm_active.load(Ordering::Relaxed)
@@ -3614,6 +3647,20 @@ impl OutputTarget for OaatOutput {
     }
 
     async fn resume(&self) -> Result<(), String> {
+        // #8726 — sans tâche de lecture, la commande `Resume` partait dans un
+        // canal sans destinataire (ou dans aucun) et la reprise se disait
+        // réussie : l'endpoint redémarré attendait une connexion qui ne
+        // venait jamais. Refuser ici fait rétablir la piste par
+        // l'orchestrateur (`device_released_on_pause`, contrat #6062).
+        #[cfg(feature = "oaat")]
+        if self.sans_session_de_lecture() {
+            warn!(device = %self.name, "oaat: resume without a playback session, reopening");
+            return Err(format!(
+                "OAAT endpoint \"{}\" has no playback session to resume; \
+                 the session must be reopened",
+                self.name
+            ));
+        }
         // #6790 — l'horloge du dernier paquet date d'avant la pause : la
         // remettre à maintenant AVANT que `paused` ne retombe, sinon le
         // superviseur des blocages voit une zone « bloquée » pendant que la
