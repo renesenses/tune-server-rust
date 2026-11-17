@@ -1315,8 +1315,12 @@ fn suivre_image_du_flux(state: &AppState, feed_url: &str, image: &str) {
             "UPDATE podcast_subscriptions SET image_url = ? WHERE feed_url = ?",
             &[&neuve as &dyn ToSqlValue, &feed as &dyn ToSqlValue],
         ) {
-            Ok(_) => info!(feed_url = %tune_core::confidentialite::masquer_url(&feed_url), ancienne = ?stockee, image, "podcast_image_du_flux_changee"),
-            Err(e) => warn!(feed_url = %tune_core::confidentialite::masquer_url(&feed_url), erreur = %e, "podcast_image_du_flux_non_enregistree"),
+            Ok(_) => {
+                info!(feed_url = %tune_core::confidentialite::masquer_url(&feed_url), ancienne = ?stockee, image, "podcast_image_du_flux_changee")
+            }
+            Err(e) => {
+                warn!(feed_url = %tune_core::confidentialite::masquer_url(&feed_url), erreur = %e, "podcast_image_du_flux_non_enregistree")
+            }
         }
     }
     let cache = crate::routes::library::artwork_cache_dir();

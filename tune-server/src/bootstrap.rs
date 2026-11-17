@@ -1049,12 +1049,11 @@ pub fn installer_le_journal(niveau_journal: &str) -> Option<std::path::PathBuf> 
         // L'ancien nom `stderr_layer` disait le contraire et n'a jamais été
         // vrai.
         let console_ferait_doublon = crate::journal::la_console_ecrit_deja_dans(&chemin);
-        let console_layer =
-            (!console_ferait_doublon).then(|| {
-                tracing_subscriber::fmt::layer()
-                    .with_timer(timer)
-                    .with_writer(|| tune_core::confidentialite::EcrivainMasque(std::io::stdout()))
-            });
+        let console_layer = (!console_ferait_doublon).then(|| {
+            tracing_subscriber::fmt::layer()
+                .with_timer(timer)
+                .with_writer(|| tune_core::confidentialite::EcrivainMasque(std::io::stdout()))
+        });
 
         tracing_subscriber::registry()
             .with(env_filter)

@@ -827,14 +827,18 @@ pub fn spawn_webhook_dispatcher(state: &AppState) {
                         let body = payload.clone();
                         // Fire-and-forget — don't block on webhook delivery
                         tokio::spawn(async move {
-                            let destination =
-                                match juger_destination_webhook(&url, MomentWebhook::Envoi).await {
-                                    Ok(d) => d,
-                                    Err(motif) => {
-                                        warn!(url = %tune_core::confidentialite::masquer_url(&url), motif, "webhook_destination_refusee");
-                                        return;
-                                    }
-                                };
+                            let destination = match juger_destination_webhook(
+                                &url,
+                                MomentWebhook::Envoi,
+                            )
+                            .await
+                            {
+                                Ok(d) => d,
+                                Err(motif) => {
+                                    warn!(url = %tune_core::confidentialite::masquer_url(&url), motif, "webhook_destination_refusee");
+                                    return;
+                                }
+                            };
                             let result = envoyer_webhook(&destination, &body).await;
 
                             if let Err(e) = result {
@@ -892,14 +896,18 @@ pub fn spawn_webhook_dispatcher(state: &AppState) {
                         let url = hook.url.clone();
                         let body = payload.clone();
                         tokio::spawn(async move {
-                            let destination =
-                                match juger_destination_webhook(&url, MomentWebhook::Envoi).await {
-                                    Ok(d) => d,
-                                    Err(motif) => {
-                                        warn!(url = %tune_core::confidentialite::masquer_url(&url), motif, "webhook_destination_refusee");
-                                        return;
-                                    }
-                                };
+                            let destination = match juger_destination_webhook(
+                                &url,
+                                MomentWebhook::Envoi,
+                            )
+                            .await
+                            {
+                                Ok(d) => d,
+                                Err(motif) => {
+                                    warn!(url = %tune_core::confidentialite::masquer_url(&url), motif, "webhook_destination_refusee");
+                                    return;
+                                }
+                            };
                             let result = envoyer_webhook(&destination, &body).await;
 
                             if let Err(e) = result {
