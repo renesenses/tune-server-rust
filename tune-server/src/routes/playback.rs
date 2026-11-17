@@ -5715,7 +5715,7 @@ async fn get_queue(
             };
             state
                 .orchestrator
-                .dsd_suivant_tenu_sur_dlna(device_id, annonce_suivante)
+                .dsd_suivant_tenu_sur_dlna(zone_id, device_id, annonce_suivante)
                 .await
         }
         _ => false,

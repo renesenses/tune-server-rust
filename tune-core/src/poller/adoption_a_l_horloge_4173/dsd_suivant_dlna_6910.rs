@@ -20,7 +20,10 @@
 //! | renderer | suivant DSD |
 //! |---|---|
 //! | annonce le DSD et `SetNext` | armé |
-//! | DSD brut forcé (« natif ») sans annonce DSD | garde conservée |
+//! | DSD brut forcé (« natif ») sans annonce DSD | armé (#8969, Eversolo DMP-A8, fil 2885) |
+//! | idem, SCPD illisible | garde conservée |
+//! | idem, règle #6477 apprise (lâche la piste au `SetNext`) | pas de `SetNext` |
+//! | DSD non annoncé, zone hors « natif » | le DSD part en PCM, armé comme avant |
 //! | annonce le DSD, SCPD illisible | garde conservée |
 //! | annonce tout, ne suit pas (RS130) | une transition perdue, puis garde rendue |
 //! | zone en DoP | armé en WAV, comme avant |
@@ -147,12 +150,68 @@ async fn renderer_dsd_natif_qui_annonce_setnext_recoit_le_suivant_dsd() {
     );
 }
 
-/// Garde conservée : DSD brut forcé par le mode « natif » sur un renderer qui
-/// n'annonce PAS le DSD (comme l'Eversolo DMP-A8). Rien ne dit qu'il tient
-/// un suivant DSD.
+/// ⭐ #8969 (fil 2885, Eversolo DMP-A8 du .18) — épreuve. Zone en DSD
+/// « natif », renderer qui n'annonce PAS le DSD mais annonce `SetNext` : le
+/// DSF part brut à chaque piste (`dsd_natif_sans_annonce_du_renderer`), la
+/// suivante doit l'être aussi. Avant : `gapless_skipped_dsd_next_dlna
+/// raison="dsd_non_annonce"` à chaque piste, puis `SetAVTransportURI` +
+/// `Play` en fin de piste — un blanc à chaque changement de piste.
 #[tokio::test]
-async fn dsd_brut_force_sans_annonce_dsd_garde_la_garde() {
-    let appareil = "uuid:banc-6910-natif-force";
+async fn dsd_brut_force_sans_annonce_dsd_arme_la_suivante_8969() {
+    let appareil = "uuid:banc-8969-natif-force";
+    let mut banc = Banc::monter_en_dsd(
+        appareil,
+        "native",
+        annonce_dsd(false),
+        AnnonceSuivante::Annoncee,
+    )
+    .await;
+    banc.la_fenetre_d_armement().await;
+    assert_eq!(
+        banc.armees().await,
+        vec![ARMEE.to_string()],
+        "#8969 : en « natif », le DSD part brut — sa suivante doit être armée"
+    );
+    assert!(banc.poll_states[&banc.zone_id].gapless_sent);
+    assert!(
+        banc.poll_states[&banc.zone_id]
+            .gapless_dsd_skip_pos
+            .is_none()
+    );
+    let url = banc.url_armee_6910().await.unwrap_or_default();
+    assert!(
+        url.to_lowercase().ends_with(".dsf"),
+        "la suivante part en DSD brut, comme la piste en cours : {url}"
+    );
+}
+
+/// #8969 — contre-épreuve : même renderer en « natif » sans annonce DSD, mais
+/// SCPD illisible. Le « natif » ne lève que l'absence d'annonce DSD.
+#[tokio::test]
+async fn dsd_brut_force_scpd_illisible_garde_la_garde_8969() {
+    let appareil = "uuid:banc-8969-natif-scpd-inconnu";
+    let mut banc = Banc::monter_en_dsd(
+        appareil,
+        "native",
+        annonce_dsd(false),
+        AnnonceSuivante::Inconnue,
+    )
+    .await;
+    banc.la_fenetre_d_armement().await;
+    assert_eq!(banc.armees().await, Vec::<String>::new());
+    assert_eq!(
+        banc.poll_states[&banc.zone_id].gapless_dsd_skip_pos,
+        Some(1)
+    );
+}
+
+/// #8969 — contre-épreuve : renderer en « natif » sans annonce DSD dont la
+/// règle #6477 est apprise (FiiO K17 : il lâche la piste en cours dès le
+/// `SetNext`, #8868). Aucun `SetNext` : la fin de piste joue la suivante.
+#[tokio::test]
+async fn dsd_brut_force_regle_6477_apprise_pas_de_set_next_8969() {
+    let appareil = "uuid:banc-8969-natif-k17";
+    crate::outputs::dlna_repli_set_uri::memoriser_set_next_coupe_la_piste(appareil);
     let mut banc = Banc::monter_en_dsd(
         appareil,
         "native",
@@ -164,13 +223,9 @@ async fn dsd_brut_force_sans_annonce_dsd_garde_la_garde() {
     assert_eq!(
         banc.armees().await,
         Vec::<String>::new(),
-        "#402 : sans annonce DSD du renderer, le suivant DSD n'est pas armé"
+        "#6477 : plus aucun SetNext vers un renderer qui lâche la piste en cours"
     );
-    assert_eq!(
-        banc.poll_states[&banc.zone_id].gapless_dsd_skip_pos,
-        Some(1),
-        "la position écartée est verrouillée, comme avant"
-    );
+    assert!(!banc.poll_states[&banc.zone_id].gapless_sent);
 }
 
 /// Garde conservée : le renderer annonce le DSD, mais son SCPD n'a rien dit
@@ -210,7 +265,7 @@ async fn suivant_dsd_arme_non_suivi_rend_la_garde_a_l_appareil() {
     assert_eq!(banc.armees().await, vec![ARMEE.to_string()]);
     assert!(
         banc.orchestrator
-            .dsd_suivant_tenu_sur_dlna(appareil, AnnonceSuivante::Annoncee)
+            .dsd_suivant_tenu_sur_dlna(banc.zone_id, appareil, AnnonceSuivante::Annoncee)
             .await
     );
 
@@ -257,7 +312,7 @@ async fn suivant_dsd_arme_non_suivi_rend_la_garde_a_l_appareil() {
     assert!(
         !banc
             .orchestrator
-            .dsd_suivant_tenu_sur_dlna(appareil, AnnonceSuivante::Annoncee)
+            .dsd_suivant_tenu_sur_dlna(banc.zone_id, appareil, AnnonceSuivante::Annoncee)
             .await,
         "#6910 : un renderer qui n'a pas suivi le DSD armé retrouve la garde de #402"
     );
@@ -354,20 +409,20 @@ mod raison_du_refus_6335 {
         assert!(ligne.contains("uuid:banc-6335-scpd-inconnu"), "{ligne}");
     }
 
-    /// DSD brut forcé sur un renderer qui ne l'annonce pas : limite de
-    /// l'appareil, dite comme telle.
+    /// #8969 — DSD brut forcé (« natif ») sur un renderer qui ne l'annonce
+    /// pas : l'absence d'annonce n'arrête plus rien, la ligne nomme la
+    /// condition qui manque VRAIMENT (ici le SCPD).
     #[tokio::test]
-    async fn dsd_non_annonce_nomme_dsd_non_annonce() {
+    async fn natif_sans_annonce_nomme_la_vraie_condition_manquante() {
         let ligne = ligne_de_refus(
             "uuid:banc-6335-natif-force",
             "native",
             annonce_dsd(false),
-            AnnonceSuivante::Annoncee,
+            AnnonceSuivante::Inconnue,
         )
         .await;
         assert!(
-            ligne.contains("dsd_non_annonce"),
-            "#6335 : le refus doit nommer l'absence d'annonce DSD : {ligne}"
+            ligne.contains("setnext_inconnu") && !ligne.contains("dsd_non_annonce"),
+            "#8969 : en « natif », le refus ne doit plus être dsd_non_annonce : {ligne}"
         );
     }
-}

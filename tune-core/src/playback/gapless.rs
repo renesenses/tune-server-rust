@@ -226,9 +226,12 @@ pub fn est_dsd(marqueur: &str) -> bool {
 /// Vrai **seulement** si les trois conditions tiennent :
 ///
 /// 1. le renderer annonce le DSD dans son `GetProtocolInfo` — un sondage
-///    CONCLUANT (`Some(true)`) ; `None` (pas sondé, sondage échoué) et
-///    `Some(false)` (DSD brut forcé par le mode « natif » sur un renderer qui
-///    ne l'annonce pas, comme l'Eversolo DMP-A8) gardent la garde ;
+///    CONCLUANT (`Some(true)`) — OU la zone est en mode DSD « natif »
+///    (`natif_force`) et le sondage a conclu (`Some(false)`) : le DSD brut part
+///    alors QUAND MÊME pour chaque piste (`should_dsd_passthrough`), le
+///    renderer le joue déjà, et lui refuser la suivante ne laissait qu'un blanc
+///    à chaque piste (Eversolo DMP-A8, fil 2885, #8969). `None` (pas sondé,
+///    sondage échoué) garde la garde ;
 /// 2. son SCPD d'AVTransport annonce `SetNextAVTransportURI`
 ///    ([`AnnonceSuivante::Annoncee`]) ; `Inconnue` garde la garde ;
 /// 3. il n'a pas déjà lâché un suivant DSD armé depuis le démarrage de Tune
@@ -239,10 +242,11 @@ pub fn est_dsd(marqueur: &str) -> bool {
 /// promesse de la file ([`enchainement_sans_blanc`]).
 pub fn dsd_suivant_tenu_sur_dlna(
     annonce_dsd: Option<bool>,
+    natif_force: bool,
     annonce_suivante: AnnonceSuivante,
     deja_lache: bool,
 ) -> bool {
-    refus_dsd_suivant_sur_dlna(annonce_dsd, annonce_suivante, deja_lache).is_none()
+    refus_dsd_suivant_sur_dlna(annonce_dsd, natif_force, annonce_suivante, deja_lache).is_none()
 }
 
 /// #6335 — POURQUOI un suivant DSD n'est pas armé sur un renderer DLNA.
@@ -255,7 +259,8 @@ pub fn dsd_suivant_tenu_sur_dlna(
 pub enum RefusDsdSuivant {
     /// `GetProtocolInfo` pas sondé, ou sondage sans réponse (`None`).
     DsdNonSonde,
-    /// Le renderer n'annonce pas le DSD (`Some(false)`).
+    /// Le renderer n'annonce pas le DSD (`Some(false)`) et la zone n'est pas
+    /// en mode « natif » : le DSD n'est pas envoyé brut à ce renderer.
     DsdNonAnnonce,
     /// SCPD d'AVTransport ni connu ni lu : Tune ne sait pas si
     /// `SetNextAVTransportURI` est permis.
@@ -281,15 +286,23 @@ impl RefusDsdSuivant {
 
 /// #6335 — la première des trois conditions de [`dsd_suivant_tenu_sur_dlna`]
 /// qui manque, `None` si le suivant DSD peut être armé.
+///
+/// `natif_force` : la zone est en mode DSD « natif » — réglage explicite qui
+/// envoie le DSD brut même au renderer qui ne l'annonce pas (#8969). Il ne
+/// lève que `Some(false)` : un sondage sans réponse (`None`) garde la garde.
+/// Les deux autres conditions tiennent toujours, et un renderer qui lâche le
+/// suivant DSD armé retrouve la garde (`deja_lache`) : une transition perdue,
+/// puis la garde.
 pub fn refus_dsd_suivant_sur_dlna(
     annonce_dsd: Option<bool>,
+    natif_force: bool,
     annonce_suivante: AnnonceSuivante,
     deja_lache: bool,
 ) -> Option<RefusDsdSuivant> {
     match annonce_dsd {
         None => return Some(RefusDsdSuivant::DsdNonSonde),
-        Some(false) => return Some(RefusDsdSuivant::DsdNonAnnonce),
-        Some(true) => {}
+        Some(false) if !natif_force => return Some(RefusDsdSuivant::DsdNonAnnonce),
+        Some(_) => {}
     }
     match annonce_suivante {
         AnnonceSuivante::Inconnue => return Some(RefusDsdSuivant::SuivanteInconnue),
@@ -492,22 +505,41 @@ mod tests {
     #[test]
     fn dsd_suivant_tenu_exige_les_trois_conditions_6910() {
         use AnnonceSuivante::*;
-        assert!(dsd_suivant_tenu_sur_dlna(Some(true), Annoncee, false));
-        // DSD non sondé, ou brut forcé sur un renderer qui ne l'annonce pas.
-        assert!(!dsd_suivant_tenu_sur_dlna(None, Annoncee, false));
-        assert!(!dsd_suivant_tenu_sur_dlna(Some(false), Annoncee, false));
+        assert!(dsd_suivant_tenu_sur_dlna(Some(true), false, Annoncee, false));
+        // DSD non sondé, ou non annoncé hors mode « natif ».
+        assert!(!dsd_suivant_tenu_sur_dlna(None, false, Annoncee, false));
+        assert!(!dsd_suivant_tenu_sur_dlna(Some(false), false, Annoncee, false));
         // SCPD illisible ou action absente.
-        assert!(!dsd_suivant_tenu_sur_dlna(Some(true), Inconnue, false));
-        assert!(!dsd_suivant_tenu_sur_dlna(Some(true), NonAnnoncee, false));
+        assert!(!dsd_suivant_tenu_sur_dlna(Some(true), false, Inconnue, false));
+        assert!(!dsd_suivant_tenu_sur_dlna(Some(true), false, NonAnnoncee, false));
         // Le renderer a déjà lâché un suivant DSD armé (RS130, #402).
-        assert!(!dsd_suivant_tenu_sur_dlna(Some(true), Annoncee, true));
+        assert!(!dsd_suivant_tenu_sur_dlna(Some(true), false, Annoncee, true));
+    }
+
+    /// #8969 (fil 2885, Eversolo DMP-A8) — zone en DSD « natif » : le DSD brut
+    /// part même sans annonce du renderer, la suivante l'est aussi. Le natif ne
+    /// lève QUE le `Some(false)` : sondage sans réponse, SCPD sans `SetNext`
+    /// ou renderer qui a déjà lâché un suivant DSD gardent la garde.
+    #[test]
+    fn natif_force_leve_seulement_le_dsd_non_annonce_8971() {
+        use AnnonceSuivante::*;
+        assert!(dsd_suivant_tenu_sur_dlna(Some(false), true, Annoncee, false));
+        assert!(!dsd_suivant_tenu_sur_dlna(None, true, Annoncee, false));
+        assert!(!dsd_suivant_tenu_sur_dlna(Some(false), true, Inconnue, false));
+        assert!(!dsd_suivant_tenu_sur_dlna(Some(false), true, NonAnnoncee, false));
+        assert!(!dsd_suivant_tenu_sur_dlna(Some(false), true, Annoncee, true));
+        assert_eq!(
+            refus_dsd_suivant_sur_dlna(Some(false), true, Annoncee, true)
+                .map(RefusDsdSuivant::raison),
+            Some("deja_lache")
+        );
     }
 
     /// #6335 — le refus nomme la condition qui manque, une par cas.
     #[test]
     fn le_refus_dsd_suivant_nomme_la_condition_manquante_6335() {
         use AnnonceSuivante::*;
-        let r = |dsd, suivante, lache| refus_dsd_suivant_sur_dlna(dsd, suivante, lache);
+        let r = |dsd, suivante, lache| refus_dsd_suivant_sur_dlna(dsd, false, suivante, lache);
         assert_eq!(r(Some(true), Annoncee, false), None);
         assert_eq!(
             r(None, Annoncee, false).map(RefusDsdSuivant::raison),
