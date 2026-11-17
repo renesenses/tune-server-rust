@@ -594,37 +594,29 @@ pub(crate) fn retenir_le_journal(chemin: PathBuf) {
 /// journalctl. Les droits ne sont pas élargis : on écrit là où le service a
 /// déjà le droit d'écrire.
 ///
-/// Dans l'ordre :
-///   1. `$TUNE_DATA_DIR/logs/tune-server.log` — le dossier de données, que
-///      l'unité ouvre en écriture (`ReadWritePaths=/opt/tune/data` sur Tune
-///      OS) ;
-///   2. `temp_dir()/tune-<uid>/tune-server.log` — le dossier de travail du
-///      compte (#4770), jamais un `/tmp` partagé.
-pub(crate) fn replis_du_journal(
-    lire: &dyn Fn(&str) -> Option<String>,
-    temp: &Path,
-    uid: u32,
-) -> Vec<PathBuf> {
-    let mut replis = Vec::new();
-    if let Some(donnees) = lire("TUNE_DATA_DIR").filter(|s| !s.is_empty()) {
-        replis.push(PathBuf::from(donnees).join("logs").join("tune-server.log"));
-    }
-    replis.push(
-        tune_core::chemins_de_travail::racine_de_travail_sous(temp, "tune", uid)
-            .join("tune-server.log"),
-    );
-    replis
+/// UN SEUL repli : `$TUNE_DATA_DIR/logs/tune-server.log`, le dossier de
+/// données, que l'unité ouvre en écriture (`ReadWritePaths=/opt/tune/data` sur
+/// Tune OS). Le dossier est créé en 0700 et le fichier en 0600
+/// ([`crate::journal::ouvrir_le_premier_journal`]).
+///
+/// ⛔ Pas de repli sous `temp_dir()` : hors Tune OS c'est un `/tmp` PARTAGÉ
+/// entre comptes (pas de `PrivateTmp`), où un autre compte peut poser le
+/// dossier ou un lien d'avance, et où la rotation `.1` se joue en deux temps.
+/// Si le chemin par défaut et le dossier de données sont refusés, le journal
+/// ne va QUE sur la sortie standard (journald, `docker logs`), et
+/// `journal_emplacement_refuse` dit pourquoi.
+pub(crate) fn replis_du_journal(lire: &dyn Fn(&str) -> Option<String>) -> Vec<PathBuf> {
+    lire("TUNE_DATA_DIR")
+        .filter(|s| !s.is_empty())
+        .map(|donnees| PathBuf::from(donnees).join("logs").join("tune-server.log"))
+        .into_iter()
+        .collect()
 }
 
 /// [`replis_du_journal`] pour ce processus.
 pub(crate) fn replis_du_journal_courants() -> Vec<PathBuf> {
     let lire = |nom: &str| std::env::var(nom).ok();
-    replis_du_journal(
-        &lire,
-        // tmp-autorise: base seule : replis_du_journal y joint l'UID du compte (#4770).
-        &std::env::temp_dir(),
-        tune_core::chemins_de_travail::uid_courant(),
-    )
+    replis_du_journal(&lire)
 }
 
 /// L'emplacement **par défaut** du journal, `TUNE_LOG_FILE` mis de côté.
@@ -1027,30 +1019,29 @@ pub fn appliquer_plan_base_macos(config: &mut TuneConfig, plan: PlanBaseMacos) {
 mod listen_socket_tests {
     use super::*;
 
-    /// #8946 — les replis du journal : le dossier de données d'abord (ouvert
-    /// en écriture par l'unité de Tune OS), puis le dossier de travail du
-    /// compte ; jamais un `/tmp` partagé.
+    /// #8946 — le SEUL repli du journal est le dossier de données (ouvert en
+    /// écriture par l'unité de Tune OS) ; jamais `temp_dir()`, un `/tmp`
+    /// partagé hors Tune OS. Sans `TUNE_DATA_DIR`, aucun repli : la sortie
+    /// standard seule.
+    ///
+    /// Contre-épreuve : remettre le repli `temp_dir()/tune-<uid>` (première
+    /// version de la PR) donne deux replis, et un repli sans `TUNE_DATA_DIR`.
     #[test]
-    fn les_replis_du_journal_commencent_par_le_dossier_de_donnees_8946() {
-        let temp = Path::new("/t");
+    fn le_seul_repli_du_journal_est_le_dossier_de_donnees_8946() {
         let avec = |nom: &str| (nom == "TUNE_DATA_DIR").then(|| "/opt/tune/data".to_string());
-        let replis = replis_du_journal(&avec, temp, 1000);
         assert_eq!(
-            replis[0],
-            PathBuf::from("/opt/tune/data/logs/tune-server.log")
+            replis_du_journal(&avec),
+            vec![PathBuf::from("/opt/tune/data/logs/tune-server.log")]
         );
-        assert_eq!(
-            replis[1],
-            tune_core::chemins_de_travail::racine_de_travail_sous(temp, "tune", 1000)
-                .join("tune-server.log")
-        );
-        assert_eq!(replis.len(), 2);
-
         let vide = |nom: &str| (nom == "TUNE_DATA_DIR").then(String::new);
-        assert_eq!(
-            replis_du_journal(&vide, temp, 1000).len(),
-            1,
+        assert!(
+            replis_du_journal(&vide).is_empty(),
             "TUNE_DATA_DIR vide ignoré"
+        );
+        let rien = |_: &str| None;
+        assert!(
+            replis_du_journal(&rien).is_empty(),
+            "aucun repli sous temp_dir()"
         );
     }
 

@@ -91,10 +91,7 @@ impl JournalBorne {
     /// explicitement un journal illimité, et évite une division par zéro
     /// implicite dans la logique de seuil.
     pub fn ouvrir(chemin: PathBuf, plafond: u64) -> io::Result<Self> {
-        let fichier = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&chemin)?;
+        let fichier = ouvrir_en_ajout(&chemin)?;
         let ecrits = fichier.metadata().map(|m| m.len()).unwrap_or(0);
         Ok(Self {
             chemin,
@@ -143,11 +140,7 @@ impl JournalBorne {
                     self.seuil = self.seuil.saturating_add(self.plafond);
                 }
             }
-            if let Ok(neuf) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&self.chemin)
-            {
+            if let Ok(neuf) = ouvrir_en_ajout(&self.chemin) {
                 self.fichier = neuf;
                 self.adopte = false;
                 self.ecrits = 0;
@@ -162,11 +155,7 @@ impl JournalBorne {
             return;
         }
 
-        match std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.chemin)
-        {
+        match ouvrir_en_ajout(&self.chemin) {
             Ok(neuf) => {
                 self.fichier = neuf;
                 self.ecrits = 0;
@@ -303,6 +292,30 @@ pub fn la_console_ecrit_deja_dans(_chemin: &std::path::Path) -> bool {
     false
 }
 
+/// #8946 — le fichier de journal, ouvert en ajout ; CRÉÉ en 0600 sous Unix.
+///
+/// Le journal porte des chemins de la bibliothèque, des noms d'appareils, des
+/// adresses : il n'a pas à être lisible par les autres comptes. Le mode ne
+/// joue qu'à la création (un fichier existant garde le sien), donc au premier
+/// démarrage et à chaque rotation.
+fn ouvrir_en_ajout(chemin: &std::path::Path) -> io::Result<File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).append(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    options.open(chemin)
+}
+
+/// Le dossier du journal, créé en 0700 sous Unix (seuls les dossiers CRÉÉS
+/// ici prennent ce mode ; un dossier existant garde le sien).
+fn creer_le_dossier_du_journal(dossier: &std::path::Path) -> io::Result<()> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut b, 0o700);
+    b.create(dossier)
+}
+
 /// #8946 — ouvre le premier journal possible parmi `candidats`, dans l'ordre.
 ///
 /// Rend le journal ouvert et son chemin, plus chaque emplacement refusé avec
@@ -317,7 +330,7 @@ pub fn ouvrir_le_premier_journal(
     let mut refus = Vec::new();
     for chemin in candidats {
         if let Some(dossier) = chemin.parent() {
-            let _ = std::fs::create_dir_all(dossier);
+            let _ = creer_le_dossier_du_journal(dossier);
         }
         crate::config::rotate_log_file(&chemin, plafond);
         match JournalBorne::ouvrir(chemin.clone(), plafond) {
@@ -359,6 +372,34 @@ mod tests {
         );
         assert_eq!(refus.len(), 1, "{refus:?}");
         assert_eq!(refus[0].0, refuse);
+
+        // Le repli est PRIVÉ : dossier 0700, fichier 0600.
+        // Contre-épreuve : `create_dir_all` et `OpenOptions` sans mode (la
+        // première version de la PR) donnent 0755 / 0644 sous l'umask usuel.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = |p: &std::path::Path| {
+                std::fs::metadata(p)
+                    .expect("métadonnées")
+                    .permissions()
+                    .mode()
+                    & 0o777
+            };
+            assert_eq!(mode(repli.parent().unwrap()), 0o700, "dossier logs/");
+            assert_eq!(mode(&d.path().join("data")), 0o700, "dossier data/ créé");
+            assert_eq!(mode(&repli), 0o600, "fichier de journal");
+        }
+
+        // Tout refusé : aucun fichier, chaque refus rendu — l'appelant écrit
+        // alors sur la sortie standard seule et dit pourquoi.
+        let autre = home_protege.join("autre/tune-server.log");
+        let (rien, refus) = ouvrir_le_premier_journal([refuse.clone(), autre.clone()], 1024);
+        assert!(rien.is_none());
+        assert_eq!(
+            refus.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
+            vec![refuse, autre]
+        );
     }
 
     /// Un dossier temporaire à soi, sans dépendance : deux tests qui
