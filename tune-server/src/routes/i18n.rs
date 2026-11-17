@@ -7,7 +7,7 @@ use serde_json::{Value, json};
 use crate::state::AppState;
 
 const SUPPORTED_LOCALES: &[&str] = &[
-    "en", "fr", "de", "es", "it", "zh", "ko", "ja", "ro", "sv", "hu", "vi", "nb", "pl", "el",
+    "en", "fr", "de", "es", "it", "zh", "ko", "ja", "ro", "sv", "hu", "vi", "nb", "pl", "el", "tr",
 ];
 
 pub fn router() -> Router<AppState> {
@@ -875,6 +875,46 @@ fn get_translations(locale: &str) -> Value {
                 "finish": "Τέλος",
             },
         }),
+        "tr" => json!({
+            "common": {
+                "play": "Çal",
+                "pause": "Duraklat",
+                "stop": "Durdur",
+                "next": "Sonraki",
+                "previous": "Önceki",
+                "search": "Ara",
+                "settings": "Ayarlar",
+                "library": "Kitaplık",
+                "artists": "Sanatçılar",
+                "albums": "Albümler",
+                "tracks": "Parçalar",
+                "genres": "Türler",
+                "playlists": "Çalma listeleri",
+                "radios": "Radyolar",
+                "queue": "Çalma sırası",
+                "favorites": "Favoriler",
+                "history": "Geçmiş",
+                "volume": "Ses düzeyi",
+            },
+            "settings": {
+                "title": "Ayarlar",
+                "musicDirs": "Müzik klasörleri",
+                "streaming": "Akış hizmetleri",
+                "zones": "Bölgeler",
+                "system": "Sistem",
+            },
+            "onboarding": {
+                "welcome": "Tune'a hoş geldiniz!",
+                "addMusic": "Müzik ekle",
+                "connectStreaming": "Akış hizmetlerini bağla",
+                "setupZones": "Bölgeleri ayarla",
+                "createProfile": "Profil oluştur",
+                "complete": "Kurulum tamamlandı!",
+                "skip": "Atla",
+                "next": "İleri",
+                "finish": "Bitir",
+            },
+        }),
         "ro" => json!({
             "common": {
                 "play": "Redă",
@@ -1029,5 +1069,16 @@ mod tests {
         assert_eq!(get_translations("nb")["settings"]["zones"], "Soner");
         assert_eq!(get_translations("pl")["settings"]["zones"], "Strefy");
         assert_eq!(get_translations("el")["settings"]["zones"], "Ζώνες");
+    }
+
+    /// Le turc est une langue de l'interface (web#3170) : un `Accept-Language`
+    /// qui le demande l'obtient.
+    ///
+    /// Contre-épreuve : retirer `"tr"` de `SUPPORTED_LOCALES` fait rougir ce
+    /// test (l'en-tête retombe sur `"en"`).
+    #[test]
+    fn le_turc_est_detecte() {
+        assert_eq!(parse_accept_language("tr-TR,tr;q=0.9,en;q=0.5"), "tr");
+        assert_eq!(get_translations("tr")["settings"]["zones"], "Bölgeler");
     }
 }
