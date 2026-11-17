@@ -114,7 +114,9 @@ impl Ondes {
         let cible = self.chemin(cle);
         let provisoire = self.dossier.join(format!("{cle}.json.part"));
         let issue = std::fs::create_dir_all(&self.dossier)
-            .and_then(|()| std::fs::write(&provisoire, serde_json::to_vec(points).unwrap_or_default()))
+            .and_then(|()| {
+                std::fs::write(&provisoire, serde_json::to_vec(points).unwrap_or_default())
+            })
             .and_then(|()| std::fs::rename(&provisoire, &cible));
         if let Err(e) = issue {
             tracing::warn!(cle, error = %e, "onde_service_cache_non_ecrit");
@@ -149,7 +151,10 @@ impl Ondes {
                 }
                 _ => {}
             }
-            let en_route = suivi.values().filter(|s| matches!(s, Suivi::EnCours)).count();
+            let en_route = suivi
+                .values()
+                .filter(|s| matches!(s, Suivi::EnCours))
+                .count();
             if en_route >= CALCULS_EN_ROUTE_MAX {
                 return Etat::EnCours;
             }
@@ -234,9 +239,13 @@ pub(crate) async fn waveform(
     let a_calculer = piste.clone();
     let dossier_tmp = service::dossier_temporaire(&ondes.dossier);
     reponse(ondes.consulter(&piste, move || async move {
-        let audio =
-            service::telecharger(&state, &a_calculer, &dossier_tmp, Limites::de_l_environnement())
-                .await?;
+        let audio = service::telecharger(
+            &state,
+            &a_calculer,
+            &dossier_tmp,
+            Limites::de_l_environnement(),
+        )
+        .await?;
         let chemin = audio.chemin().to_string_lossy().into_owned();
         let points = tune_core::audio::analyzer::generate_waveform(&chemin, POINTS).await;
         // `audio` part ici : le fichier téléchargé est effacé.

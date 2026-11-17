@@ -37,7 +37,13 @@ async fn corps(r: Response) -> (StatusCode, serde_json::Value) {
 fn piste_de_service_depuis_le_service_et_son_identifiant() {
     assert!(PisteDeService::du_service("qobuz", "48098083").is_some());
     assert!(PisteDeService::du_service(" tidal ", " 123 ").is_some());
-    for (s, id) in [("spotify", "x"), ("radio", "1"), ("podcast", "1"), ("local", "1"), ("qobuz", "  ")] {
+    for (s, id) in [
+        ("spotify", "x"),
+        ("radio", "1"),
+        ("podcast", "1"),
+        ("local", "1"),
+        ("qobuz", "  "),
+    ] {
         assert!(PisteDeService::du_service(s, id).is_none(), "{s}/{id}");
     }
     assert_eq!(piste("1").cle(), piste("1").cle());
@@ -76,7 +82,9 @@ async fn une_seule_analyse_par_piste_pending_puis_prete_puis_cache_disque() {
 
     liberer.send(()).unwrap();
     laisser_finir().await;
-    let etat = ondes.consulter(&p, || async { panic!("déjà en cache : rien à recalculer") });
+    let etat = ondes.consulter(&p, || async {
+        panic!("déjà en cache : rien à recalculer")
+    });
     assert_eq!(etat, Etat::Prete(vec![0.1, 0.9, 0.4]));
 
     // Le cache est sur le DISQUE : un autre suivi (redémarrage) le relit.
@@ -92,7 +100,9 @@ async fn refus_definitif_retenu_echec_passager_retenu_puis_503() {
     let p = piste("1");
     ondes.consulter(&p, || async { Err(Refus::NonDiffusable) });
     laisser_finir().await;
-    let etat = ondes.consulter(&p, || async { panic!("refus définitif : jamais relancé") });
+    let etat = ondes.consulter(&p, || async {
+        panic!("refus définitif : jamais relancé")
+    });
     assert_eq!(etat, Etat::Refusee(Refus::NonDiffusable));
     let (statut, v) = corps(reponse(etat)).await;
     assert_eq!(statut, StatusCode::OK);
@@ -102,7 +112,9 @@ async fn refus_definitif_retenu_echec_passager_retenu_puis_503() {
     let q = piste("2");
     ondes.consulter(&q, || async { Err(Refus::DelaiDepasse) });
     laisser_finir().await;
-    let etat = ondes.consulter(&q, || async { panic!("échec passager : retenu deux minutes") });
+    let etat = ondes.consulter(&q, || async {
+        panic!("échec passager : retenu deux minutes")
+    });
     assert_eq!(etat, Etat::Refusee(Refus::DelaiDepasse));
     let (statut, _) = corps(reponse(etat)).await;
     assert_eq!(statut, StatusCode::SERVICE_UNAVAILABLE);
