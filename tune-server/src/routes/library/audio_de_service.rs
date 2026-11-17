@@ -80,15 +80,18 @@ impl PisteDeService {
     /// `None` : piste locale, service non pris en charge, ou piste sans
     /// identifiant de service.
     pub(crate) fn de(track: &Track) -> Option<Self> {
-        let service = track.source.trim();
+        Self::du_service(&track.source, track.source_id.as_deref()?)
+    }
+
+    /// La même chose depuis le service et l'identifiant chez lui, pour une
+    /// piste qui n'est pas en bibliothèque (la piste Qobuz ou TIDAL en
+    /// lecture : `current_track.source` et `source_id`).
+    pub(crate) fn du_service(service: &str, id_service: &str) -> Option<Self> {
+        let service = service.trim();
         if !SERVICES_ANALYSABLES.contains(&service) {
             return None;
         }
-        let id = track
-            .source_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())?;
+        let id = Some(id_service.trim()).filter(|s| !s.is_empty())?;
         let qualite = StreamingQualityPreference::Hires.service_token(service)?;
         Some(Self {
             service: service.to_string(),
@@ -154,7 +157,7 @@ impl Refus {
 
     /// Le texte de `error`. « track has no local file » reste celui d'une
     /// piste sans service analysable : un écran d'avant le reconnaît.
-    fn message(self) -> &'static str {
+    pub(crate) fn message(self) -> &'static str {
         match self {
             Self::NonPrisEnCharge | Self::SourceReseau => "track has no local file",
             Self::ServiceInactif => "streaming service disabled",
