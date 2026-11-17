@@ -22,6 +22,10 @@ async-trait = { workspace = true }
 # nouvelle copie dans Cargo.lock, et `wss://` pour un serveur derriere HTTPS.
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }
 
+[dev-dependencies]
+# Dossiers d'essai nettoyés par `Drop` (garde #3030, `aucune_fuite_de_temporaires`).
+tempfile = "3"
+
 # MPRIS vit sur le bus D-Bus de la session : Linux seulement. Le reste de la
 # caisse (etat, metadonnees, volume, requetes) compile et se teste partout.
 [target.'cfg(target_os = "linux")'.dependencies]

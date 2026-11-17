@@ -234,8 +234,8 @@ fn client(adresse: &str) -> ClientTune {
 
 #[tokio::test]
 async fn instantane_puis_evenements_de_la_zone_puis_pochette_en_cache() {
-    let cache = std::env::temp_dir().join(format!("tune-mpris-synchro-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&cache);
+    let racine = tempfile::tempdir().unwrap();
+    let cache = racine.path().to_path_buf();
     // Seul essai de ce binaire qui lit le cache : les autres servent des
     // pistes sans pochette.
     unsafe { std::env::set_var("XDG_CACHE_HOME", &cache) };
@@ -294,7 +294,6 @@ async fn instantane_puis_evenements_de_la_zone_puis_pochette_en_cache() {
     );
     assert!(vu.autorisations.len() >= 3, "{:?}", vu.autorisations);
     assert!(vu.autorisations.iter().all(|a| a == "Bearer jeton-d-essai"));
-    let _ = std::fs::remove_dir_all(&cache);
 }
 
 #[tokio::test]

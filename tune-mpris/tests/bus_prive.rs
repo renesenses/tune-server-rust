@@ -24,21 +24,20 @@ use zbus::{ObjectPath, OwnedVariant};
 struct BusPrive {
     processus: Child,
     adresse: String,
-    dossier: std::path::PathBuf,
+    /// Supprimé par son `Drop`, après l'arrêt du démon (ordre des champs).
+    _dossier: tempfile::TempDir,
 }
 
 impl Drop for BusPrive {
     fn drop(&mut self) {
         let _ = self.processus.kill();
         let _ = self.processus.wait();
-        let _ = std::fs::remove_dir_all(&self.dossier);
     }
 }
 
 fn lancer_bus() -> Option<BusPrive> {
-    let dossier = std::env::temp_dir().join(format!("tune-mpris-bus-{}", std::process::id()));
-    std::fs::create_dir_all(&dossier).ok()?;
-    let config = dossier.join("bus.conf");
+    let dossier = tempfile::tempdir().ok()?;
+    let config = dossier.path().join("bus.conf");
     std::fs::write(
         &config,
         format!(
@@ -55,7 +54,7 @@ fn lancer_bus() -> Option<BusPrive> {
   </policy>
 </busconfig>
 "#,
-            dossier.display()
+            dossier.path().display()
         ),
     )
     .ok()?;
@@ -79,7 +78,7 @@ fn lancer_bus() -> Option<BusPrive> {
     Some(BusPrive {
         processus,
         adresse: adresse.trim().to_string(),
-        dossier,
+        _dossier: dossier,
     })
 }
 

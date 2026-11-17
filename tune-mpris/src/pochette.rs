@@ -204,9 +204,8 @@ mod tests {
 
     #[test]
     fn une_pochette_rangee_se_retrouve_quel_que_soit_son_type() {
-        let dossier =
-            std::env::temp_dir().join(format!("tune-mpris-retrouve-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dossier);
+        let racine = tempfile::tempdir().unwrap();
+        let dossier = racine.path().join("cache");
         assert_eq!(deja_en_cache(&dossier, "http://x/p"), None);
         let ecrit = ranger(
             &dossier,
@@ -216,13 +215,12 @@ mod tests {
         .unwrap();
         assert_eq!(deja_en_cache(&dossier, "http://x/p"), Some(ecrit));
         assert_eq!(deja_en_cache(&dossier, "http://x/autre"), None);
-        let _ = std::fs::remove_dir_all(&dossier);
     }
 
     #[test]
     fn un_part_abandonne_est_retire_un_part_frais_garde() {
-        let dossier = std::env::temp_dir().join(format!("tune-mpris-part-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dossier);
+        let racine = tempfile::tempdir().unwrap();
+        let dossier = racine.path().join("cache");
         std::fs::create_dir_all(&dossier).unwrap();
         let vieux = dossier.join(".a.jpg.part");
         let frais = dossier.join(".b.jpg.part");
@@ -237,7 +235,6 @@ mod tests {
         retirer_les_part_abandonnes(&dossier, PART_ABANDONNE);
         assert!(!vieux.exists());
         assert!(frais.exists());
-        let _ = std::fs::remove_dir_all(&dossier);
     }
 
     #[test]
@@ -250,8 +247,8 @@ mod tests {
 
     #[test]
     fn le_cache_garde_les_plus_recentes() {
-        let dossier = std::env::temp_dir().join(format!("tune-mpris-essai-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dossier);
+        let racine = tempfile::tempdir().unwrap();
+        let dossier = racine.path().join("cache");
         for i in 0..(POCHETTES_GARDEES + 3) {
             ranger(&dossier, &format!("{i:03}.jpg"), b"x").unwrap();
             // L'ordre se lit sur la date de modification.
@@ -272,6 +269,5 @@ mod tests {
                 .join(format!("{:03}.jpg", POCHETTES_GARDEES + 2))
                 .exists()
         );
-        let _ = std::fs::remove_dir_all(&dossier);
     }
 }
