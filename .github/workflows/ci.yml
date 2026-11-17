@@ -399,7 +399,7 @@ jobs:
     needs: impact
     if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true' && needs.impact.outputs.livre == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45  # test-shipped-features — ~5 min observe
+    timeout-minutes: 75  # compilation + suite complete : coupures observees a 45 min
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
