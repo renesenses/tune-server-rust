@@ -219,6 +219,10 @@ impl PlaybackOrchestrator {
             renderer_ne_lit_plus = bilan.renderer_ne_lit_plus,
             radios_fermees_par_le_serveur = congedies,
             consommateurs_restants = consommateurs(&sessions),
+            consommateurs_en_ecriture = sessions
+                .iter()
+                .map(|s| s.consommateurs_radio_en_ecriture.load(Ordering::Relaxed))
+                .sum::<u32>(),
             "dlna_sortie_de_radio"
         );
         Some(bilan)

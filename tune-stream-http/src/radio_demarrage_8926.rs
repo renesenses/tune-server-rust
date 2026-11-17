@@ -393,19 +393,22 @@ async fn la_premiere_connexion_ne_change_pas() {
     );
 }
 
-/// #8926 — sortie de radio : un renderer arrêté qui ne lit plus. Le corps de
-/// la radio est arrêté sur l'écriture (tampon TCP plein) : le congé de #7021
-/// ne l'atteint pas. L'attente ne doit plus durer les 2 s du délai.
+/// #8926 — sortie de radio, de bout en bout sur la boucle locale : un
+/// renderer qui garde sa connexion et ne lit plus (canal immobile 1 s). Ce
+/// banc ne reproduit PAS le blocage du .18 : sur la boucle locale, le réveil
+/// du congé suffit à faire relancer le corps par hyper, qui part en ~20 ms.
+/// Il garde que la sortie ne régresse pas sur ce chemin. Le blocage du .18
+/// (corps jamais relancé, `consommateurs_restants=1` après 2 s) est modelé
+/// dans `sortie_de_radio_dlna_6130_tests`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn sortie_de_radio_un_renderer_qui_ne_lit_plus_n_attend_plus_deux_secondes() {
+async fn sortie_de_radio_un_renderer_qui_ne_lit_plus_ne_retient_pas_la_sortie() {
     let (attente, depasse, ne_lit_plus) = sortie_de_radio(false).await;
     eprintln!(
-        "[banc 8926] sortie de radio, renderer arrêté : attente {} ms, delai_depasse={depasse}, \
-         renderer_ne_lit_plus={ne_lit_plus}",
+        "[banc 8926] sortie de radio, renderer arrêté (boucle locale) : attente {} ms, \
+         delai_depasse={depasse}, renderer_ne_lit_plus={ne_lit_plus}",
         ms(attente)
     );
-    assert!(!depasse, "l'attente ne doit plus épuiser le délai de 2 s");
-    assert!(ne_lit_plus);
+    assert!(!depasse, "l'attente ne doit pas épuiser le délai de 2 s");
     assert!(
         attente < Duration::from_millis(700),
         "attente de {} ms",
