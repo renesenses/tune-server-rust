@@ -499,6 +499,7 @@ async fn le_chemin_des_services_garde_une_seule_passe_2742() {
         // Le fait que les bras des services posent sur leur session.
         annonce_crossfeed: chaine.is_active() && chaine.crossfeed_executable(),
         annonce_compensation: chaine.compensation_cuite_db(),
+        annonce_reaffectation: chaine.reaffectation_executable(),
     };
     journal("services", &s);
     porte_le_crossfeed_une_fois("services", &s);
