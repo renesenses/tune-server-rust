@@ -9,6 +9,10 @@
 //! côté client — avec cette fiche mémorisée. Une panne de Qobuz n'est PAS un
 //! retrait : la ligne n'est pas grisée.
 //!
+//! La mémorisation vise la ligne (`entry_id`) de la playlist affichée, en une
+//! transaction, en tâche de fond : la réponse ne l'attend pas. Un second
+//! affichage n'écrit plus rien.
+//!
 //! Contre-épreuve : sans `memoriser`, la seconde lecture rend la ligne sans
 //! artiste ni album ni pochette ; sans `retires`, elle n'est pas grisée.
 use axum::body::{Body, to_bytes};
@@ -181,6 +185,26 @@ async fn lignes(b: &Banc) -> Vec<Value> {
     serde_json::from_slice(&corps).unwrap()
 }
 
+/// Un affichage, comme `GET …/tracks`, dont on ATTEND la mémorisation de
+/// fond : rend les lignes et le nombre de lignes réécrites.
+async fn afficher_et_memoriser(b: &Banc) -> (Vec<Value>, usize) {
+    b.state.metadonnees_playlists.vider().await;
+    let mut items: Vec<Value> = super::lignes_et_identifiants(&b.state, b.pid)
+        .unwrap()
+        .into_iter()
+        .map(|(entry_id, mut v)| {
+            v["entry_id"] = serde_json::json!(entry_id);
+            v
+        })
+        .collect();
+    let tache = super::metadonnees_7738::completer(&b.state, b.pid, &mut items).await;
+    let ecrites = match tache {
+        Some(t) => t.await.unwrap(),
+        None => 0,
+    };
+    (items, ecrites)
+}
+
 fn ligne_enregistree(b: &Banc) -> ServiceEntry {
     PlaylistRepo::with_backend(b.state.backend.clone())
         .get_entries(b.pid)
@@ -196,7 +220,8 @@ fn ligne_enregistree(b: &Banc) -> ServiceEntry {
 #[tokio::test]
 async fn la_fiche_resolue_est_memorisee_sur_la_ligne_8892() {
     let b = banc().await;
-    let _ = lignes(&b).await;
+    let (_, ecrites) = afficher_et_memoriser(&b).await;
+    assert_eq!(ecrites, 1, "la ligne est réécrite une fois");
     let s = ligne_enregistree(&b);
     assert_eq!(s.artist.as_deref(), Some("Prince"), "artiste mémorisé");
     assert_eq!(s.album.as_deref(), Some("Parade"), "album mémorisé");
@@ -204,12 +229,14 @@ async fn la_fiche_resolue_est_memorisee_sur_la_ligne_8892() {
     assert_eq!(s.cover_url.as_deref(), Some(POCHETTE), "pochette mémorisée");
     assert_eq!(s.duration_ms, Some(226_000));
     assert_eq!(s.title, "Kiss", "le titre du fichier n'est jamais réécrit");
+    let (_, encore) = afficher_et_memoriser(&b).await;
+    assert_eq!(encore, 0, "un second affichage n'écrit plus rien");
 }
 
 #[tokio::test]
 async fn un_titre_retire_de_qobuz_garde_sa_fiche_et_est_grise_8892() {
     let b = banc().await;
-    let _ = lignes(&b).await;
+    let _ = afficher_et_memoriser(&b).await;
     b.etat.store(RETIRE, Ordering::SeqCst);
     let v = lignes(&b).await;
     let l = &v[0];
@@ -227,7 +254,7 @@ async fn un_titre_retire_de_qobuz_garde_sa_fiche_et_est_grise_8892() {
 #[tokio::test]
 async fn une_panne_de_qobuz_n_est_pas_un_retrait_8892() {
     let b = banc().await;
-    let _ = lignes(&b).await;
+    let _ = afficher_et_memoriser(&b).await;
     b.etat.store(EN_PANNE, Ordering::SeqCst);
     let v = lignes(&b).await;
     let l = &v[0];

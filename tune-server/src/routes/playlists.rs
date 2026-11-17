@@ -503,7 +503,8 @@ async fn get_tracks(
             v
         })
         .collect();
-    metadonnees_7738::completer(&state, &mut items).await;
+    // #8892 — la mémorisation des fiches se poursuit en tâche de fond.
+    let _memorisation = metadonnees_7738::completer(&state, id, &mut items).await;
     attacher_ecoutes_des_lignes(&state, &mut items);
     // #4806 — un titre banni reste DANS la playlist, grisé : `banned` le dit.
     // Une ligne de service (`id` nul) n'est jamais bannie : le bannissement

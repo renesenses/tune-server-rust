@@ -250,11 +250,28 @@ fn endpoint_order(proxy_first: bool) -> (&'static str, &'static str) {
 ///
 /// Tout le reste garde la variante d'avant (`Other`, via `From<String>`) et
 /// donc son 502 : une vraie panne d'amont reste une panne d'amont.
+///
+/// #8892 — seul un 404 dont le corps est le JSON d'erreur de l'API Qobuz
+/// (`"code": 404`) vaut « introuvable » : un 404 HTML d'un relais ou de la
+/// périphérie Akamai reste une panne. Un titre ainsi « introuvable » est
+/// grisé dans les playlists : il ne faut pas griser sur une panne.
 fn erreur_de_fiche((statut, message): (Option<u16>, String)) -> TuneError {
     match statut {
-        Some(404) => TuneError::NotFound(message),
+        Some(404) if introuvable_selon_l_api(&message) => TuneError::NotFound(message),
         _ => TuneError::from(message),
     }
+}
+
+/// Le message d'échec (`qobuz {path}: 404 {corps}`) porte-t-il le JSON
+/// d'erreur de l'API Qobuz, `{"status":"error","code":404,…}` ? (#8892)
+fn introuvable_selon_l_api(message: &str) -> bool {
+    let Some(debut) = message.find('{') else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&message[debut..])
+        .ok()
+        .and_then(|corps| corps.get("code").and_then(serde_json::Value::as_i64))
+        == Some(404)
 }
 
 /// Error from a single API attempt against one base URL.
@@ -5922,6 +5939,11 @@ mod tests {
                         StatusCode::NOT_FOUND,
                         r#"{"status":"error","code":404,"message":"No result matching given argument"}"#,
                     ),
+                    // Un 404 HTML (relais, périphérie Akamai) : une panne.
+                    Some("relais") => (
+                        StatusCode::NOT_FOUND,
+                        "<html><body><h1>404 Not Found</h1>nginx</body></html>",
+                    ),
                     _ => (
                         StatusCode::BAD_REQUEST,
                         r#"{"status":"error","code":400,"message":"Invalid argument"}"#,
@@ -5947,6 +5969,11 @@ mod tests {
         assert!(
             !matches!(refus, TuneError::NotFound(_)),
             "un 400 n'est pas « introuvable » : {refus:?}"
+        );
+        let relais = svc.get_track("relais").await.unwrap_err();
+        assert!(
+            !matches!(relais, TuneError::NotFound(_)),
+            "un 404 HTML n'est pas « introuvable » : {relais:?}"
         );
     }
 

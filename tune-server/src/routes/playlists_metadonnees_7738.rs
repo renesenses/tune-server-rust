@@ -21,18 +21,31 @@ impl Cache {
     }
 }
 
-pub(super) async fn completer(state: &AppState, items: &mut [Value]) {
-    completer_service(state, items, "qobuz").await;
+/// Complète les lignes de service `items` de la playlist `playlist_id`.
+/// Rend la tâche de fond qui mémorise les fiches Qobuz résolues (#8892) —
+/// la réponse ne l'attend pas ; les tests, si.
+pub(super) async fn completer(
+    state: &AppState,
+    playlist_id: i64,
+    items: &mut [Value],
+) -> Option<tokio::task::JoinHandle<usize>> {
+    let memorisation = completer_service(state, playlist_id, items, "qobuz").await;
     // #8066 — TIDAL : seule la disponibilité est reportée sur la ligne, pour
     // que le client grise un titre indisponible (`disponible: false`) et
     // propose « Remplacer l'indisponible ». Le reste de la ligne ne change
     // pas.
-    completer_service(state, items, "tidal").await;
+    completer_service(state, playlist_id, items, "tidal").await;
+    memorisation
 }
 
-async fn completer_service(state: &AppState, items: &mut [Value], nom: &'static str) {
+async fn completer_service(
+    state: &AppState,
+    playlist_id: i64,
+    items: &mut [Value],
+    nom: &'static str,
+) -> Option<tokio::task::JoinHandle<usize>> {
     if !items.iter().any(|v| v["source"] == nom) {
-        return;
+        return None;
     }
     let ids = items
         .iter()
@@ -43,8 +56,8 @@ async fn completer_service(state: &AppState, items: &mut [Value], nom: &'static 
         connues: connus,
         retires,
     } = fiches_du_service(state, nom, ids, Duration::from_secs(30)).await;
-    // #8892 — les fiches à mémoriser sur les lignes, une fois par titre.
-    let mut a_memoriser: HashMap<String, FicheDeService> = HashMap::new();
+    // #8892 — les fiches à mémoriser, ligne par ligne (`entry_id`).
+    let mut a_memoriser: Vec<(i64, FicheDeService)> = Vec::new();
     for ligne in items {
         if ligne["source"] != nom {
             continue;
@@ -65,9 +78,10 @@ async fn completer_service(state: &AppState, items: &mut [Value], nom: &'static 
             continue;
         };
         if nom == "qobuz"
+            && let Some(entry_id) = ligne["entry_id"].as_i64()
             && let Some(fiche) = fiche_a_memoriser(ligne, piste)
         {
-            a_memoriser.insert(piste.id.clone(), fiche);
+            a_memoriser.push((entry_id, fiche));
         }
         if nom != "qobuz" {
             if let (Some(d), Some(objet)) = (piste.disponible, ligne.as_object_mut()) {
@@ -95,7 +109,7 @@ async fn completer_service(state: &AppState, items: &mut [Value], nom: &'static 
             }
         }
     }
-    memoriser(state, nom, a_memoriser);
+    memoriser(state, playlist_id, a_memoriser)
 }
 
 /// #8892 — ce que la fiche `piste` apprend de plus que la ligne enregistrée
@@ -118,20 +132,31 @@ fn fiche_a_memoriser(ligne: &Value, piste: &StreamTrack) -> Option<FicheDeServic
     (fiche != FicheDeService::default()).then_some(fiche)
 }
 
-/// #8892 — écrit les fiches résolues sur les lignes de playlist du service
-/// `nom` : quand le titre deviendra indisponible, la ligne gardera ce que
-/// sa dernière résolution réussie avait appris. Une erreur d'écriture est
-/// journalisée ; l'affichage n'en dépend pas.
-fn memoriser(state: &AppState, nom: &str, fiches: HashMap<String, FicheDeService>) {
+/// #8892 — écrit les fiches résolues sur leurs lignes de la playlist
+/// `playlist_id` : quand le titre deviendra indisponible, la ligne gardera ce
+/// que sa dernière résolution réussie avait appris. Une seule transaction,
+/// sur un fil bloquant, EN TÂCHE DE FOND : la réponse n'attend pas la base
+/// (un scan qui la tient ne fait pas pendre l'affichage). Une erreur
+/// d'écriture est journalisée, jamais renvoyée. Rend le nombre de lignes
+/// réécrites (0 en cas d'erreur).
+fn memoriser(
+    state: &AppState,
+    playlist_id: i64,
+    fiches: Vec<(i64, FicheDeService)>,
+) -> Option<tokio::task::JoinHandle<usize>> {
     if fiches.is_empty() {
-        return;
+        return None;
     }
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    for (source_id, fiche) in fiches {
-        if let Err(e) = repo.memoriser_fiche_de_service(nom, &source_id, &fiche) {
-            tracing::warn!(service = nom, source_id, error = %e, "playlist_fiche_non_memorisee");
+    Some(tokio::task::spawn_blocking(move || {
+        match repo.memoriser_fiches_de_lignes(playlist_id, &fiches) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(playlist_id, error = %e, "playlist_fiches_non_memorisees");
+                0
+            }
         }
-    }
+    }))
 }
 
 /// Les fiches lues chez un service : celles qu'il a rendues, et les
