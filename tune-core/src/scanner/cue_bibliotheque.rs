@@ -100,6 +100,14 @@ pub struct BilanCue {
     /// Tranches que la confrontation aurait retirées, mais que le plafond de
     /// purge a refusées : rien n'a été retiré (#5108).
     pub confrontation_refusee: usize,
+    /// #9014 — tranches dont la feuille relue a DÉPLACÉ le début : la ligne
+    /// existante est recalée sur le nouveau début plutôt que recréée, et garde
+    /// son id (écoutes, favoris, listes, signets, empreintes).
+    pub tranches_recalees: usize,
+    /// #9014 — lignes dont les bornes `cue_start_ms`/`cue_end_ms` ont
+    /// réellement changé à cette passe. Zéro sur un rescan sans changement :
+    /// l'écriture est conditionnelle.
+    pub bornes_corrigees: usize,
     /// Écritures refusées par la base. Jamais fatales : une feuille bancale ne
     /// doit pas emporter le scan.
     pub echecs: usize,
@@ -688,6 +696,38 @@ fn duree_de_la_tranche(piste: &PisteCue, sonde: SondeImage) -> i64 {
     (fin - debut).max(0)
 }
 
+/// #9014 — la ligne en base que la feuille relue a DÉPLACÉE, s'il y en a une
+/// et une seule.
+///
+/// Appelée quand `(cue_media_path, cue_start_ms)` ne répond pas. Une ligne est
+/// retenue si elle porte la même image et le même numéro de piste, et si son
+/// début n'est décrit par AUCUNE piste de la feuille (sinon elle appartient à
+/// une autre piste, ou y sera retrouvée par son identité). Deux candidates ou
+/// plus : rien n'est deviné, la piste est créée comme avant et la
+/// confrontation (#5108) range le reste.
+///
+/// C'est le cas des albums scannés avant le correctif de l'`INDEX 02` : la
+/// tranche était née au début de l'`INDEX 02`, la feuille relue la décrit à
+/// son `INDEX 01`. La recréer aurait perdu tout ce qui pend à son id.
+fn tranche_deplacee(
+    track_repo: &TrackRepo,
+    media: &str,
+    numero: u32,
+    debuts_decrits: &HashSet<(String, i64)>,
+) -> Option<Track> {
+    let tranches = track_repo.tranches_cue_du_media(media).ok()?;
+    let mut candidates = tranches
+        .into_iter()
+        .filter(|(_, debut)| !debuts_decrits.contains(&(media.to_string(), *debut)))
+        .filter_map(|(id, _)| track_repo.get(id).ok().flatten())
+        .filter(|t| t.track_number == numero as i32);
+    let unique = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    Some(unique)
+}
+
 /// Reprend, sur la ligne déjà en base, ce qu'une feuille CUE ne sait pas dire.
 ///
 /// Une feuille porte des titres, des interprètes, un genre, une année. Elle ne
@@ -1187,6 +1227,13 @@ fn ecrire_album_avec(
     let mut images_decoupees: HashSet<PathBuf> = HashSet::new();
     // Les pistes écrites, pour leurs métadonnées étendues (#5463).
     let mut a_completer: Vec<(Option<i64>, &PisteCue, bool)> = Vec::new();
+    // #9014 — les débuts que la feuille décrit, par image : une ligne en base
+    // dont le début y figure appartient à SA piste et n'est jamais recalée.
+    let debuts_decrits: HashSet<(String, i64)> = album
+        .pistes
+        .iter()
+        .map(|p| (p.media.to_string_lossy().into_owned(), p.debut_ms as i64))
+        .collect();
 
     for piste in &album.pistes {
         let sonde = match imposition {
@@ -1277,6 +1324,23 @@ fn ecrire_album_avec(
         } else {
             None
         };
+        // #9014 — ni l'identité ni le chemin ne répondent : la feuille a peut-
+        // être DÉPLACÉ le début de cette piste (ancien parseur qui prenait
+        // l'`INDEX 02`, `INDEX 01` retouché). Recréer la piste perdrait son
+        // historique — écoutes, favoris, listes, signets, empreintes, tous
+        // accrochés à l'id. On recale la ligne existante quand elle est
+        // désignée SANS ambiguïté (voir `tranche_deplacee`).
+        let par_cue = match (par_cue, &par_chemin) {
+            (None, None) => {
+                let recalee = tranche_deplacee(track_repo, &media, piste.numero, &debuts_decrits);
+                if recalee.is_some() {
+                    bilan.tranches_recalees += 1;
+                    info!(media = %media, numero = piste.numero, debut, "cue_tranche_recalee — début déplacé par la feuille, la ligne garde son id");
+                }
+                recalee
+            }
+            (cue, _) => cue,
+        };
         let deja_la = match (par_chemin, par_cue) {
             (Some(chemin), Some(cue)) if chemin.id != cue.id => {
                 if let Some(id) = cue.id
@@ -1299,18 +1363,26 @@ fn ecrire_album_avec(
         match deja_la {
             Some(existante) => {
                 ligne.id = existante.id;
+                // Les bornes ne se posent que sur une TRANCHE en base : la
+                // ligne du scan ordinaire adoptée par son chemin garde ses
+                // colonnes `cue_*` telles qu'elles sont.
+                let tranche_en_base = existante.cue_media_path.is_some();
                 reprendre_l_acquis(&mut ligne, &existante);
-                // #9014 — `update` ne touche pas aux colonnes `cue_*` : la
-                // fin de la tranche est posée à part, sans quoi un début
-                // corrigé sur la piste suivante laissait celle-ci déborder.
+                // #9014 — `update` ne touche pas aux colonnes `cue_*` : les
+                // bornes sont posées à part, et SEULEMENT si elles changent
+                // (un rescan sans changement n'écrit rien de plus). Sans
+                // cela, un début corrigé sur la piste suivante laissait
+                // celle-ci déborder, et une tranche recalée gardait son
+                // ancien début.
                 let maj = track_repo.update(&ligne).and_then(|()| match ligne.id {
-                    Some(id) if ligne.cue_media_path.is_some() => {
-                        track_repo.poser_fin_de_tranche(id, ligne.cue_end_ms)
+                    Some(id) if tranche_en_base => {
+                        track_repo.poser_bornes_de_tranche(id, debut, ligne.cue_end_ms)
                     }
-                    _ => Ok(()),
+                    _ => Ok(0),
                 });
                 match maj {
-                    Ok(()) => {
+                    Ok(changees) => {
+                        bilan.bornes_corrigees += changees;
                         bilan.pistes_mises_a_jour += 1;
                         ecrites += 1;
                         a_completer.push((ligne.id, piste, fichier_entier));
@@ -2492,17 +2564,46 @@ mod tests {
         assert_eq!(debuts(&db, &image), vec![0, 2_000]);
     }
 
-    /// #9014 — un album scanné AVANT le correctif garde en base les bornes que
-    /// l'`INDEX 02` avait faussées. Le scan suivant relit la feuille (même
-    /// inchangée : l'étape CUE ne passe pas par le pré-filtre incrémental), et
-    /// la confrontation remet tout d'aplomb : la tranche née de l'`INDEX 02`
-    /// part, celle de l'`INDEX 01` la remplace, et la piste d'avant retrouve
-    /// sa fin.
-    #[test]
-    fn le_scan_suivant_corrige_les_bornes_faussees_par_un_index_02_9014() {
-        let d = tempfile::TempDir::new().unwrap();
-        let (dossier, image) = album_simple(d.path());
-        let db = base_fichier(d.path());
+    /// #9014 — le témoin commun SQLite / PostgreSQL.
+    ///
+    /// Un album scanné AVANT le correctif garde en base la tranche née de
+    /// l'`INDEX 02`, avec un favori, une entrée de liste et une écoute. Le
+    /// scan suivant relit la feuille (même inchangée : l'étape CUE ne passe pas
+    /// par le pré-filtre incrémental) et RECALE cette ligne sur son `INDEX 01` :
+    /// même id, bornes justes, historique intact, aucun doublon. Un rescan
+    /// sans changement ne modifie ensuite aucune borne.
+    pub(super) fn temoin_rescan_garde_l_historique_9014(db: Arc<dyn DbBackend>, racine: &Path) {
+        use crate::db::engine::Engine;
+        use crate::db::history_repo::{HistoryRepo, ListenRecord};
+        use crate::db::playlist_repo::PlaylistRepo;
+
+        let (dossier, image) = album_simple(racine);
+        let media = image.to_string_lossy().into_owned();
+        let ph = |n: usize| match db.engine() {
+            Engine::Postgres => format!("${n}"),
+            Engine::Sqlite => format!("?{n}"),
+        };
+        let compter = |sql: &str, id: i64| -> i64 {
+            let params: [&dyn crate::db::backend::ToSqlValue; 1] = [&id];
+            db.query_one(sql, &params)
+                .unwrap()
+                .and_then(|l| l.first().and_then(|v| v.as_i64()))
+                .unwrap_or(-1)
+        };
+        let confronter = || {
+            let vus = vec![image.clone()];
+            inventorier_ecrire_et_confronter(
+                db.clone(),
+                std::slice::from_ref(&dossier),
+                &racines(racine),
+                &ConfrontationDuScan {
+                    fichiers_vus: &vus,
+                    trop_massive: &jamais,
+                },
+            )
+            .1
+        };
+
         // Ce que l'ancien parseur rangeait : la piste 2 commençait à son
         // INDEX 02 (00:02:00) au lieu de son INDEX 01 (00:01:00).
         fs::write(
@@ -2510,16 +2611,40 @@ mod tests {
             FEUILLE.replace("INDEX 01 00:01:00", "INDEX 01 00:02:00"),
         )
         .unwrap();
-        inventorier_et_ecrire(
-            db.clone(),
-            std::slice::from_ref(&dossier),
-            &racines(d.path()),
-        );
+        inventorier_et_ecrire(db.clone(), std::slice::from_ref(&dossier), &racines(racine));
         assert_eq!(
             debuts(&db, &image),
             vec![0, 2_000],
             "montage : base faussée"
         );
+        let repo = TrackRepo::with_backend(db.clone());
+        let fautive = repo
+            .get_by_cue_identity(&media, 2_000)
+            .unwrap()
+            .and_then(|t| t.id)
+            .expect("montage : la tranche fautive");
+
+        db.execute(
+            &format!(
+                "INSERT INTO favorites (profile_id, item_type, item_id) VALUES (1, 'track', {})",
+                ph(1)
+            ),
+            &[&fautive],
+        )
+        .unwrap();
+        let listes = PlaylistRepo::with_backend(db.clone());
+        let liste = listes.create("Témoin 9014", None, 1).unwrap();
+        listes.add_tracks(liste, &[fautive], None).unwrap();
+        HistoryRepo::with_backend(db.clone())
+            .record(&ListenRecord {
+                track_id: Some(fautive),
+                title: "Variatio 1".into(),
+                source: "local".into(),
+                duration_ms: 2_000,
+                profile_id: Some(1),
+                ..Default::default()
+            })
+            .unwrap();
 
         // La feuille réelle, telle qu'elle est sur le disque.
         fs::write(
@@ -2530,20 +2655,16 @@ mod tests {
             ),
         )
         .unwrap();
-        let vus = vec![image.clone()];
-        let (_, bilan, _) = inventorier_ecrire_et_confronter(
-            db.clone(),
-            &[dossier],
-            &racines(d.path()),
-            &ConfrontationDuScan {
-                fichiers_vus: &vus,
-                trop_massive: &jamais,
-            },
+        let bilan = confronter();
+        assert_eq!(bilan.tranches_recalees, 1, "bilan : {bilan:?}");
+        assert_eq!(bilan.pistes_creees, 0, "bilan : {bilan:?}");
+        assert_eq!(bilan.tranches_retirees, 0, "bilan : {bilan:?}");
+        assert_eq!(
+            bilan.bornes_corrigees, 2,
+            "fin de la 1, début de la 2 : {bilan:?}"
         );
-        assert_eq!(bilan.tranches_retirees, 1, "bilan : {bilan:?}");
-        assert_eq!(debuts(&db, &image), vec![0, 1_000]);
-        let repo = TrackRepo::with_backend(db.clone());
-        let media = image.to_string_lossy();
+        assert_eq!(debuts(&db, &image), vec![0, 1_000], "aucun doublon");
+
         let aria = repo.get_by_cue_identity(&media, 0).unwrap().unwrap();
         assert_eq!(
             aria.cue_end_ms,
@@ -2551,7 +2672,94 @@ mod tests {
             "fin de la piste 1 = INDEX 01 de la 2"
         );
         let variatio = repo.get_by_cue_identity(&media, 1_000).unwrap().unwrap();
+        assert_eq!(variatio.id, Some(fautive), "la ligne garde son id");
         assert_eq!(variatio.cue_end_ms, None);
+        assert_eq!(
+            variatio.duration_ms, 3_000,
+            "durée recalculée sur les bornes justes"
+        );
+
+        let p1 = ph(1);
+        assert_eq!(
+            compter(
+                &format!(
+                    "SELECT COUNT(*) FROM favorites WHERE item_type = 'track' AND item_id = {p1}"
+                ),
+                fautive
+            ),
+            1,
+            "le favori tient"
+        );
+        assert_eq!(
+            compter(
+                &format!("SELECT COUNT(*) FROM playlist_tracks WHERE track_id = {p1}"),
+                fautive
+            ),
+            1,
+            "l'entrée de liste tient"
+        );
+        assert_eq!(
+            compter(
+                &format!("SELECT COUNT(*) FROM listen_history WHERE track_id = {p1}"),
+                fautive
+            ),
+            1,
+            "l'écoute tient"
+        );
+
+        // Rescan sans changement : aucune borne réécrite.
+        let calme = confronter();
+        assert_eq!(calme.bornes_corrigees, 0, "bilan : {calme:?}");
+        assert_eq!(calme.tranches_recalees, 0, "bilan : {calme:?}");
+        assert_eq!(calme.pistes_creees, 0, "bilan : {calme:?}");
+        assert_eq!(calme.tranches_retirees, 0, "bilan : {calme:?}");
+        assert_eq!(debuts(&db, &image), vec![0, 1_000]);
+
+        // Nettoyage (utile sur une base PostgreSQL partagée).
+        let _ = listes.delete(liste);
+        for (id, _) in repo.tranches_cue_du_media(&media).unwrap() {
+            let _ = db.execute(
+                &format!("DELETE FROM favorites WHERE item_type = 'track' AND item_id = {p1}"),
+                &[&id],
+            );
+            let _ = db.execute(
+                &format!("DELETE FROM listen_history WHERE track_id = {p1}"),
+                &[&id],
+            );
+            let _ = repo.delete(id);
+        }
+    }
+
+    #[test]
+    fn le_rescan_recale_la_tranche_et_garde_son_historique_9014() {
+        let d = tempfile::TempDir::new().unwrap();
+        let db = base_fichier(d.path());
+        temoin_rescan_garde_l_historique_9014(db, d.path());
+    }
+
+    /// #9014 — le même témoin sur un vrai PostgreSQL (`IS DISTINCT FROM`).
+    /// Saute sans `TUNE_TEST_PG_URL` ; étape dédiée dans `test-postgres.yml`.
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_9014_le_rescan_recale_la_tranche_et_garde_son_historique() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT : TUNE_TEST_PG_URL non posée");
+            return;
+        };
+        let pool = sqlx::PgPool::connect(&url).await.expect("connexion PG");
+        for sql in crate::db::postgres::ENSURE_TABLES
+            .iter()
+            .chain(crate::db::postgres::ENSURE_COLUMNS.iter())
+        {
+            let _ = sqlx::raw_sql(*sql).execute(&pool).await;
+        }
+        crate::db::migrations::run_pg_migrations(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("run_pg_migrations : {e}"));
+        let db: Arc<dyn DbBackend> =
+            Arc::new(crate::db::backend::PostgresBackend::new(pool.clone()));
+        let d = tempfile::TempDir::new().unwrap();
+        temoin_rescan_garde_l_historique_9014(db, d.path());
     }
 
     /// #5108 — feuille supprimée : le dossier n'est confronté que si le
