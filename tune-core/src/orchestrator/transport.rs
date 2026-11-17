@@ -590,7 +590,12 @@ impl PlaybackOrchestrator {
         // à l'absence, une énumération à la demande, bornée dans le temps, et
         // seulement ici — au plus une fois par clic. L'appareil revenu passe
         // comme un parc vide (#3737) : `recreate_local_and_play` l'ouvre.
-        if self
+        //
+        // 🔴 #8171 (fil 2708, Windows, ASIO configuré) — l'appareil retrouvé
+        // est ENREGISTRÉ ici, avec l'hôte qui l'a énuméré : laissé à
+        // `recreate_local_and_play`, un nom WASAPI repartait sur l'hôte ASIO
+        // configuré, qui ne le connaît pas, et la lecture échouait encore.
+        if let Some(vue) = self
             .appareil_local_revenu(
                 zone_id,
                 dev_id,
@@ -598,10 +603,13 @@ impl PlaybackOrchestrator {
             )
             .await
         {
+            let enregistree = self.reprendre_la_sortie_locale_revenue(zone_id, &vue).await;
             info!(
                 zone_id,
                 zone_name = %zone.name,
                 device = dev_id,
+                hote = %vue.hote,
+                enregistree,
                 "play_allowed_local_device_found_on_reenumeration"
             );
             return Ok(None);

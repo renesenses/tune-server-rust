@@ -30,6 +30,14 @@ ignore = [
     # web-time. Transitif uniquement ; un build natif ne touche jamais son
     # chemin wasm.
     "RUSTSEC-2024-0384",
+    # chrono 0.4.45 - non maintenu (RUSTSEC-2026-0543, avis du 14/09/2026
+    # publie dans la base RustSec le 17/11/2026). Avis INFORMATIF, pas une
+    # vulnerabilite, et aucune version corrigee (`patched = []`). Dependance
+    # DIRECTE du workspace (tune-core, tune-server, tune-smart-http et trois
+    # greffons, une centaine de fichiers) : la remplacer par jiff ou time est
+    # un chantier a part, pas un correctif de dependance. Aucune crate tierce
+    # ne la tire. A retirer d ici quand la migration sera faite.
+    "RUSTSEC-2026-0543",
     # RUSTSEC-2026-0459 (CVE-2026-119375, SQLite < 3.54 embarque) a ete RETIRE
     # d'ici (#8196) : rusqlite 0.41 / libsqlite3-sys 0.39 embarquent SQLite
     # 3.54.0. L'exception temporaire de la rc11 (#8195) n'a plus d'objet.

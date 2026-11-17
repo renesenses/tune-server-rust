@@ -1436,6 +1436,10 @@ pub struct PlaybackOrchestrator {
     /// Un champ et non un appel direct : les témoins y substituent un parc
     /// connu, faute de périphérique réel sur la machine qui les exécute.
     pub(crate) enumerer_parc_local: reenumeration_avant_refus::EnumerateurDeParcLocal,
+    /// #8171 — le système dont la règle de ré-énumération s'applique
+    /// (`std::env::consts::OS`). Un champ pour que les témoins jouent la règle
+    /// Windows depuis Linux.
+    pub(crate) systeme_du_parc_local: &'static str,
     /// #4863 — les sources PCM fournies par les greffons (lecture d'un CD…),
     /// par nom de `source`. Voir `crate::source_pcm`.
     pub(crate) sources_pcm: crate::source_pcm::SourcesPcm,
@@ -2014,6 +2018,7 @@ impl PlaybackOrchestrator {
             replis_de_peripherique_dits: std::sync::Mutex::new(HashMap::new()),
             radios_refusees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             enumerer_parc_local: reenumeration_avant_refus::enumerateur_de_production(),
+            systeme_du_parc_local: std::env::consts::OS,
             sources_pcm: crate::source_pcm::SourcesPcm::default(),
             sources_url: crate::source_url::SourcesUrl::default(),
             sources_physiques: Arc::default(),
