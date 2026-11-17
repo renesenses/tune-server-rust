@@ -2760,7 +2760,9 @@ fn decode_to_pcm_streaming_inner(
     // #8968 — amorce et remplissage AAC (voir `rognage_aac`).
     let rognage = rognage_aac(file_path, &audio_params, decode_le_fichier);
     let trames_annoncees = if seek_s <= 0.0 {
-        rognage.and_then(|r| r.utiles).or(track.num_frames)
+        rognage
+            .and_then(|r| r.trames_annoncees())
+            .or(track.num_frames)
     } else {
         None
     };
@@ -2768,6 +2770,7 @@ fn decode_to_pcm_streaming_inner(
         .as_ref()
         .map(super::amorce_aac::Rogneur::depuis_le_debut);
     let mut track_id = track.id;
+    let echelle = track.time_base;
     let source_channels = audio_params
         .channels
         .as_ref()
@@ -2826,7 +2829,7 @@ fn decode_to_pcm_streaming_inner(
     let mut frames_to_skip: u64 = 0;
     if seek_s > 0.0 {
         let (cible, rogneur_apres) =
-            cible_de_recherche(seek_s, track_id, source_rate, rognage.as_ref());
+            cible_de_recherche(seek_s, track_id, source_rate, echelle, rognage.as_ref());
         match format.seek(SeekMode::Accurate, cible) {
             Ok(seeked) => {
                 rogneur = rogneur_apres;
@@ -4017,14 +4020,33 @@ fn rognage_aac(
 /// La cible d'un déplacement à `seek_s`. Avec une amorce AAC, la position
 /// demandée se compte en trames UTILES : l'horodatage du conteneur, lui,
 /// compte l'amorce (#8968). Rend aussi le rogneur qui s'applique ensuite.
+///
+/// L'horodatage n'est visé en trames que si l'échelle de la piste est
+/// `1 / cadence` ; une autre échelle (`mdhd` à 90 000, HE-AAC décodé au
+/// cœur) passe par `Time`, à `seek_s` plus la durée de l'amorce.
 fn cible_de_recherche(
     seek_s: f64,
     track_id: u32,
     cadence: u32,
+    echelle: Option<symphonia::core::units::TimeBase>,
     rognage: Option<&super::amorce_aac::RognageAac>,
 ) -> (SeekTo, Option<super::amorce_aac::Rogneur>) {
     use super::amorce_aac::Rogneur;
+    let echelle_en_trames = echelle.is_some_and(|e| e.numer.get() == 1 && e.denom.get() == cadence);
     match rognage {
+        Some(r) if !echelle_en_trames => {
+            let trame = (seek_s * f64::from(cadence)).round().max(0.0) as u64;
+            let s = seek_s.max(0.0) + r.amorce as f64 / f64::from(cadence.max(1));
+            let seconds = s as i64;
+            let nanos = ((s - seconds as f64) * 1_000_000_000.0) as u32;
+            (
+                SeekTo::Time {
+                    time: Time::try_new(seconds, nanos).unwrap_or(Time::ZERO),
+                    track_id: Some(track_id),
+                },
+                Some(Rogneur::apres_recherche(r, trame)),
+            )
+        }
         Some(r) => {
             let trame = (seek_s * f64::from(cadence)).round().max(0.0) as u64;
             (
@@ -4145,7 +4167,9 @@ fn decode_symphonia(
     // celle des trames UTILES, pas celle du conteneur.
     let rognage = rognage_aac(file_path, &audio_params, !image_cdda);
     let trames_annoncees = if seek_s <= 0.0 && max_duration_s <= 0.0 {
-        rognage.and_then(|r| r.utiles).or(track.num_frames)
+        rognage
+            .and_then(|r| r.trames_annoncees())
+            .or(track.num_frames)
     } else {
         None
     };
@@ -4153,6 +4177,7 @@ fn decode_symphonia(
         .as_ref()
         .map(super::amorce_aac::Rogneur::depuis_le_debut);
     let mut track_id = track.id;
+    let echelle = track.time_base;
     let source_rate = audio_params.sample_rate.unwrap_or(44100);
     let source_channels = audio_params
         .channels
@@ -4192,7 +4217,7 @@ fn decode_symphonia(
     let mut trames_a_sauter: u64 = 0;
     if seek_s > 0.0 {
         let (cible, rogneur_apres) =
-            cible_de_recherche(seek_s, track_id, source_rate, rognage.as_ref());
+            cible_de_recherche(seek_s, track_id, source_rate, echelle, rognage.as_ref());
         match format.seek(SeekMode::Accurate, cible) {
             Ok(seeked) => {
                 trames_a_sauter = (seeked.required_ts.get() - seeked.actual_ts.get()).max(0) as u64;
@@ -7160,3 +7185,45 @@ mod fenetre_bornee_sans_copie_2156 {
 #[cfg(test)]
 #[path = "canal_aac_signal_6990_tests.rs"]
 mod canal_aac_signal_6990_tests;
+
+#[cfg(test)]
+mod cible_de_recherche_8968_tests {
+    use super::*;
+    use crate::audio::amorce_aac::RognageAac;
+    use symphonia::core::units::TimeBase;
+
+    const R: RognageAac = RognageAac {
+        amorce: 2_112,
+        utiles: Some(264_600),
+        marge: 0,
+    };
+
+    /// Échelle `1/cadence` : l'horodatage vise la trame utile plus l'amorce.
+    #[test]
+    fn a_l_echelle_de_la_cadence_la_cible_compte_l_amorce_8968() {
+        let (cible, rogneur) =
+            cible_de_recherche(1.0, 1, 44_100, TimeBase::try_new(1, 44_100), Some(&R));
+        assert!(
+            matches!(cible, SeekTo::Timestamp { ts, .. } if ts.get() == 44_100 + 2_112),
+            "horodatage attendu à 44 100 + 2 112 trames"
+        );
+        assert!(rogneur.is_some());
+    }
+
+    /// Échelle `mdhd` différente (90 000) : un horodatage en trames serait
+    /// faux d'un facteur ; la cible passe par `Time`, amorce comprise.
+    #[test]
+    fn une_autre_echelle_passe_par_le_temps_amorce_comprise_8968() {
+        let (cible, rogneur) =
+            cible_de_recherche(1.0, 1, 44_100, TimeBase::try_new(1, 90_000), Some(&R));
+        match cible {
+            SeekTo::Time { time, .. } => {
+                let s = time.as_secs_f64();
+                assert!((s - (1.0 + 2_112.0 / 44_100.0)).abs() < 1e-6, "{s}");
+            }
+            SeekTo::Timestamp { ts, .. } => panic!("Time attendu, rendu Timestamp {}", ts.get()),
+        }
+        let mut r = rogneur.expect("le rogneur borne la fin");
+        assert_eq!(r.garder(1_024, 2), 0..2_048, "l'amorce n'est plus à jeter");
+    }
+}

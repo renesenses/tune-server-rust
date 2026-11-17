@@ -41,15 +41,71 @@ pub(crate) struct RognageAac {
     /// Trames utiles après l'amorce ; `None` : jusqu'au bout (aucun
     /// remplissage connu).
     pub utiles: Option<u64>,
+    /// Incertitude sur `utiles`, en trames : nulle quand la longueur est
+    /// donnée en trames (`iTunSMPB`, `elst` à l'échelle de la cadence),
+    /// d'une graduation de l'échelle du film sinon (`mvhd` à 1 000 ou 600).
+    pub marge: u64,
 }
+
+impl RognageAac {
+    /// Ce que le contrôle d'intégrité (#2218) et la coupure connue (#8483)
+    /// peuvent tenir pour promis : les trames utiles MOINS l'incertitude de
+    /// l'arrondi. Sans cette marge, une longueur arrondie au-dessus de la
+    /// vérité ferait croire à une trame perdue (`decodage_incomplet`).
+    pub(crate) fn trames_annoncees(&self) -> Option<u64> {
+        self.utiles.map(|u| u.saturating_sub(self.marge))
+    }
+}
+
+/// Mémoire des lectures : un déplacement relit la piste, il ne doit pas
+/// relire son `moov` (jusqu'à quelques Mio). Clé : chemin, taille, date.
+type CleDeFichier = (std::path::PathBuf, u64, Option<std::time::SystemTime>, u32);
+static MEMOIRE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<CleDeFichier, Option<RognageAac>>>,
+> = std::sync::LazyLock::new(Default::default);
+/// Au-delà, la mémoire est vidée (une bibliothèque lue piste après piste
+/// n'a besoin que des dernières).
+const MEMOIRE_MAX: usize = 512;
 
 /// Lit l'amorce et la longueur utile d'un AAC en MP4, en trames à `cadence`.
 /// `None` : rien de lisible, ou rien à retirer — le décodage reste celui
 /// d'avant à l'octet près.
 pub(crate) fn lire(chemin: &Path, cadence: u32) -> Option<RognageAac> {
+    let meta = std::fs::metadata(chemin).ok()?;
+    let cle = (
+        chemin.to_path_buf(),
+        meta.len(),
+        meta.modified().ok(),
+        cadence,
+    );
+    if let Ok(m) = MEMOIRE.lock()
+        && let Some(r) = m.get(&cle)
+    {
+        return *r;
+    }
+    let r = lire_sans_memoire(chemin, cadence);
+    if let Ok(mut m) = MEMOIRE.lock() {
+        if m.len() >= MEMOIRE_MAX {
+            m.clear();
+        }
+        m.insert(cle, r);
+    }
+    r
+}
+
+fn lire_sans_memoire(chemin: &Path, cadence: u32) -> Option<RognageAac> {
     let moov = lire_moov(chemin)?;
     let r = depuis_moov(&moov, cadence)?;
     (r.amorce > 0 || r.utiles.is_some()).then_some(r)
+}
+
+/// #8968 — la durée JOUÉE d'un AAC en MP4, en millisecondes, quand le
+/// conteneur dit son amorce et son remplissage : c'est celle que la
+/// bibliothèque doit afficher (lofty lit `mdhd`, amorce et remplissage
+/// compris : 6,06 s pour une piste de 6 s).
+pub(crate) fn duree_jouee_ms(chemin: &Path, cadence: u32) -> Option<u64> {
+    let utiles = lire(chemin, cadence)?.utiles?;
+    (cadence > 0).then(|| (utiles * 1000 + u64::from(cadence) / 2) / u64::from(cadence))
 }
 
 /// Le contenu de la boîte `moov` (sans son en-tête), où qu'elle soit dans le
@@ -142,10 +198,52 @@ fn depuis_moov(moov: &[u8], cadence: u32) -> Option<RognageAac> {
     if cadence == 0 {
         return None;
     }
-    if let Some(r) = itunsmpb(moov) {
+    let son = piste_son(moov)?;
+    // `iTunSMPB` compte en trames de SORTIE à l'échelle de `mdhd`. Un
+    // HE-AAC (SBR implicite) annonce le double de la cadence que symphonia
+    // 0.6 décode (le cœur LC, sans SBR) : appliquer ces nombres tels quels
+    // couperait deux fois trop. Cadences différentes : pas d'`iTunSMPB`,
+    // seule la liste d'édition (convertie d'échelle) sert.
+    if son.echelle == cadence
+        && let Some(r) = itunsmpb(moov)
+    {
         return Some(r);
     }
-    elst(moov, cadence)
+    elst(moov, &son, cadence)
+}
+
+/// La piste son du `moov` : sa boîte `trak`, l'échelle de son `mdhd` et sa
+/// durée dans cette échelle (0 : inconnue, MP4 fragmenté).
+struct PisteSon<'a> {
+    trak: &'a [u8],
+    echelle: u32,
+    duree: u64,
+}
+
+fn piste_son(moov: &[u8]) -> Option<PisteSon<'_>> {
+    for (t, trak) in boites(moov) {
+        if t != b"trak" {
+            continue;
+        }
+        let Some(mdia) = fille(trak, b"mdia") else {
+            continue;
+        };
+        if fille(mdia, b"hdlr").and_then(|h| h.get(8..12)) != Some(b"soun".as_slice()) {
+            continue;
+        }
+        let mdhd = fille(mdia, b"mdhd")?;
+        let duree = match mdhd.first()? {
+            0 => u64::from(be32(mdhd, 16)?),
+            1 => be64(mdhd, 24)?,
+            _ => return None,
+        };
+        return Some(PisteSon {
+            trak,
+            echelle: echelle(mdhd)?,
+            duree,
+        });
+    }
+    None
 }
 
 /// `----:com.apple.iTunes:iTunSMPB`, dans `moov/udta/meta/ilst` ou
@@ -200,58 +298,65 @@ fn lire_itunsmpb(texte: &str) -> Option<RognageAac> {
     if amorce > AMORCE_MAX {
         return None;
     }
+    // Tout à zéro (certains muxeurs écrivent la balise sans la remplir) :
+    // elle ne dit rien, la liste d'édition décide.
+    if amorce == 0 && champs[2] == 0 && champs[3] == 0 {
+        return None;
+    }
     Some(RognageAac {
         amorce,
         utiles: Some(champs[3]).filter(|u| *u > 0),
+        marge: 0,
     })
 }
 
 /// La liste d'édition de la piste son : première édition non vide.
-fn elst(moov: &[u8], cadence: u32) -> Option<RognageAac> {
+fn elst(moov: &[u8], son: &PisteSon<'_>, cadence: u32) -> Option<RognageAac> {
     let echelle_film = echelle(fille(moov, b"mvhd")?)?;
-    for (t, trak) in boites(moov) {
-        if t != b"trak" {
+    let liste = fille(fille(son.trak, b"edts")?, b"elst")?;
+    let version = *liste.first()?;
+    let n = be32(liste, 4)? as usize;
+    let largeur = if version == 1 { 20 } else { 12 };
+    let vers_trames = |v: u64, echelle: u32| -> u64 {
+        ((u128::from(v) * u128::from(cadence) + u128::from(echelle) / 2) / u128::from(echelle))
+            as u64
+    };
+    for k in 0..n.min(16) {
+        let i = 8 + k * largeur;
+        let (duree, debut) = if version == 1 {
+            (be64(liste, i)?, be64(liste, i + 8)? as i64)
+        } else {
+            (
+                u64::from(be32(liste, i)?),
+                i64::from(be32(liste, i + 4)? as i32),
+            )
+        };
+        if debut < 0 {
+            // Édition vide (un blanc voulu en tête de piste vidéo) : on ne
+            // fabrique pas de silence, on passe.
             continue;
         }
-        let mdia = fille(trak, b"mdia")?;
-        let son = fille(mdia, b"hdlr").and_then(|h| h.get(8..12)) == Some(b"soun".as_slice());
-        if !son {
-            continue;
+        let amorce = vers_trames(debut as u64, son.echelle);
+        if amorce > AMORCE_MAX {
+            return None;
         }
-        let echelle_media = echelle(fille(mdia, b"mdhd")?)?;
-        let liste = fille(fille(trak, b"edts")?, b"elst")?;
-        let version = *liste.first()?;
-        let n = be32(liste, 4)? as usize;
-        let largeur = if version == 1 { 20 } else { 12 };
-        for k in 0..n.min(16) {
-            let i = 8 + k * largeur;
-            let (duree, debut) = if version == 1 {
-                (be64(liste, i)?, be64(liste, i + 8)? as i64)
+        let exacte = (u128::from(duree) * u128::from(cadence)) % u128::from(echelle_film) == 0;
+        // Jamais plus que ce que la piste porte après l'amorce : un arrondi
+        // au-dessus ne promet pas une trame qui n'existe pas.
+        let total = (son.duree > 0).then(|| vers_trames(son.duree, son.echelle));
+        let utiles = (duree > 0).then(|| {
+            let u = vers_trames(duree, echelle_film);
+            total.map_or(u, |t| u.min(t.saturating_sub(amorce)))
+        });
+        return Some(RognageAac {
+            amorce,
+            utiles,
+            marge: if exacte {
+                0
             } else {
-                (
-                    u64::from(be32(liste, i)?),
-                    i64::from(be32(liste, i + 4)? as i32),
-                )
-            };
-            if debut < 0 {
-                // Édition vide (un blanc voulu en tête de piste vidéo) : on
-                // ne fabrique pas de silence, on passe.
-                continue;
-            }
-            let vers_trames = |v: u64, echelle: u32| -> u64 {
-                ((u128::from(v) * u128::from(cadence) + u128::from(echelle) / 2)
-                    / u128::from(echelle)) as u64
-            };
-            let amorce = vers_trames(debut as u64, echelle_media);
-            if amorce > AMORCE_MAX {
-                return None;
-            }
-            return Some(RognageAac {
-                amorce,
-                utiles: (duree > 0).then(|| vers_trames(duree, echelle_film)),
-            });
-        }
-        return None;
+                u64::from(cadence).div_ceil(u64::from(echelle_film))
+            },
+        });
     }
     None
 }
@@ -318,7 +423,8 @@ mod tests {
             lire(&fixture("aac320.m4a"), 44_100),
             Some(RognageAac {
                 amorce: 2_112,
-                utiles: Some(264_600)
+                utiles: Some(264_600),
+                marge: 0
             })
         );
     }
@@ -329,7 +435,8 @@ mod tests {
             lire(&fixture("test.m4a"), 44_100),
             Some(RognageAac {
                 amorce: 1_024,
-                utiles: Some(44_100)
+                utiles: Some(44_100),
+                marge: 0
             })
         );
     }
@@ -344,11 +451,169 @@ mod tests {
         let mut r = Rogneur::depuis_le_debut(&RognageAac {
             amorce: 1_500,
             utiles: Some(2_000),
+            marge: 0,
         });
         assert_eq!(r.garder(1_024, 2), 2_048..2_048);
         assert_eq!(r.garder(1_024, 2), 952..2_048);
         assert_eq!(r.garder(1_024, 2), 0..2_048);
         assert_eq!(r.garder(1_024, 2), 0..(2_000 - 548 - 1_024) * 2);
         assert_eq!(r.garder(1_024, 2), 0..0);
+    }
+
+    /// Un `moov` minimal : `mvhd`, une piste son (`mdhd`, `hdlr`, `elst`
+    /// facultative) et un `iTunSMPB` facultatif.
+    fn moov(
+        echelle_film: u32,
+        echelle_son: u32,
+        duree_son: u32,
+        edition: Option<(u32, i32)>,
+        smpb: Option<&str>,
+    ) -> Vec<u8> {
+        fn boite(nom: &[u8; 4], contenu: &[u8]) -> Vec<u8> {
+            let mut b = (contenu.len() as u32 + 8).to_be_bytes().to_vec();
+            b.extend_from_slice(nom);
+            b.extend_from_slice(contenu);
+            b
+        }
+        let mut mvhd = vec![0u8; 12];
+        mvhd.extend_from_slice(&echelle_film.to_be_bytes());
+        mvhd.extend_from_slice(&[0u8; 4]);
+        let mut mdhd = vec![0u8; 12];
+        mdhd.extend_from_slice(&echelle_son.to_be_bytes());
+        mdhd.extend_from_slice(&duree_son.to_be_bytes());
+        let mut hdlr = vec![0u8; 8];
+        hdlr.extend_from_slice(b"soun");
+        let mdia = [boite(b"mdhd", &mdhd), boite(b"hdlr", &hdlr)].concat();
+        let mut trak = Vec::new();
+        if let Some((duree, debut)) = edition {
+            let mut elst = vec![0u8; 4];
+            elst.extend_from_slice(&1u32.to_be_bytes());
+            elst.extend_from_slice(&duree.to_be_bytes());
+            elst.extend_from_slice(&debut.to_be_bytes());
+            elst.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+            trak.extend(boite(b"edts", &boite(b"elst", &elst)));
+        }
+        trak.extend(boite(b"mdia", &mdia));
+        let mut m = [boite(b"mvhd", &mvhd), boite(b"trak", &trak)].concat();
+        if let Some(v) = smpb {
+            let mut nom = vec![0u8; 4];
+            nom.extend_from_slice(b"iTunSMPB");
+            let mut donnees = vec![0u8; 8];
+            donnees.extend_from_slice(v.as_bytes());
+            let libre = [boite(b"name", &nom), boite(b"data", &donnees)].concat();
+            let mut meta = vec![0u8; 4];
+            meta.extend(boite(b"ilst", &boite(b"----", &libre)));
+            m.extend(boite(b"udta", &boite(b"meta", &meta)));
+        }
+        m
+    }
+
+    const SMPB_APPLE: &str = " 00000000 00000840 00000228 0000000000040998";
+
+    /// HE-AAC (SBR implicite) : `mdhd` à 44,1 kHz, mais symphonia 0.6 rend le
+    /// cœur LC à 22,05 kHz. Les nombres d'`iTunSMPB`, comptés à 44,1 kHz, ne
+    /// s'appliquent pas tels quels : ignorés.
+    #[test]
+    fn un_he_aac_n_applique_pas_itunsmpb_a_la_cadence_du_coeur_8968() {
+        let m = moov(44_100, 44_100, 267_264, None, Some(SMPB_APPLE));
+        assert_eq!(
+            depuis_moov(&m, 44_100),
+            Some(RognageAac {
+                amorce: 2_112,
+                utiles: Some(264_600),
+                marge: 0
+            }),
+            "témoin : à cadence égale, la balise s'applique"
+        );
+        assert_eq!(depuis_moov(&m, 22_050), None);
+    }
+
+    /// HE-AAC avec liste d'édition : elle reste appliquée, convertie de
+    /// l'échelle de `mdhd` à la cadence décodée.
+    #[test]
+    fn un_he_aac_garde_la_liste_d_edition_convertie_8968() {
+        let m = moov(
+            44_100,
+            44_100,
+            267_264,
+            Some((264_600, 2_112)),
+            Some(SMPB_APPLE),
+        );
+        assert_eq!(
+            depuis_moov(&m, 22_050),
+            Some(RognageAac {
+                amorce: 1_056,
+                utiles: Some(132_300),
+                marge: 0
+            })
+        );
+    }
+
+    #[test]
+    fn un_itunsmpb_tout_a_zero_laisse_decider_la_liste_d_edition_8968() {
+        let zero = " 00000000 00000000 00000000 0000000000000000";
+        let m = moov(44_100, 44_100, 45_124, Some((44_100, 1_024)), Some(zero));
+        assert_eq!(
+            depuis_moov(&m, 44_100),
+            Some(RognageAac {
+                amorce: 1_024,
+                utiles: Some(44_100),
+                marge: 0
+            })
+        );
+        let seul = moov(44_100, 44_100, 45_124, None, Some(zero));
+        assert_eq!(depuis_moov(&seul, 44_100), None);
+    }
+
+    /// `mvhd` à 600 (QuickTime) : la durée utile est arrondie, la marge le
+    /// dit, et elle ne dépasse jamais ce que la piste porte après l'amorce.
+    #[test]
+    fn une_duree_d_edition_arrondie_porte_sa_marge_et_sa_borne_8968() {
+        // 1,0004 s à 600 graduations par seconde : 600,24 → 600 ; et une
+        // piste dont mdhd ne porte que 1 024 + 44 000 trames.
+        let m = moov(600, 44_100, 45_024, Some((601, 1_024)), None);
+        let r = depuis_moov(&m, 44_100).unwrap();
+        assert_eq!(r.amorce, 1_024);
+        assert_eq!(r.utiles, Some(44_000), "bornée à mdhd − amorce");
+        assert_eq!(r.marge, 74, "une graduation de 1/600 s = 73,5 trames");
+        assert_eq!(r.trames_annoncees(), Some(43_926));
+    }
+
+    /// La bibliothèque affiche la durée JOUÉE : 6 000 ms pour `aac320.m4a`
+    /// (lofty lit 6 060 dans `mdhd`, amorce et remplissage compris), 1 000
+    /// pour `test.m4a` (`elst`). Copie, pour ne pas toucher la fixture.
+    #[test]
+    fn la_bibliotheque_affiche_la_duree_jouee_8968() {
+        let bac = crate::test_scratch::scratch_dir("amorce-aac-duree-8968");
+        for (nom, attendue) in [("aac320.m4a", 6_000), ("test.m4a", 1_000)] {
+            let chemin = bac.join(nom);
+            std::fs::copy(fixture(nom), &chemin).unwrap();
+            // Sans titre : le chemin `tagless_fallback`.
+            let meta = crate::metadata::read_metadata(&chemin).expect("métadonnées lues");
+            assert_eq!(meta.duration_ms, Some(attendue), "{nom} sans balise");
+            // Avec un titre : le chemin des balises.
+            intituler(&chemin);
+            let meta = crate::metadata::read_metadata(&chemin).expect("métadonnées lues");
+            assert_eq!(
+                meta.title.as_deref(),
+                Some("Banc 8968"),
+                "{nom} : balise écrite"
+            );
+            assert_eq!(meta.duration_ms, Some(attendue), "{nom} balisé");
+        }
+    }
+
+    fn intituler(chemin: &Path) {
+        use lofty::config::{ParseOptions, WriteOptions};
+        use lofty::file::AudioFile;
+        use lofty::mp4::{Ilst, Mp4File};
+        use lofty::tag::Accessor;
+        let mut fh = File::open(chemin).unwrap();
+        let mut m4a = Mp4File::read_from(&mut fh, ParseOptions::new()).unwrap();
+        drop(fh);
+        let mut ilst = m4a.ilst().cloned().unwrap_or_else(Ilst::default);
+        ilst.set_title("Banc 8968".into());
+        m4a.set_ilst(ilst);
+        m4a.save_to_path(chemin, WriteOptions::default()).unwrap();
     }
 }
