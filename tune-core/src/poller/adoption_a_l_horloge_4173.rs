@@ -753,6 +753,12 @@ mod preparation_bornee_5970;
 #[cfg(test)]
 mod set_next_coupe_la_piste_6477;
 
+/// #8868 (FiiO K17, fil 2323, rc12) — la règle #6477 relue après un
+/// redémarrage, en DSF natif comme en DoP ; le renderer conforme garde son
+/// `SetNext`.
+#[cfg(test)]
+mod k17_dsf_set_next_8868;
+
 /// #6910 (fil 2412) — le suivant DSD armé sur le renderer DLNA qui annonce le
 /// DSD et `SetNext` ; la garde de #402 gardée pour les autres.
 #[cfg(test)]
