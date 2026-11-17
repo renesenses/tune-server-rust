@@ -79,8 +79,7 @@ async fn get_artist_bio(client: &reqwest::Client, artist: &str, api_key: &str) -
 }
 
 fn strip_html(s: &str) -> String {
-    let re = regex::Regex::new(r"<[^>]+>").unwrap();
-    re.replace_all(s, "").trim().to_string()
+    crate::streaming::presentation_album::texte_de_presentation(s).unwrap_or_default()
 }
 
 pub struct LastfmEnricher {
@@ -263,5 +262,19 @@ mod tests {
     async fn no_title_no_tags() {
         let tags = get_lastfm_tags("", "Artist", "fake-key").await;
         assert!(tags.tags.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod entites_resume_8735_tests {
+    #[test]
+    fn resume_lastfm_decode_8735() {
+        assert_eq!(
+            super::strip_html(
+                "<b>Simon &amp; Garfunkel</b> : &eacute; &#233; &#xE9; &amp sans point ; &amp;amp; &inconnue;"
+            ),
+            "Simon & Garfunkel : é é é & sans point ; &amp; &inconnue;",
+            "entités Last.fm encore présentes dans le résumé"
+        );
     }
 }
