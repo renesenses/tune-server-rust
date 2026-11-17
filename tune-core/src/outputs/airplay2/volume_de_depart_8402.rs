@@ -161,10 +161,14 @@ impl Airplay2Output {
         } else {
             *self.volume.lock().await
         };
-        self.send(&serde_json::json!({"cmd": "volume", "level": niveau}))
+        // #8855 — le démon écrit 20·log10(level) : on lui donne le niveau qui
+        // retombe sur la courbe commune (-30..0 dB, -144 en sourdine).
+        let db = crate::outputs::volume_airplay_8855::curseur_vers_db(niveau);
+        let level = crate::outputs::volume_airplay_8855::niveau_pour_le_demon(niveau);
+        self.send(&serde_json::json!({"cmd": "volume", "level": level}))
             .await
             .map_err(|erreur| format!("airplay2: starting volume not sent: {erreur}"))?;
-        info!(device = %self.name, volume = niveau, "airplay2: starting volume sent");
+        info!(device = %self.name, volume = niveau, db, "airplay2: starting volume sent");
         Ok(())
     }
 }
@@ -203,8 +207,9 @@ mod tests {
         }
     }
 
-    /// Le dB que `airplay-rtsp` (`build_set_volume`) écrit pour un niveau.
-    fn decibels(niveau: f64) -> String {
+    /// Le dB que `airplay-rtsp` (`build_set_volume`, rev `d58df6265`) écrit
+    /// pour le niveau qu'il reçoit : copie fidèle du démon, en `f32`.
+    fn decibels_du_demon(niveau: f64) -> String {
         let db = if niveau <= 0.0 {
             -144.0_f32
         } else if niveau >= 1.0 {
@@ -213,6 +218,15 @@ mod tests {
             20.0 * (niveau as f32).log10()
         };
         format!("{db:.2}")
+    }
+
+    /// #8855 — le dB qu'un curseur de zone doit faire envoyer au récepteur :
+    /// la courbe commune, -30..0 dB linéaire.
+    fn attendu(curseur: f64) -> String {
+        format!(
+            "{:.2}",
+            crate::outputs::volume_airplay_8855::curseur_vers_db(curseur) as f32
+        )
     }
 
     /// Un faux `airplay-daemon` fidèle au vrai sur le volume : `connect`
@@ -252,7 +266,7 @@ mod tests {
                     },
                     "play" => match connexion {
                         Some(niveau) => {
-                            notes.lock().await.push(decibels(niveau));
+                            notes.lock().await.push(decibels_du_demon(niveau));
                             Some(serde_json::json!({"event": "playing"}))
                         }
                         None => {
@@ -288,7 +302,7 @@ mod tests {
         let recus = recus.lock().await.clone();
         assert_eq!(
             recus,
-            vec![decibels(VOLUME_DE_DEPART_PRUDENT)],
+            vec![attendu(VOLUME_DE_DEPART_PRUDENT)],
             "départ du flux : {recus:?}"
         );
         assert_ne!(recus[0], "0.00");
@@ -302,7 +316,7 @@ mod tests {
         sortie.set_volume(0.2).await.unwrap();
         let recus = demon(&sortie, false).await;
         sortie.play_media(&piste()).await.unwrap();
-        assert_eq!(*recus.lock().await, vec![decibels(0.2)]);
+        assert_eq!(*recus.lock().await, vec![attendu(0.2)]);
         assert!((sortie.get_status().await.unwrap().volume - 0.2).abs() < 1e-9);
     }
 
@@ -315,7 +329,7 @@ mod tests {
         let recus = demon(&sortie, true).await;
         sortie.play_media(&piste()).await.unwrap();
         sortie.play_media(&piste()).await.unwrap();
-        assert_eq!(*recus.lock().await, vec![decibels(0.25), decibels(0.25)]);
+        assert_eq!(*recus.lock().await, vec![attendu(0.25), attendu(0.25)]);
     }
 
     /// Une sourdine posée sans session tient au démarrage : -144 dB.
@@ -359,7 +373,7 @@ mod tests {
         sortie.ensemencer_depuis_la_base(&db).await;
         let recus = demon(&sortie, false).await;
         sortie.play_media(&piste()).await.unwrap();
-        assert_eq!(*recus.lock().await, vec![decibels(0.5)]);
+        assert_eq!(*recus.lock().await, vec![attendu(0.5)]);
     }
     /// Décision du 11/11 (révisée) — volume fixe : le départ reste à 100 %
     /// (0 dB), l'ampli tient le volume ; aucun départ muet à dire.
@@ -449,7 +463,7 @@ mod tests {
         sortie.tenir_le_volume_de_la_zone(false);
         let recus = demon(&sortie, false).await;
         sortie.play_media(&piste()).await.unwrap();
-        assert_eq!(*recus.lock().await, vec![decibels(0.3)]);
+        assert_eq!(*recus.lock().await, vec![attendu(0.3)]);
         assert!(!sortie.prendre_le_depart_muet());
     }
     /// Une session dont le récepteur a fermé la connexion (#7921) ou dont le
@@ -489,5 +503,43 @@ mod tests {
             *recus.lock().await,
             vec!["-144.00", "-144.00", "0.00", "0.00"]
         );
+    }
+
+    /// #8855 — zone à 30 % (le « sans repère ») : le récepteur reçoit
+    /// -21 dB, soit 30 % d'une échelle -30..0 dB, et non plus -10,46 dB.
+    #[tokio::test]
+    async fn une_zone_a_30_part_a_moins_21_db_8855() {
+        let sortie = enceinte();
+        sortie.set_volume(0.30).await.unwrap();
+        let recus = demon(&sortie, false).await;
+        sortie.play_media(&piste()).await.unwrap();
+        assert_eq!(*recus.lock().await, vec!["-21.00".to_string()]);
+
+        // Sans zone connue, le départ prudent est le même 30 %.
+        let neuve = enceinte();
+        let recus = demon(&neuve, false).await;
+        neuve.play_media(&piste()).await.unwrap();
+        assert_eq!(*recus.lock().await, vec![attendu(VOLUME_DE_DEPART_PRUDENT)]);
+    }
+
+    /// #8855 — le journal du testeur : zone à 65 % semée par la base, puis
+    /// une piste par titre (#8420 rouvre la session). Chaque départ envoie
+    /// -10,5 dB (65 % du récepteur), plus jamais -3,74 dB (~88 %).
+    #[tokio::test]
+    async fn une_zone_a_65_part_a_moins_10_5_db_a_chaque_titre_8855() {
+        let db = base();
+        let repo = ZoneRepo::with_backend(db.clone());
+        let zone_id = repo
+            .create("Xiaomi 8855", Some("airplay2"), Some(APPAREIL))
+            .unwrap();
+        repo.update_volume(zone_id, 65.0).unwrap();
+        let sortie = enceinte();
+        sortie.ensemencer_depuis_la_base(&db).await;
+        let recus = demon(&sortie, false).await;
+        sortie.play_media(&piste()).await.unwrap();
+        sortie.play_media(&piste()).await.unwrap();
+        let recus = recus.lock().await.clone();
+        assert_eq!(recus, vec!["-10.50", "-10.50"], "départs : {recus:?}");
+        assert_ne!(recus[0], decibels_du_demon(0.65), "l'ancien 20·log10 brut");
     }
 }

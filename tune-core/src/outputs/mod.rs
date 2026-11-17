@@ -10,6 +10,8 @@ pub mod asio_blocage_4556;
 pub mod asio_exclusive;
 #[cfg(any(all(target_os = "windows", feature = "asio"), test))]
 pub(crate) mod quantification_au_rendu_7703;
+/// #8855 — la conversion curseur → dB commune à AirPlay 1 et AirPlay 2.
+pub mod volume_airplay_8855;
 // #6133 — silence ASIO avant libération ; sans Windows+asio, seul le banc s'en sert.
 pub mod bluos;
 pub mod bridge;

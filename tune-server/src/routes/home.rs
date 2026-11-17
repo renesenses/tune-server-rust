@@ -126,6 +126,11 @@ pub fn router() -> Router<AppState> {
         .route("/recently-added/summary", get(recently_added_summary))
         .route("/recommendations", get(home_recommendations))
         .route("/top-mixes", get(top_mixes))
+        // web#3118 — « Parce que vous aimez <artiste> ».
+        .route(
+            "/because-you-like",
+            get(super::parce_que_vous_aimez::because_you_like),
+        )
         .route("/new-in-library", get(new_in_library))
         .route("/other-versions", get(other_versions))
         .route(

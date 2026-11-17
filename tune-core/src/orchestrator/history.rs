@@ -10,7 +10,7 @@ impl PlaybackOrchestrator {
     /// relance radio ou une reconnexion après la fin du bail est refusée.
     pub async fn play_without_history(&self, req: PlayRequest) -> Result<PlayResult, String> {
         self.verifier_le_bail(req.zone_id).await?;
-        self.play_inner(req, false).await
+        Box::pin(self.play_inner(req, false)).await
     }
 
     /// Oublie l'annonce en attente d'une zone navigateur : la lecture s'arrête

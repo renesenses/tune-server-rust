@@ -659,6 +659,14 @@ impl InsertOutcome {
     }
 }
 
+/// Refus métier distingués d'une erreur de stockage, pour la route de déplacement.
+#[derive(Debug)]
+pub enum ErreurDeplacementBloc {
+    Bornes,
+    OrdrePerime,
+    Stockage(String),
+}
+
 pub struct PlayQueueRepo {
     db: Arc<dyn DbBackend>,
 }
@@ -1453,6 +1461,79 @@ impl PlayQueueRepo {
             }
             Ok(())
         })
+    }
+
+    /// Déplace un bloc contigu ; `to` est son rang de départ dans la file finale.
+    /// Identités, ordre attendu et bornes sont vérifiés dans la même transaction.
+    /// Renvoie les identités avant/après pour conserver le curseur de lecture.
+    pub fn deplacer_bloc(
+        &self,
+        zone_id: i64,
+        from: i64,
+        to: i64,
+        count: i64,
+        expected_order: Option<&[i64]>,
+    ) -> Result<(Vec<i64>, Vec<i64>), ErreurDeplacementBloc> {
+        let ids_sql = self.dialect_sql(
+            |d| {
+                format!(
+                    "SELECT id FROM queue_items WHERE zone_id = {} ORDER BY position, id",
+                    d.placeholder(1)
+                )
+            },
+            |d| {
+                format!(
+                    "SELECT id FROM queue_items WHERE zone_id = {} ORDER BY position, id",
+                    d.placeholder(1)
+                )
+            },
+        );
+        let set_pos_sql = self.dialect_sql(sql::set_position_by_id, sql::set_position_by_id);
+        let mut avant = Vec::new();
+        let mut apres = Vec::new();
+        let mut refus = None;
+        let resultat = self.db.write_tx(&mut |tx| {
+            if self.db.engine() == Engine::Postgres {
+                // La lecture suivie de renumérotation doit aussi exclure un ajout
+                // concurrent. Verrou bref, sans réseau ni attente audio ; les
+                // lectures restent permises. SQLite sérialise déjà write_tx.
+                tx.execute("LOCK TABLE queue_items IN SHARE ROW EXCLUSIVE MODE", &[])?;
+            }
+            let params: [&dyn ToSqlValue; 1] = [&zone_id];
+            avant = tx
+                .query_many(&ids_sql, &params)?
+                .iter()
+                .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+                .collect();
+            if expected_order.is_some_and(|ordre| ordre != avant.as_slice()) {
+                refus = Some(ErreurDeplacementBloc::OrdrePerime);
+                return Err("queue order changed".into());
+            }
+            let len = avant.len() as i64;
+            if from < 0
+                || to < 0
+                || count <= 0
+                || count > len
+                || from > len - count
+                || to > len - count
+            {
+                refus = Some(ErreurDeplacementBloc::Bornes);
+                return Err("queue block out of range".into());
+            }
+            apres = avant.clone();
+            let bloc: Vec<_> = apres
+                .drain(from as usize..(from + count) as usize)
+                .collect();
+            apres.splice(to as usize..to as usize, bloc);
+            for (position, id) in apres.iter().enumerate() {
+                let position = position as i64;
+                let params: [&dyn ToSqlValue; 2] = [&position, id];
+                tx.execute(&set_pos_sql, &params)?;
+            }
+            Ok(())
+        });
+        resultat.map_err(|e| refus.unwrap_or(ErreurDeplacementBloc::Stockage(e)))?;
+        Ok((avant, apres))
     }
 
     /// La file entière, lue sur la connexion d'ÉCRITURE (#6526).
@@ -3775,3 +3856,7 @@ mod tests {
             .unwrap();
     }
 }
+
+#[cfg(all(test, feature = "postgres"))]
+#[path = "deplacement_bloc_pg_8849_tests.rs"]
+mod deplacement_bloc_pg_8849_tests;
