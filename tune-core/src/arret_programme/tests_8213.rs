@@ -483,7 +483,7 @@ async fn un_refus_d_extinction_est_garde_puis_efface_par_une_extinction_reussie(
     assert_eq!(
         lire_echec_extinction(&banc.db),
         Some(EchecExtinction {
-            at: "2026-11-10T23:00:00".into(),
+            at: mardi(23, 0).format("%Y-%m-%dT%H:%M:%S").to_string(),
             error: POLKIT.into(),
         }),
         "le refus est gardé, avec l'heure de l'échéance"
