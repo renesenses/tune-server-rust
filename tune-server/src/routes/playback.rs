@@ -7523,6 +7523,10 @@ pub(crate) async fn do_transfer(
     // contexte de SESSION de la source (le dernier « Lire »), que suivent les
     // lignes qui n'en portent pas. Le profil propriétaire suit aussi.
     tune_core::db::contexte_de_file::copier_les_contextes(&state.backend, from_zone, target_zone);
+    // #8968 — l'aléatoire et la répétition suivent la file copiée pour le
+    // mode ReplayGain Auto : une suiveuse de groupe (#6155) décide comme sa
+    // meneuse, au lieu de prendre deux voisines tirées au hasard pour un album.
+    tune_core::audio::replaygain::auto::copier_l_etat_de_zone(from_zone, target_zone);
     state
         .playback
         .set_session_context(
