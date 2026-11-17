@@ -300,6 +300,17 @@ pub(super) fn finir_les_bascules_interrompues(
             std::fs::remove_file(&pose).ok();
             continue;
         }
+        // Exécutable quoi qu'ait laissé la coupure.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(e) = std::fs::set_permissions(&pose, std::fs::Permissions::from_mode(0o755))
+            {
+                warn!(pose = %pose.display(), error = %e, "update_bascule_interrompue_droits");
+                std::fs::remove_file(&pose).ok();
+                continue;
+            }
+        }
         let livre = ExecutableLivre {
             source: pose.clone(),
             cible: cible.clone(),
