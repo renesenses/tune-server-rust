@@ -1295,6 +1295,17 @@ async fn mount_smb_share(
 
     // Dry run: just test reachability without mounting
     if body.dry_run {
+        // #8069 — dans le conteneur du Synology, ce test était au vert (port
+        // 445 ouvert) et l'étape suivante échouait : le montage y est
+        // impossible. Le test le dit maintenant, avec le conseil traduit.
+        if let Some(moteur) = montage_impossible_en_conteneur(
+            crate::conteneur::detecter(),
+            crate::privilege::euid(),
+            std::path::Path::new(&crate::privilege::sudo()).exists(),
+            mount_cifs_present(),
+        ) {
+            return refus_du_test_en_conteneur(moteur);
+        }
         let reachable = tokio::net::TcpStream::connect(format!("{}:445", body.host))
             .await
             .is_ok();
@@ -1611,6 +1622,69 @@ async fn mount_smb_share(
     )
 }
 
+/// #8069 — la phrase d'un échec de montage.
+///
+/// rc11 avait donné à chaque échec un code et une phrase qui dit quoi faire,
+/// mais la phrase était écrite en français, en dur, SANS `message_key`. Or le
+/// client web n'affiche `message` que si le serveur dit l'avoir traduit
+/// (`message_key`, contrat #7077, `messageServeur.ts`) : sinon il montre son
+/// message GÉNÉRIQUE (« Le serveur n'a pas pu traiter la demande ») et range
+/// le texte dans les détails. Le conseil « montez le partage sur l'hôte, en
+/// rslave » n'atteignait donc jamais l'écran de l'assistant SMB — ni en
+/// français, ni dans la langue de Jon (fil 2699).
+///
+/// Désormais : une clé de `i18n_server.json`, ses paramètres, et la cause
+/// technique (stderr, erreur de lancement) dans `cause`, jamais dans la
+/// phrase.
+#[derive(Debug)]
+struct EchecDeMontage {
+    statut: StatusCode,
+    code: &'static str,
+    cle: &'static str,
+    params: Vec<(&'static str, String)>,
+    cause: Option<String>,
+}
+
+impl EchecDeMontage {
+    fn nouveau(code: &'static str, cle: &'static str) -> Self {
+        Self {
+            statut: StatusCode::INTERNAL_SERVER_ERROR,
+            code,
+            cle,
+            params: Vec::new(),
+            cause: None,
+        }
+    }
+
+    fn avec(mut self, nom: &'static str, valeur: impl Into<String>) -> Self {
+        self.params.push((nom, valeur.into()));
+        self
+    }
+
+    fn cause(mut self, cause: impl std::fmt::Display) -> Self {
+        let c = cause.to_string();
+        if !c.trim().is_empty() {
+            self.cause = Some(c.trim().to_string());
+        }
+        self
+    }
+
+    fn statut(mut self, statut: StatusCode) -> Self {
+        self.statut = statut;
+        self
+    }
+
+    fn en_reponse(self) -> axum::response::Response {
+        let params: Vec<(&str, String)> =
+            self.params.iter().map(|(n, v)| (*n, v.clone())).collect();
+        let mut corps = crate::message_api::corps_refus(self.code, self.cle, &params);
+        if let Some(cause) = self.cause {
+            corps["cause"] = json!(cause);
+        }
+        (self.statut, Json(corps)).into_response()
+    }
+}
+
 /// #8069 — la réponse d'un montage qui n'a pas abouti, ou `None` s'il a monté.
 ///
 /// Les trois réponses d'échec d'avant portaient leur phrase dans `error`
@@ -1621,16 +1695,16 @@ async fn mount_smb_share(
 /// pas en root, et l'image n'a ni sudo, ni l'assistant de Tune OS, ni
 /// `mount.cifs` — le montage ne pouvait pas réussir, et rien ne le disait.
 ///
-/// Chaque échec rend désormais un CODE dans `error` et un TEXTE qui dit quoi
-/// faire dans `message`, comme `obstacle_de_montage`. Fonction pure sur ce
-/// qu'elle reçoit (identité, conteneur) pour se tester sans système.
+/// Chaque échec rend un CODE dans `error`, une phrase TRADUITE dans `message`
+/// (avec `message_key`) et la cause technique dans `cause`. Fonction pure sur
+/// ce qu'elle reçoit (identité, conteneur) pour se tester sans système.
 fn reponse_d_echec_du_montage(
     resultat: &Result<std::io::Result<std::process::Output>, tokio::time::error::Elapsed>,
     mount_path: &str,
     euid: u32,
     conteneur: Option<&str>,
 ) -> Option<axum::response::Response> {
-    let (statut, code, message) = match resultat {
+    let echec = match resultat {
         Ok(Ok(out)) if out.status.success() => return None,
         Ok(Ok(out)) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1641,131 +1715,129 @@ fn reponse_d_echec_du_montage(
             if crate::privilege::est_un_refus_d_elevation(&stderr) {
                 // Deja journalise par l'echelle (`smb_mount_failed`) ; ici,
                 // le message dit a l'utilisateur ce qui manque.
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "elevation_refusee",
-                    crate::privilege::message_de_refus(&stderr),
-                )
-            } else {
-                let (code, message) = obstacle_du_systeme(stderr.trim(), conteneur);
-                (StatusCode::INTERNAL_SERVER_ERROR, code, message)
+                return Some(
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(json!({
+                            "error": "elevation_refusee",
+                            "message": crate::privilege::message_de_refus(&stderr),
+                        })),
+                    )
+                        .into_response(),
+                );
             }
+            obstacle_du_systeme(stderr.trim(), conteneur)
         }
-        Ok(Err(e)) => {
-            let (code, message) = obstacle_du_lancement(e, euid, conteneur);
-            (StatusCode::INTERNAL_SERVER_ERROR, code, message)
-        }
-        Err(_) => (
-            StatusCode::GATEWAY_TIMEOUT,
-            "delai_depasse",
-            "Le serveur SMB n'a pas répondu à temps. Vérifiez que l'appareil est allumé \
-             et joignable depuis le serveur Tune, puis réessayez."
-                .to_string(),
-        ),
+        Ok(Err(e)) => obstacle_du_lancement(e, euid, conteneur),
+        Err(_) => EchecDeMontage::nouveau("delai_depasse", "api.network.smbMountTimeout")
+            .statut(StatusCode::GATEWAY_TIMEOUT),
     };
-    Some((statut, Json(json!({ "error": code, "message": message }))).into_response())
+    Some(echec.en_reponse())
 }
 
-/// #8069 — ce qu'il faut faire quand Tune tourne dans un conteneur : y monter
-/// un partage demande des outils et des privilèges que l'image n'a pas.
-fn conseil_en_conteneur(moteur: &str) -> String {
-    format!(
-        "Tune tourne dans un conteneur ({moteur}) : il ne peut pas y monter lui-même \
-         un partage SMB, car le serveur n'y a ni les privilèges système (root et la \
-         capacité CAP_SYS_ADMIN) ni l'outil de montage (cifs-utils). Montez plutôt le \
-         partage sur la machine hôte (votre NAS), puis rendez-le visible dans le \
-         conteneur par un volume en propagation « rslave », par exemple \
-         -v /volume1/music:/music:ro,rslave, et ajoutez le dossier obtenu aux \
-         dossiers de musique. Sans « rslave », un partage monté sur l'hôte après la \
-         création du conteneur n'y apparaît pas."
-    )
+/// #8069 — dans un conteneur, monter un partage demande des outils et des
+/// privilèges que l'image n'a pas : le conseil est de monter sur l'hôte.
+fn en_conteneur(code: &'static str, moteur: &str) -> EchecDeMontage {
+    EchecDeMontage::nouveau(code, "api.network.smbMountInContainer").avec("engine", moteur)
 }
 
 /// #8069 — le programme de montage n'a pas pu être lancé.
-fn obstacle_du_lancement(
-    e: &std::io::Error,
-    euid: u32,
-    conteneur: Option<&str>,
-) -> (&'static str, String) {
+fn obstacle_du_lancement(e: &std::io::Error, euid: u32, conteneur: Option<&str>) -> EchecDeMontage {
     if let Some(moteur) = conteneur {
         // En conteneur, quelle que soit la raison du lancement raté, le
         // remède est le même : monter sur l'hôte. Le détail reste lisible
-        // quand ce n'est pas un simple « introuvable ».
-        let conseil = conseil_en_conteneur(moteur);
-        let message = if e.kind() == std::io::ErrorKind::NotFound {
-            conseil
+        // (dans `cause`) quand ce n'est pas un simple « introuvable ».
+        let echec = en_conteneur("montage_impossible_en_conteneur", moteur);
+        return if e.kind() == std::io::ErrorKind::NotFound {
+            echec
         } else {
-            format!("{conseil} (Détail : {e})")
+            echec.cause(e)
         };
-        return ("montage_impossible_en_conteneur", message);
     }
     if e.kind() != std::io::ErrorKind::NotFound {
-        return (
-            "lancement_impossible",
-            format!("Impossible de lancer la commande de montage : {e}"),
-        );
+        return EchecDeMontage::nouveau("lancement_impossible", "api.network.smbMountLaunchFailed")
+            .cause(e);
     }
     if euid != 0 {
-        (
+        EchecDeMontage::nouveau(
             "assistant_de_montage_absent",
-            format!(
-                "Le serveur ne tourne pas en root et l'assistant de montage de Tune OS \
-                 ({}) est introuvable, ou sudo est absent. Donnez au service les \
-                 privilèges système, ou montez le partage par le système (/etc/fstab) \
-                 et ajoutez le dossier obtenu aux dossiers de musique.",
-                crate::privilege::ASSISTANT
-            ),
+            "api.network.smbMountHelperMissing",
         )
+        .avec("helper", crate::privilege::ASSISTANT)
     } else {
-        (
-            "outil_de_montage_absent",
-            "L'outil de montage SMB est introuvable sur ce serveur. Sous Linux, \
-             installez le paquet cifs-utils (qui fournit mount.cifs), puis réessayez."
-                .to_string(),
-        )
+        EchecDeMontage::nouveau("outil_de_montage_absent", "api.network.smbMountToolMissing")
     }
 }
 
 /// #8069 — le système a refusé le montage ; `stderr` est sa réponse.
-fn obstacle_du_systeme(stderr: &str, conteneur: Option<&str>) -> (&'static str, String) {
+fn obstacle_du_systeme(stderr: &str, conteneur: Option<&str>) -> EchecDeMontage {
     let bas = stderr.to_lowercase();
     // `mount error(1): Operation not permitted` : le noyau refuse le montage
     // à un processus sans CAP_SYS_ADMIN — typiquement un conteneur.
     if bas.contains("error(1)") || bas.contains("operation not permitted") {
-        let conseil = match conteneur {
-            Some(moteur) => conseil_en_conteneur(moteur),
-            None => "Le serveur n'a pas les privilèges système pour monter un partage \
-                     (root et la capacité CAP_SYS_ADMIN). Donnez-les au service, ou \
-                     montez le partage par le système (/etc/fstab) et ajoutez le \
-                     dossier obtenu aux dossiers de musique."
-                .to_string(),
+        let echec = match conteneur {
+            Some(moteur) => en_conteneur("privileges_insuffisants", moteur),
+            None => EchecDeMontage::nouveau(
+                "privileges_insuffisants",
+                "api.network.smbMountNoPrivileges",
+            ),
         };
-        return (
-            "privileges_insuffisants",
-            format!("{conseil} (Détail : {stderr})"),
-        );
+        return echec.cause(stderr);
     }
     // `mount error(13): Permission denied` : le partage a refusé le nom
     // d'utilisateur ou le mot de passe (fil 6336) ; la réponse du système
     // reste citée, c'est la vraie cause.
     if smb::est_refus_d_authentification(stderr) {
-        return (
+        return EchecDeMontage::nouveau(
             "identifiants_refuses",
-            format!(
-                "Le partage a refusé le nom d'utilisateur ou le mot de passe. Vérifiez-les \
-                 (et le domaine s'il en faut un), puis réessayez. (Détail : {stderr})"
-            ),
-        );
+            "api.network.smbMountCredentialsRefused",
+        )
+        .cause(stderr);
     }
-    let detail = if stderr.is_empty() {
-        "le système n'a donné aucun détail"
+    EchecDeMontage::nouveau("montage_refuse", "api.network.smbMountFailed").cause(stderr)
+}
+
+/// #8069 — dans un conteneur, un montage peut-il seulement être TENTÉ ?
+///
+/// Le test de connexion de l'assistant (`dry_run`) ne vérifiait que le port
+/// 445 : au vert dans le conteneur du Synology, puis l'étape « Monter »
+/// échouait (même défaut que #1847). Il le dit désormais AVANT, quand le
+/// montage n'a aucune chance : en conteneur, sans `sudo` pour un service qui
+/// n'est pas root (l'image tourne sous `tune`), ou sans `mount.cifs` pour un
+/// service root. Rend le moteur de conteneur dans ce cas, `None` sinon (hors
+/// conteneur, rien ne change). Fonction pure, pour se tester sans système.
+fn montage_impossible_en_conteneur<'a>(
+    conteneur: Option<&'a str>,
+    euid: u32,
+    sudo_present: bool,
+    mount_cifs_present: bool,
+) -> Option<&'a str> {
+    let moteur = conteneur?;
+    let impossible = if euid == 0 {
+        !mount_cifs_present
     } else {
-        stderr
+        !sudo_present
     };
-    (
-        "montage_refuse",
-        format!("Le montage du partage a échoué : {detail}"),
-    )
+    impossible.then_some(moteur)
+}
+
+/// `mount.cifs` est-il installé ? Les emplacements usuels de `cifs-utils`.
+fn mount_cifs_present() -> bool {
+    [
+        "/sbin/mount.cifs",
+        "/usr/sbin/mount.cifs",
+        "/bin/mount.cifs",
+        "/usr/bin/mount.cifs",
+    ]
+    .iter()
+    .any(|p| std::path::Path::new(p).exists())
+}
+
+/// La réponse du test de connexion quand le montage est impossible ici.
+fn refus_du_test_en_conteneur(moteur: &str) -> axum::response::Response {
+    en_conteneur("montage_impossible_en_conteneur", moteur)
+        .statut(StatusCode::UNPROCESSABLE_ENTITY)
+        .en_reponse()
 }
 
 /// 409 : le point de montage est occupe par autre chose que ce partage.
@@ -4241,7 +4313,7 @@ mod tests_oubli_2145 {
 /// texte qui dit quoi faire dans `message`. Le client n'affiche que `message`.
 #[cfg(all(test, unix))]
 mod tests_echec_du_montage_8069 {
-    use super::reponse_d_echec_du_montage;
+    use super::{montage_impossible_en_conteneur, reponse_d_echec_du_montage};
     use axum::http::StatusCode;
     use std::os::unix::process::ExitStatusExt;
     use std::process::{ExitStatus, Output};
@@ -4272,17 +4344,29 @@ mod tests_echec_du_montage_8069 {
         (statut, serde_json::from_slice(&octets).unwrap())
     }
 
-    /// Le contrat que lit le client : `message` non vide, `error` un code.
+    /// Le contrat que lit le client : `message` non vide, `error` un code, et
+    /// `message_key` — sans elle, le web montre son message GÉNÉRIQUE et le
+    /// conseil n'atteint pas l'écran (#8069, contrat #7077). Hors requête, la
+    /// langue est l'anglais.
+    ///
+    /// Contre-épreuve : retirer `message_key` de `corps_refus` (ou revenir au
+    /// `json!({"error", "message"})` d'avant) fait rougir chaque test qui
+    /// passe par ici.
     fn affichable(v: &serde_json::Value) -> String {
         let code = v["error"].as_str().expect("error doit etre un code");
         assert!(
             !code.is_empty() && !code.contains(' '),
             "error doit rester un code machine, pas une phrase : {code:?}"
         );
+        let cle = v["message_key"]
+            .as_str()
+            .expect("message_key absente : le web afficherait son message generique");
+        assert!(cle.starts_with("api.network.smbMount"), "{cle}");
         let message = v["message"]
             .as_str()
             .expect("message absent : le client afficherait une erreur inconnue");
         assert!(!message.trim().is_empty(), "message vide");
+        assert_ne!(message, cle, "cle sans traduction : {cle}");
         message.to_string()
     }
 
@@ -4298,12 +4382,28 @@ mod tests_echec_du_montage_8069 {
         assert_eq!(statut, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(v["error"], "montage_impossible_en_conteneur");
         let m = affichable(&v);
-        assert!(m.contains("conteneur"), "{m}");
+        assert!(m.contains("container (docker)"), "{m}");
         assert!(
             m.contains("rslave"),
             "le message doit donner la propagation : {m}"
         );
         assert!(m.contains("CAP_SYS_ADMIN"), "{m}");
+        assert_eq!(v["params"]["engine"], "docker");
+    }
+
+    /// La même clé, en français : la phrase de rc11 est gardée mot pour mot.
+    #[test]
+    fn le_conseil_en_conteneur_se_lit_en_francais() {
+        let m = crate::message_api::texte_en(
+            "fr",
+            "api.network.smbMountInContainer",
+            &[("engine", "docker".to_string())],
+        );
+        assert!(
+            m.starts_with("Tune tourne dans un conteneur (docker)"),
+            "{m}"
+        );
+        assert!(m.contains("rslave") && m.contains("CAP_SYS_ADMIN"), "{m}");
     }
 
     #[tokio::test]
@@ -4333,8 +4433,10 @@ mod tests_echec_du_montage_8069 {
         let m = affichable(&v);
         assert!(m.contains("rslave") && m.contains("CAP_SYS_ADMIN"), "{m}");
         assert!(
-            m.contains("Operation not permitted"),
-            "le detail reste lisible : {m}"
+            v["cause"]
+                .as_str()
+                .is_some_and(|c| c.contains("Operation not permitted")),
+            "le detail reste lisible dans `cause` : {v}"
         );
 
         let (_, v) = corps(Ok(Ok(sortie(32, refus))), 0, None).await;
@@ -4343,7 +4445,7 @@ mod tests_echec_du_montage_8069 {
     }
 
     #[tokio::test]
-    async fn un_autre_refus_porte_la_reponse_du_systeme_dans_message() {
+    async fn un_autre_refus_porte_la_reponse_du_systeme_dans_cause() {
         let (_, v) = corps(
             Ok(Ok(sortie(32, "mount error(112): Host is down"))),
             0,
@@ -4351,10 +4453,13 @@ mod tests_echec_du_montage_8069 {
         )
         .await;
         assert_eq!(v["error"], "montage_refuse");
-        assert!(affichable(&v).contains("Host is down"));
-        // Sans rien sur stderr, le message n'est pas vide pour autant.
+        affichable(&v);
+        assert_eq!(v["cause"], "mount error(112): Host is down");
+        // Sans rien sur stderr, le message n'est pas vide pour autant, et
+        // aucune cause vide n'est publiée.
         let (_, v) = corps(Ok(Ok(sortie(32, ""))), 0, None).await;
-        assert!(affichable(&v).contains("aucun détail"));
+        affichable(&v);
+        assert!(v.get("cause").is_none(), "{v}");
     }
 
     #[tokio::test]
@@ -4368,8 +4473,8 @@ mod tests_echec_du_montage_8069 {
         assert_eq!(statut, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(v["error"], "identifiants_refuses");
         let m = affichable(&v);
-        assert!(m.contains("mot de passe"), "{m}");
-        assert!(m.contains("Permission denied"), "la vraie cause : {m}");
+        assert!(m.contains("password"), "{m}");
+        assert_eq!(v["cause"], "mount error(13): Permission denied");
     }
 
     #[tokio::test]
@@ -4381,14 +4486,15 @@ mod tests_echec_du_montage_8069 {
         let m = affichable(&v);
         assert!(m.contains("rslave"), "{m}");
         assert!(
-            m.contains("Détail"),
-            "le détail du système reste lisible : {m}"
+            v["cause"].as_str().is_some_and(|c| !c.is_empty()),
+            "le détail du système reste lisible : {v}"
         );
 
         // Hors conteneur, le cas reste celui d'avant.
         let refuse = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
         let (_, v) = corps(Ok(Err(refuse)), 1000, None).await;
         assert_eq!(v["error"], "lancement_impossible");
+        affichable(&v);
     }
 
     #[tokio::test]
@@ -4413,7 +4519,7 @@ mod tests_echec_du_montage_8069 {
         )
         .await;
         assert_eq!(v["error"], "elevation_refusee");
-        affichable(&v);
+        assert!(v["message"].as_str().is_some_and(|m| !m.is_empty()));
         let (statut, _) = corps(
             Ok(Ok(sortie(32, "mount error(16): Device or resource busy"))),
             0,
@@ -4421,6 +4527,51 @@ mod tests_echec_du_montage_8069 {
         )
         .await;
         assert_eq!(statut, StatusCode::CONFLICT);
+    }
+
+    /// Le test de connexion en conteneur : impossible sans sudo (service
+    /// `tune`), ou sans mount.cifs (service root) ; hors conteneur, jamais.
+    /// Contre-épreuve : rendre `None` sans condition fait rougir les deux
+    /// premières assertions (le test redevient vert dans le Synology).
+    #[test]
+    fn le_test_de_connexion_sait_quand_le_montage_est_impossible() {
+        assert_eq!(
+            montage_impossible_en_conteneur(Some("docker"), 1000, false, false),
+            Some("docker")
+        );
+        assert_eq!(
+            montage_impossible_en_conteneur(Some("docker"), 0, false, false),
+            Some("docker")
+        );
+        // Conteneur privilégié et outillé : on laisse tenter.
+        assert_eq!(
+            montage_impossible_en_conteneur(Some("docker"), 0, false, true),
+            None
+        );
+        assert_eq!(
+            montage_impossible_en_conteneur(Some("podman"), 1000, true, false),
+            None
+        );
+        // Hors conteneur, rien ne change.
+        assert_eq!(
+            montage_impossible_en_conteneur(None, 1000, false, false),
+            None
+        );
+    }
+
+    /// De bout en bout sur la route : le `dry_run` d'un serveur en conteneur
+    /// sans outil rend 422, le code et le conseil traduit. On ne peut pas
+    /// simuler `/.dockerenv` ; on passe par la réponse que la route rend.
+    #[tokio::test]
+    async fn le_refus_du_test_porte_le_conseil_traduit() {
+        let rep = super::refus_du_test_en_conteneur("docker");
+        assert_eq!(rep.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let octets = axum::body::to_bytes(rep.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&octets).unwrap();
+        assert_eq!(v["error"], "montage_impossible_en_conteneur");
+        assert!(affichable(&v).contains("rslave"));
     }
 }
 
