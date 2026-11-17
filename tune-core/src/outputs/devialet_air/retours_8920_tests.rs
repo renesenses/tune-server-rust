@@ -382,3 +382,76 @@ fn air_8920_cadence_sous_le_plafond_de_la_zone() {
         }
     }
 }
+
+/// #8920 (décision du 17/11) — au DÉPART d'une lecture, un ampli monté à la
+/// télécommande au-dessus de la sécurité y est ramené avant le premier
+/// paquet ; un changement de piste en cours de lecture ne le rappelle pas
+/// (l'ampli fait foi). Contre-épreuve : sans sécurité, aucun rappel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn air_8920_depart_de_lecture_a_la_securite_au_plus() {
+    use super::{media, pieces_du_banc_securite, wav_16_bits};
+    let dossier = crate::test_scratch::scratch_dir("devialet-air-8920-depart");
+    let (chemin, _) = wav_16_bits(&dossier, 44_100, 44_100 * 30);
+    let volumes = |sim: &Simulateur| -> Vec<f32> {
+        sim.etat()
+            .commandes
+            .iter()
+            .filter(|c| c.opcode == opcode::VOLUME)
+            .map(|c| c.valeur)
+            .collect()
+    };
+    let mut annonce = annonce_de_test();
+    annonce.volume_demi_db = -40;
+    let (sim, sortie, _d, relais) = pieces_du_banc_securite(
+        annonce.clone(),
+        true,
+        BornesDb::PAR_DEFAUT,
+        Some(SECURITE_DB),
+    )
+    .await;
+    sortie.play_media(&media(&chemin)).await.unwrap();
+    assert_eq!(
+        volumes(&sim),
+        vec![SECURITE_DB as f32; 2],
+        "départ : ramené à la sécurité"
+    );
+    assert!(sim.etat().annonce.as_ref().unwrap().volume_db() <= SECURITE_DB);
+    // En lecture, l'ampli remonté à la télécommande puis une autre piste :
+    // aucun rappel.
+    sim.etat().annonce.as_mut().unwrap().volume_demi_db = -40;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    sortie.play_media(&media(&chemin)).await.unwrap();
+    assert_eq!(
+        volumes(&sim).len(),
+        2,
+        "changement de piste : pas de rappel"
+    );
+    sortie.stop().await.unwrap();
+    // Arrêt puis nouvelle lecture : de nouveau un départ, de nouveau ramené.
+    sortie.play_media(&media(&chemin)).await.unwrap();
+    assert_eq!(volumes(&sim).len(), 4);
+    assert!(volumes(&sim).iter().all(|v| f64::from(*v) <= SECURITE_DB));
+    sortie.stop().await.unwrap();
+    relais.abort();
+    drop(sim);
+
+    // Contre-épreuve : sans sécurité, le départ ne commande aucun volume.
+    let (sim, sortie, _d, relais) =
+        pieces_du_banc_securite(annonce, true, BornesDb::PAR_DEFAUT, None).await;
+    sortie.play_media(&media(&chemin)).await.unwrap();
+    assert!(volumes(&sim).is_empty(), "{:?}", volumes(&sim));
+    sortie.stop().await.unwrap();
+    relais.abort();
+}
+
+/// La limite de sécurité en dB d'ampli : arrondie vers le bas, jamais au-dessus
+/// du plafond.
+#[test]
+fn air_8920_securite_en_db() {
+    use super::super::sortie::securite_en_db;
+    let c = BornesDb::PAR_DEFAUT;
+    assert_eq!(securite_en_db(c, SECURITE), SECURITE_DB);
+    // 0,51 → −44,3 dB exacts → −44,5 (vers le bas).
+    assert_eq!(securite_en_db(c, 0.51), -44.5);
+    assert_eq!(securite_en_db(c, 1.0), reglages::PLAFOND_DB);
+}

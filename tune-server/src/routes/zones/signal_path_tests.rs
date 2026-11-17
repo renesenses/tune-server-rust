@@ -5409,6 +5409,29 @@ fn air_8920_le_volume_du_chemin_est_en_db_d_ampli() {
     assert!(!volume.contains("dB"), "{volume}");
 }
 
+/// #8920 (décision du 17/11) — DoP n'est pas branché sur Devialet AIR : un
+/// DSD part en PCM, et le chemin le dit, même si la zone demande DoP.
+/// Contre-épreuve : un FLAC n'a pas l'étape, ni un DSD vers DLNA.
+#[test]
+fn air_8920_dsd_dit_converti_en_pcm_meme_en_dop() {
+    let (backend, zone) = zone_devialet_air();
+    ZoneRepo::with_backend(backend.clone())
+        .update_dsd_mode(zone.id.unwrap(), "dop")
+        .unwrap();
+    let sp = build_signal_path(&dsd_playing(), &zone, &backend, None, "none", None).unwrap();
+    let d = step_desc(&sp, "DSD").expect("étape DSD sur AIR");
+    assert!(d.contains("PCM") && d.contains("DoP"), "{d}");
+    let sp = build_signal_path(&flac_a(96_000), &zone, &backend, None, "none", None).unwrap();
+    assert_eq!(step_desc(&sp, "DSD"), None);
+    let repo = ZoneRepo::with_backend(backend.clone());
+    let id = repo
+        .create("Salon", Some("dlna"), Some("uuid:salon-8920-dsd"))
+        .unwrap();
+    let dlna = repo.get(id).unwrap().unwrap();
+    let sp = build_signal_path(&dsd_playing(), &dlna, &backend, None, "none", None).unwrap();
+    assert_eq!(step_desc(&sp, "DSD"), None);
+}
+
 // ── #6734 — sortie locale sans contrat : l'anneau f32 ne garde que 24 bits ──
 
 /// Le WAV 32 bits entiers du fil 2358 (test RME « 192 kHz 32 bit ADI-2 Pro

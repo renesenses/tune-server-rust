@@ -47,6 +47,7 @@ impl Banc {
             ecoute.clone(),
             air::ContexteAir {
                 plafond_de_cadence: std::sync::Arc::new(|_: &str| None),
+                securite_db: std::sync::Arc::new(|_: &str| None),
                 activee: Arc::new(|| true),
                 indice_source: Arc::new(|| 9),
                 bornes_db: Arc::new(|| air::reglages::BornesDb::PAR_DEFAUT),

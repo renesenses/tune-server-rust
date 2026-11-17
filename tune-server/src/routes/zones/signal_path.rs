@@ -2797,6 +2797,17 @@ fn assembler_les_etapes_lang(
         ),
     }));
 
+    // #8920 (décision du 17/11) — Devialet AIR : le DoP n'est pas branché
+    // tant qu'il n'a pas été essayé sur un ampli ; la sortie convertit TOUT
+    // DSD en PCM, même si la zone demande DoP. L'étape le dit en clair.
+    if is_dsd && tune_core::outputs::devialet_air::reglages::est_air(zone.output_type.as_deref()) {
+        steps.push(json!({
+            "name": "DSD",
+            "code": "air_dsd_pcm",
+            "description": ts(lang, "air_dsd_pcm"),
+            "bit_perfect": false,
+        }));
+    }
     let renderer_name = renderer_label
         .or(zone.output_device_id.as_deref())
         .unwrap_or(output_type);
