@@ -770,7 +770,12 @@ mod tests {
         unsafe { std::env::set_var("TUNE_SYSTEMCTL_BIN", "/faux/systemctl") };
         assert_eq!(systemctl_bin(), "/faux/systemctl");
         unsafe { std::env::remove_var("TUNE_SYSTEMCTL_BIN") };
-        assert_eq!(systemctl_bin(), "systemctl");
+        // Sans surcharge : un chemin ABSOLU, jamais un nom cherché dans le PATH.
+        let defaut = systemctl_bin();
+        assert!(
+            defaut == "/usr/bin/systemctl" || defaut == "/bin/systemctl",
+            "{defaut}"
+        );
     }
 
     // `la_route_d_extinction_est_montee` a ete RETIRE : il affirmait
