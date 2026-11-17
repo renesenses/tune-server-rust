@@ -43,14 +43,39 @@ fn poser(state: &AppState, decalage: i64) {
     )
     .expect("album");
     for (id, artiste, album, duree, chemin) in [
-        (1 + decalage, 1i64, Some(album), 180_000i64, format!("{DOSSIER}/01.flac")),
-        (2 + decalage, 1, Some(album), 2_000, format!("{DOSSIER}/02.flac")),
-        (3 + decalage, 2, None, 3_000, "/m/divers/bip.flac".to_string()),
+        (
+            1 + decalage,
+            1i64,
+            Some(album),
+            180_000i64,
+            format!("{DOSSIER}/01.flac"),
+        ),
+        (
+            2 + decalage,
+            1,
+            Some(album),
+            2_000,
+            format!("{DOSSIER}/02.flac"),
+        ),
+        (
+            3 + decalage,
+            2,
+            None,
+            3_000,
+            "/m/divers/bip.flac".to_string(),
+        ),
     ] {
         b.execute(
             "INSERT INTO tracks (id, title, artist_id, album_id, duration_ms, source, file_path) \
              VALUES (?1, ?2, ?3, ?4, ?5, 'local', ?6)",
-            &[&id as &dyn ToSqlValue, &format!("p{}", id - decalage), &artiste, &album, &duree, &chemin],
+            &[
+                &id as &dyn ToSqlValue,
+                &format!("p{}", id - decalage),
+                &artiste,
+                &album,
+                &duree,
+                &chemin,
+            ],
         )
         .expect("piste");
     }
@@ -59,8 +84,11 @@ fn poser(state: &AppState, decalage: i64) {
 fn etat() -> AppState {
     let state = AppState::new(":memory:", 0, Default::default()).expect("état");
     let b = &state.backend;
-    b.execute("INSERT INTO artists (id, name) VALUES (1, 'Unknown Artist')", &[])
-        .expect("artiste inconnu");
+    b.execute(
+        "INSERT INTO artists (id, name) VALUES (1, 'Unknown Artist')",
+        &[],
+    )
+    .expect("artiste inconnu");
     b.execute("INSERT INTO artists (id, name) VALUES (2, 'Didier')", &[])
         .expect("artiste");
     poser(&state, 0);
@@ -87,14 +115,18 @@ async fn douteuses(state: &AppState) -> Value {
 
 /// Les raisons de la piste de chemin `fin` (les ids changent au rescan).
 fn raisons(v: &Value, fin: &str) -> Option<Vec<String>> {
-    v["items"].as_array()?.iter().find(|i| i["file_path"].as_str().is_some_and(|p| p.ends_with(fin))).map(|i| {
-        i["reasons"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|r| r.as_str().unwrap().to_string())
-            .collect()
-    })
+    v["items"]
+        .as_array()?
+        .iter()
+        .find(|i| i["file_path"].as_str().is_some_and(|p| p.ends_with(fin)))
+        .map(|i| {
+            i["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r.as_str().unwrap().to_string())
+                .collect()
+        })
 }
 
 async fn ignorer(state: &AppState, piste: i64, raison: &str) -> (StatusCode, Value) {
@@ -111,11 +143,24 @@ async fn ignorer(state: &AppState, piste: i64, raison: &str) -> (StatusCode, Val
 async fn la_liste_annonce_la_portee_de_chaque_alerte() {
     let state = etat();
     let v = douteuses(&state).await;
-    assert_eq!(v["can_ignore"], true, "authentification coupée : tout le monde est administrateur");
-    let p2 = v["items"].as_array().unwrap().iter().find(|i| i["id"] == 2).unwrap();
+    assert_eq!(
+        v["can_ignore"], true,
+        "authentification coupée : tout le monde est administrateur"
+    );
+    let p2 = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == 2)
+        .unwrap();
     assert_eq!(p2["ignore_scopes"]["missing_artist"], "album", "{p2}");
     assert_eq!(p2["ignore_scopes"]["very_short"], "track", "{p2}");
-    let p3 = v["items"].as_array().unwrap().iter().find(|i| i["id"] == 3).unwrap();
+    let p3 = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == 3)
+        .unwrap();
     assert_eq!(p3["ignore_scopes"]["missing_album"], "track", "{p3}");
 }
 
@@ -131,7 +176,10 @@ async fn piste_tres_courte_ignoree_garde_son_autre_alerte() {
     assert_eq!(r["key"], format!("{DOSSIER}/02.flac"));
     let v = douteuses(&state).await;
     assert_eq!(v["total"], 3, "la piste 2 manque toujours d'artiste : {v}");
-    assert_eq!(raisons(&v, "/02.flac"), Some(vec!["missing_artist".to_string()]));
+    assert_eq!(
+        raisons(&v, "/02.flac"),
+        Some(vec!["missing_artist".to_string()])
+    );
 
     let (_, r) = ignorer(&state, 2, "very_short").await;
     assert_eq!(r["added"], false, "rejouée : rien de plus");
@@ -141,7 +189,13 @@ async fn piste_tres_courte_ignoree_garde_son_autre_alerte() {
 #[tokio::test]
 async fn artiste_manquant_ignore_pour_tout_l_album() {
     let state = etat();
-    let (_, avant) = route(&state, "POST", "/doubtful/artist-from-folder", r#"{"dry_run":true}"#).await;
+    let (_, avant) = route(
+        &state,
+        "POST",
+        "/doubtful/artist-from-folder",
+        r#"{"dry_run":true}"#,
+    )
+    .await;
     assert_eq!(avant["tracks"], 2, "aperçu avant : {avant}");
     let (code, r) = ignorer(&state, 1, "missing_artist").await;
     assert_eq!(code, StatusCode::OK, "{r}");
@@ -149,13 +203,26 @@ async fn artiste_manquant_ignore_pour_tout_l_album() {
     assert_eq!(r["key"], DOSSIER);
     assert_eq!(r["title"], "Sound Effects");
     let v = douteuses(&state).await;
-    assert_eq!(raisons(&v, "/01.flac"), None, "piste 1 : plus aucune alerte : {v}");
-    assert_eq!(raisons(&v, "/02.flac"), Some(vec!["very_short".to_string()]));
+    assert_eq!(
+        raisons(&v, "/01.flac"),
+        None,
+        "piste 1 : plus aucune alerte : {v}"
+    );
+    assert_eq!(
+        raisons(&v, "/02.flac"),
+        Some(vec!["very_short".to_string()])
+    );
     let compte = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone())
         .count_doubtful()
         .unwrap();
     assert_eq!(compte, 2, "la pastille compte pareil");
-    let (_, apercu) = route(&state, "POST", "/doubtful/artist-from-folder", r#"{"dry_run":true}"#).await;
+    let (_, apercu) = route(
+        &state,
+        "POST",
+        "/doubtful/artist-from-folder",
+        r#"{"dry_run":true}"#,
+    )
+    .await;
     assert_eq!(apercu["tracks"], 0, "aperçu : {apercu}");
 }
 
@@ -168,10 +235,23 @@ async fn les_choix_survivent_a_un_rescan_complet() {
     ignorer(&state, 3, "very_short").await;
     rescanner(&state);
     let v = douteuses(&state).await;
-    assert!(v["items"].as_array().unwrap().iter().all(|i| i["id"].as_i64().unwrap() > 100), "{v}");
+    assert!(
+        v["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["id"].as_i64().unwrap() > 100),
+        "{v}"
+    );
     assert_eq!(raisons(&v, "/01.flac"), None, "album : {v}");
-    assert_eq!(raisons(&v, "/02.flac"), Some(vec!["very_short".to_string()]));
-    assert_eq!(raisons(&v, "/bip.flac"), Some(vec!["missing_album".to_string()]));
+    assert_eq!(
+        raisons(&v, "/02.flac"),
+        Some(vec!["very_short".to_string()])
+    );
+    assert_eq!(
+        raisons(&v, "/bip.flac"),
+        Some(vec!["missing_album".to_string()])
+    );
 
     // La liste les retrouve sous leurs nouveaux ids.
     let (_, l) = route(&state, "GET", "/doubtful/ignored", "").await;
@@ -179,7 +259,12 @@ async fn les_choix_survivent_a_un_rescan_complet() {
     for it in l["items"].as_array().unwrap() {
         assert_eq!(it["found"], true, "{it}");
     }
-    let album = l["items"].as_array().unwrap().iter().find(|i| i["scope"] == "album").unwrap();
+    let album = l["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["scope"] == "album")
+        .unwrap();
     assert_eq!(album["album_id"], 101);
     assert_eq!(album["track_count"], 2);
 
@@ -196,7 +281,11 @@ async fn un_homonyme_ailleurs_n_est_pas_couvert() {
     let state = etat();
     ignorer(&state, 1, "missing_artist").await;
     let b = &state.backend;
-    b.execute("INSERT INTO albums (id, title) VALUES (9, 'Sound Effects')", &[]).unwrap();
+    b.execute(
+        "INSERT INTO albums (id, title) VALUES (9, 'Sound Effects')",
+        &[],
+    )
+    .unwrap();
     b.execute(
         "INSERT INTO tracks (id, title, artist_id, album_id, duration_ms, source, file_path) \
          VALUES (9, 'autre', 1, 9, 180000, 'local', '/data/recordings/Tidal/Prince/Ultimate 2/01.flac')",
@@ -204,7 +293,11 @@ async fn un_homonyme_ailleurs_n_est_pas_couvert() {
     )
     .unwrap();
     let v = douteuses(&state).await;
-    assert_eq!(raisons(&v, "Ultimate 2/01.flac"), Some(vec!["missing_artist".to_string()]), "{v}");
+    assert_eq!(
+        raisons(&v, "Ultimate 2/01.flac"),
+        Some(vec!["missing_artist".to_string()]),
+        "{v}"
+    );
 }
 
 /// La liste des ignorées la montre ; l'annulation la rend.
@@ -214,7 +307,11 @@ async fn revoir_puis_annuler() {
     ignorer(&state, 3, "very_short").await;
     ignorer(&state, 3, "missing_album").await;
     let v = douteuses(&state).await;
-    assert_eq!(raisons(&v, "/bip.flac"), None, "les deux alertes de la piste 3 sont ignorées : {v}");
+    assert_eq!(
+        raisons(&v, "/bip.flac"),
+        None,
+        "les deux alertes de la piste 3 sont ignorées : {v}"
+    );
 
     let (code, l) = route(&state, "GET", "/doubtful/ignored", "").await;
     assert_eq!(code, StatusCode::OK);
@@ -225,7 +322,10 @@ async fn revoir_puis_annuler() {
     let corps = r#"{"scope":"track","key":"/m/divers/bip.flac","title":"","reason":"very_short"}"#;
     let (code, r) = route(&state, "DELETE", "/doubtful/ignored", corps).await;
     assert_eq!(code, StatusCode::OK, "{r}");
-    assert_eq!(raisons(&douteuses(&state).await, "/bip.flac"), Some(vec!["very_short".to_string()]));
+    assert_eq!(
+        raisons(&douteuses(&state).await, "/bip.flac"),
+        Some(vec!["very_short".to_string()])
+    );
     let (_, l) = route(&state, "GET", "/doubtful/ignored", "").await;
     assert_eq!(l["total"], 1);
 
@@ -264,10 +364,18 @@ async fn la_lecture_ne_purge_pas_la_fin_de_scan_complet_si() {
     let state = etat();
     ignorer(&state, 3, "very_short").await;
     ignorer(&state, 1, "missing_artist").await;
-    state.backend.execute("DELETE FROM tracks WHERE id = 3", &[]).unwrap();
+    state
+        .backend
+        .execute("DELETE FROM tracks WHERE id = 3", &[])
+        .unwrap();
     let (_, l) = route(&state, "GET", "/doubtful/ignored", "").await;
     assert_eq!(l["total"], 2, "{l}");
-    let piste = l["items"].as_array().unwrap().iter().find(|i| i["scope"] == "track").unwrap();
+    let piste = l["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["scope"] == "track")
+        .unwrap();
     assert_eq!(piste["found"], false, "{piste}");
     assert_eq!(piste["label"], "p3", "le nom figé au choix reste lisible");
 
@@ -277,7 +385,10 @@ async fn la_lecture_ne_purge_pas_la_fin_de_scan_complet_si() {
     assert_eq!(l["total"], 2, "scan partiel : rien n'est purgé");
     tune_core::db::alertes_douteuses_ignorees::purger_en_fin_de_scan(db, true, "test");
     let (_, l) = route(&state, "GET", "/doubtful/ignored", "").await;
-    assert_eq!(l["total"], 1, "scan complet : seul l'introuvable part : {l}");
+    assert_eq!(
+        l["total"], 1,
+        "scan complet : seul l'introuvable part : {l}"
+    );
     assert_eq!(l["items"][0]["scope"], "album");
 }
 
@@ -292,5 +403,8 @@ async fn reserve_a_l_administrateur() {
     let (_, v) = route(&state, "GET", "/doubtful?limit=100", "").await;
     assert_eq!(v["can_ignore"], false, "{v}");
     let (code, _) = ignorer(&state, 2, "very_short").await;
-    assert!(code == StatusCode::UNAUTHORIZED || code == StatusCode::FORBIDDEN, "{code}");
+    assert!(
+        code == StatusCode::UNAUTHORIZED || code == StatusCode::FORBIDDEN,
+        "{code}"
+    );
 }

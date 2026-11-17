@@ -218,7 +218,10 @@ pub(super) async fn retablir(
     Json(d): Json<Annulation>,
 ) -> impl IntoResponse {
     let Some(portee) = Portee::depuis(&d.scope) else {
-        return erreur(StatusCode::BAD_REQUEST, format!("unknown scope: {}", d.scope));
+        return erreur(
+            StatusCode::BAD_REQUEST,
+            format!("unknown scope: {}", d.scope),
+        );
     };
     match ignorees::retablir(&state.backend, portee, &d.key, &d.title, &d.reason) {
         Ok(true) => Json(json!({"status": "ok", "removed": true})).into_response(),

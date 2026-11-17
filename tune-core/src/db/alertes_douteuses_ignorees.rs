@@ -114,7 +114,11 @@ pub fn cle_piste(t: &Track) -> Option<String> {
     if let Some(p) = t.file_path.as_deref().filter(|p| !p.is_empty()) {
         return Some(p.to_string());
     }
-    Some(format!("{}#{}", t.cue_media_path.as_deref()?, t.cue_start_ms?))
+    Some(format!(
+        "{}#{}",
+        t.cue_media_path.as_deref()?,
+        t.cue_start_ms?
+    ))
 }
 
 /// Le chemin sur disque d'une piste (fichier, ou image CUE).
@@ -372,7 +376,10 @@ mod tests {
     fn dossier_commun_d_un_album_multi_disques() {
         let c = ["/m/Fx/Bruitages/CD1/01.flac", "/m/Fx/Bruitages/CD2/01.flac"];
         assert_eq!(dossier_commun(c).as_deref(), Some("/m/Fx/Bruitages"));
-        assert_eq!(dossier_commun(["/m/Fx/Bruitages/01.flac"]).as_deref(), Some("/m/Fx/Bruitages"));
+        assert_eq!(
+            dossier_commun(["/m/Fx/Bruitages/01.flac"]).as_deref(),
+            Some("/m/Fx/Bruitages")
+        );
         // Trop large : la racine seule ne désigne pas un album.
         assert_eq!(dossier_commun(["/a.flac", "/b.flac"]), None);
         assert_eq!(dossier_commun(["/m/a.flac", "/n/b.flac"]), None);
