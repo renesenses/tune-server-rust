@@ -46,6 +46,15 @@ pub mod titre_radio_2991;
 #[path = "dlna_volume_illisible_5662.rs"]
 pub(crate) mod volume_illisible_5662;
 
+/// #8685 — la sourdine relue sur l'appareil (`GetMute`) avant et après
+/// chaque `SetMute`.
+#[path = "dlna_sourdine_relue_8685.rs"]
+mod sourdine_relue_8685;
+
+#[cfg(test)]
+#[path = "dlna_sourdine_relue_8685_tests.rs"]
+mod sourdine_relue_8685_tests;
+
 /// #5575 — renderer qui acquitte `SetVolume` sans jamais l'appliquer.
 #[path = "dlna_volume_decoratif_5575.rs"]
 pub(crate) mod volume_decoratif_5575;
@@ -1460,6 +1469,15 @@ impl DlnaOutput {
         if self.sourdine_par_volume_nul.load(Ordering::Relaxed) {
             return self.sourdine_par_volume_nul().await;
         }
+        // #8685 — un appareil déjà muet ne reçoit pas un second `SetMute(1)` :
+        // l'Eversolo DMP-A8 sortait de ces réaffirmations avec une sourdine
+        // INVERSÉE (son au bouton « muet », silence au bouton « non muet »).
+        if self.lire_la_sourdine().await == Some(true) {
+            self.sourdine_par_volume_nul.store(false, Ordering::Relaxed);
+            self.event_state.lock().await.muted = Some(true);
+            info!(device = %self.name, device_id = %self.device_id, "dlna_sourdine_deja_tenue");
+            return Ok("deja_tenue");
+        }
         let reponse = self
             .rc_action(
                 "SetMute",
@@ -1478,7 +1496,8 @@ impl DlnaOutput {
         };
         let Some(refus) = refus else {
             self.sourdine_par_volume_nul.store(false, Ordering::Relaxed);
-            self.event_state.lock().await.muted = Some(true);
+            // #8685 — l'acquittement ne suffit pas : l'état relu fait foi.
+            self.confirmer_la_sourdine(true).await?;
             return Ok("SetMute");
         };
         warn!(device = %self.name, response = %refus, "dlna_set_mute_rejected_volume_nul");
@@ -3559,6 +3578,15 @@ impl OutputTarget for DlnaOutput {
             self.muted.store(false, Ordering::Relaxed);
             return Ok(());
         }
+        // #8685 — un appareil qui n'est pas muet ne reçoit pas `SetMute(0)` :
+        // sur un firmware qui bascule au lieu d'appliquer la valeur, ce
+        // `SetMute(0)` coupait le son que l'auditeur croyait rendre.
+        if self.lire_la_sourdine().await == Some(false) {
+            info!(device = %self.name, device_id = %self.device_id, "dlna_sourdine_deja_levee");
+            self.event_state.lock().await.muted = Some(false);
+            self.muted.store(false, Ordering::Relaxed);
+            return Ok(());
+        }
         let reponse = self
             .rc_action(
                 "SetMute",
@@ -3575,8 +3603,12 @@ impl OutputTarget for DlnaOutput {
         info!(device = %self.name, device_id = %self.device_id, commande = "SetMute", "dlna_unmute_ok");
         // Même geste que `OpenHomeOutput::set_mute` : l'état poussé porte
         // désormais la levée, on ne le laisse pas en retard d'un évènement
-        // sur ce que Tune vient d'obtenir.
-        self.event_state.lock().await.muted = Some(false);
+        // sur ce que Tune vient d'obtenir. #8685 — après relecture : un
+        // appareil resté muet n'est pas annoncé « son rendu ».
+        if let Err(e) = self.confirmer_la_sourdine(false).await {
+            self.muted.store(true, Ordering::Relaxed);
+            return Err(e);
+        }
         self.muted.store(false, Ordering::Relaxed);
         Ok(())
     }

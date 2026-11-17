@@ -35,6 +35,8 @@ const PROTEGES: &[&str] = &[
     // Sécurité : l'arrêt programmé peut éteindre la machine ; il passe par sa
     // route gardée, jamais par le réglage brut.
     "scheduled_stop",
+    // #8909 : le dernier échec d'extinction, écrit par le planificateur seul.
+    "scheduled_stop_poweroff_error",
     "auth_enabled",
     "api_key",
     "jwt_secret",

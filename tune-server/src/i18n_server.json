@@ -6679,5 +6679,22 @@
     "nb": "Å oppdage",
     "pl": "Do odkrycia",
     "el": "Για ανακάλυψη"
+  },
+  "playback.youtube_playback_disabled": {
+    "fr": "La lecture YouTube n'est pas activée. Activez-la dans Réglages › Accès et jetons › Services de streaming › Lecture YouTube : Tune télécharge un petit outil (yt-dlp), sans lequel YouTube ne se lit plus.",
+    "en": "YouTube playback is not enabled. Turn it on in Settings › Access and tokens › Streaming Services › YouTube playback: Tune downloads a small helper (yt-dlp), without which YouTube can no longer be played.",
+    "de": "Die YouTube-Wiedergabe ist nicht aktiviert. Aktivieren Sie sie unter Einstellungen › Zugang und Token › Streaming-Dienste › YouTube-Wiedergabe: Tune lädt ein kleines Hilfsprogramm (yt-dlp) herunter, ohne das YouTube nicht mehr abgespielt werden kann.",
+    "es": "La reproducción de YouTube no está activada. Actívela en Ajustes › Acceso y tokens › Servicios de streaming › Reproducción de YouTube: Tune descarga una pequeña herramienta (yt-dlp), sin la cual YouTube ya no se puede reproducir.",
+    "it": "La riproduzione YouTube non è attivata. Attivala in Impostazioni › Accesso e token › Servizi di streaming › Riproduzione YouTube: Tune scarica un piccolo strumento (yt-dlp), senza il quale YouTube non si può più riprodurre.",
+    "zh": "YouTube 播放未启用。请在 设置 › 访问与令牌 › 流媒体服务 › YouTube 播放 中启用：Tune 会下载一个小工具（yt-dlp），没有它就无法再播放 YouTube。",
+    "ja": "YouTube 再生が有効になっていません。設定 › アクセスとトークン › ストリーミングサービス › YouTube 再生 で有効にしてください。Tune が小さなツール（yt-dlp）をダウンロードします。これがないと YouTube は再生できません。",
+    "ko": "YouTube 재생이 활성화되지 않았습니다. 설정 › 접근과 토큰 › 스트리밍 서비스 › YouTube 재생에서 켜세요. Tune이 작은 도구(yt-dlp)를 내려받으며, 이것이 없으면 YouTube를 더 이상 재생할 수 없습니다.",
+    "ro": "Redarea YouTube nu este activată. Activați-o în Setări › Acces și jetoane › Servicii de streaming › Redare YouTube: Tune descarcă un mic instrument (yt-dlp), fără de care YouTube nu mai poate fi redat.",
+    "sv": "YouTube-uppspelning är inte aktiverad. Slå på den under Inställningar › Åtkomst och tokens › Streamingtjänster › YouTube-uppspelning: Tune laddar ned ett litet verktyg (yt-dlp), utan vilket YouTube inte längre kan spelas.",
+    "hu": "A YouTube-lejátszás nincs bekapcsolva. Kapcsolja be a Beállítások › Hozzáférés és tokenek › Streamingszolgáltatások › YouTube-lejátszás alatt: a Tune letölt egy kis eszközt (yt-dlp), amely nélkül a YouTube már nem játszható le.",
+    "vi": "Chưa bật phát YouTube. Hãy bật trong Cài đặt › Truy cập và token › Dịch vụ streaming › Phát YouTube: Tune sẽ tải một công cụ nhỏ (yt-dlp), thiếu nó thì không thể phát YouTube nữa.",
+    "nb": "YouTube-avspilling er ikke slått på. Slå den på under Innstillinger › Tilgang og tokener › Strømmetjenester › YouTube-avspilling: Tune laster ned et lite verktøy (yt-dlp), og uten det kan YouTube ikke lenger spilles av.",
+    "pl": "Odtwarzanie YouTube nie jest włączone. Włącz je w Ustawienia › Dostęp i tokeny › Usługi streamingowe › Odtwarzanie YouTube: Tune pobierze małe narzędzie (yt-dlp), bez którego YouTube nie da się już odtwarzać.",
+    "el": "Η αναπαραγωγή YouTube δεν είναι ενεργοποιημένη. Ενεργοποιήστε την στις Ρυθμίσεις › Πρόσβαση και διακριτικά › Υπηρεσίες streaming › Αναπαραγωγή YouTube: το Tune κατεβάζει ένα μικρό εργαλείο (yt-dlp), χωρίς το οποίο το YouTube δεν αναπαράγεται πλέον."
   }
 }

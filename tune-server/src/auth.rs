@@ -612,7 +612,14 @@ pub struct RequireAdmin;
 
 /// L'authentification est-elle active sur ce serveur ?
 pub fn authentification_active(state: &AppState) -> bool {
-    SettingsRepo::with_backend(state.backend.clone())
+    authentification_active_db(&state.backend)
+}
+
+/// [`authentification_active`] sans état HTTP (planificateurs, #8909).
+pub fn authentification_active_db(
+    db: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> bool {
+    SettingsRepo::with_backend(db.clone())
         .get("auth_enabled")
         .ok()
         .flatten()
