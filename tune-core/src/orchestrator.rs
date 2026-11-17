@@ -2446,6 +2446,11 @@ mod dsd_upnp_politique_de_zone_tests;
 #[cfg(test)]
 mod dsd_pret_de_sorties_8052_tests;
 
+/// #8956 — Atoll ST200 : un DSD de serveur UPnP part dans l'orthographe que
+/// le Sink publie pour son conteneur (`audio/x-dsf` / `audio/x-dff`).
+#[cfg(test)]
+mod dsd_upnp_atoll_st200_8956_tests;
+
 /// Relevé par #5119 — les bras DSF UPnP et AAC n'appliquent pas l'égaliseur
 /// d'une zone LOCALE dans son flux : mesuré sur le PCM, une passe et non deux.
 #[cfg(test)]
