@@ -11899,14 +11899,6 @@ async fn une_lecture_doublee_pendant_son_envoi_n_arrete_pas_la_gagnante_8404() {
         portable.output_sent,
         "le titre du portable part au renderer"
     );
-    let tablette = tablette.expect("la lecture doublée n'est pas une erreur");
-    assert!(!tablette.output_sent);
-    assert_eq!(
-        tablette.error.as_deref(),
-        Some(crate::orchestrator::PLAY_SUPERSEDED),
-        "la lecture de la tablette se sait doublée"
-    );
-
     let etat = orch.playback.get_state(zone_id).await;
     assert_eq!(
         etat.state,
@@ -11940,6 +11932,14 @@ async fn une_lecture_doublee_pendant_son_envoi_n_arrete_pas_la_gagnante_8404() {
     let mock = guard.as_any().downcast_ref::<MockOutput>().expect("mock");
     let url = mock.last_play_url().await.expect("une URL envoyée");
     assert!(url.contains(&sid_portable), "dernière URL reçue : {url}");
+
+    let tablette = tablette.expect("la lecture doublée n'est pas une erreur");
+    assert!(!tablette.output_sent);
+    assert_eq!(
+        tablette.error.as_deref(),
+        Some(crate::orchestrator::PLAY_SUPERSEDED),
+        "la lecture de la tablette se sait doublée"
+    );
 }
 
 /// #8689 — mesure sur les échantillons, sans sortie audio ni appel réseau.
