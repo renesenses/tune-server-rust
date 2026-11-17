@@ -116,6 +116,33 @@ pub fn decider_navigation(serveur: &str, cible: &Url) -> Decision {
     }
 }
 
+/// Un lien peut-il partir dans le navigateur du système ?
+///
+/// `http` et `https` avec un hôte, et rien d'autre : ni `file:`, ni
+/// `javascript:`, ni les schémas qui lancent un programme (`ms-settings:`,
+/// `search-ms:`…) qu'une page distante pourrait faire ouvrir par le système.
+pub fn ouvrable_dans_le_navigateur(cible: &Url) -> bool {
+    matches!(cible.scheme(), "http" | "https") && cible.host_str().is_some_and(|h| !h.is_empty())
+}
+
+/// Ce que la fenêtre fait d'une demande de NOUVELLE fenêtre (`target="_blank"`,
+/// `window.open`) : jamais une fenêtre du widget (web#3142).
+///
+/// - un geste `/__widget/…` du serveur configuré : exécuté, comme en navigation ;
+/// - tout autre lien http(s), vers le serveur ou ailleurs (« Site web de la
+///   station ») : le navigateur du système ;
+/// - le reste, `about:blank` compris : refusé.
+pub fn decider_nouvelle_fenetre(serveur: &str, cible: &Url) -> Decision {
+    match decider_navigation(serveur, cible) {
+        Decision::Action(a) => Decision::Action(a),
+        Decision::Refuser => Decision::Refuser,
+        Decision::Autoriser | Decision::Externe if ouvrable_dans_le_navigateur(cible) => {
+            Decision::Externe
+        }
+        Decision::Autoriser | Decision::Externe => Decision::Refuser,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +297,75 @@ mod tests {
         assert!(tailles.iter().all(|(w, _)| *w <= MINI_LARGEUR_MAX));
         assert!(MINI_REPLIE.1 >= MINI_MIN.1);
         assert!(MINI_DEPLIE.1 > MINI_REPLIE.1);
+    }
+
+    #[test]
+    fn seuls_http_et_https_partent_dans_le_navigateur() {
+        for ok in [
+            "https://www.radiofrance.fr/fip",
+            "http://example.org/a?b=c#d",
+            "https://192.168.1.18:8888/",
+        ] {
+            assert!(ouvrable_dans_le_navigateur(&u(ok)), "{ok}");
+        }
+        for ko in [
+            "file:///C:/Windows/System32/calc.exe",
+            "javascript:alert(1)",
+            "data:text/html,<script>alert(1)</script>",
+            "ms-settings:privacy",
+            "search-ms:query=x",
+            "mailto:a@b.c",
+            "tauri://localhost/",
+            "about:blank",
+            "ftp://example.org/",
+            "vbscript:msgbox(1)",
+        ] {
+            assert!(!ouvrable_dans_le_navigateur(&u(ko)), "{ko}");
+        }
+    }
+
+    #[test]
+    fn une_nouvelle_fenetre_part_dans_le_navigateur_du_systeme() {
+        // web#3142 : « Site web de la station », target="_blank".
+        assert_eq!(
+            decider_nouvelle_fenetre(SRV, &u("https://www.fip.fr/")),
+            Decision::Externe
+        );
+        // Une page du serveur ouverte en nouvel onglet : le navigateur aussi,
+        // jamais une seconde fenêtre du widget.
+        assert_eq!(
+            decider_nouvelle_fenetre(SRV, &u(&format!("{SRV}/api/v1/system/logs"))),
+            Decision::Externe
+        );
+        // Les gestes natifs restent des gestes, et seulement depuis le serveur.
+        assert_eq!(
+            decider_nouvelle_fenetre(SRV, &u(&format!("{SRV}/__widget/complet"))),
+            Decision::Action(ActionWidget::Complet)
+        );
+        assert_eq!(
+            decider_nouvelle_fenetre(SRV, &u("http://evil.example/__widget/complet")),
+            Decision::Externe
+        );
+        for ko in [
+            "about:blank",
+            "file:///etc/passwd",
+            "javascript:alert(1)",
+            "ms-settings:privacy",
+        ] {
+            assert_eq!(
+                decider_nouvelle_fenetre(SRV, &u(ko)),
+                Decision::Refuser,
+                "{ko}"
+            );
+        }
+        assert_eq!(
+            decider_nouvelle_fenetre(SRV, &u(&format!("{SRV}/__widget/inconnue"))),
+            Decision::Refuser
+        );
+        // Adresse configurée illisible : rien ne part.
+        assert_eq!(
+            decider_nouvelle_fenetre("pas une adresse", &u("https://www.fip.fr/")),
+            Decision::Refuser
+        );
     }
 }

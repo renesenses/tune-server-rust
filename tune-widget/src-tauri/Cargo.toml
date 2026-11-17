@@ -4,13 +4,14 @@
 
 [package]
 name = "tune-widget"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2021"
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-global-shortcut = "2"
-tauri-plugin-shell = "2"
+tauri-plugin-opener = "2"
+tauri-plugin-single-instance = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
@@ -22,6 +23,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "ansi"] }
 tracing-appender = "0.2"
 urlencoding = "2"
+url = "2"
+
+# Option « démarrer le serveur local » : le dossier d'installation de Tune
+# Server se lit dans la clé de désinstallation écrite par son installeur.
+[target.'cfg(windows)'.dependencies]
+winreg = "0.55"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
