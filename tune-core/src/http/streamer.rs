@@ -1177,7 +1177,6 @@ pub enum Relecture {
 }
 
 /// #5426 — fenêtre glissante des derniers blocs tirés du canal.
-#[derive(Default)]
 /// #8926 — durée d'audio que la tête du direct d'une radio peut rejouer.
 ///
 /// Sur le .18 (17/11, FIP → Eversolo DMP-A8), la sonde `Lavf` a emporté
@@ -1220,6 +1219,7 @@ pub enum TeteRejouable {
     Depassee,
 }
 
+#[derive(Default)]
 struct RetenueDuCanal {
     /// Position dans le flux du premier octet retenu.
     debut: u64,

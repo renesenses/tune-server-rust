@@ -239,7 +239,12 @@ async fn demarrer(latence: Duration, rafale: Duration, sonde: bool, secondes: us
     );
     let pret = data_ready.clone();
     let pour_le_decodeur = session.clone();
-    tokio::task::spawn_blocking(move || {
+    // Un fil à part et non `spawn_blocking` : la station ne finit jamais, et
+    // l'arrêt du runtime du test attendrait sans fin une tâche bloquante. Le
+    // fil s'arrête de lui-même quand le runtime disparaît.
+    let runtime = tokio::runtime::Handle::current();
+    std::thread::spawn(move || {
+        let _dans_le_runtime = runtime.enter();
         tune_core::orchestrator::banc_radio_8926::decoder_la_station(
             station,
             tx,
