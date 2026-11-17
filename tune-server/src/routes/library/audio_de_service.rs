@@ -133,6 +133,9 @@ pub(crate) enum Refus {
     DelaiDepasse,
     /// Tout autre échec de la résolution ou du téléchargement.
     TelechargementImpossible,
+    /// Téléchargé en entier, mais le décodeur n'en tire rien (format non
+    /// pris en charge, fichier abîmé) : le retélécharger n'y changerait rien.
+    FichierIllisible,
     /// Une plage (zoom) ou un autre nombre de colonnes : pour une piste de
     /// service, seule la piste entière au nombre par défaut se calcule (un
     /// zoom retéléchargerait la piste entière à chaque fois).
@@ -151,6 +154,7 @@ impl Refus {
             Self::TropVolumineux => "trop_volumineux",
             Self::DelaiDepasse => "delai_depasse",
             Self::TelechargementImpossible => "telechargement_impossible",
+            Self::FichierIllisible => "fichier_illisible",
             Self::ZoomNonDisponible => "zoom_non_disponible",
         }
     }
@@ -167,6 +171,7 @@ impl Refus {
             Self::TropVolumineux => "track too large to download for analysis",
             Self::DelaiDepasse => "download for analysis timed out",
             Self::TelechargementImpossible => "download for analysis failed",
+            Self::FichierIllisible => "downloaded audio could not be decoded",
             Self::ZoomNonDisponible => {
                 "only the whole track at the default size is available for a streaming track"
             }

@@ -26,7 +26,8 @@
 //! - `202 {"waveform": null, "pending": true}` : calcul lancé (ou déjà en
 //!   route) en tâche de fond ; l'écran garde la barre classique et redemande ;
 //! - `200 {"waveform": null, "raison": …}` : refus DÉFINITIF (piste non
-//!   diffusable, hors région, trop volumineuse, service non pris en charge),
+//!   diffusable, hors région, trop volumineuse, fichier téléchargé mais
+//!   indécodable, service non pris en charge),
 //!   retenu six heures : l'écran ne redemande pas ;
 //! - `503 {"waveform": null, "raison": …}` : échec PASSAGER (délai, réseau,
 //!   service déconnecté ou désactivé), retenu deux minutes pour ne pas
@@ -77,7 +78,34 @@ pub(crate) fn refus_definitif(refus: Refus) -> bool {
             | Refus::Region
             | Refus::TropVolumineux
             | Refus::ZoomNonDisponible
+            | Refus::FichierIllisible
     )
+}
+
+/// Libère la place d'un calcul qui part sans avoir rendu son issue — une
+/// panique dans la tâche de fond : sans lui, la piste resterait « en cours »
+/// et occuperait une des [`CALCULS_EN_ROUTE_MAX`] places jusqu'au
+/// redémarrage. L'échec est classé passager.
+struct GardeDuCalcul {
+    ondes: Arc<Ondes>,
+    cle: String,
+    rendu: bool,
+}
+
+impl Drop for GardeDuCalcul {
+    fn drop(&mut self) {
+        if self.rendu {
+            return;
+        }
+        tracing::warn!(cle = %self.cle, "onde_service_calcul_interrompu");
+        self.ondes.suivi().insert(
+            std::mem::take(&mut self.cle),
+            Suivi::Echec {
+                refus: Refus::TelechargementImpossible,
+                jusqua: Instant::now() + DUREE_ECHEC_PASSAGER,
+            },
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -163,7 +191,13 @@ impl Ondes {
         let travail = calculer();
         let ondes = Arc::clone(self);
         tokio::spawn(async move {
+            let mut garde = GardeDuCalcul {
+                ondes: Arc::clone(&ondes),
+                cle: cle.clone(),
+                rendu: false,
+            };
             let issue = travail.await;
+            garde.rendu = true;
             let mut suivi = ondes.suivi();
             match issue {
                 Ok(points) if points.len() >= 2 => {
@@ -171,12 +205,14 @@ impl Ondes {
                     suivi.remove(&cle);
                 }
                 Ok(_) => {
-                    // Fichier téléchargé mais illisible : rien à dessiner.
+                    // Fichier téléchargé en entier mais indécodable : rien à
+                    // dessiner, et le retélécharger (jusqu'à 400 Mo) toutes
+                    // les deux minutes n'y changerait rien. Refus définitif.
                     suivi.insert(
                         cle,
                         Suivi::Echec {
-                            refus: Refus::TelechargementImpossible,
-                            jusqua: Instant::now() + DUREE_ECHEC_PASSAGER,
+                            refus: Refus::FichierIllisible,
+                            jusqua: Instant::now() + DUREE_REFUS_DEFINITIF,
                         },
                     );
                 }

@@ -156,3 +156,52 @@ async fn reponses_http() {
     assert_eq!(statut, StatusCode::OK);
     assert_eq!(v["raison"], "service_non_pris_en_charge");
 }
+
+/// Relecture de #8977 : un fichier téléchargé mais indécodable rend une
+/// enveloppe vide. Le retélécharger (jusqu'à 400 Mo) toutes les deux minutes
+/// n'y changerait rien : refus DÉFINITIF, en 200.
+#[tokio::test]
+async fn onde_vide_refus_definitif_jamais_retelecharge() {
+    let (_dir, ondes) = ondes();
+    let p = piste("vide");
+    ondes.consulter(&p, || async { Ok(Vec::new()) });
+    laisser_finir().await;
+    let etat = ondes.consulter(&p, || async { panic!("indécodable : jamais retéléchargé") });
+    assert_eq!(etat, Etat::Refusee(Refus::FichierIllisible));
+    assert!(refus_definitif(Refus::FichierIllisible));
+    let (statut, v) = corps(reponse(etat)).await;
+    assert_eq!(statut, StatusCode::OK);
+    assert_eq!(v["raison"], "fichier_illisible");
+}
+
+/// Relecture de #8977 : une panique dans la tâche de calcul ne doit pas
+/// laisser la piste « en cours » ni garder sa place parmi les
+/// `CALCULS_EN_ROUTE_MAX` : échec passager, place libérée.
+#[tokio::test]
+async fn panique_du_calcul_libere_la_place() {
+    let (_dir, ondes) = ondes();
+    for i in 0..CALCULS_EN_ROUTE_MAX {
+        ondes.consulter(&piste(&format!("panique{i}")), || async {
+            panic!("calcul simulé qui panique")
+        });
+    }
+    laisser_finir().await;
+    let etat = ondes.consulter(&piste("panique0"), || async { panic!("retenu deux minutes") });
+    assert_eq!(etat, Etat::Refusee(Refus::TelechargementImpossible));
+    assert!(!refus_definitif(Refus::TelechargementImpossible));
+    // Les quatre places sont libres : une nouvelle piste part au calcul.
+    let lancee = Arc::new(AtomicUsize::new(0));
+    let n = Arc::clone(&lancee);
+    let etat = ondes.consulter(&piste("apres"), move || async move {
+        n.fetch_add(1, Ordering::SeqCst);
+        Ok(vec![0.3, 0.6])
+    });
+    assert_eq!(etat, Etat::EnCours);
+    laisser_finir().await;
+    assert_eq!(lancee.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        ondes.consulter(&piste("apres"), || async { panic!("en cache") }),
+        Etat::Prete(vec![0.3, 0.6])
+    );
+}
+
