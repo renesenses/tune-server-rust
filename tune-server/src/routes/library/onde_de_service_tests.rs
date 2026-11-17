@@ -208,3 +208,69 @@ async fn panique_du_calcul_libere_la_place() {
         Etat::Prete(vec![0.3, 0.6])
     );
 }
+
+/// Décision de Bertrand du 17/11 (option C) : réglage décoché → aucun
+/// téléchargement ; coché mais moins de 30 s de lecture → aucun ; coché et
+/// 30 s → UNE seule analyse, quel que soit le nombre de demandes.
+#[tokio::test]
+async fn reglage_et_trente_secondes_avant_toute_analyse() {
+    let (_dir, ondes) = ondes();
+    let p = piste("48098083");
+    let analyses = Arc::new(AtomicUsize::new(0));
+    let demander = |reglage: bool, position_ms: i64| {
+        let n = Arc::clone(&analyses);
+        let zones = [
+            ("qobuz", Some("48098083"), position_ms),
+            ("qobuz", Some("autre"), 600_000),
+            ("radio", Some("48098083"), 600_000),
+        ];
+        let a_joue = a_joue_assez(zones, &p);
+        traiter(&ondes, &p, reglage, a_joue, move || async move {
+            n.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![0.2, 0.9])
+        })
+    };
+
+    // Décoché : refus net, rien de lancé, même après des minutes de lecture.
+    for _ in 0..3 {
+        assert_eq!(demander(false, 600_000), Etat::Desactivee);
+    }
+    laisser_finir().await;
+    assert_eq!(analyses.load(Ordering::SeqCst), 0, "réglage décoché");
+    let (statut, v) = corps(reponse(Etat::Desactivee)).await;
+    assert_eq!(statut, StatusCode::OK);
+    assert_eq!(v["raison"], "reglage_desactive");
+    assert_eq!(v["waveform"], serde_json::Value::Null);
+
+    // Coché, moins de 30 s : « pas encore », rien de lancé.
+    for pos in [0, 5_000, LECTURE_MIN_MS - 1] {
+        assert_eq!(demander(true, pos), Etat::EnCours);
+    }
+    laisser_finir().await;
+    assert_eq!(analyses.load(Ordering::SeqCst), 0, "moins de 30 s");
+
+    // Coché, 30 s : une seule analyse pour plusieurs demandes.
+    for _ in 0..4 {
+        assert_eq!(demander(true, LECTURE_MIN_MS), Etat::EnCours);
+    }
+    laisser_finir().await;
+    assert_eq!(analyses.load(Ordering::SeqCst), 1, "30 s : une analyse");
+    assert_eq!(demander(true, 0), Etat::Prete(vec![0.2, 0.9]), "en cache");
+    assert_eq!(analyses.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn lecture_du_reglage_dans_ui_preferences() {
+    assert!(reglage_actif(Some(r#"{"barreOnde":true,"ondeStreaming":true}"#)));
+    for blob in [
+        None,
+        Some(""),
+        Some("{"),
+        Some(r#"{"barreOnde":true}"#),
+        Some(r#"{"ondeStreaming":false}"#),
+        Some(r#"{"ondeStreaming":"true"}"#),
+    ] {
+        assert!(!reglage_actif(blob), "{blob:?}");
+    }
+}
+
