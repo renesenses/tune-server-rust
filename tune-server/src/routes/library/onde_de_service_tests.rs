@@ -166,7 +166,9 @@ async fn onde_vide_refus_definitif_jamais_retelecharge() {
     let p = piste("vide");
     ondes.consulter(&p, || async { Ok(Vec::new()) });
     laisser_finir().await;
-    let etat = ondes.consulter(&p, || async { panic!("indécodable : jamais retéléchargé") });
+    let etat = ondes.consulter(&p, || async {
+        panic!("indécodable : jamais retéléchargé")
+    });
     assert_eq!(etat, Etat::Refusee(Refus::FichierIllisible));
     assert!(refus_definitif(Refus::FichierIllisible));
     let (statut, v) = corps(reponse(etat)).await;
@@ -186,7 +188,9 @@ async fn panique_du_calcul_libere_la_place() {
         });
     }
     laisser_finir().await;
-    let etat = ondes.consulter(&piste("panique0"), || async { panic!("retenu deux minutes") });
+    let etat = ondes.consulter(&piste("panique0"), || async {
+        panic!("retenu deux minutes")
+    });
     assert_eq!(etat, Etat::Refusee(Refus::TelechargementImpossible));
     assert!(!refus_definitif(Refus::TelechargementImpossible));
     // Les quatre places sont libres : une nouvelle piste part au calcul.
@@ -204,4 +208,3 @@ async fn panique_du_calcul_libere_la_place() {
         Etat::Prete(vec![0.3, 0.6])
     );
 }
-
