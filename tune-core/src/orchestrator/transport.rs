@@ -425,7 +425,7 @@ impl PlaybackOrchestrator {
             }
         }
 
-        self.play_inner(req, historique).await
+        Box::pin(self.play_inner(req, historique)).await
     }
 
     /// Free-tier gate: block *activating* a brand-new zone once the free active
@@ -890,7 +890,7 @@ impl PlaybackOrchestrator {
         self.playback.set_resolving(req.zone_id, true).await;
 
         let (resolved, resolve_ms) =
-            match self.resoudre_la_demande(&req, play_start, play_gen).await {
+            match Box::pin(self.resoudre_la_demande(&req, play_start, play_gen)).await {
                 Ok(ResoluOuFini::Resolu {
                     resolved,
                     resolve_ms,
