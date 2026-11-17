@@ -912,21 +912,14 @@ impl PlaybackOrchestrator {
             // geste même qu'on vient de rendre possible — bouger un curseur en
             // écoutant — claque à chaque cran.
             local_output.replace_eq_live(eq);
-            // #4176 — « Remettre à plat » sur un égaliseur coupé enregistre un
-            // profil aux bandes neutres : c'est le « prochain réglage » qui
-            // rend le niveau. Le gain gardé remonte jusqu'au signal sec, en
-            // rampe, même si le volume a monté pendant que l'égaliseur jouait.
-            let remis_a_plat = !actif && self.egaliseur_enregistre_a_plat(zone_id, taux, canaux);
-            if remis_a_plat {
-                local_output.liberer_le_preampli_garde();
-            }
+            // #6524, décision du 14/11 : la remise à plat garde la borne de
+            // niveau. Seul le geste distinct « Rendre le niveau » la libère.
             info!(
                 zone_id,
                 device_id = %device_id,
                 sample_rate = taux,
                 channels = canaux,
                 actif,
-                remis_a_plat,
                 "zone_eq_refreshed_live"
             );
             RapportEqAChaud {
@@ -970,6 +963,59 @@ impl PlaybackOrchestrator {
     /// d'être persisté, au lieu de conserver l'instantané de la lecture (#1985).
     pub async fn apply_eq_change(self: &std::sync::Arc<Self>, zone_id: i64) -> bool {
         self.apply_eq_change_portee(zone_id).await == PorteeDuReglage::Immediate
+    }
+
+    /// Le préampli réellement gardé par la sortie locale, sans mutation.
+    pub async fn preampli_garde_de_zone(
+        &self,
+        zone_id: i64,
+    ) -> Option<crate::audio::eq::PreampliGarde> {
+        #[cfg(feature = "local-audio")]
+        {
+            let device = self.peripherique_de_la_zone(zone_id);
+            let sortie = { self.outputs.lock().await.get(&device) }?;
+            let sortie = sortie.lock().await;
+            sortie
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()?
+                .preampli_garde()
+        }
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            None
+        }
+    }
+
+    /// #6524 — geste explicite : libère la borne, par la rampe existante.
+    /// Aucun profil, volume ou état de transport n'est modifié ; PURE reste intact.
+    pub async fn rendre_le_niveau_garde(&self, zone_id: i64) -> bool {
+        if self.zone_audiophile(zone_id) {
+            return false;
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let device = self.peripherique_de_la_zone(zone_id);
+            let Some(sortie) = ({ self.outputs.lock().await.get(&device) }) else {
+                return false;
+            };
+            let sortie = sortie.lock().await;
+            let Some(locale) = sortie
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            else {
+                return false;
+            };
+            if locale.preampli_garde().is_none() {
+                return false;
+            }
+            locale.liberer_le_preampli_garde();
+            true
+        }
+        #[cfg(not(feature = "local-audio"))]
+        {
+            false
+        }
     }
 
     /// [`Self::apply_eq_change`], mais qui dit QUAND le réglage atteindra le
@@ -2110,26 +2156,6 @@ impl PlaybackOrchestrator {
     /// le profil est désactivé.
     pub(super) fn eq_profile_configure(&self, zone_id: i64) -> Option<crate::audio::eq::EqProfile> {
         Self::eq_profile_configure_with(&self.db, zone_id)
-    }
-
-    /// #4176 — le profil ENREGISTRÉ de la zone est-il à plat : aucune bande
-    /// qui filtre, activé ou non (« Remettre à plat » sur un égaliseur coupé
-    /// l'enregistre désactivé) ? Même critère que le moteur, qui ne reste pas
-    /// actif sur des bandes toutes neutres. Un profil absent ou illisible
-    /// n'est pas une remise à plat.
-    #[cfg(feature = "local-audio")]
-    fn egaliseur_enregistre_a_plat(&self, zone_id: i64, taux: u32, canaux: u16) -> bool {
-        let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
-        let Some(mut profil) = settings
-            .get(&format!("zone_{zone_id}_eq_profile"))
-            .ok()
-            .flatten()
-            .and_then(|s| serde_json::from_str::<crate::audio::eq::EqProfile>(&s).ok())
-        else {
-            return false;
-        };
-        profil.enabled = true;
-        !tune_plugin_equalizer::EqProcessor::new(&profil, taux, canaux).is_enabled()
     }
 
     /// Même lecture, sans orchestrateur.

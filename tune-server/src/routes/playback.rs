@@ -2069,6 +2069,11 @@ pub fn router() -> Router<AppState> {
         )
         .route("/{id}/sleep", get(get_sleep).post(set_sleep))
         .route("/{id}/eq", get(get_eq).post(set_eq))
+        .route("/{id}/eq/retained-preamp", get(get_retained_eq_preamp))
+        .route(
+            "/{id}/eq/retained-preamp/release",
+            post(release_retained_eq_preamp),
+        )
         // DSP route is in zones.rs (/{id}/dsp GET+PUT)
         .route("/{id}/crossfade", get(get_crossfade).post(set_crossfade))
         .route("/{id}/normalization", post(set_normalization))
@@ -7001,6 +7006,39 @@ fn eq_bands_json(profile: &tune_core::audio::eq::EqProfile) -> Vec<Value> {
         .collect()
 }
 
+/// #6524 — observation du gain retenu ; aucune déduction depuis la courbe.
+async fn get_retained_eq_preamp(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+) -> Json<Value> {
+    let garde = state.orchestrator.preampli_garde_de_zone(zone_id).await;
+    Json(json!({"db": garde.map(|g| g.db), "returning": garde.is_some_and(|g| g.en_retour)}))
+}
+
+/// Le bouton explicite emprunte la rampe audio existante, sans relance de lecture.
+async fn release_retained_eq_preamp(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    if let Err(resp) = crate::premium_guard::require_premium_localise(
+        &state.license,
+        tune_core::license::Feature::DspEq,
+        &headers,
+    )
+    .await
+    {
+        return resp;
+    }
+    let released = state.orchestrator.rendre_le_niveau_garde(zone_id).await;
+    if released {
+        state
+            .event_bus
+            .emit("zone.updated", json!({"zone_id":zone_id}));
+    }
+    Json(json!({"released":released})).into_response()
+}
+
 /// Read the zone's expert-mode EQ (bands stored in `zone_{id}_eq_profile`).
 ///
 /// These two handlers were STUBS until 0.9.48: the web Expert equalizer
@@ -11766,3 +11804,7 @@ mod echec_transfert_6155_tests;
 #[cfg(test)]
 #[path = "playback/remplacement_volontaire_7247_tests.rs"]
 mod remplacement_volontaire_7247_tests;
+
+#[cfg(test)]
+#[path = "playback/preampli_garde_6524_tests.rs"]
+mod preampli_garde_6524_tests;
