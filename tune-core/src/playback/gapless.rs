@@ -546,7 +546,7 @@ mod tests {
     /// lève QUE le `Some(false)` : sondage sans réponse, SCPD sans `SetNext`
     /// ou renderer qui a déjà lâché un suivant DSD gardent la garde.
     #[test]
-    fn natif_force_leve_seulement_le_dsd_non_annonce_8971() {
+    fn natif_force_leve_seulement_le_dsd_non_annonce_8969() {
         use AnnonceSuivante::*;
         assert!(dsd_suivant_tenu_sur_dlna(
             Some(false),
