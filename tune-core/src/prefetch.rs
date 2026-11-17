@@ -163,11 +163,29 @@ impl PrefetchEngine {
         source: &str,
         source_id: &str,
     ) -> bool {
+        self.abandonner_pour_la_lecture(zone_id, Some((source, source_id)))
+    }
+
+    /// #8921 — abandonne la résolution de préchargement en cours de la zone
+    /// `zone_id`, quelle que soit sa piste : la lecture d'un album, d'une
+    /// playlist ou d'une liste ne sait pas encore quelle piste partira (il
+    /// faudrait interroger le service, celui-là même que le préchargement
+    /// tient). Rend vrai si une tâche a été abandonnée.
+    pub fn abandonner_pour_la_zone(&self, zone_id: i64) -> bool {
+        self.abandonner_pour_la_lecture(zone_id, None)
+    }
+
+    /// `demandee` : la piste que la lecture va jouer, si elle est connue ;
+    /// son propre préchargement est gardé (#7247).
+    fn abandonner_pour_la_lecture(&self, zone_id: i64, demandee: Option<(&str, &str)>) -> bool {
         let Ok(mut en_vol) = self.resolution_en_vol.lock() else {
             return false;
         };
         let autre = en_vol.as_ref().is_some_and(|r| {
-            r.zone_id == zone_id && (r.source != source || r.source_id != source_id)
+            r.zone_id == zone_id
+                && demandee.is_none_or(|(source, source_id)| {
+                    r.source != source || r.source_id != source_id
+                })
         });
         if !autre {
             return false;
@@ -178,7 +196,7 @@ impl PrefetchEngine {
                 zone_id,
                 source = %r.source,
                 source_id = %r.source_id,
-                demandee = %source_id,
+                demandee = %demandee.map_or("", |(_, id)| id),
                 "prefetch_resolution_abandonnee_pour_la_lecture"
             );
         }
