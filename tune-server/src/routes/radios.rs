@@ -3863,11 +3863,14 @@ pub fn alarms_router() -> Router<AppState> {
 }
 
 async fn list_alarms(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+    let timezone = tune_core::alarms::read_alarm_timezone(state.backend.as_ref())
+        .map_err(AppError::internal)?;
+    let instant = chrono::Utc::now();
     let rows = state.backend.query_many(
         "SELECT id, name, time, days, one_shot, skip_holidays, zone_id, source_type, CAST(source_id AS TEXT), source_name, volume, fade_duration_s, enabled, last_fired_at, created_at, fade_in_seconds, days_of_week, multi_zone_ids, interrupt_playback FROM alarms ORDER BY time",
         &[],
     ).map_err(AppError::internal)?;
-    let items: Vec<Value> = rows
+    let mut items: Vec<Value> = rows
         .into_iter()
         .map(|r| {
             json!({
@@ -3894,6 +3897,12 @@ async fn list_alarms(State(state): State<AppState>) -> Result<Json<Value>, AppEr
             })
         })
         .collect();
+    for alarm in &mut items {
+        let next = tune_core::alarms::next_alarm_at(alarm, &timezone, instant)
+            .map_err(AppError::internal)?;
+        alarm["timezone"] = json!(timezone);
+        alarm["next_fired_at"] = json!(next);
+    }
     Ok(Json(json!(items)))
 }
 

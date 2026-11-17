@@ -421,7 +421,12 @@ mod tests {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         migrations::run_migrations(&db).unwrap();
-        SettingsRepo::new(db)
+        let repo = SettingsRepo::new(db);
+        // #8838 : les migrations initialisent ce réglage. Ces tests portent
+        // sur le CRUD et les filtres, avec leur propre jeu de préférences.
+        assert_eq!(repo.get("alarms_timezone").unwrap().as_deref(), Some(""));
+        repo.delete("alarms_timezone").unwrap();
+        repo
     }
 
     #[test]

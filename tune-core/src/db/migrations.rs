@@ -2945,6 +2945,11 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "albums_release_country",
         up: "",
     },
+    Migration {
+        version: 155,
+        name: "alarms_timezone",
+        up: include_str!("../../migrations/alarms_timezone.sql"),
+    },
 ];
 
 /// Pose `albums.release_country` et `albums.release_country_mbid` (#8668) —
@@ -6307,6 +6312,11 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         120,
         "albums_release_country",
         include_str!("../../migrations/postgres/120_albums_release_country.sql"),
+    ),
+    (
+        121,
+        "alarms_timezone",
+        include_str!("../../migrations/postgres/121_alarms_timezone.sql"),
     ),
 ];
 
@@ -10252,7 +10262,8 @@ mod tests {
         // (118 = #8656, 119 = #8678, fusionnées avant).
         // Pose le pays d'édition MusicBrainz, que les facettes, le filtre
         // Pays et la passe de fond NOMMENT.
-        assert_eq!(pg_latest_version(), 120, "latest PG migration must be 120");
+        // 121 : alarms_timezone (#8838), jumelle SQLite 155.
+        assert_eq!(pg_latest_version(), 121, "latest PG migration must be 121");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
