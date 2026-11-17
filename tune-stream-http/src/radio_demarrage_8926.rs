@@ -453,9 +453,13 @@ async fn sortie_de_radio(lit: bool) -> (Duration, bool, bool) {
     let (sid, tx, _pret, session) = streamer.create_radio_session(info, 64).await;
     session.publish_detected_pcm_format(48_000, 2, 16);
     // Le décodeur : du PCM aussi vite que le canal l'accepte.
+    let envoyes = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let compte = envoyes.clone();
     tokio::spawn(async move {
         let bloc = vec![0x11u8; 32_768];
-        while tx.send(bloc.clone()).await.is_ok() {}
+        while tx.send(bloc.clone()).await.is_ok() {
+            compte.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
     });
     let mut reponse = tune_core::http::client::builder()
         .build()
@@ -473,16 +477,27 @@ async fn sortie_de_radio(lit: bool) -> (Duration, bool, bool) {
         }))
     } else {
         // Le renderer a reçu `Stop` : il garde la connexion et ne lit plus.
-        // On attend que le corps soit arrêté sur l'écriture (tampons pleins).
+        // On attend que plus rien ne sorte du canal pendant 1 s : tampons
+        // TCP pleins, hyper ne relance plus le corps.
         let debut = Instant::now();
-        while !session.consommateurs_radio_tous_en_ecriture() {
+        let mut vu = envoyes.load(std::sync::atomic::Ordering::SeqCst);
+        let mut immobile_depuis = Instant::now();
+        while immobile_depuis.elapsed() < Duration::from_secs(1) {
             assert!(
-                debut.elapsed() < Duration::from_secs(20),
-                "le corps devrait finir par attendre l'écriture"
+                debut.elapsed() < Duration::from_secs(30),
+                "le corps devrait finir par ne plus rien tirer du canal"
             );
-            tokio::time::sleep(Duration::from_millis(20)).await;
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let n = envoyes.load(std::sync::atomic::Ordering::SeqCst);
+            if n != vu {
+                vu = n;
+                immobile_depuis = Instant::now();
+            }
         }
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            session.consommateurs_radio_tous_en_ecriture(),
+            "le corps immobile doit être noté arrêté sur l'écriture"
+        );
         std::mem::forget(reponse);
         None
     };
