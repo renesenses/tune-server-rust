@@ -7,6 +7,9 @@ mod echec_de_sortie_7823;
 #[path = "playback/journal_pause_reprise_tests.rs"]
 mod journal_pause_reprise_tests;
 #[cfg(test)]
+#[path = "playback/play_sans_stop_prechargement_8921_tests.rs"]
+mod play_sans_stop_prechargement_8921_tests;
+#[cfg(test)]
 #[path = "playback/reprise_apres_redemarrage_dlna_6380_tests.rs"]
 mod reprise_apres_redemarrage_dlna_6380_tests;
 #[cfg(test)]
@@ -1451,10 +1454,10 @@ async fn album_du_titre_de_service(
     /// départ de la lecture pour une file plus longue.
     const DELAI: std::time::Duration = std::time::Duration::from_secs(5);
     let resolution = async {
-        let registry = state.services.lock().await;
-        let svc = registry
-            .get(source)
-            .ok_or_else(|| "service_absent".to_string())?;
+        // #8921 — le registre de TOUS les services n'est pas tenu pendant
+        // l'attente de celui-ci.
+        let svc = state.services.lock().await.get(source);
+        let svc = svc.ok_or_else(|| "service_absent".to_string())?;
         let svc = svc.read().await;
         let titre = svc
             .get_track(source_id)
@@ -1476,6 +1479,39 @@ async fn album_du_titre_de_service(
     match tokio::time::timeout(DELAI, resolution).await {
         Ok(r) => r,
         Err(_) => Err("delai_depasse".to_string()),
+    }
+}
+
+/// #8921 — une lecture demandée sur la zone abandonne le préchargement EN
+/// COURS d'une autre piste de cette zone, avant que la route ne prenne le
+/// verrou du service.
+///
+/// Un titre désigné seul (`source` + `source_id`, sans contenant) garde le
+/// préchargement de ce titre-là : la lecture reprend son téléchargement
+/// (#7247). Tout autre geste (album, playlist, liste, titre de la
+/// bibliothèque) ne connaît pas encore sa première piste de service :
+/// le préchargement de la zone est abandonné. L'enchaînement sans blanc
+/// (#6772) ne passe pas par cette route et n'est pas touché ; un tampon déjà
+/// complet n'est pas effacé. Rend vrai si une tâche a été abandonnée.
+fn abandonner_le_prechargement_pour_la_demande(
+    state: &AppState,
+    zone_id: i64,
+    body: &PlayRequest,
+) -> bool {
+    let sans_contenant = body.track_id.is_none()
+        && body.track_ids.is_none()
+        && body.album_id.is_none()
+        && body.playlist_id.is_none()
+        && body.artist_id.is_none()
+        && body.folder.is_none()
+        && body.streaming_album_id.is_none()
+        && body.streaming_playlist_id.is_none();
+    let prefetch = &state.orchestrator.prefetch;
+    match (body.source.as_deref(), body.source_id.as_deref()) {
+        (Some(source), Some(source_id)) if sans_contenant => {
+            prefetch.abandonner_pour_une_autre_piste(zone_id, source, source_id)
+        }
+        _ => prefetch.abandonner_pour_la_zone(zone_id),
     }
 }
 
@@ -1740,8 +1776,9 @@ async fn nom_du_contexte(
     if service == "local" {
         return (None, None);
     }
-    let registre = state.services.lock().await;
-    let Some(svc) = registre.get(service) else {
+    // #8921 — le registre n'est pas tenu pendant l'attente du service.
+    let svc = state.services.lock().await.get(service);
+    let Some(svc) = svc else {
         return (None, None);
     };
     let svc = svc.read().await;
@@ -3215,6 +3252,15 @@ async fn play_sans_conteneur_de_file(
         }
     };
 
+    // #8921 — Calum Loudon, fil 2381 (rc12) : une lecture lancée sans Stop
+    // attendait la fin du préchargement DASH de la piste suivante. Le
+    // préchargement Tidal tient le verrou en écriture du service pendant tout
+    // le téléchargement ; la route, elle, lit le service (fiche du titre,
+    // pistes de l'album) AVANT d'atteindre le crochet d'abandon de
+    // l'orchestrateur (#8249). L'abandon se fait donc ici, avant toute
+    // lecture du service.
+    abandonner_le_prechargement_pour_la_demande(&state, zone_id, &body);
+
     // #2441 — poser CE QUE l'auditeur vient de demander sur la session de la
     // zone, avant toute branche : les huit chemins de lecture ci-dessous
     // construisent chacun leur `PlayRequest`, et l'orchestrateur relira le
@@ -3373,8 +3419,9 @@ async fn play_sans_conteneur_de_file(
         let tracks = if let Some(t) = pistes_de_l_album.take() {
             t
         } else {
-            let registry = state.services.lock().await;
-            let svc = match registry.get(source) {
+            // #8921 — le registre n'est pas tenu pendant l'attente du service.
+            let svc = state.services.lock().await.get(source);
+            let svc = match svc {
                 Some(s) => s,
                 None => {
                     return (
@@ -3390,7 +3437,6 @@ async fn play_sans_conteneur_de_file(
                 Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
             };
             drop(svc);
-            drop(registry);
             tracks
         };
 
@@ -3551,8 +3597,9 @@ async fn play_sans_conteneur_de_file(
 
     // --- Streaming playlist: fetch tracks from the service, queue them, play first ---
     if let (Some(source), Some(playlist_id)) = (&body.source, &body.streaming_playlist_id) {
-        let registry = state.services.lock().await;
-        let svc = match registry.get(source) {
+        // #8921 — le registre n'est pas tenu pendant l'attente du service.
+        let svc = state.services.lock().await.get(source);
+        let svc = match svc {
             Some(s) => s,
             None => {
                 return (
@@ -3568,7 +3615,6 @@ async fn play_sans_conteneur_de_file(
             Err(e) => return (StatusCode::BAD_GATEWAY, e.to_string()).into_response(),
         };
         drop(svc);
-        drop(registry);
 
         if tracks.is_empty() {
             return (StatusCode::BAD_REQUEST, "playlist has no tracks").into_response();
@@ -5921,8 +5967,9 @@ async fn resolve_streaming_queue_meta(
     // l'enfilage pour une métadonnée manquante priverait l'auditeur d'une
     // piste que la lecture sait encore résoudre), mais il ne se présente plus
     // comme une réponse du service.
-    let registry = state.services.lock().await;
-    let non_resolu = match registry.get(source) {
+    // #8921 — le registre n'est pas tenu pendant l'attente du service.
+    let svc = state.services.lock().await.get(source);
+    let non_resolu = match svc {
         Some(svc) => {
             let svc = svc.read().await;
             match svc.get_track(source_id).await {
