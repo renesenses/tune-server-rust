@@ -36,6 +36,7 @@ pub mod conteneur;
 pub mod discovery_setup;
 /// Dossiers de données inscriptibles, contrôlés avant la base (`EX_CONFIG`).
 pub mod dossiers_inscriptibles;
+pub mod extinction_hote;
 /// Plancher de fils de travail du moteur tokio (fil 2124, #5677).
 pub mod fils_de_travail;
 /// Ce qu'une requête rejouée par le relais ou l'écoute directe peut atteindre.

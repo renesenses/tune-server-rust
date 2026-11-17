@@ -95,6 +95,10 @@ pub struct AppState {
     /// serveur : propre à cet état, pour que deux bancs d'essai parallèles ne
     /// se refusent pas l'un l'autre (409).
     pub verrou_titres_demo: Arc<tokio::sync::Mutex<()>>,
+    /// web#3118 — le cache en mémoire et les verrous par profil de
+    /// `GET /home/because-you-like`. Propre à cet état : jamais dans la table
+    /// des réglages, que `GET /system/config` publie.
+    pub parce_que_vous_aimez: Arc<crate::routes::parce_que_vous_aimez::EtatParceQueVousAimez>,
     pub port: u16,
     /// Origine du compteur `uptime_seconds` : un `Instant` capturé à la
     /// construction de l'état, donc AU DÉMARRAGE DU PROCESSUS. Il repart
@@ -737,6 +741,7 @@ impl AppState {
             )),
             dossier_titres_demo: crate::routes::titres_demo::dossier_par_defaut(db_path),
             verrou_titres_demo: Arc::new(tokio::sync::Mutex::new(())),
+            parce_que_vous_aimez: Default::default(),
             port,
             started_at: Instant::now(),
             process_started_at: time::OffsetDateTime::now_utc(),
