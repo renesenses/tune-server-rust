@@ -449,6 +449,16 @@ $('btn-connect').onclick = () => {
   init();
 };
 $('server-url').addEventListener('keydown', e => { if (e.key === 'Enter') $('btn-connect').click(); });
+// Option « Démarrer le serveur Tune s'il ne tourne pas » (fil 2868), lue et
+// écrite côté natif : c'est lui qui lance le serveur, au démarrage du widget.
+// Hors Tauri (page ouverte dans un navigateur), la case reste sans effet.
+(async () => {
+  const actif = await invoke('get_demarrer_serveur_local')?.catch?.(() => false);
+  $('demarrer-serveur').checked = actif === true;
+})();
+$('demarrer-serveur').onchange = (e) => {
+  invoke('set_demarrer_serveur_local', { actif: e.target.checked })?.catch?.(() => {});
+};
 
 // Position interpolation
 setInterval(() => {

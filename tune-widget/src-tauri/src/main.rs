@@ -1,13 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod server;
+mod serveur_local;
 mod volume;
 mod vue_mini;
 mod zone_cible;
 
 use serde::Serialize;
 use tauri::{
-    menu::{Menu, MenuItem},
+    menu::{CheckMenuItem, Menu, MenuItem},
     tray::TrayIconBuilder,
     Manager, State,
 };
@@ -390,33 +391,100 @@ async fn server_reachable(http: &reqwest::Client, url: &str) -> bool {
         .is_ok()
 }
 
-/// Ensure a tune-server is running. If nothing answers on the configured URL,
-/// spawn the bundled `tune-server` sidecar (Windows installer ships it) and wait
-/// up to ~30 s for it to come up. On a macOS dev build with no bundled sidecar,
-/// the spawn fails gracefully and the widget just uses a separately-started
-/// server.
-async fn ensure_server_running(app: tauri::AppHandle) {
-    use tauri_plugin_shell::ShellExt;
+/// Option « Démarrer le serveur Tune s'il ne tourne pas » (fil 2868).
+///
+/// Désactivée par défaut. Ne fait rien si l'adresse configurée n'est pas une
+/// adresse de bouclage (`serveur_local::adresse_locale`) ou si le serveur
+/// répond déjà. Sinon lance le serveur installé sur cette machine (chemins
+/// fixes ou lus dans la clé de l'installeur, arguments constants : voir
+/// `serveur_local`) et attend jusqu'à ~30 s qu'il réponde.
+///
+/// Remplace le lancement d'un « sidecar » `tune-server` à côté du widget, que
+/// rien n'installait (`externalBin` absent de tauri.conf.json) : il échouait à
+/// chaque démarrage.
+///
+/// `montrer_mini` : pendant l'attente, montrer le mini-lecteur embarqué (au
+/// lancement, pour qu'un démarrage lent ne ressemble pas à un lancement raté).
+///
+/// Rend `true` quand un serveur a été lancé.
+async fn demarrer_serveur_si_absent(app: &tauri::AppHandle, montrer_mini: bool) -> bool {
+    if !lire_cfg_bool(serveur_local::CLE_CONFIG, false) {
+        return false;
+    }
     let http = app.state::<AppState>().http.clone();
     let url = app.state::<AppState>().server_url.read().await.clone();
-    if server_reachable(&http, &url).await {
-        return;
+    if !serveur_local::adresse_locale(&url) {
+        tracing::info!(server_url = %url, "serveur_distant_rien_a_lancer");
+        return false;
     }
-    match app.shell().sidecar("tune-server").and_then(|c| c.spawn()) {
-        Ok(_) => tracing::info!("tune_server_sidecar_spawned"),
+    if server_reachable(&http, &url).await {
+        return false;
+    }
+    match serveur_local::lancer() {
+        Ok(programme) => {
+            tracing::info!(programme = %programme, "serveur_local_lance");
+            if montrer_mini {
+                if let Some(mini) = app.get_webview_window("main") {
+                    let _ = mini.show();
+                }
+            }
+        }
         Err(e) => {
-            tracing::warn!(error = %e, "tune_server_sidecar_unavailable");
-            return;
+            tracing::warn!(error = %e, "serveur_local_non_lance");
+            return false;
         }
     }
     for _ in 0..60 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         if server_reachable(&http, &url).await {
-            tracing::info!("tune_server_ready");
-            return;
+            tracing::info!("serveur_local_pret");
+            return true;
         }
     }
-    tracing::warn!("tune_server_start_timeout");
+    tracing::warn!("serveur_local_delai_depasse");
+    true
+}
+
+/// L'option est-elle active ? (réglage du mini-lecteur embarqué)
+#[tauri::command]
+async fn get_demarrer_serveur_local() -> Result<bool, String> {
+    Ok(lire_cfg_bool(serveur_local::CLE_CONFIG, false))
+}
+
+/// Active ou désactive l'option, et tient la case du menu à jour.
+#[tauri::command]
+async fn set_demarrer_serveur_local(app: tauri::AppHandle, actif: bool) -> Result<(), String> {
+    ecrire_cfg_bool(serveur_local::CLE_CONFIG, actif);
+    if let Some(item) = app.try_state::<CaseDemarrageServeur>() {
+        let _ = item.0.set_checked(actif);
+    }
+    tracing::info!(actif, "option_demarrer_serveur_local");
+    Ok(())
+}
+
+/// La case « Démarrer le serveur Tune s'il ne tourne pas » du menu de la zone
+/// de notification, gardée pour la synchroniser avec le réglage du mini-lecteur.
+struct CaseDemarrageServeur(CheckMenuItem<tauri::Wry>);
+
+/// Montre la fenêtre du mode retenu (mini ou complète).
+///
+/// Appelée au lancement, par une seconde instance, et sur macOS par un
+/// « reopen » : un lancement par l'utilisateur doit toujours montrer quelque
+/// chose (#8934).
+async fn montrer_le_widget(app: tauri::AppHandle) {
+    // Une fenêtre déjà visible est seulement ramenée au premier plan : passer
+    // par `set_full_mode` la rechargerait.
+    for label in ["full", "main"] {
+        if let Some(win) = app.get_webview_window(label) {
+            if win.is_visible().unwrap_or(false) {
+                let _ = win.unminimize();
+                let _ = win.show();
+                let _ = win.set_focus();
+                return;
+            }
+        }
+    }
+    set_full_mode(&app, saved_full_mode()).await;
 }
 
 /// Ouvre un journal sur disque, à côté de la configuration.
@@ -817,13 +885,7 @@ fn garder_navigation(app: &tauri::AppHandle, cible: &tauri::Url) -> bool {
             false
         }
         vue_mini::Decision::Externe => {
-            #[allow(deprecated)]
-            {
-                use tauri_plugin_shell::ShellExt;
-                if let Err(e) = app.shell().open(cible.as_str(), None) {
-                    tracing::warn!(url = %cible, error = %e, "lien_externe_non_ouvert");
-                }
-            }
+            ouvrir_dans_le_navigateur(app, cible);
             false
         }
         vue_mini::Decision::Refuser => {
@@ -831,6 +893,46 @@ fn garder_navigation(app: &tauri::AppHandle, cible: &tauri::Url) -> bool {
             false
         }
     }
+}
+
+/// Confie un lien http(s) au navigateur du système.
+///
+/// Le schéma est revérifié ici, quel que soit l'appelant : seul `http`/`https`
+/// part (`vue_mini::ouvrable_dans_le_navigateur`). Appel côté Rust : la page
+/// distante ne reçoit AUCUNE permission du greffon `opener`.
+fn ouvrir_dans_le_navigateur(app: &tauri::AppHandle, cible: &tauri::Url) {
+    use tauri_plugin_opener::OpenerExt;
+    if !vue_mini::ouvrable_dans_le_navigateur(cible) {
+        tracing::warn!(url = %cible, "lien_externe_refuse");
+        return;
+    }
+    if let Err(e) = app.opener().open_url(cible.as_str(), None::<&str>) {
+        tracing::warn!(url = %cible, error = %e, "lien_externe_non_ouvert");
+    }
+}
+
+/// Une demande de nouvelle fenêtre (`target="_blank"`, `window.open`) de la
+/// fenêtre qui charge le serveur (web#3142). Jamais de fenêtre du widget : le
+/// lien part dans le navigateur du système, ou le geste `/__widget/…` est
+/// exécuté.
+fn garder_nouvelle_fenetre(
+    app: &tauri::AppHandle,
+    cible: &tauri::Url,
+) -> tauri::webview::NewWindowResponse<tauri::Wry> {
+    let serveur = match app.state::<AppState>().server_url.try_read() {
+        Ok(s) => s.clone(),
+        Err(_) => return tauri::webview::NewWindowResponse::Deny,
+    };
+    match vue_mini::decider_nouvelle_fenetre(&serveur, cible) {
+        vue_mini::Decision::Externe => ouvrir_dans_le_navigateur(app, cible),
+        vue_mini::Decision::Action(action) => {
+            tauri::async_runtime::spawn(executer_action(app.clone(), action));
+        }
+        vue_mini::Decision::Autoriser | vue_mini::Decision::Refuser => {
+            tracing::warn!(url = %cible, "nouvelle_fenetre_refusee");
+        }
+    }
+    tauri::webview::NewWindowResponse::Deny
 }
 
 /// Persist the chosen mode next to the server URL, so a restart comes back the
@@ -980,6 +1082,12 @@ async fn open_full_window(app: &tauri::AppHandle) {
             let app = app.clone();
             move |cible| garder_navigation(&app, cible)
         })
+        // `target="_blank"` et `window.open` : sans ce gestionnaire, WebView2
+        // ne faisait rien du tout (« Site web de la station », web#3142).
+        .on_new_window({
+            let app = app.clone();
+            move |cible, _| garder_nouvelle_fenetre(&app, &cible)
+        })
         .build()
     {
         Ok(win) => {
@@ -1019,6 +1127,13 @@ fn main() {
     purge_webview_cache_on_version_change();
 
     let run = tauri::Builder::default()
+        // Instance unique (#8934), déclarée EN PREMIER comme le demande le
+        // greffon : un second lancement (raccourci du Bureau, menu Démarrer)
+        // ne crée pas un second widget, il ramène la fenêtre de celui-ci.
+        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+            tracing::info!("seconde_instance_ramene_la_fenetre");
+            tauri::async_runtime::spawn(montrer_le_widget(app.clone()));
+        }))
         .plugin(
             tauri_plugin_global_shortcut::Builder::new()
                 .with_handler(|app, shortcut, event| {
@@ -1038,7 +1153,9 @@ fn main() {
                 })
                 .build(),
         )
-        .plugin(tauri_plugin_shell::init())
+        // Ouvre les liens http(s) dans le navigateur du système, appelé côté
+        // Rust seulement : aucune fenêtre ne reçoit ses permissions.
+        .plugin(tauri_plugin_opener::init())
         .manage({
             let mut saved_url = "http://localhost:8888".to_string();
             if let Some(dir) = dirs::config_dir() {
@@ -1052,8 +1169,8 @@ fn main() {
                 }
             }
             // L'URL retenue explique à elle seule le cas « le widget a lancé un
-            // serveur local » : ensure_server_running ne démarre le sidecar que
-            // si cette adresse ne répond pas.
+            // serveur local » : demarrer_serveur_si_absent ne lance le serveur
+            // que si l'option est active, cette adresse locale et muette.
             tracing::info!(server_url = %saved_url, "server_url_resolved");
             AppState {
                 server_url: RwLock::new(saved_url),
@@ -1080,6 +1197,8 @@ fn main() {
             http_post,
             http_put,
             set_display_mode,
+            get_demarrer_serveur_local,
+            set_demarrer_serveur_local,
         ])
         .setup(|app| {
             // Hide from Dock on macOS (accessory app)
@@ -1094,7 +1213,16 @@ fn main() {
                 MenuItem::with_id(app, "open_web", "Fenêtre complète", true, None::<&str>)?;
             let open_mini =
                 MenuItem::with_id(app, "open_mini", "Mini-lecteur", true, None::<&str>)?;
-            let menu = Menu::with_items(app, &[&open_web, &open_mini, &quit])?;
+            let demarrer_serveur = CheckMenuItem::with_id(
+                app,
+                "demarrer_serveur",
+                "Démarrer le serveur Tune s'il ne tourne pas",
+                true,
+                lire_cfg_bool(serveur_local::CLE_CONFIG, false),
+                None::<&str>,
+            )?;
+            app.manage(CaseDemarrageServeur(demarrer_serveur.clone()));
+            let menu = Menu::with_items(app, &[&open_web, &open_mini, &demarrer_serveur, &quit])?;
 
             let tray_icon_bytes = include_bytes!("../icons/tray-icon.png");
             let tray_img = tauri::image::Image::from_bytes(tray_icon_bytes).expect("tray icon");
@@ -1109,9 +1237,17 @@ fn main() {
                     "open_web" => {
                         let app = app.clone();
                         tauri::async_runtime::spawn(async move {
-                            ensure_server_running(app.clone()).await;
+                            demarrer_serveur_si_absent(&app, false).await;
                             set_full_mode(&app, true).await;
                         });
+                    }
+                    "demarrer_serveur" => {
+                        // La case a déjà basculé quand l'évènement arrive.
+                        if let Some(case) = app.try_state::<CaseDemarrageServeur>() {
+                            let actif = case.0.is_checked().unwrap_or(false);
+                            ecrire_cfg_bool(serveur_local::CLE_CONFIG, actif);
+                            tracing::info!(actif, "option_demarrer_serveur_local");
+                        }
                     }
                     "open_mini" => {
                         let app = app.clone();
@@ -1183,35 +1319,49 @@ fn main() {
                 }
             }
 
-            // Come back in the mode the user left, rather than always in mini.
-            if saved_full_mode() {
-                let h = app.handle().clone();
-                tauri::async_runtime::spawn(async move {
-                    ensure_server_running(h.clone()).await;
-                    set_full_mode(&h, true).await;
-                });
-            }
-
-            // Auto-start the server on launch so opening the widget = Tune runs
-            // (single-installer launcher UX on Windows). No-op if already up.
-            tauri::async_runtime::spawn(ensure_server_running(app.handle().clone()));
+            // #8934 — un lancement par l'utilisateur MONTRE le widget, dans le
+            // mode qu'il avait laissé. Avant, seule l'icône de la zone de
+            // notification apparaissait (souvent rangée derrière « ^ » sous
+            // Windows) : « quand je clique dessus il ne se passe rien ».
+            //
+            // Si l'option le demande, le serveur local est lancé d'abord, pour
+            // que la fenêtre s'ouvre sur un serveur qui répond ; le
+            // mini-lecteur embarqué est montré pendant l'attente, pour qu'un
+            // démarrage lent ne ressemble pas à un lancement raté.
+            let h = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                demarrer_serveur_si_absent(&h, true).await;
+                montrer_le_widget(h).await;
+            });
 
             Ok(())
         })
-        .run(tauri::generate_context!());
+        .build(tauri::generate_context!());
 
     // Un échec ici est le cas qu'on cherchait justement à instrumenter : sous
     // Windows, une fenêtre qui ne s'ouvre pas vient presque toujours du runtime
     // WebView2 absent. `expect` paniquait vers une sortie d'erreur qu'une
     // application graphique n'affiche à personne.
-    if let Err(e) = run {
-        tracing::error!(
-            error = %e,
-            "widget_run_failed : impossible de démarrer l'interface. Sous Windows, \
-             vérifier que « Microsoft Edge WebView2 Runtime » est installé."
-        );
-        std::process::exit(1);
-    }
+    let app = match run {
+        Ok(app) => app,
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "widget_run_failed : impossible de démarrer l'interface. Sous Windows, \
+                 vérifier que « Microsoft Edge WebView2 Runtime » est installé."
+            );
+            std::process::exit(1);
+        }
+    };
+    app.run(|_app, _event| {
+        // macOS ne lance jamais une seconde instance d'un .app : un double-clic
+        // sur le widget déjà lancé arrive ici en « reopen ». Même réponse qu'à
+        // une seconde instance ailleurs (#8934).
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { .. } = _event {
+            tauri::async_runtime::spawn(montrer_le_widget(_app.clone()));
+        }
+    });
 }
 
 #[cfg(test)]
