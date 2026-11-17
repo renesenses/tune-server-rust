@@ -457,3 +457,69 @@ async fn une_extinction_refusee_ou_absente_n_empeche_pas_l_arret_de_la_lecture()
         vec![banc.salon]
     );
 }
+
+// ─── #8909 : l'échec d'extinction est gardé pour l'écran ─────────────
+
+#[tokio::test]
+async fn un_refus_d_extinction_est_garde_puis_efface_par_une_extinction_reussie() {
+    const POLKIT: &str = "Linux refused to power off the machine (polkit)";
+    let (banc, extinctions) = Banc::monter()
+        .await
+        .avec_extinction_comptee(Err(POLKIT.into()));
+    let mut r = reglage("23:00", "1111111", None);
+    r.action = ActionArret::Poweroff;
+    ecrire(&banc.db, r.clone()).unwrap();
+    assert_eq!(
+        lire_echec_extinction(&banc.db),
+        None,
+        "rien avant l'échéance"
+    );
+
+    let mut derniere = None;
+    banc.planificateur
+        .passage(mardi(23, 0), &mut derniere)
+        .await;
+    assert_eq!(appels(&extinctions), 1, "le crochet est bien appelé");
+    assert_eq!(
+        lire_echec_extinction(&banc.db),
+        Some(EchecExtinction {
+            at: "2026-11-10T23:00:00".into(),
+            error: POLKIT.into(),
+        }),
+        "le refus est gardé, avec l'heure de l'échéance"
+    );
+
+    // Même base, crochet qui réussit : l'échec précédent disparaît.
+    let db = banc.db.clone();
+    let (banc, _) = Banc {
+        planificateur: PlanificateurArretProgramme::new(
+            db.clone(),
+            banc.planificateur.orchestrator.clone(),
+        ),
+        ..banc
+    }
+    .avec_extinction_comptee(Ok(()));
+    let mut derniere = None;
+    banc.planificateur
+        .passage(mardi(23, 0), &mut derniere)
+        .await;
+    assert_eq!(lire_echec_extinction(&banc.db), None);
+}
+
+#[tokio::test]
+async fn stop_playback_ne_touche_pas_au_dernier_echec() {
+    let (banc, _) = Banc::monter().await.avec_extinction_comptee(Ok(()));
+    let echec = EchecExtinction {
+        at: "2026-11-09T23:00:00".into(),
+        error: "refus".into(),
+    };
+    noter_echec_extinction(&banc.db, &echec);
+    ecrire(&banc.db, reglage("23:00", "1111111", None)).unwrap();
+    let mut derniere = None;
+    banc.planificateur
+        .passage(mardi(23, 0), &mut derniere)
+        .await;
+    assert_eq!(lire_echec_extinction(&banc.db), Some(echec));
+    effacer_echec_extinction(&banc.db);
+    assert_eq!(lire_echec_extinction(&banc.db), None);
+}

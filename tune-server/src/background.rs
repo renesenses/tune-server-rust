@@ -1812,13 +1812,12 @@ fn spawn_alarm_scheduler(state: &AppState) {
     );
     alarm_sched.spawn();
     // #8213 — arrêt programmé de la lecture à heure fixe ; avec
-    // `action: "poweroff"`, extinction de la machine par la fonction unique
-    // d'extinction (refusée hors Tune OS).
-    let extinction: tune_core::arret_programme::Extinction = Arc::new(|| {
-        Box::pin(crate::routes::appliance::ordonner(
-            crate::routes::appliance::OrdreMachine::Eteindre,
-        ))
-    });
+    // `action: "poweroff"`, extinction de la machine : Tune OS par sa fonction
+    // d'extinction, hôte ordinaire par `extinction_hote` (#8909), jamais dans
+    // un conteneur. Ce crochet est le SEUL appelant de
+    // `extinction_hote::extinction_programmee`.
+    let extinction: tune_core::arret_programme::Extinction =
+        Arc::new(|| Box::pin(crate::extinction_hote::extinction_programmee()));
     Arc::new(
         tune_core::arret_programme::PlanificateurArretProgramme::new(
             state.backend.clone(),

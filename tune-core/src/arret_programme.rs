@@ -12,9 +12,11 @@
 //! restent allumés pour la télécommande du lendemain. Avec
 //! `action: "poweroff"` (décision de Bertrand du 11/11, réponse forum 10786),
 //! le planificateur arrête d'abord la lecture puis éteint la MACHINE, par le
-//! crochet [`Extinction`] que lui donne le serveur. Ce crochet est la seule
-//! fonction d'extinction du serveur (`routes::appliance::ordonner`) : elle
-//! refuse hors Tune OS, où Tune n'est pas seul sur la machine.
+//! crochet [`Extinction`] que lui donne le serveur
+//! (`extinction_hote::extinction_programmee`) : Tune OS par sa fonction
+//! d'extinction, et depuis #8909 un hôte Linux, macOS ou Windows hors
+//! conteneur. Un échec (polkit qui refuse…) est gardé sous [`CLE_ECHEC`] pour
+//! que l'écran le dise ([`lire_echec_extinction`]).
 //!
 //! Le réglage est rangé dans `settings` sous [`CLE`], en JSON.
 
@@ -31,6 +33,42 @@ use crate::playback::PlayState;
 
 /// Clé du réglage dans la table `settings`.
 pub const CLE: &str = "scheduled_stop";
+
+/// Clé du dernier échec d'extinction programmée (#8909).
+pub const CLE_ECHEC: &str = "scheduled_stop_poweroff_error";
+
+/// Le dernier échec d'extinction programmée, tel que l'API le rend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EchecExtinction {
+    /// Heure locale du serveur de l'échéance, `AAAA-MM-JJTHH:MM:SS`.
+    pub at: String,
+    /// Le message du refus, en clair.
+    pub error: String,
+}
+
+/// Lit le dernier échec d'extinction. Absent ou illisible → `None`.
+pub fn lire_echec_extinction(db: &Arc<dyn DbBackend>) -> Option<EchecExtinction> {
+    let brut = SettingsRepo::with_backend(db.clone())
+        .get_sans_ecrivain(CLE_ECHEC)
+        .ok()??;
+    serde_json::from_str(&brut).ok()
+}
+
+/// Oublie le dernier échec d'extinction (journalisé s'il ne part pas).
+pub fn effacer_echec_extinction(db: &Arc<dyn DbBackend>) {
+    if let Err(e) = SettingsRepo::with_backend(db.clone()).delete(CLE_ECHEC) {
+        warn!(error = %e, "scheduled_poweroff_error_clear_failed");
+    }
+}
+
+fn noter_echec_extinction(db: &Arc<dyn DbBackend>, echec: &EchecExtinction) {
+    let Ok(json) = serde_json::to_string(echec) else {
+        return;
+    };
+    if let Err(e) = SettingsRepo::with_backend(db.clone()).set(CLE_ECHEC, &json) {
+        warn!(error = %e, "scheduled_poweroff_error_write_failed");
+    }
+}
 
 /// Le planificateur relit le réglage toutes les 20 s : une minute `HH:MM`
 /// est toujours vue au moins deux fois, jamais manquée.
@@ -243,21 +281,32 @@ impl PlanificateurArretProgramme {
         *derniere = Some(minute);
         let arretees = self.arreter(&reglage).await;
         if reglage.action == ActionArret::Poweroff {
-            self.eteindre().await;
+            self.eteindre(maintenant).await;
         }
         arretees
     }
 
-    /// Éteint la machine par le crochet du serveur. Un refus (hors Tune OS)
-    /// ou un échec ne remonte nulle part ailleurs que dans le journal.
-    async fn eteindre(&self) {
+    /// Éteint la machine par le crochet du serveur. Un refus (conteneur,
+    /// polkit…) ou un échec est journalisé ET gardé pour l'écran (#8909) ;
+    /// une extinction partie efface l'échec précédent.
+    async fn eteindre(&self, maintenant: NaiveDateTime) {
         let Some(extinction) = &self.extinction else {
             warn!("scheduled_poweroff_unavailable: no power-off hook");
             return;
         };
         info!("scheduled_poweroff_requested");
-        if let Err(e) = extinction().await {
-            warn!(error = %e, "scheduled_poweroff_failed");
+        match extinction().await {
+            Ok(()) => effacer_echec_extinction(&self.db),
+            Err(e) => {
+                warn!(error = %e, "scheduled_poweroff_failed");
+                noter_echec_extinction(
+                    &self.db,
+                    &EchecExtinction {
+                        at: maintenant.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                        error: e,
+                    },
+                );
+            }
         }
     }
 
