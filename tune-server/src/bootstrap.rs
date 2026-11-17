@@ -453,6 +453,14 @@ pub async fn run_with(opts: RunOptions) {
     // écritures de `init_state`.
     crate::startup::journaliser_les_consentements(&state);
 
+    // Les profils de commande `SetAVTransportURI` appris par appareil après
+    // un refus (501/714/716), et les règles apprises (#6477 : pas de `SetNext`
+    // au FiiO K17), survivent au redémarrage : la mémoire est branchée sur la
+    // base AVANT toute découverte. #8868 — `init_state` lance la resonde des
+    // renderers connus, qui rattache le K17 en quelques millisecondes : la
+    // brancher après, à l'étape « découverte réseau », la laissait passer
+    // avant la base, et la règle n'était plus relue.
+    tune_core::outputs::dlna_repli_set_uri::installer_persistance(state.backend.clone());
     // Restore zone volumes, persist music_dirs/discogs_token to DB
     crate::startup::init_state(&state, &config).await;
 
@@ -543,11 +551,6 @@ pub async fn run_with(opts: RunOptions) {
     // Create shared OpenHome event listener
     crate::boot_status::set_phase("découverte réseau");
     let oh_event_listener = crate::startup::create_oh_listener().await;
-
-    // Les profils de commande `SetAVTransportURI` appris par appareil après
-    // un refus (501/714/716) survivent au redémarrage : la mémoire est
-    // branchée sur la base AVANT la découverte, qui les relit.
-    tune_core::outputs::dlna_repli_set_uri::installer_persistance(state.backend.clone());
 
     // SSDP discovery (DLNA / OpenHome)
     crate::discovery_setup::spawn_ssdp_handler(&state, &config, oh_event_listener);
