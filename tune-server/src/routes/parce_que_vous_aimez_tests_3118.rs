@@ -117,6 +117,33 @@ fn artistes_de(p: &Value) -> HashSet<String> {
         .collect()
 }
 
+/// Des blocs FIXES de trois jours : trois jours de suite donnent la même
+/// période, le quatrième en ouvre une autre.
+#[test]
+fn la_periode_dure_trois_jours() {
+    let d = |s: &str| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap();
+    let texte = |x: chrono::NaiveDate| x.format("%Y-%m-%d").to_string();
+    let mut debut = d("2026-11-01");
+    while periode(debut) != texte(debut) {
+        debut = debut.succ_opt().unwrap();
+    }
+    let p = periode(debut);
+    for k in 0..PERIODE_JOURS {
+        assert_eq!(periode(debut + chrono::Duration::days(k)), p, "jour {k}");
+    }
+    let suivant = debut + chrono::Duration::days(PERIODE_JOURS);
+    assert_eq!(
+        periode(suivant),
+        texte(suivant),
+        "le 4e jour ouvre une période"
+    );
+    let veille = debut - chrono::Duration::days(1);
+    assert_eq!(
+        periode(veille),
+        texte(debut - chrono::Duration::days(PERIODE_JOURS))
+    );
+}
+
 #[test]
 fn les_graines_suivent_le_profil_sans_radio_ni_compilation() {
     let state = etat();
@@ -153,7 +180,7 @@ fn une_graine_ecartee_par_pas_pour_moi_ne_revient_pas() {
 }
 
 #[tokio::test]
-async fn cinquante_titres_de_la_bibliotheque_autour_de_l_artiste() {
+async fn vingt_titres_de_la_bibliotheque_autour_de_l_artiste() {
     let state = etat();
     let db = &state.backend;
     bibliotheque(db);
@@ -205,7 +232,7 @@ async fn cinquante_titres_de_la_bibliotheque_autour_de_l_artiste() {
 }
 
 #[tokio::test]
-async fn le_meme_jour_donne_la_meme_playlist() {
+async fn la_meme_periode_donne_la_meme_playlist() {
     let state = etat();
     let db = &state.backend;
     bibliotheque(db);
@@ -219,8 +246,12 @@ async fn le_meme_jour_donne_la_meme_playlist() {
         ids(&b[0]),
         "deux rafraîchissements, la même liste"
     );
-    let c = composer_pour(db, "2026-11-17", &graines, v(), Vec::new()).await;
-    assert_ne!(ids(&a[0]), ids(&c[0]), "le lendemain, une autre liste");
+    let c = composer_pour(db, "2026-11-19", &graines, v(), Vec::new()).await;
+    assert_ne!(
+        ids(&a[0]),
+        ids(&c[0]),
+        "la période suivante, une autre liste"
+    );
 }
 
 #[tokio::test]
@@ -299,7 +330,7 @@ async fn les_services_completent_une_petite_bibliotheque() {
     .await;
     assert_eq!(avec.len(), 1, "{avec:?}");
     let pl = &avec[0];
-    assert!(pl["track_count"].as_u64().unwrap() >= 20, "{pl}");
+    assert_eq!(pl["track_count"], json!(TITRES_PAR_PLAYLIST), "{pl}");
     assert_eq!(pl["sources"].as_array().unwrap().len(), 2, "{pl}");
     assert!(artistes_de(pl).contains("Ghost"));
 }
@@ -321,7 +352,7 @@ async fn sans_historique_rien_n_est_propose() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn la_route_garde_sa_reponse_pour_la_journee() {
+async fn la_route_garde_sa_reponse_pour_la_periode() {
     let state = etat();
     let db = &state.backend;
     bibliotheque(db);
@@ -351,7 +382,9 @@ async fn la_route_garde_sa_reponse_pour_la_journee() {
     // De nouvelles écoutes ne rebattent pas les cartes du jour.
     ecouter(db, "Metallica", 50, None, "local");
     let b = appel(None).await;
-    assert_eq!(a, b, "même journée, même réponse");
+    assert_eq!(a, b, "même période, même réponse");
+    assert_eq!(a["refresh_days"], json!(PERIODE_JOURS));
+    assert_eq!(a["playlists"][0]["track_count"], json!(TITRES_PAR_PLAYLIST));
 
     let un = appel(Some(1)).await;
     assert_eq!(un["playlists"].as_array().unwrap().len(), 1);

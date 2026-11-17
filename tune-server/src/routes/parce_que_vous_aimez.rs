@@ -3,7 +3,10 @@
 //! Bertrand le 16/11/2026 pour la rc13).
 //!
 //! Jusqu'à [`MAX_PLAYLISTS`] playlists générées de [`TITRES_PAR_PLAYLIST`]
-//! titres, une par artiste parmi les plus écoutés du profil.
+//! titres, une par artiste parmi les plus écoutés du profil, refaites tous les
+//! [`PERIODE_JOURS`] jours — l'esprit d'un « mix pour vous » (décision de
+//! Bertrand du 17/11/2026, sur la demande de FabienM, fil 2864 : 20 titres et
+//! 3 jours, au lieu de 50 titres et d'un jour).
 //!
 //! ## Ce qui existait, et ce qui est réutilisé
 //!
@@ -18,19 +21,21 @@
 //!   bibliothèque les possède, puis des artistes du même genre. Les services
 //!   connectés (Qobuz, TIDAL…) n'interviennent qu'en COMPLÉMENT, quand la
 //!   bibliothèque ne remplit pas la playlist — et sous un délai borné.
-//! - **Stable sur la journée.** Le tirage est graine (jour, profil, artiste) :
-//!   un rafraîchissement de l'accueil ne rebat pas les cartes. Le résultat est
-//!   de plus gardé dans les réglages jusqu'au lendemain, ce qui couvre aussi
-//!   les réponses des services, qui ne sont pas les nôtres.
+//! - **Stable sur la période.** Le tirage est graine (période, profil,
+//!   artiste) : un rafraîchissement de l'accueil ne rebat pas les cartes. Le
+//!   résultat est de plus gardé dans les réglages jusqu'à la période suivante,
+//!   ce qui couvre aussi les réponses des services, qui ne sont pas les nôtres.
+//!   La période est un bloc fixe de [`PERIODE_JOURS`] jours du calendrier
+//!   local ([`periode`]), le même pour tous les profils.
 //!
 //! ## Performance (#8872)
 //!
 //! Le calcul tourne HORS de l'exécuteur (`spawn_blocking`), une seule fois à
-//! la fois (verrou), et une seule fois par jour et par profil (cache) : une
+//! la fois (verrou), et une seule fois par période et par profil (cache) : une
 //! bibliothèque de 500 000 pistes ne tient jamais un fil de travail tokio.
 //! Toutes les requêtes passent par des index (`tracks.artist_id`, clés
 //! primaires) sauf la recherche des voisins de même genre, qui ne tourne
-//! qu'au premier affichage de la journée.
+//! qu'au premier affichage de la période.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
@@ -57,11 +62,14 @@ use crate::state::AppState;
 
 /// Playlists au plus (la demande : « jusqu'à 5 »).
 pub const MAX_PLAYLISTS: usize = 5;
-/// Titres par playlist (la demande : « 50 titres »).
-pub const TITRES_PAR_PLAYLIST: usize = 50;
+/// Titres par playlist (décision du 17/11/2026 : 20, au lieu de 50).
+pub const TITRES_PAR_PLAYLIST: usize = 20;
 /// En dessous, la playlist n'est pas proposée : une « playlist » de trois
-/// titres ne vaut pas une carte sur l'accueil.
-pub const MIN_TITRES: usize = 10;
+/// titres ne vaut pas une carte sur l'accueil. Deux cinquièmes de la taille.
+pub const MIN_TITRES: usize = 8;
+/// Les playlists sont refaites tous les `PERIODE_JOURS` jours (décision du
+/// 17/11/2026 : 3, au lieu de chaque jour).
+pub const PERIODE_JOURS: i64 = 3;
 /// La fenêtre d'écoute qui désigne les artistes « que vous aimez ». Au-delà,
 /// on complète par tout l'historique.
 const FENETRE_JOURS: i64 = 90;
@@ -78,8 +86,8 @@ const DELAI_SERVICES: Duration = Duration::from_secs(15);
 /// Budget total des compléments par les services, toutes playlists comprises.
 const BUDGET_SERVICES: Duration = Duration::from_secs(30);
 /// Format du cache : changer la forme de la réponse impose de l'incrémenter.
-const VERSION_CACHE: i64 = 1;
-/// Module du tirage SQL du jour (premier).
+const VERSION_CACHE: i64 = 2;
+/// Module du tirage SQL de la période (premier).
 const MODULE_TIRAGE: i64 = 1_000_003;
 
 /// Les « artistes » qui n'en sont pas : une compilation n'est pas un goût.
@@ -105,10 +113,22 @@ pub(crate) struct Params {
     limit: Option<usize>,
 }
 
-// ── Le tirage du jour ───────────────────────────────────────────────────────
+// ── La période et son tirage ────────────────────────────────────────────────
+
+/// La période qui contient `date` : le premier jour de son bloc de
+/// [`PERIODE_JOURS`] jours, compté depuis l'ère commune — des blocs FIXES, et
+/// non « trois jours depuis le dernier calcul », pour que la période ne
+/// dépende ni d'un redémarrage ni de l'heure de la première visite.
+pub(crate) fn periode(date: chrono::NaiveDate) -> String {
+    use chrono::Datelike;
+    let decalage = i64::from(date.num_days_from_ce()).rem_euclid(PERIODE_JOURS);
+    (date - chrono::Duration::days(decalage))
+        .format("%Y-%m-%d")
+        .to_string()
+}
 
 /// FNV-1a 64 bits : un hachage STABLE d'une version de Rust à l'autre (le
-/// `DefaultHasher` ne le promet pas), pour que la graine du jour le reste.
+/// `DefaultHasher` ne le promet pas), pour que la graine de la période le reste.
 fn fnv(parts: &[&str]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for p in parts {
@@ -120,8 +140,8 @@ fn fnv(parts: &[&str]) -> u64 {
     h
 }
 
-/// Le tirage SQL du jour : `(id * a + b) % MODULE_TIRAGE`. Un ordre
-/// pseudo-aléatoire, mais le MÊME toute la journée, sur les deux moteurs, sans
+/// Le tirage SQL de la période : `(id * a + b) % MODULE_TIRAGE`. Un ordre
+/// pseudo-aléatoire, mais le MÊME toute la période, sur les deux moteurs, sans
 /// `RANDOM()`.
 #[derive(Debug, Clone, Copy)]
 struct TirageDuJour {
@@ -263,7 +283,7 @@ impl SourceRadio for VoisinsPrecharges {
     }
 }
 
-/// La bibliothèque, tirée par le [`TirageDuJour`] au lieu de `RANDOM()` :
+/// La bibliothèque, tirée par le [`TirageDuJour`] (de la période) au lieu de `RANDOM()` :
 /// les voisins de même genre et les titres d'un artiste. La discographie de
 /// l'artiste de départ (albums triés par identifiant, puis mélangés par
 /// l'`Alea` graine) est celle de la radio.
@@ -453,6 +473,7 @@ async fn sources_services(state: &AppState) -> Vec<Box<dyn SourceRadio>> {
 pub(crate) struct Entrees<'a> {
     pub db: &'a Arc<dyn DbBackend>,
     pub profil: i64,
+    /// La période ([`periode`]) : la graine du tirage.
     pub jour: &'a str,
     pub graines: &'a [(String, i64)],
     pub voisins: HashMap<String, Vec<String>>,
@@ -630,7 +651,7 @@ fn en_playlist(db: &Arc<dyn DbBackend>, artiste: &str, plays: i64, lot: &[Candid
     })
 }
 
-// ── Le cache du jour ────────────────────────────────────────────────────────
+// ── Le cache de la période ──────────────────────────────────────────────────
 
 fn cle_cache(profil: i64) -> String {
     format!("home_because_you_like_p{profil}")
@@ -663,10 +684,12 @@ fn verrou() -> &'static tokio::sync::Mutex<()> {
 
 fn reponse(jour: &str, playlists: &[Value], limite: usize) -> Json<Value> {
     let p: Vec<&Value> = playlists.iter().take(limite).collect();
-    Json(json!({"date": jour, "playlists": p}))
+    // `date` : le premier jour de la période ; les playlists sont refaites
+    // `refresh_days` jours plus tard.
+    Json(json!({"date": jour, "refresh_days": PERIODE_JOURS, "playlists": p}))
 }
 
-/// Le calcul complet, pour un profil et un jour. Tourne sur un fil bloquant.
+/// Le calcul complet, pour un profil et une période. Tourne sur un fil bloquant.
 async fn calculer(state: &AppState, profil: i64, jour: &str) -> Vec<Value> {
     let ecartees = tune_core::db::suggestions_ecartees::SuggestionsEcarteesRepo::with_backend(
         state.backend.clone(),
@@ -704,7 +727,7 @@ pub(crate) async fn because_you_like(
 ) -> Result<Json<Value>, AppError> {
     let limite = p.limit.unwrap_or(MAX_PLAYLISTS).clamp(1, MAX_PLAYLISTS);
     let profil = profile.id();
-    let jour = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let jour = periode(chrono::Local::now().date_naive());
     if let Some(v) = lire_cache(&state.backend, profil, &jour) {
         return Ok(reponse(&jour, &v, limite));
     }
@@ -724,7 +747,7 @@ pub(crate) async fn because_you_like(
                 AppError::internal("because-you-like computation failed")
             })?;
     // Une réponse vide ne se garde pas : le profil qui commence à écouter
-    // aujourd'hui doit voir ses playlists sans attendre demain.
+    // aujourd'hui doit voir ses playlists sans attendre la période suivante.
     if !playlists.is_empty() {
         ecrire_cache(&state.backend, profil, &jour, &playlists);
     }
