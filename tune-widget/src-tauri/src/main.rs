@@ -408,7 +408,7 @@ async fn server_reachable(http: &reqwest::Client, url: &str) -> bool {
 ///
 /// Rend `true` quand un serveur a été lancé.
 async fn demarrer_serveur_si_absent(app: &tauri::AppHandle, montrer_mini: bool) -> bool {
-    if !lire_cfg_bool(serveur_local::CLE_CONFIG, false) {
+    if !serveur_local::PRIS_EN_CHARGE || !lire_cfg_bool(serveur_local::CLE_CONFIG, false) {
         return false;
     }
     let http = app.state::<AppState>().http.clone();
@@ -420,7 +420,11 @@ async fn demarrer_serveur_si_absent(app: &tauri::AppHandle, montrer_mini: bool) 
     if server_reachable(&http, &url).await {
         return false;
     }
-    match serveur_local::lancer() {
+    // `lancer` attend la fin de `open` sous macOS : hors du fil asynchrone.
+    let lancement = tokio::task::spawn_blocking(serveur_local::lancer)
+        .await
+        .unwrap_or_else(|e| Err(format!("tâche de lancement interrompue : {e}")));
+    match lancement {
         Ok(programme) => {
             tracing::info!(programme = %programme, "serveur_local_lance");
             if montrer_mini {
@@ -447,13 +451,18 @@ async fn demarrer_serveur_si_absent(app: &tauri::AppHandle, montrer_mini: bool) 
 
 /// L'option est-elle active ? (réglage du mini-lecteur embarqué)
 #[tauri::command]
-async fn get_demarrer_serveur_local() -> Result<bool, String> {
-    Ok(lire_cfg_bool(serveur_local::CLE_CONFIG, false))
+///
+/// `None` hors Windows et macOS : l'interface masque alors la case.
+async fn get_demarrer_serveur_local() -> Result<Option<bool>, String> {
+    Ok(serveur_local::PRIS_EN_CHARGE.then(|| lire_cfg_bool(serveur_local::CLE_CONFIG, false)))
 }
 
 /// Active ou désactive l'option, et tient la case du menu à jour.
 #[tauri::command]
 async fn set_demarrer_serveur_local(app: tauri::AppHandle, actif: bool) -> Result<(), String> {
+    if !serveur_local::PRIS_EN_CHARGE {
+        return Err("non pris en charge sur ce système".to_string());
+    }
     ecrire_cfg_bool(serveur_local::CLE_CONFIG, actif);
     if let Some(item) = app.try_state::<CaseDemarrageServeur>() {
         let _ = item.0.set_checked(actif);
@@ -1213,16 +1222,22 @@ fn main() {
                 MenuItem::with_id(app, "open_web", "Fenêtre complète", true, None::<&str>)?;
             let open_mini =
                 MenuItem::with_id(app, "open_mini", "Mini-lecteur", true, None::<&str>)?;
-            let demarrer_serveur = CheckMenuItem::with_id(
-                app,
-                "demarrer_serveur",
-                "Démarrer le serveur Tune s'il ne tourne pas",
-                true,
-                lire_cfg_bool(serveur_local::CLE_CONFIG, false),
-                None::<&str>,
-            )?;
-            app.manage(CaseDemarrageServeur(demarrer_serveur.clone()));
-            let menu = Menu::with_items(app, &[&open_web, &open_mini, &demarrer_serveur, &quit])?;
+            // La case n'existe que là où le widget sait lancer le serveur
+            // (Windows, macOS) : sous Linux, c'est un service système.
+            let menu = Menu::with_items(app, &[&open_web, &open_mini])?;
+            if serveur_local::PRIS_EN_CHARGE {
+                let demarrer_serveur = CheckMenuItem::with_id(
+                    app,
+                    "demarrer_serveur",
+                    "Démarrer le serveur Tune s'il ne tourne pas",
+                    true,
+                    lire_cfg_bool(serveur_local::CLE_CONFIG, false),
+                    None::<&str>,
+                )?;
+                menu.append(&demarrer_serveur)?;
+                app.manage(CaseDemarrageServeur(demarrer_serveur));
+            }
+            menu.append(&quit)?;
 
             let tray_icon_bytes = include_bytes!("../icons/tray-icon.png");
             let tray_img = tauri::image::Image::from_bytes(tray_icon_bytes).expect("tray icon");
@@ -1331,7 +1346,11 @@ fn main() {
             let h = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 demarrer_serveur_si_absent(&h, true).await;
-                montrer_le_widget(h).await;
+                // PAS `montrer_le_widget` : si le serveur vient d'être lancé,
+                // le mini-lecteur embarqué est visible pendant l'attente, et
+                // il faut maintenant basculer sur le mode retenu (vue unifiée
+                // servie par le serveur), pas seulement lui donner le focus.
+                set_full_mode(&h, saved_full_mode()).await;
             });
 
             Ok(())

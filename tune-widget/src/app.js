@@ -434,7 +434,7 @@ $('search-input').addEventListener('keydown', (e) => {
 
 // Settings
 const mainEls = ['cover-container', 'track-info', 'progress-container', 'controls', 'volume-container', 'search-container'];
-$('btn-settings').onclick = () => { $('search-input').value = ''; fermerRecherche(); mainEls.forEach(id => $(id).style.display = 'none'); $('settings-panel').style.display = 'block'; $('server-url').value = SERVER.replace(/^https?:\/\//, ''); };
+$('btn-settings').onclick = () => { $('search-input').value = ''; fermerRecherche(); mainEls.forEach(id => $(id).style.display = 'none'); $('settings-panel').style.display = 'block'; $('server-url').value = SERVER.replace(/^https?:\/\//, ''); lireOptionDemarrage(); };
 $('btn-settings-back').onclick = () => { $('settings-panel').style.display = 'none'; mainEls.forEach(id => $(id).style.display = ''); };
 $('btn-connect').onclick = () => {
   const v = $('server-url').value.trim();
@@ -452,10 +452,15 @@ $('server-url').addEventListener('keydown', e => { if (e.key === 'Enter') $('btn
 // Option « Démarrer le serveur Tune s'il ne tourne pas » (fil 2868), lue et
 // écrite côté natif : c'est lui qui lance le serveur, au démarrage du widget.
 // Hors Tauri (page ouverte dans un navigateur), la case reste sans effet.
-(async () => {
-  const actif = await invoke('get_demarrer_serveur_local')?.catch?.(() => false);
+// Relue à chaque ouverture des Réglages : le menu de la zone de notification
+// peut l'avoir changée entre-temps. `null` (Linux) ou hors Tauri : masquée.
+async function lireOptionDemarrage() {
+  const actif = await invoke('get_demarrer_serveur_local')?.catch?.(() => null);
+  const pris = actif === true || actif === false;
+  $('option-demarrage').style.display = pris ? '' : 'none';
   $('demarrer-serveur').checked = actif === true;
-})();
+}
+lireOptionDemarrage();
 $('demarrer-serveur').onchange = (e) => {
   invoke('set_demarrer_serveur_local', { actif: e.target.checked })?.catch?.(() => {});
 };

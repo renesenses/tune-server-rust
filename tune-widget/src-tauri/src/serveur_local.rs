@@ -30,6 +30,9 @@
 
 use std::path::PathBuf;
 
+/// Le widget sait-il lancer le serveur sur ce système ? (Windows, macOS)
+pub const PRIS_EN_CHARGE: bool = cfg!(any(windows, target_os = "macos"));
+
 /// La clé de `config.json`.
 pub const CLE_CONFIG: &str = "demarrer_serveur_local";
 
@@ -70,7 +73,7 @@ pub fn adresse_locale(serveur: &str) -> bool {
 /// l'installeur (`"C:\…\Tune Server\uninstall.exe"`, guillemets compris ou non).
 ///
 /// Ne rend un dossier que si la valeur désigne bien `uninstall.exe` par un
-/// chemin absolu (lettre de lecteur ou chemin UNC) : toute autre forme est
+/// chemin absolu sur une lettre de lecteur (`X:\…`) : toute autre forme est
 /// ignorée, et l'emplacement par défaut prend le relais.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn dossier_depuis_desinstalleur(valeur: &str) -> Option<String> {
@@ -83,10 +86,10 @@ pub fn dossier_depuis_desinstalleur(valeur: &str) -> Option<String> {
     if !fichier.eq_ignore_ascii_case("uninstall.exe") {
         return None;
     }
-    let absolu = dossier.starts_with(r"\\")
-        || (dossier.len() >= 2
-            && dossier.as_bytes()[0].is_ascii_alphabetic()
-            && dossier.as_bytes()[1] == b':');
+    // `X:\…` seulement. Pas de `\\` : ni partage UNC, ni `\\?\`, ni `\\.\`
+    // (périphériques) — l'installeur par utilisateur n'en écrit jamais.
+    let b = dossier.as_bytes();
+    let absolu = b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\';
     if !absolu || dossier.contains('"') {
         return None;
     }
@@ -121,6 +124,16 @@ pub fn candidats_macos(home: Option<PathBuf>) -> Vec<PathBuf> {
         out.push(h.join("Applications").join(APP_MACOS));
     }
     out
+}
+
+/// Le nom du processus du lanceur macOS (`CFBundleExecutable`).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub const APPLET_MACOS: &str = "Tune Server";
+
+/// macOS : n'envoyer `open -a` que si le lanceur ne tourne pas déjà.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub fn faut_il_ouvrir_l_applet(applet_tourne: bool) -> bool {
+    !applet_tourne
 }
 
 /// Lance le serveur installé sur cette machine. `Err` dit pourquoi rien n'a
@@ -179,7 +192,23 @@ fn lancer_systeme() -> Result<String, String> {
         .into_iter()
         .find(|p| p.is_dir())
         .ok_or_else(|| format!("{APP_MACOS} introuvable dans /Applications ni ~/Applications"))?;
-    Command::new("/usr/bin/open")
+    // Le lanceur (applet « Tune Server ») tourne déjà : le serveur démarre ou
+    // redémarre sous lui. `open -a` lui enverrait un « reopen », qui ouvre un
+    // onglet de navigateur : on se contente d'attendre le port.
+    let applet_tourne = Command::new("/usr/bin/pgrep")
+        .arg("-x")
+        .arg(APPLET_MACOS)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    if !faut_il_ouvrir_l_applet(applet_tourne) {
+        return Ok(format!("{} (déjà lancé, attente du port)", app.display()));
+    }
+    // `.status()` : attendre la fin de `open`, pour en connaître l'issue
+    // (appelé dans `spawn_blocking`).
+    let statut = Command::new("/usr/bin/open")
         .arg("-g")
         .arg("-a")
         .arg(&app)
@@ -188,9 +217,13 @@ fn lancer_systeme() -> Result<String, String> {
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn()
-        .map(|_| app.display().to_string())
-        .map_err(|e| format!("{}: {e}", app.display()))
+        .status()
+        .map_err(|e| format!("{}: {e}", app.display()))?;
+    if statut.success() {
+        Ok(app.display().to_string())
+    } else {
+        Err(format!("{}: open a échoué ({statut})", app.display()))
+    }
 }
 
 #[cfg(not(any(windows, target_os = "macos")))]
@@ -244,10 +277,6 @@ mod tests {
             dossier_depuis_desinstalleur(r"D:\Musique\Tune\Uninstall.exe"),
             Some(r"D:\Musique\Tune".to_string())
         );
-        assert_eq!(
-            dossier_depuis_desinstalleur(r"\\nas\apps\Tune\uninstall.exe"),
-            Some(r"\\nas\apps\Tune".to_string())
-        );
         // Tout ce qui n'est pas « chemin absolu\uninstall.exe » est ignoré.
         for faux in [
             "",
@@ -257,6 +286,14 @@ mod tests {
             r"C:\Tune\uninstall.exe /S",
             r#"cmd /c calc & "C:\Tune\uninstall.exe""#,
             r#"C:\Tu"ne\uninstall.exe"#,
+            // Ni UNC, ni espaces de noms Win32 / périphériques.
+            r"\\nas\apps\Tune\uninstall.exe",
+            r"\\?\C:\Tune\uninstall.exe",
+            r"\\.\C:\Tune\uninstall.exe",
+            r"\\?\UNC\nas\Tune\uninstall.exe",
+            // Lecteur sans barre : relatif au dossier courant de ce lecteur.
+            r"C:Tune\uninstall.exe",
+            r"C:\uninstall.exe",
         ] {
             assert_eq!(dossier_depuis_desinstalleur(faux), None, "{faux}");
         }
@@ -293,6 +330,17 @@ mod tests {
         for c in candidats_windows(Some(r"E:\X\uninstall.exe"), Some(r"C:\L")) {
             assert!(c.ends_with(r"\tune-server.exe"), "{c}");
         }
+    }
+
+    #[test]
+    fn macos_n_ouvre_pas_l_applet_deja_lancee() {
+        assert!(faut_il_ouvrir_l_applet(false));
+        assert!(!faut_il_ouvrir_l_applet(true));
+    }
+
+    #[test]
+    fn la_case_n_existe_que_sous_windows_et_macos() {
+        assert_eq!(PRIS_EN_CHARGE, cfg!(windows) || cfg!(target_os = "macos"));
     }
 
     #[test]
