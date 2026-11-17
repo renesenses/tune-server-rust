@@ -1293,8 +1293,9 @@ pub async fn handle_stream(
             // le « burst-on-connect » d'icecast —, puis la suite du canal,
             // sans trou ni doublon (voir `StreamSession::tete_du_direct`). La
             // première connexion n'y voit rien (la tête est vide) ; une reprise
-            // `bytes=N-` d'un fichier borné non plus.
-            if reprise_bornee.is_none() {
+            // `bytes=N-` non plus (#3513 : un navigateur qui reprend après
+            // l'en-tête ne doit pas réentendre ce qu'il a déjà joué).
+            if reprise_bornee.is_none() && range_demande.unwrap_or(0) == 0 {
                 match session.tete_du_direct().await {
                     tune_core::http::streamer::TeteRejouable::Blocs(blocs) if !blocs.is_empty() => {
                         info!(
