@@ -217,6 +217,15 @@ fn actions_machine() -> Vec<(Method, &'static str, Option<&'static str>)> {
 
 /// Les routes qui, passée la garde, ne partent pas en ligne : témoins « la
 /// garde passe » sans appel à la boutique.
+/// La garde « cette machine » est-elle passée ? Son refus porte
+/// `auth_required` ; le gestionnaire de l'arrêt programmé, lui, refuse
+/// d'éteindre un HÔTE ordinaire sans authentification active (#8909) avec son
+/// propre message — garde passée, refus du gestionnaire.
+fn garde_passee(rep: &str) -> bool {
+    !rep.contains("auth_required")
+        || rep.contains(tune_server::extinction_hote::REFUS_SANS_AUTHENTIFICATION)
+}
+
 fn actions_machine_hors_ligne() -> Vec<(Method, &'static str, Option<&'static str>)> {
     actions_machine()
         .into_iter()
@@ -437,7 +446,7 @@ async fn sans_authentification_les_actions_machine_viennent_de_cette_machine() {
     // du gestionnaire : 404 hors appliance, 400 poweroff hors Tune OS).
     for (m, chemin, corps) in actions_machine_hors_ligne() {
         let (st, rep) = appel(&state, m.clone(), chemin, None, corps).await;
-        assert!(!rep.contains("auth_required"), "{m} {chemin} : {rep}");
+        assert!(garde_passee(&rep), "{m} {chemin} : {rep}");
         assert_ne!(st, StatusCode::UNAUTHORIZED, "{m} {chemin} : {rep}");
     }
 }
@@ -451,10 +460,7 @@ async fn sans_authentification_le_bouclage_ipv6_est_cette_machine() {
         for (m, chemin, corps) in actions_machine_hors_ligne() {
             let (st, _, rep) =
                 appel_depuis(&state, adresse, m.clone(), chemin, None, corps, &[]).await;
-            assert!(
-                !rep.contains("auth_required"),
-                "{adresse} {m} {chemin} : {rep}"
-            );
+            assert!(garde_passee(&rep), "{adresse} {m} {chemin} : {rep}");
             assert_ne!(
                 st,
                 StatusCode::UNAUTHORIZED,

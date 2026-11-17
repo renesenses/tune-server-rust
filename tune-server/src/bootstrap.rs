@@ -410,6 +410,11 @@ pub async fn run_with(opts: RunOptions) {
     // `AppState::new` et d'une boucle de redémarrage muette.
     crate::dossiers_inscriptibles::verifier_ou_sortir(&config);
 
+    // #8747 — `/data` sans volume (ou sur un volume anonyme) : la base serait
+    // perdue à la recréation du conteneur, mise à jour de l'image comprise.
+    // On le dit au journal ; `GET /system/env` le publie pour le bandeau.
+    crate::persistance_donnees::journaliser_au_demarrage(&config.db_path);
+
     crate::boot_status::set_phase("base de données");
     // Le coffre des clés d'API personnelles (#4805, lot 1) : sa clé maîtresse
     // vit à côté de la base. Posé AVANT tout service qui lirait une clé.

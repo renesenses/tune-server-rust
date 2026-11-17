@@ -95,6 +95,10 @@ pub struct RepriseFavoris {
     /// ceux qu'une reprise d'avant avait datés au même instant (fil 1780).
     #[serde(default)]
     pub redates: usize,
+    /// #8766 — le service limitait les demandes (`429`) : la reprise est à
+    /// refaire dans ce nombre de secondes (`Retry-After`). Absent sinon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reessayer_dans_s: Option<u64>,
 }
 
 impl RepriseFavoris {
@@ -105,6 +109,67 @@ impl RepriseFavoris {
         self.echecs += autre.echecs;
         self.redates += autre.redates;
     }
+}
+
+/// #8766 — combien de fois la reprise de démarrage se reprogramme après une
+/// limite (`429`) : assez pour passer une pénalité, pas une veille.
+pub const REPRISES_APRES_LIMITE: u32 = 3;
+
+/// #8766 — reprogramme la reprise des services que la limite de débit
+/// (`429`) a fait échouer, après le délai qu'ils annoncent.
+///
+/// `comptes` est ce que rend la reprise, un objet `{service: compte}` ; un
+/// compte qui porte `reessayer_dans_s` est refait par `relire(service)` après
+/// ce délai (plus une seconde de marge, en `seconde`), au plus
+/// [`REPRISES_APRES_LIMITE`] fois. Le nouveau compte remplace l'ancien. Rend
+/// le nombre de reprises faites.
+pub async fn reprogrammer_apres_les_limites<F, Fut>(
+    comptes: &mut serde_json::Value,
+    seconde: std::time::Duration,
+    mut relire: F,
+) -> u32
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = serde_json::Value>,
+{
+    let mut reprises = 0;
+    while reprises < REPRISES_APRES_LIMITE {
+        let limites: Vec<(String, u64)> = comptes
+            .as_object()
+            .map(|o| {
+                o.iter()
+                    .filter_map(|(nom, c)| {
+                        c.get("reessayer_dans_s")
+                            .and_then(serde_json::Value::as_u64)
+                            .map(|s| (nom.clone(), s))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let Some(attente) = limites.iter().map(|(_, s)| *s).max() else {
+            break;
+        };
+        reprises += 1;
+        for (nom, secs) in &limites {
+            warn!(service = %nom, reessayer_dans_s = secs, reprise = reprises, "reprise_favoris_reprogrammee_apres_limite");
+        }
+        tokio::time::sleep(
+            seconde.saturating_mul(u32::try_from(attente.saturating_add(1)).unwrap_or(u32::MAX)),
+        )
+        .await;
+        for (nom, _) in limites {
+            let nouveau = relire(nom.clone()).await;
+            let compte = nouveau
+                .get(&nom)
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            info!(service = %nom, reprise = reprises, compte = %compte, "reprise_favoris_apres_limite");
+            if let Some(o) = comptes.as_object_mut() {
+                o.insert(nom, compte);
+            }
+        }
+    }
+    reprises
 }
 
 /// Un favori du service, réduit à ce que la table de Tune mémorise.
@@ -364,6 +429,12 @@ pub async fn reprendre_les_favoris_du_service(
         }
     }
 
+    // #8766 — un échec sous la limite de débit (`429`) n'est pas définitif :
+    // le délai annoncé est rendu pour que le démarrage reprogramme la reprise.
+    if total.echecs > 0 {
+        total.reessayer_dans_s = svc.limite_de_debit_restante_s();
+    }
+
     if total.ajoutes > 0 || total.echecs > 0 {
         info!(
             service = %service,
@@ -372,6 +443,7 @@ pub async fn reprendre_les_favoris_du_service(
             ajoutes = total.ajoutes,
             deja_presents = total.deja_presents,
             echecs = total.echecs,
+            reessayer_dans_s = ?total.reessayer_dans_s,
             "reprise_favoris_service"
         );
     }

@@ -3,40 +3,86 @@
 use crate::state::AppState;
 use futures_util::{StreamExt, stream};
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
+use tune_core::db::playlist_repo::{FicheDeService, PlaylistRepo};
+use tune_core::error::TuneError;
 use tune_core::streaming::traits::StreamTrack;
 
 #[derive(Default)]
 pub(crate) struct Cache(Mutex<HashMap<String, (Instant, StreamTrack)>>);
 
-pub(super) async fn completer(state: &AppState, items: &mut [Value]) {
-    completer_service(state, items, "qobuz").await;
+#[cfg(test)]
+impl Cache {
+    /// Vide le cache des fiches (tests : forcer une relecture du service).
+    pub(crate) async fn vider(&self) {
+        self.0.lock().await.clear();
+    }
+}
+
+/// Complète les lignes de service `items` de la playlist `playlist_id`.
+/// Rend la tâche de fond qui mémorise les fiches Qobuz résolues (#8892) —
+/// la réponse ne l'attend pas ; les tests, si.
+pub(super) async fn completer(
+    state: &AppState,
+    playlist_id: i64,
+    items: &mut [Value],
+) -> Option<tokio::task::JoinHandle<usize>> {
+    let memorisation = completer_service(state, playlist_id, items, "qobuz").await;
     // #8066 — TIDAL : seule la disponibilité est reportée sur la ligne, pour
     // que le client grise un titre indisponible (`disponible: false`) et
     // propose « Remplacer l'indisponible ». Le reste de la ligne ne change
     // pas.
-    completer_service(state, items, "tidal").await;
+    completer_service(state, playlist_id, items, "tidal").await;
+    memorisation
 }
 
-async fn completer_service(state: &AppState, items: &mut [Value], nom: &'static str) {
+async fn completer_service(
+    state: &AppState,
+    playlist_id: i64,
+    items: &mut [Value],
+    nom: &'static str,
+) -> Option<tokio::task::JoinHandle<usize>> {
     if !items.iter().any(|v| v["source"] == nom) {
-        return;
+        return None;
     }
     let ids = items
         .iter()
         .filter(|v| v["source"] == nom)
         .filter_map(|v| v["source_id"].as_str().map(str::to_owned))
         .collect::<Vec<_>>();
-    let connus = pistes_du_service(state, nom, ids, Duration::from_secs(30)).await;
+    let Fiches {
+        connues: connus,
+        retires,
+    } = fiches_du_service(state, nom, ids, Duration::from_secs(30)).await;
+    // #8892 — les fiches à mémoriser, ligne par ligne (`entry_id`).
+    let mut a_memoriser: Vec<(i64, FicheDeService)> = Vec::new();
     for ligne in items {
         if ligne["source"] != nom {
+            continue;
+        }
+        // #8892 — le service ne connaît plus ce titre (404) : la ligne est
+        // indisponible, grisée et non jouable, et garde la fiche mémorisée
+        // (artiste, album, pochette, durée) qu'elle porte déjà.
+        if ligne["source_id"]
+            .as_str()
+            .is_some_and(|id| retires.contains(id))
+        {
+            if let Some(objet) = ligne.as_object_mut() {
+                objet.insert("disponible".into(), serde_json::json!(false));
+            }
             continue;
         }
         let Some(piste) = ligne["source_id"].as_str().and_then(|id| connus.get(id)) else {
             continue;
         };
+        if nom == "qobuz"
+            && let Some(entry_id) = ligne["entry_id"].as_i64()
+            && let Some(fiche) = fiche_a_memoriser(ligne, piste)
+        {
+            a_memoriser.push((entry_id, fiche));
+        }
         if nom != "qobuz" {
             if let (Some(d), Some(objet)) = (piste.disponible, ligne.as_object_mut()) {
                 objet.insert("disponible".into(), serde_json::json!(d));
@@ -63,6 +109,62 @@ async fn completer_service(state: &AppState, items: &mut [Value], nom: &'static 
             }
         }
     }
+    memoriser(state, playlist_id, a_memoriser)
+}
+
+/// #8892 — ce que la fiche `piste` apprend de plus que la ligne enregistrée
+/// `ligne` (artiste, album et son identifiant chez le service, pochette,
+/// durée) ; `None` quand la ligne sait déjà tout : aucune écriture à chaque
+/// affichage.
+fn fiche_a_memoriser(ligne: &Value, piste: &StreamTrack) -> Option<FicheDeService> {
+    let nouveau = |cle: &str, valeur: Option<&str>| -> Option<String> {
+        let valeur = valeur.map(str::trim).filter(|v| !v.is_empty())?;
+        (ligne[cle].as_str().map(str::trim) != Some(valeur)).then(|| valeur.to_owned())
+    };
+    let duree = i64::try_from(piste.duration_ms).ok().filter(|d| *d > 0);
+    let fiche = FicheDeService {
+        artist: nouveau("artist_name", Some(piste.artist.as_str())),
+        album: nouveau("album_title", piste.album.as_deref()),
+        album_source_id: nouveau("album_id", piste.album_id.as_deref()),
+        cover_url: nouveau("cover_path", piste.cover_path.as_deref()),
+        duration_ms: duree.filter(|d| ligne["duration_ms"].as_i64() != Some(*d)),
+    };
+    (fiche != FicheDeService::default()).then_some(fiche)
+}
+
+/// #8892 — écrit les fiches résolues sur leurs lignes de la playlist
+/// `playlist_id` : quand le titre deviendra indisponible, la ligne gardera ce
+/// que sa dernière résolution réussie avait appris. Une seule transaction,
+/// sur un fil bloquant, EN TÂCHE DE FOND : la réponse n'attend pas la base
+/// (un scan qui la tient ne fait pas pendre l'affichage). Une erreur
+/// d'écriture est journalisée, jamais renvoyée. Rend le nombre de lignes
+/// réécrites (0 en cas d'erreur).
+fn memoriser(
+    state: &AppState,
+    playlist_id: i64,
+    fiches: Vec<(i64, FicheDeService)>,
+) -> Option<tokio::task::JoinHandle<usize>> {
+    if fiches.is_empty() {
+        return None;
+    }
+    let repo = PlaylistRepo::with_backend(state.backend.clone());
+    Some(tokio::task::spawn_blocking(move || {
+        match repo.memoriser_fiches_de_lignes(playlist_id, &fiches) {
+            Ok(n) => n,
+            Err(e) => {
+                tracing::warn!(playlist_id, error = %e, "playlist_fiches_non_memorisees");
+                0
+            }
+        }
+    }))
+}
+
+/// Les fiches lues chez un service : celles qu'il a rendues, et les
+/// identifiants qu'il dit ne plus connaître (404, #8892).
+#[derive(Default)]
+struct Fiches {
+    connues: HashMap<String, StreamTrack>,
+    retires: HashSet<String>,
 }
 
 /// Les fiches des titres `ids` chez le service `nom` : le cache d'abord (cinq
@@ -73,18 +175,30 @@ async fn completer_service(state: &AppState, items: &mut [Value], nom: &'static 
 async fn pistes_du_service(
     state: &AppState,
     nom: &str,
-    mut ids: Vec<String>,
+    ids: Vec<String>,
     delai: Duration,
 ) -> HashMap<String, StreamTrack> {
-    let mut connus = HashMap::new();
+    fiches_du_service(state, nom, ids, delai).await.connues
+}
+
+/// [`pistes_du_service`], avec en plus les titres que le service dit ne plus
+/// connaître (`TuneError::NotFound`, son 404) — jamais une panne, un délai
+/// dépassé ou un refus d'une autre nature (#8892).
+async fn fiches_du_service(
+    state: &AppState,
+    nom: &str,
+    mut ids: Vec<String>,
+    delai: Duration,
+) -> Fiches {
+    let mut fiches = Fiches::default();
     // Ne jamais tenir le registre pendant les échanges réseau.
     let service = { state.services.lock().await.get(nom) };
     let Some(service) = service else {
-        return connus;
+        return fiches;
     };
     let service = service.read().await;
     if !service.enabled() || !service.auth_status().await.authenticated {
-        return connus;
+        return fiches;
     }
     ids.sort();
     ids.dedup();
@@ -93,7 +207,7 @@ async fn pistes_du_service(
         cache.retain(|_, (date, _)| date.elapsed() < Duration::from_secs(300));
         ids.retain(|id| {
             if let Some((_, piste)) = cache.get(&cle(nom, id)) {
-                connus.insert(id.clone(), piste.clone());
+                fiches.connues.insert(id.clone(), piste.clone());
                 false
             } else {
                 true
@@ -102,7 +216,7 @@ async fn pistes_du_service(
     }
     // Le cache seul (`CACHE_SEUL`) : aucun appel au service.
     if delai.is_zero() || ids.is_empty() {
-        return connus;
+        return fiches;
     }
     // Quatre requêtes au plus ; un service en panne ne bloque pas indéfiniment
     // la fiche. Les succès partiels restent en cache pour la lecture suivante.
@@ -117,7 +231,14 @@ async fn pistes_du_service(
     tokio::pin!(lectures);
     let limite = tokio::time::Instant::now() + delai;
     while let Ok(Some((id, resultat))) = tokio::time::timeout_at(limite, lectures.next()).await {
-        let Ok(Ok(piste)) = resultat else { continue };
+        let piste = match resultat {
+            Ok(Ok(piste)) => piste,
+            Ok(Err(TuneError::NotFound(_))) => {
+                fiches.retires.insert(id);
+                continue;
+            }
+            _ => continue,
+        };
         if piste.id != id {
             continue;
         }
@@ -131,9 +252,9 @@ async fn pistes_du_service(
             cache.remove(&ancienne);
         }
         cache.insert(cle(nom, &id), (Instant::now(), piste.clone()));
-        connus.insert(id, piste);
+        fiches.connues.insert(id, piste);
     }
-    connus
+    fiches
 }
 
 /// Les services dont la fiche d'un titre porte sa durée.

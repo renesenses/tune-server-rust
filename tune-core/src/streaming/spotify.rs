@@ -97,6 +97,11 @@ pub struct SpotifyService {
     /// #8766 — fin de la pénalité d'un `429` abandonné : avant elle, aucun
     /// `GET` ne repart vers Spotify.
     penalite_429: std::sync::Mutex<Option<std::time::Instant>>,
+    /// #8766 — les `GET` en vol, par chemin : deux demandes identiques
+    /// simultanées (deux bandes de l'écran sur la même rubrique) partagent
+    /// UN appel à Spotify et sa réponse. Retiré dès la réponse rendue : rien
+    /// n'est mis en cache au-delà de l'appel.
+    en_vol: std::sync::Mutex<std::collections::HashMap<String, Arc<GetEnVol>>>,
     /// #6933 — les portées que Spotify dit avoir ACCORDÉES (champ `scope`
     /// de la réponse du jeton, à l'échange comme au rafraîchissement).
     /// `None` : inconnues (liaison restaurée d'une version qui ne les gardait
@@ -303,6 +308,9 @@ pub struct ErreurApi {
     pub reessayer_apres: Option<u64>,
 }
 
+/// #8766 — un `GET` partagé par les appels simultanés au même chemin.
+type GetEnVol = tokio::sync::OnceCell<Result<serde_json::Value, ErreurApi>>;
+
 /// #8198 — statut de `/me` pour un compte que l'application n'autorise pas.
 pub const STATUT_COMPTE_NON_AUTORISE: u16 = 403;
 
@@ -409,6 +417,21 @@ impl Budget429 {
 
 /// #8766 — le début du message d'un `429` abandonné.
 const LIMITE_429: &str = "Spotify limite temporairement les demandes";
+
+/// #8154 — le texte d'un `401` de l'API Web (jeton refusé), tel que
+/// [`requete_api`] le rend.
+pub const JETON_EXPIRE: &str = "token expired";
+
+/// #8154 — le message d'action d'un jeton que Spotify refuse encore après un
+/// renouvellement : seule une reconnexion peut le lever.
+pub const MOTIF_JETON_REFUSE: &str =
+    "Spotify a refusé le jeton : reconnecter Spotify dans les Réglages.";
+
+/// #8154 — l'échec vient-il d'un jeton refusé (`401`) ? Vrai pour le texte
+/// brut de l'API Web comme pour le message d'action.
+pub fn est_un_refus_de_jeton(erreur: &str) -> bool {
+    erreur == JETON_EXPIRE || erreur == MOTIF_JETON_REFUSE
+}
 /// #8766 — plafond d'une attente demandée par `Retry-After`, en secondes.
 const RETRY_AFTER_MAX_SECS: u64 = 60;
 
@@ -759,6 +782,7 @@ impl SpotifyService {
             token_rejected: Arc::new(AtomicBool::new(false)),
             seconde_429: std::time::Duration::from_secs(1),
             penalite_429: std::sync::Mutex::new(None),
+            en_vol: std::sync::Mutex::new(std::collections::HashMap::new()),
             portees: None,
             plafond_recherche: AtomicUsize::new(PLAFOND_RECHERCHE),
             session_refusee: false,
@@ -881,9 +905,27 @@ impl SpotifyService {
     /// restant abandonne tout de suite, et la pénalité est retenue : aucun
     /// appel ne repart vers Spotify avant sa fin. L'erreur le dit en clair,
     /// statut 429 gardé ; jamais une liste vide.
+    ///
+    /// #8766 — deux appels simultanés sur le même `path` n'en font qu'un chez
+    /// Spotify ([`Self::en_vol`]) : chaque rubrique était demandée deux fois
+    /// par affichage (« ×2 »), et chaque double comptait dans la limite.
     async fn api_get_detaille(&self, path: &str) -> Result<serde_json::Value, ErreurApi> {
-        let mut budget = Budget429::nouveau(self.seconde_429);
-        self.api_get_avec_budget(path, &mut budget).await
+        let cellule = {
+            let mut en_vol = self.en_vol.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(en_vol.entry(path.to_owned()).or_default())
+        };
+        let reponse = cellule
+            .get_or_init(|| async {
+                let mut budget = Budget429::nouveau(self.seconde_429);
+                self.api_get_avec_budget(path, &mut budget).await
+            })
+            .await
+            .clone();
+        let mut en_vol = self.en_vol.lock().unwrap_or_else(|e| e.into_inner());
+        if en_vol.get(path).is_some_and(|c| Arc::ptr_eq(c, &cellule)) {
+            en_vol.remove(path);
+        }
+        reponse
     }
 
     /// #8766 — [`Self::api_get_detaille`] dans un budget fourni : une liste
@@ -1272,7 +1314,7 @@ impl SpotifyService {
                     derniere_erreur = None;
                     appareil = trouve;
                 }
-                Err(e) if e == "token expired" => return Err(e),
+                Err(e) if e == JETON_EXPIRE => return Err(e),
                 // #8766 — `api_get` a déjà réessayé le 429 jusqu'au bout
                 // (`ESSAIS_429`, `Retry-After`) : redemander 20 fois de plus
                 // prolongerait la pénalité de Spotify.
@@ -1311,7 +1353,7 @@ impl SpotifyService {
             }
             401 => {
                 self.note_token_rejected();
-                Err("Spotify a refusé le jeton : reconnecter Spotify dans les Réglages.".into())
+                Err(MOTIF_JETON_REFUSE.into())
             }
             _ => {
                 let detail = resp.text().await.unwrap_or_default();
@@ -2381,6 +2423,12 @@ impl StreamingService for SpotifyService {
             RubriqueRetirable::TitresPhares => &self.titres_phares_retires,
         };
         drapeau.load(Ordering::Relaxed)
+    }
+
+    fn limite_de_debit_restante_s(&self) -> Option<u64> {
+        let reste = self.penalite_429_restante()?;
+        let unite = self.seconde_429.as_secs_f64().max(f64::MIN_POSITIVE);
+        Some((reste.as_secs_f64() / unite).ceil().max(1.0) as u64)
     }
 
     async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
@@ -4244,6 +4292,10 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "spotify_reprise_429_8766_tests.rs"]
+mod reprise_429_8766_tests;
 
 #[cfg(test)]
 #[path = "spotify_recherche_7659_tests.rs"]
