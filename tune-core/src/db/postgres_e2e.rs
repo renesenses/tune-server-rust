@@ -3834,3 +3834,41 @@ async fn pg_916_suggestions_ecartees() {
     assert!(repo.lister(1).unwrap().is_empty());
     pool.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_8838_fuseau_reveils_migration_et_lecture() {
+    use crate::alarms::{ALARM_TIMEZONE_KEY, alarm_local_time, read_alarm_timezone};
+    use crate::db::settings_repo::SettingsRepo;
+    use chrono::Timelike;
+    let db = pg_or_skip!();
+    let postgres =
+        crate::db::postgres::PostgresDb::connect(&std::env::var("TUNE_TEST_PG_URL").unwrap())
+            .await
+            .unwrap();
+    crate::db::migrations::run_pg_migrations(postgres.pool())
+        .await
+        .unwrap();
+    postgres.ensure_schema().await;
+    let repo = SettingsRepo::with_backend(db.clone());
+    repo.delete(ALARM_TIMEZONE_KEY).unwrap();
+    db.execute_batch(include_str!(
+        "../../migrations/postgres/121_alarms_timezone.sql"
+    ))
+    .unwrap();
+    assert_eq!(repo.get(ALARM_TIMEZONE_KEY).unwrap().as_deref(), Some(""));
+    repo.set(ALARM_TIMEZONE_KEY, "Europe/Paris").unwrap();
+    db.execute_batch(include_str!(
+        "../../migrations/postgres/121_alarms_timezone.sql"
+    ))
+    .unwrap();
+    assert_eq!(read_alarm_timezone(db.as_ref()).unwrap(), "Europe/Paris");
+    for utc in ["2026-11-17T10:10:00Z", "2026-07-17T09:10:00Z"] {
+        assert_eq!(
+            alarm_local_time(db.as_ref(), utc.parse().unwrap())
+                .unwrap()
+                .hour(),
+            11
+        );
+    }
+    repo.set(ALARM_TIMEZONE_KEY, "").unwrap();
+}

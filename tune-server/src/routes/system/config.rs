@@ -1851,6 +1851,12 @@ pub(super) async fn update_config(
     Json(body): Json<ConfigPatch>,
 ) -> Result<impl IntoResponse, AppError> {
     let mut values = body.0;
+    if let Some(value) = values.get(tune_core::alarms::ALARM_TIMEZONE_KEY) {
+        let zone = value
+            .as_str()
+            .ok_or_else(|| AppError::bad_request("alarms_timezone : nom IANA attendu"))?;
+        tune_core::alarms::validate_alarm_timezone(zone).map_err(AppError::bad_request)?;
+    }
     // Les clés qui changent qui contrôle le serveur, ce qu'il exécute ou à
     // qui il parle (`tune_core::reglages_proteges`) ne passent par cette route
     // qu'avec une authentification admin EFFECTIVE. Authentification
@@ -7403,3 +7409,7 @@ mod confinement_chemins_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "fuseau_reveils_8838_tests.rs"]
+mod fuseau_reveils_8838_tests;

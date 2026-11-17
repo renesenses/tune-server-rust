@@ -8,6 +8,12 @@ use tracing::{info, warn};
 use crate::db::backend::{DbBackend, ToSqlValue};
 use crate::orchestrator::PlaybackOrchestrator;
 
+mod timezone;
+pub use timezone::{
+    ALARM_TIMEZONE_KEY, alarm_local_time, next_alarm_at, read_alarm_timezone,
+    validate_alarm_timezone,
+};
+
 const POLL_INTERVAL_SECS: u64 = 30;
 const SNOOZE_DEFAULT_MIN: i64 = 5;
 
@@ -404,8 +410,9 @@ impl AlarmScheduler {
         fired_today: &mut HashSet<i64>,
         last_date: &mut String,
     ) -> Result<(), String> {
-        use chrono::{Datelike, Local, Timelike};
-        let now = Local::now();
+        let instant = chrono::Utc::now();
+        let zone = read_alarm_timezone(self.db.as_ref())?;
+        let now = timezone::local_time(&zone, instant)?;
         let today = now.format("%Y-%m-%d").to_string();
 
         if *last_date != today {
@@ -425,8 +432,7 @@ impl AlarmScheduler {
         }
 
         // Check scheduled alarms
-        let alarms = self.list_enabled_alarms()?;
-        let dow = now.weekday().num_days_from_monday(); // 0=Mon..6=Sun
+        let alarms = self.list_scheduled_alarms()?;
 
         for alarm in &alarms {
             let alarm_id = alarm.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -437,36 +443,17 @@ impl AlarmScheduler {
                 continue;
             }
 
-            let days = resolve_alarm_days(alarm);
-            if !days.contains(&dow) {
-                continue;
-            }
-
-            if alarm
-                .get("skip_holidays")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0)
-                != 0
-                && is_french_holiday(now.year(), now.month(), now.day())
-            {
-                info!(alarm_id, date = %today, "alarm_skipped_holiday");
-                fired_today.insert(alarm_id);
-                continue;
-            }
-
-            let alarm_time = alarm.get("time").and_then(|v| v.as_str()).unwrap_or("");
-            let parts: Vec<&str> = alarm_time.split(':').collect();
-            if parts.len() < 2 {
-                continue;
-            }
-            let (h, m) = match (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
-                (Ok(h), Ok(m)) => (h, m),
-                _ => continue,
-            };
-
-            if now.hour() == h && now.minute() == m {
-                fired_today.insert(alarm_id);
-                self.sonner(alarm, false).await;
+            match timezone::decision(alarm, &zone, instant)? {
+                timezone::Decision::Wait => {}
+                timezone::Decision::Skip(reason) => {
+                    fired_today.insert(alarm_id);
+                    info!(alarm_id, reason, utc = %instant, timezone = %zone, local_time = %now, "alarm_skipped");
+                }
+                timezone::Decision::Ring => {
+                    fired_today.insert(alarm_id);
+                    info!(alarm_id, utc = %instant, timezone = %zone, local_time = %now, "alarm_scheduled_trigger");
+                    self.sonner(alarm, false).await;
+                }
             }
         }
 
@@ -771,10 +758,10 @@ impl AlarmScheduler {
         zones
     }
 
-    fn list_enabled_alarms(&self) -> Result<Vec<serde_json::Value>, String> {
+    fn list_scheduled_alarms(&self) -> Result<Vec<serde_json::Value>, String> {
         use crate::db::backend::SqlValue;
         let rows = self.db.query_many(
-            "SELECT id, name, time, days, zone_id, source_type, CAST(source_id AS TEXT), volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled, days_of_week, multi_zone_ids, profile_id, interrupt_playback FROM alarms WHERE enabled = '1'",
+            "SELECT id, name, time, days, zone_id, source_type, CAST(source_id AS TEXT), volume, fade_duration_s, fade_in_seconds, one_shot, skip_holidays, enabled, days_of_week, multi_zone_ids, profile_id, interrupt_playback FROM alarms",
             &[],
         )?;
         Ok(rows
