@@ -9,10 +9,6 @@ fn etat() -> AppState {
     AppState::new(":memory:", 0, Default::default()).unwrap()
 }
 
-fn sql(db: &Arc<dyn DbBackend>, requete: &str) {
-    db.execute(requete, &[]).expect(requete);
-}
-
 fn maintenant() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
