@@ -1211,7 +1211,11 @@ async fn list_doubtful_metadata(
                 // distincts seulement. Le titre ne sert à rien : son préfixe
                 // « 01 - » est un numéro de piste, pas un nom, et l'album ne
                 // connaît l'artiste que 33 fois sur 1 592.
-                "file_path": t.file_path,
+                //
+                // #8957 — le chemin OUVRABLE : une piste de feuille CUE n'a pas
+                // de `file_path`, son fichier image est dans `cue_media_path`.
+                "file_path": artiste_du_dossier::chemin_ouvrable(t),
+                "path_source": artiste_du_dossier::source_du_chemin(t),
                 // #8679 — l'artiste que le dossier donne, par la règle du
                 // scan : « artiste absent des balises (dossier : …) ».
                 "folder_artist": artiste_du_dossier::artiste_du_dossier_de(t),
