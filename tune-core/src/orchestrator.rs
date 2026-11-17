@@ -2176,6 +2176,9 @@ mod dsp;
 /// #8082 — flux continu entre les pistes pour les renderers DLNA.
 mod flux_continu_8082;
 mod repere_de_hausse_6721;
+// #8920 — boutons −1 / +1 dB d'une zone Devialet AIR, depuis le niveau de l'ampli.
+mod pas_air_8920;
+pub use pas_air_8920::{PasAir, consigne_du_pas};
 #[cfg(test)]
 mod repere_de_hausse_6721_tests;
 // #8137 — la bascule PURE ne commande le volume que si elle change quelque chose.

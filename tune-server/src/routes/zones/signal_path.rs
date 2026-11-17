@@ -1293,6 +1293,59 @@ pub(super) fn libelle_de_transport(output_type: &str) -> &str {
     }
 }
 
+/// #8920 — le niveau d'une zone Devialet AIR en dB d'ampli : celui que
+/// l'ampli rapporte (il fait foi), sinon la consigne lue sur la course.
+/// `None` pour toute autre sortie (`course` absente).
+fn volume_air_db(
+    ps: &ZoneState,
+    zone: &Zone,
+    course: Option<tune_core::outputs::devialet_air::reglages::BornesDb>,
+) -> Option<f64> {
+    let course = course?;
+    let rapporte = ps
+        .device_volume_observation
+        .as_ref()
+        .filter(|o| zone.output_device_id.as_deref() == Some(o.device_id.as_str()))
+        .map(|o| o.volume_db)
+        .filter(|db| db.is_finite());
+    Some(rapporte.unwrap_or_else(|| course.volume_vers_db((zone.volume / 100.0).clamp(0.0, 1.0))))
+}
+
+/// #8920 — l'étiquette du renderer d'une zone Devialet AIR : « nom de la
+/// zone (IP de l'ampli) ». L'identifiant de sortie (`devialet-air:<mac>`)
+/// qui s'affichait était illisible. Sans l'IP (ampli muet, sortie occupée) :
+/// le nom de la zone seul. `None` pour toute autre sortie.
+pub(crate) async fn libelle_renderer_air(
+    state: &crate::state::AppState,
+    zone: &Zone,
+) -> Option<String> {
+    use tune_core::outputs::devialet_air::{DevialetAirOutput, reglages};
+    if !reglages::est_air(zone.output_type.as_deref()) {
+        return None;
+    }
+    let arc = match zone.output_device_id.as_deref() {
+        Some(did) => state.outputs.lock().await.get(did),
+        None => None,
+    };
+    let ip = arc.and_then(|a| {
+        a.try_lock().ok().and_then(|sortie| {
+            sortie
+                .as_any()
+                .downcast_ref::<DevialetAirOutput>()
+                .and_then(DevialetAirOutput::ip)
+        })
+    });
+    Some(libelle_air(&zone.name, ip))
+}
+
+/// #8920 — « nom de la zone (IP) », ou le nom seul.
+pub(crate) fn libelle_air(nom_de_zone: &str, ip: Option<std::net::IpAddr>) -> String {
+    match ip {
+        Some(ip) => format!("{nom_de_zone} ({ip})"),
+        None => nom_de_zone.to_string(),
+    }
+}
+
 pub fn build_signal_path_lang(
     lang: &str,
     ps: &ZoneState,
@@ -1878,6 +1931,7 @@ fn assembler_les_etapes_lang(
         ui_volume,
         volume_full,
         correction_piece,
+        course_air,
         ..
     } = analyse.traitements;
     let Forcages {
@@ -2420,7 +2474,12 @@ fn assembler_les_etapes_lang(
         // ici. #8569 — une sortie qui annonce `can_set_volume == false`
         // (volume décoratif Diretta, #8538) la perd en sortie de
         // constructeur : `sans_volume_d_une_sortie_non_reglable`.
-        let description = if tune_core::orchestrator::is_network_output_type(Some(output_type)) {
+        let description = if let Some(db) = volume_air_db(ps, zone, course_air) {
+            // #8920 — Devialet AIR : le niveau de l'ampli en dB (celui qu'il
+            // rapporte, sinon la consigne sur la course) ; un « 9 % » n'y
+            // veut rien dire.
+            fs(lang, "amp_volume_db", &[&format!("{db:.1}")])
+        } else if tune_core::orchestrator::is_network_output_type(Some(output_type)) {
             fs(lang, "renderer_volume", &[&pourcent])
         } else {
             format!("Volume {pourcent}%")
@@ -3487,6 +3546,9 @@ struct Traitements {
     volume_full: bool,
     /// #7632 — la correction de pièce de la zone (`ir_path_{zone}`), décrite.
     correction_piece: Option<CorrectionPiece>,
+    /// #8920 — la course en dB d'une zone Devialet AIR : son volume s'écrit
+    /// en dB d'ampli. `None` pour toute autre sortie.
+    course_air: Option<tune_core::outputs::devialet_air::reglages::BornesDb>,
 }
 
 /// Relève les traitements armés sur la zone, la sonde locale primant sur les réglages.
@@ -3571,7 +3633,13 @@ fn relever_les_traitements_lang(
     let ui_volume =
         tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(zone.output_type.as_deref())
             .position(gain);
-    let volume_full = zone.fixed_volume || gain >= 1.0 || gain <= 0.0; // 0.0 means no software vol set
+    // #8920 — Devialet AIR : le volume est toujours une commande à l'ampli,
+    // en dB ; le haut et le bas de la course sont des niveaux comme les autres.
+    let course_air = tune_core::audio::volume_appareil_db::course_de_la_sortie(
+        backend,
+        zone.output_type.as_deref(),
+    );
+    let volume_full = course_air.is_none() && (zone.fixed_volume || gain >= 1.0 || gain <= 0.0); // 0.0 means no software vol set
     Traitements {
         configured_dsp_enabled,
         dsp_enabled,
@@ -3584,6 +3652,7 @@ fn relever_les_traitements_lang(
         crossfeed_du_flux,
         ui_volume,
         volume_full,
+        course_air,
         correction_piece: zone_correction_piece_lang(
             lang,
             backend,

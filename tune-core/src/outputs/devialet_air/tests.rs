@@ -798,6 +798,7 @@ async fn pieces_du_banc(
     let drapeau = Arc::new(AtomicBool::new(activee));
     let indice = Arc::new(AtomicU8::new(9));
     let contexte = ContexteAir {
+        plafond_de_cadence: std::sync::Arc::new(|_: &str| None),
         activee: {
             let d = drapeau.clone();
             Arc::new(move || d.load(Ordering::SeqCst))
@@ -1136,6 +1137,7 @@ async fn air_le_fournisseur_n_ecoute_rien_tant_que_l_option_est_desactivee() {
         .port();
     let drapeau = Arc::new(AtomicBool::new(false));
     let contexte = ContexteAir {
+        plafond_de_cadence: std::sync::Arc::new(|_: &str| None),
         activee: {
             let d = drapeau.clone();
             Arc::new(move || d.load(Ordering::SeqCst))
@@ -1178,6 +1180,9 @@ mod volume_db_6918;
 
 #[path = "demarrage_borne_6911_tests.rs"]
 mod demarrage_borne_6911;
+
+#[path = "retours_8920_tests.rs"]
+mod retours_8920;
 
 // ─── #8536 — la session de la sortie, l'écoute à côté de Roon ───────────────
 

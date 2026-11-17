@@ -708,6 +708,9 @@ mod garde_de_hausse_6721_tests;
 // #8165 — un geste de volume lève la sourdine, par le routeur public.
 #[cfg(test)]
 mod volume_leve_la_sourdine_8165_tests;
+// #8920 — retours d'un testeur Devialet Expert.
+#[cfg(test)]
+mod devialet_air_8920_tests;
 
 // #5353 — le backend nommé par le chemin du signal est celui de LA sortie.
 mod backend_de_la_sortie_5353;

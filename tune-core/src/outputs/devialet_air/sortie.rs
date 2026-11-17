@@ -72,6 +72,9 @@ pub struct ContexteAir {
     /// #6918 — la course du curseur en dB. Relue à chaque consigne : une
     /// course changée vaut pour le geste suivant et n'envoie rien.
     pub bornes_db: Arc<dyn Fn() -> reglages::BornesDb + Send + Sync>,
+    /// #8920 — le plafond de cadence (`max_sample_rate`) des zones qui
+    /// pilotent la sortie `device_id`, s'il est réglé. Relu à chaque flux.
+    pub plafond_de_cadence: Arc<dyn Fn(&str) -> Option<u32> + Send + Sync>,
     pub ports: Ports,
     pub cadence: Cadence,
 }
@@ -83,14 +86,31 @@ impl ContexteAir {
     pub fn depuis_la_base(db: Arc<dyn crate::db::backend::DbBackend>) -> Self {
         let db2 = db.clone();
         let db3 = db.clone();
+        let db4 = db.clone();
         Self {
             activee: Arc::new(move || reglages::activee(&db)),
             indice_source: Arc::new(move || reglages::indice_source(&db2)),
             bornes_db: Arc::new(move || reglages::BornesDb::lues(&db3)),
+            plafond_de_cadence: Arc::new(move |did| plafond_des_zones(&db4, did)),
             ports: Ports::AIR,
             cadence: Cadence::AIR,
         }
     }
+}
+
+/// #8920 — le plus bas `max_sample_rate` réglé parmi les zones Devialet AIR
+/// qui pilotent `device_id` ; `None` si aucune n'en règle.
+fn plafond_des_zones(db: &Arc<dyn crate::db::backend::DbBackend>, device_id: &str) -> Option<u32> {
+    crate::db::zone_repo::ZoneRepo::with_backend(db.clone())
+        .list()
+        .ok()?
+        .into_iter()
+        .filter(|z| {
+            reglages::est_air(z.output_type.as_deref())
+                && z.output_device_id.as_deref() == Some(device_id)
+        })
+        .filter_map(|z| z.max_sample_rate)
+        .min()
 }
 
 #[derive(Debug, Clone)]
@@ -267,6 +287,13 @@ impl DevialetAirOutput {
         })
     }
 
+    /// #8920 — l'adresse IP sous laquelle l'ampli s'annonce, s'il est
+    /// entendu : le chemin du signal la montre à côté du nom de la zone.
+    #[must_use]
+    pub fn ip(&self) -> Option<IpAddr> {
+        self.ampli().map(|a| a.ip)
+    }
+
     fn adresse_ampli(&self, a: &AmpliVu) -> SocketAddr {
         SocketAddr::new(a.ip, self.contexte.ports.ampli)
     }
@@ -417,6 +444,7 @@ impl DevialetAirOutput {
             debut_ms,
             media.duree_ms == 0,
             self.contexte.cadence.attente_premier_son,
+            (self.contexte.plafond_de_cadence)(&self.device_id),
         )
         .await
         .map_err(|e| format!("{} : {e}", self.nom))?;
@@ -794,6 +822,7 @@ async fn ouvrir_la_source(
     debut_ms: u64,
     en_direct: bool,
     attente: Duration,
+    plafond: Option<u32>,
 ) -> Result<SourceOuverte, String> {
     let depuis_s = debut_ms as f64 / 1_000.0;
     let (mut rx, decodeur) = ouvrir_decodeur(&source, None, depuis_s, en_direct);
@@ -808,7 +837,9 @@ async fn ouvrir_la_source(
             _ => "devialet_air: le décodeur n'a pas annoncé son format".into(),
         });
     };
-    let cadence_envoyee = reglages::cadence_envoyee(cadence_source);
+    // #8920 — 192 kHz au plus, et seulement si la zone le règle : sans
+    // réglage, 96 kHz sans perte comme avant.
+    let cadence_envoyee = reglages::cadence_envoyee_sous(cadence_source, plafond);
     let (mut rx, decodeur) = if cadence_envoyee == cadence_source {
         (rx, decodeur)
     } else {

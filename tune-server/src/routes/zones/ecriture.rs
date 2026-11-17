@@ -206,6 +206,43 @@ fn valider_le_patch(
             &format!("mode DSD inconnu (attendu : {})", MODES_DSD.join(", ")),
         ));
     }
+    // #8920 — une zone Devialet AIR : jamais de volume fixe (l'ampli tient
+    // le volume, sous les limites de confort et de sécurité), 192 kHz au
+    // plus, DSD en DoP ou en PCM seulement.
+    if tune_core::outputs::devialet_air::reglages::est_air(Some(type_sortie)) {
+        use tune_core::outputs::devialet_air::reglages::{FREQUENCE_MAX_AIR, MODES_DSD_AIR};
+        if body.fixed_volume == Some(true) {
+            return Err(refus_de_valeur(
+                id,
+                "fixed_volume",
+                "true",
+                "fixed volume is unavailable on a Devialet AIR zone: the amplifier holds the volume, under the comfort and safety limits",
+            ));
+        }
+        if let Some(Some(rate)) = body.max_sample_rate
+            && rate > FREQUENCE_MAX_AIR
+        {
+            return Err(refus_de_valeur(
+                id,
+                "max_sample_rate",
+                &rate.to_string(),
+                "Devialet AIR carries 192 kHz at most",
+            ));
+        }
+        if let Some(ref mode) = body.dsd_mode
+            && !MODES_DSD_AIR.contains(&mode.as_str())
+        {
+            return Err(refus_de_valeur(
+                id,
+                "dsd_mode",
+                mode,
+                &format!(
+                    "Devialet AIR: DSD64 as DoP or PCM only (expected: {})",
+                    MODES_DSD_AIR.join(", ")
+                ),
+            ));
+        }
+    }
     // #2271 — un mode inconnu est REFUSE, jamais range en base. Sans ce
     // garde-fou une faute de frappe s'ecrirait telle quelle et la lecture
     // tolerante de `get_autoplay_mode` la rattraperait en `similar` : la zone
