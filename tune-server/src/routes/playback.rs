@@ -27,6 +27,10 @@ mod titre_indisponible_7778_tests;
 #[cfg(test)]
 #[path = "playback/cd_disque_absent_tests.rs"]
 mod cd_disque_absent_tests;
+// #8913 — YouTube sans yt-dlp : 409 nommé et traduit, pas 502 brut.
+#[cfg(test)]
+#[path = "playback/youtube_inactive_8913_tests.rs"]
+mod youtube_inactive_8913_tests;
 // #6332 — le débit d'une piste locale dans l'état de zone.
 #[cfg(test)]
 #[path = "playback/debit_lecture_en_cours_6332_tests.rs"]
@@ -227,6 +231,27 @@ pub(crate) const MOTIF_CD_DISQUE_ABSENT: &str = "aucun disque dans le lecteur";
 /// Le code stable de ce refus, lu par le client web.
 pub(crate) const CODE_CD_DISQUE_ABSENT: &str = "cd_disc_absent";
 
+/// #8913 — le refus « lecture YouTube non activée » : le code stable, la
+/// phrase dans la langue de l'interface, et de quoi agir — l'action
+/// `enable_youtube_playback` et la route qui télécharge yt-dlp. `cause` garde
+/// le texte technique du cœur.
+pub(crate) fn refus_lecture_youtube_inactive(cause: &str, lang: &str) -> axum::response::Response {
+    let code = tune_core::streaming::youtube::CODE_LECTURE_YOUTUBE_INACTIVE;
+    let mut corps = crate::message_api::avec_message_en(
+        json!({
+            "error": code,
+            "code": code,
+            "action": "enable_youtube_playback",
+            "enable_endpoint": "/api/v1/system/youtube/enable",
+        }),
+        lang,
+        "playback.youtube_playback_disabled",
+        &[],
+    );
+    corps["cause"] = json!(cause);
+    (StatusCode::CONFLICT, Json(corps)).into_response()
+}
+
 fn play_error_response(e: String, lang: &str) -> axum::response::Response {
     if let Some(reponse) = refus_du_bail_parental(&e, lang) {
         return reponse;
@@ -275,6 +300,14 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
     if let Some(refus) = tune_core::audio::bitperfect_strict::RefusBitPerfect::depuis_sentinelle(&e)
     {
         return refus_bitperfect_strict(&refus, lang);
+    }
+    // #8913 — YouTube sans yt-dlp : la lecture YouTube n'est pas activée.
+    // Un état de réglage, pas une panne de Google : 409 au code stable,
+    // phrase traduite (`message_key`, #7077) et l'action qui l'active. Sans
+    // cette branche, le fourre-tout (« YouTube ») en faisait un 502
+    // `upstream_error` au texte brut.
+    if e.contains(tune_core::streaming::youtube::CODE_LECTURE_YOUTUBE_INACTIVE) {
+        return refus_lecture_youtube_inactive(&e, lang);
     }
     // #6018 — « Lecture Spotify (expérimental) » désactivée : un état de
     // réglage, pas une panne. 409 au code stable, phrase traduite ; sans
