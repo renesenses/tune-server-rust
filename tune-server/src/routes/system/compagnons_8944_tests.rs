@@ -302,30 +302,30 @@ mod installation_unix {
     }
 
     /// Un démon en cours garde son fichier : renommer sous lui ne le touche
-    /// pas. Le « démon » est un `sleep` lancé depuis une COPIE locale du
-    /// `sleep` du système, posée dans le dossier temporaire sous le nom
-    /// `airplay-daemon` ; il est arrêté par son propre `Child` à la fin.
+    /// pas. Le « démon » est un script `sh` posé dans le dossier temporaire
+    /// sous le nom `airplay-daemon`, qui attend sur son entrée standard comme
+    /// le vrai ; il est arrêté par son propre `Child` à la fin. (Une copie de
+    /// `sleep` ne convient pas : un `sleep` multi-appel, uutils ou busybox,
+    /// sort aussitôt quand on le lance sous un autre nom — CI de #8954.)
     #[test]
     fn un_demon_en_cours_ne_bloque_pas_la_bascule_8944() {
         let inst = Installation::nouvelle();
-        let Some(sleep) = ["/bin/sleep", "/usr/bin/sleep"]
-            .iter()
-            .map(Path::new)
-            .find(|p| p.is_file())
-        else {
-            return;
-        };
         let installe = inst.opt.join("airplay-daemon");
-        std::fs::copy(sleep, &installe).unwrap();
-        std::fs::set_permissions(&installe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ecrire_x(&installe, b"#!/bin/sh\nread ligne\n");
         let mut demon = loop {
-            match std::process::Command::new(&installe).arg("30").spawn() {
+            match std::process::Command::new(&installe)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::null())
+                .spawn()
+            {
                 Err(e) if e.kind() == io::ErrorKind::ExecutableFileBusy => {
                     std::thread::sleep(std::time::Duration::from_millis(20));
                 }
                 autre => break autre.unwrap(),
             }
         };
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let vivant_avant = demon.try_wait().unwrap().is_none();
         inst.archive("airplay-daemon", &elf("airplay-daemon neuf"));
 
         let resultat = inst.installer(&controles());
@@ -333,10 +333,12 @@ mod installation_unix {
         demon.kill().ok();
         demon.wait().ok();
 
+        assert!(vivant_avant, "le faux démon n'a pas démarré");
         resultat.expect("installation");
         assert!(encore_vivant, "la bascule a touché au démon en cours");
         assert_eq!(inst.lire("airplay-daemon"), elf("airplay-daemon neuf"));
     }
+
     /// Relecture de #8954 — la cible n'est jamais absente pendant la
     /// bascule : au moment où le neuf prend son nom, l'ancien y est encore
     /// (lien dur vers `.old`, puis `rename` qui l'écrase d'un coup).
