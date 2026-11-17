@@ -83,6 +83,8 @@ header[data-tauri-drag-region] > * { cursor: default; }
 #settings-panel h3 { font-size: 14px; font-weight: 600; margin-bottom: 12px; }
 #settings-panel label { font-size: 12px; color: #9ca3af; display: block; margin-bottom: 4px; }
 #server-config { display: flex; gap: 6px; margin-bottom: 12px; }
+#settings-panel label.option { display: flex; align-items: center; gap: 6px; color: #e5e7eb; cursor: pointer; }
+#settings-panel .option-aide { font-size: 11px; color: #6b7280; margin: 0 0 12px 22px; }
 #server-url { flex: 1; background: #1f2937; border: 1px solid #374151; color: #fff; border-radius: 6px; padding: 6px 10px; font-size: 12px; outline: none; }
 #server-url:focus { border-color: #6366f1; }
 #server-url::placeholder { color: #6b7280; }
