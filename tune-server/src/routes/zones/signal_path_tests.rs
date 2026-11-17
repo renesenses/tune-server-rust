@@ -5701,7 +5701,8 @@ fn frequence_fixe_8428_demande_et_cadence_plafonnee_sont_expliquees() {
         .unwrap();
     let ps = en_lecture(1, "flac", 44_100, 24);
     for lang in [
-        "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "vi", "hu", "nb", "pl", "el" "tr",
+        "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "vi", "hu", "nb", "pl", "el",
+        "tr",
     ] {
         let sp = build_signal_path_lang(
             lang,

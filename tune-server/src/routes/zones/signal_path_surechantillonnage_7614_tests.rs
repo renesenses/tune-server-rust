@@ -247,7 +247,8 @@ fn diagnostic_8259_machine_absente_expliquee_dans_toutes_les_langues() {
     let (backend, zone, _) = zone_locale();
     activer(&backend, zone.id.unwrap());
     for lang in [
-        "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "vi", "hu", "nb", "pl", "el" "tr",
+        "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "vi", "hu", "nb", "pl", "el",
+        "tr",
     ] {
         let (_, etape) = signal_path::etat_du_surechantillonneur_lang(
             lang,

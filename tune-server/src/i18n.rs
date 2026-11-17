@@ -26,7 +26,7 @@ use axum::http::HeaderMap;
 /// `i18n_server.json` doit porter chacune d'elles : le test
 /// `chaque_cle_porte_chaque_langue` le garde.
 pub const SUPPORTED: &[&str] = &[
-    "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "hu", "vi", "nb", "pl", "el" "tr",
+    "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "hu", "vi", "nb", "pl", "el", "tr",
 ];
 
 /// Langue de repli du serveur : l'anglais, comme le client web. Ni un en-tête
