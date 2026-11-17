@@ -1655,11 +1655,6 @@ impl YouTubeService {
         self.a_reconnecter
     }
 
-    /// #8904 — cette version a-t-elle un client OAuth de Tune ?
-    pub fn client_oauth_configure(&self) -> bool {
-        self.oauth.is_some()
-    }
-
     /// Fetch user info (email) from Google UserInfo API.
     async fn fetch_user_info(&mut self) {
         let Some(ref token) = self.access_token else {
