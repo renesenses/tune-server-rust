@@ -19,8 +19,8 @@ use tower::ServiceExt;
 use tune_core::TuneError;
 use tune_core::db::backend::ToSqlValue;
 use tune_core::streaming::traits::{
-    AuthStatus, SearchResults, StreamAlbum, StreamArtist, StreamPlaylist, StreamTrack, StreamUrl,
-    StreamingService,
+    AuthStatus, PagePersonnalisee, RangeePersonnalisee, SearchResults, StreamAlbum, StreamArtist,
+    StreamPlaylist, StreamTrack, StreamUrl, StreamingService, TitresRecommandes,
 };
 
 const ADMIN: i64 = 1;
@@ -130,6 +130,32 @@ impl StreamingService for Doublure {
     }
     async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
         Ok(Vec::new())
+    }
+    // #8935 — la page « Pour vous » et les titres recommandés passent par la
+    // même garde parentale que les autres pages du service.
+    async fn get_for_you(&self) -> Result<PagePersonnalisee, TuneError> {
+        Ok(PagePersonnalisee {
+            source: "for_you".into(),
+            rows: vec![RangeePersonnalisee {
+                id: "rangee".into(),
+                title: "Pour vous".into(),
+                albums: vec![album_de_service("eb"), album_de_service("pb")],
+                tracks: vec![piste_de_service("e4"), piste_de_service("p4")],
+                ..Default::default()
+            }],
+        })
+    }
+    async fn get_playlist_recommendations(
+        &self,
+        _playlist_id: &str,
+        _limit: usize,
+        offset: usize,
+    ) -> Result<TitresRecommandes, TuneError> {
+        Ok(TitresRecommandes {
+            tracks: vec![piste_de_service("e5"), piste_de_service("p5")],
+            total: 2,
+            offset,
+        })
     }
 }
 
@@ -266,6 +292,17 @@ const LISTES: &[(&str, &[&str], &[&str])] = &[
         "/api/v1/streaming/qobuz/playlists/pl/tracks",
         &["e3"],
         &["p3"],
+    ),
+    // #8935
+    (
+        "/api/v1/streaming/qobuz/for-you",
+        &["e4", "eb"],
+        &["p4", "pb"],
+    ),
+    (
+        "/api/v1/streaming/qobuz/playlists/pl/recommendations",
+        &["e5"],
+        &["p5"],
     ),
 ];
 
