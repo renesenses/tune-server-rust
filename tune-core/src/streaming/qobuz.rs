@@ -9790,3 +9790,7 @@ mod tests_nouveautes_du_lecteur_8646 {
         assert_eq!(album.quality.expect("qualité").sample_rate, 192_000);
     }
 }
+
+#[cfg(test)]
+#[path = "qobuz_connexion_8867_tests.rs"]
+mod connexion_8867_tests;
