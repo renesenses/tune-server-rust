@@ -1588,7 +1588,9 @@ impl PositionPoller {
                     // end-of-track instead (a small gap, never a cut). Local
                     // output keeps its internal DSD gapless chain untouched.
                     //
-                    // #6910 — sauf renderer qui annonce le DSD (GetProtocolInfo)
+                    // #6910 — sauf renderer qui annonce le DSD (GetProtocolInfo),
+                    // ou reçoit le DSD brut parce que la zone est en « natif »
+                    // (#8969, Eversolo DMP-A8),
                     // ET `SetNextAVTransportURI` (SCPD) et n'a pas déjà lâché un
                     // suivant DSD : le blanc entre deux pistes enchaînées sur le
                     // disque (fil 2412). Un renderer qui annonce tout et ne suit
@@ -1607,7 +1609,7 @@ impl PositionPoller {
                             // réponse ou SCPD jamais lu par Tune.
                             if let Some(refus) = self
                                 .orchestrator
-                                .refus_dsd_suivant_sur_dlna(device_id, annonce_suivante)
+                                .refus_dsd_suivant_sur_dlna(zone_id, device_id, annonce_suivante)
                                 .await
                             {
                                 info!(
@@ -1624,7 +1626,7 @@ impl PositionPoller {
                                 zone_id,
                                 device_id,
                                 mime = %resolved.mime_type,
-                                "gapless_dsd_next_dlna_arme — le renderer annonce le DSD et SetNextAVTransportURI"
+                                "gapless_dsd_next_dlna_arme — le renderer reçoit le DSD brut (annoncé, ou zone en « natif ») et annonce SetNextAVTransportURI"
                             );
                             dsd_arme = true;
                         }
