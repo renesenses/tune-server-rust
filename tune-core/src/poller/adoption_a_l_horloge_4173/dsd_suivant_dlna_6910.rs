@@ -41,6 +41,7 @@ fn annonce_dsd(oui: bool) -> DsdCapability {
         supports_dsf: oui,
         supports_dff: false,
         dsf_mime: oui.then(|| "audio/x-dsd".to_string()),
+        ..Default::default()
     }
 }
 
