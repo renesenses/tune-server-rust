@@ -1698,7 +1698,7 @@ impl PlaybackOrchestrator {
                 }
             }
 
-            #[cfg(test)]
+            // #8404 — point d'arrêt d'essai : vide hors des tests.
             point_d_arret_8404::traverser(req.zone_id).await;
 
             // #5522 — le producteur de la session est déjà mort (téléchargement
@@ -4562,7 +4562,9 @@ pub(crate) fn sessions_a_fermer_apres_remplacement(
 #[cfg(test)]
 mod session_remplacee_ticket_134;
 
-#[cfg(test)]
+// Hors `cfg(test)` : l'appel vit dans `envoyer_a_la_sortie`, et des gardes de
+// texte coupent ce fichier au premier `cfg(test)`. Le corps, lui, est vide
+// hors des tests.
 pub(super) mod point_d_arret_8404;
 
 #[cfg(feature = "local-audio")]
