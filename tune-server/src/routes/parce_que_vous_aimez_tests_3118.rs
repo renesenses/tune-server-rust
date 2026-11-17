@@ -3,10 +3,52 @@
 //! factice.
 
 use super::*;
+use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::streaming::traits::StreamTrack;
 
 fn etat() -> AppState {
     AppState::new(":memory:", 0, Default::default()).unwrap()
+}
+
+fn sans_filtres() -> Filtres {
+    Filtres {
+        ecartees: Ecartees::default(),
+        bannis_locaux: HashSet::new(),
+        bannis_services: HashSet::new(),
+        parental: None,
+        explicites_locaux: HashSet::new(),
+    }
+}
+
+/// Un état dont l'enrichissement ne part jamais sur le réseau : un port
+/// fermé, refus immédiat.
+fn etat_hors_ligne() -> AppState {
+    let state = etat();
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("artist_enrichment_api", "http://127.0.0.1:9")
+        .unwrap();
+    state
+}
+
+async fn appel(state: &AppState, profil: i64, limit: Option<usize>) -> Value {
+    let Ok(Json(v)) = because_you_like(
+        State(state.clone()),
+        ActiveProfile(profil),
+        Query(Params { limit }),
+    )
+    .await
+    else {
+        panic!("la route doit répondre")
+    };
+    v
+}
+
+fn ecarter_artiste(db: &Arc<dyn DbBackend>, profil: i64, nom: &str) {
+    let s: tune_core::db::suggestions_ecartees::SuggestionEcartee =
+        serde_json::from_value(json!({"item_type": "artist", "item_id": nom})).unwrap();
+    SuggestionsEcarteesRepo::with_backend(db.clone())
+        .ecarter(profil, &s)
+        .unwrap();
 }
 
 fn maintenant() -> String {
@@ -76,7 +118,6 @@ async fn composer_pour(
     v: HashMap<String, Vec<String>>,
     services: Vec<Box<dyn SourceRadio>>,
 ) -> Vec<Value> {
-    let ecartees = Ecartees::default();
     composer(Entrees {
         db,
         profil: 1,
@@ -84,9 +125,10 @@ async fn composer_pour(
         graines,
         voisins: v,
         services,
-        ecartees: &ecartees,
+        filtres: Arc::new(sans_filtres()),
     })
     .await
+    .playlists
 }
 
 fn ids(p: &Value) -> Vec<String> {
@@ -150,7 +192,7 @@ fn les_graines_suivent_le_profil_sans_radio_ni_compilation() {
     ecouter(db, "Various Artists", 20, None, "local");
     ecouter(db, "France Inter", 30, None, "radio");
 
-    let g = graines(db, 1, &Ecartees::default(), 5);
+    let g = graines(db, 1, &sans_filtres(), 5);
     assert_eq!(
         g,
         vec![
@@ -167,11 +209,11 @@ fn une_graine_ecartee_par_pas_pour_moi_ne_revient_pas() {
     let db = &state.backend;
     ecouter(db, "Miles Davis", 5, None, "local");
     ecouter(db, "John Coltrane", 3, None, "local");
-    let mut e = Ecartees::default();
     let s: tune_core::db::suggestions_ecartees::SuggestionEcartee =
         serde_json::from_value(json!({"item_type": "artist", "item_id": "Miles Davis"})).unwrap();
-    e.ajouter(&s);
-    let g = graines(db, 1, &e, 5);
+    let mut f = sans_filtres();
+    f.ecartees.ajouter(&s);
+    let g = graines(db, 1, &f, 5);
     assert_eq!(g, vec![("John Coltrane".to_string(), 3)]);
 }
 
@@ -349,40 +391,183 @@ async fn sans_historique_rien_n_est_propose() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn la_route_garde_sa_reponse_pour_la_periode() {
-    let state = etat();
+    let state = etat_hors_ligne();
     let db = &state.backend;
     bibliotheque(db);
-    // Aucun appel réel au cloud : un port fermé, refus immédiat.
-    SettingsRepo::with_backend(db.clone())
-        .set("artist_enrichment_api", "http://127.0.0.1:9")
-        .unwrap();
     ecouter(db, "Miles Davis", 6, None, "local");
     ecouter(db, "John Coltrane", 4, None, "local");
 
-    let st = &state;
-    let appel = |limit| async move {
-        let Ok(Json(v)) =
-            because_you_like(State(st.clone()), ActiveProfile(1), Query(Params { limit })).await
-        else {
-            panic!("la route doit répondre")
-        };
-        v
-    };
-    let a = appel(None).await;
+    let a = appel(&state, 1, None).await;
     assert_eq!(a["playlists"].as_array().unwrap().len(), 2, "{a}");
-    assert!(
-        lire_cache(db, 1, a["date"].as_str().unwrap()).is_some(),
-        "le cache est écrit"
-    );
 
-    // De nouvelles écoutes ne rebattent pas les cartes du jour.
+    // De nouvelles écoutes ne rebattent pas les cartes de la période.
     ecouter(db, "Metallica", 50, None, "local");
-    let b = appel(None).await;
+    let b = appel(&state, 1, None).await;
     assert_eq!(a, b, "même période, même réponse");
     assert_eq!(a["refresh_days"], json!(PERIODE_JOURS));
     assert_eq!(a["playlists"][0]["track_count"], json!(TITRES_PAR_PLAYLIST));
 
-    let un = appel(Some(1)).await;
+    let un = appel(&state, 1, Some(1)).await;
     assert_eq!(un["playlists"].as_array().unwrap().len(), 1);
     assert_eq!(un["playlists"][0], a["playlists"][0]);
+
+    // Un autre profil a son propre calcul (verrou et cache par profil) : ses
+    // écoutes à lui, plus les anciennes sans profil.
+    ecouter(db, "Herbie Hancock", 200, Some(2), "local");
+    let autre = appel(&state, 2, None).await;
+    assert_eq!(
+        autre["playlists"][0]["artist"],
+        json!("Herbie Hancock"),
+        "{autre}"
+    );
+}
+
+/// Le cache vit en mémoire : rien dans la table des réglages, donc rien dans
+/// `GET /system/config`, qui la publie. Les clés d'une version antérieure
+/// sont retirées.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn le_cache_ne_sort_par_aucune_route_generique() {
+    let state = etat_hors_ligne();
+    let db = &state.backend;
+    bibliotheque(db);
+    ecouter(db, "Miles Davis", 6, None, "local");
+    SettingsRepo::with_backend(db.clone())
+        .set("home_because_you_like_p1", r#"{"v":2,"playlists":[]}"#)
+        .unwrap();
+
+    let a = appel(&state, 1, None).await;
+    assert_eq!(a["playlists"].as_array().unwrap().len(), 1, "{a}");
+
+    let restantes = db
+        .query_one(
+            "SELECT COUNT(*) FROM settings WHERE key LIKE 'home_because_you_like%'",
+            &[],
+        )
+        .unwrap()
+        .and_then(|r| r[0].as_i64())
+        .unwrap_or(-1);
+    assert_eq!(restantes, 0, "aucune clé de ce cache dans les réglages");
+
+    use tower::ServiceExt;
+    let reponse = crate::routes::router(state.clone())
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/system/config")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(reponse.status().is_success(), "{}", reponse.status());
+    let corps = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let texte = String::from_utf8_lossy(&corps);
+    assert!(!texte.contains("because_you_like"), "{texte}");
+    assert!(
+        !texte.contains("Miles Davis"),
+        "les playlists ne sortent pas par la configuration"
+    );
+}
+
+/// « Pas pour moi » et les titres bannis s'appliquent à la lecture, même
+/// quand la réponse vient du cache.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn les_decisions_du_profil_s_appliquent_au_cache() {
+    let state = etat_hors_ligne();
+    let db = &state.backend;
+    bibliotheque(db);
+    ecouter(db, "Miles Davis", 6, None, "local");
+    ecouter(db, "John Coltrane", 4, None, "local");
+
+    let a = appel(&state, 1, None).await;
+    assert_eq!(a["playlists"].as_array().unwrap().len(), 2, "{a}");
+    let miles = &a["playlists"][0];
+    assert_eq!(miles["artist"], json!("Miles Davis"));
+    let banni = miles["tracks"][0]["track_id"].as_i64().unwrap();
+
+    ecarter_artiste(db, 1, "John Coltrane");
+    tune_core::db::hidden_repo::HiddenRepo::with_backend(db.clone())
+        .ban_track(1, banni)
+        .unwrap();
+
+    let b = appel(&state, 1, None).await;
+    let listes = b["playlists"].as_array().unwrap();
+    assert!(
+        listes.iter().all(|p| p["artist"] != json!("John Coltrane")),
+        "la playlist de l'artiste écarté disparaît : {b}"
+    );
+    for p in listes {
+        assert!(!artistes_de(p).contains("John Coltrane"), "{p}");
+        assert!(
+            !ids(p).contains(&banni.to_string()),
+            "titre banni servi : {p}"
+        );
+        assert_eq!(
+            p["track_count"],
+            json!(p["tracks"].as_array().unwrap().len())
+        );
+    }
+}
+
+/// Profil supervisé : ses seules écoutes désignent les artistes, et la
+/// politique (artiste bloqué, contenus explicites masqués) retire graines et
+/// titres.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn un_profil_supervise_suit_sa_politique() {
+    let state = etat_hors_ligne();
+    let db = &state.backend;
+    bibliotheque(db);
+    db.execute("UPDATE tracks SET explicit = 1 WHERE artist_id = 5", &[])
+        .unwrap();
+    let politique: tune_core::db::politique_parentale::PolitiqueParentale =
+        serde_json::from_value(json!({
+            "artistes_bloques": [{"nom": "Bill Evans"}, {"nom": "John Coltrane"}],
+            "masquer_explicite": true,
+        }))
+        .unwrap();
+    tune_core::db::politique_parentale::poser(db, 3, 1, 0, &politique).unwrap();
+    // Des écoutes sans profil : elles comptent pour les autres, pas pour lui.
+    ecouter(db, "Metallica", 50, None, "local");
+    ecouter(db, "John Coltrane", 40, Some(3), "local");
+    ecouter(db, "Miles Davis", 6, Some(3), "local");
+
+    let f = charger_filtres(db, 3, &[]);
+    assert_eq!(
+        graines(db, 3, &f, 5),
+        vec![("Miles Davis".to_string(), 6)],
+        "écoutes strictement à lui, artiste bloqué retiré"
+    );
+
+    let r = appel(&state, 3, None).await;
+    let listes = r["playlists"].as_array().unwrap();
+    assert_eq!(listes.len(), 1, "{r}");
+    let arts = artistes_de(&listes[0]);
+    assert!(
+        !arts.contains("Bill Evans") && !arts.contains("John Coltrane"),
+        "{arts:?}"
+    );
+    assert!(
+        !arts.contains("Herbie Hancock"),
+        "titres explicites masqués : {arts:?}"
+    );
+}
+
+#[test]
+fn la_duree_de_vie_suit_la_qualite() {
+    let t0 = Instant::now();
+    let e = |expire| EntreeCache {
+        periode: "2026-11-16".into(),
+        playlists: Arc::new(Vec::new()),
+        expire,
+    };
+    assert!(e(None).valide("2026-11-16", t0 + Duration::from_secs(86_400)));
+    assert!(
+        !e(None).valide("2026-11-19", t0),
+        "période suivante : recalcul"
+    );
+    let degradee = e(Some(t0 + DUREE_DEGRADE));
+    assert!(degradee.valide("2026-11-16", t0 + Duration::from_secs(60)));
+    assert!(!degradee.valide("2026-11-16", t0 + DUREE_DEGRADE + Duration::from_secs(1)));
+    assert!(DUREE_VIDE < DUREE_DEGRADE);
 }
