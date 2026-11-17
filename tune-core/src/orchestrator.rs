@@ -1703,6 +1703,13 @@ struct StreamingDsp {
     /// du flux ([`Self::process_flux`]). `None` tant que le flux n'a pas
     /// commencé : la première trame est armée à `latency_frames()`.
     convolveur_reste_a_jeter: Option<usize>,
+    /// #8740 — la balance (règle 2 → 2 de la zone, greffon « Réaffectation
+    /// des canaux ») sur un flux RÉSEAU : DERNIER étage, après la
+    /// compensation, pour qu'aucun étage ne remonte ce qu'elle atténue.
+    /// `None` sur une sortie locale (elle pose la matrice elle-même), en PURE,
+    /// en bit-perfect strict, hors stéréo, ou pour une règle qui monterait le
+    /// niveau ([`crate::audio::balance_reseau::regle_reseau_with`]).
+    reaffectation: Option<std::sync::Arc<crate::audio::reaffectation_canaux::Matrice>>,
 }
 
 impl StreamingDsp {
@@ -1714,6 +1721,14 @@ impl StreamingDsp {
             || self.convolver.is_some()
             || self.crossfeed.is_some()
             || self.compensation.is_some()
+            || self.reaffectation.is_some()
+    }
+
+    /// #8740 — la balance de ce porteur sera-t-elle EXÉCUTÉE ? Elle n'agit
+    /// que sur un PCM stéréo, comme le crossfeed : c'est ce fait que le flux
+    /// publie (`StreamInfo::reaffectation`).
+    fn reaffectation_executable(&self) -> bool {
+        self.reaffectation.is_some() && self.channels == 2
     }
 
     /// Le crossfeed de ce porteur sera-t-il réellement EXÉCUTÉ ?
@@ -1763,6 +1778,10 @@ impl StreamingDsp {
         }
         if let Some(c) = self.compensation.as_ref() {
             etages.push(format!("compensation:{:+.2}dB@{flux}", c.cible_db()));
+        }
+        if self.reaffectation.is_some() {
+            let inerte = if self.channels == 2 { "" } else { "(inerte)" };
+            etages.push(format!("balance@{flux}{inerte}"));
         }
         if etages.is_empty() {
             return format!("aucun_etage canaux={}", self.channels);
@@ -1817,6 +1836,11 @@ impl StreamingDsp {
         // moyen qu'ils ont retiré, et sa borne lit la crête qu'ils ont laissée.
         if let Some(comp) = self.compensation.as_mut() {
             comp.process_pcm(pcm, bit_depth);
+        }
+        // #8740 — la balance TOUT À LA FIN : elle n'atténue que, et rien
+        // après elle ne peut remonter ce qu'elle a baissé.
+        if let Some(m) = self.reaffectation.as_ref().filter(|_| self.channels == 2) {
+            crate::audio::balance_reseau::appliquer_pcm_stereo(m, pcm, bit_depth);
         }
     }
 
@@ -2148,6 +2172,9 @@ mod crossfeed_bibliotheque_reseau;
 // #5071 — témoins de bout en bout de la compensation de niveau réseau.
 #[cfg(test)]
 mod compensation_reseau_5071_tests;
+// #8740 — témoins de bout en bout de la balance sur une zone réseau.
+#[cfg(test)]
+mod balance_reseau_8740_tests;
 #[cfg(test)]
 mod convolveur_en_flux_7642_tests;
 

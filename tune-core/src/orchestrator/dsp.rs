@@ -2014,6 +2014,8 @@ impl PlaybackOrchestrator {
             sample_rate,
             en_vol: None,
             convolveur_reste_a_jeter: None,
+            // #8740 — la balance de la zone, sur un flux réseau stéréo.
+            reaffectation: self.reaffectation_reseau(zone_id).filter(|_| channels == 2),
         };
         // #5071 — la compensation lit les étages RÉELLEMENT exécutés : un
         // crossfeed n'agit qu'en stéréo (`StreamingDsp::process`).
@@ -2073,6 +2075,30 @@ impl PlaybackOrchestrator {
             );
         }
         compensation
+    }
+
+    /// #8740 — la matrice de balance (règle 2 → 2 de la zone) à appliquer au
+    /// PCM d'un flux RÉSEAU de cette zone ; `None` sur une sortie `local:`
+    /// (elle pose la matrice elle-même : l'appliquer aussi ici la doublerait)
+    /// ou sans sortie connue, et dans tous les refus de
+    /// [`crate::audio::balance_reseau::regle_reseau_with`] (PURE, bit-perfect
+    /// strict, règle absente, multicanale ou qui monterait le niveau).
+    pub(super) fn reaffectation_reseau(
+        &self,
+        zone_id: i64,
+    ) -> Option<std::sync::Arc<crate::audio::reaffectation_canaux::Matrice>> {
+        let sortie_locale = ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_device_id)
+            .is_none_or(|id| id.is_empty() || id.starts_with("local:"));
+        if sortie_locale {
+            return None;
+        }
+        crate::audio::balance_reseau::regle_reseau_with(&self.db, zone_id)
+            .ok()
+            .map(|r| r.matrice)
     }
 
     /// La zone a-t-elle un crossfeed réellement actif ?

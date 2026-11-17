@@ -236,6 +236,9 @@ pub(in crate::orchestrator) struct Servi {
     /// (`StreamInfo::compensation_db`) : c'est elle, et non plus un miroir
     /// des réglages, que le chemin du signal affiche.
     annonce_compensation: Option<f64>,
+    /// #8740 — la balance que le flux ANNONCE cuire
+    /// (`StreamInfo::reaffectation`), lue par le chemin du signal.
+    pub(in crate::orchestrator) annonce_reaffectation: bool,
 }
 
 pub(in crate::orchestrator) async fn jouer(m: &Montage, output_device_id: Option<&str>) -> Servi {
@@ -265,6 +268,7 @@ pub(in crate::orchestrator) async fn jouer(m: &Montage, output_device_id: Option
         .await
         .expect("fil publié");
     let (annonce_crossfeed, annonce_compensation) = (fil.crossfeed, fil.compensation_db);
+    let annonce_reaffectation = fil.reaffectation;
     let fichier = session.file_path.lock().await.clone();
     if let Some(chemin) = fichier {
         let premier_octet = t0.elapsed();
@@ -279,6 +283,7 @@ pub(in crate::orchestrator) async fn jouer(m: &Montage, output_device_id: Option
             premier_octet,
             annonce_crossfeed,
             annonce_compensation,
+            annonce_reaffectation,
         };
     }
     // Session progressive : on tire le canal comme le ferait le renderer.
@@ -306,6 +311,7 @@ pub(in crate::orchestrator) async fn jouer(m: &Montage, output_device_id: Option
         premier_octet: premier_octet.expect("aucun octet servi"),
         annonce_crossfeed,
         annonce_compensation,
+        annonce_reaffectation,
     }
 }
 

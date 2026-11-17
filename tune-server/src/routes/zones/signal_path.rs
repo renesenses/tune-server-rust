@@ -923,6 +923,46 @@ pub(super) fn zone_reaffectation_step_lang(
     ))
 }
 
+/// #8740 — l'étape de la balance cuite dans un flux RÉSEAU : la règle 2 → 2
+/// de la zone, décrite comme celle de la sortie locale, avec la position de
+/// la balance quand la matrice n'est qu'une balance (« balance +40 »).
+/// L'appelant ne la demande que si le flux servi la porte.
+pub(super) fn zone_balance_reseau_step_lang(
+    lang: &str,
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+) -> Option<String> {
+    use tune_core::audio::balance_reseau as br;
+    let regle = br::regle_reseau_with(backend, zone_id).ok()?;
+    let precision = match br::balance_du_reglage(&regle.reglage) {
+        Some(b) => format!(" (balance {b:+})"),
+        None => regle
+            .reglage
+            .preset
+            .as_deref()
+            .map(|p| format!(" ({p})"))
+            .unwrap_or_default(),
+    };
+    Some(fs(
+        lang,
+        "matrix",
+        &[
+            &regle.reglage.inputs.to_string(),
+            &regle.reglage.outputs.to_string(),
+            &precision,
+            ts(lang, "rule_zone"),
+            ts(
+                lang,
+                if regle.matrice.est_recopie() {
+                    "channel_copy"
+                } else {
+                    "channel_mix"
+                },
+            ),
+        ],
+    ))
+}
+
 /// #6230 — la règle armée que l'étage local n'applique PAS, et pourquoi.
 ///
 /// L'étage n'applique une matrice que si elle part exactement des canaux de
@@ -1346,6 +1386,13 @@ pub fn build_signal_path_lang(
         np.track_id,
         transformations_reelles,
     );
+    // #8740 — sur un flux RÉSEAU, la balance n'existe que si le flux servi
+    // la CUIT (`StreamInfo::reaffectation`) : lue sur le fil, pas prévue
+    // depuis les réglages — une piste servie telle quelle n'en porte pas.
+    if output_type != "local" && wire.is_some_and(|w| w.reaffectation) {
+        traitements.reaffectation_step =
+            zone_balance_reseau_step_lang(lang, backend, zone.id.unwrap_or(0));
+    }
     traitements.reaffectation_ignoree = zone_reaffectation_ignoree_lang(
         lang,
         backend,

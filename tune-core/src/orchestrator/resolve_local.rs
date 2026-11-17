@@ -169,6 +169,8 @@ struct TraitementsDuFichier {
     compensation_cuite_db: Option<f64>,
     replaygain_factor: Option<f64>,
     empreinte_dsp: Option<[u8; 32]>,
+    /// #8740 — la balance cuite dans le fichier (zone réseau, stéréo).
+    reaffectation: Option<std::sync::Arc<crate::audio::reaffectation_canaux::Matrice>>,
 }
 
 /// Distingue le conteneur du codec AAC enregistré au scan.
@@ -1976,7 +1978,14 @@ impl PlaybackOrchestrator {
             // `is_network_output &&` d'abord : sans lui, une zone LOCALE
             // paierait une lecture de réglages par piste pour un drapeau que
             // `cible_wav_pour_traitement` va de toute façon annuler.
-            let crossfeed_reseau = is_network_output && self.zone_has_active_crossfeed(req.zone_id);
+            let crossfeed_reseau = is_network_output
+                && (self.zone_has_active_crossfeed(req.zone_id)
+                    // #8740 — la balance de la zone compte comme le crossfeed :
+                    // un traitement qui ne paie jamais le fichier entier, seul
+                    // il consent au WAV progressif (renderer LPCM), sinon la
+                    // piste part telle quelle et l'écran le dit.
+                    || (transcodage.canaux_reduits.unwrap_or(source.channels) == 2
+                        && self.reaffectation_reseau(req.zone_id).is_some()));
             let traitement = eq_forces_transcode || crossfeed_reseau;
             // #2742 (24/09) — un crossfeed SEUL vaut consentement au WAV
             // progressif : `crossfeed_bibliotheque_reseau`, cas 2.
@@ -3246,6 +3255,11 @@ impl PlaybackOrchestrator {
         // Ce que le fichier servi porte, dit par son `StreamInfo` comme le
         // crossfeed ci-dessus : le chemin du signal le lit au lieu de le prévoir.
         let compensation_cuite_db = compensation.as_ref().map(|c| c.cible_db());
+        // #8740 — la balance de la zone, cuite côté RÉSEAU seulement (une
+        // sortie locale pose la matrice elle-même) et en stéréo.
+        let reaffectation = (is_network_output && !is_local_output && channels == 2)
+            .then(|| self.reaffectation_reseau(req.zone_id))
+            .flatten();
         // ReplayGain scales the samples, so like the EQ and the FIR it
         // changes the encoded bytes without being part of the cache key.
         // A cached transcode made at a different gain would be served
@@ -3318,7 +3332,13 @@ impl PlaybackOrchestrator {
                 .map(|_| self.empreinte_des_etages_tiers(req.zone_id))
                 .unwrap_or_default(),
         );
+        // #8740 — la balance change les octets : elle entre dans la clé.
+        let empreinte_dsp = crate::audio::balance_reseau::empreinte_avec_balance(
+            empreinte_dsp,
+            reaffectation.as_deref(),
+        );
         TraitementsDuFichier {
+            reaffectation,
             eq_profile,
             convolver,
             crossfeed,
@@ -3662,7 +3682,9 @@ impl PlaybackOrchestrator {
                 compensation_cuite_db,
                 replaygain_factor,
                 empreinte_dsp,
+                reaffectation,
             } = self.traitements_du_fichier(req, decision, out_sr);
+            let balance_cuite = reaffectation.is_some();
             let cache_path_opt = crate::transcode_cache::cache_path_dsp(
                 &file_path,
                 &out_ext,
@@ -3741,6 +3763,7 @@ impl PlaybackOrchestrator {
                     duration_ms: Some(track_duration_ms as u64),
                     crossfeed: crossfeed_cuit,
                     compensation_db: compensation_cuite_db,
+                    reaffectation: balance_cuite,
                     ..Default::default()
                 };
                 let session_id = self
@@ -3930,6 +3953,7 @@ impl PlaybackOrchestrator {
                         }),
                         crossfeed.map(|(processeur, _)| processeur),
                         compensation,
+                        reaffectation,
                     ),
                     progres,
                     politique,
@@ -4024,6 +4048,7 @@ impl PlaybackOrchestrator {
                             duration_ms: Some(track_duration_ms as u64),
                             crossfeed: crossfeed_cuit,
                             compensation_db: compensation_cuite_db,
+                            reaffectation: balance_cuite,
                             ..Default::default()
                         };
                         let session_id = self
@@ -4200,6 +4225,7 @@ impl PlaybackOrchestrator {
             let relais = relais_dsp_progressif(dsp.is_active(), is_local_output);
             let mut info = info;
             info.crossfeed = relais && dsp.crossfeed_executable();
+            info.reaffectation = relais && dsp.reaffectation_executable();
             info.compensation_db = dsp.compensation_cuite_db().filter(|_| relais);
             let (session_id, tx, data_ready) = self.streamer.create_session(info, false, 256).await;
             // Seule la conversion WAV par canal sert déjà le déplacement.

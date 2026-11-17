@@ -1558,6 +1558,7 @@ impl PlaybackOrchestrator {
         let dsp = self.load_streaming_dsp(req.zone_id, req.piste_rg(), sr, 2);
         let info = StreamInfo {
             crossfeed: dsp.is_active() && dsp.crossfeed_executable(),
+            reaffectation: dsp.reaffectation_executable(),
             compensation_db: dsp.compensation_cuite_db(),
             ..info
         };
@@ -1766,6 +1767,7 @@ impl PlaybackOrchestrator {
         let info = match dsp.as_ref() {
             Some(dsp) => StreamInfo {
                 crossfeed: dsp.crossfeed_executable(),
+                reaffectation: dsp.reaffectation_executable(),
                 compensation_db: dsp.compensation_cuite_db(),
                 ..info
             },

@@ -122,7 +122,8 @@ impl PlaybackOrchestrator {
             dsp.replaygain.is_some() || dsp.eq.is_some() || dsp.convolver.is_some();
         !super::crossfeed_bibliotheque_reseau::wav_progressif_consenti(
             opt_in,
-            dsp.crossfeed.is_some(),
+            // #8740 — la balance seule vaut le même consentement.
+            dsp.crossfeed.is_some() || dsp.reaffectation.is_some(),
             autre_traitement,
         )
     }
