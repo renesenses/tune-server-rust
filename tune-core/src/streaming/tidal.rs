@@ -273,6 +273,8 @@ pub struct TidalService {
     featured_cache: std::sync::Mutex<Option<FeaturedCache>>,
     /// #7822 — même choix de verrou que `featured_cache`.
     mixes_cache: std::sync::Mutex<Option<MixesCache>>,
+    /// #8935 — la page « Pour vous » du compte ; même choix de verrou.
+    pour_vous_cache: std::sync::Mutex<Option<pour_vous::PourVousCache>>,
     enabled_override: Option<bool>,
     /// Racine de l'API, déplacée par les seuls témoins vers un serveur factice
     /// (#4803). `None` partout ailleurs : [`API_BASE`].
@@ -315,6 +317,7 @@ impl TidalService {
             device_auth_started: None,
             featured_cache: std::sync::Mutex::new(None),
             mixes_cache: std::sync::Mutex::new(None),
+            pour_vous_cache: std::sync::Mutex::new(None),
             enabled_override: None,
             base_forcee: None,
             auth_forcee: None,
@@ -1032,10 +1035,13 @@ impl TidalService {
             .then(|| entree.mixes.clone())
     }
 
+    /// Oublie aussi la page « Pour vous » (#8935) : elle est, comme les
+    /// mixes, celle du compte et du pays du moment.
     fn vider_le_cache_des_mixes(&self) {
         if let Ok(mut cache) = self.mixes_cache.lock() {
             *cache = None;
         }
+        self.vider_le_cache_pour_vous();
     }
 
     /// #7822 — lit la page des mixes du compte, et à défaut les rangées de
@@ -3064,6 +3070,32 @@ impl StreamingService for TidalService {
             });
         }
         Ok(mixes)
+    }
+
+    async fn get_for_you(&self) -> Result<PagePersonnalisee, TuneError> {
+        if let Some(page) = self.pour_vous_depuis_le_cache() {
+            debug!("tidal_pour_vous_cache_hit");
+            return Ok(page);
+        }
+        let page = self.lire_la_page_pour_vous().await?;
+        if let Ok(mut cache) = self.pour_vous_cache.lock() {
+            *cache = Some(pour_vous::PourVousCache {
+                compte: self.user_id,
+                page: page.clone(),
+                fetched_at: Instant::now(),
+            });
+        }
+        Ok(page)
+    }
+
+    async fn get_playlist_recommendations(
+        &self,
+        playlist_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<TitresRecommandes, TuneError> {
+        self.lire_les_recommandations(playlist_id, limit, offset)
+            .await
     }
 
     async fn get_featured_section(&self, section_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
@@ -5870,6 +5902,14 @@ mod remplacement_8066_tests;
 #[cfg(test)]
 #[path = "tidal_qualite_livree_6334_tests.rs"]
 mod qualite_livree_6334_tests;
+
+// #8935 — la page « Pour vous » et les titres recommandés d'une playlist.
+#[path = "tidal_pour_vous.rs"]
+mod pour_vous;
+
+#[cfg(test)]
+#[path = "tidal_pour_vous_8935_tests.rs"]
+mod pour_vous_8935_tests;
 
 // #7822 — les mixes du compte, lus dans des réponses TIDAL enregistrées.
 #[cfg(test)]

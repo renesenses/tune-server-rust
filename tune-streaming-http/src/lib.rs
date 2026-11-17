@@ -614,6 +614,11 @@ where
             "/{service}/playlists/{playlist_id}/tracks",
             get(service_playlist_tracks).post(service_add_tracks),
         )
+        // #8935 — les titres que le service recommande sous une playlist.
+        .route(
+            "/{service}/playlists/{playlist_id}/recommendations",
+            get(service_playlist_recommendations),
+        )
         .route(
             "/{service}/playlists/{playlist_id}/tracks/remove",
             post(service_remove_tracks),
@@ -639,6 +644,8 @@ where
         .route("/{service}/featured", get(service_featured))
         // #7822 — les mixes personnels du compte, lisibles comme des playlists.
         .route("/{service}/mixes", get(service_mixes))
+        // #8935 — la page personnalisée du compte (TIDAL « Pour vous »).
+        .route("/{service}/for-you", get(service_for_you))
         .route(
             "/{service}/featured/sections",
             get(service_featured_sections),
@@ -1279,6 +1286,40 @@ async fn service_mixes(
     Path(service): Path<String>,
 ) -> Response {
     with_svc!(&state, &service, |svc| svc.get_user_mixes().await)
+}
+
+/// #8935 — `GET /streaming/{service}/for-you` : les rangées personnalisées
+/// du compte (TIDAL : `pages/for_you`, à défaut `pages/home`). 501 pour un
+/// service qui n'en a pas. Contenu personnel : pas de cache navigateur.
+async fn service_for_you(
+    State(state): State<StreamingHttpState>,
+    Path(service): Path<String>,
+) -> Response {
+    with_svc!(&state, &service, |svc| svc.get_for_you().await)
+}
+
+#[derive(Deserialize)]
+struct RecommandationsQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+}
+
+/// Titres recommandés par page, par défaut.
+const RECOMMANDES_PAR_DEFAUT: usize = 20;
+
+/// #8935 — `GET /streaming/{service}/playlists/{id}/recommendations` : les
+/// titres que le service propose sous la playlist, `?limit=&offset=`. 501
+/// pour un service qui n'en propose pas.
+async fn service_playlist_recommendations(
+    State(state): State<StreamingHttpState>,
+    Path((service, playlist_id)): Path<(String, String)>,
+    Query(q): Query<RecommandationsQuery>,
+) -> Response {
+    let limit = q.limit.unwrap_or(RECOMMANDES_PAR_DEFAUT);
+    let offset = q.offset.unwrap_or(0);
+    with_svc!(&state, &service, |svc| svc
+        .get_playlist_recommendations(&playlist_id, limit, offset)
+        .await)
 }
 
 async fn service_new_releases(
@@ -4692,6 +4733,9 @@ mod favoris_pagines_8040_tests;
 
 #[cfg(test)]
 mod mixes_du_compte_7822_tests;
+
+#[cfg(test)]
+mod pour_vous_8935_tests;
 
 #[cfg(test)]
 mod youtube_decouverte_tests;
