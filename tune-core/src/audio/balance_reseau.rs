@@ -510,7 +510,9 @@ mod tests {
             inputs: 2,
             outputs: 2,
             gains_db: vec![vec![Some(3.0), None], vec![None, Some(0.0)]],
-            normalize: true,
+            // Sans normalisation : armée, elle ramènerait la ligne à 1
+            // (l'identité), ce qui n'est plus une hausse.
+            normalize: false,
             preset: None,
         };
         poser(&db, &cle, &serde_json::to_string(&hausse).unwrap());
