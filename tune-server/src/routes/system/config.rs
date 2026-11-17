@@ -3812,6 +3812,7 @@ pub(crate) fn retirer_un_dossier(
         "dirs": dirs,
         "orphan_tracks": plan.tracks,
         "purged": r.purgees,
+        "purge_failed": r.echecs,
         "purge_refused": false,
         "orphan_albums_removed": r.albums_orphelins,
         "orphan_artists_removed": r.artistes_orphelins,
@@ -4040,12 +4041,12 @@ pub(crate) fn regrouper_hors_perimetre(
     sortie
 }
 
-/// `(id, file_path)` de toutes les pistes LOCALES.
+/// `(id, chemin du média)` de toutes les pistes LOCALES, tranches CUE comprises.
 fn pistes_locales(state: &AppState) -> Vec<(i64, String)> {
     state
         .backend
         .query_many(
-            "SELECT id, file_path FROM tracks WHERE source = 'local' AND file_path IS NOT NULL",
+            "SELECT id, COALESCE(file_path, cue_media_path) FROM tracks WHERE source = 'local' AND COALESCE(file_path, cue_media_path) IS NOT NULL",
             &[],
         )
         .ou_defaut_journalise()
@@ -4211,6 +4212,7 @@ fn impact(state: &AppState, ids: &[i64]) -> ImpactPurge {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct ResultatPurge {
     purgees: i64,
+    echecs: i64,
     albums_orphelins: i64,
     artistes_orphelins: i64,
     favoris_rerattaches: i64,
@@ -4236,8 +4238,12 @@ fn executer_purge(state: &AppState, ids: &[i64]) -> ResultatPurge {
     let track_repo = TrackRepo::with_backend(state.backend.clone());
     let mut r = ResultatPurge::default();
     for id in ids {
-        if track_repo.delete(*id).is_ok() {
-            r.purgees += 1;
+        match track_repo.delete(*id) {
+            Ok(()) => r.purgees += 1,
+            Err(error) => {
+                r.echecs += 1;
+                tracing::error!(track_id = *id, %error, "purge_piste_echec");
+            }
         }
     }
 
@@ -4305,6 +4311,12 @@ fn executer_purge(state: &AppState, ids: &[i64]) -> ResultatPurge {
     r.paires_distinctes_rerattachees = distinctes.relinked as i64;
     r.paires_distinctes_non_resolues = distinctes.unresolved as i64;
 
+    if r.purgees > 0 {
+        state.event_bus.emit(
+            tune_core::event_types::EventType::LibraryUpdated.as_str(),
+            json!({ "source": "purge_orphelines", "purged": r.purgees }),
+        );
+    }
     r
 }
 
@@ -4502,6 +4514,7 @@ pub(super) async fn purge_orphan_tracks(
 
     Ok(Json(json!({
         "purged": r.purgees,
+        "purge_failed": r.echecs,
         "refused": false,
         "orphan_albums_removed": r.albums_orphelins,
         "orphan_artists_removed": r.artistes_orphelins,
@@ -7403,3 +7416,7 @@ mod confinement_chemins_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "cue_purge_8836_tests.rs"]
+mod cue_purge_8836_tests;

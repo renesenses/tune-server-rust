@@ -1135,6 +1135,35 @@ pub(crate) fn preciser_les_dates(
     faites
 }
 
+/// Les tranches sans fichier propre sont absentes de la carte des fichiers.
+/// Leur élagage reste confié au scanner CUE ; on les compte ici dans le bilan
+/// hors périmètre sans jamais fusionner les tranches d'un même média.
+pub(crate) fn compter_cue_hors_perimetre_8836(
+    db: &dyn tune_core::db::backend::DbBackend,
+    racines: &[String],
+    cible: Option<&str>,
+) -> i64 {
+    if racines.is_empty() {
+        return 0;
+    }
+    let rows = match db.query_many(
+        "SELECT cue_media_path FROM tracks WHERE source = 'local' AND file_path IS NULL AND cue_media_path IS NOT NULL",
+        &[],
+    ) {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(%error, "scan_cue_hors_perimetre_illisible");
+            return 0;
+        }
+    };
+    rows.iter()
+        .filter_map(|row| row.first().and_then(|v| v.as_string()))
+        .filter(|path| !path.is_empty())
+        .filter(|path| cible.is_none_or(|c| sous_le_dossier(path, c)))
+        .filter(|path| !racines.iter().any(|r| sous_le_dossier(path, r)))
+        .count() as i64
+}
+
 /// `file_path` → la ligne de `tracks` qui le possède, toutes sources.
 ///
 /// Voir [`tune_core::db::track_repo::InfoFichier`] : la carte a la portée de
@@ -3153,6 +3182,7 @@ async fn spawn_library_scan_avec_lecteur_par(
             );
             let pruned = bilan.removed + bilan_promotions.removed;
             db_delete_failed = bilan.db_delete_failed + bilan_promotions.db_delete_failed;
+            hors_perimetre += compter_cue_hors_perimetre_8836(&*db, &scan_dirs, targeted.as_deref());
             pistes_hors_perimetre = hors_perimetre;
             pistes_protegees = protected;
             pistes_supprimees = pruned;
