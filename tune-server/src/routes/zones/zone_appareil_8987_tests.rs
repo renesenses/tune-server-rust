@@ -255,6 +255,51 @@ async fn changer_vers_l_appareil_d_une_zone_active_rend_409_qui_la_nomme() {
     );
 }
 
+/// La seconde porte du changement d'appareil (`zone-manager` hot-swap) suit
+/// la même règle : zone supprimée libérée, zone active nommée en 409.
+#[tokio::test]
+async fn le_hot_swap_suit_la_meme_regle() {
+    let (app, state) = serveur();
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let supprimee = repo
+        .create("Ancienne", Some("local"), Some("local:DAC A"))
+        .unwrap();
+    repo.delete(supprimee).unwrap();
+    let active = repo
+        .create("Salon", Some("local"), Some("local:DAC B"))
+        .unwrap();
+    let zone = repo
+        .create("Bureau", Some("local"), Some("local:HP"))
+        .unwrap();
+
+    let (statut, corps) = envoyer(
+        &app,
+        "POST",
+        &format!("/api/v1/zone-manager/zones/{zone}/hot-swap"),
+        json!({"output_device_id": "local:DAC A"}),
+    )
+    .await;
+    assert!(statut.is_success(), "{statut} {corps}");
+    assert_eq!(
+        repo.get(zone).unwrap().unwrap().output_device_id.as_deref(),
+        Some("local:DAC A")
+    );
+
+    let (statut, corps) = envoyer(
+        &app,
+        "POST",
+        &format!("/api/v1/zone-manager/zones/{zone}/hot-swap"),
+        json!({"output_device_id": "local:DAC B"}),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::CONFLICT, "{corps}");
+    assert_eq!(corps["holder_zone_id"], active, "{corps}");
+    assert_eq!(
+        repo.get(zone).unwrap().unwrap().output_device_id.as_deref(),
+        Some("local:DAC A")
+    );
+}
+
 // ── 3. Restauration sous un autre hôte audio ───────────────────────────────
 
 async fn restaurer_zone_asio(backend_configure: &str) -> (StatusCode, Value) {

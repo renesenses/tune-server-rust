@@ -330,8 +330,15 @@ async fn hot_swap_zone(
     let old_device = zone.output_device_id.clone();
 
     // Update the output device
+    // #8987 — même règle que `PATCH /zones/{id}` : une zone supprimée qui
+    // tient l'appareil le lâche, une zone active donne un 409 qui la nomme.
+    if let Err(reponse) =
+        super::zones::liberer_la_sortie_demandee(&zone_repo, id, &body.output_device_id)
+    {
+        return reponse;
+    }
     if let Err(e) = zone_repo.update_output_device(id, &body.output_device_id) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+        return super::zones::refus_apres_echec(&zone_repo, id, &body.output_device_id, e);
     }
     // #6774 — PURE / volume fixe désarmés par le changement d'appareil :
     // l'état de lecture ne reste pas au-dessus de la base.
