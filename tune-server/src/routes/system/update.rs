@@ -3322,8 +3322,11 @@ pub(super) async fn update_install(
 /// = boucle finie). `librespot` (Spotify Connect), lui, n'a pas d'entrée
 /// standard : sans cet arrêt il restait en vie, dans l'ancienne version, à
 /// côté de celui que lance le serveur relancé.
+///
+/// `disable` n'agit qu'en mémoire (l'image va être remplacée) : le réglage
+/// enregistré reste, et le serveur relancé ré-expose le récepteur.
 async fn arreter_les_demons_avant_la_relance(state: &AppState) {
-    state.spotify_connect.stop().await;
+    state.spotify_connect.disable().await;
 }
 
 /// Relance le serveur dans son binaire fraîchement posé (Unix).
@@ -8439,7 +8442,7 @@ mod executables_livres_8944_tests {
 
         let fonction = corps(source, "async fn arreter_les_demons_avant_la_relance(");
         assert!(
-            fonction.contains("spotify_connect.stop().await"),
+            fonction.contains("spotify_connect.disable().await"),
             "{fonction}"
         );
 
