@@ -12,6 +12,11 @@ on:
         required: true
       DOCKERHUB_TOKEN:
         required: true
+      # #8904 — facultatifs : sans eux, le binaire garde le client de repli.
+      TUNE_YOUTUBE_CLIENT_ID:
+        required: false
+      TUNE_YOUTUBE_CLIENT_SECRET:
+        required: false
   workflow_dispatch:
     inputs:
       version:
@@ -127,6 +132,9 @@ jobs:
       - name: Build tune-server (amd64, native)
         env:
           CARGO_TARGET_DIR: target-amd64
+          # #8904 — client OAuth Google de Tune (vide sans secret : repli).
+          TUNE_YOUTUBE_CLIENT_ID: ${{ secrets.TUNE_YOUTUBE_CLIENT_ID }}
+          TUNE_YOUTUBE_CLIENT_SECRET: ${{ secrets.TUNE_YOUTUBE_CLIENT_SECRET }}
         run: |
           bash scripts/ci/apt-robuste.sh
           sudo apt-get update && sudo apt-get install -y libasound2-dev
@@ -148,6 +156,10 @@ jobs:
           cp tune-server/tests/fixtures/plugins/playlists-converter/manifest.json dist/plugins/playlists-converter/
 
       - name: Build tune-server (arm64, cross)
+        # #8904 — transmis au conteneur `cross` par Cross.toml (passthrough).
+        env:
+          TUNE_YOUTUBE_CLIENT_ID: ${{ secrets.TUNE_YOUTUBE_CLIENT_ID }}
+          TUNE_YOUTUBE_CLIENT_SECRET: ${{ secrets.TUNE_YOUTUBE_CLIENT_SECRET }}
         run: |
           # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","plugins-wasm","audio-embedding","dst"]}
           cross build --release --package tune-server --target aarch64-unknown-linux-gnu --no-default-features --features oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme

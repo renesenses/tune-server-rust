@@ -729,8 +729,7 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn play_from_queue(&self, zone_id: i64, position: i64) -> Result<PlayResult, String> {
-        self.play_from_queue_inner(zone_id, position, true, Entree::Geste, None)
-            .await
+        Box::pin(self.play_from_queue_inner(zone_id, position, true, Entree::Geste, None)).await
     }
 
     /// Reprendre un contexte à sa position explicite (#7280).
@@ -742,15 +741,14 @@ impl PlaybackOrchestrator {
         seek_ms: u64,
     ) -> Result<PlayResult, String> {
         self.playback.oublier_le_deplacement(zone_id).await;
-        let result = self
-            .play_from_queue_inner(
-                zone_id,
-                position,
-                true,
-                Entree::RepriseDeContexte,
-                Some(seek_ms),
-            )
-            .await?;
+        let result = Box::pin(self.play_from_queue_inner(
+            zone_id,
+            position,
+            true,
+            Entree::RepriseDeContexte,
+            Some(seek_ms),
+        ))
+        .await?;
         let zone = ZoneRepo::with_backend(self.db.clone()).get(zone_id)?;
         let browser_ready = zone
             .as_ref()
@@ -788,7 +786,7 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         position: i64,
     ) -> Result<PlayResult, String> {
-        self.play_from_queue_inner(zone_id, position, true, Entree::FinDePiste, None)
+        Box::pin(self.play_from_queue_inner(zone_id, position, true, Entree::FinDePiste, None))
             .await
     }
 
@@ -807,8 +805,7 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         position: i64,
     ) -> Result<PlayResult, String> {
-        self.play_from_queue_inner(zone_id, position, false, Entree::Geste, None)
-            .await
+        Box::pin(self.play_from_queue_inner(zone_id, position, false, Entree::Geste, None)).await
     }
 
     /// #7846 (fil 2648) — le transfert vers une sortie qui DÉCODE elle-même
@@ -827,9 +824,14 @@ impl PlaybackOrchestrator {
         position: i64,
         seek_ms: u64,
     ) -> Result<PlayResult, String> {
-        let result = self
-            .play_from_queue_inner(zone_id, position, false, Entree::Geste, Some(seek_ms))
-            .await?;
+        let result = Box::pin(self.play_from_queue_inner(
+            zone_id,
+            position,
+            false,
+            Entree::Geste,
+            Some(seek_ms),
+        ))
+        .await?;
         if seek_ms > 0 && result.output_sent {
             self.playback.seek(zone_id, seek_ms as i64).await;
             if let Some(zone) = ZoneRepo::with_backend(self.db.clone()).get(zone_id)? {
@@ -982,7 +984,7 @@ impl PlaybackOrchestrator {
         self.playback
             .update_queue_info(zone_id, position, total)
             .await;
-        self.play_par_l_entree(req, historique, entree).await
+        Box::pin(self.play_par_l_entree(req, historique, entree)).await
     }
 
     /// Précharge, en tâche de fond, la piste qui suit la piste COURANTE de la
@@ -1507,7 +1509,7 @@ impl PlaybackOrchestrator {
                 disc_number: None,
                 album_ref: None,
             };
-            let resolved = self.resolve_stream(&req).await?;
+            let resolved = Box::pin(self.resolve_stream(&req)).await?;
             if let Some(ref sid) = resolved.stream_id {
                 self.gapless_sessions
                     .lock()
@@ -1595,7 +1597,7 @@ impl PlaybackOrchestrator {
             disc_number: None,
             album_ref: entry.album_ref.clone(),
         };
-        let resolved = self.resolve_stream(&req).await?;
+        let resolved = Box::pin(self.resolve_stream(&req)).await?;
         if let Some(ref sid) = resolved.stream_id {
             self.gapless_sessions
                 .lock()

@@ -425,7 +425,7 @@ impl PlaybackOrchestrator {
             }
         }
 
-        self.play_inner(req, historique).await
+        Box::pin(self.play_inner(req, historique)).await
     }
 
     /// Free-tier gate: block *activating* a brand-new zone once the free active
@@ -590,7 +590,12 @@ impl PlaybackOrchestrator {
         // à l'absence, une énumération à la demande, bornée dans le temps, et
         // seulement ici — au plus une fois par clic. L'appareil revenu passe
         // comme un parc vide (#3737) : `recreate_local_and_play` l'ouvre.
-        if self
+        //
+        // 🔴 #8171 (fil 2708, Windows, ASIO configuré) — l'appareil retrouvé
+        // est ENREGISTRÉ ici, avec l'hôte qui l'a énuméré : laissé à
+        // `recreate_local_and_play`, un nom WASAPI repartait sur l'hôte ASIO
+        // configuré, qui ne le connaît pas, et la lecture échouait encore.
+        if let Some(vue) = self
             .appareil_local_revenu(
                 zone_id,
                 dev_id,
@@ -598,10 +603,13 @@ impl PlaybackOrchestrator {
             )
             .await
         {
+            let enregistree = self.reprendre_la_sortie_locale_revenue(zone_id, &vue).await;
             info!(
                 zone_id,
                 zone_name = %zone.name,
                 device = dev_id,
+                hote = %vue.hote,
+                enregistree,
                 "play_allowed_local_device_found_on_reenumeration"
             );
             return Ok(None);
@@ -890,7 +898,7 @@ impl PlaybackOrchestrator {
         self.playback.set_resolving(req.zone_id, true).await;
 
         let (resolved, resolve_ms) =
-            match self.resoudre_la_demande(&req, play_start, play_gen).await {
+            match Box::pin(self.resoudre_la_demande(&req, play_start, play_gen)).await {
                 Ok(ResoluOuFini::Resolu {
                     resolved,
                     resolve_ms,
@@ -3352,14 +3360,18 @@ impl PlaybackOrchestrator {
         let message = Self::message_piste_non_demarree(geste, cause);
         warn!(zone_id, geste, cause, %message, "piste_non_demarree");
         if let Some(ref bus) = self.event_bus {
-            bus.emit(
-                "zone.playback_error",
-                serde_json::json!({
-                    "zone_id": zone_id,
-                    "error": message,
-                    "fatal": true,
-                }),
-            );
+            let mut charge = serde_json::json!({
+                "zone_id": zone_id,
+                "error": message,
+                "fatal": true,
+            });
+            // #8913 — « Suivant » vers une piste YouTube, yt-dlp absent : le
+            // code stable part avec l'événement, pour que le client propose
+            // d'activer la lecture YouTube au lieu d'afficher le texte brut.
+            if cause.contains(crate::streaming::youtube::CODE_LECTURE_YOUTUBE_INACTIVE) {
+                charge["code"] = crate::streaming::youtube::CODE_LECTURE_YOUTUBE_INACTIVE.into();
+            }
+            bus.emit("zone.playback_error", charge);
         }
     }
 

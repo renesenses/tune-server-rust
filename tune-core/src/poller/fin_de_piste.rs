@@ -76,10 +76,7 @@ impl PositionPoller {
         // 108 items still queued, leaving nothing but a WARN behind. Walk
         // forward over the dead items, announce each one, and stop only when
         // the queue really is exhausted (or the failures look systemic).
-        if self
-            .avancer_avec_reprises(zone_id, zone_state, next_pos)
-            .await
-        {
+        if Box::pin(self.avancer_avec_reprises(zone_id, zone_state, next_pos)).await {
             return;
         }
         self.orchestrator.stop(zone_id, device_id.as_deref()).await;
@@ -392,7 +389,9 @@ impl PositionPoller {
                         crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone());
                     if queue_repo.append_tracks(zone_id, &ids).is_ok() {
                         let new_pos = zone_state.queue_position + 1;
-                        if let Err(e) = self.orchestrator.play_from_queue(zone_id, new_pos).await {
+                        if let Err(e) =
+                            Box::pin(self.orchestrator.play_from_queue(zone_id, new_pos)).await
+                        {
                             warn!(zone_id, error = %e, "autoplay_play_failed");
                             self.orchestrator.stop(zone_id, device_id).await;
                         }
@@ -455,7 +454,9 @@ impl PositionPoller {
                         source = %source,
                         "autoplay_streaming_radio_started_preferred"
                     );
-                    if let Err(e) = self.orchestrator.play_from_queue(zone_id, new_pos).await {
+                    if let Err(e) =
+                        Box::pin(self.orchestrator.play_from_queue(zone_id, new_pos)).await
+                    {
                         warn!(zone_id, error = %e, "autoplay_play_failed");
                         self.orchestrator.stop(zone_id, device_id).await;
                     }
@@ -529,7 +530,9 @@ impl PositionPoller {
                         source = %source,
                         "autoplay_streaming_radio_started"
                     );
-                    if let Err(e) = self.orchestrator.play_from_queue(zone_id, new_pos).await {
+                    if let Err(e) =
+                        Box::pin(self.orchestrator.play_from_queue(zone_id, new_pos)).await
+                    {
                         warn!(zone_id, error = %e, "autoplay_play_failed");
                         self.orchestrator.stop(zone_id, device_id).await;
                     }
@@ -570,7 +573,8 @@ impl PositionPoller {
                 // Play the first generated track (next position after current)
                 let new_pos = zone_state.queue_position + 1;
                 info!(zone_id, new_pos, "autoplay_starting_generated_track");
-                if let Err(e) = self.orchestrator.play_from_queue(zone_id, new_pos).await {
+                if let Err(e) = Box::pin(self.orchestrator.play_from_queue(zone_id, new_pos)).await
+                {
                     warn!(zone_id, error = %e, "autoplay_play_failed");
                     self.orchestrator.stop(zone_id, device_id).await;
                 }
@@ -664,7 +668,7 @@ impl PositionPoller {
             count = items.len(),
             "radio_artiste_rechargee"
         );
-        if let Err(e) = self.orchestrator.play_from_queue(zone_id, position).await {
+        if let Err(e) = Box::pin(self.orchestrator.play_from_queue(zone_id, position)).await {
             warn!(zone_id, error = %e, "radio_artiste_lecture_echouee");
             self.orchestrator.stop(zone_id, device_id).await;
         }
@@ -720,7 +724,7 @@ impl PositionPoller {
                     );
                 }
                 let ajoutees = ids.len();
-                match self.orchestrator.play_from_queue(zone_id, position).await {
+                match Box::pin(self.orchestrator.play_from_queue(zone_id, position)).await {
                     Ok(_) => return ajoutees,
                     Err(e) => {
                         warn!(zone_id, mode = mode.as_str(), error = %e, "autoplay_play_failed");
@@ -786,10 +790,11 @@ impl PositionPoller {
         let mut skipped = 0u32;
         let mut injouables = 0u32;
         loop {
-            match self
-                .orchestrator
-                .play_from_queue_en_fin_de_piste(zone_id, attempt_pos)
-                .await
+            match Box::pin(
+                self.orchestrator
+                    .play_from_queue_en_fin_de_piste(zone_id, attempt_pos),
+            )
+            .await
             {
                 Ok(_) => {
                     if skipped > 0 {
@@ -1135,10 +1140,8 @@ impl PositionPoller {
         {
             Some(next_pos) => {
                 info!(zone_id, next_pos, "gapless_advance_metadata");
-                if let Err(e) = self
-                    .orchestrator
-                    .advance_queue_metadata(zone_id, next_pos)
-                    .await
+                if let Err(e) =
+                    Box::pin(self.orchestrator.advance_queue_metadata(zone_id, next_pos)).await
                 {
                     warn!(zone_id, error = %e, "gapless_advance_failed");
                 }
@@ -1166,7 +1169,7 @@ impl PositionPoller {
                 });
             }
             None => {
-                self.handle_track_end(zone_id, zone_state).await;
+                Box::pin(self.handle_track_end(zone_id, zone_state)).await;
             }
         }
     }
@@ -1353,23 +1356,21 @@ impl PositionPoller {
             }
         };
         if prefers_local_file {
-            return self
-                .armer_le_fichier_local(zone_id, next_pos, device_id, arme)
-                .await;
+            return Box::pin(self.armer_le_fichier_local(zone_id, next_pos, device_id, arme)).await;
         }
 
         // v0.9 gapless characterization: time the next-track resolution and
         // surface failures at warn. These paths were debug-only, so streaming
         // gapless instability (Tidal DASH download slowness, URL/token issues)
         // was invisible in production journald. Logging only — no behaviour change.
-        self.armer_le_flux_suivant(
+        Box::pin(self.armer_le_flux_suivant(
             zone_id,
             next_pos,
             device_id,
             arme,
             consigne_de_fondu,
             fin_estimee,
-        )
+        ))
         .await
     }
 

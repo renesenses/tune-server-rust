@@ -17,7 +17,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use axum::Router;
@@ -143,6 +143,10 @@ struct Enregistreuse {
     volume: Arc<Mutex<f64>>,
     muet: Arc<Mutex<bool>>,
     lectures: Arc<AtomicU32>,
+    rend_en_pause: Arc<AtomicBool>,
+    peripherique_rendu: Arc<AtomicBool>,
+    reprises: Arc<AtomicU32>,
+    position: Arc<AtomicU64>,
     /// #6370 — chaque flux reçu, dans son PROPRE tampon, par ordre de
     /// lecture : un téléchargement encore en cours de l'ancien flux ne peut
     /// pas se mêler au nouveau (déplacement pendant la mise en tampon).
@@ -164,6 +168,10 @@ impl Default for Enregistreuse {
             volume: Arc::default(),
             muet: Arc::default(),
             lectures: Arc::default(),
+            rend_en_pause: Arc::default(),
+            peripherique_rendu: Arc::default(),
+            reprises: Arc::default(),
+            position: Arc::default(),
             flux: Arc::default(),
             positions: Arc::default(),
             longueurs: Arc::default(),
@@ -193,6 +201,8 @@ impl OutputTarget for SortieLocaleSimulee {
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         let e = self.0.clone();
         e.lectures.fetch_add(1, Ordering::SeqCst);
+        e.peripherique_rendu.store(false, Ordering::SeqCst);
+        e.position.store(0, Ordering::SeqCst);
         *e.etat.lock().await = (TransportState::Playing, Some(media.url.to_string()));
         e.recu.lock().await.clear();
         // Les deux serveurs du banc écoutent sur `127.0.0.1` ; le maître, lui,
@@ -234,11 +244,19 @@ impl OutputTarget for SortieLocaleSimulee {
         });
         Ok(())
     }
+    fn device_released_on_pause(&self) -> bool {
+        self.0.peripherique_rendu.load(Ordering::SeqCst)
+    }
     async fn pause(&self) -> Result<(), String> {
+        self.0.peripherique_rendu.store(
+            self.0.rend_en_pause.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
         self.0.etat.lock().await.0 = TransportState::Paused;
         Ok(())
     }
     async fn resume(&self) -> Result<(), String> {
+        self.0.reprises.fetch_add(1, Ordering::SeqCst);
         self.0.etat.lock().await.0 = TransportState::Playing;
         Ok(())
     }
@@ -250,6 +268,7 @@ impl OutputTarget for SortieLocaleSimulee {
         // Comme `LocalOutput::seek` : la position est notée, le son ne bouge
         // pas — un flux séquentiel ne se déplace qu'en étant relancé.
         self.0.positions.lock().await.push(position_ms);
+        self.0.position.store(position_ms, Ordering::SeqCst);
         Ok(())
     }
     async fn set_volume(&self, volume: f64) -> Result<(), String> {
@@ -265,6 +284,7 @@ impl OutputTarget for SortieLocaleSimulee {
         Ok(OutputStatus {
             state,
             current_uri: uri,
+            position_ms: self.0.position.load(Ordering::SeqCst),
             volume: *self.0.volume.lock().await,
             muted: *self.0.muet.lock().await,
             ..Default::default()
@@ -1475,4 +1495,62 @@ async fn une_zone_d_agent_compte_dans_le_plafond_du_maitre_pas_chez_l_agent() {
             .is_none(),
         "la zone locale de l'agent ne doit pas être activée par le maître"
     );
+}
+
+/// #8825 — le maître doit refaire un flux à la position de pause : deux
+/// seek autour de la même URL ne changent pas les octets qu'elle contient.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reprise_agent_rouvre_le_peripherique_rendu_a_la_position_8825() {
+    let (agent, e) = agent().await;
+    e.rend_en_pause.store(true, Ordering::SeqCst);
+    let maitre = Serveur::demarrer().await;
+    let (_, zone_id, device_id) = appaires(&maitre, &agent).await;
+    let dossier = tempfile::tempdir().unwrap();
+    let pcm = pcm_pseudo_aleatoire(SECONDES_6370);
+    let track_id = piste_de_bibliotheque(&maitre, &dossier, &pcm);
+    jouer_la_piste(&maitre, zone_id, track_id).await;
+    flux_recu(&e, 1, pcm.len()).await;
+    // Le banc n'a ni DAC ni horloge de lecture : poser la mesure conservée
+    // par le maître et la sortie au moment de la pause.
+    maitre.state.playback.update_position(zone_id, 2_000).await;
+    e.position.store(2_000, Ordering::SeqCst);
+    let pause = client()
+        .post(maitre.url(&format!("/api/v1/zones/{zone_id}/pause")))
+        .send()
+        .await
+        .unwrap();
+    assert!(pause.status().is_success());
+    assert!(e.peripherique_rendu.load(Ordering::SeqCst));
+    let reprise = client()
+        .post(maitre.url(&format!("/api/v1/zones/{zone_id}/resume")))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        reprise.status().is_success(),
+        "reprise : {}",
+        reprise.text().await.unwrap()
+    );
+    assert_eq!(
+        e.lectures.load(Ordering::SeqCst),
+        2,
+        "#8825 : la reprise ne rouvre pas le périphérique rendu"
+    );
+    let neuf = flux_recu(&e, 2, ECHANTILLONS_MINIMUM_6370).await;
+    commence_a(&neuf, &pcm, 2_000)
+        .expect("#8825 : le son doit reprendre à 2000 ms, pas seulement le compteur");
+    assert_eq!(
+        e.reprises.load(Ordering::SeqCst),
+        0,
+        "resume ne rouvre pas ASIO"
+    );
+    assert!(!e.peripherique_rendu.load(Ordering::SeqCst));
+    let statut = sortie_du_maitre(&maitre, &device_id)
+        .await
+        .lock()
+        .await
+        .get_status()
+        .await
+        .unwrap();
+    assert_eq!(statut.position_ms, 2_000);
 }
