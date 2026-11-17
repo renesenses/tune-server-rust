@@ -2908,15 +2908,20 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         up: "",
     },
     // Forum, fil 2694 (Ilan) ; décision de Bertrand du 13/11 — la radio de fin
-    // de file est ACTIVÉE par défaut, comme Roon. Bascule unique des zones
-    // « désactivé » (défaut historique depuis la 46) vers « titres
-    // similaires » ; les modes nommés (#2271) ne bougent pas. Les zones
-    // créées ensuite naissent à 1 (`ZoneRepo::create`). Jumelle PG : 118.
-    // Numérotée 152 / PG 118 le 13/11 : 151 / PG 117 sont pris par #8615.
+    // de file était ACTIVÉE par défaut en rc12 : bascule unique des zones
+    // « désactivé » vers « titres similaires ». Jumelle PG : 118.
+    //
+    // #8974 (décision de Bertrand du 17/11) : retour au défaut DÉSACTIVÉ.
+    // Cette migration ne fait PLUS rien. Une base qui ne l'a pas encore jouée
+    // (rc11 ou avant → rc13) garde donc ses réglages d'avant la rc12, où un
+    // « 1 » ne pouvait venir que de l'utilisateur. Son NOM change aussi : la
+    // ligne `_migrations` d'une base passée par la rc12 garde l'ancien nom
+    // `radio_fin_de_file_par_defaut`, et c'est à lui que la 155 reconnaît une
+    // base où la bascule a réellement eu lieu.
     Migration {
         version: 152,
-        name: "radio_fin_de_file_par_defaut",
-        up: SQL_RADIO_FIN_DE_FILE_PAR_DEFAUT,
+        name: "radio_fin_de_file_par_defaut_neutralisee",
+        up: "",
     },
     // #8672 (décision de Bertrand du 13/11) — « Ma collection physique » :
     // un disque « nulle part » associé À LA MAIN à un album de la
@@ -2945,6 +2950,20 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "albums_release_country",
         up: "",
     },
+    // #8974 (décision de Bertrand du 17/11, après les fils 2694 et 2887) — la
+    // radio de fin de file redevient DÉSACTIVÉE par défaut. Annule la bascule
+    // de la 152 de la rc12, et SEULEMENT là où elle a eu lieu (ligne
+    // `_migrations` 152 sous son ancien nom). Après cette bascule, un « 1 »
+    // (titres similaires) ne dit plus si l'utilisateur l'a choisi : la rc12 l'a
+    // écrit sur toutes les zones « désactivé » et sur chaque zone créée. Rien
+    // ne prouve le choix : ces zones reprennent le défaut (coupé). Les modes
+    // nommés (#2271, album au hasard…) ne sont jamais posés par défaut : ils
+    // restent. Jumelle PG : 122. Numérotée 155 / PG 122 le 17/11.
+    Migration {
+        version: 155,
+        name: "radio_fin_de_file_coupee_par_defaut",
+        up: SQL_RADIO_FIN_DE_FILE_COUPEE_PAR_DEFAUT,
+    },
 ];
 
 /// Pose `albums.release_country` et `albums.release_country_mbid` (#8668) —
@@ -2965,10 +2984,13 @@ pub(crate) fn interruption_par_le_reveil(db: &SqliteDb) {
     );
 }
 
-/// SQL de la migration 152 (fil 2694). SQLite range `'0'` en entier (affinité
-/// INTEGER) : la comparaison à 0 couvre les deux écritures.
-pub(crate) const SQL_RADIO_FIN_DE_FILE_PAR_DEFAUT: &str = "UPDATE zones SET autoplay_enabled = 1 \
-     WHERE autoplay_enabled IS NULL OR autoplay_enabled = 0 OR autoplay_enabled = 'off'";
+/// SQL de la migration 155 (#8974). SQLite range `'1'` en entier (affinité
+/// INTEGER) : la comparaison à 1 couvre les deux écritures de « titres
+/// similaires ». Sans effet sur une base où la 152 de la rc12 n'a pas tourné.
+pub(crate) const SQL_RADIO_FIN_DE_FILE_COUPEE_PAR_DEFAUT: &str = "UPDATE zones SET autoplay_enabled = 0 \
+     WHERE (autoplay_enabled = 1 OR autoplay_enabled = 'similar') \
+       AND EXISTS (SELECT 1 FROM _migrations \
+                    WHERE version = 152 AND name = 'radio_fin_de_file_par_defaut')";
 
 /// Pose `artists.country` et `artists.country_mbid` (#8090) — bloc de version
 /// de la 146 et passe finale.
@@ -6288,10 +6310,11 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         include_str!("../../migrations/postgres/117_alarms_interrupt_playback.sql"),
     ),
     // Jumelle de la SQLite 152 (fil 2694) : radio de fin de file activée par
-    // défaut — bascule unique des zones « désactivé », DEFAULT '1'.
+    // défaut en rc12. Neutralisée par #8974 : ne fait plus rien et marque
+    // un autre nom (voir la 122).
     (
         118,
-        "radio_fin_de_file_par_defaut",
+        "radio_fin_de_file_par_defaut_neutralisee",
         include_str!("../../migrations/postgres/118_radio_fin_de_file_par_defaut.sql"),
     ),
     // Jumelle de la SQLite 153 (#8672) : `collection_physique_associations`,
@@ -6315,6 +6338,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         121,
         "index_noms_artistes_et_genres",
         include_str!("../../migrations/postgres/121_index_noms_artistes_et_genres.sql"),
+    ),
+    // Jumelle de la SQLite 155 (#8974) : radio de fin de file coupée par
+    // défaut — annule la bascule de la 118 là où elle a eu lieu, DEFAULT '0'.
+    (
+        122,
+        "radio_fin_de_file_coupee_par_defaut",
+        include_str!("../../migrations/postgres/122_radio_fin_de_file_coupee_par_defaut.sql"),
     ),
 ];
 
@@ -10251,8 +10281,8 @@ mod tests {
         // 151. Pose l'option de réveil « Interrompre la lecture en cours »,
         // que le planificateur et les routes des réveils NOMMENT.
         // 118 : `radio_fin_de_file_par_defaut` (fil 2694), jumelle de la
-        // SQLite 152. Migration de DONNÉES : la radio de fin de file activée
-        // par défaut, et le DEFAULT de `zones.autoplay_enabled` à '1'.
+        // SQLite 152. Neutralisée par #8974 (plus aucun effet, nom
+        // `radio_fin_de_file_par_defaut_neutralisee`).
         // 119 : `collection_physique_associations` (#8672), jumelle de la
         // SQLite 153 (118 = #8656, fusionnée avant). Crée les associations
         // manuelles de « Ma collection physique », que le greffon NOMME.
@@ -10262,7 +10292,10 @@ mod tests {
         // Pays et la passe de fond NOMMENT.
         // 121 : `index_noms_artistes_et_genres` (web#3118), sans jumelle
         // SQLite : index `LOWER(artists.name)` et `tracks.genre`.
-        assert_eq!(pg_latest_version(), 121, "latest PG migration must be 121");
+        // 122 : `radio_fin_de_file_coupee_par_defaut` (#8974), jumelle de la
+        // SQLite 155. Migration de DONNÉES : annule la bascule de la 118
+        // (neutralisée) là où elle a eu lieu, DEFAULT '0'.
+        assert_eq!(pg_latest_version(), 122, "latest PG migration must be 122");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
