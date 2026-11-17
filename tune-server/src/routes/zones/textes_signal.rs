@@ -17,7 +17,7 @@ fn reconnue(value: &str) -> Option<&'static str> {
     let base =
         crate::i18n::alias_langue(value.trim().split(['-', '_']).next()?.to_ascii_lowercase());
     [
-        "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "vi", "hu", "nb", "pl", "el",
+        "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "vi", "hu", "nb", "pl", "el" "tr",
     ]
     .into_iter()
     .find(|l| *l == base)

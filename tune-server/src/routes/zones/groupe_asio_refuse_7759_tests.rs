@@ -274,9 +274,9 @@ async fn au_demarrage_une_sortie_absente_ne_defait_pas_le_groupe() {
 }
 
 #[test]
-fn la_phrase_existe_dans_les_quinze_langues() {
+fn la_phrase_existe_dans_les_seize_langues() {
     for lang in [
-        "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "hu", "vi", "nb", "pl", "el",
+        "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "hu", "vi", "nb", "pl", "el" "tr",
     ] {
         let t = crate::i18n::t(lang, "zonegroup.asioUnsupported");
         assert!(
