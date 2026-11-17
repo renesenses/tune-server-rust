@@ -5113,3 +5113,7 @@ mod duree_relue_5975_tests;
 #[cfg(test)]
 #[path = "niveaux_du_dsd_natif_7775.rs"]
 mod niveaux_du_dsd_natif_7775;
+
+#[cfg(test)]
+#[path = "saut_local_8983_tests.rs"]
+mod saut_local_8983_tests;
