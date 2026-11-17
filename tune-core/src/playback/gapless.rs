@@ -505,15 +505,40 @@ mod tests {
     #[test]
     fn dsd_suivant_tenu_exige_les_trois_conditions_6910() {
         use AnnonceSuivante::*;
-        assert!(dsd_suivant_tenu_sur_dlna(Some(true), false, Annoncee, false));
+        assert!(dsd_suivant_tenu_sur_dlna(
+            Some(true),
+            false,
+            Annoncee,
+            false
+        ));
         // DSD non sondé, ou non annoncé hors mode « natif ».
         assert!(!dsd_suivant_tenu_sur_dlna(None, false, Annoncee, false));
-        assert!(!dsd_suivant_tenu_sur_dlna(Some(false), false, Annoncee, false));
+        assert!(!dsd_suivant_tenu_sur_dlna(
+            Some(false),
+            false,
+            Annoncee,
+            false
+        ));
         // SCPD illisible ou action absente.
-        assert!(!dsd_suivant_tenu_sur_dlna(Some(true), false, Inconnue, false));
-        assert!(!dsd_suivant_tenu_sur_dlna(Some(true), false, NonAnnoncee, false));
+        assert!(!dsd_suivant_tenu_sur_dlna(
+            Some(true),
+            false,
+            Inconnue,
+            false
+        ));
+        assert!(!dsd_suivant_tenu_sur_dlna(
+            Some(true),
+            false,
+            NonAnnoncee,
+            false
+        ));
         // Le renderer a déjà lâché un suivant DSD armé (RS130, #402).
-        assert!(!dsd_suivant_tenu_sur_dlna(Some(true), false, Annoncee, true));
+        assert!(!dsd_suivant_tenu_sur_dlna(
+            Some(true),
+            false,
+            Annoncee,
+            true
+        ));
     }
 
     /// #8969 (fil 2885, Eversolo DMP-A8) — zone en DSD « natif » : le DSD brut
@@ -523,11 +548,31 @@ mod tests {
     #[test]
     fn natif_force_leve_seulement_le_dsd_non_annonce_8971() {
         use AnnonceSuivante::*;
-        assert!(dsd_suivant_tenu_sur_dlna(Some(false), true, Annoncee, false));
+        assert!(dsd_suivant_tenu_sur_dlna(
+            Some(false),
+            true,
+            Annoncee,
+            false
+        ));
         assert!(!dsd_suivant_tenu_sur_dlna(None, true, Annoncee, false));
-        assert!(!dsd_suivant_tenu_sur_dlna(Some(false), true, Inconnue, false));
-        assert!(!dsd_suivant_tenu_sur_dlna(Some(false), true, NonAnnoncee, false));
-        assert!(!dsd_suivant_tenu_sur_dlna(Some(false), true, Annoncee, true));
+        assert!(!dsd_suivant_tenu_sur_dlna(
+            Some(false),
+            true,
+            Inconnue,
+            false
+        ));
+        assert!(!dsd_suivant_tenu_sur_dlna(
+            Some(false),
+            true,
+            NonAnnoncee,
+            false
+        ));
+        assert!(!dsd_suivant_tenu_sur_dlna(
+            Some(false),
+            true,
+            Annoncee,
+            true
+        ));
         assert_eq!(
             refus_dsd_suivant_sur_dlna(Some(false), true, Annoncee, true)
                 .map(RefusDsdSuivant::raison),

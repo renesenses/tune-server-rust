@@ -624,8 +624,7 @@ impl PlaybackOrchestrator {
         device_id: &str,
         annonce_suivante: crate::outputs::traits::AnnonceSuivante,
     ) -> Option<crate::playback::gapless::RefusDsdSuivant> {
-        let natif_force =
-            ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(zone_id) == "native";
+        let natif_force = ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(zone_id) == "native";
         let annonce_dsd = self
             .dsd_capabilities
             .lock()

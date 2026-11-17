@@ -426,3 +426,4 @@ mod raison_du_refus_6335 {
             "#8969 : en « natif », le refus ne doit plus être dsd_non_annonce : {ligne}"
         );
     }
+}
