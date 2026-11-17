@@ -91,7 +91,7 @@ impl ContexteAir {
             activee: Arc::new(move || reglages::activee(&db)),
             indice_source: Arc::new(move || reglages::indice_source(&db2)),
             bornes_db: Arc::new(move || reglages::BornesDb::lues(&db3)),
-            plafond_de_cadence: Arc::new(move |did| plafond_des_zones(&db4, did)),
+            plafond_de_cadence: Arc::new(move |did: &str| plafond_des_zones(&db4, did)),
             ports: Ports::AIR,
             cadence: Cadence::AIR,
         }
