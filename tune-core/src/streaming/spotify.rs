@@ -1418,6 +1418,8 @@ impl SpotifyService {
             track_count: item["total_tracks"].as_u64().unwrap_or(0) as u32,
             released_at: None,
             quality: None,
+            genre_id: None,
+            genre_name: None,
         }
     }
 
@@ -2469,6 +2471,8 @@ impl StreamingService for SpotifyService {
                             track_count: 0,
                             released_at: None,
                             quality: None,
+                            genre_id: None,
+                            genre_name: None,
                         });
                         if albums.len() >= limit {
                             break;
