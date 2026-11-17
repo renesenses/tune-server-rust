@@ -3014,7 +3014,8 @@ fn spawn_reprise_favoris_streaming(state: &AppState) {
                 .and_then(|v| v.trim().parse::<i64>().ok())
                 .filter(|&id| id > 0)
                 .unwrap_or(1);
-        let comptes = crate::routes::profiles::reprendre_les_favoris(&state, profil, None).await;
+        let mut comptes =
+            crate::routes::profiles::reprendre_les_favoris(&state, profil, None).await;
         let services = comptes.as_object().map(|o| o.len()).unwrap_or(0);
         if services > 0 {
             info!(
@@ -3024,6 +3025,17 @@ fn spawn_reprise_favoris_streaming(state: &AppState) {
                 "reprise_favoris_streaming_au_demarrage"
             );
         }
+        // #8766 — un service qui limitait les demandes (`429`) est repris
+        // après le `Retry-After` annoncé, au lieu d'être abandonné.
+        let state = &state;
+        tune_core::streaming::favorites_import::reprogrammer_apres_les_limites(
+            &mut comptes,
+            std::time::Duration::from_secs(1),
+            |nom| async move {
+                crate::routes::profiles::reprendre_les_favoris(state, profil, Some(&nom)).await
+            },
+        )
+        .await;
     });
 }
 

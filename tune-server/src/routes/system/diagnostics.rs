@@ -2628,6 +2628,14 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         state.process_started_at_rfc3339()
     ));
     md.push_str(&format!("**PID**: {}\n", std::process::id()));
+    // #8747 — dans un conteneur, le dossier de la base survit-il à la
+    // recréation ? Un « retour à zéro » après une mise à jour de l'image
+    // (volume anonyme, `/data` non monté) se lit alors au premier rapport.
+    if let Some(ligne) = crate::persistance_donnees::ligne_du_rapport(
+        crate::persistance_donnees::relever(&state.config.db_path).as_ref(),
+    ) {
+        md.push_str(&ligne);
+    }
     if let Some(rss) = rss_mb {
         md.push_str(&format!("**Memory**: {rss} MB RSS\n"));
     }
@@ -3007,6 +3015,13 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
     md.push_str(&format!(
         "- Migration version: {}\n",
         version_de_schema_affichee(db_version)
+    ));
+    // #8747 — la date de la première migration appliquée : celle de la
+    // création de la base. Une base recréée en silence (conteneur recréé sans
+    // volume) se reconnaît à une date postérieure à l'installation.
+    md.push_str(&format!(
+        "- Database created: {}\n",
+        super::date_de_creation_de_la_base(&state).unwrap_or_else(|| "unknown".to_string())
     ));
 
     // #2856 — le rapport ne portait AUCUNE section de réglages. Ni l'état de

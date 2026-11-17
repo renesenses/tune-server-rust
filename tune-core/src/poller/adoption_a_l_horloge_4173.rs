@@ -720,6 +720,11 @@ mod blanc_du_dmp_a6_rc2_4382;
 #[cfg(test)]
 mod bascule_sur_la_suivante_3967;
 
+/// #8863 — les grosses futures du sondage et de la préparation de la
+/// suivante restent en tas : la pile du fil de test ne déborde plus.
+#[cfg(test)]
+mod pile_du_sondeur_8863;
+
 /// #4682 — un déplacement de la barre de progression ne fausse plus
 /// l'enchaînement : ce même banc, la fin de piste rejouée après un
 /// déplacement près de la fin, et un recul après l'armement.
