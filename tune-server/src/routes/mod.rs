@@ -807,6 +807,9 @@ pub fn router_with_plugins(
     ))
     .layer(axum::middleware::from_fn(zones::textes_signal::avec_langue))
     .layer(axum::middleware::from_fn(cache_control_middleware))
+    .layer(axum::middleware::from_fn(
+        tune_http_types::error::avec_chemin_requete,
+    ))
     .layer(axum::Extension(contexte_sendspin))
     .layer(CompressionLayer::new().compress_when(predicat_de_compression()))
     // Contrôle d'origine (`crate::garde_origine`) : une page d'un autre site

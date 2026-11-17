@@ -3507,6 +3507,14 @@ async fn spawn_library_scan_avec_lecteur_par(
                 full_scan_ok,
                 "fin_de_scan",
             );
+            // #8958 — les alertes « Albums douteux » marquées normales tiennent
+            // par clé stable (chemin, dossier) : seules celles dont la clé ne
+            // correspond plus à aucune piste sont retirées, sur scan complet sain.
+            tune_core::db::alertes_douteuses_ignorees::purger_en_fin_de_scan(
+                &db,
+                full_scan_ok,
+                "fin_de_scan",
+            );
             // Les paires « ces deux albums ne sont pas des doublons » (#1276)
             // suivent la même mécanique et la même garde `full_scan_ok` : le
             // scan est précisément le moment où les rowids d'albums meurent et

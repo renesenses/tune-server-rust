@@ -54,6 +54,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Vérifier les payloads de promotion (200 Kio, aucun réseau)
+        run: python3 scripts/test-promotion-payloads-8902.py
+
       - name: Verify generated plugin lists
         run: python scripts/plugin-catalog.py --check
 
@@ -399,7 +402,7 @@ jobs:
     needs: impact
     if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true' && needs.impact.outputs.livre == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45  # test-shipped-features — ~5 min observe
+    timeout-minutes: 75  # compilation + suite complete : coupures observees a 45 min
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1

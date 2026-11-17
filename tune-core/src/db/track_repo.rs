@@ -4040,13 +4040,22 @@ impl TrackRepo {
     /// est jointe par `AND` **autour de la parenthèse entière**. Sans elle,
     /// `A AND B OR C OR D` se lirait `(A AND B) OR C OR D` et ne filtrerait
     /// rien du tout.
+    ///
+    /// #8958 — chaque raison porte son propre filtre des alertes marquées
+    /// normales ([`alertes_douteuses_ignorees::clause_non_ignoree`]) : une
+    /// piste dont l'artiste manque ET qui est très courte reste listée tant
+    /// qu'une des deux alertes n'est pas ignorée.
     fn where_doubtful() -> String {
+        use crate::db::alertes_douteuses_ignorees::clause_non_ignoree;
         format!(
             "WHERE {piste_locale} \
-               AND ((ar.name IS NULL OR ar.name = '' OR ar.name = 'Unknown Artist') \
-                OR (t.duration_ms > 0 AND t.duration_ms < 5000) \
-                OR (al.title IS NULL OR al.title = ''))",
+               AND (((ar.name IS NULL OR ar.name = '' OR ar.name = 'Unknown Artist') AND {sans_artiste}) \
+                OR (t.duration_ms > 0 AND t.duration_ms < 5000 AND {tres_courte}) \
+                OR ((al.title IS NULL OR al.title = '') AND {sans_album}))",
             piste_locale = sql::PISTE_LOCALE,
+            sans_artiste = clause_non_ignoree("missing_artist"),
+            tres_courte = clause_non_ignoree("very_short"),
+            sans_album = clause_non_ignoree("missing_album"),
         )
     }
 

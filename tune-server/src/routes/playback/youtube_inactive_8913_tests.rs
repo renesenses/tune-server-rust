@@ -62,7 +62,7 @@ async fn youtube_sans_yt_dlp_rend_409_nomme_et_non_502() {
 }
 
 #[tokio::test]
-async fn la_phrase_suit_la_langue_dans_les_quinze() {
+async fn la_phrase_suit_la_langue_dans_les_seize() {
     let mut vues = std::collections::HashSet::new();
     for lang in crate::i18n::SUPPORTED {
         let corps = corps(play_error_response(erreur_du_coeur(), lang)).await;
@@ -71,7 +71,7 @@ async fn la_phrase_suit_la_langue_dans_les_quinze() {
         assert!(m.contains("YouTube"), "{lang} : {m}");
         assert!(vues.insert(m.clone()), "{lang} : phrase en double {m}");
     }
-    assert_eq!(vues.len(), 15);
+    assert_eq!(vues.len(), 16);
 }
 
 /// Témoin : une autre panne YouTube (yt-dlp présent mais en échec) garde

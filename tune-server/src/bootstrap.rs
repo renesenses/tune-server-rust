@@ -226,6 +226,11 @@ pub async fn run_with(opts: RunOptions) {
     // avant le port et la base : l'`exec` ne laisse rien derrière lui.
     #[cfg(unix)]
     crate::binaire_installe::reparer_un_lancement_depuis_la_sauvegarde();
+    // #8944 — une bascule des exécutables livrés (airplay-daemon, librespot…)
+    // coupée par un arrêt de la machine est finie ici, avant qu'aucun démon
+    // ne soit lancé.
+    #[cfg(unix)]
+    crate::routes::system::update::finir_une_mise_a_jour_interrompue();
 
     // #4924 : relever l'état du processus PENDANT un gel de l'exécuteur, sans
     // ptrace ni sudo. Fil 2117/2124 (#5677) : les relevés vont dans le dossier
@@ -1045,8 +1050,8 @@ pub fn installer_le_journal(niveau_journal: &str) -> Option<std::path::PathBuf> 
         // L'ancien nom `stderr_layer` disait le contraire et n'a jamais été
         // vrai.
         let console_ferait_doublon = crate::journal::la_console_ecrit_deja_dans(&chemin);
-        let console_layer =
-            (!console_ferait_doublon).then(|| tracing_subscriber::fmt::layer().with_timer(timer));
+        let console_layer = (!console_ferait_doublon)
+            .then(|| couche_console(timer, la_console_veut_des_couleurs()));
 
         tracing_subscriber::registry()
             .with(env_filter)
@@ -1070,9 +1075,52 @@ pub fn installer_le_journal(niveau_journal: &str) -> Option<std::path::PathBuf> 
 
     tracing_subscriber::fmt()
         .with_timer(timer)
+        .with_ansi(la_console_veut_des_couleurs())
         .with_env_filter(env_filter)
         .init();
     None
+}
+
+/// #8922 — la console en couleurs SEULEMENT quand sa sortie est un terminal,
+/// et jamais quand `NO_COLOR` est posé (non vide, <https://no-color.org>).
+///
+/// Sous Docker, systemd ou une redirection vers un fichier, la sortie standard
+/// n'est pas un terminal : `docker logs` et journald recevaient les séquences
+/// `ESC[…m` telles quelles (fil 2381, rc12). `fmt::layer()` colore par défaut
+/// sans regarder où il écrit ; seule la couche FICHIER avait `with_ansi(false)`.
+fn couleurs_de_la_console(
+    sortie_est_un_terminal: bool,
+    no_color: Option<&std::ffi::OsStr>,
+) -> bool {
+    sortie_est_un_terminal && no_color.is_none_or(|v| v.is_empty())
+}
+
+/// [`couleurs_de_la_console`] pour CE processus : la sortie standard (l'écrivain
+/// de `fmt::layer()`, voir [`installer_le_journal`]) et l'environnement.
+fn la_console_veut_des_couleurs() -> bool {
+    use std::io::IsTerminal;
+    couleurs_de_la_console(
+        std::io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR").as_deref(),
+    )
+}
+
+/// La couche console, couleurs décidées par l'appelant — la fabrique que le
+/// test de #8922 éprouve.
+fn couche_console<S, T>(
+    timer: T,
+    couleurs: bool,
+) -> tracing_subscriber::fmt::Layer<
+    S,
+    tracing_subscriber::fmt::format::DefaultFields,
+    tracing_subscriber::fmt::format::Format<tracing_subscriber::fmt::format::Full, T>,
+>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    tracing_subscriber::fmt::layer()
+        .with_timer(timer)
+        .with_ansi(couleurs)
 }
 
 /// Le filtre du journal : le niveau demandé pour tout ce qui vient du dépôt,
@@ -1181,6 +1229,54 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
+    }
+    /// #8922 (fil 2381) — hors terminal, la console n'écrit AUCUNE séquence de
+    /// couleur ; `NO_COLOR` non vide les coupe aussi dans un terminal.
+    ///
+    /// Contre-épreuve : la couche d'avant (`fmt::layer().with_timer(..)`, sans
+    /// `with_ansi`) écrit `ESC[` pour le même événement — c'est le second cas,
+    /// couleurs demandées, qui prouve que la capture les voit.
+    #[test]
+    fn la_console_hors_terminal_n_ecrit_aucune_couleur() {
+        use std::ffi::OsStr;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        assert!(
+            !super::couleurs_de_la_console(false, None),
+            "Docker, journald, fichier"
+        );
+        assert!(!super::couleurs_de_la_console(false, Some(OsStr::new("1"))));
+        assert!(
+            !super::couleurs_de_la_console(true, Some(OsStr::new("1"))),
+            "NO_COLOR=1"
+        );
+        assert!(super::couleurs_de_la_console(true, None), "terminal");
+        assert!(
+            super::couleurs_de_la_console(true, Some(OsStr::new(""))),
+            "NO_COLOR vide ne compte pas (no-color.org)"
+        );
+
+        let ecrire = |couleurs: bool| {
+            let journal = JournalCapture::default();
+            let couche = super::couche_console(tracing_subscriber::fmt::time::SystemTime, couleurs)
+                .with_writer(journal.clone());
+            let abonne = tracing_subscriber::registry().with(couche);
+            tracing::subscriber::with_default(abonne, || {
+                tracing::warn!(target: "tune_server", champ = 1, "temoin_8922");
+            });
+            journal.texte()
+        };
+        let hors_terminal = ecrire(super::couleurs_de_la_console(false, None));
+        assert!(hors_terminal.contains("temoin_8922"), "{hors_terminal:?}");
+        assert!(
+            !hors_terminal.contains('\u{1b}'),
+            "séquence ANSI hors terminal : {hors_terminal:?}"
+        );
+        let terminal = ecrire(true);
+        assert!(
+            terminal.contains('\u{1b}'),
+            "la capture voit les couleurs : {terminal:?}"
+        );
     }
     /// #4480 : le journal du .18 ne portait AUCUNE ligne de `tune_stream_http`
     /// — le filtre ne nommait que `tune_server` et `tune_core`, et tout ce que
