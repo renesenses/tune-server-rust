@@ -200,7 +200,7 @@ async fn relais_injoignable_le_refus_dit_que_c_est_le_reseau() {
 }
 
 #[tokio::test]
-async fn un_vrai_refus_d_identifiants_au_relais_reste_un_refus_d_identifiants() {
+async fn le_refus_du_relais_apres_akamai_garde_son_origine_8867() {
     let direct = direct_bloque_par_akamai(Default::default()).await;
     let app = axum::Router::new().fallback(|| async {
         (
@@ -217,5 +217,14 @@ async fn un_vrai_refus_d_identifiants_au_relais_reste_un_refus_d_identifiants() 
         .authenticate(&identifiants())
         .await
         .expect_err("le relais refuse les identifiants");
-    assert!(matches!(err, TuneError::Credentials(_)), "{err:?}");
+    assert!(
+        matches!(
+            err,
+            TuneError::Refused {
+                code: "qobuz_relay_login_refused",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
 }

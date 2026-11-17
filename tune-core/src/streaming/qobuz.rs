@@ -284,6 +284,8 @@ enum AttemptError {
     Http { status: u16, body: String },
     /// Body of a successful response failed to parse — final, no fallback.
     Json(String),
+    /// Réponse de connexion 200, sans jeton utilisable.
+    MissingToken,
 }
 
 impl AttemptError {
@@ -293,7 +295,7 @@ impl AttemptError {
         match self {
             Self::Network(_) => true,
             Self::Http { status, .. } => *status >= 500 || self.refus_de_peripherie(),
-            Self::Json(_) => false,
+            Self::Json(_) | Self::MissingToken => false,
         }
     }
 
@@ -325,7 +327,7 @@ impl AttemptError {
     fn statut_http(&self) -> Option<u16> {
         match self {
             Self::Http { status, .. } => Some(*status),
-            Self::Network(_) | Self::Json(_) => None,
+            Self::Network(_) | Self::Json(_) | Self::MissingToken => None,
         }
     }
 }
@@ -389,6 +391,13 @@ const MOTIF_RESEAU_REFUSE: &str = "qobuz login: Qobuz refuses connections from t
 /// même refus de l'application. Tout autre 401 reste un refus d'identifiants,
 /// comme avant : on ne requalifie que les messages reconnus.
 fn erreur_de_connexion(err: &AttemptError) -> TuneError {
+    if matches!(err, AttemptError::MissingToken) {
+        return TuneError::Refused {
+            code: "qobuz_login_incomplete",
+            message: "Qobuz login incomplete: response contains no usable authentication token"
+                .into(),
+        };
+    }
     if application_refusee(err) {
         return TuneError::AppRefused(MOTIF_APPLICATION_REFUSEE.to_string());
     }
@@ -402,6 +411,19 @@ fn erreur_de_connexion(err: &AttemptError) -> TuneError {
         Some(401) => TuneError::Credentials("qobuz login: invalid credentials".to_string()),
         _ => TuneError::Other(format!("qobuz login: {err}")),
     }
+}
+
+/// Le relais peut rendre son propre 401 : son origine ne prouve pas que
+/// Qobuz a refusé le mot de passe. Les refus d'application reconnus restent
+/// distincts (#8134).
+fn erreur_connexion_origine(err: &AttemptError, origine: &str) -> TuneError {
+    if origine == "relais" && err.statut_http() == Some(401) && !application_refusee(err) {
+        return TuneError::Refused {
+            code: "qobuz_relay_login_refused",
+            message: "Qobuz login refused through the relay; the origin does not establish that the password is incorrect".into(),
+        };
+    }
+    erreur_de_connexion(err)
 }
 
 /// Le texte de [`TuneError::AppRefused`] pour Qobuz : il dit que le mot de
@@ -430,6 +452,9 @@ fn application_refusee(err: &AttemptError) -> bool {
 
 /// La nature d'un échec de connexion, pour le journal (`qobuz_login_failed`).
 fn nature_echec_connexion(err: &AttemptError) -> &'static str {
+    if matches!(err, AttemptError::MissingToken) {
+        return "jeton_absent";
+    }
     if application_refusee(err) {
         "application_refusee"
     } else if err.refus_de_peripherie() {
@@ -458,6 +483,7 @@ impl std::fmt::Display for AttemptError {
             Self::Network(e) => write!(f, "{e}"),
             Self::Http { status, body } => write!(f, "{status} {body}"),
             Self::Json(e) => write!(f, "json: {e}"),
+            Self::MissingToken => write!(f, "jeton absent"),
         }
     }
 }
@@ -3171,9 +3197,17 @@ impl QobuzService {
             return Err(AttemptError::Http { status, body });
         }
 
-        resp.json()
+        let data: serde_json::Value = resp
+            .json()
             .await
-            .map_err(|e| AttemptError::Json(e.to_string()))
+            .map_err(|e| AttemptError::Json(e.to_string()))?;
+        if data["user_auth_token"]
+            .as_str()
+            .is_none_or(|token| token.trim().is_empty())
+        {
+            return Err(AttemptError::MissingToken);
+        }
+        Ok(data)
     }
 
     /// Login following the configured endpoint order. Direct-first by default so
@@ -3193,14 +3227,14 @@ impl QobuzService {
 
         let (data, retenue) = match self.connexion_avec(&candidate.0, username, password).await {
             Ok(d) => (d, candidate),
-            Err(err) => {
-                self.journaliser_echec_connexion(&candidate.0, &err);
+            Err((err, origine)) => {
+                self.journaliser_echec_connexion(&candidate.0, &err, origine);
                 // #8134 — Qobuz peut refuser une application avec le message
                 // d'un mauvais mot de passe : seule la comparaison avec
                 // l'application précédente, même mot de passe, les distingue.
                 let refus = matches!(err.statut_http(), Some(400 | 401));
                 let Some(repli) = repli.filter(|_| refus) else {
-                    return Err(erreur_de_connexion(&err));
+                    return Err(erreur_connexion_origine(&err, origine));
                 };
                 match self.connexion_avec(&repli.0, username, password).await {
                     Ok(d) => {
@@ -3211,9 +3245,9 @@ impl QobuzService {
                         );
                         (d, repli)
                     }
-                    Err(e) => {
-                        self.journaliser_echec_connexion(&repli.0, &e);
-                        return Err(erreur_de_connexion(&e));
+                    Err((e, origine)) => {
+                        self.journaliser_echec_connexion(&repli.0, &e, origine);
+                        return Err(erreur_connexion_origine(&e, origine));
                     }
                 }
             }
@@ -3239,27 +3273,43 @@ impl QobuzService {
         app_id: &str,
         username: &str,
         password: &str,
-    ) -> Result<serde_json::Value, AttemptError> {
+    ) -> Result<serde_json::Value, (AttemptError, &'static str)> {
         let (primary, fallback) = self.bases_ordonnees();
+        let (origine_primaire, origine_secours) = if self.proxy_first {
+            ("relais", "direct")
+        } else {
+            ("direct", "relais")
+        };
         match self.login_at(primary, app_id, username, password).await {
             Err(err) if err.transient() => {
                 log_fallback(self.proxy_first, "/user/login", &err);
                 self.login_at(fallback, app_id, username, password)
                     .await
-                    .map_err(|e| echec_le_plus_parlant(err, e))
+                    .map_err(|e| {
+                        let origine = if err.refus_de_peripherie()
+                            && e.transient()
+                            && !e.refus_de_peripherie()
+                        {
+                            origine_primaire
+                        } else {
+                            origine_secours
+                        };
+                        (echec_le_plus_parlant(err, e), origine)
+                    })
             }
-            autre => autre,
+            autre => autre.map_err(|e| (e, origine_primaire)),
         }
     }
 
     /// Une ligne qui dit, sans relire le corps de Qobuz, si c'est le compte ou
     /// l'application qui est refusé, et avec quel `app_id` (six caractères).
-    fn journaliser_echec_connexion(&self, app_id: &str, err: &AttemptError) {
+    fn journaliser_echec_connexion(&self, app_id: &str, err: &AttemptError, origine: &str) {
         let nature = nature_echec_connexion(err);
         let app_id = prefixe_app_id(app_id);
         if nature == "application_refusee" {
             warn!(
                 nature,
+                origine,
                 app_id = %app_id,
                 error = %err,
                 conseil = "Qobuz refuse l'application (app_id), pas le mot de passe : \
@@ -3267,7 +3317,7 @@ impl QobuzService {
                 "qobuz_login_failed"
             );
         } else {
-            info!(nature, app_id = %app_id, error = %err, "qobuz_login_failed");
+            info!(nature, origine, app_id = %app_id, error = %err, "qobuz_login_failed");
         }
     }
 
