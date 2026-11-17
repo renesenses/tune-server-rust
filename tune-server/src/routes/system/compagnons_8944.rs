@@ -21,9 +21,23 @@
 //! un échec remet les anciens. Un démon en cours garde son fichier ouvert
 //! (inode) jusqu'à sa sortie : le renommer sous lui est sans effet sur lui.
 //!
+//! Sous Unix, l'ancien est mis de côté par un LIEN DUR (`<nom>.old`), puis
+//! le neuf remplace la cible par `rename` : le nom installé n'est jamais
+//! absent, même si la machine s'arrête entre les deux (relecture de #8954).
+//! Une bascule coupée par un arrêt est finie au démarrage suivant
+//! ([`finir_les_bascules_interrompues`]). Les `<nom>.old` sont retirés au
+//! premier démarrage de la version neuve ([`retirer_les_sauvegardes`]).
+//!
+//! Un exécutable que l'utilisateur veut garder (le sien, ou aucun) se
+//! protège par un marqueur vide `.no-bundled-<nom>` dans le dossier du
+//! binaire : la mise à jour ne crée ni ne remplace alors ce nom. Sans
+//! marqueur, un exécutable livré remplacé à la main par un fichier ordinaire
+//! est remplacé (un lien symbolique, lui, est toujours laissé).
+//!
 //! Arrêt et relance des démons : à la relance (`exec`), chaque
 //! `airplay-daemon` voit son entrée standard se fermer (tube `CLOEXEC`) et
-//! sort ; la relance de la mise à jour arrête `librespot` avant l'`exec`. Le
+//! sort ; la relance de la mise à jour arrête en plus les sorties AirPlay 2
+//! (et leur démon) et `librespot` avant l'`exec`. Le
 //! serveur relancé les démarre à nouveau, depuis les fichiers neufs.
 
 use std::io;
@@ -40,6 +54,11 @@ use super::installation_sure::{self, Controles, a_cote};
 pub(super) const EXECUTABLES_LIVRES: [&str; 4] =
     ["airplay-daemon", "librespot", "ffmpeg", "fpcalc"];
 
+/// Le marqueur qui dit de laisser `nom` tel qu'il est (ou absent).
+pub(super) fn marqueur_de_retrait(exe_dir: &Path, nom: &str) -> PathBuf {
+    exe_dir.join(format!(".no-bundled-{nom}"))
+}
+
 /// Un exécutable livré à installer : sa source dans l'archive extraite, sa
 /// cible dans le dossier du binaire.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +72,8 @@ pub(super) struct ExecutableLivre {
 /// `exe_dir`. `suffixe` : `""` sous Unix, `".exe"` pour Windows.
 ///
 /// Une cible qui est un lien symbolique (outil remplacé à la main par celui
-/// du système) est laissée telle quelle.
+/// du système) est laissée telle quelle, de même qu'un nom protégé par son
+/// marqueur [`marqueur_de_retrait`].
 pub(super) fn a_installer(archive: &Path, exe_dir: &Path, suffixe: &str) -> Vec<ExecutableLivre> {
     EXECUTABLES_LIVRES
         .iter()
@@ -64,6 +84,10 @@ pub(super) fn a_installer(archive: &Path, exe_dir: &Path, suffixe: &str) -> Vec<
             let ordinaire =
                 std::fs::symlink_metadata(&source).is_ok_and(|m| m.file_type().is_file());
             if !ordinaire {
+                return None;
+            }
+            if marqueur_de_retrait(exe_dir, nom).exists() {
+                info!(cible = %cible.display(), "update_executable_livre_marqueur_garde");
                 return None;
             }
             if std::fs::symlink_metadata(&cible).is_ok_and(|m| m.file_type().is_symlink()) {
@@ -132,28 +156,59 @@ pub(super) struct LivreBascule {
     pub ancien_garde: bool,
 }
 
-/// Bascule un exécutable préparé : l'ancien part en `<cible>.old` (le
-/// précédent `.old` est retiré), le `.new` prend son nom. Un échec laisse la
-/// cible comme avant.
+/// Libère `<cible>.old` : un fichier est supprimé ; un dossier, ou un
+/// fichier qui ne se supprime pas, est renommé sous un nom unique
+/// (`<cible>.old.<pid>-<n>`) plutôt que de faire échouer la mise à jour.
+fn liberer_la_sauvegarde(ancien: &Path) -> Result<(), String> {
+    let Ok(meta) = std::fs::symlink_metadata(ancien) else {
+        return Ok(());
+    };
+    if !meta.is_dir() && std::fs::remove_file(ancien).is_ok() {
+        return Ok(());
+    }
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let ecarte = a_cote(ancien, &format!("{}-{unique}", std::process::id()));
+    std::fs::rename(ancien, &ecarte)
+        .map_err(|e| format!("clear backup {}: {e}", ancien.display()))?;
+    warn!(de = %ancien.display(), vers = %ecarte.display(), "update_sauvegarde_ecartee");
+    Ok(())
+}
+
+/// Bascule un exécutable préparé : l'ancien est gardé en `<cible>.old` (le
+/// précédent est libéré), le `.new` prend son nom. Un échec laisse la cible
+/// comme avant.
+///
+/// L'ancien est gardé par un lien dur, puis `rename(.new, cible)` remplace la
+/// cible d'un coup : il n'y a pas d'instant où la cible manque. Sur un
+/// système de fichiers sans liens durs, repli sur le renommage.
 pub(super) fn basculer(
     l: &ExecutableLivre,
     renommer: fn(&Path, &Path) -> io::Result<()>,
 ) -> Result<LivreBascule, String> {
     let pose = a_cote(&l.cible, "new");
     let ancien = a_cote(&l.cible, "old");
-    if std::fs::symlink_metadata(&ancien).is_ok() {
-        std::fs::remove_file(&ancien)
-            .map_err(|e| format!("clear backup {}: {e}", ancien.display()))?;
-    }
+    liberer_la_sauvegarde(&ancien)?;
     let ancien_garde = std::fs::symlink_metadata(&l.cible).is_ok();
-    if ancien_garde {
+    if ancien_garde && let Err(e) = std::fs::hard_link(&l.cible, &ancien) {
+        warn!(cible = %l.cible.display(), error = %e, "update_lien_dur_impossible — renommage");
         renommer(&l.cible, &ancien).map_err(|e| format!("park old {}: {e}", l.cible.display()))?;
     }
     if let Err(e) = renommer(&pose, &l.cible) {
         if ancien_garde {
-            std::fs::rename(&ancien, &l.cible).ok();
+            if std::fs::symlink_metadata(&l.cible).is_ok() {
+                // Lien dur : la cible n'a pas bougé, seul le lien est retiré.
+                std::fs::remove_file(&ancien).ok();
+            } else {
+                std::fs::rename(&ancien, &l.cible).ok();
+            }
         }
         return Err(format!("swap new {} into place: {e}", l.cible.display()));
+    }
+    if let Some(dir) = l.cible.parent() {
+        installation_sure::synchroniser_dossier(dir);
     }
     info!(cible = %l.cible.display(), "update_executable_livre_remplace");
     Ok(LivreBascule {
@@ -184,6 +239,120 @@ pub(super) fn remettre_tous(bascules: &[LivreBascule]) -> Vec<String> {
         }
     }
     non_remis
+}
+
+/// Finit, au démarrage, une bascule coupée par un arrêt de la machine
+/// (Unix).
+///
+/// Les `<nom>.new` sont tous écrits AVANT la bascule du binaire, qui
+/// consomme `tune-server.new`. Donc :
+/// - `tune-server.new` encore là : le binaire n'a pas basculé, les `.new`
+///   des exécutables livrés sont d'une mise à jour abandonnée → retirés ;
+/// - sinon, un `<nom>.new` qui traîne est la suite d'une bascule coupée : il
+///   prend la place de la cible s'il est valide (non vide, ELF de cette
+///   machine sous Linux) et que la cible est absente ou plus ancienne que
+///   lui ; sinon il est retiré.
+///
+/// `binaire` : le chemin installé du serveur (jamais `.old`). Rend les
+/// cibles remplacées.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(super) fn finir_les_bascules_interrompues(
+    binaire: &Path,
+    controles: &Controles,
+) -> Vec<PathBuf> {
+    let Some(exe_dir) = binaire.parent() else {
+        return Vec::new();
+    };
+    // Le même nom que le `.new` d'`install_unix`.
+    let binaire_abandonne = binaire.with_extension("new").exists();
+    let mut finies = Vec::new();
+    for nom in EXECUTABLES_LIVRES {
+        let cible = exe_dir.join(nom);
+        let pose = a_cote(&cible, "new");
+        if !std::fs::symlink_metadata(&pose).is_ok_and(|m| m.file_type().is_file()) {
+            continue;
+        }
+        let refus = if binaire_abandonne {
+            Some("binary was not swapped".to_string())
+        } else if marqueur_de_retrait(exe_dir, nom).exists() {
+            Some("kept by its .no-bundled marker".to_string())
+        } else if std::fs::symlink_metadata(&cible).is_ok_and(|m| m.file_type().is_symlink()) {
+            Some("target is a symlink".to_string())
+        } else {
+            let sans_essai = Controles {
+                taille_attendue: None,
+                essai: |_| Ok(()),
+                ..*controles
+            };
+            match installation_sure::valider_binaire(&pose, &sans_essai) {
+                Err(e) => Some(e),
+                Ok(()) => {
+                    let date = |p: &Path| std::fs::metadata(p).and_then(|m| m.modified()).ok();
+                    match (date(&cible), date(&pose)) {
+                        (Some(c), Some(n)) if c > n => Some("target is newer".to_string()),
+                        _ => None,
+                    }
+                }
+            }
+        };
+        if let Some(motif) = refus {
+            warn!(pose = %pose.display(), motif = %motif, "update_bascule_interrompue_abandonnee");
+            std::fs::remove_file(&pose).ok();
+            continue;
+        }
+        let livre = ExecutableLivre {
+            source: pose.clone(),
+            cible: cible.clone(),
+        };
+        match basculer(&livre, |de, vers| std::fs::rename(de, vers)) {
+            Ok(_) => {
+                warn!(cible = %cible.display(), "update_bascule_interrompue_finie");
+                finies.push(cible);
+            }
+            Err(e) => {
+                warn!(cible = %cible.display(), error = %e, "update_bascule_interrompue_echec");
+            }
+        }
+    }
+    finies
+}
+
+/// Retire les sauvegardes des exécutables livrés (`<nom>.old` et ceux
+/// écartés en `<nom>.old.<…>`) une fois la version neuve démarrée : elles
+/// ne servent qu'à revenir de CETTE mise à jour, et une sauvegarde périmée
+/// ne doit pas être reprise par un retour manuel. Seuls des fichiers sont
+/// retirés, jamais un dossier. Rend les chemins retirés.
+pub(super) fn retirer_les_sauvegardes(exe_dir: &Path, suffixe: &str) -> Vec<PathBuf> {
+    let Ok(entrees) = std::fs::read_dir(exe_dir) else {
+        return Vec::new();
+    };
+    let prefixes: Vec<String> = EXECUTABLES_LIVRES
+        .iter()
+        .map(|nom| format!("{nom}{suffixe}.old"))
+        .collect();
+    let mut retirees = Vec::new();
+    for entree in entrees.flatten() {
+        let nom = entree.file_name().to_string_lossy().into_owned();
+        let sauvegarde = prefixes.iter().any(|p| {
+            nom == *p
+                || nom
+                    .strip_prefix(p.as_str())
+                    .is_some_and(|r| r.starts_with('.'))
+        });
+        if !sauvegarde || !entree.file_type().is_ok_and(|t| t.is_file()) {
+            continue;
+        }
+        if std::fs::remove_file(entree.path()).is_ok() {
+            retirees.push(entree.path());
+        }
+    }
+    if !retirees.is_empty() {
+        info!(
+            n = retirees.len(),
+            "update_sauvegardes_des_executables_livres_retirees"
+        );
+    }
+    retirees
 }
 
 fn nom(chemin: &Path) -> String {

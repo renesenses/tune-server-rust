@@ -226,6 +226,11 @@ pub async fn run_with(opts: RunOptions) {
     // avant le port et la base : l'`exec` ne laisse rien derrière lui.
     #[cfg(unix)]
     crate::binaire_installe::reparer_un_lancement_depuis_la_sauvegarde();
+    // #8944 — une bascule des exécutables livrés (airplay-daemon, librespot…)
+    // coupée par un arrêt de la machine est finie ici, avant qu'aucun démon
+    // ne soit lancé.
+    #[cfg(unix)]
+    crate::routes::system::update::finir_une_mise_a_jour_interrompue();
 
     // #4924 : relever l'état du processus PENDANT un gel de l'exécuteur, sans
     // ptrace ni sudo. Fil 2117/2124 (#5677) : les relevés vont dans le dossier

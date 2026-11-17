@@ -36,7 +36,9 @@
 //! cd /opt/tune
 //! cp -a tune-server.old tune-server
 //! rm -rf web.rejete && mv web web.rejete && mv web.old web
-//! # #8944 : les exécutables livrés basculés ont aussi leur `.old`
+//! # #8944 : les exécutables livrés basculés ont aussi leur `.old`. Ils
+//! # sont retirés au premier démarrage de la version neuve : présents, ils
+//! # sont donc ceux de la dernière mise à jour, jamais d'une plus ancienne.
 //! for f in airplay-daemon librespot ffmpeg fpcalc; do
 //!   [ -f "$f.old" ] && cp -a "$f.old" "$f"
 //! done

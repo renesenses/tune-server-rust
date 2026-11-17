@@ -337,6 +337,193 @@ mod installation_unix {
         assert!(encore_vivant, "la bascule a touché au démon en cours");
         assert_eq!(inst.lire("airplay-daemon"), elf("airplay-daemon neuf"));
     }
+    /// Relecture de #8954 — la cible n'est jamais absente pendant la
+    /// bascule : au moment où le neuf prend son nom, l'ancien y est encore
+    /// (lien dur vers `.old`, puis `rename` qui l'écrase d'un coup).
+    #[test]
+    fn la_cible_n_est_jamais_absente_pendant_la_bascule_8944() {
+        let inst = Installation::nouvelle();
+        inst.archive("airplay-daemon", &elf("airplay-daemon neuf"));
+        inst.archive("librespot", &elf("librespot neuf"));
+        let mut c = controles();
+        c.renommer = |de, vers| {
+            let pose = de.extension().is_some_and(|e| e == "new");
+            let livre = vers
+                .file_name()
+                .is_some_and(|n| n == "airplay-daemon" || n == "librespot");
+            if pose && livre && std::fs::symlink_metadata(vers).is_err() {
+                return Err(io::Error::other("cible absente pendant la bascule"));
+            }
+            std::fs::rename(de, vers)
+        };
+
+        inst.installer(&c).expect("installation");
+
+        assert_eq!(inst.lire("airplay-daemon"), elf("airplay-daemon neuf"));
+        assert_eq!(
+            inst.lire("airplay-daemon.old"),
+            elf("airplay-daemon ancien")
+        );
+        assert_eq!(inst.lire("librespot"), elf("librespot neuf"));
+    }
+
+    /// Le marqueur `.no-bundled-<nom>` garde un exécutable : ni créé quand il
+    /// manque, ni remplacé quand l'utilisateur a mis le sien.
+    #[test]
+    fn le_marqueur_garde_l_executable_de_l_utilisateur_8944() {
+        let inst = Installation::nouvelle();
+        ecrire_x(&inst.opt.join("ffmpeg"), &elf("ffmpeg de l'utilisateur"));
+        std::fs::write(inst.opt.join(".no-bundled-ffmpeg"), "").unwrap();
+        std::fs::remove_file(inst.opt.join("airplay-daemon")).unwrap();
+        std::fs::write(inst.opt.join(".no-bundled-airplay-daemon"), "").unwrap();
+        inst.archive("ffmpeg", &elf("ffmpeg neuf"));
+        inst.archive("airplay-daemon", &elf("airplay-daemon neuf"));
+        inst.archive("librespot", &elf("librespot neuf"));
+
+        inst.installer(&controles()).expect("installation");
+
+        assert_eq!(inst.lire("ffmpeg"), elf("ffmpeg de l'utilisateur"));
+        assert!(
+            !inst.opt.join("airplay-daemon").exists(),
+            "retrait volontaire défait"
+        );
+        assert_eq!(inst.lire("librespot"), elf("librespot neuf"));
+    }
+
+    /// Un `<nom>.old` qui est un dossier est écarté sous un nom unique, avec
+    /// son contenu, au lieu de faire échouer la mise à jour.
+    #[test]
+    fn une_sauvegarde_dossier_est_ecartee_sans_echec_8944() {
+        let inst = Installation::nouvelle();
+        std::fs::create_dir(inst.opt.join("airplay-daemon.old")).unwrap();
+        std::fs::write(inst.opt.join("airplay-daemon.old/note"), "a garder").unwrap();
+        inst.archive("airplay-daemon", &elf("airplay-daemon neuf"));
+
+        inst.installer(&controles()).expect("installation");
+
+        assert_eq!(inst.lire("airplay-daemon"), elf("airplay-daemon neuf"));
+        assert_eq!(
+            inst.lire("airplay-daemon.old"),
+            elf("airplay-daemon ancien")
+        );
+        let ecarte = std::fs::read_dir(&inst.opt)
+            .unwrap()
+            .flatten()
+            .find(|e| {
+                let n = e.file_name().to_string_lossy().into_owned();
+                n.starts_with("airplay-daemon.old.") && e.path().is_dir()
+            })
+            .expect("le dossier .old a disparu");
+        assert_eq!(
+            std::fs::read_to_string(ecarte.path().join("note")).unwrap(),
+            "a garder"
+        );
+    }
+
+    fn dater(p: &Path, il_y_a: std::time::Duration) {
+        let t = std::time::SystemTime::now() - il_y_a;
+        std::fs::File::options()
+            .write(true)
+            .open(p)
+            .unwrap()
+            .set_modified(t)
+            .unwrap();
+    }
+
+    const HEURE: std::time::Duration = std::time::Duration::from_secs(3600);
+
+    /// Coupure après la bascule du binaire : le `.new` valide d'un démon
+    /// prend la place de la cible plus ancienne au démarrage suivant.
+    #[test]
+    fn le_demarrage_finit_une_bascule_coupee_8944() {
+        let inst = Installation::nouvelle();
+        dater(&inst.opt.join("airplay-daemon"), HEURE);
+        std::fs::write(
+            inst.opt.join("airplay-daemon.new"),
+            elf("airplay-daemon neuf"),
+        )
+        .unwrap();
+        std::fs::remove_file(inst.opt.join("librespot")).unwrap();
+        std::fs::write(inst.opt.join("librespot.new"), elf("librespot neuf")).unwrap();
+
+        let finies = finir_les_bascules_interrompues(&inst.opt.join("tune-server"), &controles());
+
+        assert_eq!(finies.len(), 2, "{finies:?}");
+        assert_eq!(inst.lire("airplay-daemon"), elf("airplay-daemon neuf"));
+        assert_eq!(inst.mode("airplay-daemon"), 0o755);
+        assert_eq!(inst.lire("librespot"), elf("librespot neuf"));
+        assert_eq!(inst.restes(), Vec::<String>::new());
+    }
+
+    /// Coupure AVANT la bascule du binaire (`tune-server.new` encore là) :
+    /// les démons restent ceux du serveur qui tourne, les `.new` partent.
+    #[test]
+    fn sans_bascule_du_binaire_les_demons_ne_basculent_pas_8944() {
+        let inst = Installation::nouvelle();
+        std::fs::write(inst.opt.join("tune-server.new"), elf("tune-server neuf")).unwrap();
+        dater(&inst.opt.join("airplay-daemon"), HEURE);
+        std::fs::write(
+            inst.opt.join("airplay-daemon.new"),
+            elf("airplay-daemon neuf"),
+        )
+        .unwrap();
+
+        let finies = finir_les_bascules_interrompues(&inst.opt.join("tune-server"), &controles());
+
+        assert!(finies.is_empty());
+        assert_eq!(inst.lire("airplay-daemon"), elf("airplay-daemon ancien"));
+        assert!(!inst.opt.join("airplay-daemon.new").exists());
+    }
+
+    /// Un `.new` invalide (autre architecture) ou plus ancien que la cible
+    /// n'est jamais posé ; il est retiré.
+    #[test]
+    fn un_reste_invalide_ou_perime_n_est_pas_pose_8944() {
+        let inst = Installation::nouvelle();
+        let autre = if machine_hote() == 0x3E { 0xB7 } else { 0x3E };
+        dater(&inst.opt.join("airplay-daemon"), HEURE);
+        std::fs::write(
+            inst.opt.join("airplay-daemon.new"),
+            faux_elf(autre, "airplay-daemon autre arch"),
+        )
+        .unwrap();
+        let perime = inst.opt.join("librespot.new");
+        std::fs::write(&perime, elf("librespot perime")).unwrap();
+        dater(&perime, HEURE);
+
+        let finies = finir_les_bascules_interrompues(&inst.opt.join("tune-server"), &controles());
+
+        assert!(finies.is_empty(), "{finies:?}");
+        assert_eq!(inst.lire("airplay-daemon"), elf("airplay-daemon ancien"));
+        assert_eq!(inst.lire("librespot"), elf("librespot ancien"));
+        assert_eq!(inst.restes(), Vec::<String>::new());
+    }
+
+    /// Au premier démarrage de la version neuve, les sauvegardes des
+    /// exécutables livrés partent ; ni `tune-server.old`, ni un dossier, ni
+    /// un fichier étranger ne sont touchés.
+    #[test]
+    fn les_sauvegardes_partent_apres_le_demarrage_de_la_version_neuve_8944() {
+        let inst = Installation::nouvelle();
+        for f in [
+            "airplay-daemon.old",
+            "librespot.old.12-34",
+            "tune-server.old",
+            "ffmpeg.older",
+        ] {
+            std::fs::write(inst.opt.join(f), "x").unwrap();
+        }
+        std::fs::create_dir(inst.opt.join("fpcalc.old")).unwrap();
+
+        let retirees = retirer_les_sauvegardes(&inst.opt, "");
+
+        assert_eq!(retirees.len(), 2, "{retirees:?}");
+        assert!(!inst.opt.join("airplay-daemon.old").exists());
+        assert!(!inst.opt.join("librespot.old.12-34").exists());
+        assert!(inst.opt.join("tune-server.old").exists());
+        assert!(inst.opt.join("ffmpeg.older").exists());
+        assert!(inst.opt.join("fpcalc.old").is_dir());
+    }
 }
 
 /// La liste fixe suit l'archive : chaque exécutable que `release.yml` met

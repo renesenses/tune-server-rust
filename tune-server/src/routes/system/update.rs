@@ -3317,15 +3317,28 @@ pub(super) async fn update_install(
 /// exécutables neufs.
 ///
 /// `exec` (Unix) et la sortie (Windows) ne déroulent aucun destructeur :
-/// `kill_on_drop` n'y joue pas. Chaque `airplay-daemon` sort de lui-même, son
-/// entrée standard se fermant avec le serveur (tube `CLOEXEC`, lecture finie
-/// = boucle finie). `librespot` (Spotify Connect), lui, n'a pas d'entrée
-/// standard : sans cet arrêt il restait en vie, dans l'ancienne version, à
-/// côté de celui que lance le serveur relancé.
+/// `kill_on_drop` n'y joue pas. Chaque `airplay-daemon` sortirait de
+/// lui-même, son entrée standard se fermant avec le serveur (tube `CLOEXEC`,
+/// lecture finie = boucle finie) ; il est arrêté explicitement quand même,
+/// par l'arrêt de sa sortie. `librespot` (Spotify Connect), lui, n'a pas
+/// d'entrée standard : sans cet arrêt il restait en vie, dans l'ancienne
+/// version, à côté de celui que lance le serveur relancé.
 ///
 /// `disable` n'agit qu'en mémoire (l'image va être remplacée) : le réglage
 /// enregistré reste, et le serveur relancé ré-expose le récepteur.
 async fn arreter_les_demons_avant_la_relance(state: &AppState) {
+    // Les sorties AirPlay 2 arrêtent leur démon (`stop` le tue) ; prises
+    // sous le verrou du registre, arrêtées une fois le verrou relâché.
+    let airplay2: Vec<_> = {
+        let registre = state.outputs.lock().await;
+        registre
+            .list()
+            .into_iter()
+            .filter(|id| registre.type_of(id).as_deref() == Some("airplay2"))
+            .filter_map(|id| registre.get(&id))
+            .collect()
+    };
+    tune_core::outputs::registry::arreter_les_sorties_retirees(airplay2).await;
     state.spotify_connect.disable().await;
 }
 
@@ -3989,9 +4002,13 @@ fn windows_update_bat(
     // #8944 — les exécutables livrés (`airplay-daemon.exe`, `librespot.exe`…)
     // basculent après `web/`, avant le binaire, une fois le serveur sorti.
     // Windows laisse renommer un exécutable en cours (un démon resté en vie),
-    // pas le supprimer : l'ancien part donc en `.old` par `move`. Un échec
-    // remet ceux déjà basculés et `web/`, puis relance l'ancienne version
-    // (`:bundled_failed`). Un `.old` encore tenu reste à côté, sans gêner.
+    // pas le supprimer : l'ancien part donc en `.old` par `move`. Un `.old`
+    // précédent qui ne se supprime pas (un ffmpeg orphelin qui tourne encore
+    // depuis lui) ou qui est un dossier est écarté sous un nom unique
+    // (`.old.<aléa>`), et la bascule continue. Un échec réel (cible ou `.old`
+    // impossible à déplacer) remet ceux déjà basculés et `web/`, puis relance
+    // l'ancienne version (`:bundled_failed`). Les `.old` restants sont retirés
+    // au premier démarrage de la version neuve.
     let mut bascule_livres = String::new();
     let mut restaure_livres = String::new();
     let mut nettoie_livres = String::new();
@@ -3999,7 +4016,10 @@ fn windows_update_bat(
         let (cible, neuf, ancien) = (&d.cible, &d.neuf, &d.ancien);
         bascule_livres.push_str(&format!(
             "if not exist \"{neuf}\" goto bundled_done_{i}\r\n\
+             if exist \"{ancien}\\\" goto bundled_park_old_{i}\r\n\
              if exist \"{ancien}\" del /f /q \"{ancien}\" >nul 2>&1\r\n\
+             :bundled_park_old_{i}\r\n\
+             if exist \"{ancien}\" move /y \"{ancien}\" \"{ancien}.%RANDOM%%RANDOM%\" >nul 2>&1\r\n\
              if exist \"{ancien}\" goto bundled_failed\r\n\
              if not exist \"{cible}\" goto bundled_place_{i}\r\n\
              move /y \"{cible}\" \"{ancien}\" >nul 2>&1\r\n\
@@ -4017,6 +4037,8 @@ fn windows_update_bat(
             "if exist \"{neuf}\" goto bundled_restored_{i}\r\n\
              if not exist \"{ancien}\" goto bundled_restored_{i}\r\n\
              del /f /q \"{cible}\" >nul 2>&1\r\n\
+             if exist \"{cible}\" move /y \"{cible}\" \"{cible}.rejected.%RANDOM%%RANDOM%\" >nul 2>&1\r\n\
+             if exist \"{cible}\" goto bundled_restored_{i}\r\n\
              move /y \"{ancien}\" \"{cible}\" >nul 2>&1\r\n\
              :bundled_restored_{i}\r\n"
         ));
@@ -4672,6 +4694,28 @@ fn swap_took(expected: &str, actual: &str) -> Option<bool> {
 ///
 /// Aucune erreur n'est propagee : ne pas savoir d'ou l'on vient ne doit pas
 /// empecher un serveur de demarrer.
+/// Le dossier du binaire INSTALLÉ (jamais celui d'un `.old` qui tourne).
+fn dossier_du_binaire_installe() -> Option<std::path::PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    crate::binaire_installe::chemin_d_installation(&exe)
+        .parent()
+        .map(std::path::Path::to_path_buf)
+}
+
+/// #8944 — finit, au démarrage, la bascule des exécutables livrés qu'un
+/// arrêt de la machine a coupée ([`compagnons::finir_les_bascules_interrompues`]).
+#[cfg(unix)]
+pub(crate) fn finir_une_mise_a_jour_interrompue() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let binaire = crate::binaire_installe::chemin_d_installation(&exe);
+    compagnons::finir_les_bascules_interrompues(
+        &binaire,
+        &installation_sure::Controles::de_cette_machine(None),
+    );
+}
+
 pub fn noter_la_version_vue(state: &AppState) {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let courante = tune_core::version();
@@ -4683,6 +4727,11 @@ pub fn noter_la_version_vue(state: &AppState) {
             "version_changed_since_last_start"
         );
         let _ = settings.set(CLE_VERSION_PRECEDENTE, &precedente);
+        // #8944 — la version neuve a démarré : les sauvegardes des
+        // exécutables livrés de la mise à jour n'ont plus d'usage.
+        if let Some(dir) = dossier_du_binaire_installe() {
+            compagnons::retirer_les_sauvegardes(&dir, std::env::consts::EXE_SUFFIX);
+        }
     }
     // Ecrite a CHAQUE demarrage, y compris le tout premier : c'est elle qui
     // fera la comparaison la prochaine fois.
@@ -8442,6 +8491,13 @@ mod executables_livres_8944_tests {
         assert!(arret < exec && arret < lanceur);
 
         let fonction = corps(source, "async fn arreter_les_demons_avant_la_relance(");
+        // Relecture de #8954 (B1) : les sorties AirPlay 2, donc leur démon,
+        // sont arrêtées explicitement elles aussi.
+        assert!(
+            fonction.contains("Some(\"airplay2\")")
+                && fonction.contains("arreter_les_sorties_retirees(airplay2).await"),
+            "{fonction}"
+        );
         assert!(
             fonction.contains("spotify_connect.disable().await"),
             "{fonction}"
@@ -8457,5 +8513,65 @@ mod executables_livres_8944_tests {
             dernier_arret.is_some_and(|i| i > debut_bloc),
             "la sortie Windows n'arrête pas les démons"
         );
+    }
+
+    /// Relecture de #8954 — un `.old` précédent qui ne se supprime pas (tenu
+    /// par un orphelin) ou qui est un dossier est écarté sous un nom unique
+    /// AVANT d'abandonner ; la remise ne déplace l'ancien que si la cible a
+    /// bien été libérée.
+    #[test]
+    fn un_ancien_old_tenu_est_ecarte_sans_echec_8944() {
+        let s = script_avec_livres();
+        let ancien = chemin("airplay-daemon.exe.old");
+        let dossier = s
+            .find(&format!("if exist \"{ancien}\\\" goto bundled_park_old_0"))
+            .unwrap_or_else(|| panic!("un .old dossier n'est pas contourné : {s}"));
+        let suppression = s.find(&format!("del /f /q \"{ancien}\"")).unwrap();
+        let ecart = s
+            .find(&format!(
+                "move /y \"{ancien}\" \"{ancien}.%RANDOM%%RANDOM%\""
+            ))
+            .unwrap_or_else(|| panic!("un .old tenu n'est pas écarté : {s}"));
+        let abandon = s
+            .find(&format!("if exist \"{ancien}\" goto bundled_failed"))
+            .unwrap();
+        assert!(
+            dossier < suppression && suppression < ecart && ecart < abandon,
+            "{s}"
+        );
+
+        let echec = s.find(":bundled_failed").unwrap();
+        let cible = chemin("airplay-daemon.exe");
+        let garde = s[echec..]
+            .find(&format!("if exist \"{cible}\" goto bundled_restored_0"))
+            .unwrap_or_else(|| panic!("remise sans garde sur la cible : {s}"));
+        let remise = s[echec..]
+            .find(&format!("move /y \"{ancien}\" \"{cible}\""))
+            .unwrap();
+        assert!(garde < remise, "{s}");
+    }
+
+    /// Le démarrage finit une bascule coupée (Unix, avant tout démon) et la
+    /// version neuve, une fois démarrée, retire les sauvegardes.
+    #[test]
+    fn le_demarrage_finit_et_nettoie_8944() {
+        let bootstrap = include_str!("../../bootstrap.rs");
+        let reparer = bootstrap
+            .find("reparer_un_lancement_depuis_la_sauvegarde();")
+            .unwrap();
+        let finir = bootstrap
+            .find("crate::routes::system::update::finir_une_mise_a_jour_interrompue();")
+            .expect("le démarrage ne finit pas les bascules coupées");
+        let etat = bootstrap.find("crate::startup::init_state(").unwrap();
+        assert!(reparer < finir && finir < etat);
+
+        let source = include_str!("update.rs");
+        let noter = corps(source, "pub fn noter_la_version_vue(");
+        let changement = noter.find("version_precedente(").unwrap();
+        let nettoyage = noter
+            .find("compagnons::retirer_les_sauvegardes(")
+            .expect("les sauvegardes ne sont jamais retirées");
+        let ecriture = noter.find("settings.set(CLE_VERSION_VUE").unwrap();
+        assert!(changement < nettoyage && nettoyage < ecriture, "{noter}");
     }
 }
