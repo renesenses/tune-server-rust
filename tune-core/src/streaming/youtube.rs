@@ -65,6 +65,10 @@ pub struct ClientOAuth {
     pub scope: &'static str,
     /// Vrai pour le client de repli (YouTube TV public).
     pub repli: bool,
+    /// D'où vient le client : `"execution"` (variables d'environnement du
+    /// processus), `"compilation"` (figé dans le binaire par la CI) ou
+    /// `"repli"`. Pour le journal seulement (#8904).
+    pub origine: &'static str,
 }
 
 impl ClientOAuth {
@@ -82,20 +86,44 @@ impl ClientOAuth {
             (Some(id), Some(secret)) => Some((id.to_string(), secret.to_string())),
             _ => None,
         };
-        match complet(execution).or_else(|| complet(compilation)) {
-            Some((id, secret)) => Self {
-                id,
-                secret,
-                scope: GOOGLE_SCOPE_LECTURE,
-                repli: false,
-            },
-            None => Self {
-                id: GOOGLE_CLIENT_ID.into(),
-                secret: GOOGLE_CLIENT_SECRET.into(),
-                scope: GOOGLE_SCOPE,
-                repli: true,
-            },
+        let tune = |(id, secret): (String, String), origine| Self {
+            id,
+            secret,
+            scope: GOOGLE_SCOPE_LECTURE,
+            repli: false,
+            origine,
+        };
+        if let Some(paire) = complet(execution) {
+            tune(paire, "execution")
+        } else if let Some(paire) = complet(compilation) {
+            tune(paire, "compilation")
+        } else {
+            Self::repli()
         }
+    }
+
+    /// Le client de repli « YouTube TV » public, portée complète.
+    pub fn repli() -> Self {
+        Self {
+            id: GOOGLE_CLIENT_ID.into(),
+            secret: GOOGLE_CLIENT_SECRET.into(),
+            scope: GOOGLE_SCOPE,
+            repli: true,
+            origine: "repli",
+        }
+    }
+
+    /// `"tune"` ou `"repli"` : ce que le journal et la ligne de jetons
+    /// enregistrent, jamais l'identifiant lui-même (#8904).
+    pub fn libelle(&self) -> &'static str {
+        if self.repli { "repli" } else { "tune" }
+    }
+
+    /// Les huit premiers caractères de l'identifiant, suivis de « … » : assez
+    /// pour reconnaître le client dans un rapport, pas assez pour le recopier.
+    pub fn id_abrege(&self) -> String {
+        let debut: String = self.id.chars().take(8).collect();
+        format!("{debut}…")
     }
 
     /// Le client de ce processus : environnement, puis valeurs de compilation.
@@ -608,6 +636,12 @@ pub struct YouTubeService {
     data_api_base: String,
     /// Client OAuth Google de la connexion au compte (#5247).
     oauth: ClientOAuth,
+    /// Le client qui a DÉLIVRÉ le jeton de rafraîchissement en cours (#8904).
+    /// Un jeton n'est rafraîchissable que par le client qui l'a émis : quand
+    /// un binaire passe du repli au client de Tune, les comptes déjà connectés
+    /// gardent leur client d'origine jusqu'à la prochaine connexion, au lieu
+    /// d'être déconnectés au premier rafraîchissement.
+    client_du_jeton: ClientOAuth,
     enabled_override: Option<bool>,
 
     // -- OAuth state ----------------------------------------------------------
@@ -638,6 +672,16 @@ impl YouTubeService {
         let api_key = std::env::var("TUNE_YOUTUBE_API_KEY")
             .ok()
             .filter(|k| !k.is_empty());
+        let oauth = ClientOAuth::depuis_l_environnement();
+        // #8904 — quel client est présenté à Google, sans l'identifiant entier.
+        info!(
+            client = oauth.libelle(),
+            origine = oauth.origine,
+            id = %oauth.id_abrege(),
+            repli = oauth.repli,
+            scope = oauth.scope,
+            "youtube_client_oauth"
+        );
 
         Self {
             client: crate::http::client::builder()
@@ -656,11 +700,8 @@ impl YouTubeService {
             api_key,
             ytm_base: YTM_API_BASE.into(),
             data_api_base: YT_API_BASE.into(),
-            oauth: {
-                let c = ClientOAuth::depuis_l_environnement();
-                info!(repli = c.repli, scope = c.scope, "youtube_client_oauth");
-                c
-            },
+            oauth: oauth.clone(),
+            client_du_jeton: oauth,
             enabled_override: None,
             // OAuth — not authenticated until user completes Device Code flow
             access_token: None,
@@ -1461,6 +1502,7 @@ impl YouTubeService {
 
         self.access_token = Some(access_token);
         self.refresh_token = refresh_token;
+        self.client_du_jeton = self.oauth.clone();
         self.token_expires = Some(Instant::now() + Duration::from_secs(expires_in));
         self.pending_device_auth = None;
         self.device_auth_started = None;
@@ -1485,7 +1527,10 @@ impl YouTubeService {
             None => return Ok(false),
         };
 
-        info!("youtube_refreshing_access_token");
+        info!(
+            client = self.client_du_jeton.libelle(),
+            "youtube_refreshing_access_token"
+        );
 
         let resp = self
             .client
@@ -1496,7 +1541,7 @@ impl YouTubeService {
                  &client_secret={}\
                  &refresh_token={refresh_token}\
                  &grant_type=refresh_token",
-                self.oauth.id, self.oauth.secret
+                self.client_du_jeton.id, self.client_du_jeton.secret
             ))
             .send()
             .await
@@ -1541,6 +1586,23 @@ impl YouTubeService {
         } else {
             warn!("youtube_refresh_response_missing_access_token");
             Ok(false)
+        }
+    }
+
+    /// Le client qui a émis le jeton d'une ligne enregistrée (#8904). Une
+    /// ligne sans `client_oauth` date d'avant ce champ : seul le repli
+    /// existait alors dans les binaires publiés. Une ligne « tune » relue par
+    /// un processus SANS client de Tune (build local) n'a pas de client pour
+    /// la rafraîchir : le repli sera refusé par Google, la ligne effacée et
+    /// une nouvelle connexion demandée, comme pour un jeton révoqué.
+    fn client_d_une_ligne(&self, tokens: &serde_json::Value) -> ClientOAuth {
+        match tokens["client_oauth"].as_str() {
+            Some("tune") if !self.oauth.repli => self.oauth.clone(),
+            Some("tune") => {
+                warn!("youtube_jeton_du_client_tune_sans_client_tune");
+                self.oauth.clone()
+            }
+            _ => ClientOAuth::repli(),
         }
     }
 
@@ -3483,6 +3545,7 @@ impl StreamingService for YouTubeService {
         self.refresh_token = None;
         self.token_expires = None;
         self.email = None;
+        self.client_du_jeton = self.oauth.clone();
         self.pending_device_auth = None;
         self.device_auth_started = None;
         self.ligne_a_ecraser = true;
@@ -4135,6 +4198,10 @@ impl StreamingService for YouTubeService {
         if let Some(ref email) = self.email {
             obj["email"] = json!(email);
         }
+        if self.refresh_token.is_some() {
+            // #8904 — le client qui saura rafraîchir ce jeton.
+            obj["client_oauth"] = json!(self.client_du_jeton.libelle());
+        }
 
         // Persist pending device code so a server restart doesn't lose the flow
         if let Some(ref pending) = self.pending_device_auth
@@ -4161,6 +4228,7 @@ impl StreamingService for YouTubeService {
         }
         if let Some(rt) = tokens["refresh_token"].as_str() {
             self.refresh_token = Some(rt.to_string());
+            self.client_du_jeton = self.client_d_une_ligne(tokens);
         }
         if let Some(email) = tokens["email"].as_str() {
             self.email = Some(email.to_string());
@@ -4739,3 +4807,7 @@ mod opus_recherche_6967_tests;
 #[cfg(test)]
 #[path = "youtube_playlist_vl_8426_tests.rs"]
 mod playlist_vl_8426_tests;
+
+#[cfg(test)]
+#[path = "youtube_client_oauth_8904_tests.rs"]
+mod client_oauth_8904_tests;
