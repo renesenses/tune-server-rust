@@ -2483,6 +2483,68 @@ mod tests {
         assert_eq!(debuts(&db, &image), vec![0, 2_000]);
     }
 
+    /// #9014 — un album scanné AVANT le correctif garde en base les bornes que
+    /// l'`INDEX 02` avait faussées. Le scan suivant relit la feuille (même
+    /// inchangée : l'étape CUE ne passe pas par le pré-filtre incrémental), et
+    /// la confrontation remet tout d'aplomb : la tranche née de l'`INDEX 02`
+    /// part, celle de l'`INDEX 01` la remplace, et la piste d'avant retrouve
+    /// sa fin.
+    #[test]
+    fn le_scan_suivant_corrige_les_bornes_faussees_par_un_index_02_9014() {
+        let d = tempfile::TempDir::new().unwrap();
+        let (dossier, image) = album_simple(d.path());
+        let db = base_fichier(d.path());
+        // Ce que l'ancien parseur rangeait : la piste 2 commençait à son
+        // INDEX 02 (00:02:00) au lieu de son INDEX 01 (00:01:00).
+        fs::write(
+            dossier.join("album.cue"),
+            FEUILLE.replace("INDEX 01 00:01:00", "INDEX 01 00:02:00"),
+        )
+        .unwrap();
+        inventorier_et_ecrire(
+            db.clone(),
+            std::slice::from_ref(&dossier),
+            &racines(d.path()),
+        );
+        assert_eq!(
+            debuts(&db, &image),
+            vec![0, 2_000],
+            "montage : base faussée"
+        );
+
+        // La feuille réelle, telle qu'elle est sur le disque.
+        fs::write(
+            dossier.join("album.cue"),
+            FEUILLE.replace(
+                "INDEX 01 00:01:00",
+                "INDEX 00 00:00:50\n    INDEX 01 00:01:00\n    INDEX 02 00:02:00",
+            ),
+        )
+        .unwrap();
+        let vus = vec![image.clone()];
+        let (_, bilan, _) = inventorier_ecrire_et_confronter(
+            db.clone(),
+            &[dossier],
+            &racines(d.path()),
+            &ConfrontationDuScan {
+                fichiers_vus: &vus,
+                trop_massive: &jamais,
+            },
+        );
+        assert_eq!(bilan.tranches_retirees, 1, "bilan : {bilan:?}");
+        assert_eq!(debuts(&db, &image), vec![0, 1_000]);
+        let repo = TrackRepo::with_backend(db.clone());
+        let media = image.to_string_lossy();
+        let aria = repo.get_by_cue_identity(&media, 0).unwrap().unwrap();
+        assert_eq!(
+            aria.cue_end_ms,
+            Some(1_000),
+            "fin de la piste 1 = INDEX 01 de la 2"
+        );
+        let variatio = repo.get_by_cue_identity(&media, 1_000).unwrap().unwrap();
+        assert_eq!(variatio.cue_end_ms, None);
+    }
+
     /// #5108 — feuille supprimée : le dossier n'est confronté que si le
     /// parcours a vu son image. Hors du parcours (scan ciblé ailleurs, dossier
     /// exclu), rien n'est touché.
