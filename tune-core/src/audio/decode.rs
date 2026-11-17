@@ -2763,7 +2763,9 @@ fn decode_to_pcm_streaming_inner(
     // #8968 — amorce et remplissage AAC (voir `rognage_aac`).
     let rognage = rognage_aac(file_path, &audio_params, decode_le_fichier);
     let trames_annoncees = if seek_s <= 0.0 {
-        rognage.and_then(|r| r.utiles).or(track.num_frames)
+        rognage
+            .and_then(|r| r.trames_annoncees())
+            .or(track.num_frames)
     } else {
         None
     };
@@ -3335,7 +3337,9 @@ fn ape_start_position(
     if seek_s <= 0.0 {
         return Ok((0, 0));
     }
-    let start_sample = (seek_s * header.sample_rate as f64) as u64;
+    // #8968 — plancher tolérant : un départ exact `n / cadence` (tranche CUE
+    // d'une image APE) tombe sur `n`, pas sur `n − 1`.
+    let start_sample = (seek_s * header.sample_rate as f64 + PLANCHER_TOLERANT) as u64;
     if start_sample == 0 {
         return Ok((0, 0));
     }
@@ -4022,11 +4026,15 @@ fn rognage_aac(
 /// exact `n / cadence` (borne de tranche CUE convertie à l'échantillon) vaut
 /// `n − ε` une fois en flottant. Sans cette marge, la troncature tombait sur
 /// `n − 1`. Un millionième de trame ne déplace aucun autre instant.
-const PLANCHER_TOLERANT: f64 = 1e-6;
+pub(crate) const PLANCHER_TOLERANT: f64 = 1e-6;
 
 /// La cible d'un déplacement à `seek_s`. Avec une amorce AAC, la position
 /// demandée se compte en trames UTILES : l'horodatage du conteneur, lui,
 /// compte l'amorce (#8968). Rend aussi le rogneur qui s'applique ensuite.
+///
+/// L'horodatage n'est visé en trames que si l'échelle de la piste est
+/// `1 / cadence` ; une autre échelle (`mdhd` à 90 000, HE-AAC décodé au
+/// cœur) passe par `Time`, à `seek_s` plus la durée de l'amorce.
 ///
 /// #8968 — sans amorce, quand l'échelle de temps de la piste est
 /// `1 / cadence` (FLAC, WAV, AIFF…), la cible est l'horodatage
@@ -4041,7 +4049,21 @@ fn cible_de_recherche(
     rognage: Option<&super::amorce_aac::RognageAac>,
 ) -> (SeekTo, Option<super::amorce_aac::Rogneur>) {
     use super::amorce_aac::Rogneur;
+    let echelle_en_trames = echelle.is_some_and(|e| e.numer.get() == 1 && e.denom.get() == cadence);
     match rognage {
+        Some(r) if !echelle_en_trames => {
+            let trame = (seek_s * f64::from(cadence)).round().max(0.0) as u64;
+            let s = seek_s.max(0.0) + r.amorce as f64 / f64::from(cadence.max(1));
+            let seconds = s as i64;
+            let nanos = ((s - seconds as f64) * 1_000_000_000.0) as u32;
+            (
+                SeekTo::Time {
+                    time: Time::try_new(seconds, nanos).unwrap_or(Time::ZERO),
+                    track_id: Some(track_id),
+                },
+                Some(Rogneur::apres_recherche(r, trame)),
+            )
+        }
         Some(r) => {
             let trame = (seek_s * f64::from(cadence)).round().max(0.0) as u64;
             (
@@ -4052,7 +4074,7 @@ fn cible_de_recherche(
                 Some(Rogneur::apres_recherche(r, trame)),
             )
         }
-        None if echelle.is_some_and(|e| e.numer.get() == 1 && e.denom.get() == cadence) => {
+        None if echelle_en_trames => {
             let trame = (seek_s * f64::from(cadence) + PLANCHER_TOLERANT)
                 .floor()
                 .max(0.0) as i64;
@@ -4174,7 +4196,9 @@ fn decode_symphonia(
     // celle des trames UTILES, pas celle du conteneur.
     let rognage = rognage_aac(file_path, &audio_params, !image_cdda);
     let trames_annoncees = if seek_s <= 0.0 && max_duration_s <= 0.0 {
-        rognage.and_then(|r| r.utiles).or(track.num_frames)
+        rognage
+            .and_then(|r| r.trames_annoncees())
+            .or(track.num_frames)
     } else {
         None
     };
@@ -7190,3 +7214,97 @@ mod fenetre_bornee_sans_copie_2156 {
 #[cfg(test)]
 #[path = "canal_aac_signal_6990_tests.rs"]
 mod canal_aac_signal_6990_tests;
+
+#[cfg(test)]
+mod cible_de_recherche_8968_tests {
+    use super::*;
+    use crate::audio::amorce_aac::RognageAac;
+    use symphonia::core::units::TimeBase;
+
+    const R: RognageAac = RognageAac {
+        amorce: 2_112,
+        utiles: Some(264_600),
+        marge: 0,
+    };
+
+    /// Échelle `1/cadence` : l'horodatage vise la trame utile plus l'amorce.
+    #[test]
+    fn a_l_echelle_de_la_cadence_la_cible_compte_l_amorce_8968() {
+        let (cible, rogneur) =
+            cible_de_recherche(1.0, 1, 44_100, TimeBase::try_new(1, 44_100), Some(&R));
+        assert!(
+            matches!(cible, SeekTo::Timestamp { ts, .. } if ts.get() == 44_100 + 2_112),
+            "horodatage attendu à 44 100 + 2 112 trames"
+        );
+        assert!(rogneur.is_some());
+    }
+
+    /// Échelle `mdhd` différente (90 000) : un horodatage en trames serait
+    /// faux d'un facteur ; la cible passe par `Time`, amorce comprise.
+    #[test]
+    fn une_autre_echelle_passe_par_le_temps_amorce_comprise_8968() {
+        let (cible, rogneur) =
+            cible_de_recherche(1.0, 1, 44_100, TimeBase::try_new(1, 90_000), Some(&R));
+        match cible {
+            SeekTo::Time { time, .. } => {
+                let s = time.as_secs_f64();
+                assert!((s - (1.0 + 2_112.0 / 44_100.0)).abs() < 1e-6, "{s}");
+            }
+            SeekTo::Timestamp { ts, .. } => panic!("Time attendu, rendu Timestamp {}", ts.get()),
+        }
+        let mut r = rogneur.expect("le rogneur borne la fin");
+        assert_eq!(r.garder(1_024, 2), 0..2_048, "l'amorce n'est plus à jeter");
+    }
+}
+
+#[cfg(test)]
+mod depart_exact_ape_wavpack_8968_tests {
+    use super::*;
+
+    fn fixture(nom: &str) -> String {
+        format!("{}/tests/fixtures/{nom}", env!("CARGO_MANIFEST_DIR"))
+    }
+
+    /// #8968 — une trame `k` dont l'instant `k / cadence`, une fois en
+    /// flottant, se retronque en `k − 1`.
+    fn trame_piege(cadence: u32, debut: u64, max: u64) -> u64 {
+        (debut..max)
+            .find(|k| ((*k as f64 / f64::from(cadence)) * f64::from(cadence)) as u64 != *k)
+            .expect("une trame piège existe")
+    }
+
+    /// Un départ exact à l'échantillon (tranche CUE d'une image APE ou
+    /// WavPack) rend la trame `k` elle-même, pas `k − 1`.
+    fn verifier(nom: &str) {
+        let f = fixture(nom);
+        let tout = decode_to_pcm(&f, None, None, 0.0, 0.0).expect("décodage complet");
+        let ch = tout.channels as usize;
+        let total = (tout.samples_i32.len() / ch) as u64;
+        // Au milieu de la piste : loin d'un éventuel silence de tête, où
+        // deux trames voisines seraient égales et le témoin aveugle.
+        let k = trame_piege(tout.sample_rate, total / 2, total - 64);
+        let part = decode_to_pcm(&f, None, None, k as f64 / f64::from(tout.sample_rate), 0.0)
+            .expect("décodage depuis la trame piège");
+        let k = k as usize;
+        assert_eq!(
+            &part.samples_i32[..16 * ch],
+            &tout.samples_i32[k * ch..(k + 16) * ch],
+            "{nom} : le départ à la trame {k} rend une autre trame"
+        );
+        assert_ne!(
+            &tout.samples_i32[(k - 1) * ch..(k + 15) * ch],
+            &tout.samples_i32[k * ch..(k + 16) * ch],
+            "témoin aveugle : trames voisines identiques"
+        );
+    }
+
+    #[test]
+    fn un_depart_ape_exact_a_l_echantillon_8968() {
+        verifier("ape/sine_16s_c3000.ape");
+    }
+
+    #[test]
+    fn un_depart_wavpack_exact_a_l_echantillon_8968() {
+        verifier("wavpack/rip_16_44100_stereo.wv");
+    }
+}

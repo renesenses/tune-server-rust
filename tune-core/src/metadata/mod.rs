@@ -2863,6 +2863,15 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         "tagless_fallback_metadata"
     );
 
+    // #8968 — durée JOUÉE d'un AAC en MP4 (amorce et remplissage retirés),
+    // comme dans `try_read_metadata_unsanitized`.
+    let duree_ms = format
+        .as_deref()
+        .filter(|f| *f == "aac")
+        .and(props.sample_rate())
+        .and_then(|sr| crate::audio::amorce_aac::duree_jouee_ms(path, sr))
+        .unwrap_or(props.duration().as_millis() as u64);
+
     TrackMetadata {
         title,
         album,
@@ -2892,7 +2901,7 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
             .or_else(|| crate::audio::iso9660::taille_et_mtime(path).map(|(t, _)| t)),
         sample_rate: props.sample_rate(),
         channels: props.channels().map(|c| c as u16),
-        duration_ms: Some(props.duration().as_millis() as u64),
+        duration_ms: Some(duree_ms),
         bit_depth: props.bit_depth().map(|b| b as u16).or(probed_bit_depth),
         bpm: None,
         // Aucun tag lu sur ce chemin : ABSENCE, et non « tag a zero ».
@@ -4261,6 +4270,17 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
                     lofty_dur,
                     props.audio_bitrate(),
                 ))
+            } else if m4a_probe.as_ref().is_some_and(|(f, _)| f == "aac") {
+                // #8968 — lofty lit la durée dans `mdhd`, amorce et
+                // remplissage de l'encodeur compris (6,06 s pour 6 s jouées).
+                // La lecture les retire désormais : la bibliothèque affiche
+                // la durée JOUÉE quand le conteneur la dit.
+                Some(
+                    props
+                        .sample_rate()
+                        .and_then(|sr| crate::audio::amorce_aac::duree_jouee_ms(path, sr))
+                        .unwrap_or(lofty_dur),
+                )
             } else {
                 Some(lofty_dur)
             }
