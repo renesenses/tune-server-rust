@@ -57,7 +57,7 @@ pub type Extinction =
 pub struct ArretProgramme {
     /// Actif ou non. Désactivé, l'heure et les jours sont gardés.
     pub enabled: bool,
-    /// Heure locale du serveur, `HH:MM` sur 24 h.
+    /// Heure du fuseau commun aux réveils et à l’arrêt, `HH:MM` sur 24 h.
     pub time: String,
     /// Sept caractères `0`/`1`, lundi en tête (même masque que les réveils).
     #[serde(default = "tous_les_jours")]
@@ -217,10 +217,30 @@ impl PlanificateurArretProgramme {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(INTERVALLE_S));
             loop {
                 ticker.tick().await;
-                let maintenant = chrono::Local::now().naive_local();
-                self.passage(maintenant, &mut derniere).await;
+                self.passage_utc(chrono::Utc::now(), &mut derniere).await;
             }
         })
+    }
+
+    /// Le même fuseau explicite que les réveils, relu à chaque passage.
+    pub async fn passage_utc(
+        &self,
+        instant: chrono::DateTime<chrono::Utc>,
+        derniere: &mut Option<String>,
+    ) -> Vec<i64> {
+        let maintenant = match crate::alarms::alarm_local_time(self.db.as_ref(), instant) {
+            Ok(local) => local,
+            Err(error) => {
+                warn!(error, "scheduled_stop_timezone_unreadable");
+                return Vec::new();
+            }
+        };
+        let avant = derniere.clone();
+        let arretees = self.passage(maintenant.naive_local(), derniere).await;
+        if *derniere != avant {
+            info!(utc = %instant, local_time = %maintenant, "scheduled_stop_due");
+        }
+        arretees
     }
 
     /// Un passage du planificateur à l'instant `maintenant`. Rend les zones

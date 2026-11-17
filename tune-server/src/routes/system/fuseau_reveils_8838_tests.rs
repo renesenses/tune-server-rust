@@ -78,3 +78,28 @@ async fn la_liste_de_reveils_annonce_fuseau_et_prochaine_occurrence_8838() {
     use chrono::Timelike;
     assert_eq!((next.hour(), next.minute()), (11, 10));
 }
+
+#[tokio::test]
+async fn arret_8838_api_annonce_le_meme_fuseau_et_la_prochaine_heure() {
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("alarms_timezone", "Europe/Paris")
+        .unwrap();
+    let reglage =
+        serde_json::from_value(json!({"enabled":true,"time":"23:00","days_of_week":"1111111"}))
+            .unwrap();
+    tune_core::arret_programme::ecrire(&state.backend, reglage).unwrap();
+    let (status, body) = request(
+        &state,
+        "GET",
+        "/api/v1/system/settings/scheduled-stop",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["timezone"], "Europe/Paris");
+    let next =
+        chrono::DateTime::parse_from_rfc3339(body["next_stop_at"].as_str().unwrap()).unwrap();
+    use chrono::Timelike;
+    assert_eq!((next.hour(), next.minute()), (23, 0));
+}

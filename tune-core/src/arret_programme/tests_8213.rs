@@ -457,3 +457,66 @@ async fn une_extinction_refusee_ou_absente_n_empeche_pas_l_arret_de_la_lecture()
         vec![banc.salon]
     );
 }
+
+#[tokio::test]
+async fn arret_8838_fuseau_commun_paris_hiver_ete_et_temoin_utc() {
+    for instant in ["2026-11-17T22:00:00Z", "2026-07-17T21:00:00Z"] {
+        for (fuseau, doit_arreter) in [("Europe/Paris", true), ("UTC", false)] {
+            let banc = Banc::monter().await;
+            SettingsRepo::with_backend(banc.db.clone())
+                .set("alarms_timezone", fuseau)
+                .unwrap();
+            ecrire(&banc.db, reglage("23:00", "1111111", None)).unwrap();
+            banc.jouer(banc.salon).await;
+            let mut derniere = None;
+            let arretees = banc
+                .planificateur
+                .passage_utc(instant.parse().unwrap(), &mut derniere)
+                .await;
+            assert_eq!(
+                arretees.contains(&banc.salon),
+                doit_arreter,
+                "arrêt à23h dans {fuseau} depuis {instant}"
+            );
+            assert_eq!(
+                banc.etat(banc.salon).await == PlayState::Stopped,
+                doit_arreter
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn arret_8838_jour_local_et_heure_doublee() {
+    let banc = Banc::monter().await;
+    SettingsRepo::with_backend(banc.db.clone())
+        .set("alarms_timezone", "Europe/Paris")
+        .unwrap();
+    ecrire(&banc.db, reglage("00:30", "0100000", None)).unwrap();
+    banc.jouer(banc.salon).await;
+    let mut derniere = None;
+    // Mardi à Paris, lundi en UTC.
+    assert_eq!(
+        banc.planificateur
+            .passage_utc("2026-11-16T23:30:00Z".parse().unwrap(), &mut derniere)
+            .await,
+        vec![banc.salon]
+    );
+    ecrire(&banc.db, reglage("02:30", "0000001", None)).unwrap();
+    banc.jouer(banc.salon).await;
+    derniere = None;
+    assert_eq!(
+        banc.planificateur
+            .passage_utc("2026-10-25T00:30:00Z".parse().unwrap(), &mut derniere)
+            .await,
+        vec![banc.salon]
+    );
+    banc.jouer(banc.salon).await;
+    assert!(
+        banc.planificateur
+            .passage_utc("2026-10-25T01:30:00Z".parse().unwrap(), &mut derniere)
+            .await
+            .is_empty()
+    );
+    assert_eq!(banc.etat(banc.salon).await, PlayState::Playing);
+}

@@ -66,7 +66,14 @@ fn flag(alarm: &serde_json::Value, key: &str) -> bool {
         .unwrap_or_else(|| alarm[key].as_i64().unwrap_or(0) != 0)
 }
 fn alarm_time(alarm: &serde_json::Value) -> Option<NaiveTime> {
-    NaiveTime::parse_from_str(alarm["time"].as_str()?, "%H:%M").ok()
+    // Les anciennes écritures peuvent porter des secondes : le planificateur
+    // historique lit les deux premiers champs et sonne à la minute.
+    let mut fields = alarm["time"].as_str()?.split(':');
+    NaiveTime::from_hms_opt(
+        fields.next()?.parse().ok()?,
+        fields.next()?.parse().ok()?,
+        0,
+    )
 }
 
 /// Une décision pour l’occurrence du jour ; le planificateur garde les ids
@@ -227,6 +234,15 @@ mod schedule_tests {
             assert_eq!(
                 decision(&alarm("11:10"), "UTC", utc(instant)).unwrap(),
                 Decision::Wait
+            );
+        }
+    }
+    #[test]
+    fn reveil_8838_horaires_historiques_avec_secondes() {
+        for time in ["11:10", "11:10:00", "11:10:30"] {
+            assert_eq!(
+                decision(&alarm(time), "Europe/Paris", utc("2026-11-17T10:10:00Z")).unwrap(),
+                Decision::Ring
             );
         }
     }

@@ -3179,25 +3179,35 @@ pub(super) async fn set_default_zone(
 }
 
 /// #8213 — la réponse commune des routes de l'arrêt programmé : le réglage
-/// (ou `null`), la prochaine échéance en heure locale du serveur, et
+/// (ou `null`), la prochaine échéance dans le fuseau commun, et
 /// `poweroff_available` : l'action « éteindre la machine » est-elle permise
 /// ici (Tune OS seulement) ? L'écran ne propose le choix que si `true`.
 fn reponse_arret_programme(
     reglage: Option<tune_core::arret_programme::ArretProgramme>,
-) -> Json<Value> {
-    let prochain = reglage.as_ref().and_then(|r| {
-        r.prochaine_echeance(chrono::Local::now().naive_local())
-            .map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string())
-    });
-    Json(json!({
+    db: &dyn tune_core::db::backend::DbBackend,
+) -> Result<Json<Value>, AppError> {
+    let timezone = tune_core::alarms::read_alarm_timezone(db).map_err(AppError::internal)?;
+    let prochain = reglage
+        .as_ref()
+        .map(|r| tune_core::alarms::next_alarm_at(&json!(r), &timezone, chrono::Utc::now()))
+        .transpose()
+        .map_err(AppError::internal)?
+        .flatten();
+    Ok(Json(json!({
         "scheduled_stop": reglage,
         "next_stop_at": prochain,
+        "timezone": timezone,
         "poweroff_available": crate::routes::appliance::is_appliance(),
-    }))
+    })))
 }
 
-pub(super) async fn get_scheduled_stop(State(state): State<AppState>) -> Json<Value> {
-    reponse_arret_programme(tune_core::arret_programme::lire(&state.backend))
+pub(super) async fn get_scheduled_stop(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    reponse_arret_programme(
+        tune_core::arret_programme::lire(&state.backend),
+        state.backend.as_ref(),
+    )
 }
 
 /// Pose l'arrêt programmé. Réservé à l'administrateur : il arrête la lecture
@@ -3231,7 +3241,7 @@ pub(super) async fn set_scheduled_stop(
             .into_response();
     }
     match tune_core::arret_programme::ecrire(&state.backend, body) {
-        Ok(r) => reponse_arret_programme(Some(r)).into_response(),
+        Ok(r) => reponse_arret_programme(Some(r), state.backend.as_ref()).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
     }
 }
@@ -3241,7 +3251,7 @@ pub(super) async fn delete_scheduled_stop(
     State(state): State<AppState>,
 ) -> axum::response::Response {
     match tune_core::arret_programme::effacer(&state.backend) {
-        Ok(()) => reponse_arret_programme(None).into_response(),
+        Ok(()) => reponse_arret_programme(None, state.backend.as_ref()).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e })),
