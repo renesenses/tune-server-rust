@@ -2479,6 +2479,8 @@ impl StreamingService for SpotifyService {
         genre_id: &str,
         limit: usize,
     ) -> Result<Vec<StreamAlbum>, TuneError> {
+        // L'API Web de Spotify répond 400 « Invalid limit » au-delà de 50.
+        let limit = limit.min(50);
         let Some(data) = self
             .lire_ou_retire(
                 &format!("/browse/categories/{genre_id}/playlists?limit={limit}"),
