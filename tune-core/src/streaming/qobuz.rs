@@ -3660,9 +3660,13 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_track(&self, track_id: &str) -> Result<StreamTrack, TuneError> {
+        // #8892 — un titre que Qobuz ne connaît plus (404) est `NotFound`,
+        // comme la fiche d'un artiste (#992) : la playlist le montre
+        // indisponible, avec la fiche qu'elle avait mémorisée.
         let data = self
-            .api_get("/track/get", &[("track_id", track_id)])
-            .await?;
+            .api_get_avec_statut("/track/get", &[("track_id", track_id)])
+            .await
+            .map_err(erreur_de_fiche)?;
         Ok(Self::map_track(&data))
     }
 
@@ -5893,6 +5897,53 @@ mod tests {
         );
 
         let refus = svc.get_artist("mal-forme").await.unwrap_err();
+        assert!(
+            !matches!(refus, TuneError::NotFound(_)),
+            "un 400 n'est pas « introuvable » : {refus:?}"
+        );
+    }
+
+    /// #8892 — un titre retiré du catalogue Qobuz (404 sur `/track/get`) est
+    /// `NotFound` : la playlist le grise avec sa fiche mémorisée. Un 400
+    /// reste une erreur ordinaire (ne pas conclure « indisponible »).
+    #[tokio::test]
+    async fn titre_retire_de_qobuz_est_un_not_found_8892() {
+        use axum::Router;
+        use axum::extract::Query;
+        use axum::http::StatusCode;
+        use axum::routing::get;
+        use std::collections::HashMap;
+
+        let app = Router::new().route(
+            "/track/get",
+            get(|Query(q): Query<HashMap<String, String>>| async move {
+                match q.get("track_id").map(String::as_str) {
+                    Some("retire") => (
+                        StatusCode::NOT_FOUND,
+                        r#"{"status":"error","code":404,"message":"No result matching given argument"}"#,
+                    ),
+                    _ => (
+                        StatusCode::BAD_REQUEST,
+                        r#"{"status":"error","code":400,"message":"Invalid argument"}"#,
+                    ),
+                }
+            }),
+        );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        let svc = QobuzService::avec_base_forcee(format!("http://{adresse}"));
+
+        let retire = svc.get_track("retire").await.unwrap_err();
+        assert!(
+            matches!(retire, TuneError::NotFound(_)),
+            "un titre retiré de Qobuz : {retire:?}"
+        );
+        let refus = svc.get_track("mal-forme").await.unwrap_err();
         assert!(
             !matches!(refus, TuneError::NotFound(_)),
             "un 400 n'est pas « introuvable » : {refus:?}"

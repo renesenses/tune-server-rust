@@ -2727,3 +2727,7 @@ mod import_audirvana_6998_tests;
 #[cfg(test)]
 #[path = "playlists/durees_titres_de_service_tests.rs"]
 mod durees_titres_de_service_tests;
+
+#[cfg(test)]
+#[path = "playlists/fiche_memorisee_8892_tests.rs"]
+mod fiche_memorisee_8892_tests;

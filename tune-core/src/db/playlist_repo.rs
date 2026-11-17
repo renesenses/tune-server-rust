@@ -26,6 +26,29 @@ pub mod sql {
         )
     }
 
+    /// #8892 — la fiche d'un titre de service, mémorisée sur ses lignes de
+    /// playlist à chaque résolution réussie : un titre devenu indisponible
+    /// garde l'artiste, l'album, la pochette et la durée de sa dernière fiche.
+    /// Un paramètre nul garde la valeur enregistrée ; le titre n'est jamais
+    /// touché (c'est celui de l'utilisateur ou de son fichier).
+    pub fn memoriser_fiche_de_service<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE playlist_tracks SET artist = COALESCE({}, artist), \
+             album = COALESCE({}, album), \
+             album_source_id = COALESCE({}, album_source_id), \
+             cover_url = COALESCE({}, cover_url), \
+             duration_ms = COALESCE({}, duration_ms) \
+             WHERE source = {} AND source_id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+            d.placeholder(6),
+            d.placeholder(7)
+        )
+    }
+
     pub fn create<D: SqlDialect>(d: &D) -> String {
         format!(
             "INSERT INTO playlists (name, description, profile_id) VALUES ({}, {}, {})",
@@ -312,6 +335,18 @@ pub struct ServiceEntry {
     pub album_source_id: Option<String>,
     pub duration_ms: Option<i64>,
     pub cover_url: Option<String>,
+}
+
+/// #8892 — ce qu'une résolution réussie apprend d'un titre de service, à
+/// mémoriser sur ses lignes de playlist
+/// ([`PlaylistRepo::memoriser_fiche_de_service`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FicheDeService {
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub album_source_id: Option<String>,
+    pub cover_url: Option<String>,
+    pub duration_ms: Option<i64>,
 }
 
 impl ServiceEntry {
@@ -1057,6 +1092,52 @@ impl PlaylistRepo {
             &duration_ms,
             &album_source_id,
             &playlist_id,
+            &source,
+            &source_id,
+        ];
+        self.db.execute(&sql, &params)
+    }
+
+    /// #8892 — mémorise la fiche `fiche` du titre `source`/`source_id` sur
+    /// TOUTES ses lignes de playlist (la fiche est celle du catalogue du
+    /// service, la même pour chaque playlist). Les champs `None` ou vides
+    /// gardent la valeur enregistrée ; une durée nulle aussi. Rend le nombre
+    /// de lignes réécrites.
+    pub fn memoriser_fiche_de_service(
+        &self,
+        source: &str,
+        source_id: &str,
+        fiche: &FicheDeService,
+    ) -> Result<usize, String> {
+        let texte = |v: &Option<String>| {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned)
+        };
+        let artist = texte(&fiche.artist);
+        let album = texte(&fiche.album);
+        let album_source_id = texte(&fiche.album_source_id);
+        let cover_url = texte(&fiche.cover_url);
+        let duration_ms = fiche.duration_ms.filter(|d| *d > 0);
+        if artist.is_none()
+            && album.is_none()
+            && album_source_id.is_none()
+            && cover_url.is_none()
+            && duration_ms.is_none()
+        {
+            return Ok(0);
+        }
+        let sql = self.dialect_sql(
+            sql::memoriser_fiche_de_service,
+            sql::memoriser_fiche_de_service,
+        );
+        let params: [&dyn ToSqlValue; 7] = [
+            &artist,
+            &album,
+            &album_source_id,
+            &cover_url,
+            &duration_ms,
             &source,
             &source_id,
         ];
