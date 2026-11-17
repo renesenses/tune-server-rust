@@ -1997,6 +1997,10 @@ struct SaveAsPlaylistRequest {
 struct QueueMoveRequest {
     from_position: i64,
     to_position: i64,
+    /// Absent chez les anciens clients : déplacement d'une seule ligne.
+    count: Option<i64>,
+    /// Identifiants bruts queue_items.id dans l'ordre vu par le client.
+    expected_order: Option<Vec<i64>>,
 }
 
 #[derive(Deserialize)]
@@ -5771,7 +5775,7 @@ async fn get_queue(
             v
         })
         .collect();
-    let mut corps = json!({ "tracks": tracks, "position": position, "length": length });
+    let mut corps = json!({ "tracks": tracks, "position": position, "length": length, "block_move_supported": true });
     if let Some((offset, limit)) = demandee {
         // Champs ADDITIFS, présents seulement quand une fenêtre est demandée.
         corps["offset"] = json!(offset);
@@ -6496,24 +6500,39 @@ async fn queue_move(
     Path(zone_id): Path<i64>,
     Json(body): Json<QueueMoveRequest>,
 ) -> impl IntoResponse {
-    // Queue order changed — invalidate prefetched track
-    state.orchestrator.clear_prefetch().await;
+    use tune_core::db::play_queue_repo::ErreurDeplacementBloc;
     let queue_repo = PlayQueueRepo::with_backend(state.backend.clone());
-    let total = queue_repo.count_all(zone_id).unwrap_or(0);
     let from = body.from_position;
     let to = body.to_position;
-    if from < 0 || to < 0 || from >= total || to >= total {
-        return (StatusCode::BAD_REQUEST, "position out of range").into_response();
-    }
-    // Unified move: reorders across the whole queue (local + streaming), which
-    // the old local-only path could not do.
-    if let Err(e) = queue_repo.move_pos(zone_id, from, to) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
-    }
+    let count = body.count.unwrap_or(1);
+    let (avant, apres) =
+        match queue_repo.deplacer_bloc(zone_id, from, to, count, body.expected_order.as_deref()) {
+            Ok(ordre) => ordre,
+            Err(ErreurDeplacementBloc::Bornes) => {
+                return (StatusCode::BAD_REQUEST, "queue block out of range").into_response();
+            }
+            Err(ErreurDeplacementBloc::OrdrePerime) => {
+                return (
+                    StatusCode::CONFLICT,
+                    "queue order changed; reload the queue",
+                )
+                    .into_response();
+            }
+            Err(ErreurDeplacementBloc::Stockage(e)) => {
+                return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+            }
+        };
+    // La ligne courante conserve son identité SQL. Le curseur mémoire suit
+    // la même permutation, y compris quand un bloc traverse sa position.
+    state
+        .playback
+        .reordonner_curseur_de_file(zone_id, &avant, &apres)
+        .await;
+    state.orchestrator.clear_prefetch().await;
     persist_queue_async(&state, zone_id);
     state.event_bus.emit(
         "playback.queue.moved",
-        json!({ "zone_id": zone_id, "from": from, "to": to }),
+        json!({ "zone_id": zone_id, "from": from, "to": to, "count": count }),
     );
     StatusCode::NO_CONTENT.into_response()
 }
@@ -11766,3 +11785,7 @@ mod echec_transfert_6155_tests;
 #[cfg(test)]
 #[path = "playback/remplacement_volontaire_7247_tests.rs"]
 mod remplacement_volontaire_7247_tests;
+
+#[cfg(test)]
+#[path = "playback/deplacement_bloc_8849_tests.rs"]
+mod deplacement_bloc_8849_tests;
