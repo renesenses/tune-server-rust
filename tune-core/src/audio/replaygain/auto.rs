@@ -237,7 +237,11 @@ pub fn granularite(
     let (choix, motif) = decider(piste, false, courant, longueur, |r| lignes.get(&r).cloned());
     debug!(
         zone_id,
-        granularite = if choix == ReplayGainMode::Album { "album" } else { "track" },
+        granularite = if choix == ReplayGainMode::Album {
+            "album"
+        } else {
+            "track"
+        },
         motif = motif.as_str(),
         "replaygain_auto"
     );

@@ -67,10 +67,22 @@ fn une_liste_d_albums_differents_garde_le_gain_de_piste() {
 #[test]
 fn une_liste_melee_juge_chaque_piste_par_ses_voisines() {
     let file = vec![locale(1, 10), locale(2, 10), locale(3, 20), locale(4, 30)];
-    assert_eq!(sur_la_file(&file, 0, PisteRg::bibliotheque(1)), ReplayGainMode::Album);
-    assert_eq!(sur_la_file(&file, 1, PisteRg::bibliotheque(2)), ReplayGainMode::Album);
-    assert_eq!(sur_la_file(&file, 2, PisteRg::bibliotheque(3)), ReplayGainMode::Track);
-    assert_eq!(sur_la_file(&file, 3, PisteRg::bibliotheque(4)), ReplayGainMode::Track);
+    assert_eq!(
+        sur_la_file(&file, 0, PisteRg::bibliotheque(1)),
+        ReplayGainMode::Album
+    );
+    assert_eq!(
+        sur_la_file(&file, 1, PisteRg::bibliotheque(2)),
+        ReplayGainMode::Album
+    );
+    assert_eq!(
+        sur_la_file(&file, 2, PisteRg::bibliotheque(3)),
+        ReplayGainMode::Track
+    );
+    assert_eq!(
+        sur_la_file(&file, 3, PisteRg::bibliotheque(4)),
+        ReplayGainMode::Track
+    );
 }
 
 /// La piste ARMÉE pour l'enchaînement (rang suivant) est jugée à SA place
@@ -80,7 +92,10 @@ fn la_piste_armee_est_jugee_a_sa_place() {
     let file = vec![locale(1, 10), locale(2, 20), locale(3, 20)];
     // La piste 1 joue (rang 0), la piste 2 est armée : sa voisine 3 est du
     // même album.
-    assert_eq!(sur_la_file(&file, 0, PisteRg::bibliotheque(2)), ReplayGainMode::Album);
+    assert_eq!(
+        sur_la_file(&file, 0, PisteRg::bibliotheque(2)),
+        ReplayGainMode::Album
+    );
     // Une piste qui n'est ni en cours ni suivante : gain de piste.
     assert_eq!(
         decider(PisteRg::bibliotheque(3), false, Some(0), 3, |r| file
@@ -122,7 +137,10 @@ fn les_titres_de_service_se_comparent_par_la_reference_d_album() {
     assert!(!meme_album(&a, &service("qobuz", "2", Some("alb-8"))));
     assert!(!meme_album(&a, &service("tidal", "2", Some("alb-9"))));
     assert!(!meme_album(&a, &service("qobuz", "2", None)));
-    assert!(!meme_album(&service("qobuz", "1", None), &service("qobuz", "2", None)));
+    assert!(!meme_album(
+        &service("qobuz", "1", None),
+        &service("qobuz", "2", None)
+    ));
     // Local contre service : jamais le même album.
     assert!(!meme_album(&locale(1, 9), &a));
 
@@ -148,12 +166,22 @@ fn le_reglage_auto_se_relit_sans_changer_les_autres() {
 fn sans_zone_auto_vaut_le_gain_de_piste() {
     let backend = base();
     assert_eq!(
-        granularite(&backend, None, PisteRg::bibliotheque(1), ReplayGainMode::Auto),
+        granularite(
+            &backend,
+            None,
+            PisteRg::bibliotheque(1),
+            ReplayGainMode::Auto
+        ),
         ReplayGainMode::Track
     );
     // Hors Auto, le mode passe tel quel.
     assert_eq!(
-        granularite(&backend, Some(1), PisteRg::bibliotheque(1), ReplayGainMode::Album),
+        granularite(
+            &backend,
+            Some(1),
+            PisteRg::bibliotheque(1),
+            ReplayGainMode::Album
+        ),
         ReplayGainMode::Album
     );
 }
@@ -183,7 +211,11 @@ fn le_facteur_de_zone_suit_la_file_en_mode_auto() {
         )
         .unwrap();
     let meta = TrackMetadataRepo::with_backend(backend.clone());
-    for (t, piste, album) in [(1, "-6.00 dB", "-2.00 dB"), (2, "-9.00 dB", "-2.00 dB"), (3, "-4.00 dB", "-1.00 dB")] {
+    for (t, piste, album) in [
+        (1, "-6.00 dB", "-2.00 dB"),
+        (2, "-9.00 dB", "-2.00 dB"),
+        (3, "-4.00 dB", "-1.00 dB"),
+    ] {
         meta.set(t, "rg_track_gain", piste).unwrap();
         meta.set(t, "rg_album_gain", album).unwrap();
         meta.set(t, "rg_track_peak", "0.5").unwrap();
@@ -192,7 +224,10 @@ fn le_facteur_de_zone_suit_la_file_en_mode_auto() {
     SettingsRepo::with_backend(backend.clone())
         .set(MODE_KEY, "auto")
         .unwrap();
-    assert_eq!(ReplayGainSettings::load(&backend).mode, ReplayGainMode::Auto);
+    assert_eq!(
+        ReplayGainSettings::load(&backend).mode,
+        ReplayGainMode::Auto
+    );
 
     // Une zone à part : le registre de l'aléatoire est global au processus.
     let zone = 896_804;
@@ -211,19 +246,31 @@ fn le_facteur_de_zone_suit_la_file_en_mode_auto() {
 
     file.set_current_pos(zone, 0).unwrap();
     let f1 = facteur_de_zone(&backend, zone, PisteRg::bibliotheque(1));
-    assert!(proche(f1, db(-2.0)), "piste 1 : gain d'album attendu, facteur {f1}");
+    assert!(
+        proche(f1, db(-2.0)),
+        "piste 1 : gain d'album attendu, facteur {f1}"
+    );
     // La piste 2, armée pendant que 1 joue : gain d'album (voisine 1).
     let f2 = facteur_de_zone(&backend, zone, PisteRg::bibliotheque(2));
-    assert!(proche(f2, db(-2.0)), "piste 2 armée : gain d'album attendu, facteur {f2}");
+    assert!(
+        proche(f2, db(-2.0)),
+        "piste 2 armée : gain d'album attendu, facteur {f2}"
+    );
 
     file.set_current_pos(zone, 2).unwrap();
     let f3 = facteur_de_zone(&backend, zone, PisteRg::bibliotheque(3));
-    assert!(proche(f3, db(-4.0)), "piste 3 isolée : gain de piste attendu, facteur {f3}");
+    assert!(
+        proche(f3, db(-4.0)),
+        "piste 3 isolée : gain de piste attendu, facteur {f3}"
+    );
 
     // L'aléatoire armé : gain de piste, même au milieu de l'album.
     file.set_current_pos(zone, 0).unwrap();
     noter_aleatoire(zone, true);
     let f1_alea = facteur_de_zone(&backend, zone, PisteRg::bibliotheque(1));
     noter_aleatoire(zone, false);
-    assert!(proche(f1_alea, db(-6.0)), "aléatoire : gain de piste attendu, facteur {f1_alea}");
+    assert!(
+        proche(f1_alea, db(-6.0)),
+        "aléatoire : gain de piste attendu, facteur {f1_alea}"
+    );
 }

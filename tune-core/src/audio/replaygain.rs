@@ -35,6 +35,9 @@ pub mod plage_dynamique;
 /// jauge doit dire après un redémarrage, quand la campagne repart de zéro.
 pub mod bibliotheque;
 
+/// #8968 — le mode Auto : gain d'album entre pistes consécutives d'un même
+/// album, gain de piste sinon.
+pub mod auto;
 /// #5519 — le gain APPROCHÉ tiré d'un rapport `foo_dr.txt`, plafonné par la
 /// crête, quand la piste n'a aucun ReplayGain. Jamais écrit dans un fichier.
 pub mod gain_approche;
@@ -49,9 +52,6 @@ pub mod reessai;
 pub mod remesure;
 /// #8689 — le ReplayGain publié par Qobuz et TIDAL pour leurs titres.
 pub mod services;
-/// #8968 — le mode Auto : gain d'album entre pistes consécutives d'un même
-/// album, gain de piste sinon.
-pub mod auto;
 pub use rattrapage_crete::{ALBUM_TRUE_PEAK_ALGO_KEY, TRUE_PEAK_ALGO, TRUE_PEAK_ALGO_KEY};
 pub use services::PisteRg;
 
