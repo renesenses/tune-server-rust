@@ -495,10 +495,16 @@ async fn une_zone_asio_restauree_sous_wasapi_est_signalee() {
     let a = &corps["avertissement_restauration"];
     assert_eq!(a["code"], "zone_restauree_autre_hote_audio", "{corps}");
     assert_eq!(a["hote_de_la_zone"], "ASIO");
-    assert_eq!(a["hote_actif"], "WASAPI");
+    // L'hôte actif est nommé tel qu'il est sur CETTE plateforme : WASAPI
+    // sous Windows, jamais inventé ailleurs.
+    assert_eq!(
+        a["hote_actif"],
+        nom_d_hote(false, None, cfg!(target_os = "windows")),
+        "{corps}"
+    );
     assert_eq!(a["message_key"], "api.zones.restoredOnOtherAudioHost");
     let m = a["message"].as_str().unwrap();
-    assert!(m.contains("ASIO") && m.contains("WASAPI"), "{m}");
+    assert!(m.contains("ASIO"), "{m}");
 }
 
 /// Contre-épreuve : même zone, Tune réglé en ASIO — rien à signaler.

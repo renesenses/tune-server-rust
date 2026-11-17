@@ -5961,6 +5961,12 @@ mod liberer_la_sortie_8987_tests {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         db.execute_batch(INDEX).unwrap();
+        // La table `settings` naît au démarrage du serveur, pas dans
+        // `init_schema` : même définition que les autres bancs.
+        db.execute_batch(
+            "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT, updated_at TEXT)",
+        )
+        .unwrap();
         epreuve(&ZoneRepo::new(db));
     }
 
