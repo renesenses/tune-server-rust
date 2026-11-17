@@ -2967,6 +2967,13 @@ pub(super) async fn get_env(State(state): State<AppState>) -> Json<Value> {
             .as_deref()
             .and_then(crate::conteneur::identifiant_court)
             .map(str::to_string),
+        // renesenses/tune-server-rust#8747 — le dossier de la base survit-il à
+        // la recréation du conteneur ? `null` hors conteneur ; sinon
+        // `{dir, kind, persistent}`. L'interface montre un bandeau quand
+        // `persistent` est faux (volume anonyme, rien de monté, tmpfs).
+        "data_persistence": crate::persistance_donnees::en_json(
+            crate::persistance_donnees::relever(&state.config.db_path).as_ref()
+        ),
     }))
 }
 
