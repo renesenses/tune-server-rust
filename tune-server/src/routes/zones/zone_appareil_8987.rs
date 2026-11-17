@@ -109,45 +109,48 @@ pub(crate) fn refus_sortie_tenue(
     (StatusCode::CONFLICT, Json(corps)).into_response()
 }
 
-/// Avant l'écriture de `output_device_id` : une zone supprimée qui tient la
-/// sortie la lâche ; une zone active la garde, et c'est un refus nommé.
-pub(crate) fn liberer_la_sortie_demandee(
+/// #8987 — la zone `zone_id` prend `device_id`.
+///
+/// Une zone supprimée qui tient l'appareil le lâche dans LA MÊME transaction
+/// que l'écriture de la nouvelle sortie (`ZoneRepo::prendre_la_sortie`), et
+/// l'appareil lâché est noté pour qu'une restauration le reprenne. Une zone
+/// active qui le tient : refus nommé (409). Un échec d'écriture qui tient à
+/// une zone active (course) : 409 aussi ; sinon l'échec journalisé.
+pub(crate) fn prendre_la_sortie_demandee(
     repo: &ZoneRepo,
     zone_id: i64,
     device_id: &str,
+    rattachement: tune_core::audio::reglages_de_volume::Rattachement<'_>,
 ) -> Result<(), Response> {
-    match constater(repo, zone_id, device_id) {
-        OccupationDeLaSortie::Libre | OccupationDeLaSortie::CetteZone => Ok(()),
+    use tune_core::db::zone_repo::PriseDeSortie;
+    let zone_supprimee = match constater(repo, zone_id, device_id) {
         OccupationDeLaSortie::ZoneActive { id, nom } => {
-            Err(refus_sortie_tenue(zone_id, device_id, id, &nom))
+            return Err(refus_sortie_tenue(zone_id, device_id, id, &nom));
         }
-        OccupationDeLaSortie::ZoneSupprimee(supprimee) => {
-            match repo.liberer_la_sortie_d_une_zone_masquee(supprimee) {
-                Ok(n) if n > 0 => {
-                    info!(
-                        zone_id,
-                        device_id,
-                        zone_supprimee = supprimee,
-                        "sortie_liberee_d_une_zone_supprimee"
-                    );
-                    Ok(())
-                }
-                // Restaurée entre la lecture et l'écriture : elle est
-                // redevenue active, on relit pour la nommer.
-                Ok(_) => match constater(repo, zone_id, device_id) {
-                    OccupationDeLaSortie::ZoneActive { id, nom } => {
-                        Err(refus_sortie_tenue(zone_id, device_id, id, &nom))
-                    }
-                    _ => Ok(()),
-                },
-                Err(e) => Err(super::ecriture::echec_ecriture(
+        OccupationDeLaSortie::ZoneSupprimee(h) => Some(h),
+        OccupationDeLaSortie::Libre | OccupationDeLaSortie::CetteZone => None,
+    };
+    match repo.prendre_la_sortie(zone_id, device_id, zone_supprimee, rattachement) {
+        Ok(PriseDeSortie::Prise { liberee }) => {
+            if let Some(supprimee) = liberee {
+                info!(
                     zone_id,
-                    "output_device_id",
                     device_id,
-                    e,
-                )),
+                    zone_supprimee = supprimee,
+                    "sortie_liberee_d_une_zone_supprimee"
+                );
             }
+            Ok(())
         }
+        // Restaurée entre la lecture et la transaction : rien n'est écrit, on
+        // relit pour la nommer.
+        Ok(PriseDeSortie::ZoneSupprimeeRestauree) => Err(refus_apres_echec(
+            repo,
+            zone_id,
+            device_id,
+            "la zone supprimée qui tenait la sortie a été restaurée".into(),
+        )),
+        Err(e) => Err(refus_apres_echec(repo, zone_id, device_id, e)),
     }
 }
 
@@ -202,8 +205,82 @@ pub(crate) fn restauree_hors_hote_actif(backend_configure: &str, en_asio: Option
     en_asio.is_some_and(|a| a != configure_asio)
 }
 
-fn nom_d_hote(asio: bool) -> &'static str {
-    if asio { "ASIO" } else { "WASAPI" }
+/// Le nom de l'hôte audio, pour la phrase. ASIO n'existe que sous Windows ;
+/// un hôte non-ASIO s'y appelle WASAPI. Ailleurs, l'hôte réel : celui que
+/// nomme l'endpoint (`coreaudio:…`, `alsa:…`) ou celui de la plateforme.
+pub(crate) fn nom_d_hote(asio: bool, endpoint_id: Option<&str>, sur_windows: bool) -> &'static str {
+    use tune_core::outputs::identite_de_sortie::{OrigineDeLIdentifiant, origine_de_l_identifiant};
+    if asio {
+        return "ASIO";
+    }
+    match endpoint_id.map(|e| origine_de_l_identifiant(e.trim())) {
+        Some(OrigineDeLIdentifiant::Wasapi) => "WASAPI",
+        Some(OrigineDeLIdentifiant::CoreAudio) => "CoreAudio",
+        Some(OrigineDeLIdentifiant::Alsa) => "ALSA",
+        _ if sur_windows => "WASAPI",
+        _ if cfg!(target_os = "macos") => "CoreAudio",
+        _ => "ALSA",
+    }
+}
+
+/// #8987 — la zone restaurée avait lâché sa sortie au profit d'une autre zone
+/// (`zone_{id}_sortie_liberee`). Libre : elle la reprend. Tenue par une zone
+/// visible : la zone revient SANS sortie, et l'avertissement nomme la zone qui
+/// l'a reprise. Rend cet avertissement, ou `None`.
+pub(crate) fn reprendre_la_sortie_liberee(repo: &ZoneRepo, zone_id: i64) -> Option<Value> {
+    let sortie = repo.sortie_liberee(zone_id)?;
+    let zone = repo.get(zone_id).ok().flatten()?;
+    if zone.output_device_id.is_some() {
+        // Elle a déjà une sortie : la trace est périmée.
+        let _ = repo.oublier_la_sortie_liberee(zone_id);
+        return None;
+    }
+    let meme = tune_core::audio::reglages_de_volume::Rattachement::MemePeripherique {
+        origine: "restauration_sortie_liberee",
+    };
+    match prendre_la_sortie_demandee(repo, zone_id, &sortie, meme) {
+        Ok(()) => {
+            info!(zone_id, device_id = %sortie, "zone_restauree_reprend_sa_sortie");
+            let _ = repo.oublier_la_sortie_liberee(zone_id);
+            None
+        }
+        Err(_) => {
+            let (id, nom) = match constater(repo, zone_id, &sortie) {
+                OccupationDeLaSortie::ZoneActive { id, nom } => (id, nom),
+                _ => {
+                    warn!(zone_id, device_id = %sortie, "zone_restauree_sortie_non_reprise");
+                    return None;
+                }
+            };
+            warn!(
+                zone_id,
+                device_id = %sortie,
+                zone_occupante = id,
+                "zone_restauree_sortie_reprise_par_une_autre_zone"
+            );
+            Some(crate::message_api::avec_message(
+                json!({
+                    "code": "sortie_reprise_par_une_zone",
+                    "output_device_id": sortie,
+                    "holder_zone_id": id,
+                    "holder_zone_name": nom,
+                }),
+                "api.zones.restoredOutputTakenBy",
+                &[("zone", zone.name.clone()), ("holder", nom.clone())],
+            ))
+        }
+    }
+}
+
+/// Ce que la liste des zones supprimées dit d'une zone qui a lâché sa
+/// sortie : l'appareil, et la zone qui le tient maintenant (s'il y en a une).
+pub(crate) fn sortie_liberee_de_la_liste(repo: &ZoneRepo, zone_id: i64) -> Option<Value> {
+    let sortie = repo.sortie_liberee(zone_id)?;
+    let reprise = match constater(repo, zone_id, &sortie) {
+        OccupationDeLaSortie::ZoneActive { id, nom } => json!({ "id": id, "name": nom }),
+        _ => Value::Null,
+    };
+    Some(json!({ "output_device_id": sortie, "reprise_par": reprise }))
 }
 
 /// Pose `avertissement_restauration` sur la réponse d'une restauration quand
@@ -232,8 +309,13 @@ pub(crate) async fn signaler_la_restauration_hors_hote(
     if !restauree_hors_hote_actif(&configure, en_asio) {
         return;
     }
-    let hote_de_la_zone = nom_d_hote(en_asio == Some(true));
-    let hote_actif = nom_d_hote(configure.trim().eq_ignore_ascii_case("asio"));
+    let sur_windows = cfg!(target_os = "windows");
+    let hote_de_la_zone = nom_d_hote(en_asio == Some(true), endpoint.as_deref(), sur_windows);
+    let hote_actif = nom_d_hote(
+        configure.trim().eq_ignore_ascii_case("asio"),
+        None,
+        sur_windows,
+    );
     warn!(
         zone_id,
         device_id,

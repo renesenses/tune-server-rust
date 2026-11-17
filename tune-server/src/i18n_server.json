@@ -5381,6 +5381,24 @@
     "el": "Η ζώνη «{zone}» δημιουργήθηκε για την έξοδο {zoneHost}, αλλά το Tune χρησιμοποιεί τώρα {activeHost}: έτσι δεν θα παίξει. Επιστρέψτε σε {zoneHost} στις ρυθμίσεις ήχου ή επιλέξτε για αυτή τη ζώνη τη συσκευή {activeHost}.",
     "tr": "“{zone}” bölgesi {zoneHost} çıkışı için oluşturuldu, ancak Tune şu anda {activeHost} kullanıyor: bu hâliyle çalmaz. Ses ayarlarında {zoneHost} seçeneğine geri dönün veya bu bölge için {activeHost} cihazını seçin."
   },
+  "api.zones.restoredOutputTakenBy": {
+    "fr": "La zone « {zone} » est restaurée sans sortie : son appareil a été repris par « {holder} ». Choisissez-lui un autre appareil, ou changez d'abord celui de « {holder} ».",
+    "en": "The zone “{zone}” was restored without an output: its device was taken over by “{holder}”. Choose another device for it, or change the device of “{holder}” first.",
+    "de": "Die Zone „{zone}“ wurde ohne Ausgang wiederhergestellt: Ihr Gerät wurde von „{holder}“ übernommen. Wählen Sie ein anderes Gerät oder ändern Sie zuerst das Gerät von „{holder}“.",
+    "es": "La zona «{zone}» se ha restaurado sin salida: su dispositivo lo ha tomado «{holder}». Elija otro dispositivo o cambie primero el de «{holder}».",
+    "it": "La zona «{zone}» è stata ripristinata senza uscita: il suo dispositivo è stato preso da «{holder}». Scegli un altro dispositivo oppure cambia prima quello di «{holder}».",
+    "zh": "区域“{zone}”已恢复，但没有输出：它的设备已被“{holder}”占用。请为它选择其他设备，或先更改“{holder}”的设备。",
+    "ja": "ゾーン「{zone}」は出力なしで復元されました。デバイスは「{holder}」に引き継がれています。別のデバイスを選ぶか、先に「{holder}」のデバイスを変更してください。",
+    "ko": "존 “{zone}”이(가) 출력 없이 복원되었습니다. 해당 기기는 “{holder}”이(가) 사용 중입니다. 다른 기기를 선택하거나 먼저 “{holder}”의 기기를 변경하세요.",
+    "ro": "Zona „{zone}” a fost restaurată fără ieșire: dispozitivul ei a fost preluat de „{holder}”. Alegeți-i alt dispozitiv sau schimbați mai întâi dispozitivul zonei „{holder}”.",
+    "sv": "Zonen ”{zone}” återställdes utan utgång: dess enhet har tagits över av ”{holder}”. Välj en annan enhet åt den, eller byt först enhet för ”{holder}”.",
+    "hu": "A(z) „{zone}” zóna kimenet nélkül állt vissza: az eszközét átvette a(z) „{holder}”. Válasszon neki másik eszközt, vagy előbb módosítsa a(z) „{holder}” eszközét.",
+    "vi": "Vùng “{zone}” đã được khôi phục nhưng không có đầu ra: thiết bị của nó đã được “{holder}” sử dụng. Hãy chọn thiết bị khác cho vùng này, hoặc đổi thiết bị của “{holder}” trước.",
+    "nb": "Sonen «{zone}» ble gjenopprettet uten utgang: enheten er tatt over av «{holder}». Velg en annen enhet for den, eller bytt først enheten til «{holder}».",
+    "pl": "Strefa „{zone}” została przywrócona bez wyjścia: jej urządzenie przejęła strefa „{holder}”. Wybierz dla niej inne urządzenie albo najpierw zmień urządzenie strefy „{holder}”.",
+    "el": "Η ζώνη «{zone}» επαναφέρθηκε χωρίς έξοδο: τη συσκευή της την πήρε η «{holder}». Επιλέξτε άλλη συσκευή γι' αυτήν ή αλλάξτε πρώτα τη συσκευή της «{holder}».",
+    "tr": "“{zone}” bölgesi çıkışsız geri yüklendi: cihazını “{holder}” devraldı. Ona başka bir cihaz seçin veya önce “{holder}” bölgesinin cihazını değiştirin."
+  },
   "api.zones.mergeSelf": {
     "fr": "Une zone ne peut pas être fusionnée avec elle-même.",
     "en": "A zone cannot be merged into itself.",

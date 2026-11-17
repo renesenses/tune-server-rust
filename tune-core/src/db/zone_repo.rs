@@ -127,6 +127,16 @@ fn ligne_de_zone_masquee(r: &[SqlValue]) -> Option<ZoneMasquee> {
 /// Drapeau, motif et date du masquage d'une zone (#5077). `motif` NUL =
 /// inconnu : masquage d'avant la migration 112, ou zone visible.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// #8987 — l'issue de [`ZoneRepo::prendre_la_sortie`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PriseDeSortie {
+    /// La sortie est écrite ; `liberee` : la zone supprimée qui l'a lâchée.
+    Prise { liberee: Option<i64> },
+    /// La zone supprimée est redevenue active avant la transaction : rien
+    /// n'est écrit.
+    ZoneSupprimeeRestauree,
+}
+
 pub struct EtatDeMasquage {
     pub masquee: bool,
     pub motif: Option<String>,
@@ -2245,12 +2255,25 @@ impl ZoneRepo {
         let sql = self.update_field_sql("output_device_id");
         let params: [&dyn ToSqlValue; 2] = [&device_id, &id];
         self.db.execute(&sql, &params)?;
+        self.ajuster_apres_changement(id, avant, device_id, &rattachement);
+        Ok(())
+    }
+
+    /// #6774 — les réglages qui suivent l'appareil, une fois
+    /// `output_device_id` écrit.
+    fn ajuster_apres_changement(
+        &self,
+        id: i64,
+        avant: Option<(Option<String>, Option<String>)>,
+        device_id: &str,
+        rattachement: &crate::audio::reglages_de_volume::Rattachement<'_>,
+    ) {
         if let Some((ancien, mac)) = avant
             && !crate::audio::reglages_de_volume::meme_appareil(
                 ancien.as_deref(),
                 mac.as_deref(),
                 device_id,
-                &rattachement,
+                rattachement,
             )
         {
             crate::audio::reglages_de_volume::ajuster_au_changement_d_appareil(
@@ -2261,7 +2284,6 @@ impl ZoneRepo {
                 rattachement.origine(),
             );
         }
-        Ok(())
     }
 
     /// `(output_device_id, mac)` de la ligne `id`, masquée ou non ; `None`
@@ -3187,29 +3209,136 @@ impl ZoneRepo {
         Ok(touchees)
     }
 
-    /// #8987 — détache la sortie d'une zone MASQUÉE (supprimée), pour qu'une
-    /// zone visible puisse la prendre.
-    ///
-    /// L'index unique partiel `idx_zones_output_device_id` ne distingue pas
-    /// les zones masquées : une zone supprimée garde son `output_device_id`
-    /// et refusait à toute autre zone de prendre l'appareil (500 « UNIQUE
-    /// constraint failed », fil 2708). La ligne masquée reste — réglages,
-    /// historique et place dans « Zones supprimées » — mais sans sortie.
-    ///
-    /// La condition « encore masquée » est relue DANS l'écriture : une zone
-    /// restaurée entre-temps n'est pas dépouillée. Rend le nombre de lignes
-    /// touchées (`0` = la zone n'était plus masquée, ou n'existe pas).
-    pub fn liberer_la_sortie_d_une_zone_masquee(&self, id: i64) -> Result<usize, String> {
+    /// #8987 — la clé de réglage qui garde la sortie qu'une zone SUPPRIMÉE a
+    /// lâchée au profit d'une autre zone. Sans elle, « Restaurer » rendait une
+    /// zone sans sortie et `POST /zones` sur cet appareil ne la retrouvait
+    /// plus. Un réglage `zone_{id}_*` plutôt qu'une colonne : il suit la ligne
+    /// comme les autres, et ne demande aucune migration.
+    pub fn cle_sortie_liberee(id: i64) -> String {
+        format!("zone_{id}_sortie_liberee")
+    }
+
+    /// La sortie que la zone `id` a lâchée (#8987), s'il y en a une.
+    pub fn sortie_liberee(&self, id: i64) -> Option<String> {
+        super::settings_repo::SettingsRepo::with_backend(self.db.clone())
+            .get(&Self::cle_sortie_liberee(id))
+            .ok()
+            .flatten()
+            .filter(|v| !v.trim().is_empty())
+    }
+
+    /// Oublie la sortie lâchée par la zone `id` (#8987).
+    pub fn oublier_la_sortie_liberee(&self, id: i64) -> Result<(), String> {
+        super::settings_repo::SettingsRepo::with_backend(self.db.clone())
+            .delete(&Self::cle_sortie_liberee(id))
+    }
+
+    /// La zone MASQUÉE, sans sortie, qui avait lâché `device_id` (#8987) :
+    /// celle que `POST /zones` sur cet appareil doit ressusciter.
+    pub fn zone_masquee_qui_tenait(&self, device_id: &str) -> Option<i64> {
         let p = match self.db.engine() {
             Engine::Sqlite => SqliteDialect.placeholder(1),
             Engine::Postgres => PostgresDialect.placeholder(1),
         };
         let sql = format!(
-            "UPDATE zones SET output_device_id = NULL \
-             WHERE id = {p} AND COALESCE(is_hidden, 0) = 1"
+            "SELECT key FROM settings WHERE key LIKE 'zone_%_sortie_liberee' \
+             AND value = {p} ORDER BY key"
         );
-        let params: [&dyn ToSqlValue; 1] = [&id];
-        self.db.execute(&sql, &params)
+        let params: [&dyn ToSqlValue; 1] = [&device_id];
+        // Le `_` de LIKE vaut n'importe quel caractère : la clé est relue
+        // strictement ci-dessous.
+        let lignes = self.db.query_many_strong(&sql, &params).ok()?;
+        lignes
+            .iter()
+            .filter_map(|l| l.first().and_then(|v| v.as_string()))
+            .filter_map(|cle| {
+                cle.strip_prefix("zone_")?
+                    .strip_suffix("_sortie_liberee")?
+                    .parse::<i64>()
+                    .ok()
+            })
+            .find(|&id| {
+                self.etat_de_masquage(id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|e| e.masquee)
+                    && self
+                        .get(id)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|z| z.output_device_id.is_none())
+            })
+    }
+
+    /// #8987 — la zone `id` prend `device_id`, en UNE transaction.
+    ///
+    /// Quand une zone SUPPRIMÉE (masquée) tient l'appareil (`zone_supprimee`),
+    /// la même transaction :
+    ///
+    /// 1. lui retire la sortie — seulement si elle est ENCORE masquée et
+    ///    tient encore CET appareil (relu dans l'écriture) ;
+    /// 2. note l'appareil lâché (`zone_{id}_sortie_liberee`) pour qu'une
+    ///    restauration le reprenne ;
+    /// 3. écrit la nouvelle sortie de la zone `id`.
+    ///
+    /// L'index unique partiel ne voit donc jamais deux lignes sur l'appareil,
+    /// et un échec à n'importe quelle étape n'en laisse aucune trace : la zone
+    /// supprimée garde sa sortie.
+    ///
+    /// Rend [`PriseDeSortie::ZoneSupprimeeRestauree`] quand la zone supprimée a
+    /// été restaurée (ou a changé d'appareil) entre la lecture de l'appelant et
+    /// la transaction : rien n'est écrit, l'appelant relit et nomme la zone.
+    pub fn prendre_la_sortie(
+        &self,
+        id: i64,
+        device_id: &str,
+        zone_supprimee: Option<i64>,
+        rattachement: crate::audio::reglages_de_volume::Rattachement<'_>,
+    ) -> Result<PriseDeSortie, String> {
+        const RESTAUREE: &str = "zone_supprimee_redevenue_active_8987";
+        let (p1, p2) = match self.db.engine() {
+            Engine::Sqlite => (SqliteDialect.placeholder(1), SqliteDialect.placeholder(2)),
+            Engine::Postgres => (
+                PostgresDialect.placeholder(1),
+                PostgresDialect.placeholder(2),
+            ),
+        };
+        let lacher = format!(
+            "UPDATE zones SET output_device_id = NULL \
+             WHERE id = {p1} AND COALESCE(is_hidden, 0) = 1 AND output_device_id = {p2}"
+        );
+        let noter = self.dialect_sql(
+            super::settings_repo::sql::upsert,
+            super::settings_repo::sql::upsert,
+        );
+        let prendre = format!("UPDATE zones SET output_device_id = {p1} WHERE id = {p2}");
+        let avant = self.appareil_et_mac(id);
+        let maintenant = chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string();
+        let resultat = self.db.write_tx(&mut |tx| {
+            if let Some(h) = zone_supprimee {
+                let p: [&dyn ToSqlValue; 2] = [&h, &device_id];
+                if tx.execute(&lacher, &p)? == 0 {
+                    return Err(RESTAUREE.to_string());
+                }
+                let cle = Self::cle_sortie_liberee(h);
+                let p: [&dyn ToSqlValue; 3] = [&cle, &device_id, &maintenant];
+                tx.execute(&noter, &p)?;
+            }
+            let p: [&dyn ToSqlValue; 2] = [&device_id, &id];
+            tx.execute(&prendre, &p)?;
+            Ok(())
+        });
+        match resultat {
+            Ok(()) => {}
+            Err(e) if e.contains(RESTAUREE) => return Ok(PriseDeSortie::ZoneSupprimeeRestauree),
+            Err(e) => return Err(e),
+        }
+        // Après le COMMIT : les réglages qui suivent l'appareil (#6774),
+        // comme `changer_d_appareil`.
+        self.ajuster_apres_changement(id, avant, device_id, &rattachement);
+        Ok(PriseDeSortie::Prise {
+            liberee: zone_supprimee,
+        })
     }
 
     /// Démasque la zone, et efface son motif et sa date de masquage.
@@ -5726,14 +5855,22 @@ mod collision_de_sortie_5464_tests {
 /// #8987 (fil 2708) — une zone SUPPRIMÉE (masquée) tient encore sa sortie :
 /// changer l'appareil d'une zone visible vers cette sortie heurtait l'index
 /// unique partiel et ressortait en 500 « UNIQUE constraint failed ».
-/// `liberer_la_sortie_d_une_zone_masquee` la détache, sous les DEUX moteurs,
-/// et ne touche jamais une zone visible.
+/// `prendre_la_sortie` la détache dans la transaction qui écrit la nouvelle
+/// sortie, garde la trace de l'appareil lâché, sous les DEUX moteurs, et ne
+/// touche jamais une zone visible.
 #[cfg(test)]
 mod liberer_la_sortie_8987_tests {
     use super::*;
 
     const INDEX: &str = "CREATE UNIQUE INDEX IF NOT EXISTS idx_zones_output_device_id_8987 \
                          ON zones(output_device_id) WHERE output_device_id IS NOT NULL";
+
+    fn sans_preuve() -> crate::audio::reglages_de_volume::Rattachement<'static> {
+        crate::audio::reglages_de_volume::Rattachement::SansPreuve {
+            origine: "test_8987",
+            mac: None,
+        }
+    }
 
     fn epreuve(repo: &ZoneRepo) {
         let supprimee = repo
@@ -5747,17 +5884,28 @@ mod liberer_la_sortie_8987_tests {
         let visible = repo
             .create("Bureau", Some("local"), Some("local:Haut-parleurs 8987"))
             .unwrap();
+        let autre = repo
+            .create("Salon", Some("local"), Some("local:Salon 8987"))
+            .unwrap();
 
         // Témoin : sans libération, l'index refuse bien le changement
         // d'appareil — c'est le 500 du fil 2708.
         repo.update_output_device(visible, "local:DAC 8987")
             .expect_err("l'index unique doit refuser la sortie tenue par la zone supprimée");
 
-        // Une zone VISIBLE n'est jamais dépouillée.
+        // Une zone VISIBLE n'est jamais dépouillée, et rien n'est écrit.
         assert_eq!(
-            repo.liberer_la_sortie_d_une_zone_masquee(visible).unwrap(),
-            0,
-            "une zone visible garde sa sortie"
+            repo.prendre_la_sortie(visible, "local:Salon 8987", Some(autre), sans_preuve())
+                .unwrap(),
+            PriseDeSortie::ZoneSupprimeeRestauree
+        );
+        assert_eq!(
+            repo.get(autre)
+                .unwrap()
+                .unwrap()
+                .output_device_id
+                .as_deref(),
+            Some("local:Salon 8987")
         );
         assert_eq!(
             repo.get(visible)
@@ -5767,15 +5915,17 @@ mod liberer_la_sortie_8987_tests {
                 .as_deref(),
             Some("local:Haut-parleurs 8987")
         );
+        assert_eq!(repo.sortie_liberee(autre), None);
 
+        // La zone supprimée lâche la sortie, dans la même transaction que
+        // l'écriture, et la trace est gardée.
         assert_eq!(
-            repo.liberer_la_sortie_d_une_zone_masquee(supprimee)
+            repo.prendre_la_sortie(visible, "local:DAC 8987", Some(supprimee), sans_preuve())
                 .unwrap(),
-            1,
-            "la zone supprimée lâche sa sortie"
+            PriseDeSortie::Prise {
+                liberee: Some(supprimee)
+            }
         );
-        repo.update_output_device(visible, "local:DAC 8987")
-            .expect("la sortie libérée se prend sans heurter l'index");
         assert_eq!(
             repo.get(visible)
                 .unwrap()
@@ -5784,10 +5934,26 @@ mod liberer_la_sortie_8987_tests {
                 .as_deref(),
             Some("local:DAC 8987")
         );
-        // La zone supprimée reste supprimée, sans sortie.
         let etat = repo.etat_de_masquage(supprimee).unwrap().unwrap();
         assert!(etat.masquee, "la ligne supprimée reste masquée");
         assert_eq!(repo.get(supprimee).unwrap().unwrap().output_device_id, None);
+        assert_eq!(
+            repo.sortie_liberee(supprimee).as_deref(),
+            Some("local:DAC 8987"),
+            "la sortie lâchée est gardée pour la restauration"
+        );
+
+        // Le DAC rendu par « Bureau » : `POST /zones` retrouve la zone
+        // supprimée par sa trace.
+        repo.update_output_device(visible, "local:Haut-parleurs 8987")
+            .unwrap();
+        assert_eq!(
+            repo.zone_masquee_qui_tenait("local:DAC 8987"),
+            Some(supprimee)
+        );
+        assert_eq!(repo.zone_masquee_qui_tenait("local:Inconnu"), None);
+        repo.oublier_la_sortie_liberee(supprimee).unwrap();
+        assert_eq!(repo.zone_masquee_qui_tenait("local:DAC 8987"), None);
     }
 
     #[test]
@@ -5822,6 +5988,9 @@ mod liberer_la_sortie_8987_tests {
             "ALTER TABLE zones ADD COLUMN IF NOT EXISTS mac TEXT",
             "ALTER TABLE zones ADD COLUMN IF NOT EXISTS motif_masquage TEXT",
             "ALTER TABLE zones ADD COLUMN IF NOT EXISTS masquee_le TEXT",
+            // La trace de la sortie lâchée vit dans `settings` : table
+            // temporaire elle aussi, rien n'est écrit dans la base partagée.
+            "CREATE TEMP TABLE settings (LIKE public.settings INCLUDING ALL)",
             INDEX,
         ] {
             db.execute(ddl, &[]).unwrap();

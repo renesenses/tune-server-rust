@@ -332,13 +332,17 @@ async fn hot_swap_zone(
     // Update the output device
     // #8987 — même règle que `PATCH /zones/{id}` : une zone supprimée qui
     // tient l'appareil le lâche, une zone active donne un 409 qui la nomme.
-    if let Err(reponse) =
-        super::zones::liberer_la_sortie_demandee(&zone_repo, id, &body.output_device_id)
-    {
+    // L'écriture et la libération éventuelle tiennent dans une transaction.
+    if let Err(reponse) = super::zones::prendre_la_sortie_demandee(
+        &zone_repo,
+        id,
+        &body.output_device_id,
+        tune_core::audio::reglages_de_volume::Rattachement::SansPreuve {
+            origine: "update_output_device",
+            mac: None,
+        },
+    ) {
         return reponse;
-    }
-    if let Err(e) = zone_repo.update_output_device(id, &body.output_device_id) {
-        return super::zones::refus_apres_echec(&zone_repo, id, &body.output_device_id, e);
     }
     // #6774 — PURE / volume fixe désarmés par le changement d'appareil :
     // l'état de lecture ne reste pas au-dessus de la base.

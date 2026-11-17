@@ -477,12 +477,16 @@ fn persister_la_zone_et_sa_sortie(
     if let Some(ref device_id) = body.output_device_id {
         // #8987 — une zone supprimée (masquée) qui tient l'appareil le lâche ;
         // l'index unique ne ressort plus jamais en 500 (fil 2708).
-        super::zone_appareil_8987::liberer_la_sortie_demandee(repo, id, device_id)?;
-        if let Err(e) = repo.update_output_device(id, device_id) {
-            return Err(super::zone_appareil_8987::refus_apres_echec(
-                repo, id, device_id, e,
-            ));
-        }
+        // La libération et l'écriture tiennent dans UNE transaction.
+        super::zone_appareil_8987::prendre_la_sortie_demandee(
+            repo,
+            id,
+            device_id,
+            tune_core::audio::reglages_de_volume::Rattachement::SansPreuve {
+                origine: "update_output_device",
+                mac: None,
+            },
+        )?;
         // #3589 — même marque d'auteur que `ecrire!`.
         super::preconfiguration::marquer_pose(&state.backend, id, "output_device_id");
     }
@@ -1267,22 +1271,74 @@ pub(super) async fn create_zone(
             if let Some(host) = host {
                 let repo = ZoneRepo::with_backend(state.backend.clone());
                 if let Some(existing_id) = repo.zone_id_by_host(&host) {
-                    let _ = repo.update_online(existing_id, true);
-                    // Même contrat client que les deux autres retours
-                    // anticipés (#2284) : l'état RÉEL de la zone.
-                    let v = crate::routes::playback::build_zone_json(&state, existing_id).await;
-                    state
-                        .event_bus
-                        .emit("zone.updated", json!({ "zone_id": existing_id }));
+                    // #8987 — décision de Bertrand : la jumelle SSDP d'un
+                    // appareil qui a déjà une zone reçoit le MÊME refus nommé
+                    // que l'identité exacte, plus un 200 silencieux.
+                    let nom = repo
+                        .get(existing_id)
+                        .ok()
+                        .flatten()
+                        .map(|z| z.name)
+                        .unwrap_or_default();
                     info!(
                         zone_id = existing_id,
                         device_id,
                         host = %host,
-                        "zone_same_host_already_exists_returning"
+                        "zone_same_host_already_exists_refused"
                     );
-                    return (StatusCode::OK, Json(v)).into_response();
+                    return refus_zone_existe_deja(existing_id, &nom, device_id);
                 }
             }
+        }
+    }
+
+    // #8987 — une zone SUPPRIMÉE avait lâché cet appareil au profit d'une
+    // autre zone, qui l'a rendu depuis : c'est elle que l'utilisateur
+    // recrée. Elle reprend sa sortie (avant d'être démasquée : un refus ne
+    // laisse pas une zone visible sans sortie), ses réglages et le nom demandé.
+    if let Some(device_id) = output_device_id {
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        if let Some(id) = repo.zone_masquee_qui_tenait(device_id) {
+            info!(
+                zone_id = id,
+                device_id, "zone_supprimee_retrouvee_par_sa_sortie_liberee"
+            );
+            if let Err(reponse) = super::zone_appareil_8987::prendre_la_sortie_demandee(
+                &repo,
+                id,
+                device_id,
+                tune_core::audio::reglages_de_volume::Rattachement::MemePeripherique {
+                    origine: "recreation_sortie_liberee",
+                },
+            ) {
+                return reponse;
+            }
+            let _ = repo.oublier_la_sortie_liberee(id);
+            if let Err(e) = repo.unhide(id) {
+                return echec_ecriture(id, "is_hidden", "0", e);
+            }
+            sortir_la_zone_recreee_des_groupes(&state, id);
+            if let Some(ref ot) = body.output_type {
+                let _ = repo.update_output_type(id, ot);
+            }
+            let nom_actuel = repo
+                .get(id)
+                .ok()
+                .flatten()
+                .map(|z| z.name)
+                .unwrap_or_default();
+            if nom_de_zone_existante(true, &nom_actuel, &body.name) == NomDeZoneExistante::Honore
+                && let Err(e) = repo.update_name(id, &body.name)
+            {
+                return echec_ecriture(id, "name", &body.name, e);
+            }
+            let _ = repo.update_online(id, true);
+            let mut v = crate::routes::playback::build_zone_json(&state, id).await;
+            super::zone_appareil_8987::signaler_la_restauration_hors_hote(&state, id, &mut v).await;
+            state
+                .event_bus
+                .emit("zone.updated", json!({ "zone_id": id }));
+            return (StatusCode::OK, Json(v)).into_response();
         }
     }
 

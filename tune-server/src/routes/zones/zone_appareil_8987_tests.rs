@@ -213,6 +213,167 @@ async fn changer_vers_l_appareil_d_une_zone_supprimee_la_libere_au_lieu_du_500()
     let etat = repo.etat_de_masquage(supprimee).unwrap().unwrap();
     assert!(etat.masquee, "la zone supprimée le reste");
     assert_eq!(repo.get(supprimee).unwrap().unwrap().output_device_id, None);
+    assert_eq!(
+        repo.sortie_liberee(supprimee).as_deref(),
+        Some("local:DENAFRIPS USB DAC"),
+        "la sortie lâchée est gardée pour la restauration"
+    );
+}
+
+/// Une zone supprimée dont la sortie a été prise par « Bureau ».
+fn sortie_prise_par_bureau(repo: &ZoneRepo) -> (i64, i64) {
+    let supprimee = repo
+        .create(
+            "DENAFRIPS USB DAC",
+            Some("local"),
+            Some("local:DENAFRIPS USB DAC"),
+        )
+        .unwrap();
+    repo.delete(supprimee).unwrap();
+    let bureau = repo
+        .create("Bureau", Some("local"), Some("local:Haut-parleurs"))
+        .unwrap();
+    super::prendre_la_sortie_demandee(
+        repo,
+        bureau,
+        "local:DENAFRIPS USB DAC",
+        tune_core::audio::reglages_de_volume::Rattachement::SansPreuve {
+            origine: "test_8987",
+            mac: None,
+        },
+    )
+    .unwrap();
+    (supprimee, bureau)
+}
+
+#[tokio::test]
+async fn restaurer_une_zone_dont_la_sortie_est_tenue_le_dit_en_nommant_la_zone() {
+    let (app, state) = serveur();
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let (supprimee, bureau) = sortie_prise_par_bureau(&repo);
+
+    // La liste des zones supprimées le dit déjà.
+    let (statut, liste) = envoyer(&app, "GET", "/api/v1/zones/supprimees", json!(null)).await;
+    assert_eq!(statut, StatusCode::OK, "{liste}");
+    let item = liste["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == supprimee)
+        .cloned()
+        .unwrap_or_else(|| panic!("zone supprimée absente de la liste : {liste}"));
+    assert_eq!(
+        item["sortie_liberee"]["output_device_id"], "local:DENAFRIPS USB DAC",
+        "{item}"
+    );
+    assert_eq!(
+        item["sortie_liberee"]["reprise_par"]["id"], bureau,
+        "{item}"
+    );
+    assert_eq!(
+        item["sortie_liberee"]["reprise_par"]["name"], "Bureau",
+        "{item}"
+    );
+
+    let (statut, corps) = envoyer(
+        &app,
+        "POST",
+        &format!("/api/v1/zones/{supprimee}/restaurer"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    let a = &corps["avertissement_restauration"];
+    assert_eq!(a["code"], "sortie_reprise_par_une_zone", "{corps}");
+    assert_eq!(a["holder_zone_id"], bureau, "{corps}");
+    assert_eq!(a["holder_zone_name"], "Bureau", "{corps}");
+    assert_eq!(
+        a["message_key"], "api.zones.restoredOutputTakenBy",
+        "{corps}"
+    );
+    assert!(a["message"].as_str().unwrap().contains("Bureau"), "{corps}");
+    // « Bureau » garde l'appareil.
+    assert_eq!(
+        repo.get(bureau)
+            .unwrap()
+            .unwrap()
+            .output_device_id
+            .as_deref(),
+        Some("local:DENAFRIPS USB DAC")
+    );
+}
+
+#[tokio::test]
+async fn restaurer_une_zone_dont_la_sortie_est_libre_la_lui_rend() {
+    let (app, state) = serveur();
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let (supprimee, bureau) = sortie_prise_par_bureau(&repo);
+    // « Bureau » rend le DAC.
+    repo.update_output_device(bureau, "local:Haut-parleurs")
+        .unwrap();
+
+    let (statut, corps) = envoyer(
+        &app,
+        "POST",
+        &format!("/api/v1/zones/{supprimee}/restaurer"),
+        json!({}),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    assert!(corps.get("avertissement_restauration").is_none(), "{corps}");
+    assert_eq!(
+        repo.get(supprimee)
+            .unwrap()
+            .unwrap()
+            .output_device_id
+            .as_deref(),
+        Some("local:DENAFRIPS USB DAC"),
+        "la zone restaurée reprend sa sortie, pas une zone morte"
+    );
+    assert_eq!(repo.sortie_liberee(supprimee), None, "trace oubliée");
+}
+
+#[tokio::test]
+async fn nouvelle_zone_sur_le_dac_rendu_retrouve_la_zone_supprimee() {
+    let (app, state) = serveur();
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let (supprimee, bureau) = sortie_prise_par_bureau(&repo);
+    repo.update_output_device(bureau, "local:Haut-parleurs")
+        .unwrap();
+    let (statut, corps) = envoyer(
+        &app,
+        "POST",
+        "/api/v1/zones",
+        json!({"name": "DAC", "output_device_id": "local:DENAFRIPS USB DAC"}),
+    )
+    .await;
+    assert_eq!(
+        statut,
+        StatusCode::OK,
+        "la zone supprimée est retrouvée : {corps}"
+    );
+    assert_eq!(corps["id"], supprimee, "{corps}");
+    let z = repo.get(supprimee).unwrap().unwrap();
+    assert_eq!(
+        z.output_device_id.as_deref(),
+        Some("local:DENAFRIPS USB DAC")
+    );
+    assert_eq!(z.name, "DAC");
+    assert!(!repo.etat_de_masquage(supprimee).unwrap().unwrap().masquee);
+    assert_eq!(repo.list().unwrap().len(), 2, "aucune zone neuve");
+}
+
+#[test]
+fn le_nom_de_l_hote_n_invente_pas_wasapi_hors_windows() {
+    assert_eq!(nom_d_hote(true, None, false), "ASIO");
+    assert_eq!(nom_d_hote(false, None, true), "WASAPI");
+    assert_eq!(nom_d_hote(false, Some("wasapi:{g}"), true), "WASAPI");
+    assert_eq!(nom_d_hote(false, Some("coreaudio:UID"), false), "CoreAudio");
+    assert_eq!(
+        nom_d_hote(false, Some("alsa:hw:CARD=2,DEV=0"), false),
+        "ALSA"
+    );
+    assert_ne!(nom_d_hote(false, None, false), "WASAPI");
 }
 
 #[tokio::test]
