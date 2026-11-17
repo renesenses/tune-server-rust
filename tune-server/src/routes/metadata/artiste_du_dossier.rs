@@ -73,14 +73,46 @@ pub(crate) fn artiste_du_dossier_de(t: &Track) -> Option<String> {
     if !artiste_absent(t) || !locale(t) {
         return None;
     }
-    tune_core::metadata::artiste_du_dossier(t.file_path.as_deref()?)
+    tune_core::metadata::artiste_du_dossier(chemin_ouvrable(t)?)
+}
+
+/// #8957 — le chemin OUVRABLE d'une piste : son fichier, sinon, pour une piste
+/// de feuille CUE, le fichier image que la feuille découpe.
+///
+/// Une piste de feuille CUE porte `file_path = NULL` par construction ; son
+/// fichier est dans `cue_media_path`. Même règle que `sql::chemin_ouvrable!`
+/// (`tune-core/src/db/track_repo.rs`) : `COALESCE(NULLIF(file_path, ''),
+/// NULLIF(cue_media_path, ''))`. Lire `file_path` seul affichait « Chemin
+/// indisponible » dans Métadonnées › Albums douteux (fil 2685, rc12) et
+/// privait ces pistes de l'artiste du dossier.
+pub(crate) fn chemin_ouvrable(t: &Track) -> Option<&str> {
+    t.file_path
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .or_else(|| t.cue_media_path.as_deref().filter(|p| !p.is_empty()))
+}
+
+/// D'où vient le chemin rendu par [`chemin_ouvrable`] : `"file"`,
+/// `"cue_image"` (le fichier image d'une feuille CUE), ou rien.
+pub(crate) fn source_du_chemin(t: &Track) -> Option<&'static str> {
+    if t.file_path.as_deref().is_some_and(|p| !p.is_empty()) {
+        Some("file")
+    } else if chemin_ouvrable(t).is_some() {
+        Some("cue_image")
+    } else {
+        None
+    }
 }
 
 /// Une piste que la route réparera.
 #[derive(Debug, Clone)]
 pub(crate) struct Candidat {
     pub track_id: i64,
-    pub file_path: String,
+    /// Le fichier à graver. `None` pour une piste de feuille CUE (#8957) : son
+    /// fichier image porte TOUTES les pistes de la feuille, une balise ARTIST
+    /// écrite pour l'une les toucherait toutes. L'artiste s'écrit alors en base
+    /// seulement.
+    pub file_path: Option<String>,
     pub album_id: Option<i64>,
     pub artiste: String,
 }
@@ -88,7 +120,7 @@ pub(crate) struct Candidat {
 fn candidat(t: &Track) -> Option<Candidat> {
     Some(Candidat {
         track_id: t.id?,
-        file_path: t.file_path.clone()?,
+        file_path: t.file_path.clone().filter(|p| !p.is_empty()),
         album_id: t.album_id,
         artiste: artiste_du_dossier_de(t)?,
     })
@@ -214,7 +246,9 @@ pub(crate) fn ecrire_en_base(backend: &Arc<dyn DbBackend>, cands: &[Candidat]) -
                     &[tune_core::db::champs_tenus::Champ::Artiste],
                 );
                 bilan.pistes += 1;
-                bilan.ecrites.push((c.track_id, c.file_path.clone(), nom));
+                if let Some(fichier) = c.file_path.clone() {
+                    bilan.ecrites.push((c.track_id, fichier, nom));
+                }
                 if let Some(al) = c.album_id {
                     albums.insert(al, artist_id);
                 }
