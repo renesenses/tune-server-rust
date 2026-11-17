@@ -2529,6 +2529,22 @@ impl TrackRepo {
         Ok(self.db.execute(&sql, &params)? as u64)
     }
 
+    /// #9014 — pose la FIN d'une tranche CUE déjà en base.
+    ///
+    /// [`Self::update`] n'écrit pas les colonnes `cue_*` : l'identité d'une
+    /// tranche est `(cue_media_path, cue_start_ms)`, et la relecture d'une
+    /// feuille la retrouve par là. Mais sa fin, elle, dépend de la piste
+    /// SUIVANTE : quand le début de celle-ci bouge (feuille retouchée, ou
+    /// parseur corrigé comme pour l'`INDEX 02` de #9014), la ligne existante
+    /// gardait l'ancienne fin et jouait le début de la piste d'après.
+    pub fn poser_fin_de_tranche(&self, id: i64, fin_ms: Option<i64>) -> Result<(), TuneError> {
+        let (p1, p2) = self.marqueurs2();
+        let sql = format!("UPDATE tracks SET cue_end_ms = {p1} WHERE id = {p2}");
+        let params: [&dyn ToSqlValue; 2] = [&fin_ms, &id];
+        self.db.execute(&sql, &params)?;
+        Ok(())
+    }
+
     /// #5073 — les tranches que la base porte pour ce fichier image, en
     /// `(id, cue_start_ms)` : ce qu'une feuille relue confronte à ce qu'elle
     /// décrit désormais (`cue_bibliotheque::relire_le_dossier`).

@@ -1300,7 +1300,16 @@ fn ecrire_album_avec(
             Some(existante) => {
                 ligne.id = existante.id;
                 reprendre_l_acquis(&mut ligne, &existante);
-                match track_repo.update(&ligne) {
+                // #9014 — `update` ne touche pas aux colonnes `cue_*` : la
+                // fin de la tranche est posée à part, sans quoi un début
+                // corrigé sur la piste suivante laissait celle-ci déborder.
+                let maj = track_repo.update(&ligne).and_then(|()| match ligne.id {
+                    Some(id) if ligne.cue_media_path.is_some() => {
+                        track_repo.poser_fin_de_tranche(id, ligne.cue_end_ms)
+                    }
+                    _ => Ok(()),
+                });
+                match maj {
                     Ok(()) => {
                         bilan.pistes_mises_a_jour += 1;
                         ecrites += 1;
