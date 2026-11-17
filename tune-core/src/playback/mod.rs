@@ -2232,6 +2232,9 @@ impl PlaybackManager {
                 })
                 .repeat = mode;
         }
+        // #8968 — la suivante de la dernière ligne n'est la première que si
+        // toute la file se répète (mode ReplayGain Auto).
+        crate::audio::replaygain::auto::noter_boucle(zone_id, mode == RepeatMode::All);
         self.emit(PlaybackEvent {
             event: "repeat".into(),
             zone_id,

@@ -3008,6 +3008,10 @@ pub enum ReplayGainMode {
     Auto,
 }
 
+/// #8968 — les valeurs de `replaygain_mode` que ce serveur comprend, dans
+/// l'ordre de l'interface. Publiées par `GET /config` (`replaygain_modes`).
+pub const MODES_ACCEPTES: [&str; 4] = ["off", "track", "album", "auto"];
+
 impl ReplayGainMode {
     pub fn from_setting(raw: &str) -> Self {
         match raw.trim().to_lowercase().as_str() {

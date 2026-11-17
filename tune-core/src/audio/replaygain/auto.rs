@@ -32,10 +32,20 @@
 //!   de règle au gré du tirage serait incompréhensible.
 //! * **Une piste qu'on ne retrouve pas dans la file** (version substituée par
 //!   la règle de version #2264, lecture hors file) : gain de piste.
+//! * **Décidé une fois par lancement.** La granularité est décidée quand la
+//!   piste est lancée (ou armée pour l'enchaînement), puis RETENUE pour la
+//!   zone et relue partout : sortie locale, flux réseau, empreinte du
+//!   traitement, chemin du signal, réglage du préampli. Un « Lire ensuite »
+//!   ou un retrait dans la file ne change jamais le gain d'une piste en
+//!   cours ; la file n'est relue qu'au lancement suivant.
+//! * **Une requête bornée** par décision : la ligne en cours et ses voisines
+//!   (`PlayQueueRepo::voisinage_du_courant`), jamais la file entière.
+//! * La suivante de la dernière ligne n'est la première que si la zone
+//!   répète toute la file.
 //! * Le mode n'est résolu qu'ICI : en aval, `Auto` n'atteint jamais le calcul
 //!   du gain (un `Auto` non résolu vaut `Track` partout, par prudence).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, LazyLock, Mutex};
 
 use tracing::debug;
@@ -44,27 +54,112 @@ use super::{PisteRg, ReplayGainMode};
 use crate::db::backend::DbBackend;
 use crate::db::play_queue_repo::{PlayQueueRepo, QueueEntry};
 
-/// Les zones dont l'aléatoire est armé, tenu à jour par
-/// `PlaybackManager::set_shuffle` — le seul écrivain de `ZoneState::shuffle`.
-/// Le calcul du gain ne voit que la base et la piste : c'est ce registre qui
-/// lui dit l'état de l'aléatoire sans lui passer l'état de zone.
-static ALEATOIRE: LazyLock<Mutex<HashSet<i64>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
+/// Ce que la décision doit savoir de la zone et que la base ne porte pas :
+/// l'aléatoire et la répétition de toute la file. Tenu à jour par
+/// `PlaybackManager::set_shuffle` / `set_repeat` (les seuls écrivains de
+/// `ZoneState::shuffle` / `repeat`), et copié avec la file d'une zone à
+/// l'autre ([`copier_l_etat_de_zone`], transfert et groupe #6155).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct EtatDeZone {
+    aleatoire: bool,
+    boucle: bool,
+}
+
+static ETATS: LazyLock<Mutex<HashMap<i64, EtatDeZone>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn etat(zone_id: i64) -> EtatDeZone {
+    ETATS
+        .lock()
+        .ok()
+        .and_then(|e| e.get(&zone_id).copied())
+        .unwrap_or_default()
+}
+
+fn modifier(zone_id: i64, f: impl FnOnce(&mut EtatDeZone)) {
+    if let Ok(mut e) = ETATS.lock() {
+        f(e.entry(zone_id).or_default());
+    }
+}
 
 /// Retenir l'état de l'aléatoire d'une zone.
 pub fn noter_aleatoire(zone_id: i64, actif: bool) {
-    let Ok(mut zones) = ALEATOIRE.lock() else {
-        return;
-    };
-    if actif {
-        zones.insert(zone_id);
-    } else {
-        zones.remove(&zone_id);
-    }
+    modifier(zone_id, |e| e.aleatoire = actif);
+}
+
+/// Retenir si la zone répète toute la file (la suivante de la dernière
+/// ligne est alors la première).
+pub fn noter_boucle(zone_id: i64, toute_la_file: bool) {
+    modifier(zone_id, |e| e.boucle = toute_la_file);
 }
 
 /// L'aléatoire est-il armé sur la zone ?
 pub fn aleatoire(zone_id: i64) -> bool {
-    ALEATOIRE.lock().is_ok_and(|zones| zones.contains(&zone_id))
+    etat(zone_id).aleatoire
+}
+
+/// La file d'une zone recopiée sur une autre (transfert, suiveuse d'un
+/// groupe) : l'aléatoire et la répétition suivent, sinon la suiveuse
+/// jugerait « même album » deux voisines tirées au hasard.
+pub fn copier_l_etat_de_zone(de: i64, vers: i64) {
+    let source = etat(de);
+    modifier(vers, |e| *e = source);
+}
+
+/// Une piste, telle que la mémoire des décisions la reconnaît.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ClePiste {
+    Bibliotheque(i64),
+    Service(String, String),
+}
+
+fn cle(piste: PisteRg<'_>) -> Option<ClePiste> {
+    match (piste.track_id, piste.service) {
+        (Some(t), _) => Some(ClePiste::Bibliotheque(t)),
+        (None, Some((s, id))) => Some(ClePiste::Service(
+            s.trim().to_ascii_lowercase(),
+            id.trim().to_string(),
+        )),
+        (None, None) => None,
+    }
+}
+
+/// Combien de décisions une zone retient : la piste qui joue et celle
+/// qu'on arme pour l'enchaînement.
+const DECISIONS_PAR_ZONE: usize = 2;
+
+/// Les décisions prises, par zone : la granularité est décidée UNE fois, au
+/// lancement de la piste (ou quand on l'arme pour l'enchaînement), puis
+/// relue telle quelle — un « Lire ensuite », un retrait dans la file, un
+/// préampli touché ne changent jamais le gain d'une piste en cours.
+static DECISIONS: LazyLock<Mutex<HashMap<i64, VecDeque<(ClePiste, ReplayGainMode)>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn decision_retenue(zone_id: i64, cle: &ClePiste) -> Option<ReplayGainMode> {
+    DECISIONS
+        .lock()
+        .ok()?
+        .get(&zone_id)?
+        .iter()
+        .find(|(c, _)| c == cle)
+        .map(|(_, m)| *m)
+}
+
+fn retenir(zone_id: i64, cle: ClePiste, mode: ReplayGainMode) {
+    let Ok(mut d) = DECISIONS.lock() else { return };
+    let file = d.entry(zone_id).or_default();
+    file.retain(|(c, _)| *c != cle);
+    file.push_back((cle, mode));
+    while file.len() > DECISIONS_PAR_ZONE {
+        file.pop_front();
+    }
+}
+
+/// Oublier les décisions d'une zone (témoins, zone supprimée).
+pub fn oublier_les_decisions(zone_id: i64) {
+    if let Ok(mut d) = DECISIONS.lock() {
+        d.remove(&zone_id);
+    }
 }
 
 /// Ce qu'une ligne de file dit de son album, et de quoi la reconnaître.
@@ -154,17 +249,18 @@ impl MotifAuto {
 
 /// **La décision, fonction pure.**
 ///
-/// `courant` est le rang de la ligne en cours, `longueur` celle de la file,
-/// `ligne_au_rang` rend une ligne par son rang. La piste est cherchée au rang
-/// en cours (elle démarre), puis au rang suivant (elle est armée pour
-/// l'enchaînement), puis au rang 0 quand la file reboucle (répétition de
-/// toute la file).
+/// `courant` est la position de la ligne en cours, `ligne_a` rend une ligne
+/// par sa position (`None` hors de la file ou hors de la fenêtre lue). La
+/// piste est cherchée à la position en cours (elle démarre), puis à la
+/// suivante (elle est armée pour l'enchaînement), puis — seulement quand la
+/// zone répète toute la file (`boucle`) et que la ligne en cours est la
+/// dernière — à la position 0.
 pub fn decider(
     piste: PisteRg<'_>,
     aleatoire: bool,
+    boucle: bool,
     courant: Option<i64>,
-    longueur: i64,
-    ligne_au_rang: impl Fn(i64) -> Option<LigneDeFile>,
+    ligne_a: impl Fn(i64) -> Option<LigneDeFile>,
 ) -> (ReplayGainMode, MotifAuto) {
     if aleatoire {
         return (ReplayGainMode::Track, MotifAuto::Aleatoire);
@@ -172,19 +268,24 @@ pub fn decider(
     let Some(c) = courant else {
         return (ReplayGainMode::Track, MotifAuto::HorsDeLaFile);
     };
-    let suivant = if c + 1 < longueur { c + 1 } else { 0 };
-    let trouve = [c, suivant].into_iter().find_map(|rang| {
-        ligne_au_rang(rang)
+    let suivant = if ligne_a(c + 1).is_some() {
+        Some(c + 1)
+    } else if boucle && c > 0 {
+        Some(0)
+    } else {
+        None
+    };
+    let trouve = std::iter::once(c).chain(suivant).find_map(|pos| {
+        ligne_a(pos)
             .filter(|l| est_la_piste(l, piste))
-            .map(|l| (rang, l))
+            .map(|l| (pos, l))
     });
-    let Some((rang, ligne)) = trouve else {
+    let Some((pos, ligne)) = trouve else {
         return (ReplayGainMode::Track, MotifAuto::HorsDeLaFile);
     };
-    let voisine_du_meme_album = [rang - 1, rang + 1]
+    let voisine_du_meme_album = [pos - 1, pos + 1]
         .into_iter()
-        .filter(|r| (0..longueur).contains(r))
-        .filter_map(&ligne_au_rang)
+        .filter_map(&ligne_a)
         .any(|v| meme_album(&ligne, &v));
     if voisine_du_meme_album {
         (ReplayGainMode::Album, MotifAuto::VoisineDuMemeAlbum)
@@ -194,8 +295,10 @@ pub fn decider(
 }
 
 /// La granularité EFFECTIVE pour une piste d'une zone : `mode` tel quel hors
-/// `Auto` ; sinon la décision de [`decider`] sur la file de la zone. Sans
-/// zone, ou si la base ne répond pas : gain de piste.
+/// `Auto`. En `Auto` : la décision RETENUE pour cette piste sur cette zone si
+/// elle existe ; sinon une décision neuve, prise sur la file de la zone
+/// ([`decider`], une requête bornée) et retenue. Sans zone, ou si la base ne
+/// répond pas : gain de piste.
 pub fn granularite(
     backend: &Arc<dyn DbBackend>,
     zone_id: Option<i64>,
@@ -205,36 +308,13 @@ pub fn granularite(
     if mode != ReplayGainMode::Auto {
         return mode;
     }
-    let Some(zone_id) = zone_id else {
+    let (Some(zone_id), Some(cle)) = (zone_id, cle(piste)) else {
         return ReplayGainMode::Track;
     };
-    let aleatoire = aleatoire(zone_id);
-    if aleatoire {
-        return ReplayGainMode::Track;
+    if let Some(retenue) = decision_retenue(zone_id, &cle) {
+        return retenue;
     }
-    let repo = PlayQueueRepo::with_backend(backend.clone());
-    let Ok((courant, longueur)) = repo.current_index_and_length(zone_id) else {
-        return ReplayGainMode::Track;
-    };
-    // Quatre lignes autour du rang en cours (précédente, en cours, suivante,
-    // celle d'après), plus les deux premières quand la file reboucle : de quoi
-    // juger la piste qui démarre ET celle qu'on arme, sans relire la file.
-    let mut lignes: HashMap<i64, LigneDeFile> = HashMap::new();
-    let mut lire = |debut: i64, nombre: i64| {
-        if let Ok(rangs) = repo.get_ordered_window(zone_id, debut, nombre) {
-            for (i, e) in rangs.iter().enumerate() {
-                lignes.insert(debut + i as i64, LigneDeFile::from(e));
-            }
-        }
-    };
-    if let Some(c) = courant {
-        let debut = (c - 1).max(0);
-        lire(debut, c + 3 - debut);
-        if c + 1 >= longueur {
-            lire(0, 2);
-        }
-    }
-    let (choix, motif) = decider(piste, false, courant, longueur, |r| lignes.get(&r).cloned());
+    let (choix, motif) = decider_sur_la_file(backend, zone_id, piste);
     debug!(
         zone_id,
         granularite = if choix == ReplayGainMode::Album {
@@ -245,7 +325,39 @@ pub fn granularite(
         motif = motif.as_str(),
         "replaygain_auto"
     );
+    retenir(zone_id, cle, choix);
     choix
+}
+
+fn decider_sur_la_file(
+    backend: &Arc<dyn DbBackend>,
+    zone_id: i64,
+    piste: PisteRg<'_>,
+) -> (ReplayGainMode, MotifAuto) {
+    let EtatDeZone { aleatoire, boucle } = etat(zone_id);
+    if aleatoire {
+        return (ReplayGainMode::Track, MotifAuto::Aleatoire);
+    }
+    let Ok(lignes) =
+        PlayQueueRepo::with_backend(backend.clone()).voisinage_du_courant(zone_id, boucle)
+    else {
+        return (ReplayGainMode::Track, MotifAuto::HorsDeLaFile);
+    };
+    // Une file abîmée peut porter deux lignes à la même position : la
+    // première dans l'ordre `(position, id)`, comme `get_at`.
+    let mut par_position: HashMap<i64, LigneDeFile> = HashMap::new();
+    let mut courant = None;
+    for e in &lignes {
+        if e.is_current && courant.is_none() {
+            courant = Some(e.position);
+        }
+        par_position
+            .entry(e.position)
+            .or_insert_with(|| LigneDeFile::from(e));
+    }
+    decider(piste, false, boucle, courant, |p| {
+        par_position.get(&p).cloned()
+    })
 }
 
 #[cfg(test)]

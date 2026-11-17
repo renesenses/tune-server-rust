@@ -28,7 +28,7 @@ fn service(source: &str, id: &str, album_ref: Option<&str>) -> LigneDeFile {
 
 /// La décision sur une file entière, la piste au rang `rang`.
 fn sur_la_file(file: &[LigneDeFile], courant: i64, piste: PisteRg<'_>) -> ReplayGainMode {
-    decider(piste, false, Some(courant), file.len() as i64, |r| {
+    decider(piste, false, false, Some(courant), |r| {
         file.get(usize::try_from(r).ok()?).cloned()
     })
     .0
@@ -98,7 +98,7 @@ fn la_piste_armee_est_jugee_a_sa_place() {
     );
     // Une piste qui n'est ni en cours ni suivante : gain de piste.
     assert_eq!(
-        decider(PisteRg::bibliotheque(3), false, Some(0), 3, |r| file
+        decider(PisteRg::bibliotheque(3), false, false, Some(0), |r| file
             .get(r as usize)
             .cloned()),
         (ReplayGainMode::Track, MotifAuto::HorsDeLaFile)
@@ -110,7 +110,7 @@ fn la_piste_armee_est_jugee_a_sa_place() {
 #[test]
 fn en_aleatoire_c_est_toujours_le_gain_de_piste() {
     let file: Vec<_> = (1..=3).map(|t| locale(t, 7)).collect();
-    let (mode, motif) = decider(PisteRg::bibliotheque(2), true, Some(1), 3, |r| {
+    let (mode, motif) = decider(PisteRg::bibliotheque(2), true, false, Some(1), |r| {
         file.get(r as usize).cloned()
     });
     assert_eq!((mode, motif), (ReplayGainMode::Track, MotifAuto::Aleatoire));
@@ -231,6 +231,7 @@ fn le_facteur_de_zone_suit_la_file_en_mode_auto() {
 
     // Une zone à part : le registre de l'aléatoire est global au processus.
     let zone = 896_804;
+    oublier_les_decisions(zone);
     let file = PlayQueueRepo::with_backend(backend.clone());
     file.append(
         zone,
@@ -266,6 +267,8 @@ fn le_facteur_de_zone_suit_la_file_en_mode_auto() {
 
     // L'aléatoire armé : gain de piste, même au milieu de l'album.
     file.set_current_pos(zone, 0).unwrap();
+    // Un NOUVEAU lancement (décisions oubliées) en aléatoire.
+    oublier_les_decisions(zone);
     noter_aleatoire(zone, true);
     let f1_alea = facteur_de_zone(&backend, zone, PisteRg::bibliotheque(1));
     noter_aleatoire(zone, false);
@@ -273,4 +276,117 @@ fn le_facteur_de_zone_suit_la_file_en_mode_auto() {
         proche(f1_alea, db(-6.0)),
         "aléatoire : gain de piste attendu, facteur {f1_alea}"
     );
+}
+
+/// BASSE 5 — sans répétition de toute la file, la dernière ligne n'a pas de
+/// suivante : la première ligne n'est pas « armée ».
+#[test]
+fn la_file_ne_reboucle_que_si_toute_la_file_se_repete() {
+    let file = vec![locale(1, 7), locale(2, 7), locale(3, 9)];
+    let a = |boucle| {
+        decider(PisteRg::bibliotheque(1), false, boucle, Some(2), |r| {
+            file.get(usize::try_from(r).ok()?).cloned()
+        })
+    };
+    assert_eq!(a(false), (ReplayGainMode::Track, MotifAuto::HorsDeLaFile));
+    assert_eq!(
+        a(true),
+        (ReplayGainMode::Album, MotifAuto::VoisineDuMemeAlbum)
+    );
+}
+
+/// BASSE 4 — la file copiée sur une autre zone (transfert, suiveuse d'un
+/// groupe) emporte l'aléatoire et la répétition.
+#[test]
+fn l_etat_de_zone_suit_la_file_copiee() {
+    let (meneuse, suiveuse) = (896_811, 896_812);
+    noter_aleatoire(meneuse, true);
+    noter_boucle(meneuse, true);
+    assert!(!aleatoire(suiveuse));
+    copier_l_etat_de_zone(meneuse, suiveuse);
+    assert!(
+        aleatoire(suiveuse),
+        "la suiveuse ignore l'aléatoire de la meneuse"
+    );
+    noter_aleatoire(meneuse, false);
+    noter_aleatoire(suiveuse, false);
+}
+
+/// 🔴 MOYENNE 1+2 — la granularité est décidée au LANCEMENT et ne bouge
+/// plus : A1 part en gain d'album (voisine A2) ; on insère X juste après A1
+/// (« Lire ensuite », A1 n'a plus de voisine du même album), puis on touche
+/// le préampli. Le gain reste celui de l'album, préampli compris, et le
+/// chemin du signal dit toujours « album ».
+#[test]
+fn le_gain_ne_change_pas_en_cours_de_piste_quand_la_file_change() {
+    let backend = base();
+    backend
+        .execute_batch(
+            "INSERT INTO zones (id, name, output_type) VALUES (896805, 'Auto', 'local');
+             INSERT INTO artists (id, name) VALUES (1, 'A');
+             INSERT INTO albums (id, title, artist_id) VALUES (1, 'Un', 1), (2, 'Deux', 1);
+             INSERT INTO tracks (id, title, artist_id, album_id, file_path, format, duration_ms)
+               VALUES (1, 'a1', 1, 1, '/m/1.flac', 'flac', 1000),
+                      (2, 'a2', 1, 1, '/m/2.flac', 'flac', 1000),
+                      (9, 'x', 1, 2, '/m/9.flac', 'flac', 1000);",
+        )
+        .unwrap();
+    let meta = TrackMetadataRepo::with_backend(backend.clone());
+    for t in [1, 2, 9] {
+        meta.set(t, "rg_track_gain", "-6.00 dB").unwrap();
+        meta.set(t, "rg_album_gain", "-2.00 dB").unwrap();
+        meta.set(t, "rg_track_peak", "0.5").unwrap();
+        meta.set(t, "rg_album_peak", "0.5").unwrap();
+    }
+    let reglages = SettingsRepo::with_backend(backend.clone());
+    reglages.set(MODE_KEY, "auto").unwrap();
+    let zone = 896_805;
+    oublier_les_decisions(zone);
+    let file = PlayQueueRepo::with_backend(backend.clone());
+    file.append(
+        zone,
+        &[
+            QueueInput::Local { track_id: 1 },
+            QueueInput::Local { track_id: 2 },
+        ],
+    )
+    .unwrap();
+    file.set_current_pos(zone, 0).unwrap();
+    let db = |x: f64| 10f64.powf(x / 20.0);
+    let a1 = PisteRg::bibliotheque(1);
+
+    // Lancement : gain d'album.
+    let f = facteur_de_zone(&backend, zone, a1);
+    assert!(
+        (f - db(-2.0)).abs() < 1e-9,
+        "lancement : album attendu, {f}"
+    );
+
+    // « Lire ensuite » X : A1 n'a plus de voisine du même album.
+    file.insert_at(zone, &[QueueInput::Local { track_id: 9 }], Some(1))
+        .unwrap();
+    assert_eq!(
+        file.get_at(zone, 1).unwrap().and_then(|e| e.track_id),
+        Some(9),
+        "X n'est pas juste après A1 : le témoin ne mesure rien"
+    );
+    // Le préampli touché : le facteur est recalculé, la granularité reste.
+    reglages
+        .set(crate::audio::replaygain::PREAMP_KEY, "2")
+        .unwrap();
+    let f = facteur_de_zone(&backend, zone, a1);
+    assert!(
+        (f - db(0.0)).abs() < 1e-9,
+        "le gain de A1 a changé en cours de piste : facteur {f} (album -2 dB + préampli 2 dB attendu)"
+    );
+    assert_eq!(
+        crate::audio::replaygain::granularite_de_zone(&backend, zone, a1, ReplayGainMode::Auto),
+        ReplayGainMode::Album,
+        "le chemin du signal ne dirait plus la granularité appliquée"
+    );
+
+    // Le lancement SUIVANT d'A1 (décisions oubliées) relit la file : piste.
+    oublier_les_decisions(zone);
+    let f = facteur_de_zone(&backend, zone, a1);
+    assert!((f - db(-4.0)).abs() < 1e-9, "relancé : piste attendu, {f}");
 }

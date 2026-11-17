@@ -1535,7 +1535,9 @@ pub fn build_signal_path_lang(
         // ReplayGain disparaissait sans un mot, et un préampli réglé
         // semblait sans effet. Clé ABSENTE sous PURE, en mode off ou quand
         // la piste a un gain.
-        if !pure && let Some(rg) = replaygain_sans_gain_tague(backend, zone_id_courant, np.piste_rg()) {
+        if !pure
+            && let Some(rg) = replaygain_sans_gain_tague(backend, zone_id_courant, np.piste_rg())
+        {
             v["replaygain_untagged"] = rg;
         }
         // #6946 — Spotify : le format et le débit reçus, et pourquoi pas
