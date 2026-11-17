@@ -601,10 +601,11 @@ impl PlaybackOrchestrator {
     /// renderer. Un cache vide vaut « je ne sais pas », donc la garde.
     pub async fn dsd_suivant_tenu_sur_dlna(
         &self,
+        zone_id: i64,
         device_id: &str,
         annonce_suivante: crate::outputs::traits::AnnonceSuivante,
     ) -> bool {
-        self.refus_dsd_suivant_sur_dlna(device_id, annonce_suivante)
+        self.refus_dsd_suivant_sur_dlna(zone_id, device_id, annonce_suivante)
             .await
             .is_none()
     }
@@ -613,11 +614,17 @@ impl PlaybackOrchestrator {
     /// `device_id`, `None` s'il peut l'être. Mêmes lectures, sans réseau, que
     /// [`Self::dsd_suivant_tenu_sur_dlna`] ; voir
     /// [`crate::playback::gapless::refus_dsd_suivant_sur_dlna`].
+    ///
+    /// #8969 — le mode DSD de la zone `zone_id` est relu (base, pas de
+    /// réseau) : en « natif », le DSD part brut même au renderer qui ne
+    /// l'annonce pas ([`Self::should_dsd_passthrough`]), sa suivante aussi.
     pub async fn refus_dsd_suivant_sur_dlna(
         &self,
+        zone_id: i64,
         device_id: &str,
         annonce_suivante: crate::outputs::traits::AnnonceSuivante,
     ) -> Option<crate::playback::gapless::RefusDsdSuivant> {
+        let natif_force = ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(zone_id) == "native";
         let annonce_dsd = self
             .dsd_capabilities
             .lock()
@@ -631,6 +638,7 @@ impl PlaybackOrchestrator {
             .contains(device_id);
         crate::playback::gapless::refus_dsd_suivant_sur_dlna(
             annonce_dsd,
+            natif_force,
             annonce_suivante,
             deja_lache,
         )

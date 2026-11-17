@@ -201,12 +201,40 @@ fn lire_enregistrement(db: &Arc<dyn DbBackend>, udn: &str) -> Option<Enregistrem
 /// L'entrée de l'appareil, relue en base la première fois. La mémoire gagne
 /// sur la base : elle porte ce qui a été appris depuis le démarrage.
 fn appareil<'a>(m: &'a mut HashMap<String, Appareil>, udn: &str) -> &'a mut Appareil {
+    appareil_selon(m, udn, magasin())
+}
+
+/// [`appareil`], la base donnée en argument.
+///
+/// #8868 (FiiO K17, fil 2323) — `charge` ne passe à `true` qu'une fois la
+/// base RÉELLEMENT lue. Au démarrage, la resonde des renderers connus
+/// (`reregister_known_renderers`, lancée par `init_state`) rattache le K17
+/// AVANT que [`installer_persistance`] ne branche la base : sa première
+/// lecture se faisait sans base, l'entrée restait marquée « chargée », et la
+/// règle #6477 rangée en base n'était plus jamais relue de tout le processus.
+/// Chaque redémarrage de Tune renvoyait donc un `SetNext` au K17, qui
+/// coupait la piste une fois de plus pour que Tune la réapprenne.
+fn appareil_selon<'a>(
+    m: &'a mut HashMap<String, Appareil>,
+    udn: &str,
+    db: Option<Arc<dyn DbBackend>>,
+) -> &'a mut Appareil {
     let a = m.entry(udn.to_string()).or_default();
-    if !a.charge {
+    if !a.charge
+        && let Some(db) = db
+    {
         a.charge = true;
-        if let Some(db) = magasin()
-            && let Some(e) = lire_enregistrement(&db, udn)
-        {
+        // Une découverte d'avant la base a pu noter une version logicielle
+        // différente de celle de l'enregistrement : ce qui fut appris sous
+        // l'ancienne est oublié, comme le fait `charger_pour_appareil`. La
+        // base, elle, sera réécrite à la prochaine leçon.
+        let firmware_change = |e: &Enregistrement| {
+            matches!(
+                (a.firmware.as_deref(), e.firmware.as_deref()),
+                (Some(courant), Some(ancien)) if courant != ancien
+            )
+        };
+        if let Some(e) = lire_enregistrement(&db, udn).filter(|e| !firmware_change(e)) {
             if a.firmware.is_none() {
                 a.firmware = e.firmware;
             }
@@ -426,10 +454,21 @@ pub fn memoriser_set_next_coupe_la_piste(udn: &str) -> bool {
 /// descriptions UPnP n'en portent pas, et le refus d'un profil appris suffit
 /// alors à le faire oublier.
 pub fn charger_pour_appareil(udn: &str, firmware: Option<&str>) {
+    charger_pour_appareil_selon(udn, firmware, magasin());
+}
+
+/// Bancs (#8868) : la découverte d'un appareil AVANT que la base ne soit
+/// branchée, comme la resonde des renderers connus au démarrage.
+#[cfg(test)]
+pub(crate) fn charger_pour_appareil_avant_la_persistance(udn: &str, firmware: Option<&str>) {
+    charger_pour_appareil_selon(udn, firmware, None);
+}
+
+fn charger_pour_appareil_selon(udn: &str, firmware: Option<&str>, db: Option<Arc<dyn DbBackend>>) {
     let firmware = firmware.map(str::trim).filter(|f| !f.is_empty());
     let mut a_persister = false;
     if let Ok(mut m) = APPAREILS.lock() {
-        let a = appareil(&mut m, udn);
+        let a = appareil_selon(&mut m, udn, db);
         if let (Some(ancien), Some(courant)) = (a.firmware.as_deref(), firmware)
             && ancien != courant
             && (!a.profils.is_empty()

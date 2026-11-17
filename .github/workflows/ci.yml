@@ -54,6 +54,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Vérifier les payloads de promotion (200 Kio, aucun réseau)
+        run: python3 scripts/test-promotion-payloads-8902.py
+
       - name: Verify generated plugin lists
         run: python scripts/plugin-catalog.py --check
 
@@ -399,7 +402,7 @@ jobs:
     needs: impact
     if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true' && needs.impact.outputs.livre == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45  # test-shipped-features — ~5 min observe
+    timeout-minutes: 75  # compilation + suite complete : coupures observees a 45 min
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -969,7 +972,11 @@ jobs:
           # dependance a ete remplacee par `opus` / `opusic-sys`, maintenus
           # (#2251). Il n'y a plus d'avis a taire. RUSTSEC-2026-0459 (SQLite
           # < 3.54) a quitte la liste avec #8196 : SQLite 3.54.0 est embarque.
-          ignore: RUSTSEC-2024-0436,RUSTSEC-2024-0384
+          #
+          # RUSTSEC-2026-0543 (chrono non maintenu, publie le 17/11/2026) :
+          # aucune version corrigee, migration vers jiff/time a planifier.
+          # Justification dans .cargo/audit.toml.
+          ignore: RUSTSEC-2024-0436,RUSTSEC-2024-0384,RUSTSEC-2026-0543
       # Cet outil est exclu du workspace et possède son propre verrou.
       # L'audit de la racine ne couvre donc pas ses dépendances (#6503).
       - name: Auditer le verrou du moissonneur Roon

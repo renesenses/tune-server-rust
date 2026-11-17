@@ -277,6 +277,34 @@ pub mod sql {
         )
     }
 
+    /// #8968 — les lignes de la file autour de la ligne en cours, en UNE
+    /// requête bornée : de la précédente à celle d'après la suivante (rangs
+    /// `c-1 ..= c+2`), plus les deux premières quand `avec_la_tete` (file qui
+    /// reboucle). Rien du tout sans ligne en cours.
+    pub fn voisinage_du_courant<D: SqlDialect>(d: &D, avec_la_tete: bool) -> String {
+        let courant = |n: usize| {
+            format!(
+                "(SELECT c.position FROM queue_items c WHERE c.zone_id = {} \
+                 AND c.is_current = 1 ORDER BY c.position, c.id LIMIT 1)",
+                d.placeholder(n)
+            )
+        };
+        let tete = if avec_la_tete {
+            " OR (q.position <= 1 AND EXISTS (SELECT 1 FROM queue_items e \
+             WHERE e.zone_id = q.zone_id AND e.is_current = 1))"
+        } else {
+            ""
+        };
+        format!(
+            "{} WHERE q.zone_id = {} AND (q.position BETWEEN {} - 1 AND {} + 2{tete}) \
+             ORDER BY q.position, q.id LIMIT 8",
+            unified_select_base(),
+            d.placeholder(1),
+            courant(2),
+            courant(3),
+        )
+    }
+
     pub fn count_all<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT COUNT(*) FROM queue_items WHERE zone_id = {}",
@@ -1143,6 +1171,22 @@ impl PlayQueueRepo {
             .position(|r| r.first().and_then(|v| v.as_i64()).unwrap_or(0) != 0)
             .map(|p| p as i64);
         Ok((courant, rows.len() as i64))
+    }
+
+    /// #8968 — voir [`sql::voisinage_du_courant`] : au plus huit lignes, une
+    /// requête, sans relire la file ni ses drapeaux.
+    pub fn voisinage_du_courant(
+        &self,
+        zone_id: i64,
+        avec_la_tete: bool,
+    ) -> Result<Vec<QueueEntry>, String> {
+        let sql = self.dialect_sql(
+            |d| sql::voisinage_du_courant(d, avec_la_tete),
+            |d| sql::voisinage_du_courant(d, avec_la_tete),
+        );
+        let params: [&dyn ToSqlValue; 3] = [&zone_id, &zone_id, &zone_id];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(|cols| row_to_queue_entry(cols)).collect())
     }
 
     /// The single queue entry at `position` (source-agnostic), if any.
