@@ -425,7 +425,7 @@ impl PlaybackOrchestrator {
             }
         }
 
-        self.play_inner(req, historique).await
+        Box::pin(self.play_inner(req, historique)).await
     }
 
     /// Free-tier gate: block *activating* a brand-new zone once the free active
@@ -890,7 +890,7 @@ impl PlaybackOrchestrator {
         self.playback.set_resolving(req.zone_id, true).await;
 
         let (resolved, resolve_ms) =
-            match self.resoudre_la_demande(&req, play_start, play_gen).await {
+            match Box::pin(self.resoudre_la_demande(&req, play_start, play_gen)).await {
                 Ok(ResoluOuFini::Resolu {
                     resolved,
                     resolve_ms,
@@ -3352,14 +3352,18 @@ impl PlaybackOrchestrator {
         let message = Self::message_piste_non_demarree(geste, cause);
         warn!(zone_id, geste, cause, %message, "piste_non_demarree");
         if let Some(ref bus) = self.event_bus {
-            bus.emit(
-                "zone.playback_error",
-                serde_json::json!({
-                    "zone_id": zone_id,
-                    "error": message,
-                    "fatal": true,
-                }),
-            );
+            let mut charge = serde_json::json!({
+                "zone_id": zone_id,
+                "error": message,
+                "fatal": true,
+            });
+            // #8913 — « Suivant » vers une piste YouTube, yt-dlp absent : le
+            // code stable part avec l'événement, pour que le client propose
+            // d'activer la lecture YouTube au lieu d'afficher le texte brut.
+            if cause.contains(crate::streaming::youtube::CODE_LECTURE_YOUTUBE_INACTIVE) {
+                charge["code"] = crate::streaming::youtube::CODE_LECTURE_YOUTUBE_INACTIVE.into();
+            }
+            bus.emit("zone.playback_error", charge);
         }
     }
 
