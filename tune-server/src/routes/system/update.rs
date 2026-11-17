@@ -8333,8 +8333,9 @@ mod executables_livres_8944_tests {
                 chemin("librespot.exe")
             ))
             .unwrap_or_else(|| panic!("librespot.exe neuf jamais posé : {s}"));
+        // Le binaire est passé tel quel (séparateur Windows), pas par `chemin`.
         let binaire = s
-            .find(&format!("del \"{}\"", chemin("tune-server.exe")))
+            .find("del \"C:\\Program Files\\Tune\\tune-server.exe\"")
             .unwrap();
         assert!(sortie < web && web < parque && parque < place && place < librespot);
         assert!(librespot < binaire, "{s}");
