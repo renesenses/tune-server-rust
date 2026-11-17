@@ -462,6 +462,13 @@ pub struct PagePersonnalisee {
     pub rows: Vec<RangeePersonnalisee>,
 }
 
+/// #8935 — refus de la session du service (TIDAL 401 après rafraîchissement
+/// du jeton) : à reconnecter. Rendu en 409 et non en 401, statut que le client
+/// web prend pour la fin de la session TUNE (il efface alors son jeton).
+pub const REFUS_SESSION_DU_SERVICE: &str = "streaming_session_refused";
+/// #8935 — le service refuse l'accès à la ressource (TIDAL 403) : rendu en 403.
+pub const REFUS_ACCES_DU_SERVICE: &str = "streaming_access_refused";
+
 /// #8935 — les titres que le service recommande pour une playlist, une page
 /// à la fois. `total` : ce que le service annonce en tout (TIDAL : une
 /// centaine au plus).

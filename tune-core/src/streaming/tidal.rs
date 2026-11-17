@@ -275,6 +275,10 @@ pub struct TidalService {
     mixes_cache: std::sync::Mutex<Option<MixesCache>>,
     /// #8935 — la page « Pour vous » du compte ; même choix de verrou.
     pour_vous_cache: std::sync::Mutex<Option<pour_vous::PourVousCache>>,
+    /// #8935 — génération du cache « Pour vous », avancée à chaque vidage :
+    /// une lecture lancée avant une déconnexion ou un changement de pays n'y
+    /// réécrit pas l'ancienne page.
+    pour_vous_generation: std::sync::atomic::AtomicU64,
     enabled_override: Option<bool>,
     /// Racine de l'API, déplacée par les seuls témoins vers un serveur factice
     /// (#4803). `None` partout ailleurs : [`API_BASE`].
@@ -318,6 +322,7 @@ impl TidalService {
             featured_cache: std::sync::Mutex::new(None),
             mixes_cache: std::sync::Mutex::new(None),
             pour_vous_cache: std::sync::Mutex::new(None),
+            pour_vous_generation: std::sync::atomic::AtomicU64::new(0),
             enabled_override: None,
             base_forcee: None,
             auth_forcee: None,
@@ -3077,14 +3082,9 @@ impl StreamingService for TidalService {
             debug!("tidal_pour_vous_cache_hit");
             return Ok(page);
         }
+        let generation = self.generation_pour_vous();
         let page = self.lire_la_page_pour_vous().await?;
-        if let Ok(mut cache) = self.pour_vous_cache.lock() {
-            *cache = Some(pour_vous::PourVousCache {
-                compte: self.user_id,
-                page: page.clone(),
-                fetched_at: Instant::now(),
-            });
-        }
+        self.memoriser_la_page_pour_vous(&page, generation);
         Ok(page)
     }
 

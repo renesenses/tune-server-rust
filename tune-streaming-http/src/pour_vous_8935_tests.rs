@@ -110,6 +110,21 @@ impl StreamingService for ServicePourVous {
         if !self.gere_recos {
             return Err(TuneError::Unsupported("pas de recommandations".into()));
         }
+        match playlist_id {
+            "interdite" => {
+                return Err(TuneError::Refused {
+                    code: tune_core::streaming::REFUS_ACCES_DU_SERVICE,
+                    message: "refus".into(),
+                });
+            }
+            "session-perdue" => {
+                return Err(TuneError::Refused {
+                    code: tune_core::streaming::REFUS_SESSION_DU_SERVICE,
+                    message: "reconnecter".into(),
+                });
+            }
+            _ => {}
+        }
         self.recos
             .lock()
             .unwrap()
@@ -233,5 +248,33 @@ async fn la_route_des_recommandations_transmet_sa_page_8935() {
             ("1f2e-3d4c".to_string(), 5, 10)
         ],
         "20 titres par défaut, puis la page demandée"
+    );
+}
+
+#[tokio::test]
+async fn les_refus_du_service_ont_leur_statut_8935() {
+    let app = app(ServicePourVous {
+        nom: "refus-8935".into(),
+        page: None,
+        recos: Arc::default(),
+        gere_recos: true,
+    });
+    let (statut, corps) = lire(
+        &app,
+        "/api/v1/streaming/refus-8935/playlists/interdite/recommendations",
+    )
+    .await;
+    assert_eq!(statut, StatusCode::FORBIDDEN, "{corps}");
+    assert_eq!(corps["code"], tune_core::streaming::REFUS_ACCES_DU_SERVICE);
+    // Jamais 401 : le client web y lirait la fin de la session Tune.
+    let (statut, corps) = lire(
+        &app,
+        "/api/v1/streaming/refus-8935/playlists/session-perdue/recommendations",
+    )
+    .await;
+    assert_eq!(statut, StatusCode::CONFLICT, "{corps}");
+    assert_eq!(
+        corps["code"],
+        tune_core::streaming::REFUS_SESSION_DU_SERVICE
     );
 }

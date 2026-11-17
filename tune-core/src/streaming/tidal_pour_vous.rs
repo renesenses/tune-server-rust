@@ -155,6 +155,13 @@ impl TidalService {
                         .map(String::from),
                     ..Default::default()
                 };
+                // Une rangée vue deux fois (même identifiant) ne sert qu'une fois.
+                if rangees
+                    .iter()
+                    .any(|r: &RangeePersonnalisee| r.id == rangee.id)
+                {
+                    continue;
+                }
                 let items = module["pagedList"]["items"]
                     .as_array()
                     .map(Vec::as_slice)
@@ -200,6 +207,12 @@ impl TidalService {
         chemin: &str,
     ) -> Result<Vec<RangeePersonnalisee>, String> {
         let data = self.api_get(chemin).await?;
+        // Un refus que TIDAL rend en JSON (403, 429, 5xx) est une erreur, pas
+        // une page vide : il ne doit ni passer pour « rien pour vous » ni
+        // finir en cache.
+        if let Some(statut) = data["status"].as_u64().filter(|s| *s >= 400) {
+            return Err(format!("tidal page {statut}"));
+        }
         let (mut rangees, paresseux) = Self::rangees_de_la_page(&data);
         for (rang, chemin_module, type_module) in paresseux.into_iter().take(MODULES_PARESSEUX_MAX)
         {
@@ -260,6 +273,41 @@ impl TidalService {
     pub(super) fn vider_le_cache_pour_vous(&self) {
         if let Ok(mut cache) = self.pour_vous_cache.lock() {
             *cache = None;
+            self.pour_vous_generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// La génération du cache, lue AVANT d'aller chez TIDAL.
+    pub(super) fn generation_pour_vous(&self) -> u64 {
+        self.pour_vous_generation
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Met la page en cache, sauf si elle est vide (rien à resservir : on
+    /// relira TIDAL) ou si le cache a été vidé depuis `generation` (compte
+    /// déconnecté, pays changé pendant la lecture).
+    pub(super) fn memoriser_la_page_pour_vous(&self, page: &PagePersonnalisee, generation: u64) {
+        if page.rows.is_empty() {
+            return;
+        }
+        if let Ok(mut cache) = self.pour_vous_cache.lock() {
+            if self.generation_pour_vous() != generation {
+                debug!("tidal_pour_vous_cache_perime_non_ecrit");
+                return;
+            }
+            *cache = Some(PourVousCache {
+                compte: self.user_id,
+                page: page.clone(),
+                fetched_at: Instant::now(),
+            });
+        }
+    }
+
+    fn refus_de_session() -> TuneError {
+        TuneError::Refused {
+            code: REFUS_SESSION_DU_SERVICE,
+            message: "tidal session refused, reconnect".into(),
         }
     }
 
@@ -318,9 +366,24 @@ impl TidalService {
             .api_get(&format!(
                 "/playlists/{playlist_id}/recommendations/items?limit={limite}&offset={offset}"
             ))
-            .await?;
+            .await
+            .map_err(|e| {
+                // `api_get` a déjà tenté le rafraîchissement sur un 401.
+                if e.starts_with("token expired") {
+                    Self::refus_de_session()
+                } else {
+                    TuneError::from(e)
+                }
+            })?;
         match data["status"].as_u64() {
             Some(404) => return Err(TuneError::NotFound("tidal playlist not found".into())),
+            Some(401) => return Err(Self::refus_de_session()),
+            Some(403) => {
+                return Err(TuneError::Refused {
+                    code: REFUS_ACCES_DU_SERVICE,
+                    message: "tidal access refused".into(),
+                });
+            }
             Some(429) => return Err(TuneError::from("tidal rate limited".to_string())),
             Some(status) if status >= 400 => {
                 return Err(TuneError::from(format!(

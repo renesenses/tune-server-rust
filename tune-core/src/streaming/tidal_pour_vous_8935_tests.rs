@@ -211,6 +211,10 @@ struct Scenario {
     accueil: Option<serde_json::Value>,
     module: Option<serde_json::Value>,
     recommandations: Option<serde_json::Value>,
+    /// Les N premières pages demandées sont refusées par un 429 JSON.
+    refus_restants: Arc<std::sync::atomic::AtomicUsize>,
+    /// Statut HTTP imposé aux recommandations (401, 403…).
+    statut_recommandations: Option<u16>,
 }
 
 type Journal = Arc<std::sync::Mutex<Vec<String>>>;
@@ -255,6 +259,21 @@ async fn faux_tidal(scenario: Scenario) -> (TidalService, Journal) {
         RawQuery(q): RawQuery,
     ) -> axum::response::Response {
         noter(&journal, format!("/pages/{nom}"), q);
+        let refus = &scenario.refus_restants;
+        if refus
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |n| n.checked_sub(1),
+            )
+            .is_ok()
+        {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                axum::Json(json!({"status": 429, "subStatus": 0, "userMessage": "slow down"})),
+            )
+                .into_response();
+        }
         servir(match nom.as_str() {
             "for_you" => scenario.pour_vous.clone(),
             "home" => scenario.accueil.clone(),
@@ -281,6 +300,10 @@ async fn faux_tidal(scenario: Scenario) -> (TidalService, Journal) {
             format!("/playlists/{id}/recommendations/items"),
             q,
         );
+        if let Some(statut) = scenario.statut_recommandations {
+            let code = StatusCode::from_u16(statut).expect("statut");
+            return (code, axum::Json(json!({"status": statut, "subStatus": 0}))).into_response();
+        }
         servir(scenario.recommandations.clone())
     }
 
@@ -450,4 +473,112 @@ async fn une_playlist_inconnue_de_tidal_rend_introuvable_8935() {
         .await
         .expect_err("404 de TIDAL");
     assert!(matches!(e, TuneError::NotFound(_)), "{e:?}");
+}
+
+#[tokio::test]
+async fn un_refus_de_tidal_est_une_erreur_et_n_est_pas_mis_en_cache_8935() {
+    let (svc, journal) = faux_tidal(Scenario {
+        pour_vous: Some(page_pour_vous()),
+        accueil: Some(page_pour_vous()),
+        refus_restants: Arc::new(std::sync::atomic::AtomicUsize::new(2)),
+        ..Default::default()
+    })
+    .await;
+    // `pages/for_you` puis `pages/home` en 429 : une erreur, pas « rien pour vous ».
+    let e = svc
+        .get_for_you()
+        .await
+        .expect_err("un 429 n'est pas une page vide");
+    assert!(e.to_string().contains("429"), "{e}");
+    assert!(svc.pour_vous_depuis_le_cache().is_none());
+    // TIDAL répond de nouveau : la deuxième lecture va le chercher.
+    let page = svc.get_for_you().await.expect("page après le refus");
+    assert_eq!(page.source, "for_you");
+    assert_eq!(page.rows.len(), 6);
+    assert_eq!(
+        journal.lock().unwrap().as_slice(),
+        [
+            "/pages/for_you?deviceType=BROWSER",
+            "/pages/home?deviceType=BROWSER",
+            "/pages/for_you?deviceType=BROWSER"
+        ],
+        "la deuxième lecture appelle TIDAL"
+    );
+}
+
+#[tokio::test]
+async fn une_page_vide_n_est_pas_mise_en_cache_8935() {
+    let (svc, journal) = faux_tidal(Scenario {
+        pour_vous: Some(json!({"rows": []})),
+        accueil: Some(json!({"rows": []})),
+        ..Default::default()
+    })
+    .await;
+    assert!(svc.get_for_you().await.expect("page vide").rows.is_empty());
+    assert!(svc.get_for_you().await.expect("page vide").rows.is_empty());
+    assert_eq!(
+        journal.lock().unwrap().len(),
+        4,
+        "une page vide se relit chez TIDAL"
+    );
+}
+
+#[test]
+fn une_lecture_d_avant_le_vidage_n_ecrit_pas_le_cache_8935() {
+    let svc = TidalService::new();
+    let page = PagePersonnalisee {
+        source: "for_you".into(),
+        rows: vec![RangeePersonnalisee {
+            id: "m".into(),
+            title: "Rangée".into(),
+            albums: vec![TidalService::map_album(&json!({"id": 1, "title": "A"}))],
+            ..Default::default()
+        }],
+    };
+    // La lecture commence, puis le compte se déconnecte (ou le pays change).
+    let generation = svc.generation_pour_vous();
+    svc.vider_le_cache_pour_vous();
+    svc.memoriser_la_page_pour_vous(&page, generation);
+    assert!(
+        svc.pour_vous_depuis_le_cache().is_none(),
+        "la page de l'ancien compte ne revient pas dans le cache"
+    );
+    // Une lecture lancée après le vidage, elle, s'y range.
+    svc.memoriser_la_page_pour_vous(&page, svc.generation_pour_vous());
+    assert!(svc.pour_vous_depuis_le_cache().is_some());
+}
+
+#[test]
+fn une_rangee_vue_deux_fois_ne_sert_qu_une_fois_8935() {
+    let module = json!({
+        "id": "m-double", "type": "ALBUM_LIST", "title": "Deux fois",
+        "pagedList": {"items": [{"id": 1, "title": "A"}]}
+    });
+    let (rangees, _) = TidalService::rangees_de_la_page(&json!({
+        "rows": [{"modules": [module.clone()]}, {"modules": [module]}]
+    }));
+    assert_eq!(rangees.len(), 1, "{rangees:?}");
+}
+
+#[tokio::test]
+async fn les_refus_d_acces_et_de_session_de_tidal_ont_leur_code_8935() {
+    let uuid = "1f2e3d4c-0000-1111-2222-333344445555";
+    for (statut, code) in [
+        (403u16, REFUS_ACCES_DU_SERVICE),
+        (401, REFUS_SESSION_DU_SERVICE),
+    ] {
+        let (svc, _journal) = faux_tidal(Scenario {
+            statut_recommandations: Some(statut),
+            ..Default::default()
+        })
+        .await;
+        let e = svc
+            .get_playlist_recommendations(uuid, 20, 0)
+            .await
+            .expect_err("refus");
+        assert!(
+            matches!(e, TuneError::Refused { code: c, .. } if c == code),
+            "{statut} : {e:?}"
+        );
+    }
 }

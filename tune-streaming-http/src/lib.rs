@@ -230,8 +230,16 @@ fn svc_response<R: serde::Serialize>(result: Result<R, tune_core::TuneError>) ->
         // traduit et accompagne de « Reconnecter ». Aucune route de ce
         // convertisseur ne rendait `Refused` jusqu'ici (les refus de
         // connexion passent par `reponse_echec_auth`).
+        //
+        // #8935 — l'accès refusé par le service (TIDAL 403) sort en 403 ; la
+        // session du service refusée reste un 409 : un 401 ferait effacer au
+        // client web le jeton de la session TUNE.
         Err(tune_core::TuneError::Refused { code, message }) => (
-            StatusCode::CONFLICT,
+            if code == tune_core::streaming::REFUS_ACCES_DU_SERVICE {
+                StatusCode::FORBIDDEN
+            } else {
+                StatusCode::CONFLICT
+            },
             Json(json!({
                 "code": code,
                 "error": code,
