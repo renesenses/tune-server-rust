@@ -384,20 +384,26 @@ pub(crate) async fn waveform(
     let ondes = Arc::clone(&ONDES);
     let a_calculer = piste.clone();
     let dossier_tmp = service::dossier_temporaire(&ondes.dossier);
-    reponse(traiter(&ondes, &piste, reglage, a_joue, move || async move {
-        let audio = service::telecharger(
-            &state,
-            &a_calculer,
-            &dossier_tmp,
-            Limites::de_l_environnement(),
-        )
-        .await?;
-        let chemin = audio.chemin().to_string_lossy().into_owned();
-        let points = tune_core::audio::analyzer::generate_waveform(&chemin, POINTS).await;
-        // `audio` part ici : le fichier téléchargé est effacé.
-        drop(audio);
-        Ok(points)
-    }))
+    reponse(traiter(
+        &ondes,
+        &piste,
+        reglage,
+        a_joue,
+        move || async move {
+            let audio = service::telecharger(
+                &state,
+                &a_calculer,
+                &dossier_tmp,
+                Limites::de_l_environnement(),
+            )
+            .await?;
+            let chemin = audio.chemin().to_string_lossy().into_owned();
+            let points = tune_core::audio::analyzer::generate_waveform(&chemin, POINTS).await;
+            // `audio` part ici : le fichier téléchargé est effacé.
+            drop(audio);
+            Ok(points)
+        },
+    ))
 }
 
 #[cfg(test)]

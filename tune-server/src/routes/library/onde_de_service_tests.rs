@@ -261,7 +261,9 @@ async fn reglage_et_trente_secondes_avant_toute_analyse() {
 
 #[test]
 fn lecture_du_reglage_dans_ui_preferences() {
-    assert!(reglage_actif(Some(r#"{"barreOnde":true,"ondeStreaming":true}"#)));
+    assert!(reglage_actif(Some(
+        r#"{"barreOnde":true,"ondeStreaming":true}"#
+    )));
     for blob in [
         None,
         Some(""),
@@ -273,4 +275,3 @@ fn lecture_du_reglage_dans_ui_preferences() {
         assert!(!reglage_actif(blob), "{blob:?}");
     }
 }
-
