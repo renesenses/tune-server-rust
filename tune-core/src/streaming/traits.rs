@@ -424,6 +424,61 @@ pub struct FeaturedSection {
     pub name: String,
 }
 
+/// #8935 — une rangée d'une page personnalisée du compte (TIDAL « Pour
+/// vous ») : son titre et ce qu'elle porte, rangé par nature. Une rangée
+/// mêlée (TIDAL `MIXED_TYPES_LIST`) remplit plusieurs listes ; les mixes vont
+/// dans `playlists`, sous leur identifiant `mix:` (#7822).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RangeePersonnalisee {
+    pub id: String,
+    pub title: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subtitle: Option<String>,
+    #[serde(default)]
+    pub albums: Vec<StreamAlbum>,
+    #[serde(default)]
+    pub playlists: Vec<StreamPlaylist>,
+    #[serde(default)]
+    pub artists: Vec<StreamArtist>,
+    #[serde(default)]
+    pub tracks: Vec<StreamTrack>,
+}
+
+impl RangeePersonnalisee {
+    /// Une rangée sans rien à montrer n'est pas servie.
+    pub fn est_vide(&self) -> bool {
+        self.albums.is_empty()
+            && self.playlists.is_empty()
+            && self.artists.is_empty()
+            && self.tracks.is_empty()
+    }
+}
+
+/// #8935 — la page personnalisée du compte. `source` dit la page du service
+/// qui l'a fournie (TIDAL : `for_you`, ou `home` en repli).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PagePersonnalisee {
+    pub source: String,
+    pub rows: Vec<RangeePersonnalisee>,
+}
+
+/// #8935 — refus de la session du service (TIDAL 401 après rafraîchissement
+/// du jeton) : à reconnecter. Rendu en 409 et non en 401, statut que le client
+/// web prend pour la fin de la session TUNE (il efface alors son jeton).
+pub const REFUS_SESSION_DU_SERVICE: &str = "streaming_session_refused";
+/// #8935 — le service refuse l'accès à la ressource (TIDAL 403) : rendu en 403.
+pub const REFUS_ACCES_DU_SERVICE: &str = "streaming_access_refused";
+
+/// #8935 — les titres que le service recommande pour une playlist, une page
+/// à la fois. `total` : ce que le service annonce en tout (TIDAL : une
+/// centaine au plus).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TitresRecommandes {
+    pub tracks: Vec<StreamTrack>,
+    pub total: usize,
+    pub offset: usize,
+}
+
 /// A record label with (a page of) its albums. Qobuz `label/get`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LabelInfo {
@@ -1142,6 +1197,27 @@ pub trait StreamingService: Send + Sync {
     /// par `get_playlist_tracks`. Vide pour un service qui n'en a pas.
     async fn get_user_mixes(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
         Ok(vec![])
+    }
+    /// #8935 — la page personnalisée du compte (TIDAL « Pour vous »). Par
+    /// défaut : non prise en charge (501), ce que l'écran n'affiche pas.
+    async fn get_for_you(&self) -> Result<PagePersonnalisee, TuneError> {
+        Err(TuneError::Unsupported(
+            "personal page not supported for this service".into(),
+        ))
+    }
+    /// #8935 — les titres que le service recommande pour la playlist
+    /// `playlist_id` (TIDAL `playlists/{uuid}/recommendations/items`). Par
+    /// défaut : non pris en charge (501).
+    async fn get_playlist_recommendations(
+        &self,
+        playlist_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<TitresRecommandes, TuneError> {
+        let _ = (playlist_id, limit, offset);
+        Err(TuneError::Unsupported(
+            "playlist recommendations not supported for this service".into(),
+        ))
     }
     /// Browse the record label of an album: resolves the album's label and
     /// returns it with its full catalogue. Album-based so the shared
