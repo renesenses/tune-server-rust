@@ -109,8 +109,8 @@ pub(crate) async fn avec_langue(
 mod tests {
     use super::*;
     #[test]
-    fn quinze_catalogues_complets_et_parametres_identiques() {
-        assert_eq!(CATALOGUE.len(), 15);
+    fn seize_catalogues_complets_et_parametres_identiques() {
+        assert_eq!(CATALOGUE.len(), 16);
         fn parametres(s: &str) -> Vec<&str> {
             let mut v = s
                 .split('{')
