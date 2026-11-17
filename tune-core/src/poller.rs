@@ -1260,7 +1260,7 @@ mod radio_metadata_deviceless_tests;
 /// bibliotheque garnie.
 #[cfg(test)]
 mod autoplay_source_tests;
-// Fil 2694 — la radio de fin de file activée par défaut, ses gardes, sa marque.
+// Fil 2694 — la radio de fin de file (défaut coupé depuis #8974), ses gardes, sa marque.
 #[cfg(test)]
 mod radio_fin_de_file_2694_tests;
 

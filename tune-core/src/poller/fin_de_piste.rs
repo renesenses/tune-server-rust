@@ -183,9 +183,9 @@ impl PositionPoller {
             return;
         }
         let mode = ZoneRepo::with_backend(self.db.clone()).get_autoplay_mode(zone_id);
-        // Fil 2694 (Ilan) — la radio de fin de file, activée par défaut depuis
-        // la rc12, ne s'invite pas là où la fin est voulue (« Vider la
-        // file », réveil), ni après une piste en ERREUR, ni sur une zone qui
+        // Fil 2694 (Ilan) — la radio de fin de file (activée par défaut en
+        // rc12, désactivée par défaut depuis #8974) ne s'invite pas là où
+        // la fin est voulue (« Vider la file », réveil), ni après une piste en ERREUR, ni sur une zone qui
         // en SUIT une autre (la meneuse lance la radio, le relais la
         // propage), ni quand le lot précédent n'a joué aucun titre en entier,
         // ni sous contrôle parental. Les consignes de fin sont consommées
