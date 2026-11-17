@@ -86,7 +86,10 @@ fn frame_aligned_chunk_len(preferred: usize, bit_depth: u16, channels: u16) -> u
 /// `max_duration_s <= 0.0` est la convention « pas de limite » : `usize::MAX`.
 pub(crate) fn echantillons_de_la_fenetre(max_duration_s: f64, rate: u32, channels: u32) -> usize {
     if max_duration_s > 0.0 {
-        let trames = (max_duration_s * f64::from(rate)) as usize;
+        // #8968 — plancher TOLÉRANT : une durée exacte `n / rate` (tranche
+        // CUE à l'échantillon) vaut `n - ε` en flottant, que la troncature
+        // nue ramenait à `n - 1`.
+        let trames = (max_duration_s * f64::from(rate) + PLANCHER_TOLERANT) as usize;
         trames.saturating_mul(channels.max(1) as usize)
     } else {
         usize::MAX
@@ -2768,6 +2771,7 @@ fn decode_to_pcm_streaming_inner(
         .as_ref()
         .map(super::amorce_aac::Rogneur::depuis_le_debut);
     let mut track_id = track.id;
+    let echelle = track.time_base;
     let source_channels = audio_params
         .channels
         .as_ref()
@@ -2826,7 +2830,7 @@ fn decode_to_pcm_streaming_inner(
     let mut frames_to_skip: u64 = 0;
     if seek_s > 0.0 {
         let (cible, rogneur_apres) =
-            cible_de_recherche(seek_s, track_id, source_rate, rognage.as_ref());
+            cible_de_recherche(seek_s, track_id, source_rate, echelle, rognage.as_ref());
         match format.seek(SeekMode::Accurate, cible) {
             Ok(seeked) => {
                 rogneur = rogneur_apres;
@@ -4014,13 +4018,26 @@ fn rognage_aac(
     Some(r)
 }
 
+/// #8968 — marge du plancher appliqué à `secondes × cadence` : un instant
+/// exact `n / cadence` (borne de tranche CUE convertie à l'échantillon) vaut
+/// `n − ε` une fois en flottant. Sans cette marge, la troncature tombait sur
+/// `n − 1`. Un millionième de trame ne déplace aucun autre instant.
+const PLANCHER_TOLERANT: f64 = 1e-6;
+
 /// La cible d'un déplacement à `seek_s`. Avec une amorce AAC, la position
 /// demandée se compte en trames UTILES : l'horodatage du conteneur, lui,
 /// compte l'amorce (#8968). Rend aussi le rogneur qui s'applique ensuite.
+///
+/// #8968 — sans amorce, quand l'échelle de temps de la piste est
+/// `1 / cadence` (FLAC, WAV, AIFF…), la cible est l'horodatage
+/// `⌊seek_s × cadence⌋` à [`PLANCHER_TOLERANT`] près : une borne de tranche
+/// CUE exacte à l'échantillon y tombe exactement, là où le passage par
+/// `Time` (nanosecondes tronquées) pouvait perdre une trame.
 fn cible_de_recherche(
     seek_s: f64,
     track_id: u32,
     cadence: u32,
+    echelle: Option<symphonia::core::units::TimeBase>,
     rognage: Option<&super::amorce_aac::RognageAac>,
 ) -> (SeekTo, Option<super::amorce_aac::Rogneur>) {
     use super::amorce_aac::Rogneur;
@@ -4033,6 +4050,18 @@ fn cible_de_recherche(
                     track_id,
                 },
                 Some(Rogneur::apres_recherche(r, trame)),
+            )
+        }
+        None if echelle.is_some_and(|e| e.numer.get() == 1 && e.denom.get() == cadence) => {
+            let trame = (seek_s * f64::from(cadence) + PLANCHER_TOLERANT)
+                .floor()
+                .max(0.0) as i64;
+            (
+                SeekTo::Timestamp {
+                    ts: Timestamp::new(trame),
+                    track_id,
+                },
+                None,
             )
         }
         None => {
@@ -4153,6 +4182,7 @@ fn decode_symphonia(
         .as_ref()
         .map(super::amorce_aac::Rogneur::depuis_le_debut);
     let mut track_id = track.id;
+    let echelle = track.time_base;
     let source_rate = audio_params.sample_rate.unwrap_or(44100);
     let source_channels = audio_params
         .channels
@@ -4192,7 +4222,7 @@ fn decode_symphonia(
     let mut trames_a_sauter: u64 = 0;
     if seek_s > 0.0 {
         let (cible, rogneur_apres) =
-            cible_de_recherche(seek_s, track_id, source_rate, rognage.as_ref());
+            cible_de_recherche(seek_s, track_id, source_rate, echelle, rognage.as_ref());
         match format.seek(SeekMode::Accurate, cible) {
             Ok(seeked) => {
                 trames_a_sauter = (seeked.required_ts.get() - seeked.actual_ts.get()).max(0) as u64;
