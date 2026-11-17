@@ -109,9 +109,9 @@ pub fn balance_du_reglage(s: &rc::ChannelRemapSettings) -> Option<i32> {
         }
     };
     match (g[0], d[1]) {
-        (Some(a), Some(b)) if a == 0.0 && b == 0.0 => Some(0),
-        (gauche, Some(b)) if b == 0.0 => vers_b(gauche),
-        (Some(a), droite) if a == 0.0 => vers_b(droite).map(|b| -b),
+        (Some(0.0), Some(0.0)) => Some(0),
+        (gauche, Some(0.0)) => vers_b(gauche),
+        (Some(0.0), droite) => vers_b(droite).map(|b| -b),
         _ => None,
     }
 }
@@ -271,7 +271,9 @@ mod tests {
     }
 
     fn crete16(pcm: &[u8], voie: usize) -> i32 {
-        pcm.chunks_exact(4)
+        pcm.as_chunks::<4>()
+            .0
+            .iter()
             .map(|t| i32::from(i16::from_le_bytes([t[voie * 2], t[voie * 2 + 1]])).abs())
             .max()
             .unwrap_or(0)
