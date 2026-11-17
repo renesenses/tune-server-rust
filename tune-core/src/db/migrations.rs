@@ -6308,6 +6308,14 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "albums_release_country",
         include_str!("../../migrations/postgres/120_albums_release_country.sql"),
     ),
+    // web#3118 : index `LOWER(artists.name)` et `tracks.genre`, pour
+    // « Parce que vous aimez ». Sans jumelle SQLite (`idx_artists_name` en
+    // COLLATE NOCASE y existe déjà).
+    (
+        121,
+        "index_noms_artistes_et_genres",
+        include_str!("../../migrations/postgres/121_index_noms_artistes_et_genres.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -10252,7 +10260,9 @@ mod tests {
         // (118 = #8656, 119 = #8678, fusionnées avant).
         // Pose le pays d'édition MusicBrainz, que les facettes, le filtre
         // Pays et la passe de fond NOMMENT.
-        assert_eq!(pg_latest_version(), 120, "latest PG migration must be 120");
+        // 121 : `index_noms_artistes_et_genres` (web#3118), sans jumelle
+        // SQLite : index `LOWER(artists.name)` et `tracks.genre`.
+        assert_eq!(pg_latest_version(), 121, "latest PG migration must be 121");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
