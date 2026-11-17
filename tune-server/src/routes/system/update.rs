@@ -15,6 +15,9 @@ use crate::state::AppState;
 #[path = "installation_sure_7756.rs"]
 mod installation_sure;
 
+#[path = "compagnons_8944.rs"]
+mod compagnons;
+
 use super::paquet_macos::{self, VoieMiseAJour};
 
 /// An in-progress library scan older than this is treated as stale (a scan
@@ -3281,6 +3284,7 @@ pub(super) async fn update_install(
             if let Some(dir) = current_exe.parent() {
                 let _ = std::fs::write(dir.join("tune-update-expected.txt"), version.trim());
             }
+            arreter_les_demons_avant_la_relance(&state).await;
             info!(
                 "update_windows_exiting_for_bat_swap — tune-update.bat will swap the binary and restart"
             );
@@ -3308,6 +3312,20 @@ pub(super) async fn update_install(
     .into_response()
 }
 
+/// #8944 — arrête les démons enfants qui ne s'arrêtent pas d'eux-mêmes avec
+/// le serveur, pour que le serveur relancé les redémarre depuis les
+/// exécutables neufs.
+///
+/// `exec` (Unix) et la sortie (Windows) ne déroulent aucun destructeur :
+/// `kill_on_drop` n'y joue pas. Chaque `airplay-daemon` sort de lui-même, son
+/// entrée standard se fermant avec le serveur (tube `CLOEXEC`, lecture finie
+/// = boucle finie). `librespot` (Spotify Connect), lui, n'a pas d'entrée
+/// standard : sans cet arrêt il restait en vie, dans l'ancienne version, à
+/// côté de celui que lance le serveur relancé.
+async fn arreter_les_demons_avant_la_relance(state: &AppState) {
+    state.spotify_connect.stop().await;
+}
+
 /// Relance le serveur dans son binaire fraîchement posé (Unix).
 ///
 /// Sans `paquet` : `exec` sur place, comme toujours. Avec `paquet` (macOS,
@@ -3319,6 +3337,7 @@ async fn relancer_le_serveur(
     current_exe: &std::path::Path,
     paquet: Option<&std::path::Path>,
 ) {
+    arreter_les_demons_avant_la_relance(state).await;
     // #5141 — le paquet vient d'être remplacé : on relance PAR SON LANCEUR,
     // pour que macOS rattache le nouveau processus au nouveau paquet (son
     // `Info.plist`, sa signature, la permission « Réseau local »). Un `exec`
@@ -3715,7 +3734,8 @@ fn installer_unix_et_designer_la_relance(
     Ok(binaire)
 }
 
-/// Unix install: rename current binary to .old, put new one in place, update web/.
+/// Unix install: rename current binary to .old, put new one in place, then
+/// the bundled executables (#8944, [`compagnons`]), then web/.
 ///
 /// `binaire` : le chemin d'installation (jamais `.old`) ; `en_cours` : le
 /// fichier qui tourne. #5461 — quand la sauvegarde `<binaire>.old` EST le
@@ -3747,13 +3767,16 @@ fn install_unix(
             .map_err(|e| format!("chmod: {e}"))?;
     }
 
-    // Place : le `.new` et chaque copie de `web/` s'écrivent à côté de l'ancien.
+    // Place : le `.new`, chaque exécutable livré (#8944) et chaque copie de
+    // `web/` s'écrivent à côté de l'ancien.
     let source_web = tmp_dir.join("web");
     let cibles_web = (controles.cibles_web)(exe_dir);
+    let livres = compagnons::a_installer(tmp_dir, exe_dir, "");
     let taille_neuve = std::fs::metadata(new_binary)
         .map_err(|e| format!("read new binary: {e}"))?
         .len();
     let besoin = taille_neuve
+        + compagnons::taille(&livres)
         + installation_sure::taille_du_dossier(&source_web) * cibles_web.len() as u64
         + installation_sure::MARGE_DE_PLACE;
     installation_sure::verifier_la_place(exe_dir, besoin, controles.place_libre)?;
@@ -3778,6 +3801,17 @@ fn install_unix(
             }
         };
 
+    // #8944 — les exécutables livrés (`airplay-daemon`, `librespot`…) sont
+    // posés et vérifiés eux aussi AVANT de toucher au binaire.
+    if let Err(e) = compagnons::preparer(&livres, controles) {
+        std::fs::remove_file(&staging).ok();
+        installation_sure::abandonner_les_web(&webs_prepares);
+        error!(error = %e, "update_new_bundled_executable_rejected");
+        return Err(format!(
+            "{e} — previous binary, bundled executables and web/ kept"
+        ));
+    }
+
     let sauvegarde_en_cours = old_exe == en_cours;
     let sauvegarde_faite = if sauvegarde_en_cours || !binaire.exists() {
         warn!(
@@ -3793,24 +3827,30 @@ fn install_unix(
         if let Err(e) = (controles.renommer)(binaire, &old_exe) {
             std::fs::remove_file(&staging).ok();
             installation_sure::abandonner_les_web(&webs_prepares);
+            compagnons::abandonner(&livres);
             return Err(format!("rename current to .old: {e}"));
         }
         true
     };
 
-    // Remet l'ancien binaire ET les `web/` déjà basculés après un échec.
-    let restaurer = |cause: String, webs: &[installation_sure::WebBascule]| -> String {
-        let mut non_remis = Vec::new();
+    // Remet l'ancien binaire, les exécutables livrés ET les `web/` déjà
+    // basculés après un échec.
+    let restaurer = |cause: String,
+                     livres_bascules: &[compagnons::LivreBascule],
+                     webs: &[installation_sure::WebBascule]|
+     -> String {
+        let mut non_remis = compagnons::remettre_tous(livres_bascules);
         for b in webs.iter().rev() {
             if let Err(e) = installation_sure::remettre_un_web(b) {
                 error!(dir = %b.cible.display(), error = %e, "update_web_rollback_failed");
                 non_remis.push(format!("web/ {} NOT restored ({e})", b.cible.display()));
             }
         }
-        let quoi = if webs.is_empty() {
-            "binary"
-        } else {
-            "binary and web/"
+        let quoi = match (livres_bascules.is_empty(), webs.is_empty()) {
+            (true, true) => "binary",
+            (true, false) => "binary and web/",
+            (false, true) => "binary and bundled executables",
+            (false, false) => "binary, bundled executables and web/",
         };
         if !sauvegarde_faite {
             return if non_remis.is_empty() {
@@ -3841,7 +3881,24 @@ fn install_unix(
         error!(error = %e, "rename_new_to_current_failed, rolling back");
         std::fs::remove_file(&staging).ok();
         installation_sure::abandonner_les_web(&webs_prepares);
-        return Err(restaurer(format!("rename .new to current: {e}"), &[]));
+        compagnons::abandonner(&livres);
+        return Err(restaurer(format!("rename .new to current: {e}"), &[], &[]));
+    }
+    installation_sure::synchroniser_dossier(exe_dir);
+
+    // #8944 — chaque exécutable livré bascule après le binaire ; l'ancien
+    // reste en `<nom>.old`, à côté de `tune-server.old`.
+    let mut livres_bascules = Vec::new();
+    for (i, livre) in livres.iter().enumerate() {
+        match compagnons::basculer(livre, controles.renommer) {
+            Ok(b) => livres_bascules.push(b),
+            Err(e) => {
+                error!(error = %e, "update_bundled_executable_failed, rolling back");
+                compagnons::abandonner(&livres[i..]);
+                installation_sure::abandonner_les_web(&webs_prepares);
+                return Err(restaurer(e, &livres_bascules, &[]));
+            }
+        }
     }
     installation_sure::synchroniser_dossier(exe_dir);
 
@@ -3854,7 +3911,7 @@ fn install_unix(
             Err(e) => {
                 error!(error = %e, "update_web_failed, rolling back binary and web/");
                 installation_sure::abandonner_les_web(&webs_prepares[i..]);
-                return Err(restaurer(e, &webs_bascules));
+                return Err(restaurer(e, &livres_bascules, &webs_bascules));
             }
         }
     }
@@ -3881,6 +3938,7 @@ fn windows_update_bat(
     exe_name_new: &str,
     sans_console: bool,
     web: &[DossierWebEnAttente],
+    livres: &[DossierWebEnAttente],
 ) -> String {
     // #7750, #7754 — le `web/` servi ne se renomme pas tant que le serveur
     // tourne (« Accès refusé. (os error 5) ») : il bascule ici, une fois le
@@ -3925,6 +3983,44 @@ fn windows_update_bat(
             "if exist \"{ancien}\" rmdir /s /q \"{ancien}\"\r\n"
         ));
     }
+    // #8944 — les exécutables livrés (`airplay-daemon.exe`, `librespot.exe`…)
+    // basculent après `web/`, avant le binaire, une fois le serveur sorti.
+    // Windows laisse renommer un exécutable en cours (un démon resté en vie),
+    // pas le supprimer : l'ancien part donc en `.old` par `move`. Un échec
+    // remet ceux déjà basculés et `web/`, puis relance l'ancienne version
+    // (`:bundled_failed`). Un `.old` encore tenu reste à côté, sans gêner.
+    let mut bascule_livres = String::new();
+    let mut restaure_livres = String::new();
+    let mut nettoie_livres = String::new();
+    for (i, d) in livres.iter().enumerate() {
+        let (cible, neuf, ancien) = (&d.cible, &d.neuf, &d.ancien);
+        bascule_livres.push_str(&format!(
+            "if not exist \"{neuf}\" goto bundled_done_{i}\r\n\
+             if exist \"{ancien}\" del /f /q \"{ancien}\" >nul 2>&1\r\n\
+             if exist \"{ancien}\" goto bundled_failed\r\n\
+             if not exist \"{cible}\" goto bundled_place_{i}\r\n\
+             move /y \"{cible}\" \"{ancien}\" >nul 2>&1\r\n\
+             if exist \"{cible}\" goto bundled_failed\r\n\
+             :bundled_place_{i}\r\n\
+             move /y \"{neuf}\" \"{cible}\" >nul 2>&1\r\n\
+             if not exist \"{neuf}\" goto bundled_done_{i}\r\n\
+             if exist \"{ancien}\" move /y \"{ancien}\" \"{cible}\" >nul 2>&1\r\n\
+             goto bundled_failed\r\n\
+             :bundled_done_{i}\r\n"
+        ));
+        // Basculé = le neuf a quitté sa place et l'ancien est parqué. Un
+        // exécutable pas encore traité garde son `.new` : il est sauté.
+        restaure_livres.push_str(&format!(
+            "if exist \"{neuf}\" goto bundled_restored_{i}\r\n\
+             if not exist \"{ancien}\" goto bundled_restored_{i}\r\n\
+             del /f /q \"{cible}\" >nul 2>&1\r\n\
+             move /y \"{ancien}\" \"{cible}\" >nul 2>&1\r\n\
+             :bundled_restored_{i}\r\n"
+        ));
+        nettoie_livres.push_str(&format!(
+            "if exist \"{ancien}\" del /f /q \"{ancien}\" >nul 2>&1\r\n"
+        ));
+    }
     let web_servi = web.first().map(|d| d.cible.as_str()).unwrap_or("web");
     // #6253 — un serveur lancé sans fenêtre revient sans fenêtre. Le script
     // hérite de l'environnement du détaché : il en retire le marqueur, sans
@@ -3960,6 +4056,8 @@ fn windows_update_bat(
          timeout /t 1 /nobreak >nul\r\n\
          echo Replacing web interface...\r\n\
          {bascule_web}\
+         echo Replacing bundled programs...\r\n\
+         {bascule_livres}\
          echo Replacing binary...\r\n\
          del \"{exe}\"\r\n\
          if exist \"{exe}\" (\r\n\
@@ -3970,6 +4068,7 @@ fn windows_update_bat(
          if exist \"{exe}\" goto swap_failed\r\n\
          rename \"{new}\" \"{exe_name}\"\r\n\
          {nettoie_web}\
+         {nettoie_livres}\
          echo Starting updated server...\r\n\
          set \"TUNE_OPEN_BROWSER=0\"\r\n\
          {relance}\r\n\
@@ -3980,7 +4079,16 @@ fn windows_update_bat(
          echo Retry the update, or install it with the setup file.>> \"{err_file}\"\r\n\
          echo Update failed - web folder locked. Details written to {err_file}\r\n\
          goto relaunch_old\r\n\
+         :bundled_failed\r\n\
+         {restaure_livres}\
+         {restaure_web}\
+         echo Tune update failed: a bundled program next to {exe_name} could not be replaced.> \"{err_file}\"\r\n\
+         echo It was still in use. Nothing else was replaced: Tune keeps its current version.>> \"{err_file}\"\r\n\
+         echo Retry the update, or install it with the setup file.>> \"{err_file}\"\r\n\
+         echo Update failed - bundled program locked. Details written to {err_file}\r\n\
+         goto relaunch_old\r\n\
          :swap_failed\r\n\
+         {restaure_livres}\
          {restaure_web}\
          echo Tune update failed: could not replace {exe_name}.> \"{err_file}\"\r\n\
          echo The old binary was still locked by a running process.>> \"{err_file}\"\r\n\
@@ -4010,6 +4118,21 @@ impl DossierWebEnAttente {
             ancien: cible.with_extension("old").display().to_string(),
         }
     }
+
+    /// #8944 — un exécutable livré : `airplay-daemon.exe` →
+    /// `airplay-daemon.exe.new` / `airplay-daemon.exe.old`, les noms que pose
+    /// [`compagnons::preparer`].
+    fn du_fichier(cible: &std::path::Path) -> Self {
+        Self {
+            cible: cible.display().to_string(),
+            neuf: installation_sure::a_cote(cible, "new")
+                .display()
+                .to_string(),
+            ancien: installation_sure::a_cote(cible, "old")
+                .display()
+                .to_string(),
+        }
+    }
 }
 
 /// La bascule Windows préparée : binaire et `web/` posés à côté, script
@@ -4019,6 +4142,8 @@ struct BasculeWindows {
     bat: std::path::PathBuf,
     binaire_pose: std::path::PathBuf,
     web_en_attente: Vec<std::path::PathBuf>,
+    /// #8944 — les exécutables livrés posés en `<nom>.exe.new`.
+    livres_en_attente: Vec<compagnons::ExecutableLivre>,
 }
 
 impl BasculeWindows {
@@ -4041,6 +4166,7 @@ impl BasculeWindows {
         for cible in &self.web_en_attente {
             let _ = std::fs::remove_dir_all(cible.with_extension("new"));
         }
+        compagnons::abandonner(&self.livres_en_attente);
     }
 }
 
@@ -4083,6 +4209,26 @@ fn preparer_la_bascule_windows(
         }
     };
     info!(dirs = web_en_attente.len(), "update_win_web_staged");
+
+    // #8944 — les exécutables livrés sont posés à côté (`<nom>.exe.new`) et
+    // vérifiés contre l'archive ; le script les bascule après la sortie du
+    // serveur, comme `web/`.
+    let livres_en_attente = compagnons::a_installer(tmp_dir, exe_dir, ".exe");
+    let controles_windows = installation_sure::Controles {
+        architecture: None,
+        ..installation_sure::Controles::de_cette_machine(None)
+    };
+    if let Err(e) = compagnons::preparer(&livres_en_attente, &controles_windows) {
+        let _ = std::fs::remove_file(&new_staging);
+        for cible in &web_en_attente {
+            let _ = std::fs::remove_dir_all(cible.with_extension("new"));
+        }
+        return Err(e);
+    }
+    info!(
+        executables = livres_en_attente.len(),
+        "update_win_bundled_executables_staged"
+    );
 
     // Wait for OUR specific PID to exit, not any process named tune-server.exe.
     // Matching by image name hangs forever whenever a second tune-server.exe is
@@ -4147,12 +4293,17 @@ fn preparer_la_bascule_windows(
             .iter()
             .map(|c| DossierWebEnAttente::de(c))
             .collect::<Vec<_>>(),
+        &livres_en_attente
+            .iter()
+            .map(|l| DossierWebEnAttente::du_fichier(&l.cible))
+            .collect::<Vec<_>>(),
     );
 
     let bascule = BasculeWindows {
         bat: bat_path,
         binaire_pose: new_staging,
         web_en_attente,
+        livres_en_attente,
     };
     // A stale failure marker from a previous attempt would be misleading — clear it.
     let _ = std::fs::remove_file(&err_file);
@@ -6390,6 +6541,7 @@ mod windows_update_bat_tests {
             "tune-server.new.exe",
             false,
             &[],
+            &[],
         )
     }
 
@@ -6402,6 +6554,7 @@ mod windows_update_bat_tests {
             "tune-server.exe",
             "tune-server.new.exe",
             true,
+            &[],
             &[],
         )
     }
@@ -6519,6 +6672,7 @@ mod windows_update_bat_tests {
             "tune-server.new.exe",
             false,
             &[DossierWebEnAttente::de(std::path::Path::new(WEB))],
+            &[],
         )
     }
 
@@ -8112,5 +8266,192 @@ mod extraction_zip_confinee {
                 assert_eq!(mode & 0o7000, 0, "{f} : bits spéciaux restaurés ({mode:o})");
             }
         }
+    }
+}
+
+/// #8944 — sous Windows, les exécutables livrés (`airplay-daemon.exe`,
+/// `librespot.exe`…) basculent eux aussi, dans le script, après la sortie du
+/// serveur ; et la relance arrête les démons qui ne s'arrêtent pas seuls.
+#[cfg(test)]
+mod executables_livres_8944_tests {
+    use super::{DossierWebEnAttente, preparer_la_bascule_windows, windows_update_bat};
+
+    const DIR: &str = r"C:\Program Files\Tune";
+
+    fn script_avec_livres() -> String {
+        let livres: Vec<DossierWebEnAttente> = ["airplay-daemon.exe", "librespot.exe"]
+            .iter()
+            .map(|n| DossierWebEnAttente::du_fichier(&std::path::Path::new(DIR).join(n)))
+            .collect();
+        windows_update_bat(
+            4242,
+            r"C:\Program Files\Tune\tune-server.exe",
+            r"C:\Program Files\Tune\tune-server.new.exe",
+            r"C:\Program Files\Tune\tune-update-failed.txt",
+            "tune-server.exe",
+            "tune-server.new.exe",
+            false,
+            &[DossierWebEnAttente::de(
+                &std::path::Path::new(DIR).join("web"),
+            )],
+            &livres,
+        )
+    }
+
+    fn chemin(nom: &str) -> String {
+        std::path::Path::new(DIR).join(nom).display().to_string()
+    }
+
+    /// Le démon neuf prend la place de l'ancien après la sortie du serveur,
+    /// après `web/` et avant le binaire.
+    #[test]
+    fn le_demon_bascule_apres_la_sortie_et_avant_le_binaire_8944() {
+        let s = script_avec_livres();
+        let sortie = s.find(":do_swap").unwrap();
+        let web = s.find("goto web_done_0").unwrap();
+        let parque = s
+            .find(&format!(
+                "move /y \"{}\" \"{}\"",
+                chemin("airplay-daemon.exe"),
+                chemin("airplay-daemon.exe.old")
+            ))
+            .unwrap_or_else(|| panic!("airplay-daemon.exe n'est pas mis de côté : {s}"));
+        let place = s
+            .find(&format!(
+                "move /y \"{}\" \"{}\"",
+                chemin("airplay-daemon.exe.new"),
+                chemin("airplay-daemon.exe")
+            ))
+            .unwrap_or_else(|| panic!("airplay-daemon.exe neuf jamais posé : {s}"));
+        let librespot = s
+            .find(&format!(
+                "move /y \"{}\" \"{}\"",
+                chemin("librespot.exe.new"),
+                chemin("librespot.exe")
+            ))
+            .unwrap_or_else(|| panic!("librespot.exe neuf jamais posé : {s}"));
+        let binaire = s
+            .find(&format!("del \"{}\"", chemin("tune-server.exe")))
+            .unwrap();
+        assert!(sortie < web && web < parque && parque < place && place < librespot);
+        assert!(librespot < binaire, "{s}");
+    }
+
+    /// Le chemin nominal sort avant les branches d'échec, et les deux échecs
+    /// postérieurs à la bascule des démons (démon tenu, binaire verrouillé)
+    /// les remettent.
+    #[test]
+    fn les_echecs_remettent_les_anciens_demons_8944() {
+        let s = script_avec_livres();
+        let sortie = s.find("exit /b 0").unwrap();
+        let echec_livre = s.find(":bundled_failed").unwrap();
+        let echec_binaire = s.find(":swap_failed").unwrap();
+        assert!(sortie < echec_livre && sortie < echec_binaire);
+        let remise = format!(
+            "move /y \"{}\" \"{}\"",
+            chemin("airplay-daemon.exe.old"),
+            chemin("airplay-daemon.exe")
+        );
+        let apres_livre = &s[echec_livre..echec_binaire];
+        let apres_binaire = &s[echec_binaire..];
+        assert!(apres_livre.contains(&remise), "{s}");
+        assert!(apres_binaire.contains(&remise), "{s}");
+        assert!(
+            apres_livre.contains("goto relaunch_old"),
+            "un démon tenu doit relancer l'ancienne version : {s}"
+        );
+        assert!(!s.contains("del \"%~f0\""));
+    }
+
+    /// Sans exécutable livré, le script ne parle d'aucun (pas de label vide
+    /// qui casserait la bascule).
+    #[test]
+    fn sans_executable_livre_rien_n_est_bascule_8944() {
+        let s = windows_update_bat(
+            1,
+            r"C:\T\tune-server.exe",
+            r"C:\T\tune-server.new.exe",
+            r"C:\T\f.txt",
+            "tune-server.exe",
+            "tune-server.new.exe",
+            false,
+            &[],
+            &[],
+        );
+        assert!(!s.contains("bundled_done_"), "{s}");
+        assert!(!s.contains(".exe.old"), "{s}");
+    }
+
+    /// La préparation pose le démon neuf à côté (`.exe.new`), vérifié contre
+    /// l'archive, SANS toucher à l'installé ; un abandon le retire. Tout se
+    /// passe dans un dossier temporaire, avec de faux exécutables.
+    #[test]
+    fn la_preparation_pose_les_demons_sans_toucher_aux_installes_8944() {
+        let dossier = tempfile::tempdir().unwrap();
+        let exe = dossier.path().join("tune-server.exe");
+        std::fs::write(&exe, b"ancien serveur").unwrap();
+        std::fs::write(dossier.path().join("airplay-daemon.exe"), b"ancien demon").unwrap();
+        let archive = dossier.path().join("extrait");
+        std::fs::create_dir(&archive).unwrap();
+        let nouveau = archive.join("tune-server.exe");
+        std::fs::write(&nouveau, b"nouveau serveur").unwrap();
+        std::fs::write(archive.join("airplay-daemon.exe"), b"nouveau demon").unwrap();
+        std::fs::write(archive.join("intrus.exe"), b"intrus").unwrap();
+
+        let bascule = preparer_la_bascule_windows(&exe, &nouveau, &archive, &[]).unwrap();
+
+        let pose = dossier.path().join("airplay-daemon.exe.new");
+        assert_eq!(std::fs::read(&pose).unwrap(), b"nouveau demon");
+        assert_eq!(
+            std::fs::read(dossier.path().join("airplay-daemon.exe")).unwrap(),
+            b"ancien demon"
+        );
+        assert!(!dossier.path().join("intrus.exe.new").exists());
+        let script = std::fs::read_to_string(&bascule.bat).unwrap();
+        assert!(script.contains("airplay-daemon.exe.new"), "{script}");
+        assert!(!script.contains("librespot.exe.new"), "{script}");
+
+        bascule.abandonner();
+        assert!(!pose.exists(), "un abandon doit retirer le démon posé");
+    }
+
+    fn corps(source: &str, signature: &str) -> String {
+        let debut = source.find(signature).expect(signature);
+        let fin = source[debut..]
+            .find("\n}\n")
+            .map_or(source.len(), |f| debut + f);
+        source[debut..fin].to_string()
+    }
+
+    /// La relance (Unix, `exec`) et la sortie (Windows) arrêtent librespot
+    /// AVANT de partir : sans quoi l'ancien librespot survivait, à côté du
+    /// neuf lancé par le serveur relancé.
+    #[test]
+    fn la_relance_arrete_librespot_avant_de_partir_8944() {
+        let source = include_str!("update.rs");
+        let relance = corps(source, "async fn relancer_le_serveur(");
+        let arret = relance
+            .find("arreter_les_demons_avant_la_relance(state).await")
+            .expect("relancer_le_serveur n'arrête pas les démons");
+        let exec = relance.find(".exec()").expect("exec");
+        let lanceur = relance.find("std::process::exit(0)").expect("exit");
+        assert!(arret < exec && arret < lanceur);
+
+        let fonction = corps(source, "async fn arreter_les_demons_avant_la_relance(");
+        assert!(
+            fonction.contains("spotify_connect.stop().await"),
+            "{fonction}"
+        );
+
+        let sortie_windows = source
+            .find("update_windows_exiting_for_bat_swap")
+            .expect("sortie Windows");
+        let avant = &source[..sortie_windows];
+        let dernier_arret = avant.rfind("arreter_les_demons_avant_la_relance(&state).await");
+        let debut_bloc = avant.rfind("#[cfg(windows)]").unwrap();
+        assert!(
+            dernier_arret.is_some_and(|i| i > debut_bloc),
+            "la sortie Windows n'arrête pas les démons"
+        );
     }
 }
