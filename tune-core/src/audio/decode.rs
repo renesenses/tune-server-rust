@@ -2626,7 +2626,11 @@ fn decode_to_pcm_streaming_inner(
     // APE (#2505) and WavPack (#4120) have their own incremental paths above.
     // AIFF — including `.aifc` (#4030) — still uses the full-file decoder.
     if matches!(ext.as_str(), "aiff" | "aif" | "aifc") {
-        let decoded = decode_to_pcm(file_path, target_sample_rate, target_channels, 0.0, 0.0)?;
+        // #8983 — le départ demandé est honoré ici aussi (`decode_aiff_to_pcm`
+        // sait partir de `seek_s`). Décodé depuis 0, un saut sur une sortie
+        // locale relançait le morceau au DÉBUT pendant que la position, elle,
+        // partait de la cible : barre en avance, fin réelle jamais jouée.
+        let decoded = decode_to_pcm(file_path, target_sample_rate, target_channels, seek_s, 0.0)?;
         // Use target_bit_depth if provided, otherwise use the decoder's native depth.
         // This ensures the PCM byte encoding matches the WAV header declaration.
         let output_bd = target_bit_depth.unwrap_or(decoded.bit_depth);

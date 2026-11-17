@@ -2475,6 +2475,9 @@ mod mesure_saut_cd_5079;
 /// FLAC (ou le catalogue) ; inconnue, elle est refusée par une erreur nommée.
 #[cfg(test)]
 mod qobuz_cadence_nulle_5283_tests;
+/// #8983 — un saut Qobuz vers une sortie locale part de la position.
+#[cfg(test)]
+mod saut_qobuz_8983_tests;
 #[cfg(test)]
 mod tidal_aac_annonce_6334_tests;
 /// #7266 — de bout en bout, un FLAC CD TIDAL en DASH jusqu'au Play reçu par
