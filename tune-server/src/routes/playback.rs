@@ -5970,13 +5970,13 @@ async fn completer_references_de_service(
     source_id: &str,
     album: Option<String>,
     artiste: Option<String>,
-) -> (Option<String>, Option<String>) {
+) -> (Option<String>, Option<String>, Option<i64>) {
     if (album.is_some() && artiste.is_some()) || source == "bandcamp" {
-        return (album, artiste);
+        return (album, artiste, None);
     }
     // Le service SANS garder le registre verrouillé pendant la requête.
     let Some(svc) = state.services.lock().await.get(source) else {
-        return (album, artiste);
+        return (album, artiste, None);
     };
     let svc = svc.read().await;
     match tokio::time::timeout(DELAI_FICHE_POUR_LES_REFERENCES, svc.get_track(source_id)).await {
@@ -5987,6 +5987,10 @@ async fn completer_references_de_service(
             artiste.or_else(|| {
                 crate::routes::zones::identifiant_de_service_sur(t.artist_id.as_deref())
             }),
+            (t.id == source_id)
+                .then(|| i64::try_from(t.duration_ms).ok())
+                .flatten()
+                .filter(|d| *d > 0),
         ),
         Ok(Err(e)) => {
             tracing::debug!(
@@ -5995,14 +5999,14 @@ async fn completer_references_de_service(
                 error = %e,
                 "file_references_de_service_fiche_refusee_6079"
             );
-            (album, artiste)
+            (album, artiste, None)
         }
         Err(_) => {
             warn!(
                 source,
                 source_id, "file_references_de_service_fiche_trop_lente_6079"
             );
-            (album, artiste)
+            (album, artiste, None)
         }
     }
 }
@@ -6174,7 +6178,7 @@ async fn queue_add(
         let artiste_demande =
             crate::routes::zones::identifiant_de_service_sur(body.artist_id_service.as_deref())
                 .or(meta.artist_id_service);
-        let (album_ref, artist_ref) = completer_references_de_service(
+        let (album_ref, artist_ref, duree_fiche) = completer_references_de_service(
             &state,
             source,
             source_id,
@@ -6190,7 +6194,11 @@ async fn queue_add(
             artist: meta.artist,
             album: meta.album,
             cover_url: meta.cover,
-            duration_ms: meta.duration_ms,
+            duration_ms: if meta.duration_ms > 0 {
+                meta.duration_ms
+            } else {
+                duree_fiche.unwrap_or(meta.duration_ms)
+            },
             track_number: meta.track_number,
             disc_number: meta.disc_number,
             artist_ref,
@@ -6368,6 +6376,9 @@ async fn queue_add(
         .update_queue_info(zone_id, current_pos, total)
         .await;
     persist_queue_async(&state, zone_id);
+    if count > 0 {
+        duree_favori_8848::completer(&state, zone_id, &inputs);
+    }
     // Le succès aussi doit laisser une trace : c'est elle qui permet de dire à
     // un utilisateur « votre ajout est bien arrivé, à telle position » plutôt
     // que de lui demander de réessayer. `position` vaut `None` pour un ajout
@@ -11766,3 +11777,10 @@ mod echec_transfert_6155_tests;
 #[cfg(test)]
 #[path = "playback/remplacement_volontaire_7247_tests.rs"]
 mod remplacement_volontaire_7247_tests;
+
+#[cfg(test)]
+#[path = "playback/favori_direct_duree_8848_tests.rs"]
+mod favori_direct_duree_8848_tests;
+
+#[path = "playback/duree_favori_8848.rs"]
+mod duree_favori_8848;
