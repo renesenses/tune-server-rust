@@ -46,7 +46,8 @@ impl Ignorees {
 
     /// L'alerte `raison` de la piste `t` est-elle ignorée (piste ou album) ?
     pub(super) fn contient(&self, t: &Track, raison: &str) -> bool {
-        let piste = t.id.is_some_and(|id| self.0.contains(&("track", id, raison.to_string())));
+        let piste =
+            t.id.is_some_and(|id| self.0.contains(&("track", id, raison.to_string())));
         let album = t
             .album_id
             .is_some_and(|id| self.0.contains(&("album", id, raison.to_string())));
@@ -145,7 +146,10 @@ pub(super) async fn ignorer(
     Json(d): Json<Demande>,
 ) -> impl IntoResponse {
     if !raison_connue(&d.reason) {
-        return erreur(StatusCode::BAD_REQUEST, format!("unknown reason: {}", d.reason));
+        return erreur(
+            StatusCode::BAD_REQUEST,
+            format!("unknown reason: {}", d.reason),
+        );
     }
     let piste = match tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone())
         .get(d.track_id)

@@ -65,8 +65,8 @@ impl Portee {
 /// La portée d'une alerte `raison` sur une piste d'album `album_id` titré
 /// `album_titre` (voir l'en-tête du module).
 pub fn portee_pour(raison: &str, album_id: Option<i64>, album_titre: Option<&str>) -> Portee {
-    let album_reel = album_id.is_some_and(|id| id > 0)
-        && album_titre.is_some_and(|t| !t.trim().is_empty());
+    let album_reel =
+        album_id.is_some_and(|id| id > 0) && album_titre.is_some_and(|t| !t.trim().is_empty());
     if raison == "missing_artist" && album_reel {
         Portee::Album
     } else {

@@ -1202,7 +1202,12 @@ async fn list_doubtful_metadata(
             // alerte : l'écran le dit sur le bouton.
             let ignore_scopes: serde_json::Map<String, serde_json::Value> = reasons
                 .iter()
-                .map(|r| (r.to_string(), json!(alertes_ignorees::portee_de(t, r).as_str())))
+                .map(|r| {
+                    (
+                        r.to_string(),
+                        json!(alertes_ignorees::portee_de(t, r).as_str()),
+                    )
+                })
                 .collect();
             json!({
                 "id": t.id,
@@ -3143,10 +3148,10 @@ async fn merge_albums(
 #[cfg(test)]
 mod tests_fusion_compilation;
 
-mod artiste_du_dossier;
 mod alertes_ignorees;
 #[cfg(test)]
 mod alertes_ignorees_tests_8958;
+mod artiste_du_dossier;
 
 #[cfg(test)]
 mod year_path_tests {

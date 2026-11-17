@@ -33,21 +33,46 @@ async fn route(state: &AppState, methode: &str, uri: &str, corps: &str) -> (Stat
 fn etat() -> AppState {
     let state = AppState::new(":memory:", 0, Default::default()).expect("état");
     let b = &state.backend;
-    b.execute("INSERT INTO artists (id, name) VALUES (1, 'Unknown Artist')", &[])
-        .expect("artiste inconnu");
+    b.execute(
+        "INSERT INTO artists (id, name) VALUES (1, 'Unknown Artist')",
+        &[],
+    )
+    .expect("artiste inconnu");
     b.execute("INSERT INTO artists (id, name) VALUES (2, 'Didier')", &[])
         .expect("artiste");
-    b.execute("INSERT INTO albums (id, title) VALUES (1, 'Sound Effects')", &[])
-        .expect("album");
+    b.execute(
+        "INSERT INTO albums (id, title) VALUES (1, 'Sound Effects')",
+        &[],
+    )
+    .expect("album");
     for (id, artiste, album, duree, chemin) in [
-        (1i64, 1i64, Some(1i64), 180_000i64, "/data/recordings/Tidal/Prince/Ultimate/01.flac"),
-        (2, 1, Some(1), 2_000, "/data/recordings/Tidal/Prince/Ultimate/02.flac"),
+        (
+            1i64,
+            1i64,
+            Some(1i64),
+            180_000i64,
+            "/data/recordings/Tidal/Prince/Ultimate/01.flac",
+        ),
+        (
+            2,
+            1,
+            Some(1),
+            2_000,
+            "/data/recordings/Tidal/Prince/Ultimate/02.flac",
+        ),
         (3, 2, None, 3_000, "/m/divers/bip.flac"),
     ] {
         b.execute(
             "INSERT INTO tracks (id, title, artist_id, album_id, duration_ms, source, file_path) \
              VALUES (?1, ?2, ?3, ?4, ?5, 'local', ?6)",
-            &[&id as &dyn ToSqlValue, &format!("p{id}"), &artiste, &album, &duree, &chemin],
+            &[
+                &id as &dyn ToSqlValue,
+                &format!("p{id}"),
+                &artiste,
+                &album,
+                &duree,
+                &chemin,
+            ],
         )
         .expect("piste");
     }
@@ -66,24 +91,38 @@ async fn douteuses(state: &AppState) -> Value {
 }
 
 fn raisons(v: &Value, id: i64) -> Option<Vec<String>> {
-    v["items"].as_array()?.iter().find(|i| i["id"] == id).map(|i| {
-        i["reasons"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|r| r.as_str().unwrap().to_string())
-            .collect()
-    })
+    v["items"]
+        .as_array()?
+        .iter()
+        .find(|i| i["id"] == id)
+        .map(|i| {
+            i["reasons"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r.as_str().unwrap().to_string())
+                .collect()
+        })
 }
 
 #[tokio::test]
 async fn la_liste_annonce_la_portee_de_chaque_alerte() {
     let state = etat();
     let v = douteuses(&state).await;
-    let p2 = v["items"].as_array().unwrap().iter().find(|i| i["id"] == 2).unwrap();
+    let p2 = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == 2)
+        .unwrap();
     assert_eq!(p2["ignore_scopes"]["missing_artist"], "album", "{p2}");
     assert_eq!(p2["ignore_scopes"]["very_short"], "track", "{p2}");
-    let p3 = v["items"].as_array().unwrap().iter().find(|i| i["id"] == 3).unwrap();
+    let p3 = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == 3)
+        .unwrap();
     assert_eq!(p3["ignore_scopes"]["missing_album"], "track", "{p3}");
 }
 
@@ -93,7 +132,13 @@ async fn la_liste_annonce_la_portee_de_chaque_alerte() {
 async fn piste_tres_courte_ignoree_garde_son_autre_alerte() {
     let state = etat();
     assert_eq!(douteuses(&state).await["total"], 3);
-    let (code, r) = route(&state, "POST", "/doubtful/ignored", r#"{"track_id":2,"reason":"very_short"}"#).await;
+    let (code, r) = route(
+        &state,
+        "POST",
+        "/doubtful/ignored",
+        r#"{"track_id":2,"reason":"very_short"}"#,
+    )
+    .await;
     assert_eq!(code, StatusCode::OK, "{r}");
     assert_eq!(r["scope"], "track");
     assert_eq!(r["target_id"], 2);
@@ -102,7 +147,13 @@ async fn piste_tres_courte_ignoree_garde_son_autre_alerte() {
     assert_eq!(raisons(&v, 2), Some(vec!["missing_artist".to_string()]));
 
     // Rejouée : rien de plus.
-    let (_, r) = route(&state, "POST", "/doubtful/ignored", r#"{"track_id":2,"reason":"very_short"}"#).await;
+    let (_, r) = route(
+        &state,
+        "POST",
+        "/doubtful/ignored",
+        r#"{"track_id":2,"reason":"very_short"}"#,
+    )
+    .await;
     assert_eq!(r["added"], false);
 }
 
@@ -111,9 +162,21 @@ async fn piste_tres_courte_ignoree_garde_son_autre_alerte() {
 async fn artiste_manquant_ignore_pour_tout_l_album() {
     let state = etat();
     // L'autre sens d'abord : sans le choix, l'aperçu les prend bien.
-    let (_, avant) = route(&state, "POST", "/doubtful/artist-from-folder", r#"{"dry_run":true}"#).await;
+    let (_, avant) = route(
+        &state,
+        "POST",
+        "/doubtful/artist-from-folder",
+        r#"{"dry_run":true}"#,
+    )
+    .await;
     assert_eq!(avant["tracks"], 2, "aperçu avant : {avant}");
-    let (code, r) = route(&state, "POST", "/doubtful/ignored", r#"{"track_id":1,"reason":"missing_artist"}"#).await;
+    let (code, r) = route(
+        &state,
+        "POST",
+        "/doubtful/ignored",
+        r#"{"track_id":1,"reason":"missing_artist"}"#,
+    )
+    .await;
     assert_eq!(code, StatusCode::OK, "{r}");
     assert_eq!(r["scope"], "album");
     assert_eq!(r["target_id"], 1);
@@ -131,7 +194,13 @@ async fn artiste_manquant_ignore_pour_tout_l_album() {
     assert_eq!(compte, 2);
 
     // Et l'écriture de l'artiste du dossier ne la touche plus.
-    let (_, apercu) = route(&state, "POST", "/doubtful/artist-from-folder", r#"{"dry_run":true}"#).await;
+    let (_, apercu) = route(
+        &state,
+        "POST",
+        "/doubtful/artist-from-folder",
+        r#"{"dry_run":true}"#,
+    )
+    .await;
     assert_eq!(apercu["tracks"], 0, "aperçu : {apercu}");
 }
 
@@ -139,10 +208,26 @@ async fn artiste_manquant_ignore_pour_tout_l_album() {
 #[tokio::test]
 async fn revoir_puis_annuler() {
     let state = etat();
-    route(&state, "POST", "/doubtful/ignored", r#"{"track_id":3,"reason":"very_short"}"#).await;
-    route(&state, "POST", "/doubtful/ignored", r#"{"track_id":3,"reason":"missing_album"}"#).await;
+    route(
+        &state,
+        "POST",
+        "/doubtful/ignored",
+        r#"{"track_id":3,"reason":"very_short"}"#,
+    )
+    .await;
+    route(
+        &state,
+        "POST",
+        "/doubtful/ignored",
+        r#"{"track_id":3,"reason":"missing_album"}"#,
+    )
+    .await;
     let v = douteuses(&state).await;
-    assert_eq!(raisons(&v, 3), None, "les deux alertes de la piste 3 sont ignorées : {v}");
+    assert_eq!(
+        raisons(&v, 3),
+        None,
+        "les deux alertes de la piste 3 sont ignorées : {v}"
+    );
 
     let (code, l) = route(&state, "GET", "/doubtful/ignored", "").await;
     assert_eq!(code, StatusCode::OK);
@@ -152,7 +237,10 @@ async fn revoir_puis_annuler() {
 
     let (code, r) = route(&state, "DELETE", "/doubtful/ignored/track/3/very_short", "").await;
     assert_eq!(code, StatusCode::OK, "{r}");
-    assert_eq!(raisons(&douteuses(&state).await, 3), Some(vec!["very_short".to_string()]));
+    assert_eq!(
+        raisons(&douteuses(&state).await, 3),
+        Some(vec!["very_short".to_string()])
+    );
     let (_, l) = route(&state, "GET", "/doubtful/ignored", "").await;
     assert_eq!(l["total"], 1);
 
@@ -163,11 +251,29 @@ async fn revoir_puis_annuler() {
 #[tokio::test]
 async fn demandes_refusees() {
     let state = etat();
-    let (code, _) = route(&state, "POST", "/doubtful/ignored", r#"{"track_id":2,"reason":"mauvaise"}"#).await;
+    let (code, _) = route(
+        &state,
+        "POST",
+        "/doubtful/ignored",
+        r#"{"track_id":2,"reason":"mauvaise"}"#,
+    )
+    .await;
     assert_eq!(code, StatusCode::BAD_REQUEST);
-    let (code, _) = route(&state, "POST", "/doubtful/ignored", r#"{"track_id":99,"reason":"very_short"}"#).await;
+    let (code, _) = route(
+        &state,
+        "POST",
+        "/doubtful/ignored",
+        r#"{"track_id":99,"reason":"very_short"}"#,
+    )
+    .await;
     assert_eq!(code, StatusCode::NOT_FOUND);
-    let (code, _) = route(&state, "DELETE", "/doubtful/ignored/disque/1/very_short", "").await;
+    let (code, _) = route(
+        &state,
+        "DELETE",
+        "/doubtful/ignored/disque/1/very_short",
+        "",
+    )
+    .await;
     assert_eq!(code, StatusCode::BAD_REQUEST);
     // Rien n'a été retenu.
     assert_eq!(douteuses(&state).await["total"], 3);
@@ -177,8 +283,17 @@ async fn demandes_refusees() {
 #[tokio::test]
 async fn choix_orphelin_purge() {
     let state = etat();
-    route(&state, "POST", "/doubtful/ignored", r#"{"track_id":3,"reason":"very_short"}"#).await;
-    state.backend.execute("DELETE FROM tracks WHERE id = 3", &[]).unwrap();
+    route(
+        &state,
+        "POST",
+        "/doubtful/ignored",
+        r#"{"track_id":3,"reason":"very_short"}"#,
+    )
+    .await;
+    state
+        .backend
+        .execute("DELETE FROM tracks WHERE id = 3", &[])
+        .unwrap();
     let (_, l) = route(&state, "GET", "/doubtful/ignored", "").await;
     assert_eq!(l["total"], 0, "{l}");
 }
