@@ -1812,11 +1812,15 @@ fn spawn_alarm_scheduler(state: &AppState) {
     );
     alarm_sched.spawn();
     // #8213 — arrêt programmé de la lecture à heure fixe ; avec
-    // `action: "poweroff"`, extinction de la machine par la fonction unique
-    // d'extinction (refusée hors Tune OS).
-    let extinction: tune_core::arret_programme::Extinction = Arc::new(|| {
-        Box::pin(crate::routes::appliance::ordonner(
-            crate::routes::appliance::OrdreMachine::Eteindre,
+    // `action: "poweroff"`, extinction de la machine : Tune OS par sa fonction
+    // d'extinction, hôte ordinaire par `extinction_hote` (#8909), jamais dans
+    // un conteneur. Ce crochet est le SEUL appelant de
+    // `extinction_hote::extinction_programmee`.
+    let db_extinction = state.backend.clone();
+    let extinction: tune_core::arret_programme::Extinction = Arc::new(move |mode_range| {
+        Box::pin(crate::extinction_hote::extinction_programmee(
+            db_extinction.clone(),
+            mode_range,
         ))
     });
     Arc::new(
@@ -3010,7 +3014,8 @@ fn spawn_reprise_favoris_streaming(state: &AppState) {
                 .and_then(|v| v.trim().parse::<i64>().ok())
                 .filter(|&id| id > 0)
                 .unwrap_or(1);
-        let comptes = crate::routes::profiles::reprendre_les_favoris(&state, profil, None).await;
+        let mut comptes =
+            crate::routes::profiles::reprendre_les_favoris(&state, profil, None).await;
         let services = comptes.as_object().map(|o| o.len()).unwrap_or(0);
         if services > 0 {
             info!(
@@ -3020,6 +3025,17 @@ fn spawn_reprise_favoris_streaming(state: &AppState) {
                 "reprise_favoris_streaming_au_demarrage"
             );
         }
+        // #8766 — un service qui limitait les demandes (`429`) est repris
+        // après le `Retry-After` annoncé, au lieu d'être abandonné.
+        let state = &state;
+        tune_core::streaming::favorites_import::reprogrammer_apres_les_limites(
+            &mut comptes,
+            std::time::Duration::from_secs(1),
+            |nom| async move {
+                crate::routes::profiles::reprendre_les_favoris(state, profil, Some(&nom)).await
+            },
+        )
+        .await;
     });
 }
 

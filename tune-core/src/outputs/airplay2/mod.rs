@@ -1033,7 +1033,9 @@ impl OutputTarget for Airplay2Output {
         match self
             .send(&serde_json::json!({
                 "cmd": "volume",
-                "level": volume,
+                // #8855 — le démon convertit par 20·log10 : on lui donne le
+                // niveau qui retombe sur la courbe commune (-30..0 dB).
+                "level": crate::outputs::volume_airplay_8855::niveau_pour_le_demon(volume),
             }))
             .await
         {
@@ -1059,7 +1061,7 @@ impl OutputTarget for Airplay2Output {
         match self
             .send(&serde_json::json!({
                 "cmd": "volume",
-                "level": vol,
+                "level": crate::outputs::volume_airplay_8855::niveau_pour_le_demon(vol),
             }))
             .await
         {
