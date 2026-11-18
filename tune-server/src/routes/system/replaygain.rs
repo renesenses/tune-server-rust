@@ -53,12 +53,26 @@ pub(crate) async fn replaygain_progress(State(state): State<AppState>) -> Json<V
     // l'écran Santé sonde en boucle. Le payer à chaque sondage pendant qu'une
     // fonction est simplement éteinte serait une charge permanente pour un
     // chiffre que personne n'attend.
+    //
+    // #9116 — et jamais deux fois pendant une pause : la passe suspendue ne
+    // peut plus faire bouger ces chiffres, le dernier relevé est resservi
+    // (`avancement_suspendu_9116`). Compté hors de l'exécuteur.
+    let releves = &state.comptages.releves;
+    let suspendu =
+        tune_core::taches_de_fond::est_en_pause(tune_core::taches_de_fond::Tache::ReplayGain);
     let (processed, total) = if avancement.a_parle() {
         (avancement.traitees, avancement.total)
     } else if enabled {
+        let b = state.backend.clone();
         (
             0,
-            tune_core::audio::replaygain::compter_les_candidats_replaygain(&state.backend),
+            releves
+                .rg_candidats
+                .lire("replaygain_progress", suspendu, None, move || {
+                    tune_core::audio::replaygain::compter_les_candidats_replaygain(&b)
+                })
+                .await
+                .unwrap_or(0),
         )
     } else {
         (0, 0)
@@ -70,7 +84,14 @@ pub(crate) async fn replaygain_progress(State(state): State<AppState>) -> Json<V
     // (#4254). `waiting_reason` ne s'allume que si c'est la SEULE chose qui
     // reste — même contrat que `/library/search/acoustic/status` (#4187).
     let deferred = if enabled {
-        tune_core::audio::replaygain::compter_les_reportees_par_chemin(&state.backend)
+        let b = state.backend.clone();
+        releves
+            .rg_reportees
+            .lire("replaygain_progress", suspendu, None, move || {
+                tune_core::audio::replaygain::compter_les_reportees_par_chemin(&b)
+            })
+            .await
+            .unwrap_or(0)
     } else {
         0
     };
@@ -80,7 +101,15 @@ pub(crate) async fn replaygain_progress(State(state): State<AppState>) -> Json<V
     // base. Mis en cache : l'écran sonde en boucle, le comptage parcourt
     // toute la table `tracks` (528 000 pistes chez un testeur).
     let bibliotheque = if enabled {
-        state.bibliotheque_rg.lire(&state.backend)
+        let b = state.backend.clone();
+        let cache = state.bibliotheque_rg.clone();
+        releves
+            .rg_bibliotheque
+            .lire("replaygain_progress", suspendu, None, move || {
+                cache.lire(&b)
+            })
+            .await
+            .flatten()
     } else {
         None
     };

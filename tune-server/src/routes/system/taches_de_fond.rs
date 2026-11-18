@@ -267,7 +267,14 @@ pub(crate) async fn pause_tache(
     let Some(tache) = Tache::depuis_id(&id) else {
         return inconnue(&id).into_response();
     };
-    match tune_core::taches_de_fond::mettre_en_pause(&state.backend, tache) {
+    // #9116 — hors de l'exécuteur : l'écriture peut attendre son tour
+    // derrière une base engorgée, la pause en mémoire, elle, est déjà posée.
+    let b = state.backend.clone();
+    let ecrit =
+        tokio::task::spawn_blocking(move || tune_core::taches_de_fond::mettre_en_pause(&b, tache))
+            .await
+            .unwrap_or_else(|e| Err(format!("pause : écriture interrompue ({e})")));
+    match ecrit {
         Ok(()) => reponse(&state),
         Err(e) => echec(e).into_response(),
     }
@@ -305,7 +312,12 @@ pub(crate) async fn reprendre_tache(
 /// même pause sur les six traitements, une par une — pas un septième drapeau
 /// « global », qui se désynchroniserait des six dès qu'on en reprend un seul.
 pub(crate) async fn tout_suspendre(State(state): State<AppState>) -> impl IntoResponse {
-    match tune_core::taches_de_fond::tout_suspendre(&state.backend) {
+    // #9116 — hors de l'exécuteur, même raison que `pause_tache`.
+    let b = state.backend.clone();
+    let ecrit = tokio::task::spawn_blocking(move || tune_core::taches_de_fond::tout_suspendre(&b))
+        .await
+        .unwrap_or_else(|e| Err(format!("pause : écriture interrompue ({e})")));
+    match ecrit {
         Ok(()) => reponse(&state),
         Err(e) => echec(e).into_response(),
     }

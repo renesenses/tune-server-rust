@@ -324,9 +324,24 @@ pub fn reprendre(backend: &Arc<dyn DbBackend>, tache: Tache) -> Result<(), Strin
 /// part : un second drapeau se désynchroniserait des six premiers dès qu'on
 /// reprend UNE tâche, et l'écran afficherait « tout suspendu » sur une passe
 /// qui décode.
+///
+/// #9116 (fil 2935) — les NEUF bits du miroir sont posés d'abord, en une
+/// fois : chaque passe s'arrête à sa prochaine frontière et chaque jauge se
+/// fige sans attendre les neuf écritures en base, qui pouvaient patienter
+/// derrière une base engorgée (« suspendre prend déjà au moins 5 minutes »).
+/// Si une écriture échoue, les tâches qui n'étaient pas déjà en pause sont
+/// rendues à leur état d'avant et l'erreur remonte, comme avant.
 pub fn tout_suspendre(backend: &Arc<dyn DbBackend>) -> Result<(), String> {
-    for tache in Tache::TOUTES {
-        mettre_en_pause(backend, tache)?;
+    let tous = Tache::TOUTES.into_iter().fold(0u32, |m, t| m | t.bit());
+    let avant = PAUSES.fetch_or(tous, Ordering::Relaxed);
+    for (i, tache) in Tache::TOUTES.into_iter().enumerate() {
+        if let Err(e) = ecrire(backend, tache, true) {
+            // Les tâches déjà écrites restent en pause (base ET miroir, comme
+            // avant) ; les autres reprennent l'état qu'elles avaient.
+            let non_ecrites = Tache::TOUTES[i..].iter().fold(0u32, |m, t| m | t.bit());
+            PAUSES.fetch_and(!(non_ecrites & !avant), Ordering::Relaxed);
+            return Err(e);
+        }
     }
     Ok(())
 }
@@ -339,17 +354,26 @@ pub fn tout_reprendre(backend: &Arc<dyn DbBackend>) -> Result<(), String> {
     Ok(())
 }
 
-/// La base D'ABORD, le miroir ensuite.
+/// Une REPRISE : la base d'abord, le miroir ensuite — si l'écriture échoue,
+/// la passe reste garée et l'interface rend l'erreur.
 ///
-/// Cet ordre est le seul sûr : si l'écriture échoue, le miroir n'a pas bougé
-/// et l'interface rendra l'erreur. L'inverse laisserait une pause visible en
-/// mémoire que le redémarrage lèverait sans prévenir.
+/// Une PAUSE (#9116) : le miroir d'abord, pour qu'elle prenne effet tout de
+/// suite, même quand l'écriture attend son tour derrière une base engorgée ;
+/// si l'écriture échoue, le bit est retiré (s'il ne l'était pas avant) et
+/// l'erreur remonte. Ni l'un ni l'autre ne laisse donc, l'appel rendu, une
+/// pause en mémoire que la base ne porte pas.
 fn ecrire(backend: &Arc<dyn DbBackend>, tache: Tache, en_pause: bool) -> Result<(), String> {
     let reglages = SettingsRepo::with_backend(backend.clone());
-    reglages.set(tache.cle_reglage(), if en_pause { "true" } else { "false" })?;
     if en_pause {
-        PAUSES.fetch_or(tache.bit(), Ordering::Relaxed);
+        let avant = PAUSES.fetch_or(tache.bit(), Ordering::Relaxed);
+        if let Err(e) = reglages.set(tache.cle_reglage(), "true") {
+            if avant & tache.bit() == 0 {
+                PAUSES.fetch_and(!tache.bit(), Ordering::Relaxed);
+            }
+            return Err(e);
+        }
     } else {
+        reglages.set(tache.cle_reglage(), "false")?;
         PAUSES.fetch_and(!tache.bit(), Ordering::Relaxed);
     }
     tracing::info!(tache = tache.id(), en_pause, "tache_de_fond_pause_modifiee");

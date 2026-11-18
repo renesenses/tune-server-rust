@@ -567,8 +567,42 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
     // (racines exclues) : une piste hors périmètre n'est plus
     // du travail, ni à faire ni fait. Sans périmètre, ce sont les compteurs
     // d'avant, à l'identique.
+    //
+    // #9116 — les cinq compteurs de la jauge parcourent la bibliothèque : ils
+    // sont comptés ENSEMBLE hors de l'exécuteur, et figés pendant la pause de
+    // l'analyse acoustique (`avancement_suspendu_9116`).
     #[cfg(feature = "audio-embedding")]
-    let analysed = tune_core::audio::embedding_store::analysed_count_in_scope(&state.backend);
+    let [analysed, eligible, processed, deferred, apres_echecs] = {
+        let b = state.backend.clone();
+        state
+            .comptages
+            .releves
+            .acoustique
+            .lire(
+                "acoustic_status",
+                tune_core::taches_de_fond::est_en_pause(
+                    tune_core::taches_de_fond::Tache::Acoustique,
+                ),
+                None,
+                move || {
+                    use tune_core::audio::embedding_store as es;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    let seuil = tune_core::library::local_path::deferral_threshold(now);
+                    [
+                        es::analysed_count_in_scope(&b),
+                        es::eligible_count(&b),
+                        es::processed_count_in_scope(&b),
+                        es::deferred_count(&b, &seuil),
+                        es::retry_later_count(&b, &seuil),
+                    ]
+                },
+            )
+            .await
+            .unwrap_or([0; 5])
+    };
     #[cfg(not(feature = "audio-embedding"))]
     let analysed = 0_i64;
 
@@ -576,8 +610,6 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
     // pas la bibliothèque entière (le DSD et les pistes sans fichier local en
     // sont exclus). Sans lui, l'interface n'avait qu'un compteur qui montait
     // sans qu'on sache vers quoi.
-    #[cfg(feature = "audio-embedding")]
-    let eligible = tune_core::audio::embedding_store::eligible_count(&state.backend);
     #[cfg(not(feature = "audio-embedding"))]
     let eligible = 0_i64;
 
@@ -586,8 +618,6 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
     // échecs, et confondre les deux figeait la jauge sous 100 % à jamais
     // (#1819). C'est `processed` qui doit piloter la barre : il atteint le
     // dénominateur quand il ne reste plus rien à faire.
-    #[cfg(feature = "audio-embedding")]
-    let processed = tune_core::audio::embedding_store::processed_count_in_scope(&state.backend);
     #[cfg(not(feature = "audio-embedding"))]
     let processed = 0_i64;
 
@@ -603,18 +633,6 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
     // la requête des candidats, et reste comptée séparément (#4187).
     // Les pistes en échec répété mises « à réessayer plus tard » y sont
     // comptées aussi (#9046).
-    #[cfg(feature = "audio-embedding")]
-    let (deferred, apres_echecs) = {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        let seuil = tune_core::library::local_path::deferral_threshold(now);
-        (
-            tune_core::audio::embedding_store::deferred_count(&state.backend, &seuil),
-            tune_core::audio::embedding_store::retry_later_count(&state.backend, &seuil),
-        )
-    };
     #[cfg(not(feature = "audio-embedding"))]
     let (deferred, apres_echecs) = (0_i64, 0_i64);
     let total_eligible = eligible;
