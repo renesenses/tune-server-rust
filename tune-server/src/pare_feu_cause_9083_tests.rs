@@ -247,7 +247,7 @@ fn la_route_rend_la_cause_9083() {
     let mut lignes = autorisation_privee(EXE);
     lignes.push(ligne("Bloquer Tune", EXE, 4, 0));
     let e = etat(&lignes, &reseau_prive(), EXE, &sans_canonique);
-    let corps = charge_utile(true, Some(&e));
+    let corps = charge_utile(true, Some(&e), true);
     assert_eq!(corps["alerte"], true);
     assert_eq!(corps["releve"]["cause"], "regle_de_blocage");
     assert_eq!(
@@ -266,27 +266,117 @@ fn la_route_rend_la_cause_9083() {
         EXE,
         &sans_canonique,
     );
-    let corps = charge_utile(true, Some(&e));
+    let corps = charge_utile(true, Some(&e), true);
     assert_eq!(corps["alerte"], false);
     assert!(corps["releve"]["cause"].is_null());
 }
 
 /// Garde de branchement : sous Windows, la route et le démarrage comparent
-/// des chemins RÉSOLUS.
+/// des chemins RÉSOLUS, et la résolution passe par `spawn_blocking`.
 #[test]
 fn les_releves_windows_resolvent_les_chemins_9083() {
     let src = include_str!("pare_feu_windows.rs");
     let prod = src.split("#[cfg(test)]").next().unwrap();
     assert_eq!(
-        prod.matches("resoudre_les_chemins(regles, exe, &variable, &canonique_windows)")
-            .count(),
-        1,
-        "relever_l_etat doit résoudre les chemins"
+        prod.matches("resoudre_les_chemins_a_l_ecart(").count(),
+        3,
+        "définition + relever_l_etat + verdict du démarrage"
     );
+    assert!(prod.contains("tokio::task::spawn_blocking(move ||"));
+    assert!(prod.contains("if !canonicalisable(chemin) || lecteur_reseau(chemin)"));
+}
+
+/// Un partage réseau n'est jamais ouvert pour être résolu : seul un chemin
+/// local à lettre de lecteur l'est.
+#[test]
+fn un_chemin_reseau_n_est_jamais_resolu_9083() {
+    for local in [
+        EXE,
+        r"\\?\C:\Tune\tune-server.exe",
+        "\"D:/Tune/tune-server.exe\"",
+    ] {
+        assert!(canonicalisable(local), "{local}");
+    }
+    for distant in [
+        r"\\nas\tune\tune-server.exe",
+        r"\\?\UNC\nas\tune\tune-server.exe",
+        r"\\.\pipe\x",
+        "//nas/tune/tune-server.exe",
+        "tune-server.exe",
+        "%LOCALAPPDATA%\\Tune\\tune-server.exe",
+        "",
+    ] {
+        assert!(!canonicalisable(distant), "{distant}");
+    }
+    // La résolution ne consulte même pas `canonique` pour un partage.
+    let regles_nas = [ligne("nas", r"\\nas\tune\tune-server.exe", 2, 2)];
+    let consultes = std::cell::RefCell::new(Vec::<String>::new());
+    let canonique = |c: &str| {
+        consultes.borrow_mut().push(c.to_string());
+        None
+    };
+    let garde = |c: &str| {
+        if canonicalisable(c) {
+            canonique(c)
+        } else {
+            None
+        }
+    };
+    let (r, _) = resoudre_les_chemins(&regles(&regles_nas), EXE, &sans_variable, &garde);
+    assert_eq!(r[0].program, r"\\nas\tune\tune-server.exe");
+    assert_eq!(*consultes.borrow(), vec![EXE.to_string()]);
+}
+
+/// Hors administrateur et hors cette machine, la route ne livre que des
+/// noms de fichiers : un chemin complet porte le nom du compte Windows.
+#[test]
+fn les_chemins_complets_sont_reserves_a_l_administrateur_9083() {
+    let installe = r"C:\Users\thierry\Tune\tune-server.exe";
+    let e = etat(
+        &autorisation_privee(installe),
+        &reseau_prive(),
+        EXE,
+        &sans_canonique,
+    );
+    assert_eq!(e.cause, Some(CauseNonCouvert::AutreChemin));
+
+    let detail = charge_utile(true, Some(&e), true);
+    assert_eq!(detail["releve"]["programme"], EXE);
     assert_eq!(
-        prod.matches("resoudre_les_chemins(&regles, &exe, &variable, &canonique_windows)")
-            .count(),
-        1,
-        "le verdict du démarrage doit résoudre les chemins"
+        detail["releve"]["chemins_autorises_ailleurs"],
+        serde_json::json!([installe])
     );
+
+    let reduit = charge_utile(true, Some(&e), false);
+    assert_eq!(reduit["releve"]["programme"], "tune-server.exe");
+    assert_eq!(
+        reduit["releve"]["chemins_autorises_ailleurs"],
+        serde_json::json!(["tune-server.exe"])
+    );
+    assert!(!reduit.to_string().contains("thierry"), "{reduit}");
+    assert_eq!(reduit["alerte"], true);
+    assert_eq!(reduit["releve"]["cause"], "autre_chemin");
+}
+
+/// La garde du détail : l'appel de cette machine (bouclage réel) oui, le
+/// réseau local non (authentification coupée).
+#[tokio::test]
+async fn le_detail_suit_la_garde_admin_ou_cette_machine_9083() {
+    let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    let parties = |ip: [u8; 4]| {
+        axum::http::Request::builder()
+            .uri("/api/v1/system/pare-feu")
+            .header("host", "127.0.0.1:8888")
+            .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                ip, 50000,
+            ))))
+            .body(())
+            .unwrap()
+            .into_parts()
+            .0
+    };
+    let mut locale = parties([127, 0, 0, 1]);
+    let mut reseau = parties([192, 168, 1, 20]);
+    assert!(crate::auth::admin_ou_cette_machine(&mut locale, &state).await);
+    assert!(!crate::auth::admin_ou_cette_machine(&mut reseau, &state).await);
 }

@@ -144,6 +144,18 @@ pub fn resoudre_les_chemins(
     (regles, resoudre(exe))
 }
 
+/// #9083 — un chemin peut-il être ouvert pour être résolu ? Seulement un
+/// chemin local à lettre de lecteur (`X:\…`, éventuellement `\\?\X:\…`).
+/// Tout ce qui commence par `\\` après cela — partage réseau `\\hôte\…`,
+/// `\\?\UNC\…`, périphérique `\\.\…` — ne l'est jamais : un hôte
+/// injoignable ferait attendre le relevé. Pur, testé partout.
+pub fn canonicalisable(chemin: &str) -> bool {
+    let c = chemin.trim().trim_matches('"').replace('/', "\\");
+    let c = c.strip_prefix(r"\\?\").unwrap_or(&c);
+    let b = c.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\'
+}
+
 /// Retire `\\?\` (ou `\\?\UNC\` → `\\`) d'un chemin, casse conservée.
 fn sans_prefixe_verbatim(chemin: &str) -> String {
     if let Some(reste) = chemin.strip_prefix(r"\\?\UNC\") {
@@ -718,18 +730,59 @@ static CACHE: std::sync::LazyLock<tokio::sync::Mutex<CacheDuReleve>> =
     std::sync::LazyLock::new(Default::default);
 
 /// Le corps de `GET /api/v1/system/pare-feu`. Contrat additif.
-pub fn charge_utile(windows: bool, etat: Option<&EtatDuPareFeu>) -> serde_json::Value {
+///
+/// `detail` : l'appelant est l'administrateur, ou cette machine. Sinon les
+/// chemins complets (`programme`, `chemins_autorises_ailleurs`), qui portent
+/// le nom du compte Windows, sont réduits à leur nom de fichier.
+pub fn charge_utile(
+    windows: bool,
+    etat: Option<&EtatDuPareFeu>,
+    detail: bool,
+) -> serde_json::Value {
+    let vu = etat.map(|e| {
+        if detail {
+            e.clone()
+        } else {
+            EtatDuPareFeu {
+                programme: nom_de_fichier(&e.programme),
+                chemins_autorises_ailleurs: e
+                    .chemins_autorises_ailleurs
+                    .iter()
+                    .map(|c| nom_de_fichier(c))
+                    .collect(),
+                ..e.clone()
+            }
+        }
+    });
     serde_json::json!({
         "windows": windows,
-        "releve": etat,
+        "releve": vu,
         "alerte": etat.is_some_and(EtatDuPareFeu::alerte),
     })
+}
+
+/// Le dernier composant d'un chemin Windows (`\` ou `/`).
+fn nom_de_fichier(chemin: &str) -> String {
+    chemin
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(chemin)
+        .to_string()
 }
 
 /// `GET /api/v1/system/pare-feu` — l'écran des zones l'affiche quand le
 /// profil actif n'est pas couvert (#7371). Relevé de nouveau au-delà de
 /// [`DUREE_DU_CACHE`].
-pub async fn route_etat() -> axum::Json<serde_json::Value> {
+pub async fn route_etat(
+    axum::extract::State(etat_app): axum::extract::State<crate::state::AppState>,
+    mut parties: axum::http::request::Parts,
+) -> axum::Json<serde_json::Value> {
+    // Hors Windows, rien à relever ni à protéger.
+    if !cfg!(target_os = "windows") {
+        let _ = (&etat_app, &mut parties);
+        return axum::Json(charge_utile(false, None, false));
+    }
+    let detail = crate::auth::admin_ou_cette_machine(&mut parties, &etat_app).await;
     #[cfg(target_os = "windows")]
     let etat = etat_avec_cache(
         &CACHE,
@@ -748,7 +801,11 @@ pub async fn route_etat() -> axum::Json<serde_json::Value> {
     .await;
     #[cfg(not(target_os = "windows"))]
     let etat: Option<EtatDuPareFeu> = None;
-    axum::Json(charge_utile(cfg!(target_os = "windows"), etat.as_ref()))
+    axum::Json(charge_utile(
+        cfg!(target_os = "windows"),
+        etat.as_ref(),
+        detail,
+    ))
 }
 
 /// #7371 — pour chaque interface connectée : catégorie, connectivité IPv4,
@@ -801,18 +858,69 @@ async fn relever_les_regles() -> Result<Vec<RegleDePareFeu>, String> {
 async fn relever_l_etat(regles: &[RegleDePareFeu], exe: &str) -> Result<EtatDuPareFeu, String> {
     let releve = lire_le_releve_reseau(&lancer_powershell(SCRIPT_PROFILS_RESEAU).await?)?;
     let variable = |nom: &str| std::env::var(nom).ok();
-    let (regles, exe) = resoudre_les_chemins(regles, exe, &variable, &canonique_windows);
+    let (regles, exe) = resoudre_les_chemins_a_l_ecart(regles, exe).await;
     Ok(etat_du_pare_feu(&regles, &releve, &exe, &variable))
 }
 
-/// #9083 — le chemin réel d'un fichier (noms courts 8.3, liens, `subst`
-/// résolus). `None` si le fichier n'existe pas ou ne se lit pas.
+/// #9083 — le chemin réel d'un fichier LOCAL (noms courts 8.3, liens,
+/// `subst` résolus). `None` si le fichier n'existe pas, ne se lit pas, ou
+/// n'est pas sur un disque local : un partage réseau (`\\hôte\…`,
+/// `\\?\UNC\…`) ou un lecteur réseau mappé n'est JAMAIS ouvert — il reste
+/// comparé sous sa forme textuelle normalisée.
 #[cfg(target_os = "windows")]
 fn canonique_windows(chemin: &str) -> Option<String> {
+    if !canonicalisable(chemin) || lecteur_reseau(chemin) {
+        return None;
+    }
     std::fs::canonicalize(chemin)
         .ok()
         .map(|p| p.display().to_string())
 }
+
+/// La lettre de lecteur d'un chemin `X:\…` désigne-t-elle un lecteur réseau
+/// mappé (`GetDriveTypeW` = `DRIVE_REMOTE`) ? Ne touche pas au partage.
+#[cfg(target_os = "windows")]
+fn lecteur_reseau(chemin: &str) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    let Some(lettre) = chemin.trim().chars().next() else {
+        return false;
+    };
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
+    }
+    const DRIVE_REMOTE: u32 = 4;
+    let racine: Vec<u16> = std::ffi::OsString::from(format!("{lettre}:\\"))
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY : chaîne UTF-16 terminée par un zéro, vivante pendant l'appel.
+    unsafe { GetDriveTypeW(racine.as_ptr()) == DRIVE_REMOTE }
+}
+
+/// #9083 — la résolution des chemins hors des workers de tokio : les appels
+/// au système de fichiers sont bloquants. Au-delà de [`DELAI_DE_RESOLUTION`],
+/// ou en cas d'échec, les chemins sont comparés sous leur forme textuelle.
+#[cfg(target_os = "windows")]
+async fn resoudre_les_chemins_a_l_ecart(
+    regles: &[RegleDePareFeu],
+    exe: &str,
+) -> (Vec<RegleDePareFeu>, String) {
+    let variable = |nom: &str| std::env::var(nom).ok();
+    let (copie, exe_copie) = (regles.to_vec(), exe.to_string());
+    let tache = tokio::task::spawn_blocking(move || {
+        let variable = |nom: &str| std::env::var(nom).ok();
+        resoudre_les_chemins(&copie, &exe_copie, &variable, &canonique_windows)
+    });
+    match tokio::time::timeout(DELAI_DE_RESOLUTION, tache).await {
+        Ok(Ok(resolu)) => resolu,
+        _ => resoudre_les_chemins(regles, exe, &variable, &|_| None),
+    }
+}
+
+/// Le temps laissé à la résolution des chemins avant de s'en passer.
+#[cfg(target_os = "windows")]
+const DELAI_DE_RESOLUTION: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Lance le relevé en tâche de fond, une fois. Sans effet hors Windows.
 pub fn lancer_le_releve() {
@@ -831,8 +939,7 @@ pub fn lancer_le_releve() {
         };
         let variable = |nom: &str| std::env::var(nom).ok();
         // #9083 — comparer des chemins RÉELS (8.3, liens, préfixe verbatim).
-        let (resolues, exe_reel) =
-            resoudre_les_chemins(&regles, &exe, &variable, &canonique_windows);
+        let (resolues, exe_reel) = resoudre_les_chemins_a_l_ecart(&regles, &exe).await;
         let v = verdict(&resolues, &exe_reel, &variable);
         journaliser(&v, &exe_reel, regles.len());
         // #7371 — le profil du réseau actif, et ce que la règle en couvre ;
