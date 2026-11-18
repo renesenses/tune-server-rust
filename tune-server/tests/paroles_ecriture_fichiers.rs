@@ -160,9 +160,22 @@ async fn avec_consentement_la_route_accepte_et_le_lrc_apparait() {
         attendre_le_fichier(&voisin, std::time::Duration::from_secs(10)).await,
         "le `.lrc` voisin doit finir par apparaitre"
     );
+    // QA 18/11 (instable en CI le 17/11 : `Some("")`) — `write_sidecar_lrc`
+    // CRÉE le fichier (`create_new`) puis y écrit : entre les deux, il existe
+    // et il est vide. Le témoin lisait dès l'apparition et attrapait parfois
+    // ce fichier vide. Il attend désormais la fin de l'écriture (le contenu
+    // complet), sans délai fixe : la borne ne joue que si la tâche ne finit
+    // jamais.
+    let attendu = "[00:01.00] une ligne\n";
+    let debut = std::time::Instant::now();
+    while tune_core::metadata::lyrics::find_sidecar_lrc(&audio).as_deref() != Some(attendu)
+        && debut.elapsed() < std::time::Duration::from_secs(10)
+    {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
     assert_eq!(
         tune_core::metadata::lyrics::find_sidecar_lrc(&audio).as_deref(),
-        Some("[00:01.00] une ligne\n"),
+        Some(attendu),
         "et porter les paroles que Tune connaissait"
     );
 }

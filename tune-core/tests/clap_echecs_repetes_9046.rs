@@ -254,3 +254,75 @@ fn le_temoin_d_activite_est_vrai_des_le_debut_du_lot() {
         "pendant le premier lot, le témoin d'activité doit dire « en cours » (#9046)"
     );
 }
+
+/// Un faux modèle qui réussit.
+struct ModeleQuiReussit;
+impl Inference for ModeleQuiReussit {
+    fn inferer(&mut self, _wav: &[f32]) -> Result<Vec<f32>, String> {
+        Ok(vec![(1.0f32 / 512.0).sqrt(); 512])
+    }
+}
+
+/// Suite de #9046 — un témoin d'analyse qui ne s'écrit JAMAIS
+/// (`audio_embed_sentinel_write_failed`) compte comme un échec : la piste est
+/// reportée au troisième, au lieu de revenir à chaque lot sans fin.
+#[test]
+fn un_temoin_qui_ne_s_ecrit_jamais_finit_reporte() {
+    let _serie = preparer();
+    let ids = [904_621_i64];
+    let (_dir, backend) = base(&ids);
+    backend
+        .execute_batch(
+            "CREATE TRIGGER refuse_temoin_ins BEFORE INSERT ON track_metadata \
+               WHEN NEW.key = 'audio_embed_analyzed' BEGIN SELECT RAISE(ABORT, 'refus'); END; \
+             CREATE TRIGGER refuse_temoin_maj BEFORE UPDATE ON track_metadata \
+               WHEN NEW.key = 'audio_embed_analyzed' BEGIN SELECT RAISE(ABORT, 'refus'); END;",
+        )
+        .unwrap();
+    let rt = executeur();
+    let mut session: Option<Arc<Mutex<ModeleQuiReussit>>> = None;
+    let mut tours = Vec::new();
+    for _ in 0..4 {
+        tours.push(
+            rt.block_on(tour_de_balayage(&backend, &mut session, || async {
+                Some(ModeleQuiReussit)
+            })),
+        );
+    }
+    println!("temoin refuse : {tours:?}");
+    assert_eq!(
+        tours[2],
+        TourDeBalayage::Lot(1),
+        "troisième échec : reportée"
+    );
+    assert_eq!(
+        tours[3],
+        TourDeBalayage::RienAAnalyser,
+        "sans compter l'échec d'écriture, la piste revenait à chaque lot"
+    );
+    assert!(cle(&backend, 904_621, "audio_embed_retry_later").is_some());
+}
+
+/// Suite de #9046 — une piste qui finit par réussir efface ses reports passés.
+#[test]
+fn une_reussite_efface_les_reports_passes() {
+    let _serie = preparer();
+    let (_dir, backend) = base(&[904_631]);
+    backend
+        .execute(
+            "INSERT INTO track_metadata (track_id, key, value) VALUES (904631, 'audio_embed_retry_reports', '2')",
+            &[],
+        )
+        .unwrap();
+    let rt = executeur();
+    let mut session: Option<Arc<Mutex<ModeleQuiReussit>>> = None;
+    let tour = rt.block_on(tour_de_balayage(&backend, &mut session, || async {
+        Some(ModeleQuiReussit)
+    }));
+    assert_eq!(tour, TourDeBalayage::Lot(1));
+    assert_eq!(
+        cle(&backend, 904_631, "audio_embed_retry_reports"),
+        None,
+        "les reports d'une piste qui réussit doivent disparaître"
+    );
+}
