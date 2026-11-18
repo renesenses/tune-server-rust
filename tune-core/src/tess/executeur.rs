@@ -96,16 +96,23 @@ impl Executeur {
         if self.tampons.len() < n {
             self.tampons.resize_with(n, Vec::new);
         }
+        // Tampon de vidange : seulement pour un étage à latence (seul un tel
+        // étage a une queue, contrat § 1), et de la taille utile — sa queue,
+        // bornée par ce que l'étage suivant accepte d'un coup.
         let mut vidange = 0;
         for (tampon, d) in self.tampons.iter_mut().zip(&self.dispositions) {
             let capacite = d.capacite_sortie();
             if !d.sur_place && tampon.len() != capacite {
                 tampon.resize(capacite, 0.0);
             }
-            vidange = vidange.max(capacite);
+            if d.latence_trames > 0 {
+                let trames = d.max_trames_sortie.min(d.latence_trames as usize);
+                vidange = vidange.max(trames * usize::from(d.sortie.channels));
+            }
         }
-        if self.tampon_vidange.len() < vidange {
+        if self.tampon_vidange.len() != vidange {
             self.tampon_vidange.resize(vidange, 0.0);
+            self.tampon_vidange.shrink_to(vidange);
         }
         self.nb_etages = n;
         self.sortie = Some(sortie);
@@ -217,7 +224,13 @@ impl Executeur {
         let mut resultat = Ok(());
         'etages: for i in 0..nb {
             let canaux = usize::from(self.dispositions[i].sortie.channels);
-            let capacite = self.dispositions[i].capacite_sortie().min(queue.len());
+            let d = self.dispositions[i];
+            if d.latence_trames == 0 {
+                continue;
+            }
+            let capacite = (d.max_trames_sortie.min(d.latence_trames as usize)
+                * usize::from(d.sortie.channels))
+            .min(queue.len());
             for _ in 0..MAX_TOURS_DE_VIDANGE {
                 let ecrites = match etages[i].vidanger(&mut queue[..capacite]) {
                     Ok(0) => break,
@@ -891,6 +904,25 @@ mod tests {
             ex.traiter(&mut etages[..2], &mut [0.0; 4], 4).unwrap_err(),
             ErreurEtage::NonPrepare
         );
+    }
+
+    /// Mémoire : sans étage à latence, aucun tampon de vidange, même pour un
+    /// bloc géant ; avec une latence, la taille de la queue et rien de plus.
+    #[test]
+    fn le_tampon_de_vidange_n_existe_que_pour_une_queue_et_a_sa_taille() {
+        let mut ex = Executeur::new();
+        let (mut q, mut s) = (Biquad::cloche(0.02, 3.0), Saturation::new(2.0));
+        ex.preparer(&mut [&mut q, &mut s], STEREO_48K, 10_000_000, false)
+            .unwrap();
+        assert_eq!(ex.tampon_vidange.capacity(), 0);
+        let mut r = Retard::new(64);
+        ex.preparer(&mut [&mut q, &mut r], STEREO_48K, 10_000_000, false)
+            .unwrap();
+        assert_eq!(ex.tampon_vidange.len(), 64 * 2);
+        assert!(ex.tampon_vidange.capacity() < 10_000);
+        ex.preparer(&mut [&mut q, &mut s], STEREO_48K, 512, false)
+            .unwrap();
+        assert_eq!(ex.tampon_vidange.len(), 0);
     }
 
     #[test]

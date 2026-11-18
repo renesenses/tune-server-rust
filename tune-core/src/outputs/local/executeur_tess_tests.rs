@@ -18,7 +18,7 @@ use std::sync::atomic::AtomicBool;
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-fn ancien_apply_local_dsp(
+pub(in crate::outputs::local) fn ancien_apply_local_dsp(
     samples: &mut [f32],
     eq: &Mutex<Option<EqProcessor>>,
     convolver: &Mutex<Option<Convolver>>,
@@ -137,6 +137,42 @@ struct Chaine {
 }
 
 impl Chaine {
+    fn avec(
+        eq: Option<EqProcessor>,
+        conv: Option<Convolver>,
+        cf: Option<CrossfeedProcessor>,
+        mono: bool,
+    ) -> Self {
+        Self {
+            eq: Mutex::new(eq),
+            conv: Mutex::new(conv),
+            cf: Mutex::new(cf),
+            pure: AtomicBool::new(false),
+            mono: AtomicBool::new(mono),
+        }
+    }
+
+    /// Un bloc par le geste RÉEL du producteur (`decoder_par_la_chaine_tess`).
+    fn bloc_nouveau(&self, octets: &[u8], bits: u16, canaux: u16) -> Vec<f32> {
+        decoder_par_la_chaine_tess(
+            octets,
+            bits,
+            &self.moteurs(),
+            OrdreLocal::HISTORIQUE,
+            canaux,
+            false,
+        )
+    }
+
+    /// Le même bloc par l'ancien chemin.
+    fn bloc_ancien(&self, octets: &[u8], bits: u16, canaux: u16) -> Vec<f32> {
+        let mut f = crate::outputs::local::pcm_bytes_to_f32(octets, bits);
+        ancien_apply_local_dsp(
+            &mut f, &self.eq, &self.conv, &self.cf, &self.pure, &self.mono, canaux, false,
+        );
+        f
+    }
+
     fn new(eq: bool, conv: bool, cf: bool, mono: bool) -> Self {
         Self {
             eq: Mutex::new(eq.then(egaliseur)),
@@ -166,7 +202,11 @@ impl Chaine {
             executer_chaine_locale(&mut f, &self.moteurs(), ordre, 2, false);
             sortie.extend_from_slice(&f);
         }
-        sortie.extend(vidanger_chaine_locale(&self.moteurs(), ordre, 2, false));
+        sortie.extend(
+            vidanger_chaine_locale(&self.moteurs(), ordre, 2, false)
+                .into_iter()
+                .map(f64::from),
+        );
         sortie
     }
 
@@ -457,4 +497,334 @@ fn l_ordre_local_se_lit_dans_la_chaine_tess() {
     );
     assert!(OrdreLocal::depuis_ids([], true).bypass_all());
     assert_eq!(OrdreLocal::depuis_ids([], false), OrdreLocal::HISTORIQUE);
+}
+
+// ---------------------------------------------------------------------------
+// Relecture de #9024 : le chemin RÉEL, et les cas que la première série ne
+// couvrait pas.
+// ---------------------------------------------------------------------------
+
+fn pseudo_aleatoire(n: usize, graine: u64) -> Vec<u8> {
+    let mut x = graine | 1;
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect()
+}
+
+/// Compte les échantillons dont les bits diffèrent entre le décodage `f64`
+/// ramené en `f32` et l'ancien décodage `f32`.
+fn ecarts_de_decodage(
+    octets: &[u8],
+    bits: u16,
+    decodeur_f64: impl Fn(&[u8], u16) -> Vec<f64>,
+) -> usize {
+    let nouveau = frontiere_f32(&decodeur_f64(octets, bits));
+    let ancien = crate::outputs::local::pcm_bytes_to_f32(octets, bits);
+    assert_eq!(nouveau.len(), ancien.len());
+    nouveau
+        .iter()
+        .zip(&ancien)
+        .filter(|(a, b)| a.to_bits() != b.to_bits() && !(a.is_nan() && b.is_nan()))
+        .count()
+}
+
+/// BIT-PERFECT DU CHEMIN RÉEL : le décodage `f64` ramené à la frontière
+/// `f32` rend EXACTEMENT les bits de l'ancien `pcm_bytes_to_f32`, à toutes les
+/// profondeurs — 16 et 24 bits EXHAUSTIFS, 32 bits et flottant sur des mots
+/// aléatoires et les extrêmes, profondeur inconnue (lue en 16 bits). Et le
+/// geste du producteur sans étage actif, c'est l'ancien décodage.
+/// CONTRE-ÉPREUVE dans le test : un décodeur faux d'un pas (24 bits divisé
+/// par 2^23 − 1) est vu.
+#[test]
+fn le_decodage_f64_ramene_en_f32_rend_les_bits_d_avant_a_toutes_les_profondeurs() {
+    let mots16: Vec<u8> = (0..=u16::MAX).flat_map(|m| m.to_le_bytes()).collect();
+    let mots24: Vec<u8> = (0..1u32 << 24)
+        .flat_map(|m| m.to_le_bytes()[..3].to_vec())
+        .collect();
+    let mut mots32 = pseudo_aleatoire(4 << 20, 0x3232);
+    for extreme in [
+        i32::MIN,
+        i32::MAX,
+        0,
+        1,
+        -1,
+        i32::MIN + 1,
+        1 << 24,
+        (1 << 24) + 1,
+    ] {
+        mots32.extend_from_slice(&extreme.to_le_bytes());
+    }
+    let mut flottants: Vec<u8> = pseudo_aleatoire(4 << 20, 0xf32)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
+        .filter(|x| !x.is_nan())
+        .flat_map(|x| x.to_le_bytes())
+        .collect();
+    for x in [
+        f32::INFINITY,
+        f32::NEG_INFINITY,
+        f32::MIN_POSITIVE,
+        -0.0,
+        1.0,
+        -1.0,
+        f32::NAN,
+    ] {
+        flottants.extend_from_slice(&x.to_le_bytes());
+    }
+    let inconnue = pseudo_aleatoire(1 << 16, 0x8);
+    let decodeur = crate::outputs::local::pcm_bytes_to_f64;
+    for (bits, octets) in [
+        (16u16, &mots16),
+        (24, &mots24),
+        (32, &mots32),
+        (0, &flottants),
+        (8, &inconnue),
+    ] {
+        assert_eq!(ecarts_de_decodage(octets, bits, decodeur), 0, "{bits} bits");
+        // Le geste du producteur, sans étage actif : l'ancien décodage.
+        let vide = Chaine::new(false, false, false, false);
+        let geste = vide.bloc_nouveau(octets, bits, 2);
+        let ancien = crate::outputs::local::pcm_bytes_to_f32(octets, bits);
+        assert_eq!(geste.len(), ancien.len(), "{bits} bits");
+        assert!(
+            geste
+                .iter()
+                .zip(&ancien)
+                .all(|(a, b)| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())),
+            "{bits} bits : le geste sans étage doit être l'ancien décodage"
+        );
+    }
+    let faux = |o: &[u8], b: u16| -> Vec<f64> {
+        let mut v = crate::outputs::local::pcm_bytes_to_f64(o, b);
+        v.iter_mut()
+            .for_each(|x| *x = *x * 8_388_608.0 / 8_388_607.0);
+        v
+    };
+    assert!(
+        ecarts_de_decodage(&mots24, 24, faux) > 1_000,
+        "la contre-épreuve doit être vue"
+    );
+}
+
+/// Le geste du producteur (décodage par tranches dans le tampon du fil) rend
+/// les mêmes bits que la composition testée plus haut (décodage `f64` entier,
+/// chaîne, frontière), y compris pour un bloc plus grand qu'une tranche.
+#[test]
+fn le_geste_du_producteur_est_la_chaine_testee() {
+    for (bits, trames) in [(16u16, 1_000usize), (24, 40_000), (32, 70_000)] {
+        let source = octets(&mots(trames, bits), bits);
+        let a = Chaine::new(true, true, true, true);
+        let b = Chaine::new(true, true, true, true);
+        let geste = a.bloc_nouveau(&source, bits, 2);
+        let mut f = crate::outputs::local::pcm_bytes_to_f64(&source, bits);
+        executer_chaine_locale(&mut f, &b.moteurs(), OrdreLocal::HISTORIQUE, 2, false);
+        assert_eq!(
+            bits_f32(&geste),
+            bits_f32(&frontiere_f32(&f)),
+            "{bits} bits, {trames} trames"
+        );
+    }
+}
+
+/// Le chemin natif exclusif (`prepare_windows_native_pcm`) : bit-perfect
+/// inchangé en PURE et sans étage ; avec un étage, les mots d'avant.
+#[test]
+fn le_chemin_natif_rend_les_mots_d_avant() {
+    use crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU;
+    for bits in [16u16, 24, 32] {
+        let source = octets(&mots(3_000, bits), bits);
+        for (pure, cf) in [(true, true), (false, false), (false, true)] {
+            let c = Chaine::new(false, false, cf, false);
+            c.pure.store(pure, Ordering::Relaxed);
+            let natif = crate::outputs::local::prepare_windows_native_pcm(
+                &source,
+                bits,
+                2,
+                2,
+                false,
+                false,
+                UNITE_DU_GAIN_DE_RENDU,
+                &c.eq,
+                &c.conv,
+                &c.cf,
+                &c.pure,
+                &c.mono,
+                None,
+            )
+            .expect("bloc préparé");
+            let a = Chaine::new(false, false, cf, false);
+            a.pure.store(pure, Ordering::Relaxed);
+            let attendu = if pure || !cf {
+                crate::outputs::local::pcm_bytes_to_native_i32(&source, bits)
+            } else {
+                crate::outputs::local::f32_to_native_i32(&a.bloc_ancien(&source, bits, 2), bits)
+            };
+            assert_eq!(
+                natif.bit_perfect,
+                pure || !cf,
+                "{bits} bits, pure={pure}, cf={cf}"
+            );
+            assert_eq!(natif.samples, attendu, "{bits} bits, pure={pure}, cf={cf}");
+        }
+    }
+}
+
+/// Mono (1 voie) et multicanal (6 voies) avec égaliseur et convolution :
+/// les bits d'avant. Le crossfeed et le repli mono, stéréo seulement, n'y
+/// touchent pas.
+#[test]
+fn mono_et_multicanal_rendent_les_bits_d_avant() {
+    for canaux in [1u16, 6] {
+        let profil = EqProfile {
+            enabled: true,
+            bands: vec![EqBandSpec {
+                freq: 500.0,
+                gain: 4.0,
+                q: 1.2,
+                band_type: "peaking".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let ri: Vec<Vec<f32>> = (0..canaux)
+            .map(|c| {
+                let mut v = vec![0.0f32; 80];
+                v[0] = 0.9;
+                v[5 + usize::from(c)] = 0.2;
+                v
+            })
+            .collect();
+        let fabrique = || {
+            Chaine::avec(
+                Some(EqProcessor::new(&profil, 44_100, canaux)),
+                Some(Convolver::new(&ri, 64)),
+                Some(crossfeed()),
+                true,
+            )
+        };
+        let (n, a) = (fabrique(), fabrique());
+        let signal: Vec<i32> =
+            crate::tess::executeur::etages_de_test::pcm_24_bits(4_000, usize::from(canaux));
+        let source = octets(&signal, 24);
+        let trame = 3 * usize::from(canaux);
+        for bloc in source.chunks(777 * trame) {
+            assert_eq!(
+                bits_f32(&n.bloc_nouveau(bloc, 24, canaux)),
+                bits_f32(&a.bloc_ancien(bloc, 24, canaux)),
+                "{canaux} voies"
+            );
+        }
+    }
+}
+
+/// Bascules en cours de lecture, entre deux blocs : repli mono, PURE, relève
+/// d'égaliseur (nouveau profil fondu), COUPURE de l'égaliseur (fondu, le
+/// préampli reste gardé, #5215), « Remettre à plat » demandé PENDANT ce fondu
+/// (#4176 : la remontée part à la fin du fondu), puis retrait au repos. Mêmes bits que l'ancien chemin à chaque bloc,
+/// et l'égaliseur est retiré au même bloc.
+#[test]
+fn les_bascules_en_cours_de_lecture_rendent_les_bits_d_avant() {
+    let source = octets(&mots(4_410 * 300, 24), 24);
+    let (n, a) = (
+        Chaine::new(true, true, true, false),
+        Chaine::new(true, true, true, false),
+    );
+    let autre = || {
+        EqProcessor::new(
+            &EqProfile {
+                enabled: true,
+                bands: vec![EqBandSpec {
+                    freq: 300.0,
+                    gain: 9.0,
+                    q: 0.9,
+                    band_type: "peaking".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            44_100,
+            2,
+        )
+    };
+    let mut retraits = (None, None);
+    // Blocs de 4 000 trames : le fondu de 300 ms (13 230 trames) finit au
+    // MILIEU d'un bloc, là où un découpage plus fin que le bloc se verrait.
+    for (i, bloc) in source.chunks(4_000 * 6).enumerate() {
+        for c in [&n, &a] {
+            match i {
+                5 => c.mono.store(true, Ordering::Relaxed),
+                9 => c.pure.store(true, Ordering::Relaxed),
+                12 => c.pure.store(false, Ordering::Relaxed),
+                14 => c.mono.store(false, Ordering::Relaxed),
+                20 => {
+                    let mut e = c.eq.lock().unwrap();
+                    *e = EqProcessor::prendre_la_releve(Some(autre()), e.take());
+                }
+                40 => {
+                    let mut e = c.eq.lock().unwrap();
+                    *e = EqProcessor::prendre_la_releve(None, e.take());
+                }
+                // PENDANT le fondu de la coupure (300 ms, un peu plus de 3 blocs) : la rampe
+                // de « Remettre à plat » part à la FIN de ce fondu, constatée à
+                // la fin d'un appel du moteur. Mêmes appels qu'avant (un par
+                // bloc) ⇒ même départ ; un découpage plus fin le déplacerait.
+                41 => {
+                    if let Some(p) = c.eq.lock().unwrap().as_mut() {
+                        p.liberer_le_gain_garde();
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            bits_f32(&n.bloc_nouveau(bloc, 24, 2)),
+            bits_f32(&a.bloc_ancien(bloc, 24, 2)),
+            "bloc {i}"
+        );
+        if retraits.0.is_none() && n.eq.lock().unwrap().is_none() {
+            retraits.0 = Some(i);
+        }
+        if retraits.1.is_none() && a.eq.lock().unwrap().is_none() {
+            retraits.1 = Some(i);
+        }
+    }
+    assert!(
+        retraits.1.is_some(),
+        "l'égaliseur coupé doit être retiré au repos"
+    );
+    assert_eq!(
+        retraits.0, retraits.1,
+        "retrait de l'égaliseur au même bloc"
+    );
+}
+
+/// Crossfeed et natifs tiers : le nouveau chemin et l'ancien, bloc par bloc,
+/// sur deux instances du même étage (appelé par le banc de l'orchestrateur,
+/// qui construit une vraie bibliothèque native).
+pub(in crate::outputs::local) fn comparer_un_etage_casque_a_l_ancien(
+    nouveau: CrossfeedProcessor,
+    ancien: CrossfeedProcessor,
+) -> usize {
+    let (n, a) = (
+        Chaine::avec(None, None, Some(nouveau), false),
+        Chaine::avec(None, None, Some(ancien), false),
+    );
+    let source = octets(&mots(48_000, 24), 24);
+    let mut blocs = 0;
+    for bloc in source.chunks(4_800 * 6) {
+        assert_eq!(
+            bits_f32(&n.bloc_nouveau(bloc, 24, 2)),
+            bits_f32(&a.bloc_ancien(bloc, 24, 2)),
+            "bloc {blocs}"
+        );
+        blocs += 1;
+    }
+    blocs
 }

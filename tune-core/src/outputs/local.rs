@@ -550,7 +550,7 @@ mod bras_alsa_dsd;
 // TESS T03 — la chaîne DSP locale passe par l'exécuteur TESS en `f64`
 // (ordre libre, « Bypass all », adaptateurs provisoires des moteurs `f32`).
 mod executeur_tess;
-use executeur_tess::{MoteursLocaux, OrdreLocal, executer_chaine_locale, frontiere_f32};
+use executeur_tess::{MoteursLocaux, OrdreLocal};
 
 // REF-8 (#2219) : l'étage natif des bras Windows exclusifs — octets source
 // → mots `i32` alignés à gauche → `PuitsNatif` — et le puits de tout
@@ -3234,6 +3234,21 @@ impl RingBuf {
 #[cfg(test)]
 mod ringbuf_tests;
 
+// TESS T03 — mémoire du chemin compressé (relecture de #9024).
+#[cfg(test)]
+mod memoire_chemin_compresse_t03;
+
+/// TESS T03 — pour le banc des natifs tiers de l'orchestrateur : le même
+/// étage casque par la chaîne TESS et par l'ancien chemin, bloc par bloc
+/// (panique au premier écart). Rend le nombre de blocs comparés.
+#[cfg(test)]
+pub(crate) fn comparer_un_etage_casque_a_l_ancien_pour_test(
+    nouveau: crate::audio::crossfeed::CrossfeedProcessor,
+    ancien: crate::audio::crossfeed::CrossfeedProcessor,
+) -> usize {
+    executeur_tess::tests::comparer_un_etage_casque_a_l_ancien(nouveau, ancien)
+}
+
 // #3814 — le rappel cpal partagé rend-il son dû à l'horloge du pilote quand
 // il se tait ? Le banc appelle le rappel réel, période par période, et fait
 // juger le résultat par le `SuiviFamine` du sondeur.
@@ -3820,18 +3835,20 @@ impl LocalPcmProcessor<'_> {
         // TESS T03 — décodé en `f64`, traité par l'exécuteur, puis rangé en
         // `f32` à la frontière provisoire de l'anneau (engagement § 8 du
         // contrat : anneau `f64` et quantification unique au rendu).
-        let mut large = pcm_bytes_to_f64(bloc.octets_alignes(), spec.profondeur().bits_declares());
-        appliquer_chaine_tess(
-            &mut large,
-            self.eq,
-            self.convolver,
-            self.crossfeed,
-            self.pure_bypass,
-            self.mono_downmix,
+        let samples = executeur_tess::decoder_par_la_chaine_tess(
+            bloc.octets_alignes(),
+            spec.profondeur().bits_declares(),
+            &moteurs_locaux(
+                self.eq,
+                self.convolver,
+                self.crossfeed,
+                self.pure_bypass,
+                self.mono_downmix,
+            ),
+            OrdreLocal::HISTORIQUE,
             spec.canaux(),
             dop,
         );
-        let samples = frontiere_f32(&large);
         staged.drain(..aligned_len);
 
         Some(ProcessedLocalPcm {
@@ -4605,12 +4622,7 @@ fn flush_local_dsp(
         pure_bypass,
         mono_downmix,
     };
-    frontiere_f32(&executeur_tess::vidanger_chaine_locale(
-        &moteurs,
-        OrdreLocal::HISTORIQUE,
-        channels,
-        dop,
-    ))
+    executeur_tess::vidanger_chaine_locale(&moteurs, OrdreLocal::HISTORIQUE, channels, dop)
 }
 
 // Un argument par étage de traitement (EQ, convolution, crossfeed…), chacun
@@ -4626,89 +4638,79 @@ fn apply_local_dsp(
     channels: u16,
     dop: bool,
 ) {
-    // L'entrée `f32` (flux compressé décodé, témoins) : élargie en `f64`
-    // sans perte, traitée par l'exécuteur TESS, rendue en `f32` — exacte tant
-    // que les étages actifs sont les moteurs `f32` d'avant.
-    if dop || pure_bypass.load(Ordering::Relaxed) {
-        return;
-    }
-    let mut large: Vec<f64> = samples.iter().map(|&x| f64::from(x)).collect();
-    appliquer_chaine_tess(
-        &mut large,
-        eq,
-        convolver,
-        crossfeed,
-        pure_bypass,
-        mono_downmix,
+    // L'entrée `f32` (flux compressé décodé en bloc, témoins) : la chaîne
+    // TESS en `f64`, tranche par tranche, sans copie de la piste.
+    executeur_tess::executer_chaine_locale_f32(
+        samples,
+        &moteurs_locaux(eq, convolver, crossfeed, pure_bypass, mono_downmix),
+        OrdreLocal::HISTORIQUE,
         channels,
         dop,
     );
-    for (d, s) in samples.iter_mut().zip(&large) {
-        *d = *s as f32;
-    }
 }
 
-/// TESS T03 — la chaîne DSP locale en `f64` (`samples` entrelacés, pleine
-/// échelle ±1,0) : égaliseur, convolveur (RI), crossfeed et natifs tiers
-/// (stéréo seulement), puis repli mono EN DERNIER (#2362 : les trois
-/// traitements d'avant ont tous besoin de leur contexte stéréo). L'ordre est
-/// celui de [`OrdreLocal`] ; rien sous DoP ni en PURE.
-#[allow(clippy::too_many_arguments)]
-fn appliquer_chaine_tess(
-    samples: &mut [f64],
-    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
-    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
-    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
-    pure_bypass: &AtomicBool,
-    mono_downmix: &AtomicBool,
-    channels: u16,
-    dop: bool,
-) {
-    let moteurs = MoteursLocaux {
+/// Les moteurs de la chaîne locale, sous leurs verrous historiques.
+fn moteurs_locaux<'a>(
+    eq: &'a std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &'a std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &'a std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &'a AtomicBool,
+    mono_downmix: &'a AtomicBool,
+) -> MoteursLocaux<'a> {
+    MoteursLocaux {
         eq: Some(eq),
         convolver,
         crossfeed,
         pure_bypass,
         mono_downmix,
-    };
-    executer_chaine_locale(samples, &moteurs, OrdreLocal::HISTORIQUE, channels, dop);
+    }
 }
 
-/// TESS T03 — octets PCM → `f64`, sans perte à toutes les profondeurs (un mot
-/// 32 bits garde ses 32 bits, qu'un `f32` arrondissait à 24). Même
-/// sémantique de `bit_depth` que [`pcm_bytes_to_f32`].
-fn pcm_bytes_to_f64(bytes: &[u8], bit_depth: u16) -> Vec<f64> {
+/// Octets par échantillon d'une profondeur (`0` = flottant 32 bits ; une
+/// profondeur inconnue est lue en 16 bits, comme [`pcm_bytes_to_f32`]).
+fn octets_par_echantillon(bit_depth: u16) -> usize {
     match bit_depth {
-        0 => bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f64::from(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
-            .collect(),
-        24 => bytes
-            .as_chunks::<3>()
-            .0
-            .iter()
-            .map(|c| {
-                let sample =
-                    ((c[0] as i32) | ((c[1] as i32) << 8) | ((c[2] as i32) << 16)) << 8 >> 8;
-                f64::from(sample) / 8_388_608.0
-            })
-            .collect(),
-        32 => bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f64::from(i32::from_le_bytes([c[0], c[1], c[2], c[3]])) / 2_147_483_648.0)
-            .collect(),
-        // 16 bits, et le repli de `pcm_bytes_to_f32` pour une profondeur inconnue.
-        _ => bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|c| f64::from(i16::from_le_bytes([c[0], c[1]])) / 32_768.0)
-            .collect(),
+        0 | 32 => 4,
+        24 => 3,
+        _ => 2,
     }
+}
+
+/// TESS T03 — octets PCM → `f64` dans `sortie`, sans perte à toutes les
+/// profondeurs : un mot 32 bits garde ses 32 bits, qu'un `f32` arrondit à 24.
+/// Même sémantique de `bit_depth` que [`pcm_bytes_to_f32`].
+fn decoder_f64_dans(octets: &[u8], bit_depth: u16, sortie: &mut [f64]) {
+    match bit_depth {
+        0 => {
+            for (d, c) in sortie.iter_mut().zip(octets.as_chunks::<4>().0) {
+                *d = f64::from(f32::from_le_bytes(*c));
+            }
+        }
+        24 => {
+            for (d, c) in sortie.iter_mut().zip(octets.as_chunks::<3>().0) {
+                let mot = ((c[0] as i32) | ((c[1] as i32) << 8) | ((c[2] as i32) << 16)) << 8 >> 8;
+                *d = f64::from(mot) / 8_388_608.0;
+            }
+        }
+        32 => {
+            for (d, c) in sortie.iter_mut().zip(octets.as_chunks::<4>().0) {
+                *d = f64::from(i32::from_le_bytes(*c)) / 2_147_483_648.0;
+            }
+        }
+        _ => {
+            for (d, c) in sortie.iter_mut().zip(octets.as_chunks::<2>().0) {
+                *d = f64::from(i16::from_le_bytes(*c)) / 32_768.0;
+            }
+        }
+    }
+}
+
+/// Octets PCM → `f64` d'un tenant : la forme des témoins.
+#[cfg(test)]
+fn pcm_bytes_to_f64(bytes: &[u8], bit_depth: u16) -> Vec<f64> {
+    let mut sortie = vec![0.0; bytes.len() / octets_par_echantillon(bit_depth)];
+    decoder_f64_dans(bytes, bit_depth, &mut sortie);
+    sortie
 }
 
 /// Convert raw PCM bytes to f32 samples.
@@ -4719,9 +4721,8 @@ fn pcm_bytes_to_f64(bytes: &[u8], bit_depth: u16) -> Vec<f64> {
 ///   - 32: signed 32-bit little-endian integer
 ///   -  0: IEEE 754 32-bit float (already in [-1, 1] range)
 ///
-/// TESS T03 : le producteur décode désormais en `f64` ([`pcm_bytes_to_f64`]) ;
-/// il ne reste que le reliquat des bras natifs (`etage_natif`) et les témoins.
-#[cfg(any(target_os = "windows", target_os = "linux", test))]
+/// TESS T03 : c'est aussi le décodage du producteur quand aucun étage de la
+/// chaîne n'agit (`executeur_tess::decoder_par_la_chaine_tess`).
 fn pcm_bytes_to_f32(bytes: &[u8], bit_depth: u16) -> Vec<f32> {
     match bit_depth {
         0 => {
@@ -5242,18 +5243,14 @@ fn prepare_windows_native_pcm(
         // TESS T03 — décodé en `f64`, traité par l'exécuteur ; la frontière
         // `f32` reste celle de l'adaptation des voies et du volume d'avant
         // (quantification unique depuis le `f64` : suite de T03 et T07).
-        let mut large = pcm_bytes_to_f64(bytes, bit_depth);
-        appliquer_chaine_tess(
-            &mut large,
-            eq,
-            convolver,
-            crossfeed,
-            pure_bypass,
-            mono_downmix,
+        let mut float = executeur_tess::decoder_par_la_chaine_tess(
+            bytes,
+            bit_depth,
+            &moteurs_locaux(eq, convolver, crossfeed, pure_bypass, mono_downmix),
+            OrdreLocal::HISTORIQUE,
             channels,
             false,
         );
-        let mut float = frontiere_f32(&large);
         if canaux_adaptes {
             float = adapter_les_voies_natives(
                 float,

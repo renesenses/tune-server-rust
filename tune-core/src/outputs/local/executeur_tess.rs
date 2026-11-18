@@ -132,26 +132,61 @@ impl OrdreLocal {
     }
 }
 
-/// Taille de la pile de conversion d'un adaptateur `f32` (32 Kio).
-const MORCEAU: usize = 8_192;
+/// Taille maximale, en échantillons, d'une tranche traitée d'un seul tenant
+/// (256 Kio en `f32`, 512 Kio en `f64`). Un bloc du producteur (quelques
+/// dizaines de milliers d'échantillons) tient dans une tranche : les moteurs
+/// reçoivent alors EXACTEMENT les appels d'avant (même découpage, donc mêmes
+/// fins de fondu). Seul un bloc plus grand — la piste entière du chemin
+/// compressé — est découpé, et la mémoire reste bornée.
+pub(super) const TRANCHE: usize = 1 << 16;
 
-/// Fait passer `tampon` par un moteur `f32`, par morceaux de trames entières
-/// convertis dans une pile fixe. N'alloue pas. Les moteurs d'origine
-/// (convolveur, égaliseur, crossfeed) rendent la même suite quel que soit le
-/// découpage de leurs appels.
-fn par_morceaux_f32(tampon: &mut [f64], canaux: usize, mut moteur: impl FnMut(&mut [f32])) {
+thread_local! {
+    /// Tampon de conversion des adaptateurs `f32` : grandit jusqu'au plus grand
+    /// bloc vu (au plus [`TRANCHE`]), puis n'alloue plus.
+    static TAMPON_F32: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
+    /// Tampon `f64` du décodage et de l'entrée `f32` : même règle.
+    static TAMPON_F64: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Nombre d'échantillons d'une tranche : au plus [`TRANCHE`], en trames
+/// entières.
+fn pas_de_tranche(canaux: usize) -> usize {
     let canaux = canaux.max(1);
-    let pas = (MORCEAU / canaux) * canaux;
-    let mut pile = [0.0_f32; MORCEAU];
-    for morceau in tampon.chunks_mut(pas) {
-        let f = &mut pile[..morceau.len()];
-        for (d, s) in f.iter_mut().zip(morceau.iter()) {
-            *d = *s as f32;
+    ((TRANCHE / canaux) * canaux).max(canaux)
+}
+
+/// Prête un tampon de `n` échantillons (au plus [`TRANCHE`]) tiré du tampon
+/// du fil ; un emprunt réentrant (jamais en lecture ordinaire) reçoit un
+/// tampon neuf.
+fn avec_tampon<T: Copy + Default>(
+    cle: &'static std::thread::LocalKey<RefCell<Vec<T>>>,
+    n: usize,
+    f: impl FnOnce(&mut [T]),
+) {
+    cle.with(|cellule| match cellule.try_borrow_mut() {
+        Ok(mut v) => {
+            if v.len() < n {
+                v.resize(n, T::default());
+            }
+            f(&mut v[..n]);
         }
-        moteur(f);
-        for (d, s) in morceau.iter_mut().zip(f.iter()) {
-            *d = f64::from(*s);
-        }
+        Err(_) => f(&mut vec![T::default(); n]),
+    });
+}
+
+/// Fait passer `tampon` par un moteur `f32` : un seul appel par tranche
+/// (donc un seul par bloc du producteur), converti dans le tampon du fil.
+fn par_tranches_f32(tampon: &mut [f64], canaux: usize, mut moteur: impl FnMut(&mut [f32])) {
+    for morceau in tampon.chunks_mut(pas_de_tranche(canaux)) {
+        avec_tampon(&TAMPON_F32, morceau.len(), |f| {
+            for (d, s) in f.iter_mut().zip(morceau.iter()) {
+                *d = *s as f32;
+            }
+            moteur(f);
+            for (d, s) in morceau.iter_mut().zip(f.iter()) {
+                *d = f64::from(*s);
+            }
+        });
     }
 }
 
@@ -179,7 +214,7 @@ impl EtageTess for AdaptateurEgaliseur<'_> {
             && let Ok(mut e) = m.lock()
             && let Some(p) = e.as_mut()
         {
-            par_morceaux_f32(&mut t[..trames * self.canaux], self.canaux, |f| {
+            par_tranches_f32(&mut t[..trames * self.canaux], self.canaux, |f| {
                 p.process_interleaved(f);
             });
             // #5215 — l'égaliseur coupé a fini son fondu et ne garde aucun
@@ -199,6 +234,8 @@ impl EtageTess for AdaptateurEgaliseur<'_> {
 }
 
 /// Adaptateur provisoire du convolveur (`f32`) : à porter en `f64` par T09b.
+/// Sa queue de fin de piste passe par `Convolver::flush`
+/// ([`vidanger_chaine_locale`]), pas par la vidange de l'exécuteur.
 /// Le contournement avec retard conservé viendra avec le moteur `f64` (ligne
 /// de retard préparée) ; d'ici là, cet adaptateur n'est jamais contourné.
 struct AdaptateurConvolution<'a> {
@@ -212,20 +249,17 @@ impl EtageTess for AdaptateurConvolution<'_> {
     }
     fn preparer(&mut self, e: FormatFlux, max: usize) -> Result<Disposition, ErreurEtage> {
         self.canaux = usize::from(e.channels);
-        let latence = self
-            .moteur
-            .lock()
-            .ok()
-            .and_then(|c| c.as_ref().map(|c| c.latency_frames() as u32))
-            .unwrap_or(0);
-        Ok(Disposition::sur_place(e, max, latence))
+        // La latence du moteur `f32` n'est pas annoncée ici : la sortie locale
+        // ne l'utilise pas, et la lire prendrait le verrou une fois de plus
+        // par bloc. Le moteur `f64` de T09b l'annoncera (T16).
+        Ok(Disposition::sur_place(e, max, 0))
     }
     fn traiter_sur_place(&mut self, t: &mut [f64], trames: usize) -> Result<(), ErreurEtage> {
         verifier_tampon(t.len(), trames, self.canaux as u16)?;
         if let Ok(mut conv) = self.moteur.lock()
             && let Some(c) = conv.as_mut()
         {
-            par_morceaux_f32(&mut t[..trames * self.canaux], self.canaux, |f| {
+            par_tranches_f32(&mut t[..trames * self.canaux], self.canaux, |f| {
                 c.process_interleaved(f);
             });
         }
@@ -263,7 +297,7 @@ impl EtageTess for AdaptateurCrossfeed<'_> {
         if let Ok(mut cf) = self.moteur.lock()
             && let Some(c) = cf.as_mut()
         {
-            par_morceaux_f32(&mut t[..trames * 2], 2, |f| c.process_interleaved(f));
+            par_tranches_f32(&mut t[..trames * 2], 2, |f| c.process_interleaved(f));
         }
         Ok(())
     }
@@ -335,6 +369,24 @@ impl MoteursLocaux<'_> {
         dop || self.pure_bypass.load(Ordering::Relaxed) || ordre.bypass_all
     }
 
+    /// Un étage touche-t-il le signal ? Même décision que l'ancien
+    /// `apply_local_dsp` : un égaliseur posé (même neutre, pour que la chaîne
+    /// le retire au repos comme avant), un convolveur posé, et en stéréo un
+    /// crossfeed posé ou le repli mono. Sinon, aucune copie n'est faite.
+    fn un_etage_agit(&self, channels: u16) -> bool {
+        self.eq
+            .is_some_and(|m| m.lock().map(|g| g.is_some()).unwrap_or(false))
+            || self.convolver.lock().map(|g| g.is_some()).unwrap_or(false)
+            || (channels == 2
+                && (self.mono_downmix.load(Ordering::Relaxed)
+                    || self.crossfeed.lock().map(|g| g.is_some()).unwrap_or(false)))
+    }
+
+    /// La chaîne laissera-t-elle ce bloc intact ?
+    fn sans_effet(&self, ordre: OrdreLocal, channels: u16, dop: bool) -> bool {
+        self.exemptee(ordre, dop) || !self.un_etage_agit(channels)
+    }
+
     /// Fait passer `samples` par les étages `ordre.etages()[debut..]`.
     fn executer(&self, ordre: OrdreLocal, debut: usize, samples: &mut [f64], channels: u16) {
         let canaux = usize::from(channels.max(1));
@@ -397,7 +449,9 @@ impl MoteursLocaux<'_> {
     }
 }
 
-/// TESS T03 — la chaîne DSP locale, en `f64`, dans l'ordre `ordre`.
+/// TESS T03 — la chaîne DSP locale sur un tampon `f64` déjà décodé (la
+/// forme des témoins ; la production passe par [`decoder_par_la_chaine_tess`]).
+#[cfg(test)]
 pub(super) fn executer_chaine_locale(
     samples: &mut [f64],
     moteurs: &MoteursLocaux<'_>,
@@ -405,10 +459,65 @@ pub(super) fn executer_chaine_locale(
     channels: u16,
     dop: bool,
 ) {
-    if moteurs.exemptee(ordre, dop) {
+    if moteurs.sans_effet(ordre, channels, dop) {
         return;
     }
     moteurs.executer(ordre, 0, samples, channels);
+}
+
+/// TESS T03 — l'entrée `f32` (flux compressé décodé en bloc, témoins) : la
+/// chaîne en `f64`, tranche par tranche dans le tampon du fil, résultat remis
+/// en place. Ni copie de la piste, ni copie du tout si aucun étage n'agit.
+pub(super) fn executer_chaine_locale_f32(
+    samples: &mut [f32],
+    moteurs: &MoteursLocaux<'_>,
+    ordre: OrdreLocal,
+    channels: u16,
+    dop: bool,
+) {
+    if moteurs.sans_effet(ordre, channels, dop) {
+        return;
+    }
+    for morceau in samples.chunks_mut(pas_de_tranche(usize::from(channels))) {
+        avec_tampon(&TAMPON_F64, morceau.len(), |large| {
+            for (d, s) in large.iter_mut().zip(morceau.iter()) {
+                *d = f64::from(*s);
+            }
+            moteurs.executer(ordre, 0, large, channels);
+            for (d, s) in morceau.iter_mut().zip(large.iter()) {
+                *d = *s as f32;
+            }
+        });
+    }
+}
+
+/// TESS T03 — le geste du producteur : octets PCM → chaîne en `f64` →
+/// frontière `f32` de l'anneau. Une seule allocation (le bloc `f32` rendu),
+/// comme avant ; le `f64` vit dans le tampon du fil, bloc par bloc. Si
+/// aucun étage n'agit, c'est exactement l'ancien décodage `f32`.
+pub(super) fn decoder_par_la_chaine_tess(
+    octets: &[u8],
+    bit_depth: u16,
+    moteurs: &MoteursLocaux<'_>,
+    ordre: OrdreLocal,
+    channels: u16,
+    dop: bool,
+) -> Vec<f32> {
+    if moteurs.sans_effet(ordre, channels, dop) {
+        return super::pcm_bytes_to_f32(octets, bit_depth);
+    }
+    let largeur = super::octets_par_echantillon(bit_depth);
+    let total = octets.len() / largeur;
+    let mut sortie = Vec::with_capacity(total);
+    let pas = pas_de_tranche(usize::from(channels));
+    for morceau in octets[..total * largeur].chunks(pas * largeur) {
+        avec_tampon(&TAMPON_F64, morceau.len() / largeur, |large| {
+            super::decoder_f64_dans(morceau, bit_depth, large);
+            moteurs.executer(ordre, 0, large, channels);
+            sortie.extend(large.iter().map(|&x| x as f32));
+        });
+    }
+    sortie
 }
 
 /// Fin de piste : ce que le convolveur retient encore, passé par les étages
@@ -419,7 +528,7 @@ pub(super) fn vidanger_chaine_locale(
     ordre: OrdreLocal,
     channels: u16,
     dop: bool,
-) -> Vec<f64> {
+) -> Vec<f32> {
     if moteurs.exemptee(ordre, dop) {
         return Vec::new();
     }
@@ -430,27 +539,30 @@ pub(super) fn vidanger_chaine_locale(
         },
         Err(_) => return Vec::new(),
     };
-    let mut queue: Vec<f64> = queue.into_iter().map(f64::from).collect();
     if queue.is_empty() {
         return queue;
     }
+    // La queue fait `latency_frames()` trames : petite, convertie d'un tenant.
+    let mut queue: Vec<f64> = queue.into_iter().map(f64::from).collect();
     let apres = ordre
         .etages
         .iter()
         .position(|e| *e == EtageLocal::Convolution)
         .map_or(NB_ETAGES, |i| i + 1);
     moteurs.executer(ordre, apres, &mut queue, channels);
-    queue
+    queue.into_iter().map(|x| x as f32).collect()
 }
 
-/// La frontière PROVISOIRE `f64` → `f32` du producteur local : l'anneau et
+/// La frontière PROVISOIRE `f64` → `f32` du producteur local (dans la
+/// production, elle est faite en ligne par [`decoder_par_la_chaine_tess`]) : l'anneau et
 /// l'étage de conversion portent encore des `f32`. L'engagement du contrat
 /// (§ 8 : anneau en `f64`, quantification unique au rendu) la retire.
 /// Tant que les étages actifs sont des moteurs `f32`, elle est exacte.
+#[cfg(test)]
 pub(super) fn frontiere_f32(samples: &[f64]) -> Vec<f32> {
     samples.iter().map(|&x| x as f32).collect()
 }
 
 #[cfg(test)]
 #[path = "executeur_tess_tests.rs"]
-mod tests;
+pub(super) mod tests;
