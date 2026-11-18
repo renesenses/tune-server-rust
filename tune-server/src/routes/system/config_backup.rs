@@ -156,7 +156,9 @@ pub(super) enum ImportRequest {
 /// Admin-only: this writes zones, settings and credentials. It was previously
 /// reachable by any caller that passed the premium licence check.
 pub(super) async fn import(
-    _admin: RequireAdmin,
+    // Engage la machine : administrateur, ou authentification coupée,
+    // seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     Json(body): Json<ImportRequest>,
 ) -> impl IntoResponse {

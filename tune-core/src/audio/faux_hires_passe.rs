@@ -83,8 +83,13 @@ pub fn activer(db: &Arc<dyn DbBackend>, actif: bool) -> Result<(), String> {
 /// la nouvelle mesure le remplace par `coupure_spectrale`,
 /// `signature_de_codec`, … — jamais plus par lui —, la piste sort donc des
 /// candidates après un passage. Les autres mesures ne sont pas touchées.
+///
+/// #9067 — seulement pour un fichier qui se dit hi-res : la ligne
+/// `coupure_de_codec` d'un CD (16 bits, 48 kHz au plus) se lit déjà
+/// `conforme` (verdict effectif) ; la remesurer serait un décodage inutile.
 const A_REMESURER: &str = "EXISTS (SELECT 1 FROM hires_verifications h \
-     WHERE h.track_id = t.id AND h.raison = 'coupure_de_codec')";
+     WHERE h.track_id = t.id AND h.raison = 'coupure_de_codec' \
+     AND (h.sample_rate > 48000 OR h.bits_declares > 16))";
 
 /// Le prédicat des candidats : pistes LOCALES sans perte, avec un chemin, pas
 /// encore mesurées (ou à remesurer, #9035), dans le périmètre des analyses.

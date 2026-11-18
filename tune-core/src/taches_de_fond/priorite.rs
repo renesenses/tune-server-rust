@@ -165,21 +165,13 @@ pub fn oublier_la_zone(zone_id: i64) {
     noter_etat_de_lecture(zone_id, "stopped");
 }
 
-/// Exécuter `f` seulement si aucune zone ne joue, SOUS le verrou du témoin
-/// (tune-server-rust#9046). `None` si une zone joue : `f` n'est pas appelé.
-///
-/// `ZoneRepo::save_play_state` note la mémoire AVANT d'écrire la base : une
-/// zone qui démarre pendant `f` attend donc ce verrou, puis écrit « playing »
-/// APRÈS `f`. Une correction de la base faite dans `f` ne peut pas effacer le
-/// « playing » d'une zone qui démarre au même instant.
-pub fn sans_lecture_en_cours<R>(f: impl FnOnce() -> R) -> Option<R> {
-    let zones = ZONES_QUI_JOUENT.lock().unwrap_or_else(|e| e.into_inner());
-    if !zones.is_empty() {
-        return None;
-    }
-    let r = f();
-    drop(zones);
-    Some(r)
+/// CETTE zone joue-t-elle selon le témoin en mémoire (tune-server-rust#9046) ?
+/// Le verrou n'est tenu que le temps de la lecture.
+pub fn la_zone_joue(zone_id: i64) -> bool {
+    ZONES_QUI_JOUENT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&zone_id)
 }
 
 /// Une zone joue-t-elle ? Lecture atomique, gratuite.
@@ -465,22 +457,15 @@ pub fn oublier_la_lecture_pour_les_essais() {
 
 #[cfg(test)]
 mod tests_9046 {
-    /// #9046 — une zone qui joue en mémoire empêche la correction de la base :
-    /// `f` n'est pas appelé. Seul le cas « une zone joue » est vérifié : tant
-    /// que CETTE zone est notée, aucun autre essai ne peut vider l'ensemble,
-    /// et le résultat ne dépend pas du parallélisme des essais.
+    /// #9046 — le témoin d'UNE zone. Identifiant propre à l'essai : aucun
+    /// autre essai ne le note, le résultat ne dépend pas du parallélisme.
     #[test]
-    fn une_zone_qui_joue_bloque_la_correction_9046() {
+    fn la_zone_joue_lit_le_temoin_de_cette_zone_9046() {
+        assert!(!super::la_zone_joue(904_699));
         super::noter_etat_de_lecture(904_699, "playing");
-        let mut appele = false;
-        let r = super::sans_lecture_en_cours(|| {
-            appele = true;
-        });
+        let joue = super::la_zone_joue(904_699);
         super::noter_etat_de_lecture(904_699, "stopped");
-        assert!(r.is_none());
-        assert!(
-            !appele,
-            "la correction ne doit pas s'exécuter pendant une lecture"
-        );
+        assert!(joue);
+        assert!(!super::la_zone_joue(904_699));
     }
 }
