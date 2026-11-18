@@ -353,6 +353,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8714 -- --nocapture --test-threads=1
 
+      # #8487 — les titres diffusés par une radio, notés sous la ligne de leur
+      # station dans `radio_titres_diffuses` (table d'`ENSURE_TABLES`, sans
+      # script numéroté) : écriture, dédoublonnage et relecture sur PostgreSQL.
+      - name: Titres diffusés des radios sur PostgreSQL (#8487)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_titres_diffuses -- --nocapture --test-threads=1
+
       # #8416 — les règles « nombre d'écoutes » et « dernière écoute » des
       # listes et collections intelligentes comptent les écoutes importées
       # (`imported_plays`) comme la Bibliothèque. Sans cette étape, le témoin

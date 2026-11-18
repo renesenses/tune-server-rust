@@ -960,11 +960,25 @@ impl PositionPoller {
                         // #3973 — un refus « bit-perfect strict » arrive en
                         // sentinelle : il part avec son code et ses deux
                         // fréquences, et la phrase française en repli.
-                        let charge = match crate::audio::bitperfect_strict::RefusBitPerfect::depuis_sentinelle(&msg) {
-                            Some(refus) => crate::audio::bitperfect_strict::charge_utile_de_refus(
-                                zone_id, &refus,
-                            ),
-                            None => serde_json::json!({
+                        // #8696 — un flux qui a plus de voies que la
+                        // sortie exclusive : code et paramètres, phrase en
+                        // français en repli.
+                        let bitperfect =
+                            crate::audio::bitperfect_strict::RefusBitPerfect::depuis_sentinelle(
+                                &msg,
+                            );
+                        let voies_en_trop =
+                            crate::outputs::voies_en_trop_8696::VoiesEnTrop::depuis_sentinelle(
+                                &msg,
+                            );
+                        let charge = match (bitperfect, voies_en_trop) {
+                            (Some(refus), _) => {
+                                crate::audio::bitperfect_strict::charge_utile_de_refus(
+                                    zone_id, &refus,
+                                )
+                            }
+                            (None, Some(voies)) => voies.charge_utile(zone_id),
+                            (None, None) => serde_json::json!({
                                 "zone_id": zone_id,
                                 "error": msg,
                                 "fatal": true,
@@ -1518,8 +1532,10 @@ impl PositionPoller {
                 // distincts pour un seul probleme (#1522, #1492).
                 //
                 // La garde sur le peripherique de sortie, elle, est tombee
-                // avec #1536.
-                self.refresh_radio_metadata(zone_id, zone_state).await;
+                // avec #1536. Seule la NOTE du titre dans l'historique (#8487)
+                // attend un renderer qui joue.
+                self.refresh_radio_metadata_et_noter(zone_id, zone_state, !radio_stopped)
+                    .await;
 
                 // Sync metrics and skip the rest of the loop (no gapless/track-end).
                 self.shared_metrics.lock().await.insert(
