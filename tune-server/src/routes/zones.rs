@@ -466,11 +466,18 @@ fn inject_device_identity(
         "wasapi_exclusive_period_choices_ms".into(),
         json!(tune_core::outputs::periode_reglable_8696::CHOIX_MS),
     );
-    // Le réglage ne vaut que sur un serveur Windows (sortie locale en WASAPI
-    // exclusif) : le client n'affiche le sélecteur que là.
+    // Le réglage ne vaut que sur un serveur Windows, pour une zone LOCALE dont
+    // la sortie n'est pas ASIO (`backend_sortie`, posé plus tôt par
+    // `injecter_backend_de_sortie` quand il est connu) : le client n'affiche
+    // le sélecteur que là.
+    let applicable = tune_core::outputs::periode_reglable_8696::periode_applicable(
+        cfg!(target_os = "windows"),
+        obj.get("output_type").and_then(|v| v.as_str()),
+        obj.get("backend_sortie").and_then(|v| v.as_str()),
+    );
     obj.insert(
         "wasapi_exclusive_period_applicable".into(),
-        json!(cfg!(target_os = "windows")),
+        json!(applicable),
     );
     // #3254 — …et ce que ce réglage VAUT sur cette zone-ci. Le champ ci-dessus
     // était accepté et relu pour n'importe quelle zone, alors que les trois

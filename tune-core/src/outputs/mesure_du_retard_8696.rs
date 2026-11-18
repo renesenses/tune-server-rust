@@ -476,9 +476,10 @@ mod tests {
         );
     }
 
-    /// Le branchement dans la boucle de rendu : la mesure est faite APRÈS le
-    /// réveil et AVANT le tampon, la ligne de rafale APRÈS le tampon, et la
-    /// rafale en cours sort à l'arrêt du fil. Comparé sans blancs.
+    /// Le branchement dans la boucle de rendu : rien de l'horloge de
+    /// l'appareil n'est lu avant le remplissage du tampon ; la position et
+    /// l'histogramme viennent APRÈS `ReleaseBuffer`, la ligne de rafale
+    /// ensuite, et la rafale en cours sort à l'arrêt du fil. Sans blancs.
     #[test]
     fn la_boucle_de_rendu_mesure_et_journalise_par_rafale() {
         let source: String = include_str!("wasapi_exclusive.rs")
@@ -488,10 +489,12 @@ mod tests {
         let avant_attente =
             source.find("avant_attente=(unsafe{ffi::QueryPerformanceCounter(&mutt)}");
         let attente = source.find("WaitForMultipleObjects(2,poignees.as_ptr()");
-        let histogramme =
-            source.find("histogramme.ajouter(case_de_l_ecart(ecart_ticks,periode_ticks));");
         let rembourrage = source.find("rembourrage_courant(audio_client_mesure)");
         let tampon = source.find("letget_buf:GetBufferFn");
+        let liberation = source.find("rel_buf(render_client,buffer_frame_count,0)");
+        let position = source.find("unsafe{position_de_l_appareil(horloge)}");
+        let histogramme =
+            source.find("histogramme.ajouter(case_de_l_ecart(observe.ecart_ticks,periode_ticks));");
         let ligne = source.find("journaliser_la_rafale(bilan,frequence");
         let terminer = source.find("rafales.as_mut().and_then(Rafales::terminer)");
         let fin = source.find("info!(\"wasapi_exclusive_render_thread_stopped\");");
@@ -499,9 +502,11 @@ mod tests {
             ("boucle", boucle),
             ("entrée dans l'attente", avant_attente),
             ("attente", attente),
-            ("histogramme", histogramme),
             ("rembourrage", rembourrage),
             ("tampon", tampon),
+            ("libération", liberation),
+            ("position", position),
+            ("histogramme", histogramme),
             ("ligne de rafale", ligne),
             ("rafale à l'arrêt", terminer),
             ("fin", fin),
@@ -509,8 +514,17 @@ mod tests {
             assert!(p.is_some(), "absent de wasapi_exclusive.rs : {nom}");
         }
         assert!(boucle < avant_attente && avant_attente < attente);
-        assert!(attente < histogramme && histogramme < tampon);
-        assert!(rembourrage < tampon && tampon < ligne);
+        assert!(attente < rembourrage && rembourrage < tampon);
+        assert!(tampon < liberation && liberation < position);
+        assert!(position < histogramme && histogramme < ligne);
         assert!(ligne < terminer && terminer < fin);
+        // Une seule lecture de position dans la boucle : celle d'après.
+        let dans_la_boucle = &source[boucle.unwrap()..fin.unwrap()];
+        assert_eq!(
+            dans_la_boucle
+                .matches("unsafe{position_de_l_appareil(horloge)}")
+                .count(),
+            1
+        );
     }
 }

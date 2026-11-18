@@ -189,6 +189,23 @@ fn valider_le_patch(
             "unsupported PCM sample rate",
         ));
     }
+    // #8696 — une période WASAPI hors bornes est REFUSÉE (422), jamais bornée
+    // en silence ; `null` et `0` restent « Auto ».
+    if let Some(Some(ms)) = body.wasapi_exclusive_period_ms
+        && let Err(raison) = tune_core::outputs::periode_reglable_8696::valider_ms(ms)
+    {
+        warn!(zone_id = id, ms, raison = %raison, "zone_patch_rejected");
+        return Err(crate::message_api::refus_avec_cause(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "zone_field_invalid",
+            "api.zones.fieldInvalid",
+            &[
+                ("field", "wasapi_exclusive_period_ms".to_string()),
+                ("value", ms.to_string()),
+            ],
+            &raison,
+        ));
+    }
     // Les valeurs que cette route peut juger seule, avant toute écriture : un
     // PATCH est atomique du point de vue de l'utilisateur, il ne doit pas
     // laisser la moitié de ses champs écrits derrière lui.
@@ -977,8 +994,8 @@ async fn persister_le_son(
     if let Some(valeur) = body.wasapi_exclusive_period_ms {
         let settings = SettingsRepo::with_backend(state.backend.clone());
         let key = tune_core::outputs::periode_reglable_8696::cle_de_zone(id);
-        let lue = valeur
-            .and_then(|ms| tune_core::outputs::periode_reglable_8696::lire_valeur(&ms.to_string()));
+        // Validée par `valider_le_patch` : seul `0` reste à ramener à Auto.
+        let lue = valeur.filter(|ms| *ms > 0);
         let r = match lue {
             Some(ms) => settings.set(&key, &ms.to_string()),
             None => settings.delete(&key),

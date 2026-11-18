@@ -304,7 +304,7 @@ async fn frequence_fixe_8428_airplay_refuse_la_cadence_mais_permet_de_l_effacer(
 }
 
 /// #8696 — période WASAPI exclusive : publiée à `null` (Auto) avec ses
-/// choix, persistée par la route, bornée, et remise à Auto par `null` ou `0`
+/// choix, persistée par la route, refusée hors bornes (422), et remise à Auto par `null` ou `0`
 /// en SUPPRIMANT la clé.
 #[tokio::test]
 async fn periode_wasapi_8696_est_persistee_par_la_route() {
@@ -319,10 +319,8 @@ async fn periode_wasapi_8696_est_persistee_par_la_route() {
         avant["wasapi_exclusive_period_choices_ms"],
         json!([10, 20, 50, 100])
     );
-    assert_eq!(
-        avant["wasapi_exclusive_period_applicable"],
-        json!(cfg!(target_os = "windows"))
-    );
+    // Zone DLNA : jamais applicable, quelle que soit la plateforme.
+    assert_eq!(avant["wasapi_exclusive_period_applicable"], json!(false));
 
     let (statut, reponse) = patch(&app, id, json!({ "wasapi_exclusive_period_ms": 50 })).await;
     assert_eq!(statut, StatusCode::OK, "PATCH refusé : {reponse}");
@@ -332,15 +330,19 @@ async fn periode_wasapi_8696_est_persistee_par_la_route() {
     );
     assert_eq!(reglages.get(&cle).unwrap().as_deref(), Some("50"));
 
-    // Borné : 5 000 ms deviennent 500.
-    let (statut, _) = patch(&app, id, json!({ "wasapi_exclusive_period_ms": 5000 })).await;
-    assert_eq!(statut, StatusCode::OK);
-    assert_eq!(reglages.get(&cle).unwrap().as_deref(), Some("500"));
+    // Hors bornes : 422 en clair, et le réglage en place n'est pas touché.
+    for hors in [5000, 2] {
+        let (statut, reponse) =
+            patch(&app, id, json!({ "wasapi_exclusive_period_ms": hors })).await;
+        assert_eq!(statut, StatusCode::UNPROCESSABLE_ENTITY, "{reponse}");
+        assert!(reponse.to_string().contains("3 à 500 ms"), "{reponse}");
+        assert_eq!(reglages.get(&cle).unwrap().as_deref(), Some("50"));
+    }
 
     // Un PATCH sans le champ ne touche pas au réglage.
     let (statut, _) = patch(&app, id, json!({ "strict_bitperfect": false })).await;
     assert_eq!(statut, StatusCode::OK);
-    assert_eq!(reglages.get(&cle).unwrap().as_deref(), Some("500"));
+    assert_eq!(reglages.get(&cle).unwrap().as_deref(), Some("50"));
 
     let (statut, _) = patch(&app, id, json!({ "wasapi_exclusive_period_ms": 0 })).await;
     assert_eq!(statut, StatusCode::OK);

@@ -123,10 +123,9 @@ pub mod squeezebox;
 #[cfg(test)]
 mod suivante_verifiee_3967;
 pub mod traits;
-/// #8696 — le message clair d'un flux multicanal vers une sortie WASAPI
-/// exclusive qui a moins de voies.
-#[cfg(any(target_os = "windows", test))]
-pub(crate) mod voies_en_trop_8696;
+/// #8696 — le refus clair d'un flux multicanal vers une sortie WASAPI
+/// exclusive qui a moins de voies (sentinelle relue par le poller).
+pub mod voies_en_trop_8696;
 #[cfg(all(target_os = "windows", feature = "local-audio"))]
 #[allow(unsafe_op_in_unsafe_fn)]
 pub mod wasapi_exclusive;

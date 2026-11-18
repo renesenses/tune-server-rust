@@ -1149,11 +1149,11 @@ impl WasapiExclusiveOutput {
                     release(device);
                     // #8696 — un fichier multicanal vers un DAC stéréo : le
                     // dire en clair plutôt qu'en liste de formats refusés.
-                    return Err(super::voies_en_trop_8696::message_voies_en_trop(
-                        &resolved.name,
+                    return Err(super::voies_en_trop_8696::VoiesEnTrop::constater(
                         channels,
                         voies_declarees,
                     )
+                    .map(|v| v.sentinelle())
                     .unwrap_or(erreur));
                 }
             };
@@ -1672,14 +1672,14 @@ impl WasapiExclusiveOutput {
                 let mut retard_a_journaliser: Option<u64> = None;
                 let mut persistance_a_journaliser: Option<u64> = None;
                 let mut rafale_a_journaliser: Option<BilanDeRafale> = None;
+                // #8696 — un retard observé AVANT le remplissage, complété
+                // APRÈS `ReleaseBuffer` par l'avance de l'appareil : aucun
+                // appel à l'horloge ne précède le remplissage du tampon.
+                let mut retard_en_attente: Option<(u64, u64, RetardObserve)> = None;
                 if let Some(suivi) = suivi.as_mut() {
                     let mut maintenant: i64 = 0;
                     if unsafe { ffi::QueryPerformanceCounter(&mut maintenant) } != 0 {
                         let maintenant = maintenant as u64;
-                        // #8696 — la position de l'appareil à chaque réveil :
-                        // l'avance pendant un écart se lit contre la précédente.
-                        let position = frequence_horloge
-                            .and_then(|_| unsafe { position_de_l_appareil(horloge) });
                         let reveil = suivi.observer(maintenant);
                         let ecart_en_retard = match reveil {
                             Reveil::Premier | Reveil::AHeure => None,
@@ -1708,25 +1708,17 @@ impl WasapiExclusiveOutput {
                                 }
                                 _ => (0, ecart_ticks),
                             };
-                            let avance = match (position, position_precedente, frequence_horloge) {
-                                (Some(p), Some(pp), Some(f)) if p >= pp => {
-                                    avance_en_centiemes_de_periode(p - pp, f, period_100ns)
-                                }
-                                _ => None,
-                            };
+                            // Le rembourrage n'est lu QUE sur un réveil en
+                            // retard ; l'avance de l'appareil, après le tampon.
                             let observe = RetardObserve {
                                 ecart_ticks,
                                 ou: ou_est_le_temps(travail, attente, periode_ticks),
-                                avance_appareil_centiemes: avance,
+                                avance_appareil_centiemes: None,
                                 rembourrage_trames: unsafe {
                                     rembourrage_courant(audio_client_mesure)
                                 },
                             };
-                            histogramme.ajouter(case_de_l_ecart(ecart_ticks, periode_ticks));
-                            causes.noter(&observe);
-                            if let Some(r) = rafales.as_mut() {
-                                rafale_a_journaliser = r.retard(maintenant, observe);
-                            }
+                            retard_en_attente = Some((maintenant, periode_ticks, observe));
                             // #8696 — des retards sans répit pendant 10 s.
                             if let Some(p) = persistance.as_mut()
                                 && let Episode::DevientPersistant { duree_ticks } =
@@ -1739,7 +1731,6 @@ impl WasapiExclusiveOutput {
                             rafale_a_journaliser = r.a_l_heure(maintenant);
                         }
                         reveil_precedent = Some(maintenant);
-                        position_precedente = position;
                         max_wakeup_gap_us.store(
                             microsecondes(suivi.ecart_max_ticks(), frequence),
                             Ordering::Relaxed,
@@ -1756,6 +1747,9 @@ impl WasapiExclusiveOutput {
                     let hr = get_buf(render_client, buffer_frame_count, &mut buf);
                     if hr != S_OK_LOCAL {
                         callback_errors.fetch_add(1, Ordering::Relaxed);
+                        // #8696 — la référence de position n'est plus à la
+                        // même phase : l'avance suivante serait fausse.
+                        position_precedente = None;
                         continue;
                     }
 
@@ -1787,6 +1781,27 @@ impl WasapiExclusiveOutput {
                         callback_errors.fetch_add(1, Ordering::Relaxed);
                     }
                 }
+
+                // #8696 — la position de l'appareil, lue APRÈS le tampon remis :
+                // d'un `ReleaseBuffer` au suivant, à la même phase, elle dit
+                // de combien de périodes l'appareil a avancé pendant l'écart.
+                let position =
+                    frequence_horloge.and_then(|_| unsafe { position_de_l_appareil(horloge) });
+                if let Some((maintenant, periode_ticks, mut observe)) = retard_en_attente.take() {
+                    observe.avance_appareil_centiemes =
+                        match (position, position_precedente, frequence_horloge) {
+                            (Some(p), Some(pp), Some(f)) if p >= pp => {
+                                avance_en_centiemes_de_periode(p - pp, f, period_100ns)
+                            }
+                            _ => None,
+                        };
+                    histogramme.ajouter(case_de_l_ecart(observe.ecart_ticks, periode_ticks));
+                    causes.noter(&observe);
+                    if let Some(r) = rafales.as_mut() {
+                        rafale_a_journaliser = r.retard(maintenant, observe);
+                    }
+                }
+                position_precedente = position;
 
                 // #4357 — journalisé APRÈS le tampon rendu, jamais avant.
                 if let (Some(ecart_ticks), Some(suivi)) = (retard_a_journaliser, suivi.as_ref()) {

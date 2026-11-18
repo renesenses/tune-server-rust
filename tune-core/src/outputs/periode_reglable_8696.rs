@@ -53,19 +53,55 @@ pub fn cle_de_zone(zone_id: i64) -> String {
     format!("zone_{zone_id}_wasapi_periode_ms")
 }
 
-/// Lit une valeur de réglage : un entier de millisecondes, borné à
-/// [`PERIODE_MIN_MS`]..=[`PERIODE_MAX_MS`]. `0`, `auto`, vide ou illisible :
-/// `None` (la période par défaut du pilote).
-pub fn lire_valeur(valeur: &str) -> Option<u32> {
+/// Ce que dit une valeur de réglage écrite (setting ou variable
+/// d'environnement).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LectureDePeriode {
+    /// Vide, `0` ou `auto` : la période du pilote.
+    Auto,
+    /// Une période valide, en ms.
+    Ms(u32),
+    /// Un entier hors de [`PERIODE_MIN_MS`]..=[`PERIODE_MAX_MS`] : ignoré,
+    /// jamais borné en silence.
+    HorsBornes(u32),
+    /// Ni un entier ni `auto`.
+    Illisible,
+}
+
+/// Analyse une valeur écrite.
+pub fn analyser(valeur: &str) -> LectureDePeriode {
     let v = valeur.trim();
     if v.is_empty() || v.eq_ignore_ascii_case("auto") {
-        return None;
+        return LectureDePeriode::Auto;
     }
-    let ms: u32 = v.parse().ok()?;
-    if ms == 0 {
-        return None;
+    match v.parse::<u32>() {
+        Ok(0) => LectureDePeriode::Auto,
+        Ok(ms) if (PERIODE_MIN_MS..=PERIODE_MAX_MS).contains(&ms) => LectureDePeriode::Ms(ms),
+        Ok(ms) => LectureDePeriode::HorsBornes(ms),
+        Err(_) => LectureDePeriode::Illisible,
     }
-    Some(ms.clamp(PERIODE_MIN_MS, PERIODE_MAX_MS))
+}
+
+/// La période d'une valeur écrite : `Some` seulement pour une valeur valide.
+/// Auto, hors bornes ou illisible : `None` (la période du pilote).
+pub fn lire_valeur(valeur: &str) -> Option<u32> {
+    match analyser(valeur) {
+        LectureDePeriode::Ms(ms) => Some(ms),
+        _ => None,
+    }
+}
+
+/// La valeur que la route accepte : `0` = Auto (`Ok(None)`), une période dans
+/// les bornes (`Ok(Some)`), sinon le refus en clair.
+pub fn valider_ms(ms: u32) -> Result<Option<u32>, String> {
+    match analyser(&ms.to_string()) {
+        LectureDePeriode::Auto => Ok(None),
+        LectureDePeriode::Ms(ms) => Ok(Some(ms)),
+        _ => Err(format!(
+            "période WASAPI exclusive hors bornes : {ms} ms (attendu {PERIODE_MIN_MS} à \
+             {PERIODE_MAX_MS} ms, ou null / 0 pour Auto)"
+        )),
+    }
 }
 
 /// D'où vient la période demandée — journalisé à l'ouverture.
@@ -108,7 +144,37 @@ pub fn periode_demandee_pour_l_ouverture(
 ) -> Option<(u32, OrigineDeLaPeriode)> {
     let zone = (reglage_de_zone_ms > 0).then(|| reglage_de_zone_ms.to_string());
     let env = std::env::var(VARIABLE_D_ENVIRONNEMENT).ok();
+    // Une variable d'environnement fautive est DITE, puis ignorée.
+    if zone.is_none()
+        && let Some(v) = env.as_deref()
+        && matches!(
+            analyser(v),
+            LectureDePeriode::HorsBornes(_) | LectureDePeriode::Illisible
+        )
+    {
+        tracing::warn!(
+            variable = VARIABLE_D_ENVIRONNEMENT,
+            valeur = v,
+            min_ms = PERIODE_MIN_MS,
+            max_ms = PERIODE_MAX_MS,
+            "wasapi_exclusive_periode_d_environnement_ignoree — hors bornes ou illisible : période du pilote (#8696)"
+        );
+    }
     periode_demandee_ms(zone.as_deref(), env.as_deref())
+}
+
+/// Le réglage a-t-il un effet sur cette zone ? Seulement sur un serveur
+/// Windows, pour une zone LOCALE dont la sortie n'est pas ASIO (ASIO a sa
+/// propre taille de tampon, fixée par son pilote). Sortie encore inconnue :
+/// le réglage vaudra à l'ouverture en WASAPI.
+pub fn periode_applicable(
+    sur_windows: bool,
+    type_de_sortie: Option<&str>,
+    backend_de_la_sortie: Option<&str>,
+) -> bool {
+    sur_windows
+        && type_de_sortie == Some("local")
+        && !backend_de_la_sortie.is_some_and(|b| b.trim().eq_ignore_ascii_case("asio"))
 }
 
 /// La période retenue pour `Initialize(EXCLUSIVE)`, et celle de repli.
@@ -213,8 +279,24 @@ mod tests {
         assert_eq!(lire_valeur(""), None);
         assert_eq!(lire_valeur("cinquante"), None);
         assert_eq!(lire_valeur("-5"), None);
-        assert_eq!(lire_valeur("1"), Some(PERIODE_MIN_MS));
-        assert_eq!(lire_valeur("5000"), Some(PERIODE_MAX_MS));
+        // Hors bornes : ignoré, jamais borné en silence.
+        assert_eq!(lire_valeur("1"), None);
+        assert_eq!(lire_valeur("5000"), None);
+        assert_eq!(analyser("1"), LectureDePeriode::HorsBornes(1));
+        assert_eq!(analyser("5000"), LectureDePeriode::HorsBornes(5000));
+        assert_eq!(analyser("3"), LectureDePeriode::Ms(3));
+        assert_eq!(analyser("500"), LectureDePeriode::Ms(500));
+        assert_eq!(analyser("x"), LectureDePeriode::Illisible);
+    }
+
+    #[test]
+    fn la_route_refuse_une_periode_hors_bornes_en_clair() {
+        assert_eq!(valider_ms(0), Ok(None));
+        assert_eq!(valider_ms(50), Ok(Some(50)));
+        let refus = valider_ms(5000).unwrap_err();
+        assert!(refus.contains("5000 ms"), "{refus}");
+        assert!(refus.contains("3 à 500 ms"), "{refus}");
+        assert!(valider_ms(2).is_err());
     }
 
     #[test]
@@ -234,6 +316,8 @@ mod tests {
         );
         assert_eq!(periode_demandee_ms(None, None), None);
         assert_eq!(periode_demandee_ms(Some("0"), Some("")), None);
+        // Variable hors bornes : ignorée.
+        assert_eq!(periode_demandee_ms(None, Some("5000")), None);
     }
 
     #[test]
@@ -267,5 +351,16 @@ mod tests {
             assert!(p.is_some(), "absent de wasapi_exclusive.rs : {nom}");
         }
         assert!(demandee < essais && essais < client_neuf && client_neuf < init && init < occupe);
+    }
+
+    #[test]
+    fn le_reglage_ne_vaut_que_pour_une_zone_locale_windows_hors_asio() {
+        assert!(periode_applicable(true, Some("local"), None));
+        assert!(periode_applicable(true, Some("local"), Some("wasapi")));
+        assert!(!periode_applicable(true, Some("local"), Some("asio")));
+        assert!(!periode_applicable(true, Some("local"), Some(" ASIO ")));
+        assert!(!periode_applicable(true, Some("dlna"), None));
+        assert!(!periode_applicable(true, None, None));
+        assert!(!periode_applicable(false, Some("local"), Some("wasapi")));
     }
 }
