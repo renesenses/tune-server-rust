@@ -115,7 +115,7 @@ fn oublier_un_appareil_supprime_sa_zone_et_le_laisse_revenir_sqlite() {
 
 #[cfg(feature = "postgres")]
 #[tokio::test(flavor = "multi_thread")]
-async fn oublier_un_appareil_supprime_sa_zone_et_le_laisse_revenir_pg() {
+async fn pg_9044_oublier_un_appareil_supprime_sa_zone_et_le_laisse_revenir() {
     let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
         eprintln!("SAUT: TUNE_TEST_PG_URL absent — épreuve PostgreSQL #9044 sautée");
         return;
