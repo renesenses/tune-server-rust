@@ -126,6 +126,10 @@ pub struct AppState {
     pub api_analytics: Arc<tune_core::api_analytics::ApiAnalytics>,
     pub poller_metrics: tune_core::poller::PollerMetricsMap,
     pub update_phase: Arc<std::sync::Mutex<Option<String>>>,
+    /// Code à usage unique qui autorise l'activation de l'authentification
+    /// depuis un autre appareil (`POST /auth/activation`) ; affiché dans le
+    /// journal du serveur seulement.
+    pub code_activation_auth: Arc<std::sync::Mutex<Option<crate::auth::CodeActivation>>>,
     /// La raison de la dernière mise à jour qui n'a rien installé (#7600),
     /// rendue par `GET /system/update/status`.
     pub update_issue: Arc<crate::routes::system::suivi_de_mise_a_jour_7600::Issue>,
@@ -752,6 +756,7 @@ impl AppState {
             api_analytics: Arc::new(tune_core::api_analytics::ApiAnalytics::default()),
             poller_metrics: Arc::new(Mutex::new(std::collections::HashMap::new())),
             update_phase: Arc::new(std::sync::Mutex::new(None)),
+            code_activation_auth: Arc::new(std::sync::Mutex::new(None)),
             update_issue: Arc::new(std::sync::Mutex::new(None)),
             rooms: Arc::new(Mutex::new(tune_core::collaborative::RoomManager::new())),
             upnp_index_lock: Arc::new(Mutex::new(())),

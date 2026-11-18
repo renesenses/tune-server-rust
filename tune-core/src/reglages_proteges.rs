@@ -83,6 +83,10 @@ const PREFIXES_PROTEGES: &[&str] = &[
     // et catalogue hérité : ils décident du code chargé au démarrage. Ils
     // s'écrivent par les routes des greffons, gardées « cette machine ».
     "plugin_",
+    // Greffons audio Premium retenus pendant une absence de licence
+    // (`premium_audio_plugins_withheld_*`) et leur migration : la licence
+    // retrouvée les rallume (`restore_withheld`).
+    "premium_audio_plugins_",
 ];
 
 /// Suffixes qui désignent un chemin, un exécutable ou l'adresse d'un service.

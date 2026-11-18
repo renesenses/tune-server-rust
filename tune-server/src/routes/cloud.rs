@@ -1150,7 +1150,9 @@ pub const MESSAGE_ACCES_PAR_COMPTE: &str =
 /// active (`RequireAdmin`), répond 409 tant que le pont est éteint ou sans
 /// jeton, et n'en fabrique JAMAIS un — c'est le rôle de `bridge_enable`.
 async fn bridge_access_link(
-    _admin: crate::auth::RequireAdmin,
+    // Le lien porte le jeton du pont : administrateur, ou authentification
+    // coupée, seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
 ) -> axum::response::Response {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -1235,7 +1237,9 @@ fn reponse_lien_d_acces(settings: &SettingsRepo, token: &str) -> axum::response:
 ///
 /// Réponse : le nouveau lien, de la forme de `bridge_access_link`.
 async fn bridge_rotate_token(
-    _admin: crate::auth::RequireAdmin,
+    // Engage la machine : administrateur, ou authentification coupée,
+    // seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
 ) -> axum::response::Response {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -1316,7 +1320,9 @@ async fn bridge_enable(
 /// Éteint le pont. Administrateur seulement dès que l'authentification est
 /// active.
 async fn bridge_disable(
-    _admin: crate::auth::RequireAdmin,
+    // Engage la machine : administrateur, ou authentification coupée,
+    // seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
 ) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());

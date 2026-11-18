@@ -26,7 +26,7 @@ fn new_state() -> AppState {
 }
 
 async fn appel(state: &AppState, req: Request<Body>) -> (StatusCode, Value) {
-    let app: Router = tune_server::routes::router(state.clone());
+    let app: Router = tune_server::routes::router(state.clone()).layer(axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 50000))));
     let resp = app.oneshot(req).await.unwrap();
     let status = resp.status();
     let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX)

@@ -98,6 +98,9 @@ struct SetActiveSkinRequest {
 }
 
 async fn set_active_skin(
+    // Change l'apparence pour tous : administrateur quand l'authentification
+    // est active.
+    _admin: crate::auth::RequireAdmin,
     State(state): State<AppState>,
     Json(body): Json<SetActiveSkinRequest>,
 ) -> impl IntoResponse {

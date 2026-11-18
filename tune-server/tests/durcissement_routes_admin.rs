@@ -1154,6 +1154,24 @@ fn actions_machine_gardees_a_leur_tour() -> Vec<(Method, &'static str, Option<&'
             Some("{}"),
         ),
         (Method::POST, "/api/v1/cloud/bridge/enable", None),
+        // Décision du 18/11 : restaurations / imports de configuration, pont,
+        // canal de mise à jour.
+        (Method::POST, "/api/v1/cloud/bridge/disable", None),
+        (Method::POST, "/api/v1/cloud/bridge/rotate-token", None),
+        (Method::POST, "/api/v1/system/config/import", Some("{}")),
+        (Method::POST, "/api/v1/system/config-backup/import", Some("{}")),
+        (
+            Method::POST,
+            "/api/v1/system/config-backup/cloud/restore",
+            Some("{}"),
+        ),
+        (
+            Method::PUT,
+            "/api/v1/system/update/channel",
+            Some(r#"{"channel":"stable"}"#),
+        ),
+        // Le lien d'accès porte le jeton du pont.
+        (Method::GET, "/api/v1/cloud/bridge/access-link", None),
     ]
 }
 
@@ -1291,6 +1309,9 @@ async fn les_drapeaux_des_greffons_sont_des_reglages_proteges() {
         r#"{"plugin_bandcamp_enabled":"true"}"#,
         r#"{"plugin_bandcamp_hidden":"false"}"#,
         r#"{"plugins":"[]"}"#,
+        // Greffons Premium retenus : la licence retrouvée les rallumerait.
+        r#"{"premium_audio_plugins_withheld_equalizer":"installed,enabled"}"#,
+        r#"{"premium_audio_plugins_migration_v1":""}"#,
     ] {
         let (st, rep) = appel(
             &state,
@@ -1308,4 +1329,94 @@ async fn les_drapeaux_des_greffons_sont_des_reglages_proteges() {
         reglages.get("plugin_bandcamp_installed").ok().flatten(),
         None
     );
+}
+
+/// Derrière un mandataire inverse local, tout appel arrive de 127.0.0.1 : la
+/// présence d'un en-tête de mandataire retire la preuve « cette machine ».
+#[tokio::test]
+async fn derriere_un_mandataire_le_bouclage_ne_vaut_plus_cette_machine() {
+    let state = new_state();
+    for (entete, valeur) in [
+        ("x-forwarded-for", "192.168.1.50"),
+        ("forwarded", "for=192.168.1.50"),
+        ("x-real-ip", "192.168.1.50"),
+        ("via", "1.1 caddy"),
+        ("cf-connecting-ip", "203.0.113.9"),
+        ("x-forwarded-host", "tune.example.org"),
+    ] {
+        for (m, chemin, corps) in [
+            (Method::POST, "/api/v1/system/stop", None),
+            (
+                Method::POST,
+                "/api/v1/plugins/greffon-inexistant-gardes/install",
+                Some("{}"),
+            ),
+            (
+                Method::POST,
+                "/api/v1/auth/activation",
+                Some(r#"{"password":"pirate-1234"}"#),
+            ),
+        ] {
+            let (st, _, rep) = appel_depuis(
+                &state,
+                CETTE_MACHINE,
+                m.clone(),
+                chemin,
+                None,
+                corps,
+                &[(entete, valeur)],
+            )
+            .await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{entete} {m} {chemin} : {rep}");
+        }
+    }
+    assert!(!tune_server::auth::authentification_active(&state));
+    // Témoin : sans en-tête, la même machine passe la garde.
+    let (_, _, rep) = appel_depuis(
+        &state,
+        CETTE_MACHINE,
+        Method::POST,
+        "/api/v1/plugins/greffon-inexistant-gardes/install",
+        None,
+        Some("{}"),
+        &[],
+    )
+    .await;
+    assert!(!rep.contains("auth_required"), "{rep}");
+}
+
+#[test]
+fn un_mandataire_declare_retire_la_preuve_du_bouclage() {
+    use tune_server::auth::mandataire_declare;
+    assert!(!mandataire_declare(None, None));
+    assert!(!mandataire_declare(Some(""), Some(" , ")));
+    assert!(mandataire_declare(Some("https://tune.example.org"), None));
+    assert!(mandataire_declare(None, Some("tune.example.org")));
+}
+
+/// Changer l'apparence active pour tous : administrateur quand
+/// l'authentification est active.
+#[tokio::test]
+async fn le_theme_actif_exige_l_administrateur() {
+    let state = new_state();
+    enable_auth(&state);
+    let (st, rep) = appel(
+        &state,
+        Method::POST,
+        "/api/v1/skins/active",
+        Some(&tok("user", 2)),
+        Some(r#"{"skin_id":"theme-inexistant"}"#),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{rep}");
+    assert!(rep.contains("admin role required"), "{rep}");
+    let (st, rep) = appel(
+        &state,
+        Method::POST,
+        "/api/v1/skins/active",
+        Some(&tok("admin", 1)),
+        Some(r#"{"skin_id":"theme-inexistant"}"#),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{rep}");
 }

@@ -45,7 +45,7 @@ async fn appel(
     entetes: &[(&str, &str)],
     corps: Option<&str>,
 ) -> (StatusCode, HeaderMap, Value) {
-    let app: Router = tune_server::routes::router(state.clone());
+    let app: Router = tune_server::routes::router(state.clone()).layer(axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 50000))));
     let mut req = Request::builder().method(methode).uri(chemin);
     for (k, v) in entetes {
         req = req.header(*k, *v);

@@ -88,7 +88,7 @@ fn semer_les_reglages(state: &AppState) {
 }
 
 async fn get_body(state: &AppState, path: &str, bearer: Option<&str>) -> (StatusCode, String) {
-    let app: Router = tune_server::routes::router(state.clone());
+    let app: Router = tune_server::routes::router(state.clone()).layer(axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 50000))));
     let mut req = Request::get(path);
     if let Some(b) = bearer {
         req = req.header(header::AUTHORIZATION, format!("Bearer {b}"));
@@ -107,7 +107,7 @@ async fn post_json(
     bearer: Option<&str>,
     body: &str,
 ) -> (StatusCode, String) {
-    let app: Router = tune_server::routes::router(state.clone());
+    let app: Router = tune_server::routes::router(state.clone()).layer(axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 50000))));
     let mut req = Request::post(path).header(header::CONTENT_TYPE, "application/json");
     if let Some(b) = bearer {
         req = req.header(header::AUTHORIZATION, format!("Bearer {b}"));
