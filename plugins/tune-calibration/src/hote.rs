@@ -35,7 +35,7 @@ impl ElementBalayage {
 }
 
 /// Les traitements de la zone qui colorent la mesure s'ils restent actifs.
-#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct TraitementsDeZone {
     pub egaliseur: bool,
     pub correction_ir: bool,

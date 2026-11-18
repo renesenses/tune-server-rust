@@ -31,3 +31,7 @@ serde_json = { workspace = true }
 [[test]]
 name = "pieces_simulees"
 path = "tests/pieces_simulees.rs"
+
+[[test]]
+name = "positions_simulees"
+path = "tests/positions_simulees.rs"
