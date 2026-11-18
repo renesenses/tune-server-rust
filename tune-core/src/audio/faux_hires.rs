@@ -503,16 +503,12 @@ fn mesurer_selon(
     // #9035 — la signature d'un codec ne se cherche que sous une coupure
     // suspecte plus basse que la bande d'un CD : c'est le seul cas où la
     // raison hésite entre codec et mastering.
-    if let Some(f) = m
+    let trous = m
         .coupure_hz
         .filter(|&f| retenue_suspecte && f < COUPURE_CODEC_MAX_HZ)
-    {
-        if let Some(trous) = trous_de_codec(tranches, canaux as u32, sample_rate, bits_declares, f)
-        {
-            m.part_trouee = Some(trous.part);
-            m.signature_codec = trous.signature();
-        }
-    }
+        .and_then(|f| trous_de_codec(tranches, canaux as u32, sample_rate, bits_declares, f));
+    m.part_trouee = trous.map(|t| t.part);
+    m.signature_codec = trous.is_some_and(|t| t.signature());
     m
 }
 
