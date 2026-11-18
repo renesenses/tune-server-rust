@@ -334,7 +334,8 @@ impl Ligne {
     }
 }
 
-/// Les dix greffons TESS de la v1.0 et leurs droits (décisions Q2 révisée,
+/// Les onze greffons TESS de la v1.0 (dix au plan, plus `mono-downmix`,
+/// choix provisoire de T02 en attente de la décision D2) et leurs droits (décisions Q2 révisée,
 /// Q3, P1).
 ///
 /// - Graphic EQ, Headphone EQ, Crossfeed, Mono downmix (T02), Channel

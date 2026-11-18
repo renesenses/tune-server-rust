@@ -502,7 +502,12 @@ impl ChaineTess {
         }
         if !(ctx.greffon_disponible)(&m.id) {
             e.eteindre(MotifEtape::PluginUnavailable, None);
-        } else if d.entitlement.demande_le_premium() && !ctx.premium {
+        } else if d.entitlement.demande_le_premium()
+            && !ctx.premium
+            // D1 (provisoire, T02) : l'égaliseur de pièce déjà posé garde son
+            // droit acquis, comme aujourd'hui.
+            && !super::migration::droit_acquis(m)
+        {
             e.eteindre(MotifEtape::PremiumRequired, None);
         } else {
             match d.placement.channels {

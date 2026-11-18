@@ -16,42 +16,73 @@
 //! - [`migrer_zone`] enregistre la chaîne lue, sans jamais toucher une
 //!   ancienne clé. Deux migrations valent une.
 //!
+//! **La chaîne enregistrée ne dépend jamais du droit.** La conversion P2
+//! (paramétrique → graphique sans Premium) n'est appliquée qu'à la lecture
+//! ([`lire_zone`] avec `premium = false`) : un compte qui (re)devient Premium
+//! retrouve son égaliseur paramétrique.
+//!
 //! « Modifiée depuis la dernière synchronisation » se lit dans l'**ombre**
 //! (`zone_{id}_tess_chain_sync`, [`cle_ombre_zone`]) : la valeur brute de
-//! chaque ancienne clé au moment où la chaîne a été écrite. C'est ce qui
-//! garde ce que les anciennes clés ne savent pas dire (ordre, greffon décoché,
-//! Headphone EQ, upsampling DSD, headroom manuel, dither, `bypass_all`) sans
-//! jamais rater une écriture faite par une ancienne route.
+//! chaque ancienne clé au moment où la chaîne a été écrite, construite à
+//! partir de ce qui a été lu PUIS écrit, jamais relue (une ancienne route qui
+//! écrit pendant une écriture TESS n'est donc jamais avalée). Deux valeurs de
+//! même sens JSON comptent comme égales.
 //!
-//! Une clé illisible donne un **refus explicite** ([`ErreurMigration::CleCorrompue`]),
-//! jamais une chaîne vide.
+//! **Verrou par zone** : [`ecrire_chaine`] et [`migrer_zone`] prennent
+//! [`verrou_de_zone`] ; T03 (migration au démarrage) et T08 (`PUT
+//! /zones/{id}/tess`) n'écrivent la chaîne que par ces deux fonctions. Les
+//! anciennes routes ne prennent pas le verrou : l'ombre suffit pour elles.
+//!
+//! **Lecture tolérante comme aujourd'hui** : un booléen non canonique
+//! (`"on"`, `"yes"`, `"enabled": "yes"`…) vaut ce que le code actuel en fait
+//! (faux), sans refuser la zone ; une ombre illisible vaut une ombre absente.
+//! Le refus explicite ([`ErreurMigration::CleCorrompue`]) est réservé à une clé
+//! que son lecteur actuel ne sait pas lire : JSON invalide, ou réglage typé
+//! illisible (`eq_profile`, `channel_remap`, `upsampler`), et à une chaîne
+//! enregistrée illisible. Jamais une chaîne vide.
 //!
 //! # Correspondance
 //!
 //! | Ancienne clé | Chaîne |
 //! |---|---|
-//! | `zone_{id}_eq_profile` | une façade d'égaliseur (voir [`classer_egaliseur`]), `enabled` = `enabled` du profil, `settings` = le profil sans `enabled` |
+//! | `zone_{id}_eq_profile` | une façade d'égaliseur (voir [`classer_egaliseur`]), `enabled` = `enabled` du profil, `settings` = le profil sans `enabled` (sa réserve `headroom_mode` comprise) |
 //! | `ir_path_{id}` | `convolution`, coché, `settings.ir_path` |
 //! | `zone_{id}_crossfeed` | `crossfeed`, `enabled` = `enabled`, `settings` = le reste |
 //! | `zone_{id}_native_plugin_{p}` | greffon `{p}` (Crossfeed Pro, Crosstalk, paquets tiers), idem |
-//! | `zone_{id}_mono_downmix` | `mono-downmix` (greffon dédié, décision T02), coché si `"true"` |
+//! | `zone_{id}_mono_downmix` | `mono-downmix` (greffon dédié, choix provisoire D2), coché si `"true"` sur une sortie locale |
 //! | `zone_{id}_channel_remap` | `channel-remap`, en dernier, idem |
 //! | `zone_{id}_upsampler` | `fixed.upsampling` : `pcm` avec `filter`, `max_ratio`, `max_rate_hz` si `enabled`, sinon `off` |
 //! | `zone_{id}_audiophile`, `zone_{id}_strict_bitperfect` | hors chaîne : [`LectureZone::pure`] (`ContexteExecution.pure`) |
+//! | `zone_{id}_level_compensation` | hors chaîne : [`LectureZone::compensation_de_niveau`] (T07) |
+//! | colonne `zones.dsd_mode` | hors chaîne : [`LectureZone::dsd_mode`], [`lecture_dsd`] (T16) |
 //! | `zone_{id}_gain_trim_db` | hors chaîne : reste le gain de zone, porté par l'étage headroom (T07) |
 //!
 //! Ordre d'une chaîne tirée des anciennes clés : celui de la lecture
 //! d'aujourd'hui (égaliseur, convolution, crossfeed, étages tiers, repli mono,
 //! réaffectation en dernier).
+//!
+//! # Choix provisoires (décisions D1 et D2 en attente de Bertrand)
+//!
+//! - **D1** : un égaliseur de pièce mesuré déjà posé dans `eq_profile` devient
+//!   `room-correction` avec la marque `"legacy": true` dans ses réglages
+//!   ([`MARQUE_DROIT_ACQUIS`]) : la résolution le garde actif sans Premium,
+//!   comme aujourd'hui (droit acquis). La marque n'est jamais écrite dans
+//!   `eq_profile`.
+//! - **D2** : sur une zone RÉSEAU, où l'interrupteur de repli mono est
+//!   aujourd'hui inerte (#3254, sortie locale seulement), `mono-downmix` est
+//!   gardé dans la chaîne mais DÉCOCHÉ, avec `"inert_on_network": true`
+//!   ([`MARQUE_MONO_INERTE`]) : aucun changement audible, et l'ancienne clé
+//!   n'est pas touchée.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::{Map, Value};
 
 use super::chaine::{ChaineTess, MaillonGreffon, Upsampling, VERSION_CHAINE};
 use super::greffon::{Origine, catalogue_de_reference, id_valide};
+use super::resolution::LectureDsd;
 use crate::audio::crossfeed::{ID_CROSSTALK, est_de_la_famille_du_crossfeed};
 use crate::audio::eq::{EqBandSpec, EqProfile};
 use crate::audio::surechantillonnage::UpsamplerSettings;
@@ -66,6 +97,13 @@ pub const ID_CONVOLUTION: &str = "convolution";
 pub const ID_CROSSFEED: &str = "crossfeed";
 pub const ID_MONO: &str = "mono-downmix";
 pub const ID_REAFFECTATION: &str = "channel-remap";
+
+/// D1 (provisoire) : réglage qui marque un `room-correction` issu d'un
+/// `eq_profile` mesuré existant — droit acquis, actif sans Premium.
+pub const MARQUE_DROIT_ACQUIS: &str = "legacy";
+/// D2 (provisoire) : réglage qui marque un `mono-downmix` décoché parce que
+/// l'interrupteur actuel est inerte sur une sortie réseau.
+pub const MARQUE_MONO_INERTE: &str = "inert_on_network";
 
 /// Les quatre façades portées par `zone_{id}_eq_profile`.
 pub const FACADES_EQ: [&str; 4] = [
@@ -109,6 +147,19 @@ pub fn cle_ombre_zone(zone_id: i64) -> String {
 /// première fois (rien ne se perd, même un profil paramétrique converti, P2).
 pub fn cle_sauvegarde_eq(zone_id: i64) -> String {
     format!("zone_{zone_id}_eq_profile_before_tess")
+}
+
+/// Le verrou d'écriture de la chaîne d'une zone, dans ce processus. Pris par
+/// [`ecrire_chaine`] et [`migrer_zone`] : une migration au démarrage (T03)
+/// ne réécrit jamais une chaîne plus ancienne par-dessus un `PUT` TESS (T08)
+/// qui vient de passer.
+pub fn verrou_de_zone(zone_id: i64) -> Arc<Mutex<()>> {
+    static VERROUS: OnceLock<Mutex<HashMap<i64, Arc<Mutex<()>>>>> = OnceLock::new();
+    let mut table = VERROUS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    table.entry(zone_id).or_default().clone()
 }
 
 // ── Erreurs ─────────────────────────────────────────────────────────
@@ -218,6 +269,8 @@ impl Partie {
 
 /// La valeur brute de chaque ancienne clé (`None` = absente).
 type Instantane = BTreeMap<Partie, Option<String>>;
+/// L'ombre : nom de partie → valeur brute.
+type Ombre = BTreeMap<String, Option<String>>;
 
 fn stockage<T>(r: Result<T, String>) -> Result<T, ErreurMigration> {
     r.map_err(ErreurMigration::Stockage)
@@ -229,8 +282,9 @@ fn lire_instantane(settings: &SettingsRepo, zone_id: i64) -> Result<Instantane, 
         let v = stockage(settings.get(&p.cle(zone_id)))?;
         inst.insert(p, v);
     }
+    // Par préfixe : jamais toute la table `settings` (caches compris).
     let prefixe = format!("zone_{zone_id}_native_plugin_");
-    for (cle, valeur) in stockage(settings.all())? {
+    for (cle, valeur) in stockage(settings.par_prefixe(&prefixe))? {
         if let Some(id) = cle.strip_prefix(&prefixe)
             && !id.is_empty()
         {
@@ -238,6 +292,21 @@ fn lire_instantane(settings: &SettingsRepo, zone_id: i64) -> Result<Instantane, 
         }
     }
     Ok(inst)
+}
+
+/// Deux valeurs brutes ont-elles le même sens ? Égales, ou le même JSON.
+fn meme_valeur(a: Option<&str>, b: Option<&str>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(x), Some(y)) => {
+            x == y
+                || matches!(
+                    (serde_json::from_str::<Value>(x), serde_json::from_str::<Value>(y)),
+                    (Ok(u), Ok(v)) if u == v
+                )
+        }
+        _ => false,
+    }
 }
 
 /// Un objet JSON, ou un refus qui nomme la clé.
@@ -249,14 +318,10 @@ fn objet(cle: &str, brut: &str) -> Result<Map<String, Value>, ErreurMigration> {
     }
 }
 
-/// `enabled` d'un objet de réglages : absent = faux ; autre chose qu'un
-/// booléen = clé corrompue.
-fn coche(cle: &str, m: &Map<String, Value>) -> Result<bool, ErreurMigration> {
-    match m.get("enabled") {
-        None => Ok(false),
-        Some(Value::Bool(b)) => Ok(*b),
-        Some(_) => Err(corrompue(cle, "\"enabled\" is not a boolean")),
-    }
+/// `enabled` d'un objet de réglages, lu comme aujourd'hui : seul `true`
+/// coche ; absent ou non booléen = décoché, sans refus.
+fn coche(m: &Map<String, Value>) -> bool {
+    m.get("enabled").and_then(Value::as_bool).unwrap_or(false)
 }
 
 fn sans_enabled(mut m: Map<String, Value>) -> Value {
@@ -288,42 +353,21 @@ fn decoder(partie: &Partie, cle: &str, brut: Option<&str>) -> Result<Decodee, Er
                 .map_err(|e| corrompue(cle, format!("not an equalizer profile: {e}")))?;
             Decodee::Egaliseur(m, profil)
         }
-        Partie::Crossfeed | Partie::Natif(_) => {
-            let m = objet(cle, brut)?;
-            coche(cle, &m)?;
-            if matches!(partie, Partie::Crossfeed) {
-                serde_json::from_value::<tune_plugin_crossfeed::CrossfeedSettings>(Value::Object(
-                    m.clone(),
-                ))
-                .map_err(|e| corrompue(cle, format!("not crossfeed settings: {e}")))?;
-            }
-            Decodee::Objet(m)
-        }
+        // Lecteurs actuels non typés : un objet JSON suffit.
+        Partie::Crossfeed | Partie::Natif(_) => Decodee::Objet(objet(cle, brut)?),
         Partie::Reaffectation => {
             let m = objet(cle, brut)?;
-            coche(cle, &m)?;
             serde_json::from_value::<crate::audio::reaffectation_canaux::ChannelRemapSettings>(
                 Value::Object(m.clone()),
             )
             .map_err(|e| corrompue(cle, format!("not channel remap settings: {e}")))?;
             Decodee::Objet(m)
         }
-        Partie::Convolution => {
-            if brut.trim().is_empty() {
-                return Err(corrompue(cle, "empty impulse response path"));
-            }
-            Decodee::Chemin(brut.to_owned())
-        }
-        Partie::Mono => match brut {
-            "true" => Decodee::Mono(true),
-            "false" => Decodee::Mono(false),
-            autre => {
-                return Err(corrompue(
-                    cle,
-                    format!("expected \"true\" or \"false\", found {autre:?}"),
-                ));
-            }
-        },
+        // Un chemin vide ne désigne aucune réponse impulsionnelle.
+        Partie::Convolution if brut.trim().is_empty() => Decodee::Absente,
+        Partie::Convolution => Decodee::Chemin(brut.to_owned()),
+        // Comme aujourd'hui : seul « true » arme le repli mono.
+        Partie::Mono => Decodee::Mono(brut == "true"),
         Partie::Surechantillonnage => {
             let v: Value = serde_json::from_str(brut)
                 .map_err(|e| corrompue(cle, format!("invalid JSON: {e}")))?;
@@ -409,6 +453,13 @@ pub fn classer_egaliseur(
     }
 }
 
+/// D1 (provisoire) : ce maillon garde-t-il son droit acquis (actif sans
+/// Premium) ? Seul un `room-correction` marqué [`MARQUE_DROIT_ACQUIS`].
+pub fn droit_acquis(m: &MaillonGreffon) -> bool {
+    m.id == ID_CORRECTION_PIECE
+        && m.settings.get(MARQUE_DROIT_ACQUIS).and_then(Value::as_bool) == Some(true)
+}
+
 // ── Place dans la chaîne ────────────────────────────────────────────
 
 /// Le rang d'un greffon dans l'ordre de la lecture d'aujourd'hui.
@@ -492,29 +543,40 @@ fn est_natif(id: &str) -> bool {
 
 // ── Ancienne clé → chaîne ───────────────────────────────────────────
 
-fn appliquer(chaine: &mut ChaineTess, partie: &Partie, valeur: Decodee, piece: Option<&EqProfile>) {
+/// Ce que la zone sait d'elle-même, hors anciennes clés.
+struct ContexteZone {
+    piece: Option<EqProfile>,
+    /// Sortie locale : le repli mono y agit aujourd'hui.
+    sortie_locale: bool,
+}
+
+fn appliquer(chaine: &mut ChaineTess, partie: &Partie, valeur: Decodee, ctx: &ContexteZone) {
     match (partie, valeur) {
         (Partie::Egaliseur, Decodee::Egaliseur(m, profil)) => {
             let principal = egaliseur_principal(chaine);
             let precedente = principal.map(|i| chaine.plugins[i].id.clone());
-            let id = classer_egaliseur(&profil, piece, precedente.as_deref());
+            let id = classer_egaliseur(&profil, ctx.piece.as_ref(), precedente.as_deref());
+            let mut settings = sans_enabled(m);
+            if id == ID_CORRECTION_PIECE
+                && let Value::Object(s) = &mut settings
+            {
+                s.insert(MARQUE_DROIT_ACQUIS.into(), Value::Bool(true));
+            }
             let maillon = MaillonGreffon {
                 id: id.to_owned(),
                 enabled: profil.enabled,
-                settings: sans_enabled(m),
+                settings,
             };
             match principal {
                 Some(i) => {
                     // Un autre maillon portait déjà cet id : l'ancienne clé
                     // l'emporte, il n'en reste qu'un.
-                    if chaine.plugins[i].id != id {
-                        let doublon = chaine.plugins.iter().position(|x| x.id == id);
-                        chaine.plugins[i] = maillon;
-                        if let Some(j) = doublon {
-                            chaine.plugins.remove(j);
-                        }
-                    } else {
-                        chaine.plugins[i] = maillon;
+                    let doublon = (chaine.plugins[i].id != id)
+                        .then(|| chaine.plugins.iter().position(|x| x.id == id))
+                        .flatten();
+                    chaine.plugins[i] = maillon;
+                    if let Some(j) = doublon {
+                        chaine.plugins.remove(j);
                     }
                 }
                 None => inserer(chaine, maillon),
@@ -538,21 +600,30 @@ fn appliquer(chaine: &mut ChaineTess, partie: &Partie, valeur: Decodee, piece: O
         }
         (Partie::Convolution, _) => retirer(chaine, ID_CONVOLUTION),
         (Partie::Crossfeed, Decodee::Objet(m)) => {
-            let on = m.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+            let on = coche(&m);
             poser(chaine, ID_CROSSFEED, on, sans_enabled(m));
         }
         (Partie::Crossfeed, _) => retirer(chaine, ID_CROSSFEED),
         (Partie::Natif(id), Decodee::Objet(m)) => {
-            let on = m.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+            let on = coche(&m);
             poser(chaine, id, on, sans_enabled(m));
         }
         (Partie::Natif(id), _) => retirer(chaine, id),
         (Partie::Reaffectation, Decodee::Objet(m)) => {
-            let on = m.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+            let on = coche(&m);
             poser(chaine, ID_REAFFECTATION, on, sans_enabled(m));
         }
         (Partie::Reaffectation, _) => retirer(chaine, ID_REAFFECTATION),
-        (Partie::Mono, Decodee::Mono(true)) => poser(chaine, ID_MONO, true, Value::Null),
+        (Partie::Mono, Decodee::Mono(true)) if ctx.sortie_locale => {
+            poser(chaine, ID_MONO, true, Value::Null)
+        }
+        // D2 (provisoire) : inerte aujourd'hui sur une sortie réseau, gardé
+        // décoché pour ne rien changer à l'écoute.
+        (Partie::Mono, Decodee::Mono(true)) => {
+            let mut marque = Map::new();
+            marque.insert(MARQUE_MONO_INERTE.into(), Value::Bool(true));
+            poser(chaine, ID_MONO, false, Value::Object(marque))
+        }
         (Partie::Mono, _) => retirer(chaine, ID_MONO),
         (Partie::Surechantillonnage, Decodee::Surechantillonnage(s)) => {
             chaine.fixed.upsampling = if s.enabled {
@@ -578,12 +649,24 @@ pub struct LectureZone {
     /// Mode Pure demandé (`audiophile` ou `strict_bitperfect`) : alimente
     /// `ContexteExecution.pure`, ce n'est pas un champ de la chaîne.
     pub pure: bool,
+    /// #4685 — `zone_{id}_level_compensation` (vrai sauf `"false"`) : la
+    /// compensation du gain MOYEN de l'égaliseur et du crossfeed, au volume.
+    /// Ce n'est pas le headroom (réserve de crête) : T07 la garde telle
+    /// quelle, l'interrupteur coupé reste coupé.
+    pub compensation_de_niveau: bool,
+    /// La colonne `zones.dsd_mode` (`auto`, `native`, `dop`, `pcm`…) : ce que
+    /// la zone fait d'une SOURCE DSD ([`lecture_dsd`]). L'upsampling DSD de la
+    /// chaîne ne concerne que les sources PCM.
+    pub dsd_mode: String,
+    /// La zone sort sur une sortie locale (`local:`) ; inconnue = locale.
+    pub sortie_locale: bool,
     /// Aucune chaîne n'était enregistrée : elle vient des anciennes clés.
     pub depuis_les_anciennes_cles: bool,
-    /// Un égaliseur paramétrique coché a été converti en graphique (P2).
+    /// Un égaliseur paramétrique coché a été converti en graphique (P2),
+    /// pour cette lecture seulement.
     pub conversion_p2: bool,
     /// Valeur brute des anciennes clés à cet instant (l'ombre à écrire).
-    ombre: BTreeMap<String, Option<String>>,
+    ombre: Ombre,
 }
 
 impl LectureZone {
@@ -598,41 +681,50 @@ impl LectureZone {
     }
 }
 
-fn lire_ombre(
-    settings: &SettingsRepo,
-    zone_id: i64,
-) -> Result<Option<BTreeMap<String, Option<String>>>, ErreurMigration> {
-    let cle = cle_ombre_zone(zone_id);
-    let Some(brut) = stockage(settings.get(&cle))? else {
-        return Ok(None);
-    };
-    serde_json::from_str(&brut)
-        .map(Some)
-        .map_err(|e| corrompue(&cle, format!("invalid sync record: {e}")))
+/// Ce qu'un `dsd_mode` fait d'une source DSD, pour `SourceFlux::Dsd` (T16) :
+/// `native` et `dop` restent hors traitement (`dsd_source_native`), `pcm` est
+/// converti avant la chaîne. `auto` (ou inconnu) dépend du périphérique :
+/// `None`, la sortie décide.
+pub fn lecture_dsd(dsd_mode: &str) -> Option<LectureDsd> {
+    match dsd_mode {
+        "native" => Some(LectureDsd::Native),
+        "dop" => Some(LectureDsd::Dop),
+        "pcm" => Some(LectureDsd::ConvertedToPcm),
+        _ => None,
+    }
 }
 
-fn ombre_de(inst: &Instantane) -> BTreeMap<String, Option<String>> {
+/// L'ombre enregistrée ; illisible = absente (les anciennes clés
+/// l'emportent alors), jamais un refus.
+fn lire_ombre(settings: &SettingsRepo, zone_id: i64) -> Result<Option<Ombre>, ErreurMigration> {
+    let cle = cle_ombre_zone(zone_id);
+    Ok(stockage(settings.get(&cle))?.and_then(|brut| serde_json::from_str(&brut).ok()))
+}
+
+fn ombre_de(inst: &Instantane) -> Ombre {
     inst.iter().map(|(p, v)| (p.nom(), v.clone())).collect()
 }
 
+/// Mode Pure, lu exactement comme aujourd'hui : `audiophile` objet JSON avec
+/// `"enabled": true`, ou `strict_bitperfect` égal à `"true"`. Tout le reste
+/// vaut faux, sans refus.
 fn lire_pure(settings: &SettingsRepo, zone_id: i64) -> Result<bool, ErreurMigration> {
-    let cle = format!("zone_{zone_id}_audiophile");
-    let audiophile = match stockage(settings.get(&cle))? {
-        None => false,
-        Some(brut) => coche(&cle, &objet(&cle, &brut)?)?,
-    };
-    let cle = crate::audio::bitperfect_strict::cle_de_zone(zone_id);
-    let strict = match stockage(settings.get(&cle))?.as_deref() {
-        None | Some("false") => false,
-        Some("true") => true,
-        Some(autre) => {
-            return Err(corrompue(
-                &cle,
-                format!("expected \"true\" or \"false\", found {autre:?}"),
-            ));
-        }
-    };
+    let audiophile = stockage(settings.get(&format!("zone_{zone_id}_audiophile")))?
+        .and_then(|b| serde_json::from_str::<Value>(&b).ok())
+        .and_then(|v| v.get("enabled").and_then(Value::as_bool))
+        .unwrap_or(false);
+    let strict = stockage(settings.get(&crate::audio::bitperfect_strict::cle_de_zone(zone_id)))?
+        .as_deref()
+        == Some("true");
     Ok(audiophile || strict)
+}
+
+/// #4685 — vrai par défaut ; seul `"false"` l'éteint (comme l'orchestrateur).
+fn lire_compensation(settings: &SettingsRepo, zone_id: i64) -> Result<bool, ErreurMigration> {
+    Ok(
+        stockage(settings.get(&format!("zone_{zone_id}_level_compensation")))?.as_deref()
+            != Some("false"),
+    )
 }
 
 /// La grille graphique réglée sur ce serveur (`eq_expert_bands`, 10 par défaut).
@@ -649,8 +741,9 @@ pub fn grille_reglee(settings: &SettingsRepo) -> u32 {
 /// La chaîne de la zone (voir l'en-tête du module).
 ///
 /// `premium` : sans Premium, un égaliseur paramétrique COCHÉ est converti en
-/// égaliseur graphique au plus près (décision P2) ; décoché, il est gardé tel
-/// quel (un greffon décoché ne demande aucun droit).
+/// égaliseur graphique au plus près (décision P2), **dans la chaîne rendue
+/// seulement** ; décoché, il est gardé tel quel (un greffon décoché ne
+/// demande aucun droit). Rien n'est écrit.
 ///
 /// Une chaîne enregistrée par une version plus récente est rendue telle
 /// quelle, sans y réappliquer les anciennes clés (la résolution l'éteint,
@@ -671,6 +764,19 @@ pub fn lire_zone(
     let ombre = lire_ombre(settings, zone_id)?;
     let inst = lire_instantane(settings, zone_id)?;
     let pure = lire_pure(settings, zone_id)?;
+    let compensation_de_niveau = lire_compensation(settings, zone_id)?;
+    let zone = stockage(
+        crate::db::zone_repo::ZoneRepo::with_backend(settings.backend().clone()).get(zone_id),
+    )?;
+    let sortie_locale = zone.as_ref().is_none_or(|z| {
+        crate::audio::mono_downmix::mono_downmix_runs_on_output(z.output_device_id.as_deref())
+    });
+    let dsd_mode = if zone.is_some() {
+        crate::db::zone_repo::ZoneRepo::with_backend(settings.backend().clone())
+            .get_dsd_mode(zone_id)
+    } else {
+        "auto".to_owned()
+    };
 
     // Chaque ancienne clé est décodée, qu'elle ait changé ou non : une clé
     // illisible refuse toujours la zone.
@@ -680,27 +786,37 @@ pub fn lire_zone(
         decodees.push((partie.clone(), decoder(partie, &cle, brut.as_deref())?));
     }
 
+    let lecture = |chaine: ChaineTess, depuis: bool, conversion: bool, ombre: Ombre| LectureZone {
+        chaine,
+        pure,
+        compensation_de_niveau,
+        dsd_mode: dsd_mode.clone(),
+        sortie_locale,
+        depuis_les_anciennes_cles: depuis,
+        conversion_p2: conversion,
+        ombre,
+    };
+
     if let Some(c) = &stockee
         && c.version > VERSION_CHAINE
     {
-        return Ok(LectureZone {
-            chaine: c.clone(),
-            pure,
-            depuis_les_anciennes_cles: false,
-            conversion_p2: false,
-            ombre: ombre.unwrap_or_default(),
-        });
+        return Ok(lecture(c.clone(), false, false, ombre.unwrap_or_default()));
     }
 
     let depuis_les_anciennes_cles = stockee.is_none();
     // Sans ombre, toute clé compte comme modifiée (chaîne posée par une
-    // version sans ombre, ou ombre perdue) : les anciennes clés l'emportent.
-    let (mut chaine, ombre_lue) = match stockee {
-        Some(c) => (c.mettre_a_niveau(), ombre.unwrap_or_default()),
-        None => (ChaineTess::default(), BTreeMap::new()),
+    // version sans ombre, ombre perdue ou illisible) : les anciennes clés
+    // l'emportent.
+    let (mut chaine, ombre_lue, ombre_connue) = match (stockee, ombre) {
+        (Some(c), Some(o)) => (c.mettre_a_niveau(), o, true),
+        (Some(c), None) => (c.mettre_a_niveau(), Ombre::new(), false),
+        (None, _) => (ChaineTess::default(), Ombre::new(), false),
     };
 
-    let piece = profil_de_piece(settings, zone_id);
+    let ctx = ContexteZone {
+        piece: profil_de_piece(settings, zone_id),
+        sortie_locale,
+    };
     // Les parties disparues depuis l'ombre (un réglage tiers effacé) : on les
     // applique comme absentes.
     for nom in ombre_lue.keys() {
@@ -713,20 +829,22 @@ pub fn lire_zone(
     decodees.sort_by(|a, b| a.0.cmp(&b.0));
     for (partie, valeur) in decodees {
         let brut = inst.get(&partie).cloned().flatten();
-        let inchangee = ombre_lue.get(&partie.nom()) == Some(&brut);
-        if depuis_les_anciennes_cles || !inchangee {
-            appliquer(&mut chaine, &partie, valeur, piece.as_ref());
+        let inchangee = ombre_connue
+            && ombre_lue
+                .get(&partie.nom())
+                .is_some_and(|o| meme_valeur(o.as_deref(), brut.as_deref()));
+        if !inchangee {
+            appliquer(&mut chaine, &partie, valeur, &ctx);
         }
     }
 
     let conversion_p2 = !premium && convertir_p2(&mut chaine, grille_reglee(settings));
-    Ok(LectureZone {
+    Ok(lecture(
         chaine,
-        pure,
         depuis_les_anciennes_cles,
         conversion_p2,
-        ombre: ombre_de(&inst),
-    })
+        ombre_de(&inst),
+    ))
 }
 
 // ── P2 : paramétrique → graphique ───────────────────────────────────
@@ -767,7 +885,7 @@ pub fn convertir_p2(chaine: &mut ChaineTess, grille: u32) -> bool {
 /// Fréquence d'échantillonnage du calcul de courbe.
 const TAUX_DE_CALCUL: u32 = 48_000;
 /// Gain maximal d'un curseur graphique, en dB (client web : ±12).
-const GAIN_GRAPHIQUE_MAX_DB: f64 = 12.0;
+pub const GAIN_GRAPHIQUE_MAX_DB: f64 = 12.0;
 
 /// La réponse en dB de `profil` (sans son préampli) aux fréquences données,
 /// canal gauche et droit.
@@ -906,11 +1024,12 @@ enum Ecriture {
     Effacer,
 }
 
-/// Deux objets de réglages ont-ils le même sens ? `enabled` absent = faux.
+/// Deux objets de réglages ont-ils le même sens ? `enabled` lu comme
+/// aujourd'hui (seul `true` coche).
 fn meme_objet(a: &Map<String, Value>, b: &Map<String, Value>) -> bool {
     let norm = |m: &Map<String, Value>| {
         let mut m = m.clone();
-        let on = m.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+        let on = coche(&m);
         m.insert("enabled".into(), Value::Bool(on));
         m
     };
@@ -953,7 +1072,7 @@ fn projeter_objet(
             base
         }
         None => match &actuel {
-            Some(a) if a.get("enabled").and_then(Value::as_bool) == Some(true) => {
+            Some(a) if coche(a) => {
                 let mut a = a.clone();
                 a.insert("enabled".into(), Value::Bool(false));
                 a
@@ -990,6 +1109,8 @@ fn projeter_egaliseur(
                     });
                 }
             };
+            // La marque de droit acquis (D1) n'appartient qu'à la chaîne.
+            base.remove(MARQUE_DROIT_ACQUIS);
             base.insert("enabled".into(), Value::Bool(m.enabled));
             serde_json::from_value::<EqProfile>(Value::Object(base.clone())).map_err(|e| {
                 ErreurMigration::ReglagesInvalides {
@@ -1000,7 +1121,7 @@ fn projeter_egaliseur(
             base
         }
         None => match &actuel {
-            Some(a) if a.get("enabled").and_then(Value::as_bool) == Some(true) => {
+            Some(a) if coche(a) => {
                 let mut a = a.clone();
                 a.insert("enabled".into(), Value::Bool(false));
                 a
@@ -1035,13 +1156,23 @@ fn projeter_convolution(
     Ok(match (voulu, courant) {
         (Some(v), Some(c)) if v == c => Ecriture::Rien,
         (Some(v), _) => Ecriture::Poser(v),
+        // Un chemin vide ne désignait déjà rien : on n'y touche pas.
+        (None, Some(c)) if c.trim().is_empty() => Ecriture::Rien,
         (None, Some(_)) => Ecriture::Effacer,
         (None, None) => Ecriture::Rien,
     })
 }
 
 fn projeter_mono(chaine: &ChaineTess, courant: Option<&str>) -> Ecriture {
-    let voulu = chaine.plugins.iter().any(|m| m.id == ID_MONO && m.enabled);
+    let maillon = chaine.plugins.iter().find(|m| m.id == ID_MONO);
+    // D2 : décoché parce qu'inerte sur une sortie réseau — l'ancienne clé
+    // reste ce qu'elle est.
+    if maillon.is_some_and(|m| {
+        !m.enabled && m.settings.get(MARQUE_MONO_INERTE).and_then(Value::as_bool) == Some(true)
+    }) {
+        return Ecriture::Rien;
+    }
+    let voulu = maillon.is_some_and(|m| m.enabled);
     match (voulu, courant) {
         (true, Some("true")) => Ecriture::Rien,
         (true, _) => Ecriture::Poser("true".into()),
@@ -1134,9 +1265,10 @@ pub struct BilanEcriture {
 }
 
 /// Enregistre `chaine` pour la zone et met à jour les anciennes clés qu'elle
-/// exprime (écriture croisée). Aucune ancienne clé n'est réécrite si son sens
-/// ne change pas. Rien n'est validé contre le catalogue ici : le `PUT` passe
-/// par `ChaineTess::depuis_corps` puis `valider` (T08) avant d'arriver là.
+/// exprime (écriture croisée), sous [`verrou_de_zone`]. Aucune ancienne clé
+/// n'est réécrite si son sens ne change pas. Rien n'est validé contre le
+/// catalogue ici : le `PUT` passe par `ChaineTess::depuis_corps` puis
+/// `valider` (T08) avant d'arriver là.
 ///
 /// Les réglages de chaque maillon sont vérifiés AVANT toute écriture : un
 /// refus ne laisse aucune clé à moitié écrite.
@@ -1145,12 +1277,27 @@ pub fn ecrire_chaine(
     zone_id: i64,
     chaine: &ChaineTess,
 ) -> Result<BilanEcriture, ErreurMigration> {
+    ecrire_chaine_avec(settings, zone_id, chaine, || {})
+}
+
+/// [`ecrire_chaine`], avec `entre` appelé après les écritures des anciennes
+/// clés et avant celle de la chaîne et de l'ombre (sert à éprouver la course
+/// avec une ancienne route).
+fn ecrire_chaine_avec(
+    settings: &SettingsRepo,
+    zone_id: i64,
+    chaine: &ChaineTess,
+    entre: impl FnOnce(),
+) -> Result<BilanEcriture, ErreurMigration> {
     if chaine.version > VERSION_CHAINE {
         return Err(ErreurMigration::VersionPlusRecente {
             trouvee: chaine.version,
         });
     }
-    let inst = lire_instantane(settings, zone_id)?;
+    let verrou = verrou_de_zone(zone_id);
+    let _garde = verrou.lock().unwrap_or_else(|e| e.into_inner());
+
+    let mut inst = lire_instantane(settings, zone_id)?;
     let mut parties: Vec<Partie> = inst.keys().cloned().collect();
     for m in &chaine.plugins {
         let p = Partie::Natif(m.id.clone());
@@ -1176,20 +1323,29 @@ pub fn ecrire_chaine(
         {
             stockage(settings.set(&cle_sauvegarde_eq(zone_id), avant))?;
         }
+        // L'ombre est ce qui a été lu, puis ce qui vient d'être écrit :
+        // jamais relue, pour qu'une ancienne route qui écrit maintenant
+        // reste visible à la prochaine lecture.
         match e {
-            Ecriture::Poser(v) => stockage(settings.set(&cle, &v))?,
-            Ecriture::Effacer => stockage(settings.delete(&cle))?,
+            Ecriture::Poser(v) => {
+                stockage(settings.set(&cle, &v))?;
+                inst.insert(partie, Some(v));
+            }
+            Ecriture::Effacer => {
+                stockage(settings.delete(&cle))?;
+                inst.insert(partie, None);
+            }
             Ecriture::Rien => continue,
         }
         bilan.cles_modifiees.push(cle);
     }
 
-    let apres = lire_instantane(settings, zone_id)?;
+    entre();
     bilan.chaine_ecrite = enregistrer(
         settings,
         zone_id,
         &chaine.clone().mettre_a_niveau(),
-        &ombre_de(&apres),
+        &ombre_de(&inst),
     )?;
     Ok(bilan)
 }
@@ -1199,7 +1355,7 @@ fn enregistrer(
     settings: &SettingsRepo,
     zone_id: i64,
     chaine: &ChaineTess,
-    ombre: &BTreeMap<String, Option<String>>,
+    ombre: &Ombre,
 ) -> Result<bool, ErreurMigration> {
     let texte =
         serde_json::to_string(chaine).map_err(|e| ErreurMigration::Stockage(e.to_string()))?;
@@ -1225,21 +1381,24 @@ fn enregistrer(
 #[derive(Debug, Clone, PartialEq)]
 pub struct BilanMigration {
     pub zone_id: i64,
+    /// La chaîne ENREGISTRÉE, neutre vis-à-vis du droit (sans P2).
     pub chaine: ChaineTess,
     /// La chaîne ou l'ombre ont été (ré)écrites ; `false` = déjà à jour.
     pub ecrite: bool,
-    pub conversion_p2: bool,
 }
 
-/// Migre une zone : enregistre la chaîne lue ([`lire_zone`]) et l'ombre.
-/// N'écrit JAMAIS une ancienne clé : la lecture d'aujourd'hui ne change pas.
-/// Idempotente. Une chaîne d'une version plus récente n'est pas touchée.
+/// Migre une zone : enregistre la chaîne lue ([`lire_zone`]) et l'ombre,
+/// sous [`verrou_de_zone`]. N'écrit JAMAIS une ancienne clé : la lecture
+/// d'aujourd'hui ne change pas. Ne dépend pas du droit : P2 n'est jamais
+/// enregistrée. Idempotente. Une chaîne d'une version plus récente n'est pas
+/// touchée.
 pub fn migrer_zone(
     settings: &SettingsRepo,
     zone_id: i64,
-    premium: bool,
 ) -> Result<BilanMigration, ErreurMigration> {
-    let lecture = lire_zone(settings, zone_id, premium)?;
+    let verrou = verrou_de_zone(zone_id);
+    let _garde = verrou.lock().unwrap_or_else(|e| e.into_inner());
+    let lecture = lire_zone(settings, zone_id, true)?;
     let ecrite = if lecture.chaine.version > VERSION_CHAINE {
         false
     } else {
@@ -1249,7 +1408,6 @@ pub fn migrer_zone(
         zone_id,
         chaine: lecture.chaine,
         ecrite,
-        conversion_p2: lecture.conversion_p2,
     })
 }
 
@@ -1260,14 +1418,13 @@ pub type MigrationDesZones = Vec<(i64, Result<BilanMigration, ErreurMigration>)>
 /// pas les autres : son refus est rendu avec elle.
 pub fn migrer_toutes_les_zones(
     backend: &Arc<dyn DbBackend>,
-    premium: bool,
 ) -> Result<MigrationDesZones, ErreurMigration> {
     let settings = SettingsRepo::with_backend(backend.clone());
     let zones = stockage(crate::db::zone_repo::ZoneRepo::with_backend(backend.clone()).list())?;
     Ok(zones
         .into_iter()
         .filter_map(|z| z.id)
-        .map(|id| (id, migrer_zone(&settings, id, premium)))
+        .map(|id| (id, migrer_zone(&settings, id)))
         .collect())
 }
 

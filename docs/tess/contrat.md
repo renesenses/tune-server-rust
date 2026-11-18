@@ -429,36 +429,54 @@ producteur et le rendu transporte des `f64`**, et que la quantification
 
 - **Stockage** : la chaîne sous `zone_{id}_tess_chain` ; l'**ombre** sous
   `zone_{id}_tess_chain_sync` (valeur brute de chaque ancienne clé à la
-  dernière écriture de la chaîne). Une ancienne clé qui diffère de l'ombre a
-  été écrite par une ancienne route : elle l'emporte sur la chaîne pour ce
-  qu'elle exprime. Le reste (ordre, greffon décoché, Headphone EQ, DSD,
-  headroom, dither, `bypass_all`) reste celui de la chaîne.
+  dernière écriture de la chaîne, construite à partir de ce qui a été lu puis
+  écrit, jamais relue). Une ancienne clé dont le sens JSON diffère de l'ombre
+  a été écrite par une ancienne route : elle l'emporte pour ce qu'elle
+  exprime. Le reste (ordre, greffon décoché, Headphone EQ, DSD, headroom,
+  dither, `bypass_all`) reste celui de la chaîne.
+- **La chaîne enregistrée ne dépend pas du droit** : `migrer_zone` n'applique
+  jamais P2 ; P2 n'existe qu'à la lecture (`lire_zone(…, premium = false)`).
+- **Verrou par zone** (`verrou_de_zone`) : T03 (migration au démarrage) et
+  T08 (`PUT /zones/{id}/tess`) n'écrivent la chaîne que par `migrer_zone` et
+  `ecrire_chaine`, qui le prennent. Les anciennes routes ne le prennent pas :
+  l'ombre suffit pour elles.
 - **Correspondance** :
 
 | Ancienne clé | Chaîne |
 |---|---|
-| `zone_{id}_eq_profile` | une façade d'égaliseur, `enabled` du profil, `settings` = profil sans `enabled` : profil de pièce mesuré (`room_profile_{id}`) → `room-correction` ; sans bande ou courbe de grille ISO 10/15/31 → `equalizer-graphic` ; sinon `equalizer-headphone` si la chaîne l'était déjà, sinon `equalizer-parametric` |
+| `zone_{id}_eq_profile` | une façade d'égaliseur, `enabled` du profil, `settings` = profil sans `enabled` (sa réserve `headroom_mode` comprise) : profil de pièce mesuré (`room_profile_{id}`) → `room-correction` (marqué `legacy`, D1) ; sans bande ou courbe de grille ISO 10/15/31 → `equalizer-graphic` ; sinon `equalizer-headphone` si la chaîne l'était déjà, sinon `equalizer-parametric` |
 | `ir_path_{id}` | `convolution`, coché, `settings.ir_path` |
 | `zone_{id}_crossfeed` | `crossfeed` (`enabled`, reste en `settings`) |
 | `zone_{id}_native_plugin_{p}` | greffon `{p}` (Crossfeed Pro, Crosstalk, paquets tiers) |
-| `zone_{id}_mono_downmix` | `mono-downmix`, coché si `"true"` |
+| `zone_{id}_mono_downmix` | `mono-downmix`, coché si `"true"` sur une sortie locale (D2) |
 | `zone_{id}_channel_remap` | `channel-remap`, en dernier |
 | `zone_{id}_upsampler` | `fixed.upsampling` : `pcm` (`filter`, `max_ratio`, `max_rate_hz`) si `enabled`, sinon `off` |
 | `zone_{id}_audiophile`, `zone_{id}_strict_bitperfect` | hors chaîne : `ContexteExecution.pure` |
+| `zone_{id}_level_compensation` (#4685) | hors chaîne : `LectureZone::compensation_de_niveau` (vrai sauf `"false"`) |
+| colonne `zones.dsd_mode` | hors chaîne : `LectureZone::dsd_mode`, `lecture_dsd` |
 | `zone_{id}_gain_trim_db` | hors chaîne : gain de zone, porté par l'étage headroom (T07), comme le ReplayGain ; peut être positif, donc pas un headroom manuel |
 
+- **Engagements pour T07** :
+  - `level_compensation` compense le gain MOYEN de l'égaliseur et du
+    crossfeed, au volume ; ce n'est pas le headroom (réserve de crête). T07 la
+    garde : l'interrupteur coupé reste coupé.
+  - La réserve propre de l'égaliseur (`headroom_mode` `safe` ou `realistic`,
+    avec son limiteur) reste dans ses réglages. En `Auto`, l'étage headroom
+    ne l'additionne pas à ses −3 dB : la réserve appliquée est la plus forte
+    des deux, jamais la somme.
+- **Engagement pour T16** : `dsd_mode` dit ce que la zone fait d'une SOURCE
+  DSD (`native` et `dop` : hors traitement, `dsd_source_native` ; `pcm` :
+  converti avant la chaîne ; `auto` : selon le périphérique).
+  `fixed.upsampling = dsd` ne concerne que les sources PCM.
 - **Ordre d'une chaîne migrée** : celui de la lecture d'aujourd'hui :
   égaliseur, convolution, crossfeed, `crossfeed-*`, crosstalk, autres paquets,
   repli mono, réaffectation.
-- **`mono_downmix`** : greffon dédié `mono-downmix` (Free, stéréo seulement,
-  place libre), et non une matrice de `channel-remap` : la clé est
-  indépendante de la réaffectation, et `channel-remap` doit rester le dernier
-  greffon.
 - **Groupe crossfeed** : tous les membres cochés le restent ; aucune chaîne
   migrée n'est refusée (politique `priority`).
-- **P2** : sans Premium, un `equalizer-parametric` **coché** devient un
-  `equalizer-graphic` au plus près, sur la grille réglée (`eq_expert_bands`) ;
-  deux courbes si les canaux diffèrent. Décoché, il reste tel quel.
+- **P2** : à la lecture sans Premium, un `equalizer-parametric` **coché**
+  devient un `equalizer-graphic` au plus près, sur la grille réglée
+  (`eq_expert_bands`), ±12 dB au plus ; deux courbes si les canaux diffèrent.
+  Décoché, il reste tel quel.
 - **Écriture croisée** : `ecrire_chaine` met à jour les anciennes clés que la
   chaîne exprime, et seulement celles dont le sens change. Un greffon retiré
   ou décoché est décoché dans son ancienne clé (réglages gardés) ; la
@@ -467,13 +485,30 @@ producteur et le rendu transporte des `f64`**, et que la quantification
   premier profil d'égaliseur réécrit est gardé sous
   `zone_{id}_eq_profile_before_tess`. Le bilan rend les clés modifiées, à
   rafraîchir par la route (T08).
+- **Lecture** : tolérante comme aujourd'hui pour les booléens non canoniques
+  (`"on"`, `"yes"`, `"enabled": "yes"` valent faux, sans refus) ; une ombre
+  illisible vaut une ombre absente. Refus explicite (`CleCorrompue`, qui
+  nomme la clé) seulement pour une clé que son lecteur actuel ne sait pas
+  lire (JSON invalide, `eq_profile`, `channel_remap` ou `upsampler`
+  illisibles) et pour une chaîne enregistrée illisible. T03 garde alors le
+  chemin de lecture actuel pour la zone et journalise le refus.
 - **Migration** : `migrer_zone` n'écrit que la chaîne et l'ombre, jamais une
-  ancienne clé (la lecture d'aujourd'hui ne change pas). Idempotente. Une
-  clé illisible donne un refus explicite qui la nomme ; une chaîne d'une
-  version plus récente n'est jamais réécrite. Rien n'est encore branché au
-  démarrage ni dans la lecture (T03).
+  ancienne clé. Idempotente. Une chaîne d'une version plus récente n'est
+  jamais réécrite. Rien n'est encore branché au démarrage ni dans la lecture
+  (T03).
 - **Export** : `config_export` porte la chaîne de chaque zone, calculée pour
   une zone jamais migrée.
+- **Choix provisoires, décisions en attente de Bertrand** :
+  - **D1** (correction de pièce) : un égaliseur de pièce mesuré déjà posé
+    dans `eq_profile` devient `room-correction` avec `"legacy": true` dans ses
+    réglages. La résolution le garde actif sans Premium (droit acquis, comme
+    aujourd'hui). La marque n'est jamais écrite dans `eq_profile`. T08 : un
+    `PUT` qui garde ce maillon tel qu'il est enregistré n'est pas refusé en
+    402.
+  - **D2** (`mono-downmix`, 11ᵉ greffon) : gardé dans la chaîne, mais sur une
+    zone réseau, où l'interrupteur actuel est inerte (#3254, sortie locale
+    seulement), il est **décoché** avec `"inert_on_network": true` : aucun
+    changement audible, et l'ancienne clé n'est pas touchée.
 
 ### T05 : manifeste
 
