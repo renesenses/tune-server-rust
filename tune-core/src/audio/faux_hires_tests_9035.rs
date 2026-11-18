@@ -265,10 +265,16 @@ fn masterise(musique: Vec<f32>, graine: u64) -> Vec<i32> {
         .collect();
     let filtre = passe_bas(&mix, 96_000, 18_000.0);
     let crete = filtre.iter().fold(0f32, |m, s| m.max(s.abs())).max(1e-9);
-    quantifier(
-        &filtre.iter().map(|s| s / crete * 0.5).collect::<Vec<_>>(),
-        24,
-    )
+    // Un dither TPDF d'un LSB, comme en pose tout convertisseur : sans lui,
+    // l'arrondi d'un signal synthétique très lisse n'est pas un bruit blanc et
+    // creuse le spectre près de Nyquist (une falaise d'artefact).
+    let lsb = 1.0 / (1u32 << 23) as f32;
+    let mut alea = Lcg(graine ^ 0x9035);
+    let dither: Vec<f32> = filtre
+        .iter()
+        .map(|s| s / crete * 0.5 + (alea.suivant() as f32 - alea.suivant() as f32) * lsb)
+        .collect();
+    quantifier(&dither, 24)
 }
 
 /// Le verdict d'un témoin NON codec : la coupure à 18 kHz est vue, la
