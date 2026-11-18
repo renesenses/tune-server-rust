@@ -419,8 +419,8 @@ fn l_ancien_code_codec_est_remesure_une_fois_9035() {
     ] {
         let raison = raison.to_string();
         db.execute(
-            "INSERT INTO hires_verifications (track_id, verdict, raison, coupure_hz) \
-             VALUES (?1, 'douteux', ?2, 16000.0)",
+            "INSERT INTO hires_verifications (track_id, verdict, raison, coupure_hz, sample_rate, bits_declares) \
+             VALUES (?1, 'douteux', ?2, 16000.0, 96000, 24)",
             &[&id as &dyn ToSqlValue, &raison],
         )
         .unwrap();
@@ -501,4 +501,29 @@ fn une_remesure_illisible_garde_le_verdict_douteux_9035() {
     assert_eq!(r[0].as_string().as_deref(), Some("non_concluant"));
     assert_eq!(r[1].as_string().as_deref(), Some("decodage_impossible"));
     assert_eq!(compter_les_candidats(&db), 0);
+}
+
+/// #9067 — la ligne `coupure_de_codec` d'un CD (16 bits, 48 kHz au plus) se
+/// lit déjà `conforme` : elle n'est PAS remesurée (décodage inutile). Celle
+/// d'un 24/44,1 l'est.
+#[test]
+fn la_ligne_codec_d_un_cd_n_est_pas_remesuree_9067() {
+    let db = base();
+    for id in 1..=2 {
+        piste(&db, id, &format!("/m/a/{id}.flac"), "flac", "local");
+    }
+    for (id, rate, bits) in [(1i64, 44_100i64, 16i64), (2, 44_100, 24)] {
+        db.execute(
+            "INSERT INTO hires_verifications (track_id, verdict, raison, coupure_hz, sample_rate, bits_declares) \
+             VALUES (?1, 'douteux', 'coupure_de_codec', 16000.0, ?2, ?3)",
+            &[&id as &dyn ToSqlValue, &rate, &bits],
+        )
+        .unwrap();
+    }
+    let ids: Vec<i64> = prochains_candidats(&db, 10)
+        .iter()
+        .map(|c| c.track_id)
+        .collect();
+    assert_eq!(ids, vec![2], "seul le 24/44,1 est remesuré, pas le CD");
+    assert_eq!(compter_les_candidats(&db), 1);
 }
