@@ -2964,6 +2964,25 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "radio_fin_de_file_coupee_par_defaut",
         up: SQL_RADIO_FIN_DE_FILE_COUPEE_PAR_DEFAUT,
     },
+    // #9040 (go de Bertrand du 18/11, fil 2902) — la plage de sonie EBU R128
+    // (LRA) de chaque piste, et l'histogramme de ses sonies à court terme
+    // (cases de 0,1 LU) d'où se calcule la LRA d'un album. Écrite par la
+    // passe ReplayGain et le rattrapage du DR, sur le même décodage. Naît
+    // vide. `ON DELETE CASCADE` : une piste retirée emporte sa mesure.
+    // Jumelle PG : 123. Numérotée 156 / PG 123 le 18/11.
+    Migration {
+        version: 156,
+        name: "plages_de_sonie",
+        up: "
+CREATE TABLE IF NOT EXISTS plages_de_sonie (
+    track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
+    lra_lu REAL NOT NULL,
+    histogramme TEXT NOT NULL,
+    algo TEXT NOT NULL,
+    mesure_le TEXT NOT NULL
+);
+",
+    },
 ];
 
 /// Pose `albums.release_country` et `albums.release_country_mbid` (#8668) —
@@ -6351,6 +6370,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         122,
         "radio_fin_de_file_coupee_par_defaut",
         include_str!("../../migrations/postgres/122_radio_fin_de_file_coupee_par_defaut.sql"),
+    ),
+    // Jumelle de la SQLite 156 (#9040) : `plages_de_sonie`, la LRA de
+    // chaque piste et l'histogramme de ses sonies à court terme. Naît vide.
+    (
+        123,
+        "plages_de_sonie",
+        include_str!("../../migrations/postgres/123_plages_de_sonie.sql"),
     ),
 ];
 
@@ -10301,7 +10327,9 @@ mod tests {
         // 122 : `radio_fin_de_file_coupee_par_defaut` (#8974), jumelle de la
         // SQLite 155. Migration de DONNÉES : annule la bascule de la 118
         // (neutralisée) là où elle a eu lieu, DEFAULT '0'.
-        assert_eq!(pg_latest_version(), 122, "latest PG migration must be 122");
+        // 123 : `plages_de_sonie` (#9040), jumelle de la SQLite 156. Crée la
+        // table de la LRA par piste, que la passe ReplayGain NOMME.
+        assert_eq!(pg_latest_version(), 123, "latest PG migration must be 123");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

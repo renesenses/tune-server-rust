@@ -235,6 +235,9 @@ const MIGRATION_TABLES: &[&str] = &[
 const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
     // Reprises (#7280), créées par le script 100 : conserver leur file et position.
     "listening_resumes",
+    // Plages de sonie (#9040), créées par le script 123 : les recalculer
+    // redécoderait toute la bibliothèque.
+    "plages_de_sonie",
     // Positions des épisodes de podcast (#8170), créées par le script 116 :
     // sans cette ligne, chaque épisode commencé repartirait du début.
     "podcast_episode_positions",
@@ -1952,6 +1955,7 @@ fn conflict_clause(table: &str) -> &'static str {
         "podcast_episode_positions" => "ON CONFLICT (zone_id, episode_key) DO NOTHING",
         "collection_physique_associations" => "ON CONFLICT (release_id) DO NOTHING",
         "politiques_parentales" => "ON CONFLICT (profile_id) DO NOTHING",
+        "plages_de_sonie" => "ON CONFLICT (track_id) DO NOTHING",
         "alertes_douteuses_ignorees" => "ON CONFLICT (portee, cle, titre, raison) DO NOTHING",
         "notes_personnelles" => "ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
         "apports_service_albums" => "ON CONFLICT (album_id, source) DO NOTHING",
