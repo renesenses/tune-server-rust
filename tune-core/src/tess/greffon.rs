@@ -334,10 +334,12 @@ impl Ligne {
     }
 }
 
-/// Les dix greffons TESS de la v1.0 et leurs droits (décisions Q2 révisée,
+/// Les onze greffons TESS de la v1.0 (dix au plan, plus `mono-downmix`,
+/// choix provisoire de T02 en attente de la décision D2) et leurs droits (décisions Q2 révisée,
 /// Q3, P1).
 ///
-/// - Graphic EQ, Headphone EQ, Crossfeed, Channel remapping : Free ;
+/// - Graphic EQ, Headphone EQ, Crossfeed, Mono downmix (T02), Channel
+///   remapping : Free ;
 /// - Parametric EQ, Convolution, Room correction, Crossfeed Pro, Crosstalk,
 ///   Declick temps réel : Premium.
 ///
@@ -451,6 +453,17 @@ pub fn catalogue_de_reference() -> Catalogue {
             group_priority: None,
         },
         Ligne {
+            id: "mono-downmix",
+            name: "Mono downmix",
+            category: RestorationAndRouting,
+            entitlement: gratuit,
+            feature: None,
+            origin: Reference,
+            channels: StereoOnly,
+            position: libre,
+            group_priority: None,
+        },
+        Ligne {
             id: "channel-remap",
             name: "Channel remapping",
             category: RestorationAndRouting,
@@ -480,13 +493,14 @@ mod tests {
     #[test]
     fn le_catalogue_de_reference_suit_les_decisions() {
         let c = catalogue_de_reference();
-        assert_eq!(c.plugins.len(), 10);
+        assert_eq!(c.plugins.len(), 11);
         c.verifier().unwrap();
         let droit = |id: &str| c.get(id).unwrap().entitlement;
         for id in [
             "equalizer-graphic",
             "equalizer-headphone",
             "crossfeed",
+            "mono-downmix",
             "channel-remap",
         ] {
             assert_eq!(droit(id), Droit::Free, "{id}");
