@@ -374,16 +374,15 @@ pub fn fusionner(corps: &Value, enregistree: &ChaineTess) -> Result<ChaineTess, 
     let mut base = serde_json::to_value(enregistree).map_err(illisible)?;
     if let (Some(b), Some(c)) = (base.as_object_mut(), corps.as_object()) {
         for (k, v) in c {
-            match (k.as_str(), b.get_mut(k)) {
-                ("fixed", Some(Value::Object(fixe))) if v.is_object() => {
-                    for (kf, vf) in v.as_object().into_iter().flatten() {
-                        fixe.insert(kf.clone(), vf.clone());
-                    }
+            if let (true, Some(fixe_corps), Some(Value::Object(fixe))) =
+                (k == "fixed", v.as_object(), b.get_mut(k))
+            {
+                for (kf, vf) in fixe_corps {
+                    fixe.insert(kf.clone(), vf.clone());
                 }
-                _ => {
-                    b.insert(k.clone(), v.clone());
-                }
+                continue;
             }
+            b.insert(k.clone(), v.clone());
         }
     }
     serde_json::from_value(base).map_err(illisible)
@@ -530,16 +529,16 @@ async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
         .iter()
         .any(|c| c.starts_with(&format!("zone_{id}_native_plugin_")));
     if est(Partie::Egaliseur) {
-        state.orchestrator.apply_eq_change_portee(id).await;
+        let _ = state.orchestrator.apply_eq_change_portee(id).await;
     }
     if est(Partie::Crossfeed) || natif {
-        state.orchestrator.refresh_zone_crossfeed_portee(id).await;
+        let _ = state.orchestrator.refresh_zone_crossfeed_portee(id).await;
     }
     if est(Partie::Mono) {
-        state.orchestrator.refresh_zone_mono_downmix(id).await;
+        let _ = state.orchestrator.refresh_zone_mono_downmix(id).await;
     }
     if est(Partie::Reaffectation) {
-        state.orchestrator.refresh_zone_reaffectation(id).await;
+        let _ = state.orchestrator.refresh_zone_reaffectation(id).await;
     }
     if est(Partie::Surechantillonnage) {
         state.orchestrator.refresh_zone_upsampler(id).await;

@@ -140,8 +140,10 @@ reprend donc la règle de #7616 **telle qu'elle est appliquée aujourd'hui**.
     `params.replaced_by`.
   - Priorités : `crosstalk` (3) > crossfeed tiers `crossfeed-*` (2) >
     `crossfeed` intégré (1). À égalité, le premier dans la chaîne l'emporte.
-- **Politique `refuse`** : prévue, mais **non utilisée tant que Bertrand n'a
-  pas tranché**. Elle donnerait un 409 `mutually_exclusive`.
+- **Politique `refuse`** : décidée le 18/11 pour le groupe crossfeed. L'API
+  (T08, `catalogue_tess`) l'applique : un `PUT` qui coche deux membres est
+  refusé en 409 `mutually_exclusive`. La résolution garde la priorité
+  ci-dessus pour une chaîne ancienne.
 - **Appartenance au groupe** : par le manifeste (`exclusive_group`) **et** par
   le préfixe `crossfeed-` pour les paquets déjà publiés. T05 ajoute le champ
   au manifeste.
@@ -414,6 +416,44 @@ Hors TESS, avec un motif affiché :
 
 `refusal` : `{ "status": 400|402|409, "code": "…", "detail": "…", "plugin_id": "…"|null }`.
 
+### Routes (T08, `tune-server/src/routes/zones/tess.rs`)
+
+- **Authentification** : celle de toutes les routes de zone (couche
+  `auth_middleware` de `/api/v1`).
+- **`GET /tess/catalog`** → `catalog_response` :
+  `{ contract_version, premium, catalog, plugins: [ { id, entitled, available, reason } ] }`.
+  - `catalog` : la référence, les **schémas de réglages des caisses du SDK**
+    (`sdk/tune-plugin-*/schemas/config.json`, sans `enabled`, porté par le
+    maillon), les paquets natifs tiers chargés (Premium), et le groupe
+    crossfeed en politique **`refuse`** (décision du 18/11).
+  - `reason` : `plugin_unavailable` (pas installé, désactivé ou pas branché,
+    comme `declick-live` aujourd'hui) avant `premium_required`.
+  - 200 = la capacité TESS ; 404 = serveur sans TESS.
+- **`GET /zones/{id}/tess`** : la chaîne lue par `lire_zone` (P2 appliqué sans
+  Premium), résolue avec le transport, la source qui joue, le mode Pure, le
+  volume (logiciel, appareil ou fixe) et la disponibilité de chaque greffon.
+  Zone inconnue : 404 `{"error": "zone_not_found"}`.
+- **`PUT /zones/{id}/tess`**, dans cet ordre :
+  1. corps lu strictement (`depuis_corps`) : 400 `invalid_body` ;
+  2. **fusion** : un champ absent du corps garde sa valeur enregistrée
+     (`fixed` champ par champ ; `plugins`, s'il est présent, remplace la
+     liste). Un client qui ignore un champ plus récent ne l'efface donc pas ;
+  3. P2 inverse : sans Premium, le graphique converti renvoyé tel quel
+     redevient le paramétrique enregistré ;
+  4. **marques réservées** (`legacy`, `inert_on_network`) : gardées seulement
+     si le maillon a les mêmes réglages que le maillon enregistré ; sinon
+     retirées. Une marque envoyée par le client ne lève jamais un droit ;
+  5. validation : 409 (forme, exclusivité du groupe crossfeed, version),
+     puis 402 sur ce qui **change** : un maillon ou un upsampling identique à
+     la chaîne enregistrée n'est pas revérifié (la résolution l'éteint,
+     `premium_required`) ; perdre le Premium ne bloque pas l'édition du reste ;
+  6. `ecrire_chaine` (sous `verrou_de_zone`), puis rafraîchissement de la
+     sortie vivante pour chaque ancienne clé réécrite. Un `PUT` à la fois par
+     zone, de la lecture à l'écriture.
+  - Une chaîne enregistrée d'une version plus récente n'est pas réécrite :
+    409 `unsupported_version`.
+- `active_preset` : lu sous `zone_{id}_tess_active_preset` (posé par T17).
+
 ## 8. Engagements des lots suivants
 
 Ces points ne sont pas codés dans T01. Ils sont fixés ici pour que chaque lot
@@ -536,7 +576,7 @@ producteur et le rendu transporte des `f64`**, et que la quantification
 - `exclusive_group` dans le manifeste des paquets.
 - Le préfixe `crossfeed-` reste reconnu pour les paquets déjà publiés.
 
-### T08 : API
+### T08 : API (fait, § 7)
 
 - Les routes ; le corps du `PUT` passe par `depuis_corps` puis `valider`.
 - Les schémas de réglages des caisses du SDK dans le catalogue.
