@@ -277,6 +277,53 @@ pub fn alerte_pour(
     })
 }
 
+/// #9028 — l'alerte `raison` mémorisée pour la PISTE seule, quelle que soit
+/// sa nature (le geste groupé sur une partie d'un album, ou un album sans
+/// dossier exploitable). `None` quand la piste n'a pas de clé stable.
+pub fn alerte_de_la_piste(t: &Track, raison: &str, maintenant: i64) -> Option<AlerteIgnoree> {
+    Some(AlerteIgnoree {
+        portee: Portee::Piste,
+        cle: cle_piste(t)?,
+        titre: String::new(),
+        raison: raison.to_string(),
+        cible_id: t.id,
+        libelle: Some(t.title.clone()),
+        ignoree_le: maintenant,
+    })
+}
+
+/// #9028 — l'alerte `raison` mémorisée pour TOUT l'album dont `pistes` sont
+/// les pistes (toutes, pas seulement les signalées : le dossier de l'album
+/// est celui de toutes ses pistes, comme pour [`alerte_pour`]), quelle que
+/// soit la nature de l'alerte. `None` quand l'album n'a pas de titre, que
+/// les pistes ne sont pas toutes du même album, ou qu'il n'a pas de dossier
+/// exploitable (racine) : l'appelant se rabat alors sur
+/// [`alerte_de_la_piste`].
+pub fn alerte_de_l_album(pistes: &[Track], raison: &str, maintenant: i64) -> Option<AlerteIgnoree> {
+    let premiere = pistes.first()?;
+    let album_id = premiere.album_id.filter(|id| *id > 0)?;
+    let titre = premiere
+        .album_title
+        .clone()
+        .filter(|t| !t.trim().is_empty())?;
+    if pistes
+        .iter()
+        .any(|t| t.album_id != Some(album_id) || t.album_title.as_deref() != Some(titre.as_str()))
+    {
+        return None;
+    }
+    let cle = dossier_commun(pistes.iter().filter_map(chemin))?;
+    Some(AlerteIgnoree {
+        portee: Portee::Album,
+        cle,
+        titre: titre.clone(),
+        raison: raison.to_string(),
+        cible_id: Some(album_id),
+        libelle: Some(titre),
+        ignoree_le: maintenant,
+    })
+}
+
 /// Marque l'alerte comme normale. Rejouée, elle ne change rien. Rend vrai si
 /// une ligne a été ajoutée.
 pub fn ignorer(db: &Arc<dyn DbBackend>, a: &AlerteIgnoree) -> Result<bool, String> {
