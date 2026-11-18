@@ -451,10 +451,38 @@ fn l_emetteur_cale_horodate_en_temps_ptp_et_la_contre_epreuve_non() {
     // - jamais d'horodatage EN AVANCE sur le maître de plus d'une demi-ms ;
     // - un retard médian sous une durée de paquet (48 trames) ;
     // - aucune dérive : les médianes du début et de la fin concordent.
+    //
+    // QA 18/11 — l'horodatage est le temps du SUIVEUR, qui n'est calé sur le
+    // maître qu'à son écart près (borné par `SEUIL_ECART_NS` plus le délai
+    // de chemin, voir #8460). Un suiveur EN AVANCE de e ns produit des
+    // horodatages en avance de e × 48 kHz : sur un runner chargé (CI du
+    // 17/11), le retard médian est sorti à -1 trame, alors que tout le
+    // reste du banc était juste. La borne basse du retard médian est donc
+    // l'avance du suiveur MESURÉE pendant l'émission (relevée toutes les
+    // 20 ms par `ecart_ns`), plus une trame d'arrondi — jamais une
+    // tolérance fixe : un suiveur calé à quelques µs garde la borne 0..48,
+    // et un émetteur qui avancerait l'horodatage de lui-même reste rouge.
     let decalage = 0x1234_5678;
     let g0 = s.generation();
-    let recus = emettre_et_recevoir(s.clone(), &maitre, 3000, decalage);
+    let fini = std::sync::atomic::AtomicBool::new(false);
+    let (recus, avance_suiveur_ns) = std::thread::scope(|portee| {
+        let releve = portee.spawn(|| {
+            let mut avance = ecart_ns(&maitre, &s);
+            while !fini.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(Duration::from_millis(20));
+                avance = avance.max(ecart_ns(&maitre, &s));
+            }
+            avance.max(ecart_ns(&maitre, &s))
+        });
+        let recus = emettre_et_recevoir(s.clone(), &maitre, 3000, decalage);
+        fini.store(true, std::sync::atomic::Ordering::Release);
+        (recus, releve.join().unwrap())
+    });
     assert_eq!(s.generation(), g0, "ni saut ni décrochage pendant l'essai");
+    let avance_permise =
+        i32::try_from((avance_suiveur_ns.max(0) as u64 * 48_000).div_ceil(1_000_000_000))
+            .unwrap_or(i32::MAX)
+            .saturating_add(1);
     let retards: Vec<i32> = recus
         .iter()
         .map(|(e, a)| horodatage_rtp_decale(*a, 48_000, decalage).wrapping_sub(e.horodatage) as i32)
@@ -472,14 +500,18 @@ fn l_emetteur_cale_horodate_en_temps_ptp_et_la_contre_epreuve_non() {
     );
     eprintln!(
         "retards (trames) : médiane {med}, début {med_debut}, fin {med_fin}, \
-         max {}, avance max {avance_max}",
+         max {}, avance max {avance_max} ; avance du suiveur sur le maître \
+         {avance_suiveur_ns} ns, soit {avance_permise} trame(s) permise(s)",
         retards.iter().max().unwrap()
     );
     assert!(
         avance_max <= 24,
         "horodatage en avance de {avance_max} trames"
     );
-    assert!((0..48).contains(&med), "retard médian {med} trames");
+    assert!(
+        (-avance_permise..48).contains(&med),
+        "retard médian {med} trames (avance mesurée du suiveur : {avance_suiveur_ns} ns)"
+    );
     assert!(
         (med_fin - med_debut).abs() <= 12,
         "dérive {med_debut} → {med_fin}"
