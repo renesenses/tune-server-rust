@@ -226,12 +226,36 @@ pub fn mesurer_un_fichier(chemin: &str, duree_ms: i64) -> Result<Mesure, String>
 /// Range le verdict d'une piste. Une piste illisible est rangée aussi
 /// (`non_concluant`, raison `decodage_impossible`) : sinon elle serait
 /// reprise à chaque lot, indéfiniment.
+///
+/// #9035 — sauf une REMESURE de l'ancien `coupure_de_codec` : illisible, elle
+/// garde son verdict douteux et passe en `coupure_spectrale`.
 pub fn enregistrer(
     db: &Arc<dyn DbBackend>,
     track_id: i64,
     resultat: &Result<Mesure, String>,
 ) -> Result<(), String> {
     let e = db.engine();
+    // #9035 — une REMESURE (ligne `coupure_de_codec`) qui ne peut pas lire le
+    // fichier (NAS en veille, disque débranché) ne perd pas la mesure réelle :
+    // le verdict douteux et sa coupure restent, seule la raison devient
+    // `coupure_spectrale` (ce que l'ancien code voulait dire). Jamais
+    // `non_concluant` : l'album ne doit pas basculer de « douteux » à
+    // « vérifié » faute d'avoir pu relire un fichier. La ligne n'est plus
+    // candidate (pas de boucle de remesure sur un fichier absent).
+    if resultat.is_err() {
+        let gardee = db.execute(
+            &format!(
+                "UPDATE hires_verifications SET raison = 'coupure_spectrale' \
+                 WHERE track_id = {} AND raison = '{}'",
+                ph(e, 1),
+                super::faux_hires::RAISON_HERITEE_CODEC
+            ),
+            &[&track_id as &dyn ToSqlValue],
+        )?;
+        if gardee > 0 {
+            return Ok(());
+        }
+    }
     let (verdict, raison, coupure, bits, rate, bits_declares) = match resultat {
         Ok(m) => {
             let v = juger(m);

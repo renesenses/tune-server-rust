@@ -453,3 +453,49 @@ fn l_ancien_code_codec_est_remesure_une_fois_9035() {
         .unwrap();
     assert_eq!(r[0].as_string().as_deref(), Some("coupure_spectrale"));
 }
+
+/// #9035 — une REMESURE qui ne peut pas lire le fichier (NAS en veille) ne
+/// perd pas la mesure : la ligne reste `douteux` avec sa coupure, seule la
+/// raison passe de `coupure_de_codec` à `coupure_spectrale` ; jamais
+/// `non_concluant`. Elle n'est plus candidate. Une piste jamais mesurée et
+/// illisible, elle, reste rangée `non_concluant` comme avant.
+#[test]
+fn une_remesure_illisible_garde_le_verdict_douteux_9035() {
+    let db = base();
+    piste(&db, 1, "/m/a/1.flac", "flac", "local");
+    piste(&db, 2, "/m/a/2.flac", "flac", "local");
+    db.execute(
+        "INSERT INTO hires_verifications (track_id, verdict, raison, coupure_hz, bits_effectifs, sample_rate, bits_declares) \
+         VALUES (1, 'douteux', 'coupure_de_codec', 16000.0, 24, 96000, 24)",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(compter_les_candidats(&db), 2);
+    enregistrer(&db, 1, &Err("fichier injoignable".into())).unwrap();
+    enregistrer(&db, 2, &Err("fichier injoignable".into())).unwrap();
+    let r = db
+        .query_one(
+            "SELECT verdict, raison, coupure_hz, bits_effectifs FROM hires_verifications WHERE track_id = 1",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(r[0].as_string().as_deref(), Some("douteux"), "{r:?}");
+    assert_eq!(
+        r[1].as_string().as_deref(),
+        Some("coupure_spectrale"),
+        "{r:?}"
+    );
+    assert_eq!(r[2].as_f64(), Some(16000.0), "{r:?}");
+    assert_eq!(r[3].as_i64(), Some(24), "{r:?}");
+    let r = db
+        .query_one(
+            "SELECT verdict, raison FROM hires_verifications WHERE track_id = 2",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(r[0].as_string().as_deref(), Some("non_concluant"));
+    assert_eq!(r[1].as_string().as_deref(), Some("decodage_impossible"));
+    assert_eq!(compter_les_candidats(&db), 0);
+}
