@@ -35,7 +35,7 @@ async fn get(app: &axum::Router, uri: &str) -> (StatusCode, Value) {
 /// Une piste de 100 fenêtres de 3 s, toutes à `lufs` : LRA 0.
 fn constante(lufs: f64) -> PlageDeSonie {
     PlageDeSonie {
-        lra_lu: 0.0,
+        lra_lu: Some(0.0),
         histogramme: Histogramme::de(&vec![lufs; 100]),
     }
 }
@@ -97,17 +97,18 @@ fn semer(state: &AppState) {
 }
 
 #[tokio::test]
-async fn album_dr_sonie_cretes_et_lra_sur_toutes_ses_fenetres_9040() {
+async fn album_dr_sonie_cretes_et_lra_sur_ses_pistes_mesurees_9040() {
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
     semer(&state);
     let app = crate::routes::router(state.clone());
 
-    // Une seule piste mesurée : pas de LRA d'album, faite d'une moitié.
+    // Une seule piste mesurée (l'autre en échec ou injoignable) : la LRA de
+    // l'album repose sur elle, et le dit.
     ecrire(&state, 1, &constante(-20.0));
     let (statut, a) = get(&app, "/api/v1/library/albums/1/dynamique").await;
     assert_eq!(statut, StatusCode::OK, "{a}");
     assert_eq!(a["pistes"], 2, "{a}");
-    assert!(a["lra_lu"].is_null(), "{a}");
+    assert_eq!(a["lra_lu"], 0.0, "{a}");
     assert_eq!(a["lra_pistes_mesurees"], 1);
 
     // Les deux : −20 et −30 LUFS constants, LRA 0 chacune, album 10.
@@ -124,21 +125,60 @@ async fn album_dr_sonie_cretes_et_lra_sur_toutes_ses_fenetres_9040() {
     assert_eq!(a["crete_echantillon_dbfs"], -1.0);
     assert_eq!(a["crete_vraie_dbtp"], 1.0);
 
+    // A1 — une piste mesurée SANS fenêtre (moins de 3 s, muette) compte
+    // comme mesurée et ne change pas la LRA.
+    executer(
+        &state,
+        "INSERT INTO tracks (id, title, album_id, file_path, duration_ms, source) \
+         VALUES (4, 'courte', 1, '/m/4.flac', 2000, 'local')",
+    );
+    ecrire(
+        &state,
+        4,
+        &PlageDeSonie {
+            lra_lu: None,
+            histogramme: Histogramme::default(),
+        },
+    );
+    let (_, a) = get(&app, "/api/v1/library/albums/1/dynamique").await;
+    assert_eq!(
+        (a["pistes"].clone(), a["lra_pistes_mesurees"].clone()),
+        (3.into(), 3.into()),
+        "{a}"
+    );
+    assert_eq!(a["lra_lu"], 10.0, "{a}");
+
     // Un histogramme illisible ne rentre pas dans la LRA de l'album.
     executer(
         &state,
         "UPDATE plages_de_sonie SET histogramme = 'abc' WHERE track_id = 2",
     );
     let (_, a) = get(&app, "/api/v1/library/albums/1/dynamique").await;
-    assert!(a["lra_lu"].is_null(), "{a}");
+    assert_eq!(a["lra_lu"], 0.0, "{a}");
+    assert_eq!(a["lra_pistes_mesurees"], 2);
 
-    // Album inconnu : rien de mesuré, aucune valeur inventée.
-    let (statut, a) = get(&app, "/api/v1/library/albums/404/dynamique").await;
-    assert_eq!(statut, StatusCode::OK);
-    assert_eq!(a["pistes"], 0);
-    for k in ["dr", "integree_lufs", "crete_vraie_dbtp", "lra_lu"] {
-        assert!(a[k].is_null(), "{k} : {a}");
-    }
+    // Album inconnu : 404.
+    let (statut, _) = get(&app, "/api/v1/library/albums/404/dynamique").await;
+    assert_eq!(statut, StatusCode::NOT_FOUND);
+}
+
+/// Mineur de la relecture — `MAX` sur du texte : « -9.00 dB » > « -10.00 dB »
+/// en ordre alphabétique. La valeur lue est celle de la première piste.
+#[tokio::test]
+async fn la_sonie_d_album_ne_se_choisit_pas_par_ordre_alphabetique_9040() {
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    semer(&state);
+    executer(
+        &state,
+        "UPDATE track_metadata SET value = '-10.00 dB' WHERE track_id = 1 AND key = 'rg_album_gain'",
+    );
+    executer(
+        &state,
+        "UPDATE track_metadata SET value = '-9.00 dB' WHERE track_id = 2 AND key = 'rg_album_gain'",
+    );
+    let app = crate::routes::router(state);
+    let (_, a) = get(&app, "/api/v1/library/albums/1/dynamique").await;
+    assert_eq!(a["integree_lufs"], -8.0, "{a}");
 }
 
 #[tokio::test]
@@ -149,7 +189,7 @@ async fn fiche_technique_reunit_la_dynamique_de_la_piste_9040() {
         &state,
         1,
         &PlageDeSonie {
-            lra_lu: 7.3,
+            lra_lu: Some(7.3),
             histogramme: Histogramme::de(&[-20.0, -27.3]),
         },
     );
@@ -158,7 +198,7 @@ async fn fiche_technique_reunit_la_dynamique_de_la_piste_9040() {
         &state,
         1,
         &PlageDeSonie {
-            lra_lu: 7.4,
+            lra_lu: Some(7.4),
             histogramme: Histogramme::de(&[-20.0, -27.4]),
         },
     );

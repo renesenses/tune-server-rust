@@ -88,6 +88,7 @@ fn lra_de(signal: &[f64], hz: usize) -> f64 {
         .0
         .expect("plage de sonie mesurée")
         .lra_lu
+        .expect("au moins une fenêtre")
 }
 
 // ── EBU Tech 3342, cas 1 à 4 : LRA attendue ±1 LU ─────────────────────────
@@ -209,7 +210,7 @@ fn la_lra_d_un_album_se_calcule_sur_toutes_ses_fenetres() {
     let b = plage_et_dr_de(&sinus_par_paliers(&[(-30.0, 20.0)]), HZ, 2)
         .0
         .unwrap();
-    assert_eq!((a.lra_lu, b.lra_lu), (0.0, 0.0));
+    assert_eq!((a.lra_lu, b.lra_lu), (Some(0.0), Some(0.0)));
     let mut album = Histogramme::default();
     album.fusionner(&a.histogramme);
     album.fusionner(&b.histogramme);
@@ -230,8 +231,9 @@ fn l_histogramme_d_une_piste_rend_sa_lra_a_une_case_pres() {
     .0
     .unwrap();
     let h = p.histogramme.lra().unwrap();
-    eprintln!("piste {} / histogramme {h}", p.lra_lu);
-    assert!((h - p.lra_lu).abs() <= 0.11);
+    let l = p.lra_lu.unwrap();
+    eprintln!("piste {l} / histogramme {h}");
+    assert!((h - l).abs() <= 0.11);
 }
 
 #[test]
@@ -242,18 +244,27 @@ fn l_histogramme_se_relit_tel_qu_il_s_ecrit_et_refuse_une_chaine_douteuse() {
     let brut = p.histogramme.encoder();
     assert_eq!(Histogramme::decoder(&brut), Some(p.histogramme.clone()));
     assert_eq!(Histogramme::decoder(""), Some(Histogramme::default()));
+    assert_eq!(Histogramme::default().encoder(), "");
+    // Cases creuses : les zéros intermédiaires s'écrivent et se relisent.
+    let creux = Histogramme::de(&[-20.0, -20.3]);
+    assert_eq!(creux.encoder(), "-203:1,0,0,1");
+    assert_eq!(Histogramme::decoder("-203:1,0,0,1"), Some(creux));
     assert_eq!(Histogramme::decoder("-200:3;abc"), None);
     assert_eq!(Histogramme::decoder("-200:-3"), None);
+    assert_eq!(Histogramme::decoder("abc"), None);
 }
 
+/// A1 de la relecture — une piste de moins de 3 s ou muette est MESURÉE :
+/// une plage sans fenêtre (LRA nulle, histogramme vide), pas une absence qui
+/// laisserait la LRA de son album vide à jamais.
 #[test]
-fn une_piste_de_moins_de_trois_secondes_ou_muette_n_a_pas_de_lra() {
-    assert!(
-        plage_et_dr_de(&sinus_par_paliers(&[(-20.0, 2.5)]), HZ, 2)
-            .0
-            .is_none()
-    );
-    assert!(plage_et_dr_de(&vec![0.0; 2 * 10 * HZ], HZ, 2).0.is_none());
+fn une_piste_de_moins_de_trois_secondes_ou_muette_a_une_plage_sans_fenetre() {
+    for signal in [sinus_par_paliers(&[(-20.0, 2.5)]), vec![0.0; 2 * 10 * HZ]] {
+        let p = plage_et_dr_de(&signal, HZ, 2).0.expect("plage mesurée");
+        assert_eq!(p.lra_lu, None);
+        assert_eq!(p.histogramme.fenetres(), 0);
+        assert_eq!(p.histogramme.encoder(), "");
+    }
 }
 
 // ── Coût ───────────────────────────────────────────────────────────────────
@@ -279,6 +290,50 @@ fn cout_des_sous_blocs() {
             sans,
             avec,
             100.0 * (avec.as_secs_f64() / sans.as_secs_f64() - 1.0)
+        );
+    }
+}
+
+/// A3 de la relecture — la taille stockée de l'histogramme d'une piste
+/// réelle, forme compacte contre l'ancienne `case:compte;…`. Les fichiers
+/// (jamais versionnés) sont passés par `TUNE_PISTES_REELLES`, séparés par
+/// `|`. `cargo test … taille_de_l_histogramme -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore = "mesure sur des fichiers locaux, à lancer à la main"]
+async fn taille_de_l_histogramme_d_une_piste_reelle() {
+    let Ok(liste) = std::env::var("TUNE_PISTES_REELLES") else {
+        return;
+    };
+    for chemin in liste.split('|').filter(|c| !c.is_empty()) {
+        let m = crate::audio::analyzer::mesurer_tout(chemin)
+            .await
+            .expect("mesure");
+        let p = m.plage_de_sonie.expect("plage");
+        let compacte = p.histogramme.encoder();
+        let ancienne: usize = compacte
+            .split_once(':')
+            .map(|(premier, comptes)| {
+                let premier: i32 = premier.parse().unwrap();
+                comptes
+                    .split(',')
+                    .enumerate()
+                    .filter(|(_, n)| *n != "0")
+                    .map(|(i, n)| format!("{}:{n};", premier + i as i32).len())
+                    .sum()
+            })
+            .unwrap_or(0);
+        eprintln!(
+            "{} : LRA {:?} LU, DR {:?}, {} fenêtres, {} cases ; compacte {} octets, ancienne {} octets",
+            std::path::Path::new(chemin)
+                .file_name()
+                .unwrap()
+                .to_string_lossy(),
+            p.lra_lu,
+            m.valeurs.and_then(|v| v.3),
+            p.histogramme.fenetres(),
+            compacte.split(',').count(),
+            compacte.len(),
+            ancienne
         );
     }
 }

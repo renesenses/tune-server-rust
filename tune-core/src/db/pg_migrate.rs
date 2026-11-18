@@ -235,7 +235,7 @@ const MIGRATION_TABLES: &[&str] = &[
 const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
     // Reprises (#7280), créées par le script 100 : conserver leur file et position.
     "listening_resumes",
-    // Plages de sonie (#9040), créées par le script 123 : les recalculer
+    // Plages de sonie (#9040), créées par le script 125 : les recalculer
     // redécoderait toute la bibliothèque.
     "plages_de_sonie",
     // Positions des épisodes de podcast (#8170), créées par le script 116 :

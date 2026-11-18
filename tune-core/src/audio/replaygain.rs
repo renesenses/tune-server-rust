@@ -1847,6 +1847,9 @@ async fn analyser_une_piste(
             // Le fichier est bien là et reste illisible ou silencieux :
             // là, le témoin est légitime.
             debug!(track_id, path = %path, "replaygain_measure_none");
+            // #9040 — muette mais décodée : sa plage de sonie, sans fenêtre,
+            // la compte comme mesurée dans la LRA de son album.
+            ecritures.plage_de_sonie = plage_de_sonie;
         }
         Err(_elapsed) => {
             // The file blocked analysis (pathological decode / dormant NAS
@@ -2553,7 +2556,7 @@ async fn rattraper_une_piste(
         .await;
     }
     let mut mesuree = false;
-    match measured.map(|m| m.map(|t| t.valeurs)) {
+    match measured.map(|m| m.and_then(|t| t.valeurs)) {
         Ok(Some((_lufs, _peak, _true_peak, Some(dr)))) => {
             mesuree = true;
             // 🔴 LE TAG DU FICHIER FAIT FOI. La requête a bien écarté les

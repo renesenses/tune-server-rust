@@ -10,9 +10,11 @@
 //!   (`rg_*_source = analysis`) — un gain lu dans les balises n'a pas de
 //!   référence sûre (ReplayGain 1 ou 2) ;
 //! * LRA : `plages_de_sonie` ([`tune_core::audio::plage_de_sonie`]). Celle
-//!   d'un album se calcule sur les fenêtres de TOUTES ses pistes, et n'est
-//!   publiée que si toutes ses pistes à fichier sont mesurées : une LRA faite
-//!   de la moitié d'un album n'est pas celle de l'album.
+//!   d'un album se calcule sur les fenêtres de ses pistes MESURÉES, fusionnées
+//!   (une piste de moins de 3 s ou muette est mesurée, sans fenêtre). Une
+//!   piste en échec ou injoignable n'a pas de ligne : elle n'empêche pas la
+//!   LRA de l'album, elle n'y compte pas. `lra_pistes_mesurees` et `pistes`
+//!   disent sur quoi la valeur repose.
 
 use std::collections::HashMap;
 
@@ -134,6 +136,12 @@ pub(super) async fn de_l_album(
 fn album(state: &AppState, id: i64) -> Result<Value, AppError> {
     let b = &state.backend;
     let p = [&id as &dyn ToSqlValue];
+    if b.query_one("SELECT 1 FROM albums WHERE id = ?", &p)
+        .map_err(AppError::internal)?
+        .is_none()
+    {
+        return Err(AppError::not_found("album inconnu"));
+    }
     let pistes = b
         .query_one(
             "SELECT COUNT(*) FROM tracks WHERE album_id = ? \
@@ -167,16 +175,18 @@ fn album(state: &AppState, id: i64) -> Result<Value, AppError> {
         .map(|v| v == 1);
 
     // Sonie et crêtes d'album : les clés d'album de la passe ReplayGain,
-    // recopiées sur chaque piste, seulement là où l'album est de Tune.
+    // recopiées sur chaque piste, seulement là où l'album est de Tune. La
+    // valeur de la PREMIÈRE piste (plus petit identifiant) : un `MAX` sur du
+    // texte comparerait « -10.00 dB » et « -9.00 dB » dans l'ordre alphabétique.
     let lignes = b
         .query_many(
             &format!(
-                "SELECT m.key, MAX(m.value) FROM track_metadata m JOIN tracks t ON t.id = m.track_id \
+                "SELECT m.key, m.value FROM track_metadata m JOIN tracks t ON t.id = m.track_id \
                  WHERE t.album_id = ? \
                    AND m.key IN ('rg_album_gain', 'rg_album_peak', 'rg_album_true_peak') \
                    AND EXISTS (SELECT 1 FROM track_metadata s WHERE s.track_id = m.track_id \
                          AND s.key = '{}' AND s.value = '{}') \
-                 GROUP BY m.key",
+                 ORDER BY t.id",
                 rg::ALBUM_SOURCE_KEY,
                 rg::SOURCE_ANALYSIS
             ),
@@ -210,9 +220,8 @@ fn album(state: &AppState, id: i64) -> Result<Value, AppError> {
             lisibles += 1;
         }
     }
-    let lra = (pistes > 0 && lisibles == pistes)
-        .then(|| album.lra())
-        .flatten();
+    // Sur les seules pistes mesurées : `None` si aucune n'a de fenêtre.
+    let lra = album.lra();
 
     Ok(json!({
         "album_id": id,

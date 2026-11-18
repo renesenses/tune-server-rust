@@ -38,6 +38,17 @@
 //! programmes) ; l'album fusionne les histogrammes de ses pistes et applique
 //! la porte relative et les centiles à l'ensemble. Écart avec le calcul
 //! exact : au plus une case, 0,1 LU.
+//!
+//! Une piste mesurée sans aucune fenêtre (moins de 3 s, muette) a une ligne
+//! quand même : LRA nulle, histogramme vide. Elle compte ainsi parmi les
+//! pistes mesurées de son album, sans rien ajouter à sa LRA.
+//!
+//! # Forme stockée de l'histogramme
+//!
+//! Compacte : `premier:n1,n2,…` — l'indice de la première case, puis les
+//! comptes de TOUTES les cases jusqu'à la dernière, zéros compris. Une
+//! musique tient sur quelques centaines de cases contiguës : la forme
+//! `case:compte;…` répétait l'indice à chaque case.
 
 use std::collections::BTreeMap;
 
@@ -178,24 +189,36 @@ impl Histogramme {
         Some(arrondi_au_dixieme((haut - bas).max(0.0)))
     }
 
-    /// Forme stockée : `case:nombre` séparés par `;`, cases croissantes.
+    /// Forme stockée : `premier:n1,n2,…` (voir l'en-tête du module) ; une
+    /// chaîne vide pour un histogramme vide.
     pub fn encoder(&self) -> String {
-        self.0
-            .iter()
-            .map(|(c, n)| format!("{c}:{n}"))
-            .collect::<Vec<_>>()
-            .join(";")
+        let (Some((&premier, _)), Some((&dernier, _))) =
+            (self.0.first_key_value(), self.0.last_key_value())
+        else {
+            return String::new();
+        };
+        let comptes: Vec<String> = (premier..=dernier)
+            .map(|c| self.0.get(&c).copied().unwrap_or(0).to_string())
+            .collect();
+        format!("{premier}:{}", comptes.join(","))
     }
 
     /// Relit [`Self::encoder`]. `None` sur une chaîne mal formée : une valeur
     /// douteuse ne doit pas entrer dans la LRA d'un album.
     pub fn decoder(brut: &str) -> Option<Self> {
+        let brut = brut.trim();
         let mut h = BTreeMap::new();
-        for paire in brut.split(';').filter(|p| !p.trim().is_empty()) {
-            let (c, n) = paire.split_once(':')?;
-            let c: i32 = c.trim().parse().ok()?;
+        if brut.is_empty() {
+            return Some(Self(h));
+        }
+        let (premier, comptes) = brut.split_once(':')?;
+        let mut case: i32 = premier.trim().parse().ok()?;
+        for n in comptes.split(',') {
             let n: u32 = n.trim().parse().ok()?;
-            *h.entry(c).or_insert(0) += n;
+            if n > 0 {
+                h.insert(case, n);
+            }
+            case = case.checked_add(1)?;
         }
         Some(Self(h))
     }
@@ -205,20 +228,19 @@ impl Histogramme {
 /// celle de son album.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlageDeSonie {
-    pub lra_lu: f64,
+    /// `None` : aucune fenêtre (piste de moins de 3 s, muette).
+    pub lra_lu: Option<f64>,
     pub histogramme: Histogramme,
 }
 
 impl PlageDeSonie {
     /// Des sous-blocs de 100 ms (puissances pondérées K, canaux sommés).
-    /// `None` pour une piste de moins de 3 s ou muette.
-    pub fn des_sous_blocs(sous_blocs: &[f64]) -> Option<Self> {
+    pub fn des_sous_blocs(sous_blocs: &[f64]) -> Self {
         let st = courts_termes(sous_blocs);
-        let lra_lu = lra(&st)?;
-        Some(Self {
-            lra_lu,
+        Self {
+            lra_lu: lra(&st),
             histogramme: Histogramme::de(&st),
-        })
+        }
     }
 }
 

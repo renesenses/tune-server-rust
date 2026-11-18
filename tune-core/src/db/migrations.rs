@@ -2969,14 +2969,18 @@ CREATE TABLE IF NOT EXISTS imported_plays (
     // (cases de 0,1 LU) d'où se calcule la LRA d'un album. Écrite par la
     // passe ReplayGain et le rattrapage du DR, sur le même décodage. Naît
     // vide. `ON DELETE CASCADE` : une piste retirée emporte sa mesure.
-    // Jumelle PG : 123. Numérotée 156 / PG 123 le 18/11.
+    // `lra_lu` NULL : piste mesurée sans fenêtre (moins de 3 s, muette).
+    // Jumelle PG : 125. Numérotée 158 / PG 125 le 18/11 pour la RC14 : 156 /
+    // PG 123 sont pris par #8845 et 157 / PG 124 restent au renumérotage de
+    // #8912 (lot rc13). Les gardes de contiguïté ne passent qu'une fois ces
+    // deux-là dans la base : À RECALER au moment de la rc14.
     Migration {
-        version: 156,
+        version: 158,
         name: "plages_de_sonie",
         up: "
 CREATE TABLE IF NOT EXISTS plages_de_sonie (
     track_id INTEGER PRIMARY KEY REFERENCES tracks(id) ON DELETE CASCADE,
-    lra_lu REAL NOT NULL,
+    lra_lu REAL,
     histogramme TEXT NOT NULL,
     algo TEXT NOT NULL,
     mesure_le TEXT NOT NULL
@@ -6371,12 +6375,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "radio_fin_de_file_coupee_par_defaut",
         include_str!("../../migrations/postgres/122_radio_fin_de_file_coupee_par_defaut.sql"),
     ),
-    // Jumelle de la SQLite 156 (#9040) : `plages_de_sonie`, la LRA de
+    // Jumelle de la SQLite 158 (#9040) : `plages_de_sonie`, la LRA de
     // chaque piste et l'histogramme de ses sonies à court terme. Naît vide.
+    // RC14 : 123 et 124 sont aux PR #8845 et #8912 du lot rc13.
     (
-        123,
+        125,
         "plages_de_sonie",
-        include_str!("../../migrations/postgres/123_plages_de_sonie.sql"),
+        include_str!("../../migrations/postgres/125_plages_de_sonie.sql"),
     ),
 ];
 
@@ -10327,9 +10332,10 @@ mod tests {
         // 122 : `radio_fin_de_file_coupee_par_defaut` (#8974), jumelle de la
         // SQLite 155. Migration de DONNÉES : annule la bascule de la 118
         // (neutralisée) là où elle a eu lieu, DEFAULT '0'.
-        // 123 : `plages_de_sonie` (#9040), jumelle de la SQLite 156. Crée la
-        // table de la LRA par piste, que la passe ReplayGain NOMME.
-        assert_eq!(pg_latest_version(), 123, "latest PG migration must be 123");
+        // 125 : `plages_de_sonie` (#9040), jumelle de la SQLite 158 (RC14 ;
+        // 123 et 124 aux PR #8845 et #8912 du lot rc13). Crée la table de la
+        // LRA par piste, que la passe ReplayGain NOMME.
+        assert_eq!(pg_latest_version(), 125, "latest PG migration must be 125");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"
