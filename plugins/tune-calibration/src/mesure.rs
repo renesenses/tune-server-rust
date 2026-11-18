@@ -39,7 +39,7 @@ use tune_calibration::level::{LevelDecision, LevelPolicy, ProbeResult, peak_dbfs
 use tune_calibration::mic_cal::MicCalibration;
 use tune_calibration::{MeasurementSpec, analyse_capture};
 use tune_entree_audio::peripheriques::Peripheriques;
-use tune_entree_audio::tampon::CaptureVersTampon;
+use tune_entree_audio::tampon::{CaptureVersTampon, DELAI_PREMIERE_TRAME};
 
 use crate::fournisseur::FournisseurBalayage;
 use crate::generateur::{Consigne, Deroule, Emission, Plan, Voies};
@@ -226,9 +226,19 @@ pub struct Avancement {
     /// Trames jouées sur la longueur maximale promise : la barre de l'écran.
     pub progression: f64,
     pub avertissements: Vec<String>,
+    /// #9070 — le code stable d'une erreur que l'écran traduit
+    /// (`micro_muet`) ; absent sinon.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<&'static str>,
+    /// #9070 — l'identifiant exact du micro ouvert (`alsa:hw:CARD=…`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peripherique: Option<String>,
 }
 
 struct Interne {
+    /// #9070 — voir [`Avancement::code`] et [`Avancement::peripherique`].
+    code: Option<&'static str>,
+    peripherique: Option<String>,
     etat: Etat,
     salves: Vec<Salve>,
     avertissements: Vec<String>,
@@ -286,6 +296,8 @@ impl Mesure {
             depuis_s: self.debut.elapsed().as_secs_f64(),
             progression: (self.deroule.trames_rendues() as f64 / max).min(1.0),
             avertissements: i.avertissements.clone(),
+            code: i.code,
+            peripherique: i.peripherique.clone(),
         }
     }
 
@@ -308,6 +320,9 @@ pub struct Controleur {
     /// Vitesse du temps dans les essais : les attentes de capture sont en
     /// trames, pas en secondes ; ce délai borne seulement l'attente.
     pub delai_capture: Duration,
+    /// #9070 — attente maximale de la première trame du micro, avant que la
+    /// zone ne joue quoi que ce soit.
+    pub delai_premiere_trame: Duration,
     /// Les simulations de pièce sans micro (C5), gardées en mémoire.
     pub simulations: crate::modes::Magasin,
 }
@@ -328,6 +343,7 @@ impl Controleur {
             compteur: AtomicU64::new(0),
             delai_ouverture: Duration::from_secs(20),
             delai_capture: Duration::from_secs(60),
+            delai_premiere_trame: DELAI_PREMIERE_TRAME,
             simulations: Default::default(),
         })
     }
@@ -461,6 +477,8 @@ impl Controleur {
             deroule: deroule.clone(),
             debut: Instant::now(),
             interne: Mutex::new(Interne {
+                code: None,
+                peripherique: None,
                 etat: Etat::Preparation,
                 salves: Vec::new(),
                 avertissements: Vec::new(),
@@ -517,6 +535,15 @@ impl Controleur {
         let duree_max_s = deroule.plan.duree_max_ms() as f64 / 1000.0 + 30.0;
         let capture = CaptureVersTampon::demarrer(&self.peripheriques, &d.entree, duree_max_s)
             .map_err(Sortie::Erreur)?;
+        mesure.verrou().peripherique = Some(capture.peripherique().to_string());
+        // #9070 (fil 2770) — un micro ouvert qui ne remet aucune trame échoue
+        // ici, en deux secondes et en nommant le PCM, avant toute salve : il
+        // attendait une minute pour finir en « 0 trames sur 216000 ».
+        if let Err(sans) = capture.attendre_la_premiere_trame(self.delai_premiere_trame) {
+            capture.arreter();
+            mesure.verrou().code = sans.code();
+            return Err(Sortie::Erreur(sans.to_string()));
+        }
         let zone = ZoneTenue::prendre(
             self.hote.clone(),
             d.zone_id,

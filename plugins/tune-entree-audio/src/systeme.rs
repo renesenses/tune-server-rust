@@ -20,7 +20,9 @@ use crate::anneau::{Anneau, Fin};
 use crate::format::{
     Echantillons, Mesure, bits_servis, contient_iec61937, convertir_entiers, convertir_f32,
 };
-use crate::peripheriques::{Arret, CaptureDemarree, DescriptionEntree, Peripheriques};
+use crate::peripheriques::{
+    Arret, CaptureDemarree, DescriptionEntree, Peripheriques, une_ligne_par_carte_alsa,
+};
 
 pub struct Systeme;
 
@@ -144,7 +146,9 @@ impl Peripheriques for Systeme {
                 bits_servis: bits,
             });
         }
-        Ok(v)
+        // #9070 — sous ALSA, une ligne par carte (hw:, sinon plughw:) ; sans
+        // effet ailleurs.
+        Ok(une_ligne_par_carte_alsa(v))
     }
 
     fn format_natif(&self, entree: &str) -> Result<(String, FormatPcm), String> {
@@ -155,13 +159,14 @@ impl Peripheriques for Systeme {
 
     fn demarrer(&self, entree: &str, anneau: Arc<Anneau>) -> Result<CaptureDemarree, String> {
         let entree = entree.to_string();
-        let (pret_tx, pret_rx) = mpsc::channel::<Result<(String, FormatPcm), String>>();
+        let (pret_tx, pret_rx) = mpsc::channel::<Result<(String, String, FormatPcm), String>>();
         let (arret_tx, arret_rx) = mpsc::channel::<()>();
         let fil = std::thread::Builder::new()
             .name("entree-audio-capture".into())
             .spawn(move || {
                 let r = (|| {
                     let d = trouver(&entree)?;
+                    let peripherique = id(&d);
                     let (format, sample_format) = format_natif_de(&d)?;
                     let ech = echantillons(sample_format).expect("vérifié par format_natif_de");
                     let config = StreamConfig {
@@ -175,11 +180,23 @@ impl Peripheriques for Systeme {
                     let a_err = anneau.clone();
                     let mut origine: Option<cpal::StreamInstant> = None;
                     let mut octets: Vec<u8> = Vec::with_capacity(64 * 1024);
+                    // #9070 — la première remise du pilote se journalise : sans
+                    // elle, un micro ouvert mais muet ne laisse aucune trace.
+                    let mut premiere_remise = true;
+                    let id_rappel = peripherique.clone();
                     let stream = d
                         .build_input_stream_raw(
                             &config,
                             sample_format,
                             move |data: &cpal::Data, info: &cpal::InputCallbackInfo| {
+                                if premiere_remise {
+                                    premiere_remise = false;
+                                    tracing::info!(
+                                        peripherique = %id_rappel,
+                                        trames = data.len() / (canaux.max(1) as usize),
+                                        "entree_audio_premieres_trames"
+                                    );
+                                }
                                 octets.clear();
                                 let mesure = match ech {
                                     Echantillons::F32 => data
@@ -232,11 +249,23 @@ impl Peripheriques for Systeme {
                     stream
                         .play()
                         .map_err(|e| format!("démarrage de la capture impossible : {e}"))?;
-                    Ok((stream, nom(&d), format))
+                    // #9070 — le PCM exactement ouvert, et ce qui lui a été
+                    // demandé (son format courant, accepté par le pilote).
+                    tracing::info!(
+                        peripherique = %peripherique,
+                        entree = %nom(&d),
+                        format_echantillons = %sample_format,
+                        frequence = format.frequence,
+                        canaux = format.canaux,
+                        bits = format.bits,
+                        pile = pile(),
+                        "entree_audio_peripherique_ouvert"
+                    );
+                    Ok((stream, nom(&d), peripherique, format))
                 })();
                 match r {
-                    Ok((stream, nom, format)) => {
-                        let _ = pret_tx.send(Ok((nom, format)));
+                    Ok((stream, nom, peripherique, format)) => {
+                        let _ = pret_tx.send(Ok((nom, peripherique, format)));
                         // Vit jusqu'à l'arrêt (ou l'abandon de l'émetteur).
                         let _ = arret_rx.recv();
                         drop(stream);
@@ -247,11 +276,12 @@ impl Peripheriques for Systeme {
                 }
             })
             .map_err(|e| format!("fil de capture impossible : {e}"))?;
-        let (nom, format) = pret_rx
+        let (nom, peripherique, format) = pret_rx
             .recv()
             .map_err(|_| "le fil de capture s'est arrêté avant de répondre".to_string())??;
         Ok(CaptureDemarree {
             nom,
+            id: peripherique,
             format,
             arret: Box::new(ArretCpal {
                 arret: arret_tx,
