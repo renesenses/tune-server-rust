@@ -1088,3 +1088,224 @@ async fn l_adresse_snapcast_est_un_reglage_protege() {
     let reglages = SettingsRepo::with_backend(state.backend.clone());
     assert_eq!(reglages.get("snapcast_host").ok().flatten(), None);
 }
+
+/// Actions qui engagent la machine ou le code exécuté et qui n'avaient que
+/// `RequireAdmin` (ou aucune garde) : arrêt du serveur, greffons (installation,
+/// mise à jour, activation, désactivation, retrait), retrait d'un thème,
+/// greffons audio natifs, ouverture de l'accès à distance. Les noms
+/// n'existent pas : passé la garde, chaque gestionnaire refuse sans rien
+/// toucher.
+fn actions_machine_gardees_a_leur_tour() -> Vec<(Method, &'static str, Option<&'static str>)> {
+    vec![
+        (Method::POST, "/api/v1/system/stop", None),
+        (
+            Method::POST,
+            "/api/v1/plugins/greffon-inexistant-gardes/install",
+            Some("{}"),
+        ),
+        (
+            Method::POST,
+            "/api/v1/plugins/greffon-inexistant-gardes/update",
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/v1/plugins/greffon-inexistant-gardes/enable",
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/v1/plugins/greffon-inexistant-gardes/disable",
+            None,
+        ),
+        (
+            Method::DELETE,
+            "/api/v1/plugins/greffon-inexistant-gardes",
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/v1/marketplace/plugins/greffon-inexistant-gardes/uninstall",
+            None,
+        ),
+        (
+            Method::DELETE,
+            "/api/v1/skins/theme-inexistant-gardes",
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/v1/audio-plugins/greffon-inexistant-gardes/install",
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/v1/audio-plugins/greffon-inexistant-gardes/install-from-catalog",
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/v1/audio-plugins/greffon-inexistant-gardes/rollback",
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/v1/audio-plugins/greffon-inexistant-gardes/uninstall",
+            Some("{}"),
+        ),
+        (Method::POST, "/api/v1/cloud/bridge/enable", None),
+    ]
+}
+
+/// Passé la garde, l'arrêt quitte le processus : jamais exécuté sous test.
+fn sans_l_arret(
+    routes: Vec<(Method, &'static str, Option<&'static str>)>,
+) -> Vec<(Method, &'static str, Option<&'static str>)> {
+    routes
+        .into_iter()
+        .filter(|(_, chemin, _)| !chemin.ends_with("/system/stop"))
+        .collect()
+}
+
+#[tokio::test]
+async fn sans_authentification_arret_et_greffons_refuses_depuis_le_reseau_local() {
+    let state = new_state();
+    for (m, chemin, corps) in actions_machine_gardees_a_leur_tour() {
+        let (st, _, rep) = appel_depuis(
+            &state,
+            AUTRE_HOTE_DU_LAN,
+            m.clone(),
+            chemin,
+            None,
+            corps,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::FORBIDDEN,
+            "{m} {chemin} depuis le LAN : {rep}"
+        );
+        assert!(rep.contains("auth_required"), "{m} {chemin} : {rep}");
+        assert!(rep.contains("not_local"), "{m} {chemin} : {rep}");
+
+        // Relayé : vu de 127.0.0.1, émis ailleurs. Jamais local.
+        let (st, _, rep) = appel_depuis(
+            &state,
+            CETTE_MACHINE,
+            m.clone(),
+            chemin,
+            None,
+            corps,
+            &[("x-tune-relais", "1")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{m} {chemin} relayé : {rep}");
+    }
+    // Rien n'a été écrit par les appels refusés.
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    for cle in [
+        "plugin_greffon-inexistant-gardes_installed",
+        "plugin_greffon-inexistant-gardes_enabled",
+    ] {
+        assert_eq!(reglages.get(cle).ok().flatten(), None, "{cle}");
+    }
+}
+
+#[tokio::test]
+async fn sans_authentification_arret_et_greffons_acceptes_depuis_cette_machine() {
+    let state = new_state();
+    for adresse in [CETTE_MACHINE, "[::1]:50000"] {
+        for (m, chemin, corps) in sans_l_arret(actions_machine_gardees_a_leur_tour()) {
+            let (st, _, rep) =
+                appel_depuis(&state, adresse, m.clone(), chemin, None, corps, &[]).await;
+            assert!(
+                !rep.contains("auth_required"),
+                "{adresse} {m} {chemin} : {rep}"
+            );
+            assert_ne!(
+                st,
+                StatusCode::UNAUTHORIZED,
+                "{adresse} {m} {chemin} : {rep}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn avec_authentification_arret_et_greffons_exigent_l_administrateur() {
+    let state = new_state();
+    enable_auth(&state);
+    let standard = tok("user", 2);
+    for (m, chemin, corps) in actions_machine_gardees_a_leur_tour() {
+        // Depuis le réseau local comme depuis cette machine : le rôle décide.
+        for adresse in [AUTRE_HOTE_DU_LAN, CETTE_MACHINE] {
+            let (st, _, rep) = appel_depuis(
+                &state,
+                adresse,
+                m.clone(),
+                chemin,
+                Some(&standard),
+                corps,
+                &[],
+            )
+            .await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{adresse} {m} {chemin} : {rep}");
+            assert!(rep.contains("admin role required"), "{m} {chemin} : {rep}");
+            let (st, _, rep) =
+                appel_depuis(&state, adresse, m.clone(), chemin, None, corps, &[]).await;
+            assert_eq!(
+                st,
+                StatusCode::UNAUTHORIZED,
+                "{adresse} {m} {chemin} sans jeton : {rep}"
+            );
+        }
+    }
+    // L'administrateur passe la garde, y compris depuis un autre hôte du LAN.
+    let admin = tok("admin", 1);
+    for (m, chemin, corps) in sans_l_arret(actions_machine_gardees_a_leur_tour()) {
+        let (st, _, rep) = appel_depuis(
+            &state,
+            AUTRE_HOTE_DU_LAN,
+            m.clone(),
+            chemin,
+            Some(&admin),
+            corps,
+            &[],
+        )
+        .await;
+        assert_ne!(st, StatusCode::UNAUTHORIZED, "{m} {chemin} : {rep}");
+        assert!(!rep.contains("admin role required"), "{m} {chemin} : {rep}");
+        assert!(!rep.contains("auth_required"), "{m} {chemin} : {rep}");
+    }
+}
+
+/// Les drapeaux des greffons ne s'écrivent plus par l'écriture générique des
+/// réglages sans administrateur : ce serait la porte de côté des routes
+/// d'installation.
+#[tokio::test]
+async fn les_drapeaux_des_greffons_sont_des_reglages_proteges() {
+    let state = new_state();
+    for corps in [
+        r#"{"plugin_bandcamp_installed":"true"}"#,
+        r#"{"plugin_bandcamp_enabled":"true"}"#,
+        r#"{"plugin_bandcamp_hidden":"false"}"#,
+        r#"{"plugins":"[]"}"#,
+    ] {
+        let (st, rep) = appel(
+            &state,
+            Method::PATCH,
+            "/api/v1/system/config",
+            None,
+            Some(corps),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{corps} : {rep}");
+        assert!(rep.contains("protected_settings"), "{corps} : {rep}");
+    }
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    assert_eq!(
+        reglages.get("plugin_bandcamp_installed").ok().flatten(),
+        None
+    );
+}

@@ -200,6 +200,7 @@ async fn install_skin(
 }
 
 async fn uninstall_skin(
+    _garde: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     Path(skin_id): Path<String>,
 ) -> impl IntoResponse {

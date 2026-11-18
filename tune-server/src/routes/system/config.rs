@@ -4593,7 +4593,9 @@ pub(super) async fn purge_orphan_tracks(
 /// Honnêteté : sur une installation supervisée (systemd `Restart=always`,
 /// service Windows), le superviseur peut relancer le processus aussitôt —
 /// l'écran le dit dans la confirmation.
-pub(super) async fn stop(_admin: crate::auth::RequireAdmin) -> impl IntoResponse {
+/// Arrêter le serveur engage la machine, comme le redémarrage : même garde
+/// (administrateur, ou authentification coupée : seulement depuis cette machine).
+pub(super) async fn stop(_garde: crate::auth::AdminOuCetteMachine) -> impl IntoResponse {
     tokio::spawn(async {
         // Laisser la réponse HTTP partir avant de mourir.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;

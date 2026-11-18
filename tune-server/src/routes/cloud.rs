@@ -1267,7 +1267,9 @@ async fn bridge_rotate_token(
 /// Active le pont. Administrateur seulement dès que l'authentification est
 /// active : la réponse porte le jeton de pont.
 async fn bridge_enable(
-    _admin: crate::auth::RequireAdmin,
+    // Ouvrir l'accès à distance engage la machine : administrateur, ou
+    // authentification coupée, seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     // Premium gate: Cloud Relay requires Premium
