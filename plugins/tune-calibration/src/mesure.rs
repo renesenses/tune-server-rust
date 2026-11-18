@@ -70,10 +70,6 @@ pub const AVANCE_SUR_L_ECOUTE_S: f64 = 0.3;
 /// COURS de mesure.
 pub const MICRO_FIGE: Duration = Duration::from_secs(2);
 
-/// #9066 — le code stable de [`Avancement::code`] pour un micro figé : le
-/// web le traduit (web#3219) au lieu d'afficher le message en français.
-pub const CODE_MICRO_FIGE: &str = "micro_fige";
-
 /// #9066 — la sortie de ce type pousse le son par le réseau (ou par un
 /// lecteur distant) : sa latence propre — tampon du renderer, 2 s fixes
 /// d'AirPlay — s'ajoute à celle de Tune, et la fenêtre d'écoute ne la voit
@@ -266,19 +262,9 @@ pub struct Avancement {
     /// Trames jouées sur la longueur maximale promise : la barre de l'écran.
     pub progression: f64,
     pub avertissements: Vec<String>,
-    /// #9070 — le code stable d'une erreur que l'écran traduit
-    /// (`micro_muet`) ; absent sinon.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub code: Option<&'static str>,
-    /// #9070 — l'identifiant exact du micro ouvert (`alsa:hw:CARD=…`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub peripherique: Option<String>,
 }
 
 struct Interne {
-    /// #9070 — voir [`Avancement::code`] et [`Avancement::peripherique`].
-    code: Option<&'static str>,
-    peripherique: Option<String>,
     etat: Etat,
     salves: Vec<Salve>,
     avertissements: Vec<String>,
@@ -336,8 +322,6 @@ impl Mesure {
             depuis_s: self.debut.elapsed().as_secs_f64(),
             progression: (self.deroule.trames_rendues() as f64 / max).min(1.0),
             avertissements: i.avertissements.clone(),
-            code: i.code,
-            peripherique: i.peripherique.clone(),
         }
     }
 
@@ -513,8 +497,6 @@ impl Controleur {
             deroule: deroule.clone(),
             debut: Instant::now(),
             interne: Mutex::new(Interne {
-                code: None,
-                peripherique: None,
                 etat: Etat::Preparation,
                 salves: Vec::new(),
                 avertissements: Vec::new(),
@@ -819,16 +801,11 @@ impl Controleur {
         }
     }
 
-    /// #9066 — l'erreur « micro figé », avec son code stable et le
-    /// périphérique : exact s'il est déjà connu (#9070), sinon l'entrée
-    /// demandée.
+    /// #9066 — l'erreur « micro figé », qui nomme le micro. Le code stable
+    /// `micro_fige` (traduit par web#3219) se posera sur `Avancement::code`
+    /// une fois #9081 (#9070) fusionnée : c'est elle qui ajoute ce champ.
     fn erreur_micro_fige(&self, mesure: &Mesure) -> Sortie {
         let entree = mesure.demande.entree.as_str();
-        {
-            let mut i = mesure.verrou();
-            i.code = Some(CODE_MICRO_FIGE);
-            i.peripherique.get_or_insert_with(|| entree.to_string());
-        }
         Sortie::Erreur(format!(
             "le micro « {entree} » ne capte plus (débranché ou en veille ?) : \
              aucune trame depuis {} s, mesure arrêtée",
