@@ -4177,6 +4177,11 @@ pub(super) async fn api_docs() -> Json<Value> {
         ),
         (
             "GET",
+            "/library/service-tracks/{service}/{id_service}/waveform",
+            "Waveform of a Qobuz/TIDAL track (200 points; 202 while computing)",
+        ),
+        (
+            "GET",
             "/library/tracks/{id}/synced-lyrics",
             "Synchronized lyrics (.lrc)",
         ),

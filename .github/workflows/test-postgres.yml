@@ -356,6 +356,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8676 -- --nocapture --test-threads=1
 
+      # #9014 — rescan d'une feuille CUE dont un début a bougé : la tranche est
+      # recalée (même id, favori, liste et écoute intacts) et les bornes ne
+      # sont réécrites que si elles changent (`IS DISTINCT FROM`). Sans cette
+      # étape, le témoin prendrait son saut annoncé.
+      - name: Tranches CUE recalées au rescan sur PostgreSQL (#9014)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_9014 -- --nocapture --test-threads=1
+
       # #8280 — raisons des recommandations de l'accueil : les sources disent
       # vrai sur un vrai PostgreSQL, et la rangée tient sa mesure. Le témoin
       # vide `listen_history`, `tracks`, `albums`, `artists` : il tourne seul,

@@ -2178,6 +2178,9 @@ mod service_wav_progressif_openhome_6718;
 
 mod dsp;
 // #5662 — une commande de volume à la fois par sortie, la dernière valeur gagne.
+/// #8968 (PR 0) — banc de mesure de la jointure entre deux pistes.
+#[cfg(test)]
+mod banc_jointure_8968_tests;
 /// #8082 — flux continu entre les pistes pour les renderers DLNA.
 mod flux_continu_8082;
 mod repere_de_hausse_6721;
@@ -2446,6 +2449,11 @@ mod dsd_upnp_politique_de_zone_tests;
 #[cfg(test)]
 mod dsd_pret_de_sorties_8052_tests;
 
+/// #8956 — Atoll ST200 : un DSD de serveur UPnP part dans l'orthographe que
+/// le Sink publie pour son conteneur (`audio/x-dsf` / `audio/x-dff`).
+#[cfg(test)]
+mod dsd_upnp_atoll_st200_8956_tests;
+
 /// Relevé par #5119 — les bras DSF UPnP et AAC n'appliquent pas l'égaliseur
 /// d'une zone LOCALE dans son flux : mesuré sur le PCM, une passe et non deux.
 #[cfg(test)]
@@ -2467,6 +2475,9 @@ mod mesure_saut_cd_5079;
 /// FLAC (ou le catalogue) ; inconnue, elle est refusée par une erreur nommée.
 #[cfg(test)]
 mod qobuz_cadence_nulle_5283_tests;
+/// #8983 — un saut Qobuz vers une sortie locale part de la position.
+#[cfg(test)]
+mod saut_qobuz_8983_tests;
 #[cfg(test)]
 mod tidal_aac_annonce_6334_tests;
 /// #7266 — de bout en bout, un FLAC CD TIDAL en DASH jusqu'au Play reçu par
