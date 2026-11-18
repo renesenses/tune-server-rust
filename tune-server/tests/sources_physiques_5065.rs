@@ -39,7 +39,12 @@ async fn appel(
 async fn demarrer(base: &std::path::Path) -> axum::Router {
     let etat = AppState::new(base.to_str().unwrap(), 0, Default::default()).unwrap();
     let routeurs = tune_server::plugins::init(&etat, "http://127.0.0.1:0", vec![]).await;
-    tune_server::routes::router_with_plugins(etat, routeurs)
+    tune_server::routes::router_with_plugins(etat, routeurs).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    )
 }
 
 async fn sources(app: &axum::Router) -> Value {

@@ -95,6 +95,10 @@ pub struct AppState {
     /// serveur : propre à cet état, pour que deux bancs d'essai parallèles ne
     /// se refusent pas l'un l'autre (409).
     pub verrou_titres_demo: Arc<tokio::sync::Mutex<()>>,
+    /// web#3118 — le cache en mémoire et les verrous par profil de
+    /// `GET /home/because-you-like`. Propre à cet état : jamais dans la table
+    /// des réglages, que `GET /system/config` publie.
+    pub parce_que_vous_aimez: Arc<crate::routes::parce_que_vous_aimez::EtatParceQueVousAimez>,
     pub port: u16,
     /// Origine du compteur `uptime_seconds` : un `Instant` capturé à la
     /// construction de l'état, donc AU DÉMARRAGE DU PROCESSUS. Il repart
@@ -122,6 +126,14 @@ pub struct AppState {
     pub api_analytics: Arc<tune_core::api_analytics::ApiAnalytics>,
     pub poller_metrics: tune_core::poller::PollerMetricsMap,
     pub update_phase: Arc<std::sync::Mutex<Option<String>>>,
+    /// Code à usage unique qui autorise l'activation de l'authentification
+    /// depuis un autre appareil (`POST /auth/activation`) ; affiché dans le
+    /// journal du serveur seulement.
+    pub code_activation_auth: Arc<std::sync::Mutex<crate::auth::EtatCodeActivation>>,
+    /// Incrémenté à l'activation de l'authentification : chaque WebSocket
+    /// ouverte s'y abonne et se ferme (le client se reconnecte avec une
+    /// session).
+    pub fermeture_websockets: Arc<tokio::sync::watch::Sender<u64>>,
     /// La raison de la dernière mise à jour qui n'a rien installé (#7600),
     /// rendue par `GET /system/update/status`.
     pub update_issue: Arc<crate::routes::system::suivi_de_mise_a_jour_7600::Issue>,
@@ -737,6 +749,7 @@ impl AppState {
             )),
             dossier_titres_demo: crate::routes::titres_demo::dossier_par_defaut(db_path),
             verrou_titres_demo: Arc::new(tokio::sync::Mutex::new(())),
+            parce_que_vous_aimez: Default::default(),
             port,
             started_at: Instant::now(),
             process_started_at: time::OffsetDateTime::now_utc(),
@@ -747,6 +760,8 @@ impl AppState {
             api_analytics: Arc::new(tune_core::api_analytics::ApiAnalytics::default()),
             poller_metrics: Arc::new(Mutex::new(std::collections::HashMap::new())),
             update_phase: Arc::new(std::sync::Mutex::new(None)),
+            code_activation_auth: Arc::new(std::sync::Mutex::new(Default::default())),
+            fermeture_websockets: Arc::new(tokio::sync::watch::channel(0).0),
             update_issue: Arc::new(std::sync::Mutex::new(None)),
             rooms: Arc::new(Mutex::new(tune_core::collaborative::RoomManager::new())),
             upnp_index_lock: Arc::new(Mutex::new(())),

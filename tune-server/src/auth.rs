@@ -388,6 +388,9 @@ fn is_public_auth_route(method: &axum::http::Method, path: &str) -> bool {
     path.ends_with("/auth/login")
         || path.ends_with("/auth/logout")
         || (method == Method::GET && path.ends_with("/auth/config"))
+        // L'écran d'activation lit seulement l'état (activée ou non, appel de
+        // cette machine ou non).
+        || (method == Method::GET && path.ends_with("/auth/activation"))
 }
 
 /// When auth is enabled, require the caller to present a valid admin token.
@@ -612,11 +615,46 @@ pub struct RequireAdmin;
 
 /// L'authentification est-elle active sur ce serveur ?
 pub fn authentification_active(state: &AppState) -> bool {
-    SettingsRepo::with_backend(state.backend.clone())
+    authentification_active_db(&state.backend)
+}
+
+/// [`authentification_active`] sans état HTTP (planificateurs, #8909).
+pub fn authentification_active_db(
+    db: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> bool {
+    SettingsRepo::with_backend(db.clone())
         .get("auth_enabled")
         .ok()
         .flatten()
         .is_some_and(|v| v == "true")
+}
+
+/// Le jeton du pont (relais cloud, écoute à distance) change à l'activation :
+/// un lien d'accès obtenu pendant que tout était ouvert ne sert plus, et la
+/// session du relais est rouverte avec le nouveau jeton. Les apps d'écoute à
+/// distance sont à appairer de nouveau.
+fn renouveler_le_jeton_du_pont(state: &AppState) {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let present = settings
+        .get("bridge_token")
+        .ok()
+        .flatten()
+        .is_some_and(|t| !t.is_empty());
+    if !present {
+        return;
+    }
+    let jeton = uuid::Uuid::new_v4().to_string();
+    if settings.set("bridge_token", &jeton).is_err() {
+        tracing::warn!("activation_jeton_du_pont_non_enregistre");
+        return;
+    }
+    #[cfg(feature = "cloud-relay")]
+    if let Some(client) = state.relay_client.get() {
+        client.renouveler_jeton(jeton);
+    }
+    #[cfg(not(feature = "cloud-relay"))]
+    let _ = jeton;
+    tracing::info!("activation_jeton_du_pont_renouvele");
 }
 
 /// Refus d'une opération réservée aux serveurs dont l'authentification est
@@ -742,6 +780,19 @@ async fn appel_depuis_cette_machine(parts: &mut Parts, state: &AppState) -> bool
     if crate::garde_du_relais::requete_relayee(&parts.headers) {
         return false;
     }
+    // Derrière un mandataire inverse local (nginx, Caddy, proxy DSM,
+    // Tailscale Serve, cloudflared…), tout appel arrive de 127.0.0.1 : le
+    // bouclage ne prouve plus rien.
+    // HTTP/1.0 : l'empreinte d'un mandataire inverse (nginx par défaut :
+    // `proxy_http_version 1.0`, `Host` réécrit en 127.0.0.1, aucun
+    // `X-Forwarded-*`). Un navigateur parle HTTP/1.1 ou 2.
+    if parts.version == axum::http::Version::HTTP_10 {
+        return false;
+    }
+    let autorite = parts.uri.authority().map(|a| a.as_str().to_string());
+    if !requete_de_cette_machine(&parts.headers, autorite.as_deref()) {
+        return false;
+    }
     // Appliance + relais du port 80 : le bouclage ne prouve rien (voir
     // `appliance::bouclage_fiable`). Il faut alors un administrateur.
     if !crate::routes::appliance::bouclage_fiable() {
@@ -750,6 +801,95 @@ async fn appel_depuis_cette_machine(parts: &mut Parts, state: &AppState) -> bool
     adresse_de_l_appelant(parts, state)
         .await
         .is_some_and(adresse_de_cette_machine)
+}
+
+/// En-têtes qu'un mandataire inverse ajoute en relayant une requête.
+const ENTETES_DE_MANDATAIRE: &[&str] = &[
+    "forwarded",
+    "x-forwarded-for",
+    "x-forwarded-host",
+    "x-forwarded-proto",
+    "x-forwarded-port",
+    "x-real-ip",
+    "x-client-ip",
+    "via",
+    "cf-connecting-ip",
+    "true-client-ip",
+    "fastly-client-ip",
+    "tailscale-user-login",
+];
+
+/// Le nom d'hôte désigne-t-il cette machine (`localhost`, `127.x.x.x`,
+/// `[::1]`, port éventuel) ?
+pub fn hote_de_bouclage(hote: &str) -> bool {
+    let hote = hote.trim().trim_end_matches('.').to_ascii_lowercase();
+    // `[::1]:8888`, `[::1]`, `localhost:8888`, `127.0.0.1:8888`.
+    let nom = if let Some(reste) = hote.strip_prefix('[') {
+        // `[::1]` ou `[::1]:port` ; un crochet non refermé n'est rien.
+        match reste.split_once(']') {
+            Some((nom, apres)) if apres.is_empty() || apres.starts_with(':') => nom,
+            _ => return false,
+        }
+    } else {
+        hote.rsplit_once(':')
+            .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
+            .map_or(hote.as_str(), |(nom, _)| nom)
+    };
+    let nom = nom.trim_end_matches('.');
+    nom == "localhost"
+        || nom
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(adresse_de_cette_machine)
+}
+
+/// La requête vient-elle de cette machine, côté en-têtes ? Aucun en-tête de
+/// mandataire inverse, aucun mandataire déclaré, et un `Host` (ou l'autorité
+/// de l'URI, HTTP/2) qui nomme le bouclage.
+///
+/// Sans `Host` ni autorité en HTTP/1.1 (client minimal), la réponse reste
+/// oui : un navigateur en envoie toujours un. HTTP/1.0 est refusé plus haut
+/// ([`appel_depuis_cette_machine`]). Couvert : nginx avec les en-têtes
+/// `X-Forwarded-*` habituels, ou en HTTP/1.0 par défaut ; Caddy, Traefik,
+/// proxy DSM, Tailscale Serve, cloudflared (en-têtes). NON distinguable :
+/// HAProxy en mode TCP, `socat`, relais TCP qui ne posent aucun en-tête et
+/// transmettent un `Host` de bouclage en HTTP/1.1 — déclarer alors
+/// `TUNE_ALLOWED_HOSTS`, ce qui retire la preuve du bouclage (il faut
+/// l'authentification).
+pub fn requete_de_cette_machine(entetes: &axum::http::HeaderMap, autorite: Option<&str>) -> bool {
+    if derriere_un_mandataire(entetes) {
+        return false;
+    }
+    let hote = entetes
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .or(autorite);
+    hote.is_none_or(hote_de_bouclage)
+}
+
+/// La requête est-elle passée par un mandataire inverse, ou le serveur
+/// est-il déclaré servi derrière l'un d'eux (`TUNE_ALLOWED_ORIGINS`,
+/// `TUNE_ALLOWED_HOSTS`) ? Alors le bouclage n'est pas une preuve (même
+/// principe que [`crate::routes::appliance::bouclage_fiable`]).
+pub fn derriere_un_mandataire(entetes: &axum::http::HeaderMap) -> bool {
+    ENTETES_DE_MANDATAIRE
+        .iter()
+        .any(|e| entetes.contains_key(*e))
+        || mandataire_declare(
+            std::env::var(crate::garde_origine::VARIABLE_ORIGINES)
+                .ok()
+                .as_deref(),
+            std::env::var(crate::garde_origine::VARIABLE_HOTES)
+                .ok()
+                .as_deref(),
+        )
+}
+
+/// Une des deux variables qui déclarent un mandataire est-elle renseignée ?
+pub fn mandataire_declare(origines: Option<&str>, hotes: Option<&str>) -> bool {
+    [origines, hotes]
+        .into_iter()
+        .flatten()
+        .any(|v| v.split(',').any(|x| !x.trim().is_empty()))
 }
 
 /// L'adresse réelle de la connexion, si la couche de service l'a posée.
@@ -787,11 +927,13 @@ impl FromRequestParts<AppState> for AdminOuCetteMachine {
             .unwrap_or_else(|| "unknown".to_string());
         let relaye = crate::garde_du_relais::requete_relayee(&parts.headers);
         let relais_port_80 = !crate::routes::appliance::bouclage_fiable();
+        let mandataire = derriere_un_mandataire(&parts.headers);
         tracing::warn!(
             chemin = %parts.uri.path(),
             %appelant,
             relaye,
             relais_port_80,
+            mandataire,
             "action_machine_refusee_hors_de_cette_machine_sans_authentification"
         );
         // Le refus dit ce que le serveur a vu : l'exploitant comprend tout de
@@ -836,6 +978,11 @@ pub fn router() -> Router<AppState> {
         .route("/token", post(create_token))
         .route("/api-key", get(get_api_key).post(generate_api_key))
         .route("/config", get(auth_config).post(set_auth_config))
+        .route(
+            "/activation",
+            get(etat_activation).post(activer_l_authentification),
+        )
+        .route("/activation/code", post(demander_un_code_d_activation))
 }
 
 // ---------------------------------------------------------------------------
@@ -851,6 +998,7 @@ struct RegisterRequest {
 
 async fn register(
     State(state): State<AppState>,
+    DepuisCetteMachine(cette_machine): DepuisCetteMachine,
     appelant: Option<AuthUser>,
     headers: axum::http::HeaderMap,
     Json(body): Json<RegisterRequest>,
@@ -862,6 +1010,21 @@ async fn register(
     let settings = SettingsRepo::with_backend(state.backend.clone());
     if let Err(resp) = ensure_admin_if_auth_enabled(&settings, appelant.as_ref()) {
         return resp;
+    }
+    // Authentification coupée : un compte créé par un tiers du réseau
+    // survivrait à l'activation. Seulement depuis cette machine (mêmes
+    // règles que `AdminOuCetteMachine`, mandataire inverse compris).
+    if !authentification_active(&state) && !cette_machine {
+        tracing::warn!("inscription_refusee_hors_machine_sans_authentification");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "auth_required",
+                "reason": "not_local",
+                "message": "While authentication is disabled, accounts can only be created from this machine (localhost). Enable authentication first.",
+            })),
+        )
+            .into_response();
     }
     let cree_par_un_administrateur = appelant.is_some();
     let username = body.username.trim().to_string();
@@ -1002,9 +1165,10 @@ fn bouclage_de_l_operateur(ip: std::net::IpAddr) -> bool {
     adresse_de_cette_machine(ip) && crate::routes::appliance::bouclage_fiable()
 }
 
-fn login_rate_limited(ip: std::net::IpAddr) -> bool {
-    // The local operator is never locked out.
-    if bouclage_de_l_operateur(ip) {
+fn login_rate_limited(ip: std::net::IpAddr, operateur: bool) -> bool {
+    // The local operator is never locked out (never behind a reverse proxy:
+    // every proxied client would share its loopback address).
+    if operateur {
         return false;
     }
     let mut map = LOGIN_FAILURES.lock().unwrap();
@@ -1018,8 +1182,8 @@ fn login_rate_limited(ip: std::net::IpAddr) -> bool {
     }
 }
 
-fn record_login_failure(ip: std::net::IpAddr) {
-    if bouclage_de_l_operateur(ip) {
+fn record_login_failure(ip: std::net::IpAddr, operateur: bool) {
+    if operateur {
         return;
     }
     let mut map = LOGIN_FAILURES.lock().unwrap();
@@ -1056,13 +1220,19 @@ fn session_cookie(token: &str, headers: &axum::http::HeaderMap) -> String {
 async fn login(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    version: axum::http::Version,
     headers: axum::http::HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> impl IntoResponse {
     // Une requête relayée est comptée sous une adresse qui n'est jamais en
     // boucle locale : la limite de tentatives s'applique.
     let ip = crate::garde_du_relais::adresse_de_l_appelant(peer.ip(), &headers);
-    if login_rate_limited(ip) {
+    // L'opérateur de CETTE machine : bouclage réel, ni mandataire inverse ni
+    // `Host` d'un autre nom.
+    let operateur = bouclage_de_l_operateur(ip)
+        && version != axum::http::Version::HTTP_10
+        && requete_de_cette_machine(&headers, None);
+    if login_rate_limited(ip, operateur) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(json!({"error": "too many login attempts, try again later"})),
@@ -1093,7 +1263,7 @@ async fn login(
     let (profile_id, old_hash, new_hash, is_admin) = match row {
         Some(r) => r,
         None => {
-            record_login_failure(ip);
+            record_login_failure(ip, operateur);
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({"error": "invalid credentials"})),
@@ -1114,7 +1284,7 @@ async fn login(
         .flatten()
         .map(|v| v == "true")
         .unwrap_or(false);
-    let passwordless_default_allowed = !auth_enabled || bouclage_de_l_operateur(ip);
+    let passwordless_default_allowed = !auth_enabled || operateur;
 
     // Try argon2 hash first (password_hash_v2), then fall back to SHA-256 (password_hash)
     let valid_v2 = if let Some(ref h) = new_hash {
@@ -1144,7 +1314,7 @@ async fn login(
     };
 
     if !valid {
-        record_login_failure(ip);
+        record_login_failure(ip, operateur);
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "invalid credentials"})),
@@ -1153,9 +1323,15 @@ async fn login(
     }
     clear_login_failures(ip);
 
-    // If logged in with old SHA-256 hash, upgrade to argon2
+    // If logged in with old SHA-256 hash, upgrade to argon2. Le profil
+    // `default` sans mot de passe n'est réclamé (mot de passe enregistré) que
+    // par l'opérateur de cette machine : depuis le réseau, authentification
+    // coupée, la session est ouverte mais le compte administrateur n'est pas
+    // pris.
+    let ancien_hachage = old_hash.as_deref().is_some_and(|h| !h.is_empty());
     if !valid_v2
         && valid
+        && (ancien_hachage || operateur)
         && let Ok(upgraded) = hash_password(&body.password)
     {
         state
@@ -1348,6 +1524,7 @@ struct SetAuthConfig {
 
 async fn set_auth_config(
     State(state): State<AppState>,
+    DepuisCetteMachine(cette_machine): DepuisCetteMachine,
     user: Option<AuthUser>,
     Json(body): Json<SetAuthConfig>,
 ) -> Response {
@@ -1355,13 +1532,28 @@ async fn set_auth_config(
     if let Err(resp) = ensure_admin_if_auth_enabled(&settings, user.as_ref()) {
         return resp;
     }
+    let etait_active = authentification_active(&state);
+    // Authentification coupée, activer ou poser le secret de signature décide
+    // qui contrôlera le serveur : seulement depuis cette machine. Depuis un
+    // autre appareil, c'est `POST /auth/activation` avec le code du journal.
+    let veut_activer = body.auth_enabled == Some(true);
+    let pose_un_secret = body.jwt_secret.as_deref().is_some_and(|s| !s.is_empty());
+    if !etait_active && (veut_activer || pose_un_secret) && !cette_machine {
+        tracing::warn!("activation_authentification_refusee_hors_machine");
+        return refus_activation_hors_machine();
+    }
     if let Some(enabled) = body.auth_enabled {
         settings
             .set("auth_enabled", if enabled { "true" } else { "false" })
             .ok();
 
-        // Auto-generate JWT secret when enabling auth
-        if enabled {
+        if enabled && !etait_active {
+            // Les jetons et la clé émis pendant que tout était ouvert ne
+            // survivent pas à l'activation.
+            renouveler_les_secrets(&settings);
+            renouveler_le_jeton_du_pont(&state);
+            state.fermeture_websockets.send_modify(|n| *n += 1);
+        } else if enabled {
             get_or_create_jwt_secret(&settings);
         }
     }
@@ -1378,6 +1570,563 @@ async fn set_auth_config(
         .map(|v| v == "true")
         .unwrap_or(false);
     Json(json!({ "auth_enabled": enabled })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Activation de l'authentification depuis l'interface
+// ---------------------------------------------------------------------------
+
+/// L'appel vient-il de cette machine ? Même lecture que
+/// [`AdminOuCetteMachine`] (adresse réelle de la connexion, jamais relayée),
+/// sans refus : le gestionnaire décide.
+pub struct DepuisCetteMachine(pub bool);
+
+impl FromRequestParts<AppState> for DepuisCetteMachine {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(appel_depuis_cette_machine(parts, state).await))
+    }
+}
+
+/// Code d'activation à usage unique, écrit sur la CONSOLE du serveur
+/// seulement (voir [`emettre_code_activation`]).
+pub struct CodeActivation {
+    code: String,
+    emis: std::time::Instant,
+    essais_rates: u32,
+}
+
+/// L'état du code d'activation : le code en cours, la dernière émission et les
+/// échecs comptés par adresse.
+#[derive(Default)]
+pub struct EtatCodeActivation {
+    en_cours: Option<CodeActivation>,
+    derniere_emission: Option<std::time::Instant>,
+    echecs_par_ip: std::collections::HashMap<std::net::IpAddr, (u32, std::time::Instant)>,
+}
+
+/// Durée de vie d'un code d'activation.
+pub const DUREE_CODE_ACTIVATION: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// Essais faux tolérés avant que le code soit détruit.
+pub const ESSAIS_CODE_ACTIVATION: u32 = 5;
+/// Au plus une émission par minute.
+pub const DELAI_ENTRE_EMISSIONS: std::time::Duration = std::time::Duration::from_secs(60);
+/// Essais faux tolérés par adresse, tous codes confondus, sur une heure.
+pub const ECHECS_PAR_ADRESSE: u32 = 8;
+const FENETRE_ECHECS: std::time::Duration = std::time::Duration::from_secs(3600);
+/// Longueur du code (31 symboles : environ 50 bits).
+const LONGUEUR_CODE: usize = 10;
+
+/// Lettres et chiffres sans ambiguïté de lecture (ni 0/O, ni 1/I/L).
+const ALPHABET_CODE: &[u8] = b"ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+
+/// Tirage SANS BIAIS : octets du générateur du système (`uuid` v4 lit
+/// `getrandom`), en écartant les deux octets que la v4 fixe en partie
+/// (version, variante) et, par rejet, les valeurs au-delà du plus grand
+/// multiple de 31.
+fn nouveau_code_activation() -> String {
+    let limite = (256 / ALPHABET_CODE.len() * ALPHABET_CODE.len()) as u8;
+    let mut code = String::with_capacity(LONGUEUR_CODE);
+    while code.len() < LONGUEUR_CODE {
+        let octets = *uuid::Uuid::new_v4().as_bytes();
+        for (i, o) in octets.iter().enumerate() {
+            if i == 6 || i == 8 || *o >= limite {
+                continue;
+            }
+            code.push(ALPHABET_CODE[*o as usize % ALPHABET_CODE.len()] as char);
+            if code.len() == LONGUEUR_CODE {
+                break;
+            }
+        }
+    }
+    code
+}
+
+/// Normalise une saisie : majuscules, sans espaces ni tirets.
+fn normaliser_code(saisi: &str) -> String {
+    saisi
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .flat_map(char::to_uppercase)
+        .collect()
+}
+
+/// Ce que donne une demande de code.
+#[derive(Debug, PartialEq, Eq)]
+pub enum EmissionCode {
+    /// Un nouveau code est sur la console.
+    Emis,
+    /// Un code encore valable est déjà en cours : il n'est pas remplacé et
+    /// ses essais ne sont pas remis à zéro.
+    DejaEnCours,
+    /// Moins d'une minute depuis la dernière émission.
+    TropTot,
+}
+
+fn code_valable(c: &CodeActivation) -> bool {
+    c.emis.elapsed() <= DUREE_CODE_ACTIVATION && c.essais_rates < ESSAIS_CODE_ACTIVATION
+}
+
+/// Émet un code, s'il n'y en a pas déjà un de valable, et l'écrit sur la
+/// CONSOLE du serveur (sortie d'erreur : `docker logs`, `journalctl -u tune`,
+/// en SSH sur Tune OS ; sous Windows sans console, le fichier journal) — jamais dans le journal de `tracing`, que l'API sert
+/// (`/system/logs`, rapports de bogue). La ligne porte
+/// [`tune_core::confidentialite::MARQUEUR_CODE_ACTIVATION`], que tous les
+/// lecteurs de journaux retirent (cas d'une sortie d'erreur redirigée dans le
+/// fichier journal).
+pub fn emettre_code_activation(state: &AppState) -> EmissionCode {
+    let mut etat = state.code_activation_auth.lock().unwrap();
+    if etat.en_cours.as_ref().is_some_and(code_valable) {
+        return EmissionCode::DejaEnCours;
+    }
+    if etat
+        .derniere_emission
+        .is_some_and(|t| t.elapsed() < DELAI_ENTRE_EMISSIONS)
+    {
+        return EmissionCode::TropTot;
+    }
+    let code = nouveau_code_activation();
+    etat.en_cours = Some(CodeActivation {
+        code: code.clone(),
+        emis: std::time::Instant::now(),
+        essais_rates: 0,
+    });
+    etat.derniere_emission = Some(std::time::Instant::now());
+    drop(etat);
+    eprintln!(
+        "{} {code} — Tune : code d'activation de l'authentification, usage unique, {} min. \
+         Saisissez-le dans Réglages > Système > Authentification. / One-time code to enable \
+         authentication in Settings > System > Authentication.",
+        tune_core::confidentialite::MARQUEUR_CODE_ACTIVATION,
+        DUREE_CODE_ACTIVATION.as_secs() / 60,
+    );
+    tracing::warn!("auth_activation_code_ecrit_sur_la_console");
+    // Windows sans console (`lancement_sans_console`) : la sortie d'erreur
+    // ne va nulle part. Le code part aussi dans le fichier journal, que seul
+    // l'exploitant de la machine lit ; tous les lecteurs de l'API retirent
+    // la ligne (marqueur).
+    #[cfg(windows)]
+    tracing::warn!(
+        "{} {} (Windows : fichier journal tune-server.log)",
+        tune_core::confidentialite::MARQUEUR_CODE_ACTIVATION,
+        code,
+    );
+    EmissionCode::Emis
+}
+
+/// Le code en cours, comme l'exploitant le lit sur la console. Pour les
+/// épreuves seulement : aucune route ne le rend.
+#[doc(hidden)]
+pub fn code_activation_en_cours(state: &AppState) -> Option<String> {
+    let etat = state.code_activation_auth.lock().unwrap();
+    etat.en_cours
+        .as_ref()
+        .filter(|c| code_valable(c))
+        .map(|c| c.code.clone())
+}
+
+/// Pour les épreuves : oublier le délai d'une minute entre deux émissions.
+#[doc(hidden)]
+pub fn oublier_le_delai_d_emission(state: &AppState) {
+    state.code_activation_auth.lock().unwrap().derniere_emission = None;
+}
+
+enum VerdictCode {
+    Juste,
+    Faux,
+    /// Trop d'échecs depuis cette adresse.
+    Bloque,
+}
+
+/// Vérifie un code saisi depuis `adresse`. Juste : consommé. Faux : compté
+/// pour le code ET pour l'adresse ; le code est détruit au bout de
+/// [`ESSAIS_CODE_ACTIVATION`] essais, l'adresse bloquée au bout de
+/// [`ECHECS_PAR_ADRESSE`] échecs sur une heure.
+fn verifier_code_activation(
+    state: &AppState,
+    adresse: std::net::IpAddr,
+    saisi: &str,
+) -> VerdictCode {
+    let mut etat = state.code_activation_auth.lock().unwrap();
+    let EtatCodeActivation {
+        en_cours,
+        echecs_par_ip,
+        ..
+    } = &mut *etat;
+    echecs_par_ip.retain(|_, (_, depuis)| depuis.elapsed() < FENETRE_ECHECS);
+    if echecs_par_ip
+        .get(&adresse)
+        .is_some_and(|(n, _)| *n >= ECHECS_PAR_ADRESSE)
+    {
+        return VerdictCode::Bloque;
+    }
+    let juste = match en_cours.as_ref().filter(|c| code_valable(c)) {
+        Some(c) => {
+            let saisi = normaliser_code(saisi);
+            let attendu = c.code.as_bytes();
+            let propose = saisi.as_bytes();
+            // Comparaison en temps constant ; longueurs comparées en `usize`.
+            let mut difference: u8 = u8::from(attendu.len() != propose.len());
+            for (i, a) in attendu.iter().enumerate() {
+                difference |= a ^ propose.get(i).copied().unwrap_or(0);
+            }
+            difference == 0
+        }
+        None => false,
+    };
+    if juste {
+        *en_cours = None;
+        return VerdictCode::Juste;
+    }
+    if let Some(c) = en_cours.as_mut() {
+        c.essais_rates += 1;
+        if !code_valable(c) {
+            *en_cours = None;
+        }
+    }
+    let entree = echecs_par_ip
+        .entry(adresse)
+        .or_insert((0, std::time::Instant::now()));
+    entree.0 += 1;
+    VerdictCode::Faux
+}
+
+/// Nouveau secret de signature, clé d'API effacée, connexion SSO en attente
+/// oubliée : rien de ce qui a été obtenu pendant que tout était ouvert ne
+/// survit à l'activation.
+fn renouveler_les_secrets(settings: &SettingsRepo) {
+    settings
+        .set("jwt_secret", &uuid::Uuid::new_v4().to_string())
+        .ok();
+    settings.delete("api_key").ok();
+    for cle in [
+        "mozaik_pkce_pending",
+        "mozaik_pkce_pending_at",
+        "mozaik_redirect_uri_pending",
+    ] {
+        settings.delete(cle).ok();
+    }
+}
+
+fn refus_activation_hors_machine() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "activation_code_required",
+            "reason": "not_local",
+            "message": "Enabling authentication from another device requires the one-time code written to the server console (POST /auth/activation/code; docker logs, journalctl -u tune — on Tune OS over SSH —, or the log file on Windows), or a call from this machine.",
+        })),
+    )
+        .into_response()
+}
+
+fn refus_deja_active() -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({
+            "error": "auth_already_enabled",
+            "message": "Authentication is already enabled; the administrator account is managed by signing in.",
+        })),
+    )
+        .into_response()
+}
+
+/// Le compte administrateur : le premier profil administrateur (le profil
+/// `default`, id 1, sur une installation neuve).
+fn compte_administrateur(state: &AppState) -> Option<(i64, String)> {
+    state
+        .backend
+        .query_one(
+            "SELECT id, username FROM profiles WHERE is_admin = 1 ORDER BY id LIMIT 1",
+            &[],
+        )
+        .ok()
+        .flatten()
+        .and_then(|r| {
+            Some((
+                r.first().and_then(|v| v.as_i64())?,
+                r.get(1).and_then(|v| v.as_string())?,
+            ))
+        })
+}
+
+/// Les comptes qui peuvent ouvrir une session — un mot de passe enregistré,
+/// ou un compte Mozaiklabs lié (SSO) — et le compte administrateur : ce que
+/// l'écran d'activation propose de revoir. Ni l'administrateur ni le
+/// propriétaire de la licence ne sont supprimables.
+fn comptes_existants(state: &AppState, admin: Option<i64>) -> Vec<Value> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let proprietaire = tune_core::cloud::proprietaire::proprietaire(&settings);
+    state
+        .backend
+        .query_many(
+            "SELECT id, username, created_at, is_admin, password_hash, password_hash_v2, email \
+             FROM profiles ORDER BY id",
+            &[],
+        )
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| {
+            let id = r.first().and_then(|v| v.as_i64())?;
+            let nom = r.get(1).and_then(|v| v.as_string())?;
+            let cree = r.get(2).and_then(|v| v.as_string());
+            let est_admin = r.get(3).and_then(|v| v.as_i64()).unwrap_or(0) != 0
+                || r.get(3).and_then(|v| v.as_bool()).unwrap_or(false);
+            let a_un_mot_de_passe = [r.get(4), r.get(5)]
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_string())
+                .any(|h| !h.is_empty());
+            let sso = r
+                .get(6)
+                .and_then(|v| v.as_string())
+                .is_some_and(|e| !e.trim().is_empty());
+            let administrateur = est_admin || Some(id) == admin;
+            let licence = Some(id) == proprietaire;
+            if !a_un_mot_de_passe && !sso && !administrateur {
+                // Un profil d'écoute sans mot de passe ni compte lié n'ouvre
+                // aucune session.
+                return None;
+            }
+            Some(json!({
+                "id": id,
+                "username": nom,
+                "created_at": cree,
+                "role": if administrateur { "admin" } else { "user" },
+                "kind": if sso && !a_un_mot_de_passe { "sso" } else { "password" },
+                "license_owner": licence,
+                "deletable": !administrateur && !licence,
+            }))
+        })
+        .collect()
+}
+
+/// `GET /auth/activation` — ce que l'écran d'activation doit afficher.
+async fn etat_activation(
+    State(state): State<AppState>,
+    DepuisCetteMachine(cette_machine): DepuisCetteMachine,
+) -> Json<Value> {
+    let active = authentification_active(&state);
+    Json(json!({
+        "auth_enabled": active,
+        "from_this_machine": cette_machine,
+        "code_required": !active && !cette_machine,
+        "admin_username": if active { None } else { compte_administrateur(&state).map(|(_, u)| u) },
+        "accounts": if active {
+            Vec::new()
+        } else {
+            comptes_existants(&state, compte_administrateur(&state).map(|(id, _)| id))
+        },
+        "min_password_length": 8,
+    }))
+}
+
+/// `POST /auth/activation/code` — écrit un code à usage unique sur la console
+/// du serveur. Rien n'est rendu : le code ne se lit que là.
+async fn demander_un_code_d_activation(State(state): State<AppState>) -> Response {
+    if authentification_active(&state) {
+        return refus_deja_active();
+    }
+    let reponse = |statut: &str| {
+        Json(json!({
+            "status": statut,
+            "where": "server_console",
+            "expires_in": DUREE_CODE_ACTIVATION.as_secs(),
+            "max_attempts": ESSAIS_CODE_ACTIVATION,
+        }))
+        .into_response()
+    };
+    match emettre_code_activation(&state) {
+        EmissionCode::Emis => reponse("code_written_to_server_console"),
+        EmissionCode::DejaEnCours => reponse("code_already_pending"),
+        EmissionCode::TropTot => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(json!({
+                "error": "activation_code_too_soon",
+                "retry_after": DELAI_ENTRE_EMISSIONS.as_secs(),
+            })),
+        )
+            .into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ActivationRequest {
+    password: String,
+    #[serde(default)]
+    code: Option<String>,
+    /// Comptes à supprimer avant l'activation (ceux qu'on ne reconnaît pas).
+    /// Jamais l'administrateur ni le propriétaire de la licence.
+    #[serde(default)]
+    delete_accounts: Vec<i64>,
+}
+
+/// Une seule activation à la fois : l'état est relu sous ce verrou.
+static VERROU_ACTIVATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// `POST /auth/activation` — pose le mot de passe du compte administrateur
+/// et active l'authentification. Seulement tant qu'elle est coupée, et
+/// seulement depuis cette machine ou avec le code de la console.
+async fn activer_l_authentification(
+    State(state): State<AppState>,
+    DepuisCetteMachine(cette_machine): DepuisCetteMachine,
+    ConnectInfo(pair): ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<ActivationRequest>,
+) -> Response {
+    if authentification_active(&state) {
+        return refus_deja_active();
+    }
+    if body.password.chars().count() < 8 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "password_too_short",
+                "message": "password must be at least 8 characters",
+            })),
+        )
+            .into_response();
+    }
+    let Some((id, nom)) = compte_administrateur(&state) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": "no_admin_profile"})),
+        )
+            .into_response();
+    };
+    // Les comptes à supprimer : seulement des comptes listés par l'écran,
+    // jamais l'administrateur ni le propriétaire de la licence. Validé AVANT
+    // de consommer le code : une liste fausse ne le brûle pas.
+    let supprimables: std::collections::HashSet<i64> = comptes_existants(&state, Some(id))
+        .iter()
+        .filter(|c| c["deletable"] == true)
+        .filter_map(|c| c["id"].as_i64())
+        .collect();
+    if let Some(intrus) = body
+        .delete_accounts
+        .iter()
+        .find(|i| **i == id || !supprimables.contains(i))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "account_not_deletable",
+                "id": intrus,
+            })),
+        )
+            .into_response();
+    }
+    if !cette_machine {
+        let Some(code) = body.code.as_deref().filter(|c| !c.trim().is_empty()) else {
+            return refus_activation_hors_machine();
+        };
+        let adresse = crate::garde_du_relais::adresse_de_l_appelant(pair.ip(), &headers);
+        match verifier_code_activation(&state, adresse, code) {
+            VerdictCode::Juste => {}
+            VerdictCode::Faux => {
+                tracing::warn!("activation_authentification_code_refuse");
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(json!({
+                        "error": "activation_code_invalid",
+                        "message": "Invalid or expired activation code.",
+                    })),
+                )
+                    .into_response();
+            }
+            VerdictCode::Bloque => {
+                tracing::warn!("activation_authentification_adresse_bloquee");
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({
+                        "error": "activation_attempts_exceeded",
+                        "message": "Too many wrong activation codes from this address; try again later.",
+                    })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    let hachage = match hash_password(&body.password) {
+        Ok(h) => h,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("password hashing failed: {e}")})),
+            )
+                .into_response();
+        }
+    };
+
+    // Section critique, sans `await` : une seule activation, l'état relu.
+    let (token, supprimes) = {
+        let _verrou = VERROU_ACTIVATION
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if authentification_active(&state) {
+            return refus_deja_active();
+        }
+        use tune_core::db::backend::ToSqlValue;
+        if let Err(e) = state.backend.execute(
+            "UPDATE profiles SET password_hash_v2 = ?, password_hash = NULL WHERE id = ?",
+            &[&hachage as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+        ) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("failed to set password: {e}")})),
+            )
+                .into_response();
+        }
+        let mut supprimes = Vec::new();
+        let profils = tune_core::db::profile_repo::ProfileRepo::with_backend(state.backend.clone());
+        for compte in &body.delete_accounts {
+            match profils.delete(*compte) {
+                Ok(()) => supprimes.push(*compte),
+                Err(e) => {
+                    tracing::warn!(compte, error = %e, "activation_suppression_compte_echec")
+                }
+            }
+        }
+        if !supprimes.is_empty() {
+            tracing::warn!(comptes = ?supprimes, "activation_comptes_supprimes");
+        }
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        renouveler_les_secrets(&settings);
+        renouveler_le_jeton_du_pont(&state);
+        settings.set("auth_enabled", "true").ok();
+        // Un code encore en attente ne sert plus à rien.
+        state.code_activation_auth.lock().unwrap().en_cours = None;
+        let secret = get_or_create_jwt_secret(&settings);
+        (sign_jwt(id, "admin", &secret).ok(), supprimes)
+    };
+    // Les WebSocket ouvertes pendant que tout était ouvert se ferment : le
+    // client se reconnecte avec une session.
+    state.fermeture_websockets.send_modify(|n| *n += 1);
+    tracing::info!(cette_machine, admin = %nom, "authentification_activee");
+
+    let Some(token) = token else {
+        return Json(json!({"auth_enabled": true, "username": nom, "deleted_accounts": supprimes}))
+            .into_response();
+    };
+    let mut response = Json(json!({
+        "auth_enabled": true,
+        "username": nom,
+        "deleted_accounts": supprimes,
+        "token": token,
+        "token_type": "Bearer",
+        "expires_in": 86400,
+        "role": "admin",
+    }))
+    .into_response();
+    let cookie = session_cookie(&token, &headers);
+    response
+        .headers_mut()
+        .insert(axum::http::header::SET_COOKIE, cookie.parse().unwrap());
+    response
 }
 
 #[cfg(test)]

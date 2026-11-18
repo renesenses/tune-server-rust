@@ -465,7 +465,11 @@ pub async fn etat(
         statut.track_artist = None;
         statut.ended_naturally = false;
     }
-    Ok(EtatSortieDistante { tenue, statut })
+    Ok(EtatSortieDistante {
+        tenue,
+        statut,
+        peripherique_rendu_en_pause: tenue && sortie.device_released_on_pause(),
+    })
 }
 
 #[cfg(test)]

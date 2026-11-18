@@ -53,6 +53,12 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
     // (voir `enrich_tentatives`).
     include_str!("../../migrations/enrich_tentatives.sql"),
     super::enrich_tentatives::SQL_INDEX,
+    // #8958 — alertes de « Albums douteux » marquées normales, sans script
+    // numéroté (voir `alertes_douteuses_ignorees`).
+    include_str!("../../migrations/alertes_douteuses_ignorees.sql"),
+    // #8487 — titres diffusés par les radios, sans script numéroté (voir
+    // `radio_titres_diffuses`).
+    include_str!("../../migrations/radio_titres_diffuses.sql"),
     "CREATE TABLE IF NOT EXISTS file_first_seen (file_path TEXT PRIMARY KEY, first_seen_at DOUBLE PRECISION NOT NULL, created_at DOUBLE PRECISION)",
     "CREATE SEQUENCE IF NOT EXISTS streaming_favorites_id_seq",
     "CREATE TABLE IF NOT EXISTS streaming_favorites (\
