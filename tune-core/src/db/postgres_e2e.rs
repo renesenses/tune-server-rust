@@ -1233,7 +1233,7 @@ async fn pg_6285_filtre_et_regles_du_verdict_hires() {
     .await
     .expect("la migration 093 doit se rejouer");
     let _ = db.execute("DELETE FROM hires_verifications", &[]);
-    for album in 1..=7i64 {
+    for album in 1..=10i64 {
         db.execute(
             "INSERT INTO albums (id, title) VALUES (?, 'a')",
             &[&album as &dyn ToSqlValue],
@@ -1274,6 +1274,47 @@ async fn pg_6285_filtre_et_regles_du_verdict_hires() {
             .unwrap();
         }
     }
+    // #9035 — la règle de la moitié : album 8 = 2 douteuses sur 10 (pas
+    // douteux), album 9 = 6 sur 10 (douteux).
+    for (album, douteuses) in [(8i64, 2i64), (9, 6)] {
+        for i in 0..10i64 {
+            let piste = album * 100 + i;
+            let chemin = format!("/m/{piste}.flac");
+            db.execute(
+                "INSERT INTO tracks (id, album_id, title, file_path, format, source, duration_ms) \
+                 VALUES (?, ?, 't', ?, 'flac', 'local', 60000)",
+                &[&piste as &dyn ToSqlValue, &album, &chemin],
+            )
+            .unwrap();
+            let (verdict, raison) = if i < douteuses {
+                ("douteux".to_string(), Some("coupure_spectrale".to_string()))
+            } else {
+                ("verifie".to_string(), None)
+            };
+            db.execute(
+                "INSERT INTO hires_verifications (track_id, verdict, raison) VALUES (?, ?, ?)",
+                &[&piste as &dyn ToSqlValue, &verdict, &raison],
+            )
+            .unwrap();
+        }
+    }
+    // #9067 — album 10 : un CD 16/44,1 rangé « douteux » avant #9067 ; il
+    // se lit conforme et n'apparaît jamais sous « Hi-Res douteux ».
+    for piste in [1000i64, 1001] {
+        let chemin = format!("/m/{piste}.flac");
+        db.execute(
+            "INSERT INTO tracks (id, album_id, title, file_path, format, source, duration_ms) \
+             VALUES (?, 10, 't', ?, 'flac', 'local', 60000)",
+            &[&piste as &dyn ToSqlValue, &chemin],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO hires_verifications (track_id, verdict, raison, sample_rate, bits_declares) \
+             VALUES (?, 'douteux', 'coupure_de_codec', 44100, 16)",
+            &[&piste as &dyn ToSqlValue],
+        )
+        .unwrap();
+    }
     let ids_de = |sql: String| -> Vec<i64> {
         db.query_many(&sql, &[])
             .unwrap_or_else(|e| panic!("{e}\n{sql}"))
@@ -1281,7 +1322,7 @@ async fn pg_6285_filtre_et_regles_du_verdict_hires() {
             .filter_map(|r| r[0].as_i64())
             .collect()
     };
-    let ids: Vec<i64> = (1..=7).collect();
+    let ids: Vec<i64> = (1..=10).collect();
     let par_album = pistes_mesurees_par_album(&db, &ids).unwrap();
     for visible in [false, true] {
         for v in [
@@ -1336,13 +1377,25 @@ async fn pg_6285_filtre_et_regles_du_verdict_hires() {
         v.sort();
         v
     };
+    // #9035 — masqué, l'album 8 (2 douteuses sur 10) n'est pas « vérifié ».
     assert_eq!(du_catalogue(&["verifie"], false), vec![1, 6]);
+    assert_eq!(du_catalogue(&["verifie"], true), vec![1, 6, 8]);
     assert!(du_catalogue(&["douteux"], false).is_empty());
-    assert_eq!(du_catalogue(&["verifie", "douteux"], true), vec![1, 3, 6]);
+    assert_eq!(
+        du_catalogue(&["verifie", "douteux"], true),
+        vec![1, 3, 6, 8, 9]
+    );
     assert!(du_catalogue(&["hires"], true).is_empty());
+    assert!(
+        !du_catalogue(&["douteux"], true).contains(&10),
+        "#9067 : un CD n'est pas douteux"
+    );
+    assert!(du_catalogue(&["conforme"], true).contains(&10));
+    // Les pistes des albums 1 à 7 (celles des albums 8 et 9 de #9035 ont
+    // leurs propres témoins ci-dessus).
     let pistes_de = |v, visible| {
         ids_de(format!(
-            "SELECT t.id FROM tracks t WHERE {} ORDER BY t.id",
+            "SELECT t.id FROM tracks t WHERE {} AND t.id < 100 ORDER BY t.id",
             predicat_piste("t.id", v, visible)
         ))
     };

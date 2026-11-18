@@ -1252,6 +1252,10 @@ mod gapless_stage_expiry_tests;
 #[cfg(test)]
 mod radio_metadata_deviceless_tests;
 
+/// #8487 — les titres diffusés notés sous leur station, de bout en bout.
+#[cfg(test)]
+mod titres_diffuses_8487_tests;
+
 /// AutoPlay : suivre la source de ce qu'on ecoute (#1553).
 ///
 /// Sandro, 0.9.70 : en ecoute Qobuz, l'autoplay enchainait des titres LOCAUX,
