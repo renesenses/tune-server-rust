@@ -171,6 +171,68 @@ fn une_piste_en_echec_repete_est_mise_a_reessayer_plus_tard() {
             "piste {id} : reportée, PAS marquée analysée"
         );
     }
+    // Tant qu'elles sont reportées, elles sont COMPTÉES comme telles : la
+    // route en tire `waiting_reason`, la jauge ne reste pas figée sans un mot.
+    assert_eq!(
+        tune_core::audio::embedding_store::deferred_count(&backend, &seuil()),
+        2,
+        "pistes à réessayer plus tard non comptées dans les reports"
+    );
+
+    // Deux reports périmés de plus : au troisième, la piste est abandonnée
+    // (témoin d'analyse sans empreinte, compté en échec), et ne revient plus.
+    for report in 2..=3 {
+        perimer_les_reports(&backend);
+        let mut suite = Vec::new();
+        for _ in 0..3 {
+            suite.push(
+                rt.block_on(tour_de_balayage(&backend, &mut session, || async {
+                    Some(ModeleQuiPanique)
+                })),
+            );
+        }
+        println!("report {report} : {suite:?}");
+        assert_eq!(suite[2], TourDeBalayage::Lot(2), "report {report}");
+    }
+    let fin = rt.block_on(tour_de_balayage(&backend, &mut session, || async {
+        Some(ModeleQuiPanique)
+    }));
+    assert_eq!(
+        fin,
+        TourDeBalayage::RienAAnalyser,
+        "trois reports : la piste ne revient plus toutes les six heures"
+    );
+    for id in ids {
+        assert!(
+            cle(&backend, id, "audio_embed_analyzed").is_some(),
+            "piste {id} : abandonnée, donc marquée traitée (comptée en échec)"
+        );
+        assert_eq!(cle(&backend, id, "audio_embed_retry_later"), None);
+    }
+    assert_eq!(
+        tune_core::audio::embedding_store::deferred_count(&backend, &seuil()),
+        0
+    );
+}
+
+/// Le seuil de report pour l'instant présent.
+fn seuil() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    tune_core::library::local_path::deferral_threshold(now)
+}
+
+/// Faire comme si six heures avaient passé : les reports sont périmés.
+fn perimer_les_reports(backend: &Arc<dyn DbBackend>) {
+    let ancien = tune_core::library::local_path::deferral_stamp(1);
+    backend
+        .execute(
+            "UPDATE track_metadata SET value = ? WHERE key = 'audio_embed_retry_later'",
+            &[&ancien.as_str()],
+        )
+        .unwrap();
 }
 
 #[test]

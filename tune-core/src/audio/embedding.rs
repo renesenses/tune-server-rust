@@ -16,7 +16,7 @@ use ort::session::Session;
 use ort::value::Tensor;
 use tracing::{info, warn};
 
-use crate::db::backend::{DbBackend, SqlValue};
+use crate::db::backend::{DbBackend, SqlValue, ToSqlValue};
 use crate::db::track_metadata_repo::TrackMetadataRepo;
 use crate::library::local_path::{
     LocalPath, deferral_stamp, deferral_threshold, resolve_local_path,
@@ -170,6 +170,49 @@ fn noter_un_echec(track_id: i64) -> bool {
     } else {
         false
     }
+}
+
+/// Reports successifs avant l'abandon d'une piste (#9046) : trois reports de
+/// trois échecs chacun, soit neuf paniques sur au moins douze heures. La piste
+/// reçoit alors le témoin d'analyse sans empreinte — comptée dans
+/// `failed_tracks`, la jauge atteint 100 % — au lieu de revenir toutes les
+/// six heures sans fin.
+const REPORTS_AVANT_ABANDON: u32 = 3;
+
+/// Combien de fois la piste a déjà été reportée après des échecs répétés.
+const RETRY_REPORTS_KEY: &str = "audio_embed_retry_reports";
+
+/// Ce qu'un report après échecs a fait de la piste.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IssueDuReport {
+    /// Écartée jusqu'à péremption du report ; n-ième report.
+    Reportee(u32),
+    /// Trop de reports : marquée traitée sans empreinte.
+    Abandonnee,
+}
+
+/// Reporter une piste en échec répété, ou l'abandonner au
+/// [`REPORTS_AVANT_ABANDON`]-ième report.
+fn reporter_apres_echecs(
+    repo: &TrackMetadataRepo,
+    track_id: i64,
+    now: i64,
+) -> Result<IssueDuReport, String> {
+    let deja = repo
+        .get_all(track_id)?
+        .get(RETRY_REPORTS_KEY)
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(0);
+    let n = deja + 1;
+    if n >= REPORTS_AVANT_ABANDON {
+        repo.set(track_id, SENTINEL, MODEL_ID)?;
+        let _ = repo.delete(track_id, RETRY_LATER_KEY);
+        let _ = repo.delete(track_id, RETRY_REPORTS_KEY);
+        return Ok(IssueDuReport::Abandonnee);
+    }
+    repo.set(track_id, RETRY_REPORTS_KEY, &n.to_string())?;
+    repo.set(track_id, RETRY_LATER_KEY, &deferral_stamp(now))?;
+    Ok(IssueDuReport::Reportee(n))
 }
 
 /// Une piste qui réussit efface ses échecs passés.
@@ -826,8 +869,10 @@ pub async fn analyze_embedding_batch<E: Inference>(
             }
             // Arrêt du serveur : rien d'illisible, la piste sera reprise.
             Ok(false) if arret_demande() => false,
-            // Le témoin ne s'est pas écrit (`audio_embed_sentinel_write_failed`).
-            Ok(false) => true,
+            // Le témoin ne s'est pas écrit (`audio_embed_sentinel_write_failed`) :
+            // une écriture en base ratée est le plus souvent passagère (verrou,
+            // disque), et ne dit rien de la piste. Pas un échec de la piste.
+            Ok(false) => false,
             // L'inférence a paniqué : dit, et la passe continue.
             Err(e) => {
                 warn!(track_id, error = %e, "audio_embed_infer_interrupted");
@@ -836,18 +881,27 @@ pub async fn analyze_embedding_batch<E: Inference>(
         };
         // #9046, piste (b) — sans témoin, la piste revenait à CHAQUE lot.
         if echec && noter_un_echec(track_id) {
-            match repo.set(track_id, RETRY_LATER_KEY, &deferral_stamp(now)) {
-                Ok(()) => {
+            match reporter_apres_echecs(&repo, track_id, now) {
+                Ok(issue) => {
                     reportees_apres_echecs += 1;
                     // Compté comme progrès : la ligne sort de la prochaine
                     // requête, comme une piste reportée faute de chemin.
                     done += 1;
-                    warn!(
-                        track_id,
-                        echecs = ECHECS_AVANT_REPORT,
-                        "audio_embed_echec_repete_reporte — piste en échec répété, \
-                         écartée du balayage et à réessayer plus tard (#9046)"
-                    );
+                    match issue {
+                        IssueDuReport::Reportee(n) => warn!(
+                            track_id,
+                            echecs = ECHECS_AVANT_REPORT,
+                            reports = n,
+                            "audio_embed_echec_repete_reporte — piste en échec répété, \
+                             écartée du balayage et à réessayer plus tard (#9046)"
+                        ),
+                        IssueDuReport::Abandonnee => warn!(
+                            track_id,
+                            reports = REPORTS_AVANT_ABANDON,
+                            "audio_embed_echec_repete_abandonne — piste marquée traitée sans \
+                             empreinte, comptée dans les échecs (#9046)"
+                        ),
+                    }
                 }
                 Err(e) => warn!(
                     track_id,
@@ -1342,47 +1396,102 @@ enum Divergence {
     Perimee,
 }
 
+/// Au-delà de cet intervalle entre deux passages par la garde de lecture,
+/// l'écart n'a pas été observé en continu (pause utilisateur, licence, passe
+/// désactivée…) : son chronomètre repart de zéro. La garde repasse toutes les
+/// 30 s quand la base dit « playing ».
+const ECART_MAX_ENTRE_GARDES: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// Suivre l'écart « base : une zone joue » / « mémoire : aucune ».
 ///
 /// Le sens inverse (la mémoire voit jouer, pas la base) n'est pas un écart à
 /// corriger : `save_play_state` note la mémoire AVANT d'écrire la base, et la
 /// passe cède alors, ce qui est le côté prudent.
-fn suivre_divergence(
-    base_joue: bool,
-    memoire_joue: bool,
-    depuis: &mut Option<std::time::Instant>,
-    maintenant: std::time::Instant,
-    seuil: std::time::Duration,
-) -> Divergence {
-    if !base_joue || memoire_joue {
-        *depuis = None;
-        return Divergence::Aucune;
-    }
-    match *depuis {
-        None => {
-            *depuis = Some(maintenant);
-            Divergence::Debut
+#[derive(Debug, Default)]
+struct SuiviDivergence {
+    /// Depuis quand l'écart est observé sans interruption.
+    depuis: Option<std::time::Instant>,
+    /// Le dernier passage par la garde de lecture.
+    derniere_garde: Option<std::time::Instant>,
+}
+
+impl SuiviDivergence {
+    fn observer(
+        &mut self,
+        base_joue: bool,
+        memoire_joue: bool,
+        maintenant: std::time::Instant,
+        seuil: std::time::Duration,
+    ) -> Divergence {
+        // La garde n'a pas été atteinte depuis longtemps : un écart vu avant
+        // ce trou n'a pas DURÉ, il a été vu deux fois.
+        if self
+            .derniere_garde
+            .is_some_and(|t| maintenant.saturating_duration_since(t) > ECART_MAX_ENTRE_GARDES)
+        {
+            self.depuis = None;
         }
-        Some(t) if maintenant.saturating_duration_since(t) >= seuil => {
-            *depuis = None;
-            Divergence::Perimee
+        self.derniere_garde = Some(maintenant);
+        if !base_joue || memoire_joue {
+            self.depuis = None;
+            return Divergence::Aucune;
         }
-        Some(_) => Divergence::EnCours,
+        match self.depuis {
+            None => {
+                self.depuis = Some(maintenant);
+                Divergence::Debut
+            }
+            Some(t) if maintenant.saturating_duration_since(t) >= seuil => {
+                self.depuis = None;
+                Divergence::Perimee
+            }
+            Some(_) => Divergence::EnCours,
+        }
     }
 }
 
-/// Remettre à `stopped` les zones que la base dit « playing » quand le témoin
-/// en mémoire dit qu'aucune ne joue (#9046). Relit la mémoire juste avant
-/// d'écrire : une zone qui vient de démarrer n'est pas touchée. Le démarrage
-/// du serveur fait déjà ce geste (`startup.rs`) ; il manquait en cours de vie.
-fn corriger_le_temoin_de_lecture_en_base(backend: &Arc<dyn DbBackend>) -> Result<usize, String> {
-    if crate::taches_de_fond::priorite::lecture_en_cours() {
-        return Err("une zone vient de se mettre à jouer".to_string());
-    }
+/// La zone que la base dit « playing » (identifiant et nom), s'il y en a une.
+/// Panne ouverte : une erreur de requête rend `None`, comme `any_zone_playing`.
+fn zone_qui_joue_en_base(backend: &Arc<dyn DbBackend>) -> Option<(i64, String)> {
+    backend
+        .query_one(
+            "SELECT id, name FROM zones WHERE last_play_state = 'playing' LIMIT 1",
+            &[],
+        )
+        .ok()
+        .flatten()
+        .and_then(|cols| {
+            let id = cols.first().and_then(|v| v.as_i64())?;
+            let nom = cols
+                .get(1)
+                .and_then(|v| v.as_string())
+                .unwrap_or_else(|| "?".to_string());
+            Some((id, nom))
+        })
+}
+
+/// Remettre à `stopped` la SEULE zone repérée, si elle est toujours « playing ».
+fn remettre_la_zone_a_stopped(backend: &Arc<dyn DbBackend>, zone_id: i64) -> Result<usize, String> {
     backend.execute(
-        "UPDATE zones SET last_play_state = 'stopped' WHERE last_play_state = 'playing'",
-        &[],
+        "UPDATE zones SET last_play_state = 'stopped' WHERE id = ? AND last_play_state = 'playing'",
+        &[&zone_id as &dyn ToSqlValue],
     )
+}
+
+/// Corriger la base pour la zone repérée quand le témoin en mémoire dit
+/// qu'aucune zone ne joue (#9046). L'écriture se fait SOUS le verrou du témoin
+/// ([`crate::taches_de_fond::priorite::sans_lecture_en_cours`]) : une zone qui
+/// démarre au même instant écrit son « playing » après, jamais avant. Le
+/// démarrage du serveur fait déjà ce geste (`startup.rs`) ; il manquait en
+/// cours de vie.
+fn corriger_le_temoin_de_lecture_en_base(
+    backend: &Arc<dyn DbBackend>,
+    zone_id: i64,
+) -> Result<usize, String> {
+    crate::taches_de_fond::priorite::sans_lecture_en_cours(|| {
+        remettre_la_zone_a_stopped(backend, zone_id)
+    })
+    .unwrap_or_else(|| Err("une zone joue selon le témoin en mémoire".to_string()))
 }
 
 /// Le dernier lot acoustique a-t-il rendu du travail ?
@@ -1652,8 +1761,8 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
         let mut modele_present = false;
         let mut dernier_essai_modele: Option<std::time::Instant> = None;
         // #9046, piste (c) — depuis quand la base dit « une zone joue » alors
-        // que le témoin en mémoire dit « aucune » (voir [`suivre_divergence`]).
-        let mut divergence_depuis: Option<std::time::Instant> = None;
+        // que le témoin en mémoire dit « aucune » (voir [`SuiviDivergence`]).
+        let mut divergence = SuiviDivergence::default();
         loop {
             // #5138 — l'arrêt du serveur termine la passe, session relâchée.
             if arret_demande() {
@@ -1789,36 +1898,43 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                 // de `DIVERGENCE_AVANT_CORRECTION` — la mémoire fait foi, elle
                 // est notée par `save_play_state` quoi que rende l'écriture.
                 let memoire_joue = crate::taches_de_fond::priorite::lecture_en_cours();
-                let mut zone_en_base = crate::audio::replaygain::playing_zone_name(&backend);
-                match suivre_divergence(
+                let mut zone_en_base = zone_qui_joue_en_base(&backend);
+                match divergence.observer(
                     zone_en_base.is_some(),
                     memoire_joue,
-                    &mut divergence_depuis,
                     std::time::Instant::now(),
                     DIVERGENCE_AVANT_CORRECTION,
                 ) {
                     Divergence::Aucune | Divergence::EnCours => {}
                     Divergence::Debut => warn!(
-                        zone = zone_en_base.as_deref().unwrap_or("?"),
+                        zone = zone_en_base.as_ref().map(|z| z.1.as_str()).unwrap_or("?"),
                         correction_apres_s = DIVERGENCE_AVANT_CORRECTION.as_secs(),
                         "audio_embed_temoins_de_lecture_divergents — la base dit qu'une zone joue, \
                          le témoin en mémoire dit qu'aucune ne joue (#9046)"
                     ),
                     Divergence::Perimee => {
-                        let zone = zone_en_base.take().unwrap_or_else(|| "?".to_string());
-                        match corriger_le_temoin_de_lecture_en_base(&backend) {
-                            Ok(n) => warn!(
-                                zone = %zone,
-                                zones_corrigees = n,
-                                apres_s = DIVERGENCE_AVANT_CORRECTION.as_secs(),
-                                "audio_embed_temoin_de_lecture_corrige — base remise à « stopped », \
-                                 la mémoire fait foi (#9046)"
-                            ),
-                            Err(e) => {
-                                // Correction impossible (ou une zone vient de
-                                // se mettre à jouer) : on garde la prudence.
-                                warn!(zone = %zone, error = %e, "audio_embed_temoin_de_lecture_non_corrige");
-                                zone_en_base = Some(zone);
+                        if let Some((id, nom)) = zone_en_base.clone() {
+                            match corriger_le_temoin_de_lecture_en_base(&backend, id) {
+                                Ok(n) => {
+                                    warn!(
+                                        zone = %nom,
+                                        zone_id = id,
+                                        zones_corrigees = n,
+                                        apres_s = DIVERGENCE_AVANT_CORRECTION.as_secs(),
+                                        "audio_embed_temoin_de_lecture_corrige — base remise à « stopped », \
+                                         la mémoire fait foi (#9046)"
+                                    );
+                                    // Une AUTRE zone peut rester « playing » :
+                                    // son écart repartira de zéro.
+                                    zone_en_base = zone_qui_joue_en_base(&backend);
+                                }
+                                // Une zone joue en mémoire, ou l'écriture a
+                                // échoué : on garde la prudence.
+                                Err(e) => warn!(
+                                    zone = %nom,
+                                    error = %e,
+                                    "audio_embed_temoin_de_lecture_non_corrige"
+                                ),
                             }
                         }
                     }
@@ -1833,7 +1949,7 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                         // #9046 — NOMMER la zone qui retient la passe, et dire
                         // quel témoin la voit jouer.
                         info!(
-                            zone = zone_en_base.as_deref().unwrap_or("?"),
+                            zone = zone_en_base.as_ref().map(|z| z.1.as_str()).unwrap_or("?"),
                             temoin_memoire = memoire_joue,
                             temoin_base = zone_en_base.is_some(),
                             "audio_embed_yield_to_playback — zone playing, acoustic analysis paused until playback stops"
@@ -2436,101 +2552,137 @@ mod tests {
     }
 
     /// #9046, piste (c) — l'écart base « joue » / mémoire « aucune » se signale
-    /// une fois, puis se corrige au seuil ; tout accord le remet à zéro.
+    /// une fois, puis se corrige au seuil ; tout accord le remet à zéro, et un
+    /// trou entre deux passages par la garde aussi.
     #[test]
     fn l_ecart_des_temoins_de_lecture_se_signale_puis_se_corrige_9046() {
         use std::time::{Duration, Instant};
         let seuil = Duration::from_secs(600);
+        let pas = Duration::from_secs(30);
         let t0 = Instant::now();
-        let mut depuis = None;
-        assert_eq!(
-            suivre_divergence(false, false, &mut depuis, t0, seuil),
-            Divergence::Aucune
-        );
-        assert_eq!(
-            suivre_divergence(true, true, &mut depuis, t0, seuil),
-            Divergence::Aucune
-        );
+        let mut d = SuiviDivergence::default();
+        assert_eq!(d.observer(false, false, t0, seuil), Divergence::Aucune);
+        assert_eq!(d.observer(true, true, t0, seuil), Divergence::Aucune);
         // La mémoire voit jouer, pas la base : prudent, pas un écart.
+        assert_eq!(d.observer(false, true, t0, seuil), Divergence::Aucune);
+        assert_eq!(d.observer(true, false, t0, seuil), Divergence::Debut);
+        // Observé toutes les 30 s jusqu'au seuil.
+        let mut t = t0;
+        while t + pas < t0 + seuil {
+            t += pas;
+            assert_eq!(d.observer(true, false, t, seuil), Divergence::EnCours);
+        }
         assert_eq!(
-            suivre_divergence(false, true, &mut depuis, t0, seuil),
-            Divergence::Aucune
-        );
-        assert_eq!(
-            suivre_divergence(true, false, &mut depuis, t0, seuil),
-            Divergence::Debut
-        );
-        assert_eq!(
-            suivre_divergence(
-                true,
-                false,
-                &mut depuis,
-                t0 + Duration::from_secs(30),
-                seuil
-            ),
-            Divergence::EnCours
-        );
-        assert_eq!(
-            suivre_divergence(true, false, &mut depuis, t0 + seuil, seuil),
+            d.observer(true, false, t0 + seuil, seuil),
             Divergence::Perimee
         );
-        assert!(depuis.is_none(), "après correction, l'écart repart de zéro");
+        assert!(
+            d.depuis.is_none(),
+            "après correction, l'écart repart de zéro"
+        );
         // Un accord entre-temps efface l'écart.
         assert_eq!(
-            suivre_divergence(true, false, &mut depuis, t0, seuil),
+            d.observer(true, false, t0 + seuil, seuil),
             Divergence::Debut
         );
         assert_eq!(
-            suivre_divergence(true, true, &mut depuis, t0, seuil),
+            d.observer(true, true, t0 + seuil + pas, seuil),
             Divergence::Aucune
-        );
-        assert_eq!(
-            suivre_divergence(true, false, &mut depuis, t0 + seuil, seuil),
-            Divergence::Debut
         );
     }
 
-    /// #9046, piste (c) — la correction remet la base à « stopped », et
-    /// s'abstient si la mémoire voit une zone jouer.
+    /// #9046 — la garde n'a pas été atteinte pendant un long moment (pause
+    /// utilisateur, licence…) : l'écart vu avant le trou ne compte pas.
     #[test]
-    fn la_correction_remet_la_base_a_stopped_sauf_lecture_en_memoire_9046() {
-        let _serialise = ETAT_PAUSE.lock().unwrap_or_else(|e| e.into_inner());
+    fn un_trou_entre_deux_gardes_remet_l_ecart_a_zero_9046() {
+        use std::time::{Duration, Instant};
+        let seuil = Duration::from_secs(600);
+        let t0 = Instant::now();
+        let mut d = SuiviDivergence::default();
+        assert_eq!(d.observer(true, false, t0, seuil), Divergence::Debut);
+        // Vingt minutes sans passer par la garde, puis l'écart à nouveau :
+        // il RECOMMENCE, il n'est pas « périmé ».
+        let apres = t0 + Duration::from_secs(1200);
+        assert_eq!(d.observer(true, false, apres, seuil), Divergence::Debut);
+    }
+
+    /// #9046, piste (c) — la correction ne touche QUE la zone repérée, et
+    /// seulement si elle est encore « playing ». Pas de témoin global ici :
+    /// le verrou du témoin est vérifié dans `taches_de_fond::priorite`.
+    #[test]
+    fn la_correction_ne_touche_que_la_zone_reperee_9046() {
         let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
         db.execute_batch(
             "CREATE TABLE zones (id INTEGER PRIMARY KEY, name TEXT, last_play_state TEXT);
              INSERT INTO zones (id, name, last_play_state)
-                 VALUES (1, 'Salon', 'playing'), (2, 'Bureau', 'paused');",
+                 VALUES (1, 'Salon', 'playing'), (2, 'Bureau', 'playing'), (3, 'Cuisine', 'paused');",
         )
         .unwrap();
         let backend: Arc<dyn DbBackend> = Arc::new(db);
-
-        crate::taches_de_fond::priorite::noter_etat_de_lecture(9_046_002, "playing");
-        assert!(corriger_le_temoin_de_lecture_en_base(&backend).is_err());
+        let etat = |id: i64| {
+            backend
+                .query_one(
+                    "SELECT last_play_state FROM zones WHERE id = ?",
+                    &[&id as &dyn ToSqlValue],
+                )
+                .unwrap()
+                .and_then(|c| c.first().and_then(|v| v.as_string()))
+                .unwrap()
+        };
+        assert_eq!(zone_qui_joue_en_base(&backend).map(|z| z.0), Some(1));
+        assert_eq!(remettre_la_zone_a_stopped(&backend, 1), Ok(1));
+        assert_eq!(etat(1), "stopped");
+        assert_eq!(etat(2), "playing", "une autre zone n'est pas touchée");
+        assert_eq!(etat(3), "paused");
+        // Une zone qui n'est plus « playing » n'est pas réécrite.
+        assert_eq!(remettre_la_zone_a_stopped(&backend, 3), Ok(0));
+        assert_eq!(etat(3), "paused");
         assert_eq!(
-            crate::audio::replaygain::playing_zone_name(&backend).as_deref(),
-            Some("Salon")
+            zone_qui_joue_en_base(&backend),
+            Some((2, "Bureau".to_string()))
         );
-        crate::taches_de_fond::priorite::noter_etat_de_lecture(9_046_002, "stopped");
+    }
 
-        // Le témoin en mémoire est un global du processus : d'autres essais
-        // (pollers) peuvent y noter une zone. Attendre qu'il soit au repos.
-        for _ in 0..200 {
-            if !crate::taches_de_fond::priorite::lecture_en_cours() {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert_eq!(corriger_le_temoin_de_lecture_en_base(&backend), Ok(1));
-        assert_eq!(crate::audio::replaygain::playing_zone_name(&backend), None);
-        let pause = backend
-            .query_one("SELECT last_play_state FROM zones WHERE id = 2", &[])
-            .unwrap()
-            .and_then(|c| c.first().and_then(|v| v.as_string()));
+    /// #9046, piste (b) — le troisième report abandonne la piste : témoin
+    /// d'analyse posé (compté en échec), clés de report effacées.
+    #[test]
+    fn le_troisieme_report_abandonne_la_piste_9046() {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.execute("INSERT INTO artists (id, name) VALUES (1, 'A')", &[])
+            .unwrap();
+        db.execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'B', 1)",
+            &[],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO tracks (id, title, album_id, artist_id) VALUES (7, 'T', 1, 1)",
+            &[],
+        )
+        .unwrap();
+        let repo = TrackMetadataRepo::new(db);
         assert_eq!(
-            pause.as_deref(),
-            Some("paused"),
-            "une zone en pause reste en pause"
+            reporter_apres_echecs(&repo, 7, 1_000),
+            Ok(IssueDuReport::Reportee(1))
         );
+        assert_eq!(
+            reporter_apres_echecs(&repo, 7, 2_000),
+            Ok(IssueDuReport::Reportee(2))
+        );
+        let m = repo.get_all(7).unwrap();
+        assert_eq!(m.get(RETRY_REPORTS_KEY).map(String::as_str), Some("2"));
+        assert_eq!(m.get(RETRY_LATER_KEY), Some(&deferral_stamp(2_000)));
+        assert!(!m.contains_key(SENTINEL));
+        assert_eq!(
+            reporter_apres_echecs(&repo, 7, 3_000),
+            Ok(IssueDuReport::Abandonnee)
+        );
+        let m = repo.get_all(7).unwrap();
+        assert_eq!(m.get(SENTINEL).map(String::as_str), Some(MODEL_ID));
+        assert!(!m.contains_key(RETRY_LATER_KEY));
+        assert!(!m.contains_key(RETRY_REPORTS_KEY));
     }
 
     #[test]

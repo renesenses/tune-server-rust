@@ -601,6 +601,8 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
     // Une piste dont le fichier ne répond pas est reportée, jamais marquée
     // analysée. Elle sort du travail disponible pendant le même délai que
     // la requête des candidats, et reste comptée séparément (#4187).
+    // Les pistes en échec répété mises « à réessayer plus tard » y sont
+    // comptées aussi (#9046).
     #[cfg(feature = "audio-embedding")]
     let deferred = {
         let now = std::time::SystemTime::now()
