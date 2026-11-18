@@ -16,18 +16,27 @@ use crate::state::AppState;
 /// Avec la feature `sans-enrichissement` (HORS `default` : aucun build existant
 /// ne change), ces passes de fond ne sont pas lancées :
 /// - MusicBrainz : vérification des MBID, pays des artistes et des éditions,
-///   rattrapage des noms de tri et des genres d'album (ces deux derniers sont
-///   surtout locaux ; ils sont coupés pour que la bibliothèque ne soit pas
-///   réécrite en tâche de fond) ;
-/// - enrichissements distants : biographies, crédits, paroles, logos de radios ;
+///   rattrapage des noms de tri et des genres d'album, passe de nuit des
+///   albums refusés (coupés avec le reste de la famille MusicBrainz, même
+///   quand une partie du travail est locale) ;
+/// - enrichissements distants : biographies, crédits, paroles, logos de
+///   radios, apports Qobuz aux albums locaux ;
 /// - envois vers le compte et la communauté : écoutes, notes, mesures,
-///   synchronisation communautaire.
+///   synchronisation communautaire, renvoi des images d'artistes.
 ///
-/// Ce qui continue de sortir : synchronisation et sauvegarde cloud de la
-/// bibliothèque et des personnalisations, télémétrie, heartbeat (la build
-/// reste visible dans les statistiques d'installations) et vérification de
-/// mise à jour. Les routes restent. Ce n'est donc PAS un build « zéro
-/// réseau » : c'est un build sans enrichissement de fond, pour la lecture.
+/// Ce qui continue de tourner, NOTAMMENT (la liste n'est pas fermée) :
+/// - vers l'extérieur : synchronisation et sauvegarde cloud de la bibliothèque
+///   et des personnalisations, télémétrie, heartbeat (la build reste visible
+///   dans les statistiques d'installations), vérification de mise à jour,
+///   catalogue « Tune Tested » du site, reprise et veille des favoris des
+///   services de streaming, vignettes des abonnements podcasts, relais de
+///   webhooks, relais cloud (feature `cloud-relay`, absente d'une light) ;
+/// - relance au démarrage d'une passe d'enrichissement lancée à la main et
+///   coupée par l'arrêt précédent (`reprise_des_passes`) ;
+/// - en local, des rattrapages qui réécrivent la base (relecture des balises
+///   classiques, normalisation des labels).
+/// Les routes restent. Ce n'est donc PAS un build « zéro réseau » : c'est un
+/// build sans passe d'enrichissement lancée de lui-même, pour la lecture.
 pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // AVANT tout spawn (#4574). Les passes de fond relisent leur pause dans un
     // miroir en mémoire qui part à zéro ; sans cette relecture, une pause posée
@@ -46,12 +55,14 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     crate::routes::library::graver_dr::marquer_passe_interrompue_au_demarrage(&state.backend);
     spawn_squeezebox_poller(state);
     // #8077 — la passe de fond des apports Qobuz (15 min après, puis 6 h).
+    #[cfg(not(feature = "sans-enrichissement"))]
     crate::routes::library::apports_qobuz::armer_la_passe(state);
     // #8325 — une fois : relire WORK / MOVEMENTNAME / BAND des fichiers
     // déjà importés, sans scan à lancer par l'utilisateur.
     crate::routes::library::relecture_classique::armer(state);
     // rc12 — une seule fois : renvoyer au site les images d'artistes
     // qu'il a perdues (22/10 → 13/11/2026), si l'utilisateur partage.
+    #[cfg(not(feature = "sans-enrichissement"))]
     crate::routes::library::renvoi_images_artistes::armer(state);
     spawn_hqplayer_poller(state);
     spawn_session_gc(state);
@@ -102,6 +113,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     crate::routes::library::credits::spawn_passe_automatique_credits(state);
     // #4805 (13/10/2026) — la passe de nuit des albums refusés par
     // MusicBrainz. Éteinte par défaut ; un test de câblage garde la ligne.
+    #[cfg(not(feature = "sans-enrichissement"))]
     crate::routes::library::identification_lot::nuit::spawn_passe_de_nuit(state);
     #[cfg(not(feature = "sans-enrichissement"))]
     spawn_community_sync(state);
@@ -4353,14 +4365,27 @@ mod tests_licence_proprietaire_battement {
             "tune_core::cloud::ecoutes_au_compte::spawn(",
             "tune_core::cloud::notes_communautaires::spawn(",
             "tune_core::cloud::mesures_communautaires::spawn(",
+            "crate::routes::library::apports_qobuz::armer_la_passe(state);",
+            "crate::routes::library::renvoi_images_artistes::armer(state);",
+            "crate::routes::library::identification_lot::nuit::spawn_passe_de_nuit(state);",
         ] {
+            // Une seule occurrence : un second appel non gardé plus bas ne doit
+            // pas passer inaperçu derrière le premier, gardé.
+            assert_eq!(
+                corps.matches(appel).count(),
+                1,
+                "{appel} doit apparaître exactement une fois dans spawn_background_tasks"
+            );
             let pos = corps
                 .find(appel)
                 .unwrap_or_else(|| panic!("{appel} a disparu"));
-            let avant = corps[..pos].trim_end();
-            assert!(
-                avant.ends_with("#[cfg(not(feature = \"sans-enrichissement\"))]"),
-                "{appel} doit rester derrière `#[cfg(not(feature = \"sans-enrichissement\"))]`"
+            // La ligne juste avant l'appel doit être l'attribut lui-même, pas
+            // un attribut mis en commentaire.
+            let derniere = corps[..pos].trim_end().lines().last().unwrap_or("").trim();
+            assert_eq!(
+                derniere, "#[cfg(not(feature = \"sans-enrichissement\"))]",
+                "{appel} doit rester derrière `#[cfg(not(feature = \"sans-enrichissement\"))]`, \
+                 non commenté et directement avant l'appel"
             );
         }
     }

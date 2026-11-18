@@ -13,11 +13,15 @@ local-audio = ["tune-core/local-audio", "tune-entree-audio?/capture", "tune-cali
 # Build « sans enrichissement » (la version light de tune-diretta) : HORS
 # `default`, aucun build existant ne change. Ne lance pas, en tâche de fond :
 # les passes MusicBrainz (MBID, pays des artistes et des éditions, noms de tri,
-# genres d'album), les enrichissements distants (biographies, crédits,
-# paroles, logos de radios) ni les envois vers le compte et la communauté
-# (écoutes, notes, mesures, synchro communautaire). Continuent de sortir :
-# synchro et sauvegarde cloud, télémétrie, heartbeat, vérification de mise à
-# jour. Ce n'est PAS un build « zéro réseau ». Les routes restent.
+# genres d'album, passe de nuit), les enrichissements distants (biographies,
+# crédits, paroles, logos de radios, apports Qobuz) ni les envois vers le
+# compte et la communauté (écoutes, notes, mesures, synchro communautaire,
+# images d'artistes). Continuent de tourner, NOTAMMENT : synchro et sauvegarde
+# cloud, télémétrie, heartbeat, vérification de mise à jour, « Tune Tested »,
+# favoris des services de streaming, vignettes podcasts, webhooks, reprise
+# d'une passe lancée à la main, rattrapages locaux de la base. La liste
+# complète est dans la doc de `spawn_background_tasks`. Ce n'est PAS un build
+# « zéro réseau ». Les routes restent.
 sans-enrichissement = []
 asio = ["tune-core/asio"]
 # #4378 : lecture des DSDIFF compressés DST. Hors `default`, mais livrée par
