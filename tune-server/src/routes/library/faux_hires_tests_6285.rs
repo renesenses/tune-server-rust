@@ -345,3 +345,54 @@ async fn l_etat_annonce_le_filtre_du_catalogue_rc12() {
     let c = get(&app, "/api/v1/library/hires-check").await;
     assert_eq!(c["catalogue_hires_verdict"], true, "{c}");
 }
+
+/// #9035 — la fiche d'un album douteux dit combien de pistes sont en cause
+/// sur combien de mesurées, et la coupure ; une ligne rangée avant #9035 avec
+/// l'ancien `coupure_de_codec` (aucune signature de codec n'était mesurée)
+/// se publie `coupure_spectrale`, sur l'album comme sur la piste. Masqué, rien
+/// de tout cela ne paraît.
+#[tokio::test]
+async fn la_fiche_dit_la_coupure_et_les_pistes_en_cause_9035() {
+    let (app, state) = banc();
+    state
+        .backend
+        .execute_batch(
+            "INSERT INTO albums (id, title) VALUES (7, 'Sombre');
+             INSERT INTO tracks (id, title, album_id, file_path, format, duration_ms) VALUES
+               (71, 'Un', 7, '/m/71.flac', 'flac', 60000),
+               (72, 'Deux', 7, '/m/72.flac', 'flac', 60000),
+               (73, 'Trois', 7, '/m/73.flac', 'flac', 60000),
+               (74, 'Quatre', 7, '/m/74.flac', 'flac', 60000);
+             INSERT INTO hires_verifications (track_id, verdict, raison, coupure_hz, bits_effectifs, sample_rate, bits_declares)
+               VALUES (71, 'douteux', 'coupure_de_codec', 17800.0, 24, 96000, 24),
+                      (72, 'douteux', 'coupure_spectrale', 18200.0, 24, 96000, 24),
+                      (73, 'verifie', NULL, NULL, 24, 96000, 24),
+                      (74, 'non_concluant', NULL, NULL, NULL, 96000, 24);",
+        )
+        .unwrap();
+    let c = get(&app, "/api/v1/library/albums/7/hires").await;
+    assert_eq!(c["verdict"], "non_analyse", "{c}");
+    assert_eq!(c["pistes_douteuses"], Value::Null, "{c}");
+    assert_eq!(c["coupure_hz"], Value::Null, "{c}");
+
+    montrer_douteux(&app, true).await;
+    let c = get(&app, "/api/v1/library/albums/7/hires").await;
+    assert_eq!(c["verdict"], "douteux", "{c}");
+    assert_eq!(c["raison"], "coupure_spectrale", "{c}");
+    assert_eq!(c["pistes_douteuses"], 2, "{c}");
+    assert_eq!(c["pistes_mesurees"], 3, "{c}");
+    assert_eq!(c["coupure_hz"], 18200.0, "{c}");
+    assert_eq!(c["pistes"][0]["raison"], "coupure_spectrale", "{c}");
+
+    let liste = get(&app, "/api/v1/library/albums?limit=50").await;
+    let sombre = liste["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == 7)
+        .cloned()
+        .unwrap_or_else(|| panic!("album 7 absent : {liste}"));
+    assert_eq!(sombre["hires_raison"], "coupure_spectrale", "{sombre}");
+    assert_eq!(sombre["hires_pistes_douteuses"], 2, "{sombre}");
+    assert_eq!(sombre["hires_pistes_mesurees"], 3, "{sombre}");
+}

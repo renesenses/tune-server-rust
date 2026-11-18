@@ -351,6 +351,14 @@ pub async fn courir(db: Arc<dyn DbBackend>) {
     }
 }
 
+/// #9035 — combien de pistes d'un album sont DOUTEUSES, sur combien de
+/// pistes MESURÉES (verdict autre que `non_concluant`) : « 3 pistes sur 10 ».
+pub fn pistes_en_cause(pistes: &[(String, Option<String>)]) -> (usize, usize) {
+    let douteuses = pistes.iter().filter(|(v, _)| v == "douteux").count();
+    let mesurees = pistes.iter().filter(|(v, _)| v != "non_concluant").count();
+    (douteuses, mesurees)
+}
+
 /// Le verdict d'un ALBUM à partir de ceux de ses pistes : « douteux » dès
 /// qu'une piste l'est (avec la raison la plus fréquente), « vérifié » si
 /// toutes ses pistes mesurées le sont, « non analysé » sans aucune mesure,
@@ -366,8 +374,12 @@ pub fn verdict_d_album(pistes: &[(String, Option<String>)]) -> (String, Option<S
         .collect();
     if !douteuses.is_empty() {
         let mut comptes: std::collections::BTreeMap<String, usize> = Default::default();
+        // #9035 — l'ancien `coupure_de_codec` compte comme la coupure qu'il
+        // était (`raison_publiee`).
         for r in douteuses.into_iter().flatten() {
-            *comptes.entry(r.clone()).or_default() += 1;
+            *comptes
+                .entry(super::faux_hires::raison_publiee(r).to_string())
+                .or_default() += 1;
         }
         let raison = comptes.into_iter().max_by_key(|(_, n)| *n).map(|(r, _)| r);
         return ("douteux".into(), raison);

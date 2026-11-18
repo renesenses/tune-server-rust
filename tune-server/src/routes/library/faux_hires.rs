@@ -34,8 +34,11 @@ use axum::Json;
 use axum::extract::{Path, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_core::audio::faux_hires::raison_publiee;
 use tune_core::audio::faux_hires_passe::{activer, compter_les_candidats, est_active};
-use tune_core::audio::faux_hires_publie::{douteux_visible, montrer_douteux, publier_l_album};
+use tune_core::audio::faux_hires_publie::{
+    douteux_visible, montrer_douteux, pistes_en_cause_publiees, publier_l_album,
+};
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 
@@ -67,12 +70,20 @@ pub(super) async fn verdict_album(
         .map_err(AppError::internal)?;
     let visible = douteux_visible(&state.backend);
     let mut verdicts = Vec::with_capacity(rows.len());
+    let mut coupures: Vec<(Option<String>, f64)> = Vec::new();
     let pistes: Vec<Value> = rows
         .iter()
         .map(|r| {
             let verdict = r.get(1).and_then(|v| v.as_string()).unwrap_or_default();
-            let raison = r.get(2).and_then(|v| v.as_string());
+            // #9035 — l'ancien `coupure_de_codec` se publie `coupure_spectrale`.
+            let raison = r
+                .get(2)
+                .and_then(|v| v.as_string())
+                .map(|c| raison_publiee(&c).to_string());
             verdicts.push((verdict.clone(), raison.clone()));
+            if let (true, Some(f)) = (verdict == "douteux", r.get(3).and_then(|v| v.as_f64())) {
+                coupures.push((raison.clone(), f));
+            }
             // #6285 — une piste douteuse masquée se dit non analysée.
             let (verdict, raison) = if verdict == "douteux" && !visible {
                 ("non_analyse".to_string(), None)
@@ -91,10 +102,30 @@ pub(super) async fn verdict_album(
         })
         .collect();
     let (verdict, raison) = publier_l_album(&verdicts, visible);
+    // #9035 — ce que le badge de l'album dit en plus de la raison : combien
+    // de pistes sont en cause sur combien de mesurées, et la coupure (médiane
+    // des pistes douteuses qui portent la raison de l'album). `null` hors
+    // d'un douteux publié.
+    let en_cause = pistes_en_cause_publiees(&verdicts, visible);
+    let coupure_hz = raison
+        .as_ref()
+        .filter(|_| en_cause.is_some())
+        .and_then(|r| {
+            let mut f: Vec<f64> = coupures
+                .iter()
+                .filter(|(rp, _)| rp.as_ref() == Some(r))
+                .map(|(_, f)| *f)
+                .collect();
+            f.sort_by(|a, b| a.total_cmp(b));
+            f.get(f.len() / 2).copied()
+        });
     Ok(Json(json!({
         "album_id": id,
         "verdict": verdict,
         "raison": raison,
+        "pistes_douteuses": en_cause.map(|(d, _)| d),
+        "pistes_mesurees": en_cause.map(|(_, m)| m),
+        "coupure_hz": coupure_hz,
         "pistes": pistes,
     })))
 }

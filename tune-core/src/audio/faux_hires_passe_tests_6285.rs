@@ -329,3 +329,24 @@ fn le_verdict_d_album_6285() {
         ("conforme".into(), None)
     );
 }
+
+/// #9035 — l'ancien `coupure_de_codec` (rangé sans signature mesurée) se
+/// publie `coupure_spectrale`, et compte avec elle ; le compte des pistes en
+/// cause dit « 2 sur 3 » (la non concluante n'est pas mesurée).
+#[test]
+fn l_album_dit_sa_coupure_et_combien_de_pistes_9035() {
+    let p = |v: &str, r: Option<&str>| (v.to_string(), r.map(str::to_string));
+    let pistes = [
+        p("douteux", Some("coupure_de_codec")),
+        p("douteux", Some("coupure_spectrale")),
+        p("douteux", Some("bande_de_cd")),
+        p("verifie", None),
+        p("non_concluant", None),
+    ];
+    assert_eq!(
+        verdict_d_album(&pistes),
+        ("douteux".into(), Some("coupure_spectrale".into()))
+    );
+    assert_eq!(pistes_en_cause(&pistes), (3, 4));
+    assert_eq!(pistes_en_cause(&[]), (0, 0));
+}

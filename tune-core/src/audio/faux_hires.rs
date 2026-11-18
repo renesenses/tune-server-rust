@@ -15,6 +15,19 @@
 //!   fréquence) n'est pas une falaise : c'est ce qui sépare un vrai 24/96 au
 //!   contenu aigu faible d'un CD suréchantillonné.
 //!
+//! # Une coupure n'est pas un codec (#9035)
+//!
+//! Une coupure sous 20 kHz dit seulement QU'il manque l'aigu, pas POURQUOI :
+//! un MP3 converti en FLAC et un master sans perte filtré au mastering (vieille
+//! bande, passe-bas, source rééchantillonnée) ont la même falaise. La raison
+//! publiée est donc [`Raison::CoupureSpectrale`] (« coupure à X kHz, origine
+//! possible : codec avec perte ou filtrage au mastering »), sauf quand une
+//! signature PROPRE à un codec est mesurée en plus ([`trous_de_codec`]) :
+//! sous la coupure, des bandes de l'aigu qui s'éteignent et se rallument
+//! d'une trame courte à l'autre (les bandes vidées par un encodeur à court de
+//! bits, la « sfb21 » du MP3). Un filtre de mastering est fixe : il ne creuse
+//! pas de trous intermittents dans la bande qu'il laisse passer.
+//!
 //! Idée reprise d'Aède / FlacCompagnon
 //! (<https://craft-and-code.github.io/FlacCompagnon/> ; la bibliothèque
 //! `flaccompagnon-core` est sous licence MPL-2.0, le dépôt et l'application
@@ -48,6 +61,13 @@ const BORD_DB: f64 = 20.0;
 
 /// Largeur de la marche de part et d'autre d'une falaise candidate, en Hz.
 const MARCHE_HZ: f64 = 500.0;
+
+/// #9035 — le pas, en Hz, sur lequel se mesure la pente au pied d'une falaise.
+const PAS_BORD_HZ: f64 = 200.0;
+
+/// #9035 — la chute sur [`PAS_BORD_HZ`] à partir de laquelle on est dans la
+/// falaise (30 dB par kHz) et plus dans la pente naturelle du spectre.
+const PENTE_BORD_DB: f64 = 6.0;
 
 /// Largeur du lissage du spectre, en Hz.
 const LISSAGE_HZ: f64 = 200.0;
@@ -109,6 +129,14 @@ pub struct Mesure {
     /// #7859 — les fenêtres en cause, dans l'ordre du morceau, qu'elles
     /// suffisent ou non à rendre le morceau douteux.
     pub fenetres_coupees: Vec<FenetreCoupee>,
+    /// #9035 — la part des cases (trame courte × bande de l'aigu) trouées
+    /// sous la coupure retenue, quand une coupure suspecte sous
+    /// [`COUPURE_LOSSY_MAX_HZ`] a été retenue et que l'aigu sous elle était
+    /// assez fourni pour juger ; `None` sinon. Voir [`trous_de_codec`].
+    pub part_trouee: Option<f64>,
+    /// #9035 — une signature PROPRE à un codec avec perte a été mesurée : des
+    /// trous intermittents dans plusieurs bandes sous la coupure.
+    pub signature_codec: bool,
 }
 
 impl Mesure {
@@ -130,8 +158,30 @@ pub enum Raison {
     BitsDeRemplissage { effectifs: u32 },
     /// Un hi-res dont la bande s'arrête à celle d'un CD : suréchantillonné.
     BandeDeCd { coupure_hz: f64 },
-    /// Une coupure de codec avec perte (MP3, AAC) dans un fichier sans perte.
-    CoupureDeCodec { coupure_hz: f64 },
+    /// #9035 — le spectre est coupé net sous la bande d'un CD, SANS signature
+    /// propre à un codec : origine possible, un codec avec perte ou un
+    /// filtrage au mastering. Seule la fréquence est affirmée.
+    CoupureSpectrale { coupure_hz: f64 },
+    /// #9035 — la coupure, ET les trous intermittents d'un encodeur avec
+    /// perte mesurés sous elle ([`trous_de_codec`]).
+    SignatureDeCodec { coupure_hz: f64 },
+}
+
+/// #9035 — le code de raison rangé avant #9035 pour toute coupure sous
+/// 20 kHz, sans qu'aucune signature de codec ait été mesurée. Une ligne qui
+/// le porte se publie [`Raison::CoupureSpectrale`] : voir [`raison_publiee`].
+pub const RAISON_HERITEE_CODEC: &str = "coupure_de_codec";
+
+/// #9035 — le code de raison tel qu'il se publie. `coupure_de_codec`, rangé
+/// avant #9035 sur la seule fréquence de coupure, se lit `coupure_spectrale` :
+/// aucune signature de codec n'avait été mesurée. Les autres codes passent
+/// tels quels.
+pub fn raison_publiee(code: &str) -> &str {
+    if code == RAISON_HERITEE_CODEC {
+        "coupure_spectrale"
+    } else {
+        code
+    }
 }
 
 /// Le verdict d'une piste.
@@ -165,7 +215,8 @@ impl Verdict {
         match self {
             Verdict::Douteux(Raison::BitsDeRemplissage { .. }) => Some("bits_de_remplissage"),
             Verdict::Douteux(Raison::BandeDeCd { .. }) => Some("bande_de_cd"),
-            Verdict::Douteux(Raison::CoupureDeCodec { .. }) => Some("coupure_de_codec"),
+            Verdict::Douteux(Raison::CoupureSpectrale { .. }) => Some("coupure_spectrale"),
+            Verdict::Douteux(Raison::SignatureDeCodec { .. }) => Some("signature_de_codec"),
             _ => None,
         }
     }
@@ -334,7 +385,25 @@ fn falaise(db_lisse: &[f64], sample_rate: u32) -> Option<f64> {
         .rev()
         .find(|&k| db_lisse[k] >= reference - BORD_DB)
         .map_or(i, |k| k + 1);
-    Some(bord as f64 * hz_par_raie)
+    // #9035 — sur un master SOMBRE (aigu qui décroît tôt), le niveau passe
+    // sous `reference - BORD_DB` bien AVANT le vrai filtre : ce bord-là est
+    // une coupure inventée, trop basse. On remonte donc la pente douce depuis
+    // ce bord jusqu'au pied de la vraie falaise : on s'arrête dès que le
+    // niveau, [`PAS_BORD_HZ`] plus haut, tombe d'au moins [`PENTE_BORD_DB`]
+    // (une pente naturelle perd moins de 1 dB sur ce pas, un filtre ou une
+    // falaise bien plus), ou dès que la remontée a perdu [`BORD_DB`] depuis
+    // son départ (un filtre doux : on ne dépasse pas son genou).
+    let pas = ((PAS_BORD_HZ / hz_par_raie).round() as usize).max(1);
+    let depart = db_lisse[bord.min(n - 1)];
+    let mut k = bord;
+    while k + pas <= i && k + pas < n {
+        let devant = db_lisse[k + pas];
+        if db_lisse[k] - devant >= PENTE_BORD_DB || devant < depart - BORD_DB {
+            break;
+        }
+        k += 1;
+    }
+    Some(k as f64 * hz_par_raie)
 }
 
 /// Mesure un passage décodé : échantillons entrelacés, à leur profondeur
@@ -422,13 +491,231 @@ fn mesurer_selon(
         silencieux: jugees == 0,
         fenetres_jugees: jugees,
         fenetres_coupees: coupees,
+        part_trouee: None,
+        signature_codec: false,
     };
-    m.coupure_hz = if !m.fenetres_coupees.is_empty() && m.part_coupee() >= PART_COUPEE_MIN {
+    let retenue_suspecte = !m.fenetres_coupees.is_empty() && m.part_coupee() >= PART_COUPEE_MIN;
+    m.coupure_hz = if retenue_suspecte {
         mediane(m.fenetres_coupees.iter().map(|c| c.coupure_hz).collect())
     } else {
         mediane(falaises_saines)
     };
+    // #9035 — la signature d'un codec ne se cherche que sous une coupure
+    // suspecte plus basse que la bande d'un CD : c'est le seul cas où la
+    // raison hésite entre codec et mastering.
+    if let Some(f) = m
+        .coupure_hz
+        .filter(|&f| retenue_suspecte && f < COUPURE_CODEC_MAX_HZ)
+    {
+        if let Some(trous) = trous_de_codec(tranches, canaux as u32, sample_rate, bits_declares, f)
+        {
+            m.part_trouee = Some(trous.part);
+            m.signature_codec = trous.signature();
+        }
+    }
     m
+}
+
+/// #9035 — sous cette coupure, la raison hésite entre un codec avec perte et
+/// un filtrage au mastering ; au-dessus (jusqu'à 24 kHz dans un hi-res), c'est
+/// la bande d'un CD ou d'un 48 kHz. Même frontière que [`juger`].
+pub const COUPURE_CODEC_MAX_HZ: f64 = COUPURE_LOSSY_MAX_HZ - 500.0;
+
+/// #9035 — durée visée d'une trame COURTE de la recherche des trous, en
+/// secondes : de l'ordre d'un granule MP3 (576 échantillons à 44,1 kHz, 13 ms)
+/// pour qu'un trou d'un granule ou deux ne soit pas comblé par ses voisins.
+const TRAME_TROU_S: f64 = 0.012;
+
+/// #9035 — largeur d'une bande de l'aigu examinée, en Hz (l'ordre d'une
+/// bande de facteurs d'échelle d'un MP3 dans l'aigu).
+const BANDE_TROU_HZ: f64 = 1_000.0;
+
+/// #9035 — la zone examinée : au plus tant de Hz sous la coupure…
+const ZONE_TROU_HZ: f64 = 4_500.0;
+
+/// … en laissant cette marge sous la coupure (le genou du filtre)…
+const MARGE_TROU_HZ: f64 = 400.0;
+
+/// … et jamais sous cette fréquence.
+const ZONE_TROU_MIN_HZ: f64 = 9_000.0;
+
+/// #9035 — la bande de référence, juste sous la zone examinée, en Hz.
+const REFERENCE_TROU_HZ: f64 = 3_000.0;
+
+/// #9035 — un trou : une bande au moins tant de dB sous la référence de SA
+/// trame. Une pente naturelle ou un instrument qui s'éteint n'y descendent
+/// pas d'une trame à l'autre ; une bande vidée par un encodeur, si.
+const TROU_DB: f64 = 35.0;
+
+/// #9035 — une bande « vivante » : d'ordinaire (médiane des trames) à moins
+/// de tant de dB sous la référence. Une bande toujours vide n'est pas un trou
+/// intermittent, c'est la coupure elle-même.
+const BANDE_VIVANTE_DB: f64 = 25.0;
+
+/// #9035 — au plus tant de trames courtes examinées par morceau.
+const TRAMES_TROU_MAX: usize = 4_000;
+
+/// #9035 — au moins tant de trames jugées pour conclure.
+const TRAMES_TROU_MIN: usize = 40;
+
+/// #9035 — la part de cases trouées à partir de laquelle la signature est
+/// retenue (avec au moins [`BANDES_TROUEES_MIN`] bandes trouées).
+pub const PART_TROUEE_MIN: f64 = 0.02;
+
+/// #9035 — au moins tant de bandes vivantes DIFFÉRENTES ont des trous : un
+/// seul creux récurrent peut être un instrument ou une résonance.
+const BANDES_TROUEES_MIN: usize = 2;
+
+/// #9035 — ce que la recherche des trous a mesuré.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Trous {
+    /// La part des cases (trame jugée × bande vivante) trouées.
+    pub part: f64,
+    /// Combien de bandes vivantes ont au moins un trou.
+    pub bandes_trouees: usize,
+}
+
+impl Trous {
+    /// La signature d'un codec est-elle retenue ?
+    pub fn signature(&self) -> bool {
+        self.part >= PART_TROUEE_MIN && self.bandes_trouees >= BANDES_TROUEES_MIN
+    }
+}
+
+/// #9035 — les TROUS INTERMITTENTS de l'aigu sous une coupure à `coupure_hz` :
+/// la signature propre d'un encodeur avec perte (MP3, AAC) à court de bits,
+/// qui vide des bandes entières d'un granule à l'autre (la « sfb21 » du MP3).
+///
+/// Le signal est découpé en trames COURTES (~[`TRAME_TROU_S`]) ; la zone
+/// examinée va de `coupure - MARGE_TROU_HZ` jusqu'à [`ZONE_TROU_HZ`] plus bas
+/// (jamais sous [`ZONE_TROU_MIN_HZ`]), en bandes de [`BANDE_TROU_HZ`] dont le
+/// niveau est la médiane des raies intérieures ; la
+/// référence de chaque trame est le niveau moyen des [`REFERENCE_TROU_HZ`]
+/// juste dessous. Seules les trames d'un niveau ordinaire (référence à moins
+/// de 6 dB sous sa médiane) sont jugées, et seules les bandes d'ordinaire
+/// vivantes. Une case est trouée quand sa bande tombe à [`TROU_DB`] sous la
+/// référence de sa trame. `None` : trop peu de trames ou de bandes pour
+/// juger. Un filtre de mastering, fixe, ne troue rien dans sa bande passante.
+pub fn trous_de_codec(
+    tranches: &[(f64, &[i32])],
+    canaux: u32,
+    sample_rate: u32,
+    bits_declares: u32,
+    coupure_hz: f64,
+) -> Option<Trous> {
+    let canaux = canaux.max(1) as usize;
+    // La puissance de deux juste SOUS la durée visée : 512 raies à 44,1 kHz
+    // (11,6 ms), 1024 à 96 kHz (10,7 ms).
+    let taille = (1usize
+        << (sample_rate.max(1) as f64 * TRAME_TROU_S)
+            .log2()
+            .floor()
+            .max(0.0) as u32)
+        .clamp(256, 4096);
+    let hz_par_raie = sample_rate as f64 / taille as f64;
+    let haut = coupure_hz - MARGE_TROU_HZ;
+    let bas = (haut - ZONE_TROU_HZ).max(ZONE_TROU_MIN_HZ);
+    let nb_bandes = ((haut - bas) / BANDE_TROU_HZ).floor() as usize;
+    if nb_bandes < BANDES_TROUEES_MIN {
+        return None;
+    }
+    let raie = |f: f64| (f / hz_par_raie).round() as usize;
+    // Les raies INTÉRIEURES de chaque bande : la fuite de la fenêtre depuis
+    // les bandes voisines déborde sur la première et la dernière.
+    let bandes: Vec<Range<usize>> = (0..nb_bandes)
+        .map(|b| {
+            let a = raie(bas + b as f64 * BANDE_TROU_HZ) + 1;
+            let z = raie(bas + (b + 1) as f64 * BANDE_TROU_HZ).saturating_sub(1);
+            a..z.max(a + 1)
+        })
+        .collect();
+    let reference = raie(bas - REFERENCE_TROU_HZ)..raie(bas);
+
+    let echelle = 1.0 / (1u64 << bits_declares.clamp(1, 32).saturating_sub(1)) as f32;
+    let fft = RealFftPlanner::<f32>::new().plan_fft_forward(taille);
+    let hann: Vec<f32> = (0..taille)
+        .map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / taille as f32).cos())
+        .collect();
+    let mut entree = fft.make_input_vec();
+    let mut sortie = fft.make_output_vec();
+    let total: usize = tranches
+        .iter()
+        .map(|(_, e)| e.len() / canaux / taille)
+        .sum();
+    let pas_trames = total.div_ceil(TRAMES_TROU_MAX).max(1);
+    let moyenne_db = |p: &[f64], r: &Range<usize>| {
+        let s: f64 = p[r.clone()].iter().sum();
+        10.0 * (s / r.len().max(1) as f64).max(1e-30).log10()
+    };
+    // Le niveau d'une bande : la MÉDIANE de ses raies intérieures, que la
+    // fuite de la fenêtre depuis une bande voisine pleine ne remonte pas.
+    let mediane_db = |p: &[f64], r: &Range<usize>| {
+        let v = mediane(p[r.clone()].to_vec()).unwrap_or(0.0);
+        10.0 * v.max(1e-30).log10()
+    };
+    // Par trame : la référence, et l'écart de chaque bande à cette référence.
+    let mut trames: Vec<(f64, Vec<f64>)> = Vec::new();
+    let mut puissance = vec![0f64; sortie.len()];
+    let mut rang = 0usize;
+    for &(_, echantillons) in tranches {
+        let mono: Vec<f32> = echantillons
+            .chunks_exact(canaux)
+            .map(|t| t.iter().map(|&s| s as f32).sum::<f32>() * echelle / canaux as f32)
+            .collect();
+        for trame in mono.chunks_exact(taille) {
+            rang += 1;
+            if rang % pas_trames != 0 {
+                continue;
+            }
+            for ((e, &s), &w) in entree.iter_mut().zip(trame).zip(&hann) {
+                *e = s * w;
+            }
+            if fft.process(&mut entree, &mut sortie).is_err() {
+                continue;
+            }
+            for (p, c) in puissance.iter_mut().zip(&sortie) {
+                *p = (c.re as f64).powi(2) + (c.im as f64).powi(2);
+            }
+            let r = moyenne_db(&puissance, &reference);
+            let ecarts = bandes
+                .iter()
+                .map(|b| mediane_db(&puissance, b) - r)
+                .collect();
+            trames.push((r, ecarts));
+        }
+    }
+    let ref_mediane = mediane(trames.iter().map(|(r, _)| *r).collect())?;
+    let jugees: Vec<&Vec<f64>> = trames
+        .iter()
+        .filter(|(r, _)| *r >= ref_mediane - 6.0 && *r > SILENCE_DB + 30.0)
+        .map(|(_, e)| e)
+        .collect();
+    if jugees.len() < TRAMES_TROU_MIN {
+        return None;
+    }
+    let mut cases = 0usize;
+    let mut trouees = 0usize;
+    let mut bandes_trouees = 0usize;
+    for b in 0..nb_bandes {
+        let ecarts: Vec<f64> = jugees.iter().map(|e| e[b]).collect();
+        let vivante = mediane(ecarts.clone()).is_some_and(|m| m >= -BANDE_VIVANTE_DB);
+        if !vivante {
+            continue;
+        }
+        let ici = ecarts.iter().filter(|&&e| e <= -TROU_DB).count();
+        cases += ecarts.len();
+        trouees += ici;
+        if ici > 0 {
+            bandes_trouees += 1;
+        }
+    }
+    if cases == 0 {
+        return None;
+    }
+    Some(Trous {
+        part: trouees as f64 / cases as f64,
+        bandes_trouees,
+    })
 }
 
 /// La coupure qu'aurait vue l'ancien SPECTRE MOYEN (#6285) : une seule
@@ -472,19 +759,24 @@ pub fn juger(m: &Mesure) -> Verdict {
     if m.silencieux {
         return Verdict::NonConcluant;
     }
+    // #9035 — sous la bande d'un CD, la coupure seule ne dit pas sa cause :
+    // « codec » seulement si sa signature a été mesurée.
+    let sous_le_cd = |f: f64| {
+        if m.signature_codec {
+            Verdict::Douteux(Raison::SignatureDeCodec { coupure_hz: f })
+        } else {
+            Verdict::Douteux(Raison::CoupureSpectrale { coupure_hz: f })
+        }
+    };
     match m.coupure_hz {
         Some(f) if m.sample_rate > 48_000 && f <= COUPURE_HIRES_MAX_HZ => {
-            // Sous la bande d'un codec : la cause la plus probable est une
-            // source avec perte, quelle que soit la fréquence du conteneur.
-            if f < COUPURE_LOSSY_MAX_HZ - 500.0 {
-                Verdict::Douteux(Raison::CoupureDeCodec { coupure_hz: f })
+            if f < COUPURE_CODEC_MAX_HZ {
+                sous_le_cd(f)
             } else {
                 Verdict::Douteux(Raison::BandeDeCd { coupure_hz: f })
             }
         }
-        Some(f) if m.sample_rate <= 48_000 && f < COUPURE_LOSSY_MAX_HZ => {
-            Verdict::Douteux(Raison::CoupureDeCodec { coupure_hz: f })
-        }
+        Some(f) if m.sample_rate <= 48_000 && f < COUPURE_LOSSY_MAX_HZ => sous_le_cd(f),
         _ if se_dit_hires => Verdict::Verifie,
         _ => Verdict::Conforme,
     }
@@ -497,3 +789,7 @@ pub(crate) mod tests;
 #[cfg(test)]
 #[path = "faux_hires_tests_7859.rs"]
 mod tests_7859;
+
+#[cfg(test)]
+#[path = "faux_hires_tests_9035.rs"]
+mod tests_9035;

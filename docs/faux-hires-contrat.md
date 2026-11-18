@@ -20,8 +20,27 @@ vérifiées le rendent vérifié ; une conforme le rend conforme ; rien de mesur
 ou rien que du non concluant le laisse non analysé. Les pistes pas encore
 mesurées ne comptent pas.
 
-Raisons d'un « douteux » : `bits_de_remplissage`, `bande_de_cd`,
-`coupure_de_codec`.
+Raisons d'un « douteux » (#9035) :
+
+| Raison | Ce qui a été mesuré |
+|---|---|
+| `bits_de_remplissage` | les bits de poids faible sont toujours nuls |
+| `bande_de_cd` | un hi-res sans rien au-dessus de 20 à 24 kHz |
+| `coupure_spectrale` | le spectre coupé net sous 20 kHz, SANS signature de codec : origine possible, codec avec perte ou filtrage au mastering |
+| `signature_de_codec` | la coupure, ET des bandes de l'aigu vidées par intermittence sous elle (trous d'un encodeur avec perte) |
+
+`coupure_de_codec`, rangé avant #9035 sur la seule fréquence de coupure, n'est
+plus publié : une ligne qui le porte se publie `coupure_spectrale`. Un client
+qui le reçoit d'un serveur plus ancien le lit comme `coupure_spectrale`.
+
+Ce que la fiche `GET /library/albums/{id}/hires` rend en plus (#9035), `null`
+hors d'un « douteux » publié :
+
+| Champ | Valeur |
+|---|---|
+| `pistes_douteuses` | combien de pistes de l'album sont douteuses |
+| `pistes_mesurees` | sur combien de pistes mesurées (hors `non_concluant`) |
+| `coupure_hz` | la coupure de l'album : médiane des pistes douteuses qui portent sa raison |
 
 ## « Douteux » masqué par défaut
 
@@ -52,6 +71,8 @@ Chaque ligne de `items` porte deux champs de plus :
 |---|---|---|
 | `hires_verdict` | chaîne | `verifie`, `conforme`, `douteux` ou `non_analyse` |
 | `hires_raison` | chaîne ou `null` | la raison d'un `douteux` montré, `null` sinon |
+| `hires_pistes_douteuses` | entier ou `null` | #9035 — pistes douteuses d'un `douteux` montré |
+| `hires_pistes_mesurees` | entier ou `null` | #9035 — sur combien de pistes mesurées |
 
 Paramètre de filtre `?hires_verdict=<verdict>` : seuls les albums dont le
 `hires_verdict` publié est celui-là. Il se combine aux autres facettes, au tri,

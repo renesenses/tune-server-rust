@@ -98,6 +98,17 @@ pub fn publier_l_album(
     }
 }
 
+/// #9035 — `(pistes douteuses, pistes mesurées)` d'un album qui se PUBLIE
+/// douteux ; `None` pour tout autre verdict publié, et tant que « douteux »
+/// est masqué (le compte trahirait le verdict).
+pub fn pistes_en_cause_publiees(
+    pistes: &[(String, Option<String>)],
+    douteux_visible: bool,
+) -> Option<(usize, usize)> {
+    (publier_l_album(pistes, douteux_visible).0 == "douteux")
+        .then(|| super::faux_hires_passe::pistes_en_cause(pistes))
+}
+
 /// Verdict et raison de chaque piste mesurée, rangés par identifiant d'album.
 pub type PistesMesureesParAlbum = std::collections::HashMap<i64, Vec<(String, Option<String>)>>;
 

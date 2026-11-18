@@ -358,6 +358,14 @@ fn corps_de_la_page(
                 let (verdict, raison) = faux_hires_publie::publier_l_album(pistes, douteux_visible);
                 obj.insert("hires_verdict".into(), json!(verdict));
                 obj.insert("hires_raison".into(), json!(raison));
+                // #9035 — combien de pistes en cause, sur combien de mesurées
+                // (`null` hors d'un douteux publié).
+                let en_cause = faux_hires_publie::pistes_en_cause_publiees(pistes, douteux_visible);
+                obj.insert(
+                    "hires_pistes_douteuses".into(),
+                    json!(en_cause.map(|c| c.0)),
+                );
+                obj.insert("hires_pistes_mesurees".into(), json!(en_cause.map(|c| c.1)));
             }
             j
         })
