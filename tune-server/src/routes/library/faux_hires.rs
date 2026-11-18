@@ -60,9 +60,11 @@ pub(super) async fn verdict_album(
         .backend
         .query_many(
             &format!(
-                "SELECT h.track_id, h.verdict, h.raison, h.coupure_hz, h.bits_effectifs, \
+                "SELECT h.track_id, {}, h.raison, h.coupure_hz, h.bits_effectifs, \
                  h.sample_rate, h.bits_declares FROM hires_verifications h \
                  JOIN tracks t ON t.id = h.track_id WHERE t.album_id = {} ORDER BY h.track_id",
+                // #9067 — le verdict EFFECTIF : un CD rangé « douteux » avant #9067 se lit « conforme ».
+                tune_core::audio::faux_hires::verdict_effectif_sql("h"),
                 ph(state.backend.engine(), 1)
             ),
             &[&id as &dyn ToSqlValue],
@@ -79,7 +81,9 @@ pub(super) async fn verdict_album(
             let raison = r
                 .get(2)
                 .and_then(|v| v.as_string())
-                .map(|c| raison_publiee(&c).to_string());
+                .map(|c| raison_publiee(&c).to_string())
+                // #9067 — un CD lu « conforme » n'a pas de raison de doute.
+                .filter(|_| verdict != "conforme");
             verdicts.push((verdict.clone(), raison.clone()));
             if let (true, Some(f)) = (verdict == "douteux", r.get(3).and_then(|v| v.as_f64())) {
                 coupures.push((raison.clone(), f));

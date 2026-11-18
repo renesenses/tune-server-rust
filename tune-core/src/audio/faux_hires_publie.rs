@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 
+use super::faux_hires::verdict_effectif_sql;
 use super::faux_hires_passe::verdict_d_album;
 use crate::db::backend::DbBackend;
 use crate::db::settings_repo::SettingsRepo;
@@ -144,9 +145,11 @@ pub fn pistes_mesurees_par_album(
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT ht.album_id, hv.verdict, hv.raison \
+            "SELECT ht.album_id, {verdict}, \
+             CASE WHEN {verdict} = 'douteux' THEN hv.raison END \
                FROM tracks ht JOIN hires_verifications hv ON hv.track_id = ht.id \
-              WHERE ht.album_id IN ({liste}) ORDER BY ht.album_id, hv.track_id"
+              WHERE ht.album_id IN ({liste}) ORDER BY ht.album_id, hv.track_id",
+            verdict = verdict_effectif_sql("hv"),
         );
         for r in &db.query_many(&sql, &[])? {
             let (Some(album), Some(verdict)) = (
@@ -163,7 +166,8 @@ pub fn pistes_mesurees_par_album(
 }
 
 /// #9035 — « l'album est douteux » en SQL : au moins une piste douteuse, et
-/// au moins la moitié de ses pistes mesurées (hors `non_concluant`), comme
+/// au moins la moitié de ses pistes mesurées qui se disent hi-res (#9067 :
+/// vérifiées ou douteuses, verdict EFFECTIF), comme
 /// [`super::faux_hires_passe::album_majoritairement_douteux`].
 fn album_douteux(id_album: &str) -> String {
     let compte = |condition: &str| {
@@ -175,16 +179,20 @@ fn album_douteux(id_album: &str) -> String {
     format!(
         "({} AND 2 * {} >= {})",
         une_piste_de_l_album(id_album, "douteux"),
-        compte("hv.verdict = 'douteux'"),
-        compte("hv.verdict <> 'non_concluant'")
+        compte(&format!("{} = 'douteux'", verdict_effectif_sql("hv"))),
+        compte(&format!(
+            "{} IN ('verifie', 'douteux')",
+            verdict_effectif_sql("hv")
+        ))
     )
 }
 
-/// Une piste de l'album `id_album` porte ce verdict mesuré.
+/// Une piste de l'album `id_album` porte ce verdict mesuré (effectif, #9067).
 fn une_piste_de_l_album(id_album: &str, verdict: &str) -> String {
     format!(
         "EXISTS (SELECT 1 FROM tracks ht JOIN hires_verifications hv ON hv.track_id = ht.id \
-         WHERE ht.album_id = {id_album} AND hv.verdict = '{verdict}')"
+         WHERE ht.album_id = {id_album} AND {} = '{verdict}')",
+        verdict_effectif_sql("hv")
     )
 }
 
@@ -287,7 +295,8 @@ pub fn predicat_piste(id_piste: &str, verdict: VerdictPublie, douteux_visible: b
     let parmi = |verdicts: &str| {
         format!(
             "EXISTS (SELECT 1 FROM hires_verifications hv \
-             WHERE hv.track_id = {id_piste} AND hv.verdict IN ({verdicts}))"
+             WHERE hv.track_id = {id_piste} AND {} IN ({verdicts}))",
+            verdict_effectif_sql("hv")
         )
     };
     match verdict {

@@ -388,10 +388,14 @@ pub async fn courir(db: Arc<dyn DbBackend>) {
 }
 
 /// #9035 — combien de pistes d'un album sont DOUTEUSES, sur combien de
-/// pistes MESURÉES (verdict autre que `non_concluant`) : « 3 pistes sur 10 ».
+/// pistes mesurées qui SE DISENT HI-RES (#9067 : vérifiées ou douteuses ; un
+/// CD conforme n'entre pas dans le compte) : « 3 pistes sur 10 ».
 pub fn pistes_en_cause(pistes: &[(String, Option<String>)]) -> (usize, usize) {
     let douteuses = pistes.iter().filter(|(v, _)| v == "douteux").count();
-    let mesurees = pistes.iter().filter(|(v, _)| v != "non_concluant").count();
+    let mesurees = pistes
+        .iter()
+        .filter(|(v, _)| v == "verifie" || v == "douteux")
+        .count();
     (douteuses, mesurees)
 }
 

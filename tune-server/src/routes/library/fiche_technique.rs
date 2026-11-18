@@ -263,8 +263,10 @@ fn faux_hires(state: &AppState, id: i64) -> Result<Option<Value>, AppError> {
         .backend
         .query_one(
             &format!(
-                "SELECT verdict, raison, coupure_hz, bits_effectifs, sample_rate, bits_declares, \
-                 mesure_le FROM hires_verifications WHERE track_id = {}",
+                "SELECT {}, raison, coupure_hz, bits_effectifs, sample_rate, bits_declares, \
+                 mesure_le FROM hires_verifications h WHERE track_id = {}",
+                // #9067 — le verdict EFFECTIF (un CD n'est jamais « Hi-Res douteux »).
+                tune_core::audio::faux_hires::verdict_effectif_sql("h"),
                 marque(state.backend.engine(), 1)
             ),
             &[&id as &dyn ToSqlValue],
@@ -278,7 +280,9 @@ fn faux_hires(state: &AppState, id: i64) -> Result<Option<Value>, AppError> {
     let raison = r
         .get(1)
         .and_then(|v| v.as_string())
-        .map(|c| tune_core::audio::faux_hires::raison_publiee(&c).to_string());
+        .map(|c| tune_core::audio::faux_hires::raison_publiee(&c).to_string())
+        // #9067 — un CD lu « conforme » n'a pas de raison de doute.
+        .filter(|_| verdict != "conforme");
     // #6285 — tant que « douteux » est masqué, une piste douteuse se dit non
     // analysée, sans raison : même règle que `GET /library/albums/{id}/hires`.
     let visible = tune_core::audio::faux_hires_publie::douteux_visible(&state.backend);

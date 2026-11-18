@@ -167,6 +167,20 @@ pub enum Raison {
     SignatureDeCodec { coupure_hz: f64 },
 }
 
+/// #9067 — le verdict EFFECTIF d'une ligne de `hires_verifications`, en SQL
+/// (`alias` : l'alias de la table, `hv` ou `h`) : une ligne `douteux` rangée
+/// avant #9067 pour un fichier qui ne se dit pas hi-res (16 bits, 48 kHz au
+/// plus) se lit `conforme`. Les mesures déjà rangées sortent ainsi du compte
+/// « Hi-Res douteux » sans être refaites.
+pub fn verdict_effectif_sql(alias: &str) -> String {
+    format!(
+        "(CASE WHEN {a}.verdict = 'douteux' AND {a}.sample_rate IS NOT NULL \
+         AND {a}.sample_rate <= 48000 AND COALESCE({a}.bits_declares, 16) <= 16 \
+         THEN 'conforme' ELSE {a}.verdict END)",
+        a = alias
+    )
+}
+
 /// #9035 — le code de raison rangé avant #9035 pour toute coupure sous
 /// 20 kHz, sans qu'aucune signature de codec ait été mesurée. Une ligne qui
 /// le porte se publie [`Raison::CoupureSpectrale`] : voir [`raison_publiee`].
@@ -796,7 +810,13 @@ pub fn juger(m: &Mesure) -> Verdict {
                 Verdict::Douteux(Raison::BandeDeCd { coupure_hz: f })
             }
         }
-        Some(f) if m.sample_rate <= 48_000 && f < COUPURE_LOSSY_MAX_HZ => sous_le_cd(f),
+        // #9067 (décision de Bertrand du 18/11, fil 2915) — un fichier qui ne
+        // se dit PAS hi-res (16 bits, 48 kHz au plus) n'est jamais « Hi-Res
+        // douteux » : il n'annonce rien que la coupure contredise. Seul un
+        // 24 bits à 44,1/48 kHz coupé sous la bande d'un CD l'est.
+        Some(f) if m.sample_rate <= 48_000 && f < COUPURE_LOSSY_MAX_HZ && se_dit_hires => {
+            sous_le_cd(f)
+        }
         _ if se_dit_hires => Verdict::Verifie,
         _ => Verdict::Conforme,
     }

@@ -469,3 +469,41 @@ async fn deux_bonus_douteux_sur_dix_ne_font_pas_un_album_douteux_9035() {
         "filtre douteux : {ids:?}"
     );
 }
+
+/// #9067 (fil 2915) — un album CD 16/44,1 dont les pistes ont été rangées
+/// « douteuses » avant #9067 (coupure à 16 kHz) n'est pas « Hi-Res douteux » :
+/// ni sur sa fiche, ni dans le filtre `?hires_verdict=douteux` ; ses pistes
+/// se lisent conformes, sans raison de doute.
+#[tokio::test]
+async fn un_album_cd_coupe_a_16_khz_n_est_pas_hires_douteux_9067() {
+    let (app, state) = banc();
+    let mut sql = String::from("INSERT INTO albums (id, title) VALUES (12, 'CD');");
+    for i in 0..4 {
+        let piste = 1200 + i;
+        sql.push_str(&format!(
+            "INSERT INTO tracks (id, title, album_id, file_path, format, duration_ms) \
+             VALUES ({piste}, 't', 12, '/m/{piste}.flac', 'flac', 60000);
+             INSERT INTO hires_verifications (track_id, verdict, raison, coupure_hz, bits_effectifs, sample_rate, bits_declares) \
+             VALUES ({piste}, 'douteux', 'coupure_de_codec', 16000.0, 16, 44100, 16);"
+        ));
+    }
+    state.backend.execute_batch(&sql).unwrap();
+    montrer_douteux(&app, true).await;
+    let c = get(&app, "/api/v1/library/albums/12/hires").await;
+    assert_eq!(c["verdict"], "conforme", "{c}");
+    assert_eq!(c["pistes_douteuses"], Value::Null, "{c}");
+    assert_eq!(c["pistes"][0]["verdict"], "conforme", "{c}");
+    assert_eq!(c["pistes"][0]["raison"], Value::Null, "{c}");
+    let douteux = get(
+        &app,
+        "/api/v1/library/albums?hires_verdict=douteux&limit=50",
+    )
+    .await;
+    let ids: Vec<i64> = douteux["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|a| a["id"].as_i64())
+        .collect();
+    assert!(!ids.contains(&12), "filtre douteux : {ids:?}");
+}

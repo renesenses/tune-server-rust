@@ -124,7 +124,7 @@ fn codec_simule(signal: &[f32], sample_rate: u32, coupure_hz: f64, graine: u64) 
 /// est mesurée vers 18 kHz, et la raison n'est PAS « codec avec perte ».
 #[test]
 fn un_master_sans_perte_filtre_a_18_khz_n_est_pas_un_codec_9035() {
-    for (sample_rate, bits) in [(96_000, 24), (44_100, 16)] {
+    for (sample_rate, bits) in [(96_000, 24), (48_000, 24)] {
         let pcm = quantifier(&rose(sample_rate, 18_000.0, 901), bits);
         let m = mesurer(&pcm, 1, sample_rate, bits);
         let v = juger(&m);

@@ -25,6 +25,14 @@ pas. Un album qui n'est pas douteux mais a des pistes douteuses le dit
 (`pistes_douteuses`, `raison_pistes`) ; chaque piste douteuse garde son
 verdict.
 
+**Un CD n'est jamais « Hi-Res douteux »** (#9067, décision du 18/11, fil
+2915) : un fichier qui ne se dit pas hi-res (16 bits, 48 kHz au plus) est
+jugé `conforme` même si son spectre est coupé. Les lignes rangées `douteux`
+avant #9067 pour un tel fichier (`sample_rate` ≤ 48 000 et `bits_declares` ≤
+16) se LISENT `conforme` partout (fiche, liste, filtre, règles, catalogue),
+sans remesure. La règle de la moitié se compte sur les pistes mesurées qui se
+disent hi-res (vérifiées ou douteuses) : « Hi-Res douteux » ⊂ « Hi-Res ».
+
 « Douteux » masqué : un album qui a la moindre piste douteuse (même sous la
 moitié) se publie `non_analyse`, jamais `verifie` ni `conforme` — dans la
 liste, son filtre, les règles intelligentes et le catalogue.
@@ -55,7 +63,7 @@ douteux ou non :
 | Champ | Valeur |
 |---|---|
 | `pistes_douteuses` | combien de pistes de l'album sont douteuses |
-| `pistes_mesurees` | sur combien de pistes mesurées (hors `non_concluant`) |
+| `pistes_mesurees` | sur combien de pistes mesurées qui se disent hi-res (vérifiées ou douteuses, #9067) |
 | `raison_pistes` | la raison la plus fréquente des pistes douteuses (celle de l'album quand il est douteux) |
 | `coupure_hz` | médiane des coupures des pistes douteuses qui portent `raison_pistes` |
 

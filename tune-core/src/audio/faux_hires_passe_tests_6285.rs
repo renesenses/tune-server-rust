@@ -374,8 +374,10 @@ fn un_album_n_est_douteux_qu_a_partir_de_la_moitie_9035() {
     assert_eq!(pistes_en_cause(&album(2, "verifie")), (2, 10));
     assert_eq!(
         verdict_d_album(&album(2, "conforme")),
-        ("conforme".into(), None)
+        ("douteux".into(), Some("coupure_spectrale".into())),
+        "#9067 — la moitié se compte sur les pistes qui se disent hi-res : 2 sur 2"
     );
+    assert_eq!(pistes_en_cause(&album(2, "conforme")), (2, 2));
     assert_eq!(
         verdict_d_album(&album(4, "verifie")),
         ("verifie".into(), None)
