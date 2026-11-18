@@ -39,7 +39,21 @@ const DEPART: &str = "138664";
 /// « Caipirinha » (un Qobuz qui ne répond pas vite).
 struct FauxQobuz {
     appels: Arc<AtomicUsize>,
-    lenteur: Duration,
+    lenteur: Lenteur,
+}
+
+/// QA 18/11 — comment le faux Qobuz fait attendre « Caipirinha ».
+#[derive(Clone)]
+enum Lenteur {
+    /// Il répond tout de suite.
+    Aucune,
+    /// Il ne répond qu'une fois la PORTE ouverte par le test : un Qobuz lent
+    /// sans horloge. Avant, il dormait 3 s — exactement le délai par fiche
+    /// de `fiches_du_service` (`timeout(3 s)`) : la fiche arrivait ou non
+    /// selon l'ordre de deux minuteries à la même échéance, et la file
+    /// restait à 0 (CI du 17/11, « la tâche de fond n'a pas complété la
+    /// file »).
+    Porte(Arc<tokio::sync::Semaphore>),
 }
 
 fn non_prevu(quoi: &str) -> TuneError {
@@ -100,7 +114,11 @@ impl StreamingService for FauxQobuz {
         match id {
             CAIPIRINHA => {
                 self.appels.fetch_add(1, Ordering::SeqCst);
-                tokio::time::sleep(self.lenteur).await;
+                if let Lenteur::Porte(porte) = &self.lenteur {
+                    // Le test ouvre la porte en FERMANT le sémaphore :
+                    // `acquire` rend alors la main (en erreur, ignorée).
+                    let _ = porte.acquire().await;
+                }
                 Ok(fiche(id, "Caipirinha", DUREE, ALBUM))
             }
             DEPART => Ok(fiche(id, "El niño", 241_000, "aimez")),
@@ -143,7 +161,7 @@ struct Banc {
     appels: Arc<AtomicUsize>,
 }
 
-async fn banc_avec(service: Option<Duration>) -> Banc {
+async fn banc_avec(service: Option<Lenteur>) -> Banc {
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
     let appels = Arc::new(AtomicUsize::new(0));
     if let Some(lenteur) = service {
@@ -167,7 +185,7 @@ async fn banc_avec(service: Option<Duration>) -> Banc {
 }
 
 async fn banc() -> Banc {
-    banc_avec(Some(Duration::ZERO)).await
+    banc_avec(Some(Lenteur::Aucune)).await
 }
 
 /// La ligne telle que l'écrivait l'ajout depuis les Favoris.
@@ -340,33 +358,37 @@ async fn la_lecture_d_une_playlist_complete_la_file_puis_la_playlist() {
     assert_eq!(duree_en_file(&b), Some(DUREE as i64));
 }
 
-/// Relecture du 14/11 : un Qobuz LENT (3 s par fiche) ne retarde pas la
-/// lecture. Elle part tout de suite, la ligne à 0, puis la ligne de la file
-/// reçoit sa durée.
+/// Relecture du 14/11 : un Qobuz LENT ne retarde pas la lecture. Elle part
+/// tout de suite, la ligne à 0, puis la ligne de la file reçoit sa durée.
+///
+/// QA 18/11 — le Qobuz lent est une PORTE fermée, plus une attente de 3 s.
+/// Tant qu'elle est fermée, il ne répond jamais : une lecture qui
+/// l'attendrait ne finirait qu'au délai par fiche de `fiches_du_service`
+/// (3 s, `timeout`) — d'où la borne de 3 s ci-dessous, posée sur ce plancher
+/// et non sur une durée de machine. Puis le test ouvre la porte : la tâche de
+/// fond reçoit sa fiche sans course entre deux minuteries (la `Timeout` de
+/// tokio interroge la fiche avant son échéance, et rien ne s'exécute entre la
+/// fin de la lecture et l'ouverture sur ce runtime à un fil).
 #[tokio::test]
 async fn un_service_lent_ne_retarde_pas_la_lecture() {
-    let b = banc_avec(Some(Duration::from_secs(3))).await;
+    let porte = Arc::new(tokio::sync::Semaphore::new(0));
+    let b = banc_avec(Some(Lenteur::Porte(porte.clone()))).await;
     ranger_la_playlist(&b);
     let debut = std::time::Instant::now();
     lire_la_playlist(&b).await;
     let attente = debut.elapsed();
     assert!(
-        attente < Duration::from_secs(2),
-        "la lecture a attendu le service : {attente:?}"
+        attente < Duration::from_secs(3),
+        "la lecture a attendu le service (porte fermée) : {attente:?}"
     );
     assert_eq!(
         duree_en_file(&b).unwrap_or(0),
         0,
         "sans fiche en cache, la file part à 0"
     );
-    for _ in 0..100 {
-        if duree_en_file(&b).unwrap_or(0) > 0 {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    porte.close();
     assert_eq!(
-        duree_en_file(&b),
+        attendre_la_duree_en_file(&b).await,
         Some(DUREE as i64),
         "la tâche de fond n'a pas complété la file"
     );

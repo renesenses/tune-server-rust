@@ -12,3 +12,7 @@ serde_json = { workspace = true }
 serde = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
