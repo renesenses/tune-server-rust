@@ -122,7 +122,7 @@ async fn l_etat_dit_si_un_code_est_necessaire() {
 #[tokio::test]
 async fn un_tiers_du_lan_sans_code_est_refuse() {
     let state = new_state();
-    let (st, v) = activer(&state, AUTRE_HOTE_DU_LAN, r#"{"password":"pirate-1234"}"#).await;
+    let (st, v) = activer(&state, AUTRE_HOTE_DU_LAN, r#"{"password":"tiers-1234"}"#).await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
     assert_eq!(v["error"], "activation_code_required", "{v}");
     assert!(!active(&state));
@@ -134,7 +134,7 @@ async fn un_tiers_du_lan_sans_code_est_refuse() {
     let req = Request::post("/api/v1/auth/activation")
         .header(header::CONTENT_TYPE, "application/json")
         .header("x-tune-relais", "1")
-        .body(Body::from(r#"{"password":"pirate-1234"}"#))
+        .body(Body::from(r#"{"password":"tiers-1234"}"#))
         .unwrap();
     let st = app.oneshot(req).await.unwrap().status();
     assert_eq!(st, StatusCode::FORBIDDEN);
@@ -165,7 +165,7 @@ async fn un_code_faux_est_refuse_et_cinq_essais_detruisent_le_code() {
     let (st, v) = activer(
         &state,
         AUTRE_HOTE_DU_LAN,
-        r#"{"password":"pirate-1234","code":"AAAAAAAAAA"}"#,
+        r#"{"password":"tiers-1234","code":"AAAAAAAAAA"}"#,
     )
     .await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
@@ -175,7 +175,7 @@ async fn un_code_faux_est_refuse_et_cinq_essais_detruisent_le_code() {
         activer(
             &state,
             AUTRE_HOTE_DU_LAN,
-            r#"{"password":"pirate-1234","code":"BBBBBBBBBB"}"#,
+            r#"{"password":"tiers-1234","code":"BBBBBBBBBB"}"#,
         )
         .await;
     }
@@ -312,7 +312,7 @@ async fn les_jetons_emis_avant_l_activation_ne_valent_plus_rien() {
         Method::POST,
         "/api/v1/auth/login",
         None,
-        Some(r#"{"username":"default","password":"pirate-1234"}"#),
+        Some(r#"{"username":"default","password":"tiers-1234"}"#),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
@@ -373,7 +373,7 @@ async fn le_profil_default_n_est_pas_reclame_depuis_le_lan() {
         Method::POST,
         "/api/v1/auth/login",
         None,
-        Some(r#"{"username":"default","password":"pirate-1234"}"#),
+        Some(r#"{"username":"default","password":"tiers-1234"}"#),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
@@ -438,7 +438,7 @@ fn existe(state: &AppState, nom: &str) -> bool {
 #[tokio::test]
 async fn un_tiers_du_lan_ne_cree_plus_de_compte_la_machine_si() {
     let state = new_state();
-    let corps = r#"{"username":"intrus","password":"pirate-1234"}"#;
+    let corps = r#"{"username":"intrus","password":"tiers-1234"}"#;
     let (st, v) = appel(
         &state,
         AUTRE_HOTE_DU_LAN,
@@ -561,7 +561,7 @@ async fn le_code_en_cours_n_est_pas_remplace_et_les_echecs_comptent_par_adresse(
     assert_eq!(st, StatusCode::OK, "{v}");
     assert_eq!(v["status"], "code_written_to_server_console");
     let code_a = tune_server::auth::code_activation_en_cours(&state).unwrap();
-    let faux = r#"{"password":"pirate-1234","code":"BBBBBBBBBB"}"#;
+    let faux = r#"{"password":"tiers-1234","code":"BBBBBBBBBB"}"#;
     for _ in 0..3 {
         let (st, _) = activer(&state, AUTRE_HOTE_DU_LAN, faux).await;
         assert_eq!(st, StatusCode::FORBIDDEN);
@@ -582,7 +582,7 @@ async fn le_code_en_cours_n_est_pas_remplace_et_les_echecs_comptent_par_adresse(
         None,
         "5 essais : détruit"
     );
-    let juste_a = format!(r#"{{"password":"pirate-1234","code":"{code_a}"}}"#);
+    let juste_a = format!(r#"{{"password":"tiers-1234","code":"{code_a}"}}"#);
     let (st, _) = activer(&state, AUTRE_HOTE_DU_LAN, &juste_a).await;
     assert_eq!(st, StatusCode::FORBIDDEN);
     // Moins d'une minute après : pas de nouveau code.
@@ -779,7 +779,7 @@ async fn derriere_un_mandataire_la_connexion_n_est_pas_l_operateur_local() {
     let st = app
         .clone()
         .oneshot(connexion(
-            r#"{"username":"default","password":"pirate-1234"}"#,
+            r#"{"username":"default","password":"tiers-1234"}"#,
         ))
         .await
         .unwrap()

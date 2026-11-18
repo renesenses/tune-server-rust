@@ -1390,7 +1390,7 @@ async fn derriere_un_mandataire_le_bouclage_ne_vaut_plus_cette_machine() {
             (
                 Method::POST,
                 "/api/v1/auth/activation",
-                Some(r#"{"password":"pirate-1234"}"#),
+                Some(r#"{"password":"tiers-1234"}"#),
             ),
         ] {
             let (st, _, rep) = appel_depuis(
