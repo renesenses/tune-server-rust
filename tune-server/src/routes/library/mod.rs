@@ -92,6 +92,9 @@ mod audio_de_service;
 /// Fil du forum 2793 — la forme d'onde d'une piste (crêtes, RMS, écrêtage),
 /// en JSON, calculée à la demande pour sa fiche technique.
 mod forme_onde;
+/// Go du 17/11 (rc13) — l'enveloppe de la barre de progression d'une piste
+/// Qobuz ou TIDAL en lecture, par le téléchargement de `audio_de_service`.
+mod onde_de_service;
 pub(crate) mod reveler;
 mod search;
 /// #7857 — le spectrogramme d'une piste, en PNG, généré à la demande.
@@ -563,6 +566,12 @@ pub fn router() -> Router<AppState> {
         // la demande (lecture seule, plafonnée, sans image).
         .route("/tracks/{id}/file-tags", get(tracks::track_file_tags))
         .route("/tracks/{id}/waveform", get(tracks::track_waveform))
+        // Go du 17/11 (rc13) — la même enveloppe pour la piste Qobuz ou
+        // TIDAL en lecture, qui n'a pas d'identifiant de bibliothèque.
+        .route(
+            "/service-tracks/{service}/{id_service}/waveform",
+            get(onde_de_service::waveform),
+        )
         .route("/tracks/{id}/spectrogramme.png", get(spectrogramme::png))
         // #8160 — la fiche technique d'une piste (lecture seule), et le
         // recalcul de son spectrogramme conservé.

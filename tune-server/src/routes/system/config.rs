@@ -870,6 +870,13 @@ pub(super) async fn get_config(
             "label": crate::i18n::t(&lang, &format!("settings.replayGainSource.{}", rg_source_mode.as_str())),
         }),
     );
+    // #8968 — les valeurs de `replaygain_mode` que CE serveur comprend. Un
+    // client n'offre « Auto » que s'il le lit ici : un serveur plus ancien
+    // lirait `auto` comme `off`, coupant le gain ET la campagne d'analyse.
+    config.insert(
+        "replaygain_modes".to_string(),
+        json!(tune_core::audio::replaygain::MODES_ACCEPTES),
+    );
     // Consentement de contribution. Deux valeurs, et elles ne disent pas la
     // meme chose :
     //   - `enabled`   : le choix de l'utilisateur, relu sur la valeur BRUTE en
@@ -6122,6 +6129,35 @@ mod replaygain_source_tests {
         assert!(!tune_core::audio::replaygain::services_enabled(
             &state.backend
         ));
+    }
+
+    /// #8968 — `GET /config` annonce `auto` (le client n'offre le bouton
+    /// qu'à ce prix), `auto` s'écrit et se relit, et changer de SOURCE garde
+    /// la granularité `auto` au lieu de la reculer vers la piste.
+    #[tokio::test]
+    async fn le_mode_auto_est_annonce_ecrit_et_garde_8968() {
+        let state = etat();
+        let c = config_de(&state).await;
+        assert_eq!(
+            c["replaygain_modes"],
+            serde_json::json!(["off", "track", "album", "auto"]),
+            "le serveur n'annonce pas le mode Auto"
+        );
+        patch(&state, serde_json::json!({"replaygain_mode": "auto"})).unwrap();
+        assert_eq!(
+            tune_core::audio::replaygain::ReplayGainSettings::load(&state.backend).mode,
+            tune_core::audio::replaygain::ReplayGainMode::Auto
+        );
+        patch(
+            &state,
+            serde_json::json!({"replaygain_source": "file_tags"}),
+        )
+        .unwrap();
+        assert_eq!(
+            config_de(&state).await["replaygain_mode"],
+            "auto",
+            "changer de source a reculé Auto vers la piste"
+        );
     }
 
     #[tokio::test]
