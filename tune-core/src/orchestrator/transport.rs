@@ -2498,6 +2498,11 @@ impl PlaybackOrchestrator {
                     // sortie LOCALE uniquement — voir `zone_soft_mute_ms` pour
                     // les sorties qui restent nues et pourquoi.
                     local_output.set_soft_mute_ms(self.zone_soft_mute_ms(zone_id));
+                    // #8696 — la période WASAPI exclusive réglée sur la zone
+                    // (Auto par défaut). Sans effet hors du bras exclusif.
+                    local_output.set_periode_wasapi_ms(
+                        crate::outputs::periode_reglable_8696::reglage_de_zone(&self.db, zone_id),
+                    );
                     // #2211 — fondu enchaîné, sortie LOCALE uniquement : `0` en
                     // PURE et en bit-perfect strict (`duree_appliquee_ms`), et
                     // pour un flux en direct, qui n'a pas de piste suivante et
