@@ -621,3 +621,44 @@ async fn le_fichier_de_secours_coupe_l_authentification() {
     assert!(!active(&state));
     assert!(!fichier.exists());
 }
+
+/// Tune OS : un fichier de secours sur une partition en lecture seule (la
+/// carte SD) ne coupe l'authentification qu'UNE fois, pas à chaque démarrage.
+#[cfg(unix)]
+#[tokio::test]
+async fn fichier_de_secours_ineffacable_applique_une_seule_fois() {
+    use std::os::unix::fs::PermissionsExt;
+    let state = new_state();
+    let app = app(&state, LOCAL);
+    let (st, _, _) = appel(
+        &app,
+        "POST",
+        "/api/v1/auth/enable",
+        None,
+        Some(creer("alice", "motdepasse-1", None)),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let boot = tempfile::tempdir().unwrap();
+    let fichier = boot.path().join(FICHIER_DE_SECOURS);
+    std::fs::write(&fichier, "").unwrap();
+    std::fs::set_permissions(boot.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    let dossiers = vec![boot.path().to_path_buf()];
+
+    assert!(appliquer_le_fichier_de_secours_dans(&state, &dossiers));
+    assert!(!active(&state));
+    assert!(fichier.exists(), "lecture seule : le fichier reste");
+    // L'admin réactive ; au démarrage suivant, le même fichier ne coupe plus.
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("auth_enabled", "true")
+        .unwrap();
+    assert!(!appliquer_le_fichier_de_secours_dans(&state, &dossiers));
+    assert!(active(&state));
+    // Contre-épreuve : un NOUVEAU fichier (autre contenu) coupe de nouveau.
+    std::fs::set_permissions(boot.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    std::fs::write(&fichier, "encore").unwrap();
+    std::fs::set_permissions(boot.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+    assert!(appliquer_le_fichier_de_secours_dans(&state, &dossiers));
+    assert!(!active(&state));
+    std::fs::set_permissions(boot.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+}

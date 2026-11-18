@@ -47,6 +47,15 @@
 //! dossier de la base, puis redémarrer Tune. Au démarrage, le serveur coupe
 //! l'authentification et efface le fichier ([`appliquer_le_fichier_de_secours`]).
 //! Écrire dans ce dossier, c'est déjà avoir la main sur la machine.
+//!
+//! Sur Tune OS, le dossier de la base appartient à root et le compte `tune`
+//! n'a plus de sudo (#3206) : le fichier se dépose aussi à la racine de la
+//! partition de démarrage (`/boot/firmware`, `/boot`) — sur un Raspberry Pi,
+//! la carte SD lue depuis n'importe quel ordinateur, c'est-à-dire l'accès
+//! physique. Cette partition étant en lecture seule pour le service, le
+//! fichier n'y est pas effacé : sa signature (chemin, taille, date) est
+//! retenue dans `auth_secours_applique`, et le même fichier ne coupe plus
+//! l'authentification aux démarrages suivants.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -189,7 +198,12 @@ fn ecrire_le_fichier_du_code(chemin: &Path, code: &str) -> std::io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        // Lisible par les comptes de la machine : sur Tune OS, le serveur
+        // tourne en root et le propriétaire se connecte en `tune` (SSH,
+        // Cockpit). Un compte de la machine EST « cette machine » pour la
+        // doctrine de `AdminOuCetteMachine` ; le réseau, lui, ne lit pas ce
+        // fichier.
+        options.mode(0o644);
     }
     let mut f = options.open(chemin)?;
     writeln!(
@@ -437,7 +451,7 @@ pub async fn activer(
                 super::record_login_failure(ip);
                 return refus(
                     StatusCode::UNAUTHORIZED,
-                    "invalid_credentials",
+                    "invalid_admin_credentials",
                     "Wrong administrator username or password.",
                 );
             }
@@ -468,7 +482,7 @@ pub async fn activer(
             super::record_login_failure(ip);
             return refus(
                 StatusCode::UNAUTHORIZED,
-                "invalid_credentials",
+                "invalid_admin_credentials",
                 "Wrong administrator username or password.",
             );
         }
@@ -607,27 +621,63 @@ pub async fn activer(
 // Voie de secours
 // ---------------------------------------------------------------------------
 
-/// Au démarrage : si [`FICHIER_DE_SECOURS`] est dans le dossier de la base,
-/// couper l'authentification et effacer le fichier. Rend `true` quand il a
+/// Les dossiers où chercher le fichier de secours : celui de la base, puis,
+/// sur Tune OS seulement, la partition de démarrage.
+fn dossiers_de_secours(state: &AppState) -> Vec<PathBuf> {
+    let mut v: Vec<PathBuf> = dossier_de_la_base(state).into_iter().collect();
+    if Path::new("/etc/tune-appliance").is_file() {
+        v.push(PathBuf::from("/boot/firmware"));
+        v.push(PathBuf::from("/boot"));
+    }
+    v
+}
+
+fn signature(fichier: &Path) -> Option<String> {
+    let m = std::fs::metadata(fichier).ok()?;
+    let date = m
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Some(format!("{}|{}|{}", fichier.display(), m.len(), date))
+}
+
+/// Au démarrage : si [`FICHIER_DE_SECOURS`] est dans l'un des
+/// [`dossiers_de_secours`], couper l'authentification et effacer le fichier
+/// (ou, s'il ne s'efface pas, retenir sa signature). Rend `true` quand il a
 /// agi.
 pub fn appliquer_le_fichier_de_secours(state: &AppState) -> bool {
-    let Some(dossier) = dossier_de_la_base(state) else {
-        return false;
-    };
-    let fichier = dossier.join(FICHIER_DE_SECOURS);
-    if !fichier.exists() {
-        return false;
-    }
+    appliquer_le_fichier_de_secours_dans(state, &dossiers_de_secours(state))
+}
+
+#[doc(hidden)]
+pub fn appliquer_le_fichier_de_secours_dans(state: &AppState, dossiers: &[PathBuf]) -> bool {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let coupee = settings.set("auth_enabled", "false").is_ok();
-    let efface = std::fs::remove_file(&fichier).is_ok();
-    tracing::warn!(
-        fichier = %fichier.display(),
-        coupee,
-        efface,
-        "authentification_coupee_par_le_fichier_de_secours"
-    );
-    coupee
+    let deja = settings.get("auth_secours_applique").ok().flatten();
+    for dossier in dossiers {
+        let fichier = dossier.join(FICHIER_DE_SECOURS);
+        let Some(sig) = signature(&fichier) else {
+            continue;
+        };
+        let efface = std::fs::remove_file(&fichier).is_ok();
+        if !efface && deja.as_deref() == Some(sig.as_str()) {
+            // Déjà appliqué à un démarrage précédent, fichier ineffaçable.
+            continue;
+        }
+        let coupee = settings.set("auth_enabled", "false").is_ok();
+        if !efface {
+            settings.set("auth_secours_applique", &sig).ok();
+        }
+        tracing::warn!(
+            fichier = %fichier.display(),
+            coupee,
+            efface,
+            "authentification_coupee_par_le_fichier_de_secours"
+        );
+        return coupee;
+    }
+    false
 }
 
 #[cfg(test)]
