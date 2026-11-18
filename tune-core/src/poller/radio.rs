@@ -66,6 +66,30 @@ impl PositionPoller {
                 // l'album et non le logo de la radio ».
                 let pochette =
                     vignette_du_pas_radio(meta.cover_url.as_deref(), logo_station.as_deref());
+                // #8487 — le titre diffusé est noté sous la ligne de sa
+                // station, hors statistiques, à chaque lecture et pas
+                // seulement au changement : un titre lu avant que la station
+                // soit notée (zone navigateur pas encore confirmée) l'est au
+                // tour suivant. Dédoublonnage et bruit : `noter`.
+                let maintenant_ms = chrono::Utc::now().timestamp_millis();
+                match crate::db::radio_titres_diffuses::noter(
+                    &self.db,
+                    zone_id,
+                    source_id,
+                    &station_name,
+                    meta.artist.as_deref(),
+                    &meta.title,
+                    pochette.as_deref(),
+                    maintenant_ms,
+                ) {
+                    Ok(crate::db::radio_titres_diffuses::Notation::Ecrit) => {
+                        debug!(zone_id, station = %station_name, "radio_titre_diffuse_note");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(zone_id, error = %e, "radio_titre_diffuse_non_note");
+                    }
+                }
                 let title_changed = np.title != meta.title
                     || np.artist_name != meta.artist
                     || np.cover_path != pochette;

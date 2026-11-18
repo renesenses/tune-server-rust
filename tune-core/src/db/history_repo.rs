@@ -1268,6 +1268,9 @@ impl HistoryRepo {
 
     pub fn clear(&self) -> Result<(), String> {
         self.db.execute("DELETE FROM listen_history", &[])?;
+        // #8487 — les titres diffusés se rangent sous les lignes de station :
+        // ils partent avec elles.
+        super::radio_titres_diffuses::effacer_tout(&self.db)?;
         Ok(())
     }
 

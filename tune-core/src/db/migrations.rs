@@ -5258,6 +5258,12 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     if let Err(e) = db.execute_batch(super::alertes_douteuses_ignorees::SQL_TABLE) {
         tracing::warn!(error = %e, "alertes_douteuses_ignorees_table_failed");
     }
+    // Titres diffusés par les radios, notés sous leur station (#8487) — même
+    // régime, sans numéro : SQLite 156 et PG 123 sont demandés par d'autres
+    // PR du lot rc13. PG : `ENSURE_TABLES` et `PG_FULL_SCHEMA`.
+    if let Err(e) = db.execute_batch(super::radio_titres_diffuses::SQL_TABLE) {
+        tracing::warn!(error = %e, "radio_titres_diffuses_table_failed");
+    }
 
     // Registre DURABLE des serveurs multimedia (migration v101, #2219 phase 1) ;
     // re-creee inconditionnellement pour la meme raison que les tables

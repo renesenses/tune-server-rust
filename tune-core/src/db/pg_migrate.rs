@@ -226,6 +226,9 @@ const MIGRATION_TABLES: &[&str] = &[
     // Alertes de « Albums douteux » marquées normales (#8958) : sans cette
     // ligne, toutes reviendraient à la bascule SQLite → PostgreSQL.
     "alertes_douteuses_ignorees",
+    // Titres diffusés par les radios (#8487) : sans cette ligne, ils
+    // disparaîtraient de l'historique à la bascule, sous leurs stations.
+    "radio_titres_diffuses",
 ];
 
 /// Tables copiees APRES `run_pg_migrations` : elles ne sont creees que par
@@ -1249,6 +1252,20 @@ CREATE TABLE IF NOT EXISTS alertes_douteuses_ignorees (
  ignoree_le BIGINT NOT NULL,
  PRIMARY KEY (portee, cle, titre, raison)
 );
+-- Titres diffusés par les radios (#8487). Sans script numéroté : présente
+-- ici (bascule) ET dans `ENSURE_TABLES`, mêmes types
+-- (migrations/radio_titres_diffuses.sql). Copiée.
+CREATE TABLE IF NOT EXISTS radio_titres_diffuses (
+ ecoute_id BIGINT NOT NULL,
+ diffuse_le BIGINT NOT NULL,
+ zone_id BIGINT,
+ station_url TEXT,
+ station TEXT NOT NULL DEFAULT '',
+ titre TEXT NOT NULL,
+ artiste TEXT,
+ pochette TEXT,
+ PRIMARY KEY (ecoute_id, diffuse_le)
+);
 -- « Pas pour moi » de l'accueil (web#916, SQLite 145 / PG 111), par profil.
 CREATE TABLE IF NOT EXISTS suggestions_ecartees (
     profile_id BIGINT NOT NULL DEFAULT 1,
@@ -1953,6 +1970,7 @@ fn conflict_clause(table: &str) -> &'static str {
         "collection_physique_associations" => "ON CONFLICT (release_id) DO NOTHING",
         "politiques_parentales" => "ON CONFLICT (profile_id) DO NOTHING",
         "alertes_douteuses_ignorees" => "ON CONFLICT (portee, cle, titre, raison) DO NOTHING",
+        "radio_titres_diffuses" => "ON CONFLICT (ecoute_id, diffuse_le) DO NOTHING",
         "notes_personnelles" => "ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
         "apports_service_albums" => "ON CONFLICT (album_id, source) DO NOTHING",
         "apports_service" => "ON CONFLICT (album_id, track_id, champ, source) DO NOTHING",
