@@ -685,7 +685,8 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
         "enabled": enabled,
         "model_ready": model_ready,
         "model_fetch": model_fetch,
-        // « playback » | « thermal » | « low_memory » | « not_premium » | null
+        // « playback » | « thermal » | « low_memory » | « not_premium »
+        // | « library_scan » | « paused » | « model_unavailable » (#9046) | null
         "paused_reason": paused_reason,
         // Embeddings réellement écrits pour le modèle courant.
         "analysed_tracks": analysed,

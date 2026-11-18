@@ -133,6 +133,53 @@ const SENTINEL: &str = "audio_embed_analyzed";
 /// (#1865).
 const PATH_UNRESOLVED_KEY: &str = "audio_embed_path_unresolved";
 
+/// Témoin « à réessayer plus tard » — tune-server-rust#9046, piste (b).
+///
+/// Une piste dont l'inférence PANIQUE (`audio_embed_infer_interrupted`) ou dont
+/// le témoin [`SENTINEL`] ne s'écrit pas (`audio_embed_sentinel_write_failed`)
+/// n'était jamais estampillée : la requête de candidats (`LIMIT 32`, sans
+/// `ORDER BY`) la rendait au lot suivant, puis au suivant, sans fin. Trente-deux
+/// pistes de cette sorte suffisent à figer la passe entière : `Lot(0)`, sieste
+/// de quinze minutes, et on recommence — jauge immobile, rien à l'écran.
+///
+/// Après [`ECHECS_AVANT_REPORT`] échecs de suite, la piste porte cette clé
+/// (estampille de report, même format que [`PATH_UNRESOLVED_KEY`]) et sort du
+/// balayage pour [`crate::library::local_path::PATH_RETRY_AFTER_SECS`]. Ce
+/// n'est PAS le témoin d'analyse : la piste sera reprise, plus tard.
+const RETRY_LATER_KEY: &str = "audio_embed_retry_later";
+
+/// Échecs de suite avant le report d'une piste (#9046). Un échec isolé — une
+/// panique due à un état passager — mérite un second essai ; trois de suite
+/// sur la même piste désignent la piste.
+const ECHECS_AVANT_REPORT: u32 = 3;
+
+/// Les échecs de suite, par piste, depuis le démarrage du serveur.
+static ECHECS_DE_SUITE: std::sync::Mutex<Option<std::collections::HashMap<i64, u32>>> =
+    std::sync::Mutex::new(None);
+
+/// Noter un échec sur `track_id`. Rend `true` quand la piste atteint
+/// [`ECHECS_AVANT_REPORT`] — son compteur repart alors de zéro.
+fn noter_un_echec(track_id: i64) -> bool {
+    let mut g = ECHECS_DE_SUITE.lock().unwrap_or_else(|e| e.into_inner());
+    let carte = g.get_or_insert_with(Default::default);
+    let n = carte.entry(track_id).or_insert(0);
+    *n += 1;
+    if *n >= ECHECS_AVANT_REPORT {
+        carte.remove(&track_id);
+        true
+    } else {
+        false
+    }
+}
+
+/// Une piste qui réussit efface ses échecs passés.
+fn oublier_les_echecs(track_id: i64) {
+    let mut g = ECHECS_DE_SUITE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(carte) = g.as_mut() {
+        carte.remove(&track_id);
+    }
+}
+
 /// Pourquoi le décodage n'a pas rendu d'échantillons.
 ///
 /// Le témoin étant posé quoi qu'il arrive, une piste en échec sort du balayage
@@ -561,6 +608,11 @@ pub async fn analyze_embedding_batch<E: Inference>(
     if rows.is_empty() {
         return 0;
     }
+    // #9046 — la passe TRAVAILLE dès que le lot démarre avec des candidats.
+    // Le témoin ne passait à vrai qu'à la FIN du premier lot productif — 32
+    // fichiers et autant de pauses : « Ce qui tourne » disait « rien ne
+    // tourne » pendant tout ce premier lot.
+    BALAYAGE_EN_COURS.store(true, std::sync::atomic::Ordering::Relaxed);
 
     let repo = TrackMetadataRepo::with_backend(backend.clone());
     let now = SystemTime::now()
@@ -571,6 +623,8 @@ pub async fn analyze_embedding_batch<E: Inference>(
     let mut done = 0usize;
     let mut invalid_rows = 0usize;
     let mut deferred = 0usize;
+    // #9046 — pistes en échec répété, mises à réessayer plus tard.
+    let mut reportees_apres_echecs = 0usize;
     let mut yielded_to_playback = false;
     for r in &rows {
         // #5138 — l'arrêt du serveur prime sur tout : pas une piste de plus.
@@ -764,11 +818,43 @@ pub async fn analyze_embedding_batch<E: Inference>(
             stamp_embedding_processed(&repo_bloquant, track_id)
         })
         .await;
-        match ecrit {
-            Ok(true) => done += 1,
-            Ok(false) => {}
+        let echec = match ecrit {
+            Ok(true) => {
+                done += 1;
+                oublier_les_echecs(track_id);
+                false
+            }
+            // Arrêt du serveur : rien d'illisible, la piste sera reprise.
+            Ok(false) if arret_demande() => false,
+            // Le témoin ne s'est pas écrit (`audio_embed_sentinel_write_failed`).
+            Ok(false) => true,
             // L'inférence a paniqué : dit, et la passe continue.
-            Err(e) => warn!(track_id, error = %e, "audio_embed_infer_interrupted"),
+            Err(e) => {
+                warn!(track_id, error = %e, "audio_embed_infer_interrupted");
+                true
+            }
+        };
+        // #9046, piste (b) — sans témoin, la piste revenait à CHAQUE lot.
+        if echec && noter_un_echec(track_id) {
+            match repo.set(track_id, RETRY_LATER_KEY, &deferral_stamp(now)) {
+                Ok(()) => {
+                    reportees_apres_echecs += 1;
+                    // Compté comme progrès : la ligne sort de la prochaine
+                    // requête, comme une piste reportée faute de chemin.
+                    done += 1;
+                    warn!(
+                        track_id,
+                        echecs = ECHECS_AVANT_REPORT,
+                        "audio_embed_echec_repete_reporte — piste en échec répété, \
+                         écartée du balayage et à réessayer plus tard (#9046)"
+                    );
+                }
+                Err(e) => warn!(
+                    track_id,
+                    error = %e,
+                    "audio_embed_echec_repete_report_impossible"
+                ),
+            }
         }
         // Relu à chaque fichier : baisser le débit pendant que l'analyse tourne
         // doit se sentir tout de suite, pas au prochain démarrage du serveur.
@@ -796,9 +882,13 @@ pub async fn analyze_embedding_batch<E: Inference>(
     // had to be reconstructed after the fact from a 5-minute process-wide RSS
     // sampler, which is what let "memory rises while the pass runs" pass for a
     // cause (#1462). Now the pass states its own cost, batch by batch.
+    // #9046 — le témoin d'activité dit ce que le lot a rendu ; la boucle le
+    // repose de toute façon à la fin du tour.
+    BALAYAGE_EN_COURS.store(done > 0, std::sync::atomic::Ordering::Relaxed);
     info!(
-        embedded = done - deferred,
+        embedded = done - deferred - reportees_apres_echecs,
         deferred,
+        reportees_apres_echecs,
         selected = rows.len(),
         invalid_rows,
         rss_mb = process_rss_mb().unwrap_or(0),
@@ -1124,6 +1214,12 @@ pub enum PauseAcoustique {
     /// machine ou la lecture le permet ; celle-ci n'attend que « Reprendre »,
     /// et elle survit au redémarrage du serveur.
     Utilisateur,
+    /// tune-server-rust#9046 — le chargement du modèle CLAP a été ABANDONNÉ
+    /// (`audio_embedder_load_timed_out` ou `audio_embedder_load_panicked`) :
+    /// la passe ne réessaiera pas avant le prochain redémarrage du serveur.
+    /// Elle se taisait (`paused_reason = null`) et l'écran montrait une jauge
+    /// immobile sans un mot — exactement l'écran du fil 2907.
+    ModeleIndisponible,
 }
 
 impl PauseAcoustique {
@@ -1138,6 +1234,7 @@ impl PauseAcoustique {
             PauseAcoustique::Memoire => Some("low_memory"),
             PauseAcoustique::NonPremium => Some("not_premium"),
             PauseAcoustique::Utilisateur => Some("paused"),
+            PauseAcoustique::ModeleIndisponible => Some("model_unavailable"),
         }
     }
 }
@@ -1153,6 +1250,7 @@ fn poser_pause(raison: PauseAcoustique) {
         PauseAcoustique::NonPremium => 4,
         PauseAcoustique::ScanBibliotheque => 5,
         PauseAcoustique::Utilisateur => 6,
+        PauseAcoustique::ModeleIndisponible => 7,
     };
     PAUSE_ACOUSTIQUE.store(code, std::sync::atomic::Ordering::Relaxed);
 }
@@ -1184,7 +1282,10 @@ fn pause_libere_session(pause: PauseAcoustique) -> bool {
         // clique « Reprendre », et survit même au redémarrage. Garder 1,2 Go
         // de modèle CLAP résidents pendant une pause qu'on a justement
         // demandée pour rendre la machine à la musique serait un contresens.
-        | PauseAcoustique::Utilisateur => true,
+        | PauseAcoustique::Utilisateur
+        // #9046 — rien à garder : aucune session n'a pu être bâtie, et il n'y
+        // en aura pas avant le redémarrage.
+        | PauseAcoustique::ModeleIndisponible => true,
     }
 }
 
@@ -1201,6 +1302,10 @@ fn pause_libere_session(pause: PauseAcoustique) -> bool {
 /// rend alors la mémoire au noyau ([`rendre_la_memoire_apres_relachement`]).
 fn entrer_en_pause<T>(embedder: &mut Option<T>, pause: PauseAcoustique) -> bool {
     poser_pause(pause);
+    // #9046 — une passe en pause ne travaille pas. Le témoin d'activité
+    // restait vrai après un lot productif interrompu (lecture, scan,
+    // chaleur…), et le registre la disait « en cours » pendant toute la pause.
+    BALAYAGE_EN_COURS.store(false, std::sync::atomic::Ordering::Relaxed);
     pause_libere_session(pause) && embedder.take().is_some()
 }
 
@@ -1218,6 +1323,68 @@ fn sieste_de_fin_de_tour(une_zone_joue: bool) -> u64 {
     if une_zone_joue { 2 } else { IDLE_SLEEP_SECS }
 }
 
+/// Au-delà de cette durée, une base qui dit « une zone joue » contre une
+/// mémoire qui dit « aucune » est corrigée (#9046, piste c). Dix minutes : la
+/// garde de lecture repasse toutes les 30 s, et un écart réel (écriture
+/// `stopped` ratée) ne se résorbe jamais de lui-même.
+const DIVERGENCE_AVANT_CORRECTION: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Où en est l'écart entre les deux témoins de lecture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Divergence {
+    /// Les deux témoins s'accordent, ou seule la mémoire voit jouer.
+    Aucune,
+    /// L'écart vient d'apparaître : le journaliser, une fois.
+    Debut,
+    /// L'écart dure, sous le seuil.
+    EnCours,
+    /// L'écart dure depuis le seuil : se fier à la mémoire, corriger la base.
+    Perimee,
+}
+
+/// Suivre l'écart « base : une zone joue » / « mémoire : aucune ».
+///
+/// Le sens inverse (la mémoire voit jouer, pas la base) n'est pas un écart à
+/// corriger : `save_play_state` note la mémoire AVANT d'écrire la base, et la
+/// passe cède alors, ce qui est le côté prudent.
+fn suivre_divergence(
+    base_joue: bool,
+    memoire_joue: bool,
+    depuis: &mut Option<std::time::Instant>,
+    maintenant: std::time::Instant,
+    seuil: std::time::Duration,
+) -> Divergence {
+    if !base_joue || memoire_joue {
+        *depuis = None;
+        return Divergence::Aucune;
+    }
+    match *depuis {
+        None => {
+            *depuis = Some(maintenant);
+            Divergence::Debut
+        }
+        Some(t) if maintenant.saturating_duration_since(t) >= seuil => {
+            *depuis = None;
+            Divergence::Perimee
+        }
+        Some(_) => Divergence::EnCours,
+    }
+}
+
+/// Remettre à `stopped` les zones que la base dit « playing » quand le témoin
+/// en mémoire dit qu'aucune ne joue (#9046). Relit la mémoire juste avant
+/// d'écrire : une zone qui vient de démarrer n'est pas touchée. Le démarrage
+/// du serveur fait déjà ce geste (`startup.rs`) ; il manquait en cours de vie.
+fn corriger_le_temoin_de_lecture_en_base(backend: &Arc<dyn DbBackend>) -> Result<usize, String> {
+    if crate::taches_de_fond::priorite::lecture_en_cours() {
+        return Err("une zone vient de se mettre à jouer".to_string());
+    }
+    backend.execute(
+        "UPDATE zones SET last_play_state = 'stopped' WHERE last_play_state = 'playing'",
+        &[],
+    )
+}
+
 /// Le dernier lot acoustique a-t-il rendu du travail ?
 ///
 /// C'est le signal d'activité de cette passe, et il n'en existait aucun :
@@ -1231,6 +1398,13 @@ pub fn balayage_acoustique_en_cours() -> bool {
 
 static BALAYAGE_EN_COURS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Remettre le témoin d'activité au repos — pour les essais seulement, qui
+/// partagent ce global du processus.
+#[doc(hidden)]
+pub fn balayage_au_repos_pour_les_essais() {
+    BALAYAGE_EN_COURS.store(false, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// Ce qui empêche la passe acoustique de travailler, s'il y a quelque chose.
 pub fn pause_acoustique() -> PauseAcoustique {
     match PAUSE_ACOUSTIQUE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1240,6 +1414,7 @@ pub fn pause_acoustique() -> PauseAcoustique {
         4 => PauseAcoustique::NonPremium,
         5 => PauseAcoustique::ScanBibliotheque,
         6 => PauseAcoustique::Utilisateur,
+        7 => PauseAcoustique::ModeleIndisponible,
         _ => PauseAcoustique::Aucune,
     }
 }
@@ -1476,6 +1651,9 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
         // du dernier essai infructueux, pour espacer les tentatives réseau.
         let mut modele_present = false;
         let mut dernier_essai_modele: Option<std::time::Instant> = None;
+        // #9046, piste (c) — depuis quand la base dit « une zone joue » alors
+        // que le témoin en mémoire dit « aucune » (voir [`suivre_divergence`]).
+        let mut divergence_depuis: Option<std::time::Instant> = None;
         loop {
             // #5138 — l'arrêt du serveur termine la passe, session relâchée.
             if arret_demande() {
@@ -1602,14 +1780,62 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                     pause_utilisateur = false;
                     info!("audio_embed_reprise_utilisateur");
                 }
-                if crate::audio::replaygain::any_zone_playing(&backend) {
+                // #9046, piste (c) — DEUX témoins de lecture : la base
+                // (`zones.last_play_state`), que cette garde lisait seule, et la
+                // mémoire (`priorite`), que lit « Ce qui tourne ». Une écriture
+                // `stopped` ratée laissait la base à « playing » : la passe
+                // cédait à vie pendant que l'écran disait « aucune zone ne
+                // joue ». L'écart est journalisé une fois, et corrigé au bout
+                // de `DIVERGENCE_AVANT_CORRECTION` — la mémoire fait foi, elle
+                // est notée par `save_play_state` quoi que rende l'écriture.
+                let memoire_joue = crate::taches_de_fond::priorite::lecture_en_cours();
+                let mut zone_en_base = crate::audio::replaygain::playing_zone_name(&backend);
+                match suivre_divergence(
+                    zone_en_base.is_some(),
+                    memoire_joue,
+                    &mut divergence_depuis,
+                    std::time::Instant::now(),
+                    DIVERGENCE_AVANT_CORRECTION,
+                ) {
+                    Divergence::Aucune | Divergence::EnCours => {}
+                    Divergence::Debut => warn!(
+                        zone = zone_en_base.as_deref().unwrap_or("?"),
+                        correction_apres_s = DIVERGENCE_AVANT_CORRECTION.as_secs(),
+                        "audio_embed_temoins_de_lecture_divergents — la base dit qu'une zone joue, \
+                         le témoin en mémoire dit qu'aucune ne joue (#9046)"
+                    ),
+                    Divergence::Perimee => {
+                        let zone = zone_en_base.take().unwrap_or_else(|| "?".to_string());
+                        match corriger_le_temoin_de_lecture_en_base(&backend) {
+                            Ok(n) => warn!(
+                                zone = %zone,
+                                zones_corrigees = n,
+                                apres_s = DIVERGENCE_AVANT_CORRECTION.as_secs(),
+                                "audio_embed_temoin_de_lecture_corrige — base remise à « stopped », \
+                                 la mémoire fait foi (#9046)"
+                            ),
+                            Err(e) => {
+                                // Correction impossible (ou une zone vient de
+                                // se mettre à jouer) : on garde la prudence.
+                                warn!(zone = %zone, error = %e, "audio_embed_temoin_de_lecture_non_corrige");
+                                zone_en_base = Some(zone);
+                            }
+                        }
+                    }
+                }
+                if memoire_joue || zone_en_base.is_some() {
                     // #4681 — au relevé de `/system/background-tasks`.
                     crate::taches_de_fond::priorite::noter_cedee(
                         crate::taches_de_fond::Tache::Acoustique.id(),
                     );
                     if !playback_hold {
                         playback_hold = true;
+                        // #9046 — NOMMER la zone qui retient la passe, et dire
+                        // quel témoin la voit jouer.
                         info!(
+                            zone = zone_en_base.as_deref().unwrap_or("?"),
+                            temoin_memoire = memoire_joue,
+                            temoin_base = zone_en_base.is_some(),
                             "audio_embed_yield_to_playback — zone playing, acoustic analysis paused until playback stops"
                         );
                     }
@@ -1735,7 +1961,12 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                 }
                 // Passé les trois gardes, plus rien n'empêche la passe de
                 // travailler : ce qu'affiche l'interface doit le suivre.
-                poser_pause(PauseAcoustique::Aucune);
+                // Sauf un modèle abandonné (#9046) : la raison reste dite.
+                poser_pause(if load_abandonne {
+                    PauseAcoustique::ModeleIndisponible
+                } else {
+                    PauseAcoustique::Aucune
+                });
 
                 // Le nombre de fils est figé à la construction de la session.
                 // Si le réglage a changé depuis, on relâche la session pour
@@ -1813,7 +2044,17 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
                             info!(inherited, "audio_embed_inherited_from_twins");
                         }
                     }
-                    TourDeBalayage::ModeleIndisponible => {}
+                    TourDeBalayage::ModeleIndisponible => {
+                        BALAYAGE_EN_COURS.store(false, std::sync::atomic::Ordering::Relaxed);
+                        // #9046, piste (a) — le chargement a été ABANDONNÉ
+                        // (délai dépassé ou panique) : le dire à l'interface,
+                        // `paused_reason = "model_unavailable"`. Un simple
+                        // échec (modèle à télécharger, runtime absent) se
+                        // réessaie au tour suivant et ne s'annonce pas ainsi.
+                        if load_abandonne {
+                            poser_pause(PauseAcoustique::ModeleIndisponible);
+                        }
+                    }
                 }
             }
             // Une zone joue à la fin du tour : ne PAS s'endormir un quart
@@ -2095,6 +2336,8 @@ mod tests {
             PauseAcoustique::Memoire,
             PauseAcoustique::NonPremium,
             PauseAcoustique::ScanBibliotheque,
+            PauseAcoustique::Utilisateur,
+            PauseAcoustique::ModeleIndisponible,
         ];
         for raison in toutes {
             poser_pause(raison);
@@ -2146,6 +2389,147 @@ mod tests {
         assert_eq!(
             repo.get_all(42).unwrap().get(SENTINEL).map(String::as_str),
             Some(MODEL_ID)
+        );
+    }
+
+    /// #9046, piste (a) — un modèle abandonné se dit à l'interface, sous un nom
+    /// que le client traduit, et relâche toute session.
+    #[test]
+    fn le_modele_abandonne_se_publie_model_unavailable_9046() {
+        let _serialise = ETAT_PAUSE.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            PauseAcoustique::ModeleIndisponible.nom(),
+            Some("model_unavailable")
+        );
+        assert!(pause_libere_session(PauseAcoustique::ModeleIndisponible));
+        poser_pause(PauseAcoustique::ModeleIndisponible);
+        assert_eq!(pause_acoustique(), PauseAcoustique::ModeleIndisponible);
+        poser_pause(PauseAcoustique::Aucune);
+    }
+
+    /// #9046 — une passe qui entre en pause ne se dit plus « en cours ».
+    #[test]
+    fn entrer_en_pause_eteint_le_temoin_d_activite_9046() {
+        let _serialise = ETAT_PAUSE.lock().unwrap_or_else(|e| e.into_inner());
+        BALAYAGE_EN_COURS.store(true, std::sync::atomic::Ordering::Relaxed);
+        let mut session: Option<()> = None;
+        entrer_en_pause(&mut session, PauseAcoustique::Lecture);
+        assert!(!balayage_acoustique_en_cours());
+        poser_pause(PauseAcoustique::Aucune);
+    }
+
+    /// #9046, piste (b) — trois échecs de suite reportent la piste, une
+    /// réussite efface le compte.
+    #[test]
+    fn trois_echecs_de_suite_reportent_la_piste_9046() {
+        let id = 9_046_001;
+        assert!(!noter_un_echec(id));
+        assert!(!noter_un_echec(id));
+        assert!(noter_un_echec(id), "le troisième échec reporte la piste");
+        assert!(!noter_un_echec(id), "le compteur repart de zéro");
+        oublier_les_echecs(id);
+        assert!(!noter_un_echec(id));
+        assert!(!noter_un_echec(id));
+        oublier_les_echecs(id);
+        assert!(!noter_un_echec(id), "une réussite efface les échecs passés");
+        oublier_les_echecs(id);
+    }
+
+    /// #9046, piste (c) — l'écart base « joue » / mémoire « aucune » se signale
+    /// une fois, puis se corrige au seuil ; tout accord le remet à zéro.
+    #[test]
+    fn l_ecart_des_temoins_de_lecture_se_signale_puis_se_corrige_9046() {
+        use std::time::{Duration, Instant};
+        let seuil = Duration::from_secs(600);
+        let t0 = Instant::now();
+        let mut depuis = None;
+        assert_eq!(
+            suivre_divergence(false, false, &mut depuis, t0, seuil),
+            Divergence::Aucune
+        );
+        assert_eq!(
+            suivre_divergence(true, true, &mut depuis, t0, seuil),
+            Divergence::Aucune
+        );
+        // La mémoire voit jouer, pas la base : prudent, pas un écart.
+        assert_eq!(
+            suivre_divergence(false, true, &mut depuis, t0, seuil),
+            Divergence::Aucune
+        );
+        assert_eq!(
+            suivre_divergence(true, false, &mut depuis, t0, seuil),
+            Divergence::Debut
+        );
+        assert_eq!(
+            suivre_divergence(
+                true,
+                false,
+                &mut depuis,
+                t0 + Duration::from_secs(30),
+                seuil
+            ),
+            Divergence::EnCours
+        );
+        assert_eq!(
+            suivre_divergence(true, false, &mut depuis, t0 + seuil, seuil),
+            Divergence::Perimee
+        );
+        assert!(depuis.is_none(), "après correction, l'écart repart de zéro");
+        // Un accord entre-temps efface l'écart.
+        assert_eq!(
+            suivre_divergence(true, false, &mut depuis, t0, seuil),
+            Divergence::Debut
+        );
+        assert_eq!(
+            suivre_divergence(true, true, &mut depuis, t0, seuil),
+            Divergence::Aucune
+        );
+        assert_eq!(
+            suivre_divergence(true, false, &mut depuis, t0 + seuil, seuil),
+            Divergence::Debut
+        );
+    }
+
+    /// #9046, piste (c) — la correction remet la base à « stopped », et
+    /// s'abstient si la mémoire voit une zone jouer.
+    #[test]
+    fn la_correction_remet_la_base_a_stopped_sauf_lecture_en_memoire_9046() {
+        let _serialise = ETAT_PAUSE.lock().unwrap_or_else(|e| e.into_inner());
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE zones (id INTEGER PRIMARY KEY, name TEXT, last_play_state TEXT);
+             INSERT INTO zones (id, name, last_play_state)
+                 VALUES (1, 'Salon', 'playing'), (2, 'Bureau', 'paused');",
+        )
+        .unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+
+        crate::taches_de_fond::priorite::noter_etat_de_lecture(9_046_002, "playing");
+        assert!(corriger_le_temoin_de_lecture_en_base(&backend).is_err());
+        assert_eq!(
+            crate::audio::replaygain::playing_zone_name(&backend).as_deref(),
+            Some("Salon")
+        );
+        crate::taches_de_fond::priorite::noter_etat_de_lecture(9_046_002, "stopped");
+
+        // Le témoin en mémoire est un global du processus : d'autres essais
+        // (pollers) peuvent y noter une zone. Attendre qu'il soit au repos.
+        for _ in 0..200 {
+            if !crate::taches_de_fond::priorite::lecture_en_cours() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(corriger_le_temoin_de_lecture_en_base(&backend), Ok(1));
+        assert_eq!(crate::audio::replaygain::playing_zone_name(&backend), None);
+        let pause = backend
+            .query_one("SELECT last_play_state FROM zones WHERE id = 2", &[])
+            .unwrap()
+            .and_then(|c| c.first().and_then(|v| v.as_string()));
+        assert_eq!(
+            pause.as_deref(),
+            Some("paused"),
+            "une zone en pause reste en pause"
         );
     }
 
@@ -2669,7 +3053,8 @@ mod tests {
             .find("if !modele_present {")
             .expect("le bloc de téléchargement a disparu ou a été renommé");
         let cession = source
-            .find("if crate::audio::replaygain::any_zone_playing(&backend) {")
+            // #9046 — la garde lit désormais les DEUX témoins de lecture.
+            .find("if memoire_joue || zone_en_base.is_some() {")
             .expect("la cession à la lecture a disparu ou a été renommée");
 
         assert!(

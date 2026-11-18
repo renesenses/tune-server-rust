@@ -276,7 +276,9 @@ pub enum CandidatAcoustique {
 /// [`eligible_count`] doit partager le MÊME prédicat.
 ///
 /// `seuil_report` : l'estampille en deçà de laquelle un report de chemin
-/// (#1865) est périmé.
+/// (#1865) est périmé. Le même seuil périme le report « à réessayer plus
+/// tard » d'une piste en échec répété (`audio_embed_retry_later`, #9046) :
+/// sans lui, `LIMIT` sans `ORDER BY` rendait les mêmes pistes à chaque lot.
 pub fn candidats_acoustiques(
     backend: &Arc<dyn DbBackend>,
     seuil_report: &str,
@@ -296,12 +298,16 @@ pub fn candidats_acoustiques(
            AND NOT EXISTS (SELECT 1 FROM track_metadata m \
                  WHERE m.track_id = t.id AND m.key = 'audio_embed_path_unresolved' \
                    AND m.value > ?) \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'audio_embed_retry_later' \
+                   AND m.value > ?) \
          LIMIT ?"
     );
     let rows = backend.query_many(
         &sql,
         &[
             &MODEL_ID as &dyn ToSqlValue,
+            &seuil_report as &dyn ToSqlValue,
             &seuil_report as &dyn ToSqlValue,
             &limite as &dyn ToSqlValue,
         ],
