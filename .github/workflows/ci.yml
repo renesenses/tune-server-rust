@@ -141,9 +141,10 @@ jobs:
       # reste (push du lot ou de main, nuit, lancement manuel, PR vers main,
       # etiquette `ci:full`) lance tout. Une PR vers rc/* allume les familles
       # dont un check est requis sur rc/* (audit, FFI) plus Windows et macOS.
-      # Jeu livre, embedding et librespot restent EN PLUS soumis a
-      # `full` (profil rapide des PR vers batch/* et rc/* : sautes comme
-      # avant cette etape, quel que soit le diff). Un job saute est
+      # Jeu livre et librespot restent EN PLUS soumis a `full` (profil
+      # rapide des PR vers batch/* et rc/* : sautes comme avant cette etape,
+      # quel que soit le diff). Embedding ne l'est plus (#9046) : il tourne
+      # des que le diff le touche. Un job saute est
       # « skipped », que GitHub compte comme reussi pour un controle requis :
       # aucun controle requis ne disparait. Fail-closed : base introuvable,
       # diff impossible ou sortie incomplete => tout allume.
@@ -458,7 +459,12 @@ jobs:
   audio-embedding:
     name: Audio embedding feature
     needs: impact
-    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true' && needs.impact.outputs.embedding == 'true'
+    # #9046 — plus soumis a `full` : sur une PR vers batch/* (profil rapide),
+    # le job etait TOUJOURS saute, et aucun test du module `embedding` (tout
+    # entier sous `audio-embedding`) ne tournait en CI, meme quand la PR ne
+    # touchait que lui. Le classifieur n'allume `embedding` que si le diff
+    # touche `*embedding*` / `*onnx*` : le profil rapide reste rapide ailleurs.
+    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.embedding == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45  # audio-embedding — ~5 min observe
     steps:
