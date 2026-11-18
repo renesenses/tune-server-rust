@@ -222,6 +222,7 @@ impl Controleur {
         }
         info!(
             entree = %capture.nom,
+            peripherique = %capture.id,
             frequence = format.frequence,
             bits = format.bits,
             canaux = format.canaux,

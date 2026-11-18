@@ -27,6 +27,9 @@ pub struct Simulees {
     pub demarrages: Mutex<Vec<(String, u32)>>,
     /// Tant que vrai, `format_natif` ne rend pas la main (CoreAudio muet).
     pub muet: AtomicBool,
+    /// #9070 — vrai : la capture s'ouvre mais le pilote ne remet AUCUNE
+    /// trame (micro USB ouvert en ALSA direct, fil 2770).
+    pub sans_trames: AtomicBool,
 }
 
 impl Simulees {
@@ -152,7 +155,11 @@ impl Peripheriques for Simulees {
             .push((entree.to_string(), f));
         let vivant = Arc::new(AtomicBool::new(true));
         let v = vivant.clone();
+        let sans_trames = self.sans_trames.load(Ordering::SeqCst);
         std::thread::spawn(move || {
+            if sans_trames {
+                return;
+            }
             let par_bloc = (f / 100) as usize; // 10 ms
             let mut n: u32 = 0;
             while v.load(Ordering::SeqCst) {
@@ -185,6 +192,7 @@ impl Peripheriques for Simulees {
         });
         Ok(CaptureDemarree {
             nom: entree.to_string(),
+            id: format!("simule:{entree}"),
             format: format(f, canaux),
             arret: Box::new(ArretSimule(vivant)),
         })

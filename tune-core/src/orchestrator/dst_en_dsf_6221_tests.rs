@@ -116,6 +116,7 @@ async fn un_dst_vers_un_renderer_dsd_part_en_dsf_natif() {
         supports_dsf: true,
         supports_dff: false,
         dsf_mime: Some("audio/x-dsf".into()),
+        ..Default::default()
     })
     .await;
     let resolu = r.resolu.expect("le DST se résout");
@@ -161,6 +162,7 @@ async fn un_dst_vers_un_renderer_sans_dsd_reste_en_pcm() {
         supports_dsf: false,
         supports_dff: false,
         dsf_mime: None,
+        ..Default::default()
     })
     .await;
     match r.resolu {

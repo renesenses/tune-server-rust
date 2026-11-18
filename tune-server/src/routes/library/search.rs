@@ -601,23 +601,26 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
     // Une piste dont le fichier ne répond pas est reportée, jamais marquée
     // analysée. Elle sort du travail disponible pendant le même délai que
     // la requête des candidats, et reste comptée séparément (#4187).
+    // Les pistes en échec répété mises « à réessayer plus tard » y sont
+    // comptées aussi (#9046).
     #[cfg(feature = "audio-embedding")]
-    let deferred = {
+    let (deferred, apres_echecs) = {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs() as i64;
-        tune_core::audio::embedding_store::deferred_count(
-            &state.backend,
-            &tune_core::library::local_path::deferral_threshold(now),
+        let seuil = tune_core::library::local_path::deferral_threshold(now);
+        (
+            tune_core::audio::embedding_store::deferred_count(&state.backend, &seuil),
+            tune_core::audio::embedding_store::retry_later_count(&state.backend, &seuil),
         )
     };
     #[cfg(not(feature = "audio-embedding"))]
-    let deferred = 0_i64;
+    let (deferred, apres_echecs) = (0_i64, 0_i64);
     let total_eligible = eligible;
     let eligible = (total_eligible - deferred).max(0);
     let pending = (eligible - processed).max(0);
-    let waiting_reason = (pending == 0 && deferred > 0).then_some("unresolved_paths");
+    let waiting_reason = raison_d_attente(pending, deferred, apres_echecs);
 
     let throttle = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
         .get("audio_embedding_throttle")
@@ -685,7 +688,8 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
         "enabled": enabled,
         "model_ready": model_ready,
         "model_fetch": model_fetch,
-        // « playback » | « thermal » | « low_memory » | « not_premium » | null
+        // « playback » | « thermal » | « low_memory » | « not_premium »
+        // | « library_scan » | « paused » | « model_unavailable » (#9046) | null
         "paused_reason": paused_reason,
         // Embeddings réellement écrits pour le modèle courant.
         "analysed_tracks": analysed,
@@ -703,12 +707,45 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
         // Population totale, y compris les chemins temporairement reportés.
         "total_eligible_tracks": total_eligible,
         "deferred_tracks": deferred,
+        // #9046 — parmi `deferred_tracks`, celles reportées après des échecs
+        // répétés d'analyse (pas un fichier qui ne répond pas).
+        "retry_later_tracks": apres_echecs,
+        // « unresolved_paths » | « analysis_failures » (#9046) | null
         "waiting_reason": waiting_reason,
         "throttle": throttle,
         // Une requete libre en francais est-elle traduite avant d'atteindre la
         // tour texte ? `false` = elle part brute, et l'ecran doit le dire.
         "translation_available": translation_available,
     }))
+}
+
+/// Pourquoi il ne reste rien à faire maintenant alors que la passe n'est pas
+/// finie. `unresolved_paths` dès qu'un fichier ne répond pas (le geste est
+/// côté disque) ; `analysis_failures` quand SEULES des pistes en échec
+/// répété d'analyse attendent leur nouvel essai (#9046).
+fn raison_d_attente(pending: i64, deferred: i64, apres_echecs: i64) -> Option<&'static str> {
+    if pending > 0 || deferred <= 0 {
+        return None;
+    }
+    if deferred > apres_echecs {
+        Some("unresolved_paths")
+    } else {
+        Some("analysis_failures")
+    }
+}
+
+#[cfg(test)]
+mod raison_d_attente_9046 {
+    use super::raison_d_attente;
+
+    #[test]
+    fn les_echecs_d_analyse_ne_se_disent_pas_fichier_absent() {
+        assert_eq!(raison_d_attente(0, 3, 3), Some("analysis_failures"));
+        assert_eq!(raison_d_attente(0, 3, 1), Some("unresolved_paths"));
+        assert_eq!(raison_d_attente(0, 3, 0), Some("unresolved_paths"));
+        assert_eq!(raison_d_attente(2, 3, 3), None);
+        assert_eq!(raison_d_attente(0, 0, 0), None);
+    }
 }
 
 #[cfg(all(test, feature = "audio-embedding"))]
@@ -749,6 +786,30 @@ mod acoustic_reports_4187 {
         assert_eq!(body["eligible_tracks"], 2);
         assert_eq!(body["pending_tracks"], 1);
         assert_eq!(body["waiting_reason"], Value::Null);
+    }
+
+    /// #9046 — une piste en échec répété d'analyse n'est pas « un fichier qui
+    /// ne répond pas ».
+    #[tokio::test]
+    async fn la_route_9046_nomme_les_echecs_d_analyse_a_part() {
+        use tune_core::db::{models::Track, track_repo::TrackRepo};
+        use tune_core::library::local_path::deferral_stamp;
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let tracks = TrackRepo::with_backend(state.backend.clone());
+        let mut track = Track::new("Plante".into());
+        track.format = Some("flac".into());
+        track.file_path = Some("/x/plante.flac".into());
+        let plante = tracks.create(&track).unwrap();
+        let date = deferral_stamp(chrono::Utc::now().timestamp());
+        state.backend.execute("INSERT INTO track_metadata (track_id, key, value) VALUES (?, 'audio_embed_retry_later', ?)", &[&plante, &date]).unwrap();
+        let Json(body) = acoustic_status(State(state)).await;
+        assert_eq!(body["deferred_tracks"], 1);
+        assert_eq!(body["retry_later_tracks"], 1);
+        assert_eq!(body["pending_tracks"], 0);
+        assert_eq!(
+            body["waiting_reason"], "analysis_failures",
+            "une inférence qui plante n'est pas un fichier qui ne répond pas"
+        );
     }
 }
 

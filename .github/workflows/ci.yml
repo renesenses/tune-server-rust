@@ -54,6 +54,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Vérifier les payloads de promotion (200 Kio, aucun réseau)
+        run: python3 scripts/test-promotion-payloads-8902.py
+
       - name: Verify generated plugin lists
         run: python scripts/plugin-catalog.py --check
 
@@ -138,9 +141,10 @@ jobs:
       # reste (push du lot ou de main, nuit, lancement manuel, PR vers main,
       # etiquette `ci:full`) lance tout. Une PR vers rc/* allume les familles
       # dont un check est requis sur rc/* (audit, FFI) plus Windows et macOS.
-      # Jeu livre, embedding et librespot restent EN PLUS soumis a
-      # `full` (profil rapide des PR vers batch/* et rc/* : sautes comme
-      # avant cette etape, quel que soit le diff). Un job saute est
+      # Jeu livre et librespot restent EN PLUS soumis a `full` (profil
+      # rapide des PR vers batch/* et rc/* : sautes comme avant cette etape,
+      # quel que soit le diff). Embedding ne l'est plus (#9046) : il tourne
+      # des que le diff le touche. Un job saute est
       # « skipped », que GitHub compte comme reussi pour un controle requis :
       # aucun controle requis ne disparait. Fail-closed : base introuvable,
       # diff impossible ou sortie incomplete => tout allume.
@@ -399,7 +403,7 @@ jobs:
     needs: impact
     if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true' && needs.impact.outputs.livre == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 45  # test-shipped-features — ~5 min observe
+    timeout-minutes: 75  # compilation + suite complete : coupures observees a 45 min
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -455,7 +459,12 @@ jobs:
   audio-embedding:
     name: Audio embedding feature
     needs: impact
-    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true' && needs.impact.outputs.embedding == 'true'
+    # #9046 — plus soumis a `full` : sur une PR vers batch/* (profil rapide),
+    # le job etait TOUJOURS saute, et aucun test du module `embedding` (tout
+    # entier sous `audio-embedding`) ne tournait en CI, meme quand la PR ne
+    # touchait que lui. Le classifieur n'allume `embedding` que si le diff
+    # touche `*embedding*` / `*onnx*` : le profil rapide reste rapide ailleurs.
+    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.embedding == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45  # audio-embedding — ~5 min observe
     steps:
@@ -974,6 +983,21 @@ jobs:
           # aucune version corrigee, migration vers jiff/time a planifier.
           # Justification dans .cargo/audit.toml.
           ignore: RUSTSEC-2024-0436,RUSTSEC-2024-0384,RUSTSEC-2026-0543
+      # QA 18/11 — sur 14 jours, ~96 échecs de cette porte. Relu sur les 21
+      # journaux encore disponibles : AUCUN faux rouge. Deux vrais avis, chacun
+      # rougissant toutes les PR jusqu'à son traitement : RUSTSEC-2026-0538
+      # (quinn-udp, vulnérabilité, 13/11, corrigé par mise à jour) et
+      # RUSTSEC-2026-0543 (chrono non maintenu, 16-17/11, excepté par
+      # 928b920c0). La porte reste donc BLOQUANTE. Mais l'action n'écrit l'avis
+      # que dans le résumé du run (« 1 entries found ») : le journal ne disait
+      # pas LEQUEL, et chaque PR rouge se lisait comme une panne. En cas
+      # d'échec, cette étape écrit l'avis dans le journal. `cargo audit` nu lit
+      # `.cargo/audit.toml` (même liste d'exceptions, `deny = ["warnings"]`,
+      # tenue identique par `les_trois_listes_dexceptions_rustsec_sont_identiques`) :
+      # aucune liste de plus à faire dériver.
+      - name: Dire quel avis bloque (si l'audit a échoué)
+        if: failure()
+        run: cargo audit || true
       # Cet outil est exclu du workspace et possède son propre verrou.
       # L'audit de la racine ne couvre donc pas ses dépendances (#6503).
       - name: Auditer le verrou du moissonneur Roon
