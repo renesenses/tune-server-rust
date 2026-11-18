@@ -328,7 +328,7 @@ fn soixante_quatre_bits_reels_de_bout_en_bout() {
     // doit se retrouver en sortie.
     let mut entree2 = entree.clone();
     entree2[2 * 1_000] += 2f64.powi(-40);
-    assert_eq!((entree2[2000] as f32), (entree[2000] as f32));
+    assert_eq!(entree2[2000] as f32, entree[2000] as f32);
     let mut etage2 = EtageUpsampling::nouveau("polyvalent", 176_400).unwrap();
     let sortie2 = jouer(&mut etage2, 44_100, &entree2, BLOC);
     assert_ne!(
@@ -611,11 +611,10 @@ fn vidange_rend_exactement_la_latence_et_reinitialiser_repart_a_neuf() {
     let r = reference("precision", 48_000, 384_000, &avec_zeros);
     assert_eq!(vidange[..], r[premier.len()..premier.len() + vidange.len()]);
 
-    // Réinitialiser : la même entrée redonne la même sortie, au bit près.
+    // Réinitialiser (sans repréparer) : la même entrée redonne la même
+    // sortie, au bit près.
     etage.reinitialiser();
-    let d = etage.preparer(format(48_000), BLOC).unwrap();
     let mut s = vec![0.0; d.capacite_sortie()];
-    etage.reinitialiser();
     let mut deuxieme = Vec::new();
     for m in entree.chunks(BLOC * 2) {
         let n = etage.traiter_vers(m, m.len() / 2, &mut s).unwrap();
