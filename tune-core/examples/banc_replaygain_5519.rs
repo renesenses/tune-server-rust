@@ -569,6 +569,7 @@ fn etage_g_sur(rt: &tokio::runtime::Runtime, b: &Arc<dyn DbBackend>, nom: &str, 
                 effacer_le_report: true,
                 report: None,
                 mesure: Some((-12.5 - i as f64 / 7.0, 0.98, 1.01, Some(11))),
+                plage_de_sonie: None,
                 empreinte: Some(format!("env100ms-v1:{}", "ab".repeat(400))),
                 temoin: Some("1790000000".into()),
             })
