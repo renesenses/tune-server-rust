@@ -3569,6 +3569,11 @@ fn row_to_zone(cols: &[SqlValue]) -> Zone {
     }
 }
 
+// #9044 — oublier un appareil absent : suppression définitive de sa zone.
+#[path = "oubli_appareil_9044.rs"]
+mod oubli_appareil_9044;
+pub use oubli_appareil_9044::ZoneDAppareil;
+
 #[cfg(test)]
 #[path = "zone_navigateur_jumelle_3067_tests.rs"]
 mod zone_navigateur_jumelle_3067_tests;
