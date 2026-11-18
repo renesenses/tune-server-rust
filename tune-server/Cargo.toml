@@ -10,6 +10,10 @@ default = ["local-audio", "oaat", "cloud-relay", "bandcamp", "pont-roon", "cd", 
 # La capture de `entree-audio` (cpal en entrée) suit la pile audio locale :
 # sans elle, le greffon compile et dit que la capture n'est pas compilée.
 local-audio = ["tune-core/local-audio", "tune-entree-audio?/capture", "tune-calibration-greffon?/capture"]
+# Build « pure lecture » : HORS `default`. Ne lance pas les passes de fond
+# MusicBrainz (genres d'album, noms de tri, MBID, pays des artistes et des
+# éditions) ni l'envoi des écoutes au compte. Les routes, elles, restent.
+lecture-seule = []
 asio = ["tune-core/asio"]
 # #4378 : lecture des DSDIFF compressés DST. Hors `default`, mais livrée par
 # toutes les lignes de build publiées (licence de `dst-decoder` acceptée le

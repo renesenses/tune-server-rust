@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+#[cfg_attr(feature = "lecture-seule", allow(unused_imports))]
 use tracing::{debug, error, info, warn};
 
 use tune_core::db::zone_repo::CreationDeZone;
@@ -12,6 +13,11 @@ use crate::state::AppState;
 /// Spawn all periodic background tasks: squeezebox polling, session GC, position poller,
 /// token refresh, UPnP advertiser, alarm scheduler, Deezer proxy config, desktop notifications,
 /// and RSS memory diagnostics.
+/// Avec la feature `lecture-seule` (HORS `default`, aucun build existant ne
+/// change), les passes de fond qui interrogent MusicBrainz (genres d'album,
+/// noms de tri, vérification des MBID, pays des artistes et des éditions) et
+/// l'envoi des écoutes au compte ne sont pas lancées. Pour un build « pure
+/// lecture » (tune-diretta light) : rien ne part seul vers l'extérieur.
 pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // AVANT tout spawn (#4574). Les passes de fond relisent leur pause dans un
     // miroir en mémoire qui part à zéro ; sans cette relecture, une pause posée
@@ -67,6 +73,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_telemetry_reporter(state);
     spawn_heartbeat(state);
     spawn_bio_sync(state);
+    #[cfg(not(feature = "lecture-seule"))]
     spawn_verification_mbid_artistes(state);
     spawn_reprise_favoris_streaming(state);
     spawn_veille_favoris_miroir(state);
@@ -99,6 +106,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     crate::routes::system::sauvegarde_cloud::spawn(state);
     // « Mes écoutes, tous serveurs » (#6510) : l'envoi des écoutes au compte,
     // opt-in et désactivé par défaut. Un test de câblage garde la ligne.
+    #[cfg(not(feature = "lecture-seule"))]
     tune_core::cloud::ecoutes_au_compte::spawn(state.backend.clone(), state.http_client.clone());
     // Notes et écoutes de la communauté (#6545) : consentement séparé,
     // désactivé par défaut. Un test de câblage garde la ligne.
@@ -150,12 +158,16 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
         tune_core::playback::SILENCE_AVANT_ZONE_FIGEE,
     );
     spawn_mp3_duration_repair(state);
+    #[cfg(not(feature = "lecture-seule"))]
     spawn_rattrapage_genres_d_album(state);
     // #6773 — noms de tri des artistes : rattrapage MusicBrainz des fiches
     // déjà identifiées, puis déduction « Nom, Prénom ». Un test de câblage
     // garde la ligne.
+    #[cfg(not(feature = "lecture-seule"))]
     spawn_rattrapage_noms_de_tri(state);
+    #[cfg(not(feature = "lecture-seule"))]
     spawn_pays_des_artistes(state);
+    #[cfg(not(feature = "lecture-seule"))]
     spawn_pays_des_editions(state);
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state, config);
@@ -290,6 +302,7 @@ async fn spawn_ecoute_directe(state: &AppState) {
 /// Oxygen, qui lit les pistes, ne voyait pas le genre de la Bibliothèque. Une
 /// passe au démarrage, idempotente (`genre_album_pistes::rattraper_les_genres_tenus`
 /// marque chaque album traité) : sur une base déjà rattrapée, une requête.
+#[cfg_attr(feature = "lecture-seule", allow(dead_code))]
 fn spawn_rattrapage_genres_d_album(state: &AppState) {
     let backend = state.backend.clone();
     tokio::spawn(async move {
@@ -319,6 +332,7 @@ const RATTRAPAGE_NOMS_DE_TRI_PAR_TOUR: usize = 60;
 ///    gardes que la passe automatique des crédits : droit d'enrichissement
 ///    automatique, pause « Enrichissement », limiteur MusicBrainz partagé.
 ///    Curseur en base : un arrêt ou une panne reprend où il s'était arrêté.
+#[cfg_attr(feature = "lecture-seule", allow(dead_code))]
 fn spawn_rattrapage_noms_de_tri(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
@@ -419,6 +433,7 @@ const PAYS_DES_ARTISTES_RELANCE: std::time::Duration = std::time::Duration::from
 /// le rattrapage des noms de tri : droit d'enrichissement automatique, pause
 /// « Enrichissement », limiteur MusicBrainz partagé. Curseur en base : un
 /// arrêt ou une panne reprend où il s'était arrêté.
+#[cfg_attr(feature = "lecture-seule", allow(dead_code))]
 fn spawn_pays_des_artistes(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
@@ -501,6 +516,7 @@ const PAYS_DES_EDITIONS_RELANCE: std::time::Duration = std::time::Duration::from
 /// Mêmes gardes que le pays des artistes (#8090) : droit d'enrichissement
 /// automatique, pause « Enrichissement », limiteur MusicBrainz partagé (une
 /// release déjà gardée en base ne coûte aucune requête). Curseur en base.
+#[cfg_attr(feature = "lecture-seule", allow(dead_code))]
 fn spawn_pays_des_editions(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
@@ -3095,6 +3111,7 @@ const VERIFICATION_MBID_RELANCE_SECS: u64 = 3600;
 /// `tune_core::metadata::verification_mbid_artistes` ; ici, le DROIT : la
 /// passe ne part qu'avec l'enrichissement automatique (`AutoEnrichment`),
 /// comme la descente des bios communautaires.
+#[cfg_attr(feature = "lecture-seule", allow(dead_code))]
 fn spawn_verification_mbid_artistes(state: &AppState) {
     let license = state.license.clone();
     let db = state.backend.clone();
@@ -4287,6 +4304,36 @@ mod tests_licence_proprietaire_battement {
             source[debut..fin].contains("routes::system::sauvegarde_cloud::spawn(state);"),
             "la passe de sauvegarde cloud n'est plus lancee au demarrage"
         );
+    }
+
+    /// Build « pure lecture » : chaque passe MusicBrainz et l'envoi des écoutes
+    /// doivent rester derrière `not(feature = "lecture-seule")`. Si quelqu'un
+    /// retire la condition, la version light relancerait ces tâches en silence.
+    #[test]
+    fn les_passes_musicbrainz_et_les_ecoutes_sont_coupees_en_lecture_seule() {
+        let source = include_str!("background.rs");
+        let debut = source
+            .find("pub async fn spawn_background_tasks")
+            .expect("spawn_background_tasks a disparu");
+        let fin = debut + source[debut..].find("\n}\n").expect("fin du corps");
+        let corps = &source[debut..fin];
+        for appel in [
+            "spawn_verification_mbid_artistes(state);",
+            "spawn_rattrapage_genres_d_album(state);",
+            "spawn_rattrapage_noms_de_tri(state);",
+            "spawn_pays_des_artistes(state);",
+            "spawn_pays_des_editions(state);",
+            "tune_core::cloud::ecoutes_au_compte::spawn(",
+        ] {
+            let pos = corps
+                .find(appel)
+                .unwrap_or_else(|| panic!("{appel} a disparu"));
+            let avant = corps[..pos].trim_end();
+            assert!(
+                avant.ends_with("#[cfg(not(feature = \"lecture-seule\"))]"),
+                "{appel} doit rester derrière `#[cfg(not(feature = \"lecture-seule\"))]`"
+            );
+        }
     }
 
     /// #6773 — sans cet appel, le rattrapage des noms de tri serait du code
