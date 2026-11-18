@@ -136,7 +136,7 @@ pub fn une_ligne_par_carte_alsa(entrees: Vec<DescriptionEntree>) -> Vec<Descript
             None => gardees.push(e),
         }
     }
-    gardees
+    let gardees: Vec<DescriptionEntree> = gardees
         .into_iter()
         .map(|mut e| {
             if let Some(g) = pcm_alsa(&e.id).map(|(_, (c, d))| (c.to_string(), d.to_string()))
@@ -145,6 +145,26 @@ pub fn une_ligne_par_carte_alsa(entrees: Vec<DescriptionEntree>) -> Vec<Descript
                 e.par_defaut = true;
             }
             e
+        })
+        .collect();
+    // cpal ajoute aux indications ALSA un `hw:CARD=1,DEV=0` (index de la
+    // carte) pour chaque carte physique : la même carte, sous le même nom,
+    // que `hw:CARD=U18dB,DEV=0`. L'entrée par index s'efface devant celle par
+    // nom quand les deux ont le même nom et le même périphérique.
+    let nommees: Vec<(String, String)> = gardees
+        .iter()
+        .filter_map(|e| {
+            let (_, (carte, dev)) = pcm_alsa(&e.id)?;
+            (!carte.chars().all(|c| c.is_ascii_digit())).then(|| (e.nom.clone(), dev.to_string()))
+        })
+        .collect();
+    gardees
+        .into_iter()
+        .filter(|e| match pcm_alsa(&e.id) {
+            Some((_, (carte, dev))) if carte.chars().all(|c| c.is_ascii_digit()) => {
+                !nommees.contains(&(e.nom.clone(), dev.to_string()))
+            }
+            _ => true,
         })
         .collect()
 }
@@ -235,6 +255,10 @@ mod une_ligne_par_carte_9070 {
             entree("alsa:dsnoop:CARD=U18dB,DEV=0", UMIK, true),
             entree("alsa:hw:CARD=U18dB,DEV=0", UMIK, false),
             entree("alsa:plughw:CARD=U18dB,DEV=0", UMIK, false),
+            entree("alsa:usbstream:CARD=U18dB", "Umik-1  Gain: 18dB", false),
+            // Ajoutées par cpal d'après l'index de la carte (8 lignes en tout).
+            entree("alsa:hw:CARD=1,DEV=0", UMIK, false),
+            entree("alsa:plughw:CARD=1,DEV=0", UMIK, false),
         ];
         let r = une_ligne_par_carte_alsa(l);
         let ids: Vec<&str> = r.iter().map(|e| e.id.as_str()).collect();
@@ -245,6 +269,27 @@ mod une_ligne_par_carte_9070 {
         );
         assert!(r[2].par_defaut, "le défaut d'une ligne écartée passe à hw:");
         assert_eq!(r.iter().filter(|e| e.nom == UMIK).count(), 1);
+    }
+
+    /// Une carte que les indications ALSA ne nomment pas garde son entrée par
+    /// index ; deux cartes de même nom (deux UMIK-1) gardent chacune la leur.
+    #[test]
+    fn l_entree_par_index_ne_s_efface_que_devant_la_meme_carte() {
+        let r = une_ligne_par_carte_alsa(vec![
+            entree("alsa:hw:CARD=2,DEV=0", "Carte sans indication", false),
+            entree("alsa:plughw:CARD=2,DEV=0", "Carte sans indication", false),
+            entree("alsa:hw:CARD=U18dB,DEV=0", UMIK, false),
+            entree("alsa:hw:CARD=U18dB_1,DEV=0", UMIK, false),
+        ]);
+        let ids: Vec<&str> = r.iter().map(|e| e.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "alsa:hw:CARD=2,DEV=0",
+                "alsa:hw:CARD=U18dB,DEV=0",
+                "alsa:hw:CARD=U18dB_1,DEV=0"
+            ]
+        );
     }
 
     #[test]
