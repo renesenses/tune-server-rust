@@ -11,6 +11,13 @@
 //!   gain du micro, bruit de fond) et pousse du PCM 24 bits dans l'anneau,
 //!   exactement comme le rappel cpal.
 //!
+//! * [`CheminDeLecture`] (#9066) remplace, si on le demande, la pompe
+//!   directe par le chemin d'une vraie zone locale : la VRAIE pompe de
+//!   l'orchestrateur (`tune_core::source_pcm::pomper`), un canal borné de la
+//!   profondeur de la session (`create_session(…, 256)`), puis l'anneau de
+//!   la sortie locale (2 s). C'est l'avance que ce chemin permet au
+//!   générateur qui faisait sortir le balayage après la fin de l'écoute.
+//!
 //! Le temps est celui de la capture : une mesure de 15 s d'audio se déroule
 //! en moins d'une seconde à `vitesse = 25`, sans rien changer au code mesuré,
 //! qui attend des TRAMES, pas des secondes.
@@ -110,6 +117,9 @@ impl PieceEnDirect {
 /// Ce que la zone a joué et que le micro n'a pas encore capté.
 pub struct Boucle {
     joue: Mutex<VecDeque<f64>>,
+    /// Trames jouées que la boucle tient au plus avant le micro : le tampon
+    /// de la sortie.
+    capacite: usize,
     piece: Mutex<PieceEnDirect>,
     /// Vitesse du temps simulé (1 = temps réel).
     pub vitesse: f64,
@@ -121,8 +131,15 @@ const FILE_MAX: usize = 2_400;
 
 impl Boucle {
     pub fn new(piece: PieceEnDirect, vitesse: f64) -> Arc<Self> {
+        Self::avec_tampon(piece, vitesse, FILE_MAX)
+    }
+
+    /// #9066 — une boucle dont le tampon de sortie tient `capacite` trames
+    /// (l'anneau de 2 s d'une sortie locale : `2 * fs`).
+    pub fn avec_tampon(piece: PieceEnDirect, vitesse: f64, capacite: usize) -> Arc<Self> {
         Arc::new(Self {
             joue: Mutex::new(VecDeque::new()),
+            capacite: capacite.max(1),
             piece: Mutex::new(piece),
             vitesse,
         })
@@ -134,7 +151,7 @@ impl Boucle {
         while !reste.is_empty() {
             {
                 let mut j = self.joue.lock().unwrap();
-                let place = FILE_MAX.saturating_sub(j.len());
+                let place = self.capacite.saturating_sub(j.len());
                 let n = place.min(reste.len());
                 j.extend(reste[..n].iter().copied());
                 reste = &reste[n..];
@@ -254,6 +271,15 @@ impl Peripheriques for MicroSimule {
     }
 }
 
+/// La voie gauche d'une trame PCM de la zone.
+fn voie_gauche(t: &[u8], bits: u16) -> f64 {
+    if bits == 16 {
+        i16::from_le_bytes([t[0], t[1]]) as f64 / 32_768.0
+    } else {
+        (i32::from_le_bytes([0, t[0], t[1], t[2]]) >> 8) as f64 / 8_388_608.0
+    }
+}
+
 /// Ce que l'hôte simulé a reçu.
 #[derive(Debug, Default)]
 pub struct Journal {
@@ -269,8 +295,26 @@ pub struct Journal {
     pub profils: Vec<tune_core::room_correction::RoomProfile>,
 }
 
+/// #9066 — le chemin de lecture d'une zone locale, entre le générateur et
+/// le tampon de sortie (la [`Boucle`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheminDeLecture {
+    /// Profondeur du canal de la session, en tronçons remis par la pompe.
+    pub troncons: usize,
+}
+
+impl CheminDeLecture {
+    /// Le canal d'une session de source PCM finie
+    /// (`resolve_source_pcm` : `create_session(info, false, 256)`).
+    pub fn session_de_source_pcm() -> Self {
+        Self { troncons: 256 }
+    }
+}
+
 pub struct HoteSimule {
     pub fournisseur: Arc<FournisseurBalayage>,
+    /// #9066 — `None` : la pompe dépose directement dans la boucle.
+    pub chemin: Option<CheminDeLecture>,
     pub boucle: Arc<Boucle>,
     /// Le volume que la base « connaît » ; `None` : zone inconnue.
     pub volume: Mutex<Option<f64>>,
@@ -300,6 +344,26 @@ impl HoteSimule {
             boucle,
             volume: Mutex::new(volume),
             traitements,
+            chemin: None,
+            journal: Mutex::new(Journal::default()),
+            pompe_vivante: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// #9066 — une zone dont le flux passe par la vraie pompe et un canal de
+    /// session avant le tampon de sortie.
+    pub fn avec_chemin(
+        fournisseur: Arc<FournisseurBalayage>,
+        boucle: Arc<Boucle>,
+        volume: Option<f64>,
+        chemin: CheminDeLecture,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            fournisseur,
+            boucle,
+            volume: Mutex::new(volume),
+            traitements: TraitementsDeZone::default(),
+            chemin: Some(chemin),
             journal: Mutex::new(Journal::default()),
             pompe_vivante: Arc::new(AtomicBool::new(false)),
         })
@@ -339,6 +403,35 @@ impl HoteZone for HoteSimule {
         let vivant = self.pompe_vivante.clone();
         vivant.store(true, Ordering::SeqCst);
         let boucle = self.boucle.clone();
+        if let Some(chemin) = self.chemin {
+            // La vraie pompe, dans un canal borné comme celui de la session ;
+            // la « sortie » le vide dans son tampon au rythme du micro.
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(chemin.troncons);
+            let octets = flux.octets;
+            let v = vivant.clone();
+            std::thread::spawn(move || {
+                tune_core::source_pcm::pomper(&mut *lecteur, octets, |t| {
+                    tx.send(t).is_ok() && v.load(Ordering::SeqCst)
+                })
+            });
+            std::thread::spawn(move || {
+                let mut reste: Vec<u8> = Vec::new();
+                while let Ok(t) = rx.recv() {
+                    if !vivant.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    reste.extend_from_slice(&t);
+                    let entieres = reste.len() / par_trame * par_trame;
+                    let echantillons: Vec<f64> = reste[..entieres]
+                        .chunks_exact(par_trame)
+                        .map(|t| voie_gauche(t, bits))
+                        .collect();
+                    reste.drain(..entieres);
+                    boucle.deposer(&echantillons, &vivant);
+                }
+            });
+            return Ok(());
+        }
         std::thread::spawn(move || {
             let mut buf = vec![0u8; par_trame * 480];
             let mut echantillons = Vec::with_capacity(480);
@@ -349,13 +442,7 @@ impl HoteZone for HoteSimule {
                 };
                 echantillons.clear();
                 for t in buf[..n].chunks_exact(par_trame) {
-                    // Voie gauche de la zone.
-                    let v = if bits == 16 {
-                        i16::from_le_bytes([t[0], t[1]]) as f64 / 32_768.0
-                    } else {
-                        (i32::from_le_bytes([0, t[0], t[1], t[2]]) >> 8) as f64 / 8_388_608.0
-                    };
-                    echantillons.push(v);
+                    echantillons.push(voie_gauche(t, bits));
                 }
                 boucle.deposer(&echantillons, &vivant);
             }

@@ -56,6 +56,34 @@ pub const FREQUENCE_MESURE: u32 = 48_000;
 /// la mesure passe avec un avertissement, comme avant.
 pub const RSB_MIN_DB: f64 = 20.0;
 
+/// #9066 — avance permise du générateur sur l'écoute (s). Elle s'ajoute au
+/// retard que la fenêtre captée doit absorber (2 s au plus avant la queue de
+/// la réponse) ; elle doit seulement couvrir les à-coups de la capture et de
+/// la pompe, pas le chemin de lecture, qui se remplit au rythme de l'écoute.
+pub const AVANCE_SUR_L_ECOUTE_S: f64 = 0.3;
+
+/// #9066 — la sortie de ce type pousse le son par le réseau (ou par un
+/// lecteur distant) : sa latence propre — tampon du renderer, 2 s fixes
+/// d'AirPlay — s'ajoute à celle de Tune, et la fenêtre d'écoute ne la voit
+/// pas. Seule la sortie locale de la machine (ALSA, WASAPI, ASIO, Core
+/// Audio) est sûre. `None` : type inconnu (essais), traité comme local.
+pub fn sortie_a_latence_propre(output_type: Option<&str>) -> bool {
+    !matches!(output_type, None | Some("local") | Some("mock"))
+}
+
+/// #9066 — le refus d'une mesure sur une sortie à latence propre dit
+/// pourquoi elle ne peut pas aboutir, au lieu du seul motif technique.
+pub fn motif_sur_sortie(motif: String, output_type: Option<&str>) -> String {
+    match output_type {
+        Some(t) if sortie_a_latence_propre(Some(t)) => format!(
+            "{motif}. La zone mesurée sort en « {t} » : cette sortie ajoute sa propre latence \
+             (tampon de l'appareil, plusieurs secondes parfois), que la mesure ne peut pas caler. \
+             Mesurez sur une zone en sortie locale de la machine (carte son, DAC en USB)"
+        ),
+        _ => motif,
+    }
+}
+
 /// #8491 — ce qu'une mesure doit avoir pour donner un résultat, ou le refus
 /// motivé. `retard_max_ms` : au-delà, la réponse impulsionnelle (1,5 s après
 /// l'arrivée directe) sort de la fenêtre captée et sa queue est perdue.
@@ -481,6 +509,13 @@ impl Controleur {
         if traitements.pure {
             mesure.avertir("mode PURE actif : le volume forcé peut être refusé par le verrou PURE");
         }
+        if let Some(t) = self.hote.type_de_sortie(demande.zone_id)
+            && sortie_a_latence_propre(Some(&t))
+        {
+            mesure.avertir(format!(
+                "zone en sortie « {t} » : sa latence propre peut empêcher la mesure ; une sortie locale est sûre"
+            ));
+        }
         self.verrou().insert(id.clone(), mesure.clone());
         let moi = self.clone();
         std::thread::Builder::new()
@@ -498,7 +533,12 @@ impl Controleur {
         self.fournisseur.desarmer(&mesure.id);
         match sortie {
             Ok(()) => mesure.poser(Etat::Terminee),
-            Err(Sortie::Refus(motif)) => mesure.poser(Etat::Refusee { motif }),
+            Err(Sortie::Refus(motif)) => {
+                let sortie = self.hote.type_de_sortie(mesure.demande.zone_id);
+                mesure.poser(Etat::Refusee {
+                    motif: motif_sur_sortie(motif, sortie.as_deref()),
+                })
+            }
             Err(Sortie::Annulee) => mesure.poser(Etat::Annulee),
             Err(Sortie::Erreur(message)) => mesure.poser(Etat::Erreur { message }),
         }
@@ -551,6 +591,16 @@ impl Controleur {
         let tampon = capture.tampon().clone();
         let voie = d.voie_micro;
 
+        // #9066 — le flux suit l'écoute : le balayage part au plus
+        // `AVANCE_SUR_L_ECOUTE_S` avant que le micro ne capte, et non après
+        // tout le silence que le chemin de lecture aurait pu tirer d'avance.
+        {
+            let t = tampon.clone();
+            deroule.cadencer_sur_l_ecoute(
+                Arc::new(move || t.trames()),
+                (AVANCE_SUR_L_ECOUTE_S * FREQUENCE_MESURE as f64) as u64,
+            );
+        }
         self.fournisseur.armer(&mesure.id, deroule.clone());
         zone.jouer(ElementBalayage {
             mesure_id: mesure.id.clone(),
@@ -853,6 +903,28 @@ mod tests {
         // bruit entre 20 et 40 dB (avertissement seulement).
         assert!(ri_exploitable(25.0, 1948.0, 2000.0).is_ok());
         assert!(ri_exploitable(72.0, 12.0, 2000.0).is_ok());
+    }
+
+    /// #9066 — seules les sorties locales sont sûres ; ailleurs, le refus
+    /// dit pourquoi.
+    #[test]
+    fn une_sortie_reseau_explique_le_refus_9066() {
+        assert!(!sortie_a_latence_propre(None));
+        assert!(!sortie_a_latence_propre(Some("local")));
+        for t in [
+            "dlna",
+            "airplay",
+            "airplay2",
+            "chromecast",
+            "oaat",
+            "browser",
+        ] {
+            assert!(sortie_a_latence_propre(Some(t)), "{t}");
+        }
+        let m = motif_sur_sortie("rapport crête/bruit de 3 dB".into(), Some("dlna"));
+        assert!(m.starts_with("rapport crête/bruit de 3 dB"), "{m}");
+        assert!(m.contains("« dlna »") && m.contains("sortie locale"), "{m}");
+        assert_eq!(motif_sur_sortie("x".into(), Some("local")), "x");
     }
 
     #[test]

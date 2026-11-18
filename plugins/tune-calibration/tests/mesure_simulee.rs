@@ -12,7 +12,9 @@ use tune_calibration_greffon::fournisseur::FournisseurBalayage;
 use tune_calibration_greffon::generateur::Consigne;
 use tune_calibration_greffon::hote::TraitementsDeZone;
 use tune_calibration_greffon::mesure::{Controleur, Demande, Etat, FREQUENCE_MESURE};
-use tune_calibration_greffon::simulation::{Boucle, HoteSimule, MicroSimule, PieceEnDirect};
+use tune_calibration_greffon::simulation::{
+    Boucle, CheminDeLecture, HoteSimule, MicroSimule, PieceEnDirect,
+};
 use tune_entree_audio::peripheriques::Peripheriques;
 
 const MICRO: &str = "UMIK-1 simulé";
@@ -201,6 +203,62 @@ fn une_piece_simulee_est_mesuree_de_bout_en_bout() {
     assert!(m.ri_wav().is_some());
     let av = m.avancement();
     assert!(av.progression > 0.0);
+}
+
+/// #9066 (fil 2914) — la zone passe par le chemin d'une vraie sortie
+/// locale : la vraie pompe (`source_pcm::pomper`), le canal de 256 tronçons
+/// de la session, puis l'anneau de 2 s de la sortie. Ce chemin laissait le
+/// générateur prendre ~4,5 s de silence d'avance pendant l'analyse de la
+/// salve ; le balayage complet sortait après la fin de la fenêtre d'écoute
+/// (1 s + 3,5 s) et la mesure était refusée sur le « rapport crête/bruit ».
+/// La salve, elle, partait avant que l'avance ne s'accumule — exactement ce
+/// que le testeur a entendu. Cadencé sur l'écoute, le balayage arrive à
+/// l'heure et la RI retrouve le retard de la pièce.
+#[test]
+fn le_balayage_sort_pendant_l_ecoute_malgre_le_chemin_de_lecture_9066() {
+    let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
+    let boucle = Boucle::avec_tampon(
+        PieceEnDirect::depuis(&sim, 1.0),
+        VITESSE,
+        2 * FREQUENCE_MESURE as usize,
+    );
+    let fournisseur = FournisseurBalayage::new();
+    let hote = HoteSimule::avec_chemin(
+        fournisseur.clone(),
+        boucle.clone(),
+        Some(50.0),
+        CheminDeLecture::session_de_source_pcm(),
+    );
+    let micro: Arc<dyn Peripheriques> = Arc::new(MicroSimule {
+        nom: MICRO.into(),
+        frequence: FREQUENCE_MESURE,
+        boucle,
+        demarrages: Default::default(),
+    });
+    let dossier = tune_core::test_scratch::scratch_dir("tune-calibration-chemin-9066");
+    let controleur = Controleur::new(
+        micro,
+        hote.clone(),
+        fournisseur,
+        dossier.path().to_path_buf(),
+    );
+    let mut d = demande(9);
+    d.duree_s = 1.0;
+    let id = controleur.lancer(d).expect("lancée");
+    let etat = attendre_fin(&controleur, &id, Duration::from_secs(120));
+    let m = controleur.mesure(&id).unwrap();
+    assert_eq!(etat, Etat::Terminee, "{:?}", m.avancement());
+    let r = m.resultat().expect("résultat");
+    assert_eq!(r.salves.len(), 1, "{:?}", r.salves);
+    // Vol acoustique (12 ms) plus l'avance permise sur l'écoute (300 ms),
+    // par blocs de 10 ms : rien de l'anneau ni du canal.
+    assert!(
+        (12.0..=12.0 + 300.0 + 30.0).contains(&r.ri.retard_ms),
+        "retard {} ms",
+        r.ri.retard_ms
+    );
+    assert!(r.ri.rsb_db > 50.0, "RSB {}", r.ri.rsb_db);
+    assert_eq!(hote.journal().arrets, 1);
 }
 
 /// Garde-fou du niveau joué : une pièce trop sourde (enceinte presque
