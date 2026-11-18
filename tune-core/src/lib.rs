@@ -108,6 +108,9 @@ pub mod taches_de_fond;
 /// pour le pourquoi (issue #2156 : une erreur persistante sur `accept()`
 /// saturait un coeur et remplissait le disque au repos).
 pub mod temporisation_reseau;
+/// TESS (Tune Engine for Sound Shaping) : le contrat, types seulement (lot
+/// T01) ; voir `docs/tess/contrat.md`.
+pub mod tess;
 /// Chemins temporaires uniques par appel — voir le module pour le pourquoi
 /// (issue #2864 : deux tests du même binaire se volaient leur fichier).
 ///
