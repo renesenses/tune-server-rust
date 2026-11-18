@@ -629,6 +629,34 @@ pub fn authentification_active_db(
         .is_some_and(|v| v == "true")
 }
 
+/// Le jeton du pont (relais cloud, écoute à distance) change à l'activation :
+/// un lien d'accès obtenu pendant que tout était ouvert ne sert plus, et la
+/// session du relais est rouverte avec le nouveau jeton. Les apps d'écoute à
+/// distance sont à appairer de nouveau.
+fn renouveler_le_jeton_du_pont(state: &AppState) {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let present = settings
+        .get("bridge_token")
+        .ok()
+        .flatten()
+        .is_some_and(|t| !t.is_empty());
+    if !present {
+        return;
+    }
+    let jeton = uuid::Uuid::new_v4().to_string();
+    if settings.set("bridge_token", &jeton).is_err() {
+        tracing::warn!("activation_jeton_du_pont_non_enregistre");
+        return;
+    }
+    #[cfg(feature = "cloud-relay")]
+    if let Some(client) = state.relay_client.get() {
+        client.renouveler_jeton(jeton);
+    }
+    #[cfg(not(feature = "cloud-relay"))]
+    let _ = jeton;
+    tracing::info!("activation_jeton_du_pont_renouvele");
+}
+
 /// Refus d'une opération réservée aux serveurs dont l'authentification est
 /// active : `RequireAdmin` laisse tout passer quand elle est coupée.
 pub fn refus_sans_authentification(message: &str) -> (StatusCode, Json<Value>) {
@@ -755,6 +783,12 @@ async fn appel_depuis_cette_machine(parts: &mut Parts, state: &AppState) -> bool
     // Derrière un mandataire inverse local (nginx, Caddy, proxy DSM,
     // Tailscale Serve, cloudflared…), tout appel arrive de 127.0.0.1 : le
     // bouclage ne prouve plus rien.
+    // HTTP/1.0 : l'empreinte d'un mandataire inverse (nginx par défaut :
+    // `proxy_http_version 1.0`, `Host` réécrit en 127.0.0.1, aucun
+    // `X-Forwarded-*`). Un navigateur parle HTTP/1.1 ou 2.
+    if parts.version == axum::http::Version::HTTP_10 {
+        return false;
+    }
     let autorite = parts.uri.authority().map(|a| a.as_str().to_string());
     if !requete_de_cette_machine(&parts.headers, autorite.as_deref()) {
         return false;
@@ -791,7 +825,11 @@ pub fn hote_de_bouclage(hote: &str) -> bool {
     let hote = hote.trim().trim_end_matches('.').to_ascii_lowercase();
     // `[::1]:8888`, `[::1]`, `localhost:8888`, `127.0.0.1:8888`.
     let nom = if let Some(reste) = hote.strip_prefix('[') {
-        reste.split(']').next().unwrap_or("")
+        // `[::1]` ou `[::1]:port` ; un crochet non refermé n'est rien.
+        match reste.split_once(']') {
+            Some((nom, apres)) if apres.is_empty() || apres.starts_with(':') => nom,
+            _ => return false,
+        }
     } else {
         hote.rsplit_once(':')
             .filter(|(_, port)| port.chars().all(|c| c.is_ascii_digit()))
@@ -799,7 +837,6 @@ pub fn hote_de_bouclage(hote: &str) -> bool {
     };
     let nom = nom.trim_end_matches('.');
     nom == "localhost"
-        || nom.ends_with(".localhost")
         || nom
             .parse::<std::net::IpAddr>()
             .is_ok_and(adresse_de_cette_machine)
@@ -809,11 +846,15 @@ pub fn hote_de_bouclage(hote: &str) -> bool {
 /// mandataire inverse, aucun mandataire déclaré, et un `Host` (ou l'autorité
 /// de l'URI, HTTP/2) qui nomme le bouclage.
 ///
-/// Sans `Host` ni autorité (HTTP/1.0, client minimal), la réponse reste oui :
-/// un navigateur en envoie toujours un. Derrière un relais TCP qui ne pose
-/// AUCUN en-tête et transmet un `Host` de bouclage, rien ne distingue la
-/// requête : déclarer alors `TUNE_ALLOWED_HOSTS`, ce qui retire la preuve du
-/// bouclage (il faut l'authentification).
+/// Sans `Host` ni autorité en HTTP/1.1 (client minimal), la réponse reste
+/// oui : un navigateur en envoie toujours un. HTTP/1.0 est refusé plus haut
+/// ([`appel_depuis_cette_machine`]). Couvert : nginx avec les en-têtes
+/// `X-Forwarded-*` habituels, ou en HTTP/1.0 par défaut ; Caddy, Traefik,
+/// proxy DSM, Tailscale Serve, cloudflared (en-têtes). NON distinguable :
+/// HAProxy en mode TCP, `socat`, relais TCP qui ne posent aucun en-tête et
+/// transmettent un `Host` de bouclage en HTTP/1.1 — déclarer alors
+/// `TUNE_ALLOWED_HOSTS`, ce qui retire la preuve du bouclage (il faut
+/// l'authentification).
 pub fn requete_de_cette_machine(entetes: &axum::http::HeaderMap, autorite: Option<&str>) -> bool {
     if derriere_un_mandataire(entetes) {
         return false;
@@ -1179,6 +1220,7 @@ fn session_cookie(token: &str, headers: &axum::http::HeaderMap) -> String {
 async fn login(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
+    version: axum::http::Version,
     headers: axum::http::HeaderMap,
     Json(body): Json<LoginRequest>,
 ) -> impl IntoResponse {
@@ -1187,7 +1229,9 @@ async fn login(
     let ip = crate::garde_du_relais::adresse_de_l_appelant(peer.ip(), &headers);
     // L'opérateur de CETTE machine : bouclage réel, ni mandataire inverse ni
     // `Host` d'un autre nom.
-    let operateur = bouclage_de_l_operateur(ip) && requete_de_cette_machine(&headers, None);
+    let operateur = bouclage_de_l_operateur(ip)
+        && version != axum::http::Version::HTTP_10
+        && requete_de_cette_machine(&headers, None);
     if login_rate_limited(ip, operateur) {
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -1507,6 +1551,8 @@ async fn set_auth_config(
             // Les jetons et la clé émis pendant que tout était ouvert ne
             // survivent pas à l'activation.
             renouveler_les_secrets(&settings);
+            renouveler_le_jeton_du_pont(&state);
+            state.fermeture_websockets.send_modify(|n| *n += 1);
         } else if enabled {
             get_or_create_jwt_secret(&settings);
         }
@@ -1627,7 +1673,7 @@ fn code_valable(c: &CodeActivation) -> bool {
 
 /// Émet un code, s'il n'y en a pas déjà un de valable, et l'écrit sur la
 /// CONSOLE du serveur (sortie d'erreur : `docker logs`, `journalctl -u tune`,
-/// console de Tune OS) — jamais dans le journal de `tracing`, que l'API sert
+/// en SSH sur Tune OS ; sous Windows sans console, le fichier journal) — jamais dans le journal de `tracing`, que l'API sert
 /// (`/system/logs`, rapports de bogue). La ligne porte
 /// [`tune_core::confidentialite::MARQUEUR_CODE_ACTIVATION`], que tous les
 /// lecteurs de journaux retirent (cas d'une sortie d'erreur redirigée dans le
@@ -1659,6 +1705,16 @@ pub fn emettre_code_activation(state: &AppState) -> EmissionCode {
         DUREE_CODE_ACTIVATION.as_secs() / 60,
     );
     tracing::warn!("auth_activation_code_ecrit_sur_la_console");
+    // Windows sans console (`lancement_sans_console`) : la sortie d'erreur
+    // ne va nulle part. Le code part aussi dans le fichier journal, que seul
+    // l'exploitant de la machine lit ; tous les lecteurs de l'API retirent
+    // la ligne (marqueur).
+    #[cfg(windows)]
+    tracing::warn!(
+        "{} {} (Windows : fichier journal tune-server.log)",
+        tune_core::confidentialite::MARQUEUR_CODE_ACTIVATION,
+        code,
+    );
     EmissionCode::Emis
 }
 
@@ -1762,7 +1818,7 @@ fn refus_activation_hors_machine() -> Response {
         Json(json!({
             "error": "activation_code_required",
             "reason": "not_local",
-            "message": "Enabling authentication from another device requires the one-time code written to the server console (POST /auth/activation/code; docker logs, journalctl -u tune, Tune OS console), or a call from this machine.",
+            "message": "Enabling authentication from another device requires the one-time code written to the server console (POST /auth/activation/code; docker logs, journalctl -u tune — on Tune OS over SSH —, or the log file on Windows), or a call from this machine.",
         })),
     )
         .into_response()
@@ -2040,6 +2096,7 @@ async fn activer_l_authentification(
         }
         let settings = SettingsRepo::with_backend(state.backend.clone());
         renouveler_les_secrets(&settings);
+        renouveler_le_jeton_du_pont(&state);
         settings.set("auth_enabled", "true").ok();
         // Un code encore en attente ne sert plus à rien.
         state.code_activation_auth.lock().unwrap().en_cours = None;

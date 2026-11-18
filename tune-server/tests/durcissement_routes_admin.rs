@@ -1489,11 +1489,16 @@ fn les_noms_d_hote_de_bouclage() {
     for oui in [
         "localhost",
         "localhost:8888",
+        "LOCALHOST",
+        "LocalHost:8888",
+        "localhost.",
+        "localhost.:8888",
         "127.0.0.1",
         "127.0.0.1:80",
+        "127.42.0.7:8888",
         "[::1]",
         "[::1]:8888",
-        "app.localhost",
+        "[0:0:0:0:0:0:0:1]:8888",
     ] {
         assert!(hote_de_bouclage(oui), "{oui}");
     }
@@ -1503,8 +1508,62 @@ fn les_noms_d_hote_de_bouclage() {
         "192.168.1.10:8888",
         "[fd00::4]:8888",
         "localhost.example.org",
+        "localhost.evil",
+        "localhost.evil:8888",
+        "app.localhost",
         "127.0.0.1.nip.io",
+        // Formes abrégées ou octales : refusées (le navigateur les normalise).
+        "127.1",
+        "0177.0.0.1",
+        "user@localhost",
+        "user@localhost:8888",
+        "[::1",
+        "",
     ] {
         assert!(!hote_de_bouclage(non), "{non}");
     }
+}
+
+/// HTTP/1.0 n'est jamais « cette machine » : c'est l'empreinte de nginx par
+/// défaut (`proxy_http_version 1.0`, `Host` réécrit, sans `X-Forwarded-*`).
+/// HTTP/1.1 sans `Host` reste accepté.
+#[tokio::test]
+async fn http_1_0_n_est_jamais_cette_machine() {
+    let state = new_state();
+    let pair: SocketAddr = CETTE_MACHINE.parse().unwrap();
+    let envoyer = |version: axum::http::Version, hote: Option<&'static str>| {
+        let state = state.clone();
+        async move {
+            let app: Router = tune_server::routes::router(state).layer(MockConnectInfo(pair));
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/plugins/greffon-inexistant-gardes/install")
+                .version(version)
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(h) = hote {
+                req = req.header(header::HOST, h);
+            }
+            let resp = app
+                .oneshot(req.body(Body::from("{}")).unwrap())
+                .await
+                .unwrap();
+            let st = resp.status();
+            let octets = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (st, String::from_utf8_lossy(&octets).to_string())
+        }
+    };
+    for hote in [None, Some("127.0.0.1"), Some("localhost:8888")] {
+        let (st, rep) = envoyer(axum::http::Version::HTTP_10, hote).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "HTTP/1.0 {hote:?} : {rep}");
+        assert!(rep.contains("not_local"), "{rep}");
+    }
+    let (_, rep) = envoyer(axum::http::Version::HTTP_11, None).await;
+    assert!(!rep.contains("auth_required"), "HTTP/1.1 sans Host : {rep}");
+    let (_, rep) = envoyer(axum::http::Version::HTTP_11, Some("localhost:8888")).await;
+    assert!(
+        !rep.contains("auth_required"),
+        "HTTP/1.1 Host localhost : {rep}"
+    );
 }

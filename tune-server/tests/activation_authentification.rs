@@ -803,3 +803,60 @@ async fn derriere_un_mandataire_la_connexion_n_est_pas_l_operateur_local() {
     }
     assert_eq!(dernier, StatusCode::TOO_MANY_REQUESTS);
 }
+
+/// À l'activation, le jeton du pont (écoute à distance) change : le lien
+/// d'accès obtenu pendant que tout était ouvert ne sert plus. Même chose par
+/// `POST /auth/config` depuis cette machine.
+#[tokio::test]
+async fn l_activation_renouvelle_le_jeton_du_pont() {
+    for par_la_config in [false, true] {
+        let state = new_state();
+        let reglages = SettingsRepo::with_backend(state.backend.clone());
+        reglages.set("bridge_enabled", "true").unwrap();
+        reglages
+            .set("bridge_token", "ANCIEN-jeton-de-pont-FAUX")
+            .unwrap();
+        let (st, v) = if par_la_config {
+            appel(
+                &state,
+                CETTE_MACHINE,
+                Method::POST,
+                "/api/v1/auth/config",
+                None,
+                Some(r#"{"auth_enabled":true}"#),
+            )
+            .await
+        } else {
+            activer(&state, CETTE_MACHINE, r#"{"password":"proprio-1234"}"#).await
+        };
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let jeton = reglages.get("bridge_token").unwrap().unwrap_or_default();
+        assert!(!jeton.is_empty(), "un jeton de pont reste posé");
+        assert_ne!(jeton, "ANCIEN-jeton-de-pont-FAUX", "config={par_la_config}");
+        if !par_la_config {
+            let admin = v["token"].as_str().unwrap().to_string();
+            let (_, lien) = appel(
+                &state,
+                CETTE_MACHINE,
+                Method::GET,
+                "/api/v1/cloud/bridge/access-link",
+                Some(&admin),
+                None,
+            )
+            .await;
+            assert!(
+                !lien.to_string().contains("ANCIEN-jeton-de-pont-FAUX"),
+                "{lien}"
+            );
+        }
+    }
+    // Sans pont configuré, rien n'est inventé.
+    let state = new_state();
+    activer(&state, CETTE_MACHINE, r#"{"password":"proprio-1234"}"#).await;
+    assert_eq!(
+        SettingsRepo::with_backend(state.backend.clone())
+            .get("bridge_token")
+            .unwrap(),
+        None
+    );
+}
