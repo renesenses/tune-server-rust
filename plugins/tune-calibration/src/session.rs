@@ -24,6 +24,12 @@
 //!
 //! Une session vit en mémoire, comme les mesures ; c'est le client qui garde
 //! le document exporté.
+//!
+//! **Import borné** : corps de [`IMPORT_MAX_OCTETS`] au plus (limite propre à
+//! la route) ; chaque position est vérifiée par [`Session::valider`]
+//! (longueurs, valeurs finies dans des bornes physiques, grille croissante et
+//! commune) ; un id importé commence par `s` et ne peut donc pas masquer une
+//! mesure (`m…`) ; un document v1 sans `zone_id` ne vise aucune zone.
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -44,6 +50,23 @@ use crate::mesure::{Controleur, Demande, Etat, Resultat};
 pub const VERSION_SESSION: u32 = 2;
 /// Au-delà, la plus ancienne session est oubliée.
 pub const SESSIONS_GARDEES: usize = 32;
+/// Taille maximale du corps de `POST /sessions/import` : une session de 9
+/// positions sur la grille de C1 (~480 points) fait quelques centaines de Kio.
+pub const IMPORT_MAX_OCTETS: usize = 4 * 1024 * 1024;
+/// Points de réponse au plus par position (la grille de C1 en a ~480).
+pub const POINTS_MAX: usize = 4096;
+/// Bornes physiques d'une position importée.
+pub const SALVES_MAX: usize = 16;
+pub const RT60_MAX: usize = 32;
+pub const AVERTISSEMENTS_MAX: usize = 64;
+pub const TEXTE_MAX: usize = 1024;
+/// Niveau joué plausible (dBFS) : le générateur ne joue jamais au-dessus de −6.
+pub const NIVEAU_JOUE_MIN_DBFS: f64 = -150.0;
+pub const NIVEAU_JOUE_MAX_DBFS: f64 = 0.0;
+/// Réponse (dB) : le plancher numérique de C1 est −200 dB.
+pub const DB_MIN: f64 = -400.0;
+pub const DB_MAX: f64 = 200.0;
+pub const FREQ_MAX_HZ: f64 = 400_000.0;
 
 /// Une position d'une session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -65,14 +88,16 @@ pub struct PositionSession {
 impl PositionSession {
     /// Le document v1 (mono-position) de cette position : celui que
     /// `GET /mesures/{id}/resultat` rendait.
-    pub fn document_v1(&self, zone_id: i64) -> Option<Value> {
+    pub fn document_v1(&self, zone_id: Option<i64>) -> Option<Value> {
         let r = self.resultat.as_ref()?;
         let mut v = serde_json::to_value(r).ok()?;
         let o = v.as_object_mut()?;
         if let Some(id) = &self.mesure_id {
             o.insert("id".into(), json!(id));
         }
-        o.insert("zone_id".into(), json!(zone_id));
+        if let Some(z) = zone_id {
+            o.insert("zone_id".into(), json!(z));
+        }
         if let Some(e) = &self.entree {
             o.insert("entree".into(), json!(e));
         }
@@ -104,7 +129,8 @@ impl PositionSession {
 pub struct Session {
     pub version: u32,
     pub id: String,
-    pub zone_id: i64,
+    /// `None` : document v1 importé sans zone ; aucun profil n'y est écrit.
+    pub zone_id: Option<i64>,
     pub positions_prevues: usize,
     /// Index de la place d'écoute : prépondérante dans la moyenne.
     pub centrale: usize,
@@ -153,7 +179,7 @@ impl Session {
             .get("entree")
             .and_then(Value::as_str)
             .map(str::to_string);
-        let zone_id = doc.get("zone_id").and_then(Value::as_i64).unwrap_or(0);
+        let zone_id = doc.get("zone_id").and_then(Value::as_i64);
         let mut corps = doc;
         if let Some(o) = corps.as_object_mut() {
             o.remove("id");
@@ -182,9 +208,13 @@ impl Session {
     }
 
     fn valider(&self) -> Result<(), String> {
-        if self.positions_prevues == 0 || self.positions_prevues > POSITIONS_MAX {
+        // 1 : une mesure mono-position (v1, ou sa réexportation) ; sinon une
+        // vraie session, qui seule peut rendre une moyenne.
+        if self.positions_prevues != 1
+            && !(POSITIONS_MIN..=POSITIONS_MAX).contains(&self.positions_prevues)
+        {
             return Err(format!(
-                "{} positions prévues : 1 à {POSITIONS_MAX}",
+                "{} positions prévues : 1 (mesure mono-position) ou {POSITIONS_MIN} à {POSITIONS_MAX}",
                 self.positions_prevues
             ));
         }
@@ -210,6 +240,29 @@ impl Session {
         self.config
             .ponderation
             .poids(self.positions_prevues, self.centrale)?;
+        let mut grille: Option<&Vec<f64>> = None;
+        for p in &self.positions {
+            let ctx = |e: String| format!("position {} : {e}", p.index);
+            for t in [&p.etiquette, &p.mesure_id, &p.entree]
+                .into_iter()
+                .flatten()
+            {
+                if t.len() > TEXTE_MAX {
+                    return Err(ctx(format!("texte de plus de {TEXTE_MAX} octets")));
+                }
+            }
+            let Some(r) = &p.resultat else { continue };
+            valider_resultat(r).map_err(ctx)?;
+            match grille {
+                None => grille = Some(&r.reponse.freqs_hz),
+                Some(g) if *g != r.reponse.freqs_hz => {
+                    return Err(ctx(
+                        "grille de fréquences différente des autres positions".into()
+                    ));
+                }
+                Some(_) => {}
+            }
+        }
         Ok(())
     }
 
@@ -270,6 +323,70 @@ impl Session {
         }
         Ok((m, index))
     }
+}
+
+fn fini_dans(nom: &str, v: f64, lo: f64, hi: f64) -> Result<(), String> {
+    if v.is_finite() && (lo..=hi).contains(&v) {
+        Ok(())
+    } else {
+        Err(format!("{nom} = {v} : attendu entre {lo} et {hi}"))
+    }
+}
+
+/// Les bornes d'un résultat importé. Un document v1 ou v2 vient du client :
+/// rien n'en est cru sur parole (mémoire, débordement de la moyenne).
+fn valider_resultat(r: &Resultat) -> Result<(), String> {
+    let n = r.reponse.freqs_hz.len();
+    if !(2..=POINTS_MAX).contains(&n) || r.reponse.db.len() != n {
+        return Err(format!(
+            "réponse de {n} fréquences pour {} niveaux : 2 à {POINTS_MAX}, autant de chaque",
+            r.reponse.db.len()
+        ));
+    }
+    for f in &r.reponse.freqs_hz {
+        fini_dans("fréquence", *f, f64::MIN_POSITIVE, FREQ_MAX_HZ)?;
+    }
+    if r.reponse.freqs_hz.windows(2).any(|w| w[1] <= w[0]) {
+        return Err("fréquences non strictement croissantes".into());
+    }
+    for d in &r.reponse.db {
+        fini_dans("niveau de réponse (dB)", *d, DB_MIN, DB_MAX)?;
+    }
+    fini_dans(
+        "niveau_joue_dbfs",
+        r.niveau_joue_dbfs,
+        NIVEAU_JOUE_MIN_DBFS,
+        NIVEAU_JOUE_MAX_DBFS,
+    )?;
+    if !(8_000..=768_000).contains(&r.frequence) {
+        return Err(format!("fréquence d'échantillonnage {} Hz", r.frequence));
+    }
+    if r.salves.len() > SALVES_MAX
+        || r.rt60.len() > RT60_MAX
+        || r.avertissements.len() > AVERTISSEMENTS_MAX
+        || r.reponse.lissage.len() > TEXTE_MAX
+        || r.etalonnage.as_ref().is_some_and(|e| e.len() > TEXTE_MAX)
+        || r.avertissements.iter().any(|a| a.len() > TEXTE_MAX)
+        || r.salves.iter().any(|s| s.decision.len() > TEXTE_MAX)
+    {
+        return Err(format!(
+            "trop d'éléments : {SALVES_MAX} salves, {RT60_MAX} bandes RT60, {AVERTISSEMENTS_MAX} avertissements, textes de {TEXTE_MAX} octets au plus"
+        ));
+    }
+    const GRAND: f64 = 1e6;
+    let mut nombres = vec![r.ri.retard_ms, r.ri.crete_dbfs, r.ri.rsb_db];
+    for s in &r.salves {
+        nombres.extend([s.niveau_joue_dbfs, s.crete_captee_dbfs, s.rsb_db]);
+        nombres.extend(s.spl_db);
+    }
+    for b in &r.rt60 {
+        nombres.extend([b.centre_hz, b.dynamique_db]);
+        nombres.extend([b.edt_s, b.t20_s, b.t30_s].into_iter().flatten());
+    }
+    for v in nombres {
+        fini_dans("valeur", v, -GRAND, GRAND)?;
+    }
+    Ok(())
 }
 
 /// Ce que `GET /sessions/{id}` rend : la session, l'état de chaque
@@ -338,7 +455,9 @@ impl Magasin {
     /// Range la session ; garde son id s'il est libre et sûr, sinon en donne un.
     pub fn ranger(&self, mut s: Session) -> String {
         let mut v = self.verrou();
-        let sur = !s.id.is_empty()
+        // Un id de session commence par `s` : il ne peut pas masquer une
+        // mesure (`m…`) dans `/comparaisons`.
+        let sur = s.id.starts_with('s')
             && s.id.len() <= 64
             && s.id
                 .chars()
@@ -389,7 +508,7 @@ impl Controleur {
         let s = Session {
             version: VERSION_SESSION,
             id: String::new(),
-            zone_id,
+            zone_id: Some(zone_id),
             positions_prevues: d.positions,
             centrale: d.centrale,
             config: d.config,
@@ -422,9 +541,9 @@ impl Controleur {
             .sessions
             .session(session_id)
             .ok_or_else(|| format!("aucune session « {session_id} »"))?;
-        if demande.zone_id != s.zone_id {
+        if s.zone_id != Some(demande.zone_id) {
             return Err(format!(
-                "la session porte sur la zone {}, pas {}",
+                "la session porte sur la zone {:?}, pas {}",
                 s.zone_id, demande.zone_id
             ));
         }
@@ -555,7 +674,7 @@ impl Controleur {
         &self,
         id: &str,
         demande: &DemandeCorrection,
-    ) -> Result<(i64, Proposition), String> {
+    ) -> Result<(Option<i64>, Proposition), String> {
         let s = self
             .session(id)
             .ok_or_else(|| format!("aucune session « {id} »"))?;

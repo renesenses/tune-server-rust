@@ -51,7 +51,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{Path, Request, State};
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::{StatusCode, header};
 use axum::middleware::{Next, from_fn_with_state};
 use axum::response::{IntoResponse, Response};
@@ -128,7 +128,10 @@ pub fn router(etat: EtatRoutes) -> Router<()> {
         .route("/mesures/{id}/correction/profil", post(correction_profil))
         .route("/zones/{zone}/sessions", post(creer_session))
         .route("/sessions", get(sessions))
-        .route("/sessions/import", post(importer_session))
+        .route(
+            "/sessions/import",
+            post(importer_session).layer(DefaultBodyLimit::max(crate::session::IMPORT_MAX_OCTETS)),
+        )
         .route("/sessions/{id}", get(vue_session))
         .route("/sessions/{id}/positions", post(mesurer_position))
         .route("/sessions/{id}/export", get(exporter_session))
@@ -695,7 +698,14 @@ async fn mesurer_position(
     let Some(s) = etat.controleur.sessions.session(&id) else {
         return session_inconnue(&id);
     };
-    let demande = match demande_de(s.zone_id, d.mesure) {
+    let Some(zone_id) = s.zone_id else {
+        return refus(
+            StatusCode::CONFLICT,
+            "session_sans_zone",
+            "session importée sans zone : on ne peut pas y mesurer".into(),
+        );
+    };
+    let demande = match demande_de(zone_id, d.mesure) {
         Ok(d) => d,
         Err(r) => return r,
     };
@@ -758,7 +768,7 @@ fn proposition_session(
     etat: &EtatRoutes,
     id: &str,
     demande: &DemandeCorrection,
-) -> Result<(i64, Proposition), Response> {
+) -> Result<(Option<i64>, Proposition), Response> {
     if etat.controleur.sessions.session(id).is_none() {
         return Err(session_inconnue(id));
     }
@@ -793,6 +803,15 @@ async fn session_correction_profil(
     let (zone_id, p) = match proposition_session(&etat, &id, &d.demande) {
         Ok(x) => x,
         Err(r) => return r,
+    };
+    // Un document v1 importé sans `zone_id` ne vise aucune zone : pas de
+    // zone 0 par défaut.
+    let Some(zone_id) = zone_id else {
+        return refus(
+            StatusCode::BAD_REQUEST,
+            "zone_requise",
+            "session sans zone (mesure importée sans zone_id) : aucun profil à enregistrer".into(),
+        );
     };
     let nom = nom_du_profil(d.nom, || format!("Calibration {id}"));
     enregistrer_le_profil(&etat, &id, zone_id, &nom, p, false).await

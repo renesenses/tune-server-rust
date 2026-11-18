@@ -923,10 +923,26 @@ fn la_simulation_sans_micro_est_premium_et_ne_propose_que_des_coupes_prudentes()
 struct Client {
     app: axum::Router,
     rt: tokio::runtime::Runtime,
+    prefixe: &'static str,
 }
+
+/// Le préfixe et la limite de corps globale de l'API de l'hôte
+/// (`DefaultBodyLimit::max(50 Mio)` dans `tune-server/src/routes/mod.rs`).
+const PREFIXE_HOTE: &str = "/api/v1/ext/calibration";
+const LIMITE_HOTE: usize = 50 * 1024 * 1024;
 
 impl Client {
     fn new(b: &Banc) -> Self {
+        Self::monte(b, false)
+    }
+
+    /// Le routeur du greffon monté comme l'hôte le monte : sous son préfixe,
+    /// derrière la limite de corps globale de 50 Mio.
+    fn comme_l_hote(b: &Banc) -> Self {
+        Self::monte(b, true)
+    }
+
+    fn monte(b: &Banc, hote: bool) -> Self {
         let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         tune_core::db::migrations::run_migrations(&db).unwrap();
@@ -942,7 +958,22 @@ impl Client {
                 license: Some(licence),
             },
         );
-        Self { app, rt }
+        if hote {
+            let app = axum::Router::new()
+                .nest(PREFIXE_HOTE, app)
+                .layer(axum::extract::DefaultBodyLimit::max(LIMITE_HOTE));
+            Self {
+                app,
+                rt,
+                prefixe: PREFIXE_HOTE,
+            }
+        } else {
+            Self {
+                app,
+                rt,
+                prefixe: "",
+            }
+        }
     }
 
     fn appel(
@@ -954,7 +985,7 @@ impl Client {
         use tower::ServiceExt;
         let req = axum::http::Request::builder()
             .method(methode)
-            .uri(chemin)
+            .uri(format!("{}{chemin}", self.prefixe))
             .header("content-type", "application/json")
             .body(axum::body::Body::from(
                 corps.map(|c| c.to_string()).unwrap_or_default(),
@@ -1276,4 +1307,147 @@ fn anciennes_mesures_relues_sans_perte_et_positions_identiques() {
         Some(serde_json::json!({ "version": 2 })),
     );
     assert_eq!(code, StatusCode::BAD_REQUEST, "{e}");
+}
+
+/// Un résultat mono-position plausible, fabriqué sans mesure.
+fn resultat_fabrique() -> serde_json::Value {
+    use tune_calibration_greffon::mesure::{Reponse, Resultat, ResumeRi};
+    let freqs_hz = tune_calibration::analysis::LogResponse::grid(20.0, 20_000.0, 48);
+    let db = freqs_hz
+        .iter()
+        .map(|f| -20.0 + (f / 50.0).ln().sin())
+        .collect();
+    serde_json::to_value(Resultat {
+        frequence: FREQUENCE_MESURE,
+        niveau_joue_dbfs: -18.0,
+        salves: Vec::new(),
+        ri: ResumeRi {
+            retard_ms: 12.0,
+            crete_dbfs: -25.0,
+            rsb_db: 60.0,
+            trames: 72_000,
+            crete_a_la_trame: 576,
+        },
+        reponse: Reponse {
+            lissage: "1/12 octave".into(),
+            freqs_hz,
+            db,
+        },
+        rt60: Vec::new(),
+        etalonnage: None,
+        traitements_zone: TraitementsDeZone::default(),
+        avertissements: Vec::new(),
+        duree_analyse_ms: 1,
+    })
+    .unwrap()
+}
+
+/// Relecture de #9026, point 3a : l'import est BORNÉ. Routeur monté comme
+/// par l'hôte (préfixe, limite globale de 50 Mio) :
+/// * un corps de 5 Mio est refusé (413) par la limite propre à la route,
+///   alors que la limite globale l'aurait laissé passer ;
+/// * une position trop longue, inégale, non croissante, hors bornes
+///   physiques (±1e300, niveau joué +40 dBFS) est refusée (400) ;
+/// * une session v2 de 2 positions est refusée (1 ou 3 à 9) ;
+/// * un id importé `m…` ne masque pas la mesure du même nom ;
+/// * un v1 sans `zone_id` ne vise aucune zone pour le profil (400).
+#[test]
+fn l_import_de_session_est_borne() {
+    use axum::http::StatusCode;
+
+    let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
+    let b = banc(&sim, 1.0, Some(63.0), "import-borne");
+    let c = Client::comme_l_hote(&b);
+    let v1 = resultat_fabrique();
+    let mut avec_zone = v1.clone();
+    avec_zone["zone_id"] = 7.into();
+    avec_zone["id"] = "m1-1".into();
+    let (code, e) = c.appel("POST", "/sessions/import", Some(avec_zone.clone()));
+    assert_eq!(code, StatusCode::CREATED, "document plausible refusé : {e}");
+
+    // 1. Taille : 5 Mio de JSON valide, sous la limite globale de l'hôte.
+    let mut gros = avec_zone.clone();
+    gros["avertissements"] = serde_json::json!(vec!["x".repeat(1000); 5 * 1024]);
+    let (code, e) = c.appel("POST", "/sessions/import", Some(gros));
+    assert_eq!(
+        code,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "corps de 5 Mio accepté par l'import : {e}"
+    );
+
+    // 2. Bornes de chaque position.
+    let refuse = |nom: &str, doc: serde_json::Value| {
+        let (code, e) = c.appel("POST", "/sessions/import", Some(doc));
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{nom} accepté : {e}");
+        assert_eq!(e["error"], "session_invalide", "{nom} : {e}");
+    };
+    let mut d = avec_zone.clone();
+    d["reponse"]["freqs_hz"] = serde_json::json!((1..=5000).map(|i| i as f64).collect::<Vec<_>>());
+    d["reponse"]["db"] = serde_json::json!(vec![0.0; 5000]);
+    refuse("5000 points", d);
+    let mut d = avec_zone.clone();
+    d["reponse"]["db"].as_array_mut().unwrap().pop();
+    refuse("longueurs inégales", d);
+    let mut d = avec_zone.clone();
+    d["reponse"]["freqs_hz"][3] = d["reponse"]["freqs_hz"][2].clone();
+    refuse("fréquences non croissantes", d);
+    let mut d = avec_zone.clone();
+    d["reponse"]["db"][10] = 1e300.into();
+    refuse("niveau 1e300 dB", d);
+    let mut d = avec_zone.clone();
+    d["niveau_joue_dbfs"] = 40.0.into();
+    refuse("niveau joué +40 dBFS", d);
+    let mut d = avec_zone.clone();
+    d["salves"] = serde_json::json!(vec![
+        serde_json::json!({"niveau_joue_dbfs": -30.0, "crete_captee_dbfs": -40.0, "rsb_db": 30.0, "spl_db": null, "decision": "step_up"});
+        100
+    ]);
+    refuse("100 salves", d);
+
+    // 3. Nombre de positions d'une session v2 : 1 ou 3 à 9.
+    let (_, s) = c.appel("POST", "/sessions/import", Some(avec_zone.clone()));
+    let (_, export) = c.appel(
+        "GET",
+        &format!("/sessions/{}/export", s["id"].as_str().unwrap()),
+        None,
+    );
+    let mut deux = export.clone();
+    deux["positions_prevues"] = 2.into();
+    let mut p1 = export["positions"][0].clone();
+    p1["index"] = 1.into();
+    deux["positions"].as_array_mut().unwrap().push(p1);
+    refuse("session v2 de 2 positions", deux);
+
+    // 4. Un id importé `m…` ne peut pas masquer une mesure.
+    let mut masque = export.clone();
+    masque["id"] = "m1-1".into();
+    let (code, v) = c.appel("POST", "/sessions/import", Some(masque));
+    assert_eq!(code, StatusCode::CREATED, "{v}");
+    let id = v["id"].as_str().unwrap();
+    assert!(id.starts_with('s'), "id importé gardé tel quel : {id}");
+
+    // 5. Un v1 sans `zone_id` ne vise aucune zone.
+    let (code, v) = c.appel("POST", "/sessions/import", Some(v1.clone()));
+    assert_eq!(code, StatusCode::CREATED, "{v}");
+    assert!(v["zone_id"].is_null(), "{v}");
+    let sid = v["id"].as_str().unwrap().to_string();
+    let (code, e) = c.appel(
+        "POST",
+        &format!("/sessions/{sid}/correction/profil"),
+        Some(serde_json::json!({})),
+    );
+    assert_eq!(
+        code,
+        StatusCode::BAD_REQUEST,
+        "profil sur une session sans zone : {e}"
+    );
+    assert_eq!(e["error"], "zone_requise");
+    assert!(b.hote.journal().profils.is_empty(), "un profil a été écrit");
+    // La proposition seule reste possible, sans zone.
+    let (code, e) = c.appel(
+        "POST",
+        &format!("/sessions/{sid}/correction"),
+        Some(serde_json::json!({})),
+    );
+    assert_eq!(code, StatusCode::OK, "{e}");
 }
