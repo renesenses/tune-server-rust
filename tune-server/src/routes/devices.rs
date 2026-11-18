@@ -22,6 +22,7 @@ use tune_core::outputs::dlna::DlnaOutput;
 use crate::state::AppState;
 
 mod jumelage_airplay_7447;
+mod oubli_9044;
 
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -62,7 +63,13 @@ pub fn router() -> Router<AppState> {
             "/{device_id}/ignore",
             post(ignore_device).delete(unignore_device),
         )
-        .route("/{device_id}", axum::routing::delete(delete_device))
+        // #9044 — oublier un appareil parti du réseau, et sa zone.
+        .route("/absent", get(oubli_9044::list_absent_devices))
+        .route("/absent/forget", post(oubli_9044::forget_absent_devices))
+        .route(
+            "/{device_id}",
+            axum::routing::delete(oubli_9044::delete_device),
+        )
         .route("/{device_id}/pair", post(pair_device))
         .route("/{device_id}/pair/pin", post(pair_device_pin))
         .route(
@@ -1893,25 +1900,6 @@ async fn clear_devices(State(state): State<AppState>) -> impl IntoResponse {
     Json(json!({"cleared": removed}))
 }
 
-async fn delete_device(
-    State(state): State<AppState>,
-    Path(device_id): Path<String>,
-) -> impl IntoResponse {
-    let retiree = state.outputs.lock().await.remove(&device_id);
-    // #7949 — arrêtée hors du verrou : elle jouait encore, sans zone.
-    tune_core::outputs::registry::arreter_les_sorties_retirees(retiree).await;
-    // Also drop it from persistence so it isn't re-registered on next startup.
-    forget_manual_device(&state, &device_id);
-    // #6299 — un renderer DLNA decouvert aussi : il etait re-sonde a chaque
-    // demarrage, meme parti du reseau.
-    forget_discovered_dlna(&state.backend, &device_id);
-    state.event_bus.emit_typed(
-        tune_core::event_types::EventType::DeviceLost,
-        json!({ "device_id": device_id }),
-    );
-    StatusCode::NO_CONTENT
-}
-
 // ---------------------------------------------------------------------------
 // Appareils ignorés (#1280)
 // ---------------------------------------------------------------------------
@@ -3323,11 +3311,16 @@ mod oubli_des_dlna_decouverts_6299 {
     #[tokio::test]
     async fn supprimer_l_appareil_l_oublie_du_magasin_des_decouverts() {
         let (_dossier, state) = banc();
-        let statut = delete_device(State(state.clone()), Path(PARTI.to_string()))
-            .await
-            .into_response()
-            .status();
-        assert_eq!(statut, StatusCode::NO_CONTENT);
+        let statut = oubli_9044::delete_device(
+            crate::auth::RequireAdmin,
+            State(state.clone()),
+            Path(PARTI.to_string()),
+            axum::extract::Query(Default::default()),
+        )
+        .await
+        .status();
+        // #9044 — l'oubli rend 200 et son bilan (204 avant).
+        assert_eq!(statut, StatusCode::OK);
         assert_eq!(
             uuids_dlna_decouverts(&state.backend),
             vec![RESTANT.to_string()],
@@ -3387,9 +3380,13 @@ mod sortie_retiree_arretee_7949 {
     #[tokio::test]
     async fn supprimer_l_appareil_arrete_sa_sortie() {
         let (_dossier, state, sortie) = banc("dlna:factice-7949").await;
-        let _ = delete_device(State(state.clone()), Path("dlna:factice-7949".into()))
-            .await
-            .into_response();
+        let _ = oubli_9044::delete_device(
+            crate::auth::RequireAdmin,
+            State(state.clone()),
+            Path("dlna:factice-7949".into()),
+            axum::extract::Query(Default::default()),
+        )
+        .await;
         assert!(!state.outputs.lock().await.contains("dlna:factice-7949"));
         assert_eq!(
             arrets(&sortie).await,
