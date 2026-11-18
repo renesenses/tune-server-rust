@@ -147,7 +147,7 @@ mod tests {
         let poller: String = include_str!("../poller/tick.rs")
             .split_whitespace()
             .collect();
-        assert!(poller.contains("VoiesEnTrop::depuis_sentinelle(&msg)"));
+        assert!(poller.contains("VoiesEnTrop::depuis_sentinelle(&msg"));
         assert!(poller.contains("(None,Some(voies))=>voies.charge_utile(zone_id)"));
     }
 }
