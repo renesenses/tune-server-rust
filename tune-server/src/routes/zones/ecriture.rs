@@ -970,6 +970,21 @@ async fn persister_le_son(
         };
         ecrire!("exclusive_mode", format!("{valeur:?}"), r);
     }
+    // #8696 — période WASAPI exclusive de la zone → setting
+    // zone_{id}_wasapi_periode_ms ; `null` ou `0` supprime la clé (Auto). Lue
+    // par l'orchestrateur à chaque lecture : rien à rafraîchir en vol, la
+    // période vaut à la prochaine ouverture du périphérique.
+    if let Some(valeur) = body.wasapi_exclusive_period_ms {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = tune_core::outputs::periode_reglable_8696::cle_de_zone(id);
+        let lue = valeur
+            .and_then(|ms| tune_core::outputs::periode_reglable_8696::lire_valeur(&ms.to_string()));
+        let r = match lue {
+            Some(ms) => settings.set(&key, &ms.to_string()),
+            None => settings.delete(&key),
+        };
+        ecrire!("wasapi_exclusive_period_ms", format!("{lue:?}"), r);
+    }
     // Trim de gain par renderer → setting zone_{id}_gain_trim_db (±12 dB, 0 = efface).
     if let Some(db) = body.gain_trim_db {
         let settings = SettingsRepo::with_backend(state.backend.clone());
