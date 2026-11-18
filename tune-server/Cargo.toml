@@ -2203,6 +2203,12 @@ path = "tests/durcissement_routes_admin.rs"
 name = "activation_authentification"
 path = "tests/activation_authentification.rs"
 
+# Le code d'activation ne sort par aucun lecteur de journal (TUNE_LOG_FILE
+# posé pour tout le processus : cible à part).
+[[test]]
+name = "code_activation_hors_des_journaux"
+path = "tests/code_activation_hors_des_journaux.rs"
+
 # #8135 — une radio comme élément d'une playlist (ajout, liste, lecture,
 # export/import). `autotests = false` plus haut : sans cette cible, jamais compilé.
 [[test]]

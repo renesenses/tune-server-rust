@@ -1371,6 +1371,14 @@ async fn derriere_un_mandataire_le_bouclage_ne_vaut_plus_cette_machine() {
         ("via", "1.1 caddy"),
         ("cf-connecting-ip", "203.0.113.9"),
         ("x-forwarded-host", "tune.example.org"),
+        ("x-forwarded-proto", "https"),
+        ("x-forwarded-port", "443"),
+        ("x-client-ip", "192.168.1.50"),
+        ("fastly-client-ip", "203.0.113.9"),
+        ("tailscale-user-login", "intrus@example.org"),
+        // Un `Host` qui ne nomme pas cette machine : relais TCP, proxy DSM…
+        ("host", "nas.local:8888"),
+        ("host", "192.168.1.10:8888"),
     ] {
         for (m, chemin, corps) in [
             (Method::POST, "/api/v1/system/stop", None),
@@ -1447,4 +1455,56 @@ async fn le_theme_actif_exige_l_administrateur() {
     )
     .await;
     assert_eq!(st, StatusCode::NOT_FOUND, "{rep}");
+}
+
+/// Un `Host` de bouclage (avec ou sans port, IPv4, IPv6, `localhost`) reste
+/// « cette machine ».
+#[tokio::test]
+async fn un_host_de_bouclage_reste_cette_machine() {
+    let state = new_state();
+    for hote in [
+        "localhost:8888",
+        "127.0.0.1:8888",
+        "[::1]:8888",
+        "localhost",
+        "LOCALHOST.",
+    ] {
+        let (st, _, rep) = appel_depuis(
+            &state,
+            CETTE_MACHINE,
+            Method::POST,
+            "/api/v1/plugins/greffon-inexistant-gardes/install",
+            None,
+            Some("{}"),
+            &[("host", hote)],
+        )
+        .await;
+        assert!(!rep.contains("auth_required"), "{hote} : {st} {rep}");
+    }
+}
+
+#[test]
+fn les_noms_d_hote_de_bouclage() {
+    use tune_server::auth::hote_de_bouclage;
+    for oui in [
+        "localhost",
+        "localhost:8888",
+        "127.0.0.1",
+        "127.0.0.1:80",
+        "[::1]",
+        "[::1]:8888",
+        "app.localhost",
+    ] {
+        assert!(hote_de_bouclage(oui), "{oui}");
+    }
+    for non in [
+        "nas.local",
+        "nas.local:8888",
+        "192.168.1.10:8888",
+        "[fd00::4]:8888",
+        "localhost.example.org",
+        "127.0.0.1.nip.io",
+    ] {
+        assert!(!hote_de_bouclage(non), "{non}");
+    }
 }

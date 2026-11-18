@@ -423,14 +423,33 @@ pub fn anonymiser_avec(texte: &str, utilisateur: Option<&str>) -> String {
 /// C'est la porte commune de tout ce qui part vers le site : les mots du
 /// testeur (titre, description, sujet et corps d'un ticket) y passent seuls,
 /// le diagnostic y passe par [`anonymiser`], qui commence par elle.
+/// Le marqueur de la ligne qui porte le code d'activation de
+/// l'authentification. Le serveur l'écrit sur sa CONSOLE seulement ; toute
+/// ligne qui le porte est retirée de ce qui sort (journal servi par l'API,
+/// rapport de bogue, ticket, assistant) — cas d'une sortie d'erreur
+/// redirigée dans le fichier journal, ou d'un repli sur `journalctl`.
+pub const MARQUEUR_CODE_ACTIVATION: &str = "TUNE-ACTIVATION-CODE";
+
+/// Retire les lignes qui portent [`MARQUEUR_CODE_ACTIVATION`].
+pub fn retirer_les_codes_d_activation(texte: &str) -> String {
+    if !texte.contains(MARQUEUR_CODE_ACTIVATION) {
+        return texte.to_string();
+    }
+    texte
+        .split_inclusive('\n')
+        .filter(|ligne| !ligne.contains(MARQUEUR_CODE_ACTIVATION))
+        .collect()
+}
+
 pub fn masquer_acces_distant(texte: &str) -> String {
     acces_distant(texte, &identifiants_prives())
 }
 
 fn acces_distant(texte: &str, prives: &[String]) -> String {
+    // Le code d'activation de l'authentification ne sort jamais.
+    let mut texte = retirer_les_codes_d_activation(texte);
     // Les identifiants de ce serveur d'abord, en entier : une expression
     // plus loin pourrait n'en masquer qu'une partie.
-    let mut texte = texte.to_string();
     for id in prives {
         if let Ok(re_id) = Regex::new(&format!("(?i){}", regex::escape(id))) {
             texte = re_id.replace_all(&texte, MASQUE).into_owned();
@@ -560,6 +579,22 @@ pub fn anonymiser_champ(texte: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn le_code_d_activation_ne_sort_jamais() {
+        let journal = format!(
+            "INFO demarrage\n{MARQUEUR_CODE_ACTIVATION} K7QXR2MZPA — Tune : code\nERROR fin\n"
+        );
+        for sortie in [
+            anonymiser_avec(&journal, None),
+            masquer_acces_distant(&journal),
+            retirer_les_codes_d_activation(&journal),
+        ] {
+            assert!(!sortie.contains("K7QXR2MZPA"), "{sortie}");
+            assert!(sortie.contains("INFO demarrage"), "{sortie}");
+            assert!(sortie.contains("ERROR fin"), "{sortie}");
+        }
+    }
     use super::*;
     use serde_json::json;
 

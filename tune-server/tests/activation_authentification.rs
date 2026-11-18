@@ -70,6 +70,13 @@ async fn appel(
     (status, v)
 }
 
+/// Ce que l'exploitant lit sur la console : le code en cours, émis s'il le
+/// faut. Aucune route ne le rend.
+fn code_de_la_console(state: &AppState) -> String {
+    let _ = tune_server::auth::emettre_code_activation(state);
+    tune_server::auth::code_activation_en_cours(state).expect("un code en cours")
+}
+
 async fn activer(state: &AppState, adresse: &str, corps: &str) -> (StatusCode, Value) {
     appel(
         state,
@@ -154,7 +161,7 @@ async fn un_code_faux_est_refuse_et_cinq_essais_detruisent_le_code() {
     );
 
     // Ce que l'exploitant lit dans le journal.
-    let code = tune_server::auth::emettre_code_activation(&state);
+    let code = code_de_la_console(&state);
     let (st, v) = activer(
         &state,
         AUTRE_HOTE_DU_LAN,
@@ -183,7 +190,7 @@ async fn un_code_faux_est_refuse_et_cinq_essais_detruisent_le_code() {
 #[tokio::test]
 async fn un_mot_de_passe_trop_court_ne_consomme_pas_le_code() {
     let state = new_state();
-    let code = tune_server::auth::emettre_code_activation(&state);
+    let code = code_de_la_console(&state);
     let corps = format!(r#"{{"password":"court","code":"{code}"}}"#);
     let (st, v) = activer(&state, AUTRE_HOTE_DU_LAN, &corps).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
@@ -198,7 +205,7 @@ async fn un_mot_de_passe_trop_court_ne_consomme_pas_le_code() {
 #[tokio::test]
 async fn le_code_juste_active_et_ne_sert_qu_une_fois() {
     let state = new_state();
-    let code = tune_server::auth::emettre_code_activation(&state);
+    let code = code_de_la_console(&state);
     let corps = format!(r#"{{"password":"proprio-1234","code":"{code}"}}"#);
     let (st, v) = activer(&state, AUTRE_HOTE_DU_LAN, &corps).await;
     assert_eq!(st, StatusCode::OK, "{v}");
@@ -533,4 +540,266 @@ async fn l_activation_supprime_les_comptes_non_reconnus_et_garde_l_admin() {
     )
     .await;
     assert_eq!(st, StatusCode::OK);
+}
+
+/// Un nouvel appel ne remplace pas un code valable et ne remet pas ses essais
+/// à zéro ; au plus une émission par minute ; échecs comptés par adresse.
+#[tokio::test]
+async fn le_code_en_cours_n_est_pas_remplace_et_les_echecs_comptent_par_adresse() {
+    let state = new_state();
+    let demander = || {
+        appel(
+            &state,
+            AUTRE_HOTE_DU_LAN,
+            Method::POST,
+            "/api/v1/auth/activation/code",
+            None,
+            None,
+        )
+    };
+    let (st, v) = demander().await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "code_written_to_server_console");
+    let code_a = tune_server::auth::code_activation_en_cours(&state).unwrap();
+    let faux = r#"{"password":"pirate-1234","code":"BBBBBBBBBB"}"#;
+    for _ in 0..3 {
+        let (st, _) = activer(&state, AUTRE_HOTE_DU_LAN, faux).await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+    }
+    // Redemander ne remplace rien et ne rend pas d'essais.
+    let (st, v) = demander().await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], "code_already_pending");
+    assert_eq!(
+        tune_server::auth::code_activation_en_cours(&state).as_deref(),
+        Some(code_a.as_str())
+    );
+    for _ in 0..2 {
+        activer(&state, AUTRE_HOTE_DU_LAN, faux).await;
+    }
+    assert_eq!(
+        tune_server::auth::code_activation_en_cours(&state),
+        None,
+        "5 essais : détruit"
+    );
+    let juste_a = format!(r#"{{"password":"pirate-1234","code":"{code_a}"}}"#);
+    let (st, _) = activer(&state, AUTRE_HOTE_DU_LAN, &juste_a).await;
+    assert_eq!(st, StatusCode::FORBIDDEN);
+    // Moins d'une minute après : pas de nouveau code.
+    let (st, v) = demander().await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+
+    // Nouveau code (délai oublié pour l'épreuve) : l'adresse fautive a déjà
+    // 6 échecs ; deux de plus et elle est bloquée, même avec le bon code.
+    tune_server::auth::oublier_le_delai_d_emission(&state);
+    let code_b = code_de_la_console(&state);
+    for _ in 0..2 {
+        activer(&state, AUTRE_HOTE_DU_LAN, faux).await;
+    }
+    let juste_b = format!(r#"{{"password":"proprio-1234","code":"{code_b}"}}"#);
+    let (st, v) = activer(&state, AUTRE_HOTE_DU_LAN, &juste_b).await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS, "{v}");
+    assert_eq!(v["error"], "activation_attempts_exceeded");
+    assert!(!active(&state));
+    // Une autre adresse, avec le bon code, active.
+    let (st, v) = activer(&state, "192.168.1.77:50000", &juste_b).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(active(&state));
+}
+
+/// Une liste de comptes invalide ne consomme pas le code.
+#[tokio::test]
+async fn une_liste_de_comptes_invalide_ne_brule_pas_le_code() {
+    let state = new_state();
+    let code = code_de_la_console(&state);
+    let corps = format!(r#"{{"password":"proprio-1234","code":"{code}","delete_accounts":[1]}}"#);
+    let (st, v) = activer(&state, AUTRE_HOTE_DU_LAN, &corps).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(
+        tune_server::auth::code_activation_en_cours(&state).as_deref(),
+        Some(code.as_str())
+    );
+}
+
+/// Les comptes liés à Mozaiklabs (SSO) sont listés ; le propriétaire de la
+/// licence ne se supprime pas.
+#[tokio::test]
+async fn la_revue_montre_les_comptes_sso_et_protege_le_proprietaire_de_la_licence() {
+    let state = new_state();
+    use tune_core::db::backend::ToSqlValue;
+    for courriel in ["proprio@example.org", "ami@example.org"] {
+        state
+            .backend
+            .execute(
+                "INSERT INTO profiles (username, display_name, email) VALUES (?, ?, ?)",
+                &[
+                    &courriel as &dyn ToSqlValue,
+                    &courriel as &dyn ToSqlValue,
+                    &courriel as &dyn ToSqlValue,
+                ],
+            )
+            .unwrap();
+    }
+    let id_de = |nom: &str| {
+        state
+            .backend
+            .query_one(
+                "SELECT id FROM profiles WHERE username = ?",
+                &[&nom as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .unwrap()[0]
+            .as_i64()
+            .unwrap()
+    };
+    let proprio = id_de("proprio@example.org");
+    let ami = id_de("ami@example.org");
+    SettingsRepo::with_backend(state.backend.clone())
+        .set(
+            tune_core::cloud::proprietaire::CLE_PROPRIETAIRE,
+            &proprio.to_string(),
+        )
+        .unwrap();
+    let (_, v) = appel(
+        &state,
+        CETTE_MACHINE,
+        Method::GET,
+        "/api/v1/auth/activation",
+        None,
+        None,
+    )
+    .await;
+    let comptes = v["accounts"].as_array().unwrap();
+    let fiche = |id: i64| comptes.iter().find(|c| c["id"] == id).cloned().unwrap();
+    assert_eq!(fiche(proprio)["kind"], "sso");
+    assert_eq!(fiche(proprio)["license_owner"], true);
+    assert_eq!(fiche(proprio)["deletable"], false);
+    assert_eq!(fiche(ami)["deletable"], true);
+    let corps = format!(r#"{{"password":"proprio-1234","delete_accounts":[{proprio}]}}"#);
+    let (st, v) = activer(&state, CETTE_MACHINE, &corps).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    let corps = format!(r#"{{"password":"proprio-1234","delete_accounts":[{ami}]}}"#);
+    let (st, v) = activer(&state, CETTE_MACHINE, &corps).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert!(!existe(&state, "ami@example.org"));
+    assert!(existe(&state, "proprio@example.org"));
+}
+
+/// L'activation ferme les WebSocket ouvertes pendant que tout était ouvert.
+#[tokio::test]
+async fn l_activation_ferme_les_websockets() {
+    let state = new_state();
+    let mut abonne = state.fermeture_websockets.subscribe();
+    assert!(!abonne.has_changed().unwrap());
+    let (st, _) = activer(&state, CETTE_MACHINE, r#"{"password":"proprio-1234"}"#).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(abonne.has_changed().unwrap());
+}
+
+/// Une connexion SSO commencée avant l'activation ne se termine pas après ;
+/// une connexion en attente depuis plus de dix minutes non plus.
+#[tokio::test]
+async fn la_connexion_sso_en_attente_ne_survit_ni_a_l_activation_ni_au_temps() {
+    let reglages = |s: &AppState| SettingsRepo::with_backend(s.backend.clone());
+    let etat_pkce = |s: &AppState| -> Option<String> {
+        reglages(s)
+            .get("mozaik_pkce_pending")
+            .unwrap()
+            .filter(|v| !v.is_empty())
+            .and_then(|v| serde_json::from_str::<Value>(&v).ok())
+            .and_then(|v| v["state"].as_str().map(str::to_string))
+    };
+    // 1. Commencée avant l'activation.
+    let state = new_state();
+    let (st, _) = appel(
+        &state,
+        CETTE_MACHINE,
+        Method::GET,
+        "/api/v1/cloud/sso/authorize",
+        None,
+        None,
+    )
+    .await;
+    assert!(st.is_redirection(), "{st}");
+    let etat = etat_pkce(&state).expect("connexion en attente");
+    let (st, _) = activer(&state, CETTE_MACHINE, r#"{"password":"proprio-1234"}"#).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(etat_pkce(&state), None);
+    let chemin = format!("/api/v1/cloud/sso/callback?code=x&state={etat}");
+    let (st, v) = appel(&state, AUTRE_HOTE_DU_LAN, Method::GET, &chemin, None, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(v.to_string().contains("no pending SSO session"), "{v}");
+
+    // 2. Plus de dix minutes d'attente.
+    let state = new_state();
+    appel(
+        &state,
+        CETTE_MACHINE,
+        Method::GET,
+        "/api/v1/cloud/sso/authorize",
+        None,
+        None,
+    )
+    .await;
+    let etat = etat_pkce(&state).expect("connexion en attente");
+    let vieux = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 11 * 60;
+    reglages(&state)
+        .set("mozaik_pkce_pending_at", &vieux.to_string())
+        .unwrap();
+    let chemin = format!("/api/v1/cloud/sso/callback?code=x&state={etat}");
+    let (st, v) = appel(&state, CETTE_MACHINE, Method::GET, &chemin, None, None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    assert!(v.to_string().contains("no pending SSO session"), "{v}");
+}
+
+/// Derrière un mandataire inverse (connexion vue de 127.0.0.1), la connexion
+/// n'est plus « l'opérateur local » : limite de tentatives appliquée, profil
+/// `default` sans mot de passe refusé une fois l'authentification active.
+#[tokio::test]
+async fn derriere_un_mandataire_la_connexion_n_est_pas_l_operateur_local() {
+    let state = new_state();
+    let app = tune_server::routes::router(state.clone()).layer(MockConnectInfo(
+        CETTE_MACHINE.parse::<SocketAddr>().unwrap(),
+    ));
+    let connexion = |corps: &'static str| {
+        Request::post("/api/v1/auth/login")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-forwarded-for", "203.0.113.9")
+            .body(Body::from(corps))
+            .unwrap()
+    };
+    // Authentification active, profil `default` sans mot de passe.
+    let s = SettingsRepo::with_backend(state.backend.clone());
+    s.set("auth_enabled", "true").unwrap();
+    s.set("jwt_secret", "secret-de-l-epreuve").unwrap();
+    let st = app
+        .clone()
+        .oneshot(connexion(
+            r#"{"username":"default","password":"pirate-1234"}"#,
+        ))
+        .await
+        .unwrap()
+        .status();
+    assert_eq!(
+        st,
+        StatusCode::UNAUTHORIZED,
+        "default sans mot de passe via mandataire"
+    );
+    // La limite s'applique (10 échecs, puis 429).
+    let mut dernier = StatusCode::OK;
+    for _ in 0..11 {
+        dernier = app
+            .clone()
+            .oneshot(connexion(
+                r#"{"username":"inconnu","password":"faux-faux-1"}"#,
+            ))
+            .await
+            .unwrap()
+            .status();
+    }
+    assert_eq!(dernier, StatusCode::TOO_MANY_REQUESTS);
 }
