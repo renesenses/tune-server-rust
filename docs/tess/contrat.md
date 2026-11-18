@@ -320,7 +320,8 @@ chaîne. C'est le comportement de #7632.
 ### Badge (A4)
 
 - **`bit_perfect`** : aucune étape ne modifie les échantillons. C'est le cas :
-  - en mode Pure ;
+  - en mode Pure avec le volume à 0 dB (ou tenu à 100 % par le verrou
+    `audiophile_lock_volume`) ;
   - avec une chaîne vide et le volume à 0 dB, ou un volume réglé par l'appareil ;
   - avec une source DSD native.
 - **`processed_by_tess`** : « Processed by TESS · 64-bit ».
@@ -328,10 +329,14 @@ chaîne. C'est le comportement de #7632.
 
 ### Comportements particuliers
 
-- **Mode Pure** : Volume et Quantization ne sont pas effectifs.
+- **Mode Pure** : greffons, headroom et upsampling sont éteints. Le volume
+  logiciel, lui, **reste appliqué** (vérifié par T07 dans le code réel :
+  `audio::audiophile::effective_volume`), avec la quantification qu'il
+  exige ; seul le verrou `audiophile_lock_volume` (inactif par défaut) le
+  tient à 100 %, et la zone redevient alors bit-perfect.
 - **Volume et blocages** : le volume est un réglage de **zone**.
-  - « Bypass all » et une chaîne illisible ne l'éteignent pas.
-  - Hors TESS, en Pure ou en DSD natif, il n'est pas appliqué en logiciel.
+  - « Bypass all », Pure et une chaîne illisible ne l'éteignent pas.
+  - Hors TESS ou en DSD natif, il n'est pas appliqué en logiciel.
 - **Hors TESS**, la réponse n'annonce aucun headroom (`headroom_db = 0`) et
   aucun placement de volume (`placement = null`).
 
@@ -413,6 +418,22 @@ Hors TESS, avec un motif affiché :
 
 Ces points ne sont pas codés dans T01. Ils sont fixés ici pour que chaque lot
 s'y tienne.
+
+### T07 : étages fixes (`tess::etages_fixes`)
+
+- **Headroom** (`EtageHeadroom`) : headroom de TESS, ReplayGain et gain de
+  zone en un gain d'entrée, jamais au-dessus de 0 dB ; la part positive du
+  ReplayGain et du gain de zone part au rendu, sous le rabot du volume.
+- **Bilan de niveau** (`BilanDeNiveau`) : l'automatique (−3 dB) ne s'empile
+  pas sur la réserve déclarée par les greffons (−12 dB d'AutoEq ⇒ 0 dB de
+  plus) ; la compensation rend headroom et réserves UNE fois, par le volume,
+  rabotée à l'unité ; jamais le ReplayGain ni le gain de zone. La réserve de
+  3 dB du suréchantillonneur disparaît sous TESS (T11a).
+- **Volume** (`EtageVolume`) : `f64`, au rendu, consigne relue à chaque bloc
+  et rampe de 20 ms.
+- **Étape finale** : `noise_shaped` = `QuantificationMiseEnForme` ; TPDF et
+  `off` = `QuantificationPcm` (T03) ; DSD = modulateur de T11b, volume juste
+  avant.
 
 ### T03, T04 et T07 : l'anneau et la quantification
 
