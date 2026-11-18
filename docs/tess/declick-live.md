@@ -25,7 +25,7 @@ des `H` trames les plus anciennes encore modifiables, `F = [T-L, T-L+H)`.
    passées, avec un plancher : le bruit de quantification d'un 16 bits
    (−101 dBFS). Sans lui, un enregistrement 24 bits ou synthétique est si
    prévisible que toute note nouvelle dépasse le seuil de cent fois.
-4. **Candidat** : suite où `|ẽ| > K·σ` (`K` = `threshold`, **18** par
+4. **Candidat** : suite où `|ẽ| > K·σ` (`K` = `threshold`, **8** par
    défaut, 4 à 30), trous de 8 échantillons au plus, qui commence dans `F`.
 5. **Rejets** (protection de la musique) ; le candidat reste intact si :
    - il dépasse `max_click_ms` + `2p` échantillons (événement long) ;
@@ -44,10 +44,24 @@ des `H` trames les plus anciennes encore modifiables, `F = [T-L, T-L+H)`.
    l'erreur avant atteint 3 % de son maximum au dernier où l'erreur arrière
    l'atteint. Seul ce cœur (± 2) est interpolé : interpoler tout l'étalement
    du filtre adapté (± `p`) dégradait le signal plus que le clic lui-même.
-7. **Interpolation LSAR** (Godsill et Rayner) : les `m` échantillons du cœur
-   minimisent `Σ e[n]²` sur `[s, s+m+p)`, `p` échantillons connus de chaque
-   côté. Système `R x_u = −b`, `R` Toeplitz en bande, Cholesky en bande,
-   `O(m·p²)`, sans allocation.
+7. **Interpolation LSAR** (Godsill et Rayner) avec un **modèle des deux
+   côtés** : les autocorrélations du passé et des 8 ms qui suivent le clic
+   sont mises en commun, avec un léger élargissement de bande
+   (`a_k ← 0,998^k a_k`) pour éloigner les pôles du cercle unité. Les `m`
+   échantillons du cœur minimisent `Σ e[n]²` sur `[s, s+m+p)`. Système
+   `R x_u = −b`, Toeplitz en bande, Cholesky en bande, sans allocation.
+8. **Garde-fous de la réparation** : elle n'est jamais pire que l'original.
+   La réparation est annulée, l'original gardé, si :
+   - **validation croisée** : le même interpolateur (même factorisation),
+     appliqué à un trou de même longueur dans le signal propre juste avant
+     et juste après, s'y trompe de `E_cv` ; la réparation doit retirer au
+     moins `4·E_cv`, sinon elle ajouterait plus d'erreur qu'elle n'en ôte ;
+   - **débordement** : elle retire plus de 16 fois l'énergie que le clic
+     explique (excès d'erreur avant `/ R(0)`) : elle réécrit la musique ;
+   - **modèles indépendants** : elle n'abaisse pas l'erreur de prédiction
+     sous le modèle passé ET sous le modèle de l'après ;
+   - **enveloppe** : un échantillon réparé dépasse 1,5 fois le maximum de
+     son contexte.
 
 ## 3. Anticipation et latence
 
@@ -74,26 +88,56 @@ pour un clic (aucun contexte « après » fabriqué).
   nombreuses), cymbales (partiels inharmoniques, attaque nulle), piano
   (partiels inharmoniques, feutre, marteau), 20 s stéréo, 44,1 et 96 kHz,
   S16, S24 et F32 : **zéro échantillon modifié**.
-- **Détection** (`tests/detection.rs`) : 283 clics (impulsions et clics
-  amortis de 0,05 à 1 ms, −40 à −6 dBFS) dans un programme d'environ
-  −20 dBFS RMS ; taux par niveau, fausses réparations, gain de SNR local.
+- **Générateurs durs, hors contre-épreuve** (`harpsichord_hard`,
+  `piano_hard`) : les premiers générateurs du lot (clavecin excité au bruit
+  blanc jusqu'à 3,5 kHz ; piano sans feutre, rampe linéaire, choc large
+  bande). Mesurés seulement : 0 échantillon modifié à 44,1 et 96 kHz (S16).
+- **Détection** (`tests/detection.rs`) : clics impulsions et amortis de 0,05
+  à 1 ms, −40 à −6 dBFS, dans un programme d'environ −20 dBFS RMS ; taux par
+  niveau, fausses réparations, gain de SNR local, clics aggravés.
 - **CPU et latence** : `cargo run --release -p tune-plugin-declick-live
   --example banc`. À refaire sur le Raspberry Pi 4 (.44, Cortex-A72) en
   stéréo à 44,1 / 96 / 192 kHz pour fixer le plafond de cadence.
 
+### Mesures, itération 1 (tête `a3f060aa7`) → itération 2
+
+Programme, détection par niveau :
+
+| | −40…−30 | −30…−20 | −20…−6 | fausses | gain local |
+|---|---|---|---|---|---|
+| 44,1 kHz, it. 1 (K = 18) | 0 % | 54 % | 100 % | 0 | +5,3 dB |
+| 44,1 kHz, it. 2 (K = 8) | 19 % | **87 %** | 99 % | 0 | **+9,3 dB** |
+| 96 kHz, it. 1 | 4 % | 89 % | 100 % | 0 | +4,1 dB |
+| 96 kHz, it. 2 | 56 % | 97 % | 97 % | 0 | +4,6 dB |
+
+Matériel difficile avec clics (48 kHz, 120 clics) :
+
+| corpus | it. 1 : détectés / gain | it. 2 : détectés / gain / clics aggravés |
+|---|---|---|
+| piano | 92–97 % / **−6,6 dB** | 17–71 % / **+3,6 dB** / 1 |
+| clavecin | 52–68 % / −3,7 dB | 37–48 % / +2,6 dB / 4 |
+| cymbales | 0–3 % / +0,1 dB | 0–8 % / +0,4 dB / 0 |
+| piano dur (hors c.-é.) | — | 5–65 % / +4,3 dB / 1 |
+| clavecin dur (hors c.-é.) | — | 9–21 % / +1,4 dB / 0 |
+
+CPU (Shrek, Xeon E5-2630 v4, un cœur, F32 stéréo, blocs de 512, 15 ms) :
+44,1 kHz 4,7 % (pire bloc 8 %), 96 kHz 8,8 % (22 %), 192 kHz 20 % (68 %).
+
 ## 6. Limites connues
 
-- Le seuil par défaut est prudent : il trouve tous les clics au-dessus de
-  −20 dBFS, environ la moitié (44,1 kHz) à 90 % (96 kHz) entre −30 et
-  −20 dBFS, presque aucun en dessous, sous une musique à −20 dBFS RMS.
-- Sous des cymbales ou des attaques de clavecin, les clics sont surtout
-  laissés en place (le greffon préfère ne rien faire).
-- Sur piano seul, la réparation LSAR d'ordre 32 améliore mal le signal
-  (gain local négatif mesuré à 48 kHz) : à reprendre (ordre plus élevé ou
-  modèle ré-estimé des deux côtés) avant la mise en avant de la fonction.
+- **Sous des cymbales** : presque rien n'est réparé (0 à 8 %). Le bruit large
+  bande d'une cymbale masque l'erreur d'un clic ; le greffon s'abstient.
+- **Près des attaques** (clavecin, piano) : un clic situé dans les quelques
+  millisecondes d'une attaque est laissé en place ; les tests d'isolation et
+  de changement de spectre protègent l'attaque au prix de ce clic.
+- **Piano et clavecin seuls** : les garde-fous refusent beaucoup de
+  réparations (l'ordre 32 prédit mal ces signaux très riches) ; le gain
+  reste positif mais la détection effective baisse (17 à 71 % sur piano).
+- **Clics aggravés** : le gain est positif sur chaque corpus, mais quelques
+  clics isolés (1 à 6 par corpus de 120 à 283) finissent un peu plus loin
+  du signal propre qu'avant : réparation partielle d'un clic amorti.
+- **Sous −30 dBFS** à 44,1 kHz, sous une musique à −20 dBFS RMS : 19 %.
 - Stéréo : pas de détection conjointe des canaux.
-- Une attaque instantanée en marche d'escalier (synthèse sans continuité)
-  est indiscernable d'un clic par cette méthode.
 
 ## 7. Hors périmètre de ce lot
 

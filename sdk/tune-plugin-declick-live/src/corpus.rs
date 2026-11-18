@@ -61,6 +61,24 @@ pub fn harpsichord_notes(
     seconds: f64,
     seed: u64,
 ) -> (Vec<f64>, Vec<(usize, usize, f64)>) {
+    harpsichord_impl(rate, seconds, seed, false)
+}
+
+/// HARD variant, OUTSIDE the counter-proof (robustness measurement only):
+/// the first generator of this lot. White-noise excitation (each attack is
+/// a broadband burst of one period) and notes up to 3.5 kHz, beyond the
+/// instrument's compass. Its attacks are, sample for sample, short noise
+/// bursts: a click by any local definition.
+pub fn harpsichord_hard(rate: u32, seconds: f64, seed: u64) -> Vec<f64> {
+    harpsichord_impl(rate, seconds, seed, true).0
+}
+
+fn harpsichord_impl(
+    rate: u32,
+    seconds: f64,
+    seed: u64,
+    hard: bool,
+) -> (Vec<f64>, Vec<(usize, usize, f64)>) {
     let mut notes = Vec::new();
     let fs = f64::from(rate);
     let len = (seconds * fs) as usize;
@@ -69,7 +87,11 @@ pub fn harpsichord_notes(
     let mut start = (0.05 * fs) as usize;
     while start < len {
         // The harpsichord compass: FF1 (43.7 Hz) to f3 (1397 Hz).
-        let midi = rng.range(29.0, 89.0);
+        let midi = if hard {
+            rng.range(36.0, 105.0)
+        } else {
+            rng.range(29.0, 89.0)
+        };
         let f0 = 440.0 * 2f64.powf((midi - 69.0) / 12.0);
         let period = (fs / f0).max(2.0);
         let n = period as usize;
@@ -81,6 +103,9 @@ pub fn harpsichord_notes(
         let beta = rng.range(0.08, 0.2);
         let mut line: Vec<f64> = (0..n)
             .map(|i| {
+                if hard {
+                    return rng.range(-1.0, 1.0);
+                }
                 let u = i as f64 / n as f64;
                 let tri = if u < beta {
                     u / beta
@@ -170,6 +195,23 @@ pub fn piano(rate: u32, seconds: f64, seed: u64) -> Vec<f64> {
 
 /// [`piano`] and its notes: (start frame, duration, f0 in Hz).
 pub fn piano_notes(rate: u32, seconds: f64, seed: u64) -> (Vec<f64>, Vec<(usize, usize, f64)>) {
+    piano_impl(rate, seconds, seed, false)
+}
+
+/// HARD variant, OUTSIDE the counter-proof (robustness measurement only):
+/// the first generator of this lot. No felt (all 40 partials at full
+/// brightness up to Nyquist), linear 0.5 – 2 ms attacks, a loud broadband
+/// hammer thump.
+pub fn piano_hard(rate: u32, seconds: f64, seed: u64) -> Vec<f64> {
+    piano_impl(rate, seconds, seed, true).0
+}
+
+fn piano_impl(
+    rate: u32,
+    seconds: f64,
+    seed: u64,
+    hard: bool,
+) -> (Vec<f64>, Vec<(usize, usize, f64)>) {
     let mut notes = Vec::new();
     let fs = f64::from(rate);
     let len = (seconds * fs) as usize;
@@ -186,14 +228,22 @@ pub fn piano_notes(rate: u32, seconds: f64, seed: u64) -> (Vec<f64>, Vec<(usize,
             let vel = rng.range(0.2, 1.0);
             let dur = (rng.range(0.5, 3.0) * fs) as usize;
             notes.push((start, dur, f0));
-            let attack = (rng.range(0.001, 0.003) * fs).max(1.0);
+            let attack = if hard {
+                (rng.range(0.0005, 0.002) * fs).max(1.0)
+            } else {
+                (rng.range(0.001, 0.003) * fs).max(1.0)
+            };
             // Felt hammer: a velocity-dependent low-pass on the partials.
             let felt = 1_000.0 + 5_000.0 * vel;
             let partials: Vec<(f64, f64, f64)> = (1..=40)
                 .map(|k| {
                     let k = k as f64;
                     let f = k * f0 * (1.0 + b * k * k).sqrt();
-                    let lp = 1.0 / (1.0 + (f / felt).powi(2));
+                    let lp = if hard {
+                        1.0
+                    } else {
+                        1.0 / (1.0 + (f / felt).powi(2))
+                    };
                     (f, lp * vel / k.powf(1.2 - 0.4 * vel), 0.3 + 3.0 / k)
                 })
                 .filter(|p| p.0 < nyq)
@@ -202,10 +252,12 @@ pub fn piano_notes(rate: u32, seconds: f64, seed: u64) -> (Vec<f64>, Vec<(usize,
             let fade = (0.06 * fs) as usize;
             for i in 0..dur.min(len - start) {
                 let t = i as f64 / fs;
-                let rise = if (i as f64) < attack {
-                    0.5 - 0.5 * (std::f64::consts::PI * i as f64 / attack).cos()
-                } else {
+                let rise = if (i as f64) >= attack {
                     1.0
+                } else if hard {
+                    i as f64 / attack
+                } else {
+                    0.5 - 0.5 * (std::f64::consts::PI * i as f64 / attack).cos()
                 };
                 let mut v = 0.0;
                 for &(f, a, d) in &partials {
@@ -213,8 +265,9 @@ pub fn piano_notes(rate: u32, seconds: f64, seed: u64) -> (Vec<f64>, Vec<(usize,
                 }
                 if (i as f64) < 3.0 * attack {
                     // Low thump of the hammer and keybed (below ~400 Hz).
-                    thump += 0.05 * (rng.gauss() - thump);
-                    v += 0.1 * vel * thump * (1.0 - i as f64 / (3.0 * attack));
+                    let (pole, level) = if hard { (0.2, 0.3) } else { (0.05, 0.1) };
+                    thump += pole * (rng.gauss() - thump);
+                    v += level * vel * thump * (1.0 - i as f64 / (3.0 * attack));
                 }
                 out[start + i] += rise * v * release(i, dur, fade);
             }

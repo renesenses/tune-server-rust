@@ -53,3 +53,29 @@ fn cymbals_are_left_untouched() {
 fn piano_is_left_untouched() {
     counter_proof("piano", piano);
 }
+
+/// HARD generators, OUTSIDE the counter-proof: measured, not asserted. The
+/// white-noise harpsichord's attacks are short broadband bursts; the bare
+/// piano's attacks are a linear ramp of every partial up to Nyquist plus a
+/// broadband thump. Prints how many samples the plug-in would touch.
+#[test]
+fn hard_generators_robustness_is_measured() {
+    use tune_plugin_declick_live::corpus::{harpsichord_hard, piano_hard};
+    for (name, generator) in [
+        (
+            "clavecin dur",
+            harpsichord_hard as fn(u32, f64, u64) -> Vec<f64>,
+        ),
+        ("piano dur", piano_hard),
+    ] {
+        for rate in [44_100, 96_000] {
+            let x = stereo(generator, rate, SECONDS, 7);
+            let input = Pcm::quantize(SampleEncoding::S16, &x);
+            let r = run(rate, 2, &input, &enabled());
+            println!(
+                "robustesse {name:<13} {rate:>6} Hz S16: {} réparation(s), {} échantillon(s) modifié(s)",
+                r.stats.clicks_repaired, r.stats.samples_modified
+            );
+        }
+    }
+}

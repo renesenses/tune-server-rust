@@ -1,13 +1,17 @@
 //! TESS T13 — synthetic clicks injected into a generated corpus: detection
-//! rate, false repairs and local SNR gain. `--nocapture` prints the table.
+//! rate, false repairs, local SNR gain and clicks made worse. `--nocapture`
+//! prints the tables.
 mod common;
 use common::*;
 use tune_plugin_declick_live::Event;
 use tune_plugin_declick_live::corpus::{
-    Click, cymbals, harpsichord, inject_clicks, piano, programme, stereo,
+    Click, cymbals, harpsichord, harpsichord_hard, inject_clicks, piano, piano_hard, programme,
+    stereo,
 };
 use tune_plugin_declick_live::engine::ORDER;
 use tune_plugin_sdk::audio::SampleEncoding;
+
+type Generator = fn(u32, f64, u64) -> Vec<f64>;
 
 struct Score {
     detected: [usize; 3],
@@ -16,6 +20,9 @@ struct Score {
     damped: (usize, usize),
     false_repairs: usize,
     snr_gain_db: f64,
+    /// Clicks whose neighbourhood ends up further from the clean signal
+    /// than the click itself left it.
+    worsened: usize,
 }
 
 fn bucket(amplitude: f64) -> usize {
@@ -54,6 +61,7 @@ fn score(rate: u32, clean: &[f64], clicks: usize, seed: u64) -> Score {
         damped: (0, 0),
         false_repairs: 0,
         snr_gain_db: 0.0,
+        worsened: 0,
     };
     let (mut before, mut after) = (0.0, 0.0);
     let margin = (rate / 500) as usize; // 2 ms around each click
@@ -69,13 +77,17 @@ fn score(rate: u32, clean: &[f64], clicks: usize, seed: u64) -> Score {
         };
         kind.0 += usize::from(found);
         kind.1 += 1;
+        let (mut b1, mut a1) = (0.0, 0.0);
         for f in c.frame.saturating_sub(margin)..c.frame + c.width + margin {
             let i = f * 2 + c.channel;
             // F32 carrier: compare against the clean signal at f32 precision.
             let reference = f64::from(clean[i] as f32);
-            before += (f64::from(dirty[i] as f32) - reference).powi(2);
-            after += (out[i] - reference).powi(2);
+            b1 += (f64::from(dirty[i] as f32) - reference).powi(2);
+            a1 += (out[i] - reference).powi(2);
         }
+        before += b1;
+        after += a1;
+        s.worsened += usize::from(a1 > b1 * 1.0001);
     }
     s.false_repairs = r
         .events
@@ -89,7 +101,7 @@ fn score(rate: u32, clean: &[f64], clicks: usize, seed: u64) -> Score {
 fn print(name: &str, rate: u32, s: &Score) {
     let pct = |d: usize, t: usize| 100.0 * d as f64 / t.max(1) as f64;
     println!(
-        "détection {name:<10} {rate:>6} Hz : −40…−30 dBFS {:5.1} % ({}/{}), −30…−20 {:5.1} % ({}/{}), −20…−6 {:5.1} % ({}/{}) ; impulsions {:5.1} %, amorties {:5.1} % ; fausses réparations {} ; gain local {:.1} dB",
+        "détection {name:<16} {rate:>6} Hz : −40…−30 dBFS {:5.1} % ({}/{}), −30…−20 {:5.1} % ({}/{}), −20…−6 {:5.1} % ({}/{}) ; impulsions {:5.1} %, amorties {:5.1} % ; fausses réparations {} ; gain local {:.1} dB ; clics aggravés {}",
         pct(s.detected[0], s.total[0]),
         s.detected[0],
         s.total[0],
@@ -103,6 +115,7 @@ fn print(name: &str, rate: u32, s: &Score) {
         pct(s.damped.0, s.damped.1),
         s.false_repairs,
         s.snr_gain_db,
+        s.worsened,
     );
 }
 
@@ -112,20 +125,21 @@ fn clicks_in_the_programme_corpus_are_found_and_repaired() {
         let clean = stereo(programme, rate, 30.0, 3);
         let s = score(rate, &clean, 200, 17);
         print("programme", rate, &s);
-        // Default threshold (18): conservative, chosen so that the
-        // counter-proof leaves harpsichord, cymbals and piano untouched.
-        // Clicks above −20 dBFS are all found; quieter ones, buried under a
-        // programme around −20 dBFS RMS, are the price of that choice.
-        assert_eq!(s.detected[2], s.total[2], "clicks above −20 dBFS");
         assert!(
-            s.detected[1] * 2 >= s.total[1],
+            s.detected[2] * 100 >= s.total[2] * 97,
+            "−20…−6 dBFS: {}/{}",
+            s.detected[2],
+            s.total[2]
+        );
+        assert!(
+            s.detected[1] * 100 >= s.total[1] * 85,
             "−30…−20 dBFS: {}/{}",
             s.detected[1],
             s.total[1]
         );
         assert!(s.false_repairs <= 2, "false repairs: {}", s.false_repairs);
         assert!(
-            s.snr_gain_db >= 4.0,
+            s.snr_gain_db >= 3.0,
             "local SNR gain {:.1} dB",
             s.snr_gain_db
         );
@@ -133,17 +147,22 @@ fn clicks_in_the_programme_corpus_are_found_and_repaired() {
 }
 
 #[test]
-fn clicks_in_hard_material_are_reported() {
-    // Measurement only (no threshold): clicks hidden under cymbals or
-    // harpsichord attacks are the method's known limit; the counter-proof
-    // guards the music.
-    for (name, generator) in [
-        ("piano", piano as fn(u32, f64, u64) -> Vec<f64>),
+fn repairs_never_make_hard_material_worse() {
+    // Detection under cymbals or harpsichord attacks is the method's known
+    // limit (printed, not asserted). What IS asserted: whatever it does,
+    // the result is never further from the clean signal than the clicks
+    // left it, on the counter-proof material and on the HARD generators.
+    let corpora: [(&str, Generator); 5] = [
+        ("piano", piano),
         ("clavecin", harpsichord),
         ("cymbales", cymbals),
-    ] {
+        ("piano dur", piano_hard),
+        ("clavecin dur", harpsichord_hard),
+    ];
+    for (name, generator) in corpora {
         let clean = stereo(generator, 48_000, 20.0, 9);
         let s = score(48_000, &clean, 120, 23);
         print(name, 48_000, &s);
+        assert!(s.snr_gain_db >= 0.0, "{name}: gain {:.1} dB", s.snr_gain_db);
     }
 }

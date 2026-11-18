@@ -57,47 +57,11 @@ pub fn coefficient_autocorrelation(a: &[f64], out: &mut [f64]) {
     }
 }
 
-/// LSAR interpolation of `w[start..end]` given the AR coefficients `a`
-/// (`a[0] = 1`) and the `p` known samples on each side. `band` is `R(0..=p)`
-/// from [`coefficient_autocorrelation`]. `chol` holds at least
-/// `(end-start)·(p+1)` values, `ek` at least `end-start+p`, `rhs` at least
-/// `end-start`. Returns false (and leaves `w` untouched) if the system is not
-/// numerically positive definite.
-#[allow(clippy::too_many_arguments)]
-pub fn interpolate(
-    w: &mut [f64],
-    start: usize,
-    end: usize,
-    a: &[f64],
-    band: &[f64],
-    chol: &mut [f64],
-    ek: &mut [f64],
-    rhs: &mut [f64],
-) -> bool {
-    let p = a.len() - 1;
-    let m = end - start;
-    debug_assert!(start >= p && end + p <= w.len() && m > 0);
-    // ek[n - start] = prediction error with the unknown samples set to zero.
-    for (i, slot) in ek[..m + p].iter_mut().enumerate() {
-        let n = start + i;
-        let mut acc = 0.0;
-        for (k, ak) in a.iter().enumerate() {
-            let idx = n - k;
-            if idx < start || idx >= end {
-                acc += ak * w[idx];
-            }
-        }
-        *slot = acc;
-    }
-    // Normal equations R x = -Aᵀ ek.
-    for (i, slot) in rhs[..m].iter_mut().enumerate() {
-        *slot = -a
-            .iter()
-            .enumerate()
-            .map(|(k, ak)| ak * ek[i + k])
-            .sum::<f64>();
-    }
-    // Banded Cholesky, band storage: chol[i*(p+1) + d] = L[i][i-d].
+/// Band Cholesky factor of the `m × m` LSAR matrix `R(|i-j|)` (`band` =
+/// `R(0..=p)`), in `chol[i*(p+1) + d] = L[i][i-d]`. False if not positive
+/// definite.
+pub fn factor(band: &[f64], m: usize, chol: &mut [f64]) -> bool {
+    let p = band.len() - 1;
     let bw = p + 1;
     for i in 0..m {
         let j0 = i.saturating_sub(p);
@@ -117,23 +81,78 @@ pub fn interpolate(
             }
         }
     }
-    // Forward: L y = rhs.
+    true
+}
+
+/// LSAR estimate of `w[start..end]` from the `p` known samples on each side,
+/// with the factor of [`factor`] for `m = end - start`. Leaves `w` untouched
+/// and writes the estimate to `out[..m]`. `ek` holds at least `m + p`
+/// values. False if the result is not finite.
+pub fn solve(
+    w: &[f64],
+    start: usize,
+    end: usize,
+    a: &[f64],
+    chol: &[f64],
+    ek: &mut [f64],
+    out: &mut [f64],
+) -> bool {
+    let p = a.len() - 1;
+    let m = end - start;
+    let bw = p + 1;
+    debug_assert!(start >= p && end + p <= w.len() && m > 0);
+    // ek[n - start] = prediction error with the unknown samples set to zero.
+    for (i, slot) in ek[..m + p].iter_mut().enumerate() {
+        let n = start + i;
+        let mut acc = 0.0;
+        for (k, ak) in a.iter().enumerate() {
+            let idx = n - k;
+            if idx < start || idx >= end {
+                acc += ak * w[idx];
+            }
+        }
+        *slot = acc;
+    }
+    // Normal equations R x = -Aᵀ ek, then L y = rhs, Lᵀ x = y.
+    for (i, slot) in out[..m].iter_mut().enumerate() {
+        *slot = -a
+            .iter()
+            .enumerate()
+            .map(|(k, ak)| ak * ek[i + k])
+            .sum::<f64>();
+    }
     for i in 0..m {
-        let mut sum = rhs[i];
+        let mut sum = out[i];
         for k in i.saturating_sub(p)..i {
-            sum -= chol[i * bw + (i - k)] * rhs[k];
+            sum -= chol[i * bw + (i - k)] * out[k];
         }
-        rhs[i] = sum / chol[i * bw];
+        out[i] = sum / chol[i * bw];
     }
-    // Backward: Lᵀ x = y.
     for i in (0..m).rev() {
-        let mut sum = rhs[i];
+        let mut sum = out[i];
         for k in i + 1..(i + p + 1).min(m) {
-            sum -= chol[k * bw + (k - i)] * rhs[k];
+            sum -= chol[k * bw + (k - i)] * out[k];
         }
-        rhs[i] = sum / chol[i * bw];
+        out[i] = sum / chol[i * bw];
     }
-    if rhs[..m].iter().any(|v| !v.is_finite()) {
+    out[..m].iter().all(|v| v.is_finite())
+}
+
+/// LSAR interpolation of `w[start..end]` in place ([`factor`] then
+/// [`solve`]). Returns false and leaves `w` untouched on failure.
+#[allow(clippy::too_many_arguments)]
+pub fn interpolate(
+    w: &mut [f64],
+    start: usize,
+    end: usize,
+    a: &[f64],
+    band: &[f64],
+    chol: &mut [f64],
+    ek: &mut [f64],
+    rhs: &mut [f64],
+) -> bool {
+    let m = end - start;
+    if !factor(band, m, chol) || !solve(w, start, end, a, chol, ek, rhs) {
         return false;
     }
     w[start..end].copy_from_slice(&rhs[..m]);

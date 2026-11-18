@@ -19,6 +19,12 @@ pub const RMS_ISOLATION: f64 = 1.6;
 /// signal that much better than the past model: the spectrum changed, a new
 /// sound started.
 pub const CHANGE_MAX: f64 = 3.0;
+/// A repair must remove this many times the expected interpolation error.
+pub const SAFETY: f64 = 4.0;
+/// A repair may remove at most this many times the energy the click explains.
+pub const EXPLAINED: f64 = 16.0;
+/// Bandwidth expansion of the interpolation model (`a_k ← γ^k a_k`).
+const BANDWIDTH: f64 = 0.998;
 /// Fraction of the peak error that bounds the core of a click.
 const CORE: f64 = 0.03;
 /// Silence floor of the analysis window (mean square, about −120 dBFS).
@@ -53,7 +59,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            threshold: 18.0,
+            threshold: 8.0,
             lookahead_ms: 15.0,
             max_click_ms: 1.5,
         }
@@ -118,6 +124,12 @@ pub struct Stats {
     pub rejected_long: u64,
     pub rejected_transient: u64,
     pub rejected_unresolved: u64,
+    /// Repairs refused: below the cross-validated cost of interpolating.
+    pub refused_uncertain: u64,
+    /// Repairs refused: rewriting more than the click explains.
+    pub refused_overreach: u64,
+    /// Repairs refused: not better under the past and future models.
+    pub refused_worse: u64,
     pub hops_silent: u64,
 }
 
@@ -172,6 +184,13 @@ pub struct DeclickLive {
     rhs: Vec<f64>,
     future_w: Vec<f64>,
     a_future: Vec<f64>,
+    future_ok: bool,
+    r_past: Vec<f64>,
+    r_future: Vec<f64>,
+    a2: Vec<f64>,
+    band2: Vec<f64>,
+    orig: Vec<f64>,
+    trace_y: Vec<f64>,
 }
 
 impl DeclickLive {
@@ -219,6 +238,13 @@ impl DeclickLive {
             rhs: vec![0.0; max_m],
             future_w: vec![0.0; (8 * rate / 1000) as usize],
             a_future: vec![0.0; ORDER + 1],
+            future_ok: false,
+            r_past: vec![0.0; ORDER + 1],
+            r_future: vec![0.0; ORDER + 1],
+            a2: vec![0.0; ORDER + 1],
+            band2: vec![0.0; ORDER + 1],
+            orig: vec![0.0; max_m],
+            trace_y: vec![0.0; max_m],
         })
     }
 
@@ -377,6 +403,10 @@ impl DeclickLive {
         }
         ar::autocorrelation(&self.xw, &mut self.r);
         self.r[0] *= 1.0 + 1e-9;
+        let past_norm = self.window.iter().map(|w| w * w).sum::<f64>();
+        for (d, v) in self.r_past.iter_mut().zip(&self.r) {
+            *d = v / past_norm;
+        }
         if ar::levinson(&self.r, &mut self.a, &mut self.tmp).is_none() {
             return;
         }
@@ -487,19 +517,68 @@ impl DeclickLive {
             // forward error starts and end where the backward error ends.
             // Interpolating only them keeps every clean sample as context.
             let (cs, ce) = self.core(start, end, real_end, 3.0 * sigma_e);
-            let (rs, re) = (cs.saturating_sub(GUARD).max(rs), (ce + GUARD).min(re));
-            // 7. LSAR interpolation.
+            let (rs, re) = (
+                cs.saturating_sub(GUARD).max(rs),
+                (ce + GUARD).min(rs + s.max_region),
+            );
+            // 7. LSAR interpolation with a two-sided model: the
+            // autocorrelations of the past and of the 8 ms after the click
+            // are pooled, so the model knows what the gap must lead to; a
+            // slight bandwidth expansion keeps it away from the unit circle.
+            if !self.two_sided_model() {
+                self.stats.rejected_unresolved += 1;
+                continue;
+            }
+            self.orig[..re - rs].copy_from_slice(&self.w[rs..re]);
             if !ar::interpolate(
                 &mut self.w,
                 rs,
                 re,
-                &self.a,
-                &self.band,
+                &self.a2,
+                &self.band2,
                 &mut self.chol,
                 &mut self.ek,
                 &mut self.rhs,
             ) {
                 self.stats.rejected_unresolved += 1;
+                continue;
+            }
+            // 8. Never worse than the original: the repair must lower the
+            // prediction error under the past model AND under the model of
+            // the future (independent of the one that interpolated), and
+            // stay within the envelope of its surroundings.
+            // Cross-validation: the same interpolator (same factor) fills
+            // an equally long gap of CLEAN signal just before the click and
+            // just after it; its error there is what a repair costs here.
+            // The repair must remove SAFETY times more than that, otherwise
+            // the click is left: repairing would add more than it removes.
+            let removed: f64 = self.orig[..re - rs]
+                .iter()
+                .zip(&self.w[rs..re])
+                .map(|(o, r)| (o - r) * (o - r))
+                .sum();
+            let uncertainty = self.cross_validation(rs, re, from, real_end);
+            // And it must not remove much more than a click can explain:
+            // an additive click of energy E raises the forward error energy
+            // by about E·R(0). A repair that rewrites far more than that is
+            // rewriting the music.
+            let excess: f64 = self.e[rs..(re + p).min(real_end)]
+                .iter()
+                .map(|v| (v * v - sigma_e * sigma_e).max(0.0))
+                .sum();
+            let explained = excess / self.band[0];
+            let refused = if removed < SAFETY * uncertainty {
+                Some(&mut self.stats.refused_uncertain)
+            } else if removed > EXPLAINED * explained + uncertainty {
+                Some(&mut self.stats.refused_overreach)
+            } else if !self.repair_is_better(rs, re) {
+                Some(&mut self.stats.refused_worse)
+            } else {
+                None
+            };
+            if let Some(counter) = refused {
+                *counter += 1;
+                self.w[rs..re].copy_from_slice(&self.orig[..re - rs]);
                 continue;
             }
             for idx in rs..re {
@@ -525,6 +604,93 @@ impl DeclickLive {
 }
 
 impl DeclickLive {
+    /// Largest LSAR error on clean gaps of the same length right before
+    /// (`[rs-2p-m, rs-2p)`) and right after (`[re+p, re+p+m)`) the click,
+    /// with the factor already in `chol`. Infinity if neither fits.
+    fn cross_validation(&mut self, rs: usize, re: usize, from: usize, real_end: usize) -> f64 {
+        let (p, m) = (ORDER, re - rs);
+        let mut worst = None::<f64>;
+        let before = rs.checked_sub(2 * p + m).filter(|g| *g >= from + p);
+        let after = Some(re + p).filter(|g| g + m + p <= real_end);
+        for g in [before, after].into_iter().flatten() {
+            if !ar::solve(
+                &self.w,
+                g,
+                g + m,
+                &self.a2,
+                &self.chol,
+                &mut self.ek,
+                &mut self.trace_y,
+            ) {
+                return f64::INFINITY;
+            }
+            let err: f64 = self.trace_y[..m]
+                .iter()
+                .zip(&self.w[g..g + m])
+                .map(|(x, y)| (x - y) * (x - y))
+                .sum();
+            worst = Some(worst.map_or(err, |w| w.max(err)));
+        }
+        worst.unwrap_or(f64::INFINITY)
+    }
+
+    /// Pools the past and future autocorrelations into `a2` / `band2`.
+    fn two_sided_model(&mut self) -> bool {
+        for k in 0..=ORDER {
+            self.r[k] = self.r_past[k]
+                + if self.future_ok {
+                    self.r_future[k]
+                } else {
+                    0.0
+                };
+        }
+        self.r[0] *= 1.0 + 1e-6;
+        if ar::levinson(&self.r, &mut self.a2, &mut self.tmp).is_none() {
+            return false;
+        }
+        let mut g = 1.0;
+        for v in self.a2.iter_mut() {
+            *v *= g;
+            g *= BANDWIDTH;
+        }
+        ar::coefficient_autocorrelation(&self.a2, &mut self.band2);
+        true
+    }
+
+    /// Prediction error energy of `w` over `[rs, re + p)` under `a`, with
+    /// `w[rs..re]` taken from `region` (the original or the repair).
+    fn error_energy(&self, a: &[f64], rs: usize, re: usize, region: &[f64]) -> f64 {
+        let x = |i: usize| {
+            if (rs..re).contains(&i) {
+                region[i - rs]
+            } else {
+                self.w[i]
+            }
+        };
+        (rs..re + ORDER)
+            .map(|n| {
+                let e: f64 = a.iter().enumerate().map(|(k, ak)| ak * x(n - k)).sum();
+                e * e
+            })
+            .sum()
+    }
+
+    fn repair_is_better(&self, rs: usize, re: usize) -> bool {
+        let m = re - rs;
+        let orig = &self.orig[..m];
+        let repair = &self.w[rs..re];
+        let worse =
+            |a: &[f64]| self.error_energy(a, rs, re, repair) >= self.error_energy(a, rs, re, orig);
+        if worse(&self.a) || (self.future_ok && worse(&self.a_future)) {
+            return false;
+        }
+        let context = self.w[rs - ORDER..rs]
+            .iter()
+            .chain(&self.w[re..re + ORDER])
+            .fold(0.0f64, |m, v| m.max(v.abs()));
+        repair.iter().all(|v| v.abs() <= 1.5 * context)
+    }
+
     /// Prediction error power of the current (past) model over that of a
     /// model fitted on `w[from..]` (at most 8 ms, up to `until`). A click
     /// leaves the spectrum as it was: about 1. A new note changes it.
@@ -532,6 +698,7 @@ impl DeclickLive {
         let p = ORDER;
         let len = until.saturating_sub(from).min(self.future_w.len());
         if len < 4 * p {
+            self.future_ok = false;
             return 1.0;
         }
         let seg = &self.w[from..from + len];
@@ -539,11 +706,22 @@ impl DeclickLive {
             let hann = 0.5 - 0.5 * (std::f64::consts::TAU * (i as f64 + 0.5) / len as f64).cos();
             *x = hann * v;
         }
+        self.future_ok = false;
         ar::autocorrelation(&self.future_w[..len], &mut self.r);
         self.r[0] *= 1.0 + 1e-9;
+        let norm: f64 = (0..len)
+            .map(|i| {
+                let h = 0.5 - 0.5 * (std::f64::consts::TAU * (i as f64 + 0.5) / len as f64).cos();
+                h * h
+            })
+            .sum();
+        for (d, v) in self.r_future.iter_mut().zip(&self.r) {
+            *d = v / norm;
+        }
         if ar::levinson(&self.r, &mut self.a_future, &mut self.tmp).is_none() {
             return 1.0;
         }
+        self.future_ok = true;
         let (mut old, mut new) = (0.0, 0.0);
         for j in from + p..from + len {
             let (mut eo, mut en) = (0.0, 0.0);
@@ -562,8 +740,9 @@ impl DeclickLive {
     /// error reaches [`CORE`] of its maximum (and `floor`, three robust
     /// scales of the error), the last where the backward error does. The
     /// forward error only spreads AFTER the click and the backward error
-    /// only BEFORE it, so neither spread moves these bounds. Falls back to
-    /// the run if the two disagree.
+    /// only BEFORE it, so neither spread moves these bounds. For a ringing
+    /// click the end is also bounded by the forward error's end minus `p`.
+    /// Falls back to the run if the two disagree.
     fn core(&self, start: usize, end: usize, real_end: usize, floor: f64) -> (usize, usize) {
         let p = ORDER;
         let fwd = start..(end + p).min(real_end);
@@ -588,6 +767,17 @@ impl DeclickLive {
         let last = bwd
             .rev()
             .find(|&j| backward(j).abs() >= (CORE * max_b).max(floor));
+        // A damped, ringing click is partly predictable: the backward error
+        // may end early. The forward error stays up until `p` samples after
+        // the click's real end; take whichever reaches further.
+        let last_fwd = fwd
+            .rev()
+            .find(|&j| self.e[j].abs() >= (CORE * max_f).max(floor))
+            .map(|j| j.saturating_sub(p));
+        let last = match (last, last_fwd) {
+            (Some(b), Some(f)) => Some(b.max(f.min(start + self.sizes.max_region))),
+            (b, _) => b,
+        };
         match (first, last) {
             (Some(f), Some(l)) if f <= l => (f, l + 1),
             _ => (start, end),
