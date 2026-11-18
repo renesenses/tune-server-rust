@@ -16,6 +16,7 @@ use tower::ServiceExt;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_server::auth::activation::{
     FICHIER_CODE, FICHIER_DE_SECOURS, appliquer_le_fichier_de_secours,
+    appliquer_le_fichier_de_secours_dans,
 };
 use tune_server::state::AppState;
 
