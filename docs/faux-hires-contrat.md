@@ -25,6 +25,10 @@ pas. Un album qui n'est pas douteux mais a des pistes douteuses le dit
 (`pistes_douteuses`, `raison_pistes`) ; chaque piste douteuse garde son
 verdict.
 
+« Douteux » masqué : un album qui a la moindre piste douteuse (même sous la
+moitié) se publie `non_analyse`, jamais `verifie` ni `conforme` — dans la
+liste, son filtre, les règles intelligentes et le catalogue.
+
 Raisons d'un « douteux » (#9035) :
 
 | Raison | Ce qui a été mesuré |
@@ -32,11 +36,17 @@ Raisons d'un « douteux » (#9035) :
 | `bits_de_remplissage` | les bits de poids faible sont toujours nuls |
 | `bande_de_cd` | un hi-res sans rien au-dessus de 20 à 24 kHz |
 | `coupure_spectrale` | le spectre coupé net sous 20 kHz, SANS signature de codec : origine possible, codec avec perte ou filtrage au mastering |
-| `signature_de_codec` | la coupure, ET des bandes de l'aigu vidées par intermittence sous elle (trous d'un encodeur avec perte) |
+| `signature_de_codec` | la coupure, ET des bandes de l'aigu vidées par intermittence sous elle : des trous **compatibles** avec un codec avec perte (calibré sur un encodeur simulé ; le libellé reste prudent tant qu'il n'est pas calibré sur de vrais fichiers) |
 
 `coupure_de_codec`, rangé avant #9035 sur la seule fréquence de coupure, n'est
 plus publié : une ligne qui le porte se publie `coupure_spectrale`. Un client
-qui le reçoit d'un serveur plus ancien le lit comme `coupure_spectrale`.
+qui le reçoit d'un serveur plus ancien le lit comme `coupure_spectrale`. La
+passe de fond REMESURE une fois ces pistes-là (après les pistes jamais
+mesurées) ; les autres mesures ne sont pas touchées.
+
+**Publier le serveur et le client web ensemble** : un client antérieur à #9035
+ne connaît ni `coupure_spectrale` ni `signature_de_codec` et montre, sur un
+badge « douteux », l'infobulle de « vérifié ».
 
 Ce que la fiche `GET /library/albums/{id}/hires` rend en plus (#9035), `null`
 sans piste douteuse ou tant que « douteux » est masqué — l'album lui-même

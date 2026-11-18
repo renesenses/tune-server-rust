@@ -350,4 +350,21 @@ fn la_regle_de_la_moitie_vaut_pour_le_badge_et_le_filtre_9035() {
         vec![3, 9]
     );
     assert!(albums_du_predicat(&db, VerdictPublie::Verifie, true).contains(&8));
+
+    // #9035 (décision du 18/11) — « douteux » MASQUÉ : l'album 8 (2/10) n'est
+    // pas « vérifié » pour autant : sans badge, hors du filtre « Vérifié » et
+    // du catalogue « vérifié ».
+    assert_eq!(
+        publier_l_album(&par_album[&8], false),
+        ("non_analyse", None)
+    );
+    assert!(!albums_du_predicat(&db, VerdictPublie::Verifie, false).contains(&8));
+    assert!(albums_du_predicat(&db, VerdictPublie::NonAnalyse, false).contains(&8));
+    let catalogue = albums_des_verdicts(&db, &["verifie".to_string()], false).unwrap();
+    assert!(!catalogue.contains(&8), "{catalogue:?}");
+    assert!(
+        albums_des_verdicts(&db, &["verifie".to_string()], true)
+            .unwrap()
+            .contains(&8)
+    );
 }

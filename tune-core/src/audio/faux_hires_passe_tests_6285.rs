@@ -399,3 +399,57 @@ fn un_album_n_est_douteux_qu_a_partir_de_la_moitie_9035() {
     p[1] = ("verifie".into(), None);
     assert_eq!(verdict_d_album(&p).0, "douteux");
 }
+
+/// #9035 (décision du 18/11) — REMESURE CIBLÉE : une piste dont la mesure
+/// porte l'ancien `coupure_de_codec` redevient candidate, APRÈS les pistes
+/// jamais mesurées ; les autres mesures ne sont pas touchées ; une fois
+/// remesurée (nouveau code), elle n'est plus candidate.
+#[test]
+fn l_ancien_code_codec_est_remesure_une_fois_9035() {
+    let db = base();
+    for id in 1..=4 {
+        piste(&db, id, &format!("/m/a/{id}.flac"), "flac", "local");
+    }
+    for (id, raison) in [
+        (1i64, "coupure_de_codec"),
+        (2, "coupure_spectrale"),
+        (3, "bande_de_cd"),
+    ] {
+        let raison = raison.to_string();
+        db.execute(
+            "INSERT INTO hires_verifications (track_id, verdict, raison, coupure_hz) \
+             VALUES (?1, 'douteux', ?2, 16000.0)",
+            &[&id as &dyn ToSqlValue, &raison],
+        )
+        .unwrap();
+    }
+    let ids: Vec<i64> = prochains_candidats(&db, 10)
+        .iter()
+        .map(|c| c.track_id)
+        .collect();
+    assert_eq!(
+        ids,
+        vec![4, 1],
+        "la jamais mesurée d'abord, puis la remesure"
+    );
+    assert_eq!(compter_les_candidats(&db), 2);
+    // La remesure range un nouveau code : la piste sort des candidates.
+    let mesure = Mesure {
+        sample_rate: 44_100,
+        bits_declares: 16,
+        bits_effectifs: Some(16),
+        coupure_hz: Some(16_000.0),
+        ..Default::default()
+    };
+    enregistrer(&db, 1, &Ok(mesure.clone())).unwrap();
+    enregistrer(&db, 4, &Ok(mesure)).unwrap();
+    assert_eq!(compter_les_candidats(&db), 0);
+    let r = db
+        .query_one(
+            "SELECT raison FROM hires_verifications WHERE track_id = 1",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(r[0].as_string().as_deref(), Some("coupure_spectrale"));
+}

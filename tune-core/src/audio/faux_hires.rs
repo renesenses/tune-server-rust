@@ -162,8 +162,8 @@ pub enum Raison {
     /// propre à un codec : origine possible, un codec avec perte ou un
     /// filtrage au mastering. Seule la fréquence est affirmée.
     CoupureSpectrale { coupure_hz: f64 },
-    /// #9035 — la coupure, ET les trous intermittents d'un encodeur avec
-    /// perte mesurés sous elle ([`trous_de_codec`]).
+    /// #9035 — la coupure, ET des trous intermittents sous elle, COMPATIBLES
+    /// avec un encodeur avec perte ([`trous_de_codec`]) ; pas une preuve.
     SignatureDeCodec { coupure_hz: f64 },
 }
 
@@ -538,10 +538,18 @@ const ZONE_TROU_MIN_HZ: f64 = 9_000.0;
 /// #9035 — la bande de référence, juste sous la zone examinée, en Hz.
 const REFERENCE_TROU_HZ: f64 = 3_000.0;
 
-/// #9035 — un trou : une bande au moins tant de dB sous la référence de SA
-/// trame. Une pente naturelle ou un instrument qui s'éteint n'y descendent
-/// pas d'une trame à l'autre ; une bande vidée par un encodeur, si.
+/// #9035 — un trou : la médiane d'une bande au moins tant de dB sous la
+/// médiane de la référence de SA trame. Médiane contre médiane : un partiel
+/// isolé, une cymbale ou une voix ne déplacent ni l'une ni l'autre, ce que
+/// fait le bruit de fond du morceau ; une bande vidée par un encodeur, si.
 const TROU_DB: f64 = 35.0;
+
+/// #9035 — un trou n'en est un que si une bande PLUS HAUTE de la même trame
+/// le domine d'au moins tant de dB : une pente naturelle (aigu qui s'éteint,
+/// roll-off doux, fin d'une note) baisse avec la fréquence et ne remonte pas
+/// au-dessus d'une bande vide ; un encodeur vide une bande et garde ses
+/// voisines.
+const REMONTEE_DB: f64 = 20.0;
 
 /// #9035 — une bande « vivante » : d'ordinaire (médiane des trames) à moins
 /// de tant de dB sous la référence. Une bande toujours vide n'est pas un trou
@@ -558,16 +566,23 @@ const TRAMES_TROU_MIN: usize = 40;
 /// retenue (avec au moins [`BANDES_TROUEES_MIN`] bandes trouées).
 pub const PART_TROUEE_MIN: f64 = 0.02;
 
-/// #9035 — au moins tant de bandes vivantes DIFFÉRENTES ont des trous : un
-/// seul creux récurrent peut être un instrument ou une résonance.
+/// #9035 — au moins tant de bandes vivantes DIFFÉRENTES sont trouées (voir
+/// [`PART_TROUEE_BANDE_MIN`]) : un seul creux récurrent peut être un
+/// instrument ou une résonance.
 const BANDES_TROUEES_MIN: usize = 2;
+
+/// #9035 — une bande ne compte comme trouée que si au moins cette part de ses
+/// trames jugées le sont : un trou isolé sur des milliers de trames n'est pas
+/// une signature.
+pub const PART_TROUEE_BANDE_MIN: f64 = 0.02;
 
 /// #9035 — ce que la recherche des trous a mesuré.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Trous {
     /// La part des cases (trame jugée × bande vivante) trouées.
     pub part: f64,
-    /// Combien de bandes vivantes ont au moins un trou.
+    /// Combien de bandes vivantes ont au moins [`PART_TROUEE_BANDE_MIN`] de
+    /// leurs trames trouées.
     pub bandes_trouees: usize,
 }
 
@@ -587,11 +602,18 @@ impl Trous {
 /// (jamais sous [`ZONE_TROU_MIN_HZ`]), en bandes de [`BANDE_TROU_HZ`] dont le
 /// niveau est la médiane des raies intérieures ; la
 /// référence de chaque trame est le niveau moyen des [`REFERENCE_TROU_HZ`]
-/// juste dessous. Seules les trames d'un niveau ordinaire (référence à moins
-/// de 6 dB sous sa médiane) sont jugées, et seules les bandes d'ordinaire
-/// vivantes. Une case est trouée quand sa bande tombe à [`TROU_DB`] sous la
-/// référence de sa trame. `None` : trop peu de trames ou de bandes pour
-/// juger. Un filtre de mastering, fixe, ne troue rien dans sa bande passante.
+/// juste dessous ; chaque niveau est la MÉDIANE des raies de sa région. Seules
+/// les trames d'un niveau ordinaire (référence à moins de 6 dB sous sa
+/// médiane) sont jugées, et seules les bandes d'ordinaire vivantes. Une case
+/// est trouée quand sa bande tombe à [`TROU_DB`] sous la référence de sa trame
+/// ET qu'une bande plus haute de la même trame la domine de [`REMONTEE_DB`]
+/// (une pente naturelle ne remonte pas). `None` : trop peu de trames ou de
+/// bandes pour juger. Un filtre de mastering, fixe, ne troue rien dans sa
+/// bande passante.
+///
+/// Prudence (#9035) : calibré sur un encodeur SIMULÉ ; la raison publiée dit
+/// « trous compatibles avec un codec avec perte », pas « c'est un MP3 », tant
+/// que le banc sur de vrais fichiers n'est pas fait.
 pub fn trous_de_codec(
     tranches: &[(f64, &[i32])],
     canaux: u32,
@@ -639,12 +661,9 @@ pub fn trous_de_codec(
         .map(|(_, e)| e.len() / canaux / taille)
         .sum();
     let pas_trames = total.div_ceil(TRAMES_TROU_MAX).max(1);
-    let moyenne_db = |p: &[f64], r: &Range<usize>| {
-        let s: f64 = p[r.clone()].iter().sum();
-        10.0 * (s / r.len().max(1) as f64).max(1e-30).log10()
-    };
-    // Le niveau d'une bande : la MÉDIANE de ses raies intérieures, que la
-    // fuite de la fenêtre depuis une bande voisine pleine ne remonte pas.
+    // Le niveau d'une région : la MÉDIANE de ses raies (intérieures, pour
+    // une bande), que ni un partiel isolé ni la fuite de la fenêtre depuis une
+    // bande voisine pleine ne remontent.
     let mediane_db = |p: &[f64], r: &Range<usize>| {
         let v = mediane(p[r.clone()].to_vec()).unwrap_or(0.0);
         10.0 * v.max(1e-30).log10()
@@ -672,7 +691,7 @@ pub fn trous_de_codec(
             for (p, c) in puissance.iter_mut().zip(&sortie) {
                 *p = (c.re as f64).powi(2) + (c.im as f64).powi(2);
             }
-            let r = moyenne_db(&puissance, &reference);
+            let r = mediane_db(&puissance, &reference);
             let ecarts = bandes
                 .iter()
                 .map(|b| mediane_db(&puissance, b) - r)
@@ -698,10 +717,15 @@ pub fn trous_de_codec(
         if !vivante {
             continue;
         }
-        let ici = ecarts.iter().filter(|&&e| e <= -TROU_DB).count();
+        let ici = jugees
+            .iter()
+            .filter(|e| {
+                e[b] <= -TROU_DB && e[b + 1..].iter().any(|&haut| haut >= e[b] + REMONTEE_DB)
+            })
+            .count();
         cases += ecarts.len();
         trouees += ici;
-        if ici > 0 {
+        if ici as f64 >= PART_TROUEE_BANDE_MIN * ecarts.len() as f64 && ici > 0 {
             bandes_trouees += 1;
         }
     }

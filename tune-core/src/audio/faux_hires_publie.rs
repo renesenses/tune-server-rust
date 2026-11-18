@@ -88,6 +88,12 @@ pub fn publier_l_album(
     pistes: &[(String, Option<String>)],
     douteux_visible: bool,
 ) -> (&'static str, Option<String>) {
+    // #9035 (décision du 18/11) — « douteux » masqué : un album qui a la
+    // moindre piste douteuse ne se dit ni vérifié ni conforme, il reste sans
+    // badge (`non_analyse`), comme avant la règle de la moitié.
+    if !douteux_visible && pistes.iter().any(|(v, _)| v == "douteux") {
+        return ("non_analyse", None);
+    }
     let (verdict, raison) = verdict_d_album(pistes);
     match VerdictPublie::lire(&verdict) {
         Some(VerdictPublie::Douteux) if douteux_visible => ("douteux", raison),
@@ -191,10 +197,18 @@ fn une_piste_de_l_album(id_album: &str, verdict: &str) -> String {
 /// - non analysé : pas douteux, ni vérifiée ni conforme (pas de mesure, ou
 ///   rien que du non concluant).
 ///
-/// « Douteux » masqué : le prédicat douteux est faux, et un album douteux
-/// répond à « non analysé ». Les deux bases lisent ce SQL tel quel.
+/// « Douteux » masqué : le prédicat douteux est faux, et un album qui a la
+/// moindre piste douteuse (même sous la moitié, #9035) répond à « non
+/// analysé », jamais à « vérifié » ni « conforme ». Les deux bases lisent ce
+/// SQL tel quel.
 pub fn predicat_album(id_album: &str, verdict: VerdictPublie, douteux_visible: bool) -> String {
-    let d = album_douteux(id_album);
+    // Visible : douteux à partir de la moitié. Masqué : la moindre piste
+    // douteuse écarte l'album de « vérifié » et « conforme » (#9035).
+    let d = if douteux_visible {
+        album_douteux(id_album)
+    } else {
+        une_piste_de_l_album(id_album, "douteux")
+    };
     let v = une_piste_de_l_album(id_album, "verifie");
     let c = une_piste_de_l_album(id_album, "conforme");
     match verdict {

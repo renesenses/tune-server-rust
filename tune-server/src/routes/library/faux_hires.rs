@@ -109,7 +109,15 @@ pub(super) async fn verdict_album(
     // piste douteuse, ou tant que « douteux » est masqué.
     let en_cause = pistes_douteuses_publiees(&verdicts, visible);
     let raison_pistes = en_cause.as_ref().and_then(|c| c.2.clone());
-    let coupure_hz = raison_pistes.as_ref().and_then(|r| {
+    // La coupure ne se dit que pour une raison de coupure (pas pour des bits
+    // de remplissage).
+    let de_coupure = |r: &&String| {
+        matches!(
+            r.as_str(),
+            "bande_de_cd" | "coupure_spectrale" | "signature_de_codec"
+        )
+    };
+    let coupure_hz = raison_pistes.as_ref().filter(de_coupure).and_then(|r| {
         let mut f: Vec<f64> = coupures
             .iter()
             .filter(|(rp, _)| rp.as_ref() == Some(r))

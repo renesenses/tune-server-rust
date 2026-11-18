@@ -78,9 +78,17 @@ pub fn activer(db: &Arc<dyn DbBackend>, actif: bool) -> Result<(), String> {
     SettingsRepo::with_backend(db.clone()).set(REGLAGE_ACTIF, if actif { "true" } else { "false" })
 }
 
+/// #9035 — une piste dont la mesure rangée porte l'ancien code
+/// `coupure_de_codec` (déduit de la seule fréquence) est remesurée une fois :
+/// la nouvelle mesure le remplace par `coupure_spectrale`,
+/// `signature_de_codec`, … — jamais plus par lui —, la piste sort donc des
+/// candidates après un passage. Les autres mesures ne sont pas touchées.
+const A_REMESURER: &str = "EXISTS (SELECT 1 FROM hires_verifications h \
+     WHERE h.track_id = t.id AND h.raison = 'coupure_de_codec')";
+
 /// Le prédicat des candidats : pistes LOCALES sans perte, avec un chemin, pas
-/// encore mesurées, dans le périmètre des analyses. Partagé par la sélection
-/// et le compteur, comme celui des autres passes.
+/// encore mesurées (ou à remesurer, #9035), dans le périmètre des analyses.
+/// Partagé par la sélection et le compteur, comme celui des autres passes.
 fn where_candidats(db: &Arc<dyn DbBackend>) -> String {
     let formats: Vec<String> = FORMATS_SANS_PERTE
         .iter()
@@ -89,7 +97,9 @@ fn where_candidats(db: &Arc<dyn DbBackend>) -> String {
     format!(
         "{local} AND t.file_path IS NOT NULL AND t.file_path <> '' \
          AND LOWER(COALESCE(t.format, '')) IN ({formats}) \
-         AND NOT EXISTS (SELECT 1 FROM hires_verifications h WHERE h.track_id = t.id){perimetre}",
+         AND (NOT EXISTS (SELECT 1 FROM hires_verifications h WHERE h.track_id = t.id) \
+              OR {a_remesurer}){perimetre}",
+        a_remesurer = A_REMESURER,
         local = crate::db::track_repo::sql::PISTE_LOCALE,
         formats = formats.join(", "),
         perimetre = crate::taches_de_fond::perimetre::clause_decodage(db),
@@ -127,14 +137,16 @@ pub struct Candidat {
     pub duree_ms: i64,
 }
 
-/// Les `n` prochains candidats.
+/// Les `n` prochains candidats : les pistes jamais mesurées d'abord, les
+/// remesures de #9035 ensuite (priorité basse).
 pub fn prochains_candidats(db: &Arc<dyn DbBackend>, n: usize) -> Vec<Candidat> {
     let n = n as i64;
     db.query_many(
         &format!(
             "SELECT t.id, t.file_path, COALESCE(t.duration_ms, 0) FROM tracks t \
-             WHERE {} ORDER BY t.id LIMIT {}",
+             WHERE {} ORDER BY CASE WHEN {} THEN 1 ELSE 0 END, t.id LIMIT {}",
             where_candidats(db),
+            A_REMESURER,
             ph(db.engine(), 1)
         ),
         &[&n as &dyn ToSqlValue],

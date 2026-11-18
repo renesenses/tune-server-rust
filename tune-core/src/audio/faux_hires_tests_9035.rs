@@ -227,3 +227,148 @@ fn l_ancien_code_codec_se_publie_coupure_spectrale_9035() {
         assert_eq!(raison_publiee(code), code);
     }
 }
+
+/// Passe-bas idéal à `coupure_hz` sur tout le signal (FFT de sa longueur,
+/// une puissance de deux) : le filtre fixe d'un mastering.
+fn passe_bas(signal: &[f32], sample_rate: u32, coupure_hz: f64) -> Vec<f32> {
+    let n = signal.len();
+    let mut plan = RealFftPlanner::<f32>::new();
+    let avant = plan.plan_fft_forward(n);
+    let arriere = plan.plan_fft_inverse(n);
+    let mut entree = signal.to_vec();
+    let mut spectre = avant.make_output_vec();
+    avant.process(&mut entree, &mut spectre).unwrap();
+    let hz_par_raie = sample_rate as f64 / n as f64;
+    for (k, c) in spectre.iter_mut().enumerate() {
+        if k as f64 * hz_par_raie >= coupure_hz {
+            *c = Complex::new(0.0, 0.0);
+        }
+    }
+    spectre[0].im = 0.0;
+    let m = spectre.len();
+    spectre[m - 1].im = 0.0;
+    let mut sortie = arriere.make_output_vec();
+    arriere.process(&mut spectre, &mut sortie).unwrap();
+    sortie.iter().map(|s| s / n as f32).collect()
+}
+
+/// Normalise à -6 dBFS de crête, ajoute un bruit de fond rose à -60 dB (le
+/// souffle d'une prise réelle) et filtre le tout à 18 kHz : un master SANS
+/// PERTE filtré au mastering, dont il faut juger les trous.
+fn masterise(musique: Vec<f32>, graine: u64) -> Vec<i32> {
+    let crete = musique.iter().fold(0f32, |m, s| m.max(s.abs())).max(1e-9);
+    let fond = par_spectre(96_000, graine, |f| 1.0 / f.sqrt());
+    let mix: Vec<f32> = musique
+        .iter()
+        .zip(&fond)
+        .map(|(m, b)| m / crete * 0.5 + b * 1e-3)
+        .collect();
+    let filtre = passe_bas(&mix, 96_000, 18_000.0);
+    let crete = filtre.iter().fold(0f32, |m, s| m.max(s.abs())).max(1e-9);
+    quantifier(
+        &filtre.iter().map(|s| s / crete * 0.5).collect::<Vec<_>>(),
+        24,
+    )
+}
+
+/// Le verdict d'un témoin NON codec : la coupure à 18 kHz est vue, la
+/// recherche des trous a lieu, et elle ne conclut PAS au codec.
+fn pas_de_signature(nom: &str, pcm: &[i32]) {
+    let m = mesurer(pcm, 1, 96_000, 24);
+    let v = juger(&m);
+    assert!(
+        matches!(v, Verdict::Douteux(Raison::CoupureSpectrale { .. })),
+        "{nom} : coupure à 18 kHz sans signature attendue — {v:?} part trouée {:?} {m:?}",
+        m.part_trouee
+    );
+    assert!(
+        m.part_trouee.is_some(),
+        "{nom} : la recherche des trous doit avoir jugé — {m:?}"
+    );
+    assert!(
+        !m.signature_codec,
+        "{nom} : part trouée {:?}",
+        m.part_trouee
+    );
+}
+
+/// 🔴 TÉMOIN tonal — des notes aiguës (fondamentales de 1,2 à 3 kHz) dont les
+/// partiels montent jusqu'à 17,5 kHz, chacun avec son déclin (les plus hauts
+/// s'éteignent les premiers) et une attaque bruitée : l'aigu s'allume et
+/// s'éteint d'une note à l'autre, comme un clavecin ou des cordes. Pas de
+/// signature de codec.
+#[test]
+fn des_partiels_aigus_qui_s_eteignent_ne_sont_pas_un_codec_9035() {
+    let sr = 96_000f32;
+    let mut alea = Lcg(905);
+    let note = (0.15 * sr) as usize;
+    let mut musique = vec![0f32; N];
+    let mut debut = 0;
+    while debut < N {
+        let f0 = 1_200.0 + alea.suivant() as f32 * 1_800.0;
+        let fin = (debut + note).min(N);
+        for (i, s) in musique[debut..fin].iter_mut().enumerate() {
+            let t = i as f32 / sr;
+            let mut x = 0f32;
+            let mut k = 1;
+            while f0 * k as f32 <= 17_500.0 {
+                let tau = 0.3 / k as f32;
+                x +=
+                    (std::f32::consts::TAU * f0 * k as f32 * t).sin() * (-t / tau).exp() / k as f32;
+                k += 1;
+            }
+            *s = x;
+        }
+        // L'attaque : 5 ms de bruit large bande.
+        for s in musique[debut..(debut + (0.005 * sr) as usize).min(N)].iter_mut() {
+            *s += (alea.suivant() as f32 - 0.5) * 0.5;
+        }
+        debut = fin;
+    }
+    pas_de_signature("partiels aigus", &masterise(musique, 906));
+}
+
+/// 🔴 TÉMOIN non stationnaire — une musique sombre (rien au-dessus de 8 kHz)
+/// et un charleston toutes les 250 ms, qui décroît en 40 ms : l'aigu entier
+/// apparaît et disparaît. Pas de signature de codec.
+#[test]
+fn un_charleston_intermittent_n_est_pas_un_codec_9035() {
+    let sr = 96_000f32;
+    let fond = par_spectre(
+        96_000,
+        907,
+        |f| if f < 8_000.0 { 1.0 / f.sqrt() } else { 0.0 },
+    );
+    let mut alea = Lcg(908);
+    let periode = (0.25 * sr) as usize;
+    let musique: Vec<f32> = fond
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| {
+            let t = (i % periode) as f32 / sr;
+            let coup = (alea.suivant() as f32 - 0.5) * 1.5 * (-t / 0.04).exp();
+            x + coup
+        })
+        .collect();
+    pas_de_signature("charleston", &masterise(musique, 909));
+}
+
+/// 🔴 TÉMOIN — un roll-off DOUX (12 dB par octave de plus dès 6 kHz, une
+/// vieille bande), dont le niveau monte et descend de 20 dB par passages.
+/// Pas de signature de codec.
+#[test]
+fn un_roll_off_doux_qui_varie_n_est_pas_un_codec_9035() {
+    let base = par_spectre(96_000, 910, |f| {
+        (1.0 / f.sqrt()) / (1.0 + (f / 6_000.0).powi(2))
+    });
+    let passage = 96_000 / 2;
+    let musique: Vec<f32> = base
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| {
+            let g = if (i / passage) % 2 == 0 { 1.0 } else { 0.1 };
+            x * g
+        })
+        .collect();
+    pas_de_signature("roll-off doux", &masterise(musique, 911));
+}
