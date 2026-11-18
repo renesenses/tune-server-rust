@@ -359,40 +359,50 @@ pub fn pistes_en_cause(pistes: &[(String, Option<String>)]) -> (usize, usize) {
     (douteuses, mesurees)
 }
 
-/// Le verdict d'un ALBUM à partir de ceux de ses pistes : « douteux » dès
-/// qu'une piste l'est (avec la raison la plus fréquente), « vérifié » si
-/// toutes ses pistes mesurées le sont, « non analysé » sans aucune mesure,
-/// « conforme » sinon (qualité CD, rien de suspect).
-pub fn verdict_d_album(pistes: &[(String, Option<String>)]) -> (String, Option<String>) {
-    if pistes.is_empty() {
-        return ("non_analyse".into(), None);
-    }
-    let douteuses: Vec<&Option<String>> = pistes
+/// #9035 — la raison la plus fréquente parmi les pistes DOUTEUSES (l'ancien
+/// `coupure_de_codec` compte comme la coupure qu'il était, voir
+/// `raison_publiee`) ; `None` sans piste douteuse.
+pub fn raison_des_douteuses(pistes: &[(String, Option<String>)]) -> Option<String> {
+    let mut comptes: std::collections::BTreeMap<String, usize> = Default::default();
+    for r in pistes
         .iter()
         .filter(|(v, _)| v == "douteux")
-        .map(|(_, r)| r)
-        .collect();
-    if !douteuses.is_empty() {
-        let mut comptes: std::collections::BTreeMap<String, usize> = Default::default();
-        // #9035 — l'ancien `coupure_de_codec` compte comme la coupure qu'il
-        // était (`raison_publiee`).
-        for r in douteuses.into_iter().flatten() {
-            *comptes
-                .entry(super::faux_hires::raison_publiee(r).to_string())
-                .or_default() += 1;
-        }
-        let raison = comptes.into_iter().max_by_key(|(_, n)| *n).map(|(r, _)| r);
-        return ("douteux".into(), raison);
+        .filter_map(|(_, r)| r.as_deref())
+    {
+        *comptes
+            .entry(super::faux_hires::raison_publiee(r).to_string())
+            .or_default() += 1;
     }
-    let mesurees: Vec<&String> = pistes
+    comptes.into_iter().max_by_key(|(_, n)| *n).map(|(r, _)| r)
+}
+
+/// #9035 (décision de Bertrand du 18/11/2026, fil 2902) — un album est
+/// douteux quand AU MOINS LA MOITIÉ de ses pistes mesurées le sont. Deux
+/// bonus douteux sur dix pistes ne font pas un album douteux : l'album le dit
+/// (« 2 pistes douteuses », [`pistes_en_cause`]) sans en porter le verdict.
+pub fn album_majoritairement_douteux(douteuses: usize, mesurees: usize) -> bool {
+    douteuses > 0 && 2 * douteuses >= mesurees
+}
+
+/// Le verdict d'un ALBUM à partir de ceux de ses pistes : « douteux » quand
+/// au moins la moitié de ses pistes mesurées le sont (#9035, avec la raison
+/// la plus fréquente) ; sinon, les pistes douteuses mises de côté,
+/// « vérifié » si toutes les autres pistes mesurées le sont, « conforme »
+/// s'il en reste une conforme, « non analysé » sans aucune mesure.
+pub fn verdict_d_album(pistes: &[(String, Option<String>)]) -> (String, Option<String>) {
+    let (douteuses, mesurees) = pistes_en_cause(pistes);
+    if album_majoritairement_douteux(douteuses, mesurees) {
+        return ("douteux".into(), raison_des_douteuses(pistes));
+    }
+    let autres: Vec<&String> = pistes
         .iter()
         .map(|(v, _)| v)
-        .filter(|v| *v != "non_concluant")
+        .filter(|v| *v != "non_concluant" && *v != "douteux")
         .collect();
-    if mesurees.is_empty() {
+    if autres.is_empty() {
         return ("non_analyse".into(), None);
     }
-    if mesurees.iter().all(|v| *v == "verifie") {
+    if autres.iter().all(|v| *v == "verifie") {
         return ("verifie".into(), None);
     }
     ("conforme".into(), None)

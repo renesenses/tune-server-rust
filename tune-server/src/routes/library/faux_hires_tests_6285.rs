@@ -91,7 +91,7 @@ async fn le_verdict_d_album_et_de_ses_pistes_6285() {
     assert_eq!(s, StatusCode::OK, "{c}");
     assert_eq!(
         c["verdict"], "douteux",
-        "une piste douteuse rend l'album douteux — {c}"
+        "une piste douteuse sur deux (la moitié) rend l'album douteux — {c}"
     );
     assert_eq!(c["raison"], "bande_de_cd", "{c}");
     assert_eq!(
@@ -395,4 +395,77 @@ async fn la_fiche_dit_la_coupure_et_les_pistes_en_cause_9035() {
     assert_eq!(sombre["hires_raison"], "coupure_spectrale", "{sombre}");
     assert_eq!(sombre["hires_pistes_douteuses"], 2, "{sombre}");
     assert_eq!(sombre["hires_pistes_mesurees"], 3, "{sombre}");
+}
+
+/// #9035 (décision du 18/11, fil 2902) — deux bonus douteux sur dix pistes :
+/// l'album n'est PAS douteux (ni sur sa fiche, ni dans la liste, ni par le
+/// filtre « douteux »), mais il dit « 2 pistes douteuses », leur raison et
+/// leur coupure ; chaque piste douteuse garde son verdict. Six sur dix : douteux.
+#[tokio::test]
+async fn deux_bonus_douteux_sur_dix_ne_font_pas_un_album_douteux_9035() {
+    let (app, state) = banc();
+    let mut sql = String::from("INSERT INTO albums (id, title) VALUES (8, 'Bonus'), (9, 'Six');");
+    for (album, douteuses) in [(8, 2), (9, 6)] {
+        for i in 0..10 {
+            let piste = album * 100 + i;
+            let (verdict, raison) = if i < douteuses {
+                ("douteux", "'coupure_spectrale'")
+            } else {
+                ("verifie", "NULL")
+            };
+            sql.push_str(&format!(
+                "INSERT INTO tracks (id, title, album_id, file_path, format, duration_ms) \
+                 VALUES ({piste}, 't', {album}, '/m/{piste}.flac', 'flac', 60000);
+                 INSERT INTO hires_verifications (track_id, verdict, raison, coupure_hz, bits_effectifs, sample_rate, bits_declares) \
+                 VALUES ({piste}, '{verdict}', {raison}, 17800.0, 24, 96000, 24);"
+            ));
+        }
+    }
+    state.backend.execute_batch(&sql).unwrap();
+    montrer_douteux(&app, true).await;
+
+    let c = get(&app, "/api/v1/library/albums/8/hires").await;
+    assert_eq!(c["verdict"], "verifie", "2/10 : pas douteux — {c}");
+    assert_eq!(c["raison"], Value::Null, "{c}");
+    assert_eq!(c["pistes_douteuses"], 2, "{c}");
+    assert_eq!(c["pistes_mesurees"], 10, "{c}");
+    assert_eq!(c["raison_pistes"], "coupure_spectrale", "{c}");
+    assert_eq!(c["coupure_hz"], 17800.0, "{c}");
+    assert_eq!(
+        c["pistes"][0]["verdict"], "douteux",
+        "la piste garde son verdict — {c}"
+    );
+
+    let c = get(&app, "/api/v1/library/albums/9/hires").await;
+    assert_eq!(c["verdict"], "douteux", "6/10 : douteux — {c}");
+    assert_eq!(c["raison"], "coupure_spectrale", "{c}");
+    assert_eq!(c["pistes_douteuses"], 6, "{c}");
+
+    let liste = get(&app, "/api/v1/library/albums?limit=50").await;
+    let bonus = liste["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|a| a["id"] == 8)
+        .cloned()
+        .unwrap_or_else(|| panic!("album 8 absent : {liste}"));
+    assert_eq!(bonus["hires_verdict"], "verifie", "{bonus}");
+    assert_eq!(bonus["hires_pistes_douteuses"], 2, "{bonus}");
+    assert_eq!(bonus["hires_raison_pistes"], "coupure_spectrale", "{bonus}");
+
+    let douteux = get(
+        &app,
+        "/api/v1/library/albums?hires_verdict=douteux&limit=50",
+    )
+    .await;
+    let ids: Vec<i64> = douteux["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|a| a["id"].as_i64())
+        .collect();
+    assert!(
+        ids.contains(&9) && !ids.contains(&8),
+        "filtre douteux : {ids:?}"
+    );
 }

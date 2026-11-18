@@ -15,10 +15,15 @@ albums, son filtre et le critère des règles intelligentes.
 | `non_analyse` | aucune mesure, rien de concluant, ou un « douteux » masqué | aucun |
 
 Le verdict d'un album suit celui de ses pistes mesurées (`verdict_d_album`) :
-une piste douteuse le rend douteux ; sinon, toutes les pistes mesurées
-vérifiées le rendent vérifié ; une conforme le rend conforme ; rien de mesuré
-ou rien que du non concluant le laisse non analysé. Les pistes pas encore
-mesurées ne comptent pas.
+**au moins la moitié** de ses pistes mesurées douteuses le rendent douteux
+(#9035, décision du 18/11/2026, fil 2902 : deux bonus douteux sur dix pistes
+ne font pas un album douteux) ; sinon, les pistes douteuses mises de côté,
+toutes les autres pistes mesurées vérifiées le rendent vérifié, une conforme
+le rend conforme, rien de mesuré ou rien que du non concluant le laisse non
+analysé. Les pistes pas encore mesurées et les non concluantes ne comptent
+pas. Un album qui n'est pas douteux mais a des pistes douteuses le dit
+(`pistes_douteuses`, `raison_pistes`) ; chaque piste douteuse garde son
+verdict.
 
 Raisons d'un « douteux » (#9035) :
 
@@ -34,13 +39,15 @@ plus publié : une ligne qui le porte se publie `coupure_spectrale`. Un client
 qui le reçoit d'un serveur plus ancien le lit comme `coupure_spectrale`.
 
 Ce que la fiche `GET /library/albums/{id}/hires` rend en plus (#9035), `null`
-hors d'un « douteux » publié :
+sans piste douteuse ou tant que « douteux » est masqué — l'album lui-même
+douteux ou non :
 
 | Champ | Valeur |
 |---|---|
 | `pistes_douteuses` | combien de pistes de l'album sont douteuses |
 | `pistes_mesurees` | sur combien de pistes mesurées (hors `non_concluant`) |
-| `coupure_hz` | la coupure de l'album : médiane des pistes douteuses qui portent sa raison |
+| `raison_pistes` | la raison la plus fréquente des pistes douteuses (celle de l'album quand il est douteux) |
+| `coupure_hz` | médiane des coupures des pistes douteuses qui portent `raison_pistes` |
 
 ## « Douteux » masqué par défaut
 
@@ -71,8 +78,9 @@ Chaque ligne de `items` porte deux champs de plus :
 |---|---|---|
 | `hires_verdict` | chaîne | `verifie`, `conforme`, `douteux` ou `non_analyse` |
 | `hires_raison` | chaîne ou `null` | la raison d'un `douteux` montré, `null` sinon |
-| `hires_pistes_douteuses` | entier ou `null` | #9035 — pistes douteuses d'un `douteux` montré |
+| `hires_pistes_douteuses` | entier ou `null` | #9035 — pistes douteuses de l'album (douteux ou non), `null` sans piste douteuse ou masqué |
 | `hires_pistes_mesurees` | entier ou `null` | #9035 — sur combien de pistes mesurées |
+| `hires_raison_pistes` | chaîne ou `null` | #9035 — la raison la plus fréquente des pistes douteuses |
 
 Paramètre de filtre `?hires_verdict=<verdict>` : seuls les albums dont le
 `hires_verdict` publié est celui-là. Il se combine aux autres facettes, au tri,

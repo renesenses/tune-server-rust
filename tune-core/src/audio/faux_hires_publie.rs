@@ -98,15 +98,26 @@ pub fn publier_l_album(
     }
 }
 
-/// #9035 — `(pistes douteuses, pistes mesurées)` d'un album qui se PUBLIE
-/// douteux ; `None` pour tout autre verdict publié, et tant que « douteux »
-/// est masqué (le compte trahirait le verdict).
-pub fn pistes_en_cause_publiees(
+/// #9035 — les pistes douteuses d'un album, qu'il soit douteux (au moins la
+/// moitié de ses pistes mesurées) ou non (« 2 pistes douteuses » sur un album
+/// vérifié) : `(pistes douteuses, pistes mesurées, raison la plus fréquente
+/// des douteuses)`. `None` sans piste douteuse, et tant que « douteux » est
+/// masqué (le compte trahirait le verdict).
+pub fn pistes_douteuses_publiees(
     pistes: &[(String, Option<String>)],
     douteux_visible: bool,
-) -> Option<(usize, usize)> {
-    (publier_l_album(pistes, douteux_visible).0 == "douteux")
-        .then(|| super::faux_hires_passe::pistes_en_cause(pistes))
+) -> Option<(usize, usize, Option<String>)> {
+    if !douteux_visible {
+        return None;
+    }
+    let (douteuses, mesurees) = super::faux_hires_passe::pistes_en_cause(pistes);
+    (douteuses > 0).then(|| {
+        (
+            douteuses,
+            mesurees,
+            super::faux_hires_passe::raison_des_douteuses(pistes),
+        )
+    })
 }
 
 /// Verdict et raison de chaque piste mesurée, rangés par identifiant d'album.
@@ -145,6 +156,24 @@ pub fn pistes_mesurees_par_album(
     Ok(par_album)
 }
 
+/// #9035 — « l'album est douteux » en SQL : au moins une piste douteuse, et
+/// au moins la moitié de ses pistes mesurées (hors `non_concluant`), comme
+/// [`super::faux_hires_passe::album_majoritairement_douteux`].
+fn album_douteux(id_album: &str) -> String {
+    let compte = |condition: &str| {
+        format!(
+            "(SELECT COUNT(*) FROM tracks ht JOIN hires_verifications hv ON hv.track_id = ht.id \
+             WHERE ht.album_id = {id_album} AND {condition})"
+        )
+    };
+    format!(
+        "({} AND 2 * {} >= {})",
+        une_piste_de_l_album(id_album, "douteux"),
+        compte("hv.verdict = 'douteux'"),
+        compte("hv.verdict <> 'non_concluant'")
+    )
+}
+
 /// Une piste de l'album `id_album` porte ce verdict mesuré.
 fn une_piste_de_l_album(id_album: &str, verdict: &str) -> String {
     format!(
@@ -156,16 +185,16 @@ fn une_piste_de_l_album(id_album: &str, verdict: &str) -> String {
 /// Le prédicat SQL « l'album `id_album` (une colonne : `a.id`, `al.id`) se
 /// PUBLIE avec ce verdict ». Il suit [`verdict_d_album`] règle pour règle :
 ///
-/// - douteux : une piste douteuse au moins ;
-/// - vérifié : aucune douteuse, une vérifiée au moins, aucune conforme ;
-/// - conforme : aucune douteuse, une conforme au moins ;
-/// - non analysé : aucune douteuse, vérifiée ni conforme (pas de mesure, ou
+/// - douteux : au moins la moitié des pistes mesurées douteuses (#9035) ;
+/// - vérifié : pas douteux, une vérifiée au moins, aucune conforme ;
+/// - conforme : pas douteux, une conforme au moins ;
+/// - non analysé : pas douteux, ni vérifiée ni conforme (pas de mesure, ou
 ///   rien que du non concluant).
 ///
 /// « Douteux » masqué : le prédicat douteux est faux, et un album douteux
 /// répond à « non analysé ». Les deux bases lisent ce SQL tel quel.
 pub fn predicat_album(id_album: &str, verdict: VerdictPublie, douteux_visible: bool) -> String {
-    let d = une_piste_de_l_album(id_album, "douteux");
+    let d = album_douteux(id_album);
     let v = une_piste_de_l_album(id_album, "verifie");
     let c = une_piste_de_l_album(id_album, "conforme");
     match verdict {

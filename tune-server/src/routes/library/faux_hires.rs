@@ -37,7 +37,7 @@ use serde_json::{Value, json};
 use tune_core::audio::faux_hires::raison_publiee;
 use tune_core::audio::faux_hires_passe::{activer, compter_les_candidats, est_active};
 use tune_core::audio::faux_hires_publie::{
-    douteux_visible, montrer_douteux, pistes_en_cause_publiees, publier_l_album,
+    douteux_visible, montrer_douteux, pistes_douteuses_publiees, publier_l_album,
 };
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
@@ -102,29 +102,29 @@ pub(super) async fn verdict_album(
         })
         .collect();
     let (verdict, raison) = publier_l_album(&verdicts, visible);
-    // #9035 — ce que le badge de l'album dit en plus de la raison : combien
-    // de pistes sont en cause sur combien de mesurées, et la coupure (médiane
-    // des pistes douteuses qui portent la raison de l'album). `null` hors
-    // d'un douteux publié.
-    let en_cause = pistes_en_cause_publiees(&verdicts, visible);
-    let coupure_hz = raison
-        .as_ref()
-        .filter(|_| en_cause.is_some())
-        .and_then(|r| {
-            let mut f: Vec<f64> = coupures
-                .iter()
-                .filter(|(rp, _)| rp.as_ref() == Some(r))
-                .map(|(_, f)| *f)
-                .collect();
-            f.sort_by(|a, b| a.total_cmp(b));
-            f.get(f.len() / 2).copied()
-        });
+    // #9035 — ce que le badge de l'album dit en plus : combien de pistes
+    // sont douteuses sur combien de mesurées (l'album n'est douteux qu'à
+    // partir de la moitié), leur raison la plus fréquente, et la coupure
+    // (médiane des pistes douteuses qui portent cette raison). `null` sans
+    // piste douteuse, ou tant que « douteux » est masqué.
+    let en_cause = pistes_douteuses_publiees(&verdicts, visible);
+    let raison_pistes = en_cause.as_ref().and_then(|c| c.2.clone());
+    let coupure_hz = raison_pistes.as_ref().and_then(|r| {
+        let mut f: Vec<f64> = coupures
+            .iter()
+            .filter(|(rp, _)| rp.as_ref() == Some(r))
+            .map(|(_, f)| *f)
+            .collect();
+        f.sort_by(|a, b| a.total_cmp(b));
+        f.get(f.len() / 2).copied()
+    });
     Ok(Json(json!({
         "album_id": id,
         "verdict": verdict,
         "raison": raison,
-        "pistes_douteuses": en_cause.map(|(d, _)| d),
-        "pistes_mesurees": en_cause.map(|(_, m)| m),
+        "pistes_douteuses": en_cause.as_ref().map(|c| c.0),
+        "pistes_mesurees": en_cause.as_ref().map(|c| c.1),
+        "raison_pistes": raison_pistes,
         "coupure_hz": coupure_hz,
         "pistes": pistes,
     })))

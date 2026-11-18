@@ -350,3 +350,52 @@ fn l_album_dit_sa_coupure_et_combien_de_pistes_9035() {
     assert_eq!(pistes_en_cause(&pistes), (3, 4));
     assert_eq!(pistes_en_cause(&[]), (0, 0));
 }
+
+/// #9035 (décision du 18/11, fil 2902) — un album n'est douteux qu'à partir
+/// de la MOITIÉ de ses pistes mesurées. Deux bonus douteux sur dix : l'album
+/// garde le verdict de ses autres pistes ; six sur dix : douteux.
+#[test]
+fn un_album_n_est_douteux_qu_a_partir_de_la_moitie_9035() {
+    let album = |douteuses: usize, autre: &str| -> Vec<(String, Option<String>)> {
+        (0..10)
+            .map(|i| {
+                if i < douteuses {
+                    ("douteux".to_string(), Some("coupure_spectrale".to_string()))
+                } else {
+                    (autre.to_string(), None)
+                }
+            })
+            .collect()
+    };
+    assert_eq!(
+        verdict_d_album(&album(2, "verifie")),
+        ("verifie".into(), None)
+    );
+    assert_eq!(pistes_en_cause(&album(2, "verifie")), (2, 10));
+    assert_eq!(
+        verdict_d_album(&album(2, "conforme")),
+        ("conforme".into(), None)
+    );
+    assert_eq!(
+        verdict_d_album(&album(4, "verifie")),
+        ("verifie".into(), None)
+    );
+    assert_eq!(
+        verdict_d_album(&album(5, "verifie")),
+        ("douteux".into(), Some("coupure_spectrale".into())),
+        "la moitié pile suffit"
+    );
+    assert_eq!(
+        verdict_d_album(&album(6, "verifie")),
+        ("douteux".into(), Some("coupure_spectrale".into()))
+    );
+    assert_eq!(
+        raison_des_douteuses(&album(2, "verifie")),
+        Some("coupure_spectrale".into())
+    );
+    assert_eq!(raison_des_douteuses(&album(0, "verifie")), None);
+    // Les non concluantes ne comptent pas : 1 douteuse sur 2 mesurées.
+    let mut p = album(1, "non_concluant");
+    p[1] = ("verifie".into(), None);
+    assert_eq!(verdict_d_album(&p).0, "douteux");
+}

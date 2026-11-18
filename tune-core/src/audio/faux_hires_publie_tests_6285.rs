@@ -279,3 +279,75 @@ fn les_albums_des_verdicts_du_catalogue_rc12() {
     assert_eq!(ids(&["hires"], true), Vec::<i64>::new());
     assert_eq!(ids(&[], true), Vec::<i64>::new());
 }
+
+/// #9035 (décision du 18/11, fil 2902) — la règle de la moitié, en Rust ET en
+/// SQL : album 8 = 2 douteuses sur 10 (vérifié, « 2 pistes douteuses »),
+/// album 9 = 6 sur 10 (douteux). Le filtre `?hires_verdict=` et les règles
+/// intelligentes lisent le SQL : il doit rendre les mêmes albums que le badge.
+#[test]
+fn la_regle_de_la_moitie_vaut_pour_le_badge_et_le_filtre_9035() {
+    let db = bibliotheque();
+    for (album, douteuses) in [(8i64, 2usize), (9, 6)] {
+        db.execute(
+            "INSERT INTO albums (id, title) VALUES (?1, 'a')",
+            &[&album as &dyn ToSqlValue],
+        )
+        .unwrap();
+        for i in 0..10usize {
+            let piste = album * 100 + i as i64;
+            let chemin = format!("/m/{piste}.flac");
+            db.execute(
+                "INSERT INTO tracks (id, album_id, title, file_path, format, source, duration_ms) \
+                 VALUES (?1, ?2, 't', ?3, 'flac', 'local', 60000)",
+                &[&piste as &dyn ToSqlValue, &album, &chemin],
+            )
+            .unwrap();
+            let (verdict, raison) = if i < douteuses {
+                ("douteux".to_string(), Some("coupure_spectrale".to_string()))
+            } else {
+                ("verifie".to_string(), None)
+            };
+            db.execute(
+                "INSERT INTO hires_verifications (track_id, verdict, raison, coupure_hz) \
+                 VALUES (?1, ?2, ?3, 17800.0)",
+                &[&piste as &dyn ToSqlValue, &verdict, &raison],
+            )
+            .unwrap();
+        }
+    }
+    let ids: Vec<i64> = (1..=9).collect();
+    let par_album = pistes_mesurees_par_album(&db, &ids).unwrap();
+    assert_eq!(publier_l_album(&par_album[&8], true), ("verifie", None));
+    assert_eq!(
+        pistes_douteuses_publiees(&par_album[&8], true),
+        Some((2, 10, Some("coupure_spectrale".into())))
+    );
+    assert_eq!(pistes_douteuses_publiees(&par_album[&8], false), None);
+    assert_eq!(
+        publier_l_album(&par_album[&9], true),
+        ("douteux", Some("coupure_spectrale".into()))
+    );
+    for visible in [false, true] {
+        for v in TOUS {
+            let attendus: Vec<i64> = ids
+                .iter()
+                .copied()
+                .filter(|id| {
+                    let p = par_album.get(id).cloned().unwrap_or_default();
+                    publier_l_album(&p, visible).0 == v.code()
+                })
+                .collect();
+            assert_eq!(
+                albums_du_predicat(&db, v, visible),
+                attendus,
+                "prédicat {} (douteux visible : {visible})",
+                v.code()
+            );
+        }
+    }
+    assert_eq!(
+        albums_du_predicat(&db, VerdictPublie::Douteux, true),
+        vec![3, 9]
+    );
+    assert!(albums_du_predicat(&db, VerdictPublie::Verifie, true).contains(&8));
+}
