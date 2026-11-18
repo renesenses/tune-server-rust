@@ -48,6 +48,10 @@ pub use resolution::{
 };
 pub use zones::{Applicabilite, MotifHorsTess, TransportZone};
 
+/// Étages fixes (lot T07) : Headroom, Volume au rendu, bilan de niveau,
+/// étape finale avec mise en forme du bruit.
+pub mod etages_fixes;
+
 /// Version du contrat TESS publiée par l'API (`contract_version`). Elle monte
 /// quand un champ change de SENS ; un ajout facultatif (champ, valeur
 /// d'énumération) ne la fait pas monter, puisque les clients les ignorent.
