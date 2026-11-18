@@ -284,6 +284,7 @@ impl Peripheriques for MicroSimule {
             }
         });
         Ok(CaptureDemarree {
+            id: format!("simule:{nom}"),
             nom,
             format: f,
             arret: Box::new(ArretSimule(vivant)),
