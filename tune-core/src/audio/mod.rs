@@ -1,6 +1,8 @@
 pub mod aac_encoder;
 pub mod aiff;
 pub mod alac_encoder;
+/// #8968 — amorce et remplissage d'un AAC en MP4 (`iTunSMPB`, `elst`).
+pub(crate) mod amorce_aac;
 pub mod analyzer;
 pub mod ape;
 pub mod audiophile;

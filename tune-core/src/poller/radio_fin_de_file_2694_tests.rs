@@ -1,5 +1,6 @@
 //! Forum, fil 2694 (Ilan, 12/11/2026) ; décision de Bertrand du 13/11 — la
-//! radio de fin de file, « comme Roon » : activée par défaut, désactivable,
+//! radio de fin de file, « comme Roon » : activée par défaut en rc12,
+//! désactivée par défaut depuis #8974 (décision du 17/11), désactivable,
 //! jamais sur une fin voulue (« Vider la suite », réveil), jamais sous
 //! contrôle parental, sans doublon, et les titres ajoutés sont marqués.
 //!
@@ -32,15 +33,20 @@ struct Banc {
 }
 
 /// Bibliothèque de quatre pistes de jazz (1 à 4), file [1, 3], la piste 3 en
-/// cours et dernière de la file. La zone naît par `ZoneRepo::create` : son
-/// réglage est donc celui de toute nouvelle zone.
+/// cours et dernière de la file. La zone naît par `ZoneRepo::create`, puis
+/// l'auditeur ACTIVE la radio de fin de file : depuis #8974 (17/11), une
+/// nouvelle zone naît sans elle.
 async fn banc(services: crate::streaming::ServiceRegistry) -> Banc {
     let db = SqliteDb::open_in_memory().unwrap();
     db.init_schema().unwrap();
     crate::db::migrations::run_migrations(&db).unwrap();
     let db: Arc<dyn DbBackend> = Arc::new(db);
-    let cree = ZoneRepo::with_backend(db.clone())
+    let zones = ZoneRepo::with_backend(db.clone());
+    let cree = zones
         .create("Radio 2694", Some("mock"), Some(SORTIE))
+        .unwrap();
+    zones
+        .update_autoplay_mode(cree, AutoplayMode::Similar)
         .unwrap();
     // Les consignes de la radio (fin voulue, fin sur erreur, dernier lot)
     // vivent en mémoire, par zone : un identifiant propre à chaque épreuve
@@ -149,13 +155,43 @@ async fn rien_n_est_ajoute(b: &Banc) {
     assert!(rff::lignes_ajoutees_par_la_radio(&b.db, b.zone_id).is_empty());
 }
 
+/// #8974 (décision de Bertrand du 17/11) : une nouvelle zone naît SANS radio
+/// de fin de file, et sa fin de file s'arrête là.
 #[tokio::test]
-async fn une_nouvelle_zone_nait_avec_la_radio_de_fin_de_file() {
+async fn une_nouvelle_zone_nait_sans_radio_de_fin_de_file_8974() {
     let b = banc(crate::streaming::ServiceRegistry::new()).await;
+    let neuve = ZoneRepo::with_backend(b.db.clone())
+        .create("Neuve 8974", Some("mock"), Some("mock-neuve-8974"))
+        .unwrap();
+    assert_eq!(
+        ZoneRepo::with_backend(b.db.clone()).get_autoplay_mode(neuve),
+        AutoplayMode::Off
+    );
+    // La zone du banc, elle, a été activée À LA MAIN : le réglage tient.
     assert_eq!(
         ZoneRepo::with_backend(b.db.clone()).get_autoplay_mode(b.zone_id),
         AutoplayMode::Similar
     );
+}
+
+/// #8974 — la même fin de file qu'en dessous, sur une zone jamais réglée :
+/// rien n'est ajouté, la zone s'arrête.
+#[tokio::test]
+async fn fin_de_file_d_une_zone_jamais_reglee_ne_lance_pas_la_radio_8974() {
+    let mut b = banc(crate::streaming::ServiceRegistry::new()).await;
+    // Ramène la zone du banc à l'état d'une zone neuve, jamais réglée.
+    b.db.execute(
+        "UPDATE zones SET autoplay_enabled = 0 WHERE id = ?",
+        &[&b.zone_id as &dyn ToSqlValue],
+    )
+    .unwrap();
+    b.poller
+        .handle_track_end(b.zone_id, &fin_de_la_piste_3(b.zone_id))
+        .await;
+    rien_n_est_ajoute(&b).await;
+    while let Ok(e) = b.events.try_recv() {
+        assert_ne!(e.event_type, "playback.autoplay_tracks_added");
+    }
 }
 
 #[tokio::test]
@@ -478,24 +514,56 @@ async fn controle_parental_aucun_titre_ajoute() {
     rien_n_est_ajoute(&b).await;
 }
 
-#[tokio::test]
-async fn migration_152_active_la_radio_des_zones_au_reglage_par_defaut() {
+/// Une base SQLite dans l'état de ses zones juste avant la 152, avec la
+/// ligne `_migrations` 152 de la rc12 (ancien nom) quand `passee_par_la_rc12`.
+fn base_avant_8974(passee_par_la_rc12: bool) -> ZoneRepo {
     let db = SqliteDb::open_in_memory().unwrap();
     db.init_schema().unwrap();
     crate::db::migrations::run_migrations(&db).unwrap();
     db.execute_batch(
-        "INSERT INTO zones (id, name, autoplay_enabled) VALUES (1, 'Défaut', 0);
+        "INSERT INTO zones (id, name, autoplay_enabled) VALUES (1, 'Similaires', 1);
          INSERT INTO zones (id, name, autoplay_enabled) VALUES (2, 'Album', 'random_album');
          INSERT INTO zones (id, name, autoplay_enabled) VALUES (3, 'Nulle', NULL);
+         INSERT INTO zones (id, name, autoplay_enabled) VALUES (4, 'Coupée', 0);
          DELETE FROM _migrations WHERE version >= 152;",
     )
     .unwrap();
+    if passee_par_la_rc12 {
+        db.execute_batch(
+            "INSERT INTO _migrations (version, name) VALUES (152, 'radio_fin_de_file_par_defaut');
+             INSERT INTO _migrations (version, name) VALUES (153, 'collection_physique_associations');
+             INSERT INTO _migrations (version, name) VALUES (154, 'albums_release_country');",
+        )
+        .unwrap();
+    }
     crate::db::migrations::run_migrations(&db).unwrap();
     let db: Arc<dyn DbBackend> = Arc::new(db);
-    let repo = ZoneRepo::with_backend(db);
+    ZoneRepo::with_backend(db)
+}
+
+/// #8974 — une base passée par la rc12 (la 152 a basculé ses zones « coupé »
+/// en « titres similaires » et posé '1' sur chaque zone créée) : un « titres
+/// similaires » n'y prouve plus un choix, il reprend le défaut, coupé. Le
+/// mode nommé et le « coupé » ne bougent pas.
+#[tokio::test]
+async fn migration_155_coupe_la_radio_posee_par_la_rc12_8974() {
+    let repo = base_avant_8974(true);
+    assert_eq!(repo.get_autoplay_mode(1), AutoplayMode::Off);
+    assert_eq!(repo.get_autoplay_mode(2), AutoplayMode::RandomAlbum);
+    assert_eq!(repo.get_autoplay_mode(3), AutoplayMode::Off);
+    assert_eq!(repo.get_autoplay_mode(4), AutoplayMode::Off);
+}
+
+/// #8974 — une base qui saute la rc12 (rc11 ou avant → rc13) : la 152 ne
+/// fait plus rien, la 155 non plus. Avant la rc12 le défaut était coupé :
+/// un « titres similaires » y est un choix de l'utilisateur, il reste.
+#[tokio::test]
+async fn migration_152_neutralisee_garde_les_reglages_d_avant_la_rc12_8974() {
+    let repo = base_avant_8974(false);
     assert_eq!(repo.get_autoplay_mode(1), AutoplayMode::Similar);
     assert_eq!(repo.get_autoplay_mode(2), AutoplayMode::RandomAlbum);
-    assert_eq!(repo.get_autoplay_mode(3), AutoplayMode::Similar);
+    assert_eq!(repo.get_autoplay_mode(3), AutoplayMode::Off);
+    assert_eq!(repo.get_autoplay_mode(4), AutoplayMode::Off);
 }
 
 // --- Radio du titre chez le service (TIDAL) --------------------------------

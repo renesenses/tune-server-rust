@@ -1377,6 +1377,14 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                 full_scan_ok,
                 "scan_auto",
             );
+            // #8958 — les alertes « Albums douteux » marquées normales tiennent
+            // par clé stable (chemin, dossier) : seules celles dont la clé ne
+            // correspond plus à aucune piste sont retirées, sur scan complet sain.
+            tune_core::db::alertes_douteuses_ignorees::purger_en_fin_de_scan(
+                &db,
+                full_scan_ok,
+                "scan_auto",
+            );
             // Les paires « pas des doublons » (#1276) : même mécanique, même
             // garde `full_scan_ok`. Un arbitrage perdu ne se voit pas — il se
             // paie à la fusion suivante, qui supprime la ligne perdante.
