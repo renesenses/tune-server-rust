@@ -593,6 +593,11 @@ pub fn router() -> Router<AppState> {
         )
         .route("/{id}/muted", put(update_muted))
         .route("/{id}/dsp", get(get_zone_dsp).put(set_zone_dsp))
+        // TESS T08 — la chaîne de la zone, son état réel et le catalogue.
+        .route(
+            "/{id}/tess",
+            get(tess::get_zone_tess).put(tess::put_zone_tess),
+        )
         .route("/{id}/eq/response", get(eq_response))
         .route("/{id}/convolver/response", get(convolver_response))
         .route("/{id}/renderer-capabilities", post(renderer_capabilities))
@@ -686,6 +691,9 @@ pub(crate) async fn zones_a_montrer(state: &AppState) -> Vec<Zone> {
 
 mod dsp;
 pub use dsp::*;
+
+// TESS T08 — `GET/PUT /zones/{id}/tess` et `GET /tess/catalog`.
+pub mod tess;
 
 mod lecture;
 pub use lecture::*;

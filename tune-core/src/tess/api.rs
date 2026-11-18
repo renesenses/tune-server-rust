@@ -21,7 +21,7 @@ use serde_json::{Map, Value, json};
 use super::VERSION_CONTRAT;
 use super::chaine::{ChaineTess, ErreurChaine};
 use super::greffon::Catalogue;
-use super::resolution::{Badge, ContexteExecution, EtapeResolue, EtatVolume};
+use super::resolution::{Badge, ContexteExecution, EtapeResolue, EtatVolume, MotifEtape};
 use super::zones::{Applicabilite, TransportZone};
 
 /// La réponse de `GET /zones/{id}/tess` (et d'un `PUT` accepté).
@@ -65,6 +65,66 @@ impl ReponseTessZone {
             badge: r.badge,
             signal_path: r.etapes,
             catalog,
+        }
+    }
+}
+
+/// Ce qu'un greffon du catalogue vaut pour CE serveur et CE compte
+/// (`GET /tess/catalog`, lot T08).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EtatGreffonCatalogue {
+    pub id: String,
+    /// Le compte a le droit de le cocher (Free, ou Premium actif).
+    pub entitled: bool,
+    /// Installé, activé et branché dans l'hôte.
+    pub available: bool,
+    /// Pourquoi il ne traiterait pas s'il était coché, dans l'ordre de la
+    /// résolution : `plugin_unavailable` d'abord, puis `premium_required` ;
+    /// `None` : utilisable.
+    pub reason: Option<MotifEtape>,
+}
+
+/// La réponse de `GET /tess/catalog` : le catalogue (schémas de réglages,
+/// droits, contraintes de place, politique des groupes) et son état pour le
+/// compte. Un serveur sans TESS répond 404 : c'est la capacité TESS.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ReponseCatalogue {
+    pub contract_version: u32,
+    /// Le compte est Premium.
+    pub premium: bool,
+    pub catalog: Catalogue,
+    /// Un état par greffon du catalogue, dans le même ordre.
+    pub plugins: Vec<EtatGreffonCatalogue>,
+}
+
+impl ReponseCatalogue {
+    pub fn depuis(catalog: Catalogue, premium: bool, disponible: &dyn Fn(&str) -> bool) -> Self {
+        let plugins = catalog
+            .plugins
+            .iter()
+            .map(|d| {
+                let entitled = premium || !d.entitlement.demande_le_premium();
+                let available = disponible(&d.id);
+                let reason = if !available {
+                    Some(MotifEtape::PluginUnavailable)
+                } else if !entitled {
+                    Some(MotifEtape::PremiumRequired)
+                } else {
+                    None
+                };
+                EtatGreffonCatalogue {
+                    id: d.id.clone(),
+                    entitled,
+                    available,
+                    reason,
+                }
+            })
+            .collect();
+        Self {
+            contract_version: VERSION_CONTRAT,
+            premium,
+            catalog,
+            plugins,
         }
     }
 }
@@ -208,6 +268,25 @@ pub fn schema_json() -> Value {
                 },
                 "additionalProperties": false
             },
+            "catalog_response": {
+                "type": "object", "required": ["contract_version", "premium", "catalog", "plugins"],
+                "properties": {
+                    "contract_version": { "const": VERSION_CONTRAT },
+                    "premium": { "type": "boolean" },
+                    "catalog": { "$ref": "#/$defs/catalog" },
+                    "plugins": { "type": "array", "items": {
+                        "type": "object", "required": ["id", "entitled", "available", "reason"],
+                        "properties": {
+                            "id": { "$ref": "#/$defs/id" },
+                            "entitled": { "type": "boolean" },
+                            "available": { "type": "boolean" },
+                            "reason": { "enum": ["plugin_unavailable", "premium_required", null] }
+                        },
+                        "additionalProperties": false
+                    } }
+                },
+                "additionalProperties": false
+            },
             "transport": enumere(&["local", "oaat", "dlna", "openhome", "bluos", "squeezebox", "chromecast",
                                    "airplay", "devialet_air", "browser", "aes67", "sendspin", "hqplayer",
                                    "diretta", "other"]),
@@ -346,6 +425,110 @@ pub fn schema_json_lecture() -> Value {
     ouvrir(&schema_json())
 }
 
+/// Un vérificateur de schéma JSON minimal, limité aux mots-clés que
+/// [`schema_json`] emploie (sert aux tests du serveur, T08) (`pattern` et `maxLength` exceptés : l'id est
+/// vérifié par `id_valide`).
+pub fn conforme(racine: &Value, schema: &Value, v: &Value) -> Result<(), String> {
+    if let Some(r) = schema.get("$ref").and_then(Value::as_str) {
+        let nom = r.strip_prefix("#/$defs/").ok_or("ref")?;
+        return conforme(racine, &racine["$defs"][nom], v);
+    }
+    if let Some(t) = schema.get("type") {
+        let types: Vec<&str> = match t {
+            Value::String(s) => vec![s.as_str()],
+            Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+            _ => return Err("type".into()),
+        };
+        let ok = types.iter().any(|t| match *t {
+            "object" => v.is_object(),
+            "array" => v.is_array(),
+            "string" => v.is_string(),
+            "boolean" => v.is_boolean(),
+            "null" => v.is_null(),
+            "number" => v.is_number(),
+            "integer" => v.is_i64() || v.is_u64(),
+            _ => false,
+        });
+        if !ok {
+            return Err(format!("{v} n'est pas de type {t}"));
+        }
+    }
+    if let Some(c) = schema.get("const")
+        && c != v
+    {
+        return Err(format!("{v} ≠ {c}"));
+    }
+    if let Some(e) = schema.get("enum").and_then(Value::as_array)
+        && !e.contains(v)
+    {
+        return Err(format!("{v} hors de {e:?}"));
+    }
+    if let Some(n) = v.as_f64() {
+        if schema
+            .get("minimum")
+            .and_then(Value::as_f64)
+            .is_some_and(|m| n < m)
+        {
+            return Err(format!("{n} sous le minimum"));
+        }
+        if schema
+            .get("maximum")
+            .and_then(Value::as_f64)
+            .is_some_and(|m| n > m)
+        {
+            return Err(format!("{n} au-dessus du maximum"));
+        }
+    }
+    if let Some(variantes) = schema.get("oneOf").and_then(Value::as_array) {
+        let n = variantes
+            .iter()
+            .filter(|s| conforme(racine, s, v).is_ok())
+            .count();
+        if n != 1 {
+            return Err(format!("{v} : {n} variantes conformes au lieu d'une"));
+        }
+    }
+    if let Some(variantes) = schema.get("anyOf").and_then(Value::as_array)
+        && !variantes.iter().any(|s| conforme(racine, s, v).is_ok())
+    {
+        return Err(format!("{v} : aucune variante conforme"));
+    }
+    if let Some(o) = v.as_object() {
+        if let Some(req) = schema.get("required").and_then(Value::as_array) {
+            for k in req.iter().filter_map(Value::as_str) {
+                if !o.contains_key(k) {
+                    return Err(format!("champ {k} manquant"));
+                }
+            }
+        }
+        let props = schema.get("properties").and_then(Value::as_object);
+        for (k, val) in o {
+            match props.and_then(|p| p.get(k)) {
+                Some(s) => conforme(racine, s, val).map_err(|e| format!("{k}: {e}"))?,
+                None if schema.get("additionalProperties") == Some(&Value::Bool(false)) => {
+                    return Err(format!("champ inconnu {k}"));
+                }
+                None => {}
+            }
+        }
+    }
+    if let (Some(a), Some(items)) = (v.as_array(), schema.get("items")) {
+        for (i, x) in a.iter().enumerate() {
+            conforme(racine, items, x).map_err(|e| format!("[{i}]: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// `v` est-il conforme à la définition `def` du schéma EXACT ([`schema_json`]) ?
+pub fn conforme_au_schema(def: &str, v: &Value) -> Result<(), String> {
+    let s = schema_json();
+    if s["$defs"].get(def).is_none() {
+        return Err(format!("définition {def} absente du schéma"));
+    }
+    conforme(&s, &s["$defs"][def], v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,104 +538,8 @@ mod tests {
     use crate::tess::resolution::{ControleVolume, SourceFlux, VolumeZone};
     use crate::tess::{ContexteValidation, VERSION_CHAINE};
 
-    /// Un vérificateur de schéma JSON minimal, limité aux mots-clés que
-    /// [`schema_json`] emploie (`pattern` et `maxLength` exceptés : l'id est
-    /// vérifié par `id_valide`).
-    fn conforme(racine: &Value, schema: &Value, v: &Value) -> Result<(), String> {
-        if let Some(r) = schema.get("$ref").and_then(Value::as_str) {
-            let nom = r.strip_prefix("#/$defs/").ok_or("ref")?;
-            return conforme(racine, &racine["$defs"][nom], v);
-        }
-        if let Some(t) = schema.get("type") {
-            let types: Vec<&str> = match t {
-                Value::String(s) => vec![s.as_str()],
-                Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
-                _ => return Err("type".into()),
-            };
-            let ok = types.iter().any(|t| match *t {
-                "object" => v.is_object(),
-                "array" => v.is_array(),
-                "string" => v.is_string(),
-                "boolean" => v.is_boolean(),
-                "null" => v.is_null(),
-                "number" => v.is_number(),
-                "integer" => v.is_i64() || v.is_u64(),
-                _ => false,
-            });
-            if !ok {
-                return Err(format!("{v} n'est pas de type {t}"));
-            }
-        }
-        if let Some(c) = schema.get("const")
-            && c != v
-        {
-            return Err(format!("{v} ≠ {c}"));
-        }
-        if let Some(e) = schema.get("enum").and_then(Value::as_array)
-            && !e.contains(v)
-        {
-            return Err(format!("{v} hors de {e:?}"));
-        }
-        if let Some(n) = v.as_f64() {
-            if schema
-                .get("minimum")
-                .and_then(Value::as_f64)
-                .is_some_and(|m| n < m)
-            {
-                return Err(format!("{n} sous le minimum"));
-            }
-            if schema
-                .get("maximum")
-                .and_then(Value::as_f64)
-                .is_some_and(|m| n > m)
-            {
-                return Err(format!("{n} au-dessus du maximum"));
-            }
-        }
-        if let Some(variantes) = schema.get("oneOf").and_then(Value::as_array) {
-            let n = variantes
-                .iter()
-                .filter(|s| conforme(racine, s, v).is_ok())
-                .count();
-            if n != 1 {
-                return Err(format!("{v} : {n} variantes conformes au lieu d'une"));
-            }
-        }
-        if let Some(variantes) = schema.get("anyOf").and_then(Value::as_array)
-            && !variantes.iter().any(|s| conforme(racine, s, v).is_ok())
-        {
-            return Err(format!("{v} : aucune variante conforme"));
-        }
-        if let Some(o) = v.as_object() {
-            if let Some(req) = schema.get("required").and_then(Value::as_array) {
-                for k in req.iter().filter_map(Value::as_str) {
-                    if !o.contains_key(k) {
-                        return Err(format!("champ {k} manquant"));
-                    }
-                }
-            }
-            let props = schema.get("properties").and_then(Value::as_object);
-            for (k, val) in o {
-                match props.and_then(|p| p.get(k)) {
-                    Some(s) => conforme(racine, s, val).map_err(|e| format!("{k}: {e}"))?,
-                    None if schema.get("additionalProperties") == Some(&Value::Bool(false)) => {
-                        return Err(format!("champ inconnu {k}"));
-                    }
-                    None => {}
-                }
-            }
-        }
-        if let (Some(a), Some(items)) = (v.as_array(), schema.get("items")) {
-            for (i, x) in a.iter().enumerate() {
-                conforme(racine, items, x).map_err(|e| format!("[{i}]: {e}"))?;
-            }
-        }
-        Ok(())
-    }
-
     fn strict(def: &str, v: &Value) -> Result<(), String> {
-        let s = schema_json();
-        conforme(&s, &s["$defs"][def], v)
+        conforme_au_schema(def, v)
     }
 
     fn lecture(def: &str, v: &Value) -> Result<(), String> {
@@ -636,5 +723,40 @@ mod tests {
         // Contre-épreuve : un code hors contrat est refusé.
         let faux = json!({ "status": 409, "code": "nope", "detail": "", "plugin_id": null });
         assert!(strict("refusal", &faux).is_err());
+    }
+    #[test]
+    fn la_reponse_du_catalogue_suit_le_schema_et_l_ordre_des_motifs() {
+        let indisponible = |id: &str| id != "declick-live";
+        for premium in [false, true] {
+            let r = ReponseCatalogue::depuis(catalogue_de_reference(), premium, &indisponible);
+            let v = serde_json::to_value(&r).unwrap();
+            strict("catalog_response", &v).unwrap();
+            lecture("catalog_response", &v).unwrap();
+            assert_eq!(serde_json::from_value::<ReponseCatalogue>(v).unwrap(), r);
+            assert_eq!(r.plugins.len(), r.catalog.plugins.len());
+            let etat = |id: &str| r.plugins.iter().find(|p| p.id == id).unwrap().clone();
+            // Indisponible l'emporte sur le droit, comme à la résolution.
+            assert_eq!(
+                etat("declick-live").reason,
+                Some(MotifEtape::PluginUnavailable)
+            );
+            assert!(etat("crossfeed").entitled && etat("crossfeed").reason.is_none());
+            let conv = etat("convolution");
+            assert_eq!(conv.entitled, premium);
+            assert_eq!(
+                conv.reason,
+                (!premium).then_some(MotifEtape::PremiumRequired)
+            );
+        }
+        // Contre-épreuve : un champ de plus n'est pas émis par ce serveur.
+        let mut v = serde_json::to_value(ReponseCatalogue::depuis(
+            catalogue_de_reference(),
+            true,
+            &tout,
+        ))
+        .unwrap();
+        v["plugins"][0]["granted"] = json!(true);
+        assert!(strict("catalog_response", &v).is_err());
+        assert!(conforme_au_schema("nope", &v).is_err());
     }
 }

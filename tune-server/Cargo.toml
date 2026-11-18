@@ -1520,6 +1520,11 @@ path = "tests/crossfeed_ombre_5081.rs"
 name = "tess_migration_routes_t02"
 path = "tests/tess_migration_routes_t02.rs"
 
+# TESS T08 — GET/PUT /zones/{id}/tess et GET /tess/catalog.
+[[test]]
+name = "tess_api_routes_t08"
+path = "tests/tess_api_routes_t08.rs"
+
 # #4602 — le scan complet rend les mêmes comptes à chaque passe, sur SQLite
 # et sur PostgreSQL (`TUNE_TEST_PG_URL`). `autotests = false` plus haut : sans
 # cette cible, le fichier ne serait jamais compilé.
