@@ -425,7 +425,7 @@ impl PlaybackOrchestrator {
             }
         }
 
-        self.play_inner(req, historique).await
+        Box::pin(self.play_inner(req, historique)).await
     }
 
     /// Free-tier gate: block *activating* a brand-new zone once the free active
@@ -590,7 +590,12 @@ impl PlaybackOrchestrator {
         // à l'absence, une énumération à la demande, bornée dans le temps, et
         // seulement ici — au plus une fois par clic. L'appareil revenu passe
         // comme un parc vide (#3737) : `recreate_local_and_play` l'ouvre.
-        if self
+        //
+        // 🔴 #8171 (fil 2708, Windows, ASIO configuré) — l'appareil retrouvé
+        // est ENREGISTRÉ ici, avec l'hôte qui l'a énuméré : laissé à
+        // `recreate_local_and_play`, un nom WASAPI repartait sur l'hôte ASIO
+        // configuré, qui ne le connaît pas, et la lecture échouait encore.
+        if let Some(vue) = self
             .appareil_local_revenu(
                 zone_id,
                 dev_id,
@@ -598,10 +603,13 @@ impl PlaybackOrchestrator {
             )
             .await
         {
+            let enregistree = self.reprendre_la_sortie_locale_revenue(zone_id, &vue).await;
             info!(
                 zone_id,
                 zone_name = %zone.name,
                 device = dev_id,
+                hote = %vue.hote,
+                enregistree,
                 "play_allowed_local_device_found_on_reenumeration"
             );
             return Ok(None);
@@ -890,7 +898,7 @@ impl PlaybackOrchestrator {
         self.playback.set_resolving(req.zone_id, true).await;
 
         let (resolved, resolve_ms) =
-            match self.resoudre_la_demande(&req, play_start, play_gen).await {
+            match Box::pin(self.resoudre_la_demande(&req, play_start, play_gen)).await {
                 Ok(ResoluOuFini::Resolu {
                     resolved,
                     resolve_ms,
@@ -2375,6 +2383,20 @@ impl PlaybackOrchestrator {
                     crate::zones::retard_groupe_mixte_8437::retard_de_depart_de_la_zone(
                         &self.db, zone_id,
                     );
+                // ReplayGain, applied by the output itself for a local DAC.
+                // A PURE zone is left strictly alone: applying a gain would
+                // multiply every sample and the path would no longer be
+                // bit-perfect, which is the one thing PURE promises.
+                // #8689 — un titre Qobuz / TIDAL reçoit le gain que le
+                // service publie, au même calcul qu'une piste locale.
+                // #8968 — calculé AVANT le verrou de la sortie : en mode Auto,
+                // c'est ici que la granularité de la piste lancée est décidée
+                // (une lecture de la file), puis retenue pour toute la piste.
+                let rg = if zone_audiophile {
+                    1.0
+                } else {
+                    crate::audio::replaygain::facteur_de_zone(&self.db, zone_id, piste)
+                };
                 let output = output_arc.lock().await;
                 if let Some(local_output) = output
                     .as_any()
@@ -2397,17 +2419,6 @@ impl PlaybackOrchestrator {
                     // #6522, #6524 — ce que PURE contourne, lu dans les
                     // réglages : la chaîne posée plus bas sera vide en PURE.
                     self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);
-                    // ReplayGain, applied by the output itself for a local DAC.
-                    // A PURE zone is left strictly alone: applying a gain would
-                    // multiply every sample and the path would no longer be
-                    // bit-perfect, which is the one thing PURE promises.
-                    // #8689 — un titre Qobuz / TIDAL reçoit le gain que le
-                    // service publie, au même calcul qu'une piste locale.
-                    let rg = if zone_audiophile {
-                        1.0
-                    } else {
-                        crate::audio::replaygain::facteur_de_zone(&self.db, zone_id, piste)
-                    };
                     // #4685 — posé AVANT le facteur et les processeurs : chacun
                     // recompose le gain de rendu à son installation.
                     local_output
@@ -2487,6 +2498,11 @@ impl PlaybackOrchestrator {
                     // sortie LOCALE uniquement — voir `zone_soft_mute_ms` pour
                     // les sorties qui restent nues et pourquoi.
                     local_output.set_soft_mute_ms(self.zone_soft_mute_ms(zone_id));
+                    // #8696 — la période WASAPI exclusive réglée sur la zone
+                    // (Auto par défaut). Sans effet hors du bras exclusif.
+                    local_output.set_periode_wasapi_ms(
+                        crate::outputs::periode_reglable_8696::reglage_de_zone(&self.db, zone_id),
+                    );
                     // #2211 — fondu enchaîné, sortie LOCALE uniquement : `0` en
                     // PURE et en bit-perfect strict (`duree_appliquee_ms`), et
                     // pour un flux en direct, qui n'a pas de piste suivante et
@@ -3352,14 +3368,18 @@ impl PlaybackOrchestrator {
         let message = Self::message_piste_non_demarree(geste, cause);
         warn!(zone_id, geste, cause, %message, "piste_non_demarree");
         if let Some(ref bus) = self.event_bus {
-            bus.emit(
-                "zone.playback_error",
-                serde_json::json!({
-                    "zone_id": zone_id,
-                    "error": message,
-                    "fatal": true,
-                }),
-            );
+            let mut charge = serde_json::json!({
+                "zone_id": zone_id,
+                "error": message,
+                "fatal": true,
+            });
+            // #8913 — « Suivant » vers une piste YouTube, yt-dlp absent : le
+            // code stable part avec l'événement, pour que le client propose
+            // d'activer la lecture YouTube au lieu d'afficher le texte brut.
+            if cause.contains(crate::streaming::youtube::CODE_LECTURE_YOUTUBE_INACTIVE) {
+                charge["code"] = crate::streaming::youtube::CODE_LECTURE_YOUTUBE_INACTIVE.into();
+            }
+            bus.emit("zone.playback_error", charge);
         }
     }
 

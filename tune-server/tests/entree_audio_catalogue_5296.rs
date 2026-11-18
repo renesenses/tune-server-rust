@@ -68,7 +68,12 @@ async fn entree_audio_est_propose_s_installe_repond_et_se_desinstalle() {
         !routeurs.iter().any(|(n, _)| n == "entree-audio"),
         "opt-in : rien ne tourne avant l'installation"
     );
-    let app = tune_server::routes::router_with_plugins(etat.clone(), routeurs);
+    let app = tune_server::routes::router_with_plugins(etat.clone(), routeurs).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let carte = fiche(&app).await.expect(
         "#5296 : « entree-audio » doit être PROPOSÉ par le gestionnaire des \
          extensions (catalogue), pas installable seulement à la main",
@@ -108,7 +113,12 @@ async fn entree_audio_est_propose_s_installe_repond_et_se_desinstalle() {
         "installé : le greffon doit monter son routeur (montés : {:?})",
         routeurs.iter().map(|(n, _)| n).collect::<Vec<_>>()
     );
-    let app = tune_server::routes::router_with_plugins(etat.clone(), routeurs);
+    let app = tune_server::routes::router_with_plugins(etat.clone(), routeurs).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let carte = fiche(&app).await.expect("un greffon qui tourne est listé");
     assert_eq!(carte["installed"], true, "{carte}");
     assert_eq!(carte["enabled"], true, "{carte}");
@@ -147,7 +157,12 @@ async fn entree_audio_est_propose_s_installe_repond_et_se_desinstalle() {
         !routeurs.iter().any(|(n, _)| n == "entree-audio"),
         "désinstallé"
     );
-    let app = tune_server::routes::router_with_plugins(etat.clone(), routeurs);
+    let app = tune_server::routes::router_with_plugins(etat.clone(), routeurs).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let carte = fiche(&app).await.expect("toujours proposé");
     assert_eq!(carte["installed"], false, "{carte}");
     let (code, _) = appel(&app, "GET", "/api/v1/ext/entree-audio/etat").await;

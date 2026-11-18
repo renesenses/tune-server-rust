@@ -39,7 +39,9 @@ use tune_core::updater::{UpdateChannel, select_release};
 
 fn make_app() -> axum::Router {
     let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
-    tune_server::routes::router(state)
+    tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+    ))
 }
 
 async fn send(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {

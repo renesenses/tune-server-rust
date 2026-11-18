@@ -720,6 +720,11 @@ mod blanc_du_dmp_a6_rc2_4382;
 #[cfg(test)]
 mod bascule_sur_la_suivante_3967;
 
+/// #8863 — les grosses futures du sondage et de la préparation de la
+/// suivante restent en tas : la pile du fil de test ne déborde plus.
+#[cfg(test)]
+mod pile_du_sondeur_8863;
+
 /// #4682 — un déplacement de la barre de progression ne fausse plus
 /// l'enchaînement : ce même banc, la fin de piste rejouée après un
 /// déplacement près de la fin, et un recul après l'armement.
@@ -752,6 +757,12 @@ mod preparation_bornee_5970;
 /// le `SetNext` : la règle s'apprend, et la piste suivante part sans `SetNext`.
 #[cfg(test)]
 mod set_next_coupe_la_piste_6477;
+
+/// #8868 (FiiO K17, fil 2323, rc12) — la règle #6477 relue après un
+/// redémarrage, en DSF natif comme en DoP ; le renderer conforme garde son
+/// `SetNext`.
+#[cfg(test)]
+mod k17_dsf_set_next_8868;
 
 /// #6910 (fil 2412) — le suivant DSD armé sur le renderer DLNA qui annonce le
 /// DSD et `SetNext` ; la garde de #402 gardée pour les autres.

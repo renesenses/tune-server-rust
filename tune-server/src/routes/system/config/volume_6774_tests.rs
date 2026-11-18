@@ -8,7 +8,10 @@ use tower::ServiceExt;
 use tune_core::db::{settings_repo::SettingsRepo, zone_repo::ZoneRepo};
 
 async fn importer(state: &crate::state::AppState, body: Value, apercu: bool) -> Value {
-    let app = crate::routes::router(state.clone());
+    let app =
+        crate::routes::router(state.clone()).layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+        ));
     let uri = if apercu {
         "/api/v1/system/config/import?dry_run=true"
     } else {
