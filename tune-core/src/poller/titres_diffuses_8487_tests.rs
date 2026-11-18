@@ -159,3 +159,108 @@ async fn chaque_morceau_diffuse_est_note_une_fois_sous_sa_station_8487() {
         "l'historique garde UNE ligne de station : {liste:?}"
     );
 }
+
+/// Un renderer ARRÊTÉ (`radio_stopped`, #1522) garde ses métadonnées à jour,
+/// mais personne n'entend le titre : il n'est pas noté.
+#[tokio::test]
+async fn un_renderer_arrete_ne_note_rien_8487() {
+    let db = SqliteDb::open_in_memory().unwrap();
+    db.init_schema().unwrap();
+    crate::db::migrations::run_migrations(&db).unwrap();
+    let db: Arc<dyn DbBackend> = Arc::new(db);
+    let zone = ZoneRepo::with_backend(db.clone())
+        .create("Parents", None, None)
+        .unwrap();
+    let titre = Arc::new(std::sync::Mutex::new("Idles - Grace".to_string()));
+    let url = fausse_station(titre).await;
+    let poller = sondeur(db.clone());
+    let station = db
+        .execute_returning_id(
+            "INSERT INTO listen_history (title, source, source_id, zone_id, context_type, \
+             context_source, context_title) VALUES (?, 'radio', ?, ?, 'radio', 'radio', ?)",
+            &[&STATION as &dyn ToSqlValue, &url, &zone, &STATION],
+        )
+        .unwrap();
+    poller
+        .refresh_radio_metadata_et_noter(zone, &zone_en_radio(&url, STATION), false)
+        .await;
+    assert!(
+        pour_ecoutes(&db, &[station]).unwrap().is_empty(),
+        "renderer arrêté : aucun titre noté"
+    );
+    // Contre-épreuve du banc : le même tour, renderer en lecture, note.
+    poller
+        .refresh_radio_metadata_et_noter(zone, &zone_en_radio(&url, STATION), true)
+        .await;
+    assert_eq!(pour_ecoutes(&db, &[station]).unwrap()[&station].len(), 1);
+}
+
+/// De bout en bout par le VRAI lancement : la ligne de station écrite par
+/// `enregistrer_ecoute_radio` (#7965) porte le `source_id` que le sondeur lit
+/// sur `now_playing` — sans quoi aucun titre ne s'y rangerait jamais.
+#[tokio::test]
+async fn le_lancement_et_le_sondeur_parlent_du_meme_flux_8487() {
+    use crate::outputs::mock::MockOutput;
+    const RENDERER: &str = "dlna:uuid-titres-8487";
+    let db = SqliteDb::open_in_memory().unwrap();
+    db.init_schema().unwrap();
+    crate::db::migrations::run_migrations(&db).unwrap();
+    let db: Arc<dyn DbBackend> = Arc::new(db);
+    let zone = ZoneRepo::with_backend(db.clone())
+        .create("Salon", Some("dlna"), Some(RENDERER))
+        .unwrap();
+    let titre = Arc::new(std::sync::Mutex::new(
+        "King Gizzard & the Lizard Wizard - Rattlesnake".to_string(),
+    ));
+    let url = fausse_station(titre).await;
+    let poller = sondeur(db.clone());
+    poller.outputs.lock().await.register(Box::new(
+        MockOutput::new(RENDERER, "Salon").with_type("dlna"),
+    ));
+    let resultat = tokio::time::timeout(
+        std::time::Duration::from_secs(30),
+        poller.orchestrator.play(crate::orchestrator::PlayRequest {
+            zone_id: zone,
+            output_device_id: Some(RENDERER.into()),
+            source: Some("radio".into()),
+            source_id: Some(url.clone()),
+            title: Some(STATION.into()),
+            album_title: Some(STATION.into()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .expect("le lancement ne reste pas bloqué")
+    .expect("le lancement aboutit");
+    assert!(resultat.output_sent);
+
+    let etat = poller.playback.get_state(zone).await;
+    let lu = etat
+        .now_playing
+        .as_ref()
+        .and_then(|np| np.source_id.clone())
+        .expect("la radio joue");
+    let ecrit: Vec<(i64, Option<String>)> = db
+        .query_many(
+            "SELECT id, source_id FROM listen_history WHERE source = 'radio'",
+            &[],
+        )
+        .unwrap()
+        .iter()
+        .map(|r| (r[0].as_i64().unwrap(), r.get(1).and_then(|v| v.as_string())))
+        .collect();
+    assert_eq!(ecrit.len(), 1, "une ligne de station : {ecrit:?}");
+    assert_eq!(
+        ecrit[0].1.as_deref(),
+        Some(lu.as_str()),
+        "même flux des deux côtés"
+    );
+
+    poller.refresh_radio_metadata(zone, &etat).await;
+    let notes = pour_ecoutes(&db, &[ecrit[0].0]).unwrap();
+    assert_eq!(
+        notes.get(&ecrit[0].0).map(|v| v[0].titre.as_str()),
+        Some("Rattlesnake"),
+        "le titre diffusé se range sous la ligne écrite au lancement"
+    );
+}

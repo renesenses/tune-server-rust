@@ -36,13 +36,24 @@
 //!
 //! # Rattachement
 //!
-//! Un titre se rattache à la DERNIÈRE ligne d'historique de sa zone, et
-//! seulement si c'est la ligne de station du même flux (`source = 'radio'`,
-//! `context_type = 'radio'`, même `source_id`). Sur une zone navigateur, la
-//! ligne de station n'est écrite qu'une fois l'écoute confirmée par le
-//! lecteur (#6066) : avant, rien n'est noté — une écoute non prouvée n'a pas
-//! de titres. Le sondeur repasse au tour suivant, et le titre est noté dès
-//! que la station l'est.
+//! Un titre se rattache à la DERNIÈRE ligne d'historique du groupe de sa zone
+//! (#8107 : une seule zone d'un groupe écrit la ligne de station ; seule la
+//! plus petite zone du groupe note), et seulement si c'est la ligne de
+//! station du même flux (`source = 'radio'`, `context_type = 'radio'`, même
+//! `source_id`). Sur une zone navigateur, la ligne de station n'est écrite
+//! qu'une fois l'écoute confirmée par le lecteur (#6066) : avant, rien n'est
+//! noté ; le sondeur repasse au tour suivant. Un renderer arrêté ne note rien.
+//!
+//! Une ligne restée [`FRAICHEUR_MS`] sans lancement ni titre (radio reprise
+//! le lendemain, relance par `play_without_history`) n'accueille plus de
+//! titres : elle est recopiée à l'heure présente et une nouvelle session
+//! commence — jamais de titre du jour sous la ligne de la veille.
+//!
+//! # Volume
+//!
+//! [`TITRES_GARDES`] titres au plus par ligne (les plus anciens sont effacés
+//! à l'écriture) ; l'historique n'en relit que [`TITRES_PAR_STATION`], borne
+//! posée en SQL.
 //!
 //! # Schéma
 //!
@@ -70,6 +81,15 @@ pub const TITRES_COMPARES: i64 = 3;
 /// Combien de titres une ligne de station rend au plus dans
 /// `GET /library/history` : une nuit d'écoute en compte des centaines.
 pub const TITRES_PAR_STATION: usize = 100;
+
+/// Combien de titres une ligne de station garde au plus : au-delà, les plus
+/// anciens sont effacés à l'écriture ([`noter`]).
+pub const TITRES_GARDES: i64 = 200;
+
+/// Au-delà de ce silence (ni lancement ni titre noté), la ligne de station
+/// n'accueille plus de titres : une nouvelle session commence
+/// ([`station_en_cours`]).
+pub const FRAICHEUR_MS: i64 = 3 * 3600 * 1000;
 
 /// Un titre diffusé, tel que l'historique le rend sous sa station.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -103,6 +123,8 @@ pub enum Notation {
     PasDeStation,
     /// Déjà noté parmi les derniers titres de la même écoute.
     DejaNote,
+    /// Zone compagne d'un groupe : la plus petite zone du groupe note.
+    ZoneCompagne,
 }
 
 fn norme(s: &str) -> String {
@@ -222,38 +244,132 @@ pub fn date_iso(ms: i64) -> String {
         .unwrap_or_default()
 }
 
+/// `listened_at` (`AAAA-MM-JJTHH:MM:SSZ`, ou une forme voisine d'une base
+/// ancienne) en millisecondes. `None` : illisible.
+fn instant_ms(texte: &str) -> Option<i64> {
+    let t = texte.trim();
+    if let Ok(d) = chrono::DateTime::parse_from_rfc3339(t) {
+        return Some(d.timestamp_millis());
+    }
+    [
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S",
+    ]
+    .iter()
+    .find_map(|f| chrono::NaiveDateTime::parse_from_str(t, f).ok())
+    .map(|d| d.and_utc().timestamp_millis())
+}
+
+/// Les zones qui jouent ensemble : `zone_id` et ses compagnes de groupe
+/// (#8107), triées. Une zone seule rend `[zone_id]`.
+fn zones_du_groupe(db: &Arc<dyn DbBackend>, zone_id: i64) -> Vec<i64> {
+    let groupes = crate::zones::groupes_enregistres::lire(
+        &crate::db::settings_repo::SettingsRepo::with_backend(db.clone()),
+    );
+    let mut zones = crate::zones::groupes_enregistres::zones_compagnes(&groupes, zone_id);
+    zones.push(zone_id);
+    zones.sort_unstable();
+    zones.dedup();
+    zones
+}
+
+/// Les colonnes d'une ligne de station recopiées à la relance d'une session
+/// (`listened_at` prend l'heure de la copie, `zone_id` celle qui note).
+const COLONNES_RECOPIEES: &str = "track_id, title, artist_name, album_title, source, \
+     source_id, album_id, duration_ms, cover_url, profile_id, context_type, context_id, \
+     context_position, context_source, context_title, context_cover, album_ref";
+
 /// La ligne de station sous laquelle un titre de `source_id`, sur `zone_id`,
-/// se range : la dernière ligne d'historique de la zone, si c'est elle.
+/// se range, ou `None`.
+///
+/// * La DERNIÈRE ligne d'historique du groupe de la zone (#8107 : une seule
+///   zone du groupe écrit la ligne de station), si c'est la station du même
+///   flux. Sinon rien : la zone joue autre chose, ou son écoute n'est pas
+///   encore confirmée.
+/// * Si cette ligne est PÉRIMÉE — ni écrite ni enrichie d'un titre depuis
+///   [`FRAICHEUR_MS`] (une radio reprise le lendemain sans nouveau lancement,
+///   une relance par `play_without_history`) — une nouvelle session commence :
+///   la ligne est recopiée à l'heure présente et les titres se rangent sous
+///   la copie, jamais sous la veille.
 pub fn station_en_cours(
     db: &Arc<dyn DbBackend>,
     zone_id: i64,
     source_id: &str,
+    maintenant_ms: i64,
 ) -> Result<Option<i64>, String> {
+    let zones = zones_du_groupe(db, zone_id);
+    let marques = vec!["?"; zones.len()].join(", ");
+    let params: Vec<&dyn ToSqlValue> = zones.iter().map(|z| z as &dyn ToSqlValue).collect();
     let ligne = db.query_one(
-        "SELECT id, source, source_id, context_type FROM listen_history \
-         WHERE zone_id = ? ORDER BY id DESC LIMIT 1",
-        &[&zone_id as &dyn ToSqlValue],
+        &format!(
+            "SELECT id, source, source_id, context_type, listened_at FROM listen_history \
+             WHERE zone_id IN ({marques}) ORDER BY id DESC LIMIT 1"
+        ),
+        &params,
     )?;
     let Some(ligne) = ligne else {
         return Ok(None);
     };
-    let id = ligne.first().and_then(|v| v.as_i64());
+    let Some(id) = ligne.first().and_then(|v| v.as_i64()) else {
+        return Ok(None);
+    };
     let source = ligne.get(1).and_then(|v| v.as_string());
     let flux = ligne.get(2).and_then(|v| v.as_string());
     let nature = ligne.get(3).and_then(|v| v.as_string());
-    let est_la_station = source.as_deref() == Some("radio")
-        && nature.as_deref() == Some("radio")
-        && flux.as_deref() == Some(source_id);
-    Ok(id.filter(|_| est_la_station))
+    if source.as_deref() != Some("radio")
+        || nature.as_deref() != Some("radio")
+        || flux.as_deref() != Some(source_id)
+    {
+        return Ok(None);
+    }
+    let ecrite = ligne
+        .get(4)
+        .and_then(|v| v.as_string())
+        .and_then(|t| instant_ms(&t));
+    let dernier_titre = db
+        .query_one(
+            "SELECT MAX(diffuse_le) FROM radio_titres_diffuses WHERE ecoute_id = ?",
+            &[&id as &dyn ToSqlValue],
+        )?
+        .and_then(|r| r.first().and_then(|v| v.as_i64()));
+    let activite = match (ecrite, dernier_titre) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+    // Date illisible et aucun titre : on ne relance rien sur une supposition.
+    let perimee = activite.is_some_and(|a| maintenant_ms - a > FRAICHEUR_MS);
+    if !perimee {
+        return Ok(Some(id));
+    }
+    let copie = db.execute_returning_id(
+        &format!(
+            "INSERT INTO listen_history ({COLONNES_RECOPIEES}, zone_id) \
+             SELECT {COLONNES_RECOPIEES}, ? FROM listen_history WHERE id = ?"
+        ),
+        &[&zone_id as &dyn ToSqlValue, &id],
+    )?;
+    tracing::info!(
+        zone_id,
+        ancienne = id,
+        nouvelle = copie,
+        "radio_session_relancee"
+    );
+    Ok(Some(copie))
 }
 
 /// Note le titre que le flux de `source_id` annonce sur `zone_id`, sous la
 /// ligne de sa station — ou dit pourquoi il ne l'est pas.
 ///
-/// Appelée par le sondeur à chaque lecture des métadonnées d'une radio
-/// (`poller::radio::refresh_radio_metadata`), que le titre ait changé ou
-/// non : un titre lu avant que la station soit notée (zone navigateur pas
-/// encore confirmée) l'est au tour suivant.
+/// Appelée par le sondeur à chaque lecture des métadonnées d'une radio QUI
+/// JOUE (`poller::radio`), que le titre ait changé ou non : un titre lu avant
+/// que la station soit notée (zone navigateur pas encore confirmée) l'est au
+/// tour suivant. Dans un groupe de zones, seule la plus petite zone note :
+/// les autres liraient le même flux.
+///
+/// Au-delà de [`TITRES_GARDES`] titres sous une même ligne, les plus anciens
+/// sont effacés : une radio qui joue jour et nuit ne fait pas grossir la
+/// table sans fin.
 // Un argument par colonne écrite, comme `record_listen`.
 #[allow(clippy::too_many_arguments)]
 pub fn noter(
@@ -269,7 +385,10 @@ pub fn noter(
     if !titre_a_noter(station, artiste, titre) {
         return Ok(Notation::PasUnTitre);
     }
-    let Some(ecoute_id) = station_en_cours(db, zone_id, source_id)? else {
+    if zones_du_groupe(db, zone_id).first() != Some(&zone_id) {
+        return Ok(Notation::ZoneCompagne);
+    }
+    let Some(ecoute_id) = station_en_cours(db, zone_id, source_id, maintenant_ms)? else {
         return Ok(Notation::PasDeStation);
     };
     let derniers = db.query_many(
@@ -289,7 +408,7 @@ pub fn noter(
     let artiste = artiste.map(str::trim).filter(|a| !a.is_empty());
     db.execute(
         "INSERT INTO radio_titres_diffuses \
-         (ecoute_id, diffuse_le, zone_id, station_url, station, titre, artiste, pochette) \
+         (ecoute_id, diffuse_le, zone_id, flux, station, titre, artiste, pochette) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (ecoute_id, diffuse_le) DO NOTHING",
         &[
             &ecoute_id as &dyn ToSqlValue,
@@ -302,11 +421,20 @@ pub fn noter(
             &pochette,
         ],
     )?;
+    let decalage = TITRES_GARDES - 1;
+    db.execute(
+        "DELETE FROM radio_titres_diffuses WHERE ecoute_id = ? AND diffuse_le < \
+         (SELECT diffuse_le FROM radio_titres_diffuses WHERE ecoute_id = ? \
+          ORDER BY diffuse_le DESC LIMIT 1 OFFSET ?)",
+        &[&ecoute_id as &dyn ToSqlValue, &ecoute_id, &decalage],
+    )?;
     Ok(Notation::Ecrit)
 }
 
 /// Les titres diffusés sous chacune des lignes de station `ecoutes`, le plus
-/// récent d'abord, [`TITRES_PAR_STATION`] au plus par ligne.
+/// récent d'abord, [`TITRES_PAR_STATION`] au plus par ligne — borne posée
+/// EN SQL (`ROW_NUMBER`, SQLite ≥ 3.25 et PostgreSQL) : le client web relit
+/// l'historique toutes les quelques secondes.
 pub fn pour_ecoutes(
     db: &Arc<dyn DbBackend>,
     ecoutes: &[i64],
@@ -316,12 +444,16 @@ pub fn pour_ecoutes(
         return Ok(par_ecoute);
     }
     let marques = vec!["?"; ecoutes.len()].join(", ");
-    let params: Vec<&dyn ToSqlValue> = ecoutes.iter().map(|i| i as &dyn ToSqlValue).collect();
+    let plafond = TITRES_PAR_STATION as i64;
+    let mut params: Vec<&dyn ToSqlValue> = ecoutes.iter().map(|i| i as &dyn ToSqlValue).collect();
+    params.push(&plafond);
     let lignes = db.query_many(
         &format!(
-            "SELECT ecoute_id, diffuse_le, zone_id, titre, artiste, pochette \
-             FROM radio_titres_diffuses WHERE ecoute_id IN ({marques}) \
-             ORDER BY ecoute_id, diffuse_le DESC"
+            "SELECT ecoute_id, diffuse_le, zone_id, titre, artiste, pochette FROM ( \
+               SELECT ecoute_id, diffuse_le, zone_id, titre, artiste, pochette, \
+                      ROW_NUMBER() OVER (PARTITION BY ecoute_id ORDER BY diffuse_le DESC) AS rang \
+               FROM radio_titres_diffuses WHERE ecoute_id IN ({marques})) t \
+             WHERE rang <= ? ORDER BY ecoute_id, diffuse_le DESC"
         ),
         &params,
     )?;
@@ -332,11 +464,7 @@ pub fn pour_ecoutes(
         ) else {
             continue;
         };
-        let titres = par_ecoute.entry(ecoute_id).or_default();
-        if titres.len() >= TITRES_PAR_STATION {
-            continue;
-        }
-        titres.push(TitreDiffuse {
+        par_ecoute.entry(ecoute_id).or_default().push(TitreDiffuse {
             ecoute_id,
             diffuse_le,
             zone_id: r.get(2).and_then(|v| v.as_i64()),

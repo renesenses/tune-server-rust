@@ -191,6 +191,202 @@ fn les_statistiques_ne_voient_pas_les_titres_diffuses_8487() {
     );
 }
 
+fn instant(t: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(t)
+        .unwrap()
+        .timestamp_millis()
+}
+
+fn dater(db: &Arc<dyn DbBackend>, id: i64, quand: &str) {
+    db.execute(
+        "UPDATE listen_history SET listened_at = ? WHERE id = ?",
+        &[&quand as &dyn ToSqlValue, &id],
+    )
+    .unwrap();
+}
+
+fn lignes_de_station(db: &Arc<dyn DbBackend>) -> Vec<i64> {
+    db.query_many(
+        "SELECT id FROM listen_history WHERE source = 'radio' ORDER BY id",
+        &[],
+    )
+    .unwrap()
+    .iter()
+    .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+    .collect()
+}
+
+/// Une radio reprise le lendemain sans nouveau lancement : ses titres ne se
+/// rangent pas sous la ligne de la veille, une nouvelle session commence.
+#[test]
+fn une_ligne_de_la_veille_ouvre_une_nouvelle_session_8487() {
+    let (db, zone) = base();
+    let veille = ligne_de_station(&db, zone, FLUX);
+    dater(&db, veille, "2026-11-17T08:00:00Z");
+    // 2 h plus tard : même session.
+    assert_eq!(
+        noter(
+            &db,
+            zone,
+            FLUX,
+            STATION,
+            Some("A"),
+            "Un",
+            None,
+            instant("2026-11-17T10:00:00Z")
+        )
+        .unwrap(),
+        Notation::Ecrit
+    );
+    // 2 h 30 après le dernier titre (4 h 30 après le lancement) : toujours
+    // fraîche, le dernier titre la tient en vie.
+    assert_eq!(
+        noter(
+            &db,
+            zone,
+            FLUX,
+            STATION,
+            Some("B"),
+            "Deux",
+            None,
+            instant("2026-11-17T12:30:00Z")
+        )
+        .unwrap(),
+        Notation::Ecrit
+    );
+    assert_eq!(
+        lignes_de_station(&db),
+        vec![veille],
+        "une seule session jusque-là"
+    );
+    // Le lendemain matin.
+    assert_eq!(
+        noter(
+            &db,
+            zone,
+            FLUX,
+            STATION,
+            Some("C"),
+            "Trois",
+            None,
+            instant("2026-11-18T09:14:00Z")
+        )
+        .unwrap(),
+        Notation::Ecrit
+    );
+    let sessions = lignes_de_station(&db);
+    assert_eq!(
+        sessions.len(),
+        2,
+        "une nouvelle ligne de station : {sessions:?}"
+    );
+    let rendus = pour_ecoutes(&db, &sessions).unwrap();
+    let titres = |id: i64| -> Vec<String> {
+        rendus
+            .get(&id)
+            .map(|v| v.iter().map(|t| t.titre.clone()).collect())
+            .unwrap_or_default()
+    };
+    assert_eq!(
+        titres(veille),
+        vec!["Deux", "Un"],
+        "la veille garde les siens"
+    );
+    assert_eq!(
+        titres(sessions[1]),
+        vec!["Trois"],
+        "le titre du lendemain n'est pas rangé sous la veille"
+    );
+    let copie = HistoryRepo::with_backend(db.clone())
+        .recent_paginated(50, 0)
+        .unwrap()
+        .0;
+    assert!(
+        copie.iter().any(|l| l.id == Some(sessions[1])
+            && l.title == STATION
+            && l.context_type.as_deref() == Some("radio")),
+        "la nouvelle session porte la station : {copie:?}"
+    );
+}
+
+/// Une radio qui joue jour et nuit ne fait pas grossir la table sans fin, et
+/// l'historique n'en relit que les plus récents.
+#[test]
+fn les_titres_d_une_ligne_sont_bornes_8487() {
+    let (db, zone) = base();
+    let station = ligne_de_station(&db, zone, FLUX);
+    for i in 0..(TITRES_GARDES + 5) {
+        assert_eq!(
+            noter(
+                &db,
+                zone,
+                FLUX,
+                STATION,
+                Some("Artiste"),
+                &format!("Titre {i}"),
+                None,
+                i * 1000
+            )
+            .unwrap(),
+            Notation::Ecrit
+        );
+    }
+    assert_eq!(
+        titres(&db),
+        TITRES_GARDES,
+        "les plus anciens sont effacés à l'écriture"
+    );
+    let rendus = pour_ecoutes(&db, &[station]).unwrap();
+    assert_eq!(
+        rendus[&station].len(),
+        TITRES_PAR_STATION,
+        "la lecture est bornée"
+    );
+    assert_eq!(
+        rendus[&station][0].titre,
+        format!("Titre {}", TITRES_GARDES + 4)
+    );
+}
+
+/// Groupe de zones (#8107) : une seule zone écrit la ligne de station du
+/// groupe ; les titres se rangent sous ELLE, notés une fois, quelle que soit
+/// la zone qui l'a écrite.
+#[test]
+fn un_groupe_de_zones_note_une_fois_sous_la_ligne_du_groupe_8487() {
+    let (db, a) = base();
+    let b = ZoneRepo::with_backend(db.clone())
+        .create("Salon", Some("dlna"), Some("uuid:8487-b"))
+        .unwrap();
+    crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .set(
+            crate::zones::groupes_enregistres::CLE_ZONE_GROUPS,
+            &serde_json::json!([{"id": 1, "zone_ids": [a, b], "leader_zone_id": a}]).to_string(),
+        )
+        .unwrap();
+    // La veille, B jouait seule la même station.
+    let veille_b = ligne_de_station(&db, b, FLUX);
+    dater(&db, veille_b, "2026-11-17T08:00:00Z");
+    // Aujourd'hui, le groupe : c'est B qui a écrit la ligne du groupe.
+    let groupe = ligne_de_station(&db, b, FLUX);
+    let n = |z: i64, t: &str| noter(&db, z, FLUX, STATION, Some("X"), t, None, 1_000).unwrap();
+    assert_eq!(
+        n(b, "Rattlesnake"),
+        Notation::ZoneCompagne,
+        "une seule zone du groupe note"
+    );
+    assert_eq!(n(a, "Rattlesnake"), Notation::Ecrit);
+    let rendus = pour_ecoutes(&db, &[veille_b, groupe]).unwrap();
+    assert!(
+        !rendus.contains_key(&veille_b),
+        "rien sous la ligne de la veille"
+    );
+    assert_eq!(
+        rendus[&groupe].len(),
+        1,
+        "le titre est sous la ligne du groupe"
+    );
+}
+
 /// La même écriture et la même lecture sur un vrai PostgreSQL : la table
 /// (`ENSURE_TABLES`), la jointure à `listen_history`, les marqueurs `?`
 /// traduits, l'insertion sans colonne `id` (#3256). Sautée sans

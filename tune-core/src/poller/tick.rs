@@ -1518,8 +1518,10 @@ impl PositionPoller {
                 // distincts pour un seul probleme (#1522, #1492).
                 //
                 // La garde sur le peripherique de sortie, elle, est tombee
-                // avec #1536.
-                self.refresh_radio_metadata(zone_id, zone_state).await;
+                // avec #1536. Seule la NOTE du titre dans l'historique (#8487)
+                // attend un renderer qui joue.
+                self.refresh_radio_metadata_et_noter(zone_id, zone_state, !radio_stopped)
+                    .await;
 
                 // Sync metrics and skip the rest of the loop (no gapless/track-end).
                 self.shared_metrics.lock().await.insert(
