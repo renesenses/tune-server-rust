@@ -184,6 +184,15 @@ impl Etage {
         self.phases_inv.len() * std::mem::size_of::<f64>()
     }
 
+    /// Oublie l'historique et la phase, SANS allouer : l'étage repart comme
+    /// neuf (TESS T11a, `EtageTess::reinitialiser` dans le fil audio).
+    pub fn reinitialiser(&mut self) {
+        self.hist.iter_mut().for_each(|x| *x = 0.0);
+        self.w = 0;
+        self.prochaine_pos = 0;
+        self.entrees = 0;
+    }
+
     /// Consomme des trames entrelacées, pousse les trames de sortie.
     pub fn traiter(&mut self, entree: &[f64], sortie: &mut Vec<f64>) {
         let c = self.canaux;
@@ -299,6 +308,17 @@ impl Surechantillonneur {
         self.latence_theorique_trames_entree() * 1000.0 / self.plan.de as f64
     }
 
+    /// Remet l'interpolateur à neuf sans allouer (voir [`Etage::reinitialiser`]) :
+    /// sa sortie, ensuite, est celle d'un `Surechantillonneur` tout juste
+    /// construit.
+    pub fn reinitialiser(&mut self) {
+        self.etage1.reinitialiser();
+        if let Some(e2) = &mut self.etage2 {
+            e2.reinitialiser();
+        }
+        self.inter.clear();
+    }
+
     pub fn traiter(&mut self, entree: &[f64], sortie: &mut Vec<f64>) {
         match &mut self.etage2 {
             None => self.etage1.traiter(entree, sortie),
@@ -352,6 +372,22 @@ mod tests {
             "{}",
             sortie.len()
         );
+    }
+
+    #[test]
+    fn reinitialiser_rend_un_interpolateur_neuf() {
+        let c = par_id("polyvalent").unwrap();
+        let entree: Vec<f64> = (0..2 * 700).map(|i| (i as f64 * 0.013).sin()).collect();
+        let mut neuf = Surechantillonneur::nouveau(&c, 48_000, 192_000, 2).unwrap();
+        let mut attendu = Vec::new();
+        neuf.traiter(&entree, &mut attendu);
+        let mut s = Surechantillonneur::nouveau(&c, 48_000, 192_000, 2).unwrap();
+        let mut jete = Vec::new();
+        s.traiter(&entree[..2 * 333], &mut jete);
+        s.reinitialiser();
+        let mut sortie = Vec::new();
+        s.traiter(&entree, &mut sortie);
+        assert_eq!(sortie, attendu);
     }
 
     #[test]

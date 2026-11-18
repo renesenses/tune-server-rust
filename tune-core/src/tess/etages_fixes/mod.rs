@@ -14,7 +14,9 @@
 //! - [`QuantificationMiseEnForme`] : l'étape finale `noise_shaped` (TPDF et
 //!   `off` sont la `QuantificationPcm` de T03) ;
 //! - [`choisir_etape_finale`] : PCM ou modulateur DSD (T11b), d'après la
-//!   résolution.
+//!   résolution ;
+//! - [`EtageUpsampling`] (T11a) : l'upsampling PCM en `f64`, changement de
+//!   filtre à chaud, sans la réserve de 3 dB de #7614.
 //!
 //! Ce module ne branche RIEN dans la lecture : l'exécuteur de T03 monte ces
 //! étages (`outputs/local.rs`), une fois fusionné.
@@ -24,6 +26,7 @@ mod headroom;
 mod mise_en_forme;
 mod niveau;
 mod rampe;
+mod upsampling;
 mod volume;
 
 #[cfg(test)]
@@ -34,4 +37,8 @@ pub use headroom::{EtageHeadroom, ID_HEADROOM};
 pub use mise_en_forme::{QuantificationMiseEnForme, formeur_pour};
 pub use niveau::{BilanDeNiveau, EntreesNiveau, GainDeRendu};
 pub use rampe::{RAMPE_MS, decibels, lineaire};
+pub use upsampling::{
+    ChangementUpsampling, EtageUpsampling, ID_UPSAMPLING, MotifUpsampling, ReglagesUpsamplingPcm,
+    negocier, planifier_changement, transport_porte_l_upsampling,
+};
 pub use volume::{ConsigneVolume, EtageVolume, ID_VOLUME};
