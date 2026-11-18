@@ -24,6 +24,7 @@
 pub mod api;
 pub mod chaine;
 pub mod etage;
+pub mod etages_fixes;
 pub mod greffon;
 pub mod prereglages;
 pub mod resolution;

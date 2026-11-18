@@ -416,14 +416,16 @@ impl ChaineTess {
             volume.effective = false;
             volume.reason = Some(MotifEtape::VolumeNotSoftware);
         } else if volume.requested
-            && let Some((
-                m @ (MotifEtape::OutsideTess | MotifEtape::PureMode | MotifEtape::DsdSourceNative),
-                d,
-            )) = &blocage
+            && let Some((m @ (MotifEtape::OutsideTess | MotifEtape::DsdSourceNative), d)) = &blocage
         {
             // Le volume est un réglage de zone : « Bypass all » et une chaîne
-            // illisible ne l'éteignent pas ; hors TESS, en Pure ou en DSD
-            // natif, il n'est pas appliqué en logiciel.
+            // illisible ne l'éteignent pas ; hors TESS ou en DSD natif, il
+            // n'est pas appliqué en logiciel.
+            //
+            // T07 — en Pure, il RESTE appliqué : c'est le comportement réel
+            // (`audio::audiophile`, `effective_volume`). Seul le verrou
+            // `audiophile_lock_volume` (inactif par défaut) le tient à 100 %,
+            // et la consigne arrive alors à 0 dB : rien n'est demandé.
             volume.eteindre(*m, d.clone());
         }
         let etat_volume = EtatVolume {
@@ -782,14 +784,22 @@ mod tests {
     fn pure_et_chaine_vide_sont_bit_perfect() {
         let mut x = ctx(TransportZone::Local);
         x.pure = true;
+        // Pure avec le verrou de volume (consigne tenue à 0 dB).
+        x.volume.db = 0.0;
         let r = resoudre(&maquette_a1(), &x);
         assert_eq!(r.badge, Badge::BitPerfect);
         assert_eq!(effectives(&r), [Source, Output]);
-        let vol = r.etapes.iter().find(|e| e.code == Volume).unwrap();
-        assert_eq!(vol.reason, Some(MotifEtape::PureMode));
         let q = r.etapes.iter().find(|e| e.code == Quantization).unwrap();
         assert!(!q.effective);
         assert_eq!(q.detail.as_deref(), Some("Bit-perfect"));
+        // T07 — Pure SANS verrou (le défaut) : le volume logiciel reste
+        // appliqué, comme aujourd'hui ; le badge ne ment pas.
+        x.volume.db = -18.0;
+        let r = resoudre(&maquette_a1(), &x);
+        assert_eq!(effectives(&r), [Source, Volume, Quantization, Output]);
+        assert_eq!(r.badge, Badge::ProcessedByTess);
+        let conv = greffon(&r, "convolution");
+        assert_eq!(conv.reason, Some(MotifEtape::PureMode));
         // Chaîne vide et volume à 0 dB : bit-perfect aussi.
         let mut x = ctx(TransportZone::Local);
         x.volume.db = 0.0;
