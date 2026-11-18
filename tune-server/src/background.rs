@@ -4365,9 +4365,18 @@ mod tests_licence_proprietaire_battement {
             "tune_core::cloud::ecoutes_au_compte::spawn(",
             "tune_core::cloud::notes_communautaires::spawn(",
             "tune_core::cloud::mesures_communautaires::spawn(",
-            "crate::routes::library::apports_qobuz::armer_la_passe(state);",
-            "crate::routes::library::renvoi_images_artistes::armer(state);",
-            "crate::routes::library::identification_lot::nuit::spawn_passe_de_nuit(state);",
+            concat!(
+                "crate::routes::library::apports_qobuz::",
+                "armer_la_passe(state);"
+            ),
+            concat!(
+                "crate::routes::library::renvoi_images_artistes::",
+                "armer(state);"
+            ),
+            concat!(
+                "crate::routes::library::identification_lot::nuit::",
+                "spawn_passe_de_nuit(state);"
+            ),
         ] {
             // Une seule occurrence : un second appel non gardé plus bas ne doit
             // pas passer inaperçu derrière le premier, gardé.
