@@ -85,13 +85,29 @@ async fn activer(state: &AppState, adresse: &str, corps: &str) -> (StatusCode, V
 #[tokio::test]
 async fn l_etat_dit_si_un_code_est_necessaire() {
     let state = new_state();
-    let (st, v) = appel(&state, AUTRE_HOTE_DU_LAN, Method::GET, "/api/v1/auth/activation", None, None).await;
+    let (st, v) = appel(
+        &state,
+        AUTRE_HOTE_DU_LAN,
+        Method::GET,
+        "/api/v1/auth/activation",
+        None,
+        None,
+    )
+    .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert_eq!(v["auth_enabled"], false);
     assert_eq!(v["from_this_machine"], false);
     assert_eq!(v["code_required"], true);
     assert_eq!(v["admin_username"], "default");
-    let (_, v) = appel(&state, CETTE_MACHINE, Method::GET, "/api/v1/auth/activation", None, None).await;
+    let (_, v) = appel(
+        &state,
+        CETTE_MACHINE,
+        Method::GET,
+        "/api/v1/auth/activation",
+        None,
+        None,
+    )
+    .await;
     assert_eq!(v["from_this_machine"], true);
     assert_eq!(v["code_required"], false);
 }
@@ -105,8 +121,9 @@ async fn un_tiers_du_lan_sans_code_est_refuse() {
     assert!(!active(&state));
     assert_eq!(mot_de_passe_admin(&state), None);
     // Relayé (vu de 127.0.0.1, émis ailleurs) : pas « cette machine ».
-    let app = tune_server::routes::router(state.clone())
-        .layer(MockConnectInfo(CETTE_MACHINE.parse::<SocketAddr>().unwrap()));
+    let app = tune_server::routes::router(state.clone()).layer(MockConnectInfo(
+        CETTE_MACHINE.parse::<SocketAddr>().unwrap(),
+    ));
     let req = Request::post("/api/v1/auth/activation")
         .header(header::CONTENT_TYPE, "application/json")
         .header("x-tune-relais", "1")
@@ -121,18 +138,39 @@ async fn un_tiers_du_lan_sans_code_est_refuse() {
 async fn un_code_faux_est_refuse_et_cinq_essais_detruisent_le_code() {
     let state = new_state();
     // La route écrit le code dans le journal et ne le rend pas.
-    let (st, v) = appel(&state, AUTRE_HOTE_DU_LAN, Method::POST, "/api/v1/auth/activation/code", None, None).await;
+    let (st, v) = appel(
+        &state,
+        AUTRE_HOTE_DU_LAN,
+        Method::POST,
+        "/api/v1/auth/activation/code",
+        None,
+        None,
+    )
+    .await;
     assert_eq!(st, StatusCode::OK, "{v}");
-    assert!(v.get("code").is_none(), "le code ne sort jamais par l'API : {v}");
+    assert!(
+        v.get("code").is_none(),
+        "le code ne sort jamais par l'API : {v}"
+    );
 
     // Ce que l'exploitant lit dans le journal.
     let code = tune_server::auth::emettre_code_activation(&state);
-    let (st, v) = activer(&state, AUTRE_HOTE_DU_LAN, r#"{"password":"pirate-1234","code":"AAAAAAAAAA"}"#).await;
+    let (st, v) = activer(
+        &state,
+        AUTRE_HOTE_DU_LAN,
+        r#"{"password":"pirate-1234","code":"AAAAAAAAAA"}"#,
+    )
+    .await;
     assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
     assert_eq!(v["error"], "activation_code_invalid", "{v}");
     assert!(!active(&state));
     for _ in 1..tune_server::auth::ESSAIS_CODE_ACTIVATION {
-        activer(&state, AUTRE_HOTE_DU_LAN, r#"{"password":"pirate-1234","code":"BBBBBBBBBB"}"#).await;
+        activer(
+            &state,
+            AUTRE_HOTE_DU_LAN,
+            r#"{"password":"pirate-1234","code":"BBBBBBBBBB"}"#,
+        )
+        .await;
     }
     // Le code juste ne vaut plus rien après cinq essais faux.
     let corps = format!(r#"{{"password":"proprio-1234","code":"{code}"}}"#);
@@ -149,7 +187,10 @@ async fn un_mot_de_passe_trop_court_ne_consomme_pas_le_code() {
     let corps = format!(r#"{{"password":"court","code":"{code}"}}"#);
     let (st, v) = activer(&state, AUTRE_HOTE_DU_LAN, &corps).await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
-    let corps = format!(r#"{{"password":"proprio-1234","code":"{}"}}"#, code.to_lowercase());
+    let corps = format!(
+        r#"{{"password":"proprio-1234","code":"{}"}}"#,
+        code.to_lowercase()
+    );
     let (st, v) = activer(&state, AUTRE_HOTE_DU_LAN, &corps).await;
     assert_eq!(st, StatusCode::OK, "{v}");
 }
@@ -167,7 +208,15 @@ async fn le_code_juste_active_et_ne_sert_qu_une_fois() {
     let jeton = v["token"].as_str().unwrap().to_string();
 
     // Le jeton rendu est celui d'un administrateur.
-    let (st, v) = appel(&state, AUTRE_HOTE_DU_LAN, Method::GET, "/api/v1/auth/me", Some(&jeton), None).await;
+    let (st, v) = appel(
+        &state,
+        AUTRE_HOTE_DU_LAN,
+        Method::GET,
+        "/api/v1/auth/me",
+        Some(&jeton),
+        None,
+    )
+    .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     // Le mot de passe choisi ouvre la session administrateur.
     let (st, v) = appel(
@@ -199,10 +248,26 @@ async fn le_code_juste_active_et_ne_sert_qu_une_fois() {
     .await;
     assert_eq!(st, StatusCode::CONFLICT, "{v}");
     assert_eq!(v["error"], "auth_already_enabled");
-    let (st, _) = appel(&state, CETTE_MACHINE, Method::POST, "/api/v1/auth/activation/code", Some(&jeton), None).await;
+    let (st, _) = appel(
+        &state,
+        CETTE_MACHINE,
+        Method::POST,
+        "/api/v1/auth/activation/code",
+        Some(&jeton),
+        None,
+    )
+    .await;
     assert_eq!(st, StatusCode::CONFLICT);
     // L'état reste lisible sans jeton.
-    let (st, v) = appel(&state, AUTRE_HOTE_DU_LAN, Method::GET, "/api/v1/auth/activation", None, None).await;
+    let (st, v) = appel(
+        &state,
+        AUTRE_HOTE_DU_LAN,
+        Method::GET,
+        "/api/v1/auth/activation",
+        None,
+        None,
+    )
+    .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert_eq!(v["auth_enabled"], true);
     assert!(v["admin_username"].is_null());
@@ -223,7 +288,15 @@ async fn depuis_cette_machine_aucun_code_n_est_demande() {
 async fn les_jetons_emis_avant_l_activation_ne_valent_plus_rien() {
     let state = new_state();
     // Tout est ouvert : un tiers du LAN se fabrique un jeton et une clé.
-    let (st, v) = appel(&state, AUTRE_HOTE_DU_LAN, Method::POST, "/api/v1/auth/token", None, Some("{}")).await;
+    let (st, v) = appel(
+        &state,
+        AUTRE_HOTE_DU_LAN,
+        Method::POST,
+        "/api/v1/auth/token",
+        None,
+        Some("{}"),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     let jeton_ancien = v["token"].as_str().unwrap().to_string();
     let (st, v) = appel(
@@ -237,7 +310,15 @@ async fn les_jetons_emis_avant_l_activation_ne_valent_plus_rien() {
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     let session_ancienne = v["token"].as_str().unwrap().to_string();
-    let (st, v) = appel(&state, AUTRE_HOTE_DU_LAN, Method::POST, "/api/v1/auth/api-key", None, Some("{}")).await;
+    let (st, v) = appel(
+        &state,
+        AUTRE_HOTE_DU_LAN,
+        Method::POST,
+        "/api/v1/auth/api-key",
+        None,
+        Some("{}"),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     let cle = v["key"].as_str().unwrap().to_string();
 
@@ -245,19 +326,33 @@ async fn les_jetons_emis_avant_l_activation_ne_valent_plus_rien() {
     assert_eq!(st, StatusCode::OK, "{v}");
 
     for j in [&jeton_ancien, &session_ancienne] {
-        let (st, _) = appel(&state, AUTRE_HOTE_DU_LAN, Method::GET, "/api/v1/zones", Some(j), None).await;
+        let (st, _) = appel(
+            &state,
+            AUTRE_HOTE_DU_LAN,
+            Method::GET,
+            "/api/v1/zones",
+            Some(j),
+            None,
+        )
+        .await;
         assert_eq!(st, StatusCode::UNAUTHORIZED);
     }
-    let app = tune_server::routes::router(state.clone())
-        .layer(MockConnectInfo(AUTRE_HOTE_DU_LAN.parse::<SocketAddr>().unwrap()));
+    let app = tune_server::routes::router(state.clone()).layer(MockConnectInfo(
+        AUTRE_HOTE_DU_LAN.parse::<SocketAddr>().unwrap(),
+    ));
     let req = Request::get("/api/v1/zones")
         .header(header::AUTHORIZATION, format!("ApiKey {cle}"))
         .header("x-api-key", cle.as_str())
         .body(Body::empty())
         .unwrap();
-    assert_eq!(app.oneshot(req).await.unwrap().status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
-        SettingsRepo::with_backend(state.backend.clone()).get("api_key").unwrap(),
+        app.oneshot(req).await.unwrap().status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        SettingsRepo::with_backend(state.backend.clone())
+            .get("api_key")
+            .unwrap(),
         None
     );
 }
@@ -275,14 +370,29 @@ async fn le_profil_default_n_est_pas_reclame_depuis_le_lan() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(mot_de_passe_admin(&state), None, "le mot de passe du tiers n'est pas enregistré");
+    assert_eq!(
+        mot_de_passe_admin(&state),
+        None,
+        "le mot de passe du tiers n'est pas enregistré"
+    );
 }
 
 #[tokio::test]
 async fn auth_config_n_active_que_depuis_cette_machine() {
     let state = new_state();
-    for corps in [r#"{"auth_enabled":true}"#, r#"{"jwt_secret":"secret-du-tiers"}"#] {
-        let (st, v) = appel(&state, AUTRE_HOTE_DU_LAN, Method::POST, "/api/v1/auth/config", None, Some(corps)).await;
+    for corps in [
+        r#"{"auth_enabled":true}"#,
+        r#"{"jwt_secret":"secret-du-tiers"}"#,
+    ] {
+        let (st, v) = appel(
+            &state,
+            AUTRE_HOTE_DU_LAN,
+            Method::POST,
+            "/api/v1/auth/config",
+            None,
+            Some(corps),
+        )
+        .await;
         assert_eq!(st, StatusCode::FORBIDDEN, "{corps} : {v}");
         assert!(!active(&state));
     }
@@ -291,7 +401,136 @@ async fn auth_config_n_active_que_depuis_cette_machine() {
         reglages.get("jwt_secret").unwrap().as_deref(),
         Some("secret-du-tiers")
     );
-    let (st, v) = appel(&state, CETTE_MACHINE, Method::POST, "/api/v1/auth/config", None, Some(r#"{"auth_enabled":true}"#)).await;
+    let (st, v) = appel(
+        &state,
+        CETTE_MACHINE,
+        Method::POST,
+        "/api/v1/auth/config",
+        None,
+        Some(r#"{"auth_enabled":true}"#),
+    )
+    .await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert!(active(&state));
+}
+
+fn existe(state: &AppState, nom: &str) -> bool {
+    state
+        .backend
+        .query_one(
+            "SELECT COUNT(*) FROM profiles WHERE username = ?",
+            &[&nom as &dyn tune_core::db::backend::ToSqlValue],
+        )
+        .ok()
+        .flatten()
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0)
+        > 0
+}
+
+#[tokio::test]
+async fn un_tiers_du_lan_ne_cree_plus_de_compte_la_machine_si() {
+    let state = new_state();
+    let corps = r#"{"username":"intrus","password":"pirate-1234"}"#;
+    let (st, v) = appel(
+        &state,
+        AUTRE_HOTE_DU_LAN,
+        Method::POST,
+        "/api/v1/auth/register",
+        None,
+        Some(corps),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{v}");
+    assert_eq!(v["reason"], "not_local");
+    assert!(!existe(&state, "intrus"));
+    let (st, v) = appel(
+        &state,
+        CETTE_MACHINE,
+        Method::POST,
+        "/api/v1/auth/register",
+        None,
+        Some(r#"{"username":"famille","password":"famille-1234"}"#),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "{v}");
+    assert!(existe(&state, "famille"));
+}
+
+/// Un compte créé avant l'activation (par l'ancien serveur, ou depuis la
+/// machine) est listé ; l'activation peut le supprimer, jamais l'administrateur.
+#[tokio::test]
+async fn l_activation_supprime_les_comptes_non_reconnus_et_garde_l_admin() {
+    let state = new_state();
+    for nom in ["etranger", "famille"] {
+        let corps = format!(r#"{{"username":"{nom}","password":"compte-1234"}}"#);
+        let (st, v) = appel(
+            &state,
+            CETTE_MACHINE,
+            Method::POST,
+            "/api/v1/auth/register",
+            None,
+            Some(&corps),
+        )
+        .await;
+        assert_eq!(st, StatusCode::CREATED, "{v}");
+    }
+    // Un profil d'écoute sans mot de passe n'est pas un compte : non listé.
+    tune_core::db::profile_repo::ProfileRepo::with_backend(state.backend.clone())
+        .create("salon", None, None)
+        .unwrap();
+
+    let (_, v) = appel(
+        &state,
+        AUTRE_HOTE_DU_LAN,
+        Method::GET,
+        "/api/v1/auth/activation",
+        None,
+        None,
+    )
+    .await;
+    let comptes = v["accounts"].as_array().unwrap().clone();
+    let noms: Vec<&str> = comptes
+        .iter()
+        .filter_map(|c| c["username"].as_str())
+        .collect();
+    assert_eq!(noms, ["default", "etranger", "famille"], "{v}");
+    let admin = comptes.iter().find(|c| c["username"] == "default").unwrap();
+    assert_eq!(admin["role"], "admin");
+    assert_eq!(admin["deletable"], false);
+    assert!(comptes.iter().all(|c| c.get("created_at").is_some()));
+    let id_etranger = comptes
+        .iter()
+        .find(|c| c["username"] == "etranger")
+        .unwrap()["id"]
+        .as_i64()
+        .unwrap();
+    let id_admin = admin["id"].as_i64().unwrap();
+
+    // L'administrateur ne se supprime jamais.
+    let corps = format!(r#"{{"password":"proprio-1234","delete_accounts":[{id_admin}]}}"#);
+    let (st, v) = activer(&state, CETTE_MACHINE, &corps).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"], "account_not_deletable");
+    assert!(!active(&state));
+
+    let corps = format!(r#"{{"password":"proprio-1234","delete_accounts":[{id_etranger}]}}"#);
+    let (st, v) = activer(&state, CETTE_MACHINE, &corps).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["deleted_accounts"], serde_json::json!([id_etranger]));
+    assert!(active(&state));
+    assert!(!existe(&state, "etranger"));
+    assert!(existe(&state, "famille"));
+    assert!(existe(&state, "default"));
+    assert!(existe(&state, "salon"));
+    let (st, _) = appel(
+        &state,
+        AUTRE_HOTE_DU_LAN,
+        Method::POST,
+        "/api/v1/auth/login",
+        None,
+        Some(r#"{"username":"default","password":"proprio-1234"}"#),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
 }

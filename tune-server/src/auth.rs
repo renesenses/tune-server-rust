@@ -784,10 +784,16 @@ const ENTETES_DE_MANDATAIRE: &[&str] = &[
 /// `TUNE_ALLOWED_HOSTS`) ? Alors le bouclage n'est pas une preuve (même
 /// principe que [`crate::routes::appliance::bouclage_fiable`]).
 pub fn derriere_un_mandataire(entetes: &axum::http::HeaderMap) -> bool {
-    ENTETES_DE_MANDATAIRE.iter().any(|e| entetes.contains_key(*e))
+    ENTETES_DE_MANDATAIRE
+        .iter()
+        .any(|e| entetes.contains_key(*e))
         || mandataire_declare(
-            std::env::var(crate::garde_origine::VARIABLE_ORIGINES).ok().as_deref(),
-            std::env::var(crate::garde_origine::VARIABLE_HOTES).ok().as_deref(),
+            std::env::var(crate::garde_origine::VARIABLE_ORIGINES)
+                .ok()
+                .as_deref(),
+            std::env::var(crate::garde_origine::VARIABLE_HOTES)
+                .ok()
+                .as_deref(),
         )
 }
 
@@ -885,7 +891,10 @@ pub fn router() -> Router<AppState> {
         .route("/token", post(create_token))
         .route("/api-key", get(get_api_key).post(generate_api_key))
         .route("/config", get(auth_config).post(set_auth_config))
-        .route("/activation", get(etat_activation).post(activer_l_authentification))
+        .route(
+            "/activation",
+            get(etat_activation).post(activer_l_authentification),
+        )
         .route("/activation/code", post(demander_un_code_d_activation))
 }
 
@@ -902,6 +911,7 @@ struct RegisterRequest {
 
 async fn register(
     State(state): State<AppState>,
+    DepuisCetteMachine(cette_machine): DepuisCetteMachine,
     appelant: Option<AuthUser>,
     headers: axum::http::HeaderMap,
     Json(body): Json<RegisterRequest>,
@@ -913,6 +923,21 @@ async fn register(
     let settings = SettingsRepo::with_backend(state.backend.clone());
     if let Err(resp) = ensure_admin_if_auth_enabled(&settings, appelant.as_ref()) {
         return resp;
+    }
+    // Authentification coupée : un compte créé par un tiers du réseau
+    // survivrait à l'activation. Seulement depuis cette machine (mêmes
+    // règles que `AdminOuCetteMachine`, mandataire inverse compris).
+    if !authentification_active(&state) && !cette_machine {
+        tracing::warn!("inscription_refusee_hors_machine_sans_authentification");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "auth_required",
+                "reason": "not_local",
+                "message": "While authentication is disabled, accounts can only be created from this machine (localhost). Enable authentication first.",
+            })),
+        )
+            .into_response();
     }
     let cree_par_un_administrateur = appelant.is_some();
     let username = body.username.trim().to_string();
@@ -1603,6 +1628,45 @@ fn compte_administrateur(state: &AppState) -> Option<(i64, String)> {
         })
 }
 
+/// Les comptes qui peuvent se connecter (un mot de passe enregistré) et le
+/// compte administrateur : ce que l'écran d'activation propose de revoir.
+fn comptes_existants(state: &AppState, admin: Option<i64>) -> Vec<Value> {
+    state
+        .backend
+        .query_many(
+            "SELECT id, username, created_at, is_admin, password_hash, password_hash_v2 \
+             FROM profiles ORDER BY id",
+            &[],
+        )
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|r| {
+            let id = r.first().and_then(|v| v.as_i64())?;
+            let nom = r.get(1).and_then(|v| v.as_string())?;
+            let cree = r.get(2).and_then(|v| v.as_string());
+            let est_admin = r.get(3).and_then(|v| v.as_i64()).unwrap_or(0) != 0
+                || r.get(3).and_then(|v| v.as_bool()).unwrap_or(false);
+            let a_un_mot_de_passe = [r.get(4), r.get(5)]
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_string())
+                .any(|h| !h.is_empty());
+            let administrateur = est_admin || Some(id) == admin;
+            if !a_un_mot_de_passe && !administrateur {
+                // Un profil d'écoute sans mot de passe n'ouvre aucune session.
+                return None;
+            }
+            Some(json!({
+                "id": id,
+                "username": nom,
+                "created_at": cree,
+                "role": if administrateur { "admin" } else { "user" },
+                "deletable": !administrateur,
+            }))
+        })
+        .collect()
+}
+
 /// `GET /auth/activation` — ce que l'écran d'activation doit afficher.
 async fn etat_activation(
     State(state): State<AppState>,
@@ -1614,6 +1678,11 @@ async fn etat_activation(
         "from_this_machine": cette_machine,
         "code_required": !active && !cette_machine,
         "admin_username": if active { None } else { compte_administrateur(&state).map(|(_, u)| u) },
+        "accounts": if active {
+            Vec::new()
+        } else {
+            comptes_existants(&state, compte_administrateur(&state).map(|(id, _)| id))
+        },
         "min_password_length": 8,
     }))
 }
@@ -1638,6 +1707,10 @@ struct ActivationRequest {
     password: String,
     #[serde(default)]
     code: Option<String>,
+    /// Comptes à supprimer avant l'activation (ceux qu'on ne reconnaît pas).
+    /// Jamais le compte administrateur.
+    #[serde(default)]
+    delete_accounts: Vec<i64>,
 }
 
 /// `POST /auth/activation` — pose le mot de passe du compte administrateur
@@ -1685,6 +1758,27 @@ async fn activer_l_authentification(
         )
             .into_response();
     };
+    // Les comptes à supprimer : seulement des comptes listés par l'écran,
+    // jamais l'administrateur. Une liste invalide refuse tout.
+    let supprimables: std::collections::HashSet<i64> = comptes_existants(&state, Some(id))
+        .iter()
+        .filter(|c| c["deletable"] == true)
+        .filter_map(|c| c["id"].as_i64())
+        .collect();
+    if let Some(intrus) = body
+        .delete_accounts
+        .iter()
+        .find(|i| **i == id || !supprimables.contains(i))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "account_not_deletable",
+                "id": intrus,
+            })),
+        )
+            .into_response();
+    }
     let hachage = match hash_password(&body.password) {
         Ok(h) => h,
         Err(e) => {
@@ -1706,6 +1800,17 @@ async fn activer_l_authentification(
         )
             .into_response();
     }
+    let mut supprimes = Vec::new();
+    let profils = tune_core::db::profile_repo::ProfileRepo::with_backend(state.backend.clone());
+    for compte in &body.delete_accounts {
+        match profils.delete(*compte) {
+            Ok(()) => supprimes.push(*compte),
+            Err(e) => tracing::warn!(compte, error = %e, "activation_suppression_compte_echec"),
+        }
+    }
+    if !supprimes.is_empty() {
+        tracing::warn!(comptes = ?supprimes, "activation_comptes_supprimes");
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
     renouveler_les_secrets(&settings);
     settings.set("auth_enabled", "true").ok();
@@ -1720,6 +1825,7 @@ async fn activer_l_authentification(
     let mut response = Json(json!({
         "auth_enabled": true,
         "username": nom,
+        "deleted_accounts": supprimes,
         "token": token,
         "token_type": "Bearer",
         "expires_in": 86400,

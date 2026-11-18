@@ -56,7 +56,12 @@ async fn get(
     path: &str,
     bearer: Option<&str>,
 ) -> (StatusCode, String, Option<String>) {
-    let app: Router = tune_server::routes::router(state.clone()).layer(axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 50000))));
+    let app: Router = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let mut req = Request::get(path);
     if let Some(b) = bearer {
         req = req.header(header::AUTHORIZATION, format!("Bearer {b}"));

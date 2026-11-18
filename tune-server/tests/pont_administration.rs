@@ -199,8 +199,9 @@ async fn sans_authentification_activer_et_eteindre_restent_ouverts() {
     assert_eq!(pont_enregistre(&state).as_deref(), Some("false"));
 }
 
-/// Sans authentification, ouvrir l'accès à distance depuis un autre hôte du
-/// réseau local est refusé (`not_local`) ; l'éteindre reste possible.
+/// Sans authentification, ouvrir, éteindre ou renouveler l'accès à distance
+/// depuis un autre hôte du réseau local est refusé (`not_local`) ; depuis
+/// cette machine, éteindre passe.
 #[tokio::test]
 async fn sans_authentification_activer_depuis_le_reseau_local_est_refuse() {
     let state = new_state();
@@ -212,8 +213,22 @@ async fn sans_authentification_activer_depuis_le_reseau_local_est_refuse() {
     assert_ne!(pont_enregistre(&state).as_deref(), Some("true"));
 
     pont_actif_avec_jeton(&state);
-    let r = appel_depuis(&state, AUTRE_HOTE_DU_LAN, Method::POST, ETEINDRE, None).await;
-    assert_eq!(r.status, StatusCode::OK, "éteindre : {}", r.corps);
+    for chemin in [ETEINDRE, RENOUVELER] {
+        let r = appel_depuis(&state, AUTRE_HOTE_DU_LAN, Method::POST, chemin, None).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{chemin} : {}", r.corps);
+        assert!(r.corps.contains("not_local"), "{}", r.corps);
+    }
+    assert_eq!(pont_enregistre(&state).as_deref(), Some("true"));
+    assert_eq!(jeton_enregistre(&state).as_deref(), Some(FAUX_JETON));
+    let r = appel_depuis(&state, AUTRE_HOTE_DU_LAN, Method::GET, LIEN, None).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "lien : {}", r.corps);
+    let r = post(&state, ETEINDRE, None).await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "éteindre depuis cette machine : {}",
+        r.corps
+    );
     assert_eq!(pont_enregistre(&state).as_deref(), Some("false"));
 }
 

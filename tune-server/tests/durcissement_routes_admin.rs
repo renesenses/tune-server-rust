@@ -719,14 +719,38 @@ async fn sous_authentification_seul_l_administrateur_cree_un_compte() {
     );
 }
 
-/// Témoin : authentification coupée, le premier compte de
-/// l'onboarding reste possible, depuis n'importe quel hôte, avec sa session.
+/// Témoin : authentification coupée, le premier compte de l'onboarding reste
+/// possible DEPUIS CETTE MACHINE, avec sa session. Depuis un autre hôte, un
+/// compte créé par un tiers survivrait à l'activation : refusé.
 #[tokio::test]
 async fn sans_authentification_le_premier_compte_s_inscrit_toujours() {
     let state = new_state();
-    let (st, entetes, rep) = appel_depuis(
+    let (st, _, rep) = appel_depuis(
         &state,
         AUTRE_HOTE_DU_LAN,
+        Method::POST,
+        INSCRIPTION,
+        None,
+        Some(CORPS_INSCRIPTION),
+        &[],
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "depuis le LAN : {rep}");
+    assert!(rep.contains("not_local"), "{rep}");
+    let (st, _, rep) = appel_depuis(
+        &state,
+        CETTE_MACHINE,
+        Method::POST,
+        INSCRIPTION,
+        None,
+        Some(CORPS_INSCRIPTION),
+        &[("x-forwarded-for", "192.168.1.50")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "derrière un mandataire : {rep}");
+    let (st, entetes, rep) = appel_depuis(
+        &state,
+        CETTE_MACHINE,
         Method::POST,
         INSCRIPTION,
         None,
@@ -1159,7 +1183,11 @@ fn actions_machine_gardees_a_leur_tour() -> Vec<(Method, &'static str, Option<&'
         (Method::POST, "/api/v1/cloud/bridge/disable", None),
         (Method::POST, "/api/v1/cloud/bridge/rotate-token", None),
         (Method::POST, "/api/v1/system/config/import", Some("{}")),
-        (Method::POST, "/api/v1/system/config-backup/import", Some("{}")),
+        (
+            Method::POST,
+            "/api/v1/system/config-backup/import",
+            Some("{}"),
+        ),
         (
             Method::POST,
             "/api/v1/system/config-backup/cloud/restore",
