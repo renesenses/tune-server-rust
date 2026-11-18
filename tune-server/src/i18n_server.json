@@ -1,5 +1,6 @@
 {
   "api.playback.trackMissing": {
+    "tr": "Bu parça artık kütüphanede yok. Görünümü yenileyin.",
     "fr": "Cette piste n’est plus dans la bibliothèque. Actualisez la vue.",
     "en": "This track is no longer in the library. Refresh the view.",
     "de": "Dieser Titel ist nicht mehr in der Bibliothek. Aktualisiere die Ansicht.",
