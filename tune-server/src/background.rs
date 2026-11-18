@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-#[cfg_attr(feature = "lecture-seule", allow(unused_imports))]
+#[cfg_attr(feature = "sans-enrichissement", allow(unused_imports))]
 use tracing::{debug, error, info, warn};
 
 use tune_core::db::zone_repo::CreationDeZone;
@@ -13,11 +13,21 @@ use crate::state::AppState;
 /// Spawn all periodic background tasks: squeezebox polling, session GC, position poller,
 /// token refresh, UPnP advertiser, alarm scheduler, Deezer proxy config, desktop notifications,
 /// and RSS memory diagnostics.
-/// Avec la feature `lecture-seule` (HORS `default`, aucun build existant ne
-/// change), les passes de fond qui interrogent MusicBrainz (genres d'album,
-/// noms de tri, vérification des MBID, pays des artistes et des éditions) et
-/// l'envoi des écoutes au compte ne sont pas lancées. Pour un build « pure
-/// lecture » (tune-diretta light) : rien ne part seul vers l'extérieur.
+/// Avec la feature `sans-enrichissement` (HORS `default` : aucun build existant
+/// ne change), ces passes de fond ne sont pas lancées :
+/// - MusicBrainz : vérification des MBID, pays des artistes et des éditions,
+///   rattrapage des noms de tri et des genres d'album (ces deux derniers sont
+///   surtout locaux ; ils sont coupés pour que la bibliothèque ne soit pas
+///   réécrite en tâche de fond) ;
+/// - enrichissements distants : biographies, crédits, paroles, logos de radios ;
+/// - envois vers le compte et la communauté : écoutes, notes, mesures,
+///   synchronisation communautaire.
+///
+/// Ce qui continue de sortir : synchronisation et sauvegarde cloud de la
+/// bibliothèque et des personnalisations, télémétrie, heartbeat (la build
+/// reste visible dans les statistiques d'installations) et vérification de
+/// mise à jour. Les routes restent. Ce n'est donc PAS un build « zéro
+/// réseau » : c'est un build sans enrichissement de fond, pour la lecture.
 pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // AVANT tout spawn (#4574). Les passes de fond relisent leur pause dans un
     // miroir en mémoire qui part à zéro ; sans cette relecture, une pause posée
@@ -72,8 +82,9 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     );
     spawn_telemetry_reporter(state);
     spawn_heartbeat(state);
+    #[cfg(not(feature = "sans-enrichissement"))]
     spawn_bio_sync(state);
-    #[cfg(not(feature = "lecture-seule"))]
+    #[cfg(not(feature = "sans-enrichissement"))]
     spawn_verification_mbid_artistes(state);
     spawn_reprise_favoris_streaming(state);
     spawn_veille_favoris_miroir(state);
@@ -87,15 +98,19 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // curseur, derrière le même droit premium que les biographies. Une garde
     // dans `credits.rs` tient cette ligne : l'ordonnanceur de scan a été du
     // code mort pendant des mois pour une ligne comme celle-ci.
+    #[cfg(not(feature = "sans-enrichissement"))]
     crate::routes::library::credits::spawn_passe_automatique_credits(state);
     // #4805 (13/10/2026) — la passe de nuit des albums refusés par
     // MusicBrainz. Éteinte par défaut ; un test de câblage garde la ligne.
     crate::routes::library::identification_lot::nuit::spawn_passe_de_nuit(state);
+    #[cfg(not(feature = "sans-enrichissement"))]
     spawn_community_sync(state);
     spawn_replaygain_analysis(state);
+    #[cfg(not(feature = "sans-enrichissement"))]
     spawn_lyrics_catchup(state);
     #[cfg(feature = "audio-embedding")]
     spawn_audio_embedding(state);
+    #[cfg(not(feature = "sans-enrichissement"))]
     spawn_radio_logo_refresh(state);
     spawn_rattrapage_vignettes_podcasts(state);
     // #7064 — les labels déjà en base qui sont des lignes de copyright.
@@ -106,13 +121,15 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     crate::routes::system::sauvegarde_cloud::spawn(state);
     // « Mes écoutes, tous serveurs » (#6510) : l'envoi des écoutes au compte,
     // opt-in et désactivé par défaut. Un test de câblage garde la ligne.
-    #[cfg(not(feature = "lecture-seule"))]
+    #[cfg(not(feature = "sans-enrichissement"))]
     tune_core::cloud::ecoutes_au_compte::spawn(state.backend.clone(), state.http_client.clone());
     // Notes et écoutes de la communauté (#6545) : consentement séparé,
     // désactivé par défaut. Un test de câblage garde la ligne.
+    #[cfg(not(feature = "sans-enrichissement"))]
     tune_core::cloud::notes_communautaires::spawn(state.backend.clone(), state.http_client.clone());
     // Résultats d'analyse de la communauté (#5594) : recevoir et contribuer,
     // deux options désactivées par défaut. Un test de câblage garde la ligne.
+    #[cfg(not(feature = "sans-enrichissement"))]
     tune_core::cloud::mesures_communautaires::spawn(
         state.backend.clone(),
         state.http_client.clone(),
@@ -158,16 +175,16 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
         tune_core::playback::SILENCE_AVANT_ZONE_FIGEE,
     );
     spawn_mp3_duration_repair(state);
-    #[cfg(not(feature = "lecture-seule"))]
+    #[cfg(not(feature = "sans-enrichissement"))]
     spawn_rattrapage_genres_d_album(state);
     // #6773 — noms de tri des artistes : rattrapage MusicBrainz des fiches
     // déjà identifiées, puis déduction « Nom, Prénom ». Un test de câblage
     // garde la ligne.
-    #[cfg(not(feature = "lecture-seule"))]
+    #[cfg(not(feature = "sans-enrichissement"))]
     spawn_rattrapage_noms_de_tri(state);
-    #[cfg(not(feature = "lecture-seule"))]
+    #[cfg(not(feature = "sans-enrichissement"))]
     spawn_pays_des_artistes(state);
-    #[cfg(not(feature = "lecture-seule"))]
+    #[cfg(not(feature = "sans-enrichissement"))]
     spawn_pays_des_editions(state);
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state, config);
@@ -302,7 +319,7 @@ async fn spawn_ecoute_directe(state: &AppState) {
 /// Oxygen, qui lit les pistes, ne voyait pas le genre de la Bibliothèque. Une
 /// passe au démarrage, idempotente (`genre_album_pistes::rattraper_les_genres_tenus`
 /// marque chaque album traité) : sur une base déjà rattrapée, une requête.
-#[cfg_attr(feature = "lecture-seule", allow(dead_code))]
+#[cfg_attr(feature = "sans-enrichissement", allow(dead_code))]
 fn spawn_rattrapage_genres_d_album(state: &AppState) {
     let backend = state.backend.clone();
     tokio::spawn(async move {
@@ -332,7 +349,7 @@ const RATTRAPAGE_NOMS_DE_TRI_PAR_TOUR: usize = 60;
 ///    gardes que la passe automatique des crédits : droit d'enrichissement
 ///    automatique, pause « Enrichissement », limiteur MusicBrainz partagé.
 ///    Curseur en base : un arrêt ou une panne reprend où il s'était arrêté.
-#[cfg_attr(feature = "lecture-seule", allow(dead_code))]
+#[cfg_attr(feature = "sans-enrichissement", allow(dead_code))]
 fn spawn_rattrapage_noms_de_tri(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
@@ -433,7 +450,7 @@ const PAYS_DES_ARTISTES_RELANCE: std::time::Duration = std::time::Duration::from
 /// le rattrapage des noms de tri : droit d'enrichissement automatique, pause
 /// « Enrichissement », limiteur MusicBrainz partagé. Curseur en base : un
 /// arrêt ou une panne reprend où il s'était arrêté.
-#[cfg_attr(feature = "lecture-seule", allow(dead_code))]
+#[cfg_attr(feature = "sans-enrichissement", allow(dead_code))]
 fn spawn_pays_des_artistes(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
@@ -516,7 +533,7 @@ const PAYS_DES_EDITIONS_RELANCE: std::time::Duration = std::time::Duration::from
 /// Mêmes gardes que le pays des artistes (#8090) : droit d'enrichissement
 /// automatique, pause « Enrichissement », limiteur MusicBrainz partagé (une
 /// release déjà gardée en base ne coûte aucune requête). Curseur en base.
-#[cfg_attr(feature = "lecture-seule", allow(dead_code))]
+#[cfg_attr(feature = "sans-enrichissement", allow(dead_code))]
 fn spawn_pays_des_editions(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
@@ -3111,7 +3128,7 @@ const VERIFICATION_MBID_RELANCE_SECS: u64 = 3600;
 /// `tune_core::metadata::verification_mbid_artistes` ; ici, le DROIT : la
 /// passe ne part qu'avec l'enrichissement automatique (`AutoEnrichment`),
 /// comme la descente des bios communautaires.
-#[cfg_attr(feature = "lecture-seule", allow(dead_code))]
+#[cfg_attr(feature = "sans-enrichissement", allow(dead_code))]
 fn spawn_verification_mbid_artistes(state: &AppState) {
     let license = state.license.clone();
     let db = state.backend.clone();
@@ -3141,6 +3158,7 @@ fn spawn_verification_mbid_artistes(state: &AppState) {
     });
 }
 
+#[cfg_attr(feature = "sans-enrichissement", allow(dead_code))]
 fn spawn_bio_sync(state: &AppState) {
     let license = state.license.clone();
     let db = state.backend.clone();
@@ -3216,6 +3234,7 @@ fn spawn_rattrapage_vignettes_podcasts(state: &AppState) {
 /// Best-effort, at boot: fill in missing station logos from the mozaiklabs.fr
 /// radio directory so the seeded default stations show a vignette instead of
 /// the placeholder mic (Pascal). Cloud-graceful — a no-op offline.
+#[cfg_attr(feature = "sans-enrichissement", allow(dead_code))]
 fn spawn_radio_logo_refresh(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {
@@ -3251,6 +3270,7 @@ fn spawn_radio_logo_refresh(state: &AppState) {
     });
 }
 
+#[cfg_attr(feature = "sans-enrichissement", allow(dead_code))]
 fn spawn_community_sync(state: &AppState) {
     tune_core::cloud::community_sync::spawn(state.backend.clone());
 }
@@ -3291,6 +3311,7 @@ fn spawn_replaygain_analysis(state: &AppState) {
 /// Ne fait rien tant que `lyrics_lrclib_enabled` n'est pas activé, s'efface
 /// devant toute zone qui joue, et ne demande jamais plus de `LOT_DE_FOND`
 /// paroles d'affilée.
+#[cfg_attr(feature = "sans-enrichissement", allow(dead_code))]
 fn spawn_lyrics_catchup(state: &AppState) {
     tune_core::library::lyrics_pass::spawn(state.backend.clone(), state.http_client.clone());
 }
@@ -4306,11 +4327,12 @@ mod tests_licence_proprietaire_battement {
         );
     }
 
-    /// Build « pure lecture » : chaque passe MusicBrainz et l'envoi des écoutes
-    /// doivent rester derrière `not(feature = "lecture-seule")`. Si quelqu'un
-    /// retire la condition, la version light relancerait ces tâches en silence.
+    /// Build `sans-enrichissement` : chaque passe d'enrichissement et chaque
+    /// envoi doit rester derrière `not(feature = "sans-enrichissement")`. Si
+    /// quelqu'un retire la condition, la version light relancerait ces tâches
+    /// en silence.
     #[test]
-    fn les_passes_musicbrainz_et_les_ecoutes_sont_coupees_en_lecture_seule() {
+    fn les_passes_d_enrichissement_et_les_envois_sont_coupes_sans_enrichissement() {
         let source = include_str!("background.rs");
         let debut = source
             .find("pub async fn spawn_background_tasks")
@@ -4323,15 +4345,22 @@ mod tests_licence_proprietaire_battement {
             "spawn_rattrapage_noms_de_tri(state);",
             "spawn_pays_des_artistes(state);",
             "spawn_pays_des_editions(state);",
+            "spawn_bio_sync(state);",
+            "spawn_community_sync(state);",
+            "spawn_lyrics_catchup(state);",
+            "spawn_radio_logo_refresh(state);",
+            "crate::routes::library::credits::spawn_passe_automatique_credits(state);",
             "tune_core::cloud::ecoutes_au_compte::spawn(",
+            "tune_core::cloud::notes_communautaires::spawn(",
+            "tune_core::cloud::mesures_communautaires::spawn(",
         ] {
             let pos = corps
                 .find(appel)
                 .unwrap_or_else(|| panic!("{appel} a disparu"));
             let avant = corps[..pos].trim_end();
             assert!(
-                avant.ends_with("#[cfg(not(feature = \"lecture-seule\"))]"),
-                "{appel} doit rester derrière `#[cfg(not(feature = \"lecture-seule\"))]`"
+                avant.ends_with("#[cfg(not(feature = \"sans-enrichissement\"))]"),
+                "{appel} doit rester derrière `#[cfg(not(feature = \"sans-enrichissement\"))]`"
             );
         }
     }
