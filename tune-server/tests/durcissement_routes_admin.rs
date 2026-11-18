@@ -129,8 +129,9 @@ fn routes_d_administration() -> Vec<(Method, &'static str, Option<&'static str>)
             "/api/v1/appliance/wifi/forget",
             Some(r#"{"ssid":"Maison"}"#),
         ),
-        // A5
-        (Method::POST, "/api/v1/cloud/sso/disconnect", None),
+        // A5 : `sso/disconnect` n'est plus réservé à l'administrateur — un compte
+        // standard délie SON profil (voir
+        // `un_compte_standard_ne_delie_que_son_propre_profil`).
         // B4
         (Method::GET, "/api/v1/multi-server/servers", None),
         (
@@ -272,15 +273,20 @@ async fn l_administrateur_passe_la_garde_de_chaque_route() {
 async fn seul_le_retour_du_sso_reste_public() {
     let state = new_state();
     enable_auth(&state);
-    let (st, rep) = appel(
-        &state,
-        Method::GET,
-        "/api/v1/cloud/sso/callback?error=access_denied",
-        None,
-        None,
-    )
-    .await;
-    assert_ne!(st, StatusCode::UNAUTHORIZED, "callback : {rep}");
+    // Le retour passe la couche d'authentification (le navigateur revient de
+    // mozaiklabs.fr) : c'est le gestionnaire qui répond, par une PAGE.
+    // Sans la session qui a lancé la liaison, il refuse ; avec elle
+    // (administrateur ou compte standard, cookie ou jeton), il traite le
+    // retour — ici le refus du fournisseur.
+    let retour = "/api/v1/cloud/sso/callback?error=access_denied";
+    let (st, rep) = appel(&state, Method::GET, retour, None, None).await;
+    assert!(rep.contains("<!doctype html>"), "page du gestionnaire : {st} {rep}");
+    assert!(!rep.contains("OAuth error"), "sans session, le retour n'est pas traité : {rep}");
+    for jeton in [tok("admin", 1), tok("user", 2)] {
+        let (st, rep) = appel(&state, Method::GET, retour, Some(&jeton), None).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "avec la session : {rep}");
+        assert!(rep.contains("OAuth error: access_denied"), "{rep}");
+    }
     for (m, chemin) in [
         (Method::POST, "/api/v1/cloud/sso/disconnect"),
         (Method::GET, "/api/v1/cloud/sso/status"),
@@ -1566,4 +1572,40 @@ async fn http_1_0_n_est_jamais_cette_machine() {
         !rep.contains("auth_required"),
         "HTTP/1.1 Host localhost : {rep}"
     );
+}
+
+/// Un compte standard qui appelle `sso/disconnect` ne délie que SON profil :
+/// jamais le compte relié au serveur, jamais un autre profil.
+#[tokio::test]
+async fn un_compte_standard_ne_delie_que_son_propre_profil() {
+    let state = new_state();
+    enable_auth(&state);
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    // Le serveur est relié ; les profils 2 et 3 aussi, chacun au sien.
+    reglages.set("mozaik_access_token", "JETON-DU-SERVEUR-FAUX").unwrap();
+    reglages.set("mozaik_user", r#"{"email":"proprio@example.org"}"#).unwrap();
+    reglages.set("mozaik_compte_profil_2", r#"{"email":"deux@example.org"}"#).unwrap();
+    reglages.set("mozaik_compte_profil_3", r#"{"email":"trois@example.org"}"#).unwrap();
+    let (st, rep) = appel(
+        &state,
+        Method::POST,
+        "/api/v1/cloud/sso/disconnect",
+        Some(&tok("user", 2)),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{rep}");
+    assert!(rep.contains("\"scope\":\"profile\""), "{rep}");
+    assert_eq!(reglages.get("mozaik_compte_profil_2").unwrap(), None, "son profil est délié");
+    assert!(reglages.get("mozaik_compte_profil_3").unwrap().is_some(), "l'autre profil reste relié");
+    assert_eq!(
+        reglages.get("mozaik_access_token").unwrap().as_deref(),
+        Some("JETON-DU-SERVEUR-FAUX"),
+        "le serveur reste relié"
+    );
+    assert!(reglages.get("mozaik_user").unwrap().is_some(), "le compte du serveur reste");
+    // Sans jeton : 401, rien ne bouge.
+    let (st, _) = appel(&state, Method::POST, "/api/v1/cloud/sso/disconnect", None, None).await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    assert!(reglages.get("mozaik_compte_profil_3").unwrap().is_some());
 }

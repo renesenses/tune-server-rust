@@ -722,11 +722,14 @@ async fn la_connexion_sso_en_attente_ne_survit_ni_a_l_activation_ni_au_temps() {
     .await;
     assert!(st.is_redirection(), "{st}");
     let etat = etat_pkce(&state).expect("connexion en attente");
-    let (st, _) = activer(&state, CETTE_MACHINE, r#"{"password":"proprio-1234"}"#).await;
+    let (st, v) = activer(&state, CETTE_MACHINE, r#"{"password":"proprio-1234"}"#).await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(etat_pkce(&state), None);
+    // Même avec la session administrateur (le retour exige la session qui a
+    // lancé la liaison), l'attente d'avant l'activation n'existe plus.
+    let admin = v["token"].as_str().unwrap().to_string();
     let chemin = format!("/api/v1/cloud/sso/callback?code=x&state={etat}");
-    let (st, v) = appel(&state, AUTRE_HOTE_DU_LAN, Method::GET, &chemin, None, None).await;
+    let (st, v) = appel(&state, AUTRE_HOTE_DU_LAN, Method::GET, &chemin, Some(&admin), None).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
     assert!(v.to_string().contains("no pending SSO session"), "{v}");
 
@@ -754,6 +757,57 @@ async fn la_connexion_sso_en_attente_ne_survit_ni_a_l_activation_ni_au_temps() {
     let (st, v) = appel(&state, CETTE_MACHINE, Method::GET, &chemin, None, None).await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
     assert!(v.to_string().contains("no pending SSO session"), "{v}");
+}
+
+/// Compte standard (authentification active) : sa liaison de profil en
+/// attente expire aussi au bout de dix minutes, et l'activation n'en laisse
+/// aucune.
+#[tokio::test]
+async fn la_connexion_sso_d_un_profil_en_attente_expire() {
+    let state = new_state();
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    reglages.set("auth_enabled", "true").unwrap();
+    reglages.set("jwt_secret", "secret-de-l-epreuve").unwrap();
+    let jeton = tune_server::auth::sign_jwt(2, "user", "secret-de-l-epreuve").unwrap();
+    let (st, _) = appel(&state, AUTRE_HOTE_DU_LAN, Method::GET, "/api/v1/cloud/sso/authorize", Some(&jeton), None).await;
+    assert!(st.is_redirection(), "{st}");
+    let pkce = reglages.get("mozaik_pkce_pending_profil_2").unwrap().expect("attente du profil 2");
+    let etat = serde_json::from_str::<Value>(&pkce).unwrap()["state"].as_str().unwrap().to_string();
+    assert!(reglages.get("mozaik_pkce_pending_profil_2_at").unwrap().is_some(), "attente datée");
+    let vieux = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        - 11 * 60;
+    reglages.set("mozaik_pkce_pending_profil_2_at", &vieux.to_string()).unwrap();
+    let chemin = format!("/api/v1/cloud/sso/callback?code=x&state={etat}");
+    let (st, v) = appel(&state, AUTRE_HOTE_DU_LAN, Method::GET, &chemin, Some(&jeton), None).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+    assert!(v.to_string().contains("no pending SSO session"), "{v}");
+    assert_eq!(reglages.get("mozaik_pkce_pending_profil_2_at").unwrap(), None);
+}
+
+/// L'activation efface aussi les liaisons de PROFIL en attente.
+#[tokio::test]
+async fn l_activation_efface_les_attentes_sso_des_profils() {
+    let state = new_state();
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    for cle in [
+        "mozaik_pkce_pending_profil_7",
+        "mozaik_pkce_pending_profil_7_at",
+        "mozaik_redirect_uri_pending_profil_7",
+    ] {
+        reglages.set(cle, "x").unwrap();
+    }
+    let (st, _) = activer(&state, CETTE_MACHINE, r#"{"password":"proprio-1234"}"#).await;
+    assert_eq!(st, StatusCode::OK);
+    for cle in [
+        "mozaik_pkce_pending_profil_7",
+        "mozaik_pkce_pending_profil_7_at",
+        "mozaik_redirect_uri_pending_profil_7",
+    ] {
+        assert_eq!(reglages.get(cle).unwrap(), None, "{cle}");
+    }
 }
 
 /// Derrière un mandataire inverse (connexion vue de 127.0.0.1), la connexion
