@@ -99,13 +99,24 @@ pub(crate) async fn corps_general<F>(
 where
     F: FnOnce() -> Result<serde_json::Value, crate::error::AppError> + Send + 'static,
 {
+    corps_general_selon(releve, route, bibliotheque_au_repos, lire).await
+}
+
+/// [`corps_general`], l'état « au repos » fourni par l'appelant. Les témoins
+/// passent un état fixe : le vrai dépend de compteurs du processus (pauses,
+/// scans) que d'autres tests, en parallèle, font bouger.
+pub(crate) async fn corps_general_selon<F>(
+    releve: &ReleveSuspendu<serde_json::Value>,
+    route: &'static str,
+    au_repos: impl FnOnce() -> bool,
+    lire: F,
+) -> Result<serde_json::Value, crate::error::AppError>
+where
+    F: FnOnce() -> Result<serde_json::Value, crate::error::AppError> + Send + 'static,
+{
     let mut dernier = releve.dernier.lock().await;
     if let Some((v, pris_a)) = dernier.as_ref()
-        && resservir(
-            bibliotheque_au_repos(),
-            pris_a.elapsed(),
-            Some(DUREE_RELEVE_GENERAL),
-        )
+        && resservir(au_repos(), pris_a.elapsed(), Some(DUREE_RELEVE_GENERAL))
     {
         return Ok(v.clone());
     }

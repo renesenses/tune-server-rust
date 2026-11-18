@@ -137,8 +137,11 @@ async fn la_jauge_dr_est_figee_pendant_la_pause() {
 /// sinon.
 #[tokio::test]
 async fn la_completude_est_resservie_quand_tout_est_suspendu() {
-    let _pauses = crate::pauses_de_fond_tests::isoler().await;
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    // État « au repos » fixé : le vrai suit des compteurs du processus (pauses,
+    // scans) que d'autres tests font bouger en parallèle (#9116, CI PG).
+    let au_repos = || true;
+    let au_travail = || false;
     let appels = Arc::new(AtomicUsize::new(0));
     let lire = |n: i64| {
         let a = appels.clone();
@@ -149,16 +152,24 @@ async fn la_completude_est_resservie_quand_tout_est_suspendu() {
     };
     let releve = &state.comptages.releves.completude;
     assert_eq!(
-        corps_general(releve, "t", lire(1)).await.ok().unwrap()["n"],
+        corps_general_selon(releve, "t", au_travail, lire(1))
+            .await
+            .ok()
+            .unwrap()["n"],
         1
     );
     assert_eq!(
-        corps_general(releve, "t", lire(2)).await.ok().unwrap()["n"],
+        corps_general_selon(releve, "t", au_travail, lire(2))
+            .await
+            .ok()
+            .unwrap()["n"],
         2
     );
-    tune_core::taches_de_fond::tout_suspendre(&state.backend).unwrap();
     assert_eq!(
-        corps_general(releve, "t", lire(3)).await.ok().unwrap()["n"],
+        corps_general_selon(releve, "t", au_repos, lire(3))
+            .await
+            .ok()
+            .unwrap()["n"],
         2
     );
     assert_eq!(
@@ -167,8 +178,7 @@ async fn la_completude_est_resservie_quand_tout_est_suspendu() {
         "tout suspendu : pas de recomptage"
     );
     // Une erreur remonte avec son statut, et n'est pas gardée.
-    tune_core::taches_de_fond::tout_reprendre(&state.backend).unwrap();
-    let e = corps_general(releve, "t", || {
+    let e = corps_general_selon(releve, "t", au_travail, || {
         Err(crate::error::AppError::bad_request("x"))
     })
     .await
