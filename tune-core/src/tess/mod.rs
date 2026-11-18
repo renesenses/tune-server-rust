@@ -15,7 +15,10 @@
 //!   de Q9, sans jamais rejeter la chaîne ;
 //! - [`prereglages`] : préréglages de chaîne et mode d'application (A2) ;
 //! - [`zones`] : où TESS s'applique (Q8) ;
-//! - [`api`] : les corps JSON de `GET/PUT /zones/{id}/tess` et leurs schémas.
+//! - [`api`] : les corps JSON de `GET/PUT /zones/{id}/tess` et leurs schémas ;
+//! - [`executeur`] (T03) : l'[`Executeur`] de la chaîne en `f64` (ordre libre,
+//!   « Bypass all », aucune allocation au traitement) ;
+//! - [`quantification`] (T03) : la [`QuantificationPcm`], seule sortie du `f64`.
 //!
 //! Compatibilité : les types de RÉPONSE tolèrent champs et valeurs inconnus
 //! (repli `unknown`) ; seul le corps d'un `PUT` est lu strictement. Le document
@@ -24,8 +27,10 @@
 pub mod api;
 pub mod chaine;
 pub mod etage;
+pub mod executeur;
 pub mod greffon;
 pub mod prereglages;
+pub mod quantification;
 pub mod resolution;
 pub mod zones;
 
@@ -37,11 +42,13 @@ pub use chaine::{
 pub use etage::{
     Disposition, ErreurEtage, EtageTess, EtapeFinale, FormatFlux, SortieFinale, preparer_chaine,
 };
+pub use executeur::{Executeur, SortieChaine};
 pub use greffon::{
     Canaux, Catalogue, Categorie, ContraintesPlace, DescripteurGreffon, Droit, ErreurCatalogue,
     GroupeExclusif, Origine, PolitiqueGroupe, Position, catalogue_de_reference,
 };
 pub use prereglages::{ID_PREREGLAGE_PURE, ModeApplication, PreReglage, PreReglages};
+pub use quantification::QuantificationPcm;
 pub use resolution::{
     Badge, CodeEtape, ContexteExecution, ControleVolume, EtapeResolue, EtatVolume, LectureDsd,
     MotifEtape, PlacementVolume, Resolution, SourceFlux, VolumeZone,
