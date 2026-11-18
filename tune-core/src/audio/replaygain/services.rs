@@ -164,7 +164,8 @@ impl GainsDuService {
                     )
                 })
                 .or_else(piste),
-            ReplayGainMode::Track => piste(),
+            // #8968 — un `Auto` non résolu vaut le gain de piste.
+            ReplayGainMode::Track | ReplayGainMode::Auto => piste(),
         }
     }
 }

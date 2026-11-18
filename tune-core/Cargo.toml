@@ -855,6 +855,13 @@ name = "clap_fuite_rechargement_rc4"
 path = "tests/clap_fuite_rechargement_rc4.rs"
 required-features = ["audio-embedding"]
 
+# #9046 : piste en échec répété mise à réessayer plus tard ; témoin d'activité
+# vrai dès le début du lot. Faux modèle, ni ONNX ni modèle de 287 Mo.
+[[test]]
+name = "clap_echecs_repetes_9046"
+path = "tests/clap_echecs_repetes_9046.rs"
+required-features = ["audio-embedding"]
+
 # La conversion WAV 24 bits progressive contre `flac -d` (zone 10 du .18, 08/10).
 [[test]]
 name = "wav24_chaine_progressive_b209bf"
