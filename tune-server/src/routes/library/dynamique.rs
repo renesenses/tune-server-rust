@@ -90,8 +90,10 @@ pub(super) fn sonie_de_la_piste(m: &HashMap<String, String>) -> Option<Value> {
     }))
 }
 
-/// La section `dynamique` de la fiche technique d'une piste : DR, sonie,
-/// crêtes, LRA. `None` quand rien n'est mesuré.
+/// La section `dynamique` de la fiche technique d'une piste : sonie
+/// intégrée, crêtes, LRA. Le DR n'y est PAS repris : la section
+/// `dynamic_range` de la fiche le porte déjà, avec sa source (#8160). `None`
+/// quand rien n'est mesuré.
 pub(super) fn de_la_piste(
     state: &AppState,
     id: i64,
@@ -104,15 +106,9 @@ pub(super) fn de_la_piste(
             &[&id as &dyn ToSqlValue],
         )
         .map_err(AppError::internal)?;
-    let dr = m
-        .get("dr_track")
-        .and_then(|v| v.trim().parse::<i64>().ok())
-        .filter(|v| *v > 0);
     let sonie = sonie_de_la_piste(m);
     let s = |k: &str| sonie.as_ref().and_then(|v| v.get(k)).cloned();
     Ok(sans_vides(json!({
-        "dr": dr,
-        "dr_source": dr.and(m.get("dr_source").cloned()),
         "integree_lufs": s("integree_lufs"),
         "crete_echantillon_dbfs": s("crete_echantillon_dbfs"),
         "crete_vraie_dbtp": s("crete_vraie_dbtp"),

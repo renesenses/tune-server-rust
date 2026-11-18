@@ -166,9 +166,10 @@ async fn fiche_technique_reunit_la_dynamique_de_la_piste_9040() {
     let (statut, f) = get(&app, "/api/v1/library/tracks/1/fiche-technique").await;
     assert_eq!(statut, StatusCode::OK, "{f}");
     let d = &f["dynamique"];
-    assert_eq!(d["dr"], 9, "{d}");
-    assert_eq!(d["dr_source"], "analysis");
-    assert_eq!(d["integree_lufs"], -14.8);
+    // Le DR reste dans `dynamic_range`, pas répété ici.
+    assert!(d.get("dr").is_none(), "{d}");
+    assert_eq!(f["dynamic_range"]["valeur"], 9);
+    assert_eq!(d["integree_lufs"], -14.8, "{d}");
     assert_eq!(d["crete_echantillon_dbfs"], -2.0);
     assert_eq!(d["crete_vraie_dbtp"], -1.0);
     assert_eq!(d["sonie_algo"], "bs1770-tp4x-v2");
@@ -176,13 +177,11 @@ async fn fiche_technique_reunit_la_dynamique_de_la_piste_9040() {
     assert_eq!(d["lra_algo"], plage_de_sonie::ALGO);
     assert!(d["lra_mesuree_le"].as_str().is_some());
 
-    // Piste 2 : un DR, pas de mesure ReplayGain de Tune, pas de LRA.
+    // Piste 2 : un DR, mais ni mesure ReplayGain de Tune ni LRA : aucune
+    // section `dynamique`, le DR seul dans `dynamic_range`.
     let (_, f) = get(&app, "/api/v1/library/tracks/2/fiche-technique").await;
-    let d = &f["dynamique"];
-    assert_eq!(d["dr"], 12, "{d}");
-    for k in ["integree_lufs", "crete_vraie_dbtp", "lra_lu"] {
-        assert!(d.get(k).is_none(), "{k} : {d}");
-    }
+    assert!(f["dynamique"].is_null(), "{f}");
+    assert_eq!(f["dynamic_range"]["valeur"], 12);
     // Piste de service : aucune section.
     let (_, f) = get(&app, "/api/v1/library/tracks/3/fiche-technique").await;
     assert!(f["dynamique"].is_null(), "{f}");

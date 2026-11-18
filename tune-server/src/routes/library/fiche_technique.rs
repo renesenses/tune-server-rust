@@ -16,7 +16,7 @@
 //! * `provenance` : la source de la piste, ses identifiants, les champs tenus
 //!   à la main dans Tune, les crédits par source, la date du fichier lu ;
 //! * `note` : la note personnelle du profil appelant (#7849) ;
-//! * `dynamique` (#9040) : DR, sonie intégrée, sample peak, true peak et
+//! * `dynamique` (#9040) : sonie intégrée, sample peak, true peak et
 //!   plage de sonie (LRA), réunis et informatifs — voir [`super::dynamique`] ;
 //! * `forme_d_onde` (fil 2793) : son état (`a_jour` si elle est en cache
 //!   pour le fichier d'aujourd'hui, `absent` sinon) et l'URL de
