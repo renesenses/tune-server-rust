@@ -169,7 +169,21 @@ pub struct DemandeCorrection {
 impl DemandeCorrection {
     /// La configuration de l'ajustement, bornée, ou le refus motivé.
     pub fn config(&self) -> Result<(AutoEqConfig, Vec<String>), String> {
-        let mut cfg = AutoEqConfig::single_position(CADENCE);
+        self.config_pour(1)
+    }
+
+    /// La même, pour une réponse moyennée sur `positions` places (C4) : à
+    /// partir de [`tune_calibration::positions::POSITIONS_MIN`] positions,
+    /// les défauts sont ceux d'une moyenne spatiale (20–500 Hz, 10 bandes)
+    /// et la correction au-delà de Schroeder n'est plus « la position du
+    /// micro ». Les bornes dures ne bougent pas.
+    pub fn config_pour(&self, positions: usize) -> Result<(AutoEqConfig, Vec<String>), String> {
+        let spatiale = positions >= tune_calibration::positions::POSITIONS_MIN;
+        let mut cfg = if spatiale {
+            AutoEqConfig::spatial_average(CADENCE)
+        } else {
+            AutoEqConfig::single_position(CADENCE)
+        };
         let mut avertissements = Vec::new();
         let f_lo = self.f_min_hz.unwrap_or(cfg.f_lo);
         let f_hi = self.f_max_hz.unwrap_or(cfg.f_hi);
@@ -183,7 +197,7 @@ impl DemandeCorrection {
                 "zone de correction {f_lo}–{f_hi} Hz : une octave au moins"
             ));
         }
-        if f_hi > F_SCHROEDER_HZ {
+        if f_hi > F_SCHROEDER_HZ && !spatiale {
             avertissements.push(format!(
                 "correction jusqu'à {f_hi} Hz sur une mesure en un point : au-delà de {F_SCHROEDER_HZ} Hz, elle corrige surtout la position du micro"
             ));
@@ -286,8 +300,17 @@ impl Proposition {
 
 /// Calcule la proposition pour une réponse mesurée (grille log, dB).
 pub fn proposer(reponse: &LogResponse, demande: &DemandeCorrection) -> Result<Proposition, String> {
+    proposer_positions(reponse, demande, 1)
+}
+
+/// [`proposer`] sur une réponse moyennée sur `positions` places (C4).
+pub fn proposer_positions(
+    reponse: &LogResponse,
+    demande: &DemandeCorrection,
+    positions: usize,
+) -> Result<Proposition, String> {
     let cible = demande.cible.courbe()?;
-    let (cfg, mut avertissements) = demande.config()?;
+    let (cfg, mut avertissements) = demande.config_pour(positions)?;
     if reponse.freqs.len() < 8
         || reponse.freqs.len() != reponse.magnitude_db.len()
         || reponse.magnitude_db.iter().any(|d| !d.is_finite())

@@ -14,6 +14,8 @@
 //!        │       profil de pièce de la zone (appliqué par la route existante)
 //! modes.rs       C5 : modes de basse d'une pièce rectangulaire sans micro,
 //!        │       réponse estimée, correction C2 plus prudente
+//! session.rs     C4 : session à plusieurs positions (3 à 9), moyenne
+//!        │       pondérée, rejet des aberrantes, A/B ; format versionné
 //! routes.rs      /api/v1/ext/calibration/…
 //! ```
 //!
@@ -25,8 +27,7 @@
 //! l'orchestrateur (volume, file, lecture, arrêt), rien de parallèle.
 //!
 //! Hors de ce greffon : l'étape « Correction de pièce » du chemin du signal
-//! (tune-server), l'écran web, le micro du téléphone (C1-bis), le FIR (C3),
-//! les positions multiples et l'A/B (C4).
+//! (tune-server), l'écran web, le micro du téléphone (C1-bis), le FIR (C3).
 
 pub mod correction;
 pub mod fournisseur;
@@ -35,6 +36,7 @@ pub mod hote;
 pub mod mesure;
 pub mod modes;
 pub mod routes;
+pub mod session;
 pub mod simulation;
 
 use std::sync::Arc;

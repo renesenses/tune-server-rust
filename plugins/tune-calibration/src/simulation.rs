@@ -146,6 +146,12 @@ impl Boucle {
         }
     }
 
+    /// Le micro change de place (C4, mesure à plusieurs positions) : la
+    /// pièce vue par le micro devient `piece`. Entre deux mesures seulement.
+    pub fn changer_piece(&self, piece: PieceEnDirect) {
+        *self.piece.lock().unwrap() = piece;
+    }
+
     /// `n` échantillons captés : ce qui a été joué, ou du silence, à travers
     /// la pièce.
     fn capter(&self, n: usize) -> Vec<f64> {
