@@ -244,9 +244,24 @@ async fn sso_authorize(
     // Persist the exact redirect_uri: OAuth requires the token exchange in the
     // callback to present an identical value.
     settings.set("mozaik_redirect_uri_pending", &uri).ok();
+    // Une connexion en attente a une durée de vie (voir `PKCE_EN_ATTENTE_MAX`).
+    settings
+        .set("mozaik_pkce_pending_at", &maintenant_unix().to_string())
+        .ok();
     let page = page_connexion_demandee(&requete);
     let url = auth.authorize_url_avec_page(&uri, &pkce.challenge, &pkce.state, &page);
     Redirect::temporary(&url).into_response()
+}
+
+/// Durée de vie d'une connexion SSO en attente (secondes) : l'aller-retour
+/// par mozaiklabs.fr prend quelques secondes ; au-delà, on recommence.
+const PKCE_EN_ATTENTE_MAX: u64 = 10 * 60;
+
+fn maintenant_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[derive(Deserialize)]
@@ -290,12 +305,22 @@ async fn sso_callback(
 
     // Load & validate the pending PKCE session (CSRF: state must match), then
     // consume it — one-shot, cleared regardless of the exchange outcome.
+    let emise = settings
+        .get("mozaik_pkce_pending_at")
+        .ok()
+        .flatten()
+        .and_then(|s| s.trim().parse::<u64>().ok());
     let pending: Option<PkceSession> = settings
         .get("mozaik_pkce_pending")
         .ok()
         .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok());
+        .and_then(|s| serde_json::from_str(&s).ok())
+        // Sans date, ou plus vieille que dix minutes : plus valable.
+        .filter(|_| {
+            emise.is_some_and(|t| maintenant_unix().saturating_sub(t) <= PKCE_EN_ATTENTE_MAX)
+        });
     settings.set("mozaik_pkce_pending", "").ok();
+    settings.delete("mozaik_pkce_pending_at").ok();
 
     let Some(pkce) = pending else {
         return page_echec_compte(
@@ -1150,7 +1175,9 @@ pub const MESSAGE_ACCES_PAR_COMPTE: &str =
 /// active (`RequireAdmin`), répond 409 tant que le pont est éteint ou sans
 /// jeton, et n'en fabrique JAMAIS un — c'est le rôle de `bridge_enable`.
 async fn bridge_access_link(
-    _admin: crate::auth::RequireAdmin,
+    // Le lien porte le jeton du pont : administrateur, ou authentification
+    // coupée, seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
 ) -> axum::response::Response {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -1235,7 +1262,9 @@ fn reponse_lien_d_acces(settings: &SettingsRepo, token: &str) -> axum::response:
 ///
 /// Réponse : le nouveau lien, de la forme de `bridge_access_link`.
 async fn bridge_rotate_token(
-    _admin: crate::auth::RequireAdmin,
+    // Engage la machine : administrateur, ou authentification coupée,
+    // seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
 ) -> axum::response::Response {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -1267,7 +1296,9 @@ async fn bridge_rotate_token(
 /// Active le pont. Administrateur seulement dès que l'authentification est
 /// active : la réponse porte le jeton de pont.
 async fn bridge_enable(
-    _admin: crate::auth::RequireAdmin,
+    // Ouvrir l'accès à distance engage la machine : administrateur, ou
+    // authentification coupée, seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     // Premium gate: Cloud Relay requires Premium
@@ -1314,7 +1345,9 @@ async fn bridge_enable(
 /// Éteint le pont. Administrateur seulement dès que l'authentification est
 /// active.
 async fn bridge_disable(
-    _admin: crate::auth::RequireAdmin,
+    // Engage la machine : administrateur, ou authentification coupée,
+    // seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
 ) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());

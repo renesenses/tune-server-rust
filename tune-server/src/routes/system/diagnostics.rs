@@ -1901,7 +1901,19 @@ pub(super) async fn task_runs(
 /// `Json<Value>` with `logs`/`lines`/`source`. Shared by the `/logs` endpoint
 /// and the bug report so both surface identical output. Async because the tail
 /// read runs on a blocking pool (spawn_blocking) to keep off the Tokio runtime.
+/// [`collect_recent_logs_brut`], sans les lignes qui portent le code
+/// d'activation de l'authentification (fichier ET replis `journalctl` /
+/// syslog) : tous les lecteurs passent par ici.
 pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
+    let Json(mut journaux) = collect_recent_logs_brut(max_lines).await;
+    if let Some(texte) = journaux.get("logs").and_then(Value::as_str) {
+        let propre = tune_core::confidentialite::retirer_les_codes_d_activation(texte);
+        journaux["logs"] = Value::String(propre);
+    }
+    Json(journaux)
+}
+
+async fn collect_recent_logs_brut(max_lines: usize) -> Json<Value> {
     // Try the server's own log file first — same path the writer uses (main),
     // resolved via the shared helper so reader and writer always agree. This is
     // what makes "Export logs" work on Linux under Docker / a bare terminal,
