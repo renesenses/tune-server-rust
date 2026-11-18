@@ -1044,11 +1044,53 @@ pub(crate) async fn rejouer_les_appareils_debloques(state: &AppState, liberes: &
     a_rejouer.len()
 }
 
-/// #9068 — une zone DLNA dont l'appareil (même identifiant SSDP) se révèle
-/// OpenHome est promue. Dans ce sens seulement : une face OpenHome qui
-/// manque un tour ne doit pas rétrograder la zone.
-fn zone_dlna_a_promouvoir_en_openhome(type_actuel: Option<&str>, type_annonce: &str) -> bool {
-    type_actuel == Some("dlna") && type_annonce == "openhome"
+/// #9068 — le type réseau que doit porter une zone pour la sortie SSDP qui
+/// vient d'être classée, ou `None` s'il n'y a rien à changer.
+///
+/// Symétrique : `dlna` ↔ `openhome`. Le classement vient du descriptif
+/// COMPLET relu à chaque découverte (`ssdp::classer_le_descripteur`), et la
+/// sortie inscrite sous cet identifiant est une `OpenHomeOutput` ou une
+/// `DlnaOutput` selon lui. Une zone dont le type contredit la sortie qui la
+/// sert applique les mauvaises règles du sondeur (`poller::decisions`,
+/// `gapless`, `tick`). Il n'y a pas de « face qui manque un tour » à
+/// protéger : la face OpenHome et la face UPnP AV d'un même identifiant
+/// sortent du MÊME document ; si l'une manque, c'est que l'appareil ne la
+/// sert plus, et la sortie inscrite la suit déjà.
+///
+/// Aucun autre type n'est touché (une zone AirPlay, OAAT… qui partagerait
+/// l'identifiant n'est pas une zone SSDP).
+fn type_de_zone_reseau_a_aligner(
+    type_actuel: Option<&str>,
+    type_inscrit: &'static str,
+) -> Option<&'static str> {
+    match type_actuel {
+        Some(actuel @ ("dlna" | "openhome")) if actuel != type_inscrit => Some(type_inscrit),
+        _ => None,
+    }
+}
+
+/// #9068 — aligne le type de la zone liée à `dev.id` sur la sortie SSDP
+/// classée, AVANT l'inscription de la sortie : aucun tour du sondeur ne voit
+/// une `OpenHomeOutput` servir une zone encore `dlna` (ni l'inverse).
+fn aligner_le_type_de_zone_reseau(
+    db: &Arc<dyn DbBackend>,
+    dev: &tune_core::discovery::device::DiscoveredDevice,
+    type_inscrit: &'static str,
+) -> Option<i64> {
+    let repo = tune_core::db::zone_repo::ZoneRepo::with_backend(db.clone());
+    let zone = repo.get_by_device_id(&dev.id).ok().flatten()?;
+    let zone_id = zone.id?;
+    let nouveau = type_de_zone_reseau_a_aligner(zone.output_type.as_deref(), type_inscrit)?;
+    repo.update_output_type(zone_id, nouveau).ok()?;
+    info!(
+        name = %dev.name,
+        id = %dev.id,
+        zone_id,
+        ancien = ?zone.output_type,
+        nouveau,
+        "ssdp_zone_type_aligne_sur_la_sortie"
+    );
+    Some(zone_id)
 }
 
 async fn handle_ssdp_discovered(
@@ -1110,6 +1152,18 @@ async fn handle_ssdp_discovered(
         debug!(id = %dev.id, name = %dev.name, host = %dev.host, "ssdp_appareil_ignore");
         return;
     }
+
+    // #9068 — la zone prend le type de la sortie AVANT que celle-ci ne soit
+    // inscrite (voir `aligner_le_type_de_zone_reseau`).
+    aligner_le_type_de_zone_reseau(
+        db,
+        dev,
+        if dev.device_type == tune_core::discovery::device::OutputType::Openhome {
+            "openhome"
+        } else {
+            "dlna"
+        },
+    );
 
     let svc_urls = dev
         .capabilities
@@ -1319,21 +1373,6 @@ async fn handle_ssdp_discovered(
             // Backfill the host on zones created before host-based dedup existed,
             // so a later UUID change (Denon restart) can reconnect by host (#942).
             let _ = zone_repo.set_host(zone_id, &dev.host);
-            // #9068 — même identifiant, face OpenHome désormais reconnue : la
-            // zone créée en DLNA (Linn Klimax DS/2, OpenHome imbriqué que le
-            // parseur ne rattachait pas) passe en `openhome`. La sortie
-            // inscrite plus haut est déjà un `OpenHomeOutput` ; sans ceci la
-            // zone garderait `dlna` et les règles propres à OpenHome du
-            // sondeur (`poller`) ne s'appliqueraient jamais.
-            if zone_dlna_a_promouvoir_en_openhome(zone.output_type.as_deref(), type_str) {
-                let _ = zone_repo.update_output_type(zone_id, type_str);
-                info!(
-                    name = %dev.name,
-                    id = %dev.id,
-                    zone_id,
-                    "ssdp_zone_promue_dlna_vers_openhome"
-                );
-            }
         }
         // #7572 — une zone nommée par l'adresse IP prend le nom du modèle.
         renommer_zone_nommee_par_adresse(&zone_repo, event_bus, &zone, dev);
@@ -3622,9 +3661,7 @@ fn reancrage_a_differer(
 ///    répare rien.
 #[cfg(test)]
 mod filet_par_mac_ssdp_4580 {
-    use super::{
-        zone_a_reancrer_par_mac, zone_dlna_a_promouvoir_en_openhome, zone_reseau_a_reancrer_par_mac,
-    };
+    use super::{zone_a_reancrer_par_mac, zone_reseau_a_reancrer_par_mac};
     use std::sync::Arc;
     use tune_core::db::backend::DbBackend;
     use tune_core::db::zone_repo::ZoneRepo;
@@ -3741,23 +3778,6 @@ mod filet_par_mac_ssdp_4580 {
             zone_a_reancrer_par_mac(&deux, "uuid:apres", false, "dlna"),
             None
         );
-    }
-
-    /// #9068 — la zone DLNA d'un Linn dont la face OpenHome est enfin
-    /// reconnue passe en `openhome` ; jamais l'inverse.
-    #[test]
-    fn une_zone_dlna_devenue_openhome_est_promue_9068() {
-        assert!(zone_dlna_a_promouvoir_en_openhome(Some("dlna"), "openhome"));
-        assert!(!zone_dlna_a_promouvoir_en_openhome(
-            Some("openhome"),
-            "dlna"
-        ));
-        assert!(!zone_dlna_a_promouvoir_en_openhome(
-            Some("openhome"),
-            "openhome"
-        ));
-        assert!(!zone_dlna_a_promouvoir_en_openhome(Some("dlna"), "dlna"));
-        assert!(!zone_dlna_a_promouvoir_en_openhome(None, "openhome"));
     }
 
     /// Le filet est-il BRANCHÉ sur la chaîne SSDP, et au bon rang ?
@@ -5325,6 +5345,120 @@ mod dedup_identites_ssdp_1281 {
     }
 }
 
+/// #9068 — le type de la zone suit la sortie SSDP classée, dans les deux sens.
+///
+/// Câblage complet : `handle_ssdp_discovered`, base en mémoire, registre des
+/// sorties réel. Pas seulement le prédicat.
+#[cfg(test)]
+mod type_de_zone_aligne_9068 {
+    use super::{UpnpEventListener, type_de_zone_reseau_a_aligner};
+    use tune_core::db::zone_repo::ZoneRepo;
+    use tune_core::discovery::device::{DiscoveredDevice, OutputType};
+
+    const LINN: &str = "uuid:4c494e4e-0026-0f22-03eb-0142960000aa";
+
+    fn linn(ty: OutputType) -> DiscoveredDevice {
+        let mut dev = DiscoveredDevice::new(
+            LINN.into(),
+            "Klimax DS".into(),
+            ty,
+            "192.168.1.60".into(),
+            55178,
+        );
+        dev.capabilities.insert(
+            "service_urls".into(),
+            serde_json::json!({
+                "avtransport": "/av", "renderingcontrol": "/rc",
+                "product": "/p", "playlist": "/pl", "transport": "/t",
+            }),
+        );
+        dev
+    }
+
+    async fn annoncer(state: &crate::state::AppState, dev: &DiscoveredDevice) {
+        let mut seen = std::collections::HashSet::new();
+        let listener: Option<std::sync::Arc<UpnpEventListener>> = None;
+        super::handle_ssdp_discovered(
+            dev,
+            &state.outputs,
+            &state.backend,
+            &state.config,
+            &state.event_bus,
+            &listener,
+            &state.playback,
+            &state.license,
+            &mut seen,
+        )
+        .await;
+    }
+
+    fn type_de_la_zone(state: &crate::state::AppState) -> Option<String> {
+        ZoneRepo::with_backend(state.backend.clone())
+            .get_by_device_id(LINN)
+            .unwrap()
+            .expect("la zone du Linn doit exister")
+            .output_type
+    }
+
+    /// Le testeur du fil 2917 : zone créée en DLNA (rc12), puis le même
+    /// identifiant reclassé OpenHome — et l'inverse si l'appareil cesse de
+    /// servir sa face OpenHome. Une seule zone tout du long, dont le type
+    /// suit la sortie inscrite.
+    #[tokio::test]
+    async fn la_zone_suit_le_type_de_la_sortie_dans_les_deux_sens_9068() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+
+        annoncer(&state, &linn(OutputType::Dlna)).await;
+        assert_eq!(type_de_la_zone(&state).as_deref(), Some("dlna"));
+
+        annoncer(&state, &linn(OutputType::Openhome)).await;
+        assert_eq!(
+            state.outputs.lock().await.type_of(LINN).as_deref(),
+            Some("openhome"),
+            "la sortie inscrite doit être OpenHome"
+        );
+        assert_eq!(
+            type_de_la_zone(&state).as_deref(),
+            Some("openhome"),
+            "#9068 : la zone DLNA du Linn doit passer en openhome quand sa \
+             sortie est OpenHome"
+        );
+
+        annoncer(&state, &linn(OutputType::Dlna)).await;
+        assert_eq!(
+            type_de_la_zone(&state).as_deref(),
+            Some("dlna"),
+            "#9068 : une zone openhome réinscrite en DLNA doit revenir en dlna"
+        );
+        assert_eq!(
+            ZoneRepo::with_backend(state.backend.clone())
+                .list()
+                .unwrap()
+                .len(),
+            1,
+            "une seule zone pour le Linn"
+        );
+    }
+
+    #[test]
+    fn seuls_dlna_et_openhome_s_alignent_9068() {
+        assert_eq!(
+            type_de_zone_reseau_a_aligner(Some("dlna"), "openhome"),
+            Some("openhome")
+        );
+        assert_eq!(
+            type_de_zone_reseau_a_aligner(Some("openhome"), "dlna"),
+            Some("dlna")
+        );
+        assert_eq!(type_de_zone_reseau_a_aligner(Some("dlna"), "dlna"), None);
+        assert_eq!(
+            type_de_zone_reseau_a_aligner(Some("airplay"), "openhome"),
+            None
+        );
+        assert_eq!(type_de_zone_reseau_a_aligner(None, "openhome"), None);
+    }
+}
+
 /// #1280 — « ignorer cet appareil » : faire taire un APPAREIL, pas chasser ses
 /// zones une par une.
 ///
@@ -5578,9 +5712,7 @@ mod appareils_ignores_1280 {
 /// `-p tune-server`, et rien ici n'est derriere `local-audio`.
 #[cfg(test)]
 mod reancrage_par_mac {
-    use super::{
-        zone_a_reancrer_par_mac, zone_dlna_a_promouvoir_en_openhome, zone_reseau_a_reancrer_par_mac,
-    };
+    use super::{zone_a_reancrer_par_mac, zone_reseau_a_reancrer_par_mac};
     use std::sync::Arc;
     use tune_core::db::backend::DbBackend;
     use tune_core::db::zone_repo::{ZoneParMac, ZoneRepo};

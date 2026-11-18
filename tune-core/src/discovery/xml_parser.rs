@@ -46,6 +46,25 @@ impl DeviceDescription {
             .any(|s| s.service_type.contains("av-openhome-org"))
     }
 
+    /// #9068 — vrai si ce (sous-)appareil porte un lecteur OpenHome
+    /// PILOTABLE : `Product`, `Playlist` et `Transport` du domaine
+    /// `av-openhome-org`. Ce sont les services dont `OpenHomeOutput` tire la
+    /// lecture (file, transport, état). Un appareil imbriqué qui n'en porte
+    /// qu'une partie (`Product`/`Volume` seuls) ne doit pas faire basculer un
+    /// renderer DLNA en OpenHome : une fois inscrite, l'`OpenHomeOutput` n'a
+    /// aucun repli DLNA.
+    pub(crate) fn porte_un_lecteur_openhome(&self) -> bool {
+        ["Product", "Playlist", "Transport"].iter().all(|nom| {
+            self.services.iter().any(|s| {
+                let mut parties = s.service_type.split(':');
+                parties.next() == Some("urn")
+                    && parties.next() == Some("av-openhome-org")
+                    && parties.next() == Some("service")
+                    && parties.next().is_some_and(|n| n.eq_ignore_ascii_case(nom))
+            })
+        })
+    }
+
     /// Returns true if the device exposes an AVTransport service, regardless of deviceType.
     /// This catches renderers (WiiM, foobar2000 foo_upnp, etc.) that use non-standard
     /// device types but still support DLNA playback via AVTransport.
@@ -483,14 +502,18 @@ pub fn parse_device_description(xml: &str) -> Result<DeviceDescription, String> 
     // ne s'arme même pas quand la racine est déjà le MediaRenderer.
     //
     // On rattache donc l'appareil OpenHome imbriqué dès que le descriptif
-    // n'en porte pas déjà. En `extend`, pas en fusion nommée : les clés
+    // n'en porte pas déjà — à condition qu'il soit un lecteur COMPLET
+    // (`porte_un_lecteur_openhome`) : un OpenHome imbriqué partiel laisse le
+    // renderer en DLNA. En `extend`, pas en fusion nommée : les clés
     // OpenHome (`product`, `playlist`, `transport`, `volume`, `info`,
     // `time`…) ne recouvrent aucune clé UPnP AV (`avtransport`,
     // `renderingcontrol`, `connectionmanager`), et, arrivées en dernier,
     // elles l'emportent dans `service_urls()` sur un homonyme hérité des
     // anciens services `urn:linn-co-uk:*` (`Product:3`…) d'une racine Linn.
     if !desc.is_openhome()
-        && let Some(source) = embedded_devices.iter().find(|device| device.is_openhome())
+        && let Some(source) = embedded_devices
+            .iter()
+            .find(|device| device.porte_un_lecteur_openhome())
     {
         if desc.friendly_name.is_empty() {
             desc.friendly_name = source.friendly_name.clone();
@@ -1088,6 +1111,50 @@ mod tests {
         let desc = parse_device_description(LINN_OHNET_RACINE_CONTENEUR_XML).unwrap();
         assert_face_openhome_linn(&desc, "4c494e4e-0026-0f22-03eb-0142960000cc");
         assert_eq!(desc.friendly_name, "Salon:Klimax DS");
+    }
+
+    /// Composite tiers : MediaRenderer en racine, OpenHome imbriqué PARTIEL
+    /// (`Product` et `Volume` seulement, ni `Playlist` ni `Transport`). Une
+    /// `OpenHomeOutput` n'y lirait rien et n'a pas de repli DLNA : il doit
+    /// rester DLNA.
+    #[test]
+    fn un_openhome_imbrique_partiel_reste_dlna_9068() {
+        let xml = r#"<root xmlns="urn:schemas-upnp-org:device-1-0"><device>
+            <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
+            <friendlyName>Composite</friendlyName>
+            <UDN>uuid:composite</UDN>
+            <serviceList>
+              <service>
+                <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
+                <controlURL>/av/control</controlURL>
+              </service>
+            </serviceList>
+            <deviceList><device>
+              <deviceType>urn:av-openhome-org:device:Source:1</deviceType>
+              <UDN>uuid:composite-oh</UDN>
+              <serviceList>
+                <service>
+                  <serviceType>urn:av-openhome-org:service:Product:1</serviceType>
+                  <controlURL>/oh/product</controlURL>
+                </service>
+                <service>
+                  <serviceType>urn:av-openhome-org:service:Volume:1</serviceType>
+                  <controlURL>/oh/volume</controlURL>
+                </service>
+              </serviceList>
+            </device></deviceList>
+        </device></root>"#;
+        let desc = parse_device_description(xml).unwrap();
+        assert_eq!(
+            crate::discovery::ssdp::classer_le_descripteur(&desc).sortie,
+            Some(crate::discovery::device::OutputType::Dlna),
+            "#9068 : un OpenHome imbriqué partiel (ni Playlist ni Transport) ne \
+             doit pas faire basculer le renderer en OpenHome ; services vus : {:?}",
+            desc.services
+                .iter()
+                .map(|s| s.service_type.as_str())
+                .collect::<Vec<_>>()
+        );
     }
 
     /// Un pur MediaRenderer, sans appareil OpenHome nulle part, reste DLNA.
