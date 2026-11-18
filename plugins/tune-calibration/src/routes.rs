@@ -38,6 +38,10 @@
 //!   récente donne 409 `unsupported_version` ;
 //! * `POST /sessions/{id}/correction` et `/correction/profil` — C2 sur la
 //!   moyenne (défauts d'une moyenne spatiale : 20–500 Hz, 10 bandes) ;
+//! * `POST /sessions/{id}/fir` et `POST /mesures/{id}/fir` — FIR de
+//!   correction à phase mixte (C3, T10b) : rapport (courbe, latence, bornes) ;
+//! * `POST /sessions/{id}/fir.wav` et `POST /mesures/{id}/fir.wav` — le même
+//!   FIR en RI `.wav` flottante, pour la convolution ;
 //! * `POST /comparaisons` — A/B : `{ "avant", "apres" }` (ids de mesure ou de
 //!   session), `f_min_hz`, `f_max_hz`, `cible` facultatifs.
 //!
@@ -62,6 +66,7 @@ use serde_json::{Value, json};
 use tune_core::license::{Feature, LicenseManager};
 
 use crate::correction::{DemandeCorrection, Proposition, proposer};
+use crate::correction_fir::{DemandeFir, RapportFir};
 use crate::generateur::Voies;
 use crate::mesure::{Controleur, Demande};
 use crate::modes::{Entree, proposer_estimation, simuler};
@@ -140,6 +145,10 @@ pub fn router(etat: EtatRoutes) -> Router<()> {
             "/sessions/{id}/correction/profil",
             post(session_correction_profil),
         )
+        .route("/mesures/{id}/fir", post(fir_rapport))
+        .route("/mesures/{id}/fir.wav", post(fir_wav))
+        .route("/sessions/{id}/fir", post(fir_rapport))
+        .route("/sessions/{id}/fir.wav", post(fir_wav))
         .route("/comparaisons", post(comparer))
         .route("/simulations", post(simulation))
         .route("/simulations/{id}/correction", post(simulation_correction))
@@ -815,6 +824,82 @@ async fn session_correction_profil(
     };
     let nom = nom_du_profil(d.nom, || format!("Calibration {id}"));
     enregistrer_le_profil(&etat, &id, zone_id, &nom, p, false).await
+}
+
+/// La réponse (mesure ou moyenne de session) et le FIR conçu, hors du fil
+/// asynchrone : 32 768 à 131 072 coefficients, quelques FFT longues.
+async fn concevoir_fir(
+    etat: &EtatRoutes,
+    id: &str,
+    d: DemandeFir,
+) -> Result<(tune_calibration::fir::FirMesure, RapportFir), Response> {
+    if etat.controleur.sessions.session(id).is_none() && etat.controleur.mesure(id).is_none() {
+        return Err(refus(
+            StatusCode::NOT_FOUND,
+            "inconnue",
+            format!("aucune mesure ni session « {id} »"),
+        ));
+    }
+    let c = etat.controleur.clone();
+    let id = id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let (reponse, positions) = c.reponse_de(&id)?;
+        crate::correction_fir::concevoir(&reponse, positions, &d)
+    })
+    .await
+    .unwrap_or_else(|e| Err(e.to_string()))
+    .map_err(|e| refus(StatusCode::UNPROCESSABLE_ENTITY, "fir_refuse", e))
+}
+
+async fn fir_rapport(
+    State(etat): State<EtatRoutes>,
+    Path(id): Path<String>,
+    Json(d): Json<DemandeFir>,
+) -> Response {
+    match concevoir_fir(&etat, &id, d).await {
+        Ok((_, rapport)) => {
+            let mut v = serde_json::to_value(&rapport).unwrap_or(Value::Null);
+            if let Some(o) = v.as_object_mut() {
+                o.insert("id".into(), json!(id));
+            }
+            Json(v).into_response()
+        }
+        Err(r) => r,
+    }
+}
+
+async fn fir_wav(
+    State(etat): State<EtatRoutes>,
+    Path(id): Path<String>,
+    Json(d): Json<DemandeFir>,
+) -> Response {
+    let format = d.format;
+    let (f, rapport) = match concevoir_fir(&etat, &id, d).await {
+        Ok(x) => x,
+        Err(r) => return r,
+    };
+    match crate::correction_fir::wav(&f, format) {
+        Ok(octets) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "audio/wav".to_string()),
+                (
+                    header::CONTENT_DISPOSITION,
+                    format!(
+                        "attachment; filename=\"correction-{id}-{}hz.wav\"",
+                        rapport.frequence
+                    ),
+                ),
+                (
+                    header::HeaderName::from_static("x-tune-fir-latence"),
+                    rapport.latence_echantillons.to_string(),
+                ),
+            ],
+            octets,
+        )
+            .into_response(),
+        Err(e) => refus(StatusCode::UNPROCESSABLE_ENTITY, "fir_refuse", e),
+    }
 }
 
 async fn comparer(State(etat): State<EtatRoutes>, Json(d): Json<DemandeComparaison>) -> Response {

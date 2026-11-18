@@ -27,9 +27,12 @@
 //! l'orchestrateur (volume, file, lecture, arrêt), rien de parallèle.
 //!
 //! Hors de ce greffon : l'étape « Correction de pièce » du chemin du signal
-//! (tune-server), l'écran web, le micro du téléphone (C1-bis), le FIR (C3).
+//! (tune-server), l'écran web, le micro du téléphone (C1-bis). Le FIR mesuré (C3, T10b) est
+//! conçu ici (`correction_fir`) et rendu en RI `.wav` ; c'est la convolution
+//! qui l'applique.
 
 pub mod correction;
+pub mod correction_fir;
 pub mod fournisseur;
 pub mod generateur;
 pub mod hote;

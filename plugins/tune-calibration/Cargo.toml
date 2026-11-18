@@ -42,3 +42,7 @@ tower = { version = "0.5", features = ["util"] }
 [[test]]
 name = "mesure_simulee"
 path = "tests/mesure_simulee.rs"
+
+[[test]]
+name = "fir_mesure"
+path = "tests/fir_mesure.rs"
