@@ -977,6 +977,21 @@ jobs:
           # aucune version corrigee, migration vers jiff/time a planifier.
           # Justification dans .cargo/audit.toml.
           ignore: RUSTSEC-2024-0436,RUSTSEC-2024-0384,RUSTSEC-2026-0543
+      # QA 18/11 — sur 14 jours, ~96 échecs de cette porte. Relu sur les 21
+      # journaux encore disponibles : AUCUN faux rouge. Deux vrais avis, chacun
+      # rougissant toutes les PR jusqu'à son traitement : RUSTSEC-2026-0538
+      # (quinn-udp, vulnérabilité, 13/11, corrigé par mise à jour) et
+      # RUSTSEC-2026-0543 (chrono non maintenu, 16-17/11, excepté par
+      # 928b920c0). La porte reste donc BLOQUANTE. Mais l'action n'écrit l'avis
+      # que dans le résumé du run (« 1 entries found ») : le journal ne disait
+      # pas LEQUEL, et chaque PR rouge se lisait comme une panne. En cas
+      # d'échec, cette étape écrit l'avis dans le journal. `cargo audit` nu lit
+      # `.cargo/audit.toml` (même liste d'exceptions, `deny = ["warnings"]`,
+      # tenue identique par `les_trois_listes_dexceptions_rustsec_sont_identiques`) :
+      # aucune liste de plus à faire dériver.
+      - name: Dire quel avis bloque (si l'audit a échoué)
+        if: failure()
+        run: cargo audit || true
       # Cet outil est exclu du workspace et possède son propre verrou.
       # L'audit de la racine ne couvre donc pas ses dépendances (#6503).
       - name: Auditer le verrou du moissonneur Roon
