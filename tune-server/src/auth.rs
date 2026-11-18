@@ -18,6 +18,10 @@ pub use tune_http_types::AuthUser;
 
 use crate::state::AppState;
 
+/// Activer l'authentification depuis l'interface (web#3195) et voie de
+/// secours : la règle de sécurité est écrite en tête du module.
+pub mod activation;
+
 // ---------------------------------------------------------------------------
 // JWT Claims & AuthUser
 // ---------------------------------------------------------------------------
@@ -813,7 +817,8 @@ impl FromRequestParts<AppState> for AdminOuCetteMachine {
         } else {
             (
                 "not_local",
-                "This action requires authentication to be enabled, or a call from this \
+                "This action requires authentication to be enabled (Settings > System > \
+                 Server authentication) and an administrator session, or a call from this \
                  machine (localhost).",
             )
         };
@@ -843,6 +848,8 @@ pub fn router() -> Router<AppState> {
         .route("/token", post(create_token))
         .route("/api-key", get(get_api_key).post(generate_api_key))
         .route("/config", get(auth_config).post(set_auth_config))
+        .route("/enable", post(activation::activer))
+        .route("/activation-code", post(activation::demander_un_code))
 }
 
 // ---------------------------------------------------------------------------
@@ -1160,9 +1167,17 @@ async fn login(
     }
     clear_login_failures(ip);
 
-    // If logged in with old SHA-256 hash, upgrade to argon2
+    // If logged in with old SHA-256 hash, upgrade to argon2.
+    //
+    // Sécurité (web#3195) : un profil SANS mot de passe (`default`) n'en reçoit
+    // un par cette voie que si l'appel vient de cette machine. Sinon, serveur
+    // ouvert, n'importe qui sur le réseau fixait le mot de passe de
+    // l'administrateur `default`, puis s'en servait une fois l'authentification
+    // activée par le propriétaire. Le réseau passe par `POST /auth/enable`.
+    let avait_un_mot_de_passe = old_hash.as_deref().is_some_and(|h| !h.is_empty());
     if !valid_v2
         && valid
+        && (avait_un_mot_de_passe || bouclage_de_l_operateur(ip))
         && let Ok(upgraded) = hash_password(&body.password)
     {
         state
@@ -1320,7 +1335,11 @@ async fn generate_api_key(State(state): State<AppState>, user: Option<AuthUser>)
 // Auth config endpoints
 // ---------------------------------------------------------------------------
 
-async fn auth_config(State(state): State<AppState>) -> Json<Value> {
+async fn auth_config(
+    State(state): State<AppState>,
+    activation::DepuisCetteMachine(locale): activation::DepuisCetteMachine,
+    appelant: Option<AuthUser>,
+) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let enabled = settings
         .get("auth_enabled")
@@ -1340,10 +1359,25 @@ async fn auth_config(State(state): State<AppState>) -> Json<Value> {
         .flatten()
         .map(|s| !s.is_empty())
         .unwrap_or(false);
+    // Le dossier de la base (code d'activation, fichier de secours) : à qui
+    // peut déjà tout faire — serveur ouvert, ou administrateur — jamais à un
+    // anonyme quand l'authentification est active (cette route est publique).
+    let est_admin = appelant.as_ref().is_some_and(|u| u.role == "admin");
+    let dossier = if !enabled || est_admin {
+        activation::dossier_de_la_base(&state).map(|d| d.to_string_lossy().into_owned())
+    } else {
+        None
+    };
     Json(json!({
         "auth_enabled": enabled,
         "has_jwt_secret": has_secret,
         "has_api_key": has_api_key,
+        // web#3195 — ce que l'interrupteur des Réglages doit savoir.
+        "admin_with_password": activation::admin_avec_mot_de_passe_existe(&state),
+        "this_machine": locale,
+        "activation_code_file": activation::FICHIER_CODE,
+        "recovery_file": activation::FICHIER_DE_SECOURS,
+        "data_dir": dossier,
     }))
 }
 
@@ -1353,29 +1387,82 @@ struct SetAuthConfig {
     jwt_secret: Option<String>,
 }
 
+/// Écrire `auth_enabled` / `jwt_secret` (web#3195).
+///
+/// - Authentification ACTIVE : administrateur seulement (inchangé) ; il peut
+///   la couper.
+/// - Authentification COUPÉE : seulement depuis cette machine (même lecture
+///   que `AdminOuCetteMachine`), et l'activation exige un administrateur avec
+///   mot de passe (409 sinon). Depuis le réseau, l'activation passe par
+///   `POST /auth/enable` (code d'activation, administrateur, session ouverte) :
+///   voir `auth::activation`.
 async fn set_auth_config(
     State(state): State<AppState>,
+    activation::DepuisCetteMachine(locale): activation::DepuisCetteMachine,
     user: Option<AuthUser>,
     Json(body): Json<SetAuthConfig>,
 ) -> Response {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    if let Err(resp) = ensure_admin_if_auth_enabled(&settings, user.as_ref()) {
-        return resp;
-    }
-    if let Some(enabled) = body.auth_enabled {
-        settings
-            .set("auth_enabled", if enabled { "true" } else { "false" })
-            .ok();
-
-        // Auto-generate JWT secret when enabling auth
-        if enabled {
-            get_or_create_jwt_secret(&settings);
+    let active = authentification_active(&state);
+    if active {
+        if let Err(resp) = ensure_admin_if_auth_enabled(&settings, user.as_ref()) {
+            return resp;
+        }
+    } else {
+        let ecrit_quelque_chose = body.auth_enabled == Some(true)
+            || body.jwt_secret.as_deref().is_some_and(|s| !s.is_empty());
+        if ecrit_quelque_chose && !locale {
+            tracing::warn!("auth_config_refusee_hors_de_cette_machine");
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "use_enable_flow",
+                    "code": "use_enable_flow",
+                    "message": "From another device, authentication is enabled through \
+                                POST /api/v1/auth/enable (administrator password and \
+                                activation code).",
+                })),
+            )
+                .into_response();
+        }
+        if body.auth_enabled == Some(true) && !activation::admin_avec_mot_de_passe_existe(&state) {
+            return (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "admin_password_required",
+                    "code": "admin_password_required",
+                    "message": "No administrator has a password yet: create one first.",
+                })),
+            )
+                .into_response();
         }
     }
     if let Some(ref secret) = body.jwt_secret
         && !secret.is_empty()
     {
         settings.set("jwt_secret", secret).ok();
+    }
+    if let Some(enabled) = body.auth_enabled {
+        if enabled && !active {
+            // Secret renouvelé (sauf s'il vient d'être fourni) : un jeton
+            // fabriqué pendant que le serveur était ouvert ne vaut plus rien.
+            if body.jwt_secret.as_deref().is_none_or(str::is_empty) {
+                settings
+                    .set("jwt_secret", &uuid::Uuid::new_v4().to_string())
+                    .ok();
+            }
+            tracing::warn!(depuis_cette_machine = locale, "authentification_activee");
+        } else if enabled {
+            get_or_create_jwt_secret(&settings);
+        } else if active {
+            tracing::warn!(
+                administrateur = user.as_ref().map(|u| u.user_id).unwrap_or(0),
+                "authentification_desactivee"
+            );
+        }
+        settings
+            .set("auth_enabled", if enabled { "true" } else { "false" })
+            .ok();
     }
 
     let enabled = settings

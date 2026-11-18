@@ -2228,3 +2228,18 @@ path = "tests/radios_doublons_7773.rs"
 [[test]]
 name = "pays_edition_8668"
 path = "tests/pays_edition_8668.rs"
+
+# web#3195 — activer l'authentification depuis l'interface : code
+# d'activation, administrateur avec mot de passe, session ouverte, route
+# d'écriture fermée au réseau, voie de secours. `autotests = false` : sans
+# cette cible, jamais compilé.
+[[test]]
+name = "activation_authentification_3195"
+path = "tests/activation_authentification_3195.rs"
+
+# Garde P0 de la couche d'authentification (audit 2026-08). Le fichier
+# existait sans cible : `autotests = false` ne l'a jamais compilé (constaté
+# en web#3195).
+[[test]]
+name = "auth_security"
+path = "tests/auth_security.rs"

@@ -429,6 +429,10 @@ pub async fn run_with(opts: RunOptions) {
     let state = AppState::new(&config.db_path, config.port, config.clone())
         .expect("failed to init app state");
 
+    // web#3195 — voie de secours : un fichier `desactiver-authentification`
+    // dans le dossier de la base coupe l'authentification (mot de passe perdu).
+    crate::auth::activation::appliquer_le_fichier_de_secours(&state);
+
     // #5320 — la sonde du processeur est relevée en tâche de fond, une fois
     // par seconde : l'écran et la garde thermique lisent une médiane, pas la
     // pointe que provoque la requête qui les interroge.

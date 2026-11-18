@@ -213,15 +213,17 @@ async fn passwordless_default_allowed_from_loopback_then_admin_can_rotate() {
     );
 }
 
-/// With auth disabled (the default), first-run setup must stay open — the admin
-/// UI enables auth from an unauthenticated, secret-less state.
+/// With auth disabled (the default), enabling it is NOT open to the network
+/// any more (web#3195): from another device it goes through
+/// `POST /auth/enable` with the activation code. From this machine, the old
+/// route still works once an administrator has a password.
 #[tokio::test]
-async fn auth_disabled_keeps_first_run_setup_open() {
+async fn auth_disabled_enable_is_refused_from_the_network() {
     let state = new_state();
-    let app = app(&state, REMOTE);
+    let remote = app(&state, REMOTE);
 
-    let (st, _) = post_json(
-        &app,
+    let (st, body) = post_json(
+        &remote,
         "/api/v1/auth/config",
         None,
         r#"{"auth_enabled":true}"#,
@@ -229,9 +231,29 @@ async fn auth_disabled_keeps_first_run_setup_open() {
     .await;
     assert_eq!(
         st,
-        StatusCode::OK,
-        "first-run enable-auth must not be blocked"
+        StatusCode::FORBIDDEN,
+        "network enable must be refused: {body}"
     );
+    assert!(body.contains("use_enable_flow"), "{body}");
+
+    // From this machine: the `default` admin gets its password, then enables.
+    let local = app(&state, LOCAL);
+    let (st, _) = post_json(
+        &local,
+        "/api/v1/auth/login",
+        None,
+        r#"{"username":"default","password":"firstpass"}"#,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, body) = post_json(
+        &local,
+        "/api/v1/auth/config",
+        None,
+        r#"{"auth_enabled":true}"#,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "local enable: {body}");
 }
 
 /// Brute-force throttling: after LOGIN_MAX_FAILURES bad attempts from one IP,
