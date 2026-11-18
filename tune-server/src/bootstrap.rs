@@ -1019,15 +1019,41 @@ pub fn installer_le_journal(niveau_journal: &str) -> Option<std::path::PathBuf> 
     // justement le seul qui puisse dépasser 10 Mio (voir tune-server/journal.rs
     // et #2156).
     const PLAFOND_JOURNAL: u64 = 10 * 1024 * 1024;
-    let log_file = {
-        let path = config::default_log_file_path();
-        config::rotate_log_file(&path, PLAFOND_JOURNAL);
-        crate::journal::JournalBorne::ouvrir(path.clone(), PLAFOND_JOURNAL)
-            .ok()
-            .map(|j| {
-                eprintln!("Logging to {}", path.display());
-                (j, path)
-            })
+    //
+    // #8946 — l'emplacement par défaut peut être REFUSÉ au service
+    // (`ProtectHome=yes` sur Tune OS : `$HOME` inaccessible). On se replie
+    // alors sur un dossier où il a le droit d'écrire
+    // ([`config::replis_du_journal`]), on retient le chemin pour que l'export
+    // lise ce même fichier, et chaque refus est dit — sur le flux d'erreur tout
+    // de suite, dans le journal une fois l'abonné posé.
+    let (log_file, refus_du_journal) = {
+        let candidats = std::iter::once(config::default_log_file_path())
+            .chain(config::replis_du_journal_courants());
+        let (ouvert, refus) = crate::journal::ouvrir_le_premier_journal(candidats, PLAFOND_JOURNAL);
+        for (chemin, e) in &refus {
+            eprintln!(
+                "tune-server: journal impossible à ouvrir {} : {e}",
+                chemin.display()
+            );
+        }
+        let ouvert = ouvert.map(|(j, path)| {
+            eprintln!("Logging to {}", path.display());
+            if !refus.is_empty() {
+                config::retenir_le_journal(path.clone());
+            }
+            (j, path)
+        });
+        (ouvert, refus)
+    };
+    let dire_les_refus = |ecrit_dans: Option<&std::path::Path>| {
+        for (chemin, e) in &refus_du_journal {
+            tracing::warn!(
+                refuse = %chemin.display(),
+                error = %e,
+                ecrit_dans = ?ecrit_dans.map(|p| p.display().to_string()),
+                "journal_emplacement_refuse"
+            );
+        }
     };
 
     if let Some((file, chemin)) = log_file {
@@ -1059,6 +1085,7 @@ pub fn installer_le_journal(niveau_journal: &str) -> Option<std::path::PathBuf> 
             .with(file_layer)
             .init();
 
+        dire_les_refus(Some(&chemin));
         if console_ferait_doublon {
             // `eprintln!` ne traverse pas `tracing` : cette ligne-là n'est
             // jamais dédoublée. Elle va sur le flux d'erreur, que le lanceur
@@ -1078,6 +1105,7 @@ pub fn installer_le_journal(niveau_journal: &str) -> Option<std::path::PathBuf> 
         .with_ansi(la_console_veut_des_couleurs())
         .with_env_filter(env_filter)
         .init();
+    dire_les_refus(None);
     None
 }
 
