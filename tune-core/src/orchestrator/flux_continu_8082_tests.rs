@@ -198,4 +198,94 @@ mod bout_en_bout {
         assert_eq!(r.mime_type, "audio/flac");
         assert!(crate::outputs::dlna_flux_continu::plan_de(dev).is_none());
     }
+
+    /// #8968 — deux pistes d'une feuille CUE (image FLAC de 17 640 trames,
+    /// frontière à 00:00:16 = 213,33 ms = 9 408 trames) : réglage armé, elles
+    /// partent en UN WAV dont le PCM est l'image ENTIÈRE, sans une trame
+    /// perdue ni dupliquée, et la frontière tombe à l'échantillon.
+    async fn resoudre_cue(
+        renderer: &str,
+        armer: bool,
+    ) -> (PlaybackOrchestrator, ResolvedStream, tempfile::TempDir) {
+        let orch = orchestrateur();
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("image.flac");
+        std::fs::copy(FLAC, &image).unwrap();
+        let media = image.to_string_lossy().into_owned();
+        let debut_2 = crate::scanner::cue::parse_cue_time("00:00:16").unwrap() as i64;
+        assert_eq!(debut_2, 213, "la base range des millisecondes tronquées");
+        for (id, debut, fin) in [(1i64, 0i64, Some(debut_2)), (2, debut_2, None)] {
+            orch.db
+                .execute(
+                    "INSERT INTO tracks (id, title, format, duration_ms, sample_rate, \
+                     bit_depth, channels, cue_media_path, cue_start_ms, cue_end_ms) \
+                     VALUES (?, 'Piste', 'flac', 200, 44100, 16, 2, ?, ?, ?)",
+                    &[
+                        &id as &dyn ToSqlValue,
+                        &media as &dyn ToSqlValue,
+                        &debut as &dyn ToSqlValue,
+                        &fin as &dyn ToSqlValue,
+                    ],
+                )
+                .unwrap();
+        }
+        let zones = ZoneRepo::with_backend(orch.db.clone());
+        let zone_id = zones.create("Salon", Some("dlna"), Some(renderer)).unwrap();
+        if armer {
+            crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+                .set(&crate::outputs::dlna_flux_continu::cle(zone_id), "true")
+                .unwrap();
+        }
+        orch.outputs.lock().await.register(Box::new(
+            MockOutput::new(renderer, "Salon").with_type("dlna"),
+        ));
+        crate::db::play_queue_repo::PlayQueueRepo::with_backend(orch.db.clone())
+            .set_queue(zone_id, &[1, 2])
+            .unwrap();
+        orch.playback.update_queue_info(zone_id, 0, 2).await;
+        let resolu = orch
+            .resolve_stream(&PlayRequest {
+                zone_id,
+                output_device_id: Some(renderer.into()),
+                track_id: Some(1),
+                source: Some("local".into()),
+                ..Default::default()
+            })
+            .await
+            .expect("la piste CUE se résout");
+        (orch, resolu, dir)
+    }
+
+    #[tokio::test]
+    async fn zone_armee_les_tranches_cue_partent_en_un_seul_wav_8968() {
+        let dev = "dlna-8968-cue-arme";
+        let (_orch, r, _dir) = resoudre_cue(dev, true).await;
+        assert_eq!(
+            r.mime_type, "audio/wav",
+            "flux continu attendu pour la tranche CUE"
+        );
+        assert_eq!(
+            r.file_size,
+            Some(44 + 17_640 * 4),
+            "les deux tranches couvrent l'image entière, à la trame près"
+        );
+        let plan = crate::outputs::dlna_flux_continu::plan_de(dev).expect("plan posé");
+        assert_eq!(
+            plan.pistes
+                .iter()
+                .map(|p| (p.position, p.track_id, p.debut_ms, p.duree_ms))
+                .collect::<Vec<_>>(),
+            // 9 408 trames = 213,33 ms ; 8 232 trames = 186,67 ms.
+            vec![(0, 1, 0, 213), (1, 2, 213, 187)]
+        );
+    }
+
+    /// Réglage éteint : la tranche CUE se transcode comme avant, sans plan.
+    #[tokio::test]
+    async fn zone_non_armee_la_tranche_cue_se_transcode_comme_avant_8968() {
+        let dev = "dlna-8968-cue-eteint";
+        let (_orch, r, _dir) = resoudre_cue(dev, false).await;
+        assert!(crate::outputs::dlna_flux_continu::plan_de(dev).is_none());
+        assert_ne!(r.file_size, Some(44 + 17_640 * 4));
+    }
 }
