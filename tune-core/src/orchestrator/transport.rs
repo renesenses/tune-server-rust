@@ -2383,6 +2383,20 @@ impl PlaybackOrchestrator {
                     crate::zones::retard_groupe_mixte_8437::retard_de_depart_de_la_zone(
                         &self.db, zone_id,
                     );
+                // ReplayGain, applied by the output itself for a local DAC.
+                // A PURE zone is left strictly alone: applying a gain would
+                // multiply every sample and the path would no longer be
+                // bit-perfect, which is the one thing PURE promises.
+                // #8689 — un titre Qobuz / TIDAL reçoit le gain que le
+                // service publie, au même calcul qu'une piste locale.
+                // #8968 — calculé AVANT le verrou de la sortie : en mode Auto,
+                // c'est ici que la granularité de la piste lancée est décidée
+                // (une lecture de la file), puis retenue pour toute la piste.
+                let rg = if zone_audiophile {
+                    1.0
+                } else {
+                    crate::audio::replaygain::facteur_de_zone(&self.db, zone_id, piste)
+                };
                 let output = output_arc.lock().await;
                 if let Some(local_output) = output
                     .as_any()
@@ -2405,17 +2419,6 @@ impl PlaybackOrchestrator {
                     // #6522, #6524 — ce que PURE contourne, lu dans les
                     // réglages : la chaîne posée plus bas sera vide en PURE.
                     self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);
-                    // ReplayGain, applied by the output itself for a local DAC.
-                    // A PURE zone is left strictly alone: applying a gain would
-                    // multiply every sample and the path would no longer be
-                    // bit-perfect, which is the one thing PURE promises.
-                    // #8689 — un titre Qobuz / TIDAL reçoit le gain que le
-                    // service publie, au même calcul qu'une piste locale.
-                    let rg = if zone_audiophile {
-                        1.0
-                    } else {
-                        crate::audio::replaygain::facteur_de_zone(&self.db, zone_id, piste)
-                    };
                     // #4685 — posé AVANT le facteur et les processeurs : chacun
                     // recompose le gain de rendu à son installation.
                     local_output

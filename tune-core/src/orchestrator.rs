@@ -2178,6 +2178,9 @@ mod service_wav_progressif_openhome_6718;
 
 mod dsp;
 // #5662 — une commande de volume à la fois par sortie, la dernière valeur gagne.
+/// #8968 (PR 0) — banc de mesure de la jointure entre deux pistes.
+#[cfg(test)]
+mod banc_jointure_8968_tests;
 /// #8082 — flux continu entre les pistes pour les renderers DLNA.
 mod flux_continu_8082;
 mod repere_de_hausse_6721;
@@ -2472,6 +2475,9 @@ mod mesure_saut_cd_5079;
 /// FLAC (ou le catalogue) ; inconnue, elle est refusée par une erreur nommée.
 #[cfg(test)]
 mod qobuz_cadence_nulle_5283_tests;
+/// #8983 — un saut Qobuz vers une sortie locale part de la position.
+#[cfg(test)]
+mod saut_qobuz_8983_tests;
 #[cfg(test)]
 mod tidal_aac_annonce_6334_tests;
 /// #7266 — de bout en bout, un FLAC CD TIDAL en DASH jusqu'au Play reçu par
