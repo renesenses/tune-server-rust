@@ -129,6 +129,8 @@ pub mod support;
 pub mod system;
 pub mod tagger;
 pub mod tags;
+// TESS T17 — préréglages de chaîne et mode d'application.
+pub mod tess_prereglages_t17;
 pub mod upnp;
 pub mod upnp_media_renderer;
 pub mod upnp_media_server;
@@ -473,13 +475,18 @@ pub fn router_with_plugins(
         .to_string_lossy()
         .into_owned();
 
-    let zones_and_playback = zones::router().merge(playback::router());
+    // TESS T17 — `/zones/{id}/tess/presets…` vit avec les zones.
+    let zones_and_playback = zones::router()
+        .merge(playback::router())
+        .merge(tess_prereglages_t17::router_zones());
     let api = Router::new()
         .route(
             "/playback/shuffle-all",
             axum::routing::post(playback::shuffle_all),
         )
         .nest("/system", system::router())
+        // TESS T17 — préréglages globaux de chaîne.
+        .nest("/tess", tess_prereglages_t17::router())
         .route("/demo/library", get(demo_library))
         .nest("/library", library::router())
         .nest("/library/history", history::router())

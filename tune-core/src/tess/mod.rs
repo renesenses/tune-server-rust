@@ -29,6 +29,8 @@ pub mod etage;
 pub mod greffon;
 pub mod migration;
 pub mod prereglages;
+/// Préréglages : stockage, chargement par zone, actif (lot T17).
+pub mod prereglages_stockage;
 pub mod resolution;
 pub mod zones;
 

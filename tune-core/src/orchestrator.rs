@@ -2093,6 +2093,8 @@ pub mod bail_parental_7974;
 #[cfg(test)]
 mod bail_parental_7974_tests;
 mod commun;
+// TESS T17 — appliquer une chaîne chargée (préréglage) selon le mode.
+pub mod relance_tess_t17;
 // #8088 — contrôle parental : refus de lecture des contenus explicites.
 mod confirmation_navigateur_6066;
 pub mod contenu_explicite_8088;
