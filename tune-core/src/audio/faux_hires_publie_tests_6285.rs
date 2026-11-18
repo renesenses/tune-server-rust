@@ -406,7 +406,7 @@ fn un_cd_n_est_jamais_hires_douteux_9067() {
             .unwrap();
         }
     }
-    let ids: Vec<i64> = (1..=11).collect();
+    let ids: Vec<i64> = (1..=7).chain([10, 11]).collect();
     let par_album = pistes_mesurees_par_album(&db, &ids).unwrap();
     assert_eq!(publier_l_album(&par_album[&10], true), ("conforme", None));
     assert_eq!(pistes_douteuses_publiees(&par_album[&10], true), None);

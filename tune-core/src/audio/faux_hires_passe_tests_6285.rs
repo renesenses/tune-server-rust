@@ -436,10 +436,11 @@ fn l_ancien_code_codec_est_remesure_une_fois_9035() {
     );
     assert_eq!(compter_les_candidats(&db), 2);
     // La remesure range un nouveau code : la piste sort des candidates.
+    // Un 24/44,1 (il se dit hi-res : #9067) coupé à 16 kHz.
     let mesure = Mesure {
         sample_rate: 44_100,
-        bits_declares: 16,
-        bits_effectifs: Some(16),
+        bits_declares: 24,
+        bits_effectifs: Some(24),
         coupure_hz: Some(16_000.0),
         ..Default::default()
     };
