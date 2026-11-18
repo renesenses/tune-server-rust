@@ -3080,11 +3080,22 @@ pub(super) struct ImportConfigQuery {
 /// écriture qui échoue en cours de route est DITE (`500`) avec ce qui était
 /// déjà appliqué, au lieu d'un `200` silencieusement incomplet.
 pub(super) async fn import_config(
-    _admin: crate::auth::RequireAdmin,
+    // Engage la machine : administrateur, ou authentification coupée,
+    // seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
+    state: State<AppState>,
+    q: Query<ImportConfigQuery>,
+    body: Json<serde_json::Map<String, Value>>,
+) -> Result<impl IntoResponse, AppError> {
+    importer_la_configuration(state, q, body).await
+}
+
+/// Le corps de l'import, partagé avec l'aperçu (qui n'écrit rien).
+async fn importer_la_configuration(
     State(state): State<AppState>,
     Query(q): Query<ImportConfigQuery>,
     Json(body): Json<serde_json::Map<String, Value>>,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<Json<Value>, AppError> {
     use tune_core::config_export as ce;
     let mut fichier = ce::lire(body).map_err(AppError::bad_request)?;
     // Mêmes clés protégées que `PATCH /system/config` : sans admin effectif,
@@ -3137,12 +3148,11 @@ pub(super) async fn import_config(
 /// `?dry_run=true`, ignorerait le paramètre et APPLIQUERAIT l'import — c'est
 /// pourquoi l'écran passe par ici.
 pub(super) async fn preview_import_config(
-    admin: crate::auth::RequireAdmin,
+    _admin: crate::auth::RequireAdmin,
     state: State<AppState>,
     Json(body): Json<serde_json::Map<String, Value>>,
 ) -> Result<impl IntoResponse, AppError> {
-    import_config(
-        admin,
+    importer_la_configuration(
         state,
         Query(ImportConfigQuery { dry_run: true }),
         Json(body),
@@ -4593,7 +4603,9 @@ pub(super) async fn purge_orphan_tracks(
 /// Honnêteté : sur une installation supervisée (systemd `Restart=always`,
 /// service Windows), le superviseur peut relancer le processus aussitôt —
 /// l'écran le dit dans la confirmation.
-pub(super) async fn stop(_admin: crate::auth::RequireAdmin) -> impl IntoResponse {
+/// Arrêter le serveur engage la machine, comme le redémarrage : même garde
+/// (administrateur, ou authentification coupée : seulement depuis cette machine).
+pub(super) async fn stop(_garde: crate::auth::AdminOuCetteMachine) -> impl IntoResponse {
     tokio::spawn(async {
         // Laisser la réponse HTTP partir avant de mourir.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;

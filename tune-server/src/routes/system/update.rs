@@ -2421,7 +2421,9 @@ pub(super) struct UpdateChannelBody {
 /// laisserait l'écran croire que « nightly » a été retenu alors que le serveur
 /// serait resté sur `auto`.
 pub(super) async fn update_channel_set(
-    _admin: crate::auth::RequireAdmin,
+    // Engage la machine : administrateur, ou authentification coupée,
+    // seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     Json(body): Json<UpdateChannelBody>,
 ) -> impl IntoResponse {

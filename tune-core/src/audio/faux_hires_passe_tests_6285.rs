@@ -329,3 +329,201 @@ fn le_verdict_d_album_6285() {
         ("conforme".into(), None)
     );
 }
+
+/// #9035 — l'ancien `coupure_de_codec` (rangé sans signature mesurée) se
+/// publie `coupure_spectrale`, et compte avec elle ; le compte des pistes en
+/// cause dit « 2 sur 3 » (la non concluante n'est pas mesurée).
+#[test]
+fn l_album_dit_sa_coupure_et_combien_de_pistes_9035() {
+    let p = |v: &str, r: Option<&str>| (v.to_string(), r.map(str::to_string));
+    let pistes = [
+        p("douteux", Some("coupure_de_codec")),
+        p("douteux", Some("coupure_spectrale")),
+        p("douteux", Some("bande_de_cd")),
+        p("verifie", None),
+        p("non_concluant", None),
+    ];
+    assert_eq!(
+        verdict_d_album(&pistes),
+        ("douteux".into(), Some("coupure_spectrale".into()))
+    );
+    assert_eq!(pistes_en_cause(&pistes), (3, 4));
+    assert_eq!(pistes_en_cause(&[]), (0, 0));
+}
+
+/// #9035 (décision du 18/11, fil 2902) — un album n'est douteux qu'à partir
+/// de la MOITIÉ de ses pistes mesurées. Deux bonus douteux sur dix : l'album
+/// garde le verdict de ses autres pistes ; six sur dix : douteux.
+#[test]
+fn un_album_n_est_douteux_qu_a_partir_de_la_moitie_9035() {
+    let album = |douteuses: usize, autre: &str| -> Vec<(String, Option<String>)> {
+        (0..10)
+            .map(|i| {
+                if i < douteuses {
+                    ("douteux".to_string(), Some("coupure_spectrale".to_string()))
+                } else {
+                    (autre.to_string(), None)
+                }
+            })
+            .collect()
+    };
+    assert_eq!(
+        verdict_d_album(&album(2, "verifie")),
+        ("verifie".into(), None)
+    );
+    assert_eq!(pistes_en_cause(&album(2, "verifie")), (2, 10));
+    assert_eq!(
+        verdict_d_album(&album(2, "conforme")),
+        ("douteux".into(), Some("coupure_spectrale".into())),
+        "#9067 — la moitié se compte sur les pistes qui se disent hi-res : 2 sur 2"
+    );
+    assert_eq!(pistes_en_cause(&album(2, "conforme")), (2, 2));
+    assert_eq!(
+        verdict_d_album(&album(4, "verifie")),
+        ("verifie".into(), None)
+    );
+    assert_eq!(
+        verdict_d_album(&album(5, "verifie")),
+        ("douteux".into(), Some("coupure_spectrale".into())),
+        "la moitié pile suffit"
+    );
+    assert_eq!(
+        verdict_d_album(&album(6, "verifie")),
+        ("douteux".into(), Some("coupure_spectrale".into()))
+    );
+    assert_eq!(
+        raison_des_douteuses(&album(2, "verifie")),
+        Some("coupure_spectrale".into())
+    );
+    assert_eq!(raison_des_douteuses(&album(0, "verifie")), None);
+    // Les non concluantes ne comptent pas : 1 douteuse sur 2 mesurées.
+    let mut p = album(1, "non_concluant");
+    p[1] = ("verifie".into(), None);
+    assert_eq!(verdict_d_album(&p).0, "douteux");
+}
+
+/// #9035 (décision du 18/11) — REMESURE CIBLÉE : une piste dont la mesure
+/// porte l'ancien `coupure_de_codec` redevient candidate, APRÈS les pistes
+/// jamais mesurées ; les autres mesures ne sont pas touchées ; une fois
+/// remesurée (nouveau code), elle n'est plus candidate.
+#[test]
+fn l_ancien_code_codec_est_remesure_une_fois_9035() {
+    let db = base();
+    for id in 1..=4 {
+        piste(&db, id, &format!("/m/a/{id}.flac"), "flac", "local");
+    }
+    for (id, raison) in [
+        (1i64, "coupure_de_codec"),
+        (2, "coupure_spectrale"),
+        (3, "bande_de_cd"),
+    ] {
+        let raison = raison.to_string();
+        db.execute(
+            "INSERT INTO hires_verifications (track_id, verdict, raison, coupure_hz, sample_rate, bits_declares) \
+             VALUES (?1, 'douteux', ?2, 16000.0, 96000, 24)",
+            &[&id as &dyn ToSqlValue, &raison],
+        )
+        .unwrap();
+    }
+    let ids: Vec<i64> = prochains_candidats(&db, 10)
+        .iter()
+        .map(|c| c.track_id)
+        .collect();
+    assert_eq!(
+        ids,
+        vec![4, 1],
+        "la jamais mesurée d'abord, puis la remesure"
+    );
+    assert_eq!(compter_les_candidats(&db), 2);
+    // La remesure range un nouveau code : la piste sort des candidates.
+    // Un 24/44,1 (il se dit hi-res : #9067) coupé à 16 kHz.
+    let mesure = Mesure {
+        sample_rate: 44_100,
+        bits_declares: 24,
+        bits_effectifs: Some(24),
+        coupure_hz: Some(16_000.0),
+        ..Default::default()
+    };
+    enregistrer(&db, 1, &Ok(mesure.clone())).unwrap();
+    enregistrer(&db, 4, &Ok(mesure)).unwrap();
+    assert_eq!(compter_les_candidats(&db), 0);
+    let r = db
+        .query_one(
+            "SELECT raison FROM hires_verifications WHERE track_id = 1",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(r[0].as_string().as_deref(), Some("coupure_spectrale"));
+}
+
+/// #9035 — une REMESURE qui ne peut pas lire le fichier (NAS en veille) ne
+/// perd pas la mesure : la ligne reste `douteux` avec sa coupure, seule la
+/// raison passe de `coupure_de_codec` à `coupure_spectrale` ; jamais
+/// `non_concluant`. Elle n'est plus candidate. Une piste jamais mesurée et
+/// illisible, elle, reste rangée `non_concluant` comme avant.
+#[test]
+fn une_remesure_illisible_garde_le_verdict_douteux_9035() {
+    let db = base();
+    piste(&db, 1, "/m/a/1.flac", "flac", "local");
+    piste(&db, 2, "/m/a/2.flac", "flac", "local");
+    db.execute(
+        "INSERT INTO hires_verifications (track_id, verdict, raison, coupure_hz, bits_effectifs, sample_rate, bits_declares) \
+         VALUES (1, 'douteux', 'coupure_de_codec', 16000.0, 24, 96000, 24)",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(compter_les_candidats(&db), 2);
+    enregistrer(&db, 1, &Err("fichier injoignable".into())).unwrap();
+    enregistrer(&db, 2, &Err("fichier injoignable".into())).unwrap();
+    let r = db
+        .query_one(
+            "SELECT verdict, raison, coupure_hz, bits_effectifs FROM hires_verifications WHERE track_id = 1",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(r[0].as_string().as_deref(), Some("douteux"), "{r:?}");
+    assert_eq!(
+        r[1].as_string().as_deref(),
+        Some("coupure_spectrale"),
+        "{r:?}"
+    );
+    assert_eq!(r[2].as_f64(), Some(16000.0), "{r:?}");
+    assert_eq!(r[3].as_i64(), Some(24), "{r:?}");
+    let r = db
+        .query_one(
+            "SELECT verdict, raison FROM hires_verifications WHERE track_id = 2",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(r[0].as_string().as_deref(), Some("non_concluant"));
+    assert_eq!(r[1].as_string().as_deref(), Some("decodage_impossible"));
+    assert_eq!(compter_les_candidats(&db), 0);
+}
+
+/// #9067 — la ligne `coupure_de_codec` d'un CD (16 bits, 48 kHz au plus) se
+/// lit déjà `conforme` : elle n'est PAS remesurée (décodage inutile). Celle
+/// d'un 24/44,1 l'est.
+#[test]
+fn la_ligne_codec_d_un_cd_n_est_pas_remesuree_9067() {
+    let db = base();
+    for id in 1..=2 {
+        piste(&db, id, &format!("/m/a/{id}.flac"), "flac", "local");
+    }
+    for (id, rate, bits) in [(1i64, 44_100i64, 16i64), (2, 44_100, 24)] {
+        db.execute(
+            "INSERT INTO hires_verifications (track_id, verdict, raison, coupure_hz, sample_rate, bits_declares) \
+             VALUES (?1, 'douteux', 'coupure_de_codec', 16000.0, ?2, ?3)",
+            &[&id as &dyn ToSqlValue, &rate, &bits],
+        )
+        .unwrap();
+    }
+    let ids: Vec<i64> = prochains_candidats(&db, 10)
+        .iter()
+        .map(|c| c.track_id)
+        .collect();
+    assert_eq!(ids, vec![2], "seul le 24/44,1 est remesuré, pas le CD");
+    assert_eq!(compter_les_candidats(&db), 1);
+}

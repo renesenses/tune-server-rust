@@ -914,3 +914,53 @@ fn la_simulation_sans_micro_est_premium_et_ne_propose_que_des_coupes_prudentes()
     assert!(j.profils[0].filters.iter().all(|f| f.gain_db <= 0.0));
     assert!(j.joues.is_empty(), "une simulation a joué quelque chose");
 }
+
+/// #9070 (fil 2770) — l'UMIK-1 s'ouvrait en ALSA direct mais ne remettait
+/// aucune trame : la mesure attendait une minute et finissait en « capture
+/// trop lente : 0 trames sur 216000 attendues », après avoir joué une salve.
+/// Elle échoue désormais en ~4 s, AVANT toute salve, avec un code que
+/// l'écran traduit et le périphérique ouvert.
+#[test]
+fn un_micro_qui_ne_renvoie_rien_arrete_la_mesure_en_quatre_secondes_9070() {
+    use std::sync::atomic::Ordering;
+    let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
+    let boucle = Boucle::new(PieceEnDirect::depuis(&sim, 1.0), VITESSE);
+    let fournisseur = FournisseurBalayage::new();
+    let hote = HoteSimule::new(fournisseur.clone(), boucle, Some(50.0));
+    let micro = tune_entree_audio::simule::Simulees::avec(MICRO, FREQUENCE_MESURE);
+    micro.sans_trames.store(true, Ordering::SeqCst);
+    let dossier = tune_core::test_scratch::scratch_dir("tune-calibration-muet-9070");
+    let controleur = Controleur::new(
+        micro,
+        hote.clone(),
+        fournisseur,
+        dossier.path().to_path_buf(),
+    );
+    let t0 = Instant::now();
+    let id = controleur.lancer(demande(4)).expect("lancée");
+    let etat = attendre_fin(&controleur, &id, Duration::from_secs(20));
+    let duree = t0.elapsed();
+    let Etat::Erreur { message } = etat else {
+        panic!("#9070 : erreur attendue, obtenu {etat:?}");
+    };
+    assert!(
+        message.contains("ne renvoie aucun son") && message.contains(MICRO),
+        "{message}"
+    );
+    assert!(
+        duree < Duration::from_secs(10),
+        "#9070 : la mesure a attendu {duree:?} un micro muet (attendu ~4 s)"
+    );
+    let av = controleur.mesure(&id).unwrap().avancement();
+    assert_eq!(av.code, Some("micro_muet"));
+    assert_eq!(
+        av.peripherique.as_deref(),
+        Some(format!("simule:{MICRO}").as_str())
+    );
+    let j = hote.journal();
+    assert!(
+        j.joues.is_empty(),
+        "une salve a été jouée vers un micro muet"
+    );
+    assert!(j.volumes.is_empty(), "le volume de la zone a été touché");
+}

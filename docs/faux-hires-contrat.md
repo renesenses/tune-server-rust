@@ -15,13 +15,57 @@ albums, son filtre et le critère des règles intelligentes.
 | `non_analyse` | aucune mesure, rien de concluant, ou un « douteux » masqué | aucun |
 
 Le verdict d'un album suit celui de ses pistes mesurées (`verdict_d_album`) :
-une piste douteuse le rend douteux ; sinon, toutes les pistes mesurées
-vérifiées le rendent vérifié ; une conforme le rend conforme ; rien de mesuré
-ou rien que du non concluant le laisse non analysé. Les pistes pas encore
-mesurées ne comptent pas.
+**au moins la moitié** de ses pistes mesurées douteuses le rendent douteux
+(#9035, décision du 18/11/2026, fil 2902 : deux bonus douteux sur dix pistes
+ne font pas un album douteux) ; sinon, les pistes douteuses mises de côté,
+toutes les autres pistes mesurées vérifiées le rendent vérifié, une conforme
+le rend conforme, rien de mesuré ou rien que du non concluant le laisse non
+analysé. Les pistes pas encore mesurées et les non concluantes ne comptent
+pas. Un album qui n'est pas douteux mais a des pistes douteuses le dit
+(`pistes_douteuses`, `raison_pistes`) ; chaque piste douteuse garde son
+verdict.
 
-Raisons d'un « douteux » : `bits_de_remplissage`, `bande_de_cd`,
-`coupure_de_codec`.
+**Un CD n'est jamais « Hi-Res douteux »** (#9067, décision du 18/11, fil
+2915) : un fichier qui ne se dit pas hi-res (16 bits, 48 kHz au plus) est
+jugé `conforme` même si son spectre est coupé. Les lignes rangées `douteux`
+avant #9067 pour un tel fichier (`sample_rate` ≤ 48 000 et `bits_declares` ≤
+16) se LISENT `conforme` partout (fiche, liste, filtre, règles, catalogue),
+sans remesure. La règle de la moitié se compte sur les pistes mesurées qui se
+disent hi-res (vérifiées ou douteuses) : « Hi-Res douteux » ⊂ « Hi-Res ».
+
+« Douteux » masqué : un album qui a la moindre piste douteuse (même sous la
+moitié) se publie `non_analyse`, jamais `verifie` ni `conforme` — dans la
+liste, son filtre, les règles intelligentes et le catalogue.
+
+Raisons d'un « douteux » (#9035) :
+
+| Raison | Ce qui a été mesuré |
+|---|---|
+| `bits_de_remplissage` | les bits de poids faible sont toujours nuls |
+| `bande_de_cd` | un hi-res sans rien au-dessus de 20 à 24 kHz |
+| `coupure_spectrale` | le spectre coupé net sous 20 kHz, SANS signature de codec : origine possible, codec avec perte ou filtrage au mastering |
+| `signature_de_codec` | la coupure, ET des bandes de l'aigu vidées par intermittence sous elle : des trous **compatibles** avec un codec avec perte (calibré sur un encodeur simulé ; le libellé reste prudent tant qu'il n'est pas calibré sur de vrais fichiers) |
+
+`coupure_de_codec`, rangé avant #9035 sur la seule fréquence de coupure, n'est
+plus publié : une ligne qui le porte se publie `coupure_spectrale`. Un client
+qui le reçoit d'un serveur plus ancien le lit comme `coupure_spectrale`. La
+passe de fond REMESURE une fois ces pistes-là (après les pistes jamais
+mesurées) ; les autres mesures ne sont pas touchées.
+
+**Publier le serveur et le client web ensemble** : un client antérieur à #9035
+ne connaît ni `coupure_spectrale` ni `signature_de_codec` et montre, sur un
+badge « douteux », l'infobulle de « vérifié ».
+
+Ce que la fiche `GET /library/albums/{id}/hires` rend en plus (#9035), `null`
+sans piste douteuse ou tant que « douteux » est masqué — l'album lui-même
+douteux ou non :
+
+| Champ | Valeur |
+|---|---|
+| `pistes_douteuses` | combien de pistes de l'album sont douteuses |
+| `pistes_mesurees` | sur combien de pistes mesurées qui se disent hi-res (vérifiées ou douteuses, #9067) |
+| `raison_pistes` | la raison la plus fréquente des pistes douteuses (celle de l'album quand il est douteux) |
+| `coupure_hz` | médiane des coupures des pistes douteuses qui portent `raison_pistes` |
 
 ## « Douteux » masqué par défaut
 
@@ -52,6 +96,9 @@ Chaque ligne de `items` porte deux champs de plus :
 |---|---|---|
 | `hires_verdict` | chaîne | `verifie`, `conforme`, `douteux` ou `non_analyse` |
 | `hires_raison` | chaîne ou `null` | la raison d'un `douteux` montré, `null` sinon |
+| `hires_pistes_douteuses` | entier ou `null` | #9035 — pistes douteuses de l'album (douteux ou non), `null` sans piste douteuse ou masqué |
+| `hires_pistes_mesurees` | entier ou `null` | #9035 — sur combien de pistes mesurées |
+| `hires_raison_pistes` | chaîne ou `null` | #9035 — la raison la plus fréquente des pistes douteuses |
 
 Paramètre de filtre `?hires_verdict=<verdict>` : seuls les albums dont le
 `hires_verdict` publié est celui-là. Il se combine aux autres facettes, au tri,
