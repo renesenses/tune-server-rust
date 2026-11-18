@@ -118,6 +118,28 @@ pub fn ordre_des_homonymes(ids: &[String]) -> Vec<usize> {
     ordre
 }
 
+/// #9070 (relecture de #9087) — les candidats d'une ouverture par le nom :
+/// l'entrée que la liste montre ([`ordre_des_homonymes`]), puis, en repli,
+/// les SEULS autres PCM ALSA de la même carte et du même périphérique
+/// (`CARD=`/`DEV=` identiques : `plughw:`, `sysdefault`, `dsnoop`…). Jamais
+/// une autre carte de même nom (deux UMIK-1 : `CARD=U18dB` et
+/// `CARD=U18dB_1`), jamais l'entrée par index d'une carte (rien ne dit
+/// laquelle c'est), et aucun repli hors ALSA (deux interfaces identiques sous
+/// macOS) : ouvrir en silence un AUTRE appareil serait pire qu'un refus.
+pub fn candidats_par_le_nom(ids: &[String]) -> Vec<usize> {
+    let ordre = ordre_des_homonymes(ids);
+    let Some(&premier) = ordre.first() else {
+        return Vec::new();
+    };
+    let Some((_, carte)) = pcm_alsa(&ids[premier]) else {
+        return vec![premier];
+    };
+    ordre
+        .into_iter()
+        .filter(|&i| pcm_alsa(&ids[i]).is_some_and(|(_, c)| c == carte))
+        .collect()
+}
+
 /// #9070 — l'entrée qu'une ouverture par le nom essaie d'abord : celle que la
 /// liste réduite montre (`id_systeme`). `None` : liste vide.
 pub fn choisir_parmi_homonymes(ids: &[String]) -> Option<usize> {
@@ -517,6 +539,59 @@ mod une_ligne_par_carte_9070 {
         )
         .unwrap_err();
         assert_eq!(e, "format illisible");
+    }
+
+    /// Relecture de #9087 — deux cartes de même nom : si la première est
+    /// occupée, la seconde n'est JAMAIS ouverte à sa place ; le repli reste
+    /// sur la même carte. Hors ALSA, aucun repli.
+    #[test]
+    fn le_repli_ne_change_jamais_d_appareil_9070() {
+        let brut: Vec<String> = [
+            "alsa:sysdefault:CARD=U18dB",
+            "alsa:hw:CARD=U18dB,DEV=0",
+            "alsa:hw:CARD=U18dB_1,DEV=0",
+            "alsa:plughw:CARD=U18dB,DEV=0",
+            "alsa:plughw:CARD=U18dB_1,DEV=0",
+            "alsa:dsnoop:CARD=U18dB_1,DEV=0",
+            "alsa:hw:CARD=1,DEV=0",
+            "alsa:hw:CARD=U18dB,DEV=1",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let familles: Vec<&str> = candidats_par_le_nom(&brut)
+            .into_iter()
+            .map(|i| brut[i].as_str())
+            .collect();
+        assert_eq!(
+            familles,
+            [
+                "alsa:hw:CARD=U18dB,DEV=0",
+                "alsa:plughw:CARD=U18dB,DEV=0",
+                "alsa:sysdefault:CARD=U18dB"
+            ]
+        );
+        let mut essais = Vec::new();
+        let e = premier_qui_ouvre(
+            candidats_par_le_nom(&brut),
+            |&i| brut[i].clone(),
+            |&i| {
+                essais.push(brut[i].clone());
+                Err::<(), _>("Device or resource busy".to_string())
+            },
+        )
+        .unwrap_err();
+        assert!(
+            essais
+                .iter()
+                .all(|i| !i.contains("U18dB_1") && !i.contains("CARD=1,")),
+            "#9070 : le repli a ouvert un AUTRE appareil de même nom : {essais:?}"
+        );
+        assert!(e.contains("occupé") || e.contains("busy"), "{e}");
+        // Hors ALSA (deux interfaces identiques sous macOS) : la première seule.
+        let mac: Vec<String> = vec!["coreaudio:A".into(), "coreaudio:B".into()];
+        assert_eq!(candidats_par_le_nom(&mac), vec![0]);
+        assert!(candidats_par_le_nom(&[]).is_empty());
     }
 
     #[test]

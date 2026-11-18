@@ -22,7 +22,7 @@ use crate::format::{
     Echantillons, Mesure, bits_servis, contient_iec61937, convertir_entiers, convertir_f32,
 };
 use crate::peripheriques::{
-    Arret, CaptureDemarree, DescriptionEntree, Peripheriques, ordre_des_homonymes,
+    Arret, CaptureDemarree, DescriptionEntree, Peripheriques, candidats_par_le_nom,
     premier_qui_ouvre, une_ligne_par_carte_alsa,
 };
 
@@ -66,7 +66,8 @@ fn echantillons(f: SampleFormat) -> Option<Echantillons> {
 
 /// Les entrées à essayer pour `entree`, dans l'ordre : son identifiant exact
 /// (une seule, sans repli : elle a été choisie) ; sinon toutes celles de ce
-/// nom, `hw:` d'abord puis l'ordre de cpal ([`ordre_des_homonymes`], #9070).
+/// nom, `hw:` d'abord, puis les autres PCM de LA MÊME carte seulement
+/// ([`candidats_par_le_nom`], #9070) ; hors ALSA, la première seule.
 fn candidats(entree: &str) -> Result<Vec<Device>, String> {
     let host = cpal::default_host();
     let entrees: Vec<Device> = host
@@ -85,7 +86,7 @@ fn candidats(entree: &str) -> Result<Vec<Device>, String> {
         return Err(format!("aucune entrée audio « {entree} »"));
     }
     let ids: Vec<String> = homonymes.iter().flatten().map(id).collect();
-    Ok(ordre_des_homonymes(&ids)
+    Ok(candidats_par_le_nom(&ids)
         .into_iter()
         .filter_map(|i| homonymes[i].take())
         .collect())
@@ -331,11 +332,14 @@ impl Peripheriques for Systeme {
         if let Some(f) = physique::frequence_nominale(entree) {
             return Some(f);
         }
-        trouver(entree)
-            .ok()?
-            .default_input_config()
-            .ok()
-            .map(|c| c.sample_rate())
+        // #9070 — `entree` est l'identifiant du PCM ouvert (voir
+        // `Controleur::surveiller`) : c'est lui qu'on interroge, pas un
+        // homonyme. CoreAudio, lui, se lit par le nom.
+        let d = trouver(entree).ok()?;
+        if let Some(f) = physique::frequence_nominale(&nom(&d)) {
+            return Some(f);
+        }
+        d.default_input_config().ok().map(|c| c.sample_rate())
     }
 }
 
