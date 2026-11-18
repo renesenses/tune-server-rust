@@ -1,117 +1,76 @@
 //! Les corps JSON de l'API TESS et leur schéma.
 //!
 //! - `GET /zones/{id}/tess` → [`ReponseTessZone`] ;
-//! - `PUT /zones/{id}/tess` ← [`crate::tess::ChaineTess`], → [`ReponseTessZone`]
-//!   ou [`RefusTess`] (402 droit manquant, 409 chaîne invalide).
+//! - `PUT /zones/{id}/tess` ← corps lu par [`ChaineTess::depuis_corps`]
+//!   (strict), → [`ReponseTessZone`] ou [`RefusTess`] (400 corps illisible,
+//!   402 droit manquant, 409 chaîne invalide).
 //!
 //! Les routes elles-mêmes sont le lot T08. Un serveur sans TESS répond 404 sur
 //! `GET /zones/{id}/tess` : c'est ce qui garde l'écran TESS caché côté web.
+//!
+//! **Règle de compatibilité** : un client IGNORE les champs qu'il ne connaît
+//! pas et lit toute valeur d'énumération inconnue comme `unknown`. Les types
+//! Rust de réponse le font déjà ; [`schema_json_lecture`] est le schéma qu'un
+//! client doit appliquer. [`schema_json`] est le schéma exact de ce que CE
+//! serveur émet et accepte : il sert aux tests du serveur et au corps strict
+//! du `PUT`.
 
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
 use super::VERSION_CONTRAT;
-use super::chaine::{ChaineTess, CodeEtape, ErreurChaine, PlacementVolume};
+use super::chaine::{ChaineTess, ErreurChaine};
 use super::greffon::Catalogue;
+use super::resolution::{Badge, ContexteExecution, EtapeResolue, EtatVolume};
 use super::zones::{Applicabilite, TransportZone};
-
-/// Une étape du chemin du signal d'une zone : demandé, effectif, motif (sur le
-/// modèle de `crossfeed_status`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EtapeZone {
-    pub code: CodeEtape,
-    pub plugin_id: Option<String>,
-    pub fixed: bool,
-    /// Ce que la chaîne demande.
-    pub requested: bool,
-    /// Ce qui est réellement appliqué au son de la zone.
-    pub effective: bool,
-    /// Code stable du motif quand `requested != effective`.
-    pub reason: Option<String>,
-    /// Le motif en clair.
-    pub detail: Option<String>,
-}
 
 /// La réponse de `GET /zones/{id}/tess` (et d'un `PUT` accepté).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ReponseTessZone {
     pub contract_version: u32,
     pub zone_id: i64,
     pub transport: TransportZone,
     pub applicability: Applicabilite,
     pub chain: ChaineTess,
-    /// Headroom réellement appliqué, en dB.
+    /// Le préréglage chargé sur CETTE zone (« ACTIVE »), s'il y en a un.
+    pub active_preset: Option<String>,
+    /// Headroom réellement appliqué, en dB (0 hors TESS ou sans traitement).
     pub headroom_db: f64,
-    pub volume_placement: PlacementVolume,
-    /// L'ordre réel (Q9), source et sortie comprises.
-    pub signal_path: Vec<EtapeZone>,
+    pub volume: EtatVolume,
+    pub badge: Badge,
+    /// L'ordre réel (Q9), source et sortie comprises, demandé et effectif.
+    pub signal_path: Vec<EtapeResolue>,
     /// Les greffons qu'on peut ajouter (« + Add plugin »), avec leurs droits.
     pub catalog: Catalogue,
 }
 
 impl ReponseTessZone {
-    /// Assemble la réponse d'une zone. Ce contrat ne connaît que
-    /// l'applicabilité du transport : les motifs plus fins (lecteur sans LPCM,
-    /// mode Pure…) sont ajoutés par les lots T08 et T12.
     pub fn depuis(
         zone_id: i64,
-        transport: TransportZone,
         chain: ChaineTess,
+        active_preset: Option<String>,
         catalog: Catalogue,
+        ctx: &ContexteExecution<'_>,
     ) -> Self {
-        let applicability = transport.applicabilite();
-        let hors = match &applicability {
-            Applicabilite::Applied => None,
-            Applicabilite::OutsideTess { reason, detail } => Some((
-                serde_json::to_value(reason)
-                    .ok()
-                    .and_then(|v| v.as_str().map(str::to_owned))
-                    .unwrap_or_default(),
-                detail.clone(),
-            )),
-        };
-        let signal_path = chain
-            .ordre_des_etapes()
-            .into_iter()
-            .map(|e| {
-                // Hors TESS, les étapes de traitement ne sont pas appliquées ;
-                // source, volume, quantification et sortie restent celles du
-                // transport.
-                let traitement = matches!(
-                    e.code,
-                    CodeEtape::Headroom | CodeEtape::Plugin | CodeEtape::Upsampling
-                );
-                let bloque = traitement && e.active && hors.is_some();
-                EtapeZone {
-                    code: e.code,
-                    plugin_id: e.plugin_id,
-                    fixed: e.fixed,
-                    requested: e.active,
-                    effective: e.active && !bloque,
-                    reason: hors.as_ref().filter(|_| bloque).map(|h| h.0.clone()),
-                    detail: hors.as_ref().filter(|_| bloque).map(|h| h.1.clone()),
-                }
-            })
-            .collect();
+        let r = chain.resoudre(&catalog, ctx);
         Self {
             contract_version: VERSION_CONTRAT,
             zone_id,
-            transport,
-            applicability,
-            headroom_db: chain.headroom_effectif_db(),
-            volume_placement: chain.placement_volume(),
+            transport: ctx.transport,
+            applicability: ctx.transport.applicabilite(),
             chain,
-            signal_path,
+            active_preset,
+            headroom_db: r.headroom_db,
+            volume: r.volume,
+            badge: r.badge,
+            signal_path: r.etapes,
             catalog,
         }
     }
 }
 
-/// Le corps d'un refus 402 ou 409.
+/// Le corps d'un refus 400, 402 ou 409.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct RefusTess {
     pub status: u16,
     pub code: String,
@@ -130,73 +89,62 @@ impl From<&ErreurChaine> for RefusTess {
     }
 }
 
-/// Le schéma JSON (draft 2020-12) de l'API TESS. Ses définitions racines
-/// utiles : `chain` (corps du PUT), `zone_response` (GET), `refusal` (402/409),
-/// `catalog`, `presets` (préréglages et mode d'application).
+fn enumere(valeurs: &[&str]) -> Value {
+    json!({ "enum": valeurs })
+}
+
+/// Le schéma JSON (draft 2020-12) EXACT de ce que ce serveur émet et accepte.
+/// Définitions utiles : `chain` (corps du PUT), `zone_response` (GET),
+/// `refusal`, `catalog`, `presets`.
 pub fn schema_json() -> Value {
-    let chaine_ou_null = json!({ "type": ["string", "null"] });
+    let texte_ou_null = json!({ "type": ["string", "null"] });
+    let entier_ou_null = json!({ "type": ["integer", "null"] });
+    let objet_ou_null = json!({ "type": ["object", "null"] });
+    let filtre = json!({ "type": "string" });
+    let taux_dsd = enumere(&["dsd64", "dsd128", "dsd256"]);
+    let codes_refus: Vec<&str> = ErreurChaine::exemples()
+        .iter()
+        .map(ErreurChaine::code)
+        .collect();
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": "https://mozaiklabs.fr/schemas/tess/contract-1.json",
         "title": "TESS API contract",
         "x-contract-version": VERSION_CONTRAT,
         "$defs": {
-            "plugin_id": { "type": "string", "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$", "maxLength": 64 },
+            "id": { "type": "string", "pattern": "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$", "maxLength": 64 },
             "plugin_link": {
-                "type": "object",
-                "required": ["id", "enabled"],
+                "type": "object", "required": ["id", "enabled"],
                 "properties": {
-                    "id": { "$ref": "#/$defs/plugin_id" },
+                    "id": { "$ref": "#/$defs/id" },
                     "enabled": { "type": "boolean" },
-                    "settings": { "type": ["object", "null"] }
+                    "settings": objet_ou_null
                 },
                 "additionalProperties": false
             },
-            "headroom": {
-                "oneOf": [
-                    {
-                        "type": "object", "required": ["mode"],
-                        "properties": { "mode": { "const": "auto" } },
-                        "additionalProperties": false
-                    },
-                    {
-                        "type": "object", "required": ["mode", "db"],
-                        "properties": {
-                            "mode": { "const": "manual" },
-                            "db": { "type": "number", "minimum": -24.0, "maximum": 0.0 }
-                        },
-                        "additionalProperties": false
-                    }
-                ]
-            },
-            "upsampling": {
-                "oneOf": [
-                    {
-                        "type": "object", "required": ["mode"],
-                        "properties": { "mode": { "const": "off" } },
-                        "additionalProperties": false
-                    },
-                    {
-                        "type": "object", "required": ["mode", "factor"],
-                        "properties": {
-                            "mode": { "const": "pcm" },
-                            "factor": { "type": "integer", "minimum": 2, "maximum": 16 }
-                        },
-                        "additionalProperties": false
-                    },
-                    {
-                        "type": "object", "required": ["mode", "rate"],
-                        "properties": {
-                            "mode": { "const": "dsd" },
-                            "rate": { "enum": ["dsd64", "dsd128", "dsd256"] }
-                        },
-                        "additionalProperties": false
-                    }
-                ]
-            },
+            "headroom": { "oneOf": [
+                { "type": "object", "required": ["mode"],
+                  "properties": { "mode": { "const": "auto" } }, "additionalProperties": false },
+                { "type": "object", "required": ["mode", "db"],
+                  "properties": { "mode": { "const": "manual" },
+                                  "db": { "type": "number", "minimum": -24.0, "maximum": 0.0 } },
+                  "additionalProperties": false }
+            ] },
+            "upsampling": { "oneOf": [
+                { "type": "object", "required": ["mode"],
+                  "properties": { "mode": { "const": "off" } }, "additionalProperties": false },
+                { "type": "object", "required": ["mode"],
+                  "properties": { "mode": { "const": "pcm" }, "filter": filtre,
+                                  "max_ratio": { "enum": [2, 4, 8, 16, null] },
+                                  "max_rate_hz": { "type": ["integer", "null"], "minimum": 1, "maximum": 768000 } },
+                  "additionalProperties": false },
+                { "type": "object", "required": ["mode", "rate"],
+                  "properties": { "mode": { "const": "dsd" }, "rate": taux_dsd, "filter": filtre },
+                  "additionalProperties": false }
+            ] },
             "quantization": {
-                "type": "object", "required": ["dither"],
-                "properties": { "dither": { "enum": ["tpdf", "noise_shaped"] } },
+                "type": "object",
+                "properties": { "dither": enumere(&["tpdf", "noise_shaped", "off"]) },
                 "additionalProperties": false
             },
             "fixed_stages": {
@@ -209,107 +157,123 @@ pub fn schema_json() -> Value {
                 "additionalProperties": false
             },
             "chain": {
-                "type": "object",
-                "required": ["version"],
+                "type": "object", "required": ["version"],
                 "properties": {
-                    "version": { "const": 1 },
+                    "version": { "type": "integer", "minimum": 1, "maximum": super::VERSION_CHAINE },
                     "bypass_all": { "type": "boolean" },
                     "plugins": { "type": "array", "items": { "$ref": "#/$defs/plugin_link" } },
                     "fixed": { "$ref": "#/$defs/fixed_stages" }
                 },
                 "additionalProperties": false
             },
+            "exclusive_group": { "oneOf": [
+                { "type": "null" },
+                { "type": "object", "required": ["id", "priority"],
+                  "properties": { "id": { "type": "string" }, "priority": { "type": "integer", "minimum": 0, "maximum": 255 } },
+                  "additionalProperties": false }
+            ] },
             "placement": {
-                "type": "object",
-                "required": ["channels", "position", "exclusive_group"],
+                "type": "object", "required": ["channels", "position", "exclusive_group"],
                 "properties": {
-                    "channels": { "enum": ["any", "stereo_only", "remaps"] },
-                    "position": { "enum": ["free", "last_plugin"] },
-                    "exclusive_group": chaine_ou_null
+                    "channels": enumere(&["any", "stereo_only", "remaps"]),
+                    "position": enumere(&["free", "last_plugin"]),
+                    "exclusive_group": { "$ref": "#/$defs/exclusive_group" }
                 },
                 "additionalProperties": false
             },
             "plugin_descriptor": {
                 "type": "object",
-                "required": ["id", "name", "category", "entitlement", "origin", "settings_schema", "placement"],
+                "required": ["id", "name", "category", "entitlement", "feature", "origin", "settings_schema", "placement"],
                 "properties": {
-                    "id": { "$ref": "#/$defs/plugin_id" },
+                    "id": { "$ref": "#/$defs/id" },
                     "name": { "type": "string" },
-                    "category": { "enum": ["equalisation", "spatial", "room_and_filters", "restoration_and_routing"] },
-                    "entitlement": { "enum": ["free", "premium"] },
-                    "origin": { "enum": ["reference", "package"] },
+                    "category": enumere(&["equalisation", "spatial", "room_and_filters", "restoration_and_routing"]),
+                    "entitlement": enumere(&["free", "premium"]),
+                    "feature": texte_ou_null,
+                    "origin": enumere(&["reference", "package"]),
                     "settings_schema": { "type": "object" },
                     "placement": { "$ref": "#/$defs/placement" }
                 },
                 "additionalProperties": false
             },
             "catalog": {
-                "type": "object",
-                "required": ["plugins"],
+                "type": "object", "required": ["plugins"],
                 "properties": {
-                    "plugins": { "type": "array", "items": { "$ref": "#/$defs/plugin_descriptor" } }
+                    "plugins": { "type": "array", "items": { "$ref": "#/$defs/plugin_descriptor" } },
+                    "groups": { "type": "array", "items": {
+                        "type": "object", "required": ["id", "policy"],
+                        "properties": { "id": { "type": "string" }, "policy": enumere(&["priority", "refuse"]) },
+                        "additionalProperties": false
+                    } }
                 },
                 "additionalProperties": false
             },
-            "transport": {
-                "enum": ["local", "oaat", "dlna", "openhome", "bluos", "squeezebox", "chromecast",
-                         "airplay", "devialet_air", "hqplayer", "diretta", "other"]
-            },
-            "applicability": {
-                "oneOf": [
-                    {
-                        "type": "object", "required": ["status"],
-                        "properties": { "status": { "const": "applied" } },
-                        "additionalProperties": false
-                    },
-                    {
-                        "type": "object", "required": ["status", "reason", "detail"],
-                        "properties": {
-                            "status": { "const": "outside_tess" },
-                            "reason": { "enum": ["hqplayer_own_processing", "diretta_outside_tess", "unclassified_transport"] },
-                            "detail": { "type": "string" }
-                        },
-                        "additionalProperties": false
-                    }
-                ]
-            },
-            "zone_step": {
+            "transport": enumere(&["local", "oaat", "dlna", "openhome", "bluos", "squeezebox", "chromecast",
+                                   "airplay", "devialet_air", "browser", "aes67", "sendspin", "hqplayer",
+                                   "diretta", "other"]),
+            "applicability": { "oneOf": [
+                { "type": "object", "required": ["status"],
+                  "properties": { "status": { "const": "applied" } }, "additionalProperties": false },
+                { "type": "object", "required": ["status", "reason", "detail"],
+                  "properties": { "status": { "const": "outside_tess" },
+                                  "reason": enumere(&["hqplayer_own_processing", "diretta_outside_tess", "unclassified_transport"]),
+                                  "detail": { "type": "string" } },
+                  "additionalProperties": false }
+            ] },
+            "step": {
                 "type": "object",
-                "required": ["code", "plugin_id", "fixed", "requested", "effective", "reason", "detail"],
+                "required": ["code", "plugin_id", "fixed", "requested", "effective", "reason", "detail",
+                             "params", "latency_frames"],
                 "properties": {
-                    "code": { "enum": ["source", "headroom", "plugin", "upsampling", "volume",
-                                       "quantization", "dsd_modulator", "output"] },
-                    "plugin_id": chaine_ou_null,
+                    "code": enumere(&["source", "headroom", "plugin", "upsampling", "volume",
+                                      "quantization", "dsd_modulator", "output"]),
+                    "plugin_id": texte_ou_null,
                     "fixed": { "type": "boolean" },
                     "requested": { "type": "boolean" },
                     "effective": { "type": "boolean" },
-                    "reason": chaine_ou_null,
-                    "detail": chaine_ou_null
+                    "reason": { "enum": ["outside_tess", "pure_mode", "bypass_all", "dsd_source_native",
+                                         "chain_version_unsupported", "unknown_value", "unknown_plugin",
+                                         "plugin_unavailable", "premium_required", "stereo_only",
+                                         "replaced_in_group", "nothing_to_protect", "volume_not_software",
+                                         "nothing_to_quantize", null] },
+                    "detail": texte_ou_null,
+                    "params": objet_ou_null,
+                    "latency_frames": entier_ou_null
+                },
+                "additionalProperties": false
+            },
+            "volume": {
+                "type": "object", "required": ["control", "placement", "db"],
+                "properties": {
+                    "control": enumere(&["software", "device", "fixed"]),
+                    "placement": { "enum": ["at_render", "before_dsd_modulator", null] },
+                    "db": { "type": ["number", "null"] }
                 },
                 "additionalProperties": false
             },
             "zone_response": {
                 "type": "object",
                 "required": ["contract_version", "zone_id", "transport", "applicability", "chain",
-                             "headroom_db", "volume_placement", "signal_path", "catalog"],
+                             "active_preset", "headroom_db", "volume", "badge", "signal_path", "catalog"],
                 "properties": {
                     "contract_version": { "const": VERSION_CONTRAT },
                     "zone_id": { "type": "integer" },
                     "transport": { "$ref": "#/$defs/transport" },
                     "applicability": { "$ref": "#/$defs/applicability" },
                     "chain": { "$ref": "#/$defs/chain" },
+                    "active_preset": texte_ou_null,
                     "headroom_db": { "type": "number" },
-                    "volume_placement": { "enum": ["at_render", "before_dsd_modulator"] },
-                    "signal_path": { "type": "array", "items": { "$ref": "#/$defs/zone_step" } },
+                    "volume": { "$ref": "#/$defs/volume" },
+                    "badge": enumere(&["bit_perfect", "processed_by_tess", "outside_tess"]),
+                    "signal_path": { "type": "array", "items": { "$ref": "#/$defs/step" } },
                     "catalog": { "$ref": "#/$defs/catalog" }
                 },
                 "additionalProperties": false
             },
             "preset": {
-                "type": "object",
-                "required": ["id", "name", "chain"],
+                "type": "object", "required": ["id", "name", "chain"],
                 "properties": {
-                    "id": { "$ref": "#/$defs/plugin_id" },
+                    "id": { "$ref": "#/$defs/id" },
                     "name": { "type": "string" },
                     "builtin": { "type": "boolean" },
                     "chain": { "$ref": "#/$defs/chain" }
@@ -317,26 +281,20 @@ pub fn schema_json() -> Value {
                 "additionalProperties": false
             },
             "presets": {
-                "type": "object",
-                "required": ["active", "presets"],
+                "type": "object", "required": ["presets"],
                 "properties": {
-                    "active": { "type": ["string", "null"] },
-                    "apply_mode": { "enum": ["immediately", "at_next_playback"] },
+                    "apply_mode": enumere(&["immediately", "at_next_playback"]),
                     "presets": { "type": "array", "items": { "$ref": "#/$defs/preset" } }
                 },
                 "additionalProperties": false
             },
             "refusal": {
-                "type": "object",
-                "required": ["status", "code", "detail", "plugin_id"],
+                "type": "object", "required": ["status", "code", "detail", "plugin_id"],
                 "properties": {
-                    "status": { "enum": [402, 409] },
-                    "code": { "enum": ["unsupported_version", "unknown_plugin", "duplicate_plugin",
-                                       "invalid_settings", "must_be_last_plugin", "mutually_exclusive",
-                                       "stereo_only", "premium_required", "headroom_out_of_range",
-                                       "upsampling_factor_out_of_range"] },
+                    "status": { "enum": [400, 402, 409] },
+                    "code": { "enum": codes_refus },
                     "detail": { "type": "string" },
-                    "plugin_id": chaine_ou_null
+                    "plugin_id": texte_ou_null
                 },
                 "additionalProperties": false
             }
@@ -344,20 +302,62 @@ pub fn schema_json() -> Value {
     })
 }
 
+/// Ouvre un schéma pour la LECTURE par un client : champs inconnus permis,
+/// valeurs d'énumération inconnues permises, variantes inconnues permises,
+/// bornes levées. Seul `contract_version` reste fixé : il ne monte que quand un
+/// champ change de SENS, et un client doit alors le savoir.
+fn ouvrir(v: &Value) -> Value {
+    match v {
+        Value::Object(o) => {
+            let mut sortie = Map::new();
+            for (k, x) in o {
+                match k.as_str() {
+                    "additionalProperties" if *x == Value::Bool(false) => {}
+                    // Une liste fermée devient « une chaîne, un nombre ou null »,
+                    // valeurs connues gardées pour la documentation.
+                    "enum" => {
+                        sortie.insert("x-known-values".into(), x.clone());
+                    }
+                    "oneOf" => {
+                        let mut variantes: Vec<Value> =
+                            x.as_array().into_iter().flatten().map(ouvrir).collect();
+                        variantes.push(json!({ "type": "object" }));
+                        sortie.insert("anyOf".into(), Value::Array(variantes));
+                    }
+                    // Les bornes servent à l'écriture ; une version plus récente
+                    // peut les élargir (version de chaîne, plafonds).
+                    "minimum" | "maximum" => {}
+                    _ => {
+                        sortie.insert(k.clone(), ouvrir(x));
+                    }
+                }
+            }
+            Value::Object(sortie)
+        }
+        Value::Array(a) => Value::Array(a.iter().map(ouvrir).collect()),
+        autre => autre.clone(),
+    }
+}
+
+/// Le schéma qu'un CLIENT applique aux réponses : celui de [`schema_json`],
+/// ouvert (champs, valeurs et variantes inconnus permis). Un serveur plus
+/// récent qui ajoute un champ facultatif ou une valeur reste lisible.
+pub fn schema_json_lecture() -> Value {
+    ouvrir(&schema_json())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tess::chaine::{
-        Dither, EtagesFixes, Headroom, MaillonGreffon, Quantification, TauxDsd, Upsampling,
-    };
+    use crate::tess::chaine::{MaillonGreffon, TauxDsd, Upsampling};
     use crate::tess::greffon::catalogue_de_reference;
-    use crate::tess::zones::MotifHorsTess;
+    use crate::tess::prereglages::PreReglages;
+    use crate::tess::resolution::{ControleVolume, SourceFlux, VolumeZone};
     use crate::tess::{ContexteValidation, VERSION_CHAINE};
 
     /// Un vérificateur de schéma JSON minimal, limité aux mots-clés que
     /// [`schema_json`] emploie (`pattern` et `maxLength` exceptés : l'id est
-    /// vérifié par `DescripteurGreffon::verifier`). Il sert à prouver que ce que le serveur
-    /// sérialise est conforme au schéma publié — et que le schéma discrimine.
+    /// vérifié par `id_valide`).
     fn conforme(racine: &Value, schema: &Value, v: &Value) -> Result<(), String> {
         if let Some(r) = schema.get("$ref").and_then(Value::as_str) {
             let nom = r.strip_prefix("#/$defs/").ok_or("ref")?;
@@ -418,6 +418,11 @@ mod tests {
                 return Err(format!("{v} : {n} variantes conformes au lieu d'une"));
             }
         }
+        if let Some(variantes) = schema.get("anyOf").and_then(Value::as_array)
+            && !variantes.iter().any(|s| conforme(racine, s, v).is_ok())
+        {
+            return Err(format!("{v} : aucune variante conforme"));
+        }
         if let Some(o) = v.as_object() {
             if let Some(req) = schema.get("required").and_then(Value::as_array) {
                 for k in req.iter().filter_map(Value::as_str) {
@@ -445,13 +450,40 @@ mod tests {
         Ok(())
     }
 
-    fn verifier(def: &str, v: &Value) -> Result<(), String> {
+    fn strict(def: &str, v: &Value) -> Result<(), String> {
         let s = schema_json();
         conforme(&s, &s["$defs"][def], v)
     }
 
+    fn lecture(def: &str, v: &Value) -> Result<(), String> {
+        let s = schema_json_lecture();
+        conforme(&s, &s["$defs"][def], v)
+    }
+
+    fn tout(_: &str) -> bool {
+        true
+    }
+
+    fn ctx(transport: TransportZone) -> ContexteExecution<'static> {
+        ContexteExecution {
+            transport,
+            source: Some(SourceFlux::Pcm {
+                sample_rate_hz: 96_000,
+                bits: 24,
+                channels: 2,
+            }),
+            premium: true,
+            greffon_disponible: &tout,
+            pure: false,
+            volume: VolumeZone {
+                control: ControleVolume::Software,
+                db: -18.0,
+            },
+        }
+    }
+
     fn chaine_complete() -> ChaineTess {
-        ChaineTess {
+        let mut c = ChaineTess {
             version: VERSION_CHAINE,
             bypass_all: false,
             plugins: vec![
@@ -471,167 +503,138 @@ mod tests {
                     settings: Value::Null,
                 },
             ],
-            fixed: EtagesFixes {
-                headroom: Headroom::Manual { db: -3.0 },
-                upsampling: Upsampling::Dsd {
-                    rate: TauxDsd::Dsd128,
-                },
-                quantization: Quantification {
-                    dither: Dither::NoiseShaped,
-                },
-            },
-        }
+            ..ChaineTess::default()
+        };
+        c.fixed.upsampling = Upsampling::Dsd {
+            rate: TauxDsd::Dsd128,
+            filter: "polyvalent".into(),
+        };
+        c
+    }
+
+    fn reponse(t: TransportZone, c: ChaineTess) -> ReponseTessZone {
+        ReponseTessZone::depuis(
+            12,
+            c,
+            Some("evening-listening".into()),
+            catalogue_de_reference(),
+            &ctx(t),
+        )
     }
 
     #[test]
     fn la_reponse_d_une_zone_fait_l_aller_retour_et_suit_le_schema() {
         for t in TransportZone::ALL {
-            for chaine in [ChaineTess::default(), chaine_complete()] {
-                let r = ReponseTessZone::depuis(12, t, chaine, catalogue_de_reference());
+            for c in [ChaineTess::default(), chaine_complete()] {
+                let r = reponse(t, c);
                 let v = serde_json::to_value(&r).unwrap();
-                verifier("zone_response", &v).unwrap_or_else(|e| panic!("{t:?} : {e}"));
-                let relue: ReponseTessZone = serde_json::from_value(v).unwrap();
-                assert_eq!(relue, r);
+                strict("zone_response", &v).unwrap_or_else(|e| panic!("{t:?} : {e}"));
+                lecture("zone_response", &v).unwrap_or_else(|e| panic!("{t:?} : {e}"));
+                assert_eq!(serde_json::from_value::<ReponseTessZone>(v).unwrap(), r);
             }
         }
     }
 
     #[test]
-    fn hors_tess_les_etapes_de_traitement_ne_sont_pas_effectives() {
-        let r = ReponseTessZone::depuis(
-            3,
-            TransportZone::HqPlayer,
-            chaine_complete(),
-            catalogue_de_reference(),
-        );
-        let conv = r
-            .signal_path
-            .iter()
-            .find(|e| e.plugin_id.as_deref() == Some("convolution"))
-            .unwrap();
-        assert!(conv.requested && !conv.effective);
-        assert_eq!(conv.reason.as_deref(), Some("hqplayer_own_processing"));
-        assert_eq!(
-            conv.detail.as_deref(),
-            Some(MotifHorsTess::HqplayerOwnProcessing.detail())
-        );
-        // Contre-épreuve : la même chaîne sur OAAT est effective, sans motif.
-        let r = ReponseTessZone::depuis(
-            3,
-            TransportZone::Oaat,
-            chaine_complete(),
-            catalogue_de_reference(),
-        );
-        assert!(
-            r.signal_path
-                .iter()
-                .all(|e| e.requested == e.effective && e.reason.is_none())
-        );
+    fn un_client_v1_lit_une_reponse_plus_recente() {
+        let mut v = serde_json::to_value(reponse(TransportZone::Oaat, chaine_complete())).unwrap();
+        v["latency_total_frames"] = json!(512);
+        v["transport"] = json!("snapcast");
+        v["badge"] = json!("processed_by_tess_and_room");
+        v["volume"]["placement"] = json!("in_dac");
+        v["signal_path"][1]["code"] = json!("limiter");
+        v["signal_path"][1]["thermal"] = json!(true);
+        v["applicability"] = json!({ "status": "partial", "since": 2 });
+        v["chain"]["fixed"]["upsampling"] = json!({ "mode": "oversample_x3", "taps": 1024 });
+        v["chain"]["version"] = json!(VERSION_CHAINE + 1);
+        v["catalog"]["plugins"][0]["category"] = json!("dynamics");
+        // Le schéma de lecture et les types Rust l'acceptent…
+        lecture("zone_response", &v).unwrap();
+        let r: ReponseTessZone = serde_json::from_value(v.clone()).unwrap();
+        assert_eq!(r.transport, TransportZone::Other);
+        assert_eq!(r.badge, Badge::Unknown);
+        assert_eq!(r.applicability, Applicabilite::Unknown);
+        assert_eq!(r.chain.fixed.upsampling, Upsampling::Unknown);
+        // … et le schéma strict du serveur ne l'aurait pas émis (contre-épreuve).
+        assert!(strict("zone_response", &v).is_err());
     }
 
     #[test]
-    fn chaines_catalogue_et_refus_suivent_le_schema() {
-        verifier("chain", &serde_json::to_value(chaine_complete()).unwrap()).unwrap();
-        verifier(
-            "chain",
-            &serde_json::to_value(ChaineTess::default()).unwrap(),
-        )
-        .unwrap();
-        verifier("chain", &json!({ "version": 1 })).unwrap();
-        verifier(
+    fn hors_tess_la_reponse_n_annonce_ni_headroom_ni_ordre_dsd() {
+        let r = reponse(TransportZone::HqPlayer, chaine_complete());
+        assert_eq!(r.headroom_db, 0.0);
+        assert_eq!(r.volume.placement, None);
+        assert_eq!(r.badge, Badge::OutsideTess);
+        // Contre-épreuve sur OAAT.
+        let r = reponse(TransportZone::Oaat, chaine_complete());
+        assert_eq!(r.headroom_db, -3.0);
+        assert!(r.volume.placement.is_some());
+    }
+
+    #[test]
+    fn chaines_catalogue_presets_et_refus_suivent_le_schema() {
+        strict("chain", &serde_json::to_value(chaine_complete()).unwrap()).unwrap();
+        strict("chain", &json!({ "version": 1 })).unwrap();
+        strict(
             "catalog",
             &serde_json::to_value(catalogue_de_reference()).unwrap(),
         )
         .unwrap();
-        let p = crate::tess::PreReglages {
-            active: Some("pure".into()),
-            ..Default::default()
-        };
-        verifier("presets", &serde_json::to_value(&p).unwrap()).unwrap();
-        let mauvais = json!({ "active": null, "presets": [], "apply_mode": "later" });
-        assert!(verifier("presets", &mauvais).is_err());
-        let ctx = ContexteValidation {
-            channels: Some(2),
-            premium: false,
-        };
+        strict(
+            "presets",
+            &serde_json::to_value(PreReglages::default()).unwrap(),
+        )
+        .unwrap();
         let e = chaine_complete()
-            .valider(&catalogue_de_reference(), ctx)
+            .valider(
+                &catalogue_de_reference(),
+                ContexteValidation { premium: false },
+            )
             .unwrap_err();
         let refus = RefusTess::from(&e);
         assert_eq!(refus.status, 402);
         assert_eq!(refus.plugin_id.as_deref(), Some("convolution"));
         let v = serde_json::to_value(&refus).unwrap();
-        verifier("refusal", &v).unwrap();
+        strict("refusal", &v).unwrap();
         assert_eq!(serde_json::from_value::<RefusTess>(v).unwrap(), refus);
+        // Corps illisible : 400 invalid_body.
+        let e = ChaineTess::depuis_corps("{").unwrap_err();
+        let refus = RefusTess::from(&e);
+        assert_eq!((refus.status, refus.code.as_str()), (400, "invalid_body"));
+        strict("refusal", &serde_json::to_value(&refus).unwrap()).unwrap();
     }
 
     #[test]
-    fn le_schema_refuse_les_documents_invalides() {
-        // Contre-épreuve : le schéma discrimine.
+    fn le_schema_strict_refuse_les_corps_invalides() {
         for doc in [
             json!({}),
-            json!({ "version": 2 }),
+            json!({ "version": 0 }),
             json!({ "version": 1, "volume": -18 }),
             json!({ "version": 1, "plugins": [{ "id": 3, "enabled": true }] }),
             json!({ "version": 1, "plugins": [{ "id": "crossfeed" }] }),
             json!({ "version": 1, "fixed": { "headroom": { "mode": "manual", "db": 3 } } }),
             json!({ "version": 1, "fixed": { "headroom": { "mode": "auto", "db": -3 } } }),
-            json!({ "version": 1, "fixed": { "upsampling": { "mode": "pcm", "factor": 32 } } }),
+            json!({ "version": 1, "fixed": { "upsampling": { "mode": "pcm", "max_ratio": 3 } } }),
+            json!({ "version": 1, "fixed": { "upsampling": { "mode": "pcm", "factor": 2 } } }),
             json!({ "version": 1, "fixed": { "upsampling": { "mode": "dsd", "rate": "dsd512" } } }),
         ] {
-            assert!(verifier("chain", &doc).is_err(), "{doc}");
+            assert!(strict("chain", &doc).is_err(), "{doc}");
         }
-        let mut r = serde_json::to_value(ReponseTessZone::depuis(
-            1,
-            TransportZone::Local,
-            ChaineTess::default(),
-            catalogue_de_reference(),
-        ))
-        .unwrap();
-        r["transport"] = json!("sonos");
-        assert!(verifier("zone_response", &r).is_err());
     }
 
     #[test]
-    fn le_schema_couvre_tous_les_codes_de_refus() {
-        let s = schema_json();
-        let codes = s["$defs"]["refusal"]["properties"]["code"]["enum"]
-            .as_array()
-            .unwrap()
-            .clone();
-        let erreurs = [
-            ErreurChaine::VersionNonPriseEnCharge {
-                trouvee: 2,
-                attendue: 1,
-            },
-            ErreurChaine::GreffonInconnu("x".into()),
-            ErreurChaine::GreffonEnDouble("x".into()),
-            ErreurChaine::ReglagesInvalides {
-                id: "x".into(),
-                raison: "r".into(),
-            },
-            ErreurChaine::PasEnDernier("x".into()),
-            ErreurChaine::Exclusifs {
-                premier: "a".into(),
-                second: "b".into(),
-                groupe: "g".into(),
-            },
-            ErreurChaine::StereoSeulement {
-                id: "x".into(),
-                canaux: 6,
-            },
-            ErreurChaine::PremiumRequis("x".into()),
-            ErreurChaine::HeadroomHorsBornes(3.0),
-            ErreurChaine::FacteurHorsBornes(1),
-        ];
-        assert_eq!(codes.len(), erreurs.len());
-        for e in &erreurs {
-            assert!(codes.contains(&json!(e.code())), "{}", e.code());
-            verifier(
+    fn le_schema_couvre_chaque_code_de_refus() {
+        // `exemples()` couvre chaque variante (test de `chaine`) ; le schéma en
+        // est tiré, et chaque refus construit s'y conforme.
+        for e in ErreurChaine::exemples() {
+            strict(
                 "refusal",
-                &serde_json::to_value(RefusTess::from(e)).unwrap(),
+                &serde_json::to_value(RefusTess::from(&e)).unwrap(),
             )
-            .unwrap();
+            .unwrap_or_else(|x| panic!("{} : {x}", e.code()));
         }
+        // Contre-épreuve : un code hors contrat est refusé.
+        let faux = json!({ "status": 409, "code": "nope", "detail": "", "plugin_id": null });
+        assert!(strict("refusal", &faux).is_err());
     }
 }

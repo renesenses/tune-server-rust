@@ -2,17 +2,19 @@
 //!
 //! TESS s'applique sur toutes les zones où Tune FABRIQUE le flux : sortie
 //! locale, OAAT, famille UPnP (DLNA, OpenHome, BluOS, Squeezebox), Chromecast,
-//! AirPlay, Devialet AIR. HQPlayer et Diretta sont HORS TESS, et l'écran TESS
-//! affiche le motif. Un transport que ce contrat ne classe pas est hors TESS
-//! tant qu'un lot (T12) ne l'a pas classé : on ne promet jamais un traitement
-//! qui ne serait pas appliqué.
+//! AirPlay, Devialet AIR, navigateur, AES67, Sendspin. HQPlayer et Diretta
+//! sont HORS TESS, et l'écran TESS affiche le motif. Un transport que ce
+//! contrat ne classe pas est hors TESS tant qu'un lot (T12) ne l'a pas classé :
+//! on ne promet jamais un traitement qui ne serait pas appliqué.
 //!
 //! Être « dans TESS » ne veut pas dire que tout y est déjà livré : l'état
-//! effectif étape par étape (demandé, effectif, motif) est le travail des lots
-//! T08, T12a, T12b et T12c.
+//! effectif étape par étape est rendu par [`crate::tess::ChaineTess::resoudre`]
+//! et affiné par T08 et T12.
 
 use serde::{Deserialize, Serialize};
 
+/// Le transport d'une zone. `other` sert aussi de repli à la lecture : un
+/// client v1 lit sans échouer un transport ajouté plus tard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TransportZone {
     #[serde(rename = "local")]
@@ -33,11 +35,17 @@ pub enum TransportZone {
     AirPlay,
     #[serde(rename = "devialet_air")]
     DevialetAir,
+    #[serde(rename = "browser")]
+    Browser,
+    #[serde(rename = "aes67")]
+    Aes67,
+    #[serde(rename = "sendspin")]
+    Sendspin,
     #[serde(rename = "hqplayer")]
     HqPlayer,
     #[serde(rename = "diretta")]
     Diretta,
-    #[serde(rename = "other")]
+    #[serde(rename = "other", other)]
     Other,
 }
 
@@ -51,6 +59,8 @@ pub enum MotifHorsTess {
     DirettaOutsideTess,
     /// Transport pas encore classé par ce contrat.
     UnclassifiedTransport,
+    #[serde(other)]
+    Unknown,
 }
 
 impl MotifHorsTess {
@@ -63,7 +73,7 @@ impl MotifHorsTess {
             Self::DirettaOutsideTess => {
                 "Diretta carries the stream unchanged: TESS is not applied to this zone."
             }
-            Self::UnclassifiedTransport => {
+            Self::UnclassifiedTransport | Self::Unknown => {
                 "This output is not covered by TESS yet: no processing is applied."
             }
         }
@@ -72,17 +82,26 @@ impl MotifHorsTess {
 
 /// TESS s'applique-t-il à une zone ?
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+#[serde(tag = "status", rename_all = "snake_case")]
 pub enum Applicabilite {
     Applied,
     OutsideTess {
         reason: MotifHorsTess,
         detail: String,
     },
+    /// Valeur de repli à la lecture : traitée comme hors TESS.
+    #[serde(other)]
+    Unknown,
+}
+
+impl Applicabilite {
+    pub fn appliquee(&self) -> bool {
+        matches!(self, Self::Applied)
+    }
 }
 
 impl TransportZone {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 15] = [
         Self::Local,
         Self::Oaat,
         Self::Dlna,
@@ -92,6 +111,9 @@ impl TransportZone {
         Self::Chromecast,
         Self::AirPlay,
         Self::DevialetAir,
+        Self::Browser,
+        Self::Aes67,
+        Self::Sendspin,
         Self::HqPlayer,
         Self::Diretta,
         Self::Other,
@@ -109,6 +131,9 @@ impl TransportZone {
             Some("chromecast") => Self::Chromecast,
             Some("airplay" | "airplay2") => Self::AirPlay,
             Some("devialet_air") => Self::DevialetAir,
+            Some("browser") => Self::Browser,
+            Some("aes67") => Self::Aes67,
+            Some("sendspin") => Self::Sendspin,
             Some("hqplayer") => Self::HqPlayer,
             Some("diretta") => Self::Diretta,
             _ => Self::Other,
@@ -132,7 +157,10 @@ impl TransportZone {
             | Self::Squeezebox
             | Self::Chromecast
             | Self::AirPlay
-            | Self::DevialetAir => Applicabilite::Applied,
+            | Self::DevialetAir
+            | Self::Browser
+            | Self::Aes67
+            | Self::Sendspin => Applicabilite::Applied,
         }
     }
 }
@@ -140,6 +168,7 @@ impl TransportZone {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestrator::TYPE_SORTIE_AIRPLAY2;
 
     #[test]
     fn hqplayer_et_diretta_sont_hors_tess_avec_un_motif() {
@@ -153,9 +182,9 @@ mod tests {
             match t.applicabilite() {
                 Applicabilite::OutsideTess { reason, detail } => {
                     assert_eq!(reason, motif);
-                    assert!(!detail.is_empty());
+                    assert_eq!(detail, motif.detail());
                 }
-                Applicabilite::Applied => panic!("{t:?} doit être hors TESS"),
+                autre => panic!("{t:?} doit être hors TESS : {autre:?}"),
             }
         }
     }
@@ -171,17 +200,19 @@ mod tests {
             "squeezebox",
             "slimproto",
             "chromecast",
-            "airplay2",
+            "airplay",
+            TYPE_SORTIE_AIRPLAY2,
             "devialet_air",
+            "browser",
+            "aes67",
+            "sendspin",
         ] {
-            assert_eq!(
-                TransportZone::depuis_type_de_sortie(Some(t)).applicabilite(),
-                Applicabilite::Applied,
-                "{t}"
-            );
+            let transport = TransportZone::depuis_type_de_sortie(Some(t));
+            assert_ne!(transport, TransportZone::Other, "{t} non classé");
+            assert!(transport.applicabilite().appliquee(), "{t}");
         }
         // Contre-épreuve : inconnu ou absent = hors TESS, jamais appliqué en silence.
-        for t in [None, Some("aes67"), Some("")] {
+        for t in [None, Some("transport_de_demain"), Some("")] {
             assert!(matches!(
                 TransportZone::depuis_type_de_sortie(t).applicabilite(),
                 Applicabilite::OutsideTess {
@@ -201,9 +232,27 @@ mod tests {
             let texte = serde_json::to_string(&a).unwrap();
             assert_eq!(serde_json::from_str::<Applicabilite>(&texte).unwrap(), a);
         }
+    }
+
+    #[test]
+    fn un_client_v1_lit_des_valeurs_plus_recentes() {
         assert_eq!(
-            serde_json::to_value(TransportZone::HqPlayer.applicabilite()).unwrap()["reason"],
-            "hqplayer_own_processing"
+            serde_json::from_str::<TransportZone>(r#""snapcast""#).unwrap(),
+            TransportZone::Other
         );
+        let a: Applicabilite = serde_json::from_str(
+            r#"{"status":"outside_tess","reason":"vendor_lock","detail":"x","since":3}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            a,
+            Applicabilite::OutsideTess {
+                reason: MotifHorsTess::Unknown,
+                ..
+            }
+        ));
+        let a: Applicabilite = serde_json::from_str(r#"{"status":"partial"}"#).unwrap();
+        assert_eq!(a, Applicabilite::Unknown);
+        assert!(!a.appliquee());
     }
 }

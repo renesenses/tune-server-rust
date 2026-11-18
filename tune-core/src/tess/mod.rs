@@ -1,45 +1,56 @@
 //! TESS — *Tune Engine for Sound Shaping* : le **contrat** (lot T01).
 //!
-//! Ce module ne contient QUE des types : aucune ligne n'est branchée dans la
-//! lecture. Il fixe ce que les lots suivants consomment :
+//! Ce module ne contient QUE des types et des fonctions pures : aucune ligne
+//! n'est branchée dans la lecture. Il fixe ce que les lots suivants consomment :
 //!
-//! - [`etage`] : le trait [`EtageTess`] d'un étage de traitement, qui travaille
-//!   en `f64` entrelacé (décision Q5 : 64 bits réels, une seule quantification
-//!   à la fin) ;
-//! - [`greffon`] : le [`DescripteurGreffon`] (id, droit Free/Premium, schéma de
-//!   réglages, contraintes de place) et le catalogue de référence ;
-//! - [`chaine`] : la [`ChaineTess`] versionnée d'une zone, ses étages fixes et
-//!   l'ordre réel des étapes (décision Q9) ;
-//! - [`prereglages`] : préréglages de chaîne et mode d'application
-//!   (maquette A2) ;
-//! - [`zones`] : où TESS s'applique (décision Q8 : HQPlayer et Diretta hors
-//!   TESS, avec un motif) ;
-//! - [`api`] : les corps JSON de `GET/PUT /zones/{id}/tess` et leur schéma.
+//! - [`etage`] : le trait temps réel [`EtageTess`] (`f64` entrelacé, tampons
+//!   préalloués par l'hôte, aucune allocation dans le fil audio) et
+//!   l'[`EtapeFinale`] (quantification PCM ou modulateur DSD) ;
+//! - [`greffon`] : le [`DescripteurGreffon`] (id, catégorie, droit, `Feature`,
+//!   schéma de réglages, contraintes de place, groupe exclusif) et le
+//!   catalogue de référence ;
+//! - [`chaine`] : la [`ChaineTess`] versionnée d'une zone, ses étages fixes, la
+//!   lecture stricte d'un `PUT` et sa validation (400/402/409) ;
+//! - [`resolution`] : l'état réel à l'exécution, étape par étape, dans l'ordre
+//!   de Q9, sans jamais rejeter la chaîne ;
+//! - [`prereglages`] : préréglages de chaîne et mode d'application (A2) ;
+//! - [`zones`] : où TESS s'applique (Q8) ;
+//! - [`api`] : les corps JSON de `GET/PUT /zones/{id}/tess` et leurs schémas.
 //!
-//! Le document de référence est `docs/tess/contrat.md`.
+//! Compatibilité : les types de RÉPONSE tolèrent champs et valeurs inconnus
+//! (repli `unknown`) ; seul le corps d'un `PUT` est lu strictement. Le document
+//! de référence est `docs/tess/contrat.md`.
 
 pub mod api;
 pub mod chaine;
 pub mod etage;
 pub mod greffon;
 pub mod prereglages;
+pub mod resolution;
 pub mod zones;
 
-pub use api::{RefusTess, ReponseTessZone, schema_json};
+pub use api::{RefusTess, ReponseTessZone, schema_json, schema_json_lecture};
 pub use chaine::{
-    ChaineTess, CodeEtape, ContexteValidation, ErreurChaine, EtagesFixes, Etape, Headroom,
-    MaillonGreffon, PlacementVolume, Quantification, TauxDsd, Upsampling, VERSION_CHAINE,
+    ChaineTess, ContexteValidation, Dither, ErreurChaine, EtagesFixes, Headroom, MaillonGreffon,
+    Quantification, TauxDsd, Upsampling, VERSION_CHAINE,
 };
-pub use etage::{ErreurEtage, EtageTess, FormatFlux, TamponTess};
+pub use etage::{
+    Disposition, ErreurEtage, EtageTess, EtapeFinale, FormatFlux, SortieFinale, preparer_chaine,
+};
 pub use greffon::{
     Canaux, Catalogue, Categorie, ContraintesPlace, DescripteurGreffon, Droit, ErreurCatalogue,
-    Origine, Position, catalogue_de_reference,
+    GroupeExclusif, Origine, PolitiqueGroupe, Position, catalogue_de_reference,
 };
 pub use prereglages::{ID_PREREGLAGE_PURE, ModeApplication, PreReglage, PreReglages};
+pub use resolution::{
+    Badge, CodeEtape, ContexteExecution, ControleVolume, EtapeResolue, EtatVolume, LectureDsd,
+    MotifEtape, PlacementVolume, Resolution, SourceFlux, VolumeZone,
+};
 pub use zones::{Applicabilite, MotifHorsTess, TransportZone};
 
 /// Version du contrat TESS publiée par l'API (`contract_version`). Elle monte
-/// quand un champ change de sens ; un ajout facultatif ne la fait pas monter.
+/// quand un champ change de SENS ; un ajout facultatif (champ, valeur
+/// d'énumération) ne la fait pas monter, puisque les clients les ignorent.
 pub const VERSION_CONTRAT: u32 = 1;
 
 /// Clé de réglage qui portera la chaîne d'une zone (lot T02).
@@ -52,5 +63,6 @@ mod tests {
     #[test]
     fn la_cle_de_la_chaine_suit_le_modele_des_cles_de_zone() {
         assert_eq!(super::cle_chaine_zone(7), "zone_7_tess_chain");
+        assert_eq!(super::cle_chaine_zone(-1), "zone_-1_tess_chain");
     }
 }

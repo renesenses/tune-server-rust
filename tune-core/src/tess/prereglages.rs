@@ -8,11 +8,17 @@
 //!
 //! « Pure — no processing » est un préréglage fourni par le serveur
 //! ([`PreReglage::pure`]) : chaîne vide et `bypass_all`, soit le bit-perfect
-//! quand le volume est à 0 dB.
+//! quand le volume est à 0 dB. Charger un préréglage REMPLACE la chaîne de la
+//! zone : l'écran (W4) propose d'enregistrer la chaîne courante avant.
+//!
+//! Le préréglage actif est propre à chaque ZONE (maquette A1 : sélecteurs
+//! Zone et Preset) : il est publié dans la réponse de la zone
+//! (`active_preset`), pas dans cette liste globale.
 
 use serde::{Deserialize, Serialize};
 
 use super::chaine::ChaineTess;
+use super::greffon::id_valide;
 
 /// Id réservé du préréglage « Pure — no processing ».
 pub const ID_PREREGLAGE_PURE: &str = "pure";
@@ -27,11 +33,14 @@ pub enum ModeApplication {
     Immediately,
     /// Le changement attend la prochaine lecture.
     AtNextPlayback,
+    /// Valeur de repli à la lecture : traitée comme `at_next_playback`
+    /// (jamais d'interruption non voulue).
+    #[serde(other)]
+    Unknown,
 }
 
 /// Un préréglage de chaîne.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PreReglage {
     /// Identifiant stable, minuscules ASCII, chiffres et tirets.
     pub id: String,
@@ -60,10 +69,7 @@ impl PreReglage {
 
 /// La liste des préréglages et le mode d'application.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PreReglages {
-    /// Le préréglage chargé (« ACTIVE »), s'il y en a un.
-    pub active: Option<String>,
     #[serde(default)]
     pub apply_mode: ModeApplication,
     pub presets: Vec<PreReglage>,
@@ -72,7 +78,6 @@ pub struct PreReglages {
 impl Default for PreReglages {
     fn default() -> Self {
         Self {
-            active: None,
             apply_mode: ModeApplication::default(),
             presets: vec![PreReglage::pure()],
         }
@@ -88,8 +93,6 @@ pub enum ErreurPreReglage {
     IdEnDouble(String),
     #[error("le préréglage {0} n'a pas de nom")]
     NomVide(String),
-    #[error("le préréglage actif {0} n'existe pas")]
-    ActifInconnu(String),
     #[error("le préréglage Pure doit rester sans traitement")]
     PureModifie,
 }
@@ -105,12 +108,7 @@ impl PreReglages {
     /// un compte redevenu gratuit.
     pub fn verifier(&self) -> Result<(), ErreurPreReglage> {
         for (i, p) in self.presets.iter().enumerate() {
-            let id_ok = !p.id.is_empty()
-                && p.id.len() <= 64
-                && p.id
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-            if !id_ok {
+            if !id_valide(&p.id) {
                 return Err(ErreurPreReglage::IdInvalide(p.id.clone()));
             }
             if self.presets[..i].iter().any(|q| q.id == p.id) {
@@ -123,11 +121,6 @@ impl PreReglages {
                 return Err(ErreurPreReglage::PureModifie);
             }
         }
-        if let Some(a) = &self.active
-            && self.get(a).is_none()
-        {
-            return Err(ErreurPreReglage::ActifInconnu(a.clone()));
-        }
         Ok(())
     }
 }
@@ -137,7 +130,10 @@ mod tests {
     use super::*;
     use crate::tess::chaine::MaillonGreffon;
     use crate::tess::greffon::catalogue_de_reference;
-    use crate::tess::{CodeEtape, ContexteValidation};
+    use crate::tess::resolution::{
+        Badge, ContexteExecution, ControleVolume, SourceFlux, VolumeZone,
+    };
+    use crate::tess::{ContexteValidation, TransportZone};
     use serde_json::{Value, json};
 
     fn soiree() -> PreReglage {
@@ -160,7 +156,6 @@ mod tests {
     fn les_prereglages_font_l_aller_retour_json() {
         let mut l = PreReglages::default();
         l.presets.push(soiree());
-        l.active = Some("evening-listening".into());
         l.apply_mode = ModeApplication::AtNextPlayback;
         l.verifier().unwrap();
         let texte = serde_json::to_string(&l).unwrap();
@@ -175,35 +170,40 @@ mod tests {
         );
     }
 
+    fn tout(_: &str) -> bool {
+        true
+    }
+
     #[test]
-    fn pure_ne_traite_rien() {
+    fn pure_est_bit_perfect_meme_sans_droit() {
         let p = PreReglage::pure();
         p.chain
             .valider(
                 &catalogue_de_reference(),
-                ContexteValidation {
-                    channels: Some(2),
-                    premium: false,
-                },
+                ContexteValidation { premium: false },
             )
             .unwrap();
-        assert_eq!(p.chain.headroom_effectif_db(), 0.0);
-        let actives: Vec<_> = p
-            .chain
-            .ordre_des_etapes()
-            .into_iter()
-            .filter(|e| e.active)
-            .map(|e| e.code)
-            .collect();
-        assert_eq!(
-            actives,
-            [
-                CodeEtape::Source,
-                CodeEtape::Volume,
-                CodeEtape::Quantization,
-                CodeEtape::Output
-            ]
-        );
+        let ctx = ContexteExecution {
+            transport: TransportZone::Local,
+            source: Some(SourceFlux::Pcm {
+                sample_rate_hz: 44_100,
+                bits: 16,
+                channels: 2,
+            }),
+            premium: false,
+            greffon_disponible: &tout,
+            pure: false,
+            volume: VolumeZone {
+                control: ControleVolume::Software,
+                db: 0.0,
+            },
+        };
+        let r = p.chain.resoudre(&catalogue_de_reference(), &ctx);
+        assert_eq!(r.badge, Badge::BitPerfect);
+        assert_eq!(r.headroom_db, 0.0);
+        // Contre-épreuve : le préréglage « soirée » traite.
+        let r = soiree().chain.resoudre(&catalogue_de_reference(), &ctx);
+        assert_eq!(r.badge, Badge::ProcessedByTess);
     }
 
     #[test]
@@ -214,13 +214,6 @@ mod tests {
             l
         };
         base().verifier().unwrap();
-
-        let mut l = base();
-        l.active = Some("headphones".into());
-        assert_eq!(
-            l.verifier(),
-            Err(ErreurPreReglage::ActifInconnu("headphones".into()))
-        );
 
         let mut l = base();
         l.presets.push(soiree());
@@ -236,9 +229,15 @@ mod tests {
             Err(ErreurPreReglage::NomVide("evening-listening".into()))
         );
 
-        let mut l = base();
-        l.presets[1].id = "Evening listening".into();
-        assert!(matches!(l.verifier(), Err(ErreurPreReglage::IdInvalide(_))));
+        // Même règle d'identifiant que les greffons (et que le schéma).
+        for mauvais in ["Evening listening", "-x", "x-", ""] {
+            let mut l = base();
+            l.presets[1].id = mauvais.into();
+            assert_eq!(
+                l.verifier(),
+                Err(ErreurPreReglage::IdInvalide(mauvais.into()))
+            );
+        }
 
         let mut l = base();
         l.presets[0].chain.bypass_all = false;
@@ -249,16 +248,17 @@ mod tests {
         let mut l = base();
         l.presets.remove(0);
         l.verifier().unwrap();
+        assert!(l.get(ID_PREREGLAGE_PURE).is_none());
     }
 
     #[test]
-    fn un_champ_inconnu_dans_un_prereglage_est_refuse() {
-        let texte =
-            r#"{"active":null,"presets":[{"id":"x","name":"X","chain":{"version":1},"order":3}]}"#;
-        assert!(serde_json::from_str::<PreReglages>(texte).is_err());
-        let ok = r#"{"active":null,"presets":[{"id":"x","name":"X","chain":{"version":1}}]}"#;
-        let l: PreReglages = serde_json::from_str(ok).unwrap();
-        assert_eq!(l.apply_mode, ModeApplication::Immediately);
+    fn un_client_v1_lit_une_liste_plus_recente() {
+        let texte = r#"{"apply_mode":"crossfade","shared":true,
+            "presets":[{"id":"x","name":"X","chain":{"version":1},"color":"blue"}]}"#;
+        let l: PreReglages = serde_json::from_str(texte).unwrap();
+        assert_eq!(l.apply_mode, ModeApplication::Unknown);
         assert!(!l.presets[0].builtin);
+        let l: PreReglages = serde_json::from_str(r#"{"presets":[]}"#).unwrap();
+        assert_eq!(l.apply_mode, ModeApplication::Immediately);
     }
 }
