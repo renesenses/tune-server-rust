@@ -159,6 +159,7 @@ reprend donc la règle de #7616 **telle qu'elle est appliquée aujourd'hui**.
 | `convolution` | Convolution | room_and_filters | Premium | `room_correction` | référence | any | libre | — |
 | `room-correction` | Room correction | room_and_filters | Premium | `room_correction` | référence | any | libre | — |
 | `declick-live` | Declick | restoration_and_routing | **Premium** (P1) | à fixer (T19) | référence | any | libre | — |
+| `mono-downmix` | Mono downmix | restoration_and_routing | Free | — | référence | stereo_only | libre | — |
 | `channel-remap` | Channel remapping | restoration_and_routing | Free | — | référence | remaps | dernier | — |
 
 Remarques sur le catalogue :
@@ -424,28 +425,55 @@ producteur et le rendu transporte des `f64`**, et que la quantification
 - Un anneau en `f32` violerait Q5 : il est exclu.
 - La mémoire de l'anneau double. À mesurer sur le Pi 4 (T18).
 
-### T02 : migration
+### T02 : migration (fait, `tess::migration`)
 
-- **Correspondance des clés actuelles** :
-  - `eq_profile` → une des trois façades d'égaliseur. Un profil paramétrique
-    sur un compte gratuit est converti en graphique (P2) ;
-  - `crossfeed` → `crossfeed` ;
-  - `ir_path_*` → `convolution` ;
-  - `channel_remap` → `channel-remap` ;
-  - `native_plugin_*` → greffons de paquet ;
-  - `upsampler` → `fixed.upsampling`, avec **tous** ses champs ;
-  - `gain_trim_db` → headroom (avec le ReplayGain).
-- **`mono_downmix`** : il n'a pas de greffon dans ce contrat. T02 le rattache à
-  `channel-remap` (matrice de repli), ou ajoute un greffon dédié, à trancher
-  dans T02.
-- **`audiophile` et `strict_bitperfect`** : ils alimentent
-  `ContexteExecution.pure`. Ce ne sont pas des champs de la chaîne. Pure n'est
-  pas `bypass_all` : Pure coupe aussi le volume logiciel et la quantification.
-- **Zones où plusieurs membres du groupe crossfeed sont cochés ensemble** : la
-  migration les garde tous cochés. La politique `priority` reproduit l'ordre
-  actuel : crosstalk, puis Crossfeed Pro, puis crossfeed. Aucune chaîne migrée
-  n'est refusée.
-- Écriture croisée vers les anciennes clés, pour les clients mobiles.
+- **Stockage** : la chaîne sous `zone_{id}_tess_chain` ; l'**ombre** sous
+  `zone_{id}_tess_chain_sync` (valeur brute de chaque ancienne clé à la
+  dernière écriture de la chaîne). Une ancienne clé qui diffère de l'ombre a
+  été écrite par une ancienne route : elle l'emporte sur la chaîne pour ce
+  qu'elle exprime. Le reste (ordre, greffon décoché, Headphone EQ, DSD,
+  headroom, dither, `bypass_all`) reste celui de la chaîne.
+- **Correspondance** :
+
+| Ancienne clé | Chaîne |
+|---|---|
+| `zone_{id}_eq_profile` | une façade d'égaliseur, `enabled` du profil, `settings` = profil sans `enabled` : profil de pièce mesuré (`room_profile_{id}`) → `room-correction` ; sans bande ou courbe de grille ISO 10/15/31 → `equalizer-graphic` ; sinon `equalizer-headphone` si la chaîne l'était déjà, sinon `equalizer-parametric` |
+| `ir_path_{id}` | `convolution`, coché, `settings.ir_path` |
+| `zone_{id}_crossfeed` | `crossfeed` (`enabled`, reste en `settings`) |
+| `zone_{id}_native_plugin_{p}` | greffon `{p}` (Crossfeed Pro, Crosstalk, paquets tiers) |
+| `zone_{id}_mono_downmix` | `mono-downmix`, coché si `"true"` |
+| `zone_{id}_channel_remap` | `channel-remap`, en dernier |
+| `zone_{id}_upsampler` | `fixed.upsampling` : `pcm` (`filter`, `max_ratio`, `max_rate_hz`) si `enabled`, sinon `off` |
+| `zone_{id}_audiophile`, `zone_{id}_strict_bitperfect` | hors chaîne : `ContexteExecution.pure` |
+| `zone_{id}_gain_trim_db` | hors chaîne : gain de zone, porté par l'étage headroom (T07), comme le ReplayGain ; peut être positif, donc pas un headroom manuel |
+
+- **Ordre d'une chaîne migrée** : celui de la lecture d'aujourd'hui :
+  égaliseur, convolution, crossfeed, `crossfeed-*`, crosstalk, autres paquets,
+  repli mono, réaffectation.
+- **`mono_downmix`** : greffon dédié `mono-downmix` (Free, stéréo seulement,
+  place libre), et non une matrice de `channel-remap` : la clé est
+  indépendante de la réaffectation, et `channel-remap` doit rester le dernier
+  greffon.
+- **Groupe crossfeed** : tous les membres cochés le restent ; aucune chaîne
+  migrée n'est refusée (politique `priority`).
+- **P2** : sans Premium, un `equalizer-parametric` **coché** devient un
+  `equalizer-graphic` au plus près, sur la grille réglée (`eq_expert_bands`) ;
+  deux courbes si les canaux diffèrent. Décoché, il reste tel quel.
+- **Écriture croisée** : `ecrire_chaine` met à jour les anciennes clés que la
+  chaîne exprime, et seulement celles dont le sens change. Un greffon retiré
+  ou décoché est décoché dans son ancienne clé (réglages gardés) ; la
+  convolution, sans état « décoché », efface `ir_path_{id}` (le chemin reste
+  dans la chaîne) ; un upsampling DSD éteint l'ancien suréchantillonneur. Le
+  premier profil d'égaliseur réécrit est gardé sous
+  `zone_{id}_eq_profile_before_tess`. Le bilan rend les clés modifiées, à
+  rafraîchir par la route (T08).
+- **Migration** : `migrer_zone` n'écrit que la chaîne et l'ombre, jamais une
+  ancienne clé (la lecture d'aujourd'hui ne change pas). Idempotente. Une
+  clé illisible donne un refus explicite qui la nomme ; une chaîne d'une
+  version plus récente n'est jamais réécrite. Rien n'est encore branché au
+  démarrage ni dans la lecture (T03).
+- **Export** : `config_export` porte la chaîne de chaque zone, calculée pour
+  une zone jamais migrée.
 
 ### T05 : manifeste
 

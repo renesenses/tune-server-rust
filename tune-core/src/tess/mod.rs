@@ -15,7 +15,9 @@
 //!   de Q9, sans jamais rejeter la chaîne ;
 //! - [`prereglages`] : préréglages de chaîne et mode d'application (A2) ;
 //! - [`zones`] : où TESS s'applique (Q8) ;
-//! - [`api`] : les corps JSON de `GET/PUT /zones/{id}/tess` et leurs schémas.
+//! - [`api`] : les corps JSON de `GET/PUT /zones/{id}/tess` et leurs schémas ;
+//! - [`migration`] (T02) : la chaîne enregistrée d'une zone, tirée des
+//!   anciennes clés, et l'écriture croisée vers elles.
 //!
 //! Compatibilité : les types de RÉPONSE tolèrent champs et valeurs inconnus
 //! (repli `unknown`) ; seul le corps d'un `PUT` est lu strictement. Le document
@@ -25,6 +27,7 @@ pub mod api;
 pub mod chaine;
 pub mod etage;
 pub mod greffon;
+pub mod migration;
 pub mod prereglages;
 pub mod resolution;
 pub mod zones;
@@ -53,7 +56,7 @@ pub use zones::{Applicabilite, MotifHorsTess, TransportZone};
 /// d'énumération) ne la fait pas monter, puisque les clients les ignorent.
 pub const VERSION_CONTRAT: u32 = 1;
 
-/// Clé de réglage qui portera la chaîne d'une zone (lot T02).
+/// Clé de réglage qui porte la chaîne d'une zone (lot T02, [`migration`]).
 pub fn cle_chaine_zone(zone_id: i64) -> String {
     format!("zone_{zone_id}_tess_chain")
 }

@@ -130,6 +130,25 @@ fn champs_lus_par_le_depot(repo: &ZoneRepo, id: i64, obj: &mut Map<String, Value
     );
 }
 
+/// TESS (T02) : la chaîne d'une zone part avec elle. Une zone jamais migrée
+/// n'a pas encore de `zone_{id}_tess_chain` : la chaîne est tirée de ses
+/// anciennes clés pour l'export, sans rien écrire. Une clé illisible ne bloque
+/// pas l'export : ses anciennes clés partent seules, et la restauration les
+/// relira.
+fn chaine_tess_exportee(backend: &Arc<dyn DbBackend>, id: i64, reglages: &mut Map<String, Value>) {
+    if reglages.contains_key("zone_{id}_tess_chain") {
+        return;
+    }
+    let settings = SettingsRepo::with_backend(backend.clone());
+    match crate::tess::migration::lire_zone(&settings, id, true).and_then(|l| l.textes()) {
+        Ok((chaine, ombre)) => {
+            reglages.insert("zone_{id}_tess_chain".into(), valeur_exportee(&chaine));
+            reglages.insert("zone_{id}_tess_chain_sync".into(), valeur_exportee(&ombre));
+        }
+        Err(e) => tracing::warn!(zone_id = id, erreur = %e, "config_export_chaine_tess_illisible"),
+    }
+}
+
 /// Les zones VISIBLES, au format de l'export, réglages de zone compris.
 ///
 /// Une zone masquée est une zone que l'utilisateur a supprimée : elle ne part
@@ -173,6 +192,7 @@ fn zones_exportees(
         obj.remove("autoplay_enabled");
         champs_lus_par_le_depot(&repo, id, obj);
         let mut leurs_reglages = par_zone.remove(&id).unwrap_or_default();
+        chaine_tess_exportee(backend, id, &mut leurs_reglages);
         // Toujours, même avec `include_secrets` : un réglage de zone n'a
         // aucune raison de porter un secret, et s'il en portait un il partirait
         // vers une autre machine sous un autre numéro.
