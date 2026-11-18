@@ -131,17 +131,25 @@ Le reste est vérifié par le greffon.
 ### Groupe exclusif crossfeed / Crossfeed Pro / Crosstalk
 
 Deux crossfeeds en série croisent les voies deux fois. Le crosstalk (pour
-enceintes) agit en sens contraire du crossfeed (pour casque). Le contrat
-reprend donc la règle de #7616 **telle qu'elle est appliquée aujourd'hui**.
+enceintes) agit en sens contraire du crossfeed (pour casque).
 
-- **Politique `priority` (par défaut)** : la chaîne n'est **jamais refusée**.
+- **Politique `refuse` (par défaut, décision B de Bertrand du 18/11)** : une
+  chaîne ne coche qu'un membre du groupe. Un `PUT` qui en coche deux est
+  refusé en **409 `mutually_exclusive`**.
+- **Résolution toujours tolérante** (règle de #7616), quelle que soit la
+  politique : une chaîne ancienne qui arriverait quand même avec deux membres
+  cochés n'est jamais réduite au silence.
   - À l'exécution, le membre actif le plus prioritaire traite.
   - Les autres sont écartés, avec le motif `replaced_in_group` et
     `params.replaced_by`.
   - Priorités : `crosstalk` (3) > crossfeed tiers `crossfeed-*` (2) >
     `crossfeed` intégré (1). À égalité, le premier dans la chaîne l'emporte.
-- **Politique `refuse`** : prévue, mais **non utilisée tant que Bertrand n'a
-  pas tranché**. Elle donnerait un 409 `mutually_exclusive`.
+- **Politique `priority`** : reste disponible pour un groupe qui la déclare
+  (jamais de refus, la résolution tranche).
+- **Zones existantes (T02)** : la migration ne refuse jamais une zone où
+  plusieurs membres sont cochés. Elle garde celui qui traite aujourd'hui et
+  DÉCOCHE les autres, réglages gardés, marqués `"replaced_in_group": "<id du
+  gagnant>"` ; la résolution l'affiche (`replaced_in_group`). Voir § 8.
 - **Appartenance au groupe** : par le manifeste (`exclusive_group`) **et** par
   le préfixe `crossfeed-` pour les paquets déjà publiés. T05 ajoute le champ
   au manifeste.
@@ -234,7 +242,7 @@ Enregistrée sous `zone_{id}_tess_chain` (T02), échangée par
 | `duplicate_plugin` | 409 | même id deux fois |
 | `invalid_settings` | 409 | réglages non conformes au schéma (niveau hôte) |
 | `must_be_last_plugin` | 409 | greffon `last_plugin` suivi d'un autre (même décoché) |
-| `mutually_exclusive` | 409 | seulement pour un groupe en politique `refuse` |
+| `mutually_exclusive` | 409 | deux membres cochés d'un groupe en politique `refuse` (le défaut) |
 | `premium_required` | **402** | greffon Premium **coché**, ou upsampling demandé, sans Premium, hors `bypass_all` |
 
 Ce qui dépend du flux ou de l'installation n'est **pas** refusé au `PUT`
@@ -408,7 +416,7 @@ Hors TESS, avec un motif affiché :
                      "effective": true, "reason": null, "detail": null,
                      "params": { "kind": "pcm", "sample_rate_hz": 96000, "bits": 24, "channels": 2 },
                      "latency_frames": null }, … ],
-  "catalog": { "plugins": [ … ], "groups": [ { "id": "crossfeed_crosstalk", "policy": "priority" } ] }
+  "catalog": { "plugins": [ … ], "groups": [ { "id": "crossfeed_crosstalk", "policy": "refuse" } ] }
 }
 ```
 
@@ -465,11 +473,11 @@ producteur et le rendu transporte des `f64`**, et que la quantification
 
 | Ancienne clé | Chaîne |
 |---|---|
-| `zone_{id}_eq_profile` | une façade d'égaliseur, `enabled` du profil, `settings` = profil sans `enabled` (sa réserve `headroom_mode` comprise) : profil de pièce mesuré (`room_profile_{id}`) → `room-correction` (marqué `legacy`, D1) ; sans bande ou courbe de grille ISO 10/15/31 → `equalizer-graphic` ; sinon `equalizer-headphone` si la chaîne l'était déjà, sinon `equalizer-parametric` |
+| `zone_{id}_eq_profile` | une façade d'égaliseur, `enabled` du profil, `settings` = profil sans `enabled` (sa réserve `headroom_mode` comprise) : profil de pièce (`room_profile_{id}`) → `room-correction`, avec son origine `measured` ou `estimation` (D1) ; sans bande ou courbe de grille ISO 10/15/31 → `equalizer-graphic` ; sinon `equalizer-headphone` si la chaîne l'était déjà, sinon `equalizer-parametric` |
 | `ir_path_{id}` | `convolution`, coché, `settings.ir_path` |
 | `zone_{id}_crossfeed` | `crossfeed` (`enabled`, reste en `settings`) |
 | `zone_{id}_native_plugin_{p}` | greffon `{p}` (Crossfeed Pro, Crosstalk, paquets tiers) |
-| `zone_{id}_mono_downmix` | `mono-downmix`, coché si `"true"` sur une sortie locale (D2) |
+| `zone_{id}_mono_downmix` | `mono-downmix`, coché si `"true"` sur une sortie locale ; décoché avec `inert_on_network` sur une zone réseau (D2) |
 | `zone_{id}_channel_remap` | `channel-remap`, en dernier |
 | `zone_{id}_upsampler` | `fixed.upsampling` : `pcm` (`filter`, `max_ratio`, `max_rate_hz`) si `enabled`, sinon `off` |
 | `zone_{id}_audiophile`, `zone_{id}_strict_bitperfect` | hors chaîne : `ContexteExecution.pure` |
@@ -492,8 +500,16 @@ producteur et le rendu transporte des `f64`**, et que la quantification
 - **Ordre d'une chaîne migrée** : celui de la lecture d'aujourd'hui :
   égaliseur, convolution, crossfeed, `crossfeed-*`, crosstalk, autres paquets,
   repli mono, réaffectation.
-- **Groupe crossfeed** : tous les membres cochés le restent ; aucune chaîne
-  migrée n'est refusée (politique `priority`).
+- **Groupe crossfeed** (décision B) : aucune chaîne migrée n'est refusée et
+  rien ne change à l'oreille. Si les anciennes clés cochent plusieurs membres,
+  le gagnant est celui qui traite aujourd'hui : le plus prioritaire (Crosstalk
+  > `crossfeed-*` > crossfeed intégré, à égalité le premier) parmi les
+  membres en service (paquet installé et activé, greffon intégré activé ; le
+  droit Premium n'entre pas en compte, la chaîne enregistrée n'en dépend
+  pas). Les autres sont DÉCOCHÉS, réglages gardés, avec
+  `"replaced_in_group": "<gagnant>"` ; leur ancienne clé reste cochée (l'ancien
+  moteur applique déjà la priorité). Si le gagnant n'est plus coché (ancienne
+  route), le membre écarté est recoché, puis la règle s'applique de nouveau.
 - **P2** : à la lecture sans Premium, un `equalizer-parametric` **coché**
   devient un `equalizer-graphic` au plus près, sur la grille réglée
   (`eq_expert_bands`), ±12 dB au plus ; deux courbes si les canaux diffèrent.
@@ -519,17 +535,63 @@ producteur et le rendu transporte des `f64`**, et que la quantification
   (T03).
 - **Export** : `config_export` porte la chaîne de chaque zone, calculée pour
   une zone jamais migrée.
-- **Choix provisoires, décisions en attente de Bertrand** :
-  - **D1** (correction de pièce) : un égaliseur de pièce mesuré déjà posé
-    dans `eq_profile` devient `room-correction` avec `"legacy": true` dans ses
-    réglages. La résolution le garde actif sans Premium (droit acquis, comme
-    aujourd'hui). La marque n'est jamais écrite dans `eq_profile`. T08 : un
-    `PUT` qui garde ce maillon tel qu'il est enregistré n'est pas refusé en
-    402.
-  - **D2** (`mono-downmix`, 11ᵉ greffon) : gardé dans la chaîne, mais sur une
-    zone réseau, où l'interrupteur actuel est inerte (#3254, sortie locale
-    seulement), il est **décoché** avec `"inert_on_network": true` : aucun
-    changement audible, et l'ancienne clé n'est pas touchée.
+- **Décisions de Bertrand (18/11)** :
+  - **D1** (correction de pièce) : un égaliseur de pièce posé dans
+    `eq_profile` devient `room-correction`, avec son origine dans ses
+    réglages (`"origin"`, jamais écrit dans `eq_profile`).
+    - **Mesurée au micro** (`"measured"`) : Premium pour tous, plus de droit
+      acquis. Pour un compte gratuit, elle est **convertie** en égaliseur
+      graphique au plus près à la LECTURE, comme P2 ; jamais dans la chaîne
+      enregistrée ni dans `eq_profile`.
+    - **Calculée sans micro** (C5, #7919, `"estimation"`) : Free, active sans
+      Premium, jamais convertie (`correction_estimee`, honoré par la
+      résolution).
+    - **Origine** : les anciens réglages ne l'enregistrent pas. On lit
+      `room_profile_{id}` : un champ explicite (`"estimation": true|false` ou
+      `"origin"`) l'emporte ; sinon le nom par défaut d'une estimation C5
+      (« Estimation {id} ») ; sinon **mesurée**. Les bornes de C5 ne servent
+      pas d'indice (le mode expert #8332 les relève). Dans le doute, la
+      correction est donc traitée en Premium : convertie, jamais détruite.
+      Le greffon de calibration devrait écrire le champ explicite (tâche
+      Codex 28, qui sort aussi C5 de la garde Premium du greffon).
+    - **L'origine appartient au serveur** : `ecrire_chaine` la réécrit
+      d'après `room_profile_{id}` quoi que dise le corps (`"estimation"`
+      seulement si les bandes sont celles d'une estimation de la zone,
+      `"measured"` sinon). Un `PUT` ne peut donc jamais lever le droit
+      Premium en se disant « sans micro ».
+  - **D2** (`mono-downmix`) : 11ᵉ greffon, Free. Sur une zone réseau, où
+    l'interrupteur actuel était inerte (#3254, sortie locale seulement), il
+    est **décoché d'office, une seule fois, à la migration**, avec
+    `"inert_on_network": true` : aucun changement audible, et l'ancienne clé
+    n'est pas touchée. Coché ensuite (TESS ou ancienne route), il agit
+    partout. Si la zone passe ensuite sur une sortie locale, où
+    l'interrupteur (resté à `"true"`) agit, il est recoché à la lecture ;
+    une zone locale qui passe sur le réseau garde son mono coché.
+- **Les marques de la lecture appartiennent au serveur** (T02 suites, pour
+  T08) : `origin` (D1) est réécrite d'après `room_profile_{id}` ;
+  `replaced_in_group` (décision B) et `inert_on_network` (D2) ne sont gardées
+  par `ecrire_chaine` que si le maillon, décoché, porte DÉJÀ la même marque
+  dans la chaîne que le serveur lit pour la zone (migration à la lecture
+  comprise), et, pour `replaced_in_group`, si le gagnant nommé reste coché.
+  Sinon la marque est retirée et le maillon décoché est projeté normalement
+  (son ancienne clé est décochée). Un client qui renvoie les réglages lus ne
+  peut donc ni garder cochée l'ancienne clé d'un membre écarté après avoir
+  décoché le gagnant, ni faire recocher en local un mono décoché à la main.
+- **En attente de Bertrand (TODO, non tranché par T02)** :
+  - **I3** : relecture d'une copie de base réelle (`TUNE_T02_COPIE`, test
+    ignoré `i3_relecture_d_une_copie_de_base_reelle`) : attend la copie.
+  - **D2, zone locale passée sur le réseau** : le mono coché le reste et
+    agira sur le réseau une fois T03 branché, là où l'ancien moteur
+    l'ignorait (changement audible). C'est la lecture littérale de « agit
+    partout où on le coche » ; à confirmer, l'alternative étant de le
+    décocher avec `inert_on_network` au changement de sortie.
+  - **D2, zone réseau passée en local** : recoché à la lecture, parce que
+    l'interrupteur resté à `"true"` y agit dans l'ancien moteur. Déduit de
+    « aucun changement audible », à confirmer.
+  - **D1, origine des profils existants** : le nom par défaut
+    « Estimation {id} » désigne une estimation, tout le reste est traité en
+    mesure (converti pour un compte gratuit). À confirmer, et à remplacer par
+    le champ explicite dès que la tâche Codex 28 l'écrit.
 
 ### T05 : manifeste
 
