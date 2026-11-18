@@ -1430,7 +1430,11 @@ impl PlaybackOrchestrator {
         let conteneur = if !nomme && pour("dsf") != pour("dff") {
             match conteneur_dsd_par_l_en_tete(audio_url).await {
                 Some(lu) => {
-                    info!(url = %audio_url, conteneur = lu, "dsd_upnp_conteneur_lu_a_l_en_tete");
+                    info!(
+                        url = %crate::confidentialite::masquer_url(&audio_url),
+                        conteneur = lu,
+                        "dsd_upnp_conteneur_lu_a_l_en_tete"
+                    );
                     lu
                 }
                 None => conteneur,
