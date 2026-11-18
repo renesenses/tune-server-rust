@@ -79,6 +79,10 @@ pub enum MotifEtape {
     VolumeNotSoftware,
     /// Rien ne modifie les échantillons : aucune requantification.
     NothingToQuantize,
+    /// T16 — demandé et résolu, mais l'étage ne tourne pas : ce que
+    /// l'exécuteur (ou la sonde de la sortie) dit avoir réellement en service
+    /// prime sur la résolution (`tess::chemin`).
+    NotInService,
     #[serde(other)]
     Unknown,
 }
@@ -224,6 +228,10 @@ pub enum Badge {
     ProcessedByTess,
     /// Zone hors TESS.
     OutsideTess,
+    /// T16 — TESS ne touche à rien, mais le chemin, lui, n'est pas intact
+    /// (conversion de cadence du transport, source avec perte…) : le badge
+    /// ne dit jamais « Bit-perfect » sur un chemin qui ne l'est pas.
+    AlteredOutsideTess,
     #[serde(other)]
     Unknown,
 }

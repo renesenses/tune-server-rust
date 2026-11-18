@@ -1741,6 +1741,11 @@ mod signal_path;
 pub(crate) mod signal_path_groupe_8419;
 pub(crate) mod textes_signal;
 pub use signal_path::*;
+// TESS T16 — le bloc `tess` du chemin du signal (maquette A4).
+mod chemin_tess_t16;
+pub use chemin_tess_t16::avec_le_chemin_tess;
+#[cfg(test)]
+mod chemin_tess_t16_tests;
 
 mod ecriture;
 pub use ecriture::*;
