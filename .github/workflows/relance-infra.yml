@@ -1,0 +1,64 @@
+name: Relancer un job mort sans étape en échec
+
+# QA 18/11 (chantier « tests instables ») — sur les runs du 15 au 18/11, sept
+# jobs « Test (PostgreSQL) » sont en échec SANS aucune étape en échec et sans
+# journal (« log not found ») : la machine GitHub a été perdue (arrêt du
+# runner, communication perdue). Ce n'est ni un test rouge ni une compilation
+# cassée ; la PR restait pourtant rouge jusqu'à une relance à la main. Deux
+# autres jobs du 18/11 ont fini en échec dans la SEULE étape « Post Run
+# Swatinem/rust-cache » (disque plein en sauvegardant le cache), tous leurs
+# tests verts.
+#
+# Ce workflow relance UNE fois (`gh run rerun --failed`) un run de « CI » ou de
+# « Tests (PostgreSQL) » en échec, si et seulement si CHACUN de ses jobs en
+# échec :
+#   - n'a aucune étape en échec (machine perdue), ou
+#   - n'a d'étape en échec que la sauvegarde du cache (`Post Run …rust-cache`).
+# Un seul job avec une vraie étape en échec (test, compilation, clippy, audit,
+# format…) : rien n'est relancé. Jamais au-delà de la première tentative.
+#
+# Note : `workflow_run` ne se déclenche qu'avec la version de ce fichier
+# présente sur la branche PAR DÉFAUT (main) ; il prend effet à la promotion.
+
+on:
+  workflow_run:
+    workflows: ["CI", "Tests (PostgreSQL)"]
+    types: [completed]
+
+permissions:
+  actions: write   # gh run rerun
+  contents: read
+
+concurrency:
+  group: relance-infra-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  relancer:
+    name: Relancer si la machine seule est en cause
+    if: >-
+      github.event.workflow_run.conclusion == 'failure'
+      && github.event.workflow_run.run_attempt == 1
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Classer les jobs en échec, relancer si aucun n'a d'étape en échec
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          RUN: ${{ github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          jobs=$(gh api "repos/$REPO/actions/runs/$RUN/attempts/1/jobs?per_page=100" --paginate \
+            --jq '.jobs[] | select(.conclusion == "failure")
+                  | {nom: .name, etapes: [.steps[]? | select(.conclusion == "failure") | .name]}')
+          echo "$jobs"
+          if [ -z "$jobs" ]; then echo "Aucun job en échec lisible : rien à faire."; exit 0; fi
+          # Une étape en échec qui n'est pas la sauvegarde du cache = un vrai rouge.
+          vrais=$(echo "$jobs" | jq -s '[.[] | .etapes[] | select(test("^Post Run .*rust-cache") | not)] | length')
+          if [ "$vrais" != "0" ]; then
+            echo "Au moins une vraie étape en échec : pas de relance."
+            exit 0
+          fi
+          echo "Jobs morts sans étape en échec (machine perdue ou disque plein à la sauvegarde du cache) : relance unique."
+          gh run rerun "$RUN" --repo "$REPO" --failed

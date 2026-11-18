@@ -702,6 +702,10 @@ mod composant_airplay2_7084;
 mod limites_de_volume_6541;
 // #7836 — les zones supprimées, listées et restaurables.
 mod zones_supprimees_7836;
+// #8987 — un appareil déjà lié à une zone : 409 nommés, sortie libérée d'une
+// zone supprimée, restauration sous un autre hôte audio signalée.
+mod zone_appareil_8987;
+pub(crate) use zone_appareil_8987::prendre_la_sortie_demandee;
 // #6721 — la garde contre les montées brusques, par le routeur public.
 #[cfg(test)]
 mod garde_de_hausse_6721_tests;
