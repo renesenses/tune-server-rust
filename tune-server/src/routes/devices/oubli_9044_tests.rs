@@ -112,8 +112,9 @@ fn les_garde_fous_de_la_decouverte_ne_sont_ni_supprimes_ni_bloquants() {
     // Une lecture sur un garde-fou ne bloque pas : il n'est pas touché.
     assert_eq!(verdict(&zs, &joue_reflet, false, false), Ok(vec![12, 13]));
     // Un appareil dont il ne reste que des garde-fous n'est pas listé.
-    assert!(absents(&zs[..3], &rien).is_empty());
-    let liste = absents(&zs, &rien);
+    let personne: HashSet<String> = HashSet::new();
+    assert!(absents(&zs[..3], &personne).is_empty());
+    let liste = absents(&zs, &personne);
     assert_eq!(liste.len(), 1);
     assert_eq!(liste[0]["zones"].as_array().unwrap().len(), 2);
 }
