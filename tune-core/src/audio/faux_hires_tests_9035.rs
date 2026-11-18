@@ -231,11 +231,14 @@ fn l_ancien_code_codec_se_publie_coupure_spectrale_9035() {
 /// Passe-bas idéal à `coupure_hz` sur tout le signal (FFT de sa longueur,
 /// une puissance de deux) : le filtre fixe d'un mastering.
 fn passe_bas(signal: &[f32], sample_rate: u32, coupure_hz: f64) -> Vec<f32> {
+    // En f64 : l'arrondi d'une FFT f32 de 2^18 points laisse au-dessus de la
+    // coupure un plancher d'erreur qui n'est pas plat jusqu'à Nyquist, et y
+    // dessinerait une falaise d'artefact.
     let n = signal.len();
-    let mut plan = RealFftPlanner::<f32>::new();
+    let mut plan = RealFftPlanner::<f64>::new();
     let avant = plan.plan_fft_forward(n);
     let arriere = plan.plan_fft_inverse(n);
-    let mut entree = signal.to_vec();
+    let mut entree: Vec<f64> = signal.iter().map(|&s| s as f64).collect();
     let mut spectre = avant.make_output_vec();
     avant.process(&mut entree, &mut spectre).unwrap();
     let hz_par_raie = sample_rate as f64 / n as f64;
@@ -249,7 +252,7 @@ fn passe_bas(signal: &[f32], sample_rate: u32, coupure_hz: f64) -> Vec<f32> {
     spectre[m - 1].im = 0.0;
     let mut sortie = arriere.make_output_vec();
     arriere.process(&mut spectre, &mut sortie).unwrap();
-    sortie.iter().map(|s| s / n as f32).collect()
+    sortie.iter().map(|s| (s / n as f64) as f32).collect()
 }
 
 /// Normalise à -6 dBFS de crête, ajoute un bruit de fond rose à -60 dB (le
