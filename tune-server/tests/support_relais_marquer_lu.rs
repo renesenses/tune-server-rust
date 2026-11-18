@@ -29,7 +29,10 @@ fn new_state() -> AppState {
 /// « la route n'existe pas ».
 async fn appel(methode: &str, chemin: &str) -> (StatusCode, String) {
     let state = new_state();
-    let app: Router = tune_server::routes::router(state);
+    let app: Router =
+        tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+        ));
     let resp = app
         .oneshot(
             Request::builder()

@@ -185,7 +185,15 @@ fn serveur(dossier: &ScratchDir) -> (axum::Router, AppState) {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("mozaik_base_url", base).unwrap();
     settings.set("mozaik_client_id", "tune-server").unwrap();
-    (tune_server::routes::router(state.clone()).layer(axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 50000)))), state)
+    (
+        tune_server::routes::router(state.clone()).layer(
+            axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                50000,
+            ))),
+        ),
+        state,
+    )
 }
 
 /// Lancer la VRAIE boucle du battement. Elle n'envoie sa charge que si la

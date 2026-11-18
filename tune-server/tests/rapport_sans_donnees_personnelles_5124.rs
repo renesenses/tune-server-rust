@@ -150,7 +150,12 @@ async fn etat(base: &str) -> AppState {
 }
 
 async fn appel(state: &AppState, req: Request<Body>) -> String {
-    let app: Router = tune_server::routes::router(state.clone());
+    let app: Router = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let route = req.uri().to_string();
     let reponse = app.oneshot(req).await.unwrap();
     let statut = reponse.status();

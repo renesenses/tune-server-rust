@@ -102,7 +102,16 @@ fn serveur(base_url: &str) -> (axum::Router, AppState, tune_core::test_scratch::
     let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("mozaik_base_url", base_url).unwrap();
     settings.set("mozaik_client_id", "tune-server").unwrap();
-    (tune_server::routes::router(state.clone()).layer(axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 50000)))), state, dir)
+    (
+        tune_server::routes::router(state.clone()).layer(
+            axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                50000,
+            ))),
+        ),
+        state,
+        dir,
+    )
 }
 
 fn reglages(state: &AppState) -> SettingsRepo {

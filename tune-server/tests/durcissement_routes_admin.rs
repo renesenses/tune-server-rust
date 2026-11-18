@@ -280,8 +280,14 @@ async fn seul_le_retour_du_sso_reste_public() {
     // retour — ici le refus du fournisseur.
     let retour = "/api/v1/cloud/sso/callback?error=access_denied";
     let (st, rep) = appel(&state, Method::GET, retour, None, None).await;
-    assert!(rep.contains("<!doctype html>"), "page du gestionnaire : {st} {rep}");
-    assert!(!rep.contains("OAuth error"), "sans session, le retour n'est pas traité : {rep}");
+    assert!(
+        rep.contains("<!doctype html>"),
+        "page du gestionnaire : {st} {rep}"
+    );
+    assert!(
+        !rep.contains("OAuth error"),
+        "sans session, le retour n'est pas traité : {rep}"
+    );
     for jeton in [tok("admin", 1), tok("user", 2)] {
         let (st, rep) = appel(&state, Method::GET, retour, Some(&jeton), None).await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "avec la session : {rep}");
@@ -1582,10 +1588,18 @@ async fn un_compte_standard_ne_delie_que_son_propre_profil() {
     enable_auth(&state);
     let reglages = SettingsRepo::with_backend(state.backend.clone());
     // Le serveur est relié ; les profils 2 et 3 aussi, chacun au sien.
-    reglages.set("mozaik_access_token", "JETON-DU-SERVEUR-FAUX").unwrap();
-    reglages.set("mozaik_user", r#"{"email":"proprio@example.org"}"#).unwrap();
-    reglages.set("mozaik_compte_profil_2", r#"{"email":"deux@example.org"}"#).unwrap();
-    reglages.set("mozaik_compte_profil_3", r#"{"email":"trois@example.org"}"#).unwrap();
+    reglages
+        .set("mozaik_access_token", "JETON-DU-SERVEUR-FAUX")
+        .unwrap();
+    reglages
+        .set("mozaik_user", r#"{"email":"proprio@example.org"}"#)
+        .unwrap();
+    reglages
+        .set("mozaik_compte_profil_2", r#"{"email":"deux@example.org"}"#)
+        .unwrap();
+    reglages
+        .set("mozaik_compte_profil_3", r#"{"email":"trois@example.org"}"#)
+        .unwrap();
     let (st, rep) = appel(
         &state,
         Method::POST,
@@ -1596,16 +1610,33 @@ async fn un_compte_standard_ne_delie_que_son_propre_profil() {
     .await;
     assert_eq!(st, StatusCode::OK, "{rep}");
     assert!(rep.contains("\"scope\":\"profile\""), "{rep}");
-    assert_eq!(reglages.get("mozaik_compte_profil_2").unwrap(), None, "son profil est délié");
-    assert!(reglages.get("mozaik_compte_profil_3").unwrap().is_some(), "l'autre profil reste relié");
+    assert_eq!(
+        reglages.get("mozaik_compte_profil_2").unwrap(),
+        None,
+        "son profil est délié"
+    );
+    assert!(
+        reglages.get("mozaik_compte_profil_3").unwrap().is_some(),
+        "l'autre profil reste relié"
+    );
     assert_eq!(
         reglages.get("mozaik_access_token").unwrap().as_deref(),
         Some("JETON-DU-SERVEUR-FAUX"),
         "le serveur reste relié"
     );
-    assert!(reglages.get("mozaik_user").unwrap().is_some(), "le compte du serveur reste");
+    assert!(
+        reglages.get("mozaik_user").unwrap().is_some(),
+        "le compte du serveur reste"
+    );
     // Sans jeton : 401, rien ne bouge.
-    let (st, _) = appel(&state, Method::POST, "/api/v1/cloud/sso/disconnect", None, None).await;
+    let (st, _) = appel(
+        &state,
+        Method::POST,
+        "/api/v1/cloud/sso/disconnect",
+        None,
+        None,
+    )
+    .await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
     assert!(reglages.get("mozaik_compte_profil_3").unwrap().is_some());
 }
