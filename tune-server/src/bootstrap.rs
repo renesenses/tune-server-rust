@@ -226,6 +226,11 @@ pub async fn run_with(opts: RunOptions) {
     // avant le port et la base : l'`exec` ne laisse rien derrière lui.
     #[cfg(unix)]
     crate::binaire_installe::reparer_un_lancement_depuis_la_sauvegarde();
+    // #8944 — une bascule des exécutables livrés (airplay-daemon, librespot…)
+    // coupée par un arrêt de la machine est finie ici, avant qu'aucun démon
+    // ne soit lancé.
+    #[cfg(unix)]
+    crate::routes::system::update::finir_une_mise_a_jour_interrompue();
 
     // #4924 : relever l'état du processus PENDANT un gel de l'exécuteur, sans
     // ptrace ni sudo. Fil 2117/2124 (#5677) : les relevés vont dans le dossier
@@ -453,6 +458,14 @@ pub async fn run_with(opts: RunOptions) {
     // écritures de `init_state`.
     crate::startup::journaliser_les_consentements(&state);
 
+    // Les profils de commande `SetAVTransportURI` appris par appareil après
+    // un refus (501/714/716), et les règles apprises (#6477 : pas de `SetNext`
+    // au FiiO K17), survivent au redémarrage : la mémoire est branchée sur la
+    // base AVANT toute découverte. #8868 — `init_state` lance la resonde des
+    // renderers connus, qui rattache le K17 en quelques millisecondes : la
+    // brancher après, à l'étape « découverte réseau », la laissait passer
+    // avant la base, et la règle n'était plus relue.
+    tune_core::outputs::dlna_repli_set_uri::installer_persistance(state.backend.clone());
     // Restore zone volumes, persist music_dirs/discogs_token to DB
     crate::startup::init_state(&state, &config).await;
 
@@ -543,11 +556,6 @@ pub async fn run_with(opts: RunOptions) {
     // Create shared OpenHome event listener
     crate::boot_status::set_phase("découverte réseau");
     let oh_event_listener = crate::startup::create_oh_listener().await;
-
-    // Les profils de commande `SetAVTransportURI` appris par appareil après
-    // un refus (501/714/716) survivent au redémarrage : la mémoire est
-    // branchée sur la base AVANT la découverte, qui les relit.
-    tune_core::outputs::dlna_repli_set_uri::installer_persistance(state.backend.clone());
 
     // SSDP discovery (DLNA / OpenHome)
     crate::discovery_setup::spawn_ssdp_handler(&state, &config, oh_event_listener);
@@ -1011,15 +1019,41 @@ pub fn installer_le_journal(niveau_journal: &str) -> Option<std::path::PathBuf> 
     // justement le seul qui puisse dépasser 10 Mio (voir tune-server/journal.rs
     // et #2156).
     const PLAFOND_JOURNAL: u64 = 10 * 1024 * 1024;
-    let log_file = {
-        let path = config::default_log_file_path();
-        config::rotate_log_file(&path, PLAFOND_JOURNAL);
-        crate::journal::JournalBorne::ouvrir(path.clone(), PLAFOND_JOURNAL)
-            .ok()
-            .map(|j| {
-                eprintln!("Logging to {}", path.display());
-                (j, path)
-            })
+    //
+    // #8946 — l'emplacement par défaut peut être REFUSÉ au service
+    // (`ProtectHome=yes` sur Tune OS : `$HOME` inaccessible). On se replie
+    // alors sur un dossier où il a le droit d'écrire
+    // ([`config::replis_du_journal`]), on retient le chemin pour que l'export
+    // lise ce même fichier, et chaque refus est dit — sur le flux d'erreur tout
+    // de suite, dans le journal une fois l'abonné posé.
+    let (log_file, refus_du_journal) = {
+        let candidats = std::iter::once(config::default_log_file_path())
+            .chain(config::replis_du_journal_courants());
+        let (ouvert, refus) = crate::journal::ouvrir_le_premier_journal(candidats, PLAFOND_JOURNAL);
+        for (chemin, e) in &refus {
+            eprintln!(
+                "tune-server: journal impossible à ouvrir {} : {e}",
+                chemin.display()
+            );
+        }
+        let ouvert = ouvert.map(|(j, path)| {
+            eprintln!("Logging to {}", path.display());
+            if !refus.is_empty() {
+                config::retenir_le_journal(path.clone());
+            }
+            (j, path)
+        });
+        (ouvert, refus)
+    };
+    let dire_les_refus = |ecrit_dans: Option<&std::path::Path>| {
+        for (chemin, e) in &refus_du_journal {
+            tracing::warn!(
+                refuse = %chemin.display(),
+                error = %e,
+                ecrit_dans = ?ecrit_dans.map(|p| p.display().to_string()),
+                "journal_emplacement_refuse"
+            );
+        }
     };
 
     if let Some((file, chemin)) = log_file {
@@ -1042,8 +1076,8 @@ pub fn installer_le_journal(niveau_journal: &str) -> Option<std::path::PathBuf> 
         // L'ancien nom `stderr_layer` disait le contraire et n'a jamais été
         // vrai.
         let console_ferait_doublon = crate::journal::la_console_ecrit_deja_dans(&chemin);
-        let console_layer =
-            (!console_ferait_doublon).then(|| tracing_subscriber::fmt::layer().with_timer(timer));
+        let console_layer = (!console_ferait_doublon)
+            .then(|| couche_console(timer, la_console_veut_des_couleurs()));
 
         tracing_subscriber::registry()
             .with(env_filter)
@@ -1051,6 +1085,7 @@ pub fn installer_le_journal(niveau_journal: &str) -> Option<std::path::PathBuf> 
             .with(file_layer)
             .init();
 
+        dire_les_refus(Some(&chemin));
         if console_ferait_doublon {
             // `eprintln!` ne traverse pas `tracing` : cette ligne-là n'est
             // jamais dédoublée. Elle va sur le flux d'erreur, que le lanceur
@@ -1067,9 +1102,53 @@ pub fn installer_le_journal(niveau_journal: &str) -> Option<std::path::PathBuf> 
 
     tracing_subscriber::fmt()
         .with_timer(timer)
+        .with_ansi(la_console_veut_des_couleurs())
         .with_env_filter(env_filter)
         .init();
+    dire_les_refus(None);
     None
+}
+
+/// #8922 — la console en couleurs SEULEMENT quand sa sortie est un terminal,
+/// et jamais quand `NO_COLOR` est posé (non vide, <https://no-color.org>).
+///
+/// Sous Docker, systemd ou une redirection vers un fichier, la sortie standard
+/// n'est pas un terminal : `docker logs` et journald recevaient les séquences
+/// `ESC[…m` telles quelles (fil 2381, rc12). `fmt::layer()` colore par défaut
+/// sans regarder où il écrit ; seule la couche FICHIER avait `with_ansi(false)`.
+fn couleurs_de_la_console(
+    sortie_est_un_terminal: bool,
+    no_color: Option<&std::ffi::OsStr>,
+) -> bool {
+    sortie_est_un_terminal && no_color.is_none_or(|v| v.is_empty())
+}
+
+/// [`couleurs_de_la_console`] pour CE processus : la sortie standard (l'écrivain
+/// de `fmt::layer()`, voir [`installer_le_journal`]) et l'environnement.
+fn la_console_veut_des_couleurs() -> bool {
+    use std::io::IsTerminal;
+    couleurs_de_la_console(
+        std::io::stdout().is_terminal(),
+        std::env::var_os("NO_COLOR").as_deref(),
+    )
+}
+
+/// La couche console, couleurs décidées par l'appelant — la fabrique que le
+/// test de #8922 éprouve.
+fn couche_console<S, T>(
+    timer: T,
+    couleurs: bool,
+) -> tracing_subscriber::fmt::Layer<
+    S,
+    tracing_subscriber::fmt::format::DefaultFields,
+    tracing_subscriber::fmt::format::Format<tracing_subscriber::fmt::format::Full, T>,
+>
+where
+    S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+{
+    tracing_subscriber::fmt::layer()
+        .with_timer(timer)
+        .with_ansi(couleurs)
 }
 
 /// Le filtre du journal : le niveau demandé pour tout ce qui vient du dépôt,
@@ -1178,6 +1257,54 @@ mod tests {
         fn make_writer(&'a self) -> Self::Writer {
             self.clone()
         }
+    }
+    /// #8922 (fil 2381) — hors terminal, la console n'écrit AUCUNE séquence de
+    /// couleur ; `NO_COLOR` non vide les coupe aussi dans un terminal.
+    ///
+    /// Contre-épreuve : la couche d'avant (`fmt::layer().with_timer(..)`, sans
+    /// `with_ansi`) écrit `ESC[` pour le même événement — c'est le second cas,
+    /// couleurs demandées, qui prouve que la capture les voit.
+    #[test]
+    fn la_console_hors_terminal_n_ecrit_aucune_couleur() {
+        use std::ffi::OsStr;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        assert!(
+            !super::couleurs_de_la_console(false, None),
+            "Docker, journald, fichier"
+        );
+        assert!(!super::couleurs_de_la_console(false, Some(OsStr::new("1"))));
+        assert!(
+            !super::couleurs_de_la_console(true, Some(OsStr::new("1"))),
+            "NO_COLOR=1"
+        );
+        assert!(super::couleurs_de_la_console(true, None), "terminal");
+        assert!(
+            super::couleurs_de_la_console(true, Some(OsStr::new(""))),
+            "NO_COLOR vide ne compte pas (no-color.org)"
+        );
+
+        let ecrire = |couleurs: bool| {
+            let journal = JournalCapture::default();
+            let couche = super::couche_console(tracing_subscriber::fmt::time::SystemTime, couleurs)
+                .with_writer(journal.clone());
+            let abonne = tracing_subscriber::registry().with(couche);
+            tracing::subscriber::with_default(abonne, || {
+                tracing::warn!(target: "tune_server", champ = 1, "temoin_8922");
+            });
+            journal.texte()
+        };
+        let hors_terminal = ecrire(super::couleurs_de_la_console(false, None));
+        assert!(hors_terminal.contains("temoin_8922"), "{hors_terminal:?}");
+        assert!(
+            !hors_terminal.contains('\u{1b}'),
+            "séquence ANSI hors terminal : {hors_terminal:?}"
+        );
+        let terminal = ecrire(true);
+        assert!(
+            terminal.contains('\u{1b}'),
+            "la capture voit les couleurs : {terminal:?}"
+        );
     }
     /// #4480 : le journal du .18 ne portait AUCUNE ligne de `tune_stream_http`
     /// — le filtre ne nommait que `tune_server` et `tune_core`, et tout ce que

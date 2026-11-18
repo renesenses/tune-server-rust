@@ -200,7 +200,9 @@ fn refusal(error: String) -> Response {
 /// Binary ZIP body; the detached minisign signature is supplied as base64-free
 /// UTF-8 in X-Tune-Plugin-Signature (newlines encoded as literal backslash-n).
 async fn install(
-    _admin: RequireAdmin,
+    // Installe ou retire du code natif : administrateur, ou authentification
+    // coupée, seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     Path(id): Path<String>,
     headers: axum::http::HeaderMap,
@@ -318,7 +320,9 @@ async fn name_taken_by_another_plugin(state: &AppState, id: &str) -> bool {
         .is_ok_and(|infos| infos.iter().any(|i| i.manifest.id == id))
 }
 async fn rollback(
-    _admin: RequireAdmin,
+    // Installe ou retire du code natif : administrateur, ou authentification
+    // coupée, seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
@@ -358,7 +362,9 @@ fn garder_par_defaut() -> bool {
     true
 }
 async fn uninstall(
-    _admin: RequireAdmin,
+    // Installe ou retire du code natif : administrateur, ou authentification
+    // coupée, seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(options): Json<UninstallOptions>,

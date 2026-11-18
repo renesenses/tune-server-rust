@@ -1267,8 +1267,13 @@ impl HistoryRepo {
     }
 
     pub fn clear(&self) -> Result<(), String> {
-        self.db.execute("DELETE FROM listen_history", &[])?;
-        Ok(())
+        // #8487 — les titres diffusés se rangent sous les lignes de station :
+        // ils partent avec elles, dans la même transaction.
+        self.db.write_tx(&mut |tx| {
+            tx.execute("DELETE FROM radio_titres_diffuses", &[])?;
+            tx.execute("DELETE FROM listen_history", &[])?;
+            Ok(())
+        })
     }
 
     pub fn count(&self) -> Result<i64, String> {

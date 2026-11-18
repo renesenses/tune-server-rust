@@ -870,6 +870,13 @@ pub(super) async fn get_config(
             "label": crate::i18n::t(&lang, &format!("settings.replayGainSource.{}", rg_source_mode.as_str())),
         }),
     );
+    // #8968 — les valeurs de `replaygain_mode` que CE serveur comprend. Un
+    // client n'offre « Auto » que s'il le lit ici : un serveur plus ancien
+    // lirait `auto` comme `off`, coupant le gain ET la campagne d'analyse.
+    config.insert(
+        "replaygain_modes".to_string(),
+        json!(tune_core::audio::replaygain::MODES_ACCEPTES),
+    );
     // Consentement de contribution. Deux valeurs, et elles ne disent pas la
     // meme chose :
     //   - `enabled`   : le choix de l'utilisateur, relu sur la valeur BRUTE en
@@ -3073,11 +3080,22 @@ pub(super) struct ImportConfigQuery {
 /// écriture qui échoue en cours de route est DITE (`500`) avec ce qui était
 /// déjà appliqué, au lieu d'un `200` silencieusement incomplet.
 pub(super) async fn import_config(
-    _admin: crate::auth::RequireAdmin,
+    // Engage la machine : administrateur, ou authentification coupée,
+    // seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
+    state: State<AppState>,
+    q: Query<ImportConfigQuery>,
+    body: Json<serde_json::Map<String, Value>>,
+) -> Result<impl IntoResponse, AppError> {
+    importer_la_configuration(state, q, body).await
+}
+
+/// Le corps de l'import, partagé avec l'aperçu (qui n'écrit rien).
+async fn importer_la_configuration(
     State(state): State<AppState>,
     Query(q): Query<ImportConfigQuery>,
     Json(body): Json<serde_json::Map<String, Value>>,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<Json<Value>, AppError> {
     use tune_core::config_export as ce;
     let mut fichier = ce::lire(body).map_err(AppError::bad_request)?;
     // Mêmes clés protégées que `PATCH /system/config` : sans admin effectif,
@@ -3130,12 +3148,11 @@ pub(super) async fn import_config(
 /// `?dry_run=true`, ignorerait le paramètre et APPLIQUERAIT l'import — c'est
 /// pourquoi l'écran passe par ici.
 pub(super) async fn preview_import_config(
-    admin: crate::auth::RequireAdmin,
+    _admin: crate::auth::RequireAdmin,
     state: State<AppState>,
     Json(body): Json<serde_json::Map<String, Value>>,
 ) -> Result<impl IntoResponse, AppError> {
-    import_config(
-        admin,
+    importer_la_configuration(
         state,
         Query(ImportConfigQuery { dry_run: true }),
         Json(body),
@@ -4586,7 +4603,9 @@ pub(super) async fn purge_orphan_tracks(
 /// Honnêteté : sur une installation supervisée (systemd `Restart=always`,
 /// service Windows), le superviseur peut relancer le processus aussitôt —
 /// l'écran le dit dans la confirmation.
-pub(super) async fn stop(_admin: crate::auth::RequireAdmin) -> impl IntoResponse {
+/// Arrêter le serveur engage la machine, comme le redémarrage : même garde
+/// (administrateur, ou authentification coupée : seulement depuis cette machine).
+pub(super) async fn stop(_garde: crate::auth::AdminOuCetteMachine) -> impl IntoResponse {
     tokio::spawn(async {
         // Laisser la réponse HTTP partir avant de mourir.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -6122,6 +6141,35 @@ mod replaygain_source_tests {
         assert!(!tune_core::audio::replaygain::services_enabled(
             &state.backend
         ));
+    }
+
+    /// #8968 — `GET /config` annonce `auto` (le client n'offre le bouton
+    /// qu'à ce prix), `auto` s'écrit et se relit, et changer de SOURCE garde
+    /// la granularité `auto` au lieu de la reculer vers la piste.
+    #[tokio::test]
+    async fn le_mode_auto_est_annonce_ecrit_et_garde_8968() {
+        let state = etat();
+        let c = config_de(&state).await;
+        assert_eq!(
+            c["replaygain_modes"],
+            serde_json::json!(["off", "track", "album", "auto"]),
+            "le serveur n'annonce pas le mode Auto"
+        );
+        patch(&state, serde_json::json!({"replaygain_mode": "auto"})).unwrap();
+        assert_eq!(
+            tune_core::audio::replaygain::ReplayGainSettings::load(&state.backend).mode,
+            tune_core::audio::replaygain::ReplayGainMode::Auto
+        );
+        patch(
+            &state,
+            serde_json::json!({"replaygain_source": "file_tags"}),
+        )
+        .unwrap();
+        assert_eq!(
+            config_de(&state).await["replaygain_mode"],
+            "auto",
+            "changer de source a reculé Auto vers la piste"
+        );
     }
 
     #[tokio::test]

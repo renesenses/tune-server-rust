@@ -100,7 +100,8 @@ fn un_fil_perime_ne_rapporte_pas_son_echec_d_ouverture_4176() {
         (
             "bras_wasapi.rs",
             include_str!("bras_wasapi.rs"),
-            "match BackendWasapi::ouvrir(&demande) {",
+            // #8696 : WASAPI ouvre à la période réglée sur la zone.
+            "match BackendWasapi::ouvrir_a_la_periode(&demande, reglage_periode_ms) {",
         ),
         (
             "bras_asio.rs",

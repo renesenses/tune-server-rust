@@ -1892,6 +1892,11 @@ impl PlaybackOrchestrator {
             // ReplayGain en dépend, et `get_state` prend ses propres verrous.
             let en_cours = self.playback.get_state(zone_id).await.now_playing;
             let track_id = en_cours.as_ref().and_then(|np| np.track_id);
+            // #8968 — le facteur hors PURE, lu AVANT le verrou de la sortie
+            // (base et mémoire du mode Auto) ; PURE est tranché dessous.
+            let rg_hors_pure = en_cours.as_ref().map_or(1.0, |np| {
+                crate::audio::replaygain::facteur_de_zone(&self.db, zone_id, np.piste_rg())
+            });
             let output = output_arc.lock().await;
             let Some(local_output) = output
                 .as_any()
@@ -1927,12 +1932,7 @@ impl PlaybackOrchestrator {
             // Mêmes expressions que le bloc du chemin de lecture, à dessein :
             // toutes trois rendent `None`/1.0 en PURE, donc l'état repoussé est
             // celui qu'une lecture démarrée maintenant produirait.
-            let rg = match (pure, en_cours.as_ref()) {
-                (false, Some(np)) => {
-                    crate::audio::replaygain::facteur_de_zone(&self.db, zone_id, np.piste_rg())
-                }
-                _ => 1.0,
-            };
+            let rg = if pure { 1.0 } else { rg_hors_pure };
             local_output.set_compensation_de_niveau(self.zone_compensation_de_niveau(zone_id));
             local_output.set_replaygain_factor(rg);
             // #4384 — une bascule PURE en cours d'écoute change le facteur
@@ -2858,18 +2858,20 @@ impl PlaybackOrchestrator {
             // `refresh_zone_pure_dsp` : `get_state` prend ses propres verrous.
             let en_cours = self.playback.get_state(zone_id).await.now_playing;
             let pure = self.zone_audiophile(zone_id);
+            // #8968 — lu AVANT le verrou de la sortie : la granularité Auto
+            // retenue au lancement de la piste, jamais redécidée ici.
+            let rg = match (pure, en_cours.as_ref()) {
+                (false, Some(np)) => {
+                    crate::audio::replaygain::facteur_de_zone(&self.db, zone_id, np.piste_rg())
+                }
+                _ => 1.0,
+            };
             let output = output_arc.lock().await;
             let Some(local_output) = output
                 .as_any()
                 .downcast_ref::<crate::outputs::local::LocalOutput>()
             else {
                 return false;
-            };
-            let rg = match (pure, en_cours.as_ref()) {
-                (false, Some(np)) => {
-                    crate::audio::replaygain::facteur_de_zone(&self.db, zone_id, np.piste_rg())
-                }
-                _ => 1.0,
             };
             local_output.set_replaygain_factor(rg);
             // Idempotent : le même `Arc` que la lecture a déjà branché.
