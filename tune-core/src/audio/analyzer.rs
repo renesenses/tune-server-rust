@@ -363,6 +363,13 @@ struct LoudnessAccumulator {
     /// les appels `feed`, comme l'état du filtre de pondération K.
     crete_vraie: super::crete_vraie::CreteVraie,
     total_frames: usize,
+    /// #9040 — puissance de chaque sous-bloc de 100 ms (pondérée K, canaux
+    /// sommés) : les tranches que la file retire, d'où se tire la plage de
+    /// sonie ([`super::plage_de_sonie`]). Un `f64` par 100 ms.
+    sous_blocs: Vec<f64>,
+    /// Banc de coût de #9040 seulement : sans les sous-blocs.
+    #[cfg(test)]
+    sans_sous_blocs: bool,
 }
 
 impl LoudnessAccumulator {
@@ -382,6 +389,9 @@ impl LoudnessAccumulator {
             peak: 0.0,
             crete_vraie: super::crete_vraie::CreteVraie::new(sample_rate, channels),
             total_frames: 0,
+            sous_blocs: Vec::new(),
+            #[cfg(test)]
+            sans_sous_blocs: false,
         }
     }
 
@@ -414,10 +424,33 @@ impl LoudnessAccumulator {
                 power_sum += ms; // channel weight = 1.0 (mono/stereo)
             }
             self.block_powers.push(power_sum);
+            // #9040 — le sous-bloc de 100 ms qui sort de la file : sa
+            // puissance, sur les mêmes échantillons pondérés. N'entre pas dans
+            // la sonie intégrée, qui reste au bit près celle d'avant.
+            #[cfg(test)]
+            let avec_sous_blocs = !self.sans_sous_blocs;
+            #[cfg(not(test))]
+            let avec_sous_blocs = true;
+            if avec_sous_blocs {
+                let mut sous_bloc = 0.0;
+                for c in 0..self.channels {
+                    sous_bloc +=
+                        somme_des_carres(&self.bufs[c], self.step_frames) / self.step_frames as f64;
+                }
+                self.sous_blocs.push(sous_bloc);
+            }
             for c in 0..self.channels {
                 self.bufs[c].drain(..self.step_frames);
             }
         }
+    }
+
+    /// #9040 — la plage de sonie des sous-blocs vus jusqu'ici. Toujours
+    /// rendue quand l'accumulateur a vu des échantillons : une piste de moins
+    /// de 3 s ou muette a une plage SANS fenêtre (LRA nulle), qui la compte
+    /// comme mesurée.
+    fn plage_de_sonie(&self) -> super::plage_de_sonie::PlageDeSonie {
+        super::plage_de_sonie::PlageDeSonie::des_sous_blocs(&self.sous_blocs)
     }
 
     /// Integrated loudness (LUFS, rounded to 0.1) + sample peak (clamped to
@@ -544,13 +577,17 @@ pub async fn measure_loudness_and_peak(file_path: &str) -> Option<(f64, f64, f64
 /// que ses canaux n'ont pas deux pics de bloc distincts — jamais une valeur
 /// inventée.
 pub async fn mesurer_intensite_et_plage(file_path: &str) -> Option<(f64, f64, f64, Option<u32>)> {
-    mesurer_a_partir_de(file_path, None).await
+    mesurer_a_partir_de(file_path, None)
+        .await
+        .and_then(|t| t.valeurs)
 }
 
 /// Une mesure, suivie de l'empreinte que son décodage a permis de tirer.
 pub struct MesureEtEmpreinte {
     /// Ce que rendrait [`mesurer_intensite_et_plage`], au bit près.
     pub mesure: Option<(f64, f64, f64, Option<u32>)>,
+    /// #9040 — la plage de sonie, tirée du même décodage que `mesure`.
+    pub plage_de_sonie: Option<super::plage_de_sonie::PlageDeSonie>,
     /// Ce que rendrait `empreinte::empreinte_du_fichier`, au bit près — ou
     /// `None` quand ce décodage ne permet pas de la tirer (format hors du
     /// chemin partagé, tâche interrompue) : l'appelant la calcule alors à part,
@@ -612,8 +649,10 @@ fn tete_du_decodage(
 pub async fn mesurer_intensite_plage_et_empreinte(file_path: &str) -> MesureEtEmpreinte {
     const SEG_SECONDS: f64 = 30.0;
     if !empreinte_partageable(file_path) {
+        let tout = mesurer_tout(file_path).await;
         return MesureEtEmpreinte {
-            mesure: mesurer_intensite_et_plage(file_path).await,
+            plage_de_sonie: tout.as_ref().and_then(|t| t.plage_de_sonie.clone()),
+            mesure: tout.and_then(|t| t.valeurs),
             empreinte: None,
         };
     }
@@ -646,17 +685,19 @@ pub async fn mesurer_intensite_plage_et_empreinte(file_path: &str) -> MesureEtEm
         // Tâche interrompue : ni mesure ni empreinte de ce décodage-ci.
         return MesureEtEmpreinte {
             mesure: None,
+            plage_de_sonie: None,
             empreinte: None,
         };
     };
-    let mesure = match segment {
+    let tout = match segment {
         Ok(premier) => mesurer_a_partir_de(file_path, Some(premier)).await,
         // Même issue que `mesurer_intensite_et_plage` sur un premier segment
         // qui ne se décode pas.
         Err(_) => None,
     };
     MesureEtEmpreinte {
-        mesure,
+        plage_de_sonie: tout.as_ref().and_then(|t| t.plage_de_sonie.clone()),
+        mesure: tout.and_then(|t| t.valeurs),
         empreinte: Some(empreinte),
     }
 }
@@ -738,13 +779,40 @@ impl MesureEnCours {
             .feed(samples);
     }
 
-    fn finir(self) -> Option<(f64, f64, f64, Option<u32>)> {
-        let (lufs, peak, true_peak) = self.acc?.finish()?;
+    fn finir(self) -> Option<MesureComplete> {
+        let acc = self.acc?;
+        // #9040 — la plage de sonie survit à une sonie non mesurable (piste
+        // muette) : la piste compte alors comme mesurée, sans fenêtre.
+        // #9040 — facultative comme la plage dynamique : sa seule absence
+        // (piste de moins de 3 s) ne fait pas échouer la mesure.
+        let plage_de_sonie = Some(acc.plage_de_sonie());
         // La plage dynamique est FACULTATIVE : une piste dont l'intensité se
         // mesure mais dont la plage ne se calcule pas (trop courte, un seul pic)
         // ne doit pas faire échouer toute la mesure — ReplayGain en dépend.
-        Some((lufs, peak, true_peak, self.dr.and_then(|d| d.finish())))
+        let dr = self.dr;
+        let valeurs = acc
+            .finish()
+            .map(|(lufs, peak, true_peak)| (lufs, peak, true_peak, dr.and_then(|d| d.finish())));
+        Some(MesureComplete {
+            valeurs,
+            plage_de_sonie,
+        })
     }
+}
+
+/// #9040 — tout ce qu'un décodage mesure : `valeurs` est ce que rend
+/// [`mesurer_intensite_et_plage`] (sonie, crête, crête vraie, DR), au bit
+/// près, `None` pour une piste muette ; la plage de sonie s'y ajoute, et
+/// existe même pour une piste muette (sans fenêtre).
+#[derive(Debug, Clone)]
+pub struct MesureComplete {
+    pub valeurs: Option<(f64, f64, f64, Option<u32>)>,
+    pub plage_de_sonie: Option<super::plage_de_sonie::PlageDeSonie>,
+}
+
+/// [`mesurer_intensite_et_plage`] et la plage de sonie, sur le même décodage.
+pub async fn mesurer_tout(file_path: &str) -> Option<MesureComplete> {
+    mesurer_a_partir_de(file_path, None).await
 }
 
 /// Le corps de [`mesurer_intensite_et_plage`]. `premier` : le premier segment
@@ -769,7 +837,7 @@ impl MesureEnCours {
 async fn mesurer_a_partir_de(
     file_path: &str,
     premier: Option<super::decode::DecodedAudio>,
-) -> Option<(f64, f64, f64, Option<u32>)> {
+) -> Option<MesureComplete> {
     let mesure = parcourir_les_segments(file_path, premier, MesureEnCours::default()).await?;
     en_priorite_basse(move || mesure.finir()).await.ok()?
 }
@@ -1046,6 +1114,44 @@ pub async fn generate_waveform(file_path: &str, points: usize) -> Vec<f32> {
         .iter()
         .map(|v| (*v as f32 * 10000.0).round() / 10000.0)
         .collect()
+}
+
+/// #9040 — pour les témoins de [`super::plage_de_sonie`] : la plage de sonie
+/// et le DR d'échantillons normalisés, par les accumulateurs de la passe.
+#[cfg(test)]
+pub(crate) fn plage_et_dr_de(
+    samples: &[f64],
+    sample_rate: usize,
+    channels: usize,
+) -> (Option<super::plage_de_sonie::PlageDeSonie>, Option<u32>) {
+    let mut acc = LoudnessAccumulator::new(sample_rate, channels);
+    let mut dr = DrAccumulator::new(sample_rate, channels);
+    acc.feed(samples);
+    dr.feed(samples);
+    (Some(acc.plage_de_sonie()), dr.finish())
+}
+
+/// #9040 — banc de coût : durée de la sonie intégrée (pondération K, blocs,
+/// crête vraie) avec et sans les sous-blocs de la plage de sonie, sur les
+/// mêmes échantillons, par tranches de 30 s comme la passe.
+#[cfg(test)]
+pub(crate) fn duree_sonie(
+    samples: &[f64],
+    sample_rate: usize,
+    channels: usize,
+    avec_sous_blocs: bool,
+) -> std::time::Duration {
+    let mut acc = LoudnessAccumulator::new(sample_rate, channels);
+    acc.sans_sous_blocs = !avec_sous_blocs;
+    let t = std::time::Instant::now();
+    for tranche in samples.chunks(30 * sample_rate * channels) {
+        acc.feed(tranche);
+    }
+    let p = acc.plage_de_sonie();
+    let r = acc.finish();
+    let d = t.elapsed();
+    std::hint::black_box((p, r));
+    d
 }
 
 #[cfg(test)]
@@ -2220,7 +2326,7 @@ mod tests {
             integrite: Default::default(),
         };
         let _ = m.nourrir(d, f64::MAX);
-        m.finir()
+        m.finir().and_then(|t| t.valeurs)
     }
 
     /// Un FLAC (avec ou sans SEEKTABLE) et le WAV du même PCM rendent le MÊME

@@ -51,6 +51,7 @@ pub(crate) use artwork::{
     serve_artwork_from,
 };
 pub(crate) use enrich::demarrer_enrich_all;
+mod dynamique;
 mod edition_par_filtre;
 mod etiquetage_par_filtre;
 /// #4907 — ordre des répertoires et répertoire préféré d'un album.
@@ -671,6 +672,8 @@ pub fn router() -> Router<AppState> {
         .route("/albums/{id}/credits", get(credits::album_credits))
         // #6285 — le verdict des faux hi-res de l'album et de ses pistes.
         .route("/albums/{id}/hires", get(faux_hires::verdict_album))
+        // #9040 — la dynamique de l'album : DR, LRA, crêtes, sonie intégrée.
+        .route("/albums/{id}/dynamique", get(dynamique::de_l_album))
         // #6285 — l'état de la passe, et son interrupteur (désactivée par
         // défaut). Segment statique : aucun conflit avec `/albums/{id}`.
         .route(

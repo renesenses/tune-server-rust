@@ -184,6 +184,8 @@ pub struct EcrituresDePiste {
     pub report: Option<String>,
     /// `(lufs, crête, crête vraie, plage dynamique)`, quand la mesure a abouti.
     pub mesure: Option<(f64, f64, f64, Option<u32>)>,
+    /// #9040 — la plage de sonie (LRA et histogramme), du même décodage.
+    pub plage_de_sonie: Option<crate::audio::plage_de_sonie::PlageDeSonie>,
     /// L'empreinte du contenu, ou sa marque « pas d'empreinte possible ».
     pub empreinte: Option<String>,
     /// Le témoin `rg_analyzed` (heure unix) : la piste quitte le balayage.
@@ -202,6 +204,7 @@ impl EcrituresDePiste {
         !self.effacer_le_report
             && self.report.is_none()
             && self.mesure.is_none()
+            && self.plage_de_sonie.is_none()
             && self.empreinte.is_none()
             && self.temoin.is_none()
     }
@@ -280,6 +283,9 @@ fn appliquer_les_ecritures(tx: &dyn DbTxHandle, e: &EcrituresDePiste) -> Result<
                 poser(DR_ALGO_KEY, DR_ALGO)?;
             }
         }
+    }
+    if let Some(p) = &e.plage_de_sonie {
+        crate::audio::plage_de_sonie::ecrire(tx, id, p)?;
     }
     if let Some(empreinte) = &e.empreinte {
         tx.execute(
@@ -1812,15 +1818,16 @@ async fn analyser_une_piste(
             return (SuitePiste::Cedee, Some(ecritures));
         }
     };
-    let (mesure, empreinte) = match measured {
-        Ok(m) => (Ok(m.mesure), m.empreinte),
-        Err(elapsed) => (Err(elapsed), None),
+    let (mesure, empreinte, plage_de_sonie) = match measured {
+        Ok(m) => (Ok(m.mesure), m.empreinte, m.plage_de_sonie),
+        Err(elapsed) => (Err(elapsed), None, None),
     };
     match mesure {
         Ok(Some(m)) => {
             // Écrite à la fin du tour (`ecrire_le_tour`), hors des fils de
             // l'exécuteur (#4681).
             ecritures.mesure = Some(m);
+            ecritures.plage_de_sonie = plage_de_sonie;
         }
         // Le fichier a disparu ENTRE la résolution et le décodage — un
         // partage qui tombe pendant la passe, exactement le scénario qui a
@@ -1840,6 +1847,9 @@ async fn analyser_une_piste(
             // Le fichier est bien là et reste illisible ou silencieux :
             // là, le témoin est légitime.
             debug!(track_id, path = %path, "replaygain_measure_none");
+            // #9040 — muette mais décodée : sa plage de sonie, sans fenêtre,
+            // la compte comme mesurée dans la LRA de son album.
+            ecritures.plage_de_sonie = plage_de_sonie;
         }
         Err(_elapsed) => {
             // The file blocked analysis (pathological decode / dormant NAS
@@ -2510,7 +2520,7 @@ async fn rattraper_une_piste(
     let measured = match mesurer_en_cedant_a_la_lecture(
         backend,
         delai,
-        crate::audio::analyzer::mesurer_intensite_et_plage(&sur_disque),
+        crate::audio::analyzer::mesurer_tout(&sur_disque),
     )
     .await
     {
@@ -2526,8 +2536,27 @@ async fn rattraper_une_piste(
         }
     };
 
+    // #9040 — la plage de sonie du même décodage : elle comble un vide,
+    // comme le DR, et ne révise aucun gain.
+    if let Ok(Some(p)) = measured
+        .as_ref()
+        .map(|m| m.as_ref().and_then(|t| t.plage_de_sonie.clone()))
+    {
+        let b = backend.clone();
+        crate::taches_de_fond::priorite::hors_du_fil_async(
+            crate::taches_de_fond::Tache::PlageDynamique.id(),
+            move || {
+                if let Err(e) =
+                    crate::audio::plage_de_sonie::ecrire(&SansTransaction(b.as_ref()), track_id, &p)
+                {
+                    warn!(track_id, error = %e, "plage_de_sonie_ecriture_echec");
+                }
+            },
+        )
+        .await;
+    }
     let mut mesuree = false;
-    match measured {
+    match measured.map(|m| m.and_then(|t| t.valeurs)) {
         Ok(Some((_lufs, _peak, _true_peak, Some(dr)))) => {
             mesuree = true;
             // 🔴 LE TAG DU FICHIER FAIT FOI. La requête a bien écarté les

@@ -146,6 +146,8 @@ pub mod pcm_teneur;
 /// `test` de la CI, qui ne compile pas `local-audio`.
 pub mod periode_alsa;
 pub mod pipeline;
+/// #9040 — la plage de sonie EBU R128 (LRA) d'une piste et d'un album.
+pub mod plage_de_sonie;
 /// #6044 — le greffon « Réaffectation des canaux » : réglage par zone et par
 /// album, résolution de la règle qui s'applique à une piste.
 pub mod reaffectation_canaux;
