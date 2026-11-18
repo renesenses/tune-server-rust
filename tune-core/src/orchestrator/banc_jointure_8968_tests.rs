@@ -973,17 +973,14 @@ fn image(ext: &str) -> Image {
     }
 }
 
-/// Début et durée de la tranche, en secondes, comme `resolve_local` les tire
-/// aujourd'hui de `TrancheCue` (`debut_ms / 1000`, `duree_ms / 1000`).
+/// Début et durée de la tranche, en secondes, comme `resolve_local` les
+/// tire de `TrancheCue` (#8968 : à l'échantillon près, `TrancheCue::en_secondes`).
 fn tranche_en_secondes(debut_ms: u64, fin_ms: Option<u64>) -> (f64, Option<f64>) {
-    let t = super::resolve_local::TrancheCue {
+    super::resolve_local::TrancheCue {
         debut_ms,
         duree_ms: fin_ms.map(|f| f.saturating_sub(debut_ms)),
-    };
-    (
-        t.debut_ms as f64 / 1000.0,
-        t.duree_ms.map(|d| d as f64 / 1000.0),
-    )
+    }
+    .en_secondes(0, CADENCE)
 }
 
 async fn cue_par_la_session(ext: &str, attendu: Attendu) {
@@ -999,20 +996,12 @@ async fn cue_par_la_session(ext: &str, attendu: Attendu) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn banc_8968_cue_flac_tranches_session() {
-    cue_par_la_session(
-        "flac",
-        Attendu::EchecConnu("PR 2 de #8968 : bornes CUE à l'échantillon"),
-    )
-    .await;
+    cue_par_la_session("flac", Attendu::SansBlanc).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn banc_8968_cue_wav_tranches_session() {
-    cue_par_la_session(
-        "wav",
-        Attendu::EchecConnu("PR 2 de #8968 : bornes CUE à l'échantillon"),
-    )
-    .await;
+    cue_par_la_session("wav", Attendu::SansBlanc).await;
 }
 
 #[test]
@@ -1031,15 +1020,19 @@ fn banc_8968_cue_flac_tranches_decodage_complet() {
         "CUE flac × tranches (décodage complet)",
         &m,
         0.0,
-        Attendu::EchecConnu("PR 2 de #8968 : bornes CUE à l'échantillon"),
+        Attendu::SansBlanc,
     );
 }
 
-/// Flux continu #8082 et tranches CUE : aujourd'hui une piste CUE n'y entre
-/// pas (`chemin_admissible` l'écarte), la jointure revient au renderer.
+/// Flux continu #8082 et tranches CUE (#8968, PR 2) : les trois pistes de la
+/// feuille sont admises, assemblées comme en production
+/// (`chemin_admissible` puis `assembler_avec_tranches`), et le WAV virtuel lu
+/// d'un bout à l'autre doit rendre l'image à l'échantillon près, frontières
+/// comprises.
 #[test]
 fn banc_8968_cue_flux_continu() {
     use crate::db::backend::{DbBackend, ToSqlValue};
+    use crate::http::streamer::SourceVirtuelle;
     let im = image("flac");
     let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
     db.init_schema().unwrap();
@@ -1063,19 +1056,34 @@ fn banc_8968_cue_flux_continu() {
         )
         .unwrap();
     }
-    let admises = (1..=3)
-        .filter(|id| flux_continu_8082::chemin_admissible(&db, *id).is_some())
-        .count();
-    let m = Mesure {
-        // Une piste écartée du flux : la jointure n'est pas faite par Tune.
-        ecarts_de_longueur: vec![admises as i64 - 3],
-        decalages: vec![0],
-        erreur_jointure: 0.0,
-    };
-    juger(
-        "CUE flac × flux continu #8082 (pistes admises - 3)",
-        &m,
-        0.0,
-        Attendu::EchecConnu("PR 2 de #8968 : tranches CUE dans le flux continu"),
-    );
+    let mut candidates: Vec<_> = (1..=3)
+        .map(|id| {
+            let a = flux_continu_8082::chemin_admissible(&db, id).expect("tranche CUE admise");
+            (id - 1, id, PathBuf::from(a.chemin), a.tranche)
+        })
+        .collect();
+    let premiere = candidates.remove(0);
+    let f = flux_continu_8082::assembler_avec_tranches(premiere, 0, candidates)
+        .expect("flux continu assemblé");
+    assert_eq!(f.lignes.len(), 3, "les trois tranches dans le flux");
+    let mut octets = Vec::new();
+    f.wav
+        .lire(0, f.wav.total(), &mut |m| {
+            octets.extend_from_slice(&m);
+            Ok(())
+        })
+        .unwrap();
+    let tout: Vec<f64> = octets[44..]
+        .chunks_exact(2)
+        .map(|c| f64::from(i16::from_le_bytes([c[0], c[1]])) / 32_768.0)
+        .collect();
+    let mut morceaux = Vec::new();
+    let mut pos = 0usize;
+    for s in f.wav.segments() {
+        let n = s.trames as usize * 2;
+        morceaux.push(tout[pos..pos + n].to_vec());
+        pos += n;
+    }
+    let m = mesurer(&im.reference, &morceaux, &im.attendus);
+    juger("CUE flac × flux continu #8082", &m, 0.0, Attendu::SansBlanc);
 }
