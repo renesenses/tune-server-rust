@@ -166,9 +166,11 @@ impl Tampon {
 
 /// #9070 — attente maximale de la PREMIÈRE trame après l'ouverture. Un
 /// pilote remet sa première période en quelques dizaines de millisecondes ;
-/// un micro qui ne rend rien au bout de deux secondes ne rendra rien (cpal
+/// un micro qui ne rend rien au bout de quatre secondes ne rendra rien (cpal
 /// est ouvert sans délai : son fil attend sans fin et ne signale rien).
-pub const DELAI_PREMIERE_TRAME: Duration = Duration::from_secs(2);
+/// Quatre et non deux : l'attente précède toute salve, elle ne coûte rien, et
+/// elle laisse de la marge à une machine chargée (Raspberry Pi, USB partagé).
+pub const DELAI_PREMIERE_TRAME: Duration = Duration::from_secs(4);
 
 /// #9070 — pourquoi une capture n'a rien rendu dans le délai.
 #[derive(Debug, Clone, PartialEq)]
@@ -212,9 +214,13 @@ impl std::fmt::Display for SansTrame {
                     Some(hw) if !peripherique.starts_with("alsa:hw:") => {
                         write!(f, " et choisissez l'entrée matérielle {hw}")
                     }
+                    // Déjà l'accès direct : rien de mieux à conseiller (une
+                    // carte tenue par un autre logiciel refuse l'ouverture,
+                    // elle ne rend pas zéro trame). Le rapport de diagnostic
+                    // porte le journal qui dira pourquoi.
                     Some(_) => write!(
                         f,
-                        " et qu'aucun autre logiciel ne tient la carte (PipeWire, PulseAudio)"
+                        " ; s'il l'est, envoyez un rapport de diagnostic depuis l'écran Support"
                     ),
                     None => Ok(()),
                 }
@@ -428,10 +434,10 @@ mod tests {
     }
 
     /// #9070 (fil 2770) — un micro ouvert qui ne remet aucune trame : la
-    /// capture échoue en ~2 s, en nommant le périphérique ouvert, au lieu
+    /// capture échoue en ~4 s, en nommant le périphérique ouvert, au lieu
     /// d'attendre une minute « 0 trames sur 216000 ».
     #[test]
-    fn un_micro_sans_trame_echoue_en_deux_secondes_9070() {
+    fn un_micro_sans_trame_echoue_en_quatre_secondes_9070() {
         let s = Simulees::avec("Umik-1", 48_000);
         s.sans_trames.store(true, Ordering::SeqCst);
         let p: Arc<dyn Peripheriques> = s;
@@ -443,8 +449,8 @@ mod tests {
             .expect_err("#9070 : un micro qui ne rend aucune trame doit échouer");
         let duree = t0.elapsed();
         assert!(
-            duree >= Duration::from_millis(1_900) && duree < Duration::from_secs(4),
-            "échec en {duree:?}, attendu ~2 s"
+            duree >= Duration::from_millis(3_900) && duree < Duration::from_secs(8),
+            "échec en {duree:?}, attendu ~4 s"
         );
         assert_eq!(e.code(), Some("micro_muet"));
         let m = e.to_string();
@@ -474,6 +480,16 @@ mod tests {
         }
         .to_string();
         assert!(!m.contains("hw:"), "{m}");
+        // Déjà en accès direct : pas de conseil circulaire, ni de PipeWire.
+        let m = SansTrame::Muette {
+            nom: "Umik-1".into(),
+            peripherique: "alsa:hw:CARD=U18dB,DEV=0".into(),
+            delai: DELAI_PREMIERE_TRAME,
+        }
+        .to_string();
+        assert!(!m.contains("choisissez"), "{m}");
+        assert!(!m.contains("PipeWire"), "{m}");
+        assert!(m.contains("rapport de diagnostic"), "{m}");
     }
 
     /// Un micro qui rend des trames (même des zéros) passe aussitôt.

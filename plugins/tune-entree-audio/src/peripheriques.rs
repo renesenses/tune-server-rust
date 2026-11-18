@@ -93,6 +93,31 @@ fn rang_materiel(acces: &str) -> Option<u8> {
     }
 }
 
+/// #9070 — parmi des entrées de MÊME nom (énumération brute de cpal, dans
+/// son ordre), celle qu'une ouverture par le nom doit prendre : la même que
+/// [`une_ligne_par_carte_alsa`] garde dans la liste — `hw:` d'une carte
+/// nommée, puis `plughw:`, puis les mêmes par index de carte. Sans accès
+/// matériel (ou hors ALSA), la première, comme avant. `None` : liste vide.
+///
+/// Sans elle, `/jouer` par le nom ouvrait la première entrée de ce nom, qui
+/// pouvait ne pas être celle que la liste montrait (`id_systeme`).
+pub fn choisir_parmi_homonymes(ids: &[String]) -> Option<usize> {
+    let rang = |id: &str| -> u8 {
+        match pcm_alsa(id) {
+            Some((acces, (carte, _))) => {
+                let par_index = carte.chars().all(|c| c.is_ascii_digit());
+                match (rang_materiel(acces), par_index) {
+                    (Some(r), false) => r,
+                    (Some(r), true) => 2 + r,
+                    (None, _) => 4,
+                }
+            }
+            None => 4,
+        }
+    };
+    (0..ids.len()).min_by_key(|&i| (rang(&ids[i]), i))
+}
+
 /// #9070 — sous ALSA, cpal énumère pour une même carte `sysdefault`,
 /// `front`, `dsnoop`, `hw`, `plughw`… tous sous le MÊME nom (« Umik-1
 /// Gain: 18dB, USB Audio ») : la liste montrait cinq lignes identiques, et
@@ -326,6 +351,43 @@ mod une_ligne_par_carte_9070 {
             entree("Umik-1", UMIK, false),
         ];
         assert_eq!(une_ligne_par_carte_alsa(l.clone()), l);
+    }
+
+    /// `/jouer` par le nom ouvre l'entrée que la liste réduite montre.
+    #[test]
+    fn l_ouverture_par_le_nom_prend_l_entree_de_la_liste() {
+        let brut: Vec<String> = [
+            "alsa:sysdefault:CARD=U18dB",
+            "alsa:front:CARD=U18dB,DEV=0",
+            "alsa:dsnoop:CARD=U18dB,DEV=0",
+            "alsa:plughw:CARD=U18dB,DEV=0",
+            "alsa:hw:CARD=U18dB,DEV=0",
+            "alsa:hw:CARD=1,DEV=0",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let i = choisir_parmi_homonymes(&brut).unwrap();
+        assert_eq!(brut[i], "alsa:hw:CARD=U18dB,DEV=0");
+        let gardee: Vec<String> =
+            une_ligne_par_carte_alsa(brut.iter().map(|id| entree(id, UMIK, false)).collect())
+                .into_iter()
+                .map(|e| e.id)
+                .collect();
+        assert_eq!(
+            gardee,
+            vec![brut[i].clone()],
+            "liste et ouverture divergent"
+        );
+        // Hors ALSA, ou sans accès matériel : la première, comme avant.
+        let autres: Vec<String> = vec!["coreaudio:A".into(), "coreaudio:B".into()];
+        assert_eq!(choisir_parmi_homonymes(&autres), Some(0));
+        let sans_hw: Vec<String> = vec![
+            "alsa:dsnoop:CARD=Z,DEV=0".into(),
+            "alsa:sysdefault:CARD=Z".into(),
+        ];
+        assert_eq!(choisir_parmi_homonymes(&sans_hw), Some(0));
+        assert_eq!(choisir_parmi_homonymes(&[]), None);
     }
 
     #[test]

@@ -918,10 +918,10 @@ fn la_simulation_sans_micro_est_premium_et_ne_propose_que_des_coupes_prudentes()
 /// #9070 (fil 2770) — l'UMIK-1 s'ouvrait en ALSA direct mais ne remettait
 /// aucune trame : la mesure attendait une minute et finissait en « capture
 /// trop lente : 0 trames sur 216000 attendues », après avoir joué une salve.
-/// Elle échoue désormais en ~2 s, AVANT toute salve, avec un code que
+/// Elle échoue désormais en ~4 s, AVANT toute salve, avec un code que
 /// l'écran traduit et le périphérique ouvert.
 #[test]
-fn un_micro_qui_ne_renvoie_rien_arrete_la_mesure_en_deux_secondes_9070() {
+fn un_micro_qui_ne_renvoie_rien_arrete_la_mesure_en_quatre_secondes_9070() {
     use std::sync::atomic::Ordering;
     let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
     let boucle = Boucle::new(PieceEnDirect::depuis(&sim, 1.0), VITESSE);
@@ -948,8 +948,8 @@ fn un_micro_qui_ne_renvoie_rien_arrete_la_mesure_en_deux_secondes_9070() {
         "{message}"
     );
     assert!(
-        duree < Duration::from_secs(5),
-        "#9070 : la mesure a attendu {duree:?} un micro muet (attendu ~2 s)"
+        duree < Duration::from_secs(10),
+        "#9070 : la mesure a attendu {duree:?} un micro muet (attendu ~4 s)"
     );
     let av = controleur.mesure(&id).unwrap().avancement();
     assert_eq!(av.code, Some("micro_muet"));

@@ -21,7 +21,8 @@ use crate::format::{
     Echantillons, Mesure, bits_servis, contient_iec61937, convertir_entiers, convertir_f32,
 };
 use crate::peripheriques::{
-    Arret, CaptureDemarree, DescriptionEntree, Peripheriques, une_ligne_par_carte_alsa,
+    Arret, CaptureDemarree, DescriptionEntree, Peripheriques, choisir_parmi_homonymes,
+    une_ligne_par_carte_alsa,
 };
 
 pub struct Systeme;
@@ -64,11 +65,19 @@ fn echantillons(f: SampleFormat) -> Option<Echantillons> {
 
 fn trouver(entree: &str) -> Result<Device, String> {
     let host = cpal::default_host();
-    let mut entrees = host
+    let entrees: Vec<Device> = host
         .input_devices()
-        .map_err(|e| format!("énumération des entrées impossible : {e}"))?;
-    entrees
-        .find(|d| nom(d) == entree || id(d) == entree)
+        .map_err(|e| format!("énumération des entrées impossible : {e}"))?
+        .collect();
+    if let Some(i) = entrees.iter().position(|d| id(d) == entree) {
+        return Ok(entrees.into_iter().nth(i).expect("position valide"));
+    }
+    // #9070 — par le nom : sous ALSA, plusieurs entrées le portent ; prendre
+    // celle que la liste (réduite) montre, pas la première venue.
+    let mut homonymes: Vec<Device> = entrees.into_iter().filter(|d| nom(d) == entree).collect();
+    let ids: Vec<String> = homonymes.iter().map(id).collect();
+    choisir_parmi_homonymes(&ids)
+        .map(|i| homonymes.swap_remove(i))
         .ok_or_else(|| format!("aucune entrée audio « {entree} »"))
 }
 

@@ -537,7 +537,7 @@ impl Controleur {
             .map_err(Sortie::Erreur)?;
         mesure.verrou().peripherique = Some(capture.peripherique().to_string());
         // #9070 (fil 2770) — un micro ouvert qui ne remet aucune trame échoue
-        // ici, en deux secondes et en nommant le PCM, avant toute salve : il
+        // ici, en quatre secondes et en nommant le PCM, avant toute salve : il
         // attendait une minute pour finir en « 0 trames sur 216000 ».
         if let Err(sans) = capture.attendre_la_premiere_trame(self.delai_premiere_trame) {
             capture.arreter();
