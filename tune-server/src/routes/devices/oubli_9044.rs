@@ -1,16 +1,18 @@
-//! #9044 — OUBLIER les appareils qui ne sont plus sur le réseau.
+//! #9044 — OUBLIER un appareil qui n'est plus sur le réseau.
 //!
 //! Chaque appareil vu reçoit une zone ; parti du réseau, il restait listé,
 //! grisé, à vie, et supprimer sa zone ne faisait que la masquer — masquée,
 //! elle empêchait même l'appareil revenu de réapparaître.
 //!
 //! * `GET /devices/absent` : les appareils connus (par leur zone) qui ne sont
-//!   plus là, avec la dernière fois qu'ils ont répondu ;
+//!   plus là. **Sans durée** : `zones.last_seen_at` date le dernier RETOUR en
+//!   ligne, pas le départ — l'afficher comme « absent depuis » mentirait. Une
+//!   vraie date de départ viendra avec l'oubli groupé (rc14).
 //! * `DELETE /devices/{id}` : oublier UN appareil — registre, appareils
-//!   ajoutés à la main, DLNA découverts (#6299) et sa zone, supprimée
-//!   DÉFINITIVEMENT pour qu'il revienne comme neuf s'il revient ;
-//! * `POST /devices/absent/forget?older_than_days=N` : oublier ceux qui sont
-//!   absents depuis plus de N jours (7 par défaut).
+//!   ajoutés à la main, DLNA découverts (#6299) et ses zones, supprimées
+//!   DÉFINITIVEMENT pour qu'il revienne comme neuf s'il revient.
+//!
+//! Pas d'oubli groupé en rc13 (décision de Bertrand, 18/11).
 //!
 //! ## La zone liée — le choix le plus sûr
 //!
@@ -23,13 +25,19 @@
 //!   supprimer ne servirait à rien (la découverte le recrée) et casserait une
 //!   zone qui marche ; c'est « Ignorer » (#1280) qui le fait taire.
 //! * zone **visible** d'un appareil absent : `409 zone_liee`, qui nomme la
-//!   zone, tant que la requête ne porte pas `?with_zone=true`. Le client
-//!   affiche le nom dans sa confirmation, puis renvoie avec l'accord.
-//! * zone **masquée** (déjà supprimée par l'utilisateur) : supprimée sans
-//!   condition — c'est elle qui empêchait l'appareil de revenir.
+//!   zone, tant que la requête ne porte pas `?with_zone=true` — que le client
+//!   n'envoie qu'après une confirmation qui a nommé la zone.
+//! * zone **masquée par l'utilisateur** (`suppression_utilisateur`,
+//!   `suppression_totale`, sans motif), y compris celle qui a lâché sa sortie
+//!   (#8987) : supprimée — c'est elle qui empêchait l'appareil de revenir.
+//! * zone masquée par un **garde-fou de la découverte** (`fusion`,
+//!   `zone_reflet`, `appareil_ignore`…) : jamais touchée (voir
+//!   `tune_core::db::zone_repo::ZoneDAppareil::oubliable`).
 //!
-//! Réservé à l'administrateur (`RequireAdmin`), comme les autres écritures
-//! sur le parc.
+//! `DELETE` exige l'administrateur (`RequireAdmin`) : l'écriture est
+//! destructive. Les autres routes du parc (`ignore`, `clear`…) ne l'exigent
+//! pas encore ; aucune app (iOS, Android, Flutter, macOS) n'appelle
+//! `DELETE /devices/{id}`, dont la réponse passe de 204 à 200 avec un bilan.
 
 use std::collections::HashSet;
 
@@ -44,9 +52,6 @@ use tune_core::db::zone_repo::{ZoneDAppareil, ZoneRepo};
 
 use crate::auth::RequireAdmin;
 use crate::state::AppState;
-
-/// Âge d'absence par défaut de « Oublier les appareils absents ».
-pub(crate) const JOURS_PAR_DEFAUT: i64 = 7;
 
 /// Les identifiants que le réseau annonce en ce moment : scanner (identités
 /// secondaires comprises) et registre des sorties.
@@ -67,10 +72,14 @@ async fn ids_presents(state: &AppState) -> HashSet<String> {
 
 /// La zone désigne-t-elle un appareil ABSENT ?
 ///
-/// Même règle que `online` dans `GET /zones` (`zones::lecture`) : une zone
-/// navigateur n'a pas d'appareil ; une sortie locale suit la colonne `online`,
-/// tenue par le relevé des périphériques (#1626, #6551) ; le reste est présent
-/// s'il est annoncé par le scanner ou inscrit au registre.
+/// Réseau : même règle que `online` dans `GET /zones` (`zones::lecture`) —
+/// présent s'il est annoncé par le scanner ou inscrit au registre. Une zone
+/// navigateur n'a pas d'appareil : jamais absente.
+///
+/// Sortie LOCALE : règle DIFFÉRENTE, et voulue. `GET /zones` la dit en ligne
+/// dès qu'elle a un `output_device_id`, ce qui rendrait impossible d'oublier
+/// un DAC débranché pour de bon. On lit ici la colonne `online`, que le relevé
+/// des périphériques met à 0 quand le périphérique disparaît (#1626, #6551).
 pub(crate) fn zone_absente(z: &ZoneDAppareil, presents: &HashSet<String>) -> bool {
     match z.output_type.as_deref() {
         Some("browser") => false,
@@ -126,22 +135,27 @@ impl Refus {
 
 /// Le verdict, sans effet : quelles zones supprimer, ou pourquoi refuser.
 ///
-/// `zones` : les zones de l'appareil (masquées comprises) ; `en_lecture` :
-/// celles qui jouent ou sont en pause ; `present` : l'appareil est-il annoncé ;
-/// `avec_zone` : l'utilisateur a-t-il accepté de perdre la zone visible.
+/// `zones` : les zones de l'appareil (masquées et libérées comprises) ;
+/// `en_lecture` : celles qui jouent ou sont en pause ; `present` : l'appareil
+/// est-il annoncé ; `avec_zone` : l'utilisateur a-t-il accepté, après une
+/// confirmation qui la nommait, de perdre la zone visible.
+///
+/// Les zones masquées par un garde-fou de la découverte ne sont ni
+/// supprimées ni bloquantes : elles restent, et c'est tout.
 pub(crate) fn verdict(
     zones: &[ZoneDAppareil],
     en_lecture: &HashSet<i64>,
     present: bool,
     avec_zone: bool,
 ) -> Result<Vec<i64>, Refus> {
-    if let Some(z) = zones.iter().find(|z| en_lecture.contains(&z.id)) {
+    let oubliables: Vec<&ZoneDAppareil> = zones.iter().filter(|z| z.oubliable()).collect();
+    if let Some(z) = oubliables.iter().find(|z| en_lecture.contains(&z.id)) {
         return Err(Refus::ZoneEnLecture {
             zone_id: z.id,
             zone: z.name.clone(),
         });
     }
-    if let Some(z) = zones.iter().find(|z| !z.hidden) {
+    if let Some(z) = oubliables.iter().find(|z| !z.hidden) {
         if present {
             return Err(Refus::AppareilPresent {
                 zone_id: z.id,
@@ -155,7 +169,7 @@ pub(crate) fn verdict(
             });
         }
     }
-    Ok(zones.iter().map(|z| z.id).collect())
+    Ok(oubliables.iter().map(|z| z.id).collect())
 }
 
 /// L'appareil est-il présent ? Ses zones locales répondent par `online`,
@@ -167,13 +181,14 @@ fn appareil_present(device_id: &str, zones: &[ZoneDAppareil], presents: &HashSet
     zones.iter().any(|z| !zone_absente(z, presents))
 }
 
-/// Oublier `device_id` : vérifie, puis efface. Rend les zones supprimées.
+/// Oublier `device_id` : vérifie, puis efface. Rend les zones supprimées,
+/// avec leur nom.
 async fn oublier(
     state: &AppState,
     device_id: &str,
     avec_zone: bool,
     presents: &HashSet<String>,
-) -> Result<Vec<i64>, Response> {
+) -> Result<Vec<(i64, String)>, Response> {
     let repo = ZoneRepo::with_backend(state.backend.clone());
     let zones = repo.zones_de_l_appareil(device_id).map_err(|e| {
         warn!(device_id, error = %e, "appareil_oubli_lecture_zones_echouee");
@@ -203,12 +218,17 @@ async fn oublier(
     super::forget_manual_device(state, device_id);
     super::forget_discovered_dlna(&state.backend, device_id);
 
-    let mut supprimees = Vec::new();
+    let mut supprimees: Vec<(i64, String)> = Vec::new();
     for id in a_supprimer {
+        let nom = zones
+            .iter()
+            .find(|z| z.id == id)
+            .map(|z| z.name.clone())
+            .unwrap_or_default();
         tune_core::audio::dash_epingles::liberer_la_zone(id);
         match repo.supprimer_definitivement(id) {
             Ok(n) if n > 0 => {
-                supprimees.push(id);
+                supprimees.push((id, nom));
                 state.event_bus.emit_typed(
                     tune_core::event_types::EventType::ZoneDeleted,
                     json!({"id": id}),
@@ -219,7 +239,7 @@ async fn oublier(
                 warn!(device_id, zone_id = id, error = %e, "appareil_oubli_zone_non_supprimee");
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": "database_error", "zones_deleted": supprimees})),
+                    Json(json!({"error": "database_error", "zones_deleted": corps_des_zones(&supprimees)})),
                 )
                     .into_response());
             }
@@ -233,6 +253,15 @@ async fn oublier(
     Ok(supprimees)
 }
 
+fn corps_des_zones(zones: &[(i64, String)]) -> Value {
+    json!(
+        zones
+            .iter()
+            .map(|(id, nom)| json!({"zone_id": id, "zone_name": nom}))
+            .collect::<Vec<_>>()
+    )
+}
+
 #[derive(Debug, Default, Deserialize)]
 pub(crate) struct OublierQuery {
     #[serde(default)]
@@ -241,8 +270,9 @@ pub(crate) struct OublierQuery {
 
 /// `DELETE /devices/{id}` — oublier l'appareil.
 ///
-/// `200 {device_id, forgotten: true, zones_deleted: [...]}` ; `409` (voir
-/// l'en-tête du module) avec `code`, `zone_id`, `zone_name` et une phrase.
+/// `200 {device_id, forgotten: true, zones_deleted: [{zone_id, zone_name}]}`
+/// — chaque zone supprimée est NOMMÉE ; `409` (voir l'en-tête du module) avec
+/// `code`, `zone_id`, `zone_name` et une phrase qui nomme la zone.
 pub(crate) async fn delete_device(
     _admin: RequireAdmin,
     State(state): State<AppState>,
@@ -257,36 +287,54 @@ pub(crate) async fn delete_device(
         Ok(zones) => Json(json!({
             "device_id": device_id,
             "forgotten": true,
-            "zones_deleted": zones,
+            "zones_deleted": corps_des_zones(&zones),
         }))
         .into_response(),
         Err(r) => r,
     }
 }
 
-/// Une ligne de `GET /devices/absent`.
-pub(crate) fn decrire(z: &ZoneDAppareil) -> Value {
-    json!({
-        "device_id": z.output_device_id,
-        "name": z.name,
-        "type": z.output_type,
-        "zone_id": z.id,
-        "zone_name": z.name,
-        "zone_hidden": z.hidden,
-        "last_seen_at": z.last_seen_at,
-        "absent_for_s": z.age_secs,
-    })
-}
-
-/// Les zones absentes, triées de la plus ancienne absence à la plus récente
-/// (jamais vues en tête : leur absence est la plus ancienne connue).
-pub(crate) fn absentes<'a>(
-    zones: &'a [ZoneDAppareil],
-    presents: &HashSet<String>,
-) -> Vec<&'a ZoneDAppareil> {
-    let mut v: Vec<&ZoneDAppareil> = zones.iter().filter(|z| zone_absente(z, presents)).collect();
-    v.sort_by_key(|z| std::cmp::Reverse(z.age_secs.unwrap_or(i64::MAX)));
-    v
+/// Les appareils absents, un par appareil, avec TOUTES les zones qu'un oubli
+/// emporterait (visibles, masquées par l'utilisateur, libérées #8987). Un
+/// appareil dont aucune zone n'est oubliable n'est pas listé : l'oublier ne
+/// supprimerait rien de ce que l'utilisateur voit.
+pub(crate) fn absents(zones: &[ZoneDAppareil], presents: &HashSet<String>) -> Vec<Value> {
+    let mut ordre: Vec<&str> = Vec::new();
+    for z in zones.iter().filter(|z| z.oubliable()) {
+        if !ordre.contains(&z.output_device_id.as_str()) {
+            ordre.push(&z.output_device_id);
+        }
+    }
+    ordre
+        .into_iter()
+        .filter_map(|device_id| {
+            let toutes: Vec<ZoneDAppareil> = zones
+                .iter()
+                .filter(|z| z.output_device_id == device_id)
+                .cloned()
+                .collect();
+            if appareil_present(device_id, &toutes, presents) {
+                return None;
+            }
+            let siennes: Vec<&ZoneDAppareil> = toutes.iter().filter(|z| z.oubliable()).collect();
+            // La zone qui le représente : une visible d'abord.
+            let tete = siennes.iter().find(|z| !z.hidden).unwrap_or(&siennes[0]);
+            Some(json!({
+                "device_id": device_id,
+                "name": tete.name,
+                "type": tete.output_type,
+                "zone_id": tete.id,
+                "zones": siennes
+                    .iter()
+                    .map(|z| json!({
+                        "zone_id": z.id,
+                        "zone_name": z.name,
+                        "zone_hidden": z.hidden,
+                    }))
+                    .collect::<Vec<_>>(),
+            }))
+        })
+        .collect()
 }
 
 /// `GET /devices/absent` — les appareils connus qui ne sont plus là.
@@ -304,96 +352,10 @@ pub(crate) async fn list_absent_devices(State(state): State<AppState>) -> Respon
         }
     };
     let presents = ids_presents(&state).await;
-    let items: Vec<Value> = absentes(&zones, &presents)
-        .into_iter()
-        .map(decrire)
-        .collect();
+    let items = absents(&zones, &presents);
     Json(json!({
         "total": items.len(),
-        "default_older_than_days": JOURS_PAR_DEFAUT,
         "items": items,
-    }))
-    .into_response()
-}
-
-#[derive(Debug, Default, Deserialize)]
-pub(crate) struct OublierAbsentsQuery {
-    older_than_days: Option<i64>,
-}
-
-/// Les appareils à oublier : absents depuis au moins `jours` jours. Une
-/// absence non datée (jamais vue depuis la pose de `last_seen_at`) n'est pas
-/// comptée : on ne sait pas depuis quand — l'oubli un par un reste possible.
-pub(crate) fn a_oublier(absentes: &[&ZoneDAppareil], jours: i64) -> Vec<String> {
-    let seuil = jours.max(0).saturating_mul(86_400);
-    let mut ids: Vec<String> = Vec::new();
-    for z in absentes {
-        if z.age_secs.is_some_and(|a| a >= seuil) && !ids.contains(&z.output_device_id) {
-            ids.push(z.output_device_id.clone());
-        }
-    }
-    ids
-}
-
-/// `POST /devices/absent/forget?older_than_days=N` — oublier les appareils
-/// absents depuis plus de N jours (7 par défaut).
-///
-/// `200 {older_than_days, forgotten: [...], zones_deleted: [...],
-/// skipped: [{device_id, status}]}` — une zone en lecture ne bloque
-/// pas les autres, elle est sautée et dite.
-pub(crate) async fn forget_absent_devices(
-    _admin: RequireAdmin,
-    State(state): State<AppState>,
-    Query(q): Query<OublierAbsentsQuery>,
-) -> Response {
-    let jours = q.older_than_days.unwrap_or(JOURS_PAR_DEFAUT);
-    if jours < 0 {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "older_than_days"})),
-        )
-            .into_response();
-    }
-    let repo = ZoneRepo::with_backend(state.backend.clone());
-    let zones = match repo.zones_d_appareils() {
-        Ok(z) => z,
-        Err(e) => {
-            warn!(error = %e, "appareils_absents_lecture_echouee");
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "database_error"})),
-            )
-                .into_response();
-        }
-    };
-    let presents = ids_presents(&state).await;
-    let cibles = a_oublier(&absentes(&zones, &presents), jours);
-    let mut oublies = Vec::new();
-    let mut zones_supprimees = Vec::new();
-    let mut sautes = Vec::new();
-    for device_id in cibles {
-        match oublier(&state, &device_id, true, &presents).await {
-            Ok(z) => {
-                zones_supprimees.extend(z);
-                oublies.push(device_id);
-            }
-            Err(r) => sautes.push(json!({
-                "device_id": device_id,
-                "status": r.status().as_u16(),
-            })),
-        }
-    }
-    info!(
-        jours,
-        oublies = oublies.len(),
-        sautes = sautes.len(),
-        "appareils_absents_oublies"
-    );
-    Json(json!({
-        "older_than_days": jours,
-        "forgotten": oublies,
-        "zones_deleted": zones_supprimees,
-        "skipped": sautes,
     }))
     .into_response()
 }

@@ -65,7 +65,6 @@ pub fn router() -> Router<AppState> {
         )
         // #9044 — oublier un appareil parti du réseau, et sa zone.
         .route("/absent", get(oubli_9044::list_absent_devices))
-        .route("/absent/forget", post(oubli_9044::forget_absent_devices))
         .route(
             "/{device_id}",
             axum::routing::delete(oubli_9044::delete_device),
