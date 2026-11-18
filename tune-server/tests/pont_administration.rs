@@ -2,7 +2,9 @@
 //!
 //! - `POST /cloud/bridge/enable` (sa réponse porte le jeton de pont) et
 //!   `POST /cloud/bridge/disable` exigent l'administrateur dès que
-//!   l'authentification est active ; sans authentification, rien ne change.
+//!   l'authentification est active. Sans authentification, éteindre reste
+//!   ouvert ; activer (ouvrir l'accès à distance) n'est accepté que depuis
+//!   cette machine.
 //! - `POST /cloud/bridge/rotate-token` renouvelle le lien d'accès : nouveau
 //!   jeton enregistré, ancien remplacé, réponse de la forme de
 //!   `GET /cloud/bridge/access-link`, jamais mise en cache ; 409 tant que le
@@ -67,8 +69,25 @@ struct Reponse {
     cache: Option<String>,
 }
 
+/// Cette machine : l'adresse de bouclage, comme le client web servi en local.
+const CETTE_MACHINE: &str = "127.0.0.1:50000";
+/// Un autre hôte du réseau local.
+const AUTRE_HOTE_DU_LAN: &str = "192.168.1.50:50000";
+
 async fn appel(state: &AppState, method: Method, path: &str, bearer: Option<&str>) -> Reponse {
-    let app: Router = tune_server::routes::router(state.clone());
+    appel_depuis(state, CETTE_MACHINE, method, path, bearer).await
+}
+
+async fn appel_depuis(
+    state: &AppState,
+    adresse: &str,
+    method: Method,
+    path: &str,
+    bearer: Option<&str>,
+) -> Reponse {
+    let pair: std::net::SocketAddr = adresse.parse().unwrap();
+    let app: Router = tune_server::routes::router(state.clone())
+        .layer(axum::extract::connect_info::MockConnectInfo(pair));
     let mut req = Request::builder().method(method).uri(path);
     if let Some(b) = bearer {
         req = req.header(header::AUTHORIZATION, format!("Bearer {b}"));
@@ -167,7 +186,8 @@ async fn eteindre_le_pont_exige_l_administrateur() {
 
 #[tokio::test]
 async fn sans_authentification_activer_et_eteindre_restent_ouverts() {
-    // Le cas par défaut (`auth_enabled` absent) : rien ne change.
+    // Le cas par défaut (`auth_enabled` absent) : depuis cette machine, rien
+    // ne change.
     let state = new_state();
     state.license.set_account_premium(true, None).await;
 
@@ -176,6 +196,39 @@ async fn sans_authentification_activer_et_eteindre_restent_ouverts() {
     assert_eq!(pont_enregistre(&state).as_deref(), Some("true"));
     let r = post(&state, ETEINDRE, None).await;
     assert_eq!(r.status, StatusCode::OK, "éteindre : {}", r.corps);
+    assert_eq!(pont_enregistre(&state).as_deref(), Some("false"));
+}
+
+/// Sans authentification, ouvrir, éteindre ou renouveler l'accès à distance
+/// depuis un autre hôte du réseau local est refusé (`not_local`) ; depuis
+/// cette machine, éteindre passe.
+#[tokio::test]
+async fn sans_authentification_activer_depuis_le_reseau_local_est_refuse() {
+    let state = new_state();
+    state.license.set_account_premium(true, None).await;
+
+    let r = appel_depuis(&state, AUTRE_HOTE_DU_LAN, Method::POST, ACTIVER, None).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "activer : {}", r.corps);
+    assert!(r.corps.contains("not_local"), "{}", r.corps);
+    assert_ne!(pont_enregistre(&state).as_deref(), Some("true"));
+
+    pont_actif_avec_jeton(&state);
+    for chemin in [ETEINDRE, RENOUVELER] {
+        let r = appel_depuis(&state, AUTRE_HOTE_DU_LAN, Method::POST, chemin, None).await;
+        assert_eq!(r.status, StatusCode::FORBIDDEN, "{chemin} : {}", r.corps);
+        assert!(r.corps.contains("not_local"), "{}", r.corps);
+    }
+    assert_eq!(pont_enregistre(&state).as_deref(), Some("true"));
+    assert_eq!(jeton_enregistre(&state).as_deref(), Some(FAUX_JETON));
+    let r = appel_depuis(&state, AUTRE_HOTE_DU_LAN, Method::GET, LIEN, None).await;
+    assert_eq!(r.status, StatusCode::FORBIDDEN, "lien : {}", r.corps);
+    let r = post(&state, ETEINDRE, None).await;
+    assert_eq!(
+        r.status,
+        StatusCode::OK,
+        "éteindre depuis cette machine : {}",
+        r.corps
+    );
     assert_eq!(pont_enregistre(&state).as_deref(), Some("false"));
 }
 

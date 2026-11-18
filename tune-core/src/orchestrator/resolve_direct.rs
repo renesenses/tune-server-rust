@@ -903,6 +903,7 @@ impl PlaybackOrchestrator {
             return self
                 .servir_le_dsd_upnp_au_reseau(
                     req,
+                    did,
                     audio_url,
                     mime_type,
                     &title,
@@ -1396,6 +1397,51 @@ impl PlaybackOrchestrator {
     /// resolution que l'appelant a portee depuis les attributs `res@` du DIDL
     /// est conservee telle quelle : c'est ce qui empeche un ALAC 24 bits d'un
     /// NAS d'etre affiche en 44,1 kHz / 16 bits.
+    /// #8956 — le conteneur et le MIME d'un DSD distant relayé BRUT vers
+    /// `device_id`.
+    ///
+    /// Le MIME est l'orthographe que le Sink du renderer publie pour CE
+    /// conteneur (`audio/x-dsf` pour un `.dsf`, `audio/x-dff` pour un `.dff`),
+    /// à défaut un générique qu'il publie, à défaut le MIME source. Le
+    /// conteneur vient de l'adresse ; quand elle ne le nomme pas et que le
+    /// Sink distingue les deux, de l'en-tête du fichier (`DSD ` / `FRM8`).
+    /// Sans réponse du renderer en cache, rien ne change.
+    async fn mime_dsd_brut_pour_le_renderer(
+        &self,
+        device_id: &str,
+        audio_url: &str,
+        mime_type: &str,
+        conteneur: &'static str,
+    ) -> (&'static str, String) {
+        let mimes_dsd = self
+            .dsd_capabilities
+            .lock()
+            .await
+            .get(device_id)
+            .map(|cap| cap.mimes_dsd.clone())
+            .unwrap_or_default();
+        if mimes_dsd.is_empty() {
+            return (conteneur, mime_type.to_string());
+        }
+        let pour = |c: &str| crate::outputs::dlna::mime_dsd_pour_conteneur(c, &mimes_dsd);
+        let nomme = crate::outputs::dlna::conteneur_dsd_de_l_url(audio_url).is_some()
+            || mime_type.to_ascii_lowercase().contains("dff")
+            || mime_type.to_ascii_lowercase().contains("dsf");
+        let conteneur = if !nomme && pour("dsf") != pour("dff") {
+            match conteneur_dsd_par_l_en_tete(audio_url).await {
+                Some(lu) => {
+                    info!(url = %audio_url, conteneur = lu, "dsd_upnp_conteneur_lu_a_l_en_tete");
+                    lu
+                }
+                None => conteneur,
+            }
+        } else {
+            conteneur
+        };
+        let mime = pour(conteneur).unwrap_or_else(|| mime_type.to_string());
+        (conteneur, mime)
+    }
+
     /// Une piste DSD de serveur média vers un renderer réseau, selon la
     /// politique de la zone ([`super::resolve_local::PolitiqueDsdReseau`]).
     ///
@@ -1413,9 +1459,11 @@ impl PlaybackOrchestrator {
     ///   en base, ou au-delà du plafond de la zone, on retombe sur le PCM ;
     /// - **PCM** : le canal WAV des services (`pretranscoder_en_flac`), dont
     ///   le décodeur aiguille `.dsf`/`.dff` vers le convertisseur DSD natif.
+    #[allow(clippy::too_many_arguments)]
     async fn servir_le_dsd_upnp_au_reseau(
         &self,
         req: &PlayRequest,
+        device_id: &str,
         audio_url: &str,
         mime_type: &str,
         title: &str,
@@ -1429,9 +1477,18 @@ impl PlaybackOrchestrator {
 
         let (url, stream_id, out_mime, out_sr, out_bd, out_ch) = match politique {
             PolitiqueDsdReseau::Brut => {
+                // #8956 — le MIME du CONTENEUR, dans l'orthographe du Sink.
+                // MinimServer sert `application/x-dsd`, que l'Atoll ST200 ne
+                // publie pas (il publie `audio/x-dsf` et `audio/x-dff`) :
+                // refus 714 à la pose, et le DSD distant ne jouait jamais.
+                // Même règle que le `.dsf` local (`dsf_mime`), mais au
+                // conteneur près.
+                let (conteneur, mime_brut) = self
+                    .mime_dsd_brut_pour_le_renderer(device_id, audio_url, mime_type, conteneur)
+                    .await;
                 let info = StreamInfo {
                     format: conteneur.to_string(),
-                    mime_type: mime_type.to_string(),
+                    mime_type: mime_brut.clone(),
                     sample_rate: dsd_rate,
                     bit_depth: 1,
                     channels: 2,
@@ -1446,16 +1503,24 @@ impl PlaybackOrchestrator {
                 let url = self
                     .streamer
                     .get_stream_url(&session_id, &server_ip, conteneur);
+                // Le `GET` relayé rendrait le `Content-Type` du serveur média
+                // (`application/x-dsd`) : un renderer qui le confronte à la
+                // DIDL (le ST200 fait un `HEAD`) doit lire la même orthographe.
+                if !mime_brut.eq_ignore_ascii_case(mime_type) {
+                    crate::http::streamer::annoncer_mime_du_flux(&session_id, &mime_brut);
+                }
                 info!(
                     zone_id = req.zone_id,
                     url = %audio_url,
                     conteneur,
+                    mime_source = mime_type,
+                    mime_annonce = %mime_brut,
                     "dsd_upnp_brut_relaye_par_tune"
                 );
                 (
                     url,
                     Some(session_id),
-                    mime_type.to_string(),
+                    mime_brut,
                     req.sample_rate,
                     req.bit_depth.map(u32::from),
                     None,
@@ -2617,6 +2682,20 @@ pub(crate) fn conteneur_dsd(url: &str, mime: &str) -> &'static str {
     } else {
         "dsf"
     }
+}
+
+/// #8956 — le conteneur d'un DSD distant d'après ses quatre premiers octets
+/// (`DSD ` → `dsf`, `FRM8` → `dff`). Une requête `Range` bornée à trois
+/// secondes ; `None` si le serveur ne répond pas ou ne sert pas du DSD.
+async fn conteneur_dsd_par_l_en_tete(url: &str) -> Option<&'static str> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return None;
+    }
+    let sonde = super::duree_du_flux_2062::lire_une_plage(crate::http::client::shared(), url, 0, 4);
+    let (tete, _) = tokio::time::timeout(std::time::Duration::from_secs(3), sonde)
+        .await
+        .ok()??;
+    crate::outputs::dlna::conteneur_dsd_de_l_en_tete(&tete)
 }
 
 /// #8428 — l'URL annonce-t-elle de l'Opus (`.opus`, `audio/opus`, ou Ogg dont

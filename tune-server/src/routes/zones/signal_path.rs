@@ -646,7 +646,7 @@ pub(super) fn zone_replaygain_step_lang(
     {
         return None;
     }
-    replaygain_step_hors_pure_lang(lang, backend, piste)
+    replaygain_step_hors_pure_lang(lang, backend, zone_id, piste)
 }
 
 /// L'étape ReplayGain telle qu'elle serait HORS PURE — le corps de
@@ -655,15 +655,19 @@ pub(super) fn zone_replaygain_step_lang(
 fn replaygain_step_hors_pure_lang(
     lang: &str,
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
     piste: tune_core::audio::replaygain::PisteRg<'_>,
 ) -> Option<ReplayGainStep> {
     use tune_core::audio::replaygain::{
-        GainSource, ReplayGainSettings, RetenueAntiEcretage, gain_de_piste, gain_factor_with_peak,
-        stored_gain_source,
+        GainSource, ReplayGainMode, ReplayGainSettings, RetenueAntiEcretage, gain_de_piste,
+        gain_factor_with_peak, granularite_de_zone, stored_gain_source,
     };
     let settings = ReplayGainSettings::load(backend);
+    // #8968 — `Auto` se résout par la file de la zone, comme à la lecture.
+    let auto = settings.mode == ReplayGainMode::Auto;
+    let mode = granularite_de_zone(backend, zone_id, piste, settings.mode);
     // #8689 — un titre Qobuz / TIDAL : le gain que le service publie.
-    let (gain, source, peak_kind) = gain_de_piste(backend, piste, settings.mode)?;
+    let (gain, source, peak_kind) = gain_de_piste(backend, piste, mode)?;
     let (factor, retenue) = gain_factor_with_peak(gain, settings, peak_kind);
     let peak_headroom_db = peak_kind.headroom_db(settings);
     let alters_audio = (factor - 1.0).abs() > 1e-6;
@@ -681,6 +685,12 @@ fn replaygain_step_hors_pure_lang(
         tune_core::audio::replaygain::ReplayGainMode::Album => "album",
         _ => "track",
     };
+    // #8968 — le libellé dit aussi que c'est le mode Auto qui a choisi.
+    let label_affiche = if auto {
+        format!("{label}, auto")
+    } else {
+        label.to_string()
+    };
     // La provenance porte sur la granularité qui a fourni la valeur, pas sur
     // le mode demandé. Une base illisible ne doit rien inventer : on retombe
     // sur la description d'avant, sans mention d'origine.
@@ -694,14 +704,18 @@ fn replaygain_step_hors_pure_lang(
         // pré-ampli — ce que l'auditeur a réglé, pas ce que le garde-fou en a
         // fait.
         let demande_db = gain.gain_db + settings.preamp_db;
-        fs(lang, "rg_refused", &[label, &format!("{demande_db:+.1}")])
+        fs(
+            lang,
+            "rg_refused",
+            &[label_affiche.as_str(), &format!("{demande_db:+.1}")],
+        )
     } else {
         match origin {
             Some(src) => format!(
-                "ReplayGain ({label}, {applied_db:+.1} dB, {})",
+                "ReplayGain ({label_affiche}, {applied_db:+.1} dB, {})",
                 ts(lang, src.as_str())
             ),
-            None => format!("ReplayGain ({label}, {applied_db:+.1} dB)"),
+            None => format!("ReplayGain ({label_affiche}, {applied_db:+.1} dB)"),
         }
     };
     if peak_headroom_db > 0.0 {
@@ -716,6 +730,7 @@ fn replaygain_step_hors_pure_lang(
     Some(ReplayGainStep {
         description,
         granularity: label,
+        auto,
         source: origin.map(GainSource::as_str),
         clipping_guard: retenue.as_str(),
         // Un refus ne touche pas un échantillon : le fil reste intact.
@@ -745,7 +760,7 @@ pub(super) fn replaygain_ignore_par_pure(
     if !tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
         return None;
     }
-    let rg = replaygain_step_hors_pure_lang("fr", backend, piste)?;
+    let rg = replaygain_step_hors_pure_lang("fr", backend, zone_id, piste)?;
     if !rg.alters_audio {
         return None;
     }
@@ -764,21 +779,27 @@ pub(super) fn replaygain_ignore_par_pure(
 /// l'appelant.
 pub(super) fn replaygain_sans_gain_tague(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
     piste: tune_core::audio::replaygain::PisteRg<'_>,
 ) -> Option<Value> {
-    use tune_core::audio::replaygain::{ReplayGainMode, ReplayGainSettings, gain_de_piste};
+    use tune_core::audio::replaygain::{
+        ReplayGainMode, ReplayGainSettings, gain_de_piste, granularite_de_zone,
+    };
     let settings = ReplayGainSettings::load(backend);
     if settings.mode == ReplayGainMode::Off || !piste.est_identifiee() {
         return None;
     }
-    if gain_de_piste(backend, piste, settings.mode).is_some() {
+    let mode = granularite_de_zone(backend, zone_id, piste, settings.mode);
+    if gain_de_piste(backend, piste, mode).is_some() {
         return None;
     }
     Some(json!({
-        "mode": match settings.mode {
+        "mode": match mode {
             ReplayGainMode::Album => "album",
             _ => "track",
         },
+        // #8968 — additif : le réglage est `auto`.
+        "auto": settings.mode == ReplayGainMode::Auto,
         "preamp_db": (settings.preamp_db * 100.0).round() / 100.0 + 0.0,
     }))
 }
@@ -791,6 +812,9 @@ pub(super) struct ReplayGainStep {
     description: String,
     /// `"track"` ou `"album"` — celle qui a fourni la valeur.
     granularity: &'static str,
+    /// #8968 — vrai quand le réglage est `auto` : `granularity` est alors le
+    /// choix fait pour cette piste d'après la file.
+    auto: bool,
     /// `"file_tags"` ou `"analysis"`, absent si la base n'a pas répondu.
     source: Option<&'static str>,
     /// `"none"` / `"tagged_peak"` / `"refused_no_peak"` (#4072) : ce que
@@ -1511,7 +1535,9 @@ pub fn build_signal_path_lang(
         // ReplayGain disparaissait sans un mot, et un préampli réglé
         // semblait sans effet. Clé ABSENTE sous PURE, en mode off ou quand
         // la piste a un gain.
-        if !pure && let Some(rg) = replaygain_sans_gain_tague(backend, np.piste_rg()) {
+        if !pure
+            && let Some(rg) = replaygain_sans_gain_tague(backend, zone_id_courant, np.piste_rg())
+        {
             v["replaygain_untagged"] = rg;
         }
         // #6946 — Spotify : le format et le débit reçus, et pourquoi pas
@@ -2358,6 +2384,8 @@ fn assembler_les_etapes_lang(
             // afficher, ces champs permettent au client de composer le sien
             // (icône, traduction) sans analyser une chaîne française.
             "granularity": rg.granularity,
+            // #8968 — additif : la granularité vient du mode Auto.
+            "auto": rg.auto,
             "gain_source": rg.source,
             // #4072 : ce que l'anti-écrêtage a retenu, et ce que l'étage a
             // écrêté depuis le démarrage (portée processus, dite dans l'objet).

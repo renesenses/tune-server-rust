@@ -569,6 +569,30 @@ pub(crate) fn version_de_schema(state: &AppState) -> Option<i32> {
     }
 }
 
+/// #8747 — la date de création de la base : celle de la première migration
+/// appliquée (`_migrations.applied_at` sur SQLite, `schema_version.applied_at`
+/// sur PostgreSQL). `None` quand elle n'a pas pu être lue.
+///
+/// Une base neuve applique toutes ses migrations au premier démarrage : la
+/// plus ancienne date est donc celle de la création. Après une mise à jour qui
+/// a recréé le conteneur sans volume, elle tombe APRÈS l'installation, et le
+/// rapport de bogue le montre sans rien demander au testeur.
+pub(crate) fn date_de_creation_de_la_base(state: &AppState) -> Option<String> {
+    let sql = match state.backend.engine() {
+        tune_core::db::engine::Engine::Sqlite => "SELECT MIN(applied_at) FROM _migrations",
+        tune_core::db::engine::Engine::Postgres => {
+            "SELECT MIN(applied_at)::text FROM schema_version"
+        }
+    };
+    state
+        .backend
+        .query_one(sql, &[])
+        .ok()
+        .flatten()
+        .and_then(|ligne| ligne.first().and_then(|v| v.as_string()))
+        .filter(|d| !d.trim().is_empty())
+}
+
 /// La version de schéma que le binaire SAIT appliquer, pour le moteur actif.
 ///
 /// Pendant du dessus, et même règle : `None` plutôt qu'un chiffre emprunté à
@@ -604,4 +628,28 @@ pub(crate) fn get_music_dirs_list(
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+/// #8747 — la date de création de la base se lit sur une base réelle.
+#[cfg(test)]
+mod tests_date_de_creation_8747 {
+    #[test]
+    fn une_base_neuve_porte_sa_date_de_creation() {
+        let dossier = tune_core::test_scratch::scratch_dir("tune_8747_creation");
+        let db = dossier.join("tune.db");
+        let config = crate::config::TuneConfig {
+            db_path: db.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let etat = crate::state::AppState::new(db.to_str().unwrap(), 0, config).unwrap();
+        let date = super::date_de_creation_de_la_base(&etat).expect("date lisible");
+        // Format ISO de `_migrations.applied_at` : 2026-11-16T21:04:05Z.
+        assert!(date.len() >= 19 && date.as_bytes()[4] == b'-', "{date}");
+
+        // Contre-épreuve : sans aucune ligne de migration, rien n'est inventé.
+        etat.backend
+            .execute("DELETE FROM _migrations", &[])
+            .unwrap();
+        assert_eq!(super::date_de_creation_de_la_base(&etat), None);
+    }
 }

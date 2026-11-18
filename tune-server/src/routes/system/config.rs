@@ -870,6 +870,13 @@ pub(super) async fn get_config(
             "label": crate::i18n::t(&lang, &format!("settings.replayGainSource.{}", rg_source_mode.as_str())),
         }),
     );
+    // #8968 — les valeurs de `replaygain_mode` que CE serveur comprend. Un
+    // client n'offre « Auto » que s'il le lit ici : un serveur plus ancien
+    // lirait `auto` comme `off`, coupant le gain ET la campagne d'analyse.
+    config.insert(
+        "replaygain_modes".to_string(),
+        json!(tune_core::audio::replaygain::MODES_ACCEPTES),
+    );
     // Consentement de contribution. Deux valeurs, et elles ne disent pas la
     // meme chose :
     //   - `enabled`   : le choix de l'utilisateur, relu sur la valeur BRUTE en
@@ -2967,6 +2974,13 @@ pub(super) async fn get_env(State(state): State<AppState>) -> Json<Value> {
             .as_deref()
             .and_then(crate::conteneur::identifiant_court)
             .map(str::to_string),
+        // renesenses/tune-server-rust#8747 — le dossier de la base survit-il à
+        // la recréation du conteneur ? `null` hors conteneur ; sinon
+        // `{dir, kind, persistent}`. L'interface montre un bandeau quand
+        // `persistent` est faux (volume anonyme, rien de monté, tmpfs).
+        "data_persistence": crate::persistance_donnees::en_json(
+            crate::persistance_donnees::relever(&state.config.db_path).as_ref()
+        ),
     }))
 }
 
@@ -3066,11 +3080,22 @@ pub(super) struct ImportConfigQuery {
 /// écriture qui échoue en cours de route est DITE (`500`) avec ce qui était
 /// déjà appliqué, au lieu d'un `200` silencieusement incomplet.
 pub(super) async fn import_config(
-    _admin: crate::auth::RequireAdmin,
+    // Engage la machine : administrateur, ou authentification coupée,
+    // seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
+    state: State<AppState>,
+    q: Query<ImportConfigQuery>,
+    body: Json<serde_json::Map<String, Value>>,
+) -> Result<impl IntoResponse, AppError> {
+    importer_la_configuration(state, q, body).await
+}
+
+/// Le corps de l'import, partagé avec l'aperçu (qui n'écrit rien).
+async fn importer_la_configuration(
     State(state): State<AppState>,
     Query(q): Query<ImportConfigQuery>,
     Json(body): Json<serde_json::Map<String, Value>>,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<Json<Value>, AppError> {
     use tune_core::config_export as ce;
     let mut fichier = ce::lire(body).map_err(AppError::bad_request)?;
     // Mêmes clés protégées que `PATCH /system/config` : sans admin effectif,
@@ -3123,12 +3148,11 @@ pub(super) async fn import_config(
 /// `?dry_run=true`, ignorerait le paramètre et APPLIQUERAIT l'import — c'est
 /// pourquoi l'écran passe par ici.
 pub(super) async fn preview_import_config(
-    admin: crate::auth::RequireAdmin,
+    _admin: crate::auth::RequireAdmin,
     state: State<AppState>,
     Json(body): Json<serde_json::Map<String, Value>>,
 ) -> Result<impl IntoResponse, AppError> {
-    import_config(
-        admin,
+    importer_la_configuration(
         state,
         Query(ImportConfigQuery { dry_run: true }),
         Json(body),
@@ -3175,23 +3199,48 @@ pub(super) async fn set_default_zone(
 /// #8213 — la réponse commune des routes de l'arrêt programmé : le réglage
 /// (ou `null`), la prochaine échéance en heure locale du serveur, et
 /// `poweroff_available` : l'action « éteindre la machine » est-elle permise
-/// ici (Tune OS seulement) ? L'écran ne propose le choix que si `true`.
+/// ici ? L'écran ne propose le choix que si `true`.
+///
+/// #8909 — permise sur Tune OS et, hors conteneur, sur un hôte Linux, macOS
+/// ou Windows : `poweroff_mode` dit lequel (`"tune_os"`, `"host"`, `null`).
+/// `last_poweroff_error` rend le dernier échec d'extinction programmée
+/// (polkit qui refuse…), `null` sinon : complet (`at`, `code`, `error` avec la
+/// sortie d'erreur) pour l'administrateur, `at` et `code` seulement aux autres.
 fn reponse_arret_programme(
     reglage: Option<tune_core::arret_programme::ArretProgramme>,
+    echec: Option<tune_core::arret_programme::EchecExtinction>,
+    admin: bool,
 ) -> Json<Value> {
+    let echec = echec.map(|e| {
+        if admin {
+            json!(e)
+        } else {
+            json!({ "at": e.at, "code": e.code })
+        }
+    });
     let prochain = reglage.as_ref().and_then(|r| {
         r.prochaine_echeance(chrono::Local::now().naive_local())
             .map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string())
     });
+    let mode = crate::extinction_hote::mode();
     Json(json!({
         "scheduled_stop": reglage,
         "next_stop_at": prochain,
-        "poweroff_available": crate::routes::appliance::is_appliance(),
+        "poweroff_available": mode.is_some(),
+        "poweroff_mode": mode.map(crate::extinction_hote::Mode::code),
+        "last_poweroff_error": echec,
     }))
 }
 
-pub(super) async fn get_scheduled_stop(State(state): State<AppState>) -> Json<Value> {
-    reponse_arret_programme(tune_core::arret_programme::lire(&state.backend))
+pub(super) async fn get_scheduled_stop(
+    admin: Result<crate::auth::RequireAdmin, (StatusCode, Json<Value>)>,
+    State(state): State<AppState>,
+) -> Json<Value> {
+    reponse_arret_programme(
+        tune_core::arret_programme::lire(&state.backend),
+        tune_core::arret_programme::lire_echec_extinction(&state.backend),
+        admin.is_ok(),
+    )
 }
 
 /// Pose l'arrêt programmé. Réservé à l'administrateur : il arrête la lecture
@@ -3203,29 +3252,55 @@ pub(super) async fn set_scheduled_stop(
     // (programmer un simple arrêt de la lecture reste ouvert).
     garde_machine: Result<crate::auth::AdminOuCetteMachine, (StatusCode, Json<Value>)>,
     State(state): State<AppState>,
-    Json(body): Json<tune_core::arret_programme::ArretProgramme>,
+    Json(mut body): Json<tune_core::arret_programme::ArretProgramme>,
 ) -> axum::response::Response {
-    if body.action == tune_core::arret_programme::ActionArret::Poweroff
-        && let Err(refus) = garde_machine
-    {
+    let eteindre = body.action == tune_core::arret_programme::ActionArret::Poweroff;
+    if eteindre && let Err(refus) = garde_machine {
         return refus.into_response();
     }
-    // Éteindre la machine : Tune OS seulement. Refusé à l'enregistrement,
-    // pas découvert à l'heure dite (la fonction d'extinction refuse aussi).
-    if body.action == tune_core::arret_programme::ActionArret::Poweroff
-        && !crate::routes::appliance::is_appliance()
-    {
+    // Éteindre la machine : Tune OS, ou hôte Linux/macOS/Windows hors
+    // conteneur (#8909). Refusé à l'enregistrement, pas découvert à l'heure
+    // dite (l'extinction relit le mode à l'échéance et refuse aussi).
+    let mode = crate::extinction_hote::mode();
+    if eteindre && mode.is_none() {
+        let refus = crate::extinction_hote::refus_indisponible();
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": crate::routes::appliance::REFUS_HORS_TUNE_OS,
+                "error": refus.message(),
                 "code": "poweroff_unavailable",
+                "reason": refus.code(),
             })),
         )
             .into_response();
     }
+    // #8909 — éteindre un hôte ordinaire exige l'authentification active :
+    // sans elle, « depuis cette machine » ne distingue pas un appel relayé
+    // par un mandataire local. Tune OS garde son comportement (#8213).
+    if eteindre
+        && mode == Some(crate::extinction_hote::Mode::Hote)
+        && !crate::auth::authentification_active(&state)
+    {
+        let (status, Json(mut corps)) = crate::auth::refus_sans_authentification(
+            crate::extinction_hote::REFUS_SANS_AUTHENTIFICATION,
+        );
+        corps["code"] = json!("auth_required");
+        return (status, Json(corps)).into_response();
+    }
+    // Le mode validé ici est rangé avec le réglage ; celui du client est
+    // ignoré. L'échéance n'éteint que si le mode courant est le même.
+    body.poweroff_mode = if eteindre {
+        mode.map(|m| m.code().to_string())
+    } else {
+        None
+    };
     match tune_core::arret_programme::ecrire(&state.backend, body) {
-        Ok(r) => reponse_arret_programme(Some(r)).into_response(),
+        // Un réglage reposé par l'administrateur vaut accusé de lecture du
+        // dernier échec d'extinction.
+        Ok(r) => {
+            tune_core::arret_programme::effacer_echec_extinction(&state.backend);
+            reponse_arret_programme(Some(r), None, true).into_response()
+        }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
     }
 }
@@ -3235,7 +3310,10 @@ pub(super) async fn delete_scheduled_stop(
     State(state): State<AppState>,
 ) -> axum::response::Response {
     match tune_core::arret_programme::effacer(&state.backend) {
-        Ok(()) => reponse_arret_programme(None).into_response(),
+        Ok(()) => {
+            tune_core::arret_programme::effacer_echec_extinction(&state.backend);
+            reponse_arret_programme(None, None, true).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e })),
@@ -4525,7 +4603,9 @@ pub(super) async fn purge_orphan_tracks(
 /// Honnêteté : sur une installation supervisée (systemd `Restart=always`,
 /// service Windows), le superviseur peut relancer le processus aussitôt —
 /// l'écran le dit dans la confirmation.
-pub(super) async fn stop(_admin: crate::auth::RequireAdmin) -> impl IntoResponse {
+/// Arrêter le serveur engage la machine, comme le redémarrage : même garde
+/// (administrateur, ou authentification coupée : seulement depuis cette machine).
+pub(super) async fn stop(_garde: crate::auth::AdminOuCetteMachine) -> impl IntoResponse {
     tokio::spawn(async {
         // Laisser la réponse HTTP partir avant de mourir.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -6061,6 +6141,35 @@ mod replaygain_source_tests {
         assert!(!tune_core::audio::replaygain::services_enabled(
             &state.backend
         ));
+    }
+
+    /// #8968 — `GET /config` annonce `auto` (le client n'offre le bouton
+    /// qu'à ce prix), `auto` s'écrit et se relit, et changer de SOURCE garde
+    /// la granularité `auto` au lieu de la reculer vers la piste.
+    #[tokio::test]
+    async fn le_mode_auto_est_annonce_ecrit_et_garde_8968() {
+        let state = etat();
+        let c = config_de(&state).await;
+        assert_eq!(
+            c["replaygain_modes"],
+            serde_json::json!(["off", "track", "album", "auto"]),
+            "le serveur n'annonce pas le mode Auto"
+        );
+        patch(&state, serde_json::json!({"replaygain_mode": "auto"})).unwrap();
+        assert_eq!(
+            tune_core::audio::replaygain::ReplayGainSettings::load(&state.backend).mode,
+            tune_core::audio::replaygain::ReplayGainMode::Auto
+        );
+        patch(
+            &state,
+            serde_json::json!({"replaygain_source": "file_tags"}),
+        )
+        .unwrap();
+        assert_eq!(
+            config_de(&state).await["replaygain_mode"],
+            "auto",
+            "changer de source a reculé Auto vers la piste"
+        );
     }
 
     #[tokio::test]

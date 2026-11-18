@@ -123,6 +123,33 @@ impl TrancheCue {
         let duree = self.duree_ms?;
         Some(duree.saturating_sub(seek_ms) as f64 / 1000.0)
     }
+
+    /// #8968 — début (dans le fichier image) et durée restante à servir, en
+    /// secondes, À L'ÉCHANTILLON PRÈS à la cadence `cadence` du fichier.
+    ///
+    /// Les millisecondes de la base sont tronquées (`ff × 1000 / 75`) : les
+    /// diviser par mille plaçait chaque frontière jusqu'à 29 échantillons trop
+    /// tôt à 44,1 kHz. `audio::bornes_cue` retrouve la frame CD exacte, puis
+    /// l'échantillon. Le seek de l'utilisateur s'ajoute en échantillons.
+    /// Cadence inconnue (0) : la conversion d'avant, en millisecondes.
+    pub(super) fn en_secondes(&self, seek_ms: u64, cadence: u32) -> (f64, Option<f64>) {
+        if cadence == 0 {
+            return (
+                (self.debut_ms + seek_ms) as f64 / 1000.0,
+                self.duree_restante_s(seek_ms),
+            );
+        }
+        let fin_ms = self.duree_ms.map(|d| self.debut_ms + d);
+        let (debut, fin) =
+            crate::audio::bornes_cue::tranche_en_echantillons(self.debut_ms, fin_ms, cadence);
+        let c = u64::from(cadence);
+        let depart = debut + (seek_ms.saturating_mul(c) + 500) / 1000;
+        let c = c as f64;
+        (
+            depart as f64 / c,
+            fin.map(|f| f.saturating_sub(depart) as f64 / c),
+        )
+    }
 }
 
 /// Ce que les décisions rendent : la décision à exécuter, ou une résolution
@@ -601,10 +628,11 @@ impl PlaybackOrchestrator {
     /// renderer. Un cache vide vaut « je ne sais pas », donc la garde.
     pub async fn dsd_suivant_tenu_sur_dlna(
         &self,
+        zone_id: i64,
         device_id: &str,
         annonce_suivante: crate::outputs::traits::AnnonceSuivante,
     ) -> bool {
-        self.refus_dsd_suivant_sur_dlna(device_id, annonce_suivante)
+        self.refus_dsd_suivant_sur_dlna(zone_id, device_id, annonce_suivante)
             .await
             .is_none()
     }
@@ -613,11 +641,17 @@ impl PlaybackOrchestrator {
     /// `device_id`, `None` s'il peut l'être. Mêmes lectures, sans réseau, que
     /// [`Self::dsd_suivant_tenu_sur_dlna`] ; voir
     /// [`crate::playback::gapless::refus_dsd_suivant_sur_dlna`].
+    ///
+    /// #8969 — le mode DSD de la zone `zone_id` est relu (base, pas de
+    /// réseau) : en « natif », le DSD part brut même au renderer qui ne
+    /// l'annonce pas ([`Self::should_dsd_passthrough`]), sa suivante aussi.
     pub async fn refus_dsd_suivant_sur_dlna(
         &self,
+        zone_id: i64,
         device_id: &str,
         annonce_suivante: crate::outputs::traits::AnnonceSuivante,
     ) -> Option<crate::playback::gapless::RefusDsdSuivant> {
+        let natif_force = ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(zone_id) == "native";
         let annonce_dsd = self
             .dsd_capabilities
             .lock()
@@ -631,6 +665,7 @@ impl PlaybackOrchestrator {
             .contains(device_id);
         crate::playback::gapless::refus_dsd_suivant_sur_dlna(
             annonce_dsd,
+            natif_force,
             annonce_suivante,
             deja_lache,
         )
@@ -955,7 +990,20 @@ impl PlaybackOrchestrator {
             resolved_bd,
             resolved_ch,
         ) = if decision.needs_transcode {
-            self.transcoder_la_piste(req, &decision).await?
+            // #8968 — une tranche CUE que RIEN d'autre ne force à transcoder
+            // (aucun traitement, format admis) entre dans le flux continu
+            // #8082 comme un fichier entier : ses bornes y sont exactes à
+            // l'échantillon, et la jointure avec la tranche suivante n'est
+            // plus laissée au renderer.
+            let flux_cue = if decision.motifs_de_transcodage == ["est_une_tranche_cue"] {
+                self.servir_en_flux_continu(req, &decision).await
+            } else {
+                None
+            };
+            match flux_cue {
+                Some(flux) => flux,
+                None => self.transcoder_la_piste(req, &decision).await?,
+            }
         } else {
             self.servir_en_passthrough(req, &decision).await?
         };
@@ -3924,9 +3972,13 @@ impl PlaybackOrchestrator {
                         Some(abandon.clone()),
                         // #3631 — la tranche à découper dans le fichier image.
                         // `None` pour un fichier ordinaire.
-                        tranche_cue.map(|t| TrancheSource {
-                            debut_s: t.debut_ms as f64 / 1000.0,
-                            duree_s: t.duree_ms.map(|d| d as f64 / 1000.0).unwrap_or(0.0),
+                        // #8968 — bornes à l'échantillon près.
+                        tranche_cue.map(|t| {
+                            let (debut_s, duree_s) = t.en_secondes(0, sample_rate);
+                            TrancheSource {
+                                debut_s,
+                                duree_s: duree_s.unwrap_or(0.0),
+                            }
                         }),
                         crossfeed.map(|(processeur, _)| processeur),
                         compensation,
@@ -4168,6 +4220,7 @@ impl PlaybackOrchestrator {
     ) -> Result<FluxLocal, String> {
         let DecisionLocale {
             channels,
+            sample_rate,
             tranche_cue,
             is_local_output,
             ref file_path,
@@ -4306,11 +4359,13 @@ impl PlaybackOrchestrator {
             // PISTE. Pour une tranche de feuille CUE, la position dans le
             // FICHIER est le début de la tranche PLUS ce seek ; la durée
             // restante à servir, elle, en est diminuée d'autant.
+            //
+            // #8968 — bornes de la tranche à l'échantillon près.
             let seek_utilisateur_ms = req.seek_ms.unwrap_or(0);
-            let seek_s = (tranche_cue.map(|t| t.debut_ms).unwrap_or(0) + seek_utilisateur_ms)
-                as f64
-                / 1000.0;
-            let duree_tranche_s = tranche_cue.and_then(|t| t.duree_restante_s(seek_utilisateur_ms));
+            let (seek_s, duree_tranche_s) = match tranche_cue {
+                Some(t) => t.en_secondes(seek_utilisateur_ms, sample_rate),
+                None => (seek_utilisateur_ms as f64 / 1000.0, None),
+            };
             // Les niveaux sont datés sur l'horloge de la PISTE : le décalage
             // du fichier image n'a rien à y faire.
             let seek_niveaux_ms = seek_utilisateur_ms as i64;
@@ -4427,6 +4482,94 @@ impl PlaybackOrchestrator {
         Ok(flux)
     }
 
+    /// #8082 — « Flux continu entre les pistes » : la piste et les suivantes
+    /// de même format partent en UN seul WAV, sans traitement. Réglage
+    /// éteint, sortie non réseau, ou suite d'une seule piste : `None`, rien
+    /// ne change. Appelé par le passthrough, et (#8968) par une tranche CUE
+    /// que rien d'autre ne force à transcoder.
+    async fn servir_en_flux_continu(
+        &self,
+        req: &PlayRequest,
+        decision: &DecisionLocale,
+    ) -> Option<FluxLocal> {
+        let DecisionLocale {
+            is_network_output,
+            ref file_path,
+            ref zone,
+            ..
+        } = *decision;
+        if !is_network_output {
+            return None;
+        }
+        let flux = self
+            .preparer_le_flux_continu(
+                req.zone_id,
+                zone.as_ref().and_then(|z| z.output_type.as_deref()),
+                req.track_id,
+                file_path,
+                req.seek_ms,
+            )
+            .await?;
+        let format = flux.wav.format();
+        let total = crate::http::streamer::SourceVirtuelle::total(&flux.wav);
+        let duree_ms = flux.wav.bornes_ms().iter().map(|(_, d)| d).sum::<u64>();
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: format.cadence,
+            bit_depth: format.profondeur,
+            channels: format.canaux,
+            file_size: Some(total),
+            duration_ms: Some(duree_ms),
+            ..Default::default()
+        };
+        let session_id = self
+            .streamer
+            .create_file_session(info, file_path.clone(), false)
+            .await;
+        let plan = super::flux_continu_8082::plan_du_flux(req.zone_id, &session_id, &flux);
+        info!(
+            zone_id = req.zone_id,
+            stream_id = %session_id,
+            pistes = plan.pistes.len(),
+            positions = ?plan.pistes.iter().map(|p| p.position).collect::<Vec<_>>(),
+            cadence = format.cadence,
+            profondeur = format.profondeur,
+            canaux = format.canaux,
+            octets = total,
+            depart_ms = req.seek_ms.unwrap_or(0),
+            "flux_continu_servi"
+        );
+        self.streamer
+            .set_source_virtuelle(&session_id, Arc::new(flux.wav))
+            .await;
+        self.streamer
+            .noter_la_voie(&session_id, crate::http::streamer::voie::FLUX_CONTINU)
+            .await;
+        // Relance à une position : le flux commence DÉJÀ là. Le départ,
+        // porté par l'URL, ramène le relevé du renderer au début de la
+        // piste (#6059) et retient le `Seek` d'après relecture.
+        if let Some(depart) = req.seek_ms.filter(|d| *d > 0) {
+            crate::outputs::dlna_depart_natif::inscrire_session(&session_id, depart);
+        }
+        if let Some(did) = req
+            .output_device_id
+            .as_deref()
+            .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
+        {
+            crate::outputs::dlna_flux_continu::inscrire(did, plan);
+        }
+        Some((
+            session_id,
+            "audio/wav".into(),
+            "wav".into(),
+            Some(total),
+            Some(format.cadence),
+            Some(u32::from(format.profondeur)),
+            Some(u32::from(format.canaux)),
+        ))
+    }
+
     /// Arme « passthrough » du grand tuple de `resolve_local_track`, sortie telle
     /// quelle : le fichier est servi brut par une session de fichier, avec le
     /// décodage parallèle pour les niveaux quand personne d'autre ne décode.
@@ -4462,78 +4605,9 @@ impl PlaybackOrchestrator {
             ref conteneur_flac_neuf,
             ..
         } = *decision;
-        // #8082 — « Flux continu entre les pistes » : la piste et les
-        // suivantes de même format partent en UN seul WAV, sans traitement.
-        // Réglage éteint, ou suite d'une seule piste : rien ne change.
-        if is_network_output
-            && let Some(flux) = self
-                .preparer_le_flux_continu(
-                    req.zone_id,
-                    zone.as_ref().and_then(|z| z.output_type.as_deref()),
-                    req.track_id,
-                    file_path,
-                    req.seek_ms,
-                )
-                .await
-        {
-            let format = flux.wav.format();
-            let total = crate::http::streamer::SourceVirtuelle::total(&flux.wav);
-            let duree_ms = flux.wav.bornes_ms().iter().map(|(_, d)| d).sum::<u64>();
-            let info = StreamInfo {
-                format: "wav".into(),
-                mime_type: "audio/wav".into(),
-                sample_rate: format.cadence,
-                bit_depth: format.profondeur,
-                channels: format.canaux,
-                file_size: Some(total),
-                duration_ms: Some(duree_ms),
-                ..Default::default()
-            };
-            let session_id = self
-                .streamer
-                .create_file_session(info, file_path.clone(), false)
-                .await;
-            let plan = super::flux_continu_8082::plan_du_flux(req.zone_id, &session_id, &flux);
-            info!(
-                zone_id = req.zone_id,
-                stream_id = %session_id,
-                pistes = plan.pistes.len(),
-                positions = ?plan.pistes.iter().map(|p| p.position).collect::<Vec<_>>(),
-                cadence = format.cadence,
-                profondeur = format.profondeur,
-                canaux = format.canaux,
-                octets = total,
-                depart_ms = req.seek_ms.unwrap_or(0),
-                "flux_continu_servi"
-            );
-            self.streamer
-                .set_source_virtuelle(&session_id, Arc::new(flux.wav))
-                .await;
-            self.streamer
-                .noter_la_voie(&session_id, crate::http::streamer::voie::FLUX_CONTINU)
-                .await;
-            // Relance à une position : le flux commence DÉJÀ là. Le départ,
-            // porté par l'URL, ramène le relevé du renderer au début de la
-            // piste (#6059) et retient le `Seek` d'après relecture.
-            if let Some(depart) = req.seek_ms.filter(|d| *d > 0) {
-                crate::outputs::dlna_depart_natif::inscrire_session(&session_id, depart);
-            }
-            if let Some(did) = req
-                .output_device_id
-                .as_deref()
-                .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
-            {
-                crate::outputs::dlna_flux_continu::inscrire(did, plan);
-            }
-            return Ok((
-                session_id,
-                "audio/wav".into(),
-                "wav".into(),
-                Some(total),
-                Some(format.cadence),
-                Some(u32::from(format.profondeur)),
-                Some(u32::from(format.canaux)),
-            ));
+        // #8082 — « Flux continu entre les pistes ».
+        if let Some(flux) = self.servir_en_flux_continu(req, decision).await {
+            return Ok(flux);
         }
         // #6221 — un DSDIFF DST vers un renderer réseau ne part JAMAIS brut
         // (#4378) : le passthrough sert à sa place un DSF fabriqué à la volée.
@@ -5113,3 +5187,7 @@ mod duree_relue_5975_tests;
 #[cfg(test)]
 #[path = "niveaux_du_dsd_natif_7775.rs"]
 mod niveaux_du_dsd_natif_7775;
+
+#[cfg(test)]
+#[path = "saut_local_8983_tests.rs"]
+mod saut_local_8983_tests;
