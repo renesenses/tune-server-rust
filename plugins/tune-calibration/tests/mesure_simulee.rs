@@ -305,6 +305,13 @@ fn un_micro_fige_arrete_la_mesure_tot_en_le_disant_9066() {
     }
     assert!(t0.elapsed() < Duration::from_secs(8), "{:?}", t0.elapsed());
     assert_eq!(hote.journal().arrets, 1);
+    // Le code stable et le micro, pour que l'écran traduise.
+    let av = controleur.mesure(&id).unwrap().avancement();
+    assert_eq!(av.code, Some("micro_fige"));
+    assert_eq!(av.peripherique.as_deref(), Some(MICRO));
+    let json = serde_json::to_value(&av).unwrap();
+    assert_eq!(json["code"], "micro_fige", "{json}");
+    assert_eq!(json["etat"], "erreur", "{json}");
 }
 
 /// Garde-fou du niveau joué : une pièce trop sourde (enceinte presque

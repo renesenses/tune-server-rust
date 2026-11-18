@@ -65,7 +65,14 @@ pub const AVANCE_SUR_L_ECOUTE_S: f64 = 0.3;
 /// #9066 — un micro dont le compteur de trames ne bouge plus depuis ce délai
 /// est tenu pour figé (USB décroché, veille) : la mesure s'arrête tout de
 /// suite en le disant, au lieu d'attendre `delai_capture`.
+/// Même délai que `DELAI_PREMIERE_TRAME` d'entree-audio (#9070), qui couvre
+/// le micro muet DÈS l'ouverture ; celui-ci couvre le micro qui se tait EN
+/// COURS de mesure.
 pub const MICRO_FIGE: Duration = Duration::from_secs(2);
+
+/// #9066 — le code stable de [`Avancement::code`] pour un micro figé : le
+/// web le traduit (web#3219) au lieu d'afficher le message en français.
+pub const CODE_MICRO_FIGE: &str = "micro_fige";
 
 /// #9066 — la sortie de ce type pousse le son par le réseau (ou par un
 /// lecteur distant) : sa latence propre — tampon du renderer, 2 s fixes
@@ -259,9 +266,19 @@ pub struct Avancement {
     /// Trames jouées sur la longueur maximale promise : la barre de l'écran.
     pub progression: f64,
     pub avertissements: Vec<String>,
+    /// #9070 — le code stable d'une erreur que l'écran traduit
+    /// (`micro_muet`) ; absent sinon.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<&'static str>,
+    /// #9070 — l'identifiant exact du micro ouvert (`alsa:hw:CARD=…`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peripherique: Option<String>,
 }
 
 struct Interne {
+    /// #9070 — voir [`Avancement::code`] et [`Avancement::peripherique`].
+    code: Option<&'static str>,
+    peripherique: Option<String>,
     etat: Etat,
     salves: Vec<Salve>,
     avertissements: Vec<String>,
@@ -319,6 +336,8 @@ impl Mesure {
             depuis_s: self.debut.elapsed().as_secs_f64(),
             progression: (self.deroule.trames_rendues() as f64 / max).min(1.0),
             avertissements: i.avertissements.clone(),
+            code: i.code,
+            peripherique: i.peripherique.clone(),
         }
     }
 
@@ -494,6 +513,8 @@ impl Controleur {
             deroule: deroule.clone(),
             debut: Instant::now(),
             interne: Mutex::new(Interne {
+                code: None,
+                peripherique: None,
                 etat: Etat::Preparation,
                 salves: Vec::new(),
                 avertissements: Vec::new(),
@@ -649,9 +670,9 @@ impl Controleur {
             deroule.consigner(Consigne::Salve {
                 niveau_dbfs: niveau,
             });
-            let em = self.attendre_emission(&deroule, emissions)?;
+            let em = self.attendre_emission(mesure, &tampon, &deroule, emissions)?;
             emissions += 1;
-            let capte = self.capter_segment(&tampon, &d.entree, voie, depart, &em)?;
+            let capte = self.capter_segment(mesure, &tampon, voie, depart, &em)?;
             let crete = peak_dbfs(&capte);
             // Déconvolution de la salve : le RSB sur la RI, comme pour la
             // mesure finale.
@@ -701,8 +722,8 @@ impl Controleur {
         deroule.consigner(Consigne::Balayage {
             niveau_dbfs: niveau_retenu,
         });
-        let em = self.attendre_emission(&deroule, emissions)?;
-        let capte = self.capter_segment(&tampon, &d.entree, voie, depart, &em)?;
+        let em = self.attendre_emission(mesure, &tampon, &deroule, emissions)?;
+        let capte = self.capter_segment(mesure, &tampon, voie, depart, &em)?;
         deroule.consigner(Consigne::Fin);
         if deroule.annulee() {
             return Err(Sortie::Annulee);
@@ -766,18 +787,53 @@ impl Controleur {
         Ok(())
     }
 
-    fn attendre_emission(&self, deroule: &Arc<Deroule>, n: usize) -> Result<Emission, Sortie> {
-        deroule
-            .attendre_emission(n, self.delai_capture)
-            .ok_or_else(|| {
-                if deroule.annulee() {
-                    Sortie::Annulee
-                } else {
-                    Sortie::ErreurDeFlux(
-                        "le balayage n'est pas parti : la zone a cessé de tirer le flux".into(),
-                    )
-                }
-            })
+    /// #9066 — par tranches : un micro figé empêche aussi le segment de
+    /// partir (le générateur, cadencé sur l'écoute, ne rend que du silence
+    /// sans prendre la consigne) ; il est dit en [`MICRO_FIGE`], pas au bout
+    /// de `delai_capture`.
+    fn attendre_emission(
+        &self,
+        mesure: &Mesure,
+        tampon: &Arc<tune_entree_audio::tampon::Tampon>,
+        deroule: &Arc<Deroule>,
+        n: usize,
+    ) -> Result<Emission, Sortie> {
+        let echeance = Instant::now() + self.delai_capture;
+        let mut vu = tampon.trames();
+        let mut vu_a = Instant::now();
+        loop {
+            if let Some(em) = deroule.attendre_emission(n, Duration::from_millis(200)) {
+                return Ok(em);
+            }
+            if deroule.annulee() {
+                return Err(Sortie::Annulee);
+            }
+            if deroule.fini() || Instant::now() >= echeance {
+                return Err(Sortie::ErreurDeFlux(
+                    "le balayage n'est pas parti : la zone a cessé de tirer le flux".into(),
+                ));
+            }
+            if micro_fige(tampon.trames(), &mut vu, &mut vu_a) {
+                return Err(self.erreur_micro_fige(mesure));
+            }
+        }
+    }
+
+    /// #9066 — l'erreur « micro figé », avec son code stable et le
+    /// périphérique : exact s'il est déjà connu (#9070), sinon l'entrée
+    /// demandée.
+    fn erreur_micro_fige(&self, mesure: &Mesure) -> Sortie {
+        let entree = mesure.demande.entree.as_str();
+        {
+            let mut i = mesure.verrou();
+            i.code = Some(CODE_MICRO_FIGE);
+            i.peripherique.get_or_insert_with(|| entree.to_string());
+        }
+        Sortie::Erreur(format!(
+            "le micro « {entree} » ne capte plus (débranché ou en veille ?) : \
+             aucune trame depuis {} s, mesure arrêtée",
+            MICRO_FIGE.as_secs()
+        ))
     }
 
     /// Les échantillons captés depuis `depart` couvrant le segment `em`
@@ -787,12 +843,13 @@ impl Controleur {
     /// arrête la mesure tout de suite, en nommant le micro.
     fn capter_segment(
         &self,
+        mesure: &Mesure,
         tampon: &Arc<tune_entree_audio::tampon::Tampon>,
-        entree: &str,
         voie: usize,
         depart: u64,
         em: &Emission,
     ) -> Result<Vec<f64>, Sortie> {
+        let entree = mesure.demande.entree.as_str();
         let garde = (self.garde_trames() as f64).max(0.0) as u64;
         let besoin = depart + em.trames + garde;
         // Attente par tranches, pour voir passer une annulation.
@@ -803,11 +860,7 @@ impl Controleur {
             match tampon.attendre_trames(besoin, Duration::from_millis(200)) {
                 Ok(Some(_)) => break,
                 Ok(None) if micro_fige(tampon.trames(), &mut vu, &mut vu_a) => {
-                    return Err(Sortie::Erreur(format!(
-                        "le micro « {entree} » ne capte plus (débranché ou en veille ?) : \
-                         aucune trame depuis {} s, mesure arrêtée",
-                        MICRO_FIGE.as_secs()
-                    )));
+                    return Err(self.erreur_micro_fige(mesure));
                 }
                 Ok(None) if Instant::now() < echeance => {}
                 Ok(None) => {
