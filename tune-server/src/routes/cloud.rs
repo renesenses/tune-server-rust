@@ -196,11 +196,34 @@ pub(crate) fn page_connexion_demandee(requete: &[(String, String)]) -> PageConne
     )
 }
 
+/// Refus de la garde « administrateur ou cette machine » rendu en PAGE : relier
+/// ou délier le compte se fait par une navigation complète du navigateur, il
+/// n'y a aucune interface pour lire un corps JSON.
+fn page_refus_hors_machine(
+    headers: &HeaderMap,
+    refus: (StatusCode, Json<Value>),
+) -> axum::response::Response {
+    let (statut, Json(corps)) = refus;
+    let motif = corps["message"]
+        .as_str()
+        .or_else(|| corps["error"].as_str())
+        .unwrap_or("forbidden")
+        .to_string();
+    page_echec_compte(headers, statut, &motif)
+}
+
+/// Relier ce serveur à un compte Mozaiklabs : l'administrateur, ou un appel
+/// depuis cette machine quand l'authentification est coupée. Le retour
+/// (`sso_callback`) passe la même garde.
 async fn sso_authorize(
+    garde: Result<crate::auth::AdminOuCetteMachine, (StatusCode, Json<Value>)>,
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(requete): Query<Vec<(String, String)>>,
 ) -> impl IntoResponse {
+    if let Err(refus) = garde {
+        return page_refus_hors_machine(&headers, refus);
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let Some(auth) = get_mozaik_auth(&settings) else {
         // sso_authorize is a full browser navigation, so degrade to a friendly
@@ -257,10 +280,17 @@ struct CallbackQuery {
 }
 
 async fn sso_callback(
+    garde: Result<crate::auth::AdminOuCetteMachine, (StatusCode, Json<Value>)>,
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(q): Query<CallbackQuery>,
 ) -> impl IntoResponse {
+    // Même garde qu'à l'autorisation, AVANT de lire ou consommer l'attente
+    // PKCE : le navigateur qui revient de mozaiklabs.fr est celui qui a lancé
+    // la liaison (cette machine, ou l'administrateur et son cookie de session).
+    if let Err(refus) = garde {
+        return page_refus_hors_machine(&headers, refus);
+    }
     // Chaque refus de cette route est une PAGE : le navigateur y arrive par la
     // redirection de mozaiklabs, il n'y a aucune interface pour lire du JSON.
     if let Some(err) = q.error {
@@ -585,7 +615,7 @@ async fn sso_status(State(state): State<AppState>) -> Json<Value> {
 /// stored tokens/profile and revoke the account premium. The license-key path is
 /// untouched (a keyed premium survives).
 async fn sso_disconnect(
-    _admin: crate::auth::RequireAdmin,
+    _garde: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
 ) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -1327,8 +1357,18 @@ async fn bridge_disable(
 // License
 // ---------------------------------------------------------------------------
 
-async fn license_status(State(state): State<AppState>) -> Json<Value> {
+async fn license_status(
+    garde: Result<crate::auth::AdminOuCetteMachine, (StatusCode, Json<Value>)>,
+    State(state): State<AppState>,
+) -> Json<Value> {
     let ls = state.license.license_state().await;
+    // La clé en clair ne va qu'à qui peut aussi la retirer ou la remplacer ;
+    // les autres lisent la même forme masquée que `GET /system/license`.
+    let license_key = if garde.is_ok() {
+        ls.license_key.clone()
+    } else {
+        ls.license_key.as_deref().map(cle_masquee)
+    };
     let mut features = serde_json::Map::new();
     for f in tune_core::license::Feature::all_advertised() {
         let enabled = state.license.check_feature(f).await;
@@ -1380,7 +1420,7 @@ async fn license_status(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "tier": ls.tier,
         "premium_source": premium_source,
-        "license_key": ls.license_key,
+        "license_key": license_key,
         "expires_at": ls.expires_at,
         "last_validated": ls.last_validated,
         "hardware_fingerprint": ls.hardware_fingerprint,
@@ -1419,6 +1459,7 @@ async fn license_status(State(state): State<AppState>) -> Json<Value> {
 /// et Free, exactement comme avant. Aucune clé ne débloque quoi que ce soit
 /// sans confirmation en ligne.
 async fn license_activate(
+    _garde: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
@@ -1454,12 +1495,26 @@ async fn license_activate(
     .into_response()
 }
 
-async fn license_deactivate(State(state): State<AppState>) -> Json<Value> {
+async fn license_deactivate(
+    _garde: crate::auth::AdminOuCetteMachine,
+    State(state): State<AppState>,
+) -> Json<Value> {
     let remote_released = retirer_la_licence(&state).await;
     Json(reponse_de_retrait(
         json!({"status": "deactivated", "tier": "free"}),
         remote_released,
     ))
+}
+
+/// La clé de licence masquée : quatre derniers caractères visibles, comme
+/// `GET /system/license`.
+pub(crate) fn cle_masquee(k: &str) -> String {
+    let n = k.chars().count();
+    if n <= 4 {
+        return "****".to_string();
+    }
+    let fin: String = k.chars().skip(n - 4).collect();
+    format!("{}{fin}", "*".repeat(n - 4))
 }
 
 /// Retire la licence de ce serveur (#7726) : prévient d'abord mozaiklabs.fr
@@ -2753,3 +2808,7 @@ mod confinement_chemins_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "cloud_garde_compte_tests.rs"]
+mod cloud_garde_compte_tests;
