@@ -10,6 +10,7 @@
 //! passe par un canal.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -21,8 +22,8 @@ use crate::format::{
     Echantillons, Mesure, bits_servis, contient_iec61937, convertir_entiers, convertir_f32,
 };
 use crate::peripheriques::{
-    Arret, CaptureDemarree, DescriptionEntree, Peripheriques, choisir_parmi_homonymes,
-    une_ligne_par_carte_alsa,
+    Arret, CaptureDemarree, DescriptionEntree, Peripheriques, ordre_des_homonymes,
+    premier_qui_ouvre, une_ligne_par_carte_alsa,
 };
 
 pub struct Systeme;
@@ -63,21 +64,37 @@ fn echantillons(f: SampleFormat) -> Option<Echantillons> {
     }
 }
 
-fn trouver(entree: &str) -> Result<Device, String> {
+/// Les entrées à essayer pour `entree`, dans l'ordre : son identifiant exact
+/// (une seule, sans repli : elle a été choisie) ; sinon toutes celles de ce
+/// nom, `hw:` d'abord puis l'ordre de cpal ([`ordre_des_homonymes`], #9070).
+fn candidats(entree: &str) -> Result<Vec<Device>, String> {
     let host = cpal::default_host();
     let entrees: Vec<Device> = host
         .input_devices()
         .map_err(|e| format!("énumération des entrées impossible : {e}"))?
         .collect();
     if let Some(i) = entrees.iter().position(|d| id(d) == entree) {
-        return Ok(entrees.into_iter().nth(i).expect("position valide"));
+        return Ok(entrees.into_iter().skip(i).take(1).collect());
     }
-    // #9070 — par le nom : sous ALSA, plusieurs entrées le portent ; prendre
-    // celle que la liste (réduite) montre, pas la première venue.
-    let mut homonymes: Vec<Device> = entrees.into_iter().filter(|d| nom(d) == entree).collect();
-    let ids: Vec<String> = homonymes.iter().map(id).collect();
-    choisir_parmi_homonymes(&ids)
-        .map(|i| homonymes.swap_remove(i))
+    let mut homonymes: Vec<Option<Device>> = entrees
+        .into_iter()
+        .filter(|d| nom(d) == entree)
+        .map(Some)
+        .collect();
+    if homonymes.is_empty() {
+        return Err(format!("aucune entrée audio « {entree} »"));
+    }
+    let ids: Vec<String> = homonymes.iter().flatten().map(id).collect();
+    Ok(ordre_des_homonymes(&ids)
+        .into_iter()
+        .filter_map(|i| homonymes[i].take())
+        .collect())
+}
+
+fn trouver(entree: &str) -> Result<Device, String> {
+    candidats(entree)?
+        .into_iter()
+        .next()
         .ok_or_else(|| format!("aucune entrée audio « {entree} »"))
 }
 
@@ -100,6 +117,110 @@ fn format_natif_de(d: &Device) -> Result<(FormatPcm, SampleFormat), String> {
         },
         c.sample_format(),
     ))
+}
+
+/// Ouvre et démarre la capture de `d` à son format natif, vers `anneau`.
+fn ouvrir(
+    d: &Device,
+    anneau: &Arc<Anneau>,
+) -> Result<(cpal::Stream, String, String, FormatPcm), String> {
+    let peripherique = id(d);
+    let (format, sample_format) = format_natif_de(d)?;
+    let ech = echantillons(sample_format).expect("vérifié par format_natif_de");
+    let config = StreamConfig {
+        channels: format.canaux,
+        sample_rate: format.frequence,
+        buffer_size: cpal::BufferSize::Default,
+    };
+    let bits = format.bits;
+    let canaux = format.canaux;
+    let a = anneau.clone();
+    let a_err = anneau.clone();
+    // Un candidat écarté (repli) ne doit pas fermer l'anneau
+    // du suivant : son rappel d'erreur ne compte qu'une fois
+    // la capture retenue.
+    let retenu = Arc::new(AtomicBool::new(false));
+    let retenu_err = retenu.clone();
+    let mut origine: Option<cpal::StreamInstant> = None;
+    let mut octets: Vec<u8> = Vec::with_capacity(64 * 1024);
+    // #9070 — la première remise du pilote se journalise : sans
+    // elle, un micro ouvert mais muet ne laisse aucune trace.
+    let mut premiere_remise = true;
+    let id_rappel = peripherique.clone();
+    let stream = d
+        .build_input_stream_raw(
+            &config,
+            sample_format,
+            move |data: &cpal::Data, info: &cpal::InputCallbackInfo| {
+                if premiere_remise {
+                    premiere_remise = false;
+                    tracing::info!(
+                        peripherique = %id_rappel,
+                        trames = data.len() / (canaux.max(1) as usize),
+                        "entree_audio_premieres_trames"
+                    );
+                }
+                octets.clear();
+                let mesure = match ech {
+                    Echantillons::F32 => data
+                        .as_slice::<f32>()
+                        .map(|s| convertir_f32(s, bits, &mut octets)),
+                    Echantillons::I16 => data.as_slice::<i16>().map(|s| {
+                        convertir_entiers(
+                            s.iter().map(|&v| v as i32),
+                            0,
+                            32_768.0,
+                            bits,
+                            &mut octets,
+                        )
+                    }),
+                    Echantillons::I24 => data.as_slice::<cpal::I24>().map(|s| {
+                        convertir_entiers(
+                            s.iter().map(|v| v.inner()),
+                            0,
+                            8_388_608.0,
+                            bits,
+                            &mut octets,
+                        )
+                    }),
+                    Echantillons::I32 => data.as_slice::<i32>().map(|s| {
+                        convertir_entiers(s.iter().copied(), 8, 2_147_483_648.0, bits, &mut octets)
+                    }),
+                };
+                let Some(mut mesure): Option<Mesure> = mesure else {
+                    return;
+                };
+                mesure.iec61937 = contient_iec61937(&octets, canaux, bits);
+                let capture = info.timestamp().capture;
+                let o = *origine.get_or_insert(capture);
+                a.pousser(&octets, mesure, capture.duration_since(&o));
+            },
+            move |err| {
+                if !retenu_err.load(Ordering::SeqCst) {
+                    return;
+                }
+                a_err.fermer(Fin::Erreur(format!("le périphérique a failli : {err}")));
+            },
+            None,
+        )
+        .map_err(|e| format!("ouverture de la capture impossible : {e}"))?;
+    stream
+        .play()
+        .map_err(|e| format!("démarrage de la capture impossible : {e}"))?;
+    retenu.store(true, Ordering::SeqCst);
+    // #9070 — le PCM exactement ouvert, et ce qui lui a été
+    // demandé (son format courant, accepté par le pilote).
+    tracing::info!(
+        peripherique = %peripherique,
+        entree = %nom(d),
+        format_echantillons = %sample_format,
+        frequence = format.frequence,
+        canaux = format.canaux,
+        bits = format.bits,
+        pile = pile(),
+        "entree_audio_peripherique_ouvert"
+    );
+    Ok((stream, nom(d), peripherique, format))
 }
 
 impl Peripheriques for Systeme {
@@ -161,8 +282,9 @@ impl Peripheriques for Systeme {
     }
 
     fn format_natif(&self, entree: &str) -> Result<(String, FormatPcm), String> {
-        let d = trouver(entree)?;
-        let (f, _) = format_natif_de(&d)?;
+        // #9070 — même ordre et même repli que `demarrer` : le format rendu
+        // est celui de l'entrée qui s'ouvrira.
+        let (d, (f, _)) = premier_qui_ouvre(candidats(entree)?, id, format_natif_de)?;
         Ok((nom(&d), f))
     }
 
@@ -174,103 +296,9 @@ impl Peripheriques for Systeme {
             .name("entree-audio-capture".into())
             .spawn(move || {
                 let r = (|| {
-                    let d = trouver(&entree)?;
-                    let peripherique = id(&d);
-                    let (format, sample_format) = format_natif_de(&d)?;
-                    let ech = echantillons(sample_format).expect("vérifié par format_natif_de");
-                    let config = StreamConfig {
-                        channels: format.canaux,
-                        sample_rate: format.frequence,
-                        buffer_size: cpal::BufferSize::Default,
-                    };
-                    let bits = format.bits;
-                    let canaux = format.canaux;
-                    let a = anneau.clone();
-                    let a_err = anneau.clone();
-                    let mut origine: Option<cpal::StreamInstant> = None;
-                    let mut octets: Vec<u8> = Vec::with_capacity(64 * 1024);
-                    // #9070 — la première remise du pilote se journalise : sans
-                    // elle, un micro ouvert mais muet ne laisse aucune trace.
-                    let mut premiere_remise = true;
-                    let id_rappel = peripherique.clone();
-                    let stream = d
-                        .build_input_stream_raw(
-                            &config,
-                            sample_format,
-                            move |data: &cpal::Data, info: &cpal::InputCallbackInfo| {
-                                if premiere_remise {
-                                    premiere_remise = false;
-                                    tracing::info!(
-                                        peripherique = %id_rappel,
-                                        trames = data.len() / (canaux.max(1) as usize),
-                                        "entree_audio_premieres_trames"
-                                    );
-                                }
-                                octets.clear();
-                                let mesure = match ech {
-                                    Echantillons::F32 => data
-                                        .as_slice::<f32>()
-                                        .map(|s| convertir_f32(s, bits, &mut octets)),
-                                    Echantillons::I16 => data.as_slice::<i16>().map(|s| {
-                                        convertir_entiers(
-                                            s.iter().map(|&v| v as i32),
-                                            0,
-                                            32_768.0,
-                                            bits,
-                                            &mut octets,
-                                        )
-                                    }),
-                                    Echantillons::I24 => data.as_slice::<cpal::I24>().map(|s| {
-                                        convertir_entiers(
-                                            s.iter().map(|v| v.inner()),
-                                            0,
-                                            8_388_608.0,
-                                            bits,
-                                            &mut octets,
-                                        )
-                                    }),
-                                    Echantillons::I32 => data.as_slice::<i32>().map(|s| {
-                                        convertir_entiers(
-                                            s.iter().copied(),
-                                            8,
-                                            2_147_483_648.0,
-                                            bits,
-                                            &mut octets,
-                                        )
-                                    }),
-                                };
-                                let Some(mut mesure): Option<Mesure> = mesure else {
-                                    return;
-                                };
-                                mesure.iec61937 = contient_iec61937(&octets, canaux, bits);
-                                let capture = info.timestamp().capture;
-                                let o = *origine.get_or_insert(capture);
-                                a.pousser(&octets, mesure, capture.duration_since(&o));
-                            },
-                            move |err| {
-                                a_err.fermer(Fin::Erreur(format!(
-                                    "le périphérique a failli : {err}"
-                                )));
-                            },
-                            None,
-                        )
-                        .map_err(|e| format!("ouverture de la capture impossible : {e}"))?;
-                    stream
-                        .play()
-                        .map_err(|e| format!("démarrage de la capture impossible : {e}"))?;
-                    // #9070 — le PCM exactement ouvert, et ce qui lui a été
-                    // demandé (son format courant, accepté par le pilote).
-                    tracing::info!(
-                        peripherique = %peripherique,
-                        entree = %nom(&d),
-                        format_echantillons = %sample_format,
-                        frequence = format.frequence,
-                        canaux = format.canaux,
-                        bits = format.bits,
-                        pile = pile(),
-                        "entree_audio_peripherique_ouvert"
-                    );
-                    Ok((stream, nom(&d), peripherique, format))
+                    let (_, ouvert) =
+                        premier_qui_ouvre(candidats(&entree)?, id, |d| ouvrir(d, &anneau))?;
+                    Ok(ouvert)
                 })();
                 match r {
                     Ok((stream, nom, peripherique, format)) => {
