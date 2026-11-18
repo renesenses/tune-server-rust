@@ -62,6 +62,11 @@ pub const RSB_MIN_DB: f64 = 20.0;
 /// la pompe, pas le chemin de lecture, qui se remplit au rythme de l'écoute.
 pub const AVANCE_SUR_L_ECOUTE_S: f64 = 0.3;
 
+/// #9066 — un micro dont le compteur de trames ne bouge plus depuis ce délai
+/// est tenu pour figé (USB décroché, veille) : la mesure s'arrête tout de
+/// suite en le disant, au lieu d'attendre `delai_capture`.
+pub const MICRO_FIGE: Duration = Duration::from_secs(2);
+
 /// #9066 — la sortie de ce type pousse le son par le réseau (ou par un
 /// lecteur distant) : sa latence propre — tampon du renderer, 2 s fixes
 /// d'AirPlay — s'ajoute à celle de Tune, et la fenêtre d'écoute ne la voit
@@ -541,6 +546,12 @@ impl Controleur {
             }
             Err(Sortie::Annulee) => mesure.poser(Etat::Annulee),
             Err(Sortie::Erreur(message)) => mesure.poser(Etat::Erreur { message }),
+            Err(Sortie::ErreurDeFlux(message)) => {
+                let sortie = self.hote.type_de_sortie(mesure.demande.zone_id);
+                mesure.poser(Etat::Erreur {
+                    message: motif_sur_sortie(message, sortie.as_deref()),
+                })
+            }
         }
     }
 
@@ -640,7 +651,7 @@ impl Controleur {
             });
             let em = self.attendre_emission(&deroule, emissions)?;
             emissions += 1;
-            let capte = self.capter_segment(&tampon, voie, depart, &em)?;
+            let capte = self.capter_segment(&tampon, &d.entree, voie, depart, &em)?;
             let crete = peak_dbfs(&capte);
             // Déconvolution de la salve : le RSB sur la RI, comme pour la
             // mesure finale.
@@ -691,7 +702,7 @@ impl Controleur {
             niveau_dbfs: niveau_retenu,
         });
         let em = self.attendre_emission(&deroule, emissions)?;
-        let capte = self.capter_segment(&tampon, voie, depart, &em)?;
+        let capte = self.capter_segment(&tampon, &d.entree, voie, depart, &em)?;
         deroule.consigner(Consigne::Fin);
         if deroule.annulee() {
             return Err(Sortie::Annulee);
@@ -762,7 +773,7 @@ impl Controleur {
                 if deroule.annulee() {
                     Sortie::Annulee
                 } else {
-                    Sortie::Erreur(
+                    Sortie::ErreurDeFlux(
                         "le balayage n'est pas parti : la zone a cessé de tirer le flux".into(),
                     )
                 }
@@ -771,9 +782,13 @@ impl Controleur {
 
     /// Les échantillons captés depuis `depart` couvrant le segment `em`
     /// (sa longueur + la garde), une fois qu'ils sont là.
+    ///
+    /// #9066 — un micro figé (compteur immobile depuis [`MICRO_FIGE`])
+    /// arrête la mesure tout de suite, en nommant le micro.
     fn capter_segment(
         &self,
         tampon: &Arc<tune_entree_audio::tampon::Tampon>,
+        entree: &str,
         voie: usize,
         depart: u64,
         em: &Emission,
@@ -782,13 +797,22 @@ impl Controleur {
         let besoin = depart + em.trames + garde;
         // Attente par tranches, pour voir passer une annulation.
         let echeance = Instant::now() + self.delai_capture;
+        let mut vu = tampon.trames();
+        let mut vu_a = Instant::now();
         loop {
             match tampon.attendre_trames(besoin, Duration::from_millis(200)) {
                 Ok(Some(_)) => break,
+                Ok(None) if micro_fige(tampon.trames(), &mut vu, &mut vu_a) => {
+                    return Err(Sortie::Erreur(format!(
+                        "le micro « {entree} » ne capte plus (débranché ou en veille ?) : \
+                         aucune trame depuis {} s, mesure arrêtée",
+                        MICRO_FIGE.as_secs()
+                    )));
+                }
                 Ok(None) if Instant::now() < echeance => {}
                 Ok(None) => {
-                    return Err(Sortie::Erreur(format!(
-                        "capture trop lente : {} trames sur {besoin} attendues",
+                    return Err(Sortie::ErreurDeFlux(format!(
+                        "capture trop lente sur « {entree} » : {} trames sur {besoin} attendues",
                         tampon.trames()
                     )));
                 }
@@ -809,12 +833,26 @@ impl Controleur {
     }
 }
 
+/// #9066 — le compteur de trames du micro est-il immobile depuis
+/// [`MICRO_FIGE`] ? `vu`/`vu_a` : la dernière valeur vue et quand elle a bougé.
+fn micro_fige(trames: u64, vu: &mut u64, vu_a: &mut Instant) -> bool {
+    if trames != *vu {
+        *vu = trames;
+        *vu_a = Instant::now();
+        return false;
+    }
+    vu_a.elapsed() >= MICRO_FIGE
+}
+
 /// Les sorties d'un déroulé.
 #[derive(Debug)]
 enum Sortie {
     Refus(String),
     Annulee,
     Erreur(String),
+    /// #9066 — une erreur où le flux n'est pas arrivé à temps à l'écoute :
+    /// sur une sortie réseau, elle dit pourquoi (voir [`motif_sur_sortie`]).
+    ErreurDeFlux(String),
 }
 
 /// La zone pendant la mesure : volume forcé, puis rendu — quoi qu'il arrive.

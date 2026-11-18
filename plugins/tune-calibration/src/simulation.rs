@@ -120,6 +120,9 @@ pub struct Boucle {
     /// Trames jouées que la boucle tient au plus avant le micro : le tampon
     /// de la sortie.
     capacite: usize,
+    /// #9066 — micro figé (USB décroché, veille) : la capture ne pousse plus
+    /// rien, sans erreur.
+    pub fige: AtomicBool,
     piece: Mutex<PieceEnDirect>,
     /// Vitesse du temps simulé (1 = temps réel).
     pub vitesse: f64,
@@ -140,6 +143,7 @@ impl Boucle {
         Arc::new(Self {
             joue: Mutex::new(VecDeque::new()),
             capacite: capacite.max(1),
+            fige: AtomicBool::new(false),
             piece: Mutex::new(piece),
             vitesse,
         })
@@ -236,6 +240,10 @@ impl Peripheriques for MicroSimule {
             let par_bloc = (fs / 100) as usize; // 10 ms
             let pause = Duration::from_secs_f64(0.010 / boucle.vitesse);
             while v.load(Ordering::SeqCst) {
+                if boucle.fige.load(Ordering::SeqCst) {
+                    std::thread::sleep(pause);
+                    continue;
+                }
                 let captes = boucle.capter(par_bloc);
                 let mut o = Vec::with_capacity(par_bloc * 6);
                 let mut crete = 0.0f32;

@@ -157,10 +157,11 @@ impl Plan {
 pub type HorlogeDEcoute = Arc<dyn Fn() -> u64 + Send + Sync>;
 
 /// #9066 — attente maximale du générateur pour un bloc, si l'écoute ne
-/// progresse plus (capture arrêtée en fin de mesure). Au-delà, le bloc part
-/// quand même : la pompe ne reste jamais bloquée (son verrou de lecture est
-/// attendu par l'arrêt de la zone), et le débit reste dix fois sous le temps
-/// réel, donc sans avance possible.
+/// progresse plus (capture arrêtée en fin de mesure, micro décroché). Au-delà,
+/// un bloc de SILENCE part : la pompe ne reste jamais bloquée (son verrou de
+/// lecture est attendu par l'arrêt de la zone), et le segment en cours
+/// n'avance pas — aucune salve ni aucun balayage ne sort en rafales de clics
+/// au volume de mesure pendant que personne n'écoute.
 const ATTENTE_MAX_PAR_BLOC: Duration = Duration::from_millis(100);
 
 #[derive(Clone)]
@@ -445,9 +446,10 @@ impl Generateur {
 
     /// #9066 — attend que l'écoute permette `bloc` trames de plus. Voir
     /// [`Deroule::cadencer_sur_l_ecoute`] et [`ATTENTE_MAX_PAR_BLOC`].
-    fn attendre_l_ecoute(&mut self, bloc: u64) {
+    /// `false` : l'écoute n'a pas suivi à temps, le bloc doit être du silence.
+    fn attendre_l_ecoute(&mut self, bloc: u64) -> bool {
         let Some(cadence) = self.deroule.cadence() else {
-            return;
+            return true;
         };
         let origine = *self
             .origine_ecoute
@@ -458,12 +460,26 @@ impl Generateur {
             if self.trames_rendues + bloc <= ecoute + cadence.avance
                 || self.deroule.annulee()
                 || self.deroule.fini()
-                || Instant::now() >= echeance
             {
-                return;
+                return true;
+            }
+            if Instant::now() >= echeance {
+                return false;
             }
             std::thread::sleep(Duration::from_millis(2));
         }
+    }
+
+    /// #9066 — `n` trames de silence au plus (dans la longueur promise), sans
+    /// prendre de consigne ni avancer le segment en cours.
+    fn silence(&mut self, n: usize) -> Vec<u8> {
+        if self.deroule.annulee() || (self.deroule.fini() && self.segment.is_none()) {
+            return Vec::new();
+        }
+        let n = (n as u64).min(self.trames_max.saturating_sub(self.trames_rendues));
+        self.trames_rendues += n;
+        self.deroule.verrou().trames_rendues = self.trames_rendues;
+        vec![0u8; (n * self.deroule.plan.format.octets_par_trame()) as usize]
     }
 
     /// Produit `n` trames au plus, en octets.
@@ -517,8 +533,11 @@ impl Read for Generateur {
         if self.reste.is_empty() {
             // Des blocs de 10 ms : une consigne est prise au bloc suivant.
             let bloc = (self.deroule.plan.format.frequence / 100).max(1) as usize;
-            self.attendre_l_ecoute(bloc as u64);
-            self.reste = self.produire(bloc);
+            self.reste = if self.attendre_l_ecoute(bloc as u64) {
+                self.produire(bloc)
+            } else {
+                self.silence(bloc)
+            };
             if self.reste.is_empty() {
                 let mut e = self.deroule.verrou();
                 e.fini = true;
@@ -675,6 +694,41 @@ mod tests {
             assert!(g.read(&mut buf).unwrap() > 0);
         }
         assert!(d.trames_rendues() <= 48_000 + 4_800 + 4 * 480);
+    }
+
+    /// #9066 (relecture) — micro figé pendant une salve : passé l'avance
+    /// permise, le repli ne rend que du SILENCE, et le segment n'avance pas.
+    /// Avant, chaque repli laissait partir 10 ms de salve : des rafales de
+    /// clics au volume de mesure.
+    #[test]
+    fn micro_fige_le_repli_rend_du_silence_sans_avancer_le_segment_9066() {
+        let d = Deroule::new(plan());
+        d.cadencer_sur_l_ecoute(Arc::new(|| 0), 9_600);
+        d.consigner(Consigne::Salve { niveau_dbfs: -12.0 });
+        let mut g = Generateur::new(d.clone());
+        let mut lu = Vec::new();
+        let mut buf = vec![0u8; 32 * 1024];
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_millis(350) {
+            let n = g.read(&mut buf).unwrap();
+            assert!(n > 0);
+            lu.extend_from_slice(&buf[..n]);
+        }
+        // 200 ms permises : au-delà du fondu d'entrée de la salve (~100 ms).
+        let octets_permis = 9_600 * 6;
+        assert!(
+            lu.len() > octets_permis,
+            "aucun repli : {} octets",
+            lu.len()
+        );
+        assert!(crete_24(&lu[..octets_permis]) > 0.05, "la salve est partie");
+        assert_eq!(
+            crete_24(&lu[octets_permis..]),
+            0.0,
+            "du signal est sorti pendant que le micro était figé"
+        );
+        // Le segment est resté là où l'écoute l'a laissé.
+        assert_eq!(g.segment.as_ref().map(|s| s.position), Some(9_600));
     }
 
     #[test]

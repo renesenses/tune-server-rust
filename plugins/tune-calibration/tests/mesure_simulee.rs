@@ -261,6 +261,52 @@ fn le_balayage_sort_pendant_l_ecoute_malgre_le_chemin_de_lecture_9066() {
     assert_eq!(hote.journal().arrets, 1);
 }
 
+/// #9066 (relecture) — le micro se fige pendant le balayage, sans erreur
+/// (USB décroché, veille) : la mesure s'arrête en deux secondes en nommant
+/// le micro, au lieu d'attendre une minute puis « capture trop lente ».
+#[test]
+fn un_micro_fige_arrete_la_mesure_tot_en_le_disant_9066() {
+    let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
+    let boucle = Boucle::new(PieceEnDirect::depuis(&sim, 1.0), VITESSE);
+    let fournisseur = FournisseurBalayage::new();
+    let hote = HoteSimule::new(fournisseur.clone(), boucle.clone(), Some(50.0));
+    let micro: Arc<dyn Peripheriques> = Arc::new(MicroSimule {
+        nom: MICRO.into(),
+        frequence: FREQUENCE_MESURE,
+        boucle: boucle.clone(),
+        demarrages: Default::default(),
+    });
+    let dossier = tune_core::test_scratch::scratch_dir("tune-calibration-micro-fige-9066");
+    let controleur = Controleur::new(
+        micro,
+        hote.clone(),
+        fournisseur,
+        dossier.path().to_path_buf(),
+    );
+    let id = controleur.lancer(demande(10)).expect("lancée");
+    let e = attendre_etat(
+        &controleur,
+        &id,
+        |e| matches!(e, Etat::Balayage { .. }),
+        Duration::from_secs(60),
+    );
+    assert!(matches!(e, Etat::Balayage { .. }), "{e:?}");
+    boucle.fige.store(true, std::sync::atomic::Ordering::SeqCst);
+    let t0 = Instant::now();
+    let etat = attendre_fin(&controleur, &id, Duration::from_secs(20));
+    match &etat {
+        Etat::Erreur { message } => {
+            assert!(
+                message.contains("ne capte plus") && message.contains(MICRO),
+                "{message}"
+            )
+        }
+        autre => panic!("{autre:?}"),
+    }
+    assert!(t0.elapsed() < Duration::from_secs(8), "{:?}", t0.elapsed());
+    assert_eq!(hote.journal().arrets, 1);
+}
+
 /// Garde-fou du niveau joué : une pièce trop sourde (enceinte presque
 /// muette, bruit élevé) n'atteint jamais le RSB visé ; la montée s'arrête
 /// à −6 dBFS et la mesure est REFUSÉE en le disant, sans balayage complet,
