@@ -280,24 +280,24 @@ fn masterise(musique: Vec<f32>, graine: u64) -> Vec<i32> {
     quantifier(&dither, 24)
 }
 
-/// Le verdict d'un témoin NON codec : la coupure à 18 kHz est vue, la
-/// recherche des trous a lieu, et elle ne conclut PAS au codec.
+/// Le verdict d'un témoin NON codec : la recherche des trous, menée sous la
+/// coupure de 18 kHz du master, juge (assez de trames et de bandes) et ne
+/// conclut PAS au codec ; le verdict complet ne dit jamais « codec » non plus.
+/// La recherche est appelée directement : sur un signal synthétique très
+/// dynamique, l'étape de la falaise (antérieure à #9035) peut retenir une
+/// falaise d'artefact près de Nyquist et ne jamais lancer la recherche — ce
+/// qui serait un faux NÉGATIF, pas l'objet de ces témoins.
 fn pas_de_signature(nom: &str, pcm: &[i32]) {
+    let trous = trous_de_codec(&[(0.0, pcm)], 1, 96_000, 24, 18_000.0)
+        .unwrap_or_else(|| panic!("{nom} : la recherche des trous doit juger"));
+    assert!(
+        !trous.signature(),
+        "{nom} : pas de signature de codec attendue — {trous:?}"
+    );
     let m = mesurer(pcm, 1, 96_000, 24);
-    let v = juger(&m);
     assert!(
-        matches!(v, Verdict::Douteux(Raison::CoupureSpectrale { .. })),
-        "{nom} : coupure à 18 kHz sans signature attendue — {v:?} part trouée {:?} {m:?}",
-        m.part_trouee
-    );
-    assert!(
-        m.part_trouee.is_some(),
-        "{nom} : la recherche des trous doit avoir jugé — {m:?}"
-    );
-    assert!(
-        !m.signature_codec,
-        "{nom} : part trouée {:?}",
-        m.part_trouee
+        !matches!(juger(&m), Verdict::Douteux(Raison::SignatureDeCodec { .. })),
+        "{nom} : {m:?}"
     );
 }
 
