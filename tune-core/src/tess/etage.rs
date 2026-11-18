@@ -221,9 +221,31 @@ pub fn preparer_chaine(
     entree: FormatFlux,
     max_trames: usize,
 ) -> Result<PlanPrepare, ErreurEtage> {
+    let mut dispositions = Vec::with_capacity(etages.len());
+    let (sortie, max_trames_sortie, latence_totale_trames) =
+        preparer_dans(etages, entree, max_trames, &mut dispositions)?;
+    Ok(PlanPrepare {
+        dispositions,
+        latence_totale_trames,
+        sortie,
+        max_trames_sortie,
+    })
+}
+
+/// Le cœur de [`preparer_chaine`], qui écrit les dispositions dans un `Vec`
+/// fourni (vidé d'abord) : l'exécuteur (T03) le garde d'une préparation à
+/// l'autre, et une préparation qui tient dans sa capacité n'alloue rien.
+/// Rend le format de sortie, le nombre maximal de trames en sortie et la
+/// latence totale à la fréquence de sortie.
+pub(crate) fn preparer_dans(
+    etages: &mut [&mut dyn EtageTess],
+    entree: FormatFlux,
+    max_trames: usize,
+    dispositions: &mut Vec<Disposition>,
+) -> Result<(FormatFlux, usize, u64), ErreurEtage> {
+    dispositions.clear();
     let mut format = entree;
     let mut max = max_trames;
-    let mut dispositions = Vec::with_capacity(etages.len());
     for etage in etages.iter_mut() {
         let d = etage.preparer(format, max)?;
         if d.sur_place && (d.sortie != format || d.max_trames_sortie != max) {
@@ -241,12 +263,7 @@ pub fn preparer_chaine(
             num.div_ceil(u64::from(d.sortie.sample_rate_hz.max(1)))
         })
         .sum();
-    Ok(PlanPrepare {
-        dispositions,
-        latence_totale_trames,
-        sortie: format,
-        max_trames_sortie: max,
-    })
+    Ok((format, max, latence_totale_trames))
 }
 
 #[cfg(test)]

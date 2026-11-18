@@ -547,6 +547,11 @@ mod bras_alsa_natif;
 #[cfg(target_os = "linux")]
 mod bras_alsa_dsd;
 
+// TESS T03 — la chaîne DSP locale passe par l'exécuteur TESS en `f64`
+// (ordre libre, « Bypass all », adaptateurs provisoires des moteurs `f32`).
+mod executeur_tess;
+use executeur_tess::{MoteursLocaux, OrdreLocal, executer_chaine_locale, frontiere_f32};
+
 // REF-8 (#2219) : l'étage natif des bras Windows exclusifs — octets source
 // → mots `i32` alignés à gauche → `PuitsNatif` — et le puits de tout
 // `NativePcmRing`. Même `cfg` que les aides qu'il appelle : jugé sur Shrek.
@@ -3812,10 +3817,12 @@ impl LocalPcmProcessor<'_> {
             sync_volume_to_dop(self.volume, self.user_volume, self.rg_factor, dop);
         }
 
-        let mut samples =
-            pcm_bytes_to_f32(bloc.octets_alignes(), spec.profondeur().bits_declares());
-        apply_local_dsp(
-            &mut samples,
+        // TESS T03 — décodé en `f64`, traité par l'exécuteur, puis rangé en
+        // `f32` à la frontière provisoire de l'anneau (engagement § 8 du
+        // contrat : anneau `f64` et quantification unique au rendu).
+        let mut large = pcm_bytes_to_f64(bloc.octets_alignes(), spec.profondeur().bits_declares());
+        appliquer_chaine_tess(
+            &mut large,
             self.eq,
             self.convolver,
             self.crossfeed,
@@ -3824,6 +3831,7 @@ impl LocalPcmProcessor<'_> {
             spec.canaux(),
             dop,
         );
+        let samples = frontiere_f32(&large);
         staged.drain(..aligned_len);
 
         Some(ProcessedLocalPcm {
@@ -4586,35 +4594,23 @@ fn flush_local_dsp(
     channels: u16,
     dop: bool,
 ) -> Vec<f32> {
-    // Mêmes exemptions qu'`apply_local_dsp` : ce que la chaîne n'a pas traité,
-    // elle n'a rien à en rendre.
-    if dop || pure_bypass.load(Ordering::Relaxed) {
-        return Vec::new();
-    }
-    let mut queue = match convolver.lock() {
-        Ok(mut c) => match c.as_mut() {
-            Some(conv) => conv.flush(),
-            None => return Vec::new(),
-        },
-        Err(_) => return Vec::new(),
+    // TESS T03 — la queue passe par les étages qui SUIVENT le convolveur dans
+    // l'ordre de la chaîne (ici l'ordre historique : crossfeed, puis repli
+    // mono, #2362 : sans lui la queue sortirait en stéréo pendant que le corps
+    // de la piste sort en mono). Mêmes exemptions qu'`apply_local_dsp`.
+    let moteurs = MoteursLocaux {
+        eq: None,
+        convolver,
+        crossfeed,
+        pure_bypass,
+        mono_downmix,
     };
-    if queue.is_empty() {
-        return queue;
-    }
-    if channels == 2
-        && let Ok(mut cf) = crossfeed.lock()
-        && let Some(c) = cf.as_mut()
-    {
-        c.process_interleaved(&mut queue);
-    }
-    // Même ordre que `apply_local_dsp` : sans ceci la queue du convolveur
-    // sortirait en stéréo pendant que le corps de la piste sort en mono, et
-    // l'auditeur à une seule enceinte entendrait la fin de chaque piste
-    // s'appauvrir (#2362).
-    if channels == 2 && mono_downmix.load(Ordering::Relaxed) {
-        crate::audio::channels::fold_stereo_to_mono_in_place(&mut queue);
-    }
-    queue
+    frontiere_f32(&executeur_tess::vidanger_chaine_locale(
+        &moteurs,
+        OrdreLocal::HISTORIQUE,
+        channels,
+        dop,
+    ))
 }
 
 // Un argument par étage de traitement (EQ, convolution, crossfeed…), chacun
@@ -4630,39 +4626,88 @@ fn apply_local_dsp(
     channels: u16,
     dop: bool,
 ) {
+    // L'entrée `f32` (flux compressé décodé, témoins) : élargie en `f64`
+    // sans perte, traitée par l'exécuteur TESS, rendue en `f32` — exacte tant
+    // que les étages actifs sont les moteurs `f32` d'avant.
     if dop || pure_bypass.load(Ordering::Relaxed) {
         return;
     }
-    if let Ok(mut e) = eq.lock()
-        && let Some(ref mut p) = *e
-    {
-        p.process_interleaved(samples);
-        // #5215 — l'égaliseur coupé a fini son fondu et ne garde aucun
-        // préampli : on le retire, la chaîne redevient celle d'un EQ absent.
-        if p.est_neutre_au_repos() {
-            *e = None;
-        }
+    let mut large: Vec<f64> = samples.iter().map(|&x| f64::from(x)).collect();
+    appliquer_chaine_tess(
+        &mut large,
+        eq,
+        convolver,
+        crossfeed,
+        pure_bypass,
+        mono_downmix,
+        channels,
+        dop,
+    );
+    for (d, s) in samples.iter_mut().zip(&large) {
+        *d = *s as f32;
     }
-    if let Ok(mut conv) = convolver.lock()
-        && let Some(ref mut c) = *conv
-    {
-        c.process_interleaved(samples);
-    }
-    // Crossfeed is a headphone (local DAC) effect and only makes sense on a
-    // stereo stream — the difference-based algorithm needs L/R pairs.
-    if channels == 2
-        && let Ok(mut cf) = crossfeed.lock()
-        && let Some(ref mut c) = *cf
-    {
-        c.process_interleaved(samples);
-    }
-    // Repli mono EN DERNIER (#2362) : les trois traitements ci-dessus ont tous
-    // besoin de leur contexte stéréo — le crossfeed travaille sur la
-    // DIFFÉRENCE des voies et n'aurait plus rien à traiter après la somme, le
-    // convolveur applique une IR par canal, l'égaliseur des gains par canal.
-    // La duplication tombe donc juste avant l'adaptation au périphérique.
-    if channels == 2 && mono_downmix.load(Ordering::Relaxed) {
-        crate::audio::channels::fold_stereo_to_mono_in_place(samples);
+}
+
+/// TESS T03 — la chaîne DSP locale en `f64` (`samples` entrelacés, pleine
+/// échelle ±1,0) : égaliseur, convolveur (RI), crossfeed et natifs tiers
+/// (stéréo seulement), puis repli mono EN DERNIER (#2362 : les trois
+/// traitements d'avant ont tous besoin de leur contexte stéréo). L'ordre est
+/// celui de [`OrdreLocal`] ; rien sous DoP ni en PURE.
+#[allow(clippy::too_many_arguments)]
+fn appliquer_chaine_tess(
+    samples: &mut [f64],
+    eq: &std::sync::Mutex<Option<crate::audio::eq::EqProcessor>>,
+    convolver: &std::sync::Mutex<Option<crate::audio::convolver::Convolver>>,
+    crossfeed: &std::sync::Mutex<Option<crate::audio::crossfeed::CrossfeedProcessor>>,
+    pure_bypass: &AtomicBool,
+    mono_downmix: &AtomicBool,
+    channels: u16,
+    dop: bool,
+) {
+    let moteurs = MoteursLocaux {
+        eq: Some(eq),
+        convolver,
+        crossfeed,
+        pure_bypass,
+        mono_downmix,
+    };
+    executer_chaine_locale(samples, &moteurs, OrdreLocal::HISTORIQUE, channels, dop);
+}
+
+/// TESS T03 — octets PCM → `f64`, sans perte à toutes les profondeurs (un mot
+/// 32 bits garde ses 32 bits, qu'un `f32` arrondissait à 24). Même
+/// sémantique de `bit_depth` que [`pcm_bytes_to_f32`].
+fn pcm_bytes_to_f64(bytes: &[u8], bit_depth: u16) -> Vec<f64> {
+    match bit_depth {
+        0 => bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f64::from(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+            .collect(),
+        24 => bytes
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .map(|c| {
+                let sample =
+                    ((c[0] as i32) | ((c[1] as i32) << 8) | ((c[2] as i32) << 16)) << 8 >> 8;
+                f64::from(sample) / 8_388_608.0
+            })
+            .collect(),
+        32 => bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f64::from(i32::from_le_bytes([c[0], c[1], c[2], c[3]])) / 2_147_483_648.0)
+            .collect(),
+        // 16 bits, et le repli de `pcm_bytes_to_f32` pour une profondeur inconnue.
+        _ => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| f64::from(i16::from_le_bytes([c[0], c[1]])) / 32_768.0)
+            .collect(),
     }
 }
 
@@ -4673,6 +4718,10 @@ fn apply_local_dsp(
 ///   - 24: signed 24-bit little-endian integer (3 bytes per sample)
 ///   - 32: signed 32-bit little-endian integer
 ///   -  0: IEEE 754 32-bit float (already in [-1, 1] range)
+///
+/// TESS T03 : le producteur décode désormais en `f64` ([`pcm_bytes_to_f64`]) ;
+/// il ne reste que le reliquat des bras natifs (`etage_natif`) et les témoins.
+#[cfg(any(target_os = "windows", target_os = "linux", test))]
 fn pcm_bytes_to_f32(bytes: &[u8], bit_depth: u16) -> Vec<f32> {
     match bit_depth {
         0 => {
@@ -5190,9 +5239,12 @@ fn prepare_windows_native_pcm(
     let samples = if bit_perfect {
         pcm_bytes_to_native_i32(bytes, bit_depth)
     } else {
-        let mut float = pcm_bytes_to_f32(bytes, bit_depth);
-        apply_local_dsp(
-            &mut float,
+        // TESS T03 — décodé en `f64`, traité par l'exécuteur ; la frontière
+        // `f32` reste celle de l'adaptation des voies et du volume d'avant
+        // (quantification unique depuis le `f64` : suite de T03 et T07).
+        let mut large = pcm_bytes_to_f64(bytes, bit_depth);
+        appliquer_chaine_tess(
+            &mut large,
             eq,
             convolver,
             crossfeed,
@@ -5201,6 +5253,7 @@ fn prepare_windows_native_pcm(
             channels,
             false,
         );
+        let mut float = frontiere_f32(&large);
         if canaux_adaptes {
             float = adapter_les_voies_natives(
                 float,
