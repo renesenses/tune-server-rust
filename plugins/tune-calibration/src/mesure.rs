@@ -39,7 +39,7 @@ use tune_calibration::level::{LevelDecision, LevelPolicy, ProbeResult, peak_dbfs
 use tune_calibration::mic_cal::MicCalibration;
 use tune_calibration::{MeasurementSpec, analyse_capture};
 use tune_entree_audio::peripheriques::Peripheriques;
-use tune_entree_audio::tampon::CaptureVersTampon;
+use tune_entree_audio::tampon::{CaptureVersTampon, DELAI_PREMIERE_TRAME};
 
 use crate::fournisseur::FournisseurBalayage;
 use crate::generateur::{Consigne, Deroule, Emission, Plan, Voies};
@@ -65,10 +65,17 @@ pub const AVANCE_SUR_L_ECOUTE_S: f64 = 0.3;
 /// #9066 — un micro dont le compteur de trames ne bouge plus depuis ce délai
 /// est tenu pour figé (USB décroché, veille) : la mesure s'arrête tout de
 /// suite en le disant, au lieu d'attendre `delai_capture`.
-/// Même délai que `DELAI_PREMIERE_TRAME` d'entree-audio (#9070), qui couvre
-/// le micro muet DÈS l'ouverture ; celui-ci couvre le micro qui se tait EN
-/// COURS de mesure.
+///
+/// Distinct de [`DELAI_PREMIERE_TRAME`] (#9070, 4 s) : celui-là attend la
+/// PREMIÈRE trame après l'ouverture, avant toute salve, avec de la marge pour
+/// une machine lente ; celui-ci juge un micro qui a déjà capté et se tait EN
+/// COURS de mesure, pendant que la zone joue au volume de mesure — d'où un
+/// délai plus court.
 pub const MICRO_FIGE: Duration = Duration::from_secs(2);
+
+/// #9066 — le code stable de [`Avancement::code`] pour un micro figé : le web
+/// le traduit (web#3219), comme `micro_muet` (#9070).
+pub const CODE_MICRO_FIGE: &str = "micro_fige";
 
 /// #9066 — la sortie de ce type pousse le son par le réseau (ou par un
 /// lecteur distant) : sa latence propre — tampon du renderer, 2 s fixes
@@ -262,9 +269,19 @@ pub struct Avancement {
     /// Trames jouées sur la longueur maximale promise : la barre de l'écran.
     pub progression: f64,
     pub avertissements: Vec<String>,
+    /// #9070 — le code stable d'une erreur que l'écran traduit
+    /// (`micro_muet`) ; absent sinon.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<&'static str>,
+    /// #9070 — l'identifiant exact du micro ouvert (`alsa:hw:CARD=…`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peripherique: Option<String>,
 }
 
 struct Interne {
+    /// #9070 — voir [`Avancement::code`] et [`Avancement::peripherique`].
+    code: Option<&'static str>,
+    peripherique: Option<String>,
     etat: Etat,
     salves: Vec<Salve>,
     avertissements: Vec<String>,
@@ -322,6 +339,8 @@ impl Mesure {
             depuis_s: self.debut.elapsed().as_secs_f64(),
             progression: (self.deroule.trames_rendues() as f64 / max).min(1.0),
             avertissements: i.avertissements.clone(),
+            code: i.code,
+            peripherique: i.peripherique.clone(),
         }
     }
 
@@ -344,6 +363,9 @@ pub struct Controleur {
     /// Vitesse du temps dans les essais : les attentes de capture sont en
     /// trames, pas en secondes ; ce délai borne seulement l'attente.
     pub delai_capture: Duration,
+    /// #9070 — attente maximale de la première trame du micro, avant que la
+    /// zone ne joue quoi que ce soit.
+    pub delai_premiere_trame: Duration,
     /// Les simulations de pièce sans micro (C5), gardées en mémoire.
     pub simulations: crate::modes::Magasin,
 }
@@ -364,6 +386,7 @@ impl Controleur {
             compteur: AtomicU64::new(0),
             delai_ouverture: Duration::from_secs(20),
             delai_capture: Duration::from_secs(60),
+            delai_premiere_trame: DELAI_PREMIERE_TRAME,
             simulations: Default::default(),
         })
     }
@@ -497,6 +520,8 @@ impl Controleur {
             deroule: deroule.clone(),
             debut: Instant::now(),
             interne: Mutex::new(Interne {
+                code: None,
+                peripherique: None,
                 etat: Etat::Preparation,
                 salves: Vec::new(),
                 avertissements: Vec::new(),
@@ -571,6 +596,15 @@ impl Controleur {
         let duree_max_s = deroule.plan.duree_max_ms() as f64 / 1000.0 + 30.0;
         let capture = CaptureVersTampon::demarrer(&self.peripheriques, &d.entree, duree_max_s)
             .map_err(Sortie::Erreur)?;
+        mesure.verrou().peripherique = Some(capture.peripherique().to_string());
+        // #9070 (fil 2770) — un micro ouvert qui ne remet aucune trame échoue
+        // ici, en quatre secondes et en nommant le PCM, avant toute salve : il
+        // attendait une minute pour finir en « 0 trames sur 216000 ».
+        if let Err(sans) = capture.attendre_la_premiere_trame(self.delai_premiere_trame) {
+            capture.arreter();
+            mesure.verrou().code = sans.code();
+            return Err(Sortie::Erreur(sans.to_string()));
+        }
         let zone = ZoneTenue::prendre(
             self.hote.clone(),
             d.zone_id,
@@ -801,11 +835,17 @@ impl Controleur {
         }
     }
 
-    /// #9066 — l'erreur « micro figé », qui nomme le micro. Le code stable
-    /// `micro_fige` (traduit par web#3219) se posera sur `Avancement::code`
-    /// une fois #9081 (#9070) fusionnée : c'est elle qui ajoute ce champ.
+    /// #9066 — l'erreur « micro figé », qui nomme le micro, avec son code
+    /// stable et le périphérique ouvert (#9070 : `Avancement::code` et
+    /// `peripherique`). Le périphérique exact est posé à l'ouverture de la
+    /// capture ; l'entrée demandée ne sert que s'il manque.
     fn erreur_micro_fige(&self, mesure: &Mesure) -> Sortie {
         let entree = mesure.demande.entree.as_str();
+        {
+            let mut i = mesure.verrou();
+            i.code = Some(CODE_MICRO_FIGE);
+            i.peripherique.get_or_insert_with(|| entree.to_string());
+        }
         Sortie::Erreur(format!(
             "le micro « {entree} » ne capte plus (débranché ou en veille ?) : \
              aucune trame depuis {} s, mesure arrêtée",

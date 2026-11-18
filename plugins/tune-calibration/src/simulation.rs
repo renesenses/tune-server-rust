@@ -24,7 +24,7 @@
 
 use std::collections::VecDeque;
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -124,6 +124,8 @@ pub struct Boucle {
     /// rien, sans erreur.
     pub fige: AtomicBool,
     piece: Mutex<PieceEnDirect>,
+    /// QA 18/11 — les pompes de la zone en cours (voir [`Boucle::capter_bloc`]).
+    pompes: AtomicUsize,
     /// Vitesse du temps simulé (1 = temps réel).
     pub vitesse: f64,
 }
@@ -145,6 +147,7 @@ impl Boucle {
             capacite: capacite.max(1),
             fige: AtomicBool::new(false),
             piece: Mutex::new(piece),
+            pompes: AtomicUsize::new(0),
             vitesse,
         })
     }
@@ -168,13 +171,46 @@ impl Boucle {
     }
 
     /// `n` échantillons captés : ce qui a été joué, ou du silence, à travers
-    /// la pièce.
-    fn capter(&self, n: usize) -> Vec<f64> {
+    /// la pièce — ou `None` tant qu'une zone JOUE et n'a pas encore déposé
+    /// `n` échantillons.
+    ///
+    /// QA 18/11 (test instable `une_piece_simulee_est_mesuree_de_bout_en_bout`,
+    /// « retard 92 ms » en CI le 16/11) : le temps simulé est celui du micro,
+    /// mais la pompe de la zone tourne en temps RÉEL. Une pompe retardée par
+    /// l'ordonnanceur laissait la boucle vide ; le micro captait alors du
+    /// silence et le temps simulé avançait sans signal — 10 ms de retard réel
+    /// coûtaient 80 ms simulées à la vitesse 8, ajoutées au retard mesuré.
+    /// Une vraie sortie ne « saute » pas d'échantillons : tant qu'une zone
+    /// joue, le micro attend ses échantillons au lieu d'inventer du silence.
+    /// La latence vue par la mesure ne dépend plus que de [`FILE_MAX`].
+    fn capter_bloc(&self, n: usize) -> Option<Vec<f64>> {
         let mut j = self.joue.lock().unwrap();
+        if j.len() < n && self.pompes.load(Ordering::SeqCst) > 0 {
+            return None;
+        }
         let mut p = self.piece.lock().unwrap();
-        (0..n)
-            .map(|_| p.traverser(j.pop_front().unwrap_or(0.0)))
-            .collect()
+        Some(
+            (0..n)
+                .map(|_| p.traverser(j.pop_front().unwrap_or(0.0)))
+                .collect(),
+        )
+    }
+}
+
+/// Une pompe de zone comptée dans [`Boucle::pompes`] tant qu'elle vit (fin
+/// du flux, arrêt ou panique : le compte redescend toujours).
+struct PompeEnCours(Arc<Boucle>);
+
+impl PompeEnCours {
+    fn compter(boucle: Arc<Boucle>) -> Self {
+        boucle.pompes.fetch_add(1, Ordering::SeqCst);
+        Self(boucle)
+    }
+}
+
+impl Drop for PompeEnCours {
+    fn drop(&mut self) {
+        self.0.pompes.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -244,7 +280,12 @@ impl Peripheriques for MicroSimule {
                     std::thread::sleep(pause);
                     continue;
                 }
-                let captes = boucle.capter(par_bloc);
+                let Some(captes) = boucle.capter_bloc(par_bloc) else {
+                    // La zone joue mais n'a pas encore rempli le bloc : le
+                    // temps simulé n'avance pas (voir `capter_bloc`).
+                    std::thread::sleep(Duration::from_micros(50));
+                    continue;
+                };
                 let mut o = Vec::with_capacity(par_bloc * 6);
                 let mut crete = 0.0f32;
                 for x in &captes {
@@ -268,6 +309,7 @@ impl Peripheriques for MicroSimule {
             }
         });
         Ok(CaptureDemarree {
+            id: format!("simule:{nom}"),
             nom,
             format: f,
             arret: Box::new(ArretSimule(vivant)),
@@ -411,6 +453,9 @@ impl HoteZone for HoteSimule {
         let vivant = self.pompe_vivante.clone();
         vivant.store(true, Ordering::SeqCst);
         let boucle = self.boucle.clone();
+        // Compté AVANT le départ du fil : le micro attend la zone dès qu'elle
+        // est censée jouer, même si le fil n'est pas encore ordonnancé.
+        let pompe = PompeEnCours::compter(boucle.clone());
         if let Some(chemin) = self.chemin {
             // La vraie pompe, dans un canal borné comme celui de la session ;
             // la « sortie » le vide dans son tampon au rythme du micro.
@@ -423,6 +468,8 @@ impl HoteZone for HoteSimule {
                 })
             });
             std::thread::spawn(move || {
+                // C'est la « sortie » qui dépose : elle tient la pompe comptée.
+                let _pompe = pompe;
                 let mut reste: Vec<u8> = Vec::new();
                 while let Ok(t) = rx.recv() {
                     if !vivant.load(Ordering::SeqCst) {
@@ -441,6 +488,7 @@ impl HoteZone for HoteSimule {
             return Ok(());
         }
         std::thread::spawn(move || {
+            let _pompe = pompe;
             let mut buf = vec![0u8; par_trame * 480];
             let mut echantillons = Vec::with_capacity(480);
             while vivant.load(Ordering::SeqCst) {
