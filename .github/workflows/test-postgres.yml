@@ -260,6 +260,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7974 -- --nocapture --test-threads=1
 
+      # #9028 — « Normal pour les N pistes de cet album » : une ligne par
+      # piste dans une transaction (tout ou rien), annulation exacte, filtre
+      # d'une piste CUE, sur un vrai PostgreSQL. Sans cette étape, l'épreuve
+      # prendrait son saut annoncé.
+      - name: Geste groupé des alertes douteuses sur PostgreSQL (#9028)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_9028 -- --nocapture --test-threads=1
+
       # #8088 — contrôle parental : `tracks.explicit` (PG 107) sur une VRAIE
       # base : écrit, relu, gardé hors scan, retiré par le scan, marques des
       # pistes et albums, index partiel. Le témoin vide `tracks` : il tourne

@@ -11,22 +11,21 @@
 //!   l'album (titre, dossier), les pistes qui portent encore l'alerte, et la
 //!   portée qui sera retenue. Lecture seule.
 //! * `POST /metadata/doubtful/ignored/album`
-//!   `{"album_id": 12, "reason": "very_short", "track_ids": [..]}` — marque
-//!   l'alerte normale. `track_ids` (facultatif) : les pistes que l'écran a
-//!   montrées ; le serveur VÉRIFIE que chacune est de l'album et porte
-//!   l'alerte (400 sinon, rien n'est écrit).
-//!   - toutes les pistes de l'album qui portent l'alerte (ou pas de
-//!     `track_ids`) : UNE ligne de portée `album` (dossier + titre, la clé
-//!     stable de #8958, que le filtre SQL sait déjà lire) ;
-//!   - une partie seulement, ou un album sans dossier exploitable : une ligne
-//!     par piste — le geste ne couvre jamais plus que ce que l'écran a montré.
-//!
-//!   Rejoué, il ne change rien (`added: 0`).
-//! * `DELETE /metadata/doubtful/ignored/album` `{"album_id": 12, "reason": "very_short"}`
-//!   — « ne plus considérer comme normal » pour l'album : retire TOUS les
-//!   choix de cette raison qui couvrent une piste de l'album (ligne d'album,
-//!   lignes de pistes posées une à une ou par le repli ci-dessus). Rejoué :
-//!   `removed: 0`, pas d'erreur.
+//!   `{"album_id": 12, "reason": "very_short", "track_ids": [2, 3, 4]}` —
+//!   marque l'alerte normale pour CES pistes : celles que l'aperçu a montrées.
+//!   Le serveur VÉRIFIE que chacune est de l'album et porte l'alerte (400
+//!   sinon, rien n'est écrit), puis écrit UNE LIGNE PAR PISTE, dans une
+//!   transaction. 🔴 Jamais de ligne de portée `album` pour ce geste : sa clé
+//!   (dossier commun + titre) couvrirait aussi une piste ajoutée plus tard,
+//!   un homonyme du même dossier (compilation à plat, image CUE sans TITLE),
+//!   tout un dossier très large après une fusion — or le testeur n'a accepté
+//!   le geste QUE pour les pistes affichées. La réponse rend les clés des
+//!   lignes réellement AJOUTÉES (`added_keys`) : ce sont elles, et elles
+//!   seules, que l'annulation retire. Rejoué : `added: 0`, `added_keys: []`.
+//! * `DELETE /metadata/doubtful/ignored/album` `{"keys": [{scope, key, title, reason}, …]}`
+//!   — annule le geste : retire exactement ces lignes (celles que le POST a
+//!   ajoutées), dans une transaction. Un choix fait piste par piste avant le
+//!   geste n'en fait pas partie et reste. Rejoué : `removed: 0`.
 //!
 //! Les écritures sont réservées à l'administrateur, comme le reste de #8958.
 //! Aucune table nouvelle : `alertes_douteuses_ignorees`, SQLite et
@@ -128,19 +127,27 @@ pub(super) async fn apercu(
         Ok(v) => v,
         Err(r) => return r,
     };
-    let deja = ignorees::lister(&state.backend).unwrap_or_default();
+    // Une lecture en échec ne se maquille pas en « rien d'ignoré ».
+    let deja = match ignorees::lister(&state.backend) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "alertes_ignorees_lecture");
+            return erreur(StatusCode::INTERNAL_SERVER_ERROR, e);
+        }
+    };
     let (couvertes, a_marquer): (Vec<&Track>, Vec<&Track>) = signalees(&pistes, &p.reason)
         .into_iter()
         .partition(|t| deja.iter().any(|a| a.couvre(t, &p.reason)));
-    let album = ignorees::alerte_de_l_album(&pistes, &p.reason, 0);
     Json(json!({
         "album_id": p.album_id,
         "album_title": pistes[0].album_title,
         "reason": p.reason,
-        // Où le choix sera mémorisé pour l'album entier : `album` (dossier +
-        // titre), ou `track` (une ligne par piste) faute de dossier.
-        "scope": album.as_ref().map(|a| a.portee).unwrap_or(Portee::Piste).as_str(),
-        "folder": album.as_ref().map(|a| a.cle.clone()),
+        // Le geste groupé n'écrit que des lignes de pistes.
+        "scope": Portee::Piste.as_str(),
+        // Affichage seulement : où sont les pistes de l'album.
+        "folder": ignorees::dossier_commun(pistes.iter().filter_map(|t| {
+            t.file_path.as_deref().filter(|c| !c.is_empty()).or(t.cue_media_path.as_deref())
+        })),
         "tracks": a_marquer.iter().map(|t| decrire_piste(t)).collect::<Vec<_>>(),
         "total": a_marquer.len(),
         "ignored_count": couvertes.len(),
@@ -152,8 +159,11 @@ pub(super) async fn apercu(
 pub(super) struct DemandeAlbum {
     album_id: i64,
     reason: String,
-    #[serde(default)]
-    track_ids: Option<Vec<i64>>,
+    track_ids: Vec<i64>,
+}
+
+fn cle_json(a: &AlerteIgnoree) -> Value {
+    json!({"scope": a.portee.as_str(), "key": a.cle, "title": a.titre, "reason": a.raison})
 }
 
 pub(super) async fn ignorer(
@@ -169,89 +179,79 @@ pub(super) async fn ignorer(
         Err(r) => return r,
     };
     let concernees = signalees(&pistes, &d.reason);
-    if concernees.is_empty() {
-        return erreur(
-            StatusCode::BAD_REQUEST,
-            format!("reason does not apply to this album: {}", d.reason),
-        );
-    }
     let toutes: BTreeSet<i64> = concernees.iter().filter_map(|t| t.id).collect();
-    let choisies: Vec<&Track> = match &d.track_ids {
-        None => concernees.clone(),
-        Some(ids) => {
-            let refusees: Vec<i64> = ids
-                .iter()
-                .copied()
-                .filter(|id| !toutes.contains(id))
-                .collect();
-            if !refusees.is_empty() || ids.is_empty() {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({
-                        "error": "track_ids must be tracks of this album flagged with this reason",
-                        "invalid_track_ids": refusees,
-                    })),
-                )
-                    .into_response();
-            }
-            let ids: BTreeSet<i64> = ids.iter().copied().collect();
-            concernees
-                .iter()
-                .copied()
-                .filter(|t| t.id.is_some_and(|id| ids.contains(&id)))
-                .collect()
-        }
-    };
+    let refusees: Vec<i64> = d
+        .track_ids
+        .iter()
+        .copied()
+        .filter(|id| !toutes.contains(id))
+        .collect();
+    if d.track_ids.is_empty() || !refusees.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "track_ids must be tracks of this album flagged with this reason",
+                "invalid_track_ids": refusees,
+            })),
+        )
+            .into_response();
+    }
+    let ids: BTreeSet<i64> = d.track_ids.iter().copied().collect();
+    let choisies: Vec<&Track> = concernees
+        .into_iter()
+        .filter(|t| t.id.is_some_and(|id| ids.contains(&id)))
+        .collect();
     let maintenant = maintenant();
-    let tout_l_album = choisies.len() == concernees.len();
-    let lignes: Vec<AlerteIgnoree> = match tout_l_album
-        .then(|| ignorees::alerte_de_l_album(&pistes, &d.reason, maintenant))
-        .flatten()
-    {
-        Some(a) => vec![a],
-        None => choisies
-            .iter()
-            .filter_map(|t| ignorees::alerte_de_la_piste(t, &d.reason, maintenant))
-            .collect(),
-    };
-    if lignes.is_empty() {
+    let lignes: Vec<AlerteIgnoree> = choisies
+        .iter()
+        .filter_map(|t| ignorees::alerte_de_la_piste(t, &d.reason, maintenant))
+        .collect();
+    if lignes.len() != choisies.len() {
         return erreur(
             StatusCode::BAD_REQUEST,
-            "tracks have no stable key (no path)",
+            "a track has no stable key (no path)",
         );
     }
-    let mut ajoutees = 0usize;
-    for a in &lignes {
-        match ignorees::ignorer(&state.backend, a) {
-            Ok(true) => ajoutees += 1,
-            Ok(false) => {}
-            Err(e) => {
-                tracing::warn!(error = %e, "alertes_ignorees_album_ecriture");
-                return erreur(StatusCode::INTERNAL_SERVER_ERROR, e);
-            }
+    let ajoutees = match ignorees::ignorer_lot(&state.backend, &lignes) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = %e, "alertes_ignorees_album_ecriture");
+            return erreur(StatusCode::INTERNAL_SERVER_ERROR, e);
         }
-    }
-    let portee = lignes[0].portee;
+    };
+    let added_keys: Vec<Value> = lignes
+        .iter()
+        .zip(&ajoutees)
+        .filter(|(_, ajoutee)| **ajoutee)
+        .map(|(a, _)| cle_json(a))
+        .collect();
     Json(json!({
         "status": "ok",
         "album_id": d.album_id,
         "reason": d.reason,
-        "scope": portee.as_str(),
-        // La clé de la ligne d'album, pour l'annulation fine (`DELETE
-        // /doubtful/ignored`) ; vide pour des lignes de pistes.
-        "key": if portee == Portee::Album { lignes[0].cle.clone() } else { String::new() },
-        "title": lignes[0].titre,
+        "scope": Portee::Piste.as_str(),
+        // Les pistes désormais couvertes (ajoutées, ou déjà normales).
         "track_ids": choisies.iter().filter_map(|t| t.id).collect::<Vec<_>>(),
         "track_count": choisies.len(),
-        "added": ajoutees,
+        // Les lignes que CE geste a ajoutées : ce que l'annulation retire.
+        "added": added_keys.len(),
+        "added_keys": added_keys,
     }))
     .into_response()
 }
 
 #[derive(Debug, Deserialize)]
-pub(super) struct AnnulationAlbum {
-    album_id: i64,
+pub(super) struct CleAnnulee {
+    scope: String,
+    key: String,
+    #[serde(default)]
+    title: String,
     reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct AnnulationAlbum {
+    keys: Vec<CleAnnulee>,
 }
 
 pub(super) async fn retablir(
@@ -259,33 +259,21 @@ pub(super) async fn retablir(
     State(state): State<AppState>,
     Json(d): Json<AnnulationAlbum>,
 ) -> impl IntoResponse {
-    if let Err(r) = raison_valide(&d.reason) {
-        return r;
+    let mut lot = Vec::with_capacity(d.keys.len());
+    for k in d.keys {
+        let Some(portee) = Portee::depuis(&k.scope) else {
+            return erreur(
+                StatusCode::BAD_REQUEST,
+                format!("unknown scope: {}", k.scope),
+            );
+        };
+        lot.push((portee, k.key, k.title, k.reason));
     }
-    let pistes = match pistes_de_l_album(&state, d.album_id) {
-        Ok(v) => v,
-        Err(r) => return r,
-    };
-    let deja = match ignorees::lister(&state.backend) {
-        Ok(v) => v,
-        Err(e) => return erreur(StatusCode::INTERNAL_SERVER_ERROR, e),
-    };
-    // Tout choix de cette raison qui couvre une piste de l'album, qu'il
-    // porte sur l'album ou sur une piste.
-    let mut retirees = 0usize;
-    for a in deja
-        .iter()
-        .filter(|a| pistes.iter().any(|t| a.couvre(t, &d.reason)))
-    {
-        match ignorees::retablir(&state.backend, a.portee, &a.cle, &a.titre, &a.raison) {
-            Ok(true) => retirees += 1,
-            Ok(false) => {}
-            Err(e) => {
-                tracing::warn!(error = %e, "alertes_ignorees_album_ecriture");
-                return erreur(StatusCode::INTERNAL_SERVER_ERROR, e);
-            }
+    match ignorees::retablir_lot(&state.backend, &lot) {
+        Ok(n) => Json(json!({"status": "ok", "removed": n})).into_response(),
+        Err(e) => {
+            tracing::warn!(error = %e, "alertes_ignorees_album_ecriture");
+            erreur(StatusCode::INTERNAL_SERVER_ERROR, e)
         }
     }
-    Json(json!({"status": "ok", "album_id": d.album_id, "reason": d.reason, "removed": retirees}))
-        .into_response()
 }

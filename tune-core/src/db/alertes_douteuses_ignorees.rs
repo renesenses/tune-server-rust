@@ -278,8 +278,10 @@ pub fn alerte_pour(
 }
 
 /// #9028 — l'alerte `raison` mémorisée pour la PISTE seule, quelle que soit
-/// sa nature (le geste groupé sur une partie d'un album, ou un album sans
-/// dossier exploitable). `None` quand la piste n'a pas de clé stable.
+/// sa nature : le geste groupé « Normal pour les N pistes de cet album »
+/// n'écrit QUE des lignes de pistes, pour ne couvrir que les pistes montrées
+/// (jamais une piste ajoutée ensuite, ni un homonyme du même dossier). `None`
+/// quand la piste n'a pas de clé stable.
 pub fn alerte_de_la_piste(t: &Track, raison: &str, maintenant: i64) -> Option<AlerteIgnoree> {
     Some(AlerteIgnoree {
         portee: Portee::Piste,
@@ -288,38 +290,6 @@ pub fn alerte_de_la_piste(t: &Track, raison: &str, maintenant: i64) -> Option<Al
         raison: raison.to_string(),
         cible_id: t.id,
         libelle: Some(t.title.clone()),
-        ignoree_le: maintenant,
-    })
-}
-
-/// #9028 — l'alerte `raison` mémorisée pour TOUT l'album dont `pistes` sont
-/// les pistes (toutes, pas seulement les signalées : le dossier de l'album
-/// est celui de toutes ses pistes, comme pour [`alerte_pour`]), quelle que
-/// soit la nature de l'alerte. `None` quand l'album n'a pas de titre, que
-/// les pistes ne sont pas toutes du même album, ou qu'il n'a pas de dossier
-/// exploitable (racine) : l'appelant se rabat alors sur
-/// [`alerte_de_la_piste`].
-pub fn alerte_de_l_album(pistes: &[Track], raison: &str, maintenant: i64) -> Option<AlerteIgnoree> {
-    let premiere = pistes.first()?;
-    let album_id = premiere.album_id.filter(|id| *id > 0)?;
-    let titre = premiere
-        .album_title
-        .clone()
-        .filter(|t| !t.trim().is_empty())?;
-    if pistes
-        .iter()
-        .any(|t| t.album_id != Some(album_id) || t.album_title.as_deref() != Some(titre.as_str()))
-    {
-        return None;
-    }
-    let cle = dossier_commun(pistes.iter().filter_map(chemin))?;
-    Some(AlerteIgnoree {
-        portee: Portee::Album,
-        cle,
-        titre: titre.clone(),
-        raison: raison.to_string(),
-        cible_id: Some(album_id),
-        libelle: Some(titre),
         ignoree_le: maintenant,
     })
 }
@@ -361,6 +331,58 @@ pub fn retablir(
         &[&portee as &dyn ToSqlValue, &cle, &titre, &raison],
     )
     .map(|n| n > 0)
+}
+
+/// #9028 — [`ignorer`] pour plusieurs alertes, dans UNE transaction : tout
+/// ou rien. Rend, dans l'ordre, si chaque ligne a été ajoutée (faux : elle
+/// existait déjà).
+pub fn ignorer_lot(db: &Arc<dyn DbBackend>, lot: &[AlerteIgnoree]) -> Result<Vec<bool>, String> {
+    let mut ajoutees = Vec::with_capacity(lot.len());
+    db.write_tx(&mut |tx| {
+        ajoutees.clear();
+        for a in lot {
+            let portee = a.portee.as_str();
+            let n = tx.execute(
+                "INSERT INTO alertes_douteuses_ignorees \
+                 (portee, cle, titre, raison, cible_id, libelle, ignoree_le) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (portee, cle, titre, raison) DO NOTHING",
+                &[
+                    &portee as &dyn ToSqlValue,
+                    &a.cle,
+                    &a.titre,
+                    &a.raison,
+                    &a.cible_id,
+                    &a.libelle,
+                    &a.ignoree_le,
+                ],
+            )?;
+            ajoutees.push(n > 0);
+        }
+        Ok(())
+    })?;
+    Ok(ajoutees)
+}
+
+/// #9028 — [`retablir`] pour plusieurs choix `(portée, clé, titre, raison)`,
+/// dans UNE transaction. Rend le nombre de lignes retirées.
+pub fn retablir_lot(
+    db: &Arc<dyn DbBackend>,
+    lot: &[(Portee, String, String, String)],
+) -> Result<usize, String> {
+    let mut retirees = 0usize;
+    db.write_tx(&mut |tx| {
+        retirees = 0;
+        for (portee, cle, titre, raison) in lot {
+            let portee = portee.as_str();
+            retirees += tx.execute(
+                "DELETE FROM alertes_douteuses_ignorees \
+                 WHERE portee = ? AND cle = ? AND titre = ? AND raison = ?",
+                &[&portee as &dyn ToSqlValue, cle, titre, raison],
+            )?;
+        }
+        Ok(())
+    })?;
+    Ok(retirees)
 }
 
 /// Toutes les alertes ignorées, les plus récentes d'abord.
@@ -414,6 +436,10 @@ pub fn purger_en_fin_de_scan(db: &Arc<dyn DbBackend>, scan_complet_sain: bool, o
         Err(e) => tracing::warn!(error = %e, origine, "alertes_douteuses_ignorees_purge_echec"),
     }
 }
+
+#[cfg(test)]
+#[path = "alertes_douteuses_ignorees_tests_9028.rs"]
+mod tests_9028;
 
 #[cfg(test)]
 mod tests {

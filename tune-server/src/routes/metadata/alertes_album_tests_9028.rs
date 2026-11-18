@@ -143,7 +143,10 @@ async fn l_apercu_liste_les_pistes_de_l_album() {
     .await;
     assert_eq!(code, StatusCode::OK, "{a}");
     assert_eq!(a["album_title"], "Everyday Life");
-    assert_eq!(a["scope"], "album");
+    assert_eq!(
+        a["scope"], "track",
+        "le geste groupé n'écrit que des pistes"
+    );
     assert_eq!(a["folder"], "/m/Coldplay/Everyday Life");
     assert_eq!(a["total"], 3, "{a}");
     let ids: Vec<i64> = a["tracks"]
@@ -160,10 +163,28 @@ async fn l_apercu_liste_les_pistes_de_l_album() {
     assert_eq!(a["ignored_count"], 0);
 }
 
-/// 🔴 Le geste : UNE ligne d'album couvre les trois pistes cachées, et
-/// seulement elles ; rejoué, il ne change rien ; il tient au rescan complet.
+/// Une lecture en échec ne se maquille pas en « rien d'ignoré ».
 #[tokio::test]
-async fn un_geste_pour_tout_l_album() {
+async fn l_apercu_ne_masque_pas_une_erreur_de_lecture() {
+    let state = etat();
+    state
+        .backend
+        .execute("DROP TABLE alertes_douteuses_ignorees", &[])
+        .unwrap();
+    let (code, a) = route(
+        &state,
+        "GET",
+        "/doubtful/album?album_id=1&reason=very_short",
+        "",
+    )
+    .await;
+    assert_eq!(code, StatusCode::INTERNAL_SERVER_ERROR, "{a}");
+}
+
+/// 🔴 Le geste : UNE LIGNE PAR PISTE montrée ; rejoué, rien ; tient au
+/// rescan complet (clé CUE `image#début`).
+#[tokio::test]
+async fn un_geste_ecrit_une_ligne_par_piste() {
     let state = etat();
     assert_eq!(courtes(&state).await, vec![2, 3, 4, 5, 6, 7]);
     let (code, r) = marquer(
@@ -172,11 +193,26 @@ async fn un_geste_pour_tout_l_album() {
     )
     .await;
     assert_eq!(code, StatusCode::OK, "{r}");
-    assert_eq!(r["scope"], "album");
-    assert_eq!(r["key"], "/m/Coldplay/Everyday Life");
-    assert_eq!(r["title"], "Everyday Life");
+    assert_eq!(r["scope"], "track");
     assert_eq!(r["track_count"], 3);
-    assert_eq!(r["added"], 1);
+    assert_eq!(r["added"], 3);
+    let cles: Vec<&str> = r["added_keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|k| {
+            assert_eq!(k["scope"], "track", "{k}");
+            k["key"].as_str().unwrap()
+        })
+        .collect();
+    assert_eq!(
+        cles,
+        vec![
+            format!("{IMAGE}#240000"),
+            format!("{IMAGE}#243000"),
+            format!("{IMAGE}#246000")
+        ]
+    );
     assert_eq!(
         courtes(&state).await,
         vec![5, 6, 7],
@@ -189,9 +225,17 @@ async fn un_geste_pour_tout_l_album() {
     )
     .await;
     assert_eq!(r["added"], 0, "rejoué : rien de plus : {r}");
+    assert_eq!(r["added_keys"], serde_json::json!([]));
+    assert_eq!(r["track_count"], 3);
     let (_, l) = route(&state, "GET", "/doubtful/ignored", "").await;
-    assert_eq!(l["total"], 1, "{l}");
-    assert_eq!(l["items"][0]["scope"], "album");
+    assert_eq!(l["total"], 3, "{l}");
+    assert!(
+        l["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|i| i["scope"] == "track")
+    );
 
     let (_, a) = route(
         &state,
@@ -203,16 +247,48 @@ async fn un_geste_pour_tout_l_album() {
     assert_eq!(a["total"], 0, "{a}");
     assert_eq!(a["ignored_count"], 3, "{a}");
 
-    // Rescan complet : nouveaux ids, même clé (dossier + titre).
     state.backend.execute("DELETE FROM tracks", &[]).unwrap();
     state.backend.execute("DELETE FROM albums", &[]).unwrap();
     poser(&state, 100);
     assert_eq!(courtes(&state).await, vec![105, 106, 107]);
 }
 
-/// Une partie seulement des pistes : une ligne par piste, jamais l'album.
+/// 🔴 Ne couvrir QUE les pistes montrées : une piste ajoutée ensuite au même
+/// album, ou un autre album de même titre dans le même dossier (image CUE
+/// sans TITLE, compilation à plat), restent signalées.
 #[tokio::test]
-async fn une_partie_de_l_album_reste_piste_par_piste() {
+async fn rien_au_dela_des_pistes_montrees() {
+    let state = etat();
+    marquer(
+        &state,
+        r#"{"album_id":1,"reason":"very_short","track_ids":[2,3,4]}"#,
+    )
+    .await;
+    let b = &state.backend;
+    b.execute(
+        "INSERT INTO tracks (id, title, artist_id, album_id, duration_ms, source, \
+         file_path, cue_media_path, cue_start_ms) \
+         VALUES (8, 'ajoutée', 1, 1, 3000, 'local', NULL, ?1, 249000)",
+        &[&IMAGE as &dyn ToSqlValue],
+    )
+    .unwrap();
+    b.execute(
+        "INSERT INTO albums (id, title) VALUES (4, 'Everyday Life')",
+        &[],
+    )
+    .unwrap();
+    b.execute(
+        "INSERT INTO tracks (id, title, artist_id, album_id, duration_ms, source, file_path) \
+         VALUES (9, 'homonyme', 1, 4, 2000, 'local', '/m/Coldplay/Everyday Life/bonus.flac')",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(courtes(&state).await, vec![5, 6, 7, 8, 9]);
+}
+
+/// Une partie seulement des pistes : ces pistes-là.
+#[tokio::test]
+async fn une_partie_de_l_album() {
     let state = etat();
     let (code, r) = marquer(
         &state,
@@ -220,14 +296,14 @@ async fn une_partie_de_l_album_reste_piste_par_piste() {
     )
     .await;
     assert_eq!(code, StatusCode::OK, "{r}");
-    assert_eq!(r["scope"], "track");
     assert_eq!(r["added"], 2);
+    assert_eq!(r["track_count"], 2);
     assert_eq!(courtes(&state).await, vec![4, 5, 6, 7]);
 }
 
-/// Album à la racine (pas de dossier exploitable) : repli piste par piste.
+/// Album à la racine : même règle, pas de dossier à afficher.
 #[tokio::test]
-async fn album_sans_dossier_repli_piste_par_piste() {
+async fn album_a_la_racine() {
     let state = etat();
     let (_, a) = route(
         &state,
@@ -236,10 +312,13 @@ async fn album_sans_dossier_repli_piste_par_piste() {
         "",
     )
     .await;
-    assert_eq!(a["scope"], "track", "{a}");
-    let (code, r) = marquer(&state, r#"{"album_id":3,"reason":"very_short"}"#).await;
+    assert_eq!(a["folder"], Value::Null, "{a}");
+    let (code, r) = marquer(
+        &state,
+        r#"{"album_id":3,"reason":"very_short","track_ids":[6,7]}"#,
+    )
+    .await;
     assert_eq!(code, StatusCode::OK, "{r}");
-    assert_eq!(r["scope"], "track");
     assert_eq!(r["added"], 2);
     assert_eq!(courtes(&state).await, vec![2, 3, 4, 5]);
 }
@@ -253,9 +332,9 @@ async fn la_liste_de_pistes_est_verifiee() {
         r#"{"album_id":1,"reason":"very_short","track_ids":[2,3,5]}"#,
         r#"{"album_id":1,"reason":"very_short","track_ids":[1,2]}"#,
         r#"{"album_id":1,"reason":"very_short","track_ids":[]}"#,
-        r#"{"album_id":1,"reason":"missing_album"}"#,
-        r#"{"album_id":1,"reason":"missing_artist"}"#,
-        r#"{"album_id":1,"reason":"mauvaise"}"#,
+        r#"{"album_id":1,"reason":"missing_album","track_ids":[2]}"#,
+        r#"{"album_id":1,"reason":"missing_artist","track_ids":[2]}"#,
+        r#"{"album_id":1,"reason":"mauvaise","track_ids":[2]}"#,
     ] {
         let (code, r) = marquer(&state, corps).await;
         assert_eq!(code, StatusCode::BAD_REQUEST, "{corps} : {r}");
@@ -266,51 +345,58 @@ async fn la_liste_de_pistes_est_verifiee() {
     )
     .await;
     assert_eq!(r["invalid_track_ids"], serde_json::json!([5]), "{r}");
-    let (code, _) = marquer(&state, r#"{"album_id":99,"reason":"very_short"}"#).await;
+    let (code, _) = marquer(&state, r#"{"album_id":1,"reason":"very_short"}"#).await;
+    assert!(code.is_client_error(), "sans track_ids : {code}");
+    let (code, _) = marquer(
+        &state,
+        r#"{"album_id":99,"reason":"very_short","track_ids":[2]}"#,
+    )
+    .await;
     assert_eq!(code, StatusCode::NOT_FOUND);
     let (_, l) = route(&state, "GET", "/doubtful/ignored", "").await;
     assert_eq!(l["total"], 0, "rien n'a été retenu : {l}");
     assert_eq!(courtes(&state).await, vec![2, 3, 4, 5, 6, 7]);
 }
 
-/// « Ne plus considérer comme normal » pour l'album : la ligne d'album ET
-/// les choix piste par piste (geste de #8958 compris) partent ; l'autre
-/// album garde les siens ; rejoué, rien à retirer.
+/// 🔴 L'annulation retire EXACTEMENT les lignes ajoutées par le geste : la
+/// piste 2, marquée seule avant, reste normale — qu'elle ait été hors du
+/// geste ou dedans (`added_keys` ne la contient alors pas).
 #[tokio::test]
-async fn annuler_pour_l_album() {
-    let state = etat();
-    marquer(&state, r#"{"album_id":1,"reason":"very_short"}"#).await;
-    let (code, r) = route(
-        &state,
-        "POST",
-        "/doubtful/ignored",
-        r#"{"track_id":2,"reason":"very_short"}"#,
-    )
-    .await;
-    assert_eq!(code, StatusCode::OK, "{r}");
-    route(
-        &state,
-        "POST",
-        "/doubtful/ignored",
-        r#"{"track_id":5,"reason":"very_short"}"#,
-    )
-    .await;
-    assert_eq!(courtes(&state).await, vec![6, 7]);
+async fn annuler_ne_retire_que_les_lignes_du_geste() {
+    for ids in ["[3,4]", "[2,3,4]"] {
+        let state = etat();
+        let (code, r) = route(
+            &state,
+            "POST",
+            "/doubtful/ignored",
+            r#"{"track_id":2,"reason":"very_short"}"#,
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK, "{r}");
+        let (_, r) = marquer(
+            &state,
+            &format!(r#"{{"album_id":1,"reason":"very_short","track_ids":{ids}}}"#),
+        )
+        .await;
+        assert_eq!(r["added"], 2, "{ids} : {r}");
+        assert_eq!(courtes(&state).await, vec![5, 6, 7]);
 
-    let (code, r) = annuler(&state, r#"{"album_id":1,"reason":"very_short"}"#).await;
-    assert_eq!(code, StatusCode::OK, "{r}");
-    assert_eq!(r["removed"], 2, "ligne d'album + piste 2 : {r}");
-    assert_eq!(courtes(&state).await, vec![2, 3, 4, 6, 7]);
-    let (_, l) = route(&state, "GET", "/doubtful/ignored", "").await;
-    assert_eq!(l["total"], 1, "le choix de l'album 2 reste : {l}");
-
-    let (code, r) = annuler(&state, r#"{"album_id":1,"reason":"very_short"}"#).await;
-    assert_eq!(code, StatusCode::OK);
-    assert_eq!(r["removed"], 0, "rejouée : {r}");
+        let corps = serde_json::json!({"keys": r["added_keys"]}).to_string();
+        let (code, a) = annuler(&state, &corps).await;
+        assert_eq!(code, StatusCode::OK, "{a}");
+        assert_eq!(a["removed"], 2, "{ids} : {a}");
+        assert_eq!(
+            courtes(&state).await,
+            vec![3, 4, 5, 6, 7],
+            "{ids} : la piste 2 reste normale"
+        );
+        let (_, a) = annuler(&state, &corps).await;
+        assert_eq!(a["removed"], 0, "rejouée : {a}");
+    }
 }
 
 /// Authentification active, sans jeton : le geste et l'annulation sont
-/// refusés ; l'aperçu reste lisible.
+/// refusés.
 #[tokio::test]
 async fn ecritures_reservees_a_l_administrateur() {
     let state = etat();
@@ -318,8 +404,11 @@ async fn ecritures_reservees_a_l_administrateur() {
         .set("auth_enabled", "true")
         .unwrap();
     for (m, corps) in [
-        ("POST", r#"{"album_id":1,"reason":"very_short"}"#),
-        ("DELETE", r#"{"album_id":1,"reason":"very_short"}"#),
+        (
+            "POST",
+            r#"{"album_id":1,"reason":"very_short","track_ids":[2]}"#,
+        ),
+        ("DELETE", r#"{"keys":[]}"#),
     ] {
         let (code, _) = route(&state, m, "/doubtful/ignored/album", corps).await;
         assert!(
