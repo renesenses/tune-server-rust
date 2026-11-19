@@ -159,21 +159,20 @@ impl Correspondance {
                 })
             }
             Mode::Values => {
-                let prefix = match self.prefix.as_deref().map(str::trim) {
-                    None | Some("") => None,
-                    Some(p) if p.chars().count() > MAX_LONGUEUR_PREFIXE => {
-                        return Err(format!(
-                            "{key} : le préfixe dépasse {MAX_LONGUEUR_PREFIXE} caractères"
-                        ));
-                    }
-                    Some(p) if p.chars().any(char::is_control) => {
-                        return Err(format!(
-                            "{key} : le préfixe contient un caractère de contrôle"
-                        ));
-                    }
-                    // L'espace finale compte : « Humeur : » + « Calme ».
-                    Some(_) => self.prefix.map(|p| p.trim_start().to_string()),
-                };
+                let brut = self.prefix.unwrap_or_default();
+                let nu = brut.trim();
+                if nu.chars().count() > MAX_LONGUEUR_PREFIXE {
+                    return Err(format!(
+                        "{key} : le préfixe dépasse {MAX_LONGUEUR_PREFIXE} caractères"
+                    ));
+                }
+                if nu.chars().any(char::is_control) {
+                    return Err(format!(
+                        "{key} : le préfixe contient un caractère de contrôle"
+                    ));
+                }
+                // L'espace finale compte : « Humeur : » + « Calme ».
+                let prefix = (!nu.is_empty()).then(|| brut.trim_start().to_string());
                 Ok(Correspondance {
                     key,
                     mode: Mode::Values,
@@ -423,13 +422,13 @@ pub fn est_cle_connue(nom: &str) -> bool {
 /// correspondance ? Rend son nom comparé, `None` pour une trame ID3 standard
 /// (`TIT2`…), un atome MP4 à quatre lettres (`©nam`…), un bloc ID3v1 ou RIFF.
 pub fn nom_utilisable(bloc: &str, cle: &str) -> Option<String> {
-    match bloc {
+    let nom = match bloc {
         "id3v2" if cle.starts_with("TXXX:") => Some(nom_de_cle(cle)),
         "mp4" if cle.starts_with("----:") => Some(nom_de_cle(cle)),
         "vorbis" | "ape" => Some(nom_de_cle(cle)),
         _ => None,
-    }
-    .filter(|n| !n.is_empty())
+    };
+    nom.filter(|n| !n.is_empty())
 }
 
 // ---------------------------------------------------------------------------
