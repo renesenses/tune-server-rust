@@ -117,7 +117,7 @@ struct HeartbeatPayload {
     /// « macOS 15.4 ») — voir [`super::plateforme`]. Rien d'identifiant.
     os_version: Option<String>,
     /// `docker`, `tune-os`, `homebrew`, `windows-installer`, `macos-app`,
-    /// `ios-app`, `package` ou `other`.
+    /// `ios-app`, `android-app`, `package` ou `other`.
     install_kind: &'static str,
     /// Modele de la carte sous Linux ARM (« Raspberry Pi 5 Model B Rev 1.0 »),
     /// `null` ailleurs.

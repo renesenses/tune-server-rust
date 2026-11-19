@@ -8,7 +8,8 @@
 //!
 //! - `os_version` : nom et version lisibles du système ;
 //! - `install_kind` : `docker`, `tune-os`, `homebrew`, `windows-installer`,
-//!   `macos-app`, `ios-app`, `package` (le `.deb`), sinon `other` ;
+//!   `macos-app`, `ios-app`, `android-app`, `package` (le `.deb`), sinon
+//!   `other` ;
 //! - `device_model` : modèle de la carte ARM sous Linux
 //!   (`/proc/device-tree/model`), absent ailleurs.
 //!
@@ -210,7 +211,9 @@ pub struct IndicesInstallation<'a> {
     pub dockerenv: bool,
     /// Contenu de `/proc/1/cgroup`.
     pub cgroup: &'a str,
-    /// Chemin de l'exécutable (jamais envoyé).
+    /// Chemin de l'exécutable, liens symboliques RÉSOLUS (jamais envoyé).
+    /// Sur macOS, `current_exe()` ne résout pas les liens : Homebrew lance
+    /// `/opt/homebrew/opt/tune-server/bin/tune-server`, lien vers le Cellar.
     pub exe: &'a str,
     /// La liste dpkg du paquet `tune-server` existe.
     pub paquet_dpkg: bool,
@@ -223,6 +226,9 @@ pub fn type_installation(i: &IndicesInstallation<'_>) -> &'static str {
     let exe = i.exe.replace('\\', "/");
     if i.os == "ios" {
         return "ios-app";
+    }
+    if i.os == "android" {
+        return "android-app";
     }
     // Tune OS d'abord : l'image peut embarquer le paquet ou un cgroup
     // quelconque, mais c'est le marqueur qui la définit.
@@ -238,7 +244,10 @@ pub fn type_installation(i: &IndicesInstallation<'_>) -> &'static str {
     if i.os == "windows" && i.desinstallateur_voisin {
         return "windows-installer";
     }
-    if i.os == "macos" && exe.contains(".app/Contents/MacOS/") {
+    // Le DMG pose le binaire dans `Tune Server.app/Contents/Resources/`
+    // (release.yml, « Create DMG ») ; une app qui embarque le serveur le lance
+    // depuis `Contents/MacOS/`. Les deux sont l'application macOS.
+    if i.os == "macos" && exe.contains(".app/Contents/") {
         return "macos-app";
     }
     if i.os == "linux" && i.paquet_dpkg && exe.starts_with("/opt/tune/") {
@@ -251,19 +260,53 @@ fn lire(chemin: &str) -> String {
     std::fs::read_to_string(chemin).unwrap_or_default()
 }
 
+/// `reg.exe` par son chemin ABSOLU : un nom nu se chercherait d'abord dans
+/// le dossier de l'exécutable, inscriptible par l'utilisateur pour une
+/// installation par utilisateur (`AppData\Local\Programs`).
 #[cfg(windows)]
 fn sortie_registre_windows() -> String {
+    use std::io::Read;
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    std::process::Command::new("reg")
+    const DELAI_MAX: std::time::Duration = std::time::Duration::from_secs(5);
+    let racine = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
+    let reg = std::path::PathBuf::from(racine)
+        .join("System32")
+        .join("reg.exe");
+    let Ok(mut enfant) = std::process::Command::new(reg)
         .args([
             "query",
             r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion",
         ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
         .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .unwrap_or_default()
+        .spawn()
+    else {
+        return String::new();
+    };
+    // Délai maximal : un `reg` bloqué ne doit pas figer la tâche du battement.
+    // La sortie (quelques Ko) tient dans le tampon du tuyau.
+    let debut = std::time::Instant::now();
+    loop {
+        match enfant.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if debut.elapsed() < DELAI_MAX => {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            _ => {
+                let _ = enfant.kill();
+                let _ = enfant.wait();
+                return String::new();
+            }
+        }
+    }
+    let mut octets = Vec::new();
+    if let Some(mut sortie) = enfant.stdout.take() {
+        let _ = sortie.read_to_end(&mut octets);
+    }
+    String::from_utf8_lossy(&octets).into_owned()
 }
 
 #[cfg(not(windows))]
@@ -303,7 +346,10 @@ fn os_version_lu(os: &str) -> Option<String> {
 pub fn detecter() -> Plateforme {
     let os = std::env::consts::OS;
     let arch = std::env::consts::ARCH;
-    let exe_chemin = std::env::current_exe().ok();
+    // Liens résolus (Homebrew sur macOS), repli sur le chemin brut.
+    let exe_chemin = std::env::current_exe()
+        .ok()
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p));
     let exe = exe_chemin
         .as_deref()
         .map(|p| p.to_string_lossy().into_owned())
@@ -555,12 +601,27 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(type_installation(&brew), "homebrew");
+        // Chemin du paquet réellement livré par le DMG (release.yml).
+        let dmg = IndicesInstallation {
+            os: "macos",
+            exe: "/Applications/Tune Server.app/Contents/Resources/tune-server",
+            ..Default::default()
+        };
+        assert_eq!(type_installation(&dmg), "macos-app");
         let app = IndicesInstallation {
             os: "macos",
             exe: "/Applications/Tune.app/Contents/MacOS/Tune",
             ..Default::default()
         };
         assert_eq!(type_installation(&app), "macos-app");
+        // Contre-épreuve : le lien `opt/` NON résolu ne dit pas Homebrew,
+        // d'où `canonicalize` dans `detecter`.
+        let lien = IndicesInstallation {
+            os: "macos",
+            exe: "/opt/homebrew/opt/tune-server/bin/tune-server",
+            ..Default::default()
+        };
+        assert_eq!(type_installation(&lien), "other");
         let nu = IndicesInstallation {
             os: "macos",
             exe: "/usr/local/bin/tune-server",
@@ -588,6 +649,49 @@ mod tests {
             }),
             "ios-app"
         );
+        assert_eq!(
+            type_installation(&IndicesInstallation {
+                os: "android",
+                ..Default::default()
+            }),
+            "android-app"
+        );
+    }
+
+    /// Homebrew sur macOS : `current_exe()` rend le lien `opt/…/bin`, que
+    /// seule la résolution ramène au Cellar. Épreuve sur un vrai lien.
+    #[cfg(unix)]
+    #[test]
+    fn homebrew_reconnu_a_travers_le_lien_opt() {
+        let racine = tempfile::tempdir().unwrap();
+        let cellar = racine.path().join("Cellar/tune-server/1.0.0/bin");
+        std::fs::create_dir_all(&cellar).unwrap();
+        let binaire = cellar.join("tune-server");
+        std::fs::write(&binaire, b"").unwrap();
+        let opt = racine.path().join("opt/tune-server/bin");
+        std::fs::create_dir_all(&opt).unwrap();
+        let lien = opt.join("tune-server");
+        std::os::unix::fs::symlink(&binaire, &lien).unwrap();
+
+        let resolu = std::fs::canonicalize(&lien).unwrap_or(lien.clone());
+        let resolu = resolu.to_string_lossy().into_owned();
+        let brut = lien.to_string_lossy().into_owned();
+        let par_resolu = IndicesInstallation {
+            os: "macos",
+            exe: &resolu,
+            ..Default::default()
+        };
+        let par_brut = IndicesInstallation {
+            os: "macos",
+            exe: &brut,
+            ..Default::default()
+        };
+        assert_eq!(type_installation(&par_resolu), "homebrew");
+        assert_eq!(
+            type_installation(&par_brut),
+            "other",
+            "contre-épreuve : lien non résolu"
+        );
     }
 
     /// La détection réelle rend des valeurs bornées et ASCII, et toujours un
@@ -609,6 +713,7 @@ mod tests {
                 | "windows-installer"
                 | "macos-app"
                 | "ios-app"
+                | "android-app"
                 | "package"
                 | "other"
         ));
