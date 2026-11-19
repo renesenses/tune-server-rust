@@ -1566,6 +1566,12 @@ impl AudioStreamer {
         }
     }
 
+    /// Le port HTTP du serveur, celui des URL `/stream/...` qu'il publie.
+    /// #9207 — sert aussi à reconnaître une URI de NOTRE bibliothèque.
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
     /// #6658 — note que la session `stream_id` est retirée parce que son
     /// producteur est mort avant d'avoir écrit un octet
     /// (`abandonner_la_session_de_transcodage`).
