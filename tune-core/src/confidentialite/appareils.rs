@@ -72,7 +72,8 @@ const NOMS_MAX: usize = 8192;
 /// Un nom plus court toucherait des mots ordinaires (« TV », « Hi »).
 const NOM_MIN: usize = 3;
 
-/// Une zone se nomme souvent d'un mot court et générique (« Bar », « Hi-Fi »).
+/// Une zone de trois lettres (« Bar », « Spa », « Den ») est un mot du
+/// quotidien bien plus souvent qu'un nom personnel : elle n'est pas retenue.
 const ZONE_MIN: usize = 4;
 
 /// Noms qui ne désignent personne : les masquer effacerait du diagnostic.
@@ -134,6 +135,116 @@ const NOMS_GENERIQUES: &[&str] = &[
     "youtube",
     "minimserver",
     "minidlna",
+    // Les étiquettes des zones locales (`config::ETIQUETTES_LOCALES_GENERIQUES`).
+    "this computer",
+    "cet ordinateur",
+    // Noms d'hôte d'images système : personne derrière.
+    "raspberrypi",
+    "raspberry pi",
+    "volumio",
+    "moode",
+    "moodeaudio",
+    "dietpi",
+    "openwrt",
+    "nas",
+    "localhost.localdomain",
+];
+
+/// Fabricants audio (et marques courantes) : un mot de cette liste n'est
+/// jamais pris pour un nom personnel. mDNS donne souvent le modèle sans le
+/// fabricant (AirPlay `am`) : sans cette liste, « Denon » de « Denon
+/// AVR-X1700H » serait retenu, puis masqué partout, `manufacturer=Denon`
+/// compris.
+const MARQUES: &[&str] = &[
+    "denon",
+    "marantz",
+    "yamaha",
+    "naim",
+    "wiim",
+    "bluesound",
+    "linn",
+    "arcam",
+    "cambridge",
+    "nad",
+    "onkyo",
+    "pioneer",
+    "sony",
+    "bose",
+    "kef",
+    "devialet",
+    "lumin",
+    "auralic",
+    "eversolo",
+    "topping",
+    "fiio",
+    "matrix",
+    "cocktail",
+    "primare",
+    "sonos",
+    "heos",
+    "rotel",
+    "technics",
+    "harman",
+    "kardon",
+    "jbl",
+    "bang",
+    "olufsen",
+    "teac",
+    "esoteric",
+    "luxman",
+    "chord",
+    "rme",
+    "focusrite",
+    "scarlett",
+    "motu",
+    "audient",
+    "smsl",
+    "gustard",
+    "denafrips",
+    "innuos",
+    "lyngdorf",
+    "dynaudio",
+    "bowers",
+    "wilkins",
+    "polk",
+    "audiolab",
+    "hifiberry",
+    "samsung",
+    "lg",
+    "philips",
+    "panasonic",
+    "sharp",
+    "tcl",
+    "hisense",
+    "xiaomi",
+    "google",
+    "amazon",
+    "apple",
+    "nvidia",
+    "shield",
+    "roku",
+    "freebox",
+    "livebox",
+    "bbox",
+    "synology",
+    "qnap",
+    "elac",
+    "klipsch",
+    "sennheiser",
+    "pro-ject",
+    "project",
+    "nubert",
+    "canton",
+    "teufel",
+    "magnat",
+    "triangle",
+    "cabasse",
+    "focal",
+    "advance",
+    "acoustics",
+    "audio",
+    "hi-fi",
+    "hifi",
 ];
 
 /// Mots qui, devant « ’s » ou après « de », ne sont pas un propriétaire.
@@ -164,11 +275,13 @@ const SEP: &str = r"(?:[ \t-]|\\{1,2}032)";
 
 /// Appareils dont le nom suffit à reconnaître le motif, quelle que soit la
 /// casse (les noms d'hôte mDNS passent souvent en minuscules).
-const DISTINCTIFS: &str = r"(?i:macbook(?:(?:[ \t-]|\\{1,2}032)(?:pro|air))?|imac(?:(?:[ \t-]|\\{1,2}032)pro)?|iphone|ipad|ipod(?:(?:[ \t-]|\\{1,2}032)touch)?|homepod(?:(?:[ \t-]|\\{1,2}032)mini)?|airpods(?:(?:[ \t-]|\\{1,2}032)(?:pro|max))?|apple(?:[ \t-]|\\{1,2}032)tv|apple(?:[ \t-]|\\{1,2}032)watch|mac(?:[ \t-]|\\{1,2}032)(?:mini|studio|pro)|galaxy|chromebook|xperia|thinkpad)";
+const DISTINCTIFS: &str = r"(?i:macbook(?:(?:[ \t-]|\\{1,2}032)(?:pro|air))?|imac(?:(?:[ \t-]|\\{1,2}032)pro)?|iphone|ipad|ipod(?:(?:[ \t-]|\\{1,2}032)touch)?|homepod(?:(?:[ \t-]|\\{1,2}032)mini)?|airpods(?:(?:[ \t-]|\\{1,2}032)(?:pro|max))?|apple(?:[ \t-]|\\{1,2}032)tv|apple(?:[ \t-]|\\{1,2}032)watch|mac(?:[ \t-]|\\{1,2}032)(?:mini|studio|pro)|galaxy|chromebook|xperia|thinkpad|echo(?:[ \t-]|\\{1,2}032)(?:dot|show|studio|pop|spot)|surface(?:[ \t-]|\\{1,2}032)(?:pro|laptop|book|go))";
 
 /// Mots d'appareil courants, reconnus seulement avec leur majuscule : « mac de
-/// l'appareil » ou « portable de la cuisine » ne sont pas des noms.
-const GENERIQUES: &str = r"(?:Mac|PC|TV|Echo|Pixel|Kindle|Surface|Nest|Sonos|Bose|JBL|Marshall|Beats|Xbox|PlayStation|Ordinateur|Portable|Téléphone|Telephone|Tablette|Enceinte|Laptop|Phone|Speaker|Watch)";
+/// l'appareil » ou « portable de la cuisine » ne sont pas des noms. Pas de
+/// « Watch », « Echo » ni « Surface » seuls : « The Night's Watch », « Echo de
+/// Paris », « Surface de réparation » sont des titres.
+const GENERIQUES: &str = r"(?:Mac|PC|TV|Pixel|Kindle|Nest|Sonos|Bose|JBL|Marshall|Beats|Xbox|PlayStation|Ordinateur|Portable|Téléphone|Telephone|Tablette|Enceinte|Laptop|Phone|Speaker)";
 
 /// Ce qui suit le mot d'appareil dans « X’s <appareil> » : modèle (« S21 »,
 /// « 15 », « Pro », « Dot »), jamais un mot quelconque.
@@ -199,7 +312,7 @@ static RE_POSSESSIF: LazyLock<Regex> = LazyLock::new(|| {
 /// « JBL Flip 5 de Jean », « iPad d’Anne », « Mac von Jan ».
 static RE_APPAREIL_DE: LazyLock<Regex> = LazyLock::new(|| {
     re(&format!(
-        r"(?-u:\b)(?:(?P<distinctif>{DISTINCTIFS})|{GENERIQUES})(?-u:\b){SUFFIXE_DE}{SEP}+(?:(?:de|du|di|da|von|van){SEP}+|d{APOSTROPHE})(?P<proprio>[\p{{L}}][\p{{L}}\p{{M}}]+(?:-[\p{{L}}][\p{{L}}\p{{M}}]+)*(?:{BLANC}\p{{Lu}}\p{{Ll}}+)?)"
+        r"(?-u:\b)(?:(?P<distinctif>{DISTINCTIFS})|{GENERIQUES})(?-u:\b){SUFFIXE_DE}{SEP}+(?:(?i:de|du|di|da|von|van){SEP}+|(?i:d){APOSTROPHE})(?P<proprio>[\p{{L}}][\p{{L}}\p{{M}}]+(?:-[\p{{L}}][\p{{L}}\p{{M}}]+)*(?:{BLANC}\p{{Lu}}\p{{Ll}}+)?)"
     ))
 });
 
@@ -209,6 +322,14 @@ static RE_HOTE_MDNS: LazyLock<Regex> = LazyLock::new(|| {
     re(
         r"(?P<proprio>[\p{L}][\p{L}\p{M}]+(?:-[\p{L}][\p{L}\p{M}]+)*?)s-(?i:macbook(?:-(?:pro|air))?|imac|iphone|ipad|mac-(?:mini|studio|pro)|homepod)(?-u:\b)(?:-[0-9]+)?",
     )
+});
+
+/// iOS en japonais, coréen, chinois : « 太郎のiPhone », « 철수의 iPhone »,
+/// « 小明的iPhone ».
+static RE_CJK: LazyLock<Regex> = LazyLock::new(|| {
+    re(&format!(
+        r"(?P<proprio>[\p{{Han}}\p{{Hiragana}}\p{{Katakana}}\p{{Hangul}}]{{1,12}})(?:の|의[ \t]?|的)(?:{DISTINCTIFS}|{GENERIQUES})(?-u:\b){SUFFIXE}"
+    ))
 });
 
 /// Les écritures d'apostrophe et d'espace que [`cle`] ramène à `'` et ` `.
@@ -286,11 +407,11 @@ fn mots(texte: &str) -> Vec<String> {
 /// « NR1711 », « Sonos One » face à `Sonos` + `One`.
 pub fn est_nom_de_materiel(nom: &str, materiels: &[String]) -> bool {
     let du_nom = mots(nom);
+    let du_materiel: Vec<String> = materiels.iter().flat_map(|m| mots(m)).collect();
     !du_nom.is_empty()
-        && materiels.iter().any(|m| {
-            let du_materiel = mots(m);
-            du_nom.iter().all(|x| du_materiel.contains(x))
-        })
+        && du_nom
+            .iter()
+            .all(|x| du_materiel.contains(x) || MARQUES.contains(&x.as_str()))
 }
 
 /// Les morceaux d'un nom qui ne sont pas le matériel : « MinimServer [x] »
@@ -353,6 +474,13 @@ fn nom_a_masquer(sorte: Sorte, nom: &str, materiels: &[String]) -> bool {
     if c.starts_with('[') || c.starts_with('<') {
         return false;
     }
+    // Le nom par défaut d'un serveur Tune (« tune-ab12 », « Tune 3f9c »).
+    if let Some(reste) = c.strip_prefix("tune-").or_else(|| c.strip_prefix("tune "))
+        && !reste.is_empty()
+        && reste.chars().all(|ch| ch.is_ascii_alphanumeric())
+    {
+        return false;
+    }
     !est_nom_de_materiel(nom, materiels)
 }
 
@@ -367,23 +495,101 @@ fn proprietaire_exclu(proprio: &str) -> bool {
 struct Instantane {
     /// Clé ([`cle`]) → jeton.
     jetons: HashMap<String, String>,
-    /// La passe 1.
-    motif: Option<Regex>,
+    /// La passe 1, en paquets : du plus long nom au plus court, d'un paquet au
+    /// suivant comme à l'intérieur de chacun.
+    motifs: Vec<Regex>,
     /// Le dernier numéro donné, par sorte.
     compteurs: [usize; 3],
+}
+
+/// Noms par paquet de la passe 1.
+const PAQUET: usize = 256;
+
+/// Plafond de taille d'une expression compilée (le défaut du moteur est de
+/// 10 Mio) : au-delà, le paquet est coupé en deux.
+const TAILLE_MOTIF: usize = 32 << 20;
+
+fn compiler(alternatives: &[String], limite: usize) -> Result<Regex, regex::Error> {
+    regex::RegexBuilder::new(&format!("{MOTIF_JETON}|{}", alternatives.join("|")))
+        .case_insensitive(true)
+        .size_limit(limite)
+        .build()
+}
+
+/// Les expressions de la passe 1. Un paquet qui ne compile pas (trop gros) est
+/// coupé en deux, jusqu'au nom seul, compilé alors sans plafond réduit :
+/// aucun nom retenu ne sort en clair parce que l'expression a échoué.
+fn construire_motifs(noms: &[String], limite: usize) -> Vec<Regex> {
+    let mut tries: Vec<&String> = noms.iter().collect();
+    // Les plus longs d'abord : « Salon TV » avant « Salon ».
+    tries.sort_by_key(|n| std::cmp::Reverse(n.chars().count()));
+    let alternatives: Vec<String> = tries.iter().map(|n| motif_du_nom(n)).collect();
+    let mut motifs = Vec::new();
+    let mut pile: Vec<&[String]> = alternatives.chunks(PAQUET).rev().collect();
+    while let Some(paquet) = pile.pop() {
+        match compiler(paquet, limite) {
+            Ok(m) => motifs.push(m),
+            Err(e) if paquet.len() > 1 => {
+                tracing::warn!(noms = paquet.len(), erreur = %e, "confidentialite_paquet_de_noms_coupe");
+                let (a, b) = paquet.split_at(paquet.len() / 2);
+                pile.push(b);
+                pile.push(a);
+            }
+            Err(e) => match compiler(paquet, TAILLE_MOTIF * 8) {
+                Ok(m) => motifs.push(m),
+                Err(e2) => {
+                    tracing::error!(erreur = %e, repli = %e2, "confidentialite_nom_sans_motif");
+                    // Dernier repli : le nom écrit tel quel, sans variantes.
+                    if let Ok(m) = regex::RegexBuilder::new(&regex::escape(&paquet[0]))
+                        .case_insensitive(true)
+                        .build()
+                    {
+                        motifs.push(m);
+                    }
+                }
+            },
+        }
+    }
+    motifs
+}
+
+fn construire(
+    noms: &[String],
+    jetons: HashMap<String, String>,
+    compteurs: [usize; 3],
+    limite: usize,
+) -> Instantane {
+    Instantane {
+        jetons,
+        motifs: construire_motifs(noms, limite),
+        compteurs,
+    }
 }
 
 /// Les noms retenus et leurs jetons.
 #[derive(Default)]
 pub struct Registre {
     jetons: HashMap<String, String>,
-    /// Les noms déjà examinés, retenus ou non (bornée à [`NOMS_MAX`]) : la
-    /// réannonce d'un appareil ne refait pas le travail.
+    /// Les couples (nom, matériels) déjà examinés, retenus ou non (bornée à
+    /// [`NOMS_MAX`]) : la réannonce d'un appareil ne refait pas le travail,
+    /// mais la même annonce avec un matériel plus complet (SSDP après mDNS)
+    /// est réexaminée.
     vus: HashSet<String>,
+    /// Nom examiné → les morceaux qu'il a fait retenir (pour les oublier si
+    /// une annonce plus complète montre qu'ils n'étaient que du matériel).
+    origines: HashMap<String, Vec<String>>,
     noms: Vec<String>,
     compteurs: [usize; 3],
-    /// Reconstruit à la première séance après un nom retenu.
+    /// Change à chaque nom retenu ou oublié.
+    generation: u64,
+    /// Reconstruit à la première séance après un changement.
     instantane: Option<Arc<Instantane>>,
+}
+
+fn cle_d_examen(nom: &str, materiels: &[String]) -> String {
+    let mut m: Vec<String> = materiels.iter().map(|x| cle(x)).collect();
+    m.sort();
+    format!("{}\u{1}{}", cle(nom), m.join("\u{1}"))
 }
 
 impl Registre {
@@ -391,11 +597,10 @@ impl Registre {
         Self::default()
     }
 
-    /// Ce nom est-il déjà retenu ? (Lecture seule : la découverte l'appelle à
-    /// chaque réannonce.)
-    pub fn connait(&self, nom: &str) -> bool {
-        let c = cle(nom);
-        self.jetons.contains_key(&c) || self.vus.contains(&c)
+    /// Ce couple (nom, matériels) a-t-il déjà été examiné ? (Lecture seule :
+    /// la découverte l'appelle à chaque réannonce.)
+    pub fn connait(&self, nom: &str, materiels: &[String]) -> bool {
+        self.vus.contains(&cle_d_examen(nom, materiels))
     }
 
     /// Retient un nom ; rend son jeton (celui de son premier morceau quand le
@@ -403,23 +608,50 @@ impl Registre {
     /// d'être masqué (`materiels` : les « fabricant modèle » auxquels le
     /// comparer). Un nom déjà retenu garde son jeton.
     pub fn retenir(&mut self, sorte: Sorte, nom: &str, materiels: &[String]) -> Option<String> {
+        if self.vus.len() < NOMS_MAX {
+            self.vus.insert(cle_d_examen(nom, materiels));
+        }
         let c = cle(nom);
+        if !nom_a_masquer(sorte, nom, materiels) {
+            // Une annonce plus complète dit que ce nom n'est que du
+            // matériel : ce qu'une annonce pauvre avait fait retenir est oublié.
+            if est_nom_de_materiel(nom, materiels) {
+                self.oublier(&c, materiels);
+            }
+            return None;
+        }
         if let Some(j) = self.jetons.get(&c) {
             return Some(j.clone());
         }
-        if self.vus.len() < NOMS_MAX {
-            self.vus.insert(c);
-        }
-        if !nom_a_masquer(sorte, nom, materiels) {
-            return None;
-        }
         let mut premier = None;
+        let mut retenus = Vec::new();
         for morceau in morceaux_hors_materiel(nom, materiels) {
             if let Some(j) = self.retenir_un(sorte, &morceau) {
+                retenus.push(cle(&morceau));
                 premier.get_or_insert(j);
             }
         }
+        if !retenus.is_empty() && self.origines.len() < NOMS_MAX {
+            self.origines.entry(c).or_default().extend(retenus);
+        }
         premier
+    }
+
+    fn oublier(&mut self, c: &str, materiels: &[String]) {
+        let Some(morceaux) = self.origines.remove(c) else {
+            return;
+        };
+        for m in morceaux {
+            if est_nom_de_materiel(&m, materiels) && self.jetons.remove(&m).is_some() {
+                self.noms.retain(|n| cle(n) != m);
+                self.changer();
+            }
+        }
+    }
+
+    fn changer(&mut self) {
+        self.generation += 1;
+        self.instantane = None;
     }
 
     fn retenir_un(&mut self, sorte: Sorte, nom: &str) -> Option<String> {
@@ -439,28 +671,20 @@ impl Registre {
         };
         self.jetons.insert(c, j.clone());
         self.noms.push(nom.trim().to_string());
-        self.instantane = None;
+        self.changer();
         Some(j)
     }
 
-    fn instantane(&mut self) -> Arc<Instantane> {
+    fn instantane_avec(&mut self, limite: usize) -> Arc<Instantane> {
         if let Some(i) = &self.instantane {
             return i.clone();
         }
-        let motif = (!self.noms.is_empty()).then(|| {
-            // Les plus longs d'abord : « Salon TV » avant « Salon ».
-            let mut noms: Vec<&String> = self.noms.iter().collect();
-            noms.sort_by_key(|n| std::cmp::Reverse(n.chars().count()));
-            let alternatives: Vec<String> = noms.iter().map(|n| motif_du_nom(n)).collect();
-            // Le jeton en tête : à sa position, c'est lui qui l'emporte, et
-            // aucun nom ne peut commencer au milieu.
-            Regex::new(&format!("(?i){MOTIF_JETON}|{}", alternatives.join("|"))).ok()
-        });
-        let i = Arc::new(Instantane {
-            jetons: self.jetons.clone(),
-            motif: motif.flatten(),
-            compteurs: self.compteurs,
-        });
+        let i = Arc::new(construire(
+            &self.noms,
+            self.jetons.clone(),
+            self.compteurs,
+            limite,
+        ));
         self.instantane = Some(i.clone());
         i
     }
@@ -468,12 +692,12 @@ impl Registre {
     /// Une séance de nettoyage : les noms retenus à cet instant, plus les noms
     /// que le filet trouvera, numérotés à la suite pour cette séance seule.
     pub fn seance(&mut self) -> Seance {
-        let instantane = self.instantane();
-        Seance {
-            suivant: instantane.compteurs[Sorte::Appareil.indice()],
-            instantane,
-            locaux: HashMap::new(),
-        }
+        Seance::sur(self.instantane_avec(TAILLE_MOTIF))
+    }
+
+    #[cfg(test)]
+    fn seance_avec_limite(&mut self, limite: usize) -> Seance {
+        Seance::sur(self.instantane_avec(limite))
     }
 }
 
@@ -485,40 +709,91 @@ pub struct Seance {
     suivant: usize,
 }
 
+/// La correspondance `[debut, fin)` respecte-t-elle les bornes de mot ?
+fn bornes_ok(texte: &str, debut: usize, fin: usize) -> bool {
+    let tout = &texte[debut..fin];
+    let avant = texte[..debut].chars().next_back();
+    let apres = texte[fin..].chars().next();
+    !((lettre_ou_chiffre(tout.chars().next()) && lettre_ou_chiffre(avant))
+        || (lettre_ou_chiffre(tout.chars().next_back()) && lettre_ou_chiffre(apres)))
+}
+
 impl Seance {
+    fn sur(instantane: Arc<Instantane>) -> Self {
+        Seance {
+            suivant: instantane.compteurs[Sorte::Appareil.indice()],
+            instantane,
+            locaux: HashMap::new(),
+        }
+    }
+
     /// Une séance sans aucun nom retenu (le filet seul).
     pub fn vide() -> Self {
         Registre::new().seance()
     }
 
-    /// Passe 1 : les noms retenus.
+    /// Passe 1 : les noms retenus, paquet par paquet.
     fn masquer_connus(&self, texte: &str) -> String {
-        let Some(motif) = &self.instantane.motif else {
-            return texte.to_string();
-        };
+        let mut t = texte.to_string();
+        for motif in &self.instantane.motifs {
+            t = self.masquer_paquet(&t, motif);
+        }
+        t
+    }
+
+    /// Un paquet. Quand le nom le plus long trouvé à une position ne tient pas
+    /// ses bornes (« Salon TV » dans « Salon TVs »), un nom plus court à la
+    /// même position est cherché (« Salon »).
+    fn masquer_paquet(&self, texte: &str, motif: &Regex) -> String {
         let mut sortie = String::with_capacity(texte.len());
         let mut dernier = 0;
-        for m in motif.find_iter(texte) {
-            let tout = m.as_str();
-            if tout.starts_with('[') {
-                continue;
+        let mut pos = 0;
+        while pos <= texte.len() {
+            let Some(m) = motif.find_at(texte, pos) else {
+                break;
+            };
+            let debut = m.start();
+            let mut fin = m.end();
+            // (fin, jeton) ; un jeton déjà posé est sauté sans être touché.
+            let mut retenu: Option<(usize, Option<&str>)> = None;
+            while fin > debut {
+                let Some(c) = motif.find_at(&texte[..fin], debut) else {
+                    break;
+                };
+                if c.start() != debut {
+                    break;
+                }
+                if c.as_str().starts_with('[') {
+                    retenu = Some((c.end(), None));
+                    break;
+                }
+                if bornes_ok(texte, c.start(), c.end()) {
+                    let jeton = self
+                        .instantane
+                        .jetons
+                        .get(&cle(c.as_str()))
+                        .map_or("[appareil]", String::as_str);
+                    retenu = Some((c.end(), Some(jeton)));
+                    break;
+                }
+                let dernier_car = c.as_str().chars().next_back().map_or(1, char::len_utf8);
+                fin = c.end() - dernier_car;
             }
-            // Bornes de mot : « Salon » ne touche pas « Salonnière ».
-            let avant = texte[..m.start()].chars().next_back();
-            let apres = texte[m.end()..].chars().next();
-            let debut_mot = lettre_ou_chiffre(tout.chars().next());
-            let fin_mot = lettre_ou_chiffre(tout.chars().next_back());
-            if (debut_mot && lettre_ou_chiffre(avant)) || (fin_mot && lettre_ou_chiffre(apres)) {
-                continue;
+            match retenu {
+                Some((f, Some(jeton))) => {
+                    sortie.push_str(&texte[dernier..debut]);
+                    sortie.push_str(jeton);
+                    dernier = f;
+                    pos = f;
+                }
+                Some((f, None)) => pos = f.max(debut + 1),
+                None => {
+                    pos = debut + texte[debut..].chars().next().map_or(1, char::len_utf8);
+                }
             }
-            sortie.push_str(&texte[dernier..m.start()]);
-            sortie.push_str(
-                self.instantane
-                    .jetons
-                    .get(&cle(tout))
-                    .map_or("[appareil]", String::as_str),
-            );
-            dernier = m.end();
+            if pos > texte.len() {
+                break;
+            }
         }
         sortie.push_str(&texte[dernier..]);
         sortie
@@ -591,7 +866,8 @@ impl Seance {
             let generique = c.name("distinctif").is_none();
             proprietaire_exclu(p) || (generique && !p.starts_with(char::is_uppercase))
         });
-        self.masquer_motif(&t, &RE_HOTE_MDNS, exclu)
+        let t = self.masquer_motif(&t, &RE_HOTE_MDNS, exclu);
+        self.masquer_motif(&t, &RE_CJK, |_| false)
     }
 }
 
@@ -602,10 +878,10 @@ static REGISTRE: LazyLock<RwLock<Registre>> = LazyLock::new(|| RwLock::new(Regis
 /// Retient un nom dans la liste du serveur.
 pub(super) fn retenir(sorte: Sorte, nom: &str, materiels: &[String]) {
     // La réannonce d'un appareil connu ne prend pas le verrou en écriture.
-    let connu = match REGISTRE.read() {
-        Ok(r) => r.connait(nom),
-        Err(e) => e.into_inner().connait(nom),
-    };
+    let connu = REGISTRE
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .connait(nom, materiels);
     if connu {
         return;
     }
@@ -613,10 +889,24 @@ pub(super) fn retenir(sorte: Sorte, nom: &str, materiels: &[String]) {
     r.retenir(sorte, nom, materiels);
 }
 
-/// Une séance sur la liste du serveur. Le verrou n'est tenu que le temps de
-/// prendre l'instantané, jamais pendant le nettoyage.
+/// Une séance sur la liste du serveur. Le verrou n'est tenu ni pendant la
+/// construction des expressions (copie sous lecture, construction hors
+/// verrou, rangement si rien n'a changé entre-temps) ni pendant le
+/// nettoyage.
 pub(super) fn seance() -> Seance {
-    REGISTRE.write().unwrap_or_else(|e| e.into_inner()).seance()
+    let (noms, jetons, compteurs, generation) = {
+        let r = REGISTRE.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = &r.instantane {
+            return Seance::sur(i.clone());
+        }
+        (r.noms.clone(), r.jetons.clone(), r.compteurs, r.generation)
+    };
+    let i = Arc::new(construire(&noms, jetons, compteurs, TAILLE_MOTIF));
+    let mut r = REGISTRE.write().unwrap_or_else(|e| e.into_inner());
+    if r.generation == generation && r.instantane.is_none() {
+        r.instantane = Some(i.clone());
+    }
+    Seance::sur(i)
 }
 
 #[cfg(test)]
@@ -836,6 +1126,140 @@ mod tests {
         ] {
             assert_eq!(s.masquer(texte), texte, "modifié à tort");
         }
+    }
+
+    /// Relecture de suivi : matériel, marques, étiquettes locales, noms
+    /// d'hôte d'images système.
+    #[test]
+    fn materiel_marques_et_etiquettes_locales_restent_lisibles() {
+        let mut reg = Registre::new();
+        for (nom, materiels) in [
+            ("This Computer", vec![]),
+            ("Cet ordinateur", vec![]),
+            ("Topping D90SE", vec!["Topping D90SE".to_string()]),
+            ("Scarlett 2i2 USB", vec!["Scarlett 2i2 USB".to_string()]),
+            ("RME ADI-2 DAC FS", vec!["RME ADI-2 DAC FS".to_string()]),
+            // mDNS : le modèle sans le fabricant.
+            ("Denon AVR-X1700H", vec!["AVR-X1700H".to_string()]),
+            ("Denon", vec![]),
+            ("WiiM Pro", vec!["Pro".to_string()]),
+            ("raspberrypi", vec![]),
+            ("volumio", vec![]),
+            ("tune-ab12", vec![]),
+            ("Tune 3f9c", vec![]),
+        ] {
+            assert_eq!(reg.retenir(Sorte::Zone, nom, &materiels), None, "{nom}");
+            assert_eq!(reg.retenir(Sorte::Appareil, nom, &materiels), None, "{nom}");
+        }
+        let texte = "zone This Computer: Topping D90SE 44100 Hz ; manufacturer=Denon model=AVR-X1700H ; \
+                     raspberrypi.local volumio tune-ab12";
+        assert_eq!(reg.seance().masquer(texte), texte);
+        // Le morceau personnel d'une zone locale, lui, est retenu.
+        assert!(
+            reg.retenir(
+                Sorte::Zone,
+                "Grenier Topping D90SE",
+                &["Topping D90SE".to_string()]
+            )
+            .is_some()
+        );
+        assert_eq!(
+            reg.seance().masquer("Grenier Topping D90SE"),
+            "[zone 1] Topping D90SE"
+        );
+    }
+
+    /// Une annonce pauvre (mDNS : modèle seul) a fait retenir un mot que
+    /// l'annonce complète (SSDP : fabricant + modèle) dit être du matériel :
+    /// il est oublié.
+    #[test]
+    fn la_decouverte_complete_corrige_un_verdict_mdns() {
+        let mut reg = Registre::new();
+        reg.retenir(Sorte::Appareil, "Kalvex Rondo", &["Rondo".to_string()]);
+        assert_eq!(
+            reg.seance().masquer("manufacturer=Kalvex"),
+            "manufacturer=[appareil 1]"
+        );
+        reg.retenir(
+            Sorte::Appareil,
+            "Kalvex Rondo",
+            &["Kalvex Rondo".to_string()],
+        );
+        assert_eq!(
+            reg.seance().masquer("manufacturer=Kalvex"),
+            "manufacturer=Kalvex"
+        );
+    }
+
+    /// Un paquet qui ne compile pas n'en laisse sortir aucun nom : il est
+    /// coupé jusqu'au nom seul.
+    #[test]
+    fn beaucoup_de_noms_longs_et_paquets_qui_ne_compilent_pas() {
+        let mut reg = Registre::new();
+        let noms: Vec<String> = (0..1200)
+            .map(|i| format!("Bibliothèque musicale numéro {i:04} de la maison d’Eulalie Quarante"))
+            .collect();
+        for n in &noms {
+            reg.retenir(Sorte::Zone, n, &[]);
+        }
+        let texte: String = noms
+            .iter()
+            .step_by(37)
+            .map(|n| format!("INFO zone {n} volume=0.5\n"))
+            .collect();
+        // Plafond normal : paquets de 256.
+        let sortie = reg.seance().masquer(&texte);
+        assert!(!sortie.contains("Eulalie"), "{sortie}");
+        // Plafond minuscule : chaque paquet échoue, coupé jusqu'au nom seul.
+        reg.instantane = None;
+        let mut s = reg.seance_avec_limite(4096);
+        assert!(
+            s.instantane.motifs.len() > 1200 / PAQUET + 1,
+            "{}",
+            s.instantane.motifs.len()
+        );
+        let sortie = s.masquer(&texte);
+        assert!(
+            !sortie.contains("Eulalie"),
+            "un nom est sorti en clair : {sortie}"
+        );
+        assert_eq!(sortie.matches(" volume=0.5").count(), texte.lines().count());
+    }
+
+    #[test]
+    fn un_nom_long_rejete_ne_cache_pas_un_nom_court() {
+        let mut reg = Registre::new();
+        reg.retenir(Sorte::Zone, "Véranda", &[]);
+        reg.retenir(Sorte::Appareil, "Véranda TV", &[]);
+        assert_eq!(
+            reg.seance().masquer("Véranda TVs ; Véranda TV ; Vérandas"),
+            "[zone 1] TVs ; [appareil 1] ; Vérandas"
+        );
+    }
+
+    #[test]
+    fn filet_casse_de_et_noms_ios_asiatiques() {
+        let mut s = Seance::vide();
+        let sortie = s.masquer(
+            "iPhone De Prosper ; MacBook-Pro-DE-prosper ; 太郎のiPhone ; 철수의 iPhone ; 小明的iPad",
+        );
+        for fuite in ["Prosper", "prosper", "太郎", "철수", "小明"] {
+            assert!(
+                !sortie.contains(fuite),
+                "« {fuite} » sort encore : {sortie}"
+            );
+        }
+        for titre in [
+            "The Night's Watch",
+            "Echo de Paris",
+            "Surface de Réparation",
+            "Kathy's Echo",
+        ] {
+            assert_eq!(s.masquer(titre), titre, "titre modifié à tort");
+        }
+        // Les formes complètes restent couvertes.
+        let sortie = s.masquer("Prosper’s Echo Dot ; Surface Pro de Prosper");
+        assert!(!sortie.contains("Prosper"), "{sortie}");
     }
 
     /// Mesure : 1 000 lignes non ASCII, 300 noms retenus.

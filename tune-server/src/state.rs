@@ -863,20 +863,27 @@ impl AppState {
             &[],
         );
         let zones = tune_core::db::zone_repo::ZoneRepo::with_backend(self.backend.clone());
+        // Une zone locale porte le nom de son périphérique audio (« Topping
+        // D90SE », « Scarlett 2i2 USB ») : c'est du matériel, comparé à la
+        // partie `local:<nom>` de son identifiant de sortie.
         let noms_de_zones = zones
             .list()
             .unwrap_or_default()
             .into_iter()
-            .map(|z| z.name)
+            .map(|z| (z.name, z.output_device_id.unwrap_or_default()))
             .chain(
                 zones
                     .zones_masquees()
                     .unwrap_or_default()
                     .into_iter()
-                    .map(|z| z.name),
+                    .map(|z| (z.name, z.device_id)),
             );
-        for nom in noms_de_zones {
-            retenir_nom_d_appareil(Sorte::Zone, &nom, &materiels);
+        for (nom, sortie) in noms_de_zones {
+            let mut comparer = materiels.clone();
+            if let Some(peripherique) = sortie.strip_prefix("local:") {
+                comparer.push(peripherique.to_string());
+            }
+            retenir_nom_d_appareil(Sorte::Zone, &nom, &comparer);
         }
         for p in tune_core::db::profile_repo::ProfileRepo::with_backend(self.backend.clone())
             .list()
