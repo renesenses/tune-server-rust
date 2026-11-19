@@ -1604,13 +1604,19 @@ const LOT_METADONNEES_ETENDUES: usize = 500;
 /// exactement un refus de lot, sans le convertir en nombre de pistes (#4420).
 fn ecrire_lot_etendu(
     repo: &TrackMetadataRepo,
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
     lot: &mut Vec<(i64, std::collections::HashMap<String, String>)>,
 ) -> usize {
     if lot.is_empty() {
         return 0;
     }
     let refus = match repo.set_batch_multi(lot) {
-        Ok(()) => 0,
+        Ok(()) => {
+            // #9158 — les balises personnelles réglées deviennent des tags
+            // Tune, comme au scan et au surveillant.
+            tune_core::db::tags_perso_repo::ecrire_lot(backend, lot);
+            0
+        }
         Err(e) => {
             tracing::warn!(error = %e, "rescan_extended_metadata_insert_failed");
             1
@@ -1731,7 +1737,7 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
                 }
                 if etendues.len() >= LOT_METADONNEES_ETENDUES {
                     extended_metadata_failed_batches +=
-                        ecrire_lot_etendu(&meta_repo, &mut etendues);
+                        ecrire_lot_etendu(&meta_repo, &backend_inner, &mut etendues);
                 }
 
                 let Some(meta) = tune_core::metadata::read_metadata(path) else {
@@ -1756,7 +1762,7 @@ pub(super) async fn rescan_metadata(State(state): State<AppState>) -> impl IntoR
             // LOT_METADONNEES_ETENDUES pistes n'écrirait jamais rien.
             if !etendues.is_empty() {
                 extended_metadata_failed_batches +=
-                    ecrire_lot_etendu(&meta_repo, &mut etendues);
+                    ecrire_lot_etendu(&meta_repo, &backend_inner, &mut etendues);
             }
 
             // Refresh album genre/quality from their tracks. La qualité passe

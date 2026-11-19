@@ -2874,6 +2874,9 @@ async fn spawn_library_scan_avec_lecteur_par(
                                 // lignes `track_credits` (source `balises`), dans
                                 // la même transaction, sans rouvrir le fichier.
                                 tune_core::metadata::credits_balises::ecrire_lot(&db, &meta_entries);
+                                // #9158 — les balises personnelles réglées
+                                // deviennent des tags Tune (piste, album).
+                                tune_core::db::tags_perso_repo::ecrire_lot(&db, &meta_entries);
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "scan_extended_metadata_insert_failed");

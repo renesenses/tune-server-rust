@@ -35,7 +35,7 @@ impl Lcg {
 
 /// Un signal mono d'amplitude spectrale `gain(f)` (phases aléatoires),
 /// normalisé à -6 dBFS de crête.
-fn par_spectre(sample_rate: u32, graine: u64, gain: impl Fn(f64) -> f64) -> Vec<f32> {
+pub(super) fn par_spectre(sample_rate: u32, graine: u64, gain: impl Fn(f64) -> f64) -> Vec<f32> {
     let mut plan = RealFftPlanner::<f32>::new();
     let inverse = plan.plan_fft_inverse(N);
     let mut spectre = inverse.make_input_vec();
@@ -62,7 +62,12 @@ fn par_spectre(sample_rate: u32, graine: u64, gain: impl Fn(f64) -> f64) -> Vec<
 /// de 1,4 kHz s'éteignent par intermittence, pendant 3 à 8 trames (16 à
 /// 43 ms à 96 kHz) — les bandes qu'un encodeur à court de bits vide d'un
 /// granule à l'autre (la « sfb21 » du MP3 à 128 kbit/s).
-fn codec_simule(signal: &[f32], sample_rate: u32, coupure_hz: f64, graine: u64) -> Vec<f32> {
+pub(super) fn codec_simule(
+    signal: &[f32],
+    sample_rate: u32,
+    coupure_hz: f64,
+    graine: u64,
+) -> Vec<f32> {
     const T: usize = 1024;
     const PAS: usize = T / 2;
     let mut plan = RealFftPlanner::<f32>::new();
@@ -145,7 +150,12 @@ fn un_master_sans_perte_filtre_a_18_khz_n_est_pas_un_codec_9035() {
 
 /// Un master SOMBRE : spectre rose jusqu'à `coude_hz`, puis 24 dB par octave
 /// de plus, coupé net à `bande_hz` (le filtre d'un CD).
-fn sombre_coupe(sample_rate: u32, coude_hz: f64, bande_hz: f64, graine: u64) -> Vec<f32> {
+pub(super) fn sombre_coupe(
+    sample_rate: u32,
+    coude_hz: f64,
+    bande_hz: f64,
+    graine: u64,
+) -> Vec<f32> {
     par_spectre(sample_rate, graine, |f| {
         if f < bande_hz {
             (1.0 / f.sqrt()) / (1.0 + (f / coude_hz).powi(2)).powi(2)
