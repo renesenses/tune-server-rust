@@ -168,9 +168,7 @@ pub fn depuis_registre_windows(sortie: &str) -> Option<String> {
         })
     };
     let produit = valeur("ProductName");
-    let build: Option<u32> = valeur("CurrentBuildNumber")
-        .or_else(|| valeur("CurrentBuild"))
-        .and_then(|b| b.parse().ok());
+    let build: Option<u32> = valeur("CurrentBuildNumber").and_then(|b| b.parse().ok());
     let famille = match (&produit, build) {
         (Some(p), _) if p.contains("Server") => p.clone(),
         (_, Some(b)) if b >= 22000 => "Windows 11".to_string(),
