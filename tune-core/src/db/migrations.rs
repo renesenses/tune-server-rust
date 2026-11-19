@@ -6595,9 +6595,11 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
         warn!(error = %e, "pg_library_revision_failed");
     }
     // #9116 — la révision des chemins, un bloc `DO` (texte constant).
-    if let Err(e) = sqlx::raw_sql(sqlx::AssertSqlSafe(super::arbre_des_dossiers::sql_postgres()))
-        .execute(pool)
-        .await
+    if let Err(e) = sqlx::raw_sql(sqlx::AssertSqlSafe(
+        super::arbre_des_dossiers::sql_postgres(),
+    ))
+    .execute(pool)
+    .await
     {
         warn!(error = %e, "pg_library_paths_revision_failed");
     }
