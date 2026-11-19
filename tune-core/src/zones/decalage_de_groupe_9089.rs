@@ -26,6 +26,15 @@
 //! Les déplacements dans la piste donnés sur la meneuse sont relayés à la
 //! suiveuse avec le même décalage.
 //!
+//! Autres limites connues :
+//! - un groupe formé quand la meneuse est entre `d` et `d + 3 s` : la position
+//!   `p − d` passe sous le seuil de 3 s du transfert, la suiveuse repart de
+//!   0:00 et l'écart vaut `p`, pas `d` ;
+//! - une pause de la meneuse plus courte que `d` n'est pas relayée : au
+//!   réveil la meneuse rejoue, rien n'est à faire, et la suiveuse prend
+//!   l'avance de la durée de la pause ;
+//! - sans durée connue (flux), un décalage négatif n'avance rien.
+//!
 //! Rangé dans le réglage `zone_{id}_decalage_de_groupe_ms` : pas de colonne,
 //! donc ni migration SQLite ni PostgreSQL.
 
@@ -80,7 +89,11 @@ pub fn ecrire(
 /// La position de la suiveuse quand la meneuse est à `position_meneuse_ms` :
 /// `d` ms en arrière (positif) ou en avant (négatif), jamais avant le début,
 /// et jamais au-delà de la fin quand la durée est connue (`duree_ms > 0`).
+/// Sans durée connue (flux), aucune avance : la fin ne peut pas être bornée.
 pub fn position_de_la_suiveuse(position_meneuse_ms: u64, decalage_ms: i64, duree_ms: i64) -> u64 {
+    if decalage_ms < 0 && duree_ms <= 0 {
+        return position_meneuse_ms;
+    }
     let decalee = (position_meneuse_ms as i64)
         .saturating_sub(decalage_ms)
         .max(0);
@@ -136,6 +149,13 @@ mod tests {
         assert_eq!(attente_avant_un_geste_ms(-500), 0);
         // Jamais au-delà de la fin de la piste.
         assert_eq!(position_de_la_suiveuse(299_800, -500, 300_000), 299_999);
+    }
+
+    #[test]
+    fn sans_duree_connue_aucune_avance() {
+        assert_eq!(position_de_la_suiveuse(60_000, -500, 0), 60_000);
+        // Le retard, lui, reste possible.
+        assert_eq!(position_de_la_suiveuse(60_000, 500, 0), 59_500);
     }
 
     #[test]

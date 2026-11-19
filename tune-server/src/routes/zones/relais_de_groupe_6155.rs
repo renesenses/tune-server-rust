@@ -378,8 +378,11 @@ pub(crate) async fn lancer_en_tete_du_groupe<R: axum::response::IntoResponse>(
 /// quand le groupe se forme autour d'une zone qui joue déjà.
 ///
 /// #9089 — une suiveuse qui porte un décalage positif reçoit son geste plus
-/// tard, dans une tâche détachée (le relais n'attend pas) ; la décision est
-/// alors reprise sur l'état relu après l'attente.
+/// tard, dans une tâche détachée (le relais n'attend pas). Chaque geste prend
+/// un ticket de [`GestesDeSuiveuses`] : un geste plus récent rend caduque
+/// l'attente du précédent, et les gestes d'une même suiveuse passent un à un
+/// (jamais deux transferts à la fois). La décision est reprise sous le
+/// ticket, sur le groupe et l'état relus.
 pub(crate) async fn aligner_les_suiveuses(state: &AppState, meneuse: i64) {
     let suiveuses = zones_suiveuses(&groupes_enregistres(state), meneuse);
     if suiveuses.is_empty() {
@@ -395,8 +398,9 @@ pub(crate) async fn aligner_les_suiveuses(state: &AppState, meneuse: i64) {
         };
         let decalage_ms = decalage_de_groupe_9089::lire(&reglages, suiveuse);
         let attente_ms = attente_avant_le_geste_ms(geste, etat_tete.position_ms, decalage_ms);
+        let ticket = state.gestes_de_suiveuses.nouveau_ticket(suiveuse);
         if attente_ms == 0 {
-            executer_le_geste(state, meneuse, suiveuse, geste, decalage_ms).await;
+            aligner_sous_ticket(state, meneuse, suiveuse, ticket).await;
             continue;
         }
         info!(
@@ -410,14 +414,84 @@ pub(crate) async fn aligner_les_suiveuses(state: &AppState, meneuse: i64) {
         let state = state.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(attente_ms)).await;
-            // Relu après l'attente : la meneuse a pu changer de piste, se
-            // mettre en pause ou s'arrêter, et la suiveuse enchaîner seule.
-            let tete = Instantane::de(&state.playback.get_state(meneuse).await);
-            let etat = Instantane::de(&state.playback.get_state(suiveuse).await);
-            if let Some(geste) = geste_pour_la_suiveuse(&tete, &etat) {
-                executer_le_geste(&state, meneuse, suiveuse, geste, decalage_ms).await;
-            }
+            aligner_sous_ticket(&state, meneuse, suiveuse, ticket).await;
         });
+    }
+}
+
+/// [`aligner_les_suiveuses`] pour les bancs d'intégration (`tests/`), qui
+/// rejouent deux `started` rapprochés (#9089).
+#[doc(hidden)]
+pub async fn aligner_les_suiveuses_pour_test(state: &AppState, meneuse: i64) {
+    aligner_les_suiveuses(state, meneuse).await;
+}
+
+/// #9089 — le geste d'une suiveuse, sous son ticket : rien si un geste plus
+/// récent l'a dépassé, si la zone ne suit plus `meneuse` (dégroupée, ou
+/// devenue meneuse par une lecture lancée sur elle, #7717), ou si l'état relu
+/// ne demande plus rien. Le décalage est relu au même moment.
+async fn aligner_sous_ticket(state: &AppState, meneuse: i64, suiveuse: i64, ticket: TicketDeGeste) {
+    let _un_a_la_fois = ticket.file.un_a_la_fois.lock().await;
+    if !ticket.est_le_dernier() {
+        info!(meneuse, suiveuse, "zone_group_follower_gesture_superseded");
+        return;
+    }
+    if !zones_suiveuses(&groupes_enregistres(state), meneuse).contains(&suiveuse) {
+        info!(meneuse, suiveuse, "zone_group_follower_left_group");
+        return;
+    }
+    let tete = Instantane::de(&state.playback.get_state(meneuse).await);
+    let etat = Instantane::de(&state.playback.get_state(suiveuse).await);
+    let Some(geste) = geste_pour_la_suiveuse(&tete, &etat) else {
+        return;
+    };
+    let decalage_ms =
+        decalage_de_groupe_9089::lire(&SettingsRepo::with_backend(state.backend.clone()), suiveuse);
+    executer_le_geste(state, meneuse, suiveuse, geste, decalage_ms).await;
+}
+
+/// #9089 (relecture de #9155) — les gestes relayés à chaque suiveuse, par
+/// numéro de génération, sur le modèle de [`DeplacementsDeGroupe`] : seul le
+/// dernier s'applique, et ils passent un à un.
+#[derive(Default)]
+pub struct GestesDeSuiveuses {
+    par_suiveuse: std::sync::Mutex<std::collections::HashMap<i64, Arc<FileDeGestes>>>,
+}
+
+#[derive(Default)]
+struct FileDeGestes {
+    derniere: std::sync::atomic::AtomicU64,
+    un_a_la_fois: tokio::sync::Mutex<()>,
+}
+
+/// Un geste destiné à une suiveuse, numéroté à sa décision.
+pub(crate) struct TicketDeGeste {
+    file: Arc<FileDeGestes>,
+    generation: u64,
+}
+
+impl GestesDeSuiveuses {
+    /// Numérote un nouveau geste pour `suiveuse` : il dépasse tous les
+    /// précédents.
+    pub(crate) fn nouveau_ticket(&self, suiveuse: i64) -> TicketDeGeste {
+        let file = self
+            .par_suiveuse
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(suiveuse)
+            .or_default()
+            .clone();
+        let generation = file
+            .derniere
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        TicketDeGeste { file, generation }
+    }
+}
+
+impl TicketDeGeste {
+    fn est_le_dernier(&self) -> bool {
+        self.file.derniere.load(std::sync::atomic::Ordering::SeqCst) == self.generation
     }
 }
 

@@ -241,39 +241,120 @@ async fn la_route_enregistre_et_borne_le_decalage() {
     let (_, corps) = requete(&banc.app, "GET", &chemin, None).await;
     assert_eq!(corps["offset_ms"], json!(0));
 
-    // Zone inconnue.
+    // Borne négative : refusée de même.
+    let (status, corps) = requete(
+        &banc.app,
+        "PUT",
+        &chemin,
+        Some(json!({ "offset_ms": -2500 })),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{corps}");
+    let (_, corps) = requete(&banc.app, "GET", &chemin, None).await;
+    assert_eq!(corps["offset_ms"], json!(0));
+
+    // Zone inconnue, en lecture comme en écriture.
     let (status, _) = requete(&banc.app, "GET", "/api/v1/zones/987654/group-offset", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = requete(
+        &banc.app,
+        "PUT",
+        "/api/v1/zones/987654/group-offset",
+        Some(json!({ "offset_ms": 100 })),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 /// Une suiveuse décalée de +800 ms ne reçoit la piste de la meneuse qu'après
-/// ce délai (la meneuse vient de partir de 0:00).
+/// ce délai : rien 300 ms après le départ de la meneuse, la piste ensuite.
 ///
-/// Contre-épreuve : `la_lecture_lancee_sur_le_groupe_sort_sur_les_deux_enceintes`
-/// (#6155), sans décalage, voit la KEF jouer sans attendre ; mettre
-/// `attente_avant_le_geste_ms` à 0 fait tomber ce test.
+/// Le chrono part au retour de `play_from_queue` (la meneuse joue déjà).
+/// Contre-épreuve (mesurée sur Shrek) : forcer `attente_avant_le_geste_ms` à
+/// rendre 0 fait tomber ce test à la vérification des 300 ms (la KEF a déjà
+/// reçu la piste).
 #[tokio::test]
 async fn une_suiveuse_retardee_part_apres_son_decalage() {
     let banc = phantom_et_kef().await;
     decaler(&banc, banc.kef, 800).await;
     grouper(&banc).await;
 
-    let depart = Instant::now();
     banc.state
         .orchestrator
         .play_from_queue(banc.phantom, 0)
         .await
         .expect("lecture sur la meneuse");
+    let depart = Instant::now();
+    assert_eq!(
+        joues_par(&banc.state, "dlna-phantom").await,
+        vec!["Canopée".to_string()],
+        "témoin : la meneuse joue"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        joues_par(&banc.state, "dlna-kef").await.is_empty(),
+        "#9089 : la KEF (décalage +800 ms) ne doit rien recevoir {:?} après le départ \
+         de la meneuse — reçu : {:?}",
+        depart.elapsed(),
+        joues_par(&banc.state, "dlna-kef").await
+    );
     let kef_joue = attendre(|| async {
         joues_par(&banc.state, "dlna-kef").await == vec!["Canopée".to_string()]
     })
     .await;
-    let ecoule = depart.elapsed();
-    assert!(kef_joue, "témoin : la KEF finit par rejoindre le groupe");
-    // La meneuse a pu avancer un peu avant le relais : marge de 100 ms.
+    assert!(kef_joue, "la KEF finit par rejoindre le groupe");
+}
+
+/// Relecture de #9155, point 1 — une attente en cours ne fait rien si la
+/// zone a quitté le groupe entre-temps.
+#[tokio::test]
+async fn une_attente_ne_rejoint_plus_une_zone_degroupee() {
+    let banc = phantom_et_kef().await;
+    decaler(&banc, banc.kef, 800).await;
+    grouper(&banc).await;
+    banc.state
+        .orchestrator
+        .play_from_queue(banc.phantom, 0)
+        .await
+        .expect("lecture sur la meneuse");
+    // Dégroupé pendant l'attente de la KEF.
+    tune_core::db::settings_repo::SettingsRepo::with_backend(banc.state.backend.clone())
+        .set("zone_groups", "[]")
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
     assert!(
-        ecoule >= Duration::from_millis(700),
-        "#9089 : la KEF (décalage +800 ms) est partie {ecoule:?} après la meneuse"
+        joues_par(&banc.state, "dlna-kef").await.is_empty(),
+        "une zone dégroupée pendant l'attente ne doit pas être relancée — reçu : {:?}",
+        joues_par(&banc.state, "dlna-kef").await
+    );
+}
+
+/// Relecture de #9155, point 2 — deux gestes pour la même suiveuse : le plus
+/// ancien, dépassé, ne fait rien, et un seul transfert part.
+#[tokio::test]
+async fn un_geste_differe_depasse_ne_transfere_pas_une_seconde_fois() {
+    use tune_server::routes::zones::relais_de_groupe_6155::aligner_les_suiveuses_pour_test;
+
+    let banc = phantom_et_kef().await;
+    decaler(&banc, banc.kef, 600).await;
+    grouper(&banc).await;
+    banc.state
+        .orchestrator
+        .play_from_queue(banc.phantom, 0)
+        .await
+        .expect("lecture sur la meneuse");
+    // Un second alignement, comme un second `started` rapproché.
+    aligner_les_suiveuses_pour_test(&banc.state, banc.phantom).await;
+    let kef_joue = attendre(|| async {
+        joues_par(&banc.state, "dlna-kef").await == vec!["Canopée".to_string()]
+    })
+    .await;
+    assert!(kef_joue, "la KEF rejoint le groupe");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        joues_par(&banc.state, "dlna-kef").await.len(),
+        1,
+        "un seul transfert vers la KEF"
     );
 }
 
