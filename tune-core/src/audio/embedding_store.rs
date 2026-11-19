@@ -440,6 +440,102 @@ pub fn rank_by_vector(
     scored
 }
 
+/// #9157 — taille minimale du vivier dans lequel une ambiance tire sa
+/// sélection quand elle varie : les 250 pistes les plus proches de la requête.
+pub const VIVIER_MINIMAL: usize = 250;
+
+/// Taille du vivier pour une page de `limit` titres : au moins
+/// [`VIVIER_MINIMAL`], et cinq fois la page pour qu'une grande page (jusqu'à
+/// 200) garde de quoi varier.
+pub fn taille_du_vivier(limit: usize) -> usize {
+    VIVIER_MINIMAL.max(limit.saturating_mul(5))
+}
+
+/// Graine tirée de l'aléa du système, quand l'appelant n'en impose pas.
+pub fn graine_au_hasard() -> u64 {
+    let mut octets = [0u8; 8];
+    if getrandom::getrandom(&mut octets).is_err() {
+        // Repli sans aléa système : l'horloge suffit à varier une ambiance.
+        return std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9157);
+    }
+    u64::from_le_bytes(octets)
+}
+
+/// SplitMix64 : petit générateur déterministe. Une graine donnée redonne la
+/// même suite sur toutes les plateformes et toutes les versions de dépendances
+/// (ce que `rand::StdRng` ne garantit pas), d'où la même sélection en test.
+struct SplitMix64(u64);
+
+impl SplitMix64 {
+    fn suivant(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// Réel uniforme dans ]0, 1[ (jamais 0 : son logarithme sert de clé).
+    fn uniforme(&mut self) -> f64 {
+        ((self.suivant() >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+    }
+}
+
+/// #9157 — fait varier une ambiance d'un rappel à l'autre.
+///
+/// `classement` est trié du plus proche au plus lointain (sortie de
+/// [`rank_by_vector`]). Les `vivier` premières pistes sont remises dans un
+/// ordre tiré au hasard, pondéré par la proximité : la plus proche du vivier
+/// pèse 1, la plus lointaine e⁻³ ≈ 0,05, avec une décroissance exponentielle
+/// entre les deux, mesurée sur l'écart de cosinus propre au vivier (les
+/// cosinus CLAP texte→audio tiennent dans une bande étroite : une échelle
+/// absolue rendrait le tirage uniforme ou figé selon la requête). C'est
+/// l'échantillonnage pondéré sans remise d'Efraimidis–Spirakis : prendre les
+/// `n` premières de la sortie, c'est tirer `n` titres du vivier sans remise.
+/// La suite du classement, hors vivier, garde son ordre et sa place.
+///
+/// Même `graine` et même classement redonnent le même ordre.
+pub fn varier_le_classement(
+    classement: Vec<(i64, f32)>,
+    vivier: usize,
+    graine: u64,
+) -> Vec<(i64, f32)> {
+    let n = vivier.min(classement.len());
+    if n < 2 {
+        return classement;
+    }
+    let mut classement = classement;
+    let reste = classement.split_off(n);
+    let haut = classement
+        .iter()
+        .map(|(_, s)| *s)
+        .fold(f32::NEG_INFINITY, f32::max);
+    let bas = classement
+        .iter()
+        .map(|(_, s)| *s)
+        .fold(f32::INFINITY, f32::min);
+    let ecart = (haut - bas) as f64;
+    let mut alea = SplitMix64(graine);
+    let mut cles: Vec<(f64, (i64, f32))> = classement
+        .into_iter()
+        .map(|(id, s)| {
+            let poids = if ecart > 1e-6 {
+                (-3.0 * (haut - s) as f64 / ecart).exp()
+            } else {
+                1.0
+            };
+            (alea.uniforme().ln() / poids, (id, s))
+        })
+        .collect();
+    cles.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let mut sortie: Vec<(i64, f32)> = cles.into_iter().map(|(_, p)| p).collect();
+    sortie.extend(reste);
+    sortie
+}
+
 /// Héritage d'embeddings entre éditions d'une même piste (#1732, phase 1).
 ///
 /// Le DSD est exclu de l'analyse acoustique (le rééchantillonneur boucle sur
@@ -1096,5 +1192,101 @@ mod pistes_cue_tests {
             ligne_candidate(&[SqlValue::Text("not-an-id".into()), SqlValue::Null]),
             CandidatAcoustique::SansIdentifiant
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_varier_9157 {
+    use super::*;
+
+    /// 1 000 pistes, cosinus décroissant de 0,40 à 0,10 : la forme d'un
+    /// classement CLAP réel.
+    fn classement() -> Vec<(i64, f32)> {
+        (0..1000)
+            .map(|i| (i as i64 + 1, 0.40 - 0.0003 * i as f32))
+            .collect()
+    }
+
+    fn selection(graine: u64) -> Vec<i64> {
+        varier_le_classement(classement(), taille_du_vivier(50), graine)
+            .into_iter()
+            .take(50)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    #[test]
+    fn deux_rappels_tirent_deux_selections_differentes_dans_le_vivier() {
+        let vivier = taille_du_vivier(50);
+        assert_eq!(vivier, 250);
+        let a = selection(1);
+        let b = selection(2);
+        let mut ta = a.clone();
+        ta.sort_unstable();
+        let mut tb = b.clone();
+        tb.sort_unstable();
+        assert_ne!(ta, tb, "deux graines doivent donner deux sélections");
+        for id in a.iter().chain(b.iter()) {
+            assert!(
+                (1..=vivier as i64).contains(id),
+                "piste {id} hors du vivier des {vivier} plus proches"
+            );
+        }
+        ta.dedup();
+        assert_eq!(ta.len(), 50, "tirage sans remise : aucun doublon");
+    }
+
+    #[test]
+    fn la_meme_graine_redonne_la_meme_selection() {
+        assert_eq!(selection(9157), selection(9157));
+    }
+
+    #[test]
+    fn le_tirage_penche_vers_les_plus_proches() {
+        // Sur 200 tirages, le premier quart du vivier sort bien plus souvent
+        // que le dernier quart : la probabilité décroît avec la distance.
+        let (mut tete, mut queue) = (0usize, 0usize);
+        for g in 0..200u64 {
+            for id in selection(g) {
+                if id <= 62 {
+                    tete += 1;
+                } else if id > 188 {
+                    queue += 1;
+                }
+            }
+        }
+        assert!(tete > 3 * queue, "tête {tete}, queue {queue}");
+    }
+
+    #[test]
+    fn hors_vivier_l_ordre_ne_bouge_pas() {
+        let sortie = varier_le_classement(classement(), 250, 7);
+        assert_eq!(sortie.len(), 1000);
+        assert_eq!(&sortie[250..], &classement()[250..]);
+    }
+
+    #[test]
+    fn contre_epreuve_sans_variation_le_classement_reste_fige() {
+        // Ce que faisait le serveur avant #9157 (et fait encore avec
+        // `vary=false`) : les 50 premières, toujours les mêmes.
+        let fige: Vec<i64> = classement()
+            .into_iter()
+            .take(50)
+            .map(|(id, _)| id)
+            .collect();
+        assert_eq!(fige, (1..=50).collect::<Vec<i64>>());
+        assert_ne!(selection(1), fige);
+    }
+
+    #[test]
+    fn petits_classements_et_cosinus_egaux() {
+        assert_eq!(varier_le_classement(vec![(1, 0.3)], 250, 1), vec![(1, 0.3)]);
+        let egaux: Vec<(i64, f32)> = (1..=10).map(|i| (i, 0.2)).collect();
+        let mut sortie: Vec<i64> = varier_le_classement(egaux, 250, 3)
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        sortie.sort_unstable();
+        assert_eq!(sortie, (1..=10).collect::<Vec<i64>>());
     }
 }
