@@ -10,9 +10,10 @@
 //! publiés sur le bus. Aucun son, aucun périphérique : le registre des sorties
 //! est vide, l'envoi échoue après la résolution, qui seule arme les niveaux.
 //!
-//! Témoin : la même zone en mode DSD `pcm` transcode le DSF, et ce chemin-là
-//! publiait déjà ses niveaux — si le témoin tombe, c'est le banc qui ne
-//! mesure rien.
+//! Ce qui prouve que le banc mesure : la contre-épreuve (bloc #9117 de
+//! `resolve_local.rs` neutralisé → 0 trame, test rouge). Un témoin « même
+//! DSF en mode `pcm` » a été écarté : sur ce banc, où aucun renderer ne tire
+//! le flux, le chemin transcodé ne publie aucune trame.
 use crate::db::backend::DbBackend;
 use crate::db::models::Track;
 use crate::db::track_repo::TrackRepo;
@@ -179,20 +180,5 @@ async fn dsf_servi_tel_quel_a_un_renderer_dlna_publie_des_niveaux_9117() {
     assert!(
         crete > -90.0,
         "les niveaux mesurent la source : crête {crete}"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn temoin_le_meme_dsf_transcode_en_pcm_publiait_deja_ses_niveaux_9117() {
-    let mut b = banc("pcm").await;
-    let url = b.jouer().await;
-    assert!(
-        !url.ends_with(".dsf"),
-        "en mode `pcm`, le DSF doit être transcodé : URL {url:?}"
-    );
-    let (n, _) = b.compter(ATTENDUS).await;
-    assert!(
-        n >= ATTENDUS,
-        "témoin : le chemin transcodé publie {n} trame(s)"
     );
 }
