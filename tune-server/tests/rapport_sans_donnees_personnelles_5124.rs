@@ -140,7 +140,11 @@ async fn etat(base: &str) -> AppState {
         .unwrap();
     // #9140 — une zone au nom personnel.
     tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
-        .create("Mansarde de Philibert5124", Some("dlna"), Some("uuid:mansarde-5124"))
+        .create(
+            "Mansarde de Philibert5124",
+            Some("dlna"),
+            Some("uuid:mansarde-5124"),
+        )
         .unwrap();
     state.media_servers.lock().await.insert(
         "uuid:minim".into(),

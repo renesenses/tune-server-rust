@@ -1772,7 +1772,10 @@ async fn inscrire_le_serveur_multimedia(
     crate::confidentialite::retenir_nom_d_appareil(
         crate::confidentialite::Sorte::Appareil,
         &ms.name,
-        &[crate::confidentialite::materiel(Some(&ms.manufacturer), Some(&ms.model))],
+        &[crate::confidentialite::materiel(
+            Some(&ms.manufacturer),
+            Some(&ms.model),
+        )],
     );
     info!(
         id = %dev_id,

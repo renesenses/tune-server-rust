@@ -466,10 +466,18 @@ mod tests {
             "{forum}"
         );
         let mut noms = BTreeMap::new();
-        noms.insert("zone".to_string(), vec!["Véranda de Quirinal9140".to_string()]);
-        noms.insert("appareil".to_string(), vec!["Ampli Quirinal9140".to_string()]);
+        noms.insert(
+            "zone".to_string(),
+            vec!["Véranda de Quirinal9140".to_string()],
+        );
+        noms.insert(
+            "appareil".to_string(),
+            vec!["Ampli Quirinal9140".to_string()],
+        );
         let brut = ContexteBrut {
-            zone: Some(json!({"name": "Véranda de Quirinal9140", "state": "stopped", "output_type": "dlna"})),
+            zone: Some(
+                json!({"name": "Véranda de Quirinal9140", "state": "stopped", "output_type": "dlna"}),
+            ),
             journal: vec![ligne.to_string()],
             systeme: json!({"version": "1.0.0"}),
             noms,

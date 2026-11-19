@@ -1131,7 +1131,8 @@ mod tests {
         assert_eq!(encore, rapport);
         // La variante de l'assistant garde les noms (il les pseudonymise
         // lui-même), mais nettoie le reste.
-        let mut assistant = json!({"logs": "INFO zone Grenier de Wenceslas9140 prête token=abcdef0123456789"});
+        let mut assistant =
+            json!({"logs": "INFO zone Grenier de Wenceslas9140 prête token=abcdef0123456789"});
         anonymiser_json_garder_appareils(&mut assistant);
         let logs = assistant["logs"].as_str().unwrap();
         assert!(logs.contains("Grenier de Wenceslas9140"), "{logs}");

@@ -176,18 +176,21 @@ const SUFFIXE: &str = r"(?:(?:[ \t-]|\\{1,2}032)(?:[0-9A-Za-z]*[0-9][0-9A-Za-z]*
 
 /// Ce qui suit le mot d'appareil dans « <appareil> de X » : le « de » borne,
 /// un mot à majuscule y est un modèle (« JBL Flip 5 de X »).
-const SUFFIXE_DE: &str = r"(?:(?:[ \t-]|\\{1,2}032)(?:\p{Lu}\p{L}*|[0-9A-Za-z]*[0-9][0-9A-Za-z]*|mini))*";
+const SUFFIXE_DE: &str =
+    r"(?:(?:[ \t-]|\\{1,2}032)(?:\p{Lu}\p{L}*|[0-9A-Za-z]*[0-9][0-9A-Za-z]*|mini))*";
 
 /// Le propriétaire devant « ’s » : « Jean », « jean », « Jean-Pierre »,
 /// « Jean Paul ».
 fn proprietaire_possessif() -> String {
-    format!(r"(?P<proprio>(?:\p{{Lu}}\p{{Ll}}+{BLANC})?[\p{{L}}][\p{{L}}\p{{M}}]*(?:-[\p{{L}}][\p{{L}}\p{{M}}]*)*)")
+    format!(
+        r"(?P<proprio>(?:\p{{Lu}}\p{{Ll}}+{BLANC})?[\p{{L}}][\p{{L}}\p{{M}}]*(?:-[\p{{L}}][\p{{L}}\p{{M}}]*)*)"
+    )
 }
 
 /// « Jean’s MacBook Pro », « jean's iPhone 15 », « Jean Paul’s Echo Dot ».
 static RE_POSSESSIF: LazyLock<Regex> = LazyLock::new(|| {
     re(&format!(
-        r"\b{}{APOSTROPHE}s{SEP}+(?:{DISTINCTIFS}|{GENERIQUES})\b{SUFFIXE}",
+        r"{}{APOSTROPHE}s{SEP}+(?:{DISTINCTIFS}|{GENERIQUES})(?-u:\b){SUFFIXE}",
         proprietaire_possessif()
     ))
 });
@@ -196,7 +199,7 @@ static RE_POSSESSIF: LazyLock<Regex> = LazyLock::new(|| {
 /// « JBL Flip 5 de Jean », « iPad d’Anne », « Mac von Jan ».
 static RE_APPAREIL_DE: LazyLock<Regex> = LazyLock::new(|| {
     re(&format!(
-        r"\b(?:(?P<distinctif>{DISTINCTIFS})|{GENERIQUES})\b{SUFFIXE_DE}{SEP}+(?:(?:de|du|di|da|von|van){SEP}+|d{APOSTROPHE})(?P<proprio>[\p{{L}}][\p{{L}}\p{{M}}]+(?:-[\p{{L}}][\p{{L}}\p{{M}}]+)*(?:{BLANC}\p{{Lu}}\p{{Ll}}+)?)"
+        r"(?-u:\b)(?:(?P<distinctif>{DISTINCTIFS})|{GENERIQUES})(?-u:\b){SUFFIXE_DE}{SEP}+(?:(?:de|du|di|da|von|van){SEP}+|d{APOSTROPHE})(?P<proprio>[\p{{L}}][\p{{L}}\p{{M}}]+(?:-[\p{{L}}][\p{{L}}\p{{M}}]+)*(?:{BLANC}\p{{Lu}}\p{{Ll}}+)?)"
     ))
 });
 
@@ -204,13 +207,15 @@ static RE_APPAREIL_DE: LazyLock<Regex> = LazyLock::new(|| {
 /// « Jean-Pierres-MacBook-Pro ».
 static RE_HOTE_MDNS: LazyLock<Regex> = LazyLock::new(|| {
     re(
-        r"\b(?P<proprio>[\p{L}][\p{L}\p{M}]+(?:-[\p{L}][\p{L}\p{M}]+)*?)s-(?i:macbook(?:-(?:pro|air))?|imac|iphone|ipad|mac-(?:mini|studio|pro)|homepod)\b(?:-[0-9]+)?",
+        r"(?P<proprio>[\p{L}][\p{L}\p{M}]+(?:-[\p{L}][\p{L}\p{M}]+)*?)s-(?i:macbook(?:-(?:pro|air))?|imac|iphone|ipad|mac-(?:mini|studio|pro)|homepod)(?-u:\b)(?:-[0-9]+)?",
     )
 });
 
 /// Les écritures d'apostrophe et d'espace que [`cle`] ramène à `'` et ` `.
 static RE_ECHAPPEMENTS: LazyLock<Regex> = LazyLock::new(|| {
-    re(r"&apos;|&#0*39;|&#[xX]0*27;|&#0*8217;|&rsquo;|\\{1,2}226\\{1,2}128\\{1,2}153|\\{1,2}'|(\\{1,2}032)")
+    re(
+        r"&apos;|&#0*39;|&#[xX]0*27;|&#0*8217;|&rsquo;|\\{1,2}226\\{1,2}128\\{1,2}153|\\{1,2}'|(\\{1,2}032)",
+    )
 });
 
 /// Un jeton déjà posé : jamais repris.
@@ -219,9 +224,13 @@ const MOTIF_JETON: &str = r"\[(?:appareil|zone|profil)(?: [0-9]+)?\]";
 /// La clé d'un nom : casse, apostrophes, échappements et blancs ramenés à une
 /// seule forme, comme les compare le motif de la passe 1.
 fn cle(nom: &str) -> String {
-    let decode = RE_ECHAPPEMENTS.replace_all(nom.trim(), |c: &Captures| {
-        if c.get(1).is_some() { " " } else { "'" }
-    });
+    let decode =
+        RE_ECHAPPEMENTS.replace_all(
+            nom.trim(),
+            |c: &Captures| {
+                if c.get(1).is_some() { " " } else { "'" }
+            },
+        );
     let mut sortie = String::with_capacity(decode.len());
     let mut blanc = false;
     for c in decode.trim().chars() {
@@ -243,14 +252,13 @@ fn cle(nom: &str) -> String {
 }
 
 /// Le motif d'un nom connu : apostrophes, échappements et blancs
-/// indifférents, bornes de mot là où le nom commence ou finit par une lettre
-/// ou un chiffre.
+/// indifférents. Les bornes de mot sont vérifiées à la main par
+/// [`Seance::masquer_connus`] : une borne Unicode (`\b`) prive le moteur de son
+/// automate rapide dès qu'un caractère non ASCII paraît (×30 sur un journal
+/// accentué).
 fn motif_du_nom(nom: &str) -> String {
     let nom = cle(nom);
     let mut m = String::new();
-    if nom.chars().next().is_some_and(char::is_alphanumeric) {
-        m.push_str(r"\b");
-    }
     for c in nom.chars() {
         match c {
             ' ' => m.push_str(r"(?:\s|\\{1,2}032)+"),
@@ -258,10 +266,11 @@ fn motif_du_nom(nom: &str) -> String {
             _ => m.push_str(&regex::escape(&c.to_string())),
         }
     }
-    if nom.chars().last().is_some_and(char::is_alphanumeric) {
-        m.push_str(r"\b");
-    }
     m
+}
+
+fn lettre_ou_chiffre(c: Option<char>) -> bool {
+    c.is_some_and(|c| c.is_alphanumeric() || c == '_')
 }
 
 fn mots(texte: &str) -> Vec<String> {
@@ -302,10 +311,8 @@ fn morceaux_hors_materiel(nom: &str, materiels: &[String]) -> Vec<String> {
     mots_materiel.sort();
     mots_materiel.dedup();
     let trim = |m: &str| {
-        m.trim_matches(|c: char| {
-            c.is_whitespace() || "-–—:_|,;·()[]{}\"'«»".contains(c)
-        })
-        .to_string()
+        m.trim_matches(|c: char| c.is_whitespace() || "-–—:_|,;·()[]{}\"'«»".contains(c))
+            .to_string()
     };
     if mots_materiel.is_empty() {
         return vec![trim(nom)];
@@ -324,7 +331,11 @@ fn morceaux_hors_materiel(nom: &str, materiels: &[String]) -> Vec<String> {
 /// Ce nom mérite-t-il un jeton ?
 fn nom_a_masquer(sorte: Sorte, nom: &str, materiels: &[String]) -> bool {
     let nom = nom.trim();
-    let min = if sorte == Sorte::Zone { ZONE_MIN } else { NOM_MIN };
+    let min = if sorte == Sorte::Zone {
+        ZONE_MIN
+    } else {
+        NOM_MIN
+    };
     if nom.chars().count() < min || !nom.chars().any(char::is_alphabetic) {
         return false;
     }
@@ -399,7 +410,7 @@ impl Registre {
         if self.vus.len() < NOMS_MAX {
             self.vus.insert(c);
         }
-        if est_nom_de_materiel(nom, materiels) {
+        if !nom_a_masquer(sorte, nom, materiels) {
             return None;
         }
         let mut premier = None;
@@ -485,24 +496,42 @@ impl Seance {
         let Some(motif) = &self.instantane.motif else {
             return texte.to_string();
         };
-        motif
-            .replace_all(texte, |c: &Captures| {
-                let tout = &c[0];
-                if tout.starts_with('[') {
-                    return tout.to_string();
-                }
+        let mut sortie = String::with_capacity(texte.len());
+        let mut dernier = 0;
+        for m in motif.find_iter(texte) {
+            let tout = m.as_str();
+            if tout.starts_with('[') {
+                continue;
+            }
+            // Bornes de mot : « Salon » ne touche pas « Salonnière ».
+            let avant = texte[..m.start()].chars().next_back();
+            let apres = texte[m.end()..].chars().next();
+            let debut_mot = lettre_ou_chiffre(tout.chars().next());
+            let fin_mot = lettre_ou_chiffre(tout.chars().next_back());
+            if (debut_mot && lettre_ou_chiffre(avant)) || (fin_mot && lettre_ou_chiffre(apres)) {
+                continue;
+            }
+            sortie.push_str(&texte[dernier..m.start()]);
+            sortie.push_str(
                 self.instantane
                     .jetons
                     .get(&cle(tout))
-                    .cloned()
-                    .unwrap_or_else(|| "[appareil]".to_string())
-            })
-            .into_owned()
+                    .map_or("[appareil]", String::as_str),
+            );
+            dernier = m.end();
+        }
+        sortie.push_str(&texte[dernier..]);
+        sortie
     }
 
     fn jeton_local(&mut self, nom: &str) -> String {
         let c = cle(nom);
-        if let Some(j) = self.instantane.jetons.get(&c).or_else(|| self.locaux.get(&c)) {
+        if let Some(j) = self
+            .instantane
+            .jetons
+            .get(&c)
+            .or_else(|| self.locaux.get(&c))
+        {
             return j.clone();
         }
         self.suivant += 1;
@@ -626,7 +655,10 @@ mod tests {
                        INFO Alicia’s  Salon Box";
         let sortie = reg.seance().masquer(journal);
         for fuite in ["Alicia", "Naim", "naim", "Zélie", "Octavine"] {
-            assert!(!sortie.contains(fuite), "« {fuite} » sort encore : {sortie}");
+            assert!(
+                !sortie.contains(fuite),
+                "« {fuite} » sort encore : {sortie}"
+            );
         }
         assert_eq!(sortie.matches("[appareil 1]").count(), 5, "{sortie}");
         for garde in [
@@ -660,7 +692,14 @@ mod tests {
     fn noms_generiques_courts_et_materiels_ignores() {
         let mut reg = Registre::new();
         for n in [
-            "TV", "Tune", "AirPlay", "Zone 31", "  ", "1234", "[appareil 4]", "USB DAC",
+            "TV",
+            "Tune",
+            "AirPlay",
+            "Zone 31",
+            "  ",
+            "1234",
+            "[appareil 4]",
+            "USB DAC",
         ] {
             assert_eq!(retenu(&mut reg, Sorte::Appareil, n), None, "{n}");
         }
@@ -673,7 +712,10 @@ mod tests {
             assert_eq!(reg.retenir(Sorte::Zone, n, &materiels), None, "{n}");
         }
         // Un vrai nom à côté du matériel, lui, est retenu.
-        assert!(reg.retenir(Sorte::Appareil, "Marantz de Wilfried", &materiels).is_some());
+        assert!(
+            reg.retenir(Sorte::Appareil, "Marantz de Wilfried", &materiels)
+                .is_some()
+        );
         let texte = "Tune AirPlay: Zone 31 TV ok, Main, Marantz NR1711 USB DAC";
         assert_eq!(reg.seance().masquer(texte), texte);
     }
@@ -690,7 +732,10 @@ mod tests {
              - Mansarde de Philibert - Sonos Play:1 (dlna)\n\
              INFO Mansarde de Philibert volume=0.3",
         );
-        assert!(!sortie.contains("Rosalinde") && !sortie.contains("Philibert"), "{sortie}");
+        assert!(
+            !sortie.contains("Rosalinde") && !sortie.contains("Philibert"),
+            "{sortie}"
+        );
         for garde in [
             "- MinimServer [[appareil 1]] — 192.168.1.20:9790",
             "- [zone 1] - Sonos Play:1 (dlna)",
@@ -707,7 +752,8 @@ mod tests {
             reg.retenir(Sorte::Appareil, &format!("Enceinte numero {i}"), &[]);
         }
         assert_eq!(
-            reg.retenir(Sorte::Appareil, "Grenier d’Ondine", &[]).as_deref(),
+            reg.retenir(Sorte::Appareil, "Grenier d’Ondine", &[])
+                .as_deref(),
             Some("[appareil]")
         );
         let sortie = reg.seance().masquer("Grenier d’Ondine volume=0.4");
@@ -738,7 +784,10 @@ mod tests {
             "Alicia", "Bastien", "Hilaire", "Céleste", "Dorian", "Paul", "eloise", "Anouk",
             "Fabrice", "Gontran", "Hortense", "Ignace", "Kilian", "Gaëlle",
         ] {
-            assert!(!sortie.contains(fuite), "« {fuite} » sort encore : {sortie}");
+            assert!(
+                !sortie.contains(fuite),
+                "« {fuite} » sort encore : {sortie}"
+            );
         }
         // Le même appareil, le même jeton, sur les quatre formes.
         assert_eq!(sortie.matches("[appareil 1]").count(), 4, "{sortie}");
@@ -804,6 +853,8 @@ mod tests {
         let duree = debut.elapsed();
         eprintln!("1 000 lignes, 300 noms : {duree:?}");
         assert!(!sortie.contains("Zoéline") && !sortie.contains("Gaëlle"));
-        assert!(duree < std::time::Duration::from_secs(20), "{duree:?}");
+        // Large : la machine des épreuves est chargée, et c'est un binaire de
+        // mise au point. Avant l'automate rapide : 33 s.
+        assert!(duree < std::time::Duration::from_secs(8), "{duree:?}");
     }
 }
