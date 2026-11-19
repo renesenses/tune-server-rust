@@ -1101,13 +1101,44 @@ fn natural_end_when_played_enough() {
 
 #[test]
 fn natural_end_repeat_active_with_meaningful_playback() {
-    // Repeat on + peak > 5s → treat as natural end (DEvir QA B-05).
+    // Repeat on + peak > 5s, duration UNKNOWN → treat as natural end
+    // (DEvir QA B-05) : nothing else could tell the end.
     assert!(decisions::natural_end(
-        false, true, 6_000, false, 0, 300_000, true
+        false, true, 6_000, false, 0, 0, true
     ));
     // Repeat on but peak <= 5s → not enough.
     assert!(!decisions::natural_end(
-        false, true, 4_000, false, 0, 300_000, true
+        false, true, 4_000, false, 0, 0, true
+    ));
+    // Repeat on, known duration, peak at its end → natural end
+    // (`peak_reached_end`, #3229) : B-05 stays fixed.
+    assert!(decisions::natural_end(
+        false, true, 299_000, false, 2, 300_000, true
+    ));
+}
+
+/// #9031 (fil 2882, UAPP sur Android, rc12) — le relevé réel :
+/// `track_end_gap motif="natural_end_after_stopped" peak_pos=98000
+/// track_dur=153640 wall_secs=94`, zone en « Tout répéter ». Cinq sondes
+/// `Stopped` d'un renderer qui JOUAIT encore ne sont pas une fin de piste,
+/// répétition ou non.
+#[test]
+fn natural_end_repeat_all_ne_conclut_pas_a_mi_piste_9031() {
+    let (peak, dur, wall) = (98_000, 153_640, 94);
+    let joue_assez = decisions::played_enough(dur, peak, wall);
+    assert!(!joue_assez, "64 % joués ne suffisent pas");
+    assert!(
+        !decisions::natural_end(joue_assez, true, peak, false, wall, dur, true),
+        "#9031 : sous « Tout répéter », un Stopped à 98 s sur 153 s faisait \
+         passer au titre suivant pendant que le renderer jouait encore"
+    );
+    // Second relevé du même rapport (13:39:35) : 15 s sur 248 s.
+    assert!(!decisions::natural_end(
+        false, true, 15_000, false, 0, 248_706, true
+    ));
+    // Sans répétition, rien ne change : déjà refusé.
+    assert!(!decisions::natural_end(
+        joue_assez, false, peak, false, wall, dur, true
     ));
 }
 
