@@ -31,7 +31,12 @@
 //! est exactement celui que la base rendrait. Sans ce compteur (déclencheurs
 //! absents), la révision de la bibliothèque ([`super::library_revision`]) en
 //! tient lieu (plus souvent invalidée, jamais fausse) ; sans l'une ni l'autre,
-//! [`lire`] rend `None` et la route retombe sur ses requêtes SQL.
+//! aucun arbre n'est gardé ([`Lecture::SansRevision`]) et la route compte en
+//! SQL, comme avant.
+//!
+//! Pendant un scan, la révision bouge à chaque ajout : le dernier arbre est
+//! alors servi comme APPROCHÉ ([`Lecture::Approche`]), et reconstruit au plus
+//! une fois par [`INTERVALLE_DES_RECONSTRUCTIONS`].
 //!
 //! Les comptes sont ceux des requêtes qu'ils remplacent, moteur par moteur :
 //!
@@ -217,19 +222,30 @@ impl ArbreDesDossiers {
         self.chemins
     }
 
-    /// Estimation de la mémoire tenue : nœuds, tables d'enfants (clés
-    /// comprises, plus un octet de contrôle par case), identifiants.
+    /// Estimation de la mémoire tenue, par excès : le tableau des nœuds ;
+    /// pour chaque table d'enfants, ses cases RÉELLES (une table de hachage
+    /// alloue une puissance de deux de cases pour 7/8 de remplissage, plus un
+    /// octet de contrôle par case et un groupe de 16) ; chaque clé et chaque
+    /// liste d'identifiants comme une allocation à part, arrondie à 16 octets
+    /// avec 16 octets d'en-tête d'allocateur.
     pub fn octets(&self) -> usize {
         use std::mem::size_of;
-        let case = size_of::<(Box<str>, u32)>() + 1;
-        self.noeuds.capacity() * size_of::<Noeud>()
+        let allocation = |n: usize| if n == 0 { 0 } else { n.div_ceil(16) * 16 + 16 };
+        let table = |capacite: usize| {
+            if capacite == 0 {
+                return 0;
+            }
+            let cases = (capacite * 8).div_ceil(7).next_power_of_two().max(4);
+            allocation(cases * (size_of::<(Box<str>, u32)>() + 1) + 16)
+        };
+        allocation(self.noeuds.capacity() * size_of::<Noeud>())
             + self
                 .noeuds
                 .iter()
                 .map(|n| {
-                    n.enfants.capacity() * case
-                        + n.enfants.keys().map(|k| k.len()).sum::<usize>()
-                        + n.directes.capacity() * size_of::<i64>()
+                    table(n.enfants.capacity())
+                        + n.enfants.keys().map(|k| allocation(k.len())).sum::<usize>()
+                        + allocation(n.directes.capacity() * size_of::<i64>())
                 })
                 .sum::<usize>()
     }
@@ -314,19 +330,29 @@ fn clef(db: &dyn DbBackend) -> Option<Clef> {
 
 /// Un arbre par BASE (l'instance de la révision) : un serveur n'en a qu'une ;
 /// les tests, qui ouvrent plusieurs bases dans un même processus, ne
-/// s'évincent pas l'un l'autre.
+/// s'évincent pas l'un l'autre. Le DERNIER arbre construit reste gardé quand
+/// la révision bouge : il sert de valeur approchée (voir [`Lecture`]) pendant
+/// que le suivant se construit. Un seul arbre plein par base, donc (deux le
+/// temps d'une construction).
 struct Cache {
     courants: Mutex<HashMap<i64, (Clef, Arc<ArbreDesDossiers>)>>,
     /// Une construction à la fois : cinq clics pendant la première ne lancent
     /// pas cinq parcours.
     construction: Mutex<()>,
+    /// Début de la dernière construction lancée en arrière-plan, par base.
+    lancements: Mutex<HashMap<i64, std::time::Instant>>,
 }
 
 /// Au-delà, la table est vidée (voir [`Cache`]).
 const BASES_EN_CACHE_MAX: usize = 8;
 
+/// Pendant un scan, chaque ajout change la révision : l'arbre serait périmé
+/// avant d'être fini. Tant qu'un arbre approché existe, on n'en relance la
+/// construction (544 147 chemins) qu'une fois par intervalle.
+pub const INTERVALLE_DES_RECONSTRUCTIONS: std::time::Duration = std::time::Duration::from_secs(30);
+
 impl Cache {
-    fn servi(&self, clef: Clef) -> Option<Arc<ArbreDesDossiers>> {
+    fn exact(&self, clef: Clef) -> Option<Arc<ArbreDesDossiers>> {
         let courants = self.courants.lock().unwrap_or_else(|e| e.into_inner());
         courants
             .get(&clef.1)
@@ -334,12 +360,24 @@ impl Cache {
             .map(|(_, a)| a.clone())
     }
 
+    fn dernier(&self, instance: i64) -> Option<Arc<ArbreDesDossiers>> {
+        let courants = self.courants.lock().unwrap_or_else(|e| e.into_inner());
+        courants.get(&instance).map(|(_, a)| a.clone())
+    }
+
     fn garder(&self, clef: Clef, arbre: Arc<ArbreDesDossiers>) {
         let mut courants = self.courants.lock().unwrap_or_else(|e| e.into_inner());
         if courants.len() >= BASES_EN_CACHE_MAX && !courants.contains_key(&clef.1) {
             courants.clear();
         }
-        // L'arbre d'une révision passée est remplacé : un seul par base.
+        // Une révision plus ancienne que celle gardée ne la remplace pas
+        // (deux constructions qui se croisent).
+        if let Some((c, _)) = courants.get(&clef.1)
+            && c.0 == clef.0
+            && c.2 > clef.2
+        {
+            return;
+        }
         courants.insert(clef.1, (clef, arbre));
     }
 }
@@ -347,23 +385,26 @@ impl Cache {
 static CACHE: LazyLock<Cache> = LazyLock::new(|| Cache {
     courants: Mutex::new(HashMap::new()),
     construction: Mutex::new(()),
+    lancements: Mutex::new(HashMap::new()),
 });
 
-/// L'arbre des dossiers de `db`, construit au besoin, ou `None` si aucune
-/// révision n'est lisible (rien ne peut alors le garder exact) ou si la
-/// construction échoue — l'appelant retombe sur ses requêtes SQL.
+/// L'arbre EXACT des dossiers de `db`, construit au besoin (en attendant),
+/// ou `None` si aucune révision n'est lisible (rien ne peut alors le garder
+/// exact) ou si la construction échoue — l'appelant retombe sur ses requêtes
+/// SQL.
 ///
 /// La révision est lue AVANT la construction : une écriture validée pendant
-/// celle-ci change la révision suivante, et cet arbre n'est plus servi.
+/// celle-ci change la révision suivante, et cet arbre n'est plus servi comme
+/// exact.
 pub fn lire(db: &dyn DbBackend) -> Option<Arc<ArbreDesDossiers>> {
     let clef = clef(db)?;
-    if let Some(a) = CACHE.servi(clef) {
+    if let Some(a) = CACHE.exact(clef) {
         return Some(a);
     }
     // Un verrou empoisonné (une construction a paniqué) ne désactive pas
     // l'arbre pour la vie du processus : il ne garde aucune donnée.
     let _une_a_la_fois = CACHE.construction.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(a) = CACHE.servi(clef) {
+    if let Some(a) = CACHE.exact(clef) {
         return Some(a);
     }
     let debut = std::time::Instant::now();
@@ -390,6 +431,52 @@ pub fn lire(db: &dyn DbBackend) -> Option<Arc<ArbreDesDossiers>> {
 /// cours : on n'en lance pas une seconde.
 static EN_FOND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Remet [`EN_FOND`] à faux quand le travail de fond se termine, panique
+/// comprise, ou quand il n'a jamais pu partir (fermeture abandonnée).
+struct FinDuFond;
+
+impl Drop for FinDuFond {
+    fn drop(&mut self) {
+        EN_FOND.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Lance la construction de l'arbre de `db` hors du fil appelant, si aucune
+/// ne tourne déjà. Rend `true` si celle-ci vient d'être lancée.
+///
+/// Sur le pool de fils BLOQUANTS de l'exécuteur Tokio courant quand il y en
+/// a un : le moteur PostgreSQL passe par `Handle::current().block_on`, qui
+/// panique sur un fil nu (l'arbre ne se construisait jamais sous PostgreSQL).
+fn lancer_en_fond(db: &Arc<dyn DbBackend>) -> bool {
+    use std::sync::atomic::Ordering;
+    if EN_FOND.swap(true, Ordering::AcqRel) {
+        return false;
+    }
+    let fin = FinDuFond;
+    let db = db.clone();
+    let travail = move || {
+        let _fin = fin;
+        let _ = lire(db.as_ref());
+    };
+    match tokio::runtime::Handle::try_current() {
+        Ok(executeur) => {
+            drop(executeur.spawn_blocking(travail));
+        }
+        Err(_) => {
+            // Hors de tout exécuteur (outil, test synchrone) : un fil à lui.
+            // En cas d'échec, la fermeture abandonnée relâche `EN_FOND`.
+            if let Err(e) = std::thread::Builder::new()
+                .name("arbre-dossiers".into())
+                .spawn(travail)
+            {
+                tracing::warn!(error = %e, "arbre_des_dossiers_fil_impossible");
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Pour les témoins (ici et dans tune-server) : retient toute construction
 /// tant que la garde vit, ce qui simule une grande bibliothèque dont l'arbre
 /// n'est pas prêt. Rien d'autre ne l'appelle.
@@ -398,53 +485,95 @@ pub fn retenir_les_constructions() -> std::sync::MutexGuard<'static, ()> {
     CACHE.construction.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Pour les témoins : oublie quand la dernière construction de fond a été
+/// lancée, pour ne pas attendre [`INTERVALLE_DES_RECONSTRUCTIONS`].
+#[doc(hidden)]
+pub fn oublier_les_lancements() {
+    CACHE
+        .lancements
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
 /// Ce qu'a rendu [`lire_sans_attendre`].
 pub enum Lecture {
     /// L'arbre de l'état courant des chemins.
-    Pret(Arc<ArbreDesDossiers>),
-    /// Pas encore construit (sa construction tourne en arrière-plan), ou
-    /// impossible à garder exact (aucune révision lisible).
+    Exact(Arc<ArbreDesDossiers>),
+    /// Le dernier arbre construit, d'un état PASSÉ des chemins (un scan
+    /// tourne) : comptes approchés, à annoncer comme tels. Le suivant se
+    /// construit en arrière-plan, au plus une fois par
+    /// [`INTERVALLE_DES_RECONSTRUCTIONS`].
+    Approche(Arc<ArbreDesDossiers>),
+    /// Aucun arbre encore : le premier se construit en arrière-plan.
     EnAttente,
+    /// Aucune révision lisible (déclencheurs absents) : aucun arbre ne
+    /// peut rester exact ; l'appelant compte en SQL.
+    SansRevision,
+}
+
+/// Combien [`lire_sans_attendre`] attend un arbre qui n'existe pas encore.
+#[derive(Clone, Copy)]
+pub enum Attente {
+    /// Au plus cette durée, et seulement pour l'appel qui lance la toute
+    /// première construction (une petite bibliothèque a fini avant).
+    AuPlus(std::time::Duration),
+    /// Jusqu'au premier arbre (clients qui ne savent pas recevoir des comptes
+    /// différés). Un arbre approché, lui, est toujours servi sans attendre.
+    JusquAuPremier,
 }
 
 /// #9116 (fil 2935, Thierry C. : « à quoi te sert de compter […] quand
 /// c'est moi qui prendrai la décision d'ouvrir tel ou tel disque ? ») —
-/// l'arbre s'il est prêt, sans JAMAIS faire attendre la navigation plus de
-/// `attente` : s'il manque, sa construction part sur un fil à elle, et
-/// l'appelant affiche ses dossiers sans comptes (le client les redemande
-/// ensuite). `attente` laisse finir une construction courte (petite
-/// bibliothèque) pour servir les comptes du premier coup.
-pub fn lire_sans_attendre(db: &Arc<dyn DbBackend>, attente: std::time::Duration) -> Lecture {
-    use std::sync::atomic::Ordering;
+/// l'arbre exact s'il est prêt ; sinon le dernier construit, annoncé
+/// approché ; sinon rien, sans faire attendre la navigation (selon
+/// `attente`). Ce qui manque se construit en arrière-plan, une construction
+/// à la fois, et pas plus d'une par [`INTERVALLE_DES_RECONSTRUCTIONS`] tant
+/// qu'un arbre approché peut être servi.
+pub fn lire_sans_attendre(db: &Arc<dyn DbBackend>, attente: Attente) -> Lecture {
     let Some(clef) = clef(db.as_ref()) else {
-        return Lecture::EnAttente;
+        return Lecture::SansRevision;
     };
-    if let Some(a) = CACHE.servi(clef) {
-        return Lecture::Pret(a);
+    if let Some(a) = CACHE.exact(clef) {
+        return Lecture::Exact(a);
     }
-    if !EN_FOND.swap(true, Ordering::AcqRel) {
-        let db = db.clone();
-        let lance = std::thread::Builder::new()
-            .name("arbre-dossiers".into())
-            .spawn(move || {
-                let _ = lire(db.as_ref());
-                EN_FOND.store(false, Ordering::Release);
-            });
-        if let Err(e) = lance {
-            EN_FOND.store(false, Ordering::Release);
-            tracing::warn!(error = %e, "arbre_des_dossiers_fil_impossible");
+    if let Some(a) = CACHE.dernier(clef.1) {
+        let mut lancements = CACHE.lancements.lock().unwrap_or_else(|e| e.into_inner());
+        let du = lancements
+            .get(&clef.1)
+            .is_none_or(|t| t.elapsed() >= INTERVALLE_DES_RECONSTRUCTIONS);
+        if du && lancer_en_fond(db) {
+            lancements.insert(clef.1, std::time::Instant::now());
         }
+        return Lecture::Approche(a);
     }
-    let fin = std::time::Instant::now() + attente;
-    loop {
-        if let Some(a) = CACHE.servi(clef) {
-            return Lecture::Pret(a);
+    let lance = lancer_en_fond(db);
+    if lance {
+        CACHE
+            .lancements
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(clef.1, std::time::Instant::now());
+    }
+    match attente {
+        Attente::JusquAuPremier => match lire(db.as_ref()) {
+            Some(a) => Lecture::Exact(a),
+            None => Lecture::EnAttente,
+        },
+        Attente::AuPlus(_) if !lance => Lecture::EnAttente,
+        Attente::AuPlus(duree) => {
+            let fin = std::time::Instant::now() + duree;
+            loop {
+                if let Some(a) = CACHE.exact(clef) {
+                    return Lecture::Exact(a);
+                }
+                let reste = fin.saturating_duration_since(std::time::Instant::now());
+                if reste.is_zero() {
+                    return Lecture::EnAttente;
+                }
+                std::thread::sleep(reste.min(std::time::Duration::from_millis(10)));
+            }
         }
-        let reste = fin.saturating_duration_since(std::time::Instant::now());
-        if reste.is_zero() {
-            return Lecture::EnAttente;
-        }
-        std::thread::sleep(reste.min(std::time::Duration::from_millis(10)));
     }
 }
 

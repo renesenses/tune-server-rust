@@ -256,6 +256,21 @@ pub fn sql_pistes_du_dossier(engine: Engine, depart_enfant: usize) -> String {
     )
 }
 
+/// #9116 — combien de pistes sous un dossier, en s'arrêtant à `plafond` :
+/// `SELECT COUNT(*)` d'au plus `plafond` entrées de [`INDEX_CHEMIN_DOSSIER_SQLITE`]
+/// (plage de [`plage_du_dossier`], paramètres 1 et 2 = [`bornes_du_dossier`]).
+/// Sert à décider, sans arbre exact, si la plage récursive de
+/// [`sql_pistes_du_dossier`] est bon marché (un album) ou non (un disque
+/// entier) — sans jamais parcourir plus de `plafond` entrées.
+pub fn sql_compter_sous_dossier_plafonne(engine: Engine, plafond: usize) -> String {
+    let (p1, p2) = match engine {
+        Engine::Postgres => ("$1", "$2"),
+        Engine::Sqlite => ("?1", "?2"),
+    };
+    let plage = plage_du_dossier(engine, CHEMIN_DE_LA_PISTE, p1, p2);
+    format!("SELECT COUNT(*) FROM (SELECT 1 FROM tracks WHERE {plage} LIMIT {plafond}) AS s")
+}
+
 /// #9116 — les mêmes colonnes, dans le même ordre et triées de même, que
 /// [`sql_pistes_du_dossier`], mais pour `n` identifiants (`?1`…`?n`) : les
 /// pistes directes d'un dossier, que [`super::arbre_des_dossiers`] connaît

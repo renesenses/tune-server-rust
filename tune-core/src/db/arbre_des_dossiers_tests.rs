@@ -101,10 +101,10 @@ fn banc_200k_descente_par_niveau_arbre_contre_sql() {
         octets as f64 / total as f64
     );
     // Mémoire bornée : l'identifiant (8 octets) par piste, plus un nœud par
-    // dossier (≈ 21 000 ici). Plafond large, mais qui rougit si l'arbre se
-    // mettait à garder les chemins entiers (~50 octets chacun).
+    // dossier (≈ 21 000 ici), estimés par excès (`octets`). Plafond large,
+    // mais qui rougit si l'arbre se mettait à garder les chemins entiers.
     assert!(
-        octets < 40 * total as usize,
+        octets < 64 * total as usize,
         "{octets} octets pour {total} chemins : l'arbre ne doit pas garder les chemins"
     );
 
@@ -323,4 +323,137 @@ fn la_lecture_par_pages_ne_perd_rien() {
     let a = construire(&db).unwrap();
     assert_eq!(a.nb_chemins() as i64, n);
     assert_eq!(a.fichiers_sous("/m"), n);
+}
+
+/// Pendant un scan, la révision des chemins bouge à chaque ajout. Le dernier
+/// arbre est servi comme APPROCHÉ, une seule reconstruction part en fond, et
+/// pas de nouvelle avant [`INTERVALLE_DES_RECONSTRUCTIONS`] : jamais une
+/// reconstruction de toute la bibliothèque par clic.
+#[test]
+fn pendant_un_scan_l_arbre_approche_et_les_reconstructions_sont_espacees() {
+    let db: Arc<dyn DbBackend> = Arc::new(base());
+    let poser = |i: i64| {
+        db.execute_batch(&format!(
+            "INSERT INTO tracks (title, file_path, format, source) \
+             VALUES ('t', '/m/A/{i}.flac', 'flac', 'local');"
+        ))
+        .unwrap()
+    };
+    poser(1);
+    let premier = lire(db.as_ref()).unwrap();
+    oublier_les_lancements();
+    poser(2);
+    // Approché, aussitôt ; une reconstruction part en fond.
+    let Lecture::Approche(a) = lire_sans_attendre(&db, Attente::AuPlus(Duration::ZERO)) else {
+        panic!("pendant un scan, le dernier arbre doit être servi");
+    };
+    assert!(Arc::ptr_eq(&a, &premier));
+    let exact = attendre_l_exact(&db, Duration::from_secs(10))
+        .expect("la reconstruction de fond doit aboutir");
+    assert_eq!(exact.pistes_sous("/m/A"), 2);
+    // Nouvel ajout DANS l'intervalle : servi approché, AUCUNE reconstruction.
+    poser(3);
+    for _ in 0..20 {
+        match lire_sans_attendre(&db, Attente::AuPlus(Duration::ZERO)) {
+            Lecture::Approche(a) => assert_eq!(a.pistes_sous("/m/A"), 2),
+            _ => panic!("reconstruit dans l'intervalle : une par clic pendant un scan"),
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // L'intervalle écoulé (simulé) : la suivante part.
+    oublier_les_lancements();
+    assert!(matches!(
+        lire_sans_attendre(&db, Attente::AuPlus(Duration::ZERO)),
+        Lecture::Approche(_)
+    ));
+    let exact = attendre_l_exact(&db, Duration::from_secs(10)).unwrap();
+    assert_eq!(exact.pistes_sous("/m/A"), 3);
+}
+
+/// Relit jusqu'à l'arbre exact de l'état courant (en relançant la
+/// construction de fond si un autre témoin tenait le verrou de fond).
+fn attendre_l_exact(db: &Arc<dyn DbBackend>, max: Duration) -> Option<Arc<ArbreDesDossiers>> {
+    let fin = Instant::now() + max;
+    while Instant::now() < fin {
+        if let Lecture::Exact(a) = lire_sans_attendre(db, Attente::AuPlus(Duration::ZERO)) {
+            return Some(a);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    None
+}
+
+/// Une construction de fond qui panique relâche son verrou de fond : la
+/// suivante peut partir (sans quoi l'arbre ne se construisait plus jamais).
+#[test]
+fn une_construction_de_fond_qui_echoue_n_empeche_pas_la_suivante() {
+    use std::sync::atomic::Ordering;
+    {
+        let fin = FinDuFond;
+        EN_FOND.store(true, Ordering::SeqCst);
+        let _ = std::thread::spawn(move || {
+            let _fin = fin;
+            panic!("construction en échec (simulée)");
+        })
+        .join();
+    }
+    assert!(
+        !EN_FOND.load(Ordering::SeqCst),
+        "une construction de fond qui panique laisse le verrou de fond pris"
+    );
+}
+
+/// #9116 — sous PostgreSQL, le moteur passe par `Handle::current().block_on` :
+/// la construction de fond doit tourner DANS l'exécuteur (pool bloquant), pas
+/// sur un fil nu où elle paniquait — l'arbre ne se construisait jamais et les
+/// comptes restaient à 0. Saute sans `TUNE_TEST_PG_URL`.
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_9116_arbre_des_dossiers_se_construit_en_fond() {
+    let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+        eprintln!("SAUT : TUNE_TEST_PG_URL non posée");
+        return;
+    };
+    let pool = sqlx::PgPool::connect(&url).await.expect("connexion PG");
+    for sql in crate::db::postgres::ENSURE_TABLES
+        .iter()
+        .chain(crate::db::postgres::ENSURE_COLUMNS.iter())
+    {
+        let _ = sqlx::raw_sql(*sql).execute(&pool).await;
+    }
+    crate::db::migrations::run_pg_migrations(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("run_pg_migrations : {e}"));
+    let db: Arc<dyn DbBackend> = Arc::new(crate::db::backend::PostgresBackend::new(pool));
+    db.execute("TRUNCATE TABLE tracks RESTART IDENTITY CASCADE", &[])
+        .unwrap();
+    db.execute(
+        "INSERT INTO tracks (title, file_path, format, source) \
+         SELECT 't' || i, '/pg9116/Artiste ' || (i / 100) || '/' || i || '.flac', 'flac', 'local' \
+         FROM generate_series(1, 3000) AS g(i)",
+        &[],
+    )
+    .unwrap();
+    assert!(
+        lire_revision_des_chemins(db.as_ref()).is_some(),
+        "révision des chemins absente sous PostgreSQL"
+    );
+    // Comme la route : depuis un fil bloquant de l'exécuteur.
+    let resultat = tokio::task::spawn_blocking(move || {
+        let fin = Instant::now() + Duration::from_secs(30);
+        loop {
+            match lire_sans_attendre(&db, Attente::AuPlus(Duration::ZERO)) {
+                Lecture::Exact(a) => return Some(a.fichiers_sous("/pg9116")),
+                _ if Instant::now() > fin => return None,
+                _ => std::thread::sleep(Duration::from_millis(50)),
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        resultat,
+        Some(3000),
+        "sous PostgreSQL, l'arbre des dossiers ne s'est jamais construit en fond"
+    );
 }
