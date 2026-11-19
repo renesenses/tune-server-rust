@@ -113,8 +113,8 @@ pub const ID_REAFFECTATION: &str = "channel-remap";
 /// [`ORIGINE_MESURE`] (micro, Premium) ou [`ORIGINE_ESTIMATION`] (calculée
 /// sans micro, Free). N'appartient qu'à la chaîne, jamais à `eq_profile`.
 pub const CHAMP_ORIGINE: &str = "origin";
-pub const ORIGINE_MESURE: &str = "measured";
-pub const ORIGINE_ESTIMATION: &str = "estimation";
+pub const ORIGINE_MESURE: &str = crate::room_correction::ORIGINE_MESUREE;
+pub const ORIGINE_ESTIMATION: &str = crate::room_correction::ORIGINE_ESTIMEE;
 /// Le nom par défaut d'un profil de pièce calculé sans micro (C5,
 /// `plugins/tune-calibration/src/routes.rs` : « Estimation {id} »).
 pub const PREFIXE_NOM_ESTIMATION: &str = "Estimation ";
@@ -856,8 +856,38 @@ fn lire_ombre(settings: &SettingsRepo, zone_id: i64) -> Result<Option<Ombre>, Er
     Ok(stockage(settings.get(&cle))?.and_then(|brut| serde_json::from_str(&brut).ok()))
 }
 
-fn ombre_de(inst: &Instantane) -> Ombre {
-    inst.iter().map(|(p, v)| (p.nom(), v.clone())).collect()
+/// D2 : l'entrée de l'ombre qui garde la nature de la sortie de la zone à
+/// la dernière synchronisation ([`SORTIE_LOCALE`] ou [`SORTIE_RESEAU`]). Ce
+/// n'est pas une partie : [`Partie::depuis_nom`] l'ignore.
+pub const OMBRE_SORTIE: &str = "output";
+pub const SORTIE_LOCALE: &str = "local";
+pub const SORTIE_RESEAU: &str = "network";
+
+fn ombre_de(inst: &Instantane, sortie_locale: bool) -> Ombre {
+    let mut o: Ombre = inst.iter().map(|(p, v)| (p.nom(), v.clone())).collect();
+    o.insert(
+        OMBRE_SORTIE.into(),
+        Some(
+            if sortie_locale {
+                SORTIE_LOCALE
+            } else {
+                SORTIE_RESEAU
+            }
+            .into(),
+        ),
+    );
+    o
+}
+
+/// La sortie de la zone est-elle locale (le repli mono y agit aujourd'hui) ?
+/// Zone inconnue : locale, comme la lecture d'aujourd'hui.
+fn sortie_locale_de(settings: &SettingsRepo, zone_id: i64) -> Result<bool, ErreurMigration> {
+    let zone = stockage(
+        crate::db::zone_repo::ZoneRepo::with_backend(settings.backend().clone()).get(zone_id),
+    )?;
+    Ok(zone.as_ref().is_none_or(|z| {
+        crate::audio::mono_downmix::mono_downmix_runs_on_output(z.output_device_id.as_deref())
+    }))
 }
 
 /// Mode Pure, lu exactement comme aujourd'hui : `audiophile` objet JSON avec
@@ -999,6 +1029,30 @@ pub fn lire_zone(
     }
 
     exclusivite_du_groupe(&mut chaine, &|id| membre_en_service(settings, id));
+    // D2 (18/11 soir) : la zone est passée d'une sortie locale au réseau
+    // depuis la dernière synchronisation, et l'interrupteur mono n'a pas
+    // bougé : même règle qu'à la migration, le mono est décoché d'office
+    // (l'ancien moteur l'ignorait sur le réseau). Recoché ensuite (`PUT`),
+    // l'ombre dit « réseau » et il agit.
+    let mono_inchange = inst.get(&Partie::Mono).is_some_and(|brut| {
+        ombre_lue
+            .get(&Partie::Mono.nom())
+            .is_some_and(|o| meme_valeur(o.as_deref(), brut.as_deref()))
+    });
+    if !sortie_locale
+        && ombre_connue
+        && mono_inchange
+        && ombre_lue.get(OMBRE_SORTIE).and_then(|o| o.as_deref()) == Some(SORTIE_LOCALE)
+    {
+        for m in &mut chaine.plugins {
+            if m.id == ID_MONO && m.enabled {
+                let mut marque = Map::new();
+                marque.insert(MARQUE_MONO_INERTE.into(), Value::Bool(true));
+                m.enabled = false;
+                m.settings = Value::Object(marque);
+            }
+        }
+    }
     // D2 : un repli mono décoché parce qu'inerte sur le réseau redevient
     // coché si la zone sort maintenant en local (l'interrupteur, resté à
     // « true », y agit).
@@ -1023,7 +1077,7 @@ pub fn lire_zone(
         chaine,
         depuis_les_anciennes_cles,
         conversion,
-        ombre_de(&inst),
+        ombre_de(&inst, sortie_locale),
     ))
 }
 
@@ -1646,7 +1700,7 @@ fn ecrire_chaine_avec(
         settings,
         zone_id,
         &chaine.clone().mettre_a_niveau(),
-        &ombre_de(&inst),
+        &ombre_de(&inst, sortie_locale_de(settings, zone_id)?),
     )?;
     Ok(bilan)
 }

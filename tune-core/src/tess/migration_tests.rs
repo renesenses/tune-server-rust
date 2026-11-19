@@ -325,6 +325,7 @@ fn semer(backend: &Arc<dyn DbBackend>, s: &SettingsRepo) -> Vec<i64> {
                     filters: filtres_de_piece(),
                     created_at: "2026-11-18T00:00:00Z".into(),
                     measurement_data: None,
+                    origin: None,
                 };
                 s.set(
                     &format!("room_profile_{z}"),
@@ -1306,6 +1307,7 @@ fn poser_la_piece(s: &SettingsRepo, z: i64, nom: &str, champ: Option<(&str, Valu
         filters: filtres_de_piece(),
         created_at: "2026-11-18T00:00:00Z".into(),
         measurement_data: None,
+        origin: None,
     };
     let mut v = serde_json::to_value(&piece).unwrap();
     if let Some((k, x)) = champ {
@@ -1395,6 +1397,56 @@ fn d1_une_correction_calculee_sans_micro_est_free_et_jamais_convertie() {
         etape_piece(&sans, false).reason,
         Some(MotifEtape::PremiumRequired)
     );
+}
+
+#[test]
+fn d1_l_origine_enregistree_a_la_creation_l_emporte_sur_le_nom() {
+    // Décision du 18/11 soir : tout profil créé enregistre son origine
+    // (`RoomProfile::origin`) ; le nom ne sert plus qu'aux profils anciens.
+    let profil = |nom: &str, origine: Option<&str>| crate::room_correction::RoomProfile {
+        name: nom.into(),
+        zone_id: "1".into(),
+        filters: filtres_de_piece(),
+        created_at: "2026-11-18T00:00:00Z".into(),
+        measurement_data: None,
+        origin: origine.map(str::to_owned),
+    };
+    let v = |p| serde_json::to_value(p).unwrap();
+    assert_eq!(
+        origine_de_la_piece(&v(profil("Estimation 3", Some("measured")))),
+        ORIGINE_MESURE
+    );
+    assert_eq!(
+        origine_de_la_piece(&v(profil("Mon salon", Some("estimation")))),
+        ORIGINE_ESTIMATION
+    );
+    // Profil ancien, sans origine : la règle du nom (et le champ absent du
+    // JSON, pour rester lisible par une version précédente).
+    let ancien = v(profil("Estimation 3", None));
+    assert!(ancien.get("origin").is_none());
+    assert_eq!(origine_de_la_piece(&ancien), ORIGINE_ESTIMATION);
+    assert_eq!(
+        origine_de_la_piece(&v(profil("Salon", None))),
+        ORIGINE_MESURE
+    );
+    // Et de bout en bout : une estimation renommée reste Free sans Premium.
+    let (_b, s) = base();
+    let z = 22;
+    let p = profil("Mon salon", Some("estimation"));
+    s.set(
+        &format!("room_profile_{z}"),
+        &serde_json::to_string(&p).unwrap(),
+    )
+    .unwrap();
+    let eq = crate::room_correction::profil_eq_de_correction(&filtres_de_piece());
+    s.set(
+        &format!("zone_{z}_eq_profile"),
+        &serde_json::to_string(&eq).unwrap(),
+    )
+    .unwrap();
+    let l = lire_zone(&s, z, false).unwrap();
+    assert!(!l.conversion_piece);
+    assert!(correction_estimee(&l.chaine.plugins[0]));
 }
 
 #[test]
@@ -2075,7 +2127,7 @@ fn d2_reseau_vers_local_le_mono_reprend() {
 }
 
 #[test]
-fn d2_local_vers_reseau_le_mono_coche_agit_partout() {
+fn d2_local_vers_reseau_le_mono_est_decoche_d_office_puis_agit_si_recoche() {
     let (backend, s) = base();
     let repo = crate::db::zone_repo::ZoneRepo::with_backend(backend.clone());
     let z = repo
@@ -2083,8 +2135,52 @@ fn d2_local_vers_reseau_le_mono_coche_agit_partout() {
         .unwrap();
     s.set(&format!("zone_{z}_mono_downmix"), "true").unwrap();
     migrer_zone(&s, z).unwrap();
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_MONO, true)]
+    );
     changer_de_sortie(&backend, z, "dlna:uuid-10");
-    // Décision A : coché après la migration, il agit partout.
+    // Décision du 18/11 soir : même règle qu'à la migration, le mono est
+    // décoché d'office au passage sur le réseau (l'ancien moteur l'y
+    // ignorait), marqué, et l'ancienne clé n'est pas touchée.
+    let c = lire_zone(&s, z, true).unwrap().chaine;
+    assert_eq!(ids(&c), vec![(ID_MONO, false)]);
+    assert_eq!(c.plugins[0].settings, json!({"inert_on_network": true}));
+    let avant = hors_tess(&s);
+    assert!(ecrire_chaine(&s, z, &c).unwrap().cles_modifiees.is_empty());
+    assert_eq!(hors_tess(&s), avant);
+    // Toujours décoché après cette écriture (l'ombre dit « réseau »).
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_MONO, false)]
+    );
+    // Recoché à la main sur le réseau : il agit, et le reste.
+    let mut c = lire_zone(&s, z, true).unwrap().chaine;
+    c.plugins[0].enabled = true;
+    ecrire_chaine(&s, z, &c).unwrap();
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_MONO, true)]
+    );
+    // Revenue en local : coché (l'interrupteur, resté à « true », y agit).
+    changer_de_sortie(&backend, z, "local:hw:3");
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_MONO, true)]
+    );
+}
+
+#[test]
+fn d2_temoin_une_zone_locale_qui_reste_locale_garde_son_mono() {
+    let (backend, s) = base();
+    let repo = crate::db::zone_repo::ZoneRepo::with_backend(backend.clone());
+    let z = repo
+        .create("Casque", Some("local"), Some("local:hw:6"))
+        .unwrap();
+    s.set(&format!("zone_{z}_mono_downmix"), "true").unwrap();
+    migrer_zone(&s, z).unwrap();
+    // Une autre sortie locale : rien ne change.
+    changer_de_sortie(&backend, z, "local:hw:7");
     assert_eq!(
         ids(&lire_zone(&s, z, true).unwrap().chaine),
         vec![(ID_MONO, true)]

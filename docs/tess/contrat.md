@@ -546,14 +546,17 @@ producteur et le rendu transporte des `f64`**, et que la quantification
     - **Calculée sans micro** (C5, #7919, `"estimation"`) : Free, active sans
       Premium, jamais convertie (`correction_estimee`, honoré par la
       résolution).
-    - **Origine** : les anciens réglages ne l'enregistrent pas. On lit
+    - **Origine** : tout profil créé désormais l'enregistre
+      (`RoomProfile.origin`, `"measured"` ou `"estimation"`) : le greffon de
+      calibration selon sa route (mesure C2 ou estimation C5), la route
+      manuelle `POST /room-correction/profiles/{zone}` toujours en
+      `"measured"`. Les profils anciens ne l'ont pas. On lit
       `room_profile_{id}` : un champ explicite (`"estimation": true|false` ou
       `"origin"`) l'emporte ; sinon le nom par défaut d'une estimation C5
       (« Estimation {id} ») ; sinon **mesurée**. Les bornes de C5 ne servent
       pas d'indice (le mode expert #8332 les relève). Dans le doute, la
       correction est donc traitée en Premium : convertie, jamais détruite.
-      Le greffon de calibration devrait écrire le champ explicite (tâche
-      Codex 28, qui sort aussi C5 de la garde Premium du greffon).
+      Sortir C5 de la garde Premium du greffon reste la tâche Codex 28.
     - **L'origine appartient au serveur** : `ecrire_chaine` la réécrit
       d'après `room_profile_{id}` quoi que dise le corps (`"estimation"`
       seulement si les bandes sont celles d'une estimation de la zone,
@@ -565,8 +568,13 @@ producteur et le rendu transporte des `f64`**, et que la quantification
     `"inert_on_network": true` : aucun changement audible, et l'ancienne clé
     n'est pas touchée. Coché ensuite (TESS ou ancienne route), il agit
     partout. Si la zone passe ensuite sur une sortie locale, où
-    l'interrupteur (resté à `"true"`) agit, il est recoché à la lecture ;
-    une zone locale qui passe sur le réseau garde son mono coché.
+    l'interrupteur (resté à `"true"`) agit, il est recoché à la lecture.
+    Une zone locale qui passe sur le réseau suit la règle de la migration :
+    son mono est décoché d'office avec `inert_on_network` (l'ancien moteur
+    l'ignorait sur le réseau) ; recoché ensuite à la main, il agit. La
+    nature de la sortie à la dernière synchronisation est gardée dans
+    l'ombre (entrée `"output"` : `"local"` ou `"network"`) ; la règle ne
+    joue que si l'interrupteur mono n'a pas bougé depuis.
 - **Les marques de la lecture appartiennent au serveur** (T02 suites, pour
   T08) : `origin` (D1) est réécrite d'après `room_profile_{id}` ;
   `replaced_in_group` (décision B) et `inert_on_network` (D2) ne sont gardées
@@ -577,21 +585,19 @@ producteur et le rendu transporte des `f64`**, et que la quantification
   (son ancienne clé est décochée). Un client qui renvoie les réglages lus ne
   peut donc ni garder cochée l'ancienne clé d'un membre écarté après avoir
   décoché le gagnant, ni faire recocher en local un mono décoché à la main.
-- **En attente de Bertrand (TODO, non tranché par T02)** :
-  - **I3** : relecture d'une copie de base réelle (`TUNE_T02_COPIE`, test
-    ignoré `i3_relecture_d_une_copie_de_base_reelle`) : attend la copie.
-  - **D2, zone locale passée sur le réseau** : le mono coché le reste et
-    agira sur le réseau une fois T03 branché, là où l'ancien moteur
-    l'ignorait (changement audible). C'est la lecture littérale de « agit
-    partout où on le coche » ; à confirmer, l'alternative étant de le
-    décocher avec `inert_on_network` au changement de sortie.
-  - **D2, zone réseau passée en local** : recoché à la lecture, parce que
-    l'interrupteur resté à `"true"` y agit dans l'ancien moteur. Déduit de
-    « aucun changement audible », à confirmer.
-  - **D1, origine des profils existants** : le nom par défaut
-    « Estimation {id} » désigne une estimation, tout le reste est traité en
-    mesure (converti pour un compte gratuit). À confirmer, et à remplacer par
-    le champ explicite dès que la tâche Codex 28 l'écrit.
+- **Décidé le 18/11 au soir** (Bertrand : « fais au mieux » ; principe :
+  aucun changement audible dû à la migration, aucun droit Premium sans le
+  payer ; `decisions-tess.md`) :
+  - **I3** : pas de copie de base réelle de testeur (données personnelles).
+    Le test `i3_relecture_d_une_copie_de_base_reelle` reste sauté et
+    recensé dans le garde-fou 2816 ; la grande base synthétique couvre la
+    migration. Ce n'est pas un préalable à la fusion.
+  - **D2, zone locale passée sur le réseau** : mono décoché d'office
+    (`inert_on_network`), recoché à la main il agit (voir D2 ci-dessus).
+  - **D2, zone réseau passée en local** : recoché à la lecture. Confirmé.
+  - **D1, origine** : la règle du nom « Estimation {id} » est acceptée
+    pour les profils anciens ; tout profil créé enregistre son origine, et
+    la règle du nom ne s'applique plus qu'aux profils sans origine.
 
 ### T05 : manifeste
 
