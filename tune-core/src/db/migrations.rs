@@ -5328,6 +5328,13 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
         db.execute_batch("ROLLBACK").ok();
         warn!(error = %e, "sqlite_library_revision_failed");
     }
+    // #9116 — la révision des CHEMINS (arbre des dossiers de la vue
+    // Répertoires) : même passe, même transaction unique ; un échec la laisse
+    // absente et l'arbre se garde sous la révision de la bibliothèque.
+    if let Err(e) = db.execute_batch(&super::arbre_des_dossiers::sql_sqlite()) {
+        db.execute_batch("ROLLBACK").ok();
+        warn!(error = %e, "sqlite_library_paths_revision_failed");
+    }
     // #7619 (L1) — la clé de tri des pistes et son index : même passe, sans
     // numéro de migration (aucune collision possible avec un lot voisin).
     // La colonne naît NULL ; `TrackRepo::assurer_les_cles_de_tri` la remplit.
@@ -6586,6 +6593,13 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
         .await
     {
         warn!(error = %e, "pg_library_revision_failed");
+    }
+    // #9116 — la révision des chemins, un bloc `DO` (texte constant).
+    if let Err(e) = sqlx::raw_sql(sqlx::AssertSqlSafe(super::arbre_des_dossiers::sql_postgres()))
+        .execute(pool)
+        .await
+    {
+        warn!(error = %e, "pg_library_paths_revision_failed");
     }
     // #7619 (L3) — même index, même texte que la passe finale SQLite.
     if let Err(e) = sqlx::raw_sql(TRACKS_GENRE_COMPOSER_INDEX)

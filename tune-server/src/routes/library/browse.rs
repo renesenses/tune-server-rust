@@ -44,6 +44,7 @@ fn lire_les_racines(state: &AppState, lang: &str) -> Value {
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| state.config.music_dirs.clone());
+    let arbre = arbre_des_dossiers(state);
     let mut roots: Vec<Value> = dirs
         .iter()
         .map(|d| {
@@ -55,9 +56,8 @@ fn lire_les_racines(state: &AppState, lang: &str) -> Value {
             // racine de lecteur ou de partage (« D:\ », « \\NAS\ ») produit un
             // séparateur doublé (« D:\\% ») qui ne correspond à rien → 0 piste.
             let pattern = tune_core::db::track_repo::folder_like_pattern(&norm);
-            // #9116 — gardé tant que la bibliothèque n'a pas changé (voir
-            // `compte_de_racine`).
-            let count: i64 = match compte_de_racine(state, &norm) {
+            // #9116 — lu dans l'arbre des dossiers (voir `compte_de_racine`).
+            let count: i64 = match compte_de_racine(state, arbre.as_deref(), &norm) {
                 Ok(n) => n,
                 Err(e) => {
                     warn!(path = %norm_nfc, error = %e, "browse_root_count_failed");
@@ -121,7 +121,7 @@ fn lire_les_racines(state: &AppState, lang: &str) -> Value {
     if none_populated
         && let Some(base) = tune_core::db::track_repo::derive_common_root(state.backend.as_ref())
     {
-        let count: i64 = compte_de_racine(state, &base).unwrap_or(0);
+        let count: i64 = compte_de_racine(state, arbre.as_deref(), &base).unwrap_or(0);
         let dup = roots
             .iter()
             .any(|r| r.get("path").and_then(|v| v.as_str()) == Some(base.as_str()));
@@ -143,92 +143,38 @@ fn lire_les_racines(state: &AppState, lang: &str) -> Value {
     json!({ "roots": roots })
 }
 
-/// #9116 (fil 2935) — les comptes de la vue Répertoires, gardés en mémoire
-/// tant que la RÉVISION de la bibliothèque n'a pas bougé.
-///
-/// Même avec la plage indexée (#5998), ouvrir la racine d'une bibliothèque de
-/// 544 147 pistes relit tout l'index du chemin pour grouper par sous-dossier,
-/// et chaque retour en arrière le refaisait — derrière les autres lectures qui
-/// attendaient déjà une connexion. La révision
-/// ([`tune_core::db::library_revision`]) change à CHAQUE écriture dans
-/// `tracks` (scan, édition, suppression), quelle que soit la connexion : un
-/// compte gardé sous la révision `r` est exactement celui que la base rendrait
-/// encore. Sans révision lisible (déclencheurs absents), rien n'est gardé :
-/// plus lent, jamais faux.
-///
-/// La révision est lue AVANT le comptage : une écriture validée entre les deux
-/// change la révision suivante, et le compte gardé n'est plus jamais servi.
-struct ComptesParRevision<V> {
-    entrees: std::sync::Mutex<std::collections::HashMap<(i64, i64, String), V>>,
-}
-
-/// Au-delà, la table est vidée : une révision n'a que les dossiers ouverts
-/// depuis la dernière écriture, et un serveur n'a qu'une base.
-const COMPTES_EN_CACHE_MAX: usize = 512;
-
-impl<V: Clone> ComptesParRevision<V> {
-    fn new() -> Self {
-        Self {
-            entrees: std::sync::Mutex::new(std::collections::HashMap::new()),
-        }
-    }
-
-    fn lire_ou_compter(
-        &self,
-        revision: Option<(i64, i64)>,
-        dossier: &str,
-        compter: impl FnOnce() -> Result<V, String>,
-    ) -> Result<V, String> {
-        let Some((instance, rev)) = revision else {
-            return compter();
-        };
-        let clef = (instance, rev, dossier.to_string());
-        if let Ok(entrees) = self.entrees.lock()
-            && let Some(v) = entrees.get(&clef)
-        {
-            return Ok(v.clone());
-        }
-        let v = compter()?;
-        if let Ok(mut entrees) = self.entrees.lock() {
-            // Les révisions passées ne seront plus jamais servies.
-            entrees.retain(|(i, r, _), _| *i != instance || *r == rev);
-            if entrees.len() >= COMPTES_EN_CACHE_MAX {
-                entrees.clear();
-            }
-            entrees.insert(clef, v.clone());
-        }
-        Ok(v)
-    }
-}
-
-static COMPTES_DES_RACINES: std::sync::LazyLock<ComptesParRevision<i64>> =
-    std::sync::LazyLock::new(ComptesParRevision::new);
-static COMPTES_DES_SOUS_DOSSIERS: std::sync::LazyLock<
-    ComptesParRevision<std::sync::Arc<tune_core::db::track_repo::ComptesParSousDossier>>,
-> = std::sync::LazyLock::new(ComptesParRevision::new);
-
-/// Le nombre de pistes sous une racine
-/// ([`tune_core::db::track_repo::compter_pistes_sous_dossier`] : index couvrant
-/// sur SQLite, plage indexée sur PostgreSQL), gardé par révision.
-fn compte_de_racine(state: &AppState, racine: &str) -> Result<i64, String> {
-    let revision = tune_core::db::library_revision::lire(state.backend.as_ref());
-    COMPTES_DES_RACINES.lire_ou_compter(revision, racine, || {
-        tune_core::db::track_repo::compter_pistes_sous_dossier(state.backend.as_ref(), racine)
-    })
-}
-
-/// Les comptes des sous-dossiers d'un dossier (#3857, #5998), gardés par
-/// révision.
-fn comptes_des_sous_dossiers(
+/// #9116 (fil 2935) — l'arbre des dossiers de la bibliothèque
+/// ([`tune_core::db::arbre_des_dossiers`]) : construit UNE fois par état des
+/// chemins de `tracks`, il rend les comptes de chaque dossier et ses pistes
+/// directes sans relire la base. `None` (aucune révision lisible, ou
+/// construction en échec) : la route retombe sur ses requêtes SQL d'avant.
+fn arbre_des_dossiers(
     state: &AppState,
-    dossier: &str,
-) -> Result<std::sync::Arc<tune_core::db::track_repo::ComptesParSousDossier>, String> {
-    let revision = tune_core::db::library_revision::lire(state.backend.as_ref());
-    COMPTES_DES_SOUS_DOSSIERS.lire_ou_compter(revision, dossier, || {
-        tune_core::db::track_repo::compter_pistes_par_sous_dossier(state.backend.as_ref(), dossier)
-            .map(std::sync::Arc::new)
-    })
+) -> Option<std::sync::Arc<tune_core::db::arbre_des_dossiers::ArbreDesDossiers>> {
+    tune_core::db::arbre_des_dossiers::lire(state.backend.as_ref())
 }
+
+/// Le nombre de pistes sous une racine : lu dans l'arbre, ou à défaut compté
+/// ([`tune_core::db::track_repo::compter_pistes_sous_dossier`]). Mêmes
+/// chiffres des deux côtés (`file_path` seul).
+fn compte_de_racine(
+    state: &AppState,
+    arbre: Option<&tune_core::db::arbre_des_dossiers::ArbreDesDossiers>,
+    racine: &str,
+) -> Result<i64, String> {
+    match arbre {
+        Some(a) => Ok(a.fichiers_sous(racine)),
+        None => {
+            tune_core::db::track_repo::compter_pistes_sous_dossier(state.backend.as_ref(), racine)
+        }
+    }
+}
+
+/// Au-delà, les pistes directes d'un dossier se lisent par la plage d'avant
+/// plutôt que par une liste d'identifiants (bornée par les marques de
+/// paramètres des deux moteurs). Un dossier « à plat » de plus de 900 pistes
+/// est rare ; il paie alors ce qu'il payait.
+const PISTES_DIRECTES_PAR_IDS_MAX: usize = 900;
 
 /// Résout le chemin demandé en tenant compte de la forme de normalisation
 /// Unicode réellement utilisée par le système de fichiers.
@@ -393,52 +339,69 @@ fn lire_le_repertoire(state: &AppState, lang: &str, q: BrowseQuery) -> Result<Va
     // annoncee pour un partage qui en contient 34 169). On remonte desormais la
     // raison au lieu de mentir (#1190).
     let mut unreadable: Option<String> = None;
+    // #9116 — l'arbre des dossiers : les comptes et les pistes directes de ce
+    // dossier, sans relire tout ce qui est sous lui. Construit au besoin
+    // (une fois par état des chemins), avant le disque.
+    let t_arbre = std::time::Instant::now();
+    let arbre = arbre_des_dossiers(state);
+    let vue = arbre.as_deref().map(|a| a.dossier(&normalized_query));
+    let ms_arbre = t_arbre.elapsed().as_millis() as u64;
     #[cfg(test)]
     simuler_un_disque_lent(resolved);
-    match std::fs::read_dir(resolved) {
+    let t_disque = std::time::Instant::now();
+    // Le disque ne sert qu'à LISTER les sous-dossiers (un dossier pas encore
+    // scanné doit apparaître) ; leurs comptes viennent de la base.
+    let lus = std::fs::read_dir(resolved).map(|entries| {
+        entries
+            .flatten()
+            .filter(est_un_dossier)
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>()
+    });
+    let ms_disque = t_disque.elapsed().as_millis() as u64;
+    match lus {
         Err(e) => {
             warn!(path = %resolved.display(), error = %e, "browse_dir_unreadable");
             unreadable = Some(e.to_string());
         }
-        Ok(entries) => {
-            // UNE requete pour TOUT le niveau, au lieu d'un
-            // `SELECT COUNT(*) … LIKE` par sous-dossier (#3857). Le commentaire
-            // de `like_escape_clause` dit pourquoi la boucle coutait si cher :
-            // ce `LIKE` ne peut pas s'appuyer sur l'index de `file_path`, donc
-            // chaque compte parcourait toute la table. Mesure sur 155 829
-            // pistes (la bibliotheque de Pierre M, fil forum 1671) : un coffret
-            // de 63 dossiers `CDxx` passe de 1 166 ms a 21 ms, et une racine de
-            // 11 891 dossiers d'artistes de 303 965 ms a 187 ms.
+        Ok(dossiers) => {
+            // Sans arbre : UNE requete pour TOUT le niveau, au lieu d'un
+            // `SELECT COUNT(*) … LIKE` par sous-dossier (#3857). Mesure sur
+            // 155 829 pistes (la bibliotheque de Pierre M, fil forum 1671) :
+            // un coffret de 63 dossiers `CDxx` passe de 1 166 ms a 21 ms, et
+            // une racine de 11 891 dossiers d'artistes de 303 965 ms a 187 ms.
+            // Avec l'arbre (#9116) : aucune requete.
             //
             // L'echec est journalise UNE fois et rend une table vide : chaque
             // sous-dossier retombe alors a 0, soit exactement ce que la boucle
             // faisait de son cote sur `browse_dir_count_failed`.
-            let comptes = match comptes_des_sous_dossiers(state, &normalized_query) {
-                Ok(c) => c,
-                Err(e) => {
+            let comptes_sql = vue.is_none().then(|| {
+                tune_core::db::track_repo::compter_pistes_par_sous_dossier(
+                    state.backend.as_ref(),
+                    &normalized_query,
+                )
+                .unwrap_or_else(|e| {
                     warn!(path = %normalized_query, error = %e, "browse_dir_count_failed");
-                    std::sync::Arc::new(tune_core::db::track_repo::ComptesParSousDossier::default())
+                    tune_core::db::track_repo::ComptesParSousDossier::default()
+                })
+            });
+            for path in dossiers {
+                let dir_path: String = path.to_string_lossy().nfc().collect();
+                let name = path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("")
+                    .to_string();
+                if name.starts_with('.') {
+                    continue;
                 }
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if est_un_dossier(&entry) {
-                    let dir_path: String = path.to_string_lossy().nfc().collect();
-                    let name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or("")
-                        .to_string();
-                    if name.starts_with('.') {
-                        continue;
-                    }
-                    let track_count: i64 = comptes.get(&name);
-                    subdirs.push(
-                        json!({ "name": name, "path": dir_path, "track_count": track_count }),
-                    );
-                }
+                let track_count: i64 = match (&vue, &comptes_sql) {
+                    (Some(v), _) => v.pistes_du_sous_dossier(&name),
+                    (None, Some(c)) => c.get(&name),
+                    (None, None) => 0,
+                };
+                subdirs.push(json!({ "name": name, "path": dir_path, "track_count": track_count }));
             }
-            // conn removed — using state.backend
         }
     }
     // Le conseil se calcule sur le chemin TEL QUE CONFIGURE (`q.path`), pas sur
@@ -498,20 +461,46 @@ fn lire_le_repertoire(state: &AppState, lang: &str, q: BrowseQuery) -> Result<Va
     // autres : sans le `COALESCE`, un album CUE s'ouvrait sur une liste vide.
     // La colonne 16 porte ce chemin pour `est_enfant_direct` ; `file_path`
     // reste publié tel qu'en base (NULL pour une tranche CUE).
-    let sql =
-        tune_core::db::track_repo::sql_pistes_du_dossier(state.backend.engine(), depart_enfant);
-    let rows = state
-        .backend
-        .query_many(
-            &sql,
-            &[
-                &dir_prefix as &dyn tune_core::db::backend::ToSqlValue,
-                &sep_txt as &dyn tune_core::db::backend::ToSqlValue,
-                &bas as &dyn tune_core::db::backend::ToSqlValue,
-                &haut as &dyn tune_core::db::backend::ToSqlValue,
-            ],
-        )
-        .ou_defaut_journalise();
+    //
+    // #9116 — avec l'arbre, les pistes directes sont connues par identifiant :
+    // aucune lecture pour un dossier qui n'en a pas (tous les niveaux
+    // intermédiaires), une lecture par clé primaire sinon. La plage récursive
+    // ne sert plus que sans arbre, ou pour un dossier « à plat » très peuplé.
+    let t_pistes = std::time::Instant::now();
+    let rows = match vue.as_ref().map(|v| v.pistes_directes()) {
+        Some([]) => Vec::new(),
+        Some(ids) if ids.len() <= PISTES_DIRECTES_PAR_IDS_MAX => {
+            let sql =
+                tune_core::db::track_repo::sql_pistes_par_ids(state.backend.engine(), ids.len());
+            let params: Vec<&dyn tune_core::db::backend::ToSqlValue> = ids
+                .iter()
+                .map(|id| id as &dyn tune_core::db::backend::ToSqlValue)
+                .collect();
+            state
+                .backend
+                .query_many(&sql, &params)
+                .ou_defaut_journalise()
+        }
+        _ => {
+            let sql = tune_core::db::track_repo::sql_pistes_du_dossier(
+                state.backend.engine(),
+                depart_enfant,
+            );
+            state
+                .backend
+                .query_many(
+                    &sql,
+                    &[
+                        &dir_prefix as &dyn tune_core::db::backend::ToSqlValue,
+                        &sep_txt as &dyn tune_core::db::backend::ToSqlValue,
+                        &bas as &dyn tune_core::db::backend::ToSqlValue,
+                        &haut as &dyn tune_core::db::backend::ToSqlValue,
+                    ],
+                )
+                .ou_defaut_journalise()
+        }
+    };
+    let ms_pistes = t_pistes.elapsed().as_millis() as u64;
     let tracks: Vec<Value> = rows
         .iter()
         .filter_map(|cols| {
@@ -553,6 +542,10 @@ fn lire_le_repertoire(state: &AppState, lang: &str, q: BrowseQuery) -> Result<Va
         path = %normalized_query,
         ms_total = debut.elapsed().as_millis() as u64,
         ms_sous_dossiers,
+        ms_arbre,
+        ms_disque,
+        ms_pistes,
+        arbre = arbre.is_some(),
         sous_dossiers = subdirs.len(),
         pistes = tracks.len(),
         "browse_dir_lu"
@@ -1008,60 +1001,23 @@ mod garde_de_remontee_tests {
     }
 }
 
-/// #9116 (fil 2935) — les comptes de la vue Répertoires : une seule lecture par révision,
-/// gardés par révision, et jamais périmés après une écriture.
+/// #9116 (fil 2935) — les comptes et les pistes de la vue Répertoires, lus
+/// dans l'arbre des dossiers : jamais périmés après une écriture.
 #[cfg(test)]
 mod comptes_9116_tests {
-    use super::{BrowseQuery, ComptesParRevision, lire_le_repertoire, lire_les_racines};
+    use super::{BrowseQuery, lire_le_repertoire, lire_les_racines};
     use crate::state::AppState;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use unicode_normalization::UnicodeNormalization;
 
-    #[test]
-    fn un_compte_est_garde_tant_que_la_revision_ne_bouge_pas() {
-        let cache: ComptesParRevision<i64> = ComptesParRevision::new();
-        let appels = AtomicUsize::new(0);
-        let compter = || {
-            appels.fetch_add(1, Ordering::SeqCst);
-            Ok(7)
-        };
-        assert_eq!(cache.lire_ou_compter(Some((1, 10)), "/m", compter), Ok(7));
-        assert_eq!(cache.lire_ou_compter(Some((1, 10)), "/m", compter), Ok(7));
-        assert_eq!(
-            appels.load(Ordering::SeqCst),
-            1,
-            "même révision : aucun recomptage"
-        );
-        assert_eq!(cache.lire_ou_compter(Some((1, 11)), "/m", compter), Ok(7));
-        assert_eq!(
-            appels.load(Ordering::SeqCst),
-            2,
-            "révision nouvelle : recompté"
-        );
-        assert_eq!(cache.lire_ou_compter(Some((1, 11)), "/n", compter), Ok(7));
-        assert_eq!(appels.load(Ordering::SeqCst), 3, "autre dossier : compté");
-        assert_eq!(cache.lire_ou_compter(None, "/m", compter), Ok(7));
-        assert_eq!(cache.lire_ou_compter(None, "/m", compter), Ok(7));
-        assert_eq!(
-            appels.load(Ordering::SeqCst),
-            5,
-            "sans révision : rien n'est gardé"
-        );
-        // Une erreur n'est pas gardée.
-        let echec = cache.lire_ou_compter(Some((1, 12)), "/e", || Err("panne".to_string()));
-        assert!(echec.is_err());
-        assert_eq!(cache.lire_ou_compter(Some((1, 12)), "/e", compter), Ok(7));
-        assert_eq!(appels.load(Ordering::SeqCst), 6);
-    }
-
-    fn poser(state: &AppState, chemin: &std::path::Path) {
-        let chemin = chemin.to_str().unwrap().to_string();
+    fn poser(state: &AppState, chemin: &std::path::Path) -> i64 {
+        let chemin: String = chemin.to_str().unwrap().nfc().collect();
         state
             .backend
-            .execute(
+            .execute_returning_id(
                 "INSERT INTO tracks (title, file_path, format, source) VALUES ('t', ?, 'flac', 'local')",
                 &[&chemin as &dyn tune_core::db::backend::ToSqlValue],
             )
-            .unwrap();
+            .unwrap()
     }
 
     fn compte_racine(state: &AppState) -> i64 {
@@ -1070,34 +1026,53 @@ mod comptes_9116_tests {
             .unwrap()
     }
 
-    fn compte_jazz(state: &AppState, racine: &std::path::Path) -> i64 {
-        let v = lire_le_repertoire(
+    fn lire(state: &AppState, dossier: &std::path::Path) -> serde_json::Value {
+        lire_le_repertoire(
             state,
             "fr",
             BrowseQuery {
-                path: racine.to_str().unwrap().to_string(),
+                path: dossier.to_str().unwrap().to_string(),
             },
         )
         .ok()
-        .unwrap();
-        v["directories"]
+        .unwrap()
+    }
+
+    fn compte_de(state: &AppState, parent: &std::path::Path, nom: &str) -> i64 {
+        let nom: String = nom.nfc().collect();
+        lire(state, parent)["directories"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|d| d["name"] == "Jazz")
+            .find(|d| d["name"].as_str().map(|n| n.nfc().collect::<String>()) == Some(nom.clone()))
             .and_then(|d| d["track_count"].as_i64())
             .unwrap()
     }
 
-    #[test]
-    fn une_piste_ajoutee_se_voit_aussitot_dans_les_comptes() {
+    fn pistes_de(state: &AppState, dossier: &std::path::Path) -> Vec<i64> {
+        lire(state, dossier)["tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["id"].as_i64().unwrap())
+            .collect()
+    }
+
+    struct Banc {
+        state: AppState,
+        racine: std::path::PathBuf,
+        _rt: tokio::runtime::Runtime,
+        _dossier: tempfile::TempDir,
+    }
+
+    fn banc() -> Banc {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let dossier = tempfile::tempdir().unwrap();
         let racine = dossier.path().join("musique");
-        std::fs::create_dir_all(racine.join("Jazz")).unwrap();
+        std::fs::create_dir_all(racine.join("Jazz").join("Miles")).unwrap();
         let base = dossier.path().join("tune.db");
         let state = rt.block_on(async {
             AppState::new(base.to_str().unwrap(), 0, Default::default()).unwrap()
@@ -1109,18 +1084,145 @@ mod comptes_9116_tests {
             )
             .unwrap();
         assert!(
-            tune_core::db::library_revision::lire(state.backend.as_ref()).is_some(),
-            "la révision doit exister, sans quoi ce témoin ne garde rien"
+            tune_core::db::arbre_des_dossiers::lire_revision_des_chemins(state.backend.as_ref())
+                .is_some(),
+            "la révision des chemins doit exister, sans quoi ce témoin ne garde rien"
         );
-        poser(&state, &racine.join("Jazz").join("01.flac"));
-        assert_eq!(compte_racine(&state), 1);
-        assert_eq!(compte_jazz(&state, &racine), 1);
-        // Relu sans écriture : le même chiffre (servi par le cache).
-        assert_eq!(compte_racine(&state), 1);
-        assert_eq!(compte_jazz(&state, &racine), 1);
-        // Une écriture change la révision : rien de périmé n'est servi.
-        poser(&state, &racine.join("Jazz").join("02.flac"));
-        assert_eq!(compte_racine(&state), 2);
-        assert_eq!(compte_jazz(&state, &racine), 2);
+        Banc {
+            state,
+            racine,
+            _rt: rt,
+            _dossier: dossier,
+        }
+    }
+
+    /// Ajout, suppression, déplacement : chaque écriture se voit aussitôt,
+    /// dans les comptes (racine, sous-dossier) et dans les pistes directes.
+    #[test]
+    fn ajout_suppression_et_deplacement_se_voient_aussitot() {
+        let b = banc();
+        let (s, r) = (&b.state, &b.racine);
+        let jazz = r.join("Jazz");
+        let a = poser(s, &jazz.join("01.flac"));
+        poser(s, &jazz.join("Miles").join("01.flac"));
+        assert_eq!(compte_racine(s), 2);
+        assert_eq!(compte_de(s, r, "Jazz"), 2);
+        assert_eq!(compte_de(s, &jazz, "Miles"), 1);
+        assert_eq!(pistes_de(s, &jazz), vec![a]);
+        // Relu sans écriture : les mêmes chiffres (servis par l'arbre).
+        assert_eq!(compte_racine(s), 2);
+        assert_eq!(compte_de(s, r, "Jazz"), 2);
+        // Ajout.
+        let c = poser(s, &jazz.join("02.flac"));
+        assert_eq!(compte_racine(s), 3);
+        assert_eq!(compte_de(s, r, "Jazz"), 3);
+        assert_eq!(pistes_de(s, &jazz), vec![a, c]);
+        // Suppression.
+        s.backend
+            .execute(
+                "DELETE FROM tracks WHERE id = ?",
+                &[&a as &dyn tune_core::db::backend::ToSqlValue],
+            )
+            .unwrap();
+        assert_eq!(compte_racine(s), 2);
+        assert_eq!(compte_de(s, r, "Jazz"), 2);
+        assert_eq!(pistes_de(s, &jazz), vec![c]);
+        // Déplacement (« Remplacer le chemin ») : seul `file_path` change.
+        let neuf = jazz.join("Miles").join("02.flac");
+        let neuf = neuf.to_str().unwrap().to_string();
+        s.backend
+            .execute(
+                "UPDATE tracks SET file_path = ? WHERE id = ?",
+                &[
+                    &neuf as &dyn tune_core::db::backend::ToSqlValue,
+                    &c as &dyn tune_core::db::backend::ToSqlValue,
+                ],
+            )
+            .unwrap();
+        assert_eq!(compte_de(s, &jazz, "Miles"), 2);
+        assert!(pistes_de(s, &jazz).is_empty());
+    }
+
+    /// La route lit l'ARBRE, pas la base : une piste ajoutée en coupant le
+    /// déclencheur de la révision des chemins (rien ne prévient l'arbre)
+    /// n'apparaît pas dans les comptes, alors que la base la compte. Sans
+    /// arbre, chaque niveau recompterait tout ce qui est sous lui (#9116).
+    #[test]
+    fn la_route_lit_l_arbre_et_non_la_base() {
+        let b = banc();
+        let (s, r) = (&b.state, &b.racine);
+        let jazz = r.join("Jazz");
+        poser(s, &jazz.join("Miles").join("01.flac"));
+        assert_eq!(compte_racine(s), 1);
+        assert_eq!(compte_de(s, r, "Jazz"), 1);
+        s.backend
+            .execute_batch("DROP TRIGGER library_paths_revision_ins;")
+            .unwrap();
+        poser(s, &jazz.join("Miles").join("02.flac"));
+        assert_eq!(
+            tune_core::db::track_repo::compter_pistes_par_sous_dossier(
+                s.backend.as_ref(),
+                r.to_str().unwrap()
+            )
+            .unwrap()
+            .get("Jazz"),
+            2,
+            "la base compte bien la seconde piste"
+        );
+        assert_eq!(
+            compte_de(s, r, "Jazz"),
+            1,
+            "le compte doit venir de l'arbre gardé, sans relire la base"
+        );
+        assert_eq!(compte_de(s, &jazz, "Miles"), 1);
+        assert_eq!(compte_racine(s), 1);
+    }
+
+    /// Une écriture qui ne touche pas les chemins (une passe de fond qui pose
+    /// son genre, son ReplayGain…) ne fait pas reconstruire l'arbre.
+    #[test]
+    fn une_ecriture_hors_chemins_ne_bouge_pas_la_revision_des_chemins() {
+        let b = banc();
+        let id = poser(&b.state, &b.racine.join("Jazz").join("01.flac"));
+        let lire = || {
+            tune_core::db::arbre_des_dossiers::lire_revision_des_chemins(b.state.backend.as_ref())
+                .unwrap()
+        };
+        let avant = lire();
+        b.state
+            .backend
+            .execute(
+                "UPDATE tracks SET genre = 'Jazz', title = 'x' WHERE id = ?",
+                &[&id as &dyn tune_core::db::backend::ToSqlValue],
+            )
+            .unwrap();
+        tune_core::db::settings_repo::SettingsRepo::with_backend(b.state.backend.clone())
+            .set("une_cle", "1")
+            .unwrap();
+        assert_eq!(lire(), avant, "ni le genre, ni le titre, ni les réglages");
+        // Un `UPDATE` qui réécrit le même chemin ne compte pas non plus.
+        b.state
+            .backend
+            .execute(
+                "UPDATE tracks SET file_path = file_path WHERE id = ?",
+                &[&id as &dyn tune_core::db::backend::ToSqlValue],
+            )
+            .unwrap();
+        assert_eq!(lire(), avant, "chemin réécrit à l'identique");
+    }
+
+    /// Un dossier accentué que le disque n'expose qu'en NFD : ses comptes et
+    /// ses pistes (écrites en NFC par le scanner) se lisent dans l'arbre.
+    #[test]
+    fn un_dossier_decompose_sur_le_disque_se_lit_dans_l_arbre() {
+        let b = banc();
+        let nfd: String = "Chostakovitch dirigé".nfd().collect();
+        let dossier = b.racine.join(&nfd);
+        std::fs::create_dir_all(dossier.join("CD1")).unwrap();
+        let direct = poser(&b.state, &dossier.join("01.flac"));
+        poser(&b.state, &dossier.join("CD1").join("01.flac"));
+        assert_eq!(compte_de(&b.state, &b.racine, &nfd), 2);
+        assert_eq!(compte_de(&b.state, &dossier, "CD1"), 1);
+        assert_eq!(pistes_de(&b.state, &dossier), vec![direct]);
     }
 }

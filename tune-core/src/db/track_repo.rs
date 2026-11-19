@@ -256,6 +256,30 @@ pub fn sql_pistes_du_dossier(engine: Engine, depart_enfant: usize) -> String {
     )
 }
 
+/// #9116 — les mêmes colonnes, dans le même ordre et triées de même, que
+/// [`sql_pistes_du_dossier`], mais pour `n` identifiants (`?1`…`?n`) : les
+/// pistes directes d'un dossier, que [`super::arbre_des_dossiers`] connaît
+/// déjà. Plus de plage récursive sur tout ce qui est sous le dossier.
+pub fn sql_pistes_par_ids(engine: Engine, n: usize) -> String {
+    let marques: Vec<String> = (1..=n)
+        .map(|i| match engine {
+            Engine::Postgres => format!("${i}"),
+            Engine::Sqlite => format!("?{i}"),
+        })
+        .collect();
+    format!(
+        "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, \
+               t.disc_number, t.track_number, t.duration_ms, t.file_path, \
+               t.format, t.sample_rate, t.bit_depth, t.genre, t.year, al.cover_path, \
+               COALESCE(t.file_path, t.cue_media_path) \
+               FROM tracks t LEFT JOIN albums al ON t.album_id = al.id \
+               LEFT JOIN artists ar ON t.artist_id = ar.id \
+               WHERE t.id IN ({}) \
+               ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title",
+        marques.join(", ")
+    )
+}
+
 /// Le texte SQL de [`compter_pistes_par_sous_dossier`]. Paramètres, dans
 /// l'ordre : le motif de [`folder_like_pattern`], le séparateur, puis les deux
 /// bornes de [`bornes_du_dossier`]. Public pour que les tests lisent le plan

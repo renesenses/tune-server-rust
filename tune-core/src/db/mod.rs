@@ -10,6 +10,8 @@ pub mod album_repo;
 pub mod alertes_douteuses_ignorees;
 /// #8077 — les apports d'un service à un album local (SQLite 142 / PG 108).
 pub mod apports_service;
+/// #9116 — l'arbre des dossiers de la vue Répertoires, gardé en mémoire.
+pub mod arbre_des_dossiers;
 pub mod artist_repo;
 pub mod backend;
 /// Contrôle parental, étape 2 (#7974) : bail d'écoute et temps écouté.
