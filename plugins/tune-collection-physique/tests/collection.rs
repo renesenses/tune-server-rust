@@ -2360,3 +2360,107 @@ async fn une_correspondance_de_service_se_remplace_et_se_retire_9166() {
         assert_eq!(r["error"], "collection_physique.disque_inconnu");
     }
 }
+
+/// #9166 (relecture) : la liste blanche des services, « Revenir à
+/// l'automatique », et la purge des choix d'un disque sorti de la collection.
+#[tokio::test]
+async fn services_connus_retour_a_l_automatique_et_purge_9166() {
+    let b = banc_avec(HoteEssai::new());
+    suivre(&b, "exemple").await;
+    synchro_complete(&b, "exemple").await;
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    let release = disque(&c, "Giving My Love / Brazil")["release_id"]
+        .as_u64()
+        .unwrap();
+    let chemin = format!("/disques/{release}/streaming");
+
+    // Un service inconnu du serveur n'entre pas dans les choix rangés ; un
+    // service où la recherche cherche (Spotify) y entre.
+    let (code, r) = appel(
+        &b.app,
+        "PUT",
+        &chemin,
+        Some(json!({"service": "deezer", "id": "D-1"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{r}");
+    assert_eq!(r["error"], "collection_physique.service_inconnu");
+    let (code, r) = appel(&b.app, "DELETE", &format!("{chemin}/deezer"), None).await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{r}");
+    assert_eq!(r["error"], "collection_physique.service_inconnu");
+    let (code, r) = appel(
+        &b.app,
+        "PUT",
+        &chemin,
+        Some(json!({"service": "spotify", "id": "S-1"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{r}");
+    let choix = tune_collection_physique::choix_streaming::lire(&b.backend).unwrap();
+    assert_eq!(choix[&release].keys().collect::<Vec<_>>(), vec!["spotify"]);
+
+    // Retirer TIDAL, puis revenir à l'automatique : T-42 revient.
+    let (code, r) = appel(&b.app, "DELETE", &format!("{chemin}/tidal"), None).await;
+    assert_eq!(code, StatusCode::OK, "{r}");
+    assert_eq!(r["disque"]["streaming_retires"], json!(["tidal"]), "{r}");
+    let (code, r) = appel(&b.app, "DELETE", &format!("{chemin}/tidal/choix"), None).await;
+    assert_eq!(code, StatusCode::OK, "{r}");
+    assert_eq!(r["disque"]["streaming_retires"], json!([]), "{r}");
+    let ids: Vec<&str> = r["disque"]["streaming"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["T-42", "S-1"], "{r}");
+    // Sans choix, rien à défaire : même réponse.
+    let (code, _) = appel(&b.app, "DELETE", &format!("{chemin}/tidal/choix"), None).await;
+    assert_eq!(code, StatusCode::OK);
+
+    // Un disque sorti de la collection : ses choix s'oublient à la lecture
+    // suivante de la collection.
+    tune_collection_physique::choix_streaming::retirer(&b.backend, 424_242, "tidal").unwrap();
+    let (_, _) = appel(&b.app, "GET", "/collection", None).await;
+    let choix = tune_collection_physique::choix_streaming::lire(&b.backend).unwrap();
+    assert!(!choix.contains_key(&424_242), "purgé : {choix:?}");
+    assert!(
+        choix.contains_key(&release),
+        "le disque présent garde son choix"
+    );
+}
+
+/// #9166 (relecture) : un retrait ne dit « nulle part » que quand TOUS les
+/// services ont répondu ; avant, le disque est « à vérifier ».
+#[tokio::test]
+async fn un_retrait_attend_la_reponse_de_tous_les_services_9166() {
+    let hote = HoteEssai::new();
+    *hote.services_muets.lock().unwrap() = vec!["qobuz".into()];
+    let b = banc_avec(hote);
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    let gm = disque(&c, "Giving My Love / Brazil");
+    assert_eq!(gm["streaming"][0]["id"], "T-42", "{gm}");
+    let release = gm["release_id"].as_u64().unwrap();
+    let (code, r) = appel(
+        &b.app,
+        "DELETE",
+        &format!("/disques/{release}/streaming/tidal"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{r}");
+    assert_eq!(
+        r["disque"]["etat"], "a_verifier",
+        "Qobuz n'a pas répondu : {r}"
+    );
+    assert_eq!(r["disque"]["raison"], Value::Null, "{r}");
+
+    // Contre-épreuve : Qobuz répond à la synchronisation suivante.
+    b.hote.services_muets.lock().unwrap().clear();
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    let gm = disque(&c, "Giving My Love / Brazil");
+    assert_eq!(gm["etat"], "nulle_part", "{gm}");
+    assert_eq!(gm["raison"], "correspondance_retiree", "{gm}");
+}

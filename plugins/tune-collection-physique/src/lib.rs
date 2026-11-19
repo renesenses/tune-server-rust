@@ -35,6 +35,7 @@
 //! | `DELETE /disques/{release}/association` | « Dissocier » : le disque revient au rapprochement automatique (#8672) |
 //! | `PUT /disques/{release}/streaming` | `{service, id, titre, artiste}` : remplace la correspondance de ce service par un résultat choisi à la main (#9166) |
 //! | `DELETE /disques/{release}/streaming/{service}` | retire la correspondance de ce service ; le rapprochement automatique ne la recrée pas (#9166) |
+//! | `DELETE /disques/{release}/streaming/{service}/choix` | « Revenir à l'automatique » : oublie le choix ou le retrait de ce service (#9166) |
 //! | `GET /cd?mb_release=&code_barre=` | un CD inséré est-il dans la collection, et copié ? |
 //! | `GET /pochettes/{release}[?taille=originale]` | la pochette, servie depuis le cache local (`ETag`, 304) |
 //! | `DELETE /cache[?quoi=pochettes]` | efface le cache : pochettes et mémoire, ou les pochettes seules |
@@ -376,10 +377,7 @@ fn vue(
         EtatDisque::Bibliotheque
     } else if !trouves.is_empty() {
         EtatDisque::Streaming
-    } else if !retires.is_empty()
-        || services.is_empty()
-        || streaming.is_some_and(|s| s.services == services)
-    {
+    } else if services.is_empty() || streaming.is_some_and(|s| s.services == services) {
         EtatDisque::NullePart
     } else {
         EtatDisque::AVerifier
@@ -561,6 +559,22 @@ async fn collection(State(etat): State<Etat>, Query(f): Query<FiltresCollection>
     };
     let index = Index::new(&albums);
     let manuelles = associations_manuelles(&etat);
+    // #9166 : les choix des disques sortis de la collection s'oublient (la
+    // liste est remplacée d'un bloc par la synchronisation ; tronquée, elle
+    // ne dit pas ce qui est sorti).
+    if !m.tronquee {
+        let presents: std::collections::HashSet<u64> =
+            m.disques.iter().map(|d| d.release_id).collect();
+        match choix_streaming::purger(&etat.backend, |r| presents.contains(&r)) {
+            Ok(0) => {}
+            Ok(n) => {
+                tracing::info!(target: "plugin", n, "collection_physique_choix_streaming_purges")
+            }
+            Err(e) => {
+                tracing::warn!(target: "plugin", erreur = %e, "collection_physique_choix_streaming_non_purges")
+            }
+        }
+    }
     let choix = choix_manuels(&etat);
     let mut par_etat = serde_json::Map::new();
     let mut par_format = serde_json::Map::new();
@@ -836,6 +850,19 @@ struct CorpsChoixStreaming {
     artiste: String,
 }
 
+/// Les services connus du serveur (#9166) : ceux que la synchronisation
+/// interroge et ceux où « Chercher sur les services » cherche. Seuls ceux-là
+/// entrent dans les choix rangés, qui restent ainsi bornés.
+async fn services_connus(etat: &Etat) -> Vec<String> {
+    let mut v: Vec<String> = synchro::SERVICES.iter().map(|s| s.to_string()).collect();
+    for s in etat.moteur.hote.services_de_recherche().await {
+        if !v.contains(&s) {
+            v.push(s);
+        }
+    }
+    v
+}
+
 /// `PUT /disques/{release}/streaming` (#9166) : `{service, id, titre,
 /// artiste}`, un résultat de « Chercher sur les services » qui REMPLACE la
 /// correspondance de ce service. Mêmes droits que l'association à un album
@@ -861,6 +888,9 @@ async fn choisir_sur_un_service(
     if disque_suivi(&etat, release).is_none() {
         return refus(StatusCode::NOT_FOUND, "disque_inconnu");
     }
+    if !services_connus(&etat).await.contains(&c.service) {
+        return refus(StatusCode::UNPROCESSABLE_ENTITY, "service_inconnu");
+    }
     if let Err(e) = choix_streaming::choisir(&etat.backend, release, &c.service, choisi) {
         tracing::warn!(target: "plugin", erreur = %e, "collection_physique_choix_streaming_non_ecrit");
         return refus(StatusCode::INTERNAL_SERVER_ERROR, code::ECRITURE);
@@ -878,11 +908,40 @@ async fn retirer_d_un_service(
     if !choix_streaming::service_valide(&service) {
         return refus(StatusCode::UNPROCESSABLE_ENTITY, "corps_invalide");
     }
-    if disque_suivi(&etat, release).is_none() {
+    let Some((m, _)) = disque_suivi(&etat, release) else {
         return refus(StatusCode::NOT_FOUND, "disque_inconnu");
+    };
+    // Un service connu, ou celui d'une correspondance automatique du disque.
+    let du_disque = m
+        .streaming
+        .get(&release)
+        .is_some_and(|s| s.trouves.iter().any(|t| t.service == service));
+    if !du_disque && !services_connus(&etat).await.contains(&service) {
+        return refus(StatusCode::UNPROCESSABLE_ENTITY, "service_inconnu");
     }
     if let Err(e) = choix_streaming::retirer(&etat.backend, release, &service) {
         tracing::warn!(target: "plugin", erreur = %e, "collection_physique_retrait_streaming_non_ecrit");
+        return refus(StatusCode::INTERNAL_SERVER_ERROR, code::ECRITURE);
+    }
+    disque_relu(&etat, release).await
+}
+
+/// `DELETE /disques/{release}/streaming/{service}/choix` (#9166) :
+/// « Revenir à l'automatique ». Le choix ou le retrait de ce service est
+/// oublié ; sans choix, rien à défaire : la réponse est la même. Rend le
+/// disque relu.
+async fn revenir_a_l_automatique(
+    State(etat): State<Etat>,
+    Path((release, service)): Path<(u64, String)>,
+) -> Response {
+    if !choix_streaming::service_valide(&service) {
+        return refus(StatusCode::UNPROCESSABLE_ENTITY, "corps_invalide");
+    }
+    if disque_suivi(&etat, release).is_none() {
+        return refus(StatusCode::NOT_FOUND, "disque_inconnu");
+    }
+    if let Err(e) = choix_streaming::oublier(&etat.backend, release, &service) {
+        tracing::warn!(target: "plugin", erreur = %e, "collection_physique_choix_streaming_non_oublie");
         return refus(StatusCode::INTERNAL_SERVER_ERROR, code::ECRITURE);
     }
     disque_relu(&etat, release).await
@@ -1104,6 +1163,10 @@ pub fn router(backend: Arc<dyn DbBackend>, moteur: Arc<Moteur>) -> Router<()> {
         .route(
             "/disques/{release}/streaming/{service}",
             delete(retirer_d_un_service),
+        )
+        .route(
+            "/disques/{release}/streaming/{service}/choix",
+            delete(revenir_a_l_automatique),
         )
         .route("/pochettes/{release}", get(pochette))
         .route("/cache", delete(effacer_cache))

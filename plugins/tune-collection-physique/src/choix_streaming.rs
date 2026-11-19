@@ -19,7 +19,16 @@
 //! donc retirée au passage suivant du rapprochement automatique : c'est le
 //! marqueur « refusé par l'utilisateur » (`null` pour ce service).
 //!
+//! « Revenir à l'automatique » (`DELETE
+//! /disques/{release}/streaming/{service}/choix`) efface le choix ou le
+//! retrait de ce service : le rapprochement automatique reprend la main.
+//!
 //! La forme rangée : `{"<release>": {"<service>": {id, titre, artiste} | null}}`.
+//! Elle reste bornée : un service n'y entre que s'il est connu du serveur
+//! (liste blanche, voir `lib.rs`), et les disques sortis de la collection en
+//! sont purgés ([`purger`]). Un réglage illisible n'est jamais écrasé en
+//! silence : il est journalisé et copié sous [`REGLAGE_ILLISIBLE`] avant la
+//! première écriture.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -32,6 +41,10 @@ use crate::memoire::SurUnService;
 
 /// La clé du réglage.
 pub const REGLAGE: &str = "collection_physique_choix_streaming";
+
+/// La copie d'un réglage illisible, gardée avant qu'une écriture ne le
+/// remplace.
+pub const REGLAGE_ILLISIBLE: &str = "collection_physique_choix_streaming_illisible";
 
 /// `par` d'une correspondance choisie à la main.
 pub const PAR_MANUEL: &str = "manuel";
@@ -75,31 +88,52 @@ pub fn choisi_valide(c: &Choisi) -> bool {
         && c.artiste.chars().count() <= TEXTE_MAX
 }
 
-/// Les choix rangés. Un réglage illisible vaut « aucun choix » (et se dit
-/// au journal) : l'écran ne tombe pas pour autant.
-pub fn lire(db: &Arc<dyn DbBackend>) -> Result<Choix, String> {
+/// Le réglage tel que rangé : les choix, ou le texte brut s'il est
+/// illisible.
+fn lire_brut(db: &Arc<dyn DbBackend>) -> Result<Result<Choix, String>, String> {
     let brut = SettingsRepo::with_backend(db.clone()).get(REGLAGE)?;
     Ok(match brut {
-        None => Choix::new(),
-        Some(s) => serde_json::from_str(&s).unwrap_or_else(|e| {
+        None => Ok(Choix::new()),
+        Some(s) => serde_json::from_str(&s).map_err(|e| {
             tracing::warn!(target: "plugin", erreur = %e, "collection_physique_choix_streaming_illisibles");
-            Choix::new()
+            s
         }),
     })
 }
 
-fn modifier(db: &Arc<dyn DbBackend>, f: impl FnOnce(&mut Choix)) -> Result<(), String> {
+/// Les choix rangés. Un réglage illisible vaut « aucun choix » (et se dit
+/// au journal) : l'écran ne tombe pas pour autant, et rien n'est écrit.
+pub fn lire(db: &Arc<dyn DbBackend>) -> Result<Choix, String> {
+    Ok(lire_brut(db)?.unwrap_or_default())
+}
+
+/// Lit, modifie, range. `f` dit s'il a changé quelque chose : sinon rien
+/// n'est écrit. Un réglage illisible est d'abord copié sous
+/// [`REGLAGE_ILLISIBLE`] (s'il n'y en a pas déjà une copie), puis remplacé.
+fn modifier(db: &Arc<dyn DbBackend>, f: impl FnOnce(&mut Choix) -> bool) -> Result<bool, String> {
     let _g = ECRITURE.lock().unwrap_or_else(|e| e.into_inner());
-    let mut choix = lire(db)?;
-    f(&mut choix);
-    choix.retain(|_, c| !c.is_empty());
     let repo = SettingsRepo::with_backend(db.clone());
+    let (mut choix, illisible) = match lire_brut(db)? {
+        Ok(c) => (c, None),
+        Err(brut) => (Choix::new(), Some(brut)),
+    };
+    if !f(&mut choix) {
+        return Ok(false);
+    }
+    if let Some(brut) = illisible {
+        if repo.get(REGLAGE_ILLISIBLE)?.is_none() {
+            repo.set(REGLAGE_ILLISIBLE, &brut)?;
+        }
+        tracing::warn!(target: "plugin", copie = REGLAGE_ILLISIBLE, "collection_physique_choix_streaming_illisibles_remplaces");
+    }
+    choix.retain(|_, c| !c.is_empty());
     if choix.is_empty() {
-        repo.delete(REGLAGE)
+        repo.delete(REGLAGE)?;
     } else {
         let s = serde_json::to_string(&choix).map_err(|e| e.to_string())?;
-        repo.set(REGLAGE, &s)
+        repo.set(REGLAGE, &s)?;
     }
+    Ok(true)
 }
 
 /// Remplace la correspondance de `service` pour la release par `choisi`.
@@ -113,7 +147,9 @@ pub fn choisir(
         c.entry(release)
             .or_default()
             .insert(service.to_string(), Some(choisi));
+        true
     })
+    .map(|_| ())
 }
 
 /// Retire la correspondance de `service` pour la release : refusée par
@@ -123,7 +159,31 @@ pub fn retirer(db: &Arc<dyn DbBackend>, release: u64, service: &str) -> Result<(
         c.entry(release)
             .or_default()
             .insert(service.to_string(), None);
+        true
     })
+    .map(|_| ())
+}
+
+/// « Revenir à l'automatique » : oublie le choix ou le retrait de `service`
+/// pour la release. `true` s'il y en avait un.
+pub fn oublier(db: &Arc<dyn DbBackend>, release: u64, service: &str) -> Result<bool, String> {
+    modifier(db, |c| {
+        c.get_mut(&release)
+            .is_some_and(|d| d.remove(service).is_some())
+    })
+}
+
+/// Oublie les choix des disques qui ne sont plus dans la collection. Rend
+/// le nombre de disques purgés ; n'écrit rien s'il n'y en a aucun.
+pub fn purger(db: &Arc<dyn DbBackend>, garder: impl Fn(u64) -> bool) -> Result<usize, String> {
+    let mut n = 0;
+    modifier(db, |c| {
+        let avant = c.len();
+        c.retain(|r, _| garder(*r));
+        n = avant - c.len();
+        n > 0
+    })?;
+    Ok(n)
 }
 
 /// Ce que l'écran montre : les correspondances du rapprochement automatique
@@ -229,6 +289,39 @@ mod tests {
         // Retirer après avoir choisi : le choix devient un refus.
         retirer(&db, 7, "qobuz").unwrap();
         assert_eq!(lire(&db).unwrap()[&7]["qobuz"], None);
+    }
+
+    #[test]
+    fn oublier_et_purger_9166() {
+        let db = base();
+        retirer(&db, 7, "tidal").unwrap();
+        retirer(&db, 8, "qobuz").unwrap();
+        assert!(oublier(&db, 7, "tidal").unwrap(), "il y avait un retrait");
+        assert!(!oublier(&db, 7, "tidal").unwrap(), "plus rien");
+        assert!(!lire(&db).unwrap().contains_key(&7), "disque vide retiré");
+        assert_eq!(purger(&db, |r| r != 8).unwrap(), 1);
+        assert!(lire(&db).unwrap().is_empty());
+        assert_eq!(purger(&db, |_| false).unwrap(), 0);
+    }
+
+    #[test]
+    fn un_reglage_illisible_est_copie_avant_d_etre_remplace_9166() {
+        let db = base();
+        let repo = SettingsRepo::with_backend(db.clone());
+        repo.set(REGLAGE, "{pas du json").unwrap();
+        assert!(lire(&db).unwrap().is_empty(), "illisible : aucun choix");
+        assert_eq!(
+            repo.get(REGLAGE).unwrap().as_deref(),
+            Some("{pas du json"),
+            "une lecture n'écrit rien"
+        );
+        retirer(&db, 7, "tidal").unwrap();
+        assert_eq!(
+            repo.get(REGLAGE_ILLISIBLE).unwrap().as_deref(),
+            Some("{pas du json"),
+            "copie gardée"
+        );
+        assert_eq!(lire(&db).unwrap()[&7]["tidal"], None);
     }
 
     #[test]
