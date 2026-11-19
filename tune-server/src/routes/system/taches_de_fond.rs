@@ -289,7 +289,16 @@ pub(crate) async fn reprendre_tache(
     let Some(tache) = Tache::depuis_id(&id) else {
         return inconnue(&id).into_response();
     };
-    match tune_core::taches_de_fond::reprendre(&state.backend, tache) {
+    // #9116 — hors de l'exécuteur, comme `pause_tache` : la reprise prend le
+    // verrou des écritures de pause, qu'un « tout suspendre » peut tenir le
+    // temps de ses écritures sur une base engorgée. Dans l'exécuteur, chaque
+    // clic « Reprendre » y aurait figé un fil `tokio-rt-worker`.
+    let b = state.backend.clone();
+    let ecrit =
+        tokio::task::spawn_blocking(move || tune_core::taches_de_fond::reprendre(&b, tache))
+            .await
+            .unwrap_or_else(|e| Err(format!("reprise : écriture interrompue ({e})")));
+    match ecrit {
         Ok(()) => {
             // #5469 — lever le drapeau ne suffit pas quand la passe n'existe
             // plus : un arrêt du serveur l'a tuée, et « Reprendre » n'avait
@@ -333,7 +342,11 @@ pub(crate) async fn tout_reprendre(State(state): State<AppState>) -> impl IntoRe
 
 /// Lever toutes les pauses, puis relancer les passes que l'arrêt a tuées.
 async fn reprendre_et_relancer_tout(state: &AppState) -> Result<Vec<&'static str>, String> {
-    tune_core::taches_de_fond::tout_reprendre(&state.backend)?;
+    // #9116 — hors de l'exécuteur, même raison que `reprendre_tache`.
+    let b = state.backend.clone();
+    tokio::task::spawn_blocking(move || tune_core::taches_de_fond::tout_reprendre(&b))
+        .await
+        .unwrap_or_else(|e| Err(format!("reprise : écriture interrompue ({e})")))?;
     // #5469 — même règle que la reprise d'UN traitement.
     let mut relancees = Vec::new();
     for tache in Tache::TOUTES {
@@ -563,5 +576,90 @@ mod tests_6286 {
             tache(&state).paused,
             "l'audit en pause : sa tâche du registre doit le dire"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests_9116_reprise {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// Un « tout suspendre » qui tient le verrou des écritures de pause (base
+    /// engorgée : l'écrivain est pris par une autre connexion). Rend l'état,
+    /// la tâche d'écriture et de quoi libérer la base ; une seconde de
+    /// sécurité la libère de toute façon au bout de 3 s.
+    async fn suspendre_sur_base_tenue(
+        dossier: &tempfile::TempDir,
+    ) -> (
+        AppState,
+        tokio::task::JoinHandle<Result<(), String>>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let chemin = dossier.path().join("tune.db");
+        let state = AppState::new(chemin.to_str().unwrap(), 0, Default::default()).unwrap();
+        let tenue = rusqlite::Connection::open(&chemin).unwrap();
+        tenue.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (liberer, signal) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            let _ = signal.recv_timeout(Duration::from_secs(3));
+            tenue.execute_batch("ROLLBACK").unwrap();
+        });
+        let b = state.backend.clone();
+        let ecriture =
+            tokio::task::spawn_blocking(move || tune_core::taches_de_fond::tout_suspendre(&b));
+        let debut = Instant::now();
+        while !tune_core::taches_de_fond::tout_est_suspendu() {
+            assert!(debut.elapsed() < Duration::from_secs(2));
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        // Le temps que la tâche prenne le verrou et bute sur la base.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        (state, ecriture, liberer)
+    }
+
+    /// L'exécuteur (un seul fil ici, comme un serveur saturé) doit rester
+    /// libre pendant que la reprise attend le verrou.
+    async fn l_executeur_reste_libre() {
+        let debut = Instant::now();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            debut.elapsed() < Duration::from_secs(1),
+            "la reprise a bloqué le fil de l'exécuteur ({:?})",
+            debut.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn reprendre_une_tache_ne_bloque_pas_l_executeur() {
+        let _pauses = crate::pauses_de_fond_tests::isoler().await;
+        let dossier = tempfile::tempdir().unwrap();
+        let (state, ecriture, liberer) = suspendre_sur_base_tenue(&dossier).await;
+        let s = state.clone();
+        let reprise = tokio::spawn(async move {
+            reprendre_tache(State(s), Path(Tache::Integrite.id().to_string()))
+                .await
+                .into_response()
+                .status()
+        });
+        l_executeur_reste_libre().await;
+        let _ = liberer.send(());
+        ecriture.await.unwrap().unwrap();
+        assert!(reprise.await.unwrap().is_success());
+        assert!(!tune_core::taches_de_fond::est_en_pause(Tache::Integrite));
+    }
+
+    #[tokio::test]
+    async fn tout_reprendre_ne_bloque_pas_l_executeur() {
+        let _pauses = crate::pauses_de_fond_tests::isoler().await;
+        let dossier = tempfile::tempdir().unwrap();
+        let (state, ecriture, liberer) = suspendre_sur_base_tenue(&dossier).await;
+        let s = state.clone();
+        let reprise =
+            tokio::spawn(async move { tout_reprendre(State(s)).await.into_response().status() });
+        l_executeur_reste_libre().await;
+        let _ = liberer.send(());
+        ecriture.await.unwrap().unwrap();
+        assert!(reprise.await.unwrap().is_success());
+        assert!(tune_core::taches_de_fond::suspendus().is_empty());
     }
 }
