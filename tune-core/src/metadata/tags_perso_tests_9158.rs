@@ -235,7 +235,7 @@ fn mp3(epreuve: &str, txxx: &[(&str, &str)]) -> crate::test_scratch::ScratchFile
     chemin
 }
 
-fn m4a(epreuve: &str, libres: &[(&'static str, &str)]) -> crate::test_scratch::ScratchFile {
+fn m4a(epreuve: &str, libres: &[(&str, &str)]) -> crate::test_scratch::ScratchFile {
     use lofty::mp4::{Atom, AtomData, AtomIdent, Ilst, Mp4File};
     use std::borrow::Cow;
     let chemin = copie("test.m4a", epreuve);
@@ -247,7 +247,7 @@ fn m4a(epreuve: &str, libres: &[(&'static str, &str)]) -> crate::test_scratch::S
         ilst.insert(Atom::new(
             AtomIdent::Freeform {
                 mean: Cow::Borrowed("com.apple.iTunes"),
-                name: Cow::Borrowed(nom),
+                name: Cow::Owned(nom.to_string()),
             },
             AtomData::UTF8(v.to_string()),
         ));
@@ -586,7 +586,7 @@ fn rob_plusieurs_noms_de_champs_9158() {
 
 fn mp3_trames(
     epreuve: &str,
-    texte: &[(&'static str, &str)],
+    texte: &[(&str, &str)],
     txxx: &[(&str, &str)],
 ) -> crate::test_scratch::ScratchFile {
     use lofty::TextEncoding;
@@ -603,7 +603,7 @@ fn mp3_trames(
     tag.set_artist("Rob".into());
     for (id, v) in texte {
         tag.insert(Frame::Text(TextInformationFrame::new(
-            FrameId::Valid(Cow::Borrowed(id)),
+            FrameId::Valid(Cow::Owned(id.to_string())),
             TextEncoding::UTF8,
             v.to_string(),
         )));
