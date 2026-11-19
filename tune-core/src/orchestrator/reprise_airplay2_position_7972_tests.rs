@@ -220,7 +220,7 @@ async fn flux_decode_a_la_position_le_depart_est_note_7972() {
     let reelle = "airplay-7972-decode";
     sortie_airplay2(&orch, reelle).await;
     assert!(
-        orch.noter_le_depart_airplay2_si_le_flux_y_commence(reelle, Some(&sid), Some(3_000))
+        orch.noter_le_depart_si_le_flux_y_commence(reelle, Some(&sid), Some(3_000))
             .await
     );
     let position = position_publiee(&orch, reelle).await;
@@ -256,7 +256,7 @@ async fn flux_servi_depuis_l_octet_0_aucun_depart_note_7972() {
     sortie_airplay2(&orch, reelle).await;
     assert!(
         !orch
-            .noter_le_depart_airplay2_si_le_flux_y_commence(reelle, Some(&sid), Some(720_000))
+            .noter_le_depart_si_le_flux_y_commence(reelle, Some(&sid), Some(720_000))
             .await
     );
     let position = position_publiee(&orch, reelle).await;

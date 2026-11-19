@@ -79,18 +79,46 @@ struct Media {
     /// Fréquence native annoncée par l'orchestrateur, pour éviter un
     /// rééchantillonnage quand l'enceinte annonce ce taux.
     taux: Option<u32>,
+    /// #9175 — la source se RELIT-elle (fichier, session fichier ou
+    /// mandataire, radio en direct) ? Un flux traité servi par un canal
+    /// (`PlayMedia::byte_seekable == false`) ne se lit qu'une fois : une
+    /// reprise ou un saut ne peuvent pas le rouvrir, c'est la zone qui
+    /// relance le flux à la position.
+    relisible: bool,
+    /// #9175 — position, dans la piste, où commence le flux servi : non nulle
+    /// quand la zone a relancé un flux décodé à une position (saut, reprise).
+    /// Le décodeur compte depuis le début du flux, l'écran depuis le début de
+    /// la piste.
+    depart_du_flux_ms: u64,
 }
 
 impl Media {
     fn depuis(media: &PlayMedia<'_>) -> Self {
         Self {
+            // #9175 — `file_path` n'est renseigné pour cette sortie que si le
+            // flux servi EST le fichier d'origine (passthrough, aucun
+            // traitement : `fichier_d_origine_pour_la_sortie`). Dès que le
+            // serveur transcode (égaliseur, correction de pièce, ReplayGain,
+            // crossfeed), il vaut `None` et c'est le flux traité de `url` qui
+            // est décodé.
             source: media.file_path.unwrap_or(media.url).to_string(),
             uri: media.url.to_string(),
             titre: media.title.map(str::to_owned),
             artiste: media.artist.map(str::to_owned),
             duree_ms: media.duration_ms.unwrap_or(0),
             taux: media.sample_rate,
+            relisible: media.file_path.is_some() || media.byte_seekable || media.live_stream,
+            depart_du_flux_ms: 0,
         }
+    }
+
+    /// Le flux commence à `depart_ms` dans la piste : la durée annoncée était
+    /// celle qui restait (#6630), on rend celle de la piste.
+    fn noter_le_depart(&mut self, depart_ms: u64) {
+        if self.duree_ms > 0 {
+            self.duree_ms = self.duree_ms.saturating_sub(self.depart_du_flux_ms) + depart_ms;
+        }
+        self.depart_du_flux_ms = depart_ms;
     }
 }
 
@@ -300,6 +328,21 @@ impl SendspinOutput {
         *self.tache.lock().await = Some(tache);
     }
 
+    /// #9175 — la zone a relancé un flux DÉCODÉ qui commence à `depart_ms`
+    /// dans la piste (saut ou reprise sur un flux traité, qui ne se relit
+    /// pas) : la position et la durée se comptent depuis le début de la
+    /// piste, le décodeur depuis le début du flux.
+    pub fn noter_le_depart_du_flux(&self, depart_ms: u64) {
+        let mut d = self.diffusion();
+        if let Some(s) = d.segments.first_mut() {
+            s.debut_ms = s.debut_ms.saturating_sub(s.media.depart_du_flux_ms) + depart_ms;
+            s.media.noter_le_depart(depart_ms);
+        }
+        if let Some(m) = d.media_hors_lecture.as_mut() {
+            m.noter_le_depart(depart_ms);
+        }
+    }
+
     /// Fige l'état hors lecture (pause ou arrêt) sur la piste en cours.
     fn figer(&self, phase: Phase) -> (u64, Option<Media>) {
         let mut d = self.diffusion();
@@ -363,7 +406,23 @@ type DecodeurOuvert = (
 );
 
 /// Le décodeur progressif d'un fichier, à partir de `depuis_s`, dans `format`.
-fn ouvrir_decodeur(chemin: &str, format: &FormatAudio, depuis_s: f64) -> DecodeurOuvert {
+fn ouvrir_decodeur(
+    source: &str,
+    format: &FormatAudio,
+    depuis_s: f64,
+    en_direct: bool,
+) -> DecodeurOuvert {
+    if super::decodeur_distant::est_distante(source) {
+        return super::decodeur_distant::ouvrir_decodeur_distant(
+            source.to_owned(),
+            Some(format.sample_rate),
+            Some(u32::from(format.channels)),
+            Some(format.bit_depth),
+            depuis_s,
+            en_direct,
+        );
+    }
+    let chemin = source.strip_prefix("file://").unwrap_or(source);
     let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
     let (niveaux, niveaux_rx) = tokio::sync::mpsc::unbounded_channel();
     // Personne ne lit les niveaux de cette sortie : un récepteur fermé fait
@@ -413,11 +472,16 @@ async fn diffuser(
     // émises depuis : l'horodatage d'un morceau est `base + durée(trames)`.
     let mut base_us = t0;
     let mut trames_base: u64 = 0;
-    let mut position_s = debut_ms as f64 / 1_000.0;
+    // Position dans le FLUX : il commence à `depart_du_flux_ms` dans la piste.
+    let mut position_s = debut_ms.saturating_sub(media.depart_du_flux_ms) as f64 / 1_000.0;
     let mut trames_total: u64 = 0;
 
     'pistes: loop {
-        let (chemin, _garde) = super::airplay::url_to_local_path(&media.source).await?;
+        // #9175 — la source (fichier, ou flux servi par Tune) est décodée au
+        // fil de l'eau, comme chez Devialet AIR (#6911) : plus de
+        // téléchargement complet en mémoire avant le premier échantillon.
+        let chemin = media.source.clone();
+        let en_direct = media.duree_ms == 0;
         'decodeur: loop {
             // Le format se re-dérive à chaque ouverture du décodeur : nouvelle
             // piste à un autre taux, ou préférence changée par l'enceinte.
@@ -449,7 +513,7 @@ async fn diffuser(
             } else {
                 0.0
             };
-            let (mut rx, decodeur) = ouvrir_decodeur(&chemin, &format, depuis_s);
+            let (mut rx, decodeur) = ouvrir_decodeur(&chemin, &format, depuis_s, en_direct);
             let mut tampon: Vec<u8> = Vec::with_capacity(octets_morceau * 2);
             let mut premier = true;
             let mut decodage_fini = false;
@@ -643,6 +707,13 @@ impl OutputTarget for SendspinOutput {
             (d.position_pause_ms, d.media_hors_lecture.clone())
         };
         let media = media.ok_or("sendspin: nothing to resume")?;
+        if !media.relisible {
+            // #9175 — `device_released_on_pause` l'a déjà dit à la zone, qui
+            // relance le flux à la position au lieu d'appeler ceci.
+            return Err(
+                "sendspin: le flux traité ne se relit pas : la zone doit le relancer".into(),
+            );
+        }
         let format = format_voulu(&self.liaison, media.taux)
             .ok_or_else(|| "sendspin: no producible format".to_string())?;
         let codec = Codec::nouveau(&format, self.liaison.capacite())?;
@@ -678,6 +749,14 @@ impl OutputTarget for SendspinOutput {
                 };
                 let format = format.ok_or("sendspin: no format")?;
                 let media = media.ok_or("sendspin: nothing to seek")?;
+                if !media.relisible {
+                    // #9175 — le saut se joue par une relance du flux à la
+                    // position (`deplacer_la_sortie`), jamais ici.
+                    return Err(
+                        "sendspin: le flux traité ne se relit pas : la zone doit le relancer"
+                            .into(),
+                    );
+                }
                 let codec = Codec::nouveau(&format, self.liaison.capacite())?;
                 self.interrompre().await;
                 self.ordonner(OrdreLecteur::Vider).await?;
@@ -742,6 +821,13 @@ impl OutputTarget for SendspinOutput {
         self.liaison.connectee() && self.liaison.etat().disponible()
     }
 
+    /// #9175 — en pause sur un flux traité servi par un canal : il ne se
+    /// relit pas, la reprise doit relancer le flux à la position.
+    fn device_released_on_pause(&self) -> bool {
+        let d = self.diffusion();
+        d.phase == Phase::Pause && d.media_hors_lecture.as_ref().is_some_and(|m| !m.relisible)
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -770,5 +856,161 @@ mod tests {
         assert_eq!(trames_par_morceau(&f, 2 * (13 + 600)), 100);
         assert_eq!(trames_par_morceau(&f, 0), 1, "jamais zéro trame");
         assert_eq!(identifiant_de_sortie("abc"), "sendspin:abc");
+    }
+
+    /// Une enceinte factice : chaque ordre est accepté et noté.
+    fn enceinte_factice() -> (SendspinOutput, Arc<Mutex<Vec<&'static str>>>) {
+        let (liaison, mut cote) = crate::sendspin::lecteur::relier(
+            vec![crate::sendspin::lecteur::FormatAudio::pcm(44_100, 2, 16)],
+            None,
+        );
+        let ordres = Arc::new(Mutex::new(Vec::new()));
+        let notes = ordres.clone();
+        tokio::spawn(async move {
+            while let Some(d) = cote.ordres.recv().await {
+                let nom = match d.ordre {
+                    OrdreLecteur::Morceau { .. } => "morceau",
+                    OrdreLecteur::Demarrer { .. } => "demarrer",
+                    OrdreLecteur::Vider => "vider",
+                    OrdreLecteur::Suspendre => "suspendre",
+                    OrdreLecteur::Arreter => "arreter",
+                    _ => "autre",
+                };
+                notes.lock().unwrap().push(nom);
+                let _ = d.reponse.send(Ok(()));
+            }
+        });
+        (
+            SendspinOutput::new("Banc 9175".into(), "banc-9175", liaison),
+            ordres,
+        )
+    }
+
+    /// Un WAV stéréo 16 bits à 44,1 kHz de `secondes`, en octets.
+    fn wav(secondes: usize) -> Vec<u8> {
+        let donnees = vec![0x11u8; 44_100 * 4 * secondes];
+        let mut f =
+            crate::audio::wav::build_wav_header_with_data_size(2, 44_100, 16, donnees.len() as u32)
+                .to_vec();
+        f.extend_from_slice(&donnees);
+        f
+    }
+
+    async fn attendre_un_morceau(ordres: &Mutex<Vec<&'static str>>) -> bool {
+        for _ in 0..300 {
+            if ordres.lock().unwrap().contains(&"morceau") {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// #9175 — un flux TRAITÉ servi par un canal (`byte_seekable == false`,
+    /// pas de fichier d'origine) ne se lit qu'une fois : la sortie ne le
+    /// rouvre ni au saut ni à la reprise, elle dit à la zone de le relancer
+    /// (`device_released_on_pause`) et compte depuis le début de la piste
+    /// quand la zone lui apprend où le flux relancé commence.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn un_flux_traite_en_canal_se_relance_par_la_zone_9175() {
+        let dossier = crate::test_scratch::scratch_dir("sendspin-canal-9175");
+        let chemin = dossier.path().join("piste.wav");
+        std::fs::write(&chemin, wav(3)).unwrap();
+        let chemin = chemin.to_string_lossy().into_owned();
+        let (sortie, ordres) = enceinte_factice();
+
+        let canal = PlayMedia {
+            url: &chemin,
+            file_path: None,
+            byte_seekable: false,
+            mime_type: "audio/wav",
+            duration_ms: Some(2_000),
+            ..Default::default()
+        };
+        sortie.play_media(&canal).await.unwrap();
+        assert!(attendre_un_morceau(&ordres).await, "témoin : le flux part");
+
+        assert!(
+            sortie.seek(1_000).await.is_err(),
+            "#9175 : un canal ne se rouvre pas à la position, la zone doit le relancer"
+        );
+        sortie.noter_le_depart_du_flux(60_000);
+        let st = sortie.get_status().await.unwrap();
+        assert!(
+            st.position_ms >= 60_000,
+            "#9175 : position comptée depuis le début de la piste ({})",
+            st.position_ms
+        );
+        assert_eq!(st.duration_ms, 62_000, "durée de la piste, pas du reste");
+
+        sortie.pause().await.unwrap();
+        assert!(
+            sortie.device_released_on_pause(),
+            "#9175 : en pause sur un canal, la reprise doit relancer le flux"
+        );
+        assert!(sortie.resume().await.is_err());
+        sortie.stop().await.unwrap();
+
+        // Contre-épreuve : la même piste servie par son fichier se rouvre.
+        let fichier = PlayMedia {
+            url: &chemin,
+            file_path: Some(&chemin),
+            mime_type: "audio/wav",
+            duration_ms: Some(3_000),
+            ..Default::default()
+        };
+        sortie.play_media(&fichier).await.unwrap();
+        sortie.pause().await.unwrap();
+        assert!(!sortie.device_released_on_pause());
+        sortie.resume().await.unwrap();
+        sortie.stop().await.unwrap();
+    }
+
+    /// #9175 — le flux servi par Tune est décodé AU FIL DE L'EAU. Le serveur
+    /// du banc envoie l'en-tête et deux secondes, puis se tait sans fermer :
+    /// l'ancien téléchargement complet (`url_to_local_path`, `bytes()`)
+    /// attendait la fin du corps, et rien ne partait vers l'enceinte.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn le_flux_servi_est_decode_au_fil_de_l_eau_9175() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let adresse = ecoute.local_addr().unwrap();
+        let serveur = tokio::spawn(async move {
+            loop {
+                let Ok((mut c, _)) = ecoute.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut requete = [0u8; 2048];
+                    let _ = c.read(&mut requete).await;
+                    // Un canal : ni `Range`, ni longueur, et une fin qui ne
+                    // vient pas (60 s annoncées, 2 s envoyées).
+                    let _ = c
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\nConnection: close\r\n\r\n",
+                        )
+                        .await;
+                    let corps = wav(60);
+                    let _ = c.write_all(&corps[..44 + 44_100 * 4 * 2]).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                });
+            }
+        });
+        let url = format!("http://{adresse}/stream/banc-9175.wav");
+        let (sortie, ordres) = enceinte_factice();
+        let canal = PlayMedia {
+            url: &url,
+            byte_seekable: false,
+            mime_type: "audio/wav",
+            duration_ms: Some(60_000),
+            ..Default::default()
+        };
+        sortie.play_media(&canal).await.unwrap();
+        assert!(
+            attendre_un_morceau(&ordres).await,
+            "#9175 : le premier morceau doit partir sans attendre la fin du flux"
+        );
+        sortie.stop().await.unwrap();
+        serveur.abort();
     }
 }

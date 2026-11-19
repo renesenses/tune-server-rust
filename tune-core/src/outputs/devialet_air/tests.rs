@@ -1102,6 +1102,69 @@ async fn air_pause_envoie_un_arret_et_la_reprise_ouvre_un_flux_neuf() {
     assert_eq!(s.arrets.len(), 2);
 }
 
+/// #9175 — un flux TRAITÉ servi par un canal (`byte_seekable == false`, pas de
+/// fichier d'origine) ne se lit qu'une fois. La sortie ne le rouvre ni à la
+/// reprise, ni au saut : elle dit à la zone de le relancer à la position
+/// (`device_released_on_pause`), et compte depuis le début de la piste quand
+/// la zone lui apprend où le flux relancé commence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn air_un_flux_traite_en_canal_se_relance_par_la_zone_9175() {
+    let b = banc(annonce_de_test(), true).await;
+    let dossier = crate::test_scratch::scratch_dir("devialet-air-canal-9175");
+    let (chemin, _) = wav_16_bits(&dossier, 44_100, 88_200);
+    let canal = PlayMedia {
+        url: &chemin,
+        file_path: None,
+        byte_seekable: false,
+        mime_type: "audio/wav",
+        duration_ms: Some(2_000),
+        ..Default::default()
+    };
+    b.sortie.play_media(&canal).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let saut = b.sortie.seek(1_000).await;
+    assert!(
+        saut.is_err(),
+        "#9175 : un canal ne se rouvre pas à la position, la zone doit le relancer"
+    );
+    assert_eq!(
+        b.sortie.get_status().await.unwrap().state,
+        TransportState::Playing,
+        "le refus du saut ne coupe pas la lecture"
+    );
+
+    // La zone a relancé le flux à 60 s : il commence là dans la piste.
+    b.sortie.noter_le_depart_du_flux(60_000).await;
+    let st = b.sortie.get_status().await.unwrap();
+    assert!(
+        st.position_ms >= 60_000,
+        "#9175 : position comptée depuis le début de la piste ({})",
+        st.position_ms
+    );
+    assert_eq!(st.duration_ms, 62_000, "durée de la piste, pas du reste");
+
+    b.sortie.pause().await.unwrap();
+    assert!(
+        b.sortie.device_released_on_pause(),
+        "#9175 : en pause sur un canal, la reprise doit relancer le flux"
+    );
+    assert!(
+        b.sortie.resume().await.is_err(),
+        "#9175 : la sortie ne rouvre pas un canal à la reprise"
+    );
+    b.sortie.stop().await.unwrap();
+    assert!(!b.sortie.device_released_on_pause());
+
+    // Contre-épreuve : la même piste servie par son fichier se rouvre.
+    b.sortie.play_media(&media(&chemin)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    b.sortie.pause().await.unwrap();
+    assert!(!b.sortie.device_released_on_pause());
+    b.sortie.resume().await.unwrap();
+    b.sortie.stop().await.unwrap();
+}
+
 /// #6923 — un déplacement dont le flux neuf ne part pas laisse la sortie
 /// arrêtée. Elle doit le DIRE (`take_output_failure`), sinon le sondeur
 /// prend cet arrêt pour une fin de piste et passe au morceau suivant.
