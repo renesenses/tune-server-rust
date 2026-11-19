@@ -181,14 +181,54 @@ async fn status(_admin: RequireAdmin, State(state): State<AppState>) -> Response
     let tiers = third_party_ids().into_iter().map(|id| (id, true));
     let plugins: Vec<_> = integres
         .chain(tiers)
-        .map(|(id, third_party)| {
-            // `version` : celle du catalogue à l'installation, `null` pour un
-            // paquet envoyé à la main (le manifeste du SDK n'en porte pas).
-            let version = settings.get(&format!("plugin_{id}_version")).ok().flatten();
-            json!({"id":id,"third_party":third_party,"native_loaded":tune_plugin_native::provider(&id).is_some(),"error":tune_plugin_native::failure(&id),"version":version})
-        })
+        .map(|(id, third_party)| fiche_d_etat(&settings, &id, third_party))
         .collect();
     Json(json!({"abi":1,"target":tune_plugin_native::package::host_target(),"trust_configured":trusted_keys().is_ok_and(|v|!v.is_empty()),"plugins":plugins})).into_response()
+}
+/// Une ligne du panneau « État des greffons » (`GET /audio-plugins/`).
+///
+/// `native_loaded` dit seulement qu'un PAQUET natif a été chargé depuis le
+/// disque. Un emplacement intégré sans paquet tourne par son moteur embarqué
+/// (`Engine::Bundled`, `tune-core/src/audio/eq.rs`) : `native_loaded` y vaut
+/// `false` chez tout le monde, et le panneau affichait « Not loaded » pour un
+/// égaliseur ou un suréchantillonneur qui marchaient (#9151, fil 2945 ; #8740
+/// point 3). D'où deux champs :
+/// - `engine` : `"native"` (paquet chargé), `"bundled"` (intégré, moteur
+///   embarqué) ou `null` (greffon tiers sans bibliothèque chargée) ;
+/// - `active` : l'état effectif, le prédicat même qui ouvre les routes et la
+///   chaîne DSP — [`premium_plugins::enabled`] pour un intégré,
+///   [`natifs_tiers::actif`] (demandé ET chargé) pour un tiers.
+///
+/// [`premium_plugins::enabled`]: tune_core::audio::premium_plugins::enabled
+/// [`natifs_tiers::actif`]: tune_core::audio::natifs_tiers::actif
+pub(crate) fn fiche_d_etat(
+    settings: &tune_core::db::settings_repo::SettingsRepo,
+    id: &str,
+    third_party: bool,
+) -> serde_json::Value {
+    // `version` : celle du catalogue à l'installation, `null` pour un
+    // paquet envoyé à la main (le manifeste du SDK n'en porte pas).
+    let version = settings.get(&format!("plugin_{id}_version")).ok().flatten();
+    let native_loaded = tune_plugin_native::provider(id).is_some();
+    let engine = match (native_loaded, third_party) {
+        (true, _) => Some("native"),
+        (false, false) => Some("bundled"),
+        (false, true) => None,
+    };
+    let active = if third_party {
+        tune_core::audio::natifs_tiers::actif(settings, id)
+    } else {
+        tune_core::audio::premium_plugins::enabled(settings, id)
+    };
+    json!({
+        "id": id,
+        "third_party": third_party,
+        "native_loaded": native_loaded,
+        "engine": engine,
+        "active": active,
+        "error": tune_plugin_native::failure(id),
+        "version": version,
+    })
 }
 fn refusal(error: String) -> Response {
     (
@@ -587,3 +627,7 @@ mod cle_de_mozaiklabs_5149 {
 #[cfg(test)]
 #[path = "native_audio_desinstallation_6256_tests.rs"]
 mod desinstallation_6256_tests;
+
+#[cfg(test)]
+#[path = "native_audio_etat_9151_tests.rs"]
+mod etat_9151_tests;
