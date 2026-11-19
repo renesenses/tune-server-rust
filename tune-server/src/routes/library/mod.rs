@@ -95,6 +95,9 @@ mod forme_onde;
 /// Go du 17/11 (rc13) — l'enveloppe de la barre de progression d'une piste
 /// Qobuz ou TIDAL en lecture, par le téléchargement de `audio_de_service`.
 mod onde_de_service;
+/// Fil du forum 2954 (rc13) — l'enveloppe de la barre de lecture d'une piste
+/// de bibliothèque, à la résolution demandée (`?points=`).
+mod onde_lecture;
 pub(crate) mod reveler;
 mod search;
 /// #7857 — le spectrogramme d'une piste, en PNG, généré à la demande.

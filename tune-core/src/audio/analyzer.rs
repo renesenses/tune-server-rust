@@ -1007,30 +1007,40 @@ pub async fn detect_bpm(file_path: &str) -> Option<f64> {
     Some(bpm)
 }
 
-pub async fn generate_waveform(file_path: &str, points: usize) -> Vec<f32> {
-    let sample_rate = 22050_u32;
+/// Nombre de points de l'enveloppe de la barre de lecture quand le client
+/// n'en demande pas : celui d'avant le fil 2954, gardé pour les anciens
+/// clients (et leur cache en base, `tracks.waveform_json`).
+pub const ONDE_POINTS_ANCIEN: usize = 200;
+/// La résolution fine proposée aux clients (fil du forum 2954, rc13).
+pub const ONDE_POINTS_FIN: usize = 1000;
+/// Bornes du paramètre `points` de `GET /library/tracks/{id}/waveform`.
+pub const ONDE_POINTS_MIN: usize = 100;
+pub const ONDE_POINTS_MAX: usize = 2000;
 
-    let pcm = match decode_pcm(file_path, sample_rate, 1, 0.0, 0.0).await {
-        Ok(p) => p,
-        Err(_) => return Vec::new(),
-    };
+/// Ramène un nombre de points demandé dans [`ONDE_POINTS_MIN`, `ONDE_POINTS_MAX`].
+pub fn borner_points_onde(points: usize) -> usize {
+    points.clamp(ONDE_POINTS_MIN, ONDE_POINTS_MAX)
+}
 
-    let samples: Vec<f64> = pcm
-        .chunks_exact(2)
-        .map(|c| i16::from_le_bytes([c[0], c[1]]) as f64)
-        .collect();
-
-    if samples.len() < points {
+/// L'enveloppe RMS de `samples` (mono, à n'importe quelle échelle entière)
+/// en `points` tranches, normalisée à la plus forte (1,0) et arrondie au
+/// dix-millième. Vide quand il y a moins d'échantillons que de points.
+///
+/// Les tranches couvrent TOUS les échantillons (bornes `i·n/points`) : la fin
+/// de la piste n'est pas tronquée. Le calcul ne copie pas le PCM (une piste
+/// d'une heure à 22 050 Hz, c'est 79 M d'échantillons).
+pub fn enveloppe_rms(samples: &[i32], points: usize) -> Vec<f32> {
+    let n = samples.len();
+    if points == 0 || n < points {
         return Vec::new();
     }
-
-    let frame_size = samples.len() / points;
     let mut rms_values: Vec<f64> = (0..points)
         .map(|i| {
-            let start = i * frame_size;
-            let end = start + frame_size;
-            let frame = &samples[start..end];
-            let mean_sq = frame.iter().map(|s| s * s).sum::<f64>() / frame.len() as f64;
+            let start = (i as u128 * n as u128 / points as u128) as usize;
+            let end = ((i as u128 + 1) * n as u128 / points as u128) as usize;
+            let frame = &samples[start..end.max(start + 1).min(n)];
+            let mean_sq =
+                frame.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / frame.len() as f64;
             mean_sq.sqrt()
         })
         .collect();
@@ -1046,6 +1056,28 @@ pub async fn generate_waveform(file_path: &str, points: usize) -> Vec<f32> {
         .iter()
         .map(|v| (*v as f32 * 10000.0).round() / 10000.0)
         .collect()
+}
+
+/// L'enveloppe de la barre de lecture d'un fichier, ou d'une TRANCHE de
+/// fichier (`seek_s`, `duree_s` ; `0.0` = jusqu'au bout) — la piste d'une
+/// feuille CUE dans son image. BLOQUANT : décode tout ce qu'il faut lire ;
+/// à appeler hors de l'exécuteur async. Vide si le fichier est illisible.
+pub fn onde_du_fichier(file_path: &str, points: usize, seek_s: f64, duree_s: f64) -> Vec<f32> {
+    match super::decode::decode_to_pcm(file_path, Some(22050), Some(1), seek_s, duree_s) {
+        Ok(decoded) => enveloppe_rms(&decoded.samples_i32, points),
+        Err(e) => {
+            warn!(file = file_path, error = %e, "waveform_decode_failed");
+            Vec::new()
+        }
+    }
+}
+
+/// [`onde_du_fichier`] sur le fichier entier, hors de l'exécuteur async.
+pub async fn generate_waveform(file_path: &str, points: usize) -> Vec<f32> {
+    let path = file_path.to_string();
+    tokio::task::spawn_blocking(move || onde_du_fichier(&path, points, 0.0, 0.0))
+        .await
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -1676,6 +1708,106 @@ mod tests {
     // -----------------------------------------------------------------------
     // Existing tests (preserved)
     // -----------------------------------------------------------------------
+
+    /// Fil 2954 — la résolution demandée est respectée, les tranches
+    /// couvrent toute la piste et la plus forte vaut 1.
+    #[test]
+    fn enveloppe_rms_rend_le_nombre_de_points_demande() {
+        // 10 000 échantillons : la première moitié à 1 000, la seconde à 4 000.
+        let samples: Vec<i32> = (0..10_000)
+            .map(|i| if i < 5_000 { 1_000 } else { -4_000 })
+            .collect();
+        for points in [100usize, 200, 1000, 2000] {
+            let e = enveloppe_rms(&samples, points);
+            assert_eq!(e.len(), points);
+            assert!((e[0] - 0.25).abs() < 1e-4, "{points} : {}", e[0]);
+            assert!((e[points - 1] - 1.0).abs() < 1e-4);
+            assert!(e.iter().all(|v| (0.0..=1.0).contains(v)));
+        }
+        // La dernière tranche n'est pas perdue quand n n'est pas un multiple.
+        let mut s = vec![0i32; 1_001];
+        s[1_000] = 500;
+        let e = enveloppe_rms(&s, 1000);
+        assert_eq!(e.len(), 1000);
+        assert!(e[999] > 0.0, "le dernier échantillon compte");
+    }
+
+    #[test]
+    fn enveloppe_rms_vide_si_trop_peu_d_echantillons() {
+        assert!(enveloppe_rms(&[1, 2, 3], 1000).is_empty());
+        assert!(enveloppe_rms(&[1, 2, 3], 0).is_empty());
+        // Silence : tout à zéro, pas de NaN.
+        let e = enveloppe_rms(&vec![0; 2_000], 1000);
+        assert!(e.iter().all(|v| *v == 0.0));
+    }
+
+    #[test]
+    fn borner_points_onde_tient_les_bornes() {
+        assert_eq!(borner_points_onde(0), ONDE_POINTS_MIN);
+        assert_eq!(borner_points_onde(50), 100);
+        assert_eq!(borner_points_onde(1000), 1000);
+        assert_eq!(borner_points_onde(1_000_000), ONDE_POINTS_MAX);
+    }
+
+    /// Fil 2954 — une tranche (piste CUE) se lit à sa place dans le fichier.
+    #[tokio::test]
+    async fn onde_d_une_tranche_ne_lit_que_la_tranche() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("image.wav");
+        // 4 s : 2 s de silence, puis 2 s de son.
+        const HZ: usize = 22_050;
+        let mut donnees = Vec::new();
+        for i in 0..HZ * 4 {
+            let v: i16 = if i < HZ * 2 {
+                0
+            } else if i % 2 == 0 {
+                20_000
+            } else {
+                -20_000
+            };
+            donnees.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut w = Vec::new();
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36u32 + donnees.len() as u32).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes());
+        w.extend_from_slice(&(HZ as u32).to_le_bytes());
+        w.extend_from_slice(&((HZ * 2) as u32).to_le_bytes());
+        w.extend_from_slice(&2u16.to_le_bytes());
+        w.extend_from_slice(&16u16.to_le_bytes());
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(donnees.len() as u32).to_le_bytes());
+        w.extend_from_slice(&donnees);
+        std::fs::write(&f, w).unwrap();
+        let chemin = f.to_str().unwrap();
+
+        let entier = onde_du_fichier(chemin, 100, 0.0, 0.0);
+        assert_eq!(entier.len(), 100);
+        assert_eq!(entier[0], 0.0, "le fichier entier commence par le silence");
+
+        // La tranche [1 s, 3 s] : moitié silence, moitié son.
+        let tranche = onde_du_fichier(chemin, 100, 1.0, 2.0);
+        assert_eq!(tranche.len(), 100);
+        assert!(
+            tranche[..45].iter().all(|v| *v < 0.01),
+            "{:?}",
+            &tranche[..50]
+        );
+        assert!(
+            tranche[55..].iter().all(|v| *v > 0.9),
+            "{:?}",
+            &tranche[50..]
+        );
+
+        // La tranche [2 s, fin] : que du son.
+        let fin = onde_du_fichier(chemin, 100, 2.0, 0.0);
+        assert!(fin.iter().all(|v| *v > 0.9), "{fin:?}");
+
+        assert_eq!(generate_waveform(chemin, 100).await, entier);
+    }
 
     #[test]
     fn waveform_normalize() {

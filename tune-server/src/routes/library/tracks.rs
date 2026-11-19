@@ -1550,47 +1550,22 @@ pub(super) async fn identify_track(
     .into_response()
 }
 
+/// `GET /library/tracks/{id}/waveform[?points=N]` — voir `onde_lecture`
+/// (fil du forum 2954 : résolution à la demande, cache par résolution,
+/// tranche CUE).
 pub(super) async fn track_waveform(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-) -> impl IntoResponse {
-    let repo = TrackRepo::with_backend(state.backend.clone());
-
-    // Return cached waveform if available
-    if let Ok(Some(cached)) = repo.get_waveform(id) {
-        return Json(json!({ "track_id": id, "waveform": serde_json::from_str::<Value>(&cached).unwrap_or(Value::Null) })).into_response();
-    }
-
-    // Generate on demand
-    let track = match repo.get(id) {
-        Ok(Some(t)) => t,
-        Ok(None) => return (StatusCode::NOT_FOUND, "track not found").into_response(),
-        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
-    };
-
-    let file_path = match track.file_path.as_deref() {
-        Some(p) => p.to_string(),
-        None => {
-            return Json(json!({ "track_id": id, "waveform": null, "error": "no file path" }))
-                .into_response();
-        }
-    };
-
-    // Le décodeur reçoit la graphie du disque, pas celle de la base : sur les
-    // pistes dont le nom est décomposé, `generate_waveform` rendait un vecteur
-    // vide et la route répondait « file unreadable » pour un fichier qui se
-    // joue très bien (#1865).
-    let file_path = tune_core::library::local_path::resolve_existing_local_path(&file_path)
-        .unwrap_or(file_path);
-    let points = tune_core::audio::analyzer::generate_waveform(&file_path, 200).await;
-    if points.is_empty() {
-        return Json(json!({ "track_id": id, "waveform": null, "error": "file unreadable or unsupported format" })).into_response();
-    }
-
-    let json_str = serde_json::to_string(&points).unwrap_or_default();
-    repo.set_waveform(id, &json_str).ok();
-
-    Json(json!({ "track_id": id, "waveform": points })).into_response()
+    Query(p): Query<super::onde_lecture::Parametres>,
+) -> axum::response::Response {
+    super::onde_lecture::servir(
+        &state,
+        id,
+        p,
+        &super::onde_lecture::dossier_du_cache(),
+        super::onde_lecture::plafond(),
+    )
+    .await
 }
 
 /// Combien de pistes accumulées avant d'écrire le magasin étendu.

@@ -248,3 +248,76 @@ fn calcul_abandonne_entre_deux_fenetres() {
     assert_eq!(e, INTERROMPU);
     assert_eq!(cessions.get(), 1, "arrêté dès la première cession");
 }
+
+/// Fil 2954 — une plage courte rend ses échantillons, au bit près.
+#[test]
+fn plage_courte_rend_les_echantillons() {
+    let signal = sinus(&[0.5, 0.25], 0.1);
+    let trames = signal.len() / 2;
+    assert!(trames <= ECHANTILLONS_MAX);
+    let f = forme(&signal, 2, 1000, Some(trames as u64));
+    let g = f.voies[0]
+        .echantillons
+        .as_ref()
+        .expect("échantillons à gauche");
+    let d = f.voies[1]
+        .echantillons
+        .as_ref()
+        .expect("échantillons à droite");
+    assert_eq!(g.len(), trames);
+    let attendus_g: Vec<f32> = signal.iter().step_by(2).copied().collect();
+    let attendus_d: Vec<f32> = signal.iter().skip(1).step_by(2).copied().collect();
+    assert_eq!(g, &attendus_g);
+    assert_eq!(d, &attendus_d);
+}
+
+#[test]
+fn plage_longue_ou_inconnue_sans_echantillons() {
+    let signal = sinus(&[0.5], 1.0);
+    let n = signal.len() as u64;
+    assert!(
+        forme(&signal, 1, 100, Some(n)).voies[0]
+            .echantillons
+            .is_none()
+    );
+    assert!(forme(&signal, 1, 100, None).voies[0].echantillons.is_none());
+    // Une estimation trop courte : dépassée en route, rien de tronqué n'est rendu.
+    assert!(
+        forme(&signal, 1, 100, Some(4000)).voies[0]
+            .echantillons
+            .is_none()
+    );
+}
+
+/// Fil 2954 — le marqueur d'écrêtage tombe dans la colonne de l'évènement.
+#[test]
+fn ecretage_dans_la_bonne_colonne() {
+    let mut signal = sinus(&[0.3], 1.0);
+    let debut = (0.735 * f64::from(SR)) as usize;
+    for x in &mut signal[debut..debut + 10] {
+        *x = 1.0;
+    }
+    let f = forme(&signal, 1, 100, Some(u64::from(SR)));
+    assert_eq!(f.voies[0].colonnes_ecretees, vec![73]);
+    assert_eq!(f.voies[0].ecretes, 10);
+}
+
+/// Fil 2954 — un sinus GRAVE (50 Hz) normalisé à 0 dBFS, quantifié par
+/// arrondi en 16 bits, touche la pleine échelle sur un ou deux échantillons
+/// par crête : ce n'est pas un écrêtage (la règle des trois échantillons).
+#[test]
+fn sinus_grave_normalise_n_est_pas_ecrete() {
+    let n = 2 * SR as usize;
+    let signal: Vec<f32> = (0..n)
+        .map(|i| {
+            let s = (std::f64::consts::TAU * 50.0 * i as f64 / f64::from(SR)).sin();
+            ((s * 32767.0).round() / 32768.0) as f32
+        })
+        .collect();
+    let f = {
+        let mut acc = Accumulateur::new(SR, 1, 100, Some(n as u64)).avec_bits(16);
+        acc.pousser(&signal);
+        acc.terminer()
+    };
+    assert_eq!(f.ecretes, 0, "{:?}", f.voies[0].colonnes_ecretees);
+}

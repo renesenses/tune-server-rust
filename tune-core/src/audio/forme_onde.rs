@@ -36,6 +36,12 @@ pub const COLONNES_DEFAUT: usize = 1000;
 /// d'échantillons consécutifs, sur un même canal : un signal coupé reste
 /// collé au plafond, une crête normalisée le touche une fois.
 pub const ECRETAGE_SUITE_MIN: u64 = 3;
+/// Fil du forum 2954 — au fort zoom, les ÉCHANTILLONS eux-mêmes : une plage
+/// d'au plus autant de trames (0,19 s à 44,1 kHz) rend, par canal, chaque
+/// échantillon normalisé en plus des colonnes. Une colonne d'un seul
+/// échantillon a `min == max` : sa bande n'a plus d'épaisseur et l'onde
+/// disparaissait du tracé ; l'écran trace alors la courbe des échantillons.
+pub const ECHANTILLONS_MAX: usize = 8192;
 /// En deçà, un niveau est du silence : pas de valeur en dBFS.
 pub const PLANCHER_DBFS: f64 = -150.0;
 
@@ -138,6 +144,9 @@ pub struct Accumulateur {
     totaux: Vec<Totaux>,
     trames: u64,
     seuil: f32,
+    /// Les échantillons bruts par canal, tant qu'il y en a au plus
+    /// [`ECHANTILLONS_MAX`] (`None` : plage trop longue, ou dépassée).
+    echantillons: Option<Vec<Vec<f32>>>,
 }
 
 impl Accumulateur {
@@ -167,6 +176,9 @@ impl Accumulateur {
             totaux: vec![Totaux::default(); canaux],
             trames: 0,
             seuil: 1.0,
+            echantillons: trames_estimees
+                .filter(|t| *t <= ECHANTILLONS_MAX as u64)
+                .map(|_| vec![Vec::new(); canaux]),
         }
     }
 
@@ -183,6 +195,18 @@ impl Accumulateur {
 
     /// Pousse des trames entrelacées (`canaux` valeurs par trame).
     pub fn pousser(&mut self, entrelaces: &[f32]) {
+        if let Some(bruts) = &mut self.echantillons {
+            let trames = entrelaces.len() / self.canaux;
+            if bruts[0].len() + trames > ECHANTILLONS_MAX {
+                self.echantillons = None;
+            } else {
+                for trame in entrelaces.chunks_exact(self.canaux) {
+                    for (c, &x) in trame.iter().enumerate() {
+                        bruts[c].push(x);
+                    }
+                }
+            }
+        }
         for trame in entrelaces.chunks_exact(self.canaux) {
             for (c, &x) in trame.iter().enumerate() {
                 self.courante[c].ajouter(x);
@@ -245,11 +269,13 @@ impl Accumulateur {
         }
         let m = self.cases[0].len();
         let colonnes = self.colonnes.min(m);
+        let mut bruts = self.echantillons.take().map(Vec::into_iter);
         let voies = self
             .cases
             .iter()
             .zip(&self.totaux)
             .map(|(cases, t)| {
+                let echantillons = bruts.as_mut().and_then(Iterator::next);
                 let mut min = Vec::with_capacity(colonnes);
                 let mut max = Vec::with_capacity(colonnes);
                 let mut rms = Vec::with_capacity(colonnes);
@@ -280,6 +306,7 @@ impl Accumulateur {
                         (t.somme_carres / t.n as f64).sqrt()
                     },
                     ecretes: t.ecretes,
+                    echantillons,
                 }
             })
             .collect::<Vec<_>>();
@@ -316,6 +343,9 @@ pub struct Voie {
     /// RMS globale, linéaire.
     pub rms_globale: f64,
     pub ecretes: u64,
+    /// Au fort zoom (plage d'au plus [`ECHANTILLONS_MAX`] trames) : chaque
+    /// échantillon, normalisé à ±1 (fil 2954).
+    pub echantillons: Option<Vec<f32>>,
 }
 
 impl Voie {
