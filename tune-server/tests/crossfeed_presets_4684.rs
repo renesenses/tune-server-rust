@@ -152,17 +152,20 @@ async fn valeurs_bornees_et_nom_requis() {
     assert_eq!(lister(&app).await.len(), 1, "rien d'écrit par les refus");
 }
 
-/// Écrire demande le crossfeed Premium, comme `PUT /zones/{id}/dsp` ; lire
-/// reste libre.
+/// Le compte Free peut créer, lire et supprimer un préréglage (#9210).
 #[tokio::test]
-async fn ecrire_demande_le_premium() {
+async fn ecrire_est_gratuit_9210() {
     let app = tune_server::routes::router(etat(false).await);
     let (status, _) = post(
         &app,
         json!({"name": "Salon", "amount": 0.3, "delay_ms": 0.5}),
     )
     .await;
-    assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+    assert_eq!(status, StatusCode::CREATED);
+    let presets = lister(&app).await;
+    assert_eq!(presets.len(), 1);
+    let (status, _) = supprimer(&app, presets[0]["id"].as_str().unwrap()).await;
+    assert!(status.is_success());
     assert!(lister(&app).await.is_empty());
 }
 

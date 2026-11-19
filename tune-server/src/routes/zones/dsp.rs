@@ -504,8 +504,8 @@ pub(super) async fn set_zone_dsp(
     headers: axum::http::HeaderMap,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
-    // Authorize the whole request before any write: EQ is free, crossfeed is
-    // separately Premium. A mixed request must never partially mutate EQ.
+    // Authorize the whole request before any write. EQ and simple crossfeed
+    // are free; a mixed request must never partially mutate EQ.
     if body.get("crossfeed").is_some()
         && let Err(resp) = crate::premium_guard::require_premium_localise(
             &state.license,
@@ -559,7 +559,7 @@ pub(super) async fn set_zone_dsp(
     }
 
     // Handle crossfeed sub-object if present (local-output headphone effect).
-    // Separate Premium crossfeed gate above. Ranges clamped by
+    // Installation checked above. Ranges clamped by
     // `tune_core::audio::crossfeed::borner` (amount 0..0.5, delay_ms 0..5 — la
     // même borne que les préréglages, #4684). Persisted to `zone_{id}_crossfeed`.
     let mut crossfeed_saved: Option<Value> = None;
@@ -628,7 +628,7 @@ pub(super) async fn set_zone_dsp(
 
     // #4685 — l'interrupteur de compensation de niveau. Pas de garde Premium :
     // il ne crée aucun traitement, il rend par le volume ce que l'égaliseur
-    // (gratuit) ou le crossfeed (Premium, déjà gardé) retirent.
+    // ou le crossfeed simple (tous deux gratuits) retirent.
     let mut compensation_appliquee_a_chaud = false;
     // #5071 — quand la bascule s'entend, comme `eq_portee` ; `null` sans
     // `level_compensation` dans le corps.

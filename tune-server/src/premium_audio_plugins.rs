@@ -128,7 +128,7 @@ pub fn descriptor(id: &str) -> Value {
             "batch",
         ),
         "declick" => ("declick", vec!["/api/v1/declick"], "declick", "batch"),
-        // #7614 — payant comme le crossfeed, facultatif comme l'égaliseur.
+        // #7614 — payant, facultatif comme l'égaliseur.
         "upsampler" => (
             "upsampler",
             vec!["/api/v1/upsampler", "/api/v1/upsampler/zones/{zone}"],
@@ -711,7 +711,8 @@ pub(crate) mod tests {
             let settings = SettingsRepo::with_backend(state.backend.clone());
             let routers = crate::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
             assert!(!state.license.is_premium().await);
-            for id in ["crossfeed", "converter", "declick"] {
+            assert!(premium_plugins::enabled(&settings, "crossfeed"));
+            for id in ["converter", "declick"] {
                 assert!(
                     !premium_plugins::enabled(&settings, id),
                     "{id} actif en Free"
@@ -809,10 +810,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn temoin_4861_bandeau_premium_sans_les_trois_greffons() {
         let (_state, _settings, app) = installation_touchee(true).await;
-        assert_eq!(
-            proposes(&app).await,
-            json!(["crossfeed", "converter", "declick"])
-        );
+        assert_eq!(proposes(&app).await, json!(["converter", "declick"]));
     }
 
     /// Témoin 2 : un compte Free ne reçoit jamais rien.
@@ -830,10 +828,10 @@ pub(crate) mod tests {
     async fn temoin_4861_bandeau_ignorer_est_memorise() {
         let (_state, settings, app) = installation_touchee(true).await;
         let (status, reponse) =
-            appel_avec_corps(&app, "POST", IGNORER, json!({"ids": ["crossfeed"]})).await;
+            appel_avec_corps(&app, "POST", IGNORER, json!({"ids": ["converter"]})).await;
         assert_eq!(status, StatusCode::OK, "{reponse}");
-        assert_eq!(reponse["ids"], json!(["converter", "declick"]));
-        assert_eq!(proposes(&app).await, json!(["converter", "declick"]));
+        assert_eq!(reponse["ids"], json!(["declick"]));
+        assert_eq!(proposes(&app).await, json!(["declick"]));
 
         let (status, reponse) = appel_avec_corps(
             &app,
@@ -846,11 +844,11 @@ pub(crate) mod tests {
         assert_eq!(reponse["ids"], json!([]));
         assert_eq!(proposes(&app).await, json!([]));
 
-        let (status, reponse) = appel(&app, "POST", "/api/v1/plugins/crossfeed/install").await;
+        let (status, reponse) = appel(&app, "POST", "/api/v1/plugins/converter/install").await;
         assert_eq!(status, StatusCode::OK, "{reponse}");
-        let (status, reponse) = appel(&app, "DELETE", "/api/v1/plugins/crossfeed").await;
+        let (status, reponse) = appel(&app, "DELETE", "/api/v1/plugins/converter").await;
         assert_eq!(status, StatusCode::OK, "{reponse}");
-        assert!(!premium_plugins::installed(&settings, "crossfeed"));
+        assert!(!premium_plugins::installed(&settings, "converter"));
         assert_eq!(
             proposes(&app).await,
             json!([]),
@@ -864,7 +862,7 @@ pub(crate) mod tests {
         let (_state, settings, app) = installation_touchee(true).await;
         settings.set("plugin_converter_installed", "true").unwrap();
         settings.set("plugin_converter_enabled", "true").unwrap();
-        assert_eq!(proposes(&app).await, json!(["crossfeed", "declick"]));
+        assert_eq!(proposes(&app).await, json!(["declick"]));
     }
 
     /// Témoin 5 : « Réinstaller » par la route d'installation EXISTANTE rend le
@@ -872,10 +870,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn temoin_4861_reinstaller_par_la_route_existante() {
         let (_state, settings, app) = installation_touchee(true).await;
-        assert_eq!(
-            proposes(&app).await,
-            json!(["crossfeed", "converter", "declick"])
-        );
+        assert_eq!(proposes(&app).await, json!(["converter", "declick"]));
         for id in ["crossfeed", "converter", "declick"] {
             let (status, reponse) =
                 appel(&app, "POST", &format!("/api/v1/plugins/{id}/install")).await;
