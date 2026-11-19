@@ -942,9 +942,10 @@ pub fn grille_reglee(settings: &SettingsRepo) -> u32 {
 /// seulement** ; décoché, il est gardé tel quel (un greffon décoché ne
 /// demande aucun droit). Rien n'est écrit.
 ///
-/// Une chaîne enregistrée par une version plus récente est rendue telle
-/// quelle, sans y réappliquer les anciennes clés (la résolution l'éteint,
-/// `chain_version_unsupported`).
+/// Une chaîne enregistrée par une version plus récente est rendue sans y
+/// réappliquer les anciennes clés (la résolution l'éteint,
+/// `chain_version_unsupported`) ; l'origine de ses corrections de pièce est
+/// tout de même recalculée, et P2/D1 appliqués sans Premium.
 pub fn lire_zone(
     settings: &SettingsRepo,
     zone_id: i64,
@@ -1001,7 +1002,22 @@ pub fn lire_zone(
     if let Some(c) = &stockee
         && c.version > VERSION_CHAINE
     {
-        return Ok(lecture(c.clone(), false, None, ombre.unwrap_or_default()));
+        // Rendue sans y réappliquer les anciennes clés, mais D1 vaut aussi
+        // ici : l'origine d'une correction de pièce est recalculée d'après
+        // `room_profile_{id}`, et un compte gratuit a la même conversion
+        // qu'ailleurs. Aucune origine ne vient du stockage brut.
+        let mut chaine = origines_par_le_serveur(settings, zone_id, c);
+        let conversion = if premium {
+            None
+        } else {
+            convertir_p2(&mut chaine, grille_reglee(settings))
+        };
+        return Ok(lecture(
+            chaine,
+            false,
+            conversion,
+            ombre.unwrap_or_default(),
+        ));
     }
 
     let depuis_les_anciennes_cles = stockee.is_none();

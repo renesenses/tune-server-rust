@@ -2413,3 +2413,62 @@ fn d1_les_cles_tenues_par_le_serveur() {
         assert!(!cle_tenue_par_le_serveur(cle), "{cle}");
     }
 }
+
+/// Relecture du 19/11 : une chaîne d'une version FUTURE (écrite par un
+/// serveur plus récent, puis retour en arrière) ne garde pas l'origine
+/// qu'elle stocke : `lire_zone` la recalcule d'après `room_profile_{id}` et
+/// convertit pour un compte gratuit, comme pour une chaîne courante.
+#[test]
+fn d1_une_chaine_de_version_future_est_relue_avec_l_origine_du_serveur() {
+    let (_b, s) = base();
+    let z = 64;
+    poser_la_piece(&s, z, "Calibration abc", None);
+    let mut c = migrer_zone(&s, z).unwrap().chaine;
+    c.version = crate::tess::chaine::VERSION_CHAINE + 1;
+    c.plugins[0]
+        .settings
+        .as_object_mut()
+        .unwrap()
+        .insert("origin".into(), json!("estimation"));
+    s.set(&cle_chaine_zone(z), &serde_json::to_string(&c).unwrap())
+        .unwrap();
+
+    let premium = lire_zone(&s, z, true).unwrap();
+    assert_eq!(
+        premium.chaine.version,
+        crate::tess::chaine::VERSION_CHAINE + 1
+    );
+    assert_eq!(
+        maillon(&premium.chaine, ID_CORRECTION_PIECE).settings["origin"],
+        json!("measured"),
+        "origine lue dans le stockage brut d'une chaîne future"
+    );
+    let gratuit = lire_zone(&s, z, false).unwrap();
+    assert!(
+        gratuit.conversion_piece,
+        "le droit Premium a été levé par une chaîne de version future"
+    );
+    assert!(
+        !gratuit
+            .chaine
+            .plugins
+            .iter()
+            .any(|m| m.id == ID_CORRECTION_PIECE && m.enabled),
+        "{:?}",
+        ids(&gratuit.chaine)
+    );
+    // La chaîne stockée n'est pas réécrite pour autant.
+    assert!(!migrer_zone(&s, z).unwrap().ecrite);
+
+    // Témoin : une vraie estimation reste Free sur ce chemin aussi.
+    let (_b, s) = base();
+    let z = 65;
+    poser_la_piece(&s, z, "Estimation 8", None);
+    let mut c = migrer_zone(&s, z).unwrap().chaine;
+    c.version = crate::tess::chaine::VERSION_CHAINE + 1;
+    s.set(&cle_chaine_zone(z), &serde_json::to_string(&c).unwrap())
+        .unwrap();
+    let l = lire_zone(&s, z, false).unwrap();
+    assert!(!l.conversion_piece);
+    assert!(correction_estimee(&l.chaine.plugins[0]));
+}

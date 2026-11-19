@@ -533,8 +533,29 @@ producteur et le rendu transporte des `f64`**, et que la quantification
   ancienne clé. Idempotente. Une chaîne d'une version plus récente n'est
   jamais réécrite. Rien n'est encore branché au démarrage ni dans la lecture
   (T03).
-- **Export** : `config_export` porte la chaîne de chaque zone, calculée pour
-  une zone jamais migrée.
+- **Export et import de configuration** (décision B de Bertrand, 19/11) :
+  l'export (`config_export`, format 2) porte, dans chaque zone,
+  `zone_{id}_tess_chain` : la chaîne que le serveur LIT pour la zone
+  (`lire_zone`, neutre vis-à-vis du droit), donc toujours d'accord avec les
+  anciennes clés qui partent avec elle, et calculée pour une zone jamais
+  migrée. L'ombre `zone_{id}_tess_chain_sync` ne part plus. L'import
+  (`POST /system/config/import` et restauration cloud, par
+  `config_export::planifier`/`appliquer`) **réécrit** cette chaîne par
+  `ecrire_chaine` sous le numéro de la zone d'arrivée, après les autres
+  réglages de la zone : lecture stricte (`ChaineTess::depuis_corps`),
+  origine des corrections et marques recalculées par le serveur, anciennes
+  clés et ombre réécrites. L'ombre d'un fichier n'est jamais importée, sans
+  avertissement. Une chaîne illisible ou d'une version plus récente n'est
+  pas importée (avertissement) : la chaîne se reconstruit alors depuis les
+  anciennes clés. Le profil de pièce de la zone (`room_profile_{id}`) est
+  restauré comme **mesuré**, `zone_id` remplacé par le numéro d'arrivée,
+  index tenu par `room_correction::save_profile`, avec un avertissement
+  (« restored as measured »), comme `config_backup`. Il est écrit AVANT la
+  chaîne, qui en tire son origine. `room_profile_index` dans les réglages
+  généraux d'un fichier au format 2 est ignoré sans avertissement (il se
+  reconstruit). Un aller-retour normal ne donne donc plus d'avertissement
+  « server-managed ». L'aperçu compare la chaîne du fichier à celle que le
+  serveur lit (origine exclue) : réimporter le même fichier ne change rien.
 - **Décisions de Bertrand (18/11)** :
   - **D1** (correction de pièce) : un égaliseur de pièce posé dans
     `eq_profile` devient `room-correction`, avec son origine dans ses
@@ -562,16 +583,22 @@ producteur et le rendu transporte des `f64`**, et que la quantification
       par `PATCH /system/config` (`403 server_managed_settings`, admin
       compris) ; elles ne s'écrivent que par leurs routes. L'import de
       configuration (`POST /system/config/import`, et la restauration cloud
-      qui passe par le même plan) les ignore, dans les réglages comme dans
-      la partie zones, et le dit dans ses avertissements ; la chaîne se
-      reconstruit alors depuis les anciennes clés. La restauration d'une
+      qui passe par le même plan) ne les écrit jamais telles quelles : dans
+      la partie zones d'un fichier au format 2, la chaîne et le profil de
+      pièce sont réécrits par le serveur (voir « Export et import de
+      configuration » ci-dessus) ; partout ailleurs (réglages généraux,
+      ancien format à plat), il les ignore et le dit dans ses
+      avertissements. La restauration d'une
       sauvegarde (`config_backup`) ignore ces clés dans ses réglages
       généraux, n'écrit que des clés de profil dans sa section des profils,
       et restaure chaque profil comme **mesuré** (l'origine d'un fichier ne
       se vérifie pas ; converti, jamais détruit, pour un compte gratuit), en
       le disant.
     - **L'origine appartient au serveur** : `lire_zone` la recalcule à
-      chaque lecture (jamais tirée du stockage brut de la chaîne), et
+      chaque lecture (jamais tirée du stockage brut de la chaîne, y compris
+      pour une chaîne d'une version plus récente, rendue sans les anciennes
+      clés mais avec l'origine recalculée et la conversion d'un compte
+      gratuit), et
       `ecrire_chaine` la réécrit
       d'après `room_profile_{id}` quoi que dise le corps (`"estimation"`
       seulement si les bandes sont celles d'une estimation de la zone,
