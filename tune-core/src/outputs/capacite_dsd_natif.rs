@@ -199,6 +199,34 @@ fn a_resonder_apres(device_name: &str, delai: Duration, maintenant: Instant) -> 
     }
 }
 
+fn verdicts_journalises() -> &'static Mutex<HashMap<String, String>> {
+    static TABLE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// #9170 (fil 2951) — `verdict` est-il NOUVEAU pour `device_name` ? Le
+/// sondage écrit alors sa cause en INFO, une fois : un rapport de testeur
+/// sans DEBUG montre pourquoi le natif n'est pas tenté (nom résolu vers
+/// `alsa:default:CARD=…`, DAC introuvable…), sans répéter la ligne à chaque
+/// piste. `None` (le sondage a trouvé le `hw:`) efface le dernier verdict :
+/// une rechute se rejournalise.
+pub fn verdict_nouveau(device_name: &str, verdict: Option<&str>) -> bool {
+    let mut t = verdicts_journalises()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    match verdict {
+        None => {
+            t.remove(device_name);
+            false
+        }
+        Some(v) if t.get(device_name).is_some_and(|d| d == v) => false,
+        Some(v) => {
+            t.insert(device_name.to_string(), v.to_string());
+            true
+        }
+    }
+}
+
 /// #9170 — un flux DSD natif ALSA vient de s'ouvrir ET de démarrer sur le
 /// `hw:` de `device_name` : la preuve la plus forte qui soit. Les cadences
 /// re-sondées à l'ouverture remplacent tout verdict antérieur, provisoire ou
@@ -480,5 +508,18 @@ mod tests_9170 {
         noter_sondage_sans_reponse(nom);
         assert!(!a_resonder_a_l_ouverture(nom));
         assert!(a_resonder(nom), "la résolution DSD n'attend pas le délai");
+    }
+
+    /// Fil 2951 : la cause d'un « pas de PCM matériel » s'écrit en INFO une
+    /// fois par verdict, pas à chaque piste ; un `hw:` retrouvé réarme.
+    #[test]
+    fn un_verdict_ne_se_journalise_qu_une_fois() {
+        let nom = "9170-journal";
+        let defaut = "PCM « alsa:default:CARD=DACZ8 » : pas un accès direct hw:";
+        assert!(verdict_nouveau(nom, Some(defaut)));
+        assert!(!verdict_nouveau(nom, Some(defaut)));
+        assert!(verdict_nouveau(nom, Some("périphérique introuvable")));
+        assert!(!verdict_nouveau(nom, None));
+        assert!(verdict_nouveau(nom, Some(defaut)));
     }
 }

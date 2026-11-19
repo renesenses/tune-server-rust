@@ -167,9 +167,20 @@ pub(super) fn sonder_la_sortie(
     voies: u16,
 ) -> ResultatSondeDsdAlsa {
     let pcm = match pcm_materiel(device_name, endpoint_id, origin_host, audio_backend) {
-        Ok((_, pcm)) => pcm,
+        Ok((_, pcm)) => {
+            crate::outputs::capacite_dsd_natif::verdict_nouveau(device_name, None);
+            pcm
+        }
         Err(raison) => {
-            debug!(device = %device_name, raison = %raison, "alsa_dsd_natif_pas_de_pcm_materiel");
+            // #9170 (fil 2951) — en INFO une fois par verdict : la cause
+            // (nom résolu vers `alsa:default:CARD=…`, introuvable, repli) doit
+            // se lire dans un rapport de testeur sans DEBUG.
+            let texte = raison.to_string();
+            if crate::outputs::capacite_dsd_natif::verdict_nouveau(device_name, Some(&texte)) {
+                info!(device = %device_name, raison = %texte, "alsa_dsd_natif_pas_de_pcm_materiel");
+            } else {
+                debug!(device = %device_name, raison = %texte, "alsa_dsd_natif_pas_de_pcm_materiel");
+            }
             return match raison {
                 SansPcmMateriel::HoteNonAlsa(_) => ResultatSondeDsdAlsa::PasUnPcmMateriel,
                 SansPcmMateriel::PcmLogiciel(_) => ResultatSondeDsdAlsa::PcmLogiciel,
