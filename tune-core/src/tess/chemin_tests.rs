@@ -578,3 +578,168 @@ fn le_dither_suit_la_chaine() {
     assert!(q.etape.effective);
     assert_eq!(q.etape.params.clone().unwrap()["dither"], "noise_shaped");
 }
+
+// ── Reprise T16 : les quatre cas de la mission (chaîne, Bypass all, DSD
+// natif, sortie réseau), chacun avec ce qui tourne réellement. ──────────
+
+fn sonde(actif: bool, volume: bool) -> EnService {
+    EnService {
+        greffons: GreffonsEnService::Sonde {
+            actif,
+            hors_service: vec![],
+        },
+        headroom_db: None,
+        upsampling: false,
+        volume_logiciel: volume,
+        latences: vec![],
+    }
+}
+
+/// Les étapes de traitement (hors source et sortie) et leur motif.
+fn motifs(c: &CheminTess) -> Vec<(CodeEtape, Option<&str>, bool, Option<MotifEtape>)> {
+    c.steps
+        .iter()
+        .filter(|e| !matches!(e.etape.code, CodeEtape::Source | CodeEtape::Output))
+        .map(|e| {
+            (
+                e.etape.code,
+                e.etape.plugin_id.as_deref(),
+                e.etape.effective,
+                e.etape.reason,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn bypass_all_contourne_greffons_headroom_upsampling_et_garde_le_volume() {
+    let mut chaine = maquette_a4();
+    chaine.bypass_all = true;
+    chaine.fixed.upsampling = Upsampling::Pcm {
+        filter: "sinc".into(),
+        max_ratio: None,
+        max_rate_hz: Some(192_000),
+    };
+    // L'exécuteur, en « Bypass all », n'appelle aucun étage.
+    let s = service(&[], None, true);
+    let c = chemin(&chaine, &ctx(TransportZone::Local, false, -12.0), &s, None);
+    for (code, id, effective, motif) in motifs(&c) {
+        match code {
+            CodeEtape::Plugin if id == Some("crossfeed") => {
+                // Décoché : rien à contourner.
+                assert!(!effective);
+                assert_eq!(motif, None);
+            }
+            CodeEtape::Plugin | CodeEtape::Headroom | CodeEtape::Upsampling => {
+                assert!(!effective, "{code:?} {id:?}");
+                assert_eq!(motif, Some(MotifEtape::BypassAll), "{code:?} {id:?}");
+            }
+            // Contrat § 4 : le volume est un réglage de zone, il reste.
+            CodeEtape::Volume | CodeEtape::Quantization => assert!(effective, "{code:?}"),
+            autre => panic!("étape inattendue {autre:?}"),
+        }
+    }
+    assert_eq!(c.badge, Badge::ProcessedByTess);
+    assert_eq!(c.headroom_db, 0.0);
+    assert!(c.discrepancies.is_empty(), "{:?}", c.discrepancies);
+    // Volume à 0 dB : plus rien ne modifie, « Bit-perfect ».
+    let c = chemin(
+        &chaine,
+        &ctx(TransportZone::Local, false, 0.0),
+        &service(&[], None, false),
+        None,
+    );
+    assert_eq!(c.badge, Badge::BitPerfect);
+    assert_eq!(noms_effectifs(&c), ["Source", "Output"]);
+    // Mais si un moteur traite malgré le « Bypass all », c'est publié, et
+    // le badge ne dit pas « Bit-perfect ».
+    let c = chemin(
+        &chaine,
+        &ctx(TransportZone::Local, false, 0.0),
+        &sonde(true, false),
+        None,
+    );
+    assert_eq!(c.badge, Badge::ProcessedByTess);
+    assert!(
+        c.discrepancies
+            .iter()
+            .any(|d| d.kind == SensEcart::RunningNotRequested),
+        "{:?}",
+        c.discrepancies
+    );
+    assert_eq!(
+        greffon(&c, "equalizer-graphic").etape.reason,
+        Some(MotifEtape::BypassAll)
+    );
+}
+
+#[test]
+fn dsd_natif_rien_n_est_traite_et_chaque_etape_dit_pourquoi() {
+    let mut chaine = maquette_a4();
+    chaine.fixed.headroom = Headroom::Manual { db: -3.0 };
+    let mut x = ctx(TransportZone::Local, false, -12.0);
+    x.source = Some(SourceFlux::Dsd {
+        rate: TauxDsd::Dsd128,
+        channels: 2,
+        played_as: crate::tess::resolution::LectureDsd::Native,
+    });
+    // La sortie native ne peut ni filtrer ni atténuer un flux DSD.
+    let c = chemin(&chaine, &x, &service(&[], None, false), Some(true));
+    for (code, id, effective, motif) in motifs(&c) {
+        assert!(!effective, "{code:?} {id:?}");
+        match code {
+            CodeEtape::Plugin if id == Some("crossfeed") => assert_eq!(motif, None),
+            CodeEtape::Plugin | CodeEtape::Headroom | CodeEtape::Volume => {
+                assert_eq!(motif, Some(MotifEtape::DsdSourceNative), "{code:?} {id:?}")
+            }
+            CodeEtape::Upsampling => assert_eq!(motif, None, "rien de demandé"),
+            CodeEtape::Quantization => assert_eq!(motif, Some(MotifEtape::NothingToQuantize)),
+            autre => panic!("étape inattendue {autre:?}"),
+        }
+    }
+    assert_eq!(c.badge, Badge::BitPerfect);
+    assert_eq!(c.volume.placement, None);
+    let src = etape(&c, CodeEtape::Source).etape.params.clone().unwrap();
+    assert_eq!(src["kind"], "dsd");
+    assert_eq!(src["played_as"], "native");
+    assert!(c.discrepancies.is_empty(), "{:?}", c.discrepancies);
+}
+
+#[test]
+fn sortie_reseau_volume_de_l_appareil_ordre_reel_et_repli_mono_inerte() {
+    let mut chaine = maquette_a4();
+    // D2 : le repli mono hérité est décoché d'office sur le réseau.
+    chaine.plugins.push(maillon(
+        "mono-downmix",
+        false,
+        json!({ MARQUE_MONO_INERTE: true }),
+    ));
+    let mut x = ctx(TransportZone::Dlna, false, 0.0);
+    x.volume = VolumeZone {
+        control: ControleVolume::Device,
+        db: 0.0,
+    };
+    // Le flux réseau est traité (StreamingDsp) dans l'ordre historique.
+    let c = chemin(&chaine, &x, &sonde(true, false), Some(false));
+    let ids: Vec<_> = c
+        .effectives()
+        .filter_map(|e| e.etape.plugin_id.as_deref())
+        .collect();
+    assert_eq!(ids, ["equalizer-graphic", "convolution"]);
+    let vol = etape(&c, CodeEtape::Volume);
+    assert!(!vol.etape.effective);
+    assert_eq!(vol.etape.reason, Some(MotifEtape::VolumeNotSoftware));
+    assert_eq!(c.volume.control, ControleVolume::Device);
+    assert_eq!(c.volume.placement, None);
+    let mono = greffon(&c, "mono-downmix");
+    assert!(!mono.etape.effective);
+    assert_eq!(mono.etape.detail.as_deref(), Some(DETAIL_INERTE_RESEAU));
+    assert_eq!(mono.name, "Mono downmix");
+    assert_eq!(c.badge, Badge::ProcessedByTess);
+    // Rien ne traite le flux : bit-perfect côté TESS, mais un chemin altéré
+    // ailleurs (transcodage du transport) ne l'est jamais.
+    let c = chemin(&chaine, &x, &sonde(false, false), Some(false));
+    assert_eq!(c.badge, Badge::AlteredOutsideTess);
+    let c = chemin(&chaine, &x, &sonde(false, false), Some(true));
+    assert_eq!(c.badge, Badge::BitPerfect);
+}

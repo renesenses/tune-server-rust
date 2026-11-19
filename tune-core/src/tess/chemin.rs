@@ -53,6 +53,7 @@ use serde_json::{Map, Value, json};
 use super::chaine::{ChaineTess, Dither, Upsampling};
 use super::etages_fixes::{BilanDeNiveau, GainDeRendu};
 use super::greffon::Catalogue;
+use super::migration::MARQUE_MONO_INERTE;
 use super::resolution::{
     Badge, CodeEtape, EtapeResolue, EtatVolume, MotifEtape, PlacementVolume, Resolution,
 };
@@ -159,6 +160,9 @@ pub const DETAIL_PAS_EN_SERVICE: &str = "Requested but not running";
 pub const DETAIL_HORS_RESOLUTION: &str = "Running although the chain does not ask for it";
 /// Détail d'un traitement que la sonde voit sans pouvoir l'attribuer.
 pub const DETAIL_NON_ATTRIBUE: &str = "Processing not attributed to a plugin";
+/// Détail d'un greffon décoché parce qu'il n'agit pas sur une sortie réseau
+/// (marque `inert_on_network` de T02, décision D2).
+pub const DETAIL_INERTE_RESEAU: &str = "No effect on a network output";
 
 /// Rang d'un greffon dans l'ordre des moteurs d'avant l'exécuteur
 /// (`apply_local_dsp`, `StreamingDsp::process`) : égaliseur, convolution,
@@ -366,7 +370,16 @@ pub fn chemin_du_signal(
             .find(|(x, _)| *x == id)
             .map(|(_, l)| *l)
             .or(g.latency_frames);
-        fusionner_params(g, params_du_greffon(&id, &reglages(&id)));
+        let r = reglages(&id);
+        fusionner_params(g, params_du_greffon(&id, &r));
+        // D2 : décoché d'office sur le réseau, il le dit plutôt que de
+        // passer pour un oubli.
+        if !g.requested
+            && g.detail.is_none()
+            && r.get(MARQUE_MONO_INERTE).and_then(Value::as_bool) == Some(true)
+        {
+            g.detail = Some(DETAIL_INERTE_RESEAU.into());
+        }
     }
     match &en_service.greffons {
         GreffonsEnService::Exacts(v) => {
@@ -519,6 +532,7 @@ pub fn chemin_du_signal(
         };
         EtapeNommee { name, etape: e }
     };
+    let niveau_publie = niveau.filter(|_| headroom.effective || volume.effective || modifie);
     let mut steps = Vec::with_capacity(actifs.len() + inactifs.len() + 6);
     steps.push(nommer(source));
     steps.push(nommer(headroom));
@@ -533,7 +547,7 @@ pub fn chemin_du_signal(
         badge,
         headroom_db,
         volume: etat_volume,
-        level: niveau.filter(|_| headroom.effective || volume.effective || modifie),
+        level: niveau_publie,
         steps,
         discrepancies: ecarts,
     }

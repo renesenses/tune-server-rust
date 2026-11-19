@@ -281,3 +281,184 @@ fn la_sonde_du_chemin_historique() {
         }
     );
 }
+
+// ── Reprise T16 : chaîne TESS, Bypass all, DSD natif, sortie réseau, sur le
+// vrai chemin du signal. ─────────────────────────────────────────────────
+
+fn etape_du_greffon<'a>(tess: &'a Value, prefixe: &str) -> &'a Value {
+    tess["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|e| {
+            e["code"] == "plugin"
+                && e["plugin_id"]
+                    .as_str()
+                    .is_some_and(|id| id.starts_with(prefixe))
+        })
+        .unwrap_or_else(|| panic!("pas d'étape {prefixe} : {tess}"))
+}
+
+fn codes(tess: &Value) -> Vec<String> {
+    tess["steps"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["code"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Réécrit la chaîne de la zone par T02 (`ecrire_chaine`), comme le `PUT`.
+fn modifier_la_chaine(
+    backend: &Arc<dyn DbBackend>,
+    zone_id: i64,
+    f: impl FnOnce(&mut tune_core::tess::ChaineTess),
+) {
+    let s = SettingsRepo::with_backend(backend.clone());
+    let mut l = tune_core::tess::migration::lire_zone(&s, zone_id, true).unwrap();
+    f(&mut l.chaine);
+    tune_core::tess::migration::ecrire_chaine(&s, zone_id, &l.chaine).unwrap();
+}
+
+#[test]
+fn zone_avec_chaine_tess_ordre_q9_et_etapes_nommees() {
+    let b = base();
+    let z = zone(&b, "local", "local:dac", 50.0);
+    armer_l_eq(&b, z.id.unwrap());
+    let (_, tess) = les_deux(
+        &b,
+        &z,
+        &en_lecture(OutputDspState::Applied, OutputVolumeState::Applied),
+    );
+    assert_eq!(tess["badge"], "processed_by_tess");
+    // Q9 : Source → Headroom → greffons → Upsampling → Volume → Dither → Output.
+    let c = codes(&tess);
+    assert_eq!(c.first().map(String::as_str), Some("source"));
+    assert_eq!(c.last().map(String::as_str), Some("output"));
+    let pos = |k: &str| c.iter().position(|x| x == k).unwrap();
+    assert!(pos("headroom") < pos("plugin"), "{c:?}");
+    assert!(pos("plugin") < pos("upsampling"), "{c:?}");
+    assert!(pos("upsampling") < pos("volume"), "{c:?}");
+    assert!(pos("volume") < pos("quantization"), "{c:?}");
+    assert_eq!(etape(&tess, "volume")["name"], "Volume control");
+    assert_eq!(etape(&tess, "volume")["effective"], true);
+    assert_eq!(etape(&tess, "quantization")["name"], "Dither");
+    assert_eq!(etape(&tess, "quantization")["effective"], true);
+    assert_eq!(tess["volume"]["placement"], "at_render");
+    let eq = etape_du_greffon(&tess, "equalizer-");
+    assert_eq!(eq["effective"], true);
+    assert!(eq["name"].as_str().unwrap().contains("EQ"), "{eq}");
+    // Le headroom de T07 n'est pas branché dans la lecture : il ne se dit
+    // pas appliqué.
+    assert_eq!(tess["headroom_db"], 0.0);
+}
+
+#[test]
+fn bypass_all_greffons_contournes_avec_leur_motif() {
+    let b = base();
+    let z = zone(&b, "local", "local:dac", 100.0);
+    let zid = z.id.unwrap();
+    armer_l_eq(&b, zid);
+    modifier_la_chaine(&b, zid, |c| c.bypass_all = true);
+    // La sortie ne traite rien : chaque greffon dit « bypass_all ».
+    let (_, tess) = les_deux(
+        &b,
+        &z,
+        &en_lecture(OutputDspState::Inactive, OutputVolumeState::Unity),
+    );
+    assert_eq!(tess["badge"], "bit_perfect", "{tess}");
+    let eq = etape_du_greffon(&tess, "equalizer-");
+    assert_eq!(eq["effective"], false);
+    assert_eq!(eq["reason"], "bypass_all");
+    assert!(
+        tess["discrepancies"].as_array().unwrap().is_empty(),
+        "{tess}"
+    );
+    // Si la sortie traite encore (moteur historique), la vue TESS ne le tait
+    // pas : traitement publié, écart publié, jamais « Bit-perfect ».
+    let (_, tess) = les_deux(
+        &b,
+        &z,
+        &en_lecture(OutputDspState::Applied, OutputVolumeState::Unity),
+    );
+    assert_ne!(tess["badge"], "bit_perfect", "{tess}");
+    assert!(
+        tess["discrepancies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|d| d["kind"] == "running_not_requested"),
+        "{tess}"
+    );
+}
+
+#[test]
+fn dsd_natif_rien_n_est_traite_et_chaque_etape_dit_pourquoi() {
+    let b = base();
+    let z = zone(&b, "local", "local:dac", 50.0);
+    let zid = z.id.unwrap();
+    armer_l_eq(&b, zid);
+    ZoneRepo::with_backend(b.clone())
+        .update_dsd_mode(zid, "native")
+        .unwrap();
+    let mut ps = en_lecture(OutputDspState::Inactive, OutputVolumeState::Unity);
+    if let Some(np) = ps.now_playing.as_mut() {
+        np.format = Some("dsf".into());
+        np.sample_rate = Some(5_644_800);
+        np.bit_depth = Some(1);
+    }
+    let (_, tess) = les_deux(&b, &z, &ps);
+    assert_eq!(tess["badge"], "bit_perfect", "{tess}");
+    let src = etape(&tess, "source");
+    assert_eq!(src["params"]["kind"], "dsd", "{src}");
+    assert_eq!(src["params"]["played_as"], "native", "{src}");
+    let eq = etape_du_greffon(&tess, "equalizer-");
+    assert_eq!(eq["effective"], false);
+    assert_eq!(eq["reason"], "dsd_source_native");
+    // Volume à 50 % : non appliqué en logiciel sur un flux DSD natif.
+    assert_eq!(etape(&tess, "volume")["effective"], false);
+    assert_eq!(etape(&tess, "volume")["reason"], "dsd_source_native");
+    assert!(tess["volume"]["placement"].is_null());
+    assert_eq!(
+        etape(&tess, "quantization")["reason"],
+        "nothing_to_quantize"
+    );
+}
+
+#[test]
+fn sortie_reseau_volume_de_l_appareil_et_repli_mono_inerte() {
+    let b = base();
+    let z = zone(&b, "dlna", "uuid:renderer", 40.0);
+    let zid = z.id.unwrap();
+    armer_l_eq(&b, zid);
+    SettingsRepo::with_backend(b.clone())
+        .set(&format!("zone_{zid}_mono_downmix"), "true")
+        .unwrap();
+    let mut ps = en_lecture(OutputDspState::Inactive, OutputVolumeState::Unity);
+    ps.output_signal_path = None;
+    let sp = build_signal_path(&ps, &z, &b, Some("Renderer"), "", None).expect("chemin");
+    let tess = chemin_tess_de_la_zone(&b, &z, &ps, &sp, true).expect("bloc tess");
+    // Le volume est celui de l'appareil : aucune étape logicielle.
+    assert_eq!(tess["volume"]["control"], "device");
+    assert!(tess["volume"]["placement"].is_null());
+    assert_eq!(etape(&tess, "volume")["effective"], false);
+    assert_eq!(etape(&tess, "volume")["reason"], "volume_not_software");
+    // D2 : le repli mono hérité, inerte sur le réseau, est dit inerte.
+    let mono = etape_du_greffon(&tess, "mono-downmix");
+    assert_eq!(mono["effective"], false);
+    assert_eq!(
+        mono["detail"],
+        tune_core::tess::chemin::DETAIL_INERTE_RESEAU,
+        "{mono}"
+    );
+    // Ce que TESS publie effectif est exactement ce que le chemin servi
+    // montre altéré (sonde du flux) : jamais plus, jamais moins.
+    let s = en_service_d_apres_le_chemin(&sp, false);
+    let GreffonsEnService::Sonde { actif, .. } = s.greffons else {
+        panic!("sonde attendue")
+    };
+    assert_eq!(!greffons_effectifs(&tess).is_empty(), actif, "{sp}\n{tess}");
+    if tess["badge"] == "bit_perfect" {
+        assert_eq!(sp["bit_perfect"], true, "{sp}");
+    }
+}
