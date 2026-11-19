@@ -79,7 +79,11 @@ struct ReplyBody {
     body: String,
 }
 
-async fn list(State(state): State<AppState>, headers: HeaderMap) -> Response {
+async fn list(
+    _garde: crate::auth::AdminOuCetteMachine,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
     let auth = match auth(&state) {
         Ok(a) => a,
         Err(resp) => return resp,
@@ -94,7 +98,11 @@ async fn list(State(state): State<AppState>, headers: HeaderMap) -> Response {
 /// Crée un ticket. Un seul endpoint pour deux formats : `application/json`
 /// (sans pièce jointe, chemin historique) ou `multipart/form-data` (avec
 /// `attachments[]`). Le format est choisi d'après le `Content-Type` entrant.
-async fn create(State(state): State<AppState>, req: Request) -> Response {
+async fn create(
+    _garde: crate::auth::AdminOuCetteMachine,
+    State(state): State<AppState>,
+    req: Request,
+) -> Response {
     // Les identifiants de ce serveur ne partent dans aucun champ du ticket.
     tune_core::confidentialite::retenir_identifiants_du_serveur(&SettingsRepo::with_backend(
         state.backend.clone(),
@@ -351,6 +359,7 @@ fn ext_allowed(ext: &str) -> bool {
 }
 
 async fn detail(
+    _garde: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<i64>,
@@ -379,7 +388,12 @@ async fn detail(
 /// ⚠️ Ce qui reste hors de ce dépôt : que ce deuxième message apparaisse sur le
 /// **forum**. Le miroir (`MirrorTicketToForum`) n'est branché qu'à la création
 /// du ticket, côté Laravel ; aucune ligne d'ici ne peut l'y brancher.
-async fn reply(State(state): State<AppState>, Path(id): Path<i64>, req: Request) -> Response {
+async fn reply(
+    _garde: crate::auth::AdminOuCetteMachine,
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    req: Request,
+) -> Response {
     // Les identifiants de ce serveur ne partent dans aucun champ du ticket.
     tune_core::confidentialite::retenir_identifiants_du_serveur(&SettingsRepo::with_backend(
         state.backend.clone(),
@@ -471,6 +485,7 @@ async fn reply_multipart(
 /// Marque un fil comme lu. Aucun corps attendu : l'identité vient d'`auth()`,
 /// jamais d'une clé de licence fournie par la page.
 async fn mark_read(
+    _garde: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<i64>,

@@ -74,7 +74,12 @@ fn serveur_froid(base_url: &str) -> (axum::Router, tune_core::test_scratch::Scra
     let state = AppState::new(db_path.to_str().unwrap(), 0, Default::default()).unwrap();
     let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("mozaik_base_url", base_url).unwrap();
-    (tune_server::routes::router(state), base)
+    (
+        tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+        )),
+        base,
+    )
 }
 
 async fn appeler(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {
