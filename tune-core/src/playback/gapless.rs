@@ -236,9 +236,10 @@ pub fn est_dsd(marqueur: &str) -> bool {
 ///    ([`AnnonceSuivante::Annoncee`]) ; `Inconnue` garde la garde ;
 /// 3. il n'est pas sous la garde rendue aux renderers qui lâchent le suivant
 ///    DSD armé (`deja_lache`, voir [`EchecsDsdSuivant`]) : un renderer comme le
-///    RS130, qui annonce les deux et ne suit pas, perd au plus
-///    [`ECHECS_DSD_SUIVANT_AVANT_GARDE`] transitions, puis retrouve la garde
-///    pour [`DUREE_GARDE_DSD_SUIVANT`].
+///    RS130, qui annonce les deux et ne suit pas, perd
+///    [`ECHECS_DSD_SUIVANT_AVANT_GARDE`] transitions, puis retrouve la garde ;
+///    à chaque échéance il retente, et un seul échec la lui rend, pour une
+///    durée doublée.
 ///
 /// Une seule définition, lue par le sondeur (`prepare_gapless`) et par la
 /// promesse de la file ([`enchainement_sans_blanc`]).
@@ -270,7 +271,7 @@ pub enum RefusDsdSuivant {
     /// Le SCPD d'AVTransport ne porte pas `SetNextAVTransportURI`.
     SuivanteNonAnnoncee,
     /// Le renderer a lâché des suivants DSD armés : la garde lui est rendue
-    /// pour [`DUREE_GARDE_DSD_SUIVANT`] (voir [`EchecsDsdSuivant`]).
+    /// pour un temps (voir [`EchecsDsdSuivant`]).
     DejaLache,
 }
 
@@ -315,49 +316,88 @@ pub fn refus_dsd_suivant_sur_dlna(
     deja_lache.then_some(RefusDsdSuivant::DejaLache)
 }
 
-/// #9206 — échecs constatés avant de rendre la garde DSD à un appareil.
+/// #9206 — échecs constatés avant de rendre la garde DSD à un appareil la
+/// PREMIÈRE fois.
 ///
-/// #6910 la rendait au PREMIER : une seule fausse conclusion (fil 2961, une
+/// #6910 la rendait au premier : une seule fausse conclusion (fil 2961, une
 /// fin coupée pendant que le renderer basculait sur le flux armé) supprimait
 /// le sans-blanc DSD pour toute la session, alors que la transition d'avant
-/// venait d'enchaîner sans blanc.
+/// venait d'enchaîner sans blanc. Après une première garde, l'appareil est
+/// récidiviste : un seul échec la lui rend (voir [`EchecsDsdSuivant`]).
 pub const ECHECS_DSD_SUIVANT_AVANT_GARDE: u32 = 2;
 
-/// #9206 — fenêtre dans laquelle les échecs se cumulent ; un échec isolé plus
-/// ancien est oublié.
-pub const FENETRE_ECHECS_DSD_SUIVANT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+/// #9206 — fenêtre dans laquelle les échecs se cumulent avant la première
+/// garde ; un échec isolé plus ancien est oublié. Large (une séance
+/// d'écoute) : deux échecs séparés par une longue piste comptent.
+pub const FENETRE_ECHECS_DSD_SUIVANT: std::time::Duration =
+    std::time::Duration::from_secs(6 * 60 * 60);
 
-/// #9206 — durée de la garde rendue ; passé ce délai, le suivant DSD est de
-/// nouveau tenté (au lieu de « jusqu'au redémarrage »).
+/// #9206 — durée de la PREMIÈRE garde ; passé ce délai, le suivant DSD est
+/// de nouveau tenté (au lieu de « jusqu'au redémarrage »). Chaque récidive
+/// la double, jusqu'à [`DUREE_GARDE_DSD_SUIVANT_MAX`].
 pub const DUREE_GARDE_DSD_SUIVANT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// #9206 — plafond de la garde d'un récidiviste.
+pub const DUREE_GARDE_DSD_SUIVANT_MAX: std::time::Duration =
+    std::time::Duration::from_secs(8 * 60 * 60);
 
 /// #9206 — ce qu'un échec constaté change pour l'appareil.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IssueEchecDsdSuivant {
     /// Échec noté, la garde n'est pas (encore) rendue.
     Note { echecs: u32 },
-    /// Seuil atteint : la garde est rendue pour [`DUREE_GARDE_DSD_SUIVANT`].
-    GardeRendue { echecs: u32 },
+    /// La garde est rendue pour `duree` (la `garde`-ième fois).
+    GardeRendue {
+        echecs: u32,
+        garde: u32,
+        duree: std::time::Duration,
+    },
     /// La garde était déjà rendue : rien ne change.
     DejaGarde,
 }
 
 /// #6910 / #9206 — la mémoire, par appareil, des suivants DSD armés et lâchés.
+///
+/// - première garde : [`ECHECS_DSD_SUIVANT_AVANT_GARDE`] échecs dans
+///   [`FENETRE_ECHECS_DSD_SUIVANT`], ou un seul si l'appareil avoue avoir
+///   perdu la suivante ;
+/// - la garde échoit : l'appareil retente le suivant DSD, mais reste
+///   RÉCIDIVISTE (`gardes` est conservé) : un seul échec lui rend la garde,
+///   pour une durée doublée à chaque fois (30 min, 1 h, 2 h… plafond 8 h).
+///   Un RS130 (#402) ne reperd donc qu'une transition par échéance, de plus
+///   en plus rares.
 #[derive(Debug, Clone, Default)]
 pub struct EchecsDsdSuivant {
     echecs: u32,
     premier_echec: Option<std::time::Instant>,
     garde_depuis: Option<std::time::Instant>,
+    /// Gardes déjà rendues à cet appareil depuis le démarrage.
+    gardes: u32,
 }
 
 impl EchecsDsdSuivant {
-    /// La garde est-elle rendue à `maintenant` ? Une garde échue est
-    /// oubliée, échecs compris : l'appareil retente le suivant DSD.
+    /// Durée de la `garde`-ième garde (1 = la première).
+    pub fn duree_de_la_garde(garde: u32) -> std::time::Duration {
+        let facteur = 1u32 << garde.saturating_sub(1).min(16);
+        DUREE_GARDE_DSD_SUIVANT
+            .saturating_mul(facteur)
+            .min(DUREE_GARDE_DSD_SUIVANT_MAX)
+    }
+
+    /// La garde est-elle rendue à `maintenant` ? Une garde échue est levée et
+    /// ses échecs oubliés ; la récidive (`gardes`) est retenue.
     pub fn garde_active(&mut self, maintenant: std::time::Instant) -> bool {
         match self.garde_depuis {
-            Some(t) if maintenant.saturating_duration_since(t) < DUREE_GARDE_DSD_SUIVANT => true,
+            Some(t)
+                if maintenant.saturating_duration_since(t)
+                    < Self::duree_de_la_garde(self.gardes) =>
+            {
+                true
+            }
             Some(_) => {
-                *self = Self::default();
+                self.garde_depuis = None;
+                self.echecs = 0;
+                self.premier_echec = None;
                 false
             }
             None => false,
@@ -378,20 +418,30 @@ impl EchecsDsdSuivant {
             .premier_echec
             .is_some_and(|t| maintenant.saturating_duration_since(t) >= FENETRE_ECHECS_DSD_SUIVANT)
         {
-            *self = Self::default();
+            self.echecs = 0;
+            self.premier_echec = None;
         }
         self.echecs = self.echecs.saturating_add(1);
         self.premier_echec.get_or_insert(maintenant);
-        if immediat || self.echecs >= ECHECS_DSD_SUIVANT_AVANT_GARDE {
+        let recidiviste = self.gardes > 0;
+        if immediat || recidiviste || self.echecs >= ECHECS_DSD_SUIVANT_AVANT_GARDE {
+            self.gardes = self.gardes.saturating_add(1);
             self.garde_depuis = Some(maintenant);
             IssueEchecDsdSuivant::GardeRendue {
                 echecs: self.echecs,
+                garde: self.gardes,
+                duree: Self::duree_de_la_garde(self.gardes),
             }
         } else {
             IssueEchecDsdSuivant::Note {
                 echecs: self.echecs,
             }
         }
+    }
+
+    /// Échecs notés depuis la dernière garde (banc).
+    pub fn echecs(&self) -> u32 {
+        self.echecs
     }
 }
 
@@ -664,34 +714,48 @@ mod tests {
     }
 
     /// #9206 — un seul échec ne rend plus la garde ; le deuxième, si ; la
-    /// garde échoit et l'appareil retente.
+    /// garde échoit, l'appareil retente ; récidiviste, un échec la lui rend
+    /// aussitôt, pour une durée doublée, plafonnée.
     #[test]
-    fn la_garde_dsd_suit_deux_echecs_et_echoit_9206() {
+    fn la_garde_dsd_suit_deux_echecs_puis_la_recidive_9206() {
         use std::time::{Duration, Instant};
         let t0 = Instant::now();
         let mut m = EchecsDsdSuivant::default();
-        assert_eq!(
-            m.noter_echec(t0, false),
-            IssueEchecDsdSuivant::Note { echecs: 1 }
-        );
+        assert_eq!(m.noter_echec(t0, false), IssueEchecDsdSuivant::Note { echecs: 1 });
         assert!(!m.garde_active(t0), "un seul échec ne rend pas la garde");
-        let t1 = t0 + Duration::from_secs(240);
+        // Deux échecs séparés d'une longue piste (> 30 min) comptent.
+        let t1 = t0 + Duration::from_secs(45 * 60);
         assert_eq!(
             m.noter_echec(t1, false),
-            IssueEchecDsdSuivant::GardeRendue { echecs: 2 }
+            IssueEchecDsdSuivant::GardeRendue {
+                echecs: 2,
+                garde: 1,
+                duree: DUREE_GARDE_DSD_SUIVANT
+            }
         );
         assert!(m.garde_active(t1));
         assert_eq!(m.noter_echec(t1, false), IssueEchecDsdSuivant::DejaGarde);
         assert!(m.garde_active(t1 + DUREE_GARDE_DSD_SUIVANT - Duration::from_secs(1)));
+        let t2 = t1 + DUREE_GARDE_DSD_SUIVANT;
         assert!(
-            !m.garde_active(t1 + DUREE_GARDE_DSD_SUIVANT),
+            !m.garde_active(t2),
             "la garde échoit : plus de « jusqu'au redémarrage »"
         );
-        // Après l'échéance, on repart de zéro : un échec ne suffit pas.
-        let t2 = t1 + DUREE_GARDE_DSD_SUIVANT + Duration::from_secs(1);
+        // Récidive : un seul échec, garde doublée.
         assert_eq!(
             m.noter_echec(t2, false),
-            IssueEchecDsdSuivant::Note { echecs: 1 }
+            IssueEchecDsdSuivant::GardeRendue {
+                echecs: 1,
+                garde: 2,
+                duree: DUREE_GARDE_DSD_SUIVANT * 2
+            }
+        );
+        assert!(m.garde_active(t2 + DUREE_GARDE_DSD_SUIVANT));
+        assert!(!m.garde_active(t2 + DUREE_GARDE_DSD_SUIVANT * 2));
+        assert_eq!(
+            EchecsDsdSuivant::duree_de_la_garde(10),
+            DUREE_GARDE_DSD_SUIVANT_MAX,
+            "plafond"
         );
     }
 
@@ -704,17 +768,14 @@ mod tests {
         let mut m = EchecsDsdSuivant::default();
         m.noter_echec(t0, false);
         assert_eq!(
-            m.noter_echec(
-                t0 + FENETRE_ECHECS_DSD_SUIVANT + Duration::from_secs(1),
-                false
-            ),
+            m.noter_echec(t0 + FENETRE_ECHECS_DSD_SUIVANT + Duration::from_secs(1), false),
             IssueEchecDsdSuivant::Note { echecs: 1 }
         );
         let mut avoue = EchecsDsdSuivant::default();
-        assert_eq!(
+        assert!(matches!(
             avoue.noter_echec(t0, true),
-            IssueEchecDsdSuivant::GardeRendue { echecs: 1 }
-        );
+            IssueEchecDsdSuivant::GardeRendue { garde: 1, .. }
+        ));
         assert!(avoue.garde_active(t0));
     }
 

@@ -18,15 +18,19 @@
 //! remis sa position à zéro à 18.0 : il bascule SEUL, 1,2 s après
 //! l'ouverture, mais nomme encore la piste finie dans l'intervalle.
 //!
-//! ## Les épreuves (vrai `tick`, renderer simulé)
+//! ## Les épreuves (vrai `tick`, renderer simulé, suivant DSD armé)
 //!
-//! - le renderer ouvre le flux armé à la fin : la fin épinglée est différée,
-//!   la bascule est suivie sans `Play`, l'appareil garde le suivant DSD ;
-//! - contre-épreuve DMP-A6 (#4173/#4382) : flux armé préchargé 27 s avant la
-//!   fin, renderer épinglé sur la piste finie → relance au MÊME sondage
-//!   qu'avant ;
-//! - contre-épreuve : flux ouvert à la fin, renderer qui ne bascule jamais →
-//!   relance une fois la fenêtre passée (borné).
+//! - le renderer lit le flux armé à la fin : la fin épinglée est différée,
+//!   la bascule est suivie sans `Play`, aucun échec DSD n'est noté — que la
+//!   bascule se lise par l'URI ou par la seule remise à zéro de la position ;
+//! - renderer qui sonde l'en-tête au `SetNext` puis lit à la fin : daté à la
+//!   lecture, différé ;
+//! - contre-épreuve DMP-A6 (#4173/#4382) : flux armé lu 27 s avant la fin,
+//!   renderer épinglé sur la piste finie → relance au MÊME sondage qu'avant ;
+//! - contre-épreuve : flux lu à la fin, renderer qui ne bascule jamais →
+//!   relance une fois la fenêtre passée (borné) ;
+//! - contre-épreuve : en-tête seul → rien de différé ;
+//! - suivant PCM (WAV) : rien de différé, le repli d'avant au sondage près.
 
 use super::dsd_suivant_dlna_6910::annonce_dsd;
 use super::*;
@@ -37,8 +41,8 @@ use crate::outputs::traits::AnnonceSuivante;
 const OCTETS_LUS: u64 = 200_000;
 
 impl Banc {
-    /// Le renderer a ouvert le flux armé il y a `il_y_a` et en a tiré
-    /// `octets` — ce que `tune-stream-http` écrit sur la session.
+    /// Le renderer LIT le flux armé depuis `il_y_a` (seuil de l'en-tête
+    /// franchi) et en a tiré `octets` — ce que `tune-stream-http` écrit.
     async fn le_renderer_ouvre_le_flux_arme(&self, flux: &str, octets: u64, il_y_a: Duration) {
         let sessions = self.orchestrator.streamer.sessions_state();
         let sessions = sessions.lock().await;
@@ -47,9 +51,20 @@ impl Banc {
             .bytes_sent
             .store(octets, std::sync::atomic::Ordering::Relaxed);
         session
-            .premier_octet_servi
+            .lecture_au_dela_de_l_en_tete
             .set(std::time::Instant::now() - il_y_a)
-            .expect("premier octet daté une seule fois");
+            .expect("lecture datée une seule fois");
+    }
+
+    /// Le service HTTP compte `octets` servis sur le flux armé, MAINTENANT —
+    /// le vrai chemin de `tune-stream-http`.
+    async fn le_service_sert(&self, flux: &str, octets: u64) {
+        let sessions = self.orchestrator.streamer.sessions_state();
+        let sessions = sessions.lock().await;
+        sessions
+            .get(flux)
+            .expect("le flux armé existe")
+            .compter_octets_servis(octets);
     }
 
     /// Un sondage tel que le renderer le rend, SANS retoucher la position
@@ -90,14 +105,8 @@ impl Banc {
     }
 }
 
-/// ⭐ Le cas du fil 2961. Renderer DSD natif, suivant DSD armé ; à la fin il
-/// ouvre le flux armé et le lit, mais nomme encore la piste finie au sondage
-/// épinglé. Avant : relance au premier sondage épinglé (~2,5 s de blanc) et
-/// garde DSD rendue à l'appareil. Après : rien ne part, la bascule du
-/// renderer est suivie, le sans-blanc DSD reste acquis.
-#[tokio::test]
-async fn le_renderer_qui_ouvre_le_flux_arme_a_la_fin_n_est_pas_coupe_9206() {
-    let appareil = "uuid:banc-9206-android-dsd";
+/// Zone DSD du fil 2961, suivant DSD armé : le banc, le flux armé, son URL.
+async fn monter_9206(appareil: &str) -> (Banc, String, String) {
     let mut banc = Banc::monter_en_dsd(
         appareil,
         "auto",
@@ -113,7 +122,39 @@ async fn le_renderer_qui_ouvre_le_flux_arme_a_la_fin_n_est_pas_coupe_9206() {
         .await
         .expect("le suivant DSD est armé par flux");
     let url = banc.url_armee().await.expect("URL armée");
+    (banc, flux, url)
+}
 
+/// Après la bascule : aucun `Play`, l'écran sur la piste armée, aucun échec
+/// de suivant DSD noté pour l'appareil.
+async fn verifier_la_bascule_suivie(banc: &Banc, appareil: &str) {
+    assert_eq!(
+        banc.play_complets().await,
+        Vec::<String>::new(),
+        "la bascule du renderer est suivie, sans `SetAVTransportURI` + `Play`"
+    );
+    let (position, titre, _) = banc.ecran().await;
+    assert_eq!(
+        (position, titre.as_str()),
+        (1, ARMEE),
+        "l'écran suit le renderer sur la piste armée"
+    );
+    assert_eq!(
+        banc.orchestrator.echecs_dsd_suivant_pour_banc(appareil),
+        0,
+        "#9206 : l'appareil a enchaîné — aucun échec de suivant DSD ne doit être noté"
+    );
+}
+
+/// ⭐ Le cas du fil 2961. Renderer DSD natif, suivant DSD armé ; à la fin il
+/// ouvre le flux armé et le lit, mais nomme encore la piste finie au sondage
+/// épinglé. Avant : relance au premier sondage épinglé (~2,5 s de blanc) et
+/// garde DSD rendue à l'appareil. Après : rien ne part, la bascule du
+/// renderer est suivie, aucun échec noté.
+#[tokio::test]
+async fn le_renderer_qui_ouvre_le_flux_arme_a_la_fin_n_est_pas_coupe_9206() {
+    let appareil = "uuid:banc-9206-android-dsd";
+    let (mut banc, flux, url) = monter_9206(appareil).await;
     banc.jusqu_a_la_duree().await;
     // 19:48:46.99 → 47.50 : `bytes=0-`, sonde de fin, `bytes=28-`.
     banc.le_renderer_ouvre_le_flux_arme(&flux, OCTETS_LUS, Duration::from_millis(1_150))
@@ -129,36 +170,55 @@ async fn le_renderer_qui_ouvre_le_flux_arme_a_la_fin_n_est_pas_coupe_9206() {
     let (position, titre, _) = banc.ecran().await;
     assert_eq!((position, titre.as_str()), (0, FINIE));
 
-    // 19:48:48.x : le renderer a basculé — URI du flux armé, position à zéro.
+    // Le renderer a basculé — URI du flux armé, position à zéro.
     banc.le_renderer_rapporte(Some(url)).await;
     banc.sondage_9206(1_000, 242).await;
+    verifier_la_bascule_suivie(&banc, appareil).await;
+}
+
+/// Même cas, mais le renderer bascule SANS mettre son URI à jour : seule la
+/// remise à zéro de sa position le dit. Elle doit suffire.
+#[tokio::test]
+async fn remise_a_zero_pendant_le_report_uri_restee_sur_la_piste_finie_9206() {
+    let appareil = "uuid:banc-9206-uri-en-retard";
+    let (mut banc, flux, _) = monter_9206(appareil).await;
+    banc.jusqu_a_la_duree().await;
+    banc.le_renderer_ouvre_le_flux_arme(&flux, OCTETS_LUS, Duration::from_millis(1_150))
+        .await;
+    banc.sondage_9206(POSITION_GELEE_MS, 241).await;
+    assert_eq!(banc.play_complets().await, Vec::<String>::new());
+    // URI toujours celle de la piste finie ; position repartie de zéro.
+    banc.sondage_9206(1_000, 242).await;
+    verifier_la_bascule_suivie(&banc, appareil).await;
+}
+
+/// Renderer qui SONDE l'en-tête du flux armé au `SetNext` (quelques
+/// octets), puis le LIT à la fin : la datation suit la lecture, pas la
+/// sonde, et la fin est différée.
+#[tokio::test]
+async fn sonde_de_l_en_tete_au_set_next_puis_lecture_a_la_fin_9206() {
+    let appareil = "uuid:banc-9206-sonde-en-tete";
+    let (mut banc, flux, url) = monter_9206(appareil).await;
+    banc.le_service_sert(&flux, 92).await;
+    banc.jusqu_a_la_duree().await;
+    banc.le_service_sert(&flux, OCTETS_LUS).await;
+    banc.sondage_9206(POSITION_GELEE_MS, 241).await;
     assert_eq!(
         banc.play_complets().await,
         Vec::<String>::new(),
-        "la bascule du renderer est suivie, sans `SetAVTransportURI` + `Play`"
+        "la lecture vient de commencer : la sonde d'en-tête ne vieillit pas la datation"
     );
-    let (position, titre, _) = banc.ecran().await;
-    assert_eq!(
-        (position, titre.as_str()),
-        (1, ARMEE),
-        "l'écran suit le renderer sur la piste armée"
-    );
-    assert!(
-        banc.orchestrator
-            .dsd_suivant_tenu_sur_dlna(banc.zone_id, appareil, AnnonceSuivante::Annoncee)
-            .await,
-        "#9206 : l'appareil a enchaîné — il garde le suivant DSD"
-    );
+    banc.le_renderer_rapporte(Some(url)).await;
+    banc.sondage_9206(1_000, 242).await;
+    verifier_la_bascule_suivie(&banc, appareil).await;
 }
 
-/// Contre-épreuve (#4173/#4382, DMP-A6) : le flux armé a été préchargé ~3 s
-/// après le `SetNext` (27 s avant la fin) et le renderer, épinglé, nomme la
-/// piste finie. Il n'enchaînera pas : la relance part au MÊME sondage
-/// qu'avant le correctif.
+/// Contre-épreuve (#4173/#4382, DMP-A6) : le flux armé a été lu ~3 s après
+/// le `SetNext` (27 s avant la fin) et le renderer, épinglé, nomme la piste
+/// finie. Il n'enchaînera pas : la relance part au MÊME sondage qu'avant.
 #[tokio::test]
 async fn le_dmp_a6_qui_a_precharge_le_flux_arme_est_relance_comme_avant_9206() {
-    let mut banc = Banc::monter().await;
-    let (flux, _) = banc.armer().await;
+    let (mut banc, flux, _) = monter_9206("uuid:banc-9206-dmp-a6").await;
     banc.le_renderer_ouvre_le_flux_arme(&flux, OCTETS_TIRES, Duration::from_secs(27))
         .await;
     banc.jusqu_a_la_duree().await;
@@ -166,15 +226,14 @@ async fn le_dmp_a6_qui_a_precharge_le_flux_arme_est_relance_comme_avant_9206() {
     verifier_le_repli(&banc, &flux).await;
 }
 
-/// Contre-épreuve : le renderer ouvre le flux armé à la fin mais ne bascule
+/// Contre-épreuve : le renderer lit le flux armé à la fin mais ne bascule
 /// jamais. La fin n'est différée que dans la fenêtre ; passé celle-ci, le
 /// repli d'avant relance la suivante.
 #[tokio::test]
 async fn ouvert_a_la_fin_sans_bascule_le_repli_part_apres_la_fenetre_9206() {
-    let mut banc = Banc::monter().await;
-    let (flux, _) = banc.armer().await;
+    let (mut banc, flux, _) = monter_9206("uuid:banc-9206-sans-bascule").await;
     banc.jusqu_a_la_duree().await;
-    let marge = Duration::from_millis(300);
+    let marge = Duration::from_secs(1);
     banc.le_renderer_ouvre_le_flux_arme(
         &flux,
         OCTETS_LUS,
@@ -187,8 +246,8 @@ async fn ouvert_a_la_fin_sans_bascule_le_repli_part_apres_la_fenetre_9206() {
         Vec::<String>::new(),
         "dans la fenêtre, la fin est différée"
     );
-    // Horloge réelle : le premier octet est daté en `std::time::Instant`.
-    std::thread::sleep(marge + Duration::from_millis(100));
+    // Horloge réelle : la lecture est datée en `std::time::Instant`.
+    std::thread::sleep(marge + Duration::from_millis(200));
     banc.sondage_9206(POSITION_GELEE_MS, 242).await;
     verifier_le_repli(&banc, &flux).await;
 }
@@ -197,13 +256,39 @@ async fn ouvert_a_la_fin_sans_bascule_le_repli_part_apres_la_fenetre_9206() {
 /// rien n'est différé.
 #[tokio::test]
 async fn en_tete_seul_ne_differe_rien_9206() {
+    let (mut banc, flux, _) = monter_9206("uuid:banc-9206-en-tete").await;
+    banc.jusqu_a_la_duree().await;
+    banc.le_service_sert(&flux, 92).await;
+    banc.sondage_9206(POSITION_GELEE_MS, 241).await;
+    verifier_le_repli(&banc, &flux).await;
+}
+
+/// Suivant PCM (WAV) : le report est réservé au DSD. Un flux armé lu à la
+/// fin ne diffère rien — le repli d'avant, au sondage près.
+#[tokio::test]
+async fn suivant_pcm_rien_de_differe_9206() {
     let mut banc = Banc::monter().await;
     let (flux, _) = banc.armer().await;
     banc.jusqu_a_la_duree().await;
-    banc.le_renderer_ouvre_le_flux_arme(&flux, 92, Duration::from_millis(500))
+    banc.le_renderer_ouvre_le_flux_arme(&flux, OCTETS_LUS, Duration::from_millis(1_150))
         .await;
     banc.sondage_9206(POSITION_GELEE_MS, 241).await;
     verifier_le_repli(&banc, &flux).await;
+}
+
+/// La datation : la sonde d'en-tête ne date rien ; le franchissement du
+/// seuil, si.
+#[tokio::test]
+async fn la_lecture_est_datee_au_franchissement_de_l_en_tete_9206() {
+    let mut banc = Banc::monter().await;
+    let (flux, _) = banc.armer().await;
+    let orchestrateur = banc.orchestrator.clone();
+    banc.le_service_sert(&flux, 92).await;
+    banc.le_service_sert(&flux, decisions::OCTETS_AU_DELA_DE_L_EN_TETE - 92)
+        .await;
+    assert_eq!(orchestrateur.streamer_lecture_au_dela_de_l_en_tete_depuis_ms(&flux).await, None, "seuil atteint, pas franchi");
+    banc.le_service_sert(&flux, 1).await;
+    assert!(orchestrateur.streamer_lecture_au_dela_de_l_en_tete_depuis_ms(&flux).await.is_some_and(|ms| ms < 1_000));
 }
 
 /// La règle pure.
@@ -211,24 +296,23 @@ async fn en_tete_seul_ne_differe_rien_9206() {
 fn la_bascule_en_cours_pure_9206() {
     use decisions::{EnchainementArme as E, bascule_en_cours_sur_le_flux_arme as en_cours};
     let fenetre = decisions::FENETRE_BASCULE_SUR_FLUX_ARME_MS;
-    assert!(en_cours(E::Aucun, Some(OCTETS_LUS), Some(1_150)));
-    assert!(en_cours(E::Aucun, Some(OCTETS_LUS), Some(fenetre)));
-    assert!(!en_cours(E::Aucun, Some(OCTETS_LUS), Some(fenetre + 1)));
-    assert!(
-        !en_cours(E::Aucun, Some(OCTETS_LUS), Some(27_000)),
-        "DMP-A6"
-    );
-    assert!(!en_cours(E::Aucun, Some(OCTETS_LUS), None), "non daté");
-    assert!(!en_cours(E::Aucun, Some(0), Some(500)), "RS130 : rien tiré");
-    assert!(!en_cours(E::Aucun, None, Some(500)), "session disparue");
+    assert!(en_cours(E::Aucun, true, Some(OCTETS_LUS), Some(1_150)));
+    assert!(en_cours(E::Aucun, true, Some(OCTETS_LUS), Some(fenetre)));
+    assert!(!en_cours(E::Aucun, false, Some(OCTETS_LUS), Some(1_150)), "PCM");
+    assert!(!en_cours(E::Aucun, true, Some(OCTETS_LUS), Some(fenetre + 1)));
+    assert!(!en_cours(E::Aucun, true, Some(OCTETS_LUS), Some(27_000)), "DMP-A6");
+    assert!(!en_cours(E::Aucun, true, Some(OCTETS_LUS), None), "non daté");
+    assert!(!en_cours(E::Aucun, true, Some(0), Some(500)), "RS130 : rien tiré");
+    assert!(!en_cours(E::Aucun, true, None, Some(500)), "session disparue");
     assert!(
         !en_cours(
             E::Aucun,
+            true,
             Some(decisions::OCTETS_AU_DELA_DE_L_EN_TETE),
             Some(500)
         ),
         "en-tête seul"
     );
-    assert!(!en_cours(E::Certain, Some(OCTETS_LUS), Some(500)));
-    assert!(!en_cours(E::Probable, Some(OCTETS_LUS), Some(500)));
+    assert!(!en_cours(E::Certain, true, Some(OCTETS_LUS), Some(500)));
+    assert!(!en_cours(E::Probable, true, Some(OCTETS_LUS), Some(500)));
 }

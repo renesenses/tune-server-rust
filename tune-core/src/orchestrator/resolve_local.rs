@@ -675,8 +675,9 @@ impl PlaybackOrchestrator {
 
     /// #6910 — `device_id` a lâché un suivant DSD armé. #9206 : la garde de
     /// #402 ne lui est rendue qu'au deuxième échec (ou tout de suite si
-    /// `immediat` : il a dit lui-même avoir perdu la suivante), et pour
-    /// [`crate::playback::gapless::DUREE_GARDE_DSD_SUIVANT`] seulement.
+    /// `immediat` : il a dit lui-même avoir perdu la suivante, ou s'il est
+    /// récidiviste), pour un temps (voir
+    /// [`crate::playback::gapless::EchecsDsdSuivant`]).
     pub fn retenir_dsd_suivant_lache(
         &self,
         device_id: &str,
@@ -688,6 +689,16 @@ impl PlaybackOrchestrator {
             .entry(device_id.to_string())
             .or_default()
             .noter_echec(std::time::Instant::now(), immediat)
+    }
+
+    /// Banc (#9206) : échecs de suivant DSD notés pour `device_id`.
+    #[cfg(test)]
+    pub(crate) fn echecs_dsd_suivant_pour_banc(&self, device_id: &str) -> u32 {
+        self.appareils_qui_lachent_le_dsd_suivant
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(device_id)
+            .map_or(0, |m| m.echecs())
     }
 
     /// Banc : ce que le `GetProtocolInfo` du renderer aurait dit du DSD.

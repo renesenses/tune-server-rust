@@ -4132,24 +4132,34 @@ impl PositionPoller {
                         // flux armé et le lit (`bytes=0-` puis `bytes=28-`),
                         // mais nomme encore la piste finie : il bascule, son
                         // URI retarde. Conclure ici coupait la transition (~2,5 s
-                        // de blanc) et lui retirait le sans-blanc DSD. La fin
-                        // est différée, au plus `FENETRE_BASCULE_SUR_FLUX_ARME_MS`
-                        // après le premier octet ; un flux préchargé de longue
-                        // date (DMP-A6, #4173) ne diffère rien.
-                        let premier_octet_arme_depuis_ms = match flux_arme.as_deref() {
+                        // de blanc) et lui retirait le sans-blanc DSD. Pour un
+                        // suivant DSD, la fin est différée, au plus
+                        // `FENETRE_BASCULE_SUR_FLUX_ARME_MS` après le début de
+                        // la lecture ; un flux lu de longue date (DMP-A6,
+                        // #4173) ne diffère rien.
+                        let suivant_dsd_arme = self
+                            .dsd_suivant_arme
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .contains_key(&zone_id);
+                        let lecture_armee_depuis_ms = match flux_arme.as_deref() {
                             Some(f)
                                 if ps.past_end_ticks >= seuil_ticks
+                                    && suivant_dsd_arme
                                     && enchainement == decisions::EnchainementArme::Aucun =>
                             {
-                                self.orchestrator.streamer_premier_octet_depuis_ms(f).await
+                                self.orchestrator
+                                    .streamer_lecture_au_dela_de_l_en_tete_depuis_ms(f)
+                                    .await
                             }
                             _ => None,
                         };
                         let bascule_en_cours = ps.past_end_ticks >= seuil_ticks
                             && decisions::bascule_en_cours_sur_le_flux_arme(
                                 enchainement,
+                                suivant_dsd_arme,
                                 octets_tires,
-                                premier_octet_arme_depuis_ms,
+                                lecture_armee_depuis_ms,
                             );
                         let enchainement = if ps.past_end_ticks >= seuil_ticks
                             && !bascule_en_cours
@@ -4180,7 +4190,7 @@ impl PositionPoller {
                                 flux_arme = flux_arme_journal.as_str(),
                                 uri_courante = status.current_uri.as_deref().unwrap_or(""),
                                 octets_tires = octets_tires.unwrap_or(0),
-                                premier_octet_depuis_ms = premier_octet_arme_depuis_ms.unwrap_or(0),
+                                lu_depuis_ms = lecture_armee_depuis_ms.unwrap_or(0),
                                 "fin_differee_flux_arme_ouvert"
                             );
                         } else if let Some(flux) =

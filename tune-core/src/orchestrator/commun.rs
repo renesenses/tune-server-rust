@@ -1147,11 +1147,14 @@ impl PlaybackOrchestrator {
         self.streamer.stream_bytes_sent(stream_id).await
     }
 
-    /// #9206 — depuis combien de millisecondes le premier octet de ce flux
-    /// est parti (voir [`AudioStreamer::stream_premier_octet_depuis_ms`]).
-    pub async fn streamer_premier_octet_depuis_ms(&self, stream_id: &str) -> Option<u64> {
+    /// #9206 — depuis combien de millisecondes ce flux est lu au-delà de
+    /// l'en-tête (voir [`AudioStreamer::stream_lecture_au_dela_de_l_en_tete_depuis_ms`]).
+    pub async fn streamer_lecture_au_dela_de_l_en_tete_depuis_ms(
+        &self,
+        stream_id: &str,
+    ) -> Option<u64> {
         self.streamer
-            .stream_premier_octet_depuis_ms(stream_id)
+            .stream_lecture_au_dela_de_l_en_tete_depuis_ms(stream_id)
             .await
     }
 
