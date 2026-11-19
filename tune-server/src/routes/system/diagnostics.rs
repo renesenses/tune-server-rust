@@ -1921,9 +1921,31 @@ async fn collect_recent_logs_brut(max_lines: usize) -> Json<Value> {
     let log_path = crate::config::default_log_file_path()
         .to_string_lossy()
         .into_owned();
+    collect_recent_logs_depuis(
+        max_lines,
+        log_path,
+        crate::config::refus_du_journal_au_demarrage(),
+    )
+    .await
+}
+
+/// [`collect_recent_logs_brut`], chemin du journal et refus du démarrage
+/// passés — ce que le test de #9118 éprouve.
+///
+/// #9118 — quand le démarrage n'a pu ouvrir AUCUN fichier de journal
+/// (`refus_au_demarrage`), le fichier n'est plus relu : chaque export levait
+/// un `WARN log_export_fichier_illisible_replis_tentes … Permission denied`
+/// sur un chemin déjà refusé, et l'anonymisation du rapport (`/home/x` →
+/// `~`) le faisait lire comme un `~` non développé. On va droit aux replis ;
+/// si eux aussi échouent, la réponse dit le refus du démarrage.
+async fn collect_recent_logs_depuis(
+    max_lines: usize,
+    log_path: String,
+    refus_au_demarrage: Option<String>,
+) -> Json<Value> {
     // #6866 — l'erreur d'un fichier présent mais illisible, gardée pour la fin :
     // elle ne dispense plus des replis.
-    let mut fichier_illisible: Option<String> = None;
+    let mut fichier_illisible: Option<String> = refus_au_demarrage;
 
     // Read only a bounded tail, off the async runtime. Reading the whole file
     // with read_to_string both blocked a Tokio worker (same trap as
@@ -1931,7 +1953,7 @@ async fn collect_recent_logs_brut(max_lines: usize) -> Json<Value> {
     // file had grown large — and that failure fell through to the misleading
     // "No log file found" fallback, exporting an empty log (Yacine, DS418j
     // 1 GB RAM).
-    {
+    if fichier_illisible.is_none() {
         let path = log_path.clone();
         // On lit CANDIDATE_FACTOR fois plus de lignes que demandé, puis on
         // sélectionne : rebalancer suppose d'avoir le choix, et prendre
@@ -6139,3 +6161,54 @@ mod volume_des_zones_au_rapport_7841 {
 #[cfg(test)]
 #[path = "diagnostics_oaat_8006_tests.rs"]
 mod registre_libre_pendant_le_diagnostic_8006;
+
+#[cfg(test)]
+mod tests_journal_refuse_au_demarrage_9118 {
+    use super::collect_recent_logs_depuis;
+
+    /// #9118 — le démarrage n'a pu ouvrir aucun fichier de journal : l'export
+    /// ne relit pas ce chemin (un `WARN … Permission denied` par rapport), il
+    /// va droit aux replis. Le fichier témoin est LISIBLE ici : s'il est lu,
+    /// c'est que le refus du démarrage a été ignoré.
+    #[tokio::test]
+    async fn un_journal_refuse_au_demarrage_n_est_plus_relu() {
+        let dossier = tempfile::tempdir().unwrap();
+        let chemin = dossier.path().join("tune-server.log");
+        std::fs::write(
+            &chemin,
+            "2026-11-18T10:00:00Z  INFO m: temoin-9118-ne-doit-pas-etre-lu\n",
+        )
+        .unwrap();
+        let chemin = chemin.to_string_lossy().into_owned();
+
+        let axum::Json(v) = collect_recent_logs_depuis(
+            50,
+            chemin.clone(),
+            Some(format!("{chemin} : Permission denied (os error 13)")),
+        )
+        .await;
+
+        let logs = v["logs"].as_str().unwrap_or_default();
+        assert!(
+            !logs.contains("temoin-9118-ne-doit-pas-etre-lu"),
+            "un chemin refusé au démarrage ne doit pas être relu : {v}"
+        );
+        if v["source"] == "file_unreadable" {
+            assert!(logs.contains("Permission denied"), "le refus est dit : {v}");
+        }
+    }
+
+    /// Sans refus au démarrage, le fichier est lu comme avant.
+    #[tokio::test]
+    async fn sans_refus_le_fichier_est_lu() {
+        let dossier = tempfile::tempdir().unwrap();
+        let chemin = dossier.path().join("tune-server.log");
+        std::fs::write(&chemin, "2026-11-18T10:00:00Z  INFO m: temoin-9118-lu\n").unwrap();
+        let chemin = chemin.to_string_lossy().into_owned();
+
+        let axum::Json(v) = collect_recent_logs_depuis(50, chemin.clone(), None).await;
+
+        assert_eq!(v["source"], "file", "{v}");
+        assert!(v["logs"].as_str().unwrap().contains("temoin-9118-lu"));
+    }
+}
