@@ -43,6 +43,10 @@ impl PositionPoller {
         let fin_sur_erreur = crate::playback::radio_fin_de_file::prendre_fin_sur_erreur(zone_id);
         if !fin_sur_erreur {
             self.noter_la_ligne_courante_jouee(zone_id, zone_state.queue_position);
+            // #9143 — la fin naturelle achève la piste, même courte ou
+            // passée entre deux relevés du sondeur.
+            self.orchestrator
+                .noter_piste_achevee_pour_le_sas(zone_state, true);
         }
 
         let Some(next_pos) = Self::next_position(zone_state) else {

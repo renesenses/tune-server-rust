@@ -28,6 +28,8 @@ pub mod disques_par_dossier;
 /// Les dossiers « Collections » suivent leurs albums (#5527, #5528).
 pub mod dossiers_des_collections;
 /// #7763 — les écoutes importées (Roon, Plex, m3u), à part de l'historique.
+/// #9143 — « Écouter plus tard » rend un album écouté en entier (option).
+pub mod ecouter_plus_tard_retrait;
 pub mod ecoutes_importees;
 pub mod edition_album;
 pub mod engine;

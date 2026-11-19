@@ -311,6 +311,24 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// #9143 — la piste en lecture est-elle achevée (90 % ou fin naturelle) ?
+    /// Elle compte alors pour l'écoute complète de l'album en session, qui
+    /// sort l'album d'« Écouter plus tard » si le profil l'a demandé. Appelé
+    /// par le sondeur à chaque tour en lecture, et à la fin naturelle.
+    pub fn noter_piste_achevee_pour_le_sas(&self, etat: &ZoneState, naturel: bool) {
+        let Ok(mut suivis) = self.suivis_ecouter_plus_tard.lock() else {
+            return;
+        };
+        if let Err(e) = crate::db::ecouter_plus_tard_retrait::noter_piste_achevee(
+            &self.db,
+            &mut suivis,
+            etat,
+            naturel,
+        ) {
+            tracing::warn!(zone_id = etat.zone_id, error = %e, "ecouter_plus_tard_non_retire");
+        }
+    }
+
     /// Une écoute est-elle en attente sur la zone ? (diagnostic et tests)
     pub fn ecoute_en_attente(&self, zone_id: i64) -> bool {
         self.ecoutes_en_attente

@@ -23,6 +23,9 @@ impl PositionPoller {
                 // Avant `track_position`, qui ne fait que suivre une reprise
                 // déjà créée.
                 self.orchestrator.valider_l_ecoute(s);
+                // #9143 — une piste au-delà de 90 % compte pour l'écoute
+                // complète de son album (retrait d'« Écouter plus tard »).
+                self.orchestrator.noter_piste_achevee_pour_le_sas(s, false);
                 if let Err(e) = crate::db::listening_resume::track_position(&self.db, s) {
                     tracing::warn!(zone_id = s.zone_id, error = %e, "reprise_titre_non_enregistree");
                 }
