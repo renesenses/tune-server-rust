@@ -89,8 +89,7 @@ pub fn retenir_provisoire(device_name: &str, capacite: CapaciteConnue) {
 
 fn retenir_provisoire_a(device_name: &str, capacite: CapaciteConnue, maintenant: Instant) {
     let mut t = table().lock().unwrap_or_else(|p| p.into_inner());
-    if t
-        .get(device_name)
+    if t.get(device_name)
         .is_some_and(|e| e.provisoire_depuis.is_none())
     {
         return;

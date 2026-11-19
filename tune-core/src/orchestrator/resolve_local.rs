@@ -5115,10 +5115,7 @@ pub(super) fn sonder_l_entete_dsd(file_path: &str) -> Option<(u32, u32)> {
 
 /// #9170 — retient ce qui part réellement pour la piste DSD de la zone
 /// (lu par les réglages, `dsd_transport`). Sans sortie nommée, rien.
-fn noter_transport_reel_dsd(
-    req: &PlayRequest,
-    transport: TransportReelDsd,
-) {
+fn noter_transport_reel_dsd(req: &PlayRequest, transport: TransportReelDsd) {
     if let Some(sortie) = req.output_device_id.as_deref() {
         crate::outputs::capacite_dsd_natif::noter_transport_reel(req.zone_id, sortie, transport);
     }
@@ -5137,7 +5134,9 @@ pub(super) fn sortie_alsa_apres_sonde(
 ) -> SortieDsdLocale {
     use crate::outputs::local::ResultatSondeDsdAlsa;
     match r {
-        ResultatSondeDsdAlsa::Sonde { cadences, voies } => SortieDsdLocale::Alsa { cadences, voies },
+        ResultatSondeDsdAlsa::Sonde { cadences, voies } => {
+            SortieDsdLocale::Alsa { cadences, voies }
+        }
         ResultatSondeDsdAlsa::Occupe | ResultatSondeDsdAlsa::Introuvable => {
             SortieDsdLocale::AlsaNonSondee
         }

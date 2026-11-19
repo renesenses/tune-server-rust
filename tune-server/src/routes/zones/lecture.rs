@@ -19,9 +19,10 @@ fn diagnostic_transport_dsd(zone: &Zone, dsd_mode: &str) -> (Value, Value) {
         // qui est RÉELLEMENT parti (natif, ou converti en PCM — un DSD512
         // sous un plafond de 768 kHz ne passe pas en DoP), pas seulement ce
         // que la capacité retenue laisserait attendre.
-        let reel = zone.id.zip(zone.output_device_id.as_deref()).and_then(
-            |(zone_id, sortie)| capacite_dsd_natif::transport_reel(zone_id, sortie),
-        );
+        let reel = zone
+            .id
+            .zip(zone.output_device_id.as_deref())
+            .and_then(|(zone_id, sortie)| capacite_dsd_natif::transport_reel(zone_id, sortie));
         match reel {
             Some(TransportReelDsd::Natif) => return (json!("natif"), Value::Null),
             Some(TransportReelDsd::Pcm) => return (json!("pcm"), json!("converti_en_pcm")),
@@ -29,21 +30,20 @@ fn diagnostic_transport_dsd(zone: &Zone, dsd_mode: &str) -> (Value, Value) {
         }
         // Un seul instantané pour le transport et son motif : un sondage
         // concurrent ne peut pas produire deux réponses contradictoires.
-        let selon_la_capacite = match capacite_dsd_natif::connue(nom) {
-            None => (Value::Null, json!("capacite_non_sondee")),
-            Some(CapaciteConnue::SortieNonAsio) => {
-                (json!("natif_servi_en_dop"), json!("sortie_non_asio"))
-            }
-            Some(CapaciteConnue::Asio { cadences } | CapaciteConnue::AlsaDsdU32 { cadences })
-                if cadences.is_empty() =>
-            {
-                (json!("natif_servi_en_dop"), json!("pilote_sans_dsd"))
-            }
-            // #8248 — un PCM ALSA `hw:` qui offre `DSD_U32` : natif, comme ASIO.
-            Some(CapaciteConnue::Asio { .. } | CapaciteConnue::AlsaDsdU32 { .. }) => {
-                (json!("natif"), Value::Null)
-            }
-        };
+        let selon_la_capacite =
+            match capacite_dsd_natif::connue(nom) {
+                None => (Value::Null, json!("capacite_non_sondee")),
+                Some(CapaciteConnue::SortieNonAsio) => {
+                    (json!("natif_servi_en_dop"), json!("sortie_non_asio"))
+                }
+                Some(
+                    CapaciteConnue::Asio { cadences } | CapaciteConnue::AlsaDsdU32 { cadences },
+                ) if cadences.is_empty() => (json!("natif_servi_en_dop"), json!("pilote_sans_dsd")),
+                // #8248 — un PCM ALSA `hw:` qui offre `DSD_U32` : natif, comme ASIO.
+                Some(CapaciteConnue::Asio { .. } | CapaciteConnue::AlsaDsdU32 { .. }) => {
+                    (json!("natif"), Value::Null)
+                }
+            };
         // #9170 — la dernière piste est partie en DoP : jamais « natif », ni
         // « à déterminer » ; le motif de la capacité s'il en donne un.
         if reel == Some(TransportReelDsd::Dop) && selon_la_capacite.0 != json!("natif_servi_en_dop")
