@@ -81,6 +81,7 @@ impl Zone {
             ),
             voies_pilotees: false,
             fondu_ms: 0,
+            surechantillonnage_voulu: false,
         }
     }
 }
@@ -288,6 +289,89 @@ fn le_chemin_partage_reste_pris_hors_du_cas_natif_6734() {
     ] {
         assert_eq!(chemin_natif_s32(&conditions), Err(motif));
     }
+}
+
+/// #9165 (fil 2945) — une source PCM entière 32 bits, au volume unité, sans
+/// autre DSP : le cas même du chemin natif. Le greffon de suréchantillonnage
+/// armé pour la zone doit le faire céder au chemin partagé, seul à porter
+/// l'étage ; sans greffon, ou sous PURE / DoP / sortie double (que l'ouverture
+/// partagée écarterait de toute façon), le natif reste pris.
+#[test]
+fn le_greffon_arme_fait_ceder_le_chemin_natif_9165() {
+    use super::super::diagnostic_surechantillonnage_8259::surechantillonneur_voulu;
+    let zone = Zone::au_repos();
+    let s32 = spec(ProfondeurPcm::Entier32);
+    let amorce = octets_le(&mots_de_test());
+    let voulu = |choix: bool, pure: bool, dop: bool, double: bool| ConditionsDuNatif {
+        surechantillonnage_voulu: surechantillonneur_voulu(choix, s32, &amorce, pure, dop, double),
+        ..zone.conditions(s32, UNITE_DU_GAIN_DE_RENDU)
+    };
+    assert!(zone.conditions(s32, UNITE_DU_GAIN_DE_RENDU).dsp_identite);
+    assert_eq!(chemin_natif_s32(&voulu(false, false, false, false)), Ok(()));
+    assert_eq!(
+        chemin_natif_s32(&voulu(true, false, false, false)),
+        Err(MotifDuCheminPartage::SurechantillonnageDemande),
+        "greffon armé : le chemin natif ne doit pas être pris (#9165)"
+    );
+    assert_eq!(
+        MotifDuCheminPartage::SurechantillonnageDemande.code(),
+        "surechantillonnage_demande"
+    );
+    for (pure, dop, double) in [
+        (true, false, false),
+        (false, true, false),
+        (false, false, true),
+    ] {
+        assert_eq!(
+            chemin_natif_s32(&voulu(true, pure, dop, double)),
+            Ok(()),
+            "l'ouverture partagée écarterait le greffon : rien à céder"
+        );
+    }
+
+    // À la frontière d'une chaîne native : armé en cours de route, il fait
+    // finir la chaîne ; PURE le contourne.
+    let choix = std::sync::Mutex::new(None);
+    let pure = AtomicBool::new(false);
+    assert!(!greffon_arme_a_la_frontiere(&choix, &pure));
+    {
+        use crate::audio::surechantillonnage::{
+            ChoixSurechantillonnage, UpsamplerSettings, VerdictMachine,
+        };
+        *choix.lock().unwrap() = Some(ChoixSurechantillonnage {
+            reglages: UpsamplerSettings {
+                enabled: true,
+                ..Default::default()
+            },
+            verdict: VerdictMachine {
+                simd_path: "scalaire".into(),
+                margin: 1.0,
+                results: Vec::new(),
+                measured_at: 0,
+            },
+        });
+    }
+    assert!(greffon_arme_a_la_frontiere(&choix, &pure));
+    pure.store(true, Ordering::SeqCst);
+    assert!(!greffon_arme_a_la_frontiere(&choix, &pure));
+}
+
+/// Garde de branchement #9165 : `play_url` passe le choix de la zone aux
+/// conditions du natif, et le bras le relit à la frontière.
+#[test]
+fn play_url_passe_le_greffon_au_chemin_natif_9165() {
+    let local = include_str!("../local.rs");
+    let conditions = local
+        .find("let conditions = bras_alsa_natif::ConditionsDuNatif {")
+        .expect("conditions du natif");
+    let regle = local
+        .find("bras_alsa_natif::chemin_natif_s32(&conditions)")
+        .expect("règle du natif");
+    let voulu = local
+        .find("surechantillonnage_voulu:")
+        .expect("le choix de suréchantillonnage doit entrer dans les conditions");
+    assert!(conditions < voulu && voulu < regle);
+    assert!(local.contains("surechantillonnage: &surechantillonnage,"));
 }
 
 /// Le volume baissé EN COURS de piste sur le chemin natif : appliqué dans le

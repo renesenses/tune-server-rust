@@ -66,6 +66,10 @@ pub(super) struct ConditionsDuNatif {
     /// Durée du fondu enchaîné réglée sur la sortie (ms) : la chaîne native
     /// ne fond pas, elle enchaîne.
     pub(super) fondu_ms: u32,
+    /// #9165 — le greffon de suréchantillonnage est armé pour la zone et
+    /// porterait ce flux sur le chemin partagé
+    /// (`diagnostic_surechantillonnage_8259::surechantillonneur_voulu`).
+    pub(super) surechantillonnage_voulu: bool,
 }
 
 /// Pourquoi le chemin natif S32 n'est pas pris — journalisé tel quel.
@@ -82,6 +86,10 @@ pub(super) enum MotifDuCheminPartage {
     VoiesPilotees,
     /// Un fondu enchaîné est réglé.
     FonduEnchaine,
+    /// #9165 — le greffon de suréchantillonnage est armé : seul le chemin
+    /// partagé porte son étage. Sans ce motif, une source S32 au volume unité
+    /// partait en natif et le greffon était ignoré en silence.
+    SurechantillonnageDemande,
 }
 
 impl MotifDuCheminPartage {
@@ -92,6 +100,7 @@ impl MotifDuCheminPartage {
             Self::DspActif => "dsp_actif",
             Self::VoiesPilotees => "voies_pilotees",
             Self::FonduEnchaine => "fondu_enchaine",
+            Self::SurechantillonnageDemande => "surechantillonnage_demande",
         }
     }
 }
@@ -110,6 +119,9 @@ pub(super) fn chemin_natif_s32(c: &ConditionsDuNatif) -> Result<(), MotifDuChemi
     if !c.dsp_identite {
         return Err(MotifDuCheminPartage::DspActif);
     }
+    if c.surechantillonnage_voulu {
+        return Err(MotifDuCheminPartage::SurechantillonnageDemande);
+    }
     if c.voies_pilotees {
         return Err(MotifDuCheminPartage::VoiesPilotees);
     }
@@ -117,6 +129,15 @@ pub(super) fn chemin_natif_s32(c: &ConditionsDuNatif) -> Result<(), MotifDuChemi
         return Err(MotifDuCheminPartage::FonduEnchaine);
     }
     Ok(())
+}
+
+/// #9165 — à une frontière de la chaîne native : le greffon de
+/// suréchantillonnage est-il armé (et PURE éteint, qui le contournerait) ?
+pub(super) fn greffon_arme_a_la_frontiere(
+    choix: &std::sync::Mutex<Option<crate::audio::surechantillonnage::ChoixSurechantillonnage>>,
+    pure_bypass: &AtomicBool,
+) -> bool {
+    !pure_bypass.load(Ordering::Relaxed) && choix.lock().is_ok_and(|c| c.is_some())
 }
 
 /// Le verdict que le bras publie après chaque poussée : l'étage dit si ses
@@ -469,6 +490,11 @@ pub(super) struct ContexteAlsaNatif<'a> {
     pub(super) track_artist: &'a std::sync::Mutex<Option<String>>,
     pub(super) duration_ms: &'a AtomicU64,
     pub(super) seek_offset_ms: &'a AtomicU64,
+    /// #9165 — le choix de suréchantillonnage de la zone, relu à chaque
+    /// frontière : armé en cours de chaîne, il s'applique à la piste suivante,
+    /// qui ne s'enchaîne donc pas en natif.
+    pub(super) surechantillonnage:
+        &'a std::sync::Mutex<Option<crate::audio::surechantillonnage::ChoixSurechantillonnage>>,
 }
 
 /// Ce que la chaîne native emprunte au bras : témoins d'arrêt, publication,
@@ -478,6 +504,9 @@ struct HoteAlsaNatif<'a, F: FnMut(bool, bool)> {
     position_ms: &'a AtomicU64,
     publier: &'a mut F,
     reserve: ReserveHttp<'a>,
+    surechantillonnage:
+        &'a std::sync::Mutex<Option<crate::audio::surechantillonnage::ChoixSurechantillonnage>>,
+    pure_bypass: &'a AtomicBool,
 }
 
 impl<F: FnMut(bool, bool)> ReserveDeLaChaine for HoteAlsaNatif<'_, F> {
@@ -488,6 +517,13 @@ impl<F: FnMut(bool, bool)> ReserveDeLaChaine for HoteAlsaNatif<'_, F> {
     }
 
     fn preparer_la_suivante(&mut self) -> Suivante<Self::Lecteur> {
+        // #9165 — le greffon armé en cours de chaîne : la suivante reste en
+        // réserve, la piste courante finit, et la fin naturelle la rouvre par
+        // `play_url`, où le chemin partagé porte l'étage.
+        if greffon_arme_a_la_frontiere(self.surechantillonnage, self.pure_bypass) {
+            info!("local_audio_alsa_natif_s32_chaine_cede_au_surechantillonneur");
+            return Suivante::Aucune;
+        }
         self.reserve.preparer_la_suivante()
     }
 
@@ -578,6 +614,7 @@ pub(super) fn jouer_via_alsa_natif(mut backend: BackendAlsaNatif<'_>, ctx: Conte
         track_artist,
         duration_ms,
         seek_offset_ms,
+        surechantillonnage,
     } = ctx;
     let sortie = backend.format_ouvert();
     info!(
@@ -689,6 +726,8 @@ pub(super) fn jouer_via_alsa_natif(mut backend: BackendAlsaNatif<'_>, ctx: Conte
         stop_rx,
         position_ms,
         publier: &mut publier_le_verdict,
+        surechantillonnage,
+        pure_bypass,
         reserve: ReserveHttp {
             force_silent,
             position_ms,

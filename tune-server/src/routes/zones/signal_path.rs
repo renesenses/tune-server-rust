@@ -1691,6 +1691,10 @@ fn texte_du_refus_surechantillonnage(raison: &str) -> &'static str {
         "source_rate_unknown" | "source_probe_incomplete" => "upsampling_source_unknown",
         "output_path_not_supported" => "upsampling_output_path",
         "dop" => "upsampling_dop",
+        // #9165 — les chemins Linux sans étage nomment leur cause, au lieu du
+        // « chemin de sortie » réservé aux bras exclusifs macOS/Windows.
+        "dsd" => "upsampling_dsd",
+        "compressed_stream" => "upsampling_compressed_stream",
         "multiple_outputs" => "upsampling_multiple_outputs",
         "output_rate_open_failed" | "filter_initialization_failed" => "upsampling_opening_failed",
         _ => "upsampling_not_applied",

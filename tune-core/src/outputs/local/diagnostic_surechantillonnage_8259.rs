@@ -7,6 +7,8 @@ use std::sync::Mutex;
 struct Etat {
     demande: Option<&'static str>,
     piste: Option<&'static str>,
+    /// #9165 — un choix était armé à l'ouverture de la piste.
+    choix_present: bool,
 }
 
 #[derive(Default)]
@@ -24,6 +26,7 @@ impl Diagnostic {
     /// Appelé sous le verrou du choix : la raison et le choix sont du même instant.
     pub(super) fn ouvrir(&self, choix_present: bool) {
         if let Ok(mut e) = self.etat.lock() {
+            e.choix_present = choix_present;
             e.piste = if choix_present {
                 // Les chemins qui n'ouvrent pas d'étage ne doivent pas promettre
                 // un traitement à la piste suivante. CPAL affine cette raison.
@@ -31,6 +34,18 @@ impl Diagnostic {
             } else {
                 e.demande
             };
+        }
+    }
+
+    /// #9165 — un chemin qui n'ouvre pas d'étage nomme SA cause (DSD natif,
+    /// flux compressé décodé en entier) au lieu du « chemin de sortie » posé
+    /// d'office, réservé aux bras exclusifs macOS/Windows. Sans choix armé,
+    /// la raison de la demande (licence, test de la machine…) reste.
+    pub(super) fn chemin_sans_etage(&self, raison: &'static str) {
+        if let Ok(mut e) = self.etat.lock()
+            && e.choix_present
+        {
+            e.piste = Some(raison);
         }
     }
 
@@ -43,6 +58,21 @@ impl Diagnostic {
     pub(super) fn declarer(&self, t: TransformationsReelles) -> TransformationsReelles {
         t.avec_refus_surechantillonnage(self.etat.lock().ok().and_then(|e| e.piste))
     }
+}
+
+/// #9165 — le greffon porterait-il ce flux sur le chemin partagé ? Un choix
+/// armé (non écarté) qu'aucune garde d'ouverture n'écarte : le chemin natif
+/// S32 de Linux doit alors céder, comme pour un DSP actif.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn surechantillonneur_voulu(
+    choix_present: bool,
+    spec: AudioSpec,
+    amorce: &[u8],
+    pure: bool,
+    dop: bool,
+    sortie_double: bool,
+) -> bool {
+    choix_present && refus_a_l_ouverture(spec, amorce, pure, dop, sortie_double).is_none()
 }
 
 /// Les gardes existantes de l'ouverture, avec leur raison au lieu d'un booléen.
@@ -144,6 +174,61 @@ mod tests {
         );
         d.noter(None);
         assert!(d.declarer(mesure()).refus_surechantillonnage().is_none());
+    }
+
+    #[test]
+    fn diagnostic_9165_les_chemins_sans_etage_nomment_leur_cause() {
+        let d = Diagnostic::default();
+        // Choix armé : la valeur d'office cède à la cause du chemin.
+        d.ouvrir(true);
+        assert_eq!(
+            d.declarer(mesure()).refus_surechantillonnage(),
+            Some("output_path_not_supported")
+        );
+        d.chemin_sans_etage("dsd");
+        assert_eq!(d.declarer(mesure()).refus_surechantillonnage(), Some("dsd"));
+        d.ouvrir(true);
+        d.chemin_sans_etage("compressed_stream");
+        assert_eq!(
+            d.declarer(mesure()).refus_surechantillonnage(),
+            Some("compressed_stream")
+        );
+        // Sans choix armé, la raison de la demande n'est pas réécrite.
+        d.demander(Some("premium_required"));
+        d.ouvrir(false);
+        d.chemin_sans_etage("dsd");
+        assert_eq!(
+            d.declarer(mesure()).refus_surechantillonnage(),
+            Some("premium_required")
+        );
+    }
+
+    #[test]
+    fn surechantillonneur_voulu_9165_suit_les_gardes_de_l_ouverture() {
+        let s32 = AudioSpec::depuis_entete(192_000, 32, 2).unwrap();
+        assert!(surechantillonneur_voulu(
+            true,
+            s32,
+            &[],
+            false,
+            false,
+            false
+        ));
+        assert!(!surechantillonneur_voulu(
+            false,
+            s32,
+            &[],
+            false,
+            false,
+            false
+        ));
+        for (pure, dop, double) in [
+            (true, false, false),
+            (false, true, false),
+            (false, false, true),
+        ] {
+            assert!(!surechantillonneur_voulu(true, s32, &[], pure, dop, double));
+        }
     }
 
     #[test]
