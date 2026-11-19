@@ -429,10 +429,14 @@ mod tests_9170 {
     #[test]
     fn la_reponse_du_pilote_a_l_ouverture_remplace_la_capacite() {
         let nom = "9170-autre-dac";
+        // L'ancien DAC offrait DSD64, DSD128 et DSD512 ; le nouveau, sous le
+        // même nom, ne répond que DSD64 : DSD128 ne doit pas survivre (oublier
+        // la seule cadence refusée le garderait, et la piste DSD128 suivante
+        // échouerait encore).
         retenir(
             nom,
             CapaciteConnue::AlsaDsdU32 {
-                cadences: vec![2_822_400, 22_579_200],
+                cadences: vec![2_822_400, 5_644_800, 22_579_200],
             },
         );
         retenir_reponse_du_pilote(nom, true, 22_579_200, vec![2_822_400]);

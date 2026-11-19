@@ -341,7 +341,10 @@ pub(super) fn jouer_dsd_natif_via_alsa(entrees: EntreesDsdNatifAlsa) {
                     &device_name,
                     entete.canaux == crate::outputs::local::VOIES_SONDEES_DSD_ALSA,
                     entete.cadence,
-                    reponse.as_ref().map(|c| c.cadences.clone()).unwrap_or_default(),
+                    reponse
+                        .as_ref()
+                        .map(|c| c.cadences.clone())
+                        .unwrap_or_default(),
                 );
             }
             echouer(
@@ -595,7 +598,10 @@ mod perte_du_hw_9172 {
         let nom = "9172 Z8 debranche";
         prouve(nom);
         assert!(!a_resonder(nom));
-        retenir_la_perte_du_hw(nom, &SansPcmMateriel::Introuvable("périphérique introuvable"));
+        retenir_la_perte_du_hw(
+            nom,
+            &SansPcmMateriel::Introuvable("périphérique introuvable"),
+        );
         assert!(a_resonder(nom), "la piste DSD suivante doit re-sonder");
         assert_eq!(
             connue(nom),

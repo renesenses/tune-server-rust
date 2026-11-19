@@ -82,7 +82,10 @@ fn injecter_transport_dsd(obj: &mut serde_json::Map<String, Value>, zone: &Zone,
     let (transport, motif) = diagnostic_transport_dsd(zone, mode);
     obj.insert("dsd_transport".into(), transport);
     obj.insert("dsd_transport_reason".into(), motif);
-    obj.insert("dsd_transport_scope".into(), json!(portee_du_transport_dsd(zone, mode)));
+    obj.insert(
+        "dsd_transport_scope".into(),
+        json!(portee_du_transport_dsd(zone, mode)),
+    );
 }
 
 /// #9170 — la portée de [`diagnostic_transport_dsd`] : même condition que
@@ -98,7 +101,11 @@ fn portee_du_transport_dsd(zone: &Zone, dsd_mode: &str) -> &'static str {
                 tune_core::outputs::capacite_dsd_natif::transport_reel(zone_id, sortie)
             })
             .is_some();
-    if reel { "last_dsd_track" } else { "output_capability" }
+    if reel {
+        "last_dsd_track"
+    } else {
+        "output_capability"
+    }
 }
 
 pub(super) async fn sync_status(State(state): State<AppState>) -> Json<Value> {
@@ -1083,7 +1090,10 @@ mod transport_reel_9170 {
             (json!("natif_servi_en_dop"), json!("sortie_non_asio")),
             "témoin : sans lecture relevée, la capacité parle"
         );
-        assert_eq!(portee_du_transport_dsd(&zone, "native"), "output_capability");
+        assert_eq!(
+            portee_du_transport_dsd(&zone, "native"),
+            "output_capability"
+        );
         capacite_dsd_natif::noter_transport_reel(
             zone.id.unwrap(),
             zone.output_device_id.as_deref().unwrap(),
