@@ -83,6 +83,30 @@ pub(super) fn sonder_le_pcm(pcm: &str, voies: u16) -> SondeDuPcm {
     }))
 }
 
+/// #9170 — pourquoi la sortie n'ouvre pas (ou pas maintenant) un PCM `hw:`.
+#[derive(Debug)]
+enum SansPcmMateriel {
+    /// L'hôte audio n'est pas ALSA : structurel, aucun bras natif possible.
+    HoteNonAlsa(String),
+    /// Le nom a résolu vers un PCM logiciel (`plughw:`, `default`, PipeWire…).
+    /// Observation de l'instant, pas une réponse du pilote : un `hw:` tenu
+    /// ou pas encore énuméré peut laisser le nom résoudre ailleurs.
+    PcmLogiciel(String),
+    /// Périphérique introuvable, ou repli sur le périphérique par défaut :
+    /// DAC débranché, éteint, pas encore énuméré. Ne dit RIEN du DAC.
+    Introuvable(&'static str),
+}
+
+impl std::fmt::Display for SansPcmMateriel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::HoteNonAlsa(h) => write!(f, "hôte {h}, pas ALSA"),
+            Self::PcmLogiciel(id) => write!(f, "PCM « {id} » : pas un accès direct hw:"),
+            Self::Introuvable(r) => f.write_str(r),
+        }
+    }
+}
+
 /// Le PCM ALSA matériel (`hw:`) qu'ouvrirait la sortie, sans repli.
 /// `Err` dit pourquoi il n'y en a pas.
 fn pcm_materiel(
@@ -90,23 +114,25 @@ fn pcm_materiel(
     endpoint_id: Option<&str>,
     origin_host: Option<&str>,
     audio_backend: &str,
-) -> Result<(cpal::Device, String), String> {
+) -> Result<(cpal::Device, String), SansPcmMateriel> {
     let host = select_host(audio_backend);
     let host_id_name: &'static str = host.id().name();
     if !host_id_name.eq_ignore_ascii_case("alsa") {
-        return Err(format!("hôte {host_id_name}, pas ALSA"));
+        return Err(SansPcmMateriel::HoteNonAlsa(host_id_name.to_string()));
     }
     let Some((device, fell_back)) =
         find_device_with_fallback(&host, device_name, endpoint_id, origin_host)
     else {
-        return Err("périphérique introuvable".to_string());
+        return Err(SansPcmMateriel::Introuvable("périphérique introuvable"));
     };
     if fell_back {
-        return Err("repli sur le périphérique par défaut".to_string());
+        return Err(SansPcmMateriel::Introuvable(
+            "repli sur le périphérique par défaut",
+        ));
     }
     let id = device.id().map(|id| id.to_string()).unwrap_or_default();
     if !alsa_pcm_is_direct_hardware(&id) {
-        return Err(format!("PCM « {id} » : pas un accès direct hw:"));
+        return Err(SansPcmMateriel::PcmLogiciel(id));
     }
     let pcm = crate::outputs::pseudo_peripherique_alsa::pcm_alsa(&id).to_string();
     Ok((device, pcm))
@@ -125,7 +151,11 @@ pub(super) fn sonder_la_sortie(
         Ok((_, pcm)) => pcm,
         Err(raison) => {
             debug!(device = %device_name, raison = %raison, "alsa_dsd_natif_pas_de_pcm_materiel");
-            return ResultatSondeDsdAlsa::PasUnPcmMateriel;
+            return match raison {
+                SansPcmMateriel::HoteNonAlsa(_) => ResultatSondeDsdAlsa::PasUnPcmMateriel,
+                SansPcmMateriel::PcmLogiciel(_) => ResultatSondeDsdAlsa::PcmLogiciel,
+                SansPcmMateriel::Introuvable(_) => ResultatSondeDsdAlsa::Introuvable,
+            };
         }
     };
     match sonder_le_pcm(&pcm, voies) {
@@ -270,8 +300,10 @@ pub(super) fn jouer_dsd_natif_via_alsa(entrees: EntreesDsdNatifAlsa) {
             return;
         }
     };
-    let ordre = match sonder_le_pcm(&pcm, entete.canaux) {
-        SondeDuPcm::Repond(Some(c)) if c.cadences.contains(&entete.cadence) => c.ordre,
+    let (ordre, cadences_sondees) = match sonder_le_pcm(&pcm, entete.canaux) {
+        SondeDuPcm::Repond(Some(c)) if c.cadences.contains(&entete.cadence) => {
+            (c.ordre, c.cadences)
+        }
         autre => {
             if !matches!(autre, SondeDuPcm::Occupe | SondeDuPcm::Erreur(_)) {
                 crate::outputs::capacite_dsd_natif::oublier_cadence(&device_name, entete.cadence);
@@ -377,6 +409,13 @@ pub(super) fn jouer_dsd_natif_via_alsa(entrees: EntreesDsdNatifAlsa) {
         "local_audio_alsa_dsd_natif_playing"
     );
     note_opened_device("ALSA", &device_name, &pcm, Some(pcm.as_str()));
+    // #9170 — le DSD natif part pour de vrai : la capacité retenue le dit,
+    // quel que soit le verdict d'un sondage antérieur (et donc le texte des
+    // réglages aussi). Sondé sur les voies du fichier : un stéréo, le cas
+    // des DAC USB, est la valeur que l'orchestrateur consulte.
+    if entete.canaux == crate::outputs::local::VOIES_SONDEES_DSD_ALSA {
+        crate::outputs::capacite_dsd_natif::confirmer_natif_alsa(&device_name, cadences_sondees);
+    }
 
     // ── Alimentation : DsdU8 → mots DSD_U32 → anneau. ──
     let mut mots: Vec<u8> = Vec::new();

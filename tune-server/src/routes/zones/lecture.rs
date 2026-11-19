@@ -8,16 +8,28 @@ use super::*;
 /// Une capacité déclarée ne garantit pas toutes les cadences de toutes les
 /// pistes : les contraintes de piste/zone restent décidées par la résolution.
 fn diagnostic_transport_dsd(zone: &Zone, dsd_mode: &str) -> (Value, Value) {
-    use tune_core::outputs::capacite_dsd_natif::{self, CapaciteConnue};
+    use tune_core::outputs::capacite_dsd_natif::{self, CapaciteConnue, TransportReelDsd};
     let nom_local = zone
         .output_device_id
         .as_deref()
         .and_then(|id| id.strip_prefix("local:"));
     let is_network = tune_core::orchestrator::is_network_output_type(zone.output_type.as_deref());
     if let Some(nom) = nom_local.filter(|_| dsd_mode == "native") {
+        // #9170 — une piste DSD a déjà joué sur cette sortie : le texte dit ce
+        // qui est RÉELLEMENT parti (natif, ou converti en PCM — un DSD512
+        // sous un plafond de 768 kHz ne passe pas en DoP), pas seulement ce
+        // que la capacité retenue laisserait attendre.
+        let reel = zone.id.zip(zone.output_device_id.as_deref()).and_then(
+            |(zone_id, sortie)| capacite_dsd_natif::transport_reel(zone_id, sortie),
+        );
+        match reel {
+            Some(TransportReelDsd::Natif) => return (json!("natif"), Value::Null),
+            Some(TransportReelDsd::Pcm) => return (json!("pcm"), json!("converti_en_pcm")),
+            Some(TransportReelDsd::Dop) | None => {}
+        }
         // Un seul instantané pour le transport et son motif : un sondage
         // concurrent ne peut pas produire deux réponses contradictoires.
-        return match capacite_dsd_natif::connue(nom) {
+        let selon_la_capacite = match capacite_dsd_natif::connue(nom) {
             None => (Value::Null, json!("capacite_non_sondee")),
             Some(CapaciteConnue::SortieNonAsio) => {
                 (json!("natif_servi_en_dop"), json!("sortie_non_asio"))
@@ -32,6 +44,13 @@ fn diagnostic_transport_dsd(zone: &Zone, dsd_mode: &str) -> (Value, Value) {
                 (json!("natif"), Value::Null)
             }
         };
+        // #9170 — la dernière piste est partie en DoP : jamais « natif », ni
+        // « à déterminer » ; le motif de la capacité s'il en donne un.
+        if reel == Some(TransportReelDsd::Dop) && selon_la_capacite.0 != json!("natif_servi_en_dop")
+        {
+            return (json!("natif_servi_en_dop"), Value::Null);
+        }
+        return selon_la_capacite;
     }
     (
         json!(
@@ -1008,6 +1027,92 @@ mod asio_7372 {
                 "GET ne doit pas sonder ni altérer le pilote"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod transport_reel_9170 {
+    use super::*;
+    use tune_core::outputs::capacite_dsd_natif::{self, CapaciteConnue, TransportReelDsd};
+
+    /// `id_unique` : la table des transports réels est globale au processus
+    /// et les tests tournent en parallèle sur des bases `:memory:` qui
+    /// numérotent toutes leur première zone 1.
+    fn zone_native(state: &AppState, nom: &str, id_unique: i64) -> Zone {
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        let id = repo
+            .create(nom, Some("local"), Some(&format!("local:{nom}")))
+            .unwrap();
+        repo.update_dsd_mode(id, "native").unwrap();
+        let mut zone = repo.get(id).unwrap().unwrap();
+        zone.id = Some(id_unique);
+        zone
+    }
+
+    /// Le cas du fil 2951 : « pas de DSD natif » retenu, mais la dernière
+    /// piste DSD est partie en natif — l'écran dit « natif », plus « DoP ».
+    #[tokio::test]
+    async fn une_lecture_native_l_emporte_sur_un_verdict_perime() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let nom = "9170-eversolo-natif";
+        let zone = zone_native(&state, nom, -917_001);
+        capacite_dsd_natif::retenir(nom, CapaciteConnue::SortieNonAsio);
+        assert_eq!(
+            diagnostic_transport_dsd(&zone, "native"),
+            (json!("natif_servi_en_dop"), json!("sortie_non_asio")),
+            "témoin : sans lecture relevée, la capacité parle"
+        );
+        capacite_dsd_natif::noter_transport_reel(
+            zone.id.unwrap(),
+            zone.output_device_id.as_deref().unwrap(),
+            TransportReelDsd::Natif,
+        );
+        assert_eq!(
+            diagnostic_transport_dsd(&zone, "native"),
+            (json!("natif"), Value::Null)
+        );
+    }
+
+    /// Un DSD512 converti en PCM (DoP hors plafond) n'est pas annoncé « DoP ».
+    #[tokio::test]
+    async fn une_conversion_pcm_n_est_pas_annoncee_en_dop() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let nom = "9170-eversolo-pcm";
+        let zone = zone_native(&state, nom, -917_002);
+        capacite_dsd_natif::retenir(nom, CapaciteConnue::SortieNonAsio);
+        capacite_dsd_natif::noter_transport_reel(
+            zone.id.unwrap(),
+            zone.output_device_id.as_deref().unwrap(),
+            TransportReelDsd::Pcm,
+        );
+        assert_eq!(
+            diagnostic_transport_dsd(&zone, "native"),
+            (json!("pcm"), json!("converti_en_pcm"))
+        );
+    }
+
+    /// Une piste partie en DoP sur une sortie natif-capable (cadence non
+    /// déclarée) : pas « natif ».
+    #[tokio::test]
+    async fn un_dop_reel_n_est_pas_annonce_natif() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let nom = "9170-dop-reel";
+        let zone = zone_native(&state, nom, -917_003);
+        capacite_dsd_natif::retenir(
+            nom,
+            CapaciteConnue::AlsaDsdU32 {
+                cadences: vec![2_822_400],
+            },
+        );
+        capacite_dsd_natif::noter_transport_reel(
+            zone.id.unwrap(),
+            zone.output_device_id.as_deref().unwrap(),
+            TransportReelDsd::Dop,
+        );
+        assert_eq!(
+            diagnostic_transport_dsd(&zone, "native"),
+            (json!("natif_servi_en_dop"), Value::Null)
+        );
     }
 }
 
