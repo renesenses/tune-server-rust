@@ -821,31 +821,71 @@ impl AppState {
     }
 
     /// #9140 — retient, pour le nettoyage de ce qui sort, les noms des
-    /// appareils découverts (SSDP, mDNS) et des zones : ils partent sous un
-    /// jeton stable (`[appareil 3]`, `[zone 2]`). Appelé par chaque porte de
-    /// sortie juste avant de nettoyer. Le nom annoncé ne compte pas quand il
-    /// n'est que le modèle ou le fabricant (« Sonos One ») : c'est du diagnostic.
+    /// appareils et serveurs multimédia découverts, des zones (masquées
+    /// comprises), des profils et le nom annoncé de ce serveur : ils partent
+    /// sous un jeton stable (`[appareil 3]`, `[zone 2]`, `[profil 1]`). La
+    /// découverte retient déjà chaque appareil à son arrivée (un appareil
+    /// perdu depuis reste couvert) ; chaque porte de sortie appelle ceci juste
+    /// avant de nettoyer. Un nom qui n'est que le matériel (« Marantz
+    /// NR1711 ») ne compte pas : c'est du diagnostic.
     pub async fn retenir_noms_d_appareils(&self) {
-        use tune_core::confidentialite::{Sorte, retenir_nom_d_appareil};
+        use tune_core::confidentialite::{Sorte, materiel, retenir_nom_d_appareil};
         let mut appareils = self.scanner.devices().await;
         let mdns = { self.mdns_scanner.lock().ok().and_then(|g| g.clone()) };
         if let Some(mdns) = mdns {
             appareils.extend(mdns.devices().await);
         }
+        // Le balayage ET le registre que le rapport lit (`media_servers`) :
+        // un serveur ajouté à la main ou retiré du balayage y reste.
+        let mut serveurs = self.scanner.media_servers().await;
+        serveurs.extend(self.media_servers.lock().await.values().cloned());
+        let materiels: Vec<String> = appareils
+            .iter()
+            .map(|d| materiel(d.manufacturer.as_deref(), d.model.as_deref()))
+            .chain(
+                serveurs
+                    .iter()
+                    .map(|m| materiel(Some(&m.manufacturer), Some(&m.model))),
+            )
+            .filter(|m| !m.is_empty())
+            .collect();
         for d in &appareils {
-            let generique = [d.model.as_deref(), d.manufacturer.as_deref()]
-                .into_iter()
-                .flatten()
-                .any(|m| m.trim().eq_ignore_ascii_case(d.name.trim()));
-            if !generique {
-                retenir_nom_d_appareil(Sorte::Appareil, &d.name);
-            }
+            let propre = [materiel(d.manufacturer.as_deref(), d.model.as_deref())];
+            retenir_nom_d_appareil(Sorte::Appareil, &d.name, &propre);
         }
-        for z in tune_core::db::zone_repo::ZoneRepo::with_backend(self.backend.clone())
+        for m in &serveurs {
+            let propre = [materiel(Some(&m.manufacturer), Some(&m.model))];
+            retenir_nom_d_appareil(Sorte::Appareil, &m.name, &propre);
+        }
+        retenir_nom_d_appareil(
+            Sorte::Appareil,
+            &crate::discovery_setup::nom_annonce_du_serveur(self),
+            &[],
+        );
+        let zones = tune_core::db::zone_repo::ZoneRepo::with_backend(self.backend.clone());
+        let noms_de_zones = zones
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|z| z.name)
+            .chain(
+                zones
+                    .zones_masquees()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|z| z.name),
+            );
+        for nom in noms_de_zones {
+            retenir_nom_d_appareil(Sorte::Zone, &nom, &materiels);
+        }
+        for p in tune_core::db::profile_repo::ProfileRepo::with_backend(self.backend.clone())
             .list()
             .unwrap_or_default()
         {
-            retenir_nom_d_appareil(Sorte::Zone, &z.name);
+            retenir_nom_d_appareil(Sorte::Profil, &p.name, &[]);
+            if let Some(affiche) = p.display_name.as_deref() {
+                retenir_nom_d_appareil(Sorte::Profil, affiche, &[]);
+            }
         }
     }
 

@@ -53,6 +53,9 @@ const FUITES: &[&str] = &[
     "UAT-SECRET-5124",
     "0f1e2d3c4b5a5124",
     "3C:4D:5E",
+    // #9140 — noms d'appareils et de zones.
+    "Philibert5124",
+    "Rosalinde5124",
 ];
 
 /// Ce qui DOIT rester : le diagnostic. Une sortie vide passerait sinon
@@ -64,6 +67,8 @@ const UTILES_RAPPORT: &[&str] = &[
     "~/Musique",
     "tidal_token_exchange_success",
     "00:1A:2B",
+    "[zone ",
+    "[appareil ",
 ];
 
 /// Le journal du testeur, au format `tracing` que le serveur écrit.
@@ -73,6 +78,9 @@ const JOURNAL: &str = concat!(
     "2026-09-26T10:00:02.000Z  WARN tune_core::http: GET https://www.qobuz.com/api.json/0.2/file?user_auth_token=UAT-SECRET-5124&format_id=27\n",
     "2026-09-26T10:00:03.000Z  INFO tune_core::scanner: scan_dir path=/Users/jdupont5124/Musique/Album\n",
     "2026-09-26T10:00:04.000Z  INFO tune_core::discovery: renderer mac=00:1A:2B:3C:4D:5E\n",
+    // #9140 — un nom de zone retenu, et un appareil que la découverte n'a pas vu.
+    "2026-09-26T10:00:05.000Z  INFO tune_core::outputs::dlna: zone Mansarde de Philibert5124 volume=0.5\n",
+    "2026-09-26T10:00:06.000Z  INFO tune_core::outputs::airplay: Rosalinde5124’s iPhone host=192.168.1.31\n",
 );
 
 #[derive(Default)]
@@ -129,6 +137,10 @@ async fn etat(base: &str) -> AppState {
         .unwrap();
     settings
         .set("music_dirs", r#"["/Users/jdupont5124/Musique"]"#)
+        .unwrap();
+    // #9140 — une zone au nom personnel.
+    tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .create("Mansarde de Philibert5124", Some("dlna"), Some("uuid:mansarde-5124"))
         .unwrap();
     state.media_servers.lock().await.insert(
         "uuid:minim".into(),

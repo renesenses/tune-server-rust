@@ -1553,6 +1553,9 @@ async fn enregistrer_l_appareil(
             st.miss_count.remove(&dev_id);
             st.devices.insert(dev_id.clone(), device.clone());
             drop(st);
+            // #9140 — retenu dès la découverte : un appareil perdu avant le rapport
+            // reste masqué dans les lignes de journal qui le nomment.
+            crate::discovery::device::retenir_pour_la_confidentialite(&device);
 
             info!(id = %dev_id, name = %device.name, "ssdp_device_discovered");
             let _ = event_tx
@@ -1604,6 +1607,9 @@ async fn enregistrer_l_appareil(
                     st.miss_count.remove(&dev_id);
                     st.devices.insert(dev_id.clone(), device.clone());
                     drop(st);
+                    // #9140 — retenu dès la découverte : un appareil perdu avant le rapport
+                    // reste masqué dans les lignes de journal qui le nomment.
+                    crate::discovery::device::retenir_pour_la_confidentialite(&device);
 
                     info!(id = %dev_id, name = %probe.name, "ssdp_minimal_dmr_discovered");
                     let _ = event_tx
@@ -1761,6 +1767,13 @@ async fn inscrire_le_serveur_multimedia(
         // Le registre de fraîcheur, sans lequel rien n'expire (#2139).
         st.media_servers.insert(dev_id.to_string(), ms.clone());
     }
+    // #9140 — le nom d'un serveur multimédia (« Serveur Plex de … ») est
+    // retenu pour le nettoyage de ce qui sort.
+    crate::confidentialite::retenir_nom_d_appareil(
+        crate::confidentialite::Sorte::Appareil,
+        &ms.name,
+        &[crate::confidentialite::materiel(Some(&ms.manufacturer), Some(&ms.model))],
+    );
     info!(
         id = %dev_id,
         name = %ms.name,

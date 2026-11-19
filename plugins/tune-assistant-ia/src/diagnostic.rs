@@ -202,8 +202,11 @@ pub fn preparer(brut: &ContexteBrut, question: &str, langue: &str) -> Prepare {
         "journal": journal,
     });
     // `anonymiser` d'abord (jetons, clés, utilisateur, chemins personnels),
-    // puis la passe stricte.
-    tune_core::confidentialite::anonymiser_json(&mut contexte);
+    // puis la passe stricte. #9140 — SANS la passe des noms d'appareils et de
+    // zones du forum : ici, c'est la pseudonymisation de l'assistant qui les
+    // remplace (`<zone-1>`), et les rétablit à l'écran. Avec elle, le modèle
+    // recevait `[zone 2]` dès qu'un rapport ou un export avait eu lieu.
+    tune_core::confidentialite::anonymiser_json_garder_appareils(&mut contexte);
     passer_json(&mut contexte, &mut p);
     Prepare {
         systeme: consigne(langue),
@@ -446,6 +449,47 @@ mod tests {
         assert!(zone.get("current_track").is_none(), "{zone}");
         assert_eq!(chemin["chemin_statique"]["output_type"], "dlna");
         assert!(chemin["chemin_du_signal"].is_null());
+    }
+
+    /// #9140 — après un rapport ou un export (noms retenus par le forum),
+    /// l'assistant voit toujours les vrais noms, sous SES pseudonymes, et les
+    /// rétablit à l'écran ; le forum, lui, reçoit le jeton.
+    #[test]
+    fn apres_un_export_l_assistant_pseudonymise_les_vrais_noms() {
+        use tune_core::confidentialite::{Sorte, anonymiser, retenir_nom_d_appareil};
+        retenir_nom_d_appareil(Sorte::Zone, "Véranda de Quirinal9140", &[]);
+        retenir_nom_d_appareil(Sorte::Appareil, "Ampli Quirinal9140", &[]);
+        let ligne = "WARN dlna: Ampli Quirinal9140 injoignable (zone Véranda de Quirinal9140)";
+        let forum = anonymiser(ligne);
+        assert!(
+            forum.contains("[appareil") && forum.contains("[zone") && !forum.contains("Quirinal"),
+            "{forum}"
+        );
+        let mut noms = BTreeMap::new();
+        noms.insert("zone".to_string(), vec!["Véranda de Quirinal9140".to_string()]);
+        noms.insert("appareil".to_string(), vec!["Ampli Quirinal9140".to_string()]);
+        let brut = ContexteBrut {
+            zone: Some(json!({"name": "Véranda de Quirinal9140", "state": "stopped", "output_type": "dlna"})),
+            journal: vec![ligne.to_string()],
+            systeme: json!({"version": "1.0.0"}),
+            noms,
+        };
+        let p = preparer(&brut, "Pourquoi ?", "fr");
+        assert!(!p.message.contains("Quirinal"), "{}", p.message);
+        assert!(
+            !p.message.contains("[zone") && !p.message.contains("[appareil"),
+            "le jeton du forum est parti chez le fournisseur : {}",
+            p.message
+        );
+        assert!(
+            p.message.contains("<zone-1>") && p.message.contains("<appareil-1>"),
+            "{}",
+            p.message
+        );
+        assert_eq!(
+            p.pseudonymes.retablir("<appareil-1> dans <zone-1>"),
+            "Ampli Quirinal9140 dans Véranda de Quirinal9140"
+        );
     }
 
     #[test]

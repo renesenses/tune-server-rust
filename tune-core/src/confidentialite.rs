@@ -36,11 +36,12 @@
 //!   lettres les identifiants propres à CE serveur, retenus par
 //!   [`retenir_identifiants_du_serveur`].
 //!
-//! - les noms d'appareils et de zones (#9140) : chaque nom retenu par
-//!   [`retenir_nom_d_appareil`] (appareils découverts, zones) devient un jeton
-//!   stable, `[appareil 3]`, `[zone 2]` ; en filet, les noms personnels
-//!   reconnus à leur forme (« X’s MacBook », « iPhone de X », « Xs-MacBook-Pro »)
-//!   aussi. Voir le module `appareils`.
+//! - les noms d'appareils, de zones et de profils (#9140) : chaque nom retenu
+//!   par [`retenir_nom_d_appareil`] (appareils et serveurs découverts depuis
+//!   le démarrage, zones, profils, nom annoncé du serveur) devient un jeton
+//!   stable, `[appareil 3]`, `[zone 2]`, `[profil 1]` ; en filet, les noms
+//!   personnels reconnus à leur forme (« X’s MacBook », « iPhone de X »,
+//!   « Xs-MacBook-Pro ») aussi. Voir le module `appareils`.
 //!
 //! Ce qui reste, parce que c'est le diagnostic : versions, OS, modèles, type de
 //! serveur, adresses IP du réseau local, ports, compteurs.
@@ -54,7 +55,7 @@ use regex::{Captures, Regex};
 use serde_json::Value;
 
 mod appareils;
-pub use appareils::{NomsDAppareils, Sorte};
+pub use appareils::{NUMEROTES_MAX, Registre, Seance, Sorte, est_nom_de_materiel};
 
 pub use crate::secrets::MASQUE;
 
@@ -198,14 +199,25 @@ pub fn retenir_identifiants_du_serveur(settings: &crate::db::settings_repo::Sett
     }
 }
 
-/// Retient le nom d'un appareil ou d'une zone : il sortira sous un jeton
-/// stable (`[appareil 3]`, `[zone 2]`) de tout ce que nettoie [`anonymiser`].
-/// Appelé par chaque porte de sortie juste avant de nettoyer, avec la liste
-/// que le serveur connaît à ce moment (#9140).
-pub fn retenir_nom_d_appareil(sorte: Sorte, nom: &str) {
-    if let Ok(mut noms) = appareils::NOMS.write() {
-        noms.retenir(sorte, nom);
-    }
+/// Retient le nom d'un appareil, d'une zone ou d'un profil : il sortira sous
+/// un jeton stable (`[appareil 3]`, `[zone 2]`) de tout ce que nettoie
+/// [`anonymiser`] (#9140). Appelé par la découverte à chaque appareil vu, et
+/// par chaque porte de sortie juste avant de nettoyer. `materiels` : les
+/// « fabricant modèle » connus — un nom qui n'est que le matériel
+/// (« Marantz NR1711 ») n'est pas retenu, c'est du diagnostic.
+pub fn retenir_nom_d_appareil(sorte: Sorte, nom: &str, materiels: &[String]) {
+    appareils::retenir(sorte, nom, materiels);
+}
+
+/// Le « fabricant modèle » d'un appareil, pour [`retenir_nom_d_appareil`].
+pub fn materiel(fabricant: Option<&str>, modele: Option<&str>) -> String {
+    [fabricant, modele]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn identifiants_prives() -> Vec<String> {
@@ -431,25 +443,23 @@ pub fn anonymiser(texte: &str) -> String {
 /// [`anonymiser`], le nom d'utilisateur local donné explicitement — pour les
 /// épreuves, qui ne doivent pas dépendre du compte qui les exécute.
 pub fn anonymiser_avec(texte: &str, utilisateur: Option<&str>) -> String {
-    match appareils::NOMS.write() {
-        Ok(mut noms) => nettoyer(texte, utilisateur, &identifiants_prives(), Some(&mut *noms)),
-        // Liste empoisonnée : le filet par motifs tourne quand même.
-        Err(_) => nettoyer(
-            texte,
-            utilisateur,
-            &identifiants_prives(),
-            Some(&mut NomsDAppareils::new()),
-        ),
-    }
+    nettoyer(
+        texte,
+        utilisateur,
+        &identifiants_prives(),
+        Some(&mut appareils::seance()),
+    )
 }
 
-/// [`anonymiser`] sans la passe des noms d'appareils : pour l'assistant IA
-/// seulement, qui pseudonymise lui-même ces noms (`<appareil-1>`) et les
-/// rétablit à l'écran. Rien de ce qui part sur le forum n'y passe.
+/// [`anonymiser_json`] SANS la passe des noms d'appareils, de zones et de
+/// profils : pour l'assistant IA seulement, qui pseudonymise lui-même ces
+/// noms (`<appareil-1>`) et les rétablit à l'écran. Rien de ce qui part sur
+/// le forum n'y passe (le résumé joint à un rapport repasse par
+/// [`anonymiser`]).
 pub fn anonymiser_json_garder_appareils(valeur: &mut Value) {
-    parcourir_json(valeur, &|s| {
-        nettoyer(s, utilisateur_local(), &identifiants_prives(), None)
-    });
+    let utilisateur = utilisateur_local();
+    let prives = identifiants_prives();
+    parcourir_json(valeur, &mut |s| nettoyer(s, utilisateur, &prives, None));
 }
 
 /// Masque ce qui ouvre ou désigne l'accès distant à ce serveur, et RIEN
@@ -526,7 +536,7 @@ fn nettoyer(
     texte: &str,
     utilisateur: Option<&str>,
     prives: &[String],
-    appareils: Option<&mut NomsDAppareils>,
+    appareils: Option<&mut Seance>,
 ) -> String {
     let t = acces_distant(texte, prives);
     // Les noms d'appareils AVANT les MAC et le nom d'utilisateur : un nom
@@ -594,20 +604,31 @@ pub fn anonymiser_json(valeur: &mut Value) {
 }
 
 /// [`anonymiser_json`], le nom d'utilisateur local donné explicitement.
+///
+/// Tout le document est UNE séance (#9140) : un nom d'appareil trouvé par le
+/// filet garde le même jeton d'un champ à l'autre.
 pub fn anonymiser_json_avec(valeur: &mut Value, utilisateur: Option<&str>) {
-    parcourir_json(valeur, &|s| anonymiser_avec(s, utilisateur));
+    let prives = identifiants_prives();
+    let mut seance = appareils::seance();
+    parcourir_json(valeur, &mut |s| {
+        nettoyer(s, utilisateur, &prives, Some(&mut seance))
+    });
 }
 
-fn parcourir_json(valeur: &mut Value, nettoie: &dyn Fn(&str) -> String) {
+fn parcourir_json(valeur: &mut Value, nettoie: &mut dyn FnMut(&str) -> String) {
     match valeur {
         Value::String(s) => *s = nettoie(s),
-        Value::Array(items) => items.iter_mut().for_each(|v| parcourir_json(v, nettoie)),
+        Value::Array(items) => {
+            for v in items.iter_mut() {
+                parcourir_json(v, &mut *nettoie);
+            }
+        }
         Value::Object(carte) => {
             for (cle, v) in carte.iter_mut() {
                 if est_personnel(cle) && matches!(v, Value::String(_) | Value::Number(_)) {
                     *v = Value::String(MASQUE.to_string());
                 } else {
-                    parcourir_json(v, nettoie);
+                    parcourir_json(v, &mut *nettoie);
                 }
             }
         }
@@ -948,7 +969,7 @@ mod tests {
             &journal_d_acces_distant(),
             None,
             &[],
-            Some(&mut NomsDAppareils::new()),
+            Some(&mut Seance::vide()),
         );
         for fuite in [
             SID,
@@ -975,7 +996,7 @@ mod tests {
             assert!(sortie.contains(garde), "« {garde} » a disparu :\n{sortie}");
         }
         assert_eq!(
-            nettoyer(&sortie, None, &[], Some(&mut NomsDAppareils::new())),
+            nettoyer(&sortie, None, &[], Some(&mut Seance::vide())),
             sortie,
             "non idempotent"
         );
@@ -995,14 +1016,14 @@ mod tests {
             &texte,
             None,
             &[SID.to_string(), JETON.to_string()],
-            Some(&mut NomsDAppareils::new()),
+            Some(&mut Seance::vide()),
         );
         assert!(!sortie.to_lowercase().contains(SID), "{sortie}");
         assert!(!sortie.contains(JETON), "{sortie}");
         assert!(sortie.contains(zone), "la zone a disparu : {sortie}");
         // Sans l'identifiant retenu, un UUID v4 nu reste : c'est le registre
         // qui le masque, pas une expression.
-        let sans = nettoyer(&texte, None, &[], Some(&mut NomsDAppareils::new()));
+        let sans = nettoyer(&texte, None, &[], Some(&mut Seance::vide()));
         assert!(sans.to_lowercase().contains(SID), "{sans}");
     }
 
@@ -1055,8 +1076,8 @@ mod tests {
     /// ceux du filet sortent sous un jeton, le même partout dans le document.
     #[test]
     fn noms_d_appareils_masques_dans_le_rapport() {
-        retenir_nom_d_appareil(Sorte::Appareil, "Ysaline’s HomePod Synth9140");
-        retenir_nom_d_appareil(Sorte::Zone, "Grenier de Wenceslas9140");
+        retenir_nom_d_appareil(Sorte::Appareil, "Ysaline’s HomePod Synth9140", &[]);
+        retenir_nom_d_appareil(Sorte::Zone, "Grenier de Wenceslas9140", &[]);
         let mut rapport = json!({
             "zones": {"items": [{"name": "Grenier de Wenceslas9140", "output_type": "airplay"}]},
             "logs": "INFO raop: Ysaline's HomePod Synth9140 volume=0.5\n\
@@ -1094,9 +1115,26 @@ mod tests {
         let md = rapport["markdown"].as_str().unwrap();
         assert!(md.contains(&format!("- {zone} (airplay)")), "{md}");
         assert!(logs.contains(&format!("zone {zone} prête")), "{logs}");
+        // Le nom trouvé par le filet garde son jeton d'un champ à l'autre.
+        let jeton_macbook = logs
+            .split(" host=192.168.1.20")
+            .next()
+            .unwrap()
+            .rsplit("raop: ")
+            .next()
+            .unwrap();
+        assert!(jeton_macbook.starts_with("[appareil "), "{logs}");
+        assert!(md.ends_with(&format!("- {jeton_macbook}")), "{md}");
         // Idempotent.
         let mut encore = rapport.clone();
         anonymiser_json_avec(&mut encore, None);
         assert_eq!(encore, rapport);
+        // La variante de l'assistant garde les noms (il les pseudonymise
+        // lui-même), mais nettoie le reste.
+        let mut assistant = json!({"logs": "INFO zone Grenier de Wenceslas9140 prête token=abcdef0123456789"});
+        anonymiser_json_garder_appareils(&mut assistant);
+        let logs = assistant["logs"].as_str().unwrap();
+        assert!(logs.contains("Grenier de Wenceslas9140"), "{logs}");
+        assert!(!logs.contains("abcdef0123456789"), "{logs}");
     }
 }
