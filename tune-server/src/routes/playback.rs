@@ -7493,6 +7493,19 @@ pub(crate) async fn do_transfer(
     target_zone: i64,
     stop_source: bool,
 ) -> axum::response::Response {
+    do_transfer_decale(state, from_zone, target_zone, stop_source, 0).await
+}
+
+/// [`do_transfer`], la cible reprenant `decalage_ms` en arrière (positif) ou en
+/// avant (négatif) de la position de la source : la jonction d'une suiveuse
+/// de groupe qui porte un décalage manuel (#9089, fil 2757).
+pub(crate) async fn do_transfer_decale(
+    state: &AppState,
+    from_zone: i64,
+    target_zone: i64,
+    stop_source: bool,
+    decalage_ms: i64,
+) -> axum::response::Response {
     let current = state.playback.get_state(from_zone).await;
     if current.now_playing.is_none() {
         return (
@@ -7597,6 +7610,16 @@ pub(crate) async fn do_transfer(
     let source_paused = current.state == tune_core::playback::PlayState::Paused;
 
     let np = current.now_playing.unwrap();
+    // #9089 — la suiveuse décalée rejoint sa meneuse à sa propre position.
+    let source_position_ms = if decalage_ms == 0 {
+        source_position_ms
+    } else {
+        tune_core::zones::decalage_de_groupe_9089::position_de_la_suiveuse(
+            source_position_ms,
+            decalage_ms,
+            np.duration_ms,
+        )
+    };
     let target_db_zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
         .get(target_zone)
         .ok()
