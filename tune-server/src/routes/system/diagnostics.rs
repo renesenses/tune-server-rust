@@ -1818,7 +1818,9 @@ fn selectionner_lignes(
 #[cfg(feature = "assistant-ia")]
 pub(crate) async fn journal_pour_assistant(max_lines: usize) -> Vec<String> {
     let Json(mut journaux) = collect_recent_logs(max_lines).await;
-    tune_core::confidentialite::anonymiser_json(&mut journaux);
+    // #9140 — sans la passe des noms d'appareils : le greffon les pseudonymise
+    // lui-même et les rétablit à l'écran.
+    tune_core::confidentialite::anonymiser_json_garder_appareils(&mut journaux);
     journaux["logs"]
         .as_str()
         .unwrap_or("")
@@ -1827,9 +1829,11 @@ pub(crate) async fn journal_pour_assistant(max_lines: usize) -> Vec<String> {
         .collect()
 }
 
-pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
+pub(super) async fn logs(State(state): State<AppState>, Query(q): Query<LogsQuery>) -> Json<Value> {
     // #5124 — « Exporter les journaux » : le fichier finit collé dans un fil.
     // Même nettoyage que le rapport de bogue, par la même fonction.
+    // #9140 — les noms d'appareils et de zones d'abord retenus.
+    state.retenir_noms_d_appareils().await;
     let Json(mut journaux) = collect_recent_logs(q.lines.unwrap_or(1000)).await;
     tune_core::confidentialite::anonymiser_json(&mut journaux);
     Json(journaux)
@@ -2529,6 +2533,8 @@ fn lignes_zones_masquees(
 /// Generate a bug report with comprehensive diagnostic data.
 /// Returns JSON that can also be rendered as markdown by the client.
 pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
+    // #9140 — les noms d'appareils et de zones sortent sous un jeton stable.
+    state.retenir_noms_d_appareils().await;
     tune_core::confidentialite::retenir_identifiants_du_serveur(&SettingsRepo::with_backend(
         state.backend.clone(),
     ));

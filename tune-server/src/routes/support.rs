@@ -99,6 +99,8 @@ async fn create(State(state): State<AppState>, req: Request) -> Response {
     tune_core::confidentialite::retenir_identifiants_du_serveur(&SettingsRepo::with_backend(
         state.backend.clone(),
     ));
+    // #9140 — ni les noms d'appareils et de zones.
+    state.retenir_noms_d_appareils().await;
     let auth = match auth(&state) {
         Ok(a) => a,
         Err(resp) => return resp,
@@ -384,6 +386,8 @@ async fn reply(State(state): State<AppState>, Path(id): Path<i64>, req: Request)
     tune_core::confidentialite::retenir_identifiants_du_serveur(&SettingsRepo::with_backend(
         state.backend.clone(),
     ));
+    // #9140 — ni les noms d'appareils et de zones.
+    state.retenir_noms_d_appareils().await;
     let auth = match auth(&state) {
         Ok(a) => a,
         Err(resp) => return resp,

@@ -820,6 +820,35 @@ impl AppState {
         tune_core::discovery::sendspin::decrire(&scanner.devices().await)
     }
 
+    /// #9140 — retient, pour le nettoyage de ce qui sort, les noms des
+    /// appareils découverts (SSDP, mDNS) et des zones : ils partent sous un
+    /// jeton stable (`[appareil 3]`, `[zone 2]`). Appelé par chaque porte de
+    /// sortie juste avant de nettoyer. Le nom annoncé ne compte pas quand il
+    /// n'est que le modèle ou le fabricant (« Sonos One ») : c'est du diagnostic.
+    pub async fn retenir_noms_d_appareils(&self) {
+        use tune_core::confidentialite::{Sorte, retenir_nom_d_appareil};
+        let mut appareils = self.scanner.devices().await;
+        let mdns = { self.mdns_scanner.lock().ok().and_then(|g| g.clone()) };
+        if let Some(mdns) = mdns {
+            appareils.extend(mdns.devices().await);
+        }
+        for d in &appareils {
+            let generique = [d.model.as_deref(), d.manufacturer.as_deref()]
+                .into_iter()
+                .flatten()
+                .any(|m| m.trim().eq_ignore_ascii_case(d.name.trim()));
+            if !generique {
+                retenir_nom_d_appareil(Sorte::Appareil, &d.name);
+            }
+        }
+        for z in tune_core::db::zone_repo::ZoneRepo::with_backend(self.backend.clone())
+            .list()
+            .unwrap_or_default()
+        {
+            retenir_nom_d_appareil(Sorte::Zone, &z.name);
+        }
+    }
+
     pub async fn discovered_tune_peers(&self) -> Vec<serde_json::Value> {
         use tune_core::discovery::device::OutputType;
         let scanner = { self.mdns_scanner.lock().unwrap().clone() };
