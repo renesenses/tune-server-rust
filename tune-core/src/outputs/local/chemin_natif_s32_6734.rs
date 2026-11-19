@@ -356,6 +356,39 @@ fn le_greffon_arme_fait_ceder_le_chemin_natif_9165() {
     assert!(!greffon_arme_a_la_frontiere(&choix, &pure));
 }
 
+/// #9165 (fil 2945, réponse 11772) — le chemin RÉEL : une sortie locale
+/// reçoit toujours un WAV entier 32 bits (`local_needs_wav` → 32), quelle que
+/// soit la source. Un FLAC 16 ou 24 bits (ou un flux Qobuz) arrive donc en
+/// `Entier32`, mots alignés à gauche, bits bas nuls : le greffon armé doit
+/// faire céder le natif exactement comme pour une vraie source 32 bits.
+#[test]
+fn une_source_16_ou_24_bits_servie_en_wav_32_bits_cede_au_greffon_9165() {
+    use super::super::diagnostic_surechantillonnage_8259::surechantillonneur_voulu;
+    let zone = Zone::au_repos();
+    let s32 = AudioSpec::nouvelle(96_000, ProfondeurPcm::Entier32, 2).unwrap();
+    for bits_source in [16u32, 24] {
+        let decalage = 32 - bits_source;
+        let elargis: Vec<i32> = mots_de_test()
+            .iter()
+            .map(|m| (m >> decalage) << decalage)
+            .collect();
+        assert!(elargis.iter().all(|m| m & ((1 << decalage) - 1) == 0));
+        let amorce = octets_le(&elargis);
+        let conditions = |arme: bool| ConditionsDuNatif {
+            surechantillonnage_voulu: surechantillonneur_voulu(
+                arme, s32, &amorce, false, false, false,
+            ),
+            ..zone.conditions(s32, UNITE_DU_GAIN_DE_RENDU)
+        };
+        assert_eq!(
+            chemin_natif_s32(&conditions(true)),
+            Err(MotifDuCheminPartage::SurechantillonnageDemande),
+            "source {bits_source} bits servie en WAV 32 bits, greffon armé (#9165)"
+        );
+        assert_eq!(chemin_natif_s32(&conditions(false)), Ok(()));
+    }
+}
+
 /// Garde de branchement #9165 : `play_url` passe le choix de la zone aux
 /// conditions du natif, et le bras le relit à la frontière.
 #[test]
