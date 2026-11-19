@@ -29,17 +29,22 @@ use tracing::info;
 use super::{PlayRequest, PlaybackOrchestrator, ResolvedStream};
 
 /// L'identifiant de piste porté par `uri` quand elle désigne l'audio d'une
-/// piste servie par CETTE instance, `None` sinon.
+/// piste servie par CETTE instance, `None` sinon. C'est la SEULE règle
+/// d'hôte : la relecture des métadonnées (#4323, avance sans blanc) et la
+/// lecture en piste locale (#9207) passent toutes deux par elle.
 ///
-/// - schéma `http` ou `https` ;
-/// - port (explicite, ou celui du schéma) = `port_du_serveur` ;
-/// - hôte accepté par `hote_est_le_notre` ;
-/// - chemin `{API_PATH}/library/tracks/<id>/audio`, éventuellement suivi
-///   d'une extension (`/audio.aif`) ; requête et fragment ignorés.
+/// - schéma `http` ou `https`, sans identifiants dans l'URL ;
+/// - port (explicite, ou celui du schéma) = `port_du_serveur` : une autre
+///   instance sur la même machine écoute sur un autre port ;
+/// - chemin exact `{API_PATH}/library/tracks/<id>/audio` (la route que
+///   publie le MediaServer, rien d'autre), requête et fragment ignorés ;
+/// - hôte accepté par `hote_est_le_notre`, consulté en DERNIER : les
+///   interfaces et le nom de la machine ne sont lus que pour une URI déjà
+///   candidate.
 pub(super) fn id_de_piste_de_cette_instance(
     uri: &str,
     port_du_serveur: u16,
-    hote_est_le_notre: impl Fn(&reqwest::Url) -> bool,
+    hote_est_le_notre: impl FnOnce(&reqwest::Url) -> bool,
 ) -> Option<i64> {
     let url = reqwest::Url::parse(uri.trim()).ok()?;
     if !matches!(url.scheme(), "http" | "https") {
@@ -53,35 +58,31 @@ pub(super) fn id_de_piste_de_cette_instance(
     if !url.username().is_empty() || url.password().is_some() {
         return None;
     }
-    if !hote_est_le_notre(&url) {
-        return None;
-    }
-    let reste = url
+    let id = url
         .path()
         .strip_prefix(crate::upnp_server::API_PATH)?
-        .strip_prefix("/library/tracks/")?;
-    let (id, fin) = reste.split_once('/')?;
-    let fin_valide = fin == "audio"
-        || fin
-            .strip_prefix("audio.")
-            .is_some_and(|ext| !ext.is_empty() && ext.chars().all(|c| c.is_ascii_alphanumeric()));
-    if !fin_valide || id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+        .strip_prefix("/library/tracks/")?
+        .strip_suffix("/audio")?;
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    id.parse::<i64>().ok().filter(|id| *id > 0)
+    let id = id.parse::<i64>().ok().filter(|id| *id > 0)?;
+    hote_est_le_notre(&url).then_some(id)
 }
 
 /// L'hôte de `url` désigne-t-il cette machine ?
 ///
 /// Boucle locale, `localhost`, une adresse IPv4 portée par une interface,
 /// l'adresse annoncée par la configuration (`advertised_ip`), ou le NOM de la
-/// machine (`hostname`, `hostname.local`). Aucun appel DNS : un nom inconnu
-/// est refusé, et le refus ne coûte que le flux distant d'avant.
+/// machine (`nom`, `nom.local`, étiquette mDNS). Aucun appel DNS : un nom
+/// inconnu est refusé, et le refus ne coûte que le flux distant d'avant.
+/// Sans nom de machine connu, aucun nom n'est accepté (pas de nom de repli,
+/// que deux instances partageraient).
 pub(super) fn hote_de_cette_instance(
     url: &reqwest::Url,
     adresses_locales: &[std::net::Ipv4Addr],
     ip_annoncee: Option<&str>,
-    nom_de_la_machine: &str,
+    nom_de_la_machine: Option<&str>,
 ) -> bool {
     let Some(hote) = url.host_str() else {
         return false;
@@ -103,31 +104,65 @@ pub(super) fn hote_de_cette_instance(
     if nom == "localhost" {
         return true;
     }
-    let machine = nom_de_la_machine
-        .trim()
-        .trim_end_matches('.')
-        .to_ascii_lowercase();
+    let Some(machine) = nom_de_la_machine
+        .map(|m| m.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|m| !m.is_empty())
+    else {
+        return false;
+    };
     let court = machine.trim_end_matches(".local");
     if court.is_empty() {
         return false;
     }
-    // Le nom tel que l'annonce mDNS le publie (`<étiquette>.local`).
-    let etiquette = crate::discovery::mdns_host_label(&machine).to_ascii_lowercase();
     let sans_local = nom.strip_suffix(".local").unwrap_or(&nom);
-    nom == machine || sans_local == court || sans_local == etiquette
+    if nom == machine || sans_local == court {
+        return true;
+    }
+    // Le nom tel que l'annonce mDNS le publie (`<étiquette>.local`) — sauf
+    // quand l'étiquette n'est que le repli de `mdns_host_label`.
+    let etiquette = crate::discovery::mdns_host_label(&machine).to_ascii_lowercase();
+    let repli = etiquette == "tune-server" && court != "tune-server";
+    !repli && sans_local == etiquette
+}
+
+/// Le nom réel de la machine, sans repli : `HOSTNAME` / `COMPUTERNAME`, puis
+/// `gethostname(2)`. `None` quand aucun n'est lisible.
+fn nom_de_la_machine() -> Option<String> {
+    std::env::var("HOSTNAME")
+        .or_else(|_| std::env::var("COMPUTERNAME"))
+        .ok()
+        .map(|h| h.trim().to_string())
+        .filter(|h| !h.is_empty())
+        .or_else(|| {
+            hostname::get()
+                .ok()
+                .and_then(|s| s.into_string().ok())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
 }
 
 impl PlaybackOrchestrator {
+    /// L'identifiant de piste d'une URI audio de CETTE instance (port du
+    /// serveur, hôte reconnu), que la ligne existe ou non.
+    pub(super) fn id_de_notre_uri(&self, uri: &str) -> Option<i64> {
+        id_de_piste_de_cette_instance(uri, self.streamer.port(), |url| {
+            let adresses = crate::discovery::ssdp::local_ipv4_addresses();
+            let machine = nom_de_la_machine();
+            hote_de_cette_instance(
+                url,
+                &adresses,
+                self.advertised_ip.as_deref(),
+                machine.as_deref(),
+            )
+        })
+    }
+
     /// La piste LOCALE que désigne une URI reçue par le renderer, quand cette
     /// URI est une adresse audio de cette instance et que la ligne existe
     /// sans venir d'un serveur UPnP indexé (dont le fichier n'est pas ici).
     pub(super) fn piste_locale_de_notre_uri(&self, uri: &str) -> Option<i64> {
-        let adresses = crate::discovery::ssdp::local_ipv4_addresses();
-        let machine = crate::discovery::system_hostname();
-        let ip_annoncee = self.advertised_ip.as_deref();
-        let id = id_de_piste_de_cette_instance(uri, self.streamer.port(), |url| {
-            hote_de_cette_instance(url, &adresses, ip_annoncee, &machine)
-        })?;
+        let id = self.id_de_notre_uri(uri)?;
         self.ligne_locale(id).then_some(id)
     }
 
@@ -172,6 +207,13 @@ impl PlaybackOrchestrator {
             temp_file_path: None,
             ..req.clone()
         };
+        // La piste reconnue est traitée en piste locale de bout en bout,
+        // règles de zone comprises : les gardes de `play()` (#8088, #8611)
+        // ont vu une demande `upnp` sans ligne ; elles revoient ici la piste
+        // elle-même. `resolve_stream` est le passage commun du départ (Play,
+        // Next) et du pré-armement de la suivante (SetNext).
+        self.verifier_le_contenu_explicite(&locale).await?;
+        self.verifier_l_artiste_bloque(&locale).await?;
         let mut resolu = Box::pin(self.resolve_local_track(&locale)).await?;
         resolu.source = "upnp".into();
         info!(
@@ -194,7 +236,7 @@ mod tests {
 
     fn id(uri: &str) -> Option<i64> {
         id_de_piste_de_cette_instance(uri, PORT, |url| {
-            hote_de_cette_instance(url, &[LAN], Some("192.0.2.77"), "studio")
+            hote_de_cette_instance(url, &[LAN], Some("192.0.2.77"), Some("studio"))
         })
     }
 
@@ -206,7 +248,6 @@ mod tests {
             "  http://192.0.2.10:8888/api/v1/library/tracks/2982/audio  ",
             "http://192.0.2.10:8888/api/v1/library/tracks/2982/audio?format=aiff",
             "http://192.0.2.10:8888/api/v1/library/tracks/2982/audio#x",
-            "http://192.0.2.10:8888/api/v1/library/tracks/2982/audio.aif",
             "https://192.0.2.10:8888/api/v1/library/tracks/2982/audio",
             "http://127.0.0.1:8888/api/v1/library/tracks/2982/audio",
             "http://[::1]:8888/api/v1/library/tracks/2982/audio",
@@ -241,6 +282,11 @@ mod tests {
             // Autre chemin, identifiant illisible.
             "http://127.0.0.1:8888/api/v1/library/tracks/2982",
             "http://127.0.0.1:8888/api/v1/library/tracks/2982/audio/x",
+            // Aucune route ne sert `/audio.<ext>`.
+            "http://127.0.0.1:8888/api/v1/library/tracks/2982/audio.aif",
+            "http://127.0.0.1:8888/api/v1/library/tracks//audio",
+            // Le condensat d'identité d'une ligne indexée n'est pas une URL.
+            "uuid:258FC2D5-E2C3-B734-0-123456789abc|85944171f73967e8",
             "http://127.0.0.1:8888/api/v1/library/tracks/abc/audio",
             "http://127.0.0.1:8888/api/v1/library/tracks/-3/audio",
             "http://127.0.0.1:8888/api/v1/library/tracks/0/audio",
@@ -277,9 +323,31 @@ mod tests {
     #[test]
     fn nom_de_machine_vide_9207() {
         let url = reqwest::Url::parse("http://x:8888/").unwrap();
-        assert!(!hote_de_cette_instance(&url, &[], None, ""));
+        assert!(!hote_de_cette_instance(&url, &[], None, Some("")));
+        assert!(!hote_de_cette_instance(&url, &[], None, None));
         let url = reqwest::Url::parse("http://local:8888/").unwrap();
-        assert!(!hote_de_cette_instance(&url, &[], None, ".local"));
+        assert!(!hote_de_cette_instance(&url, &[], None, Some(".local")));
+    }
+
+    /// Pas de nom de repli : deux machines dont le nom ne se lit pas (ou ne
+    /// donne aucune étiquette mDNS) ne se prennent pas l'une pour l'autre.
+    #[test]
+    fn pas_de_nom_de_repli_9207() {
+        let url = reqwest::Url::parse("http://tune-server:8888/").unwrap();
+        assert!(!hote_de_cette_instance(&url, &[], None, None));
+        assert!(!hote_de_cette_instance(&url, &[], None, Some("___")));
+        let url = reqwest::Url::parse("http://tune-server.local:8888/").unwrap();
+        assert!(!hote_de_cette_instance(&url, &[], None, Some("é")));
+        // Une machine réellement nommée ainsi, elle, se reconnaît.
+        assert!(hote_de_cette_instance(&url, &[], None, Some("tune-server")));
+        // L'étiquette mDNS d'un nom à espaces.
+        let url = reqwest::Url::parse("http://salon-de-musique.local:8888/").unwrap();
+        assert!(hote_de_cette_instance(
+            &url,
+            &[],
+            None,
+            Some("Salon de musique")
+        ));
     }
 
     // ----- Bout en bout : `resolve_stream` et l'avance de file -----
@@ -320,7 +388,12 @@ mod tests {
 
     fn piste_aiff(orch: &PlaybackOrchestrator, source: &str) -> i64 {
         let mut t = Track::new("Piste AIFF".into());
-        t.file_path = Some(AIFF.into());
+        // `tracks.file_path` est unique : une copie du témoin par piste.
+        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let copie = std::env::temp_dir().join(format!("tune-9207-{}-{n}.aiff", std::process::id()));
+        std::fs::copy(AIFF, &copie).unwrap();
+        t.file_path = Some(copie.to_string_lossy().into_owned());
         t.format = Some("aiff".into());
         t.sample_rate = Some(44_100);
         t.bit_depth = Some(16);
@@ -458,5 +531,228 @@ mod tests {
             .expect("AIFF reconnu par symphonia");
         assert!(format.default_track(TrackType::Audio).is_some());
         assert!(format.next_packet().is_ok(), "un paquet se lit");
+    }
+
+    /// Le chemin relu et le chemin publié dans la DIDL sont le MÊME contrat.
+    #[test]
+    fn l_aller_et_le_retour_parlent_de_la_meme_url_9207() {
+        let url = crate::upnp_server::track_audio_url("http://127.0.0.1:8888", 187_500);
+        assert_eq!(id(&url), Some(187_500), "{url}");
+    }
+
+    // ----- Une seule règle d'hôte : la relecture #4323 passe par elle -----
+
+    /// Hôte nommé (nom réel de la machine) et `advertised_ip` : `track_id`
+    /// relu (historique, compteurs, gardes) ; autre port : rien, une autre
+    /// instance sur la même machine ne reçoit pas le titre d'une piste d'ici.
+    #[tokio::test]
+    async fn la_relecture_4323_suit_la_meme_regle_d_hote_9207() {
+        let mut orch = orchestrateur();
+        orch.advertised_ip = Some("192.0.2.77".into());
+        let id = piste_aiff(&orch, "local");
+        let relue = |uri: String| {
+            let mut req = requete_upnp(43, &uri);
+            orch.resoudre_l_uri_en_piste_de_bibliotheque(&mut req);
+            req.track_id
+        };
+        assert_eq!(
+            relue(crate::upnp_server::track_audio_url(
+                "http://192.0.2.77:8888",
+                id
+            )),
+            Some(id),
+            "advertised_ip"
+        );
+        if let Some(machine) = nom_de_la_machine() {
+            let court = machine.trim_end_matches(".local");
+            assert_eq!(
+                relue(crate::upnp_server::track_audio_url(
+                    &format!("http://{court}.local:8888"),
+                    id
+                )),
+                Some(id),
+                "nom de la machine ({court}.local)"
+            );
+        }
+        assert_eq!(
+            relue(format!(
+                "http://127.0.0.1:8889/api/v1/library/tracks/{id}/audio"
+            )),
+            None,
+            "autre port : une autre instance"
+        );
+        assert_eq!(
+            relue(crate::upnp_server::track_audio_url(
+                "http://192.0.2.78:8888",
+                id
+            )),
+            None,
+            "autre hôte"
+        );
+    }
+
+    // ----- Règles de zone : la piste reconnue est jugée comme une piste locale -----
+
+    const ENFANT: i64 = 2;
+    const ADMIN: i64 = 1;
+    const ZONE: i64 = 92071;
+
+    async fn orchestrateur_supervise(
+        politique: crate::db::politique_parentale::PolitiqueParentale,
+    ) -> (PlaybackOrchestrator, i64, i64) {
+        use crate::db::backend::ToSqlValue;
+        let orch = orchestrateur();
+        let sql = |q: &str, p: &[&dyn ToSqlValue]| {
+            orch.db.execute(q, p).unwrap();
+        };
+        sql(
+            "INSERT INTO zones (id, name, output_type, output_device_id) \
+             VALUES (?, 'Zone 9207', 'local', 'local:banc-9207')",
+            &[&ZONE],
+        );
+        for (id, nom) in [(7i64, "Groupe Interdit"), (8, "Groupe Libre")] {
+            sql("INSERT INTO artists (id, name) VALUES (?, ?)", &[&id, &nom]);
+        }
+        let interdite = piste_aiff(&orch, "local");
+        let libre = piste_aiff(&orch, "local");
+        sql(
+            "UPDATE tracks SET artist_id = 7, explicit = 1 WHERE id = ?",
+            &[&interdite],
+        );
+        sql("UPDATE tracks SET artist_id = 8 WHERE id = ?", &[&libre]);
+        crate::db::politique_parentale::poser(&orch.db, ENFANT, ADMIN, 0, &politique).unwrap();
+        orch.playback.set_session_profile(ZONE, Some(ENFANT)).await;
+        (orch, interdite, libre)
+    }
+
+    fn artiste_bloque() -> crate::db::politique_parentale::PolitiqueParentale {
+        crate::db::politique_parentale::PolitiqueParentale {
+            artistes_bloques: vec![crate::db::politique_parentale::ArtisteBloque {
+                id: Some(7),
+                nom: Some("Groupe Interdit".into()),
+            }],
+            ..Default::default()
+        }
+    }
+
+    fn explicite_masque() -> crate::db::politique_parentale::PolitiqueParentale {
+        crate::db::politique_parentale::PolitiqueParentale {
+            masquer_explicite: true,
+            ..Default::default()
+        }
+    }
+
+    async fn suivante(orch: &PlaybackOrchestrator, uri: &str) -> Result<(), String> {
+        let file: Vec<StreamingQueueItem> = vec![(
+            uri.to_string(),
+            String::new(),
+            String::new(),
+            None,
+            None,
+            0i64,
+            Some("upnp".to_string()),
+            Some(1),
+            None,
+        )];
+        PlayQueueRepo::with_backend(orch.db.clone())
+            .set_streaming_queue(ZONE, &file)
+            .unwrap();
+        orch.resolve_queue_item_url(ZONE, 0).await.map(|_| ())
+    }
+
+    /// Play ET SetNext : la piste reconnue d'un artiste bloqué ou explicite
+    /// masqué est refusée ; contre-épreuve, l'autre piste passe.
+    #[tokio::test]
+    async fn les_regles_de_zone_s_appliquent_a_la_piste_reconnue_9207() {
+        for (politique, code) in [
+            (
+                artiste_bloque(),
+                crate::db::politique_parentale::CODE_REFUS_CONTENU_BLOQUE,
+            ),
+            (
+                explicite_masque(),
+                crate::db::politique_parentale::CODE_REFUS_EXPLICITE,
+            ),
+        ] {
+            let (orch, interdite, libre) = orchestrateur_supervise(politique).await;
+            let uri = |id| crate::upnp_server::track_audio_url("http://127.0.0.1:8888", id);
+
+            let refus = orch
+                .resolve_stream(&requete_upnp(ZONE, &uri(interdite)))
+                .await
+                .err()
+                .expect("Play : la piste doit être refusée");
+            assert!(refus.contains(code), "{code} attendu : {refus}");
+            let refus = suivante(&orch, &uri(interdite))
+                .await
+                .expect_err("SetNext : la suivante doit être refusée");
+            assert!(refus.contains(code), "{code} attendu : {refus}");
+
+            assert!(
+                orch.resolve_stream(&requete_upnp(ZONE, &uri(libre)))
+                    .await
+                    .is_ok(),
+                "contre-épreuve Play ({code})"
+            );
+            assert_eq!(
+                suivante(&orch, &uri(libre)).await,
+                Ok(()),
+                "contre-épreuve SetNext ({code})"
+            );
+        }
+    }
+
+    // ----- Choix de l'exemplaire -----
+
+    /// La règle de version (#2264) a choisi un autre exemplaire LOCAL : il
+    /// prime. Un `track_id` qui n'est pas une ligne locale ne prime pas.
+    #[tokio::test]
+    async fn l_exemplaire_choisi_par_la_regle_de_version_prime_9207() {
+        let orch = orchestrateur();
+        let a = piste_aiff(&orch, "local");
+        let b = piste_aiff(&orch, "local");
+        let c = piste_aiff(&orch, "upnp");
+        orch.db
+            .execute(
+                "UPDATE tracks SET title = 'Exemplaire B' WHERE id = ?",
+                &[&b as &dyn crate::db::backend::ToSqlValue],
+            )
+            .unwrap();
+        let uri = crate::upnp_server::track_audio_url("http://127.0.0.1:8888", a);
+
+        let mut req = requete_upnp(44, &uri);
+        req.track_id = Some(b);
+        let resolu = orch.resolve_stream(&req).await.expect("exemplaire B");
+        assert_eq!(resolu.title, "Exemplaire B");
+
+        req.track_id = Some(c);
+        let resolu = orch.resolve_stream(&req).await.expect("repli sur A");
+        assert_eq!(resolu.title, "Piste AIFF", "une ligne `upnp` ne prime pas");
+    }
+
+    // ----- La fonction `aiff` de symphonia, ailleurs -----
+
+    /// Le flux continu (#8082) admettait l'AIFF sans savoir le sonder.
+    #[test]
+    fn le_flux_continu_sonde_l_aiff_9207() {
+        let sonde = crate::audio::wav_continu::sonder(std::path::Path::new(AIFF))
+            .expect("l'AIFF doit entrer dans un flux continu");
+        assert_eq!(
+            (
+                sonde.format.cadence,
+                sonde.format.profondeur,
+                sonde.format.canaux
+            ),
+            (44_100, 16, 2)
+        );
+        assert!(sonde.trames > 0);
+    }
+
+    /// L'audit d'intégrité complet devient vérifiable pour l'AIFF.
+    #[test]
+    fn l_audit_d_integrite_verifie_l_aiff_9207() {
+        use crate::audio::audit_integrite::{Verdict, verifier};
+        let r = verifier(std::path::Path::new(AIFF), || true).expect("verdict");
+        assert_eq!(r.verdict, Verdict::Sain, "{r:?}");
     }
 }

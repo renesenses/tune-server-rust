@@ -9631,7 +9631,9 @@ async fn audio_offer_crossfeed_hard_cut_preserves_settings_for_premium_reactivat
 #[tokio::test]
 async fn une_uri_de_notre_bibliotheque_n_est_plus_un_episode() {
     let device_id = "dlna-4323";
-    let orch = test_orchestrator();
+    let mut orch = test_orchestrator();
+    // #9207 — l'URI n'est la nôtre que sur le port du serveur.
+    orch.streamer = Arc::new(AudioStreamer::new(8888));
 
     orch.db
         .execute(
@@ -9649,9 +9651,14 @@ async fn une_uri_de_notre_bibliotheque_n_est_plus_un_episode() {
         .execute(
             "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, \
              duration_ms, sample_rate, bit_depth, channels) \
-             VALUES (187500, 'Quartet No. 10', 1, 1, '/aucun/chemin/4323.flac', 'flac', \
+             VALUES (187500, 'Quartet No. 10', 1, 1, ?, 'flac', \
              300000, 44100, 16, 2)",
-            &[],
+            // #9207 — la piste reconnue se résout en piste locale : son
+            // fichier doit exister.
+            &[
+                &concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac")
+                    as &dyn crate::db::backend::ToSqlValue,
+            ],
         )
         .unwrap();
 
