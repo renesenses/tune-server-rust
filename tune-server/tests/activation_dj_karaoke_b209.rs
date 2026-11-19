@@ -83,7 +83,7 @@ async fn cocher_installe_et_annonce_le_redemarrage_decocher_retire() {
     for id in IDS {
         let state = new_state();
         tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
-        let app = tune_server::routes::router(state.clone());
+        let routeur = tune_server::routes::router(state.clone());
         let reglages = SettingsRepo::with_backend(state.backend.clone());
         let cle = format!("plugin_{id}_installed");
         assert_eq!(
@@ -91,6 +91,20 @@ async fn cocher_installe_et_annonce_le_redemarrage_decocher_retire() {
             None,
             "banc : rien avant le clic"
         );
+
+        // #9075 : installer ou retirer un greffon est gardé
+        // `AdminOuCetteMachine`. Authentification coupée, un appel dont
+        // l'origine est inconnue (aucun `ConnectInfo`) est refusé et n'écrit
+        // rien : c'est la contre-épreuve de la garde.
+        let (statut, corps) =
+            appel(&routeur, "POST", &format!("/api/v1/plugins/{id}/install")).await;
+        assert_eq!(statut, StatusCode::FORBIDDEN, "{corps}");
+        assert_eq!(reglages.get(&cle).unwrap(), None, "refusé : rien d'écrit");
+
+        // La case cochée dans Réglages › Extensions, depuis cette machine.
+        let app = routeur.layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+        ));
 
         let (statut, corps) = appel(&app, "POST", &format!("/api/v1/plugins/{id}/install")).await;
         assert_eq!(statut, StatusCode::OK, "{corps}");
