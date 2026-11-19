@@ -269,9 +269,9 @@ fn lus(meta: &HashMap<String, String>) -> Option<Vec<String>> {
 }
 
 fn lire(chemin: &Path, r: &TagsPerso) -> HashMap<String, String> {
-    super::read_extended_metadata_avec(
+    crate::metadata::read_extended_metadata_avec(
         chemin,
-        &super::balises_classique::BalisesClassique::default(),
+        &crate::metadata::balises_classique::BalisesClassique::default(),
         r,
     )
 }
@@ -309,9 +309,9 @@ fn le_scan_lit_les_balises_libres_des_trois_conteneurs_9158() {
     assert!(!sans.contains_key(CLE_LUE), "{sans:?}");
     assert_eq!(
         sans,
-        super::read_extended_metadata_selon(
+        crate::metadata::read_extended_metadata_selon(
             &f,
-            &super::balises_classique::BalisesClassique::default()
+            &crate::metadata::balises_classique::BalisesClassique::default()
         )
     );
     // Réglé mais rien dans le fichier : clé présente et vide (c'est ce qui
