@@ -288,6 +288,22 @@ fn dechiffrer(cle: &[u8; 32], scelle: &str) -> Result<String, String> {
 /// y trouvent la clé personnelle sans qu'on leur passe un chemin.
 static DOSSIER_DU_SERVEUR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
+/// Vrai si `valeur` a la forme d'une valeur scellée par [`Coffre::sceller`]
+/// (`{"v":…,"nonce":…,"ct":…}`), qu'elle s'ouvre ou non avec la clé en place.
+/// Sert à distinguer une ligne déjà scellée d'une ligne écrite en clair par
+/// une version antérieure.
+pub fn est_scelle(valeur: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(valeur.trim())
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .is_some_and(|o| {
+            o.len() == 3
+                && o.get("v").is_some_and(serde_json::Value::is_u64)
+                && o.get("nonce").is_some_and(serde_json::Value::is_string)
+                && o.get("ct").is_some_and(serde_json::Value::is_string)
+        })
+}
+
 /// Le dossier qui porte la base `db_path` (« . » pour un chemin nu).
 pub fn dossier_de_la_base(db_path: &str) -> PathBuf {
     Path::new(db_path)
@@ -317,6 +333,24 @@ pub fn fin_de_cle(cle: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn est_scelle_reconnait_la_forme_scellee_et_elle_seule() {
+        let dir = tempfile::tempdir().unwrap();
+        let coffre = Coffre::new(dir.path());
+        assert!(est_scelle(
+            &coffre.sceller(r#"{"access_token":"a"}"#).unwrap()
+        ));
+        for clair in [
+            r#"{"access_token":"a","refresh_token":"r"}"#,
+            r#"{"v":1,"nonce":"00"}"#,
+            r#"{"v":1,"nonce":"00","ct":"00","autre":1}"#,
+            "jeton-brut",
+            "",
+        ] {
+            assert!(!est_scelle(clair), "{clair}");
+        }
+    }
 
     #[test]
     fn sceller_puis_ouvrir_rend_la_cle_et_le_scelle_ne_la_contient_pas() {

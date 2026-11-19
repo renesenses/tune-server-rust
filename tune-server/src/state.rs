@@ -553,7 +553,11 @@ impl AppState {
 
         let mut services = ServiceRegistry::new();
         services.register(Box::new(
-            tune_core::streaming::tidal::TidalService::with_quality(&tune_config.tidal_quality),
+            tune_core::streaming::tidal::TidalService::with_quality(&tune_config.tidal_quality)
+                .avec_identifiants(
+                    tune_config.tidal_client_id.as_deref(),
+                    tune_config.tidal_client_secret.as_deref(),
+                ),
         ));
         // Qobuz endpoint order: direct-first for everyone; proxy-first only for
         // founder accounts (persisted `qobuz_proxy_first` flag from the cloud

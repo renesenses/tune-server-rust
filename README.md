@@ -166,6 +166,7 @@ Copy `tune.toml.example` to `tune.toml` and edit, or use environment variables:
 | `TUNE_INGEST_STAGING` | *(next to artwork cache)* | Where drag-and-dropped files are staged before import |
 | `TUNE_LOG_LEVEL` | info | Log level |
 | `TUNE_SPOTIFY_CLIENT_ID` | *(none)* | Client ID of **your own** Spotify application — Spotify grants no shared one |
+| `TUNE_TIDAL_CLIENT_ID` / `TUNE_TIDAL_CLIENT_SECRET` | *(embedded in published binaries)* | TIDAL client credentials (also `tidal_client_id` / `tidal_client_secret` in `tune.toml`). Needed only for a build from source; without them TIDAL reports « not configured » |
 | `TUNE_SPOTIFY_REDIRECT_URI` | `http://127.0.0.1:<TUNE_PORT>/api/v1/streaming/spotify/callback` | Overrides the derived default; required for a remote install |
 
 ## Architecture

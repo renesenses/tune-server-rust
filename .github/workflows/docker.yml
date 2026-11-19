@@ -17,6 +17,12 @@ on:
         required: false
       TUNE_YOUTUBE_CLIENT_SECRET:
         required: false
+      # Identifiants client TIDAL, figés par `option_env!` ; facultatifs ici
+      # (release.yml refuse déjà un tag sans eux).
+      TUNE_TIDAL_CLIENT_ID:
+        required: false
+      TUNE_TIDAL_CLIENT_SECRET:
+        required: false
   workflow_dispatch:
     inputs:
       version:
@@ -135,6 +141,8 @@ jobs:
           # #8904 — client OAuth Google de Tune (vide sans secret : repli).
           TUNE_YOUTUBE_CLIENT_ID: ${{ secrets.TUNE_YOUTUBE_CLIENT_ID }}
           TUNE_YOUTUBE_CLIENT_SECRET: ${{ secrets.TUNE_YOUTUBE_CLIENT_SECRET }}
+          TUNE_TIDAL_CLIENT_ID: ${{ secrets.TUNE_TIDAL_CLIENT_ID }}
+          TUNE_TIDAL_CLIENT_SECRET: ${{ secrets.TUNE_TIDAL_CLIENT_SECRET }}
         run: |
           bash scripts/ci/apt-robuste.sh
           sudo apt-get update && sudo apt-get install -y libasound2-dev
@@ -160,6 +168,8 @@ jobs:
         env:
           TUNE_YOUTUBE_CLIENT_ID: ${{ secrets.TUNE_YOUTUBE_CLIENT_ID }}
           TUNE_YOUTUBE_CLIENT_SECRET: ${{ secrets.TUNE_YOUTUBE_CLIENT_SECRET }}
+          TUNE_TIDAL_CLIENT_ID: ${{ secrets.TUNE_TIDAL_CLIENT_ID }}
+          TUNE_TIDAL_CLIENT_SECRET: ${{ secrets.TUNE_TIDAL_CLIENT_SECRET }}
         run: |
           # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","plugins-wasm","audio-embedding","dst"]}
           cross build --release --package tune-server --target aarch64-unknown-linux-gnu --no-default-features --features oaat,cloud-relay,local-audio,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme

@@ -1751,7 +1751,11 @@ fn spawn_token_refresher(state: &AppState) {
                                 settings.delete(&key).ok();
                                 tracing::warn!(service = %name, "expired_session_row_deleted");
                             } else if let Some(tokens) = svc.save_tokens() {
-                                settings.set(&key, &tokens.to_string()).ok();
+                                tune_core::streaming::registry::ecrire_les_jetons(
+                                    &settings,
+                                    &key,
+                                    &tokens.to_string(),
+                                );
                             }
                         }
                         Ok(false) => {}
