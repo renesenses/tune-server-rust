@@ -1192,6 +1192,10 @@ mod comptes_9116_tests {
         assert_eq!(dossier["directories"][0]["name"], "Jazz", "{dossier}");
         assert_eq!(dossier["directories"][0]["track_count"], 0, "{dossier}");
         eprintln!("#9116 : racines + dossier sans arbre servis en {ms} ms");
+        assert!(
+            ms < 1000,
+            "la liste a attendu l'arbre des dossiers : {ms} ms pour deux lectures sans comptes"
+        );
         drop(retenue);
         // L'arbre prêt (construit en arrière-plan, ou ici) : les vrais comptes.
         assert_eq!(compte_racine(s), 1);
