@@ -1780,7 +1780,10 @@ impl PositionPoller {
         immediat: bool,
     ) {
         use crate::playback::gapless::IssueEchecDsdSuivant;
-        match self.orchestrator.retenir_dsd_suivant_lache(device_id, immediat) {
+        match self
+            .orchestrator
+            .retenir_dsd_suivant_lache(device_id, immediat)
+        {
             IssueEchecDsdSuivant::Note { echecs } => info!(
                 zone_id,
                 device_id,

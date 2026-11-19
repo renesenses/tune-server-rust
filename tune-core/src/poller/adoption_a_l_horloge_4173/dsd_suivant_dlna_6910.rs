@@ -285,7 +285,13 @@ impl Banc {
             mock.set_duration(duree_ms);
             mock.set_position(position_ms);
         }
-        let ps = self.poll_states.get_mut(&self.zone_id).unwrap();
+        // La fin de piste a retiré l'état de sondage : la piste relancée en
+        // reçoit un neuf, comme après un `play()`.
+        let generation = self.playback.get_state(self.zone_id).await.track_generation;
+        let ps = self
+            .poll_states
+            .entry(self.zone_id)
+            .or_insert_with(|| ZonePollState::new(generation));
         ps.track_started_at = Some(Instant::now() - Duration::from_secs(horloge_secs));
         if position_ms > ps.peak_position_ms {
             ps.peak_position_ms = position_ms;

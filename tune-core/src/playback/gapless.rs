@@ -721,7 +721,10 @@ mod tests {
         use std::time::{Duration, Instant};
         let t0 = Instant::now();
         let mut m = EchecsDsdSuivant::default();
-        assert_eq!(m.noter_echec(t0, false), IssueEchecDsdSuivant::Note { echecs: 1 });
+        assert_eq!(
+            m.noter_echec(t0, false),
+            IssueEchecDsdSuivant::Note { echecs: 1 }
+        );
         assert!(!m.garde_active(t0), "un seul échec ne rend pas la garde");
         // Deux échecs séparés d'une longue piste (> 30 min) comptent.
         let t1 = t0 + Duration::from_secs(45 * 60);
@@ -768,7 +771,10 @@ mod tests {
         let mut m = EchecsDsdSuivant::default();
         m.noter_echec(t0, false);
         assert_eq!(
-            m.noter_echec(t0 + FENETRE_ECHECS_DSD_SUIVANT + Duration::from_secs(1), false),
+            m.noter_echec(
+                t0 + FENETRE_ECHECS_DSD_SUIVANT + Duration::from_secs(1),
+                false
+            ),
             IssueEchecDsdSuivant::Note { echecs: 1 }
         );
         let mut avoue = EchecsDsdSuivant::default();

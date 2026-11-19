@@ -200,6 +200,12 @@ async fn sonde_de_l_en_tete_au_set_next_puis_lecture_a_la_fin_9206() {
     let appareil = "uuid:banc-9206-sonde-en-tete";
     let (mut banc, flux, url) = monter_9206(appareil).await;
     banc.le_service_sert(&flux, 92).await;
+    // La sonde est plus vieille que la fenêtre (horloge réelle : la datation
+    // est un `std::time::Instant`).
+    std::thread::sleep(
+        Duration::from_millis(decisions::FENETRE_BASCULE_SUR_FLUX_ARME_MS)
+            + Duration::from_millis(200),
+    );
     banc.jusqu_a_la_duree().await;
     banc.le_service_sert(&flux, OCTETS_LUS).await;
     banc.sondage_9206(POSITION_GELEE_MS, 241).await;
@@ -286,9 +292,20 @@ async fn la_lecture_est_datee_au_franchissement_de_l_en_tete_9206() {
     banc.le_service_sert(&flux, 92).await;
     banc.le_service_sert(&flux, decisions::OCTETS_AU_DELA_DE_L_EN_TETE - 92)
         .await;
-    assert_eq!(orchestrateur.streamer_lecture_au_dela_de_l_en_tete_depuis_ms(&flux).await, None, "seuil atteint, pas franchi");
+    assert_eq!(
+        orchestrateur
+            .streamer_lecture_au_dela_de_l_en_tete_depuis_ms(&flux)
+            .await,
+        None,
+        "seuil atteint, pas franchi"
+    );
     banc.le_service_sert(&flux, 1).await;
-    assert!(orchestrateur.streamer_lecture_au_dela_de_l_en_tete_depuis_ms(&flux).await.is_some_and(|ms| ms < 1_000));
+    assert!(
+        orchestrateur
+            .streamer_lecture_au_dela_de_l_en_tete_depuis_ms(&flux)
+            .await
+            .is_some_and(|ms| ms < 1_000)
+    );
 }
 
 /// La règle pure.
@@ -298,12 +315,32 @@ fn la_bascule_en_cours_pure_9206() {
     let fenetre = decisions::FENETRE_BASCULE_SUR_FLUX_ARME_MS;
     assert!(en_cours(E::Aucun, true, Some(OCTETS_LUS), Some(1_150)));
     assert!(en_cours(E::Aucun, true, Some(OCTETS_LUS), Some(fenetre)));
-    assert!(!en_cours(E::Aucun, false, Some(OCTETS_LUS), Some(1_150)), "PCM");
-    assert!(!en_cours(E::Aucun, true, Some(OCTETS_LUS), Some(fenetre + 1)));
-    assert!(!en_cours(E::Aucun, true, Some(OCTETS_LUS), Some(27_000)), "DMP-A6");
-    assert!(!en_cours(E::Aucun, true, Some(OCTETS_LUS), None), "non daté");
-    assert!(!en_cours(E::Aucun, true, Some(0), Some(500)), "RS130 : rien tiré");
-    assert!(!en_cours(E::Aucun, true, None, Some(500)), "session disparue");
+    assert!(
+        !en_cours(E::Aucun, false, Some(OCTETS_LUS), Some(1_150)),
+        "PCM"
+    );
+    assert!(!en_cours(
+        E::Aucun,
+        true,
+        Some(OCTETS_LUS),
+        Some(fenetre + 1)
+    ));
+    assert!(
+        !en_cours(E::Aucun, true, Some(OCTETS_LUS), Some(27_000)),
+        "DMP-A6"
+    );
+    assert!(
+        !en_cours(E::Aucun, true, Some(OCTETS_LUS), None),
+        "non daté"
+    );
+    assert!(
+        !en_cours(E::Aucun, true, Some(0), Some(500)),
+        "RS130 : rien tiré"
+    );
+    assert!(
+        !en_cours(E::Aucun, true, None, Some(500)),
+        "session disparue"
+    );
     assert!(
         !en_cours(
             E::Aucun,
