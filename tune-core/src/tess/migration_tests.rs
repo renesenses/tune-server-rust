@@ -1787,8 +1787,19 @@ fn config_export_inclut_la_chaine() {
     let chaine_a: ChaineTess =
         serde_json::from_value(zone(a)["settings"]["zone_{id}_tess_chain"].clone()).unwrap();
     assert_eq!(ids(&chaine_a), vec![(ID_CROSSFEED, true)]);
-    assert!(zone(a)["settings"]["zone_{id}_tess_chain_sync"].is_object());
-    // Zone migrée : la chaîne enregistrée part telle quelle.
+    // L'ombre ne part plus (décision B du 19/11 : elle est propre à la base
+    // qui l'a écrite, l'import la reconstruit).
+    assert!(
+        zone(a)["settings"]
+            .get("zone_{id}_tess_chain_sync")
+            .is_none()
+    );
+    assert!(
+        zone(b)["settings"]
+            .get("zone_{id}_tess_chain_sync")
+            .is_none()
+    );
+    // Zone migrée : la chaîne que le serveur lit part, réglages TESS compris.
     let chaine_b: ChaineTess =
         serde_json::from_value(zone(b)["settings"]["zone_{id}_tess_chain"].clone()).unwrap();
     assert_eq!(chaine_b, c);
