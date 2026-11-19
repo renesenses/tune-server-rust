@@ -858,7 +858,14 @@ pub async fn analyze_embedding_batch<E: Inference>(
             // produced a vector, so a broken or silent file drops out of the
             // sweep (until the next model bump) instead of being retried every
             // pass.
-            stamp_embedding_processed(&repo_bloquant, track_id)
+            let ecrit = stamp_embedding_processed(&repo_bloquant, track_id);
+            if ecrit {
+                // #9046 — une piste qui finit par réussir repart de zéro : sans
+                // cet effacement, ses reports passés avançaient son abandon
+                // lors d'un échec futur (nouveau modèle, fichier remplacé).
+                let _ = repo_bloquant.delete(track_id, RETRY_REPORTS_KEY);
+            }
+            ecrit
         })
         .await;
         let echec = match ecrit {
@@ -870,9 +877,11 @@ pub async fn analyze_embedding_batch<E: Inference>(
             // Arrêt du serveur : rien d'illisible, la piste sera reprise.
             Ok(false) if arret_demande() => false,
             // Le témoin ne s'est pas écrit (`audio_embed_sentinel_write_failed`) :
-            // une écriture en base ratée est le plus souvent passagère (verrou,
-            // disque), et ne dit rien de la piste. Pas un échec de la piste.
-            Ok(false) => false,
+            // compté comme un échec (#9046). Sans cela, une écriture qui
+            // échoue à chaque fois rendait la même piste à chaque lot, sans
+            // fin. Trois échecs de suite la reportent ; une écriture
+            // passagère ratée coûte un essai, pas plus.
+            Ok(false) => true,
             // L'inférence a paniqué : dit, et la passe continue.
             Err(e) => {
                 warn!(track_id, error = %e, "audio_embed_infer_interrupted");
@@ -1479,20 +1488,77 @@ fn remettre_la_zone_a_stopped(backend: &Arc<dyn DbBackend>, zone_id: i64) -> Res
 }
 
 /// Corriger la base pour la zone repérée quand le témoin en mémoire dit
-/// qu'aucune zone ne joue (#9046). L'écriture se fait SOUS le verrou du témoin
-/// ([`crate::taches_de_fond::priorite::sans_lecture_en_cours`]) : une zone qui
-/// démarre au même instant écrit son « playing » après, jamais avant. Le
-/// démarrage du serveur fait déjà ce geste (`startup.rs`) ; il manquait en
-/// cours de vie.
+/// qu'aucune zone ne joue (#9046). Le démarrage du serveur fait déjà ce geste
+/// (`startup.rs`) ; il manquait en cours de vie.
 fn corriger_le_temoin_de_lecture_en_base(
     backend: &Arc<dyn DbBackend>,
     zone_id: i64,
 ) -> Result<usize, String> {
-    crate::taches_de_fond::priorite::sans_lecture_en_cours(|| {
-        remettre_la_zone_a_stopped(backend, zone_id)
-    })
-    .unwrap_or_else(|| Err("une zone joue selon le témoin en mémoire".to_string()))
+    corriger_avec(
+        backend,
+        zone_id,
+        crate::taches_de_fond::priorite::lecture_en_cours,
+        crate::taches_de_fond::priorite::la_zone_joue,
+    )
 }
+
+/// La correction, témoins injectés (essais).
+///
+/// Le verrou du témoin en mémoire n'est PAS tenu pendant l'écriture : un
+/// UPDATE peut attendre le verrou d'écriture unique de la base plusieurs
+/// secondes (8,4 s mesurées chez JeromeQ), et `save_play_state` — sur le
+/// chemin de la lecture — aurait attendu avec lui. À la place :
+/// - témoin relu AVANT : une zone qui joue, rien n'est écrit ;
+/// - UPDATE restreint à la zone repérée ;
+/// - témoin relu APRÈS : si CETTE zone a démarré entre-temps,
+///   `save_play_state` a noté la mémoire avant d'écrire la base, donc son
+///   « playing » a pu être écrasé : il est réécrit. Une autre zone qui démarre
+///   n'est jamais touchée par l'UPDATE.
+/// - #9084 — témoin relu après CHAQUE écriture, jusqu'à ce qu'il confirme ce
+///   qui vient d'être écrit : si la zone a démarré puis a été ARRÊTÉE avant
+///   que la réécriture « playing » n'obtienne le verrou d'écriture, le
+///   « stopped » de `save_play_state` était passé en premier et la
+///   réécriture remettait « playing » à tort (base « playing », mémoire
+///   muette : ReplayGain et faux Hi-Res cédaient jusqu'à la correction
+///   suivante, 10 min). Le « stopped » est alors rétabli. Borné à
+///   [`TOURS_DE_CORRECTION_MAX`] écritures : une zone qui bascule sans cesse
+///   est laissée à la correction suivante.
+fn corriger_avec(
+    backend: &Arc<dyn DbBackend>,
+    zone_id: i64,
+    lecture_en_cours: impl Fn() -> bool,
+    la_zone_joue: impl Fn(i64) -> bool,
+) -> Result<usize, String> {
+    if lecture_en_cours() {
+        return Err("une zone joue selon le témoin en mémoire".to_string());
+    }
+    let n = remettre_la_zone_a_stopped(backend, zone_id)?;
+    let mut ecrit_joue = false;
+    for _ in 0..TOURS_DE_CORRECTION_MAX {
+        let joue = la_zone_joue(zone_id);
+        if joue == ecrit_joue {
+            // Le témoin confirme la dernière écriture : la base est juste.
+            return if joue {
+                Err("la zone vient de démarrer : « playing » rétabli".to_string())
+            } else {
+                Ok(n)
+            };
+        }
+        if joue {
+            backend.execute(
+                "UPDATE zones SET last_play_state = 'playing' WHERE id = ?",
+                &[&zone_id as &dyn ToSqlValue],
+            )?;
+        } else {
+            remettre_la_zone_a_stopped(backend, zone_id)?;
+        }
+        ecrit_joue = joue;
+    }
+    Err("la zone change d'état pendant la correction : reportée".to_string())
+}
+
+/// #9084 — nombre maximal d'écritures d'une correction du témoin en base.
+const TOURS_DE_CORRECTION_MAX: usize = 4;
 
 /// Le dernier lot acoustique a-t-il rendu du travail ?
 ///
@@ -2609,6 +2675,77 @@ mod tests {
     /// #9046, piste (c) — la correction ne touche QUE la zone repérée, et
     /// seulement si elle est encore « playing ». Pas de témoin global ici :
     /// le verrou du témoin est vérifié dans `taches_de_fond::priorite`.
+    /// #9046 — verrou relâché pendant l'UPDATE : si la zone démarre entre la
+    /// lecture du témoin et l'écriture, son « playing » est rétabli ; si une
+    /// zone joue avant, rien n'est écrit. Témoins injectés : aucun global.
+    #[test]
+    fn une_zone_qui_demarre_pendant_la_correction_garde_playing_9046() {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE zones (id INTEGER PRIMARY KEY, name TEXT, last_play_state TEXT);
+             INSERT INTO zones (id, name, last_play_state) VALUES (1, 'Salon', 'playing');",
+        )
+        .unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        // Démarrage pendant l'écriture : rétabli.
+        assert!(corriger_avec(&backend, 1, || false, |_| true).is_err());
+        assert_eq!(zone_qui_joue_en_base(&backend).map(|z| z.0), Some(1));
+        // Une zone joue avant : rien n'est écrit.
+        assert!(corriger_avec(&backend, 1, || true, |_| false).is_err());
+        assert_eq!(zone_qui_joue_en_base(&backend).map(|z| z.0), Some(1));
+        // Personne ne joue : corrigée.
+        assert_eq!(corriger_avec(&backend, 1, || false, |_| false), Ok(1));
+        assert_eq!(zone_qui_joue_en_base(&backend), None);
+    }
+
+    /// #9084 — la zone démarre pendant la correction, puis l'utilisateur
+    /// l'arrête AVANT que la réécriture « playing » n'obtienne le verrou
+    /// d'écriture : le « stopped » de `save_play_state` est déjà en base, la
+    /// réécriture ne doit pas le recouvrir. Témoin séquencé : joue au premier
+    /// relevé, ne joue plus aux suivants.
+    #[test]
+    fn une_zone_arretee_pendant_la_reecriture_reste_stopped_9084() {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE zones (id INTEGER PRIMARY KEY, name TEXT, last_play_state TEXT);
+             INSERT INTO zones (id, name, last_play_state) VALUES (1, 'Salon', 'playing');",
+        )
+        .unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let releves = std::cell::Cell::new(0u32);
+        let la_zone_joue = |_: i64| {
+            releves.set(releves.get() + 1);
+            releves.get() == 1
+        };
+        let r = corriger_avec(&backend, 1, || false, la_zone_joue);
+        assert_eq!(
+            zone_qui_joue_en_base(&backend),
+            None,
+            "#9084 : base « playing » alors que plus aucune zone ne joue ({r:?})"
+        );
+        assert_eq!(r, Ok(1));
+    }
+
+    /// #9084 — une zone qui bascule sans cesse : la correction s'arrête
+    /// (bornée) au lieu de boucler.
+    #[test]
+    fn une_zone_qui_bascule_sans_cesse_ne_fait_pas_boucler_la_correction_9084() {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE zones (id INTEGER PRIMARY KEY, name TEXT, last_play_state TEXT);
+             INSERT INTO zones (id, name, last_play_state) VALUES (1, 'Salon', 'playing');",
+        )
+        .unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let releves = std::cell::Cell::new(0u32);
+        let bascule = |_: i64| {
+            releves.set(releves.get() + 1);
+            releves.get() % 2 == 1
+        };
+        assert!(corriger_avec(&backend, 1, || false, bascule).is_err());
+        assert!(releves.get() as usize <= TOURS_DE_CORRECTION_MAX);
+    }
+
     #[test]
     fn la_correction_ne_touche_que_la_zone_reperee_9046() {
         let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();

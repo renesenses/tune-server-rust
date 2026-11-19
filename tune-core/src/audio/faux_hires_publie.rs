@@ -67,7 +67,9 @@ impl VerdictPublie {
         match mot.trim().to_ascii_lowercase().as_str() {
             "verifie" => Some(Self::Verifie),
             "conforme" => Some(Self::Conforme),
-            "douteux" => Some(Self::Douteux),
+            // #9067 — `altere` (« Source altérée ») : alias d'entrée de
+            // `douteux`, le mot publié qui ne change pas (clients existants).
+            "douteux" | "altere" | "alteree" => Some(Self::Douteux),
             "non_analyse" => Some(Self::NonAnalyse),
             _ => None,
         }
@@ -166,8 +168,8 @@ pub fn pistes_mesurees_par_album(
 }
 
 /// #9035 — « l'album est douteux » en SQL : au moins une piste douteuse, et
-/// au moins la moitié de ses pistes mesurées qui se disent hi-res (#9067 :
-/// vérifiées ou douteuses, verdict EFFECTIF), comme
+/// au moins la moitié de ses pistes mesurées concluantes (#9067, 19/11 :
+/// vérifiées, conformes ou douteuses, verdict EFFECTIF), comme
 /// [`super::faux_hires_passe::album_majoritairement_douteux`].
 fn album_douteux(id_album: &str) -> String {
     let compte = |condition: &str| {
@@ -181,7 +183,7 @@ fn album_douteux(id_album: &str) -> String {
         une_piste_de_l_album(id_album, "douteux"),
         compte(&format!("{} = 'douteux'", verdict_effectif_sql("hv"))),
         compte(&format!(
-            "{} IN ('verifie', 'douteux')",
+            "{} IN ('verifie', 'conforme', 'douteux')",
             verdict_effectif_sql("hv")
         ))
     )

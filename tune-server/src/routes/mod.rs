@@ -344,12 +344,42 @@ async fn api_fallback(
         };
         return axum::response::Redirect::permanent(&redirect_to).into_response();
     }
+    // #9078 — une route d'extension non montée (extension désactivée ou
+    // absente) est un cas PRÉVU : le client web l'attend et le dit à
+    // l'utilisateur (« assistant inactif », web#2966). Un `WARN api_not_found`
+    // par clic remplissait chaque rapport de bogue d'une fausse panne. Le
+    // corps garde `"error": "not found"` (que le client compare) et dit en
+    // plus quelle extension n'est pas chargée ; le journal passe en `debug`.
+    if let Some(extension) = extension_non_montee(path) {
+        tracing::debug!(path = %path, extension = %extension, "api_extension_non_montee");
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(serde_json::json!({
+                "error": "not found",
+                "code": "extension_inactive",
+                "extension": extension,
+                "path": path,
+            })),
+        )
+            .into_response();
+    }
     tracing::warn!(path = %path, "api_not_found");
     (
         StatusCode::NOT_FOUND,
         axum::Json(serde_json::json!({"error": "not found", "path": path})),
     )
         .into_response()
+}
+
+/// #9078 — le nom d'extension d'un chemin `/api/v1/ext/<nom>/…`.
+///
+/// Une extension chargée monte tout son préfixe par `nest_service`
+/// ([`router_with_plugins`]) : ses chemins, même inconnus, ne passent jamais
+/// par [`api_fallback`]. Un chemin `/api/v1/ext/<nom>` qui y arrive désigne
+/// donc une extension qui n'est pas chargée.
+fn extension_non_montee(path: &str) -> Option<&str> {
+    let nom = path.strip_prefix("/api/v1/ext/")?.split('/').next()?;
+    (!nom.is_empty()).then_some(nom)
 }
 
 /// Minimal HTML-entity escaping for untrusted text reflected into a page on the
@@ -817,6 +847,107 @@ pub fn router_with_plugins(
     // CORS est la plus externe : elle répond seule aux préflights.
     .layer(axum::middleware::from_fn(crate::garde_origine::garde))
     .layer(crate::garde_origine::couche_cors())
+}
+
+#[cfg(test)]
+mod extension_non_montee_9078_tests {
+    use axum::Router;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    #[derive(Clone, Default)]
+    struct Journal(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Journal {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Journal {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    /// Le repli de l'API, monté comme en production sous `/api/v1`, appelé
+    /// sous un journal capturé au niveau `info` (celui des rapports).
+    async fn appeler(chemin: &str) -> (StatusCode, serde_json::Value, String) {
+        let app = Router::new().nest("/api/v1", Router::new().fallback(super::api_fallback));
+        let journal = Journal::default();
+        let abonne = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(journal.clone())
+            .finish();
+        let reponse = {
+            let _garde = tracing::subscriber::set_default(abonne);
+            app.oneshot(Request::builder().uri(chemin).body(Body::empty()).unwrap())
+                .await
+                .unwrap()
+        };
+        let statut = reponse.status();
+        let octets = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let corps = serde_json::from_slice(&octets).unwrap();
+        let journal = String::from_utf8(journal.0.lock().unwrap().clone()).unwrap();
+        (statut, corps, journal)
+    }
+
+    /// Le cas du rapport : l'assistant IA n'est pas chargé, l'écran Support
+    /// appelle son aperçu. 404 comme avant, `"error": "not found"` que le
+    /// client compare, l'extension nommée — et plus de `WARN` au journal.
+    #[tokio::test]
+    async fn une_extension_non_chargee_ne_laisse_pas_de_warn() {
+        let (statut, corps, journal) = appeler("/api/v1/ext/assistant-ia/diagnostic/apercu").await;
+        assert_eq!(statut, StatusCode::NOT_FOUND);
+        assert_eq!(
+            corps["error"], "not found",
+            "le client web compare ce champ"
+        );
+        assert_eq!(corps["code"], "extension_inactive");
+        assert_eq!(corps["extension"], "assistant-ia");
+        assert!(
+            !journal.contains("api_not_found") && !journal.contains("WARN"),
+            "une extension non chargée ne doit pas laisser de WARN : {journal:?}"
+        );
+    }
+
+    /// Témoin : une vraie route inconnue garde son `WARN api_not_found` et
+    /// son corps d'avant.
+    #[tokio::test]
+    async fn une_route_inconnue_garde_son_warn() {
+        let (statut, corps, journal) = appeler("/api/v1/nexiste-pas").await;
+        assert_eq!(statut, StatusCode::NOT_FOUND);
+        assert_eq!(corps["error"], "not found");
+        assert!(corps.get("code").is_none(), "{corps}");
+        assert!(
+            journal.contains("WARN") && journal.contains("api_not_found"),
+            "{journal:?}"
+        );
+    }
+
+    #[test]
+    fn le_nom_d_extension_est_le_premier_segment() {
+        assert_eq!(
+            super::extension_non_montee("/api/v1/ext/assistant-ia/diagnostic/apercu"),
+            Some("assistant-ia")
+        );
+        assert_eq!(super::extension_non_montee("/api/v1/ext/dj"), Some("dj"));
+        assert_eq!(super::extension_non_montee("/api/v1/ext/"), None);
+        assert_eq!(super::extension_non_montee("/api/v1/extensions"), None);
+        assert_eq!(super::extension_non_montee("/api/v1/zones"), None);
+    }
 }
 
 #[cfg(test)]
