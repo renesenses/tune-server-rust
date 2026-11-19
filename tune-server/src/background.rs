@@ -34,6 +34,9 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // #8325 — une fois : relire WORK / MOVEMENTNAME / BAND des fichiers
     // déjà importés, sans scan à lancer par l'utilisateur.
     crate::routes::library::relecture_classique::armer(state);
+    // rc12 — une seule fois : renvoyer au site les images d'artistes
+    // qu'il a perdues (22/10 → 13/11/2026), si l'utilisateur partage.
+    crate::routes::library::renvoi_images_artistes::armer(state);
     spawn_hqplayer_poller(state);
     spawn_session_gc(state);
     spawn_dash_temp_gc();
@@ -153,6 +156,7 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // garde la ligne.
     spawn_rattrapage_noms_de_tri(state);
     spawn_pays_des_artistes(state);
+    spawn_pays_des_editions(state);
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state, config);
     spawn_social_sharing_listener(state);
@@ -474,6 +478,94 @@ fn spawn_pays_des_artistes(state: &AppState) {
             }
             reglages
                 .set(PAYS_DES_ARTISTES_CURSEUR, &bilan.dernier_id.to_string())
+                .ok();
+            // Une panne MusicBrainz : on laisse le limiteur se calmer.
+            let pause = if bilan.pannes > 0 { 600 } else { 5 };
+            tokio::time::sleep(std::time::Duration::from_secs(pause)).await;
+        }
+    });
+}
+
+/// #8668 — curseur de reprise de la passe « pays d'édition ».
+const PAYS_DES_EDITIONS_CURSEUR: &str = "pays_des_editions_8668_curseur";
+/// Albums par tour : au créneau d'une requête par seconde, une minute de
+/// MusicBrainz au plus, puis la main aux autres passes.
+const PAYS_DES_EDITIONS_PAR_TOUR: usize = 60;
+/// Une fois la liste parcourue, la passe repart de zéro après ce délai : les
+/// releases identifiées depuis (ou changées) y sont reprises. Sur une base à
+/// jour, un tour ne coûte qu'une requête SQL.
+const PAYS_DES_EDITIONS_RELANCE: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+
+/// #8668 — le pays d'ÉDITION, lu sur la release MusicBrainz de chaque album
+/// identifié sans balise RELEASECOUNTRY (`metadata::pays_des_editions`).
+/// Mêmes gardes que le pays des artistes (#8090) : droit d'enrichissement
+/// automatique, pause « Enrichissement », limiteur MusicBrainz partagé (une
+/// release déjà gardée en base ne coûte aucune requête). Curseur en base.
+fn spawn_pays_des_editions(state: &AppState) {
+    let state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(150)).await;
+        let backend = state.backend.clone();
+        let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone());
+        loop {
+            if !state
+                .license
+                .check_feature(tune_core::license::Feature::AutoEnrichment)
+                .await
+            {
+                tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
+                continue;
+            }
+            if tune_core::taches_de_fond::est_en_pause(
+                tune_core::taches_de_fond::Tache::Enrichissement,
+            ) {
+                tokio::time::sleep(tune_core::taches_de_fond::CADENCE_RELECTURE_PAUSE).await;
+                continue;
+            }
+            let apres = reglages
+                .get(PAYS_DES_EDITIONS_CURSEUR)
+                .ok()
+                .flatten()
+                .and_then(|c| c.parse::<i64>().ok())
+                .unwrap_or(0);
+            let transport = backend.clone();
+            let bilan = match tune_core::metadata::pays_des_editions::rattraper_les_editions(
+                &backend,
+                apres,
+                PAYS_DES_EDITIONS_PAR_TOUR,
+                |mbid| {
+                    tune_core::metadata::pays_des_editions::interroger_la_release(
+                        transport.clone(),
+                        mbid,
+                    )
+                },
+            )
+            .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(error = %e, "pays_des_editions_echoue");
+                    tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                    continue;
+                }
+            };
+            if bilan.traitees > 0 || bilan.pannes > 0 {
+                info!(
+                    traitees = bilan.traitees,
+                    poses = bilan.poses,
+                    sans_pays = bilan.sans_pays,
+                    pannes = bilan.pannes,
+                    fin_de_liste = bilan.fin_de_liste,
+                    "pays_des_editions_tour"
+                );
+            }
+            if bilan.fin_de_liste {
+                reglages.set(PAYS_DES_EDITIONS_CURSEUR, "0").ok();
+                tokio::time::sleep(PAYS_DES_EDITIONS_RELANCE).await;
+                continue;
+            }
+            reglages
+                .set(PAYS_DES_EDITIONS_CURSEUR, &bilan.dernier_id.to_string())
                 .ok();
             // Une panne MusicBrainz : on laisse le limiteur se calmer.
             let pause = if bilan.pannes > 0 { 600 } else { 5 };
@@ -1480,7 +1572,11 @@ fn spawn_dash_temp_gc() {
                     .and_then(|m| now.duration_since(m).ok())
                     .map(|age| age.as_secs() > 600) // 10 min ≫ 240s cache TTL
                     .unwrap_or(false);
-                if too_old && std::fs::remove_file(entry.path()).is_ok() {
+                // #8701 — le fichier d'une piste qu'une zone joue ou prépare
+                // reste : un saut dans la piste le relit.
+                let epingle =
+                    tune_core::audio::dash_epingles::est_epingle(&entry.path().to_string_lossy());
+                if too_old && !epingle && std::fs::remove_file(entry.path()).is_ok() {
                     removed += 1;
                 }
             }
@@ -1716,11 +1812,15 @@ fn spawn_alarm_scheduler(state: &AppState) {
     );
     alarm_sched.spawn();
     // #8213 — arrêt programmé de la lecture à heure fixe ; avec
-    // `action: "poweroff"`, extinction de la machine par la fonction unique
-    // d'extinction (refusée hors Tune OS).
-    let extinction: tune_core::arret_programme::Extinction = Arc::new(|| {
-        Box::pin(crate::routes::appliance::ordonner(
-            crate::routes::appliance::OrdreMachine::Eteindre,
+    // `action: "poweroff"`, extinction de la machine : Tune OS par sa fonction
+    // d'extinction, hôte ordinaire par `extinction_hote` (#8909), jamais dans
+    // un conteneur. Ce crochet est le SEUL appelant de
+    // `extinction_hote::extinction_programmee`.
+    let db_extinction = state.backend.clone();
+    let extinction: tune_core::arret_programme::Extinction = Arc::new(move |mode_range| {
+        Box::pin(crate::extinction_hote::extinction_programmee(
+            db_extinction.clone(),
+            mode_range,
         ))
     });
     Arc::new(
@@ -2914,7 +3014,8 @@ fn spawn_reprise_favoris_streaming(state: &AppState) {
                 .and_then(|v| v.trim().parse::<i64>().ok())
                 .filter(|&id| id > 0)
                 .unwrap_or(1);
-        let comptes = crate::routes::profiles::reprendre_les_favoris(&state, profil, None).await;
+        let mut comptes =
+            crate::routes::profiles::reprendre_les_favoris(&state, profil, None).await;
         let services = comptes.as_object().map(|o| o.len()).unwrap_or(0);
         if services > 0 {
             info!(
@@ -2924,6 +3025,17 @@ fn spawn_reprise_favoris_streaming(state: &AppState) {
                 "reprise_favoris_streaming_au_demarrage"
             );
         }
+        // #8766 — un service qui limitait les demandes (`429`) est repris
+        // après le `Retry-After` annoncé, au lieu d'être abandonné.
+        let state = &state;
+        tune_core::streaming::favorites_import::reprogrammer_apres_les_limites(
+            &mut comptes,
+            std::time::Duration::from_secs(1),
+            |nom| async move {
+                crate::routes::profiles::reprendre_les_favoris(state, profil, Some(&nom)).await
+            },
+        )
+        .await;
     });
 }
 

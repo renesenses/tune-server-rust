@@ -85,7 +85,14 @@ async fn retard_recu(delai_ms: i32, groupees: bool) -> u64 {
         )));
 
     let (envoyee, erreur) = orch
-        .send_to_output(LOCALE, &piste(), None, false, pi, None)
+        .send_to_output(
+            LOCALE,
+            &piste(),
+            None,
+            false,
+            pi,
+            crate::audio::replaygain::PisteRg::AUCUNE,
+        )
         .await;
     assert!(envoyee, "la piste doit partir : {erreur:?}");
 

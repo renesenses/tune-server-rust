@@ -156,7 +156,9 @@ pub(super) enum ImportRequest {
 /// Admin-only: this writes zones, settings and credentials. It was previously
 /// reachable by any caller that passed the premium licence check.
 pub(super) async fn import(
-    _admin: RequireAdmin,
+    // Engage la machine : administrateur, ou authentification coupée,
+    // seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     Json(body): Json<ImportRequest>,
 ) -> impl IntoResponse {
@@ -172,7 +174,14 @@ pub(super) async fn import(
     };
     // Mêmes clés protégées que `PATCH /system/config` : sans admin effectif,
     // écartées de la restauration et nommées dans `report.warnings`.
-    let ecartees = super::config::ecarter_les_cles_protegees(&state, &mut snapshot.settings);
+    let mut ecartees = super::config::ecarter_les_cles_protegees(&state, &mut snapshot.settings);
+    // Sécurité — une racine restaurée passe le périmètre de
+    // l'explorateur, comme `POST /system/music-dirs/add`.
+    ecartees.extend(super::config::ecarter_les_racines_hors_perimetre(
+        &state,
+        &mut snapshot.settings,
+        |v: &String| serde_json::from_str::<Vec<String>>(v).ok(),
+    ));
 
     info!(
         version = %snapshot.version,

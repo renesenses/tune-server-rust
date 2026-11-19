@@ -123,6 +123,33 @@ impl TrancheCue {
         let duree = self.duree_ms?;
         Some(duree.saturating_sub(seek_ms) as f64 / 1000.0)
     }
+
+    /// #8968 — début (dans le fichier image) et durée restante à servir, en
+    /// secondes, À L'ÉCHANTILLON PRÈS à la cadence `cadence` du fichier.
+    ///
+    /// Les millisecondes de la base sont tronquées (`ff × 1000 / 75`) : les
+    /// diviser par mille plaçait chaque frontière jusqu'à 29 échantillons trop
+    /// tôt à 44,1 kHz. `audio::bornes_cue` retrouve la frame CD exacte, puis
+    /// l'échantillon. Le seek de l'utilisateur s'ajoute en échantillons.
+    /// Cadence inconnue (0) : la conversion d'avant, en millisecondes.
+    pub(super) fn en_secondes(&self, seek_ms: u64, cadence: u32) -> (f64, Option<f64>) {
+        if cadence == 0 {
+            return (
+                (self.debut_ms + seek_ms) as f64 / 1000.0,
+                self.duree_restante_s(seek_ms),
+            );
+        }
+        let fin_ms = self.duree_ms.map(|d| self.debut_ms + d);
+        let (debut, fin) =
+            crate::audio::bornes_cue::tranche_en_echantillons(self.debut_ms, fin_ms, cadence);
+        let c = u64::from(cadence);
+        let depart = debut + (seek_ms.saturating_mul(c) + 500) / 1000;
+        let c = c as f64;
+        (
+            depart as f64 / c,
+            fin.map(|f| f.saturating_sub(depart) as f64 / c),
+        )
+    }
 }
 
 /// Ce que les décisions rendent : la décision à exécuter, ou une résolution
@@ -153,6 +180,8 @@ pub(super) struct FormatDeSortie {
     pub(super) out_ext: String,
     pub(super) target_format_str: String,
     pub(super) use_file_transcode: bool,
+    l16: bool,
+    conteneur_natif: bool,
     pub(super) info: StreamInfo,
 }
 
@@ -167,6 +196,14 @@ struct TraitementsDuFichier {
     compensation_cuite_db: Option<f64>,
     replaygain_factor: Option<f64>,
     empreinte_dsp: Option<[u8; 32]>,
+}
+
+/// Distingue le conteneur du codec AAC enregistré au scan.
+fn est_un_conteneur_mp4(chemin: &str) -> bool {
+    std::path::Path::new(chemin)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("m4a") || ext.eq_ignore_ascii_case("mp4"))
 }
 
 /// Ce que le premier temps de `decider_la_lecture_locale` relève de la ligne
@@ -591,10 +628,11 @@ impl PlaybackOrchestrator {
     /// renderer. Un cache vide vaut « je ne sais pas », donc la garde.
     pub async fn dsd_suivant_tenu_sur_dlna(
         &self,
+        zone_id: i64,
         device_id: &str,
         annonce_suivante: crate::outputs::traits::AnnonceSuivante,
     ) -> bool {
-        self.refus_dsd_suivant_sur_dlna(device_id, annonce_suivante)
+        self.refus_dsd_suivant_sur_dlna(zone_id, device_id, annonce_suivante)
             .await
             .is_none()
     }
@@ -603,11 +641,17 @@ impl PlaybackOrchestrator {
     /// `device_id`, `None` s'il peut l'être. Mêmes lectures, sans réseau, que
     /// [`Self::dsd_suivant_tenu_sur_dlna`] ; voir
     /// [`crate::playback::gapless::refus_dsd_suivant_sur_dlna`].
+    ///
+    /// #8969 — le mode DSD de la zone `zone_id` est relu (base, pas de
+    /// réseau) : en « natif », le DSD part brut même au renderer qui ne
+    /// l'annonce pas ([`Self::should_dsd_passthrough`]), sa suivante aussi.
     pub async fn refus_dsd_suivant_sur_dlna(
         &self,
+        zone_id: i64,
         device_id: &str,
         annonce_suivante: crate::outputs::traits::AnnonceSuivante,
     ) -> Option<crate::playback::gapless::RefusDsdSuivant> {
+        let natif_force = ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(zone_id) == "native";
         let annonce_dsd = self
             .dsd_capabilities
             .lock()
@@ -621,6 +665,7 @@ impl PlaybackOrchestrator {
             .contains(device_id);
         crate::playback::gapless::refus_dsd_suivant_sur_dlna(
             annonce_dsd,
+            natif_force,
             annonce_suivante,
             deja_lache,
         )
@@ -945,7 +990,20 @@ impl PlaybackOrchestrator {
             resolved_bd,
             resolved_ch,
         ) = if decision.needs_transcode {
-            self.transcoder_la_piste(req, &decision).await?
+            // #8968 — une tranche CUE que RIEN d'autre ne force à transcoder
+            // (aucun traitement, format admis) entre dans le flux continu
+            // #8082 comme un fichier entier : ses bornes y sont exactes à
+            // l'échantillon, et la jointure avec la tranche suivante n'est
+            // plus laissée au renderer.
+            let flux_cue = if decision.motifs_de_transcodage == ["est_une_tranche_cue"] {
+                self.servir_en_flux_continu(req, &decision).await
+            } else {
+                None
+            };
+            match flux_cue {
+                Some(flux) => flux,
+                None => self.transcoder_la_piste(req, &decision).await?,
+            }
         } else {
             self.servir_en_passthrough(req, &decision).await?
         };
@@ -1678,6 +1736,7 @@ impl PlaybackOrchestrator {
         let aac_passthrough = source_format == Some(AudioFormat::Aac)
             && is_network_output
             && !dlna_force_wav
+            && zone_max_sample_rate.is_none_or(|max| *sample_rate <= max)
             && ZoneRepo::with_backend(self.db.clone()).get_aac_passthrough(req.zone_id);
 
         // Chromecast's Default Media Receiver decodes a narrower set than most
@@ -1927,7 +1986,7 @@ impl PlaybackOrchestrator {
                 // as the EQ — and would be discarded in the same way on a
                 // passthrough. Enabling it is an explicit choice of processing;
                 // PURE zones are excluded upstream.
-                replaygain: self.zone_replaygain_changes_audio(req.zone_id, req.track_id),
+                replaygain: self.zone_replaygain_changes_audio(req.zone_id, req.piste_rg()),
             }
         } else {
             TraitementsDeZone::default()
@@ -2624,6 +2683,9 @@ impl PlaybackOrchestrator {
         String,
     > {
         let format = self.format_de_sortie_avec_bascule(req, decision).await?;
+        if format.conteneur_natif {
+            return self.servir_en_passthrough(req, decision).await;
+        }
         if format.use_file_transcode {
             self.transcoder_vers_fichier(req, decision, format).await
         } else {
@@ -2755,8 +2817,12 @@ impl PlaybackOrchestrator {
         let format = self
             .decider_le_format_de_sortie(req, &decision, None)
             .await?;
-        let dsp =
-            self.load_streaming_dsp(req.zone_id, req.track_id, format.out_sr, decision.channels);
+        let dsp = self.load_streaming_dsp(
+            req.zone_id,
+            req.piste_rg(),
+            format.out_sr,
+            decision.channels,
+        );
         let actif = dsp.is_active();
         Ok((
             actif,
@@ -3270,6 +3336,8 @@ impl PlaybackOrchestrator {
             out_ext,
             target_format_str,
             use_file_transcode,
+            l16: false,
+            conteneur_natif: false,
             info,
         })
     }
@@ -3344,10 +3412,10 @@ impl PlaybackOrchestrator {
         // played at -12 dB, quietly.
         let replaygain_factor = match (
             is_local_output || self.zone_audiophile(req.zone_id),
-            req.track_id,
+            req.piste_rg(),
         ) {
-            (false, Some(tid)) => {
-                let f = crate::audio::replaygain::playback_factor(&self.db, tid);
+            (false, p) if p.est_identifiee() => {
+                let f = crate::audio::replaygain::facteur_de_zone(&self.db, req.zone_id, p);
                 if (f - 1.0).abs() > 1e-6 {
                     Some(f)
                 } else {
@@ -3437,6 +3505,163 @@ impl PlaybackOrchestrator {
         )
     }
 
+    /// #8722 — si le format prévu est refusé par un Sink concluant,
+    /// choisir des octets encodables qu'il accepte, avant tout Play.
+    async fn ajuster_m4a_au_sink(
+        &self,
+        req: &PlayRequest,
+        decision: &DecisionLocale,
+        format: &mut FormatDeSortie,
+    ) -> Result<(), String> {
+        if !matches!(
+            decision.source_format,
+            Some(AudioFormat::Alac | AudioFormat::M4a)
+        ) && !(decision.source_format == Some(AudioFormat::Aac)
+            && est_un_conteneur_mp4(&decision.file_path))
+            || decision
+                .zone
+                .as_ref()
+                .and_then(|z| z.output_type.as_deref())
+                != Some("dlna")
+        {
+            return Ok(());
+        }
+        let did = identifiant_du_renderer(
+            req.output_device_id.as_deref(),
+            decision
+                .zone
+                .as_ref()
+                .and_then(|z| z.output_device_id.as_deref()),
+        );
+        let output = { self.outputs.lock().await.get(did) };
+        let Some(output) = output else { return Ok(()) };
+        let caps = {
+            let locked = output.lock().await;
+            let Some(dlna) = locked
+                .as_any()
+                .downcast_ref::<crate::outputs::dlna::DlnaOutput>()
+            else {
+                return Ok(());
+            };
+            dlna.probe_capabilities().await
+        };
+        if !caps.probed {
+            return Ok(());
+        }
+        let wav = caps.wav
+            || caps.sink.iter().any(|entry| {
+                entry.split(':').nth(2).is_some_and(|mime| {
+                    matches!(
+                        mime.split(';')
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_ascii_lowercase()
+                            .as_str(),
+                        "audio/wave" | "audio/vnd.wave"
+                    )
+                })
+            });
+        if (format.target_format_str == "flac" && caps.flac)
+            || (format.target_format_str == "wav" && wav)
+        {
+            return Ok(());
+        }
+        let l16 = caps.sink.iter().any(|entry| {
+            let Some(mime) = entry.split(':').nth(2) else {
+                return false;
+            };
+            let mut fields = mime.split(';');
+            if !fields
+                .next()
+                .is_some_and(|m| m.trim().eq_ignore_ascii_case("audio/l16"))
+            {
+                return false;
+            }
+            fields.all(|field| {
+                let Some((k, v)) = field.trim().split_once('=') else {
+                    return true;
+                };
+                match k.trim().to_ascii_lowercase().as_str() {
+                    "rate" => v.trim().parse::<u32>() == Ok(format.out_sr),
+                    "channels" => v.trim().parse::<u16>() == Ok(decision.channels),
+                    _ => true,
+                }
+            })
+        });
+        let (target, bits, raw_l16) = if caps.flac {
+            (
+                "flac",
+                if decision.dlna_cap_16bit {
+                    16
+                } else {
+                    decision.bit_depth.clamp(16, 24)
+                },
+                false,
+            )
+        } else if l16 {
+            if decision.bit_depth > 16
+                && (decision.dlna_wav24
+                    || crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id))
+            {
+                return Err("Le lecteur DLNA ne propose que du L16 : le réglage actuel interdit la réduction à 16 bits.".into());
+            }
+            ("wav", 16, true)
+        } else if wav {
+            ("wav", format.out_bd, false)
+        } else {
+            // Le conteneur original n'est qu'un dernier recours. Il ne doit
+            // jamais effacer un traitement, une limite ou un forçage de zone.
+            let natif_annonce = caps.sink.iter().any(|entry| {
+                entry.split(':').nth(2).is_some_and(|mime| {
+                    matches!(
+                        mime.split(';')
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_ascii_lowercase()
+                            .as_str(),
+                        "audio/mp4" | "audio/m4a" | "audio/x-m4a" | "*"
+                    )
+                })
+            });
+            let zones = ZoneRepo::with_backend(self.db.clone());
+            let sans_traitement = decision
+                .motifs_de_transcodage
+                .iter()
+                .all(|motif| matches!(*motif, "needs_transcode_for_output" | "dlna_needs_wav"));
+            if natif_annonce
+                && sans_traitement
+                && !zones.get_dlna_lpcm(req.zone_id)
+                && !zones.get_dlna_wav24(req.zone_id)
+            {
+                format.conteneur_natif = true;
+                return Ok(());
+            }
+            return Err(format!(
+                "Le lecteur DLNA n'annonce aucun format de sortie compatible avec ce M4A à {} Hz / {} canaux (FLAC, L16 ou WAV).",
+                format.out_sr, decision.channels
+            ));
+        };
+        format.target_format_str = target.into();
+        format.out_ext = target.into();
+        format.out_bd = bits;
+        format.l16 = raw_l16;
+        format.out_mime = if raw_l16 {
+            format!(
+                "audio/L16;rate={};channels={}",
+                format.out_sr, decision.channels
+            )
+        } else {
+            format!("audio/{target}")
+        };
+        format.info.format = if raw_l16 { "l16" } else { target }.into();
+        format.info.mime_type = format.out_mime.clone();
+        format.info.bit_depth = bits;
+        format.use_file_transcode = true;
+        Ok(())
+    }
+
     /// #8558 (volet B) — le format de sortie, avec la bascule vers le WAV
     /// progressif d'une piste trop lourde pour le bras FICHIER (la piste
     /// entière en mémoire). Forum, fil 2777 : un FLAC 192/24 vers un
@@ -3456,10 +3681,11 @@ impl PlaybackOrchestrator {
         decision: &DecisionLocale,
     ) -> Result<FormatDeSortie, String> {
         use super::bascule_progressive_8558 as b;
-        let format = self
+        let mut format = self
             .decider_le_format_de_sortie(req, decision, None)
             .await?;
-        if !format.use_file_transcode {
+        self.ajuster_m4a_au_sink(req, decision, &mut format).await?;
+        if format.conteneur_natif || format.l16 || !format.use_file_transcode {
             return Ok(format);
         }
         let src_fmt = decision.source_format.unwrap_or(AudioFormat::Flac);
@@ -3538,8 +3764,11 @@ impl PlaybackOrchestrator {
             profondeur = ?profondeur,
             "bras_fichier_trop_lourd_session_progressive_8558"
         );
-        self.decider_le_format_de_sortie(req, decision, Some(profondeur))
-            .await
+        let mut format = self
+            .decider_le_format_de_sortie(req, decision, Some(profondeur))
+            .await?;
+        self.ajuster_m4a_au_sink(req, decision, &mut format).await?;
+        Ok(format)
     }
 
     /// Deuxième temps, sorties réseau : décodage → encodage → fichier
@@ -3567,6 +3796,7 @@ impl PlaybackOrchestrator {
             out_mime,
             out_ext,
             target_format_str,
+            l16,
             ..
         } = format;
         let flux = {
@@ -3648,8 +3878,19 @@ impl PlaybackOrchestrator {
                 crate::transcode_cache::touch(cp);
                 let file_size = std::fs::metadata(cp).map(|m| m.len()).unwrap_or(0);
                 info!(file = %file_path, cache = %cp, file_size, "transcode_cache_hit");
+                let source_l16: Option<Arc<dyn crate::http::streamer::SourceVirtuelle>> = if l16 {
+                    Some(Arc::new(
+                        crate::audio::l16_depuis_wav::L16DepuisWav::ouvrir_pour_mime(
+                            std::path::Path::new(cp),
+                            &out_mime,
+                        )?,
+                    ))
+                } else {
+                    None
+                };
+                let file_size = source_l16.as_ref().map_or(file_size, |s| s.total());
                 let file_info = StreamInfo {
-                    format: out_ext.clone(),
+                    format: if l16 { "l16".into() } else { out_ext.clone() },
                     mime_type: out_mime.clone(),
                     sample_rate: out_sr,
                     bit_depth: out_bd,
@@ -3664,6 +3905,11 @@ impl PlaybackOrchestrator {
                     .streamer
                     .create_file_session(file_info, cp.clone(), false)
                     .await;
+                if let Some(source) = source_l16 {
+                    self.streamer
+                        .set_source_virtuelle(&session_id, source)
+                        .await;
+                }
                 self.streamer
                     .noter_la_voie(&session_id, crate::http::streamer::voie::FICHIER_CONVERTI)
                     .await;
@@ -3752,7 +3998,7 @@ impl PlaybackOrchestrator {
                 (
                     session_id,
                     out_mime,
-                    out_ext,
+                    if l16 { "l16".into() } else { out_ext },
                     Some(file_size),
                     Some(out_sr),
                     Some(out_bd as u32),
@@ -3836,9 +4082,13 @@ impl PlaybackOrchestrator {
                         Some(abandon.clone()),
                         // #3631 — la tranche à découper dans le fichier image.
                         // `None` pour un fichier ordinaire.
-                        tranche_cue.map(|t| TrancheSource {
-                            debut_s: t.debut_ms as f64 / 1000.0,
-                            duree_s: t.duree_ms.map(|d| d as f64 / 1000.0).unwrap_or(0.0),
+                        // #8968 — bornes à l'échantillon près.
+                        tranche_cue.map(|t| {
+                            let (debut_s, duree_s) = t.en_secondes(0, sample_rate);
+                            TrancheSource {
+                                debut_s,
+                                duree_s: duree_s.unwrap_or(0.0),
+                            }
                         }),
                         crossfeed.map(|(processeur, _)| processeur),
                         compensation,
@@ -3914,8 +4164,20 @@ impl PlaybackOrchestrator {
 
                         // Create a file session — HTTP handler serves with
                         // Content-Length and Range support.
+                        let source_l16: Option<Arc<dyn crate::http::streamer::SourceVirtuelle>> =
+                            if l16 {
+                                Some(Arc::new(
+                                    crate::audio::l16_depuis_wav::L16DepuisWav::ouvrir_pour_mime(
+                                        std::path::Path::new(&serve_path),
+                                        &out_mime,
+                                    )?,
+                                ))
+                            } else {
+                                None
+                            };
+                        let file_size = source_l16.as_ref().map_or(file_size, |s| s.total());
                         let file_info = StreamInfo {
-                            format: out_ext.clone(),
+                            format: if l16 { "l16".into() } else { out_ext.clone() },
                             mime_type: out_mime.clone(),
                             sample_rate: out_sr,
                             bit_depth: out_bd,
@@ -3930,6 +4192,11 @@ impl PlaybackOrchestrator {
                             .streamer
                             .create_file_session(file_info, serve_path, false)
                             .await;
+                        if let Some(source) = source_l16 {
+                            self.streamer
+                                .set_source_virtuelle(&session_id, source)
+                                .await;
+                        }
                         self.streamer
                             .noter_la_voie(
                                 &session_id,
@@ -3958,7 +4225,7 @@ impl PlaybackOrchestrator {
                         (
                             session_id,
                             out_mime,
-                            out_ext,
+                            if l16 { "l16".into() } else { out_ext },
                             Some(file_size),
                             Some(out_sr),
                             Some(out_bd as u32),
@@ -4063,6 +4330,7 @@ impl PlaybackOrchestrator {
     ) -> Result<FluxLocal, String> {
         let DecisionLocale {
             channels,
+            sample_rate,
             tranche_cue,
             is_local_output,
             ref file_path,
@@ -4091,7 +4359,7 @@ impl PlaybackOrchestrator {
             // Chargé AVANT la session (#5114) : le flux doit dire, dans son
             // `StreamInfo`, s'il porte le crossfeed — et seul le porteur
             // réellement posé sur le canal le sait.
-            let mut dsp = self.load_streaming_dsp(req.zone_id, req.track_id, out_sr, channels);
+            let mut dsp = self.load_streaming_dsp(req.zone_id, req.piste_rg(), out_sr, channels);
             let relais = relais_dsp_progressif(dsp.is_active(), is_local_output);
             let mut info = info;
             info.crossfeed = relais && dsp.crossfeed_executable();
@@ -4201,11 +4469,13 @@ impl PlaybackOrchestrator {
             // PISTE. Pour une tranche de feuille CUE, la position dans le
             // FICHIER est le début de la tranche PLUS ce seek ; la durée
             // restante à servir, elle, en est diminuée d'autant.
+            //
+            // #8968 — bornes de la tranche à l'échantillon près.
             let seek_utilisateur_ms = req.seek_ms.unwrap_or(0);
-            let seek_s = (tranche_cue.map(|t| t.debut_ms).unwrap_or(0) + seek_utilisateur_ms)
-                as f64
-                / 1000.0;
-            let duree_tranche_s = tranche_cue.and_then(|t| t.duree_restante_s(seek_utilisateur_ms));
+            let (seek_s, duree_tranche_s) = match tranche_cue {
+                Some(t) => t.en_secondes(seek_utilisateur_ms, sample_rate),
+                None => (seek_utilisateur_ms as f64 / 1000.0, None),
+            };
             // Les niveaux sont datés sur l'horloge de la PISTE : le décalage
             // du fichier image n'a rien à y faire.
             let seek_niveaux_ms = seek_utilisateur_ms as i64;
@@ -4322,6 +4592,94 @@ impl PlaybackOrchestrator {
         Ok(flux)
     }
 
+    /// #8082 — « Flux continu entre les pistes » : la piste et les suivantes
+    /// de même format partent en UN seul WAV, sans traitement. Réglage
+    /// éteint, sortie non réseau, ou suite d'une seule piste : `None`, rien
+    /// ne change. Appelé par le passthrough, et (#8968) par une tranche CUE
+    /// que rien d'autre ne force à transcoder.
+    async fn servir_en_flux_continu(
+        &self,
+        req: &PlayRequest,
+        decision: &DecisionLocale,
+    ) -> Option<FluxLocal> {
+        let DecisionLocale {
+            is_network_output,
+            ref file_path,
+            ref zone,
+            ..
+        } = *decision;
+        if !is_network_output {
+            return None;
+        }
+        let flux = self
+            .preparer_le_flux_continu(
+                req.zone_id,
+                zone.as_ref().and_then(|z| z.output_type.as_deref()),
+                req.track_id,
+                file_path,
+                req.seek_ms,
+            )
+            .await?;
+        let format = flux.wav.format();
+        let total = crate::http::streamer::SourceVirtuelle::total(&flux.wav);
+        let duree_ms = flux.wav.bornes_ms().iter().map(|(_, d)| d).sum::<u64>();
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: format.cadence,
+            bit_depth: format.profondeur,
+            channels: format.canaux,
+            file_size: Some(total),
+            duration_ms: Some(duree_ms),
+            ..Default::default()
+        };
+        let session_id = self
+            .streamer
+            .create_file_session(info, file_path.clone(), false)
+            .await;
+        let plan = super::flux_continu_8082::plan_du_flux(req.zone_id, &session_id, &flux);
+        info!(
+            zone_id = req.zone_id,
+            stream_id = %session_id,
+            pistes = plan.pistes.len(),
+            positions = ?plan.pistes.iter().map(|p| p.position).collect::<Vec<_>>(),
+            cadence = format.cadence,
+            profondeur = format.profondeur,
+            canaux = format.canaux,
+            octets = total,
+            depart_ms = req.seek_ms.unwrap_or(0),
+            "flux_continu_servi"
+        );
+        self.streamer
+            .set_source_virtuelle(&session_id, Arc::new(flux.wav))
+            .await;
+        self.streamer
+            .noter_la_voie(&session_id, crate::http::streamer::voie::FLUX_CONTINU)
+            .await;
+        // Relance à une position : le flux commence DÉJÀ là. Le départ,
+        // porté par l'URL, ramène le relevé du renderer au début de la
+        // piste (#6059) et retient le `Seek` d'après relecture.
+        if let Some(depart) = req.seek_ms.filter(|d| *d > 0) {
+            crate::outputs::dlna_depart_natif::inscrire_session(&session_id, depart);
+        }
+        if let Some(did) = req
+            .output_device_id
+            .as_deref()
+            .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
+        {
+            crate::outputs::dlna_flux_continu::inscrire(did, plan);
+        }
+        Some((
+            session_id,
+            "audio/wav".into(),
+            "wav".into(),
+            Some(total),
+            Some(format.cadence),
+            Some(u32::from(format.profondeur)),
+            Some(u32::from(format.canaux)),
+        ))
+    }
+
     /// Arme « passthrough » du grand tuple de `resolve_local_track`, sortie telle
     /// quelle : le fichier est servi brut par une session de fichier, avec le
     /// décodage parallèle pour les niveaux quand personne d'autre ne décode.
@@ -4357,78 +4715,9 @@ impl PlaybackOrchestrator {
             ref conteneur_flac_neuf,
             ..
         } = *decision;
-        // #8082 — « Flux continu entre les pistes » : la piste et les
-        // suivantes de même format partent en UN seul WAV, sans traitement.
-        // Réglage éteint, ou suite d'une seule piste : rien ne change.
-        if is_network_output
-            && let Some(flux) = self
-                .preparer_le_flux_continu(
-                    req.zone_id,
-                    zone.as_ref().and_then(|z| z.output_type.as_deref()),
-                    req.track_id,
-                    file_path,
-                    req.seek_ms,
-                )
-                .await
-        {
-            let format = flux.wav.format();
-            let total = crate::http::streamer::SourceVirtuelle::total(&flux.wav);
-            let duree_ms = flux.wav.bornes_ms().iter().map(|(_, d)| d).sum::<u64>();
-            let info = StreamInfo {
-                format: "wav".into(),
-                mime_type: "audio/wav".into(),
-                sample_rate: format.cadence,
-                bit_depth: format.profondeur,
-                channels: format.canaux,
-                file_size: Some(total),
-                duration_ms: Some(duree_ms),
-                ..Default::default()
-            };
-            let session_id = self
-                .streamer
-                .create_file_session(info, file_path.clone(), false)
-                .await;
-            let plan = super::flux_continu_8082::plan_du_flux(req.zone_id, &session_id, &flux);
-            info!(
-                zone_id = req.zone_id,
-                stream_id = %session_id,
-                pistes = plan.pistes.len(),
-                positions = ?plan.pistes.iter().map(|p| p.position).collect::<Vec<_>>(),
-                cadence = format.cadence,
-                profondeur = format.profondeur,
-                canaux = format.canaux,
-                octets = total,
-                depart_ms = req.seek_ms.unwrap_or(0),
-                "flux_continu_servi"
-            );
-            self.streamer
-                .set_source_virtuelle(&session_id, Arc::new(flux.wav))
-                .await;
-            self.streamer
-                .noter_la_voie(&session_id, crate::http::streamer::voie::FLUX_CONTINU)
-                .await;
-            // Relance à une position : le flux commence DÉJÀ là. Le départ,
-            // porté par l'URL, ramène le relevé du renderer au début de la
-            // piste (#6059) et retient le `Seek` d'après relecture.
-            if let Some(depart) = req.seek_ms.filter(|d| *d > 0) {
-                crate::outputs::dlna_depart_natif::inscrire_session(&session_id, depart);
-            }
-            if let Some(did) = req
-                .output_device_id
-                .as_deref()
-                .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
-            {
-                crate::outputs::dlna_flux_continu::inscrire(did, plan);
-            }
-            return Ok((
-                session_id,
-                "audio/wav".into(),
-                "wav".into(),
-                Some(total),
-                Some(format.cadence),
-                Some(u32::from(format.profondeur)),
-                Some(u32::from(format.canaux)),
-            ));
+        // #8082 — « Flux continu entre les pistes ».
+        if let Some(flux) = self.servir_en_flux_continu(req, decision).await {
+            return Ok(flux);
         }
         // #6221 — un DSDIFF DST vers un renderer réseau ne part JAMAIS brut
         // (#4378) : le passthrough sert à sa place un DSF fabriqué à la volée.
@@ -4470,6 +4759,9 @@ impl PlaybackOrchestrator {
                 cap.get(did)
                     .and_then(|c| c.dsf_mime.clone())
                     .unwrap_or_else(|| "application/x-dsd".into())
+            } else if source_format == Some(AudioFormat::Aac) && est_un_conteneur_mp4(file_path) {
+                // Le codec AAC scanné ne distingue pas ADTS du conteneur MP4.
+                "audio/mp4".into()
             } else {
                 source_format
                     .map(|f| f.mime_type().to_string())
@@ -5013,3 +5305,7 @@ pub(super) fn cadences_pcm_de_test()
         std::sync::OnceLock::new();
     T.get_or_init(Default::default)
 }
+
+#[cfg(test)]
+#[path = "saut_local_8983_tests.rs"]
+mod saut_local_8983_tests;

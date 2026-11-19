@@ -151,13 +151,56 @@ pub fn ajouter_mes_plus_ecoutes(
             return;
         }
     };
-    let ajouts: Vec<Value> = morceaux(ecoutes)
-        .into_iter()
-        .filter(|m| !deja_dans_la_liste(m, service, items))
-        .filter_map(|m| piste_jouable(&m, service))
-        .take(MES_PLUS_ECOUTES_MAX)
+    // web#3045 (fil 2822, Supertramp) — deux morceaux peuvent désigner le
+    // MÊME enregistrement : deux lignes d'historique d'un même titre, à des
+    // durées écartées de plus de la tolérance (tranches CUE), se résolvent
+    // sur la même piste. Les deux ajouts portaient la même désignation, et la
+    // liste du client, indexée par elle, se figeait (`each_key_duplicate`).
+    // Une désignation déjà présente, dans la liste ou parmi les ajouts, n'est
+    // jamais ajoutée une seconde fois ; un titre déjà ajouté non plus.
+    let mut vues: Vec<String> = items
+        .iter()
+        .filter_map(|v| designation(v, service))
         .collect();
+    let mut ajouts: Vec<Value> = Vec::new();
+    for m in morceaux(ecoutes) {
+        if ajouts.len() >= MES_PLUS_ECOUTES_MAX {
+            break;
+        }
+        if deja_dans_la_liste(&m, service, items) || deja_dans_la_liste(&m, service, &ajouts) {
+            continue;
+        }
+        let Some(piste) = piste_jouable(&m, service) else {
+            continue;
+        };
+        if let Some(cle) = designation(&piste, service) {
+            if vues.contains(&cle) {
+                continue;
+            }
+            vues.push(cle);
+        }
+        ajouts.push(piste);
+    }
     items.extend(ajouts);
+}
+
+/// La désignation d'un titre, celle qui l'indexe chez le client : sa source
+/// (celle du service à défaut) et son identifiant (`id`, sinon `source_id`).
+/// `None` pour un titre sans identifiant.
+fn designation(v: &Value, service: &str) -> Option<String> {
+    let source = v
+        .get("source")
+        .and_then(Value::as_str)
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| service.to_string());
+    let id = |c: &str| match v.get(c) {
+        Some(Value::String(s)) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        _ => None,
+    };
+    let id = id("id").or_else(|| id("source_id"))?;
+    Some(format!("{source}:{id}"))
 }
 
 /// L'interprète que nomment le plus souvent les titres (à égalité, le
@@ -245,12 +288,42 @@ fn deja_dans_la_liste(m: &Morceau, service: &str, items: &[Value]) -> bool {
     })
 }
 
+/// Les sources qui désignent un titre d'un CATALOGUE : un service qui le
+/// rejoue à la demande, aujourd'hui comme demain.
+///
+/// 🔴 Recette de Bertrand, .18, rc12 (13/11/2026) : fiche Genesis › Titres
+/// phares › « Dance on a Volcano » → « Erreur de lecture — HTTP 500 —
+/// aucun disque dans le lecteur ». Le titre avait été écouté 11 fois sur le
+/// CD (`source = "cd"`, `source_id` = disque/plage) avant d'être extrait ; la
+/// règle d'avant classait toute source non locale AVANT le fichier, et le
+/// titre ajouté désignait donc le CD, sorti du lecteur depuis. Un CD, un
+/// serveur UPnP, une entrée audio, une radio, un fichier glissé ne sont pas
+/// des catalogues : ce qu'ils désignaient n'est plus forcément là. Seul un
+/// service de cette liste, ou un fichier de la bibliothèque, désigne un titre
+/// phare.
+pub const SOURCES_DE_CATALOGUE: [&str; 7] = [
+    "qobuz", "tidal", "deezer", "spotify", "youtube", "amazon", "bandcamp",
+];
+
+/// La source désigne-t-elle un titre d'un catalogue (voir
+/// [`SOURCES_DE_CATALOGUE`]) ?
+pub fn est_une_source_de_catalogue(source: &str) -> bool {
+    SOURCES_DE_CATALOGUE.contains(&source.trim().to_ascii_lowercase().as_str())
+}
+
 /// Le titre ajouté, désigné par l'enregistrement le plus jouable du morceau.
+///
+/// Un enregistrement écouté sur un appareil (CD, serveur UPnP, entrée audio…)
+/// ne désigne jamais le titre : voir [`SOURCES_DE_CATALOGUE`]. Le morceau se
+/// désigne alors par un service ou par le fichier de la bibliothèque, et
+/// n'est pas ajouté s'il n'en a aucun.
 fn piste_jouable(m: &Morceau, service: &str) -> Option<Value> {
     let rang = |l: &EcouteDInterprete| -> Option<u8> {
         if l.source == "local" {
             l.track_id.map(|_| 2)
         } else if l.source_id.is_empty() {
+            None
+        } else if l.source != service && !est_une_source_de_catalogue(&l.source) {
             None
         } else if l.source == service {
             Some(0)

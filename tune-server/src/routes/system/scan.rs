@@ -880,6 +880,40 @@ pub(crate) fn sous_le_dossier(path: &str, dossier: &str) -> bool {
     tune_core::metadata::enrich_scope::sous_le_dossier(path, dossier)
 }
 
+/// La cible d'un scan ciblé (`POST /system/scan?path=`) est-elle sous un
+/// dossier de musique ?
+///
+/// Sécurité — `sous_le_dossier` seul est un test de PRÉFIXE de texte :
+/// `/musique/../home` y passait, et le scan indexait (donc rendait lisibles)
+/// les fichiers audio de n'importe quel dossier de la machine.
+/// `tune_core::chemin_sur` refuse d'abord tout `..`, sur les deux séparateurs.
+pub(crate) fn cible_autorisee(cible: &str, music_dirs: &[String]) -> bool {
+    tune_core::chemin_sur::racine_contenante(cible, music_dirs).is_ok()
+        && music_dirs.iter().any(|root| sous_le_dossier(cible, root))
+}
+
+#[cfg(test)]
+mod cible_autorisee_tests {
+    use super::cible_autorisee;
+
+    #[test]
+    fn une_cible_qui_remonte_hors_des_dossiers_est_refusee() {
+        let dirs = vec!["/mnt/musique".to_string(), r"D:\Musique".to_string()];
+        assert!(cible_autorisee("/mnt/musique/Jazz", &dirs));
+        assert!(cible_autorisee(r"D:\Musique\Jazz", &dirs));
+        for c in [
+            "/mnt/musique/../home/user",
+            "/mnt/musique/Jazz/../../../etc",
+            r"D:\Musique\..\Users",
+            "/mnt/musique/%2e%2e/home",
+            "/mnt/musique2/x",
+            "/etc",
+        ] {
+            assert!(!cible_autorisee(c, &dirs), "{c} doit être refusée");
+        }
+    }
+}
+
 /// Ce que la purge de fin de scan a le droit de faire d'une piste absente du
 /// disque.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2001,7 +2035,7 @@ async fn spawn_library_scan_avec_lecteur_par(
             // scan ciblé ne pouvait aboutir — chacun retombait en scan complet,
             // silencieusement, en journalisant « outside music dirs » pour un
             // chemin qui était pourtant dedans.
-            if music_dirs.iter().any(|root| sous_le_dossier(p, root)) {
+            if cible_autorisee(p, &music_dirs) {
                 Some(p.clone())
             } else {
                 tracing::warn!(path = %p, dirs = ?music_dirs, "scan_targeted_path_outside_music_dirs — falling back to full scan");
@@ -3470,6 +3504,14 @@ async fn spawn_library_scan_avec_lecteur_par(
             // moi ») : même mécanique, même garde `full_scan_ok`.
             tune_core::db::suggestions_ecartees::reconcilier_journalise(
                 db.clone(),
+                full_scan_ok,
+                "fin_de_scan",
+            );
+            // #8958 — les alertes « Albums douteux » marquées normales tiennent
+            // par clé stable (chemin, dossier) : seules celles dont la clé ne
+            // correspond plus à aucune piste sont retirées, sur scan complet sain.
+            tune_core::db::alertes_douteuses_ignorees::purger_en_fin_de_scan(
+                &db,
                 full_scan_ok,
                 "fin_de_scan",
             );

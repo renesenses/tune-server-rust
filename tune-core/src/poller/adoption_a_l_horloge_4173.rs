@@ -309,9 +309,13 @@ impl Banc {
     }
 
     async fn tic(&mut self) {
-        self.poller
-            .tick(&mut self.poll_states, &mut self.idle, &Instant::now())
-            .await;
+        // Le sondage peut relancer une lecture complète. Garder sa grosse
+        // future sur le tas évite de la répéter dans chaque état du banc.
+        Box::pin(
+            self.poller
+                .tick(&mut self.poll_states, &mut self.idle, &Instant::now()),
+        )
+        .await;
     }
 
     /// 19:16:47 — la fenêtre d'armement : `SetNext` acquitté par le
@@ -716,6 +720,11 @@ mod blanc_du_dmp_a6_rc2_4382;
 #[cfg(test)]
 mod bascule_sur_la_suivante_3967;
 
+/// #8863 — les grosses futures du sondage et de la préparation de la
+/// suivante restent en tas : la pile du fil de test ne déborde plus.
+#[cfg(test)]
+mod pile_du_sondeur_8863;
+
 /// #4682 — un déplacement de la barre de progression ne fausse plus
 /// l'enchaînement : ce même banc, la fin de piste rejouée après un
 /// déplacement près de la fin, et un recul après l'armement.
@@ -749,7 +758,30 @@ mod preparation_bornee_5970;
 #[cfg(test)]
 mod set_next_coupe_la_piste_6477;
 
+/// #8868 (FiiO K17, fil 2323, rc12) — la règle #6477 relue après un
+/// redémarrage, en DSF natif comme en DoP ; le renderer conforme garde son
+/// `SetNext`.
+#[cfg(test)]
+mod k17_dsf_set_next_8868;
+
 /// #6910 (fil 2412) — le suivant DSD armé sur le renderer DLNA qui annonce le
 /// DSD et `SetNext` ; la garde de #402 gardée pour les autres.
 #[cfg(test)]
 mod dsd_suivant_dlna_6910;
+
+/// Budget du cadre de sondage du banc : il est emboîté plusieurs fois dans
+/// les scénarios d'adoption, sur la petite pile des threads de test macOS.
+/// Le cadre doit rester léger (4 Kio au plus), sans embarquer les quelque
+/// 25 Kio de la future tick mesurés sans allocation sur Shrek.
+/// Cette garde de taille ne reproduit pas à elle seule le crash macOS.
+#[tokio::test]
+async fn le_sondage_du_banc_garde_un_cadre_borne_8785() {
+    let mut banc = Banc::monter().await;
+    let sondage = banc.tic();
+    let taille = std::mem::size_of_val(&sondage);
+    eprintln!("#8785 : cadre du sondage = {taille} octets");
+    assert!(
+        taille <= 4 * 1024,
+        "cadre du sondage trop gros : {taille} octets"
+    );
+}

@@ -223,6 +223,12 @@ const MIGRATION_TABLES: &[&str] = &[
     // Contrôle parental (#7856) : sans cette ligne, un profil supervisé
     // retrouverait des listes sans filtre après la bascule.
     "politiques_parentales",
+    // Alertes de « Albums douteux » marquées normales (#8958) : sans cette
+    // ligne, toutes reviendraient à la bascule SQLite → PostgreSQL.
+    "alertes_douteuses_ignorees",
+    // Titres diffusés par les radios (#8487) : sans cette ligne, ils
+    // disparaîtraient de l'historique à la bascule, sous leurs stations.
+    "radio_titres_diffuses",
 ];
 
 /// Tables copiees APRES `run_pg_migrations` : elles ne sont creees que par
@@ -235,6 +241,10 @@ const MIGRATION_TABLES_APRES_SCRIPTS: &[&str] = &[
     // Positions des épisodes de podcast (#8170), créées par le script 116 :
     // sans cette ligne, chaque épisode commencé repartirait du début.
     "podcast_episode_positions",
+    // Associations manuelles de « Ma collection physique » (#8672), créées
+    // par le script 119 : sans cette ligne, chaque disque associé à la main
+    // retomberait « nulle part » après la bascule.
+    "collection_physique_associations",
     // Écoutes importées (#7763, script 101) : sans cette ligne, les écoutes
     // reportées de Roon, Plex ou d'une liste m3u seraient perdues à la bascule.
     "imported_plays",
@@ -1229,6 +1239,33 @@ CREATE TABLE IF NOT EXISTS enrich_tentatives (
  mtime_vu TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_enrich_tentatives_issue ON enrich_tentatives(issue, reessai_apres);
+-- Alertes de « Albums douteux » marquées normales (#8958). Sans script
+-- numéroté : présente ici (bascule) ET dans `ENSURE_TABLES`, mêmes types
+-- (migrations/alertes_douteuses_ignorees.sql). Copiée.
+CREATE TABLE IF NOT EXISTS alertes_douteuses_ignorees (
+ portee TEXT NOT NULL,
+ cle TEXT NOT NULL,
+ titre TEXT NOT NULL DEFAULT '',
+ raison TEXT NOT NULL,
+ cible_id BIGINT,
+ libelle TEXT,
+ ignoree_le BIGINT NOT NULL,
+ PRIMARY KEY (portee, cle, titre, raison)
+);
+-- Titres diffusés par les radios (#8487). Sans script numéroté : présente
+-- ici (bascule) ET dans `ENSURE_TABLES`, mêmes types
+-- (migrations/radio_titres_diffuses.sql). Copiée.
+CREATE TABLE IF NOT EXISTS radio_titres_diffuses (
+ ecoute_id BIGINT NOT NULL,
+ diffuse_le BIGINT NOT NULL,
+ zone_id BIGINT,
+ flux TEXT,
+ station TEXT NOT NULL DEFAULT '',
+ titre TEXT NOT NULL,
+ artiste TEXT,
+ pochette TEXT,
+ PRIMARY KEY (ecoute_id, diffuse_le)
+);
 -- « Pas pour moi » de l'accueil (web#916, SQLite 145 / PG 111), par profil.
 CREATE TABLE IF NOT EXISTS suggestions_ecartees (
     profile_id BIGINT NOT NULL DEFAULT 1,
@@ -1475,6 +1512,10 @@ ALTER TABLE radio_stations ADD COLUMN IF NOT EXISTS surcharge_locale TEXT;
 -- PG 117, #8615). TEXT pour la copie ; la 117, rejouee juste apres, la
 -- convertit.
 ALTER TABLE alarms ADD COLUMN IF NOT EXISTS interrupt_playback TEXT DEFAULT 1;
+-- albums: pays d'edition lu sur MusicBrainz et release dont il a ete lu
+-- (SQLite migration v154 / PG 120, #8668). TEXT des deux cotes.
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_country TEXT;
+ALTER TABLE albums ADD COLUMN IF NOT EXISTS release_country_mbid TEXT;
 -- artists: provenance du nom de tri (SQLite migration v131 / PG 095, #6474).
 ALTER TABLE artists ADD COLUMN IF NOT EXISTS sort_name_source TEXT;
 -- artists: provenance du MBID (SQLite migration v133 / PG 097, #6463).
@@ -1926,7 +1967,10 @@ fn conflict_clause(table: &str) -> &'static str {
         "settings" => "ON CONFLICT (key) DO NOTHING",
         "listening_resumes" => "ON CONFLICT (zone_id, context_type, context_id, source) DO NOTHING",
         "podcast_episode_positions" => "ON CONFLICT (zone_id, episode_key) DO NOTHING",
+        "collection_physique_associations" => "ON CONFLICT (release_id) DO NOTHING",
         "politiques_parentales" => "ON CONFLICT (profile_id) DO NOTHING",
+        "alertes_douteuses_ignorees" => "ON CONFLICT (portee, cle, titre, raison) DO NOTHING",
+        "radio_titres_diffuses" => "ON CONFLICT (ecoute_id, diffuse_le) DO NOTHING",
         "notes_personnelles" => "ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
         "apports_service_albums" => "ON CONFLICT (album_id, source) DO NOTHING",
         "apports_service" => "ON CONFLICT (album_id, track_id, champ, source) DO NOTHING",

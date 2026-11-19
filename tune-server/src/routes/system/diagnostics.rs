@@ -404,6 +404,182 @@ fn section_famine_anneau(releve: &[Value]) -> String {
     md
 }
 
+/// #8696 — le relevé JSON des sessions WASAPI exclusives en cours.
+fn releve_reveils_wasapi_json(
+    releve: &[tune_core::outputs::rendu_sans_bridage_8696::ReleveSessionWasapi],
+) -> Vec<Value> {
+    releve
+        .iter()
+        .map(|s| {
+            json!({
+                "device": s.peripherique,
+                "in_progress": s.en_cours,
+                "period_us": s.periode_us,
+                "late_wakeups": s.reveils_en_retard,
+                "max_wakeup_gap_us": s.ecart_max_us,
+                "underruns": s.underruns,
+                "deadline_misses": s.deadline_misses,
+                "persistent_late_wakeups": s.retards_persistants,
+                "power_throttling_opt_out": s.bridage_refuse,
+                // #8696 — écarts en périodes : 2, 3, 4, 5, 6 et plus.
+                "late_wakeup_gap_periods": {
+                    "labels": tune_core::outputs::mesure_du_retard_8696::LIBELLES_DES_CASES,
+                    "counts": s.histogramme_periodes,
+                },
+                "reopened_after_ms": s.reouverture_apres_ms,
+                "late_wakeup_causes": {
+                    "in_render_turn": s.causes.dans_le_rendu,
+                    "in_wait": s.causes.dans_l_attente,
+                    "device_advanced": s.causes.appareil_a_avance,
+                    "device_stalled": s.causes.appareil_fige,
+                },
+            })
+        })
+        .collect()
+}
+
+/// #8696 — la section « réveils du fil de rendu WASAPI » du rapport de bogue :
+/// les sessions EN COURS et les dernières sessions closes (le testeur envoie
+/// son rapport juste après « Arrêter »). Vide quand il n'y en a aucune (et
+/// hors Windows).
+fn section_reveils_wasapi(
+    releve: &[tune_core::outputs::rendu_sans_bridage_8696::ReleveSessionWasapi],
+) -> String {
+    use tune_core::outputs::mesure_du_retard_8696::LIBELLES_DES_CASES;
+    if releve.is_empty() {
+        return String::new();
+    }
+    let mut md = String::from(
+        "## WASAPI exclusif — réveils du fil de rendu (sessions en cours et récentes)\n",
+    );
+    for s in releve {
+        let bridage = match s.bridage_refuse {
+            Some(true) => "EcoQoS refusé",
+            Some(false) => "⚠ EcoQoS NON refusé",
+            None => "EcoQoS sans objet",
+        };
+        let ouverture = match s.reouverture_apres_ms {
+            Some(ms) => format!("rouverte {ms} ms après la fermeture précédente"),
+            None => "première ouverture".to_string(),
+        };
+        md.push_str(&format!(
+            "- {} ({}, {}) : {} réveil(s) en retard, écart max {} µs (période {} µs) ; {} anneau vide, {} échéance(s) manquée(s) ; {}{}\n",
+            s.peripherique,
+            if s.en_cours { "en cours" } else { "terminée" },
+            ouverture,
+            s.reveils_en_retard,
+            s.ecart_max_us,
+            s.periode_us,
+            s.underruns,
+            s.deadline_misses,
+            bridage,
+            if s.retards_persistants {
+                " ; ⚠ RETARDS PERSISTANTS (plus de 10 s sans répit)"
+            } else {
+                ""
+            },
+        ));
+        if s.histogramme_periodes.iter().any(|&n| n > 0) {
+            let cases: Vec<String> = LIBELLES_DES_CASES
+                .iter()
+                .zip(s.histogramme_periodes)
+                .map(|(l, n)| format!("{l} : {n}"))
+                .collect();
+            let c = s.causes;
+            md.push_str(&format!(
+                "  - écarts en périodes (#8696) — {} ; temps perdu dans le tour de rendu : {}, dans l'attente de l'événement : {} ; appareil qui a joué sans le fil : {}, appareil arrêté avec lui : {}\n",
+                cases.join(", "),
+                c.dans_le_rendu,
+                c.dans_l_attente,
+                c.appareil_a_avance,
+                c.appareil_fige,
+            ));
+        }
+    }
+    md.push_str(
+        "  (un réveil en retard = le fil de rendu servi plus d'une période et \
+         demie après le précédent, anneau plein : panne d'ORDONNANCEMENT ou de \
+         PILOTE, pas de producteur. « Appareil qui a joué sans le fil » : \
+         périodes rejouées par le DAC, ce sont les sauts entendus)\n\n",
+    );
+    md
+}
+
+#[cfg(test)]
+mod reveils_wasapi_dans_le_rapport_8696 {
+    use super::*;
+    use tune_core::outputs::rendu_sans_bridage_8696::ReleveSessionWasapi;
+
+    fn session(persistants: bool) -> ReleveSessionWasapi {
+        ReleveSessionWasapi {
+            peripherique: "SMSL SU-8".to_string(),
+            en_cours: true,
+            periode_us: 10_000,
+            reveils_en_retard: 64,
+            ecart_max_us: 40_235,
+            underruns: 0,
+            deadline_misses: 0,
+            retards_persistants: persistants,
+            bridage_refuse: Some(true),
+            histogramme_periodes: [0; 5],
+            causes: Default::default(),
+            reouverture_apres_ms: None,
+        }
+    }
+
+    #[test]
+    fn aucune_session_aucune_section() {
+        assert_eq!(section_reveils_wasapi(&[]), "");
+        assert!(releve_reveils_wasapi_json(&[]).is_empty());
+    }
+
+    #[test]
+    fn la_session_en_cours_porte_ses_reveils_en_retard() {
+        let md = section_reveils_wasapi(&[session(false)]);
+        assert!(md.contains("(sessions en cours et récentes)"));
+        assert!(
+            md.contains(
+                "SMSL SU-8 (en cours, première ouverture) : 64 réveil(s) en retard, écart max 40235 µs (période 10000 µs)"
+            )
+        );
+        assert!(!md.contains("écarts en périodes"), "pas d'histogramme vide");
+        assert!(md.contains("EcoQoS refusé"));
+        assert!(!md.contains("PERSISTANTS"));
+    }
+
+    #[test]
+    fn des_retards_persistants_se_voient_dans_le_texte_colle() {
+        let md = section_reveils_wasapi(&[session(true)]);
+        assert!(md.contains("RETARDS PERSISTANTS"));
+        let json = releve_reveils_wasapi_json(&[session(true)]);
+        assert_eq!(json[0]["late_wakeups"], 64);
+        assert_eq!(json[0]["persistent_late_wakeups"], true);
+        assert_eq!(json[0]["power_throttling_opt_out"], true);
+    }
+
+    /// #8696 — la session close, son histogramme et ses causes : ce que le
+    /// rapport envoyé juste après « Arrêter » doit porter.
+    #[test]
+    fn la_session_terminee_porte_son_histogramme_et_ses_causes() {
+        let mut s = session(true);
+        s.en_cours = false;
+        s.histogramme_periodes = [3, 0, 120, 2, 0];
+        s.causes.dans_l_attente = 125;
+        s.causes.appareil_a_avance = 118;
+        s.reouverture_apres_ms = Some(230);
+        let md = section_reveils_wasapi(&[s.clone()]);
+        assert!(md.contains("SMSL SU-8 (terminée, rouverte 230 ms après la fermeture précédente)"));
+        assert!(md.contains("2 : 3, 3 : 0, 4 : 120, 5 : 2, 6+ : 0"));
+        assert!(md.contains("dans l'attente de l'événement : 125"));
+        assert!(md.contains("appareil qui a joué sans le fil : 118"));
+        let json = releve_reveils_wasapi_json(&[s]);
+        assert_eq!(json[0]["in_progress"], false);
+        assert_eq!(json[0]["late_wakeup_gap_periods"]["counts"][2], 120);
+        assert_eq!(json[0]["late_wakeup_causes"]["device_advanced"], 118);
+        assert_eq!(json[0]["reopened_after_ms"], 230);
+    }
+}
+
 /// #3801 — Didier, décrochages FLAC 16/44 en sortie locale WASAPI (fil 1741).
 ///
 /// Le dossier tient sur UNE mesure, et elle est déjà livrée chez lui :
@@ -1039,6 +1215,10 @@ pub(super) async fn diagnostics(State(state): State<AppState>) -> Json<Value> {
         // / `stream_ms` donnent le dénominateur qui rend le taux calculable.
         // À NE PAS confondre avec l'underrun ALSA : voir `releve_famine_anneau`.
         "ring_starvation": ring_starvation,
+        // #8696 — réveils du fil de rendu WASAPI exclusif, session en cours.
+        "wasapi_exclusive_sessions": releve_reveils_wasapi_json(
+            &tune_core::outputs::rendu_sans_bridage_8696::releve_des_sessions(),
+        ),
         // #3479 — `eq_non_finite_samples` > 0 dit que l'étage d'égalisation a
         // remis des échantillons à ZÉRO : c'est du silence produit par l'EQ
         // lui-même, sur un anneau qui n'a pas eu faim. `eq_overs` dit
@@ -1295,14 +1475,22 @@ pub(super) async fn diagnostics_oaat(State(state): State<AppState>) -> Json<Valu
 
 pub(super) async fn health_monitor(State(state): State<AppState>) -> Json<Value> {
     let report = state.health_monitor.run_checks().await;
-    let tracks = TrackRepo::with_backend(state.backend.clone())
-        .count()
+    // #8805 — le `COUNT(*) FROM tracks` de cette route a tenu un fil de
+    // l'exécuteur 108 s dans le rapport du fil 2841. Même cache que
+    // `/system/health`, qui compte la même table.
+    let tracks = super::comptages_8805::comptes_sante(&state, "system_health_monitor")
+        .await
+        .tracks
         .unwrap_or(0);
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let scan_status = settings
-        .get("scan_status")
-        .ok()
-        .flatten()
+    let lecteur = state.backend.clone();
+    let scan_status =
+        super::comptages_8805::lecture_hors_executeur("system_health_monitor", None, move || {
+            SettingsRepo::with_backend(lecteur)
+                .get("scan_status")
+                .ok()
+                .flatten()
+        })
+        .await
         .unwrap_or_else(|| "idle".into());
     Json(json!({
         "status": report.status,
@@ -1713,7 +1901,19 @@ pub(super) async fn task_runs(
 /// `Json<Value>` with `logs`/`lines`/`source`. Shared by the `/logs` endpoint
 /// and the bug report so both surface identical output. Async because the tail
 /// read runs on a blocking pool (spawn_blocking) to keep off the Tokio runtime.
+/// [`collect_recent_logs_brut`], sans les lignes qui portent le code
+/// d'activation de l'authentification (fichier ET replis `journalctl` /
+/// syslog) : tous les lecteurs passent par ici.
 pub(super) async fn collect_recent_logs(max_lines: usize) -> Json<Value> {
+    let Json(mut journaux) = collect_recent_logs_brut(max_lines).await;
+    if let Some(texte) = journaux.get("logs").and_then(Value::as_str) {
+        let propre = tune_core::confidentialite::retirer_les_codes_d_activation(texte);
+        journaux["logs"] = Value::String(propre);
+    }
+    Json(journaux)
+}
+
+async fn collect_recent_logs_brut(max_lines: usize) -> Json<Value> {
     // Try the server's own log file first — same path the writer uses (main),
     // resolved via the shared helper so reader and writer always agree. This is
     // what makes "Export logs" work on Linux under Docker / a bare terminal,
@@ -2508,6 +2708,14 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         state.process_started_at_rfc3339()
     ));
     md.push_str(&format!("**PID**: {}\n", std::process::id()));
+    // #8747 — dans un conteneur, le dossier de la base survit-il à la
+    // recréation ? Un « retour à zéro » après une mise à jour de l'image
+    // (volume anonyme, `/data` non monté) se lit alors au premier rapport.
+    if let Some(ligne) = crate::persistance_donnees::ligne_du_rapport(
+        crate::persistance_donnees::relever(&state.config.db_path).as_ref(),
+    ) {
+        md.push_str(&ligne);
+    }
     if let Some(rss) = rss_mb {
         md.push_str(&format!("**Memory**: {rss} MB RSS\n"));
     }
@@ -2774,13 +2982,22 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     if !oaat_endpoints.is_empty() {
         md.push_str(&format!("## OAAT Endpoints ({})\n", oaat_endpoints.len()));
         for ep in &oaat_endpoints {
+            let dsd_max = if ep["dsd_capabilities_received"].as_bool() == Some(true) {
+                ep["dsd_max_rate"]
+                    .as_u64()
+                    .map(|n| format!("DSD{n}"))
+                    .unwrap_or_else(|| "not advertised".into())
+            } else {
+                "unknown".into()
+            };
             md.push_str(&format!(
-                "- {} ({}): connected={}, packets={}, format={}\n",
+                "- {} ({}): connected={}, packets={}, format={}, DSD max={}\n",
                 ep["name"].as_str().unwrap_or("?"),
                 ep["host"].as_str().unwrap_or("?"),
                 ep["connected"].as_bool().unwrap_or(false),
                 ep["packets_sent"].as_u64().unwrap_or(0),
                 ep["format"].as_str().unwrap_or("?"),
+                dsd_max,
             ));
             if ep["stall_detected"].as_bool().unwrap_or(false) {
                 md.push_str("  **⚠ STALL DETECTED**\n");
@@ -2793,6 +3010,12 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     // que le testeur colle sur le forum — et c'est ce rapport, sur un parc
     // réel, qui doit décider si le noyau RT de Tune OS sert à quelque chose.
     md.push_str(&section_famine_anneau(&ring_starvation));
+    // #8696 : les réveils du fil de rendu WASAPI exclusif de la session EN
+    // COURS — jusqu'ici `reveils_en_retard` ne sortait qu'à l'arrêt, et le
+    // rapport du fil 2805 a été envoyé pendant la session malade.
+    md.push_str(&section_reveils_wasapi(
+        &tune_core::outputs::rendu_sans_bridage_8696::releve_des_sessions(),
+    ));
     // #5677 : les relevés de gel restaient sur la machine du testeur (tickets
     // 223, 224) ; le rapport joint désormais les deux plus récents. Lus hors
     // de l'exécuteur : ce sont des fichiers.
@@ -2872,6 +3095,13 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
     md.push_str(&format!(
         "- Migration version: {}\n",
         version_de_schema_affichee(db_version)
+    ));
+    // #8747 — la date de la première migration appliquée : celle de la
+    // création de la base. Une base recréée en silence (conteneur recréé sans
+    // volume) se reconnaît à une date postérieure à l'installation.
+    md.push_str(&format!(
+        "- Database created: {}\n",
+        super::date_de_creation_de_la_base(&state).unwrap_or_else(|| "unknown".to_string())
     ));
 
     // #2856 — le rapport ne portait AUCUNE section de réglages. Ni l'état de
@@ -3013,6 +3243,10 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
         },
         "oaat_endpoints": oaat_endpoints,
         "ring_starvation": ring_starvation,
+        // #8696 — réveils du fil de rendu WASAPI exclusif, session en cours.
+        "wasapi_exclusive_sessions": releve_reveils_wasapi_json(
+            &tune_core::outputs::rendu_sans_bridage_8696::releve_des_sessions(),
+        ),
         // Le pendant JSON de la section markdown ci-dessus (#3479).
         "dsp_egaliseur": dsp_egaliseur,
         // Le pendant JSON de la section « DSP — ecretage » (#2218).
@@ -4020,6 +4254,11 @@ pub(super) async fn api_docs() -> Json<Value> {
             "GET",
             "/library/tracks/{id}/waveform",
             "Track waveform (200-point amplitude)",
+        ),
+        (
+            "GET",
+            "/library/service-tracks/{service}/{id_service}/waveform",
+            "Waveform of a Qobuz/TIDAL track (200 points; 202 while computing)",
         ),
         (
             "GET",

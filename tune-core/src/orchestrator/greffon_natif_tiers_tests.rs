@@ -286,11 +286,12 @@ async fn greffon_natif_tiers_porte_par_l_etage_casque_en_premium_seulement() {
     );
     // Il entre dans l'empreinte du traitement du flux.
     assert!(
-        orch.empreinte_du_traitement(1, None).contains("tiers="),
+        orch.empreinte_du_traitement(1, crate::audio::replaygain::PisteRg::AUCUNE)
+            .contains("tiers="),
         "empreinte du traitement sans l'étage tiers"
     );
     assert_eq!(
-        orch.traitement_que_pure_gouverne(1, None),
+        orch.traitement_que_pure_gouverne(1, crate::audio::replaygain::PisteRg::AUCUNE),
         Some("greffon_natif_tiers")
     );
 

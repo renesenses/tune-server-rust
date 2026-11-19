@@ -330,8 +330,19 @@ async fn hot_swap_zone(
     let old_device = zone.output_device_id.clone();
 
     // Update the output device
-    if let Err(e) = zone_repo.update_output_device(id, &body.output_device_id) {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    // #8987 — même règle que `PATCH /zones/{id}` : une zone supprimée qui
+    // tient l'appareil le lâche, une zone active donne un 409 qui la nomme.
+    // L'écriture et la libération éventuelle tiennent dans une transaction.
+    if let Err(reponse) = super::zones::prendre_la_sortie_demandee(
+        &zone_repo,
+        id,
+        &body.output_device_id,
+        tune_core::audio::reglages_de_volume::Rattachement::SansPreuve {
+            origine: "update_output_device",
+            mac: None,
+        },
+    ) {
+        return reponse;
     }
     // #6774 — PURE / volume fixe désarmés par le changement d'appareil :
     // l'état de lecture ne reste pas au-dessus de la base.
@@ -477,7 +488,7 @@ async fn update_group(
         .iter()
         .position(|g| g.get("id").and_then(|v| v.as_i64()) == Some(id));
     match idx {
-        Some(i) => {
+        Some(mut i) => {
             if let Some(ref name) = body.name {
                 groups[i]["name"] = json!(name);
             }
@@ -486,7 +497,14 @@ async fn update_group(
                 if let Some(refus) = refus_asio_du_gestionnaire(&state, zone_ids).await {
                     return refus;
                 }
-                groups[i]["zone_ids"] = json!(zone_ids);
+                // #8680 — une zone n'appartient qu'à UN groupe (même règle
+                // que `create_group`) : celles du groupe recomposé quittent
+                // les autres, et le groupe passe en fin de liste.
+                i = tune_core::zones::groupes_enregistres::recomposer_le_groupe(
+                    &mut groups,
+                    i,
+                    zone_ids,
+                );
             }
             let result = groups[i].clone();
             save_json_setting(&settings, "zone_groups", &groups);

@@ -250,11 +250,28 @@ fn endpoint_order(proxy_first: bool) -> (&'static str, &'static str) {
 ///
 /// Tout le reste garde la variante d'avant (`Other`, via `From<String>`) et
 /// donc son 502 : une vraie panne d'amont reste une panne d'amont.
+///
+/// #8892 — seul un 404 dont le corps est le JSON d'erreur de l'API Qobuz
+/// (`"code": 404`) vaut « introuvable » : un 404 HTML d'un relais ou de la
+/// périphérie Akamai reste une panne. Un titre ainsi « introuvable » est
+/// grisé dans les playlists : il ne faut pas griser sur une panne.
 fn erreur_de_fiche((statut, message): (Option<u16>, String)) -> TuneError {
     match statut {
-        Some(404) => TuneError::NotFound(message),
+        Some(404) if introuvable_selon_l_api(&message) => TuneError::NotFound(message),
         _ => TuneError::from(message),
     }
+}
+
+/// Le message d'échec (`qobuz {path}: 404 {corps}`) porte-t-il le JSON
+/// d'erreur de l'API Qobuz, `{"status":"error","code":404,…}` ? (#8892)
+fn introuvable_selon_l_api(message: &str) -> bool {
+    let Some(debut) = message.find('{') else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&message[debut..])
+        .ok()
+        .and_then(|corps| corps.get("code").and_then(serde_json::Value::as_i64))
+        == Some(404)
 }
 
 /// Error from a single API attempt against one base URL.
@@ -262,19 +279,41 @@ fn erreur_de_fiche((statut, message): (Option<u16>, String)) -> TuneError {
 enum AttemptError {
     /// Network-level failure (timeout, DNS, connect) — eligible for fallback.
     Network(String),
-    /// HTTP error status. 5xx is eligible for fallback; 4xx is final.
+    /// HTTP error status. 5xx is eligible for fallback; 4xx is final — sauf
+    /// le refus de la périphérie Akamai (#8694, [`AttemptError::refus_de_peripherie`]).
     Http { status: u16, body: String },
     /// Body of a successful response failed to parse — final, no fallback.
     Json(String),
 }
 
 impl AttemptError {
-    /// Whether the other endpoint should be tried (network error or 5xx).
+    /// Whether the other endpoint should be tried (network error, 5xx, or
+    /// the Akamai edge refusing the network — #8694).
     fn transient(&self) -> bool {
         match self {
             Self::Network(_) => true,
-            Self::Http { status, .. } => *status >= 500,
+            Self::Http { status, .. } => *status >= 500 || self.refus_de_peripherie(),
             Self::Json(_) => false,
+        }
+    }
+
+    /// Le 403 vient-il de la PÉRIPHÉRIE Akamai de Qobuz, et non de l'API ?
+    ///
+    /// #8694 (fil 2803, rc11 macOS) : toutes les requêtes du testeur vers
+    /// `www.qobuz.com/api.json/0.2`, `user/login` compris, recevaient
+    /// `403 <HTML>…Access Denied…` servi par `errors.edgesuite.net`. C'est le
+    /// réseau du testeur (VPN, pays, réputation de l'adresse) qui est refusé,
+    /// avant l'API : ni le jeton, ni le mot de passe, ni l'application. Le
+    /// traiter comme un 4xx de l'API privait du relais mozaiklabs, qui passe
+    /// par un autre réseau.
+    ///
+    /// L'API de Qobuz répond TOUJOURS en JSON (`{"status":"error",…}`) : un
+    /// 403 dont le corps n'est pas du JSON est la page de la périphérie. Un
+    /// 403 JSON (jeton périmé…) garde son traitement d'avant.
+    fn refus_de_peripherie(&self) -> bool {
+        match self {
+            Self::Http { status: 403, body } => corps_de_peripherie(body),
+            _ => false,
         }
     }
 
@@ -290,6 +329,38 @@ impl AttemptError {
         }
     }
 }
+
+/// Un corps de réponse qui n'est pas du JSON de l'API Qobuz : la page HTML
+/// « Access Denied » d'Akamai (`errors.edgesuite.net`), ou rien — #8694.
+fn corps_de_peripherie(body: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body).is_err()
+}
+
+/// De deux tentatives ratées (primaire puis secours), celle qui explique le
+/// mieux l'échec — #8694.
+///
+/// Si l'une est un refus de la périphérie Akamai et que l'autre n'a pas eu de
+/// réponse de l'API (panne réseau, 5xx, autre refus de périphérie), c'est le
+/// refus de périphérie qui dit ce qui se passe : « Qobuz refuse votre
+/// réseau ». Une vraie réponse de l'API au secours (401 identifiants, 400
+/// application…) l'emporte toujours : elle seule parle du compte.
+fn echec_le_plus_parlant(primaire: AttemptError, secours: AttemptError) -> AttemptError {
+    if primaire.refus_de_peripherie() && secours.transient() && !secours.refus_de_peripherie() {
+        info!(error = %secours, "qobuz_fallback_failed_after_edge_refusal");
+        primaire
+    } else {
+        secours
+    }
+}
+
+/// Code stable rendu quand la périphérie de Qobuz refuse le réseau de
+/// l'utilisateur et que le relais n'a pas pu prendre le relais (#8694). Le
+/// client le traduit.
+pub const CODE_RESEAU_REFUSE: &str = "service_network_refused";
+
+/// Le texte du refus de réseau : il dit que le mot de passe n'est pas en cause.
+const MOTIF_RESEAU_REFUSE: &str = "qobuz login: Qobuz refuses connections from this network (VPN, country…); \
+     your password is not the cause";
 
 /// Ce que `POST /streaming/qobuz/auth` rend quand la connexion échoue
 /// (renesenses/tune-server-rust#7068).
@@ -320,6 +391,12 @@ impl AttemptError {
 fn erreur_de_connexion(err: &AttemptError) -> TuneError {
     if application_refusee(err) {
         return TuneError::AppRefused(MOTIF_APPLICATION_REFUSEE.to_string());
+    }
+    if err.refus_de_peripherie() {
+        return TuneError::Refused {
+            code: CODE_RESEAU_REFUSE,
+            message: MOTIF_RESEAU_REFUSE.to_string(),
+        };
     }
     match err.statut_http() {
         Some(401) => TuneError::Credentials("qobuz login: invalid credentials".to_string()),
@@ -355,6 +432,8 @@ fn application_refusee(err: &AttemptError) -> bool {
 fn nature_echec_connexion(err: &AttemptError) -> &'static str {
     if application_refusee(err) {
         "application_refusee"
+    } else if err.refus_de_peripherie() {
+        "reseau_refuse_par_la_peripherie"
     } else if err.statut_http() == Some(401) {
         "identifiants_refuses"
     } else {
@@ -386,6 +465,15 @@ impl std::fmt::Display for AttemptError {
 /// Log the primary-endpoint failure that triggers the fallback, keeping the
 /// historical proxy-first event names and their direct-first mirrors.
 fn log_fallback(proxy_first: bool, path: &str, err: &AttemptError) {
+    if err.refus_de_peripherie() {
+        let event = if proxy_first {
+            "qobuz_proxy_edge_refused_trying_direct"
+        } else {
+            "qobuz_direct_edge_refused_trying_proxy"
+        };
+        info!(path, event, "qobuz_edge_refused_trying_fallback");
+        return;
+    }
     match (proxy_first, err) {
         (true, AttemptError::Http { status, .. }) => {
             info!(path, status, "qobuz_proxy_5xx_trying_direct");
@@ -795,8 +883,7 @@ pub(crate) fn artiste_unique_du_nom(data: &serde_json::Value, nom: &str) -> Opti
 }
 
 /// La biographie d'une réponse `/artist/get`, en texte (même nettoyage que la
-/// note d'album, [`super::presentation_album::texte_de_presentation`] : il
-/// décode aussi les entités, ce que `strip_html_tags` ne fait pas), avec la
+/// note d'album, [`super::presentation_album::texte_de_presentation`]), avec la
 /// langue que Qobuz annonce (`biography.language`).
 pub(crate) fn bio_editoriale_de(
     data: &serde_json::Value,
@@ -1375,6 +1462,7 @@ impl QobuzService {
                     .await
                     .map_err(|e| {
                         info!(path, error = %e, "qobuz_fallback_api_error");
+                        let e = echec_le_plus_parlant(err, e);
                         (e.statut_http(), format!("qobuz {path}: {e}"))
                     })
             }
@@ -2339,6 +2427,18 @@ impl QobuzService {
 
     fn map_track(item: &serde_json::Value) -> StreamTrack {
         let album = &item["album"];
+        // #8689 — le ReplayGain que Qobuz publie (`audio_info`) est retenu au
+        // passage : la lecture le retrouvera sans nouvel appel.
+        if let Some(gains) = crate::audio::replaygain::services::GainsDuService::depuis_qobuz(item)
+        {
+            let id = item["id"]
+                .as_u64()
+                .map(|i| i.to_string())
+                .or_else(|| item["id"].as_str().map(String::from));
+            if let Some(id) = id {
+                crate::audio::replaygain::services::noter("qobuz", &id, gains);
+            }
+        }
         StreamTrack {
             id: item["id"].as_u64().unwrap_or(0).to_string(),
             title: Self::titre_avec_version(item),
@@ -3144,7 +3244,9 @@ impl QobuzService {
         match self.login_at(primary, app_id, username, password).await {
             Err(err) if err.transient() => {
                 log_fallback(self.proxy_first, "/user/login", &err);
-                self.login_at(fallback, app_id, username, password).await
+                self.login_at(fallback, app_id, username, password)
+                    .await
+                    .map_err(|e| echec_le_plus_parlant(err, e))
             }
             autre => autre,
         }
@@ -3235,9 +3337,10 @@ impl QobuzService {
             Ok(v) => Ok(v),
             Err(err) if err.transient() => {
                 log_fallback(self.proxy_first, path, &err);
-                self.api_post_at(fallback, path, params)
-                    .await
-                    .map_err(|e| (e.statut_http(), format!("qobuz {path}: {e}")))
+                self.api_post_at(fallback, path, params).await.map_err(|e| {
+                    let e = echec_le_plus_parlant(err, e);
+                    (e.statut_http(), format!("qobuz {path}: {e}"))
+                })
             }
             Err(err) => Err((err.statut_http(), format!("qobuz {path}: {err}"))),
         }
@@ -3488,15 +3591,8 @@ impl QobuzService {
             bio: item["biography"]["content"]
                 .as_str()
                 .or_else(|| item["biography"]["summary"].as_str())
-                .map(Self::strip_html_tags)
-                .filter(|s| !s.is_empty()),
+                .and_then(super::presentation_album::texte_de_presentation),
         }
-    }
-
-    /// Strip HTML tags from Qobuz editorial text (biography content is HTML).
-    fn strip_html_tags(s: &str) -> String {
-        let re = regex::Regex::new(r"<[^>]+>").unwrap();
-        re.replace_all(s, "").trim().to_string()
     }
 }
 
@@ -3581,9 +3677,13 @@ impl StreamingService for QobuzService {
     }
 
     async fn get_track(&self, track_id: &str) -> Result<StreamTrack, TuneError> {
+        // #8892 — un titre que Qobuz ne connaît plus (404) est `NotFound`,
+        // comme la fiche d'un artiste (#992) : la playlist le montre
+        // indisponible, avec la fiche qu'elle avait mémorisée.
         let data = self
-            .api_get("/track/get", &[("track_id", track_id)])
-            .await?;
+            .api_get_avec_statut("/track/get", &[("track_id", track_id)])
+            .await
+            .map_err(erreur_de_fiche)?;
         Ok(Self::map_track(&data))
     }
 
@@ -5368,6 +5468,20 @@ mod tests {
         assert_eq!(muet.disponible, None);
     }
 
+    /// #8689 — `map_track` retient le ReplayGain d'`audio_info` : la lecture
+    /// d'un titre parcouru (album, playlist, recherche) le retrouve sans appel.
+    #[test]
+    fn map_track_retient_le_replaygain_publie_8689() {
+        QobuzService::map_track(&json!({
+            "id": 868_9001, "title": "Fort", "performer": {"name": "X"},
+            "album": {"title": "A", "id": 9},
+            "audio_info": {"replaygain_track_gain": -9.5, "replaygain_track_peak": 1.0}
+        }));
+        let g = crate::audio::replaygain::services::lire("qobuz", "8689001")
+            .expect("gain Qobuz retenu par map_track");
+        assert_eq!((g.piste_db, g.piste_pic), (Some(-9.5), Some(1.0)));
+    }
+
     fn map_track_basic() {
         let json = json!({
             "id": 12345,
@@ -5806,6 +5920,63 @@ mod tests {
         );
     }
 
+    /// #8892 — un titre retiré du catalogue Qobuz (404 sur `/track/get`) est
+    /// `NotFound` : la playlist le grise avec sa fiche mémorisée. Un 400
+    /// reste une erreur ordinaire (ne pas conclure « indisponible »).
+    #[tokio::test]
+    async fn titre_retire_de_qobuz_est_un_not_found_8892() {
+        use axum::Router;
+        use axum::extract::Query;
+        use axum::http::StatusCode;
+        use axum::routing::get;
+        use std::collections::HashMap;
+
+        let app = Router::new().route(
+            "/track/get",
+            get(|Query(q): Query<HashMap<String, String>>| async move {
+                match q.get("track_id").map(String::as_str) {
+                    Some("retire") => (
+                        StatusCode::NOT_FOUND,
+                        r#"{"status":"error","code":404,"message":"No result matching given argument"}"#,
+                    ),
+                    // Un 404 HTML (relais, périphérie Akamai) : une panne.
+                    Some("relais") => (
+                        StatusCode::NOT_FOUND,
+                        "<html><body><h1>404 Not Found</h1>nginx</body></html>",
+                    ),
+                    _ => (
+                        StatusCode::BAD_REQUEST,
+                        r#"{"status":"error","code":400,"message":"Invalid argument"}"#,
+                    ),
+                }
+            }),
+        );
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("port libre");
+        let adresse = ecoute.local_addr().expect("adresse locale");
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        let svc = QobuzService::avec_base_forcee(format!("http://{adresse}"));
+
+        let retire = svc.get_track("retire").await.unwrap_err();
+        assert!(
+            matches!(retire, TuneError::NotFound(_)),
+            "un titre retiré de Qobuz : {retire:?}"
+        );
+        let refus = svc.get_track("mal-forme").await.unwrap_err();
+        assert!(
+            !matches!(refus, TuneError::NotFound(_)),
+            "un 400 n'est pas « introuvable » : {refus:?}"
+        );
+        let relais = svc.get_track("relais").await.unwrap_err();
+        assert!(
+            !matches!(relais, TuneError::NotFound(_)),
+            "un 404 HTML n'est pas « introuvable » : {relais:?}"
+        );
+    }
+
     #[test]
     /// Point 10 — la date de sortie voyage : un album à paraître se reconnaît
     /// à elle seule (les pistes, elles, ne se résolvent pas encore).
@@ -6062,6 +6233,20 @@ mod tests {
         });
         let album = QobuzService::map_album(&json);
         assert_eq!(album.id, "abc123");
+    }
+
+    #[test]
+    fn map_artist_entites_8698() {
+        let item = json!({"id": 42, "name": "Duffy", "biography": {
+            "content": "<p>Soul &amp; pop. &copy Matt Collar /TiVo</p>", "language": "en"
+        }});
+        let attendu = "Soul & pop. © Matt Collar /TiVo";
+        assert_eq!(
+            QobuzService::map_artist(&item).bio.as_deref(),
+            Some(attendu),
+            "la fiche artiste doit décoder les mêmes entités que la biographie éditoriale"
+        );
+        assert_eq!(bio_editoriale_de(&item, "42").unwrap().texte, attendu);
     }
 
     #[test]
@@ -9316,6 +9501,10 @@ mod versions_mixes_8271_tests;
 #[path = "qobuz_application_distante_8134_tests.rs"]
 mod application_distante_8134_tests;
 
+#[cfg(test)]
+#[path = "qobuz_peripherie_akamai_8694_tests.rs"]
+mod peripherie_akamai_8694_tests;
+
 /// renesenses/tune-server-rust#7068 — un mauvais mot de passe Qobuz sortait en
 /// `qobuz login: 401 {"status":"error","code":401,"message":"Invalid
 /// username\/email and password combination"}` : le JSON du service, recopié
@@ -9410,9 +9599,11 @@ mod tests_erreur_de_connexion_7068 {
                 status: 500,
                 body: "boom".into(),
             },
+            // Un 403 de l'API (JSON). Celui de la périphérie Akamai (HTML) a
+            // désormais son propre refus : voir #8694.
             AttemptError::Http {
                 status: 403,
-                body: "akamai".into(),
+                body: r#"{"status":"error","code":403,"message":"forbidden"}"#.into(),
             },
             AttemptError::Network("timeout".into()),
             AttemptError::Json("eof".into()),

@@ -32,7 +32,6 @@ use super::cle_de_tri::{Curseur, valeur_json, valeur_sql};
 use super::{Placeholders, SqlValue, ToSqlValue, Track, TrackFilter, TrackRepo, sql};
 use crate::TuneError;
 use crate::db::engine::Engine;
-use crate::db::history_repo::sql::provenance;
 
 /// Une colonne du tableau des pistes par laquelle le serveur sait trier.
 ///
@@ -112,36 +111,35 @@ pub const COLONNES_TRIABLES: [(&str, ColonneDeTri); 27] = [
     ("lastPlayed", ColonneDeTri::DerniereEcoute),
 ];
 
-/// L'historique d'écoute agrégé par titre et interprète, joint à la piste
-/// (alias `ec`) pour les tris `plays` et `lastPlayed` — tune-web-client#1470.
-///
-/// Le rapprochement est CELUI de `HistoryRepo::plays_for_tracks`, qui remplit
-/// `play_count` et `last_played_at` dans la réponse : même provenance que la
-/// piste, radio exclue (#7980, [`provenance!`], les lignes anciennes à source
-/// NULL étant locales), égalité stricte du titre, interprète égal ou absent
-/// des deux côtés (`listen_history.track_id` est toujours NULL, voir ce
-/// module). L'ordre suit donc exactement les nombres que la colonne affiche.
-///
-/// Agrégé UNE fois puis joint, plutôt qu'une sous-requête corrélée par piste :
-/// le tri porte sur toute la bibliothèque filtrée, et PostgreSQL n'a pas
-/// d'index `(title, artist_name)` sur l'historique. L'égalité sur le titre
-/// est la clé de hachage ; la condition sur l'interprète filtre ensuite.
-/// `GROUP BY title, artist_name, provenance` et la provenance dans la
-/// jointure : une piste rencontre AU PLUS une ligne, le `COUNT(*) OVER ()` de
-/// la page n'est pas multiplié.
-const JOINTURE_ECOUTES: &str = concat!(
-    " LEFT JOIN (SELECT lh.title, lh.artist_name, ",
-    provenance!("lh"),
-    " AS provenance, COUNT(*) AS n, MAX(lh.listened_at) AS derniere \
-       FROM listen_history lh WHERE ",
-    provenance!("lh"),
-    " <> 'radio' GROUP BY lh.title, lh.artist_name, ",
-    provenance!("lh"),
-    ") ec ON ec.title = t.title AND ec.provenance = ",
-    provenance!("t"),
-    " AND (ec.artist_name = ar.name OR (ec.artist_name IS NULL AND ar.name IS NULL)) \
-     LEFT JOIN imported_plays ip ON ip.track_id = t.id"
-);
+/// Le tri agrège par identifiant de piste avec la même règle que la colonne :
+/// piste encore présente, puis album et titre, puis titre et interprète.
+/// Une seule ligne par piste évite de multiplier le total paginé.
+static JOINTURE_ECOUTES: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    let regle = crate::db::history_repo::sql::ecoute_de_la_piste("te", "lh");
+    let piste_absente = "(lh.track_id IS NULL OR NOT EXISTS (SELECT 1 FROM tracks origine WHERE origine.id = lh.track_id))";
+    let album_present =
+        "EXISTS (SELECT 1 FROM albums origine_album WHERE origine_album.id = lh.album_id)";
+    // Trois branches exclusives donnent à PG une clé de jointure simple
+    // (id, album+titre, titre). La règle commune contrôle provenance et
+    // interprète ; le OR de cette règle ne force pas un produit cartésien.
+    format!(
+        " LEFT JOIN (
+           SELECT track_id, COUNT(*) AS n, MAX(listened_at) AS derniere FROM (
+             SELECT te.id AS track_id, lh.listened_at FROM listen_history lh
+               JOIN tracks te ON te.id = lh.track_id AND {regle}
+             UNION ALL
+             SELECT te.id AS track_id, lh.listened_at FROM listen_history lh
+               JOIN tracks te ON te.album_id = lh.album_id AND te.title = lh.title AND {regle}
+               WHERE {piste_absente} AND {album_present}
+             UNION ALL
+             SELECT te.id AS track_id, lh.listened_at FROM listen_history lh
+               JOIN tracks te ON te.title = lh.title AND {regle}
+               WHERE {piste_absente} AND NOT {album_present}
+           ) correspondances GROUP BY track_id
+         ) ec ON ec.track_id = t.id
+         LEFT JOIN imported_plays ip ON ip.track_id = t.id"
+    )
+});
 
 /// Comment une valeur « vide » se reconnaît, pour la ranger en FIN de liste
 /// dans les deux sens : une cellule vide en tête d'un tri descendant cacherait
@@ -200,7 +198,11 @@ impl ColonneDeTri {
             Self::Empreinte => ("t.audio_hash".into(), Vide::Texte),
             Self::Source => (expression_provenance(engine), Vide::Texte),
             Self::Duree => ("t.duration_ms".into(), Vide::NulOuZero),
-            Self::Annee => ("t.year".into(), Vide::NulOuZero),
+            // Go du 13/11 — l'année de la piste, à défaut celle de son album.
+            Self::Annee => (
+                crate::db::annee_de_la_piste::ANNEE_DE_LA_PISTE.into(),
+                Vide::NulOuZero,
+            ),
             Self::Frequence => ("t.sample_rate".into(), Vide::NulOuZero),
             Self::Profondeur => ("t.bit_depth".into(), Vide::NulOuZero),
             Self::Canaux => ("t.channels".into(), Vide::Nul),
@@ -233,7 +235,7 @@ impl ColonneDeTri {
     /// La jointure qu'appelle l'expression de tri, s'il en faut une.
     fn jointure(self) -> &'static str {
         match self {
-            Self::Ecoutes | Self::DerniereEcoute => JOINTURE_ECOUTES,
+            Self::Ecoutes | Self::DerniereEcoute => JOINTURE_ECOUTES.as_str(),
             _ => "",
         }
     }

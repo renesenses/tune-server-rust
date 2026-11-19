@@ -358,6 +358,24 @@ fn corps_de_la_page(
                 let (verdict, raison) = faux_hires_publie::publier_l_album(pistes, douteux_visible);
                 obj.insert("hires_verdict".into(), json!(verdict));
                 obj.insert("hires_raison".into(), json!(raison));
+                // #9035 — les pistes douteuses de l'album, qu'il soit douteux
+                // (au moins la moitié) ou non : combien, sur combien de
+                // mesurées, et leur raison la plus fréquente (`null` sans
+                // piste douteuse, ou « douteux » masqué).
+                let en_cause =
+                    faux_hires_publie::pistes_douteuses_publiees(pistes, douteux_visible);
+                obj.insert(
+                    "hires_pistes_douteuses".into(),
+                    json!(en_cause.as_ref().map(|c| c.0)),
+                );
+                obj.insert(
+                    "hires_pistes_mesurees".into(),
+                    json!(en_cause.as_ref().map(|c| c.1)),
+                );
+                obj.insert(
+                    "hires_raison_pistes".into(),
+                    json!(en_cause.and_then(|c| c.2)),
+                );
             }
             j
         })
@@ -950,7 +968,7 @@ pub(super) fn provenance_du_dr(
 /// favoris.
 ///
 /// Une seule requête pour toute la page, et aucune du tout sur une page vide.
-pub(super) fn attacher_ecoutes(state: &AppState, items: &mut [Value]) {
+pub(crate) fn attacher_ecoutes(state: &AppState, items: &mut [Value]) {
     let ids: Vec<i64> = items
         .iter()
         .filter_map(|v| v.get("id").and_then(Value::as_i64))

@@ -134,6 +134,24 @@ struct CachedUrl {
     suivi: Option<Arc<crate::audio::dash_growth::SuiviDuTelechargement>>,
 }
 
+impl CachedUrl {
+    fn stream_url(&self) -> StreamUrl {
+        StreamUrl {
+            url: self.url.clone(),
+            mime_type: self.mime_type.clone(),
+            quality: StreamQuality {
+                codec: self.codec.clone(),
+                sample_rate: self.sample_rate,
+                bit_depth: self.bit_depth,
+                bitrate: self.bitrate,
+                channels: 2,
+            },
+            expires_at: None,
+            headers: Vec::new(),
+        }
+    }
+}
+
 struct UrlCache {
     entries: HashMap<String, CachedUrl>,
     ttl: Duration,
@@ -147,16 +165,24 @@ impl UrlCache {
         }
     }
 
+    /// #8701 — une entrée vaut tant que son TTL court, OU tant qu'une zone
+    /// joue (ou prépare) le fMP4 DASH qu'elle désigne : le TTL de 240 s est
+    /// pensé pour une URL signée, pas pour un fichier local qu'un saut dans
+    /// la piste doit retrouver après 4 min d'écoute.
+    fn vivante(entry: &CachedUrl, ttl: Duration) -> bool {
+        entry.created.elapsed() < ttl || crate::audio::dash_epingles::est_epingle(&entry.url)
+    }
+
     fn get(&self, key: &str) -> Option<&CachedUrl> {
         self.entries
             .get(key)
-            .filter(|&entry| entry.created.elapsed() < self.ttl)
+            .filter(|&entry| Self::vivante(entry, self.ttl))
     }
 
     fn set(&mut self, key: String, entry: CachedUrl) {
         if self.entries.len() > 1000 {
             let ttl = self.ttl;
-            self.entries.retain(|_, e| e.created.elapsed() < ttl);
+            self.entries.retain(|_, e| Self::vivante(e, ttl));
         }
         self.entries.insert(key, entry);
     }
@@ -247,6 +273,12 @@ pub struct TidalService {
     featured_cache: std::sync::Mutex<Option<FeaturedCache>>,
     /// #7822 — même choix de verrou que `featured_cache`.
     mixes_cache: std::sync::Mutex<Option<MixesCache>>,
+    /// #8935 — la page « Pour vous » du compte ; même choix de verrou.
+    pour_vous_cache: std::sync::Mutex<Option<pour_vous::PourVousCache>>,
+    /// #8935 — génération du cache « Pour vous », avancée à chaque vidage :
+    /// une lecture lancée avant une déconnexion ou un changement de pays n'y
+    /// réécrit pas l'ancienne page.
+    pour_vous_generation: std::sync::atomic::AtomicU64,
     enabled_override: Option<bool>,
     /// Racine de l'API, déplacée par les seuls témoins vers un serveur factice
     /// (#4803). `None` partout ailleurs : [`API_BASE`].
@@ -289,6 +321,8 @@ impl TidalService {
             device_auth_started: None,
             featured_cache: std::sync::Mutex::new(None),
             mixes_cache: std::sync::Mutex::new(None),
+            pour_vous_cache: std::sync::Mutex::new(None),
+            pour_vous_generation: std::sync::atomic::AtomicU64::new(0),
             enabled_override: None,
             base_forcee: None,
             auth_forcee: None,
@@ -479,6 +513,7 @@ impl TidalService {
                     let growth = crate::audio::dash_growth::DashGrowth::new(total_bytes);
                     crate::audio::dash_growth::register(&tmp_path, growth.clone());
                     let suivi = crate::audio::dash_growth::SuiviDuTelechargement::new();
+                    suivi.lier_la_croissance(&growth);
                     info!(
                         track_id,
                         path = tmp_path.as_str(),
@@ -1005,10 +1040,13 @@ impl TidalService {
             .then(|| entree.mixes.clone())
     }
 
+    /// Oublie aussi la page « Pour vous » (#8935) : elle est, comme les
+    /// mixes, celle du compte et du pays du moment.
     fn vider_le_cache_des_mixes(&self) {
         if let Ok(mut cache) = self.mixes_cache.lock() {
             *cache = None;
         }
+        self.vider_le_cache_pour_vous();
     }
 
     /// #7822 — lit la page des mixes du compte, et à défaut les rangées de
@@ -1230,7 +1268,23 @@ impl TidalService {
         Some(element)
     }
 
+    /// Fil 2694 — les pistes d'une réponse `/tracks/{id}/radio`.
+    fn pistes_de_la_radio(data: &serde_json::Value) -> Vec<StreamTrack> {
+        data["items"]
+            .as_array()
+            .map(|items| items.iter().map(Self::map_track).collect())
+            .unwrap_or_default()
+    }
+
     fn map_track(item: &serde_json::Value) -> StreamTrack {
+        // #8689 — `replayGain` / `peak` de l'objet piste v1, retenus pour la
+        // lecture (la réponse de lecture y ajoutera le gain d'album).
+        if let (Some(id), Some(gains)) = (
+            item["id"].as_u64(),
+            crate::audio::replaygain::services::GainsDuService::depuis_tidal_piste(item),
+        ) {
+            crate::audio::replaygain::services::noter("tidal", &id.to_string(), gains);
+        }
         let tags = item["mediaMetadata"]["tags"].as_array();
         let is_hires = tags
             .map(|t| {
@@ -2366,19 +2420,25 @@ impl StreamingService for TidalService {
                     // ordinaire la tronquerait au dernier segment reçu.
                     || cached.suivi.as_ref().is_some_and(|s| !s.est_complet());
                 if !stale_dash {
-                    return Ok(StreamUrl {
-                        url: cached.url.clone(),
-                        mime_type: cached.mime_type.clone(),
-                        quality: StreamQuality {
-                            codec: cached.codec.clone(),
-                            sample_rate: cached.sample_rate,
-                            bit_depth: cached.bit_depth,
-                            bitrate: cached.bitrate,
-                            channels: 2,
-                        },
-                        expires_at: None,
-                        headers: Vec::new(),
-                    });
+                    return Ok(cached.stream_url());
+                }
+                // #8701 — un lecteur qui sait suivre un fichier en croissance
+                // (sortie locale ou OAAT, y compris pour un saut) se raccroche
+                // au téléchargement en cours : la poignée est réinscrite pour
+                // son décodeur, qui lit tout de suite ce qui est déjà écrit et
+                // n'attend à la frontière que le segment qu'il lui faut — ni
+                // la fin du téléchargement, ni un second téléchargement.
+                if crate::audio::dash_growth::decodage_en_croissance()
+                    && let Some(chemin) = cached.url.strip_prefix("file://")
+                    && let Some(growth) = cached.suivi.as_ref().and_then(|s| s.croissance_vivante())
+                {
+                    crate::audio::dash_growth::register(chemin, growth);
+                    info!(
+                        track_id,
+                        path = chemin,
+                        "tidal_dash_croissance_partagee_8701"
+                    );
+                    return Ok(cached.stream_url());
                 }
                 match en_croissance {
                     Some(suivi)
@@ -2569,6 +2629,14 @@ impl StreamingService for TidalService {
         let data = data.ok_or_else(|| {
             format!("tidal: no usable stream found for track {track_id} (all qualities failed)")
         })?;
+
+        // #8689 — le ReplayGain publié dans la réponse de lecture (v1, ou v2
+        // ramenée à la forme v1), retenu pour le facteur de lecture.
+        if let Some(gains) =
+            crate::audio::replaygain::services::GainsDuService::depuis_tidal_lecture(&data)
+        {
+            crate::audio::replaygain::services::noter("tidal", track_id, gains);
+        }
 
         // #6334 — d'où vient la réponse retenue (journalisé avec le format reçu).
         let voie = data["voie"]
@@ -2887,6 +2955,21 @@ impl StreamingService for TidalService {
         true
     }
 
+    /// Fil 2694 — `GET /tracks/{id}/radio` (API v1, celle que lit `tidalapi`,
+    /// `Track.get_track_radio`) : la radio du titre, paginée en `items` comme
+    /// les autres listes. Sert la radio de fin de file.
+    async fn get_track_radio(
+        &self,
+        track_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StreamTrack>, TuneError> {
+        let id = urlencoding::encode(track_id);
+        let data = self
+            .api_get(&format!("/tracks/{id}/radio?limit={limit}"))
+            .await?;
+        Ok(Self::pistes_de_la_radio(&data))
+    }
+
     async fn get_playlist(&self, playlist_id: &str) -> Result<StreamPlaylist, TuneError> {
         if let Some(mix_id) = playlist_id.strip_prefix(PREFIXE_MIX) {
             if let Some(mix) = self
@@ -2992,6 +3075,27 @@ impl StreamingService for TidalService {
             });
         }
         Ok(mixes)
+    }
+
+    async fn get_for_you(&self) -> Result<PagePersonnalisee, TuneError> {
+        if let Some(page) = self.pour_vous_depuis_le_cache() {
+            debug!("tidal_pour_vous_cache_hit");
+            return Ok(page);
+        }
+        let generation = self.generation_pour_vous();
+        let page = self.lire_la_page_pour_vous().await?;
+        self.memoriser_la_page_pour_vous(&page, generation);
+        Ok(page)
+    }
+
+    async fn get_playlist_recommendations(
+        &self,
+        playlist_id: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<TitresRecommandes, TuneError> {
+        self.lire_les_recommandations(playlist_id, limit, offset)
+            .await
     }
 
     async fn get_featured_section(&self, section_id: &str) -> Result<Vec<StreamAlbum>, TuneError> {
@@ -3733,8 +3837,14 @@ impl GardeCroissance {
 
     /// Plus personne ne lit ni n'attend : la garde tient la seule référence
     /// restante et le suivi n'a pas d'attendant.
+    ///
+    /// #8701 — et aucune zone ne joue ce fichier : entre l'ancien décodeur
+    /// lâché par un saut et le nouveau qui reprend la poignée, la piste reste
+    /// épinglée, son téléchargement n'est pas abandonné.
     fn personne_ne_lit(&self) -> bool {
-        self.growth().abandonnee() && !self.suivi.attendu()
+        self.growth().abandonnee()
+            && !self.suivi.attendu()
+            && !crate::audio::dash_epingles::est_epingle(&self.path)
     }
 
     fn finir(mut self) {
@@ -5775,6 +5885,14 @@ impl TidalService {
         });
         svc
     }
+
+    /// #8701 — le même faux TIDAL avec un autre TTL du cache d'URL : `0`
+    /// simule une piste qui joue depuis plus longtemps que le TTL (240 s).
+    #[cfg(test)]
+    pub(crate) fn avec_ttl_du_cache_d_url(mut self, secondes: u64) -> Self {
+        self.url_cache = Arc::new(Mutex::new(UrlCache::new(secondes)));
+        self
+    }
 }
 
 #[cfg(test)]
@@ -5784,6 +5902,14 @@ mod remplacement_8066_tests;
 #[cfg(test)]
 #[path = "tidal_qualite_livree_6334_tests.rs"]
 mod qualite_livree_6334_tests;
+
+// #8935 — la page « Pour vous » et les titres recommandés d'une playlist.
+#[path = "tidal_pour_vous.rs"]
+mod pour_vous;
+
+#[cfg(test)]
+#[path = "tidal_pour_vous_8935_tests.rs"]
+mod pour_vous_8935_tests;
 
 // #7822 — les mixes du compte, lus dans des réponses TIDAL enregistrées.
 #[cfg(test)]
@@ -5798,6 +5924,11 @@ mod pays_du_catalogue_8481_tests;
 // #6334 — lecture par `trackManifests` v2, repli v1.
 #[path = "tidal_manifeste_v2.rs"]
 mod manifeste_v2;
+
+// Go du 13/11 (#8739) — les adresses de l'audio pour une analyse, sans
+// téléchargement sous le garde du service.
+#[path = "tidal_analyse_service.rs"]
+pub mod analyse_service;
 #[cfg(test)]
 #[path = "tidal_manifeste_v2_6334_tests.rs"]
 mod manifeste_v2_6334_tests;

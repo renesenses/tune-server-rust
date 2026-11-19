@@ -23,10 +23,29 @@ pub fn router() -> Router<AppState> {
         .route("/sync", post(sync_to_music))
 }
 
+/// Le nom d'utilisateur du pont : un jeton, un seul segment de chemin.
+fn nom_hue_valide(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 128
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
+}
+
+/// L'adresse et le nom du pont. Une valeur hors forme (adresse qui n'est pas
+/// `hôte[:port]`, nom qui n'est pas un jeton) vaut « non configuré » : l'URL
+/// composée ne vise jamais que l'API du pont.
 fn hue_settings(state: &AppState) -> (Option<String>, Option<String>) {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let bridge_ip = settings.get("hue_bridge_ip").ok().flatten();
-    let username = settings.get("hue_username").ok().flatten();
+    let bridge_ip = settings
+        .get("hue_bridge_ip")
+        .ok()
+        .flatten()
+        .filter(|ip| crate::routes::developer_api::adresse_reseau_nue(ip));
+    let username = settings
+        .get("hue_username")
+        .ok()
+        .flatten()
+        .filter(|u| nom_hue_valide(u));
     (bridge_ip, username)
 }
 
@@ -94,17 +113,32 @@ struct HueConfigBody {
 }
 
 async fn set_hue_config(
+    _garde: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     Json(body): Json<HueConfigBody>,
-) -> Json<Value> {
+) -> axum::response::Response {
+    let ip = body.hue_bridge_ip.as_deref().map(str::trim);
+    let user = body.hue_username.as_deref().map(str::trim);
+    if ip.is_some_and(|ip| !crate::routes::developer_api::adresse_reseau_nue(ip))
+        || user.is_some_and(|u| !nom_hue_valide(u))
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_hue_config",
+                "message": "hue_bridge_ip must be host or host:port, hue_username a single token.",
+            })),
+        )
+            .into_response();
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    if let Some(ip) = &body.hue_bridge_ip {
+    if let Some(ip) = ip {
         settings.set("hue_bridge_ip", ip).ok();
     }
-    if let Some(user) = &body.hue_username {
+    if let Some(user) = user {
         settings.set("hue_username", user).ok();
     }
-    Json(json!({"saved": true}))
+    Json(json!({"saved": true})).into_response()
 }
 
 async fn hue_lights(State(state): State<AppState>) -> impl IntoResponse {

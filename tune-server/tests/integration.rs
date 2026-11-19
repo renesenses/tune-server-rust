@@ -2329,14 +2329,28 @@ async fn autoplay_active_est_rapporte_par_le_detail_de_la_zone() {
 }
 
 #[tokio::test]
-async fn autoplay_inactif_reste_inactif() {
-    // Le defaut ne doit pas basculer dans l'autre sens en corrigeant le bug.
+async fn autoplay_inactif_par_defaut_et_activable_8974() {
+    // #8974 (décision de Bertrand du 17/11) : une zone neuve n'enchaîne rien à
+    // la fin de la file (c'était l'inverse en rc12, fil 2694) ; le réglage
+    // s'active, reste actif, se coupe et reste coupé.
     let app = make_app();
     let zid = make_zone(&app, "AutoPlay Defaut").await;
 
     let (status, zone) = get(&app, &format!("/api/v1/zones/{zid}")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(zone["autoplay_enabled"], false, "defaut attendu : {zone}");
+    assert_eq!(zone["autoplay_mode"], "off", "defaut attendu : {zone}");
+
+    for voulu in [true, false] {
+        patch_json(
+            &app,
+            &format!("/api/v1/zones/{zid}"),
+            json!({ "autoplay_enabled": voulu }),
+        )
+        .await;
+        let (_, zone) = get(&app, &format!("/api/v1/zones/{zid}")).await;
+        assert_eq!(zone["autoplay_enabled"], voulu, "réglage tenu : {zone}");
+    }
 }
 
 /// Une playlist bâtie depuis les favoris radio doit dire ce qui n'a PAS marché.

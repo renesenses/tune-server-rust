@@ -1436,6 +1436,10 @@ pub struct PlaybackOrchestrator {
     /// Un champ et non un appel direct : les témoins y substituent un parc
     /// connu, faute de périphérique réel sur la machine qui les exécute.
     pub(crate) enumerer_parc_local: reenumeration_avant_refus::EnumerateurDeParcLocal,
+    /// #8171 — le système dont la règle de ré-énumération s'applique
+    /// (`std::env::consts::OS`). Un champ pour que les témoins jouent la règle
+    /// Windows depuis Linux.
+    pub(crate) systeme_du_parc_local: &'static str,
     /// #4863 — les sources PCM fournies par les greffons (lecture d'un CD…),
     /// par nom de `source`. Voir `crate::source_pcm`.
     pub(crate) sources_pcm: crate::source_pcm::SourcesPcm,
@@ -1500,6 +1504,18 @@ impl Drop for LevelsPrewarmScope<'_> {
                 comptes.remove(&self.zone_id);
             }
         }
+    }
+}
+
+impl PlayRequest {
+    /// #8689 — la piste dont le ReplayGain s'applique : bibliothèque, ou
+    /// titre Qobuz / TIDAL par son identifiant de service.
+    pub fn piste_rg(&self) -> crate::audio::replaygain::PisteRg<'_> {
+        crate::audio::replaygain::PisteRg::new(
+            self.track_id,
+            self.source.as_deref(),
+            self.source_id.as_deref(),
+        )
     }
 }
 
@@ -2002,6 +2018,7 @@ impl PlaybackOrchestrator {
             replis_de_peripherique_dits: std::sync::Mutex::new(HashMap::new()),
             radios_refusees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             enumerer_parc_local: reenumeration_avant_refus::enumerateur_de_production(),
+            systeme_du_parc_local: std::env::consts::OS,
             sources_pcm: crate::source_pcm::SourcesPcm::default(),
             sources_url: crate::source_url::SourcesUrl::default(),
             sources_physiques: Arc::default(),
@@ -2161,6 +2178,9 @@ mod service_wav_progressif_openhome_6718;
 
 mod dsp;
 // #5662 — une commande de volume à la fois par sortie, la dernière valeur gagne.
+/// #8968 (PR 0) — banc de mesure de la jointure entre deux pistes.
+#[cfg(test)]
+mod banc_jointure_8968_tests;
 /// #8082 — flux continu entre les pistes pour les renderers DLNA.
 mod flux_continu_8082;
 mod repere_de_hausse_6721;
@@ -2429,6 +2449,11 @@ mod dsd_upnp_politique_de_zone_tests;
 #[cfg(test)]
 mod dsd_pret_de_sorties_8052_tests;
 
+/// #8956 — Atoll ST200 : un DSD de serveur UPnP part dans l'orthographe que
+/// le Sink publie pour son conteneur (`audio/x-dsf` / `audio/x-dff`).
+#[cfg(test)]
+mod dsd_upnp_atoll_st200_8956_tests;
+
 /// Relevé par #5119 — les bras DSF UPnP et AAC n'appliquent pas l'égaliseur
 /// d'une zone LOCALE dans son flux : mesuré sur le PCM, une passe et non deux.
 #[cfg(test)]
@@ -2450,6 +2475,9 @@ mod mesure_saut_cd_5079;
 /// FLAC (ou le catalogue) ; inconnue, elle est refusée par une erreur nommée.
 #[cfg(test)]
 mod qobuz_cadence_nulle_5283_tests;
+/// #8983 — un saut Qobuz vers une sortie locale part de la position.
+#[cfg(test)]
+mod saut_qobuz_8983_tests;
 #[cfg(test)]
 mod tidal_aac_annonce_6334_tests;
 /// #7266 — de bout en bout, un FLAC CD TIDAL en DASH jusqu'au Play reçu par
@@ -2460,6 +2488,10 @@ mod tidal_cd_dash_jusqu_au_play_7266;
 /// téléchargement DASH.
 #[cfg(test)]
 mod tidal_premiere_note_7266_tests;
+/// #8701 — un saut dans une piste TIDAL DASH reprend le fichier (après le TTL
+/// du cache d'URL) ou le téléchargement en cours (sans en attendre la fin).
+#[cfg(test)]
+mod tidal_saut_8701_tests;
 
 /// #6401 — le préchargement sans blanc et la sonde de niveaux après une
 /// avance sans blanc passent par le même repli Qobuz en 16/44,1 que la
@@ -2694,6 +2726,10 @@ mod profondeur_annoncee_egale_profondeur_ecrite;
 #[cfg(test)]
 mod recreation_locale_guard;
 
+// #3245 — la sortie recréée à la volée suit le réglage de sa zone.
+#[cfg(test)]
+mod recreation_exclusif_zone_3245_tests;
+
 #[cfg(test)]
 mod adoption_du_flux_pre_arme_3442;
 
@@ -2726,3 +2762,8 @@ mod deplacement_qobuz_6982_tests;
 // #8188 — plafond 16 bits de la zone sur le bras HTTPS des services (Qobuz).
 #[cfg(test)]
 mod plafond_16_bits_service_8188_tests;
+
+#[cfg(test)]
+mod format_m4a_sink_8722_tests;
+#[cfg(test)]
+mod reprise_dlna_701_8738_tests;

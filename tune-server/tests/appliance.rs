@@ -12,7 +12,67 @@ use tower::ServiceExt;
 
 fn make_app() -> axum::Router {
     let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
-    tune_server::routes::router(state)
+    // Sécurité : sans authentification, les actions d'appliance ne sont
+    // acceptées que depuis cette machine — le test se présente en 127.0.0.1.
+    tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+    ))
+}
+
+/// Sécurité : sur une appliance dont le relais du port 80 rouvre les
+/// connexions depuis 127.0.0.1, le bouclage ne prouve plus rien : les actions
+/// machine exigent un administrateur, même vues de 127.0.0.1. L'image corrigée
+/// retire les unités et le bouclage redevient fiable.
+#[tokio::test]
+async fn le_relais_du_port_80_ferme_l_exemption_cette_machine() {
+    let _environment = crate::lock_environment();
+    struct Retirer;
+    impl Drop for Retirer {
+        fn drop(&mut self) {
+            unsafe {
+                std::env::remove_var("TUNE_APPLIANCE");
+                std::env::remove_var("TUNE_WEB80_RELAIS");
+            }
+        }
+    }
+    let _retirer = Retirer;
+    unsafe {
+        std::env::set_var("TUNE_APPLIANCE", "1");
+        std::env::set_var("TUNE_WEB80_RELAIS", "1");
+    }
+    assert!(!tune_server::routes::appliance::bouclage_fiable());
+    let app = make_app();
+    // La garde refuse AVANT le gestionnaire : rien ne redémarre ici.
+    let (status, body) = post_json(&app, "/api/v1/appliance/reboot", json!(null)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], json!("auth_required"), "{body}");
+    assert_eq!(body["reason"], json!("port80_relay"), "{body}");
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/appliance/install-to-disk",
+        json!({"device": "sda", "confirm": "oui"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["reason"], json!("port80_relay"), "{body}");
+
+    // La base entière suit la même règle : vue de 127.0.0.1 derrière le
+    // relais, sans authentification, l'export est refusé.
+    let (status, body) = get(&app, "/api/v1/system/database/export").await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"], json!("auth_required"), "{body}");
+
+    // Image corrigée : plus d'unité de relais, le bouclage vaut de nouveau.
+    unsafe { std::env::set_var("TUNE_WEB80_RELAIS", "0") };
+    assert!(tune_server::routes::appliance::bouclage_fiable());
+    let (status, body) = post_json(
+        &app,
+        "/api/v1/appliance/install-to-disk",
+        json!({"device": "sda", "confirm": "oui"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "confirm invalide : {body}");
+    assert_ne!(body["error"], json!("auth_required"), "{body}");
 }
 
 async fn get(app: &axum::Router, path: &str) -> (StatusCode, Value) {
@@ -252,24 +312,24 @@ async fn extinction_montee_et_gardee_par_l_auth() {
     }
 }
 
-/// #8213 — l'arrêt programmé `action: "poweroff"` n'est permis que sur
-/// Tune OS : refusé en clair ailleurs, et l'écran sait s'il doit le proposer
-/// (`poweroff_available`). Le planificateur n'est pas lancé par
-/// `routes::router` : rien ne peut s'éteindre ici.
+/// #8213, #8909 — l'arrêt programmé `action: "poweroff"` : permis sur Tune OS
+/// et sur un hôte ordinaire (Linux/macOS/Windows) hors conteneur ; masqué et
+/// refusé en clair dans un conteneur, même avec `TUNE_APPLIANCE=1` ; désactivé
+/// par défaut ; réservé à l'administrateur. Le planificateur n'est pas lancé
+/// par `routes::router` : rien ne peut s'éteindre ici.
 #[tokio::test]
-async fn arret_programme_poweroff_reserve_a_tune_os() {
+async fn arret_programme_poweroff_hote_tune_os_et_conteneur() {
     let _environment = crate::lock_environment();
     const ROUTE: &str = "/api/v1/system/settings/scheduled-stop";
 
-    async fn put(app: &axum::Router, body: Value) -> (StatusCode, Value) {
+    async fn put(app: &axum::Router, body: Value, jeton: Option<&str>) -> (StatusCode, Value) {
+        let mut req = Request::put(ROUTE).header("content-type", "application/json");
+        if let Some(j) = jeton {
+            req = req.header("authorization", format!("Bearer {j}"));
+        }
         let resp = app
             .clone()
-            .oneshot(
-                Request::put(ROUTE)
-                    .header("content-type", "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
+            .oneshot(req.body(Body::from(body.to_string())).unwrap())
             .await
             .unwrap();
         let status = resp.status();
@@ -279,46 +339,172 @@ async fn arret_programme_poweroff_reserve_a_tune_os() {
         (status, serde_json::from_slice(&body).unwrap_or(json!(null)))
     }
 
-    // Retire `TUNE_APPLIANCE` même si une assertion échoue en route : un
-    // « 1 » laissé derrière ferait croire aux essais voisins qu'ils tournent
-    // sur Tune OS.
-    struct RetirerAppliance;
-    impl Drop for RetirerAppliance {
+    // Retire les variables même si une assertion échoue en route : un « 1 »
+    // laissé derrière ferait croire aux essais voisins qu'ils tournent sur
+    // Tune OS, un « docker » qu'ils tournent en conteneur.
+    struct Retirer;
+    impl Drop for Retirer {
         fn drop(&mut self) {
-            unsafe { std::env::remove_var("TUNE_APPLIANCE") };
+            unsafe {
+                std::env::remove_var("TUNE_APPLIANCE");
+                std::env::remove_var("TUNE_CONTENEUR_FORCE");
+            }
         }
     }
-    let _retirer = RetirerAppliance;
+    let _retirer = Retirer;
 
     let eteindre = json!({"enabled": true, "time": "23:00", "action": "poweroff"});
 
-    // 1) Machine ordinaire (Docker, NAS, Mac, bureau) : refus clair, rien posé.
-    unsafe { std::env::set_var("TUNE_APPLIANCE", "0") };
+    // 1) Conteneur (Docker) : option masquée, refus clair, rien posé — même
+    //    avec TUNE_APPLIANCE=1 posé dans l'image.
+    for appliance in ["0", "1"] {
+        unsafe {
+            std::env::set_var("TUNE_CONTENEUR_FORCE", "docker");
+            std::env::set_var("TUNE_APPLIANCE", appliance);
+        }
+        let app = make_app();
+        let (status, body) = get(&app, ROUTE).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["poweroff_available"], json!(false), "{body}");
+        assert_eq!(body["poweroff_mode"], json!(null), "{body}");
+        let (status, body) = put(&app, eteindre.clone(), None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(body["code"], json!("poweroff_unavailable"), "{body}");
+        assert_eq!(body["reason"], json!("container"), "{body}");
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("container"),
+            "le refus doit dire pourquoi : {body}"
+        );
+        let (_, body) = get(&app, ROUTE).await;
+        assert_eq!(body["scheduled_stop"], json!(null), "un refus ne pose rien");
+
+        // L'arrêt de la lecture, lui, reste permis partout.
+        let (status, body) = put(&app, json!({"enabled": true, "time": "23:00"}), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["scheduled_stop"]["action"], json!("stop_playback"));
+    }
+
+    // 2) Hôte ordinaire hors conteneur (la machine de test : Linux ou macOS) :
+    //    désactivé par défaut, proposé ; mais SANS authentification active,
+    //    refusé même depuis le bouclage (#8909) — accepté plus bas, en 4).
+    unsafe {
+        std::env::set_var("TUNE_CONTENEUR_FORCE", "aucun");
+        std::env::set_var("TUNE_APPLIANCE", "0");
+    }
     let app = make_app();
-    let (status, body) = get(&app, ROUTE).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["poweroff_available"], json!(false), "{body}");
-    let (status, body) = put(&app, eteindre.clone()).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(body["code"], json!("poweroff_unavailable"), "{body}");
+    let (_, body) = get(&app, ROUTE).await;
+    assert_eq!(body["scheduled_stop"], json!(null), "rien par défaut");
+    assert_eq!(body["poweroff_available"], json!(true), "{body}");
+    assert_eq!(body["poweroff_mode"], json!("host"), "{body}");
+    assert_eq!(body["last_poweroff_error"], json!(null), "{body}");
+    let (status, body) = put(&app, json!({"enabled": true, "time": "23:00"}), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["scheduled_stop"]["action"],
+        json!("stop_playback"),
+        "sans `action`, l'option reste désactivée"
+    );
+    let (status, body) = put(&app, eteindre.clone(), None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["code"], json!("auth_required"), "{body}");
     assert!(
-        body["error"].as_str().unwrap_or("").contains("Tune OS"),
-        "le refus doit dire pourquoi : {body}"
+        body["message"]
+            .as_str()
+            .unwrap_or("")
+            .contains("enable authentication"),
+        "{body}"
     );
     let (_, body) = get(&app, ROUTE).await;
-    assert_eq!(body["scheduled_stop"], json!(null), "un refus ne pose rien");
+    assert_eq!(
+        body["scheduled_stop"]["action"],
+        json!("stop_playback"),
+        "un refus ne pose rien"
+    );
 
-    // L'arrêt de la lecture, lui, reste permis partout (défaut inchangé).
-    let (status, body) = put(&app, json!({"enabled": true, "time": "23:00"})).await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["scheduled_stop"]["action"], json!("stop_playback"));
-
-    // 2) Tune OS : l'action est proposée et acceptée.
+    // 3) Tune OS : l'action est proposée et acceptée, en mode « tune_os ».
     unsafe { std::env::set_var("TUNE_APPLIANCE", "1") };
     let app = make_app();
     let (_, body) = get(&app, ROUTE).await;
     assert_eq!(body["poweroff_available"], json!(true), "{body}");
-    let (status, body) = put(&app, eteindre).await;
+    assert_eq!(body["poweroff_mode"], json!("tune_os"), "{body}");
+    // Le mode rangé est celui du serveur, jamais celui du client.
+    let mut avec_mode_client = eteindre.clone();
+    avec_mode_client["poweroff_mode"] = json!("host");
+    let (status, body) = put(&app, avec_mode_client, None).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["scheduled_stop"]["action"], json!("poweroff"));
+    assert_eq!(
+        body["scheduled_stop"]["poweroff_mode"],
+        json!("tune_os"),
+        "{body}"
+    );
+
+    // 4) Authentification active : un compte ordinaire ne pose pas l'option,
+    //    l'administrateur si (même garde que les autres réglages système).
+    unsafe { std::env::set_var("TUNE_APPLIANCE", "0") };
+    const SECRET: &str = "test-jwt-secret-8909";
+    let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    settings.set("auth_enabled", "true").unwrap();
+    settings.set("jwt_secret", SECRET).unwrap();
+    let etat = state.clone();
+    let app =
+        tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([192, 168, 1, 50], 50000)),
+        ));
+    let jeton_user = tune_server::auth::sign_jwt(2, "user", SECRET).unwrap();
+    let jeton_admin = tune_server::auth::sign_jwt(1, "admin", SECRET).unwrap();
+    let (status, _) = put(&app, eteindre.clone(), None).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "anonyme refusé");
+    let (status, body) = put(&app, eteindre.clone(), Some(&jeton_user)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "rôle user refusé : {body}");
+    let (status, body) = put(&app, eteindre, Some(&jeton_admin)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "l'administrateur pose l'option : {body}"
+    );
+    assert_eq!(body["scheduled_stop"]["action"], json!("poweroff"));
+    assert_eq!(
+        body["scheduled_stop"]["poweroff_mode"],
+        json!("host"),
+        "{body}"
+    );
+
+    // 5) Le dernier échec : complet pour l'administrateur, code seul aux autres.
+    tune_core::db::settings_repo::SettingsRepo::with_backend(etat.backend.clone())
+        .set(
+            "scheduled_stop_poweroff_error",
+            r#"{"at":"2026-11-16T23:00:00","code":"polkit_denied","error":"Access denied"}"#,
+        )
+        .unwrap();
+    async fn lire(app: &axum::Router, jeton: &str) -> Value {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::get(ROUTE)
+                    .header("authorization", format!("Bearer {jeton}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let octets = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice::<Value>(&octets).unwrap()
+    }
+    let vu = lire(&app, &jeton_admin).await;
+    assert_eq!(
+        vu["last_poweroff_error"]["error"],
+        json!("Access denied"),
+        "{vu}"
+    );
+    let vu = lire(&app, &jeton_user).await;
+    assert_eq!(
+        vu["last_poweroff_error"]["code"],
+        json!("polkit_denied"),
+        "{vu}"
+    );
+    assert_eq!(vu["last_poweroff_error"].get("error"), None, "{vu}");
 }

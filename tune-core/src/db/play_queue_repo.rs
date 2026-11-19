@@ -17,6 +17,18 @@ use super::sqlite::SqliteDb;
 pub mod sql {
     use super::SqlDialect;
 
+    /// Recette du 14/11 — la durée d'un titre de service entré en file à 0.
+    pub fn completer_duree_de_service<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE queue_items SET duration_ms = {} WHERE zone_id = {} AND source = {} \
+             AND source_id = {} AND (duration_ms IS NULL OR duration_ms <= 0)",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4)
+        )
+    }
+
     pub fn queue_select_base() -> &'static str {
         "SELECT q.id, q.zone_id, q.track_id, q.position, q.is_current, t.title, ar.name, al.title, t.duration_ms, t.file_path, COALESCE(t.cover_path, al.cover_path), t.format, t.sample_rate, t.bit_depth FROM queue_items q LEFT JOIN tracks t ON q.track_id = t.id LEFT JOIN albums al ON t.album_id = al.id LEFT JOIN artists ar ON t.artist_id = ar.id"
     }
@@ -262,6 +274,34 @@ pub mod sql {
             unified_select_base(),
             d.placeholder(1),
             d.placeholder(2)
+        )
+    }
+
+    /// #8968 — les lignes de la file autour de la ligne en cours, en UNE
+    /// requête bornée : de la précédente à celle d'après la suivante (rangs
+    /// `c-1 ..= c+2`), plus les deux premières quand `avec_la_tete` (file qui
+    /// reboucle). Rien du tout sans ligne en cours.
+    pub fn voisinage_du_courant<D: SqlDialect>(d: &D, avec_la_tete: bool) -> String {
+        let courant = |n: usize| {
+            format!(
+                "(SELECT c.position FROM queue_items c WHERE c.zone_id = {} \
+                 AND c.is_current = 1 ORDER BY c.position, c.id LIMIT 1)",
+                d.placeholder(n)
+            )
+        };
+        let tete = if avec_la_tete {
+            " OR (q.position <= 1 AND EXISTS (SELECT 1 FROM queue_items e \
+             WHERE e.zone_id = q.zone_id AND e.is_current = 1))"
+        } else {
+            ""
+        };
+        format!(
+            "{} WHERE q.zone_id = {} AND (q.position BETWEEN {} - 1 AND {} + 2{tete}) \
+             ORDER BY q.position, q.id LIMIT 8",
+            unified_select_base(),
+            d.placeholder(1),
+            courant(2),
+            courant(3),
         )
     }
 
@@ -635,6 +675,14 @@ impl InsertOutcome {
             _ => courant,
         }
     }
+}
+
+/// Refus métier distingués d'une erreur de stockage, pour la route de déplacement.
+#[derive(Debug)]
+pub enum ErreurDeplacementBloc {
+    Bornes,
+    OrdrePerime,
+    Stockage(String),
 }
 
 pub struct PlayQueueRepo {
@@ -1033,6 +1081,24 @@ impl PlayQueueRepo {
         Ok(n)
     }
 
+    /// Recette du 14/11 — donne sa durée à un titre de service de la file
+    /// qui n'en a pas (0 ou nul). Une durée déjà connue n'est jamais
+    /// remplacée. Rend le nombre de lignes complétées.
+    pub fn completer_duree_de_service(
+        &self,
+        zone_id: i64,
+        source: &str,
+        source_id: &str,
+        duration_ms: i64,
+    ) -> Result<usize, String> {
+        let sql = self.dialect_sql(
+            sql::completer_duree_de_service,
+            sql::completer_duree_de_service,
+        );
+        let params: [&dyn ToSqlValue; 4] = [&duration_ms, &zone_id, &source, &source_id];
+        self.db.execute(&sql, &params)
+    }
+
     pub fn clear(&self, zone_id: i64) -> Result<(), String> {
         // Delete both subsets (local + streaming) of the unified table.
         let delete_local = self.dialect_sql(sql::delete_for_zone, sql::delete_for_zone);
@@ -1105,6 +1171,22 @@ impl PlayQueueRepo {
             .position(|r| r.first().and_then(|v| v.as_i64()).unwrap_or(0) != 0)
             .map(|p| p as i64);
         Ok((courant, rows.len() as i64))
+    }
+
+    /// #8968 — voir [`sql::voisinage_du_courant`] : au plus huit lignes, une
+    /// requête, sans relire la file ni ses drapeaux.
+    pub fn voisinage_du_courant(
+        &self,
+        zone_id: i64,
+        avec_la_tete: bool,
+    ) -> Result<Vec<QueueEntry>, String> {
+        let sql = self.dialect_sql(
+            |d| sql::voisinage_du_courant(d, avec_la_tete),
+            |d| sql::voisinage_du_courant(d, avec_la_tete),
+        );
+        let params: [&dyn ToSqlValue; 3] = [&zone_id, &zone_id, &zone_id];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(|cols| row_to_queue_entry(cols)).collect())
     }
 
     /// The single queue entry at `position` (source-agnostic), if any.
@@ -1309,6 +1391,33 @@ impl PlayQueueRepo {
         self.insert_at(zone_id, items, None).map(|_| ())
     }
 
+    /// Fil 2694 — retire d'un coup les lignes `ids` de la file `entries` (lue
+    /// par l'appelant) et renumérote le reste en 0..N-1, dans une transaction.
+    /// Rend le nombre de lignes retirées.
+    pub fn retirer_les_lignes(&self, entries: &[QueueEntry], ids: &[i64]) -> Result<usize, String> {
+        let retirees = entries.iter().filter(|e| ids.contains(&e.id)).count();
+        if retirees == 0 {
+            return Ok(0);
+        }
+        let delete_sql = self.dialect_sql(sql::delete_by_id, sql::delete_by_id);
+        let set_pos_sql = self.dialect_sql(sql::set_position_by_id, sql::set_position_by_id);
+        self.db.write_tx(&mut |tx| {
+            let mut new_pos = 0i64;
+            for e in entries.iter() {
+                if ids.contains(&e.id) {
+                    let dp: [&dyn ToSqlValue; 1] = [&e.id];
+                    tx.execute(&delete_sql, &dp)?;
+                    continue;
+                }
+                let p: [&dyn ToSqlValue; 2] = [&new_pos, &e.id];
+                tx.execute(&set_pos_sql, &p)?;
+                new_pos += 1;
+            }
+            Ok(())
+        })?;
+        Ok(retirees)
+    }
+
     /// Remove the item at `position` (source-agnostic) and close the gap.
     pub fn remove_pos(&self, zone_id: i64, position: i64) -> Result<bool, String> {
         // `position` from the client is an ORDINAL into the displayed queue
@@ -1380,6 +1489,79 @@ impl PlayQueueRepo {
             }
             Ok(())
         })
+    }
+
+    /// Déplace un bloc contigu ; `to` est son rang de départ dans la file finale.
+    /// Identités, ordre attendu et bornes sont vérifiés dans la même transaction.
+    /// Renvoie les identités avant/après pour conserver le curseur de lecture.
+    pub fn deplacer_bloc(
+        &self,
+        zone_id: i64,
+        from: i64,
+        to: i64,
+        count: i64,
+        expected_order: Option<&[i64]>,
+    ) -> Result<(Vec<i64>, Vec<i64>), ErreurDeplacementBloc> {
+        let ids_sql = self.dialect_sql(
+            |d| {
+                format!(
+                    "SELECT id FROM queue_items WHERE zone_id = {} ORDER BY position, id",
+                    d.placeholder(1)
+                )
+            },
+            |d| {
+                format!(
+                    "SELECT id FROM queue_items WHERE zone_id = {} ORDER BY position, id",
+                    d.placeholder(1)
+                )
+            },
+        );
+        let set_pos_sql = self.dialect_sql(sql::set_position_by_id, sql::set_position_by_id);
+        let mut avant = Vec::new();
+        let mut apres = Vec::new();
+        let mut refus = None;
+        let resultat = self.db.write_tx(&mut |tx| {
+            if self.db.engine() == Engine::Postgres {
+                // La lecture suivie de renumérotation doit aussi exclure un ajout
+                // concurrent. Verrou bref, sans réseau ni attente audio ; les
+                // lectures restent permises. SQLite sérialise déjà write_tx.
+                tx.execute("LOCK TABLE queue_items IN SHARE ROW EXCLUSIVE MODE", &[])?;
+            }
+            let params: [&dyn ToSqlValue; 1] = [&zone_id];
+            avant = tx
+                .query_many(&ids_sql, &params)?
+                .iter()
+                .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+                .collect();
+            if expected_order.is_some_and(|ordre| ordre != avant.as_slice()) {
+                refus = Some(ErreurDeplacementBloc::OrdrePerime);
+                return Err("queue order changed".into());
+            }
+            let len = avant.len() as i64;
+            if from < 0
+                || to < 0
+                || count <= 0
+                || count > len
+                || from > len - count
+                || to > len - count
+            {
+                refus = Some(ErreurDeplacementBloc::Bornes);
+                return Err("queue block out of range".into());
+            }
+            apres = avant.clone();
+            let bloc: Vec<_> = apres
+                .drain(from as usize..(from + count) as usize)
+                .collect();
+            apres.splice(to as usize..to as usize, bloc);
+            for (position, id) in apres.iter().enumerate() {
+                let position = position as i64;
+                let params: [&dyn ToSqlValue; 2] = [&position, id];
+                tx.execute(&set_pos_sql, &params)?;
+            }
+            Ok(())
+        });
+        resultat.map_err(|e| refus.unwrap_or(ErreurDeplacementBloc::Stockage(e)))?;
+        Ok((avant, apres))
     }
 
     /// La file entière, lue sur la connexion d'ÉCRITURE (#6526).
@@ -3556,3 +3738,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(all(test, feature = "postgres"))]
+#[path = "deplacement_bloc_pg_8849_tests.rs"]
+mod deplacement_bloc_pg_8849_tests;

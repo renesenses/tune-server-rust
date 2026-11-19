@@ -158,14 +158,10 @@ pub(super) async fn facteur_replaygain_de_zone(state: &AppState, zone_id: i64) -
     if tune_core::audio::audiophile::zone_enabled(&state.backend, zone_id) {
         return 1.0;
     }
-    let piste = state
-        .playback
-        .get_state(zone_id)
-        .await
-        .now_playing
-        .and_then(|np| np.track_id);
-    let f = piste.map_or(1.0, |tid| {
-        tune_core::audio::replaygain::playback_factor(&state.backend, tid)
+    // #8689 — un titre Qobuz / TIDAL compte aussi (gain publié par le service).
+    let en_cours = state.playback.get_state(zone_id).await.now_playing;
+    let f = en_cours.as_ref().map_or(1.0, |np| {
+        tune_core::audio::replaygain::facteur_de_zone(&state.backend, zone_id, np.piste_rg())
     });
     if f.is_finite() && f > 0.0 {
         f.min(4.0)

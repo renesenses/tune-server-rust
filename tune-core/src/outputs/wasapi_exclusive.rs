@@ -23,8 +23,19 @@ use super::local::{
 #[cfg(target_os = "windows")]
 use super::masque_de_canaux_4357::negocier_format_et_masque;
 #[cfg(target_os = "windows")]
+use super::mesure_du_retard_8696::{
+    BilanDeRafale, CausesCumulees, Histogramme, Rafales, RetardObserve,
+    avance_en_centiemes_de_periode, case_de_l_ecart, ou_est_le_temps,
+};
+#[cfg(target_os = "windows")]
 use super::negociation_format_exclusif_3837::{
     CandidatFormat, ResultatSonde, message_peripherique_occupe,
+};
+#[cfg(target_os = "windows")]
+use super::rendu_sans_bridage_8696::{
+    CompteursSession, Episode, PersistanceDesRetards, RESOLUTION_MINUTEUR_MS,
+    THREAD_POWER_THROTTLING, inscrire_session, ms_depuis_la_fermeture, noter_la_fermeture,
+    refus_du_bridage,
 };
 #[cfg(target_os = "windows")]
 use super::reveil_en_retard_4357::{Reveil, SuiviDesReveils, microsecondes, tache_mmcss_utf16};
@@ -138,6 +149,14 @@ mod ffi {
         data4: [0xA7, 0xBF, 0xAD, 0xDC, 0xA7, 0xC2, 0x60, 0xE2],
     };
 
+    // #8696 — IID_IAudioClock {CD63314F-3FBA-4A1B-812C-EF96358728E7}
+    pub const IID_IAUDIO_CLOCK: GUID = GUID {
+        data1: 0xCD63314F,
+        data2: 0x3FBA,
+        data3: 0x4A1B,
+        data4: [0x81, 0x2C, 0xEF, 0x96, 0x35, 0x87, 0x28, 0xE7],
+    };
+
     #[repr(C, packed)]
     #[derive(Clone, Copy)]
     pub struct WAVEFORMATEX {
@@ -166,6 +185,7 @@ mod ffi {
     //               7=IsFormatSupported, 8=GetMixFormat, 9=GetDevicePeriod, 10=Start,
     //               11=Stop, 12=Reset, 13=SetEventHandle, 14=GetService
     // IAudioRenderClient: 3=GetBuffer, 4=ReleaseBuffer
+    // IAudioClock: 3=GetFrequency, 4=GetPosition, 5=GetCharacteristics (#8696)
     // IPropertyStore: 3=GetCount, 4=GetAt, 5=GetValue
 
     unsafe extern "system" {
@@ -194,6 +214,32 @@ mod ffi {
         /// #4357 — l'horloge des réveils de la boucle de rendu.
         pub fn QueryPerformanceCounter(lpPerformanceCount: *mut i64) -> i32;
         pub fn QueryPerformanceFrequency(lpFrequency: *mut i64) -> i32;
+        /// #8696 — refuser le bridage d'énergie (EcoQoS) au fil de rendu.
+        pub fn GetCurrentThread() -> HANDLE;
+        pub fn SetThreadInformation(
+            hThread: HANDLE,
+            ThreadInformationClass: i32,
+            ThreadInformation: *const c_void,
+            ThreadInformationSize: u32,
+        ) -> i32;
+        /// #8696 — le cœur qui exécute le fil, au premier retard grave.
+        pub fn GetCurrentProcessorNumberEx(ProcNumber: *mut PROCESSOR_NUMBER);
+    }
+
+    /// #8696 — `PROCESSOR_NUMBER` (winnt.h).
+    #[repr(C)]
+    #[derive(Clone, Copy, Default)]
+    pub struct PROCESSOR_NUMBER {
+        pub Group: WORD,
+        pub Number: u8,
+        pub Reserved: u8,
+    }
+
+    // #8696 — la résolution du minuteur pendant la lecture.
+    #[link(name = "winmm")]
+    unsafe extern "system" {
+        pub fn timeBeginPeriod(uPeriod: u32) -> u32;
+        pub fn timeEndPeriod(uPeriod: u32) -> u32;
     }
 
     // #4357 — MMCSS : le fil de rendu passe dans la tâche « Pro Audio ».
@@ -331,6 +377,158 @@ unsafe fn audio_client_buffer_size(audio_client: *mut std::ffi::c_void) -> Resul
         return Err("IAudioClient::GetBufferSize a renvoyé zéro frame".to_string());
     }
     Ok(frames)
+}
+
+/// Initialise `audio_client` en exclusif événementiel à `period`, avec la
+/// reprise alignée de #2208. Windows peut refuser une période pour la seule
+/// raison que son nombre de trames n'est pas aligné : la reprise documentée
+/// exige `GetBufferSize` sur le client refusé, `Release`, un `Activate` neuf,
+/// puis `Initialize` à la durée alignée — jamais un second `Initialize` sur
+/// le même `IAudioClient`.
+///
+/// Rend le client initialisé et la période retenue. En cas d'échec, le
+/// client est LIBÉRÉ (pas `device`) et l'erreur porte le `HRESULT` du refus
+/// quand il y en a un.
+///
+/// # Safety
+/// `device` et `audio_client` doivent être valides ; `audio_client` non
+/// encore initialisé.
+#[cfg(target_os = "windows")]
+unsafe fn initialiser_a_la_periode(
+    device: *mut std::ffi::c_void,
+    audio_client: *mut std::ffi::c_void,
+    format: *const ffi::WAVEFORMATEX,
+    period: ffi::REFERENCE_TIME,
+    sample_rate: u32,
+) -> Result<(*mut std::ffi::c_void, ffi::REFERENCE_TIME), (String, Option<ffi::HRESULT>)> {
+    let first_hr = unsafe { initialize_audio_client(audio_client, format, period) };
+    match wasapi_init_decision(first_hr) {
+        WasapiInitDecision::Ready => Ok((audio_client, period)),
+        WasapiInitDecision::RetryWithAlignedBuffer => {
+            let aligned_frames = match unsafe { audio_client_buffer_size(audio_client) } {
+                Ok(frames) => frames,
+                Err(error) => {
+                    unsafe { ffi::release(audio_client) };
+                    return Err((
+                        format!("WASAPI n a pas fourni la taille alignée après le refus : {error}"),
+                        None,
+                    ));
+                }
+            };
+            unsafe { ffi::release(audio_client) };
+            let aligned = wasapi_aligned_duration_100ns(aligned_frames, sample_rate)
+                .map_err(|error| (error, None))?;
+            let client = unsafe { activate_audio_client(device) }.map_err(|error| {
+                (
+                    format!("Réactivation IAudioClient après alignement impossible : {error}"),
+                    None,
+                )
+            })?;
+            let retry_hr = unsafe { initialize_audio_client(client, format, aligned) };
+            if retry_hr != ffi::S_OK {
+                unsafe { ffi::release(client) };
+                return Err((
+                    message_peripherique_occupe(retry_hr).unwrap_or_else(|| {
+                        format!(
+                            "IAudioClient::Initialize(EXCLUSIVE, aligned) failed: 0x{retry_hr:08X}"
+                        )
+                    }),
+                    Some(retry_hr),
+                ));
+            }
+            Ok((client, aligned))
+        }
+        WasapiInitDecision::Fail(hr) => {
+            unsafe { ffi::release(audio_client) };
+            // #3067 : l'endpoint tenu par un autre programme se dit en clair,
+            // pas en `HRESULT`.
+            Err((
+                message_peripherique_occupe(hr).unwrap_or_else(|| {
+                    format!("IAudioClient::Initialize(EXCLUSIVE) failed: 0x{hr:08X}")
+                }),
+                Some(hr),
+            ))
+        }
+    }
+}
+
+/// #8696 — `IAudioClock::GetPosition` : la position de l'appareil, dans
+/// l'unité de `GetFrequency`. `None` si l'horloge est absente ou refuse.
+///
+/// # Safety
+/// `horloge` doit être nul ou un `IAudioClock` valide.
+#[cfg(target_os = "windows")]
+unsafe fn position_de_l_appareil(horloge: *mut std::ffi::c_void) -> Option<u64> {
+    if horloge.is_null() {
+        return None;
+    }
+    type GetPositionFn =
+        unsafe extern "system" fn(*mut std::ffi::c_void, *mut u64, *mut u64) -> ffi::HRESULT;
+    let vtable = unsafe { *(horloge as *const *const *const std::ffi::c_void) };
+    let get_position: GetPositionFn = unsafe { std::mem::transmute(*vtable.add(4)) };
+    let mut position = 0u64;
+    let mut qpc = 0u64;
+    (unsafe { get_position(horloge, &mut position, &mut qpc) } == ffi::S_OK).then_some(position)
+}
+
+/// #8696 — `IAudioClock::GetFrequency`. `None` si l'horloge est absente,
+/// refuse, ou annonce zéro.
+///
+/// # Safety
+/// `horloge` doit être nul ou un `IAudioClock` valide.
+#[cfg(target_os = "windows")]
+unsafe fn frequence_de_l_horloge(horloge: *mut std::ffi::c_void) -> Option<u64> {
+    if horloge.is_null() {
+        return None;
+    }
+    type GetFrequencyFn =
+        unsafe extern "system" fn(*mut std::ffi::c_void, *mut u64) -> ffi::HRESULT;
+    let vtable = unsafe { *(horloge as *const *const *const std::ffi::c_void) };
+    let get_frequency: GetFrequencyFn = unsafe { std::mem::transmute(*vtable.add(3)) };
+    let mut frequence = 0u64;
+    (unsafe { get_frequency(horloge, &mut frequence) } == ffi::S_OK && frequence > 0)
+        .then_some(frequence)
+}
+
+/// #8696 — `IAudioClient::GetCurrentPadding`, en trames. Lu au seul réveil
+/// en retard, jamais à chaque période.
+///
+/// # Safety
+/// `audio_client` doit être un `IAudioClient` initialisé.
+#[cfg(target_os = "windows")]
+unsafe fn rembourrage_courant(audio_client: *mut std::ffi::c_void) -> Option<u32> {
+    type GetPaddingFn = unsafe extern "system" fn(*mut std::ffi::c_void, *mut u32) -> ffi::HRESULT;
+    let vtable = unsafe { *(audio_client as *const *const *const std::ffi::c_void) };
+    let get_padding: GetPaddingFn = unsafe { std::mem::transmute(*vtable.add(6)) };
+    let mut trames = 0u32;
+    (unsafe { get_padding(audio_client, &mut trames) } == ffi::S_OK).then_some(trames)
+}
+
+/// #8696 — une ligne de journal par RAFALE de réveils en retard.
+#[cfg(target_os = "windows")]
+fn journaliser_la_rafale(b: &BilanDeRafale, frequence: i64, periode_us: u64, buffer_frames: u32) {
+    let [h2, h3, h4, h5, h6] = b.histogramme;
+    warn!(
+        reveils = b.reveils,
+        duree_ms = microsecondes(b.duree_ticks, frequence) / 1_000,
+        ecart_max_us = microsecondes(b.ecart_max_ticks, frequence),
+        periode_us,
+        periodes_2 = h2,
+        periodes_3 = h3,
+        periodes_4 = h4,
+        periodes_5 = h5,
+        periodes_6_et_plus = h6,
+        dans_le_rendu = b.dans_le_rendu,
+        dans_l_attente = b.dans_l_attente,
+        appareil_a_avance = b.appareil_a_avance,
+        appareil_fige = b.appareil_fige,
+        avance_max_centiemes_de_periode = ?b.avance_max_centiemes,
+        rembourrage_min_trames = ?b.rembourrage_min,
+        rembourrage_max_trames = ?b.rembourrage_max,
+        buffer_frames,
+        verdict = b.verdict(),
+        "wasapi_exclusive_rafale_de_retards (#8696)"
+    );
 }
 
 /// #3837 — le `WAVEFORMATEXTENSIBLE` d'un candidat, à cadence et canaux
@@ -789,6 +987,11 @@ pub struct WasapiExclusiveOutput {
     audio_client: *mut std::ffi::c_void,
     #[cfg(target_os = "windows")]
     render_client: *mut std::ffi::c_void,
+    /// #8696 — `IAudioClock` du flux, pour relever la position de l'appareil
+    /// aux réveils en retard. Nul si le pilote ne le fournit pas : la mesure
+    /// se tait, la lecture n'en dépend jamais.
+    #[cfg(target_os = "windows")]
+    audio_clock: *mut std::ffi::c_void,
     #[cfg(target_os = "windows")]
     event_handle: ffi::HANDLE,
     /// #4357 — événement à **réinitialisation manuelle** que `stop()` signale
@@ -813,6 +1016,14 @@ pub struct WasapiExclusiveOutput {
     late_wakeups: Arc<AtomicU64>,
     /// #4357 — le plus grand écart mesuré entre deux réveils, en µs.
     max_wakeup_gap_us: Arc<AtomicU64>,
+    /// #8696 — les réveils en retard par écart en périodes, et leurs causes.
+    #[cfg(target_os = "windows")]
+    histogramme: Arc<Histogramme>,
+    #[cfg(target_os = "windows")]
+    causes: Arc<CausesCumulees>,
+    /// #8696 — ms écoulées depuis la fermeture précédente du même appareil.
+    #[cfg(target_os = "windows")]
+    reouverture_apres_ms: Option<u64>,
     render_thread: Option<std::thread::JoinHandle<()>>,
     resources_released: bool,
     #[cfg(target_os = "windows")]
@@ -822,7 +1033,11 @@ pub struct WasapiExclusiveOutput {
 impl WasapiExclusiveOutput {
     /// Open exactly the WASAPI endpoint requested by the zone in exclusive
     /// mode at the given sample rate and bit depth.
+    ///
+    /// #8696 — `reglage_periode_ms` : la période réglée sur la zone, `0` pour
+    /// « Auto » (variable d'environnement, sinon période du pilote).
     #[cfg(target_os = "windows")]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         device_name: &str,
         endpoint_id: Option<&str>,
@@ -831,6 +1046,7 @@ impl WasapiExclusiveOutput {
         channels: u32,
         ring: Arc<NativePcmRing>,
         paused: Arc<AtomicBool>,
+        reglage_periode_ms: u32,
     ) -> Result<Self, String> {
         Self::ouvrir_l_endpoint(
             device_name,
@@ -841,6 +1057,7 @@ impl WasapiExclusiveOutput {
             ring,
             paused,
             false,
+            reglage_periode_ms,
         )
     }
 
@@ -854,6 +1071,7 @@ impl WasapiExclusiveOutput {
     /// Jamais plus de voies que la sortie n'en déclare ; l'appelant rouvre
     /// alors au format de la source, comme avant.
     #[cfg(target_os = "windows")]
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_sur_voies_pilotees(
         device_name: &str,
         endpoint_id: Option<&str>,
@@ -862,6 +1080,7 @@ impl WasapiExclusiveOutput {
         voies: u32,
         ring: Arc<NativePcmRing>,
         paused: Arc<AtomicBool>,
+        reglage_periode_ms: u32,
     ) -> Result<Self, String> {
         Self::ouvrir_l_endpoint(
             device_name,
@@ -872,6 +1091,7 @@ impl WasapiExclusiveOutput {
             ring,
             paused,
             true,
+            reglage_periode_ms,
         )
     }
 
@@ -886,6 +1106,7 @@ impl WasapiExclusiveOutput {
         ring: Arc<NativePcmRing>,
         paused: Arc<AtomicBool>,
         plafonner_aux_voies_declarees: bool,
+        reglage_periode_ms: u32,
     ) -> Result<Self, String> {
         use ffi::*;
         use std::ffi::c_void;
@@ -895,6 +1116,10 @@ impl WasapiExclusiveOutput {
 
         unsafe {
             let resolved = resolve_wasapi_endpoint(endpoint_id.unwrap_or(device_name))?;
+            // #8696 — les sessions malades s'ouvraient juste après un arrêt :
+            // le délai depuis la fermeture précédente de CE périphérique.
+            let reouverture_apres_ms =
+                ms_depuis_la_fermeture(&resolved.id, std::time::Instant::now());
 
             // 1. Create MMDeviceEnumerator
             let mut enumerator: *mut c_void = ptr::null_mut();
@@ -1003,17 +1228,26 @@ impl WasapiExclusiveOutput {
                 Err(erreur) => {
                     let mixeur =
                         format_du_mixeur(audio_client).unwrap_or_else(|| "illisible".to_string());
+                    let voies_declarees = canaux_du_mixeur(audio_client);
                     info!(
                         sample_rate,
                         bit_depth,
                         channels,
                         format_du_mixeur = %mixeur,
+                        voies_declarees = ?voies_declarees,
                         detail = %erreur,
                         "wasapi_exclusive_format_not_supported"
                     );
                     release(audio_client);
                     release(device);
-                    return Err(erreur);
+                    // #8696 — un fichier multicanal vers un DAC stéréo : le
+                    // dire en clair plutôt qu'en liste de formats refusés.
+                    return Err(super::voies_en_trop_8696::VoiesEnTrop::constater(
+                        channels,
+                        voies_declarees,
+                    )
+                    .map(|v| v.sentinelle())
+                    .unwrap_or(erreur));
                 }
             };
             let negocie = retenu.negocie;
@@ -1064,12 +1298,18 @@ impl WasapiExclusiveOutput {
                 }
             }
             // #4357 — la période PAR DÉFAUT, plus la minimale : voir
-            // `periode_exclusive_4357`. Les deux sont journalisées.
-            let period = match super::periode_exclusive_4357::periode_exclusive_100ns(
+            // `periode_exclusive_4357`. #8696 — remplacée par la période
+            // réglée (zone, puis `TUNE_WASAPI_EXCLUSIVE_PERIOD_MS`) quand il y
+            // en a une ; la période par défaut reste le repli si le pilote la
+            // refuse. Toutes sont journalisées.
+            let demandee =
+                super::periode_reglable_8696::periode_demandee_pour_l_ouverture(reglage_periode_ms);
+            let retenue = match super::periode_reglable_8696::periode_retenue_100ns(
                 default_period,
                 min_period,
+                demandee.map(|(ms, _)| ms),
             ) {
-                Ok(period) => period,
+                Ok(retenue) => retenue,
                 Err(error) => {
                     release(audio_client);
                     release(device);
@@ -1077,73 +1317,59 @@ impl WasapiExclusiveOutput {
                 }
             };
 
-            // 7. Initialize in exclusive event-driven mode. Windows can reject
-            // the requested period solely because its frame count is not
-            // aligned. The documented recovery requires GetBufferSize on the
-            // rejected client, Release, a fresh Activate, then Initialize with
-            // the aligned duration — never a second Initialize on the same
-            // one-shot IAudioClient.
-            let mut selected_period = period;
-            let first_hr = initialize_audio_client(
-                audio_client,
-                &wfx.Format as *const WAVEFORMATEX,
-                selected_period,
-            );
-            match wasapi_init_decision(first_hr) {
-                WasapiInitDecision::Ready => {}
-                WasapiInitDecision::RetryWithAlignedBuffer => {
-                    let aligned_frames = match audio_client_buffer_size(audio_client) {
-                        Ok(frames) => frames,
-                        Err(error) => {
-                            release(audio_client);
-                            release(device);
-                            return Err(format!(
-                                "WASAPI n a pas fourni la taille alignée après le refus : {error}"
-                            ));
-                        }
-                    };
-                    release(audio_client);
-                    selected_period =
-                        match wasapi_aligned_duration_100ns(aligned_frames, sample_rate) {
-                            Ok(duration) => duration,
-                            Err(error) => {
-                                release(device);
-                                return Err(error);
-                            }
-                        };
+            // 7. Initialize in exclusive event-driven mode, period by period:
+            // the requested one, then the driver default if the driver
+            // refuses it (#8696). Alignment retries happen inside
+            // `initialiser_a_la_periode` (#2208).
+            let mut selected_period: REFERENCE_TIME = 0;
+            let mut derniere_erreur = String::new();
+            let mut ouvert = false;
+            let mut repli = false;
+            for (essai, periode) in retenue.periodes_a_essayer().into_iter().enumerate() {
+                if essai > 0 {
+                    warn!(
+                        device = %resolved.name,
+                        periode_refusee_100ns = retenue.periode_100ns,
+                        periode_de_repli_100ns = periode,
+                        erreur = %derniere_erreur,
+                        "wasapi_exclusive_periode_reglee_refusee_repli_sur_la_periode_du_pilote (#8696)"
+                    );
                     audio_client = match activate_audio_client(device) {
                         Ok(client) => client,
                         Err(error) => {
                             release(device);
-                            return Err(format!(
-                                "Réactivation IAudioClient après alignement impossible : {error}"
-                            ));
+                            return Err(error);
                         }
                     };
-                    let retry_hr = initialize_audio_client(
-                        audio_client,
-                        &wfx.Format as *const WAVEFORMATEX,
-                        selected_period,
-                    );
-                    if retry_hr != S_OK {
-                        release(audio_client);
-                        release(device);
-                        return Err(message_peripherique_occupe(retry_hr).unwrap_or_else(|| {
-                            format!(
-                                "IAudioClient::Initialize(EXCLUSIVE, aligned) failed: 0x{retry_hr:08X}"
-                            )
-                        }));
+                }
+                match initialiser_a_la_periode(
+                    device,
+                    audio_client,
+                    &wfx.Format as *const WAVEFORMATEX,
+                    periode,
+                    sample_rate,
+                ) {
+                    Ok((client, periode_alignee)) => {
+                        audio_client = client;
+                        selected_period = periode_alignee;
+                        ouvert = true;
+                        repli = essai > 0;
+                        break;
+                    }
+                    Err((erreur, hr)) => {
+                        // Le client a été libéré par `initialiser_a_la_periode`.
+                        derniere_erreur = erreur;
+                        // Un endpoint tenu ailleurs ne s'ouvrira pas mieux à
+                        // une autre période.
+                        if hr.is_some_and(|hr| message_peripherique_occupe(hr).is_some()) {
+                            break;
+                        }
                     }
                 }
-                WasapiInitDecision::Fail(hr) => {
-                    release(audio_client);
-                    release(device);
-                    // #3067 : l'endpoint tenu par un autre programme se dit
-                    // en clair, pas en `HRESULT`.
-                    return Err(message_peripherique_occupe(hr).unwrap_or_else(|| {
-                        format!("IAudioClient::Initialize(EXCLUSIVE) failed: 0x{hr:08X}")
-                    }));
-                }
+            }
+            if !ouvert {
+                release(device);
+                return Err(derniere_erreur);
             }
             release(device);
 
@@ -1205,6 +1431,27 @@ impl WasapiExclusiveOutput {
                 }
             }
 
+            // 11. #8696 — l'horloge de l'appareil, pour la mesure des réveils
+            // en retard. Facultative : un refus ne coûte que la mesure.
+            let mut audio_clock: *mut c_void = ptr::null_mut();
+            {
+                type GetServiceFn = unsafe extern "system" fn(
+                    *mut c_void,
+                    *const GUID,
+                    *mut *mut c_void,
+                ) -> HRESULT;
+                let vtable = *(audio_client as *const *const *const c_void);
+                let get_service: GetServiceFn = std::mem::transmute(*vtable.add(14));
+                let hr = get_service(audio_client, &IID_IAUDIO_CLOCK, &mut audio_clock);
+                if hr != S_OK {
+                    audio_clock = ptr::null_mut();
+                    info!(
+                        hr = format!("0x{hr:08X}"),
+                        "wasapi_exclusive_horloge_indisponible — la mesure #8696 se passera de la position de l'appareil"
+                    );
+                }
+            }
+
             info!(
                 requested_device = %device_name,
                 device = %resolved.name,
@@ -1221,6 +1468,13 @@ impl WasapiExclusiveOutput {
                 period_100ns = selected_period,
                 periode_par_defaut_100ns = default_period,
                 periode_minimale_100ns = min_period,
+                // #8696 — la période réglée, d'où elle vient, et si le pilote
+                // l'a refusée (repli sur la sienne).
+                periode_reglee_ms = ?demandee.map(|(ms, _)| ms),
+                origine_du_reglage = ?demandee.map(|(_, origine)| origine),
+                periode_reglee_refusee = repli,
+                reouverture_apres_ms = ?reouverture_apres_ms,
+                horloge_de_l_appareil = !audio_clock.is_null(),
                 "wasapi_exclusive_initialized"
             );
 
@@ -1236,6 +1490,7 @@ impl WasapiExclusiveOutput {
                 silence: Arc::new(Default::default()),
                 audio_client,
                 render_client,
+                audio_clock,
                 event_handle: event,
                 stop_event,
                 buffer_frame_count,
@@ -1246,6 +1501,9 @@ impl WasapiExclusiveOutput {
                 callback_errors: Arc::new(AtomicU64::new(0)),
                 late_wakeups: Arc::new(AtomicU64::new(0)),
                 max_wakeup_gap_us: Arc::new(AtomicU64::new(0)),
+                histogramme: Arc::new(Histogramme::default()),
+                causes: Arc::new(CausesCumulees::default()),
+                reouverture_apres_ms,
                 render_thread: None,
                 resources_released: false,
                 _com_apartment: com_apartment,
@@ -1351,6 +1609,15 @@ impl WasapiExclusiveOutput {
         let late_wakeups = self.late_wakeups.clone();
         let max_wakeup_gap_us = self.max_wakeup_gap_us.clone();
         let period_100ns = self.period_100ns;
+        // #8696 — le nom de l'appareil, pour le relevé de la session en cours.
+        let peripherique = self.device_name.clone();
+        // #8696 — la mesure qui tranche : client (rembourrage), horloge de
+        // l'appareil (position), histogramme et causes partagés au relevé.
+        let audio_client_mesure = self.audio_client as usize;
+        let audio_clock = self.audio_clock as usize;
+        let histogramme = self.histogramme.clone();
+        let causes = self.causes.clone();
+        let reouverture_apres_ms = self.reouverture_apres_ms;
 
         let handle = std::thread::spawn(move || {
             const S_OK_LOCAL: i32 = 0;
@@ -1365,6 +1632,8 @@ impl WasapiExclusiveOutput {
             }
 
             let render_client = render_client as *mut std::ffi::c_void;
+            let audio_client_mesure = audio_client_mesure as *mut std::ffi::c_void;
+            let horloge = audio_clock as *mut std::ffi::c_void;
             // #4357 — l'événement du pilote EN PREMIER : `WaitForMultipleObjects`
             // rend l'indice le plus BAS parmi les poignées signalées, et un
             // rendu dû doit primer sur un arrêt déjà obtenu.
@@ -1398,6 +1667,38 @@ impl WasapiExclusiveOutput {
                 );
             }
 
+            // #8696 — refuser le bridage d'énergie (EcoQoS / Power Throttling).
+            // Sur un processeur hybride, Windows peut placer un fil jugé peu
+            // important sur un cœur lent ou à fréquence réduite, MMCSS ou
+            // non : fil 2805, réveils ~39 ms en retard une session sur deux,
+            // guéris par arrêt/relance (le fil est recréé). Un refus (Windows
+            // antérieur à 10 1709) ne coûte que la ligne de journal.
+            let etat_bridage = refus_du_bridage();
+            let bridage_refuse = unsafe {
+                ffi::SetThreadInformation(
+                    ffi::GetCurrentThread(),
+                    THREAD_POWER_THROTTLING,
+                    &etat_bridage as *const _ as *const std::ffi::c_void,
+                    std::mem::size_of_val(&etat_bridage) as u32,
+                )
+            } != 0;
+            if bridage_refuse {
+                info!(
+                    "wasapi_exclusive_bridage_energie_refuse — EcoQoS désactivé pour le fil de rendu (#8696)"
+                );
+            } else {
+                let code = unsafe { ffi::GetLastError() };
+                warn!(
+                    code,
+                    "wasapi_exclusive_bridage_energie_non_refuse — SetThreadInformation(ThreadPowerThrottling) a échoué (#8696)"
+                );
+            }
+            // #8696 — résolution du minuteur à 1 ms tant que le fil joue,
+            // rendue à sa sortie. Ne touche pas au réveil par l'événement du
+            // pilote ; réduit la granularité de l'ordonnanceur quand Windows
+            // l'a relâchée.
+            let minuteur = unsafe { ffi::timeBeginPeriod(RESOLUTION_MINUTEUR_MS) } == 0;
+
             // #4357 — l'horloge des réveils. Sans fréquence lisible, pas de
             // mesure : la lecture, elle, ne dépend jamais de ce suivi.
             let mut frequence: i64 = 0;
@@ -1407,7 +1708,42 @@ impl WasapiExclusiveOutput {
                 None
             };
 
+            // #8696 — un épisode de retards qui dure, et la session en cours
+            // inscrite au relevé du rapport de bogue tant que le fil vit.
+            let mut persistance = PersistanceDesRetards::nouveau(frequence);
+            // #8696 — la mesure qui tranche, une ligne par rafale.
+            let frequence_horloge = unsafe { frequence_de_l_horloge(horloge) };
+            let mut rafales = suivi
+                .as_ref()
+                .and_then(|s| Rafales::nouveau(s.periode_ticks(), frequence));
+            let periode_us_journal = u64::try_from(period_100ns / 10).unwrap_or(0);
+            let mut avant_attente: Option<u64> = None;
+            let mut reveil_precedent: Option<u64> = None;
+            let mut position_precedente: Option<u64> = None;
+            let persistant = Arc::new(AtomicBool::new(false));
+            let mut premier_retard_grave = true;
+            let _inscription = inscrire_session(CompteursSession {
+                peripherique,
+                periode_us: u64::try_from(period_100ns / 10).unwrap_or(0),
+                reveils_en_retard: late_wakeups.clone(),
+                ecart_max_us: max_wakeup_gap_us.clone(),
+                underruns: underruns.clone(),
+                deadline_misses: deadline_misses.clone(),
+                persistant: persistant.clone(),
+                bridage_refuse: Some(bridage_refuse),
+                histogramme: histogramme.clone(),
+                causes: causes.clone(),
+                reouverture_apres_ms,
+            });
+
             while running.load(Ordering::SeqCst) {
+                // #8696 — l'entrée dans l'attente : sépare le temps passé
+                // dans le tour de rendu de celui passé à attendre l'événement.
+                if suivi.is_some() {
+                    let mut t: i64 = 0;
+                    avant_attente =
+                        (unsafe { ffi::QueryPerformanceCounter(&mut t) } != 0).then_some(t as u64);
+                }
                 let wait_result =
                     unsafe { WaitForMultipleObjects(2, poignees.as_ptr(), 0, ATTENTE_RENDU_MS) };
                 match reveil_rendu(wait_result, running.load(Ordering::SeqCst)) {
@@ -1417,6 +1753,8 @@ impl WasapiExclusiveOutput {
                         if let Some(suivi) = suivi.as_mut() {
                             suivi.oublier_le_dernier();
                         }
+                        reveil_precedent = None;
+                        position_precedente = None;
                         continue;
                     }
                     ReveilRendu::Rendre => {}
@@ -1425,13 +1763,22 @@ impl WasapiExclusiveOutput {
                 // #4357 — l'instant du réveil, comparé au précédent. La ligne
                 // de journal éventuelle attend que le tampon soit rendu.
                 let mut retard_a_journaliser: Option<u64> = None;
+                let mut persistance_a_journaliser: Option<u64> = None;
+                let mut rafale_a_journaliser: Option<BilanDeRafale> = None;
+                // #8696 — un retard observé AVANT le remplissage, complété
+                // APRÈS `ReleaseBuffer` par l'avance de l'appareil : aucun
+                // appel à l'horloge ne précède le remplissage du tampon.
+                let mut retard_en_attente: Option<(u64, u64, RetardObserve)> = None;
                 if let Some(suivi) = suivi.as_mut() {
                     let mut maintenant: i64 = 0;
                     if unsafe { ffi::QueryPerformanceCounter(&mut maintenant) } != 0 {
-                        match suivi.observer(maintenant as u64) {
-                            Reveil::Premier | Reveil::AHeure => {}
-                            Reveil::EnRetard { .. } => {
+                        let maintenant = maintenant as u64;
+                        let reveil = suivi.observer(maintenant);
+                        let ecart_en_retard = match reveil {
+                            Reveil::Premier | Reveil::AHeure => None,
+                            Reveil::EnRetard { ecart_ticks } => {
                                 late_wakeups.fetch_add(1, Ordering::Relaxed);
+                                Some(ecart_ticks)
                             }
                             Reveil::TresEnRetard {
                                 ecart_ticks,
@@ -1441,8 +1788,42 @@ impl WasapiExclusiveOutput {
                                 if journaliser {
                                     retard_a_journaliser = Some(ecart_ticks);
                                 }
+                                Some(ecart_ticks)
                             }
+                        };
+                        if let Some(ecart_ticks) = ecart_en_retard {
+                            // #8696 — où le temps est passé, ce qu'a fait
+                            // l'appareil, ce qu'il restait en file.
+                            let periode_ticks = suivi.periode_ticks();
+                            let (travail, attente) = match (reveil_precedent, avant_attente) {
+                                (Some(r), Some(a)) => {
+                                    (a.saturating_sub(r), maintenant.saturating_sub(a))
+                                }
+                                _ => (0, ecart_ticks),
+                            };
+                            // Le rembourrage n'est lu QUE sur un réveil en
+                            // retard ; l'avance de l'appareil, après le tampon.
+                            let observe = RetardObserve {
+                                ecart_ticks,
+                                ou: ou_est_le_temps(travail, attente, periode_ticks),
+                                avance_appareil_centiemes: None,
+                                rembourrage_trames: unsafe {
+                                    rembourrage_courant(audio_client_mesure)
+                                },
+                            };
+                            retard_en_attente = Some((maintenant, periode_ticks, observe));
+                            // #8696 — des retards sans répit pendant 10 s.
+                            if let Some(p) = persistance.as_mut()
+                                && let Episode::DevientPersistant { duree_ticks } =
+                                    p.retard(maintenant)
+                            {
+                                persistant.store(true, Ordering::Relaxed);
+                                persistance_a_journaliser = Some(duree_ticks);
+                            }
+                        } else if let Some(r) = rafales.as_mut() {
+                            rafale_a_journaliser = r.a_l_heure(maintenant);
                         }
+                        reveil_precedent = Some(maintenant);
                         max_wakeup_gap_us.store(
                             microsecondes(suivi.ecart_max_ticks(), frequence),
                             Ordering::Relaxed,
@@ -1459,6 +1840,9 @@ impl WasapiExclusiveOutput {
                     let hr = get_buf(render_client, buffer_frame_count, &mut buf);
                     if hr != S_OK_LOCAL {
                         callback_errors.fetch_add(1, Ordering::Relaxed);
+                        // #8696 — la référence de position n'est plus à la
+                        // même phase : l'avance suivante serait fausse.
+                        position_precedente = None;
                         continue;
                     }
 
@@ -1491,6 +1875,27 @@ impl WasapiExclusiveOutput {
                     }
                 }
 
+                // #8696 — la position de l'appareil, lue APRÈS le tampon remis :
+                // d'un `ReleaseBuffer` au suivant, à la même phase, elle dit
+                // de combien de périodes l'appareil a avancé pendant l'écart.
+                let position =
+                    frequence_horloge.and_then(|_| unsafe { position_de_l_appareil(horloge) });
+                if let Some((maintenant, periode_ticks, mut observe)) = retard_en_attente.take() {
+                    observe.avance_appareil_centiemes =
+                        match (position, position_precedente, frequence_horloge) {
+                            (Some(p), Some(pp), Some(f)) if p >= pp => {
+                                avance_en_centiemes_de_periode(p - pp, f, period_100ns)
+                            }
+                            _ => None,
+                        };
+                    histogramme.ajouter(case_de_l_ecart(observe.ecart_ticks, periode_ticks));
+                    causes.noter(&observe);
+                    if let Some(r) = rafales.as_mut() {
+                        rafale_a_journaliser = r.retard(maintenant, observe);
+                    }
+                }
+                position_precedente = position;
+
                 // #4357 — journalisé APRÈS le tampon rendu, jamais avant.
                 if let (Some(ecart_ticks), Some(suivi)) = (retard_a_journaliser, suivi.as_ref()) {
                     warn!(
@@ -1499,7 +1904,43 @@ impl WasapiExclusiveOutput {
                         reveils_en_retard = suivi.reveils_en_retard(),
                         "wasapi_exclusive_reveil_tres_en_retard — plus de deux périodes entre deux réveils du fil de rendu (#4357)"
                     );
+                    // #8696 — le cœur qui exécute le fil, au premier retard
+                    // grave de la session : un cœur E le désignerait.
+                    if premier_retard_grave {
+                        premier_retard_grave = false;
+                        let mut coeur = ffi::PROCESSOR_NUMBER::default();
+                        unsafe { ffi::GetCurrentProcessorNumberEx(&mut coeur) };
+                        warn!(
+                            groupe = coeur.Group,
+                            coeur = coeur.Number,
+                            bridage_refuse,
+                            "wasapi_exclusive_coeur_au_premier_retard (#8696)"
+                        );
+                    }
                 }
+                // #8696 — une ligne par rafale, après le tampon rendu.
+                if let Some(bilan) = rafale_a_journaliser.as_ref() {
+                    journaliser_la_rafale(bilan, frequence, periode_us_journal, buffer_frame_count);
+                }
+                if let Some(duree_ticks) = persistance_a_journaliser {
+                    warn!(
+                        duree_ms = microsecondes(duree_ticks, frequence) / 1_000,
+                        reveils_en_retard = late_wakeups.load(Ordering::Relaxed),
+                        ecart_max_us = max_wakeup_gap_us.load(Ordering::Relaxed),
+                        bridage_refuse,
+                        "wasapi_exclusive_reveils_en_retard_persistants — le fil de rendu WASAPI n'est plus réveillé à temps depuis plus de 10 s : coupures audibles probables. Arrêter puis relancer la lecture recrée le fil (#8696)"
+                    );
+                }
+            }
+
+            // #8696 — la rafale en cours à l'arrêt.
+            if let Some(bilan) = rafales.as_mut().and_then(Rafales::terminer) {
+                journaliser_la_rafale(&bilan, frequence, periode_us_journal, buffer_frame_count);
+            }
+
+            // #8696 — rendre la résolution du minuteur.
+            if minuteur {
+                unsafe { ffi::timeEndPeriod(RESOLUTION_MINUTEUR_MS) };
             }
 
             // #4357 — rendre la promotion MMCSS depuis le fil qui l'a obtenue.
@@ -1566,6 +2007,7 @@ impl WasapiExclusiveOutput {
 
         let close_ok = unsafe {
             ffi::release(self.render_client);
+            ffi::release(self.audio_clock);
             ffi::release(self.audio_client);
             let arret_ferme = ffi::CloseHandle(self.stop_event);
             let pilote_ferme = ffi::CloseHandle(self.event_handle);
@@ -1575,6 +2017,8 @@ impl WasapiExclusiveOutput {
             warn!("wasapi_exclusive_close_event_failed");
         }
         self.resources_released = true;
+        // #8696 — l'instant où Tune a rendu ce périphérique.
+        noter_la_fermeture(&self.device_id, std::time::Instant::now());
 
         info!(
             device = %self.device_name,
@@ -1584,6 +2028,9 @@ impl WasapiExclusiveOutput {
             reveils_en_retard = self.late_wakeup_count(),
             ecart_max_us = self.max_wakeup_gap_us.load(Ordering::Relaxed),
             periode_100ns = self.period_100ns,
+            // #8696 — 2, 3, 4, 5, 6+ périodes.
+            histogramme_periodes = ?self.histogramme.lire(),
+            causes = ?self.causes.lire(),
             "wasapi_exclusive_stopped"
         );
     }
@@ -1650,6 +2097,7 @@ impl Drop for WasapiExclusiveOutput {
 // Stub for non-Windows platforms
 #[cfg(not(target_os = "windows"))]
 impl WasapiExclusiveOutput {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         _device_name: &str,
         _endpoint_id: Option<&str>,
@@ -1658,10 +2106,12 @@ impl WasapiExclusiveOutput {
         _channels: u32,
         _ring: Arc<NativePcmRing>,
         _paused: Arc<AtomicBool>,
+        _reglage_periode_ms: u32,
     ) -> Result<Self, String> {
         Err("WASAPI Exclusive is only available on Windows".into())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_sur_voies_pilotees(
         _device_name: &str,
         _endpoint_id: Option<&str>,
@@ -1670,6 +2120,7 @@ impl WasapiExclusiveOutput {
         _voies: u32,
         _ring: Arc<NativePcmRing>,
         _paused: Arc<AtomicBool>,
+        _reglage_periode_ms: u32,
     ) -> Result<Self, String> {
         Err("WASAPI Exclusive is only available on Windows".into())
     }
@@ -1693,6 +2144,7 @@ mod banc_windows_3067 {
             2,
             Arc::new(NativePcmRing::new(44_100 * 2 * 2)),
             Arc::new(AtomicBool::new(false)),
+            0,
         )
     }
 

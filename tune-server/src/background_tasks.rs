@@ -177,7 +177,11 @@ pub fn tache_suspendable(id: &str) -> Option<Tache> {
         // `album_artwork` : la passe des pochettes d'albums (inscrite sous
         // `artwork` avant l'écran des images, 01/11/2026) ; elle attend son
         // tour sur `Tache::ImagesArtistes`, comme les portraits.
-        "artist_artwork" | "artwork" | "album_artwork" => Some(Tache::ImagesArtistes),
+        // rc12 — `renvoi_images_artistes` : le renvoi unique des images
+        // d'artistes perdues par le site attend son tour sur la même tâche.
+        "artist_artwork" | "artwork" | "album_artwork" | "renvoi_images_artistes" => {
+            Some(Tache::ImagesArtistes)
+        }
         // `label_logos` n'est PAS rangé ici : la passe Qobuz ne consulte
         // aucune pause, et la carte « Enrichissement » se dirait en cours
         // pendant une passe de logos.

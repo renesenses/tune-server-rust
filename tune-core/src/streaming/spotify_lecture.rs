@@ -28,7 +28,7 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::source_pcm::{FluxPcm, FormatPcm, FournisseurPcm, QualiteRecue};
 use crate::streaming::registry::ServiceRegistry;
-use crate::streaming::spotify::SpotifyService;
+use crate::streaming::spotify::{MOTIF_JETON_REFUSE, SpotifyService, est_un_refus_de_jeton};
 use crate::streaming::spotify_connect::{
     OCTETS_PAR_SECONDE, OCTETS_PAR_TRAME, SpotifyConnectManager,
 };
@@ -123,6 +123,16 @@ pub fn est_un_refus_premium(erreur: &str) -> bool {
         || bas.contains("compte spotify premium est exigé")
 }
 
+/// #8764 — le motif d'un lancement refusé hors refus d'identifiants :
+/// l'erreur de l'API Web, puis la dernière ligne ERROR de librespot en
+/// complément, s'il y en a une.
+pub fn motif_echec_de_la_commande(echec: &str, erreur_librespot: Option<&str>) -> String {
+    match erreur_librespot {
+        Some(l) => format!("{echec} (librespot : « {l} »)"),
+        None => echec.to_string(),
+    }
+}
+
 /// #6933 — ce que le motif d'échec doit savoir du récepteur.
 pub struct ContexteDeLibrespot<'a> {
     /// Le binaire lancé, décrit (chemin, origine, version).
@@ -152,9 +162,7 @@ pub fn motif_echec_librespot(
 ) -> String {
     let binaire = ctx.binaire;
     if !est_un_refus_d_identifiants(erreur) {
-        return format!(
-            "librespot ({binaire}) s'est arrêté sans se connecter au compte Spotify : « {erreur} »."
-        );
+        return format!("librespot ({binaire}) a refusé la commande de lecture : « {erreur} ».");
     }
     if porte_la_lecture == Some(false) {
         return format!(
@@ -202,6 +210,74 @@ impl PiloteDuRegistre {
             .get(SOURCE)
             .ok_or_else(|| "service Spotify absent".to_string())
     }
+
+    /// #8154 — un `401` en pleine lecture : renouveler le jeton UNE fois.
+    /// `Ok` seulement si un nouveau jeton est là ; sinon le message d'action
+    /// (« reconnecter Spotify »), le motif du renouvellement au journal.
+    async fn renouveler_le_jeton(&self) -> Result<(), String> {
+        let svc = self.service().await?;
+        let mut svc = svc.write().await;
+        match svc.refresh_if_needed().await {
+            Ok(true) if !svc.session_expired() => {
+                tracing::info!("spotify_lecture_jeton_renouvele");
+                Ok(())
+            }
+            Ok(renouvele) => {
+                tracing::warn!(renouvele, "spotify_lecture_jeton_non_renouvelable");
+                Err(MOTIF_JETON_REFUSE.into())
+            }
+            Err(e) => {
+                tracing::warn!(erreur = %e, "spotify_lecture_renouvellement_echoue");
+                Err(MOTIF_JETON_REFUSE.into())
+            }
+        }
+    }
+
+    async fn duree_ms_une_fois(&self, piste: &str) -> Result<u64, String> {
+        let svc = self.service().await?;
+        let svc = svc.read().await;
+        let titre = svc.get_track(piste).await.map_err(|e| e.to_string())?;
+        Ok(titre.duration_ms)
+    }
+
+    async fn lancer_une_fois(
+        &self,
+        appareil: &str,
+        piste: &str,
+        position_ms: u64,
+    ) -> Result<(), String> {
+        let svc = self.service().await?;
+        let svc = svc.read().await;
+        let spotify = svc
+            .as_any()
+            .downcast_ref::<SpotifyService>()
+            .ok_or("service Spotify inattendu")?;
+        spotify
+            .lancer_sur_l_appareil(appareil, piste, position_ms)
+            .await
+    }
+}
+
+/// #8154 (fil 2288) — un appel de lecture refusé pour jeton (`401`) : le
+/// jeton est renouvelé une fois, l'appel refait une fois, sans boucle. Encore
+/// refusé : le message d'action, jamais le « token expired » brut.
+macro_rules! avec_un_renouvellement {
+    ($pilote:expr, $appel:expr) => {{
+        match $appel.await {
+            Err(e) if est_un_refus_de_jeton(&e) => {
+                tracing::warn!(erreur = %e, "spotify_lecture_jeton_refuse_nouvel_essai");
+                $pilote.renouveler_le_jeton().await?;
+                match $appel.await {
+                    Err(e) if est_un_refus_de_jeton(&e) => {
+                        tracing::warn!(erreur = %e, "spotify_lecture_jeton_refuse_apres_renouvellement");
+                        Err(MOTIF_JETON_REFUSE.to_string())
+                    }
+                    autre => autre,
+                }
+            }
+            autre => autre,
+        }
+    }};
 }
 
 #[async_trait]
@@ -221,22 +297,11 @@ impl PiloteSpotify for PiloteDuRegistre {
     }
 
     async fn duree_ms(&self, piste: &str) -> Result<u64, String> {
-        let svc = self.service().await?;
-        let svc = svc.read().await;
-        let titre = svc.get_track(piste).await.map_err(|e| e.to_string())?;
-        Ok(titre.duration_ms)
+        avec_un_renouvellement!(self, self.duree_ms_une_fois(piste))
     }
 
     async fn lancer(&self, appareil: &str, piste: &str, position_ms: u64) -> Result<(), String> {
-        let svc = self.service().await?;
-        let svc = svc.read().await;
-        let spotify = svc
-            .as_any()
-            .downcast_ref::<SpotifyService>()
-            .ok_or("service Spotify inattendu")?;
-        spotify
-            .lancer_sur_l_appareil(appareil, piste, position_ms)
-            .await
+        avec_un_renouvellement!(self, self.lancer_une_fois(appareil, piste, position_ms))
     }
 
     async fn mettre_en_pause(&self, appareil: &str) -> Result<(), String> {
@@ -444,9 +509,26 @@ impl FournisseurPcm for FournisseurSpotify {
                 tracing::warn!(detail = %detail, "spotify_lecture_premium_requis");
                 return Err(format!("{SENTINELLE_PREMIUM_REQUIS}{detail}"));
             }
+            // #8764 — hors refus d'identifiants, la raison de l'échec est
+            // celle de l'API Web (`e`) : une ligne ERROR de librespot, même
+            // ancienne (une commande Spotify Connect refusée, librespot
+            // connecté), n'en est que le complément. Elle n'est plus rendue
+            // comme « librespot s'est arrêté sans se connecter ».
+            let erreur_librespot = self.recepteur.derniere_erreur_librespot();
+            if !erreur_librespot
+                .as_deref()
+                .is_some_and(est_un_refus_d_identifiants)
+            {
+                tracing::warn!(
+                    echec = %e,
+                    erreur_librespot = ?erreur_librespot,
+                    "spotify_lecture_commande_refusee"
+                );
+                return Err(motif_echec_de_la_commande(&e, erreur_librespot.as_deref()));
+            }
             // #6933 — si librespot a dit pourquoi il ne s'est pas connecté,
             // c'est SA raison qui est rendue, pas un « reconnecter » générique.
-            if let Some(erreur) = self.recepteur.derniere_erreur_librespot() {
+            if let Some(erreur) = erreur_librespot {
                 let portee = rt.block_on(self.pilote.porte_la_lecture());
                 let lance = self.recepteur.librespot_lance();
                 let binaire = lance
@@ -1165,6 +1247,97 @@ exit 1
         assert!(!m.to_lowercase().contains("reconnect"), "{m}");
     }
 
+    /// #8764 — librespot connecté qui refuse une commande Spotify Connect
+    /// (`StateError::NoContext`, écrit par `handle_connect_state_request`).
+    const LIBRESPOT_SANS_CONTEXTE: &str = r#"#!/bin/sh
+echo "[2026-11-14T10:00:00Z INFO  librespot] librespot 0.8.0 (Built on 2025-10-01)" >&2
+echo "[2026-11-14T10:00:01Z ERROR librespot_connect::spirc] failed to handle request: Invalid state { context is not available. type: Default }" >&2
+exit 1
+"#;
+
+    /// #8764 — le `PUT /me/player/play` de Tune échoue (l'API Web répond).
+    struct PiloteLectureRefusee;
+
+    const ECHEC_API_WEB_8764: &str =
+        "Spotify /me/player/play : HTTP 502 « Player command failed: Restriction violated »";
+
+    #[async_trait]
+    impl PiloteSpotify for PiloteLectureRefusee {
+        async fn jeton(&self) -> Result<String, String> {
+            Ok("jeton-essai".into())
+        }
+        async fn duree_ms(&self, _: &str) -> Result<u64, String> {
+            Ok(1000)
+        }
+        async fn lancer(&self, _: &str, _: &str, _: u64) -> Result<(), String> {
+            // librespot a le temps d'écrire sa ligne ERROR.
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            Err(ECHEC_API_WEB_8764.into())
+        }
+        async fn porte_la_lecture(&self) -> Option<bool> {
+            Some(true)
+        }
+    }
+
+    /// #8764 — hors refus d'identifiants, l'écran montre l'erreur de l'API
+    /// Web, la ligne de librespot en complément, et plus « s'est arrêté sans
+    /// se connecter » : librespot était connecté.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spotify_8764_erreur_connect_ne_masque_pas_l_erreur_de_l_api_web() {
+        let refus = tokio::task::spawn_blocking(|| {
+            refus_avec(LIBRESPOT_SANS_CONTEXTE, Arc::new(PiloteLectureRefusee))
+        })
+        .await
+        .unwrap();
+        assert!(
+            refus.contains(ECHEC_API_WEB_8764),
+            "l'erreur de l'API Web est masquée : {refus}"
+        );
+        assert!(
+            refus.contains("(librespot : « ") && refus.contains("context is not available"),
+            "la ligne de librespot doit rester en complément : {refus}"
+        );
+        assert!(!refus.contains("s'est arrêté"), "{refus}");
+        assert!(
+            LiaisonRequise::depuis_sentinelle(&refus).is_none()
+                && !refus.starts_with(SENTINELLE_PREMIUM_REQUIS),
+            "{refus}"
+        );
+    }
+
+    /// #8764 — contre-épreuve : le refus d'identifiants garde son motif
+    /// (#6933/#8154), même quand l'API Web a aussi échoué.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spotify_8764_le_refus_d_identifiants_garde_son_motif() {
+        let refus = tokio::task::spawn_blocking(|| {
+            refus_avec(LIBRESPOT_REFUSE, Arc::new(PiloteLectureRefusee))
+        })
+        .await
+        .unwrap();
+        let enveloppe = format!("source « spotify » : {refus}");
+        let liaison = LiaisonRequise::depuis_sentinelle(&enveloppe)
+            .unwrap_or_else(|| panic!("le refus d'identifiants perd son code : {refus}"));
+        assert!(
+            liaison.detail.contains("INVALID_CREDENTIALS"),
+            "{}",
+            liaison.detail
+        );
+        assert!(
+            !liaison.detail.contains(ECHEC_API_WEB_8764),
+            "{}",
+            liaison.detail
+        );
+    }
+
+    #[test]
+    fn spotify_8764_motif_de_la_commande() {
+        assert_eq!(motif_echec_de_la_commande("HTTP 404", None), "HTTP 404");
+        assert_eq!(
+            motif_echec_de_la_commande("HTTP 404", Some("oups")),
+            "HTTP 404 (librespot : « oups »)"
+        );
+    }
+
     /// « Le dernier geste gagne » — un pilote dont le lancement réussit ou
     /// échoue, et qui note les pauses demandées.
     struct PiloteReprise {
@@ -1451,3 +1624,7 @@ exit 1
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "spotify_jeton_expire_8154_tests.rs"]
+mod jeton_expire_8154_tests;

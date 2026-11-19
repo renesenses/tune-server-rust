@@ -31,6 +31,8 @@ pub mod reaffectation_canaux;
 /// #7614 — le greffon de suréchantillonnage (`/upsampler`).
 pub mod upsampler;
 pub use tune_streaming_http::deezer_proxy_handler;
+/// Sécurité — chemins clients confinés (lecture et écriture).
+pub(crate) mod confinement;
 pub mod developer_api;
 pub mod devialet_air;
 pub mod devices;
@@ -65,6 +67,7 @@ pub mod multi_server;
 pub mod network;
 pub mod offline;
 pub mod onboarding;
+pub mod parce_que_vous_aimez;
 mod pochettes_upnp;
 // Retrait d'une bibliotheque UPnP par serveur media (#4624).
 pub mod retrait_upnp;
@@ -804,6 +807,9 @@ pub fn router_with_plugins(
     ))
     .layer(axum::middleware::from_fn(zones::textes_signal::avec_langue))
     .layer(axum::middleware::from_fn(cache_control_middleware))
+    .layer(axum::middleware::from_fn(
+        tune_http_types::error::avec_chemin_requete,
+    ))
     .layer(axum::Extension(contexte_sendspin))
     .layer(CompressionLayer::new().compress_when(predicat_de_compression()))
     // Contrôle d'origine (`crate::garde_origine`) : une page d'un autre site

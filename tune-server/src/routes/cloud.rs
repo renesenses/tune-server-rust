@@ -244,9 +244,24 @@ async fn sso_authorize(
     // Persist the exact redirect_uri: OAuth requires the token exchange in the
     // callback to present an identical value.
     settings.set("mozaik_redirect_uri_pending", &uri).ok();
+    // Une connexion en attente a une durée de vie (voir `PKCE_EN_ATTENTE_MAX`).
+    settings
+        .set("mozaik_pkce_pending_at", &maintenant_unix().to_string())
+        .ok();
     let page = page_connexion_demandee(&requete);
     let url = auth.authorize_url_avec_page(&uri, &pkce.challenge, &pkce.state, &page);
     Redirect::temporary(&url).into_response()
+}
+
+/// Durée de vie d'une connexion SSO en attente (secondes) : l'aller-retour
+/// par mozaiklabs.fr prend quelques secondes ; au-delà, on recommence.
+const PKCE_EN_ATTENTE_MAX: u64 = 10 * 60;
+
+fn maintenant_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[derive(Deserialize)]
@@ -290,12 +305,22 @@ async fn sso_callback(
 
     // Load & validate the pending PKCE session (CSRF: state must match), then
     // consume it — one-shot, cleared regardless of the exchange outcome.
+    let emise = settings
+        .get("mozaik_pkce_pending_at")
+        .ok()
+        .flatten()
+        .and_then(|s| s.trim().parse::<u64>().ok());
     let pending: Option<PkceSession> = settings
         .get("mozaik_pkce_pending")
         .ok()
         .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok());
+        .and_then(|s| serde_json::from_str(&s).ok())
+        // Sans date, ou plus vieille que dix minutes : plus valable.
+        .filter(|_| {
+            emise.is_some_and(|t| maintenant_unix().saturating_sub(t) <= PKCE_EN_ATTENTE_MAX)
+        });
     settings.set("mozaik_pkce_pending", "").ok();
+    settings.delete("mozaik_pkce_pending_at").ok();
 
     let Some(pkce) = pending else {
         return page_echec_compte(
@@ -707,14 +732,48 @@ async fn marketplace_list(State(state): State<AppState>) -> Json<Value> {
     Json(json!(plugins))
 }
 
+/// Un nom de greffon tel que la boutique les forme : `^[a-z0-9][a-z0-9_-]{0,63}$`.
+/// Rien d'autre n'entre dans un chemin sous le dossier des greffons.
+fn nom_de_greffon_valide(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_lowercase() || c.is_ascii_digit() => {}
+        _ => return false,
+    }
+    name.len() <= 64
+        && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
 async fn marketplace_install(
+    // Sécurité : même garde que `/marketplace/plugins/{slug}/install`.
+    _garde: crate::auth::AdminOuCetteMachine,
     Path(name): Path<String>,
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
+    if !nom_de_greffon_valide(&name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "invalid_plugin_name",
+                "message": "plugin name must match ^[a-z0-9][a-z0-9_-]{0,63}$",
+            })),
+        )
+            .into_response();
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let base_url = settings.get("mozaik_base_url").ok().flatten();
     let mp = PluginMarketplace::new(base_url.as_deref());
+
+    // Sécurité — `name` vient du chemin de l'URL, décodé, et
+    // devient un dossier sous `TUNE_PLUGINS_DIR` : un seul segment, sans `..`.
+    if let Err(refus) = crate::routes::confinement::segment_sous(std::path::Path::new("."), &name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": crate::routes::confinement::message("name", refus)})),
+        )
+            .into_response();
+    }
 
     match mp.download(&name).await {
         Ok(data) => {
@@ -1116,7 +1175,9 @@ pub const MESSAGE_ACCES_PAR_COMPTE: &str =
 /// active (`RequireAdmin`), répond 409 tant que le pont est éteint ou sans
 /// jeton, et n'en fabrique JAMAIS un — c'est le rôle de `bridge_enable`.
 async fn bridge_access_link(
-    _admin: crate::auth::RequireAdmin,
+    // Le lien porte le jeton du pont : administrateur, ou authentification
+    // coupée, seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
 ) -> axum::response::Response {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -1201,7 +1262,9 @@ fn reponse_lien_d_acces(settings: &SettingsRepo, token: &str) -> axum::response:
 ///
 /// Réponse : le nouveau lien, de la forme de `bridge_access_link`.
 async fn bridge_rotate_token(
-    _admin: crate::auth::RequireAdmin,
+    // Engage la machine : administrateur, ou authentification coupée,
+    // seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
 ) -> axum::response::Response {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -1233,7 +1296,9 @@ async fn bridge_rotate_token(
 /// Active le pont. Administrateur seulement dès que l'authentification est
 /// active : la réponse porte le jeton de pont.
 async fn bridge_enable(
-    _admin: crate::auth::RequireAdmin,
+    // Ouvrir l'accès à distance engage la machine : administrateur, ou
+    // authentification coupée, seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     // Premium gate: Cloud Relay requires Premium
@@ -1280,7 +1345,9 @@ async fn bridge_enable(
 /// Éteint le pont. Administrateur seulement dès que l'authentification est
 /// active.
 async fn bridge_disable(
-    _admin: crate::auth::RequireAdmin,
+    // Engage la machine : administrateur, ou authentification coupée,
+    // seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
 ) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -2689,5 +2756,33 @@ mod tests_page_connexion_b209sso {
     fn valeur_repetee_premiere_retenue() {
         let p = page_connexion_demandee(&q(&[("theme", "brown"), ("theme", "evil")]));
         assert_eq!(p.theme.as_deref(), Some("brown"));
+    }
+}
+
+/// Sécurité — le nom d'un greffon est un seul segment.
+#[cfg(test)]
+mod confinement_chemins_tests {
+    use super::*;
+    use crate::routes::confinement::banc;
+
+    #[tokio::test]
+    async fn un_nom_de_greffon_qui_remonte_est_refuse() {
+        let b = banc();
+        // Aucun réseau : si la garde manquait, le téléchargement échouerait
+        // sur ce port fermé — par une autre erreur qu'un 400.
+        tune_core::db::settings_repo::SettingsRepo::with_backend(b.state.backend.clone())
+            .set("mozaik_base_url", "http://127.0.0.1:9")
+            .unwrap();
+        for nom in ["../../dehors", "..", r"..\x", "a/b"] {
+            let r = marketplace_install(
+                crate::auth::AdminOuCetteMachine,
+                Path(nom.to_string()),
+                State(b.state.clone()),
+                HeaderMap::new(),
+            )
+            .await
+            .into_response();
+            assert_eq!(r.status(), StatusCode::BAD_REQUEST, "{nom} accepté");
+        }
     }
 }

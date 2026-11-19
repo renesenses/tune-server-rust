@@ -7,9 +7,11 @@
 //!   porte `context_type = 'radio'` : c'est ce qui la distingue, à la
 //!   lecture, des anciennes lignes de radio à titre ICY, qui restent cachées.
 //!   Une radio n'a pas de durée : la ligne est écrite au lancement
-//!   (`armer_l_ecoute`). Un changement de titre ICY ne met à jour que
-//!   `now_playing` dans le sondeur et n'écrit rien ; les relances
-//!   automatiques du flux passent par `play_without_history`.
+//!   (`armer_l_ecoute`). Un changement de titre ICY n'écrit aucune ligne
+//!   dans `listen_history` ; les relances automatiques du flux passent par
+//!   `play_without_history`. Depuis #8487 (go du 18/11/2026), le sondeur note
+//!   les titres diffusés À PART, sous cette ligne de station et hors de toute
+//!   statistique (`db::radio_titres_diffuses`).
 //! - **Podcast** : `play_episode` (route du serveur) joue un épisode hors
 //!   zone navigateur sans passer par `play` ; il écrit sa ligne par
 //!   [`PlaybackOrchestrator::enregistrer_ecoute_podcast`], soumise au même
@@ -110,6 +112,7 @@ impl PlaybackOrchestrator {
                 pochette: station.logo.as_deref(),
             },
             None,
+            None,
         );
     }
 
@@ -149,6 +152,7 @@ impl PlaybackOrchestrator {
                 titre: Some(podcast),
                 pochette,
             },
+            None,
             None,
         );
     }

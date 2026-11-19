@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 
+use super::faux_hires::verdict_effectif_sql;
 use super::faux_hires_passe::verdict_d_album;
 use crate::db::backend::DbBackend;
 use crate::db::settings_repo::SettingsRepo;
@@ -88,6 +89,12 @@ pub fn publier_l_album(
     pistes: &[(String, Option<String>)],
     douteux_visible: bool,
 ) -> (&'static str, Option<String>) {
+    // #9035 (décision du 18/11) — « douteux » masqué : un album qui a la
+    // moindre piste douteuse ne se dit ni vérifié ni conforme, il reste sans
+    // badge (`non_analyse`), comme avant la règle de la moitié.
+    if !douteux_visible && pistes.iter().any(|(v, _)| v == "douteux") {
+        return ("non_analyse", None);
+    }
     let (verdict, raison) = verdict_d_album(pistes);
     match VerdictPublie::lire(&verdict) {
         Some(VerdictPublie::Douteux) if douteux_visible => ("douteux", raison),
@@ -96,6 +103,28 @@ pub fn publier_l_album(
         }
         Some(v) => (v.code(), None),
     }
+}
+
+/// #9035 — les pistes douteuses d'un album, qu'il soit douteux (au moins la
+/// moitié de ses pistes mesurées) ou non (« 2 pistes douteuses » sur un album
+/// vérifié) : `(pistes douteuses, pistes mesurées, raison la plus fréquente
+/// des douteuses)`. `None` sans piste douteuse, et tant que « douteux » est
+/// masqué (le compte trahirait le verdict).
+pub fn pistes_douteuses_publiees(
+    pistes: &[(String, Option<String>)],
+    douteux_visible: bool,
+) -> Option<(usize, usize, Option<String>)> {
+    if !douteux_visible {
+        return None;
+    }
+    let (douteuses, mesurees) = super::faux_hires_passe::pistes_en_cause(pistes);
+    (douteuses > 0).then(|| {
+        (
+            douteuses,
+            mesurees,
+            super::faux_hires_passe::raison_des_douteuses(pistes),
+        )
+    })
 }
 
 /// Verdict et raison de chaque piste mesurée, rangés par identifiant d'album.
@@ -116,9 +145,11 @@ pub fn pistes_mesurees_par_album(
             .collect::<Vec<_>>()
             .join(",");
         let sql = format!(
-            "SELECT ht.album_id, hv.verdict, hv.raison \
+            "SELECT ht.album_id, {verdict}, \
+             CASE WHEN {verdict} = 'douteux' THEN hv.raison END \
                FROM tracks ht JOIN hires_verifications hv ON hv.track_id = ht.id \
-              WHERE ht.album_id IN ({liste}) ORDER BY ht.album_id, hv.track_id"
+              WHERE ht.album_id IN ({liste}) ORDER BY ht.album_id, hv.track_id",
+            verdict = verdict_effectif_sql("hv"),
         );
         for r in &db.query_many(&sql, &[])? {
             let (Some(album), Some(verdict)) = (
@@ -134,27 +165,58 @@ pub fn pistes_mesurees_par_album(
     Ok(par_album)
 }
 
-/// Une piste de l'album `id_album` porte ce verdict mesuré.
+/// #9035 — « l'album est douteux » en SQL : au moins une piste douteuse, et
+/// au moins la moitié de ses pistes mesurées qui se disent hi-res (#9067 :
+/// vérifiées ou douteuses, verdict EFFECTIF), comme
+/// [`super::faux_hires_passe::album_majoritairement_douteux`].
+fn album_douteux(id_album: &str) -> String {
+    let compte = |condition: &str| {
+        format!(
+            "(SELECT COUNT(*) FROM tracks ht JOIN hires_verifications hv ON hv.track_id = ht.id \
+             WHERE ht.album_id = {id_album} AND {condition})"
+        )
+    };
+    format!(
+        "({} AND 2 * {} >= {})",
+        une_piste_de_l_album(id_album, "douteux"),
+        compte(&format!("{} = 'douteux'", verdict_effectif_sql("hv"))),
+        compte(&format!(
+            "{} IN ('verifie', 'douteux')",
+            verdict_effectif_sql("hv")
+        ))
+    )
+}
+
+/// Une piste de l'album `id_album` porte ce verdict mesuré (effectif, #9067).
 fn une_piste_de_l_album(id_album: &str, verdict: &str) -> String {
     format!(
         "EXISTS (SELECT 1 FROM tracks ht JOIN hires_verifications hv ON hv.track_id = ht.id \
-         WHERE ht.album_id = {id_album} AND hv.verdict = '{verdict}')"
+         WHERE ht.album_id = {id_album} AND {} = '{verdict}')",
+        verdict_effectif_sql("hv")
     )
 }
 
 /// Le prédicat SQL « l'album `id_album` (une colonne : `a.id`, `al.id`) se
 /// PUBLIE avec ce verdict ». Il suit [`verdict_d_album`] règle pour règle :
 ///
-/// - douteux : une piste douteuse au moins ;
-/// - vérifié : aucune douteuse, une vérifiée au moins, aucune conforme ;
-/// - conforme : aucune douteuse, une conforme au moins ;
-/// - non analysé : aucune douteuse, vérifiée ni conforme (pas de mesure, ou
+/// - douteux : au moins la moitié des pistes mesurées douteuses (#9035) ;
+/// - vérifié : pas douteux, une vérifiée au moins, aucune conforme ;
+/// - conforme : pas douteux, une conforme au moins ;
+/// - non analysé : pas douteux, ni vérifiée ni conforme (pas de mesure, ou
 ///   rien que du non concluant).
 ///
-/// « Douteux » masqué : le prédicat douteux est faux, et un album douteux
-/// répond à « non analysé ». Les deux bases lisent ce SQL tel quel.
+/// « Douteux » masqué : le prédicat douteux est faux, et un album qui a la
+/// moindre piste douteuse (même sous la moitié, #9035) répond à « non
+/// analysé », jamais à « vérifié » ni « conforme ». Les deux bases lisent ce
+/// SQL tel quel.
 pub fn predicat_album(id_album: &str, verdict: VerdictPublie, douteux_visible: bool) -> String {
-    let d = une_piste_de_l_album(id_album, "douteux");
+    // Visible : douteux à partir de la moitié. Masqué : la moindre piste
+    // douteuse écarte l'album de « vérifié » et « conforme » (#9035).
+    let d = if douteux_visible {
+        album_douteux(id_album)
+    } else {
+        une_piste_de_l_album(id_album, "douteux")
+    };
     let v = une_piste_de_l_album(id_album, "verifie");
     let c = une_piste_de_l_album(id_album, "conforme");
     match verdict {
@@ -194,6 +256,38 @@ impl FiltreHires {
     }
 }
 
+/// rc12 — les albums dont le verdict PUBLIÉ est l'un de `mots` (OU entre
+/// eux, comme les pastilles de la Bibliothèque) : le filtre `hires_verdict`
+/// du catalogue imprimable. Mêmes prédicats que `?hires_verdict=` de la
+/// liste ([`FiltreHires::predicat`]) : un mot inconnu ne rend rien, et
+/// « douteux » masqué ne rend rien non plus.
+pub fn albums_des_verdicts(
+    db: &Arc<dyn DbBackend>,
+    mots: &[String],
+    douteux_visible: bool,
+) -> Result<std::collections::HashSet<i64>, String> {
+    if mots.is_empty() {
+        return Ok(Default::default());
+    }
+    let ou = mots
+        .iter()
+        .map(|m| {
+            format!(
+                "({})",
+                FiltreHires::depuis_le_mot(m, douteux_visible).predicat("a.id")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" OR ");
+    let sql = format!("SELECT a.id FROM albums a WHERE {ou}");
+    Ok(db
+        .query_many(&sql, &[])
+        .map_err(|e| e.to_string())?
+        .iter()
+        .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+        .collect())
+}
+
 /// Le prédicat SQL « la piste `id_piste` (`t.id`) se PUBLIE avec ce
 /// verdict » : celui de sa ligne de `hires_verifications`. Sans ligne, ou
 /// `non_concluant`, elle est non analysée ; douteuse masquée aussi.
@@ -201,7 +295,8 @@ pub fn predicat_piste(id_piste: &str, verdict: VerdictPublie, douteux_visible: b
     let parmi = |verdicts: &str| {
         format!(
             "EXISTS (SELECT 1 FROM hires_verifications hv \
-             WHERE hv.track_id = {id_piste} AND hv.verdict IN ({verdicts}))"
+             WHERE hv.track_id = {id_piste} AND {} IN ({verdicts}))",
+            verdict_effectif_sql("hv")
         )
     };
     match verdict {

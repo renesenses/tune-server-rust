@@ -97,16 +97,16 @@ async fn start_sacd_rip(
     Json(body): Json<SacdRipRequest>,
 ) -> Result<Json<Value>, AppError> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-
-    let output_dir = body
-        .output_dir
-        .or_else(|| settings.get("sacd_rip_output_dir").ok().flatten())
-        .unwrap_or_else(|| {
-            // #4770 : un dossier par compte, jamais un nom fixe partagé.
-            tune_core::chemins_de_travail::racine_de_travail("tune-sacd-rip")
-                .to_string_lossy()
-                .to_string()
-        });
+    // Sécurité — `output_dir` est un dossier d'ÉCRITURE choisi
+    // par le client : confiné aux dossiers de musique, au dossier
+    // d'extraction configuré ou au dossier de travail (#4770 : un dossier par
+    // compte, jamais un nom fixe partagé).
+    let output_dir = crate::routes::confinement::dossier_de_sortie(
+        &state,
+        body.output_dir.clone(),
+        "sacd_rip_output_dir",
+        "tune-sacd-rip",
+    )?;
     let format = body.format.unwrap_or_else(|| "dsf".into());
     let layer = body.layer.unwrap_or_else(|| "stereo".into());
 
@@ -230,5 +230,44 @@ mod iso_status_tests_3234 {
             .await
             .unwrap();
         assert_eq!(next.status(), StatusCode::OK);
+    }
+}
+
+/// Sécurité — `output_dir` (écriture) reste dans un dossier autorisé.
+#[cfg(test)]
+mod confinement_chemins_tests {
+    use super::*;
+    use crate::routes::confinement::{banc, statut};
+
+    #[tokio::test]
+    async fn un_dossier_de_sortie_hors_des_racines_autorisees_est_refuse() {
+        let b = banc();
+        for chemin in [b.remontee("/rip"), b.remontee(""), "/etc".to_string()] {
+            let corps: SacdRipRequest =
+                serde_json::from_value(serde_json::json!({ "output_dir": chemin, "tracks": [] }))
+                    .unwrap();
+            assert_eq!(
+                statut(start_sacd_rip(State(b.state.clone()), Json(corps)).await),
+                axum::http::StatusCode::BAD_REQUEST,
+                "{chemin} : sortie hors des dossiers autorisés acceptée"
+            );
+        }
+        // Autorisés : un dossier de musique, le dossier configuré, le défaut.
+        let ok = |demande: Option<String>| {
+            crate::routes::confinement::dossier_de_sortie(
+                &b.state,
+                demande,
+                "sacd_rip_output_dir",
+                "tune-confinement-banc",
+            )
+        };
+        assert!(ok(Some(b.dedans("/Rips"))).is_ok());
+        assert!(ok(None).is_ok());
+        tune_core::db::settings_repo::SettingsRepo::with_backend(b.state.backend.clone())
+            .set("sacd_rip_output_dir", "/srv/rips")
+            .unwrap();
+        assert!(ok(Some("/srv/rips/Album".into())).is_ok());
+        assert!(ok(Some("/srv/rips/../etc".into())).is_err());
+        assert!(ok(Some("/srv/ripsx".into())).is_err());
     }
 }

@@ -5,7 +5,6 @@ use serde_json::{Value, json};
 
 use tracing::{info, warn};
 
-use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
@@ -59,7 +58,16 @@ fn admin_errors_disabled() -> Json<Value> {
 /// errors, and return the most recent `max_lines` of them (newest first).
 /// Returns `None` if the file can't be opened/read.
 fn read_error_tail(log_path: &str, max_lines: usize) -> Option<(Vec<String>, String)> {
-    read_error_tail_windowed(log_path, max_lines, ERROR_LOG_TAIL_BYTES)
+    // Jamais la ligne du code d'activation de l'authentification.
+    read_error_tail_windowed(log_path, max_lines, ERROR_LOG_TAIL_BYTES).map(|(lignes, src)| {
+        (
+            lignes
+                .into_iter()
+                .filter(|l| !l.contains(tune_core::confidentialite::MARQUEUR_CODE_ACTIVATION))
+                .collect(),
+            src,
+        )
+    })
 }
 
 fn read_error_tail_windowed(
@@ -131,23 +139,28 @@ pub(super) async fn admin_discovery(State(state): State<AppState>) -> Json<Value
 
 pub(super) async fn admin_health(State(state): State<AppState>) -> Json<Value> {
     let uptime = state.started_at.elapsed().as_secs();
-    let tracks = TrackRepo::with_backend(state.backend.clone())
-        .count()
-        .unwrap_or(0);
-    let albums = AlbumRepo::with_backend(state.backend.clone())
-        .count()
-        .unwrap_or(0);
-    // #5086 — par le pool de lecture : une sonde de santé n'attend pas
-    // l'écrivain SQLite.
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let scan_status = settings
-        .get_sans_ecrivain("scan_status")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "idle".into());
-    let zone_count = ZoneRepo::with_backend(state.backend.clone())
-        .count()
-        .unwrap_or(0);
+    // #8805 — hors exécuteur : la sonde du Support compte les mêmes tables
+    // que `/system/health`, et partage son cache.
+    let comptes = super::comptages_8805::comptes_sante(&state, "system_admin_health").await;
+    let tracks = comptes.tracks.unwrap_or(0);
+    let albums = comptes.albums.unwrap_or(0);
+    let lecteur = state.backend.clone();
+    let (scan_status, zone_count) = super::comptages_8805::lecture_hors_executeur(
+        "system_admin_health",
+        (None, 0),
+        move || {
+            // #5086 — par le pool de lecture : une sonde de santé n'attend pas
+            // l'écrivain SQLite.
+            let scan_status = SettingsRepo::with_backend(lecteur.clone())
+                .get_sans_ecrivain("scan_status")
+                .ok()
+                .flatten();
+            let zones = ZoneRepo::with_backend(lecteur).count().unwrap_or(0);
+            (scan_status, zones)
+        },
+    )
+    .await;
+    let scan_status = scan_status.unwrap_or_else(|| "idle".into());
     let playback_states = state.playback.all_states().await;
     let playing = playback_states
         .iter()

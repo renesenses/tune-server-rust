@@ -206,7 +206,8 @@ impl Compilateur {
     /// (paramètre lié) : elle peut donc apparaître deux fois dans une plage.
     fn colonne_nombre(&mut self, champ: ChampNombre) -> String {
         match champ {
-            ChampNombre::Annee => "COALESCE(t.year, al.year)".to_string(),
+            // Go du 13/11 — une année à 0 vaut « pas d'année », des deux côtés.
+            ChampNombre::Annee => crate::db::annee_de_la_piste::ANNEE_DE_LA_PISTE.to_string(),
             ChampNombre::Frequence => "t.sample_rate".to_string(),
             ChampNombre::Resolution => "t.bit_depth".to_string(),
             ChampNombre::Canaux => "t.channels".to_string(),

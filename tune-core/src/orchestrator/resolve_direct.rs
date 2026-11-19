@@ -229,6 +229,15 @@ impl PlaybackOrchestrator {
         file_path: &str,
         req: &PlayRequest,
     ) -> Result<ResolvedStream, String> {
+        // Sécurité — un fichier « téléversé » ne se lit QUE dans le
+        // dossier des téléversements. Le chemin vient du client
+        // (`temp_file_path`, ou `source_id` d'une entrée `upload`) : sans
+        // cette garde, n'importe quel fichier audio de la machine se jouait.
+        let racine = crate::chemins_de_travail::racine_des_televersements();
+        if crate::chemin_sur::racine_contenante(file_path, &[racine.to_string_lossy()]).is_err() {
+            warn!(file = %file_path, "uploaded_file_outside_upload_dir");
+            return Err(format!("uploaded file not found: {file_path}"));
+        }
         let path = std::path::Path::new(file_path);
         if !path.exists() {
             return Err(format!("uploaded file not found: {file_path}"));
@@ -586,7 +595,9 @@ impl PlaybackOrchestrator {
         let raw_url = url_retenue
             .as_deref()
             .or(req.source_id.as_deref())
-            .ok_or("source_id (audio URL) required for podcast/radio playback")?;
+            .ok_or("source_id (audio URL) required for podcast/radio playback")?
+            // Sécurité — la valeur VÉRIFIÉE est celle qui part.
+            .trim();
         // Une piste indexée dont l'instantané ne porte aucune URL jouable ne
         // doit pas partir « au cas où » : `source_id` est alors le condensat
         // d'identité, et le pousser à une sortie produirait une erreur de
@@ -599,6 +610,18 @@ impl PlaybackOrchestrator {
                  (POST /network/media-servers/<id>/indexer) la rétablira.",
                 req.title.as_deref().unwrap_or("cette piste")
             ));
+        }
+        // Sécurité — `podcast`, `radio` et `bandcamp` (et toute
+        // source qui passe par ici) : le `source_id` vient du client, et une
+        // sortie AirPlay, Sendspin ou locale lit un chemin nu ou un `file://`
+        // comme un fichier de la machine. Seule une adresse http(s) part.
+        if !est_une_url_http(raw_url) {
+            warn!(
+                zone_id = req.zone_id,
+                source = %source_apparente,
+                "lecture_directe_refusee_hors_http"
+            );
+            return Err(refus_hors_http(&source_apparente));
         }
         // Au niveau INFO, donc visible avec le `log_level` ordinaire : c'est la
         // ligne qui dit, pour une piste indexée, D'OÙ vient l'adresse jouée.
@@ -761,6 +784,16 @@ impl PlaybackOrchestrator {
             None
         };
         let audio_url: &str = bc_url_resignee.as_deref().unwrap_or(audio_url);
+        // Sécurité — ni une liste m3u/pls distante, ni une page
+        // Bandcamp, ni sa resignature ne peuvent ramener un chemin local.
+        if !est_une_url_http(audio_url) {
+            warn!(
+                zone_id = req.zone_id,
+                source = %source,
+                "lecture_directe_refusee_hors_http_apres_resolution"
+            );
+            return Err(refus_hors_http(&source));
+        }
 
         let is_local_output = req
             .output_device_id
@@ -870,6 +903,7 @@ impl PlaybackOrchestrator {
             return self
                 .servir_le_dsd_upnp_au_reseau(
                     req,
+                    did,
                     audio_url,
                     mime_type,
                     &title,
@@ -1363,6 +1397,51 @@ impl PlaybackOrchestrator {
     /// resolution que l'appelant a portee depuis les attributs `res@` du DIDL
     /// est conservee telle quelle : c'est ce qui empeche un ALAC 24 bits d'un
     /// NAS d'etre affiche en 44,1 kHz / 16 bits.
+    /// #8956 — le conteneur et le MIME d'un DSD distant relayé BRUT vers
+    /// `device_id`.
+    ///
+    /// Le MIME est l'orthographe que le Sink du renderer publie pour CE
+    /// conteneur (`audio/x-dsf` pour un `.dsf`, `audio/x-dff` pour un `.dff`),
+    /// à défaut un générique qu'il publie, à défaut le MIME source. Le
+    /// conteneur vient de l'adresse ; quand elle ne le nomme pas et que le
+    /// Sink distingue les deux, de l'en-tête du fichier (`DSD ` / `FRM8`).
+    /// Sans réponse du renderer en cache, rien ne change.
+    async fn mime_dsd_brut_pour_le_renderer(
+        &self,
+        device_id: &str,
+        audio_url: &str,
+        mime_type: &str,
+        conteneur: &'static str,
+    ) -> (&'static str, String) {
+        let mimes_dsd = self
+            .dsd_capabilities
+            .lock()
+            .await
+            .get(device_id)
+            .map(|cap| cap.mimes_dsd.clone())
+            .unwrap_or_default();
+        if mimes_dsd.is_empty() {
+            return (conteneur, mime_type.to_string());
+        }
+        let pour = |c: &str| crate::outputs::dlna::mime_dsd_pour_conteneur(c, &mimes_dsd);
+        let nomme = crate::outputs::dlna::conteneur_dsd_de_l_url(audio_url).is_some()
+            || mime_type.to_ascii_lowercase().contains("dff")
+            || mime_type.to_ascii_lowercase().contains("dsf");
+        let conteneur = if !nomme && pour("dsf") != pour("dff") {
+            match conteneur_dsd_par_l_en_tete(audio_url).await {
+                Some(lu) => {
+                    info!(url = %audio_url, conteneur = lu, "dsd_upnp_conteneur_lu_a_l_en_tete");
+                    lu
+                }
+                None => conteneur,
+            }
+        } else {
+            conteneur
+        };
+        let mime = pour(conteneur).unwrap_or_else(|| mime_type.to_string());
+        (conteneur, mime)
+    }
+
     /// Une piste DSD de serveur média vers un renderer réseau, selon la
     /// politique de la zone ([`super::resolve_local::PolitiqueDsdReseau`]).
     ///
@@ -1380,9 +1459,11 @@ impl PlaybackOrchestrator {
     ///   en base, ou au-delà du plafond de la zone, on retombe sur le PCM ;
     /// - **PCM** : le canal WAV des services (`pretranscoder_en_flac`), dont
     ///   le décodeur aiguille `.dsf`/`.dff` vers le convertisseur DSD natif.
+    #[allow(clippy::too_many_arguments)]
     async fn servir_le_dsd_upnp_au_reseau(
         &self,
         req: &PlayRequest,
+        device_id: &str,
         audio_url: &str,
         mime_type: &str,
         title: &str,
@@ -1396,9 +1477,18 @@ impl PlaybackOrchestrator {
 
         let (url, stream_id, out_mime, out_sr, out_bd, out_ch) = match politique {
             PolitiqueDsdReseau::Brut => {
+                // #8956 — le MIME du CONTENEUR, dans l'orthographe du Sink.
+                // MinimServer sert `application/x-dsd`, que l'Atoll ST200 ne
+                // publie pas (il publie `audio/x-dsf` et `audio/x-dff`) :
+                // refus 714 à la pose, et le DSD distant ne jouait jamais.
+                // Même règle que le `.dsf` local (`dsf_mime`), mais au
+                // conteneur près.
+                let (conteneur, mime_brut) = self
+                    .mime_dsd_brut_pour_le_renderer(device_id, audio_url, mime_type, conteneur)
+                    .await;
                 let info = StreamInfo {
                     format: conteneur.to_string(),
-                    mime_type: mime_type.to_string(),
+                    mime_type: mime_brut.clone(),
                     sample_rate: dsd_rate,
                     bit_depth: 1,
                     channels: 2,
@@ -1413,16 +1503,24 @@ impl PlaybackOrchestrator {
                 let url = self
                     .streamer
                     .get_stream_url(&session_id, &server_ip, conteneur);
+                // Le `GET` relayé rendrait le `Content-Type` du serveur média
+                // (`application/x-dsd`) : un renderer qui le confronte à la
+                // DIDL (le ST200 fait un `HEAD`) doit lire la même orthographe.
+                if !mime_brut.eq_ignore_ascii_case(mime_type) {
+                    crate::http::streamer::annoncer_mime_du_flux(&session_id, &mime_brut);
+                }
                 info!(
                     zone_id = req.zone_id,
                     url = %audio_url,
                     conteneur,
+                    mime_source = mime_type,
+                    mime_annonce = %mime_brut,
                     "dsd_upnp_brut_relaye_par_tune"
                 );
                 (
                     url,
                     Some(session_id),
-                    mime_type.to_string(),
+                    mime_brut,
                     req.sample_rate,
                     req.bit_depth.map(u32::from),
                     None,
@@ -1522,7 +1620,7 @@ impl PlaybackOrchestrator {
             ..Default::default()
         };
         // #5114 — le porteur d'abord : le flux dit s'il cuit le crossfeed.
-        let dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
+        let dsp = self.load_streaming_dsp(req.zone_id, req.piste_rg(), sr, 2);
         let info = StreamInfo {
             crossfeed: dsp.is_active() && dsp.crossfeed_executable(),
             compensation_db: dsp.compensation_cuite_db(),
@@ -1728,7 +1826,7 @@ impl PlaybackOrchestrator {
             ..Default::default()
         };
         let dsp = (!is_local_output)
-            .then(|| self.load_streaming_dsp(req.zone_id, req.track_id, cadence, 2))
+            .then(|| self.load_streaming_dsp(req.zone_id, req.piste_rg(), cadence, 2))
             .filter(|dsp| dsp.is_active());
         let info = match dsp.as_ref() {
             Some(dsp) => StreamInfo {
@@ -2586,6 +2684,20 @@ pub(crate) fn conteneur_dsd(url: &str, mime: &str) -> &'static str {
     }
 }
 
+/// #8956 — le conteneur d'un DSD distant d'après ses quatre premiers octets
+/// (`DSD ` → `dsf`, `FRM8` → `dff`). Une requête `Range` bornée à trois
+/// secondes ; `None` si le serveur ne répond pas ou ne sert pas du DSD.
+async fn conteneur_dsd_par_l_en_tete(url: &str) -> Option<&'static str> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return None;
+    }
+    let sonde = super::duree_du_flux_2062::lire_une_plage(crate::http::client::shared(), url, 0, 4);
+    let (tete, _) = tokio::time::timeout(std::time::Duration::from_secs(3), sonde)
+        .await
+        .ok()??;
+    crate::outputs::dlna::conteneur_dsd_de_l_en_tete(&tete)
+}
+
 /// #8428 — l'URL annonce-t-elle de l'Opus (`.opus`, `audio/opus`, ou Ogg dont
 /// le MIME porte `opus`) ? Un `.ogg` sans indication reste lu comme Vorbis.
 fn opus_annonce(conteneur: &str, mime: &str) -> bool {
@@ -2753,9 +2865,14 @@ pub(crate) const CLE_URL_DE_LECTURE_UPNP: &str = "upnp_res_url";
 /// Le seul test qui sépare une URL de lecture du CONDENSAT D'IDENTITÉ que
 /// `tracks.source_id` porte depuis la phase 2 (`uuid:…|9f3c…`). Sans lui, le
 /// condensat partirait à la sortie comme s'il était une adresse.
+/// Sécurité — le refus d'une source directe qui n'est pas une
+/// adresse http(s). Le texte ne répète pas la valeur reçue.
+pub(crate) fn refus_hors_http(source: &str) -> String {
+    format!("Lecture impossible : la source « {source} » n'accepte qu'une adresse http(s).")
+}
+
 pub(crate) fn est_une_url_http(valeur: &str) -> bool {
-    let v = valeur.trim();
-    (v.starts_with("http://") || v.starts_with("https://")) && v.len() > "https://".len()
+    crate::chemin_sur::est_une_adresse_http(valeur)
 }
 
 #[cfg(test)]

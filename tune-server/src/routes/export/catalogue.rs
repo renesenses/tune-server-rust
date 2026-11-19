@@ -21,6 +21,11 @@
 //! - `quality` : `dsd`, `hires`, `cd`, `lossy`, plusieurs séparés par des
 //!   virgules (OU entre eux, comme les pastilles de la Bibliothèque) ;
 //! - `format` : `FLAC`, `WAV`…, plusieurs séparés par des virgules, sans casse ;
+//! - `hires_verdict` (rc12) : `verifie`, `douteux`, `conforme`, `non_analyse`,
+//!   plusieurs séparés par des virgules — le verdict des faux hi-res PUBLIÉ,
+//!   comme `GET /library/albums?hires_verdict=` (« douteux » masqué ne rend
+//!   rien). Il est une valeur de plus de la facette Qualité : OU avec
+//!   `quality`, comme les pastilles de la Bibliothèque ;
 //! - `sort` : `title` (défaut), `artist`, `year` ; `order` : `asc` ou `desc` ;
 //! - `covers=false` : sans pochettes, pour une très grande bibliothèque ;
 //! - `lang` : `fr` ou `en` (à défaut, l'en-tête `Accept-Language`).
@@ -30,6 +35,7 @@ use std::collections::HashMap;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
+use tune_core::audio::faux_hires_publie;
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::models::Album;
 
@@ -48,6 +54,11 @@ pub struct FiltresCatalogue {
     pub artist_id: Option<i64>,
     pub qualities: Vec<String>,
     pub formats: Vec<String>,
+    /// rc12 — les mots de `hires_verdict`.
+    pub hires_verdicts: Vec<String>,
+    /// Les albums de ces verdicts, lus en base par la route
+    /// (`faux_hires_publie::albums_des_verdicts`) ; `None` sans `hires_verdict`.
+    pub albums_hires: Option<std::collections::HashSet<i64>>,
     pub sort: String,
     pub desc: bool,
     pub covers: bool,
@@ -95,6 +106,8 @@ impl FiltresCatalogue {
             artist_id: texte("artist_id").and_then(|v| v.parse().ok()),
             qualities: liste("quality"),
             formats: liste("format"),
+            hires_verdicts: liste("hires_verdict"),
+            albums_hires: None,
             sort,
             desc: texte("order").is_some_and(|o| o.eq_ignore_ascii_case("desc")),
             covers: texte("covers").is_none_or(|v| v != "false" && v != "0"),
@@ -121,14 +134,20 @@ impl FiltresCatalogue {
         {
             return false;
         }
-        if !self.qualities.is_empty() {
+        if !self.qualities.is_empty() || self.albums_hires.is_some() {
             // `hi-res` est le badge, `hires` la clé de la route : les deux.
             let badge = a.quality().map(|b| b.replace('-', ""));
-            if !self
+            let par_qualite = self
                 .qualities
                 .iter()
-                .any(|q| badge.as_deref() == Some(q.replace('-', "").as_str()))
-            {
+                .any(|q| badge.as_deref() == Some(q.replace('-', "").as_str()));
+            // rc12 — le verdict hi-res est une valeur de plus de la facette :
+            // OU avec les qualités, comme à l'écran.
+            let par_verdict = self
+                .albums_hires
+                .as_ref()
+                .is_some_and(|ids| a.id.is_some_and(|id| ids.contains(&id)));
+            if !par_qualite && !par_verdict {
                 return false;
             }
         }
@@ -294,8 +313,8 @@ pub fn rendre_html(lignes: &[LigneCatalogue], f: &FiltresCatalogue, date: &str) 
     if let Some(a) = &f.artist {
         filtres.push(format!("{} : {}", l.artiste, echapper(a)));
     }
-    if !f.qualities.is_empty() {
-        let q: Vec<String> = f
+    if !f.qualities.is_empty() || !f.hires_verdicts.is_empty() {
+        let mut q: Vec<String> = f
             .qualities
             .iter()
             .map(|q| match q.as_str() {
@@ -304,6 +323,13 @@ pub fn rendre_html(lignes: &[LigneCatalogue], f: &FiltresCatalogue, date: &str) 
                 autre => echapper(autre),
             })
             .collect();
+        q.extend(f.hires_verdicts.iter().map(|v| match (v.as_str(), f.lang) {
+            ("verifie", Langue::Fr) => "Hi-Res vérifié".to_string(),
+            ("verifie", Langue::En) => "Verified Hi-Res".to_string(),
+            ("douteux", Langue::Fr) => "Hi-Res douteux".to_string(),
+            ("douteux", Langue::En) => "Doubtful Hi-Res".to_string(),
+            (autre, _) => format!("Hi-Res : {}", echapper(autre)),
+        }));
         filtres.push(format!("{} : {}", l.qualite, q.join(", ")));
     }
     if !f.formats.is_empty() {
@@ -448,14 +474,31 @@ pub(super) async fn export_catalogue_html(
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
     let accept = headers.get("accept-language").and_then(|v| v.to_str().ok());
-    let filtres = FiltresCatalogue::depuis_requete(&q, accept);
+    let mut filtres = FiltresCatalogue::depuis_requete(&q, accept);
+    // rc12 — `hires_verdict` : les albums du verdict publié, lus une fois.
+    if !filtres.hires_verdicts.is_empty() {
+        let visible = faux_hires_publie::douteux_visible(&state.backend);
+        match faux_hires_publie::albums_des_verdicts(
+            &state.backend,
+            &filtres.hires_verdicts,
+            visible,
+        ) {
+            Ok(ids) => filtres.albums_hires = Some(ids),
+            Err(e) => {
+                tracing::warn!("catalogue export: hires verdict lookup failed: {e}");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        }
+    }
 
     let repo = AlbumRepo::with_backend(state.backend.clone());
     let order = if filtres.desc { "desc" } else { "asc" };
     // Albums masqués exclus, comme dans la Bibliothèque. Le tri vient de la
     // base ; une seule qualité passe aussi par elle, le reste est filtré ici.
+    // Avec `hires_verdict`, la qualité est un OU avec le verdict : la base ne
+    // pré-filtre plus sur elle.
     let qualite_sql = match filtres.qualities.as_slice() {
-        [une] => Some(une.as_str()),
+        [une] if filtres.albums_hires.is_none() => Some(une.as_str()),
         _ => None,
     };
     let albums = match repo.list_filtered(

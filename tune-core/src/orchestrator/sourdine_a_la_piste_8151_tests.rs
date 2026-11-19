@@ -73,7 +73,14 @@ async fn une_zone_dlna_en_sourdine_ne_repart_jamais_avec_le_son() {
         "http://127.0.0.1:9/stream/8151-zone-podcast.mp3",
     ] {
         let (envoyee, erreur) = orch
-            .send_to_output(udn, &piste(url), None, false, zone_id, None)
+            .send_to_output(
+                udn,
+                &piste(url),
+                None,
+                false,
+                zone_id,
+                crate::audio::replaygain::PisteRg::AUCUNE,
+            )
             .await;
         assert!(envoyee, "la piste doit partir : {erreur:?}");
         assert_eq!(
@@ -121,7 +128,7 @@ async fn une_zone_hors_sourdine_ne_recoit_aucune_sourdine() {
             None,
             false,
             zone_id,
-            None,
+            crate::audio::replaygain::PisteRg::AUCUNE,
         )
         .await;
     assert!(envoyee, "la piste doit partir : {erreur:?}");
@@ -232,4 +239,35 @@ async fn l_enchainement_hors_sourdine_n_envoie_aucune_sourdine() {
 
     compat::reinitialiser_compatibilite(udn).unwrap();
     vie.abort();
+}
+
+/// 🔴 #8685 — la réaffirmation de l'enchaînement attend le verrou de la
+/// sortie, que le sondeur tient pendant ses relevés. Si l'auditeur lève la
+/// sourdine pendant cette attente, rien ne doit la reposer derrière lui : le
+/// bouton dirait « son », l'appareil serait muet. La contre-épreuve est
+/// `l_enchainement_sans_blanc_repose_la_sourdine_de_la_zone` : zone toujours
+/// muette, la sourdine part.
+#[tokio::test]
+async fn l_enchainement_ne_repose_pas_une_sourdine_levee_pendant_l_attente_8685() {
+    let udn = "uuid:banc-8685-course";
+    let (orch, zone_id, etat, vie) = banc(udn, true).await;
+    let sortie = orch.outputs.lock().await.get(udn).expect("sortie inscrite");
+    // Le sondeur tient la sortie.
+    let tenue = sortie.lock().await;
+    orch.reimposer_la_sourdine_a_l_enchainement(zone_id).await;
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // L'auditeur lève la sourdine de la zone.
+    ZoneRepo::with_backend(orch.db.clone())
+        .update_muted(zone_id, false)
+        .unwrap();
+    orch.playback.set_mute(zone_id, false).await;
+    drop(tenue);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let commandes = etat.commandes.lock().await.clone();
+    compat::reinitialiser_compatibilite(udn).unwrap();
+    vie.abort();
+    assert!(
+        !commandes.iter().any(|c| c.starts_with("SetMute")),
+        "#8685 : sourdine reposée après sa levée : {commandes:?}"
+    );
 }

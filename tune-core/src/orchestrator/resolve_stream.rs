@@ -484,13 +484,17 @@ mod youtube_dlna_demarrage_8228_tests;
 /// leur session WAV est servie en continu, sans longueur annoncée, et le
 /// décodeur suit la frontière d'écriture. Non pour un renderer réseau (DLNA,
 /// Chromecast, AirPlay : il leur faut le fichier complet et sa longueur), ni
-/// pour un départ à une position (le décodeur en croissance ne sait pas aller
-/// au-delà du téléchargé), ni si `TUNE_DASH_STREAM_DECODE=0`.
+/// si `TUNE_DASH_STREAM_DECODE=0`.
+///
+/// #8701 — un départ à une position (un saut) aussi : le démuxeur fMP4 lit
+/// les fragments dans l'ordre jusqu'à celui de la position, et la source en
+/// croissance ne bloque qu'au-delà de ce qui est écrit. Un saut dans la
+/// partie téléchargée joue tout de suite ; au-delà, il n'attend que le
+/// segment visé, plus la fin de tout le téléchargement.
 pub(super) fn decoder_pendant_le_telechargement(req: &PlayRequest) -> bool {
     req.output_device_id.as_deref().is_some_and(|id| {
         id.starts_with("local:") || id.starts_with("oaat:") || id.starts_with("oaat-group:")
-    }) && !req.seek_ms.is_some_and(|ms| ms > 0)
-        && !crate::audio::dash_growth::decodage_local_desarme()
+    }) && !crate::audio::dash_growth::decodage_local_desarme()
 }
 
 impl PlaybackOrchestrator {
@@ -671,6 +675,31 @@ impl PlaybackOrchestrator {
             return Err(format!("service désactivé : {service_name}"));
         }
         let mut svc = svc.write().await;
+
+        // #8689 — Qobuz ne publie son ReplayGain que sur l'objet piste
+        // (`audio_info`), que la navigation a d'ordinaire déjà lu (album,
+        // playlist, recherche : `map_track` le retient). Une file restaurée
+        // après un redémarrage ne l'a pas : UNE lecture de `track/get`, et
+        // seulement quand le gain servira (ReplayGain armé, zone hors PURE).
+        if service_name == "qobuz"
+            && crate::audio::replaygain::services_enabled(&self.db)
+            && !crate::audio::replaygain::service_contourne(&self.db, req.zone_id, req.piste_rg())
+            && crate::audio::replaygain::services::lire("qobuz", source_id).is_none()
+            && crate::audio::replaygain::ReplayGainSettings::load(&self.db).mode
+                != crate::audio::replaygain::ReplayGainMode::Off
+            && !self.zone_audiophile(req.zone_id)
+        {
+            let lu =
+                tokio::time::timeout(std::time::Duration::from_secs(3), svc.get_track(source_id))
+                    .await
+                    .is_ok_and(|resultat| resultat.is_ok());
+            debug!(
+                source_id,
+                lu,
+                trouve = crate::audio::replaygain::services::lire("qobuz", source_id).is_some(),
+                "qobuz_replaygain_lu_pour_la_lecture"
+            );
+        }
 
         // Chronomètre de la PREMIÈRE étape (#3568). Pour Tidal en DASH
         // multi-segments, `get_track_url()` ne rend pas une adresse : il
@@ -1126,6 +1155,34 @@ impl PlaybackOrchestrator {
             let (session_id, tx, data_ready) = self
                 .ouvrir_la_session_wav(wav_info, service_name, &codec, sr, bd)
                 .await;
+
+            // #8689 — la sortie locale applique le gain au rendu. OAAT
+            // reçoit les octets du WAV : son gain de service doit donc être
+            // porté ici, une seule fois, sans ajouter les autres DSP de zone.
+            let tx = if !is_local_stream && !self.zone_audiophile(req.zone_id) {
+                let facteur = crate::audio::replaygain::facteur_de_zone(
+                    &self.db,
+                    req.zone_id,
+                    req.piste_rg(),
+                );
+                if (facteur - 1.0).abs() > 1e-6 {
+                    spawn_streaming_dsp_relay(
+                        StreamingDsp {
+                            replaygain: Some(facteur),
+                            channels: 2,
+                            sample_rate: sr,
+                            ..Default::default()
+                        },
+                        bd,
+                        true,
+                        tx,
+                    )
+                } else {
+                    tx
+                }
+            } else {
+                tx
+            };
 
             let tache = self.capturer_pour_le_transcodage(
                 req,
@@ -1828,7 +1885,7 @@ impl PlaybackOrchestrator {
         // ⚠️ Ce bras ne chargeait que l'ÉGALISEUR (#2863) : le convolveur de
         // correction de pièce et le ReplayGain y étaient perdus, exactement
         // comme sur les bras non-DASH. `StreamingDsp` porte les trois.
-        let dash_dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr_servie, 2);
+        let dash_dsp = self.load_streaming_dsp(req.zone_id, req.piste_rg(), sr_servie, 2);
         let dash_dsp_active = dash_dsp.is_active();
 
         // Browser (Web Audio) zones pull the stream themselves via <audio> and
@@ -2721,7 +2778,7 @@ impl PlaybackOrchestrator {
             // fil de l'eau, sans rien bufferiser de plus — le démarrage
             // immédiat conquis en 0.9.106 est préservé. Sans traitement
             // actif, le canal reste celui d'avant, à l'octet près.
-            let aac_dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
+            let aac_dsp = self.load_streaming_dsp(req.zone_id, req.piste_rg(), sr, 2);
             // #5114 — chargé avant la session : le flux dit s'il cuit le crossfeed.
             let info = StreamInfo {
                 crossfeed: aac_dsp.is_active() && aac_dsp.crossfeed_executable(),
@@ -2849,7 +2906,7 @@ impl PlaybackOrchestrator {
             // SERVIE, pas à celle du service : ses coefficients sont calculés
             // pour le fil.
             let sr = cadence_plafonnee.unwrap_or(stream_data.quality.sample_rate);
-            let mut https_dsp = self.load_streaming_dsp(req.zone_id, req.track_id, sr, 2);
+            let mut https_dsp = self.load_streaming_dsp(req.zone_id, req.piste_rg(), sr, 2);
             let https_dsp_active = https_dsp.is_active();
             // #5114 — lu avant que le porteur parte dans la tâche de décodage.
             let https_crossfeed = https_dsp_active && https_dsp.crossfeed_executable();
@@ -3522,5 +3579,137 @@ mod remux_par_defaut_7266_tests {
             !remux(source_dash_en_flac("AAC"), false, false, false, false),
             "un AAC DASH sans traitement prend le remux FLAC, qui échoue"
         );
+    }
+}
+
+#[cfg(test)]
+mod replaygain_oaat_8689 {
+    use super::super::service_wav_progressif_5080::{
+        cdn_par_range, flux_qobuz, orchestrateur, requete_qobuz,
+    };
+    use crate::audio::replaygain::{
+        MODE_KEY, PREAMP_KEY, SERVICES_ENABLED_KEY,
+        services::{GainsDuService, noter},
+    };
+    use crate::db::{settings_repo::SettingsRepo, zone_repo::ZoneRepo};
+    use std::time::Duration;
+
+    /// Le vrai producteur WAV, un CDN synthétique, aucune sortie audio.
+    /// Le gain doit atteindre les octets OAAT, pas seulement le calcul DSP.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn le_wav_oaat_des_services_porte_le_gain_8689() {
+        let orch = orchestrateur();
+        let zone = ZoneRepo::with_backend(orch.db.clone())
+            .create("RG OAAT", Some("oaat"), Some("oaat:8689-test"))
+            .unwrap();
+        let reglages = SettingsRepo::with_backend(orch.db.clone());
+        reglages.set(MODE_KEY, "track").unwrap();
+        reglages.set(PREAMP_KEY, "2").unwrap();
+        let brut = crate::audio::decode::decode_to_pcm(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+            None,
+            Some(2),
+            0.0,
+            0.0,
+        )
+        .unwrap();
+        let flux = flux_qobuz(cdn_par_range().await, brut.sample_rate, brut.bit_depth);
+        for source in ["qobuz", "tidal"] {
+            let mut req = requete_qobuz(zone);
+            req.source = Some(source.into());
+            req.source_id = Some("8689301".into());
+            noter(
+                source,
+                "8689301",
+                GainsDuService {
+                    piste_db: Some(-8.0),
+                    piste_pic: Some(0.5),
+                    ..Default::default()
+                },
+            );
+            for (actif, pure, strict) in [
+                (false, false, false),
+                (true, true, false),
+                (true, false, true),
+                (true, false, false),
+            ] {
+                reglages
+                    .set(SERVICES_ENABLED_KEY, if actif { "true" } else { "false" })
+                    .unwrap();
+                reglages
+                    .set(
+                        &format!("zone_{zone}_audiophile"),
+                        &format!("{{\"enabled\":{pure}}}"),
+                    )
+                    .unwrap();
+                reglages
+                    .set(
+                        &crate::audio::bitperfect_strict::cle_de_zone(zone),
+                        if strict { "true" } else { "false" },
+                    )
+                    .unwrap();
+                let (_, sid, mime, _) = orch
+                    .resoudre_flux_local_ou_oaat(&req, source, &flux, false)
+                    .await
+                    .unwrap();
+                assert_eq!(mime, "audio/wav");
+                let sid = sid.unwrap();
+                let session = orch
+                    .streamer
+                    .sessions_state()
+                    .lock()
+                    .await
+                    .get(&sid)
+                    .unwrap()
+                    .clone();
+                let entete = tokio::time::timeout(Duration::from_secs(10), session.recv_chunk())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(&entete[..4], b"RIFF");
+                assert!(entete.len() <= 80);
+                let attendu = brut.pcm_bytes();
+                let mut recu = Vec::new();
+                while recu.len() < attendu.len() {
+                    match tokio::time::timeout(Duration::from_secs(10), session.recv_chunk()).await
+                    {
+                        Ok(Some(chunk)) => recu.extend_from_slice(&chunk),
+                        _ => break,
+                    }
+                }
+                assert_eq!(recu.len(), attendu.len(), "PCM complet attendu");
+                if actif && !pure && !strict {
+                    // TPDF : au plus 1 LSB de bruit + 0,5 LSB d'arrondi.
+                    // Sa graine dépend du bloc : comparer les valeurs, pas
+                    // le bruit d'un tampon entier à celui des blocs réseau.
+                    assert_ne!(recu, attendu, "le gain doit modifier le signal");
+                    let largeur = usize::from(brut.bit_depth / 8);
+                    let facteur = 10f64.powf(-6.0 / 20.0);
+                    for (i, (octets, original)) in recu
+                        .chunks_exact(largeur)
+                        .zip(brut.samples_i32.iter())
+                        .enumerate()
+                    {
+                        let obtenu = match largeur {
+                            2 => i16::from_le_bytes([octets[0], octets[1]]) as i32,
+                            3 => i32::from_le_bytes([0, octets[0], octets[1], octets[2]]) >> 8,
+                            4 => i32::from_le_bytes(octets.try_into().unwrap()),
+                            _ => panic!("profondeur inattendue"),
+                        };
+                        let ideal = *original as f64 * facteur;
+                        assert!(
+                            (obtenu as f64 - ideal).abs() <= 1.51,
+                            "#8689 : gain absent ou incorrect dans le WAV OAAT : source={source}, échantillon={i}, obtenu={obtenu}, idéal={ideal}"
+                        );
+                    }
+                } else {
+                    assert!(
+                        recu == attendu,
+                        "#8689 : garde ignorée dans le WAV OAAT : source={source}, actif={actif}, pure={pure}, strict={strict}"
+                    );
+                }
+                orch.streamer.remove_session(&sid).await;
+            }
+        }
     }
 }

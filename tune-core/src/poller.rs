@@ -1252,6 +1252,10 @@ mod gapless_stage_expiry_tests;
 #[cfg(test)]
 mod radio_metadata_deviceless_tests;
 
+/// #8487 — les titres diffusés notés sous leur station, de bout en bout.
+#[cfg(test)]
+mod titres_diffuses_8487_tests;
+
 /// AutoPlay : suivre la source de ce qu'on ecoute (#1553).
 ///
 /// Sandro, 0.9.70 : en ecoute Qobuz, l'autoplay enchainait des titres LOCAUX,
@@ -1260,6 +1264,9 @@ mod radio_metadata_deviceless_tests;
 /// bibliotheque garnie.
 #[cfg(test)]
 mod autoplay_source_tests;
+// Fil 2694 — la radio de fin de file (défaut coupé depuis #8974), ses gardes, sa marque.
+#[cfg(test)]
+mod radio_fin_de_file_2694_tests;
 
 #[cfg(all(test, feature = "oaat"))]
 mod bascule_des_niveaux_tests {
@@ -1608,6 +1615,9 @@ mod reprise_apres_pause_4666;
 
 #[cfg(test)]
 mod fin_hors_temps_reel_tests;
+// #7330 — le sondeur pendant l'attente de fin jouée d'une sortie OAAT.
+#[cfg(all(test, feature = "oaat"))]
+mod fin_oaat_jouee_7330_tests;
 
 /// #4661 — un fichier servi EN ENTIER se finit à l'HORLOGE DE PISTE, pas au
 /// bout d'un forfait de deux minutes.

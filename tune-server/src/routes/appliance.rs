@@ -44,7 +44,15 @@ pub fn router() -> Router<AppState> {
 /// Le binaire d'extinction, surchargeable pour les tests et les images
 /// atypiques.
 fn systemctl_bin() -> String {
-    std::env::var("TUNE_SYSTEMCTL_BIN").unwrap_or_else(|_| "systemctl".into())
+    // Chemin absolu : `/usr/bin` (Fedora, Debian fusionnée), sinon `/bin`
+    // (images Debian historiques non fusionnées).
+    std::env::var("TUNE_SYSTEMCTL_BIN").unwrap_or_else(|_| {
+        if std::path::Path::new("/usr/bin/systemctl").is_file() {
+            "/usr/bin/systemctl".into()
+        } else {
+            "/bin/systemctl".into()
+        }
+    })
 }
 
 /// Les deux ordres que Tune donne à la machine (#1511, #8213).
@@ -139,7 +147,7 @@ fn ordonner_apres_la_reponse(ordre: OrdreMachine) {
 /// éteindre depuis une page web y serait au mieux une surprise, au pire une
 /// perte de travail. `require_appliance()` rend 404 ailleurs — la route
 /// n'existe pas, plutôt que d'exister et de refuser.
-async fn shutdown(_admin: crate::auth::RequireAdmin) -> Result<Json<Value>, AppError> {
+async fn shutdown(_garde: crate::auth::AdminOuCetteMachine) -> Result<Json<Value>, AppError> {
     require_appliance()?;
     ordonner_apres_la_reponse(OrdreMachine::Eteindre);
     Ok(Json(json!({ "status": "shutting_down" })))
@@ -147,7 +155,7 @@ async fn shutdown(_admin: crate::auth::RequireAdmin) -> Result<Json<Value>, AppE
 
 /// Redémarrer la MACHINE (#8213) — mêmes gardes que [`shutdown`]. À ne pas
 /// confondre avec `POST /system/restart`, qui relance le seul processus Tune.
-async fn reboot(_admin: crate::auth::RequireAdmin) -> Result<Json<Value>, AppError> {
+async fn reboot(_garde: crate::auth::AdminOuCetteMachine) -> Result<Json<Value>, AppError> {
     require_appliance()?;
     ordonner_apres_la_reponse(OrdreMachine::Redemarrer);
     Ok(Json(json!({ "status": "rebooting" })))
@@ -159,6 +167,42 @@ pub fn is_appliance() -> bool {
         return v == "1" || v.eq_ignore_ascii_case("true");
     }
     std::path::Path::new(APPLIANCE_MARKER).exists()
+}
+
+/// Unités du relais du port 80 que posent les images Tune OS
+/// (`systemd-socket-proxyd` vers 127.0.0.1:8888). Tant qu'elles existent, une
+/// connexion venue du LAN par le port 80 arrive au serveur DEPUIS 127.0.0.1.
+const UNITES_RELAIS_PORT_80: &[&str] = &[
+    "/etc/systemd/system/tune-web80.socket",
+    "/etc/systemd/system/tune-web80.service",
+];
+
+/// Le relais du port 80 est-il installé ? `TUNE_WEB80_RELAIS` (dev/test)
+/// l'emporte sur la présence des unités.
+pub fn relais_port_80_installe() -> bool {
+    if let Ok(v) = std::env::var("TUNE_WEB80_RELAIS") {
+        if v == "1" || v.eq_ignore_ascii_case("true") {
+            return true;
+        }
+        // Lever le mode strict par l'environnement : en développement et sous
+        // test seulement. Un binaire de production ne se fie qu'aux unités.
+        if cfg!(debug_assertions) {
+            return false;
+        }
+    }
+    UNITES_RELAIS_PORT_80
+        .iter()
+        .any(|p| std::path::Path::new(p).exists())
+}
+
+/// Une connexion vue de 127.0.0.1 vient-elle VRAIMENT de cette machine ?
+/// Non sur une appliance dont le relais du port 80 rouvre les connexions du
+/// réseau local depuis le bouclage : rien ne les distingue alors
+/// d'un appel local, et le bouclage ne vaut plus preuve. L'image corrigée
+/// (redirection nftables, qui conserve l'adresse source) retire les unités,
+/// et le bouclage redevient fiable sans autre changement.
+pub fn bouclage_fiable() -> bool {
+    !(is_appliance() && relais_port_80_installe())
 }
 
 fn require_appliance() -> Result<(), AppError> {
@@ -447,7 +491,7 @@ async fn wifi_scan(headers: HeaderMap) -> Result<Json<Value>, AppError> {
 }
 
 async fn wifi_connect(
-    _admin: crate::auth::RequireAdmin,
+    _garde: crate::auth::AdminOuCetteMachine,
     headers: HeaderMap,
     Json(body): Json<WifiConnect>,
 ) -> Result<Json<Value>, AppError> {
@@ -473,7 +517,7 @@ async fn wifi_connect(
 }
 
 async fn wifi_forget(
-    _admin: crate::auth::RequireAdmin,
+    _garde: crate::auth::AdminOuCetteMachine,
     headers: HeaderMap,
     Json(body): Json<WifiForget>,
 ) -> Result<Json<Value>, AppError> {
@@ -726,7 +770,12 @@ mod tests {
         unsafe { std::env::set_var("TUNE_SYSTEMCTL_BIN", "/faux/systemctl") };
         assert_eq!(systemctl_bin(), "/faux/systemctl");
         unsafe { std::env::remove_var("TUNE_SYSTEMCTL_BIN") };
-        assert_eq!(systemctl_bin(), "systemctl");
+        // Sans surcharge : un chemin ABSOLU, jamais un nom cherché dans le PATH.
+        let defaut = systemctl_bin();
+        assert!(
+            defaut == "/usr/bin/systemctl" || defaut == "/bin/systemctl",
+            "{defaut}"
+        );
     }
 
     // `la_route_d_extinction_est_montee` a ete RETIRE : il affirmait

@@ -1,10 +1,16 @@
 # Docker on Synology: writable model cache
 
-Tune's acoustic analysis downloads its model on first use. With the default
-settings, the image stores `clap-audio-music-2023.onnx` in
-`/app/embedding_models`. Text search models and the ONNX runtime also use this
-cache. `/data` contains the database and other persistent application data;
-mounting `/data` alone does not make `/app/embedding_models` writable.
+Tune's acoustic analysis downloads its model on first use. Since 1.0.0-rc12
+(#8675), the image stores `clap-audio-music-2023.onnx`, the text search models
+and the ONNX runtime in `/data/embedding_models`
+(`TUNE_EMBEDDING_MODELS_DIR`), next to the database: **mounting `/data` is
+enough, nothing below is needed any more.**
+
+The rest of this page describes the workaround for earlier images, where the
+cache was `/app/embedding_models`, which mounting `/data` alone did not make
+writable. An installation that already mounts `/app/embedding_models` keeps
+using that folder after the upgrade (the entrypoint detects the mount), so the
+model already downloaded there is not fetched again.
 
 Prepare a separate persistent folder before starting acoustic analysis. For
 example, in DSM File Station, create `docker/tune/embedding_models` on your data
@@ -50,6 +56,21 @@ instead of the default path above.
 This documents the dedicated-volume workaround reported in server issue
 [#7028](https://github.com/renesenses/tune-server-rust/issues/7028). A new DSM
 installation has not been reproduced as part of this documentation change.
+
+## Keep your data across image updates
+
+Tune keeps its database, settings and streaming-service logins in `/data`.
+In Container Manager, open the stopped container's **Edit › Volume settings ›
+Add folder**, choose a folder such as `/volume1/docker/tune/data`, and set the
+mount path to `/data` (read/write). Without it, Docker uses an anonymous
+volume, and **Image › Update** recreates the container with a new, empty one:
+library folders and streaming connections are gone (forum thread 2798,
+[#8747](https://github.com/renesenses/tune-server-rust/issues/8747)).
+
+Since 1.0.0-rc13 Tune warns about it: a banner in Settings, a
+`donnees_non_persistantes` line in the container log, and a `Data dir` line
+in the bug report. The previous anonymous volume is usually still on the NAS
+(`docker volume ls -f dangling=true` over SSH) until it is pruned.
 
 ## SMB share mounted on the NAS
 

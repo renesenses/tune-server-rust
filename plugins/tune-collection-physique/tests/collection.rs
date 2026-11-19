@@ -1926,3 +1926,297 @@ async fn une_reponse_d_avant_la_regle_assouplie_se_redemande_7981() {
         "les deux disques absents de la bibliothèque sont redemandés aux deux services"
     );
 }
+
+/// La bibliothèque de « plusieurs correspondants » (#7981) : deux éditions
+/// distinctes de « Giving My Love / Brazil », et TIDAL ne le trouve plus.
+fn hote_plusieurs_candidats() -> HoteEssai {
+    let mut h = HoteEssai::new();
+    h.recherches.clear();
+    h.albums.lock().unwrap().extend([
+        AlbumLocal {
+            id: 10,
+            titre: "Giving My Love / Brazil - Remastered".into(),
+            artiste: Some("Janice McClain".into()),
+            ..Default::default()
+        },
+        AlbumLocal {
+            id: 11,
+            titre: "Giving My Love / Brazil Expanded Edition".into(),
+            artiste: Some("Janice McClain".into()),
+            ..Default::default()
+        },
+    ]);
+    h
+}
+
+/// #8672 : un disque « plusieurs correspondants » s'associe à la main à l'un
+/// des candidats ; le lien prime, survit aux synchronisations, au
+/// redémarrage et à « Effacer le cache », et se défait (« Dissocier »).
+#[tokio::test]
+async fn un_disque_nulle_part_s_associe_a_la_main_8672() {
+    let b = banc_avec(hote_plusieurs_candidats());
+    suivre(&b, "exemple").await;
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    let gm = disque(&c, "Giving My Love / Brazil");
+    assert_eq!(gm["raison"], "plusieurs_candidats", "{gm}");
+    let release = gm["release_id"].as_u64().unwrap();
+
+    // « Associer à un album » : les candidats, et la recherche préremplie
+    // (premier artiste + titre) qui les trouve aussi.
+    let (code, r) = appel(&b.app, "GET", &format!("/disques/{release}/albums"), None).await;
+    assert_eq!(code, StatusCode::OK, "{r}");
+    let ids = |v: &Value| -> Vec<i64> {
+        v.as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["album_id"].as_i64().unwrap())
+            .collect()
+    };
+    assert_eq!(ids(&r["candidats"]), vec![10, 11], "{r}");
+    assert_eq!(
+        r["requete"], "Janice McClain Giving My Love / Brazil",
+        "{r}"
+    );
+    assert_eq!(r["proposee"], r["requete"]);
+    // Par artiste puis titre normalisés : « … Expanded Edition » avant
+    // « … - Remastered ».
+    assert_eq!(ids(&r["albums"]), vec![11, 10], "{r}");
+    assert_eq!(r["association"], Value::Null);
+    // Une autre recherche, sans accents ni casse.
+    let (_, r) = appel(
+        &b.app,
+        "GET",
+        &format!("/disques/{release}/albums?q=SILENT"),
+        None,
+    )
+    .await;
+    assert_eq!(ids(&r["albums"]), vec![3], "{r}");
+    assert_eq!(ids(&r["candidats"]), vec![10, 11], "les candidats restent");
+
+    // Les refus.
+    let (code, r) = appel(
+        &b.app,
+        "PUT",
+        &format!("/disques/{release}/association"),
+        Some(json!({"album_id": 999})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{r}");
+    assert_eq!(r["error"], "collection_physique.album_inconnu");
+    let (code, r) = appel(
+        &b.app,
+        "PUT",
+        "/disques/1/association",
+        Some(json!({"album_id": 11})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::NOT_FOUND, "{r}");
+    assert_eq!(r["error"], "collection_physique.disque_inconnu");
+    let (code, _) = appel(
+        &b.app,
+        "PUT",
+        &format!("/disques/{release}/association"),
+        Some(json!({"album": 11})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // Associer : « dans la bibliothèque », par la main.
+    let (code, r) = appel(
+        &b.app,
+        "PUT",
+        &format!("/disques/{release}/association"),
+        Some(json!({"album_id": 11})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{r}");
+    assert_eq!(r["disque"]["etat"], "bibliotheque", "{r}");
+    assert_eq!(r["disque"]["bibliotheque"]["album_id"], 11, "{r}");
+    assert_eq!(r["disque"]["bibliotheque"]["par"], "manuel", "{r}");
+    assert_eq!(r["disque"]["raison"], Value::Null);
+    assert_eq!(r["disque"]["candidats_locaux"], Value::Null);
+
+    let associe = |c: &Value| {
+        let gm = disque(c, "Giving My Love / Brazil");
+        assert_eq!(gm["etat"], "bibliotheque", "{gm}");
+        assert_eq!(gm["bibliotheque"]["album_id"], 11, "{gm}");
+        assert_eq!(gm["bibliotheque"]["par"], "manuel", "{gm}");
+    };
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    associe(&c);
+    assert_eq!(
+        c["compteurs"]["par_raison"]["plusieurs_candidats"], 0,
+        "{c}"
+    );
+    assert_eq!(c["compteurs"]["par_etat"]["bibliotheque"], 4, "{c}");
+
+    // Une synchronisation Discogs ne le défait pas.
+    b.moteur.synchroniser_maintenant("exemple").await.unwrap();
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    associe(&c);
+
+    // Ni un redémarrage (un nouveau moteur, la même base).
+    let moteur = Arc::new(Moteur::new(
+        b.hote.clone(),
+        b._dossier.path().to_path_buf(),
+        Cadence::immediate(),
+    ));
+    let app = router(b.backend.clone(), moteur.clone());
+    let (_, c) = appel(&app, "GET", "/collection", None).await;
+    associe(&c);
+
+    // Ni « Effacer le cache » suivi d'une synchronisation complète.
+    let (code, _) = appel(&app, "DELETE", "/cache", None).await;
+    assert_eq!(code, StatusCode::OK);
+    moteur.synchroniser_maintenant("exemple").await.unwrap();
+    let (_, c) = appel(&app, "GET", "/collection", None).await;
+    associe(&c);
+    let (_, r) = appel(&app, "GET", &format!("/disques/{release}/albums"), None).await;
+    assert_eq!(r["association"], 11, "{r}");
+
+    // « Dissocier » : retour au rapprochement automatique.
+    let (code, r) = appel(
+        &app,
+        "DELETE",
+        &format!("/disques/{release}/association"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{r}");
+    assert_eq!(r["disque"]["etat"], "nulle_part", "{r}");
+    assert_eq!(r["disque"]["raison"], "plusieurs_candidats", "{r}");
+    assert_eq!(r["disque"]["candidats_locaux"], 2, "{r}");
+    let (_, c) = appel(&app, "GET", "/collection", None).await;
+    assert_eq!(
+        disque(&c, "Giving My Love / Brazil")["etat"],
+        "nulle_part",
+        "{c}"
+    );
+}
+
+/// #8672 : l'association manuelle PRIME sur le rapprochement automatique,
+/// et un album qui quitte la bibliothèque rend le disque au rapprochement
+/// automatique sans perdre le lien.
+#[tokio::test]
+async fn l_association_manuelle_prime_sur_le_rapprochement_8672() {
+    let b = banc_avec(HoteEssai::new());
+    suivre(&b, "exemple").await;
+    synchro_complete(&b, "exemple").await;
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    let rick = disque(&c, "Never Gonna Give You Up");
+    assert_eq!(rick["bibliotheque"]["par"], "musicbrainz_album", "{rick}");
+    let release = rick["release_id"].as_u64().unwrap();
+
+    // Déjà rapproché de l'album 1 : changer d'album se demande (#8678).
+    let (code, r) = appel(
+        &b.app,
+        "PUT",
+        &format!("/disques/{release}/association"),
+        Some(json!({"album_id": 3, "remplacer": true})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{r}");
+    assert_eq!(r["disque"]["bibliotheque"]["album_id"], 3, "{r}");
+    assert_eq!(r["disque"]["bibliotheque"]["par"], "manuel", "{r}");
+
+    // L'album 3 quitte la bibliothèque : le rapprochement automatique
+    // reprend (album 1), le lien reste rangé.
+    b.hote.albums.lock().unwrap().retain(|a| a.id != 3);
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    let rick = disque(&c, "Never Gonna Give You Up");
+    assert_eq!(rick["bibliotheque"]["album_id"], 1, "{rick}");
+    assert_eq!(rick["bibliotheque"]["par"], "musicbrainz_album", "{rick}");
+    // Il revient : le lien compte de nouveau.
+    b.hote
+        .albums
+        .lock()
+        .unwrap()
+        .extend(bibliotheque().into_iter().filter(|a| a.id == 3));
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    let rick = disque(&c, "Never Gonna Give You Up");
+    assert_eq!(rick["bibliotheque"]["album_id"], 3, "{rick}");
+}
+
+/// #8678 : `PUT /disques/{release}/association` ne remplace plus en silence.
+/// Un disque déjà rattaché à un AUTRE album — par le rapprochement
+/// automatique ou par une association dont l'album est encore là — répond
+/// 409 `deja_associe` ; le même album reste accepté (200) ; changer d'album
+/// demande `remplacer: true`, ou « Dissocier » d'abord.
+#[tokio::test]
+async fn un_disque_deja_associe_refuse_un_autre_album_8678() {
+    let b = banc_avec(HoteEssai::new());
+    suivre(&b, "exemple").await;
+    synchro_complete(&b, "exemple").await;
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    let rick = disque(&c, "Never Gonna Give You Up");
+    assert_eq!(rick["bibliotheque"]["album_id"], 1, "{rick}");
+    let release = rick["release_id"].as_u64().unwrap();
+    let chemin = format!("/disques/{release}/association");
+
+    // Rapproché automatiquement de l'album 1 : un autre album est refusé.
+    let (code, r) = appel(&b.app, "PUT", &chemin, Some(json!({"album_id": 3}))).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{r}");
+    assert_eq!(r["error"], "collection_physique.deja_associe", "{r}");
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    let rick = disque(&c, "Never Gonna Give You Up");
+    assert_eq!(rick["bibliotheque"]["album_id"], 1, "rien d'écrit : {rick}");
+    assert_eq!(rick["bibliotheque"]["par"], "musicbrainz_album", "{rick}");
+
+    // Le même album : accepté.
+    let (code, r) = appel(&b.app, "PUT", &chemin, Some(json!({"album_id": 1}))).await;
+    assert_eq!(code, StatusCode::OK, "{r}");
+    assert_eq!(r["disque"]["bibliotheque"]["album_id"], 1, "{r}");
+    assert_eq!(r["disque"]["bibliotheque"]["par"], "manuel", "{r}");
+
+    // Associé à la main à l'album 1 : un autre album est refusé…
+    let (code, r) = appel(&b.app, "PUT", &chemin, Some(json!({"album_id": 3}))).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{r}");
+    assert_eq!(r["error"], "collection_physique.deja_associe", "{r}");
+    // … `remplacer: false` aussi…
+    let (code, _) = appel(
+        &b.app,
+        "PUT",
+        &chemin,
+        Some(json!({"album_id": 3, "remplacer": false})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    // … sauf `remplacer: true`.
+    let (code, r) = appel(
+        &b.app,
+        "PUT",
+        &chemin,
+        Some(json!({"album_id": 3, "remplacer": true})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{r}");
+    assert_eq!(r["disque"]["bibliotheque"]["album_id"], 3, "{r}");
+    assert_eq!(r["disque"]["bibliotheque"]["par"], "manuel", "{r}");
+    // Le même album de nouveau : accepté.
+    let (code, _) = appel(&b.app, "PUT", &chemin, Some(json!({"album_id": 3}))).await;
+    assert_eq!(code, StatusCode::OK);
+
+    // L'album 3 quitte la bibliothèque : le lien ne compte plus, mais le
+    // rapprochement automatique (album 1) refuse toujours un autre album.
+    b.hote.albums.lock().unwrap().retain(|a| a.id != 3);
+    let (code, r) = appel(&b.app, "PUT", &chemin, Some(json!({"album_id": 2}))).await;
+    assert_eq!(code, StatusCode::CONFLICT, "{r}");
+    assert_eq!(r["error"], "collection_physique.deja_associe", "{r}");
+
+    // « Dissocier » puis associer : le rapprochement automatique refuse
+    // encore un autre album, `remplacer: true` passe.
+    let (code, _) = appel(&b.app, "DELETE", &chemin, None).await;
+    assert_eq!(code, StatusCode::OK);
+    let (code, _) = appel(&b.app, "PUT", &chemin, Some(json!({"album_id": 2}))).await;
+    assert_eq!(code, StatusCode::CONFLICT);
+    let (code, r) = appel(
+        &b.app,
+        "PUT",
+        &chemin,
+        Some(json!({"album_id": 2, "remplacer": true})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{r}");
+    assert_eq!(r["disque"]["bibliotheque"]["album_id"], 2, "{r}");
+}

@@ -65,7 +65,12 @@ async fn circle_est_propose_s_installe_repond_et_se_desinstalle() {
         !routeurs.iter().any(|(n, _)| n == "circle"),
         "opt-in : rien ne tourne avant l'installation"
     );
-    let app = tune_server::routes::router_with_plugins(etat.clone(), routeurs);
+    let app = tune_server::routes::router_with_plugins(etat.clone(), routeurs).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let fiche = fiche_circle(&app)
         .await
         .expect("« circle » doit être PROPOSÉ par le gestionnaire (catalogue, #5018)");
@@ -104,7 +109,12 @@ async fn circle_est_propose_s_installe_repond_et_se_desinstalle() {
         "installé : le greffon doit monter son routeur (montés : {:?})",
         routeurs.iter().map(|(n, _)| n).collect::<Vec<_>>()
     );
-    let app = tune_server::routes::router_with_plugins(etat.clone(), routeurs);
+    let app = tune_server::routes::router_with_plugins(etat.clone(), routeurs).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let fiche = fiche_circle(&app)
         .await
         .expect("un greffon qui tourne est listé");
@@ -129,7 +139,12 @@ async fn circle_est_propose_s_installe_repond_et_se_desinstalle() {
     let etat = demarrer(&base);
     let routeurs = tune_server::plugins::init(&etat, "http://127.0.0.1:0", vec![]).await;
     assert!(!routeurs.iter().any(|(n, _)| n == "circle"), "désinstallé");
-    let app = tune_server::routes::router_with_plugins(etat.clone(), routeurs);
+    let app = tune_server::routes::router_with_plugins(etat.clone(), routeurs).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let fiche = fiche_circle(&app).await.expect("toujours proposé");
     assert_eq!(fiche["installed"], false, "{fiche}");
     // Sans barre finale : l'hôte redirige `…/` (308) vers la forme sans barre.

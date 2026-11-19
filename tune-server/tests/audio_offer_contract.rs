@@ -98,7 +98,12 @@ async fn audio_offer_free_eq_and_premium_four_survive_real_startup() {
             tune_plugin_native::provider("equalizer").is_none(),
             "fixture must prove bundled EQ with no package"
         );
-        let app = tune_server::routes::router_with_plugins(state.clone(), routers);
+        let app = tune_server::routes::router_with_plugins(state.clone(), routers).layer(
+            axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                50000,
+            ))),
+        );
         let eq =
             json!({"enabled":true,"bands":[{"freq":1000.0,"gain":3.0,"q":1.41,"type":"peak"}]});
         let (status, response) = request(
@@ -176,6 +181,10 @@ async fn audio_offer_free_eq_and_premium_four_survive_real_startup() {
         wav.extend((data.len() as u32).to_le_bytes());
         wav.extend(data);
         std::fs::write(&input, wav).unwrap();
+        // La source est lue : elle doit être dans un dossier de musique.
+        settings
+            .set("music_dirs", &json!([dir.path()]).to_string())
+            .unwrap();
         for tool in ["converter", "declick"] {
             let (status, response) = request(&app, "POST", &format!("/api/v1/{tool}/start"), json!({"sources":[{"path":input}],"format":"wav","options":{"output_format":"wav"}})).await;
             assert_eq!(

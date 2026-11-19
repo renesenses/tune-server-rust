@@ -234,12 +234,21 @@ async fn les_groupes_d_avant_sont_recalcules_au_demarrage() {
     let cuisine = repo
         .create("Cuisine", Some("dlna"), Some("dlna:uuid-1"))
         .unwrap();
+    let chambre = repo
+        .create("Chambre", Some("dlna"), Some("dlna:uuid-2"))
+        .unwrap();
+    let garage = repo
+        .create("Garage", Some("dlna"), Some("dlna:uuid-3"))
+        .unwrap();
     let settings = SettingsRepo::with_backend(state.backend.clone());
+    // #8680 — deux groupes qui ne se chevauchent pas : le démarrage remet
+    // désormais une zone dans un seul groupe (le plus récent), ce que
+    // `groupes_chevauchants_8680_tests` couvre.
     let anciens = serde_json::json!([
         { "id": 1, "group_id": "1", "name": "Maison", "leader_id": salon,
           "zone_ids": [salon, bureau, cuisine, atelier] },
-        { "id": 2, "group_id": "2", "name": "Réseau", "leader_id": cuisine,
-          "zone_ids": [cuisine, salon] },
+        { "id": 2, "group_id": "2", "name": "Réseau", "leader_id": chambre,
+          "zone_ids": [chambre, garage] },
     ]);
     settings.set("zone_groups", &anciens.to_string()).unwrap();
 
@@ -251,7 +260,7 @@ async fn les_groupes_d_avant_sont_recalcules_au_demarrage() {
         vec!["DAC B".to_string(), "DAC C".to_string()],
         "le meneur local doit recevoir ses deux suiveuses"
     );
-    assert_eq!(settings.get(&cle(cuisine)).unwrap(), None);
+    assert_eq!(settings.get(&cle(chambre)).unwrap(), None);
     let groupes: Vec<serde_json::Value> =
         serde_json::from_str(&settings.get("zone_groups").unwrap().unwrap()).unwrap();
     assert_eq!(

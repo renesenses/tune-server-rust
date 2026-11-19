@@ -5,12 +5,17 @@ mod bio_liens;
 /// #4806 — le drapeau `banned` des listes de pistes, partagé avec les
 /// playlists et la recherche fédérée qui vivent hors de ce module.
 pub(crate) use albums::attacher_banni;
+/// « # écoutes » et « Dernière écoute » des lignes d'une playlist, sur la
+/// même règle que les autres listes de pistes.
+pub(crate) use albums::attacher_ecoutes;
 mod albums_detailed;
+// #8668 — le pays de chaque album, pour la carte des pays.
 mod ambiances;
 mod artists;
 mod artwork;
 mod better_quality;
 mod browse;
+mod pays_des_albums;
 // `pub(crate)` : `/tags/{id}/collections` (routes/tags.rs) rend les dossiers d'une
 // étiquette dans la forme SERVIE de `/library/collections` — même fonction,
 // mêmes `album_count` et `orphan_album_ids` (#4798).
@@ -23,6 +28,8 @@ pub(crate) mod credits;
 pub(crate) mod credits_mb;
 /// #8325 — la relecture unique des balises classiques des fichiers importés.
 pub(crate) mod relecture_classique;
+/// rc12 — le renvoi unique des images d'artistes perdues par le site.
+pub(crate) mod renvoi_images_artistes;
 // #4805 — les crédits d'un album lus juste après son identification.
 mod credits_apres_identification;
 mod duplicates;
@@ -79,6 +86,15 @@ mod reports;
 pub(crate) mod requete_avancee;
 // tune-web-client#1875 — ouvrir le dossier d'un album dans le gestionnaire de
 // fichiers de CETTE machine.
+/// Go du 13/11 — forme d'onde et spectrogramme d'une piste Qobuz ou TIDAL :
+/// téléchargée pour le calcul, puis effacée.
+mod audio_de_service;
+/// Fil du forum 2793 — la forme d'onde d'une piste (crêtes, RMS, écrêtage),
+/// en JSON, calculée à la demande pour sa fiche technique.
+mod forme_onde;
+/// Go du 17/11 (rc13) — l'enveloppe de la barre de progression d'une piste
+/// Qobuz ou TIDAL en lecture, par le téléchargement de `audio_de_service`.
+mod onde_de_service;
 pub(crate) mod reveler;
 mod search;
 /// #7857 — le spectrogramme d'une piste, en PNG, généré à la demande.
@@ -410,6 +426,9 @@ pub fn router() -> Router<AppState> {
             post(edition_par_filtre::annuler_fichiers),
         )
         .route("/albums-detailed", get(albums_detailed::albums_detailed))
+        // #8668 — le pays de chaque album (artiste ou édition), que la carte
+        // des pays croise avec les albums que la grille garde.
+        .route("/album-countries", get(pays_des_albums::pays_des_albums))
         .route("/folder-facet", get(folder_facet::folder_facet))
         .route("/albums/recent", get(albums::recent_albums))
         .route("/albums/grouped", get(albums::albums_grouped))
@@ -547,6 +566,12 @@ pub fn router() -> Router<AppState> {
         // la demande (lecture seule, plafonnée, sans image).
         .route("/tracks/{id}/file-tags", get(tracks::track_file_tags))
         .route("/tracks/{id}/waveform", get(tracks::track_waveform))
+        // Go du 17/11 (rc13) — la même enveloppe pour la piste Qobuz ou
+        // TIDAL en lecture, qui n'a pas d'identifiant de bibliothèque.
+        .route(
+            "/service-tracks/{service}/{id_service}/waveform",
+            get(onde_de_service::waveform),
+        )
         .route("/tracks/{id}/spectrogramme.png", get(spectrogramme::png))
         // #8160 — la fiche technique d'une piste (lecture seule), et le
         // recalcul de son spectrogramme conservé.
@@ -555,6 +580,8 @@ pub fn router() -> Router<AppState> {
             "/tracks/{id}/spectrogramme",
             post(spectrogramme::recalculer),
         )
+        // Fil 2793 — la forme d'onde de la fiche technique.
+        .route("/tracks/{id}/forme-onde", get(forme_onde::json))
         .route("/tracks/{id}/similar", get(tracks::track_similar))
         .route("/tracks/{id}/versions", get(tracks::track_versions))
         // #2264 — les mêmes candidats, regroupés par enregistrement, avec la

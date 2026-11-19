@@ -933,6 +933,11 @@ pub struct LocalOutput {
     /// verdict est tranché en un point unique,
     /// [`crate::audio::soft_mute::armed_ms`].
     soft_mute_ms: Arc<AtomicU32>,
+    /// #8696 — la période WASAPI exclusive réglée sur la zone, en ms ; `0` =
+    /// Auto (variable d'environnement, sinon période du pilote). Posée par
+    /// l'orchestrateur à chaque lecture, lue UNE fois par piste par
+    /// `play_url`. Sans effet hors du bras WASAPI exclusif.
+    periode_wasapi_ms: Arc<AtomicU32>,
     /// True while the PCM currently flowing through this output is a **DoP**
     /// (DSD over PCM) payload, as detected on the bytes themselves by
     /// [`is_dop_pcm`].
@@ -1509,6 +1514,7 @@ impl LocalOutput {
             // zone : une sortie construite hors chemin de lecture se comporte
             // exactement comme avant #1590.
             soft_mute_ms: Arc::new(AtomicU32::new(0)),
+            periode_wasapi_ms: Arc::new(AtomicU32::new(0)),
             crossfeed: Arc::new(std::sync::Mutex::new(None)),
             diagnostic_surechantillonnage: Arc::default(),
             surechantillonnage: Arc::new(std::sync::Mutex::new(None)),
@@ -2290,6 +2296,19 @@ impl LocalOutput {
     /// Le repli mono est-il armé sur cette sortie ?
     pub fn has_mono_downmix(&self) -> bool {
         self.mono_downmix.load(Ordering::Relaxed)
+    }
+
+    /// #8696 — poser la période WASAPI exclusive réglée sur la zone (`None`
+    /// = Auto). Prise en compte à la prochaine ouverture du périphérique.
+    pub fn set_periode_wasapi_ms(&self, ms: Option<u32>) {
+        self.periode_wasapi_ms
+            .store(ms.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    /// #8696 — la période WASAPI exclusive posée par l'orchestrateur (`0` =
+    /// Auto).
+    pub fn periode_wasapi_ms(&self) -> u32 {
+        self.periode_wasapi_ms.load(Ordering::Relaxed)
     }
 
     /// Régler la durée de la rampe anti-« ploc » de la zone qui joue sur cette
@@ -6740,6 +6759,10 @@ impl OutputTarget for LocalOutput {
         // #6171 — lus UNE fois par piste ; seul le bras ASIO s'en sert.
         #[cfg(all(target_os = "windows", feature = "asio"))]
         let canaux_de_carte = self.canaux_de_carte();
+        // #8696 — lue UNE fois par piste ; seul le bras WASAPI exclusif s'en
+        // sert.
+        #[cfg(target_os = "windows")]
+        let reglage_periode_wasapi_ms = self.periode_wasapi_ms();
         let crossfeed = self.crossfeed.clone();
         let surechantillonnage = self.surechantillonnage.clone();
         let diagnostic_surechantillonnage = self.diagnostic_surechantillonnage.clone();
@@ -7919,6 +7942,7 @@ impl OutputTarget for LocalOutput {
                     track_artist: artist_ref,
                     duration_ms: duration_ms_arc,
                     seek_offset_ms: seek_offset_arc,
+                    reglage_periode_ms: reglage_periode_wasapi_ms,
                 });
                 return;
             }

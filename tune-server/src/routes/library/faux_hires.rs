@@ -34,8 +34,11 @@ use axum::Json;
 use axum::extract::{Path, State};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tune_core::audio::faux_hires::raison_publiee;
 use tune_core::audio::faux_hires_passe::{activer, compter_les_candidats, est_active};
-use tune_core::audio::faux_hires_publie::{douteux_visible, montrer_douteux, publier_l_album};
+use tune_core::audio::faux_hires_publie::{
+    douteux_visible, montrer_douteux, pistes_douteuses_publiees, publier_l_album,
+};
 use tune_core::db::backend::ToSqlValue;
 use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 
@@ -57,9 +60,11 @@ pub(super) async fn verdict_album(
         .backend
         .query_many(
             &format!(
-                "SELECT h.track_id, h.verdict, h.raison, h.coupure_hz, h.bits_effectifs, \
+                "SELECT h.track_id, {}, h.raison, h.coupure_hz, h.bits_effectifs, \
                  h.sample_rate, h.bits_declares FROM hires_verifications h \
                  JOIN tracks t ON t.id = h.track_id WHERE t.album_id = {} ORDER BY h.track_id",
+                // #9067 — le verdict EFFECTIF : un CD rangé « douteux » avant #9067 se lit « conforme ».
+                tune_core::audio::faux_hires::verdict_effectif_sql("h"),
                 ph(state.backend.engine(), 1)
             ),
             &[&id as &dyn ToSqlValue],
@@ -67,12 +72,22 @@ pub(super) async fn verdict_album(
         .map_err(AppError::internal)?;
     let visible = douteux_visible(&state.backend);
     let mut verdicts = Vec::with_capacity(rows.len());
+    let mut coupures: Vec<(Option<String>, f64)> = Vec::new();
     let pistes: Vec<Value> = rows
         .iter()
         .map(|r| {
             let verdict = r.get(1).and_then(|v| v.as_string()).unwrap_or_default();
-            let raison = r.get(2).and_then(|v| v.as_string());
+            // #9035 — l'ancien `coupure_de_codec` se publie `coupure_spectrale`.
+            let raison = r
+                .get(2)
+                .and_then(|v| v.as_string())
+                .map(|c| raison_publiee(&c).to_string())
+                // #9067 — un CD lu « conforme » n'a pas de raison de doute.
+                .filter(|_| verdict != "conforme");
             verdicts.push((verdict.clone(), raison.clone()));
+            if let (true, Some(f)) = (verdict == "douteux", r.get(3).and_then(|v| v.as_f64())) {
+                coupures.push((raison.clone(), f));
+            }
             // #6285 — une piste douteuse masquée se dit non analysée.
             let (verdict, raison) = if verdict == "douteux" && !visible {
                 ("non_analyse".to_string(), None)
@@ -91,10 +106,38 @@ pub(super) async fn verdict_album(
         })
         .collect();
     let (verdict, raison) = publier_l_album(&verdicts, visible);
+    // #9035 — ce que le badge de l'album dit en plus : combien de pistes
+    // sont douteuses sur combien de mesurées (l'album n'est douteux qu'à
+    // partir de la moitié), leur raison la plus fréquente, et la coupure
+    // (médiane des pistes douteuses qui portent cette raison). `null` sans
+    // piste douteuse, ou tant que « douteux » est masqué.
+    let en_cause = pistes_douteuses_publiees(&verdicts, visible);
+    let raison_pistes = en_cause.as_ref().and_then(|c| c.2.clone());
+    // La coupure ne se dit que pour une raison de coupure (pas pour des bits
+    // de remplissage).
+    let de_coupure = |r: &&String| {
+        matches!(
+            r.as_str(),
+            "bande_de_cd" | "coupure_spectrale" | "signature_de_codec"
+        )
+    };
+    let coupure_hz = raison_pistes.as_ref().filter(de_coupure).and_then(|r| {
+        let mut f: Vec<f64> = coupures
+            .iter()
+            .filter(|(rp, _)| rp.as_ref() == Some(r))
+            .map(|(_, f)| *f)
+            .collect();
+        f.sort_by(|a, b| a.total_cmp(b));
+        f.get(f.len() / 2).copied()
+    });
     Ok(Json(json!({
         "album_id": id,
         "verdict": verdict,
         "raison": raison,
+        "pistes_douteuses": en_cause.as_ref().map(|c| c.0),
+        "pistes_mesurees": en_cause.as_ref().map(|c| c.1),
+        "raison_pistes": raison_pistes,
+        "coupure_hz": coupure_hz,
         "pistes": pistes,
     })))
 }
@@ -112,6 +155,10 @@ pub(super) async fn etat(State(state): State<AppState>) -> Json<Value> {
         "douteux_visible": douteux_visible(&state.backend),
         "restantes": compter_les_candidats(&state.backend),
         "rangees": rangees,
+        // rc12 — `GET /export/catalogue.html` accepte `hires_verdict=` : le
+        // client web n'active l'export d'un filtre « Hi-Res vérifié /
+        // douteux » que devant un serveur qui le dit.
+        "catalogue_hires_verdict": true,
     }))
 }
 

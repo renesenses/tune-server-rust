@@ -192,3 +192,24 @@ fn une_presentation_d_album_ne_lie_ni_l_album_ni_son_artiste_8129() {
 fn sans_texte_rien_8129() {
     assert!(bio_qobuz_segmentee("<p> </p>", &index(), &page_miles()).is_none());
 }
+
+#[test]
+fn biographie_entites_sans_point_virgule_8698() {
+    let (texte, segments) = bio_qobuz_segmentee(
+        "<p>Duffy &amp soul. &copy Matt Collar /TiVo</p>",
+        &index(),
+        &page_miles(),
+    )
+    .unwrap();
+    assert_eq!(
+        texte, "Duffy & soul. © Matt Collar /TiVo",
+        "la biographie Qobuz doit décoder le crédit sans point-virgule"
+    );
+    assert_eq!(
+        segments
+            .iter()
+            .map(|s| s.texte.as_str())
+            .collect::<String>(),
+        texte
+    );
+}

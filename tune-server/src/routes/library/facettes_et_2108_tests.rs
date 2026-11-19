@@ -85,7 +85,13 @@ fn une_facette_monovaluee_ignore_le_et() {
     let q = depuis("year=1971&year=1972&all_of=year&all_of=inconnue");
     assert!(q.sel.en_et.is_empty(), "{:?}", q.sel.en_et);
     let (conds, _) = build_facet_conditions(&q, Engine::Postgres, "", None);
-    assert_eq!(conds, vec!["t.year IN ($1, $2)"]);
+    assert_eq!(
+        conds,
+        vec![format!(
+            "{} IN ($1, $2)",
+            tune_core::db::annee_de_la_piste::ANNEE_DE_LA_PISTE
+        )]
+    );
 }
 
 /// De bout en bout, sur une vraie base : la liste ET le rail.

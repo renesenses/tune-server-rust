@@ -148,7 +148,10 @@ COPY --from=web /web/dist/ /app/web/
 RUN chown -R root:root /app && chmod -R 755 /app
 
 # Create data + artwork_cache directories owned by tune
-RUN mkdir -p /data/artwork_cache && chown -R tune:tune /data
+# #8675 — the acoustic-analysis models (audio, text, onnxruntime) go under
+# /data too: the server runs as `tune` in a root-owned /app, where the former
+# relative default (/app/embedding_models) could never be created.
+RUN mkdir -p /data/artwork_cache /data/embedding_models && chown -R tune:tune /data
 
 # Plugins the user installs live under /data (owned by `tune`, kept across
 # image upgrades). The ones shipped in /app/plugins stay read-only: uninstalling
@@ -157,6 +160,7 @@ ENV TUNE_PORT=8888 \
     TUNE_DB_PATH=/data/tune.db \
     TUNE_LIBRESPOT=/usr/local/bin/librespot \
     TUNE_ARTWORK_DIR=/data/artwork_cache \
+    TUNE_EMBEDDING_MODELS_DIR=/data/embedding_models \
     TUNE_PLUGINS_USER_DIR=/data/plugins \
     TUNE_WEB_DIR=/app/web \
     TUNE_MUSIC_DIRS='["/music"]' \

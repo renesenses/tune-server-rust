@@ -4,6 +4,7 @@ pub mod gapless;
 pub mod melange;
 pub mod queue;
 pub mod radio_artiste;
+pub mod radio_fin_de_file;
 // `crossfade` a été retiré ici (#2211), pour la même raison que
 // `radio_handler` juste en dessous : un module complet, **sans un seul
 // appelant** dans tout le dépôt depuis sa création.
@@ -179,6 +180,16 @@ pub struct VersionJouee {
 }
 
 impl NowPlaying {
+    /// #8689 — la piste dont le ReplayGain s'applique : bibliothèque, ou
+    /// titre Qobuz / TIDAL par son identifiant de service.
+    pub fn piste_rg(&self) -> crate::audio::replaygain::PisteRg<'_> {
+        crate::audio::replaygain::PisteRg::new(
+            self.track_id,
+            Some(self.source.as_str()),
+            self.source_id.as_deref(),
+        )
+    }
+
     /// Canonical mapping from a library [`Track`](crate::db::models::Track) row
     /// to a local `NowPlaying`.
     ///
@@ -194,6 +205,17 @@ impl NowPlaying {
     /// that need URL-resolved cover art or a zone-derived source override those
     /// fields on the returned value. `stream_id` is always `None` (local rows are
     /// not streamed sessions).
+    /// Variante utilisée par le démarrage et l'avance de la bibliothèque :
+    /// l'année de l'album ne sert qu'à cette copie pour l'affichage.
+    pub fn from_track_avec_album(
+        track: &crate::db::models::Track,
+        db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    ) -> Self {
+        let mut lecture = Self::from_track(track);
+        lecture.year = crate::db::annee_de_la_piste::pour_affichage(track, db);
+        lecture
+    }
+
     pub fn from_track(track: &crate::db::models::Track) -> Self {
         Self {
             track_id: track.id,
@@ -2184,6 +2206,8 @@ impl PlaybackManager {
             state.shuffle_order.clear();
             state.shuffle_index = -1;
         }
+        // #8968 — le mode ReplayGain Auto donne le gain de piste en aléatoire.
+        crate::audio::replaygain::auto::noter_aleatoire(zone_id, enabled);
         if !enabled {
             self.oublier_l_ordre_d_origine(zone_id);
         }
@@ -2208,6 +2232,9 @@ impl PlaybackManager {
                 })
                 .repeat = mode;
         }
+        // #8968 — la suivante de la dernière ligne n'est la première que si
+        // toute la file se répète (mode ReplayGain Auto).
+        crate::audio::replaygain::auto::noter_boucle(zone_id, mode == RepeatMode::All);
         self.emit(PlaybackEvent {
             event: "repeat".into(),
             zone_id,
@@ -2478,6 +2505,21 @@ impl PlaybackManager {
         // file EST l'ordre joué. Le tirage refait à chaque changement de
         // longueur rebattait les titres déjà joués et envoyait un « Lire
         // ensuite » n'importe où.
+    }
+
+    /// Applique une permutation de file au curseur sans modifier le transport.
+    pub async fn reordonner_curseur_de_file(&self, zone_id: i64, avant: &[i64], apres: &[i64]) {
+        let mut zones = self.zones.lock().await;
+        if let Some(state) = zones.get_mut(&zone_id) {
+            if let Some(id) = usize::try_from(state.queue_position)
+                .ok()
+                .and_then(|i| avant.get(i))
+                && let Some(position) = apres.iter().position(|nouveau| nouveau == id)
+            {
+                state.queue_position = position as i64;
+            }
+            state.queue_length = apres.len() as i64;
+        }
     }
 
     /// #6526 — l'ordre d'origine retenu pour la zone (vide = rien à rétablir).

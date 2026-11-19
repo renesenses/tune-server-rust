@@ -2529,6 +2529,40 @@ impl TrackRepo {
         Ok(self.db.execute(&sql, &params)? as u64)
     }
 
+    /// #9014 — pose les BORNES d'une tranche CUE déjà en base, et seulement
+    /// si elles changent. Rend le nombre de lignes modifiées (0 ou 1).
+    ///
+    /// [`Self::update`] n'écrit pas les colonnes `cue_*`. Or la fin d'une
+    /// tranche dépend de la piste SUIVANTE : quand le début de celle-ci bouge
+    /// (feuille retouchée, ou parseur corrigé comme pour l'`INDEX 02`), la
+    /// ligne gardait l'ancienne fin et jouait le début de la piste d'après.
+    /// Et une tranche recalée (voir `cue_bibliotheque::tranche_deplacee`)
+    /// doit recevoir son nouveau début.
+    ///
+    /// Conditionnelle (`IS NOT` / `IS DISTINCT FROM`) : un rescan sans
+    /// changement ne touche aucune ligne, donc ne relance pas le déclencheur
+    /// plein texte `tracks_fts_update` sous SQLite.
+    pub fn poser_bornes_de_tranche(
+        &self,
+        id: i64,
+        debut_ms: i64,
+        fin_ms: Option<i64>,
+    ) -> Result<usize, TuneError> {
+        let sql = match self.db.engine() {
+            Engine::Postgres => {
+                "UPDATE tracks SET cue_start_ms = $1, cue_end_ms = $2 \
+                 WHERE id = $3 AND (cue_start_ms IS DISTINCT FROM $1 \
+                 OR cue_end_ms IS DISTINCT FROM $2)"
+            }
+            Engine::Sqlite => {
+                "UPDATE tracks SET cue_start_ms = ?1, cue_end_ms = ?2 \
+                 WHERE id = ?3 AND (cue_start_ms IS NOT ?1 OR cue_end_ms IS NOT ?2)"
+            }
+        };
+        let params: [&dyn ToSqlValue; 3] = [&debut_ms, &fin_ms, &id];
+        self.db.execute(sql, &params).map_err(TuneError::Db)
+    }
+
     /// #5073 — les tranches que la base porte pour ce fichier image, en
     /// `(id, cue_start_ms)` : ce qu'une feuille relue confronte à ce qu'elle
     /// décrit désormais (`cue_bibliotheque::relire_le_dossier`).
@@ -2963,7 +2997,11 @@ impl TrackRepo {
             owned_params.extend(p);
         }
 
-        if let Some(c) = ph.in_list("t.year", f.years.len()) {
+        // Go du 13/11 — l'année de la piste, à défaut celle de son album.
+        if let Some(c) = ph.in_list(
+            crate::db::annee_de_la_piste::ANNEE_DE_LA_PISTE,
+            f.years.len(),
+        ) {
             conditions.push(c);
             for y in &f.years {
                 owned_params.push(SqlValue::Int(*y));
@@ -3066,8 +3104,18 @@ impl TrackRepo {
 
         // Extended-tag filters via the open `track_metadata` k/v store. The key
         // is a fixed literal; only the values are bound parameters.
+        // #8668 — le pays d'édition : balise RELEASECOUNTRY, ou pays de la
+        // release MusicBrainz d'un album sans balise.
+        if let Some((c, p)) = combiner(
+            ph,
+            &f.countries,
+            f.est_en_et("country"),
+            crate::db::facet_filter::bloc_pays_edition,
+        ) {
+            conditions.push(c);
+            owned_params.extend(p);
+        }
         for (values, key, param) in [
-            (&f.countries, "release_country", "country"),
             (&f.moods, "mood", "mood"),
             (&f.source_medias, "source_media", "source_media"),
         ] {
@@ -4026,13 +4074,22 @@ impl TrackRepo {
     /// est jointe par `AND` **autour de la parenthèse entière**. Sans elle,
     /// `A AND B OR C OR D` se lirait `(A AND B) OR C OR D` et ne filtrerait
     /// rien du tout.
+    ///
+    /// #8958 — chaque raison porte son propre filtre des alertes marquées
+    /// normales ([`alertes_douteuses_ignorees::clause_non_ignoree`]) : une
+    /// piste dont l'artiste manque ET qui est très courte reste listée tant
+    /// qu'une des deux alertes n'est pas ignorée.
     fn where_doubtful() -> String {
+        use crate::db::alertes_douteuses_ignorees::clause_non_ignoree;
         format!(
             "WHERE {piste_locale} \
-               AND ((ar.name IS NULL OR ar.name = '' OR ar.name = 'Unknown Artist') \
-                OR (t.duration_ms > 0 AND t.duration_ms < 5000) \
-                OR (al.title IS NULL OR al.title = ''))",
+               AND (((ar.name IS NULL OR ar.name = '' OR ar.name = 'Unknown Artist') AND {sans_artiste}) \
+                OR (t.duration_ms > 0 AND t.duration_ms < 5000 AND {tres_courte}) \
+                OR ((al.title IS NULL OR al.title = '') AND {sans_album}))",
             piste_locale = sql::PISTE_LOCALE,
+            sans_artiste = clause_non_ignoree("missing_artist"),
+            tres_courte = clause_non_ignoree("very_short"),
+            sans_album = clause_non_ignoree("missing_album"),
         )
     }
 

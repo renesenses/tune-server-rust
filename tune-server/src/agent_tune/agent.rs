@@ -357,8 +357,16 @@ pub async fn executer(
             if !tenue && !libre {
                 return Err(pas_tenue());
             }
+            // Sécurité — le maître envoie l'adresse de SON flux :
+            // un chemin nu ferait lire à la sortie un fichier de cette machine.
+            if !tune_core::chemin_sur::est_une_adresse_http(&url) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    "url must be an http(s) address".to_string(),
+                ));
+            }
             let media = PlayMedia {
-                url: &url,
+                url: url.trim(),
                 mime_type: &mime_type,
                 title: titre.as_deref(),
                 artist: artiste.as_deref(),
@@ -457,7 +465,11 @@ pub async fn etat(
         statut.track_artist = None;
         statut.ended_naturally = false;
     }
-    Ok(EtatSortieDistante { tenue, statut })
+    Ok(EtatSortieDistante {
+        tenue,
+        statut,
+        peripherique_rendu_en_pause: tenue && sortie.device_released_on_pause(),
+    })
 }
 
 #[cfg(test)]

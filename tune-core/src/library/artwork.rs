@@ -503,7 +503,11 @@ pub fn sniff_image_ext(data: &[u8]) -> Option<&'static str> {
 /// condensat n'a aucun fichier : l'annoncer en base est alors un mensonge.
 pub fn find_cached(cache_dir: &Path, hash: &str) -> Option<(PathBuf, &'static str)> {
     for ext in CACHE_EXTENSIONS {
-        let path = cache_dir.join(format!("{hash}.{ext}"));
+        // `hash` vient du chemin de l'URL, décodé : `..%2F..%2Fetc%2Fx`
+        // sortait du cache. Joint par `chemin_sur`, il ne peut plus en sortir.
+        let Ok(path) = crate::chemin_sur::joindre_sous(cache_dir, &format!("{hash}.{ext}")) else {
+            return None;
+        };
         if path.exists() {
             return Some((path, cache_mime(ext)));
         }
@@ -752,7 +756,21 @@ pub fn cache_fetched_image(data: &[u8], cache_dir: &Path, ext: &str) -> Option<S
 /// image nommée — c'est pour cela qu'on relit les OCTETS au lieu de recopier
 /// `image_path`. Une URL distante n'a pas d'empreinte locale.
 pub fn empreinte_image_en_cache(cache_dir: &Path, image_path: &str) -> Option<String> {
-    if image_path.starts_with("http") {
+    let (chemin, _) = fichier_image_en_cache(cache_dir, image_path)?;
+    std::fs::read(chemin)
+        .ok()
+        .map(|octets| content_hash(&octets))
+}
+
+/// Le fichier du cache (et son type MIME) qu'un `image_path` d'artiste
+/// désigne : le condensat de contenu (depuis #1444) ou l'ancienne adresse
+/// `artwork_hash(...)` d'une image nommée. `None` pour une URL distante ou un
+/// fichier absent du cache.
+pub fn fichier_image_en_cache(
+    cache_dir: &Path,
+    image_path: &str,
+) -> Option<(PathBuf, &'static str)> {
+    if image_path.is_empty() || image_path.starts_with("http") {
         return None;
     }
     let hex = (image_path.len() == 32 || image_path.len() == 64)
@@ -762,10 +780,7 @@ pub fn empreinte_image_en_cache(cache_dir: &Path, image_path: &str) -> Option<St
     } else {
         artwork_hash(image_path)
     };
-    let (chemin, _) = find_cached(cache_dir, &adresse)?;
-    std::fs::read(chemin)
-        .ok()
-        .map(|octets| content_hash(&octets))
+    find_cached(cache_dir, &adresse)
 }
 
 /// Écarte une image d'artiste que l'utilisateur a déjà rejetée (#4837).
@@ -1734,6 +1749,13 @@ async fn url_artiste_lastfm(
     Some(image_url.to_string())
 }
 
+fn image_deezer_non_vide(artiste: &serde_json::Value) -> Option<&str> {
+    artiste
+        .get("picture_xl")
+        .and_then(|v| v.as_str())
+        .filter(|url| !url.is_empty() && !url.contains("/images/artist//"))
+}
+
 /// URL Deezer d'un artiste dont le nom rendu est exactement celui demandé.
 ///
 /// `search/artist` est flou : « Janine Jansen » ramène aussi d'autres
@@ -1746,15 +1768,15 @@ fn deezer_pick_image_url<'a>(data: &'a serde_json::Value, artist_name: &str) -> 
             .get("name")
             .and_then(|v| v.as_str())
             .is_some_and(|name| artist_name_matches_exactly(name, artist_name))
+            // #8833 : une fiche à zéro fan ET sans image n'est pas un homonyme.
+            && !(artist.get("nb_fan").and_then(|v| v.as_u64()) == Some(0)
+                && image_deezer_non_vide(artist).is_none())
     });
     let chosen = exact.next()?;
     if exact.next().is_some() {
         return None;
     }
-    chosen
-        .get("picture_xl")
-        .and_then(|v| v.as_str())
-        .filter(|url| !url.is_empty() && !url.contains("/images/artist//"))
+    image_deezer_non_vide(chosen)
 }
 
 async fn url_artiste_deezer(client: &reqwest::Client, artist_name: &str) -> Option<String> {
@@ -4680,3 +4702,36 @@ mod tests_source_image_artiste {
         assert!(!S::Mozaiklabs.a_partager());
     }
 }
+
+/// Sécurité — `GET /library/artwork/{hash}` : le `hash` décodé ne sort jamais du
+/// cache.
+#[cfg(test)]
+mod find_cached_remontee_tests {
+    use super::find_cached;
+
+    #[test]
+    fn un_hash_qui_remonte_ne_lit_rien_hors_du_cache() {
+        let d = tempfile::tempdir().unwrap();
+        let cache = d.path().join("cache").join("artwork");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(d.path().join("photo.jpg"), b"PRIVE").unwrap();
+        std::fs::write(cache.join("8865c2f2e1a6f89c34ab584ec5b8e158.jpg"), b"IMAGE").unwrap();
+        assert!(find_cached(&cache, "8865c2f2e1a6f89c34ab584ec5b8e158").is_some());
+        let absolu = d.path().join("photo");
+        for hash in [
+            "../../photo".to_string(),
+            r"..\..\photo".to_string(),
+            "%2e%2e/%2e%2e/photo".to_string(),
+            absolu.to_string_lossy().into_owned(),
+        ] {
+            assert!(
+                find_cached(&cache, &hash).is_none(),
+                "{hash} a atteint un fichier hors du cache"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "artwork_deezer_fantomes_8833_tests.rs"]
+mod deezer_fantomes_8833_tests;

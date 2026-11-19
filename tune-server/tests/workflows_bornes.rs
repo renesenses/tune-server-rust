@@ -449,12 +449,25 @@ fn les_pr_compilent_vite_et_la_branche_de_livraison_compile_tout() {
             "job {nom} : les crates HTTP extraites ne sont plus testees explicitement"
         );
     }
-    for nom in ["test-shipped-features", "audio-embedding"] {
-        assert!(
-            corps(nom).contains("needs.impact.outputs.full == 'true'"),
-            "suite complete {nom} encore lancee sur chaque correctif du lot"
-        );
-    }
+    assert!(
+        corps("test-shipped-features").contains("needs.impact.outputs.full == 'true'"),
+        "suite complete test-shipped-features encore lancee sur chaque correctif du lot"
+    );
+    // tune-server-rust#9046 — `audio-embedding` n'attend plus le profil
+    // complet : sous `full`, il etait TOUJOURS saute sur une PR vers batch/*,
+    // et aucun test du module `embedding` (tout entier sous la feature) ne
+    // tournait en CI avant l'integration du lot, meme sur une PR qui ne
+    // touchait que lui. La garde de cout tient toujours, mais par le
+    // classifieur de chemins : il n'allume `embedding` que pour un diff
+    // `*embedding*` / `*onnx*` (contre-epreuves dans
+    // `detecter-jobs-lourds-ci.sh --autotest`). Il ne tourne donc PAS sur
+    // chaque correctif du lot. Les autres suites longues restent sous `full`.
+    let embedding = corps("audio-embedding");
+    assert!(
+        embedding.contains("needs.impact.outputs.full == 'true'")
+            || embedding.contains("needs.impact.outputs.embedding == 'true'"),
+        "suite audio-embedding lancee sur chaque correctif du lot, sans garde de chemins"
+    );
     // `windows-pr` et `macos-pr` ont QUITTE cette liste (#3123) : voir
     // `les_deux_plateformes_compilent_sur_toute_pr_rust`, qui exige l'inverse.
 
@@ -960,9 +973,15 @@ fn postgresql_execute_les_requetes_de_tune_server() {
          le detecteur ne voit plus ce qu'il doit compter"
     );
     paquets.sort_unstable();
+    // Recette du 13/11 (n° 73, tune-server-rust#8755) — `tune-smart-http`
+    // entre dans l'inventaire : les comptes de la liste des collections
+    // intelligentes se jouent aussi sur PostgreSQL
+    // (`pg_comptes_collections_en_une_passe`). Le SQL des règles vit dans
+    // cette caisse ; l'éprouver là où il est écrit élargit la couverture que
+    // cette garde protège.
     assert_eq!(
         paquets,
-        ["tune-core", "tune-server"],
+        ["tune-core", "tune-server", "tune-smart-http"],
         "l'inventaire des paquets joues sur PostgreSQL a change : on n'en retire \
          jamais, et `tune-server` doit y rester — c'est la que vivent les \
          requetes des routes"

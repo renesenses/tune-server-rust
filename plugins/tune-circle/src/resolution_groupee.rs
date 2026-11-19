@@ -32,6 +32,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::hash::Hash;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -50,32 +51,39 @@ pub const DUREE_INTROUVABLE: Duration = Duration::from_secs(60);
 pub const ENTREES_MAX: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct Cle {
+pub struct Cle {
     reference: Reference,
     services: Vec<String>,
 }
 
-struct Entree {
+struct Entree<T> {
     jusqu_a: Instant,
     insere: Instant,
-    trouvee: Option<Trouvee>,
+    trouvee: Option<T>,
 }
 
-/// Ce que les dernières résolutions ont donné, pour un temps.
-pub struct CacheDeResolution {
-    entrees: Mutex<HashMap<Cle, Entree>>,
+/// Ce que les dernières recherches ont donné, pour un temps : un trouvé
+/// [`DUREE_TROUVEE`], un introuvable moins longtemps, [`ENTREES_MAX`] au plus.
+///
+/// web#3001 : le même cache sert aux pochettes de mes sources
+/// ([`crate::pochettes_de_mes_sources`]), avec sa propre clé.
+pub struct CacheBorne<K, T> {
+    entrees: Mutex<HashMap<K, Entree<T>>>,
     duree_trouvee: Duration,
     duree_introuvable: Duration,
     capacite: usize,
 }
 
-impl Default for CacheDeResolution {
+/// Les résolutions de morceaux (#7022).
+pub type CacheDeResolution = CacheBorne<Cle, Trouvee>;
+
+impl<K: Clone + Eq + Hash, T: Clone> Default for CacheBorne<K, T> {
     fn default() -> Self {
         Self::avec(DUREE_TROUVEE, DUREE_INTROUVABLE, ENTREES_MAX)
     }
 }
 
-impl CacheDeResolution {
+impl<K: Clone + Eq + Hash, T: Clone> CacheBorne<K, T> {
     pub fn avec(duree_trouvee: Duration, duree_introuvable: Duration, capacite: usize) -> Self {
         Self {
             entrees: Mutex::new(HashMap::new()),
@@ -86,7 +94,7 @@ impl CacheDeResolution {
     }
 
     /// `Some(résultat)` si la clé est connue et encore valable.
-    fn lire(&self, cle: &Cle) -> Option<Option<Trouvee>> {
+    pub(crate) fn lire(&self, cle: &K) -> Option<Option<T>> {
         let mut entrees = self.entrees.lock().unwrap_or_else(|e| e.into_inner());
         let maintenant = Instant::now();
         match entrees.get(cle) {
@@ -99,7 +107,7 @@ impl CacheDeResolution {
         }
     }
 
-    fn garder(&self, cle: Cle, trouvee: Option<Trouvee>) {
+    pub(crate) fn garder(&self, cle: K, trouvee: Option<T>) {
         let duree = if trouvee.is_some() {
             self.duree_trouvee
         } else {

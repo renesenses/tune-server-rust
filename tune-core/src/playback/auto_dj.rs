@@ -103,6 +103,12 @@ pub async fn similar_artist_names(
         .get("artist_enrichment_api")
         .ok()
         .flatten();
+    // Fil 2694 — la radio de fin de file est désormais active par défaut :
+    // sous test, aucune épreuve ne doit partir sur le vrai service
+    // d'enrichissement. Sans adresse posée par l'épreuve, aucun voisin.
+    if cfg!(test) && api_base.is_none() {
+        return Vec::new();
+    }
     let mut client =
         crate::metadata::artist_enrichment::ArtistEnrichmentClient::new(api_base.as_deref(), 5);
     // `get_similar` est indexée par MBID ; on lui passait le NOM de la graine.
@@ -417,9 +423,14 @@ pub fn generate_queue(
     count: usize,
 ) -> Vec<Value> {
     // Load seed track metadata
+    // Go du 13/11 — l'année de la piste, à défaut celle de son album, pour la
+    // graine comme pour les candidates.
     let seed = db
         .query_one(
-            "SELECT t.genre, t.year, t.bpm FROM tracks t WHERE t.id = ?",
+            &format!(
+                "SELECT t.genre, {}, t.bpm FROM tracks t WHERE t.id = ?",
+                crate::db::annee_de_la_piste::ANNEE_DE_LA_PISTE
+            ),
             &[&seed_track_id],
         )
         .ok()
@@ -452,7 +463,8 @@ pub fn generate_queue(
 
     if let Some(y) = year {
         conditions.push(format!(
-            "t.year BETWEEN ?{param_idx} AND ?{}",
+            "{} BETWEEN ?{param_idx} AND ?{}",
+            crate::db::annee_de_la_piste::ANNEE_DE_LA_PISTE_AVEC_AL,
             param_idx + 1
         ));
         owned_params.push((y - 5).to_sql_value());

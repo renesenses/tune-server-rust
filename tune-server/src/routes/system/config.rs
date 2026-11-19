@@ -8,10 +8,8 @@ use tune_http_types::panne_sql::OuDefautJournalise;
 
 use tune_core::db::album_repo::AlbumRepo;
 use tune_core::db::artist_repo::ArtistRepo;
-use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::track_repo::TrackRepo;
-use tune_core::db::zone_repo::ZoneRepo;
 
 use tune_core::audio::replaygain::{ReplayGainMode, ReplayGainSourceMode};
 
@@ -72,8 +70,13 @@ pub(super) async fn version() -> Json<Value> {
 /// ici : ses sondes lancent un sous-processus `df`, ce qu'une route sollicitée
 /// par la découverte réseau et par une boucle de 700 ms ne peut pas payer.
 pub(super) async fn health(State(state): State<AppState>) -> impl IntoResponse {
-    let tracks_result = TrackRepo::with_backend(state.backend.clone()).count();
-    let albums_result = AlbumRepo::with_backend(state.backend.clone()).count();
+    // #8805 — hors exécuteur, un seul comptage en vol, resservi s'il a été
+    // lent : cette sonde tourne en boucle, et sous un disque saturé chacun de
+    // ses deux `COUNT(*)` tenait un fil de l'exécuteur plus de 100 s.
+    let super::comptages_8805::ComptesSante {
+        tracks: tracks_result,
+        albums: albums_result,
+    } = super::comptages_8805::comptes_sante(&state, "system_health").await;
     let uptime_secs = state.started_at.elapsed().as_secs();
 
     // Le nom voyage AVEC la version (#2110). C'est la même requête que la barre
@@ -85,8 +88,13 @@ pub(super) async fn health(State(state): State<AppState>) -> impl IntoResponse {
     // #5086 — par le pool de lecture : cette route est la sonde « le serveur
     // répond-il ? ». Par l'écrivain, elle attendait tout écrivain en cours, et
     // un serveur qui servait passait pour « injoignable ».
-    let name_result =
-        SettingsRepo::with_backend(state.backend.clone()).get_sans_ecrivain("server_name");
+    let lecteur = state.backend.clone();
+    let name_result = super::comptages_8805::lecture_hors_executeur(
+        "system_health",
+        Err("lecture du nom interrompue".to_string()),
+        move || SettingsRepo::with_backend(lecteur).get_sans_ecrivain("server_name"),
+    )
+    .await;
     let server_name = resolve_server_name(name_result.as_ref().ok().and_then(|v| v.as_deref()));
 
     let sondes = [
@@ -169,21 +177,18 @@ pub(super) async fn health(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 pub(super) async fn stats(State(state): State<AppState>) -> Json<Value> {
-    let artists = ArtistRepo::with_backend(state.backend.clone())
-        .count()
-        .unwrap_or(0);
-    let albums = AlbumRepo::with_backend(state.backend.clone())
-        .count()
-        .unwrap_or(0);
-    let tracks = TrackRepo::with_backend(state.backend.clone())
-        .count()
-        .unwrap_or(0);
-    let listens = HistoryRepo::with_backend(state.backend.clone())
-        .count()
-        .unwrap_or(0);
-    let zones = ZoneRepo::with_backend(state.backend.clone())
-        .count()
-        .unwrap_or(0);
+    // #8805 (fil 2841) — ces cinq `COUNT(*)` et la ventilation tournaient sur
+    // les fils de l'exécuteur : sous un scan qui sature le disque, deux appels
+    // à cette route tenaient deux des quatre fils plus de 100 s. Hors
+    // exécuteur, un seul comptage en vol, resservi s'il a été lent.
+    let super::comptages_8805::ComptesStats {
+        artists,
+        albums,
+        tracks,
+        listens,
+        zones,
+        ventilation,
+    } = super::comptages_8805::comptes_stats(&state).await;
     // Use timeout to avoid blocking if scanner/outputs mutex is held (e.g. during SSDP scan)
     let devices = tokio::time::timeout(std::time::Duration::from_secs(2), async {
         state.scanner.devices().await.len()
@@ -214,10 +219,7 @@ pub(super) async fn stats(State(state): State<AppState>) -> Json<Value> {
         "server_version": tune_core::version(),
         "server_engine": "rust",
     });
-    crate::routes::library::stats::ajouter_ventilation(
-        &mut corps,
-        &crate::routes::library::stats::VentilationParSource::lire(&state),
-    );
+    crate::routes::library::stats::ajouter_ventilation(&mut corps, &ventilation);
     Json(corps)
 }
 
@@ -496,6 +498,10 @@ pub(super) async fn get_config(
         // ReplayGain application at playback. Off by default: it multiplies
         // every sample, so it must be an explicit choice, never a surprise.
         ("replaygain_mode", json!("off")),
+        (
+            tune_core::audio::replaygain::SERVICES_ENABLED_KEY,
+            json!(false),
+        ),
         ("replaygain_preamp_db", json!(0.0)),
         ("replaygain_prevent_clipping", json!(true)),
         // Plafond dBTP de l'anti-écrêtage (#1694) : 0 (défaut, comportement
@@ -863,6 +869,13 @@ pub(super) async fn get_config(
             ],
             "label": crate::i18n::t(&lang, &format!("settings.replayGainSource.{}", rg_source_mode.as_str())),
         }),
+    );
+    // #8968 — les valeurs de `replaygain_mode` que CE serveur comprend. Un
+    // client n'offre « Auto » que s'il le lit ici : un serveur plus ancien
+    // lirait `auto` comme `off`, coupant le gain ET la campagne d'analyse.
+    config.insert(
+        "replaygain_modes".to_string(),
+        json!(tune_core::audio::replaygain::MODES_ACCEPTES),
     );
     // Consentement de contribution. Deux valeurs, et elles ne disent pas la
     // meme chose :
@@ -1852,6 +1865,22 @@ pub(super) async fn update_config(
     // alors refusées, en bloc, avant toute écriture.
     if let Some(refus) = refus_des_cles_protegees(&state, values.keys().map(String::as_str)) {
         return Ok(refus);
+    }
+    // Sécurité — `music_dirs` reste écrivable ici (aller-retour de
+    // `GET /system/settings`), mais une racine AJOUTÉE passe le même périmètre
+    // que `POST /system/music-dirs/add`. Rien n'est écrit si l'une est refusée.
+    if let Some(valeur) = values.get("music_dirs") {
+        let Some(liste) = dirs_depuis_valeur(valeur) else {
+            return Err(AppError::bad_request("music_dirs must be a list of paths"));
+        };
+        let avant = super::get_music_dirs_list(&state.backend);
+        if let Some((chemin, motif)) = racines_ajoutees_refusees(&state, &liste, &avant).pop() {
+            return Ok((
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": motif, "path": chemin, "key": "music_dirs" })),
+            )
+                .into_response());
+        }
     }
     if let Some(value) = values.get(tune_core::db::listening_resume::REWIND_KEY) {
         if value
@@ -2945,6 +2974,13 @@ pub(super) async fn get_env(State(state): State<AppState>) -> Json<Value> {
             .as_deref()
             .and_then(crate::conteneur::identifiant_court)
             .map(str::to_string),
+        // renesenses/tune-server-rust#8747 — le dossier de la base survit-il à
+        // la recréation du conteneur ? `null` hors conteneur ; sinon
+        // `{dir, kind, persistent}`. L'interface montre un bandeau quand
+        // `persistent` est faux (volume anonyme, rien de monté, tmpfs).
+        "data_persistence": crate::persistance_donnees::en_json(
+            crate::persistance_donnees::relever(&state.config.db_path).as_ref()
+        ),
     }))
 }
 
@@ -3044,16 +3080,32 @@ pub(super) struct ImportConfigQuery {
 /// écriture qui échoue en cours de route est DITE (`500`) avec ce qui était
 /// déjà appliqué, au lieu d'un `200` silencieusement incomplet.
 pub(super) async fn import_config(
-    _admin: crate::auth::RequireAdmin,
+    // Engage la machine : administrateur, ou authentification coupée,
+    // seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
+    state: State<AppState>,
+    q: Query<ImportConfigQuery>,
+    body: Json<serde_json::Map<String, Value>>,
+) -> Result<impl IntoResponse, AppError> {
+    importer_la_configuration(state, q, body).await
+}
+
+/// Le corps de l'import, partagé avec l'aperçu (qui n'écrit rien).
+async fn importer_la_configuration(
     State(state): State<AppState>,
     Query(q): Query<ImportConfigQuery>,
     Json(body): Json<serde_json::Map<String, Value>>,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<Json<Value>, AppError> {
     use tune_core::config_export as ce;
     let mut fichier = ce::lire(body).map_err(AppError::bad_request)?;
     // Mêmes clés protégées que `PATCH /system/config` : sans admin effectif,
     // elles sont écartées de l'import et nommées dans `warnings`.
-    let ecartees = ecarter_les_cles_protegees(&state, &mut fichier.settings);
+    let mut ecartees = ecarter_les_cles_protegees(&state, &mut fichier.settings);
+    ecartees.extend(ecarter_les_racines_hors_perimetre(
+        &state,
+        &mut fichier.settings,
+        dirs_depuis_valeur,
+    ));
     let mut plan = ce::planifier(&state.backend, &fichier).map_err(AppError::internal)?;
     plan.avertissements.extend(ecartees.iter().cloned());
     let mut reponse = ce::rapport(&plan);
@@ -3096,12 +3148,11 @@ pub(super) async fn import_config(
 /// `?dry_run=true`, ignorerait le paramètre et APPLIQUERAIT l'import — c'est
 /// pourquoi l'écran passe par ici.
 pub(super) async fn preview_import_config(
-    admin: crate::auth::RequireAdmin,
+    _admin: crate::auth::RequireAdmin,
     state: State<AppState>,
     Json(body): Json<serde_json::Map<String, Value>>,
 ) -> Result<impl IntoResponse, AppError> {
-    import_config(
-        admin,
+    importer_la_configuration(
         state,
         Query(ImportConfigQuery { dry_run: true }),
         Json(body),
@@ -3148,48 +3199,108 @@ pub(super) async fn set_default_zone(
 /// #8213 — la réponse commune des routes de l'arrêt programmé : le réglage
 /// (ou `null`), la prochaine échéance en heure locale du serveur, et
 /// `poweroff_available` : l'action « éteindre la machine » est-elle permise
-/// ici (Tune OS seulement) ? L'écran ne propose le choix que si `true`.
+/// ici ? L'écran ne propose le choix que si `true`.
+///
+/// #8909 — permise sur Tune OS et, hors conteneur, sur un hôte Linux, macOS
+/// ou Windows : `poweroff_mode` dit lequel (`"tune_os"`, `"host"`, `null`).
+/// `last_poweroff_error` rend le dernier échec d'extinction programmée
+/// (polkit qui refuse…), `null` sinon : complet (`at`, `code`, `error` avec la
+/// sortie d'erreur) pour l'administrateur, `at` et `code` seulement aux autres.
 fn reponse_arret_programme(
     reglage: Option<tune_core::arret_programme::ArretProgramme>,
+    echec: Option<tune_core::arret_programme::EchecExtinction>,
+    admin: bool,
 ) -> Json<Value> {
+    let echec = echec.map(|e| {
+        if admin {
+            json!(e)
+        } else {
+            json!({ "at": e.at, "code": e.code })
+        }
+    });
     let prochain = reglage.as_ref().and_then(|r| {
         r.prochaine_echeance(chrono::Local::now().naive_local())
             .map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string())
     });
+    let mode = crate::extinction_hote::mode();
     Json(json!({
         "scheduled_stop": reglage,
         "next_stop_at": prochain,
-        "poweroff_available": crate::routes::appliance::is_appliance(),
+        "poweroff_available": mode.is_some(),
+        "poweroff_mode": mode.map(crate::extinction_hote::Mode::code),
+        "last_poweroff_error": echec,
     }))
 }
 
-pub(super) async fn get_scheduled_stop(State(state): State<AppState>) -> Json<Value> {
-    reponse_arret_programme(tune_core::arret_programme::lire(&state.backend))
+pub(super) async fn get_scheduled_stop(
+    admin: Result<crate::auth::RequireAdmin, (StatusCode, Json<Value>)>,
+    State(state): State<AppState>,
+) -> Json<Value> {
+    reponse_arret_programme(
+        tune_core::arret_programme::lire(&state.backend),
+        tune_core::arret_programme::lire_echec_extinction(&state.backend),
+        admin.is_ok(),
+    )
 }
 
 /// Pose l'arrêt programmé. Réservé à l'administrateur : il arrête la lecture
 /// de toutes les zones, pas seulement celle de l'appelant.
 pub(super) async fn set_scheduled_stop(
     _admin: crate::auth::RequireAdmin,
+    // Sécurité : éteindre la machine à l'heure dite, c'est `/appliance/shutdown`
+    // par une porte de côté — même garde, mais seulement pour `poweroff`
+    // (programmer un simple arrêt de la lecture reste ouvert).
+    garde_machine: Result<crate::auth::AdminOuCetteMachine, (StatusCode, Json<Value>)>,
     State(state): State<AppState>,
-    Json(body): Json<tune_core::arret_programme::ArretProgramme>,
+    Json(mut body): Json<tune_core::arret_programme::ArretProgramme>,
 ) -> axum::response::Response {
-    // Éteindre la machine : Tune OS seulement. Refusé à l'enregistrement,
-    // pas découvert à l'heure dite (la fonction d'extinction refuse aussi).
-    if body.action == tune_core::arret_programme::ActionArret::Poweroff
-        && !crate::routes::appliance::is_appliance()
-    {
+    let eteindre = body.action == tune_core::arret_programme::ActionArret::Poweroff;
+    if eteindre && let Err(refus) = garde_machine {
+        return refus.into_response();
+    }
+    // Éteindre la machine : Tune OS, ou hôte Linux/macOS/Windows hors
+    // conteneur (#8909). Refusé à l'enregistrement, pas découvert à l'heure
+    // dite (l'extinction relit le mode à l'échéance et refuse aussi).
+    let mode = crate::extinction_hote::mode();
+    if eteindre && mode.is_none() {
+        let refus = crate::extinction_hote::refus_indisponible();
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": crate::routes::appliance::REFUS_HORS_TUNE_OS,
+                "error": refus.message(),
                 "code": "poweroff_unavailable",
+                "reason": refus.code(),
             })),
         )
             .into_response();
     }
+    // #8909 — éteindre un hôte ordinaire exige l'authentification active :
+    // sans elle, « depuis cette machine » ne distingue pas un appel relayé
+    // par un mandataire local. Tune OS garde son comportement (#8213).
+    if eteindre
+        && mode == Some(crate::extinction_hote::Mode::Hote)
+        && !crate::auth::authentification_active(&state)
+    {
+        let (status, Json(mut corps)) = crate::auth::refus_sans_authentification(
+            crate::extinction_hote::REFUS_SANS_AUTHENTIFICATION,
+        );
+        corps["code"] = json!("auth_required");
+        return (status, Json(corps)).into_response();
+    }
+    // Le mode validé ici est rangé avec le réglage ; celui du client est
+    // ignoré. L'échéance n'éteint que si le mode courant est le même.
+    body.poweroff_mode = if eteindre {
+        mode.map(|m| m.code().to_string())
+    } else {
+        None
+    };
     match tune_core::arret_programme::ecrire(&state.backend, body) {
-        Ok(r) => reponse_arret_programme(Some(r)).into_response(),
+        // Un réglage reposé par l'administrateur vaut accusé de lecture du
+        // dernier échec d'extinction.
+        Ok(r) => {
+            tune_core::arret_programme::effacer_echec_extinction(&state.backend);
+            reponse_arret_programme(Some(r), None, true).into_response()
+        }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
     }
 }
@@ -3199,7 +3310,10 @@ pub(super) async fn delete_scheduled_stop(
     State(state): State<AppState>,
 ) -> axum::response::Response {
     match tune_core::arret_programme::effacer(&state.backend) {
-        Ok(()) => reponse_arret_programme(None).into_response(),
+        Ok(()) => {
+            tune_core::arret_programme::effacer_echec_extinction(&state.backend);
+            reponse_arret_programme(None, None, true).into_response()
+        }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({ "error": e })),
@@ -3452,6 +3566,72 @@ pub(super) async fn estimate_dir(
     )
 }
 
+/// Sécurité — le motif du refus d'une racine de bibliothèque hors
+/// du périmètre de l'explorateur, ou `None` si elle peut être déclarée.
+/// Toutes les écritures de `music_dirs` passent ici : ajout, onboarding,
+/// `PATCH /system/config` et les deux imports de configuration.
+pub(crate) fn refus_de_racine_de_musique(state: &AppState, chemin: &str) -> Option<&'static str> {
+    // Les dossiers de montage réseau de Tune restent des racines valides,
+    // même sous `/var/lib/tune` (installation `.deb`).
+    let montages: Vec<String> = crate::routes::network::racines_des_montages(state)
+        .iter()
+        .map(|m| m.to_string_lossy().into_owned())
+        .collect();
+    super::explorateur::verifier_une_racine_de_musique_avec(chemin, &montages)
+        .err()
+        .map(|refus| {
+            tracing::warn!(path = %chemin, motif = ?refus, "racine_de_musique_refusee");
+            refus.libelle()
+        })
+}
+
+/// Les racines d'une nouvelle liste `music_dirs` qui n'y étaient pas déjà et
+/// que le périmètre refuse, avec leur motif. Une racine DÉJÀ déclarée n'est
+/// pas revérifiée : une installation existante ne casse pas à la mise à jour.
+pub(crate) fn racines_ajoutees_refusees(
+    state: &AppState,
+    nouvelles: &[String],
+    avant: &[String],
+) -> Vec<(String, &'static str)> {
+    let deja: Vec<String> = avant
+        .iter()
+        .map(|d| tune_core::scanner::walker::normalize_path(d))
+        .collect();
+    nouvelles
+        .iter()
+        .filter(|d| !deja.contains(&tune_core::scanner::walker::normalize_path(d)))
+        .filter_map(|d| refus_de_racine_de_musique(state, d).map(|m| (d.clone(), m)))
+        .collect()
+}
+
+/// Imports de configuration : la clé `music_dirs` est écartée (et nommée dans
+/// les avertissements) si elle est illisible ou si elle ajoute une racine que
+/// le périmètre refuse. Vaut avec ou sans authentification.
+pub(super) fn ecarter_les_racines_hors_perimetre<T>(
+    state: &AppState,
+    reglages: &mut Vec<(String, T)>,
+    lire: impl Fn(&T) -> Option<Vec<String>>,
+) -> Vec<String> {
+    let avant = super::get_music_dirs_list(&state.backend);
+    let mut avertissements = Vec::new();
+    reglages.retain(|(cle, valeur)| {
+        if cle != "music_dirs" {
+            return true;
+        }
+        let refus = match lire(valeur) {
+            None => vec![("?".to_string(), "music_dirs must be a list of paths")],
+            Some(liste) => racines_ajoutees_refusees(state, &liste, &avant),
+        };
+        for (chemin, motif) in &refus {
+            avertissements.push(format!(
+                "setting 'music_dirs' skipped: '{chemin}' refused ({motif})"
+            ));
+        }
+        refus.is_empty()
+    });
+    avertissements
+}
+
 #[derive(Deserialize)]
 pub(super) struct AddMusicDir {
     path: String,
@@ -3480,6 +3660,16 @@ pub(super) async fn add_music_dir(
         return Ok((
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "path is empty" })),
+        )
+            .into_response());
+    }
+    // Sécurité — les dossiers de musique sont le périmètre de
+    // toutes les gardes de chemin : une racine se déclare dans le périmètre de
+    // l'explorateur, jamais au-delà (ni `/`, ni un arbre système, ni `..`).
+    if let Some(motif) = refus_de_racine_de_musique(&state, &normalized) {
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": motif, "path": normalized })),
         )
             .into_response());
     }
@@ -4413,7 +4603,9 @@ pub(super) async fn purge_orphan_tracks(
 /// Honnêteté : sur une installation supervisée (systemd `Restart=always`,
 /// service Windows), le superviseur peut relancer le processus aussitôt —
 /// l'écran le dit dans la confirmation.
-pub(super) async fn stop(_admin: crate::auth::RequireAdmin) -> impl IntoResponse {
+/// Arrêter le serveur engage la machine, comme le redémarrage : même garde
+/// (administrateur, ou authentification coupée : seulement depuis cette machine).
+pub(super) async fn stop(_garde: crate::auth::AdminOuCetteMachine) -> impl IntoResponse {
     tokio::spawn(async {
         // Laisser la réponse HTTP partir avant de mourir.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -4423,7 +4615,7 @@ pub(super) async fn stop(_admin: crate::auth::RequireAdmin) -> impl IntoResponse
     Json(json!({ "stopping": true }))
 }
 
-pub(super) async fn restart(_admin: crate::auth::RequireAdmin) -> impl IntoResponse {
+pub(super) async fn restart(_garde: crate::auth::AdminOuCetteMachine) -> impl IntoResponse {
     if let Some(moteur) = crate::conteneur::detecter() {
         // #7074 — dans un conteneur, un `execv` qui échoue arrête le
         // conteneur : le journal le dit, c'est ce qu'on cherchera.
@@ -5935,6 +6127,52 @@ mod replaygain_source_tests {
     }
 
     #[tokio::test]
+    async fn services_replaygain_8689_desactives_par_defaut_et_persistes() {
+        let state = etat();
+        let cle = tune_core::audio::replaygain::SERVICES_ENABLED_KEY;
+        assert_eq!(config_de(&state).await[cle], false);
+        patch(&state, serde_json::json!({cle: true})).unwrap();
+        assert_eq!(config_de(&state).await[cle], true);
+        assert!(tune_core::audio::replaygain::services_enabled(
+            &state.backend
+        ));
+        patch(&state, serde_json::json!({cle: false})).unwrap();
+        assert_eq!(config_de(&state).await[cle], false);
+        assert!(!tune_core::audio::replaygain::services_enabled(
+            &state.backend
+        ));
+    }
+
+    /// #8968 — `GET /config` annonce `auto` (le client n'offre le bouton
+    /// qu'à ce prix), `auto` s'écrit et se relit, et changer de SOURCE garde
+    /// la granularité `auto` au lieu de la reculer vers la piste.
+    #[tokio::test]
+    async fn le_mode_auto_est_annonce_ecrit_et_garde_8968() {
+        let state = etat();
+        let c = config_de(&state).await;
+        assert_eq!(
+            c["replaygain_modes"],
+            serde_json::json!(["off", "track", "album", "auto"]),
+            "le serveur n'annonce pas le mode Auto"
+        );
+        patch(&state, serde_json::json!({"replaygain_mode": "auto"})).unwrap();
+        assert_eq!(
+            tune_core::audio::replaygain::ReplayGainSettings::load(&state.backend).mode,
+            tune_core::audio::replaygain::ReplayGainMode::Auto
+        );
+        patch(
+            &state,
+            serde_json::json!({"replaygain_source": "file_tags"}),
+        )
+        .unwrap();
+        assert_eq!(
+            config_de(&state).await["replaygain_mode"],
+            "auto",
+            "changer de source a reculé Auto vers la piste"
+        );
+    }
+
+    #[tokio::test]
     async fn les_trois_modes_voyagent_dans_get_config() {
         let state = etat();
         let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -7249,3 +7487,28 @@ mod dossiers_exclus_de_l_enrichissement_7538_tests {
 #[cfg(test)]
 #[path = "consentements_patch_partiel_8521_tests.rs"]
 mod consentements_patch_partiel_8521_tests;
+
+/// Sécurité — une racine porteuse de `..` n'est pas ajoutée.
+#[cfg(test)]
+mod confinement_chemins_tests {
+    use super::*;
+    use crate::routes::confinement::banc;
+
+    #[tokio::test]
+    async fn une_racine_qui_remonte_n_est_pas_ajoutee() {
+        let b = banc();
+        let r = add_music_dir(
+            crate::auth::RequireAdmin,
+            State(b.state.clone()),
+            Json(AddMusicDir {
+                path: b.remontee(""),
+            }),
+        )
+        .await;
+        assert_eq!(
+            crate::routes::confinement::statut(r),
+            StatusCode::BAD_REQUEST,
+            "racine `..` ajoutée"
+        );
+    }
+}
