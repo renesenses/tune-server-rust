@@ -1769,8 +1769,13 @@ async fn spawn_upnp_advertiser(state: &AppState, config: &TuneConfig) {
     if let Some(ref upnp) = state.upnp {
         // `upnp_enabled` (POST /api/v1/upnp/config) était écrit mais jamais
         // lu : désactiver le media server depuis l'interface n'avait aucun
-        // effet. Les routes /upnp restent montées (inertes sans annonce) ;
-        // la bascule prend effet au redémarrage, comme le renommage.
+        // effet.
+        //
+        // #9079 — l'annonceur démarre toujours et suit l'interrupteur de
+        // `UpnpState` : coupé, il n'annonce rien et ne répond à aucun
+        // M-SEARCH ; POST /api/v1/upnp/config le rallume ou le coupe (avec
+        // `ssdp:byebye`) sans redémarrage, et les routes /upnp répondent 404
+        // tant qu'il est coupé.
         //
         // #8374 — sans clé en base, `TUNE_UPNP_SERVER_ENABLED` décide : la
         // variable était déclarée dans `tune_core::config` et jamais lue, un
@@ -1779,9 +1784,9 @@ async fn spawn_upnp_advertiser(state: &AppState, config: &TuneConfig) {
         let settings =
             tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
         let enabled = tune_core::upnp_server::annonce_voulue(&settings);
+        upnp.annonce.basculer(enabled);
         if !enabled {
             info!("upnp_mediaserver_disabled_by_setting");
-            return;
         }
         // La LOCATION n'est plus figée ici : l'annonceur recalcule l'IP à
         // chaque cycle et n'annonce rien tant qu'aucune IP réseau n'est
@@ -1791,6 +1796,7 @@ async fn spawn_upnp_advertiser(state: &AppState, config: &TuneConfig) {
             upnp.uuid.clone(),
             config.port,
             config.advertised_ip.clone(),
+            upnp.annonce.clone(),
         )
         .await;
         info!("upnp_mediaserver_advertiser_started");
