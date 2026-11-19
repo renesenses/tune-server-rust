@@ -327,7 +327,7 @@ const BASES_EN_CACHE_MAX: usize = 8;
 
 impl Cache {
     fn servi(&self, clef: Clef) -> Option<Arc<ArbreDesDossiers>> {
-        let courants = self.courants.lock().ok()?;
+        let courants = self.courants.lock().unwrap_or_else(|e| e.into_inner());
         courants
             .get(&clef.1)
             .filter(|(c, _)| *c == clef)
@@ -335,13 +335,12 @@ impl Cache {
     }
 
     fn garder(&self, clef: Clef, arbre: Arc<ArbreDesDossiers>) {
-        if let Ok(mut courants) = self.courants.lock() {
-            if courants.len() >= BASES_EN_CACHE_MAX && !courants.contains_key(&clef.1) {
-                courants.clear();
-            }
-            // L'arbre d'une révision passée est remplacé : un seul par base.
-            courants.insert(clef.1, (clef, arbre));
+        let mut courants = self.courants.lock().unwrap_or_else(|e| e.into_inner());
+        if courants.len() >= BASES_EN_CACHE_MAX && !courants.contains_key(&clef.1) {
+            courants.clear();
         }
+        // L'arbre d'une révision passée est remplacé : un seul par base.
+        courants.insert(clef.1, (clef, arbre));
     }
 }
 
@@ -361,7 +360,9 @@ pub fn lire(db: &dyn DbBackend) -> Option<Arc<ArbreDesDossiers>> {
     if let Some(a) = CACHE.servi(clef) {
         return Some(a);
     }
-    let _une_a_la_fois = CACHE.construction.lock().ok()?;
+    // Un verrou empoisonné (une construction a paniqué) ne désactive pas
+    // l'arbre pour la vie du processus : il ne garde aucune donnée.
+    let _une_a_la_fois = CACHE.construction.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(a) = CACHE.servi(clef) {
         return Some(a);
     }
