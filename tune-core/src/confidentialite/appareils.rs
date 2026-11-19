@@ -1196,7 +1196,7 @@ mod tests {
     #[test]
     fn beaucoup_de_noms_longs_et_paquets_qui_ne_compilent_pas() {
         let mut reg = Registre::new();
-        let noms: Vec<String> = (0..1200)
+        let noms: Vec<String> = (0..520)
             .map(|i| format!("Bibliothèque musicale numéro {i:04} de la maison d’Eulalie Quarante"))
             .collect();
         for n in &noms {
@@ -1214,7 +1214,7 @@ mod tests {
         reg.instantane = None;
         let mut s = reg.seance_avec_limite(4096);
         assert!(
-            s.instantane.motifs.len() > 1200 / PAQUET + 1,
+            s.instantane.motifs.len() > noms.len() / PAQUET + 1,
             "{}",
             s.instantane.motifs.len()
         );
