@@ -1515,6 +1515,15 @@ impl PlaybackOrchestrator {
             let byte_seekable = self
                 .media_byte_seekable(resolved.stream_id.as_deref())
                 .await;
+            // #9175 — Sendspin et Devialet AIR décodent `file_path` quand il
+            // est là : ne le leur donner que si le flux servi EST ce fichier.
+            let fichier_pour_la_sortie = self
+                .fichier_d_origine_pour_la_sortie(
+                    self.output_type_of(device_id).await.as_deref(),
+                    resolved.stream_id.as_deref(),
+                    local_file_path.as_deref(),
+                )
+                .await;
             let media = crate::outputs::traits::PlayMedia {
                 url: &resolved.url,
                 mime_type: &resolved.mime_type,
@@ -1529,7 +1538,7 @@ impl PlaybackOrchestrator {
                 // dépasse la « durée » et le sondeur passe au suivant trop tôt.
                 duration_ms: duree_annoncee_a_la_sortie(resolved, is_local),
                 file_size: resolved.file_size,
-                file_path: local_file_path.as_deref(),
+                file_path: fichier_pour_la_sortie.as_deref(),
                 sample_rate: resolved.sample_rate,
                 // #6334 — la profondeur du FIL, pas celle de la source : un
                 // AAC décodé en WAV part bien en 16 bits.
@@ -2272,6 +2281,45 @@ impl PlaybackOrchestrator {
         _start_position_ms: Option<u64>,
     ) -> (bool, Option<String>) {
         (false, Some(format!("Device not found: {device_id}")))
+    }
+
+    /// #9175 — le `PlayMedia::file_path` remis à la sortie `output_type`.
+    ///
+    /// L'orchestrateur connaît le fichier de TOUTE piste locale, quelle que
+    /// soit la sortie. Sendspin et Devialet AIR le préféraient à `url`
+    /// (`Media::depuis`) : ils décodaient le fichier d'origine et jetaient le
+    /// flux que le serveur venait de préparer pour eux — égaliseur, correction
+    /// de pièce, ReplayGain, crossfeed, compensation, que
+    /// `pull_output_needs_dsp_transcode` force bel et bien pour ces sorties.
+    /// AirPlay 2 a eu le même défaut (#1216) et ne lit plus que `url`.
+    ///
+    /// Ici, le fichier ne leur est remis que si la session publiée dans `url`
+    /// SERT ce fichier, octet pour octet : c'est le passthrough, rien n'est
+    /// appliqué, et lire le disque évite de retélécharger la piste. Dès que
+    /// le serveur transcode (fichier temporaire, cache, canal progressif,
+    /// tranche CUE), `file_path` vaut `None` et la sortie lit le flux traité.
+    /// Un fait du flux, pas une déduction des réglages : c'est ce que le
+    /// chemin du signal annonce qui part alors vraiment.
+    ///
+    /// Les autres sorties gardent le fichier tel quel : OAAT le lit derrière
+    /// ses propres gardes (#9176), les autres ne le lisent pas.
+    pub(super) async fn fichier_d_origine_pour_la_sortie(
+        &self,
+        output_type: Option<&str>,
+        stream_id: Option<&str>,
+        fichier_d_origine: Option<&str>,
+    ) -> Option<String> {
+        let origine = fichier_d_origine?;
+        if !sortie_qui_decode_file_path(output_type) {
+            return Some(origine.to_owned());
+        }
+        let session = {
+            let sessions = self.streamer.sessions_state();
+            let guard = sessions.lock().await;
+            guard.get(stream_id?).cloned()
+        }?;
+        let servi = session.file_path.lock().await.clone()?;
+        meme_fichier(&servi, origine).then_some(servi)
     }
 
     /// `output_type()` of the registered output for `device_id` (e.g. "dlna",
@@ -4606,4 +4654,30 @@ fn message_flux_non_ouvert(resolved: &ResolvedStream) -> String {
         "Le flux de « {} » n'a pas pu être ouvert auprès du service ({}).",
         resolved.title, resolved.source
     )
+}
+
+/// #9175 — les sorties qui décodent elles-mêmes `PlayMedia::file_path` quand
+/// il est renseigné, à la place de `url`.
+pub(super) fn sortie_qui_decode_file_path(output_type: Option<&str>) -> bool {
+    matches!(
+        output_type,
+        Some(crate::outputs::sendspin::TYPE_DE_SORTIE)
+            | Some(crate::outputs::devialet_air::TYPE_DE_SORTIE)
+    )
+}
+
+/// #9175 — `servi` (le fichier de la session) est-il `origine` (le chemin de la
+/// bibliothèque) ? La session sert le chemin RÉSOLU (repli NFC/NFD,
+/// `resolve_existing_local_path`), qui peut différer de la graphie en base.
+fn meme_fichier(servi: &str, origine: &str) -> bool {
+    if servi == origine {
+        return true;
+    }
+    match (std::fs::canonicalize(servi), std::fs::canonicalize(origine)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => {
+            crate::library::local_path::resolve_existing_local_path(origine).as_deref()
+                == Some(servi)
+        }
+    }
 }

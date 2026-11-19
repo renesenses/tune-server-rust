@@ -106,6 +106,12 @@ struct Media {
 impl Media {
     fn depuis(media: &PlayMedia<'_>) -> Self {
         Self {
+            // #9175 — `file_path` n'est renseigné pour cette sortie que si le
+            // flux servi EST le fichier d'origine (passthrough, aucun
+            // traitement : `fichier_d_origine_pour_la_sortie`). Dès que le
+            // serveur transcode (égaliseur, correction de pièce, ReplayGain,
+            // crossfeed), il vaut `None` et c'est le flux traité de `url` qui
+            // est décodé.
             source: media.file_path.unwrap_or(media.url).to_string(),
             uri: media.url.to_string(),
             titre: media.title.map(str::to_owned),
