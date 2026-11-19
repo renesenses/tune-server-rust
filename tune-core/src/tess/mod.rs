@@ -16,6 +16,8 @@
 //! - [`prereglages`] : préréglages de chaîne et mode d'application (A2) ;
 //! - [`zones`] : où TESS s'applique (Q8) ;
 //! - [`api`] : les corps JSON de `GET/PUT /zones/{id}/tess` et leurs schémas ;
+//! - [`migration`] (T02) : la chaîne enregistrée d'une zone, tirée des
+//!   anciennes clés, et l'écriture croisée vers elles.
 //! - [`executeur`] (T03) : l'[`Executeur`] de la chaîne en `f64` (ordre libre,
 //!   « Bypass all », aucune allocation au traitement) ;
 //! - [`quantification`] (T03) : la [`QuantificationPcm`], seule sortie du `f64`.
@@ -29,6 +31,7 @@ pub mod chaine;
 pub mod etage;
 pub mod executeur;
 pub mod greffon;
+pub mod migration;
 pub mod prereglages;
 pub mod quantification;
 pub mod resolution;
@@ -64,7 +67,7 @@ pub mod etages_fixes;
 /// d'énumération) ne la fait pas monter, puisque les clients les ignorent.
 pub const VERSION_CONTRAT: u32 = 1;
 
-/// Clé de réglage qui portera la chaîne d'une zone (lot T02).
+/// Clé de réglage qui porte la chaîne d'une zone (lot T02, [`migration`]).
 pub fn cle_chaine_zone(zone_id: i64) -> String {
     format!("zone_{zone_id}_tess_chain")
 }
