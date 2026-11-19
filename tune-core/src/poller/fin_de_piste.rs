@@ -1753,7 +1753,7 @@ impl PositionPoller {
         if tenue == crate::outputs::traits::SuivantePreparee::Perdue {
             notes.remove(&zone_id);
             drop(notes);
-            self.retenir_dsd_suivant_lache(zone_id, device_id, "suivante_perdue");
+            self.retenir_dsd_suivant_lache(zone_id, device_id, "suivante_perdue", true);
             return;
         }
         notes.insert(zone_id, device_id.to_string());
@@ -1768,18 +1768,38 @@ impl PositionPoller {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&zone_id);
         if let Some(appareil) = appareil {
-            self.retenir_dsd_suivant_lache(zone_id, &appareil, "avance_bloquee");
+            self.retenir_dsd_suivant_lache(zone_id, &appareil, "avance_bloquee", false);
         }
     }
 
-    fn retenir_dsd_suivant_lache(&self, zone_id: i64, device_id: &str, motif: &str) {
-        if self.orchestrator.retenir_dsd_suivant_lache(device_id) {
-            info!(
+    fn retenir_dsd_suivant_lache(
+        &self,
+        zone_id: i64,
+        device_id: &str,
+        motif: &str,
+        immediat: bool,
+    ) {
+        use crate::playback::gapless::{DUREE_GARDE_DSD_SUIVANT, IssueEchecDsdSuivant};
+        match self
+            .orchestrator
+            .retenir_dsd_suivant_lache(device_id, immediat)
+        {
+            IssueEchecDsdSuivant::Note { echecs } => info!(
                 zone_id,
                 device_id,
                 motif,
-                "gapless_dsd_next_dlna_non_suivi — garde DSD rendue à cet appareil jusqu'au redémarrage"
-            );
+                echecs,
+                "gapless_dsd_next_dlna_echec_note — suivant DSD encore tenté (#9206)"
+            ),
+            IssueEchecDsdSuivant::GardeRendue { echecs } => info!(
+                zone_id,
+                device_id,
+                motif,
+                echecs,
+                duree_secs = DUREE_GARDE_DSD_SUIVANT.as_secs(),
+                "gapless_dsd_next_dlna_non_suivi — garde DSD rendue à cet appareil, réessai après le délai"
+            ),
+            IssueEchecDsdSuivant::DejaGarde => {}
         }
     }
 }

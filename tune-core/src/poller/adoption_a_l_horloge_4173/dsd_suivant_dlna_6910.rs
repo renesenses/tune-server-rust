@@ -25,7 +25,7 @@
 //! | idem, règle #6477 apprise (lâche la piste au `SetNext`) | pas de `SetNext` |
 //! | DSD non annoncé, zone hors « natif » | le DSD part en PCM, armé comme avant |
 //! | annonce le DSD, SCPD illisible | garde conservée |
-//! | annonce tout, ne suit pas (RS130) | une transition perdue, puis garde rendue |
+//! | annonce tout, ne suit pas (RS130) | deux transitions perdues, puis garde rendue (#9206) |
 //! | zone en DoP | armé en WAV, comme avant |
 //!
 //! ## Ce que le banc ne prouve pas
@@ -39,7 +39,7 @@ use crate::outputs::traits::{AnnonceSuivante, TransportState};
 
 const DSF: &str = "ref_dsd64_stereo.dsf";
 
-fn annonce_dsd(oui: bool) -> DsdCapability {
+pub(super) fn annonce_dsd(oui: bool) -> DsdCapability {
     DsdCapability {
         supports_dsf: oui,
         supports_dff: false,
@@ -51,7 +51,7 @@ fn annonce_dsd(oui: bool) -> DsdCapability {
 impl Banc {
     /// La piste `ARMEE` devient un DSF ; la zone passe au mode DSD `mode` ;
     /// le renderer a annoncé `dsd` (GetProtocolInfo) et `suivante` (SCPD).
-    async fn monter_en_dsd(
+    pub(super) async fn monter_en_dsd(
         appareil: &str,
         mode: &str,
         dsd: DsdCapability,
@@ -97,7 +97,7 @@ impl Banc {
     }
 
     /// La fenêtre d'armement s'ouvre : quelques sondages.
-    async fn la_fenetre_d_armement(&mut self) {
+    pub(super) async fn la_fenetre_d_armement(&mut self) {
         for (position, horloge) in [(207_000, 210), (210_000, 213)] {
             self.renderer_a(position, horloge).await;
             self.tic().await;
@@ -249,8 +249,9 @@ async fn scpd_illisible_garde_la_garde() {
 }
 
 /// Le RS130 de #402 : il annonce tout, acquitte, puis s'arrête à zéro sans
-/// passer au DSD armé. La suivante est relancée (jamais un silence), et
-/// l'appareil retrouve la garde : une transition perdue, pas une par piste.
+/// passer au DSD armé. La suivante est relancée (jamais un silence). #9206 :
+/// ce premier échec est NOTÉ, l'appareil garde le suivant DSD ; au deuxième,
+/// il retrouve la garde — deux transitions perdues, pas une par piste.
 #[tokio::test]
 async fn suivant_dsd_arme_non_suivi_rend_la_garde_a_l_appareil() {
     let appareil = "uuid:banc-6910-rs130";
@@ -310,11 +311,21 @@ async fn suivant_dsd_arme_non_suivi_rend_la_garde_a_l_appareil() {
     );
     assert_eq!(banc.play_complets().await, vec![ARMEE.to_string()]);
     assert!(
+        banc.orchestrator
+            .dsd_suivant_tenu_sur_dlna(banc.zone_id, appareil, AnnonceSuivante::Annoncee)
+            .await,
+        "#9206 : un seul suivant DSD lâché ne retire plus le sans-blanc DSD à l'appareil"
+    );
+    // Le même constat à la transition suivante (celui que `tick` fait sur
+    // `track_end_gap` avec `gapless_sent`).
+    banc.orchestrator.retenir_dsd_suivant_lache(appareil, false);
+    assert!(
         !banc
             .orchestrator
             .dsd_suivant_tenu_sur_dlna(banc.zone_id, appareil, AnnonceSuivante::Annoncee)
             .await,
-        "#6910 : un renderer qui n'a pas suivi le DSD armé retrouve la garde de #402"
+        "#6910 : un renderer qui ne suit pas le DSD armé retrouve la garde de #402 \
+         (au deuxième échec, #9206)"
     );
 }
 

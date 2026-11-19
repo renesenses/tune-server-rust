@@ -4128,7 +4128,31 @@ impl PositionPoller {
                         // L'appareil qui n'annonce rien, qui ne retient rien,
                         // ou qui refuse le `Next` garde le repli d'aujourd'hui
                         // sans qu'une seule ligne change pour lui.
+                        // #9206 (fil 2961) — le renderer vient d'OUVRIR le
+                        // flux armé et le lit (`bytes=0-` puis `bytes=28-`),
+                        // mais nomme encore la piste finie : il bascule, son
+                        // URI retarde. Conclure ici coupait la transition (~2,5 s
+                        // de blanc) et lui retirait le sans-blanc DSD. La fin
+                        // est différée, au plus `FENETRE_BASCULE_SUR_FLUX_ARME_MS`
+                        // après le premier octet ; un flux préchargé de longue
+                        // date (DMP-A6, #4173) ne diffère rien.
+                        let premier_octet_arme_depuis_ms = match flux_arme.as_deref() {
+                            Some(f)
+                                if ps.past_end_ticks >= seuil_ticks
+                                    && enchainement == decisions::EnchainementArme::Aucun =>
+                            {
+                                self.orchestrator.streamer_premier_octet_depuis_ms(f).await
+                            }
+                            _ => None,
+                        };
+                        let bascule_en_cours = ps.past_end_ticks >= seuil_ticks
+                            && decisions::bascule_en_cours_sur_le_flux_arme(
+                                enchainement,
+                                octets_tires,
+                                premier_octet_arme_depuis_ms,
+                            );
                         let enchainement = if ps.past_end_ticks >= seuil_ticks
+                            && !bascule_en_cours
                             && decisions::bascule_sur_la_suivante_autorisee(
                                 is_dlna,
                                 ps.suivante_preparee,
@@ -4146,7 +4170,20 @@ impl PositionPoller {
                         // ci-dessous consomme `flux_arme`, et c'est justement
                         // sa présence ou son absence qui nomme la branche.
                         let flux_arme_journal = flux_arme.clone().unwrap_or_default();
-                        if let Some(flux) =
+                        if bascule_en_cours {
+                            info!(
+                                zone_id,
+                                position_ms = status.position_ms,
+                                track_dur = track_duration_ms,
+                                past_end_ticks = ps.past_end_ticks,
+                                epingle_piste_finie,
+                                flux_arme = flux_arme_journal.as_str(),
+                                uri_courante = status.current_uri.as_deref().unwrap_or(""),
+                                octets_tires = octets_tires.unwrap_or(0),
+                                premier_octet_depuis_ms = premier_octet_arme_depuis_ms.unwrap_or(0),
+                                "fin_differee_flux_arme_ouvert"
+                            );
+                        } else if let Some(flux) =
                             flux_arme.filter(|_| enchainement != decisions::EnchainementArme::Aucun)
                         {
                             Box::pin(self.adopter_l_enchainement_a_l_horloge(

@@ -662,7 +662,8 @@ impl PlaybackOrchestrator {
             .appareils_qui_lachent_le_dsd_suivant
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(device_id);
+            .get_mut(device_id)
+            .is_some_and(|m| m.garde_active(std::time::Instant::now()));
         crate::playback::gapless::refus_dsd_suivant_sur_dlna(
             annonce_dsd,
             natif_force,
@@ -671,13 +672,21 @@ impl PlaybackOrchestrator {
         )
     }
 
-    /// #6910 — `device_id` a lâché un suivant DSD armé : la garde de #402 lui
-    /// est rendue jusqu'au redémarrage. Vrai à la première fois seulement.
-    pub fn retenir_dsd_suivant_lache(&self, device_id: &str) -> bool {
+    /// #6910 — `device_id` a lâché un suivant DSD armé. #9206 : la garde de
+    /// #402 ne lui est rendue qu'au deuxième échec (ou tout de suite si
+    /// `immediat` : il a dit lui-même avoir perdu la suivante), et pour
+    /// [`crate::playback::gapless::DUREE_GARDE_DSD_SUIVANT`] seulement.
+    pub fn retenir_dsd_suivant_lache(
+        &self,
+        device_id: &str,
+        immediat: bool,
+    ) -> crate::playback::gapless::IssueEchecDsdSuivant {
         self.appareils_qui_lachent_le_dsd_suivant
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(device_id.to_string())
+            .entry(device_id.to_string())
+            .or_default()
+            .noter_echec(std::time::Instant::now(), immediat)
     }
 
     /// Banc : ce que le `GetProtocolInfo` du renderer aurait dit du DSD.

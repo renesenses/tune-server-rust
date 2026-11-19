@@ -451,6 +451,16 @@ pub struct StreamSession {
     retenue: std::sync::Mutex<RetenueDuCanal>,
     pub created_at: Instant,
     pub bytes_sent: std::sync::atomic::AtomicU64,
+    /// #9206 — instant du PREMIER octet servi sur cette session, toutes
+    /// connexions confondues (posé par [`Self::compter_octets_servis`]).
+    ///
+    /// `bytes_sent` dit combien, jamais QUAND. Or c'est le « quand » qui
+    /// sépare deux renderers que la fin de piste confondait : le DMP-A6
+    /// (#4173) précharge le flux armé ~3 s après le `SetNext`, soit ~27 s
+    /// avant la fin, et n'y passe jamais ; le lecteur du fil 2961 (Android
+    /// 7.1.2, DSF natif) l'ouvre À la fin (`bytes=0-` puis `bytes=28-`) et
+    /// bascule 1,2 s plus tard. Vide tant qu'aucun octet n'est parti.
+    pub premier_octet_servi: std::sync::OnceLock<Instant>,
     /// #4455 — reprises `Range` d'un fichier WAV dont le premier octet ne
     /// tombe PAS sur une frontière de trame PCM. Servies telles quelles
     /// (le fichier est adressable à l'octet), mais un renderer qui les
@@ -587,6 +597,24 @@ pub struct StreamSession {
 }
 
 impl StreamSession {
+    /// Compte `n` octets servis au lecteur — seul point d'écriture de
+    /// `bytes_sent` côté service HTTP — et date le premier (#9206).
+    pub fn compter_octets_servis(&self, n: u64) {
+        if n > 0 && self.premier_octet_servi.get().is_none() {
+            let _ = self.premier_octet_servi.set(Instant::now());
+        }
+        self.bytes_sent
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// #9206 — depuis combien de millisecondes le premier octet est parti ;
+    /// `None` tant qu'aucun ne l'a été.
+    pub fn premier_octet_depuis_ms(&self) -> Option<u64> {
+        self.premier_octet_servi
+            .get()
+            .map(|t| t.elapsed().as_millis() as u64)
+    }
+
     /// Une session-CANAL : la conversion à la volée (DSD→WAV), dont les octets
     /// ne se lisent qu'une fois. Ni fichier sur disque (Range réel), ni
     /// mandataire (Range relayé en amont), ni radio (déjà annoncée live).
@@ -776,6 +804,7 @@ impl StreamSession {
             retenue: std::sync::Mutex::new(RetenueDuCanal::default()),
             created_at: Instant::now(),
             bytes_sent: std::sync::atomic::AtomicU64::new(0),
+            premier_octet_servi: std::sync::OnceLock::new(),
             ranges_hors_trame: std::sync::atomic::AtomicU32::new(0),
             longueur_amont: std::sync::atomic::AtomicU64::new(0),
             requetes_mandataire: std::sync::atomic::AtomicU32::new(0),
@@ -2096,6 +2125,14 @@ impl AudioStreamer {
         sessions
             .get(stream_id)
             .map(|s| s.bytes_sent.load(std::sync::atomic::Ordering::Relaxed))
+    }
+
+    /// #9206 — depuis combien de millisecondes le premier octet de ce flux
+    /// est parti (voir [`StreamSession::premier_octet_servi`]). `None` :
+    /// session inconnue ou rien servi.
+    pub async fn stream_premier_octet_depuis_ms(&self, stream_id: &str) -> Option<u64> {
+        let sessions = self.sessions.lock().await;
+        sessions.get(stream_id)?.premier_octet_depuis_ms()
     }
 
     /// 🔴 #4480 — combien de MILLISECONDES D'AUDIO ont été servies à ce

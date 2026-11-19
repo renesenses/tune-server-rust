@@ -2065,6 +2065,51 @@ pub fn enchainement_sur_le_flux_arme(
     }
 }
 
+/// #9206 — fenêtre après le PREMIER octet servi sur le flux armé pendant
+/// laquelle une fin à l'horloge sans enchaînement attesté est différée.
+///
+/// Fil 2961 (Android 7.1.2, DSF natif, `SetNext` sans `Next`) : 1,2 s entre
+/// l'ouverture du flux armé et la remise à zéro de la position (19:47:16.8 →
+/// 18.0), et Tune coupait 1,15 s après l'ouverture (19:48:46.99 → 48.14).
+/// Quatre sondages couvrent ce délai trois fois ; au-delà, le repli d'avant.
+pub const FENETRE_BASCULE_SUR_FLUX_ARME_MS: u64 = 4_000;
+
+/// #9206 — octets à tirer du flux armé pour que l'ouverture compte : au-delà
+/// de l'en-tête et des sondes (`bytes=0-` refermé, sonde de fin), le renderer
+/// LIT les données (`bytes=28-` d'un DSF).
+pub const OCTETS_AU_DELA_DE_L_EN_TETE: u64 = 4_096;
+
+/// #9206 — la fin à l'horloge (épinglage #4382, gel #4173, horloge de Tune)
+/// tombe-t-elle PENDANT que le renderer bascule sur le flux armé ?
+///
+/// Vrai quand rien n'atteste l'enchaînement (`Aucun` : le renderer nomme
+/// encore la piste finie), mais que le flux armé vient d'être OUVERT — son
+/// premier octet est parti il y a au plus [`FENETRE_BASCULE_SUR_FLUX_ARME_MS`]
+/// — et LU au-delà de l'en-tête. L'URI que le renderer annonce retarde alors
+/// sur ce qu'il fait : la fin est différée, la remise à zéro de sa position
+/// (`gapless_advance_on_position_reset`) ou son URI (`Certain`) dira la suite.
+///
+/// Ce qui ne change pas :
+///
+/// - le DMP-A6 de #4173/#4382, qui précharge le flux armé ~3 s après le
+///   `SetNext` (premier octet ~27 s avant la fin) et n'y passe jamais : son
+///   ouverture est ancienne, le repli part au même sondage qu'avant ;
+/// - le RS130 de #402, qui ne tire pas un octet du flux armé ;
+/// - un renderer qui ouvre le flux à la fin sans jamais y passer : différé de
+///   la fenêtre au plus, puis le repli.
+///
+/// `premier_octet_depuis_ms` : `None` (rien servi, session disparue, octets
+/// posés sans date) ne diffère jamais.
+pub fn bascule_en_cours_sur_le_flux_arme(
+    enchainement: EnchainementArme,
+    octets_tires: Option<u64>,
+    premier_octet_depuis_ms: Option<u64>,
+) -> bool {
+    enchainement == EnchainementArme::Aucun
+        && octets_tires.is_some_and(|o| o > OCTETS_AU_DELA_DE_L_EN_TETE)
+        && premier_octet_depuis_ms.is_some_and(|ms| ms <= FENETRE_BASCULE_SUR_FLUX_ARME_MS)
+}
+
 /// Ce que devient une adoption prononcée à l'horloge, tick après tick (#4173).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SuiteAdoption {
