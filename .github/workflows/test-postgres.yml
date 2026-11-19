@@ -201,6 +201,28 @@ jobs:
       # Cout mesure sur Shrek (arbre chaud) : 4 min 47 pour tune-core seul,
       # 5 min 36 pour les deux, soit +49 s. La compilation de `tune-server` est
       # ensuite REUTILISEE par l'etape « Routes de tune-server » plus bas.
+      # Mémoire (#9025 suite, mesuré sur Shrek le 19/11, rustc 1.100, réglages
+      # de ce job) : les quatre rustc lourds de l'étape suivante sont
+      #   tune-core lib 5,5 Gio · tune-core lib de TEST 10,3 Gio
+      #   tune-server lib 5,6 Gio · tune-server lib de TEST 8,0 Gio
+      # À CARGO_BUILD_JOBS=3, cargo les lance EN MÊME TEMPS : pic simultané de
+      # 20,8 à 21,2 Gio (187 s au-dessus de 16 Gio sur Shrek, bien plus sur la
+      # machine gratuite), pour 16 Gio de RAM : l'échange tourne à vide et
+      # GitHub perd la machine. À l'exécution, aucun binaire de test ne
+      # dépasse 0,6 Gio (260 cibles de tune-server, 84 de tune-core mesurées).
+      # On sépare donc la compilation en deux temps, SANS changer les
+      # features (même commande `cargo test`, donc mêmes empreintes, rien
+      # n'est recompilé à l'étape suivante) :
+      # 1. dépendances + les deux bibliothèques (une petite cible d'essai
+      #    suffit à les tirer) : pic mesuré 7,2 Gio ;
+      # 2. les cibles lourdes une par une (-j1) : pic 10,2 Gio. Coût : ~+15 min
+      #    sur Shrek (1 592 s au lieu de 706 s pour cette compilation).
+      # `cargo build --lib` ne convient PAS : sans les dev-dependencies, la
+      # résolution des features change et tout tune-core est recompilé.
+      - name: Précompiler les bibliothèques (mémoire, #9025)
+        run: cargo test --no-run -p tune-core -p tune-server --no-default-features --features postgres,oaat --test annee_repli_album
+      - name: Précompiler les libs de test une à une (mémoire, #9025)
+        run: cargo test --no-run -j1 -p tune-core -p tune-server --no-default-features --features postgres,oaat --lib --bins
       - name: Tests tune-core et tune-server avec PostgreSQL
         run: cargo test --no-fail-fast -p tune-core -p tune-server --no-default-features --features postgres,oaat
 
