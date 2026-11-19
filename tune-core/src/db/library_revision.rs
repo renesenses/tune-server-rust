@@ -49,6 +49,11 @@ use super::engine::Engine;
 /// les masquages, les favoris, les notes d'album, les listes de lecture, les
 /// collections intelligentes, et `settings` (les collections manuelles y
 /// vivent, en JSON).
+///
+/// ⚠️ #9116 — les jauges figées pendant la pause (`avancement_suspendu_9116`
+/// dans tune-server) se fient aussi à cette révision. Le relevé ACOUSTIQUE
+/// dépend du périmètre (racines exclues), rangé dans `settings` : retirer
+/// `settings` d'ici laisserait cette jauge figée sur un périmètre changé.
 pub const TABLES_SUIVIES: [&str; 14] = [
     "tracks",
     "albums",

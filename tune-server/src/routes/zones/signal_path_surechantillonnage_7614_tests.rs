@@ -203,6 +203,8 @@ fn diagnostic_8259_le_chemin_restitue_le_refus_observe_et_non_un_reglage_deduit(
         ("source_probe_incomplete", "source"),
         ("output_path_not_supported", "chemin"),
         ("dop", "DoP"),
+        ("dsd", "DSD"),
+        ("compressed_stream", "compressé"),
         ("multiple_outputs", "plusieurs"),
         ("output_rate_open_failed", "impossible"),
         ("filter_initialization_failed", "impossible"),

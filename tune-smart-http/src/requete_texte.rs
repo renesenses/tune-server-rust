@@ -496,7 +496,8 @@ fn regle(
             let verdict = match simplifier(valeur).as_str() {
                 "verifie" => "verifie",
                 "conforme" => "conforme",
-                "douteux" => "douteux",
+                // #9067 — « Source altérée » : `altere` est un alias de `douteux`.
+                "douteux" | "altere" | "alteree" => "douteux",
                 "non_analyse" => "non_analyse",
                 _ => return refus("« verifie », « conforme », « douteux » ou « non_analyse »"),
             };

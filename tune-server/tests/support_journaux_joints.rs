@@ -113,7 +113,9 @@ fn app_vers(base: &str) -> Router {
     reglages
         .set("hardware_fingerprint", "empreinte-p2a-2916")
         .expect("empreinte");
-    tune_server::routes::router(state)
+    tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+    ))
 }
 
 /// Un vrai markdown de rapport de bogue, assez long (~4 Ko) pour qu'une
@@ -330,7 +332,10 @@ async fn temoin_sans_reglage_le_relais_de_test_ne_recoit_rien() {
     let state = AppState::new(":memory:", 0, Default::default()).expect("état en mémoire");
     // Pas de `mozaik_base_url`, et surtout pas de clé : `auth()` refuse par 412
     // AVANT toute sortie réseau — ce 412 est la preuve qu'on n'est pas sorti.
-    let app = tune_server::routes::router(state);
+    let app =
+        tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+        ));
 
     let envoi = json!({ "subject": "Question", "body": "DSD ?", "logs": "trace" });
     let (status, _) = poster(&app, "application/json", envoi.to_string().into_bytes()).await;

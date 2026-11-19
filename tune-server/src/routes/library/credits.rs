@@ -1019,6 +1019,7 @@ pub(crate) struct BilanTour {
 /// (0 sur 30 mesuré sur .18) et l'onglet Instrument à venir n'aurait rien à
 /// montrer. Bornée par tour, reprenable par curseur, effacée devant la passe
 /// manuelle, et derrière le même droit premium que les biographies.
+#[cfg_attr(feature = "sans-enrichissement", allow(dead_code))]
 pub(crate) fn spawn_passe_automatique_credits(state: &AppState) {
     let state = state.clone();
     tokio::spawn(passe_automatique_credits(state));

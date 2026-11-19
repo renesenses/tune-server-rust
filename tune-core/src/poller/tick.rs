@@ -2946,6 +2946,10 @@ impl PositionPoller {
                             // natural end so the poller re-triggers play instead
                             // of accumulating stopped_ticks until force_stop.
                             // (DEvir QA B-05: repeat mode doesn't work on DLNA)
+                            // #9031 — seulement quand la durée est inconnue :
+                            // une durée connue passe par `peak_reached_end`,
+                            // sinon un `Stopped` passager en pleine piste
+                            // (UAPP) faisait sauter au titre suivant.
                             let repeat_active =
                                 matches!(zone_state.repeat, RepeatMode::One | RepeatMode::All);
                             let natural_end = decisions::natural_end(
