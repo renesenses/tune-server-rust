@@ -1435,7 +1435,12 @@ async fn membres_d_un_rayon_de(
 // Cercle partagé (site-mozaiklabs#568) ----------------------------------------
 
 /// Compte le geste et rend le refus forcé, s'il y en a un.
-fn geste_entre_membres(f: &mut Faux, m: &Method, chemin: String, corps: &Bytes) -> Option<Response> {
+fn geste_entre_membres(
+    f: &mut Faux,
+    m: &Method,
+    chemin: String,
+    corps: &Bytes,
+) -> Option<Response> {
     f.gestes_entre_membres
         .push((format!("{m} {chemin}"), corps.to_vec()));
     f.refus_entre_membres
@@ -1455,7 +1460,9 @@ async fn partager_entre_membres(
         return r;
     }
     let mut f = e.lock().unwrap();
-    if let Some(r) = geste_entre_membres(&mut f, &m, format!("/circles/{id}/sharing/members"), &corps) {
+    if let Some(r) =
+        geste_entre_membres(&mut f, &m, format!("/circles/{id}/sharing/members"), &corps)
+    {
         return r;
     }
     let Some(k) = position(&f.circles, "id", &id) else {
