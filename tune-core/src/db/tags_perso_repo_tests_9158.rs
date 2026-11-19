@@ -481,3 +481,85 @@ fn la_fusion_d_albums_redirige_les_marques_du_scan_9158() {
     synchroniser(&b, "album", cible, &[]).unwrap();
     assert_eq!(noms(&b, "album", cible), vec!["Y".to_string()]);
 }
+
+// ---------------------------------------------------------------------------
+// Suite de la relecture (19/11 soir).
+// ---------------------------------------------------------------------------
+
+/// Un nom de tag impossible à créer saute SA piste ; le lot continue.
+#[test]
+fn un_nom_non_resolu_saute_sa_piste_sans_arreter_le_lot_9158() {
+    let b = base_sqlite();
+    poser(&b, 1100);
+    ecrire_lot(&b, &[entree(1101, &["Avant"])]);
+    b.execute_batch(
+        "CREATE TRIGGER interdit_9158 BEFORE INSERT ON tags WHEN NEW.name = 'Interdit' \
+         BEGIN SELECT RAISE(ABORT, 'interdit'); END;",
+    )
+    .unwrap();
+    let bilan = ecrire_lot(&b, &[entree(1101, &["Interdit"]), entree(1102, &["Ok"])]);
+    assert_eq!(noms(&b, "track", 1102), vec!["Ok".to_string()], "{bilan:?}");
+    assert_eq!(
+        noms(&b, "track", 1101),
+        vec!["Avant".to_string()],
+        "piste sautée : rien retiré"
+    );
+}
+
+/// Fusion : le tag que le doublon porte À LA MAIN et la cible du scan
+/// devient manuel sur la cible.
+#[test]
+fn la_fusion_garde_la_pose_manuelle_du_doublon_9158() {
+    let b = base_sqlite();
+    poser(&b, 1200);
+    let (cible, doublon) = (1200, 1201);
+    let repo = TagRepo::with_backend(b.clone());
+    let z = repo.create("Z", None).unwrap();
+    synchroniser(&b, "album", cible, &[z]).unwrap();
+    repo.tag_item(z, "album", doublon).unwrap();
+    crate::db::album_repo::AlbumRepo::with_backend(b.clone())
+        .absorber(cible, doublon)
+        .unwrap();
+    synchroniser(&b, "album", cible, &[]).unwrap();
+    assert_eq!(
+        noms(&b, "album", cible),
+        vec!["Z".to_string()],
+        "la pose manuelle du doublon ne part pas au scan"
+    );
+}
+
+/// Renommer un tag posé par le scan le rend manuel : le scan suivant ne le
+/// retire pas (il repose l'ancien nom, lu dans le fichier).
+#[test]
+fn renommer_un_tag_du_scan_le_rend_manuel_9158() {
+    let b = base_sqlite();
+    poser(&b, 1300);
+    ecrire_lot(&b, &[entree(1301, &["Nuit"])]);
+    let repo = TagRepo::with_backend(b.clone());
+    let id = repo
+        .get_by_name("Nuit")
+        .unwrap()
+        .and_then(|t| t.id)
+        .unwrap();
+    // Changer seulement la casse ne compte pas comme un renommage.
+    repo.update(id, Some("NUIT"), None).unwrap();
+    ecrire_lot(&b, &[entree(1301, &[])]);
+    assert_eq!(
+        noms(&b, "track", 1301),
+        Vec::<String>::new(),
+        "casse : reste du scan"
+    );
+    ecrire_lot(&b, &[entree(1301, &["Nuit"])]);
+    repo.update(id, Some("Soir"), None).unwrap();
+    ecrire_lot(&b, &[entree(1301, &["Nuit"])]);
+    assert_eq!(
+        noms(&b, "track", 1301),
+        vec!["Nuit".to_string(), "Soir".to_string()]
+    );
+    ecrire_lot(&b, &[entree(1301, &[])]);
+    assert_eq!(
+        noms(&b, "track", 1301),
+        vec!["Soir".to_string()],
+        "Soir est manuel"
+    );
+}
