@@ -84,12 +84,20 @@ pub fn activer(db: &Arc<dyn DbBackend>, actif: bool) -> Result<(), String> {
 /// `signature_de_codec`, … — jamais plus par lui —, la piste sort donc des
 /// candidates après un passage. Les autres mesures ne sont pas touchées.
 ///
-/// #9067 — seulement pour un fichier qui se dit hi-res : la ligne
-/// `coupure_de_codec` d'un CD (16 bits, 48 kHz au plus) se lit déjà
-/// `conforme` (verdict effectif) ; la remesurer serait un décodage inutile.
-const A_REMESURER: &str = "EXISTS (SELECT 1 FROM hires_verifications h \
-     WHERE h.track_id = t.id AND h.raison = 'coupure_de_codec' \
-     AND (h.sample_rate > 48000 OR h.bits_declares > 16))";
+/// #9067 (décision du 19/11, « Source altérée ») — les CD sont remesurés
+/// aussi, mais seulement les lignes que la nouvelle règle (mur de codec) peut
+/// changer : voir [`super::faux_hires::cd_a_remesurer_sql`]. Les lignes
+/// `coupure_de_codec` des fichiers hi-res le restent comme avant (#9035).
+/// Une ligne remesurée n'est plus candidate : la boucle ne tourne pas.
+fn a_remesurer() -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM hires_verifications h WHERE h.track_id = t.id AND \
+         ((h.raison = '{codec}' AND (h.sample_rate > 48000 OR h.bits_declares > 16)) \
+          OR {cd}))",
+        codec = super::faux_hires::RAISON_HERITEE_CODEC,
+        cd = super::faux_hires::cd_a_remesurer_sql("h"),
+    )
+}
 
 /// Le prédicat des candidats : pistes LOCALES sans perte, avec un chemin, pas
 /// encore mesurées (ou à remesurer, #9035), dans le périmètre des analyses.
@@ -104,7 +112,7 @@ fn where_candidats(db: &Arc<dyn DbBackend>) -> String {
          AND LOWER(COALESCE(t.format, '')) IN ({formats}) \
          AND (NOT EXISTS (SELECT 1 FROM hires_verifications h WHERE h.track_id = t.id) \
               OR {a_remesurer}){perimetre}",
-        a_remesurer = A_REMESURER,
+        a_remesurer = a_remesurer(),
         local = crate::db::track_repo::sql::PISTE_LOCALE,
         formats = formats.join(", "),
         perimetre = crate::taches_de_fond::perimetre::clause_decodage(db),
@@ -151,7 +159,7 @@ pub fn prochains_candidats(db: &Arc<dyn DbBackend>, n: usize) -> Vec<Candidat> {
             "SELECT t.id, t.file_path, COALESCE(t.duration_ms, 0) FROM tracks t \
              WHERE {} ORDER BY CASE WHEN {} THEN 1 ELSE 0 END, t.id LIMIT {}",
             where_candidats(db),
-            A_REMESURER,
+            a_remesurer(),
             ph(db.engine(), 1)
         ),
         &[&n as &dyn ToSqlValue],
@@ -240,6 +248,24 @@ pub fn enregistrer(
     resultat: &Result<Mesure, String>,
 ) -> Result<(), String> {
     let e = db.engine();
+    // #9067 — la REMESURE d'un CD (règle du 19/11) qui ne peut pas lire le
+    // fichier : il n'a jamais été montré altéré sans mur (verdict effectif
+    // `conforme`), il le reste, marqué pour ne plus être candidat.
+    if resultat.is_err() {
+        let gardee = db.execute(
+            &format!(
+                "UPDATE hires_verifications SET verdict = 'conforme', raison = '{}' \
+                 WHERE track_id = {} AND {}",
+                super::faux_hires::RAISON_CD_SANS_MUR,
+                ph(e, 1),
+                super::faux_hires::cd_a_remesurer_sql("hires_verifications")
+            ),
+            &[&track_id as &dyn ToSqlValue],
+        )?;
+        if gardee > 0 {
+            return Ok(());
+        }
+    }
     // #9035 — une REMESURE (ligne `coupure_de_codec`) qui ne peut pas lire le
     // fichier (NAS en veille, disque débranché) ne perd pas la mesure réelle :
     // le verdict douteux et sa coupure restent, seule la raison devient
@@ -264,9 +290,17 @@ pub fn enregistrer(
     let (verdict, raison, coupure, bits, rate, bits_declares) = match resultat {
         Ok(m) => {
             let v = juger(m);
+            // #9067 — un CD conforme malgré une coupure suspecte (pas de mur)
+            // garde une trace, jamais publiée, de la règle qui l'a jugé.
+            let raison = v.code_raison().map(str::to_string).or_else(|| {
+                (v == Verdict::Conforme
+                    && m.coupure_hz
+                        .is_some_and(|f| f < super::faux_hires::COUPURE_LOSSY_MAX_HZ))
+                .then(|| super::faux_hires::RAISON_CD_SANS_MUR.to_string())
+            });
             (
                 v.code().to_string(),
-                v.code_raison().map(str::to_string),
+                raison,
                 m.coupure_hz,
                 m.bits_effectifs.map(|b| b as i64),
                 Some(m.sample_rate as i64),
@@ -392,14 +426,16 @@ pub async fn courir(db: Arc<dyn DbBackend>) {
     }
 }
 
-/// #9035 — combien de pistes d'un album sont DOUTEUSES, sur combien de
-/// pistes mesurées qui SE DISENT HI-RES (#9067 : vérifiées ou douteuses ; un
-/// CD conforme n'entre pas dans le compte) : « 3 pistes sur 10 ».
+/// #9035 — combien de pistes d'un album sont DOUTEUSES (« source altérée »),
+/// sur combien de pistes mesurées : « 3 pistes sur 10 ». #9067 (19/11) — la
+/// source altérée couvre tous les formats : toutes les pistes mesurées
+/// concluantes comptent (vérifiées, conformes ou douteuses), un CD conforme
+/// aussi. Un album ne peut donc pas être altéré par une piste sur dix.
 pub fn pistes_en_cause(pistes: &[(String, Option<String>)]) -> (usize, usize) {
     let douteuses = pistes.iter().filter(|(v, _)| v == "douteux").count();
     let mesurees = pistes
         .iter()
-        .filter(|(v, _)| v == "verifie" || v == "douteux")
+        .filter(|(v, _)| v == "verifie" || v == "conforme" || v == "douteux")
         .count();
     (douteuses, mesurees)
 }

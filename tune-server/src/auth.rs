@@ -1822,6 +1822,13 @@ fn renouveler_les_secrets(settings: &SettingsRepo) {
     ] {
         settings.delete(cle).ok();
     }
+    // Celles des profils (`…_profil_{id}`), dates comprises.
+    for (cle, _) in settings.all().unwrap_or_default() {
+        if cle.starts_with("mozaik_pkce_pending") || cle.starts_with("mozaik_redirect_uri_pending")
+        {
+            settings.delete(&cle).ok();
+        }
+    }
 }
 
 fn refus_activation_hors_machine() -> Response {

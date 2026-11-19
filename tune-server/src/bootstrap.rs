@@ -1100,6 +1100,16 @@ pub fn installer_le_journal(niveau_journal: &str) -> Option<std::path::PathBuf> 
         return Some(chemin);
     }
 
+    // #9118 — aucun fichier : l'export ne retentera pas ces chemins à chaque
+    // rapport, il ira droit aux replis (journald, syslog).
+    if !refus_du_journal.is_empty() {
+        let raison = refus_du_journal
+            .iter()
+            .map(|(chemin, e)| format!("{} : {e}", chemin.display()))
+            .collect::<Vec<_>>()
+            .join(" ; ");
+        config::retenir_le_refus_du_journal(raison);
+    }
     tracing_subscriber::fmt()
         .with_timer(timer)
         .with_ansi(la_console_veut_des_couleurs())

@@ -374,10 +374,11 @@ fn un_album_n_est_douteux_qu_a_partir_de_la_moitie_9035() {
     assert_eq!(pistes_en_cause(&album(2, "verifie")), (2, 10));
     assert_eq!(
         verdict_d_album(&album(2, "conforme")),
-        ("douteux".into(), Some("coupure_spectrale".into())),
-        "#9067 — la moitié se compte sur les pistes qui se disent hi-res : 2 sur 2"
+        ("conforme".into(), None),
+        "#9067 (19/11) — source altérée, tous formats : la moitié se compte sur \
+         toutes les pistes mesurées, CD conformes compris : 2 sur 10"
     );
-    assert_eq!(pistes_en_cause(&album(2, "conforme")), (2, 2));
+    assert_eq!(pistes_en_cause(&album(2, "conforme")), (2, 10));
     assert_eq!(
         verdict_d_album(&album(4, "verifie")),
         ("verifie".into(), None)
@@ -503,27 +504,120 @@ fn une_remesure_illisible_garde_le_verdict_douteux_9035() {
     assert_eq!(compter_les_candidats(&db), 0);
 }
 
-/// #9067 — la ligne `coupure_de_codec` d'un CD (16 bits, 48 kHz au plus) se
-/// lit déjà `conforme` : elle n'est PAS remesurée (décodage inutile). Celle
-/// d'un 24/44,1 l'est.
+/// #9067 (décision du 19/11, « Source altérée ») — les lignes d'un CD que la
+/// nouvelle règle (mur de codec) peut changer sont REMESURÉES une fois : un CD
+/// rangé `douteux` sur la seule coupure (avant #9067), un CD rangé `conforme`
+/// avec une coupure suspecte sans trace de la règle (du 18 au 19/11). Celles
+/// qui portent déjà le jugement du 19/11 (`mur_de_codec`, `coupure_sans_mur`),
+/// un CD conforme sans coupure suspecte et un hi-res ne le sont pas.
 #[test]
-fn la_ligne_codec_d_un_cd_n_est_pas_remesuree_9067() {
+fn les_lignes_d_un_cd_a_rejuger_sont_remesurees_9067() {
     let db = base();
-    for id in 1..=2 {
+    for id in 1..=8 {
         piste(&db, id, &format!("/m/a/{id}.flac"), "flac", "local");
     }
-    for (id, rate, bits) in [(1i64, 44_100i64, 16i64), (2, 44_100, 24)] {
+    let lignes: [(i64, &str, Option<&str>, Option<f64>, i64, i64); 8] = [
+        (
+            1,
+            "douteux",
+            Some("coupure_de_codec"),
+            Some(16000.0),
+            44_100,
+            16,
+        ),
+        (
+            2,
+            "douteux",
+            Some("coupure_spectrale"),
+            Some(17000.0),
+            48_000,
+            16,
+        ),
+        (3, "conforme", None, Some(16000.0), 44_100, 16),
+        (
+            4,
+            "douteux",
+            Some("mur_de_codec"),
+            Some(16000.0),
+            44_100,
+            16,
+        ),
+        (
+            5,
+            "conforme",
+            Some("coupure_sans_mur"),
+            Some(18000.0),
+            44_100,
+            16,
+        ),
+        (6, "conforme", None, Some(21000.0), 44_100, 16),
+        (7, "conforme", None, None, 44_100, 16),
+        (
+            8,
+            "douteux",
+            Some("coupure_spectrale"),
+            Some(16000.0),
+            96_000,
+            24,
+        ),
+    ];
+    for (id, verdict, raison, coupure, rate, bits) in lignes {
+        let verdict = verdict.to_string();
+        let raison = raison.map(str::to_string);
         db.execute(
             "INSERT INTO hires_verifications (track_id, verdict, raison, coupure_hz, sample_rate, bits_declares) \
-             VALUES (?1, 'douteux', 'coupure_de_codec', 16000.0, ?2, ?3)",
-            &[&id as &dyn ToSqlValue, &rate, &bits],
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            &[&id as &dyn ToSqlValue, &verdict, &raison, &coupure, &rate, &bits],
         )
         .unwrap();
     }
-    let ids: Vec<i64> = prochains_candidats(&db, 10)
+    let ids: Vec<i64> = prochains_candidats(&db, 20)
         .iter()
         .map(|c| c.track_id)
         .collect();
-    assert_eq!(ids, vec![2], "seul le 24/44,1 est remesuré, pas le CD");
-    assert_eq!(compter_les_candidats(&db), 1);
+    assert_eq!(ids, vec![1, 2, 3], "seules les lignes CD à rejuger");
+    assert_eq!(compter_les_candidats(&db), 3);
+
+    // Remesurées : un mur → `mur_de_codec` ; pas de mur → conforme marqué ;
+    // illisible → conforme marqué. Aucune ne redevient candidate.
+    let cd = |en_mur: bool| Mesure {
+        sample_rate: 44_100,
+        bits_declares: 16,
+        bits_effectifs: Some(16),
+        coupure_hz: Some(16_000.0),
+        fenetres_jugees: 4,
+        fenetres_coupees: vec![
+            crate::audio::faux_hires::FenetreCoupee {
+                debut_s: 0.0,
+                fin_s: 1.0,
+                coupure_hz: 16_000.0,
+            };
+            4
+        ],
+        coupure_en_mur: en_mur,
+        ..Default::default()
+    };
+    enregistrer(&db, 1, &Ok(cd(true))).unwrap();
+    enregistrer(&db, 2, &Ok(cd(false))).unwrap();
+    enregistrer(&db, 3, &Err("NAS en veille".into())).unwrap();
+    assert_eq!(compter_les_candidats(&db), 0);
+    let lire = |id: i64| {
+        let r = db
+            .query_one(
+                &format!("SELECT verdict, raison FROM hires_verifications WHERE track_id = {id}"),
+                &[],
+            )
+            .unwrap()
+            .unwrap();
+        (r[0].as_string().unwrap(), r[1].as_string())
+    };
+    assert_eq!(lire(1), ("douteux".into(), Some("mur_de_codec".into())));
+    assert_eq!(
+        lire(2),
+        ("conforme".into(), Some("coupure_sans_mur".into()))
+    );
+    assert_eq!(
+        lire(3),
+        ("conforme".into(), Some("coupure_sans_mur".into()))
+    );
 }
