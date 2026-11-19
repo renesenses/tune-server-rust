@@ -507,3 +507,50 @@ async fn un_album_cd_coupe_a_16_khz_n_est_pas_hires_douteux_9067() {
         .collect();
     assert!(!ids.contains(&12), "filtre douteux : {ids:?}");
 }
+
+/// #9067 (décision du 19/11, « Source altérée ») — un album CD 16/44,1 dont
+/// les pistes portent un MUR de codec (raison `mur_de_codec`) est altéré : sa
+/// fiche le dit `douteux` (mot publié inchangé) avec la raison et la coupure,
+/// il sort sous `?hires_verdict=douteux` comme sous l'alias `altere`, et
+/// l'état annonce `source_alteree`. Contre-épreuve : l'album CD rangé sur la
+/// seule coupure (avant #9067) reste conforme, sous les deux mots.
+#[tokio::test]
+async fn un_album_cd_au_mur_de_codec_est_une_source_alteree_9067() {
+    let (app, state) = banc();
+    let mut sql =
+        String::from("INSERT INTO albums (id, title) VALUES (13, 'MP3'), (14, 'Vieux CD');");
+    for (album, raison) in [(13, "mur_de_codec"), (14, "coupure_de_codec")] {
+        for i in 0..3 {
+            let piste = album * 100 + i;
+            sql.push_str(&format!(
+                "INSERT INTO tracks (id, title, album_id, file_path, format, duration_ms) \
+                 VALUES ({piste}, 't', {album}, '/m/{piste}.flac', 'flac', 60000);
+                 INSERT INTO hires_verifications (track_id, verdict, raison, coupure_hz, bits_effectifs, sample_rate, bits_declares) \
+                 VALUES ({piste}, 'douteux', '{raison}', 16000.0, 16, 44100, 16);"
+            ));
+        }
+    }
+    state.backend.execute_batch(&sql).unwrap();
+    montrer_douteux(&app, true).await;
+    let etat = get(&app, "/api/v1/library/hires-check").await;
+    assert_eq!(etat["source_alteree"], true, "{etat}");
+    let c = get(&app, "/api/v1/library/albums/13/hires").await;
+    assert_eq!(c["verdict"], "douteux", "{c}");
+    assert_eq!(c["raison"], "mur_de_codec", "{c}");
+    assert_eq!(c["pistes_douteuses"], 3, "{c}");
+    assert_eq!(c["pistes_mesurees"], 3, "{c}");
+    assert_eq!(c["coupure_hz"], 16000.0, "{c}");
+    assert_eq!(c["pistes"][0]["raison"], "mur_de_codec", "{c}");
+    let c = get(&app, "/api/v1/library/albums/14/hires").await;
+    assert_eq!(c["verdict"], "conforme", "{c}");
+    for mot in ["douteux", "altere"] {
+        let page = get(
+            &app,
+            &format!("/api/v1/library/albums?hires_verdict={mot}&limit=50"),
+        )
+        .await;
+        let ids = ids(&page);
+        assert!(ids.contains(&13), "{mot} : {ids:?}");
+        assert!(!ids.contains(&14), "{mot} : {ids:?}");
+    }
+}
