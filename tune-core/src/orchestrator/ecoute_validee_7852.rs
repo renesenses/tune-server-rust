@@ -311,22 +311,51 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// #9143 — les réglages d'un profil viennent de changer : l'option
+    /// « retirer d'Écouter plus tard » se relira.
+    pub fn reglages_du_profil_modifies(&self) {
+        self.sas_retrait.reglages_modifies();
+    }
+
     /// #9143 — la piste en lecture est-elle achevée (90 % ou fin naturelle) ?
     /// Elle compte alors pour l'écoute complète de l'album en session, qui
     /// sort l'album d'« Écouter plus tard » si le profil l'a demandé. Appelé
-    /// par le sondeur à chaque tour en lecture, et à la fin naturelle.
+    /// par le sondeur à chaque tour en lecture, et à la fin naturelle. Le
+    /// total d'un album de SERVICE se demande au service hors du sondeur.
     pub fn noter_piste_achevee_pour_le_sas(&self, etat: &ZoneState, naturel: bool) {
-        let Ok(mut suivis) = self.suivis_ecouter_plus_tard.lock() else {
+        use crate::db::ecouter_plus_tard_retrait::Suite;
+        let suite = match self.sas_retrait.noter(&self.db, etat, naturel) {
+            Ok(Some(s)) => s,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(zone_id = etat.zone_id, error = %e, "ecouter_plus_tard_non_retire");
+                return;
+            }
+        };
+        let Suite::VerifierService(v) = suite else {
             return;
         };
-        if let Err(e) = crate::db::ecouter_plus_tard_retrait::noter_piste_achevee(
-            &self.db,
-            &mut suivis,
-            etat,
-            naturel,
-        ) {
-            tracing::warn!(zone_id = etat.zone_id, error = %e, "ecouter_plus_tard_non_retire");
-        }
+        let (db, services, sas) = (
+            self.db.clone(),
+            self.services.clone(),
+            self.sas_retrait.clone(),
+        );
+        tokio::spawn(async move {
+            let service = services.lock().await.get_actif(&v.source).await;
+            let total = match service {
+                Some(s) => s
+                    .read()
+                    .await
+                    .get_album(&v.id)
+                    .await
+                    .ok()
+                    .map(|a| a.track_count),
+                None => None,
+            };
+            if let Err(e) = sas.conclure_service(&db, &v, total) {
+                tracing::warn!(zone_id = v.zone_id, error = %e, "ecouter_plus_tard_non_retire");
+            }
+        });
     }
 
     /// Une écoute est-elle en attente sur la zone ? (diagnostic et tests)
