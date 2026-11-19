@@ -39,8 +39,31 @@ pub fn router() -> Router<UpnpState> {
 
 /// Build a standalone Axum `Router` (with state already applied) suitable for
 /// merging into the main server or serving separately.
+///
+/// #9079 — toutes les routes du MediaServer passent par
+/// [`serveur_coupe_en_404`] : serveur multimédia désactivé, elles répondent
+/// 404 au lieu de servir encore la description et le catalogue.
 pub fn standalone_router(state: UpnpState) -> Router {
-    router().with_state(state)
+    router()
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            serveur_coupe_en_404,
+        ))
+        .with_state(state)
+}
+
+/// #9079 — un point de contrôle qui a déjà vu Tune (JPLAY) le revalide par
+/// un GET de sa LOCATION. Tant que la description répondait, il le gardait
+/// dans sa liste même annonce coupée.
+async fn serveur_coupe_en_404(
+    State(state): State<UpnpState>,
+    requete: axum::extract::Request,
+    suite: axum::middleware::Next,
+) -> Response {
+    if !state.annonce.est_actif() {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    suite.run(requete).await
 }
 
 async fn device_description(State(state): State<UpnpState>) -> impl IntoResponse {
@@ -115,4 +138,111 @@ async fn connection_manager_control(body: String) -> impl IntoResponse {
     soap_response(tune_core::upnp_server::build_connection_manager_response(
         &body,
     ))
+}
+
+#[cfg(test)]
+mod serveur_coupe_9079_tests {
+    use std::sync::Arc;
+
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+    use tune_core::db::backend::DbBackend;
+    use tune_core::upnp_server::UpnpState;
+
+    fn etat(upnp_enabled: Option<&str>) -> UpnpState {
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        if let Some(v) = upnp_enabled {
+            tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+                .set("upnp_enabled", v)
+                .unwrap();
+        }
+        UpnpState::new(backend, 8888, None)
+    }
+
+    async fn statut(state: &UpnpState, methode: &str, chemin: &str) -> StatusCode {
+        super::standalone_router(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method(methode)
+                    .uri(chemin)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
+    }
+
+    const ROUTES: &[(&str, &str)] = &[
+        ("GET", "/description.xml"),
+        ("POST", "/ContentDirectory/control"),
+        ("SUBSCRIBE", "/ContentDirectory/event"),
+        ("GET", "/ContentDirectory/scpd.xml"),
+        ("POST", "/ConnectionManager/control"),
+        ("SUBSCRIBE", "/ConnectionManager/event"),
+        ("GET", "/ConnectionManager/scpd.xml"),
+    ];
+
+    /// Le symptôme : `upnp_enabled=false`, la description répondait encore.
+    #[tokio::test]
+    async fn serveur_coupe_toutes_les_routes_repondent_404() {
+        let state = etat(Some("false"));
+        for (methode, chemin) in ROUTES {
+            assert_eq!(
+                statut(&state, methode, chemin).await,
+                StatusCode::NOT_FOUND,
+                "{methode} {chemin} doit repondre 404 quand le serveur multimedia est coupe"
+            );
+        }
+    }
+
+    /// Témoin : en service (réglage absent ou à true), la description et le
+    /// SCPD répondent 200 — la garde ne coupe pas un serveur actif.
+    #[tokio::test]
+    async fn serveur_en_service_la_description_repond() {
+        for reglage in [None, Some("true")] {
+            let state = etat(reglage);
+            assert_eq!(
+                statut(&state, "GET", "/description.xml").await,
+                StatusCode::OK
+            );
+            assert_eq!(
+                statut(&state, "GET", "/ContentDirectory/scpd.xml").await,
+                StatusCode::OK
+            );
+        }
+    }
+
+    /// La bascule prend effet sans redémarrage, dans les deux sens.
+    #[tokio::test]
+    async fn la_bascule_prend_effet_sans_redemarrage() {
+        let state = etat(None);
+        assert_eq!(
+            statut(&state, "GET", "/description.xml").await,
+            StatusCode::OK
+        );
+        state.annonce.basculer(false);
+        assert_eq!(
+            statut(&state, "GET", "/description.xml").await,
+            StatusCode::NOT_FOUND
+        );
+        state.annonce.basculer(true);
+        assert_eq!(
+            statut(&state, "GET", "/description.xml").await,
+            StatusCode::OK
+        );
+    }
+
+    /// Garde de câblage : POST /api/v1/upnp/config bascule l'interrupteur et
+    /// envoie le byebye quand on coupe.
+    #[test]
+    fn l_ecran_de_configuration_bascule_et_retire_du_reseau() {
+        let ecran = include_str!("upnp.rs");
+        assert!(ecran.contains("upnp.annonce.basculer(enabled)"));
+        assert!(ecran.contains("tune_core::upnp_server::retirer_du_reseau().await"));
+    }
 }

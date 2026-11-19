@@ -68,7 +68,16 @@ async fn serveur_avec_licence(
     settings.set("mozaik_base_url", base_url).unwrap();
     settings.set("server_id", "serveur-7726").unwrap();
     state.license.set_license_key(CLE).await.unwrap();
-    (tune_server::routes::router(state.clone()), state, dir)
+    (
+        tune_server::routes::router(state.clone()).layer(
+            axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                50000,
+            ))),
+        ),
+        state,
+        dir,
+    )
 }
 
 async fn appeler(app: &axum::Router, methode: &str, uri: &str) -> (StatusCode, Value) {

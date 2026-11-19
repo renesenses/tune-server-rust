@@ -803,6 +803,18 @@ async fn appel_depuis_cette_machine(parts: &mut Parts, state: &AppState) -> bool
         .is_some_and(adresse_de_cette_machine)
 }
 
+/// La même règle que [`AdminOuCetteMachine`], sans rejet ni trace : pour une
+/// route ouverte à tous qui ne détaille certains champs qu'à l'administrateur
+/// (authentification active) ou à un appel de cette machine (#9083).
+pub async fn admin_ou_cette_machine(parts: &mut Parts, state: &AppState) -> bool {
+    if authentification_active(state) {
+        return <RequireAdmin as FromRequestParts<AppState>>::from_request_parts(parts, state)
+            .await
+            .is_ok();
+    }
+    appel_depuis_cette_machine(parts, state).await
+}
+
 /// En-têtes qu'un mandataire inverse ajoute en relayant une requête.
 const ENTETES_DE_MANDATAIRE: &[&str] = &[
     "forwarded",
@@ -1809,6 +1821,13 @@ fn renouveler_les_secrets(settings: &SettingsRepo) {
         "mozaik_redirect_uri_pending",
     ] {
         settings.delete(cle).ok();
+    }
+    // Celles des profils (`…_profil_{id}`), dates comprises.
+    for (cle, _) in settings.all().unwrap_or_default() {
+        if cle.starts_with("mozaik_pkce_pending") || cle.starts_with("mozaik_redirect_uri_pending")
+        {
+            settings.delete(&cle).ok();
+        }
     }
 }
 

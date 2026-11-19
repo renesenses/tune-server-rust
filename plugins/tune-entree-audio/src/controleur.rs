@@ -232,6 +232,7 @@ impl Controleur {
         let veille = Arc::new(AtomicBool::new(true));
         self.surveiller(
             capture.nom.clone(),
+            capture.id.clone(),
             format.frequence,
             veille.clone(),
             anneau.clone(),
@@ -251,6 +252,9 @@ impl Controleur {
     fn surveiller(
         &self,
         entree: String,
+        // #9070 — l'identifiant du PCM ouvert : la fréquence se relit sur
+        // lui, pas sur un homonyme de même nom.
+        peripherique: String,
         frequence: u32,
         veille: Arc<AtomicBool>,
         anneau: Arc<Anneau>,
@@ -279,7 +283,7 @@ impl Controleur {
                         }
                         return;
                     }
-                    let Some(f) = periph.frequence_courante(&entree) else {
+                    let Some(f) = periph.frequence_courante(&peripherique) else {
                         continue;
                     };
                     if f != frequence {

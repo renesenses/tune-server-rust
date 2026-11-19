@@ -68,7 +68,9 @@ fn app_vers(base_url: &str) -> axum::Router {
     SettingsRepo::with_backend(state.backend.clone())
         .set("mozaik_base_url", base_url)
         .unwrap();
-    tune_server::routes::router(state)
+    tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+    ))
 }
 
 /// Envoie un POST JSON et rend (statut, en-tête `Retry-After`, corps).

@@ -116,6 +116,8 @@ pub mod streaming_favorites_repo;
 /// « Pas pour moi » — suggestions d'accueil écartées, par profil (web#916).
 pub mod suggestions_ecartees;
 pub mod tag_repo;
+/// Balises personnelles → tags Tune : pose et marque d'origine (#9158).
+pub mod tags_perso_repo;
 /// Registre des executions automatisees (#2080).
 pub mod task_run_repo;
 /// #8625 — le comptage de la bibliothèque partagé par tous les écrans.

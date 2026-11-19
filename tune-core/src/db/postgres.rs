@@ -202,6 +202,16 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
             PRIMARY KEY (profile_id, item_type, source, source_id)\
         )",
     "CREATE INDEX IF NOT EXISTS idx_streaming_hidden_items_item ON streaming_hidden_items(item_type, source, source_id)",
+    // #9158 — marque d'origine « scan » des tags tirés des balises
+    // personnelles. Sans script numéroté, même régime que la table
+    // ci-dessus : ce rattrapage rejoué à chaque démarrage la pose partout.
+    "CREATE TABLE IF NOT EXISTS item_tags_scan (\
+            tag_id BIGINT NOT NULL,\
+            item_type TEXT NOT NULL,\
+            item_id BIGINT NOT NULL,\
+            PRIMARY KEY (tag_id, item_type, item_id)\
+        )",
+    "CREATE INDEX IF NOT EXISTS idx_item_tags_scan_item ON item_tags_scan(item_type, item_id)",
     // « Pas pour moi » de l'accueil (web#916, PG 111). Ici AUSSI : une base
     // PostgreSQL convertie avant cette version ne rejoue pas la 111, et les
     // rangées de `/home/*` LISENT la table à chaque affichage.
