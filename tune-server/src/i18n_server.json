@@ -7216,5 +7216,41 @@
     "pl": "To urządzenie nadal jest w sieci: jego strefa „{zone}” zostaje zachowana. Aby je ukryć, zignoruj urządzenie.",
     "el": "Αυτή η συσκευή είναι ακόμη στο δίκτυο: η ζώνη της «{zone}» διατηρείται. Για να την κρύψετε, αγνοήστε τη συσκευή.",
     "tr": "Bu cihaz hâlâ ağda: “{zone}” bölgesi korunuyor. Gizlemek için bunun yerine cihazı yok sayın."
+  },
+  "api.circle.adminRequired": {
+    "fr": "Seul un administrateur de ce serveur peut modifier le cercle.",
+    "en": "Only an administrator of this server can change the circle.",
+    "de": "Nur ein Administrator dieses Servers kann den Kreis ändern.",
+    "es": "Solo un administrador de este servidor puede modificar el círculo.",
+    "it": "Solo un amministratore di questo server può modificare la cerchia.",
+    "zh": "只有此服务器的管理员才能修改圈子。",
+    "ja": "サークルを変更できるのはこのサーバーの管理者だけです。",
+    "ko": "이 서버의 관리자만 서클을 변경할 수 있습니다.",
+    "ro": "Doar un administrator al acestui server poate modifica cercul.",
+    "sv": "Endast en administratör för den här servern kan ändra cirkeln.",
+    "hu": "Csak a szerver rendszergazdája módosíthatja a kört.",
+    "vi": "Chỉ quản trị viên của máy chủ này mới có thể thay đổi vòng kết nối.",
+    "nb": "Bare en administrator for denne serveren kan endre sirkelen.",
+    "pl": "Tylko administrator tego serwera może zmieniać krąg.",
+    "el": "Μόνο ένας διαχειριστής αυτού του διακομιστή μπορεί να αλλάξει τον κύκλο.",
+    "tr": "Çevreyi yalnızca bu sunucunun yöneticisi değiştirebilir."
+  },
+  "api.circle.remoteReadOnly": {
+    "fr": "À distance, le cercle est en lecture seule : modifiez-le depuis le réseau local.",
+    "en": "Remotely, the circle is read-only: change it from the local network.",
+    "de": "Aus der Ferne ist der Kreis schreibgeschützt: Ändern Sie ihn im lokalen Netzwerk.",
+    "es": "A distancia, el círculo es de solo lectura: modifíquelo desde la red local.",
+    "it": "Da remoto la cerchia è in sola lettura: modificala dalla rete locale.",
+    "zh": "远程访问时圈子为只读：请在本地网络中修改。",
+    "ja": "リモートではサークルは読み取り専用です。ローカルネットワークから変更してください。",
+    "ko": "원격에서는 서클이 읽기 전용입니다. 로컬 네트워크에서 변경하세요.",
+    "ro": "De la distanță, cercul este doar pentru citire: modificați-l din rețeaua locală.",
+    "sv": "På distans är cirkeln skrivskyddad: ändra den från det lokala nätverket.",
+    "hu": "Távolról a kör csak olvasható: a helyi hálózatról módosítsa.",
+    "vi": "Khi truy cập từ xa, vòng kết nối chỉ đọc: hãy thay đổi từ mạng cục bộ.",
+    "nb": "Eksternt er sirkelen skrivebeskyttet: endre den fra det lokale nettverket.",
+    "pl": "Zdalnie krąg jest tylko do odczytu: zmień go w sieci lokalnej.",
+    "el": "Από απόσταση ο κύκλος είναι μόνο για ανάγνωση: αλλάξτε τον από το τοπικό δίκτυο.",
+    "tr": "Uzaktan çevre salt okunurdur: yerel ağdan değiştirin."
   }
 }
