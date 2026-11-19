@@ -297,7 +297,10 @@ mod tests {
     /// `/home`, par POST et au motif exact.
     #[test]
     fn reprise_d_une_ecoute_seule_ouverte_en_ecriture_sous_home() {
-        assert!(ok(Method::POST, "/api/v1/home/continue-listening/12/resume"));
+        assert!(ok(
+            Method::POST,
+            "/api/v1/home/continue-listening/12/resume"
+        ));
         for (m, c) in [
             (Method::PUT, "/api/v1/home/continue-listening/12/resume"),
             (Method::DELETE, "/api/v1/home/continue-listening/12/resume"),
@@ -310,7 +313,10 @@ mod tests {
             (Method::POST, "/api/v1/home/continue-listening/abc/resume"),
             (Method::POST, "/api/v1/home/continue-listening/-1/resume"),
             (Method::POST, "/api/v1/home/continue-listening/1%2f2/resume"),
-            (Method::POST, "/api/v1/home/continue-listening/..%2f..%2fsystem/resume"),
+            (
+                Method::POST,
+                "/api/v1/home/continue-listening/..%2f..%2fsystem/resume",
+            ),
             (Method::POST, "/api/v1/home/continue-listening/../resume"),
             (Method::POST, "//api/v1/home/continue-listening/1/resume"),
             (Method::POST, "/api/v1//home/continue-listening/1/resume"),
