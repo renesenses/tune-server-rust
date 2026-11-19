@@ -385,6 +385,68 @@ pub fn lire(db: &dyn DbBackend) -> Option<Arc<ArbreDesDossiers>> {
     Some(arbre)
 }
 
+/// Une construction lancée en arrière-plan par [`lire_sans_attendre`] est en
+/// cours : on n'en lance pas une seconde.
+static EN_FOND: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Pour les témoins (ici et dans tune-server) : retient toute construction
+/// tant que la garde vit, ce qui simule une grande bibliothèque dont l'arbre
+/// n'est pas prêt. Rien d'autre ne l'appelle.
+#[doc(hidden)]
+pub fn retenir_les_constructions() -> std::sync::MutexGuard<'static, ()> {
+    CACHE.construction.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Ce qu'a rendu [`lire_sans_attendre`].
+pub enum Lecture {
+    /// L'arbre de l'état courant des chemins.
+    Pret(Arc<ArbreDesDossiers>),
+    /// Pas encore construit (sa construction tourne en arrière-plan), ou
+    /// impossible à garder exact (aucune révision lisible).
+    EnAttente,
+}
+
+/// #9116 (fil 2935, Thierry C. : « à quoi te sert de compter […] quand
+/// c'est moi qui prendrai la décision d'ouvrir tel ou tel disque ? ») —
+/// l'arbre s'il est prêt, sans JAMAIS faire attendre la navigation plus de
+/// `attente` : s'il manque, sa construction part sur un fil à elle, et
+/// l'appelant affiche ses dossiers sans comptes (le client les redemande
+/// ensuite). `attente` laisse finir une construction courte (petite
+/// bibliothèque) pour servir les comptes du premier coup.
+pub fn lire_sans_attendre(db: &Arc<dyn DbBackend>, attente: std::time::Duration) -> Lecture {
+    use std::sync::atomic::Ordering;
+    let Some(clef) = clef(db.as_ref()) else {
+        return Lecture::EnAttente;
+    };
+    if let Some(a) = CACHE.servi(clef) {
+        return Lecture::Pret(a);
+    }
+    if !EN_FOND.swap(true, Ordering::AcqRel) {
+        let db = db.clone();
+        let lance = std::thread::Builder::new()
+            .name("arbre-dossiers".into())
+            .spawn(move || {
+                let _ = lire(db.as_ref());
+                EN_FOND.store(false, Ordering::Release);
+            });
+        if let Err(e) = lance {
+            EN_FOND.store(false, Ordering::Release);
+            tracing::warn!(error = %e, "arbre_des_dossiers_fil_impossible");
+        }
+    }
+    let fin = std::time::Instant::now() + attente;
+    loop {
+        if let Some(a) = CACHE.servi(clef) {
+            return Lecture::Pret(a);
+        }
+        let reste = fin.saturating_duration_since(std::time::Instant::now());
+        if reste.is_zero() {
+            return Lecture::EnAttente;
+        }
+        std::thread::sleep(reste.min(std::time::Duration::from_millis(10)));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // La révision des chemins
 // ---------------------------------------------------------------------------

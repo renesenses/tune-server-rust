@@ -37,6 +37,11 @@ pub(super) async fn browse_roots(
 
 /// Le corps de `GET /library/browse`, exécuté HORS de l'exécuteur (#5677).
 fn lire_les_racines(state: &AppState, lang: &str) -> Value {
+    lire_les_racines_avec(state, lang, ATTENTE_DES_COMPTES)
+}
+
+/// [`lire_les_racines`], en n'attendant l'arbre des dossiers que `attente`.
+fn lire_les_racines_avec(state: &AppState, lang: &str, attente: std::time::Duration) -> Value {
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     let dirs: Vec<String> = settings
         .get("music_dirs")
@@ -44,7 +49,7 @@ fn lire_les_racines(state: &AppState, lang: &str) -> Value {
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| state.config.music_dirs.clone());
-    let arbre = arbre_des_dossiers(state);
+    let arbre = arbre_des_dossiers(state, attente);
     let mut roots: Vec<Value> = dirs
         .iter()
         .map(|d| {
@@ -56,15 +61,10 @@ fn lire_les_racines(state: &AppState, lang: &str) -> Value {
             // racine de lecteur ou de partage (« D:\ », « \\NAS\ ») produit un
             // séparateur doublé (« D:\\% ») qui ne correspond à rien → 0 piste.
             let pattern = tune_core::db::track_repo::folder_like_pattern(&norm);
-            // #9116 — lu dans l'arbre des dossiers (voir `compte_de_racine`).
-            let count: i64 = match compte_de_racine(state, arbre.as_deref(), &norm) {
-                Ok(n) => n,
-                Err(e) => {
-                    warn!(path = %norm_nfc, error = %e, "browse_root_count_failed");
-                    0
-                }
-            };
-            if count == 0 {
+            // #9116 — lu dans l'arbre des dossiers, ou pas encore connu : la
+            // racine s'affiche quand même, son compte arrive ensuite.
+            let count: Option<i64> = arbre.as_deref().map(|a| a.fichiers_sous(&norm));
+            if count == Some(0) {
                 let sample = state
                     .backend
                     .query_one("SELECT file_path FROM tracks LIMIT 1", &[])
@@ -103,8 +103,10 @@ fn lire_les_racines(state: &AppState, lang: &str) -> Value {
             let hint = (!exists)
                 .then(|| crate::chemin_inaccessible::conseil(lang, &norm))
                 .flatten();
+            // `track_count` reste un entier (les remotes le décodent comme
+            // tel) : 0 tant que `comptes_en_attente` est vrai.
             json!({
-                "path": norm, "name": name, "track_count": count,
+                "path": norm, "name": name, "track_count": count.unwrap_or(0),
                 "exists": exists, "hint": hint,
             })
         })
@@ -115,13 +117,17 @@ fn lire_les_racines(state: &AppState, lang: &str) -> Value {
     // live under /data/music), the Répertoires view would show only empty roots
     // and browsing would go nowhere. Surface the real root inferred from the
     // data so it still works — the same fallback the Oxygen folder facet uses.
+    //
+    // Tant que les comptes ne sont pas connus, rien ne dit qu'aucune racine
+    // n'est peuplée : le repli attend qu'ils le soient.
     let none_populated = roots
         .iter()
         .all(|r| r.get("track_count").and_then(|v| v.as_i64()).unwrap_or(0) == 0);
-    if none_populated
+    if let Some(arbre) = arbre.as_deref()
+        && none_populated
         && let Some(base) = tune_core::db::track_repo::derive_common_root(state.backend.as_ref())
     {
-        let count: i64 = compte_de_racine(state, arbre.as_deref(), &base).unwrap_or(0);
+        let count: i64 = arbre.fichiers_sous(&base);
         let dup = roots
             .iter()
             .any(|r| r.get("path").and_then(|v| v.as_str()) == Some(base.as_str()));
@@ -140,35 +146,35 @@ fn lire_les_racines(state: &AppState, lang: &str) -> Value {
         }
     }
 
-    json!({ "roots": roots })
+    // #9116 — `true` : les comptes ne sont pas encore connus (l'arbre des
+    // dossiers se construit) ; le client les redemande sans bloquer.
+    json!({ "roots": roots, "comptes_en_attente": arbre.is_none() })
 }
 
 /// #9116 (fil 2935) — l'arbre des dossiers de la bibliothèque
 /// ([`tune_core::db::arbre_des_dossiers`]) : construit UNE fois par état des
 /// chemins de `tracks`, il rend les comptes de chaque dossier et ses pistes
-/// directes sans relire la base. `None` (aucune révision lisible, ou
-/// construction en échec) : la route retombe sur ses requêtes SQL d'avant.
+/// directes sans relire la base.
+///
+/// Thierry C. (fil 2935, 11781) : « à quoi te sert de compter le nombre de
+/// fichiers présents dans chaque arborescence quand c'est moi qui prendrai la
+/// décision d'ouvrir tel ou tel disque ? ». La liste des dossiers n'attend
+/// donc JAMAIS un comptage : au plus `attente`, le temps qu'une petite
+/// bibliothèque finisse son arbre ; au-delà, `None`, l'arbre se construit sur
+/// un fil à lui, la réponse part sans comptes (`comptes_en_attente`) et le
+/// client les redemande.
 fn arbre_des_dossiers(
     state: &AppState,
+    attente: std::time::Duration,
 ) -> Option<std::sync::Arc<tune_core::db::arbre_des_dossiers::ArbreDesDossiers>> {
-    tune_core::db::arbre_des_dossiers::lire(state.backend.as_ref())
-}
-
-/// Le nombre de pistes sous une racine : lu dans l'arbre, ou à défaut compté
-/// ([`tune_core::db::track_repo::compter_pistes_sous_dossier`]). Mêmes
-/// chiffres des deux côtés (`file_path` seul).
-fn compte_de_racine(
-    state: &AppState,
-    arbre: Option<&tune_core::db::arbre_des_dossiers::ArbreDesDossiers>,
-    racine: &str,
-) -> Result<i64, String> {
-    match arbre {
-        Some(a) => Ok(a.fichiers_sous(racine)),
-        None => {
-            tune_core::db::track_repo::compter_pistes_sous_dossier(state.backend.as_ref(), racine)
-        }
+    match tune_core::db::arbre_des_dossiers::lire_sans_attendre(&state.backend, attente) {
+        tune_core::db::arbre_des_dossiers::Lecture::Pret(a) => Some(a),
+        tune_core::db::arbre_des_dossiers::Lecture::EnAttente => None,
     }
 }
+
+/// Ce que la vue Répertoires accepte d'attendre l'arbre des dossiers.
+const ATTENTE_DES_COMPTES: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Au-delà, les pistes directes d'un dossier se lisent par la plage d'avant
 /// plutôt que par une liste d'identifiants (bornée par les marques de
@@ -280,6 +286,16 @@ fn est_un_dossier(entry: &std::fs::DirEntry) -> bool {
 
 /// Le corps de `GET /library/browse/dir`, exécuté HORS de l'exécuteur (#5677).
 fn lire_le_repertoire(state: &AppState, lang: &str, q: BrowseQuery) -> Result<Value, AppError> {
+    lire_le_repertoire_avec(state, lang, q, ATTENTE_DES_COMPTES)
+}
+
+/// [`lire_le_repertoire`], en n'attendant l'arbre des dossiers que `attente`.
+fn lire_le_repertoire_avec(
+    state: &AppState,
+    lang: &str,
+    q: BrowseQuery,
+    attente: std::time::Duration,
+) -> Result<Value, AppError> {
     let debut = std::time::Instant::now();
     // Sécurité — l'appartenance à un dossier de musique est
     // tranchée AVANT tout accès au disque, sur le texte demandé (rogné et
@@ -340,10 +356,10 @@ fn lire_le_repertoire(state: &AppState, lang: &str, q: BrowseQuery) -> Result<Va
     // raison au lieu de mentir (#1190).
     let mut unreadable: Option<String> = None;
     // #9116 — l'arbre des dossiers : les comptes et les pistes directes de ce
-    // dossier, sans relire tout ce qui est sous lui. Construit au besoin
-    // (une fois par état des chemins), avant le disque.
+    // dossier, sans relire tout ce qui est sous lui. Jamais attendu plus de
+    // `attente` : sans lui, les dossiers s'affichent sans comptes.
     let t_arbre = std::time::Instant::now();
-    let arbre = arbre_des_dossiers(state);
+    let arbre = arbre_des_dossiers(state, attente);
     let vue = arbre.as_deref().map(|a| a.dossier(&normalized_query));
     let ms_arbre = t_arbre.elapsed().as_millis() as u64;
     #[cfg(test)]
@@ -365,26 +381,10 @@ fn lire_le_repertoire(state: &AppState, lang: &str, q: BrowseQuery) -> Result<Va
             unreadable = Some(e.to_string());
         }
         Ok(dossiers) => {
-            // Sans arbre : UNE requete pour TOUT le niveau, au lieu d'un
-            // `SELECT COUNT(*) … LIKE` par sous-dossier (#3857). Mesure sur
-            // 155 829 pistes (la bibliotheque de Pierre M, fil forum 1671) :
-            // un coffret de 63 dossiers `CDxx` passe de 1 166 ms a 21 ms, et
-            // une racine de 11 891 dossiers d'artistes de 303 965 ms a 187 ms.
-            // Avec l'arbre (#9116) : aucune requete.
-            //
-            // L'echec est journalise UNE fois et rend une table vide : chaque
-            // sous-dossier retombe alors a 0, soit exactement ce que la boucle
-            // faisait de son cote sur `browse_dir_count_failed`.
-            let comptes_sql = vue.is_none().then(|| {
-                tune_core::db::track_repo::compter_pistes_par_sous_dossier(
-                    state.backend.as_ref(),
-                    &normalized_query,
-                )
-                .unwrap_or_else(|e| {
-                    warn!(path = %normalized_query, error = %e, "browse_dir_count_failed");
-                    tune_core::db::track_repo::ComptesParSousDossier::default()
-                })
-            });
+            // #9116 — les comptes viennent de l'arbre, sans aucune requête ;
+            // sans lui, AUCUN comptage ne retient la liste (avant : une
+            // requête groupée sur tout ce qui est sous le dossier, #3857) —
+            // `track_count` vaut 0 et `comptes_en_attente` le dit.
             for path in dossiers {
                 let dir_path: String = path.to_string_lossy().nfc().collect();
                 let name = path
@@ -395,11 +395,7 @@ fn lire_le_repertoire(state: &AppState, lang: &str, q: BrowseQuery) -> Result<Va
                 if name.starts_with('.') {
                     continue;
                 }
-                let track_count: i64 = match (&vue, &comptes_sql) {
-                    (Some(v), _) => v.pistes_du_sous_dossier(&name),
-                    (None, Some(c)) => c.get(&name),
-                    (None, None) => 0,
-                };
+                let track_count: i64 = vue.as_ref().map_or(0, |v| v.pistes_du_sous_dossier(&name));
                 subdirs.push(json!({ "name": name, "path": dir_path, "track_count": track_count }));
             }
         }
@@ -574,6 +570,9 @@ fn lire_le_repertoire(state: &AppState, lang: &str, q: BrowseQuery) -> Result<Va
         // n'appartient qu'a la session qui l'a creee, et il faut lui substituer
         // le chemin UNC.
         "accessible": unreadable.is_none(),
+        // #9116 — `true` : les comptes des sous-dossiers ne sont pas encore
+        // connus (0 en attendant) ; le client les redemande sans bloquer.
+        "comptes_en_attente": arbre.is_none(),
         "access_error": unreadable,
         "access_hint": access_hint,
     }))
@@ -777,6 +776,10 @@ mod hors_executeur_5677 {
                 piste(2, &lent.join("CD1").join("01.flac")),
             ))
             .unwrap();
+        // #9116 — l'arbre des dossiers prêt d'avance : ce banc mesure
+        // l'exécuteur, et ses comptes ne doivent pas dépendre d'une
+        // construction en arrière-plan.
+        assert!(tune_core::db::arbre_des_dossiers::lire(state.backend.as_ref()).is_some());
         Banc {
             rt,
             state,
@@ -1005,9 +1008,18 @@ mod garde_de_remontee_tests {
 /// dans l'arbre des dossiers : jamais périmés après une écriture.
 #[cfg(test)]
 mod comptes_9116_tests {
-    use super::{BrowseQuery, lire_le_repertoire, lire_les_racines};
+    use super::{
+        BrowseQuery, lire_le_repertoire, lire_le_repertoire_avec, lire_les_racines,
+        lire_les_racines_avec,
+    };
     use crate::state::AppState;
     use unicode_normalization::UnicodeNormalization;
+
+    /// L'arbre de l'état courant, construit ici même : la route ne l'attend
+    /// que 250 ms, et ces témoins lisent des comptes.
+    fn arbre_pret(state: &AppState) {
+        assert!(tune_core::db::arbre_des_dossiers::lire(state.backend.as_ref()).is_some());
+    }
 
     fn poser(state: &AppState, chemin: &std::path::Path) -> i64 {
         let chemin: String = chemin.to_str().unwrap().nfc().collect();
@@ -1021,12 +1033,14 @@ mod comptes_9116_tests {
     }
 
     fn compte_racine(state: &AppState) -> i64 {
+        arbre_pret(state);
         lire_les_racines(state, "fr")["roots"][0]["track_count"]
             .as_i64()
             .unwrap()
     }
 
     fn lire(state: &AppState, dossier: &std::path::Path) -> serde_json::Value {
+        arbre_pret(state);
         lire_le_repertoire(
             state,
             "fr",
@@ -1141,6 +1155,48 @@ mod comptes_9116_tests {
             .unwrap();
         assert_eq!(compte_de(s, &jazz, "Miles"), 2);
         assert!(pistes_de(s, &jazz).is_empty());
+    }
+
+    /// Thierry C. (fil 2935, 11781) : la liste des dossiers n'attend AUCUN
+    /// comptage. Arbre pas encore construit et zéro attente consentie : les
+    /// racines et les sous-dossiers s'affichent aussitôt, comptes à 0 et
+    /// `comptes_en_attente` vrai ; une fois l'arbre prêt, les vrais comptes.
+    #[test]
+    fn la_liste_des_dossiers_n_attend_pas_les_comptes() {
+        let b = banc();
+        let (s, r) = (&b.state, &b.racine);
+        poser(s, &r.join("Jazz").join("Miles").join("01.flac"));
+        let zero = std::time::Duration::ZERO;
+        // Une grande bibliothèque : l'arbre ne sera pas prêt pendant ces
+        // deux lectures.
+        let retenue = tune_core::db::arbre_des_dossiers::retenir_les_constructions();
+        let t0 = std::time::Instant::now();
+        let racines = lire_les_racines_avec(s, "fr", zero);
+        let dossier = lire_le_repertoire_avec(
+            s,
+            "fr",
+            BrowseQuery {
+                path: r.to_str().unwrap().to_string(),
+            },
+            zero,
+        )
+        .ok()
+        .unwrap();
+        let ms = t0.elapsed().as_millis();
+        assert_eq!(racines["comptes_en_attente"], true, "{racines}");
+        assert_eq!(racines["roots"].as_array().unwrap().len(), 1, "{racines}");
+        assert_eq!(
+            dossier["comptes_en_attente"], true,
+            "la liste a attendu l'arbre des dossiers : {dossier}"
+        );
+        assert_eq!(dossier["directories"][0]["name"], "Jazz", "{dossier}");
+        assert_eq!(dossier["directories"][0]["track_count"], 0, "{dossier}");
+        eprintln!("#9116 : racines + dossier sans arbre servis en {ms} ms");
+        drop(retenue);
+        // L'arbre prêt (construit en arrière-plan, ou ici) : les vrais comptes.
+        assert_eq!(compte_racine(s), 1);
+        assert_eq!(compte_de(s, r, "Jazz"), 1);
+        assert_eq!(lire(s, r)["comptes_en_attente"], false);
     }
 
     /// La route lit l'ARBRE, pas la base : une piste ajoutée en coupant le
