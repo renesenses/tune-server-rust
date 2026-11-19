@@ -69,6 +69,10 @@ pub fn connue(device_name: &str) -> Option<CapaciteConnue> {
 /// pilote ASIO sondé), ou la sortie ne peut structurellement pas porter de
 /// bras natif (hôte non ALSA, plateforme sans bras). Définitif.
 pub fn retenir(device_name: &str, capacite: CapaciteConnue) {
+    sans_reponse()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(device_name);
     table().lock().unwrap_or_else(|p| p.into_inner()).insert(
         device_name.to_string(),
         Entree {
@@ -111,41 +115,90 @@ pub fn a_resonder(device_name: &str) -> bool {
     a_resonder_apres(device_name, Duration::ZERO, Instant::now())
 }
 
-/// #9170 — [`a_resonder`] pour l'ouverture d'un flux : une capacité
-/// provisoire n'est re-sondée qu'après [`DELAI_AVANT_RESONDAGE`].
+/// #9170 (suivi de #9172) — faut-il sonder `device_name` à l'ouverture de
+/// ce flux ?
+///
+/// **Seulement sur demande.** L'ouverture d'un flux (`LocalOutput::play_url`)
+/// ne sonde plus d'elle-même : seule la résolution d'une piste DSD sur une
+/// zone « Natif » qui n'a rien pu apprendre (PCM tenu par la piste
+/// précédente, DAC introuvable, verdict provisoire) le demande
+/// ([`demander_sondage_a_l_ouverture`]), pour que la piste DSD suivante parte
+/// en natif. Une suite de pistes PCM, ou une zone qui n'est pas « Natif », ne
+/// sonde donc jamais.
 ///
 /// **Coût.** Un sondage énumère les périphériques ALSA (cpal) puis ouvre le
 /// PCM en non bloquant : de quelques dizaines à quelques centaines de ms, sur
-/// un fil bloquant, avant l'ouverture du flux. Une sortie dont le verdict
-/// reste INCONNU (DAC introuvable, repli sur le défaut, PCM occupé : rien
-/// n'est retenu) serait donc re-sondée à chaque piste ; un sondage sans
-/// réponse ([`noter_sondage_sans_reponse`]) espace lui aussi le suivant de
-/// [`DELAI_AVANT_RESONDAGE`]. La résolution d'une piste DSD « Natif »
-/// ([`a_resonder`]) n'attend pas ce délai : elle ne concerne que le DSD.
+/// un fil bloquant, avant l'ouverture du flux. Un sondage sans réponse
+/// (introuvable, occupé) espace le suivant de façon croissante
+/// ([`ESPACEMENTS_SANS_REPONSE`]) ; la demande reste en attente jusque-là.
 #[must_use]
 pub fn a_resonder_a_l_ouverture(device_name: &str) -> bool {
-    let maintenant = Instant::now();
+    a_resonder_a_l_ouverture_a(device_name, Instant::now())
+}
+
+fn a_resonder_a_l_ouverture_a(device_name: &str, maintenant: Instant) -> bool {
+    let mut demandes = demandes().lock().unwrap_or_else(|p| p.into_inner());
+    if !demandes.contains(device_name) {
+        return false;
+    }
     let espace = sans_reponse()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get(device_name)
-        .is_none_or(|t| maintenant.saturating_duration_since(*t) >= DELAI_AVANT_RESONDAGE);
-    espace && a_resonder_apres(device_name, DELAI_AVANT_RESONDAGE, maintenant)
+        .is_none_or(|(depuis, n)| {
+            maintenant.saturating_duration_since(*depuis) >= espacement_sans_reponse(*n)
+        });
+    if !espace {
+        return false;
+    }
+    demandes.remove(device_name);
+    a_resonder_apres(device_name, Duration::ZERO, maintenant)
 }
 
-fn sans_reponse() -> &'static Mutex<HashMap<String, Instant>> {
-    static TABLE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+fn demandes() -> &'static Mutex<std::collections::HashSet<String>> {
+    static TABLE: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// #9170 — la résolution d'une piste DSD « Natif » n'a rien pu apprendre de
+/// `device_name` : la prochaine ouverture de flux, qui trouve le PCM libre,
+/// le sondera (une fois).
+pub fn demander_sondage_a_l_ouverture(device_name: &str) {
+    demandes()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(device_name.to_string());
+}
+
+/// #9170 — l'espacement entre deux sondages à l'ouverture après `n`
+/// sondages consécutifs sans réponse : 30 s, 2 min, puis 10 min.
+pub const ESPACEMENTS_SANS_REPONSE: [Duration; 3] = [
+    DELAI_AVANT_RESONDAGE,
+    Duration::from_secs(120),
+    Duration::from_secs(600),
+];
+
+fn espacement_sans_reponse(n: u32) -> Duration {
+    let i = (n.max(1) - 1) as usize;
+    ESPACEMENTS_SANS_REPONSE[i.min(ESPACEMENTS_SANS_REPONSE.len() - 1)]
+}
+
+fn sans_reponse() -> &'static Mutex<HashMap<String, (Instant, u32)>> {
+    static TABLE: OnceLock<Mutex<HashMap<String, (Instant, u32)>>> = OnceLock::new();
     TABLE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// #9170 — un sondage de `device_name` n'a rien appris (introuvable, repli,
-/// occupé) : rien n'est retenu, mais l'ouverture suivante ne re-sonde
-/// qu'après [`DELAI_AVANT_RESONDAGE`] (voir le coût ci-dessus).
+/// occupé) : rien n'est retenu, et le sondage suivant à l'ouverture
+/// s'espace d'autant plus que les échecs se suivent.
 pub fn noter_sondage_sans_reponse(device_name: &str) {
-    sans_reponse()
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(device_name.to_string(), Instant::now());
+    noter_sondage_sans_reponse_a(device_name, Instant::now());
+}
+
+fn noter_sondage_sans_reponse_a(device_name: &str, maintenant: Instant) {
+    let mut t = sans_reponse().lock().unwrap_or_else(|p| p.into_inner());
+    let n = t.get(device_name).map_or(0, |(_, n)| *n);
+    t.insert(device_name.to_string(), (maintenant, n.saturating_add(1)));
 }
 
 /// #9170 — le nom ne mène plus au `hw:` qui a prouvé sa capacité (DAC
@@ -500,14 +553,49 @@ mod tests_9170 {
         assert_eq!(connue(nom), Some(CapaciteConnue::SortieNonAsio));
     }
 
-    /// Un sondage sans réponse espace le suivant à l'ouverture.
+    /// Suivi #9172 : une suite de pistes PCM ne sonde jamais à l'ouverture,
+    /// même sur une sortie inconnue ou provisoire ; une demande de la
+    /// résolution DSD « Natif » vaut UN sondage.
     #[test]
-    fn un_sondage_sans_reponse_espace_le_suivant_a_l_ouverture() {
-        let nom = "9170-sans-reponse";
-        assert!(a_resonder_a_l_ouverture(nom));
-        noter_sondage_sans_reponse(nom);
-        assert!(!a_resonder_a_l_ouverture(nom));
-        assert!(a_resonder(nom), "la résolution DSD n'attend pas le délai");
+    fn une_suite_de_pistes_pcm_ne_sonde_jamais() {
+        let nom = "9172-suite-pcm";
+        let t0 = Instant::now();
+        let sondages = |de: u64, a: u64| {
+            (de..a)
+                .filter(|i| {
+                    a_resonder_a_l_ouverture_a(nom, t0 + Duration::from_secs(i * 240))
+                })
+                .count()
+        };
+        assert_eq!(sondages(0, 50), 0, "sortie inconnue : 0 sondage attendu");
+        retenir_provisoire_a(nom, CapaciteConnue::SortieNonAsio, t0);
+        assert_eq!(sondages(50, 100), 0, "verdict provisoire : 0 sondage attendu");
+        demander_sondage_a_l_ouverture(nom);
+        assert_eq!(sondages(100, 150), 1, "une demande = un sondage");
+    }
+
+    /// Introuvable : 30 s, 2 min, puis 10 min entre deux sondages demandés.
+    #[test]
+    fn introuvable_s_espace_de_plus_en_plus() {
+        let nom = "9172-introuvable";
+        let t0 = Instant::now();
+        let s = |sec: u64| t0 + Duration::from_secs(sec);
+        demander_sondage_a_l_ouverture(nom);
+        noter_sondage_sans_reponse_a(nom, t0);
+        assert!(!a_resonder_a_l_ouverture_a(nom, s(29)));
+        assert!(a_resonder_a_l_ouverture_a(nom, s(30)));
+        demander_sondage_a_l_ouverture(nom);
+        noter_sondage_sans_reponse_a(nom, s(30));
+        assert!(!a_resonder_a_l_ouverture_a(nom, s(30 + 119)));
+        assert!(a_resonder_a_l_ouverture_a(nom, s(30 + 120)));
+        demander_sondage_a_l_ouverture(nom);
+        noter_sondage_sans_reponse_a(nom, s(150));
+        noter_sondage_sans_reponse_a(nom, s(150));
+        assert!(!a_resonder_a_l_ouverture_a(nom, s(150 + 599)));
+        assert!(a_resonder_a_l_ouverture_a(nom, s(150 + 600)));
+        // Une réponse du pilote remet l'espacement à zéro.
+        retenir(nom, CapaciteConnue::AlsaDsdU32 { cadences: vec![] });
+        assert!(sans_reponse().lock().unwrap().get(nom).is_none());
     }
 
     /// Fil 2951 : la cause d'un « pas de PCM matériel » s'écrit en INFO une

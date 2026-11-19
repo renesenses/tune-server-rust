@@ -1308,6 +1308,23 @@ impl PlaybackOrchestrator {
         };
         let mut transport = transport_dsd(is_local_output, is_network_output, &dsd_mode);
 
+        // #8248 / #9170 (suivi #9172) — une piste PCM sur une zone « Natif »
+        // dont la sortie n'a jamais été sondée : la prochaine ouverture de
+        // flux (PCM libre) la sondera une fois, pour que la PREMIÈRE piste DSD
+        // qui suit parte déjà en natif. Une zone qui n'est pas « Natif » ne
+        // demande rien : ses pistes PCM ne sondent jamais.
+        if is_local_output
+            && source_format != Some(AudioFormat::Dsd)
+            && let Some(nom) = req
+                .output_device_id
+                .as_deref()
+                .and_then(|id| id.strip_prefix("local:"))
+            && crate::outputs::capacite_dsd_natif::connue(nom).is_none()
+            && ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(req.zone_id) == "native"
+        {
+            crate::outputs::capacite_dsd_natif::demander_sondage_a_l_ouverture(nom);
+        }
+
         // #5643 — « natif » sur une sortie locale ASIO dont le pilote déclare
         // le DSD à la cadence du fichier : du DSD natif, pour de vrai. Sinon
         // `NatifServiEnDop`, comme avant, avec le motif au journal.
@@ -1355,7 +1372,7 @@ impl PlaybackOrchestrator {
                             fin_ms: None,
                         },
                     };
-                    return self
+                    let servi = self
                         .servir_le_dsd_natif(
                             req,
                             track,
@@ -1365,6 +1382,12 @@ impl PlaybackOrchestrator {
                             fenetre,
                         )
                         .await;
+                    // #9170 — échec avant le bras : le natif attendu ne
+                    // partira pas, il ne doit pas rester en attente.
+                    if !matches!(servi, Ok(Some(_))) {
+                        crate::outputs::capacite_dsd_natif::effacer_transport_reel(req.zone_id);
+                    }
+                    return servi;
                 }
                 Err(motif) => motif_natif = Some(motif),
             }
@@ -2229,6 +2252,14 @@ impl PlaybackOrchestrator {
                         let r = tokio::task::spawn_blocking(move || sonde.sonder_et_retenir())
                             .await
                             .unwrap_or(ResultatSondeDsdAlsa::Occupe);
+                        // #9170 (suivi #9172) — rien appris (PCM tenu par la
+                        // piste précédente, DAC introuvable, verdict
+                        // provisoire) : la prochaine ouverture de flux, PCM
+                        // libre, sondera UNE fois. Seul ce chemin — piste DSD,
+                        // zone « Natif » — le demande.
+                        if !matches!(r, ResultatSondeDsdAlsa::Sonde { .. }) {
+                            capacite::demander_sondage_a_l_ouverture(&nom);
+                        }
                         return sortie_alsa_apres_sonde(r);
                     }
                 }

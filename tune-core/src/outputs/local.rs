@@ -6665,9 +6665,10 @@ impl OutputTarget for LocalOutput {
         // relevé, la première piste DSD qui suit une piste PCM partirait en
         // DoP. Une fois par périphérique : la réponse prouvée est retenue.
         #[cfg(target_os = "linux")]
-        // #9170 — et aussi s'il n'est que provisoire (PCM logiciel observé
-        // sans réponse du pilote), passé un délai : sinon un sondage tombé
-        // au mauvais moment figeait « pas de DSD natif » jusqu'au redémarrage.
+        // #9170 (suivi #9172) — seulement si la résolution d'une piste DSD
+        // « Natif » l'a DEMANDÉ (PCM tenu, DAC introuvable, verdict
+        // provisoire) : une suite de pistes PCM ne sonde jamais, et un échec
+        // espace le sondage suivant (30 s, 2 min, 10 min).
         if crate::outputs::capacite_dsd_natif::a_resonder_a_l_ouverture(&self.device_name)
             && let Some(sonde) = self.sonde_dsd_alsa()
         {
