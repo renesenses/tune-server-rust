@@ -258,9 +258,9 @@ pub fn verdict_effectif_sql(alias: &str) -> String {
 /// [`RAISON_CD_SANS_MUR`] et n'est plus candidate.
 pub fn cd_a_remesurer_sql(alias: &str) -> String {
     format!(
-        "({cd} AND ((({a}.verdict = 'douteux' AND COALESCE({a}.raison, '') <> '{mur}')) \
+        "({cd} AND (({a}.verdict = 'douteux' AND COALESCE({a}.raison, '') <> '{mur}') \
          OR ({a}.verdict = 'conforme' AND {a}.raison IS NULL \
-             AND {a}.coupure_hz IS NOT NULL AND {a}.coupure_hz < {lossy}))))",
+             AND {a}.coupure_hz IS NOT NULL AND {a}.coupure_hz < {lossy})))",
         a = alias,
         cd = cd_sql(alias),
         mur = RAISON_MUR_DE_CODEC,

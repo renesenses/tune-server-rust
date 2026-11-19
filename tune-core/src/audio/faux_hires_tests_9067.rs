@@ -101,18 +101,18 @@ fn un_cd_sombre_est_conforme_9067() {
 }
 
 /// 🟢 CONTRE-ÉPREUVE du critère du mur — un filtre RAIDE mais pas un mur
-/// (23 dB par kHz à partir de 17 kHz, jusqu'au plancher) : l'ancienne règle
-/// y voyait une coupure suspecte (falaise sous 20,5 kHz) ; ce n'est pas le
-/// passe-bas d'un encodeur, le CD reste conforme. Le même spectre dans un
-/// 24/44,1 garde la règle hi-res (douteux), qui ne change pas.
+/// (23 dB par kHz à partir de 17 kHz sur un spectre plat, jusqu'au plancher
+/// des 16 bits) : l'ancienne règle y voyait une coupure suspecte (falaise
+/// sous 20,5 kHz) ; ce n'est pas le passe-bas d'un encodeur, le CD reste
+/// conforme. Le même spectre dans un 24/44,1 garde la règle hi-res
+/// (douteux), qui ne change pas.
 #[test]
 fn un_filtre_raide_qui_n_est_pas_un_mur_laisse_le_cd_conforme_9067() {
     let rampe = |f: f64| {
-        let base = 1.0 / f.sqrt();
         if f <= 17_000.0 {
-            base
+            1.0
         } else {
-            base * 10f64.powf(-23.0 * (f - 17_000.0) / 1_000.0 / 20.0)
+            10f64.powf(-23.0 * (f - 17_000.0) / 1_000.0 / 20.0)
         }
     };
     let pcm = quantifier(&par_spectre(44_100, 9081, rampe), 16);
