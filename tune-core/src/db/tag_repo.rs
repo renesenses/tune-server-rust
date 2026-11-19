@@ -494,6 +494,10 @@ impl TagRepo {
         let sql = self.dialect_sql(sql::delete_by_id, sql::delete_by_id);
         let params: [&dyn ToSqlValue; 1] = [&id];
         self.db.execute(&sql, &params)?;
+        // #9158 — les marques d'origine du tag supprimé (au mieux).
+        let _ = self
+            .db
+            .execute("DELETE FROM item_tags_scan WHERE tag_id = ?", &params);
         Ok(())
     }
 
@@ -549,7 +553,21 @@ impl TagRepo {
         let sql = self.dialect_sql(sql::tag_item, sql::tag_item);
         let params: [&dyn ToSqlValue; 3] = [&tag_id, &item_type, &item_id];
         self.db.execute(&sql, &params)?;
+        self.effacer_marque_du_scan(&params);
         Ok(())
+    }
+
+    /// #9158 — une pose ou un retrait MANUELS effacent la marque d'origine
+    /// « scan » (`item_tags_scan`) : la pose devient manuelle, et le scan ne
+    /// la retirera plus. Au mieux : une base sans la table (montée à la
+    /// main) n'empêche pas d'étiqueter.
+    fn effacer_marque_du_scan(&self, params: &[&dyn ToSqlValue; 3]) {
+        if let Err(e) = self
+            .db
+            .execute(super::tags_perso_repo::SQL_EFFACER_MARQUE, params)
+        {
+            tracing::debug!(error = %e, "tags_perso_marque_non_effacee");
+        }
     }
 
     /// Retire une étiquette d'un objet.
@@ -562,6 +580,7 @@ impl TagRepo {
         let sql = self.dialect_sql(sql::untag_item, sql::untag_item);
         let params: [&dyn ToSqlValue; 3] = [&tag_id, &item_type, &item_id];
         self.db.execute(&sql, &params)?;
+        self.effacer_marque_du_scan(&params);
         Ok(())
     }
 
@@ -667,6 +686,7 @@ impl TagRepo {
         for &item_id in item_ids {
             let params: [&dyn ToSqlValue; 3] = [&tag_id, &item_type, &item_id];
             self.db.execute(&sql, &params)?;
+            self.effacer_marque_du_scan(&params);
             count += 1;
         }
         Ok(count)
@@ -683,6 +703,7 @@ impl TagRepo {
         for &item_id in item_ids {
             let params: [&dyn ToSqlValue; 3] = [&tag_id, &item_type, &item_id];
             self.db.execute(&sql, &params)?;
+            self.effacer_marque_du_scan(&params);
             count += 1;
         }
         Ok(count)

@@ -259,6 +259,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5998 -- --nocapture --test-threads=1
 
+      # #9116 — vue Répertoires : le compte d'une racine part de l'index du
+      # chemin (plan générique compris) et rend l'ancien compte. Sans cette
+      # étape, l'épreuve prendrait son saut annoncé.
+      - name: Compte de racine par l'index du chemin sur PostgreSQL (#9116)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_9116 -- --nocapture --test-threads=1
+
       # #7856 — contrôle parental : stockage, révision optimiste, droits du
       # superviseur et filtre relu de la base. Sans cette étape, l'épreuve
       # prendrait son saut annoncé.
@@ -353,6 +361,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8714 -- --nocapture --test-threads=1
 
+      # #8487 — les titres diffusés par une radio, notés sous la ligne de leur
+      # station dans `radio_titres_diffuses` (table d'`ENSURE_TABLES`, sans
+      # script numéroté) : écriture, dédoublonnage et relecture sur PostgreSQL.
+      - name: Titres diffusés des radios sur PostgreSQL (#8487)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_titres_diffuses -- --nocapture --test-threads=1
+
       # #8416 — les règles « nombre d'écoutes » et « dernière écoute » des
       # listes et collections intelligentes comptent les écoutes importées
       # (`imported_plays`) comme la Bibliothèque. Sans cette étape, le témoin
@@ -369,6 +385,24 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8676 -- --nocapture --test-threads=1
+
+      # #9158 (Rob) — balises personnelles → tags Tune : pose sur la piste et
+      # l'album, idempotence, retrait des seules poses du scan, tag manuel
+      # intact, table `item_tags_scan` d'ENSURE_TABLES. Sans cette étape, le
+      # témoin prendrait son saut annoncé.
+      - name: Balises personnelles en tags Tune sur PostgreSQL (#9158)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_9158 -- --nocapture --test-threads=1
+
+      # #9044 — oublier un appareil parti du réseau : zones d'un appareil et
+      # motifs de masquage, garde-fous non oubliables, suppression définitive,
+      # retour comme neuf, zone libérée (#8987) emportée avec sa clé, sur un
+      # vrai PostgreSQL. Sans cette étape, le témoin prendrait son saut annoncé.
+      - name: Oublier un appareil sur PostgreSQL (#9044)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_9044 -- --nocapture --test-threads=1
 
       # #9014 — rescan d'une feuille CUE dont un début a bougé : la tranche est
       # recalée (même id, favori, liste et écoute intacts) et les bornes ne
