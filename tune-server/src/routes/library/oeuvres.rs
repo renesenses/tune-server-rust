@@ -37,7 +37,7 @@
 //! n'est fusionné, aucune colonne n'est ajoutée. `GET /library/albums` est
 //! inchangé ; seul un client qui demande les œuvres les reçoit.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use axum::Json;
 use axum::extract::{Path, Query, State};
@@ -102,6 +102,10 @@ pub(crate) struct Candidat {
     pub bit_depth: Option<i32>,
     /// La valeur `VERSION` commune aux pistes de l'album.
     pub version: Option<String>,
+    /// #8953 — l'album porte le marqueur de coffret (composé à la main ou
+    /// réuni automatiquement) : il est sa propre œuvre, jamais une version
+    /// d'un autre album.
+    pub coffret: bool,
 }
 
 /// Comment une œuvre a été formée.
@@ -269,7 +273,7 @@ pub(crate) fn regrouper(
     // Les groupes MusicBrainz joignables par la clé 2 : (artiste, titre) →
     // identifiants de groupe distincts.
     let mut mb_par_titre: HashMap<(i64, String), Vec<String>> = HashMap::new();
-    for c in albums {
+    for c in albums.iter().filter(|c| !c.coffret) {
         if let (Some(g), Some(a)) = (
             c.groupe_mb.as_deref().filter(|g| !g.is_empty()),
             c.artist_id,
@@ -288,6 +292,14 @@ pub(crate) fn regrouper(
             c.groupe_mb.as_deref().filter(|g| !g.is_empty()),
             c.artist_id,
         ) {
+            // 🔴 #8953 (fil 2884) — un COFFRET n'est la version de rien. Son
+            // titre composé perd ce qui distinguait ses disques (« …(50th
+            // Anniversary)(Stereo) [DSD64 …] » devient « …(50th
+            // Anniversary) ») : sa clé de titre retombait sur celle de
+            // l'album simple (« The Dark Side Of The Moon »), et la grille
+            // le repliait sous la carte d'une édition FLAC. Il disparaissait
+            // de Bibliothèque › Albums, présent dans Coffrets seulement.
+            _ if c.coffret => (format!("album:{}", c.id), Methode::Seule),
             (Some(g), _) => (format!("mb:{g}"), Methode::MusicBrainz),
             (None, Some(a)) => {
                 let titre = titre_normalise(&c.titre);
@@ -410,9 +422,27 @@ fn versions_des_albums(state: &AppState) -> HashMap<i64, String> {
         .collect()
 }
 
-fn candidat(a: &Album, versions: &HashMap<i64, String>) -> Option<Candidat> {
+/// #8953 — les albums qui portent le marqueur de coffret (`album_metadata`,
+/// clé `coffret`), composés à la main ou réunis automatiquement. Une base
+/// illisible rend l'ensemble vide : le regroupement d'avant, journalisé.
+fn albums_coffrets(state: &AppState) -> HashSet<i64> {
+    match tune_core::db::coffrets_auto::marqueurs(&state.backend) {
+        Ok(m) => m.into_keys().collect(),
+        Err(e) => {
+            tracing::warn!(error = %e, "oeuvres_marqueurs_coffret_illisibles");
+            HashSet::new()
+        }
+    }
+}
+
+fn candidat(
+    a: &Album,
+    versions: &HashMap<i64, String>,
+    coffrets: &HashSet<i64>,
+) -> Option<Candidat> {
     let id = a.id?;
     Some(Candidat {
+        coffret: coffrets.contains(&id),
         id,
         titre: a.title.clone(),
         artist_id: a.artist_id,
@@ -542,9 +572,10 @@ pub(crate) async fn lister_oeuvres(
     let actif = regroupement_actif(&state);
     let albums = albums_visibles(&state);
     let versions = versions_des_albums(&state);
+    let coffrets = albums_coffrets(&state);
     let candidats: Vec<Candidat> = albums
         .iter()
-        .filter_map(|a| candidat(a, &versions))
+        .filter_map(|a| candidat(a, &versions, &coffrets))
         .collect();
     let oeuvres = regrouper(&candidats, actif, &distinctes(&state), &preferees(&state));
     let par_id: HashMap<i64, &Album> = albums.iter().filter_map(|a| Some((a.id?, a))).collect();
@@ -576,9 +607,10 @@ pub(crate) async fn membres_des_oeuvres(State(state): State<AppState>) -> Json<V
     }
     let albums = albums_visibles(&state);
     let versions = versions_des_albums(&state);
+    let coffrets = albums_coffrets(&state);
     let candidats: Vec<Candidat> = albums
         .iter()
-        .filter_map(|a| candidat(a, &versions))
+        .filter_map(|a| candidat(a, &versions, &coffrets))
         .collect();
     let oeuvres = regrouper(&candidats, true, &distinctes(&state), &preferees(&state));
     let works: Vec<Value> = oeuvres
@@ -638,9 +670,10 @@ pub(crate) async fn versions_de_l_album(
         }
     }
     let versions = versions_des_albums(&state);
+    let coffrets = albums_coffrets(&state);
     let candidats: Vec<Candidat> = albums
         .values()
-        .filter_map(|a| candidat(a, &versions))
+        .filter_map(|a| candidat(a, &versions, &coffrets))
         .collect();
     let actif = regroupement_actif(&state);
     let oeuvres = regrouper(&candidats, actif, &distinctes(&state), &preferees(&state));

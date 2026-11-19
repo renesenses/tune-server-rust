@@ -823,3 +823,175 @@ async fn chaque_version_porte_son_numero_de_catalogue_quand_il_est_connu() {
         "numéro vide, pas de clé : {seul}"
     );
 }
+
+// ── #8953 (fil 2884) : un coffret n'est la version de rien ─────────────────
+
+/// Un album DSD de Didier : ses dix pistes, disque 1, en local.
+fn disque_dsd(b: &Banc, titre: &str, artiste: i64, dossier: &str) -> i64 {
+    let id = album(&b.state, titre, artiste, None, 2_822_400);
+    for n in 1..=10i64 {
+        let chemin = format!("{dossier}/{n:02}.dsf");
+        b.state
+            .backend
+            .execute(
+                "INSERT INTO tracks (title, album_id, file_path, source, track_number, \
+                 disc_number, format) VALUES (?1, ?2, ?3, 'local', ?4, 1, 'dsf')",
+                &[
+                    &format!("piste {n}") as &dyn ToSqlValue,
+                    &id,
+                    &chemin,
+                    &n,
+                ],
+            )
+            .unwrap();
+    }
+    id
+}
+
+/// Les identifiants que `/works/members` replie dans une œuvre de plusieurs
+/// versions, et ceux qu'il y garde pour la carte.
+async fn membres(b: &Banc) -> (Vec<i64>, Vec<i64>) {
+    let (statut, corps) = appeler(
+        &b.state,
+        "GET",
+        "/api/v1/library/albums/works/members",
+        None,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    let mut replies = Vec::new();
+    let mut gardes = Vec::new();
+    for w in corps["works"].as_array().unwrap() {
+        let pref = w["preferred_id"].as_i64().unwrap();
+        gardes.push(pref);
+        for id in w["ids"].as_array().unwrap() {
+            let id = id.as_i64().unwrap();
+            if id != pref {
+                replies.push(id);
+            }
+        }
+    }
+    (replies, gardes)
+}
+
+/// Le témoin : les deux disques de Didier réunis à la main, sous le nom que
+/// Tune propose. Le coffret ne doit être replié sous AUCUNE autre carte —
+/// ni par `/works/members` (la grille), ni par `/albums/{id}/versions` (la
+/// fiche) — et `GET /library/albums` le rend, recherche comprise.
+#[tokio::test]
+async fn un_coffret_compose_n_est_replie_sous_aucune_autre_carte_8953() {
+    let b = banc();
+    let floyd = artiste_de(&b, b.dsotm);
+    let stereo = disque_dsd(
+        &b,
+        "The Dark Side Of The Moon (2023)(50th Anniversary)(Stereo) [DSD64 - SACD Sony Records Int'l Japan 2023]",
+        floyd,
+        "/m/dsotm50/Stereo",
+    );
+    let multi = disque_dsd(
+        &b,
+        "The Dark Side Of The Moon (2023)(50th Anniversary)(Multichannel) [DSD64 - SACD Sony Records Int'l Japan 2023]",
+        floyd,
+        "/m/dsotm50/Multichannel",
+    );
+    // Avant la réunion, aucun des deux disques n'est replié.
+    let (replies, _) = membres(&b).await;
+    assert!(!replies.contains(&stereo) && !replies.contains(&multi), "{replies:?}");
+
+    let (statut, corps) = appeler(
+        &b.state,
+        "POST",
+        "/api/v1/library/albums/coffret",
+        Some(json!({ "album_ids": [stereo, multi] })),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    assert_eq!(corps["cible"], json!(stereo));
+    // Le nom proposé garde sa parenthèse fermante.
+    assert_eq!(
+        corps["titre"],
+        json!("The Dark Side Of The Moon (2023)(50th Anniversary)")
+    );
+
+    let (replies, _) = membres(&b).await;
+    assert!(
+        !replies.contains(&stereo),
+        "le coffret est replié sous une autre carte : {replies:?}"
+    );
+    let (statut, fiche) = appeler(
+        &b.state,
+        "GET",
+        &format!("/api/v1/library/albums/{stereo}/versions"),
+        None,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{fiche}");
+    assert_eq!(ids(&fiche), vec![stereo], "{fiche}");
+    assert_eq!(fiche["method"], json!("single"), "{fiche}");
+
+    for url in [
+        "/api/v1/library/albums?limit=500&sort=title".to_string(),
+        "/api/v1/library/albums?limit=500&sort=title&q=The%20Dark%20Side%20Of%20The%20Moon%20(2"
+            .to_string(),
+    ] {
+        let (statut, liste) = appeler(&b.state, "GET", &url, None).await;
+        assert_eq!(statut, StatusCode::OK, "{liste}");
+        let rendus: Vec<i64> = liste["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|a| a["id"].as_i64())
+            .collect();
+        assert!(rendus.contains(&stereo), "{url} : coffret absent de {rendus:?}");
+        assert!(!rendus.contains(&multi), "{url} : disque absorbé encore rendu");
+    }
+}
+
+/// La contre-épreuve : le MÊME album, sans marqueur de coffret, sous le même
+/// titre, rejoint l'œuvre « The Dark Side of the Moon » — c'est exactement ce
+/// qui retirait le coffret de la grille avant #8953. Sans elle, le témoin
+/// pourrait passer parce que le titre ne grouperait de toute façon pas.
+#[tokio::test]
+async fn sans_marqueur_le_meme_titre_rejoint_l_oeuvre_contre_epreuve_8953() {
+    let b = banc();
+    let floyd = artiste_de(&b, b.dsotm);
+    let stereo = disque_dsd(
+        &b,
+        "The Dark Side Of The Moon (2023)(50th Anniversary)(Stereo) [DSD64 - SACD Sony Records Int'l Japan 2023]",
+        floyd,
+        "/m/dsotm50/Stereo",
+    );
+    let multi = disque_dsd(
+        &b,
+        "The Dark Side Of The Moon (2023)(50th Anniversary)(Multichannel) [DSD64 - SACD Sony Records Int'l Japan 2023]",
+        floyd,
+        "/m/dsotm50/Multichannel",
+    );
+    let (statut, corps) = appeler(
+        &b.state,
+        "POST",
+        "/api/v1/library/albums/coffret",
+        Some(json!({ "album_ids": [stereo, multi] })),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    b.state
+        .backend
+        .execute(
+            "DELETE FROM album_metadata WHERE album_id = ?1 AND key = 'coffret'",
+            &[&stereo as &dyn ToSqlValue],
+        )
+        .unwrap();
+    let (statut, fiche) = appeler(
+        &b.state,
+        "GET",
+        &format!("/api/v1/library/albums/{stereo}/versions"),
+        None,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{fiche}");
+    assert!(
+        ids(&fiche).contains(&b.dsotm),
+        "sans marqueur, le coffret doit rejoindre l'œuvre DSOTM : {fiche}"
+    );
+}

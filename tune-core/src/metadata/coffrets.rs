@@ -379,8 +379,35 @@ const SEPARATEURS: [char; 14] = [
 
 /// Le socle, débarrassé de ce qu'il traîne À DROITE. La gauche est gardée :
 /// c'est le début du titre.
+///
+/// 🔴 #8953 (fil 2884) — une parenthèse ou un crochet FERMANT qui referme une
+/// ouverture du socle en fait partie : il reste. « The Dark Side Of The Moon
+/// (2023)(50th Anniversary)(Stereo) » et « …(Multichannel) » ont pour préfixe
+/// « …(50th Anniversary)( » ; rogner tous les séparateurs donnait
+/// « …(50th Anniversary », parenthèse non fermée. Seul le fermant ORPHELIN
+/// (aucune ouverture à refermer avant lui) est rogné.
 fn rogner_separateurs(s: &str) -> String {
-    s.trim().trim_end_matches(SEPARATEURS).trim().to_string()
+    let mut socle: Vec<char> = s.trim().chars().collect();
+    while let Some(&c) = socle.last() {
+        if !SEPARATEURS.contains(&c) {
+            break;
+        }
+        let ouvrant = match c {
+            ')' => Some('('),
+            ']' => Some('['),
+            _ => None,
+        };
+        if let Some(o) = ouvrant {
+            let avant = &socle[..socle.len() - 1];
+            let ouverts = avant.iter().filter(|&&x| x == o).count();
+            let fermes = avant.iter().filter(|&&x| x == c).count();
+            if ouverts > fermes {
+                break;
+            }
+        }
+        socle.pop();
+    }
+    socle.into_iter().collect::<String>().trim().to_string()
 }
 
 /// Le parent d'un dossier, et son nom de feuille.
@@ -1125,6 +1152,30 @@ mod tests {
         );
         // Et quand il n'y a aucune séparation où reculer, on ne rend rien.
         assert_eq!(titre_commun(&t(&["Kind", "Kinder"])), None);
+    }
+
+    /// #8953 (fil 2884) — les deux disques DSD de Didier. Le préfixe commun
+    /// finit sur « …(50th Anniversary)( » : la parenthèse ouvrante orpheline
+    /// tombe, la fermante qui referme « (50th Anniversary » reste.
+    #[test]
+    fn la_parenthese_qui_referme_le_socle_reste_8953() {
+        assert_eq!(
+            titre_commun(&t(&[
+                "The Dark Side Of The Moon (2023)(50th Anniversary)(Stereo) [DSD64 - SACD Sony Records Int'l Japan 2023]",
+                "The Dark Side Of The Moon (2023)(50th Anniversary)(Multichannel) [DSD64 - SACD Sony Records Int'l Japan 2023]",
+            ])),
+            Some("The Dark Side Of The Moon (2023)(50th Anniversary)".to_string())
+        );
+        // Contre-épreuve : un fermant ORPHELIN est encore rogné, et un crochet
+        // qui referme le socle reste lui aussi.
+        assert_eq!(
+            titre_commun(&t(&["Live) - CD1", "Live) - CD2"])),
+            Some("Live".to_string())
+        );
+        assert_eq!(
+            titre_commun(&t(&["Works [Deluxe] - Disc 1", "Works [Deluxe] - Disc 2"])),
+            Some("Works [Deluxe]".to_string())
+        );
     }
 
     #[test]
