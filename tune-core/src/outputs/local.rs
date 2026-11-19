@@ -2618,12 +2618,46 @@ pub const VOIES_SONDEES_DSD_ALSA: u16 = 2;
 /// #8248 — ce qu'a rendu le sondage DSD natif d'une sortie ALSA.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ResultatSondeDsdAlsa {
-    /// La sortie n'ouvre pas un PCM ALSA matériel (`hw:`) : pas de DSD natif.
+    /// La sortie ne peut pas ouvrir de PCM ALSA matériel (hôte audio non
+    /// ALSA) : pas de DSD natif, définitivement.
     PasUnPcmMateriel,
+    /// #9170 — le nom a résolu vers un PCM logiciel (`plughw:`, `default`,
+    /// PipeWire…) : pas de DSD natif À CET INSTANT. Retenu comme provisoire,
+    /// re-sondé ensuite : un `hw:` tenu ou pas encore énuméré peut laisser le
+    /// nom résoudre ailleurs.
+    PcmLogiciel,
+    /// #9170 — périphérique introuvable ou repli sur le périphérique par
+    /// défaut (DAC débranché, éteint, pas encore énuméré) : cela ne dit rien
+    /// du DAC, rien n'est retenu.
+    Introuvable,
     /// PCM tenu (ou illisible) : capacité non sondée, rien n'est retenu.
     Occupe,
     /// PCM sondé : les cadences DSD acceptées en `DSD_U32` (vide = aucune).
     Sonde { cadences: Vec<u32>, voies: u16 },
+}
+
+impl ResultatSondeDsdAlsa {
+    /// #9170 — ce que ce sondage de `device_name` laisse dans
+    /// `capacite_dsd_natif`. Seule une réponse du pilote (`Sonde`, y compris
+    /// « aucun `DSD_U32` ») ou l'absence structurelle d'ALSA est définitive ;
+    /// un PCM logiciel est provisoire ; un périphérique introuvable ou occupé
+    /// ne retient rien (une capacité déjà prouvée reste donc en place).
+    pub fn retenir(&self, device_name: &str) {
+        use crate::outputs::capacite_dsd_natif::{self as capacite, CapaciteConnue};
+        match self {
+            Self::Sonde { cadences, .. } => capacite::retenir(
+                device_name,
+                CapaciteConnue::AlsaDsdU32 {
+                    cadences: cadences.clone(),
+                },
+            ),
+            Self::PasUnPcmMateriel => capacite::retenir(device_name, CapaciteConnue::SortieNonAsio),
+            Self::PcmLogiciel => {
+                capacite::retenir_provisoire(device_name, CapaciteConnue::SortieNonAsio);
+            }
+            Self::Introuvable | Self::Occupe => capacite::noter_sondage_sans_reponse(device_name),
+        }
+    }
 }
 
 /// #8248 — une question « ce PCM offre-t-il le DSD natif ? », détachée de la
@@ -2642,12 +2676,12 @@ pub struct SondeDsdAlsa {
 }
 
 impl SondeDsdAlsa {
-    /// Bloquant. Une réponse (PCM matériel ou non, cadences) est retenue dans
-    /// `capacite_dsd_natif` ; un PCM occupé ne retient rien.
+    /// Bloquant. Le résultat est retenu dans `capacite_dsd_natif` selon
+    /// [`ResultatSondeDsdAlsa::retenir`] (#9170 : jamais de verdict définitif
+    /// sans réponse du pilote).
     pub fn sonder_et_retenir(&self) -> ResultatSondeDsdAlsa {
         #[cfg(target_os = "linux")]
         {
-            use crate::outputs::capacite_dsd_natif::{self as capacite, CapaciteConnue};
             let r = bras_alsa_dsd::sonder_la_sortie(
                 &self.device_name,
                 self.endpoint_id.as_deref(),
@@ -2655,18 +2689,7 @@ impl SondeDsdAlsa {
                 &self.audio_backend,
                 VOIES_SONDEES_DSD_ALSA,
             );
-            match &r {
-                ResultatSondeDsdAlsa::Sonde { cadences, .. } => capacite::retenir(
-                    &self.device_name,
-                    CapaciteConnue::AlsaDsdU32 {
-                        cadences: cadences.clone(),
-                    },
-                ),
-                ResultatSondeDsdAlsa::PasUnPcmMateriel => {
-                    capacite::retenir(&self.device_name, CapaciteConnue::SortieNonAsio);
-                }
-                ResultatSondeDsdAlsa::Occupe => {}
-            }
+            r.retenir(&self.device_name);
             r
         }
         #[cfg(not(target_os = "linux"))]
@@ -6640,9 +6663,12 @@ impl OutputTarget for LocalOutput {
         // DSD natif s'il est encore inconnu. L'orchestrateur ne peut pas le
         // faire pendant qu'une piste PCM tient le PCM `hw:` (EBUSY) ; sans ce
         // relevé, la première piste DSD qui suit une piste PCM partirait en
-        // DoP. Une fois par périphérique : la réponse est retenue.
+        // DoP. Une fois par périphérique : la réponse prouvée est retenue.
         #[cfg(target_os = "linux")]
-        if crate::outputs::capacite_dsd_natif::connue(&self.device_name).is_none()
+        // #9170 — et aussi s'il n'est que provisoire (PCM logiciel observé
+        // sans réponse du pilote), passé un délai : sinon un sondage tombé
+        // au mauvais moment figeait « pas de DSD natif » jusqu'au redémarrage.
+        if crate::outputs::capacite_dsd_natif::a_resonder_a_l_ouverture(&self.device_name)
             && let Some(sonde) = self.sonde_dsd_alsa()
         {
             let _ = tokio::task::spawn_blocking(move || sonde.sonder_et_retenir()).await;
@@ -6891,6 +6917,10 @@ impl OutputTarget for LocalOutput {
             // cadence du fichier. Reconnu AVANT le WAV, dont il n'a pas
             // l'en-tête ; rien du chemin PCM ne le voit.
             if let Some(entete) = crate::audio::dsd_brut::lire_entete(&header_buf) {
+                // #9165 — le greffon est PCM : un flux DSD natif ne le traverse
+                // jamais, et le chemin du signal le dit (« dsd »), pas un
+                // « chemin de sortie non pris en charge ».
+                diagnostic_surechantillonnage.chemin_sans_etage("dsd");
                 if !ouverture_encore_voulue(
                     force_silent.load(Ordering::SeqCst),
                     stop_rx.try_recv().is_ok(),
@@ -7035,6 +7065,9 @@ impl OutputTarget for LocalOutput {
                 // No WAV header — this is a compressed stream (FLAC, MP3, AAC).
                 // Read the rest of the stream, decode with symphonia, and play.
                 info!("local_audio_non_wav_stream_detected_decoding");
+                // #9165 — ce chemin n'ouvre pas l'étage du greffon : il le dit
+                // sous son nom, pas sous le « chemin de sortie » posé d'office.
+                diagnostic_surechantillonnage.chemin_sans_etage("compressed_stream");
                 // #6132 — la sortie double n'est branchée que sur le chemin
                 // PCM partagé (`BackendCpal`) ; dit plutôt que tu.
                 for nom in seconde_sortie.iter().map(|d| d.nom.as_str()) {
@@ -7943,6 +7976,22 @@ impl OutputTarget for LocalOutput {
             // inchangé. Voir `local/bras_alsa_natif.rs`.
             #[cfg(target_os = "linux")]
             {
+                // #9165 — ce que l'ouverture partagée ferait du greffon, par
+                // ses propres règles (gardes, strict, cadences sans
+                // périphérique) : s'il serait porté, le natif lui cède.
+                let greffon = diagnostic_surechantillonnage_8259::greffon_avant_le_natif(
+                    surechantillonnage
+                        .lock()
+                        .ok()
+                        .and_then(|c| c.clone())
+                        .as_ref(),
+                    spec,
+                    header_buf.get(data_offset..).unwrap_or_default(),
+                    pure_bypass.load(Ordering::Relaxed),
+                    dop_active.load(Ordering::Relaxed),
+                    !seconde_sortie.is_empty(),
+                    strict_bitperfect,
+                );
                 let conditions = bras_alsa_natif::ConditionsDuNatif {
                     spec,
                     volume_units: volume.load(Ordering::SeqCst),
@@ -7962,9 +8011,22 @@ impl OutputTarget for LocalOutput {
                         )
                         .is_some_and(|voies| voies != channels),
                     fondu_ms: fondu_ms.load(Ordering::Relaxed),
+                    // #9165 — le greffon armé n'est porté que par le chemin
+                    // partagé : le natif lui cède, comme à un DSP actif.
+                    surechantillonnage_voulu: greffon
+                        == diagnostic_surechantillonnage_8259::GreffonAvantLeNatif::Voulu,
                 };
                 match bras_alsa_natif::chemin_natif_s32(&conditions) {
                     Ok(()) => {
+                        // Le natif est pris avec un greffon armé mais écarté :
+                        // le chemin du signal dit pourquoi, pas « chemin de
+                        // sortie non pris en charge ».
+                        if let diagnostic_surechantillonnage_8259::GreffonAvantLeNatif::Ecarte(
+                            raison,
+                        ) = greffon
+                        {
+                            diagnostic_surechantillonnage.noter(Some(raison));
+                        }
                         let demande = DemandeDOuverture {
                             spec,
                             voies_de_la_matrice: None,
@@ -8032,6 +8094,9 @@ impl OutputTarget for LocalOutput {
                                         track_artist: &artist_ref,
                                         duration_ms: &duration_ms_arc,
                                         seek_offset_ms: &seek_offset_arc,
+                                        surechantillonnage: &surechantillonnage,
+                                        sortie_double: !seconde_sortie.is_empty(),
+                                        strict_bitperfect,
                                     },
                                 );
                                 return;
