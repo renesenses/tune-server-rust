@@ -103,7 +103,10 @@ pub(super) fn hote_de_cette_instance(
     if nom == "localhost" {
         return true;
     }
-    let machine = nom_de_la_machine.trim().trim_end_matches('.').to_ascii_lowercase();
+    let machine = nom_de_la_machine
+        .trim()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
     let court = machine.trim_end_matches(".local");
     if court.is_empty() {
         return false;
@@ -136,7 +139,10 @@ impl PlaybackOrchestrator {
             &[&track_id as &dyn ToSqlValue],
         ) {
             Ok(Some(ligne)) => {
-                let source = ligne.first().and_then(|v| v.as_string()).unwrap_or_default();
+                let source = ligne
+                    .first()
+                    .and_then(|v| v.as_string())
+                    .unwrap_or_default();
                 source.is_empty() || source == "local"
             }
             _ => false,
@@ -209,7 +215,11 @@ mod tests {
             "http://studio:8888/api/v1/library/tracks/2982/audio",
             "http://Studio.local:8888/api/v1/library/tracks/2982/audio",
         ] {
-            assert_eq!(id(uri), Some(2982), "« {uri} » devrait désigner la piste 2982");
+            assert_eq!(
+                id(uri),
+                Some(2982),
+                "« {uri} » devrait désigner la piste 2982"
+            );
         }
     }
 
@@ -242,7 +252,11 @@ mod tests {
             "/api/v1/library/tracks/2982/audio",
             "",
         ] {
-            assert_eq!(id(uri), None, "« {uri} » ne doit désigner aucune piste locale");
+            assert_eq!(
+                id(uri),
+                None,
+                "« {uri} » ne doit désigner aucune piste locale"
+            );
         }
     }
 
@@ -339,11 +353,18 @@ mod tests {
             .resolve_stream(&requete_upnp(41, &uri))
             .await
             .expect("la piste locale doit se résoudre");
-        assert_eq!(resolu.source, "upnp", "la session du renderer se reconnaît à sa source");
-        assert_ne!(resolu.url, uri, "l'URI HTTP brute ne doit plus partir vers la sortie");
+        assert_eq!(
+            resolu.source, "upnp",
+            "la session du renderer se reconnaît à sa source"
+        );
+        assert_ne!(
+            resolu.url, uri,
+            "l'URI HTTP brute ne doit plus partir vers la sortie"
+        );
         assert!(
             resolu.stream_id.is_some(),
-            "le chemin local sert la piste par une session du streamer : {}", resolu.url
+            "le chemin local sert la piste par une session du streamer : {}",
+            resolu.url
         );
     }
 
@@ -357,7 +378,10 @@ mod tests {
         assert_eq!(orch.piste_locale_de_notre_uri(&uri), None);
         let resolu = orch.resolve_stream(&requete_upnp(42, &uri)).await;
         if let Ok(resolu) = resolu {
-            let vue = resolu.origin_url.clone().unwrap_or_else(|| resolu.url.clone());
+            let vue = resolu
+                .origin_url
+                .clone()
+                .unwrap_or_else(|| resolu.url.clone());
             assert_eq!(vue, uri, "le flux distant part tel quel");
         }
     }
@@ -371,7 +395,11 @@ mod tests {
         let uri = crate::upnp_server::track_audio_url("http://127.0.0.1:8888", id);
         assert_eq!(orch.piste_locale_de_notre_uri(&uri), None);
         let absente = crate::upnp_server::track_audio_url("http://127.0.0.1:8888", id + 1000);
-        assert_eq!(orch.piste_locale_de_notre_uri(&absente), None, "ligne absente");
+        assert_eq!(
+            orch.piste_locale_de_notre_uri(&absente),
+            None,
+            "ligne absente"
+        );
     }
 
     /// La suivante (`SetNextAVTransportURI`) entre dans la file de la zone en
