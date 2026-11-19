@@ -379,3 +379,93 @@ async fn les_cles_tenues_par_le_serveur_sont_refusees_par_l_ecriture_generique()
     assert!(statut.is_success(), "{statut} {v}");
     assert_eq!(reglage(&state, "theme").as_deref(), Some("clair"));
 }
+
+/// Même règle à l'import de configuration : ancien format à plat comme
+/// nouveau format (partie zones comprise), les clés tenues par le serveur
+/// sont ignorées et l'import le dit.
+#[tokio::test]
+async fn l_import_ignore_les_cles_tenues_par_le_serveur() {
+    let state = etat();
+    let faux_profil = r#"{"name":"Estimation 7","zone_id":"7","origin":"estimation","filters":[]}"#;
+    // Ancien format, à plat.
+    let corps = serde_json::json!({
+        "theme": "importe",
+        "room_profile_7": faux_profil,
+        "room_profile_index": "[\"7\"]",
+        "zone_7_tess_chain": "{\"version\":1,\"plugins\":[]}",
+        "zone_7_tess_chain_sync": "{}",
+    })
+    .to_string();
+    let (statut, _, v) = appel(
+        &state,
+        Method::POST,
+        "/api/v1/system/config/import",
+        &[],
+        Some(&corps),
+    )
+    .await;
+    assert!(statut.is_success(), "{statut} {v}");
+    assert_eq!(reglage(&state, "theme").as_deref(), Some("importe"));
+    for cle in [
+        "room_profile_7",
+        "room_profile_index",
+        "zone_7_tess_chain",
+        "zone_7_tess_chain_sync",
+    ] {
+        assert_eq!(reglage(&state, cle), None, "{cle} a été importée");
+        assert!(
+            v["warnings"].to_string().contains(cle),
+            "{cle} non signalée : {v}"
+        );
+    }
+
+    // Nouveau format : la partie zones.
+    let state = etat();
+    let corps = serde_json::json!({
+        "format": "tune-config",
+        "format_version": 2,
+        "settings": { "theme": "importe" },
+        "zones": [{
+            "name": "Salon",
+            "output_type": "local",
+            "output_device_id": "local:hw:9",
+            "settings": {
+                "room_profile_{id}": faux_profil,
+                "zone_{id}_tess_chain": "{\"version\":1,\"plugins\":[]}",
+                "zone_{id}_tess_chain_sync": "{}",
+                "zone_{id}_crossfeed": "{\"enabled\":true}",
+            },
+        }],
+    })
+    .to_string();
+    let (statut, _, v) = appel(
+        &state,
+        Method::POST,
+        "/api/v1/system/config/import",
+        &[],
+        Some(&corps),
+    )
+    .await;
+    assert!(statut.is_success(), "{statut} {v}");
+    let id = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get_by_device_id("local:hw:9")
+        .unwrap()
+        .and_then(|z| z.id)
+        .expect("zone importée");
+    // Témoin : un réglage de zone ordinaire passe.
+    assert!(
+        reglage(&state, &format!("zone_{id}_crossfeed")).is_some(),
+        "{v}"
+    );
+    for cle in [
+        format!("room_profile_{id}"),
+        format!("zone_{id}_tess_chain"),
+        format!("zone_{id}_tess_chain_sync"),
+    ] {
+        assert_eq!(reglage(&state, &cle), None, "{cle} a été importée");
+    }
+    assert!(
+        v["warnings"].to_string().contains("server-managed"),
+        "l'import doit le dire : {v}"
+    );
+}

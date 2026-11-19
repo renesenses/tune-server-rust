@@ -560,7 +560,16 @@ producteur et le rendu transporte des `f64`**, et que la quantification
     - **Clés tenues par le serveur** : `room_profile_*` (index compris),
       `zone_{id}_tess_chain` et `zone_{id}_tess_chain_sync` sont refusées
       par `PATCH /system/config` (`403 server_managed_settings`, admin
-      compris) ; elles ne s'écrivent que par leurs routes.
+      compris) ; elles ne s'écrivent que par leurs routes. L'import de
+      configuration (`POST /system/config/import`, et la restauration cloud
+      qui passe par le même plan) les ignore, dans les réglages comme dans
+      la partie zones, et le dit dans ses avertissements ; la chaîne se
+      reconstruit alors depuis les anciennes clés. La restauration d'une
+      sauvegarde (`config_backup`) ignore ces clés dans ses réglages
+      généraux, n'écrit que des clés de profil dans sa section des profils,
+      et restaure chaque profil comme **mesuré** (l'origine d'un fichier ne
+      se vérifie pas ; converti, jamais détruit, pour un compte gratuit), en
+      le disant.
     - **L'origine appartient au serveur** : `lire_zone` la recalcule à
       chaque lecture (jamais tirée du stockage brut de la chaîne), et
       `ecrire_chaine` la réécrit
