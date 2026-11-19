@@ -30,7 +30,7 @@ fn un_integre_actif_sans_paquet_natif_est_dit_actif_9151() {
     let s = reglages();
     installer(&s, "channel-remap");
 
-    let fiche = fiche_d_etat(&s, "channel-remap", false);
+    let fiche = fiche_d_etat(&s, "channel-remap", false, true, true);
 
     assert_eq!(fiche["native_loaded"], false, "aucun paquet natif ici");
     assert_eq!(
@@ -48,11 +48,14 @@ fn un_integre_actif_sans_paquet_natif_est_dit_actif_9151() {
 #[test]
 fn un_integre_non_installe_ou_desactive_reste_inactif_9151() {
     let s = reglages();
-    assert_eq!(fiche_d_etat(&s, "channel-remap", false)["active"], false);
+    assert_eq!(
+        fiche_d_etat(&s, "channel-remap", false, true, true)["active"],
+        false
+    );
 
     installer(&s, "channel-remap");
     s.set("plugin_channel-remap_enabled", "false").unwrap();
-    let fiche = fiche_d_etat(&s, "channel-remap", false);
+    let fiche = fiche_d_etat(&s, "channel-remap", false, true, true);
     assert_eq!(fiche["active"], false, "désactivé : inactif");
     assert_eq!(fiche["engine"], "bundled");
 }
@@ -64,7 +67,7 @@ fn un_tiers_sans_bibliotheque_chargee_n_est_pas_actif_9151() {
     let s = reglages();
     installer(&s, "greffon-tiers-9151");
 
-    let fiche = fiche_d_etat(&s, "greffon-tiers-9151", true);
+    let fiche = fiche_d_etat(&s, "greffon-tiers-9151", true, false, true);
 
     assert_eq!(fiche["native_loaded"], false);
     assert!(
@@ -73,4 +76,47 @@ fn un_tiers_sans_bibliotheque_chargee_n_est_pas_actif_9151() {
     );
     assert_eq!(fiche["active"], false, "demandé mais non chargé : inactif");
     assert_eq!(fiche["third_party"], true);
+}
+
+/// ⭐ Relecture de #9219 : un intégré facultatif installé EN COURS DE SESSION
+/// (l'upsampler du fil 2945) a ses réglages à `true`, mais ses routes ne se
+/// montent qu'au démarrage. Il n'est pas « actif » : il attend un redémarrage.
+#[test]
+fn un_integre_installe_en_cours_de_session_attend_un_redemarrage_9151() {
+    let s = reglages();
+    installer(&s, "upsampler");
+
+    let fiche = fiche_d_etat(&s, "upsampler", false, false, true);
+    assert_eq!(
+        fiche["active"], false,
+        "#9151 : installé mais pas monté par ce processus, il n'est pas actif"
+    );
+    assert_eq!(fiche["restart_required"], true);
+
+    // Contre-épreuve : monté au démarrage, le même est actif, sans attente.
+    let fiche = fiche_d_etat(&s, "upsampler", false, true, true);
+    assert_eq!(fiche["active"], true);
+    assert_eq!(fiche["restart_required"], false);
+}
+
+/// Un intégré payant monté, mais dont la licence ne couvre plus le droit,
+/// n'est pas dit actif : ses routes le refusent (`require_premium`).
+#[test]
+fn un_integre_sans_le_droit_premium_n_est_pas_actif_9151() {
+    let s = reglages();
+    installer(&s, "crossfeed");
+
+    let fiche = fiche_d_etat(&s, "crossfeed", false, true, false);
+    assert_eq!(fiche["active"], false, "licence tombée : inactif");
+    assert_eq!(fiche["licensed"], false);
+    assert_eq!(fiche["restart_required"], false, "rien à redémarrer");
+}
+
+/// Un intégré désactivé n'attend aucun redémarrage, même non monté.
+#[test]
+fn un_integre_desactive_n_attend_pas_de_redemarrage_9151() {
+    let s = reglages();
+    let fiche = fiche_d_etat(&s, "upsampler", false, false, true);
+    assert_eq!(fiche["active"], false);
+    assert_eq!(fiche["restart_required"], false);
 }
