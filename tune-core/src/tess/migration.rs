@@ -445,10 +445,12 @@ fn profil_de_piece(settings: &SettingsRepo, zone_id: i64) -> Option<(EqProfile, 
 
 /// D1 — d'où vient un profil de pièce (`room_profile_{id}`, JSON brut) ?
 ///
-/// Les anciens réglages n'enregistrent pas l'origine ; on tranche ainsi :
-/// 1. un champ explicite l'emporte s'il existe (`"estimation": true|false`,
-///    ou `"origin": "estimation"|"measured"`) — c'est ce que le greffon de
-///    calibration devrait écrire désormais ;
+/// On tranche ainsi :
+/// 1. `"origin": "estimation"|"measured"`, que le serveur enregistre à la
+///    création du profil (`RoomProfile::origin`), l'emporte. Aucun autre
+///    champ n'est cru : le serveur n'écrit jamais `"estimation": bool` dans
+///    un profil, et un client ne peut pas écrire `room_profile_*` par
+///    `PATCH /system/config` (voir [`cle_tenue_par_le_serveur`]) ;
 /// 2. sinon, le nom par défaut d'une estimation C5 (« Estimation {id} »,
 ///    [`PREFIXE_NOM_ESTIMATION`]) désigne une estimation ;
 /// 3. sinon : MESURÉE. Les bornes plus serrées de C5 ne servent pas d'indice
@@ -456,13 +458,6 @@ fn profil_de_piece(settings: &SettingsRepo, zone_id: i64) -> Option<(EqProfile, 
 ///    doute, la correction est traitée comme Premium : sur un compte gratuit
 ///    elle est convertie en graphique, jamais détruite.
 pub fn origine_de_la_piece(profil: &Value) -> &'static str {
-    if let Some(b) = profil.get("estimation").and_then(Value::as_bool) {
-        return if b {
-            ORIGINE_ESTIMATION
-        } else {
-            ORIGINE_MESURE
-        };
-    }
     match profil.get("origin").and_then(Value::as_str) {
         Some(ORIGINE_ESTIMATION) => return ORIGINE_ESTIMATION,
         Some(ORIGINE_MESURE) => return ORIGINE_MESURE,
@@ -591,6 +586,23 @@ fn marques_par_le_serveur(reference: Option<&ChaineTess>, chaine: &ChaineTess) -
         }
     }
     c
+}
+
+/// D1 : les réglages que seul le serveur écrit, refusés par l'écriture
+/// générique (`PATCH /system/config`) : le profil de pièce de chaque zone et
+/// son index (l'origine y décide du droit Premium), la chaîne TESS de chaque
+/// zone et son ombre (`zone_{id}_tess_chain`, `zone_{id}_tess_chain_sync`).
+pub fn cle_tenue_par_le_serveur(cle: &str) -> bool {
+    if cle.starts_with("room_profile_") {
+        return true;
+    }
+    cle.strip_prefix("zone_")
+        .and_then(|reste| reste.split_once('_'))
+        .is_some_and(|(id, suite)| {
+            !id.is_empty()
+                && id.bytes().all(|b| b.is_ascii_digit())
+                && (suite == "tess_chain" || suite == "tess_chain_sync")
+        })
 }
 
 /// D1 : ce maillon est-il une correction de pièce CALCULÉE SANS MICRO (C5),
@@ -1067,6 +1079,11 @@ pub fn lire_zone(
             }
         }
     }
+
+    // D1 : l'origine d'une correction de pièce ne vient jamais du stockage
+    // brut de la chaîne (un client a pu l'écrire) : elle est recalculée
+    // d'après `room_profile_{id}`, comme à l'écriture.
+    let mut chaine = origines_par_le_serveur(settings, zone_id, &chaine);
 
     let conversion = if premium {
         None
@@ -1649,7 +1666,15 @@ fn ecrire_chaine_avec(
     let chaine = &origines_par_le_serveur(settings, zone_id, chaine);
     // Groupe crossfeed et D2 : les marques de la lecture appartiennent au
     // serveur (la chaîne qu'il lit, migration à la lecture comprise).
-    let reference = lire_zone(settings, zone_id, true).ok().map(|l| l.chaine);
+    let reference = match lire_zone(settings, zone_id, true) {
+        Ok(l) => Some(l.chaine),
+        Err(e) => {
+            // Sans chaîne de référence, toutes les marques du corps sont
+            // retirées (repli sûr) ; on le dit.
+            tracing::warn!(zone_id, erreur = %e, "tess_ecriture_chaine_de_reference_illisible");
+            None
+        }
+    };
     let chaine = &marques_par_le_serveur(reference.as_ref(), chaine);
 
     let mut inst = lire_instantane(settings, zone_id)?;

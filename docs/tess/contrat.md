@@ -551,13 +551,19 @@ producteur et le rendu transporte des `f64`**, et que la quantification
       calibration selon sa route (mesure C2 ou estimation C5), la route
       manuelle `POST /room-correction/profiles/{zone}` toujours en
       `"measured"`. Les profils anciens ne l'ont pas. On lit
-      `room_profile_{id}` : un champ explicite (`"estimation": true|false` ou
-      `"origin"`) l'emporte ; sinon le nom par défaut d'une estimation C5
-      (« Estimation {id} ») ; sinon **mesurée**. Les bornes de C5 ne servent
+      `room_profile_{id}` : `"origin"` l'emporte (aucun autre champ n'est
+      cru, `"estimation": bool` compris) ; sinon le nom par défaut d'une
+      estimation C5 (« Estimation {id} ») ; sinon **mesurée**. Les bornes de C5 ne servent
       pas d'indice (le mode expert #8332 les relève). Dans le doute, la
       correction est donc traitée en Premium : convertie, jamais détruite.
       Sortir C5 de la garde Premium du greffon reste la tâche Codex 28.
-    - **L'origine appartient au serveur** : `ecrire_chaine` la réécrit
+    - **Clés tenues par le serveur** : `room_profile_*` (index compris),
+      `zone_{id}_tess_chain` et `zone_{id}_tess_chain_sync` sont refusées
+      par `PATCH /system/config` (`403 server_managed_settings`, admin
+      compris) ; elles ne s'écrivent que par leurs routes.
+    - **L'origine appartient au serveur** : `lire_zone` la recalcule à
+      chaque lecture (jamais tirée du stockage brut de la chaîne), et
+      `ecrire_chaine` la réécrit
       d'après `room_profile_{id}` quoi que dise le corps (`"estimation"`
       seulement si les bandes sont celles d'une estimation de la zone,
       `"measured"` sinon). Un `PUT` ne peut donc jamais lever le droit

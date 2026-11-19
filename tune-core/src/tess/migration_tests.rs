@@ -1451,16 +1451,22 @@ fn d1_l_origine_enregistree_a_la_creation_l_emporte_sur_le_nom() {
 
 #[test]
 fn d1_l_origine_explicite_l_emporte_sur_le_nom() {
-    // Renommée par l'utilisateur, mais marquée estimation : Free.
+    // `"estimation": bool` n'est plus cru (le serveur ne l'écrit jamais) :
+    // une fiche « Mon salon » qui se dit estimation reste MESURÉE, donc
+    // convertie sans Premium...
     let (_b, s) = base();
     poser_la_piece(&s, 19, "Mon salon", Some(("estimation", json!(true))));
-    assert!(correction_estimee(
-        &lire_zone(&s, 19, false).unwrap().chaine.plugins[0]
-    ));
-    // Nom d'estimation, mais marquée mesurée : Premium, convertie.
+    assert!(lire_zone(&s, 19, false).unwrap().conversion_piece);
+    // ... et « Estimation 3 » qui se dit mesurée suit la règle du nom.
     let (_b, s) = base();
     poser_la_piece(&s, 20, "Estimation 3", Some(("estimation", json!(false))));
-    assert!(lire_zone(&s, 20, false).unwrap().conversion_piece);
+    assert!(correction_estimee(
+        &lire_zone(&s, 20, false).unwrap().chaine.plugins[0]
+    ));
+    // `origin` mesurée l'emporte sur le nom d'estimation.
+    let (_b, s) = base();
+    poser_la_piece(&s, 23, "Estimation 4", Some(("origin", json!("measured"))));
+    assert!(lire_zone(&s, 23, false).unwrap().conversion_piece);
     // `origin` explicite.
     let (_b, s) = base();
     poser_la_piece(&s, 21, "Salon", Some(("origin", json!("estimation"))));
@@ -2351,4 +2357,59 @@ fn d2_temoin_un_put_inchange_garde_la_marque_du_mono() {
         ids(&lire_zone(&s, z, true).unwrap().chaine),
         vec![(ID_MONO, true)]
     );
+}
+
+// ── D1 : une chaîne écrite à la main ne lève pas le droit Premium ───
+
+#[test]
+fn d1_une_chaine_stockee_qui_se_dit_estimation_est_relue_par_le_serveur() {
+    // Une correction MESURÉE, migrée ; puis la chaîne enregistrée est
+    // réécrite directement (sans `ecrire_chaine`) avec une origine
+    // « estimation ».
+    let (_b, s) = base();
+    let z = 60;
+    poser_la_piece(&s, z, "Calibration abc", None);
+    let mut c = migrer_zone(&s, z).unwrap().chaine;
+    assert_eq!(c.plugins[0].settings["origin"], json!("measured"));
+    c.plugins[0]
+        .settings
+        .as_object_mut()
+        .unwrap()
+        .insert("origin".into(), json!("estimation"));
+    s.set(&cle_chaine_zone(z), &serde_json::to_string(&c).unwrap())
+        .unwrap();
+    let l = lire_zone(&s, z, false).unwrap();
+    assert!(
+        l.conversion_piece,
+        "le droit Premium a été levé par le stockage"
+    );
+    // Témoin : une vraie estimation enregistrée par le serveur reste Free.
+    let (_b, s) = base();
+    let z = 62;
+    poser_la_piece(&s, z, "Estimation 8", None);
+    migrer_zone(&s, z).unwrap();
+    let l = lire_zone(&s, z, false).unwrap();
+    assert!(!l.conversion_piece);
+    assert!(correction_estimee(&l.chaine.plugins[0]));
+}
+
+#[test]
+fn d1_les_cles_tenues_par_le_serveur() {
+    for cle in [
+        "room_profile_7",
+        "room_profile_index",
+        "zone_7_tess_chain",
+        "zone_12_tess_chain_sync",
+    ] {
+        assert!(cle_tenue_par_le_serveur(cle), "{cle}");
+    }
+    for cle in [
+        "zone_7_eq_profile",
+        "zone_7_tess_chainette",
+        "zone_x_tess_chain",
+        "room_correction_enabled",
+        "theme",
+    ] {
+        assert!(!cle_tenue_par_le_serveur(cle), "{cle}");
+    }
 }
