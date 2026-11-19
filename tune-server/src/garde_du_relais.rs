@@ -84,6 +84,16 @@ const SEGMENTS_DE_COMPTE: &[&str] = &[
     "debug",
 ];
 
+/// `/home/continue-listening/{zone}/resume`, la zone en chiffres seulement.
+fn reprise_d_une_ecoute(api: &str) -> bool {
+    let segments: Vec<&str> = api.split('/').skip(1).collect();
+    matches!(
+        segments.as_slice(),
+        ["home", "continue-listening", zone, "resume"]
+            if !zone.is_empty() && zone.bytes().all(|b| b.is_ascii_digit())
+    )
+}
+
 /// Une route de l'API (`/api/v1` retiré) relayable ?
 fn route_d_api_relayable(m: &Method, api: &str, auth_active: bool) -> bool {
     // Lecture, file, volume, transfert : tout ce qui pilote une zone.
@@ -146,6 +156,11 @@ fn route_d_api_relayable(m: &Method, api: &str, auth_active: bool) -> bool {
             ("POST", "/auth/login") | ("POST", "/auth/logout") | ("GET", "/auth/me")
         )
     {
+        return true;
+    }
+    // Reprendre une écoute de l'accueil dans une zone : le même geste que
+    // `/zones/*`. Cette seule route sous `/home` s'ouvre en écriture.
+    if m == Method::POST && reprise_d_une_ecoute(api) {
         return true;
     }
     if !lecture(m) {
@@ -257,6 +272,8 @@ mod tests {
             (Method::GET, "/api/v1/streaming/qobuz/album/1"),
             (Method::GET, "/api/v1/system/health"),
             (Method::GET, "/api/v1/home/shortcuts"),
+            (Method::GET, "/api/v1/home/continue-listening"),
+            (Method::POST, "/api/v1/home/continue-listening/3/resume"),
             (Method::GET, "/stream/2338763c.flac"),
             (Method::HEAD, "/stream/2338763c.flac"),
             (Method::GET, "/ws"),
@@ -274,6 +291,43 @@ mod tests {
         assert!(!ok(Method::POST, "/api/v1/home/shortcuts"));
         assert!(!ok(Method::PATCH, "/api/v1/system/config"));
         assert!(!ok(Method::GET, "/api/v1/system/config"));
+    }
+
+    /// #9154 — seule la reprise d'une écoute s'ouvre en écriture sous
+    /// `/home`, par POST et au motif exact.
+    #[test]
+    fn reprise_d_une_ecoute_seule_ouverte_en_ecriture_sous_home() {
+        assert!(ok(Method::POST, "/api/v1/home/continue-listening/12/resume"));
+        for (m, c) in [
+            (Method::PUT, "/api/v1/home/continue-listening/12/resume"),
+            (Method::DELETE, "/api/v1/home/continue-listening/12/resume"),
+            (Method::PATCH, "/api/v1/home/continue-listening/12/resume"),
+            (Method::POST, "/api/v1/home/continue-listening"),
+            (Method::POST, "/api/v1/home/continue-listening/12"),
+            (Method::POST, "/api/v1/home/continue-listening/12/resume/"),
+            (Method::POST, "/api/v1/home/continue-listening/12/resume/x"),
+            (Method::POST, "/api/v1/home/continue-listening//resume"),
+            (Method::POST, "/api/v1/home/continue-listening/abc/resume"),
+            (Method::POST, "/api/v1/home/continue-listening/-1/resume"),
+            (Method::POST, "/api/v1/home/continue-listening/1%2f2/resume"),
+            (Method::POST, "/api/v1/home/continue-listening/..%2f..%2fsystem/resume"),
+            (Method::POST, "/api/v1/home/continue-listening/../resume"),
+            (Method::POST, "//api/v1/home/continue-listening/1/resume"),
+            (Method::POST, "/api/v1//home/continue-listening/1/resume"),
+            (Method::POST, "/api/v1/Home/continue-listening/1/resume"),
+            (Method::POST, "/api/v1/home/Continue-Listening/1/resume"),
+            (Method::POST, "/api/v1/home/continue-listening/1/RESUME"),
+            (Method::POST, "/API/V1/home/continue-listening/1/resume"),
+            (Method::POST, "/api/v1/home/shortcuts"),
+            (Method::POST, "/api/v1/home"),
+            (Method::POST, "/api/v1/home/"),
+            (Method::POST, "/api/v1/home/recommendations"),
+            (Method::POST, "/api/v1/home/dismissed-suggestions"),
+            (Method::POST, "/api/v1/home/dismissed-suggestions/restore"),
+            (Method::POST, "/api/v1/homex/continue-listening/1/resume"),
+        ] {
+            assert!(!ok(m.clone(), c), "{m} {c} ne doit pas être relayable");
+        }
     }
 
     #[test]
