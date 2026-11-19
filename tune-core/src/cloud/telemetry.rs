@@ -113,6 +113,15 @@ struct HeartbeatPayload {
     albums_with_bio: i64,
     os: String,
     arch: String,
+    /// Systeme PRECIS (« Ubuntu 24.04.1 LTS », « Windows 11 23H2 »,
+    /// « macOS 15.4 ») — voir [`super::plateforme`]. Rien d'identifiant.
+    os_version: Option<String>,
+    /// `docker`, `tune-os`, `homebrew`, `windows-installer`, `macos-app`,
+    /// `ios-app`, `package` ou `other`.
+    install_kind: &'static str,
+    /// Modele de la carte sous Linux ARM (« Raspberry Pi 5 Model B Rev 1.0 »),
+    /// `null` ailleurs.
+    device_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tune_tested: Option<super::tune_tested_auto::Contribution>,
 }
@@ -128,6 +137,7 @@ fn charge_utile(
     if !TelemetryReporter::is_enabled_for(settings) {
         return None;
     }
+    let plateforme = super::plateforme::plateforme();
     Some(HeartbeatPayload {
         server_id: super::tune_tested_auto::pseudonyme_serveur(
             &TelemetryReporter::get_or_create_server_id(settings),
@@ -140,6 +150,9 @@ fn charge_utile(
         albums_with_bio,
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
+        os_version: plateforme.os_version.clone(),
+        install_kind: plateforme.install_kind,
+        device_model: plateforme.device_model.clone(),
         tune_tested: super::tune_tested_auto::contribution(settings),
     })
 }
@@ -313,6 +326,9 @@ impl TelemetryReporter {
         web_dir: std::path::PathBuf,
     ) {
         tokio::spawn(async move {
+            // Systeme precis, mode d'installation et modele de carte : lus UNE
+            // fois, au demarrage, hors de l'executeur (sous Windows, `reg.exe`).
+            let _ = tokio::task::spawn_blocking(super::plateforme::plateforme).await;
             // Initial delay: give the server time to restore tokens and scan
             tokio::time::sleep(std::time::Duration::from_secs(30)).await;
             loop {
@@ -353,6 +369,13 @@ mod tests {
             !json.to_string().contains(brut),
             "le battement ne doit jamais exporter l'identité brute"
         );
+        // Systeme precis : les trois champs partent, figes sur la detection
+        // du demarrage.
+        let p = super::super::plateforme::plateforme();
+        assert_eq!(json["install_kind"], p.install_kind);
+        assert_eq!(json["os_version"], serde_json::json!(p.os_version));
+        assert_eq!(json["device_model"], serde_json::json!(p.device_model));
+        assert!(json.get("hostname").is_none());
         settings.set(TELEMETRY_SETTING_KEY, "false").unwrap();
         assert!(
             charge_utile(&settings, Vec::new(), 0, 0, 0, web_dir.path()).is_none(),
