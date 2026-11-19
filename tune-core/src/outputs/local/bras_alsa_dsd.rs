@@ -200,7 +200,7 @@ pub(super) fn sonder_la_sortie(
             }
             return match raison {
                 SansPcmMateriel::HoteNonAlsa(_) => ResultatSondeDsdAlsa::PasUnPcmMateriel,
-                SansPcmMateriel::PcmLogiciel(id) if pcm_logiciel_generique(id) => {
+                SansPcmMateriel::PcmLogiciel(id) if pcm_logiciel_generique(&id) => {
                     ResultatSondeDsdAlsa::PasUnPcmMateriel
                 }
                 SansPcmMateriel::PcmLogiciel(_) => ResultatSondeDsdAlsa::PcmLogiciel,
@@ -647,7 +647,14 @@ mod perte_du_hw_9172 {
     #[test]
     fn un_pcm_logiciel_generique_est_definitif() {
         use super::pcm_logiciel_generique;
-        for id in ["alsa:default", "pipewire", "alsa:pulse", "dmix", "sysdefault", "plug"] {
+        for id in [
+            "alsa:default",
+            "pipewire",
+            "alsa:pulse",
+            "dmix",
+            "sysdefault",
+            "plug",
+        ] {
             assert!(pcm_logiciel_generique(id), "{id} : générique attendu");
         }
         for id in [

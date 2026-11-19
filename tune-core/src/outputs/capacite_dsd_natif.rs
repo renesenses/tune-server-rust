@@ -562,14 +562,16 @@ mod tests_9170 {
         let t0 = Instant::now();
         let sondages = |de: u64, a: u64| {
             (de..a)
-                .filter(|i| {
-                    a_resonder_a_l_ouverture_a(nom, t0 + Duration::from_secs(i * 240))
-                })
+                .filter(|i| a_resonder_a_l_ouverture_a(nom, t0 + Duration::from_secs(i * 240)))
                 .count()
         };
         assert_eq!(sondages(0, 50), 0, "sortie inconnue : 0 sondage attendu");
         retenir_provisoire_a(nom, CapaciteConnue::SortieNonAsio, t0);
-        assert_eq!(sondages(50, 100), 0, "verdict provisoire : 0 sondage attendu");
+        assert_eq!(
+            sondages(50, 100),
+            0,
+            "verdict provisoire : 0 sondage attendu"
+        );
         demander_sondage_a_l_ouverture(nom);
         assert_eq!(sondages(100, 150), 1, "une demande = un sondage");
     }
