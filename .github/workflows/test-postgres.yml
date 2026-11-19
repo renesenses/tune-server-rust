@@ -259,6 +259,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5998 -- --nocapture --test-threads=1
 
+      # #9116 — vue Répertoires : le compte d'une racine part de l'index du
+      # chemin (plan générique compris) et rend l'ancien compte. Sans cette
+      # étape, l'épreuve prendrait son saut annoncé.
+      - name: Compte de racine par l'index du chemin sur PostgreSQL (#9116)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_9116 -- --nocapture --test-threads=1
+
       # #7856 — contrôle parental : stockage, révision optimiste, droits du
       # superviseur et filtre relu de la base. Sans cette étape, l'épreuve
       # prendrait son saut annoncé.

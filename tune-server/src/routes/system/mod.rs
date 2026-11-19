@@ -9,6 +9,7 @@ mod backup;
 // #8189 — `GET /system/capabilities`.
 pub(crate) mod capacites;
 // Réglages ▸ Clés d'API (#4805, lot 1 MetaRust).
+pub(crate) mod avancement_suspendu_9116;
 pub(crate) mod cles_api;
 pub(crate) mod comptages_8805;
 mod config;
