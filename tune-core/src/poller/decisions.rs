@@ -1084,7 +1084,16 @@ pub fn natural_end(
     track_duration_ms: u64,
     realtime: bool,
 ) -> bool {
-    let repeat_end = repeat_active && peak_position_ms > 5_000;
+    // #9031 — la répétition n'est PAS une preuve de fin. Sous « Tout
+    // répéter », `repeat_active && peak > 5 s` suffisait : un renderer qui
+    // annonce `Stopped` en pleine lecture (UAPP, Android, fil 2882 : cinq
+    // sondes `Stopped` à 98 s d'un titre de 153 s, il jouait encore) voyait
+    // sa piste abandonnée pour la suivante. La leçon de DEvir QA B-05 (la
+    // répétition ne repartait pas en DLNA) est tenue par
+    // [`peak_reached_end`] depuis #3229 dès que la durée est connue ; la
+    // tolérance ne reste que pour une durée INCONNUE, où rien d'autre ne
+    // dirait la fin.
+    let repeat_end = repeat_active && track_duration_ms == 0 && peak_position_ms > 5_000;
     played_enough
         // Le pic a atteint la fin : la piste est finie, quoi qu'en dise
         // l'horloge murale. C'est ce qui branche enfin le correctif sur le

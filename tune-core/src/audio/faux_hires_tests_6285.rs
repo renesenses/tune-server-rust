@@ -114,16 +114,9 @@ fn un_cd_suréchantillonné_est_douteux_par_la_bande_6285() {
     coupure_vers(&m, 21_000.0);
 }
 
-/// 🔴 #9067 (décision du 18/11, fil 2915) — un CD 16/44,1 coupé à 16 kHz
-/// n'annonce pas de hi-res : il n'est JAMAIS « Hi-Res douteux », il reste
-/// conforme (la coupure reste mesurée et rangée).
-#[test]
-fn un_cd_16_44_coupe_a_16_khz_n_est_pas_hires_douteux_9067() {
-    let pcm = quantifier(&rose(44_100, 16_000.0, 4), 16);
-    let (m, v) = verdict(&pcm, 44_100, 16);
-    assert_eq!(v, Verdict::Conforme, "{m:?}");
-    coupure_vers(&m, 16_000.0);
-}
+// #9067 — le CD 16/44,1 coupé EN MUR à 16 kHz : « source altérée » depuis la
+// décision du 19/11 (il était conforme du 18 au 19/11) ; voir
+// `faux_hires_tests_9067.rs`.
 
 /// 🔴 Le même spectre coupé à 16 kHz dans un 24/44,1, qui se dit hi-res par
 /// ses bits : douteux. #9035 — la coupure seule (un filtre fixe, sans trou
