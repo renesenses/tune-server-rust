@@ -6917,6 +6917,10 @@ impl OutputTarget for LocalOutput {
             // cadence du fichier. Reconnu AVANT le WAV, dont il n'a pas
             // l'en-tête ; rien du chemin PCM ne le voit.
             if let Some(entete) = crate::audio::dsd_brut::lire_entete(&header_buf) {
+                // #9165 — le greffon est PCM : un flux DSD natif ne le traverse
+                // jamais, et le chemin du signal le dit (« dsd »), pas un
+                // « chemin de sortie non pris en charge ».
+                diagnostic_surechantillonnage.chemin_sans_etage("dsd");
                 if !ouverture_encore_voulue(
                     force_silent.load(Ordering::SeqCst),
                     stop_rx.try_recv().is_ok(),
@@ -7061,6 +7065,9 @@ impl OutputTarget for LocalOutput {
                 // No WAV header — this is a compressed stream (FLAC, MP3, AAC).
                 // Read the rest of the stream, decode with symphonia, and play.
                 info!("local_audio_non_wav_stream_detected_decoding");
+                // #9165 — ce chemin n'ouvre pas l'étage du greffon : il le dit
+                // sous son nom, pas sous le « chemin de sortie » posé d'office.
+                diagnostic_surechantillonnage.chemin_sans_etage("compressed_stream");
                 // #6132 — la sortie double n'est branchée que sur le chemin
                 // PCM partagé (`BackendCpal`) ; dit plutôt que tu.
                 for nom in seconde_sortie.iter().map(|d| d.nom.as_str()) {
@@ -7969,6 +7976,22 @@ impl OutputTarget for LocalOutput {
             // inchangé. Voir `local/bras_alsa_natif.rs`.
             #[cfg(target_os = "linux")]
             {
+                // #9165 — ce que l'ouverture partagée ferait du greffon, par
+                // ses propres règles (gardes, strict, cadences sans
+                // périphérique) : s'il serait porté, le natif lui cède.
+                let greffon = diagnostic_surechantillonnage_8259::greffon_avant_le_natif(
+                    surechantillonnage
+                        .lock()
+                        .ok()
+                        .and_then(|c| c.clone())
+                        .as_ref(),
+                    spec,
+                    header_buf.get(data_offset..).unwrap_or_default(),
+                    pure_bypass.load(Ordering::Relaxed),
+                    dop_active.load(Ordering::Relaxed),
+                    !seconde_sortie.is_empty(),
+                    strict_bitperfect,
+                );
                 let conditions = bras_alsa_natif::ConditionsDuNatif {
                     spec,
                     volume_units: volume.load(Ordering::SeqCst),
@@ -7988,9 +8011,22 @@ impl OutputTarget for LocalOutput {
                         )
                         .is_some_and(|voies| voies != channels),
                     fondu_ms: fondu_ms.load(Ordering::Relaxed),
+                    // #9165 — le greffon armé n'est porté que par le chemin
+                    // partagé : le natif lui cède, comme à un DSP actif.
+                    surechantillonnage_voulu: greffon
+                        == diagnostic_surechantillonnage_8259::GreffonAvantLeNatif::Voulu,
                 };
                 match bras_alsa_natif::chemin_natif_s32(&conditions) {
                     Ok(()) => {
+                        // Le natif est pris avec un greffon armé mais écarté :
+                        // le chemin du signal dit pourquoi, pas « chemin de
+                        // sortie non pris en charge ».
+                        if let diagnostic_surechantillonnage_8259::GreffonAvantLeNatif::Ecarte(
+                            raison,
+                        ) = greffon
+                        {
+                            diagnostic_surechantillonnage.noter(Some(raison));
+                        }
                         let demande = DemandeDOuverture {
                             spec,
                             voies_de_la_matrice: None,
@@ -8058,6 +8094,9 @@ impl OutputTarget for LocalOutput {
                                         track_artist: &artist_ref,
                                         duration_ms: &duration_ms_arc,
                                         seek_offset_ms: &seek_offset_arc,
+                                        surechantillonnage: &surechantillonnage,
+                                        sortie_double: !seconde_sortie.is_empty(),
+                                        strict_bitperfect,
                                     },
                                 );
                                 return;
