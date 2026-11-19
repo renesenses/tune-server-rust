@@ -1729,8 +1729,17 @@ impl PlaybackOrchestrator {
             let result = self
                 .session_morte_pendant_l_envoi(req, resolved, device_id, result)
                 .await;
-            if result.0 {
-                self.noter_le_depart_airplay2_si_le_flux_y_commence(
+            if result.0
+                && !self
+                    .noter_le_depart_si_le_flux_y_commence(
+                        device_id,
+                        resolved.stream_id.as_deref(),
+                        req.seek_ms,
+                    )
+                    .await
+            {
+                self.deplacer_la_sortie_qui_decode_si_le_flux_part_de_zero(
+                    self.output_type_of(device_id).await.as_deref(),
                     device_id,
                     resolved.stream_id.as_deref(),
                     req.seek_ms,
@@ -2319,7 +2328,16 @@ impl PlaybackOrchestrator {
             guard.get(stream_id?).cloned()
         }?;
         let servi = session.file_path.lock().await.clone()?;
-        meme_fichier(&servi, origine).then_some(servi)
+        if servi == origine {
+            return Some(servi);
+        }
+        // `canonicalize` et le repli NFC/NFD touchent le disque (partage
+        // réseau possible) : hors de l'exécuteur async.
+        let (a, b) = (servi.clone(), origine.to_owned());
+        tokio::task::spawn_blocking(move || meme_fichier(&a, &b))
+            .await
+            .unwrap_or(false)
+            .then_some(servi)
     }
 
     /// `output_type()` of the registered output for `device_id` (e.g. "dlna",
@@ -2749,7 +2767,7 @@ impl PlaybackOrchestrator {
     /// l'octet 0 (épisode de podcast par `resolve_direct`, qui ignore
     /// `seek_ms`), ne note RIEN : l'écran dirait 12:00 sur un son à 0:00.
     /// Rend `true` quand le départ a été noté.
-    pub(super) async fn noter_le_depart_airplay2_si_le_flux_y_commence(
+    pub(super) async fn noter_le_depart_si_le_flux_y_commence(
         &self,
         device_id: &str,
         stream_id: Option<&str>,
@@ -2767,14 +2785,62 @@ impl PlaybackOrchestrator {
             return false;
         }
         let sortie = output.lock().await;
-        let Some(airplay2) = sortie
-            .as_any()
-            .downcast_ref::<crate::outputs::airplay2::Airplay2Output>()
-        else {
+        let quelconque = sortie.as_any();
+        if let Some(airplay2) =
+            quelconque.downcast_ref::<crate::outputs::airplay2::Airplay2Output>()
+        {
+            airplay2.noter_le_depart_du_flux(depart_ms);
+            return true;
+        }
+        // #9175 — même contrat pour Sendspin et Devialet AIR : relancés à la
+        // position sur un flux traité (canal), ils décodent depuis le début
+        // du flux et doivent compter depuis le début de la piste.
+        if let Some(sendspin) =
+            quelconque.downcast_ref::<crate::outputs::sendspin::SendspinOutput>()
+        {
+            sendspin.noter_le_depart_du_flux(depart_ms);
+            return true;
+        }
+        if let Some(air) =
+            quelconque.downcast_ref::<crate::outputs::devialet_air::DevialetAirOutput>()
+        {
+            air.noter_le_depart_du_flux(depart_ms).await;
+            return true;
+        }
+        false
+    }
+
+    /// #9175 — Sendspin et Devialet AIR lancés à une position non nulle sur
+    /// une session qui se RELIT (fichier d'origine, fichier transcodé,
+    /// mandataire) : ces sessions servent depuis l'octet 0 et ignorent
+    /// `seek_ms` (#2893). La sortie, qui décode elle-même, s'y déplace.
+    /// Le cas du canal (flux qui commence déjà à la position) est celui de
+    /// [`Self::noter_le_depart_si_le_flux_y_commence`].
+    pub(super) async fn deplacer_la_sortie_qui_decode_si_le_flux_part_de_zero(
+        &self,
+        output_type: Option<&str>,
+        device_id: &str,
+        stream_id: Option<&str>,
+        seek_ms: Option<u64>,
+    ) -> bool {
+        let (Some(position_ms), Some(sid)) = (seek_ms.filter(|ms| *ms > 0), stream_id) else {
             return false;
         };
-        airplay2.noter_le_depart_du_flux(depart_ms);
-        true
+        if !sortie_qui_decode_file_path(output_type)
+            || !self.streamer.is_seekable_session(sid).await
+        {
+            return false;
+        }
+        let Some(output) = ({ self.outputs.lock().await.get(device_id) }) else {
+            return false;
+        };
+        match output.lock().await.checked_seek(position_ms).await {
+            Ok(()) => true,
+            Err(e) => {
+                warn!(device_id, position_ms, error = %e, "sortie_qui_decode_depart_non_atteint");
+                false
+            }
+        }
     }
 
     /// Envoyer à la sortie le `Seek` qui manque après une recréation de flux
@@ -4450,7 +4516,37 @@ impl PlaybackOrchestrator {
                     _ => false,
                 };
 
-            if bibliotheque_sans_range_sur_reseau {
+            // #9175 — Sendspin et Devialet AIR décodent eux-mêmes le flux
+            // servi. Traité (égaliseur, correction de pièce, ReplayGain…), il
+            // arrive par un CANAL qui ne se relit pas : la sortie ne peut pas
+            // le rouvrir à la position (la seconde connexion n'en reçoit que
+            // la suite). Le flux est recréé À la position, comme pour #6017 ;
+            // la sortie apprend où il commence
+            // (`noter_le_depart_si_le_flux_y_commence`).
+            let canal_d_une_sortie_qui_decode =
+                sortie_qui_decode_file_path(zone_output_type.as_deref())
+                    && match state.now_playing.as_ref() {
+                        Some(np) if np.source != "radio" => match np.stream_id {
+                            Some(ref sid) => !self.streamer.is_seekable_session(sid).await,
+                            None => false,
+                        },
+                        _ => false,
+                    };
+
+            if canal_d_une_sortie_qui_decode {
+                info!(
+                    zone_id,
+                    position_ms, "seek_sortie_qui_decode_canal_recreation_du_flux"
+                );
+                if let Err(e) = self
+                    .replay_zone_at_position(zone_id, position_ms, "seek_canal_9175")
+                    .await
+                {
+                    warn!(zone_id, error = %e, "seek_sortie_qui_decode_canal_echouee");
+                    self.playback.seek(zone_id, original_position_ms).await;
+                    return Err(OutputCommandError::failed(OutputCommand::Seek, e));
+                }
+            } else if bibliotheque_sans_range_sur_reseau {
                 info!(
                     zone_id,
                     position_ms, "seek_bibliotheque_sans_range_recreation_du_flux"
@@ -4669,7 +4765,7 @@ pub(super) fn sortie_qui_decode_file_path(output_type: Option<&str>) -> bool {
 /// #9175 — `servi` (le fichier de la session) est-il `origine` (le chemin de la
 /// bibliothèque) ? La session sert le chemin RÉSOLU (repli NFC/NFD,
 /// `resolve_existing_local_path`), qui peut différer de la graphie en base.
-fn meme_fichier(servi: &str, origine: &str) -> bool {
+pub(super) fn meme_fichier(servi: &str, origine: &str) -> bool {
     if servi == origine {
         return true;
     }

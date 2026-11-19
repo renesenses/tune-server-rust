@@ -29,10 +29,14 @@ const FLAC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.fla
 /// Ce que la sortie a reçu : `(url, file_path)`.
 type Recu = Arc<std::sync::Mutex<Vec<(String, Option<String>)>>>;
 
+/// Les `seek` reçus par la sortie.
+type Sauts = Arc<std::sync::Mutex<Vec<u64>>>;
+
 struct SortieQuiDecode {
     type_de_sortie: &'static str,
     appareil: String,
     recu: Recu,
+    sauts: Sauts,
 }
 
 #[async_trait::async_trait]
@@ -65,7 +69,8 @@ impl OutputTarget for SortieQuiDecode {
     async fn stop(&self) -> Result<(), String> {
         Ok(())
     }
-    async fn seek(&self, _: u64) -> Result<(), String> {
+    async fn seek(&self, position_ms: u64) -> Result<(), String> {
+        self.sauts.lock().unwrap().push(position_ms);
         Ok(())
     }
     async fn set_volume(&self, _: f64) -> Result<(), String> {
@@ -88,6 +93,7 @@ struct Banc {
     track_id: i64,
     appareil: String,
     recu: Recu,
+    sauts: Sauts,
 }
 
 async fn banc(type_de_sortie: &'static str) -> Banc {
@@ -114,6 +120,7 @@ async fn banc(type_de_sortie: &'static str) -> Banc {
         .create("Zone du banc 9175", Some(type_de_sortie), Some(&appareil))
         .unwrap();
     let recu: Recu = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sauts: Sauts = Arc::new(std::sync::Mutex::new(Vec::new()));
     orch.outputs
         .lock()
         .await
@@ -121,6 +128,7 @@ async fn banc(type_de_sortie: &'static str) -> Banc {
             type_de_sortie,
             appareil: appareil.clone(),
             recu: recu.clone(),
+            sauts: sauts.clone(),
         }));
     let mut t = Track::new("Piste du banc 9175".into());
     t.duration_ms = 1_000;
@@ -138,6 +146,7 @@ async fn banc(type_de_sortie: &'static str) -> Banc {
         track_id,
         appareil,
         recu,
+        sauts,
     }
 }
 
@@ -274,4 +283,140 @@ fn seules_sendspin_et_devialet_air_voient_leur_fichier_filtre_9175() {
         assert!(!filtre(Some(autre)), "{autre}");
     }
     assert!(!filtre(None));
+}
+
+impl Banc {
+    fn armer_l_egaliseur(&self) {
+        let s = SettingsRepo::with_backend(self.orch.db.clone());
+        s.set("plugin_equalizer_installed", "true").unwrap();
+        let profil = crate::audio::eq::EqProfile {
+            enabled: true,
+            bands: vec![crate::audio::eq::EqBandSpec {
+                freq: 1000.0,
+                gain: 12.0,
+                q: 1.0,
+                band_type: "peak".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        s.set(
+            &format!("zone_{}_eq_profile", self.zone_id),
+            &serde_json::to_string(&profil).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            self.orch.zone_has_active_eq(self.zone_id),
+            "prémisse : l'égaliseur est actif sur la zone"
+        );
+    }
+
+    async fn session_cherchable(&self) -> bool {
+        let sid = self
+            .orch
+            .playback
+            .get_state(self.zone_id)
+            .await
+            .now_playing
+            .and_then(|np| np.stream_id)
+            .expect("session installée");
+        self.orch.streamer.is_seekable_session(&sid).await
+    }
+}
+
+/// L'égaliseur (+12 dB) force le flux traité, comme la correction de pièce.
+#[tokio::test]
+async fn egaliseur_actif_la_sortie_lit_le_flux_traite_9175() {
+    for type_de_sortie in [
+        crate::outputs::sendspin::TYPE_DE_SORTIE,
+        crate::outputs::devialet_air::TYPE_DE_SORTIE,
+    ] {
+        let b = banc(type_de_sortie).await;
+        b.armer_l_egaliseur();
+        let (url, file_path) = b.jouer().await;
+        assert_eq!(
+            file_path, None,
+            "#9175 ({type_de_sortie}) : égaliseur actif, la sortie doit lire le flux \
+             traité ({url})"
+        );
+    }
+}
+
+/// Un saut sur un flux TRAITÉ servi par un canal : la sortie ne peut pas le
+/// rouvrir (la seconde connexion n'en reçoit que la suite). La zone recrée le
+/// flux à la position (une seconde lecture), sans `seek` à la sortie.
+#[tokio::test]
+async fn saut_sur_un_flux_traite_recree_le_flux_a_la_position_9175() {
+    for type_de_sortie in [
+        crate::outputs::sendspin::TYPE_DE_SORTIE,
+        crate::outputs::devialet_air::TYPE_DE_SORTIE,
+    ] {
+        let b = banc(type_de_sortie).await;
+        b.armer_l_egaliseur();
+        b.jouer().await;
+        assert!(
+            !b.session_cherchable().await,
+            "prémisse ({type_de_sortie}) : le flux traité est un canal"
+        );
+
+        let r = b.orch.seek(b.zone_id, 500, Some(&b.appareil)).await;
+
+        assert!(r.is_ok(), "{type_de_sortie} : {r:?}");
+        assert_eq!(
+            b.recu.lock().unwrap().len(),
+            2,
+            "#9175 ({type_de_sortie}) : le saut sur un canal doit recréer le flux à la \
+             position (une seconde lecture)"
+        );
+        assert!(
+            b.sauts.lock().unwrap().is_empty(),
+            "#9175 ({type_de_sortie}) : aucun `seek` à la sortie, qui rouvrirait le \
+             canal : {:?}",
+            b.sauts.lock().unwrap()
+        );
+        assert_eq!(b.recu.lock().unwrap()[1].1, None, "toujours le flux traité");
+    }
+}
+
+/// Contre-épreuve : sans traitement, la sortie lit le fichier d'origine et
+/// s'y déplace elle-même, sans recréer de flux.
+#[tokio::test]
+async fn saut_sans_traitement_la_sortie_se_deplace_dans_le_fichier_9175() {
+    for type_de_sortie in [
+        crate::outputs::sendspin::TYPE_DE_SORTIE,
+        crate::outputs::devialet_air::TYPE_DE_SORTIE,
+    ] {
+        let b = banc(type_de_sortie).await;
+        b.jouer().await;
+        assert!(b.session_cherchable().await, "prémisse : passthrough");
+
+        let r = b.orch.seek(b.zone_id, 500, Some(&b.appareil)).await;
+
+        assert!(r.is_ok(), "{type_de_sortie} : {r:?}");
+        assert_eq!(b.recu.lock().unwrap().len(), 1, "aucun flux recréé");
+        assert_eq!(*b.sauts.lock().unwrap(), vec![500]);
+    }
+}
+
+/// La session sert le chemin RÉSOLU (repli NFC/NFD) ; la bibliothèque peut
+/// garder l'autre graphie. C'est le même fichier.
+#[test]
+fn meme_fichier_sous_deux_graphies_unicode_9175() {
+    let dossier = crate::test_scratch::scratch_dir("meme-fichier-9175");
+    // « é » composé (NFC) sur le disque, décomposé (NFD) en base.
+    let nfc = dossier.path().join("Caf\u{e9}.flac");
+    std::fs::write(&nfc, b"x").unwrap();
+    let nfd = dossier.path().join("Cafe\u{301}.flac");
+    let (nfc, nfd) = (
+        nfc.to_string_lossy().into_owned(),
+        nfd.to_string_lossy().into_owned(),
+    );
+    assert!(super::transport::meme_fichier(&nfc, &nfd), "{nfc} / {nfd}");
+    assert!(super::transport::meme_fichier(&nfc, &nfc));
+    let autre = dossier.path().join("Autre.flac");
+    std::fs::write(&autre, b"y").unwrap();
+    assert!(!super::transport::meme_fichier(
+        &nfc,
+        &autre.to_string_lossy()
+    ));
 }
