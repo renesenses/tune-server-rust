@@ -113,9 +113,75 @@ pub fn a_resonder(device_name: &str) -> bool {
 
 /// #9170 — [`a_resonder`] pour l'ouverture d'un flux : une capacité
 /// provisoire n'est re-sondée qu'après [`DELAI_AVANT_RESONDAGE`].
+///
+/// **Coût.** Un sondage énumère les périphériques ALSA (cpal) puis ouvre le
+/// PCM en non bloquant : de quelques dizaines à quelques centaines de ms, sur
+/// un fil bloquant, avant l'ouverture du flux. Une sortie dont le verdict
+/// reste INCONNU (DAC introuvable, repli sur le défaut, PCM occupé : rien
+/// n'est retenu) serait donc re-sondée à chaque piste ; un sondage sans
+/// réponse ([`noter_sondage_sans_reponse`]) espace lui aussi le suivant de
+/// [`DELAI_AVANT_RESONDAGE`]. La résolution d'une piste DSD « Natif »
+/// ([`a_resonder`]) n'attend pas ce délai : elle ne concerne que le DSD.
 #[must_use]
 pub fn a_resonder_a_l_ouverture(device_name: &str) -> bool {
-    a_resonder_apres(device_name, DELAI_AVANT_RESONDAGE, Instant::now())
+    let maintenant = Instant::now();
+    let espace = sans_reponse()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(device_name)
+        .is_none_or(|t| maintenant.saturating_duration_since(*t) >= DELAI_AVANT_RESONDAGE);
+    espace && a_resonder_apres(device_name, DELAI_AVANT_RESONDAGE, maintenant)
+}
+
+fn sans_reponse() -> &'static Mutex<HashMap<String, Instant>> {
+    static TABLE: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// #9170 — un sondage de `device_name` n'a rien appris (introuvable, repli,
+/// occupé) : rien n'est retenu, mais l'ouverture suivante ne re-sonde
+/// qu'après [`DELAI_AVANT_RESONDAGE`] (voir le coût ci-dessus).
+pub fn noter_sondage_sans_reponse(device_name: &str) {
+    sans_reponse()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(device_name.to_string(), Instant::now());
+}
+
+/// #9170 — le nom ne mène plus au `hw:` qui a prouvé sa capacité (DAC
+/// débranché, remplacé, nom qui résout désormais vers un PCM logiciel) : la
+/// capacité reste publiée mais redevient provisoire, donc re-sondée à la
+/// piste DSD suivante au lieu de faire échouer chaque piste native jusqu'au
+/// redémarrage.
+pub fn retrograder_en_provisoire(device_name: &str) {
+    if let Some(e) = table()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .get_mut(device_name)
+    {
+        e.provisoire_depuis.get_or_insert_with(Instant::now);
+    }
+}
+
+/// #9170 — le pilote a RÉPONDU à l'ouverture native (re-sondage du `hw:`)
+/// sans offrir la cadence du fichier : sa réponse entière remplace la
+/// capacité retenue — un autre DAC branché sous le même nom ne garde pas les
+/// cadences de l'ancien, et la piste suivante part en DoP dès le premier
+/// échec. `voies_sondees` : le sondage portait sur les voies de la table
+/// ([`crate::outputs::local::VOIES_SONDEES_DSD_ALSA`]) ; sinon la réponse ne
+/// vaut que pour ces voies-là, et seule la cadence est oubliée.
+pub fn retenir_reponse_du_pilote(
+    device_name: &str,
+    voies_sondees: bool,
+    cadence: u32,
+    mut cadences: Vec<u32>,
+) {
+    if voies_sondees {
+        cadences.retain(|c| *c != cadence);
+        retenir(device_name, CapaciteConnue::AlsaDsdU32 { cadences });
+    } else {
+        oublier_cadence(device_name, cadence);
+    }
 }
 
 fn a_resonder_apres(device_name: &str, delai: Duration, maintenant: Instant) -> bool {
@@ -186,8 +252,16 @@ pub enum TransportReelDsd {
     Pcm,
 }
 
-fn transports_reels() -> &'static Mutex<HashMap<i64, (String, TransportReelDsd)>> {
-    static TABLE: OnceLock<Mutex<HashMap<i64, (String, TransportReelDsd)>>> = OnceLock::new();
+/// Ce qui est retenu par zone : la sortie, et le transport — un natif
+/// décidé n'est RÉEL qu'une fois le flux démarré par le bras.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EtatTransport {
+    NatifEnAttente,
+    Reel(TransportReelDsd),
+}
+
+fn transports_reels() -> &'static Mutex<HashMap<i64, (String, EtatTransport)>> {
+    static TABLE: OnceLock<Mutex<HashMap<i64, (String, EtatTransport)>>> = OnceLock::new();
     TABLE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -197,20 +271,74 @@ pub fn noter_transport_reel(zone_id: i64, output_device_id: &str, transport: Tra
     transports_reels()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .insert(zone_id, (output_device_id.to_string(), transport));
+        .insert(
+            zone_id,
+            (output_device_id.to_string(), EtatTransport::Reel(transport)),
+        );
+}
+
+/// #9170 — l'orchestrateur a DÉCIDÉ le natif pour `zone_id` : rien n'est
+/// affiché tant que le bras n'a pas démarré le flux
+/// ([`confirmer_transport_natif`]) ; un échec l'efface
+/// ([`abandonner_transport_natif`]).
+pub fn noter_natif_en_attente(zone_id: i64, output_device_id: &str) {
+    transports_reels()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(
+            zone_id,
+            (output_device_id.to_string(), EtatTransport::NatifEnAttente),
+        );
+}
+
+/// #9170 — le flux DSD natif a démarré sur `output_device_id` : les zones qui
+/// l'attendaient sur cette sortie sont réellement en natif.
+pub fn confirmer_transport_natif(output_device_id: &str) {
+    for (sortie, etat) in transports_reels()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .values_mut()
+    {
+        if sortie == output_device_id && *etat == EtatTransport::NatifEnAttente {
+            *etat = EtatTransport::Reel(TransportReelDsd::Natif);
+        }
+    }
+}
+
+/// #9170 — le bras natif a échoué sur `output_device_id` : rien n'est parti,
+/// le natif attendu ne s'affiche pas.
+pub fn abandonner_transport_natif(output_device_id: &str) {
+    transports_reels()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retain(|_, (sortie, etat)| {
+            !(sortie == output_device_id && *etat == EtatTransport::NatifEnAttente)
+        });
+}
+
+/// #9170 — la piste DSD de `zone_id` a été refusée (strict) : rien n'est
+/// parti, l'ancien transport ne doit pas survivre.
+pub fn effacer_transport_reel(zone_id: i64) {
+    transports_reels()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&zone_id);
 }
 
 /// #9170 — le transport réel de la dernière piste DSD de `zone_id`, s'il a
 /// été relevé sur la sortie `output_device_id` (une autre sortie ne compte
-/// pas : la zone a changé de sortie depuis).
+/// pas : la zone a changé de sortie depuis). Un natif seulement décidé n'est
+/// pas un transport réel.
 #[must_use]
 pub fn transport_reel(zone_id: i64, output_device_id: &str) -> Option<TransportReelDsd> {
-    transports_reels()
+    match transports_reels()
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .get(&zone_id)
-        .filter(|(sortie, _)| sortie == output_device_id)
-        .map(|(_, t)| *t)
+    {
+        Some((sortie, EtatTransport::Reel(t))) if sortie == output_device_id => Some(*t),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -274,5 +402,79 @@ mod tests_9170 {
             Some(TransportReelDsd::Pcm)
         );
         assert_eq!(transport_reel(-9170, "local:B"), None);
+    }
+
+    /// Relecture #9172 : un natif décidé puis un bras en échec n'est jamais
+    /// affiché « natif » ; démarré, il l'est.
+    #[test]
+    fn natif_decide_puis_bras_en_echec_n_est_pas_affiche_natif() {
+        noter_transport_reel(-91_721, "local:Z8", TransportReelDsd::Pcm);
+        noter_natif_en_attente(-91_721, "local:Z8");
+        assert_eq!(transport_reel(-91_721, "local:Z8"), None);
+        abandonner_transport_natif("local:Z8");
+        assert_eq!(transport_reel(-91_721, "local:Z8"), None);
+
+        noter_natif_en_attente(-91_722, "local:Z8b");
+        confirmer_transport_natif("local:Z8b");
+        assert_eq!(
+            transport_reel(-91_722, "local:Z8b"),
+            Some(TransportReelDsd::Natif)
+        );
+        effacer_transport_reel(-91_722);
+        assert_eq!(transport_reel(-91_722, "local:Z8b"), None);
+    }
+
+    /// Relecture #9172 : autre DAC sous le même nom — la réponse du pilote à
+    /// l'ouverture remplace la capacité prouvée dès le premier échec.
+    #[test]
+    fn la_reponse_du_pilote_a_l_ouverture_remplace_la_capacite() {
+        let nom = "9170-autre-dac";
+        retenir(
+            nom,
+            CapaciteConnue::AlsaDsdU32 {
+                cadences: vec![2_822_400, 22_579_200],
+            },
+        );
+        retenir_reponse_du_pilote(nom, true, 22_579_200, vec![2_822_400]);
+        assert_eq!(
+            connue(nom),
+            Some(CapaciteConnue::AlsaDsdU32 {
+                cadences: vec![2_822_400]
+            })
+        );
+        retenir_reponse_du_pilote(nom, true, 2_822_400, vec![]);
+        assert_eq!(
+            connue(nom),
+            Some(CapaciteConnue::AlsaDsdU32 { cadences: vec![] })
+        );
+        assert!(!natif_annonce(Some(&format!("local:{nom}"))));
+    }
+
+    /// Relecture #9172 : un nom qui ne mène plus au `hw:` prouvé rend la
+    /// capacité provisoire (re-sondée), sans l'effacer de l'écran.
+    #[test]
+    fn un_hw_perdu_retrograde_la_capacite_en_provisoire() {
+        let nom = "9170-hw-perdu";
+        retenir(
+            nom,
+            CapaciteConnue::AlsaDsdU32 {
+                cadences: vec![22_579_200],
+            },
+        );
+        assert!(!a_resonder(nom));
+        retrograder_en_provisoire(nom);
+        assert!(a_resonder(nom));
+        retenir_provisoire(nom, CapaciteConnue::SortieNonAsio);
+        assert_eq!(connue(nom), Some(CapaciteConnue::SortieNonAsio));
+    }
+
+    /// Un sondage sans réponse espace le suivant à l'ouverture.
+    #[test]
+    fn un_sondage_sans_reponse_espace_le_suivant_a_l_ouverture() {
+        let nom = "9170-sans-reponse";
+        assert!(a_resonder_a_l_ouverture(nom));
+        noter_sondage_sans_reponse(nom);
+        assert!(!a_resonder_a_l_ouverture(nom));
+        assert!(a_resonder(nom), "la résolution DSD n'attend pas le délai");
     }
 }

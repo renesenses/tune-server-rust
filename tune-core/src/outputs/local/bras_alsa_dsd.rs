@@ -107,6 +107,25 @@ impl std::fmt::Display for SansPcmMateriel {
     }
 }
 
+/// #9170 (relecture #9172) — ce qu'une ouverture native sans `hw:` laisse
+/// dans `capacite_dsd_natif` : hôte non ALSA, définitivement « pas de
+/// natif » ; PCM logiciel, « pas de natif » provisoire ; introuvable, la
+/// capacité reste affichée mais devient provisoire. Dans les trois cas la
+/// piste DSD suivante ne retente pas aveuglément le natif.
+fn retenir_la_perte_du_hw(device_name: &str, raison: &SansPcmMateriel) {
+    use crate::outputs::capacite_dsd_natif::{self as capacite, CapaciteConnue};
+    match raison {
+        SansPcmMateriel::HoteNonAlsa(_) => {
+            capacite::retenir(device_name, CapaciteConnue::SortieNonAsio);
+        }
+        SansPcmMateriel::PcmLogiciel(_) => {
+            capacite::retrograder_en_provisoire(device_name);
+            capacite::retenir_provisoire(device_name, CapaciteConnue::SortieNonAsio);
+        }
+        SansPcmMateriel::Introuvable(_) => capacite::retrograder_en_provisoire(device_name),
+    }
+}
+
 /// Le PCM ALSA matériel (`hw:`) qu'ouvrirait la sortie, sans repli.
 /// `Err` dit pourquoi il n'y en a pas.
 fn pcm_materiel(
@@ -239,6 +258,10 @@ fn echouer(
     my_generation: u64,
 ) {
     warn!(device = %entrees_device, erreur = %message, "local_audio_alsa_dsd_natif_refuse");
+    // #9170 — rien n'est parti en natif : la zone ne l'affiche pas.
+    crate::outputs::capacite_dsd_natif::abandonner_transport_natif(&format!(
+        "local:{entrees_device}"
+    ));
     if play_generation.load(Ordering::SeqCst) == my_generation {
         if let Ok(mut slot) = open_failure.lock() {
             *slot = Some(format!("« {entrees_device} » : {message}"));
@@ -289,6 +312,10 @@ pub(super) fn jouer_dsd_natif_via_alsa(entrees: EntreesDsdNatifAlsa) {
     ) {
         Ok(v) => v,
         Err(raison) => {
+            // #9170 (relecture #9172) — le nom ne mène plus au `hw:` qui avait
+            // prouvé sa capacité : sans cela, chaque piste native échouerait
+            // ici jusqu'au redémarrage. La piste suivante re-sonde.
+            retenir_la_perte_du_hw(&device_name, &raison);
             echouer(
                 &device_name,
                 format!("flux DSD natif reçu, mais pas de PCM ALSA matériel ({raison})."),
@@ -305,8 +332,17 @@ pub(super) fn jouer_dsd_natif_via_alsa(entrees: EntreesDsdNatifAlsa) {
             (c.ordre, c.cadences)
         }
         autre => {
-            if !matches!(autre, SondeDuPcm::Occupe | SondeDuPcm::Erreur(_)) {
-                crate::outputs::capacite_dsd_natif::oublier_cadence(&device_name, entete.cadence);
+            // #9170 (relecture #9172) — le pilote a répondu : sa réponse
+            // entière remplace la capacité retenue (un autre DAC sous le même
+            // nom), pour que la piste suivante parte en DoP dès ce premier
+            // échec.
+            if let SondeDuPcm::Repond(reponse) = &autre {
+                crate::outputs::capacite_dsd_natif::retenir_reponse_du_pilote(
+                    &device_name,
+                    entete.canaux == crate::outputs::local::VOIES_SONDEES_DSD_ALSA,
+                    entete.cadence,
+                    reponse.as_ref().map(|c| c.cadences.clone()).unwrap_or_default(),
+                );
             }
             echouer(
                 &device_name,
@@ -364,7 +400,14 @@ pub(super) fn jouer_dsd_natif_via_alsa(entrees: EntreesDsdNatifAlsa) {
     ) {
         Ok(s) => s,
         Err(e) => {
-            crate::outputs::capacite_dsd_natif::oublier_cadence(&device_name, entete.cadence);
+            // Le pilote vient de répondre (re-sondage ci-dessus) puis a refusé
+            // d'ouvrir cette cadence : sa réponse, moins elle, fait foi.
+            crate::outputs::capacite_dsd_natif::retenir_reponse_du_pilote(
+                &device_name,
+                entete.canaux == crate::outputs::local::VOIES_SONDEES_DSD_ALSA,
+                entete.cadence,
+                cadences_sondees.clone(),
+            );
             echouer(
                 &device_name,
                 format!(
@@ -416,6 +459,8 @@ pub(super) fn jouer_dsd_natif_via_alsa(entrees: EntreesDsdNatifAlsa) {
     if entete.canaux == crate::outputs::local::VOIES_SONDEES_DSD_ALSA {
         crate::outputs::capacite_dsd_natif::confirmer_natif_alsa(&device_name, cadences_sondees);
     }
+    // Et la zone qui attendait ce natif l'affiche, maintenant qu'il est réel.
+    crate::outputs::capacite_dsd_natif::confirmer_transport_natif(&format!("local:{device_name}"));
 
     // ── Alimentation : DsdU8 → mots DSD_U32 → anneau. ──
     let mut mots: Vec<u8> = Vec::new();
@@ -514,4 +559,49 @@ pub(super) fn jouer_dsd_natif_via_alsa(entrees: EntreesDsdNatifAlsa) {
         repos = SILENCE_DSD_MSB_FIRST,
         "local_audio_alsa_dsd_natif_stopped"
     );
+}
+
+#[cfg(test)]
+mod perte_du_hw_9172 {
+    use super::{SansPcmMateriel, retenir_la_perte_du_hw};
+    use crate::outputs::capacite_dsd_natif::{CapaciteConnue, a_resonder, connue, retenir};
+
+    const DSD512: u32 = 22_579_200;
+
+    fn prouve(nom: &str) {
+        retenir(
+            nom,
+            CapaciteConnue::AlsaDsdU32 {
+                cadences: vec![DSD512],
+            },
+        );
+    }
+
+    /// Relecture #9172 : le nom d'un DAC prouvé natif résout maintenant vers
+    /// un PCM logiciel — « pas de natif » provisoire, la piste suivante part
+    /// en DoP et la suivante encore re-sonde.
+    #[test]
+    fn un_pcm_logiciel_a_l_ouverture_retire_le_natif_prouve() {
+        let nom = "9172 Z8 devenu plughw";
+        prouve(nom);
+        retenir_la_perte_du_hw(nom, &SansPcmMateriel::PcmLogiciel("plughw:CARD=Z8".into()));
+        assert_eq!(connue(nom), Some(CapaciteConnue::SortieNonAsio));
+        assert!(a_resonder(nom));
+    }
+
+    /// DAC introuvable à l'ouverture : capacité gardée mais re-sondée.
+    #[test]
+    fn un_dac_introuvable_a_l_ouverture_rend_la_capacite_provisoire() {
+        let nom = "9172 Z8 debranche";
+        prouve(nom);
+        assert!(!a_resonder(nom));
+        retenir_la_perte_du_hw(nom, &SansPcmMateriel::Introuvable("périphérique introuvable"));
+        assert!(a_resonder(nom), "la piste DSD suivante doit re-sonder");
+        assert_eq!(
+            connue(nom),
+            Some(CapaciteConnue::AlsaDsdU32 {
+                cadences: vec![DSD512]
+            })
+        );
+    }
 }

@@ -2655,7 +2655,7 @@ impl ResultatSondeDsdAlsa {
             Self::PcmLogiciel => {
                 capacite::retenir_provisoire(device_name, CapaciteConnue::SortieNonAsio);
             }
-            Self::Introuvable | Self::Occupe => {}
+            Self::Introuvable | Self::Occupe => capacite::noter_sondage_sans_reponse(device_name),
         }
     }
 }

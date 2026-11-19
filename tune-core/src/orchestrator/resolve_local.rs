@@ -1326,7 +1326,14 @@ impl PlaybackOrchestrator {
             ) {
                 Ok(()) => {
                     transport = TransportDsd::Natif;
-                    noter_transport_reel_dsd(req, TransportReelDsd::Natif);
+                    // #9170 — décidé, pas encore réel : le bras le confirme
+                    // quand le flux démarre, ou l'efface s'il échoue.
+                    if let Some(sortie) = req.output_device_id.as_deref() {
+                        crate::outputs::capacite_dsd_natif::noter_natif_en_attente(
+                            req.zone_id,
+                            sortie,
+                        );
+                    }
                     let (cadence, canaux) = entete.unwrap_or_default();
                     info!(
                         zone_id = req.zone_id,
@@ -1490,7 +1497,11 @@ impl PlaybackOrchestrator {
                     Ok(Some(_)) => noter_transport_reel_dsd(req, TransportReelDsd::Dop),
                     // DoP hors plafond : le chemin ordinaire convertit en PCM.
                     Ok(None) => noter_transport_reel_dsd(req, TransportReelDsd::Pcm),
-                    Err(_) => {}
+                    // Refus (bit-perfect strict) : rien n'est parti, l'ancien
+                    // transport ne doit pas rester affiché.
+                    Err(_) => {
+                        crate::outputs::capacite_dsd_natif::effacer_transport_reel(req.zone_id);
+                    }
                 }
             }
             return anticipe;
