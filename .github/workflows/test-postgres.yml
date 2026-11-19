@@ -220,9 +220,9 @@ jobs:
       # `cargo build --lib` ne convient PAS : sans les dev-dependencies, la
       # résolution des features change et tout tune-core est recompilé.
       - name: Précompiler les bibliothèques (mémoire, #9025)
-        run: cargo test --no-run -p tune-core -p tune-server --no-default-features --features postgres,oaat --test annee_repli_album
+        run: cargo test --no-run --no-fail-fast -p tune-core -p tune-server --no-default-features --features postgres,oaat --test annee_repli_album
       - name: Précompiler les libs de test une à une (mémoire, #9025)
-        run: cargo test --no-run -j1 -p tune-core -p tune-server --no-default-features --features postgres,oaat --lib --bins
+        run: cargo test --no-run --no-fail-fast -j1 -p tune-core -p tune-server --no-default-features --features postgres,oaat --lib --bins
       - name: Tests tune-core et tune-server avec PostgreSQL
         run: cargo test --no-fail-fast -p tune-core -p tune-server --no-default-features --features postgres,oaat
 
