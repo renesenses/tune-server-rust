@@ -570,7 +570,8 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
     //
     // #9116 — les cinq compteurs de la jauge parcourent la bibliothèque : ils
     // sont comptés ENSEMBLE hors de l'exécuteur, et figés pendant la pause de
-    // l'analyse acoustique (`avancement_suspendu_9116`).
+    // l'analyse acoustique tant que la bibliothèque garde la même révision
+    // (`avancement_suspendu_9116`).
     #[cfg(feature = "audio-embedding")]
     let [analysed, eligible, processed, deferred, apres_echecs] = {
         let b = state.backend.clone();
@@ -583,7 +584,7 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
                 tune_core::taches_de_fond::est_en_pause(
                     tune_core::taches_de_fond::Tache::Acoustique,
                 ),
-                None,
+                crate::routes::system::avancement_suspendu_9116::revision_de(&state.backend),
                 move || {
                     use tune_core::audio::embedding_store as es;
                     let now = std::time::SystemTime::now()

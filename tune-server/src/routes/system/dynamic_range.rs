@@ -77,7 +77,7 @@ fn releve_json(r: &Releve) -> Value {
 pub(crate) async fn dynamic_range_progress(State(state): State<AppState>) -> Json<Value> {
     let releve = state.passe_dr.releve();
     // #9116 — compté hors de l'exécuteur, et figé pendant la pause de la
-    // plage dynamique : rien ne peut plus faire bouger ce chiffre.
+    // plage dynamique tant que la bibliothèque garde la même révision.
     let candidates = if releve.actif {
         None
     } else {
@@ -91,7 +91,7 @@ pub(crate) async fn dynamic_range_progress(State(state): State<AppState>) -> Jso
                 tune_core::taches_de_fond::est_en_pause(
                     tune_core::taches_de_fond::Tache::PlageDynamique,
                 ),
-                None,
+                crate::routes::system::avancement_suspendu_9116::revision_de(&state.backend),
                 move || tune_core::audio::replaygain::compter_les_candidats_dr(&b),
             )
             .await

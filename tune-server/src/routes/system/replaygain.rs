@@ -54,9 +54,11 @@ pub(crate) async fn replaygain_progress(State(state): State<AppState>) -> Json<V
     // fonction est simplement éteinte serait une charge permanente pour un
     // chiffre que personne n'attend.
     //
-    // #9116 — et jamais deux fois pendant une pause : la passe suspendue ne
-    // peut plus faire bouger ces chiffres, le dernier relevé est resservi
-    // (`avancement_suspendu_9116`). Compté hors de l'exécuteur.
+    // #9116 — et pas deux fois pendant une pause : tant que la passe est
+    // suspendue et que la bibliothèque garde la même révision, le dernier
+    // relevé est resservi (`avancement_suspendu_9116`). Compté hors de
+    // l'exécuteur.
+    use crate::routes::system::avancement_suspendu_9116::revision_de;
     let releves = &state.comptages.releves;
     let suspendu =
         tune_core::taches_de_fond::est_en_pause(tune_core::taches_de_fond::Tache::ReplayGain);
@@ -68,9 +70,12 @@ pub(crate) async fn replaygain_progress(State(state): State<AppState>) -> Json<V
             0,
             releves
                 .rg_candidats
-                .lire("replaygain_progress", suspendu, None, move || {
-                    tune_core::audio::replaygain::compter_les_candidats_replaygain(&b)
-                })
+                .lire(
+                    "replaygain_progress",
+                    suspendu,
+                    revision_de(&state.backend),
+                    move || tune_core::audio::replaygain::compter_les_candidats_replaygain(&b),
+                )
                 .await
                 .unwrap_or(0),
         )
@@ -87,9 +92,12 @@ pub(crate) async fn replaygain_progress(State(state): State<AppState>) -> Json<V
         let b = state.backend.clone();
         releves
             .rg_reportees
-            .lire("replaygain_progress", suspendu, None, move || {
-                tune_core::audio::replaygain::compter_les_reportees_par_chemin(&b)
-            })
+            .lire(
+                "replaygain_progress",
+                suspendu,
+                revision_de(&state.backend),
+                move || tune_core::audio::replaygain::compter_les_reportees_par_chemin(&b),
+            )
             .await
             .unwrap_or(0)
     } else {
@@ -105,9 +113,12 @@ pub(crate) async fn replaygain_progress(State(state): State<AppState>) -> Json<V
         let cache = state.bibliotheque_rg.clone();
         releves
             .rg_bibliotheque
-            .lire("replaygain_progress", suspendu, None, move || {
-                cache.lire(&b)
-            })
+            .lire(
+                "replaygain_progress",
+                suspendu,
+                revision_de(&state.backend),
+                move || cache.lire(&b),
+            )
             .await
             .flatten()
     } else {

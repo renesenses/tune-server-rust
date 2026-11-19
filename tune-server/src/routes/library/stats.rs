@@ -129,12 +129,14 @@ pub(super) async fn library_stats(State(state): State<AppState>) -> Result<Json<
     // comme les routes de #5438. Sous un disque saturé, chacune tenait un fil
     // `tokio-rt-worker` aussi longtemps qu'elle lisait.
     //
-    // #9116 — et resservi une minute quand tout est suspendu (scan compris) :
-    // l'écran État du serveur la sonde toutes les 5 s.
+    // #9116 — et resservi quand tout est suspendu (scan compris), sous la
+    // même révision de bibliothèque, une minute au plus : l'écran État du
+    // serveur la sonde toutes les 5 s.
     let s = state.clone();
     crate::routes::system::avancement_suspendu_9116::corps_general(
         &state.comptages.releves.stats_bibliotheque,
         "library_stats",
+        &state.backend,
         move || lire_library_stats(&s),
     )
     .await
@@ -232,11 +234,13 @@ pub(super) async fn completeness_stats(
     // #9116 — une vingtaine de comptages sur toute la bibliothèque, dont des
     // `NOT EXISTS` sur `track_metadata`, que l'écran État du serveur relançait
     // toutes les 5 s DANS l'exécuteur. Hors de l'exécuteur désormais, et
-    // resservi une minute quand tout est suspendu (scan compris).
+    // resservi quand tout est suspendu (scan compris), sous la même révision
+    // de bibliothèque, une minute au plus.
     let s = state.clone();
     crate::routes::system::avancement_suspendu_9116::corps_general(
         &state.comptages.releves.completude,
         "completeness_stats",
+        &state.backend,
         move || lire_completude(&s),
     )
     .await
