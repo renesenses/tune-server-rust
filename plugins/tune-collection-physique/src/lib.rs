@@ -33,6 +33,8 @@
 //! | `GET /disques/{release}/albums[?q=]` | « Associer à un album » (#8672) : la recherche dans la bibliothèque (préremplie artiste + titre) et, pour « plusieurs correspondants », les candidats |
 //! | `PUT /disques/{release}/association` | `{album_id}` : associe le disque à cet album, à la main (#8672) |
 //! | `DELETE /disques/{release}/association` | « Dissocier » : le disque revient au rapprochement automatique (#8672) |
+//! | `PUT /disques/{release}/streaming` | `{service, id, titre, artiste}` : remplace la correspondance de ce service par un résultat choisi à la main (#9166) |
+//! | `DELETE /disques/{release}/streaming/{service}` | retire la correspondance de ce service ; le rapprochement automatique ne la recrée pas (#9166) |
 //! | `GET /cd?mb_release=&code_barre=` | un CD inséré est-il dans la collection, et copié ? |
 //! | `GET /pochettes/{release}[?taille=originale]` | la pochette, servie depuis le cache local (`ETag`, 304) |
 //! | `DELETE /cache[?quoi=pochettes]` | efface le cache : pochettes et mémoire, ou les pochettes seules |
@@ -53,6 +55,7 @@
 //! depuis le catalogue (Réglages › Extensions).
 
 pub mod associations;
+pub mod choix_streaming;
 pub mod correspondance;
 pub mod discogs;
 pub mod memoire;
@@ -285,13 +288,16 @@ enum Raison {
     /// Aucun service de streaming connecté : seule la bibliothèque a été
     /// regardée.
     ServiceNonInterroge,
+    /// La correspondance de service a été retirée à la main (#9166).
+    CorrespondanceRetiree,
 }
 
 impl Raison {
-    const TOUTES: [Raison; 3] = [
+    const TOUTES: [Raison; 4] = [
         Raison::AucunCandidat,
         Raison::PlusieursCandidats,
         Raison::ServiceNonInterroge,
+        Raison::CorrespondanceRetiree,
     ];
 
     fn code(self) -> &'static str {
@@ -299,6 +305,7 @@ impl Raison {
             Raison::AucunCandidat => "aucun_candidat",
             Raison::PlusieursCandidats => "plusieurs_candidats",
             Raison::ServiceNonInterroge => "service_non_interroge",
+            Raison::CorrespondanceRetiree => "correspondance_retiree",
         }
     }
 }
@@ -327,6 +334,15 @@ fn associations_manuelles(etat: &Etat) -> HashMap<u64, i64> {
     })
 }
 
+/// Les correspondances de service choisies ou retirées à la main (#9166).
+/// Illisibles : aucune, et on le dit au journal.
+fn choix_manuels(etat: &Etat) -> choix_streaming::Choix {
+    choix_streaming::lire(&etat.backend).unwrap_or_else(|e| {
+        tracing::warn!(target: "plugin", erreur = %e, "collection_physique_choix_streaming_illisibles");
+        choix_streaming::Choix::new()
+    })
+}
+
 /// Un disque tel que l'écran le lit, et son état.
 fn vue(
     d: &Disque,
@@ -334,6 +350,7 @@ fn vue(
     index: &Index<'_>,
     services: &[String],
     manuelles: &HashMap<u64, i64>,
+    choix: &choix_streaming::Choix,
 ) -> (Value, EtatDisque) {
     let codes = m
         .fiches
@@ -349,18 +366,27 @@ fn vue(
         .map(|a| (a, Par::Manuel))
         .or_else(|| rapprochement.trouve());
     let streaming = m.streaming.get(&d.release_id);
-    let trouves = streaming.map(|s| s.trouves.clone()).unwrap_or_default();
+    // Les choix faits à la main (#9166) corrigent le rapprochement
+    // automatique : une correspondance retirée ne revient pas.
+    let (trouves, retires) = choix_streaming::appliquer(
+        streaming.map(|s| s.trouves.as_slice()).unwrap_or_default(),
+        choix.get(&d.release_id),
+    );
     let etat = if local.is_some() {
         EtatDisque::Bibliotheque
     } else if !trouves.is_empty() {
         EtatDisque::Streaming
-    } else if services.is_empty() || streaming.is_some_and(|s| s.services == services) {
+    } else if !retires.is_empty()
+        || services.is_empty()
+        || streaming.is_some_and(|s| s.services == services)
+    {
         EtatDisque::NullePart
     } else {
         EtatDisque::AVerifier
     };
     let raison = (etat == EtatDisque::NullePart).then_some(match rapprochement {
         Rapprochement::Plusieurs(_) => Raison::PlusieursCandidats,
+        _ if !retires.is_empty() => Raison::CorrespondanceRetiree,
         _ if services.is_empty() => Raison::ServiceNonInterroge,
         _ => Raison::AucunCandidat,
     });
@@ -386,6 +412,8 @@ fn vue(
         "pochette": d.pochette.is_some() || d.vignette.is_some(),
         "bibliotheque": bibliotheque,
         "streaming": trouves,
+        // #9166 : les services dont la correspondance a été retirée à la main.
+        "streaming_retires": retires,
         "etat": etat.code(),
         // « nulle part » seulement : pourquoi (#7981) ; `null` sinon.
         "raison": raison.map(Raison::code),
@@ -533,6 +561,7 @@ async fn collection(State(etat): State<Etat>, Query(f): Query<FiltresCollection>
     };
     let index = Index::new(&albums);
     let manuelles = associations_manuelles(&etat);
+    let choix = choix_manuels(&etat);
     let mut par_etat = serde_json::Map::new();
     let mut par_format = serde_json::Map::new();
     for e in EtatDisque::TOUS {
@@ -549,7 +578,7 @@ async fn collection(State(etat): State<Etat>, Query(f): Query<FiltresCollection>
     let navigation = compteurs_de_navigation(&m);
     let mut disques = Vec::new();
     for d in &m.disques {
-        let (v, e) = vue(d, &m, &index, &services, &manuelles);
+        let (v, e) = vue(d, &m, &index, &services, &manuelles, &choix);
         incrementer(&mut par_etat, e.code());
         incrementer(&mut par_format, d.famille.code());
         if let Some(r) = v["raison"].as_str() {
@@ -711,7 +740,14 @@ async fn disque_relu(etat: &Etat, release: u64) -> Response {
         Err(r) => return r.into_response(),
     };
     let index = Index::new(&albums);
-    let (v, _) = vue(&d, &m, &index, &services, &associations_manuelles(etat));
+    let (v, _) = vue(
+        &d,
+        &m,
+        &index,
+        &services,
+        &associations_manuelles(etat),
+        &choix_manuels(etat),
+    );
     Json(json!({"disque": v, "attribution": attribution()})).into_response()
 }
 
@@ -790,6 +826,68 @@ async fn dissocier(State(etat): State<Etat>, Path(release): Path<u64>) -> Respon
     disque_relu(&etat, release).await
 }
 
+#[derive(Deserialize)]
+struct CorpsChoixStreaming {
+    service: String,
+    id: String,
+    #[serde(default)]
+    titre: String,
+    #[serde(default)]
+    artiste: String,
+}
+
+/// `PUT /disques/{release}/streaming` (#9166) : `{service, id, titre,
+/// artiste}`, un résultat de « Chercher sur les services » qui REMPLACE la
+/// correspondance de ce service. Mêmes droits que l'association à un album
+/// (`PUT /disques/{release}/association`). 404 `disque_inconnu` hors de la
+/// collection, 422 `corps_invalide` pour un service ou un identifiant
+/// irrecevable. Rend le disque relu.
+async fn choisir_sur_un_service(
+    State(etat): State<Etat>,
+    Path(release): Path<u64>,
+    corps: axum::body::Bytes,
+) -> Response {
+    let Ok(c) = serde_json::from_slice::<CorpsChoixStreaming>(&corps) else {
+        return refus(StatusCode::UNPROCESSABLE_ENTITY, "corps_invalide");
+    };
+    let choisi = choix_streaming::Choisi {
+        id: c.id.trim().to_string(),
+        titre: c.titre.trim().to_string(),
+        artiste: c.artiste.trim().to_string(),
+    };
+    if !choix_streaming::service_valide(&c.service) || !choix_streaming::choisi_valide(&choisi) {
+        return refus(StatusCode::UNPROCESSABLE_ENTITY, "corps_invalide");
+    }
+    if disque_suivi(&etat, release).is_none() {
+        return refus(StatusCode::NOT_FOUND, "disque_inconnu");
+    }
+    if let Err(e) = choix_streaming::choisir(&etat.backend, release, &c.service, choisi) {
+        tracing::warn!(target: "plugin", erreur = %e, "collection_physique_choix_streaming_non_ecrit");
+        return refus(StatusCode::INTERNAL_SERVER_ERROR, code::ECRITURE);
+    }
+    disque_relu(&etat, release).await
+}
+
+/// `DELETE /disques/{release}/streaming/{service}` (#9166) : retire la
+/// correspondance de ce service. Le refus est rangé : le rapprochement
+/// automatique suivant ne la recrée pas. Rend le disque relu.
+async fn retirer_d_un_service(
+    State(etat): State<Etat>,
+    Path((release, service)): Path<(u64, String)>,
+) -> Response {
+    if !choix_streaming::service_valide(&service) {
+        return refus(StatusCode::UNPROCESSABLE_ENTITY, "corps_invalide");
+    }
+    if disque_suivi(&etat, release).is_none() {
+        return refus(StatusCode::NOT_FOUND, "disque_inconnu");
+    }
+    if let Err(e) = choix_streaming::retirer(&etat.backend, release, &service) {
+        tracing::warn!(target: "plugin", erreur = %e, "collection_physique_retrait_streaming_non_ecrit");
+        return refus(StatusCode::INTERNAL_SERVER_ERROR, code::ECRITURE);
+    }
+    disque_relu(&etat, release).await
+}
+
 fn incrementer(m: &mut serde_json::Map<String, Value>, cle: &str) {
     let n = m.get(cle).and_then(Value::as_u64).unwrap_or(0) + 1;
     m.insert(cle.to_string(), json!(n));
@@ -842,7 +940,14 @@ async fn cd(State(etat): State<Etat>, Query(q): Query<QuestionCd>) -> Response {
         Err(r) => return r.into_response(),
     };
     let index = Index::new(&albums);
-    let (v, _) = vue(d, &m, &index, &services, &associations_manuelles(&etat));
+    let (v, _) = vue(
+        d,
+        &m,
+        &index,
+        &services,
+        &associations_manuelles(&etat),
+        &choix_manuels(&etat),
+    );
     Json(json!({
         "dans_la_collection": true,
         "copie": v["copie"] == true,
@@ -994,6 +1099,11 @@ pub fn router(backend: Arc<dyn DbBackend>, moteur: Arc<Moteur>) -> Router<()> {
         .route(
             "/disques/{release}/association",
             put(associer).delete(dissocier),
+        )
+        .route("/disques/{release}/streaming", put(choisir_sur_un_service))
+        .route(
+            "/disques/{release}/streaming/{service}",
+            delete(retirer_d_un_service),
         )
         .route("/pochettes/{release}", get(pochette))
         .route("/cache", delete(effacer_cache))

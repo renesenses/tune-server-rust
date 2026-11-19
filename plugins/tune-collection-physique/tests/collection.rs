@@ -1843,7 +1843,8 @@ async fn un_disque_nulle_part_dit_pourquoi_7981() {
     assert_eq!(h["raison"], "aucun_candidat", "{h}");
     assert_eq!(
         c["compteurs"]["par_raison"],
-        json!({"aucun_candidat": 1, "plusieurs_candidats": 0, "service_non_interroge": 0}),
+        json!({"aucun_candidat": 1, "plusieurs_candidats": 0, "service_non_interroge": 0,
+               "correspondance_retiree": 0}),
         "{c}"
     );
     let gm = disque(&c, "Giving My Love / Brazil");
@@ -2219,4 +2220,143 @@ async fn un_disque_deja_associe_refuse_un_autre_album_8678() {
     .await;
     assert_eq!(code, StatusCode::OK, "{r}");
     assert_eq!(r["disque"]["bibliotheque"]["album_id"], 2, "{r}");
+}
+
+// ─── #9166 : changer ou retirer une correspondance de service ─────────────
+
+/// Un disque déjà rapproché d'un album de service se corrige à la main :
+/// « Remplacer » range un autre résultat pour CE service, « Retirer » range
+/// un refus. Les deux survivent à « Effacer le cache » et à une nouvelle
+/// synchronisation, qui retrouve pourtant l'ancienne correspondance : le
+/// rapprochement automatique ne recrée pas ce que l'utilisateur a retiré.
+#[tokio::test]
+async fn une_correspondance_de_service_se_remplace_et_se_retire_9166() {
+    let b = banc_avec(HoteEssai::new());
+    suivre(&b, "exemple").await;
+    synchro_complete(&b, "exemple").await;
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    let gm = disque(&c, "Giving My Love / Brazil");
+    assert_eq!(gm["streaming"][0]["id"], "T-42", "{gm}");
+    let release = gm["release_id"].as_u64().unwrap();
+
+    // Remplacer.
+    let (code, r) = appel(
+        &b.app,
+        "PUT",
+        &format!("/disques/{release}/streaming"),
+        Some(json!({"service": "tidal", "id": "T-99", "titre": "Le bon", "artiste": "Elle"})),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{r}");
+    assert_eq!(
+        r["disque"]["streaming"],
+        json!([{"service": "tidal", "id": "T-99", "titre": "Le bon",
+                "artiste": "Elle", "par": "manuel"}]),
+        "{r}"
+    );
+    assert_eq!(r["disque"]["etat"], "streaming");
+
+    // Retirer.
+    let (code, r) = appel(
+        &b.app,
+        "DELETE",
+        &format!("/disques/{release}/streaming/tidal"),
+        None,
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{r}");
+    assert_eq!(r["disque"]["streaming"], json!([]), "{r}");
+    assert_eq!(r["disque"]["streaming_retires"], json!(["tidal"]), "{r}");
+    assert_eq!(r["disque"]["etat"], "nulle_part", "{r}");
+    assert_eq!(r["disque"]["raison"], "correspondance_retiree", "{r}");
+
+    // Le cache effacé, une synchronisation complète REFAIT la recherche et
+    // retrouve T-42… que l'écran ne montre pas.
+    let avant = b.hote.appels("service ");
+    let (code, _) = appel(&b.app, "DELETE", "/cache", None).await;
+    assert_eq!(code, StatusCode::OK);
+    synchro_complete(&b, "exemple").await;
+    assert!(
+        b.hote.appels("service ") > avant,
+        "la recherche automatique est repassée"
+    );
+    assert!(
+        b.moteur.memoire().streaming[&release]
+            .trouves
+            .iter()
+            .any(|s| s.id == "T-42"),
+        "le rapprochement automatique a retrouvé l'ancienne correspondance"
+    );
+    let (_, c) = appel(&b.app, "GET", "/collection", None).await;
+    let gm = disque(&c, "Giving My Love / Brazil");
+    assert_eq!(
+        gm["streaming"],
+        json!([]),
+        "retirée, elle ne revient pas : {gm}"
+    );
+    assert_eq!(gm["etat"], "nulle_part", "{gm}");
+    assert_eq!(
+        c["compteurs"]["par_raison"]["correspondance_retiree"], 1,
+        "{c}"
+    );
+
+    // Choisir de nouveau après un retrait.
+    let (code, r) = appel(
+        &b.app,
+        "PUT",
+        &format!("/disques/{release}/streaming"),
+        Some(
+            json!({"service": "tidal", "id": "T-42", "titre": "Giving My Love / Brazil",
+                    "artiste": "Janice McClain"}),
+        ),
+    )
+    .await;
+    assert_eq!(code, StatusCode::OK, "{r}");
+    assert_eq!(r["disque"]["streaming"][0]["id"], "T-42", "{r}");
+    assert_eq!(r["disque"]["streaming_retires"], json!([]), "{r}");
+
+    // Les refus.
+    for (methode, chemin, corps) in [
+        (
+            "PUT",
+            format!("/disques/{release}/streaming"),
+            Some(json!({"service": "../x", "id": "1"})),
+        ),
+        (
+            "PUT",
+            format!("/disques/{release}/streaming"),
+            Some(json!({"service": "tidal", "id": " "})),
+        ),
+        (
+            "PUT",
+            format!("/disques/{release}/streaming"),
+            Some(json!({"id": "1"})),
+        ),
+        (
+            "DELETE",
+            format!("/disques/{release}/streaming/TIDAL"),
+            None,
+        ),
+    ] {
+        let (code, r) = appel(&b.app, methode, &chemin, corps).await;
+        assert_eq!(
+            code,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "{methode} {chemin} : {r}"
+        );
+        assert_eq!(r["error"], "collection_physique.corps_invalide");
+    }
+    for (methode, corps) in [
+        ("PUT", Some(json!({"service": "tidal", "id": "1"}))),
+        ("DELETE", None),
+    ] {
+        let chemin = if methode == "PUT" {
+            "/disques/1/streaming"
+        } else {
+            "/disques/1/streaming/tidal"
+        };
+        let (code, r) = appel(&b.app, methode, chemin, corps).await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "{r}");
+        assert_eq!(r["error"], "collection_physique.disque_inconnu");
+    }
 }
