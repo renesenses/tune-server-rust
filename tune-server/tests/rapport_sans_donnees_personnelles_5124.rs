@@ -55,7 +55,7 @@ const FUITES: &[&str] = &[
     "3C:4D:5E",
     // #9140 — noms d'appareils et de zones.
     "Philibert5124",
-    "Rosalinde5124",
+    "Rosalindequinze",
 ];
 
 /// Ce qui DOIT rester : le diagnostic. Une sortie vide passerait sinon
@@ -80,7 +80,7 @@ const JOURNAL: &str = concat!(
     "2026-09-26T10:00:04.000Z  INFO tune_core::discovery: renderer mac=00:1A:2B:3C:4D:5E\n",
     // #9140 — un nom de zone retenu, et un appareil que la découverte n'a pas vu.
     "2026-09-26T10:00:05.000Z  INFO tune_core::outputs::dlna: zone Mansarde de Philibert5124 volume=0.5\n",
-    "2026-09-26T10:00:06.000Z  INFO tune_core::outputs::airplay: Rosalinde5124’s iPhone host=192.168.1.31\n",
+    "2026-09-26T10:00:06.000Z  INFO tune_core::outputs::airplay: Rosalindequinze’s iPhone host=192.168.1.31\n",
 );
 
 #[derive(Default)]
