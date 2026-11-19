@@ -356,12 +356,14 @@ async fn sans_place_libre_pas_encore_tout_de_suite() {
     let banc = Banc::new();
     banc.piste(31);
     let aucune = places(0);
-    let t = std::time::Instant::now();
-    let (statut, reessai, v) = banc.demander_texte(31, Some("1000".into()), &aucune).await;
-    assert!(
-        t.elapsed() < std::time::Duration::from_secs(2),
-        "aucune attente"
-    );
+    // Borné : une route qui attendrait une place pendrait sans fin ; le
+    // délai fait rougir le test au lieu de le figer.
+    let (statut, reessai, v) = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        banc.demander_texte(31, Some("1000".into()), &aucune),
+    )
+    .await
+    .expect("aucune attente");
     assert_eq!(statut, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(reessai.as_deref(), Some("3"));
     assert_eq!(v["pending"], true);
