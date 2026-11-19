@@ -386,6 +386,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8676 -- --nocapture --test-threads=1
 
+      # #9158 (Rob) — balises personnelles → tags Tune : pose sur la piste et
+      # l'album, idempotence, retrait des seules poses du scan, tag manuel
+      # intact, table `item_tags_scan` d'ENSURE_TABLES. Sans cette étape, le
+      # témoin prendrait son saut annoncé.
+      - name: Balises personnelles en tags Tune sur PostgreSQL (#9158)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_9158 -- --nocapture --test-threads=1
+
       # #9044 — oublier un appareil parti du réseau : zones d'un appareil et
       # motifs de masquage, garde-fous non oubliables, suppression définitive,
       # retour comme neuf, zone libérée (#8987) emportée avec sa clé, sur un

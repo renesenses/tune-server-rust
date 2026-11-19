@@ -64,6 +64,7 @@ mod replaygain;
 // expressément.
 /// Réglage « Balises du classique » (#8325, ESL63P).
 mod balises_classique;
+// #9158 (Rob) — balises personnelles des fichiers → tags Tune.
 /// « Ce qui tourne » : passes de fond, cession à la lecture, avancement,
 /// garde thermique (#4681).
 pub(crate) mod ce_qui_tourne;
@@ -73,6 +74,7 @@ pub(crate) mod suivi_de_mise_a_jour_7600;
 /// Pause et reprise des traitements de fond (#4574) — voir le module.
 pub(crate) mod taches_de_fond;
 mod tags;
+mod tags_perso;
 pub(crate) mod update;
 mod youtube;
 
@@ -134,6 +136,20 @@ pub fn router() -> Router<AppState> {
         .route(
             "/settings/classical-tags",
             get(balises_classique::get_classical_tags).put(balises_classique::set_classical_tags),
+        )
+        // #9158 (Rob) — les balises personnelles des fichiers deviennent des
+        // tags Tune : correspondances, aperçu des clés, passe « Appliquer ».
+        .route(
+            "/settings/personal-tags",
+            get(tags_perso::get_personal_tags).put(tags_perso::set_personal_tags),
+        )
+        .route(
+            "/settings/personal-tags/keys",
+            get(tags_perso::personal_tag_keys),
+        )
+        .route(
+            "/settings/personal-tags/apply",
+            get(tags_perso::get_apply_status).post(tags_perso::apply_personal_tags),
         )
         // #8213 — arrêt programmé de la lecture à heure fixe.
         .route(

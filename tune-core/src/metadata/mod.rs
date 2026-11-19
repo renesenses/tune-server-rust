@@ -17,6 +17,8 @@ pub mod choix_de_pressage;
 pub mod coffrets;
 pub mod completude;
 pub mod credits_balises;
+/// Réglage « Balises personnelles → tags Tune » (#9158, Rob).
+pub mod tags_perso;
 // « Joue avec » de la page artiste (#7768).
 #[cfg(test)]
 mod credits_balises_tests_7766;
@@ -4455,6 +4457,18 @@ pub fn read_extended_metadata_selon(
     path: &Path,
     classique: &balises_classique::BalisesClassique,
 ) -> HashMap<String, String> {
+    read_extended_metadata_avec(path, classique, &tags_perso::courante())
+}
+
+/// [`read_extended_metadata_selon`] avec, en plus, un réglage « Balises
+/// personnelles → tags Tune » explicite (#9158, Rob) : les témoins le passent
+/// sans toucher au miroir global. Réglage vide (défaut) : lecture identique à
+/// celle d'avant, aucune clé [`tags_perso::CLE_LUE`].
+pub fn read_extended_metadata_avec(
+    path: &Path,
+    classique: &balises_classique::BalisesClassique,
+    perso: &tags_perso::TagsPerso,
+) -> HashMap<String, String> {
     use balises_classique::{BalisesClassique, STANDARD_CHEF, STANDARD_MOUVEMENT, STANDARD_OEUVRE};
     use lofty::file::{AudioFile, TaggedFileExt};
     use lofty::tag::{Accessor, ItemKey};
@@ -4662,6 +4676,8 @@ pub fn read_extended_metadata_selon(
                         .cles_brutes()
                         .into_iter()
                         .chain(std::iter::once(credits_balises::CLE_BAND.to_string()))
+                        // #9158 — les clés des balises personnelles réglées.
+                        .chain(perso.cles())
                         .flat_map(|k| {
                             find_vorbis_comments(h, &k, usize::MAX)
                                 .into_iter()
@@ -4680,6 +4696,15 @@ pub fn read_extended_metadata_selon(
         }
         if let Some(v) = balises_brutes::version_parmi(&brutes) {
             meta.insert("version".into(), v);
+        }
+        // #9158 — les balises personnelles qui deviennent des tags Tune.
+        // Présente, même vide, dès qu'une correspondance existe : une liste
+        // vide RETIRE les tags que le scan avait posés.
+        if !perso.est_vide() {
+            meta.insert(
+                tags_perso::CLE_LUE.into(),
+                tags_perso::encoder(&perso.tags_des_paires(&brutes)),
+            );
         }
         // #7766 — ce que lofty ne range sous aucun `ItemKey` : l'ensemble ou
         // l'orchestre (ENSEMBLE, ORCHESTRA), la liste des musiciens ID3v2.4

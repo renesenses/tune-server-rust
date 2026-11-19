@@ -1006,6 +1006,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                                     &db,
                                     &meta_entries,
                                 );
+                                // #9158 — les balises personnelles réglées
+                                // deviennent des tags Tune (piste, album).
+                                tune_core::db::tags_perso_repo::ecrire_lot(&db, &meta_entries);
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "auto_scan_extended_metadata_insert_failed");
@@ -2573,7 +2576,10 @@ pub(crate) fn reimporter_fichier_surveillant(
                 tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(db.clone())
                     .set_batch(id, &ext)?;
                 // #7766 — les crédits des balises, comme les deux scans.
-                tune_core::metadata::credits_balises::ecrire_lot(db, &[(id, ext)]);
+                let lot = [(id, ext)];
+                tune_core::metadata::credits_balises::ecrire_lot(db, &lot);
+                // #9158 — les balises personnelles, comme les deux scans.
+                tune_core::db::tags_perso_repo::ecrire_lot(db, &lot);
                 Ok(())
             })();
             if let Err(e) = metadonnees {
