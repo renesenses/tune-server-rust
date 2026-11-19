@@ -836,12 +836,7 @@ fn disque_dsd(b: &Banc, titre: &str, artiste: i64, dossier: &str) -> i64 {
             .execute(
                 "INSERT INTO tracks (title, album_id, file_path, source, track_number, \
                  disc_number, format) VALUES (?1, ?2, ?3, 'local', ?4, 1, 'dsf')",
-                &[
-                    &format!("piste {n}") as &dyn ToSqlValue,
-                    &id,
-                    &chemin,
-                    &n,
-                ],
+                &[&format!("piste {n}") as &dyn ToSqlValue, &id, &chemin, &n],
             )
             .unwrap();
     }
@@ -896,7 +891,10 @@ async fn un_coffret_compose_n_est_replie_sous_aucune_autre_carte_8953() {
     );
     // Avant la réunion, aucun des deux disques n'est replié.
     let (replies, _) = membres(&b).await;
-    assert!(!replies.contains(&stereo) && !replies.contains(&multi), "{replies:?}");
+    assert!(
+        !replies.contains(&stereo) && !replies.contains(&multi),
+        "{replies:?}"
+    );
 
     let (statut, corps) = appeler(
         &b.state,
@@ -942,8 +940,14 @@ async fn un_coffret_compose_n_est_replie_sous_aucune_autre_carte_8953() {
             .iter()
             .filter_map(|a| a["id"].as_i64())
             .collect();
-        assert!(rendus.contains(&stereo), "{url} : coffret absent de {rendus:?}");
-        assert!(!rendus.contains(&multi), "{url} : disque absorbé encore rendu");
+        assert!(
+            rendus.contains(&stereo),
+            "{url} : coffret absent de {rendus:?}"
+        );
+        assert!(
+            !rendus.contains(&multi),
+            "{url} : disque absorbé encore rendu"
+        );
     }
 }
 
