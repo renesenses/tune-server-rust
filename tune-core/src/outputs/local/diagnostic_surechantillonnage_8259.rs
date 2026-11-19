@@ -60,19 +60,84 @@ impl Diagnostic {
     }
 }
 
-/// #9165 — le greffon porterait-il ce flux sur le chemin partagé ? Un choix
-/// armé (non écarté) qu'aucune garde d'ouverture n'écarte : le chemin natif
-/// S32 de Linux doit alors céder, comme pour un DSP actif.
+/// #9165 — ce que l'ouverture partagée ferait du greffon, jugé AVANT le
+/// chemin natif S32 de Linux, par les mêmes règles : les gardes de
+/// l'ouverture ([`refus_a_l_ouverture`]), puis la part de la négociation de
+/// cadence qui se juge sans périphérique (bit-perfect strict, cadences
+/// candidates, verdict de la machine, plafonds).
 #[cfg(any(target_os = "linux", test))]
-pub(super) fn surechantillonneur_voulu(
-    choix_present: bool,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GreffonAvantLeNatif {
+    /// Aucun choix armé pour la zone.
+    Absent,
+    /// Le chemin partagé porterait l'étage : le natif doit céder.
+    Voulu,
+    /// Armé, mais l'ouverture partagée l'écarterait : la raison, pour le
+    /// chemin du signal quand le natif est pris.
+    Ecarte(&'static str),
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn greffon_avant_le_natif(
+    choix: Option<&crate::audio::surechantillonnage::ChoixSurechantillonnage>,
     spec: AudioSpec,
     amorce: &[u8],
     pure: bool,
     dop: bool,
     sortie_double: bool,
-) -> bool {
-    choix_present && refus_a_l_ouverture(spec, amorce, pure, dop, sortie_double).is_none()
+    strict_bitperfect: bool,
+) -> GreffonAvantLeNatif {
+    let Some(choix) = choix else {
+        return GreffonAvantLeNatif::Absent;
+    };
+    if let Some(raison) = refus_a_l_ouverture(spec, amorce, pure, dop, sortie_double) {
+        return GreffonAvantLeNatif::Ecarte(raison);
+    }
+    match super::backend::surechantillonneur_possible_sans_peripherique(
+        choix,
+        strict_bitperfect,
+        spec.cadence(),
+    ) {
+        Ok(()) => GreffonAvantLeNatif::Voulu,
+        Err(refus) => GreffonAvantLeNatif::Ecarte(refus.code()),
+    }
+}
+
+/// Un choix que le test de la machine admet vers toutes les cadences de
+/// référence, filtre et plafonds par défaut.
+#[cfg(test)]
+pub(super) fn choix_admis_pour_test() -> crate::audio::surechantillonnage::ChoixSurechantillonnage {
+    use crate::audio::surechantillonnage::{
+        ChoixSurechantillonnage, MesureMachine, UpsamplerSettings, VerdictMachine,
+    };
+    let reglages = UpsamplerSettings {
+        enabled: true,
+        ..Default::default()
+    };
+    let results = [
+        (44_100, 352_800),
+        (44_100, 705_600),
+        (48_000, 384_000),
+        (48_000, 768_000),
+    ]
+    .into_iter()
+    .map(|(from_hz, to_hz)| MesureMachine {
+        filter: reglages.filter.clone(),
+        from_hz,
+        to_hz,
+        realtime_factor: 10.0,
+        admitted: true,
+    })
+    .collect();
+    ChoixSurechantillonnage {
+        reglages,
+        verdict: VerdictMachine {
+            simd_path: "scalaire".into(),
+            margin: 1.0,
+            results,
+            measured_at: 0,
+        },
+    }
 }
 
 /// Les gardes existantes de l'ouverture, avec leur raison au lieu d'un booléen.
@@ -204,31 +269,42 @@ mod tests {
     }
 
     #[test]
-    fn surechantillonneur_voulu_9165_suit_les_gardes_de_l_ouverture() {
-        let s32 = AudioSpec::depuis_entete(192_000, 32, 2).unwrap();
-        assert!(surechantillonneur_voulu(
-            true,
-            s32,
-            &[],
-            false,
-            false,
-            false
-        ));
-        assert!(!surechantillonneur_voulu(
-            false,
-            s32,
-            &[],
-            false,
-            false,
-            false
-        ));
-        for (pure, dop, double) in [
-            (true, false, false),
-            (false, true, false),
-            (false, false, true),
-        ] {
-            assert!(!surechantillonneur_voulu(true, s32, &[], pure, dop, double));
-        }
+    fn greffon_avant_le_natif_9165_suit_les_regles_de_l_ouverture() {
+        use GreffonAvantLeNatif::{Absent, Ecarte, Voulu};
+        let choix = choix_admis_pour_test();
+        let s32 = AudioSpec::depuis_entete(96_000, 32, 2).unwrap();
+        let juger = |spec, pure, dop, double, strict| {
+            greffon_avant_le_natif(Some(&choix), spec, &[], pure, dop, double, strict)
+        };
+        assert_eq!(
+            greffon_avant_le_natif(None, s32, &[], false, false, false, false),
+            Absent
+        );
+        assert_eq!(juger(s32, false, false, false, false), Voulu);
+        assert_eq!(juger(s32, true, false, false, false), Ecarte("pure"));
+        assert_eq!(juger(s32, false, true, false, false), Ecarte("dop"));
+        assert_eq!(
+            juger(s32, false, false, true, false),
+            Ecarte("multiple_outputs")
+        );
+        // Bit-perfect strict : l'ouverture partagée refuserait le greffon.
+        assert_eq!(
+            juger(s32, false, false, false, true),
+            Ecarte("strict_bitperfect")
+        );
+        // Source déjà au plus haut des cadences candidates.
+        let s768 = AudioSpec::depuis_entete(768_000, 32, 2).unwrap();
+        assert_eq!(
+            juger(s768, false, false, false, false),
+            Ecarte("no_candidate_rate_accepted_by_device")
+        );
+        // Machine qui n'admet rien.
+        let mut refuse = choix.clone();
+        refuse.verdict.results.clear();
+        assert_eq!(
+            greffon_avant_le_natif(Some(&refuse), s32, &[], false, false, false, false),
+            Ecarte("machine_test_rejects_accepted_rates")
+        );
     }
 
     #[test]
