@@ -1333,9 +1333,13 @@ impl PlaybackOrchestrator {
             } else {
                 true
             };
+            // #9142 — une tranche de feuille CUE n'a pas de `file_path` : ses
+            // bornes donnent le média et le début de la tranche.
+            let bornes_cue = track.as_ref().and_then(|t| t.bornes_cue());
             let a_mesurer = fichier_a_mesurer_apres_avance(
                 format.as_deref(),
                 track.and_then(|t| t.file_path),
+                bornes_cue,
                 la_sortie_mesure,
             );
             // Génération épinglée ici : l'avance vient d'avoir lieu, c'est
@@ -1356,8 +1360,19 @@ impl PlaybackOrchestrator {
                     (None, true) => "non_lance_sans_fichier",
                 },
             );
-            if let Some(path) = a_mesurer {
-                spawn_local_file_levels_decode(bus, self.playback.clone(), zone_id, play_seq, path);
+            if let Some((path, debut_fichier_ms)) = a_mesurer {
+                // Les fenêtres sont datées depuis 0, la position dans la
+                // PISTE ; le fichier, lui, se décode depuis le début de la
+                // tranche (0 pour une piste ordinaire).
+                spawn_local_file_levels_decode_depuis(
+                    bus,
+                    self.playback.clone(),
+                    zone_id,
+                    play_seq,
+                    path,
+                    debut_fichier_ms,
+                    0,
+                );
             }
         } else if let (Some(bus), Some(source_id)) =
             (self.event_bus.clone(), advance_source_id.clone())

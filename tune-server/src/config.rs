@@ -584,6 +584,26 @@ pub(crate) fn retenir_le_journal(chemin: PathBuf) {
     let _ = JOURNAL_RETENU.set(chemin);
 }
 
+/// #9118 — la raison pour laquelle AUCUN fichier de journal n'a pu être ouvert
+/// au démarrage (emplacement par défaut et replis tous refusés). Posée une
+/// fois par [`crate::bootstrap::installer_le_journal`] ; le journal ne va
+/// alors que sur la sortie standard (journald, `docker logs`).
+static JOURNAL_REFUSE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Retient que l'écrivain n'a pu ouvrir aucun fichier, et pourquoi.
+pub(crate) fn retenir_le_refus_du_journal(raison: String) {
+    let _ = JOURNAL_REFUSE.set(raison);
+}
+
+/// #9118 — `Some(raison)` quand l'écrivain n'a ouvert aucun fichier : le
+/// lecteur n'a plus à retenter, à chaque export, un chemin que le démarrage a
+/// déjà vu refuser (un `WARN … Permission denied` par rapport, qui a fait
+/// croire à un `~` non développé alors que le `~` n'est que l'anonymisation
+/// du rapport).
+pub(crate) fn refus_du_journal_au_demarrage() -> Option<String> {
+    JOURNAL_REFUSE.get().cloned()
+}
+
 /// #8946 — où écrire le journal quand l'emplacement par défaut est refusé.
 ///
 /// Tune OS (fil 2882, rc12) : `tune.service` tourne avec `ProtectHome=yes`, et

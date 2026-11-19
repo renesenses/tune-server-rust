@@ -157,6 +157,10 @@ const MIGRATION_TABLES: &[&str] = &[
     "radio_favorites",
     "tags",
     "item_tags",
+    // Marques d'origine « scan » des tags (#9158). Sans cette ligne, toutes
+    // les poses du scan deviendraient MANUELLES à la bascule : le scan ne
+    // pourrait plus retirer un tag dont la balise a quitté le fichier.
+    "item_tags_scan",
     // Etiquettes posees sur un album de streaming (#3699). Sans cette ligne,
     // tout l'etiquetage du catalogue Qobuz/Tidal/Bandcamp serait perdu a la
     // bascule SQLite -> PostgreSQL — et c'est justement sur le streaming que
@@ -226,6 +230,9 @@ const MIGRATION_TABLES: &[&str] = &[
     // Alertes de « Albums douteux » marquées normales (#8958) : sans cette
     // ligne, toutes reviendraient à la bascule SQLite → PostgreSQL.
     "alertes_douteuses_ignorees",
+    // Titres diffusés par les radios (#8487) : sans cette ligne, ils
+    // disparaîtraient de l'historique à la bascule, sous leurs stations.
+    "radio_titres_diffuses",
 ];
 
 /// Tables copiees APRES `run_pg_migrations` : elles ne sont creees que par
@@ -955,6 +962,17 @@ CREATE TABLE IF NOT EXISTS streaming_item_tags (
     PRIMARY KEY (tag_id, item_type, source, source_id)
 );
 
+-- Marque d'origine « scan » des tags tirés des balises personnelles (#9158).
+-- BIGINT et non TEXT, comme `streaming_item_tags` : comparée a `tags.id` et
+-- `item_tags.item_id`, que la migration 012 remet en BIGINT.
+CREATE TABLE IF NOT EXISTS item_tags_scan (
+    tag_id BIGINT NOT NULL,
+    item_type TEXT NOT NULL,
+    item_id BIGINT NOT NULL,
+    PRIMARY KEY (tag_id, item_type, item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_item_tags_scan_item ON item_tags_scan(item_type, item_id);
+
 -- Titres de SERVICE bannis (#4806) — jumelle de `hidden_items` pour la paire
 -- `source` + `source_id`. `profile_id` en BIGINT et non TEXT : la copie lie
 -- NATIVEMENT les entiers, et les filtres le comparent a un entier.
@@ -1252,6 +1270,20 @@ CREATE TABLE IF NOT EXISTS alertes_douteuses_ignorees (
  libelle TEXT,
  ignoree_le BIGINT NOT NULL,
  PRIMARY KEY (portee, cle, titre, raison)
+);
+-- Titres diffusés par les radios (#8487). Sans script numéroté : présente
+-- ici (bascule) ET dans `ENSURE_TABLES`, mêmes types
+-- (migrations/radio_titres_diffuses.sql). Copiée.
+CREATE TABLE IF NOT EXISTS radio_titres_diffuses (
+ ecoute_id BIGINT NOT NULL,
+ diffuse_le BIGINT NOT NULL,
+ zone_id BIGINT,
+ flux TEXT,
+ station TEXT NOT NULL DEFAULT '',
+ titre TEXT NOT NULL,
+ artiste TEXT,
+ pochette TEXT,
+ PRIMARY KEY (ecoute_id, diffuse_le)
 );
 -- « Pas pour moi » de l'accueil (web#916, SQLite 145 / PG 111), par profil.
 CREATE TABLE IF NOT EXISTS suggestions_ecartees (
@@ -1957,6 +1989,7 @@ fn conflict_clause(table: &str) -> &'static str {
         "collection_physique_associations" => "ON CONFLICT (release_id) DO NOTHING",
         "politiques_parentales" => "ON CONFLICT (profile_id) DO NOTHING",
         "alertes_douteuses_ignorees" => "ON CONFLICT (portee, cle, titre, raison) DO NOTHING",
+        "radio_titres_diffuses" => "ON CONFLICT (ecoute_id, diffuse_le) DO NOTHING",
         "notes_personnelles" => "ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
         "apports_service_albums" => "ON CONFLICT (album_id, source) DO NOTHING",
         "apports_service" => "ON CONFLICT (album_id, track_id, champ, source) DO NOTHING",
@@ -1965,6 +1998,8 @@ fn conflict_clause(table: &str) -> &'static str {
         "radio_favorites" => "ON CONFLICT (title, artist) DO NOTHING",
         "favorites" => "ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
         "item_tags" => "ON CONFLICT (tag_id, item_type, item_id) DO NOTHING",
+        // Pas de colonne `id` : la clef est le triplet (#9158).
+        "item_tags_scan" => "ON CONFLICT (tag_id, item_type, item_id) DO NOTHING",
         // Cette table n'a PAS de colonne `id` : la clause par defaut
         // `ON CONFLICT (id)` ci-dessous echouerait sur elle (#3699).
         "streaming_item_tags" => "ON CONFLICT (tag_id, item_type, source, source_id) DO NOTHING",

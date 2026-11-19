@@ -3443,39 +3443,185 @@ async fn contre_epreuve_le_filtre_dsd_historique_eteint_bien_les_vu() {
 #[test]
 fn le_fichier_a_mesurer_couvre_le_dsd_sauf_quand_rien_ne_mesure() {
     let f = || Some("/musique/piste".to_string());
+    let attendu = || Some(("/musique/piste".to_string(), 0u64));
     for fmt in ["dsf", "dff", "dsd", "DSF", "Dff"] {
         assert_eq!(
-            super::fichier_a_mesurer_apres_avance(Some(fmt), f(), true),
-            f(),
+            super::fichier_a_mesurer_apres_avance(Some(fmt), f(), None, true),
+            attendu(),
             "{fmt} : une sortie qui mesure doit recevoir des niveaux"
         );
         assert_eq!(
-            super::fichier_a_mesurer_apres_avance(Some(fmt), f(), false),
+            super::fichier_a_mesurer_apres_avance(Some(fmt), f(), None, false),
             None,
             "{fmt} : rendre du 1 bit en PCM pour une sortie qui ne mesure pas"
         );
     }
     for fmt in ["flac", "wav", "mp3", "alac"] {
         assert_eq!(
-            super::fichier_a_mesurer_apres_avance(Some(fmt), f(), true),
-            f(),
+            super::fichier_a_mesurer_apres_avance(Some(fmt), f(), None, true),
+            attendu(),
             "{fmt} : comportement inchangé"
         );
         assert_eq!(
-            super::fichier_a_mesurer_apres_avance(Some(fmt), f(), false),
-            f(),
+            super::fichier_a_mesurer_apres_avance(Some(fmt), f(), None, false),
+            attendu(),
             "{fmt} : la réponse de la sortie ne concerne que le DSD"
         );
     }
     assert_eq!(
-        super::fichier_a_mesurer_apres_avance(Some("flac"), None, true),
+        super::fichier_a_mesurer_apres_avance(Some("flac"), None, None, true),
         None,
-        "sans chemin de fichier, rien à décoder"
+        "sans chemin de fichier ni tranche CUE, rien à décoder"
     );
     assert_eq!(
-        super::fichier_a_mesurer_apres_avance(None, f(), true),
-        f(),
+        super::fichier_a_mesurer_apres_avance(None, f(), None, true),
+        attendu(),
         "format inconnu : on décode, comme avant"
+    );
+}
+
+/// #9142 — une piste virtuelle de feuille CUE (`file_path` NULL) se mesure
+/// sur `cue_media_path`, depuis le début de sa tranche. Avant le correctif,
+/// la décision ne lisait que `file_path` : `None`, d'où
+/// `non_lance_sans_fichier` à chaque enchaînement d'un album CUE.
+#[test]
+fn le_fichier_a_mesurer_d_une_tranche_cue_est_son_media_au_debut_de_la_tranche() {
+    let bornes = || {
+        Some((
+            "/musique/album.flac".to_string(),
+            245_320u64,
+            Some(512_000u64),
+        ))
+    };
+    assert_eq!(
+        super::fichier_a_mesurer_apres_avance(Some("flac"), None, bornes(), true),
+        Some(("/musique/album.flac".to_string(), 245_320)),
+        "tranche CUE : le média de la feuille, au début de la tranche"
+    );
+    assert_eq!(
+        super::fichier_a_mesurer_apres_avance(Some("flac"), None, bornes(), false),
+        Some(("/musique/album.flac".to_string(), 245_320)),
+        "hors DSD, la réponse de la sortie ne change rien, tranche ou pas"
+    );
+    let dsd = || Some(("/musique/album.dsf".to_string(), 60_000u64, None));
+    assert_eq!(
+        super::fichier_a_mesurer_apres_avance(Some("dsf"), None, dsd(), true),
+        Some(("/musique/album.dsf".to_string(), 60_000)),
+        "tranche CUE DSD sur une sortie qui mesure"
+    );
+    assert_eq!(
+        super::fichier_a_mesurer_apres_avance(Some("dsf"), None, dsd(), false),
+        None,
+        "tranche CUE DSD sur la sortie qui ne mesure pas : on ne paie pas"
+    );
+    // Même précédence que la lecture explicite (`resolve_local`, #3631) :
+    // un `file_path` posé l'emporte, la tranche garde son début.
+    assert_eq!(
+        super::fichier_a_mesurer_apres_avance(
+            Some("flac"),
+            Some("/musique/autre.flac".into()),
+            bornes(),
+            true,
+        ),
+        Some(("/musique/autre.flac".to_string(), 245_320)),
+    );
+}
+
+/// #9142 — une zone qui joue la piste 1 d'un album en feuille CUE, prête à
+/// enchaîner sur la piste 2. L'image fait 4 s : 2 s de SILENCE (piste 1)
+/// puis 2 s d'un carré franc (piste 2). Les deux pistes sont des tranches
+/// virtuelles — `file_path` NULL, identité `(cue_media_path, cue_start_ms)` —
+/// comme celles qu'écrit le scanner. Le silence en tête rend le DÉCALAGE
+/// observable : un décodage parti du début de l'image ne publie que du
+/// silence pendant les deux premières secondes de la piste 2.
+async fn zone_cue_prete_a_enchainer(
+    image: &std::path::Path,
+) -> (
+    Arc<PlaybackOrchestrator>,
+    i64,
+    tokio::sync::broadcast::Receiver<crate::event_bus::TuneEvent>,
+) {
+    const SR: u32 = 44_100;
+    let trames = SR as usize * 2;
+    let mut buf = Vec::with_capacity(44 + trames * 8);
+    buf.extend_from_slice(&crate::audio::wav::build_wav_header_with_duration(
+        2,
+        SR,
+        16,
+        Some(4_000),
+    ));
+    buf.resize(buf.len() + trames * 4, 0);
+    let demi_periode = (SR / 86) as usize;
+    for t in 0..trames {
+        let v: i16 = if (t / demi_periode).is_multiple_of(2) {
+            24_000
+        } else {
+            -24_000
+        };
+        buf.extend_from_slice(&v.to_le_bytes());
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(image, &buf).unwrap();
+
+    let bus = Arc::new(EventBus::new());
+    let mut orch = test_orchestrator();
+    orch.event_bus = Some(bus.clone());
+    let orch = Arc::new(orch);
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("TASCAM US-366", Some("local"), Some("local:TASCAM US-366"))
+        .unwrap();
+    let pistes = crate::db::track_repo::TrackRepo::with_backend(orch.db.clone());
+    let mut ids = Vec::new();
+    for n in 1..=2i64 {
+        let mut piste = crate::db::models::Track::new(format!("Piste CUE {n}"));
+        piste.file_path = None;
+        piste.cue_media_path = Some(image.to_string_lossy().into_owned());
+        piste.cue_start_ms = Some((n - 1) * 2_000);
+        piste.cue_end_ms = Some(n * 2_000);
+        piste.format = Some("wav".into());
+        piste.sample_rate = Some(SR as i32);
+        piste.bit_depth = Some(16);
+        piste.channels = 2;
+        piste.track_number = n as i32;
+        piste.duration_ms = 2_000;
+        ids.push(pistes.create(&piste).unwrap());
+    }
+    crate::db::play_queue_repo::PlayQueueRepo::with_backend(orch.db.clone())
+        .set_queue(zone_id, &ids)
+        .unwrap();
+    orch.playback.play(zone_id, NowPlaying::default()).await;
+    let rx = bus.subscribe();
+    (orch, zone_id, rx)
+}
+
+/// #9142 (fil 2943) — après une avance gapless sur la piste 2 d'un album
+/// CUE, la mesure des niveaux REDÉMARRE, sur le média de la feuille, au
+/// début de la tranche. Avant le correctif : `non_lance_sans_fichier`, zéro
+/// événement, spectre et VU-mètres morts jusqu'à la prochaine lecture
+/// explicite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn avance_gapless_sur_une_tranche_cue_relance_les_niveaux_au_bon_decalage() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("album.wav");
+    let (orch, zone_id, mut rx) = zone_cue_prete_a_enchainer(&image).await;
+
+    orch.advance_queue_metadata(zone_id, 1)
+        .await
+        .expect("l'avance gapless doit aboutir");
+
+    // ~600 ms de piste 2 : toutes dans le carré si le décodage part bien de
+    // 2 000 ms dans l'image, toutes dans le silence s'il part de 0.
+    let (n, crete) =
+        compter_niveaux(&mut rx, zone_id, std::time::Duration::from_secs(10), 15).await;
+    assert!(
+        n >= 15,
+        "après l'avance gapless sur une tranche CUE, les niveaux doivent \
+         repartir : reçu {n} événements (non_lance_sans_fichier ?)"
+    );
+    assert!(
+        crete > -20.0,
+        "les niveaux doivent décrire la tranche de la piste 2 (carré), pas le \
+         début de l'image (silence) : crête {crete:.1} dBFS"
     );
 }
 
