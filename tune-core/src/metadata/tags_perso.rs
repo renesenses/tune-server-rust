@@ -52,13 +52,10 @@ use crate::db::settings_repo::SettingsRepo;
 /// La clé de `settings` qui porte le réglage (JSON).
 pub const CLE_REGLAGE: &str = "personal_tags";
 
-/// La clé RÉSERVÉE des métadonnées étendues qui porte les tags lus, joints
-/// par [`SEPARATEUR_LU`]. Le `@` initial la marque réservée : aucune balise
+/// La clé RÉSERVÉE des métadonnées étendues qui porte les tags lus, en
+/// tableau JSON ([`encoder`]). Le `@` initial la marque réservée : aucune balise
 /// ne produit une telle clé, et `TrackMetadataRepo` ne l'écrit jamais.
 pub const CLE_LUE: &str = "@tags_perso";
-/// Le séparateur des noms de tags sous [`CLE_LUE`] (US, jamais dans un nom :
-/// [`nettoyer_nom_de_tag`] retire les caractères de contrôle).
-pub const SEPARATEUR_LU: char = '\u{1f}';
 
 /// Au plus tant de correspondances.
 pub const MAX_CORRESPONDANCES: usize = 32;
@@ -357,20 +354,18 @@ impl TagsPerso {
 
 /// Les noms de tags sous [`CLE_LUE`], tels que le scan les a rangés.
 pub fn encoder(tags: &[String]) -> String {
-    let mut s = String::new();
-    for (i, t) in tags.iter().enumerate() {
-        if i > 0 {
-            s.push(SEPARATEUR_LU);
-        }
-        s.push_str(t);
-    }
-    s
+    // Un tableau JSON, pas un séparateur de contrôle : la lecture étendue
+    // nettoie ses valeurs (caractère de contrôle → espace) avant de les
+    // rendre, et un séparateur US y devenait une espace (« Calme Nuit »).
+    serde_json::to_string(tags).unwrap_or_else(|_| "[]".into())
 }
 
 /// L'inverse de [`encoder`].
 pub fn decoder(brut: &str) -> Vec<String> {
-    brut.split(SEPARATEUR_LU)
-        .filter_map(nettoyer_nom_de_tag)
+    serde_json::from_str::<Vec<String>>(brut)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|t| nettoyer_nom_de_tag(t))
         .collect()
 }
 
