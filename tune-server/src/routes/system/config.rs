@@ -5033,6 +5033,7 @@ pub(super) async fn get_license(State(state): State<AppState>) -> Json<Value> {
 }
 
 pub(super) async fn set_license(
+    _garde: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     Json(body): Json<LicenseBody>,
 ) -> impl IntoResponse {
@@ -5065,7 +5066,10 @@ pub(super) async fn set_license(
     .into_response()
 }
 
-pub(super) async fn delete_license(State(state): State<AppState>) -> Json<Value> {
+pub(super) async fn delete_license(
+    _garde: crate::auth::AdminOuCetteMachine,
+    State(state): State<AppState>,
+) -> Json<Value> {
     let remote_released = crate::routes::cloud::retirer_la_licence(&state).await;
     Json(crate::routes::cloud::reponse_de_retrait(
         json!({ "status": "ok", "tier": "free" }),

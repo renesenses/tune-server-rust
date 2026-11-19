@@ -4861,6 +4861,35 @@ impl PlaybackOrchestrator {
             // restent exclus par `sortie_tire_le_flux` : eux décodent déjà.
             let output_decodes_server_side =
                 !(is_network_output || is_browser_output || sortie_tire_le_flux);
+            // #9117 — le DSD servi tel quel (DSF/DFF vers un renderer qui
+            // annonce le DSD) n'est pas décodé « au fil des valeurs taguées »
+            // comme le PCM ci-dessous (`Some(sr)` vaudrait 2,8 MHz), mais il
+            // n'est plus laissé sans niveaux : la sonde du DoP et du DSD natif
+            // (#6456, #7775) le convertit en PCM à la cadence que choisit le
+            // convertisseur, freinée sur la lecture, pour les seules aiguilles.
+            // Le flux envoyé au renderer ne change pas.
+            if skip_passthrough_levels
+                && !output_decodes_server_side
+                && self.levels_attach_allowed(req.zone_id)
+                && let Some(ref bus) = self.event_bus
+            {
+                let play_seq = self.playback.current_play_seq(req.zone_id).await;
+                info!(
+                    zone_id = req.zone_id,
+                    play_seq,
+                    file = %file_path,
+                    "dsd_passthrough_niveaux_sonde"
+                );
+                spawn_local_file_levels_decode_depuis(
+                    bus.clone(),
+                    self.playback.clone(),
+                    req.zone_id,
+                    play_seq,
+                    file_path.clone(),
+                    0,
+                    0,
+                );
+            }
             if !skip_passthrough_levels
                 && !output_decodes_server_side
                 && self.levels_attach_allowed(req.zone_id)
@@ -5187,6 +5216,10 @@ mod duree_relue_5975_tests;
 #[cfg(test)]
 #[path = "niveaux_du_dsd_natif_7775.rs"]
 mod niveaux_du_dsd_natif_7775;
+
+#[cfg(test)]
+#[path = "niveaux_dsd_passthrough_reseau_9117.rs"]
+mod niveaux_dsd_passthrough_reseau_9117;
 
 #[cfg(test)]
 #[path = "saut_local_8983_tests.rs"]

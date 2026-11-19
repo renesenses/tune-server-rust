@@ -361,6 +361,54 @@ pub fn compter_pistes_par_sous_dossier(
     })
 }
 
+/// #9116 — le texte SQL de [`compter_pistes_sous_dossier`]. Paramètres : le
+/// motif de [`folder_like_pattern`], puis (PostgreSQL seulement) les deux
+/// bornes de [`bornes_du_dossier`]. Public pour que les témoins lisent le plan
+/// de la requête même que la route exécute.
+///
+/// Le résultat est celui de la route d'avant, à l'unité près, sur les deux
+/// moteurs (`file_path LIKE …` : une tranche CUE n'y est pas comptée) ; seul le
+/// chemin d'accès change, moteur par moteur, MESURÉ (banc
+/// `banc_repertoires_9116`, 544 147 pistes, une racine qui couvre toute la
+/// bibliothèque) :
+///
+/// * **SQLite** : le `LIKE` seul se lit dans l'index de `file_path`, sans
+///   toucher la table (`SCAN tracks USING COVERING INDEX`) — 84 ms. La plage de
+///   [`plage_du_dossier`] y COÛTE plus (259 ms) : l'index du chemin n'est pas
+///   couvrant et chaque entrée relit sa ligne. La requête reste donc telle
+///   quelle ; c'est le cache par révision de la route qui supprime la relecture.
+/// * **PostgreSQL** : un `LIKE $1` préparé ne peut partir d'aucun index (plan
+///   générique) et parcourt la table ; la plage sur
+///   [`INDEX_CHEMIN_DOSSIER_PG`] le borne, le `LIKE` reste la garde exacte.
+pub fn sql_compter_pistes_sous_dossier(engine: Engine) -> String {
+    let esc = like_escape_clause();
+    match engine {
+        Engine::Sqlite => format!("SELECT COUNT(*) FROM tracks WHERE file_path LIKE ?1{esc}"),
+        Engine::Postgres => {
+            let plage = plage_du_dossier(engine, CHEMIN_DE_LA_PISTE, "$2", "$3");
+            format!("SELECT COUNT(*) FROM tracks WHERE {plage} AND file_path LIKE $1{esc}")
+        }
+    }
+}
+
+/// #9116 (fil 2935) — le nombre de pistes sous `dossier`, récursivement :
+/// le compte d'une racine de la vue Répertoires (`GET /library/browse`).
+/// Voir [`sql_compter_pistes_sous_dossier`] pour le chemin d'accès.
+pub fn compter_pistes_sous_dossier(backend: &dyn DbBackend, dossier: &str) -> Result<i64, String> {
+    let motif = folder_like_pattern(dossier);
+    let (bas, haut) = bornes_du_dossier(dossier);
+    let params: [&dyn ToSqlValue; 3] = [&motif, &bas, &haut];
+    let n = match backend.engine() {
+        Engine::Sqlite => 1,
+        Engine::Postgres => 3,
+    };
+    let sql = sql_compter_pistes_sous_dossier(backend.engine());
+    Ok(backend
+        .query_one(&sql, &params[..n])?
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0))
+}
+
 /// Un dossier tel que le lisent les requêtes « exactes » du parcours par
 /// dossiers du serveur média (#4318) : le motif `LIKE` (pré-filtre, échappé),
 /// le préfixe littéral `<dossier><séparateur>` en NFC, et sa longueur en
@@ -8037,6 +8085,10 @@ mod tests_notes_du_profil_7594 {
 #[cfg(test)]
 #[path = "track_repo_repertoires_5998_tests.rs"]
 mod repertoires_5998_tests;
+
+#[cfg(test)]
+#[path = "track_repo_racines_9116_tests.rs"]
+mod racines_9116_tests;
 
 #[cfg(test)]
 #[path = "track_repo_ordre_fichiers_6222_tests.rs"]

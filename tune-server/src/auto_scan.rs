@@ -211,13 +211,36 @@ pub fn build_track_from_metadata_opts(
         } else {
             String::new()
         };
+        // #7694 — la qualité du fichier, comme le scan (`scan_import`) : la
+        // règle des dossiers miroirs (#4907) ne rattache à la copie d'une autre
+        // racine qu'un fichier de MÊME qualité. Sans elle, l'édition CD posée
+        // pendant que Tune tourne rejoignait l'album de l'édition DSD rangée au
+        // même chemin sous l'autre racine. Le surveillant range un fichier à la
+        // fois : rien n'attend en mémoire, ce qui compte est déjà en base.
+        let score = (meta.format.is_some()
+            || meta.sample_rate.is_some()
+            || meta.bit_depth.is_some())
+        .then(|| {
+            tune_core::library::quality::score_qualite(
+                meta.format.as_deref(),
+                meta.sample_rate.map(i64::from),
+                meta.bit_depth.map(i64::from),
+            )
+        });
+        let rien_en_memoire = |_: &str| -> Vec<(bool, i64)> { Vec::new() };
         album_repo
-            .get_or_create_for_folder(
+            .get_or_create_for_folder_de_qualite(
                 &folder,
                 title,
                 aid,
                 meta.year.map(|y| y as i32),
                 meta.musicbrainz_release_id.as_deref(),
+                None,
+                None,
+                score.map(|score| tune_core::db::album_repo::QualiteDuFichier {
+                    score,
+                    vues_dans_le_scan: &rien_en_memoire,
+                }),
             )
             .ok()
     });
@@ -983,6 +1006,9 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
                                     &db,
                                     &meta_entries,
                                 );
+                                // #9158 — les balises personnelles réglées
+                                // deviennent des tags Tune (piste, album).
+                                tune_core::db::tags_perso_repo::ecrire_lot(&db, &meta_entries);
                             }
                             Err(e) => {
                                 tracing::warn!(error = %e, "auto_scan_extended_metadata_insert_failed");
@@ -2550,7 +2576,10 @@ pub(crate) fn reimporter_fichier_surveillant(
                 tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(db.clone())
                     .set_batch(id, &ext)?;
                 // #7766 — les crédits des balises, comme les deux scans.
-                tune_core::metadata::credits_balises::ecrire_lot(db, &[(id, ext)]);
+                let lot = [(id, ext)];
+                tune_core::metadata::credits_balises::ecrire_lot(db, &lot);
+                // #9158 — les balises personnelles, comme les deux scans.
+                tune_core::db::tags_perso_repo::ecrire_lot(db, &lot);
                 Ok(())
             })();
             if let Err(e) = metadonnees {
@@ -3880,6 +3909,10 @@ pub fn spawn_file_watcher(
         }
     });
 }
+
+#[cfg(test)]
+#[path = "surveillant_editions_miroirs_tests_7694.rs"]
+mod surveillant_editions_miroirs_tests_7694;
 
 #[cfg(test)]
 #[path = "surveillant_retouche_tests_4896.rs"]

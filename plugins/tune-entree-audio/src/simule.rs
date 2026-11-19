@@ -199,6 +199,9 @@ impl Peripheriques for Simulees {
     }
 
     fn frequence_courante(&self, entree: &str) -> Option<u32> {
-        self.trouver(entree).ok().map(|(f, _, _)| f)
+        // Par le nom ou par l'identifiant (`simule:<nom>`), comme `demarrer`
+        // le rend.
+        let nom = entree.strip_prefix("simule:").unwrap_or(entree);
+        self.trouver(nom).ok().map(|(f, _, _)| f)
     }
 }
