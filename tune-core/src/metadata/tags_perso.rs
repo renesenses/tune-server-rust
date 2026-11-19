@@ -96,6 +96,54 @@ pub struct Correspondance {
     /// Le préfixe des tags ([`Mode::Values`] seulement) : « Humeur : ».
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prefix: Option<String>,
+    /// Le séparateur des valeurs d'UNE balise ([`Mode::Values`]) : absent =
+    /// `;` (défaut), `""` = aucun, sinon `|`, `/` ou une chaîne choisie (au
+    /// plus [`MAX_LONGUEUR_SEPARATEUR`] caractères). S'applique EN PLUS des
+    /// champs répétés (deux trames `GROUPING`) et des valeurs multiples ID3v2.4
+    /// (séparées par NUL), toujours découpés.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub separator: Option<String>,
+}
+
+/// Le séparateur par défaut des valeurs d'une balise.
+pub const SEPARATEUR_DEFAUT: &str = ";";
+/// Au plus tant de caractères de séparateur.
+pub const MAX_LONGUEUR_SEPARATEUR: usize = 8;
+
+/// Les balises proposées d'office (demande de Rob et usages courants :
+/// Roon, foobar2000, Mp3tag).
+pub const SUGGESTIONS: [&str; 5] = ["GROUPING", "MOOD", "STYLE", "ROONTRACKTAG", "ROONALBUMTAG"];
+
+/// Les trames et atomes STANDARD qui portent le même champ qu'un nom libre :
+/// le regroupement est `TIT1` / `GRP1` en ID3 et `©grp` en MP4, l'humeur
+/// `TMOO` en ID3v2.4. Une correspondance `GROUPING` les lit aussi.
+/// `TIT1` n'est le regroupement que sans `GRP1` : quand iTunes (12.5 et
+/// suivants) écrit `GRP1`, `TIT1` est l'ŒUVRE (même règle que la lecture
+/// étendue, `ItemKey::Work`).
+fn alias_standard(nom: &str) -> &'static [&'static str] {
+    match nom {
+        "GROUPING" => &["GRP1", "\u{a9}GRP", "TIT1"],
+        "MOOD" => &["TMOO"],
+        _ => &[],
+    }
+}
+
+/// Les valeurs de la balise `nom` parmi `paires`, toutes trames comprises,
+/// graphies standard comprises ([`alias_standard`]).
+fn valeurs_de<'a>(nom: &str, paires: &'a [(String, String)]) -> Vec<&'a str> {
+    let alias = alias_standard(nom);
+    let a_grp1 = paires.iter().any(|(k, _)| k == "GRP1");
+    paires
+        .iter()
+        .filter(|(k, _)| {
+            let n = nom_de_cle(k);
+            // Un alias est une trame ou un atome NU (`TIT1`, `©grp`), jamais
+            // `TXXX:TIT1`.
+            n == nom
+                || (!k.contains(':') && alias.contains(&n.as_str()) && !(n == "TIT1" && a_grp1))
+        })
+        .map(|(_, v)| v.as_str())
+        .collect()
 }
 
 /// Le réglage entier.
@@ -156,6 +204,7 @@ impl Correspondance {
                     mode: Mode::Fixed,
                     tag: Some(tag),
                     prefix: None,
+                    separator: None,
                 })
             }
             Mode::Values => {
@@ -173,11 +222,28 @@ impl Correspondance {
                 }
                 // L'espace finale compte : « Humeur : » + « Calme ».
                 let prefix = (!nu.is_empty()).then(|| brut.trim_start().to_string());
+                let separator = match self.separator {
+                    None => None,
+                    Some(sep) if sep == SEPARATEUR_DEFAUT => None,
+                    Some(sep) if sep.chars().count() > MAX_LONGUEUR_SEPARATEUR => {
+                        return Err(format!(
+                            "{key} : le séparateur dépasse {MAX_LONGUEUR_SEPARATEUR} caractères"
+                        ));
+                    }
+                    Some(sep) if sep.chars().any(char::is_control) => {
+                        return Err(format!(
+                            "{key} : le séparateur contient un caractère de contrôle"
+                        ));
+                    }
+                    // `""` = aucun séparateur (seuls les champs répétés et NUL).
+                    Some(sep) => Some(sep),
+                };
                 Ok(Correspondance {
                     key,
                     mode: Mode::Values,
                     tag: None,
                     prefix,
+                    separator,
                 })
             }
         }
@@ -196,7 +262,11 @@ impl TagsPerso {
         for c in self.mappings {
             let c = c.valider()?;
             let deja = sortie.iter().any(|d| {
-                d.nom() == c.nom() && d.mode == c.mode && d.tag == c.tag && d.prefix == c.prefix
+                d.nom() == c.nom()
+                    && d.mode == c.mode
+                    && d.tag == c.tag
+                    && d.prefix == c.prefix
+                    && d.separator == c.separator
             });
             if !deja {
                 sortie.push(c);
@@ -238,13 +308,10 @@ impl TagsPerso {
         };
         for c in &self.mappings {
             let nom = c.nom();
-            let valeurs = paires
-                .iter()
-                .filter(|(k, _)| nom_de_cle(k) == nom)
-                .map(|(_, v)| v.as_str());
+            let valeurs = valeurs_de(&nom, paires);
             match c.mode {
                 Mode::Fixed => {
-                    let presente = valeurs.clone().any(|v| {
+                    let presente = valeurs.iter().any(|v| {
                         !v.trim_matches(|ch: char| ch.is_whitespace() || ch == ';' || ch == '\0')
                             .is_empty()
                     });
@@ -253,11 +320,22 @@ impl TagsPerso {
                     }
                 }
                 Mode::Values => {
+                    let sep = c.separator.as_deref().unwrap_or(SEPARATEUR_DEFAUT);
                     for v in valeurs {
-                        // `;` sépare les valeurs ; les trames ID3 à valeurs
-                        // multiples arrivent jointes par « ; » (NUL relu par
-                        // `balises_brutes`), un NUL resté brut aussi.
-                        for morceau in v.split([';', '\0']) {
+                        // Chaque trame compte (champs répétés) ; dans une
+                        // trame, le séparateur réglé, et toujours NUL (valeurs
+                        // multiples ID3v2.4).
+                        let morceaux: Vec<&str> = v
+                            .split('\0')
+                            .flat_map(|m| {
+                                if sep.is_empty() {
+                                    vec![m]
+                                } else {
+                                    m.split(sep).collect()
+                                }
+                            })
+                            .collect();
+                        for morceau in morceaux {
                             let Some(valeur) = nettoyer_nom_de_tag(morceau) else {
                                 continue;
                             };
@@ -353,7 +431,6 @@ const CLES_CONNUES: &[&str] = &[
     "ENSEMBLE",
     "EXPLICIT",
     "GENRE",
-    "GROUPING",
     "ISRC",
     "ITUNESADVISORY",
     "LABEL",
@@ -366,7 +443,6 @@ const CLES_CONNUES: &[&str] = &[
     "MEDIA",
     "METADATA_BLOCK_PICTURE",
     "MIXER",
-    "MOOD",
     "MOVEMENT",
     "MOVEMENTNAME",
     "MOVEMENTTOTAL",
@@ -424,6 +500,11 @@ pub fn est_cle_connue(nom: &str) -> bool {
 pub fn nom_utilisable(bloc: &str, cle: &str) -> Option<String> {
     let nom = match bloc {
         "id3v2" if cle.starts_with("TXXX:") => Some(nom_de_cle(cle)),
+        // Les graphies standard du regroupement et de l'humeur (voir
+        // `alias_standard`) : comptées sous le nom à saisir.
+        "id3v2" if cle == "GRP1" || cle == "TIT1" => Some("GROUPING".to_string()),
+        "id3v2" if cle == "TMOO" => Some("MOOD".to_string()),
+        "mp4" if cle == "\u{a9}grp" => Some("GROUPING".to_string()),
         "mp4" if cle.starts_with("----:") => Some(nom_de_cle(cle)),
         "vorbis" | "ape" => Some(nom_de_cle(cle)),
         _ => None,

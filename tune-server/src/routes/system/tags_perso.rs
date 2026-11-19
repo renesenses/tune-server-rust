@@ -72,6 +72,8 @@ fn reponse(reglage: &tp::TagsPerso) -> Json<Value> {
     Json(json!({
         "personal_tags": reglage,
         "max_mappings": tp::MAX_CORRESPONDANCES,
+        "suggestions": tp::SUGGESTIONS,
+        "default_separator": tp::SEPARATEUR_DEFAUT,
         "apply": avancement(),
     }))
 }

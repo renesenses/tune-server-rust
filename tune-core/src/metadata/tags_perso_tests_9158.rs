@@ -456,3 +456,242 @@ fn de_bout_en_bout_piste_album_idempotence_retrait_et_tags_manuels_9158() {
     ecrire_lot(&b, &[(2, HashMap::new())]);
     assert_eq!(compte(&b, "SELECT COUNT(*) FROM item_tags"), avant);
 }
+
+// ---------------------------------------------------------------------------
+// Retour de Rob (19/11) : GROUPING répété, séparateurs, plusieurs noms,
+// graphies standard MP3 (TIT1 / GRP1 / TMOO, NUL ID3v2.4) et M4A (©grp).
+// ---------------------------------------------------------------------------
+
+fn r_sep(cle: &str, sep: Option<&str>) -> TagsPerso {
+    let mut c = serde_json::json!({ "key": cle });
+    if let Some(s) = sep {
+        c["separator"] = serde_json::json!(s);
+    }
+    reglage(serde_json::json!({ "mappings": [c] }))
+}
+
+fn s(v: &[&str]) -> Vec<String> {
+    v.iter().map(|x| x.to_string()).collect()
+}
+
+#[test]
+fn rob_grouping_repete_dans_un_flac_donne_trois_tags_9158() {
+    let f = flac(
+        "rob-repete",
+        &[
+            ("TITLE", "t"),
+            ("ARTIST", "a"),
+            ("GROUPING", "Roots"),
+            ("GROUPING", "Pop & Rock"),
+            ("GROUPING", " Americana "),
+            ("GROUPING", "roots"),
+        ],
+    );
+    assert_eq!(
+        lus(&lire(&f, &r_sep("GROUPING", None))),
+        Some(s(&["Roots", "Pop & Rock", "Americana"])),
+        "champs répétés : chaque trame est un tag, bords nettoyés, doublon ignoré"
+    );
+}
+
+#[test]
+fn rob_separateurs_reglables_9158() {
+    let un =
+        |v: &str, sep: Option<&str>| r_sep("GROUPING", sep).tags_des_paires(&p(&[("GROUPING", v)]));
+    let attendu = s(&["Roots", "Pop & Rock", "Americana"]);
+    assert_eq!(
+        un("Roots;Pop & Rock; Americana", None),
+        attendu,
+        "; par défaut"
+    );
+    assert_eq!(un("Roots|Pop & Rock|Americana", Some("|")), attendu);
+    assert_eq!(un("Roots/Pop & Rock/Americana", Some("/")), attendu);
+    assert_eq!(
+        un("Roots // Pop & Rock // Americana", Some("//")),
+        attendu,
+        "personnalisé"
+    );
+    assert_eq!(
+        un("Roots|Pop & Rock", Some("")),
+        s(&["Roots|Pop & Rock"]),
+        "aucun séparateur : la valeur entière"
+    );
+    assert_eq!(
+        un("Roots;Pop & Rock", Some("|")),
+        s(&["Roots;Pop & Rock"]),
+        "le séparateur réglé REMPLACE le ; par défaut"
+    );
+    // Séparateur ET champs répétés ensemble.
+    assert_eq!(
+        r_sep("GROUPING", Some("|")).tags_des_paires(&p(&[
+            ("GROUPING", "Roots|Pop & Rock"),
+            ("GROUPING", "Americana|roots")
+        ])),
+        attendu
+    );
+    // NUL (valeurs multiples ID3v2.4) est toujours découpé, même sans séparateur.
+    assert_eq!(un("Roots\u{0}Pop & Rock\u{0}Americana", Some("")), attendu);
+    // Validation.
+    for (sep, motif) in [("123456789", "dépasse"), ("\t", "contrôle")] {
+        let e = serde_json::from_value::<TagsPerso>(serde_json::json!({
+            "mappings": [{ "key": "GROUPING", "separator": sep }]
+        }))
+        .unwrap()
+        .valider()
+        .unwrap_err();
+        assert!(e.contains(motif), "{e}");
+    }
+    // `;` saisi = le défaut, rangé absent.
+    assert_eq!(r_sep("GROUPING", Some(";")).mappings[0].separator, None);
+    assert_eq!(
+        r_sep("GROUPING", Some("")).mappings[0].separator.as_deref(),
+        Some("")
+    );
+}
+
+#[test]
+fn rob_plusieurs_noms_de_champs_9158() {
+    let r = reglage(serde_json::json!({ "mappings": [
+        { "key": "GROUPING" }, { "key": "MOOD" }, { "key": "STYLE" },
+        { "key": "ROONTRACKTAG", "separator": "|" }, { "key": "ROONALBUMTAG" },
+    ]}));
+    let f = flac(
+        "rob-noms",
+        &[
+            ("TITLE", "t"),
+            ("ARTIST", "a"),
+            ("GROUPING", "Roots"),
+            ("MOOD", "Calme"),
+            ("STYLE", "Folk"),
+            ("ROONTRACKTAG", "Live|Acoustique"),
+            ("ROONALBUMTAG", "Coup de cœur"),
+        ],
+    );
+    assert_eq!(
+        lus(&lire(&f, &r)),
+        Some(s(&[
+            "Roots",
+            "Calme",
+            "Folk",
+            "Live",
+            "Acoustique",
+            "Coup de cœur"
+        ]))
+    );
+    assert_eq!(
+        SUGGESTIONS,
+        ["GROUPING", "MOOD", "STYLE", "ROONTRACKTAG", "ROONALBUMTAG"]
+    );
+}
+
+fn mp3_trames(
+    epreuve: &str,
+    texte: &[(&'static str, &str)],
+    txxx: &[(&str, &str)],
+) -> crate::test_scratch::ScratchFile {
+    use lofty::TextEncoding;
+    use lofty::id3::v2::{ExtendedTextFrame, Frame, FrameId, Id3v2Tag, TextInformationFrame};
+    use lofty::mpeg::MpegFile;
+    use std::borrow::Cow;
+    let chemin = copie("test.mp3", epreuve);
+    let mut fh = std::fs::File::open(&*chemin).unwrap();
+    let mut f = MpegFile::read_from(&mut fh, ParseOptions::new()).unwrap();
+    drop(fh);
+    let mut tag = f.id3v2().cloned().unwrap_or_else(Id3v2Tag::new);
+    use lofty::tag::Accessor;
+    tag.set_title("Titre".into());
+    tag.set_artist("Rob".into());
+    for (id, v) in texte {
+        tag.insert(Frame::Text(TextInformationFrame::new(
+            FrameId::Valid(Cow::Borrowed(id)),
+            TextEncoding::UTF8,
+            v.to_string(),
+        )));
+    }
+    for (k, v) in txxx {
+        tag.insert(Frame::UserText(ExtendedTextFrame::new(
+            TextEncoding::UTF8,
+            k.to_string(),
+            v.to_string(),
+        )));
+    }
+    f.set_id3v2(tag);
+    f.save_to_path(&*chemin, WriteOptions::default()).unwrap();
+    chemin
+}
+
+#[test]
+fn rob_mp3_txxx_nul_grp1_tit1_et_tmoo_9158() {
+    let r = reglage(serde_json::json!({ "mappings": [{ "key": "GROUPING" }, { "key": "MOOD" }] }));
+    // TXXX:GROUPING à valeurs multiples ID3v2.4 (NUL).
+    let a = mp3_trames(
+        "rob-txxx",
+        &[],
+        &[("GROUPING", "Roots\u{0}Pop & Rock\u{0}Americana")],
+    );
+    assert_eq!(
+        lus(&lire(&a, &r)),
+        Some(s(&["Roots", "Pop & Rock", "Americana"]))
+    );
+    // GRP1 (iTunes 12.5+) : le regroupement ; TIT1 est alors l'ŒUVRE.
+    let b = mp3_trames(
+        "rob-grp1",
+        &[("GRP1", "Roots"), ("TIT1", "Sonate"), ("TMOO", "Calme")],
+        &[],
+    );
+    assert_eq!(
+        lus(&lire(&b, &r)),
+        Some(s(&["Roots", "Calme"])),
+        "GRP1 et TMOO lus, TIT1 écarté quand GRP1 est là"
+    );
+    // TIT1 seul : le regroupement classique.
+    let c = mp3_trames("rob-tit1", &[("TIT1", "Roots;Americana")], &[]);
+    assert_eq!(lus(&lire(&c, &r)), Some(s(&["Roots", "Americana"])));
+}
+
+#[test]
+fn rob_m4a_grp_et_atome_libre_a_valeurs_multiples_9158() {
+    use lofty::mp4::{Atom, AtomData, AtomIdent, Ilst, Mp4File};
+    use std::borrow::Cow;
+    let chemin = copie("test.m4a", "rob-m4a");
+    let mut fh = std::fs::File::open(&*chemin).unwrap();
+    let mut f = Mp4File::read_from(&mut fh, ParseOptions::new()).unwrap();
+    drop(fh);
+    let mut ilst = f.ilst().cloned().unwrap_or_else(Ilst::default);
+    ilst.insert(Atom::new(
+        AtomIdent::Fourcc(*b"\xa9grp"),
+        AtomData::UTF8("Roots|Americana".into()),
+    ));
+    let humeur = Atom::from_collection(
+        AtomIdent::Freeform {
+            mean: Cow::Borrowed("com.apple.iTunes"),
+            name: Cow::Borrowed("MOOD"),
+        },
+        vec![
+            AtomData::UTF8("Calme".into()),
+            AtomData::UTF8("Nuit".into()),
+        ],
+    )
+    .expect("atome à deux valeurs");
+    ilst.insert(humeur);
+    f.set_ilst(ilst);
+    f.save_to_path(&*chemin, WriteOptions::default()).unwrap();
+    let r = reglage(serde_json::json!({ "mappings": [
+        { "key": "GROUPING", "separator": "|" }, { "key": "MOOD" },
+    ]}));
+    assert_eq!(
+        lus(&lire(&chemin, &r)),
+        Some(s(&["Roots", "Americana", "Calme", "Nuit"]))
+    );
+    // L'aperçu les compte sous le nom à saisir.
+    assert_eq!(
+        nom_utilisable("mp4", "\u{a9}grp").as_deref(),
+        Some("GROUPING")
+    );
+    assert_eq!(nom_utilisable("id3v2", "GRP1").as_deref(), Some("GROUPING"));
+    assert_eq!(nom_utilisable("id3v2", "TMOO").as_deref(), Some("MOOD"));
+    assert!(
+        !est_cle_connue("GROUPING") && !est_cle_connue("MOOD"),
+        "proposées, pas masquées"
+    );
+}

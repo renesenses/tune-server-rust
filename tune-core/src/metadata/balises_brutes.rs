@@ -399,9 +399,18 @@ fn id3v2(sortie: &mut BalisesDuFichier, tag: &lofty::id3::v2::Id3v2Tag) {
     for trame in tag {
         let id = trame.id_str().to_string();
         match trame {
-            Frame::Text(f) => sortie.pousser("id3v2", id, &f.value),
+            // #9158 — une trame texte ID3v2.4 à valeurs MULTIPLES les sépare
+            // par NUL : une ligne par valeur, sous la même clé (comme deux
+            // trames Vorbis répétées), au lieu d'une seule jointe par « ; ».
+            Frame::Text(f) => {
+                for v in f.value.split('\0') {
+                    sortie.pousser("id3v2", id.clone(), v);
+                }
+            }
             Frame::UserText(f) => {
-                sortie.pousser("id3v2", format!("TXXX:{}", f.description), &f.content)
+                for v in f.content.split('\0') {
+                    sortie.pousser("id3v2", format!("TXXX:{}", f.description), v);
+                }
             }
             Frame::Comment(f) => {
                 let cle = if f.description.is_empty() {
