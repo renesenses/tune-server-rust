@@ -260,15 +260,43 @@ fn lire(chemin: &str) -> String {
     std::fs::read_to_string(chemin).unwrap_or_default()
 }
 
+/// Les seules valeurs lues dans `HKLM\...\Windows NT\CurrentVersion`.
+#[cfg(any(windows, test))]
+const VALEURS_REGISTRE: [&str; 4] = [
+    "ProductName",
+    "CurrentBuildNumber",
+    "DisplayVersion",
+    "ReleaseId",
+];
+
 /// `reg.exe` par son chemin ABSOLU : un nom nu se chercherait d'abord dans
 /// le dossier de l'exécutable, inscriptible par l'utilisateur pour une
 /// installation par utilisateur (`AppData\Local\Programs`).
+///
+/// Une requête `/v <nom>` PAR valeur, jamais la clé entière : sans `/v`,
+/// `reg query` sort la cinquantaine de sous-clés et `DigitalProductId4`,
+/// davantage que le tampon de 4 Ko du tuyau sous Windows — `reg` restait
+/// bloqué en écriture jusqu'au délai et `os_version` valait toujours
+/// « Windows ». Une valeur seule tient en quelques centaines d'octets, et
+/// `DigitalProductId` ne transite plus. Les sorties sont mises bout à bout
+/// pour [`depuis_registre_windows`].
 #[cfg(windows)]
 fn sortie_registre_windows() -> String {
+    // Délai maximal pour l'ensemble des requêtes : un `reg` bloqué ne doit
+    // pas figer la tâche du battement.
+    let echeance = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    VALEURS_REGISTRE
+        .iter()
+        .map(|nom| valeur_registre_windows(nom, echeance))
+        .collect::<Vec<_>>()
+        .join("\r\n")
+}
+
+#[cfg(windows)]
+fn valeur_registre_windows(nom: &str, echeance: std::time::Instant) -> String {
     use std::io::Read;
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    const DELAI_MAX: std::time::Duration = std::time::Duration::from_secs(5);
     let racine = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
     let reg = std::path::PathBuf::from(racine)
         .join("System32")
@@ -277,6 +305,8 @@ fn sortie_registre_windows() -> String {
         .args([
             "query",
             r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion",
+            "/v",
+            nom,
         ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
@@ -286,14 +316,11 @@ fn sortie_registre_windows() -> String {
     else {
         return String::new();
     };
-    // Délai maximal : un `reg` bloqué ne doit pas figer la tâche du battement.
-    // La sortie (quelques Ko) tient dans le tampon du tuyau.
-    let debut = std::time::Instant::now();
     loop {
         match enfant.try_wait() {
             Ok(Some(_)) => break,
-            Ok(None) if debut.elapsed() < DELAI_MAX => {
-                std::thread::sleep(std::time::Duration::from_millis(50));
+            Ok(None) if std::time::Instant::now() < echeance => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
             }
             _ => {
                 let _ = enfant.kill();
@@ -463,6 +490,52 @@ mod tests {
     }
 
     const REG_WIN11: &str = "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\r\n    SystemRoot    REG_SZ    C:\\WINDOWS\r\n    CurrentBuildNumber    REG_SZ    22631\r\n    DisplayVersion    REG_SZ    23H2\r\n    ProductName    REG_SZ    Windows 10 Pro\r\n    RegisteredOwner    REG_SZ    Jean Dupont\r\n";
+
+    /// Sorties réelles de `reg query <clé> /v <nom>`, une par valeur, mises
+    /// bout à bout comme le fait `sortie_registre_windows`. Une valeur absente
+    /// (`ReleaseId` sur Windows 11 récent) ne rend RIEN sur stdout : l'erreur
+    /// part sur stderr, fermé.
+    #[test]
+    fn windows_lit_les_sorties_de_reg_query_par_valeur() {
+        let cle = "\r\nHKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\r\n";
+        let par_valeur = [
+            format!("{cle}    ProductName    REG_SZ    Windows 10 Pro\r\n\r\n"),
+            format!("{cle}    CurrentBuildNumber    REG_SZ    22631\r\n\r\n"),
+            format!("{cle}    DisplayVersion    REG_SZ    23H2\r\n\r\n"),
+            String::new(),
+        ];
+        assert_eq!(VALEURS_REGISTRE.len(), par_valeur.len());
+        assert_eq!(
+            depuis_registre_windows(&par_valeur.join("\r\n")).as_deref(),
+            Some("Windows 11 23H2")
+        );
+        // Contre-épreuve : sans DisplayVersion mais avec ReleaseId (Windows 10
+        // ancien), c'est ReleaseId qui est repris ; sans aucune des deux, le build.
+        let ancien = [
+            format!("{cle}    ProductName    REG_SZ    Windows 10 Home\r\n\r\n"),
+            format!("{cle}    CurrentBuildNumber    REG_SZ    18363\r\n\r\n"),
+            String::new(),
+            format!("{cle}    ReleaseId    REG_SZ    1909\r\n\r\n"),
+        ];
+        assert_eq!(
+            depuis_registre_windows(&ancien.join("\r\n")).as_deref(),
+            Some("Windows 10 1909")
+        );
+        let build_seul = [
+            ancien[0].clone(),
+            ancien[1].clone(),
+            String::new(),
+            String::new(),
+        ];
+        assert_eq!(
+            depuis_registre_windows(&build_seul.join("\r\n")).as_deref(),
+            Some("Windows 10 (build 18363)")
+        );
+        assert_eq!(
+            depuis_registre_windows(&["", "", "", ""].join("\r\n")),
+            None
+        );
+    }
 
     #[test]
     fn windows_11_se_reconnait_au_build_et_ignore_le_proprietaire() {
