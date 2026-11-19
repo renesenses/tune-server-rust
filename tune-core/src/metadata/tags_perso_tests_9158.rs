@@ -695,3 +695,41 @@ fn rob_m4a_grp_et_atome_libre_a_valeurs_multiples_9158() {
         "proposées, pas masquées"
     );
 }
+
+/// Relecture du 19/11 : une lecture brute RATÉE ne range rien (les tags du
+/// scan restent) ; une lecture réussie sans la balise range une liste vide
+/// (ils partent).
+#[test]
+fn une_lecture_ratee_ne_retire_pas_les_tags_du_scan_9158() {
+    let r = reglage(serde_json::json!({ "mappings": [{ "key": "MOOD" }] }));
+    assert_eq!(
+        valeur_lue(&r, None),
+        None,
+        "fichier illisible : piste sautée"
+    );
+    assert_eq!(valeur_lue(&r, Some(&[])).as_deref(), Some("[]"));
+    assert_eq!(
+        decoder(&valeur_lue(&r, Some(&p(&[("MOOD", "Calme")]))).unwrap()),
+        vec!["Calme".to_string()]
+    );
+    assert_eq!(valeur_lue(&TagsPerso::default(), Some(&[])), None);
+}
+
+/// NFC et caractères de format : une même valeur écrite autrement donne le
+/// même tag.
+#[test]
+fn les_noms_de_tags_sont_nfc_et_sans_caractere_de_format_9158() {
+    assert_eq!(nettoyer_nom_de_tag("Cafe\u{301}").as_deref(), Some("Café"));
+    assert_eq!(
+        nettoyer_nom_de_tag("\u{FEFF}Ca\u{200B}lme\u{200E}").as_deref(),
+        Some("Calme")
+    );
+    assert_eq!(nettoyer_nom_de_tag("\u{200B}\u{FEFF}"), None);
+    assert_eq!(cle_de_nom("CAFE\u{301}"), cle_de_nom("café"));
+    let r = reglage(serde_json::json!({ "mappings": [{ "key": "MOOD" }] }));
+    assert_eq!(
+        r.tags_des_paires(&p(&[("MOOD", "Café;cafe\u{301};CAFÉ\u{200B}")])),
+        vec!["Café".to_string()],
+        "doublons sous toutes leurs formes"
+    );
+}

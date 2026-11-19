@@ -300,3 +300,184 @@ async fn pg_9158_tags_perso() {
     scenario(&db, base);
     nettoyer(&db);
 }
+
+// ---------------------------------------------------------------------------
+// Relecture indépendante (19/11) : la pose SOUS le `BEGIN IMMEDIATE` d'un lot
+// de scan, sur une base FICHIER (WAL : le pool de lecture ne voit pas la
+// transaction de l'écrivain ; `:memory:` partage une seule connexion et
+// masquerait le défaut).
+// ---------------------------------------------------------------------------
+
+fn base_fichier(dossier: &Path) -> Arc<dyn DbBackend> {
+    let chemin = dossier.join("tune-9158.db");
+    let db = crate::db::sqlite::SqliteDb::open(&chemin.to_string_lossy()).unwrap();
+    db.init_schema().unwrap();
+    crate::db::migrations::run_migrations(&db).unwrap();
+    Arc::new(db)
+}
+
+fn entree(id: i64, tags: &[&str]) -> (i64, HashMap<String, String>) {
+    let tags: Vec<String> = tags.iter().map(|t| t.to_string()).collect();
+    (
+        id,
+        HashMap::from([(
+            crate::metadata::tags_perso::CLE_LUE.to_string(),
+            crate::metadata::tags_perso::encoder(&tags),
+        )]),
+    )
+}
+
+/// Scénario A : premier scan. Les pistes sont insérées DANS la transaction
+/// du lot, puis `ecrire_lot` : l'album reçoit le tag que portent ses deux
+/// pistes. Scénario B : rescan, une piste perd le tag : l'album le perd.
+#[test]
+fn sous_begin_immediate_l_album_suit_ses_pistes_base_fichier_9158() {
+    let dossier = tempfile::tempdir().unwrap();
+    let b = base_fichier(dossier.path());
+
+    // A — tout dans la transaction du lot, comme le scan.
+    b.execute_batch("BEGIN IMMEDIATE").unwrap();
+    poser(&b, 700);
+    let (t1, t2, alb) = (701, 702, 700);
+    let bilan = ecrire_lot(&b, &[entree(t1, &["Nuit"]), entree(t2, &["Nuit"])]);
+    b.execute_batch("COMMIT").unwrap();
+    assert_eq!(noms(&b, "track", t1), vec!["Nuit".to_string()]);
+    assert_eq!(noms(&b, "track", t2), vec!["Nuit".to_string()]);
+    assert_eq!(
+        noms(&b, "album", alb),
+        vec!["Nuit".to_string()],
+        "A : l'album doit recevoir le tag de ses deux pistes ({bilan:?})"
+    );
+
+    // B — rescan du fichier 2 modifié : Nuit retiré de la piste 2.
+    b.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let bilan = ecrire_lot(&b, &[entree(t2, &[])]);
+    b.execute_batch("COMMIT").unwrap();
+    assert_eq!(noms(&b, "track", t1), vec!["Nuit".to_string()]);
+    assert_eq!(noms(&b, "track", t2), Vec::<String>::new());
+    assert_eq!(
+        noms(&b, "album", alb),
+        Vec::<String>::new(),
+        "B : l'album ne doit plus porter un tag qu'une piste a perdu ({bilan:?})"
+    );
+
+    // Idempotence sous transaction : le même lot n'écrit plus rien.
+    b.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let bilan = ecrire_lot(&b, &[entree(t1, &["Nuit"]), entree(t2, &[])]);
+    b.execute_batch("COMMIT").unwrap();
+    assert_eq!(bilan, Bilan::default());
+}
+
+/// Un tag créé dans la transaction d'un lot (nom neuf) est retrouvé, casse
+/// et forme Unicode ignorées, par le lot suivant de la même transaction.
+#[test]
+fn sous_begin_immediate_un_tag_neuf_est_reutilise_nfc_9158() {
+    let dossier = tempfile::tempdir().unwrap();
+    let b = base_fichier(dossier.path());
+    b.execute_batch("BEGIN IMMEDIATE").unwrap();
+    poser(&b, 800);
+    ecrire_lot(&b, &[entree(801, &["Café"])]);
+    // « Cafe » + accent combinant (NFD), autre casse : le même tag.
+    ecrire_lot(&b, &[entree(802, &["CAFE\u{301}"])]);
+    b.execute_batch("COMMIT").unwrap();
+    let n: i64 = b.query_many("SELECT COUNT(*) FROM tags", &[]).unwrap()[0][0]
+        .as_i64()
+        .unwrap();
+    assert_eq!(n, 1, "un seul tag : {:?}", noms(&b, "track", 802));
+    assert_eq!(noms(&b, "album", 800), vec!["Café".to_string()]);
+}
+
+/// Un tag repris PAR FILTRE devient manuel : le scan ne le retire plus.
+#[test]
+fn un_tag_repris_par_filtre_n_est_plus_retire_par_le_scan_9158() {
+    use crate::db::track_repo::{CibleDuFiltre, TrackFilter, TrackRepo};
+    let b = base_sqlite();
+    poser(&b, 900);
+    ecrire_lot(&b, &[entree(901, &["Fête"])]);
+    let fete = TagRepo::with_backend(b.clone())
+        .get_by_name("Fête")
+        .unwrap()
+        .and_then(|t| t.id)
+        .unwrap();
+    let filtre = TrackFilter {
+        collection_track_ids: Some(vec![901]),
+        ..Default::default()
+    };
+    TrackRepo::with_backend(b.clone())
+        .etiqueter_par_filtre(fete, &filtre, CibleDuFiltre::Pistes, false)
+        .unwrap()
+        .unwrap();
+    // Le fichier n'a plus la balise : la pose, devenue manuelle, reste.
+    ecrire_lot(&b, &[entree(901, &[])]);
+    assert_eq!(noms(&b, "track", 901), vec!["Fête".to_string()]);
+}
+
+/// L'aperçu ne propose que des clés que le réglage accepte.
+#[test]
+fn l_apercu_ne_propose_que_des_cles_acceptees_9158() {
+    let b = |cle: &str| BaliseBrute {
+        bloc: "vorbis",
+        cle: cle.into(),
+        valeur: "x".into(),
+        tronquee: false,
+    };
+    let fichier = BalisesDuFichier {
+        format: Some("FLAC".into()),
+        balises: vec![b("ÉPOQUE"), b("MOOD/2"), b("HUMEUR (ROB)"), b("OCCASION")],
+        liste_tronquee: false,
+    };
+    let a = apercu(
+        &["/a".to_string()],
+        &TagsPerso::default(),
+        |_| Some(fichier.clone()),
+        || true,
+    );
+    let cles: Vec<&str> = a.keys.iter().map(|k| k.key.as_str()).collect();
+    assert_eq!(cles, vec!["OCCASION"], "{cles:?}");
+    for k in &a.keys {
+        serde_json::from_value::<TagsPerso>(serde_json::json!({ "mappings": [{ "key": k.key }] }))
+            .unwrap()
+            .valider()
+            .unwrap_or_else(|e| panic!("{} refusée : {e}", k.key));
+    }
+}
+
+/// La fusion d'albums redirige les marques « scan » avec leurs poses ; une
+/// pose manuelle de la cible ne devient pas « du scan ».
+#[test]
+fn la_fusion_d_albums_redirige_les_marques_du_scan_9158() {
+    let b = base_sqlite();
+    poser(&b, 1000);
+    let (cible, doublon) = (1000, 1001);
+    let repo = TagRepo::with_backend(b.clone());
+    let x = repo.create("X", None).unwrap();
+    let y = repo.create("Y", None).unwrap();
+    // Le doublon tient X et Y du scan ; la cible porte Y à la main.
+    synchroniser(&b, "album", doublon, &[x, y]).unwrap();
+    repo.tag_item(y, "album", cible).unwrap();
+    crate::db::album_repo::AlbumRepo::with_backend(b.clone())
+        .absorber(cible, doublon)
+        .unwrap();
+    assert_eq!(
+        noms(&b, "album", cible),
+        vec!["X".to_string(), "Y".to_string()]
+    );
+    let marques = |item: i64| -> Vec<i64> {
+        let mut v: Vec<i64> = b
+            .query_many(
+                "SELECT tag_id FROM item_tags_scan WHERE item_type = 'album' AND item_id = ?",
+                &[&item as &dyn ToSqlValue],
+            )
+            .unwrap()
+            .into_iter()
+            .filter_map(|r| r[0].as_i64())
+            .collect();
+        v.sort();
+        v
+    };
+    assert_eq!(marques(cible), vec![x], "X suit sa pose, Y reste manuel");
+    assert!(marques(doublon).is_empty());
+    // Le scan rend la cible conforme à « rien » : X part, Y (manuel) reste.
+    synchroniser(&b, "album", cible, &[]).unwrap();
+    assert_eq!(noms(&b, "album", cible), vec!["Y".to_string()]);
+}

@@ -4661,6 +4661,10 @@ pub fn read_extended_metadata_avec(
     // qu'en dernier recours ; une date qui ne commence pas par une année est
     // écartée (`balises_brutes::date_valide`).
     {
+        // #9158 — une lecture brute RATÉE n'est pas un fichier sans balise :
+        // les tags du scan ne sont pas retirés (piste sautée, comme la passe
+        // « Appliquer »).
+        let mut brutes_lues = true;
         let brutes: Vec<(String, String)> = match header.as_deref() {
             Some(h) => balises_brutes::CLES_DATE_ORIGINALE
                 .iter()
@@ -4685,9 +4689,13 @@ pub fn read_extended_metadata_avec(
                         }),
                 )
                 .collect(),
-            None => balises_brutes::lire_balises_du_fichier(path)
-                .map(|b| b.paires())
-                .unwrap_or_default(),
+            None => match balises_brutes::lire_balises_du_fichier(path) {
+                Ok(b) => b.paires(),
+                Err(_) => {
+                    brutes_lues = false;
+                    Vec::new()
+                }
+            },
         };
         if let Some(v) = balises_brutes::date_originale_parmi(&brutes).or_else(|| {
             get(ItemKey::OriginalReleaseDate).and_then(|v| balises_brutes::date_valide(&v))
@@ -4700,11 +4708,8 @@ pub fn read_extended_metadata_avec(
         // #9158 — les balises personnelles qui deviennent des tags Tune.
         // Présente, même vide, dès qu'une correspondance existe : une liste
         // vide RETIRE les tags que le scan avait posés.
-        if !perso.est_vide() {
-            meta.insert(
-                tags_perso::CLE_LUE.into(),
-                tags_perso::encoder(&perso.tags_des_paires(&brutes)),
-            );
+        if let Some(v) = tags_perso::valeur_lue(perso, brutes_lues.then_some(&brutes[..])) {
+            meta.insert(tags_perso::CLE_LUE.into(), v);
         }
         // #7766 — ce que lofty ne range sous aucun `ItemKey` : l'ensemble ou
         // l'orchestre (ENSEMBLE, ORCHESTRA), la liste des musiciens ID3v2.4

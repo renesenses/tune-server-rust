@@ -126,13 +126,13 @@ pub fn synchroniser(
     voulus: &[i64],
 ) -> Result<Bilan, String> {
     let p2: [&dyn ToSqlValue; 2] = [&item_type, &item_id];
-    let presents: HashSet<i64> = ids(backend.query_many(
+    let presents: HashSet<i64> = ids(backend.query_many_strong(
         "SELECT tag_id FROM item_tags WHERE item_type = ? AND item_id = ?",
         &p2,
     )?)
     .into_iter()
     .collect();
-    let marques: Vec<i64> = ids(backend.query_many(
+    let marques: Vec<i64> = ids(backend.query_many_strong(
         "SELECT tag_id FROM item_tags_scan WHERE item_type = ? AND item_id = ?",
         &p2,
     )?);
@@ -176,6 +176,7 @@ pub fn synchroniser(
 /// Les identifiants des tags nommés, créés s'ils manquent. La casse est
 /// ignorée : « calme » existant sert pour « Calme » lu dans un fichier.
 pub struct Resolveur {
+    backend: Arc<dyn DbBackend>,
     repo: TagRepo,
     par_nom: HashMap<String, i64>,
 }
@@ -184,26 +185,41 @@ impl Resolveur {
     pub fn new(backend: &Arc<dyn DbBackend>) -> Result<Self, String> {
         let repo = TagRepo::with_backend(backend.clone());
         let mut par_nom = HashMap::new();
-        for t in repo.list()? {
-            if let Some(id) = t.id {
-                par_nom.entry(t.name.to_lowercase()).or_insert(id);
+        // Lecture FORTE : appelé sous le `BEGIN IMMEDIATE` d'un lot de scan
+        // (SQLite), où le pool de lecture ne voit pas la transaction.
+        for r in backend.query_many_strong("SELECT id, name FROM tags ORDER BY id", &[])? {
+            if let (Some(id), Some(nom)) = (
+                r.first().and_then(|v| v.as_i64()),
+                r.get(1).and_then(|v| v.as_string()),
+            ) {
+                par_nom.entry(tags_perso::cle_de_nom(&nom)).or_insert(id);
             }
         }
-        Ok(Self { repo, par_nom })
+        Ok(Self {
+            backend: backend.clone(),
+            repo,
+            par_nom,
+        })
     }
 
     pub fn id(&mut self, nom: &str) -> Result<i64, String> {
-        let cle = nom.to_lowercase();
+        let cle = tags_perso::cle_de_nom(nom);
         if let Some(id) = self.par_nom.get(&cle) {
             return Ok(*id);
         }
         let id = match self.repo.create(nom, None) {
             Ok(id) if id > 0 => id,
-            // Créé entre-temps par un autre chemin (nom UNIQUE) : relu.
+            // Créé entre-temps par un autre chemin (nom UNIQUE) : relu, par
+            // la connexion d'écriture (même raison que `new`).
             _ => self
-                .repo
-                .get_by_name(nom)?
-                .and_then(|t| t.id)
+                .backend
+                .query_many_strong(
+                    "SELECT id FROM tags WHERE name = ?",
+                    &[&nom as &dyn ToSqlValue],
+                )?
+                .first()
+                .and_then(|r| r.first())
+                .and_then(|v| v.as_i64())
                 .ok_or_else(|| format!("tag « {nom} » ni créé ni trouvé"))?,
         };
         self.par_nom.insert(cle, id);
@@ -233,7 +249,7 @@ pub fn albums_des_pistes(
             "SELECT DISTINCT album_id FROM tracks WHERE album_id IS NOT NULL AND id IN ({})",
             liste_ids(tranche)
         );
-        for a in ids(backend.query_many(&sql, &[])?) {
+        for a in ids(backend.query_many_strong(&sql, &[])?) {
             if a > 0 && !albums.contains(&a) {
                 albums.push(a);
             }
@@ -249,11 +265,11 @@ pub fn tags_voulus_pour_l_album(
     album_id: i64,
 ) -> Result<Vec<i64>, String> {
     let p1: [&dyn ToSqlValue; 1] = [&album_id];
-    let pistes = ids(backend.query_many("SELECT id FROM tracks WHERE album_id = ?", &p1)?);
+    let pistes = ids(backend.query_many_strong("SELECT id FROM tracks WHERE album_id = ?", &p1)?);
     if pistes.is_empty() {
         return Ok(Vec::new());
     }
-    let poses = backend.query_many(
+    let poses = backend.query_many_strong(
         "SELECT it.tag_id, it.item_id FROM item_tags it JOIN tracks t ON t.id = it.item_id \
          WHERE it.item_type = 'track' AND t.album_id = ?",
         &p1,
@@ -267,7 +283,7 @@ pub fn tags_voulus_pour_l_album(
             porteurs.entry(tag).or_default().insert(piste);
         }
     }
-    let mut marques = ids(backend.query_many(
+    let mut marques = ids(backend.query_many_strong(
         "SELECT DISTINCT s.tag_id FROM item_tags_scan s JOIN tracks t ON t.id = s.item_id \
          WHERE s.item_type = 'track' AND t.album_id = ?",
         &p1,

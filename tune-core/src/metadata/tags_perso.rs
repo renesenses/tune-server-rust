@@ -154,14 +154,43 @@ pub struct TagsPerso {
 /// resserrées, borné à [`MAX_LONGUEUR_TAG`] caractères. `None` s'il ne reste
 /// rien.
 pub fn nettoyer_nom_de_tag(brut: &str) -> Option<String> {
+    use unicode_normalization::UnicodeNormalization as _;
+    // NFC : « Café » décomposé (macOS, certains éditeurs) et composé donnent
+    // le même tag. Les caractères de FORMAT invisibles (BOM, largeur nulle,
+    // marques de sens) sont retirés, pas changés en espace : « Ca\u{200B}lme »
+    // est « Calme ».
     let une_ligne: String = brut
-        .chars()
+        .nfc()
+        .filter(|c| !est_caractere_de_format(*c))
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     let resserre = une_ligne.split_whitespace().collect::<Vec<_>>().join(" ");
     let borne: String = resserre.chars().take(MAX_LONGUEUR_TAG).collect();
     let borne = borne.trim().to_string();
     (!borne.is_empty()).then_some(borne)
+}
+
+/// Les caractères de format invisibles (catégorie Unicode `Cf` courante).
+fn est_caractere_de_format(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'
+            | '\u{061C}'
+            | '\u{180E}'
+            | '\u{200B}'..='\u{200F}'
+            | '\u{202A}'..='\u{202E}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{2066}'..='\u{206F}'
+            | '\u{FEFF}'
+    )
+}
+
+/// La clé de comparaison d'un nom de tag : nettoyé (NFC, sans caractère de
+/// format) puis en minuscules. « calme » existant sert pour « Calme » lu.
+pub fn cle_de_nom(nom: &str) -> String {
+    nettoyer_nom_de_tag(nom)
+        .unwrap_or_else(|| nom.to_string())
+        .to_lowercase()
 }
 
 fn cle_valide(brut: &str) -> Result<String, String> {
@@ -299,7 +328,7 @@ impl TagsPerso {
         let mut tags: Vec<String> = Vec::new();
         let mut vus: HashSet<String> = HashSet::new();
         let mut pousser = |t: String, tags: &mut Vec<String>| {
-            if tags.len() < MAX_TAGS_PAR_PISTE && vus.insert(t.to_lowercase()) {
+            if tags.len() < MAX_TAGS_PAR_PISTE && vus.insert(cle_de_nom(&t)) {
                 tags.push(t);
             }
         };
@@ -350,6 +379,18 @@ impl TagsPerso {
         }
         tags
     }
+}
+
+/// La valeur à ranger sous [`CLE_LUE`] pour un fichier dont les balises
+/// brutes sont `brutes` (`None` = lecture ratée). `None` = ne rien ranger :
+/// aucun réglage, ou fichier illisible — les tags que le scan avait posés
+/// RESTENT (la piste est sautée, comme dans la passe « Appliquer »). Sinon la
+/// liste, même vide : une liste vide RETIRE les tags du scan.
+pub fn valeur_lue(perso: &TagsPerso, brutes: Option<&[(String, String)]>) -> Option<String> {
+    if perso.est_vide() {
+        return None;
+    }
+    brutes.map(|b| encoder(&perso.tags_des_paires(b)))
 }
 
 /// Les noms de tags sous [`CLE_LUE`], tels que le scan les a rangés.
@@ -504,7 +545,9 @@ pub fn nom_utilisable(bloc: &str, cle: &str) -> Option<String> {
         "vorbis" | "ape" => Some(nom_de_cle(cle)),
         _ => None,
     };
-    nom.filter(|n| !n.is_empty())
+    // Seulement ce que le `PUT` du réglage acceptera (`cle_valide`) :
+    // l'aperçu ne propose pas une clé que « Ajouter » ferait refuser.
+    nom.filter(|n| !n.is_empty() && cle_valide(n).is_ok())
 }
 
 // ---------------------------------------------------------------------------
