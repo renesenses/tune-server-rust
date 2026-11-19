@@ -34,6 +34,20 @@
 //! sous MIT) ; aucune ligne de code n'en est reprise, seulement le principe
 //! des deux signatures.
 //!
+//! # Source altérée : tous les formats, CD compris (#9067)
+//!
+//! Décision de Bertrand du 19/11/2026 (fil 2915) : la rubrique « Hi-Res
+//! douteux » devient « Source altérée » et couvre aussi les CD. Un CD (16 bits,
+//! 44,1/48 kHz) n'est altéré que sur la signature d'un codec avec perte : une
+//! coupure EN MUR ([`en_mur`] : au moins [`MUR_DB`] de chute dans les
+//! [`MUR_LARGEUR_HZ`] au-dessus du bord) entre [`COUPURE_MUR_CD_MIN_HZ`] et
+//! [`COUPURE_LOSSY_MAX_HZ`] (un MP3 à 128 kbit/s coupe vers 16 kHz, à 320 vers
+//! 19-20 kHz) ; JAMAIS sur une pente douce avant 20 kHz (vieille bande, master
+//! sombre), ni sur une coupure qui n'est pas un mur. Les règles des fichiers
+//! qui se disent hi-res ne changent pas. Le mot rangé et publié reste
+//! `douteux` (compatibilité des clients) ; la raison d'un CD altéré est
+//! [`Raison::MurDeCodec`].
+//!
 //! # Ce que le verdict ne prétend pas
 //!
 //! Un hi-res « vérifié » porte du contenu au-dessus de 24 kHz et plus de
@@ -79,6 +93,24 @@ const SILENCE_DB: f64 = -150.0;
 /// Un 44,1/48 kHz coupé sous cette fréquence porte la signature d'un codec
 /// avec perte (MP3 à 128 kbit/s coupe vers 16 kHz, à 320 vers 20 kHz).
 pub const COUPURE_LOSSY_MAX_HZ: f64 = 20_500.0;
+
+/// #9067 — un CD n'est « source altérée » que si sa coupure en mur tombe à
+/// partir de cette fréquence (et sous [`COUPURE_LOSSY_MAX_HZ`]) : la plage des
+/// passe-bas d'encodeur (MP3/AAC de 96 à 320 kbit/s, 15 à 20 kHz). Plus bas,
+/// un mur est plus souvent un filtre de restauration (transfert de 78 tours)
+/// qu'un encodeur : le CD reste conforme.
+pub const COUPURE_MUR_CD_MIN_HZ: f64 = 15_000.0;
+
+/// #9067 — la largeur, en Hz, au-dessus du bord d'une coupure, au-delà de
+/// laquelle un MUR est déjà tombé de [`MUR_DB`].
+pub const MUR_LARGEUR_HZ: f64 = 1_000.0;
+
+/// #9067 — la chute minimale, en dB, d'un MUR : du niveau des 500 Hz sous le
+/// bord au plus haut de tout ce qui suit [`MUR_LARGEUR_HZ`] au-dessus, jusqu'à
+/// Nyquist. 40 dB en 1 kHz : le passe-bas d'un encodeur (rien au-dessus, que
+/// le bruit de quantification). Une pente naturelle ou un filtre analogique
+/// (12 à 48 dB par octave, soit 1 à 4 dB par kHz vers 18 kHz) en est très loin.
+pub const MUR_DB: f64 = 40.0;
 
 /// Un « hi-res » (plus de 48 kHz) coupé sous cette fréquence n'a jamais eu
 /// plus que la bande d'un CD ou d'un 48 kHz.
@@ -129,6 +161,10 @@ pub struct Mesure {
     /// #7859 — les fenêtres en cause, dans l'ordre du morceau, qu'elles
     /// suffisent ou non à rendre le morceau douteux.
     pub fenetres_coupees: Vec<FenetreCoupee>,
+    /// #9067 — la coupure suspecte retenue est un MUR ([`en_mur`]) dans au
+    /// moins la moitié des fenêtres en cause. Faux sans coupure suspecte
+    /// retenue.
+    pub coupure_en_mur: bool,
     /// #9035 — la part des cases (trame courte × bande de l'aigu) trouées
     /// sous la coupure retenue, quand une coupure suspecte sous
     /// [`COUPURE_LOSSY_MAX_HZ`] a été retenue et que l'aigu sous elle était
@@ -165,19 +201,70 @@ pub enum Raison {
     /// #9035 — la coupure, ET des trous intermittents sous elle, COMPATIBLES
     /// avec un encodeur avec perte ([`trous_de_codec`]) ; pas une preuve.
     SignatureDeCodec { coupure_hz: f64 },
+    /// #9067 — un CD (16 bits, 48 kHz au plus) coupé EN MUR à une fréquence
+    /// de passe-bas d'encodeur ([`COUPURE_MUR_CD_MIN_HZ`] à
+    /// [`COUPURE_LOSSY_MAX_HZ`]) : la signature d'un codec avec perte.
+    MurDeCodec { coupure_hz: f64 },
+}
+
+/// #9067 — la raison rangée et publiée d'un CD altéré ([`Raison::MurDeCodec`]).
+pub const RAISON_MUR_DE_CODEC: &str = "mur_de_codec";
+
+/// #9067 — la raison rangée sur un CD `conforme` dont une coupure suspecte a
+/// été mesurée SANS mur (pente, filtre doux) : jamais publiée (un conforme n'a
+/// pas de raison), elle dit seulement que la ligne a été jugée par la règle de
+/// #9067 et qu'il ne faut pas la remesurer.
+pub const RAISON_CD_SANS_MUR: &str = "coupure_sans_mur";
+
+/// #9067 — les raisons qui portent une fréquence de coupure.
+pub fn raison_de_coupure(code: &str) -> bool {
+    matches!(
+        raison_publiee(code),
+        "bande_de_cd" | "coupure_spectrale" | "signature_de_codec" | RAISON_MUR_DE_CODEC
+    )
+}
+
+/// #9067 — un fichier qui ne se dit PAS hi-res (16 bits au plus, 48 kHz au
+/// plus), en SQL sur l'alias `a` de `hires_verifications`.
+fn cd_sql(a: &str) -> String {
+    format!(
+        "{a}.sample_rate IS NOT NULL AND {a}.sample_rate <= 48000 \
+         AND COALESCE({a}.bits_declares, 16) <= 16"
+    )
 }
 
 /// #9067 — le verdict EFFECTIF d'une ligne de `hires_verifications`, en SQL
-/// (`alias` : l'alias de la table, `hv` ou `h`) : une ligne `douteux` rangée
-/// avant #9067 pour un fichier qui ne se dit pas hi-res (16 bits, 48 kHz au
-/// plus) se lit `conforme`. Les mesures déjà rangées sortent ainsi du compte
-/// « Hi-Res douteux » sans être refaites.
+/// (`alias` : l'alias de la table, `hv` ou `h`). Un CD (16 bits, 48 kHz au
+/// plus) n'est « source altérée » (`douteux`) que par un mur de codec
+/// ([`RAISON_MUR_DE_CODEC`], décision du 19/11) : une ligne `douteux` rangée
+/// pour un CD sous une autre raison (avant #9067, sur la seule coupure) se lit
+/// `conforme` jusqu'à sa remesure (`faux_hires_passe::A_REMESURER`).
 pub fn verdict_effectif_sql(alias: &str) -> String {
     format!(
-        "(CASE WHEN {a}.verdict = 'douteux' AND {a}.sample_rate IS NOT NULL \
-         AND {a}.sample_rate <= 48000 AND COALESCE({a}.bits_declares, 16) <= 16 \
+        "(CASE WHEN {a}.verdict = 'douteux' AND {cd} \
+         AND COALESCE({a}.raison, '') <> '{mur}' \
          THEN 'conforme' ELSE {a}.verdict END)",
-        a = alias
+        a = alias,
+        cd = cd_sql(alias),
+        mur = RAISON_MUR_DE_CODEC,
+    )
+}
+
+/// #9067 — la ligne d'un CD est-elle à REMESURER par la règle du 19/11 ? En
+/// SQL sur l'alias `a` : un CD rangé `douteux` sous une autre raison qu'un mur
+/// de codec (jugé sur la seule coupure, avant #9067), ou rangé `conforme` avec
+/// une coupure suspecte et sans raison (jugé du 18 au 19/11, sans regarder le
+/// mur). Une fois remesurée, la ligne porte [`RAISON_MUR_DE_CODEC`] ou
+/// [`RAISON_CD_SANS_MUR`] et n'est plus candidate.
+pub fn cd_a_remesurer_sql(alias: &str) -> String {
+    format!(
+        "({cd} AND ((({a}.verdict = 'douteux' AND COALESCE({a}.raison, '') <> '{mur}')) \
+         OR ({a}.verdict = 'conforme' AND {a}.raison IS NULL \
+             AND {a}.coupure_hz IS NOT NULL AND {a}.coupure_hz < {lossy}))))",
+        a = alias,
+        cd = cd_sql(alias),
+        mur = RAISON_MUR_DE_CODEC,
+        lossy = COUPURE_LOSSY_MAX_HZ,
     )
 }
 
@@ -231,6 +318,7 @@ impl Verdict {
             Verdict::Douteux(Raison::BandeDeCd { .. }) => Some("bande_de_cd"),
             Verdict::Douteux(Raison::CoupureSpectrale { .. }) => Some("coupure_spectrale"),
             Verdict::Douteux(Raison::SignatureDeCodec { .. }) => Some("signature_de_codec"),
+            Verdict::Douteux(Raison::MurDeCodec { .. }) => Some(RAISON_MUR_DE_CODEC),
             _ => None,
         }
     }
@@ -420,6 +508,31 @@ fn falaise(db_lisse: &[f64], sample_rate: u32) -> Option<f64> {
     Some(k as f64 * hz_par_raie)
 }
 
+/// #9067 — la coupure à `bord_hz` d'un spectre lissé est-elle un MUR ? Le
+/// niveau des 500 Hz sous le bord (médiane) dépasse d'au moins [`MUR_DB`] le
+/// plus haut de tout ce qui suit [`MUR_LARGEUR_HZ`] au-dessus du bord, jusqu'à
+/// Nyquist. Le passe-bas d'un encodeur ne laisse rien au-dessus de lui ; une
+/// pente douce, un filtre analogique ou le genou d'un filtre de mastering
+/// doux perdent quelques dB par kHz.
+pub(crate) fn en_mur(db_lisse: &[f64], sample_rate: u32, bord_hz: f64) -> bool {
+    let n = db_lisse.len();
+    let hz_par_raie = sample_rate as f64 / TAILLE_FFT as f64;
+    let bord = (bord_hz / hz_par_raie).round() as usize;
+    let dessous = bord.saturating_sub((500.0 / hz_par_raie).round() as usize)..bord.min(n);
+    let apres = bord + (MUR_LARGEUR_HZ / hz_par_raie).round() as usize;
+    if dessous.is_empty() || apres >= n {
+        return false;
+    }
+    let Some(niveau) = mediane(db_lisse[dessous].to_vec()) else {
+        return false;
+    };
+    let plafond = db_lisse[apres..]
+        .iter()
+        .copied()
+        .fold(f64::NEG_INFINITY, f64::max);
+    niveau - plafond >= MUR_DB
+}
+
 /// Mesure un passage décodé : échantillons entrelacés, à leur profondeur
 /// d'origine (`bits_declares`), comme les rend `decode::decode_to_pcm`.
 pub fn mesurer(echantillons: &[i32], canaux: u32, sample_rate: u32, bits_declares: u32) -> Mesure {
@@ -467,6 +580,7 @@ fn mesurer_selon(
     let mut bits = None;
     let mut jugees = 0u32;
     let mut coupees = Vec::new();
+    let mut murs = 0usize;
     let mut falaises_saines = Vec::new();
     for &(depart_s, echantillons) in tranches {
         // Le OU de tous les échantillons de toutes les tranches : le plus
@@ -487,11 +601,16 @@ fn mesurer_selon(
             }
             jugees += 1;
             match falaise(&lisse, sample_rate) {
-                Some(f) if coupure_suspecte(sample_rate, f) => coupees.push(FenetreCoupee {
-                    debut_s: depart_s + fenetre.start as f64 * s_par_trame,
-                    fin_s: depart_s + fenetre.end as f64 * s_par_trame,
-                    coupure_hz: f,
-                }),
+                Some(f) if coupure_suspecte(sample_rate, f) => {
+                    if en_mur(&lisse, sample_rate, f) {
+                        murs += 1;
+                    }
+                    coupees.push(FenetreCoupee {
+                        debut_s: depart_s + fenetre.start as f64 * s_par_trame,
+                        fin_s: depart_s + fenetre.end as f64 * s_par_trame,
+                        coupure_hz: f,
+                    })
+                }
                 Some(f) => falaises_saines.push(f),
                 None => {}
             }
@@ -505,10 +624,12 @@ fn mesurer_selon(
         silencieux: jugees == 0,
         fenetres_jugees: jugees,
         fenetres_coupees: coupees,
+        coupure_en_mur: false,
         part_trouee: None,
         signature_codec: false,
     };
     let retenue_suspecte = !m.fenetres_coupees.is_empty() && m.part_coupee() >= PART_COUPEE_MIN;
+    m.coupure_en_mur = retenue_suspecte && 2 * murs >= m.fenetres_coupees.len();
     m.coupure_hz = if retenue_suspecte {
         mediane(m.fenetres_coupees.iter().map(|c| c.coupure_hz).collect())
     } else {
@@ -810,12 +931,21 @@ pub fn juger(m: &Mesure) -> Verdict {
                 Verdict::Douteux(Raison::BandeDeCd { coupure_hz: f })
             }
         }
-        // #9067 (décision de Bertrand du 18/11, fil 2915) — un fichier qui ne
-        // se dit PAS hi-res (16 bits, 48 kHz au plus) n'est jamais « Hi-Res
-        // douteux » : il n'annonce rien que la coupure contredise. Seul un
-        // 24 bits à 44,1/48 kHz coupé sous la bande d'un CD l'est.
+        // Un 24 bits à 44,1/48 kHz coupé sous la bande d'un CD : règle hi-res.
         Some(f) if m.sample_rate <= 48_000 && f < COUPURE_LOSSY_MAX_HZ && se_dit_hires => {
             sous_le_cd(f)
+        }
+        // #9067 (décision de Bertrand du 19/11, fil 2915) — un CD (16 bits,
+        // 48 kHz au plus) n'est « source altérée » QUE sur la signature d'un
+        // codec avec perte : une coupure EN MUR dans la plage des passe-bas
+        // d'encodeur. Une pente douce, un filtre doux ou un mur plus bas que
+        // [`COUPURE_MUR_CD_MIN_HZ`] le laissent conforme.
+        Some(f)
+            if !se_dit_hires
+                && m.coupure_en_mur
+                && (COUPURE_MUR_CD_MIN_HZ..COUPURE_LOSSY_MAX_HZ).contains(&f) =>
+        {
+            Verdict::Douteux(Raison::MurDeCodec { coupure_hz: f })
         }
         _ if se_dit_hires => Verdict::Verifie,
         _ => Verdict::Conforme,
@@ -833,3 +963,7 @@ mod tests_7859;
 #[cfg(test)]
 #[path = "faux_hires_tests_9035.rs"]
 mod tests_9035;
+
+#[cfg(test)]
+#[path = "faux_hires_tests_9067.rs"]
+mod tests_9067;
