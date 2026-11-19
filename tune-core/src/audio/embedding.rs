@@ -1514,6 +1514,15 @@ fn corriger_le_temoin_de_lecture_en_base(
 ///   `save_play_state` a noté la mémoire avant d'écrire la base, donc son
 ///   « playing » a pu être écrasé : il est réécrit. Une autre zone qui démarre
 ///   n'est jamais touchée par l'UPDATE.
+/// - #9084 — témoin relu après CHAQUE écriture, jusqu'à ce qu'il confirme ce
+///   qui vient d'être écrit : si la zone a démarré puis a été ARRÊTÉE avant
+///   que la réécriture « playing » n'obtienne le verrou d'écriture, le
+///   « stopped » de `save_play_state` était passé en premier et la
+///   réécriture remettait « playing » à tort (base « playing », mémoire
+///   muette : ReplayGain et faux Hi-Res cédaient jusqu'à la correction
+///   suivante, 10 min). Le « stopped » est alors rétabli. Borné à
+///   [`TOURS_DE_CORRECTION_MAX`] écritures : une zone qui bascule sans cesse
+///   est laissée à la correction suivante.
 fn corriger_avec(
     backend: &Arc<dyn DbBackend>,
     zone_id: i64,
@@ -1524,15 +1533,32 @@ fn corriger_avec(
         return Err("une zone joue selon le témoin en mémoire".to_string());
     }
     let n = remettre_la_zone_a_stopped(backend, zone_id)?;
-    if la_zone_joue(zone_id) {
-        backend.execute(
-            "UPDATE zones SET last_play_state = 'playing' WHERE id = ?",
-            &[&zone_id as &dyn ToSqlValue],
-        )?;
-        return Err("la zone vient de démarrer : « playing » rétabli".to_string());
+    let mut ecrit_joue = false;
+    for _ in 0..TOURS_DE_CORRECTION_MAX {
+        let joue = la_zone_joue(zone_id);
+        if joue == ecrit_joue {
+            // Le témoin confirme la dernière écriture : la base est juste.
+            return if joue {
+                Err("la zone vient de démarrer : « playing » rétabli".to_string())
+            } else {
+                Ok(n)
+            };
+        }
+        if joue {
+            backend.execute(
+                "UPDATE zones SET last_play_state = 'playing' WHERE id = ?",
+                &[&zone_id as &dyn ToSqlValue],
+            )?;
+        } else {
+            remettre_la_zone_a_stopped(backend, zone_id)?;
+        }
+        ecrit_joue = joue;
     }
-    Ok(n)
+    Err("la zone change d'état pendant la correction : reportée".to_string())
 }
+
+/// #9084 — nombre maximal d'écritures d'une correction du témoin en base.
+const TOURS_DE_CORRECTION_MAX: usize = 4;
 
 /// Le dernier lot acoustique a-t-il rendu du travail ?
 ///
@@ -2670,6 +2696,54 @@ mod tests {
         // Personne ne joue : corrigée.
         assert_eq!(corriger_avec(&backend, 1, || false, |_| false), Ok(1));
         assert_eq!(zone_qui_joue_en_base(&backend), None);
+    }
+
+    /// #9084 — la zone démarre pendant la correction, puis l'utilisateur
+    /// l'arrête AVANT que la réécriture « playing » n'obtienne le verrou
+    /// d'écriture : le « stopped » de `save_play_state` est déjà en base, la
+    /// réécriture ne doit pas le recouvrir. Témoin séquencé : joue au premier
+    /// relevé, ne joue plus aux suivants.
+    #[test]
+    fn une_zone_arretee_pendant_la_reecriture_reste_stopped_9084() {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE zones (id INTEGER PRIMARY KEY, name TEXT, last_play_state TEXT);
+             INSERT INTO zones (id, name, last_play_state) VALUES (1, 'Salon', 'playing');",
+        )
+        .unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let releves = std::cell::Cell::new(0u32);
+        let la_zone_joue = |_: i64| {
+            releves.set(releves.get() + 1);
+            releves.get() == 1
+        };
+        let r = corriger_avec(&backend, 1, || false, la_zone_joue);
+        assert_eq!(
+            zone_qui_joue_en_base(&backend),
+            None,
+            "#9084 : base « playing » alors que plus aucune zone ne joue ({r:?})"
+        );
+        assert_eq!(r, Ok(1));
+    }
+
+    /// #9084 — une zone qui bascule sans cesse : la correction s'arrête
+    /// (bornée) au lieu de boucler.
+    #[test]
+    fn une_zone_qui_bascule_sans_cesse_ne_fait_pas_boucler_la_correction_9084() {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.execute_batch(
+            "CREATE TABLE zones (id INTEGER PRIMARY KEY, name TEXT, last_play_state TEXT);
+             INSERT INTO zones (id, name, last_play_state) VALUES (1, 'Salon', 'playing');",
+        )
+        .unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let releves = std::cell::Cell::new(0u32);
+        let bascule = |_: i64| {
+            releves.set(releves.get() + 1);
+            releves.get() % 2 == 1
+        };
+        assert!(corriger_avec(&backend, 1, || false, bascule).is_err());
+        assert!(releves.get() as usize <= TOURS_DE_CORRECTION_MAX);
     }
 
     #[test]
