@@ -343,11 +343,20 @@ fn ecrire_lot_ou_erreur(
     }
     let mut resolveur = Resolveur::new(backend)?;
     let mut bilan = Bilan::default();
+    let mut pistes: Vec<i64> = Vec::with_capacity(a_traiter.len());
     for (id, noms) in &a_traiter {
-        let voulus = resolveur.ids(noms)?;
+        // Un nom impossible à créer ou à retrouver n'arrête pas le lot : la
+        // piste est SAUTÉE (rien posé, rien retiré), les suivantes passent.
+        let voulus = match resolveur.ids(noms) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(track_id = id, error = %e, "tags_perso_nom_non_resolu_piste_sautee");
+                continue;
+            }
+        };
         bilan.ajouter(synchroniser(backend, "track", *id, &voulus)?);
+        pistes.push(*id);
     }
-    let pistes: Vec<i64> = a_traiter.iter().map(|(id, _)| *id).collect();
     let albums = albums_des_pistes(backend, &pistes)?;
     bilan.ajouter(synchroniser_albums(backend, &albums)?);
     Ok(bilan)
