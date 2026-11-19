@@ -102,9 +102,10 @@ pub(crate) struct Candidat {
     pub bit_depth: Option<i32>,
     /// La valeur `VERSION` commune aux pistes de l'album.
     pub version: Option<String>,
-    /// #8953 — l'album porte le marqueur de coffret (composé à la main ou
-    /// réuni automatiquement) : il est sa propre œuvre, jamais une version
-    /// d'un autre album.
+    /// #8953 — l'album est un coffret COMPOSÉ À LA MAIN : il est sa propre
+    /// œuvre, jamais une version d'un autre album. Un coffret réuni
+    /// automatiquement (« Disc 1 / Disc 2 » d'un même parent) reste un album
+    /// à plusieurs disques ordinaire, regroupé comme les autres (#7617).
     pub coffret: bool,
 }
 
@@ -292,7 +293,7 @@ pub(crate) fn regrouper(
             c.groupe_mb.as_deref().filter(|g| !g.is_empty()),
             c.artist_id,
         ) {
-            // 🔴 #8953 (fil 2884) — un COFFRET n'est la version de rien. Son
+            // 🔴 #8953 (fil 2884) — un coffret MANUEL n'est la version de rien. Son
             // titre composé perd ce qui distinguait ses disques (« …(50th
             // Anniversary)(Stereo) [DSD64 …] » devient « …(50th
             // Anniversary) ») : sa clé de titre retombait sur celle de
@@ -422,12 +423,19 @@ fn versions_des_albums(state: &AppState) -> HashMap<i64, String> {
         .collect()
 }
 
-/// #8953 — les albums qui portent le marqueur de coffret (`album_metadata`,
-/// clé `coffret`), composés à la main ou réunis automatiquement. Une base
+/// #8953 — les coffrets COMPOSÉS À LA MAIN (marqueur `coffret`, origine
+/// `manuel`). Les coffrets réunis automatiquement n'y sont pas : un « Disc 1 /
+/// Disc 2 » rangé en dossiers est un album double ordinaire, et l'exclure de
+/// sa clé MusicBrainz casserait les regroupements de #7617 (The Wall 2 CD et
+/// sa version hi-res) selon le seul rangement en dossiers. Une base
 /// illisible rend l'ensemble vide : le regroupement d'avant, journalisé.
 fn albums_coffrets(state: &AppState) -> HashSet<i64> {
     match tune_core::db::coffrets_auto::marqueurs(&state.backend) {
-        Ok(m) => m.into_keys().collect(),
+        Ok(m) => m
+            .into_iter()
+            .filter(|(_, marqueur)| marqueur.est_manuel())
+            .map(|(id, _)| id)
+            .collect(),
         Err(e) => {
             tracing::warn!(error = %e, "oeuvres_marqueurs_coffret_illisibles");
             HashSet::new()

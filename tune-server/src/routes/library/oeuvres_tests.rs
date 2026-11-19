@@ -926,6 +926,19 @@ async fn un_coffret_compose_n_est_replie_sous_aucune_autre_carte_8953() {
     assert_eq!(statut, StatusCode::OK, "{fiche}");
     assert_eq!(ids(&fiche), vec![stereo], "{fiche}");
     assert_eq!(fiche["method"], json!("single"), "{fiche}");
+    // L'œuvre DSOTM garde ses éditions : le coffret n'y entre pas, et il
+    // n'en retire rien.
+    let (statut, dsotm) = appeler(
+        &b.state,
+        "GET",
+        &format!("/api/v1/library/albums/{}/versions", b.dsotm),
+        None,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{dsotm}");
+    let mut attendu = vec![b.dsotm, b.dsotm_sacd];
+    attendu.sort();
+    assert_eq!(ids(&dsotm), attendu, "{dsotm}");
 
     for url in [
         "/api/v1/library/albums?limit=500&sort=title".to_string(),
@@ -998,4 +1011,54 @@ async fn sans_marqueur_le_meme_titre_rejoint_l_oeuvre_contre_epreuve_8953() {
         ids(&fiche).contains(&b.dsotm),
         "sans marqueur, le coffret doit rejoindre l'œuvre DSOTM : {fiche}"
     );
+}
+
+/// Un album de DSOTM, du groupe MusicBrainz de l'œuvre, marqué coffret
+/// d'origine `origine`.
+fn coffret_marque(b: &Banc, origine: &str) -> i64 {
+    let floyd = artiste_de(b, b.dsotm);
+    let id = album(
+        &b.state,
+        "The Dark Side of the Moon (Immersion Box Set)",
+        floyd,
+        Some("rg-dsotm"),
+        48_000,
+    );
+    let marqueur = json!({ "origine": origine, "cle": "dsotm-immersion" }).to_string();
+    tune_core::db::album_metadata_repo::AlbumMetadataRepo::with_backend(b.state.backend.clone())
+        .set(id, tune_core::db::coffrets_auto::CLE_COFFRET, &marqueur)
+        .unwrap();
+    id
+}
+
+async fn ids_de_l_oeuvre(b: &Banc, album: i64) -> Vec<i64> {
+    let (statut, fiche) = appeler(
+        &b.state,
+        "GET",
+        &format!("/api/v1/library/albums/{album}/versions"),
+        None,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{fiche}");
+    ids(&fiche)
+}
+
+/// Relecture de #9217 — un coffret AUTO (« Disc 1 / Disc 2 » réunis) est un
+/// album à plusieurs disques ordinaire : avec le groupe MusicBrainz de
+/// l'œuvre, il y reste (#7617).
+#[tokio::test]
+async fn un_coffret_auto_du_groupe_mb_reste_dans_son_oeuvre_8953() {
+    let b = banc();
+    let auto = coffret_marque(&b, "auto");
+    assert!(ids_de_l_oeuvre(&b, b.dsotm).await.contains(&auto));
+}
+
+/// Contre-épreuve : le même album, marqué coffret MANUEL, sort de l'œuvre.
+/// Sans elle, le témoin auto passerait aussi si le marqueur était ignoré.
+#[tokio::test]
+async fn le_meme_album_en_coffret_manuel_sort_de_l_oeuvre_contre_epreuve_8953() {
+    let b = banc();
+    let manuel = coffret_marque(&b, "manuel");
+    assert!(!ids_de_l_oeuvre(&b, b.dsotm).await.contains(&manuel));
+    assert_eq!(ids_de_l_oeuvre(&b, manuel).await, vec![manuel]);
 }

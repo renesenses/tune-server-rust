@@ -398,10 +398,18 @@ fn rogner_separateurs(s: &str) -> String {
             _ => None,
         };
         if let Some(o) = ouvrant {
-            let avant = &socle[..socle.len() - 1];
-            let ouverts = avant.iter().filter(|&&x| x == o).count();
-            let fermes = avant.iter().filter(|&&x| x == c).count();
-            if ouverts > fermes {
+            // Appariement par PILE, pas par comptage : dans « Foo) (Bar) »,
+            // le « ) » de « Foo) » est orphelin et ne referme rien ; le
+            // dernier « ) » referme « (Bar » et reste.
+            let mut ouverts = 0usize;
+            for &x in &socle[..socle.len() - 1] {
+                if x == o {
+                    ouverts += 1;
+                } else if x == c {
+                    ouverts = ouverts.saturating_sub(1);
+                }
+            }
+            if ouverts > 0 {
                 break;
             }
         }
@@ -1175,6 +1183,12 @@ mod tests {
         assert_eq!(
             titre_commun(&t(&["Works [Deluxe] - Disc 1", "Works [Deluxe] - Disc 2"])),
             Some("Works [Deluxe]".to_string())
+        );
+        // Appariement par pile : le « ) » orphelin de « Foo) » ne compte
+        // pas, le dernier referme « (Bar » et reste.
+        assert_eq!(
+            titre_commun(&t(&["Foo) (Bar) CD1", "Foo) (Bar) CD2"])),
+            Some("Foo) (Bar)".to_string())
         );
     }
 
