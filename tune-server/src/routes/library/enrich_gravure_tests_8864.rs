@@ -134,7 +134,7 @@ async fn pg_gravure_conserve_enrichissement_8864() {
             .unwrap();
         let sep = if url.contains('?') { '&' } else { '?' };
         let config = crate::config::TuneConfig {
-            database_url: Some(format!("{url}{sep}options=-csearch_path%3D{schema}")),
+            database_url: Some(format!("{url}{sep}options=-csearch_path%3D{schema},public")),
             ..Default::default()
         };
         let state = AppState::new(":memory:", 0, config).unwrap();
