@@ -1022,54 +1022,79 @@ pub fn borner_points_onde(points: usize) -> usize {
     points.clamp(ONDE_POINTS_MIN, ONDE_POINTS_MAX)
 }
 
-/// L'enveloppe RMS de `samples` (mono, à n'importe quelle échelle entière)
-/// en `points` tranches, normalisée à la plus forte (1,0) et arrondie au
-/// dix-millième. Vide quand il y a moins d'échantillons que de points.
-///
-/// Les tranches couvrent TOUS les échantillons (bornes `i·n/points`) : la fin
-/// de la piste n'est pas tronquée. Le calcul ne copie pas le PCM (une piste
-/// d'une heure à 22 050 Hz, c'est 79 M d'échantillons).
-pub fn enveloppe_rms(samples: &[i32], points: usize) -> Vec<f32> {
-    let n = samples.len();
-    if points == 0 || n < points {
+/// L'enveloppe RMS de la barre de lecture tirée d'une forme d'onde : par
+/// colonne, la RMS de tous les canaux (moyenne des énergies), normalisée à la
+/// plus forte (1,0) et arrondie au dix-millième. Une piste plus courte que le
+/// nombre de colonnes demandé rend une onde plus courte (une colonne par
+/// échantillon), pas une onde vide.
+pub fn enveloppe_des_voies(f: &super::forme_onde::FormeOnde) -> Vec<f32> {
+    let n = f.voies.iter().map(|v| v.rms.len()).min().unwrap_or(0);
+    if n == 0 {
         return Vec::new();
     }
-    let mut rms_values: Vec<f64> = (0..points)
-        .map(|i| {
-            let start = (i as u128 * n as u128 / points as u128) as usize;
-            let end = ((i as u128 + 1) * n as u128 / points as u128) as usize;
-            let frame = &samples[start..end.max(start + 1).min(n)];
-            let mean_sq =
-                frame.iter().map(|&s| (s as f64) * (s as f64)).sum::<f64>() / frame.len() as f64;
-            mean_sq.sqrt()
+    let canaux = f.voies.len() as f64;
+    let mut rms: Vec<f64> = (0..n)
+        .map(|j| {
+            let energie: f64 = f
+                .voies
+                .iter()
+                .map(|v| f64::from(v.rms[j]) * f64::from(v.rms[j]))
+                .sum();
+            (energie / canaux).sqrt()
         })
         .collect();
-
-    let max_rms = rms_values.iter().cloned().fold(0.0_f64, f64::max);
-    if max_rms > 0.0 {
-        for v in &mut rms_values {
-            *v /= max_rms;
+    let max = rms.iter().cloned().fold(0.0_f64, f64::max);
+    if max > 0.0 {
+        for v in &mut rms {
+            *v /= max;
         }
     }
-
-    rms_values
-        .iter()
+    rms.iter()
         .map(|v| (*v as f32 * 10000.0).round() / 10000.0)
         .collect()
 }
 
 /// L'enveloppe de la barre de lecture d'un fichier, ou d'une TRANCHE de
 /// fichier (`seek_s`, `duree_s` ; `0.0` = jusqu'au bout) — la piste d'une
-/// feuille CUE dans son image. BLOQUANT : décode tout ce qu'il faut lire ;
-/// à appeler hors de l'exécuteur async. Vide si le fichier est illisible.
-pub fn onde_du_fichier(file_path: &str, points: usize, seek_s: f64, duree_s: f64) -> Vec<f32> {
-    match super::decode::decode_to_pcm(file_path, Some(22050), Some(1), seek_s, duree_s) {
-        Ok(decoded) => enveloppe_rms(&decoded.samples_i32, points),
+/// feuille CUE dans son image. `duree_connue_s` : la durée du fichier quand
+/// on la connaît (dimensionne les cases ; sans elle, elles grossissent en
+/// route).
+///
+/// MÉMOIRE BORNÉE (relecture de server#9182) : le décodage passe par
+/// fenêtres de [`super::forme_onde::FENETRE_S`] secondes, réduites en cases
+/// à mesure (`forme_onde::calculer`, celui de la fiche technique) — une piste
+/// d'une heure ne tient jamais en entier en mémoire. Avant, la piste entière
+/// était décodée d'un bloc (≈ 1,3 Go pour une heure de CD).
+///
+/// BLOQUANT : à appeler hors de l'exécuteur async. Vide si le fichier est
+/// illisible.
+pub fn onde_du_fichier_avec(
+    file_path: &str,
+    points: usize,
+    seek_s: f64,
+    duree_s: f64,
+    duree_connue_s: Option<f64>,
+) -> Vec<f32> {
+    let duree = (duree_s > 0.0).then_some(duree_s);
+    match super::forme_onde::calculer(
+        file_path,
+        points.max(1),
+        seek_s,
+        duree,
+        duree_connue_s,
+        &|| true,
+    ) {
+        Ok(f) => enveloppe_des_voies(&f),
         Err(e) => {
             warn!(file = file_path, error = %e, "waveform_decode_failed");
             Vec::new()
         }
     }
+}
+
+/// [`onde_du_fichier_avec`] sans durée connue.
+pub fn onde_du_fichier(file_path: &str, points: usize, seek_s: f64, duree_s: f64) -> Vec<f32> {
+    onde_du_fichier_avec(file_path, points, seek_s, duree_s, None)
 }
 
 /// [`onde_du_fichier`] sur le fichier entier, hors de l'exécuteur async.
@@ -1709,36 +1734,63 @@ mod tests {
     // Existing tests (preserved)
     // -----------------------------------------------------------------------
 
-    /// Fil 2954 — la résolution demandée est respectée, les tranches
-    /// couvrent toute la piste et la plus forte vaut 1.
+    fn forme_mono(samples: &[f32], colonnes: usize) -> crate::audio::forme_onde::FormeOnde {
+        let mut acc = crate::audio::forme_onde::Accumulateur::new(
+            22_050,
+            1,
+            colonnes,
+            Some(samples.len() as u64),
+        );
+        acc.pousser(samples);
+        acc.terminer()
+    }
+
+    /// Fil 2954 — la résolution demandée est respectée et la plus forte
+    /// colonne vaut 1.
     #[test]
-    fn enveloppe_rms_rend_le_nombre_de_points_demande() {
-        // 10 000 échantillons : la première moitié à 1 000, la seconde à 4 000.
-        let samples: Vec<i32> = (0..10_000)
-            .map(|i| if i < 5_000 { 1_000 } else { -4_000 })
+    fn enveloppe_des_voies_rend_le_nombre_de_points_demande() {
+        // 100 000 échantillons : la première moitié à 0,1, la seconde à 0,4.
+        let samples: Vec<f32> = (0..100_000)
+            .map(|i| if i < 50_000 { 0.1 } else { -0.4 })
             .collect();
         for points in [100usize, 200, 1000, 2000] {
-            let e = enveloppe_rms(&samples, points);
+            let e = enveloppe_des_voies(&forme_mono(&samples, points));
             assert_eq!(e.len(), points);
-            assert!((e[0] - 0.25).abs() < 1e-4, "{points} : {}", e[0]);
+            assert!((e[0] - 0.25).abs() < 1e-3, "{points} : {}", e[0]);
             assert!((e[points - 1] - 1.0).abs() < 1e-4);
             assert!(e.iter().all(|v| (0.0..=1.0).contains(v)));
         }
-        // La dernière tranche n'est pas perdue quand n n'est pas un multiple.
-        let mut s = vec![0i32; 1_001];
-        s[1_000] = 500;
-        let e = enveloppe_rms(&s, 1000);
-        assert_eq!(e.len(), 1000);
-        assert!(e[999] > 0.0, "le dernier échantillon compte");
     }
 
+    /// Relecture de server#9182 — une piste plus courte que la résolution
+    /// rend une onde courte, pas une onde vide ; un silence, des zéros.
     #[test]
-    fn enveloppe_rms_vide_si_trop_peu_d_echantillons() {
-        assert!(enveloppe_rms(&[1, 2, 3], 1000).is_empty());
-        assert!(enveloppe_rms(&[1, 2, 3], 0).is_empty());
-        // Silence : tout à zéro, pas de NaN.
-        let e = enveloppe_rms(&vec![0; 2_000], 1000);
+    fn enveloppe_courte_ou_silencieuse() {
+        let court: Vec<f32> = (0..300).map(|i| if i < 150 { 0.0 } else { 0.5 }).collect();
+        let e = enveloppe_des_voies(&forme_mono(&court, 1000));
+        assert!(!e.is_empty() && e.len() <= 300, "{}", e.len());
+        assert_eq!(e[0], 0.0);
+        assert_eq!(*e.last().unwrap(), 1.0);
+        let e = enveloppe_des_voies(&forme_mono(&vec![0.0; 5_000], 1000));
+        assert_eq!(e.len(), 1000);
         assert!(e.iter().all(|v| *v == 0.0));
+    }
+
+    /// Deux canaux : la RMS de l'ensemble (moyenne des énergies).
+    #[test]
+    fn enveloppe_stereo_moyenne_des_energies() {
+        let mut acc = crate::audio::forme_onde::Accumulateur::new(22_050, 2, 10, Some(10_000));
+        let mut entrelaces = Vec::new();
+        for i in 0..10_000 {
+            let fort = i >= 5_000;
+            entrelaces.push(if fort { 0.6 } else { 0.3 });
+            entrelaces.push(0.0);
+        }
+        acc.pousser(&entrelaces);
+        let e = enveloppe_des_voies(&acc.terminer());
+        assert_eq!(e.len(), 10);
+        assert!((e[0] - 0.5).abs() < 1e-3, "{e:?}");
+        assert!((e[9] - 1.0).abs() < 1e-4);
     }
 
     #[test]
@@ -1807,6 +1859,77 @@ mod tests {
         assert!(fin.iter().all(|v| *v > 0.9), "{fin:?}");
 
         assert_eq!(generate_waveform(chemin, 100).await, entier);
+    }
+
+    /// Relecture de server#9182 — MÉMOIRE BORNÉE : une heure de PCM CD
+    /// stéréo (635 Mo de WAV) ; décodée d'un bloc, elle demandait plus d'un
+    /// gigaoctet. Lancé à la main (`--ignored --test-threads=1`, Linux) : il
+    /// mesure le pic de mémoire du processus (VmHWM).
+    #[test]
+    #[ignore]
+    fn onde_d_une_heure_en_memoire_bornee() {
+        fn vm_hwm_ko() -> u64 {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("VmHWM:"))
+                        .and_then(|l| l.split_whitespace().nth(1)?.parse().ok())
+                })
+                .unwrap_or(0)
+        }
+        use std::io::Write;
+        const HZ: u32 = 44_100;
+        let secondes = 3600u32;
+        let dir = tempfile::TempDir::new().unwrap();
+        let f = dir.path().join("heure.wav");
+        let octets = secondes * HZ * 4;
+        let mut w = std::io::BufWriter::new(std::fs::File::create(&f).unwrap());
+        w.write_all(b"RIFF").unwrap();
+        w.write_all(&(36 + octets).to_le_bytes()).unwrap();
+        w.write_all(b"WAVEfmt ").unwrap();
+        w.write_all(&16u32.to_le_bytes()).unwrap();
+        w.write_all(&1u16.to_le_bytes()).unwrap();
+        w.write_all(&2u16.to_le_bytes()).unwrap();
+        w.write_all(&HZ.to_le_bytes()).unwrap();
+        w.write_all(&(HZ * 4).to_le_bytes()).unwrap();
+        w.write_all(&4u16.to_le_bytes()).unwrap();
+        w.write_all(&16u16.to_le_bytes()).unwrap();
+        w.write_all(b"data").unwrap();
+        w.write_all(&octets.to_le_bytes()).unwrap();
+        let mut trame = [0u8; 4];
+        for i in 0..(secondes * HZ) {
+            let v = ((i % 100) as i16 - 50) * 300;
+            trame[..2].copy_from_slice(&v.to_le_bytes());
+            trame[2..].copy_from_slice(&v.to_le_bytes());
+            w.write_all(&trame).unwrap();
+        }
+        w.flush().unwrap();
+        drop(w);
+        let avant = vm_hwm_ko();
+        let t = std::time::Instant::now();
+        let e = onde_du_fichier_avec(
+            f.to_str().unwrap(),
+            1000,
+            0.0,
+            0.0,
+            Some(f64::from(secondes)),
+        );
+        let apres = vm_hwm_ko();
+        eprintln!(
+            "onde 1 h CD : {} points en {:?}, VmHWM {} Mo -> {} Mo (+{} Mo)",
+            e.len(),
+            t.elapsed(),
+            avant / 1024,
+            apres / 1024,
+            apres.saturating_sub(avant) / 1024
+        );
+        assert_eq!(e.len(), 1000);
+        assert!(
+            apres.saturating_sub(avant) < 200 * 1024,
+            "pic de mémoire : +{} Mo",
+            apres.saturating_sub(avant) / 1024
+        );
     }
 
     #[test]

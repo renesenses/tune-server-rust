@@ -163,7 +163,11 @@ impl Accumulateur {
         let colonnes = colonnes.max(1);
         let taille_case = trames_estimees
             .map(|t| t / (2 * colonnes as u64))
-            .unwrap_or(256)
+            // Sans durée connue, des cases d'une trame qui doublent en route
+            // (la mémoire reste bornée à `4 × colonnes` cases) : une piste
+            // courte garde toutes ses colonnes (relecture de server#9182 —
+            // à 256 trames la case, 4 s rendaient 345 colonnes sur 1 000).
+            .unwrap_or(1)
             .max(1);
         Self {
             canaux,

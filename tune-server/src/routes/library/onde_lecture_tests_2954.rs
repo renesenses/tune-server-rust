@@ -89,18 +89,38 @@ impl Banc {
     }
 
     async fn demander(&self, id: i64, points: Option<usize>) -> (StatusCode, Value) {
-        let r = servir(
+        let (statut, _, v) = self
+            .demander_texte(id, points.map(|n| n.to_string()), &places(2))
+            .await;
+        (statut, v)
+    }
+
+    /// `points` tel que la requête le porte, et un sémaphore propre au test
+    /// (celui de la route est partagé avec les autres bancs du processus).
+    async fn demander_texte(
+        &self,
+        id: i64,
+        points: Option<String>,
+        places: &Arc<tokio::sync::Semaphore>,
+    ) -> (StatusCode, Option<String>, Value) {
+        let r = servir_avec(
             &self.state,
             id,
             Parametres { points },
             self.cache.path(),
             PLAFOND_DEFAUT_OCTETS,
+            places,
         )
         .await;
         let statut = r.status();
+        let reessai = r
+            .headers()
+            .get("retry-after")
+            .map(|v| v.to_str().unwrap().to_string());
         let corps = to_bytes(r.into_body(), usize::MAX).await.unwrap();
         (
             statut,
+            reessai,
             serde_json::from_slice(&corps).unwrap_or(Value::Null),
         )
     }
@@ -122,6 +142,10 @@ impl Banc {
         v.sort();
         v
     }
+}
+
+fn places(n: usize) -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(n))
 }
 
 fn onde(v: &Value) -> Vec<f64> {
@@ -294,13 +318,175 @@ async fn sans_fichier_ou_inconnue() {
     assert_eq!(v["waveform"], Value::Null);
     assert_eq!(v["error"], "no file path");
 
-    let r = servir(
+    let r = servir_avec(
         &banc.state,
         999,
-        Parametres { points: Some(1000) },
+        Parametres {
+            points: Some("1000".into()),
+        },
         banc.cache.path(),
         PLAFOND_DEFAUT_OCTETS,
+        &places(2),
     )
     .await;
     assert_eq!(r.status(), StatusCode::NOT_FOUND);
+}
+
+/// Relecture de server#9182 — une valeur illisible est refusée, pas
+/// ramenée à 200 en silence ; vide = l'ancien contrat.
+#[tokio::test]
+async fn points_illisible_400() {
+    let banc = Banc::new();
+    banc.piste(30);
+    for mauvais in ["abc", "-5", "1.5", "1e3"] {
+        let (statut, _, _) = banc
+            .demander_texte(30, Some(mauvais.into()), &places(2))
+            .await;
+        assert_eq!(statut, StatusCode::BAD_REQUEST, "{mauvais}");
+    }
+    let (statut, _, v) = banc.demander_texte(30, Some(" ".into()), &places(2)).await;
+    assert_eq!(statut, StatusCode::OK);
+    assert_eq!(v["points"], 200);
+}
+
+/// Relecture de server#9182 — pas de file d'attente : sans place libre,
+/// « pas encore » tout de suite, avec Retry-After ; rien n'est calculé.
+#[tokio::test]
+async fn sans_place_libre_pas_encore_tout_de_suite() {
+    let banc = Banc::new();
+    banc.piste(31);
+    let aucune = places(0);
+    let t = std::time::Instant::now();
+    let (statut, reessai, v) = banc.demander_texte(31, Some("1000".into()), &aucune).await;
+    assert!(
+        t.elapsed() < std::time::Duration::from_secs(2),
+        "aucune attente"
+    );
+    assert_eq!(statut, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(reessai.as_deref(), Some("3"));
+    assert_eq!(v["pending"], true);
+    assert_eq!(v["raison"], "occupe");
+    assert!(banc.fichiers_du_cache().is_empty());
+    // Une place se libère : l'onde vient.
+    let (statut, _, v) = banc
+        .demander_texte(31, Some("1000".into()), &places(1))
+        .await;
+    assert_eq!(statut, StatusCode::OK);
+    assert_eq!(onde(&v).len(), 1000);
+}
+
+/// Relecture de server#9182 — une seule tâche par clé : la même onde déjà
+/// en calcul rend « pas encore » ; une autre résolution, elle, se calcule.
+#[tokio::test]
+async fn meme_onde_deja_en_calcul_pas_encore() {
+    let banc = Banc::new();
+    let chemin = banc.piste(32);
+    let track = TrackRepo::with_backend(banc.state.backend.clone())
+        .get(32)
+        .unwrap()
+        .unwrap();
+    let source = source_de(&track).unwrap();
+    assert_eq!(source.chemin, chemin.to_string_lossy());
+    let meta = std::fs::metadata(&chemin).unwrap();
+    let reservee = Reservation::prendre(&nom_en_cache(32, &source, &meta, 1000)).unwrap();
+    let (statut, reessai, v) = banc
+        .demander_texte(32, Some("1000".into()), &places(2))
+        .await;
+    assert_eq!(statut, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(reessai.as_deref(), Some("3"));
+    assert_eq!(v["raison"], "en_cours");
+    let (statut, _, _) = banc
+        .demander_texte(32, Some("500".into()), &places(2))
+        .await;
+    assert_eq!(statut, StatusCode::OK, "une autre clé n'est pas bloquée");
+    drop(reservee);
+    let (statut, _, v) = banc
+        .demander_texte(32, Some("1000".into()), &places(2))
+        .await;
+    assert_eq!(statut, StatusCode::OK);
+    assert_eq!(onde(&v).len(), 1000);
+}
+
+/// Relecture de server#9182 — une piste plus courte que la résolution rend
+/// une onde courte, pas « file unreadable ».
+#[tokio::test]
+async fn piste_tres_courte_onde_courte() {
+    let banc = Banc::new();
+    let chemin = banc.dossier.path().join("court.wav");
+    // 300 échantillons (14 ms) : moins que les 1 000 points demandés.
+    let mut donnees = Vec::new();
+    for i in 0..300i32 {
+        let v: i16 = if i % 2 == 0 { 10_000 } else { -10_000 };
+        donnees.extend_from_slice(&v.to_le_bytes());
+    }
+    let mut w = Vec::new();
+    w.extend_from_slice(b"RIFF");
+    w.extend_from_slice(&(36u32 + donnees.len() as u32).to_le_bytes());
+    w.extend_from_slice(b"WAVEfmt ");
+    w.extend_from_slice(&16u32.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes());
+    w.extend_from_slice(&1u16.to_le_bytes());
+    w.extend_from_slice(&(HZ as u32).to_le_bytes());
+    w.extend_from_slice(&((HZ * 2) as u32).to_le_bytes());
+    w.extend_from_slice(&2u16.to_le_bytes());
+    w.extend_from_slice(&16u16.to_le_bytes());
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&(donnees.len() as u32).to_le_bytes());
+    w.extend_from_slice(&donnees);
+    std::fs::write(&chemin, w).unwrap();
+    banc.state
+        .backend
+        .execute(
+            "INSERT INTO tracks (id, title, file_path, duration_ms, source) VALUES (33, 'court', ?, 14, 'local')",
+            &[&chemin.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+    let (statut, v) = banc.demander(33, Some(1000)).await;
+    assert_eq!(statut, StatusCode::OK);
+    let o = onde(&v);
+    assert!(!o.is_empty() && o.len() <= 300, "{} points", o.len());
+}
+
+/// Relecture de server#9182 — un `.json.part` orphelin (plus de 10 min)
+/// part ; un provisoire récent (écriture en cours) reste.
+#[test]
+fn provisoires_orphelins_effaces() {
+    let dir = tempfile::tempdir().unwrap();
+    let vieux = dir.path().join("1-abc-1000.json.part");
+    let jeune = dir.path().join("2-abc-1000.json.part");
+    let onde = dir.path().join("3-abc-1000.json");
+    for f in [&vieux, &jeune, &onde] {
+        std::fs::write(f, b"[0.5]").unwrap();
+    }
+    let il_y_a_une_heure = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&vieux)
+        .unwrap()
+        .set_modified(il_y_a_une_heure)
+        .unwrap();
+    assert_eq!(purger_les_provisoires(dir.path()), 1);
+    assert!(!vieux.exists());
+    assert!(jeune.exists());
+    assert!(onde.exists());
+}
+
+/// L'empreinte ne dépend que du chemin, de la taille et de la date.
+#[test]
+fn empreinte_stable_deterministe() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("a.wav");
+    std::fs::write(&f, b"0123").unwrap();
+    let quand = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+    std::fs::File::options()
+        .write(true)
+        .open(&f)
+        .unwrap()
+        .set_modified(quand)
+        .unwrap();
+    let c = f.to_str().unwrap();
+    let a = empreinte_stable(c, &std::fs::metadata(&f).unwrap());
+    assert_eq!(a, empreinte_stable(c, &std::fs::metadata(&f).unwrap()));
+    std::fs::write(&f, b"01234").unwrap();
+    assert_ne!(a, empreinte_stable(c, &std::fs::metadata(&f).unwrap()));
 }

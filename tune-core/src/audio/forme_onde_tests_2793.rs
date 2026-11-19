@@ -321,3 +321,20 @@ fn sinus_grave_normalise_n_est_pas_ecrete() {
     };
     assert_eq!(f.ecretes, 0, "{:?}", f.voies[0].colonnes_ecretees);
 }
+
+/// Relecture de server#9182 — sans durée connue, une piste courte (4 s à
+/// 22 050 Hz) garde toutes les colonnes demandées.
+#[test]
+fn piste_courte_sans_duree_connue_garde_ses_colonnes() {
+    let n = 4 * 22_050;
+    let signal: Vec<f32> = (0..n)
+        .map(|i| if i % 2 == 0 { 0.5 } else { -0.5 })
+        .collect();
+    let mut acc = Accumulateur::new(22_050, 1, 1000, None);
+    for morceau in signal.chunks(7919) {
+        acc.pousser(morceau);
+    }
+    let f = acc.terminer();
+    assert_eq!(f.colonnes, 1000);
+    assert_eq!(f.voies[0].rms.len(), 1000);
+}
