@@ -412,20 +412,23 @@ async fn tout_suspendu_le_corps_general_est_resservi_puis_recompte_a_la_reprise(
     let mut essais = 0;
     loop {
         essais += 1;
+        // La première lecture compte (ou reprend le relevé d'un essai
+        // précédent) ; la seconde, sans scan entre les deux, ne compte pas.
         let scan = tune_core::scanner::activite::scan_bibliotheque_en_cours;
-        let avant = appels.load(Ordering::SeqCst);
         let v1 = corps_general(&releve, "t", &state.backend, lire(1))
             .await
             .ok()
             .unwrap();
+        let apres_v1 = appels.load(Ordering::SeqCst);
         let sans_scan = !scan();
         let v2 = corps_general(&releve, "t", &state.backend, lire(2))
             .await
             .ok()
             .unwrap();
         if sans_scan && !scan() {
+            assert!(apres_v1 >= 1, "un relevé a été pris après la pause");
             assert_eq!(v1, v2, "tout suspendu, même révision : resservi");
-            assert_eq!(appels.load(Ordering::SeqCst), avant + 1);
+            assert_eq!(appels.load(Ordering::SeqCst), apres_v1);
             break;
         }
         assert!(essais < 50, "un scan tourne sans fin dans le processus");
