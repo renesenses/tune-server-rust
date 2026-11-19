@@ -107,6 +107,8 @@ async fn create(
     tune_core::confidentialite::retenir_identifiants_du_serveur(&SettingsRepo::with_backend(
         state.backend.clone(),
     ));
+    // #9140 — ni les noms d'appareils et de zones.
+    state.retenir_noms_d_appareils().await;
     let auth = match auth(&state) {
         Ok(a) => a,
         Err(resp) => return resp,
@@ -398,6 +400,8 @@ async fn reply(
     tune_core::confidentialite::retenir_identifiants_du_serveur(&SettingsRepo::with_backend(
         state.backend.clone(),
     ));
+    // #9140 — ni les noms d'appareils et de zones.
+    state.retenir_noms_d_appareils().await;
     let auth = match auth(&state) {
         Ok(a) => a,
         Err(resp) => return resp,
