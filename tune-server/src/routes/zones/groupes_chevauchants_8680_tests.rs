@@ -383,7 +383,10 @@ async fn une_lecture_sur_la_meneuse_ne_part_pas_en_cascade() {
 async fn compte_gratuit_recomposer_un_groupe_est_refuse_402_9240() {
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
     poser_les_groupes(&state, &[groupe(1, 1, &[1, 2])]);
-    assert_eq!(patcher(&state, 1, json!({ "zone_ids": [1, 2, 3] })).await, 402);
+    assert_eq!(
+        patcher(&state, 1, json!({ "zone_ids": [1, 2, 3] })).await,
+        402
+    );
     assert_eq!(lire_les_groupes(&state), vec![groupe(1, 1, &[1, 2])]);
     // Renommer reste permis.
     assert_eq!(patcher(&state, 1, json!({ "name": "Rez" })).await, 200);
