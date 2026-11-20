@@ -279,3 +279,188 @@ fn les_albums_des_verdicts_du_catalogue_rc12() {
     assert_eq!(ids(&["hires"], true), Vec::<i64>::new());
     assert_eq!(ids(&[], true), Vec::<i64>::new());
 }
+
+/// #9035 (décision du 18/11, fil 2902) — la règle de la moitié, en Rust ET en
+/// SQL : album 8 = 2 douteuses sur 10 (vérifié, « 2 pistes douteuses »),
+/// album 9 = 6 sur 10 (douteux). Le filtre `?hires_verdict=` et les règles
+/// intelligentes lisent le SQL : il doit rendre les mêmes albums que le badge.
+#[test]
+fn la_regle_de_la_moitie_vaut_pour_le_badge_et_le_filtre_9035() {
+    let db = bibliotheque();
+    for (album, douteuses) in [(8i64, 2usize), (9, 6)] {
+        db.execute(
+            "INSERT INTO albums (id, title) VALUES (?1, 'a')",
+            &[&album as &dyn ToSqlValue],
+        )
+        .unwrap();
+        for i in 0..10usize {
+            let piste = album * 100 + i as i64;
+            let chemin = format!("/m/{piste}.flac");
+            db.execute(
+                "INSERT INTO tracks (id, album_id, title, file_path, format, source, duration_ms) \
+                 VALUES (?1, ?2, 't', ?3, 'flac', 'local', 60000)",
+                &[&piste as &dyn ToSqlValue, &album, &chemin],
+            )
+            .unwrap();
+            let (verdict, raison) = if i < douteuses {
+                ("douteux".to_string(), Some("coupure_spectrale".to_string()))
+            } else {
+                ("verifie".to_string(), None)
+            };
+            db.execute(
+                "INSERT INTO hires_verifications (track_id, verdict, raison, coupure_hz) \
+                 VALUES (?1, ?2, ?3, 17800.0)",
+                &[&piste as &dyn ToSqlValue, &verdict, &raison],
+            )
+            .unwrap();
+        }
+    }
+    let ids: Vec<i64> = (1..=9).collect();
+    let par_album = pistes_mesurees_par_album(&db, &ids).unwrap();
+    assert_eq!(publier_l_album(&par_album[&8], true), ("verifie", None));
+    assert_eq!(
+        pistes_douteuses_publiees(&par_album[&8], true),
+        Some((2, 10, Some("coupure_spectrale".into())))
+    );
+    assert_eq!(pistes_douteuses_publiees(&par_album[&8], false), None);
+    assert_eq!(
+        publier_l_album(&par_album[&9], true),
+        ("douteux", Some("coupure_spectrale".into()))
+    );
+    for visible in [false, true] {
+        for v in TOUS {
+            let attendus: Vec<i64> = ids
+                .iter()
+                .copied()
+                .filter(|id| {
+                    let p = par_album.get(id).cloned().unwrap_or_default();
+                    publier_l_album(&p, visible).0 == v.code()
+                })
+                .collect();
+            assert_eq!(
+                albums_du_predicat(&db, v, visible),
+                attendus,
+                "prédicat {} (douteux visible : {visible})",
+                v.code()
+            );
+        }
+    }
+    assert_eq!(
+        albums_du_predicat(&db, VerdictPublie::Douteux, true),
+        vec![3, 9]
+    );
+    assert!(albums_du_predicat(&db, VerdictPublie::Verifie, true).contains(&8));
+
+    // #9035 (décision du 18/11) — « douteux » MASQUÉ : l'album 8 (2/10) n'est
+    // pas « vérifié » pour autant : sans badge, hors du filtre « Vérifié » et
+    // du catalogue « vérifié ».
+    assert_eq!(
+        publier_l_album(&par_album[&8], false),
+        ("non_analyse", None)
+    );
+    assert!(!albums_du_predicat(&db, VerdictPublie::Verifie, false).contains(&8));
+    assert!(albums_du_predicat(&db, VerdictPublie::NonAnalyse, false).contains(&8));
+    let catalogue = albums_des_verdicts(&db, &["verifie".to_string()], false).unwrap();
+    assert!(!catalogue.contains(&8), "{catalogue:?}");
+    assert!(
+        albums_des_verdicts(&db, &["verifie".to_string()], true)
+            .unwrap()
+            .contains(&8)
+    );
+}
+
+/// #9067 — « Source altérée » (décision du 19/11, fil 2915) : un CD n'est
+/// altéré que par un mur de codec. Album 10 = 10 pistes CD rangées `douteux`
+/// sur la seule coupure (avant #9067) → lues conformes, absent du filtre.
+/// Album 11 = 2 pistes 24/96 douteuses + 8 pistes CD lues conformes : la
+/// moitié se compte sur TOUTES les pistes mesurées (2 sur 10) → pas altéré,
+/// « 2 pistes sur 10 ». Album 12 = 10 pistes CD au mur de codec → altéré.
+/// Rust et SQL rendent les mêmes albums.
+#[test]
+fn un_cd_n_est_altere_que_par_un_mur_de_codec_9067() {
+    let db = bibliotheque();
+    for (album, hires) in [(10i64, 0usize), (11, 2), (12, 0)] {
+        db.execute(
+            "INSERT INTO albums (id, title) VALUES (?1, 'a')",
+            &[&album as &dyn ToSqlValue],
+        )
+        .unwrap();
+        for i in 0..10usize {
+            let piste = album * 100 + i as i64;
+            let chemin = format!("/m/{piste}.flac");
+            db.execute(
+                "INSERT INTO tracks (id, album_id, title, file_path, format, source, duration_ms) \
+                 VALUES (?1, ?2, 't', ?3, 'flac', 'local', 60000)",
+                &[&piste as &dyn ToSqlValue, &album, &chemin],
+            )
+            .unwrap();
+            let (rate, bits): (i64, i64) = if i < hires {
+                (96_000, 24)
+            } else {
+                (44_100, 16)
+            };
+            let raison = if album == 12 {
+                "mur_de_codec".to_string()
+            } else {
+                "coupure_de_codec".to_string()
+            };
+            db.execute(
+                "INSERT INTO hires_verifications (track_id, verdict, raison, coupure_hz, sample_rate, bits_declares) \
+                 VALUES (?1, 'douteux', ?4, 16000.0, ?2, ?3)",
+                &[&piste as &dyn ToSqlValue, &rate, &bits, &raison],
+            )
+            .unwrap();
+        }
+    }
+    let ids: Vec<i64> = (1..=7).chain([10, 11, 12]).collect();
+    let par_album = pistes_mesurees_par_album(&db, &ids).unwrap();
+    assert_eq!(publier_l_album(&par_album[&10], true), ("conforme", None));
+    assert_eq!(pistes_douteuses_publiees(&par_album[&10], true), None);
+    assert_eq!(publier_l_album(&par_album[&11], true), ("conforme", None));
+    assert_eq!(
+        pistes_douteuses_publiees(&par_album[&11], true),
+        Some((2, 10, Some("coupure_spectrale".into())))
+    );
+    assert_eq!(
+        publier_l_album(&par_album[&12], true),
+        ("douteux", Some("mur_de_codec".into()))
+    );
+    assert_eq!(
+        pistes_douteuses_publiees(&par_album[&12], true),
+        Some((10, 10, Some("mur_de_codec".into())))
+    );
+    for visible in [false, true] {
+        for v in TOUS {
+            let attendus: Vec<i64> = ids
+                .iter()
+                .copied()
+                .filter(|id| {
+                    let p = par_album.get(id).cloned().unwrap_or_default();
+                    publier_l_album(&p, visible).0 == v.code()
+                })
+                .collect();
+            assert_eq!(
+                albums_du_predicat(&db, v, visible),
+                attendus,
+                "prédicat {} (douteux visible : {visible})",
+                v.code()
+            );
+        }
+    }
+    let douteux = albums_du_predicat(&db, VerdictPublie::Douteux, true);
+    assert!(
+        douteux.contains(&12) && !douteux.contains(&10) && !douteux.contains(&11),
+        "seul le CD au mur de codec est altéré : {douteux:?}"
+    );
+    // La piste CD rangée douteuse sur la seule coupure se lit conforme ; la
+    // piste 24/96 douteuse et la piste CD au mur de codec sont altérées.
+    let pistes_douteuses = pistes_du_predicat(&db, VerdictPublie::Douteux, true);
+    assert!(!pistes_douteuses.contains(&1000), "{pistes_douteuses:?}");
+    assert!(pistes_douteuses.contains(&1100) && pistes_douteuses.contains(&1200));
+    // `altere` est l'alias d'entrée de `douteux`.
+    assert_eq!(VerdictPublie::lire("altere"), Some(VerdictPublie::Douteux));
+    assert_eq!(
+        albums_des_verdicts(&db, &["altere".to_string()], true).unwrap(),
+        albums_des_verdicts(&db, &["douteux".to_string()], true).unwrap()
+    );
+}

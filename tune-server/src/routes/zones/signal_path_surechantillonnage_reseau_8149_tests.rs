@@ -155,7 +155,7 @@ fn zone_locale_en_bit_perfect_strict_dit_la_raison_8149() {
 fn le_texte_du_strict_existe_dans_toutes_les_langues_8149() {
     let textes: serde_json::Map<String, Value> =
         serde_json::from_str(include_str!("textes_signal.json")).unwrap();
-    assert_eq!(textes.len(), 15);
+    assert_eq!(textes.len(), 16);
     for (lang, t) in &textes {
         let v = t["upsampling_strict_bitperfect"].as_str();
         assert!(v.is_some_and(|v| !v.is_empty()), "manque en {lang}");
@@ -195,7 +195,7 @@ fn zone_locale_a_cadence_fixe_dit_la_raison_8428() {
 fn le_texte_de_la_cadence_fixe_existe_dans_toutes_les_langues_8428() {
     let textes: serde_json::Map<String, Value> =
         serde_json::from_str(include_str!("textes_signal.json")).unwrap();
-    assert_eq!(textes.len(), 15);
+    assert_eq!(textes.len(), 16);
     for (lang, t) in &textes {
         let v = t["upsampling_fixed_rate"].as_str();
         assert!(v.is_some_and(|v| !v.is_empty()), "manque en {lang}");

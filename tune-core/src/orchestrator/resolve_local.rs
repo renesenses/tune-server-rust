@@ -1,4 +1,5 @@
 use super::*;
+use crate::outputs::capacite_dsd_natif::TransportReelDsd;
 
 // Durée client des seuls canaux PCM qui commencent déjà à une position.
 // Le flux/DIDL conserve sa durée restante (#6630). Ce registre ne participe
@@ -122,6 +123,33 @@ impl TrancheCue {
     fn duree_restante_s(&self, seek_ms: u64) -> Option<f64> {
         let duree = self.duree_ms?;
         Some(duree.saturating_sub(seek_ms) as f64 / 1000.0)
+    }
+
+    /// #8968 — début (dans le fichier image) et durée restante à servir, en
+    /// secondes, À L'ÉCHANTILLON PRÈS à la cadence `cadence` du fichier.
+    ///
+    /// Les millisecondes de la base sont tronquées (`ff × 1000 / 75`) : les
+    /// diviser par mille plaçait chaque frontière jusqu'à 29 échantillons trop
+    /// tôt à 44,1 kHz. `audio::bornes_cue` retrouve la frame CD exacte, puis
+    /// l'échantillon. Le seek de l'utilisateur s'ajoute en échantillons.
+    /// Cadence inconnue (0) : la conversion d'avant, en millisecondes.
+    pub(super) fn en_secondes(&self, seek_ms: u64, cadence: u32) -> (f64, Option<f64>) {
+        if cadence == 0 {
+            return (
+                (self.debut_ms + seek_ms) as f64 / 1000.0,
+                self.duree_restante_s(seek_ms),
+            );
+        }
+        let fin_ms = self.duree_ms.map(|d| self.debut_ms + d);
+        let (debut, fin) =
+            crate::audio::bornes_cue::tranche_en_echantillons(self.debut_ms, fin_ms, cadence);
+        let c = u64::from(cadence);
+        let depart = debut + (seek_ms.saturating_mul(c) + 500) / 1000;
+        let c = c as f64;
+        (
+            depart as f64 / c,
+            fin.map(|f| f.saturating_sub(depart) as f64 / c),
+        )
     }
 }
 
@@ -601,10 +629,11 @@ impl PlaybackOrchestrator {
     /// renderer. Un cache vide vaut « je ne sais pas », donc la garde.
     pub async fn dsd_suivant_tenu_sur_dlna(
         &self,
+        zone_id: i64,
         device_id: &str,
         annonce_suivante: crate::outputs::traits::AnnonceSuivante,
     ) -> bool {
-        self.refus_dsd_suivant_sur_dlna(device_id, annonce_suivante)
+        self.refus_dsd_suivant_sur_dlna(zone_id, device_id, annonce_suivante)
             .await
             .is_none()
     }
@@ -613,11 +642,17 @@ impl PlaybackOrchestrator {
     /// `device_id`, `None` s'il peut l'être. Mêmes lectures, sans réseau, que
     /// [`Self::dsd_suivant_tenu_sur_dlna`] ; voir
     /// [`crate::playback::gapless::refus_dsd_suivant_sur_dlna`].
+    ///
+    /// #8969 — le mode DSD de la zone `zone_id` est relu (base, pas de
+    /// réseau) : en « natif », le DSD part brut même au renderer qui ne
+    /// l'annonce pas ([`Self::should_dsd_passthrough`]), sa suivante aussi.
     pub async fn refus_dsd_suivant_sur_dlna(
         &self,
+        zone_id: i64,
         device_id: &str,
         annonce_suivante: crate::outputs::traits::AnnonceSuivante,
     ) -> Option<crate::playback::gapless::RefusDsdSuivant> {
+        let natif_force = ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(zone_id) == "native";
         let annonce_dsd = self
             .dsd_capabilities
             .lock()
@@ -628,21 +663,52 @@ impl PlaybackOrchestrator {
             .appareils_qui_lachent_le_dsd_suivant
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(device_id);
+            .get_mut(device_id)
+            .is_some_and(|m| m.garde_active(std::time::Instant::now()));
         crate::playback::gapless::refus_dsd_suivant_sur_dlna(
             annonce_dsd,
+            natif_force,
             annonce_suivante,
             deja_lache,
         )
     }
 
-    /// #6910 — `device_id` a lâché un suivant DSD armé : la garde de #402 lui
-    /// est rendue jusqu'au redémarrage. Vrai à la première fois seulement.
-    pub fn retenir_dsd_suivant_lache(&self, device_id: &str) -> bool {
+    /// #6910 — `device_id` a lâché un suivant DSD armé. #9206 : la garde de
+    /// #402 ne lui est rendue qu'au deuxième échec (ou tout de suite si
+    /// `immediat` : il a dit lui-même avoir perdu la suivante, ou s'il est
+    /// récidiviste), pour un temps (voir
+    /// [`crate::playback::gapless::EchecsDsdSuivant`]).
+    pub fn retenir_dsd_suivant_lache(
+        &self,
+        device_id: &str,
+        immediat: bool,
+    ) -> crate::playback::gapless::IssueEchecDsdSuivant {
         self.appareils_qui_lachent_le_dsd_suivant
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(device_id.to_string())
+            .entry(device_id.to_string())
+            .or_default()
+            .noter_echec(std::time::Instant::now(), immediat)
+    }
+
+    /// #9206 — `device_id` a suivi un suivant DSD armé : ses échecs et sa
+    /// récidive sont oubliés. Vrai s'il y avait quelque chose à oublier.
+    pub fn noter_succes_dsd_suivant(&self, device_id: &str) -> bool {
+        self.appareils_qui_lachent_le_dsd_suivant
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(device_id)
+            .is_some()
+    }
+
+    /// Banc (#9206) : échecs de suivant DSD notés pour `device_id`.
+    #[cfg(test)]
+    pub(crate) fn echecs_dsd_suivant_pour_banc(&self, device_id: &str) -> u32 {
+        self.appareils_qui_lachent_le_dsd_suivant
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(device_id)
+            .map_or(0, |m| m.echecs())
     }
 
     /// Banc : ce que le `GetProtocolInfo` du renderer aurait dit du DSD.
@@ -955,7 +1021,20 @@ impl PlaybackOrchestrator {
             resolved_bd,
             resolved_ch,
         ) = if decision.needs_transcode {
-            self.transcoder_la_piste(req, &decision).await?
+            // #8968 — une tranche CUE que RIEN d'autre ne force à transcoder
+            // (aucun traitement, format admis) entre dans le flux continu
+            // #8082 comme un fichier entier : ses bornes y sont exactes à
+            // l'échantillon, et la jointure avec la tranche suivante n'est
+            // plus laissée au renderer.
+            let flux_cue = if decision.motifs_de_transcodage == ["est_une_tranche_cue"] {
+                self.servir_en_flux_continu(req, &decision).await
+            } else {
+                None
+            };
+            match flux_cue {
+                Some(flux) => flux,
+                None => self.transcoder_la_piste(req, &decision).await?,
+            }
         } else {
             self.servir_en_passthrough(req, &decision).await?
         };
@@ -1259,6 +1338,20 @@ impl PlaybackOrchestrator {
         };
         let mut transport = transport_dsd(is_local_output, is_network_output, &dsd_mode);
 
+        // #8248 / #9170 (suivi #9172) — une piste PCM sur une zone « Natif »
+        // dont la sortie n'a jamais été sondée : la prochaine ouverture de
+        // flux (PCM libre) la sondera une fois, pour que la PREMIÈRE piste DSD
+        // qui suit parte déjà en natif. Une zone qui n'est pas « Natif » ne
+        // demande rien : ses pistes PCM ne sondent jamais.
+        if let Some(nom) = sortie_a_sonder_pour_une_piste_pcm(
+            is_local_output,
+            source_format,
+            req.output_device_id.as_deref(),
+            || ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(req.zone_id),
+        ) {
+            crate::outputs::capacite_dsd_natif::demander_sondage_a_l_ouverture(nom);
+        }
+
         // #5643 — « natif » sur une sortie locale ASIO dont le pilote déclare
         // le DSD à la cadence du fichier : du DSD natif, pour de vrai. Sinon
         // `NatifServiEnDop`, comme avant, avec le motif au journal.
@@ -1277,6 +1370,14 @@ impl PlaybackOrchestrator {
             ) {
                 Ok(()) => {
                     transport = TransportDsd::Natif;
+                    // #9170 — décidé, pas encore réel : le bras le confirme
+                    // quand le flux démarre, ou l'efface s'il échoue.
+                    if let Some(sortie) = req.output_device_id.as_deref() {
+                        crate::outputs::capacite_dsd_natif::noter_natif_en_attente(
+                            req.zone_id,
+                            sortie,
+                        );
+                    }
                     let (cadence, canaux) = entete.unwrap_or_default();
                     info!(
                         zone_id = req.zone_id,
@@ -1298,7 +1399,7 @@ impl PlaybackOrchestrator {
                             fin_ms: None,
                         },
                     };
-                    return self
+                    let servi = self
                         .servir_le_dsd_natif(
                             req,
                             track,
@@ -1308,6 +1409,12 @@ impl PlaybackOrchestrator {
                             fenetre,
                         )
                         .await;
+                    // #9170 — échec avant le bras : le natif attendu ne
+                    // partira pas, il ne doit pas rester en attente.
+                    if !matches!(servi, Ok(Some(_))) {
+                        crate::outputs::capacite_dsd_natif::effacer_transport_reel(req.zone_id);
+                    }
+                    return servi;
                 }
                 Err(motif) => motif_natif = Some(motif),
             }
@@ -1367,6 +1474,13 @@ impl PlaybackOrchestrator {
             transport = TransportDsd::Pcm;
         }
         let dop_requested = transport != TransportDsd::Pcm;
+        // #9170 — « Natif » réglé, la piste DSD part autrement : l'écran des
+        // réglages doit dire ce qui est réellement parti (DoP ou PCM), pas
+        // seulement ce que la sortie accepterait.
+        let natif_demande_en_local = motif_natif.is_some();
+        if natif_demande_en_local && !dop_requested {
+            noter_transport_reel_dsd(req, TransportReelDsd::Pcm);
+        }
 
         // #2369 — « natif » sur une sortie locale N'EST PAS natif.
         //
@@ -1434,7 +1548,7 @@ impl PlaybackOrchestrator {
             // zone repartait de la position visée — d'où une fin de piste
             // déclarée bien avant la fin de l'audio entendu (Levente, fil 2305).
             let tranche = tranche_dop(tranche_cue, req.seek_ms);
-            return self
+            let anticipe = self
                 .anticiper_le_dop(
                     req.zone_id,
                     track,
@@ -1446,6 +1560,19 @@ impl PlaybackOrchestrator {
                     req.seek_ms,
                 )
                 .await;
+            if natif_demande_en_local {
+                match &anticipe {
+                    Ok(Some(_)) => noter_transport_reel_dsd(req, TransportReelDsd::Dop),
+                    // DoP hors plafond : le chemin ordinaire convertit en PCM.
+                    Ok(None) => noter_transport_reel_dsd(req, TransportReelDsd::Pcm),
+                    // Refus (bit-perfect strict) : rien n'est parti, l'ancien
+                    // transport ne doit pas rester affiché.
+                    Err(_) => {
+                        crate::outputs::capacite_dsd_natif::effacer_transport_reel(req.zone_id);
+                    }
+                }
+            }
+            return anticipe;
         }
         Ok(None)
     }
@@ -2142,15 +2269,22 @@ impl PlaybackOrchestrator {
                 #[cfg(target_os = "linux")]
                 {
                     use crate::outputs::local::ResultatSondeDsdAlsa;
-                    match capacite::connue(&nom) {
-                        Some(CapaciteConnue::AlsaDsdU32 { cadences }) => {
-                            return SortieDsdLocale::Alsa {
-                                cadences,
-                                voies: crate::outputs::local::VOIES_SONDEES_DSD_ALSA,
-                            };
+                    // #9170 — une capacité provisoire (PCM logiciel observé
+                    // sans réponse du pilote) se re-sonde ici, à chaque piste
+                    // DSD « Natif » : elle ne fige plus la sortie en DoP.
+                    if !capacite::a_resonder(&nom) {
+                        match capacite::connue(&nom) {
+                            Some(CapaciteConnue::AlsaDsdU32 { cadences }) => {
+                                return SortieDsdLocale::Alsa {
+                                    cadences,
+                                    voies: crate::outputs::local::VOIES_SONDEES_DSD_ALSA,
+                                };
+                            }
+                            Some(CapaciteConnue::SortieNonAsio) => {
+                                return SortieDsdLocale::NonAsio;
+                            }
+                            _ => {}
                         }
-                        Some(CapaciteConnue::SortieNonAsio) => return SortieDsdLocale::NonAsio,
-                        _ => {}
                     }
                     let sonde = {
                         let sortie = sortie.lock().await;
@@ -2160,16 +2294,20 @@ impl PlaybackOrchestrator {
                             .and_then(crate::outputs::local::LocalOutput::sonde_dsd_alsa)
                     };
                     if let Some(sonde) = sonde {
-                        match tokio::task::spawn_blocking(move || sonde.sonder_et_retenir())
+                        let r = tokio::task::spawn_blocking(move || sonde.sonder_et_retenir())
                             .await
-                            .unwrap_or(ResultatSondeDsdAlsa::Occupe)
-                        {
-                            ResultatSondeDsdAlsa::Sonde { cadences, voies } => {
-                                return SortieDsdLocale::Alsa { cadences, voies };
-                            }
-                            ResultatSondeDsdAlsa::Occupe => return SortieDsdLocale::AlsaNonSondee,
-                            ResultatSondeDsdAlsa::PasUnPcmMateriel => {}
+                            .unwrap_or(ResultatSondeDsdAlsa::Occupe);
+                        // #9170 (suivi #9172, relecture #9211) — rien appris
+                        // (PCM tenu par la piste précédente, DAC introuvable,
+                        // verdict provisoire) : la demande est posée, SANS
+                        // armer l'espacement (`ResultatSondeDsdAlsa::retenir`
+                        // n'en arme aucun) — l'ouverture de CETTE piste, PCM
+                        // libre, sonde donc, et la suivante peut partir en
+                        // natif. Seuls les échecs à l'ouverture espacent.
+                        if !matches!(r, ResultatSondeDsdAlsa::Sonde { .. }) {
+                            capacite::demander_sondage_a_l_ouverture(&nom);
                         }
+                        return sortie_alsa_apres_sonde(r);
                     }
                 }
                 capacite::retenir(&nom, CapaciteConnue::SortieNonAsio);
@@ -3942,9 +4080,13 @@ impl PlaybackOrchestrator {
                         Some(abandon.clone()),
                         // #3631 — la tranche à découper dans le fichier image.
                         // `None` pour un fichier ordinaire.
-                        tranche_cue.map(|t| TrancheSource {
-                            debut_s: t.debut_ms as f64 / 1000.0,
-                            duree_s: t.duree_ms.map(|d| d as f64 / 1000.0).unwrap_or(0.0),
+                        // #8968 — bornes à l'échantillon près.
+                        tranche_cue.map(|t| {
+                            let (debut_s, duree_s) = t.en_secondes(0, sample_rate);
+                            TrancheSource {
+                                debut_s,
+                                duree_s: duree_s.unwrap_or(0.0),
+                            }
                         }),
                         crossfeed.map(|(processeur, _)| processeur),
                         compensation,
@@ -4186,6 +4328,7 @@ impl PlaybackOrchestrator {
     ) -> Result<FluxLocal, String> {
         let DecisionLocale {
             channels,
+            sample_rate,
             tranche_cue,
             is_local_output,
             ref file_path,
@@ -4324,11 +4467,13 @@ impl PlaybackOrchestrator {
             // PISTE. Pour une tranche de feuille CUE, la position dans le
             // FICHIER est le début de la tranche PLUS ce seek ; la durée
             // restante à servir, elle, en est diminuée d'autant.
+            //
+            // #8968 — bornes de la tranche à l'échantillon près.
             let seek_utilisateur_ms = req.seek_ms.unwrap_or(0);
-            let seek_s = (tranche_cue.map(|t| t.debut_ms).unwrap_or(0) + seek_utilisateur_ms)
-                as f64
-                / 1000.0;
-            let duree_tranche_s = tranche_cue.and_then(|t| t.duree_restante_s(seek_utilisateur_ms));
+            let (seek_s, duree_tranche_s) = match tranche_cue {
+                Some(t) => t.en_secondes(seek_utilisateur_ms, sample_rate),
+                None => (seek_utilisateur_ms as f64 / 1000.0, None),
+            };
             // Les niveaux sont datés sur l'horloge de la PISTE : le décalage
             // du fichier image n'a rien à y faire.
             let seek_niveaux_ms = seek_utilisateur_ms as i64;
@@ -4445,6 +4590,94 @@ impl PlaybackOrchestrator {
         Ok(flux)
     }
 
+    /// #8082 — « Flux continu entre les pistes » : la piste et les suivantes
+    /// de même format partent en UN seul WAV, sans traitement. Réglage
+    /// éteint, sortie non réseau, ou suite d'une seule piste : `None`, rien
+    /// ne change. Appelé par le passthrough, et (#8968) par une tranche CUE
+    /// que rien d'autre ne force à transcoder.
+    async fn servir_en_flux_continu(
+        &self,
+        req: &PlayRequest,
+        decision: &DecisionLocale,
+    ) -> Option<FluxLocal> {
+        let DecisionLocale {
+            is_network_output,
+            ref file_path,
+            ref zone,
+            ..
+        } = *decision;
+        if !is_network_output {
+            return None;
+        }
+        let flux = self
+            .preparer_le_flux_continu(
+                req.zone_id,
+                zone.as_ref().and_then(|z| z.output_type.as_deref()),
+                req.track_id,
+                file_path,
+                req.seek_ms,
+            )
+            .await?;
+        let format = flux.wav.format();
+        let total = crate::http::streamer::SourceVirtuelle::total(&flux.wav);
+        let duree_ms = flux.wav.bornes_ms().iter().map(|(_, d)| d).sum::<u64>();
+        let info = StreamInfo {
+            format: "wav".into(),
+            mime_type: "audio/wav".into(),
+            sample_rate: format.cadence,
+            bit_depth: format.profondeur,
+            channels: format.canaux,
+            file_size: Some(total),
+            duration_ms: Some(duree_ms),
+            ..Default::default()
+        };
+        let session_id = self
+            .streamer
+            .create_file_session(info, file_path.clone(), false)
+            .await;
+        let plan = super::flux_continu_8082::plan_du_flux(req.zone_id, &session_id, &flux);
+        info!(
+            zone_id = req.zone_id,
+            stream_id = %session_id,
+            pistes = plan.pistes.len(),
+            positions = ?plan.pistes.iter().map(|p| p.position).collect::<Vec<_>>(),
+            cadence = format.cadence,
+            profondeur = format.profondeur,
+            canaux = format.canaux,
+            octets = total,
+            depart_ms = req.seek_ms.unwrap_or(0),
+            "flux_continu_servi"
+        );
+        self.streamer
+            .set_source_virtuelle(&session_id, Arc::new(flux.wav))
+            .await;
+        self.streamer
+            .noter_la_voie(&session_id, crate::http::streamer::voie::FLUX_CONTINU)
+            .await;
+        // Relance à une position : le flux commence DÉJÀ là. Le départ,
+        // porté par l'URL, ramène le relevé du renderer au début de la
+        // piste (#6059) et retient le `Seek` d'après relecture.
+        if let Some(depart) = req.seek_ms.filter(|d| *d > 0) {
+            crate::outputs::dlna_depart_natif::inscrire_session(&session_id, depart);
+        }
+        if let Some(did) = req
+            .output_device_id
+            .as_deref()
+            .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
+        {
+            crate::outputs::dlna_flux_continu::inscrire(did, plan);
+        }
+        Some((
+            session_id,
+            "audio/wav".into(),
+            "wav".into(),
+            Some(total),
+            Some(format.cadence),
+            Some(u32::from(format.profondeur)),
+            Some(u32::from(format.canaux)),
+        ))
+    }
+
     /// Arme « passthrough » du grand tuple de `resolve_local_track`, sortie telle
     /// quelle : le fichier est servi brut par une session de fichier, avec le
     /// décodage parallèle pour les niveaux quand personne d'autre ne décode.
@@ -4480,78 +4713,9 @@ impl PlaybackOrchestrator {
             ref conteneur_flac_neuf,
             ..
         } = *decision;
-        // #8082 — « Flux continu entre les pistes » : la piste et les
-        // suivantes de même format partent en UN seul WAV, sans traitement.
-        // Réglage éteint, ou suite d'une seule piste : rien ne change.
-        if is_network_output
-            && let Some(flux) = self
-                .preparer_le_flux_continu(
-                    req.zone_id,
-                    zone.as_ref().and_then(|z| z.output_type.as_deref()),
-                    req.track_id,
-                    file_path,
-                    req.seek_ms,
-                )
-                .await
-        {
-            let format = flux.wav.format();
-            let total = crate::http::streamer::SourceVirtuelle::total(&flux.wav);
-            let duree_ms = flux.wav.bornes_ms().iter().map(|(_, d)| d).sum::<u64>();
-            let info = StreamInfo {
-                format: "wav".into(),
-                mime_type: "audio/wav".into(),
-                sample_rate: format.cadence,
-                bit_depth: format.profondeur,
-                channels: format.canaux,
-                file_size: Some(total),
-                duration_ms: Some(duree_ms),
-                ..Default::default()
-            };
-            let session_id = self
-                .streamer
-                .create_file_session(info, file_path.clone(), false)
-                .await;
-            let plan = super::flux_continu_8082::plan_du_flux(req.zone_id, &session_id, &flux);
-            info!(
-                zone_id = req.zone_id,
-                stream_id = %session_id,
-                pistes = plan.pistes.len(),
-                positions = ?plan.pistes.iter().map(|p| p.position).collect::<Vec<_>>(),
-                cadence = format.cadence,
-                profondeur = format.profondeur,
-                canaux = format.canaux,
-                octets = total,
-                depart_ms = req.seek_ms.unwrap_or(0),
-                "flux_continu_servi"
-            );
-            self.streamer
-                .set_source_virtuelle(&session_id, Arc::new(flux.wav))
-                .await;
-            self.streamer
-                .noter_la_voie(&session_id, crate::http::streamer::voie::FLUX_CONTINU)
-                .await;
-            // Relance à une position : le flux commence DÉJÀ là. Le départ,
-            // porté par l'URL, ramène le relevé du renderer au début de la
-            // piste (#6059) et retient le `Seek` d'après relecture.
-            if let Some(depart) = req.seek_ms.filter(|d| *d > 0) {
-                crate::outputs::dlna_depart_natif::inscrire_session(&session_id, depart);
-            }
-            if let Some(did) = req
-                .output_device_id
-                .as_deref()
-                .or(zone.as_ref().and_then(|z| z.output_device_id.as_deref()))
-            {
-                crate::outputs::dlna_flux_continu::inscrire(did, plan);
-            }
-            return Ok((
-                session_id,
-                "audio/wav".into(),
-                "wav".into(),
-                Some(total),
-                Some(format.cadence),
-                Some(u32::from(format.profondeur)),
-                Some(u32::from(format.canaux)),
-            ));
+        // #8082 — « Flux continu entre les pistes ».
+        if let Some(flux) = self.servir_en_flux_continu(req, decision).await {
+            return Ok(flux);
         }
         // #6221 — un DSDIFF DST vers un renderer réseau ne part JAMAIS brut
         // (#4378) : le passthrough sert à sa place un DSF fabriqué à la volée.
@@ -4805,6 +4969,35 @@ impl PlaybackOrchestrator {
             // restent exclus par `sortie_tire_le_flux` : eux décodent déjà.
             let output_decodes_server_side =
                 !(is_network_output || is_browser_output || sortie_tire_le_flux);
+            // #9117 — le DSD servi tel quel (DSF/DFF vers un renderer qui
+            // annonce le DSD) n'est pas décodé « au fil des valeurs taguées »
+            // comme le PCM ci-dessous (`Some(sr)` vaudrait 2,8 MHz), mais il
+            // n'est plus laissé sans niveaux : la sonde du DoP et du DSD natif
+            // (#6456, #7775) le convertit en PCM à la cadence que choisit le
+            // convertisseur, freinée sur la lecture, pour les seules aiguilles.
+            // Le flux envoyé au renderer ne change pas.
+            if skip_passthrough_levels
+                && !output_decodes_server_side
+                && self.levels_attach_allowed(req.zone_id)
+                && let Some(ref bus) = self.event_bus
+            {
+                let play_seq = self.playback.current_play_seq(req.zone_id).await;
+                info!(
+                    zone_id = req.zone_id,
+                    play_seq,
+                    file = %file_path,
+                    "dsd_passthrough_niveaux_sonde"
+                );
+                spawn_local_file_levels_decode_depuis(
+                    bus.clone(),
+                    self.playback.clone(),
+                    req.zone_id,
+                    play_seq,
+                    file_path.clone(),
+                    0,
+                    0,
+                );
+            }
             if !skip_passthrough_levels
                 && !output_decodes_server_side
                 && self.levels_attach_allowed(req.zone_id)
@@ -5009,6 +5202,60 @@ pub(super) fn sonder_l_entete_dsd(file_path: &str) -> Option<(u32, u32)> {
     }
 }
 
+/// #9170 — retient ce qui part réellement pour la piste DSD de la zone
+/// (lu par les réglages, `dsd_transport`). Sans sortie nommée, rien.
+fn noter_transport_reel_dsd(req: &PlayRequest, transport: TransportReelDsd) {
+    if let Some(sortie) = req.output_device_id.as_deref() {
+        crate::outputs::capacite_dsd_natif::noter_transport_reel(req.zone_id, sortie, transport);
+    }
+}
+
+/// #8248 / #9170 (relecture #9211) — la sortie dont une piste NON DSD doit
+/// demander le sondage à l'ouverture : sortie locale jamais sondée, zone
+/// réglée « Natif » (`dsd_mode`, lu seulement si tout le reste le permet).
+pub(super) fn sortie_a_sonder_pour_une_piste_pcm<'a>(
+    is_local_output: bool,
+    source_format: Option<AudioFormat>,
+    output_device_id: Option<&'a str>,
+    dsd_mode: impl FnOnce() -> String,
+) -> Option<&'a str> {
+    if !is_local_output || source_format == Some(AudioFormat::Dsd) {
+        return None;
+    }
+    let nom = output_device_id?.strip_prefix("local:")?;
+    (crate::outputs::capacite_dsd_natif::connue(nom).is_none() && dsd_mode() == "native")
+        .then_some(nom)
+}
+
+/// #9170 — ce qu'un sondage DSD natif ALSA permet pour la piste qui se
+/// résout. Seul le pilote dit « pas de DSD » (`Sonde` sans cadence, jugé par
+/// `decider_dsd_natif_local`) ; un PCM logiciel ou un hôte non ALSA n'a pas
+/// de bras natif ; un périphérique introuvable (DAC débranché, pas encore
+/// énuméré, repli sur le défaut) ou occupé laisse la capacité INCONNUE : la
+/// piste part en DoP sans que rien ne soit retenu, et la suivante re-sonde.
+#[cfg(feature = "local-audio")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn sortie_alsa_apres_sonde(
+    r: crate::outputs::local::ResultatSondeDsdAlsa,
+) -> SortieDsdLocale {
+    use crate::outputs::local::ResultatSondeDsdAlsa;
+    match r {
+        ResultatSondeDsdAlsa::Sonde { cadences, voies } => {
+            SortieDsdLocale::Alsa { cadences, voies }
+        }
+        ResultatSondeDsdAlsa::Occupe | ResultatSondeDsdAlsa::Introuvable => {
+            SortieDsdLocale::AlsaNonSondee
+        }
+        ResultatSondeDsdAlsa::PasUnPcmMateriel | ResultatSondeDsdAlsa::PcmLogiciel => {
+            SortieDsdLocale::NonAsio
+        }
+    }
+}
+
+#[cfg(all(test, feature = "local-audio"))]
+#[path = "dsd_natif_verdict_9170_tests.rs"]
+mod dsd_natif_verdict_9170_tests;
+
 #[cfg(test)]
 mod tranche_dop_tests_6456 {
     use super::{TrancheCue, duree_servie_du_dop, tranche_dop};
@@ -5131,3 +5378,11 @@ mod duree_relue_5975_tests;
 #[cfg(test)]
 #[path = "niveaux_du_dsd_natif_7775.rs"]
 mod niveaux_du_dsd_natif_7775;
+
+#[cfg(test)]
+#[path = "niveaux_dsd_passthrough_reseau_9117.rs"]
+mod niveaux_dsd_passthrough_reseau_9117;
+
+#[cfg(test)]
+#[path = "saut_local_8983_tests.rs"]
+mod saut_local_8983_tests;

@@ -120,25 +120,31 @@ fn rapport(nom: &str, fichier: &str, sr: u32, bd: u16) -> (Wav, Vec<f64>) {
 
 /// Rapport signal/erreur (dB) contre la source, par fenêtre de 50 ms, après
 /// recalage du délai de l'encodeur (priming). Rend (délai, pire RSB, instant).
-fn rsb_contre_source(s: &[f64], sr: u32) -> (usize, f64, f64) {
+fn rsb_contre_source(s: &[f64], sr: u32) -> (i64, f64, f64) {
     let src = parse_wav(&std::fs::read(format!("{FIX}src.wav")).unwrap());
     assert_eq!(src.sr, sr);
     let r = samples(&src);
     let n = (r.len() / 2).min(s.len() / 2);
-    let mut meilleur = (0usize, f64::MAX);
-    for lag in 0..4096usize {
+    // #8968 — l'amorce est désormais retirée : le délai attendu est NUL, et
+    // la recherche couvre aussi les délais négatifs (un rognage excessif).
+    // Bornée à ±3 000 trames : les deux sinus de la source (997 et 440 Hz)
+    // se retrouvent presque en phase 3 804 trames plus loin, un alias que
+    // l'ancienne recherche (0..4 096, délai vrai 2 112) n'atteignait pas.
+    let mut meilleur = (0i64, f64::MAX);
+    for lag in -3000i64..3000 {
         let mut e = 0.0;
-        for i in 22050..26460 {
-            if i + lag >= s.len() / 2 {
+        for i in 22050..26460i64 {
+            let j = i + lag;
+            if j < 0 || j as usize >= s.len() / 2 {
                 break;
             }
-            e += (s[2 * (i + lag)] - r[2 * i]).powi(2);
+            e += (s[2 * j as usize] - r[2 * i as usize]).powi(2);
         }
         if e < meilleur.1 {
             meilleur = (lag, e);
         }
     }
-    let lag = meilleur.0;
+    let lag = meilleur.0.max(0) as usize;
     let fen = (sr / 20) as usize;
     let mut pire = (f64::MAX, 0.0);
     let mut i = 0;
@@ -157,7 +163,7 @@ fn rsb_contre_source(s: &[f64], sr: u32) -> (usize, f64, f64) {
         }
         i += fen;
     }
-    (lag, pire.0, pire.1)
+    (meilleur.0, pire.0, pire.1)
 }
 
 #[test]
@@ -166,9 +172,10 @@ fn canal_aac_6990_rsb_contre_la_source() {
         let (_w, s) = rapport("rsb", "aac320.m4a", 44100, bd);
         let (lag, pire, t) = rsb_contre_source(&s, 44100);
         eprintln!("6990 rsb {bd} bits: delai {lag} trames, pire fenetre {pire:.1} dB a {t:.2} s");
-        // Le délai de l'encodeur (2 112 trames) n'est pas retiré : 48 ms de
-        // silence en tête, pas une déformation. Au-delà, le signal servi doit
-        // suivre la source à la précision d'un AAC 320 kbit/s.
+        // #8968 — l'amorce de l'encodeur (2 112 trames, `iTunSMPB`) est
+        // désormais retirée : le signal servi commence avec la source, sans
+        // délai. Il doit la suivre à la précision d'un AAC 320 kbit/s.
+        assert_eq!(lag, 0, "{bd} bits: amorce AAC non retirée ({lag} trames)");
         assert!(
             pire > 40.0,
             "{bd} bits: fenetre a {pire:.1} dB de la source a {t:.2} s"
@@ -235,7 +242,15 @@ fn canal_aac_6990_mp4_fragmente_nomme_aac() {
             w.sr, w.bits
         );
         assert_eq!((w.sr, w.bits), (44100, 16), "{src} -> {nom}: en-tete WAV");
-        assert!((duree - 6.06).abs() < 0.05, "{src} -> {nom}: duree {duree}");
+        // #8968 — le MP4 plat porte `iTunSMPB` : amorce (2 112) et
+        // remplissage (552) retirés, il dure exactement ses 6 s. Le MP4
+        // fragmenté de TIDAL n'a ni `iTunSMPB` ni `elst` : rien à retirer,
+        // 6 s plus l'amorce et le remplissage.
+        let attendue = if src == "aac320.m4a" { 6.0 } else { 6.06 };
+        assert!(
+            (duree - attendue).abs() < 0.005,
+            "{src} -> {nom}: duree {duree}, attendu {attendue}"
+        );
         assert!(
             (fl - 997.0).abs() < 5.0 && sl < 0.09 && ll < 0.3,
             "{src} -> {nom}: {fl} Hz, sauts {sl} / {ll}"

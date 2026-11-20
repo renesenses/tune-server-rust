@@ -6,6 +6,8 @@ pub mod album_distinct_repo;
 pub mod album_doublons;
 pub mod album_metadata_repo;
 pub mod album_repo;
+/// #8958 — les alertes de « Albums douteux » marquées normales.
+pub mod alertes_douteuses_ignorees;
 /// #8077 — les apports d'un service à un album local (SQLite 142 / PG 108).
 pub mod apports_service;
 pub mod artist_repo;
@@ -87,6 +89,7 @@ pub mod profile_repo;
 /// #6682 — le temps d'écoute radio par station (« Mon écoute »).
 pub mod radio_ecoute;
 pub mod radio_repo;
+pub mod radio_titres_diffuses;
 /// #6500 — les stations de radio indexées comme pistes par l'UPnP, retirées.
 pub mod radios_indexees_upnp_6500;
 pub mod rating_repo;
@@ -113,6 +116,8 @@ pub mod streaming_favorites_repo;
 /// « Pas pour moi » — suggestions d'accueil écartées, par profil (web#916).
 pub mod suggestions_ecartees;
 pub mod tag_repo;
+/// Balises personnelles → tags Tune : pose et marque d'origine (#9158).
+pub mod tags_perso_repo;
 /// Registre des executions automatisees (#2080).
 pub mod task_run_repo;
 /// #8625 — le comptage de la bibliothèque partagé par tous les écrans.

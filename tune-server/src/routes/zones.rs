@@ -278,6 +278,15 @@ struct PatchZone {
     /// le périphérique (`exclusive_mode_applique` dans la fiche de zone).
     #[serde(default, deserialize_with = "double_option")]
     exclusive_mode: Option<Option<bool>>,
+
+    /// #8696 — période WASAPI exclusive de CETTE zone, en ms (Windows,
+    /// sortie locale en exclusif). Persistée en setting
+    /// `zone_{id}_wasapi_periode_ms`, bornée à 3..=500 ms. `null` ou `0`
+    /// efface : « Auto », la période du pilote (ou la variable
+    /// d'environnement `TUNE_WASAPI_EXCLUSIVE_PERIOD_MS`). Prise en compte à
+    /// la prochaine ouverture du périphérique.
+    #[serde(default, deserialize_with = "double_option")]
+    wasapi_exclusive_period_ms: Option<Option<u32>>,
 }
 
 /// Une transition vers le volume fixe est une commande de volume à 100 %, pas
@@ -451,6 +460,32 @@ fn inject_device_identity(
     obj.insert(
         "dsd_volume_protection".into(),
         json!(tune_core::audio::dop_ecarte_7265::protection_du_niveau_active(backend, zone_id)),
+    );
+    // #8696 — la période WASAPI exclusive réglée sur la zone. TOUJOURS
+    // publiée : `null` dit « Auto », et sa présence dit au client que ce
+    // serveur connaît le réglage. Les choix proposés l'accompagnent.
+    obj.insert(
+        "wasapi_exclusive_period_ms".into(),
+        json!(tune_core::outputs::periode_reglable_8696::reglage_de_zone(
+            backend, zone_id
+        )),
+    );
+    obj.insert(
+        "wasapi_exclusive_period_choices_ms".into(),
+        json!(tune_core::outputs::periode_reglable_8696::CHOIX_MS),
+    );
+    // Le réglage ne vaut que sur un serveur Windows, pour une zone LOCALE dont
+    // la sortie n'est pas ASIO (`backend_sortie`, posé plus tôt par
+    // `injecter_backend_de_sortie` quand il est connu) : le client n'affiche
+    // le sélecteur que là.
+    let applicable = tune_core::outputs::periode_reglable_8696::periode_applicable(
+        cfg!(target_os = "windows"),
+        obj.get("output_type").and_then(|v| v.as_str()),
+        obj.get("backend_sortie").and_then(|v| v.as_str()),
+    );
+    obj.insert(
+        "wasapi_exclusive_period_applicable".into(),
+        json!(applicable),
     );
     // #3254 — …et ce que ce réglage VAUT sur cette zone-ci. Le champ ci-dessus
     // était accepté et relu pour n'importe quelle zone, alors que les trois
@@ -710,6 +745,10 @@ mod composant_airplay2_7084;
 mod limites_de_volume_6541;
 // #7836 — les zones supprimées, listées et restaurables.
 mod zones_supprimees_7836;
+// #8987 — un appareil déjà lié à une zone : 409 nommés, sortie libérée d'une
+// zone supprimée, restauration sous un autre hôte audio signalée.
+mod zone_appareil_8987;
+pub(crate) use zone_appareil_8987::prendre_la_sortie_demandee;
 // #6721 — la garde contre les montées brusques, par le routeur public.
 #[cfg(test)]
 mod garde_de_hausse_6721_tests;

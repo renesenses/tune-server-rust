@@ -167,7 +167,7 @@ impl Feature {
             Feature::DacCalibration => "DAC Calibration",
             Feature::BatchConverter => "Batch Audio Converter",
             Feature::PlaylistsHub => "Playlists Hub",
-            Feature::Declick => "Dé-ploc",
+            Feature::Declick => "Declick",
         }
     }
 
@@ -230,7 +230,7 @@ impl Feature {
         match self {
             // Features licensed by Premium but NOT yet available/functional
             // (product decision — Bertrand). These show a red cross in the UI.
-            // Note: Dé-ploc IS available, so it is deliberately NOT listed here.
+            // Note: Declick IS available, so it is deliberately NOT listed here.
             // AES67 (#7336) : expérimentale dans la rc10, désactivée par défaut,
             // jamais essayée sur un vrai récepteur Dante/Ravenna.
             // Subsonic (#7855) : le socle seul (étape 1 sur 3), sans écran de
@@ -2501,4 +2501,27 @@ pub(crate) fn licence_premium_pour_test(db: Arc<dyn DbBackend>) -> Arc<LicenseMa
     let licence = Arc::new(LicenseManager::new(db));
     assert!(licence.premium_snapshot(), "licence de test non Premium");
     licence
+}
+
+#[cfg(test)]
+mod declick_nom_9213_tests {
+    use super::*;
+
+    #[test]
+    fn le_nom_affiche_est_declick() {
+        assert_eq!(Feature::Declick.display_name(), "Declick");
+    }
+
+    #[tokio::test]
+    async fn le_code_et_le_droit_premium_restent_inchanges() {
+        assert_eq!(Feature::Declick.code(), "declick");
+        assert!(Feature::all_premium().contains(&Feature::Declick));
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let licence = LicenseManager::new(Arc::new(db));
+        assert!(!licence.check_feature(Feature::Declick).await);
+        licence.set_account_premium(true, None).await;
+        assert!(licence.check_feature(Feature::Declick).await);
+    }
 }

@@ -88,7 +88,12 @@ async fn mon_theme_est_propose_s_installe_et_range_le_theme_par_profil() {
     let etat = demarrer(&base);
     let routeurs = tune_server::plugins::init(&etat, "http://127.0.0.1:0", vec![]).await;
     assert!(!routeurs.iter().any(|(n, _)| n == "mon-theme"), "opt-in");
-    let app = tune_server::routes::router_with_plugins(etat.clone(), routeurs);
+    let app = tune_server::routes::router_with_plugins(etat.clone(), routeurs).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let f = fiche(&app)
         .await
         .expect("« mon-theme » doit être PROPOSÉ par le gestionnaire (#2527)");
@@ -115,7 +120,12 @@ async fn mon_theme_est_propose_s_installe_et_range_le_theme_par_profil() {
     let alice = profils.create("alice-2527", None, None).unwrap();
     let bruno = profils.create("bruno-2527", None, None).unwrap();
     let routeurs = tune_server::plugins::init(&etat, "http://127.0.0.1:0", vec![]).await;
-    let app = tune_server::routes::router_with_plugins(etat.clone(), routeurs);
+    let app = tune_server::routes::router_with_plugins(etat.clone(), routeurs).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let f = fiche(&app).await.expect("un greffon qui tourne est listé");
     assert_eq!(f["enabled"], true, "{f}");
     assert_eq!(

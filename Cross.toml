@@ -131,6 +131,11 @@ passthrough = [
     "TUNE_VERSION",
     # #7148 — le SHA du commit construit, que la sentinelle de streaming publie.
     "TUNE_GIT_SHA",
+    # #8904 — client OAuth Google de Tune, lu par `option_env!` : sans ces
+    # deux lignes, les binaires ARM (Raspberry Pi, Docker arm64) garderaient
+    # le client de repli même quand la CI fournit celui de Tune.
+    "TUNE_YOUTUBE_CLIENT_ID",
+    "TUNE_YOUTUBE_CLIENT_SECRET",
 ]
 [target.aarch64-unknown-linux-musl.env]
 passthrough = [
@@ -147,4 +152,6 @@ passthrough = [
     # Cf. la cible gnu ci-dessus : la version du tag, pas celle de Cargo.toml.
     "TUNE_VERSION",
     "TUNE_GIT_SHA",
+    "TUNE_YOUTUBE_CLIENT_ID",
+    "TUNE_YOUTUBE_CLIENT_SECRET",
 ]
