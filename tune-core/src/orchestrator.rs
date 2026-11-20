@@ -1391,6 +1391,9 @@ pub struct PlaybackOrchestrator {
     /// de zones (`zone_groups`) ne compte qu'une écoute par titre. Voir
     /// `ecoute_validee_7852`.
     ecoutes_ecrites: std::sync::Mutex<HashMap<i64, ecoute_validee_7852::EcouteEcrite>>,
+    /// #9143 — le décompte, par zone, des pistes achevées de l'album en
+    /// session, pour le retrait automatique d'« Écouter plus tard ».
+    sas_retrait: Arc<crate::db::ecouter_plus_tard_retrait::SasRetrait>,
     /// #7974 — le suivi du bail d'écoute de chaque zone en lecture. Voir
     /// `bail_parental_7974`.
     ///
@@ -2023,6 +2026,7 @@ impl PlaybackOrchestrator {
             annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
             ecoutes_en_attente: std::sync::Mutex::new(HashMap::new()),
             ecoutes_ecrites: std::sync::Mutex::new(HashMap::new()),
+            sas_retrait: Arc::new(crate::db::ecouter_plus_tard_retrait::SasRetrait::new()),
             suivis_de_bail: std::sync::Mutex::new(HashMap::new()),
             confirmations_du_lecteur: std::sync::Mutex::new(Default::default()),
             #[cfg(feature = "local-audio")]
