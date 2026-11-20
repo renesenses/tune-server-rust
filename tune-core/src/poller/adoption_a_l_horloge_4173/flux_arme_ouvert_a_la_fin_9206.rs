@@ -363,6 +363,49 @@ async fn un_echec_une_reussite_un_echec_pas_de_garde_9206() {
     );
 }
 
+/// Une retombée de position alors que le renderer nomme ENCORE la piste
+/// finie (#5411, Sony BD-P2100) n'est qu'une avance provisoire : l'appareil
+/// n'est pas blanchi. Si la surveillance l'infirme (relance par `Play`),
+/// c'est un échec de suivant DSD.
+#[tokio::test]
+async fn rejeu_de_la_piste_finie_ne_blanchit_pas_l_appareil_9206() {
+    let appareil = "uuid:banc-9206-rejeu";
+    let (mut banc, _, _) = monter_9206(appareil).await;
+    // Un échec plus tôt dans la séance.
+    banc.orchestrator.retenir_dsd_suivant_lache(appareil, false);
+    let uri = banc.uri_finie_9206();
+    banc.le_renderer_rapporte(Some(uri)).await;
+    banc.sondage_9206(236_000, 239).await;
+    // Il repart de zéro… sur la piste finie.
+    banc.sondage_9206(1_000, 240).await;
+    let delai = banc
+        .surveillance()
+        .expect("#5411 : l'avance sur la piste finie est surveillée")
+        .delai_secs;
+    assert_eq!(
+        banc.orchestrator.echecs_dsd_suivant_pour_banc(appareil),
+        1,
+        "#9206 : une avance provisoire (rejeu) ne blanchit pas l'appareil"
+    );
+    // Le délai passe sans signe de vie sur le flux armé : relance.
+    banc.poll_states
+        .get_mut(&banc.zone_id)
+        .unwrap()
+        .adoption_horloge
+        .as_mut()
+        .unwrap()
+        .depuis = Instant::now() - Duration::from_secs(delai + 1);
+    banc.sondage_9206(9_000, delai + 1).await;
+    assert_eq!(banc.play_complets().await, vec![ARMEE.to_string()]);
+    assert!(
+        !banc
+            .orchestrator
+            .dsd_suivant_tenu_sur_dlna(banc.zone_id, appareil, AnnonceSuivante::Annoncee)
+            .await,
+        "#9206 : l'avance infirmée est le deuxième échec — la garde est rendue"
+    );
+}
+
 /// La règle pure.
 #[test]
 fn la_bascule_en_cours_pure_9206() {

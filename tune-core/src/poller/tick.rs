@@ -2048,6 +2048,8 @@ impl PositionPoller {
                                 "gapless_adoption_horloge_infirmee_relance"
                             );
                             ps.adoption_horloge = None;
+                            // #9206 — le renderer n'a pas suivi le flux armé.
+                            self.constater_le_suivant_non_suivi(zone_id);
                             poll_states.remove(&zone_id);
                             let position = zone_state.queue_position;
                             if let Err(e) =
@@ -2453,7 +2455,11 @@ impl PositionPoller {
                         .await;
                         info!(zone_id, next_pos, "gapless_advance_on_position_reset");
                         // #9206 — le renderer a suivi le flux armé de lui-même.
-                        self.constater_le_suivant_suivi(zone_id);
+                        // Pas s'il nomme encore la piste finie (#5411) : l'avance
+                        // n'est que provisoire, la surveillance tranchera.
+                        if rejeu.is_none() {
+                            self.constater_le_suivant_suivi(zone_id);
+                        }
                         let avance =
                             Box::pin(self.orchestrator.advance_queue_metadata(zone_id, next_pos))
                                 .await;
@@ -3545,7 +3551,10 @@ impl PositionPoller {
                             )
                             .await;
                             info!(zone_id, next_pos, "gapless_confirmed_advancing_metadata");
-                            self.constater_le_suivant_suivi(zone_id);
+                            // #9206 — voir la retombée de position.
+                            if rejeu.is_none() {
+                                self.constater_le_suivant_suivi(zone_id);
+                            }
                             let avance = Box::pin(
                                 self.orchestrator.advance_queue_metadata(zone_id, next_pos),
                             )
