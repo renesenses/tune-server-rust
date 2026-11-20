@@ -35,7 +35,7 @@ jobs:
   # manuel reste toujours complet.
   impact:
     name: Impact et garde-fous légers
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.classer.outputs.rust }}
@@ -238,9 +238,26 @@ jobs:
         run: python3 scripts/nouveautes-forum.py --self-test
 
       - name: Syntaxe des scripts de garde-fou
+        if: vars.SANS_DOCKER != '1'
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE:/repo" -w /repo \
             koalaman/shellcheck-alpine:v0.10.0 shellcheck --severity=warning \
+            scripts/detecter-impact-ci.sh \
+            scripts/determiner-profil-ci.sh \
+            scripts/detecter-jobs-lourds-ci.sh \
+            scripts/verifier-fermeture.sh \
+            scripts/verifier-refs-issues.sh \
+            scripts/docker-install.sh \
+            packaging/docker/entrypoint.sh \
+            packaging/docker/test-entrypoint.sh
+
+      # Runner auto-heberge sans docker (vars.SANS_DOCKER == '1') : meme
+      # shellcheck v0.10.0, en binaire epingle dans le PATH du runner.
+      - name: Syntaxe des scripts de garde-fou (sans docker)
+        if: vars.SANS_DOCKER == '1'
+        run: |
+          shellcheck --version | grep -qx 'version: 0.10.0'
+          shellcheck --severity=warning \
             scripts/detecter-impact-ci.sh \
             scripts/determiner-profil-ci.sh \
             scripts/detecter-jobs-lourds-ci.sh \
@@ -254,15 +271,35 @@ jobs:
       # setpriv/usermod/chown en root dans debian:bookworm-slim, la base de
       # Dockerfile.dist.
       - name: Entrypoint de l image Docker
+        if: vars.SANS_DOCKER != '1'
         run: bash packaging/docker/test-entrypoint.sh --conteneur
+
+      # Sans docker : la simulation (sans root) tourne ; le vrai passage en
+      # conteneur debian:bookworm-slim est SAUTE et le dit.
+      - name: Entrypoint de l image Docker (simulation, sans docker)
+        if: vars.SANS_DOCKER == '1'
+        run: |
+          echo "::warning::runner sans docker (vars.SANS_DOCKER=1) : passage en conteneur de test-entrypoint.sh saute, simulation seule"
+          bash packaging/docker/test-entrypoint.sh
 
       # Les workflows historiques portent quelques remarques shellcheck, mais
       # leur YAML et leurs expressions sont valides. On garde le controle
       # structurel et on ignore seulement ces deux familles connues.
       - name: Syntaxe des workflows GitHub
+        if: vars.SANS_DOCKER != '1'
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE:/repo" -w /repo \
             rhysd/actionlint:1.7.7 \
+            -shellcheck= \
+            -ignore 'constant.expression.*false' \
+            -ignore 'label.*macos-15-intel.*is unknown'
+
+      # Sans docker : meme actionlint 1.7.7, en binaire epingle.
+      - name: Syntaxe des workflows GitHub (sans docker)
+        if: vars.SANS_DOCKER == '1'
+        run: |
+          actionlint --version | head -1 | grep -qx '1.7.7'
+          actionlint \
             -shellcheck= \
             -ignore 'constant.expression.*false' \
             -ignore 'label.*macos-15-intel.*is unknown'
@@ -271,7 +308,7 @@ jobs:
     name: Format
     needs: impact
     if: needs.impact.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 15  # fmt — 27 s observe
     steps:
       - uses: actions/checkout@v4
@@ -285,7 +322,7 @@ jobs:
     name: Test
     needs: impact
     if: needs.impact.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 75  # test — 37 à 45 min observées début novembre (45 dépassé, PR #7711 et #7727)
     # 02/11 (train rc10) : le runner tuait le job en pleine compilation (143)
     # ou le coupait a 45 min. Sans info de debogage et a 2 compilations en
@@ -402,7 +439,7 @@ jobs:
     name: Test (jeu de fonctionnalites livre)
     needs: impact
     if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true' && needs.impact.outputs.livre == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 75  # compilation + suite complete : coupures observees a 45 min
     steps:
       - uses: actions/checkout@v4
@@ -465,7 +502,7 @@ jobs:
     # touchait que lui. Le classifieur n'allume `embedding` que si le diff
     # touche `*embedding*` / `*onnx*` : le profil rapide reste rapide ailleurs.
     if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.embedding == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 45  # audio-embedding — ~5 min observe
     steps:
       - uses: actions/checkout@v4
@@ -535,7 +572,7 @@ jobs:
   windows-pr:
     name: Windows + ASIO (compilation PR)
     needs: impact
-    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true' && needs.impact.outputs.windows == 'true'
+    if: (github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true' && needs.impact.outputs.windows == 'true') && vars.SANS_WINDOWS != '1'
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -579,7 +616,7 @@ jobs:
     name: macOS (compilation PR)
     needs: impact
     if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true' && needs.impact.outputs.macos == 'true'
-    runs-on: macos-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_MACOS || '"macos-latest"') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -623,7 +660,7 @@ jobs:
             os: windows-latest
             artifact: tune-server-windows-x86_64
 
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (startsWith(matrix.os, 'ubuntu-') && fromJSON(vars.RUNNER_LINUX || toJSON(matrix.os))) || (matrix.os == 'macos-latest' && fromJSON(vars.RUNNER_MACOS || '"macos-latest"')) || matrix.os }}
     timeout-minutes: 60  # build — 18 min au pire observe
     steps:
       - uses: actions/checkout@v4
@@ -824,7 +861,7 @@ jobs:
     name: Clippy
     needs: impact
     if: needs.impact.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 45  # clippy — 4 min observe (2 min avant #2865)
     steps:
       - uses: actions/checkout@v4
@@ -927,7 +964,7 @@ jobs:
     name: Security Audit
     needs: impact
     if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.audit == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 15  # audit — 10 s observe
     # Blocking: a security advisory must fail CI, not be swallowed. The wasmtime
     # advisories that forced continue-on-error are fixed (bump to 47.0.3).
@@ -1022,7 +1059,7 @@ jobs:
     # garde-fou (#1751) a refuse le tag, correctement, mais le signal n'est
     # jamais remonte jusqu'ici.
     #
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -1109,7 +1146,7 @@ jobs:
           - {target: x86_64-apple-darwin, os: macos-15-intel, cross: false}
           - {target: aarch64-apple-darwin, os: macos-latest, cross: false}
           - {target: x86_64-pc-windows-msvc, os: windows-latest, cross: false}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (startsWith(matrix.os, 'ubuntu-') && fromJSON(vars.RUNNER_LINUX || toJSON(matrix.os))) || (matrix.os == 'macos-latest' && fromJSON(vars.RUNNER_MACOS || '"macos-latest"')) || matrix.os }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -1194,7 +1231,7 @@ jobs:
       - audit
       - ffi
       - librespot
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 2
     steps:
       - name: Refuser une branche autre qu'une RC
