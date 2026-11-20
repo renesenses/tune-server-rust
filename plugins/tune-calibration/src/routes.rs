@@ -508,7 +508,7 @@ async fn enregistrer_le_profil(
             "aucune bande à enregistrer : rien à couper dans la zone".into(),
         );
     }
-    let profil = p.profil_de_zone(zone_id, nom, &chrono::Utc::now().to_rfc3339());
+    let profil = p.profil_de_zone(zone_id, nom, &chrono::Utc::now().to_rfc3339(), estimation);
     let hote = etat.controleur.hote.clone();
     let a_ecrire = profil.clone();
     let ecrit = tokio::task::spawn_blocking(move || hote.enregistrer_profil_piece(&a_ecrire))

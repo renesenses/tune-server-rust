@@ -41,6 +41,11 @@ pub struct CorrectionFilter {
     pub filter_type: FilterType,
 }
 
+/// D1 (TESS, 18/11) : origine d'une correction mesurée au micro (Premium).
+pub const ORIGINE_MESUREE: &str = "measured";
+/// D1 : origine d'une correction calculée sans micro (C5, #7919 ; Free).
+pub const ORIGINE_ESTIMEE: &str = "estimation";
+
 /// A complete room correction profile for one zone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RoomProfile {
@@ -56,6 +61,12 @@ pub struct RoomProfile {
     /// reference / re-analysis.  `None` when the profile was created
     /// manually without measurement.
     pub measurement_data: Option<String>,
+    /// D1 (TESS) : d'où vient la correction, [`ORIGINE_MESUREE`] ou
+    /// [`ORIGINE_ESTIMEE`], enregistré à la création par le serveur. Absent
+    /// pour un profil plus ancien : TESS le devine alors par le nom
+    /// (`tess::migration::origine_de_la_piece`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
