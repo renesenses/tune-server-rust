@@ -126,6 +126,10 @@ async fn un_refus_du_recepteur_en_session_ne_change_pas_le_statut_confirme() {
     *sortie.rtsp_session.lock().await = Some(session);
     assert!(sortie.set_volume(0.25).await.is_err());
     let status = sortie.get_status().await.unwrap();
-    assert_eq!(status.volume, 1.0);
+    // #8855 : le niveau de naissance, jamais la pleine échelle.
+    assert_eq!(
+        status.volume,
+        crate::outputs::airplay2::volume_de_depart_8402::VOLUME_DE_DEPART_PRUDENT
+    );
     assert!(sortie.volume_en_attente.lock().await.is_none());
 }

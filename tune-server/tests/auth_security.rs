@@ -213,15 +213,27 @@ async fn passwordless_default_allowed_from_loopback_then_admin_can_rotate() {
     );
 }
 
-/// With auth disabled (the default), first-run setup must stay open — the admin
-/// UI enables auth from an unauthenticated, secret-less state.
+/// With auth disabled (the default), first-run setup stays open FROM THIS
+/// MACHINE. From another host, enabling auth (which decides who controls the
+/// server) goes through `POST /auth/activation` with the one-time code
+/// written in the server log.
 #[tokio::test]
 async fn auth_disabled_keeps_first_run_setup_open() {
     let state = new_state();
-    let app = app(&state, REMOTE);
+
+    let (st, corps) = post_json(
+        &app(&state, REMOTE),
+        "/api/v1/auth/config",
+        None,
+        r#"{"auth_enabled":true}"#,
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "remote enable-auth: {corps}");
+    assert!(corps.contains("activation_code_required"), "{corps}");
+    assert!(!tune_server::auth::authentification_active(&state));
 
     let (st, _) = post_json(
-        &app,
+        &app(&state, LOCAL),
         "/api/v1/auth/config",
         None,
         r#"{"auth_enabled":true}"#,
@@ -230,7 +242,7 @@ async fn auth_disabled_keeps_first_run_setup_open() {
     assert_eq!(
         st,
         StatusCode::OK,
-        "first-run enable-auth must not be blocked"
+        "first-run enable-auth from this machine must not be blocked"
     );
 }
 

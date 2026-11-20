@@ -190,6 +190,9 @@ fn piste_locale_dans_un_album(state: &AppState) -> (i64, i64) {
 
 fn de_service(source: &str, source_id: &str, album_ref: Option<&str>) -> QueueInput {
     QueueInput::Streaming {
+        media_format: None,
+        sample_rate: None,
+        bit_depth: None,
         source: source.into(),
         source_id: source_id.into(),
         title: "Meet Her At The Love Parade".into(),

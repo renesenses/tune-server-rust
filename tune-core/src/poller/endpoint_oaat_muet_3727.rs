@@ -51,12 +51,29 @@ async fn endpoint_qui_accepte_et_se_tait() -> u16 {
     port
 }
 
-/// Un port que personne n'écoute : lié puis relâché, il refuse (RST).
-async fn port_sans_personne() -> u16 {
-    let ecouteur = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = ecouteur.local_addr().unwrap().port();
-    drop(ecouteur);
-    port
+/// Un port que personne n'écoute, et que personne NE PEUT prendre : la
+/// prise est LIÉE au port sans jamais écouter (`listen` jamais appelé), et
+/// gardée vivante par le test. Une connexion y est refusée (RST).
+///
+/// QA 18/11 (instable en CI le 17/11) — l'ancienne version liait puis
+/// relâchait le port. Pendant les ≈ 40 s de tentatives, un autre test du même
+/// processus (ou le noyau, pour une connexion sortante vers ce même port :
+/// l'auto-connexion TCP) pouvait reprendre le port : la quinzième tentative
+/// était ACCEPTÉE puis restait muette, et le motif devenait « tenu par un
+/// autre serveur ». Le port réservé ne peut plus être ni écouté par un
+/// autre, ni choisi comme port source.
+fn port_sans_personne() -> (u16, socket2::Socket) {
+    let prise = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    prise
+        .bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+        .unwrap();
+    let port = prise
+        .local_addr()
+        .unwrap()
+        .as_socket()
+        .expect("adresse IPv4")
+        .port();
+    (port, prise)
 }
 
 struct Banc {
@@ -252,7 +269,12 @@ async fn un_endpoint_qui_accepte_et_se_tait_est_nomme_et_la_zone_ne_reste_pas_pl
 /// déclaré « tenu par un autre serveur Tune ».
 #[tokio::test]
 async fn un_port_sans_personne_renonce_en_disant_injoignable_sans_accuser_un_voisin() {
-    let port = port_sans_personne().await;
+    let (port, _reserve) = port_sans_personne();
+    // Le banc mesure ce qu'il croit mesurer : personne ne peut écouter ce port.
+    assert!(
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_err(),
+        "le port {port} du contre-témoin doit rester impossible à écouter"
+    );
     let mut banc = Banc::monter(port).await;
 
     let (message, fatal) = banc

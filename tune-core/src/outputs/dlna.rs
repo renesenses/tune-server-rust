@@ -46,6 +46,15 @@ pub mod titre_radio_2991;
 #[path = "dlna_volume_illisible_5662.rs"]
 pub(crate) mod volume_illisible_5662;
 
+/// #8685 — la sourdine relue sur l'appareil (`GetMute`) avant et après
+/// chaque `SetMute`.
+#[path = "dlna_sourdine_relue_8685.rs"]
+mod sourdine_relue_8685;
+
+#[cfg(test)]
+#[path = "dlna_sourdine_relue_8685_tests.rs"]
+mod sourdine_relue_8685_tests;
+
 /// #5575 — renderer qui acquitte `SetVolume` sans jamais l'appliquer.
 #[path = "dlna_volume_decoratif_5575.rs"]
 pub(crate) mod volume_decoratif_5575;
@@ -1460,6 +1469,15 @@ impl DlnaOutput {
         if self.sourdine_par_volume_nul.load(Ordering::Relaxed) {
             return self.sourdine_par_volume_nul().await;
         }
+        // #8685 — un appareil déjà muet ne reçoit pas un second `SetMute(1)` :
+        // l'Eversolo DMP-A8 sortait de ces réaffirmations avec une sourdine
+        // INVERSÉE (son au bouton « muet », silence au bouton « non muet »).
+        if self.lire_la_sourdine().await == Some(true) {
+            self.sourdine_par_volume_nul.store(false, Ordering::Relaxed);
+            self.event_state.lock().await.muted = Some(true);
+            info!(device = %self.name, device_id = %self.device_id, "dlna_sourdine_deja_tenue");
+            return Ok("deja_tenue");
+        }
         let reponse = self
             .rc_action(
                 "SetMute",
@@ -1478,7 +1496,8 @@ impl DlnaOutput {
         };
         let Some(refus) = refus else {
             self.sourdine_par_volume_nul.store(false, Ordering::Relaxed);
-            self.event_state.lock().await.muted = Some(true);
+            // #8685 — l'acquittement ne suffit pas : l'état relu fait foi.
+            self.confirmer_la_sourdine(true).await?;
             return Ok("SetMute");
         };
         warn!(device = %self.name, response = %refus, "dlna_set_mute_rejected_volume_nul");
@@ -2498,7 +2517,7 @@ impl DlnaOutput {
     /// GetProtocolInfo Sink spelling (Beoplay A9 / Sink audio/x-flac, forum
     /// 714) and for the 714 PCM fallback.
     fn didl_metadata_mime(media: &PlayMedia<'_>, item_id: &str, mime: &str) -> String {
-        let is_dsd = mime.contains("dsd") || mime.contains("dsf");
+        let is_dsd = mime_est_du_dsd(mime);
         DidlBuilder::new(media.title.unwrap_or("Unknown"), media.url, mime)
             .protocol_style(ProtocolStyle::Dlna)
             .live_stream(media.live_stream)
@@ -2540,7 +2559,7 @@ impl DlnaOutput {
     /// `sampleFrequency` / `bitsPerSample` dans `<res>` : le budget d'un
     /// segment TCP est préservé — la variante sans `PN` est même plus courte.
     fn didl_metadata_minimale(media: &PlayMedia<'_>, item_id: &str, mime: &str) -> String {
-        let is_dsd = mime.contains("dsd") || mime.contains("dsf");
+        let is_dsd = mime_est_du_dsd(mime);
         DidlBuilder::new(media.title.unwrap_or("Unknown"), media.url, mime)
             .protocol_style(ProtocolStyle::Dlna)
             .live_stream(media.live_stream)
@@ -2670,66 +2689,83 @@ impl OutputTarget for DlnaOutput {
         // chaque lecture en empilerait deux de plus dans le récepteur, tous
         // renouvelés toutes les 250 s pour un flux mort.
         self.unsubscribe_events().await;
-        // Fire-and-forget Stop with a tight deadline: give the renderer up to
-        // 500ms to acknowledge Stop, then proceed regardless.  Most renderers
-        // accept SetAVTransportURI while playing (implicit stop), but we still
-        // send Stop for renderers like DMP-A8 that need it.  The short deadline
-        // ensures we don't block 2-10s waiting for a slow SOAP response.
-        let url_stop = self.url_de(VoieSoap::AvTransport);
-        let stop_fut = self.soap_action_fast(
-            &url_stop,
-            AV_TRANSPORT_URN,
-            "Stop",
-            "<InstanceID>0</InstanceID>",
-        );
-        tokio::select! {
-            result = stop_fut => {
-                match result {
-                    Ok(()) => debug!(device = %self.name, "dlna_play_pre_stop_ok"),
-                    Err(e) => debug!(device = %self.name, error = %e, "dlna_play_pre_stop_ignored"),
+        // #8834 — pour le Musicbook, tenter la nouvelle URI en lecture. Le
+        // pré-Stop peut couper sa sortie (relais), puis ajoute l'attente
+        // d'arrêt. Liste volontairement étroite, fondée sur modelName UPnP :
+        // un nom de zone ou d'appareil renommé ne suffit pas. DMP-A8 et modèles
+        // inconnus gardent la séquence d'arrêt confirmé ci-dessous.
+        let sans_pre_stop = self.modele.as_deref().is_some_and(|modele| {
+            let normalise: String = modele
+                .chars()
+                .filter(|c| c.is_ascii_alphanumeric())
+                .map(|c| c.to_ascii_lowercase())
+                .collect();
+            normalise == "musicbooksource"
+        });
+        if sans_pre_stop {
+            debug!(device = %self.name, modele = ?self.modele, "dlna_saut_sans_pre_stop");
+        } else {
+            // Fire-and-forget Stop with a tight deadline: give the renderer up to
+            // 500ms to acknowledge Stop, then proceed regardless.  Most renderers
+            // accept SetAVTransportURI while playing (implicit stop), but we still
+            // send Stop for renderers like DMP-A8 that need it.  The short deadline
+            // ensures we don't block 2-10s waiting for a slow SOAP response.
+            let url_stop = self.url_de(VoieSoap::AvTransport);
+            let stop_fut = self.soap_action_fast(
+                &url_stop,
+                AV_TRANSPORT_URN,
+                "Stop",
+                "<InstanceID>0</InstanceID>",
+            );
+            tokio::select! {
+                result = stop_fut => {
+                    match result {
+                        Ok(()) => debug!(device = %self.name, "dlna_play_pre_stop_ok"),
+                        Err(e) => debug!(device = %self.name, error = %e, "dlna_play_pre_stop_ignored"),
+                    }
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                    debug!(device = %self.name, "dlna_play_pre_stop_timeout_proceeding");
                 }
             }
-            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
-                debug!(device = %self.name, "dlna_play_pre_stop_timeout_proceeding");
-            }
-        }
 
-        // Un Stop ACQUITTÉ n'est pas un Stop APPLIQUÉ. L'Eversolo répond OK
-        // puis met ~1-2 s à s'arrêter ; un SetAVTransportURI envoyé 5 ms plus
-        // tard est acquitté… et ignoré — il continue son flux précédent (la
-        // course des 5 ms, .42, 24/08 ; la même séquence espacée de 2 s est
-        // acceptée). On attend l'arrêt réel, borné à ~2 s, et on continue quoi
-        // qu'il arrive : c'est une politesse, jamais une barrière. Le renderer
-        // déjà arrêté — le cas nominal — coûte UN GetTransportInfo.
-        for attente in 0..8u32 {
-            match self
-                .av_action("GetTransportInfo", "<InstanceID>0</InstanceID>")
-                .await
-            {
-                Ok(resp) if arret_effectif(&resp) => {
-                    if attente > 0 {
-                        debug!(device = %self.name, polls = attente + 1, "dlna_pre_stop_arret_confirme");
+            // Un Stop ACQUITTÉ n'est pas un Stop APPLIQUÉ. L'Eversolo répond OK
+            // puis met ~1-2 s à s'arrêter ; un SetAVTransportURI envoyé 5 ms plus
+            // tard est acquitté… et ignoré — il continue son flux précédent (la
+            // course des 5 ms, .42, 24/08 ; la même séquence espacée de 2 s est
+            // acceptée). On attend l'arrêt réel, borné à ~2 s, et on continue quoi
+            // qu'il arrive : c'est une politesse, jamais une barrière. Le renderer
+            // déjà arrêté — le cas nominal — coûte UN GetTransportInfo.
+            for attente in 0..8u32 {
+                match self
+                    .av_action("GetTransportInfo", "<InstanceID>0</InstanceID>")
+                    .await
+                {
+                    Ok(resp) if arret_effectif(&resp) => {
+                        if attente > 0 {
+                            debug!(device = %self.name, polls = attente + 1, "dlna_pre_stop_arret_confirme");
+                        }
+                        break;
                     }
-                    break;
-                }
-                // Un renderer sans GetTransportInfo ne doit rien bloquer.
-                Err(_) => break,
-                Ok(_) if attente == 7 => {
-                    warn!(device = %self.name, "dlna_pre_stop_jamais_applique_on_continue");
-                }
-                Ok(_) => {
-                    // À mi-parcours, escalader : l'Eversolo coincé en
-                    // TRANSITIONING (flux mort qu'il ressasse) ACQUITTE les
-                    // Stop sans les exécuter — seul Pause→Stop le libère
-                    // (constaté par SOAP direct sur le DMP-A8, 25/08 : Stop →
-                    // toujours PLAYING ; Pause → PAUSED_PLAYBACK ; Stop →
-                    // STOPPED).
-                    if attente == 3 {
-                        debug!(device = %self.name, "dlna_pre_stop_escalade_pause_puis_stop");
-                        let _ = self.av_action("Pause", "<InstanceID>0</InstanceID>").await;
-                        let _ = self.av_action("Stop", "<InstanceID>0</InstanceID>").await;
+                    // Un renderer sans GetTransportInfo ne doit rien bloquer.
+                    Err(_) => break,
+                    Ok(_) if attente == 7 => {
+                        warn!(device = %self.name, "dlna_pre_stop_jamais_applique_on_continue");
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    Ok(_) => {
+                        // À mi-parcours, escalader : l'Eversolo coincé en
+                        // TRANSITIONING (flux mort qu'il ressasse) ACQUITTE les
+                        // Stop sans les exécuter — seul Pause→Stop le libère
+                        // (constaté par SOAP direct sur le DMP-A8, 25/08 : Stop →
+                        // toujours PLAYING ; Pause → PAUSED_PLAYBACK ; Stop →
+                        // STOPPED).
+                        if attente == 3 {
+                            debug!(device = %self.name, "dlna_pre_stop_escalade_pause_puis_stop");
+                            let _ = self.av_action("Pause", "<InstanceID>0</InstanceID>").await;
+                            let _ = self.av_action("Stop", "<InstanceID>0</InstanceID>").await;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
                 }
             }
         }
@@ -2774,7 +2810,10 @@ impl OutputTarget for DlnaOutput {
             .niveau_de_depart(maintenant_ms, &self.name);
         // Le profil qui a fini par passer sur CET appareil (UDN) pour ce MIME
         // source : on part de lui, sans repayer les refus à chaque piste.
-        let profil_appris = repli_set_uri::profil_memorise(&self.device_id, media.mime_type);
+        // #8956 — un DSD générique se mémorise PAR CONTENEUR : le profil
+        // `audio/x-dsf` appris sur un `.dsf` ne doit pas étiqueter un `.dff`.
+        let cle_profil = cle_du_profil_set_uri(media.mime_type, media.url);
+        let profil_appris = repli_set_uri::profil_memorise(&self.device_id, &cle_profil);
         if let Some(profil) = &profil_appris {
             attempt_mime = profil.mime_annonce.clone();
             niveau_impose_par_repli = profil.niveau_didl_min;
@@ -2834,7 +2873,7 @@ impl OutputTarget for DlnaOutput {
                     {
                         repli_set_uri::memoriser_profil(
                             &self.device_id,
-                            media.mime_type,
+                            &cle_profil,
                             repli_set_uri::ProfilSetUri {
                                 mime_annonce: attempt_mime.clone(),
                                 niveau_didl_min: niveau_impose_par_repli,
@@ -2893,7 +2932,7 @@ impl OutputTarget for DlnaOutput {
             if essai == 1 && profil_appris.is_some() {
                 // Le profil mémorisé ne passe plus (mise à jour du renderer,
                 // autre réglage) : on l'oublie, la reprise repart de lui.
-                repli_set_uri::oublier_profil(&self.device_id, media.mime_type);
+                repli_set_uri::oublier_profil(&self.device_id, &cle_profil);
             }
 
             // Error 714 ("Illegal MIME-type"): the renderer parsed the DIDL but
@@ -2918,7 +2957,7 @@ impl OutputTarget for DlnaOutput {
                 // (e.g. audio/x-flac) if it differs from what we just sent.
                 if !tried_exact {
                     tried_exact = true;
-                    let exact = advertised_mime_for_sink(media.mime_type, &sink);
+                    let exact = advertised_mime_for_sink_url(media.mime_type, media.url, &sink);
                     if !exact.eq_ignore_ascii_case(&attempt_mime) {
                         warn!(
                             device = %self.name,
@@ -2942,6 +2981,24 @@ impl OutputTarget for DlnaOutput {
                         replis += 1;
                         continue;
                     }
+                }
+
+                // #8956 — jamais d'étiquette PCM sur des octets DSD. Cette
+                // reprise ne touche pas au flux : l'Atoll ST200 recevait
+                // `audio/wav;DLNA.ORG_PN=LPCM` dans la DIDL, faisait un `HEAD`
+                // sur l'adresse, y lisait le `Content-Type` DSD du flux et
+                // refusait (714) — et un renderer moins regardant aurait lu
+                // du DSF comme du WAV. Le DSD se reprend par l'orthographe du
+                // conteneur (ci-dessus) ; le PCM, c'est le réglage DSD de la
+                // zone (« PCM ») qui le fabrique, pas une étiquette.
+                if !tried_fallback && mime_est_du_dsd(media.mime_type) {
+                    tried_fallback = true;
+                    warn!(
+                        device = %self.name,
+                        advertised_mime = %attempt_mime,
+                        sink = ?sink,
+                        "dlna_set_uri_714_pas_d_etiquette_pcm_sur_du_dsd"
+                    );
                 }
 
                 // Retry (b): fall back to a PCM MIME the Sink lists (audio/wav
@@ -2992,7 +3049,7 @@ impl OutputTarget for DlnaOutput {
                     tried_exact = true;
                     (
                         "minimal_canonique",
-                        advertised_mime_for_sink(media.mime_type, &sink),
+                        advertised_mime_for_sink_url(media.mime_type, media.url, &sink),
                         1u8,
                     )
                 } else {
@@ -3542,6 +3599,15 @@ impl OutputTarget for DlnaOutput {
             self.muted.store(false, Ordering::Relaxed);
             return Ok(());
         }
+        // #8685 — un appareil qui n'est pas muet ne reçoit pas `SetMute(0)` :
+        // sur un firmware qui bascule au lieu d'appliquer la valeur, ce
+        // `SetMute(0)` coupait le son que l'auditeur croyait rendre.
+        if self.lire_la_sourdine().await == Some(false) {
+            info!(device = %self.name, device_id = %self.device_id, "dlna_sourdine_deja_levee");
+            self.event_state.lock().await.muted = Some(false);
+            self.muted.store(false, Ordering::Relaxed);
+            return Ok(());
+        }
         let reponse = self
             .rc_action(
                 "SetMute",
@@ -3558,8 +3624,12 @@ impl OutputTarget for DlnaOutput {
         info!(device = %self.name, device_id = %self.device_id, commande = "SetMute", "dlna_unmute_ok");
         // Même geste que `OpenHomeOutput::set_mute` : l'état poussé porte
         // désormais la levée, on ne le laisse pas en retard d'un évènement
-        // sur ce que Tune vient d'obtenir.
-        self.event_state.lock().await.muted = Some(false);
+        // sur ce que Tune vient d'obtenir. #8685 — après relecture : un
+        // appareil resté muet n'est pas annoncé « son rendu ».
+        if let Err(e) = self.confirmer_la_sourdine(false).await {
+            self.muted.store(true, Ordering::Relaxed);
+            return Err(e);
+        }
         self.muted.store(false, Ordering::Relaxed);
         Ok(())
     }
@@ -3838,7 +3908,10 @@ impl OutputTarget for DlnaOutput {
         // Le profil appris par `play_media` sur un refus (501/714/716) vaut
         // pour la suivante du même format : sans lui, le gapless repaierait le
         // refus que la pose de la piste courante a déjà résolu.
-        let profil = repli_set_uri::profil_memorise(&self.device_id, media.mime_type);
+        let profil = repli_set_uri::profil_memorise(
+            &self.device_id,
+            &cle_du_profil_set_uri(media.mime_type, media.url),
+        );
         let mime_suivant = profil
             .as_ref()
             .map(|p| p.mime_annonce.clone())
@@ -4121,6 +4194,104 @@ pub struct DsdCapability {
     pub supports_dsf: bool,
     pub supports_dff: bool,
     pub dsf_mime: Option<String>,
+    /// #8956 — toutes les orthographes DSD du Sink (MIME de base, dans
+    /// l'ordre du Sink, sans doublon). `dsf_mime` ne garde que la première,
+    /// qui ne dit pas le conteneur : l'Atoll ST200 publie `audio/x-dsf` ET
+    /// `audio/x-dff`, et refuse le générique `application/x-dsd`.
+    /// Voir [`mime_dsd_pour_conteneur`].
+    pub mimes_dsd: Vec<String>,
+}
+
+/// Le conteneur DSD que nomme une adresse : `dsf` / `dff` d'après
+/// l'extension du chemin, `None` si elle ne dit rien.
+pub(crate) fn conteneur_dsd_de_l_url(url: &str) -> Option<&'static str> {
+    let chemin = url
+        .split(['?', '#'])
+        .next()
+        .unwrap_or(url)
+        .to_ascii_lowercase();
+    if chemin.ends_with(".dff") {
+        Some("dff")
+    } else if chemin.ends_with(".dsf") {
+        Some("dsf")
+    } else {
+        None
+    }
+}
+
+/// Le conteneur DSD que nomment les premiers octets d'un fichier :
+/// `DSD ` → `dsf`, `FRM8` → `dff`.
+pub(crate) fn conteneur_dsd_de_l_en_tete(tete: &[u8]) -> Option<&'static str> {
+    match tete.get(..4)? {
+        b"DSD " => Some("dsf"),
+        b"FRM8" => Some("dff"),
+        _ => None,
+    }
+}
+
+/// Un MIME qui nomme du DSD (générique ou conteneur précis).
+pub(crate) fn mime_est_du_dsd(mime: &str) -> bool {
+    let m = mime.to_ascii_lowercase();
+    m.contains("dsd") || m.contains("dsf") || m.contains("dff")
+}
+
+/// #8956 — l'orthographe DSD à annoncer pour `conteneur` (`dsf` / `dff`)
+/// parmi celles que publie le Sink (`listes`, MIME de base).
+///
+/// D'abord l'orthographe du CONTENEUR (`audio/x-dsf`, `audio/dsf`,
+/// `application/dsf` ; `audio/x-dff`, `audio/dff`), puis les génériques
+/// (`audio/x-dsd`, `audio/dsd`, `application/x-dsd`, `audio/vnd.dsd`). Jamais
+/// l'orthographe de l'AUTRE conteneur : un DFF annoncé `audio/x-dsf` est un
+/// mensonge sur les octets. `None` : le Sink ne publie rien qui convienne.
+pub(crate) fn mime_dsd_pour_conteneur(conteneur: &str, listes: &[String]) -> Option<String> {
+    let propres: &[&str] = if conteneur == "dff" {
+        &["audio/x-dff", "audio/dff"]
+    } else {
+        &[
+            "audio/x-dsf",
+            "audio/dsf",
+            "application/dsf",
+            "application/x-dsf",
+        ]
+    };
+    let generiques = [
+        "audio/x-dsd",
+        "audio/dsd",
+        "application/x-dsd",
+        "audio/vnd.dsd",
+    ];
+    propres
+        .iter()
+        .chain(generiques.iter())
+        .find_map(|voulu| listes.iter().find(|b| b.eq_ignore_ascii_case(voulu)))
+        .cloned()
+}
+
+/// #8956 — l'orthographe à annoncer sur une reprise de refus : pour un DSD
+/// dont l'adresse nomme le conteneur, celle du conteneur que publie le Sink ;
+/// sinon [`advertised_mime_for_sink`].
+fn advertised_mime_for_sink_url(desired: &str, url: &str, sink: &[String]) -> String {
+    if mime_est_du_dsd(desired)
+        && let Some(conteneur) = conteneur_dsd_de_l_url(url)
+    {
+        let listes: Vec<String> = sink
+            .iter()
+            .filter_map(|e| sink_entry_base_mime(e))
+            .collect();
+        if let Some(m) = mime_dsd_pour_conteneur(conteneur, &listes) {
+            return m;
+        }
+    }
+    advertised_mime_for_sink(desired, sink)
+}
+
+/// #8956 — la clé sous laquelle se mémorise le profil de pose : le MIME
+/// source, précisé du conteneur pour un DSD dont l'adresse le nomme.
+fn cle_du_profil_set_uri(mime_source: &str, url: &str) -> String {
+    match conteneur_dsd_de_l_url(url) {
+        Some(conteneur) if mime_est_du_dsd(mime_source) => format!("{mime_source}#{conteneur}"),
+        _ => mime_source.to_string(),
+    }
 }
 
 /// Read native DSD support out of a non-empty GetProtocolInfo Sink.
@@ -4153,6 +4324,12 @@ pub(crate) fn parse_dsd_capability(protocols: &[String]) -> DsdCapability {
         }
         if lower.contains("audio/dff") || lower.contains("x-dff") || lower.contains("audio/x-dff") {
             cap.supports_dff = true;
+        }
+        if let Some(base) = sink_entry_base_mime(proto)
+            && mime_est_du_dsd(&base)
+            && !cap.mimes_dsd.iter().any(|m| m.eq_ignore_ascii_case(&base))
+        {
+            cap.mimes_dsd.push(base);
         }
     }
     cap
@@ -5127,6 +5304,59 @@ mod tests {
         assert!(cap.supports_dsf, "x-dsd counts as DSD");
         assert!(cap.supports_dff);
         assert_eq!(cap.dsf_mime.as_deref(), Some("audio/x-dsd"));
+    }
+
+    /// #8956 — l'orthographe du CONTENEUR d'abord, puis un générique ; jamais
+    /// celle de l'autre conteneur.
+    #[test]
+    fn mime_dsd_8956_suit_le_conteneur_dans_l_orthographe_du_sink() {
+        let st200 = vec![
+            "http-get:*:audio/flac:*".to_string(),
+            "http-get:*:audio/x-dsf:*".to_string(),
+            "rtsp-rtp-udp:*:audio/x-dsf:*".to_string(),
+            "http-get:*:audio/x-dff:*".to_string(),
+        ];
+        let cap = parse_dsd_capability(&st200);
+        assert_eq!(cap.mimes_dsd, vec!["audio/x-dsf", "audio/x-dff"]);
+        assert_eq!(
+            mime_dsd_pour_conteneur("dsf", &cap.mimes_dsd).as_deref(),
+            Some("audio/x-dsf")
+        );
+        assert_eq!(
+            mime_dsd_pour_conteneur("dff", &cap.mimes_dsd).as_deref(),
+            Some("audio/x-dff")
+        );
+        // Un Sink qui ne publie qu'un générique : le générique, pour les deux.
+        let generique = vec!["audio/x-dsd".to_string()];
+        assert_eq!(
+            mime_dsd_pour_conteneur("dff", &generique).as_deref(),
+            Some("audio/x-dsd")
+        );
+        // DSF seul : un DFF n'en prend PAS l'orthographe.
+        let dsf_seul = vec!["audio/dsf".to_string()];
+        assert_eq!(mime_dsd_pour_conteneur("dff", &dsf_seul), None);
+        assert_eq!(
+            conteneur_dsd_de_l_url("http://h/x/piste.DFF?t=1"),
+            Some("dff")
+        );
+        assert_eq!(
+            conteneur_dsd_de_l_url("http://h/stream/abc.dsf"),
+            Some("dsf")
+        );
+        assert_eq!(conteneur_dsd_de_l_url("http://h/item?id=3"), None);
+        assert_eq!(conteneur_dsd_de_l_en_tete(b"FRM8\0\0"), Some("dff"));
+        assert_eq!(conteneur_dsd_de_l_en_tete(b"DSD \0"), Some("dsf"));
+        assert_eq!(conteneur_dsd_de_l_en_tete(b"RIFF"), None);
+        // La reprise 714 d'un DSD : le conteneur de l'adresse ; un FLAC garde
+        // la règle des alias.
+        assert_eq!(
+            advertised_mime_for_sink_url("application/x-dsd", "http://h/stream/a.dff", &st200),
+            "audio/x-dff"
+        );
+        assert_eq!(
+            advertised_mime_for_sink_url("audio/x-flac", "http://h/stream/a.flac", &st200),
+            "audio/flac"
+        );
     }
 
     #[test]

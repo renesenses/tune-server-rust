@@ -563,6 +563,28 @@ pub(super) fn cadence_pour_le_surechantillonneur(
     }
 }
 
+/// #9165 — la part de [`cadence_pour_le_surechantillonneur`] qui se juge
+/// SANS périphérique, par la même fonction : bit-perfect strict, source déjà
+/// au plus haut des cadences candidates, verdict de la machine, plafonds des
+/// réglages. On suppose que le périphérique accepte toutes les candidates et
+/// que sa liste est mesurée (`hw:`) ; ce qui reste lié au matériel — liste
+/// supposée, aucune candidate acceptée — ne se sait qu'à l'ouverture.
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn surechantillonneur_possible_sans_peripherique(
+    choix: &crate::audio::surechantillonnage::ChoixSurechantillonnage,
+    strict_bitperfect: bool,
+    source_sr: u32,
+) -> Result<(), RefusDeCadenceDuGreffon> {
+    cadence_pour_le_surechantillonneur(
+        choix,
+        super::resolution::SampleRateEvidence::Measured,
+        strict_bitperfect,
+        source_sr,
+        |_| true,
+    )
+    .map(|_| ())
+}
+
 /// #8149 — pourquoi [`cadence_pour_le_surechantillonneur`] ne rend aucune
 /// cadence. Chaque variante porte les cadences qui ont passé l'étape
 /// précédente : le journal dit où la chaîne s'arrête.

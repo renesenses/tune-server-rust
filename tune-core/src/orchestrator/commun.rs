@@ -177,7 +177,7 @@ impl PlaybackOrchestrator {
     pub(super) async fn resolve_stream(&self, req: &PlayRequest) -> Result<ResolvedStream, String> {
         let resolu = match self.reprendre_preparation_fichier(req).await {
             Some(resolu) => resolu,
-            None => self.resolve_stream_frais(req).await,
+            None => Box::pin(self.resolve_stream_frais(req)).await,
         };
         // #8701 — le fMP4 DASH de la piste que la zone joue (ou prépare,
         // `resolve_queue_item_url`) reste servi par le cache du service tant
@@ -201,7 +201,7 @@ impl PlaybackOrchestrator {
         // pendant qu'elle tourne, l'empreinte notée est l'ancienne, et le
         // prochain changement relancera. Jamais l'inverse.
         let empreinte = self.empreinte_du_traitement(req.zone_id, req.piste_rg());
-        let resolu = self.resolve_stream_sans_noter(req).await?;
+        let resolu = Box::pin(self.resolve_stream_sans_noter(req)).await?;
         if let Some(ref sid) = resolu.stream_id {
             self.noter_traitement_du_flux(req.zone_id, sid, empreinte);
         }
@@ -231,9 +231,23 @@ impl PlaybackOrchestrator {
             // cherche un service nommé « bandcamp » dans le registre et
             // échoue — c'est pour ça que la vue jouait dans l'onglet plutôt
             // que dans la zone (#1768).
+            // #9207 (fil 2962) — une URI reçue par le MediaRenderer qui
+            // désigne la bibliothèque de CETTE instance se joue comme la
+            // piste locale : même chaîne que l'interface web (conversion,
+            // bit-perfect, PURE), au lieu du flux HTTP brut de notre propre
+            // route, que la sortie locale ne sait pas toujours sonder (AIFF).
+            // Toute autre URI reste un flux distant.
+            if source == "upnp"
+                && let Some(track_id) = req
+                    .source_id
+                    .as_deref()
+                    .and_then(|uri| self.piste_locale_de_notre_uri(uri))
+            {
+                return Box::pin(self.resoudre_notre_uri_en_piste_locale(req, track_id)).await;
+            }
             if source == "podcast" || source == "radio" || source == "upnp" || source == "bandcamp"
             {
-                return self.resolve_direct_url(req).await;
+                return Box::pin(self.resolve_direct_url(req)).await;
             }
             // #4863 — une source PCM inscrite par un greffon (lecture d'un CD).
             if let Some(fournisseur) = self.sources_pcm.fournisseur(source) {
@@ -242,10 +256,10 @@ impl PlaybackOrchestrator {
             // #5327 — une source dont un greffon fournit l'URL au moment de
             // jouer (Tune Circle : un billet d'écoute par piste).
             if let Some(fournisseur) = self.sources_url.fournisseur(source) {
-                return self.resolve_source_url(source, fournisseur, req).await;
+                return Box::pin(self.resolve_source_url(source, fournisseur, req)).await;
             }
             // #4366 — un 403 YouTube rafraîchit yt-dlp et relance une fois.
-            return self.resolve_streaming_url_avec_relance(source, req).await;
+            return Box::pin(self.resolve_streaming_url_avec_relance(source, req)).await;
         }
 
         // Phase 3 du chantier `unifier-serveurs-upnp-et-bibliotheque` : une
@@ -266,7 +280,7 @@ impl PlaybackOrchestrator {
         if let Some(track_id) = req.track_id
             && self.source_de_la_ligne(track_id).as_deref() == Some("upnp")
         {
-            return self.resolve_direct_url_de_source(req, Some("upnp")).await;
+            return Box::pin(self.resolve_direct_url_de_source(req, Some("upnp"))).await;
         }
 
         self.resolve_local_track(req).await
@@ -1145,6 +1159,17 @@ impl PlaybackOrchestrator {
 
     pub async fn streamer_bytes_sent(&self, stream_id: &str) -> Option<u64> {
         self.streamer.stream_bytes_sent(stream_id).await
+    }
+
+    /// #9206 — depuis combien de millisecondes ce flux est lu au-delà de
+    /// l'en-tête (voir [`AudioStreamer::stream_lecture_au_dela_de_l_en_tete_depuis_ms`]).
+    pub async fn streamer_lecture_au_dela_de_l_en_tete_depuis_ms(
+        &self,
+        stream_id: &str,
+    ) -> Option<u64> {
+        self.streamer
+            .stream_lecture_au_dela_de_l_en_tete_depuis_ms(stream_id)
+            .await
     }
 
     /// Audio servie à ce renderer, en millisecondes (voir
