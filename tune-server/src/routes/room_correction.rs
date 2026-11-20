@@ -375,6 +375,29 @@ fn cadence_du_fichier(chemin: &str) -> Option<u32> {
         .map(|(_, sr)| sr)
 }
 
+/// #8761 — valider un fichier depose AVANT de l'enregistrer : lisible, et
+/// dans les bornes (frequence de 8 a 768 kHz, canaux, prises). Rend sa
+/// frequence.
+fn valider_le_depot(chemin: &std::path::Path) -> Result<u32, String> {
+    tune_core::audio::convolver::ConvolverConfig::from_wav(chemin.to_str().unwrap_or(""))
+        .map(|c| c.sample_rate())
+}
+
+/// #8761 — un nom provisoire UNIQUE pour un depot : deux depots simultanes
+/// sur la meme zone ne s'ecrasent pas.
+fn chemin_provisoire(ir_dir: &std::path::Path, zone_id: i64) -> std::path::PathBuf {
+    static NUMERO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NUMERO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    ir_dir.join(format!(
+        "depot_zone_{zone_id}_{}_{t}_{n}.tmp",
+        std::process::id()
+    ))
+}
+
 fn ecrire_supplementaires(settings: &SettingsRepo, zone_id: i64, liste: &[String]) {
     let cle = format!(
         "{}{zone_id}",
@@ -402,7 +425,7 @@ async fn ajouter_au_jeu(
 ) -> axum::response::Response {
     let ir_dir = dossier_ir();
     std::fs::create_dir_all(&ir_dir).ok();
-    let provisoire = ir_dir.join(format!("zone_{zone_id}_depot.wav"));
+    let provisoire = chemin_provisoire(&ir_dir, zone_id);
     if let Err(e) = std::fs::write(&provisoire, body) {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -410,13 +433,12 @@ async fn ajouter_au_jeu(
         )
             .into_response();
     }
-    let Some(cadence) = cadence_du_fichier(provisoire.to_str().unwrap_or("")) else {
-        let e =
-            tune_core::audio::convolver::Convolver::read_ir_taps(provisoire.to_str().unwrap_or(""))
-                .err()
-                .unwrap_or_default();
-        std::fs::remove_file(&provisoire).ok();
-        return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+    let cadence = match valider_le_depot(&provisoire) {
+        Ok(c) => c,
+        Err(e) => {
+            std::fs::remove_file(&provisoire).ok();
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+        }
     };
     let chemin = ir_dir.join(format!("zone_{zone_id}_sr{cadence}.wav"));
     if let Err(e) = std::fs::rename(&provisoire, &chemin) {
@@ -510,6 +532,7 @@ async fn upload_ir_handler(
     let ir_dir = dossier_ir();
     std::fs::create_dir_all(&ir_dir).ok();
     let ir_path = ir_dir.join(format!("zone_{zone_id}.wav"));
+    let provisoire = chemin_provisoire(&ir_dir, zone_id);
     let cote = match canal.channel.as_deref() {
         None | Some("") => None,
         Some("left") | Some("l") | Some("gauche") => Some("L"),
@@ -562,11 +585,26 @@ async fn upload_ir_handler(
         if let Err(e) = tune_core::audio::convolver::Convolver::combiner_en_stereo(
             gauche.to_str().unwrap_or(""),
             droite.to_str().unwrap_or(""),
-            ir_path.to_str().unwrap_or(""),
+            provisoire.to_str().unwrap_or(""),
         ) {
+            std::fs::remove_file(&provisoire).ok();
             return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
         }
-    } else if let Err(e) = std::fs::write(&ir_path, &body) {
+    } else if let Err(e) = std::fs::write(&provisoire, &body) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("write IR: {e}")})),
+        )
+            .into_response();
+    }
+    // #8761 — valider AVANT de remplacer le fichier et d'ecrire le reglage :
+    // un fichier refuse ne laisse ni reglage ni ancien filtre ecrase.
+    if let Err(e) = valider_le_depot(&provisoire) {
+        std::fs::remove_file(&provisoire).ok();
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+    }
+    if let Err(e) = std::fs::rename(&provisoire, &ir_path) {
+        std::fs::remove_file(&provisoire).ok();
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("write IR: {e}")})),
@@ -645,10 +683,15 @@ async fn clear_ir_handler(
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let ir_dir = dossier_ir();
     let principal_par_defaut = ir_dir.join(format!("zone_{zone_id}.wav"));
-    // On n'efface que ce que Tune a lui-meme range dans son dossier `ir/`.
+    // Validation stricte des chemins : on n'efface que ce que Tune a lui-meme
+    // range dans son dossier `ir/` pour CETTE zone (dossier parent compare
+    // apres resolution, nom exact `zone_{id}.wav` ou `zone_{id}_sr{N}.wav`).
     let effacer = |chemin: &str| {
-        if std::path::Path::new(chemin).starts_with(&ir_dir) {
-            std::fs::remove_file(chemin).ok();
+        let p = std::path::Path::new(chemin);
+        if tune_core::audio::convolver::par_cadence::chemin_du_jeu_effacable(p, &ir_dir, zone_id) {
+            std::fs::remove_file(p).ok();
+        } else {
+            tracing::warn!(zone_id, chemin, "convolver_ir_suppression_refusee_hors_dossier");
         }
     };
     let mut supplementaires =

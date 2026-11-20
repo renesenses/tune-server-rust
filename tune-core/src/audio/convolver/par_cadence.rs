@@ -47,6 +47,112 @@ pub const CLE_JEU: &str = "ir_jeu_";
 /// d'avant #8761). Absent ou toute autre valeur : autorisé.
 pub const CLE_REECHANTILLONNAGE: &str = "ir_resample_";
 
+/// Cadences admises pour un fichier de réponse impulsionnelle : de 8 kHz à
+/// 768 kHz. Un en-tête WAV peut annoncer n'importe quel entier sur 32 bits ;
+/// au-delà de ces bornes, le rééchantillonnage demanderait des tampons
+/// démesurés.
+pub const CADENCE_MIN: u32 = 8_000;
+pub const CADENCE_MAX: u32 = 768_000;
+/// Prises par canal d'un fichier (2^20 : 21,8 s à 48 kHz).
+pub const PRISES_MAX: usize = 1 << 20;
+/// Prises par canal APRÈS rééchantillonnage (2^21) : plafonne prises ×
+/// rapport de cadences.
+pub const PRISES_MAX_APRES: usize = 1 << 21;
+/// Canaux par fichier.
+pub const CANAUX_MAX: usize = 32;
+
+/// `Ok` si `sample_rate` est dans [`CADENCE_MIN`, `CADENCE_MAX`].
+pub fn cadence_admise(sample_rate: u32) -> Result<(), String> {
+    if (CADENCE_MIN..=CADENCE_MAX).contains(&sample_rate) {
+        Ok(())
+    } else {
+        Err(format!(
+            "fréquence d'échantillonnage de {sample_rate} Hz hors des bornes admises ({CADENCE_MIN} à {CADENCE_MAX} Hz)"
+        ))
+    }
+}
+
+/// Bornes d'une réponse impulsionnelle chargée : cadence, canaux, prises.
+pub fn ri_admise(taps: &[Vec<f32>], sample_rate: u32) -> Result<(), String> {
+    cadence_admise(sample_rate)?;
+    if taps.is_empty() || taps.iter().any(Vec::is_empty) {
+        return Err("réponse impulsionnelle vide".into());
+    }
+    if taps.len() > CANAUX_MAX {
+        return Err(format!(
+            "réponse impulsionnelle à {} canaux (au plus {CANAUX_MAX})",
+            taps.len()
+        ));
+    }
+    let prises = taps.iter().map(Vec::len).max().unwrap_or(0);
+    if prises > PRISES_MAX {
+        return Err(format!(
+            "réponse impulsionnelle de {prises} prises (au plus {PRISES_MAX})"
+        ));
+    }
+    Ok(())
+}
+
+/// #8761 — le nom d'un fichier que Tune range lui-même dans son dossier
+/// `ir/` pour une zone : `zone_{id}.wav` ou `zone_{id}_sr{cadence}.wav`.
+/// `zone_id` à `None` accepte n'importe quel identifiant (import d'une
+/// configuration venue d'une autre machine).
+pub fn nom_du_jeu_valide(nom: &str, zone_id: Option<i64>) -> bool {
+    let chiffres = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let Some(corps) = nom.strip_prefix("zone_").and_then(|r| r.strip_suffix(".wav")) else {
+        return false;
+    };
+    let id = match corps.split_once("_sr") {
+        Some((id, cadence)) if chiffres(cadence) => id,
+        Some(_) => return false,
+        None => corps,
+    };
+    chiffres(id) && zone_id.is_none_or(|z| id == z.to_string())
+}
+
+/// Validation stricte d'un chemin avant suppression : le fichier est
+/// DIRECTEMENT dans `ir_dir` (dossiers parents comparés après résolution
+/// des liens et des `..`) et son nom est l'un de ceux que Tune donne à la
+/// zone `zone_id`.
+pub fn chemin_du_jeu_effacable(
+    chemin: &std::path::Path,
+    ir_dir: &std::path::Path,
+    zone_id: i64,
+) -> bool {
+    let (Some(parent), Some(nom)) = (chemin.parent(), chemin.file_name().and_then(|n| n.to_str()))
+    else {
+        return false;
+    };
+    if !nom_du_jeu_valide(nom, Some(zone_id)) {
+        return false;
+    }
+    match (parent.canonicalize(), ir_dir.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Validation stricte d'une valeur `ir_jeu_{zone}` importée : un tableau
+/// JSON de chemins sans composant `..`, dont le nom est un nom de jeu. Rend
+/// la liste filtrée, ou `None` s'il ne reste rien.
+pub fn liste_du_jeu_importable(valeur: &str) -> Option<String> {
+    let liste: Vec<String> = serde_json::from_str(valeur).ok()?;
+    let gardes: Vec<String> = liste
+        .into_iter()
+        .filter(|p| {
+            let chemin = std::path::Path::new(p);
+            !chemin
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+                && chemin
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| nom_du_jeu_valide(n, None))
+        })
+        .collect();
+    (!gardes.is_empty()).then(|| serde_json::to_string(&gardes).ok())?
+}
+
 /// Une réponse impulsionnelle du jeu, à sa cadence.
 #[derive(Clone)]
 pub(super) struct Variante {
@@ -72,12 +178,7 @@ impl Variante {
 
     pub(super) fn depuis_fichier(chemin: &str) -> Result<Self, String> {
         let (taps, sample_rate) = Convolver::read_wav_ir(chemin)?;
-        if sample_rate == 0 {
-            return Err(format!("{chemin} : cadence nulle"));
-        }
-        if taps.is_empty() || taps.iter().any(Vec::is_empty) {
-            return Err(format!("{chemin} : réponse impulsionnelle vide"));
-        }
+        ri_admise(&taps, sample_rate).map_err(|e| format!("{chemin} : {e}"))?;
         let meta = std::fs::metadata(chemin).ok();
         let taille = meta.as_ref().map(|m| m.len()).unwrap_or(0);
         let date = meta
@@ -185,9 +286,10 @@ pub fn marge_d_amorce(de: u32, vers: u32) -> (usize, usize) {
 ///
 /// Rubato sinc (le rééchantillonneur de la chaîne, phase linéaire), sur le
 /// filtre complété de [`marge_d_amorce`] zéros de chaque côté ; coefficients
-/// mis à l'échelle `de / vers` pour conserver la réponse en fréquence. Le
-/// résultat est retardé de `marge_d_amorce(de, vers).1` trames, sur tous les
-/// canaux à l'identique.
+/// mis à l'échelle `de / vers` pour conserver la réponse en fréquence. Les
+/// `marge_d_amorce(de, vers).1` trames d'amorce sont retirées en tête : la
+/// RI rééchantillonnée garde l'instant zéro du fichier d'origine, et le
+/// convolveur sa latence annoncée (`latency_frames`, fondu de #7632).
 pub fn reechantillonner_ri(taps: &[Vec<f32>], de: u32, vers: u32) -> Vec<Vec<f32>> {
     if de == vers || taps.is_empty() {
         return taps.to_vec();
@@ -204,30 +306,52 @@ pub fn reechantillonner_ri(taps: &[Vec<f32>], de: u32, vers: u32) -> Vec<Vec<f32
     }
     let sortie = crate::audio::resample::rubato_resample_track(&entrelace, de, vers, canaux as u16);
     let echelle = de as f32 / vers as f32;
+    let (_, retard) = marge_d_amorce(de, vers);
     let n = sortie.len() / canaux;
+    let debut = retard.min(n);
     (0..canaux)
-        .map(|c| (0..n).map(|i| sortie[i * canaux + c] * echelle).collect())
+        .map(|c| (debut..n).map(|i| sortie[i * canaux + c] * echelle).collect())
         .collect()
 }
 
 /// Le cache des RI rééchantillonnées, partagé par toutes les sorties : clé =
-/// (identité du contenu, cadence visée). Borné : au-delà, on repart de zéro
-/// (une RI de 65 536 prises stéréo pèse 0,5 Mo ; 32 entrées, 16 Mo au pire).
+/// (identité du contenu, cadence visée). Borné en entrées ET en octets :
+/// au-delà, on repart de zéro (une RI de 65 536 prises stéréo rééchantillonnée
+/// à 96 kHz pèse environ 1,1 Mo). Une RI plus grosse que le plafond entier
+/// n'est pas gardée.
 const CACHE_MAX: usize = 32;
+const CACHE_MAX_OCTETS: usize = 64 << 20;
 type CleCache = (String, u32);
-static CACHE: LazyLock<Mutex<HashMap<CleCache, Arc<[Vec<f32>]>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+#[derive(Default)]
+struct CacheRi {
+    entrees: HashMap<CleCache, Arc<[Vec<f32>]>>,
+    octets: usize,
+}
+static CACHE: LazyLock<Mutex<CacheRi>> = LazyLock::new(|| Mutex::new(CacheRi::default()));
+
+fn octets_de(ri: &[Vec<f32>]) -> usize {
+    ri.iter().map(|c| c.len() * std::mem::size_of::<f32>()).sum()
+}
 
 /// La RI de `variante` à la cadence `vers`, depuis le cache ou calculée (le
 /// calcul se fait HORS du verrou : un rééchantillonnage en cours ne bloque
 /// pas un autre lecteur du cache).
-pub(super) fn ri_a_la_cadence(variante: &Variante, vers: u32) -> Arc<[Vec<f32>]> {
+pub(super) fn ri_a_la_cadence(variante: &Variante, vers: u32) -> Result<Arc<[Vec<f32>]>, String> {
     if variante.sample_rate == vers {
-        return variante.taps.clone();
+        return Ok(variante.taps.clone());
+    }
+    cadence_admise(vers).map_err(|e| format!("flux : {e}"))?;
+    let prises = variante.taps.iter().map(Vec::len).max().unwrap_or(0) as u64;
+    let prises_apres = prises * vers as u64 / variante.sample_rate.max(1) as u64;
+    if prises_apres > PRISES_MAX_APRES as u64 {
+        return Err(format!(
+            "réponse impulsionnelle trop longue pour être rééchantillonnée de {} à {vers} Hz : {prises_apres} prises (au plus {PRISES_MAX_APRES}) ; fournissez un fichier à {vers} Hz",
+            variante.sample_rate
+        ));
     }
     let cle = (variante.cle.clone(), vers);
-    if let Some(ri) = CACHE.lock().ok().and_then(|c| c.get(&cle).cloned()) {
-        return ri;
+    if let Some(ri) = CACHE.lock().ok().and_then(|c| c.entrees.get(&cle).cloned()) {
+        return Ok(ri);
     }
     let debut = std::time::Instant::now();
     let ri: Arc<[Vec<f32>]> =
@@ -241,15 +365,29 @@ pub(super) fn ri_a_la_cadence(variante: &Variante, vers: u32) -> Arc<[Vec<f32>]>
         ms = debut.elapsed().as_secs_f64() * 1000.0,
         "convolver_ir_reechantillonnee"
     );
+    let taille = octets_de(&ri);
+    if taille > CACHE_MAX_OCTETS {
+        return Ok(ri);
+    }
     if let Ok(mut c) = CACHE.lock() {
-        if c.len() >= CACHE_MAX && !c.contains_key(&cle) {
-            c.clear();
-        }
         // Un calcul concurrent a pu passer devant : garder le premier, pour
         // que tous les appelants partagent la même instance.
-        return c.entry(cle).or_insert(ri).clone();
+        if let Some(deja) = c.entrees.get(&cle) {
+            return Ok(deja.clone());
+        }
+        if c.entrees.len() >= CACHE_MAX || c.octets + taille > CACHE_MAX_OCTETS {
+            c.entrees.clear();
+            c.octets = 0;
+        }
+        c.octets += taille;
+        c.entrees.insert(cle, ri.clone());
     }
-    ri
+    Ok(ri)
+}
+
+/// Octets occupés par le cache (tests, diagnostic).
+pub fn octets_en_cache() -> usize {
+    CACHE.lock().map(|c| c.octets).unwrap_or(0)
 }
 
 /// L'état effectif par jeu (clé : le chemin du fichier principal), écrit à

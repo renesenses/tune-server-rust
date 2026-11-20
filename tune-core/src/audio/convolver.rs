@@ -47,6 +47,7 @@ impl ConvolverConfig {
         if impulse_response.is_empty() || impulse_response.iter().any(Vec::is_empty) {
             return Err("la réponse impulsionnelle doit contenir des taps sur chaque canal".into());
         }
+        par_cadence::ri_admise(&impulse_response, sample_rate)?;
         let taps: Arc<[Vec<f32>]> = impulse_response.into();
         Ok(Self {
             variantes: vec![par_cadence::Variante::en_memoire(taps.clone(), sample_rate)].into(),
@@ -172,7 +173,7 @@ impl ConvolverConfig {
         let choix = self.choix_pour(cible)?;
         let (i, _) = par_cadence::planifier(&self.variantes, cible)
             .ok_or("aucun fichier de réponse impulsionnelle")?;
-        let taps = par_cadence::ri_a_la_cadence(&self.variantes[i], cible);
+        let taps = par_cadence::ri_a_la_cadence(&self.variantes[i], cible)?;
         Ok((choix, taps))
     }
 
@@ -184,7 +185,9 @@ impl ConvolverConfig {
         }
         for &c in cadences {
             if let Some((i, _)) = par_cadence::planifier(&self.variantes, c) {
-                let _ = par_cadence::ri_a_la_cadence(&self.variantes[i], c);
+                if let Err(e) = par_cadence::ri_a_la_cadence(&self.variantes[i], c) {
+                    tracing::warn!(cadence = c, error = %e, "convolver_ir_prechauffe_ecartee");
+                }
             }
         }
     }
