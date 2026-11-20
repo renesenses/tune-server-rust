@@ -516,15 +516,23 @@ fn volume_restaurable(zone: &Map<String, Value>) -> bool {
 /// Un gabarit de réglage de zone, une fois l'identifiant posé, doit rester une
 /// clé de CETTE zone et ne rien porter de secret : un fichier ne peut pas
 /// écrire n'importe quoi par ce chemin.
+/// TESS D1 : un gabarit de réglage de zone que seul le serveur écrit (profil
+/// de pièce, chaîne TESS et son ombre) ; l'import l'ignore.
+fn gabarit_tenu_par_le_serveur(gabarit: &str) -> bool {
+    crate::tess::migration::cle_tenue_par_le_serveur(&gabarit.replace("{id}", "0"))
+}
+
 fn cle_de_zone_valide(gabarit: &str, id: i64) -> Option<String> {
     let cle = gabarit.replace("{id}", &id.to_string());
     match gabarit_de_cle_de_zone(&cle) {
         // Fil 2694 — les marques de la radio de fin de file ne s'importent pas.
+        // TESS D1 — ni les clés tenues par le serveur.
         Some((zid, g))
             if zid == id
                 && g == gabarit
                 && !est_secret(&cle)
-                && !crate::playback::radio_fin_de_file::cle_de_marques(&cle) =>
+                && !crate::playback::radio_fin_de_file::cle_de_marques(&cle)
+                && !crate::tess::migration::cle_tenue_par_le_serveur(&cle) =>
         {
             Some(cle)
         }
@@ -624,6 +632,19 @@ pub fn planifier(backend: &Arc<dyn DbBackend>, fichier: &Fichier) -> Result<Plan
                 avertissements.push(format!(
                     "zone '{nom}': no device identity; volume settings were not restored"
                 ));
+            }
+            // TESS D1 : le profil de pièce (son origine décide du droit
+            // Premium) et la chaîne TESS ne s'importent pas ; la chaîne se
+            // reconstruit depuis les anciennes clés de la zone.
+            if let Some(r) = donnees.get_mut("settings").and_then(Value::as_object_mut) {
+                let avant = r.len();
+                r.retain(|gabarit, _| !gabarit_tenu_par_le_serveur(gabarit));
+                let ecartes = avant - r.len();
+                if ecartes > 0 {
+                    avertissements.push(format!(
+                        "zone '{nom}': {ecartes} server-managed setting(s) (room correction profile, TESS chain) skipped"
+                    ));
+                }
             }
             let zone = &donnees;
             if let Some(id) = existante
@@ -729,7 +750,13 @@ pub fn planifier(backend: &Arc<dyn DbBackend>, fichier: &Fichier) -> Result<Plan
     // ── Réglages ──
     let mut reglages = Vec::new();
     let mut ignores_de_zone = 0usize;
+    let mut tenus_par_le_serveur: Vec<&str> = Vec::new();
     for (cle, brute) in &fichier.settings {
+        // TESS D1 : mêmes clés que celles que `PATCH /system/config` refuse.
+        if crate::tess::migration::cle_tenue_par_le_serveur(cle) {
+            tenus_par_le_serveur.push(cle);
+            continue;
+        }
         // L'ancien format à plat ne porte aucune identité d'appareil.
         if fichier.format_version < 2
             && gabarit_de_cle_de_zone(cle).is_some_and(|(_, gabarit)| {
@@ -777,6 +804,12 @@ pub fn planifier(backend: &Arc<dyn DbBackend>, fichier: &Fichier) -> Result<Plan
     if ignores_de_zone > 0 {
         avertissements.push(format!(
             "{ignores_de_zone} zone setting(s) outside their zone were skipped"
+        ));
+    }
+    if !tenus_par_le_serveur.is_empty() {
+        avertissements.push(format!(
+            "server-managed setting(s) skipped (room correction profiles and TESS chains are written by their own routes): {}",
+            tenus_par_le_serveur.join(", ")
         ));
     }
 

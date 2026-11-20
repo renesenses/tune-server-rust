@@ -292,6 +292,9 @@ fn natifs_variante(i: i64) -> Vec<(&'static str, Value)> {
 fn semer(backend: &Arc<dyn DbBackend>, s: &SettingsRepo) -> Vec<i64> {
     let repo = crate::db::zone_repo::ZoneRepo::with_backend(backend.clone());
     s.set("eq_expert_bands", "10").unwrap();
+    // Le crossfeed intégré et les deux paquets du groupe sont en service :
+    // la priorité seule départage (décision B).
+    installer(s, &["crossfeed", "crossfeed-pro", "crosstalk"]);
     let mut zones = Vec::new();
     for i in 0..ZONES {
         let appareil = if reseau(i) {
@@ -311,11 +314,18 @@ fn semer(backend: &Arc<dyn DbBackend>, s: &SettingsRepo) -> Vec<i64> {
         if let Some((p, id)) = eq_variante(i) {
             if id == ID_CORRECTION_PIECE {
                 let piece = crate::room_correction::RoomProfile {
-                    name: format!("Room {i:03}"),
+                    // D1 : une zone de pièce sur deux est une estimation
+                    // sans micro (C5), au nom par défaut de C5.
+                    name: if estimation_c5(i) {
+                        format!("Estimation sim-{i:03}")
+                    } else {
+                        format!("Calibration mes-{i:03}")
+                    },
                     zone_id: z.to_string(),
                     filters: filtres_de_piece(),
                     created_at: "2026-11-18T00:00:00Z".into(),
                     measurement_data: None,
+                    origin: None,
                 };
                 s.set(
                     &format!("room_profile_{z}"),
@@ -393,14 +403,24 @@ fn semer(backend: &Arc<dyn DbBackend>, s: &SettingsRepo) -> Vec<i64> {
 
 /// Ce que la chaîne ENREGISTRÉE doit contenir pour la zone `i`, dans
 /// l'ordre, déduit des variantes et non du code de migration.
+/// D1 : la correction de pièce de la zone `i` est-elle calculée sans micro ?
+fn estimation_c5(i: i64) -> bool {
+    i % 24 == 21
+}
+
 fn attendu(i: i64) -> Vec<(String, bool, Value)> {
     let mut v = Vec::new();
     if let Some((p, id)) = eq_variante(i) {
         let mut s = sans_enabled_v(serde_json::to_value(&p).unwrap());
         if id == ID_CORRECTION_PIECE {
+            let origine = if estimation_c5(i) {
+                "estimation"
+            } else {
+                "measured"
+            };
             s.as_object_mut()
                 .unwrap()
-                .insert("legacy".into(), json!(true));
+                .insert("origin".into(), json!(origine));
         }
         v.push((id.to_owned(), p.enabled, s));
     }
@@ -435,7 +455,44 @@ fn attendu(i: i64) -> Vec<(String, bool, Value)> {
             sans_enabled_v(x),
         ));
     }
+    // Décision B, écrite à la main : Crosstalk (3) > crossfeed-* (2) >
+    // crossfeed (1) ; les autres membres cochés sont décochés et marqués.
+    let prio = |id: &str| match id {
+        "crosstalk" => Some(3),
+        "crossfeed-pro" => Some(2),
+        "crossfeed" => Some(1),
+        _ => None,
+    };
+    let membres: Vec<usize> = (0..v.len())
+        .filter(|&k| v[k].1 && prio(&v[k].0).is_some())
+        .collect();
+    if membres.len() > 1 {
+        let gagnant = *membres
+            .iter()
+            .max_by_key(|&&k| (prio(&v[k].0), std::cmp::Reverse(k)))
+            .unwrap();
+        let id_gagnant = v[gagnant].0.clone();
+        for k in membres {
+            if k != gagnant {
+                v[k].1 = false;
+                v[k].2
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("replaced_in_group".into(), json!(id_gagnant));
+            }
+        }
+    }
     v
+}
+
+/// Installe et active ces greffons (intégrés ou paquets).
+fn installer(s: &SettingsRepo, ids: &[&str]) {
+    s.set(crate::audio::premium_plugins::MIGRATION, "complete")
+        .unwrap();
+    for id in ids {
+        s.set(&format!("plugin_{id}_installed"), "true").unwrap();
+        s.set(&format!("plugin_{id}_enabled"), "true").unwrap();
+    }
 }
 
 fn upsampling_attendu(i: i64) -> Upsampling {
@@ -540,19 +597,22 @@ fn la_grande_base_lue_sans_premium() {
         let i = i as i64;
         let premium = lire_zone(&s, z, true).unwrap();
         let gratuit = lire_zone(&s, z, false).unwrap();
-        // P2 seulement sur un paramétrique coché (variantes 7 et 10).
-        let converti = matches!(i % 12, 7 | 10);
+        // P2 sur un paramétrique coché (variantes 7 et 10), D1 sur une
+        // correction de pièce MESURÉE (variante 9, hors estimations C5).
+        let piece_mesuree = i % 12 == 9 && !estimation_c5(i);
+        let converti = matches!(i % 12, 7 | 10) || piece_mesuree;
         assert_eq!(gratuit.conversion_p2, converti, "zone {i}");
+        assert_eq!(gratuit.conversion_piece, piece_mesuree, "zone {i}");
         if converti {
             assert_eq!(gratuit.chaine.plugins[0].id, ID_EQ_GRAPHIQUE);
             assert_eq!(gratuit.chaine.plugins[1..], premium.chaine.plugins[1..]);
         } else {
             assert_eq!(gratuit.chaine, premium.chaine, "zone {i}");
         }
-        // D1 : l'égaliseur de pièce reste actif sans Premium.
-        if i % 12 == 9 {
+        // D1 : l'estimation sans micro reste active et non convertie.
+        if estimation_c5(i) {
             let m = maillon(&gratuit.chaine, ID_CORRECTION_PIECE);
-            assert!(m.enabled && droit_acquis(m));
+            assert!(m.enabled && correction_estimee(m));
         }
     }
     // Lire n'écrit rien.
@@ -591,12 +651,26 @@ fn la_base_couvre_toutes_les_combinaisons_connues() {
     ] {
         assert!(vus.contains(&(id.to_owned(), on)), "{id} {on}");
     }
-    // Le groupe crossfeed entier coché ensemble (§ 8).
+    // Le groupe crossfeed entier, coché ensemble dans les anciennes clés :
+    // un seul membre coché dans la chaîne, les autres marqués (décision B).
     assert!(chaines.iter().any(|c| {
-        ["crossfeed", "crossfeed-pro", "crosstalk"]
-            .iter()
-            .all(|id| c.plugins.iter().any(|m| m.id == *id && m.enabled))
+        let membre = |id: &str| c.plugins.iter().find(|m| m.id == id);
+        membre("crosstalk").is_some_and(|m| m.enabled)
+            && ["crossfeed", "crossfeed-pro"].iter().all(|id| {
+                membre(id).is_some_and(|m| {
+                    !m.enabled && m.settings["replaced_in_group"] == json!("crosstalk")
+                })
+            })
     }));
+    // Jamais deux membres cochés.
+    for c in &chaines {
+        let coches = c
+            .plugins
+            .iter()
+            .filter(|m| m.enabled && priorite_dans_le_groupe(&m.id).is_some())
+            .count();
+        assert!(coches <= 1, "{:?}", ids(c));
+    }
     let surechantillonnages: BTreeSet<String> = chaines
         .iter()
         .map(|c| format!("{:?}", c.fixed.upsampling))
@@ -676,7 +750,7 @@ fn ecrire_comme_les_anciennes_routes(s: &SettingsRepo, z: i64) {
         .unwrap();
     s.set(
         &format!("zone_{z}_native_plugin_crosstalk"),
-        r#"{"enabled":true,"span_deg":45}"#,
+        r#"{"enabled":false,"span_deg":45}"#,
     )
     .unwrap();
 }
@@ -1224,58 +1298,187 @@ fn contexte_gratuit(dispo: &dyn Fn(&str) -> bool) -> ContexteExecution<'_> {
     }
 }
 
-#[test]
-fn d1_l_egaliseur_de_piece_deja_pose_reste_actif_sans_premium() {
-    let (_b, s) = base();
-    let z = 15;
+/// Pose un profil de pièce (JSON brut, pour pouvoir y ajouter un champ) et
+/// l'égaliseur qu'il produit, comme `POST /room-correction/.../apply`.
+fn poser_la_piece(s: &SettingsRepo, z: i64, nom: &str, champ: Option<(&str, Value)>) -> String {
     let piece = crate::room_correction::RoomProfile {
-        name: "Salon".into(),
+        name: nom.into(),
         zone_id: z.to_string(),
         filters: filtres_de_piece(),
         created_at: "2026-11-18T00:00:00Z".into(),
         measurement_data: None,
+        origin: None,
     };
-    s.set(
-        &format!("room_profile_{z}"),
-        &serde_json::to_string(&piece).unwrap(),
-    )
-    .unwrap();
+    let mut v = serde_json::to_value(&piece).unwrap();
+    if let Some((k, x)) = champ {
+        v.as_object_mut().unwrap().insert(k.into(), x);
+    }
+    s.set(&format!("room_profile_{z}"), &v.to_string()).unwrap();
     let eq = crate::room_correction::profil_eq_de_correction(&filtres_de_piece());
     let brut = serde_json::to_string(&eq).unwrap();
     s.set(&format!("zone_{z}_eq_profile"), &brut).unwrap();
+    brut
+}
 
-    let c = lire_zone(&s, z, false).unwrap().chaine;
-    let m = maillon(&c, ID_CORRECTION_PIECE);
-    assert!(droit_acquis(m));
+fn etape_piece(c: &ChaineTess, premium: bool) -> crate::tess::EtapeResolue {
     let tout_dispo = |_: &str| true;
-    let r = c.resoudre(&catalogue_de_reference(), &contexte_gratuit(&tout_dispo));
-    let etape = r
+    let mut ctx = contexte_gratuit(&tout_dispo);
+    ctx.premium = premium;
+    c.resoudre(&catalogue_de_reference(), &ctx)
         .etapes
-        .iter()
+        .into_iter()
         .find(|e| e.plugin_id.as_deref() == Some(ID_CORRECTION_PIECE))
-        .unwrap();
-    assert!(etape.effective, "{etape:?}");
-    // Contre-épreuve : sans la marque, Premium requis.
-    let mut sans = c.clone();
+        .expect("étape room-correction")
+}
+
+#[test]
+fn d1_une_correction_mesuree_est_premium_et_convertie_a_la_lecture() {
+    let (_b, s) = base();
+    let z = 15;
+    let brut = poser_la_piece(&s, z, "Calibration abc", None);
+
+    // Enregistrée telle quelle, origine « measured », sans droit acquis.
+    let b = migrer_zone(&s, z).unwrap();
+    let m = maillon(&b.chaine, ID_CORRECTION_PIECE);
+    assert_eq!(m.settings["origin"], json!("measured"));
+    assert!(!correction_estimee(m));
+    let e = etape_piece(&b.chaine, false);
+    assert_eq!(e.reason, Some(MotifEtape::PremiumRequired), "{e:?}");
+    assert!(etape_piece(&b.chaine, true).effective);
+
+    // Compte gratuit : convertie en graphique au plus près, à la lecture.
+    let gratuit = lire_zone(&s, z, false).unwrap();
+    assert!(gratuit.conversion_p2 && gratuit.conversion_piece);
+    assert_eq!(gratuit.chaine.plugins[0].id, ID_EQ_GRAPHIQUE);
+    assert!(gratuit.chaine.plugins[0].settings.get("origin").is_none());
+    let converti = converti_de(&gratuit);
+    assert!(est_courbe_graphique(&converti.bands));
+    let original = crate::room_correction::profil_eq_de_correction(&filtres_de_piece());
+    let (aux_points, _) = ecarts(&original, &converti, 10);
+    assert!(aux_points < 1.5, "{aux_points:.2} dB");
+    // Premium : rien n'est converti.
+    assert!(!lire_zone(&s, z, true).unwrap().conversion_p2);
+
+    // Jamais détruite : ni la chaîne enregistrée ni `eq_profile` ne bougent,
+    // et l'origine n'entre jamais dans `eq_profile`.
+    let enregistree: ChaineTess =
+        serde_json::from_str(&s.get(&cle_chaine_zone(z)).unwrap().unwrap()).unwrap();
+    assert_eq!(enregistree, b.chaine);
+    let e = ecrire_chaine(&s, z, &b.chaine).unwrap();
+    assert!(e.cles_modifiees.is_empty());
+    assert_eq!(
+        s.get(&format!("zone_{z}_eq_profile")).unwrap().as_deref(),
+        Some(brut.as_str())
+    );
+}
+
+#[test]
+fn d1_une_correction_calculee_sans_micro_est_free_et_jamais_convertie() {
+    let (_b, s) = base();
+    let z = 18;
+    poser_la_piece(&s, z, "Estimation sim-7", None);
+    let gratuit = lire_zone(&s, z, false).unwrap();
+    assert!(!gratuit.conversion_p2 && !gratuit.conversion_piece);
+    let m = maillon(&gratuit.chaine, ID_CORRECTION_PIECE);
+    assert!(m.enabled && correction_estimee(m));
+    assert_eq!(m.settings["origin"], json!("estimation"));
+    let e = etape_piece(&gratuit.chaine, false);
+    assert!(e.effective, "{e:?}");
+
+    // Contre-épreuve : le même maillon sans l'origine « estimation » demande
+    // le Premium.
+    let mut sans = gratuit.chaine.clone();
     sans.plugins[0]
         .settings
         .as_object_mut()
         .unwrap()
-        .remove("legacy");
-    let r = sans.resoudre(&catalogue_de_reference(), &contexte_gratuit(&tout_dispo));
-    let etape = r
-        .etapes
-        .iter()
-        .find(|e| e.plugin_id.as_deref() == Some(ID_CORRECTION_PIECE))
-        .unwrap();
-    assert_eq!(etape.reason, Some(MotifEtape::PremiumRequired));
-    // La marque n'entre jamais dans `eq_profile`.
-    migrer_zone(&s, z).unwrap();
-    let b = ecrire_chaine(&s, z, &lire_zone(&s, z, true).unwrap().chaine).unwrap();
-    assert!(b.cles_modifiees.is_empty());
+        .insert("origin".into(), json!("measured"));
     assert_eq!(
-        s.get(&format!("zone_{z}_eq_profile")).unwrap().as_deref(),
-        Some(brut.as_str())
+        etape_piece(&sans, false).reason,
+        Some(MotifEtape::PremiumRequired)
+    );
+}
+
+#[test]
+fn d1_l_origine_enregistree_a_la_creation_l_emporte_sur_le_nom() {
+    // Décision du 18/11 soir : tout profil créé enregistre son origine
+    // (`RoomProfile::origin`) ; le nom ne sert plus qu'aux profils anciens.
+    let profil = |nom: &str, origine: Option<&str>| crate::room_correction::RoomProfile {
+        name: nom.into(),
+        zone_id: "1".into(),
+        filters: filtres_de_piece(),
+        created_at: "2026-11-18T00:00:00Z".into(),
+        measurement_data: None,
+        origin: origine.map(str::to_owned),
+    };
+    let v = |p| serde_json::to_value(p).unwrap();
+    assert_eq!(
+        origine_de_la_piece(&v(profil("Estimation 3", Some("measured")))),
+        ORIGINE_MESURE
+    );
+    assert_eq!(
+        origine_de_la_piece(&v(profil("Mon salon", Some("estimation")))),
+        ORIGINE_ESTIMATION
+    );
+    // Profil ancien, sans origine : la règle du nom (et le champ absent du
+    // JSON, pour rester lisible par une version précédente).
+    let ancien = v(profil("Estimation 3", None));
+    assert!(ancien.get("origin").is_none());
+    assert_eq!(origine_de_la_piece(&ancien), ORIGINE_ESTIMATION);
+    assert_eq!(
+        origine_de_la_piece(&v(profil("Salon", None))),
+        ORIGINE_MESURE
+    );
+    // Et de bout en bout : une estimation renommée reste Free sans Premium.
+    let (_b, s) = base();
+    let z = 22;
+    let p = profil("Mon salon", Some("estimation"));
+    s.set(
+        &format!("room_profile_{z}"),
+        &serde_json::to_string(&p).unwrap(),
+    )
+    .unwrap();
+    let eq = crate::room_correction::profil_eq_de_correction(&filtres_de_piece());
+    s.set(
+        &format!("zone_{z}_eq_profile"),
+        &serde_json::to_string(&eq).unwrap(),
+    )
+    .unwrap();
+    let l = lire_zone(&s, z, false).unwrap();
+    assert!(!l.conversion_piece);
+    assert!(correction_estimee(&l.chaine.plugins[0]));
+}
+
+#[test]
+fn d1_l_origine_explicite_l_emporte_sur_le_nom() {
+    // `"estimation": bool` n'est plus cru (le serveur ne l'écrit jamais) :
+    // une fiche « Mon salon » qui se dit estimation reste MESURÉE, donc
+    // convertie sans Premium...
+    let (_b, s) = base();
+    poser_la_piece(&s, 19, "Mon salon", Some(("estimation", json!(true))));
+    assert!(lire_zone(&s, 19, false).unwrap().conversion_piece);
+    // ... et « Estimation 3 » qui se dit mesurée suit la règle du nom.
+    let (_b, s) = base();
+    poser_la_piece(&s, 20, "Estimation 3", Some(("estimation", json!(false))));
+    assert!(correction_estimee(
+        &lire_zone(&s, 20, false).unwrap().chaine.plugins[0]
+    ));
+    // `origin` mesurée l'emporte sur le nom d'estimation.
+    let (_b, s) = base();
+    poser_la_piece(&s, 23, "Estimation 4", Some(("origin", json!("measured"))));
+    assert!(lire_zone(&s, 23, false).unwrap().conversion_piece);
+    // `origin` explicite.
+    let (_b, s) = base();
+    poser_la_piece(&s, 21, "Salon", Some(("origin", json!("estimation"))));
+    assert!(!lire_zone(&s, 21, false).unwrap().conversion_piece);
+    // Rien d'explicite, nom quelconque : dans le doute, mesurée.
+    assert_eq!(
+        origine_de_la_piece(&json!({"name": "Salon"})),
+        ORIGINE_MESURE
+    );
+    assert_eq!(
+        origine_de_la_piece(&json!({"name": "estimation 3"})),
+        ORIGINE_MESURE
     );
 }
 
@@ -1661,4 +1864,552 @@ fn i3_relecture_d_une_copie_de_base_reelle() {
         eprintln!("  refus — {r}");
     }
     assert_eq!(tout(&s), avant, "la relecture a écrit dans la copie");
+}
+
+// ── Décision B : un seul membre du groupe crossfeed ─────────────────
+
+fn groupe_tout_coche(s: &SettingsRepo, z: i64) {
+    s.set(
+        &format!("zone_{z}_crossfeed"),
+        r#"{"enabled":true,"amount":0.3}"#,
+    )
+    .unwrap();
+    s.set(
+        &format!("zone_{z}_native_plugin_crossfeed-pro"),
+        r#"{"enabled":true,"profile":"hd800"}"#,
+    )
+    .unwrap();
+    s.set(
+        &format!("zone_{z}_native_plugin_crosstalk"),
+        r#"{"enabled":true,"span_deg":30}"#,
+    )
+    .unwrap();
+}
+
+fn contexte_premium(dispo: &dyn Fn(&str) -> bool) -> ContexteExecution<'_> {
+    let mut c = contexte_gratuit(dispo);
+    c.premium = true;
+    c
+}
+
+#[test]
+fn groupe_b_la_migration_garde_le_membre_qui_traite_et_decoche_les_autres() {
+    let (_b, s) = base();
+    let z = 40;
+    installer(&s, &["crossfeed", "crossfeed-pro", "crosstalk"]);
+    groupe_tout_coche(&s, z);
+    let avant = hors_tess(&s);
+
+    let b = migrer_zone(&s, z).unwrap();
+    let c = &b.chaine;
+    assert_eq!(
+        ids(c),
+        vec![
+            ("crossfeed", false),
+            ("crossfeed-pro", false),
+            ("crosstalk", true)
+        ]
+    );
+    assert_eq!(
+        maillon(c, "crossfeed").settings["replaced_in_group"],
+        json!("crosstalk")
+    );
+    assert_eq!(maillon(c, "crossfeed").settings["amount"], json!(0.3));
+    assert_eq!(
+        maillon(c, "crossfeed-pro").settings["profile"],
+        json!("hd800")
+    );
+    // Aucune ancienne clé touchée, ni par la migration ni par une réécriture.
+    assert_eq!(hors_tess(&s), avant);
+    assert!(ecrire_chaine(&s, z, c).unwrap().cles_modifiees.is_empty());
+    assert_eq!(hors_tess(&s), avant);
+    // La chaîne migrée passe la validation (politique « refuse »).
+    c.valider(
+        &catalogue_de_reference(),
+        ContexteValidation { premium: true },
+    )
+    .unwrap();
+    // Le chemin du signal note l'écart, et c'est Crosstalk qui traite, comme
+    // l'ancien moteur.
+    let dispo = |_: &str| true;
+    let r = c.resoudre(&catalogue_de_reference(), &contexte_premium(&dispo));
+    let etape = |id: &str| {
+        r.etapes
+            .iter()
+            .find(|e| e.plugin_id.as_deref() == Some(id))
+            .unwrap()
+            .clone()
+    };
+    assert!(etape("crosstalk").effective);
+    for id in ["crossfeed", "crossfeed-pro"] {
+        let e = etape(id);
+        assert!(!e.effective);
+        assert_eq!(e.reason, Some(MotifEtape::ReplacedInGroup), "{id}");
+        assert_eq!(e.params, Some(json!({"replaced_by": "crosstalk"})));
+    }
+    // Idempotent.
+    assert!(!migrer_zone(&s, z).unwrap().ecrite);
+}
+
+#[test]
+fn groupe_b_contre_epreuve_deux_membres_coches_sont_refuses_au_put_mais_jamais_muets() {
+    let mut c = ChaineTess::default();
+    for id in ["crossfeed", "crossfeed-pro", "crosstalk"] {
+        c.plugins.push(MaillonGreffon {
+            id: id.into(),
+            enabled: true,
+            settings: json!({}),
+        });
+    }
+    // Un PUT qui coche deux membres : 409 `mutually_exclusive`.
+    let e = c
+        .valider(
+            &catalogue_de_reference(),
+            ContexteValidation { premium: true },
+        )
+        .unwrap_err();
+    assert_eq!(e.statut_http(), 409);
+    assert_eq!(e.code(), "mutually_exclusive");
+    // Une chaîne ancienne qui arrive quand même ainsi : la résolution reste
+    // tolérante, le plus prioritaire DISPONIBLE traite, jamais de silence.
+    let sans_crosstalk = |id: &str| id != "crosstalk";
+    let r = c.resoudre(
+        &catalogue_de_reference(),
+        &contexte_premium(&sans_crosstalk),
+    );
+    let effectifs: Vec<&str> = r
+        .etapes
+        .iter()
+        .filter(|e| e.effective && e.plugin_id.is_some())
+        .filter_map(|e| e.plugin_id.as_deref())
+        .collect();
+    assert_eq!(effectifs, vec!["crossfeed-pro"]);
+}
+
+#[test]
+fn groupe_b_le_gagnant_est_un_membre_en_service() {
+    let (_b, s) = base();
+    let z = 41;
+    // Crosstalk coché mais pas installé : aujourd'hui, Crossfeed Pro traite.
+    installer(&s, &["crossfeed", "crossfeed-pro"]);
+    groupe_tout_coche(&s, z);
+    let c = lire_zone(&s, z, true).unwrap().chaine;
+    assert_eq!(
+        ids(&c),
+        vec![
+            ("crossfeed", false),
+            ("crossfeed-pro", true),
+            ("crosstalk", false)
+        ]
+    );
+    assert_eq!(
+        maillon(&c, "crosstalk").settings["replaced_in_group"],
+        json!("crossfeed-pro")
+    );
+    // Témoin : aucun membre en service, la priorité seule départage.
+    let (_b, s) = base();
+    s.set(crate::audio::premium_plugins::MIGRATION, "complete")
+        .unwrap();
+    groupe_tout_coche(&s, z);
+    let c = lire_zone(&s, z, true).unwrap().chaine;
+    assert_eq!(
+        ids(&c),
+        vec![
+            ("crossfeed", false),
+            ("crossfeed-pro", false),
+            ("crosstalk", true)
+        ]
+    );
+}
+
+#[test]
+fn groupe_b_un_membre_ecarte_revient_quand_son_gagnant_disparait() {
+    let (_b, s) = base();
+    let z = 42;
+    installer(&s, &["crossfeed", "crossfeed-pro", "crosstalk"]);
+    groupe_tout_coche(&s, z);
+    migrer_zone(&s, z).unwrap();
+    // Une ancienne route efface le réglage de Crosstalk.
+    s.delete(&format!("zone_{z}_native_plugin_crosstalk"))
+        .unwrap();
+    let c = lire_zone(&s, z, true).unwrap().chaine;
+    assert_eq!(ids(&c), vec![("crossfeed", false), ("crossfeed-pro", true)]);
+    assert!(
+        maillon(&c, "crossfeed-pro")
+            .settings
+            .get("replaced_in_group")
+            .is_none()
+    );
+    assert_eq!(
+        maillon(&c, "crossfeed").settings["replaced_in_group"],
+        json!("crossfeed-pro")
+    );
+}
+
+// ── D1 : l'origine appartient au serveur ────────────────────────────
+
+#[test]
+fn d1_un_put_ne_peut_pas_se_dire_sans_micro() {
+    // Une correction MESURÉE ; le client prétend « estimation ».
+    let (_b, s) = base();
+    let z = 50;
+    poser_la_piece(&s, z, "Calibration abc", None);
+    let mut c = lire_zone(&s, z, true).unwrap().chaine;
+    c.plugins[0]
+        .settings
+        .as_object_mut()
+        .unwrap()
+        .insert("origin".into(), json!("estimation"));
+    ecrire_chaine(&s, z, &c).unwrap();
+    let enregistree: ChaineTess =
+        serde_json::from_str(&s.get(&cle_chaine_zone(z)).unwrap().unwrap()).unwrap();
+    assert_eq!(enregistree.plugins[0].settings["origin"], json!("measured"));
+    let l = lire_zone(&s, z, false).unwrap();
+    assert!(l.conversion_piece, "le droit a été levé par le client");
+
+    // Une estimation existe, mais le client y met d'autres bandes en se
+    // disant « estimation » : mesurée.
+    let (_b, s) = base();
+    poser_la_piece(&s, z, "Estimation 4", None);
+    let mut c = lire_zone(&s, z, true).unwrap().chaine;
+    let reglages = c.plugins[0].settings.as_object_mut().unwrap();
+    reglages.insert(
+        "bands".into(),
+        json!([{"freq": 80.0, "gain": -9.0, "q": 2.0, "type": "peak"}]),
+    );
+    reglages.insert("origin".into(), json!("estimation"));
+    ecrire_chaine(&s, z, &c).unwrap();
+    assert!(!correction_estimee(
+        &lire_zone(&s, z, false).unwrap().chaine.plugins[0]
+    ));
+
+    // Témoin : l'estimation telle quelle reste une estimation, même si le
+    // client a retiré l'origine.
+    let (_b, s) = base();
+    poser_la_piece(&s, z, "Estimation 5", None);
+    let mut c = lire_zone(&s, z, true).unwrap().chaine;
+    c.plugins[0]
+        .settings
+        .as_object_mut()
+        .unwrap()
+        .remove("origin");
+    ecrire_chaine(&s, z, &c).unwrap();
+    assert!(correction_estimee(
+        &lire_zone(&s, z, false).unwrap().chaine.plugins[0]
+    ));
+}
+
+// ── D2 : changement de sortie après la migration ────────────────────
+
+fn changer_de_sortie(backend: &Arc<dyn DbBackend>, z: i64, appareil: &str) {
+    let appareil = appareil.to_owned();
+    backend
+        .execute(
+            "UPDATE zones SET output_device_id = ?1 WHERE id = ?2",
+            &[&appareil, &z],
+        )
+        .unwrap();
+}
+
+#[test]
+fn d2_reseau_vers_local_le_mono_reprend() {
+    let (backend, s) = base();
+    let repo = crate::db::zone_repo::ZoneRepo::with_backend(backend.clone());
+    let z = repo
+        .create("Salon", Some("dlna"), Some("dlna:uuid-9"))
+        .unwrap();
+    s.set(&format!("zone_{z}_mono_downmix"), "true").unwrap();
+    migrer_zone(&s, z).unwrap();
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_MONO, false)]
+    );
+    changer_de_sortie(&backend, z, "local:hw:2");
+    // L'interrupteur, resté à « true », agit en local : coché.
+    let c = lire_zone(&s, z, true).unwrap().chaine;
+    assert_eq!(ids(&c), vec![(ID_MONO, true)]);
+    assert_eq!(c.plugins[0].settings, Value::Null);
+    assert!(ecrire_chaine(&s, z, &c).unwrap().cles_modifiees.is_empty());
+}
+
+#[test]
+fn d2_local_vers_reseau_le_mono_est_decoche_d_office_puis_agit_si_recoche() {
+    let (backend, s) = base();
+    let repo = crate::db::zone_repo::ZoneRepo::with_backend(backend.clone());
+    let z = repo
+        .create("Casque", Some("local"), Some("local:hw:3"))
+        .unwrap();
+    s.set(&format!("zone_{z}_mono_downmix"), "true").unwrap();
+    migrer_zone(&s, z).unwrap();
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_MONO, true)]
+    );
+    changer_de_sortie(&backend, z, "dlna:uuid-10");
+    // Décision du 18/11 soir : même règle qu'à la migration, le mono est
+    // décoché d'office au passage sur le réseau (l'ancien moteur l'y
+    // ignorait), marqué, et l'ancienne clé n'est pas touchée.
+    let c = lire_zone(&s, z, true).unwrap().chaine;
+    assert_eq!(ids(&c), vec![(ID_MONO, false)]);
+    assert_eq!(c.plugins[0].settings, json!({"inert_on_network": true}));
+    let avant = hors_tess(&s);
+    assert!(ecrire_chaine(&s, z, &c).unwrap().cles_modifiees.is_empty());
+    assert_eq!(hors_tess(&s), avant);
+    // Toujours décoché après cette écriture (l'ombre dit « réseau »).
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_MONO, false)]
+    );
+    // Recoché à la main sur le réseau : il agit, et le reste.
+    let mut c = lire_zone(&s, z, true).unwrap().chaine;
+    c.plugins[0].enabled = true;
+    ecrire_chaine(&s, z, &c).unwrap();
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_MONO, true)]
+    );
+    // Revenue en local : coché (l'interrupteur, resté à « true », y agit).
+    changer_de_sortie(&backend, z, "local:hw:3");
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_MONO, true)]
+    );
+}
+
+#[test]
+fn d2_temoin_une_zone_locale_qui_reste_locale_garde_son_mono() {
+    let (backend, s) = base();
+    let repo = crate::db::zone_repo::ZoneRepo::with_backend(backend.clone());
+    let z = repo
+        .create("Casque", Some("local"), Some("local:hw:6"))
+        .unwrap();
+    s.set(&format!("zone_{z}_mono_downmix"), "true").unwrap();
+    migrer_zone(&s, z).unwrap();
+    // Une autre sortie locale : rien ne change.
+    changer_de_sortie(&backend, z, "local:hw:7");
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_MONO, true)]
+    );
+}
+
+#[test]
+fn d2_coche_apres_la_migration_sur_le_reseau_il_agit() {
+    let (backend, s) = base();
+    let repo = crate::db::zone_repo::ZoneRepo::with_backend(backend.clone());
+    let z = repo
+        .create("Salon", Some("dlna"), Some("dlna:uuid-11"))
+        .unwrap();
+    s.set(&format!("zone_{z}_mono_downmix"), "true").unwrap();
+    migrer_zone(&s, z).unwrap();
+    // Une ancienne route le décoche puis le recoche : il agit.
+    s.delete(&format!("zone_{z}_mono_downmix")).unwrap();
+    migrer_zone(&s, z).unwrap();
+    assert!(lire_zone(&s, z, true).unwrap().chaine.plugins.is_empty());
+    s.set(&format!("zone_{z}_mono_downmix"), "true").unwrap();
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_MONO, true)]
+    );
+    // Et coché via TESS sur une zone réseau fraîchement migrée, aussi.
+    let (backend, s) = base();
+    let repo = crate::db::zone_repo::ZoneRepo::with_backend(backend.clone());
+    let z = repo
+        .create("Cuisine", Some("dlna"), Some("dlna:uuid-12"))
+        .unwrap();
+    s.set(&format!("zone_{z}_mono_downmix"), "true").unwrap();
+    let mut c = migrer_zone(&s, z).unwrap().chaine;
+    c.plugins[0].enabled = true;
+    c.plugins[0].settings = Value::Null;
+    ecrire_chaine(&s, z, &c).unwrap();
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_MONO, true)]
+    );
+}
+
+// ── Marques de la lecture : elles appartiennent au serveur ──────────
+
+fn coche_dans(s: &SettingsRepo, cle: &str) -> bool {
+    s.get(cle)
+        .unwrap()
+        .and_then(|v| serde_json::from_str::<Value>(&v).ok())
+        .and_then(|v| v.get("enabled").and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+#[test]
+fn groupe_b_un_put_qui_decoche_le_gagnant_decoche_aussi_les_ecartes() {
+    let (_b, s) = base();
+    let z = 43;
+    installer(&s, &["crossfeed", "crossfeed-pro", "crosstalk"]);
+    groupe_tout_coche(&s, z);
+    // Le client lit la chaîne migrée, décoche Crosstalk et renvoie les
+    // réglages des membres écartés tels qu'il les a lus (marque comprise).
+    let mut c = migrer_zone(&s, z).unwrap().chaine;
+    c.plugins
+        .iter_mut()
+        .find(|m| m.id == "crosstalk")
+        .unwrap()
+        .enabled = false;
+    assert!(
+        maillon(&c, "crossfeed-pro")
+            .settings
+            .get("replaced_in_group")
+            .is_some()
+    );
+    ecrire_chaine(&s, z, &c).unwrap();
+    // Plus aucun membre coché, ni dans les anciennes clés (l'ancien moteur ne
+    // joue plus rien) ni à la lecture (rien n'est recoché).
+    for cle in [
+        format!("zone_{z}_crossfeed"),
+        format!("zone_{z}_native_plugin_crossfeed-pro"),
+        format!("zone_{z}_native_plugin_crosstalk"),
+    ] {
+        assert!(!coche_dans(&s, &cle), "{cle} reste cochée");
+    }
+    let lue = lire_zone(&s, z, true).unwrap().chaine;
+    assert!(lue.plugins.iter().all(|m| !m.enabled), "{:?}", ids(&lue));
+    // Réglages gardés, marque retirée.
+    assert_eq!(
+        maillon(&lue, "crossfeed-pro").settings["profile"],
+        json!("hd800")
+    );
+    assert!(
+        maillon(&lue, "crossfeed")
+            .settings
+            .get("replaced_in_group")
+            .is_none()
+    );
+}
+
+#[test]
+fn groupe_b_une_marque_forgee_par_le_client_n_est_pas_gardee() {
+    let (_b, s) = base();
+    let z = 44;
+    installer(&s, &["crossfeed", "crossfeed-pro"]);
+    s.set(
+        &format!("zone_{z}_native_plugin_crossfeed-pro"),
+        r#"{"enabled":true,"profile":"hd800"}"#,
+    )
+    .unwrap();
+    migrer_zone(&s, z).unwrap();
+    // Le client coche le crossfeed intégré et décoche Crossfeed Pro en le
+    // disant « remplacé » : l'ancienne clé de Crossfeed Pro, plus
+    // prioritaire, ne doit pas rester cochée (l'ancien moteur le jouerait).
+    let mut c = ChaineTess::default();
+    c.plugins.push(MaillonGreffon {
+        id: "crossfeed".into(),
+        enabled: true,
+        settings: json!({"amount": 0.3}),
+    });
+    c.plugins.push(MaillonGreffon {
+        id: "crossfeed-pro".into(),
+        enabled: false,
+        settings: json!({"profile": "hd800", "replaced_in_group": "crossfeed"}),
+    });
+    ecrire_chaine(&s, z, &c).unwrap();
+    assert!(coche_dans(&s, &format!("zone_{z}_crossfeed")));
+    assert!(!coche_dans(
+        &s,
+        &format!("zone_{z}_native_plugin_crossfeed-pro")
+    ));
+    let lue = lire_zone(&s, z, true).unwrap().chaine;
+    assert_eq!(
+        ids(&lue),
+        vec![("crossfeed", true), ("crossfeed-pro", false)]
+    );
+}
+
+#[test]
+fn d2_un_mono_decoche_a_la_main_sur_le_reseau_reste_decoche_en_local() {
+    let (backend, s) = base();
+    let repo = crate::db::zone_repo::ZoneRepo::with_backend(backend.clone());
+    let z = repo
+        .create("Salon", Some("dlna"), Some("dlna:uuid-13"))
+        .unwrap();
+    s.set(&format!("zone_{z}_mono_downmix"), "true").unwrap();
+    let mut c = migrer_zone(&s, z).unwrap().chaine;
+    // Le client coche puis décoche le mono en renvoyant les réglages lus
+    // (marque comprise).
+    c.plugins[0].enabled = true;
+    ecrire_chaine(&s, z, &c).unwrap();
+    c.plugins[0].enabled = false;
+    ecrire_chaine(&s, z, &c).unwrap();
+    assert_eq!(s.get(&format!("zone_{z}_mono_downmix")).unwrap(), None);
+    changer_de_sortie(&backend, z, "local:hw:4");
+    let lue = lire_zone(&s, z, true).unwrap().chaine;
+    assert!(lue.plugins.iter().all(|m| !m.enabled), "{:?}", ids(&lue));
+}
+
+#[test]
+fn d2_temoin_un_put_inchange_garde_la_marque_du_mono() {
+    let (backend, s) = base();
+    let repo = crate::db::zone_repo::ZoneRepo::with_backend(backend.clone());
+    let z = repo
+        .create("Salon", Some("dlna"), Some("dlna:uuid-14"))
+        .unwrap();
+    s.set(&format!("zone_{z}_mono_downmix"), "true").unwrap();
+    let c = migrer_zone(&s, z).unwrap().chaine;
+    assert!(ecrire_chaine(&s, z, &c).unwrap().cles_modifiees.is_empty());
+    changer_de_sortie(&backend, z, "local:hw:5");
+    assert_eq!(
+        ids(&lire_zone(&s, z, true).unwrap().chaine),
+        vec![(ID_MONO, true)]
+    );
+}
+
+// ── D1 : une chaîne écrite à la main ne lève pas le droit Premium ───
+
+#[test]
+fn d1_une_chaine_stockee_qui_se_dit_estimation_est_relue_par_le_serveur() {
+    // Une correction MESURÉE, migrée ; puis la chaîne enregistrée est
+    // réécrite directement (sans `ecrire_chaine`) avec une origine
+    // « estimation ».
+    let (_b, s) = base();
+    let z = 60;
+    poser_la_piece(&s, z, "Calibration abc", None);
+    let mut c = migrer_zone(&s, z).unwrap().chaine;
+    assert_eq!(c.plugins[0].settings["origin"], json!("measured"));
+    c.plugins[0]
+        .settings
+        .as_object_mut()
+        .unwrap()
+        .insert("origin".into(), json!("estimation"));
+    s.set(&cle_chaine_zone(z), &serde_json::to_string(&c).unwrap())
+        .unwrap();
+    let l = lire_zone(&s, z, false).unwrap();
+    assert!(
+        l.conversion_piece,
+        "le droit Premium a été levé par le stockage"
+    );
+    // Témoin : une vraie estimation enregistrée par le serveur reste Free.
+    let (_b, s) = base();
+    let z = 62;
+    poser_la_piece(&s, z, "Estimation 8", None);
+    migrer_zone(&s, z).unwrap();
+    let l = lire_zone(&s, z, false).unwrap();
+    assert!(!l.conversion_piece);
+    assert!(correction_estimee(&l.chaine.plugins[0]));
+}
+
+#[test]
+fn d1_les_cles_tenues_par_le_serveur() {
+    for cle in [
+        "room_profile_7",
+        "room_profile_index",
+        "zone_7_tess_chain",
+        "zone_12_tess_chain_sync",
+    ] {
+        assert!(cle_tenue_par_le_serveur(cle), "{cle}");
+    }
+    for cle in [
+        "zone_7_eq_profile",
+        "zone_7_tess_chainette",
+        "zone_x_tess_chain",
+        "room_correction_enabled",
+        "theme",
+    ] {
+        assert!(!cle_tenue_par_le_serveur(cle), "{cle}");
+    }
 }

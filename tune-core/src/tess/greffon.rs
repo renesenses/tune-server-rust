@@ -89,12 +89,14 @@ pub enum Position {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum PolitiqueGroupe {
-    /// Comportement actuel (#7616) : le plus prioritaire traite, les autres
-    /// sont écartés avec un motif dans le chemin du signal. Jamais de refus.
-    #[default]
+    /// Le plus prioritaire traite, les autres sont écartés avec un motif
+    /// dans le chemin du signal (#7616). La résolution suit TOUJOURS cette
+    /// règle, quelle que soit la politique : une chaîne ancienne qui arrive
+    /// avec deux membres cochés n'est jamais réduite au silence.
     Priority,
-    /// Refus de la chaîne en 409 (`mutually_exclusive`). Réservé à une
-    /// décision ultérieure de Bertrand.
+    /// Défaut (décision B de Bertrand, 18/11) : un `PUT` qui coche deux
+    /// membres d'un même groupe est refusé en 409 (`mutually_exclusive`).
+    #[default]
     Refuse,
     #[serde(other)]
     Unknown,
@@ -269,7 +271,7 @@ pub struct PolitiqueDeGroupe {
 pub struct Catalogue {
     pub plugins: Vec<DescripteurGreffon>,
     /// Politique de chaque groupe exclusif ; un groupe absent suit
-    /// [`PolitiqueGroupe::Priority`].
+    /// [`PolitiqueGroupe::Refuse`].
     #[serde(default)]
     pub groups: Vec<PolitiqueDeGroupe>,
 }
@@ -334,9 +336,10 @@ impl Ligne {
     }
 }
 
-/// Les onze greffons TESS de la v1.0 (dix au plan, plus `mono-downmix`,
-/// choix provisoire de T02 en attente de la décision D2) et leurs droits (décisions Q2 révisée,
-/// Q3, P1).
+/// Les onze greffons TESS de la v1.0 et leurs droits (décisions Q2 révisée,
+/// Q3, P1 ; `mono-downmix` ajouté par T02, décision D2 de Bertrand du 18/11).
+/// Room correction : Premium pour une correction mesurée ; une correction
+/// calculée sans micro (C5) est Free (D1, voir `migration::correction_estimee`).
 ///
 /// - Graphic EQ, Headphone EQ, Crossfeed, Mono downmix (T02), Channel
 ///   remapping : Free ;
@@ -479,7 +482,7 @@ pub fn catalogue_de_reference() -> Catalogue {
         plugins: lignes.iter().map(Ligne::descripteur).collect(),
         groups: vec![PolitiqueDeGroupe {
             id: GROUPE_CROSSFEED_CROSSTALK.into(),
-            policy: PolitiqueGroupe::Priority,
+            policy: PolitiqueGroupe::Refuse,
         }],
     }
 }
@@ -568,9 +571,9 @@ mod tests {
         assert!(prio("crossfeed-pro") > prio("crossfeed"));
         assert_eq!(
             c.politique(GROUPE_CROSSFEED_CROSSTALK),
-            PolitiqueGroupe::Priority
+            PolitiqueGroupe::Refuse
         );
-        assert_eq!(c.politique("autre"), PolitiqueGroupe::Priority);
+        assert_eq!(c.politique("autre"), PolitiqueGroupe::Refuse);
     }
 
     #[test]

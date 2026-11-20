@@ -144,6 +144,9 @@ async fn save_profile_handler(
         filters,
         created_at: now,
         measurement_data: body.measurement_data,
+        // D1 (TESS) : un profil posé à la main par l'API est traité comme
+        // une mesure (Premium) ; le corps ne peut pas se dire « estimation ».
+        origin: Some(tune_core::room_correction::ORIGINE_MESUREE.to_owned()),
     };
 
     save_profile(&state.backend, &profile).map_err(AppError::internal)?;

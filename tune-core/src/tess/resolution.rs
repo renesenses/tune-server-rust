@@ -500,15 +500,28 @@ impl ChaineTess {
             return e;
         };
         if !m.enabled {
+            // Groupe crossfeed (T02, décision B) : un membre décoché par la
+            // migration au profit d'un autre le dit.
+            if let Some(g) = m
+                .settings
+                .get(super::migration::MARQUE_REMPLACE)
+                .and_then(Value::as_str)
+            {
+                e.eteindre(
+                    MotifEtape::ReplacedInGroup,
+                    Some(format!("Replaced by {g}")),
+                );
+                e.params = Some(json!({ "replaced_by": g }));
+            }
             return e;
         }
         if !(ctx.greffon_disponible)(&m.id) {
             e.eteindre(MotifEtape::PluginUnavailable, None);
         } else if d.entitlement.demande_le_premium()
             && !ctx.premium
-            // D1 (provisoire, T02) : l'égaliseur de pièce déjà posé garde son
-            // droit acquis, comme aujourd'hui.
-            && !super::migration::droit_acquis(m)
+            // D1 (T02) : la correction de pièce calculée sans micro (C5) est
+            // Free.
+            && !super::migration::correction_estimee(m)
         {
             e.eteindre(MotifEtape::PremiumRequired, None);
         } else {

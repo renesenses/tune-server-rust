@@ -714,22 +714,14 @@ mod tests {
     }
 
     #[test]
-    fn le_groupe_du_crossfeed_ne_refuse_pas_par_defaut() {
-        // Politique « priority » (comportement actuel) : la chaîne passe, la
-        // résolution écarte les moins prioritaires.
+    fn le_groupe_du_crossfeed_refuse_deux_membres_coches() {
+        // Décision B (18/11) : deux membres cochés = 409 `mutually_exclusive`.
         let c = chaine(vec![
             maillon("crossfeed", true),
             maillon("crossfeed-pro", true),
             maillon("crosstalk", true),
         ]);
-        valider(&c, PREMIUM).unwrap();
-        // Contre-épreuve : avec la politique « refuse », 409.
-        let mut cat = catalogue_de_reference();
-        cat.groups = vec![PolitiqueDeGroupe {
-            id: "crossfeed_crosstalk".into(),
-            policy: PolitiqueGroupe::Refuse,
-        }];
-        let e = c.valider(&cat, PREMIUM).unwrap_err();
+        let e = valider(&c, PREMIUM).unwrap_err();
         assert_eq!(
             e,
             ErreurChaine::Exclusifs {
@@ -739,6 +731,22 @@ mod tests {
             }
         );
         assert_eq!(e.statut_http(), 409);
+        assert_eq!(e.code(), "mutually_exclusive");
+        // Contre-épreuve : un seul membre coché, les autres décochés, passe.
+        let un_seul = chaine(vec![
+            maillon("crossfeed", false),
+            maillon("crossfeed-pro", false),
+            maillon("crosstalk", true),
+        ]);
+        valider(&un_seul, PREMIUM).unwrap();
+        // Et la politique « priority » reste disponible pour un groupe qui la
+        // déclare.
+        let mut cat = catalogue_de_reference();
+        cat.groups = vec![PolitiqueDeGroupe {
+            id: "crossfeed_crosstalk".into(),
+            policy: PolitiqueGroupe::Priority,
+        }];
+        c.valider(&cat, PREMIUM).unwrap();
     }
 
     #[test]
