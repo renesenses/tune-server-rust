@@ -79,7 +79,13 @@ async fn get_artist_bio(client: &reqwest::Client, artist: &str, api_key: &str) -
 }
 
 fn strip_html(s: &str) -> String {
-    crate::streaming::presentation_album::texte_de_presentation(s).unwrap_or_default()
+    // Last.fm sépare aussi les paragraphes par des sauts de ligne bruts.
+    // Les protéger avant le convertisseur HTML, qui replie les lignes source.
+    let html = s
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', "<br>");
+    crate::streaming::presentation_album::texte_de_presentation(&html).unwrap_or_default()
 }
 
 pub struct LastfmEnricher {
@@ -267,6 +273,20 @@ mod tests {
 
 #[cfg(test)]
 mod entites_resume_8735_tests {
+    #[test]
+    fn paragraphes_lastfm_preserves_8735() {
+        for brut in [
+            "Para 1.\n\nPara 2 &amp; fin",
+            "Para 1.\r\n\r\nPara 2 &amp; fin",
+        ] {
+            assert_eq!(
+                super::strip_html(brut),
+                "Para 1.\n\nPara 2 & fin",
+                "les deux paragraphes Last.fm doivent rester distincts"
+            );
+        }
+    }
+
     #[test]
     fn resume_lastfm_decode_8735() {
         assert_eq!(

@@ -363,7 +363,13 @@ async fn fetch_album_bio_lastfm(
 }
 
 fn strip_html(s: &str) -> String {
-    crate::streaming::presentation_album::texte_de_presentation(s).unwrap_or_default()
+    // Last.fm sépare aussi les paragraphes par des sauts de ligne bruts.
+    // Les protéger avant le convertisseur HTML, qui replie les lignes source.
+    let html = s
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', "<br>");
+    crate::streaming::presentation_album::texte_de_presentation(&html).unwrap_or_default()
 }
 
 /// Les noms sous lesquels la clé Last.fm peut avoir été posée dans
@@ -1106,6 +1112,20 @@ mod tests_bio_lastfm {
 
 #[cfg(test)]
 mod entites_lastfm_8735_tests {
+    #[test]
+    fn paragraphes_lastfm_preserves_8735() {
+        for brut in [
+            "Para 1.\n\nPara 2 &amp; fin",
+            "Para 1.\r\n\r\nPara 2 &amp; fin",
+        ] {
+            assert_eq!(
+                super::strip_html(brut),
+                "Para 1.\n\nPara 2 & fin",
+                "les deux paragraphes Last.fm doivent rester distincts"
+            );
+        }
+    }
+
     use super::bio_lastfm_depuis_json;
     use crate::db::{artist_repo::ArtistRepo, sqlite::SqliteDb};
     use serde_json::json;
