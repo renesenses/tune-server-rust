@@ -324,7 +324,11 @@ pub async fn run_with(opts: RunOptions) {
                             );
                             eprintln!("{phrase}");
                             info!(url = %tune_core::confidentialite::masquer_url(&url), port = config.port, "instance_existante_ouverte — {phrase}");
-                            ie::ouvrir_le_navigateur(&url);
+                            let ouvrir = url.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                ie::ouvrir_le_navigateur(&ouvrir)
+                            })
+                            .await;
                             std::process::exit(0);
                         }
                         if let Some(version) = en_place.as_deref() {
@@ -706,7 +710,11 @@ pub async fn run_with(opts: RunOptions) {
             }
             let url = format!("http://localhost:{port}");
             info!(url = %tune_core::confidentialite::masquer_url(&url), "opening_browser");
-            crate::instance_existante::ouvrir_le_navigateur(&url);
+            // Registre, shell, lancement : bloquant (#9061).
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::instance_existante::ouvrir_le_navigateur(&url)
+            })
+            .await;
         });
     }
 
