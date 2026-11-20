@@ -57,6 +57,7 @@ impl Drop for Moteur {
 
 pub(super) struct LecteurHttpAnnulable {
     corps: Corps,
+    restant: Option<u64>,
 }
 
 /// #5439 — ce que la sortie lit : le corps HTTP tel quel, ou le même corps
@@ -124,6 +125,7 @@ impl LecteurHttpAnnulable {
             );
         }
         Ok(Self {
+            restant: None,
             corps: Corps::Http(CorpsHttp {
                 response,
                 tampon: Vec::new(),
@@ -132,6 +134,10 @@ impl LecteurHttpAnnulable {
                 moteur,
             }),
         })
+    }
+
+    pub(super) fn borner(&mut self, restant: Option<u64>) {
+        self.restant = restant;
     }
 
     pub(super) fn status(&self) -> reqwest::StatusCode {
@@ -148,11 +154,15 @@ impl LecteurHttpAnnulable {
     pub(super) fn decoder_en_continu(self, prefixe: Vec<u8>, extension: &'static str) -> Self {
         match self.corps {
             Corps::Http(http) => Self {
+                restant: None,
                 corps: Corps::Decode(super::decodage_en_continu::FluxDecode::lancer(
                     http, prefixe, extension,
                 )),
             },
-            deja @ Corps::Decode(_) => Self { corps: deja },
+            deja @ Corps::Decode(_) => Self {
+                corps: deja,
+                restant: self.restant,
+            },
         }
     }
 
@@ -167,10 +177,20 @@ impl LecteurHttpAnnulable {
 
 impl Read for LecteurHttpAnnulable {
     fn read(&mut self, destination: &mut [u8]) -> io::Result<usize> {
-        match &mut self.corps {
-            Corps::Http(http) => http.read(destination),
-            Corps::Decode(flux) => flux.read(destination),
+        let limite = self.restant.map_or(destination.len(), |n| {
+            n.min(destination.len() as u64) as usize
+        });
+        if limite == 0 {
+            return Ok(0);
         }
+        let lus = match &mut self.corps {
+            Corps::Http(http) => http.read(&mut destination[..limite]),
+            Corps::Decode(flux) => flux.read(&mut destination[..limite]),
+        }?;
+        if let Some(restant) = &mut self.restant {
+            *restant -= lus as u64;
+        }
+        Ok(lus)
     }
 }
 
