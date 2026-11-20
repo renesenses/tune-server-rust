@@ -380,9 +380,10 @@ async fn les_cles_tenues_par_le_serveur_sont_refusees_par_l_ecriture_generique()
     assert_eq!(reglage(&state, "theme").as_deref(), Some("clair"));
 }
 
-/// Même règle à l'import de configuration : ancien format à plat comme
-/// nouveau format (partie zones comprise), les clés tenues par le serveur
-/// sont ignorées et l'import le dit.
+/// Même règle à l'import de configuration : aucune clé tenue par le serveur
+/// n'est écrite telle quelle. L'ancien format à plat les ignore et le dit ;
+/// le nouveau format fait réécrire la chaîne et le profil de pièce de chaque
+/// zone par le serveur (décision B du 19/11).
 #[tokio::test]
 async fn l_import_ignore_les_cles_tenues_par_le_serveur() {
     let state = etat();
@@ -419,21 +420,26 @@ async fn l_import_ignore_les_cles_tenues_par_le_serveur() {
         );
     }
 
-    // Nouveau format : la partie zones.
+    // Nouveau format : la partie zones. Décision B du 19/11 : la chaîne
+    // TESS est RÉÉCRITE par le serveur (`ecrire_chaine`), le profil de pièce
+    // est restauré MESURÉ sous le numéro d'arrivée, l'ombre n'est jamais
+    // importée et l'index se reconstruit.
     let state = etat();
+    let faux_profil = r#"{"name":"Estimation 7","zone_id":"7","origin":"estimation","filters":[],"created_at":"2026-11-19T00:00:00Z"}"#;
     let corps = serde_json::json!({
         "format": "tune-config",
         "format_version": 2,
-        "settings": { "theme": "importe" },
+        "settings": { "theme": "importe", "room_profile_index": "[\"7\"]" },
         "zones": [{
+            "id": 7,
             "name": "Salon",
             "output_type": "local",
             "output_device_id": "local:hw:9",
             "settings": {
                 "room_profile_{id}": faux_profil,
-                "zone_{id}_tess_chain": "{\"version\":1,\"plugins\":[]}",
-                "zone_{id}_tess_chain_sync": "{}",
-                "zone_{id}_crossfeed": "{\"enabled\":true}",
+                "zone_{id}_tess_chain": "{\"version\":1,\"plugins\":[],\"fixed\":{\"headroom\":{\"mode\":\"manual\",\"db\":-3.0}}}",
+                "zone_{id}_tess_chain_sync": "{\"poison\":\"1\"}",
+                "zone_{id}_level_compensation": "false",
             },
         }],
     })
@@ -453,19 +459,25 @@ async fn l_import_ignore_les_cles_tenues_par_le_serveur() {
         .and_then(|z| z.id)
         .expect("zone importée");
     // Témoin : un réglage de zone ordinaire passe.
-    assert!(
-        reglage(&state, &format!("zone_{id}_crossfeed")).is_some(),
+    assert_eq!(
+        reglage(&state, &format!("zone_{id}_level_compensation")).as_deref(),
+        Some("false"),
         "{v}"
     );
-    for cle in [
-        format!("room_profile_{id}"),
-        format!("zone_{id}_tess_chain"),
-        format!("zone_{id}_tess_chain_sync"),
-    ] {
-        assert_eq!(reglage(&state, &cle), None, "{cle} a été importée");
-    }
-    assert!(
-        v["warnings"].to_string().contains("server-managed"),
-        "l'import doit le dire : {v}"
+    let profil: serde_json::Value =
+        serde_json::from_str(&reglage(&state, &format!("room_profile_{id}")).expect("profil"))
+            .unwrap();
+    assert_eq!(profil["origin"], "measured", "{profil}");
+    assert_eq!(profil["zone_id"], id.to_string(), "{profil}");
+    assert_eq!(
+        reglage(&state, "room_profile_index"),
+        Some(format!("[\"{id}\"]"))
     );
+    let chaine = reglage(&state, &format!("zone_{id}_tess_chain")).expect("chaîne réécrite");
+    assert!(chaine.contains("-3"), "réserve manuelle perdue : {chaine}");
+    let ombre = reglage(&state, &format!("zone_{id}_tess_chain_sync")).expect("ombre");
+    assert!(!ombre.contains("poison"), "ombre importée : {ombre}");
+    let dit = v["warnings"].to_string();
+    assert!(!dit.contains("server-managed"), "{v}");
+    assert!(dit.contains("restored as measured"), "{v}");
 }
