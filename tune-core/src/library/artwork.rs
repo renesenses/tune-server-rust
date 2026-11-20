@@ -1749,6 +1749,13 @@ async fn url_artiste_lastfm(
     Some(image_url.to_string())
 }
 
+fn image_deezer_non_vide(artiste: &serde_json::Value) -> Option<&str> {
+    artiste
+        .get("picture_xl")
+        .and_then(|v| v.as_str())
+        .filter(|url| !url.is_empty() && !url.contains("/images/artist//"))
+}
+
 /// URL Deezer d'un artiste dont le nom rendu est exactement celui demandé.
 ///
 /// `search/artist` est flou : « Janine Jansen » ramène aussi d'autres
@@ -1761,15 +1768,15 @@ fn deezer_pick_image_url<'a>(data: &'a serde_json::Value, artist_name: &str) -> 
             .get("name")
             .and_then(|v| v.as_str())
             .is_some_and(|name| artist_name_matches_exactly(name, artist_name))
+            // #8833 : une fiche à zéro fan ET sans image n'est pas un homonyme.
+            && !(artist.get("nb_fan").and_then(|v| v.as_u64()) == Some(0)
+                && image_deezer_non_vide(artist).is_none())
     });
     let chosen = exact.next()?;
     if exact.next().is_some() {
         return None;
     }
-    chosen
-        .get("picture_xl")
-        .and_then(|v| v.as_str())
-        .filter(|url| !url.is_empty() && !url.contains("/images/artist//"))
+    image_deezer_non_vide(chosen)
 }
 
 async fn url_artiste_deezer(client: &reqwest::Client, artist_name: &str) -> Option<String> {
@@ -4724,3 +4731,7 @@ mod find_cached_remontee_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "artwork_deezer_fantomes_8833_tests.rs"]
+mod deezer_fantomes_8833_tests;

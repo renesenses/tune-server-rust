@@ -646,7 +646,7 @@ pub(super) fn zone_replaygain_step_lang(
     {
         return None;
     }
-    replaygain_step_hors_pure_lang(lang, backend, piste)
+    replaygain_step_hors_pure_lang(lang, backend, zone_id, piste)
 }
 
 /// L'étape ReplayGain telle qu'elle serait HORS PURE — le corps de
@@ -655,15 +655,19 @@ pub(super) fn zone_replaygain_step_lang(
 fn replaygain_step_hors_pure_lang(
     lang: &str,
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
     piste: tune_core::audio::replaygain::PisteRg<'_>,
 ) -> Option<ReplayGainStep> {
     use tune_core::audio::replaygain::{
-        GainSource, ReplayGainSettings, RetenueAntiEcretage, gain_de_piste, gain_factor_with_peak,
-        stored_gain_source,
+        GainSource, ReplayGainMode, ReplayGainSettings, RetenueAntiEcretage, gain_de_piste,
+        gain_factor_with_peak, granularite_de_zone, stored_gain_source,
     };
     let settings = ReplayGainSettings::load(backend);
+    // #8968 — `Auto` se résout par la file de la zone, comme à la lecture.
+    let auto = settings.mode == ReplayGainMode::Auto;
+    let mode = granularite_de_zone(backend, zone_id, piste, settings.mode);
     // #8689 — un titre Qobuz / TIDAL : le gain que le service publie.
-    let (gain, source, peak_kind) = gain_de_piste(backend, piste, settings.mode)?;
+    let (gain, source, peak_kind) = gain_de_piste(backend, piste, mode)?;
     let (factor, retenue) = gain_factor_with_peak(gain, settings, peak_kind);
     let peak_headroom_db = peak_kind.headroom_db(settings);
     let alters_audio = (factor - 1.0).abs() > 1e-6;
@@ -681,6 +685,12 @@ fn replaygain_step_hors_pure_lang(
         tune_core::audio::replaygain::ReplayGainMode::Album => "album",
         _ => "track",
     };
+    // #8968 — le libellé dit aussi que c'est le mode Auto qui a choisi.
+    let label_affiche = if auto {
+        format!("{label}, auto")
+    } else {
+        label.to_string()
+    };
     // La provenance porte sur la granularité qui a fourni la valeur, pas sur
     // le mode demandé. Une base illisible ne doit rien inventer : on retombe
     // sur la description d'avant, sans mention d'origine.
@@ -694,14 +704,18 @@ fn replaygain_step_hors_pure_lang(
         // pré-ampli — ce que l'auditeur a réglé, pas ce que le garde-fou en a
         // fait.
         let demande_db = gain.gain_db + settings.preamp_db;
-        fs(lang, "rg_refused", &[label, &format!("{demande_db:+.1}")])
+        fs(
+            lang,
+            "rg_refused",
+            &[label_affiche.as_str(), &format!("{demande_db:+.1}")],
+        )
     } else {
         match origin {
             Some(src) => format!(
-                "ReplayGain ({label}, {applied_db:+.1} dB, {})",
+                "ReplayGain ({label_affiche}, {applied_db:+.1} dB, {})",
                 ts(lang, src.as_str())
             ),
-            None => format!("ReplayGain ({label}, {applied_db:+.1} dB)"),
+            None => format!("ReplayGain ({label_affiche}, {applied_db:+.1} dB)"),
         }
     };
     if peak_headroom_db > 0.0 {
@@ -716,6 +730,7 @@ fn replaygain_step_hors_pure_lang(
     Some(ReplayGainStep {
         description,
         granularity: label,
+        auto,
         source: origin.map(GainSource::as_str),
         clipping_guard: retenue.as_str(),
         // Un refus ne touche pas un échantillon : le fil reste intact.
@@ -745,7 +760,7 @@ pub(super) fn replaygain_ignore_par_pure(
     if !tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
         return None;
     }
-    let rg = replaygain_step_hors_pure_lang("fr", backend, piste)?;
+    let rg = replaygain_step_hors_pure_lang("fr", backend, zone_id, piste)?;
     if !rg.alters_audio {
         return None;
     }
@@ -764,21 +779,27 @@ pub(super) fn replaygain_ignore_par_pure(
 /// l'appelant.
 pub(super) fn replaygain_sans_gain_tague(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
     piste: tune_core::audio::replaygain::PisteRg<'_>,
 ) -> Option<Value> {
-    use tune_core::audio::replaygain::{ReplayGainMode, ReplayGainSettings, gain_de_piste};
+    use tune_core::audio::replaygain::{
+        ReplayGainMode, ReplayGainSettings, gain_de_piste, granularite_de_zone,
+    };
     let settings = ReplayGainSettings::load(backend);
     if settings.mode == ReplayGainMode::Off || !piste.est_identifiee() {
         return None;
     }
-    if gain_de_piste(backend, piste, settings.mode).is_some() {
+    let mode = granularite_de_zone(backend, zone_id, piste, settings.mode);
+    if gain_de_piste(backend, piste, mode).is_some() {
         return None;
     }
     Some(json!({
-        "mode": match settings.mode {
+        "mode": match mode {
             ReplayGainMode::Album => "album",
             _ => "track",
         },
+        // #8968 — additif : le réglage est `auto`.
+        "auto": settings.mode == ReplayGainMode::Auto,
         "preamp_db": (settings.preamp_db * 100.0).round() / 100.0 + 0.0,
     }))
 }
@@ -791,6 +812,9 @@ pub(super) struct ReplayGainStep {
     description: String,
     /// `"track"` ou `"album"` — celle qui a fourni la valeur.
     granularity: &'static str,
+    /// #8968 — vrai quand le réglage est `auto` : `granularity` est alors le
+    /// choix fait pour cette piste d'après la file.
+    auto: bool,
     /// `"file_tags"` ou `"analysis"`, absent si la base n'a pas répondu.
     source: Option<&'static str>,
     /// `"none"` / `"tagged_peak"` / `"refused_no_peak"` (#4072) : ce que
@@ -1511,7 +1535,9 @@ pub fn build_signal_path_lang(
         // ReplayGain disparaissait sans un mot, et un préampli réglé
         // semblait sans effet. Clé ABSENTE sous PURE, en mode off ou quand
         // la piste a un gain.
-        if !pure && let Some(rg) = replaygain_sans_gain_tague(backend, np.piste_rg()) {
+        if !pure
+            && let Some(rg) = replaygain_sans_gain_tague(backend, zone_id_courant, np.piste_rg())
+        {
             v["replaygain_untagged"] = rg;
         }
         // #6946 — Spotify : le format et le débit reçus, et pourquoi pas
@@ -1528,14 +1554,48 @@ pub fn build_signal_path_lang(
     })
 }
 
+/// 19/11/2026 — ce que la compensation de la réserve laisse d'écart avec la
+/// lecture sans suréchantillonnage, en clair et traduit : niveaux égaux,
+/// compensée en partie (volume entre −3 et 0 dB), ou rien de compensé
+/// (volume à 100 %, le niveau se règle au DAC ou au préampli). `None` quand
+/// la sortie ne dit pas l'écart.
+pub(super) fn note_de_niveau_du_surechantillonneur(
+    lang: &str,
+    reserve_db: f64,
+    ecart_db: Option<f64>,
+) -> Option<(bool, String)> {
+    let ecart = ecart_db?;
+    // Au centième de dB près : l'écart est rangé en centièmes.
+    if ecart > -0.01 {
+        return Some((true, fs(lang, "upsampling_level_matched", &[])));
+    }
+    let ecart_txt = format!("{:.1}", -ecart);
+    if ecart <= reserve_db + 0.01 {
+        return Some((
+            false,
+            fs(
+                lang,
+                "upsampling_level_full_volume",
+                &[&ecart_txt, &format!("{:.1}", -reserve_db)],
+            ),
+        ));
+    }
+    Some((false, fs(lang, "upsampling_level_partial", &[&ecart_txt])))
+}
+
 /// #7614 — l'étape du greffon de suréchantillonnage quand il porte la
 /// cadence : jamais bit-perfect, filtre et réserve de niveau affichés.
+///
+/// 19/11/2026 — et ce que la compensation de cette réserve laisse d'écart
+/// avec la lecture sans lui (`level_gap_db`, `level_matched`), dit aussi
+/// dans la description.
 pub(super) fn etape_du_surechantillonneur_lang(
     lang: &str,
     de: u32,
     vers: u32,
     filtre: &str,
     reserve_db: f64,
+    ecart_db: Option<f64>,
 ) -> Value {
     let khz = |hz: u32| {
         let k = f64::from(hz) / 1000.0;
@@ -1545,24 +1605,36 @@ pub(super) fn etape_du_surechantillonneur_lang(
             format!("{k:.1}")
         }
     };
-    json!({
+    let mut description = fs(
+        lang,
+        "upsampling",
+        &[
+            &format!("{} kHz \u{2192} {} kHz", khz(de), khz(vers)),
+            filtre,
+            &format!("{reserve_db:.2}"),
+        ],
+    );
+    let note = note_de_niveau_du_surechantillonneur(lang, reserve_db, ecart_db);
+    if let Some((_, texte)) = &note {
+        description.push_str(" \u{b7} ");
+        description.push_str(texte);
+    }
+    let mut etape = json!({
         "name": "Upsampler",
         "code": "upsampling",
         "from_hz": de,
         "to_hz": vers,
         "filter": filtre,
         "headroom_db": reserve_db,
-        "description": fs(
-            lang,
-            "upsampling",
-            &[
-                &format!("{} kHz \u{2192} {} kHz", khz(de), khz(vers)),
-                filtre,
-                &format!("{reserve_db:.2}"),
-            ],
-        ),
+        "description": description,
         "bit_perfect": false,
-    })
+    });
+    if let (Some(ecart), Some((egal, texte))) = (ecart_db, note) {
+        etape["level_gap_db"] = json!(ecart);
+        etape["level_matched"] = json!(egal);
+        etape["level_note"] = json!(texte);
+    }
+    etape
 }
 
 /// #7614 — le greffon de suréchantillonnage RÉGLÉ sur la zone mais qui ne
@@ -1582,16 +1654,24 @@ pub(super) fn etat_du_surechantillonneur_lang(
     if let Some((filtre, reserve_db)) = transformations_reelles.and_then(|t| t.surechantillonnage())
     {
         let t = transformations_reelles?;
-        return Some((
-            json!({
-                "active": true,
-                "from_hz": t.entree().cadence(),
-                "to_hz": t.ouvert().cadence,
-                "filter": filtre,
-                "headroom_db": reserve_db,
-            }),
-            Value::Null,
-        ));
+        let mut etat = json!({
+            "active": true,
+            "from_hz": t.entree().cadence(),
+            "to_hz": t.ouvert().cadence,
+            "filter": filtre,
+            "headroom_db": reserve_db,
+        });
+        // 19/11/2026 — l'écart de niveau qui reste, réserve compensée.
+        let ecart = t.ecart_de_niveau_surechantillonnage();
+        if let (Some(ecart), Some((egal, texte))) = (
+            ecart,
+            note_de_niveau_du_surechantillonneur(lang, reserve_db, ecart),
+        ) {
+            etat["level_gap_db"] = json!(ecart);
+            etat["level_matched"] = json!(egal);
+            etat["level_note"] = json!(texte);
+        }
+        return Some((etat, Value::Null));
     }
     if !reglages.enabled {
         return None;
@@ -1665,6 +1745,10 @@ fn texte_du_refus_surechantillonnage(raison: &str) -> &'static str {
         "source_rate_unknown" | "source_probe_incomplete" => "upsampling_source_unknown",
         "output_path_not_supported" => "upsampling_output_path",
         "dop" => "upsampling_dop",
+        // #9165 — les chemins Linux sans étage nomment leur cause, au lieu du
+        // « chemin de sortie » réservé aux bras exclusifs macOS/Windows.
+        "dsd" => "upsampling_dsd",
+        "compressed_stream" => "upsampling_compressed_stream",
         "multiple_outputs" => "upsampling_multiple_outputs",
         "output_rate_open_failed" | "filter_initialization_failed" => "upsampling_opening_failed",
         _ => "upsampling_not_applied",
@@ -2292,6 +2376,7 @@ fn assembler_les_etapes_lang(
             t.ouvert().cadence,
             filtre,
             reserve_db,
+            t.ecart_de_niveau_surechantillonnage(),
         ));
     } else if let Some(t) = reel.filter(|t| t.reechantillonnage()) {
         let src_khz = t.entree().cadence() / 1000;
@@ -2358,6 +2443,8 @@ fn assembler_les_etapes_lang(
             // afficher, ces champs permettent au client de composer le sien
             // (icône, traduction) sans analyser une chaîne française.
             "granularity": rg.granularity,
+            // #8968 — additif : la granularité vient du mode Auto.
+            "auto": rg.auto,
             "gain_source": rg.source,
             // #4072 : ce que l'anti-écrêtage a retenu, et ce que l'étage a
             // écrêté depuis le démarrage (portée processus, dite dans l'objet).

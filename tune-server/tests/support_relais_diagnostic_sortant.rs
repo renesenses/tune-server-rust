@@ -296,7 +296,12 @@ fn corps_multipart() -> String {
 }
 
 async fn ouvrir(state: &AppState, content_type: &str, corps: String) -> StatusCode {
-    let app: Router = tune_server::routes::router(state.clone());
+    let app: Router = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     app.oneshot(
         Request::post(TICKETS)
             .header(header::CONTENT_TYPE, content_type)

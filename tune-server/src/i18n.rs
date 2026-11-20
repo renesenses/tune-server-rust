@@ -20,12 +20,13 @@ use axum::http::HeaderMap;
 /// `Accept-Language` parse so an unsupported browser locale falls back to
 /// [`FALLBACK`].
 ///
-/// Quinze langues depuis le norvégien bokmål, le polonais et le grec (rc9) — les mêmes que
+/// Seize langues depuis le turc (web#3170) — après le norvégien bokmål, le polonais et le grec
+/// (rc9) —, les mêmes que
 /// l'interface web (`tune-web-client/src/lib/locales/`). Chaque clé de
 /// `i18n_server.json` doit porter chacune d'elles : le test
 /// `chaque_cle_porte_chaque_langue` le garde.
 pub const SUPPORTED: &[&str] = &[
-    "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "hu", "vi", "nb", "pl", "el",
+    "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "hu", "vi", "nb", "pl", "el", "tr",
 ];
 
 /// Langue de repli du serveur : l'anglais, comme le client web. Ni un en-tête
@@ -308,6 +309,22 @@ mod tests {
         );
     }
 
+    /// Le turc est une langue de l'interface (web#3170) : un `Accept-Language`
+    /// qui le demande doit l'obtenir, et non l'anglais.
+    ///
+    /// Contre-épreuve : retirer `"tr"` de `SUPPORTED` fait rougir ce test
+    /// (l'en-tête retombe sur `"en"`).
+    #[test]
+    fn le_turc_est_servi() {
+        assert_eq!(lang_from_header(&en_tetes("tr-TR,tr;q=0.9,en;q=0.8")), "tr");
+        assert_eq!(t("tr", "metafield.composer"), "Besteci");
+        assert_eq!(
+            t("tr", "ai.zonesAvailable"),
+            "Kullanılabilir bölgeler: {zones}",
+            "« zone » se dit « bölge », comme dans l'interface web"
+        );
+    }
+
     /// Les jetons `{…}` d'un texte : `{title}`, `{n}`…
     fn jetons(texte: &str) -> Vec<String> {
         let mut vus: Vec<String> = Vec::new();
@@ -411,6 +428,7 @@ mod tests {
             ("nb", "Tilgang og tokener"),
             ("pl", "Dostęp i tokeny"),
             ("el", "Πρόσβαση και διακριτικά"),
+            ("tr", "Erişim ve belirteçler"),
         ];
         assert_eq!(onglet.len(), super::SUPPORTED.len());
         for (lang, libelle) in onglet {

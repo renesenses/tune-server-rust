@@ -258,6 +258,8 @@ async fn build_snapshot(state: &AppState, lang: &str) -> serde_json::Value {
 async fn handle_socket(mut socket: WebSocket, state: AppState, lang: &str) {
     let mut rx = state.playback.subscribe();
     let mut event_rx = state.event_bus.subscribe();
+    // Activation de l'authentification : la socket se ferme.
+    let mut fermeture = state.fermeture_websockets.subscribe();
     let mut patterns: Vec<String> = vec!["*".to_string()];
     let mut ping_interval = interval(PING_INTERVAL);
     ping_interval.tick().await;
@@ -281,6 +283,10 @@ async fn handle_socket(mut socket: WebSocket, state: AppState, lang: &str) {
 
     loop {
         tokio::select! {
+            _ = fermeture.changed() => {
+                let _ = socket.send(Message::Close(None)).await;
+                break;
+            }
             event = rx.recv() => {
                 match event {
                     Ok(ev) => {
