@@ -337,6 +337,7 @@ pub async fn sonder_un_flux(flux: &StreamUrl) -> Result<FluxDecode, EchecSonde> 
     if !(flux.url.starts_with("https://") || flux.url.starts_with("http://")) {
         return Err(EchecSonde::new(
             Cause::Resolution,
+            // `EchecSonde::new` retire la requête signée (`masquer_les_requetes`).
             format!("adresse de flux inattendue : {}", flux.url),
         ));
     }
@@ -402,7 +403,11 @@ async fn sonder_en_http(flux: &StreamUrl) -> Result<FluxDecode, EchecSonde> {
         let mut reponse = requete
             .send()
             .await
-            .map_err(|e| EchecSonde::new(Cause::Http, format!("GET du flux : {e}")))?;
+            // `without_url` : l'adresse signée ne part ni au journal ni dans
+            // l'historique de la sentinelle.
+            .map_err(|e| {
+                EchecSonde::new(Cause::Http, format!("GET du flux : {}", e.without_url()))
+            })?;
         let statut = reponse.status();
         if !statut.is_success() {
             return Err(EchecSonde::new(

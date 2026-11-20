@@ -259,6 +259,10 @@ deleted, but each service shows « session unreadable, reconnect ».
 - Back up `tune-secrets.cle` together with the database. Local backups
   (`backups/`), the appliance data relocation and the macOS/Windows folder
   migration carry it; a database export or a `.enc` backup does not.
+- ⚠️ The local `backups/` folder holds a copy of the key: a copy of that
+  folder (to a NAS, an external disk, cloud storage) is enough to open the
+  saved sessions. Exclude `tune-secrets.cle*` from off-machine copies (keep
+  the key somewhere safe) or encrypt them.
 - The key must be readable by the account the service runs as (a key created
   by `root` is unreadable for a `tune` service: `chown`/`chmod 600` it).
 - Several servers on the **same PostgreSQL database**: give them the same

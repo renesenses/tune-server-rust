@@ -107,7 +107,16 @@ la base. Tout geste qui déplace ou copie la base doit l'emporter :
   clé déjà présente à la cible n'est jamais écrasée.
 - **Sauvegardes locales** (`backups/`) : une copie de la clé y est rangée ; la
   restauration la remet si la base l'a perdue, sans jamais remplacer une clé
-  en place.
+  en place. Si la clé des données change (perdue puis recréée), la copie
+  rangée suit et l'ancienne est gardée à côté (`tune-secrets.cle.remplacee-…`) :
+  les sauvegardes plus anciennes ont été scellées avec elle. La restauration
+  n'accepte que les fichiers au nom des sauvegardes et à l'en-tête SQLite.
+
+> ⚠️ **Le dossier `backups/` contient la clé.** Une copie de ce dossier (vers
+> un NAS, un disque externe, un service de stockage) **suffit à ouvrir** les
+> jetons des services et les clés d'API de ces sauvegardes. Pour une copie hors
+> de la machine, excluez `tune-secrets.cle*` (et gardez la clé à part, en lieu
+> sûr), ou chiffrez la copie.
 - **Export de la base, sauvegarde chiffrée `.enc`, copie à la main** : la clé
   n'y est **pas**. Sauvegardez `tune-secrets.cle` avec la base (même dossier),
   ou attendez-vous à reconnecter les services après restauration ailleurs.

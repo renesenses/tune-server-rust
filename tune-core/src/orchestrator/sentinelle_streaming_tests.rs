@@ -773,3 +773,69 @@ async fn un_cdn_qui_coupe_apres_un_octet_rougit_en_http_coupe_et_non_en_decodage
         echec.detail
     );
 }
+
+/// Un flux injoignable dont l'adresse porte un jeton signé : ni le détail
+/// (historique de la sentinelle), ni le journal ne le recopient — l'erreur
+/// reqwest est rendue sans son adresse. Contre-épreuve : l'erreur brute de
+/// reqwest le contient.
+#[tokio::test]
+async fn un_flux_injoignable_ne_livre_pas_son_jeton_signe() {
+    #[derive(Clone, Default)]
+    struct Journal(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Journal {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Journal {
+        type Writer = Journal;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+    crate::journal_de_test::fiabiliser_la_capture();
+    let journal = Journal::default();
+    let _garde = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish(),
+    );
+
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let url = format!("http://127.0.0.1:{port}/piste.flac?token=JETON-SIGNE-SENTINELLE");
+    let echec = sonder_un_flux(&flux(url.clone(), "FLAC"))
+        .await
+        .expect_err("injoignable");
+    assert_eq!(echec.cause, Cause::Http, "{echec:?}");
+    assert!(echec.detail.starts_with("GET du flux"), "{}", echec.detail);
+    assert!(
+        !echec.detail.contains("JETON-SIGNE-SENTINELLE"),
+        "{}",
+        echec.detail
+    );
+    let texte = String::from_utf8(journal.0.lock().unwrap().clone()).unwrap();
+    assert!(!texte.contains("JETON-SIGNE-SENTINELLE"), "{texte}");
+
+    let brute = crate::http::client::builder()
+        .build()
+        .unwrap()
+        .get(&url)
+        .send()
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        brute.contains("JETON-SIGNE-SENTINELLE"),
+        "contre-épreuve : {brute}"
+    );
+}

@@ -155,14 +155,7 @@ pub(crate) fn est_un_extrait_v1(reponse: &serde_json::Value) -> bool {
         .is_some_and(|p| p.eq_ignore_ascii_case("PREVIEW"))
 }
 
-/// Une adresse de flux pour le journal : sans sa requête ni son fragment,
-/// qui portent les jetons d'accès signés du CDN.
-pub(crate) fn url_pour_journal(url: &str) -> String {
-    match url.find(['?', '#']) {
-        Some(i) => format!("{}?…", &url[..i]),
-        None => url.to_string(),
-    }
-}
+pub(crate) use crate::http::client::url_pour_journal;
 
 /// Le refus « TIDAL non configuré ».
 fn refus_non_configure() -> TuneError {

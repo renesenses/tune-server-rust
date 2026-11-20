@@ -64,6 +64,16 @@ pub fn blocking_builder() -> reqwest::blocking::ClientBuilder {
 /// à zéro, TLS — n'apparaît que dans ses `source()`. Ce texte garde la nature
 /// de l'erreur, ajoute chaque cause, et laisse l'URL de côté : l'URL vit à
 /// part dans l'erreur, aucune cause ne la recopie.
+/// Une adresse de flux pour le journal ou un message d'erreur : sans sa
+/// requête ni son fragment, qui portent les jetons d'accès signés du CDN
+/// (`?token=…`).
+pub fn url_pour_journal(url: &str) -> String {
+    match url.find(['?', '#']) {
+        Some(i) => format!("{}?…", &url[..i]),
+        None => url.to_string(),
+    }
+}
+
 pub fn decrire_erreur_http(error: &reqwest::Error) -> String {
     let nature = if error.is_timeout() {
         "timeout"

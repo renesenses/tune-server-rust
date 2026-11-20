@@ -70,6 +70,34 @@ pub fn create_backup(db_path: &str) -> Option<BackupInfo> {
     })
 }
 
+/// L'en-tête de tout fichier de base SQLite (les 16 premiers octets).
+const EN_TETE_SQLITE: &[u8; 16] = b"SQLite format 3\0";
+
+/// `filename` suit-il le motif des sauvegardes de `db_file`
+/// (`{stem}_….{ext}`, celui de [`list_backups`]) ? Comparaison exacte, casse
+/// comprise, quel que soit le système de fichiers.
+fn est_un_nom_de_sauvegarde(db_file: &Path, filename: &str) -> bool {
+    let (Some(stem), ext) = (
+        db_file.file_stem().and_then(|s| s.to_str()),
+        db_file.extension().and_then(|e| e.to_str()).unwrap_or("db"),
+    ) else {
+        return false;
+    };
+    filename.len() > stem.len() + 1 + ext.len() + 1
+        && filename.starts_with(&format!("{stem}_"))
+        && filename.ends_with(&format!(".{ext}"))
+}
+
+/// Le fichier commence-t-il par l'en-tête SQLite ?
+fn a_l_en_tete_sqlite(chemin: &Path) -> bool {
+    use std::io::Read;
+    let mut tete = [0u8; 16];
+    fs::File::open(chemin)
+        .and_then(|mut f| f.read_exact(&mut tete))
+        .is_ok()
+        && &tete == EN_TETE_SQLITE
+}
+
 /// Range une copie de la clé du coffre (`tune-secrets.cle`) dans le dossier
 /// des sauvegardes : une sauvegarde de la base sans sa clé rendrait, une fois
 /// restaurée ailleurs, des jetons et des clés d'API qui ne s'ouvrent plus. Au
@@ -79,6 +107,27 @@ fn emporter_la_cle_du_coffre(db_file: &Path, backup_dir: &Path) {
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    let source = dossier.join(crate::coffre::FICHIER_CLE);
+    let rangee = backup_dir.join(crate::coffre::FICHIER_CLE);
+    // La clé des données a changé (perdue puis recréée) : la copie rangée est
+    // mise à jour, l'ancienne gardée à côté sous un nom daté — les
+    // sauvegardes plus anciennes ont été scellées avec elle.
+    if let (Ok(actuelle), Ok(ancienne)) = (fs::read(&source), fs::read(&rangee))
+        && actuelle != ancienne
+    {
+        let datee = backup_dir.join(format!(
+            "{}.remplacee-{}",
+            crate::coffre::FICHIER_CLE,
+            chrono::Local::now().format("%Y%m%d_%H%M%S")
+        ));
+        match fs::rename(&rangee, &datee) {
+            Ok(()) => info!(ancienne = %datee.display(), "database_backup_cle_du_coffre_remplacee"),
+            Err(e) => {
+                warn!(error = %e, "database_backup_cle_du_coffre_non_remplacee");
+                return;
+            }
+        }
+    }
     if let Err(e) = crate::coffre::copier_la_cle(dossier, backup_dir) {
         warn!(error = %e, "database_backup_cle_du_coffre_non_copiee");
     }
@@ -260,10 +309,12 @@ pub fn restore_backup(db_path: &str, filename: &str) -> bool {
         warn!("path_traversal_blocked");
         return false;
     }
-    // La copie de la clé du coffre vit dans ce dossier : elle n'est pas une
-    // base, et la prendre pour telle écraserait `tune.db`.
-    if filename == crate::coffre::FICHIER_CLE {
-        warn!("restore_refuse_cle_du_coffre");
+    // Seul un nom de SAUVEGARDE de cette base (le motif que `list_backups`
+    // montre) est accepté. La copie de la clé du coffre vit dans ce dossier :
+    // sur un système insensible à la casse (APFS, NTFS), un nom exact
+    // n'aurait pas suffi à l'écarter (`TUNE-SECRETS.CLE`).
+    if !est_un_nom_de_sauvegarde(db_file, filename) {
+        warn!("restore_refuse_nom_hors_motif");
         return false;
     }
     let Ok(backup_path) = crate::chemin_sur::joindre_sous(&backup_dir, filename) else {
@@ -272,6 +323,11 @@ pub fn restore_backup(db_path: &str, filename: &str) -> bool {
     };
 
     if !backup_path.is_file() {
+        return false;
+    }
+    // Et le fichier doit ÊTRE une base SQLite : son en-tête le dit.
+    if !a_l_en_tete_sqlite(&backup_path) {
+        warn!("restore_refuse_fichier_non_sqlite");
         return false;
     }
 
@@ -673,7 +729,7 @@ mod tests {
     fn la_sauvegarde_emporte_la_cle_du_coffre_et_la_restauration_la_remet() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("tune.db");
-        std::fs::write(&db_path, b"base").unwrap();
+        std::fs::write(&db_path, b"SQLite format 3\0base").unwrap();
         let coffre = crate::coffre::Coffre::new(dir.path());
         let scelle = coffre.sceller("jeton").unwrap();
         let info = create_backup(db_path.to_str().unwrap()).expect("sauvegarde");
@@ -691,12 +747,16 @@ mod tests {
         assert!(coffre.ouvrir(&scelle).is_err(), "contre-épreuve");
         assert!(restore_backup(db_path.to_str().unwrap(), &info.filename));
         assert_eq!(coffre.ouvrir(&scelle).unwrap(), "jeton");
-        // La copie de la clé ne se « restaure » pas comme une base.
-        assert!(!restore_backup(
-            db_path.to_str().unwrap(),
-            crate::coffre::FICHIER_CLE
-        ));
-        assert_eq!(std::fs::read(&db_path).unwrap(), b"base");
+        // La copie de la clé ne se « restaure » pas comme une base, quelle
+        // que soit la casse du nom (APFS, NTFS).
+        for nom in [
+            crate::coffre::FICHIER_CLE,
+            "TUNE-SECRETS.CLE",
+            "Tune-Secrets.cle",
+        ] {
+            assert!(!restore_backup(db_path.to_str().unwrap(), nom), "{nom}");
+        }
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"SQLite format 3\0base");
     }
 
     /// La migration de la base (macOS, Windows) emporte la clé du coffre.
@@ -732,19 +792,95 @@ mod tests {
         );
     }
 
+    /// Seuls les fichiers au motif des sauvegardes ET à l'en-tête SQLite se
+    /// restaurent. Contre-épreuve : la même sauvegarde, en-tête intact, passe.
+    /// La clé des données a changé : la copie rangée dans `backups/` suit,
+    /// l'ancienne est gardée sous un nom daté (les sauvegardes plus anciennes
+    /// ont été scellées avec elle).
+    #[test]
+    fn la_cle_rangee_suit_une_cle_de_donnees_recreee() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("tune.db");
+        fs::write(&db_path, b"SQLite format 3\0base").unwrap();
+        let cle = dir.path().join(crate::coffre::FICHIER_CLE);
+        let backups = dir.path().join("backups");
+        crate::coffre::Coffre::new(dir.path()).sceller("x").unwrap();
+        create_backup(db_path.to_str().unwrap()).unwrap();
+        let premiere = fs::read(&cle).unwrap();
+        assert_eq!(
+            fs::read(backups.join(crate::coffre::FICHIER_CLE)).unwrap(),
+            premiere
+        );
+
+        // Clé perdue puis recréée.
+        fs::remove_file(&cle).unwrap();
+        crate::coffre::Coffre::new(dir.path()).sceller("y").unwrap();
+        let seconde = fs::read(&cle).unwrap();
+        assert_ne!(premiere, seconde);
+        create_backup(db_path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            fs::read(backups.join(crate::coffre::FICHIER_CLE)).unwrap(),
+            seconde
+        );
+        let anciennes: Vec<_> = fs::read_dir(&backups)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".remplacee-"))
+            .collect();
+        assert_eq!(anciennes.len(), 1);
+        assert_eq!(fs::read(anciennes[0].path()).unwrap(), premiere);
+    }
+
+    #[test]
+    fn la_restauration_exige_le_motif_et_l_en_tete_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("tune.db");
+        fs::write(&db_path, b"SQLite format 3\0active").unwrap();
+        let backups = dir.path().join("backups");
+        fs::create_dir_all(&backups).unwrap();
+        // Bon motif, pas une base : refusé.
+        fs::write(backups.join("tune_20261120_000000.db"), b"pas une base").unwrap();
+        // En-tête SQLite, mauvais motif : refusé.
+        fs::write(backups.join("autre.db"), b"SQLite format 3\0autre").unwrap();
+        fs::write(
+            backups.join("TUNE_20261120_000001.DB"),
+            b"SQLite format 3\0casse",
+        )
+        .unwrap();
+        let db_s = db_path.to_str().unwrap();
+        for nom in [
+            "tune_20261120_000000.db",
+            "autre.db",
+            "TUNE_20261120_000001.DB",
+        ] {
+            assert!(!restore_backup(db_s, nom), "{nom}");
+            assert_eq!(
+                fs::read(&db_path).unwrap(),
+                b"SQLite format 3\0active",
+                "{nom}"
+            );
+        }
+        fs::write(
+            backups.join("tune_20261120_000002.db"),
+            b"SQLite format 3\0bonne",
+        )
+        .unwrap();
+        assert!(restore_backup(db_s, "tune_20261120_000002.db"));
+        assert_eq!(fs::read(&db_path).unwrap(), b"SQLite format 3\0bonne");
+    }
+
     #[test]
     fn create_and_restore_backup() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
-        fs::write(&db_path, b"original").unwrap();
+        fs::write(&db_path, b"SQLite format 3\0original").unwrap();
 
         let info = create_backup(db_path.to_str().unwrap()).unwrap();
 
-        fs::write(&db_path, b"modified").unwrap();
-        assert_eq!(fs::read_to_string(&db_path).unwrap(), "modified");
+        fs::write(&db_path, b"SQLite format 3\0modified").unwrap();
 
         assert!(restore_backup(db_path.to_str().unwrap(), &info.filename));
-        assert_eq!(fs::read_to_string(&db_path).unwrap(), "original");
+        assert_eq!(fs::read(&db_path).unwrap(), b"SQLite format 3\0original");
     }
 
     #[test]
