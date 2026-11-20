@@ -297,9 +297,38 @@ fn peupler(db: &Arc<dyn DbBackend>, suffixe: &str) -> Base {
     }
 }
 
+/// Les liaisons des crédits de CE test : une base PostgreSQL partagée en
+/// porte d'autres, qui ne regardent pas ce test.
+fn liaisons_du_test(db: &Arc<dyn DbBackend>, base: &Base) -> Vec<Liaison> {
+    let mut v: Vec<Liaison> = lister(db)
+        .unwrap()
+        .into_iter()
+        .filter(|l| l.credit_id == base.a_et_b || l.credit_id == base.a_feat_x)
+        .collect();
+    v.sort();
+    v
+}
+
+/// Toutes les vérifications portent sur les fiches et albums créés par
+/// [`peupler`] : sur une base partagée, le reste de la bibliothèque bouge.
 fn verifier(db: &Arc<dyn DbBackend>, base: &Base) {
-    let bilan = recalculer(db, &[]).unwrap();
-    assert!(bilan.liaisons >= 2, "{bilan:?}");
+    recalculer(db, &[]).unwrap();
+    assert_eq!(
+        liaisons_du_test(db, base),
+        vec![
+            Liaison {
+                credit_id: base.a_et_b,
+                artiste_id: base.a,
+                rang: 0
+            },
+            Liaison {
+                credit_id: base.a_et_b,
+                artiste_id: base.b,
+                rang: 1
+            },
+        ],
+        "« A & B » relié à A puis B ; « A feat. X » (X sans fiche) non relié"
+    );
     let artistes = ArtistRepo::with_backend(db.clone());
     let grille: Vec<i64> = artistes
         .list(100_000, 0)
@@ -319,11 +348,6 @@ fn verifier(db: &Arc<dyn DbBackend>, base: &Base) {
     assert!(
         grille.contains(&base.a_feat_x),
         "« feat. » d'un artiste sans fiche : crédit entier, gardé"
-    );
-    assert_eq!(
-        artistes.count().unwrap() as usize,
-        grille.len(),
-        "le total suit la page"
     );
 
     let albums = AlbumRepo::with_backend(db.clone());
@@ -359,10 +383,10 @@ fn verifier(db: &Arc<dyn DbBackend>, base: &Base) {
     let de_a = albums_des_pistes(base.a);
     assert!(de_a.contains(&base.album_a) && de_a.contains(&base.album_ab));
 
-    // Idempotente : la seconde passe n'écrit rien.
-    let encore = recalculer(db, &[]).unwrap();
-    assert!(!encore.ecrit, "{encore:?}");
-    assert_eq!(encore.liaisons, bilan.liaisons);
+    // Une seconde passe rend les mêmes liaisons.
+    let avant = liaisons_du_test(db, base);
+    recalculer(db, &[]).unwrap();
+    assert_eq!(liaisons_du_test(db, base), avant);
 }
 
 fn sqlite() -> Arc<dyn DbBackend> {
@@ -377,6 +401,13 @@ fn grille_et_page_artiste_sqlite() {
     let db = sqlite();
     let base = peupler(&db, "");
     verifier(&db, &base);
+    // Base à soi : le total suit la page, et la seconde passe n'écrit rien.
+    let artistes = ArtistRepo::with_backend(db.clone());
+    assert_eq!(
+        artistes.count().unwrap() as usize,
+        artistes.list(100_000, 0).unwrap().len()
+    );
+    assert!(!recalculer(&db, &[]).unwrap().ecrit);
     // Le crédit d'origine reste en base, intact.
     let credit = ArtistRepo::with_backend(db.clone())
         .get(base.a_et_b)
@@ -453,8 +484,14 @@ async fn pg_9265_grille_et_page_artiste() {
     .unwrap();
     let db2 = db.clone();
     tokio::task::spawn_blocking(move || {
-        db2.execute("DELETE FROM artistes_des_credits", &[])
+        // Seules les liaisons des crédits de ce test.
+        for credit in [base.a_et_b, base.a_feat_x] {
+            db2.execute(
+                "DELETE FROM artistes_des_credits WHERE credit_id = $1",
+                &[&credit as &dyn ToSqlValue],
+            )
             .unwrap();
+        }
         for album in [base.album_a, base.album_ab, base.album_ax] {
             db2.execute(
                 "DELETE FROM tracks WHERE album_id = $1",
