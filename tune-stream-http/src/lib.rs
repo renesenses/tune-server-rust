@@ -439,6 +439,11 @@ pub async fn handle_stream(
     let Some(session) = session else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // #8963 — tirée par le pont (relais, écoute directe) : la retenue couvre
+    // toute la piste, AVANT que cette connexion tire le canal.
+    if req_headers.contains_key(tune_core::cloud::ENTETE_RELAIS) {
+        session.noter_tirage_par_le_pont();
+    }
 
     let range_hdr = req_headers
         .get("Range")
@@ -3723,11 +3728,41 @@ async fn proxy_stream(
     (StatusCode::OK, headers, body).into_response()
 }
 
+/// Le pair est-il cette machine même ?
+pub(crate) fn pair_en_boucle_locale(pair: std::net::IpAddr) -> bool {
+    match pair {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
+/// #8963 — la marque du pont ([`tune_core::cloud::ENTETE_RELAIS`]) n'est
+/// crue que d'un pair en boucle locale : le relais et l'écoute directe
+/// rejouent depuis 127.0.0.1. Posée par un appareil du réseau, ou sans
+/// adresse de pair connue, elle est retirée avant [`handle_stream`].
+async fn handle_stream_par_la_route(
+    chemin: Path<String>,
+    etat: State<SharedSessions>,
+    connexion: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    mut req_headers: HeaderMap,
+) -> Response {
+    let en_boucle_locale =
+        connexion.is_some_and(|axum::Extension(axum::extract::ConnectInfo(pair))| {
+            pair_en_boucle_locale(pair.ip())
+        });
+    if !en_boucle_locale {
+        req_headers.remove(tune_core::cloud::ENTETE_RELAIS);
+    }
+    handle_stream(chemin, etat, req_headers).await
+}
+
 pub fn router(sessions: SharedSessions) -> axum::Router {
     axum::Router::new()
         .route(
             "/stream/{stream_id}",
-            axum::routing::get(handle_stream).head(handle_head),
+            axum::routing::get(handle_stream_par_la_route).head(handle_head),
         )
         // #7807 — journal seul, aucun changement de comportement : une ligne
         // par requête du renderer (méthode, chemin, Range, agent, IP, statut,
@@ -6005,6 +6040,8 @@ mod stream_url_distant_tests {
 
 #[cfg(test)]
 mod fin_de_piste_relue_6050;
+#[cfg(test)]
+mod reprise_par_le_pont_8963;
 
 #[cfg(test)]
 mod long_wav_4016;
