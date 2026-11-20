@@ -449,6 +449,11 @@ pub struct StreamSession {
     /// Alimentée sous le verrou du récepteur (`recv_chunk_retenu`), donc dans
     /// l'ordre exact du canal ; bornée par `fenetre_de_retenue`.
     retenue: std::sync::Mutex<RetenueDuCanal>,
+    /// #8963 — une connexion arrivée par le pont (relais ou écoute directe,
+    /// en-tête [`crate::cloud::ENTETE_RELAIS`]) a tiré ce flux, et ces octets
+    /// de retenue lui ont été accordés sur le budget commun du pont : voir
+    /// [`StreamSession::reserver_pour_le_pont`]. Rendus quand la session meurt.
+    reservation_du_pont: std::sync::OnceLock<(&'static BudgetDuPont, u64)>,
     pub created_at: Instant,
     pub bytes_sent: std::sync::atomic::AtomicU64,
     /// #9206 — instant où `bytes_sent` a franchi
@@ -844,7 +849,90 @@ impl StreamSession {
             first_request: std::sync::Arc::new(tokio::sync::Notify::new()),
             data_ready: std::sync::Arc::new(tokio::sync::Notify::new()),
             producer_done: std::sync::atomic::AtomicBool::new(false),
+            reservation_du_pont: std::sync::OnceLock::new(),
         }
+    }
+
+    /// #8963 — note qu'une connexion venue du pont tire ce flux. À appeler
+    /// AVANT de tirer le canal : la retenue s'élargit pour les blocs suivants,
+    /// sur le budget commun [`BUDGET_DU_PONT`].
+    pub fn noter_tirage_par_le_pont(&self) {
+        self.reserver_pour_le_pont(&BUDGET_DU_PONT, RETENUE_PONT_MAX_OCTETS);
+    }
+
+    /// Réserve sur `budget` la retenue du pont de cette session : toute la
+    /// piste si elle tient sous `plafond`, sinon `plafond` octets gardés
+    /// depuis son DÉBUT. Rend `true` si la session a (ou avait déjà) sa
+    /// réservation. Rien pour une longueur inconnue (radio), ni quand la
+    /// fenêtre ordinaire couvre déjà la piste, ni quand le budget est épuisé
+    /// — la fenêtre ordinaire s'applique alors.
+    pub fn reserver_pour_le_pont(&self, budget: &'static BudgetDuPont, plafond: u64) -> bool {
+        if self.reservation_du_pont.get().is_some() {
+            return true;
+        }
+        let Some(total) = self.info.wav_content_length() else {
+            return false;
+        };
+        let n = total.min(plafond);
+        if total <= self.info.fenetre_de_retenue() || n == 0 {
+            return false;
+        }
+        if !budget.reserver(n) {
+            tracing::warn!(
+                stream_id = %self.id,
+                demande = n,
+                utilise = budget.utilise(),
+                plafond = budget.plafond(),
+                "retenue_du_pont_refusee — budget commun des flux tirés par le pont épuisé : \
+                 fenêtre ordinaire (#8963)"
+            );
+            return false;
+        }
+        if self.reservation_du_pont.set((budget, n)).is_err() {
+            // Une autre connexion a réservé entre-temps : on rend la nôtre.
+            budget.rendre(n);
+        }
+        true
+    }
+
+    /// `(fenêtre glissante, tête gardée depuis 0)` de la retenue de cette
+    /// session.
+    fn parametres_de_retenue(&self) -> (u64, u64) {
+        let base = self.info.fenetre_de_retenue();
+        match (
+            self.reservation_du_pont.get(),
+            self.info.wav_content_length(),
+        ) {
+            (Some(&(_, n)), Some(total)) if n >= total => (base.max(n), 0),
+            (Some(&(_, n)), Some(_)) => (base, n),
+            _ => (base, 0),
+        }
+    }
+
+    /// La fenêtre de retenue de CETTE session.
+    ///
+    /// #8963 (fil 2880, téléphone en 5G par le pont, rc12) : une conversion
+    /// FLAC 88,2/24 → WAV 88,2/16 de 73 Mo a été tirée EN ENTIER en 1,4 s —
+    /// le relais pousse au débit de la liaison montante, pas à celui du
+    /// lecteur. Neuf secondes plus tard le téléphone reprenait en
+    /// `bytes=44-`, juste après l'en-tête : la retenue (180 s, soit 63,5 Mo à
+    /// ce débit) ne commençait plus qu'à 9,8 Mo. Connexion fermée sans un
+    /// octet, puis 404 à chaque redémarrage (#6050) : la piste était perdue.
+    ///
+    /// Tirée par le pont, une piste de longueur CONNUE est donc retenue en
+    /// entier, jusqu'à [`RETENUE_PONT_MAX_OCTETS`] ; au-delà, ses premiers
+    /// [`RETENUE_PONT_MAX_OCTETS`] sont gardés en plus de la fenêtre
+    /// ordinaire ([`StreamSession::tete_de_retenue_effective`]). Une radio
+    /// (longueur inconnue), toute session locale, et toute session refusée
+    /// par le budget commun gardent la fenêtre de toujours.
+    pub fn fenetre_de_retenue_effective(&self) -> u64 {
+        self.parametres_de_retenue().0
+    }
+
+    /// #8963 — octets gardés depuis le DÉBUT de la piste, en plus de la
+    /// fenêtre glissante : 0 hors du pont, ou quand la fenêtre couvre tout.
+    pub fn tete_de_retenue_effective(&self) -> u64 {
+        self.parametres_de_retenue().1
     }
 
     pub async fn recv_chunk(&self) -> Option<Vec<u8>> {
@@ -916,9 +1004,9 @@ impl StreamSession {
         preparer(debut, &mut bloc);
         self.octets_du_canal
             .fetch_add(bloc.len() as u64, std::sync::atomic::Ordering::SeqCst);
-        let fenetre = self.info.fenetre_de_retenue();
+        let (fenetre, tete) = self.parametres_de_retenue();
         if let Ok(mut r) = self.retenue.lock() {
-            r.ajouter(debut, bloc.clone(), fenetre);
+            r.ajouter(debut, bloc.clone(), fenetre, tete);
         }
         (debut, bloc)
     }
@@ -947,10 +1035,21 @@ impl StreamSession {
     }
 
     /// `[début, fin)` de ce que la retenue peut rejouer.
+    ///
+    /// #8963 — avec une tête gardée (pont, piste plus longue que le plafond),
+    /// le début vaut 0 : une reprise y est servie depuis la tête, et la suite
+    /// depuis la fenêtre si elles se touchent.
     pub fn etendue_retenue(&self) -> (u64, u64) {
         self.retenue
             .lock()
-            .map(|r| (r.debut, r.debut + r.taille))
+            .map(|r| {
+                let fin = (r.debut + r.taille).max(r.tete.len() as u64);
+                if r.tete.is_empty() {
+                    (r.debut, fin)
+                } else {
+                    (0, fin)
+                }
+            })
             .unwrap_or((0, 0))
     }
 
@@ -1165,10 +1264,19 @@ struct RetenueDuCanal {
     blocs: std::collections::VecDeque<Vec<u8>>,
     taille: u64,
     fin: Option<u64>,
+    /// #8963 — les premiers octets du flux, gardés hors de la fenêtre
+    /// glissante (pont, piste plus longue que le plafond).
+    tete: Vec<u8>,
 }
 
 impl RetenueDuCanal {
-    fn ajouter(&mut self, position: u64, bloc: Vec<u8>, fenetre: u64) {
+    fn ajouter(&mut self, position: u64, bloc: Vec<u8>, fenetre: u64, tete_max: u64) {
+        let long = self.tete.len() as u64;
+        if long < tete_max && position <= long && position + bloc.len() as u64 > long {
+            let depuis = (long - position) as usize;
+            let jusqu = ((tete_max - position).min(bloc.len() as u64)) as usize;
+            self.tete.extend_from_slice(&bloc[depuis..jusqu]);
+        }
         if position != self.debut + self.taille {
             // Un bloc tiré hors de la retenue (autre voie de lecture) : la
             // continuité est rompue, on repart de celui-ci.
@@ -1187,6 +1295,11 @@ impl RetenueDuCanal {
     }
 
     fn relire(&self, position: u64, max: usize) -> Relecture {
+        if position < self.tete.len() as u64 && position < self.debut {
+            let depuis = position as usize;
+            let jusqu = (depuis + max).min(self.tete.len());
+            return Relecture::Octets(self.tete[depuis..jusqu].to_vec());
+        }
         let fin = self.debut + self.taille;
         if position >= fin {
             return Relecture::AuBout;
@@ -1222,6 +1335,68 @@ impl RetenueDuCanal {
 pub const RETENUE_SECONDES: u64 = 180;
 pub const RETENUE_MIN_OCTETS: u64 = 8 * 1024 * 1024;
 pub const RETENUE_MAX_OCTETS: u64 = 64 * 1024 * 1024;
+/// #8963 — une piste tirée par le pont est retenue en entier jusqu'à ce
+/// plafond : 12 min de WAV 88,2/16, 25 min de CD. Au-delà, ce sont ses
+/// premiers octets qui sont gardés, en plus de la fenêtre ordinaire : une
+/// reprise juste après l'en-tête (`bytes=44-`) reste servie.
+pub const RETENUE_PONT_MAX_OCTETS: u64 = 256 * 1024 * 1024;
+
+/// #8963 — ce que TOUTES les sessions tirées par le pont peuvent retenir
+/// ensemble au-delà de la fenêtre ordinaire. Au-delà, une nouvelle session
+/// garde la fenêtre ordinaire.
+pub const BUDGET_PONT_OCTETS: u64 = 384 * 1024 * 1024;
+
+/// Le budget commun des retenues du pont.
+pub static BUDGET_DU_PONT: BudgetDuPont = BudgetDuPont::new(BUDGET_PONT_OCTETS);
+
+/// Un budget d'octets partagé, réservé et rendu sans verrou.
+#[derive(Debug)]
+pub struct BudgetDuPont {
+    utilise: std::sync::atomic::AtomicU64,
+    plafond: u64,
+}
+
+impl BudgetDuPont {
+    pub const fn new(plafond: u64) -> Self {
+        Self {
+            utilise: std::sync::atomic::AtomicU64::new(0),
+            plafond,
+        }
+    }
+
+    /// Réserve `n` octets s'ils tiennent sous le plafond, tout ou rien.
+    pub fn reserver(&self, n: u64) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.utilise
+            .fetch_update(SeqCst, SeqCst, |u| {
+                u.checked_add(n).filter(|total| *total <= self.plafond)
+            })
+            .is_ok()
+    }
+
+    pub fn rendre(&self, n: u64) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let _ = self
+            .utilise
+            .fetch_update(SeqCst, SeqCst, |u| Some(u.saturating_sub(n)));
+    }
+
+    pub fn utilise(&self) -> u64 {
+        self.utilise.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn plafond(&self) -> u64 {
+        self.plafond
+    }
+}
+
+impl Drop for StreamSession {
+    fn drop(&mut self) {
+        if let Some(&(budget, n)) = self.reservation_du_pont.get() {
+            budget.rendre(n);
+        }
+    }
+}
 
 impl StreamInfo {
     /// Taille de la fenêtre de retenue de ce flux — voir [`RETENUE_SECONDES`].

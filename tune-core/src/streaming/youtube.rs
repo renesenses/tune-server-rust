@@ -932,6 +932,8 @@ impl YouTubeService {
                             track_count: 0,
                             quality: None,
                             released_at: None,
+                            genre_id: None,
+                            genre_name: None,
                         });
                     }
                     "youtube#channel" => {
@@ -1871,6 +1873,8 @@ impl YouTubeService {
             track_count: content["itemCount"].as_u64().unwrap_or(0) as u32,
             quality: None,
             released_at: None,
+            genre_id: None,
+            genre_name: None,
         }
     }
 
@@ -2050,6 +2054,8 @@ impl YouTubeService {
             track_count,
             quality: None,
             released_at: None,
+            genre_id: None,
+            genre_name: None,
         }
     }
 
@@ -2173,6 +2179,8 @@ impl YouTubeService {
                         track_count: 0,
                         quality: None,
                         released_at: None,
+                        genre_id: None,
+                        genre_name: None,
                     });
                 } else if !video_id.is_empty() {
                     tracks.push(StreamTrack {
@@ -2375,6 +2383,8 @@ impl YouTubeService {
                             track_count: 0,
                             quality: None,
                             released_at: None,
+                            genre_id: None,
+                            genre_name: None,
                         });
                     }
                 } else if section_type.contains("artist") {
@@ -2880,6 +2890,8 @@ impl YouTubeService {
             track_count: 0, // Set from tracks count
             quality: None,
             released_at: None,
+            genre_id: None,
+            genre_name: None,
         })
     }
 
@@ -2990,6 +3002,8 @@ impl YouTubeService {
                             track_count: 0,
                             quality: None,
                             released_at: None,
+                            genre_id: None,
+                            genre_name: None,
                         });
                     }
                 }
@@ -3217,6 +3231,8 @@ impl YouTubeService {
                             track_count: 0,
                             quality: None,
                             released_at: None,
+                            genre_id: None,
+                            genre_name: None,
                         });
                     }
                 }
