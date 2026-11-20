@@ -201,6 +201,18 @@ dotenvy = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 tune-aes67 = { path = "../plugins/tune-aes67", optional = true }
 
+# #9061 — ouvrir l'interface par le shell Windows sans sa boîte d'erreur
+# (`AssocQueryStringW`, `ShellExecuteExW` + `SEE_MASK_FLAG_NO_UI`) et lire le
+# choix de navigateur de l'utilisateur dans le registre.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+windows-registry = "0.6"
+
 [dev-dependencies]
 tower = "0.5"
 # Test-only (#6286) : donner aux FLAC témoins de l'audit d'intégrité le MD5

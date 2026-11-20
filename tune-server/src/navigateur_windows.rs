@@ -10,19 +10,26 @@
 //! le testeur a conclu que le serveur ne tournait pas et il est revenu à la
 //! rc10.
 //!
-//! Désormais, l'ouverture regarde d'abord où mène l'association :
+//! Désormais :
 //!
-//! 1. le choix de l'utilisateur pour `http` (`UserChoice`, `ProgId`), puis la
-//!    commande `shell\open\command` de ce `ProgId` (ou, à défaut, celle de
-//!    `HKCR\http`) ; si l'exécutable qu'elle nomme EXISTE, `start` l'emploie,
-//!    comme avant ;
-//! 2. sinon, un navigateur installé à son emplacement habituel (Firefox,
+//! 1. l'association est lue par le shell lui-même (`AssocQueryStringW`,
+//!    `ASSOCSTR_EXECUTABLE`) : pour le `ProgId` choisi par l'utilisateur
+//!    (`UserChoice`) s'il y en a un — et SEULEMENT pour lui, jamais un repli
+//!    sur `HKCR\http`, qui nomme souvent un iexplore encore présent alors que
+//!    le shell, lui, suit le choix cassé —, sinon pour le protocole `http` ;
+//!    un `ProgId` sans exécutable mais dont la clé `HKCR\<ProgId>` existe
+//!    (application du Store, Edge ancien) compte comme valide ;
+//! 2. l'ouverture par l'association passe par `ShellExecuteExW` avec
+//!    `SEE_MASK_FLAG_NO_UI` : jamais de boîte d'erreur, et un échec retombe
+//!    sur la suite ;
+//! 3. sinon, un navigateur installé à son emplacement habituel (Firefox,
 //!    Chrome, Edge), lancé directement avec l'adresse ;
-//! 3. sinon, une fenêtre de Tune dit en clair que le serveur tourne et quelle
-//!    adresse ouvrir — jamais la fenêtre d'erreur de Windows.
+//! 4. sinon, une fenêtre de Tune dit en clair que le serveur tourne et quelle
+//!    adresse ouvrir.
 //!
 //! Les décisions sont des fonctions pures, éprouvées sur toutes les machines ;
-//! seule la lecture du registre et le lancement sont propres à Windows.
+//! seuls la lecture du registre, le shell et le lancement sont propres à
+//! Windows. L'appel est bloquant : `bootstrap` le passe en `spawn_blocking`.
 
 use std::path::{Path, PathBuf};
 
@@ -37,91 +44,71 @@ pub(crate) enum Ouverture {
     Avis,
 }
 
+/// Ce que le shell sait de l'association `http`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Association {
+    /// `UserChoice\ProgId`, s'il est posé.
+    pub prog_id: Option<String>,
+    /// La clé `HKCR\<ProgId>` existe.
+    pub prog_id_enregistre: bool,
+    /// L'exécutable résolu : celui du `ProgId` s'il y en a un, sinon celui
+    /// du protocole `http`.
+    pub executable: Option<PathBuf>,
+}
+
+/// Rassemble l'association, sans effet de bord.
+///
+/// `cle_existe(prog_id)` : `HKCR\<prog_id>` existe ; `executable_de(nom,
+/// protocole)` : `AssocQueryStringW(ASSOCSTR_EXECUTABLE)` pour ce `ProgId`
+/// (`protocole = false`) ou pour le protocole `http` (`true`). Un `ProgId`
+/// posé n'est JAMAIS complété par l'exécutable de `http`.
+pub(crate) fn lire_association(
+    prog_id: Option<String>,
+    cle_existe: impl Fn(&str) -> bool,
+    executable_de: impl Fn(&str, bool) -> Option<PathBuf>,
+) -> Association {
+    match prog_id.filter(|id| !id.trim().is_empty()) {
+        Some(id) => Association {
+            executable: executable_de(&id, false),
+            prog_id_enregistre: cle_existe(&id),
+            prog_id: Some(id),
+        },
+        None => Association {
+            prog_id: None,
+            prog_id_enregistre: false,
+            executable: executable_de("http", true),
+        },
+    }
+}
+
+/// L'association mène-t-elle quelque part ?
+///
+/// Un exécutable nommé doit exister ; sans exécutable, seul un `ProgId`
+/// enregistré compte (application du Store).
+pub(crate) fn association_utilisable(a: &Association, existe: impl Fn(&Path) -> bool) -> bool {
+    match &a.executable {
+        Some(exe) => existe(exe),
+        None => a.prog_id.is_some() && a.prog_id_enregistre,
+    }
+}
+
 /// La décision, sans effet de bord.
 ///
-/// `programme_associe` : l'exécutable que nomme la commande d'ouverture de
-/// `http` (`None` : pas d'association). `existe` : le système de fichiers, en
-/// paramètre pour les témoins. `installes` : les emplacements habituels des
-/// navigateurs, dans l'ordre de préférence.
+/// `installes` : les emplacements habituels des navigateurs, dans l'ordre de
+/// préférence ; `existe` : le système de fichiers, en paramètre pour les
+/// témoins.
 pub(crate) fn decider(
-    programme_associe: Option<&Path>,
+    association: &Association,
     installes: &[PathBuf],
     existe: impl Fn(&Path) -> bool,
 ) -> Ouverture {
-    if programme_associe.is_some_and(&existe) {
+    if association_utilisable(association, &existe) {
         return Ouverture::ParLAssociation;
     }
     match installes.iter().find(|p| existe(p)) {
         Some(p) => Ouverture::Navigateur(p.clone()),
         None => Ouverture::Avis,
     }
-}
-
-/// La valeur d'une ligne de `reg query` : `    <nom>    REG_SZ    <valeur>`.
-///
-/// Le nom de la valeur par défaut est traduit (« (Default) », « (par
-/// défaut) ») : on ne le lit pas, on prend ce qui suit le type.
-pub(crate) fn valeur_de_reg_query(sortie: &str) -> Option<String> {
-    for ligne in sortie.lines() {
-        for type_ in ["REG_EXPAND_SZ", "REG_SZ"] {
-            if let Some((_, reste)) = ligne.split_once(&format!("    {type_}    ")) {
-                let v = reste.trim();
-                if !v.is_empty() {
-                    return Some(v.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-/// Développe les `%VARIABLE%` d'une valeur `REG_EXPAND_SZ`.
-pub(crate) fn developper(valeur: &str, env: impl Fn(&str) -> Option<String>) -> String {
-    let mut sortie = String::new();
-    let mut reste = valeur;
-    while let Some(debut) = reste.find('%') {
-        sortie.push_str(&reste[..debut]);
-        let apres = &reste[debut + 1..];
-        match apres.find('%') {
-            Some(fin) => {
-                let nom = &apres[..fin];
-                match env(nom) {
-                    Some(v) if !nom.is_empty() => sortie.push_str(&v),
-                    _ => {
-                        sortie.push('%');
-                        sortie.push_str(nom);
-                        sortie.push('%');
-                    }
-                }
-                reste = &apres[fin + 1..];
-            }
-            None => {
-                sortie.push('%');
-                reste = apres;
-            }
-        }
-    }
-    sortie.push_str(reste);
-    sortie
-}
-
-/// L'exécutable d'une commande d'ouverture :
-/// `"C:\Program Files\Mozilla Firefox\firefox.exe" -osint -url "%1"`.
-pub(crate) fn executable_de_la_commande(commande: &str) -> Option<PathBuf> {
-    let c = commande.trim();
-    let exe = if let Some(guillemets) = c.strip_prefix('"') {
-        guillemets.split('"').next()?
-    } else {
-        // Sans guillemets : jusqu'au `.exe`, qui peut suivre des espaces
-        // (`C:\Program Files\…\x.exe -arg`), sinon jusqu'au premier blanc.
-        let bas = c.to_ascii_lowercase();
-        match bas.find(".exe") {
-            Some(i) => &c[..i + 4],
-            None => c.split_whitespace().next()?,
-        }
-    };
-    let exe = exe.trim();
-    (!exe.is_empty()).then(|| PathBuf::from(exe))
 }
 
 /// Les emplacements habituels des navigateurs, dans l'ordre de préférence.
@@ -173,70 +160,129 @@ pub(crate) fn ligne_de_l_avis(url: &str) -> String {
 mod systeme {
     use super::*;
     use std::os::windows::process::CommandExt;
+    use windows::Win32::System::Com::{
+        COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
+    };
+    use windows::Win32::UI::Shell::{
+        ASSOCF_IS_PROTOCOL, ASSOCF_NONE, ASSOCSTR_EXECUTABLE, AssocQueryStringW,
+        SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW,
+    };
+    use windows::core::{HSTRING, PCWSTR, PWSTR};
 
     const CREATE_NO_WINDOW: u32 = crate::lancement_sans_console::CREATE_NO_WINDOW;
 
-    fn reg_query(cle: &str, valeur: Option<&str>) -> Option<String> {
-        let mut cmd = std::process::Command::new("reg");
-        cmd.arg("query").arg(cle);
-        match valeur {
-            Some(v) => {
-                cmd.arg("/v").arg(v);
-            }
-            None => {
-                cmd.arg("/ve");
-            }
-        }
-        let sortie = cmd.creation_flags(CREATE_NO_WINDOW).output().ok()?;
-        if !sortie.status.success() {
+    fn prog_id_choisi() -> Option<String> {
+        windows_registry::CURRENT_USER
+            .open(
+                r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice",
+            )
+            .ok()?
+            .get_string("ProgId")
+            .ok()
+    }
+
+    fn cle_existe(prog_id: &str) -> bool {
+        windows_registry::CLASSES_ROOT.open(prog_id).is_ok()
+    }
+
+    fn executable_de(nom: &str, protocole: bool) -> Option<PathBuf> {
+        let drapeaux = if protocole {
+            ASSOCF_IS_PROTOCOL
+        } else {
+            ASSOCF_NONE
+        };
+        let nom = HSTRING::from(nom);
+        let verbe = HSTRING::from("open");
+        let mut tampon = vec![0u16; 1024];
+        let mut longueur = tampon.len() as u32;
+        // SAFETY: le tampon vit le temps de l'appel et `longueur` dit sa
+        // contenance en caractères, terminateur compris.
+        let resultat = unsafe {
+            AssocQueryStringW(
+                drapeaux,
+                ASSOCSTR_EXECUTABLE,
+                &nom,
+                &verbe,
+                Some(PWSTR(tampon.as_mut_ptr())),
+                &mut longueur,
+            )
+        };
+        if resultat.is_err() {
             return None;
         }
-        valeur_de_reg_query(&String::from_utf8_lossy(&sortie.stdout))
+        let fin = tampon.iter().position(|c| *c == 0).unwrap_or(tampon.len());
+        let chemin = String::from_utf16_lossy(&tampon[..fin]);
+        let chemin = chemin.trim();
+        (!chemin.is_empty()).then(|| PathBuf::from(chemin))
+    }
+
+    /// `ShellExecuteExW`, sans aucune interface d'erreur du shell.
+    fn ouvrir_par_le_shell(url: &str) -> windows::core::Result<()> {
+        // SAFETY: initialisation COM du fil courant, recommandée avant
+        // `ShellExecuteExW` ; un échec (déjà initialisé autrement) est sans
+        // conséquence pour une URL.
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+        let verbe = HSTRING::from("open");
+        let fichier = HSTRING::from(url);
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_FLAG_NO_UI | SEE_MASK_NOASYNC,
+            lpVerb: PCWSTR(verbe.as_ptr()),
+            lpFile: PCWSTR(fichier.as_ptr()),
+            // SW_SHOWNORMAL
+            nShow: 1,
+            ..Default::default()
+        };
+        // SAFETY: `info` et les chaînes qu'il désigne vivent le temps de
+        // l'appel.
+        unsafe { ShellExecuteExW(&mut info) }
     }
 
     fn env(nom: &str) -> Option<String> {
         std::env::var(nom).ok()
     }
 
-    /// L'exécutable vers lequel mène l'association `http`, s'il y en a une.
-    pub(super) fn programme_associe() -> Option<PathBuf> {
-        let prog_id = reg_query(
-            r"HKCU\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice",
-            Some("ProgId"),
-        );
-        let commande = prog_id
-            .and_then(|id| reg_query(&format!(r"HKCR\{id}\shell\open\command"), None))
-            .or_else(|| reg_query(r"HKCR\http\shell\open\command", None))?;
-        executable_de_la_commande(&developper(&commande, env))
+    fn avis(url: &str) {
+        if let Err(e) = std::process::Command::new("cmd")
+            .raw_arg(ligne_de_l_avis(url))
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+        {
+            tracing::warn!(error = %e, "ouverture_du_navigateur_windows_avis_impossible");
+        }
     }
 
     pub(super) fn ouvrir(url: &str) {
         let installes = navigateurs_habituels(env);
-        let associe = programme_associe();
-        let ouverture = decider(associe.as_deref(), &installes, |p| p.is_file());
-        tracing::info!(
-            ?ouverture,
-            programme_associe = ?associe,
-            "ouverture_du_navigateur_windows"
-        );
-        let resultat = match &ouverture {
-            Ouverture::ParLAssociation => std::process::Command::new("cmd")
-                .args(["/C", "start", "", url])
-                .creation_flags(CREATE_NO_WINDOW)
-                .spawn(),
-            Ouverture::Navigateur(exe) => std::process::Command::new(exe).arg(url).spawn(),
-            Ouverture::Avis => std::process::Command::new("cmd")
-                .raw_arg(ligne_de_l_avis(url))
-                .spawn(),
-        };
-        if let Err(e) = resultat {
-            tracing::warn!(error = %e, ?ouverture, "ouverture_du_navigateur_windows_echouee");
+        let association = lire_association(prog_id_choisi(), cle_existe, executable_de);
+        let mut ouverture = decider(&association, &installes, |p| p.is_file());
+        tracing::info!(?ouverture, ?association, "ouverture_du_navigateur_windows");
+        if ouverture == Ouverture::ParLAssociation {
+            match ouvrir_par_le_shell(url) {
+                Ok(()) => return,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "ouverture_du_navigateur_windows_par_le_shell_echouee — repli"
+                    );
+                    ouverture = decider(&Association::default(), &installes, |p| p.is_file());
+                }
+            }
+        }
+        match ouverture {
+            Ouverture::Navigateur(exe) => {
+                if let Err(e) = std::process::Command::new(&exe).arg(url).spawn() {
+                    tracing::warn!(error = %e, exe = %exe.display(), "ouverture_du_navigateur_windows_echouee");
+                    avis(url);
+                }
+            }
+            Ouverture::Avis | Ouverture::ParLAssociation => avis(url),
         }
     }
 }
 
 /// Ouvre `url` sous Windows, sans jamais laisser la fenêtre d'erreur du shell
-/// pour seul retour.
+/// pour seul retour. Bloquant : registre, shell, lancement.
 #[cfg(windows)]
 pub(crate) fn ouvrir(url: &str) {
     systeme::ouvrir(url);
@@ -255,6 +301,14 @@ mod tests {
         move |k| m.get(k).cloned()
     }
 
+    fn assoc(exe: Option<&str>) -> Association {
+        Association {
+            prog_id: None,
+            prog_id_enregistre: false,
+            executable: exe.map(PathBuf::from),
+        }
+    }
+
     /// Le cas du testeur : aucune association utilisable, Firefox installé.
     /// Avant, `start` partait quand même et Windows affichait « Application
     /// introuvable ».
@@ -268,7 +322,7 @@ mod tests {
         let firefox = PathBuf::from(r"C:\Program Files").join(r"Mozilla Firefox\firefox.exe");
         let present = firefox.clone();
         assert_eq!(
-            decider(None, &installes, |p| p == present.as_path()),
+            decider(&assoc(None), &installes, |p| p == present.as_path()),
             Ouverture::Navigateur(firefox)
         );
     }
@@ -277,31 +331,73 @@ mod tests {
     /// c'est exactement ce que Windows appelle « Application introuvable ».
     #[test]
     fn une_association_vers_un_programme_absent_ne_compte_pas_9061() {
-        let mort = PathBuf::from(r"C:\Program Files\Ancien\browser.exe");
         let edge = PathBuf::from(r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe");
         let present = edge.clone();
+        let a = assoc(Some(r"C:\Program Files\Ancien\browser.exe"));
         assert_eq!(
-            decider(Some(&mort), std::slice::from_ref(&edge), |p| p
-                == present.as_path()),
+            decider(&a, std::slice::from_ref(&edge), |p| p == present.as_path()),
             Ouverture::Navigateur(edge)
         );
     }
 
+    /// Le choix cassé de l'utilisateur (`ProgId` sans commande ni clé) n'est
+    /// PAS complété par `HKCR\http` : iexplore y est souvent encore nommé,
+    /// alors que le shell suit le choix cassé et rend la même erreur.
+    #[test]
+    fn un_prog_id_casse_ne_retombe_pas_sur_l_executable_de_http_9061() {
+        let iexplore = PathBuf::from(r"C:\Program Files\Internet Explorer\iexplore.exe");
+        let vu = std::cell::RefCell::new(Vec::new());
+        let a = lire_association(
+            Some("FirefoxURL-308046B0AF4A39CB".into()),
+            |_| false,
+            |nom, protocole| {
+                vu.borrow_mut().push((nom.to_string(), protocole));
+                (nom == "http" && protocole).then(|| iexplore.clone())
+            },
+        );
+        assert_eq!(a.executable, None, "{a:?}");
+        assert_eq!(
+            *vu.borrow(),
+            vec![("FirefoxURL-308046B0AF4A39CB".to_string(), false)],
+            "seul le ProgId choisi est interrogé"
+        );
+        assert!(!association_utilisable(&a, |_| true));
+    }
+
+    /// Une application du Store (ou l'ancien Edge) : pas d'exécutable, mais
+    /// la clé `HKCR\<ProgId>` existe — l'association est valide.
+    #[test]
+    fn un_prog_id_du_store_enregistre_est_valide() {
+        let a = lire_association(Some("AppXq0fevzme2pys62n3e0fbqa7peapykr8v".into()), |_| true, |_, _| None);
+        assert!(association_utilisable(&a, |_| false));
+        assert_eq!(decider(&a, &[], |_| false), Ouverture::ParLAssociation);
+    }
+
+    /// Sans choix de l'utilisateur, c'est le protocole `http` qui est lu.
+    #[test]
+    fn sans_prog_id_le_protocole_http_est_lu() {
+        let a = lire_association(None, |_| true, |nom, protocole| {
+            (nom == "http" && protocole).then(|| PathBuf::from(r"C:\b\nav.exe"))
+        });
+        assert_eq!(a.executable, Some(PathBuf::from(r"C:\b\nav.exe")));
+        assert!(association_utilisable(&a, |_| true));
+        assert!(!association_utilisable(&a, |_| false));
+        let vide = lire_association(Some("  ".into()), |_| true, |_, _| None);
+        assert_eq!(vide.prog_id, None, "un ProgId vide ne compte pas");
+    }
+
     #[test]
     fn une_association_valide_garde_le_navigateur_choisi_par_l_utilisateur() {
-        let choisi = PathBuf::from(r"C:\Program Files\BraveSoftware\brave.exe");
         let firefox = PathBuf::from(r"C:\Program Files\Mozilla Firefox\firefox.exe");
-        assert_eq!(
-            decider(Some(&choisi), &[firefox], |_| true),
-            Ouverture::ParLAssociation
-        );
+        let a = assoc(Some(r"C:\Program Files\BraveSoftware\brave.exe"));
+        assert_eq!(decider(&a, &[firefox], |_| true), Ouverture::ParLAssociation);
     }
 
     #[test]
     fn rien_a_lancer_donne_l_avis_et_jamais_start_9061() {
         let firefox = PathBuf::from(r"C:\Program Files\Mozilla Firefox\firefox.exe");
-        assert_eq!(decider(None, &[firefox], |_| false), Ouverture::Avis);
-        assert_eq!(decider(None, &[], |_| true), Ouverture::Avis);
+        assert_eq!(decider(&assoc(None), &[firefox], |_| false), Ouverture::Avis);
+        assert_eq!(decider(&assoc(None), &[], |_| true), Ouverture::Avis);
     }
 
     #[test]
@@ -316,60 +412,6 @@ mod tests {
         assert!(noms[0].ends_with(r"firefox.exe"), "{noms:?}");
         assert!(noms[1].ends_with(r"chrome.exe"), "{noms:?}");
         assert!(noms[2].ends_with(r"msedge.exe"), "{noms:?}");
-    }
-
-    #[test]
-    fn lit_la_valeur_de_reg_query_quelle_que_soit_la_langue() {
-        let progid = "\r\nHKEY_CURRENT_USER\\Software\\...\\UserChoice\r\n    ProgId    REG_SZ    FirefoxURL-308046B0AF4A39CB\r\n\r\n";
-        assert_eq!(
-            valeur_de_reg_query(progid).as_deref(),
-            Some("FirefoxURL-308046B0AF4A39CB")
-        );
-        let defaut_fr = "\r\nHKEY_CLASSES_ROOT\\MSEdgeHTM\\shell\\open\\command\r\n    (par défaut)    REG_SZ    \"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\" --single-argument %1\r\n";
-        assert_eq!(
-            valeur_de_reg_query(defaut_fr).as_deref(),
-            Some(
-                "\"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe\" --single-argument %1"
-            )
-        );
-        let etendue = "    (Default)    REG_EXPAND_SZ    %ProgramFiles%\\x\\y.exe \"%1\"\r\n";
-        assert_eq!(
-            valeur_de_reg_query(etendue).as_deref(),
-            Some("%ProgramFiles%\\x\\y.exe \"%1\"")
-        );
-        assert_eq!(valeur_de_reg_query("ERREUR : clé introuvable"), None);
-        assert_eq!(valeur_de_reg_query("    (Default)    REG_SZ    \r\n"), None);
-    }
-
-    #[test]
-    fn l_executable_de_la_commande_avec_ou_sans_guillemets() {
-        assert_eq!(
-            executable_de_la_commande(
-                r#""C:\Program Files\Mozilla Firefox\firefox.exe" -osint -url "%1""#
-            ),
-            Some(PathBuf::from(
-                r"C:\Program Files\Mozilla Firefox\firefox.exe"
-            ))
-        );
-        assert_eq!(
-            executable_de_la_commande(r#"C:\Program Files\X\x.EXE "%1""#),
-            Some(PathBuf::from(r"C:\Program Files\X\x.EXE"))
-        );
-        assert_eq!(
-            executable_de_la_commande(r"C:\bin\nav %1"),
-            Some(PathBuf::from(r"C:\bin\nav"))
-        );
-        assert_eq!(executable_de_la_commande("  "), None);
-        assert_eq!(executable_de_la_commande(r#""""#), None);
-    }
-
-    #[test]
-    fn developpe_les_variables_connues_et_garde_les_autres() {
-        let env = env_de(&[("ProgramFiles", r"C:\Program Files")]);
-        assert_eq!(
-            developper(r"%ProgramFiles%\x.exe %1 %INCONNUE% 50%", env),
-            r"C:\Program Files\x.exe %1 %INCONNUE% 50%"
-        );
     }
 
     #[test]
