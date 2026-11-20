@@ -76,8 +76,13 @@ another machine of the LAN fails — the same trap as Tune Server's #4949.
 
 Up to rc12 it also triggered the *Accessibility* prompt (« control this
 computer »): `tauri-plugin-global-shortcut` captured the keyboard's media keys
-through a `CGEventTap`. Global shortcuts are gone (decision of 20 Nov 2026);
-a test keeps `global-hotkey` out of `Cargo.lock`.
+through a `CGEventTap`. Global shortcuts are gone **on macOS** (decision of
+20 Nov 2026). They stay on **Windows only** (#8531), where they need no
+permission: `tauri-plugin-global-shortcut` is a
+`[target.'cfg(windows)'.dependencies]` entry and `raccourcis_globaux.rs` is
+`#[cfg(windows)]` — `Ctrl+Shift+Space / → / ← / ↑ / ↓ / M` and the keyboard's
+Play/Pause, Next, Previous media keys. A test keeps the plugin out of every
+other section of `Cargo.toml` and out of the capabilities.
 
 ## Release (signed + notarized)
 
@@ -91,10 +96,10 @@ Three ways in:
 
 - **With every server release (since rc10).** `release.yml` calls
   `widget.yml` (`workflow_call`, input `release_tag`). The files are named
-  after the server tag — `tune-widget-<tag>-macos-aarch64.dmg`,
-  `tune-widget-<tag>-macos-x86_64.dmg`,
-  `tune-widget-<tag>-windows-x86_64-setup.exe` — and land in the same draft
-  release, inside `SHA256SUMS`. The `tune-widget-` prefix keeps them out of the
+  after the server tag — `tune-client-<tag>-macos-aarch64.dmg`,
+  `tune-client-<tag>-macos-x86_64.dmg`,
+  `tune-client-<tag>-windows-x86_64-setup.exe` (`tune-widget-…` until
+  rc12) — and land in the same draft release, inside `SHA256SUMS`. The `tune-client-` prefix keeps them out of the
   self-updater (`tune-server-` archives only) and of the /download page.
 - **Manually** (`workflow_dispatch`): with `release_tag` set, the run produces
   exactly the files a release would carry, without any tag — the way to check
@@ -125,7 +130,7 @@ remote page. Pin and collapse states persist in `config.json`
 
 ## Keyboard shortcuts and target zone (#9255, #8531)
 
-In-app shortcuts only — menu-bar key equivalents on macOS, active while the
+On macOS, in-app shortcuts only — menu-bar key equivalents, active while the
 app is frontmost, no permission needed (`src-tauri/src/raccourcis.rs`,
 following Roon where it does not clash with macOS):
 

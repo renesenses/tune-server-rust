@@ -36,6 +36,9 @@ objc2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
+# Raccourcis GLOBAUX, sous Windows seulement (#8531, relecture de #9257) :
+# sous macOS, le greffon déclencherait la demande d'Accessibilité (#9255).
+tauri-plugin-global-shortcut = "2"
 
 # Les bancs lisent les raccourcis du menu avec l'analyseur de Tauri lui-même
 # (`muda`, déjà dans l'arbre par Tauri).

@@ -55,6 +55,7 @@ pub enum Action {
 }
 
 /// Le menu de la barre des menus où l'entrée se range.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Menu {
     App,
@@ -66,10 +67,13 @@ pub enum Menu {
 pub struct Entree {
     /// Identifiant de l'entrée de menu (`MenuEvent::id`).
     pub id: &'static str,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub libelle: &'static str,
     /// Équivalent clavier, syntaxe des accélérateurs de Tauri (`muda`).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub accelerateur: Option<&'static str>,
     pub action: Action,
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     pub menu: Menu,
 }
 
@@ -153,6 +157,7 @@ pub fn action_de(id: &str) -> Option<Action> {
 }
 
 /// Les entrées d'un menu, dans l'ordre.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub fn entrees_de(menu: Menu) -> impl Iterator<Item = &'static Entree> {
     ENTREES.iter().filter(move |e| e.menu == menu)
 }
@@ -257,21 +262,35 @@ mod tests {
         assert_eq!(script_de(Action::LecturePause), None);
     }
 
-    /// La décision du 20/11 : AUCUN raccourci global, donc aucune demande
-    /// d'Accessibilité. Le greffon et la caisse qui capture le clavier hors de
-    /// l'app (`global-hotkey`) ne doivent plus être dans l'arbre.
+    /// La décision du 20/11 : AUCUN raccourci global sous macOS, donc aucune
+    /// demande d'Accessibilité. Sous Windows, ils restent (#8531, relecture de
+    /// #9257) : le greffon ne doit être une dépendance QUE pour Windows, sans
+    /// quoi il serait compilé — et la capture des touches média active — dans
+    /// l'app macOS. Aucune capacité ne doit l'ouvrir (enregistrement côté Rust).
     #[test]
-    fn plus_aucun_raccourci_global() {
-        let verrou = include_str!("../Cargo.lock");
-        for caisse in ["tauri-plugin-global-shortcut", "global-hotkey"] {
-            assert!(
-                !verrou.contains(&format!("name = \"{caisse}\"")),
-                "{caisse} est revenu dans Cargo.lock : macOS redemanderait l'Accessibilité"
-            );
-        }
+    fn aucun_raccourci_global_sous_macos() {
         let manifeste = include_str!("../Cargo.toml");
-        assert!(!manifeste.contains("global-shortcut"));
-        let capacites = include_str!("../capabilities/default.json");
-        assert!(!capacites.contains("global-shortcut"));
+        let mut section = "";
+        for ligne in manifeste.lines() {
+            let l = ligne.trim();
+            if l.starts_with('[') {
+                section = l;
+            } else if l.starts_with("tauri-plugin-global-shortcut") {
+                assert_eq!(
+                    section, "[target.'cfg(windows)'.dependencies]",
+                    "tauri-plugin-global-shortcut hors de la section Windows : \
+                     macOS redemanderait l'Accessibilité"
+                );
+            }
+        }
+        for capacite in [
+            include_str!("../capabilities/default.json"),
+            include_str!("../capabilities/full-window.json"),
+        ] {
+            assert!(!capacite.contains("global-shortcut"));
+        }
+        // Le code qui l'utilise n'est compilé que pour Windows.
+        let main = include_str!("main.rs");
+        assert!(main.contains("#[cfg(windows)]\nmod raccourcis_globaux;"));
     }
 }

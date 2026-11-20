@@ -2,6 +2,8 @@
 
 mod decouverte;
 mod raccourcis;
+#[cfg(windows)]
+mod raccourcis_globaux;
 mod server;
 mod serveur_local;
 mod volume;
@@ -1172,12 +1174,16 @@ fn active_work_area(app: &tauri::AppHandle) -> (Option<(u32, u32)>, f64) {
 }
 
 /// Bits de `NSWindowCollectionBehavior` qui règlent le plein écran.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const NS_PLEIN_ECRAN_PRINCIPAL: usize = 1 << 7; // FullScreenPrimary
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const NS_PLEIN_ECRAN_AUXILIAIRE: usize = 1 << 8; // FullScreenAuxiliary
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 const NS_PLEIN_ECRAN_AUCUN: usize = 1 << 9; // FullScreenNone
 
 /// Le `collectionBehavior` d'une fenêtre, plein écran permis ou non : les
 /// autres bits (Spaces, Exposé…) sont gardés tels quels.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn comportement_plein_ecran(actuel: usize, permis: bool) -> usize {
     let base =
         actuel & !(NS_PLEIN_ECRAN_PRINCIPAL | NS_PLEIN_ECRAN_AUXILIAIRE | NS_PLEIN_ECRAN_AUCUN);
@@ -1413,7 +1419,7 @@ fn main() {
     // fichiers de son cache dès qu'il démarre.
     purge_webview_cache_on_version_change();
 
-    let run = tauri::Builder::default()
+    let builder = tauri::Builder::default()
         // Instance unique (#8934), déclarée EN PREMIER comme le demande le
         // greffon : un second lancement (raccourci du Bureau, menu Démarrer)
         // ne crée pas un second widget, il ramène la fenêtre de celui-ci.
@@ -1423,7 +1429,11 @@ fn main() {
         }))
         // Ouvre les liens http(s) dans le navigateur du système, appelé côté
         // Rust seulement : aucune fenêtre ne reçoit ses permissions.
-        .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_opener::init());
+    // Windows seulement : les raccourcis globaux et les touches média (#8531).
+    #[cfg(windows)]
+    let builder = builder.plugin(raccourcis_globaux::greffon());
+    let run = builder
         .manage({
             let mut saved_url = "http://localhost:8888".to_string();
             if let Some(dir) = dirs::config_dir() {
@@ -1562,7 +1572,9 @@ fn main() {
                             set_full_mode(&app, false).await;
                         });
                     }
-                    "choisir_serveur" => ouvrir_choix_serveur(app),
+                    // « choisir_serveur » : traité UNE fois, par le gestionnaire
+                    // de l'app (`Builder::on_menu_event`), qui reçoit aussi les
+                    // évènements de ce menu.
                     _ => {}
                 })
                 .on_tray_icon_event(|tray, event| {
@@ -1614,6 +1626,9 @@ fn main() {
                     }
                 })
                 .build(app)?;
+
+            #[cfg(windows)]
+            raccourcis_globaux::enregistrer(app.handle());
 
             // #8934 — un lancement par l'utilisateur MONTRE le widget, dans le
             // mode qu'il avait laissé. Avant, seule l'icône de la zone de
