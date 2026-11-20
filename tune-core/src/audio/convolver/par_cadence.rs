@@ -290,9 +290,10 @@ pub fn marge_d_amorce(de: u32, vers: u32) -> (usize, usize) {
 /// Rubato sinc (le rééchantillonneur de la chaîne, phase linéaire), sur le
 /// filtre complété de [`marge_d_amorce`] zéros de chaque côté ; coefficients
 /// mis à l'échelle `de / vers` pour conserver la réponse en fréquence. Les
-/// `marge_d_amorce(de, vers).1` trames d'amorce sont retirées en tête : la
-/// RI rééchantillonnée garde l'instant zéro du fichier d'origine, et le
-/// convolveur sa latence annoncée (`latency_frames`, fondu de #7632).
+/// `marge_d_amorce(de, vers).1` trames de marge sont retirées en tête et en
+/// queue : la RI rééchantillonnée garde l'instant zéro et la durée du
+/// fichier d'origine, et le convolveur sa latence annoncée
+/// (`latency_frames`, fondu de #7632).
 pub fn reechantillonner_ri(taps: &[Vec<f32>], de: u32, vers: u32) -> Vec<Vec<f32>> {
     if de == vers || taps.is_empty() {
         return taps.to_vec();
@@ -312,6 +313,8 @@ pub fn reechantillonner_ri(taps: &[Vec<f32>], de: u32, vers: u32) -> Vec<Vec<f32
     let (_, retard) = marge_d_amorce(de, vers);
     let n = sortie.len() / canaux;
     let debut = retard.min(n);
+    // La marge de QUEUE aussi : la RI garde sa durée, `round(prises × vers / de)`.
+    let n = n.saturating_sub(retard).max(debut);
     (0..canaux)
         .map(|c| {
             (debut..n)
@@ -350,7 +353,9 @@ pub(super) fn ri_a_la_cadence(variante: &Variante, vers: u32) -> Result<Arc<[Vec
         return Ok(variante.taps.clone());
     }
     cadence_admise(vers).map_err(|e| format!("flux : {e}"))?;
-    let prises = variante.taps.iter().map(Vec::len).max().unwrap_or(0) as u64;
+    // La marge d'amorce (tête et queue) passe aussi par le rééchantillonneur.
+    let (marge, _) = marge_d_amorce(variante.sample_rate, vers);
+    let prises = (variante.taps.iter().map(Vec::len).max().unwrap_or(0) + 2 * marge) as u64;
     let prises_apres = prises * vers as u64 / variante.sample_rate.max(1) as u64;
     if prises_apres > PRISES_MAX_APRES as u64 {
         return Err(format!(

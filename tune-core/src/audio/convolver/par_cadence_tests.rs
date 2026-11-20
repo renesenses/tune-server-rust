@@ -206,8 +206,10 @@ fn un_dirac_reechantillonne_garde_module_phase_et_longueur_8761() {
         let ri = dirac(n, 1000);
         let apres = reechantillonner_ri(&[ri.clone()], de, vers);
         let (marge, retard) = marge_d_amorce(de, vers);
-        let attendue =
-            (((n + 2 * marge) as f64) * vers as f64 / de as f64).round() as usize - retard;
+        // Marges de tête et de queue retirées : la durée du fichier.
+        let attendue = (((n + 2 * marge) as f64) * vers as f64 / de as f64).round() as usize
+            - 2 * retard;
+        assert_eq!(attendue, ((n as f64) * vers as f64 / de as f64).round() as usize);
         assert_eq!(apres[0].len(), attendue, "{de}→{vers} : longueur");
         // Le pic tombe là où le temps le dit : 1000/de s, plus l'amorce.
         let pic = apres[0]

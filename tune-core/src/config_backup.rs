@@ -1088,7 +1088,20 @@ fn import_settings(
                 volume_ecarte += 1;
                 continue;
             }
-            settings.set(&gabarit.replace("{id}", &arrivee.id.to_string()), value)?;
+            // #8761 — validation stricte des chemins du jeu de convolution,
+            // comme l'import de configuration (`config_export`).
+            let valeur = if gabarit == "ir_jeu_{id}" {
+                match crate::audio::convolver::par_cadence::liste_du_jeu_importable(value) {
+                    Some(v) => v,
+                    None => {
+                        warnings.push(format!("setting '{key}' has no valid file; skipped"));
+                        continue;
+                    }
+                }
+            } else {
+                value.clone()
+            };
+            settings.set(&gabarit.replace("{id}", &arrivee.id.to_string()), &valeur)?;
             count += 1;
             continue;
         }
@@ -1574,6 +1587,48 @@ fn import_legacy_tokens(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #8761 — la restauration d'une sauvegarde filtre les chemins du jeu de
+    /// convolution comme l'import de configuration : aucun `..`, noms de
+    /// fichiers que Tune range lui-même.
+    #[test]
+    fn la_restauration_filtre_les_chemins_du_jeu_de_convolution_8761() {
+        use crate::db::migrations;
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        let mut correspondances = Correspondances::new();
+        correspondances.insert(3, ZoneDArrivee { id: 9, sure: true });
+        let reglages = vec![
+            (
+                "ir_jeu_3".to_string(),
+                r#"["/d/ir/zone_3_sr96000.wav","/d/ir/../../etc/zone_3.wav","/etc/passwd"]"#
+                    .to_string(),
+            ),
+            ("ir_path_3".to_string(), "/d/ir/zone_3.wav".to_string()),
+        ];
+        let mut avertissements = Vec::new();
+        import_settings(&backend, &reglages, &correspondances, &mut avertissements).unwrap();
+        let settings = SettingsRepo::with_backend(backend.clone());
+        assert_eq!(
+            settings.get("ir_jeu_9").unwrap().as_deref(),
+            Some(r#"["/d/ir/zone_3_sr96000.wav"]"#)
+        );
+        assert_eq!(settings.get("ir_path_9").unwrap().as_deref(), Some("/d/ir/zone_3.wav"));
+
+        // Rien de valide : le réglage n'est pas écrit, et c'est dit.
+        let reglages = vec![("ir_jeu_3".to_string(), r#"["../zone_1.wav"]"#.to_string())];
+        let mut avertissements = Vec::new();
+        settings.delete("ir_jeu_9").unwrap();
+        import_settings(&backend, &reglages, &correspondances, &mut avertissements).unwrap();
+        assert_eq!(settings.get("ir_jeu_9").unwrap(), None);
+        assert!(
+            avertissements.iter().any(|a| a.contains("ir_jeu_3")),
+            "{avertissements:?}"
+        );
+    }
 
     /// The legacy reader must keep working: users hold snapshots in the old
     /// format and a restore has to accept them. The *writer* is gone — this
