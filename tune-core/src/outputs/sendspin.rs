@@ -112,10 +112,13 @@ impl Media {
         }
     }
 
-    /// Le flux commence à `depart_ms` dans la piste : la durée annoncée était
-    /// celle qui restait (#6630), on rend celle de la piste.
-    fn noter_le_depart(&mut self, depart_ms: u64) {
-        if self.duree_ms > 0 {
+    /// Le flux commence à `depart_ms` dans la piste. La durée de la piste,
+    /// quand l'orchestrateur la donne, fait foi ; sinon la durée annoncée
+    /// était celle qui restait (#6630), et on rend celle de la piste.
+    fn noter_le_depart(&mut self, depart_ms: u64, duree_piste_ms: Option<u64>) {
+        if let Some(d) = duree_piste_ms.filter(|d| *d > 0) {
+            self.duree_ms = d;
+        } else if self.duree_ms > 0 {
             self.duree_ms = self.duree_ms.saturating_sub(self.depart_du_flux_ms) + depart_ms;
         }
         self.depart_du_flux_ms = depart_ms;
@@ -332,14 +335,14 @@ impl SendspinOutput {
     /// dans la piste (saut ou reprise sur un flux traité, qui ne se relit
     /// pas) : la position et la durée se comptent depuis le début de la
     /// piste, le décodeur depuis le début du flux.
-    pub fn noter_le_depart_du_flux(&self, depart_ms: u64) {
+    pub fn noter_le_depart_du_flux(&self, depart_ms: u64, duree_piste_ms: Option<u64>) {
         let mut d = self.diffusion();
         if let Some(s) = d.segments.first_mut() {
             s.debut_ms = s.debut_ms.saturating_sub(s.media.depart_du_flux_ms) + depart_ms;
-            s.media.noter_le_depart(depart_ms);
+            s.media.noter_le_depart(depart_ms, duree_piste_ms);
         }
         if let Some(m) = d.media_hors_lecture.as_mut() {
-            m.noter_le_depart(depart_ms);
+            m.noter_le_depart(depart_ms, duree_piste_ms);
         }
     }
 
@@ -411,6 +414,7 @@ fn ouvrir_decodeur(
     format: &FormatAudio,
     depuis_s: f64,
     en_direct: bool,
+    relisible: bool,
 ) -> DecodeurOuvert {
     if super::decodeur_distant::est_distante(source) {
         return super::decodeur_distant::ouvrir_decodeur_distant(
@@ -420,6 +424,7 @@ fn ouvrir_decodeur(
             Some(format.bit_depth),
             depuis_s,
             en_direct,
+            relisible,
         );
     }
     let chemin = source.strip_prefix("file://").unwrap_or(source);
@@ -513,7 +518,8 @@ async fn diffuser(
             } else {
                 0.0
             };
-            let (mut rx, decodeur) = ouvrir_decodeur(&chemin, &format, depuis_s, en_direct);
+            let (mut rx, decodeur) =
+                ouvrir_decodeur(&chemin, &format, depuis_s, en_direct, media.relisible);
             let mut tampon: Vec<u8> = Vec::with_capacity(octets_morceau * 2);
             let mut premier = true;
             let mut decodage_fini = false;
@@ -934,7 +940,7 @@ mod tests {
             sortie.seek(1_000).await.is_err(),
             "#9175 : un canal ne se rouvre pas à la position, la zone doit le relancer"
         );
-        sortie.noter_le_depart_du_flux(60_000);
+        sortie.noter_le_depart_du_flux(60_000, None);
         let st = sortie.get_status().await.unwrap();
         assert!(
             st.position_ms >= 60_000,
@@ -1012,5 +1018,66 @@ mod tests {
         );
         sortie.stop().await.unwrap();
         serveur.abort();
+    }
+
+    /// Suite de #9175 — un canal ne se lit qu'une fois : une seule connexion,
+    /// sans sonde `Range` (qui en ouvrirait une de plus, puis d'autres pour
+    /// lire par plages, jusqu'à une fin réclamée au-delà de ce que le canal a
+    /// produit). Contre-épreuve : une source qui se relit est sondée.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn un_canal_se_lit_d_une_seule_connexion_9175() {
+        use std::sync::atomic::{AtomicUsize, Ordering as O};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        async fn connexions_pour(byte_seekable: bool) -> usize {
+            let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let adresse = ecoute.local_addr().unwrap();
+            let compte = Arc::new(AtomicUsize::new(0));
+            let c2 = compte.clone();
+            let serveur = tokio::spawn(async move {
+                while let Ok((mut c, _)) = ecoute.accept().await {
+                    c2.fetch_add(1, O::SeqCst);
+                    tokio::spawn(async move {
+                        let mut requete = [0u8; 2048];
+                        let _ = c.read(&mut requete).await;
+                        let corps = wav(2);
+                        let _ = c
+                            .write_all(
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Type: audio/wav\r\n\
+                                     Content-Length: {}\r\nConnection: close\r\n\r\n",
+                                    corps.len()
+                                )
+                                .as_bytes(),
+                            )
+                            .await;
+                        let _ = c.write_all(&corps).await;
+                    });
+                }
+            });
+            let url = format!("http://{adresse}/stream/banc-connexions-9175.wav");
+            let (sortie, ordres) = enceinte_factice();
+            let media = PlayMedia {
+                url: &url,
+                byte_seekable,
+                mime_type: "audio/wav",
+                duration_ms: Some(2_000),
+                ..Default::default()
+            };
+            sortie.play_media(&media).await.unwrap();
+            assert!(attendre_un_morceau(&ordres).await, "témoin : le flux part");
+            sortie.stop().await.unwrap();
+            serveur.abort();
+            compte.load(O::SeqCst)
+        }
+        assert_eq!(
+            connexions_pour(false).await,
+            1,
+            "suite de #9175 : un canal se lit d'une seule connexion, sans sonde Range"
+        );
+        assert_eq!(
+            connexions_pour(true).await,
+            2,
+            "contre-épreuve : une source qui se relit est sondée par Range, puis lue"
+        );
     }
 }

@@ -53,6 +53,14 @@ fn cadence_de_l_entete(entete: &[u8]) -> Option<u32> {
 
 /// Ouvre le décodage progressif de `url` vers du PCM à la `cadence`, aux
 /// `canaux` et à la `profondeur` demandés, à partir de `depuis_s`.
+///
+/// `relisible` : la source se relit-elle (fichier, mandataire) ? Un canal
+/// (flux traité, `PlayMedia::byte_seekable == false`) ne se lit qu'UNE fois :
+/// il est lu d'une seule connexion, en continu, sans sonde `Range`. Une
+/// sonde y ouvrirait une connexion de plus, et la lecture par `Range` en
+/// demanderait d'autres, jusqu'à une fin de piste réclamée au-delà de ce que
+/// le canal a réellement produit quand sa longueur annoncée vient de la
+/// durée (416).
 pub(crate) fn ouvrir_decodeur_distant(
     url: String,
     cadence: Option<u32>,
@@ -60,6 +68,7 @@ pub(crate) fn ouvrir_decodeur_distant(
     profondeur: Option<u16>,
     depuis_s: f64,
     en_direct: bool,
+    relisible: bool,
 ) -> DecodeurOuvert {
     let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
     let indice = format!("flux-distant.{}", extension_de_l_url(&url));
@@ -68,10 +77,15 @@ pub(crate) fn ouvrir_decodeur_distant(
     let decodeur = {
         let a_ecarter = a_ecarter.clone();
         tokio::task::spawn_blocking(move || {
+            let par_range = if relisible {
+                crate::audio::http_range::HttpRangeSource::open(&url).ok()
+            } else {
+                None
+            };
             let (source, depuis_s): (Box<dyn symphonia::core::io::MediaSource>, f64) =
-                match crate::audio::http_range::HttpRangeSource::open(&url) {
-                    Ok(source) => (Box::new(source), depuis_s),
-                    Err(_) => {
+                match par_range {
+                    Some(source) => (Box::new(source), depuis_s),
+                    None => {
                         let reponse = crate::http::client::blocking_builder()
                             .timeout(None)
                             .connect_timeout(Duration::from_secs(10))

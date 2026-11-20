@@ -1735,6 +1735,7 @@ impl PlaybackOrchestrator {
                         device_id,
                         resolved.stream_id.as_deref(),
                         req.seek_ms,
+                        req.duration_ms.and_then(|d| u64::try_from(d).ok()),
                     )
                     .await
             {
@@ -2767,11 +2768,17 @@ impl PlaybackOrchestrator {
     /// l'octet 0 (épisode de podcast par `resolve_direct`, qui ignore
     /// `seek_ms`), ne note RIEN : l'écran dirait 12:00 sur un son à 0:00.
     /// Rend `true` quand le départ a été noté.
+    ///
+    /// `duree_piste_ms` : la durée de la PISTE quand l'appelant la connaît.
+    /// Sendspin et Devialet AIR la reprennent telle quelle ; la durée qu'ils
+    /// ont reçue peut être celle du reste (#6630) comme celle de la piste,
+    /// selon le bras qui a servi le flux.
     pub(super) async fn noter_le_depart_si_le_flux_y_commence(
         &self,
         device_id: &str,
         stream_id: Option<&str>,
         seek_ms: Option<u64>,
+        duree_piste_ms: Option<u64>,
     ) -> bool {
         let (Some(depart_ms), Some(sid)) = (seek_ms.filter(|ms| *ms > 0), stream_id) else {
             return false;
@@ -2798,13 +2805,13 @@ impl PlaybackOrchestrator {
         if let Some(sendspin) =
             quelconque.downcast_ref::<crate::outputs::sendspin::SendspinOutput>()
         {
-            sendspin.noter_le_depart_du_flux(depart_ms);
+            sendspin.noter_le_depart_du_flux(depart_ms, duree_piste_ms);
             return true;
         }
         if let Some(air) =
             quelconque.downcast_ref::<crate::outputs::devialet_air::DevialetAirOutput>()
         {
-            air.noter_le_depart_du_flux(depart_ms).await;
+            air.noter_le_depart_du_flux(depart_ms, duree_piste_ms).await;
             return true;
         }
         false

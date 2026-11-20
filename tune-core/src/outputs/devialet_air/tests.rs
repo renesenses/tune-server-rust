@@ -1135,7 +1135,7 @@ async fn air_un_flux_traite_en_canal_se_relance_par_la_zone_9175() {
     );
 
     // La zone a relancé le flux à 60 s : il commence là dans la piste.
-    b.sortie.noter_le_depart_du_flux(60_000).await;
+    b.sortie.noter_le_depart_du_flux(60_000, None).await;
     let st = b.sortie.get_status().await.unwrap();
     assert!(
         st.position_ms >= 60_000,
@@ -1162,6 +1162,33 @@ async fn air_un_flux_traite_en_canal_se_relance_par_la_zone_9175() {
     b.sortie.pause().await.unwrap();
     assert!(!b.sortie.device_released_on_pause());
     b.sortie.resume().await.unwrap();
+    b.sortie.stop().await.unwrap();
+}
+
+/// Suite de #9175 — sur un canal, la cadence ANNONCÉE (48 kHz) peut différer
+/// de celle du flux réellement servi (44,1 kHz : plafond, cadence fixe). Le
+/// décodeur doit viser la cadence d'AIR et rééchantillonner, pas refuser la
+/// lecture (« flux à 48000 Hz attendu »).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn air_un_canal_a_une_autre_cadence_que_l_annoncee_joue_quand_meme_9175() {
+    let b = banc(annonce_de_test(), true).await;
+    let dossier = crate::test_scratch::scratch_dir("devialet-air-canal-cadence-9175");
+    let (chemin, _) = wav_16_bits(&dossier, 44_100, 44_100);
+    let canal = PlayMedia {
+        url: &chemin,
+        file_path: None,
+        byte_seekable: false,
+        mime_type: "audio/wav",
+        sample_rate: Some(48_000),
+        duration_ms: Some(1_000),
+        ..Default::default()
+    };
+    let lecture = b.sortie.play_media(&canal).await;
+    assert!(
+        lecture.is_ok(),
+        "suite de #9175 : un canal dont la cadence diffère de l'annonce doit être \
+         rééchantillonné, pas refusé : {lecture:?}"
+    );
     b.sortie.stop().await.unwrap();
 }
 
