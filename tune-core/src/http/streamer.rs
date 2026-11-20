@@ -449,6 +449,10 @@ pub struct StreamSession {
     /// Alimentée sous le verrou du récepteur (`recv_chunk_retenu`), donc dans
     /// l'ordre exact du canal ; bornée par `fenetre_de_retenue`.
     retenue: std::sync::Mutex<RetenueDuCanal>,
+    /// #8963 — une connexion arrivée par le pont (relais ou écoute directe,
+    /// en-tête [`crate::cloud::ENTETE_RELAIS`]) a tiré ce flux : voir
+    /// [`StreamSession::fenetre_de_retenue_effective`].
+    tiree_par_le_pont: std::sync::atomic::AtomicBool,
     pub created_at: Instant,
     pub bytes_sent: std::sync::atomic::AtomicU64,
     /// #4455 — reprises `Range` d'un fichier WAV dont le premier octet ne
@@ -796,6 +800,41 @@ impl StreamSession {
             first_request: std::sync::Arc::new(tokio::sync::Notify::new()),
             data_ready: std::sync::Arc::new(tokio::sync::Notify::new()),
             producer_done: std::sync::atomic::AtomicBool::new(false),
+            tiree_par_le_pont: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// #8963 — note qu'une connexion venue du pont tire ce flux. À appeler
+    /// AVANT de tirer le canal : la retenue s'élargit pour les blocs suivants.
+    pub fn noter_tirage_par_le_pont(&self) {
+        self.tiree_par_le_pont
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// La fenêtre de retenue de CETTE session.
+    ///
+    /// #8963 (fil 2880, téléphone en 5G par le pont, rc12) : une conversion
+    /// FLAC 88,2/24 → WAV 88,2/16 de 73 Mo a été tirée EN ENTIER en 1,4 s —
+    /// le relais pousse au débit de la liaison montante, pas à celui du
+    /// lecteur. Neuf secondes plus tard le téléphone reprenait en
+    /// `bytes=44-`, juste après l'en-tête : la retenue (180 s, soit 63,5 Mo à
+    /// ce débit) ne commençait plus qu'à 9,8 Mo. Connexion fermée sans un
+    /// octet, puis 404 à chaque redémarrage (#6050) : la piste était perdue.
+    ///
+    /// Tirée par le pont, une piste de longueur CONNUE est donc retenue en
+    /// entier, jusqu'à [`RETENUE_PONT_MAX_OCTETS`]. Une radio (longueur
+    /// inconnue) et toute session locale gardent la fenêtre de toujours.
+    pub fn fenetre_de_retenue_effective(&self) -> u64 {
+        let base = self.info.fenetre_de_retenue();
+        if !self
+            .tiree_par_le_pont
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return base;
+        }
+        match self.info.wav_content_length() {
+            Some(total) => base.max(total.min(RETENUE_PONT_MAX_OCTETS)),
+            None => base,
         }
     }
 
@@ -868,7 +907,7 @@ impl StreamSession {
         preparer(debut, &mut bloc);
         self.octets_du_canal
             .fetch_add(bloc.len() as u64, std::sync::atomic::Ordering::SeqCst);
-        let fenetre = self.info.fenetre_de_retenue();
+        let fenetre = self.fenetre_de_retenue_effective();
         if let Ok(mut r) = self.retenue.lock() {
             r.ajouter(debut, bloc.clone(), fenetre);
         }
@@ -1174,6 +1213,10 @@ impl RetenueDuCanal {
 pub const RETENUE_SECONDES: u64 = 180;
 pub const RETENUE_MIN_OCTETS: u64 = 8 * 1024 * 1024;
 pub const RETENUE_MAX_OCTETS: u64 = 64 * 1024 * 1024;
+/// #8963 — une piste tirée par le pont est retenue en entier jusqu'à ce
+/// plafond : 12 min de WAV 88,2/16, 25 min de CD. Au-delà, la retenue garde
+/// les 256 derniers Mio tirés, comme la fenêtre ordinaire glisse.
+pub const RETENUE_PONT_MAX_OCTETS: u64 = 256 * 1024 * 1024;
 
 impl StreamInfo {
     /// Taille de la fenêtre de retenue de ce flux — voir [`RETENUE_SECONDES`].

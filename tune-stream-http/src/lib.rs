@@ -439,6 +439,11 @@ pub async fn handle_stream(
     let Some(session) = session else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // #8963 — tirée par le pont (relais, écoute directe) : la retenue couvre
+    // toute la piste, AVANT que cette connexion tire le canal.
+    if req_headers.contains_key(tune_core::cloud::ENTETE_RELAIS) {
+        session.noter_tirage_par_le_pont();
+    }
 
     let range_hdr = req_headers
         .get("Range")
@@ -6009,6 +6014,8 @@ mod stream_url_distant_tests {
 
 #[cfg(test)]
 mod fin_de_piste_relue_6050;
+#[cfg(test)]
+mod reprise_par_le_pont_8963;
 
 #[cfg(test)]
 mod long_wav_4016;
