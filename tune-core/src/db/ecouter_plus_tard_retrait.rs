@@ -1,7 +1,7 @@
 //! #9143 (fil forum 2934, validé par Bertrand le 19/11/2026) — « Écouter
 //! plus tard » rend un album écouté EN ENTIER, si le profil l'a demandé.
 //!
-//!     « Retirer automatiquement après lecture ? Oui ou Non »
+//! > « Retirer automatiquement après lecture ? Oui ou Non »
 //!
 //! Le sas est une étiquette ordinaire (web#1653) dont l'identifiant vit dans
 //! les réglages du profil, sous [`CLE_ETIQUETTE`]. Le retrait automatique est
