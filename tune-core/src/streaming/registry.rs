@@ -5,7 +5,7 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use super::traits::StreamingService;
-use crate::coffre::{Coffre, est_scelle};
+use crate::coffre::{Coffre, EtatDeLaCle, est_scelle};
 use crate::db::backend::DbBackend;
 use crate::db::settings_repo::SettingsRepo;
 
@@ -16,9 +16,32 @@ pub enum LigneDeJetons {
     EnClair(String),
     /// Scellée par le coffre, et ouverte : le JSON des jetons.
     Scellee(String),
-    /// Scellée, mais la clé maîtresse en place ne l'ouvre pas (base déplacée
-    /// sans `tune-secrets.cle`, ou processus sans coffre).
-    Illisible,
+    /// Scellée, mais la clé maîtresse en place ne l'ouvre pas : la raison.
+    Illisible(RaisonIllisible),
+}
+
+/// Pourquoi une ligne de jetons scellée ne s'ouvre pas. Le code (`as_str`)
+/// est publié par l'état des services (`session_unreadable`), que l'écran
+/// traduit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaisonIllisible {
+    /// `tune-secrets.cle` absente (base déplacée ou restaurée sans elle).
+    CleAbsente,
+    /// `tune-secrets.cle` présente mais illisible (droits : créée par `root`,
+    /// service lancé sous un autre compte ; ou fichier abîmé).
+    CleIllisible,
+    /// La clé se lit, mais ce n'est pas celle qui a scellé la ligne.
+    AutreCle,
+}
+
+impl RaisonIllisible {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CleAbsente => "key_missing",
+            Self::CleIllisible => "key_unreadable",
+            Self::AutreCle => "key_mismatch",
+        }
+    }
 }
 
 impl LigneDeJetons {
@@ -26,7 +49,7 @@ impl LigneDeJetons {
     pub fn clair(&self) -> Option<&str> {
         match self {
             Self::EnClair(c) | Self::Scellee(c) => Some(c),
-            Self::Illisible => None,
+            Self::Illisible(_) => None,
         }
     }
 }
@@ -36,9 +59,16 @@ pub fn ouvrir_les_jetons(coffre: Option<&Coffre>, stockee: &str) -> LigneDeJeton
     if !est_scelle(stockee) {
         return LigneDeJetons::EnClair(stockee.to_string());
     }
-    match coffre.map(|c| c.ouvrir(stockee)) {
-        Some(Ok(clair)) => LigneDeJetons::Scellee(clair),
-        _ => LigneDeJetons::Illisible,
+    let Some(coffre) = coffre else {
+        return LigneDeJetons::Illisible(RaisonIllisible::CleAbsente);
+    };
+    match coffre.ouvrir(stockee) {
+        Ok(clair) => LigneDeJetons::Scellee(clair),
+        Err(_) => LigneDeJetons::Illisible(match coffre.etat_de_la_cle() {
+            EtatDeLaCle::Absente => RaisonIllisible::CleAbsente,
+            EtatDeLaCle::Illisible => RaisonIllisible::CleIllisible,
+            EtatDeLaCle::Presente => RaisonIllisible::AutreCle,
+        }),
     }
 }
 
@@ -98,6 +128,12 @@ pub fn ecrire_les_jetons(settings: &SettingsRepo, cle: &str, clair: &str) {
 /// Il n'y a donc pas de cas silencieusement faux.
 pub struct ServiceRegistry {
     services: HashMap<String, Arc<RwLock<Box<dyn StreamingService>>>>,
+    /// Les services dont la ligne de jetons, scellée, n'a pas pu être relue
+    /// au démarrage, et pourquoi. La ligne reste en place (la clé peut
+    /// revenir) ; l'écran du service le dit (`session_unreadable`) au lieu
+    /// d'un simple « non connecté ». Vidé pour un service dès qu'une nouvelle
+    /// ligne est écrite (reconnexion).
+    sessions_illisibles: std::sync::Mutex<HashMap<String, RaisonIllisible>>,
 }
 
 impl Default for ServiceRegistry {
@@ -110,6 +146,7 @@ impl ServiceRegistry {
     pub fn new() -> Self {
         Self {
             services: HashMap::new(),
+            sessions_illisibles: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -137,6 +174,28 @@ impl ServiceRegistry {
         Some(svc.clone())
     }
 
+    /// Pourquoi la session enregistrée de `name` n'a pas pu être relue, si
+    /// c'est le cas ([`RaisonIllisible::as_str`]).
+    pub fn session_illisible(&self, name: &str) -> Option<RaisonIllisible> {
+        self.sessions_illisibles
+            .lock()
+            .ok()
+            .and_then(|m| m.get(name).copied())
+    }
+
+    fn noter_session_illisible(&self, name: &str, raison: Option<RaisonIllisible>) {
+        if let Ok(mut m) = self.sessions_illisibles.lock() {
+            match raison {
+                Some(r) => {
+                    m.insert(name.to_string(), r);
+                }
+                None => {
+                    m.remove(name);
+                }
+            }
+        }
+    }
+
     pub fn list(&self) -> Vec<String> {
         self.services.keys().cloned().collect()
     }
@@ -158,6 +217,12 @@ impl ServiceRegistry {
                 // #5997 — le serveur propage lui-même les cœurs de ce service
                 // et en tient le miroir : le client ne recopie plus.
                 "favoris_miroir": svc.favoris_miroir(),
+                // La session enregistrée n'a pas pu être relue (clé du coffre
+                // absente, illisible ou autre) : code que l'écran traduit.
+                "session_unreadable": self
+                    .session_illisible(name)
+                    .filter(|_| !status.authenticated)
+                    .map(RaisonIllisible::as_str),
             }));
         }
         results
@@ -198,6 +263,7 @@ impl ServiceRegistry {
                     continue;
                 }
                 settings.set(&key, &valeur).ok();
+                self.noter_session_illisible(name, None);
                 info!(service = %name, "tokens_saved");
             }
         }
@@ -307,9 +373,11 @@ impl ServiceRegistry {
                 .ok()
                 .flatten()
                 .map(|v| ouvrir_les_jetons(coffre, &v));
-            if matches!(ligne, Some(LigneDeJetons::Illisible)) {
+            if let Some(LigneDeJetons::Illisible(raison)) = ligne {
                 // Ni effacée ni réécrite : la clé maîtresse peut revenir.
-                warn!(service = %name, "tokens_illisibles_cle_maitresse");
+                // L'écran du service le dit (`session_unreadable`).
+                warn!(service = %name, raison = raison.as_str(), "tokens_illisibles_cle_maitresse");
+                self.noter_session_illisible(name, Some(raison));
             }
             let en_clair = matches!(ligne, Some(LigneDeJetons::EnClair(_)));
             if let Some(json_str) = ligne.as_ref().and_then(LigneDeJetons::clair)

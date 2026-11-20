@@ -180,3 +180,34 @@ fn les_noms_se_listent_sans_les_valeurs() {
     assert_eq!(noms_des_entetes(&entetes), "User-Agent,Referer");
     assert_eq!(noms_des_entetes(&[]), "");
 }
+
+/// L'adresse amont porte un jeton signé (`?token=…`) : un échec de connexion
+/// ne le recopie pas dans le message d'erreur, qui finit au journal.
+/// Contre-épreuve : l'erreur brute de reqwest, elle, le contient.
+#[test]
+fn un_echec_amont_ne_recopie_pas_l_adresse_signee() {
+    // Port réservé puis libéré : la connexion est refusée tout de suite.
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let url = format!("http://127.0.0.1:{port}/piste.flac?token=JETON-SIGNE-TEMOIN");
+    let dir = tempfile::tempdir().unwrap();
+    let vers = dir.path().join("dl");
+    let erreur = telecharger_amont(&url, &[], vers.to_str().unwrap()).unwrap_err();
+    assert!(erreur.starts_with("upstream fetch"), "{erreur}");
+    assert!(!erreur.contains("JETON-SIGNE-TEMOIN"), "{erreur}");
+
+    let brute = crate::http::client::blocking_builder()
+        .build()
+        .unwrap()
+        .get(&url)
+        .send()
+        .unwrap_err()
+        .to_string();
+    assert!(
+        brute.contains("JETON-SIGNE-TEMOIN"),
+        "contre-épreuve : {brute}"
+    );
+}

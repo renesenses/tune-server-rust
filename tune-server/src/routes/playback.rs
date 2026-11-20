@@ -255,6 +255,20 @@ pub(crate) fn refus_lecture_youtube_inactive(cause: &str, lang: &str) -> axum::r
     (StatusCode::CONFLICT, Json(corps)).into_response()
 }
 
+/// Le refus « TIDAL ne sert qu'un extrait » : code stable, phrase dans la
+/// langue de l'interface, texte technique dans `cause`.
+pub(crate) fn refus_extrait_tidal(cause: &str, lang: &str) -> axum::response::Response {
+    let code = tune_core::streaming::tidal::CODE_EXTRAIT_SEULEMENT;
+    let mut corps = crate::message_api::avec_message_en(
+        json!({"error": code, "code": code, "service": "tidal"}),
+        lang,
+        "tidal.playback.previewOnly",
+        &[],
+    );
+    corps["cause"] = json!(cause);
+    (StatusCode::CONFLICT, Json(corps)).into_response()
+}
+
 fn play_error_response(e: String, lang: &str) -> axum::response::Response {
     if let Some(reponse) = refus_du_bail_parental(&e, lang) {
         return reponse;
@@ -311,6 +325,12 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
     // `upstream_error` au texte brut.
     if e.contains(tune_core::streaming::youtube::CODE_LECTURE_YOUTUBE_INACTIVE) {
         return refus_lecture_youtube_inactive(&e, lang);
+    }
+    // TIDAL ne sert qu'un extrait de 30 s de ce titre pour ce compte : il
+    // n'est pas lu. Un fait du compte, pas une panne : 409 au code stable,
+    // phrase traduite (`message_key`).
+    if e.contains(tune_core::streaming::tidal::CODE_EXTRAIT_SEULEMENT) {
+        return refus_extrait_tidal(&e, lang);
     }
     // #6018 — « Lecture Spotify (expérimental) » désactivée : un état de
     // réglage, pas une panne. 409 au code stable, phrase traduite ; sans
@@ -2449,9 +2469,29 @@ mod cadence_inconnue_5283 {
     use serde_json::Value;
     use tune_core::streaming::cadence_du_flux::{CODE_CADENCE_INCONNUE, erreur_cadence_inconnue};
 
-    /// #5283 — l'erreur nommée du cœur sort de la route avec un code STABLE
-    /// (`error` et `code`), en 422, et non en 502 `upstream_error` où le
-    /// client ne pouvait la reconnaître qu'en lisant le texte.
+    /// Un extrait TIDAL : 409 au code stable, phrase traduite.
+    #[tokio::test]
+    async fn un_extrait_tidal_rend_un_409_au_code_stable_et_traduit() {
+        let erreur = format!("stream: {}", tune_core::streaming::tidal::EXTRAIT_SEULEMENT);
+        for (lang, attendu) in [
+            ("fr", "extrait de 30 secondes"),
+            ("de", "30-Sekunden-Vorschau"),
+        ] {
+            let reponse = play_error_response(erreur.clone(), lang);
+            assert_eq!(reponse.status(), StatusCode::CONFLICT);
+            let corps = axum::body::to_bytes(reponse.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let v: Value = serde_json::from_slice(&corps).unwrap();
+            assert_eq!(v["code"], "tidal_preview_only");
+            assert_eq!(v["message_key"], "tidal.playback.previewOnly");
+            assert!(v["message"].as_str().unwrap().contains(attendu), "{v}");
+        }
+        // Contre-épreuve : une autre panne de TIDAL ne prend pas ce code.
+        let autre = play_error_response("tidal: no usable stream found".into(), "fr");
+        assert_ne!(autre.status(), StatusCode::CONFLICT);
+    }
+
     #[tokio::test]
     async fn la_route_rend_le_code_stable_de_la_cadence_inconnue() {
         let reponse = play_error_response(erreur_cadence_inconnue("qobuz"), "fr");

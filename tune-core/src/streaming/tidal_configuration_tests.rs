@@ -403,6 +403,29 @@ fn un_tag_sans_les_secrets_tidal_s_arrete_avant_la_compilation() {
     }
 }
 
+/// docker.yml lancé sans les secrets (à la main, ou depuis un fork) : un
+/// avertissement visible avant la compilation, sans jamais afficher les
+/// valeurs.
+#[test]
+fn docker_sans_les_secrets_tidal_avertit_avant_la_compilation() {
+    let etape = DOCKER
+        .split("- name: Identifiants client TIDAL (avertissement)")
+        .nth(1)
+        .expect("étape d'avertissement absente de docker.yml");
+    let etape = etape.split("\n      - ").next().unwrap();
+    assert!(etape.contains("::warning"), "{etape}");
+    assert!(etape.contains("GITHUB_STEP_SUMMARY"), "{etape}");
+    // Jamais la valeur : seul le test de vacuité la lit.
+    assert!(!etape.contains("echo \"$TUNE_TIDAL"), "{etape}");
+    let garde = DOCKER
+        .find("Identifiants client TIDAL (avertissement)")
+        .unwrap();
+    let premier_build = DOCKER
+        .find("build --release --package tune-server")
+        .unwrap();
+    assert!(garde < premier_build);
+}
+
 // ---------------------------------------------------------------------------
 // 4. Pays : navigation au choix, lecture au pays du compte
 // ---------------------------------------------------------------------------

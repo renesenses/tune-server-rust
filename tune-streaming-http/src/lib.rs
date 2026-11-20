@@ -1753,9 +1753,17 @@ async fn service_status(
     // playlists) et retenait toutes les lectures arrivées après lui : les
     // widgets de l'accueil tombaient en « délai ». L'écriture n'est prise que
     // pour une connexion par interrogation, que Qobuz n'a pas.
+    // La session enregistrée n'a pas pu être relue au démarrage (clé du
+    // coffre absente, illisible ou autre) : l'écran le dit.
+    let illisible = state
+        .services
+        .lock()
+        .await
+        .session_illisible(&service)
+        .map(|r| r.as_str());
     let mut status = svc.read().await.auth_status().await;
     if status.authenticated || !connexion_par_interrogation(&service) {
-        return reponse_etat_du_service(&service, &status);
+        return reponse_etat_du_service(&service, &status, illisible);
     }
     let mut svc = svc.write().await;
     status = svc.auth_status().await;
@@ -1768,7 +1776,7 @@ async fn service_status(
         state.save_tokens().await;
         purge_contenu_utilisateur(&service);
     }
-    reponse_etat_du_service(&service, &status)
+    reponse_etat_du_service(&service, &status, illisible)
 }
 
 /// Le service sait-il se connecter par interrogation (`{"poll": true}`) ?
@@ -1783,6 +1791,7 @@ fn connexion_par_interrogation(service: &str) -> bool {
 fn reponse_etat_du_service(
     service: &str,
     status: &tune_core::streaming::traits::AuthStatus,
+    session_illisible: Option<&str>,
 ) -> Response {
     Json(json!({
         "service": service,
@@ -1790,6 +1799,7 @@ fn reponse_etat_du_service(
         "authenticated": status.authenticated,
         "username": status.username,
         "subscription": status.subscription,
+        "session_unreadable": session_illisible.filter(|_| !status.authenticated),
     }))
     .into_response()
 }

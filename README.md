@@ -249,6 +249,25 @@ TUNE_LOG_LEVEL=debug cargo run --package tune-server
 ./bench.sh localhost:8888
 ```
 
+## Secrets key (`tune-secrets.cle`) — back it up with the database
+
+Streaming-service tokens (`auth_tokens_*`) and personal API keys are sealed in
+the database with a master key, `tune-secrets.cle`, stored **next to**
+`tune.db` (mode 0600). Without it the sealed values no longer open: nothing is
+deleted, but each service shows « session unreadable, reconnect ».
+
+- Back up `tune-secrets.cle` together with the database. Local backups
+  (`backups/`), the appliance data relocation and the macOS/Windows folder
+  migration carry it; a database export or a `.enc` backup does not.
+- The key must be readable by the account the service runs as (a key created
+  by `root` is unreadable for a `tune` service: `chown`/`chmod 600` it).
+- Several servers on the **same PostgreSQL database**: give them the same
+  `tune-secrets.cle`, otherwise each only reads the sessions it wrote.
+- Downgrading to a version that predates sealed tokens: reconnect the
+  streaming services.
+
+See [docs/DATA-RELOCATION.md](docs/DATA-RELOCATION.md).
+
 ## Spotify — the redirect URI you must declare yourself
 
 Tune ships **no** Spotify client ID: `DEFAULT_CLIENT_ID` is the literal

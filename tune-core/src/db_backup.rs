@@ -49,6 +49,7 @@ pub fn create_backup(db_path: &str) -> Option<BackupInfo> {
     }
 
     info!(path = %backup_path.display(), "database_backup_created");
+    emporter_la_cle_du_coffre(db_file, &backup_dir);
 
     prune_backups(&backup_dir, stem, ext);
 
@@ -67,6 +68,20 @@ pub fn create_backup(db_path: &str) -> Option<BackupInfo> {
         size: meta.len(),
         created_at: created,
     })
+}
+
+/// Range une copie de la clé du coffre (`tune-secrets.cle`) dans le dossier
+/// des sauvegardes : une sauvegarde de la base sans sa clé rendrait, une fois
+/// restaurée ailleurs, des jetons et des clés d'API qui ne s'ouvrent plus. Au
+/// mieux : un échec est journalisé, la sauvegarde de la base reste valable.
+fn emporter_la_cle_du_coffre(db_file: &Path, backup_dir: &Path) {
+    let dossier = db_file
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    if let Err(e) = crate::coffre::copier_la_cle(dossier, backup_dir) {
+        warn!(error = %e, "database_backup_cle_du_coffre_non_copiee");
+    }
 }
 
 /// Une sauvegarde de sécurité : ce que [`create_backup`] rend, plus le chemin
@@ -142,6 +157,7 @@ pub fn create_safety_backup(
     }
     let meta = fs::metadata(&backup_path).map_err(|e| format!("{dest}: {e}"))?;
     info!(path = %dest, label, size = meta.len(), "database_safety_backup_created");
+    emporter_la_cle_du_coffre(db_file, &backup_dir);
     prune_backups(&backup_dir, stem, ext);
     let created_at = meta
         .modified()
@@ -244,6 +260,12 @@ pub fn restore_backup(db_path: &str, filename: &str) -> bool {
         warn!("path_traversal_blocked");
         return false;
     }
+    // La copie de la clé du coffre vit dans ce dossier : elle n'est pas une
+    // base, et la prendre pour telle écraserait `tune.db`.
+    if filename == crate::coffre::FICHIER_CLE {
+        warn!("restore_refuse_cle_du_coffre");
+        return false;
+    }
     let Ok(backup_path) = crate::chemin_sur::joindre_sous(&backup_dir, filename) else {
         warn!("path_traversal_blocked");
         return false;
@@ -259,6 +281,16 @@ pub fn restore_backup(db_path: &str, filename: &str) -> bool {
             warn!("path_traversal_blocked");
             return false;
         }
+    }
+
+    // La clé du coffre revient avec la sauvegarde si la base l'a perdue :
+    // sans elle, les valeurs scellées de la base restaurée ne s'ouvriraient
+    // plus. Une clé déjà en place n'est jamais remplacée.
+    if let Some(dossier) = db_file.parent()
+        && !dossier.join(crate::coffre::FICHIER_CLE).exists()
+        && let Err(e) = crate::coffre::copier_la_cle(&backup_dir, dossier)
+    {
+        warn!(error = %e, "database_restore_cle_du_coffre_non_restauree");
     }
 
     match replace_database(db_path, &backup_path) {
@@ -366,6 +398,20 @@ pub fn copier_base_sqlite(source: &Path, cible: &Path) -> Result<u64, String> {
         .and_then(|n| n.to_str())
         .ok_or_else(|| format!("chemin de base invalide : {}", cible.display()))?;
     let marque = format!("{nom_cible}.migration-{}", std::process::id());
+
+    // La clé du coffre suit la base (sinon jetons et clés d'API scellés ne
+    // s'ouvrent plus à la nouvelle place). Au mieux : une migration de la base
+    // ne s'arrête pas pour elle ; une AUTRE clé déjà à la cible n'est jamais
+    // écrasée (l'écran du service dira alors « reconnectez-vous »).
+    let dossier_de = |p: &Path| {
+        p.parent()
+            .filter(|d| !d.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
+    if let Err(e) = crate::coffre::copier_la_cle(&dossier_de(source), &dossier_de(cible)) {
+        warn!(error = %e, "migration_base_cle_du_coffre_non_copiee");
+    }
 
     // (temporaire, nom définitif)
     let mut a_poser: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -617,6 +663,72 @@ mod tests {
         assert!(
             !shm.exists(),
             "le -shm de la base sortante doit disparaitre"
+        );
+    }
+
+    /// La sauvegarde emporte la clé du coffre ; la restauration la remet si
+    /// la base l'a perdue. Contre-épreuve : sans elle, la valeur scellée de la
+    /// base restaurée ne s'ouvre plus.
+    #[test]
+    fn la_sauvegarde_emporte_la_cle_du_coffre_et_la_restauration_la_remet() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("tune.db");
+        std::fs::write(&db_path, b"base").unwrap();
+        let coffre = crate::coffre::Coffre::new(dir.path());
+        let scelle = coffre.sceller("jeton").unwrap();
+        let info = create_backup(db_path.to_str().unwrap()).expect("sauvegarde");
+        let backups = dir.path().join("backups");
+        assert!(backups.join(crate::coffre::FICHIER_CLE).exists());
+        // La liste des sauvegardes ne montre pas la clé.
+        assert!(
+            list_backups(db_path.to_str().unwrap())
+                .iter()
+                .all(|b| !b.filename.contains("secrets"))
+        );
+
+        // La base perd sa clé (dossier recopié sans elle).
+        std::fs::remove_file(dir.path().join(crate::coffre::FICHIER_CLE)).unwrap();
+        assert!(coffre.ouvrir(&scelle).is_err(), "contre-épreuve");
+        assert!(restore_backup(db_path.to_str().unwrap(), &info.filename));
+        assert_eq!(coffre.ouvrir(&scelle).unwrap(), "jeton");
+        // La copie de la clé ne se « restaure » pas comme une base.
+        assert!(!restore_backup(
+            db_path.to_str().unwrap(),
+            crate::coffre::FICHIER_CLE
+        ));
+        assert_eq!(std::fs::read(&db_path).unwrap(), b"base");
+    }
+
+    /// La migration de la base (macOS, Windows) emporte la clé du coffre.
+    #[test]
+    fn copier_base_sqlite_emporte_la_cle_du_coffre() {
+        let de = tempfile::tempdir().unwrap();
+        let vers = tempfile::tempdir().unwrap();
+        let source = de.path().join("tune.db");
+        std::fs::write(&source, b"base").unwrap();
+        let scelle = crate::coffre::Coffre::new(de.path())
+            .sceller("jeton")
+            .unwrap();
+        let cible = vers.path().join("tune.db");
+        copier_base_sqlite(&source, &cible).unwrap();
+        assert_eq!(
+            crate::coffre::Coffre::new(vers.path())
+                .ouvrir(&scelle)
+                .unwrap(),
+            "jeton"
+        );
+        // Une AUTRE clé à la cible : la base migre quand même, la clé en
+        // place n'est pas écrasée.
+        let autre = tempfile::tempdir().unwrap();
+        crate::coffre::Coffre::new(autre.path())
+            .sceller("x")
+            .unwrap();
+        let avant = std::fs::read(autre.path().join(crate::coffre::FICHIER_CLE)).unwrap();
+        let cible2 = autre.path().join("tune.db");
+        copier_base_sqlite(&source, &cible2).unwrap();
+        assert_eq!(
+            std::fs::read(autre.path().join(crate::coffre::FICHIER_CLE)).unwrap(),
+            avant
         );
     }
 

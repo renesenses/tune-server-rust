@@ -135,6 +135,21 @@ jobs:
       # La garde
       # `toute_feature_par_defaut_est_livree_par_toute_ligne_de_build_de_release`
       # (tune-server/tests/features_livrees_3355.rs) lit ce fichier.
+      # Lancé à la main (workflow_dispatch) ou depuis un dépôt sans ces
+      # secrets, l'image serait construite SANS identifiants client TIDAL :
+      # TIDAL y répondrait « non configuré ». Avertissement visible, jamais
+      # les valeurs.
+      - name: Identifiants client TIDAL (avertissement)
+        env:
+          TUNE_TIDAL_CLIENT_ID: ${{ secrets.TUNE_TIDAL_CLIENT_ID }}
+          TUNE_TIDAL_CLIENT_SECRET: ${{ secrets.TUNE_TIDAL_CLIENT_SECRET }}
+        run: |
+          if [ -z "$TUNE_TIDAL_CLIENT_ID" ] || [ -z "$TUNE_TIDAL_CLIENT_SECRET" ]; then
+            echo "::warning title=TIDAL non configuré::Secrets TUNE_TIDAL_CLIENT_ID / TUNE_TIDAL_CLIENT_SECRET absents : l'image n'aura pas TIDAL (les poser dans l'environnement du conteneur, ou relancer avec les secrets)."
+            echo "### ⚠️ TIDAL non configuré dans cette image" >> "$GITHUB_STEP_SUMMARY"
+            echo "Les secrets \`TUNE_TIDAL_CLIENT_ID\` / \`TUNE_TIDAL_CLIENT_SECRET\` étaient absents de ce lancement." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Build tune-server (amd64, native)
         env:
           CARGO_TARGET_DIR: target-amd64

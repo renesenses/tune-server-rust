@@ -136,10 +136,16 @@ pub(crate) fn erreur_oauth(corps: &str) -> String {
     }
 }
 
-/// Le message d'un titre dont TIDAL ne sert qu'un extrait de 30 s : il
-/// n'est jamais lu comme un morceau entier.
-pub const EXTRAIT_SEULEMENT: &str = "TIDAL ne sert qu'un extrait de 30 secondes de ce \
-     titre pour ce compte (abonnement ou droits du titre) : il n'est pas lu";
+/// Code stable d'un titre dont TIDAL ne sert qu'un extrait de 30 s. La
+/// route de lecture le reconnaît dans l'erreur et rend la phrase traduite
+/// (`tidal.playback.previewOnly`, `i18n_server.json`).
+pub const CODE_EXTRAIT_SEULEMENT: &str = "tidal_preview_only";
+
+/// L'erreur d'un titre dont TIDAL ne sert qu'un extrait : jamais lu comme un
+/// morceau entier. Commence par [`CODE_EXTRAIT_SEULEMENT`] ; le texte anglais
+/// n'est qu'un repli technique.
+pub const EXTRAIT_SEULEMENT: &str = "tidal_preview_only: TIDAL only serves a 30-second \
+     preview of this track for this account; it is not played";
 
 /// Une réponse v1 `playbackinfopostpaywall` qui n'est qu'un extrait :
 /// `assetPresentation` vaut `PREVIEW` (au lieu de `FULL`).
