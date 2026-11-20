@@ -371,27 +371,49 @@ mod tests {
         "/tests/fixtures/aiff/ref_16_44100_stereo.aiff"
     );
 
-    fn orchestrateur() -> PlaybackOrchestrator {
+    /// L'orchestrateur du banc et le dossier temporaire de ses fichiers,
+    /// retiré avec lui.
+    struct Banc {
+        orch: PlaybackOrchestrator,
+        dossier: tempfile::TempDir,
+    }
+
+    impl std::ops::Deref for Banc {
+        type Target = PlaybackOrchestrator;
+        fn deref(&self) -> &PlaybackOrchestrator {
+            &self.orch
+        }
+    }
+
+    impl std::ops::DerefMut for Banc {
+        fn deref_mut(&mut self) -> &mut PlaybackOrchestrator {
+            &mut self.orch
+        }
+    }
+
+    fn orchestrateur() -> Banc {
         let db = SqliteDb::open_in_memory().unwrap();
         db.init_schema().unwrap();
         run_migrations(&db).unwrap();
         let db: Arc<dyn crate::db::backend::DbBackend> = Arc::new(db);
-        PlaybackOrchestrator::new(
-            db,
-            Arc::new(PlaybackManager::new()),
-            Arc::new(AudioStreamer::new(PORT)),
-            Arc::new(Mutex::new(ServiceRegistry::new())),
-            Arc::new(Mutex::new(OutputRegistry::new())),
-            None,
-        )
+        Banc {
+            orch: PlaybackOrchestrator::new(
+                db,
+                Arc::new(PlaybackManager::new()),
+                Arc::new(AudioStreamer::new(PORT)),
+                Arc::new(Mutex::new(ServiceRegistry::new())),
+                Arc::new(Mutex::new(OutputRegistry::new())),
+                None,
+            ),
+            dossier: tempfile::tempdir().unwrap(),
+        }
     }
 
-    fn piste_aiff(orch: &PlaybackOrchestrator, source: &str) -> i64 {
+    fn piste_aiff(banc: &Banc, source: &str) -> i64 {
         let mut t = Track::new("Piste AIFF".into());
         // `tracks.file_path` est unique : une copie du témoin par piste.
-        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let copie = std::env::temp_dir().join(format!("tune-9207-{}-{n}.aiff", std::process::id()));
+        let n = std::fs::read_dir(banc.dossier.path()).unwrap().count();
+        let copie = banc.dossier.path().join(format!("{n}.aiff"));
         std::fs::copy(AIFF, &copie).unwrap();
         t.file_path = Some(copie.to_string_lossy().into_owned());
         t.format = Some("aiff".into());
@@ -400,7 +422,7 @@ mod tests {
         t.channels = 2;
         t.duration_ms = 1_000;
         t.source = source.into();
-        TrackRepo::with_backend(orch.db.clone()).create(&t).unwrap()
+        TrackRepo::with_backend(banc.db.clone()).create(&t).unwrap()
     }
 
     fn requete_upnp(zone_id: i64, uri: &str) -> PlayRequest {
@@ -599,7 +621,7 @@ mod tests {
 
     async fn orchestrateur_supervise(
         politique: crate::db::politique_parentale::PolitiqueParentale,
-    ) -> (PlaybackOrchestrator, i64, i64) {
+    ) -> (Banc, i64, i64) {
         use crate::db::backend::ToSqlValue;
         let orch = orchestrateur();
         let sql = |q: &str, p: &[&dyn ToSqlValue]| {
