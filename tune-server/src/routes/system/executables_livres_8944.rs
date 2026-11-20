@@ -13,7 +13,7 @@
 //! exécutable livré plus ancien que `tune-server` de plus d'un jour est
 //! signalé : c'est exactement la signature d'un démon qui n'a pas suivi la
 //! mise à jour. Pour `airplay-daemon`, le rapport dit aussi le chemin que le
-//! serveur lance vraiment, quand ce n'est pas celui d'à côté (Docker,
+//! serveur lancerait, quand ce n'est pas celui d'à côté (Docker,
 //! `/usr/local/bin`, `PATH`).
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -25,9 +25,11 @@ use sha2::{Digest, Sha256};
 /// la mise à jour intégrée aussi (#8954).
 const ECART_SIGNALE_SECS: u64 = 86_400;
 
-/// Un fichier plus gros n'est pas haché (ffmpeg statique : ~80 Mio) : le
-/// rapport reste rapide, la date et la taille suffisent à le situer.
-const EMPREINTE_MAX_OCTETS: u64 = 128 * 1024 * 1024;
+/// Un fichier plus gros n'est pas haché : la date et la taille suffisent à
+/// le situer. Au pire, le relevé lit 5 × 64 Mio par rapport (tune-server
+/// compris), hors du fil asynchrone ; un `ffmpeg` statique plus gros que le
+/// plafond n'a pas d'empreinte.
+const EMPREINTE_MAX_OCTETS: u64 = 64 * 1024 * 1024;
 
 /// Ce qu'on sait d'un exécutable sur le disque.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -150,10 +152,10 @@ pub(crate) fn section_markdown(releves: &[Releve], demon_lance: Option<&Releve>)
     }
     if let Some(d) = demon_lance {
         md.push_str(&format!(
-            "- airplay-daemon in use: {} (not the bundled one)\n",
+            "- airplay-daemon the server would launch: {} (not the bundled one)\n",
             d.chemin.display()
         ));
-        md.push_str(&ligne(d, "  in-use airplay-daemon"));
+        md.push_str(&ligne(d, "  that airplay-daemon"));
     }
     md.push('\n');
     md
@@ -176,12 +178,12 @@ pub(crate) fn json(releves: &[Releve], demon_lance: Option<&Releve>) -> serde_js
     };
     serde_json::json!({
         "files": releves.iter().map(un).collect::<Vec<_>>(),
-        "airplay_daemon_in_use": demon_lance.map(un),
+        "airplay_daemon_resolved": demon_lance.map(un),
     })
 }
 
 /// Le relevé complet, pour le rapport : binaire courant, son dossier, et le
-/// démon AirPlay 2 réellement lancé s'il n'est pas celui d'à côté.
+/// démon AirPlay 2 que le serveur lancerait, s'il n'est pas celui d'à côté.
 pub(crate) fn relever_l_installation() -> (Vec<Releve>, Option<Releve>) {
     let Ok(serveur) = std::env::current_exe() else {
         return (Vec::new(), None);

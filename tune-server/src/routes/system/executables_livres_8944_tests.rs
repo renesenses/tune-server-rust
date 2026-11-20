@@ -106,6 +106,9 @@ fn le_demon_lance_ailleurs_est_nomme_8944() {
     let md = section_markdown(&releves, Some(&lance));
 
     assert!(md.contains("- airplay-daemon: absent"), "{md}");
-    assert!(md.contains("airplay-daemon in use: "), "{md}");
+    assert!(
+        md.contains("airplay-daemon the server would launch: "),
+        "{md}"
+    );
     assert!(md.contains("older than tune-server by 3 day(s)"), "{md}");
 }

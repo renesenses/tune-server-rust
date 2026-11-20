@@ -2706,7 +2706,8 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
     };
 
     // #8944 — l'état des exécutables livrés (date, taille, empreinte), lu
-    // hors du fil asynchrone : il hache quelques Mio sur le disque.
+    // hors du fil asynchrone : il lit et hache chaque fichier de 64 Mio au
+    // plus (cinq au pire, `executables_livres::EMPREINTE_MAX_OCTETS`).
     let (executables_livres, demon_lance) =
         tokio::task::spawn_blocking(super::executables_livres::relever_l_installation)
             .await
