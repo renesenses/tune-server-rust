@@ -47,6 +47,9 @@ fn input(e: &QueueEntry) -> QueueInput {
         return QueueInput::Local { track_id };
     }
     QueueInput::Streaming {
+        media_format: e.format.clone(),
+        sample_rate: e.sample_rate.and_then(|v| u32::try_from(v).ok()),
+        bit_depth: e.bit_depth.and_then(|v| u32::try_from(v).ok()),
         source: e.source.clone().unwrap_or_else(|| "local".into()),
         source_id: e.source_id.clone().unwrap_or_default(),
         title: e.title.clone().unwrap_or_default(),
@@ -719,6 +722,9 @@ pub fn podcast_started_in_context(
         position_ms: position_ms.max(0),
         updated_at: chrono::Utc::now().to_rfc3339(),
         items: vec![QueueInput::Streaming {
+            media_format: None,
+            sample_rate: None,
+            bit_depth: None,
             source: "podcast".into(),
             source_id: url.into(),
             title: np.title.clone(),
@@ -759,8 +765,8 @@ pub fn restore(db: &Arc<dyn DbBackend>, zone_id: i64, r: &Resume) -> Result<(), 
                 QueueInput::Local { track_id } => {
                     if tx.execute(&insert_local, &[&zone_id as &dyn ToSqlValue, track_id, &pos, track_id])? != 1 { return Err(format!("piste de reprise disparue : {track_id}")); }
                 }
-                QueueInput::Streaming { source, source_id, title, artist, album, cover_url, duration_ms, track_number, disc_number, album_ref, artist_ref } => {
-                    tx.execute(&insert_stream, &[&zone_id as &dyn ToSqlValue, &pos, source_id, title, artist, album, cover_url, duration_ms, source, track_number, disc_number, album_ref, artist_ref])?;
+                QueueInput::Streaming { source, source_id, title, artist, album, cover_url, duration_ms, track_number, disc_number, album_ref, artist_ref, media_format, sample_rate, bit_depth } => {
+                    tx.execute(&insert_stream, &[&zone_id as &dyn ToSqlValue, &pos, source_id, title, artist, album, cover_url, duration_ms, source, track_number, disc_number, album_ref, artist_ref, media_format, &sample_rate.map(i64::from), &bit_depth.map(i64::from)])?;
                 }
             }
         }

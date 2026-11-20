@@ -15,6 +15,9 @@ async fn paused_browser() -> (AppState, i64, String) {
         .into_iter()
         .enumerate()
         .map(|(i, title)| QueueInput::Streaming {
+            media_format: None,
+            sample_rate: None,
+            bit_depth: None,
             source: "qobuz".into(),
             source_id: i.to_string(),
             title: title.into(),

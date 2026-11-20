@@ -337,6 +337,9 @@ impl HostContext for AppStateHost {
                 t.get("source_id").and_then(Value::as_str),
             ) {
                 inputs.push(QueueInput::Streaming {
+                    media_format: None,
+                    sample_rate: None,
+                    bit_depth: None,
                     source: source.to_string(),
                     source_id: source_id.to_string(),
                     title: t

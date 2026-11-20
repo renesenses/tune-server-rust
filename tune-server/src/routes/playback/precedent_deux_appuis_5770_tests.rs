@@ -52,6 +52,9 @@ async fn banc(type_de_sortie: &str) -> Banc {
     let items: Vec<QueueInput> = ["a", "b", "c"]
         .iter()
         .map(|id| QueueInput::Streaming {
+            media_format: None,
+            sample_rate: None,
+            bit_depth: None,
             source: "qobuz".into(),
             source_id: (*id).into(),
             title: (*id).to_string(),

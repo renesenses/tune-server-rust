@@ -2249,6 +2249,9 @@ pub fn spawn_mdns_handler(
                                 )
                                 .avec_appairage_airplay2_requis(appairage_requis)
                                 .avec_composant_airplay2_manquant(composant_manquant);
+                                // #8855 — comme AirPlay 2 (#8402) : elle part du
+                                // volume mémorisé de sa zone, jamais de 0 dB.
+                                ap.ensemencer_depuis_la_base(&db).await;
                                 (Some(Box::new(ap)), "airplay")
                             }
                         }
