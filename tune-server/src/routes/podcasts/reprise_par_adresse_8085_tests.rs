@@ -186,6 +186,7 @@ fn reprise_sous(
 ) -> reprises::Resume {
     reprises::Resume {
         resume_key: format!("cle-{context_type}-{context_id}"),
+        profile_id: None,
         context_type: context_type.into(),
         context_id: context_id.into(),
         source: "podcast".into(),
@@ -311,6 +312,7 @@ fn reprise_de_service(
     let (source_id, titre, artiste, album) = piste;
     reprises::Resume {
         resume_key: format!("cle-{source}-{context_id}"),
+        profile_id: None,
         context_type: context_type.into(),
         context_id: context_id.into(),
         source: source.into(),

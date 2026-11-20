@@ -2593,6 +2593,7 @@ mod tests {
         };
         let reprise = Resume {
             resume_key: "cle-reprise".into(),
+            profile_id: None,
             context_type: "playlist".into(),
             context_id: "mixte".into(),
             source: "qobuz".into(),
