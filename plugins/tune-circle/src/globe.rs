@@ -53,11 +53,11 @@
 //!
 //! ## Les cercles du monde (rc13, décision de Bertrand du 20/11/2026)
 //!
-//! `GET /world/circles` : tous les cercles Tune, par pays, en tranches
-//! (`[{ country_code, circles, members }]`, « <5 », « 5-19 »…), sans nom de
-//! cercle ni de membre, sans identifiant, sans coordonnée. Le cloud fait
-//! l'anonymisation (pays de la ville du propriétaire, carte publique rc9 comme
-//! consentement, cercles de l'appelant exclus) ; le greffon relaie tel quel,
+//! `GET /world/circles` : tous les cercles Tune, en points anonymes
+//! (`[{ lat, lon, circles }]`) : un point par lieu de propriétaire (0,5°), une
+//! tranche du nombre de cercles (« <5 », « 5-19 »…), sans nom de personne ni
+//! de cercle, sans identifiant. Le cloud fait l'anonymisation (carte publique
+//! rc9 comme consentement, même réponse pour tous) ; le greffon relaie tel quel,
 //! avec les mêmes états (`412`, `503`, `404` sur un cloud plus ancien) et
 //! `Cache-Control: no-store`.
 
@@ -237,7 +237,7 @@ pub(crate) async fn points_du_monde(State(relais): State<Arc<Relais>>) -> Respon
     ))
 }
 
-/// rc13 : les cercles du monde, anonymes, par pays et en tranches.
+/// rc13 : les cercles du monde, en points anonymes, `[{lat, lon, circles}]`.
 pub(crate) async fn cercles_du_monde(State(relais): State<Arc<Relais>>) -> Response {
     sans_cache(en_reponse(
         relais

@@ -134,8 +134,8 @@ async fn points(State(e): State<Etat>, h: HeaderMap) -> Response {
 /// rc13 : les cercles du monde, tels que le cloud les anonymise.
 fn cercles_attendus() -> Value {
     json!([
-        { "country_code": "BE", "circles": "<5", "members": "<5" },
-        { "country_code": "FR", "circles": "<5", "members": "20-99" }
+        { "lat": 46.0, "lon": 5.0, "circles": "5-19" },
+        { "lat": 51.0, "lon": 4.5, "circles": "<5" }
     ])
 }
 
