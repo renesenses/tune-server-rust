@@ -191,7 +191,13 @@ async fn compte_gratuit_agrandir_refuse_reduire_permis_9240() {
     )
     .await;
     assert!(est_le_refus_premium(statut, &corps), "{statut} {corps}");
-    let (statut, _) = envoyer(&state, "PATCH", "/groups/1", json!({ "zone_ids": [1, 2, 3] })).await;
+    let (statut, _) = envoyer(
+        &state,
+        "PATCH",
+        "/groups/1",
+        json!({ "zone_ids": [1, 2, 3] }),
+    )
+    .await;
     assert_eq!(statut, StatusCode::OK, "passer à 3 zones est gratuit");
 
     poser_un_groupe(&state, json!([1, 2, 3, 4, 5]));
@@ -202,7 +208,11 @@ async fn compte_gratuit_agrandir_refuse_reduire_permis_9240() {
         json!({ "zone_ids": [1, 2, 3, 4] }),
     )
     .await;
-    assert_eq!(statut, StatusCode::OK, "réduire n'est jamais refusé : {corps}");
+    assert_eq!(
+        statut,
+        StatusCode::OK,
+        "réduire n'est jamais refusé : {corps}"
+    );
     let (statut, _) = envoyer(&state, "PATCH", "/groups/1", json!({ "name": "Rez" })).await;
     assert_eq!(statut, StatusCode::OK);
 }

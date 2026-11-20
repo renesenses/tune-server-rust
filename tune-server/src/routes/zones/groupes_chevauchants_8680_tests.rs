@@ -423,10 +423,19 @@ async fn premium_grouper_4_zones_est_permis_9240() {
 async fn compte_gratuit_agrandir_refuse_reduire_permis_9240() {
     let (state, z) = cinq_zones_sans_premium().await;
     poser_les_groupes(&state, &[groupe(1, z[0], &z[..2])]);
-    assert_eq!(patcher(&state, 1, json!({ "zone_ids": &z[..4] })).await, 402);
-    assert_eq!(patcher(&state, 1, json!({ "zone_ids": &z[..3] })).await, 200);
+    assert_eq!(
+        patcher(&state, 1, json!({ "zone_ids": &z[..4] })).await,
+        402
+    );
+    assert_eq!(
+        patcher(&state, 1, json!({ "zone_ids": &z[..3] })).await,
+        200
+    );
     // Un groupe de 4, formé quand le compte était Premium, se réduit.
     poser_les_groupes(&state, &[groupe(1, z[0], &z[..4])]);
-    assert_eq!(patcher(&state, 1, json!({ "zone_ids": &z[..3] })).await, 200);
+    assert_eq!(
+        patcher(&state, 1, json!({ "zone_ids": &z[..3] })).await,
+        200
+    );
     assert_eq!(patcher(&state, 1, json!({ "name": "Rez" })).await, 200);
 }
