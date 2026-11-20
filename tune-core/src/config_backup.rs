@@ -1616,7 +1616,10 @@ mod tests {
             settings.get("ir_jeu_9").unwrap().as_deref(),
             Some(r#"["/d/ir/zone_3_sr96000.wav"]"#)
         );
-        assert_eq!(settings.get("ir_path_9").unwrap().as_deref(), Some("/d/ir/zone_3.wav"));
+        assert_eq!(
+            settings.get("ir_path_9").unwrap().as_deref(),
+            Some("/d/ir/zone_3.wav")
+        );
 
         // Rien de valide : le réglage n'est pas écrit, et c'est dit.
         let reglages = vec![("ir_jeu_3".to_string(), r#"["../zone_1.wav"]"#.to_string())];
