@@ -24,6 +24,18 @@ const DART: &str = "Dart/3.12 (dart:io)";
 /// Une conversion 8 bits mono à 8 kHz, de longueur annoncée : sa fenêtre
 /// ordinaire tombe au plancher de 8 Mio, qu'un flux de 10 Mo fait glisser.
 async fn servir(id: &str, pcm: usize) -> (String, Arc<StreamSession>, Vec<u8>) {
+    servir_avec(id, pcm, true, |_| {}).await
+}
+
+/// `adresse_du_pair` : servi comme par `aiguillage_des_flux`, qui pose
+/// l'adresse du pair sur chaque requête. `avant` voit la session avant le
+/// premier octet (réservation sur un budget de test).
+async fn servir_avec(
+    id: &str,
+    pcm: usize,
+    adresse_du_pair: bool,
+    avant: impl FnOnce(&StreamSession),
+) -> (String, Arc<StreamSession>, Vec<u8>) {
     let info = StreamInfo {
         format: "wav".into(),
         mime_type: "audio/wav".into(),
@@ -42,6 +54,7 @@ async fn servir(id: &str, pcm: usize) -> (String, Arc<StreamSession>, Vec<u8>) {
     source.extend((0..pcm).map(|i| (i % 251) as u8));
     let session = Arc::new(StreamSession::new(id.into(), info, false, 16));
     session.wav_header_included.store(true, SeqCst);
+    avant(&session);
     let tx = session.tx.lock().await.clone().expect("tx");
     session.close_sender().await;
     let envoi = source.clone();
@@ -58,7 +71,16 @@ async fn servir(id: &str, pcm: usize) -> (String, Arc<StreamSession>, Vec<u8>) {
     let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = ecoute.local_addr().unwrap().port();
     tokio::spawn(async move {
-        axum::serve(ecoute, router(sessions)).await.ok();
+        if adresse_du_pair {
+            axum::serve(
+                ecoute,
+                router(sessions).into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .ok();
+        } else {
+            axum::serve(ecoute, router(sessions)).await.ok();
+        }
     });
     (
         format!("http://127.0.0.1:{port}/stream/{id}.wav"),
@@ -192,9 +214,12 @@ fn une_radio_tiree_par_le_pont_garde_sa_fenetre() {
     assert_eq!(session.fenetre_de_retenue_effective(), fenetre);
 }
 
-/// Le plafond : une piste plus longue que lui n'est retenue que jusqu'à lui.
+/// Le plafond : une piste plus longue que lui garde ses premiers
+/// `RETENUE_PONT_MAX_OCTETS`, en plus de la fenêtre ordinaire.
 #[test]
 fn la_retenue_par_le_pont_est_plafonnee() {
+    static BUDGET: tune_core::http::streamer::BudgetDuPont =
+        tune_core::http::streamer::BudgetDuPont::new(u64::MAX);
     let info = StreamInfo {
         format: "wav".into(),
         mime_type: "audio/wav".into(),
@@ -207,10 +232,113 @@ fn la_retenue_par_le_pont_est_plafonnee() {
     };
     let session = StreamSession::new("long-8963".into(), info, false, 16);
     let avant = session.fenetre_de_retenue_effective();
-    session.noter_tirage_par_le_pont();
+    assert_eq!(session.tete_de_retenue_effective(), 0);
+    assert!(session.reserver_pour_le_pont(
+        &BUDGET,
+        tune_core::http::streamer::RETENUE_PONT_MAX_OCTETS
+    ));
+    assert_eq!(session.fenetre_de_retenue_effective(), avant);
     assert_eq!(
-        session.fenetre_de_retenue_effective(),
+        session.tete_de_retenue_effective(),
         tune_core::http::streamer::RETENUE_PONT_MAX_OCTETS
     );
-    assert!(avant < tune_core::http::streamer::RETENUE_PONT_MAX_OCTETS);
+}
+
+/// Sans adresse de pair connue, la marque du pont n'est pas crue : un appareil
+/// du réseau ne peut pas, en la posant, faire retenir des pistes entières.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn la_marque_du_pont_n_est_crue_que_d_un_pair_en_boucle_locale() {
+    let pcm = 10_000_000usize;
+    let (url, session, _) = servir_avec("sans-pair-8963", pcm, false, |_| {}).await;
+    let premier = corps(demander(&url, None, true).await).await;
+    assert_eq!(premier.len(), 44 + pcm);
+    assert!(
+        session.etendue_retenue().0 > 0,
+        "marque crue sans adresse de pair : la retenue n'aurait pas dû s'élargir"
+    );
+    assert!(pair_en_boucle_locale("127.0.0.1".parse().unwrap()));
+    assert!(pair_en_boucle_locale("::1".parse().unwrap()));
+    assert!(pair_en_boucle_locale("::ffff:127.0.0.1".parse().unwrap()));
+    assert!(!pair_en_boucle_locale("192.168.1.20".parse().unwrap()));
+    assert!(!pair_en_boucle_locale("::ffff:192.168.1.20".parse().unwrap()));
+}
+
+/// Le budget commun : une réservation qui ne tient plus est refusée, la
+/// session garde la fenêtre ordinaire ; la mort d'une session rend son dû.
+#[test]
+fn le_budget_commun_du_pont_borne_les_retenues_et_se_rend() {
+    static BUDGET: tune_core::http::streamer::BudgetDuPont =
+        tune_core::http::streamer::BudgetDuPont::new(15_000_000);
+    let info = || StreamInfo {
+        format: "wav".into(),
+        mime_type: "audio/wav".into(),
+        sample_rate: 8_000,
+        channels: 1,
+        bit_depth: 8,
+        duration_ms: Some(1_250_000),
+        ..StreamInfo::default()
+    };
+    let a = StreamSession::new("budget-a".into(), info(), false, 16);
+    let b = StreamSession::new("budget-b".into(), info(), false, 16);
+    let ordinaire = a.fenetre_de_retenue_effective();
+    assert!(a.reserver_pour_le_pont(&BUDGET, u64::MAX));
+    assert!(a.fenetre_de_retenue_effective() > ordinaire);
+    assert!(
+        !b.reserver_pour_le_pont(&BUDGET, u64::MAX),
+        "deux pistes de 10 Mo ne tiennent pas dans 15 Mo"
+    );
+    assert_eq!(b.fenetre_de_retenue_effective(), ordinaire);
+    assert!(a.reserver_pour_le_pont(&BUDGET, u64::MAX), "déjà réservée");
+    assert_eq!(BUDGET.utilise(), a.info.wav_content_length().unwrap());
+    drop(a);
+    assert_eq!(BUDGET.utilise(), 0, "la session morte rend sa réservation");
+    assert!(b.reserver_pour_le_pont(&BUDGET, u64::MAX));
+}
+
+/// Au-delà du plafond, le DÉBUT de la piste est gardé : la reprise à 44 est
+/// servie. Plafond de 9 Mo pour une piste de 10 Mo : tête [0, 9 Mo) et
+/// fenêtre ordinaire de 8 Mio se touchent, toute la piste se reprend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn au_dela_du_plafond_le_debut_de_la_piste_est_garde() {
+    static BUDGET: tune_core::http::streamer::BudgetDuPont =
+        tune_core::http::streamer::BudgetDuPont::new(u64::MAX);
+    let pcm = 10_000_000usize;
+    let (url, session, source) = servir_avec("tete-8963", pcm, true, |s| {
+        assert!(s.reserver_pour_le_pont(&BUDGET, 9_000_000));
+    })
+    .await;
+    assert_eq!(session.tete_de_retenue_effective(), 9_000_000);
+    let premier = corps(demander(&url, None, false).await).await;
+    assert_eq!(premier.len(), 44 + pcm);
+    assert_eq!(session.etendue_retenue().0, 0, "la tête commence à 0");
+    let reprise = demander(&url, Some("bytes=44-"), false).await;
+    assert_eq!(reprise.status(), reqwest::StatusCode::PARTIAL_CONTENT);
+    let octets = corps(reprise).await;
+    assert_eq!(octets.len(), pcm, "reprise à 44 au-delà du plafond");
+    assert!(octets == source[44..]);
+}
+
+/// Tête et fenêtre disjointes (plafond de 1 Mo) : la reprise à 44 rend au
+/// moins toute la tête, à l'octet — de quoi démarrer, au lieu de rien.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn une_tete_disjointe_rend_au_moins_le_debut_a_l_octet() {
+    static BUDGET: tune_core::http::streamer::BudgetDuPont =
+        tune_core::http::streamer::BudgetDuPont::new(u64::MAX);
+    let pcm = 10_000_000usize;
+    let (url, _session, source) = servir_avec("tete-disjointe-8963", pcm, true, |s| {
+        assert!(s.reserver_pour_le_pont(&BUDGET, 1_000_000));
+    })
+    .await;
+    let premier = corps(demander(&url, None, false).await).await;
+    assert_eq!(premier.len(), 44 + pcm);
+    let octets = match envoyer(&url, Some("bytes=44-"), false).await {
+        Ok(r) => corps(r).await,
+        Err(_) => Vec::new(),
+    };
+    assert!(
+        octets.len() >= 1_000_000 - 44,
+        "reprise à 44 : {} octets, la tête n'a pas été servie",
+        octets.len()
+    );
+    assert!(octets[..1_000_000 - 44] == source[44..1_000_000]);
 }

@@ -3732,11 +3732,41 @@ async fn proxy_stream(
     (StatusCode::OK, headers, body).into_response()
 }
 
+/// Le pair est-il cette machine même ?
+pub(crate) fn pair_en_boucle_locale(pair: std::net::IpAddr) -> bool {
+    match pair {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
+/// #8963 — la marque du pont ([`tune_core::cloud::ENTETE_RELAIS`]) n'est
+/// crue que d'un pair en boucle locale : le relais et l'écoute directe
+/// rejouent depuis 127.0.0.1. Posée par un appareil du réseau, ou sans
+/// adresse de pair connue, elle est retirée avant [`handle_stream`].
+async fn handle_stream_par_la_route(
+    chemin: Path<String>,
+    etat: State<SharedSessions>,
+    connexion: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    mut req_headers: HeaderMap,
+) -> Response {
+    let en_boucle_locale = connexion
+        .is_some_and(|axum::Extension(axum::extract::ConnectInfo(pair))| {
+            pair_en_boucle_locale(pair.ip())
+        });
+    if !en_boucle_locale {
+        req_headers.remove(tune_core::cloud::ENTETE_RELAIS);
+    }
+    handle_stream(chemin, etat, req_headers).await
+}
+
 pub fn router(sessions: SharedSessions) -> axum::Router {
     axum::Router::new()
         .route(
             "/stream/{stream_id}",
-            axum::routing::get(handle_stream).head(handle_head),
+            axum::routing::get(handle_stream_par_la_route).head(handle_head),
         )
         // #7807 — journal seul, aucun changement de comportement : une ligne
         // par requête du renderer (méthode, chemin, Range, agent, IP, statut,
