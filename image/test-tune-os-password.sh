@@ -96,6 +96,17 @@ pw="$(cat "${work}/run/premier-mot-de-passe")"
 [[ "$(cat "${work}/state/ssh-password-v2")" == "reset-from-console" ]] || fail "marqueur absent"
 [[ "$sortie" != *"$pw"* ]] || fail "mot de passe écrit sur la sortie (journal)"
 grep -q "$pw" "${work}/issue.d/90-tune-initial-password.issue" || fail "avis de console absent"
+mode="$(stat -c %a "${work}/issue.d/90-tune-initial-password.issue" 2>/dev/null \
+    || stat -f %Lp "${work}/issue.d/90-tune-initial-password.issue")"
+[[ "$mode" == 600 ]] || fail "avis de console lisible au-delà de root (mode $mode)"
+compgen -G "${work}/issue.d/90-tune-initial-password.issue.*" > /dev/null \
+    && fail "fichier temporaire de l'avis resté"
+# Un avis déjà présent, d'une version précédente, en 0644 : remplacé en 0600.
+chmod 0644 "${work}/issue.d/90-tune-initial-password.issue"
+reinitialiser > /dev/null 2>&1
+mode="$(stat -c %a "${work}/issue.d/90-tune-initial-password.issue" 2>/dev/null \
+    || stat -f %Lp "${work}/issue.d/90-tune-initial-password.issue")"
+[[ "$mode" == 600 ]] || fail "avis existant laissé lisible au-delà de root (mode $mode)"
 REINITIALISER
 
 # main must be reached exactly as in production (#5617): the server pipes

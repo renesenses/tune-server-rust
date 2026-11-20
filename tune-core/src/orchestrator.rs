@@ -1277,9 +1277,11 @@ pub struct PlaybackOrchestrator {
     preparations_fichiers: std::sync::Mutex<HashMap<i64, preparation_fichier_7247::Preparation>>,
     dsd_capabilities: Mutex<HashMap<String, crate::outputs::dlna::DsdCapability>>,
     /// #6910 — renderers DLNA qui ont lâché un suivant DSD armé (acquitté,
-    /// jamais suivi : HiFi Rose RS130, #402). La garde DSD leur est rendue
-    /// pour la vie du processus.
-    appareils_qui_lachent_le_dsd_suivant: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// jamais suivi : HiFi Rose RS130, #402). #9206 : la garde DSD leur est
+    /// rendue après plusieurs échecs, pour une durée bornée (voir
+    /// [`crate::playback::gapless::EchecsDsdSuivant`]).
+    appareils_qui_lachent_le_dsd_suivant:
+        std::sync::Mutex<HashMap<String, crate::playback::gapless::EchecsDsdSuivant>>,
     /// Cache of MIME types that each DLNA renderer does NOT support.
     /// Key: device_id, Value: set of unsupported MIME types (e.g. "audio/flac").
     /// Only negative results are cached — if a MIME is not in the set, it's
@@ -1333,6 +1335,15 @@ pub struct PlaybackOrchestrator {
     /// Verrous std : accès très courts, jamais tenus à travers un await.
     eq_replay_gen: std::sync::Mutex<std::collections::HashMap<i64, u64>>,
     eq_replay_last: std::sync::Mutex<std::collections::HashMap<i64, std::time::Instant>>,
+    /// 19/11/2026 — zones dont un changement de réglage du suréchantillonneur
+    /// attend sa relance. Une demande plus récente (égaliseur, PURE) qui la
+    /// remplace hérite de sa règle : plancher court et report au lieu
+    /// d'abandon, puisque la réponse a déjà dit « appliqué ».
+    surech_replay_en_attente: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// 19/11/2026 — une seule relance à la fois par zone : deux relances
+    /// concurrentes (arrêt, `play`) se marcheraient dessus.
+    verrous_de_relance:
+        std::sync::Mutex<std::collections::HashMap<i64, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     /// Le traitement que chaque flux RÉSOLU porte dans ses octets (#4407) :
     /// `zone_id → [(stream_id, empreinte)]`, les plus récents en dernier,
     /// bornés à [`Self::FLUX_TRAITES_PAR_ZONE`].
@@ -1380,6 +1391,9 @@ pub struct PlaybackOrchestrator {
     /// de zones (`zone_groups`) ne compte qu'une écoute par titre. Voir
     /// `ecoute_validee_7852`.
     ecoutes_ecrites: std::sync::Mutex<HashMap<i64, ecoute_validee_7852::EcouteEcrite>>,
+    /// #9143 — le décompte, par zone, des pistes achevées de l'album en
+    /// session, pour le retrait automatique d'« Écouter plus tard ».
+    sas_retrait: Arc<crate::db::ecouter_plus_tard_retrait::SasRetrait>,
     /// #7974 — le suivi du bail d'écoute de chaque zone en lecture. Voir
     /// `bail_parental_7974`.
     ///
@@ -1994,9 +2008,7 @@ impl PlaybackOrchestrator {
             prefetch: Arc::new(PrefetchEngine::new()),
             preparations_fichiers: Default::default(),
             dsd_capabilities: Mutex::new(HashMap::new()),
-            appareils_qui_lachent_le_dsd_suivant: std::sync::Mutex::new(
-                std::collections::HashSet::new(),
-            ),
+            appareils_qui_lachent_le_dsd_suivant: std::sync::Mutex::new(HashMap::new()),
             dlna_unsupported_mimes: Mutex::new(HashMap::new()),
             dlna_lpcm_accepte: Mutex::new(HashMap::new()),
             dlna_canaux_max: Mutex::new(HashMap::new()),
@@ -2006,12 +2018,15 @@ impl PlaybackOrchestrator {
             reprises_sur_place: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_gen: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
+            surech_replay_en_attente: std::sync::Mutex::new(std::collections::HashSet::new()),
+            verrous_de_relance: std::sync::Mutex::new(std::collections::HashMap::new()),
             traitement_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_en_vol_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_net_play: Mutex::new(HashMap::new()),
             annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
             ecoutes_en_attente: std::sync::Mutex::new(HashMap::new()),
             ecoutes_ecrites: std::sync::Mutex::new(HashMap::new()),
+            sas_retrait: Arc::new(crate::db::ecouter_plus_tard_retrait::SasRetrait::new()),
             suivis_de_bail: std::sync::Mutex::new(HashMap::new()),
             confirmations_du_lecteur: std::sync::Mutex::new(Default::default()),
             #[cfg(feature = "local-audio")]
@@ -2083,6 +2098,17 @@ impl PlaybackOrchestrator {
     /// environ une seconde de silence — deux par cinq secondes est déjà
     /// beaucoup.
     const EQ_REPLAY_FLOOR_MS: u64 = 5_000;
+    /// Plancher entre deux relances d'une même zone pour un changement de
+    /// réglage du suréchantillonneur (décision de Bertrand du 19/11/2026).
+    ///
+    /// Plus court que [`Self::EQ_REPLAY_FLOOR_MS`] : ce geste-là sert une
+    /// écoute comparative (activé, désactivé, autre filtre), et 5 s de
+    /// plancher la rendaient impossible. Assez long pour qu'une rafale de
+    /// clics ne hache pas la lecture : la relance coûte environ une seconde
+    /// de silence, plus le reverrouillage du DAC quand la cadence change.
+    /// Et une demande trop proche n'est pas abandonnée, mais DIFFÉRÉE jusqu'à
+    /// la fin du plancher : la réponse a promis « appliqué ».
+    pub(crate) const UPSAMPLER_REPLAY_FLOOR_MS: u64 = 1_500;
 }
 
 // #8611 — contrôle parental : refus de lecture des artistes bloqués.
@@ -2127,6 +2153,43 @@ mod resolve_stream;
 pub mod sentinelle_streaming;
 // #6130 — quitter une radio sur une sortie DLNA : Stop, puis attendre le renderer.
 mod sortie_de_radio_dlna_6130;
+// #8926 — le banc du démarrage d'une radio (tune-stream-http) : le vrai
+// décodeur et la vraie attente de sortie de radio, sans orchestrateur.
+#[doc(hidden)]
+pub mod banc_radio_8926 {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::http::streamer::StreamSession;
+
+    /// Le décodeur de production d'une radio vers DLNA (WAV 16 bits), tel que
+    /// `servir_la_radio_au_reseau` le lance.
+    pub fn decoder_la_station(
+        url: String,
+        tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        data_ready: Arc<tokio::sync::Notify>,
+        session: Arc<StreamSession>,
+    ) -> Result<(), String> {
+        super::radio::decode_radio_stream_to_pcm(
+            url, tx, data_ready, session, None, None, false, None,
+        )
+    }
+
+    /// L'attente de `dlna_sortie_de_radio` après le congé du direct : rend
+    /// (durée, délai dépassé, renderer qui ne lit plus).
+    pub async fn attendre_le_depart(
+        sessions: &[Arc<StreamSession>],
+        delai: Duration,
+    ) -> (Duration, bool, bool) {
+        let fin =
+            super::sortie_de_radio_dlna_6130::attendre_le_depart_des_consommateurs(sessions, delai)
+                .await;
+        (fin.attente, fin.delai_depasse, fin.renderer_ne_lit_plus)
+    }
+
+    pub const DELAI_FERMETURE_RADIO: Duration =
+        super::sortie_de_radio_dlna_6130::DELAI_FERMETURE_RADIO;
+}
 // #6130 — le contexte d'un flux de conversion, pour son journal.
 mod contexte_de_conversion_6130;
 // #4366 — 403 YouTube : rafraîchir yt-dlp, puis une seule relance.
@@ -2242,6 +2305,9 @@ mod greffon_natif_tiers_reseau_7616_tests;
 // #6780 — PURE contourne aussi la réaffectation des canaux armée de la zone.
 #[cfg(all(test, feature = "local-audio"))]
 mod pure_reaffectation_6780_tests;
+// 19/11/2026 — un réglage du suréchantillonneur relance le flux tout de suite.
+#[cfg(all(test, feature = "local-audio"))]
+mod surechantillonnage_immediat_tests;
 // #7932 — PURE contourne aussi la réaffectation des canaux de l'album joué.
 #[cfg(all(test, feature = "local-audio"))]
 mod pure_reaffectation_album_7932_tests;
@@ -2262,6 +2328,9 @@ mod passthrough_sans_traitement_7986_tests;
 // #9175 — Sendspin et Devialet AIR lisent le flux traité dès qu'un traitement est actif.
 #[cfg(test)]
 mod sorties_qui_decodent_le_fichier_9175_tests;
+// Suite de #9175 — saut et reprise de bout en bout avec une vraie sortie Sendspin.
+#[cfg(test)]
+mod sendspin_relance_9175_tests;
 // #8006 — Pause et Arrêt n'attendent plus sans limite un appareil occupé.
 #[cfg(test)]
 mod sortie_occupee_8006_tests;
@@ -2275,6 +2344,8 @@ mod prefetch_fiche_qobuz_m3u_8229_tests;
 #[cfg(test)]
 mod prefetch_wav_annonce_6990_tests;
 mod resolve_direct;
+// #9207 — une URI de notre bibliothèque reçue par le renderer se joue en local.
+mod uri_de_notre_bibliotheque_9207;
 /// #2264 — la règle de version appliquée à la lecture.
 mod version_de_lecture;
 // #4894 — capacité LPCM par type de sortie, quand aucun Sink n'est sondable.

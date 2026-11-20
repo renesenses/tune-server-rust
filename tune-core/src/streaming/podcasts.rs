@@ -454,7 +454,7 @@ impl PodcastService {
     /// Les épisodes ET l'image de la chaîne d'un flux — celle que l'abonnement
     /// met en cache (#5214) : un flux qui la change se reconnaît ici.
     pub async fn get_feed(&self, feed_url: &str, limit: usize) -> Result<FluxPodcast, String> {
-        debug!(feed_url, "podcast_feed_fetching");
+        debug!(feed_url = %crate::confidentialite::masquer_url(&feed_url), "podcast_feed_fetching");
         let resp = self
             .client
             .get(feed_url)
@@ -472,7 +472,7 @@ impl PodcastService {
             .text()
             .await
             .map_err(|e| format!("podcast feed read: {e}"))?;
-        debug!(feed_url, bytes = xml_text.len(), "podcast_feed_fetched");
+        debug!(feed_url = %crate::confidentialite::masquer_url(&feed_url), bytes = xml_text.len(), "podcast_feed_fetched");
         Ok(FluxPodcast {
             image_url: extract_channel_image(&xml_text),
             episodes: parse_rss(&xml_text, limit)?,
@@ -873,7 +873,7 @@ impl PodcastService {
         country: Option<&str>,
     ) -> Result<String, EchecResolution> {
         let url = Self::lookup_url(&self.lookup_base, apple_id, country);
-        debug!(url = %url, "podcast_lookup");
+        debug!(url = %crate::confidentialite::masquer_url(&url), "podcast_lookup");
         let resp = self
             .client
             .get(&url)
@@ -1067,7 +1067,7 @@ impl PodcastService {
             }
         }
 
-        debug!(url = %url, "apple_top_podcasts_fetch");
+        debug!(url = %crate::confidentialite::masquer_url(&url), "apple_top_podcasts_fetch");
         let resp = self
             .client
             .get(&url)

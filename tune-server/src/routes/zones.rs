@@ -267,6 +267,13 @@ struct PatchZone {
     /// signal. Pris en compte à la lecture suivante.
     strict_bitperfect: Option<bool>,
 
+    /// #8869 — silence de verrouillage (ms, 0 à 2000) inséré devant le flux
+    /// d'une sortie LOCALE quand son format change (cadence, canaux, PCM /
+    /// DoP / DSD natif). Persisté en setting
+    /// `zone_{id}_silence_verrouillage_ms` ; `0` supprime la clé (défaut).
+    /// Borné côté serveur. Pris en compte à la lecture suivante.
+    silence_verrouillage_ms: Option<i64>,
+
     /// #3245 — mode exclusif de CETTE zone, pour l'appareil local qu'elle
     /// joue. Persisté en setting `zone_{id}_exclusive_mode`. `null` efface :
     /// la zone suit à nouveau le réglage de machine `local_exclusive_mode`.
@@ -450,6 +457,14 @@ fn inject_device_identity(
     obj.insert(
         "strict_bitperfect".into(),
         json!(tune_core::audio::bitperfect_strict::zone_enabled(
+            backend, zone_id
+        )),
+    );
+    // #8869 — TOUJOURS publié : sa présence dit au client que ce serveur
+    // connaît le réglage.
+    obj.insert(
+        "silence_verrouillage_ms".into(),
+        json!(tune_core::audio::silence_de_verrouillage::lire(
             backend, zone_id
         )),
     );
@@ -663,6 +678,11 @@ pub fn router() -> Router<AppState> {
             get(tune_tested::etat_tune_tested).post(tune_tested::proposer_tune_tested),
         )
         .route("/group-delays", get(list_group_delays).put(set_group_delay))
+        // #9089 — décalage manuel d'une zone qui suit la meneuse de son groupe.
+        .route(
+            "/{id}/group-offset",
+            get(decalage_de_groupe_9089::lire).put(decalage_de_groupe_9089::ecrire),
+        )
         .route("/group", get(list_groups).post(create_group))
         .route("/groups", get(list_groups).post(create_group))
         .route("/groups/list", get(list_groups))
@@ -1800,6 +1820,8 @@ pub(crate) use preconfiguration::preconfigurer_zone as preconfigurer_zone_decouv
 
 mod groupes;
 pub use groupes::*;
+// #9089 — `GET` / `PUT /zones/{id}/group-offset`.
+mod decalage_de_groupe_9089;
 
 // #6155 — les suiveuses d'un groupe jouent ce que joue la meneuse.
 pub mod relais_de_groupe_6155;

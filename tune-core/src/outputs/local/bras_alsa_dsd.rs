@@ -118,12 +118,29 @@ fn retenir_la_perte_du_hw(device_name: &str, raison: &SansPcmMateriel) {
         SansPcmMateriel::HoteNonAlsa(_) => {
             capacite::retenir(device_name, CapaciteConnue::SortieNonAsio);
         }
+        SansPcmMateriel::PcmLogiciel(id) if pcm_logiciel_generique(id) => {
+            capacite::retenir(device_name, CapaciteConnue::SortieNonAsio);
+        }
         SansPcmMateriel::PcmLogiciel(_) => {
             capacite::retrograder_en_provisoire(device_name);
             capacite::retenir_provisoire(device_name, CapaciteConnue::SortieNonAsio);
         }
         SansPcmMateriel::Introuvable(_) => capacite::retrograder_en_provisoire(device_name),
     }
+}
+
+/// #9170 (suivi #9172) — un PCM logiciel GÉNÉRIQUE, sans carte désignée
+/// (`default`, `pipewire`, `pulse`, `dmix`, `sysdefault`, `plug`, `jack`…) :
+/// le nom de la sortie désigne le mixeur du système, jamais un DAC, et ne
+/// résoudra pas vers un `hw:` — verdict définitif, pas de re-sondage.
+///
+/// Un PCM logiciel qui désigne une carte (`default:CARD=DACZ8`,
+/// `plughw:CARD=…`, `dmix:CARD=…`) reste provisoire : la même carte expose
+/// aussi son `hw:`, que l'énumération peut préférer au sondage suivant (le
+/// cas du fil 2951).
+fn pcm_logiciel_generique(endpoint_id: &str) -> bool {
+    let pcm = crate::outputs::pseudo_peripherique_alsa::pcm_alsa(endpoint_id);
+    !pcm.is_empty() && !pcm.contains(':')
 }
 
 /// Le PCM ALSA matériel (`hw:`) qu'ouvrirait la sortie, sans repli.
@@ -183,6 +200,9 @@ pub(super) fn sonder_la_sortie(
             }
             return match raison {
                 SansPcmMateriel::HoteNonAlsa(_) => ResultatSondeDsdAlsa::PasUnPcmMateriel,
+                SansPcmMateriel::PcmLogiciel(id) if pcm_logiciel_generique(&id) => {
+                    ResultatSondeDsdAlsa::PasUnPcmMateriel
+                }
                 SansPcmMateriel::PcmLogiciel(_) => ResultatSondeDsdAlsa::PcmLogiciel,
                 SansPcmMateriel::Introuvable(_) => ResultatSondeDsdAlsa::Introuvable,
             };
@@ -240,6 +260,9 @@ pub(super) struct EntreesDsdNatifAlsa {
     pub(super) dop_active: Arc<AtomicBool>,
     pub(super) chain_exhausted: Arc<AtomicBool>,
     pub(super) device_gone: Arc<AtomicBool>,
+    /// #8869 — le silence de verrouillage dont le flux est précédé.
+    pub(super) silence_de_verrouillage:
+        crate::audio::silence_de_verrouillage::SilenceDeVerrouillage,
 }
 
 /// Ce que le rappel écrit dans un tampon `DSD_U32` : le motif de repos tant
@@ -308,6 +331,7 @@ pub(super) fn jouer_dsd_natif_via_alsa(entrees: EntreesDsdNatifAlsa) {
         dop_active,
         chain_exhausted,
         device_gone,
+        silence_de_verrouillage,
     } = entrees;
     let canaux = usize::from(entete.canaux);
 
@@ -395,10 +419,14 @@ pub(super) fn jouer_dsd_natif_via_alsa(entrees: EntreesDsdNatifAlsa) {
     let famines = Arc::new(AtomicU64::new(0));
     let famines_rappel = famines.clone();
     let disparu = device_gone.clone();
+    // Même promotion temps réel que les autres chemins de rendu, à la première
+    // période de chaque fil cpal neuf.
+    let mut promotion = PromotionDuFilDeRendu::nouvelle();
     let stream = match device.build_output_stream_raw(
         &config,
         cpal::SampleFormat::DsdU32,
         move |data: &mut cpal::Data, _: &cpal::OutputCallbackInfo| {
+            promotion.a_la_premiere_periode();
             let repos = paused_rappel.load(Ordering::Relaxed)
                 || silence_rappel.load(Ordering::Relaxed)
                 || fermeture_rappel.load(Ordering::Relaxed);
@@ -458,7 +486,7 @@ pub(super) fn jouer_dsd_natif_via_alsa(entrees: EntreesDsdNatifAlsa) {
     info!(
         device = %device_name,
         pcm = %pcm,
-        url = %url,
+        url = %crate::confidentialite::masquer_url(&url),
         format = ordre.nom_alsa(),
         cadence_dsd = entete.cadence,
         cadence_de_trame,
@@ -476,6 +504,15 @@ pub(super) fn jouer_dsd_natif_via_alsa(entrees: EntreesDsdNatifAlsa) {
     // Et la zone qui attendait ce natif l'affiche, maintenant qu'il est réel.
     crate::outputs::capacite_dsd_natif::confirmer_transport_natif(&format!("local:{device_name}"));
 
+    // #8869 — au changement de format, du repos DSD avant le premier octet.
+    super::silence_de_verrouillage_8869::pousser_dans_l_anneau_dsd(
+        &silence_de_verrouillage,
+        &anneau,
+        entete.cadence,
+        entete.canaux,
+        octets_par_trame,
+        || force_silent.load(Ordering::Relaxed) || device_gone.load(Ordering::Relaxed),
+    );
     // ── Alimentation : DsdU8 → mots DSD_U32 → anneau. ──
     let mut mots: Vec<u8> = Vec::new();
     empaqueteur.pousser(header_buf.get(ENTETE_LEN..).unwrap_or_default(), &mut mots);
@@ -620,5 +657,35 @@ mod perte_du_hw_9172 {
                 cadences: vec![DSD512]
             })
         );
+    }
+
+    /// Suivi #9172 : `default`, `pipewire`… sans carte sont définitifs ;
+    /// un PCM logiciel qui désigne une carte reste provisoire (fil 2951).
+    #[test]
+    fn un_pcm_logiciel_generique_est_definitif() {
+        use super::pcm_logiciel_generique;
+        for id in [
+            "alsa:default",
+            "pipewire",
+            "alsa:pulse",
+            "dmix",
+            "sysdefault",
+            "plug",
+        ] {
+            assert!(pcm_logiciel_generique(id), "{id} : générique attendu");
+        }
+        for id in [
+            "alsa:default:CARD=DACZ8",
+            "plughw:CARD=Z8,DEV=0",
+            "dmix:CARD=Z8,DEV=0",
+            "sysdefault:CARD=Z8",
+        ] {
+            assert!(!pcm_logiciel_generique(id), "{id} : désigne une carte");
+        }
+        let nom = "9172 sortie pipewire";
+        prouve(nom);
+        retenir_la_perte_du_hw(nom, &SansPcmMateriel::PcmLogiciel("alsa:pipewire".into()));
+        assert_eq!(connue(nom), Some(CapaciteConnue::SortieNonAsio));
+        assert!(!a_resonder(nom), "un PCM générique ne se re-sonde pas");
     }
 }

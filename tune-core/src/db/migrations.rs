@@ -2964,10 +2964,21 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "radio_fin_de_file_coupee_par_defaut",
         up: SQL_RADIO_FIN_DE_FILE_COUPEE_PAR_DEFAUT,
     },
+    Migration {
+        version: 156,
+        name: "queue_items_format_streaming",
+        up: "",
+    },
 ];
 
-/// Pose `albums.release_country` et `albums.release_country_mbid` (#8668) —
-/// bloc de version de la 154 et passe finale.
+/// #8788 — le format des pistes UPnP, migration 156 et réparation idempotente.
+fn format_des_elements_de_file(db: &SqliteDb) {
+    add_column_if_missing(db, "queue_items", "media_format", "TEXT");
+    add_column_if_missing(db, "queue_items", "sample_rate", "INTEGER");
+    add_column_if_missing(db, "queue_items", "bit_depth", "INTEGER");
+}
+
+/// Pose le pays d'édition MusicBrainz (#8668), migration 154 et passe finale.
 fn pays_des_editions(db: &SqliteDb) {
     add_column_if_missing(db, "albums", "release_country", "TEXT");
     add_column_if_missing(db, "albums", "release_country_mbid", "TEXT");
@@ -4462,6 +4473,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // Index des identifiants d'enregistrement (#2264).
             index_des_identifiants_d_enregistrement(db);
         }
+        if migration.version == 156 {
+            format_des_elements_de_file(db);
+        }
         if migration.version == 123 {
             // L'artiste d'une piste de service chez son service (#6079). Sans
             // défaut : NULL = INCONNU pour toute ligne existante.
@@ -5148,6 +5162,7 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // #6079) — posé ICI aussi : l'écriture de la file le NOMME, et une base
     // arrivée sans lui ne pourrait plus rien mettre en file. PG : migration 087.
     add_column_if_missing(db, "queue_items", "artist_ref", "TEXT");
+    format_des_elements_de_file(db);
     // La note de la piste (migration 124, #6123) — posée ICI aussi : l'INSERT
     // et l'UPDATE des pistes la NOMMENT, et une base arrivée sans elle ne
     // pourrait plus rien scanner. PG : migration 088.
@@ -5333,6 +5348,13 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     if let Err(e) = db.execute_batch(&super::library_revision::sql_sqlite()) {
         db.execute_batch("ROLLBACK").ok();
         warn!(error = %e, "sqlite_library_revision_failed");
+    }
+    // #9116 — la révision des CHEMINS (arbre des dossiers de la vue
+    // Répertoires) : même passe, même transaction unique ; un échec la laisse
+    // absente et l'arbre se garde sous la révision de la bibliothèque.
+    if let Err(e) = db.execute_batch(&super::arbre_des_dossiers::sql_sqlite()) {
+        db.execute_batch("ROLLBACK").ok();
+        warn!(error = %e, "sqlite_library_paths_revision_failed");
     }
     // #7619 (L1) — la clé de tri des pistes et son index : même passe, sans
     // numéro de migration (aucune collision possible avec un lot voisin).
@@ -6364,6 +6386,11 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         "radio_fin_de_file_coupee_par_defaut",
         include_str!("../../migrations/postgres/122_radio_fin_de_file_coupee_par_defaut.sql"),
     ),
+    (
+        123,
+        "queue_items_format_streaming",
+        include_str!("../../migrations/postgres/123_queue_items_format_streaming.sql"),
+    ),
 ];
 
 /// Run all pending PostgreSQL migrations against the pool.
@@ -6592,6 +6619,15 @@ pub async fn run_pg_migrations(pool: &sqlx::PgPool) -> Result<(), String> {
         .await
     {
         warn!(error = %e, "pg_library_revision_failed");
+    }
+    // #9116 — la révision des chemins, un bloc `DO` (texte constant).
+    if let Err(e) = sqlx::raw_sql(sqlx::AssertSqlSafe(
+        super::arbre_des_dossiers::sql_postgres(),
+    ))
+    .execute(pool)
+    .await
+    {
+        warn!(error = %e, "pg_library_paths_revision_failed");
     }
     // #7619 (L3) — même index, même texte que la passe finale SQLite.
     if let Err(e) = sqlx::raw_sql(TRACKS_GENRE_COMPOSER_INDEX)
@@ -10313,7 +10349,8 @@ mod tests {
         // 122 : `radio_fin_de_file_coupee_par_defaut` (#8974), jumelle de la
         // SQLite 155. Migration de DONNÉES : annule la bascule de la 118
         // (neutralisée) là où elle a eu lieu, DEFAULT '0'.
-        assert_eq!(pg_latest_version(), 122, "latest PG migration must be 122");
+        // 123 : format des pistes UPnP en file (#8788), SQLite 156.
+        assert_eq!(pg_latest_version(), 123, "latest PG migration must be 123");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

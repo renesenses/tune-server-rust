@@ -134,10 +134,13 @@ impl Media {
         }
     }
 
-    /// Le flux commence à `depart_ms` dans la piste : la durée annoncée était
-    /// celle qui restait (#6630), on rend celle de la piste.
-    fn noter_le_depart(&mut self, depart_ms: u64) {
-        if self.duree_ms > 0 {
+    /// Le flux commence à `depart_ms` dans la piste. La durée de la piste,
+    /// quand l'orchestrateur la donne, fait foi ; sinon la durée annoncée
+    /// était celle qui restait (#6630), et on rend celle de la piste.
+    fn noter_le_depart(&mut self, depart_ms: u64, duree_piste_ms: Option<u64>) {
+        if let Some(d) = duree_piste_ms.filter(|d| *d > 0) {
+            self.duree_ms = d;
+        } else if self.duree_ms > 0 {
             self.duree_ms = self.duree_ms.saturating_sub(self.depart_du_flux_ms) + depart_ms;
         }
         self.depart_du_flux_ms = depart_ms;
@@ -278,15 +281,15 @@ impl DevialetAirOutput {
     /// dans la piste (saut ou reprise sur un flux traité, qui ne se relit
     /// pas) : la position et la durée se comptent depuis le début de la
     /// piste, le décodeur depuis le début du flux.
-    pub async fn noter_le_depart_du_flux(&self, depart_ms: u64) {
+    pub async fn noter_le_depart_du_flux(&self, depart_ms: u64, duree_piste_ms: Option<u64>) {
         let mut phase = self.phase.lock().await;
         match &mut *phase {
             Phase::Lecture(flux) => {
                 flux.debut_ms =
                     flux.debut_ms.saturating_sub(flux.media.depart_du_flux_ms) + depart_ms;
-                flux.media.noter_le_depart(depart_ms);
+                flux.media.noter_le_depart(depart_ms, duree_piste_ms);
             }
-            Phase::Pause { media, .. } => media.noter_le_depart(depart_ms),
+            Phase::Pause { media, .. } => media.noter_le_depart(depart_ms, duree_piste_ms),
             _ => {}
         }
     }
@@ -470,6 +473,7 @@ impl DevialetAirOutput {
             // Un canal ne s'ouvre qu'une fois : la cadence annoncée choisit
             // d'emblée celle qu'AIR transporte.
             media.taux.filter(|_| !media.relisible),
+            media.relisible,
         )
         .await
         .map_err(|e| format!("{} : {e}", self.nom))?;
@@ -671,10 +675,19 @@ fn ouvrir_decodeur(
     cadence: Option<u32>,
     depuis_s: f64,
     en_direct: bool,
+    relisible: bool,
 ) -> DecodeurOuvert {
     let source = source.to_owned();
     if est_distante(&source) {
-        return ouvrir_decodeur_distant(source, cadence, Some(2), Some(24), depuis_s, en_direct);
+        return ouvrir_decodeur_distant(
+            source,
+            cadence,
+            Some(2),
+            Some(24),
+            depuis_s,
+            en_direct,
+            relisible,
+        );
     }
     let (tx, rx) = mpsc::channel::<Vec<u8>>(8);
     let chemin = source
@@ -733,6 +746,7 @@ async fn ouvrir_la_source(
     en_direct: bool,
     attente: Duration,
     cadence_d_un_canal: Option<u32>,
+    relisible: bool,
 ) -> Result<SourceOuverte, String> {
     let depuis_s = debut_ms as f64 / 1_000.0;
     // #9175 — un flux traité servi par un canal ne se lit qu'une fois : le
@@ -740,12 +754,13 @@ async fn ouvrir_la_source(
     // cadence annoncée par l'orchestrateur décide donc d'emblée.
     if let Some(cadence_source) = cadence_d_un_canal {
         let cadence_envoyee = reglages::cadence_envoyee(cadence_source);
-        let (mut rx, decodeur) = ouvrir_decodeur(
-            &source,
-            (cadence_envoyee != cadence_source).then_some(cadence_envoyee),
-            depuis_s,
-            en_direct,
-        );
+        // Toujours la cadence visée, jamais `None` : la cadence annoncée
+        // (`resolved.sample_rate`) peut différer de celle du flux traité
+        // (plafond de zone, cadence fixe). Le décodeur ne rééchantillonne
+        // que si le flux n'y est pas déjà ; avec `None`, il rendait la
+        // cadence réelle et la lecture était refusée ci-dessous.
+        let (mut rx, decodeur) =
+            ouvrir_decodeur(&source, Some(cadence_envoyee), depuis_s, en_direct, false);
         match premier_bloc(&mut rx, attente)
             .await?
             .as_deref()
@@ -764,7 +779,7 @@ async fn ouvrir_la_source(
             cadence_envoyee,
         });
     }
-    let (mut rx, decodeur) = ouvrir_decodeur(&source, None, depuis_s, en_direct);
+    let (mut rx, decodeur) = ouvrir_decodeur(&source, None, depuis_s, en_direct, relisible);
     let entete = premier_bloc(&mut rx, attente).await?;
     let Some(cadence_source) = entete.as_deref().and_then(cadence_de_l_entete) else {
         drop(rx);
@@ -785,8 +800,13 @@ async fn ouvrir_la_source(
         // fin, sortie verrouillée. Privé de récepteur, il s'arrête seul au
         // prochain bloc ou quand la source ferme.
         drop((rx, decodeur));
-        let (mut rx, decodeur) =
-            ouvrir_decodeur(&source, Some(cadence_envoyee), depuis_s, en_direct);
+        let (mut rx, decodeur) = ouvrir_decodeur(
+            &source,
+            Some(cadence_envoyee),
+            depuis_s,
+            en_direct,
+            relisible,
+        );
         match premier_bloc(&mut rx, attente)
             .await?
             .as_deref()

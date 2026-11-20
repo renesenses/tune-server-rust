@@ -1554,14 +1554,48 @@ pub fn build_signal_path_lang(
     })
 }
 
+/// 19/11/2026 — ce que la compensation de la réserve laisse d'écart avec la
+/// lecture sans suréchantillonnage, en clair et traduit : niveaux égaux,
+/// compensée en partie (volume entre −3 et 0 dB), ou rien de compensé
+/// (volume à 100 %, le niveau se règle au DAC ou au préampli). `None` quand
+/// la sortie ne dit pas l'écart.
+pub(super) fn note_de_niveau_du_surechantillonneur(
+    lang: &str,
+    reserve_db: f64,
+    ecart_db: Option<f64>,
+) -> Option<(bool, String)> {
+    let ecart = ecart_db?;
+    // Au centième de dB près : l'écart est rangé en centièmes.
+    if ecart > -0.01 {
+        return Some((true, fs(lang, "upsampling_level_matched", &[])));
+    }
+    let ecart_txt = format!("{:.1}", -ecart);
+    if ecart <= reserve_db + 0.01 {
+        return Some((
+            false,
+            fs(
+                lang,
+                "upsampling_level_full_volume",
+                &[&ecart_txt, &format!("{:.1}", -reserve_db)],
+            ),
+        ));
+    }
+    Some((false, fs(lang, "upsampling_level_partial", &[&ecart_txt])))
+}
+
 /// #7614 — l'étape du greffon de suréchantillonnage quand il porte la
 /// cadence : jamais bit-perfect, filtre et réserve de niveau affichés.
+///
+/// 19/11/2026 — et ce que la compensation de cette réserve laisse d'écart
+/// avec la lecture sans lui (`level_gap_db`, `level_matched`), dit aussi
+/// dans la description.
 pub(super) fn etape_du_surechantillonneur_lang(
     lang: &str,
     de: u32,
     vers: u32,
     filtre: &str,
     reserve_db: f64,
+    ecart_db: Option<f64>,
 ) -> Value {
     let khz = |hz: u32| {
         let k = f64::from(hz) / 1000.0;
@@ -1571,24 +1605,36 @@ pub(super) fn etape_du_surechantillonneur_lang(
             format!("{k:.1}")
         }
     };
-    json!({
+    let mut description = fs(
+        lang,
+        "upsampling",
+        &[
+            &format!("{} kHz \u{2192} {} kHz", khz(de), khz(vers)),
+            filtre,
+            &format!("{reserve_db:.2}"),
+        ],
+    );
+    let note = note_de_niveau_du_surechantillonneur(lang, reserve_db, ecart_db);
+    if let Some((_, texte)) = &note {
+        description.push_str(" \u{b7} ");
+        description.push_str(texte);
+    }
+    let mut etape = json!({
         "name": "Upsampler",
         "code": "upsampling",
         "from_hz": de,
         "to_hz": vers,
         "filter": filtre,
         "headroom_db": reserve_db,
-        "description": fs(
-            lang,
-            "upsampling",
-            &[
-                &format!("{} kHz \u{2192} {} kHz", khz(de), khz(vers)),
-                filtre,
-                &format!("{reserve_db:.2}"),
-            ],
-        ),
+        "description": description,
         "bit_perfect": false,
-    })
+    });
+    if let (Some(ecart), Some((egal, texte))) = (ecart_db, note) {
+        etape["level_gap_db"] = json!(ecart);
+        etape["level_matched"] = json!(egal);
+        etape["level_note"] = json!(texte);
+    }
+    etape
 }
 
 /// #7614 — le greffon de suréchantillonnage RÉGLÉ sur la zone mais qui ne
@@ -1608,16 +1654,24 @@ pub(super) fn etat_du_surechantillonneur_lang(
     if let Some((filtre, reserve_db)) = transformations_reelles.and_then(|t| t.surechantillonnage())
     {
         let t = transformations_reelles?;
-        return Some((
-            json!({
-                "active": true,
-                "from_hz": t.entree().cadence(),
-                "to_hz": t.ouvert().cadence,
-                "filter": filtre,
-                "headroom_db": reserve_db,
-            }),
-            Value::Null,
-        ));
+        let mut etat = json!({
+            "active": true,
+            "from_hz": t.entree().cadence(),
+            "to_hz": t.ouvert().cadence,
+            "filter": filtre,
+            "headroom_db": reserve_db,
+        });
+        // 19/11/2026 — l'écart de niveau qui reste, réserve compensée.
+        let ecart = t.ecart_de_niveau_surechantillonnage();
+        if let (Some(ecart), Some((egal, texte))) = (
+            ecart,
+            note_de_niveau_du_surechantillonneur(lang, reserve_db, ecart),
+        ) {
+            etat["level_gap_db"] = json!(ecart);
+            etat["level_matched"] = json!(egal);
+            etat["level_note"] = json!(texte);
+        }
+        return Some((etat, Value::Null));
     }
     if !reglages.enabled {
         return None;
@@ -1897,6 +1951,20 @@ fn assembler_les_etapes_lang(
         variante_hls_refusee,
         ..
     } = analyse.source;
+    // #8809 — nommer le fil PCM observé, dans l’étape ET dans le résumé.
+    // Le mode demandé ne prouve ni du DoP ni du DSD natif.
+    let output_format_name = if output_type == "local"
+        && is_dsd
+        && !ps.dop_active
+        && wire_sample_rate
+            .zip(wire_bit_depth)
+            .is_some_and(|(rate, bits)| {
+                rate > 0 && bits > 0 && !is_dsd_resolution(rate as i32, i32::from(bits))
+            }) {
+        "PCM"
+    } else {
+        output_format_name
+    };
     let Traitements {
         eq_step_description,
         replaygain_step,
@@ -2322,6 +2390,7 @@ fn assembler_les_etapes_lang(
             t.ouvert().cadence,
             filtre,
             reserve_db,
+            t.ecart_de_niveau_surechantillonnage(),
         ));
     } else if let Some(t) = reel.filter(|t| t.reechantillonnage()) {
         let src_khz = t.entree().cadence() / 1000;
@@ -4082,3 +4151,7 @@ mod repli_de_demarrage_6452_tests {
         assert_eq!(detail_du_transport("dlna", None, Some("asio")), None);
     }
 }
+
+#[cfg(test)]
+#[path = "signal_path_dsd_pcm_8809_tests.rs"]
+mod dsd_pcm_8809_tests;

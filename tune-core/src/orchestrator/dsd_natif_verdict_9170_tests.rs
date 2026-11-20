@@ -191,3 +191,110 @@ fn sondage_et_orchestrateur_passent_par_la_regle() {
     assert!(resolve.contains("if !capacite::a_resonder(&nom) {"));
     assert!(resolve.contains("return sortie_alsa_apres_sonde(r);"));
 }
+
+/// Relecture #9211 — garde de #8248 : une piste PCM sur une zone « Natif »
+/// dont la sortie locale n'a jamais été sondée demande UN sondage à
+/// l'ouverture ; rien sinon.
+#[test]
+fn une_piste_pcm_d_une_zone_native_inconnue_demande_le_sondage() {
+    use super::sortie_a_sonder_pour_une_piste_pcm as demande;
+    use crate::audio::formats::AudioFormat;
+    let natif = || "native".to_string();
+    let id = "local:9211 Z8 jamais sonde";
+    assert_eq!(
+        demande(true, Some(AudioFormat::Flac), Some(id), natif),
+        Some("9211 Z8 jamais sonde")
+    );
+    assert_eq!(
+        demande(true, Some(AudioFormat::Flac), Some(id), || "dop".into()),
+        None,
+        "zone non « Natif » : rien"
+    );
+    assert_eq!(
+        demande(true, Some(AudioFormat::Dsd), Some(id), natif),
+        None,
+        "piste DSD : la résolution DSD s'en charge"
+    );
+    assert_eq!(
+        demande(false, Some(AudioFormat::Flac), Some(id), natif),
+        None
+    );
+    let connu = "9211 Z8 deja sonde";
+    retenir(connu, CapaciteConnue::AlsaDsdU32 { cadences: vec![] });
+    assert_eq!(
+        demande(
+            true,
+            Some(AudioFormat::Flac),
+            Some(&format!("local:{connu}")),
+            natif
+        ),
+        None,
+        "sortie déjà sondée : rien"
+    );
+
+    // Et la condition est BRANCHÉE : appelée hors de sa définition, suivie de
+    // la demande.
+    let src = std::fs::read_to_string("src/orchestrator/resolve_local.rs").unwrap();
+    let appel = "if let Some(nom) = sortie_a_sonder_pour_une_piste_pcm(";
+    let i = src
+        .find(appel)
+        .expect("la garde de #8248 n'est plus appelée");
+    assert!(
+        src[i..i + 600].contains("demander_sondage_a_l_ouverture(nom)"),
+        "la garde de #8248 ne pose plus la demande"
+    );
+}
+
+/// Relecture #9211 — un album DSD sur une sortie inconnue : la piste
+/// précédente tient le PCM à chaque résolution (« occupé »), mais
+/// l'ouverture de la piste, PCM libre, sonde quand même ; dès qu'elle a
+/// répondu, la piste suivante part en natif (comportement de la rc12).
+#[test]
+fn un_occupe_a_la_resolution_n_empeche_pas_le_sondage_a_l_ouverture() {
+    use crate::outputs::capacite_dsd_natif::{
+        a_resonder_a_l_ouverture, demander_sondage_a_l_ouverture,
+    };
+    let nom = "9211 album DSD occupe";
+    // Piste 1 : résolution, PCM tenu par la piste précédente.
+    let r = ResultatSondeDsdAlsa::Occupe;
+    r.retenir(nom);
+    demander_sondage_a_l_ouverture(nom);
+    assert_eq!(sortie_alsa_apres_sonde(r), SortieDsdLocale::AlsaNonSondee);
+    // Ouverture de la piste 1, PCM libre : le sondage DOIT avoir lieu.
+    assert!(
+        a_resonder_a_l_ouverture(nom),
+        "un « occupé » vu à la résolution a armé l'espacement : l'album part en DoP"
+    );
+    ResultatSondeDsdAlsa::Sonde {
+        cadences: cadences_z8(),
+        voies: 2,
+    }
+    .retenir_a_l_ouverture(nom);
+    // Piste 2 : la capacité est connue, natif.
+    assert!(!a_resonder(nom));
+    let sortie = SortieDsdLocale::Alsa {
+        cadences: cadences_z8(),
+        voies: 2,
+    };
+    assert_eq!(decider_dsd512(&sortie), Ok(()));
+    assert_eq!(
+        connue(nom),
+        Some(CapaciteConnue::AlsaDsdU32 {
+            cadences: cadences_z8()
+        })
+    );
+}
+
+/// Contre-témoin : un échec À L'OUVERTURE espace bien le sondage suivant.
+#[test]
+fn un_echec_a_l_ouverture_espace_le_suivant() {
+    use crate::outputs::capacite_dsd_natif::{
+        a_resonder_a_l_ouverture, demander_sondage_a_l_ouverture,
+    };
+    let nom = "9211 occupe a l'ouverture";
+    demander_sondage_a_l_ouverture(nom);
+    assert!(a_resonder_a_l_ouverture(nom));
+    ResultatSondeDsdAlsa::Occupe.retenir_a_l_ouverture(nom);
+    demander_sondage_a_l_ouverture(nom);
+    assert!(!a_resonder_a_l_ouverture(nom), "30 s d'espacement attendus");
+}

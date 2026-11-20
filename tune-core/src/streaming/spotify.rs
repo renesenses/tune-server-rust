@@ -757,7 +757,7 @@ impl SpotifyService {
         let redirect_uri = effective_redirect_uri(redirect_uri, api_port);
         if let Some(refus) = refus_redirection(&redirect_uri) {
             warn!(
-                redirect_uri = %redirect_uri,
+                redirect_uri = %crate::confidentialite::masquer_url(&redirect_uri),
                 refus = refus.code(),
                 "spotify_redirect_uri_refusee: Spotify n'accepte en http:// que \
                  http://127.0.0.1:<port> ou http://[::1]:<port> ; sinon HTTPS"
@@ -1494,6 +1494,8 @@ impl SpotifyService {
             track_count: item["total_tracks"].as_u64().unwrap_or(0) as u32,
             released_at: None,
             quality: None,
+            genre_id: None,
+            genre_name: None,
         }
     }
 
@@ -2513,6 +2515,8 @@ impl StreamingService for SpotifyService {
         genre_id: &str,
         limit: usize,
     ) -> Result<Vec<StreamAlbum>, TuneError> {
+        // L'API Web de Spotify répond 400 « Invalid limit » au-delà de 50.
+        let limit = limit.min(50);
         let Some(data) = self
             .lire_ou_retire(
                 &format!("/browse/categories/{genre_id}/playlists?limit={limit}"),
@@ -2551,6 +2555,8 @@ impl StreamingService for SpotifyService {
                             track_count: 0,
                             released_at: None,
                             quality: None,
+                            genre_id: None,
+                            genre_name: None,
                         });
                         if albums.len() >= limit {
                             break;

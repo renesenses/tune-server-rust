@@ -1479,7 +1479,9 @@ async fn partager_entre_membres(
 }
 
 /// `PUT|DELETE /member-of/{id}/show-me` (membre) : l'entrée `member_of`,
-/// avec `show_me` ; 404 hors membre, 409 `circle_not_shared`.
+/// avec `show_me` ; 404 hors membre. Comme le site : 409 `circle_not_shared`
+/// pour `PUT` seulement, `DELETE` rend 200 (idempotent) même sur un cercle
+/// qui n'est plus partagé.
 async fn me_montrer(
     m: Method,
     State(e): State<Partage>,
@@ -1497,7 +1499,7 @@ async fn me_montrer(
     let Some(k) = position(&f.member_of, "circle_id", &id) else {
         return introuvable();
     };
-    if f.member_of[k]["members_see_each_other"] != json!(true) {
+    if m == Method::PUT && f.member_of[k]["members_see_each_other"] != json!(true) {
         return refus(StatusCode::CONFLICT, "circle_not_shared");
     }
     f.member_of[k]["show_me"] = json!(m == Method::PUT);

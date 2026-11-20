@@ -310,7 +310,7 @@ impl DlnaOutput {
             device = %self.name,
             mode = mode.as_str(),
             action,
-            uri = %pose.url,
+            uri = %crate::confidentialite::masquer_url(&pose.url),
             // Toujours vrai aujourd'hui : écrit pour que le journal le dise.
             uri_identique_a_la_pose = true,
             titre = %titre.titre,

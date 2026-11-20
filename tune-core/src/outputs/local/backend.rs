@@ -408,9 +408,23 @@ pub(super) struct BackendCpal<'a> {
     recopie_possible: bool,
     /// #6132 — les sorties suiveuses, vivantes tant que le backend l'est.
     secondes: Option<super::sortie_double_locale::SecondesSorties>,
+    /// #8869 — le silence de verrouillage dont le puits sera précédé.
+    verrouillage: Option<crate::audio::silence_de_verrouillage::SilenceDeVerrouillage>,
 }
 
 impl BackendCpal<'_> {
+    /// #8869 — le puits rendu par [`BackendLocal::puits`] sera précédé du
+    /// silence de verrouillage. Le rendu de ce backend ne démarre qu'après le
+    /// pré-remplissage : le silence est plafonné à la capacité de l'anneau
+    /// moins un quart de seconde, pour que l'anneau ne soit jamais plein
+    /// avant que le rendu ne le vide.
+    pub(super) fn preceder_d_un_silence(
+        &mut self,
+        verrouillage: crate::audio::silence_de_verrouillage::SilenceDeVerrouillage,
+    ) {
+        self.verrouillage = Some(verrouillage);
+    }
+
     /// #7614 — la cadence que ce flux a ouverte pour le suréchantillonneur.
     /// `None` : le greffon ne tourne pas sur ce flux (désactivé, PURE, DoP,
     /// cadences non mesurées, aucun multiple entier accepté, ou le flux
@@ -1289,6 +1303,7 @@ impl<'a> BackendCpal<'a> {
             recopie,
             recopie_possible,
             secondes: None,
+            verrouillage: None,
         })
     }
 }
@@ -1307,12 +1322,28 @@ impl<'a> BackendLocal<'a> for BackendCpal<'a> {
     }
 
     fn puits(&self) -> Puits<'a> {
-        Puits::Flottant(Box::new(PuitsAnneauCpal {
+        let anneau = Box::new(PuitsAnneauCpal {
             anneau: self.anneau.clone(),
             stop_rx: self.stop_rx,
             paused: self.paused,
             force_silent: self.force_silent,
-        }))
+        });
+        match &self.verrouillage {
+            Some(verrouillage) => {
+                let canaux = usize::from(self.sortie.canaux.max(1));
+                let plafond = (self.anneau.capacity() / canaux)
+                    .saturating_sub(self.sortie.cadence as usize / 4);
+                Puits::Flottant(Box::new(
+                    super::silence_de_verrouillage_8869::PuitsFlottantVerrouille::nouveau(
+                        anneau,
+                        self.sortie,
+                        verrouillage.clone(),
+                        Some(plafond),
+                    ),
+                ))
+            }
+            None => Puits::Flottant(anneau),
+        }
     }
 
     fn demarrer(&mut self) -> Result<(), RefusDOuverture> {

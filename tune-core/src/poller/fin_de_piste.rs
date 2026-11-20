@@ -43,6 +43,10 @@ impl PositionPoller {
         let fin_sur_erreur = crate::playback::radio_fin_de_file::prendre_fin_sur_erreur(zone_id);
         if !fin_sur_erreur {
             self.noter_la_ligne_courante_jouee(zone_id, zone_state.queue_position);
+            // #9143 — la fin naturelle achève la piste, même courte ou
+            // passée entre deux relevés du sondeur.
+            self.orchestrator
+                .noter_piste_achevee_pour_le_sas(zone_state, true);
         }
 
         let Some(next_pos) = Self::next_position(zone_state) else {
@@ -1030,7 +1034,7 @@ impl PositionPoller {
             etat = ?status.state,
             position_ms = status.position_ms,
             position_figee_ms = adoption.position_figee_ms,
-            uri = ?status.current_uri,
+            uri = ?status.current_uri.as_deref().map(crate::confidentialite::masquer_url),
             stream_id = %adoption.flux,
             octets_tires = ?octets_tires,
             octets_depuis_adoption = ?octets_depuis_adoption,
@@ -1109,7 +1113,7 @@ impl PositionPoller {
             wall_secs = wall_elapsed,
             past_end_ticks = ps.past_end_ticks,
             stream_id = %flux,
-            uri = ?status.current_uri,
+            uri = ?status.current_uri.as_deref().map(crate::confidentialite::masquer_url),
             octets_tires = ?octets_tires,
             preuve = ?preuve,
             arm_to_advance_ms = ps
@@ -1214,7 +1218,7 @@ impl PositionPoller {
         warn!(
             zone_id,
             position_ms = status.position_ms,
-            uri = ?status.current_uri,
+            uri = ?status.current_uri.as_deref().map(crate::confidentialite::masquer_url),
             flux_fini = ?flux_fini,
             flux_arme = ?flux_arme,
             "gapless_retombee_sur_la_piste_finie_surveillee"
@@ -1753,7 +1757,7 @@ impl PositionPoller {
         if tenue == crate::outputs::traits::SuivantePreparee::Perdue {
             notes.remove(&zone_id);
             drop(notes);
-            self.retenir_dsd_suivant_lache(zone_id, device_id, "suivante_perdue");
+            self.retenir_dsd_suivant_lache(zone_id, device_id, "suivante_perdue", true);
             return;
         }
         notes.insert(zone_id, device_id.to_string());
@@ -1768,18 +1772,64 @@ impl PositionPoller {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&zone_id);
         if let Some(appareil) = appareil {
-            self.retenir_dsd_suivant_lache(zone_id, &appareil, "avance_bloquee");
+            self.retenir_dsd_suivant_lache(zone_id, &appareil, "avance_bloquee", false);
         }
     }
 
-    fn retenir_dsd_suivant_lache(&self, zone_id: i64, device_id: &str, motif: &str) {
-        if self.orchestrator.retenir_dsd_suivant_lache(device_id) {
+    /// #9206 — le suivant armé de `zone_id` a été SUIVI (le renderer y est
+    /// passé sans `Play`) : si c'était un suivant DSD sur DLNA, l'appareil
+    /// est blanchi — échecs et récidive oubliés. Deux faux échecs séparés
+    /// par des transitions réussies ne font pas un récidiviste.
+    pub(super) fn constater_le_suivant_suivi(&self, zone_id: i64) {
+        let appareil = self
+            .dsd_suivant_arme
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&zone_id);
+        if let Some(appareil) = appareil
+            && self.orchestrator.noter_succes_dsd_suivant(&appareil)
+        {
             info!(
+                zone_id,
+                device_id = %appareil,
+                "gapless_dsd_next_dlna_suivi — échecs de suivant DSD oubliés (#9206)"
+            );
+        }
+    }
+
+    fn retenir_dsd_suivant_lache(
+        &self,
+        zone_id: i64,
+        device_id: &str,
+        motif: &str,
+        immediat: bool,
+    ) {
+        use crate::playback::gapless::IssueEchecDsdSuivant;
+        match self
+            .orchestrator
+            .retenir_dsd_suivant_lache(device_id, immediat)
+        {
+            IssueEchecDsdSuivant::Note { echecs } => info!(
                 zone_id,
                 device_id,
                 motif,
-                "gapless_dsd_next_dlna_non_suivi — garde DSD rendue à cet appareil jusqu'au redémarrage"
-            );
+                echecs,
+                "gapless_dsd_next_dlna_echec_note — suivant DSD encore tenté (#9206)"
+            ),
+            IssueEchecDsdSuivant::GardeRendue {
+                echecs,
+                garde,
+                duree,
+            } => info!(
+                zone_id,
+                device_id,
+                motif,
+                echecs,
+                garde,
+                duree_secs = duree.as_secs(),
+                "gapless_dsd_next_dlna_non_suivi — garde DSD rendue à cet appareil, réessai après le délai"
+            ),
+            IssueEchecDsdSuivant::DejaGarde => {}
         }
     }
 }

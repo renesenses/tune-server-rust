@@ -225,6 +225,11 @@ jobs:
             psql -h localhost -U tune -d tune_test -v ON_ERROR_STOP=1 -q -f "$migration"
           done
 
+      - name: Format UPnP conservé dans la file PostgreSQL (#8788)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8788 -- --nocapture --test-threads=1
+
       - name: Déplacement de bloc concurrent sur PostgreSQL (#8849)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
@@ -281,6 +286,15 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7974 -- --nocapture --test-threads=1
+
+      # #9028 — « Normal pour les N pistes de cet album » : une ligne par
+      # piste dans une transaction (tout ou rien), annulation exacte, filtre
+      # d'une piste CUE, sur un vrai PostgreSQL. Sans cette étape, l'épreuve
+      # prendrait son saut annoncé.
+      - name: Geste groupé des alertes douteuses sur PostgreSQL (#9028)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_9028 -- --nocapture --test-threads=1
 
       # #8088 — contrôle parental : `tracks.explicit` (PG 107) sur une VRAIE
       # base : écrit, relu, gardé hors scan, retiré par le scan, marques des
@@ -1310,6 +1324,12 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features postgres,oaat pg_7983 -- --nocapture --test-threads=1
+
+      # #8864 — vraie gravure DR, marque conservée, réessai 503 et scan extérieur.
+      - name: Gravure DR et marque d'enrichissement sur PostgreSQL (#8864)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features postgres,oaat gravure_conserve_enrichissement_8864 -- --nocapture --test-threads=1
 
       # #8679 — « Albums douteux » : l'artiste du dossier écrit en base (piste
       # rattachée à l'artiste existant, album d'un seul artiste), sur le
