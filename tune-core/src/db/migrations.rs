@@ -2964,10 +2964,21 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         name: "radio_fin_de_file_coupee_par_defaut",
         up: SQL_RADIO_FIN_DE_FILE_COUPEE_PAR_DEFAUT,
     },
+    Migration {
+        version: 156,
+        name: "queue_items_format_streaming",
+        up: "",
+    },
 ];
 
-/// Pose `albums.release_country` et `albums.release_country_mbid` (#8668) —
-/// bloc de version de la 154 et passe finale.
+/// #8788 — le format des pistes UPnP, migration 156 et réparation idempotente.
+fn format_des_elements_de_file(db: &SqliteDb) {
+    add_column_if_missing(db, "queue_items", "media_format", "TEXT");
+    add_column_if_missing(db, "queue_items", "sample_rate", "INTEGER");
+    add_column_if_missing(db, "queue_items", "bit_depth", "INTEGER");
+}
+
+/// Pose le pays d'édition MusicBrainz (#8668), migration 154 et passe finale.
 fn pays_des_editions(db: &SqliteDb) {
     add_column_if_missing(db, "albums", "release_country", "TEXT");
     add_column_if_missing(db, "albums", "release_country_mbid", "TEXT");
@@ -4462,6 +4473,9 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // Index des identifiants d'enregistrement (#2264).
             index_des_identifiants_d_enregistrement(db);
         }
+        if migration.version == 156 {
+            format_des_elements_de_file(db);
+        }
         if migration.version == 123 {
             // L'artiste d'une piste de service chez son service (#6079). Sans
             // défaut : NULL = INCONNU pour toute ligne existante.
@@ -5050,6 +5064,12 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             ON streaming_hidden_items(item_type, source, source_id);",
     )
     .ok();
+    // #9158 (Rob) — la marque d'origine « scan » des tags Tune tirés des
+    // balises personnelles. SANS migration numérotée, comme
+    // `streaming_hidden_items` : table neuve, additive, posée à CHAQUE
+    // démarrage ; le CORE_SCHEMA de `sqlite.rs` la porte aussi. Jumelles :
+    // `ENSURE_TABLES` et `PG_FULL_SCHEMA` (PostgreSQL).
+    db.execute_batch(super::tags_perso_repo::DDL_SQLITE).ok();
     // Réponses `/release/{mbid}` de MusicBrainz gardées en base (#4805, idée 3
     // de MetaRust). SANS migration numérotée, pour la raison écrite juste
     // au-dessus pour `streaming_hidden_items` : une table neuve n'en a pas
@@ -5142,6 +5162,7 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // #6079) — posé ICI aussi : l'écriture de la file le NOMME, et une base
     // arrivée sans lui ne pourrait plus rien mettre en file. PG : migration 087.
     add_column_if_missing(db, "queue_items", "artist_ref", "TEXT");
+    format_des_elements_de_file(db);
     // La note de la piste (migration 124, #6123) — posée ICI aussi : l'INSERT
     // et l'UPDATE des pistes la NOMMENT, et une base arrivée sans elle ne
     // pourrait plus rien scanner. PG : migration 088.
@@ -6364,6 +6385,11 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         122,
         "radio_fin_de_file_coupee_par_defaut",
         include_str!("../../migrations/postgres/122_radio_fin_de_file_coupee_par_defaut.sql"),
+    ),
+    (
+        123,
+        "queue_items_format_streaming",
+        include_str!("../../migrations/postgres/123_queue_items_format_streaming.sql"),
     ),
 ];
 
@@ -10323,7 +10349,8 @@ mod tests {
         // 122 : `radio_fin_de_file_coupee_par_defaut` (#8974), jumelle de la
         // SQLite 155. Migration de DONNÉES : annule la bascule de la 118
         // (neutralisée) là où elle a eu lieu, DEFAULT '0'.
-        assert_eq!(pg_latest_version(), 122, "latest PG migration must be 122");
+        // 123 : format des pistes UPnP en file (#8788), SQLite 156.
+        assert_eq!(pg_latest_version(), 123, "latest PG migration must be 123");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

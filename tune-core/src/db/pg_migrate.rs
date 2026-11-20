@@ -157,6 +157,10 @@ const MIGRATION_TABLES: &[&str] = &[
     "radio_favorites",
     "tags",
     "item_tags",
+    // Marques d'origine « scan » des tags (#9158). Sans cette ligne, toutes
+    // les poses du scan deviendraient MANUELLES à la bascule : le scan ne
+    // pourrait plus retirer un tag dont la balise a quitté le fichier.
+    "item_tags_scan",
     // Etiquettes posees sur un album de streaming (#3699). Sans cette ligne,
     // tout l'etiquetage du catalogue Qobuz/Tidal/Bandcamp serait perdu a la
     // bascule SQLite -> PostgreSQL — et c'est justement sur le streaming que
@@ -929,6 +933,10 @@ ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_ref TEXT;
 -- L'artiste d'une piste de service chez son service (#6079, PG 087 / SQLite
 -- 122). En ALTER pour la même raison que juste au-dessus.
 ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS artist_ref TEXT;
+ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS media_format TEXT;
+ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS sample_rate INTEGER;
+ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS bit_depth INTEGER;
+
 -- Le conteneur de chaque élément de file (#6466, PG 092 / SQLite 128).
 ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS context_type TEXT;
 ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS context_id TEXT;
@@ -957,6 +965,17 @@ CREATE TABLE IF NOT EXISTS streaming_item_tags (
     created_at TEXT NOT NULL DEFAULT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
     PRIMARY KEY (tag_id, item_type, source, source_id)
 );
+
+-- Marque d'origine « scan » des tags tirés des balises personnelles (#9158).
+-- BIGINT et non TEXT, comme `streaming_item_tags` : comparée a `tags.id` et
+-- `item_tags.item_id`, que la migration 012 remet en BIGINT.
+CREATE TABLE IF NOT EXISTS item_tags_scan (
+    tag_id BIGINT NOT NULL,
+    item_type TEXT NOT NULL,
+    item_id BIGINT NOT NULL,
+    PRIMARY KEY (tag_id, item_type, item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_item_tags_scan_item ON item_tags_scan(item_type, item_id);
 
 -- Titres de SERVICE bannis (#4806) — jumelle de `hidden_items` pour la paire
 -- `source` + `source_id`. `profile_id` en BIGINT et non TEXT : la copie lie
@@ -1983,6 +2002,8 @@ fn conflict_clause(table: &str) -> &'static str {
         "radio_favorites" => "ON CONFLICT (title, artist) DO NOTHING",
         "favorites" => "ON CONFLICT (profile_id, item_type, item_id) DO NOTHING",
         "item_tags" => "ON CONFLICT (tag_id, item_type, item_id) DO NOTHING",
+        // Pas de colonne `id` : la clef est le triplet (#9158).
+        "item_tags_scan" => "ON CONFLICT (tag_id, item_type, item_id) DO NOTHING",
         // Cette table n'a PAS de colonne `id` : la clause par defaut
         // `ON CONFLICT (id)` ci-dessous echouerait sur elle (#3699).
         "streaming_item_tags" => "ON CONFLICT (tag_id, item_type, source, source_id) DO NOTHING",
@@ -2566,6 +2587,9 @@ mod tests {
         let cible = base_jetable(&url, BASE).await;
         let sqlite = sqlite_de_depart();
         let item = |source: &str, id: &str| QueueInput::Streaming {
+            media_format: None,
+            sample_rate: None,
+            bit_depth: None,
             source: source.into(),
             source_id: id.into(),
             title: id.into(),
@@ -2580,6 +2604,7 @@ mod tests {
         };
         let reprise = Resume {
             resume_key: "cle-reprise".into(),
+            profile_id: None,
             context_type: "playlist".into(),
             context_id: "mixte".into(),
             source: "qobuz".into(),

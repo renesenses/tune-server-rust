@@ -1418,6 +1418,16 @@ fn find_daemon_binary() -> String {
         .unwrap_or(exe_name)
 }
 
+/// #8944 — le chemin du démon que [`Airplay2Output`] lancerait, s'il en
+/// trouve un : celui d'à côté du binaire, un emplacement connu, ou le `PATH`.
+/// Le rapport de bogue le compare à celui que la mise à jour remplace.
+pub fn chemin_du_demon_lance() -> Option<String> {
+    let exe_name = daemon_exe_name();
+    let exe = std::env::current_exe().ok();
+    let exe_dir = exe.as_deref().and_then(|p| p.parent());
+    resolve_daemon_path(exe_dir, &exe_name).or_else(|| which_daemon(&exe_name))
+}
+
 /// Check if the airplay-daemon binary is available on this system.
 pub fn daemon_available() -> bool {
     let exe_name = daemon_exe_name();

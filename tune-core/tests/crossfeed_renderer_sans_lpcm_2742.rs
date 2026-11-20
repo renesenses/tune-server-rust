@@ -343,6 +343,9 @@ async fn un_renderer_sans_lpcm_entend_le_crossfeed_sur_un_flux_de_service_2742()
         .append(
             b.zone_id,
             &[QueueInput::Streaming {
+                media_format: None,
+                sample_rate: None,
+                bit_depth: None,
                 source: SERVICE.into(),
                 source_id: PISTE.into(),
                 title: "Flux 2742".into(),

@@ -961,6 +961,9 @@ CREATE TABLE IF NOT EXISTS queue_items (
     disc_number INTEGER,
     album_ref TEXT,
     artist_ref TEXT,
+    media_format TEXT,
+    sample_rate INTEGER,
+    bit_depth INTEGER,
     context_type TEXT,
     context_id TEXT,
     context_source TEXT,
@@ -1058,6 +1061,19 @@ CREATE TABLE IF NOT EXISTS streaming_hidden_items (
     PRIMARY KEY (profile_id, item_type, source, source_id)
 );
 CREATE INDEX IF NOT EXISTS idx_streaming_hidden_items_item ON streaming_hidden_items(item_type, source, source_id);
+
+-- Marque d'origine « scan » des tags Tune tirés des balises personnelles
+-- (#9158) : une ligne = la pose de même clé dans `item_tags` vient du scan,
+-- qui peut donc la retirer. Sans migration numérotée, comme
+-- `streaming_hidden_items` : présente AUSSI dans le rattrapage de
+-- `run_migrations` (bases existantes).
+CREATE TABLE IF NOT EXISTS item_tags_scan (
+    tag_id INTEGER NOT NULL,
+    item_type TEXT NOT NULL,
+    item_id INTEGER NOT NULL,
+    PRIMARY KEY (tag_id, item_type, item_id)
+);
+CREATE INDEX IF NOT EXISTS idx_item_tags_scan_item ON item_tags_scan(item_type, item_id);
 
 -- « Pas pour moi » sur une suggestion de l'accueil (web#916, migration 145),
 -- par profil. Ne retire RIEN de la bibliothèque : seules les rangées de

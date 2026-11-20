@@ -40,12 +40,13 @@ impl PositionPoller {
                     tracing::warn!(zone_id = s.zone_id, error = %e, "reprise_contexte_non_retiree");
                 }
                 if let Some(np) = s.now_playing.as_ref().filter(|np| np.source == "podcast") {
-                    if let Err(e) = crate::db::listening_resume::podcast_started_in_context(
+                    if let Err(e) = crate::db::listening_resume::podcast_started_du_profil(
                         &self.db,
                         s.zone_id,
                         np,
                         s.position_ms,
                         s.session_context_id.as_deref(),
+                        s.session_profile_id,
                     ) {
                         tracing::warn!(zone_id = s.zone_id, error = %e, "reprise_podcast_non_enregistree");
                     }
@@ -2029,6 +2030,7 @@ impl PositionPoller {
                                 preuve = ?adoption.preuve,
                                 "gapless_adoption_horloge_confirmee"
                             );
+                            self.constater_le_suivant_suivi(zone_id);
                             ps.adoption_horloge = None;
                         }
                         decisions::SuiteAdoption::Infirmee => {
@@ -2047,6 +2049,8 @@ impl PositionPoller {
                                 "gapless_adoption_horloge_infirmee_relance"
                             );
                             ps.adoption_horloge = None;
+                            // #9206 — le renderer n'a pas suivi le flux armé.
+                            self.constater_le_suivant_non_suivi(zone_id);
                             poll_states.remove(&zone_id);
                             let position = zone_state.queue_position;
                             if let Err(e) =
@@ -2451,6 +2455,12 @@ impl PositionPoller {
                         )
                         .await;
                         info!(zone_id, next_pos, "gapless_advance_on_position_reset");
+                        // #9206 — le renderer a suivi le flux armé de lui-même.
+                        // Pas s'il nomme encore la piste finie (#5411) : l'avance
+                        // n'est que provisoire, la surveillance tranchera.
+                        if rejeu.is_none() {
+                            self.constater_le_suivant_suivi(zone_id);
+                        }
                         let avance =
                             Box::pin(self.orchestrator.advance_queue_metadata(zone_id, next_pos))
                                 .await;
@@ -3541,6 +3551,9 @@ impl PositionPoller {
                                 std::mem::take(&mut ps.tune_tested_rendu_ms),
                             )
                             .await;
+                            // #9206 — voir la retombée de position : pas de
+                            // constat de suivi sur une avance provisoire.
+                            let suivi_avere = rejeu.is_none();
                             info!(zone_id, next_pos, "gapless_confirmed_advancing_metadata");
                             let avance = Box::pin(
                                 self.orchestrator.advance_queue_metadata(zone_id, next_pos),
@@ -3556,6 +3569,9 @@ impl PositionPoller {
                             // Identity-keyed latch re-arms on the new track;
                             // clearing also covers gapless repeat-one (#1113).
                             ps.scrobbled_key = None;
+                            if suivi_avere {
+                                self.constater_le_suivant_suivi(zone_id);
+                            }
                         }
                     }
                     if ps.track_started_at.is_none() {
@@ -3690,6 +3706,8 @@ impl PositionPoller {
                             // Identity-keyed latch re-arms on the new track;
                             // clearing also covers gapless repeat-one (#1113).
                             ps.scrobbled_key = None;
+                            // #9206 — le renderer a suivi le flux armé.
+                            self.constater_le_suivant_suivi(zone_id);
                         } else {
                             Box::pin(self.handle_track_end(zone_id, zone_state)).await;
                         }
@@ -4128,7 +4146,41 @@ impl PositionPoller {
                         // L'appareil qui n'annonce rien, qui ne retient rien,
                         // ou qui refuse le `Next` garde le repli d'aujourd'hui
                         // sans qu'une seule ligne change pour lui.
+                        // #9206 (fil 2961) — le renderer vient d'OUVRIR le
+                        // flux armé et le lit (`bytes=0-` puis `bytes=28-`),
+                        // mais nomme encore la piste finie : il bascule, son
+                        // URI retarde. Conclure ici coupait la transition (~2,5 s
+                        // de blanc) et lui retirait le sans-blanc DSD. Pour un
+                        // suivant DSD, la fin est différée, au plus
+                        // `FENETRE_BASCULE_SUR_FLUX_ARME_MS` après le début de
+                        // la lecture ; un flux lu de longue date (DMP-A6,
+                        // #4173) ne diffère rien.
+                        let suivant_dsd_arme = self
+                            .dsd_suivant_arme
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .contains_key(&zone_id);
+                        let lecture_armee_depuis_ms = match flux_arme.as_deref() {
+                            Some(f)
+                                if ps.past_end_ticks >= seuil_ticks
+                                    && suivant_dsd_arme
+                                    && enchainement == decisions::EnchainementArme::Aucun =>
+                            {
+                                self.orchestrator
+                                    .streamer_lecture_au_dela_de_l_en_tete_depuis_ms(f)
+                                    .await
+                            }
+                            _ => None,
+                        };
+                        let bascule_en_cours = ps.past_end_ticks >= seuil_ticks
+                            && decisions::bascule_en_cours_sur_le_flux_arme(
+                                enchainement,
+                                suivant_dsd_arme,
+                                octets_tires,
+                                lecture_armee_depuis_ms,
+                            );
                         let enchainement = if ps.past_end_ticks >= seuil_ticks
+                            && !bascule_en_cours
                             && decisions::bascule_sur_la_suivante_autorisee(
                                 is_dlna,
                                 ps.suivante_preparee,
@@ -4146,7 +4198,20 @@ impl PositionPoller {
                         // ci-dessous consomme `flux_arme`, et c'est justement
                         // sa présence ou son absence qui nomme la branche.
                         let flux_arme_journal = flux_arme.clone().unwrap_or_default();
-                        if let Some(flux) =
+                        if bascule_en_cours {
+                            info!(
+                                zone_id,
+                                position_ms = status.position_ms,
+                                track_dur = track_duration_ms,
+                                past_end_ticks = ps.past_end_ticks,
+                                epingle_piste_finie,
+                                flux_arme = flux_arme_journal.as_str(),
+                                uri_courante = status.current_uri.as_deref().unwrap_or(""),
+                                octets_tires = octets_tires.unwrap_or(0),
+                                lu_depuis_ms = lecture_armee_depuis_ms.unwrap_or(0),
+                                "fin_differee_flux_arme_ouvert"
+                            );
+                        } else if let Some(flux) =
                             flux_arme.filter(|_| enchainement != decisions::EnchainementArme::Aucun)
                         {
                             Box::pin(self.adopter_l_enchainement_a_l_horloge(

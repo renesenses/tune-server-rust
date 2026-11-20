@@ -7278,6 +7278,9 @@ async fn l_historique_garde_la_page_d_une_ecoute_bandcamp_2121() {
         .append(
             zone_id,
             &[QueueInput::Streaming {
+                media_format: None,
+                sample_rate: None,
+                bit_depth: None,
                 source: "bandcamp".into(),
                 source_id: "https://t4.bcbits.com/stream/e4/mp3-128/29192493?ts=1791020000".into(),
                 title: "Meet Her".into(),
@@ -9631,7 +9634,9 @@ async fn audio_offer_crossfeed_hard_cut_preserves_settings_for_premium_reactivat
 #[tokio::test]
 async fn une_uri_de_notre_bibliotheque_n_est_plus_un_episode() {
     let device_id = "dlna-4323";
-    let orch = test_orchestrator();
+    let mut orch = test_orchestrator();
+    // #9207 — l'URI n'est la nôtre que sur le port du serveur.
+    orch.streamer = Arc::new(AudioStreamer::new(8888));
 
     orch.db
         .execute(
@@ -9649,9 +9654,14 @@ async fn une_uri_de_notre_bibliotheque_n_est_plus_un_episode() {
         .execute(
             "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, \
              duration_ms, sample_rate, bit_depth, channels) \
-             VALUES (187500, 'Quartet No. 10', 1, 1, '/aucun/chemin/4323.flac', 'flac', \
+             VALUES (187500, 'Quartet No. 10', 1, 1, ?, 'flac', \
              300000, 44100, 16, 2)",
-            &[],
+            // #9207 — la piste reconnue se résout en piste locale : son
+            // fichier doit exister.
+            &[
+                &concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac")
+                    as &dyn crate::db::backend::ToSqlValue,
+            ],
         )
         .unwrap();
 
@@ -11997,6 +12007,97 @@ async fn remplacer_la_lecture_d_une_zone_dlna_ferme_le_flux_remplace_8404() {
     );
 }
 
+/// #8404 — la course de deux `play` sur la même zone DLNA, rendue
+/// déterministe. La tablette lance la piste 1 ; pendant que sa lecture attend
+/// encore d'être envoyée au renderer (pré-tampon DLNA, sortie lente), le
+/// portable lance la piste 3, qui ferme la session de la piste 1 et part au
+/// renderer. La lecture de la tablette trouve alors son flux mort : elle
+/// arrêtait la zone, écrivait « stopped » en base et diffusait un bandeau
+/// fatal, alors que le renderer jouait la piste du portable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn une_lecture_doublee_pendant_son_envoi_n_arrete_pas_la_gagnante_8404() {
+    use crate::db::backend::ToSqlValue;
+    let device_id = "dlna-marantz-nr1200-course-8404";
+    let (orch, zone_creee, _dir) = zone_reseau_trois_pistes(device_id, false).await;
+    // Identifiant propre au test : le point d'arrêt est un registre global.
+    let zone_id: i64 = 984_404;
+    orch.db
+        .execute(
+            "UPDATE zones SET id = ? WHERE id = ?",
+            &[&zone_id as &dyn ToSqlValue, &zone_creee as &dyn ToSqlValue],
+        )
+        .unwrap();
+
+    let (arrivee, reprise) = super::transport::point_d_arret_8404::armer(zone_id);
+    let tablette = orch.play(PlayRequest {
+        zone_id,
+        track_id: Some(1),
+        source: Some("local".into()),
+        ..Default::default()
+    });
+    let portable = async {
+        // La tablette est retenue juste avant son envoi.
+        arrivee.notified().await;
+        let resultat = orch
+            .play(PlayRequest {
+                zone_id,
+                track_id: Some(3),
+                source: Some("local".into()),
+                ..Default::default()
+            })
+            .await;
+        reprise.notify_one();
+        resultat
+    };
+    let (tablette, portable) = tokio::join!(tablette, portable);
+    let portable = portable.expect("lecture du portable");
+    assert!(
+        portable.output_sent,
+        "le titre du portable part au renderer"
+    );
+    let etat = orch.playback.get_state(zone_id).await;
+    assert_eq!(
+        etat.state,
+        PlayState::Playing,
+        "la lecture doublée a arrêté la zone qui joue le titre du portable"
+    );
+    let np = etat.now_playing.expect("le titre du portable est en cours");
+    assert_eq!(np.track_id, Some(3));
+    let sid_portable = np.stream_id.expect("session du portable");
+    assert_eq!(
+        ZoneRepo::with_backend(orch.db.clone())
+            .get_last_play_state(zone_id)
+            .as_deref(),
+        Some("playing"),
+        "« stopped » écrit en base : la reprise au redémarrage perdrait la lecture"
+    );
+    let vivantes: Vec<String> = {
+        let sessions = orch.streamer.sessions_state();
+        let sessions = sessions.lock().await;
+        sessions.keys().cloned().collect()
+    };
+    assert_eq!(
+        vivantes,
+        vec![sid_portable.clone()],
+        "une seule session vivante"
+    );
+
+    let outputs = orch.outputs.lock().await;
+    let out = outputs.get(device_id).expect("sortie enregistrée");
+    let guard = out.lock().await;
+    let mock = guard.as_any().downcast_ref::<MockOutput>().expect("mock");
+    let url = mock.last_play_url().await.expect("une URL envoyée");
+    assert!(url.contains(&sid_portable), "dernière URL reçue : {url}");
+
+    let tablette = tablette.expect("la lecture doublée n'est pas une erreur");
+    assert!(!tablette.output_sent);
+    assert_eq!(
+        tablette.error.as_deref(),
+        Some(crate::orchestrator::PLAY_SUPERSEDED),
+        "la lecture de la tablette se sait doublée"
+    );
+}
+
 /// #8689 — mesure sur les échantillons, sans sortie audio ni appel réseau.
 /// Le bras réseau utilise cette même chaîne DSP pour les titres de service.
 #[tokio::test]
@@ -12166,4 +12267,63 @@ async fn une_source_directe_http_reste_jouable() {
             .unwrap_or_else(|| resolu.url.clone());
         assert!(vue.starts_with("http"), "valeur rognée attendue : {vue:?}");
     }
+}
+
+#[tokio::test]
+async fn le_format_upnp_suit_lecture_preparation_et_avance_de_file_8788() {
+    use crate::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+    let orch = test_orchestrator();
+    let device = "mock-format-8788";
+    let zone = ZoneRepo::with_backend(orch.db.clone())
+        .create("Format UPnP factice", Some("mock"), Some(device))
+        .unwrap();
+    orch.outputs
+        .lock()
+        .await
+        .register(Box::new(MockOutput::new(device, "Sortie muette")));
+    let items = (0..2)
+        .map(|i| {
+            serde_json::from_value::<QueueInput>(serde_json::json!({"Streaming": {
+                "source": "upnp", "source_id": format!("http://127.0.0.1:9/ressource/{i}"),
+                "title": format!("Piste {i}"), "artist": "Banc", "album": null, "cover_url": null,
+                "duration_ms": 1000, "track_number": null, "disc_number": null,
+                "album_ref": null, "artist_ref": null,
+                "media_format": "wav", "sample_rate": 705600, "bit_depth": 24
+            }}))
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    PlayQueueRepo::with_backend(orch.db.clone())
+        .append(zone, &items)
+        .unwrap();
+    let suivante = orch.resolve_queue_item_url(zone, 1).await.unwrap();
+    assert_eq!(
+        suivante.mime_type, "audio/wav",
+        "#8788 : le préchargement oublie le conteneur UPnP sans extension"
+    );
+    assert_eq!(
+        suivante.sample_rate,
+        Some(705600),
+        "#8788 : le préchargement oublie la cadence"
+    );
+    assert_eq!(suivante.bit_depth, Some(24));
+    orch.play_from_queue(zone, 0).await.unwrap();
+    let premiere = orch.playback.get_state(zone).await.now_playing.unwrap();
+    assert_eq!(
+        premiere.format.as_deref(),
+        Some("wav"),
+        "#8788 : Lire depuis la file oublie le conteneur"
+    );
+    assert_eq!(premiere.sample_rate, Some(705600));
+    assert_eq!(premiere.bit_depth, Some(24));
+    orch.advance_queue_metadata(zone, 1).await.unwrap();
+    let seconde = orch.playback.get_state(zone).await.now_playing.unwrap();
+    assert_eq!(seconde.title, "Piste 1");
+    assert_eq!(
+        seconde.format.as_deref(),
+        Some("wav"),
+        "#8788 : l'avance sans blanc oublie le conteneur"
+    );
+    assert_eq!(seconde.sample_rate, Some(705600));
+    assert_eq!(seconde.bit_depth, Some(24));
 }

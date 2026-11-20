@@ -496,6 +496,9 @@ pub async fn run_with(opts: RunOptions) {
     // #8325 / ESL63P — le réglage « Balises du classique » dans son miroir en
     // mémoire AVANT le premier scan : le scan le lit à chaque fichier.
     tune_core::metadata::balises_classique::charger(&state.backend);
+    // #9158 (Rob) — le réglage « Balises personnelles → tags Tune », pour la
+    // même raison : le scan le lit à chaque fichier.
+    tune_core::metadata::tags_perso::charger(&state.backend);
 
     // Auto-scan music directories at startup — et, même sans `auto_scan`,
     // la reprise d'un scan qu'une mise à jour forcée a arrêté (#5531).

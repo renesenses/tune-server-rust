@@ -892,9 +892,9 @@ impl PlaybackOrchestrator {
                 duration_ms: entry.duration_ms,
                 seek_ms,
                 temp_file_path: None,
-                sample_rate: None,
-                bit_depth: None,
-                media_format: None,
+                sample_rate: entry.sample_rate.and_then(|v| u32::try_from(v).ok()),
+                bit_depth: entry.bit_depth.and_then(|v| u16::try_from(v).ok()),
+                media_format: entry.format.clone(),
                 track_number: entry.track_number.map(|n| n as u32),
                 disc_number: entry.disc_number.map(|n| n as u32),
                 album_ref: None,
@@ -969,9 +969,9 @@ impl PlaybackOrchestrator {
                 duration_ms,
                 seek_ms,
                 temp_file_path: None,
-                sample_rate: None,
-                bit_depth: None,
-                media_format: None,
+                sample_rate: entry.sample_rate.and_then(|v| u32::try_from(v).ok()),
+                bit_depth: entry.bit_depth.and_then(|v| u16::try_from(v).ok()),
+                media_format: entry.format.clone(),
                 track_number: entry.track_number.map(|n| n as u32),
                 disc_number: entry.disc_number.map(|n| n as u32),
                 album_ref: entry.album_ref.clone(),
@@ -1156,9 +1156,13 @@ impl PlaybackOrchestrator {
             let (format, sample_rate, bit_depth, bitrate_kbps) = match qualite {
                 Some(q) => (q.format, q.sample_rate, q.bit_depth, q.bitrate_kbps),
                 None => (
-                    fiche.format.clone(),
-                    fiche.sample_rate,
-                    fiche.bit_depth,
+                    fiche.format.clone().or_else(|| entry.format.clone()),
+                    fiche
+                        .sample_rate
+                        .or_else(|| entry.sample_rate.and_then(|v| u32::try_from(v).ok())),
+                    fiche
+                        .bit_depth
+                        .or_else(|| entry.bit_depth.and_then(|v| u32::try_from(v).ok())),
                     fiche.bitrate_kbps,
                 ),
             };
@@ -1605,9 +1609,9 @@ impl PlaybackOrchestrator {
             duration_ms: duration,
             seek_ms: None,
             temp_file_path: None,
-            sample_rate: None,
-            bit_depth: None,
-            media_format: None,
+            sample_rate: entry.sample_rate.and_then(|v| u32::try_from(v).ok()),
+            bit_depth: entry.bit_depth.and_then(|v| u16::try_from(v).ok()),
+            media_format: entry.format.clone(),
             track_number: None,
             disc_number: None,
             album_ref: entry.album_ref.clone(),
