@@ -44,7 +44,7 @@ jobs:
   # Il ne calcule PAS `full` : ce job ne se decide plus sur le profil.
   impact:
     name: Impact (PostgreSQL)
-    runs-on: ${{ fromJSON(vars.RUNNER_LINUX_PG || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX_PG || vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.classer.outputs.rust }}
@@ -99,11 +99,15 @@ jobs:
     # la deuxieme clause, comme #2808 l'exige. Ce qui s'ajoute, c'est la PR de
     # lot qui touche du Rust. Une PR de lot qui ne touche QUE de la
     # documentation reste hors de ce job : les quatre clauses sont fausses.
+    # Le service PostgreSQL est un conteneur : saute sur un runner sans docker
+    # (vars.SANS_DOCKER == '1'). La couverture PostgreSQL manque alors.
     if: >-
+      vars.SANS_DOCKER != '1' && (
       github.event_name != 'pull_request'
       || (!startsWith(github.base_ref, 'batch/') && !startsWith(github.base_ref, 'rc/'))
       || contains(github.event.pull_request.labels.*.name, 'ci:full')
       || needs.impact.outputs.rust == 'true'
+      )
     runs-on: ${{ fromJSON(vars.RUNNER_LINUX_PG || '"ubuntu-latest"') }}
     # 45 et non 30 : le job compile et execute un paquet de plus (#3123). Mesure
     # du 01/09/2026 — le job tenait en 6 min 21 et 6 min 31 sur les deux
