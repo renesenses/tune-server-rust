@@ -140,7 +140,10 @@ async fn desinstaller_un_greffon_fourni_en_lecture_seule_le_masque_au_lieu_d_ech
     }
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let app = tune_server::routes::router(state);
+    let app =
+        tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+        ));
 
     let (_, liste) = call(&app, "GET", "/api/v1/plugins", "fr").await;
     assert!(est_liste(&liste, "playlists-converter"));
@@ -243,7 +246,10 @@ async fn un_greffon_de_l_utilisateur_est_supprime_pour_de_bon() {
         return;
     }
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
-    let app = tune_server::routes::router(state);
+    let app =
+        tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+        ));
     let (statut, corps) = call(&app, "DELETE", "/api/v1/plugins/mon-greffon", "en").await;
     assert_eq!(statut, StatusCode::OK, "{corps}");
     assert!(corps.get("hidden").is_none(), "pas masqué : supprimé");

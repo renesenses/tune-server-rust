@@ -183,9 +183,9 @@ impl PositionPoller {
             return;
         }
         let mode = ZoneRepo::with_backend(self.db.clone()).get_autoplay_mode(zone_id);
-        // Fil 2694 (Ilan) — la radio de fin de file, activée par défaut depuis
-        // la rc12, ne s'invite pas là où la fin est voulue (« Vider la
-        // file », réveil), ni après une piste en ERREUR, ni sur une zone qui
+        // Fil 2694 (Ilan) — la radio de fin de file (activée par défaut en
+        // rc12, désactivée par défaut depuis #8974) ne s'invite pas là où
+        // la fin est voulue (« Vider la file », réveil), ni après une piste en ERREUR, ni sur une zone qui
         // en SUIT une autre (la meneuse lance la radio, le relais la
         // propage), ni quand le lot précédent n'a joué aucun titre en entier,
         // ni sous contrôle parental. Les consignes de fin sont consommées
@@ -1588,7 +1588,9 @@ impl PositionPoller {
                     // end-of-track instead (a small gap, never a cut). Local
                     // output keeps its internal DSD gapless chain untouched.
                     //
-                    // #6910 — sauf renderer qui annonce le DSD (GetProtocolInfo)
+                    // #6910 — sauf renderer qui annonce le DSD (GetProtocolInfo),
+                    // ou reçoit le DSD brut parce que la zone est en « natif »
+                    // (#8969, Eversolo DMP-A8),
                     // ET `SetNextAVTransportURI` (SCPD) et n'a pas déjà lâché un
                     // suivant DSD : le blanc entre deux pistes enchaînées sur le
                     // disque (fil 2412). Un renderer qui annonce tout et ne suit
@@ -1607,7 +1609,7 @@ impl PositionPoller {
                             // réponse ou SCPD jamais lu par Tune.
                             if let Some(refus) = self
                                 .orchestrator
-                                .refus_dsd_suivant_sur_dlna(device_id, annonce_suivante)
+                                .refus_dsd_suivant_sur_dlna(zone_id, device_id, annonce_suivante)
                                 .await
                             {
                                 info!(
@@ -1624,7 +1626,7 @@ impl PositionPoller {
                                 zone_id,
                                 device_id,
                                 mime = %resolved.mime_type,
-                                "gapless_dsd_next_dlna_arme — le renderer annonce le DSD et SetNextAVTransportURI"
+                                "gapless_dsd_next_dlna_arme — le renderer reçoit le DSD brut (annoncé, ou zone en « natif ») et annonce SetNextAVTransportURI"
                             );
                             dsd_arme = true;
                         }
@@ -1751,7 +1753,7 @@ impl PositionPoller {
         if tenue == crate::outputs::traits::SuivantePreparee::Perdue {
             notes.remove(&zone_id);
             drop(notes);
-            self.retenir_dsd_suivant_lache(zone_id, device_id, "suivante_perdue");
+            self.retenir_dsd_suivant_lache(zone_id, device_id, "suivante_perdue", true);
             return;
         }
         notes.insert(zone_id, device_id.to_string());
@@ -1766,18 +1768,64 @@ impl PositionPoller {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&zone_id);
         if let Some(appareil) = appareil {
-            self.retenir_dsd_suivant_lache(zone_id, &appareil, "avance_bloquee");
+            self.retenir_dsd_suivant_lache(zone_id, &appareil, "avance_bloquee", false);
         }
     }
 
-    fn retenir_dsd_suivant_lache(&self, zone_id: i64, device_id: &str, motif: &str) {
-        if self.orchestrator.retenir_dsd_suivant_lache(device_id) {
+    /// #9206 — le suivant armé de `zone_id` a été SUIVI (le renderer y est
+    /// passé sans `Play`) : si c'était un suivant DSD sur DLNA, l'appareil
+    /// est blanchi — échecs et récidive oubliés. Deux faux échecs séparés
+    /// par des transitions réussies ne font pas un récidiviste.
+    pub(super) fn constater_le_suivant_suivi(&self, zone_id: i64) {
+        let appareil = self
+            .dsd_suivant_arme
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&zone_id);
+        if let Some(appareil) = appareil
+            && self.orchestrator.noter_succes_dsd_suivant(&appareil)
+        {
             info!(
+                zone_id,
+                device_id = %appareil,
+                "gapless_dsd_next_dlna_suivi — échecs de suivant DSD oubliés (#9206)"
+            );
+        }
+    }
+
+    fn retenir_dsd_suivant_lache(
+        &self,
+        zone_id: i64,
+        device_id: &str,
+        motif: &str,
+        immediat: bool,
+    ) {
+        use crate::playback::gapless::IssueEchecDsdSuivant;
+        match self
+            .orchestrator
+            .retenir_dsd_suivant_lache(device_id, immediat)
+        {
+            IssueEchecDsdSuivant::Note { echecs } => info!(
                 zone_id,
                 device_id,
                 motif,
-                "gapless_dsd_next_dlna_non_suivi — garde DSD rendue à cet appareil jusqu'au redémarrage"
-            );
+                echecs,
+                "gapless_dsd_next_dlna_echec_note — suivant DSD encore tenté (#9206)"
+            ),
+            IssueEchecDsdSuivant::GardeRendue {
+                echecs,
+                garde,
+                duree,
+            } => info!(
+                zone_id,
+                device_id,
+                motif,
+                echecs,
+                garde,
+                duree_secs = duree.as_secs(),
+                "gapless_dsd_next_dlna_non_suivi — garde DSD rendue à cet appareil, réessai après le délai"
+            ),
+            IssueEchecDsdSuivant::DejaGarde => {}
         }
     }
 }

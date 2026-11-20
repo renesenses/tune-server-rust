@@ -898,7 +898,7 @@ async fn get_plugin_brut(name: String, state: AppState) -> Json<Value> {
 /// `state.wasm_plugins`, le même que lit `loaded` dans `GET /plugins`. Sans
 /// lui, `enable` d'un wasm qui tourne réclamait un redémarrage inutile, et
 /// `disable` taisait celui qu'il faut pour le décharger (#5112).
-fn greffon_charge(state: &AppState, name: &str) -> bool {
+pub(crate) fn greffon_charge(state: &AppState, name: &str) -> bool {
     plugin_snapshot(state).iter().any(|p| p.name == name)
         || setup_report_snapshot(state)
             .loaded_after_retry
@@ -944,6 +944,7 @@ fn wasm_charge(_state: &AppState, _name: &str) -> bool {
 /// greffon déjà absent, ne demande aucun redémarrage — et le prétendre
 /// enverrait couper la musique pour rien.
 async fn enable_plugin(
+    _garde: crate::auth::AdminOuCetteMachine,
     Path(name): Path<String>,
     State(state): State<AppState>,
 ) -> axum::response::Response {
@@ -962,7 +963,11 @@ async fn enable_plugin(
 /// Le pendant de [`enable_plugin`] : un greffon qui tourne continue de tourner
 /// jusqu'au prochain démarrage, ses routes montées et son abonnement au bus
 /// actif. Le dire est la même dette que ci-dessus.
-async fn disable_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
+async fn disable_plugin(
+    _garde: crate::auth::AdminOuCetteMachine,
+    Path(name): Path<String>,
+    State(state): State<AppState>,
+) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     // Choix explicite : le retour du Premium ne doit pas l'annuler (#4861).
     tune_core::audio::premium_plugins::forget_withheld(&settings, &name).ok();
@@ -1045,7 +1050,12 @@ fn greffon_inconnu(name: &str) -> axum::response::Response {
         .into_response()
 }
 
+/// Installer, mettre à jour, activer, désactiver ou retirer un greffon
+/// change le code que le serveur exécute : garde `AdminOuCetteMachine`
+/// (administrateur, ou authentification coupée : seulement depuis cette
+/// machine), comme les installations de la boutique.
 async fn install_plugin(
+    _garde: crate::auth::AdminOuCetteMachine,
     Path(name): Path<String>,
     State(state): State<AppState>,
     Json(_body): Json<InstallRequest>,
@@ -1078,6 +1088,7 @@ async fn install_plugin(
 }
 
 async fn update_plugin(
+    _garde: crate::auth::AdminOuCetteMachine,
     Path(name): Path<String>,
     State(state): State<AppState>,
 ) -> axum::response::Response {
@@ -1140,6 +1151,7 @@ pub(crate) fn desinstaller_natif(
 }
 
 async fn delete_plugin(
+    _garde: crate::auth::AdminOuCetteMachine,
     Path(name): Path<String>,
     State(state): State<AppState>,
     headers: HeaderMap,

@@ -892,9 +892,9 @@ impl PlaybackOrchestrator {
                 duration_ms: entry.duration_ms,
                 seek_ms,
                 temp_file_path: None,
-                sample_rate: None,
-                bit_depth: None,
-                media_format: None,
+                sample_rate: entry.sample_rate.and_then(|v| u32::try_from(v).ok()),
+                bit_depth: entry.bit_depth.and_then(|v| u16::try_from(v).ok()),
+                media_format: entry.format.clone(),
                 track_number: entry.track_number.map(|n| n as u32),
                 disc_number: entry.disc_number.map(|n| n as u32),
                 album_ref: None,
@@ -969,9 +969,9 @@ impl PlaybackOrchestrator {
                 duration_ms,
                 seek_ms,
                 temp_file_path: None,
-                sample_rate: None,
-                bit_depth: None,
-                media_format: None,
+                sample_rate: entry.sample_rate.and_then(|v| u32::try_from(v).ok()),
+                bit_depth: entry.bit_depth.and_then(|v| u16::try_from(v).ok()),
+                media_format: entry.format.clone(),
                 track_number: entry.track_number.map(|n| n as u32),
                 disc_number: entry.disc_number.map(|n| n as u32),
                 album_ref: entry.album_ref.clone(),
@@ -1156,9 +1156,13 @@ impl PlaybackOrchestrator {
             let (format, sample_rate, bit_depth, bitrate_kbps) = match qualite {
                 Some(q) => (q.format, q.sample_rate, q.bit_depth, q.bitrate_kbps),
                 None => (
-                    fiche.format.clone(),
-                    fiche.sample_rate,
-                    fiche.bit_depth,
+                    fiche.format.clone().or_else(|| entry.format.clone()),
+                    fiche
+                        .sample_rate
+                        .or_else(|| entry.sample_rate.and_then(|v| u32::try_from(v).ok())),
+                    fiche
+                        .bit_depth
+                        .or_else(|| entry.bit_depth.and_then(|v| u32::try_from(v).ok())),
                     fiche.bitrate_kbps,
                 ),
             };
@@ -1329,9 +1333,13 @@ impl PlaybackOrchestrator {
             } else {
                 true
             };
+            // #9142 — une tranche de feuille CUE n'a pas de `file_path` : ses
+            // bornes donnent le média et le début de la tranche.
+            let bornes_cue = track.as_ref().and_then(|t| t.bornes_cue());
             let a_mesurer = fichier_a_mesurer_apres_avance(
                 format.as_deref(),
                 track.and_then(|t| t.file_path),
+                bornes_cue,
                 la_sortie_mesure,
             );
             // Génération épinglée ici : l'avance vient d'avoir lieu, c'est
@@ -1352,8 +1360,19 @@ impl PlaybackOrchestrator {
                     (None, true) => "non_lance_sans_fichier",
                 },
             );
-            if let Some(path) = a_mesurer {
-                spawn_local_file_levels_decode(bus, self.playback.clone(), zone_id, play_seq, path);
+            if let Some((path, debut_fichier_ms)) = a_mesurer {
+                // Les fenêtres sont datées depuis 0, la position dans la
+                // PISTE ; le fichier, lui, se décode depuis le début de la
+                // tranche (0 pour une piste ordinaire).
+                spawn_local_file_levels_decode_depuis(
+                    bus,
+                    self.playback.clone(),
+                    zone_id,
+                    play_seq,
+                    path,
+                    debut_fichier_ms,
+                    0,
+                );
             }
         } else if let (Some(bus), Some(source_id)) =
             (self.event_bus.clone(), advance_source_id.clone())
@@ -1590,9 +1609,9 @@ impl PlaybackOrchestrator {
             duration_ms: duration,
             seek_ms: None,
             temp_file_path: None,
-            sample_rate: None,
-            bit_depth: None,
-            media_format: None,
+            sample_rate: entry.sample_rate.and_then(|v| u32::try_from(v).ok()),
+            bit_depth: entry.bit_depth.and_then(|v| u16::try_from(v).ok()),
+            media_format: entry.format.clone(),
             track_number: None,
             disc_number: None,
             album_ref: entry.album_ref.clone(),
