@@ -47,6 +47,10 @@ impl Banc {
         let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
             .create("Zone", Some(output_type), Some(device))
             .unwrap();
+        // Volume plein : une chaîne vide est alors bit-perfect.
+        tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+            .update_volume(zone, 100.0)
+            .unwrap();
         let app = tune_server::routes::router(state.clone());
         Self { state, app, zone }
     }
@@ -163,8 +167,16 @@ async fn get_rend_la_zone_conforme_au_schema_et_le_groupe_crossfeed_en_refus_t08
     assert_eq!(
         v["badge"],
         json!("bit_perfect"),
-        "chaîne vide, volume plein"
+        "chaîne vide, volume plein : {v}"
     );
+    // Contre-épreuve : volume à 50 %, le volume logiciel traite.
+    tune_core::db::zone_repo::ZoneRepo::with_backend(b.state.backend.clone())
+        .update_volume(b.zone, 50.0)
+        .unwrap();
+    let (_, v) = b.get().await;
+    assert_eq!(v["badge"], json!("processed_by_tess"), "{v}");
+    assert_eq!(v["volume"]["control"], json!("software"), "{v}");
+    assert!(v["volume"]["db"].as_f64().unwrap() < -1.0, "{v}");
     assert_eq!(
         v["catalog"]["groups"][0],
         json!({"id": "crossfeed_crosstalk", "policy": "refuse"})

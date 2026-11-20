@@ -286,32 +286,41 @@ fn source_de(etat: &tune_core::playback::ZoneState, dsd_mode: &str) -> Option<So
     })
 }
 
-/// Le volume de la zone tel que TESS le voit : logiciel (sortie locale,
-/// navigateur), réglé par l'appareil, ou fixe.
-async fn volume_de(
-    state: &AppState,
-    zone: &Zone,
-    etat: &tune_core::playback::ZoneState,
-) -> VolumeZone {
+/// Le volume de la zone tel que TESS le voit, sur le modèle du chemin du
+/// signal (T16) : fixe (zone à volume fixe, ou sortie qui ne sait pas le
+/// régler), logiciel sur une sortie locale, réglé par l'appareil ailleurs.
+/// `zones.volume` est sur 0 à 100 ; le verrou Pure (`audiophile_lock_volume`)
+/// le tient à 100 % (`effective_volume`), donc 0 dB.
+async fn volume_de(state: &AppState, zone: &Zone) -> VolumeZone {
     let capacites = super::output_capabilities(state, zone.output_device_id.as_deref()).await;
-    let fixe = zone.fixed_volume || capacites.is_some_and(|c| !c.can_set_volume);
-    let logiciel =
-        tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(zone.output_type.as_deref())
-            == tune_core::audio::volume_scale::EchelleDeVolume::Perceptive;
-    let lineaire = if etat.volume > 0.0 {
-        etat.volume
+    if zone.fixed_volume || capacites.is_some_and(|c| !c.can_set_volume) {
+        return VolumeZone {
+            control: ControleVolume::Fixed,
+            db: 0.0,
+        };
+    }
+    if zone.output_type.as_deref().unwrap_or("local") != "local" {
+        return VolumeZone {
+            control: ControleVolume::Device,
+            db: 0.0,
+        };
+    }
+    let gain = tune_core::audio::audiophile::effective_volume(
+        &state.backend,
+        zone.id.unwrap_or_default(),
+        zone.volume / 100.0,
+    );
+    let db = if gain >= 1.0 {
+        0.0
     } else {
-        zone.volume / 100.0
+        tune_core::audio::volume_scale::linear_to_db(gain)
+            .unwrap_or(-120.0)
+            .max(-120.0)
     };
-    let db = tune_core::audio::volume_scale::linear_to_db(lineaire).unwrap_or(-120.0);
-    let control = if fixe {
-        ControleVolume::Fixed
-    } else if logiciel {
-        ControleVolume::Software
-    } else {
-        ControleVolume::Device
-    };
-    VolumeZone { control, db }
+    VolumeZone {
+        control: ControleVolume::Software,
+        db,
+    }
 }
 
 /// La réponse de la zone, à partir de sa chaîne lue (T02).
@@ -325,7 +334,7 @@ async fn reponse_de_zone(
     let zone_id = zone.id.unwrap_or_default();
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let etat = state.playback.get_state(zone_id).await;
-    let volume = volume_de(state, zone, &etat).await;
+    let volume = volume_de(state, zone).await;
     let disponible = |id: &str| greffon_disponible(&settings, id);
     let ctx = ContexteExecution {
         transport: TransportZone::depuis_type_de_sortie(zone.output_type.as_deref()),
