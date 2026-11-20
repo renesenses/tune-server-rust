@@ -2700,6 +2700,21 @@ impl PlaybackOrchestrator {
         let output_type = zone_row.as_ref().and_then(|z| z.output_type.clone());
         let output_device_id = zone_row.and_then(|z| z.output_device_id);
 
+        // #8855 — une relance n'est pas une lecture neuve : une sortie
+        // AirPlay 1 en PURE verrouillé garde le niveau en cours.
+        if let Some(ref did) = output_device_id {
+            let arc = { self.outputs.lock().await.get(did.as_str()) };
+            if let Some(output) = arc {
+                let sortie = output.lock().await;
+                if let Some(airplay) = sortie
+                    .as_any()
+                    .downcast_ref::<crate::outputs::airplay::AirplayOutput>()
+                {
+                    airplay.marquer_relance_interne();
+                }
+            }
+        }
+
         // Arrêter la sortie AVANT que play() n'en crée une autre : sans ça,
         // l'ancien fil ASIO/WASAPI peut encore tenir la connexion HTTP quand la
         // nouvelle session démarre — d'où un « request or response body error »

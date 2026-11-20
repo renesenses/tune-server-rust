@@ -189,6 +189,15 @@ pub struct AirplayOutput {
     /// l'extérieur : la suivante enchaîne et garde le niveau en cours (0 %
     /// d'un départ PURE, ou ce qu'un geste a donné depuis).
     lecture_enchainee: Arc<AtomicBool>,
+    /// #8855 — l'orchestrateur relance la piste en cours (transfert, seek
+    /// rejoué, réaffectation de voies, relance DSP) : le `stop` qui peut
+    /// précéder n'est pas celui de l'utilisateur, la lecture reste
+    /// enchaînée. Consommé par le `stop` ou par la lecture suivante.
+    relance_interne: Arc<AtomicBool>,
+    /// #8855 — l'instant où le dernier flux a fini de lui-même (fin de file
+    /// sans `stop`). Au-delà de [`ARRET_LONG_LECTURE_NEUVE`], la lecture
+    /// suivante est neuve.
+    fin_du_dernier_flux: Arc<std::sync::Mutex<Option<std::time::Instant>>>,
     /// #8855 — la dernière lecture est partie à 0 % (PURE). Pris une fois.
     depart_muet: Arc<AtomicBool>,
 }
@@ -308,6 +317,8 @@ impl AirplayOutput {
             volume_fixe_de_la_zone: Arc::new(AtomicBool::new(false)),
             volume_tenu_par_la_zone: Arc::new(AtomicBool::new(false)),
             lecture_enchainee: Arc::new(AtomicBool::new(false)),
+            relance_interne: Arc::new(AtomicBool::new(false)),
+            fin_du_dernier_flux: Arc::new(std::sync::Mutex::new(None)),
             depart_muet: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -829,6 +840,30 @@ impl AirplayOutput {
         info!(device = %self.name, "airplay_stop");
     }
 
+    /// #8855 — l'orchestrateur va relancer la piste en cours (transfert,
+    /// seek rejoué, réaffectation de voies, relance DSP) : la relance garde
+    /// le niveau en cours, même en PURE verrouillé.
+    pub fn marquer_relance_interne(&self) {
+        self.relance_interne.store(true, Ordering::SeqCst);
+    }
+
+    /// La piste qui part ouvre-t-elle une lecture neuve ? Oui après un `stop`
+    /// de l'utilisateur, au premier départ, ou quand le dernier flux a fini
+    /// de lui-même il y a plus de [`ARRET_LONG_LECTURE_NEUVE`]. Une relance
+    /// interne marquée n'est jamais neuve.
+    fn lecture_neuve(&self) -> bool {
+        if self.relance_interne.load(Ordering::SeqCst) {
+            return false;
+        }
+        if !self.lecture_enchainee.load(Ordering::SeqCst) {
+            return true;
+        }
+        self.fin_du_dernier_flux
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_some_and(|fin| fin.elapsed() >= ARRET_LONG_LECTURE_NEUVE)
+    }
+
     /// #8855 — l'orchestrateur, avant chaque piste : la zone est-elle en
     /// PURE verrouillé, en volume fixe ?
     pub fn regler_selon_la_zone(&self, pure_verrouille: bool, volume_fixe: bool) {
@@ -858,6 +893,10 @@ impl AirplayOutput {
         warn!(device = %self.name, "airplay_depart_a_zero_pure_verrouille");
     }
 }
+
+/// #8855 — après une fin de file sans `stop`, un arrêt plus long que ceci
+/// fait de la lecture suivante une lecture neuve (départ PURE à 0 %).
+pub const ARRET_LONG_LECTURE_NEUVE: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 /// #8855 — la courbe commune à AirPlay 1 et AirPlay 2 : -30..0 dB linéaire,
 /// -144 en sourdine (voir `volume_airplay_8855`). L'ancien `30·log10` faisait
@@ -981,7 +1020,8 @@ impl OutputTarget for AirplayOutput {
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         // #8855 — relevé AVANT l'arrêt de la piste précédente.
-        let lecture_neuve = !self.lecture_enchainee.load(Ordering::SeqCst);
+        let lecture_neuve = self.lecture_neuve();
+        self.relance_interne.store(false, Ordering::SeqCst);
         self.arreter_la_session().await;
         let generation_courante = {
             let _echec = self.echec.lock().unwrap_or_else(|e| e.into_inner());
@@ -1078,6 +1118,7 @@ impl OutputTarget for AirplayOutput {
         let name = self.name.clone();
         let echec = self.echec.clone();
         let generation = self.generation.clone();
+        let fin_du_dernier_flux = self.fin_du_dernier_flux.clone();
 
         tokio::spawn(async move {
             let result = stream_to_airplay(
@@ -1101,10 +1142,17 @@ impl OutputTarget for AirplayOutput {
                 *echec = Some(e);
             }
             playing.store(false, Ordering::SeqCst);
+            *fin_du_dernier_flux
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(std::time::Instant::now());
             info!(device = %name, "airplay_stream_ended");
         });
 
         self.lecture_enchainee.store(true, Ordering::SeqCst);
+        *self
+            .fin_du_dernier_flux
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         info!(device = %self.name, url = media.url, "airplay_play");
         Ok(())
     }
@@ -1129,8 +1177,11 @@ impl OutputTarget for AirplayOutput {
 
     async fn stop(&self) -> Result<(), String> {
         // #8855 — un arrêt venu de l'extérieur clôt la lecture : la
-        // suivante est neuve (départ PURE à 0 %).
-        self.lecture_enchainee.store(false, Ordering::SeqCst);
+        // suivante est neuve (départ PURE à 0 %). Sauf celui d'une relance
+        // interne de l'orchestrateur : la piste reprend au niveau en cours.
+        if !self.relance_interne.swap(false, Ordering::SeqCst) {
+            self.lecture_enchainee.store(false, Ordering::SeqCst);
+        }
         self.arreter_la_session().await;
         Ok(())
     }

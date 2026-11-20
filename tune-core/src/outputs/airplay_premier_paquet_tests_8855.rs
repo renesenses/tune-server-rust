@@ -271,3 +271,85 @@ async fn en_volume_fixe_aucun_volume_ne_part_au_depart_2395() {
     assert_eq!(piste, vec!["RECORD".to_string(), "RTP".to_string()]);
     sortie.stop().await.ok();
 }
+
+/// Attend que le flux en cours finisse de lui-même (fin de file sans `stop`).
+async fn attendre_la_fin_du_flux(sortie: &AirplayOutput) {
+    let limite = tokio::time::Instant::now() + Duration::from_secs(5);
+    while sortie
+        .fin_du_dernier_flux
+        .lock()
+        .unwrap()
+        .is_none()
+    {
+        assert!(tokio::time::Instant::now() < limite, "le flux ne finit pas");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn premier_volume(piste: &[String]) -> Option<String> {
+    piste
+        .iter()
+        .position(|e| e == "RECORD")
+        .and_then(|i| piste.get(i + 1).cloned())
+}
+
+/// Relecture du 20/11 : une relance interne de l'orchestrateur (transfert,
+/// seek rejoué, réaffectation de voies, relance DSP) n'est pas une lecture
+/// neuve. En PURE verrouillé, la piste relancée garde le niveau en cours,
+/// même si un `stop` précède la relance. Contre-épreuve dans le même banc :
+/// le même `stop` sans marque repart à 0 %.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn une_relance_interne_en_pure_garde_le_niveau_en_cours_8855() {
+    let url = stream_court().await;
+    let (port, journal) = faux_recepteur().await;
+    let sortie = sortie(port);
+    sortie.regler_selon_la_zone(true, false);
+    let premiere = jouer_une_piste(&sortie, &url, &journal).await;
+    assert_eq!(premier_volume(&premiere), Some(volume(0.0)));
+    sortie.set_volume(0.50).await.unwrap();
+
+    sortie.marquer_relance_interne();
+    sortie.stop().await.unwrap();
+    let relance = jouer_une_piste(&sortie, &url, &journal).await;
+    assert_eq!(premier_volume(&relance), Some(volume(0.50)), "{relance:?}");
+    assert!(!sortie.prendre_le_depart_muet());
+
+    // La marque est consommée : le `stop` suivant est celui de l'utilisateur.
+    sortie.stop().await.unwrap();
+    let apres_stop = jouer_une_piste(&sortie, &url, &journal).await;
+    assert_eq!(premier_volume(&apres_stop), Some(volume(0.0)), "{apres_stop:?}");
+    sortie.stop().await.ok();
+}
+
+/// Relecture du 20/11 : après une fin de file sans `stop`, une reprise
+/// au-delà de `ARRET_LONG_LECTURE_NEUVE` est une lecture neuve (PURE : 0 %).
+/// Contre-épreuve : la piste suivante tout de suite après la fin garde le
+/// niveau.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn apres_une_fin_de_file_longue_la_lecture_repart_a_zero_8855() {
+    let url = stream_court().await;
+    let (port, journal) = faux_recepteur().await;
+    let sortie = sortie(port);
+    sortie.regler_selon_la_zone(true, false);
+    jouer_une_piste(&sortie, &url, &journal).await;
+    sortie.set_volume(0.50).await.unwrap();
+
+    attendre_la_fin_du_flux(&sortie).await;
+    let tout_de_suite = jouer_une_piste(&sortie, &url, &journal).await;
+    assert_eq!(premier_volume(&tout_de_suite), Some(volume(0.50)), "{tout_de_suite:?}");
+
+    attendre_la_fin_du_flux(&sortie).await;
+    *sortie.fin_du_dernier_flux.lock().unwrap() = Some(
+        std::time::Instant::now()
+            .checked_sub(ARRET_LONG_LECTURE_NEUVE + Duration::from_secs(1))
+            .expect("horloge monotone assez avancée"),
+    );
+    let apres_long_arret = jouer_une_piste(&sortie, &url, &journal).await;
+    assert_eq!(
+        premier_volume(&apres_long_arret),
+        Some(volume(0.0)),
+        "{apres_long_arret:?}"
+    );
+    assert!(sortie.prendre_le_depart_muet());
+    sortie.stop().await.ok();
+}
