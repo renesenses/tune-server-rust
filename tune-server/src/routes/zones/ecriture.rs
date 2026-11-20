@@ -974,6 +974,12 @@ async fn persister_le_son(
         };
         ecrire!("strict_bitperfect", enabled, r);
     }
+    // #8869 — silence de verrouillage → setting zone_{id}_silence_verrouillage_ms,
+    // borné à 0..=2000 ; 0 supprime la clé. Lu à chaque lecture.
+    if let Some(ms) = body.silence_verrouillage_ms {
+        let r = tune_core::audio::silence_de_verrouillage::ecrire(&state.backend, id, ms);
+        ecrire!("silence_verrouillage_ms", ms, r);
+    }
     // #3245 — mode exclusif de la zone → setting zone_{id}_exclusive_mode ;
     // `null` supprime la clé (la zone suit la machine). La sortie est alignée
     // par `patch_zone`, après la persistance.
