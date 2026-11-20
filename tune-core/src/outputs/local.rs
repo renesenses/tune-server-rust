@@ -2655,7 +2655,23 @@ impl ResultatSondeDsdAlsa {
             Self::PcmLogiciel => {
                 capacite::retenir_provisoire(device_name, CapaciteConnue::SortieNonAsio);
             }
-            Self::Introuvable | Self::Occupe => capacite::noter_sondage_sans_reponse(device_name),
+            // Relecture #9211 — un « occupé » ou un « introuvable » vu à la
+            // RÉSOLUTION (la piste précédente tient le PCM) n'arme pas
+            // l'espacement : l'ouverture qui suit, PCM libre, doit sonder.
+            // Seuls les échecs à l'ouverture comptent
+            // ([`Self::retenir_a_l_ouverture`]).
+            Self::Introuvable | Self::Occupe => {}
+        }
+    }
+
+    /// #9170 (relecture #9211) — [`Self::retenir`] pour un sondage fait à
+    /// l'OUVERTURE d'un flux, PCM libre : là, un « occupé » (autre programme)
+    /// ou un « introuvable » est un vrai échec, qui espace le sondage suivant
+    /// (30 s, 2 min, 10 min).
+    pub fn retenir_a_l_ouverture(&self, device_name: &str) {
+        self.retenir(device_name);
+        if matches!(self, Self::Introuvable | Self::Occupe) {
+            crate::outputs::capacite_dsd_natif::noter_sondage_sans_reponse(device_name);
         }
     }
 }
@@ -2680,17 +2696,30 @@ impl SondeDsdAlsa {
     /// [`ResultatSondeDsdAlsa::retenir`] (#9170 : jamais de verdict définitif
     /// sans réponse du pilote).
     pub fn sonder_et_retenir(&self) -> ResultatSondeDsdAlsa {
+        let r = self.sonder();
+        r.retenir(&self.device_name);
+        r
+    }
+
+    /// #9170 (relecture #9211) — le sondage de l'ouverture d'un flux
+    /// (`LocalOutput::play_url`) : retenu par
+    /// [`ResultatSondeDsdAlsa::retenir_a_l_ouverture`].
+    pub fn sonder_et_retenir_a_l_ouverture(&self) -> ResultatSondeDsdAlsa {
+        let r = self.sonder();
+        r.retenir_a_l_ouverture(&self.device_name);
+        r
+    }
+
+    fn sonder(&self) -> ResultatSondeDsdAlsa {
         #[cfg(target_os = "linux")]
         {
-            let r = bras_alsa_dsd::sonder_la_sortie(
+            bras_alsa_dsd::sonder_la_sortie(
                 &self.device_name,
                 self.endpoint_id.as_deref(),
                 self.origin_host.as_deref(),
                 &self.audio_backend,
                 VOIES_SONDEES_DSD_ALSA,
-            );
-            r.retenir(&self.device_name);
-            r
+            )
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -6672,7 +6701,8 @@ impl OutputTarget for LocalOutput {
         if crate::outputs::capacite_dsd_natif::a_resonder_a_l_ouverture(&self.device_name)
             && let Some(sonde) = self.sonde_dsd_alsa()
         {
-            let _ = tokio::task::spawn_blocking(move || sonde.sonder_et_retenir()).await;
+            let _ =
+                tokio::task::spawn_blocking(move || sonde.sonder_et_retenir_a_l_ouverture()).await;
         }
 
         // Create a FRESH force_silent flag for the new stream.

@@ -1313,15 +1313,12 @@ impl PlaybackOrchestrator {
         // flux (PCM libre) la sondera une fois, pour que la PREMIÈRE piste DSD
         // qui suit parte déjà en natif. Une zone qui n'est pas « Natif » ne
         // demande rien : ses pistes PCM ne sondent jamais.
-        if is_local_output
-            && source_format != Some(AudioFormat::Dsd)
-            && let Some(nom) = req
-                .output_device_id
-                .as_deref()
-                .and_then(|id| id.strip_prefix("local:"))
-            && crate::outputs::capacite_dsd_natif::connue(nom).is_none()
-            && ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(req.zone_id) == "native"
-        {
+        if let Some(nom) = sortie_a_sonder_pour_une_piste_pcm(
+            is_local_output,
+            source_format,
+            req.output_device_id.as_deref(),
+            || ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(req.zone_id),
+        ) {
             crate::outputs::capacite_dsd_natif::demander_sondage_a_l_ouverture(nom);
         }
 
@@ -2252,11 +2249,13 @@ impl PlaybackOrchestrator {
                         let r = tokio::task::spawn_blocking(move || sonde.sonder_et_retenir())
                             .await
                             .unwrap_or(ResultatSondeDsdAlsa::Occupe);
-                        // #9170 (suivi #9172) — rien appris (PCM tenu par la
-                        // piste précédente, DAC introuvable, verdict
-                        // provisoire) : la prochaine ouverture de flux, PCM
-                        // libre, sondera UNE fois. Seul ce chemin — piste DSD,
-                        // zone « Natif » — le demande.
+                        // #9170 (suivi #9172, relecture #9211) — rien appris
+                        // (PCM tenu par la piste précédente, DAC introuvable,
+                        // verdict provisoire) : la demande est posée, SANS
+                        // armer l'espacement (`ResultatSondeDsdAlsa::retenir`
+                        // n'en arme aucun) — l'ouverture de CETTE piste, PCM
+                        // libre, sonde donc, et la suivante peut partir en
+                        // natif. Seuls les échecs à l'ouverture espacent.
                         if !matches!(r, ResultatSondeDsdAlsa::Sonde { .. }) {
                             capacite::demander_sondage_a_l_ouverture(&nom);
                         }
@@ -5161,6 +5160,23 @@ fn noter_transport_reel_dsd(req: &PlayRequest, transport: TransportReelDsd) {
     if let Some(sortie) = req.output_device_id.as_deref() {
         crate::outputs::capacite_dsd_natif::noter_transport_reel(req.zone_id, sortie, transport);
     }
+}
+
+/// #8248 / #9170 (relecture #9211) — la sortie dont une piste NON DSD doit
+/// demander le sondage à l'ouverture : sortie locale jamais sondée, zone
+/// réglée « Natif » (`dsd_mode`, lu seulement si tout le reste le permet).
+pub(super) fn sortie_a_sonder_pour_une_piste_pcm<'a>(
+    is_local_output: bool,
+    source_format: Option<AudioFormat>,
+    output_device_id: Option<&'a str>,
+    dsd_mode: impl FnOnce() -> String,
+) -> Option<&'a str> {
+    if !is_local_output || source_format == Some(AudioFormat::Dsd) {
+        return None;
+    }
+    let nom = output_device_id?.strip_prefix("local:")?;
+    (crate::outputs::capacite_dsd_natif::connue(nom).is_none() && dsd_mode() == "native")
+        .then_some(nom)
 }
 
 /// #9170 — ce qu'un sondage DSD natif ALSA permet pour la piste qui se
