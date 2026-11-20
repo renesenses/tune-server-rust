@@ -37,7 +37,9 @@ async fn activer_sans_premium_est_refuse_402() {
     let Json(v) = lire_zone(State(state), Path(1)).await;
     assert_eq!(v["settings"]["enabled"], false);
     assert_eq!(v["constraint"], "disabled");
-    assert_eq!(v["applies_at"], "next_track");
+    // 19/11/2026 — un changement s'applique tout de suite.
+    assert_eq!(v["applies_at"], "now");
+    assert_eq!(v["restart"], false);
 }
 
 #[tokio::test]
@@ -51,6 +53,15 @@ async fn desactiver_est_toujours_permis_et_un_reglage_invalide_refuse() {
     )
     .await;
     assert_eq!(r.status(), StatusCode::OK);
+    // 19/11/2026 — rien ne joue : le réglage vaut tout de suite, sans relance.
+    let corps: Value = serde_json::from_slice(
+        &axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(corps["applies_at"], "now", "{corps}");
+    assert_eq!(corps["restart"], false, "{corps}");
     let Json(v) = lire_zone(State(state.clone()), Path(2)).await;
     assert_eq!(v["settings"]["filter"], "precision-pm");
     assert_eq!(v["settings"]["max_ratio"], 4);

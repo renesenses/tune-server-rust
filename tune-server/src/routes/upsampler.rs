@@ -13,9 +13,13 @@
 //! activer exige le Premium (402) et le greffon installé (409). Désactiver
 //! reste toujours possible.
 //!
-//! Le réglage ne change jamais la piste en cours : l'étage d'une piste garde
-//! le choix de son ouverture, la sortie compare à la frontière suivante et
-//! rouvre. La réponse le dit (`applies_at: "next_track"`).
+//! Décision de Bertrand du 19/11/2026 (étude de la spec de Rémi, § B.2) : le
+//! réglage s'applique TOUT DE SUITE. L'étage d'une piste garde toujours le
+//! choix de son ouverture, mais `PUT /zones/{id}` relance le flux à la
+//! position en cours (environ une seconde de silence), comme la bascule PURE
+//! (#8422). La réponse le dit : `applies_at: "now"` (avec `restart: true`
+//! quand le flux est relancé), ou `"next_track"` quand rien ne peut agir
+//! avant (zone en pause, position inconnue).
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -136,7 +140,22 @@ fn contrainte(state: &AppState, premium: bool, zone_id: i64) -> Option<&'static 
     None
 }
 
-async fn forme_de_zone(state: &AppState, zone_id: i64) -> Value {
+/// Quand le réglage atteint le son, pour le client.
+fn applies_at(portee: tune_core::orchestrator::PorteeDuReglage) -> &'static str {
+    use tune_core::orchestrator::PorteeDuReglage as P;
+    match portee {
+        P::Immediate | P::Relance | P::RienNeJoue => "now",
+        P::PisteSuivante => "next_track",
+    }
+}
+
+/// `portee` : celle du `PUT` qui vient d'écrire ; `None` pour une lecture,
+/// qui dit ce que fera un changement (tout de suite).
+async fn forme_de_zone(
+    state: &AppState,
+    zone_id: i64,
+    portee: Option<tune_core::orchestrator::PorteeDuReglage>,
+) -> Value {
     let s = settings(state);
     let premium = state.license.check_feature(Feature::Upsampling).await;
     let reglages = su::reglages_de_la_zone(&s, zone_id);
@@ -147,12 +166,13 @@ async fn forme_de_zone(state: &AppState, zone_id: i64) -> Value {
         "admitted_filters": su::verdict_enregistre(&s).map(|v| {
             v.filtres_admis().into_iter().map(str::to_string).collect::<Vec<_>>()
         }),
-        "applies_at": "next_track",
+        "applies_at": portee.map_or("now", applies_at),
+        "restart": portee == Some(tune_core::orchestrator::PorteeDuReglage::Relance),
     })
 }
 
 async fn lire_zone(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    Json(forme_de_zone(&state, id).await)
+    Json(forme_de_zone(&state, id, None).await)
 }
 
 async fn ecrire_zone(
@@ -204,10 +224,10 @@ async fn ecrire_zone(
         )
             .into_response();
     }
-    // La sortie vivante reçoit le nouveau choix ; la piste en cours n'en
-    // est pas affectée (frontière suivante).
-    state.orchestrator.refresh_zone_upsampler(id).await;
-    Json(forme_de_zone(&state, id).await).into_response()
+    // 19/11/2026 — la sortie vivante reçoit le nouveau choix, et le flux qui
+    // joue est relancé à la position en cours pour l'entendre tout de suite.
+    let portee = state.orchestrator.apply_upsampler_change_portee(id).await;
+    Json(forme_de_zone(&state, id, Some(portee)).await).into_response()
 }
 
 #[cfg(test)]

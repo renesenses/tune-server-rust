@@ -1,6 +1,7 @@
 mod boucle_locale_5639;
 mod diagnostic_surechantillonnage_8259;
 mod lecture_http;
+mod reserve_du_surechantillonneur;
 mod retard_de_depart_8437;
 use lecture_http::LecteurHttpAnnulable;
 
@@ -689,6 +690,10 @@ pub struct LocalOutput {
     /// du crête-mètre et le volume. Partagé avec le `PlaybackManager` comme
     /// `volume` (voir [`Self::gain_moyen_du_dsp`]).
     gain_moyen_dsp: Arc<AtomicU32>,
+    /// Compensation de la réserve du suréchantillonneur (19/11/2026) : c'est
+    /// elle qui publie `rg_factor` et `gain_moyen_dsp`, réserve de l'étage
+    /// ouvert comprise. Voir [`reserve_du_surechantillonneur`].
+    reserve_du_surechantillonneur: reserve_du_surechantillonneur::ReserveDuSurechantillonneur,
     /// Volume stored before mute, so unmute can restore it
     pre_mute_volume: Arc<AtomicU32>,
     muted: Arc<AtomicBool>,
@@ -1235,10 +1240,7 @@ impl LocalOutput {
         // Le crête-mètre multiplie ce gain par le volume rendu : la part
         // portée par l'égaliseur, retirée du volume, revient donc ici, et le
         // produit que lit l'aiguille ne bouge pas.
-        self.gain_moyen_dsp.store(
-            (en_millemes(dsp_db) * porte_par_l_eq).clamp(0.0, 64_000.0) as u32,
-            Ordering::SeqCst,
-        );
+        let gain_moyen_dsp = (en_millemes(dsp_db) * porte_par_l_eq).clamp(0.0, 64_000.0) as u32;
         let compensation = if self.compensation_de_niveau.load(Ordering::Relaxed) {
             -dsp_db
         } else {
@@ -1257,9 +1259,12 @@ impl LocalOutput {
         // facteur a réellement bougé. Rien d'autre ne peut avoir rendu
         // `volume` périmé : ses seuls écrivains (`set_volume`, `set_mute`, la
         // bascule DoP) le recalculent eux-mêmes depuis `rg_factor`.
-        if self.rg_factor.swap(compose, Ordering::SeqCst) != compose {
-            self.recompute_effective_volume();
-        }
+        //
+        // 19/11/2026 — publié avec la compensation de la réserve du
+        // suréchantillonneur ouvert : `rg_factor` et `gain_moyen_dsp` sont
+        // écrits là, et le volume recalculé si le facteur a bougé.
+        self.reserve_du_surechantillonneur
+            .poser_le_rendu(compose, gain_moyen_dsp);
     }
 
     /// #4685 — le gain MOYEN du DSP installé, en millièmes, partagé comme
@@ -1453,6 +1458,20 @@ impl LocalOutput {
         audio_backend: &str,
     ) -> Self {
         let device_id = format!("local:{device_name}");
+        let volume = Arc::new(AtomicU32::new(UNITE_DU_GAIN_DE_RENDU));
+        let user_volume = Arc::new(AtomicU32::new(UNITE_DU_GAIN_DE_RENDU));
+        let rg_factor = Arc::new(AtomicU32::new(1000));
+        let gain_moyen_dsp = Arc::new(AtomicU32::new(1000));
+        let dop_active = Arc::new(AtomicBool::new(false));
+        let reserve_du_surechantillonneur =
+            reserve_du_surechantillonneur::ReserveDuSurechantillonneur::nouvelle(
+                rg_factor.clone(),
+                gain_moyen_dsp.clone(),
+                user_volume.clone(),
+                dop_active.clone(),
+                volume.clone(),
+                &device_name,
+            );
         Self {
             device_name,
             device_id,
@@ -1460,15 +1479,16 @@ impl LocalOutput {
             origin_host: None,
             playing: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
-            volume: Arc::new(AtomicU32::new(UNITE_DU_GAIN_DE_RENDU)),
-            user_volume: Arc::new(AtomicU32::new(UNITE_DU_GAIN_DE_RENDU)),
-            rg_factor: Arc::new(AtomicU32::new(1000)),
+            volume,
+            user_volume,
+            rg_factor,
             replaygain_seul: AtomicU32::new(1000),
             // Même défaut que le réglage de zone : une sortie construite hors
             // chemin de lecture compense aussi, mais sans DSP installé le
             // facteur vaut 1 et rien ne change.
             compensation_de_niveau: AtomicBool::new(true),
-            gain_moyen_dsp: Arc::new(AtomicU32::new(1000)),
+            gain_moyen_dsp,
+            reserve_du_surechantillonneur,
             pre_mute_volume: Arc::new(AtomicU32::new(UNITE_DU_GAIN_DE_RENDU)),
             muted: Arc::new(AtomicBool::new(false)),
             position_ms: Arc::new(AtomicU64::new(0)),
@@ -1518,7 +1538,7 @@ impl LocalOutput {
             crossfeed: Arc::new(std::sync::Mutex::new(None)),
             diagnostic_surechantillonnage: Arc::default(),
             surechantillonnage: Arc::new(std::sync::Mutex::new(None)),
-            dop_active: Arc::new(AtomicBool::new(false)),
+            dop_active,
             signal_path_status: Arc::new(std::sync::Mutex::new(None)),
             transformations_reelles: Arc::new(std::sync::Mutex::new(None)),
             open_failure: Arc::new(std::sync::Mutex::new(None)),
@@ -6745,6 +6765,13 @@ impl OutputTarget for LocalOutput {
         // décrivent plus rien.
         self.cretes_de_sortie.oublier();
         let cretes_de_sortie = self.cretes_de_sortie.clone();
+        // 19/11/2026 — un flux neuf ne porte pas (encore) l'étage du
+        // suréchantillonneur : sa réserve n'est plus compensée tant que le
+        // fil de lecture ne l'a pas ouvert. Sans cette remise à l'unité, un
+        // chemin qui ne porte pas l'étage (natif S32, DoP, bras exclusifs)
+        // hériterait de la compensation et jouerait 3 dB trop fort.
+        self.reserve_du_surechantillonneur.poser_l_etage(None);
+        let reserve_du_surechantillonneur = self.reserve_du_surechantillonneur.clone();
         let position_ms = self.position_ms.clone();
         let mut seek_offset = self.seek_offset_ms.load(Ordering::SeqCst);
         let seek_offset_arc = self.seek_offset_ms.clone();
@@ -8303,6 +8330,12 @@ impl OutputTarget for LocalOutput {
                                 headroom_db = etage.reserve_db(),
                                 "local_audio_upsampler_engaged"
                             );
+                            // 19/11/2026 — la réserve est compensée dans le
+                            // gain de rendu, et le crête-mètre, qui relève
+                            // AVANT l'étage, la reporte sur ses crêtes.
+                            reserve_du_surechantillonneur.poser_l_etage(Some(etage.reserve_db()));
+                            cretes_de_sortie
+                                .poser_le_gain_aval(reserve_du_surechantillonneur.gain());
                             Some(etage)
                         }
                         Err(e) => {
@@ -9406,11 +9439,18 @@ impl OutputTarget for LocalOutput {
         // #6741 — un égaliseur coupé qui applique encore son préampli le dit :
         // le voyant nomme ce gain au lieu d'un « DSP appliqué » ambigu.
         let garde = self.preampli_garde();
+        // 19/11/2026 — l'écart de niveau qui reste, réserve compensée : il
+        // suit le volume en direct, comme le gain de rendu.
+        let ecart = self.reserve_du_surechantillonneur.ecart_de_niveau_db();
         mesure.map(|t| {
             let t = self
                 .diagnostic_surechantillonnage
                 .declarer(t)
                 .avec_fondu_enchaine(fondu);
+            let t = match ecart {
+                Some(db) => t.avec_ecart_de_niveau_surechantillonnage(db),
+                None => t,
+            };
             match garde {
                 Some(g) => t.avec_preampli_garde(g.db, g.en_retour),
                 None => t,

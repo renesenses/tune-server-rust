@@ -2083,6 +2083,17 @@ impl PlaybackOrchestrator {
     /// environ une seconde de silence — deux par cinq secondes est déjà
     /// beaucoup.
     const EQ_REPLAY_FLOOR_MS: u64 = 5_000;
+    /// Plancher entre deux relances d'une même zone pour un changement de
+    /// réglage du suréchantillonneur (décision de Bertrand du 19/11/2026).
+    ///
+    /// Plus court que [`Self::EQ_REPLAY_FLOOR_MS`] : ce geste-là sert une
+    /// écoute comparative (activé, désactivé, autre filtre), et 5 s de
+    /// plancher la rendaient impossible. Assez long pour qu'une rafale de
+    /// clics ne hache pas la lecture : la relance coûte environ une seconde
+    /// de silence, plus le reverrouillage du DAC quand la cadence change.
+    /// Et une demande trop proche n'est pas abandonnée, mais DIFFÉRÉE jusqu'à
+    /// la fin du plancher : la réponse a promis « appliqué ».
+    pub(crate) const UPSAMPLER_REPLAY_FLOOR_MS: u64 = 1_500;
 }
 
 // #8611 — contrôle parental : refus de lecture des artistes bloqués.
@@ -2242,6 +2253,9 @@ mod greffon_natif_tiers_reseau_7616_tests;
 // #6780 — PURE contourne aussi la réaffectation des canaux armée de la zone.
 #[cfg(all(test, feature = "local-audio"))]
 mod pure_reaffectation_6780_tests;
+// 19/11/2026 — un réglage du suréchantillonneur relance le flux tout de suite.
+#[cfg(all(test, feature = "local-audio"))]
+mod surechantillonnage_immediat_tests;
 // #7932 — PURE contourne aussi la réaffectation des canaux de l'album joué.
 #[cfg(all(test, feature = "local-audio"))]
 mod pure_reaffectation_album_7932_tests;

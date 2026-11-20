@@ -37,6 +37,11 @@ pub(crate) enum RaisonDeRelance {
     Reglage,
     /// Une bascule du mode PURE, annoncée aux télécommandes.
     BasculePure,
+    /// Un changement de réglage du suréchantillonneur (19/11/2026) : la
+    /// sortie locale rouvre son étage avec le nouveau choix, à la position
+    /// en cours. Plancher propre, plus court
+    /// (`UPSAMPLER_REPLAY_FLOOR_MS`), et différé plutôt qu'abandonné.
+    Surechantillonnage,
 }
 
 impl RaisonDeRelance {
@@ -45,7 +50,23 @@ impl RaisonDeRelance {
         match self {
             Self::Reglage => "eq_change",
             Self::BasculePure => "pure_bascule",
+            Self::Surechantillonnage => "upsampler_change",
         }
+    }
+
+    /// Le plancher entre deux relances de la même zone, en millisecondes.
+    pub(crate) fn plancher_ms(self) -> u64 {
+        match self {
+            Self::Surechantillonnage => PlaybackOrchestrator::UPSAMPLER_REPLAY_FLOOR_MS,
+            Self::Reglage | Self::BasculePure => PlaybackOrchestrator::EQ_REPLAY_FLOOR_MS,
+        }
+    }
+
+    /// Trop tôt après la relance précédente : abandonner (le réglage prendra
+    /// effet à la piste suivante) ou attendre la fin du plancher ? Seul le
+    /// suréchantillonneur attend : sa réponse a dit « appliqué ».
+    pub(crate) fn differe_sous_le_plancher(self) -> bool {
+        self == Self::Surechantillonnage
     }
 }
 
@@ -1561,12 +1582,33 @@ impl PlaybackOrchestrator {
             // Plancher : trop tôt après le précédent, on renonce plutôt que de
             // hacher. Le réglage prendra effet à la piste suivante, ce que le
             // client sait déjà dire (`applied_live: false`).
-            {
+            //
+            // 19/11/2026 — le suréchantillonneur a son plancher, plus court,
+            // et ATTEND la fin du plancher au lieu de renoncer ; une demande
+            // plus récente arrivée pendant l'attente le remplace.
+            let reste_ms = {
                 let derniers = moi.eq_replay_last.lock().unwrap();
-                if let Some(t) = derniers.get(&zone_id)
-                    && t.elapsed().as_millis() < Self::EQ_REPLAY_FLOOR_MS as u128
-                {
+                derniers.get(&zone_id).and_then(|t| {
+                    raison
+                        .plancher_ms()
+                        .checked_sub(t.elapsed().as_millis() as u64)
+                        .filter(|reste| *reste > 0)
+                })
+            };
+            if let Some(reste_ms) = reste_ms {
+                if !raison.differe_sous_le_plancher() {
                     info!(zone_id, "eq_replay_skipped_floor");
+                    return;
+                }
+                info!(
+                    zone_id,
+                    reste_ms,
+                    raison = raison.code(),
+                    "eq_replay_deferred_floor"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(reste_ms)).await;
+                let gens = moi.eq_replay_gen.lock().unwrap();
+                if gens.get(&zone_id).copied() != Some(generation) {
                     return;
                 }
             }
@@ -2505,9 +2547,98 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// Décision de Bertrand du 19/11/2026 (étude de la spec de Rémi, § B.2)
+    /// — un changement de réglage du suréchantillonneur s'applique TOUT DE
+    /// SUITE : le choix est reposé sur la sortie locale
+    /// ([`Self::refresh_zone_upsampler`]) puis, si la zone joue et que ce
+    /// choix a changé, le flux est relancé à la position en cours, comme la
+    /// bascule PURE (#8422). Environ une seconde de silence, accepté pour une
+    /// écoute comparative ; plancher propre et différé
+    /// ([`RaisonDeRelance::Surechantillonnage`]).
+    ///
+    /// Rend :
+    /// - [`PorteeDuReglage::Immediate`] : rien à relancer (le choix de la
+    ///   sortie n'a pas changé, ou la zone ne joue pas sur une sortie
+    ///   locale, où le réglage n'agit pas) ;
+    /// - [`PorteeDuReglage::Relance`] : relance programmée ;
+    /// - [`PorteeDuReglage::PisteSuivante`] : zone en pause (une relance la
+    ///   remettrait en lecture, #7556) ou position inconnue (#2595) ;
+    /// - [`PorteeDuReglage::RienNeJoue`] : la prochaine lecture partira avec
+    ///   ce réglage.
+    pub async fn apply_upsampler_change_portee(
+        self: &std::sync::Arc<Self>,
+        zone_id: i64,
+    ) -> PorteeDuReglage {
+        let avant = self.choix_du_surechantillonneur_pose(zone_id).await;
+        self.refresh_zone_upsampler(zone_id).await;
+        let apres = self.choix_du_surechantillonneur_pose(zone_id).await;
+        let portee = self
+            .portee_du_reglage_du_surechantillonneur(zone_id, avant != apres)
+            .await;
+        info!(zone_id, portee = ?portee, "upsampler_change_portee");
+        if let Some(ref bus) = self.event_bus {
+            bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
+        }
+        portee
+    }
+
+    async fn portee_du_reglage_du_surechantillonneur(
+        self: &std::sync::Arc<Self>,
+        zone_id: i64,
+        choix_change: bool,
+    ) -> PorteeDuReglage {
+        let etat = self.playback.get_state(zone_id).await;
+        if etat.now_playing.is_none() || etat.state == crate::playback::PlayState::Stopped {
+            return PorteeDuReglage::RienNeJoue;
+        }
+        if !choix_change {
+            return PorteeDuReglage::Immediate;
+        }
+        // #7556 — en pause, la relance remettrait la zone en lecture : le
+        // choix vaudra à la reprise d'un nouveau flux, au plus tard à la
+        // piste suivante.
+        if etat.state != crate::playback::PlayState::Playing {
+            return PorteeDuReglage::PisteSuivante;
+        }
+        if self.schedule_replay_pour(zone_id, RaisonDeRelance::Surechantillonnage) {
+            PorteeDuReglage::Relance
+        } else {
+            PorteeDuReglage::PisteSuivante
+        }
+    }
+
+    /// Les réglages du suréchantillonneur que la sortie locale de la zone
+    /// tient en ce moment (`None` : désactivé, écarté, ou pas de sortie
+    /// locale vivante).
+    async fn choix_du_surechantillonneur_pose(
+        &self,
+        zone_id: i64,
+    ) -> Option<crate::audio::surechantillonnage::UpsamplerSettings> {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            None
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let device_id = self.peripherique_de_la_zone(zone_id);
+            if !device_id.starts_with("local:") {
+                return None;
+            }
+            let output_arc = { self.outputs.lock().await.get(&device_id) }?;
+            let output = output_arc.lock().await;
+            output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+                .and_then(|local| local.surechantillonnage())
+                .map(|choix| choix.reglages)
+        }
+    }
+
     /// #7614 — repose le choix du suréchantillonneur sur la sortie locale de
-    /// la zone après un changement de réglage. La piste en cours n'en est
-    /// pas affectée : la sortie le compare à la frontière suivante.
+    /// la zone après un changement de réglage. Seul, il n'affecte pas la
+    /// piste en cours : la sortie le compare à la frontière suivante. C'est
+    /// [`Self::apply_upsampler_change_portee`] qui relance le flux.
     pub async fn refresh_zone_upsampler(&self, zone_id: i64) {
         #[cfg(not(feature = "local-audio"))]
         let _ = zone_id;
