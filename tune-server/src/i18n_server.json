@@ -5217,7 +5217,7 @@
     "nb": "Tune kjører i en container ({engine}): der kan den ikke selv montere en SMB-deling, fordi serveren verken har systemrettighetene (root og evnen CAP_SYS_ADMIN) eller monteringsverktøyet (cifs-utils). Monter i stedet delingen på vertsmaskinen (NAS-en din), og gjør den synlig i containeren med et volum med «rslave»-propagering, for eksempel -v /volume1/music:/music:ro,rslave, og legg deretter mappen du får til i musikkmappene. Uten «rslave» vises ikke en deling som monteres på verten etter at containeren ble opprettet.",
     "pl": "Tune działa w kontenerze ({engine}): nie może sam zamontować w nim udziału SMB, ponieważ serwer nie ma ani uprawnień systemowych (root i zdolność CAP_SYS_ADMIN), ani narzędzia do montowania (cifs-utils). Zamontuj udział na maszynie hosta (swoim NAS-ie), a następnie udostępnij go w kontenerze przez wolumin z propagacją „rslave”, na przykład -v /volume1/music:/music:ro,rslave, i dodaj uzyskany folder do folderów z muzyką. Bez „rslave” udział zamontowany na hoście po utworzeniu kontenera nie pojawi się w nim.",
     "el": "Το Tune εκτελείται σε κοντέινερ ({engine}): δεν μπορεί να προσαρτήσει μόνο του εκεί έναν κοινόχρηστο φάκελο SMB, επειδή ο διακομιστής δεν έχει ούτε τα δικαιώματα συστήματος (root και τη δυνατότητα CAP_SYS_ADMIN) ούτε το εργαλείο προσάρτησης (cifs-utils). Προσαρτήστε αντί γι' αυτό τον κοινόχρηστο φάκελο στο κεντρικό μηχάνημα (το NAS σας) και κάντε τον ορατό στο κοντέινερ με έναν τόμο με διάδοση «rslave», για παράδειγμα -v /volume1/music:/music:ro,rslave, και προσθέστε τον φάκελο που προκύπτει στους φακέλους μουσικής. Χωρίς «rslave», ένας κοινόχρηστος φάκελος που προσαρτάται στο κεντρικό μηχάνημα μετά τη δημιουργία του κοντέινερ δεν εμφανίζεται σε αυτό.",
-    "tr": "Tune bir kapsayıcıda ({engine}) çalışıyor: sunucuda ne sistem ayrıcalıkları (root ve CAP_SYS_ADMIN yetkisi) ne de bağlama aracı (cifs-utils) bulunduğundan, burada SMB paylaşımını kendisi bağlayamaz. Paylaşımı ana makineye (NAS cihazınıza) bağlayın, ardından \"rslave\" yayılımına sahip bir birim üzerinden kapsayıcıya aktarın; örneğin -v /volume1/music:/music:ro,rslave. Sonra oluşan klasörü müzik klasörlerine ekleyin. \"rslave\" olmadan, kapsayıcı oluşturulduktan sonra ana makineye bağlanan bir paylaşım kapsayıcıda görünmez."
+    "tr": "Tune bir kapsayıcı içinde çalışıyor ({engine}): sunucunun orada ne sistem ayrıcalıkları (root ve CAP_SYS_ADMIN yeteneği) ne de bağlama aracı (cifs-utils) bulunduğundan, bir SMB paylaşımını kendisi bağlayamaz. Bunun yerine paylaşımı ana makineye (NAS'ınıza) bağlayın, ardından \"rslave\" yayılımlı bir birimle kapsayıcıda görünür hale getirin, örneğin -v /volume1/music:/music:ro,rslave, ve elde edilen klasörü müzik klasörlerine ekleyin. \"rslave\" olmadan, kapsayıcı oluşturulduktan sonra ana makineye bağlanan bir paylaşım kapsayıcıda görünmez."
   },
   "api.network.smbMountNoPrivileges": {
     "fr": "Le serveur n'a pas les privilèges système pour monter un partage (root et la capacité CAP_SYS_ADMIN). Donnez-les au service, ou montez le partage par le système (/etc/fstab) et ajoutez le dossier obtenu aux dossiers de musique.",
@@ -5235,7 +5235,7 @@
     "nb": "Serveren har ikke systemrettighetene som trengs for å montere en deling (root og evnen CAP_SYS_ADMIN). Gi tjenesten dem, eller monter delingen via systemet (/etc/fstab) og legg mappen du får til i musikkmappene.",
     "pl": "Serwer nie ma uprawnień systemowych do zamontowania udziału (root i zdolność CAP_SYS_ADMIN). Nadaj je usłudze albo zamontuj udział przez system (/etc/fstab) i dodaj uzyskany folder do folderów z muzyką.",
     "el": "Ο διακομιστής δεν έχει τα δικαιώματα συστήματος για να προσαρτήσει έναν κοινόχρηστο φάκελο (root και τη δυνατότητα CAP_SYS_ADMIN). Δώστε τα στην υπηρεσία ή προσαρτήστε τον φάκελο μέσω του συστήματος (/etc/fstab) και προσθέστε τον φάκελο που προκύπτει στους φακέλους μουσικής.",
-    "tr": "Sunucunun paylaşım bağlamak için gereken sistem ayrıcalıkları (root ve CAP_SYS_ADMIN yetkisi) yok. Bu ayrıcalıkları hizmete verin veya paylaşımı sistem üzerinden (/etc/fstab) bağlayıp oluşan klasörü müzik klasörlerine ekleyin."
+    "tr": "Sunucunun bir paylaşımı bağlamak için gereken sistem ayrıcalıkları (root ve CAP_SYS_ADMIN yeteneği) yok. Bu ayrıcalıkları hizmete verin ya da paylaşımı sistem üzerinden (/etc/fstab) bağlayıp elde edilen klasörü müzik klasörlerine ekleyin."
   },
   "api.network.smbMountLaunchFailed": {
     "fr": "La commande de montage n'a pas pu être lancée.",
@@ -5271,7 +5271,7 @@
     "nb": "Serveren kjører ikke som root, og monteringshjelperen i Tune OS ({helper}) finnes ikke, eller sudo mangler. Gi tjenesten systemrettigheter, eller monter delingen via systemet (/etc/fstab) og legg mappen du får til i musikkmappene.",
     "pl": "Serwer nie działa jako root i nie znaleziono pomocnika montowania Tune OS ({helper}) albo brakuje sudo. Nadaj usłudze uprawnienia systemowe albo zamontuj udział przez system (/etc/fstab) i dodaj uzyskany folder do folderów z muzyką.",
     "el": "Ο διακομιστής δεν εκτελείται ως root και δεν βρέθηκε ο βοηθός προσάρτησης του Tune OS ({helper}) ή λείπει το sudo. Δώστε στην υπηρεσία δικαιώματα συστήματος ή προσαρτήστε τον φάκελο μέσω του συστήματος (/etc/fstab) και προσθέστε τον φάκελο που προκύπτει στους φακέλους μουσικής.",
-    "tr": "Sunucu root olarak çalışmıyor ve Tune OS bağlama yardımcısı ({helper}) bulunamıyor veya sudo eksik. Hizmete sistem ayrıcalıkları verin veya paylaşımı sistem üzerinden (/etc/fstab) bağlayıp oluşan klasörü müzik klasörlerine ekleyin."
+    "tr": "Sunucu root olarak çalışmıyor ve Tune OS bağlama yardımcısı ({helper}) bulunamıyor ya da sudo yok. Hizmete sistem ayrıcalıkları verin ya da paylaşımı sistem üzerinden (/etc/fstab) bağlayıp elde edilen klasörü müzik klasörlerine ekleyin."
   },
   "api.network.smbMountToolMissing": {
     "fr": "L'outil de montage SMB est introuvable sur ce serveur. Sous Linux, installez le paquet cifs-utils (qui fournit mount.cifs), puis réessayez.",
@@ -5289,7 +5289,7 @@
     "nb": "SMB-monteringsverktøyet finnes ikke på denne serveren. Installer pakken cifs-utils (som gir mount.cifs) på Linux, og prøv igjen.",
     "pl": "Na tym serwerze nie znaleziono narzędzia do montowania SMB. W systemie Linux zainstaluj pakiet cifs-utils (zawiera mount.cifs) i spróbuj ponownie.",
     "el": "Το εργαλείο προσάρτησης SMB δεν βρέθηκε σε αυτόν τον διακομιστή. Σε Linux, εγκαταστήστε το πακέτο cifs-utils (παρέχει το mount.cifs) και δοκιμάστε ξανά.",
-    "tr": "Bu sunucuda SMB bağlama aracı bulunamadı. Linux üzerinde cifs-utils paketini (mount.cifs aracını sağlar) yükleyip yeniden deneyin."
+    "tr": "Bu sunucuda SMB bağlama aracı bulunamıyor. Linux'ta cifs-utils paketini (mount.cifs'i sağlar) kurun, ardından yeniden deneyin."
   },
   "api.network.smbMountCredentialsRefused": {
     "fr": "Le partage a refusé le nom d'utilisateur ou le mot de passe. Vérifiez-les (et le domaine s'il en faut un), puis réessayez.",
@@ -5307,7 +5307,7 @@
     "nb": "Delingen avviste brukernavnet eller passordet. Kontroller dem (og domenet hvis det trengs), og prøv igjen.",
     "pl": "Udział odrzucił nazwę użytkownika lub hasło. Sprawdź je (oraz domenę, jeśli jest potrzebna) i spróbuj ponownie.",
     "el": "Ο κοινόχρηστος φάκελος απέρριψε το όνομα χρήστη ή τον κωδικό πρόσβασης. Ελέγξτε τα (και τον τομέα, αν χρειάζεται) και δοκιμάστε ξανά.",
-    "tr": "Paylaşım kullanıcı adını veya parolayı reddetti. Bunları (gerekiyorsa etki alanını da) kontrol edip yeniden deneyin."
+    "tr": "Paylaşım kullanıcı adını veya parolayı reddetti. Bunları (ve gerekiyorsa etki alanını) denetleyin, ardından yeniden deneyin."
   },
   "api.network.smbMountFailed": {
     "fr": "Le montage du partage a échoué.",
@@ -5343,7 +5343,7 @@
     "nb": "SMB-serveren svarte ikke i tide. Kontroller at enheten er slått på og kan nås fra Tune-serveren, og prøv igjen.",
     "pl": "Serwer SMB nie odpowiedział na czas. Sprawdź, czy urządzenie jest włączone i osiągalne z serwera Tune, i spróbuj ponownie.",
     "el": "Ο διακομιστής SMB δεν απάντησε εγκαίρως. Ελέγξτε ότι η συσκευή είναι αναμμένη και προσβάσιμη από τον διακομιστή Tune και δοκιμάστε ξανά.",
-    "tr": "SMB sunucusu zamanında yanıt vermedi. Cihazın açık ve Tune sunucusundan erişilebilir olduğunu kontrol edip yeniden deneyin."
+    "tr": "SMB sunucusu zamanında yanıt vermedi. Aygıtın açık olduğunu ve Tune sunucusundan erişilebildiğini denetleyin, ardından yeniden deneyin."
   },
   "api.profiles.listUnreadable": {
     "fr": "La liste des profils n'a pas pu être lue dans la base.",
