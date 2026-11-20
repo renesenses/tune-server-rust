@@ -383,3 +383,123 @@ fn arret_leve_au_drop_du_futur() {
     }
     assert!(arret.load(Ordering::Relaxed));
 }
+
+/// Fil 2954 — un WAV mono 16 bits de 3 s : sinus à −12 dBFS, et une suite de
+/// 20 échantillons à la pleine échelle à 1,505 s.
+fn ecrire_wav_ecrete(chemin: &CheminFs) {
+    let n = 3 * SR as usize;
+    let coupe = (1.505 * f64::from(SR)) as usize;
+    let mut o = Vec::new();
+    o.extend_from_slice(b"RIFF");
+    o.extend_from_slice(&(36 + 2 * n as u32).to_le_bytes());
+    o.extend_from_slice(b"WAVEfmt ");
+    o.extend_from_slice(&16u32.to_le_bytes());
+    o.extend_from_slice(&1u16.to_le_bytes());
+    o.extend_from_slice(&1u16.to_le_bytes());
+    o.extend_from_slice(&SR.to_le_bytes());
+    o.extend_from_slice(&(SR * 2).to_le_bytes());
+    o.extend_from_slice(&2u16.to_le_bytes());
+    o.extend_from_slice(&16u16.to_le_bytes());
+    o.extend_from_slice(b"data");
+    o.extend_from_slice(&(2 * n as u32).to_le_bytes());
+    for i in 0..n {
+        let v: i16 = if (coupe..coupe + 20).contains(&i) {
+            32767
+        } else {
+            let s = (std::f64::consts::TAU * 440.0 * i as f64 / f64::from(SR)).sin();
+            (0.25 * s * 32767.0) as i16
+        };
+        o.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(chemin, o).unwrap();
+}
+
+fn piste_ecretee(banc: &Banc, id: i64) {
+    let chemin = banc.dossier.path().join(format!("ecretee_{id}.wav"));
+    ecrire_wav_ecrete(&chemin);
+    banc.state
+        .backend
+        .execute(
+            "INSERT INTO tracks (id, title, file_path, duration_ms, source) VALUES (?, 'coupe', ?, 3000, 'local')",
+            &[&id, &chemin.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+}
+
+#[tokio::test]
+async fn zoom_2954_marqueur_d_ecretage_aligne_sur_la_plage() {
+    let banc = Banc::new();
+    piste_ecretee(&banc, 40);
+    // Piste entière, 300 colonnes de 10 ms : la colonne 150.
+    let (_, _, f) = banc.servir(40, colonnes(300)).await;
+    assert_eq!(
+        f["voies"][0]["colonnes_ecretees"],
+        json!([150]),
+        "{}",
+        f["voies"][0]["colonnes_ecretees"]
+    );
+    // Plage [1 s, 2 s], 100 colonnes de 10 ms : la colonne 50.
+    let p = Parametres {
+        colonnes: Some(100),
+        debut_s: Some(1.0),
+        fin_s: Some(2.0),
+    };
+    let (_, _, f) = banc.servir(40, p).await;
+    assert_eq!(f["voies"][0]["colonnes_ecretees"], json!([50]));
+    assert_eq!(f["voies"][0]["ecretes"], 20);
+    assert!(
+        f["voies"][0].get("echantillons").is_none(),
+        "1 s : trop long pour les échantillons"
+    );
+}
+
+#[tokio::test]
+async fn zoom_2954_echantillons_au_fort_zoom_et_cache_borne() {
+    let banc = Banc::new();
+    piste_ecretee(&banc, 41);
+    // 0,1 s autour de la coupe : 4 410 trames.
+    let p = || Parametres {
+        colonnes: Some(1000),
+        debut_s: Some(1.45),
+        fin_s: Some(1.55),
+    };
+    let (statut, cache, f) = banc.servir(41, p()).await;
+    assert_eq!(statut, StatusCode::OK, "{f}");
+    assert_eq!(cache.as_deref(), Some("plage"));
+    let e = f["voies"][0]["echantillons"]
+        .as_array()
+        .expect("échantillons");
+    assert!((4400..=4420).contains(&e.len()), "{}", e.len());
+    // La coupe est à 55 ms du début de la plage : 2 425 trames.
+    let pleins: Vec<usize> = e
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| v.as_f64().unwrap() > 0.999)
+        .map(|(i, _)| i)
+        .collect();
+    assert_eq!(pleins.len(), 20, "{pleins:?}");
+    assert!((2420..=2430).contains(&pleins[0]), "{pleins:?}");
+
+    // Le même zoom ne redécode rien : servi par le cache en mémoire.
+    let (_, cache, f2) = banc.servir(41, p()).await;
+    assert_eq!(cache.as_deref(), Some("plage-hit"));
+    assert_eq!(f2["voies"], f["voies"]);
+}
+
+#[test]
+fn cache_des_plages_borne() {
+    let c = CachePlages::new();
+    for i in 0..(PLAGES_MAX + 10) {
+        c.garder(format!("k{i}"), vec![0u8; 10]);
+    }
+    assert_eq!(c.longueur(), PLAGES_MAX);
+    assert!(c.lire("k0").is_none(), "les plus anciennes partent");
+    assert!(c.lire(&format!("k{}", PLAGES_MAX + 9)).is_some());
+    // Borné en octets aussi.
+    c.garder("gros1".into(), vec![0u8; PLAGES_OCTETS_MAX / 2 + 1]);
+    c.garder("gros2".into(), vec![0u8; PLAGES_OCTETS_MAX / 2 + 1]);
+    assert!(c.lire("gros1").is_none());
+    assert!(c.lire("gros2").is_some());
+    c.garder("trop".into(), vec![0u8; PLAGES_OCTETS_MAX + 1]);
+    assert!(c.lire("trop").is_none());
+}

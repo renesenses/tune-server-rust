@@ -3469,6 +3469,43 @@ fn raw_vorbis_comment(path: &Path, field_name: &str) -> Option<String> {
 /// This matters at scan time: looking for four Dynamic Range spellings with four
 /// separate calls costs four 1 MB reads on *every* file, and the files that have
 /// none — the vast majority — pay the full price every time.
+/// La tête Vorbis lue par [`read_vorbis_header`] : au plus tant d'octets.
+const TETE_VORBIS_OCTETS: usize = 1024 * 1024;
+
+/// #9158 — la tête lue contient-elle À COUP SÛR tous les commentaires Vorbis ?
+///
+/// Oui si le fichier entier tient dans la tête, ou si c'est un FLAC dont le
+/// bloc VORBIS_COMMENT finit dans la tête (ou qui n'en a pas). Non sinon : un
+/// FLAC dont une grosse image (PICTURE) ou un bourrage précède les
+/// commentaires, et tout Ogg (Vorbis, Opus) tronqué — ses balises peuvent
+/// suivre un METADATA_BLOCK_PICTURE en base64 de plusieurs Mio. Une balise
+/// absente d'une tête incomplète n'est PAS absente du fichier.
+fn tete_vorbis_complete(data: &[u8]) -> bool {
+    if data.len() < TETE_VORBIS_OCTETS {
+        return true;
+    }
+    if !data.starts_with(b"fLaC") {
+        return false;
+    }
+    let mut pos = 4usize;
+    loop {
+        let Some(h) = data.get(pos..pos + 4) else {
+            return false;
+        };
+        let dernier = h[0] & 0x80 != 0;
+        let genre = h[0] & 0x7f;
+        let longueur = u32::from_be_bytes([0, h[1], h[2], h[3]]) as usize;
+        let fin = pos + 4 + longueur;
+        if genre == 4 {
+            return fin <= data.len();
+        }
+        if dernier {
+            return true;
+        }
+        pos = fin;
+    }
+}
+
 fn read_vorbis_header(path: &Path) -> Option<Vec<u8>> {
     let ext = path.extension()?.to_str()?.to_lowercase();
     if !matches!(ext.as_str(), "flac" | "ogg" | "oga" | "opus") {
@@ -3476,13 +3513,12 @@ fn read_vorbis_header(path: &Path) -> Option<Vec<u8>> {
     }
     // Vorbis comments live in the file header; a bounded prefix read finds them
     // without slurping a multi-GB hi-res FLAC into RAM.
-    const HEADER_BYTES: u64 = 1024 * 1024;
     let mut data = Vec::new();
     {
         use std::io::Read;
         crate::audio::iso9660::ouvrir_fichier(path)
             .ok()?
-            .take(HEADER_BYTES)
+            .take(TETE_VORBIS_OCTETS as u64)
             .read_to_end(&mut data)
             .ok()?;
     }
@@ -4708,7 +4744,25 @@ pub fn read_extended_metadata_avec(
         // #9158 — les balises personnelles qui deviennent des tags Tune.
         // Présente, même vide, dès qu'une correspondance existe : une liste
         // vide RETIRE les tags que le scan avait posés.
-        if let Some(v) = tags_perso::valeur_lue(perso, brutes_lues.then_some(&brutes[..])) {
+        //
+        // Tête Vorbis INCOMPLÈTE (commentaires au-delà du premier Mio : grosse
+        // image avant eux, Ogg/Opus) : les balises personnelles sont relues
+        // dans le fichier entier, comme la passe « Appliquer » ; sans quoi le
+        // scan retirerait des tags que le fichier porte. Échec de cette
+        // relecture = lecture ratée (rien n'est touché).
+        let relues: Option<Vec<(String, String)>> = (!perso.est_vide()
+            && brutes_lues
+            && header.as_deref().is_some_and(|h| !tete_vorbis_complete(h)))
+        .then(|| {
+            balises_brutes::lire_balises_du_fichier(path)
+                .map(|b| b.paires())
+                .unwrap_or_else(|_| {
+                    brutes_lues = false;
+                    Vec::new()
+                })
+        });
+        let pour_perso = relues.as_deref().unwrap_or(&brutes[..]);
+        if let Some(v) = tags_perso::valeur_lue(perso, brutes_lues.then_some(pour_perso)) {
             meta.insert(tags_perso::CLE_LUE.into(), v);
         }
         // #7766 — ce que lofty ne range sous aucun `ItemKey` : l'ensemble ou

@@ -347,8 +347,17 @@ fn corps_de_peripherie(body: &str) -> bool {
 /// réseau ». Une vraie réponse de l'API au secours (401 identifiants, 400
 /// application…) l'emporte toujours : elle seule parle du compte.
 fn echec_le_plus_parlant(primaire: AttemptError, secours: AttemptError) -> AttemptError {
-    if primaire.refus_de_peripherie() && secours.transient() && !secours.refus_de_peripherie() {
-        info!(error = %secours, "qobuz_fallback_failed_after_edge_refusal");
+    echec_et_origine_les_plus_parlants((primaire, ()), (secours, ())).0
+}
+
+/// L'origine accompagne exactement l'erreur retenue, sans recopier sa priorité.
+fn echec_et_origine_les_plus_parlants<T>(
+    primaire: (AttemptError, T),
+    secours: (AttemptError, T),
+) -> (AttemptError, T) {
+    if primaire.0.refus_de_peripherie() && secours.0.transient() && !secours.0.refus_de_peripherie()
+    {
+        info!(error = %secours.0, "qobuz_fallback_failed_after_edge_refusal");
         primaire
     } else {
         secours
@@ -417,13 +426,30 @@ fn erreur_de_connexion(err: &AttemptError) -> TuneError {
 /// Qobuz a refusé le mot de passe. Les refus d'application reconnus restent
 /// distincts (#8134).
 fn erreur_connexion_origine(err: &AttemptError, origine: &str) -> TuneError {
-    if origine == "relais" && err.statut_http() == Some(401) && !application_refusee(err) {
+    if origine == "relais"
+        && err.statut_http() == Some(401)
+        && !application_refusee(err)
+        && !identifiants_refuses_par_qobuz(err)
+    {
         return TuneError::Refused {
             code: "qobuz_relay_login_refused",
             message: "Qobuz login refused through the relay; the origin does not establish that the password is incorrect".into(),
         };
     }
     erreur_de_connexion(err)
+}
+
+/// Le relais peut transmettre tel quel le refus explicite de Qobuz.
+fn identifiants_refuses_par_qobuz(err: &AttemptError) -> bool {
+    let AttemptError::Http { status: 401, body } = err else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value["message"].as_str().map(str::to_owned))
+        .is_some_and(|message| {
+            message.eq_ignore_ascii_case("Invalid username/email and password combination")
+        })
 }
 
 /// Le texte de [`TuneError::AppRefused`] pour Qobuz : il dit que le mot de
@@ -3286,15 +3312,10 @@ impl QobuzService {
                 self.login_at(fallback, app_id, username, password)
                     .await
                     .map_err(|e| {
-                        let origine = if err.refus_de_peripherie()
-                            && e.transient()
-                            && !e.refus_de_peripherie()
-                        {
-                            origine_primaire
-                        } else {
-                            origine_secours
-                        };
-                        (echec_le_plus_parlant(err, e), origine)
+                        echec_et_origine_les_plus_parlants(
+                            (err, origine_primaire),
+                            (e, origine_secours),
+                        )
                     })
             }
             autre => autre.map_err(|e| (e, origine_primaire)),
