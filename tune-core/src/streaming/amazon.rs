@@ -233,6 +233,8 @@ impl AmazonMusicService {
             track_count: data["trackCount"].as_u64().unwrap_or(0) as u32,
             released_at: None,
             quality: None,
+            genre_id: None,
+            genre_name: None,
         }
     }
 

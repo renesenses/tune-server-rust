@@ -424,6 +424,8 @@ impl DeezerService {
             quality: None,
             released_at: None,
             release_type: None,
+            genre_id: None,
+            genre_name: None,
         })
     }
 
@@ -808,6 +810,8 @@ impl DeezerService {
             track_count: item["nb_tracks"].as_u64().unwrap_or(0) as u32,
             released_at: None,
             quality: None,
+            genre_id: None,
+            genre_name: None,
         }
     }
 

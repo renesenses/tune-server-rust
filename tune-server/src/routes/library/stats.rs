@@ -468,13 +468,19 @@ fn lire_completude(state: &AppState) -> Result<Value, AppError> {
     Ok(corps)
 }
 
+/// L'activité récente : l'historique du profil appelant, comme
+/// `GET /history` (ses écoutes et celles sans profil), 200 lignes au plus.
 pub(super) async fn library_activity(
     State(state): State<AppState>,
+    crate::routes::active_profile::ActiveProfile(moi): crate::routes::active_profile::ActiveProfile,
     Query(p): Query<Pagination>,
 ) -> Json<Value> {
-    let limit = p.limit.unwrap_or(20);
+    let limit = p.limit.unwrap_or(20).clamp(1, 200);
     let repo = HistoryRepo::with_backend(state.backend.clone());
-    let items = repo.recent(limit).unwrap_or_default();
+    let items = repo
+        .recent_paginated_du_profil(limit, 0, moi)
+        .map(|(items, _)| items)
+        .unwrap_or_default();
     Json(json!(items))
 }
 
