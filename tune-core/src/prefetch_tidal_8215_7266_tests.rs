@@ -522,3 +522,72 @@ async fn la_fin_d_une_ancienne_resolution_n_efface_pas_la_nouvelle_8249() {
     ancienne.abort();
     nouvelle.abort();
 }
+
+// ── #8795 ───────────────────────────────────────────────────────────────
+
+/// « Suivant » vers la piste dont le préchargement DASH est en vol, sur une
+/// sortie locale ou OAAT : la lecture n'attend plus la fin du téléchargement
+/// entier (9,6 s au fil 2836), le préchargement est abandonné et le service
+/// rendu tout de suite ; la lecture passe par le chemin en croissance de
+/// #7266.
+///
+/// Contre-épreuve : faire rendre `abandonner_pour_une_autre_piste` à la
+/// branche `suit_la_croissance` d'`abandonner_avant_la_lecture` fait tomber
+/// ce test.
+#[tokio::test]
+async fn suivant_vers_la_piste_prechargee_sur_sortie_locale_n_attend_plus_8795() {
+    let banc = banc("LENTE", None).await;
+    let moteur = Arc::new(PrefetchEngine::new());
+    let tache = prechargement_en_cours(&banc, &moteur).await;
+    assert!(
+        !service_libre(&banc).await,
+        "prémisse : le préchargement tient le service"
+    );
+    assert!(
+        moteur.abandonner_avant_la_lecture(banc.zone_id, "tidal", "LENTE", true),
+        "sortie locale : le préchargement de la piste demandée doit être abandonné"
+    );
+    assert!(
+        service_libre(&banc).await,
+        "la lecture ne doit plus attendre la fin du téléchargement préchargé (#8795)"
+    );
+    tokio::time::timeout(Duration::from_secs(2), tache)
+        .await
+        .expect("le préchargement abandonné se termine")
+        .unwrap();
+}
+
+/// Sur un renderer réseau, la lecture de la piste préchargée la reprend
+/// toujours entière (#7247) ; une autre piste l'abandonne toujours (#8215).
+#[tokio::test]
+async fn renderer_reseau_garde_le_prechargement_de_la_piste_demandee_8795() {
+    let banc = banc("LENTE", None).await;
+    let moteur = Arc::new(PrefetchEngine::new());
+    let tache = prechargement_en_cours(&banc, &moteur).await;
+    assert!(
+        !moteur.abandonner_avant_la_lecture(banc.zone_id, "tidal", "LENTE", false),
+        "renderer réseau : le préchargement de la piste demandée est repris (#7247)"
+    );
+    assert!(!service_libre(&banc).await, "le préchargement tient toujours");
+    assert!(
+        moteur.abandonner_avant_la_lecture(banc.zone_id, "tidal", "AUTRE", false),
+        "une autre piste l'abandonne toujours (#8215)"
+    );
+    assert!(service_libre(&banc).await);
+    tokio::time::timeout(Duration::from_secs(2), tache)
+        .await
+        .expect("le préchargement abandonné se termine")
+        .unwrap();
+}
+
+/// Une sortie locale qui joue sur une AUTRE zone ne touche pas au
+/// préchargement de celle-ci (#8249).
+#[tokio::test]
+async fn sortie_locale_d_une_autre_zone_n_abandonne_rien_8795() {
+    let banc = banc("LENTE", None).await;
+    let moteur = Arc::new(PrefetchEngine::new());
+    let tache = prechargement_en_cours(&banc, &moteur).await;
+    assert!(!moteur.abandonner_avant_la_lecture(banc.zone_id + 1, "tidal", "LENTE", true));
+    assert!(!service_libre(&banc).await);
+    tache.abort();
+}
