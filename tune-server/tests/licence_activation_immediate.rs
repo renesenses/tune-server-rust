@@ -97,7 +97,12 @@ fn serveur_froid(base_url: &str) -> (axum::Router, tune_core::test_scratch::Scra
         None,
         "l'état de départ doit être froid : aucune clé enregistrée"
     );
-    (tune_server::routes::router(state), base)
+    (
+        tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+        )),
+        base,
+    )
 }
 
 async fn appeler(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {

@@ -369,16 +369,17 @@ fn la_regle_de_la_moitie_vaut_pour_le_badge_et_le_filtre_9035() {
     );
 }
 
-/// #9067 (décision du 18/11, fil 2915) — un CD 16/44,1 n'est jamais « Hi-Res
-/// douteux », même si sa ligne a été rangée `douteux` avant #9067 : album 10
-/// = 10 pistes CD rangées douteuses (coupure à 16 kHz) → conforme, absent du
-/// filtre « douteux ». Album 11 = 2 pistes 24/96 douteuses + 8 pistes CD
-/// rangées douteuses : la moitié se compte sur les pistes qui se disent
-/// hi-res (2 sur 2) → douteux. Rust et SQL rendent les mêmes albums.
+/// #9067 — « Source altérée » (décision du 19/11, fil 2915) : un CD n'est
+/// altéré que par un mur de codec. Album 10 = 10 pistes CD rangées `douteux`
+/// sur la seule coupure (avant #9067) → lues conformes, absent du filtre.
+/// Album 11 = 2 pistes 24/96 douteuses + 8 pistes CD lues conformes : la
+/// moitié se compte sur TOUTES les pistes mesurées (2 sur 10) → pas altéré,
+/// « 2 pistes sur 10 ». Album 12 = 10 pistes CD au mur de codec → altéré.
+/// Rust et SQL rendent les mêmes albums.
 #[test]
-fn un_cd_n_est_jamais_hires_douteux_9067() {
+fn un_cd_n_est_altere_que_par_un_mur_de_codec_9067() {
     let db = bibliotheque();
-    for (album, hires) in [(10i64, 0usize), (11, 2)] {
+    for (album, hires) in [(10i64, 0usize), (11, 2), (12, 0)] {
         db.execute(
             "INSERT INTO albums (id, title) VALUES (?1, 'a')",
             &[&album as &dyn ToSqlValue],
@@ -398,25 +399,35 @@ fn un_cd_n_est_jamais_hires_douteux_9067() {
             } else {
                 (44_100, 16)
             };
+            let raison = if album == 12 {
+                "mur_de_codec".to_string()
+            } else {
+                "coupure_de_codec".to_string()
+            };
             db.execute(
                 "INSERT INTO hires_verifications (track_id, verdict, raison, coupure_hz, sample_rate, bits_declares) \
-                 VALUES (?1, 'douteux', 'coupure_de_codec', 16000.0, ?2, ?3)",
-                &[&piste as &dyn ToSqlValue, &rate, &bits],
+                 VALUES (?1, 'douteux', ?4, 16000.0, ?2, ?3)",
+                &[&piste as &dyn ToSqlValue, &rate, &bits, &raison],
             )
             .unwrap();
         }
     }
-    let ids: Vec<i64> = (1..=7).chain([10, 11]).collect();
+    let ids: Vec<i64> = (1..=7).chain([10, 11, 12]).collect();
     let par_album = pistes_mesurees_par_album(&db, &ids).unwrap();
     assert_eq!(publier_l_album(&par_album[&10], true), ("conforme", None));
     assert_eq!(pistes_douteuses_publiees(&par_album[&10], true), None);
-    assert_eq!(
-        publier_l_album(&par_album[&11], true),
-        ("douteux", Some("coupure_spectrale".into()))
-    );
+    assert_eq!(publier_l_album(&par_album[&11], true), ("conforme", None));
     assert_eq!(
         pistes_douteuses_publiees(&par_album[&11], true),
-        Some((2, 2, Some("coupure_spectrale".into())))
+        Some((2, 10, Some("coupure_spectrale".into())))
+    );
+    assert_eq!(
+        publier_l_album(&par_album[&12], true),
+        ("douteux", Some("mur_de_codec".into()))
+    );
+    assert_eq!(
+        pistes_douteuses_publiees(&par_album[&12], true),
+        Some((10, 10, Some("mur_de_codec".into())))
     );
     for visible in [false, true] {
         for v in TOUS {
@@ -438,11 +449,18 @@ fn un_cd_n_est_jamais_hires_douteux_9067() {
     }
     let douteux = albums_du_predicat(&db, VerdictPublie::Douteux, true);
     assert!(
-        !douteux.contains(&10),
-        "un CD n'est pas « Hi-Res douteux » : {douteux:?}"
+        douteux.contains(&12) && !douteux.contains(&10) && !douteux.contains(&11),
+        "seul le CD au mur de codec est altéré : {douteux:?}"
     );
-    assert!(douteux.contains(&11), "{douteux:?}");
-    // La piste CD rangée douteuse se lit conforme, la piste 24/96 douteuse.
+    // La piste CD rangée douteuse sur la seule coupure se lit conforme ; la
+    // piste 24/96 douteuse et la piste CD au mur de codec sont altérées.
     let pistes_douteuses = pistes_du_predicat(&db, VerdictPublie::Douteux, true);
-    assert!(!pistes_douteuses.contains(&1000) && pistes_douteuses.contains(&1100));
+    assert!(!pistes_douteuses.contains(&1000), "{pistes_douteuses:?}");
+    assert!(pistes_douteuses.contains(&1100) && pistes_douteuses.contains(&1200));
+    // `altere` est l'alias d'entrée de `douteux`.
+    assert_eq!(VerdictPublie::lire("altere"), Some(VerdictPublie::Douteux));
+    assert_eq!(
+        albums_des_verdicts(&db, &["altere".to_string()], true).unwrap(),
+        albums_des_verdicts(&db, &["douteux".to_string()], true).unwrap()
+    );
 }

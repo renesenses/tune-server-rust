@@ -11,7 +11,7 @@ albums, son filtre et le critère des règles intelligentes.
 |---|---|---|
 | `verifie` | se dit hi-res et l'est | « hi-res vérifié » |
 | `conforme` | qualité CD déclarée, rien de suspect | aucun |
-| `douteux` | une signature contredit ce que le fichier déclare (`raison`) | « douteux », **seulement si le réglage le montre** |
+| `douteux` | **« Source altérée »** (#9067) : une signature contredit ce que le fichier déclare (`raison`) | « Source altérée », **seulement si le réglage le montre** |
 | `non_analyse` | aucune mesure, rien de concluant, ou un « douteux » masqué | aucun |
 
 Le verdict d'un album suit celui de ses pistes mesurées (`verdict_d_album`) :
@@ -25,13 +25,34 @@ pas. Un album qui n'est pas douteux mais a des pistes douteuses le dit
 (`pistes_douteuses`, `raison_pistes`) ; chaque piste douteuse garde son
 verdict.
 
-**Un CD n'est jamais « Hi-Res douteux »** (#9067, décision du 18/11, fil
-2915) : un fichier qui ne se dit pas hi-res (16 bits, 48 kHz au plus) est
-jugé `conforme` même si son spectre est coupé. Les lignes rangées `douteux`
-avant #9067 pour un tel fichier (`sample_rate` ≤ 48 000 et `bits_declares` ≤
-16) se LISENT `conforme` partout (fiche, liste, filtre, règles, catalogue),
-sans remesure. La règle de la moitié se compte sur les pistes mesurées qui se
-disent hi-res (vérifiées ou douteuses) : « Hi-Res douteux » ⊂ « Hi-Res ».
+**« Source altérée » couvre tous les formats, CD compris** (#9067, décision
+de Bertrand du 19/11, fil 2915 ; elle remplace celle du 18/11, « un CD n'est
+jamais Hi-Res douteux »). Le mot rangé et publié reste `douteux` : seuls les
+libellés changent (« Source altérée »). Un CD (16 bits, 48 kHz au plus) n'est
+altéré que sur la signature d'un codec avec perte : une coupure **en mur**
+(au moins 40 dB de chute entre les 500 Hz sous le bord et tout ce qui suit
+1 kHz au-dessus, jusqu'à Nyquist ; dans au moins la moitié des fenêtres en
+cause) à partir de **15 kHz et sous 20 kHz** (passe-bas d'un encodeur :
+~16 kHz à 128 kbit/s, 19-20 kHz à 320). Jamais sur une pente douce avant
+20 kHz (vieille bande, master sombre), un filtre qui n'est pas un mur, un mur
+sous 15 kHz, ni un mur à 20 kHz ou au-dessus. Borne haute abaissée de 20,5 à
+20 kHz le 19/11 (décision de Bertrand après #9139) : le filtre d'un vrai CD
+coupe souvent entre 20,0 et 20,5 kHz, et un vrai CD ne doit jamais être marqué
+altéré, quitte à laisser passer certains MP3 à 320 kbit/s.
+Raison : `mur_de_codec`. Les règles des fichiers qui se disent hi-res ne
+changent pas.
+
+Lignes déjà rangées : un CD rangé `douteux` sous une autre raison que
+`mur_de_codec` (jugé sur la seule coupure, avant #9067) se LIT `conforme`
+partout et la passe le REMESURE une fois ; de même un CD rangé `mur_de_codec`
+avec un mur à 20 kHz ou au-dessus (jugé par #9139 avec la borne de 20,5 kHz).
+Un CD rangé `conforme` avec une coupure sous 20,5 kHz et sans raison (jugé du
+18 au 19/11) est remesuré aussi.
+Après remesure, la ligne porte `mur_de_codec` (altérée) ou, conforme, la
+raison interne `coupure_sans_mur` (jamais publiée) : elle n'est plus
+candidate. La règle de la moitié se compte sur **toutes** les pistes mesurées
+concluantes (vérifiées, conformes ou altérées) : une piste altérée sur dix ne
+fait pas un album altéré.
 
 « Douteux » masqué : un album qui a la moindre piste douteuse (même sous la
 moitié) se publie `non_analyse`, jamais `verifie` ni `conforme` — dans la
@@ -44,6 +65,7 @@ Raisons d'un « douteux » (#9035) :
 | `bits_de_remplissage` | les bits de poids faible sont toujours nuls |
 | `bande_de_cd` | un hi-res sans rien au-dessus de 20 à 24 kHz |
 | `coupure_spectrale` | le spectre coupé net sous 20 kHz, SANS signature de codec : origine possible, codec avec perte ou filtrage au mastering |
+| `mur_de_codec` | #9067 — un CD coupé en mur entre 15 kHz (inclus) et 20 kHz (exclu) (`coupure_hz`) : la signature d'un encodeur avec perte |
 | `signature_de_codec` | la coupure, ET des bandes de l'aigu vidées par intermittence sous elle : des trous **compatibles** avec un codec avec perte (calibré sur un encodeur simulé ; le libellé reste prudent tant qu'il n'est pas calibré sur de vrais fichiers) |
 
 `coupure_de_codec`, rangé avant #9035 sur la seule fréquence de coupure, n'est
@@ -63,7 +85,7 @@ douteux ou non :
 | Champ | Valeur |
 |---|---|
 | `pistes_douteuses` | combien de pistes de l'album sont douteuses |
-| `pistes_mesurees` | sur combien de pistes mesurées qui se disent hi-res (vérifiées ou douteuses, #9067) |
+| `pistes_mesurees` | sur combien de pistes mesurées concluantes (vérifiées, conformes ou altérées, #9067) |
 | `raison_pistes` | la raison la plus fréquente des pistes douteuses (celle de l'album quand il est douteux) |
 | `coupure_hz` | médiane des coupures des pistes douteuses qui portent `raison_pistes` |
 
@@ -78,7 +100,7 @@ mesuré. Le verdict reste en base ; poser le réglage le montre partout.
 
 | Route | Corps | Réponse |
 |---|---|---|
-| `GET /library/hires-check` | — | `{"active", "douteux_visible", "restantes", "rangees"}` |
+| `GET /library/hires-check` | — | `{"active", "douteux_visible", "restantes", "rangees", "catalogue_hires_verdict", "source_alteree"}` |
 | `POST` ou `PUT /library/hires-check` | `{"active"?, "douteux_visible"?}` | `{"active", "douteux_visible"}` |
 
 Les deux champs sont facultatifs : un champ absent garde sa valeur, sauf un
@@ -87,6 +109,19 @@ l'interrupteur « Détecter les faux Hi-Res » de Réglages › Bibliothèque �
 arme la passe ET montre « douteux » ; `{"active": false}` seul la désarme et
 le masque. Un `douteux_visible` fourni dans le même corps l'emporte. Sans geste
 de l'utilisateur, rien ne change : passe éteinte, « douteux » masqué.
+
+## Compatibilité « Source altérée » (#9067)
+
+Aucun champ ne change de nom ni de valeur : `douteux`, `douteux_visible`,
+`hires_verdict`, `faux_hires_douteux_visible` restent. En plus :
+
+- `GET /library/hires-check` rend `"source_alteree": true` : le client web
+  relibelle « Hi-Res douteux » en « Source altérée » devant un serveur qui le
+  dit ;
+- `altere` (et `alteree`) est accepté comme ALIAS d'entrée de `douteux` :
+  `?hires_verdict=altere`, le catalogue, le critère `hires_verdict` des règles
+  et la requête texte (`hires:altere`). Le mot publié reste `douteux` ;
+- une raison de plus, `mur_de_codec`.
 
 ## Liste des albums : `GET /library/albums`
 

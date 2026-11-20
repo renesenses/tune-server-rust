@@ -115,12 +115,7 @@ pub(super) async fn verdict_album(
     let raison_pistes = en_cause.as_ref().and_then(|c| c.2.clone());
     // La coupure ne se dit que pour une raison de coupure (pas pour des bits
     // de remplissage).
-    let de_coupure = |r: &&String| {
-        matches!(
-            r.as_str(),
-            "bande_de_cd" | "coupure_spectrale" | "signature_de_codec"
-        )
-    };
+    let de_coupure = |r: &&String| tune_core::audio::faux_hires::raison_de_coupure(r);
     let coupure_hz = raison_pistes.as_ref().filter(de_coupure).and_then(|r| {
         let mut f: Vec<f64> = coupures
             .iter()
@@ -159,6 +154,11 @@ pub(super) async fn etat(State(state): State<AppState>) -> Json<Value> {
         // client web n'active l'export d'un filtre « Hi-Res vérifié /
         // douteux » que devant un serveur qui le dit.
         "catalogue_hires_verdict": true,
+        // #9067 (19/11) — « Source altérée » : le verdict `douteux` couvre
+        // tous les formats, CD compris (raison `mur_de_codec`), et les filtres
+        // acceptent `altere` comme alias de `douteux`. Le client web relibelle
+        // la rubrique devant un serveur qui le dit.
+        "source_alteree": true,
     }))
 }
 

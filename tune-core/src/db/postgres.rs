@@ -202,6 +202,16 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
             PRIMARY KEY (profile_id, item_type, source, source_id)\
         )",
     "CREATE INDEX IF NOT EXISTS idx_streaming_hidden_items_item ON streaming_hidden_items(item_type, source, source_id)",
+    // #9158 — marque d'origine « scan » des tags tirés des balises
+    // personnelles. Sans script numéroté, même régime que la table
+    // ci-dessus : ce rattrapage rejoué à chaque démarrage la pose partout.
+    "CREATE TABLE IF NOT EXISTS item_tags_scan (\
+            tag_id BIGINT NOT NULL,\
+            item_type TEXT NOT NULL,\
+            item_id BIGINT NOT NULL,\
+            PRIMARY KEY (tag_id, item_type, item_id)\
+        )",
+    "CREATE INDEX IF NOT EXISTS idx_item_tags_scan_item ON item_tags_scan(item_type, item_id)",
     // « Pas pour moi » de l'accueil (web#916, PG 111). Ici AUSSI : une base
     // PostgreSQL convertie avant cette version ne rejoue pas la 111, et les
     // rangées de `/home/*` LISENT la table à chaque affichage.
@@ -473,6 +483,9 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // AUSSI, même raison : une base de bascule ne rejouera jamais la 087, alors
     // que l'écriture de la file nomme la colonne.
     "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS artist_ref TEXT",
+    "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS media_format TEXT",
+    "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS sample_rate INTEGER",
+    "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS bit_depth INTEGER",
     // #6466 — le conteneur de chaque élément de file (PG 092). Ici AUSSI :
     // une base de bascule ne rejouera jamais la 092.
     "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS context_type TEXT",

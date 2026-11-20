@@ -49,6 +49,25 @@
 //! | `GET /contacts/{user_id}/library/tracks?…`             | idem, requête comprise                 |
 //! | `GET /library-sync`                                    | — (état LOCAL de la copie en ligne)    |
 //!
+//! Le cercle partagé (site-mozaiklabs#568, rc13) : le propriétaire partage un
+//! cercle entre ses membres, chaque membre choisit de s'y montrer. Le droit
+//! (propriété : 404 ; membre au lien actif : 404 ; cercle non partagé : 409
+//! `circle_not_shared`, pour `PUT …/show-me` seulement — `DELETE …/show-me`
+//! rend 200, idempotent, même si le cercle n'est plus partagé) est jugé par
+//! le cloud seul et relayé avec son corps. Sans corps dans les deux sens ;
+//! `{id}` en chiffres seulement, sinon `404 circle.not_found` sans appel.
+//!
+//! Ces routes, comme toutes les écritures du greffon, sont réservées à
+//! l'administrateur du serveur et refusées à distance : la garde est posée
+//! par l'hôte (`tune_server::garde_du_cercle`).
+//!
+//! | Tune (`/api/v1/ext/circle`)                  | mozaiklabs (`/api/v1/circle`)          |
+//! |----------------------------------------------|----------------------------------------|
+//! | `PUT /circles/{id}/sharing/members`          | idem → le cercle, `members_see_each_other` |
+//! | `DELETE /circles/{id}/sharing/members`       | idem                                   |
+//! | `PUT /member-of/{id}/show-me`                | idem → l'entrée `member_of`, `show_me` ; 409 si non partagé |
+//! | `DELETE /member-of/{id}/show-me`             | idem, 200 idempotent                   |
+//!
 //! rc8 (#6900), l'écran de Levente et le globe opt-in, dans [`crate::globe`] :
 //! `GET /contacts/{user_id}/library/summary`, `GET|PUT|DELETE /me/location`,
 //! `GET /contacts/locations`, relayés à l'identique.
@@ -165,6 +184,15 @@ pub fn router(relais: Arc<Relais>, license: Arc<LicenseManager>) -> Router<()> {
         .route(
             "/circles/{id}/sharing/library",
             put(partager).delete(ne_plus_partager),
+        )
+        // Le cercle partagé (site-mozaiklabs#568).
+        .route(
+            "/circles/{id}/sharing/members",
+            put(partager_entre_membres).delete(ne_plus_partager_entre_membres),
+        )
+        .route(
+            "/member-of/{id}/show-me",
+            put(me_montrer).delete(ne_plus_me_montrer),
         )
         .route("/shared-with-me", get(partage_avec_moi))
         .route("/contacts/{user_id}/library/stats", get(bibliotheque_stats))
@@ -652,6 +680,80 @@ async fn deranger(
             )
             .await,
     )
+}
+
+// Le cercle partagé (site-mozaiklabs#568) -----------------------------------
+
+/// Un identifiant de cercle : des chiffres, et rien d'autre. Les quatre
+/// interrupteurs du cercle partagé ne relaient qu'un cercle désigné par son
+/// numéro — le contrat du cloud n'en connaît pas d'autre forme.
+pub(crate) fn identifiant_numerique(id: &str) -> bool {
+    (1..=20).contains(&id.len()) && id.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Un interrupteur du cercle partagé : sans corps, statut et corps du cloud
+/// relayés tels quels (404, 409 `circle_not_shared`, 403, 429…).
+async fn interrupteur(
+    relais: &Relais,
+    route: &'static str,
+    methode: Method,
+    segments: &[&str],
+    id: &str,
+) -> Response {
+    if !identifiant_numerique(id) {
+        return introuvable();
+    }
+    en_reponse(relais.appeler(route, methode, segments, None).await)
+}
+
+async fn partager_entre_membres(
+    State(relais): State<Arc<Relais>>,
+    Path(id): Path<String>,
+) -> Response {
+    interrupteur(
+        &relais,
+        "PUT /circles/{id}/sharing/members",
+        Method::PUT,
+        &["circles", &id, "sharing", "members"],
+        &id,
+    )
+    .await
+}
+
+async fn ne_plus_partager_entre_membres(
+    State(relais): State<Arc<Relais>>,
+    Path(id): Path<String>,
+) -> Response {
+    interrupteur(
+        &relais,
+        "DELETE /circles/{id}/sharing/members",
+        Method::DELETE,
+        &["circles", &id, "sharing", "members"],
+        &id,
+    )
+    .await
+}
+
+async fn me_montrer(State(relais): State<Arc<Relais>>, Path(id): Path<String>) -> Response {
+    interrupteur(
+        &relais,
+        "PUT /member-of/{id}/show-me",
+        Method::PUT,
+        &["member-of", &id, "show-me"],
+        &id,
+    )
+    .await
+}
+
+async fn ne_plus_me_montrer(State(relais): State<Arc<Relais>>, Path(id): Path<String>) -> Response {
+    interrupteur(
+        &relais,
+        "DELETE /member-of/{id}/show-me",
+        Method::DELETE,
+        &["member-of", &id, "show-me"],
+        &id,
+    )
+    .await
 }
 
 // T2 : le catalogue d'un contact, en lecture (#5325) -------------------------
