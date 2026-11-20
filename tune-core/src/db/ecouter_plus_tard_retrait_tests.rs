@@ -50,6 +50,9 @@ fn piste_qobuz(id: &str, album: &str) -> QueueInput {
         disc_number: None,
         album_ref: Some(album.into()),
         artist_ref: None,
+        media_format: None,
+        sample_rate: None,
+        bit_depth: None,
     }
 }
 
