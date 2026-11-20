@@ -1336,7 +1336,9 @@ pub(crate) fn pseudo_de_la_saisie(brut: &str) -> Result<String, EchecLiaison> {
             _ => return Err(EchecLiaison::PseudoInvalide),
         }
     } else if let Some(sous_domaine) = hote_min.strip_suffix(".bandcamp.com") {
-        return Err(EchecLiaison::PageArtiste(format!("{sous_domaine}.bandcamp.com")));
+        return Err(EchecLiaison::PageArtiste(format!(
+            "{sous_domaine}.bandcamp.com"
+        )));
     } else if chemin.is_none_or(|c| c.trim_matches('/').is_empty()) {
         // Le cas courant : le pseudo seul (un `/` final toléré).
         hote
@@ -1496,7 +1498,8 @@ async fn bc_lier_compte(
         }))
         .into_response(),
         Err(e @ (EchecLiaison::PseudoInvalide | EchecLiaison::PageArtiste(_))) => {
-            let (code, message) = refus_de_saisie(&e).unwrap_or(("invalid_username", String::new()));
+            let (code, message) =
+                refus_de_saisie(&e).unwrap_or(("invalid_username", String::new()));
             (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": message, "code": code})),
@@ -3058,7 +3061,11 @@ mod tests_saisie_pseudo_9152 {
             "https://bandcamp.com/didierv#collection",
             "https://bandcamp.com/didierv/wishlist",
         ] {
-            assert_eq!(pseudo(saisie).as_deref(), Some("didierv"), "saisie {saisie:?}");
+            assert_eq!(
+                pseudo(saisie).as_deref(),
+                Some("didierv"),
+                "saisie {saisie:?}"
+            );
         }
     }
 
@@ -3076,7 +3083,10 @@ mod tests_saisie_pseudo_9152 {
             }
         }
         let e = pseudo_de_la_saisie("artiste.bandcamp.com").err().unwrap();
-        assert_eq!(refus_de_saisie(&e).unwrap().0, "artist_page_not_fan_profile");
+        assert_eq!(
+            refus_de_saisie(&e).unwrap().0,
+            "artist_page_not_fan_profile"
+        );
     }
 
     /// Contre-épreuve : ce qui n'a pas de pseudo reste refusé.
@@ -3091,7 +3101,10 @@ mod tests_saisie_pseudo_9152 {
             "nom/autre",
         ] {
             assert!(
-                matches!(pseudo_de_la_saisie(saisie), Err(EchecLiaison::PseudoInvalide)),
+                matches!(
+                    pseudo_de_la_saisie(saisie),
+                    Err(EchecLiaison::PseudoInvalide)
+                ),
                 "saisie {saisie:?}"
             );
         }
