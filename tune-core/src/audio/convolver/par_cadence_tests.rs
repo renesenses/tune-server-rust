@@ -297,13 +297,22 @@ fn une_frequence_hors_bornes_est_refusee_au_chargement_8761() {
         let e = ConvolverConfig::from_wav(p.to_str().unwrap())
             .err()
             .unwrap_or_else(|| panic!("{sr} Hz doit être refusé"));
-        assert!(e.contains("hors des bornes") || e.contains("cadence"), "{sr} : {e}");
-        assert!(ConvolverConfig::new(vec![vec![1.0]], sr).is_err(), "{sr} en mémoire");
+        assert!(
+            e.contains("hors des bornes") || e.contains("cadence"),
+            "{sr} : {e}"
+        );
+        assert!(
+            ConvolverConfig::new(vec![vec![1.0]], sr).is_err(),
+            "{sr} en mémoire"
+        );
     }
     for sr in [8_000u32, 768_000] {
         let p = d.path().join(format!("ok{sr}.wav"));
         wav_brut(&p, sr, 64);
-        assert!(ConvolverConfig::from_wav(p.to_str().unwrap()).is_ok(), "{sr}");
+        assert!(
+            ConvolverConfig::from_wav(p.to_str().unwrap()).is_ok(),
+            "{sr}"
+        );
     }
     // Dans un jeu, un fichier aberrant est écarté sans priver la zone des
     // autres ; en principal, il refuse le jeu (avertissement à l'appelant).
@@ -319,7 +328,9 @@ fn une_ri_trop_longue_est_refusee_8761() {
     let d = crate::test_scratch::scratch_dir("ri-8761-longue");
     let p = d.path().join("longue.wav");
     wav_brut(&p, 48_000, PRISES_MAX + 1);
-    let e = ConvolverConfig::from_wav(p.to_str().unwrap()).err().expect("refus");
+    let e = ConvolverConfig::from_wav(p.to_str().unwrap())
+        .err()
+        .expect("refus");
     assert!(e.contains("prises"), "{e}");
     // Admise à sa cadence, mais trop longue une fois rééchantillonnée :
     // prises × rapport est plafonné, le moteur n'est pas bâti.
@@ -337,20 +348,34 @@ fn seuls_les_fichiers_de_la_zone_dans_ir_sont_effacables_8761() {
     let autre = d.path().join("autre");
     std::fs::create_dir_all(&ir).unwrap();
     std::fs::create_dir_all(&autre).unwrap();
-    for f in ["zone_7.wav", "zone_7_sr96000.wav", "zone_8.wav", "notes.wav"] {
+    for f in [
+        "zone_7.wav",
+        "zone_7_sr96000.wav",
+        "zone_8.wav",
+        "notes.wav",
+    ] {
         std::fs::write(ir.join(f), b"x").unwrap();
     }
     std::fs::write(autre.join("zone_7.wav"), b"x").unwrap();
     let ok = |p: std::path::PathBuf| chemin_du_jeu_effacable(&p, &ir, 7);
     assert!(ok(ir.join("zone_7.wav")));
     assert!(ok(ir.join("zone_7_sr96000.wav")));
-    assert!(ok(ir.join("..").join("ir").join("zone_7.wav")), "même dossier une fois résolu");
-    assert!(!ok(ir.join("..").join("autre").join("zone_7.wav")), "« ../ » hors de ir/");
+    assert!(
+        ok(ir.join("..").join("ir").join("zone_7.wav")),
+        "même dossier une fois résolu"
+    );
+    assert!(
+        !ok(ir.join("..").join("autre").join("zone_7.wav")),
+        "« ../ » hors de ir/"
+    );
     assert!(!ok(autre.join("zone_7.wav")));
     assert!(!ok(ir.join("zone_8.wav")), "autre zone");
     assert!(!ok(ir.join("notes.wav")));
     assert!(!ok(std::path::PathBuf::from("/etc/passwd")));
-    assert!(autre.join("zone_7.wav").exists(), "rien n'est supprimé par la garde");
+    assert!(
+        autre.join("zone_7.wav").exists(),
+        "rien n'est supprimé par la garde"
+    );
 
     assert!(nom_du_jeu_valide("zone_7_sr44100.wav", Some(7)));
     assert!(!nom_du_jeu_valide("zone_7_sr.wav", Some(7)));

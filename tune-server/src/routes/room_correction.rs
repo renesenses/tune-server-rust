@@ -691,7 +691,11 @@ async fn clear_ir_handler(
         if tune_core::audio::convolver::par_cadence::chemin_du_jeu_effacable(p, &ir_dir, zone_id) {
             std::fs::remove_file(p).ok();
         } else {
-            tracing::warn!(zone_id, chemin, "convolver_ir_suppression_refusee_hors_dossier");
+            tracing::warn!(
+                zone_id,
+                chemin,
+                "convolver_ir_suppression_refusee_hors_dossier"
+            );
         }
     };
     let mut supplementaires =

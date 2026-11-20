@@ -99,7 +99,10 @@ pub fn ri_admise(taps: &[Vec<f32>], sample_rate: u32) -> Result<(), String> {
 /// configuration venue d'une autre machine).
 pub fn nom_du_jeu_valide(nom: &str, zone_id: Option<i64>) -> bool {
     let chiffres = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
-    let Some(corps) = nom.strip_prefix("zone_").and_then(|r| r.strip_suffix(".wav")) else {
+    let Some(corps) = nom
+        .strip_prefix("zone_")
+        .and_then(|r| r.strip_suffix(".wav"))
+    else {
         return false;
     };
     let id = match corps.split_once("_sr") {
@@ -310,7 +313,11 @@ pub fn reechantillonner_ri(taps: &[Vec<f32>], de: u32, vers: u32) -> Vec<Vec<f32
     let n = sortie.len() / canaux;
     let debut = retard.min(n);
     (0..canaux)
-        .map(|c| (debut..n).map(|i| sortie[i * canaux + c] * echelle).collect())
+        .map(|c| {
+            (debut..n)
+                .map(|i| sortie[i * canaux + c] * echelle)
+                .collect()
+        })
         .collect()
 }
 
@@ -330,7 +337,9 @@ struct CacheRi {
 static CACHE: LazyLock<Mutex<CacheRi>> = LazyLock::new(|| Mutex::new(CacheRi::default()));
 
 fn octets_de(ri: &[Vec<f32>]) -> usize {
-    ri.iter().map(|c| c.len() * std::mem::size_of::<f32>()).sum()
+    ri.iter()
+        .map(|c| c.len() * std::mem::size_of::<f32>())
+        .sum()
 }
 
 /// La RI de `variante` à la cadence `vers`, depuis le cache ou calculée (le

@@ -982,9 +982,7 @@ pub fn appliquer(backend: &Arc<dyn DbBackend>, plan: &Plan) -> Result<Bilan, Str
                     };
                     texte = liste;
                 }
-                settings
-                    .set(&cle, &texte)
-                    .map_err(|e| etape(&bilan, e))?;
+                settings.set(&cle, &texte).map_err(|e| etape(&bilan, e))?;
             }
         }
         if nouvelle {
