@@ -56,9 +56,14 @@ pub fn encode_ogg_opus(
     let mut out_buf = vec![0u8; 4000]; // max recommended packet size
     let total_frames = pcm.len() / chu;
     let mut frame = vec![0i16; FRAME_SAMPLES * chu];
+    // #8982 — l'encodeur retarde le signal de `pre_skip` trames : il faut lui
+    // faire coder `total_frames + pre_skip` trames (complétées de silence)
+    // pour que les dernières trames du signal sortent. Sans cela la fin du
+    // morceau n'était jamais codée.
+    let a_coder = total_frames + pre_skip as usize;
     let mut offset = 0usize;
-    while offset < total_frames {
-        let avail = (total_frames - offset).min(FRAME_SAMPLES);
+    while offset < a_coder {
+        let avail = total_frames.saturating_sub(offset).min(FRAME_SAMPLES);
         let src = &pcm[offset * chu..(offset + avail) * chu];
         // Final partial frame: pad with silence, granulepos trims the tail.
         frame[..src.len()].copy_from_slice(src);
@@ -67,7 +72,7 @@ pub fn encode_ogg_opus(
             .encode(&frame, &mut out_buf)
             .map_err(|e| format!("opus encode: {e}"))?;
         packets.push(out_buf[..n].to_vec());
-        offset += avail;
+        offset += FRAME_SAMPLES;
     }
 
     // --- Ogg encapsulation ----------------------------------------------
@@ -94,8 +99,10 @@ pub fn encode_ogg_opus(
     tags.extend_from_slice(&0u32.to_le_bytes()); // no comments
     ogg.write_page(&[&tags], 0, false, false);
 
-    // Audio pages. Granulepos = pre-skip + samples decodable up to and
-    // including this page; the final page's value trims the padded tail.
+    // Audio pages. Granulepos = samples DECODED up to and including this page
+    // (the pre-skip frames are part of them, RFC 7845 §4) ; the final page's
+    // value, pre-skip + useful samples, trims the padded tail. Les pages
+    // intermédiaires annonçaient `pre_skip` trames de trop (#8982).
     let mut samples_done = 0u64;
     for (i, group) in packets.chunks(PACKETS_PER_PAGE).enumerate() {
         let is_last = (i + 1) * PACKETS_PER_PAGE >= packets.len();
@@ -104,7 +111,7 @@ pub fn encode_ogg_opus(
         let granule = if is_last {
             pre_skip as u64 + total_frames as u64
         } else {
-            pre_skip as u64 + samples_done
+            samples_done
         };
         let refs: Vec<&[u8]> = group.iter().map(|p| p.as_slice()).collect();
         ogg.write_page(&refs, granule, false, is_last);
@@ -326,6 +333,57 @@ mod tests {
             / decoded.samples_i32.len() as f64)
             .sqrt();
         assert!(rms > 1000.0, "decoded signal is near-silent: rms={rms}");
+    }
+
+    /// #8982 — longueur et calage exacts. Un signal de 47 123 trames (ni
+    /// multiple de 960, ni de 312) encodé puis relu par la chaîne de Tune doit
+    /// revenir avec 47 123 trames, sans les `pre_skip` trames d'amorce en tête
+    /// ni le remplissage du dernier paquet en queue, et sans perdre sa fin
+    /// (l'encodeur est vidé). Avant : 47 123 + 312 + remplissage rendues, la
+    /// fin du signal jamais codée.
+    #[test]
+    fn aller_retour_rend_la_longueur_exacte_et_le_calage_8982() {
+        const TRAMES: usize = 47_123;
+        let pcm: Vec<i16> = (0..TRAMES)
+            .flat_map(|n| {
+                let v = ((2.0 * std::f64::consts::PI * 440.0 * n as f64 / 48000.0).sin()
+                    * 16000.0) as i16;
+                [v, v]
+            })
+            .collect();
+        let bytes = encode_ogg_opus(&pcm, 2, 192, 48000).expect("encode");
+        let dir = crate::test_scratch::scratch_dir("tune-opus-8982");
+        let path = dir.join("longueur.opus");
+        std::fs::write(&path, &bytes).unwrap();
+        let decoded =
+            crate::audio::decode::decode_to_pcm(path.to_str().unwrap(), None, None, 0.0, 0.0)
+                .expect("decode back");
+        assert_eq!(decoded.samples_i32.len() / 2, TRAMES, "longueur décodée");
+        assert!(
+            !decoded.integrite.perte_detectee(),
+            "la longueur annoncée (granule − pre-skip) doit valoir la longueur rendue : {:?}",
+            decoded.integrite
+        );
+        // Calage : le décalage qui aligne le mieux la source et le décodé, au
+        // milieu du signal, est nul (il valait le pre-skip, 312 trames).
+        let src = channel_f64(&pcm.iter().map(|&s| i32::from(s)).collect::<Vec<_>>(), 2, 0);
+        let dec = channel_f64(&decoded.samples_i32, 2, 0);
+        let fenetre = 4_800usize;
+        let base = 20_000usize;
+        let erreur = |lag: i64| -> f64 {
+            (0..fenetre)
+                .map(|i| {
+                    let a = src[base + i];
+                    let b = dec[(base as i64 + i as i64 + lag) as usize];
+                    (a - b) * (a - b)
+                })
+                .sum()
+        };
+        let meilleur = (-400i64..=400).min_by(|a, b| erreur(*a).total_cmp(&erreur(*b))).unwrap();
+        // Un sinus de 440 Hz se recale aussi à ±109 trames (une période) :
+        // seul le décalage nul est admis, la fenêtre de recherche couvre le
+        // pre-skip.
+        assert_eq!(meilleur, 0, "décalage du décodé par rapport à la source");
     }
 
     /// `seconds` de deux sinus distincts — `fl` à gauche, `fr` à droite —
