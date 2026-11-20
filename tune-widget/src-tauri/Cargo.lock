@@ -758,7 +758,7 @@ dependencies = [
  "libc",
  "option-ext",
  "redox_users",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -944,7 +944,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1006,6 +1006,17 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+]
+
+[[package]]
+name = "flume"
+version = "0.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e139bc46ca777eb5efaf62df0ab8cc5fd400866427e56c68b22e414e53bd3be"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "spin",
 ]
 
 [[package]]
@@ -1256,16 +1267,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "gethostname"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1bd49230192a3797a9a4d6abe9b3eed6f7fa4c8a8a4947977c6f80025f92cbd8"
-dependencies = [
- "rustix",
- "windows-link 0.2.1",
-]
-
-[[package]]
 name = "getrandom"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1390,24 +1391,6 @@ name = "glob"
 version = "0.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0cc23270f6e1808e30a928bdc84dea0b9b4136a8bc82338574f23baf47bbd280"
-
-[[package]]
-name = "global-hotkey"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8c386b0a4a70cb2d39fffd74480f985b6f0bfbcb934b6a6b6b7e630e448f242e"
-dependencies = [
- "crossbeam-channel",
- "keyboard-types",
- "objc2",
- "objc2-app-kit",
- "once_cell",
- "serde",
- "thiserror 2.0.18",
- "windows-sys 0.59.0",
- "x11rb",
- "xkeysym",
-]
 
 [[package]]
 name = "gobject-sys"
@@ -1775,6 +1758,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "image"
 version = "0.25.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1999,9 +1992,9 @@ dependencies = [
 
 [[package]]
 name = "libc"
-version = "0.2.186"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libdbus-sys"
@@ -2029,6 +2022,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f02ab6bace2054fb888a3c16f990117b579d14a3088e472d63c6011fa185c9d3"
 dependencies = [
  "libc",
+]
+
+[[package]]
+name = "libxdo"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "00333b8756a3d28e78def82067a377de7fa61b24909000aeaa2b446a948d14db"
+dependencies = [
+ "libxdo-sys",
+]
+
+[[package]]
+name = "libxdo-sys"
+version = "0.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "db23b9e7e2b7831bbd8aac0bbeeeb7b68cbebc162b227e7052e8e55829a09212"
+dependencies = [
+ "libc",
+ "x11",
 ]
 
 [[package]]
@@ -2076,6 +2088,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mdns-sd"
+version = "0.20.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86dbb9f00c8c367f75ed3a775d3eb31d0375a72f58275ef64a1bc53c255a2ce2"
+dependencies = [
+ "fastrand",
+ "flume",
+ "if-addrs",
+ "log",
+ "mio",
+ "socket-pktinfo",
+ "socket2",
+]
+
+[[package]]
 name = "memchr"
 version = "2.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2113,6 +2140,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02bd0af71c67b473010cbbc60715ee815645a4dc942899111f494b4b737d6fda"
 dependencies = [
  "libc",
+ "log",
  "wasi",
  "windows-sys 0.61.2",
 ]
@@ -2137,6 +2165,7 @@ dependencies = [
  "dpi",
  "gtk",
  "keyboard-types",
+ "libxdo",
  "objc2",
  "objc2-app-kit",
  "objc2-core-foundation",
@@ -2184,7 +2213,7 @@ version = "0.50.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7957b9740744892f114936ab4a57b3f487491bbeafaf8083688b16841a4240e5"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2824,7 +2853,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3089,7 +3118,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3520,6 +3549,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
+name = "socket-pktinfo"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "512f5c35377cf69f350b106df2366c3a1df6bd01b047a7a58c8390b70d28838d"
+dependencies = [
+ "libc",
+ "socket2",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "socket2"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3575,6 +3615,15 @@ dependencies = [
  "gobject-sys",
  "libc",
  "system-deps",
+]
+
+[[package]]
+name = "spin"
+version = "0.9.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
+dependencies = [
+ "lock_api",
 ]
 
 [[package]]
@@ -3889,21 +3938,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tauri-plugin-global-shortcut"
-version = "2.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4dd9f4c5136c09cd962da0c86dc4accd4666db2ea591cf16e6597435843bd2b"
-dependencies = [
- "global-hotkey",
- "log",
- "serde",
- "serde_json",
- "tauri",
- "tauri-plugin",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "tauri-plugin-opener"
 version = "2.5.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4051,7 +4085,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4491,12 +4525,14 @@ version = "0.1.7"
 dependencies = [
  "dirs",
  "futures-util",
+ "mdns-sd",
+ "muda",
+ "objc2",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tauri",
  "tauri-build",
- "tauri-plugin-global-shortcut",
  "tauri-plugin-opener",
  "tauri-plugin-single-instance",
  "tokio",
@@ -4991,7 +5027,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -5601,29 +5637,6 @@ dependencies = [
  "once_cell",
  "pkg-config",
 ]
-
-[[package]]
-name = "x11rb"
-version = "0.13.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9993aa5be5a26815fe2c3eacfc1fde061fc1a1f094bf1ad2a18bf9c495dd7414"
-dependencies = [
- "gethostname",
- "rustix",
- "x11rb-protocol",
-]
-
-[[package]]
-name = "x11rb-protocol"
-version = "0.13.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
-
-[[package]]
-name = "xkeysym"
-version = "0.2.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9cc00251562a284751c9973bace760d86c0276c471b4be569fe6b068ee97a56"
 
 [[package]]
 name = "yoke"
