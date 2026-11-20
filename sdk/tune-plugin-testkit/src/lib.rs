@@ -6,9 +6,35 @@ pub mod batch;
 use std::collections::VecDeque;
 use tune_plugin_sdk::{Error, Settings, audio::*, observation::SpectrumFrame};
 
-pub struct Capture {
-    pub samples: Vec<f32>,
+pub struct Capture<T = f32> {
+    pub samples: Vec<T>,
     pub reports: Vec<ProcessReport>,
+}
+
+/// The two float encodings a test host renders: `F32`, and `F64` for a
+/// plugin that requests `audio-f64` (TESS T05).
+trait Scalar: Copy + Default {
+    const ENCODING: SampleEncoding;
+    fn finite(self) -> bool;
+    fn samples(s: &mut [Self]) -> SamplesMut<'_>;
+}
+impl Scalar for f32 {
+    const ENCODING: SampleEncoding = SampleEncoding::F32;
+    fn finite(self) -> bool {
+        self.is_finite()
+    }
+    fn samples(s: &mut [Self]) -> SamplesMut<'_> {
+        SamplesMut::F32(s)
+    }
+}
+impl Scalar for f64 {
+    const ENCODING: SampleEncoding = SampleEncoding::F64;
+    fn finite(self) -> bool {
+        self.is_finite()
+    }
+    fn samples(s: &mut [Self]) -> SamplesMut<'_> {
+        SamplesMut::F64(s)
+    }
 }
 
 /// Exercise planning, preparation, multiple blocks and end-of-stream. Bypass
@@ -22,7 +48,49 @@ pub fn render_f32(
     input: &[f32],
     chunk_frames: usize,
 ) -> Result<Capture, Error> {
-    if format.encoding() != SampleEncoding::F32 {
+    render(
+        factory,
+        context,
+        licensed,
+        settings,
+        format,
+        input,
+        chunk_frames,
+    )
+}
+
+/// TESS T05 — [`render_f32`] with `F64` blocks, for a plugin that requests
+/// `audio-f64`: the factory receives `F64` and nothing is converted.
+pub fn render_f64(
+    factory: &dyn DspFactory,
+    context: PlaybackContext,
+    licensed: bool,
+    settings: &Settings,
+    format: AudioFormat,
+    input: &[f64],
+    chunk_frames: usize,
+) -> Result<Capture<f64>, Error> {
+    render(
+        factory,
+        context,
+        licensed,
+        settings,
+        format,
+        input,
+        chunk_frames,
+    )
+}
+
+fn render<T: Scalar>(
+    factory: &dyn DspFactory,
+    context: PlaybackContext,
+    licensed: bool,
+    settings: &Settings,
+    format: AudioFormat,
+    input: &[T],
+    chunk_frames: usize,
+) -> Result<Capture<T>, Error> {
+    if format.encoding() != T::ENCODING {
         return Err(Error::UnsupportedFormat);
     }
     if chunk_frames == 0 {
@@ -54,7 +122,7 @@ pub fn render_f32(
     let mut processor = factory.prepare(format, chunk_frames, settings)?;
     for (index, chunk) in input.chunks(chunk_samples).enumerate() {
         let mut samples = chunk.to_vec();
-        let mut block = AudioBlock::new(format, SamplesMut::F32(&mut samples), chunk_frames)?;
+        let mut block = AudioBlock::new(format, T::samples(&mut samples), chunk_frames)?;
         let report = processor.process(
             &mut block,
             BlockContext {
@@ -63,7 +131,7 @@ pub fn render_f32(
                 position_frames: (index * chunk_frames) as u64,
             },
         )?;
-        if samples.iter().any(|s| !s.is_finite()) {
+        if samples.iter().any(|s| !s.finite()) {
             return Err(Error::NonFinite);
         }
         capture.samples.extend(samples);
@@ -71,15 +139,15 @@ pub fn render_f32(
     }
     // A broken drain must fail rather than hang a CI worker indefinitely.
     for _ in 0..1024 {
-        let mut samples = vec![0.0; chunk_samples];
-        let mut block = AudioBlock::new(format, SamplesMut::F32(&mut samples), chunk_frames)?;
+        let mut samples = vec![T::default(); chunk_samples];
+        let mut block = AudioBlock::new(format, T::samples(&mut samples), chunk_frames)?;
         let report = processor.drain(&mut block)?;
         if report.frames_written > chunk_frames || (!report.complete && report.frames_written == 0)
         {
             return Err(Error::InvalidState);
         }
         let written = &samples[..report.frames_written * channels];
-        if written.iter().any(|s| !s.is_finite()) {
+        if written.iter().any(|s| !s.finite()) {
             return Err(Error::NonFinite);
         }
         capture.samples.extend_from_slice(written);
