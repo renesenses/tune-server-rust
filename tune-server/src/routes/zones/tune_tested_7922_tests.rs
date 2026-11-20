@@ -98,7 +98,9 @@ fn banc(base: &str, reglages: &[(&str, &str)]) -> Banc {
         .create("PRIVATE kitchen", Some("dlna"), Some(UDN))
         .unwrap();
     Banc {
-        app: crate::routes::router(state),
+        app: crate::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+        )),
         settings,
         zone,
     }
