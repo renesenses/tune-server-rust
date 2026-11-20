@@ -479,3 +479,60 @@ fn les_diagnostics_d_un_reglage_viennent_du_greffon() {
         crate::audio::natifs_tiers::valider_reglage(&id, &serde_json::json!({"gain": 0.5})).is_ok()
     );
 }
+
+/// TESS T03 (relecture de #9024) — un étage casque qui porte le crossfeed
+/// intégré ET un greffon natif tiers (une VRAIE bibliothèque native) passe par
+/// la chaîne TESS de la sortie locale avec les bits de l'ancien chemin, bloc
+/// par bloc.
+#[cfg(feature = "local-audio")]
+#[tokio::test]
+async fn crossfeed_et_natif_tiers_par_la_chaine_tess_rendent_les_bits_d_avant() {
+    let (ids, _dossier) = enregistrer_les_bibliotheques_de_test(&["gain-essai-t03"]);
+    let id = &ids[0];
+    let mut orch = orchestrateur();
+    let licence = Arc::new(crate::license::LicenseManager::new_with_limit(
+        orch.db.clone(),
+        3,
+    ));
+    orch.license = Some(licence.clone());
+    licence.set_account_premium(true, None).await;
+    let s = SettingsRepo::with_backend(orch.db.clone());
+    s.set(crate::audio::premium_plugins::MIGRATION, "complete")
+        .unwrap();
+    s.set("plugin_crossfeed_installed", "true").unwrap();
+    s.set("plugin_crossfeed_enabled", "true").unwrap();
+    s.set(
+        "zone_1_crossfeed",
+        r#"{"enabled":true,"amount":0.5,"delay_ms":0.3}"#,
+    )
+    .unwrap();
+    s.set(&format!("plugin_{id}_installed"), "true").unwrap();
+    s.set(&format!("plugin_{id}_enabled"), "true").unwrap();
+    s.set(
+        &crate::audio::natifs_tiers::cle_de_zone(1, id),
+        r#"{"enabled":true,"gain":0.5}"#,
+    )
+    .unwrap();
+    let nouveau = orch
+        .load_crossfeed_processor(1, 48_000)
+        .expect("étage casque");
+    let ancien = orch
+        .load_crossfeed_processor(1, 48_000)
+        .expect("étage casque");
+    assert_eq!(
+        nouveau.etages_tiers(),
+        1,
+        "le natif tiers doit être dans l'étage"
+    );
+    assert!(
+        nouveau
+            .decrire()
+            .iter()
+            .any(|e| e.starts_with("crossfeed:")),
+        "le crossfeed intégré doit être dans l'étage : {:?}",
+        nouveau.decrire()
+    );
+    let blocs =
+        crate::outputs::local::comparer_un_etage_casque_a_l_ancien_pour_test(nouveau, ancien);
+    assert_eq!(blocs, 10);
+}

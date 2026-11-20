@@ -264,7 +264,15 @@ pub struct Proposition {
 impl Proposition {
     /// Le profil de pièce de la zone, tel que
     /// `POST /room-correction/profiles/{zone}/apply` l'applique.
-    pub fn profil_de_zone(&self, zone_id: i64, nom: &str, maintenant: &str) -> RoomProfile {
+    /// `estimation` : calculé sans micro (C5) ; l'origine est enregistrée
+    /// dans le profil (D1 de TESS).
+    pub fn profil_de_zone(
+        &self,
+        zone_id: i64,
+        nom: &str,
+        maintenant: &str,
+        estimation: bool,
+    ) -> RoomProfile {
         let mesure: Vec<FrequencyPoint> = self
             .courbes
             .freqs_hz
@@ -294,6 +302,14 @@ impl Proposition {
                 .collect(),
             created_at: maintenant.to_string(),
             measurement_data: serde_json::to_string(&mesure).ok(),
+            origin: Some(
+                if estimation {
+                    tune_core::room_correction::ORIGINE_ESTIMEE
+                } else {
+                    tune_core::room_correction::ORIGINE_MESUREE
+                }
+                .to_owned(),
+            ),
         }
     }
 }
@@ -566,7 +582,14 @@ mod tests {
     #[test]
     fn le_profil_de_zone_est_celui_que_l_egaliseur_natif_relit() {
         let p = proposer(&salon(), &DemandeCorrection::default()).unwrap();
-        let profil = p.profil_de_zone(7, "Salon", "2026-11-04T10:00:00Z");
+        let profil = p.profil_de_zone(7, "Salon", "2026-11-04T10:00:00Z", false);
+        assert_eq!(profil.origin.as_deref(), Some("measured"));
+        assert_eq!(
+            p.profil_de_zone(7, "Salon", "2026-11-04T10:00:00Z", true)
+                .origin
+                .as_deref(),
+            Some("estimation")
+        );
         assert_eq!(profil.zone_id, "7");
         assert_eq!(profil.filters.len(), p.bandes.len());
         let eq = tune_core::room_correction::profil_eq_de_correction(&profil.filters);

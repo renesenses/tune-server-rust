@@ -131,10 +131,14 @@ Le reste est vérifié par le greffon.
 ### Groupe exclusif crossfeed / Crossfeed Pro / Crosstalk
 
 Deux crossfeeds en série croisent les voies deux fois. Le crosstalk (pour
-enceintes) agit en sens contraire du crossfeed (pour casque). Le contrat
-reprend donc la règle de #7616 **telle qu'elle est appliquée aujourd'hui**.
+enceintes) agit en sens contraire du crossfeed (pour casque).
 
-- **Politique `priority` (par défaut)** : la chaîne n'est **jamais refusée**.
+- **Politique `refuse` (par défaut, décision B de Bertrand du 18/11)** : une
+  chaîne ne coche qu'un membre du groupe. Un `PUT` qui en coche deux est
+  refusé en **409 `mutually_exclusive`**.
+- **Résolution toujours tolérante** (règle de #7616), quelle que soit la
+  politique : une chaîne ancienne qui arriverait quand même avec deux membres
+  cochés n'est jamais réduite au silence.
   - À l'exécution, le membre actif le plus prioritaire traite.
   - Les autres sont écartés, avec le motif `replaced_in_group` et
     `params.replaced_by`.
@@ -144,6 +148,12 @@ reprend donc la règle de #7616 **telle qu'elle est appliquée aujourd'hui**.
   (T08, `catalogue_tess`) l'applique : un `PUT` qui coche deux membres est
   refusé en 409 `mutually_exclusive`. La résolution garde la priorité
   ci-dessus pour une chaîne ancienne.
+- **Politique `priority`** : reste disponible pour un groupe qui la déclare
+  (jamais de refus, la résolution tranche).
+- **Zones existantes (T02)** : la migration ne refuse jamais une zone où
+  plusieurs membres sont cochés. Elle garde celui qui traite aujourd'hui et
+  DÉCOCHE les autres, réglages gardés, marqués `"replaced_in_group": "<id du
+  gagnant>"` ; la résolution l'affiche (`replaced_in_group`). Voir § 8.
 - **Appartenance au groupe** : par le manifeste (`exclusive_group`) **et** par
   le préfixe `crossfeed-` pour les paquets déjà publiés. T05 ajoute le champ
   au manifeste.
@@ -236,7 +246,7 @@ Enregistrée sous `zone_{id}_tess_chain` (T02), échangée par
 | `duplicate_plugin` | 409 | même id deux fois |
 | `invalid_settings` | 409 | réglages non conformes au schéma (niveau hôte) |
 | `must_be_last_plugin` | 409 | greffon `last_plugin` suivi d'un autre (même décoché) |
-| `mutually_exclusive` | 409 | seulement pour un groupe en politique `refuse` |
+| `mutually_exclusive` | 409 | deux membres cochés d'un groupe en politique `refuse` (le défaut) |
 | `premium_required` | **402** | greffon Premium **coché**, ou upsampling demandé, sans Premium, hors `bypass_all` |
 
 Ce qui dépend du flux ou de l'installation n'est **pas** refusé au `PUT`
@@ -410,7 +420,7 @@ Hors TESS, avec un motif affiché :
                      "effective": true, "reason": null, "detail": null,
                      "params": { "kind": "pcm", "sample_rate_hz": 96000, "bits": 24, "channels": 2 },
                      "latency_frames": null }, … ],
-  "catalog": { "plugins": [ … ], "groups": [ { "id": "crossfeed_crosstalk", "policy": "priority" } ] }
+  "catalog": { "plugins": [ … ], "groups": [ { "id": "crossfeed_crosstalk", "policy": "refuse" } ] }
 }
 ```
 
@@ -505,11 +515,11 @@ producteur et le rendu transporte des `f64`**, et que la quantification
 
 | Ancienne clé | Chaîne |
 |---|---|
-| `zone_{id}_eq_profile` | une façade d'égaliseur, `enabled` du profil, `settings` = profil sans `enabled` (sa réserve `headroom_mode` comprise) : profil de pièce mesuré (`room_profile_{id}`) → `room-correction` (marqué `legacy`, D1) ; sans bande ou courbe de grille ISO 10/15/31 → `equalizer-graphic` ; sinon `equalizer-headphone` si la chaîne l'était déjà, sinon `equalizer-parametric` |
+| `zone_{id}_eq_profile` | une façade d'égaliseur, `enabled` du profil, `settings` = profil sans `enabled` (sa réserve `headroom_mode` comprise) : profil de pièce (`room_profile_{id}`) → `room-correction`, avec son origine `measured` ou `estimation` (D1) ; sans bande ou courbe de grille ISO 10/15/31 → `equalizer-graphic` ; sinon `equalizer-headphone` si la chaîne l'était déjà, sinon `equalizer-parametric` |
 | `ir_path_{id}` | `convolution`, coché, `settings.ir_path` |
 | `zone_{id}_crossfeed` | `crossfeed` (`enabled`, reste en `settings`) |
 | `zone_{id}_native_plugin_{p}` | greffon `{p}` (Crossfeed Pro, Crosstalk, paquets tiers) |
-| `zone_{id}_mono_downmix` | `mono-downmix`, coché si `"true"` sur une sortie locale (D2) |
+| `zone_{id}_mono_downmix` | `mono-downmix`, coché si `"true"` sur une sortie locale ; décoché avec `inert_on_network` sur une zone réseau (D2) |
 | `zone_{id}_channel_remap` | `channel-remap`, en dernier |
 | `zone_{id}_upsampler` | `fixed.upsampling` : `pcm` (`filter`, `max_ratio`, `max_rate_hz`) si `enabled`, sinon `off` |
 | `zone_{id}_audiophile`, `zone_{id}_strict_bitperfect` | hors chaîne : `ContexteExecution.pure` |
@@ -532,8 +542,16 @@ producteur et le rendu transporte des `f64`**, et que la quantification
 - **Ordre d'une chaîne migrée** : celui de la lecture d'aujourd'hui :
   égaliseur, convolution, crossfeed, `crossfeed-*`, crosstalk, autres paquets,
   repli mono, réaffectation.
-- **Groupe crossfeed** : tous les membres cochés le restent ; aucune chaîne
-  migrée n'est refusée (politique `priority`).
+- **Groupe crossfeed** (décision B) : aucune chaîne migrée n'est refusée et
+  rien ne change à l'oreille. Si les anciennes clés cochent plusieurs membres,
+  le gagnant est celui qui traite aujourd'hui : le plus prioritaire (Crosstalk
+  > `crossfeed-*` > crossfeed intégré, à égalité le premier) parmi les
+  membres en service (paquet installé et activé, greffon intégré activé ; le
+  droit Premium n'entre pas en compte, la chaîne enregistrée n'en dépend
+  pas). Les autres sont DÉCOCHÉS, réglages gardés, avec
+  `"replaced_in_group": "<gagnant>"` ; leur ancienne clé reste cochée (l'ancien
+  moteur applique déjà la priorité). Si le gagnant n'est plus coché (ancienne
+  route), le membre écarté est recoché, puis la règle s'applique de nouveau.
 - **P2** : à la lecture sans Premium, un `equalizer-parametric` **coché**
   devient un `equalizer-graphic` au plus près, sur la grille réglée
   (`eq_expert_bands`), ±12 dB au plus ; deux courbes si les canaux diffèrent.
@@ -557,19 +575,113 @@ producteur et le rendu transporte des `f64`**, et que la quantification
   ancienne clé. Idempotente. Une chaîne d'une version plus récente n'est
   jamais réécrite. Rien n'est encore branché au démarrage ni dans la lecture
   (T03).
-- **Export** : `config_export` porte la chaîne de chaque zone, calculée pour
-  une zone jamais migrée.
-- **Choix provisoires, décisions en attente de Bertrand** :
-  - **D1** (correction de pièce) : un égaliseur de pièce mesuré déjà posé
-    dans `eq_profile` devient `room-correction` avec `"legacy": true` dans ses
-    réglages. La résolution le garde actif sans Premium (droit acquis, comme
-    aujourd'hui). La marque n'est jamais écrite dans `eq_profile`. T08 : un
-    `PUT` qui garde ce maillon tel qu'il est enregistré n'est pas refusé en
-    402.
-  - **D2** (`mono-downmix`, 11ᵉ greffon) : gardé dans la chaîne, mais sur une
-    zone réseau, où l'interrupteur actuel est inerte (#3254, sortie locale
-    seulement), il est **décoché** avec `"inert_on_network": true` : aucun
-    changement audible, et l'ancienne clé n'est pas touchée.
+- **Export et import de configuration** (décision B de Bertrand, 19/11) :
+  l'export (`config_export`, format 2) porte, dans chaque zone,
+  `zone_{id}_tess_chain` : la chaîne que le serveur LIT pour la zone
+  (`lire_zone`, neutre vis-à-vis du droit), donc toujours d'accord avec les
+  anciennes clés qui partent avec elle, et calculée pour une zone jamais
+  migrée. L'ombre `zone_{id}_tess_chain_sync` ne part plus. L'import
+  (`POST /system/config/import` et restauration cloud, par
+  `config_export::planifier`/`appliquer`) **réécrit** cette chaîne par
+  `ecrire_chaine` sous le numéro de la zone d'arrivée, après les autres
+  réglages de la zone : lecture stricte (`ChaineTess::depuis_corps`),
+  origine des corrections et marques recalculées par le serveur, anciennes
+  clés et ombre réécrites. L'ombre d'un fichier n'est jamais importée, sans
+  avertissement. Une chaîne illisible ou d'une version plus récente n'est
+  pas importée (avertissement) : la chaîne se reconstruit alors depuis les
+  anciennes clés. Le profil de pièce de la zone (`room_profile_{id}`) est
+  restauré comme **mesuré**, `zone_id` remplacé par le numéro d'arrivée,
+  index tenu par `room_correction::save_profile`, avec un avertissement
+  (« restored as measured »), comme `config_backup`. Il est écrit AVANT la
+  chaîne, qui en tire son origine. `room_profile_index` dans les réglages
+  généraux d'un fichier au format 2 est ignoré sans avertissement (il se
+  reconstruit). Un aller-retour normal ne donne donc plus d'avertissement
+  « server-managed ». L'aperçu compare la chaîne du fichier à celle que le
+  serveur lit (origine exclue) : réimporter le même fichier ne change rien.
+- **Décisions de Bertrand (18/11)** :
+  - **D1** (correction de pièce) : un égaliseur de pièce posé dans
+    `eq_profile` devient `room-correction`, avec son origine dans ses
+    réglages (`"origin"`, jamais écrit dans `eq_profile`).
+    - **Mesurée au micro** (`"measured"`) : Premium pour tous, plus de droit
+      acquis. Pour un compte gratuit, elle est **convertie** en égaliseur
+      graphique au plus près à la LECTURE, comme P2 ; jamais dans la chaîne
+      enregistrée ni dans `eq_profile`.
+    - **Calculée sans micro** (C5, #7919, `"estimation"`) : Free, active sans
+      Premium, jamais convertie (`correction_estimee`, honoré par la
+      résolution).
+    - **Origine** : tout profil créé désormais l'enregistre
+      (`RoomProfile.origin`, `"measured"` ou `"estimation"`) : le greffon de
+      calibration selon sa route (mesure C2 ou estimation C5), la route
+      manuelle `POST /room-correction/profiles/{zone}` toujours en
+      `"measured"`. Les profils anciens ne l'ont pas. On lit
+      `room_profile_{id}` : `"origin"` l'emporte (aucun autre champ n'est
+      cru, `"estimation": bool` compris) ; sinon le nom par défaut d'une
+      estimation C5 (« Estimation {id} ») ; sinon **mesurée**. Les bornes de C5 ne servent
+      pas d'indice (le mode expert #8332 les relève). Dans le doute, la
+      correction est donc traitée en Premium : convertie, jamais détruite.
+      Sortir C5 de la garde Premium du greffon reste la tâche Codex 28.
+    - **Clés tenues par le serveur** : `room_profile_*` (index compris),
+      `zone_{id}_tess_chain` et `zone_{id}_tess_chain_sync` sont refusées
+      par `PATCH /system/config` (`403 server_managed_settings`, admin
+      compris) ; elles ne s'écrivent que par leurs routes. L'import de
+      configuration (`POST /system/config/import`, et la restauration cloud
+      qui passe par le même plan) ne les écrit jamais telles quelles : dans
+      la partie zones d'un fichier au format 2, la chaîne et le profil de
+      pièce sont réécrits par le serveur (voir « Export et import de
+      configuration » ci-dessus) ; partout ailleurs (réglages généraux,
+      ancien format à plat), il les ignore et le dit dans ses
+      avertissements. La restauration d'une
+      sauvegarde (`config_backup`) ignore ces clés dans ses réglages
+      généraux, n'écrit que des clés de profil dans sa section des profils,
+      et restaure chaque profil comme **mesuré** (l'origine d'un fichier ne
+      se vérifie pas ; converti, jamais détruit, pour un compte gratuit), en
+      le disant.
+    - **L'origine appartient au serveur** : `lire_zone` la recalcule à
+      chaque lecture (jamais tirée du stockage brut de la chaîne, y compris
+      pour une chaîne d'une version plus récente, rendue sans les anciennes
+      clés mais avec l'origine recalculée et la conversion d'un compte
+      gratuit), et
+      `ecrire_chaine` la réécrit
+      d'après `room_profile_{id}` quoi que dise le corps (`"estimation"`
+      seulement si les bandes sont celles d'une estimation de la zone,
+      `"measured"` sinon). Un `PUT` ne peut donc jamais lever le droit
+      Premium en se disant « sans micro ».
+  - **D2** (`mono-downmix`) : 11ᵉ greffon, Free. Sur une zone réseau, où
+    l'interrupteur actuel était inerte (#3254, sortie locale seulement), il
+    est **décoché d'office, une seule fois, à la migration**, avec
+    `"inert_on_network": true` : aucun changement audible, et l'ancienne clé
+    n'est pas touchée. Coché ensuite (TESS ou ancienne route), il agit
+    partout. Si la zone passe ensuite sur une sortie locale, où
+    l'interrupteur (resté à `"true"`) agit, il est recoché à la lecture.
+    Une zone locale qui passe sur le réseau suit la règle de la migration :
+    son mono est décoché d'office avec `inert_on_network` (l'ancien moteur
+    l'ignorait sur le réseau) ; recoché ensuite à la main, il agit. La
+    nature de la sortie à la dernière synchronisation est gardée dans
+    l'ombre (entrée `"output"` : `"local"` ou `"network"`) ; la règle ne
+    joue que si l'interrupteur mono n'a pas bougé depuis.
+- **Les marques de la lecture appartiennent au serveur** (T02 suites, pour
+  T08) : `origin` (D1) est réécrite d'après `room_profile_{id}` ;
+  `replaced_in_group` (décision B) et `inert_on_network` (D2) ne sont gardées
+  par `ecrire_chaine` que si le maillon, décoché, porte DÉJÀ la même marque
+  dans la chaîne que le serveur lit pour la zone (migration à la lecture
+  comprise), et, pour `replaced_in_group`, si le gagnant nommé reste coché.
+  Sinon la marque est retirée et le maillon décoché est projeté normalement
+  (son ancienne clé est décochée). Un client qui renvoie les réglages lus ne
+  peut donc ni garder cochée l'ancienne clé d'un membre écarté après avoir
+  décoché le gagnant, ni faire recocher en local un mono décoché à la main.
+- **Décidé le 18/11 au soir** (Bertrand : « fais au mieux » ; principe :
+  aucun changement audible dû à la migration, aucun droit Premium sans le
+  payer ; `decisions-tess.md`) :
+  - **I3** : pas de copie de base réelle de testeur (données personnelles).
+    Le test `i3_relecture_d_une_copie_de_base_reelle` reste sauté et
+    recensé dans le garde-fou 2816 ; la grande base synthétique couvre la
+    migration. Ce n'est pas un préalable à la fusion.
+  - **D2, zone locale passée sur le réseau** : mono décoché d'office
+    (`inert_on_network`), recoché à la main il agit (voir D2 ci-dessus).
+  - **D2, zone réseau passée en local** : recoché à la lecture. Confirmé.
+  - **D1, origine** : la règle du nom « Estimation {id} » est acceptée
+    pour les profils anciens ; tout profil créé enregistre son origine, et
+    la règle du nom ne s'applique plus qu'aux profils sans origine.
 
 ### T05 : manifeste
 

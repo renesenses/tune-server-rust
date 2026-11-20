@@ -602,6 +602,8 @@ fn la_mesure_simulee_donne_un_egaliseur_qui_coupe_les_modes_sans_relever() {
     assert_eq!(j.profils.len(), 1);
     assert_eq!(j.profils[0].zone_id, "7");
     assert_eq!(j.profils[0].name, "Salon");
+    // D1 (TESS) : une mesure enregistre son origine.
+    assert_eq!(j.profils[0].origin.as_deref(), Some("measured"));
     assert!(!j.profils[0].filters.is_empty());
     assert!(j.profils[0].filters.iter().all(|f| f.gain_db <= 0.0));
 }
@@ -913,6 +915,8 @@ fn la_simulation_sans_micro_est_premium_et_ne_propose_que_des_coupes_prudentes()
     assert_eq!(j.profils.len(), 1);
     assert_eq!(j.profils[0].zone_id, "7");
     assert_eq!(j.profils[0].name, format!("Estimation {id}"));
+    // D1 (TESS) : une estimation C5 enregistre son origine.
+    assert_eq!(j.profils[0].origin.as_deref(), Some("estimation"));
     assert!(j.profils[0].filters.iter().all(|f| f.gain_db <= 0.0));
     assert!(j.joues.is_empty(), "une simulation a joué quelque chose");
 }
