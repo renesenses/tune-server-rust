@@ -1270,8 +1270,12 @@ struct LierBody {
 /// l'écran affichait le compte lié, `GET /collection` répondait ensuite
 /// « aucun compte Bandcamp lié », et RIEN dans le journal ne reliait les deux.
 pub(crate) enum EchecLiaison {
-    /// Pseudo vide ou contenant un `/`.
+    /// Pseudo vide, ou saisie dont aucun pseudo ne se tire.
     PseudoInvalide,
+    /// #9152 — la saisie désigne une page d'ARTISTE ou de LABEL
+    /// (`<nom>.bandcamp.com`), pas un profil de fan (`bandcamp.com/<pseudo>`) :
+    /// aucune collection n'y est attachée. Porte le sous-domaine.
+    PageArtiste(String),
     /// Bandcamp ne connaît pas ce profil public.
     ProfilIntrouvable(String),
     /// L'appel sortant a échoué, ou la page n'a pas livré de `fan_id`.
@@ -1300,6 +1304,100 @@ pub(crate) async fn lier_compte(
     lier_compte_sur(backend, pseudo_brut, BC_RACINE_PROFILS).await
 }
 
+/// Pages de bandcamp.com qui ne sont pas des profils de fan : leur premier
+/// segment ne devient pas un pseudo (`bandcamp.com/discover`, `/tag/jazz`).
+const CHEMINS_RESERVES_BANDCAMP: &[&str] = &[
+    "discover",
+    "tag",
+    "tags",
+    "search",
+    "about",
+    "help",
+    "artists",
+    "login",
+    "signup",
+    "settings",
+    "feed",
+    "dashboard",
+    "music",
+    "community",
+    "gift_cards",
+    "fan_signup",
+    "daily",
+    "terms_of_use",
+    "privacy",
+    "contact",
+    "guide",
+];
+
+/// #9152 — tirer le pseudo d'une saisie telle qu'un auditeur la colle.
+///
+/// L'écran demande « le nom de l'adresse bandcamp.com/votre-nom » ; on y
+/// colle volontiers l'adresse entière. `https://bandcamp.com/nom`,
+/// `www.bandcamp.com/nom/`, `bandcamp.com/nom?from=menubar` rendent `nom`.
+/// Tout `/` restant, une saisie vide, ou un chemin propre à Bandcamp hors
+/// profil, restent refusés (`PseudoInvalide`). Un sous-domaine
+/// `<nom>.bandcamp.com` (page d'artiste ou de label) est nommé comme tel
+/// (`PageArtiste`) au lieu d'être cherché en profil et de rendre un 404.
+pub(crate) fn pseudo_de_la_saisie(brut: &str) -> Result<String, EchecLiaison> {
+    let mut s = brut.trim();
+    for prefixe in ["https://", "http://"] {
+        if s.len() >= prefixe.len() && s[..prefixe.len()].eq_ignore_ascii_case(prefixe) {
+            s = &s[prefixe.len()..];
+        }
+    }
+    // Requête et fragment ne font pas partie du pseudo.
+    let s = s.split(['?', '#']).next().unwrap_or("");
+    let (hote, chemin) = match s.split_once('/') {
+        Some((h, c)) => (h, Some(c)),
+        None => (s, None),
+    };
+    let hote_min = hote.to_ascii_lowercase();
+    let hote_min = hote_min.strip_prefix("www.").unwrap_or(&hote_min);
+    let pseudo = if hote_min == "bandcamp.com" {
+        // `bandcamp.com/<pseudo>`, `/` final toléré ; un onglet du profil
+        // (`bandcamp.com/<pseudo>/wishlist`) rend aussi `<pseudo>`.
+        match chemin.and_then(|c| c.split('/').next()) {
+            Some(p)
+                if !p.is_empty()
+                    && !CHEMINS_RESERVES_BANDCAMP.contains(&p.to_ascii_lowercase().as_str()) =>
+            {
+                p
+            }
+            _ => return Err(EchecLiaison::PseudoInvalide),
+        }
+    } else if let Some(sous_domaine) = hote_min.strip_suffix(".bandcamp.com") {
+        return Err(EchecLiaison::PageArtiste(format!(
+            "{sous_domaine}.bandcamp.com"
+        )));
+    } else if chemin.is_none_or(|c| c.trim_matches('/').is_empty()) {
+        // Le cas courant : le pseudo seul (un `/` final toléré).
+        hote
+    } else {
+        return Err(EchecLiaison::PseudoInvalide);
+    };
+    if pseudo.is_empty() {
+        return Err(EchecLiaison::PseudoInvalide);
+    }
+    Ok(pseudo.to_string())
+}
+
+/// Le texte et le code stable d'un refus de saisie (#9152) : le code permet au
+/// client de traduire, le texte reste lisible tel quel.
+pub(crate) fn refus_de_saisie(e: &EchecLiaison) -> Option<(&'static str, String)> {
+    match e {
+        EchecLiaison::PseudoInvalide => Some(("invalid_username", "username invalide".into())),
+        EchecLiaison::PageArtiste(hote) => Some((
+            "artist_page_not_fan_profile",
+            format!(
+                "« {hote} » est une page d'artiste ou de label Bandcamp : saisir le \
+                 pseudo du profil de fan, celui de l'adresse bandcamp.com/<pseudo>"
+            ),
+        )),
+        _ => None,
+    }
+}
+
 /// [`lier_compte`], la racine des profils en paramètre (l'épreuve la pointe
 /// sur un serveur local).
 pub(crate) async fn lier_compte_sur(
@@ -1307,10 +1405,19 @@ pub(crate) async fn lier_compte_sur(
     pseudo_brut: &str,
     racine: &str,
 ) -> Result<CompteLie, EchecLiaison> {
-    let pseudo = pseudo_brut.trim().to_string();
-    if pseudo.is_empty() || pseudo.contains('/') {
-        return Err(EchecLiaison::PseudoInvalide);
-    }
+    let pseudo = match pseudo_de_la_saisie(pseudo_brut) {
+        Ok(p) => p,
+        Err(e) => {
+            // Le journal gardait le refus sans la saisie (#9152) : impossible
+            // de savoir ce que l'auditeur avait tapé.
+            // `?` : la saisie est échappée (pas de fausse ligne de journal) ;
+            // tronquée, pour qu'un texte collé par erreur n'y entre pas
+            // entier.
+            let saisie: String = pseudo_brut.trim().chars().take(100).collect();
+            tracing::warn!(saisie = ?saisie, "bandcamp_liaison_saisie_refusee");
+            return Err(e);
+        }
+    };
     let client = tune_core::http::client::shared();
     let url = format!("{racine}/{pseudo}");
     let reponse = client
@@ -1421,14 +1528,20 @@ async fn bc_lier_compte(
             "linked": true,
         }))
         .into_response(),
-        Err(EchecLiaison::PseudoInvalide) => (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": "username invalide"})),
+        Err(e @ (EchecLiaison::PseudoInvalide | EchecLiaison::PageArtiste(_))) => {
+            let (code, message) =
+                refus_de_saisie(&e).unwrap_or(("invalid_username", String::new()));
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": message, "code": code})),
+            )
+                .into_response()
+        }
+        Err(EchecLiaison::ProfilIntrouvable(m)) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": m, "code": "fan_profile_not_found" })),
         )
             .into_response(),
-        Err(EchecLiaison::ProfilIntrouvable(m)) => {
-            (StatusCode::NOT_FOUND, Json(json!({ "error": m }))).into_response()
-        }
         Err(EchecLiaison::Passerelle(m)) => passerelle_en_echec(m),
         // 500 et non 502 : la panne est CHEZ NOUS, pas chez Bandcamp — et
         // surtout, ce n'est plus un 200 `linked: true` sur du vide (#2778).
@@ -2952,6 +3065,82 @@ mod tests_album_d_une_piste_7591 {
             "https://x.bandcamp.com:8443/track/y",
         ] {
             assert!(!est_une_page_de_piste(etrangere), "{etrangere}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests_saisie_pseudo_9152 {
+    use super::{EchecLiaison, pseudo_de_la_saisie, refus_de_saisie};
+
+    fn pseudo(s: &str) -> Option<String> {
+        pseudo_de_la_saisie(s).ok()
+    }
+
+    /// L'adresse du profil de fan collée telle quelle rend le pseudo.
+    #[test]
+    fn une_adresse_de_profil_collee_rend_le_pseudo() {
+        for saisie in [
+            "didierv",
+            "  didierv  ",
+            "didierv/",
+            "bandcamp.com/didierv",
+            "https://bandcamp.com/didierv",
+            "https://bandcamp.com/didierv/",
+            "http://www.bandcamp.com/didierv",
+            "HTTPS://Bandcamp.com/didierv?from=menubar",
+            "https://bandcamp.com/didierv#collection",
+            "https://bandcamp.com/didierv/wishlist",
+        ] {
+            assert_eq!(
+                pseudo(saisie).as_deref(),
+                Some("didierv"),
+                "saisie {saisie:?}"
+            );
+        }
+    }
+
+    /// Le sous-domaine d'un artiste est nommé, pas cherché comme profil.
+    #[test]
+    fn un_sous_domaine_d_artiste_est_nomme_page_d_artiste() {
+        for saisie in [
+            "artiste.bandcamp.com",
+            "https://artiste.bandcamp.com",
+            "https://artiste.bandcamp.com/album/un-album",
+        ] {
+            match pseudo_de_la_saisie(saisie) {
+                Err(EchecLiaison::PageArtiste(h)) => assert_eq!(h, "artiste.bandcamp.com"),
+                _ => panic!("{saisie:?} doit être reconnu comme page d'artiste"),
+            }
+        }
+        let e = pseudo_de_la_saisie("artiste.bandcamp.com").err().unwrap();
+        assert_eq!(
+            refus_de_saisie(&e).unwrap().0,
+            "artist_page_not_fan_profile"
+        );
+    }
+
+    /// Contre-épreuve : ce qui n'a pas de pseudo reste refusé.
+    #[test]
+    fn une_saisie_sans_pseudo_reste_refusee() {
+        for saisie in [
+            "",
+            "   ",
+            "bandcamp.com",
+            "https://bandcamp.com/",
+            "https://bandcamp.com//",
+            "https://bandcamp.com/discover",
+            "bandcamp.com/tag/jazz",
+            "https://bandcamp.com/search?q=x",
+            "nom/autre",
+        ] {
+            assert!(
+                matches!(
+                    pseudo_de_la_saisie(saisie),
+                    Err(EchecLiaison::PseudoInvalide)
+                ),
+                "saisie {saisie:?}"
+            );
         }
     }
 }
