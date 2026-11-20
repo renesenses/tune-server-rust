@@ -448,15 +448,19 @@ Hors TESS, avec un motif affiché :
   2. **fusion** : un champ absent du corps garde sa valeur enregistrée
      (`fixed` champ par champ ; `plugins`, s'il est présent, remplace la
      liste). Un client qui ignore un champ plus récent ne l'efface donc pas ;
-  3. P2 inverse : sans Premium, le graphique converti renvoyé tel quel
-     redevient le paramétrique enregistré ;
-  4. **marques réservées** (`legacy`, `inert_on_network`) : gardées seulement
-     si le maillon a les mêmes réglages que le maillon enregistré ; sinon
-     retirées. Une marque envoyée par le client ne lève jamais un droit ;
+  3. P2 inverse (et D1) : sans Premium, le graphique converti renvoyé tel
+     quel redevient le paramétrique, ou la correction de pièce mesurée,
+     enregistré ; un graphique modifié le remplace ;
+  4. **origine D1** : l'`origin` d'un `room-correction` est réécrite par le
+     serveur d'après `room_profile_{id}` (`origines_par_le_serveur`), jamais
+     crue du corps. Les marques de lecture (`replaced_in_group`,
+     `inert_on_network`) sont tenues par `ecrire_chaine` ; elles ne marquent
+     que des maillons décochés et ne lèvent aucun droit ;
   5. validation : 409 (forme, exclusivité du groupe crossfeed, version),
      puis 402 sur ce qui **change** : un maillon ou un upsampling identique à
      la chaîne enregistrée n'est pas revérifié (la résolution l'éteint,
      `premium_required`) ; perdre le Premium ne bloque pas l'édition du reste ;
+     une correction de pièce d'origine `estimation` (C5, sans micro) est Free ;
   6. `ecrire_chaine` (sous `verrou_de_zone`), puis rafraîchissement de la
      sortie vivante pour chaque ancienne clé réécrite. Un `PUT` à la fois par
      zone, de la lecture à l'écriture.

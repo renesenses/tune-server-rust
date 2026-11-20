@@ -13,7 +13,7 @@ use serde_json::{Value, json};
 use tower::ServiceExt;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::tess::api::conforme_au_schema;
-use tune_core::tess::migration::{ecrire_chaine, lire_zone};
+use tune_core::tess::migration::lire_zone;
 use tune_core::tess::{ChaineTess, cle_chaine_zone};
 
 const SECRET: &str = "test-jwt-secret";
@@ -574,77 +574,142 @@ async fn perdre_le_premium_ne_bloque_pas_l_edition_du_reste_t08() {
     refus_conforme(&v, 402, "premium_required");
 }
 
-// ── Marques réservées au serveur ────────────────────────────────────
+// ── D1 : l'origine de la correction de pièce vient du serveur ────────
 
-fn correction(legacy: bool, gain: f64) -> Value {
-    let mut s = profil(json!([{"freq": 60.0, "gain": gain, "q": 2.0, "type": "peak"}]));
-    if legacy {
-        s["legacy"] = json!(true);
+fn filtres_de_piece() -> Vec<tune_core::room_correction::CorrectionFilter> {
+    use tune_core::room_correction::{CorrectionFilter, FilterType};
+    vec![
+        CorrectionFilter {
+            frequency_hz: 52.0,
+            gain_db: -6.5,
+            q_factor: 4.0,
+            filter_type: FilterType::Peaking,
+        },
+        CorrectionFilter {
+            frequency_hz: 118.0,
+            gain_db: -3.0,
+            q_factor: 2.5,
+            filter_type: FilterType::Peaking,
+        },
+    ]
+}
+
+impl Banc {
+    /// Pose `room_profile_{zone}`, comme la calibration (C2 mesurée, C5
+    /// estimée sans micro).
+    fn poser_la_piece(&self, origine: &str) {
+        let piece = tune_core::room_correction::RoomProfile {
+            name: if origine == "estimation" {
+                format!("Estimation {}", self.zone)
+            } else {
+                "Living room".into()
+            },
+            zone_id: self.zone.to_string(),
+            filters: filtres_de_piece(),
+            created_at: "2026-11-20T00:00:00Z".into(),
+            measurement_data: None,
+            origin: Some(origine.into()),
+        };
+        self.settings()
+            .set(
+                &format!("room_profile_{}", self.zone),
+                &serde_json::to_string(&piece).unwrap(),
+            )
+            .unwrap();
+    }
+}
+
+/// Le maillon `room-correction` que l'écran renvoie, avec l'origine que le
+/// CLIENT prétend.
+fn correction(origine: Option<&str>) -> Value {
+    let eq = tune_core::room_correction::profil_eq_de_correction(&filtres_de_piece());
+    let mut s = serde_json::to_value(&eq).unwrap();
+    s.as_object_mut().unwrap().remove("enabled");
+    if let Some(o) = origine {
+        s["origin"] = json!(o);
     }
     json!({"id": "room-correction", "enabled": true, "settings": s})
 }
 
 #[tokio::test]
-async fn une_marque_du_client_ne_leve_jamais_un_droit_t08() {
-    // Gratuit : « legacy » fabriquée par le client → retirée → 402.
+async fn une_origine_envoyee_par_le_client_ne_leve_jamais_le_droit_t08() {
+    // Gratuit, aucun profil de pièce : « estimation » prétendue par le
+    // client → réécrite « measured » → 402, rien d'écrit.
     let b = Banc::nouveau(false).await;
     let (s, v) = b
-        .put(json!({"version": 1, "plugins": [correction(true, -4.0)]}))
+        .put(json!({"version": 1, "plugins": [correction(Some("estimation"))]}))
         .await;
     assert_eq!(s, StatusCode::PAYMENT_REQUIRED, "{v}");
     refus_conforme(&v, 402, "premium_required");
     assert_eq!(v["plugin_id"], json!("room-correction"));
     assert!(b.enregistree().is_none());
 
-    // Premium : la marque fabriquée n'est pas enregistrée (sinon elle
-    // survivrait à la perte du droit).
-    b.premium(true).await;
+    // Une pièce MESURÉE au micro : toujours Premium (D1).
+    b.poser_la_piece("measured");
     let (s, v) = b
-        .put(json!({"version": 1, "plugins": [correction(true, -4.0)]}))
+        .put(json!({"version": 1, "plugins": [correction(Some("estimation"))]}))
+        .await;
+    assert_eq!(s, StatusCode::PAYMENT_REQUIRED, "{v}");
+    assert!(b.enregistree().is_none());
+
+    // Contre-épreuve : la pièce de la zone est CALCULÉE SANS MICRO (C5) :
+    // Free, même corps (et même sans origine) → accepté et effectif.
+    b.poser_la_piece("estimation");
+    let (s, v) = b
+        .put(json!({"version": 1, "plugins": [correction(None)]}))
         .await;
     assert_eq!(s, StatusCode::OK, "{v}");
-    let c = b.chaine();
-    assert!(
-        c.plugins[0].settings.get("legacy").is_none(),
-        "{:?}",
-        c.plugins
-    );
-    b.premium(false).await;
-    let (_, v) = b.get().await;
+    let e = etape(&v, "room-correction");
     assert_eq!(
-        etape(&v, "room-correction")["reason"],
-        json!("premium_required")
+        (e["effective"].clone(), e["reason"].clone()),
+        (json!(true), Value::Null),
+        "{v}"
     );
+    assert_eq!(
+        b.chaine().plugins[0].settings["origin"],
+        json!("estimation")
+    );
+    conforme_au_schema("zone_response", &v).unwrap();
 }
 
 #[tokio::test]
-async fn la_marque_posee_par_le_serveur_reste_valable_telle_quelle_t08() {
-    let b = Banc::nouveau(false).await;
-    // Le serveur (migration T02, D1 provisoire) a posé le droit acquis.
-    let chaine: ChaineTess = serde_json::from_value(
-        json!({"version": 1, "plugins": [correction(true, -4.0), {"id": "crossfeed", "enabled": false}]}),
-    )
-    .unwrap();
-    ecrire_chaine(&b.settings(), b.zone, &chaine).unwrap();
+async fn la_correction_mesuree_convertie_redevient_la_mesure_enregistree_t08() {
+    let b = Banc::nouveau(true).await;
+    b.poser_la_piece("measured");
+    let (s, v) = b
+        .put(json!({"version": 1, "plugins": [
+            correction(None),
+            {"id": "crossfeed", "enabled": false}
+        ]}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(b.chaine().plugins[0].settings["origin"], json!("measured"));
+    // Compte redevenu gratuit : le GET montre la mesure convertie en
+    // graphique au plus près (D1, comme P2).
+    b.premium(false).await;
+    let (_, v) = b.get().await;
+    assert_eq!(
+        v["chain"]["plugins"][0]["id"],
+        json!("equalizer-graphic"),
+        "{v}"
+    );
+    // Renvoyée telle quelle, crossfeed coché : la mesure enregistrée reste.
+    let mut c = v["chain"].clone();
+    c["plugins"][1]["enabled"] = json!(true);
+    let (s, v) = b.put(c.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let enr = b.chaine();
+    assert_eq!(enr.plugins[0].id, "room-correction", "{:?}", enr.plugins);
+    assert_eq!(enr.plugins[0].settings["origin"], json!("measured"));
+    assert!(enr.plugins[1].enabled);
+    // Redevenu Premium : la mesure traite de nouveau.
+    b.premium(true).await;
     let (_, v) = b.get().await;
     assert_eq!(
         etape(&v, "room-correction")["effective"],
         json!(true),
         "{v}"
     );
-    // Renvoyé tel quel, avec une autre modification : accepté, marque gardée.
-    let mut c = v["chain"].clone();
-    c["plugins"][1]["enabled"] = json!(true);
-    let (s, v) = b.put(c.clone()).await;
-    assert_eq!(s, StatusCode::OK, "{v}");
-    assert_eq!(
-        b.chaine().plugins[0].settings.get("legacy"),
-        Some(&json!(true))
-    );
-    // Contre-épreuve : la courbe modifiée, la marque ne la couvre plus.
-    c["plugins"][0]["settings"]["bands"][0]["gain"] = json!(-6.0);
-    let (s, v) = b.put(c).await;
-    assert_eq!(s, StatusCode::PAYMENT_REQUIRED, "{v}");
 }
 
 #[tokio::test]

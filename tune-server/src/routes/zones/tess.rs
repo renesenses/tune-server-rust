@@ -14,14 +14,18 @@
 //!   chaque greffon pour le compte. Un serveur sans TESS répond 404 : c'est la
 //!   capacité TESS que l'écran attend.
 //!
-//! **Droits.** Le droit vient de la licence, jamais du corps : une marque
-//! réservée au serveur (`legacy`, `inert_on_network`) envoyée par le client
-//! n'est gardée que si le maillon est identique à celui que le serveur a
-//! enregistré ; sinon elle est retirée avant la validation
-//! ([`normaliser_les_marques`]). Un maillon (ou l'upsampling) identique à la
-//! chaîne enregistrée n'est pas revérifié au droit : il ne lève rien (la
-//! résolution l'éteint, `premium_required`), et perdre le Premium ne bloque
-//! pas l'édition du reste de la chaîne.
+//! **Droits.** Le droit vient de la licence, jamais du corps :
+//! - l'origine d'une correction de pièce (D1 : `measured` Premium,
+//!   `estimation` Free) est réécrite par le serveur d'après
+//!   `room_profile_{id}` AVANT la validation ([`origines_par_le_serveur`]) ;
+//! - les marques de lecture (`replaced_in_group`, `inert_on_network`) sont
+//!   tenues par le serveur à l'écriture (`ecrire_chaine`) et ne marquent que
+//!   des maillons décochés : elles ne lèvent aucun droit.
+//!
+//! Un maillon (ou l'upsampling) identique à la chaîne enregistrée n'est pas
+//! revérifié au droit : il ne lève rien (la résolution l'éteint,
+//! `premium_required`), et perdre le Premium ne bloque pas l'édition du reste
+//! de la chaîne.
 //!
 //! **Authentification** : celle de toutes les routes de zone (couche
 //! `auth_middleware` de `/api/v1`), rien de plus.
@@ -42,8 +46,8 @@ use tune_core::tess::greffon::{
 };
 use tune_core::tess::migration::{
     ErreurMigration, ID_CONVOLUTION, ID_CORRECTION_PIECE, ID_CROSSFEED, ID_EQ_CASQUE,
-    ID_EQ_GRAPHIQUE, ID_EQ_PARAMETRIQUE, ID_MONO, ID_REAFFECTATION, LectureZone,
-    MARQUE_DROIT_ACQUIS, MARQUE_MONO_INERTE, Partie, ecrire_chaine, lecture_dsd, lire_zone,
+    ID_EQ_GRAPHIQUE, ID_EQ_PARAMETRIQUE, ID_MONO, ID_REAFFECTATION, LectureZone, Partie,
+    correction_estimee, ecrire_chaine, lecture_dsd, lire_zone, origines_par_le_serveur,
 };
 use tune_core::tess::resolution::{
     ContexteExecution, ControleVolume, LectureDsd, SourceFlux, VolumeZone,
@@ -54,9 +58,6 @@ use super::*;
 
 /// L'id du greffon Declick temps réel : pas encore branché dans l'hôte (T13).
 const ID_DECLICK_LIVE: &str = "declick-live";
-
-/// Les marques que seul le serveur pose dans les réglages d'un maillon (T02).
-pub const MARQUES_RESERVEES: [&str; 2] = [MARQUE_DROIT_ACQUIS, MARQUE_MONO_INERTE];
 
 /// Le préréglage chargé sur la zone (« ACTIVE »), posé par T17.
 pub fn cle_prereglage_actif(zone_id: i64) -> String {
@@ -388,35 +389,10 @@ pub fn fusionner(corps: &Value, enregistree: &ChaineTess) -> Result<ChaineTess, 
     serde_json::from_value(base).map_err(illisible)
 }
 
-/// Retire les marques réservées au serveur d'un maillon qui n'est pas
-/// identique (mêmes réglages) au maillon enregistré : une marque envoyée par
-/// le client ne lève JAMAIS un droit. Un repli mono coché perd sa marque
-/// « inerte ».
-pub fn normaliser_les_marques(chaine: &mut ChaineTess, enregistree: &ChaineTess) {
-    for m in &mut chaine.plugins {
-        let Some(reglages) = m.settings.as_object_mut() else {
-            continue;
-        };
-        if !MARQUES_RESERVEES.iter().any(|k| reglages.contains_key(*k)) {
-            continue;
-        }
-        let identique = enregistree
-            .plugins
-            .iter()
-            .any(|e| e.id == m.id && e.settings.as_object() == Some(&*reglages));
-        if !identique {
-            for k in MARQUES_RESERVEES {
-                reglages.remove(k);
-            }
-        }
-        if m.enabled {
-            reglages.remove(MARQUE_MONO_INERTE);
-        }
-    }
-}
-
 /// Valide la chaîne : d'abord la forme (409) avec tous les droits, puis le
-/// droit (402) sur ce qui CHANGE par rapport à la chaîne enregistrée.
+/// droit (402) sur ce qui CHANGE par rapport à la chaîne enregistrée. Une
+/// correction de pièce calculée sans micro (D1, origine `estimation` posée
+/// par le serveur) est Free.
 pub fn valider_le_put(
     chaine: &ChaineTess,
     enregistree: &ChaineTess,
@@ -433,7 +409,7 @@ pub fn valider_le_put(
             .plugins
             .iter()
             .any(|e| e.id == m.id && e.enabled == m.enabled && e.settings == m.settings);
-        if inchange {
+        if inchange || correction_estimee(m) {
             m.enabled = false;
         }
     }
@@ -443,11 +419,18 @@ pub fn valider_le_put(
     a_payer.valider(catalogue, ContexteValidation { premium })
 }
 
-/// Le P2 inverse : sans Premium, le `GET` montre l'égaliseur paramétrique
-/// coché converti en graphique. Renvoyé tel quel, ce graphique redevient le
-/// paramétrique enregistré : la chaîne enregistrée ne dépend pas du droit
-/// (T02, B1), et le compte qui redevient Premium le retrouve.
-pub fn defaire_p2(chaine: &mut ChaineTess, enregistree: &ChaineTess, vue_gratuite: &ChaineTess) {
+/// Le P2 inverse (et D1) : sans Premium, le `GET` montre l'égaliseur
+/// paramétrique coché, ou la correction de pièce MESURÉE cochée
+/// (`conversion_piece`), converti en graphique. Renvoyé tel quel, ce
+/// graphique redevient le maillon enregistré : la chaîne enregistrée ne
+/// dépend pas du droit (T02, B1), et le compte qui redevient Premium le
+/// retrouve. Un graphique modifié, lui, remplace le maillon Premium.
+pub fn defaire_p2(
+    chaine: &mut ChaineTess,
+    enregistree: &ChaineTess,
+    vue_gratuite: &ChaineTess,
+    conversion_piece: bool,
+) {
     let Some(converti) = vue_gratuite
         .plugins
         .iter()
@@ -455,20 +438,25 @@ pub fn defaire_p2(chaine: &mut ChaineTess, enregistree: &ChaineTess, vue_gratuit
     else {
         return;
     };
-    let Some(parametrique) = enregistree
+    let source = if conversion_piece {
+        ID_CORRECTION_PIECE
+    } else {
+        ID_EQ_PARAMETRIQUE
+    };
+    let Some(premium) = enregistree
         .plugins
         .iter()
-        .find(|m| m.id == ID_EQ_PARAMETRIQUE && m.enabled)
+        .find(|m| m.id == source && m.enabled && !correction_estimee(m))
     else {
         return;
     };
-    if chaine.plugins.iter().any(|m| m.id == ID_EQ_PARAMETRIQUE) {
+    if chaine.plugins.iter().any(|m| m.id == source) {
         return;
     }
     if let Some(m) = chaine.plugins.iter_mut().find(|m| {
         m.id == converti.id && m.enabled == converti.enabled && m.settings == converti.settings
     }) {
-        *m = parametrique.clone();
+        *m = premium.clone();
     }
 }
 
@@ -509,9 +497,11 @@ fn appliquer_le_put(
         && let Ok(vue) = lire_zone(settings, zone_id, false)
         && vue.conversion_p2
     {
-        defaire_p2(&mut chaine, &enregistree, &vue.chaine);
+        defaire_p2(&mut chaine, &enregistree, &vue.chaine, vue.conversion_piece);
     }
-    normaliser_les_marques(&mut chaine, &enregistree);
+    // D1 : l'origine d'une correction de pièce vient de `room_profile_{id}`,
+    // jamais du corps ; `ecrire_chaine` la réécrit de même.
+    let chaine = origines_par_le_serveur(settings, zone_id, &chaine);
     valider_le_put(&chaine, &enregistree, catalogue, premium).map_err(|e| refus(&e))?;
     let chaine = chaine.mettre_a_niveau();
 

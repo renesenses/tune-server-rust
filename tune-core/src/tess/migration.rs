@@ -514,7 +514,7 @@ pub fn classer_egaliseur(
 /// ses bandes sont celles d'un profil de pièce calculé sans micro de la zone,
 /// `"measured"` sinon. Un corps de `PUT` ne peut donc jamais lever le droit
 /// Premium en se disant « sans micro ».
-fn origines_par_le_serveur(
+pub fn origines_par_le_serveur(
     settings: &SettingsRepo,
     zone_id: i64,
     chaine: &ChaineTess,
