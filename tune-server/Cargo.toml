@@ -201,7 +201,6 @@ dotenvy = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 tune-aes67 = { path = "../plugins/tune-aes67", optional = true }
 
-
 [dev-dependencies]
 tower = "0.5"
 # Test-only (#6286) : donner aux FLAC témoins de l'audit d'intégrité le MD5
