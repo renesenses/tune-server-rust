@@ -235,7 +235,7 @@ pub fn schema_json() -> Value {
                                          "chain_version_unsupported", "unknown_value", "unknown_plugin",
                                          "plugin_unavailable", "premium_required", "stereo_only",
                                          "replaced_in_group", "nothing_to_protect", "volume_not_software",
-                                         "nothing_to_quantize", null] },
+                                         "nothing_to_quantize", "not_in_service", null] },
                     "detail": texte_ou_null,
                     "params": objet_ou_null,
                     "latency_frames": entier_ou_null
@@ -264,7 +264,8 @@ pub fn schema_json() -> Value {
                     "active_preset": texte_ou_null,
                     "headroom_db": { "type": "number" },
                     "volume": { "$ref": "#/$defs/volume" },
-                    "badge": enumere(&["bit_perfect", "processed_by_tess", "outside_tess"]),
+                    "badge": enumere(&["bit_perfect", "processed_by_tess", "outside_tess",
+                                       "altered_outside_tess"]),
                     "signal_path": { "type": "array", "items": { "$ref": "#/$defs/step" } },
                     "catalog": { "$ref": "#/$defs/catalog" }
                 },
