@@ -53,7 +53,12 @@ write_notice() {
     printf '%s\n' "$password" > "$INITIAL_SECRET"
     chmod 0600 "$INITIAL_SECRET"
     install -d -m 0755 "$(dirname "$ISSUE_NOTICE")"
-    cat > "$ISSUE_NOTICE" <<EOF
+    # agetty reads /etc/issue.d as root: the notice is root-only (0600). A
+    # fresh file (mktemp creates it 0600) renamed over the old one, so that it
+    # is never readable by anyone else, not even while it is being written.
+    local tmp
+    tmp="$(mktemp "${ISSUE_NOTICE}.XXXXXX")"
+    cat > "$tmp" <<EOF
 
   Tune OS — premier accès SSH
   Utilisateur : tune
@@ -61,7 +66,8 @@ write_notice() {
   Le changement de ce mot de passe est obligatoire à la première connexion.
 
 EOF
-    chmod 0644 "$ISSUE_NOTICE"
+    chmod 0600 "$tmp"
+    mv -f "$tmp" "$ISSUE_NOTICE"
 }
 
 rotate_and_expire() {

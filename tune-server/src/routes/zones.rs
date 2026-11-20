@@ -671,6 +671,11 @@ pub fn router() -> Router<AppState> {
             get(tune_tested::etat_tune_tested).post(tune_tested::proposer_tune_tested),
         )
         .route("/group-delays", get(list_group_delays).put(set_group_delay))
+        // #9089 — décalage manuel d'une zone qui suit la meneuse de son groupe.
+        .route(
+            "/{id}/group-offset",
+            get(decalage_de_groupe_9089::lire).put(decalage_de_groupe_9089::ecrire),
+        )
         .route("/group", get(list_groups).post(create_group))
         .route("/groups", get(list_groups).post(create_group))
         .route("/groups/list", get(list_groups))
@@ -1808,6 +1813,8 @@ pub(crate) use preconfiguration::preconfigurer_zone as preconfigurer_zone_decouv
 
 mod groupes;
 pub use groupes::*;
+// #9089 — `GET` / `PUT /zones/{id}/group-offset`.
+mod decalage_de_groupe_9089;
 
 // #6155 — les suiveuses d'un groupe jouent ce que joue la meneuse.
 pub mod relais_de_groupe_6155;
