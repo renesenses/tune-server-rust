@@ -122,6 +122,11 @@ pub(super) struct CorrectionPiece {
     pub reason: Option<String>,
     pub ir_sample_rate: Option<u32>,
     pub taps: Option<usize>,
+    /// #8761 — la cadence vers laquelle le fichier a été rééchantillonné
+    /// (`None` : fichier pris à sa cadence).
+    pub resampled_to: Option<u32>,
+    /// #8761 — les cadences des fichiers du jeu de la zone.
+    pub ir_files: Vec<u32>,
 }
 
 impl CorrectionPiece {
@@ -134,6 +139,8 @@ impl CorrectionPiece {
             "reason": self.reason,
             "ir_sample_rate": self.ir_sample_rate,
             "taps": self.taps,
+            "resampled_to": self.resampled_to,
+            "ir_files": self.ir_files,
         })
     }
 }
@@ -146,8 +153,9 @@ fn latence_convolueur_ms(sample_rate: u32) -> f64 {
 
 /// L'étape « Correction de pièce » (#7632) : `None` sans `ir_path_{zone}`.
 /// Le fichier est LU (cadence, taps) pour dire si le convolueur l'applique
-/// au flux courant — la même règle que `ConvolverConfig::build_for` : pas de
-/// rééchantillonnage, donc cadence de l'IR = cadence du flux, sinon rien.
+/// au flux courant — la même règle que `ConvolverConfig::build_for` (#8761) :
+/// le fichier du jeu à la cadence du flux, sinon le plus proche
+/// rééchantillonné, sinon (rééchantillonnage refusé par la zone) rien.
 pub(super) fn zone_correction_piece_lang(
     lang: &str,
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
@@ -174,6 +182,8 @@ pub(super) fn zone_correction_piece_lang(
                 reason: Some(e),
                 ir_sample_rate: None,
                 taps: None,
+                resampled_to: None,
+                ir_files: Vec::new(),
             });
         }
     };
@@ -186,6 +196,55 @@ pub(super) fn zone_correction_piece_lang(
             reason: Some("pure".into()),
             ir_sample_rate: ir_sr,
             taps,
+            resampled_to: None,
+            ir_files: Vec::new(),
+        });
+    }
+    // #8761 — le jeu par cadence : un fichier à la cadence du fil, ou le plus
+    // proche rééchantillonné (sauf refus réglé). Seul un refus laisse la
+    // piste sans correction.
+    let jeu = tune_core::audio::convolver::JeuDeZone::lire(
+        &tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone()),
+        zone_id,
+    )
+    .and_then(|j| j.charger().ok());
+    let ir_files: Vec<u32> = jeu.as_ref().map(|j| j.cadences()).unwrap_or_default();
+    if let (Some(fil), Some(jeu)) = (wire_sample_rate, jeu.as_ref())
+        && let Ok(choix) = jeu.choix_pour(fil)
+    {
+        let taps = jeu.prises_pour(fil).or(taps);
+        let description = if choix.reechantillonne {
+            fs(
+                lang,
+                "correction_piece_reechantillonnee",
+                &[
+                    &taps.map(|t| t.to_string()).unwrap_or_else(|| "?".into()),
+                    &choix.cadence_fichier.to_string(),
+                    &fil.to_string(),
+                    &format!("{:.0}", latence_convolueur_ms(fil)),
+                ],
+            )
+        } else {
+            fs(
+                lang,
+                "correction_piece_active",
+                &[
+                    &taps.map(|t| t.to_string()).unwrap_or_else(|| "?".into()),
+                    &fil.to_string(),
+                    &format!("{:.0}", latence_convolueur_ms(fil)),
+                ],
+            )
+        };
+        return Some(CorrectionPiece {
+            kind: "ir",
+            status: "applied",
+            applied: true,
+            description,
+            reason: None,
+            ir_sample_rate: Some(choix.cadence_fichier),
+            taps,
+            resampled_to: choix.reechantillonne.then_some(fil),
+            ir_files,
         });
     }
     if let (Some(fil), Some(ir)) = (wire_sample_rate, ir_sr)
@@ -203,6 +262,8 @@ pub(super) fn zone_correction_piece_lang(
             reason: Some(format!("ir_sample_rate {ir} != stream_sample_rate {fil}")),
             ir_sample_rate: ir_sr,
             taps,
+            resampled_to: None,
+            ir_files: Vec::new(),
         });
     }
     let cadence = wire_sample_rate.or(ir_sr).unwrap_or(48_000);
@@ -222,6 +283,8 @@ pub(super) fn zone_correction_piece_lang(
         reason: None,
         ir_sample_rate: ir_sr,
         taps,
+        resampled_to: None,
+        ir_files: Vec::new(),
     })
 }
 
@@ -292,6 +355,8 @@ fn correction_piece_egaliseur_lang(
         reason,
         ir_sample_rate: None,
         taps: None,
+        resampled_to: None,
+        ir_files: Vec::new(),
     })
 }
 

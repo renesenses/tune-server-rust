@@ -206,10 +206,22 @@ fn la_ri_ne_s_applique_qu_a_sa_cadence_et_a_un_nombre_de_canaux_compatible_7986(
         orch.zone_ir_s_appliquerait(zone_id, None, 2),
         "cadence inconnue"
     );
+    // #8761 — une autre cadence est servie par le filtre rééchantillonné…
+    assert!(
+        orch.zone_ir_s_appliquerait(zone_id, Some(48_000), 2),
+        "cadence : repli rééchantillonné"
+    );
+    // … sauf si le réglage de la zone refuse le rééchantillonnage.
+    SettingsRepo::with_backend(orch.db.clone())
+        .set(&format!("ir_resample_{zone_id}"), "false")
+        .unwrap();
     assert!(
         !orch.zone_ir_s_appliquerait(zone_id, Some(48_000), 2),
-        "cadence"
+        "cadence, rééchantillonnage refusé"
     );
+    SettingsRepo::with_backend(orch.db.clone())
+        .delete(&format!("ir_resample_{zone_id}"))
+        .unwrap();
 
     let stereo = ecrire_ri("ri-7986-stereo", 44_100, 2);
     regler_ri(&orch, zone_id, stereo.as_str().as_ref());

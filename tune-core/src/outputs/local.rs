@@ -1948,6 +1948,30 @@ impl LocalOutput {
 
     pub fn set_convolver_ir(&self, path: &str) -> Result<(), String> {
         let config = super::super::audio::convolver::ConvolverConfig::from_wav(path)?;
+        self.set_convolver_config(config)
+    }
+
+    /// #8761 — installer un JEU de réponses impulsionnelles (une par cadence,
+    /// rééchantillonnage en repli selon le réglage de la zone). Les cadences
+    /// usuelles absentes du jeu sont préparées en tâche de fond : un
+    /// changement de cadence entre deux pistes enchaînées trouve alors le
+    /// filtre rééchantillonné déjà en cache, sans calcul sur le fil audio.
+    pub fn set_convolver_config(
+        &self,
+        config: super::super::audio::convolver::ConvolverConfig,
+    ) -> Result<(), String> {
+        let path = config_chemin_pour_journal(&config);
+        let path = path.as_str();
+        if config.reechantillonnage_autorise() {
+            let a_chauffer = config.clone();
+            let _ = std::thread::Builder::new()
+                .name("tune-ri-prechauffe".into())
+                .spawn(move || {
+                    a_chauffer.prechauffer(
+                        &super::super::audio::convolver::par_cadence::CADENCES_USUELLES,
+                    )
+                });
+        }
         *self.convolver_config.lock().unwrap() = Some(config.clone());
         let current_format = self
             .current_format()
@@ -1972,6 +1996,8 @@ impl LocalOutput {
             path,
             device = %self.device_name,
             ir_sample_rate = config.sample_rate(),
+            ir_rates = ?config.cadences(),
+            ir_resample = config.reechantillonnage_autorise(),
             ir_channels = config.source_channels(),
             active = current_format.is_some(),
             "convolver_ir_set"
@@ -10293,3 +10319,11 @@ mod etage_exclusif_observe_7093;
 
 #[cfg(test)]
 mod exclusif_par_zone_3245_tests;
+
+/// #8761 — les cadences du jeu, pour la ligne de journal de l'installation.
+fn config_chemin_pour_journal(
+    config: &crate::audio::convolver::ConvolverConfig,
+) -> String {
+    let cadences: Vec<String> = config.cadences().iter().map(u32::to_string).collect();
+    format!("jeu[{} Hz]", cadences.join(", "))
+}

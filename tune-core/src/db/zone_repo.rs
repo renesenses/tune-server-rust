@@ -1005,23 +1005,27 @@ fn schema_incomplet(e: &str) -> bool {
 }
 
 /// Les réglages d'une zone qui vivent dans `settings` : le préfixe de
-/// convention `zone_{id}_…` et les quatre clés qui l'ignorent (calibration
+/// convention `zone_{id}_…` et les six clés qui l'ignorent (calibration
 /// DAC, pièce, réponse impulsionnelle, renderer UPnP).
-fn cles_de_zone(id: i64) -> (String, [String; 4]) {
+fn cles_de_zone(id: i64) -> (String, [String; 6]) {
     (
         format!("zone_{id}_"),
         CLES_DE_ZONE_SUFFIXEES.map(|prefixe| format!("{prefixe}{id}")),
     )
 }
 
-/// Les quatre clés de zone qui portent l'identifiant en SUFFIXE (voir
+/// Les six clés de zone qui portent l'identifiant en SUFFIXE (voir
 /// [`cles_de_zone`]). Une seule liste, lue par le report des doublons et par
 /// l'export de configuration.
-const CLES_DE_ZONE_SUFFIXEES: [&str; 4] = [
+const CLES_DE_ZONE_SUFFIXEES: [&str; 6] = [
     "dac_profile_",
     "room_profile_",
     "ir_path_",
     "upnp_renderer_udn_",
+    // #8761 — les fichiers de convolution par cadence et le réglage de repli
+    // suivent le fichier principal.
+    "ir_jeu_",
+    "ir_resample_",
 ];
 
 /// Le gabarit d'un réglage de zone rangé dans `settings` : l'identifiant de
