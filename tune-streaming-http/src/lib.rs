@@ -1371,12 +1371,27 @@ struct GenreAlbumsQuery {
     section: Option<String>,
 }
 
+/// Profondeur maximale servie par `/genres/{id}/albums`.
+const LIMITE_MAX_ALBUMS_GENRE: usize = 200;
+
 async fn service_genre_albums(
     State(state): State<StreamingHttpState>,
     Path((service, genre_id)): Path<(String, String)>,
     Query(q): Query<GenreAlbumsQuery>,
 ) -> Response {
-    let limit = q.limit.unwrap_or(50);
+    // Sans `?limit=`, seules les nouveautés d'un genre chez Qobuz montent à
+    // 200 : c'est le seul connecteur qui pagine en interne
+    // (`nouveautes_du_lecteur()`, par pages de 50). Spotify refuse un `limit`
+    // au-delà de 50 (400) et TIDAL plafonne ses pages, donc les autres
+    // services et les rubriques éditoriales gardent 50. Une limite explicite
+    // est bornée à `LIMITE_MAX_ALBUMS_GENRE` pour qu'un `?limit=100000` ne
+    // fasse pas paginer Qobuz indéfiniment.
+    let defaut = if q.section.is_none() && service == "qobuz" {
+        LIMITE_MAX_ALBUMS_GENRE
+    } else {
+        50
+    };
+    let limit = q.limit.unwrap_or(defaut).min(LIMITE_MAX_ALBUMS_GENRE);
     match q.section.as_deref() {
         None => with_svc_editorial_retirable!(
             &state,
@@ -3377,11 +3392,11 @@ mod tests_cache_utilisateur {
         async fn get_genre_albums(
             &self,
             genre_id: &str,
-            _limit: usize,
+            limit: usize,
         ) -> Result<Vec<StreamAlbum>, TuneError> {
             Ok(vec![StreamAlbum {
                 id: "n1".into(),
-                title: format!("nouveautes|{genre_id}"),
+                title: format!("nouveautes|{genre_id}|{limit}"),
                 ..StreamAlbum::default()
             }])
         }
@@ -4579,7 +4594,39 @@ mod tests_route_rubrique_par_genre {
     #[tokio::test]
     async fn sans_rubrique_la_route_rend_les_nouveautes() {
         let vus = titres("essai-genre-defaut", None, None).await;
-        assert_eq!(vus, vec![String::from("nouveautes|80")]);
+        assert_eq!(vus, vec![String::from("nouveautes|80|50")]);
+    }
+
+    /// Sans `?limit=`, Qobuz (seul à paginer en interne) sert 200 nouveautés ;
+    /// les autres services gardent 50 (Spotify refuse plus, 400).
+    #[tokio::test]
+    async fn la_limite_par_defaut_depend_du_service() {
+        assert_eq!(
+            titres("qobuz", None, None).await,
+            vec![String::from("nouveautes|80|200")]
+        );
+        assert_eq!(
+            titres("spotify", None, None).await,
+            vec![String::from("nouveautes|80|50")]
+        );
+        // Une rubrique éditoriale garde 50 même chez Qobuz.
+        assert_eq!(
+            titres("qobuz", None, Some("press-awards")).await,
+            vec![String::from("press-awards|80|50")]
+        );
+    }
+
+    /// Une limite explicite passe telle quelle, mais bornée à 200.
+    #[tokio::test]
+    async fn la_limite_explicite_est_bornee() {
+        assert_eq!(
+            titres("qobuz", Some(40), None).await,
+            vec![String::from("nouveautes|80|40")]
+        );
+        assert_eq!(
+            titres("qobuz", Some(100_000), None).await,
+            vec![String::from("nouveautes|80|200")]
+        );
     }
 }
 
