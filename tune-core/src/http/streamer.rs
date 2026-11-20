@@ -2623,11 +2623,48 @@ pub fn cleanup_leftover_transcode_files() {
             && std::fs::remove_file(entry.path()).is_ok()
         {
             count += 1;
+            continue;
+        }
+        // #8795 — un fMP4 DASH de TIDAL laissé par un arrêt brutal ou par
+        // un téléchargement coupé.
+        if let Some(name) = entry.file_name().to_str() {
+            let age = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| std::time::SystemTime::now().duration_since(m).ok());
+            let epingle =
+                crate::audio::dash_epingles::est_epingle(&entry.path().to_string_lossy());
+            if dash_tidal_orphelin(name, age, epingle) && std::fs::remove_file(entry.path()).is_ok()
+            {
+                count += 1;
+            }
         }
     }
     if count > 0 {
         info!(count, "leftover_transcode_files_cleaned_up");
     }
+}
+
+/// #8795 — `tune-dash-<uuid>.mp4` que le démarrage peut supprimer : ni
+/// épinglé par une zone (#8701), ni récent. Aucune lecture de ce processus
+/// n'a encore commencé au démarrage ; l'âge minimal (le même que le
+/// ramasse-miettes périodique, bien au-delà du TTL de 240 s du cache d'URL)
+/// épargne le fichier qu'un AUTRE serveur du même compte assemble ou lit en
+/// ce moment. Les pré-transcodages (`tune-dash-transcode-`) et les rendus
+/// du préchauffage (`tune-dash-warm-`) ne sont pas des `.mp4` DASH.
+pub(crate) fn dash_tidal_orphelin(
+    nom: &str,
+    age: Option<std::time::Duration>,
+    epingle: bool,
+) -> bool {
+    const AGE_MIN: std::time::Duration = std::time::Duration::from_secs(600);
+    nom.starts_with("tune-dash-")
+        && nom.ends_with(".mp4")
+        && !nom.starts_with("tune-dash-transcode-")
+        && !nom.starts_with("tune-dash-warm-")
+        && !epingle
+        && age.is_some_and(|a| a > AGE_MIN)
 }
 
 // ─── Helpers (framework-agnostic) ───────────────────────────────
@@ -3950,5 +3987,40 @@ mod tests {
             ..aac
         };
         assert_eq!(avec_taille.debit_nominal_octets_par_seconde(), Some(40_000));
+    }
+}
+
+#[cfg(test)]
+mod balayage_dash_8795_tests {
+    use super::dash_tidal_orphelin;
+    use std::time::Duration;
+
+    const VIEUX: Option<Duration> = Some(Duration::from_secs(3600));
+
+    /// Contre-épreuve : retirer la clause `tune-dash-` de
+    /// `cleanup_leftover_transcode_files` laisse ces fichiers au démarrage ;
+    /// rendre `true` sans condition fait tomber les cas épargnés.
+    #[test]
+    fn un_fmp4_dash_vieux_et_libre_est_balaye_8795() {
+        assert!(dash_tidal_orphelin(
+            "tune-dash-3f2a9c1e-0000-4000-8000-000000000000.mp4",
+            VIEUX,
+            false
+        ));
+    }
+
+    #[test]
+    fn epingle_recent_ou_autre_fichier_est_epargne_8795() {
+        let nom = "tune-dash-3f2a9c1e-0000-4000-8000-000000000000.mp4";
+        assert!(!dash_tidal_orphelin(nom, VIEUX, true), "épinglé (#8701)");
+        assert!(
+            !dash_tidal_orphelin(nom, Some(Duration::from_secs(30)), false),
+            "récent : peut-être celui d'un autre serveur en cours"
+        );
+        assert!(!dash_tidal_orphelin(nom, None, false), "âge inconnu");
+        assert!(!dash_tidal_orphelin("tune-dash-transcode-x.mp4", VIEUX, false));
+        assert!(!dash_tidal_orphelin("tune-dash-warm-x.mp4", VIEUX, false));
+        assert!(!dash_tidal_orphelin("tune-dash-x.flac", VIEUX, false));
+        assert!(!dash_tidal_orphelin("musique.mp4", VIEUX, false));
     }
 }

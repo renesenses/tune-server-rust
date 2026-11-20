@@ -568,7 +568,10 @@ async fn renderer_reseau_garde_le_prechargement_de_la_piste_demandee_8795() {
         !moteur.abandonner_avant_la_lecture(banc.zone_id, "tidal", "LENTE", false),
         "renderer réseau : le préchargement de la piste demandée est repris (#7247)"
     );
-    assert!(!service_libre(&banc).await, "le préchargement tient toujours");
+    assert!(
+        !service_libre(&banc).await,
+        "le préchargement tient toujours"
+    );
     assert!(
         moteur.abandonner_avant_la_lecture(banc.zone_id, "tidal", "AUTRE", false),
         "une autre piste l'abandonne toujours (#8215)"

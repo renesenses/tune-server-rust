@@ -476,6 +476,10 @@ async fn produire_le_canal_aac(c: CanalAac) {
 mod canal_aac_fin_notee_6298_tests;
 
 #[cfg(test)]
+#[path = "suivant_prechargement_8795_tests.rs"]
+mod suivant_prechargement_8795_tests;
+
+#[cfg(test)]
 #[path = "youtube_dlna_demarrage_8228_tests.rs"]
 mod youtube_dlna_demarrage_8228_tests;
 
