@@ -12327,3 +12327,94 @@ async fn le_format_upnp_suit_lecture_preparation_et_avance_de_file_8788() {
     assert_eq!(seconde.sample_rate, Some(705600));
     assert_eq!(seconde.bit_depth, Some(24));
 }
+
+/// Relecture rc13 — la licence et le greffon tiennent AUSSI le relais WAV
+/// progressif d'OAAT et du navigateur, pas seulement l'écran
+/// (`crossfeed_status_de_zone` / `avec_les_droits`).
+///
+/// La décision du traitement se prend en UN point, `load_crossfeed_processor`
+/// → `crossfeed_configure` → `crossfeed_configure_sous_licence`, qui lit la
+/// même licence (palier effectif) et le même `premium_plugins::enabled` que la
+/// route. Ce test mesure la décision réelle (`relais_dsp_pour_test`) sur les
+/// deux sorties que #9178 déverrouille à l'écran.
+///
+/// Un égaliseur (gratuit) est posé pour que le relais soit armé dans les trois
+/// cas : sans lui, « pas de crossfeed » ne se distinguerait pas de « pas de
+/// relais » (le FLAC partirait tel quel vers le navigateur). Seul le crossfeed
+/// doit varier avec les droits.
+#[tokio::test]
+async fn relais_oaat_et_navigateur_crossfeed_sous_licence_et_greffon() {
+    for (type_de_sortie, peripherique) in [
+        ("oaat", "oaat:salon-licence"),
+        ("browser", "browser:salon-licence"),
+    ] {
+        let mut orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Salon", Some(type_de_sortie), Some(peripherique))
+            .unwrap();
+        piste_3234(
+            &orch,
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+            "flac",
+        );
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+        // Hors de la fenêtre legacy : le greffon compte par ses clés.
+        settings
+            .set(crate::audio::premium_plugins::MIGRATION, "complete")
+            .unwrap();
+        settings.set("plugin_equalizer_installed", "true").unwrap();
+        settings
+            .set(
+                &format!("zone_{zone_id}_eq_profile"),
+                &serde_json::to_string(&radio_test_eq_profile()).unwrap(),
+            )
+            .unwrap();
+        settings
+            .set(
+                &format!("zone_{zone_id}_crossfeed"),
+                r#"{"enabled":true,"amount":0.3,"delay_ms":0.3}"#,
+            )
+            .unwrap();
+        settings.set("plugin_crossfeed_installed", "true").unwrap();
+        let mut req = requete_locale_3234(zone_id, 1);
+        req.output_device_id = Some(peripherique.into());
+
+        // 1. Palier gratuit, greffon installé : le relais tourne (égaliseur),
+        //    SANS crossfeed.
+        orch.license = Some(Arc::new(crate::license::LicenseManager::new(
+            orch.db.clone(),
+        )));
+        assert!(!orch.license.as_ref().unwrap().premium_snapshot());
+        let (actif, relais, crossfeed) = orch.relais_dsp_pour_test(&req).await.unwrap();
+        assert!(
+            actif && relais,
+            "{type_de_sortie} : l'égaliseur doit armer le relais, sinon le test ne prouve rien"
+        );
+        assert!(
+            !crossfeed,
+            "{type_de_sortie} : sans licence Premium, le relais porte le crossfeed"
+        );
+
+        // 2. Premium, greffon retiré : toujours pas de crossfeed.
+        orch.license = Some(crate::license::licence_premium_pour_test(orch.db.clone()));
+        settings.set("plugin_crossfeed_installed", "false").unwrap();
+        let (actif, relais, crossfeed) = orch.relais_dsp_pour_test(&req).await.unwrap();
+        assert!(
+            actif && relais,
+            "{type_de_sortie} : relais armé par l'égaliseur"
+        );
+        assert!(
+            !crossfeed,
+            "{type_de_sortie} : sans le greffon, le relais porte le crossfeed"
+        );
+
+        // 3. Premium ET greffon : le relais porte le crossfeed (témoin).
+        settings.set("plugin_crossfeed_installed", "true").unwrap();
+        let (actif, relais, crossfeed) = orch.relais_dsp_pour_test(&req).await.unwrap();
+        assert!(actif && relais, "{type_de_sortie} : relais armé");
+        assert!(
+            crossfeed,
+            "{type_de_sortie} : licence et greffon réunis, le crossfeed doit être porté"
+        );
+    }
+}
