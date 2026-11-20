@@ -443,6 +443,9 @@ async fn un_contenant_designe_reste_un_nouveau_geste() {
 async fn la_relance_d_un_titre_de_service_deja_en_file_garde_la_playlist() {
     let banc = BancDeLecture::new().await;
     let ligne = |id: &str| tune_core::db::play_queue_repo::QueueInput::Streaming {
+        media_format: None,
+        sample_rate: None,
+        bit_depth: None,
         source: "qobuz".into(),
         source_id: id.into(),
         title: format!("Service {id}"),

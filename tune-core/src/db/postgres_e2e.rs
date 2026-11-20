@@ -1008,6 +1008,9 @@ async fn pg_6079_la_file_garde_l_artiste_de_service() {
         .unwrap();
     let repo = PlayQueueRepo::with_backend(db.clone());
     let ligne = |id: &str, album: Option<&str>, artiste: Option<&str>| QueueInput::Streaming {
+        media_format: None,
+        sample_rate: None,
+        bit_depth: None,
         source: "qobuz".into(),
         source_id: id.into(),
         title: format!("Titre {id}"),
@@ -1098,6 +1101,9 @@ async fn pg_6466_le_conteneur_des_elements_de_file() {
         .unwrap();
     let repo = PlayQueueRepo::with_backend(db.clone());
     let ligne = |id: &str| QueueInput::Streaming {
+        media_format: None,
+        sample_rate: None,
+        bit_depth: None,
         source: "qobuz".into(),
         source_id: id.into(),
         title: format!("Titre {id}"),
@@ -1233,7 +1239,7 @@ async fn pg_6285_filtre_et_regles_du_verdict_hires() {
     .await
     .expect("la migration 093 doit se rejouer");
     let _ = db.execute("DELETE FROM hires_verifications", &[]);
-    for album in 1..=10i64 {
+    for album in 1..=11i64 {
         db.execute(
             "INSERT INTO albums (id, title) VALUES (?, 'a')",
             &[&album as &dyn ToSqlValue],
@@ -1315,6 +1321,29 @@ async fn pg_6285_filtre_et_regles_du_verdict_hires() {
         )
         .unwrap();
     }
+    // #9067 (19/11, « Source altérée ») — album 11 : deux pistes CD au mur de
+    // codec et une CD conforme (2 sur 3) : altéré, sur PostgreSQL aussi.
+    for (piste, verdict, raison) in [
+        (1100i64, "douteux", Some("mur_de_codec")),
+        (1101, "douteux", Some("mur_de_codec")),
+        (1102, "conforme", None),
+    ] {
+        let chemin = format!("/m/{piste}.flac");
+        db.execute(
+            "INSERT INTO tracks (id, album_id, title, file_path, format, source, duration_ms) \
+             VALUES (?, 11, 't', ?, 'flac', 'local', 60000)",
+            &[&piste as &dyn ToSqlValue, &chemin],
+        )
+        .unwrap();
+        let verdict = verdict.to_string();
+        let raison = raison.map(str::to_string);
+        db.execute(
+            "INSERT INTO hires_verifications (track_id, verdict, raison, coupure_hz, sample_rate, bits_declares) \
+             VALUES (?, ?, ?, 16000.0, 44100, 16)",
+            &[&piste as &dyn ToSqlValue, &verdict, &raison],
+        )
+        .unwrap();
+    }
     let ids_de = |sql: String| -> Vec<i64> {
         db.query_many(&sql, &[])
             .unwrap_or_else(|e| panic!("{e}\n{sql}"))
@@ -1322,7 +1351,7 @@ async fn pg_6285_filtre_et_regles_du_verdict_hires() {
             .filter_map(|r| r[0].as_i64())
             .collect()
     };
-    let ids: Vec<i64> = (1..=10).collect();
+    let ids: Vec<i64> = (1..=11).collect();
     let par_album = pistes_mesurees_par_album(&db, &ids).unwrap();
     for visible in [false, true] {
         for v in [
@@ -1383,12 +1412,17 @@ async fn pg_6285_filtre_et_regles_du_verdict_hires() {
     assert!(du_catalogue(&["douteux"], false).is_empty());
     assert_eq!(
         du_catalogue(&["verifie", "douteux"], true),
-        vec![1, 3, 6, 8, 9]
+        vec![1, 3, 6, 8, 9, 11]
+    );
+    assert_eq!(
+        du_catalogue(&["altere"], true),
+        du_catalogue(&["douteux"], true),
+        "#9067 : `altere` est l'alias de `douteux`"
     );
     assert!(du_catalogue(&["hires"], true).is_empty());
     assert!(
         !du_catalogue(&["douteux"], true).contains(&10),
-        "#9067 : un CD n'est pas douteux"
+        "#9067 : un CD n'est pas altéré sur la seule coupure"
     );
     assert!(du_catalogue(&["conforme"], true).contains(&10));
     // Les pistes des albums 1 à 7 (celles des albums 8 et 9 de #9035 ont

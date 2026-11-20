@@ -212,6 +212,8 @@ impl ComptesStats {
 pub(crate) struct Comptages {
     pub(crate) sante: Arc<CacheDeComptage<ComptesSante>>,
     pub(crate) stats: Arc<CacheDeComptage<ComptesStats>>,
+    /// #9116 — les jauges d'avancement, figées pendant la pause.
+    pub(crate) releves: super::avancement_suspendu_9116::RelevesSuspendus,
 }
 
 /// Les comptes de santé, hors exécuteur. Une tâche perdue se lit comme une

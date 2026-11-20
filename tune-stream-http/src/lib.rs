@@ -2162,7 +2162,6 @@ fn corps_virtuel(
     length: u64,
     byte_counter: std::sync::Arc<StreamSession>,
 ) -> Body {
-    use std::sync::atomic::Ordering::Relaxed;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
     let stream_id = byte_counter.id.clone();
     tokio::task::spawn_blocking(move || {
@@ -2183,7 +2182,7 @@ fn corps_virtuel(
             let Some(morceau) = rx.recv().await else { break };
             let n = (morceau.len() as u64).min(remaining);
             remaining -= n;
-            byte_counter.bytes_sent.fetch_add(n, Relaxed);
+            byte_counter.compter_octets_servis(n);
             chrono.compter(n);
             let mut octets = bytes::Bytes::from(morceau);
             octets.truncate(n as usize);
@@ -2398,9 +2397,7 @@ where
 {
     Body::from_stream(futures_util::StreamExt::map(flux, move |morceau| {
         if let Ok(ref o) = morceau {
-            compteur
-                .bytes_sent
-                .fetch_add(o.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            compteur.compter_octets_servis(o.len() as u64);
         }
         morceau
     }))
@@ -2714,7 +2711,6 @@ fn build_file_body(
     byte_counter: std::sync::Arc<StreamSession>,
     octets_par_seconde: Option<u32>,
 ) -> Body {
-    use std::sync::atomic::Ordering::Relaxed;
     let mut chrono = ChronoServiceFichier::new(byte_counter.id.clone(), length, octets_par_seconde);
     Body::from_stream(async_stream::stream! {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -2727,7 +2723,7 @@ fn build_file_body(
             while remaining > 0 && vpos < header_len {
                 let n = ((header_len - vpos).min(remaining)) as usize;
                 let s = vpos as usize;
-                byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
+                byte_counter.compter_octets_servis(n as u64);
                 chrono.compter(n as u64);
                 let envoi = std::time::Instant::now();
                 yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&map.header[s..s + n]));
@@ -2755,7 +2751,7 @@ fn build_file_body(
                                 Ok(0) => { chrono.noter_fin(FinDuService::FichierPlusCourt); break; }
                                 Ok(n) => {
                                     remaining -= n as u64;
-                                    byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
+                                    byte_counter.compter_octets_servis(n as u64);
                                     chrono.compter(n as u64);
                                     let envoi = std::time::Instant::now();
                                     yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n]));
@@ -2786,7 +2782,7 @@ fn build_file_body(
                             Ok(0) => { chrono.noter_fin(FinDuService::FichierPlusCourt); break; }
                             Ok(n) => {
                                 remaining -= n as u64;
-                                byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
+                                byte_counter.compter_octets_servis(n as u64);
                                 chrono.compter(n as u64);
                                 let envoi = std::time::Instant::now();
                                 yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n]));

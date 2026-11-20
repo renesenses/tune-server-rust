@@ -125,6 +125,9 @@ async fn se_deconnecter(state: &AppState) -> (StatusCode, String) {
         .finish();
     let _garde = tracing::subscriber::set_default(abonne);
     let reponse = tune_server::routes::router(state.clone())
+        .layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+        ))
         .oneshot(
             Request::post("/api/v1/cloud/sso/disconnect")
                 .body(Body::empty())
