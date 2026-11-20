@@ -46,6 +46,25 @@ impl DeviceDescription {
             .any(|s| s.service_type.contains("av-openhome-org"))
     }
 
+    /// #9068 — vrai si ce (sous-)appareil porte un lecteur OpenHome
+    /// PILOTABLE : `Product`, `Playlist` et `Transport` du domaine
+    /// `av-openhome-org`. Ce sont les services dont `OpenHomeOutput` tire la
+    /// lecture (file, transport, état). Un appareil imbriqué qui n'en porte
+    /// qu'une partie (`Product`/`Volume` seuls) ne doit pas faire basculer un
+    /// renderer DLNA en OpenHome : une fois inscrite, l'`OpenHomeOutput` n'a
+    /// aucun repli DLNA.
+    pub(crate) fn porte_un_lecteur_openhome(&self) -> bool {
+        ["Product", "Playlist", "Transport"].iter().all(|nom| {
+            self.services.iter().any(|s| {
+                let mut parties = s.service_type.split(':');
+                parties.next() == Some("urn")
+                    && parties.next() == Some("av-openhome-org")
+                    && parties.next() == Some("service")
+                    && parties.next().is_some_and(|n| n.eq_ignore_ascii_case(nom))
+            })
+        })
+    }
+
     /// Returns true if the device exposes an AVTransport service, regardless of deviceType.
     /// This catches renderers (WiiM, foobar2000 foo_upnp, etc.) that use non-standard
     /// device types but still support DLNA playback via AVTransport.
@@ -472,6 +491,48 @@ pub fn parse_device_description(xml: &str) -> Result<DeviceDescription, String> 
         }
     }
 
+    // ── La face OPENHOME portée par un appareil imbriqué (#9068) ────────────
+    //
+    // `is_openhome()` ne regarde que les services déjà rattachés : la racine,
+    // plus le MediaRenderer imbriqué ci-dessus. Un descriptif dont les
+    // services `urn:av-openhome-org:*` vivent dans un AUTRE appareil de la
+    // `deviceList` (Linn ohNet : `Source:1` à côté ou en dessous du
+    // `MediaRenderer:1`) était donc classé DLNA, et la face OpenHome ne
+    // l'était jamais — Klimax DS/2, fil forum 2917. Le bloc renderer, lui,
+    // ne s'arme même pas quand la racine est déjà le MediaRenderer.
+    //
+    // On rattache donc l'appareil OpenHome imbriqué dès que le descriptif
+    // n'en porte pas déjà — à condition qu'il soit un lecteur COMPLET
+    // (`porte_un_lecteur_openhome`) : un OpenHome imbriqué partiel laisse le
+    // renderer en DLNA. En `extend`, pas en fusion nommée : les clés
+    // OpenHome (`product`, `playlist`, `transport`, `volume`, `info`,
+    // `time`…) ne recouvrent aucune clé UPnP AV (`avtransport`,
+    // `renderingcontrol`, `connectionmanager`), et, arrivées en dernier,
+    // elles l'emportent dans `service_urls()` sur un homonyme hérité des
+    // anciens services `urn:linn-co-uk:*` (`Product:3`…) d'une racine Linn.
+    if !desc.is_openhome()
+        && let Some(source) = embedded_devices
+            .iter()
+            .find(|device| device.porte_un_lecteur_openhome())
+    {
+        if desc.friendly_name.is_empty() {
+            desc.friendly_name = source.friendly_name.clone();
+        }
+        if desc.manufacturer.is_empty() {
+            desc.manufacturer = source.manufacturer.clone();
+        }
+        if desc.model_name.is_empty() {
+            desc.model_name = source.model_name.clone();
+        }
+        if desc.model_description.is_empty() {
+            desc.model_description = source.model_description.clone();
+        }
+        if desc.version_logicielle.is_empty() {
+            desc.version_logicielle = source.version_logicielle.clone();
+        }
+        desc.services.extend(source.services.iter().cloned());
+    }
+
     // ── La moitié SERVEUR du même composite (#4124) ─────────────────────────
     //
     // Le bloc ci-dessus n'a jamais rattaché que le renderer : il a été écrit
@@ -744,6 +805,366 @@ mod tests {
         let urls = desc.service_urls();
         assert!(urls.contains_key("product"));
         assert!(urls.contains_key("playlist"));
+    }
+
+    // ── #9068 — Linn ohNet : la face OpenHome dans un appareil imbriqué ─────
+    //
+    // Descriptifs bâtis sur la pile ohNet des Linn DS (URL de contrôle
+    // `/<udn>/<domaine>-<service>-<version>/control`, préfixe d'UDN
+    // `4c494e4e` = « LINN », `deviceType` `urn:linn-co-uk:device:Source:1`),
+    // celle que montre le journal du fil forum 2917. Le descriptif exact du
+    // Klimax DS/2 n'a pas pu être relevé : les deux dispositions ci-dessous
+    // sont celles qui donnent EXACTEMENT le symptôme (renderer DLNA à l'UDN
+    // `4c494e4e…`, aucune sortie OpenHome, un seul appareil compté).
+
+    /// Racine = le MediaRenderer, OpenHome `Source:1` imbriqué dessous.
+    const LINN_OHNET_RACINE_RENDERER_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <specVersion><major>1</major><minor>0</minor></specVersion>
+        <device>
+          <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
+          <friendlyName>Salon:Klimax DS:MediaRenderer</friendlyName>
+          <manufacturer>Linn Products Ltd</manufacturer>
+          <modelName>Klimax DS</modelName>
+          <UDN>uuid:4c494e4e-0026-0f22-03eb-0142960000aa</UDN>
+          <serviceList>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
+            <serviceId>urn:upnp-org:serviceId:AVTransport</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000aa/Upnp/upnp.org/AVTransport/1/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000aa/upnp.org-AVTransport-1/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000aa/upnp.org-AVTransport-1/event</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType>
+            <serviceId>urn:upnp-org:serviceId:RenderingControl</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000aa/Upnp/upnp.org/RenderingControl/1/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000aa/upnp.org-RenderingControl-1/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000aa/upnp.org-RenderingControl-1/event</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>
+            <serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000aa/Upnp/upnp.org/ConnectionManager/1/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000aa/upnp.org-ConnectionManager-1/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000aa/upnp.org-ConnectionManager-1/event</eventSubURL>
+          </service>
+          </serviceList>
+          <deviceList>
+        <device>
+          <deviceType>urn:linn-co-uk:device:Source:1</deviceType>
+          <friendlyName>Salon:Klimax DS</friendlyName>
+          <manufacturer>Linn Products Ltd</manufacturer>
+          <modelName>Klimax DS</modelName>
+          <UDN>uuid:4c494e4e-0026-0f22-03eb-0142960000bb</UDN>
+          <serviceList>
+          <service>
+            <serviceType>urn:av-openhome-org:service:Product:2</serviceType>
+            <serviceId>urn:av-openhome-org:serviceId:Product</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000bb/Upnp/av.openhome.org/Product/2/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Product-2/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Product-2/event</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:av-openhome-org:service:Playlist:1</serviceType>
+            <serviceId>urn:av-openhome-org:serviceId:Playlist</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000bb/Upnp/av.openhome.org/Playlist/1/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Playlist-1/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Playlist-1/event</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:av-openhome-org:service:Transport:1</serviceType>
+            <serviceId>urn:av-openhome-org:serviceId:Transport</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000bb/Upnp/av.openhome.org/Transport/1/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Transport-1/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Transport-1/event</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:av-openhome-org:service:Volume:2</serviceType>
+            <serviceId>urn:av-openhome-org:serviceId:Volume</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000bb/Upnp/av.openhome.org/Volume/2/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Volume-2/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Volume-2/event</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:av-openhome-org:service:Info:1</serviceType>
+            <serviceId>urn:av-openhome-org:serviceId:Info</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000bb/Upnp/av.openhome.org/Info/1/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Info-1/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Info-1/event</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:av-openhome-org:service:Time:1</serviceType>
+            <serviceId>urn:av-openhome-org:serviceId:Time</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000bb/Upnp/av.openhome.org/Time/1/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Time-1/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Time-1/event</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:av-openhome-org:service:Radio:1</serviceType>
+            <serviceId>urn:av-openhome-org:serviceId:Radio</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000bb/Upnp/av.openhome.org/Radio/1/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Radio-1/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Radio-1/event</eventSubURL>
+          </service>
+          </serviceList>
+        </device>
+          </deviceList>
+        </device>
+</root>"#;
+
+    /// Racine Linn à services hérités `urn:linn-co-uk:*` (dont un `Product:3`
+    /// homonyme), MediaRenderer ET OpenHome `Source:1` imbriqués côte à côte.
+    const LINN_OHNET_RACINE_CONTENEUR_XML: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <specVersion><major>1</major><minor>0</minor></specVersion>
+        <device>
+          <deviceType>urn:linn-co-uk:device:Ds:1</deviceType>
+          <friendlyName>Salon:Klimax DS</friendlyName>
+          <manufacturer>Linn Products Ltd</manufacturer>
+          <modelName>Klimax DS</modelName>
+          <UDN>uuid:4c494e4e-0026-0f22-03eb-0142960000cc</UDN>
+          <serviceList>
+          <service>
+            <serviceType>urn:linn-co-uk:service:Product:3</serviceType>
+            <serviceId>urn:linn-co-uk:serviceId:Product</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000cc/Upnp/linn.co.uk/Product/3/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000cc/linn.co.uk-Product-3/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000cc/linn.co.uk-Product-3/event</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:linn-co-uk:service:Info:1</serviceType>
+            <serviceId>urn:linn-co-uk:serviceId:Info</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000cc/Upnp/linn.co.uk/Info/1/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000cc/linn.co.uk-Info-1/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000cc/linn.co.uk-Info-1/event</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:linn-co-uk:service:Time:1</serviceType>
+            <serviceId>urn:linn-co-uk:serviceId:Time</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000cc/Upnp/linn.co.uk/Time/1/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000cc/linn.co.uk-Time-1/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000cc/linn.co.uk-Time-1/event</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:linn-co-uk:service:Volkano:1</serviceType>
+            <serviceId>urn:linn-co-uk:serviceId:Volkano</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000cc/Upnp/linn.co.uk/Volkano/1/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000cc/linn.co.uk-Volkano-1/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000cc/linn.co.uk-Volkano-1/event</eventSubURL>
+          </service>
+          </serviceList>
+          <deviceList>
+        <device>
+          <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
+          <friendlyName>Salon:Klimax DS:MediaRenderer</friendlyName>
+          <manufacturer>Linn Products Ltd</manufacturer>
+          <modelName>Klimax DS</modelName>
+          <UDN>uuid:4c494e4e-0026-0f22-03eb-0142960000aa</UDN>
+          <serviceList>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
+            <serviceId>urn:upnp-org:serviceId:AVTransport</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000aa/Upnp/upnp.org/AVTransport/1/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000aa/upnp.org-AVTransport-1/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000aa/upnp.org-AVTransport-1/event</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType>
+            <serviceId>urn:upnp-org:serviceId:RenderingControl</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000aa/Upnp/upnp.org/RenderingControl/1/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000aa/upnp.org-RenderingControl-1/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000aa/upnp.org-RenderingControl-1/event</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>
+            <serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000aa/Upnp/upnp.org/ConnectionManager/1/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000aa/upnp.org-ConnectionManager-1/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000aa/upnp.org-ConnectionManager-1/event</eventSubURL>
+          </service>
+          </serviceList>
+        </device>
+        <device>
+          <deviceType>urn:linn-co-uk:device:Source:1</deviceType>
+          <friendlyName>Salon:Klimax DS</friendlyName>
+          <manufacturer>Linn Products Ltd</manufacturer>
+          <modelName>Klimax DS</modelName>
+          <UDN>uuid:4c494e4e-0026-0f22-03eb-0142960000bb</UDN>
+          <serviceList>
+          <service>
+            <serviceType>urn:av-openhome-org:service:Product:2</serviceType>
+            <serviceId>urn:av-openhome-org:serviceId:Product</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000bb/Upnp/av.openhome.org/Product/2/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Product-2/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Product-2/event</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:av-openhome-org:service:Playlist:1</serviceType>
+            <serviceId>urn:av-openhome-org:serviceId:Playlist</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000bb/Upnp/av.openhome.org/Playlist/1/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Playlist-1/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Playlist-1/event</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:av-openhome-org:service:Transport:1</serviceType>
+            <serviceId>urn:av-openhome-org:serviceId:Transport</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000bb/Upnp/av.openhome.org/Transport/1/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Transport-1/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Transport-1/event</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:av-openhome-org:service:Volume:2</serviceType>
+            <serviceId>urn:av-openhome-org:serviceId:Volume</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000bb/Upnp/av.openhome.org/Volume/2/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Volume-2/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Volume-2/event</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:av-openhome-org:service:Info:1</serviceType>
+            <serviceId>urn:av-openhome-org:serviceId:Info</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000bb/Upnp/av.openhome.org/Info/1/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Info-1/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Info-1/event</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:av-openhome-org:service:Time:1</serviceType>
+            <serviceId>urn:av-openhome-org:serviceId:Time</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000bb/Upnp/av.openhome.org/Time/1/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Time-1/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Time-1/event</eventSubURL>
+          </service>
+          <service>
+            <serviceType>urn:av-openhome-org:service:Radio:1</serviceType>
+            <serviceId>urn:av-openhome-org:serviceId:Radio</serviceId>
+            <SCPDURL>/4c494e4e-0026-0f22-03eb-0142960000bb/Upnp/av.openhome.org/Radio/1/service.xml</SCPDURL>
+            <controlURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Radio-1/control</controlURL>
+            <eventSubURL>/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Radio-1/event</eventSubURL>
+          </service>
+          </serviceList>
+        </device>
+          </deviceList>
+        </device>
+</root>"#;
+
+    fn assert_face_openhome_linn(desc: &DeviceDescription, udn_racine: &str) {
+        assert!(
+            desc.is_openhome(),
+            "#9068 : la face OpenHome imbriquée n'est pas rattachée, le Linn \
+             reste classé DLNA ; services vus : {:?}",
+            desc.services
+                .iter()
+                .map(|s| s.service_type.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            crate::discovery::ssdp::classer_le_descripteur(desc).sortie,
+            Some(crate::discovery::device::OutputType::Openhome),
+            "#9068 : le Linn doit être classé OpenHome, pas DLNA"
+        );
+        // L'identité SSDP reste celle de la racine.
+        assert_eq!(desc.udn, format!("uuid:{udn_racine}"));
+        let urls = desc.service_urls();
+        // Ce sont les URL de l'appareil OpenHome qui servent, pas celles des
+        // services hérités homonymes.
+        assert_eq!(
+            urls.get("product").map(String::as_str),
+            Some("/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Product-2/control")
+        );
+        assert_eq!(
+            urls.get("playlist").map(String::as_str),
+            Some("/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Playlist-1/control")
+        );
+        assert_eq!(
+            urls.get("transport").map(String::as_str),
+            Some("/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Transport-1/control")
+        );
+        assert_eq!(
+            urls.get("info").map(String::as_str),
+            Some("/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Info-1/control")
+        );
+        assert_eq!(
+            desc.event_sub_urls().get("volume").map(String::as_str),
+            Some("/4c494e4e-0026-0f22-03eb-0142960000bb/av.openhome.org-Volume-2/event")
+        );
+        // La face UPnP AV n'est pas perdue : AVTransport et le
+        // ConnectionManager (Sink) restent ceux du MediaRenderer.
+        assert_eq!(
+            urls.get("avtransport").map(String::as_str),
+            Some("/4c494e4e-0026-0f22-03eb-0142960000aa/upnp.org-AVTransport-1/control")
+        );
+        assert_eq!(
+            urls.get("connectionmanager").map(String::as_str),
+            Some("/4c494e4e-0026-0f22-03eb-0142960000aa/upnp.org-ConnectionManager-1/control")
+        );
+    }
+
+    #[test]
+    fn linn_ohnet_racine_renderer_classe_openhome_9068() {
+        let desc = parse_device_description(LINN_OHNET_RACINE_RENDERER_XML).unwrap();
+        assert_face_openhome_linn(&desc, "4c494e4e-0026-0f22-03eb-0142960000aa");
+        assert_eq!(desc.friendly_name, "Salon:Klimax DS:MediaRenderer");
+    }
+
+    #[test]
+    fn linn_ohnet_racine_conteneur_classe_openhome_9068() {
+        let desc = parse_device_description(LINN_OHNET_RACINE_CONTENEUR_XML).unwrap();
+        assert_face_openhome_linn(&desc, "4c494e4e-0026-0f22-03eb-0142960000cc");
+        assert_eq!(desc.friendly_name, "Salon:Klimax DS");
+    }
+
+    /// Composite tiers : MediaRenderer en racine, OpenHome imbriqué PARTIEL
+    /// (`Product` et `Volume` seulement, ni `Playlist` ni `Transport`). Une
+    /// `OpenHomeOutput` n'y lirait rien et n'a pas de repli DLNA : il doit
+    /// rester DLNA.
+    #[test]
+    fn un_openhome_imbrique_partiel_reste_dlna_9068() {
+        let xml = r#"<root xmlns="urn:schemas-upnp-org:device-1-0"><device>
+            <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
+            <friendlyName>Composite</friendlyName>
+            <UDN>uuid:composite</UDN>
+            <serviceList>
+              <service>
+                <serviceType>urn:schemas-upnp-org:service:AVTransport:1</serviceType>
+                <controlURL>/av/control</controlURL>
+              </service>
+            </serviceList>
+            <deviceList><device>
+              <deviceType>urn:av-openhome-org:device:Source:1</deviceType>
+              <UDN>uuid:composite-oh</UDN>
+              <serviceList>
+                <service>
+                  <serviceType>urn:av-openhome-org:service:Product:1</serviceType>
+                  <controlURL>/oh/product</controlURL>
+                </service>
+                <service>
+                  <serviceType>urn:av-openhome-org:service:Volume:1</serviceType>
+                  <controlURL>/oh/volume</controlURL>
+                </service>
+              </serviceList>
+            </device></deviceList>
+        </device></root>"#;
+        let desc = parse_device_description(xml).unwrap();
+        assert_eq!(
+            crate::discovery::ssdp::classer_le_descripteur(&desc).sortie,
+            Some(crate::discovery::device::OutputType::Dlna),
+            "#9068 : un OpenHome imbriqué partiel (ni Playlist ni Transport) ne \
+             doit pas faire basculer le renderer en OpenHome ; services vus : {:?}",
+            desc.services
+                .iter()
+                .map(|s| s.service_type.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// Un pur MediaRenderer, sans appareil OpenHome nulle part, reste DLNA.
+    #[test]
+    fn un_renderer_sans_openhome_reste_dlna_9068() {
+        let desc = parse_device_description(SAMPLE_XML).unwrap();
+        assert_eq!(
+            crate::discovery::ssdp::classer_le_descripteur(&desc).sortie,
+            Some(crate::discovery::device::OutputType::Dlna)
+        );
     }
 
     /// WiiM devices may advertise as PlayGroupManager instead of MediaRenderer,

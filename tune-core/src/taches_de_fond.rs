@@ -236,6 +236,29 @@ impl Etat {
 /// au démarrage, AVANT que les passes ne sortent de leur sieste de 120 s.
 static PAUSES: AtomicU32 = AtomicU32::new(0);
 
+/// #9116 — le masque des pauses tel que la BASE les porte, et le verrou qui
+/// sérialise toutes les écritures de pause ([`ecrire`], [`tout_suspendre`],
+/// [`tout_reprendre`], [`hydrater`]).
+///
+/// Une pause pose son bit dans [`PAUSES`] AVANT de prendre ce verrou (effet
+/// immédiat, même quand l'écriture attend une base engorgée), puis le repose
+/// sous le verrou. Un échec d'écriture rend au miroir le bit de la base — et
+/// non « l'état d'avant l'appel », que deux appels concurrents ne partagent
+/// pas : sans ce verrou, le retour en arrière d'un « tout suspendre » en échec
+/// effaçait le bit qu'un `pause(X)` venait d'écrire en base (base en pause,
+/// mémoire au travail).
+static ECRITES: std::sync::Mutex<u32> = std::sync::Mutex::new(0);
+
+fn ecrites() -> std::sync::MutexGuard<'static, u32> {
+    ECRITES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Rend au miroir, pour les bits de `masque`, l'état que la base porte.
+fn rendre_l_etat_ecrit(ecrites: u32, masque: u32) {
+    PAUSES.fetch_and(!(masque & !ecrites), Ordering::Relaxed);
+    PAUSES.fetch_or(masque & ecrites, Ordering::Relaxed);
+}
+
 /// Cadence à laquelle une passe garée relit le drapeau.
 ///
 /// Deux secondes : assez court pour qu'un clic sur « Reprendre » se voie
@@ -275,13 +298,16 @@ pub fn tout_est_suspendu() -> bool {
 /// où la moitié des pauses seraient levées.
 pub fn hydrater(backend: &Arc<dyn DbBackend>) {
     let reglages = SettingsRepo::with_backend(backend.clone());
+    let mut ecrites = ecrites();
     let mut masque = 0u32;
     for tache in Tache::TOUTES {
         if lire_en_base(&reglages, tache) {
             masque |= tache.bit();
         }
     }
+    *ecrites = masque;
     PAUSES.store(masque, Ordering::Relaxed);
+    drop(ecrites);
     // #5169 — le réglage d'ordre est une décision de l'utilisateur, comme la
     // pause : il survit au redémarrage par le même chemin.
     ordre::hydrater(backend);
@@ -324,33 +350,73 @@ pub fn reprendre(backend: &Arc<dyn DbBackend>, tache: Tache) -> Result<(), Strin
 /// part : un second drapeau se désynchroniserait des six premiers dès qu'on
 /// reprend UNE tâche, et l'écran afficherait « tout suspendu » sur une passe
 /// qui décode.
+///
+/// #9116 (fil 2935) — les NEUF bits du miroir sont posés d'abord, en une
+/// fois : chaque passe s'arrête à sa prochaine frontière et chaque jauge se
+/// fige sans attendre les neuf écritures en base, qui pouvaient patienter
+/// derrière une base engorgée (« suspendre prend déjà au moins 5 minutes »).
+/// Si une écriture échoue, les tâches non écrites reprennent l'état que la
+/// base leur donne ([`ECRITES`]) et l'erreur remonte, comme avant.
 pub fn tout_suspendre(backend: &Arc<dyn DbBackend>) -> Result<(), String> {
+    let tous = Tache::TOUTES.into_iter().fold(0u32, |m, t| m | t.bit());
+    PAUSES.fetch_or(tous, Ordering::Relaxed);
+    let mut ecrites = ecrites();
     for tache in Tache::TOUTES {
-        mettre_en_pause(backend, tache)?;
+        ecrire_sous_verrou(backend, &mut ecrites, tache, true)?;
     }
     Ok(())
 }
 
 /// L'interrupteur général : tout reprendre.
 pub fn tout_reprendre(backend: &Arc<dyn DbBackend>) -> Result<(), String> {
+    let mut ecrites = ecrites();
     for tache in Tache::TOUTES {
-        reprendre(backend, tache)?;
+        ecrire_sous_verrou(backend, &mut ecrites, tache, false)?;
     }
     Ok(())
 }
 
-/// La base D'ABORD, le miroir ensuite.
+/// Une REPRISE : la base d'abord, le miroir ensuite — si l'écriture échoue,
+/// la passe reste garée et l'interface rend l'erreur.
 ///
-/// Cet ordre est le seul sûr : si l'écriture échoue, le miroir n'a pas bougé
-/// et l'interface rendra l'erreur. L'inverse laisserait une pause visible en
-/// mémoire que le redémarrage lèverait sans prévenir.
+/// Une PAUSE (#9116) : le miroir d'abord, pour qu'elle prenne effet tout de
+/// suite, même quand l'écriture attend son tour derrière une base engorgée
+/// (ou derrière une autre écriture de pause, [`ECRITES`]) ; si l'écriture
+/// échoue, le bit reprend l'état que la base porte et l'erreur remonte. Ni
+/// l'un ni l'autre ne laisse donc, l'appel rendu, une pause en mémoire que la
+/// base ne porte pas.
 fn ecrire(backend: &Arc<dyn DbBackend>, tache: Tache, en_pause: bool) -> Result<(), String> {
-    let reglages = SettingsRepo::with_backend(backend.clone());
-    reglages.set(tache.cle_reglage(), if en_pause { "true" } else { "false" })?;
     if en_pause {
         PAUSES.fetch_or(tache.bit(), Ordering::Relaxed);
+    }
+    let mut ecrites = ecrites();
+    ecrire_sous_verrou(backend, &mut ecrites, tache, en_pause)
+}
+
+/// [`ecrire`], le verrou [`ECRITES`] tenu par l'appelant.
+fn ecrire_sous_verrou(
+    backend: &Arc<dyn DbBackend>,
+    ecrites: &mut u32,
+    tache: Tache,
+    en_pause: bool,
+) -> Result<(), String> {
+    let reglages = SettingsRepo::with_backend(backend.clone());
+    if en_pause {
+        // Reposé sous le verrou : un retour en arrière concurrent a pu
+        // l'effacer entre la pose immédiate et ici.
+        PAUSES.fetch_or(tache.bit(), Ordering::Relaxed);
+        if let Err(e) = reglages.set(tache.cle_reglage(), "true") {
+            // Tout bit posé d'avance et pas encore écrit (« tout suspendre »
+            // compris) reprend l'état de la base.
+            let tous = Tache::TOUTES.into_iter().fold(0u32, |m, t| m | t.bit());
+            rendre_l_etat_ecrit(*ecrites, tous);
+            return Err(e);
+        }
+        *ecrites |= tache.bit();
     } else {
+        reglages.set(tache.cle_reglage(), "false")?;
         PAUSES.fetch_and(!tache.bit(), Ordering::Relaxed);
+        *ecrites &= !tache.bit();
     }
     tracing::info!(tache = tache.id(), en_pause, "tache_de_fond_pause_modifiee");
     Ok(())
@@ -401,6 +467,8 @@ pub async fn attendre_son_tour(tache: Tache) {
 /// caisse, et les témoins de `tune-core/tests/` comme ceux de `tune-server`
 /// sont des caisses EXTERNES.
 pub fn oublier_pour_les_essais() {
+    let mut ecrites = ecrites();
+    *ecrites = 0;
     PAUSES.store(0, Ordering::Relaxed);
 }
 

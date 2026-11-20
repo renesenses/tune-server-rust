@@ -55,18 +55,10 @@ fn lire_les_racines(state: &AppState, lang: &str) -> Value {
             // racine de lecteur ou de partage (« D:\ », « \\NAS\ ») produit un
             // séparateur doublé (« D:\\% ») qui ne correspond à rien → 0 piste.
             let pattern = tune_core::db::track_repo::folder_like_pattern(&norm);
-            let ph = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
-                "$1"
-            } else {
-                "?1"
-            };
-            let esc = tune_core::db::track_repo::like_escape_clause();
-            let count: i64 = match state.backend.query_one(
-                &format!("SELECT COUNT(*) FROM tracks WHERE file_path LIKE {ph}{esc}"),
-                &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
-            ) {
-                Ok(Some(cols)) => cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
-                Ok(None) => 0,
+            // #9116 — gardé tant que la bibliothèque n'a pas changé (voir
+            // `compte_de_racine`).
+            let count: i64 = match compte_de_racine(state, &norm) {
+                Ok(n) => n,
                 Err(e) => {
                     warn!(path = %norm_nfc, error = %e, "browse_root_count_failed");
                     0
@@ -129,23 +121,7 @@ fn lire_les_racines(state: &AppState, lang: &str) -> Value {
     if none_populated
         && let Some(base) = tune_core::db::track_repo::derive_common_root(state.backend.as_ref())
     {
-        let pattern = tune_core::db::track_repo::folder_like_pattern(&base);
-        let ph = if state.backend.engine() == tune_core::db::engine::Engine::Postgres {
-            "$1"
-        } else {
-            "?1"
-        };
-        let esc = tune_core::db::track_repo::like_escape_clause();
-        let count: i64 = state
-            .backend
-            .query_one(
-                &format!("SELECT COUNT(*) FROM tracks WHERE file_path LIKE {ph}{esc}"),
-                &[&pattern as &dyn tune_core::db::backend::ToSqlValue],
-            )
-            .ok()
-            .flatten()
-            .and_then(|r| r.first().and_then(|v| v.as_i64()))
-            .unwrap_or(0);
+        let count: i64 = compte_de_racine(state, &base).unwrap_or(0);
         let dup = roots
             .iter()
             .any(|r| r.get("path").and_then(|v| v.as_str()) == Some(base.as_str()));
@@ -165,6 +141,93 @@ fn lire_les_racines(state: &AppState, lang: &str) -> Value {
     }
 
     json!({ "roots": roots })
+}
+
+/// #9116 (fil 2935) — les comptes de la vue Répertoires, gardés en mémoire
+/// tant que la RÉVISION de la bibliothèque n'a pas bougé.
+///
+/// Même avec la plage indexée (#5998), ouvrir la racine d'une bibliothèque de
+/// 544 147 pistes relit tout l'index du chemin pour grouper par sous-dossier,
+/// et chaque retour en arrière le refaisait — derrière les autres lectures qui
+/// attendaient déjà une connexion. La révision
+/// ([`tune_core::db::library_revision`]) change à CHAQUE écriture dans
+/// `tracks` (scan, édition, suppression), quelle que soit la connexion : un
+/// compte gardé sous la révision `r` est exactement celui que la base rendrait
+/// encore. Sans révision lisible (déclencheurs absents), rien n'est gardé :
+/// plus lent, jamais faux.
+///
+/// La révision est lue AVANT le comptage : une écriture validée entre les deux
+/// change la révision suivante, et le compte gardé n'est plus jamais servi.
+struct ComptesParRevision<V> {
+    entrees: std::sync::Mutex<std::collections::HashMap<(i64, i64, String), V>>,
+}
+
+/// Au-delà, la table est vidée : une révision n'a que les dossiers ouverts
+/// depuis la dernière écriture, et un serveur n'a qu'une base.
+const COMPTES_EN_CACHE_MAX: usize = 512;
+
+impl<V: Clone> ComptesParRevision<V> {
+    fn new() -> Self {
+        Self {
+            entrees: std::sync::Mutex::new(std::collections::HashMap::new()),
+        }
+    }
+
+    fn lire_ou_compter(
+        &self,
+        revision: Option<(i64, i64)>,
+        dossier: &str,
+        compter: impl FnOnce() -> Result<V, String>,
+    ) -> Result<V, String> {
+        let Some((instance, rev)) = revision else {
+            return compter();
+        };
+        let clef = (instance, rev, dossier.to_string());
+        if let Ok(entrees) = self.entrees.lock()
+            && let Some(v) = entrees.get(&clef)
+        {
+            return Ok(v.clone());
+        }
+        let v = compter()?;
+        if let Ok(mut entrees) = self.entrees.lock() {
+            // Les révisions passées ne seront plus jamais servies.
+            entrees.retain(|(i, r, _), _| *i != instance || *r == rev);
+            if entrees.len() >= COMPTES_EN_CACHE_MAX {
+                entrees.clear();
+            }
+            entrees.insert(clef, v.clone());
+        }
+        Ok(v)
+    }
+}
+
+static COMPTES_DES_RACINES: std::sync::LazyLock<ComptesParRevision<i64>> =
+    std::sync::LazyLock::new(ComptesParRevision::new);
+static COMPTES_DES_SOUS_DOSSIERS: std::sync::LazyLock<
+    ComptesParRevision<std::sync::Arc<tune_core::db::track_repo::ComptesParSousDossier>>,
+> = std::sync::LazyLock::new(ComptesParRevision::new);
+
+/// Le nombre de pistes sous une racine
+/// ([`tune_core::db::track_repo::compter_pistes_sous_dossier`] : index couvrant
+/// sur SQLite, plage indexée sur PostgreSQL), gardé par révision.
+fn compte_de_racine(state: &AppState, racine: &str) -> Result<i64, String> {
+    let revision = tune_core::db::library_revision::lire(state.backend.as_ref());
+    COMPTES_DES_RACINES.lire_ou_compter(revision, racine, || {
+        tune_core::db::track_repo::compter_pistes_sous_dossier(state.backend.as_ref(), racine)
+    })
+}
+
+/// Les comptes des sous-dossiers d'un dossier (#3857, #5998), gardés par
+/// révision.
+fn comptes_des_sous_dossiers(
+    state: &AppState,
+    dossier: &str,
+) -> Result<std::sync::Arc<tune_core::db::track_repo::ComptesParSousDossier>, String> {
+    let revision = tune_core::db::library_revision::lire(state.backend.as_ref());
+    COMPTES_DES_SOUS_DOSSIERS.lire_ou_compter(revision, dossier, || {
+        tune_core::db::track_repo::compter_pistes_par_sous_dossier(state.backend.as_ref(), dossier)
+            .map(std::sync::Arc::new)
+    })
 }
 
 /// Résout le chemin demandé en tenant compte de la forme de normalisation
@@ -350,14 +413,11 @@ fn lire_le_repertoire(state: &AppState, lang: &str, q: BrowseQuery) -> Result<Va
             // L'echec est journalise UNE fois et rend une table vide : chaque
             // sous-dossier retombe alors a 0, soit exactement ce que la boucle
             // faisait de son cote sur `browse_dir_count_failed`.
-            let comptes = match tune_core::db::track_repo::compter_pistes_par_sous_dossier(
-                state.backend.as_ref(),
-                &normalized_query,
-            ) {
+            let comptes = match comptes_des_sous_dossiers(state, &normalized_query) {
                 Ok(c) => c,
                 Err(e) => {
                     warn!(path = %normalized_query, error = %e, "browse_dir_count_failed");
-                    tune_core::db::track_repo::ComptesParSousDossier::default()
+                    std::sync::Arc::new(tune_core::db::track_repo::ComptesParSousDossier::default())
                 }
             };
             for entry in entries.flatten() {
@@ -945,5 +1005,122 @@ mod garde_de_remontee_tests {
             .unwrap()
             .into_owned();
         assert!(lire(&b, &decode).is_err(), "{decode}");
+    }
+}
+
+/// #9116 (fil 2935) — les comptes de la vue Répertoires : une seule lecture par révision,
+/// gardés par révision, et jamais périmés après une écriture.
+#[cfg(test)]
+mod comptes_9116_tests {
+    use super::{BrowseQuery, ComptesParRevision, lire_le_repertoire, lire_les_racines};
+    use crate::state::AppState;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn un_compte_est_garde_tant_que_la_revision_ne_bouge_pas() {
+        let cache: ComptesParRevision<i64> = ComptesParRevision::new();
+        let appels = AtomicUsize::new(0);
+        let compter = || {
+            appels.fetch_add(1, Ordering::SeqCst);
+            Ok(7)
+        };
+        assert_eq!(cache.lire_ou_compter(Some((1, 10)), "/m", compter), Ok(7));
+        assert_eq!(cache.lire_ou_compter(Some((1, 10)), "/m", compter), Ok(7));
+        assert_eq!(
+            appels.load(Ordering::SeqCst),
+            1,
+            "même révision : aucun recomptage"
+        );
+        assert_eq!(cache.lire_ou_compter(Some((1, 11)), "/m", compter), Ok(7));
+        assert_eq!(
+            appels.load(Ordering::SeqCst),
+            2,
+            "révision nouvelle : recompté"
+        );
+        assert_eq!(cache.lire_ou_compter(Some((1, 11)), "/n", compter), Ok(7));
+        assert_eq!(appels.load(Ordering::SeqCst), 3, "autre dossier : compté");
+        assert_eq!(cache.lire_ou_compter(None, "/m", compter), Ok(7));
+        assert_eq!(cache.lire_ou_compter(None, "/m", compter), Ok(7));
+        assert_eq!(
+            appels.load(Ordering::SeqCst),
+            5,
+            "sans révision : rien n'est gardé"
+        );
+        // Une erreur n'est pas gardée.
+        let echec = cache.lire_ou_compter(Some((1, 12)), "/e", || Err("panne".to_string()));
+        assert!(echec.is_err());
+        assert_eq!(cache.lire_ou_compter(Some((1, 12)), "/e", compter), Ok(7));
+        assert_eq!(appels.load(Ordering::SeqCst), 6);
+    }
+
+    fn poser(state: &AppState, chemin: &std::path::Path) {
+        let chemin = chemin.to_str().unwrap().to_string();
+        state
+            .backend
+            .execute(
+                "INSERT INTO tracks (title, file_path, format, source) VALUES ('t', ?, 'flac', 'local')",
+                &[&chemin as &dyn tune_core::db::backend::ToSqlValue],
+            )
+            .unwrap();
+    }
+
+    fn compte_racine(state: &AppState) -> i64 {
+        lire_les_racines(state, "fr")["roots"][0]["track_count"]
+            .as_i64()
+            .unwrap()
+    }
+
+    fn compte_jazz(state: &AppState, racine: &std::path::Path) -> i64 {
+        let v = lire_le_repertoire(
+            state,
+            "fr",
+            BrowseQuery {
+                path: racine.to_str().unwrap().to_string(),
+            },
+        )
+        .ok()
+        .unwrap();
+        v["directories"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["name"] == "Jazz")
+            .and_then(|d| d["track_count"].as_i64())
+            .unwrap()
+    }
+
+    #[test]
+    fn une_piste_ajoutee_se_voit_aussitot_dans_les_comptes() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let dossier = tempfile::tempdir().unwrap();
+        let racine = dossier.path().join("musique");
+        std::fs::create_dir_all(racine.join("Jazz")).unwrap();
+        let base = dossier.path().join("tune.db");
+        let state = rt.block_on(async {
+            AppState::new(base.to_str().unwrap(), 0, Default::default()).unwrap()
+        });
+        tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+            .set(
+                "music_dirs",
+                &serde_json::to_string(&[racine.to_str().unwrap()]).unwrap(),
+            )
+            .unwrap();
+        assert!(
+            tune_core::db::library_revision::lire(state.backend.as_ref()).is_some(),
+            "la révision doit exister, sans quoi ce témoin ne garde rien"
+        );
+        poser(&state, &racine.join("Jazz").join("01.flac"));
+        assert_eq!(compte_racine(&state), 1);
+        assert_eq!(compte_jazz(&state, &racine), 1);
+        // Relu sans écriture : le même chiffre (servi par le cache).
+        assert_eq!(compte_racine(&state), 1);
+        assert_eq!(compte_jazz(&state, &racine), 1);
+        // Une écriture change la révision : rien de périmé n'est servi.
+        poser(&state, &racine.join("Jazz").join("02.flac"));
+        assert_eq!(compte_racine(&state), 2);
+        assert_eq!(compte_jazz(&state, &racine), 2);
     }
 }

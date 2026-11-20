@@ -168,6 +168,9 @@ async fn microphones(State(etat): State<EtatRoutes>) -> Response {
                 json!({
                     "nom": e.nom,
                     "id": e.id,
+                    // #9070 — le type d'accès ALSA (`hw`, `plughw`,
+                    // `dsnoop`…) à côté du nom ; `null` hors ALSA.
+                    "acces": tune_entree_audio::peripheriques::acces_alsa(&e.id),
                     "canaux": e.canaux,
                     "frequence_courante": e.frequence_courante,
                     "frequences": e.frequences,

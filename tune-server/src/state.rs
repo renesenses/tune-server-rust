@@ -126,6 +126,14 @@ pub struct AppState {
     pub api_analytics: Arc<tune_core::api_analytics::ApiAnalytics>,
     pub poller_metrics: tune_core::poller::PollerMetricsMap,
     pub update_phase: Arc<std::sync::Mutex<Option<String>>>,
+    /// Code à usage unique qui autorise l'activation de l'authentification
+    /// depuis un autre appareil (`POST /auth/activation`) ; affiché dans le
+    /// journal du serveur seulement.
+    pub code_activation_auth: Arc<std::sync::Mutex<crate::auth::EtatCodeActivation>>,
+    /// Incrémenté à l'activation de l'authentification : chaque WebSocket
+    /// ouverte s'y abonne et se ferme (le client se reconnecte avec une
+    /// session).
+    pub fermeture_websockets: Arc<tokio::sync::watch::Sender<u64>>,
     /// La raison de la dernière mise à jour qui n'a rien installé (#7600),
     /// rendue par `GET /system/update/status`.
     pub update_issue: Arc<crate::routes::system::suivi_de_mise_a_jour_7600::Issue>,
@@ -142,6 +150,11 @@ pub struct AppState {
     /// [`crate::routes::zones::relais_de_groupe_6155::DeplacementsDeGroupe`]).
     pub deplacements_de_groupe:
         Arc<crate::routes::zones::relais_de_groupe_6155::DeplacementsDeGroupe>,
+    /// #9089 — les gestes relayés à chaque suiveuse d'un groupe, numérotés :
+    /// une attente dépassée ne fait rien, et deux gestes d'une même suiveuse
+    /// ne tournent jamais à la fois (voir
+    /// [`crate::routes::zones::relais_de_groupe_6155::GestesDeSuiveuses`]).
+    pub gestes_de_suiveuses: Arc<crate::routes::zones::relais_de_groupe_6155::GestesDeSuiveuses>,
     /// mDNS scanner handle, populated by
     /// [`crate::discovery_setup::spawn_mdns_handler`] once discovery starts. Kept
     /// here (not just as a local `_mdns_handle`) so routes can list the peer Tune
@@ -752,12 +765,15 @@ impl AppState {
             api_analytics: Arc::new(tune_core::api_analytics::ApiAnalytics::default()),
             poller_metrics: Arc::new(Mutex::new(std::collections::HashMap::new())),
             update_phase: Arc::new(std::sync::Mutex::new(None)),
+            code_activation_auth: Arc::new(std::sync::Mutex::new(Default::default())),
+            fermeture_websockets: Arc::new(tokio::sync::watch::channel(0).0),
             update_issue: Arc::new(std::sync::Mutex::new(None)),
             rooms: Arc::new(Mutex::new(tune_core::collaborative::RoomManager::new())),
             upnp_index_lock: Arc::new(Mutex::new(())),
             media_servers: Arc::new(Mutex::new(HashMap::new())),
             derniers_seeks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             deplacements_de_groupe: Arc::default(),
+            gestes_de_suiveuses: Arc::default(),
             mdns_scanner: Arc::new(std::sync::Mutex::new(None)),
             active_audio_backend: Arc::new(std::sync::RwLock::new(None)),
             annuaire_radios: Arc::new(std::sync::RwLock::new(Vec::new())),
@@ -808,6 +824,82 @@ impl AppState {
             return Vec::new();
         };
         tune_core::discovery::sendspin::decrire(&scanner.devices().await)
+    }
+
+    /// #9140 — retient, pour le nettoyage de ce qui sort, les noms des
+    /// appareils et serveurs multimédia découverts, des zones (masquées
+    /// comprises), des profils et le nom annoncé de ce serveur : ils partent
+    /// sous un jeton stable (`[appareil 3]`, `[zone 2]`, `[profil 1]`). La
+    /// découverte retient déjà chaque appareil à son arrivée (un appareil
+    /// perdu depuis reste couvert) ; chaque porte de sortie appelle ceci juste
+    /// avant de nettoyer. Un nom qui n'est que le matériel (« Marantz
+    /// NR1711 ») ne compte pas : c'est du diagnostic.
+    pub async fn retenir_noms_d_appareils(&self) {
+        use tune_core::confidentialite::{Sorte, materiel, retenir_nom_d_appareil};
+        let mut appareils = self.scanner.devices().await;
+        let mdns = { self.mdns_scanner.lock().ok().and_then(|g| g.clone()) };
+        if let Some(mdns) = mdns {
+            appareils.extend(mdns.devices().await);
+        }
+        // Le balayage ET le registre que le rapport lit (`media_servers`) :
+        // un serveur ajouté à la main ou retiré du balayage y reste.
+        let mut serveurs = self.scanner.media_servers().await;
+        serveurs.extend(self.media_servers.lock().await.values().cloned());
+        let materiels: Vec<String> = appareils
+            .iter()
+            .map(|d| materiel(d.manufacturer.as_deref(), d.model.as_deref()))
+            .chain(
+                serveurs
+                    .iter()
+                    .map(|m| materiel(Some(&m.manufacturer), Some(&m.model))),
+            )
+            .filter(|m| !m.is_empty())
+            .collect();
+        for d in &appareils {
+            let propre = [materiel(d.manufacturer.as_deref(), d.model.as_deref())];
+            retenir_nom_d_appareil(Sorte::Appareil, &d.name, &propre);
+        }
+        for m in &serveurs {
+            let propre = [materiel(Some(&m.manufacturer), Some(&m.model))];
+            retenir_nom_d_appareil(Sorte::Appareil, &m.name, &propre);
+        }
+        retenir_nom_d_appareil(
+            Sorte::Appareil,
+            &crate::discovery_setup::nom_annonce_du_serveur(self),
+            &[],
+        );
+        let zones = tune_core::db::zone_repo::ZoneRepo::with_backend(self.backend.clone());
+        // Une zone locale porte le nom de son périphérique audio (« Topping
+        // D90SE », « Scarlett 2i2 USB ») : c'est du matériel, comparé à la
+        // partie `local:<nom>` de son identifiant de sortie.
+        let noms_de_zones = zones
+            .list()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|z| (z.name, z.output_device_id.unwrap_or_default()))
+            .chain(
+                zones
+                    .zones_masquees()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|z| (z.name, z.device_id)),
+            );
+        for (nom, sortie) in noms_de_zones {
+            let mut comparer = materiels.clone();
+            if let Some(peripherique) = sortie.strip_prefix("local:") {
+                comparer.push(peripherique.to_string());
+            }
+            retenir_nom_d_appareil(Sorte::Zone, &nom, &comparer);
+        }
+        for p in tune_core::db::profile_repo::ProfileRepo::with_backend(self.backend.clone())
+            .list()
+            .unwrap_or_default()
+        {
+            retenir_nom_d_appareil(Sorte::Profil, &p.name, &[]);
+            if let Some(affiche) = p.display_name.as_deref() {
+                retenir_nom_d_appareil(Sorte::Profil, affiche, &[]);
+            }
+        }
     }
 
     pub async fn discovered_tune_peers(&self) -> Vec<serde_json::Value> {

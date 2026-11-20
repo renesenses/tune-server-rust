@@ -39,7 +39,7 @@ use tune_calibration::level::{LevelDecision, LevelPolicy, ProbeResult, peak_dbfs
 use tune_calibration::mic_cal::MicCalibration;
 use tune_calibration::{MeasurementSpec, analyse_capture};
 use tune_entree_audio::peripheriques::Peripheriques;
-use tune_entree_audio::tampon::CaptureVersTampon;
+use tune_entree_audio::tampon::{CaptureVersTampon, DELAI_PREMIERE_TRAME};
 
 use crate::fournisseur::FournisseurBalayage;
 use crate::generateur::{Consigne, Deroule, Emission, Plan, Voies};
@@ -55,6 +55,49 @@ pub const FREQUENCE_MESURE: u32 = 48_000;
 /// (2 311 s à 250 Hz chez Xavier Joly, 11/11). Entre ce seuil et 40 dB,
 /// la mesure passe avec un avertissement, comme avant.
 pub const RSB_MIN_DB: f64 = 20.0;
+
+/// #9066 — avance permise du générateur sur l'écoute (s). Elle s'ajoute au
+/// retard que la fenêtre captée doit absorber (2 s au plus avant la queue de
+/// la réponse) ; elle doit seulement couvrir les à-coups de la capture et de
+/// la pompe, pas le chemin de lecture, qui se remplit au rythme de l'écoute.
+pub const AVANCE_SUR_L_ECOUTE_S: f64 = 0.3;
+
+/// #9066 — un micro dont le compteur de trames ne bouge plus depuis ce délai
+/// est tenu pour figé (USB décroché, veille) : la mesure s'arrête tout de
+/// suite en le disant, au lieu d'attendre `delai_capture`.
+///
+/// Distinct de [`DELAI_PREMIERE_TRAME`] (#9070, 4 s) : celui-là attend la
+/// PREMIÈRE trame après l'ouverture, avant toute salve, avec de la marge pour
+/// une machine lente ; celui-ci juge un micro qui a déjà capté et se tait EN
+/// COURS de mesure, pendant que la zone joue au volume de mesure — d'où un
+/// délai plus court.
+pub const MICRO_FIGE: Duration = Duration::from_secs(2);
+
+/// #9066 — le code stable de [`Avancement::code`] pour un micro figé : le web
+/// le traduit (web#3219), comme `micro_muet` (#9070).
+pub const CODE_MICRO_FIGE: &str = "micro_fige";
+
+/// #9066 — la sortie de ce type pousse le son par le réseau (ou par un
+/// lecteur distant) : sa latence propre — tampon du renderer, 2 s fixes
+/// d'AirPlay — s'ajoute à celle de Tune, et la fenêtre d'écoute ne la voit
+/// pas. Seule la sortie locale de la machine (ALSA, WASAPI, ASIO, Core
+/// Audio) est sûre. `None` : type inconnu (essais), traité comme local.
+pub fn sortie_a_latence_propre(output_type: Option<&str>) -> bool {
+    !matches!(output_type, None | Some("local") | Some("mock"))
+}
+
+/// #9066 — le refus d'une mesure sur une sortie à latence propre dit
+/// pourquoi elle ne peut pas aboutir, au lieu du seul motif technique.
+pub fn motif_sur_sortie(motif: String, output_type: Option<&str>) -> String {
+    match output_type {
+        Some(t) if sortie_a_latence_propre(Some(t)) => format!(
+            "{motif}. La zone mesurée sort en « {t} » : cette sortie ajoute sa propre latence \
+             (tampon de l'appareil, plusieurs secondes parfois), que la mesure ne peut pas caler. \
+             Mesurez sur une zone en sortie locale de la machine (carte son, DAC en USB)"
+        ),
+        _ => motif,
+    }
+}
 
 /// #8491 — ce qu'une mesure doit avoir pour donner un résultat, ou le refus
 /// motivé. `retard_max_ms` : au-delà, la réponse impulsionnelle (1,5 s après
@@ -226,9 +269,19 @@ pub struct Avancement {
     /// Trames jouées sur la longueur maximale promise : la barre de l'écran.
     pub progression: f64,
     pub avertissements: Vec<String>,
+    /// #9070 — le code stable d'une erreur que l'écran traduit
+    /// (`micro_muet`) ; absent sinon.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<&'static str>,
+    /// #9070 — l'identifiant exact du micro ouvert (`alsa:hw:CARD=…`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peripherique: Option<String>,
 }
 
 struct Interne {
+    /// #9070 — voir [`Avancement::code`] et [`Avancement::peripherique`].
+    code: Option<&'static str>,
+    peripherique: Option<String>,
     etat: Etat,
     salves: Vec<Salve>,
     avertissements: Vec<String>,
@@ -286,6 +339,8 @@ impl Mesure {
             depuis_s: self.debut.elapsed().as_secs_f64(),
             progression: (self.deroule.trames_rendues() as f64 / max).min(1.0),
             avertissements: i.avertissements.clone(),
+            code: i.code,
+            peripherique: i.peripherique.clone(),
         }
     }
 
@@ -308,6 +363,9 @@ pub struct Controleur {
     /// Vitesse du temps dans les essais : les attentes de capture sont en
     /// trames, pas en secondes ; ce délai borne seulement l'attente.
     pub delai_capture: Duration,
+    /// #9070 — attente maximale de la première trame du micro, avant que la
+    /// zone ne joue quoi que ce soit.
+    pub delai_premiere_trame: Duration,
     /// Les simulations de pièce sans micro (C5), gardées en mémoire.
     pub simulations: crate::modes::Magasin,
     /// Les sessions à plusieurs positions (C4), gardées en mémoire.
@@ -330,6 +388,7 @@ impl Controleur {
             compteur: AtomicU64::new(0),
             delai_ouverture: Duration::from_secs(20),
             delai_capture: Duration::from_secs(60),
+            delai_premiere_trame: DELAI_PREMIERE_TRAME,
             simulations: Default::default(),
             sessions: Default::default(),
         })
@@ -464,6 +523,8 @@ impl Controleur {
             deroule: deroule.clone(),
             debut: Instant::now(),
             interne: Mutex::new(Interne {
+                code: None,
+                peripherique: None,
                 etat: Etat::Preparation,
                 salves: Vec::new(),
                 avertissements: Vec::new(),
@@ -484,6 +545,13 @@ impl Controleur {
         if traitements.pure {
             mesure.avertir("mode PURE actif : le volume forcé peut être refusé par le verrou PURE");
         }
+        if let Some(t) = self.hote.type_de_sortie(demande.zone_id)
+            && sortie_a_latence_propre(Some(&t))
+        {
+            mesure.avertir(format!(
+                "zone en sortie « {t} » : sa latence propre peut empêcher la mesure ; une sortie locale est sûre"
+            ));
+        }
         self.verrou().insert(id.clone(), mesure.clone());
         let moi = self.clone();
         std::thread::Builder::new()
@@ -501,9 +569,20 @@ impl Controleur {
         self.fournisseur.desarmer(&mesure.id);
         match sortie {
             Ok(()) => mesure.poser(Etat::Terminee),
-            Err(Sortie::Refus(motif)) => mesure.poser(Etat::Refusee { motif }),
+            Err(Sortie::Refus(motif)) => {
+                let sortie = self.hote.type_de_sortie(mesure.demande.zone_id);
+                mesure.poser(Etat::Refusee {
+                    motif: motif_sur_sortie(motif, sortie.as_deref()),
+                })
+            }
             Err(Sortie::Annulee) => mesure.poser(Etat::Annulee),
             Err(Sortie::Erreur(message)) => mesure.poser(Etat::Erreur { message }),
+            Err(Sortie::ErreurDeFlux(message)) => {
+                let sortie = self.hote.type_de_sortie(mesure.demande.zone_id);
+                mesure.poser(Etat::Erreur {
+                    message: motif_sur_sortie(message, sortie.as_deref()),
+                })
+            }
         }
     }
 
@@ -520,6 +599,15 @@ impl Controleur {
         let duree_max_s = deroule.plan.duree_max_ms() as f64 / 1000.0 + 30.0;
         let capture = CaptureVersTampon::demarrer(&self.peripheriques, &d.entree, duree_max_s)
             .map_err(Sortie::Erreur)?;
+        mesure.verrou().peripherique = Some(capture.peripherique().to_string());
+        // #9070 (fil 2770) — un micro ouvert qui ne remet aucune trame échoue
+        // ici, en quatre secondes et en nommant le PCM, avant toute salve : il
+        // attendait une minute pour finir en « 0 trames sur 216000 ».
+        if let Err(sans) = capture.attendre_la_premiere_trame(self.delai_premiere_trame) {
+            capture.arreter();
+            mesure.verrou().code = sans.code();
+            return Err(Sortie::Erreur(sans.to_string()));
+        }
         let zone = ZoneTenue::prendre(
             self.hote.clone(),
             d.zone_id,
@@ -554,6 +642,16 @@ impl Controleur {
         let tampon = capture.tampon().clone();
         let voie = d.voie_micro;
 
+        // #9066 — le flux suit l'écoute : le balayage part au plus
+        // `AVANCE_SUR_L_ECOUTE_S` avant que le micro ne capte, et non après
+        // tout le silence que le chemin de lecture aurait pu tirer d'avance.
+        {
+            let t = tampon.clone();
+            deroule.cadencer_sur_l_ecoute(
+                Arc::new(move || t.trames()),
+                (AVANCE_SUR_L_ECOUTE_S * FREQUENCE_MESURE as f64) as u64,
+            );
+        }
         self.fournisseur.armer(&mesure.id, deroule.clone());
         zone.jouer(ElementBalayage {
             mesure_id: mesure.id.clone(),
@@ -591,9 +689,9 @@ impl Controleur {
             deroule.consigner(Consigne::Salve {
                 niveau_dbfs: niveau,
             });
-            let em = self.attendre_emission(&deroule, emissions)?;
+            let em = self.attendre_emission(mesure, &tampon, &deroule, emissions)?;
             emissions += 1;
-            let capte = self.capter_segment(&tampon, voie, depart, &em)?;
+            let capte = self.capter_segment(mesure, &tampon, voie, depart, &em)?;
             let crete = peak_dbfs(&capte);
             // Déconvolution de la salve : le RSB sur la RI, comme pour la
             // mesure finale.
@@ -643,8 +741,8 @@ impl Controleur {
         deroule.consigner(Consigne::Balayage {
             niveau_dbfs: niveau_retenu,
         });
-        let em = self.attendre_emission(&deroule, emissions)?;
-        let capte = self.capter_segment(&tampon, voie, depart, &em)?;
+        let em = self.attendre_emission(mesure, &tampon, &deroule, emissions)?;
+        let capte = self.capter_segment(mesure, &tampon, voie, depart, &em)?;
         deroule.consigner(Consigne::Fin);
         if deroule.annulee() {
             return Err(Sortie::Annulee);
@@ -708,40 +806,86 @@ impl Controleur {
         Ok(())
     }
 
-    fn attendre_emission(&self, deroule: &Arc<Deroule>, n: usize) -> Result<Emission, Sortie> {
-        deroule
-            .attendre_emission(n, self.delai_capture)
-            .ok_or_else(|| {
-                if deroule.annulee() {
-                    Sortie::Annulee
-                } else {
-                    Sortie::Erreur(
-                        "le balayage n'est pas parti : la zone a cessé de tirer le flux".into(),
-                    )
-                }
-            })
+    /// #9066 — par tranches : un micro figé empêche aussi le segment de
+    /// partir (le générateur, cadencé sur l'écoute, ne rend que du silence
+    /// sans prendre la consigne) ; il est dit en [`MICRO_FIGE`], pas au bout
+    /// de `delai_capture`.
+    fn attendre_emission(
+        &self,
+        mesure: &Mesure,
+        tampon: &Arc<tune_entree_audio::tampon::Tampon>,
+        deroule: &Arc<Deroule>,
+        n: usize,
+    ) -> Result<Emission, Sortie> {
+        let echeance = Instant::now() + self.delai_capture;
+        let mut vu = tampon.trames();
+        let mut vu_a = Instant::now();
+        loop {
+            if let Some(em) = deroule.attendre_emission(n, Duration::from_millis(200)) {
+                return Ok(em);
+            }
+            if deroule.annulee() {
+                return Err(Sortie::Annulee);
+            }
+            if deroule.fini() || Instant::now() >= echeance {
+                return Err(Sortie::ErreurDeFlux(
+                    "le balayage n'est pas parti : la zone a cessé de tirer le flux".into(),
+                ));
+            }
+            if micro_fige(tampon.trames(), &mut vu, &mut vu_a) {
+                return Err(self.erreur_micro_fige(mesure));
+            }
+        }
+    }
+
+    /// #9066 — l'erreur « micro figé », qui nomme le micro, avec son code
+    /// stable et le périphérique ouvert (#9070 : `Avancement::code` et
+    /// `peripherique`). Le périphérique exact est posé à l'ouverture de la
+    /// capture ; l'entrée demandée ne sert que s'il manque.
+    fn erreur_micro_fige(&self, mesure: &Mesure) -> Sortie {
+        let entree = mesure.demande.entree.as_str();
+        {
+            let mut i = mesure.verrou();
+            i.code = Some(CODE_MICRO_FIGE);
+            i.peripherique.get_or_insert_with(|| entree.to_string());
+        }
+        Sortie::Erreur(format!(
+            "le micro « {entree} » ne capte plus (débranché ou en veille ?) : \
+             aucune trame depuis {} s, mesure arrêtée",
+            MICRO_FIGE.as_secs()
+        ))
     }
 
     /// Les échantillons captés depuis `depart` couvrant le segment `em`
     /// (sa longueur + la garde), une fois qu'ils sont là.
+    ///
+    /// #9066 — un micro figé (compteur immobile depuis [`MICRO_FIGE`])
+    /// arrête la mesure tout de suite, en nommant le micro.
     fn capter_segment(
         &self,
+        mesure: &Mesure,
         tampon: &Arc<tune_entree_audio::tampon::Tampon>,
         voie: usize,
         depart: u64,
         em: &Emission,
     ) -> Result<Vec<f64>, Sortie> {
+        let entree = mesure.demande.entree.as_str();
         let garde = (self.garde_trames() as f64).max(0.0) as u64;
         let besoin = depart + em.trames + garde;
         // Attente par tranches, pour voir passer une annulation.
         let echeance = Instant::now() + self.delai_capture;
+        let mut vu = tampon.trames();
+        let mut vu_a = Instant::now();
         loop {
             match tampon.attendre_trames(besoin, Duration::from_millis(200)) {
                 Ok(Some(_)) => break,
+                Ok(None) if micro_fige(tampon.trames(), &mut vu, &mut vu_a) => {
+                    return Err(self.erreur_micro_fige(mesure));
+                }
                 Ok(None) if Instant::now() < echeance => {}
                 Ok(None) => {
-                    return Err(Sortie::Erreur(format!(
-                        "capture trop lente : {} trames sur {besoin} attendues",
+                    return Err(Sortie::ErreurDeFlux(format!(
+                        "capture trop lente sur « {entree} » : {} trames sur {besoin} attendues",
                         tampon.trames()
                     )));
                 }
@@ -762,12 +906,26 @@ impl Controleur {
     }
 }
 
+/// #9066 — le compteur de trames du micro est-il immobile depuis
+/// [`MICRO_FIGE`] ? `vu`/`vu_a` : la dernière valeur vue et quand elle a bougé.
+fn micro_fige(trames: u64, vu: &mut u64, vu_a: &mut Instant) -> bool {
+    if trames != *vu {
+        *vu = trames;
+        *vu_a = Instant::now();
+        return false;
+    }
+    vu_a.elapsed() >= MICRO_FIGE
+}
+
 /// Les sorties d'un déroulé.
 #[derive(Debug)]
 enum Sortie {
     Refus(String),
     Annulee,
     Erreur(String),
+    /// #9066 — une erreur où le flux n'est pas arrivé à temps à l'écoute :
+    /// sur une sortie réseau, elle dit pourquoi (voir [`motif_sur_sortie`]).
+    ErreurDeFlux(String),
 }
 
 /// La zone pendant la mesure : volume forcé, puis rendu — quoi qu'il arrive.
@@ -856,6 +1014,28 @@ mod tests {
         // bruit entre 20 et 40 dB (avertissement seulement).
         assert!(ri_exploitable(25.0, 1948.0, 2000.0).is_ok());
         assert!(ri_exploitable(72.0, 12.0, 2000.0).is_ok());
+    }
+
+    /// #9066 — seules les sorties locales sont sûres ; ailleurs, le refus
+    /// dit pourquoi.
+    #[test]
+    fn une_sortie_reseau_explique_le_refus_9066() {
+        assert!(!sortie_a_latence_propre(None));
+        assert!(!sortie_a_latence_propre(Some("local")));
+        for t in [
+            "dlna",
+            "airplay",
+            "airplay2",
+            "chromecast",
+            "oaat",
+            "browser",
+        ] {
+            assert!(sortie_a_latence_propre(Some(t)), "{t}");
+        }
+        let m = motif_sur_sortie("rapport crête/bruit de 3 dB".into(), Some("dlna"));
+        assert!(m.starts_with("rapport crête/bruit de 3 dB"), "{m}");
+        assert!(m.contains("« dlna »") && m.contains("sortie locale"), "{m}");
+        assert_eq!(motif_sur_sortie("x".into(), Some("local")), "x");
     }
 
     #[test]

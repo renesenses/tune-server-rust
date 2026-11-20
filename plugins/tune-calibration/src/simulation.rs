@@ -11,13 +11,20 @@
 //!   gain du micro, bruit de fond) et pousse du PCM 24 bits dans l'anneau,
 //!   exactement comme le rappel cpal.
 //!
+//! * [`CheminDeLecture`] (#9066) remplace, si on le demande, la pompe
+//!   directe par le chemin d'une vraie zone locale : la VRAIE pompe de
+//!   l'orchestrateur (`tune_core::source_pcm::pomper`), un canal borné de la
+//!   profondeur de la session (`create_session(…, 256)`), puis l'anneau de
+//!   la sortie locale (2 s). C'est l'avance que ce chemin permet au
+//!   générateur qui faisait sortir le balayage après la fin de l'écoute.
+//!
 //! Le temps est celui de la capture : une mesure de 15 s d'audio se déroule
 //! en moins d'une seconde à `vitesse = 25`, sans rien changer au code mesuré,
 //! qui attend des TRAMES, pas des secondes.
 
 use std::collections::VecDeque;
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -110,7 +117,15 @@ impl PieceEnDirect {
 /// Ce que la zone a joué et que le micro n'a pas encore capté.
 pub struct Boucle {
     joue: Mutex<VecDeque<f64>>,
+    /// Trames jouées que la boucle tient au plus avant le micro : le tampon
+    /// de la sortie.
+    capacite: usize,
+    /// #9066 — micro figé (USB décroché, veille) : la capture ne pousse plus
+    /// rien, sans erreur.
+    pub fige: AtomicBool,
     piece: Mutex<PieceEnDirect>,
+    /// QA 18/11 — les pompes de la zone en cours (voir [`Boucle::capter_bloc`]).
+    pompes: AtomicUsize,
     /// Vitesse du temps simulé (1 = temps réel).
     pub vitesse: f64,
 }
@@ -121,9 +136,18 @@ const FILE_MAX: usize = 2_400;
 
 impl Boucle {
     pub fn new(piece: PieceEnDirect, vitesse: f64) -> Arc<Self> {
+        Self::avec_tampon(piece, vitesse, FILE_MAX)
+    }
+
+    /// #9066 — une boucle dont le tampon de sortie tient `capacite` trames
+    /// (l'anneau de 2 s d'une sortie locale : `2 * fs`).
+    pub fn avec_tampon(piece: PieceEnDirect, vitesse: f64, capacite: usize) -> Arc<Self> {
         Arc::new(Self {
             joue: Mutex::new(VecDeque::new()),
+            capacite: capacite.max(1),
+            fige: AtomicBool::new(false),
             piece: Mutex::new(piece),
+            pompes: AtomicUsize::new(0),
             vitesse,
         })
     }
@@ -134,7 +158,7 @@ impl Boucle {
         while !reste.is_empty() {
             {
                 let mut j = self.joue.lock().unwrap();
-                let place = FILE_MAX.saturating_sub(j.len());
+                let place = self.capacite.saturating_sub(j.len());
                 let n = place.min(reste.len());
                 j.extend(reste[..n].iter().copied());
                 reste = &reste[n..];
@@ -153,13 +177,46 @@ impl Boucle {
     }
 
     /// `n` échantillons captés : ce qui a été joué, ou du silence, à travers
-    /// la pièce.
-    fn capter(&self, n: usize) -> Vec<f64> {
+    /// la pièce — ou `None` tant qu'une zone JOUE et n'a pas encore déposé
+    /// `n` échantillons.
+    ///
+    /// QA 18/11 (test instable `une_piece_simulee_est_mesuree_de_bout_en_bout`,
+    /// « retard 92 ms » en CI le 16/11) : le temps simulé est celui du micro,
+    /// mais la pompe de la zone tourne en temps RÉEL. Une pompe retardée par
+    /// l'ordonnanceur laissait la boucle vide ; le micro captait alors du
+    /// silence et le temps simulé avançait sans signal — 10 ms de retard réel
+    /// coûtaient 80 ms simulées à la vitesse 8, ajoutées au retard mesuré.
+    /// Une vraie sortie ne « saute » pas d'échantillons : tant qu'une zone
+    /// joue, le micro attend ses échantillons au lieu d'inventer du silence.
+    /// La latence vue par la mesure ne dépend plus que de [`FILE_MAX`].
+    fn capter_bloc(&self, n: usize) -> Option<Vec<f64>> {
         let mut j = self.joue.lock().unwrap();
+        if j.len() < n && self.pompes.load(Ordering::SeqCst) > 0 {
+            return None;
+        }
         let mut p = self.piece.lock().unwrap();
-        (0..n)
-            .map(|_| p.traverser(j.pop_front().unwrap_or(0.0)))
-            .collect()
+        Some(
+            (0..n)
+                .map(|_| p.traverser(j.pop_front().unwrap_or(0.0)))
+                .collect(),
+        )
+    }
+}
+
+/// Une pompe de zone comptée dans [`Boucle::pompes`] tant qu'elle vit (fin
+/// du flux, arrêt ou panique : le compte redescend toujours).
+struct PompeEnCours(Arc<Boucle>);
+
+impl PompeEnCours {
+    fn compter(boucle: Arc<Boucle>) -> Self {
+        boucle.pompes.fetch_add(1, Ordering::SeqCst);
+        Self(boucle)
+    }
+}
+
+impl Drop for PompeEnCours {
+    fn drop(&mut self) {
+        self.0.pompes.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -225,7 +282,16 @@ impl Peripheriques for MicroSimule {
             let par_bloc = (fs / 100) as usize; // 10 ms
             let pause = Duration::from_secs_f64(0.010 / boucle.vitesse);
             while v.load(Ordering::SeqCst) {
-                let captes = boucle.capter(par_bloc);
+                if boucle.fige.load(Ordering::SeqCst) {
+                    std::thread::sleep(pause);
+                    continue;
+                }
+                let Some(captes) = boucle.capter_bloc(par_bloc) else {
+                    // La zone joue mais n'a pas encore rempli le bloc : le
+                    // temps simulé n'avance pas (voir `capter_bloc`).
+                    std::thread::sleep(Duration::from_micros(50));
+                    continue;
+                };
                 let mut o = Vec::with_capacity(par_bloc * 6);
                 let mut crete = 0.0f32;
                 for x in &captes {
@@ -249,6 +315,7 @@ impl Peripheriques for MicroSimule {
             }
         });
         Ok(CaptureDemarree {
+            id: format!("simule:{nom}"),
             nom,
             format: f,
             arret: Box::new(ArretSimule(vivant)),
@@ -257,6 +324,15 @@ impl Peripheriques for MicroSimule {
 
     fn frequence_courante(&self, _: &str) -> Option<u32> {
         Some(self.frequence)
+    }
+}
+
+/// La voie gauche d'une trame PCM de la zone.
+fn voie_gauche(t: &[u8], bits: u16) -> f64 {
+    if bits == 16 {
+        i16::from_le_bytes([t[0], t[1]]) as f64 / 32_768.0
+    } else {
+        (i32::from_le_bytes([0, t[0], t[1], t[2]]) >> 8) as f64 / 8_388_608.0
     }
 }
 
@@ -275,8 +351,26 @@ pub struct Journal {
     pub profils: Vec<tune_core::room_correction::RoomProfile>,
 }
 
+/// #9066 — le chemin de lecture d'une zone locale, entre le générateur et
+/// le tampon de sortie (la [`Boucle`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheminDeLecture {
+    /// Profondeur du canal de la session, en tronçons remis par la pompe.
+    pub troncons: usize,
+}
+
+impl CheminDeLecture {
+    /// Le canal d'une session de source PCM finie
+    /// (`resolve_source_pcm` : `create_session(info, false, 256)`).
+    pub fn session_de_source_pcm() -> Self {
+        Self { troncons: 256 }
+    }
+}
+
 pub struct HoteSimule {
     pub fournisseur: Arc<FournisseurBalayage>,
+    /// #9066 — `None` : la pompe dépose directement dans la boucle.
+    pub chemin: Option<CheminDeLecture>,
     pub boucle: Arc<Boucle>,
     /// Le volume que la base « connaît » ; `None` : zone inconnue.
     pub volume: Mutex<Option<f64>>,
@@ -306,6 +400,26 @@ impl HoteSimule {
             boucle,
             volume: Mutex::new(volume),
             traitements,
+            chemin: None,
+            journal: Mutex::new(Journal::default()),
+            pompe_vivante: Arc::new(AtomicBool::new(false)),
+        })
+    }
+
+    /// #9066 — une zone dont le flux passe par la vraie pompe et un canal de
+    /// session avant le tampon de sortie.
+    pub fn avec_chemin(
+        fournisseur: Arc<FournisseurBalayage>,
+        boucle: Arc<Boucle>,
+        volume: Option<f64>,
+        chemin: CheminDeLecture,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            fournisseur,
+            boucle,
+            volume: Mutex::new(volume),
+            traitements: TraitementsDeZone::default(),
+            chemin: Some(chemin),
             journal: Mutex::new(Journal::default()),
             pompe_vivante: Arc::new(AtomicBool::new(false)),
         })
@@ -345,7 +459,42 @@ impl HoteZone for HoteSimule {
         let vivant = self.pompe_vivante.clone();
         vivant.store(true, Ordering::SeqCst);
         let boucle = self.boucle.clone();
+        // Compté AVANT le départ du fil : le micro attend la zone dès qu'elle
+        // est censée jouer, même si le fil n'est pas encore ordonnancé.
+        let pompe = PompeEnCours::compter(boucle.clone());
+        if let Some(chemin) = self.chemin {
+            // La vraie pompe, dans un canal borné comme celui de la session ;
+            // la « sortie » le vide dans son tampon au rythme du micro.
+            let (tx, rx) = std::sync::mpsc::sync_channel::<Vec<u8>>(chemin.troncons);
+            let octets = flux.octets;
+            let v = vivant.clone();
+            std::thread::spawn(move || {
+                tune_core::source_pcm::pomper(&mut *lecteur, octets, |t| {
+                    tx.send(t).is_ok() && v.load(Ordering::SeqCst)
+                })
+            });
+            std::thread::spawn(move || {
+                // C'est la « sortie » qui dépose : elle tient la pompe comptée.
+                let _pompe = pompe;
+                let mut reste: Vec<u8> = Vec::new();
+                while let Ok(t) = rx.recv() {
+                    if !vivant.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    reste.extend_from_slice(&t);
+                    let entieres = reste.len() / par_trame * par_trame;
+                    let echantillons: Vec<f64> = reste[..entieres]
+                        .chunks_exact(par_trame)
+                        .map(|t| voie_gauche(t, bits))
+                        .collect();
+                    reste.drain(..entieres);
+                    boucle.deposer(&echantillons, &vivant);
+                }
+            });
+            return Ok(());
+        }
         std::thread::spawn(move || {
+            let _pompe = pompe;
             let mut buf = vec![0u8; par_trame * 480];
             let mut echantillons = Vec::with_capacity(480);
             while vivant.load(Ordering::SeqCst) {
@@ -355,13 +504,7 @@ impl HoteZone for HoteSimule {
                 };
                 echantillons.clear();
                 for t in buf[..n].chunks_exact(par_trame) {
-                    // Voie gauche de la zone.
-                    let v = if bits == 16 {
-                        i16::from_le_bytes([t[0], t[1]]) as f64 / 32_768.0
-                    } else {
-                        (i32::from_le_bytes([0, t[0], t[1], t[2]]) >> 8) as f64 / 8_388_608.0
-                    };
-                    echantillons.push(v);
+                    echantillons.push(voie_gauche(t, bits));
                 }
                 boucle.deposer(&echantillons, &vivant);
             }
