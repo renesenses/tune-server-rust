@@ -64,6 +64,8 @@ pub fn plist_macos() -> String {
 		<string>--args</string>
 		<string>{ARG_SESSION}</string>
 	</array>
+	<key>AssociatedBundleIdentifiers</key>
+	<string>{ID_PAQUET_MACOS}</string>
 	<key>RunAtLoad</key>
 	<true/>
 </dict>
@@ -198,6 +200,10 @@ mod tests {
         let args = "<string>/usr/bin/open</string>\n\t\t<string>-g</string>\n\t\t<string>-b</string>\n\t\t<string>fr.mozaiklabs.tune-widget</string>\n\t\t<string>--args</string>\n\t\t<string>--session</string>";
         assert!(p.contains(args), "{p}");
         assert!(p.contains("<key>RunAtLoad</key>\n\t<true/>"));
+        // Réglages Système › Ouverture range l'agent sous « Tune Client ».
+        assert!(p.contains(
+            "<key>AssociatedBundleIdentifiers</key>\n\t<string>fr.mozaiklabs.tune-widget</string>"
+        ));
         // Pas de KeepAlive : quitter Tune Client doit le laisser quitté.
         assert!(!p.contains("KeepAlive"));
     }

@@ -668,17 +668,23 @@ async fn instantane_serveur(app: &tauri::AppHandle) -> etat_serveur::Instantane 
         Ok(_) => Etat::EnMarche { version: None },
         Err(_) => Etat::Arrete,
     };
-    let processus_local = local
-        && serveur_local::PRIS_EN_CHARGE
-        && matches!(etat, Etat::EnMarche { .. })
-        && tokio::task::spawn_blocking(etat_serveur::processus_serveur_present)
-            .await
-            .unwrap_or(false);
+    // Le serveur Tune de cet utilisateur qui ÉCOUTE sur le port de l'adresse
+    // (jamais un tunnel `ssh -L`, voir `etat_serveur::pid_a_arreter`).
+    let pid_local =
+        if local && serveur_local::PRIS_EN_CHARGE && matches!(etat, Etat::EnMarche { .. }) {
+            let s = serveur.clone();
+            tokio::task::spawn_blocking(move || etat_serveur::pid_du_serveur(&s))
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
     etat_serveur::Instantane {
         serveur,
         local,
         etat,
-        processus_local,
+        pid_local,
     }
 }
 
@@ -704,6 +710,11 @@ async fn rafraichir_menu_serveur(app: &tauri::AppHandle) {
         return;
     }
     let i = instantane_serveur(app).await;
+    // Une action a pu commencer pendant la photographie : son texte
+    // (« Arrêt du serveur… ») ne doit pas être écrasé par un état périmé.
+    if menu.occupe.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     let (texte, actif) = etat_serveur::libelle_action(etat_serveur::action_proposee(
         &i,
         serveur_local::PRIS_EN_CHARGE,
@@ -724,14 +735,18 @@ async fn surveiller_serveur(app: tauri::AppHandle) {
 async fn arreter_serveur_local(app: &tauri::AppHandle) -> Result<String, String> {
     // Revérifié ici, quel que soit l'état affiché : jamais un serveur distant.
     let i = instantane_serveur(app).await;
-    if etat_serveur::action_proposee(&i, serveur_local::PRIS_EN_CHARGE)
-        != etat_serveur::Action::Arreter
-    {
-        return Err(format!(
-            "rien à arrêter ici ({})",
-            etat_serveur::libelle_etat(&i)
-        ));
-    }
+    let pid = match (
+        etat_serveur::action_proposee(&i, serveur_local::PRIS_EN_CHARGE),
+        i.pid_local,
+    ) {
+        (etat_serveur::Action::Arreter, Some(pid)) => pid,
+        _ => {
+            return Err(format!(
+                "rien à arrêter ici ({})",
+                etat_serveur::libelle_etat(&i)
+            ))
+        }
+    };
     let http = app.state::<AppState>().http.clone();
     let route = format!(
         "{}{}",
@@ -748,8 +763,9 @@ async fn arreter_serveur_local(app: &tauri::AppHandle) -> Result<String, String>
     let fait = match etat_serveur::apres_route(statut) {
         etat_serveur::ApresRoute::Accepte => "arrêté par POST /system/stop".to_string(),
         etat_serveur::ApresRoute::ParLeProcessus => {
-            tracing::info!(?statut, "arret_serveur_route_refusee_repli_processus");
-            tokio::task::spawn_blocking(etat_serveur::arreter_par_le_processus)
+            tracing::info!(?statut, pid, "arret_serveur_route_refusee_repli_processus");
+            let serveur = i.serveur.clone();
+            tokio::task::spawn_blocking(move || etat_serveur::arreter_le_pid(&serveur, pid))
                 .await
                 .unwrap_or_else(|e| Err(format!("tâche interrompue : {e}")))?
         }
@@ -1730,13 +1746,18 @@ fn main() {
                 app,
                 &[
                     &etat_serveur_item,
-                    &action_serveur,
                     &tauri::menu::PredefinedMenuItem::separator(app)?,
                     &open_web,
                     &open_mini,
                     &choisir,
                 ],
             )?;
+            // Démarrer / Arrêter : seulement là où Tune Client sait le faire
+            // (Windows, macOS). Sous Linux, le serveur est un service système :
+            // l'entrée n'apparaît pas, la ligne d'état reste.
+            if serveur_local::PRIS_EN_CHARGE {
+                menu.insert(&action_serveur, 1)?;
+            }
             app.manage(MenuServeur {
                 etat: etat_serveur_item,
                 action: action_serveur,
