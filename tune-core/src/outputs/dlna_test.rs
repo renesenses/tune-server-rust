@@ -23,6 +23,10 @@ mod tests {
         /// renderer à 1 Hz pendant toute la lecture (#2263) : ce compteur est
         /// là pour prouver que `get_status` n'en émet plus AUCUNE.
         get_mute_count: Arc<AtomicU32>,
+        /// #8685 — `GetMute` répond sans `CurrentMute` : la sourdine n'est
+        /// pas lisible, `set_mute` garde le comportement d'avant
+        /// (l'acquittement fait foi).
+        get_mute_illisible: Arc<AtomicBool>,
         transport_state: Arc<Mutex<String>>,
         last_seek_target: Arc<Mutex<String>>,
         /// Simule Platinum/1.0.5.13 : tout SetAVTransportURI/SetNext dont le
@@ -121,6 +125,7 @@ mod tests {
                 set_next_count: Arc::new(AtomicU32::new(0)),
                 volume_count: Arc::new(AtomicU32::new(0)),
                 get_mute_count: Arc::new(AtomicU32::new(0)),
+                get_mute_illisible: Arc::new(AtomicBool::new(false)),
                 transport_state: Arc::new(Mutex::new("STOPPED".into())),
                 last_seek_target: Arc::new(Mutex::new(String::new())),
                 set_uri_max_corps: Arc::new(Mutex::new(None)),
@@ -509,6 +514,9 @@ mod tests {
             // de #2263 le verraient.
             "GetMute" => {
                 state.get_mute_count.fetch_add(1, Ordering::Relaxed);
+                if state.get_mute_illisible.load(Ordering::Relaxed) {
+                    return soap_ok("GetMute", "").into_response();
+                }
                 soap_ok("GetMute", "<CurrentMute>1</CurrentMute>").into_response()
             }
             _ => soap_ok(&action, "").into_response(),
@@ -1431,26 +1439,55 @@ mod tests {
     }
 
     /// La suppression du `GetMute` ne casse pas la fonction : l'état coupé
-    /// reste celui que Tune a posé par `set_mute`, sans un seul aller-retour
-    /// de lecture.
+    /// reste celui que Tune a posé par `set_mute`, et `get_status` ne fait
+    /// aucun aller-retour de lecture.
+    ///
+    /// #8685 — `set_mute` relit la sourdine (`GetMute`) autour de son ordre ;
+    /// ce renderer-ci ne sait pas la rendre lisible, et l'acquittement fait
+    /// foi comme avant. Seul `get_status` doit rester sans `GetMute`.
     #[tokio::test]
     async fn dlna_set_mute_reste_visible_dans_le_statut() {
         let state = MockState::default();
+        state.get_mute_illisible.store(true, Ordering::Relaxed);
         let (base, handle) = start_mock(state.clone()).await;
         let output = make_dlna(&base);
+        let lectures = || state.get_mute_count.load(Ordering::Relaxed);
 
+        let avant = lectures();
         assert!(!output.get_status().await.unwrap().muted);
+        assert_eq!(lectures(), avant, "get_status a émis un GetMute");
 
         output.set_mute(true).await.unwrap();
+        let avant = lectures();
         assert!(
             output.get_status().await.unwrap().muted,
             "l'état coupé posé par Tune n'est plus rapporté"
         );
+        assert_eq!(lectures(), avant, "get_status a émis un GetMute");
 
         output.set_mute(false).await.unwrap();
+        let avant = lectures();
         assert!(!output.get_status().await.unwrap().muted);
+        assert_eq!(lectures(), avant, "get_status a émis un GetMute");
+        handle.abort();
+    }
 
-        assert_eq!(state.get_mute_count.load(Ordering::Relaxed), 0);
+    /// #8685 — un renderer qui rend « coupé » à `GetMute` après une levée
+    /// acquittée n'est pas annoncé « son rendu » : la levée échoue, et le
+    /// statut reste coupé, comme l'appareil.
+    #[tokio::test]
+    async fn dlna_une_levee_que_l_appareil_dement_echoue_8685() {
+        let state = MockState::default();
+        let (base, handle) = start_mock(state.clone()).await;
+        let output = make_dlna(&base);
+
+        output.set_mute(true).await.unwrap();
+        assert!(output.get_status().await.unwrap().muted);
+        assert!(
+            output.set_mute(false).await.is_err(),
+            "l'appareil se dit encore coupé : la levée doit échouer"
+        );
+        assert!(output.get_status().await.unwrap().muted);
         handle.abort();
     }
 

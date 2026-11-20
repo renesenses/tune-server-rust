@@ -1252,6 +1252,10 @@ mod gapless_stage_expiry_tests;
 #[cfg(test)]
 mod radio_metadata_deviceless_tests;
 
+/// #8487 — les titres diffusés notés sous leur station, de bout en bout.
+#[cfg(test)]
+mod titres_diffuses_8487_tests;
+
 /// AutoPlay : suivre la source de ce qu'on ecoute (#1553).
 ///
 /// Sandro, 0.9.70 : en ecoute Qobuz, l'autoplay enchainait des titres LOCAUX,
@@ -1260,7 +1264,7 @@ mod radio_metadata_deviceless_tests;
 /// bibliotheque garnie.
 #[cfg(test)]
 mod autoplay_source_tests;
-// Fil 2694 — la radio de fin de file activée par défaut, ses gardes, sa marque.
+// Fil 2694 — la radio de fin de file (défaut coupé depuis #8974), ses gardes, sa marque.
 #[cfg(test)]
 mod radio_fin_de_file_2694_tests;
 

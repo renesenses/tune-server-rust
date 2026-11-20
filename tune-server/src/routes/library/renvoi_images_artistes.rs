@@ -29,6 +29,7 @@ fn version() -> &'static str {
 }
 
 /// Au démarrage : la passe, une seule fois, si elle n'est pas faite.
+#[cfg_attr(feature = "sans-enrichissement", allow(dead_code))]
 pub(crate) fn armer(state: &AppState) {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     if renvoi::deja_fait(&settings) {

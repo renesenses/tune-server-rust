@@ -28,7 +28,7 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::source_pcm::{FluxPcm, FormatPcm, FournisseurPcm, QualiteRecue};
 use crate::streaming::registry::ServiceRegistry;
-use crate::streaming::spotify::SpotifyService;
+use crate::streaming::spotify::{MOTIF_JETON_REFUSE, SpotifyService, est_un_refus_de_jeton};
 use crate::streaming::spotify_connect::{
     OCTETS_PAR_SECONDE, OCTETS_PAR_TRAME, SpotifyConnectManager,
 };
@@ -210,6 +210,74 @@ impl PiloteDuRegistre {
             .get(SOURCE)
             .ok_or_else(|| "service Spotify absent".to_string())
     }
+
+    /// #8154 — un `401` en pleine lecture : renouveler le jeton UNE fois.
+    /// `Ok` seulement si un nouveau jeton est là ; sinon le message d'action
+    /// (« reconnecter Spotify »), le motif du renouvellement au journal.
+    async fn renouveler_le_jeton(&self) -> Result<(), String> {
+        let svc = self.service().await?;
+        let mut svc = svc.write().await;
+        match svc.refresh_if_needed().await {
+            Ok(true) if !svc.session_expired() => {
+                tracing::info!("spotify_lecture_jeton_renouvele");
+                Ok(())
+            }
+            Ok(renouvele) => {
+                tracing::warn!(renouvele, "spotify_lecture_jeton_non_renouvelable");
+                Err(MOTIF_JETON_REFUSE.into())
+            }
+            Err(e) => {
+                tracing::warn!(erreur = %e, "spotify_lecture_renouvellement_echoue");
+                Err(MOTIF_JETON_REFUSE.into())
+            }
+        }
+    }
+
+    async fn duree_ms_une_fois(&self, piste: &str) -> Result<u64, String> {
+        let svc = self.service().await?;
+        let svc = svc.read().await;
+        let titre = svc.get_track(piste).await.map_err(|e| e.to_string())?;
+        Ok(titre.duration_ms)
+    }
+
+    async fn lancer_une_fois(
+        &self,
+        appareil: &str,
+        piste: &str,
+        position_ms: u64,
+    ) -> Result<(), String> {
+        let svc = self.service().await?;
+        let svc = svc.read().await;
+        let spotify = svc
+            .as_any()
+            .downcast_ref::<SpotifyService>()
+            .ok_or("service Spotify inattendu")?;
+        spotify
+            .lancer_sur_l_appareil(appareil, piste, position_ms)
+            .await
+    }
+}
+
+/// #8154 (fil 2288) — un appel de lecture refusé pour jeton (`401`) : le
+/// jeton est renouvelé une fois, l'appel refait une fois, sans boucle. Encore
+/// refusé : le message d'action, jamais le « token expired » brut.
+macro_rules! avec_un_renouvellement {
+    ($pilote:expr, $appel:expr) => {{
+        match $appel.await {
+            Err(e) if est_un_refus_de_jeton(&e) => {
+                tracing::warn!(erreur = %e, "spotify_lecture_jeton_refuse_nouvel_essai");
+                $pilote.renouveler_le_jeton().await?;
+                match $appel.await {
+                    Err(e) if est_un_refus_de_jeton(&e) => {
+                        tracing::warn!(erreur = %e, "spotify_lecture_jeton_refuse_apres_renouvellement");
+                        Err(MOTIF_JETON_REFUSE.to_string())
+                    }
+                    autre => autre,
+                }
+            }
+            autre => autre,
+        }
+    }};
 }
 
 #[async_trait]
@@ -229,22 +297,11 @@ impl PiloteSpotify for PiloteDuRegistre {
     }
 
     async fn duree_ms(&self, piste: &str) -> Result<u64, String> {
-        let svc = self.service().await?;
-        let svc = svc.read().await;
-        let titre = svc.get_track(piste).await.map_err(|e| e.to_string())?;
-        Ok(titre.duration_ms)
+        avec_un_renouvellement!(self, self.duree_ms_une_fois(piste))
     }
 
     async fn lancer(&self, appareil: &str, piste: &str, position_ms: u64) -> Result<(), String> {
-        let svc = self.service().await?;
-        let svc = svc.read().await;
-        let spotify = svc
-            .as_any()
-            .downcast_ref::<SpotifyService>()
-            .ok_or("service Spotify inattendu")?;
-        spotify
-            .lancer_sur_l_appareil(appareil, piste, position_ms)
-            .await
+        avec_un_renouvellement!(self, self.lancer_une_fois(appareil, piste, position_ms))
     }
 
     async fn mettre_en_pause(&self, appareil: &str) -> Result<(), String> {
@@ -1567,3 +1624,7 @@ exit 1
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "spotify_jeton_expire_8154_tests.rs"]
+mod jeton_expire_8154_tests;

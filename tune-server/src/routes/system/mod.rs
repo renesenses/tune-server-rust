@@ -9,6 +9,7 @@ mod backup;
 // #8189 — `GET /system/capabilities`.
 pub(crate) mod capacites;
 // Réglages ▸ Clés d'API (#4805, lot 1 MetaRust).
+pub(crate) mod avancement_suspendu_9116;
 pub(crate) mod cles_api;
 pub(crate) mod comptages_8805;
 mod config;
@@ -24,6 +25,8 @@ mod deplacer_racine;
 #[cfg(test)]
 mod diagnostic_sans_ecrivain_tests;
 pub(crate) mod diagnostics;
+#[path = "executables_livres_8944.rs"]
+pub(crate) mod executables_livres;
 pub(crate) mod sauvegarde_cloud;
 // `pub(crate)` depuis #2507 : `enrich::QuotaDuJour` est la lecture unique du
 // compteur journalier, et les essais de `routes/library/artwork.rs` la lisent
@@ -63,6 +66,7 @@ mod replaygain;
 // expressément.
 /// Réglage « Balises du classique » (#8325, ESL63P).
 mod balises_classique;
+// #9158 (Rob) — balises personnelles des fichiers → tags Tune.
 /// « Ce qui tourne » : passes de fond, cession à la lecture, avancement,
 /// garde thermique (#4681).
 pub(crate) mod ce_qui_tourne;
@@ -72,6 +76,7 @@ pub(crate) mod suivi_de_mise_a_jour_7600;
 /// Pause et reprise des traitements de fond (#4574) — voir le module.
 pub(crate) mod taches_de_fond;
 mod tags;
+mod tags_perso;
 pub(crate) mod update;
 mod youtube;
 
@@ -133,6 +138,20 @@ pub fn router() -> Router<AppState> {
         .route(
             "/settings/classical-tags",
             get(balises_classique::get_classical_tags).put(balises_classique::set_classical_tags),
+        )
+        // #9158 (Rob) — les balises personnelles des fichiers deviennent des
+        // tags Tune : correspondances, aperçu des clés, passe « Appliquer ».
+        .route(
+            "/settings/personal-tags",
+            get(tags_perso::get_personal_tags).put(tags_perso::set_personal_tags),
+        )
+        .route(
+            "/settings/personal-tags/keys",
+            get(tags_perso::personal_tag_keys),
+        )
+        .route(
+            "/settings/personal-tags/apply",
+            get(tags_perso::get_apply_status).post(tags_perso::apply_personal_tags),
         )
         // #8213 — arrêt programmé de la lecture à heure fixe.
         .route(
@@ -569,6 +588,30 @@ pub(crate) fn version_de_schema(state: &AppState) -> Option<i32> {
     }
 }
 
+/// #8747 — la date de création de la base : celle de la première migration
+/// appliquée (`_migrations.applied_at` sur SQLite, `schema_version.applied_at`
+/// sur PostgreSQL). `None` quand elle n'a pas pu être lue.
+///
+/// Une base neuve applique toutes ses migrations au premier démarrage : la
+/// plus ancienne date est donc celle de la création. Après une mise à jour qui
+/// a recréé le conteneur sans volume, elle tombe APRÈS l'installation, et le
+/// rapport de bogue le montre sans rien demander au testeur.
+pub(crate) fn date_de_creation_de_la_base(state: &AppState) -> Option<String> {
+    let sql = match state.backend.engine() {
+        tune_core::db::engine::Engine::Sqlite => "SELECT MIN(applied_at) FROM _migrations",
+        tune_core::db::engine::Engine::Postgres => {
+            "SELECT MIN(applied_at)::text FROM schema_version"
+        }
+    };
+    state
+        .backend
+        .query_one(sql, &[])
+        .ok()
+        .flatten()
+        .and_then(|ligne| ligne.first().and_then(|v| v.as_string()))
+        .filter(|d| !d.trim().is_empty())
+}
+
 /// La version de schéma que le binaire SAIT appliquer, pour le moteur actif.
 ///
 /// Pendant du dessus, et même règle : `None` plutôt qu'un chiffre emprunté à
@@ -604,4 +647,28 @@ pub(crate) fn get_music_dirs_list(
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_default()
+}
+
+/// #8747 — la date de création de la base se lit sur une base réelle.
+#[cfg(test)]
+mod tests_date_de_creation_8747 {
+    #[test]
+    fn une_base_neuve_porte_sa_date_de_creation() {
+        let dossier = tune_core::test_scratch::scratch_dir("tune_8747_creation");
+        let db = dossier.join("tune.db");
+        let config = crate::config::TuneConfig {
+            db_path: db.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let etat = crate::state::AppState::new(db.to_str().unwrap(), 0, config).unwrap();
+        let date = super::date_de_creation_de_la_base(&etat).expect("date lisible");
+        // Format ISO de `_migrations.applied_at` : 2026-11-16T21:04:05Z.
+        assert!(date.len() >= 19 && date.as_bytes()[4] == b'-', "{date}");
+
+        // Contre-épreuve : sans aucune ligne de migration, rien n'est inventé.
+        etat.backend
+            .execute("DELETE FROM _migrations", &[])
+            .unwrap();
+        assert_eq!(super::date_de_creation_de_la_base(&etat), None);
+    }
 }

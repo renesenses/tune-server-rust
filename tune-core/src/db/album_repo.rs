@@ -1342,6 +1342,21 @@ impl AlbumRepo {
             cible,
             doublon,
         )?;
+        // #9158 — les marques d'origine « scan » (`item_tags_scan`) suivent
+        // leur pose, AVANT `item_tags` : une marque du doublon dont la cible
+        // porte déjà le tag (à la main ou du scan) est oubliée — la pose de la
+        // cible garde son origine, un tag manuel ne devient pas « du scan » ;
+        // les autres passent à la cible avec leur pose.
+        marqueurs += self.rendre_manuelles_les_poses_manuelles_du_doublon(cible, doublon)?;
+        marqueurs += self.oublier_les_marques_du_scan_deja_portees(cible, doublon)?;
+        marqueurs += self.repointer_a_cle_unique(
+            "item_tags_scan",
+            "item_id",
+            "tag_id",
+            album,
+            cible,
+            doublon,
+        )?;
         marqueurs +=
             self.repointer_a_cle_unique("item_tags", "item_id", "tag_id", album, cible, doublon)?;
         marqueurs += self.repointer(
@@ -1459,6 +1474,52 @@ impl AlbumRepo {
     /// ligne du doublon dont la cible possède déjà l'équivalent est retirée
     /// d'abord — la cible garde la sienne — puis le reste est repointé.
     /// Portable : `UPDATE OR IGNORE` n'existe pas sous PostgreSQL.
+    /// #9158 — un tag que le doublon porte À LA MAIN (pose sans marque) et
+    /// que la cible tient du scan : la fusion garde la volonté manuelle, la
+    /// marque de la cible est effacée (le scan ne le retirera plus).
+    fn rendre_manuelles_les_poses_manuelles_du_doublon(
+        &self,
+        cible: i64,
+        doublon: i64,
+    ) -> Result<usize, TuneError> {
+        let sql = format!(
+            "DELETE FROM item_tags_scan WHERE item_type = 'album' AND item_id = {} \
+             AND tag_id IN (SELECT it.tag_id FROM item_tags it \
+               WHERE it.item_type = 'album' AND it.item_id = {} \
+               AND NOT EXISTS (SELECT 1 FROM item_tags_scan s WHERE s.tag_id = it.tag_id \
+                 AND s.item_type = 'album' AND s.item_id = it.item_id))",
+            self.marque(1),
+            self.marque(2)
+        );
+        let params: [&dyn ToSqlValue; 2] = [&cible, &doublon];
+        match self.db.execute(&sql, &params) {
+            Ok(n) => Ok(n),
+            Err(e) if table_absente(&e) => Ok(0),
+            Err(e) => Err(TuneError::from(e)),
+        }
+    }
+
+    /// #9158 — voir l'appel dans la fusion : les marques « scan » du doublon
+    /// pour un tag que la cible porte déjà.
+    fn oublier_les_marques_du_scan_deja_portees(
+        &self,
+        cible: i64,
+        doublon: i64,
+    ) -> Result<usize, TuneError> {
+        let sql = format!(
+            "DELETE FROM item_tags_scan WHERE item_type = 'album' AND item_id = {} \
+             AND tag_id IN (SELECT tag_id FROM item_tags WHERE item_type = 'album' AND item_id = {})",
+            self.marque(1),
+            self.marque(2)
+        );
+        let params: [&dyn ToSqlValue; 2] = [&doublon, &cible];
+        match self.db.execute(&sql, &params) {
+            Ok(n) => Ok(n),
+            Err(e) if table_absente(&e) => Ok(0),
+            Err(e) => Err(TuneError::from(e)),
+        }
+    }
+
     fn repointer_a_cle_unique(
         &self,
         table: &str,

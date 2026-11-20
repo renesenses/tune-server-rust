@@ -1,0 +1,50 @@
+{
+  "data": [
+    {
+      "id": 1120,
+      "name": "Jean-Jacques Goldman",
+      "link": "https://www.deezer.com/artist/1120",
+      "picture": "https://api.deezer.com/artist/1120/image",
+      "picture_small": "https://cdn-images.dzcdn.net/images/artist/b0203e76d3416e351fee48ce463f13f2/56x56-000000-80-0-0.jpg",
+      "picture_medium": "https://cdn-images.dzcdn.net/images/artist/b0203e76d3416e351fee48ce463f13f2/250x250-000000-80-0-0.jpg",
+      "picture_big": "https://cdn-images.dzcdn.net/images/artist/b0203e76d3416e351fee48ce463f13f2/500x500-000000-80-0-0.jpg",
+      "picture_xl": "https://cdn-images.dzcdn.net/images/artist/b0203e76d3416e351fee48ce463f13f2/1000x1000-000000-80-0-0.jpg",
+      "nb_album": 34,
+      "nb_fan": 1887158,
+      "radio": true,
+      "tracklist": "https://api.deezer.com/artist/1120/top?limit=50",
+      "type": "artist"
+    },
+    {
+      "id": 412286182,
+      "name": "Jean-Jacques Goldman",
+      "link": "https://www.deezer.com/artist/412286182",
+      "picture": "https://api.deezer.com/artist/412286182/image",
+      "picture_small": "https://cdn-images.dzcdn.net/images/artist//56x56-000000-80-0-0.jpg",
+      "picture_medium": "https://cdn-images.dzcdn.net/images/artist//250x250-000000-80-0-0.jpg",
+      "picture_big": "https://cdn-images.dzcdn.net/images/artist//500x500-000000-80-0-0.jpg",
+      "picture_xl": "https://cdn-images.dzcdn.net/images/artist//1000x1000-000000-80-0-0.jpg",
+      "nb_album": 0,
+      "nb_fan": 0,
+      "radio": true,
+      "tracklist": "https://api.deezer.com/artist/412286182/top?limit=50",
+      "type": "artist"
+    },
+    {
+      "id": 418508862,
+      "name": "Celine Dion en duo feat. Jean-Jacques Goldman",
+      "link": "https://www.deezer.com/artist/418508862",
+      "picture": "https://api.deezer.com/artist/418508862/image",
+      "picture_small": "https://cdn-images.dzcdn.net/images/artist//56x56-000000-80-0-0.jpg",
+      "picture_medium": "https://cdn-images.dzcdn.net/images/artist//250x250-000000-80-0-0.jpg",
+      "picture_big": "https://cdn-images.dzcdn.net/images/artist//500x500-000000-80-0-0.jpg",
+      "picture_xl": "https://cdn-images.dzcdn.net/images/artist//1000x1000-000000-80-0-0.jpg",
+      "nb_album": 0,
+      "nb_fan": 1,
+      "radio": true,
+      "tracklist": "https://api.deezer.com/artist/418508862/top?limit=50",
+      "type": "artist"
+    }
+  ],
+  "total": 3
+}

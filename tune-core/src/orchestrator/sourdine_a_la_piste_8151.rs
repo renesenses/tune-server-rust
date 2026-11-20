@@ -29,16 +29,26 @@ impl MomentDeLaSourdine {
     }
 }
 
+/// La zone est-elle en sourdine ? La base (`zones.muted`) survit au
+/// redémarrage ; l'état de lecture porte le dernier geste.
+async fn zone_en_sourdine(
+    db: &Arc<dyn crate::db::backend::DbBackend>,
+    playback: &Arc<crate::playback::PlaybackManager>,
+    zone_id: i64,
+) -> bool {
+    let en_base = crate::db::zone_repo::ZoneRepo::with_backend(db.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .is_some_and(|z| z.muted);
+    en_base || playback.get_state(zone_id).await.muted
+}
+
 impl PlaybackOrchestrator {
     /// La zone est-elle en sourdine ? La base (`zones.muted`) survit au
     /// redémarrage ; l'état de lecture porte le dernier geste.
     pub(super) async fn zone_en_sourdine(&self, zone_id: i64) -> bool {
-        let en_base = crate::db::zone_repo::ZoneRepo::with_backend(self.db.clone())
-            .get(zone_id)
-            .ok()
-            .flatten()
-            .is_some_and(|z| z.muted);
-        en_base || self.playback.get_state(zone_id).await.muted
+        zone_en_sourdine(&self.db, &self.playback, zone_id).await
     }
 
     /// Réaffirme la sourdine de la zone sur `sortie`. Un refus est journalisé
@@ -97,10 +107,29 @@ impl PlaybackOrchestrator {
         let Some(sortie) = sortie else {
             return;
         };
+        let db = self.db.clone();
+        let playback = self.playback.clone();
         tokio::spawn(async move {
+            // #8685 — la tâche attend le verrou de la sortie, que le sondeur
+            // tient pendant ses relevés : l'auditeur a pu lever la sourdine
+            // entre-temps. Elle n'est réaffirmée que si la zone est TOUJOURS
+            // muette au moment de l'envoi, verrou tenu.
             let issue = match envoi_direct {
-                Some(envoi) => envoi.set_mute(true).await,
-                None => sortie.lock().await.set_mute(true).await,
+                Some(envoi) => {
+                    if !zone_en_sourdine(&db, &playback, zone_id).await {
+                        info!(zone_id, device_id = %device_id, "zone_sourdine_levee_avant_reaffirmation");
+                        return;
+                    }
+                    envoi.set_mute(true).await
+                }
+                None => {
+                    let sortie = sortie.lock().await;
+                    if !zone_en_sourdine(&db, &playback, zone_id).await {
+                        info!(zone_id, device_id = %device_id, "zone_sourdine_levee_avant_reaffirmation");
+                        return;
+                    }
+                    sortie.set_mute(true).await
+                }
             };
             match issue {
                 Ok(()) => info!(
