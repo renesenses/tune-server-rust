@@ -102,7 +102,10 @@ fn chaque_fil_de_rendu_cpal_demande_le_temps_reel() {
     let sources: [(&str, &str); 5] = [
         ("local.rs", include_str!("../local.rs")),
         ("local/backend.rs", include_str!("backend.rs")),
-        ("local/bras_alsa_natif.rs", include_str!("bras_alsa_natif.rs")),
+        (
+            "local/bras_alsa_natif.rs",
+            include_str!("bras_alsa_natif.rs"),
+        ),
         ("local/bras_alsa_dsd.rs", include_str!("bras_alsa_dsd.rs")),
         (
             "local/sortie_double_locale.rs",
