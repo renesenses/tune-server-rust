@@ -141,7 +141,20 @@ pub(crate) fn message_d_avis(url: &str) -> String {
     )
 }
 
+/// `CoInitializeEx` a-t-il réussi, donc faut-il un `CoUninitialize` en
+/// retour ? Oui pour `S_OK` (0) et `S_FALSE` (1, déjà initialisé dans le
+/// même mode) ; non pour un échec, `RPC_E_CHANGED_MODE` compris (le fil est
+/// déjà dans l'autre mode, celui de son propriétaire).
+pub(crate) fn com_a_rendre(hresult: i32) -> bool {
+    hresult >= 0
+}
+
 /// La ligne de commande de la fenêtre d'avis, telle que `cmd` la lit.
+///
+/// L'échappement ne vaut que pour l'URL que Tune construit lui-même
+/// (`http://localhost:<port>`). Si une autre entrée devait un jour y passer,
+/// il faudrait REJETER `"` et `%` plutôt que les échapper : `^` ne protège
+/// pas `%` de l'expansion de `cmd`, ni `"` du découpage de `/K`.
 ///
 /// `start` ouvre une NOUVELLE fenêtre de console, visible même depuis le
 /// serveur détaché (`CREATE_NO_WINDOW`) ; `cmd /K` la garde ouverte. Les
@@ -163,7 +176,7 @@ mod systeme {
     use std::os::windows::process::CommandExt;
     use tune_core::windows::Win32::Foundation::ERROR_SUCCESS;
     use tune_core::windows::Win32::System::Com::{
-        COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
+        COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
     };
     use tune_core::windows::Win32::System::Registry::{
         HKEY, HKEY_CLASSES_ROOT, HKEY_CURRENT_USER, KEY_READ, RRF_RT_REG_SZ, RegCloseKey,
@@ -252,12 +265,34 @@ mod systeme {
         (!chemin.is_empty()).then(|| PathBuf::from(chemin))
     }
 
+    /// Rend au fil, en sortie de portée, l'initialisation COM qu'il a reçue.
+    struct ComDuFil(bool);
+
+    impl ComDuFil {
+        fn initialiser() -> Self {
+            // SAFETY: initialisation COM du fil courant, rendue par `Drop`
+            // si elle a réussi.
+            let hr =
+                unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+            Self(com_a_rendre(hr.0))
+        }
+    }
+
+    impl Drop for ComDuFil {
+        fn drop(&mut self) {
+            if self.0 {
+                // SAFETY: équilibre le `CoInitializeEx` réussi de ce fil.
+                unsafe { CoUninitialize() };
+            }
+        }
+    }
+
     /// `ShellExecuteExW`, sans aucune interface d'erreur du shell.
     fn ouvrir_par_le_shell(url: &str) -> tune_core::windows::core::Result<()> {
-        // SAFETY: initialisation COM du fil courant, recommandée avant
-        // `ShellExecuteExW` ; un échec (déjà initialisé autrement) est sans
-        // conséquence pour une URL.
-        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE) };
+        // COM du fil courant, recommandé avant `ShellExecuteExW`. Le fil vient
+        // du pool de `spawn_blocking` et sera réutilisé (l'encodeur AAC y
+        // initialise en MTA) : l'initialisation réussie est rendue en sortie.
+        let _com = ComDuFil::initialiser();
         let verbe = HSTRING::from("open");
         let fichier = HSTRING::from(url);
         let mut info = SHELLEXECUTEINFOW {
@@ -460,6 +495,17 @@ mod tests {
         assert!(noms[0].ends_with(r"firefox.exe"), "{noms:?}");
         assert!(noms[1].ends_with(r"chrome.exe"), "{noms:?}");
         assert!(noms[2].ends_with(r"msedge.exe"), "{noms:?}");
+    }
+
+    /// #9061 — l'initialisation COM n'est rendue que si elle a réussi : jamais
+    /// sur `RPC_E_CHANGED_MODE`, qui laisserait le fil (du pool, réutilisé)
+    /// désinitialisé sous son propriétaire.
+    #[test]
+    fn com_n_est_rendu_que_si_l_initialisation_a_reussi() {
+        assert!(com_a_rendre(0), "S_OK");
+        assert!(com_a_rendre(1), "S_FALSE");
+        assert!(!com_a_rendre(0x8001_0106_u32 as i32), "RPC_E_CHANGED_MODE");
+        assert!(!com_a_rendre(0x8007_000E_u32 as i32), "E_OUTOFMEMORY");
     }
 
     #[test]
