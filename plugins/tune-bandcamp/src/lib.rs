@@ -1329,9 +1329,10 @@ pub(crate) fn pseudo_de_la_saisie(brut: &str) -> Result<String, EchecLiaison> {
     let hote_min = hote.to_ascii_lowercase();
     let hote_min = hote_min.strip_prefix("www.").unwrap_or(&hote_min);
     let pseudo = if hote_min == "bandcamp.com" {
-        // `bandcamp.com/<pseudo>`, `/` final toléré.
-        match chemin.map(|c| c.trim_end_matches('/')) {
-            Some(p) if !p.is_empty() && !p.contains('/') => p,
+        // `bandcamp.com/<pseudo>`, `/` final toléré ; un onglet du profil
+        // (`bandcamp.com/<pseudo>/wishlist`) rend aussi `<pseudo>`.
+        match chemin.and_then(|c| c.split('/').next()) {
+            Some(p) if !p.is_empty() => p,
             _ => return Err(EchecLiaison::PseudoInvalide),
         }
     } else if let Some(sous_domaine) = hote_min.strip_suffix(".bandcamp.com") {
@@ -1356,7 +1357,8 @@ pub(crate) fn refus_de_saisie(e: &EchecLiaison) -> Option<(&'static str, String)
         EchecLiaison::PageArtiste(hote) => Some((
             "artist_page_not_fan_profile",
             format!(
-                "« {hote} » est une page d'artiste ou de label Bandcamp : saisir le                  pseudo du profil de fan, celui de l'adresse bandcamp.com/<pseudo>"
+                "« {hote} » est une page d'artiste ou de label Bandcamp : saisir le \
+                 pseudo du profil de fan, celui de l'adresse bandcamp.com/<pseudo>"
             ),
         )),
         _ => None,
@@ -1375,7 +1377,11 @@ pub(crate) async fn lier_compte_sur(
         Err(e) => {
             // Le journal gardait le refus sans la saisie (#9152) : impossible
             // de savoir ce que l'auditeur avait tapé.
-            tracing::warn!(saisie = %pseudo_brut.trim(), "bandcamp_liaison_saisie_refusee");
+            // `?` : la saisie est échappée (pas de fausse ligne de journal) ;
+            // tronquée, pour qu'un texte collé par erreur n'y entre pas
+            // entier.
+            let saisie: String = pseudo_brut.trim().chars().take(100).collect();
+            tracing::warn!(saisie = ?saisie, "bandcamp_liaison_saisie_refusee");
             return Err(e);
         }
     };
@@ -3050,6 +3056,7 @@ mod tests_saisie_pseudo_9152 {
             "http://www.bandcamp.com/didierv",
             "HTTPS://Bandcamp.com/didierv?from=menubar",
             "https://bandcamp.com/didierv#collection",
+            "https://bandcamp.com/didierv/wishlist",
         ] {
             assert_eq!(pseudo(saisie).as_deref(), Some("didierv"), "saisie {saisie:?}");
         }
@@ -3080,7 +3087,7 @@ mod tests_saisie_pseudo_9152 {
             "   ",
             "bandcamp.com",
             "https://bandcamp.com/",
-            "https://bandcamp.com/didierv/wishlist",
+            "https://bandcamp.com//",
             "nom/autre",
         ] {
             assert!(
