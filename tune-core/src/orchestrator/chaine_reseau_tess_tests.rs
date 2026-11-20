@@ -198,19 +198,27 @@ fn soixante_quatre_bits_reels_sur_la_chaine_reseau() {
 /// Deux requantifications (l'ancien chemin) ne la rendent pas.
 #[test]
 fn une_seule_quantification_a_la_fin() {
-    for bits in [16u16, 24] {
+    // Les deux puits : sortie quantifiée au fil de l'eau (sans compensation)
+    // et sortie gardée pour la crête de la piste (avec).
+    for (bits, avec_comp) in [(16u16, true), (24, true), (16, false), (24, false)] {
         let src = source(bits, 24_000, 0.8, 23);
         let x = lire(&src, bits);
         let facteur = 0.61;
         let mut chaine = porteur(Some(facteur));
-        chaine.compensation = CompensationReseau::depuis_db(1.5);
+        if avec_comp {
+            chaine.compensation = CompensationReseau::depuis_db(1.5);
+        }
         let mut pcm = src.clone();
         chaine.process(&mut pcm, bits);
 
         let apres_rg: Vec<f64> = x.iter().map(|v| v * facteur).collect();
-        let mut comp = CompensationReseau::depuis_db(1.5).unwrap();
-        comp.retenir_pour_crete(apres_rg.iter().fold(0.0, |m, v| m.max(v.abs())));
-        let g = comp.gain_lineaire();
+        let g = if avec_comp {
+            let mut comp = CompensationReseau::depuis_db(1.5).unwrap();
+            comp.retenir_pour_crete(apres_rg.iter().fold(0.0, |m, v| m.max(v.abs())));
+            comp.gain_lineaire()
+        } else {
+            1.0
+        };
         let reference: Vec<f64> = apres_rg.iter().map(|v| v * g).collect();
         let format = FormatFlux {
             channels: 2,
@@ -234,9 +242,12 @@ fn une_seule_quantification_a_la_fin() {
         assert_eq!(
             sha(&pcm),
             sha(&attendu),
-            "{bits} bits : la sortie n'est pas UNE quantification de la référence"
+            "{bits} bits (compensation : {avec_comp}) : la sortie n'est pas UNE \
+             quantification de la référence"
         );
-
+        if !avec_comp {
+            continue;
+        }
         let mut ancien = src.clone();
         let mut comp_ancien = CompensationReseau::depuis_db(1.5).unwrap();
         ancien_chemin_gain_puis_compensation(&mut ancien, bits, facteur, &mut comp_ancien);
