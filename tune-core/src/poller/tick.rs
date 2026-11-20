@@ -3550,11 +3550,10 @@ impl PositionPoller {
                                 std::mem::take(&mut ps.tune_tested_rendu_ms),
                             )
                             .await;
+                            // #9206 — voir la retombée de position : pas de
+                            // constat de suivi sur une avance provisoire.
+                            let suivi_avere = rejeu.is_none();
                             info!(zone_id, next_pos, "gapless_confirmed_advancing_metadata");
-                            // #9206 — voir la retombée de position.
-                            if rejeu.is_none() {
-                                self.constater_le_suivant_suivi(zone_id);
-                            }
                             let avance = Box::pin(
                                 self.orchestrator.advance_queue_metadata(zone_id, next_pos),
                             )
@@ -3569,6 +3568,9 @@ impl PositionPoller {
                             // Identity-keyed latch re-arms on the new track;
                             // clearing also covers gapless repeat-one (#1113).
                             ps.scrobbled_key = None;
+                            if suivi_avere {
+                                self.constater_le_suivant_suivi(zone_id);
+                            }
                         }
                     }
                     if ps.track_started_at.is_none() {
