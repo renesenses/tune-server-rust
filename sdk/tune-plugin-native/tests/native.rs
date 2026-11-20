@@ -172,3 +172,39 @@ fn signed_native_activation_keeps_old_instance_alive_during_update_and_rollback(
     // Drop the processor before TempDir: Windows intentionally keeps its DLL mapped.
     drop(processor);
 }
+/// TESS T05 — the reference equalizer and crossfeed do not request
+/// `audio-f64` and refuse F64. Through `Stage::process_f64` they still run,
+/// converted at their boundary, bit for bit like the historical F32 path.
+/// Pointed at libraries built from a pre-T05 tree (`TUNE_NATIVE_TEST_DIR`),
+/// this proves an existing F32 binary runs unchanged under the new host.
+#[test]
+fn reference_f32_plugins_run_unchanged_behind_the_f64_boundary() {
+    for (id, settings) in [
+        (
+            "equalizer",
+            serde_json::json!({"enabled":true,"listening":"headphones","room_size":"medium","speaker_placement":"free_standing","bass_gain_db":0.0,"mid_gain_db":0.0,"treble_gain_db":0.0,"bands":[{"freq":1700.0,"gain":-7.0,"q":1.2,"channel":0}]}),
+        ),
+        (
+            "crossfeed",
+            serde_json::json!({"enabled":true,"amount":0.3,"delay_ms":0.3}),
+        ),
+    ] {
+        let library = library(id);
+        assert!(!library.manifest.declares_f64(), "{id} now requests F64");
+        let mut wide = Stage::prepare(library.clone(), 48000, 2, &settings).unwrap();
+        let mut narrow = Stage::prepare(library, 48000, 2, &settings).unwrap();
+        assert!(!wide.processes_f64_natively());
+        let input: Vec<f64> = (0..32768)
+            .map(|i| (f64::from(i) * 0.07).sin() * 0.8 + 1e-11)
+            .collect();
+        let mut x = input.clone();
+        for chunk in x.chunks_mut(2 * 333) {
+            wide.process_f64(chunk).unwrap();
+        }
+        let mut y: Vec<f32> = input.iter().map(|v| *v as f32).collect();
+        narrow.process_f32(&mut y).unwrap();
+        let expected: Vec<f64> = y.iter().map(|v| f64::from(*v)).collect();
+        assert_eq!(x, expected, "{id}: F64 boundary differs from the F32 path");
+        assert_ne!(x, input, "{id}: native DSP must actually run");
+    }
+}

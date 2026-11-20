@@ -285,3 +285,73 @@ fn rate_change_capability_is_not_offered_before_a_host_adapter_exists() {
         "a capability enters the reference host only with its adapter and matrix witness"
     );
 }
+
+/// TESS T05 — `audio-f64` is offered by the reference host and negotiated
+/// like any optional capability: a manifest without it is never an F64
+/// plugin, one that requests it is, and a host without it simply does not
+/// grant it (the plugin then stays in F32).
+#[test]
+fn f64_is_a_negotiated_optional_capability() {
+    assert!(reference_host_capabilities().contains_key(AUDIO_F64));
+    let m = manifest();
+    assert!(!m.declares_f64(), "no request, no F64");
+    let mut m = manifest();
+    m.capabilities.push(CapabilityRequest {
+        id: AUDIO_F64.into(),
+        version: SDK_VERSION,
+        required: false,
+    });
+    assert!(m.declares_f64());
+    assert!(
+        m.negotiate(&reference_host_capabilities())
+            .unwrap()
+            .contains(AUDIO_F64)
+    );
+    let older: BTreeMap<String, Version> = [("audio-process".into(), SDK_VERSION)].into();
+    assert!(
+        !m.negotiate(&older).unwrap().contains(AUDIO_F64),
+        "an older host loads the plugin without granting F64"
+    );
+    m.kind = PluginKind::Batch;
+    assert!(!m.declares_f64(), "F64 blocks are a DSP notion");
+}
+
+/// TESS T05 — `exclusive_group` is optional: manifests published before it
+/// still parse and serialize unchanged; a malformed group is refused.
+#[test]
+fn exclusive_group_is_optional_and_validated() {
+    let m = manifest();
+    assert!(m.exclusive_group.is_none());
+    assert!(
+        serde_json::to_value(&m)
+            .unwrap()
+            .get("exclusive_group")
+            .is_none(),
+        "a pre-T05 manifest must serialize exactly as before"
+    );
+    let mut value = serde_json::to_value(manifest()).unwrap();
+    value["exclusive_group"] = serde_json::json!({"id": "crossfeed_crosstalk", "priority": 2});
+    let m: Manifest = serde_json::from_value(value).unwrap();
+    assert_eq!(m.validate(), Ok(()));
+    assert_eq!(
+        m.exclusive_group,
+        Some(ExclusiveGroup {
+            id: "crossfeed_crosstalk".into(),
+            priority: 2
+        })
+    );
+    for bad in [
+        serde_json::json!({"id": "", "priority": 1}),
+        serde_json::json!({"id": "Crossfeed", "priority": 1}),
+        serde_json::json!({"id": "crossfeed_crosstalk", "priority": 0}),
+    ] {
+        let mut value = serde_json::to_value(manifest()).unwrap();
+        value["exclusive_group"] = bad.clone();
+        let m: Manifest = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            m.validate(),
+            Err(ManifestError::InvalidExclusiveGroup),
+            "{bad}"
+        );
+    }
+}

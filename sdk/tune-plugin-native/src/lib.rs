@@ -58,11 +58,47 @@ impl Library {
         if (api.kind == abi::DSP) != (manifest.kind == tune_plugin_sdk::manifest::PluginKind::Dsp) {
             return Err("manifest kind differs from ABI".into());
         }
-        Ok(Arc::new(Self {
+        let library = Arc::new(Self {
             library,
             api: pointer,
             manifest,
-        }))
+        });
+        if library.manifest.declares_f64() {
+            library.probe_f64()?;
+        }
+        Ok(library)
+    }
+    /// TESS T05 — a plugin that requests [`tune_plugin_sdk::manifest::AUDIO_F64`]
+    /// must accept `F64`. Probed at load with neutral settings (`null`) and a
+    /// silent block: a format refusal (`UnsupportedFormat`/`InvalidFormat`)
+    /// refuses the library. A refusal of the probe settings proves nothing
+    /// either way; [`stage::Stage::prepare`] then enforces the same rule with
+    /// the real settings.
+    fn probe_f64(self: &Arc<Self>) -> Result<(), String> {
+        const LIAR: &str = "plugin declares audio-f64 but refuses F64 blocks";
+        let format = AudioFormat::new(48_000, ChannelLayout::Stereo, SampleEncoding::F64)
+            .map_err(|e| format!("{e:?}"))?;
+        let refuses = |e: &Error| matches!(e, Error::UnsupportedFormat | Error::InvalidFormat);
+        let mut processor = match self.prepare(format, 64, &Settings::Null) {
+            Ok(p) => p,
+            Err(e) if refuses(&e) => return Err(LIAR.into()),
+            Err(_) => return Ok(()),
+        };
+        let mut silence = vec![0.0f64; 64 * 2];
+        let block = AudioBlock::new(format, SamplesMut::F64(&mut silence), 64);
+        match block.and_then(|mut b| {
+            processor.process(
+                &mut b,
+                BlockContext {
+                    zone_id: 0,
+                    generation: 0,
+                    position_frames: 0,
+                },
+            )
+        }) {
+            Err(e) if refuses(&e) => Err(LIAR.into()),
+            _ => Ok(()),
+        }
     }
     fn api(&self) -> &abi::Api {
         let _pin = &self.library;
