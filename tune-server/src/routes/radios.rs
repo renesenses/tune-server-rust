@@ -4604,3 +4604,7 @@ mod tests_recherche_diffuseur_6964;
 #[cfg(test)]
 #[path = "radios_logo_de_lancement_7051_tests.rs"]
 mod tests_logo_de_lancement_7051;
+
+#[cfg(test)]
+#[path = "radios_logos_fip_2862_tests.rs"]
+mod tests_logos_fip_2862;
