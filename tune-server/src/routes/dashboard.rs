@@ -9,6 +9,8 @@ use tune_core::db::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use tune_core::db::history_repo::HistoryRepo;
 
 use crate::error::AppError;
+use crate::routes::active_profile::ActiveProfile;
+use crate::routes::history::{VueDuFoyer, profil_du_classement};
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -73,8 +75,37 @@ fn genres_ecoutes(state: &AppState) -> Option<i64> {
     Some(cles.len() as i64)
 }
 
-async fn dashboard_stats(State(state): State<AppState>) -> Json<Value> {
+/// Les totaux du foyer pour qui le voit ([`VueDuFoyer`]) ; pour un compte
+/// standard, ceux de son profil (avec les écoutes sans profil), sans le
+/// nombre de genres du foyer.
+async fn dashboard_stats(
+    State(state): State<AppState>,
+    ActiveProfile(moi): ActiveProfile,
+    VueDuFoyer(foyer): VueDuFoyer,
+) -> Json<Value> {
     let repo = HistoryRepo::with_backend(state.backend.clone());
+    if let Some(p) = profil_du_classement(moi, foyer) {
+        let totaux = repo
+            .full_dashboard_avec_communes("all", None, Some(p), 1, true)
+            .map(|d| d.totals);
+        return Json(match totaux {
+            Ok(t) => json!({
+                "total_listens": t.plays,
+                "total_duration_ms": t.listening_ms,
+                "unique_tracks": t.unique_tracks,
+                "unique_artists": t.unique_artists,
+            }),
+            Err(e) => {
+                tracing::warn!(error = %e, "dashboard_stats_error");
+                json!({
+                    "total_listens": 0,
+                    "total_duration_ms": 0,
+                    "unique_tracks": 0,
+                    "unique_artists": 0,
+                })
+            }
+        });
+    }
     match repo.dashboard() {
         Ok(s) => {
             let mut v = json!(s);
@@ -95,11 +126,17 @@ async fn dashboard_stats(State(state): State<AppState>) -> Json<Value> {
     }
 }
 
-async fn top_artists(State(state): State<AppState>, Query(p): Query<DashParams>) -> Json<Value> {
+async fn top_artists(
+    State(state): State<AppState>,
+    ActiveProfile(moi): ActiveProfile,
+    VueDuFoyer(foyer): VueDuFoyer,
+    Query(p): Query<DashParams>,
+) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
+    let profil = profil_du_classement(moi, foyer);
     let repo = HistoryRepo::with_backend(state.backend.clone());
     let items: Vec<Value> = repo
-        .top_artists(limit)
+        .top_artists_du_profil(limit, profil)
         .unwrap_or_default()
         .into_iter()
         .map(|(name, plays)| json!({ "name": name, "plays": plays }))
@@ -107,18 +144,30 @@ async fn top_artists(State(state): State<AppState>, Query(p): Query<DashParams>)
     Json(json!(items))
 }
 
-async fn top_tracks(State(state): State<AppState>, Query(p): Query<DashParams>) -> Json<Value> {
+async fn top_tracks(
+    State(state): State<AppState>,
+    ActiveProfile(moi): ActiveProfile,
+    VueDuFoyer(foyer): VueDuFoyer,
+    Query(p): Query<DashParams>,
+) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
+    let profil = profil_du_classement(moi, foyer);
     let repo = HistoryRepo::with_backend(state.backend.clone());
-    let items = repo.top_tracks(limit).unwrap_or_default();
+    let items = repo.top_tracks_du_profil(limit, profil).unwrap_or_default();
     Json(json!(items))
 }
 
-async fn top_albums(State(state): State<AppState>, Query(p): Query<DashParams>) -> Json<Value> {
+async fn top_albums(
+    State(state): State<AppState>,
+    ActiveProfile(moi): ActiveProfile,
+    VueDuFoyer(foyer): VueDuFoyer,
+    Query(p): Query<DashParams>,
+) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
+    let profil = profil_du_classement(moi, foyer);
     let repo = HistoryRepo::with_backend(state.backend.clone());
     let items: Vec<Value> = repo
-        .top_albums(limit)
+        .top_albums_du_profil(limit, profil)
         .unwrap_or_default()
         .into_iter()
         .map(|(title, artist, plays)| json!({ "album_title": title, "artist_name": artist, "plays": plays }))
@@ -128,12 +177,14 @@ async fn top_albums(State(state): State<AppState>, Query(p): Query<DashParams>) 
 
 async fn listening_history(
     State(state): State<AppState>,
+    ActiveProfile(moi): ActiveProfile,
+    VueDuFoyer(foyer): VueDuFoyer,
     Query(p): Query<DashParams>,
 ) -> Json<Value> {
     let days = p.days.unwrap_or(30);
     let repo = HistoryRepo::with_backend(state.backend.clone());
     let items: Vec<Value> = repo
-        .listening_history(days)
+        .listening_history_du_profil(days, profil_du_classement(moi, foyer))
         .unwrap_or_default()
         .into_iter()
         .map(|(day, play_count, total_ms)| {
@@ -396,7 +447,7 @@ mod genres_ecoutes_4527 {
     }
 
     async fn stats(state: AppState) -> Value {
-        let Json(v) = dashboard_stats(State(state)).await;
+        let Json(v) = dashboard_stats(State(state), ActiveProfile(1), VueDuFoyer(true)).await;
         v
     }
 

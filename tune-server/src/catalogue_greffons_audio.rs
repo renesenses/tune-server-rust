@@ -36,7 +36,7 @@ use sha2::{Digest, Sha256};
 use tune_core::cloud::support::SupportAuth;
 use tune_core::db::settings_repo::SettingsRepo;
 
-use crate::{auth::RequireAdmin, state::AppState};
+use crate::state::AppState;
 
 const DEFAULT_BASE_URL: &str = "https://mozaiklabs.fr";
 /// La fiche est un petit JSON : un site qui ne répond pas en 20 s est en panne.
@@ -351,10 +351,23 @@ fn plus_recente(candidate: &str, installee: &str) -> bool {
 /// installé depuis le catalogue dont la version est plus ancienne ; la mise à
 /// jour passe par `install-from-catalog`, jamais d'elle-même.
 pub async fn catalog_status(
-    _admin: RequireAdmin,
+    // Lu à chaque ouverture des greffons, depuis tout appareil : refus sans
+    // avertissement au journal.
+    relie: crate::auth::ReliePourLesComptes,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
+    if !relie.0 {
+        return (
+            axum::http::StatusCode::FORBIDDEN,
+            axum::Json(serde_json::json!({
+                "error": "auth_required",
+                "reason": "not_local",
+                "message": "Enable authentication, or open this page on the machine running Tune.",
+            })),
+        )
+            .into_response();
+    }
     if let Err(response) = crate::native_audio::check_slot(&state, &id).await {
         return response;
     }
