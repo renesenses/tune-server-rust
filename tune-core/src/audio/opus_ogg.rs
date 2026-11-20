@@ -56,10 +56,18 @@ pub fn encode_ogg_opus(
     let mut out_buf = vec![0u8; 4000]; // max recommended packet size
     let total_frames = pcm.len() / chu;
     let mut frame = vec![0i16; FRAME_SAMPLES * chu];
+    // #8982 — l'encodeur retarde le signal de `pre_skip` trames : il faut lui
+    // faire coder `total_frames + pre_skip` trames (complétées de silence)
+    // pour que les dernières trames du signal sortent. Sans cela la fin du
+    // morceau n'était jamais codée.
+    let a_coder = total_frames + pre_skip as usize;
     let mut offset = 0usize;
-    while offset < total_frames {
-        let avail = (total_frames - offset).min(FRAME_SAMPLES);
-        let src = &pcm[offset * chu..(offset + avail) * chu];
+    while offset < a_coder {
+        // Au-delà du signal (trames de vidage), la tranche source est vide :
+        // son début est borné à la fin du PCM, sinon l'indice dépasse.
+        let debut = offset.min(total_frames);
+        let avail = (total_frames - debut).min(FRAME_SAMPLES);
+        let src = &pcm[debut * chu..(debut + avail) * chu];
         // Final partial frame: pad with silence, granulepos trims the tail.
         frame[..src.len()].copy_from_slice(src);
         frame[src.len()..].fill(0);
@@ -67,7 +75,7 @@ pub fn encode_ogg_opus(
             .encode(&frame, &mut out_buf)
             .map_err(|e| format!("opus encode: {e}"))?;
         packets.push(out_buf[..n].to_vec());
-        offset += avail;
+        offset += FRAME_SAMPLES;
     }
 
     // --- Ogg encapsulation ----------------------------------------------
@@ -94,8 +102,10 @@ pub fn encode_ogg_opus(
     tags.extend_from_slice(&0u32.to_le_bytes()); // no comments
     ogg.write_page(&[&tags], 0, false, false);
 
-    // Audio pages. Granulepos = pre-skip + samples decodable up to and
-    // including this page; the final page's value trims the padded tail.
+    // Audio pages. Granulepos = samples DECODED up to and including this page
+    // (the pre-skip frames are part of them, RFC 7845 §4) ; the final page's
+    // value, pre-skip + useful samples, trims the padded tail. Les pages
+    // intermédiaires annonçaient `pre_skip` trames de trop (#8982).
     let mut samples_done = 0u64;
     for (i, group) in packets.chunks(PACKETS_PER_PAGE).enumerate() {
         let is_last = (i + 1) * PACKETS_PER_PAGE >= packets.len();
@@ -104,7 +114,7 @@ pub fn encode_ogg_opus(
         let granule = if is_last {
             pre_skip as u64 + total_frames as u64
         } else {
-            pre_skip as u64 + samples_done
+            samples_done
         };
         let refs: Vec<&[u8]> = group.iter().map(|p| p.as_slice()).collect();
         ogg.write_page(&refs, granule, false, is_last);
@@ -326,6 +336,118 @@ mod tests {
             / decoded.samples_i32.len() as f64)
             .sqrt();
         assert!(rms > 1000.0, "decoded signal is near-silent: rms={rms}");
+    }
+
+    /// #8982 — longueur et calage exacts. Un signal de 47 123 trames (ni
+    /// multiple de 960, ni de 312) encodé puis relu par la chaîne de Tune doit
+    /// revenir avec 47 123 trames, sans les `pre_skip` trames d'amorce en tête
+    /// ni le remplissage du dernier paquet en queue, et sans perdre sa fin
+    /// (l'encodeur est vidé). Avant : 47 123 + 312 + remplissage rendues, la
+    /// fin du signal jamais codée.
+    /// Un glissando stéréo (200 Hz → plus d'1 kHz), pas un sinus : un signal
+    /// périodique se recalerait aussi à une période près.
+    fn glissando_8982(trames: usize) -> Vec<i16> {
+        (0..trames)
+            .flat_map(|n| {
+                let t = n as f64 / 48000.0;
+                let phase = 2.0 * std::f64::consts::PI * (200.0 * t + 500.0 * t * t);
+                let v = (phase.sin() * 16000.0) as i16;
+                [v, v]
+            })
+            .collect()
+    }
+
+    /// Encode `pcm`, l'écrit, le relit par la chaîne de Tune à partir de
+    /// `debut_s`.
+    fn aller_retour_8982(
+        nom: &str,
+        pcm: &[i16],
+        debut_s: f64,
+    ) -> crate::audio::decode::DecodedAudio {
+        let bytes = encode_ogg_opus(pcm, 2, 192, 48000).expect("encode");
+        let dir = crate::test_scratch::scratch_dir(&format!("tune-opus-8982-{nom}"));
+        let path = dir.join(format!("{nom}.opus"));
+        std::fs::write(&path, &bytes).unwrap();
+        crate::audio::decode::decode_to_pcm(path.to_str().unwrap(), None, None, debut_s, 0.0)
+            .expect("decode back")
+    }
+
+    /// Le décalage (en trames, cherché sur ±400, pre-skip compris) qui aligne
+    /// le mieux `dec[i]` sur `src[decalage_source + i]`, mesuré à partir de
+    /// `dec[base]`.
+    fn meilleur_decalage_8982(
+        src: &[i16],
+        dec: &[i32],
+        decalage_source: usize,
+        base: usize,
+    ) -> i64 {
+        let src = channel_f64(&src.iter().map(|&s| i32::from(s)).collect::<Vec<_>>(), 2, 0);
+        let dec = channel_f64(dec, 2, 0);
+        let fenetre = 4_800usize;
+        let erreur = |lag: i64| -> f64 {
+            (0..fenetre)
+                .map(|i| {
+                    let a = src[decalage_source + base + i];
+                    let b = dec[(base as i64 + i as i64 + lag) as usize];
+                    (a - b) * (a - b)
+                })
+                .sum()
+        };
+        (-400i64..=400)
+            .min_by(|a, b| erreur(*a).total_cmp(&erreur(*b)))
+            .unwrap()
+    }
+
+    #[test]
+    fn aller_retour_rend_la_longueur_exacte_et_le_calage_8982() {
+        const TRAMES: usize = 47_123;
+        let pcm = glissando_8982(TRAMES);
+        let decoded = aller_retour_8982("longueur", &pcm, 0.0);
+        assert_eq!(decoded.samples_i32.len() / 2, TRAMES, "longueur décodée");
+        assert!(
+            !decoded.integrite.perte_detectee(),
+            "la longueur annoncée (granule − pre-skip) doit valoir la longueur rendue : {:?}",
+            decoded.integrite
+        );
+        // Calage nul au milieu du signal (il valait le pre-skip, 312 trames).
+        assert_eq!(
+            meilleur_decalage_8982(&pcm, &decoded.samples_i32, 0, 20_000),
+            0,
+            "décalage du décodé par rapport à la source"
+        );
+    }
+
+    /// Le vidage de l'encodeur code au-delà du signal : quand la dernière
+    /// trame utile tombe tard dans son paquet (47 000 % 960 = 920 ; tout reste
+    /// de 649 à 959), l'indice de la tranche source dépassait le PCM et
+    /// l'encodage paniquait (route de conversion).
+    #[test]
+    fn encoder_une_fin_tardive_dans_son_paquet_ne_panique_pas_8982() {
+        const TRAMES: usize = 47_000;
+        let pcm = glissando_8982(TRAMES);
+        let decoded = aller_retour_8982("fin-tardive", &pcm, 0.0);
+        assert_eq!(decoded.samples_i32.len() / 2, TRAMES, "longueur décodée");
+    }
+
+    /// Saut dans la piste : la première trame rendue est celle de `seek_s`
+    /// (granule cible = pre-skip + seek × 48 000), sans décalage du pre-skip.
+    #[test]
+    fn un_saut_rend_la_trame_demandee_8982() {
+        const TRAMES: usize = 144_000;
+        let pcm = glissando_8982(TRAMES);
+        let seek_s = 1.3;
+        let decoded = aller_retour_8982("saut", &pcm, seek_s);
+        let cible = (seek_s * 48_000.0) as usize;
+        assert_eq!(
+            decoded.samples_i32.len() / 2,
+            TRAMES - cible,
+            "longueur rendue après le saut"
+        );
+        assert_eq!(
+            meilleur_decalage_8982(&pcm, &decoded.samples_i32, cible, 4_800),
+            0,
+            "le décodé après saut doit commencer à la trame demandée"
+        );
     }
 
     /// `seconds` de deux sinus distincts — `fl` à gauche, `fr` à droite —

@@ -2472,8 +2472,19 @@ impl PlaybackOrchestrator {
             track.channels as u32,
         );
         let dop_rate = crate::audio::dsd_to_dop::DsdToDoP::dop_rate(dsd_rate);
-        // Réutilise le plafond déjà combiné avec le quirk catalogue.
-        let zone_max_sr = zone_max_sample_rate;
+        // #8789 — en local, ne pas ouvrir un porteur DoP au-delà du DSD256.
+        // Les deux familles gardent leur DSD256 (705,6 / 768 kHz). Le plafond
+        // de zone peut encore abaisser cette borne ; le chemin natif est séparé.
+        let zone_max_sr = if is_local_output {
+            let plafond_dop = if dsd_rate.is_multiple_of(48_000) {
+                768_000
+            } else {
+                705_600
+            };
+            Some(zone_max_sample_rate.unwrap_or(plafond_dop).min(plafond_dop))
+        } else {
+            zone_max_sample_rate
+        };
         if let Some(max_sr) = zone_max_sr {
             if dop_rate > max_sr {
                 // #3973 — le DoP dépasse le plafond : le chemin ordinaire

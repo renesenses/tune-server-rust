@@ -104,11 +104,11 @@ fn decoder(url: &str, tx: mpsc::Sender<Vec<u8>>) -> Result<(u16, u32), String> {
     let indice = format!("flux-distant.{}", extension_de_l_url(url));
     match crate::audio::http_range::HttpRangeSource::open(url) {
         Ok(source) => {
-            info!(url, "airplay_flux_progressif_range");
+            info!(url = %crate::confidentialite::masquer_url(&url), "airplay_flux_progressif_range");
             decoder_sur(&indice, Some(Box::new(source)))
         }
         Err(raison) => {
-            info!(url, raison = %raison, "airplay_flux_progressif_continu");
+            info!(url = %crate::confidentialite::masquer_url(&url), raison = %raison, "airplay_flux_progressif_continu");
             let reponse = crate::http::client::blocking_builder()
                 .timeout(None)
                 .connect_timeout(std::time::Duration::from_secs(10))

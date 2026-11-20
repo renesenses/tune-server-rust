@@ -429,10 +429,19 @@ impl StreamingService for BandcampService {
                 username: Some(compte.pseudo),
                 ..Default::default()
             }),
-            Err(EchecLiaison::PseudoInvalide) => Err(TuneError::from("username invalide")),
-            Err(EchecLiaison::ProfilIntrouvable(m) | EchecLiaison::Passerelle(m)) => {
-                Err(TuneError::from(m))
+            // #9152 — le code stable arrive aussi par Réglages › Services :
+            // `Refused` le porte jusqu'au client, `Other` n'aurait rendu que
+            // le texte.
+            Err(e @ (EchecLiaison::PseudoInvalide | EchecLiaison::PageArtiste(_))) => {
+                let (code, message) =
+                    crate::refus_de_saisie(&e).unwrap_or(("invalid_username", String::new()));
+                Err(TuneError::Refused { code, message })
             }
+            Err(EchecLiaison::ProfilIntrouvable(message)) => Err(TuneError::Refused {
+                code: "fan_profile_not_found",
+                message,
+            }),
+            Err(EchecLiaison::Passerelle(m)) => Err(TuneError::from(m)),
             // 🔴 #2778 — l'écriture qui échoue REMONTE au lieu d'être jetée.
             Err(EchecLiaison::Ecriture(m)) => Err(TuneError::from(m)),
         }
@@ -1232,6 +1241,35 @@ mod case_actif_fil1952 {
             (true, true),
             "compte lié : Bandcamp doit être activé ET utilisable"
         );
+    }
+
+    /// #9152 — par `authenticate` (Réglages › Services), une page d'artiste
+    /// rend le code stable, pas un texte brut.
+    #[tokio::test]
+    async fn authenticate_rend_le_code_stable_d_une_page_d_artiste_9152() {
+        let mut svc = BandcampService::new(base());
+        let r = svc
+            .authenticate(&serde_json::json!({"username": "https://artiste.bandcamp.com"}))
+            .await;
+        match r {
+            Err(TuneError::Refused { code, .. }) => {
+                assert_eq!(code, "artist_page_not_fan_profile")
+            }
+            _ => panic!("page d'artiste : refus avec code stable attendu"),
+        }
+    }
+
+    /// #9152 — l'adresse du profil collée entière lie le compte (elle était
+    /// refusée en local, « username invalide »), sous le seul pseudo.
+    #[tokio::test]
+    async fn lier_par_l_adresse_du_profil_lie_le_compte_9152() {
+        let b = base();
+        let racine = profil_local().await;
+        let compte = crate::lier_compte_sur(&b, "https://bandcamp.com/didierv/", &racine)
+            .await
+            .unwrap_or_else(|_| panic!("l'adresse du profil doit lier le compte"));
+        assert_eq!(compte.pseudo, "didierv");
+        assert_eq!(compte.fan_id, 897100);
     }
 
     #[tokio::test]

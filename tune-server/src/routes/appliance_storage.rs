@@ -295,7 +295,7 @@ fn mount_unit_contents(uuid: &str, mount_point: &str) -> String {
          [Mount]\n\
          What=/dev/disk/by-uuid/{uuid}\n\
          Where={mount_point}\n\
-         Options=nofail\n\
+         Options=nofail,nosuid,nodev\n\
          TimeoutSec=15\n\n\
          [Install]\n\
          WantedBy=multi-user.target\n"
@@ -1070,6 +1070,6 @@ tmpfs /run tmpfs rw 0 0
         let u = mount_unit_contents("A1B2-C3D4", "/srv/tune-data");
         assert!(u.contains("What=/dev/disk/by-uuid/A1B2-C3D4"));
         assert!(u.contains("Where=/srv/tune-data"));
-        assert!(u.contains("Options=nofail"));
+        assert!(u.contains("Options=nofail,nosuid,nodev"));
     }
 }

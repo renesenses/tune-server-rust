@@ -157,6 +157,14 @@ pub(crate) fn est_un_extrait_v1(reponse: &serde_json::Value) -> bool {
 
 pub(crate) use crate::http::client::url_pour_journal;
 
+/// Les 500 premiers caractères d'un MPD pour le journal, chaque adresse
+/// réduite à son schéma et son hôte (les jetons signés vivent dans
+/// `initialization`, `media`, `BaseURL`).
+pub(crate) fn extrait_de_manifeste_pour_journal(mpd: &str) -> String {
+    let debut: String = mpd.chars().take(500).collect();
+    crate::orchestrator::sentinelle_streaming::masquer_les_requetes(&debut)
+}
+
 /// Le refus « TIDAL non configuré ».
 fn refus_non_configure() -> TuneError {
     TuneError::Refused {
@@ -1751,7 +1759,12 @@ impl TidalService {
             if let Some(cc) = me["countryCode"].as_str() {
                 self.adopter_pays(cc);
             }
-            info!(username = ?self.username, country = %self.country_code, "tidal_user_refreshed");
+            // Pas le nom du compte : c'est souvent une adresse e-mail.
+            info!(
+                compte_nomme = self.username.is_some(),
+                country = %self.country_code,
+                "tidal_user_refreshed"
+            );
         }
         // Fetch subscription type for quality diagnostics
         if let Some(uid) = self.user_id
@@ -2204,6 +2217,30 @@ impl TidalService {
             .unwrap_or_default()
     }
 
+    /// #9119 — le refus que TIDAL rend À LA PLACE d'une liste.
+    ///
+    /// `api_get` lit le corps de toute réponse autre que 401 : un 404 ou un
+    /// 400 de TIDAL arrive ici sous la forme `{"status": 404, "subStatus":
+    /// 2001, "userMessage": "…"}`. Lu comme une liste, il donnait `items`
+    /// absent, donc une liste VIDE servie en 200 : un genre que TIDAL refuse
+    /// pour le pays du catalogue (« Polish » avec `countryCode=PL`)
+    /// s'affichait vide, sans erreur ni trace. `None` pour une vraie liste,
+    /// même vide.
+    fn refus_de_tidal(data: &serde_json::Value) -> Option<String> {
+        if !data["items"].is_null() {
+            return None;
+        }
+        let statut = data["status"].as_u64().filter(|s| *s >= 400)?;
+        let message = data["userMessage"]
+            .as_str()
+            .filter(|m| !m.is_empty())
+            .unwrap_or("refus sans message");
+        let sous_statut = data["subStatus"]
+            .as_u64()
+            .map(|s| format!(" ({s})"))
+            .unwrap_or_default();
+        Some(format!("tidal {statut}{sous_statut}: {message}"))
+    }
     fn map_genre(item: &serde_json::Value) -> StreamGenre {
         StreamGenre {
             id: item["path"].as_str().unwrap_or("").into(),
@@ -2888,19 +2925,21 @@ impl StreamingService for TidalService {
         let mut fichier_en_croissance = None;
         let (url, man_codec, man_mime) = if manifest_mime == "application/dash+xml" {
             // Log raw manifest content for debugging Hi-Res issues
+            // Le MPD porte des adresses signées (`initialization`, `media`,
+            // `BaseURL`) : l'extrait journalisé les réduit à leur hôte.
             debug!(
                 track_id,
                 manifest_len = decoded.len(),
-                manifest_content = &decoded[..decoded.len().min(500)],
+                manifest_content = %extrait_de_manifeste_pour_journal(&decoded),
                 "tidal_dash_manifest_raw"
             );
             // DASH manifest (MPD XML) — parse to extract URL, codec, and MIME type
             let dash = parse_dash_manifest(&decoded).ok_or_else(|| {
+                // En WARN, la taille seulement (l'extrait masqué est en debug).
                 warn!(
                     track_id,
                     manifest_len = decoded.len(),
-                    manifest_content = &decoded[..decoded.len().min(500)],
-                    "tidal_dash_parse_failed — full manifest logged above"
+                    "tidal_dash_parse_failed"
                 );
                 format!("tidal: could not parse DASH manifest for track {track_id}")
             })?;
@@ -3278,11 +3317,55 @@ impl StreamingService for TidalService {
                 urlencoding::encode(genre_id)
             ))
             .await?;
+        // #9119 — un refus de TIDAL est une erreur, pas un genre vide.
+        if let Some(refus) = Self::refus_de_tidal(&data) {
+            warn!(genre = %genre_id, pays = %self.pays_effectif(), refus = %refus, "tidal_genre_albums_refuse");
+            return Err(TuneError::Streaming(refus));
+        }
         let albums = data["items"]
             .as_array()
             .map(|items| items.iter().map(Self::map_album).collect())
             .unwrap_or_default();
         Ok(albums)
+    }
+    /// #9119 — les playlists éditoriales d'un genre TIDAL
+    /// (`/genres/{path}/playlists`), que l'écran Genres demande à côté des
+    /// albums (`/featured-playlists?genre=`, #5313). Sans elles, un genre que
+    /// TIDAL ne garnit que de playlists — les genres locaux qu'ajoute le pays
+    /// du catalogue — ouvrait une page vide.
+    ///
+    /// Seule la forme « genre sans tag » est servie ; les autres rendent ce
+    /// qu'elles rendaient (liste vide). Une playlist de genre est un
+    /// complément : un refus de TIDAL laisse la bande absente, il ne fait pas
+    /// échouer l'écran (les albums du genre disent déjà l'erreur).
+    async fn get_featured_playlists(
+        &self,
+        tag: Option<&str>,
+        genre: Option<&str>,
+    ) -> Result<Vec<StreamPlaylist>, TuneError> {
+        let (None, Some(genre_id)) = (tag, genre.filter(|g| !g.is_empty())) else {
+            return Ok(vec![]);
+        };
+        let data = self
+            .api_get(&format!(
+                "/genres/{}/playlists?limit=50",
+                urlencoding::encode(genre_id)
+            ))
+            .await?;
+        if let Some(refus) = Self::refus_de_tidal(&data) {
+            warn!(genre = %genre_id, pays = %self.pays_effectif(), refus = %refus, "tidal_genre_playlists_refuse");
+            return Ok(vec![]);
+        }
+        Ok(data["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(Self::map_playlist)
+                    .filter(|p| !p.id.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     async fn get_featured_sections(&self) -> Result<Vec<FeaturedSection>, TuneError> {
@@ -6210,6 +6293,10 @@ mod pour_vous_8935_tests;
 #[cfg(test)]
 #[path = "tidal_mixes_7822_tests.rs"]
 mod mixes_7822_tests;
+// #9119 — genres du pays du catalogue : refus de TIDAL et playlists du genre.
+#[cfg(test)]
+#[path = "tidal_genres_du_pays_9119_tests.rs"]
+mod genres_du_pays_9119_tests;
 
 // #8481 — le pays du catalogue choisi dans les Réglages.
 #[cfg(test)]

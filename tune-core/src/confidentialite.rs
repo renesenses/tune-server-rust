@@ -15,7 +15,9 @@
 //!
 //! Ce qui est masqué :
 //! - les adresses électroniques, en clair ou encodées (`%40`) → `<email>` ;
-//! - les identifiants d'une URL (`scheme://user:pass@hôte`) ;
+//! - les identifiants d'une URL (`scheme://user:pass@hôte`) et la valeur de ses
+//!   paramètres sensibles (`?user=…&pass=…`), par [`masquer_url`], qui sert
+//!   aussi aux lignes du journal lui-même ;
 //! - les chemins personnels `/Users/<nom>`, `/home/<nom>`, `C:\Users\<nom>` → `~` ;
 //! - les valeurs des clés secrètes (`token`, `secret`, `password`, `sig`,
 //!   `hmac`, `serial`, `username`…) écrites `clé=valeur`, `clé: valeur` ou en
@@ -132,10 +134,12 @@ fn re(motif: &str) -> Regex {
     Regex::new(motif).expect("motif de confidentialité valide")
 }
 
-/// `scheme://utilisateur:motdepasse@` — avant l'adresse électronique, qui
-/// sinon prendrait `motdepasse@hôte.fr` pour une adresse.
+/// `scheme://utilisateur:motdepasse@` (ou `scheme://jeton@`) — avant
+/// l'adresse électronique, qui sinon prendrait `motdepasse@hôte.fr` pour une
+/// adresse. L'information d'utilisateur s'arrête au premier `/`, `?` ou `#` :
+/// un `@` plus loin (`?email=a@b.fr`) n'en fait pas partie.
 static RE_URL_IDENTIFIANTS: LazyLock<Regex> =
-    LazyLock::new(|| re(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@"));
+    LazyLock::new(|| re(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@?#]+@"));
 
 /// JSON Web Token : trois segments base64url dont les deux premiers
 /// commencent par `eyJ` (`{"`).
@@ -148,13 +152,111 @@ static RE_JWT: LazyLock<Regex> =
 static RE_PORTEUR: LazyLock<Regex> =
     LazyLock::new(|| re(r"(?i)\b(bearer|basic)\s+([A-Za-z0-9._~+/=-]{6,})"));
 
-/// Paramètres d'URL sensibles, quel que soit leur nom de clé ailleurs — en
-/// requête (`?`, `&`) comme en fragment (`#token=…`).
+/// Noms de paramètres d'URL dont la VALEUR ne sort jamais : identifiants,
+/// mots de passe, jetons, clés, signatures, sessions. Comparés en entier et
+/// sans égard à la casse (`Pass=`, `API_KEY=`) ; le nom reste écrit, seule
+/// la valeur devient [`MASQUE`]. Une seule liste, lue par [`masquer_url`].
+pub const PARAMETRES_URL_SENSIBLES: &[&str] = &[
+    "user",
+    "username",
+    "user_name",
+    "login",
+    "pass",
+    "passwd",
+    "password",
+    "pwd",
+    "token",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "auth_token",
+    "user_auth_token",
+    "__token__",
+    "key",
+    "api_key",
+    "apikey",
+    "secret",
+    "client_secret",
+    "app_secret",
+    "sig",
+    "request_sig",
+    "signature",
+    "x-amz-signature",
+    "x-amz-credential",
+    "x-amz-security-token",
+    "hdnea",
+    "hdntl",
+    "hmac",
+    "auth",
+    "session",
+    "session_id",
+    "sessionid",
+    "sid",
+    "code",
+    "state",
+    "identity",
+];
+
+/// Paramètres d'URL sensibles ([`PARAMETRES_URL_SENSIBLES`]) — en requête
+/// (`?`, `&`, le `;` d'un `&amp;`) comme en fragment (`#token=…`). La valeur
+/// s'arrête au paramètre suivant, à un blanc, ou au guillemet qui ferme un
+/// champ de journal (`url="…&pass=x"`).
 static RE_PARAMETRE_URL: LazyLock<Regex> = LazyLock::new(|| {
-    re(
-        r"(?i)([?&#](?:code|state|key|token|sig|hmac|auth|access_token|refresh_token|user_auth_token|app_secret|request_sig|password|session|identity)=)[^&\s#]+",
-    )
+    let noms = PARAMETRES_URL_SENSIBLES
+        .iter()
+        .map(|n| regex::escape(n))
+        .collect::<Vec<_>>()
+        .join("|");
+    re(&format!(r#"(?i)([?&#;](?:{noms})=)[^&\s#"'<>]+"#))
 });
+
+/// Masque les identifiants d'une URL — ou de toutes les URL d'un texte — en
+/// gardant le reste lisible pour le diagnostic :
+/// - l'information d'utilisateur : `scheme://user:pass@hôte` → `scheme://********@hôte` ;
+/// - la valeur des paramètres sensibles ([`PARAMETRES_URL_SENSIBLES`]) :
+///   `?user=bob&pass=x&format=mp3` → `?user=********&pass=********&format=mp3`.
+///
+/// Toute ligne de journal qui porte une adresse de flux ou d'API passe par
+/// ici, et le nettoyage des exports ([`anonymiser`], [`masquer_acces_distant`])
+/// aussi : une seule règle. Ne panique jamais — un texte qui n'est pas une
+/// URL ressort tel quel — et est idempotente.
+pub fn masquer_url(url: &str) -> String {
+    let t = RE_URL_IDENTIFIANTS.replace_all(url, format!("${{1}}{MASQUE}@"));
+    RE_PARAMETRE_URL
+        .replace_all(&t, format!("${{1}}{MASQUE}"))
+        .into_owned()
+}
+
+/// Un écrivain de journal qui passe chaque écriture par [`masquer_url`] avant
+/// de la confier à l'écrivain d'origine.
+///
+/// `tracing-subscriber` formate un événement entier puis l'écrit d'un seul
+/// `write_all` : une écriture est une ligne complète, le motif la voit en
+/// entier. C'est le filet des lignes qui citent une adresse sans passer par
+/// [`masquer_url`] (le texte d'une erreur HTTP, qui reprend l'URL demandée).
+pub struct EcrivainMasque<W>(pub W);
+
+impl<W: std::io::Write> std::io::Write for EcrivainMasque<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let a_regarder = buf.windows(3).any(|w| w == b"://")
+            || buf.iter().any(|b| matches!(b, b'?' | b'&' | b'#' | b';'));
+        if !a_regarder {
+            return self.0.write(buf);
+        }
+        match std::str::from_utf8(buf) {
+            Ok(texte) => {
+                self.0.write_all(masquer_url(texte).as_bytes())?;
+                Ok(buf.len())
+            }
+            // Un caractère coupé en deux écritures : rien à reconnaître.
+            Err(_) => self.0.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
 
 /// Adresse du pont : `bridge.mozaiklabs.fr/<identifiant>/…`. Le chemin désigne
 /// un serveur précis ; seul l'hôte reste.
@@ -509,7 +611,7 @@ fn acces_distant(texte: &str, prives: &[String]) -> String {
             format!("{}/{MASQUE}", &c[1])
         }
     });
-    let t = RE_URL_IDENTIFIANTS.replace_all(&t, format!("${{1}}{MASQUE}@"));
+    let t = masquer_url(&t);
     let t = RE_JWT.replace_all(&t, MASQUE);
     let t = RE_PORTEUR.replace_all(&t, |c: &Captures| {
         let jeton = &c[2];
@@ -519,7 +621,6 @@ fn acces_distant(texte: &str, prives: &[String]) -> String {
             c[0].to_string()
         }
     });
-    let t = RE_PARAMETRE_URL.replace_all(&t, format!("${{1}}{MASQUE}"));
     RE_CLE_VALEUR
         .replace_all(&t, |c: &Captures| {
             if est_acces_distant(&c[1]) {
@@ -1070,6 +1171,116 @@ mod tests {
         ] {
             assert!(sortie.contains(garde), "« {garde} » a disparu : {sortie}");
         }
+    }
+
+    // ---- masquer_url : la règle unique des URL journalisées ----
+
+    #[test]
+    fn masquer_url_masque_l_information_d_utilisateur() {
+        assert_eq!(
+            masquer_url("http://jdupont:s3cret@flux.example.test:8000/live.mp3"),
+            format!("http://{MASQUE}@flux.example.test:8000/live.mp3")
+        );
+        // Un jeton seul, sans mot de passe, est aussi une information d'utilisateur.
+        assert_eq!(
+            masquer_url("https://abc123jeton@cdn.example.test/a.flac"),
+            format!("https://{MASQUE}@cdn.example.test/a.flac")
+        );
+        // Un `@` dans la requête n'est pas une information d'utilisateur.
+        assert_eq!(
+            masquer_url("https://hote.test/p?format=mp3&contact=a@b.test"),
+            "https://hote.test/p?format=mp3&contact=a@b.test"
+        );
+    }
+
+    #[test]
+    fn masquer_url_masque_les_parametres_sensibles_quelle_que_soit_la_casse() {
+        let url = "http://streams.example.test/live/jazz_128?User=alice&PASS=secret&Token=t0k&api_KEY=k&sig=s&Format=mp3";
+        let propre = masquer_url(url);
+        assert_eq!(
+            propre,
+            format!(
+                "http://streams.example.test/live/jazz_128?User={MASQUE}&PASS={MASQUE}&Token={MASQUE}&api_KEY={MASQUE}&sig={MASQUE}&Format=mp3"
+            )
+        );
+        for nom in PARAMETRES_URL_SENSIBLES {
+            let u = format!("https://h.test/x?a=1&{nom}=valeur-secrete&b=2");
+            let p = masquer_url(&u);
+            assert!(
+                !p.contains("valeur-secrete"),
+                "« {nom} » n'est pas masqué : {p}"
+            );
+            assert!(p.contains(&format!("&{nom}={MASQUE}&b=2")), "{p}");
+        }
+        // Fragment, `&amp;` et champ de journal entre guillemets.
+        assert_eq!(
+            masquer_url(r#"url="https://h.test/x?a=1&amp;pass=zz" suite"#),
+            format!(r#"url="https://h.test/x?a=1&amp;pass={MASQUE}" suite"#)
+        );
+        assert_eq!(
+            masquer_url("https://h.test/#access_token=abc&x=1"),
+            format!("https://h.test/#access_token={MASQUE}&x=1")
+        );
+    }
+
+    #[test]
+    fn masquer_url_laisse_intacte_une_url_sans_secret() {
+        for url in [
+            "http://ice.example.test:8000/radio.mp3",
+            "https://api.example.test/v1/tracks/123?format=flac&quality=27&passage=1&user_id=42",
+            "http://192.168.1.20:49152/desc.xml",
+            "",
+            "pas une url du tout",
+        ] {
+            assert_eq!(masquer_url(url), url);
+        }
+    }
+
+    #[test]
+    fn masquer_url_ne_panique_pas_et_reste_idempotente() {
+        for brut in [
+            "://@",
+            "http://",
+            "?pass=",
+            "?pass",
+            "http://@@@/?&&&pass==x#user=#",
+            "héhé://ü:ö@ä/?pass=ß",
+            "\u{0}\u{ffff}?token=\u{1F3B5}",
+        ] {
+            let une = masquer_url(brut);
+            assert_eq!(
+                masquer_url(&une),
+                une,
+                "masquer deux fois change « {brut} »"
+            );
+        }
+        assert!(!masquer_url("héhé://ü:ö@ä/?pass=ß").contains('ß'));
+    }
+
+    #[test]
+    fn l_export_masque_les_parametres_d_une_url_de_flux() {
+        let ligne = "INFO radio_local_decode_stream_connected url=http://s.example.test/a?user=alice&pass=secret content_type=audio/mpeg";
+        for sortie in [anonymiser_avec(ligne, None), masquer_acces_distant(ligne)] {
+            assert!(!sortie.contains("secret"), "{sortie}");
+            assert!(!sortie.contains("alice"), "{sortie}");
+            assert!(sortie.contains("content_type=audio/mpeg"), "{sortie}");
+        }
+    }
+
+    #[test]
+    fn l_ecrivain_masque_chaque_ligne_ecrite() {
+        use std::io::Write;
+        let mut sortie = EcrivainMasque(Vec::new());
+        sortie
+            .write_all(b"WARN radio HTTP fetch failed: error sending request for url (http://u:p@h.test/s?pass=secret)\n")
+            .unwrap();
+        sortie.write_all(b"INFO rien a cacher\n").unwrap();
+        let texte = String::from_utf8(sortie.0).unwrap();
+        assert!(
+            !texte.contains("secret") && !texte.contains("u:p@"),
+            "{texte}"
+        );
+        assert!(texte.contains("INFO rien a cacher"), "{texte}");
     }
 
     /// #9140 — de bout en bout, par la porte du rapport : les noms retenus et

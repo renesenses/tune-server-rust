@@ -54,16 +54,6 @@ pub fn blocking_builder() -> reqwest::blocking::ClientBuilder {
         .http1_max_headers(MAX_ENTETES_HTTP1)
 }
 
-/// Décrit une erreur `reqwest` pour un journal, **sans son URL** et avec la
-/// chaîne de ses causes (#5553, #5522).
-///
-/// Une URL de CDN signée porte ses paramètres d'autorisation : elle ne doit
-/// pas finir dans un journal qu'un testeur publie. `reqwest::Error` l'écrit
-/// pourtant dans son `Display` (« error sending request for url (…) »), et
-/// s'arrête là : la cause réelle — connexion fermée avant la réponse, remise
-/// à zéro, TLS — n'apparaît que dans ses `source()`. Ce texte garde la nature
-/// de l'erreur, ajoute chaque cause, et laisse l'URL de côté : l'URL vit à
-/// part dans l'erreur, aucune cause ne la recopie.
 /// Une adresse de flux pour le journal ou un message d'erreur : le SCHÉMA et
 /// l'HÔTE seulement (`https://hôte/…`). Un jeton signé ne vit pas que dans la
 /// requête (`?token=…`) : Akamai le met dans le chemin (`/hdntl=…~hmac=…/`),
@@ -88,6 +78,16 @@ pub fn url_pour_journal(url: &str) -> String {
     }
 }
 
+/// Décrit une erreur `reqwest` pour un journal, **sans son URL** et avec la
+/// chaîne de ses causes (#5553, #5522).
+///
+/// Une URL de CDN signée porte ses paramètres d'autorisation : elle ne doit
+/// pas finir dans un journal qu'un testeur publie. `reqwest::Error` l'écrit
+/// pourtant dans son `Display` (« error sending request for url (…) »), et
+/// s'arrête là : la cause réelle — connexion fermée avant la réponse, remise
+/// à zéro, TLS — n'apparaît que dans ses `source()`. Ce texte garde la nature
+/// de l'erreur, ajoute chaque cause, et laisse l'URL de côté : l'URL vit à
+/// part dans l'erreur, aucune cause ne la recopie.
 pub fn decrire_erreur_http(error: &reqwest::Error) -> String {
     let nature = if error.is_timeout() {
         "timeout"

@@ -355,11 +355,46 @@ async fn delete_playlist(
     Path(id): Path<i64>,
 ) -> impl IntoResponse {
     let repo = PlaylistRepo::with_backend(state.backend.clone());
-    match repo.delete_for_profile(id, profile.id()) {
+    match supprimer_et_journaliser(&repo, id, profile.id()) {
         Ok(true) => StatusCode::NO_CONTENT.into_response(),
         Ok(false) => StatusCode::NOT_FOUND.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
+}
+
+/// web#3090 (fil 2849) — la suppression d'une playlist laisse une trace.
+///
+/// Une playlist « disparue » ne se distinguait pas d'une playlist supprimée
+/// d'un clic de trop : `DELETE /playlists/{id}` est la seule voie qui efface
+/// une ligne de `playlists`, et elle ne journalisait rien. Une ligne INFO
+/// `playlist_supprimee` dit désormais quoi (identifiant, nombre de lignes),
+/// pour qui (profil) et quand (l'horodatage du journal). Le nom de la
+/// playlist n'y figure PAS (web#3090) : il est choisi par l'utilisateur et
+/// n'a pas à sortir dans les journaux ; l'identifiant suffit à la retrouver.
+///
+/// La playlist est lue AVANT la suppression, sous la même garde de profil :
+/// après, il n'y a plus rien à lire. Une lecture en échec ne bloque pas la
+/// suppression ; la ligne garde alors l'identifiant et le profil. Rien n'est
+/// journalisé quand rien n'est supprimé (404, erreur de base).
+pub(crate) fn supprimer_et_journaliser(
+    repo: &PlaylistRepo,
+    id: i64,
+    profile_id: i64,
+) -> Result<bool, String> {
+    let avant = repo.get_for_profile(id, profile_id).ok().flatten();
+    let supprimee = repo.delete_for_profile(id, profile_id)?;
+    if supprimee {
+        match avant {
+            Some(p) => tracing::info!(
+                playlist_id = id,
+                profile_id,
+                lignes = p.track_count,
+                "playlist_supprimee"
+            ),
+            None => tracing::info!(playlist_id = id, profile_id, "playlist_supprimee"),
+        }
+    }
+    Ok(supprimee)
 }
 
 /// Les lignes d'une playlist, locales ET de service (#4889), dans l'ordre et
@@ -2728,6 +2763,10 @@ mod import_audirvana_6998_tests;
 #[cfg(test)]
 #[path = "playlists/durees_titres_de_service_tests.rs"]
 mod durees_titres_de_service_tests;
+
+#[cfg(test)]
+#[path = "playlists/suppression_journal_3090_tests.rs"]
+mod suppression_journal_3090_tests;
 
 #[cfg(test)]
 #[path = "playlists/fiche_memorisee_8892_tests.rs"]

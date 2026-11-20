@@ -524,3 +524,63 @@ fn aucun_corps_de_reponse_oauth_ni_code_d_appareil_au_journal() {
         assert!(!source.contains(interdit), "tidal.rs : « {interdit} »");
     }
 }
+
+// ---------------------------------------------------------------------------
+// 7. Journal : MPD et nom du compte
+// ---------------------------------------------------------------------------
+
+const MPD_SIGNE: &str = r#"<?xml version="1.0"?>
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011"><Period><AdaptationSet>
+<Representation id="x" codecs="flac"><SegmentTemplate initialization="https://sp-ad-fa.audio.tidal.invalid/mt/0.mp4?token=JETON-MPD-INIT" media="https://sp-ad-fa.audio.tidal.invalid/mt/$Number$.mp4?token=JETON-MPD-MEDIA"/>
+<BaseURL>https://ak.cdn.invalid/hdntl=exp=1~hmac=JETON-MPD-CHEMIN/</BaseURL>"#;
+
+#[test]
+fn l_extrait_du_manifeste_ne_garde_que_les_hotes() {
+    let extrait = extrait_de_manifeste_pour_journal(MPD_SIGNE);
+    assert!(!extrait.contains("JETON-MPD"), "{extrait}");
+    assert!(
+        extrait.contains("sp-ad-fa.audio.tidal.invalid"),
+        "{extrait}"
+    );
+    assert!(extrait.contains("<MPD"), "{extrait}");
+    // Contre-épreuve : les 500 premiers caractères bruts portent les jetons.
+    let brut: String = MPD_SIGNE.chars().take(500).collect();
+    assert!(brut.contains("JETON-MPD-INIT"));
+}
+
+/// Un MPD illisible, aux adresses signées : ni le WARN ni le debug ne
+/// recopient un jeton. Contre-épreuve : le manifeste servi les porte.
+#[tokio::test]
+async fn un_manifeste_illisible_ne_livre_pas_ses_jetons_au_journal() {
+    let (journal, _garde) = capturer();
+    // Pas de `</MPD>` ni de représentation exploitable : l'analyse échoue.
+    let mpd = format!("{MPD_SIGNE} tronqué");
+    let mut reponse = v1("FULL");
+    reponse["manifestMimeType"] = json!("application/dash+xml");
+    reponse["manifest"] = json!(base64::engine::general_purpose::STANDARD.encode(&mpd));
+    assert!(mpd.contains("JETON-MPD-INIT"), "contre-épreuve");
+    let (svc, _) = faux_tidal(reponse).await;
+    let _ = svc.get_track_url("1", Some("LOSSLESS")).await;
+    let texte = journal.texte();
+    assert!(
+        texte.contains("tidal_dash_manifest_raw"),
+        "capture : {texte}"
+    );
+    assert!(!texte.contains("JETON-MPD"), "{texte}");
+}
+
+/// `tidal_user_refreshed` ne journalise pas le nom du compte (souvent un
+/// e-mail). Contre-épreuve : le service l'a bien lu.
+#[tokio::test]
+async fn le_nom_du_compte_ne_passe_pas_au_journal() {
+    let (journal, _garde) = capturer();
+    let (mut svc, _) = faux_tidal(v1("FULL")).await;
+    svc.refresh_user_info().await;
+    assert_eq!(svc.username.as_deref(), Some("temoin"));
+    let texte = journal.texte();
+    let ligne = texte
+        .lines()
+        .find(|l| l.contains("tidal_user_refreshed"))
+        .unwrap_or_else(|| panic!("capture : {texte}"));
+    assert!(!ligne.contains("temoin"), "{ligne}");
+}
