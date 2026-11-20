@@ -208,8 +208,11 @@ pub(crate) fn chemin_tess_de_la_zone(
         }
     };
     let catalogue = catalogue_de_reference();
+    // Les paquets du catalogue (`crossfeed-pro`, `crosstalk`) sont des
+    // greffons natifs TIERS, hors des emplacements de `premium_plugins` :
+    // disponibles s'ils sont demandés ET chargés, comme pour l'étage casque.
     let disponible = |id: &str| match catalogue.get(id).map(|d| d.origin) {
-        Some(Origine::Package) => tune_core::audio::premium_plugins::enabled(&settings, id),
+        Some(Origine::Package) => tune_core::audio::natifs_tiers::actif(&settings, id),
         Some(_) => true,
         None => false,
     };

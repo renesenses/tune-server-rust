@@ -87,6 +87,10 @@ pub mod secrets;
 pub mod sendspin;
 /// #6336 — substitution des programmes externes en construction de tests.
 pub mod services_factices;
+/// #6522, TESS T16 — greffon natif de test construit et chargé par le banc.
+#[cfg(any(test, feature = "services-factices"))]
+#[doc(hidden)]
+pub mod greffon_natif_de_test;
 pub mod services_manager;
 pub mod skins;
 pub mod sleep_timer;

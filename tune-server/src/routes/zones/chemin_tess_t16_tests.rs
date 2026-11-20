@@ -462,3 +462,77 @@ fn sortie_reseau_volume_de_l_appareil_et_repli_mono_inerte() {
         assert_eq!(sp["bit_perfect"], true, "{sp}");
     }
 }
+
+// ── #9160 — un paquet du catalogue (Crosstalk, Crossfeed Pro) est un greffon
+// natif TIERS : disponible s'il est demandé ET chargé (`natifs_tiers::actif`),
+// jamais jugé par les emplacements de `premium_plugins`, qui l'ignorent. ──
+
+/// Coche le paquet `id` sur la zone comme le fait l'interface : installé,
+/// activé, réglage de zone `enabled: true`.
+fn cocher_le_paquet(backend: &Arc<dyn DbBackend>, zone_id: i64, id: &str) {
+    let s = SettingsRepo::with_backend(backend.clone());
+    s.set(&format!("plugin_{id}_installed"), "true").unwrap();
+    s.set(&format!("plugin_{id}_enabled"), "true").unwrap();
+    s.set(
+        &tune_core::audio::natifs_tiers::cle_de_zone(zone_id, id),
+        r#"{"enabled":true}"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn crosstalk_charge_et_en_service_est_effectif_dans_le_vrai_chemin_9160() {
+    // Une VRAIE bibliothèque native inscrite sous l'identifiant `crosstalk`.
+    let (_ids, _dossier) =
+        tune_core::greffon_natif_de_test::enregistrer_les_bibliotheques_de_test(&["crosstalk"]);
+    let b = base();
+    let z = zone(&b, "local", "local:dac", 100.0);
+    let zid = z.id.unwrap();
+    cocher_le_paquet(&b, zid, "crosstalk");
+    let s = SettingsRepo::with_backend(b.clone());
+    // Le moteur historique le porte bien : c'est l'étage casque de la zone.
+    assert_eq!(
+        tune_core::audio::natifs_tiers::greffon_de_crossfeed_de_la_zone(&s, zid).as_deref(),
+        Some("crosstalk")
+    );
+    let (_, tess) = les_deux(
+        &b,
+        &z,
+        &en_lecture(OutputDspState::Applied, OutputVolumeState::Unity),
+    );
+    let ct = etape_du_greffon(&tess, "crosstalk");
+    assert_eq!(ct["effective"], true, "{tess}");
+    assert!(ct["reason"].is_null(), "{ct}");
+    assert_eq!(tess["badge"], "processed_by_tess", "{tess}");
+
+    // Contre-épreuve 1 : désactivé dans Greffons (`plugin_crosstalk_enabled`
+    // = false), la bibliothèque toujours chargée → indisponible.
+    s.set("plugin_crosstalk_enabled", "false").unwrap();
+    let (_, tess) = les_deux(
+        &b,
+        &z,
+        &en_lecture(OutputDspState::Inactive, OutputVolumeState::Unity),
+    );
+    let ct = etape_du_greffon(&tess, "crosstalk");
+    assert_eq!(ct["effective"], false, "{tess}");
+    assert_eq!(ct["reason"], "plugin_unavailable", "{ct}");
+}
+
+#[test]
+fn crossfeed_pro_installe_mais_non_charge_reste_indisponible_9160() {
+    // Contre-épreuve 2 : installé et coché, mais aucune bibliothèque
+    // `crossfeed-pro` chargée dans ce processus → indisponible, pas effectif.
+    assert!(tune_plugin_native::provider("crossfeed-pro").is_none());
+    let b = base();
+    let z = zone(&b, "local", "local:dac", 100.0);
+    let zid = z.id.unwrap();
+    cocher_le_paquet(&b, zid, "crossfeed-pro");
+    let (_, tess) = les_deux(
+        &b,
+        &z,
+        &en_lecture(OutputDspState::Inactive, OutputVolumeState::Unity),
+    );
+    let cp = etape_du_greffon(&tess, "crossfeed-pro");
+    assert_eq!(cp["effective"], false, "{tess}");
+    assert_eq!(cp["reason"], "plugin_unavailable", "{cp}");
+}
