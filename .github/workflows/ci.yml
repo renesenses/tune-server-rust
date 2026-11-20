@@ -323,7 +323,7 @@ jobs:
     needs: impact
     if: needs.impact.outputs.rust == 'true'
     runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
-    timeout-minutes: 75  # test — 37 à 45 min observées début novembre (45 dépassé, PR #7711 et #7727)
+    timeout-minutes: ${{ vars.RUNNER_LINUX && 180 || 75 }}  # test — 37 à 45 min observées début novembre (45 dépassé, PR #7711 et #7727) ; > 75 min sur Shrek à 4 cœurs (run 44792749729) : 180 sur runner auto-hébergé
     # 02/11 (train rc10) : le runner tuait le job en pleine compilation (143)
     # ou le coupait a 45 min. Sans info de debogage et a 2 compilations en
     # parallele, memoire et disque restent sous les limites du runner.
