@@ -38,6 +38,20 @@ struct RadioConsumerGuard {
     /// first). That is an expected, internal end — not a client disconnect — so
     /// the Drop path stays quiet about it.
     superseded: bool,
+    /// #8926 — ce corps a remis un bloc à hyper et attend d'être relancé
+    /// (voir `StreamSession::noter_ecriture_radio`).
+    en_ecriture: bool,
+}
+
+impl RadioConsumerGuard {
+    /// #8926 — à poser AVANT de remettre un bloc à hyper (`true`) et dès que
+    /// le corps est relancé (`false`).
+    fn ecriture(&mut self, entre: bool) {
+        if self.en_ecriture != entre {
+            self.en_ecriture = entre;
+            self.session.noter_ecriture_radio(entre);
+        }
+    }
 }
 
 /// Can this renderer consume a live radio stream as a chunked, length-less
@@ -212,6 +226,7 @@ impl RadioConsumerGuard {
             started: std::time::Instant::now(),
             completed: false,
             superseded: false,
+            en_ecriture: false,
         }
     }
 }
@@ -219,6 +234,8 @@ impl RadioConsumerGuard {
 impl Drop for RadioConsumerGuard {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
+        // Un corps lâché pendant qu'il attendait hyper ne l'attend plus.
+        self.ecriture(false);
         let remaining = self
             .session
             .active_consumers
@@ -1267,6 +1284,71 @@ pub async fn handle_stream(
             // one stops without pulling a further chunk, so no chunk is split,
             // lost, or duplicated at the hand-off.
             let my_epoch = session.claim_channel_consumer();
+
+            // ── #8926 — la sonde de `Lavf` ne doit plus emporter l'avance ──
+            //
+            // .18, 17/11, FIP → Eversolo DMP-A8 : le renderer ouvre le flux
+            // (`bytes=0-`), en tire 1 058 924 octets en 1,49 s — la réserve
+            // de 3 s de #1628 et la rafale d'icecast, 5,5 s d'audio — puis se
+            // ferme et revient avec `bytes=0-`. Cette seconde connexion, la
+            // vraie lecture, ne recevait que le DIRECT : l'avance était
+            // partie dans la sonde, le renderer remplissait sa mémoire au
+            // rythme réel avant de jouer. Une lecture qui demande le début
+            // reçoit donc d'abord la tête du direct, d'un trait — ce que fait
+            // le « burst-on-connect » d'icecast —, puis la suite du canal,
+            // sans trou ni doublon (voir `StreamSession::tete_du_direct`). La
+            // première connexion n'y voit rien (la tête est vide) ; une reprise
+            // `bytes=N-` non plus (#3513 : un navigateur qui reprend après
+            // l'en-tête ne doit pas réentendre ce qu'il a déjà joué).
+            if reprise_bornee.is_none() && range_demande.unwrap_or(0) == 0 {
+                match session.tete_du_direct().await {
+                    tune_core::http::streamer::TeteRejouable::Blocs(blocs) if !blocs.is_empty() => {
+                        info!(
+                            stream_id = %session.id,
+                            blocs = blocs.len(),
+                            octets = blocs.iter().map(Vec::len).sum::<usize>(),
+                            agent = %agent_journal,
+                            "radio_tete_du_direct_rejouee — une lecture demande le DÉBUT après \
+                             qu'une connexion précédente a tiré l'avance : elle la reçoit d'un \
+                             trait, puis le direct (#8926)"
+                        );
+                        for mut chunk in blocs {
+                            if !session.is_current_channel_consumer(my_epoch) {
+                                break;
+                            }
+                            if remplissage_de_phase > 0 {
+                                let mut complet = vec![0u8; remplissage_de_phase];
+                                complet.extend_from_slice(&chunk);
+                                chunk = complet;
+                                remplissage_de_phase = 0;
+                            }
+                            guard.ecriture(true);
+                            if has_icy {
+                                for part in decoupe_icy(
+                                    &chunk,
+                                    &mut bytes_since_meta,
+                                    &bloc_icy_courant,
+                                ) {
+                                    yield Ok(part);
+                                }
+                            } else {
+                                yield Ok(bytes::Bytes::from(chunk));
+                            }
+                            guard.ecriture(false);
+                        }
+                    }
+                    tune_core::http::streamer::TeteRejouable::Depassee => {
+                        info!(
+                            stream_id = %session.id,
+                            agent = %agent_journal,
+                            "radio_tete_du_direct_depassee — plus de {} s déjà servies : \
+                             la lecture reprend au direct (#8926)",
+                            tune_core::http::streamer::TETE_DU_DIRECT_SECONDES
+                        );
+                    }
+                    _ => {}
+                }
+            }
             loop {
                 // Subscribe to the supersede signal and register the waiter
                 // BEFORE checking the epoch. The epoch bump in
@@ -1297,7 +1379,7 @@ pub async fn handle_stream(
                     // drop the recv future unread, leaving the chunk in the
                     // channel for the new owner.
                     _ = &mut superseded => continue,
-                    maybe_chunk = session.recv_chunk() => {
+                    maybe_chunk = session.recv_chunk_radio() => {
                         match maybe_chunk {
                             // Le direct passe TOUJOURS par cette boucle-ci, ICY
                             // ou pas : c'est elle qui tient le canal PCM à un
@@ -1314,6 +1396,7 @@ pub async fn handle_stream(
                                     chunk = complet;
                                     remplissage_de_phase = 0;
                                 }
+                                guard.ecriture(true);
                                 if has_icy {
                                     for part in decoupe_icy(
                                         &chunk,
@@ -1325,6 +1408,7 @@ pub async fn handle_stream(
                                 } else {
                                     yield Ok(bytes::Bytes::from(chunk));
                                 }
+                                guard.ecriture(false);
                             }
                             None => {
                                 // recv returned None → the PCM channel was closed
@@ -7343,6 +7427,10 @@ mod safari_radio_5975_tests {
 
 #[cfg(test)]
 mod reprise_chunkee_aac_6990;
+
+// #8926 — banc du démarrage d'une radio : faux icecast, faux renderer Lavf.
+#[cfg(test)]
+mod radio_demarrage_8926;
 
 #[cfg(test)]
 mod multichannel_7275_tests;

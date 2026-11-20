@@ -530,6 +530,16 @@ pub struct StreamSession {
     /// counter surfaces that case for diagnostics (a renderer that re-requests
     /// without closing its first connection — DMP-A8 FIP silent-after-reconnect).
     pub active_consumers: std::sync::atomic::AtomicU32,
+    /// #8926 — connexions radio dont le corps a remis un bloc à hyper et
+    /// n'a pas été relancé depuis : le renderer ne lit plus (tampon TCP
+    /// plein). Un tel corps ne peut pas voir qu'on le congédie avant que le
+    /// renderer ne lise de nouveau. Tenu par `RadioConsumerGuard`.
+    pub consommateurs_radio_en_ecriture: std::sync::atomic::AtomicU32,
+    /// #8926 — la TÊTE du direct : les premiers blocs PCM tirés du canal
+    /// d'une radio, au plus [`TETE_DU_DIRECT_SECONDES`]. Une sonde `Lavf`
+    /// emporte l'avance (réserve de #1628 + rafale d'icecast) puis se ferme ;
+    /// la lecture qui suit la reçoit de nouveau, d'un trait.
+    tete_du_direct: std::sync::Mutex<TeteDuDirect>,
     /// The local-output watchdog is armed at most once for this session. A
     /// session prepared for gapless remains unarmed until its URL is actually
     /// handed to the local output.
@@ -837,6 +847,8 @@ impl StreamSession {
             gc_active_at_ms: std::sync::atomic::AtomicU64::new(0),
             fichiers_prepares: std::sync::atomic::AtomicU32::new(0),
             active_consumers: std::sync::atomic::AtomicU32::new(0),
+            consommateurs_radio_en_ecriture: std::sync::atomic::AtomicU32::new(0),
+            tete_du_direct: std::sync::Mutex::new(TeteDuDirect::default()),
             consumer_watch_armed: std::sync::atomic::AtomicBool::new(false),
             consumer_epoch: std::sync::atomic::AtomicU64::new(0),
             channel_was_full: std::sync::atomic::AtomicBool::new(false),
@@ -937,6 +949,61 @@ impl StreamSession {
 
     pub async fn recv_chunk(&self) -> Option<Vec<u8>> {
         self.rx.lock().await.recv().await
+    }
+
+    /// #8926 — tire un bloc du canal d'une radio et, tant que la tête du
+    /// direct n'est pas pleine, l'y garde. Sous le verrou du récepteur : la
+    /// tête contient, dans l'ordre exact du canal, tout ce qui en est sorti.
+    pub async fn recv_chunk_radio(&self) -> Option<Vec<u8>> {
+        let mut rx = self.rx.lock().await;
+        let bloc = rx.recv().await?;
+        let plafond = self.plafond_de_la_tete();
+        if let Ok(mut tete) = self.tete_du_direct.lock() {
+            tete.garder(&bloc, plafond);
+        }
+        Some(bloc)
+    }
+
+    /// #8926 — ce que la tête du direct peut rejouer à une lecture qui
+    /// demande le DÉBUT. Pris sous le verrou du récepteur, après que la
+    /// connexion a réclamé le canal : aucun bloc ne peut sortir du canal
+    /// entre le dernier bloc rendu ici et le premier que cette connexion
+    /// tirera elle-même — ni trou ni doublon à la jonction.
+    pub async fn tete_du_direct(&self) -> TeteRejouable {
+        let _rx = self.rx.lock().await;
+        match self.tete_du_direct.lock() {
+            Ok(tete) if tete.depassee => TeteRejouable::Depassee,
+            Ok(tete) => TeteRejouable::Blocs(tete.blocs.clone()),
+            Err(_) => TeteRejouable::Blocs(Vec::new()),
+        }
+    }
+
+    fn plafond_de_la_tete(&self) -> u64 {
+        let info = self.effective_output_info();
+        let debit =
+            u64::from(info.sample_rate) * u64::from(info.channels) * u64::from(info.bit_depth / 8);
+        debit.max(1) * TETE_DU_DIRECT_SECONDES
+    }
+
+    /// #8926 — le corps radio vient de remettre un bloc à hyper (`entre`) ou
+    /// d'être relancé par lui (`!entre`).
+    pub fn noter_ecriture_radio(&self, entre: bool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if entre {
+            self.consommateurs_radio_en_ecriture.fetch_add(1, SeqCst);
+        } else {
+            let _ = self
+                .consommateurs_radio_en_ecriture
+                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1));
+        }
+    }
+
+    /// #8926 — vrai quand CHAQUE connexion encore accrochée à cette radio est
+    /// arrêtée sur l'écriture : le renderer ne lit plus rien.
+    pub fn consommateurs_radio_tous_en_ecriture(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let actifs = self.active_consumers.load(SeqCst);
+        actifs > 0 && self.consommateurs_radio_en_ecriture.load(SeqCst) >= actifs
     }
 
     /// #5426 — tire un bloc du canal, le POSITIONNE et le RETIENT, sous le
@@ -1257,6 +1324,48 @@ pub enum Relecture {
 }
 
 /// #5426 — fenêtre glissante des derniers blocs tirés du canal.
+/// #8926 — durée d'audio que la tête du direct d'une radio peut rejouer.
+///
+/// Sur le .18 (17/11, FIP → Eversolo DMP-A8), la sonde `Lavf` a emporté
+/// 1 058 924 octets, 5,5 s à 48 kHz/16 bits, avant de se fermer. Huit secondes
+/// la couvrent avec de la marge ; au-delà, la tête est abandonnée (mémoire
+/// rendue) et une lecture qui revient au début reçoit le direct, comme avant :
+/// une reprise après de longues secondes d'écoute ne réentend jamais le début.
+pub const TETE_DU_DIRECT_SECONDES: u64 = 8;
+
+#[derive(Default)]
+struct TeteDuDirect {
+    blocs: Vec<Vec<u8>>,
+    taille: u64,
+    depassee: bool,
+}
+
+impl TeteDuDirect {
+    fn garder(&mut self, bloc: &[u8], plafond: u64) {
+        if self.depassee {
+            return;
+        }
+        if self.taille + bloc.len() as u64 > plafond {
+            self.depassee = true;
+            self.blocs = Vec::new();
+            self.taille = 0;
+            return;
+        }
+        self.taille += bloc.len() as u64;
+        self.blocs.push(bloc.to_vec());
+    }
+}
+
+/// #8926 — ce que rend [`StreamSession::tete_du_direct`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TeteRejouable {
+    /// Les blocs déjà tirés du canal, depuis le premier (vide : rien n'est
+    /// encore sorti du canal, c'est la première connexion).
+    Blocs(Vec<Vec<u8>>),
+    /// Plus de [`TETE_DU_DIRECT_SECONDES`] sont déjà sorties : on ne rejoue rien.
+    Depassee,
+}
+
 #[derive(Default)]
 struct RetenueDuCanal {
     /// Position dans le flux du premier octet retenu.
