@@ -1307,9 +1307,27 @@ pub(crate) async fn lier_compte(
 /// Pages de bandcamp.com qui ne sont pas des profils de fan : leur premier
 /// segment ne devient pas un pseudo (`bandcamp.com/discover`, `/tag/jazz`).
 const CHEMINS_RESERVES_BANDCAMP: &[&str] = &[
-    "discover", "tag", "tags", "search", "about", "help", "artists", "login", "signup",
-    "settings", "feed", "dashboard", "music", "community", "gift_cards", "fan_signup", "daily",
-    "terms_of_use", "privacy", "contact", "guide",
+    "discover",
+    "tag",
+    "tags",
+    "search",
+    "about",
+    "help",
+    "artists",
+    "login",
+    "signup",
+    "settings",
+    "feed",
+    "dashboard",
+    "music",
+    "community",
+    "gift_cards",
+    "fan_signup",
+    "daily",
+    "terms_of_use",
+    "privacy",
+    "contact",
+    "guide",
 ];
 
 /// #9152 — tirer le pseudo d'une saisie telle qu'un auditeur la colle.
@@ -1340,7 +1358,12 @@ pub(crate) fn pseudo_de_la_saisie(brut: &str) -> Result<String, EchecLiaison> {
         // `bandcamp.com/<pseudo>`, `/` final toléré ; un onglet du profil
         // (`bandcamp.com/<pseudo>/wishlist`) rend aussi `<pseudo>`.
         match chemin.and_then(|c| c.split('/').next()) {
-            Some(p) if !p.is_empty() && !CHEMINS_RESERVES_BANDCAMP.contains(&p.to_ascii_lowercase().as_str()) => p,
+            Some(p)
+                if !p.is_empty()
+                    && !CHEMINS_RESERVES_BANDCAMP.contains(&p.to_ascii_lowercase().as_str()) =>
+            {
+                p
+            }
             _ => return Err(EchecLiaison::PseudoInvalide),
         }
     } else if let Some(sous_domaine) = hote_min.strip_suffix(".bandcamp.com") {
