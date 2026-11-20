@@ -242,23 +242,41 @@ fn maintenant() -> u64 {
 }
 
 /// Une URL signée est un secret le temps de sa validité, et ce message part
-/// dans un journal et une réponse d'API : toute requête (`?…`) d'une adresse
-/// est remplacée par `?…`. Le chemin reste, il suffit au diagnostic ; la
-/// PRÉSENCE de `amp;` est dite à part, c'est le défaut de #7106.
+/// dans un journal et une réponse d'API : toute adresse est réduite à son
+/// schéma et son hôte ([`crate::http::client::url_pour_journal`]) — le jeton
+/// peut vivre dans la requête, le chemin (Akamai, googlevideo) ou le
+/// fragment. Un chemin nu suivi d'une requête devient `/…`. La PRÉSENCE de
+/// `amp;` est dite à part, c'est le défaut de #7106.
 pub fn masquer_les_requetes(texte: &str) -> String {
+    const PONCTUATION: &[char] = &[')', ']', '>', ',', ';', '.', '"', '\''];
     let mut sortie = String::with_capacity(texte.len());
     for (i, morceau) in texte.split(' ').enumerate() {
         if i > 0 {
             sortie.push(' ');
         }
-        if (morceau.contains("://") || morceau.starts_with('/'))
-            && let Some((avant, requete)) = morceau.split_once('?')
-        {
-            sortie.push_str(avant);
-            sortie.push_str("?…");
-            if requete.contains("amp;") {
-                sortie.push_str("[requête avec amp;]");
+        let marque = if morceau.contains("amp;") {
+            "[requête avec amp;]"
+        } else {
+            ""
+        };
+        if let Some(pos) = morceau.find("://") {
+            // Début du schéma : lettres, chiffres, `+`, `-`, `.` avant `://`.
+            let debut = morceau[..pos]
+                .rfind(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.')))
+                .map_or(0, |j| j + 1);
+            let corps = &morceau[debut..];
+            let adresse = corps.trim_end_matches(PONCTUATION);
+            let queue = &corps[adresse.len()..];
+            let masquee = crate::http::client::url_pour_journal(adresse);
+            sortie.push_str(&morceau[..debut]);
+            sortie.push_str(&masquee);
+            if masquee != adresse {
+                sortie.push_str(marque);
             }
+            sortie.push_str(queue);
+        } else if morceau.starts_with('/') && morceau.contains(['?', '#']) {
+            sortie.push_str("/…");
+            sortie.push_str(marque);
         } else {
             sortie.push_str(morceau);
         }

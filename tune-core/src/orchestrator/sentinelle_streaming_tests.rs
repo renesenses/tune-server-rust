@@ -584,9 +584,90 @@ fn le_masque_cache_les_requetes_et_nomme_amp() {
     );
     assert_eq!(
         m,
-        "upstream fetch https://sp-ad-cf.audio.tidal.com/x/0.mp4?…[requête avec amp;] refusé"
+        "upstream fetch https://sp-ad-cf.audio.tidal.com/…[requête avec amp;] refusé"
     );
     assert_eq!(masquer_les_requetes("rien à cacher"), "rien à cacher");
+}
+
+/// Un jeton dans le CHEMIN (Akamai, googlevideo) ou le fragment, une
+/// adresse entre parenthèses (erreur reqwest), un identifiant `user:pass@` :
+/// seuls le schéma et l'hôte restent. Contre-épreuve : le chemin d'un fichier
+/// local sans requête, et une adresse sans chemin, ne changent pas.
+#[test]
+fn le_masque_cache_aussi_le_chemin_et_le_fragment() {
+    for (brut, attendu) in [
+        (
+            "GET https://ak.cdn.invalid/hls/hdntl=exp=1~acl=%2f*~hmac=SECRET-AKAMAI/seg.ts refusé",
+            "GET https://ak.cdn.invalid/… refusé",
+        ),
+        (
+            "(https://r1.googlevideo.invalid/videoplayback/id/1/signature/SECRET-GV/key/yt8)",
+            "(https://r1.googlevideo.invalid/…)",
+        ),
+        (
+            "https://cdn.invalid/a.flac#SECRET-FRAGMENT,",
+            "https://cdn.invalid/…,",
+        ),
+        (
+            "url=https://moi:SECRET-MDP@cdn.invalid/x",
+            "url=https://cdn.invalid/…",
+        ),
+        ("/videoplayback?sig=SECRET-REL", "/…"),
+    ] {
+        let m = masquer_les_requetes(brut);
+        assert_eq!(m, attendu, "{brut}");
+        assert!(!m.contains("SECRET"), "{m}");
+    }
+    for intact in [
+        "fichier DASH absent ou vide : /tmp/tidal-1.mp4",
+        "hôte https://cdn.invalid injoignable",
+        "file:///tmp/a.mp4 vide",
+    ] {
+        assert_eq!(masquer_les_requetes(intact), intact);
+    }
+}
+
+/// Un flux HTTP refusé (403) dont l'adresse porte le jeton dans le CHEMIN :
+/// ni le détail (historique de la sentinelle) ni le journal capturé ne le
+/// recopient. Contre-épreuve : l'adresse servie contient bien le jeton.
+#[tokio::test]
+async fn un_jeton_dans_le_chemin_ne_part_ni_au_journal_ni_dans_l_historique() {
+    #[derive(Clone, Default)]
+    struct Journal(Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Journal {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Journal {
+        type Writer = Journal;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+    crate::journal_de_test::fiabiliser_la_capture();
+    let journal = Journal::default();
+    let _garde = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::TRACE)
+            .finish(),
+    );
+    let base = serveur().await;
+    // Le serveur d'essai répond 404 à ce chemin inconnu.
+    let url = format!("{base}/hdntl=exp=1~acl=%2f*~hmac=JETON-CHEMIN/inconnu.wav");
+    assert!(url.contains("JETON-CHEMIN"), "contre-épreuve");
+    let echec = sonder_un_flux(&flux(url, "WAV"))
+        .await
+        .expect_err("chemin inconnu");
+    assert!(!echec.detail.contains("JETON-CHEMIN"), "{}", echec.detail);
+    let texte = String::from_utf8(journal.0.lock().unwrap().clone()).unwrap();
+    assert!(!texte.contains("JETON-CHEMIN"), "{texte}");
 }
 
 #[test]

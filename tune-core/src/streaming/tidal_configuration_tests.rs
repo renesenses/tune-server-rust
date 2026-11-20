@@ -488,7 +488,12 @@ async fn un_titre_entier_v1_se_lit() {
 fn une_adresse_de_flux_perd_sa_requete_au_journal() {
     assert_eq!(
         url_pour_journal("https://sp-ad-fa.audio.tidal.com/mediatracks/abc/0.mp4?token=xyz&info=1"),
-        "https://sp-ad-fa.audio.tidal.com/mediatracks/abc/0.mp4?…"
+        "https://sp-ad-fa.audio.tidal.com/…"
+    );
+    // Jeton dans le chemin (Akamai) : seul l'hôte reste.
+    assert_eq!(
+        url_pour_journal("https://ak.cdn.invalid/hdntl=exp=1~hmac=SECRET/seg.mp4"),
+        "https://ak.cdn.invalid/…"
     );
     assert_eq!(url_pour_journal("file:///tmp/a.mp4"), "file:///tmp/a.mp4");
 }
