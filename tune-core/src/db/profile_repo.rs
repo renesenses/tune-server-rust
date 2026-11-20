@@ -232,6 +232,29 @@ impl ProfileRepo {
         Ok(())
     }
 
+    /// Supprime le profil `id` ET ses écoutes (titres diffusés compris), dans
+    /// une seule transaction : orphelines, elles ne seraient plus visibles de
+    /// personne mais compteraient encore dans le foyer. Le profil par défaut
+    /// ne se supprime pas.
+    pub fn delete_avec_ses_ecoutes(&self, id: i64) -> Result<(), String> {
+        if id == 1 {
+            return Err("cannot delete default profile".into());
+        }
+        // `id` est un entier : rien d'autre n'entre dans le texte des requêtes.
+        let titres = format!(
+            "DELETE FROM radio_titres_diffuses WHERE ecoute_id IN \
+             (SELECT h.id FROM listen_history h WHERE h.profile_id = {id})"
+        );
+        let ecoutes = format!("DELETE FROM listen_history WHERE profile_id = {id}");
+        let profil = format!("DELETE FROM profiles WHERE id = {id}");
+        self.db.write_tx(&mut |tx| {
+            tx.execute(&titres, &[])?;
+            tx.execute(&ecoutes, &[])?;
+            tx.execute(&profil, &[])?;
+            Ok(())
+        })
+    }
+
     pub fn add_favorite(
         &self,
         profile_id: i64,
