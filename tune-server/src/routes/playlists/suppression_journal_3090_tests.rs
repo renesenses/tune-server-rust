@@ -1,6 +1,6 @@
 //! web#3090 (fil 2849) — `DELETE /playlists/{id}` laisse une ligne INFO
-//! `playlist_supprimee` (identifiant, nom, nombre de lignes, profil), et
-//! rien quand rien n'est supprimé.
+//! `playlist_supprimee` (identifiant, nombre de lignes, profil, JAMAIS le
+//! nom), et rien quand rien n'est supprimé.
 
 use super::supprimer_et_journaliser;
 use std::io::{self, Write};
@@ -54,7 +54,7 @@ fn journal_de<R>(f: impl FnOnce() -> R) -> (R, String) {
 }
 
 #[test]
-fn la_suppression_laisse_une_ligne_info_avec_id_nom_lignes_et_profil() {
+fn la_suppression_laisse_une_ligne_info_avec_id_lignes_et_profil_sans_le_nom() {
     let db = base();
     let pistes = TrackRepo::with_backend(db.clone());
     let ids: Vec<i64> = (0..2)
@@ -82,7 +82,10 @@ fn la_suppression_laisse_une_ligne_info_avec_id_nom_lignes_et_profil() {
     assert!(ligne.contains("INFO"), "{ligne}");
     assert!(ligne.contains(&format!("playlist_id={id}")), "{ligne}");
     assert!(ligne.contains("profile_id=1"), "{ligne}");
-    assert!(ligne.contains("nom=Dimanche"), "{ligne}");
+    assert!(
+        !texte.contains("Dimanche"),
+        "le nom de la playlist ne doit pas sortir au journal (web#3090) : {texte}"
+    );
     assert!(ligne.contains("lignes=2"), "{ligne}");
 }
 
