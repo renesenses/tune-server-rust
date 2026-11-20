@@ -84,6 +84,49 @@ permission: `tauri-plugin-global-shortcut` is a
 Play/Pause, Next, Previous media keys. A test keeps the plugin out of every
 other section of `Cargo.toml` and out of the capabilities.
 
+## Server status, start / stop, open at login (#9244)
+
+Tune Server has no menu bar / tray icon of its own (decision of 20 Nov 2026,
+forum thread 2966): **this** icon shows it. Tray menu, top:
+
+- a status line (disabled): `Serveur local : en marche (<version>)` /
+  `Serveur local : arrêté`, or `Serveur <host:port> : en marche / injoignable`
+  for a server on another machine. Polled every 5 s with the public
+  `GET /api/v1/system/version` (`src-tauri/src/etat_serveur.rs`);
+- `Démarrer le serveur` when the local server is stopped — same launcher as
+  the option below (`serveur_local::lancer`: `Tune Server.app` on macOS,
+  `tune-server.exe --sans-console` on Windows);
+- `Arrêter le serveur` when it runs **on this machine**: loopback address
+  (`serveur_local::adresse_locale`) AND a `tune-server` process of this user
+  (`pgrep -x tune-server` / `tasklist`). Otherwise greyed out — a remote
+  server, a container or an SSH tunnel on `localhost` is never stopped.
+  Stop = `POST /api/v1/system/stop` first (the server exits by itself; its
+  guard accepts a call from this machine while authentication is off, and
+  answers `403 not_local` from elsewhere). Refused (authentication on: Tune
+  Client has no token) or no answer → by the process: SIGTERM to
+  `tune-server` on macOS (clean shutdown; the `Tune Server.app` launcher then
+  quits on its own), `taskkill /F` on the user's `tune-server.exe` on Windows
+  (no window to close). Linux: no start/stop (system service).
+
+**Open at login** — tray checkbox `Ouvrir Tune Client à l'ouverture de
+session` (off by default; `src-tauri/src/ouverture_session.rs`). It reflects
+the system, not a copy in `config.json`:
+
+- macOS: `~/Library/LaunchAgents/fr.mozaiklabs.tune-client.plist` →
+  `open -g -b fr.mozaiklabs.tune-widget --args --session` (macOS shows it under
+  System Settings › General › Login Items);
+- Windows: value `Tune Client` of `HKCU\…\CurrentVersion\Run` →
+  `"<tune-widget.exe>" --session`; a value disabled in Task Manager
+  (`StartupApproved\Run`) counts as unchecked.
+
+Launched with `--session`, Tune Client opens no window (only the icon). With
+**`Démarrer le serveur Tune s'il ne tourne pas`** also ticked, it starts the
+local server: that is how the **server** starts with the session. On Windows,
+#8861 (open) adds the server's own `Tune Server` value under the same `Run`
+key: both can be on — the later launch finds the port held, waits, then gives up.
+
+The menus are French only, like the rest of the app's native menus.
+
 ## Release (signed + notarized)
 
 Recipe: [`.github/workflows/widget.yml`](../.github/workflows/widget.yml) —
