@@ -1161,6 +1161,17 @@ impl PlaybackOrchestrator {
         self.streamer.stream_bytes_sent(stream_id).await
     }
 
+    /// #9206 — depuis combien de millisecondes ce flux est lu au-delà de
+    /// l'en-tête (voir [`AudioStreamer::stream_lecture_au_dela_de_l_en_tete_depuis_ms`]).
+    pub async fn streamer_lecture_au_dela_de_l_en_tete_depuis_ms(
+        &self,
+        stream_id: &str,
+    ) -> Option<u64> {
+        self.streamer
+            .stream_lecture_au_dela_de_l_en_tete_depuis_ms(stream_id)
+            .await
+    }
+
     /// Audio servie à ce renderer, en millisecondes (voir
     /// [`AudioStreamer::stream_audio_servi_ms`]). #4480 : c'est le compteur
     /// d'octets converti au débit nominal du flux — la seule forme sous
