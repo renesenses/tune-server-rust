@@ -123,6 +123,9 @@ impl StreamingService for ServiceQuiNote {
 
 pub(crate) fn titre_qobuz(source_id: &str) -> QueueInput {
     QueueInput::Streaming {
+        media_format: None,
+        sample_rate: None,
+        bit_depth: None,
         source: "qobuz".into(),
         source_id: source_id.into(),
         title: format!("Titre {source_id}"),

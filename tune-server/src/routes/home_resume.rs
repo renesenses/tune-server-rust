@@ -126,6 +126,9 @@ mod tests {
         q.append(
             zone,
             &[QueueInput::Streaming {
+                media_format: None,
+                sample_rate: None,
+                bit_depth: None,
                 source: "qobuz".into(),
                 source_id: "9140031".into(),
                 title: "Titre démarré".into(),
@@ -185,6 +188,9 @@ mod tests {
                 let inputs: Vec<_> = ["trois", "un", "deux"]
                     .into_iter()
                     .map(|id| QueueInput::Streaming {
+                        media_format: None,
+                        sample_rate: None,
+                        bit_depth: None,
                         source: source.into(),
                         source_id: id.into(),
                         title: id.into(),
@@ -428,6 +434,9 @@ async fn complete_single_container(
                     }
                     tune_core::db::playlist_repo::EntryContent::Service(s) => {
                         Some(QueueInput::Streaming {
+                            media_format: None,
+                            sample_rate: None,
+                            bit_depth: None,
                             source: s.source,
                             source_id: s.source_id,
                             title: s.title,
@@ -460,6 +469,9 @@ async fn complete_single_container(
         tracks
             .into_iter()
             .map(|t| QueueInput::Streaming {
+                media_format: None,
+                sample_rate: None,
+                bit_depth: None,
                 source: r.source.clone(),
                 source_id: t.id,
                 title: t.title,
@@ -674,6 +686,9 @@ mod single_origin_tests {
             .unwrap();
         let q = PlayQueueRepo::with_backend(db.clone());
         let flux = QueueInput::Streaming {
+            media_format: None,
+            sample_rate: None,
+            bit_depth: None,
             source: "radio".into(),
             source_id: FLUX.into(),
             title: "FIP".into(),
@@ -864,6 +879,9 @@ mod replay_tests {
         let _lecture = LectureFactice(zone);
         let q = PlayQueueRepo::with_backend(state.backend.clone());
         let input = |id: &str| QueueInput::Streaming {
+            media_format: None,
+            sample_rate: None,
+            bit_depth: None,
             source: "circle".into(),
             source_id: id.into(),
             title: id.into(),
@@ -957,6 +975,9 @@ mod replay_tests {
         let _lecture = LectureFactice(zone);
         let q = PlayQueueRepo::with_backend(state.backend.clone());
         let input = |id: &str| QueueInput::Streaming {
+            media_format: None,
+            sample_rate: None,
+            bit_depth: None,
             source: "circle".into(),
             source_id: id.into(),
             title: id.into(),

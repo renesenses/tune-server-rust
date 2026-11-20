@@ -483,6 +483,9 @@ pub(crate) const ENSURE_COLUMNS: &[&str] = &[
     // AUSSI, même raison : une base de bascule ne rejouera jamais la 087, alors
     // que l'écriture de la file nomme la colonne.
     "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS artist_ref TEXT",
+    "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS media_format TEXT",
+    "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS sample_rate INTEGER",
+    "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS bit_depth INTEGER",
     // #6466 — le conteneur de chaque élément de file (PG 092). Ici AUSSI :
     // une base de bascule ne rejouera jamais la 092.
     "ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS context_type TEXT",

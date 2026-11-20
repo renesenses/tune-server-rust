@@ -46,7 +46,7 @@ impl TunePlugin for PremiumAudio {
             "upsampler" => {
                 "Suréchantillonnage : filtres polyphases vers la plus haute cadence du DAC, sortie locale"
             }
-            _ => "Dé-ploc : silence en tête/queue et passages par zéro, FLAC/WAV",
+            _ => "Declick : silence en tête/queue et passages par zéro, FLAC/WAV",
         }
     }
     fn default_enabled(&self) -> bool {

@@ -179,16 +179,82 @@ async fn status(_admin: RequireAdmin, State(state): State<AppState>) -> Response
         .into_iter()
         .map(|id| (id.to_string(), false));
     let tiers = third_party_ids().into_iter().map(|id| (id, true));
-    let plugins: Vec<_> = integres
-        .chain(tiers)
-        .map(|(id, third_party)| {
-            // `version` : celle du catalogue à l'installation, `null` pour un
-            // paquet envoyé à la main (le manifeste du SDK n'en porte pas).
-            let version = settings.get(&format!("plugin_{id}_version")).ok().flatten();
-            json!({"id":id,"third_party":third_party,"native_loaded":tune_plugin_native::provider(&id).is_some(),"error":tune_plugin_native::failure(&id),"version":version})
-        })
-        .collect();
+    let mut plugins = Vec::new();
+    for (id, third_party) in integres.chain(tiers) {
+        // #9151 — ce que ce processus a réellement monté (routes
+        // `/api/v1/ext/<id>`), et le droit que les routes exigent.
+        let charge = crate::routes::plugins::greffon_charge(&state, &id);
+        let licence = state.license.check_feature(feature(&id)).await;
+        plugins.push(fiche_d_etat(&settings, &id, third_party, charge, licence));
+    }
     Json(json!({"abi":1,"target":tune_plugin_native::package::host_target(),"trust_configured":trusted_keys().is_ok_and(|v|!v.is_empty()),"plugins":plugins})).into_response()
+}
+/// Une ligne du panneau « État des greffons » (`GET /audio-plugins/`).
+///
+/// `native_loaded` dit seulement qu'un PAQUET natif a été chargé depuis le
+/// disque. Un emplacement intégré sans paquet tourne par son moteur embarqué
+/// (`Engine::Bundled`, `tune-core/src/audio/eq.rs`) : `native_loaded` y vaut
+/// `false` chez tout le monde, et le panneau affichait « Not loaded » pour un
+/// égaliseur ou un suréchantillonneur qui marchaient (#9151, fil 2945 ; #8740
+/// point 3). D'où quatre champs :
+/// - `engine` : `"native"` (paquet chargé), `"bundled"` (intégré, moteur
+///   embarqué) ou `null` (greffon tiers sans bibliothèque chargée) ;
+/// - `restart_required` : voulu actif mais pas encore monté par ce
+///   processus. Un intégré facultatif (`upsampler`, `channel-remap`)
+///   installé en cours de session a ses réglages à `true`, mais ses routes
+///   `/api/v1/ext/<id>` ne se montent qu'au démarrage (`setup_all`) ; un
+///   tiers ne charge sa bibliothèque qu'au démarrage ;
+/// - `licensed` : le droit que ses routes exigent (`require_premium`) ;
+/// - `active` : voulu ([`premium_plugins::enabled`] pour un intégré,
+///   [`natifs_tiers::actif`] pour un tiers), monté (`charge`) ET couvert par
+///   la licence. Faux tant qu'un redémarrage est attendu.
+///
+/// `charge` : [`crate::routes::plugins::greffon_charge`] pour un intégré
+/// (sans effet pour un tiers, dont le chargement est `native_loaded`).
+///
+/// [`premium_plugins::enabled`]: tune_core::audio::premium_plugins::enabled
+/// [`natifs_tiers::actif`]: tune_core::audio::natifs_tiers::actif
+pub(crate) fn fiche_d_etat(
+    settings: &tune_core::db::settings_repo::SettingsRepo,
+    id: &str,
+    third_party: bool,
+    charge: bool,
+    licence: bool,
+) -> serde_json::Value {
+    // `version` : celle du catalogue à l'installation, `null` pour un
+    // paquet envoyé à la main (le manifeste du SDK n'en porte pas).
+    let version = settings.get(&format!("plugin_{id}_version")).ok().flatten();
+    let native_loaded = tune_plugin_native::provider(id).is_some();
+    let error = tune_plugin_native::failure(id);
+    let engine = match (native_loaded, third_party) {
+        (true, _) => Some("native"),
+        (false, false) => Some("bundled"),
+        (false, true) => None,
+    };
+    let (voulu, monte) = if third_party {
+        (
+            tune_core::audio::natifs_tiers::demande(settings, id),
+            tune_core::audio::natifs_tiers::actif(settings, id),
+        )
+    } else {
+        (
+            tune_core::audio::premium_plugins::enabled(settings, id),
+            charge,
+        )
+    };
+    // Un échec de chargement n'attend pas un redémarrage : il le dit par `error`.
+    let restart_required = voulu && !monte && error.is_none();
+    json!({
+        "id": id,
+        "third_party": third_party,
+        "native_loaded": native_loaded,
+        "engine": engine,
+        "active": voulu && monte && licence,
+        "restart_required": restart_required,
+        "licensed": licence,
+        "error": error,
+        "version": version,
+    })
 }
 fn refusal(error: String) -> Response {
     (
@@ -614,3 +680,7 @@ mod crossfeed_gratuit_9210_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "native_audio_etat_9151_tests.rs"]
+mod etat_9151_tests;

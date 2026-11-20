@@ -25,6 +25,8 @@ mod deplacer_racine;
 #[cfg(test)]
 mod diagnostic_sans_ecrivain_tests;
 pub(crate) mod diagnostics;
+#[path = "executables_livres_8944.rs"]
+pub(crate) mod executables_livres;
 pub(crate) mod sauvegarde_cloud;
 // `pub(crate)` depuis #2507 : `enrich::QuotaDuJour` est la lecture unique du
 // compteur journalier, et les essais de `routes/library/artwork.rs` la lisent
