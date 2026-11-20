@@ -57,10 +57,11 @@ pub(super) fn wav_progressif_consenti(
 /// Cas 1 — le ré-encodage par le fichier doit-il cuire le crossfeed ?
 ///
 /// Seulement vers une zone RÉSEAU, et jamais vers une sortie locale (qui
-/// l'applique elle-même : [`traitement_cuit_dans_le_fichier`]). Le navigateur
-/// et les sorties PULL passent aussi par ce bras ; le statut les déclare
-/// `non_local_output`, sans mesure qui dise le contraire : ils n'en
-/// reçoivent pas.
+/// l'applique elle-même : [`traitement_cuit_dans_le_fichier`]). Les sorties
+/// PULL passent aussi par ce bras ; le statut les déclare `non_local_output`,
+/// sans mesure qui dise le contraire : elles n'en reçoivent pas. Le
+/// navigateur, lui, part en WAV progressif dès qu'un traitement est actif
+/// (`browser_needs_wav`) : statut `non_local_partial` (#9178).
 pub(super) fn crossfeed_cuit_dans_le_fichier(
     sortie_est_reseau: bool,
     sortie_est_locale: bool,

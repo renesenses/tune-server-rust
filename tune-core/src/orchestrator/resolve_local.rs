@@ -2810,6 +2810,38 @@ impl PlaybackOrchestrator {
     /// correctif restaient VERTES, la garde de site comprise, parce
     /// qu'aucune ne regardait le porteur réellement construit. Celle-ci le
     /// regarde.
+    /// #9178 — la piste sera-t-elle transcodée (`needs_transcode`) ou servie
+    /// telle quelle ? Le relais ne porte le crossfeed que dans le premier cas.
+    #[cfg(test)]
+    pub(super) async fn transcodage_decide_pour_test(
+        &self,
+        req: &PlayRequest,
+    ) -> Result<bool, String> {
+        let track_id = req.track_id.ok_or("no track_id for local playback")?;
+        let track = TrackRepo::with_backend(self.db.clone())
+            .get(track_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("track not found")?;
+        let file_path = track.file_path.clone().ok_or("track has no file_path")?;
+        let fmt = track.format.clone().unwrap_or_else(|| "flac".into());
+        let source_format = AudioFormat::from_extension(&fmt);
+        let is_dsd_source = source_format == Some(AudioFormat::Dsd);
+        match self
+            .decider_la_lecture_locale(
+                req,
+                &track,
+                file_path,
+                fmt,
+                source_format,
+                is_dsd_source,
+                None,
+            )
+            .await?
+        {
+            DecisionOuResolu::Decision(d) => Ok(d.needs_transcode),
+            DecisionOuResolu::Resolu(_) => Ok(false),
+        }
+    }
     #[cfg(test)]
     pub(super) async fn relais_dsp_pour_test(
         &self,

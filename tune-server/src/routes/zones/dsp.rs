@@ -495,6 +495,15 @@ pub(super) async fn crossfeed_status_de_zone(
         progressif_arme,
         renderer_accepte_lpcm,
     );
+    // #9178 — OAAT et navigateur reçoivent le flux traité au fil de l'eau :
+    // réserve partielle, et non plus « sortie non locale » verrouillée.
+    let sortie = tune_core::audio::crossfeed::avec_le_flux_traite(
+        sortie,
+        tune_core::audio::crossfeed::sortie_porte_le_flux_traite(
+            zone.as_ref().and_then(|z| z.output_type.as_deref()),
+            device.as_deref(),
+        ),
+    );
     tune_core::audio::crossfeed::avec_les_droits(sortie, premium, greffon_actif)
 }
 
