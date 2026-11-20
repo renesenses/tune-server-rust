@@ -12327,3 +12327,138 @@ async fn le_format_upnp_suit_lecture_preparation_et_avance_de_file_8788() {
     assert_eq!(seconde.sample_rate, Some(705600));
     assert_eq!(seconde.bit_depth, Some(24));
 }
+
+/// #9178 — le statut du crossfeed d'une zone OAAT ou navigateur ne la
+/// verrouille plus (`CrossfeedConstraint::NonLocalPartial`). La preuve, sur la
+/// DÉCISION réelle : ces sorties reçoivent le WAV progressif dont le relais
+/// porte le crossfeed. `armer` pose le seul crossfeed (et l'égaliseur si
+/// demandé) sur la zone.
+fn armer_crossfeed_9178(orch: &PlaybackOrchestrator, zone_id: i64, egaliseur: bool) {
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(
+            &format!("zone_{zone_id}_crossfeed"),
+            r#"{"enabled":true,"amount":0.3,"delay_ms":0.3}"#,
+        )
+        .unwrap();
+    if egaliseur {
+        settings
+            .set(
+                &format!("zone_{zone_id}_eq_profile"),
+                &serde_json::to_string(&radio_test_eq_profile()).unwrap(),
+            )
+            .unwrap();
+        settings.set("plugin_equalizer_installed", "true").unwrap();
+    }
+    assert!(
+        orch.zone_has_active_crossfeed(zone_id),
+        "montage sans crossfeed"
+    );
+}
+
+/// OAAT, crossfeed SEUL, FLAC de la bibliothèque : WAV progressif, relais
+/// armé, crossfeed exécuté.
+#[tokio::test]
+async fn oaat_porte_le_crossfeed_seul_9178() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Bureau", Some("oaat"), Some("oaat:bureau-9178"))
+        .unwrap();
+    piste_3234(
+        &orch,
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+        "flac",
+    );
+    armer_crossfeed_9178(&orch, zone_id, false);
+    let mut req = requete_locale_3234(zone_id, 1);
+    req.output_device_id = Some("oaat:bureau-9178".into());
+    let format = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(format.out_mime, "audio/wav");
+    assert!(!format.use_file_transcode, "OAAT part en session");
+    assert!(
+        orch.transcodage_decide_pour_test(&req).await.unwrap(),
+        "la piste doit passer par le relais, pas être servie telle quelle"
+    );
+    let (actif, relais, crossfeed) = orch.relais_dsp_pour_test(&req).await.unwrap();
+    assert!(
+        actif && relais && crossfeed,
+        "#9178 : OAAT doit recevoir le crossfeed par le relais ({actif}, {relais}, {crossfeed})"
+    );
+}
+
+/// Navigateur, FLAC + égaliseur + crossfeed : WAV progressif, le relais porte
+/// aussi le crossfeed.
+#[tokio::test]
+async fn navigateur_avec_un_autre_traitement_porte_le_crossfeed_9178() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Onglet", Some("browser"), Some("browser:onglet-9178"))
+        .unwrap();
+    piste_3234(
+        &orch,
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+        "flac",
+    );
+    armer_crossfeed_9178(&orch, zone_id, true);
+    let req = requete_locale_3234(zone_id, 1);
+    let format = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(format.out_mime, "audio/wav");
+    assert!(!format.use_file_transcode);
+    assert!(
+        orch.transcodage_decide_pour_test(&req).await.unwrap(),
+        "la piste doit passer par le relais, pas être servie telle quelle"
+    );
+    let (actif, relais, crossfeed) = orch.relais_dsp_pour_test(&req).await.unwrap();
+    assert!(
+        actif && relais && crossfeed,
+        "({actif}, {relais}, {crossfeed})"
+    );
+}
+
+/// Navigateur, AIFF (que `<audio>` ne lit pas) et crossfeed SEUL : converti
+/// en WAV, donc porté.
+#[tokio::test]
+async fn navigateur_aiff_porte_le_crossfeed_seul_9178() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Onglet", Some("browser"), Some("browser:onglet-aiff-9178"))
+        .unwrap();
+    piste_3234(
+        &orch,
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.aiff"),
+        "aiff",
+    );
+    armer_crossfeed_9178(&orch, zone_id, false);
+    let req = requete_locale_3234(zone_id, 1);
+    assert!(
+        orch.transcodage_decide_pour_test(&req).await.unwrap(),
+        "la piste doit passer par le relais, pas être servie telle quelle"
+    );
+    let (actif, relais, crossfeed) = orch.relais_dsp_pour_test(&req).await.unwrap();
+    assert!(
+        actif && relais && crossfeed,
+        "({actif}, {relais}, {crossfeed})"
+    );
+}
+
+/// La réserve, mesurée : navigateur, FLAC et crossfeed SEUL, la piste part
+/// telle quelle (aucune conversion), donc sans crossfeed. C'est pourquoi le
+/// motif est PARTIEL et non absent.
+#[tokio::test]
+async fn navigateur_flac_avec_le_crossfeed_seul_part_tel_quel_9178() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Onglet", Some("browser"), Some("browser:onglet-flac-9178"))
+        .unwrap();
+    piste_3234(
+        &orch,
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+        "flac",
+    );
+    armer_crossfeed_9178(&orch, zone_id, false);
+    let req = requete_locale_3234(zone_id, 1);
+    assert!(
+        !orch.transcodage_decide_pour_test(&req).await.unwrap(),
+        "un FLAC sans autre traitement est servi tel quel au navigateur"
+    );
+}
