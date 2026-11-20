@@ -1725,8 +1725,18 @@ fn decode_opus_to_pcm(
     // Longueur annoncée par le conteneur, relevée AVANT le `format.seek` qui
     // suit : `track` emprunte `format`, et le lire après empêcherait l'emprunt
     // mutable du seek.
+    // #8982 — pre-skip de l'en-tête `OpusHead` : le démuxeur Ogg de symphonia
+    // le range dans `track.delay` mais ne le retire pas des paquets (le
+    // `trim_start` des paquets Opus reste nul). Ces trames d'amorce de
+    // l'encodeur étaient rendues en tête de chaque piste : 312 trames de trop
+    // et un décalage d'autant à la jointure de deux fichiers. Le Matroska ne
+    // le renseigne pas (son `CodecDelay` décale déjà les `pts`) : 0, comme
+    // avant.
+    let mut pre_skip = i64::from(track.delay.unwrap_or(0));
+    // La granule de la dernière page compte le pre-skip : la longueur utile
+    // annoncée est la granule moins le pre-skip.
     let trames_annoncees = if seek_s <= 0.0 && max_duration_s <= 0.0 {
-        track.num_frames
+        track.num_frames.map(|n| n.saturating_sub(pre_skip as u64))
     } else {
         None
     };
@@ -1743,22 +1753,31 @@ fn decode_opus_to_pcm(
 
     // Coarse container seek to land near the target page before sample-accurate
     // skipping. Best-effort: on failure we still skip from the start via pts.
-    let mut skip_frames: i64 = if seek_s > 0.0 {
-        let seconds = seek_s as i64;
-        let nanos = ((seek_s - seconds as f64) * 1_000_000_000.0) as u32;
-        if let Some(time) = Time::try_new(seconds, nanos) {
-            let _ = format.seek(
-                SeekMode::Coarse,
-                SeekTo::Time {
-                    time,
-                    track_id: Some(track_id),
-                },
-            );
-        }
-        (seek_s * 48000.0) as i64
-    } else {
-        0
-    };
+    // Position des paquets : par leur `pts` après un saut (seule repère
+    // disponible), sinon par le compte des trames décodées depuis le début du
+    // lien — le pre-skip s'applique aux premières trames DÉCODÉES, quelle que
+    // soit la granule de départ du flux.
+    let mut par_pts = seek_s > 0.0;
+    let mut trames_decodees: i64 = 0;
+    // En unités de granule (pre-skip compris) : la trame utile à `seek_s` a
+    // pour granule `pre_skip + seek_s × 48 000`.
+    let mut skip_frames: i64 = pre_skip
+        + if seek_s > 0.0 {
+            let seconds = seek_s as i64;
+            let nanos = ((seek_s - seconds as f64) * 1_000_000_000.0) as u32;
+            if let Some(time) = Time::try_new(seconds, nanos) {
+                let _ = format.seek(
+                    SeekMode::Coarse,
+                    SeekTo::Time {
+                        time,
+                        track_id: Some(track_id),
+                    },
+                );
+            }
+            (seek_s * 48000.0) as i64
+        } else {
+            0
+        };
 
     let mut decoder =
         OpusDecoder::new(48_000, channels_enum).map_err(|e| format!("opus decoder init: {e}"))?;
@@ -1826,9 +1845,13 @@ fn decode_opus_to_pcm(
                 track_id = track.id;
                 time_base = track.time_base;
                 // The seek point was consumed in the first link and pts
-                // restarts at 0 in the new physical stream — never re-skip,
-                // or the head of every following link would be dropped.
-                skip_frames = 0;
+                // restarts at 0 in the new physical stream — never re-skip
+                // the seek offset, or the head of every following link would
+                // be dropped. Only the new link's own pre-skip (#8982).
+                pre_skip = i64::from(track.delay.unwrap_or(0));
+                skip_frames = pre_skip;
+                par_pts = false;
+                trames_decodees = 0;
                 debug!(file = file_path, track_id, "ogg_opus_chain_decoder_rebuilt");
                 continue;
             }
@@ -1845,13 +1868,21 @@ fn decode_opus_to_pcm(
             continue;
         }
         // Sample index (@48 kHz) of this packet's first frame.
-        let pkt_start_frame: i64 = match time_base {
-            Some(tb) => {
-                let t = tb.calc_time_saturating(packet.pts);
-                (t.as_secs_f64() * 48000.0).round() as i64
+        let pkt_start_frame: i64 = if par_pts {
+            match time_base {
+                Some(tb) => {
+                    let t = tb.calc_time_saturating(packet.pts);
+                    (t.as_secs_f64() * 48000.0).round() as i64
+                }
+                None => packet.pts.get(),
             }
-            None => packet.pts.get(),
+        } else {
+            trames_decodees
         };
+        // #8982 — fin de flux : la granule de la dernière page borne les
+        // trames utiles, symphonia en tire `trim_end` (le remplissage du
+        // dernier paquet). Il était rendu tel quel.
+        let trim_end = packet.trim_end.get();
         // `opus::Decoder::decode` prend les octets du paquet tels quels et rend
         // le nombre d'échantillons PAR CANAL — même contrat que l'`audiopus`
         // qu'il remplace (#2251). Les enveloppes `Packet` / `MutSignals`
@@ -1871,7 +1902,9 @@ fn decode_opus_to_pcm(
         };
         // Per-channel frame count decoded from this packet.
         let n = n.min(out_buf.len() / ch);
-        // Drop leading frames until we reach the requested seek point.
+        trames_decodees += n as i64;
+        let n = n.saturating_sub(usize::try_from(trim_end).unwrap_or(usize::MAX));
+        // Drop leading frames (pre-skip, then up to the requested seek point).
         let local_offset: usize = if skip_frames > pkt_start_frame {
             ((skip_frames - pkt_start_frame) as usize).min(n)
         } else {
@@ -6288,8 +6321,9 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
     /// embarque la 1.6.1 et la lie toujours en statique — même libopus
     /// partout, désormais.
     ///
-    /// Valeurs observées : 96 960 trames, rms G = 2877,6, rms D = 1442,1,
-    /// crête = 4140, dominante 440 Hz.
+    /// Valeurs observées : 96 000 trames (2 s exactes ; 96 960 avant #8982,
+    /// pre-skip et remplissage du dernier paquet compris), rms G = 2877,6,
+    /// rms D = 1442,1, crête = 4140, dominante 440 Hz.
     #[test]
     fn decode_opus_fixture_garde_le_profil_du_signal() {
         use crate::audio::opus_ogg::{channel_f64, goertzel_power, rms};
@@ -6301,10 +6335,11 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
 
         // Nombre de trames : contrat de découpage (pre-skip + granulepos).
         // Un remplaçant qui compte autrement doit être regardé de près, pas
-        // adopté en silence.
+        // adopté en silence. #8982 : 2 s exactes, le pre-skip (312) et le
+        // remplissage du dernier paquet (648) ne sont plus rendus.
         assert_eq!(
             d.samples_i32.len() / 2,
-            96_960,
+            96_000,
             "le nombre de trames décodées a changé — pre-skip ou fin de flux \
              traités différemment"
         );
