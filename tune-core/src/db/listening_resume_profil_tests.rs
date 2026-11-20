@@ -154,6 +154,9 @@ fn piste(id: &str) -> QueueInput {
         disc_number: None,
         album_ref: None,
         artist_ref: None,
+        media_format: None,
+        sample_rate: None,
+        bit_depth: None,
     }
 }
 
