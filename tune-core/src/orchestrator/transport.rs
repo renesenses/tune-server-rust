@@ -2287,6 +2287,10 @@ impl PlaybackOrchestrator {
         local_out.set_retard_de_depart_ms(
             crate::zones::retard_groupe_mixte_8437::retard_de_depart_de_la_zone(&self.db, zone_id),
         );
+        // #8869 — et le silence de verrouillage de la zone.
+        local_out.set_silence_de_verrouillage_ms(crate::audio::silence_de_verrouillage::lire(
+            &self.db, zone_id,
+        ));
         {
             let mut outputs = self.outputs.lock().await;
             outputs.register(Box::new(local_out));
@@ -2520,6 +2524,11 @@ impl PlaybackOrchestrator {
                     // lecture comme le strict : `play_url` la lit une fois.
                     local_output.set_secondes_sorties(secondes_sorties);
                     local_output.set_retard_de_depart_ms(retard_de_depart_ms);
+                    // #8869 — le silence de verrouillage de la zone, lu à
+                    // chaque lecture : `play_url` le lit une fois.
+                    local_output.set_silence_de_verrouillage_ms(
+                        crate::audio::silence_de_verrouillage::lire(&self.db, zone_id),
+                    );
                     // #6522, #6524 — ce que PURE contourne, lu dans les
                     // réglages : la chaîne posée plus bas sera vide en PURE.
                     self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);

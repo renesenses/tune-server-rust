@@ -28,10 +28,18 @@ impl std::fmt::Display for Tier {
     }
 }
 
+/// #9240 — nombre de zones (ou de récepteurs OAAT) qu'un groupe peut compter
+/// sans Premium. Au-delà, [`Feature::MultiroomSync`].
+pub const ZONES_GROUPEES_GRATUITES: usize = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Feature {
     UnlimitedZones,
+    /// Le multiroom AU-DELÀ de [`ZONES_GROUPEES_GRATUITES`] zones ou
+    /// récepteurs dans un groupe (décision de Bertrand du 20/11/2026, #9240).
+    /// Jusque-là, grouper est gratuit : OAAT compris, et groupes DLNA,
+    /// AirPlay, locaux. Les paires stéréo restent gratuites.
     MultiroomSync,
     /// Equalizer is free; retain the historical wire name `dsp_eq`.
     DspEq,
@@ -96,7 +104,9 @@ impl Feature {
             Feature::MultiroomSync,
             Feature::Crossfeed,
             Feature::CloudRelay,
-            // OAAT is free — open-source protocol, core feature
+            // OAAT is free — open-source protocol, core feature. Son
+            // multiroom aussi, jusqu'à `ZONES_GROUPEES_GRATUITES` récepteurs ;
+            // au-delà, c'est `MultiroomSync` (#9240).
             // Feature::OaatProtocol,
             Feature::CloudBackup,
             Feature::SyncedLyrics,

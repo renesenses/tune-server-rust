@@ -1951,6 +1951,20 @@ fn assembler_les_etapes_lang(
         variante_hls_refusee,
         ..
     } = analyse.source;
+    // #8809 — nommer le fil PCM observé, dans l’étape ET dans le résumé.
+    // Le mode demandé ne prouve ni du DoP ni du DSD natif.
+    let output_format_name = if output_type == "local"
+        && is_dsd
+        && !ps.dop_active
+        && wire_sample_rate
+            .zip(wire_bit_depth)
+            .is_some_and(|(rate, bits)| {
+                rate > 0 && bits > 0 && !is_dsd_resolution(rate as i32, i32::from(bits))
+            }) {
+        "PCM"
+    } else {
+        output_format_name
+    };
     let Traitements {
         eq_step_description,
         replaygain_step,
@@ -4137,3 +4151,7 @@ mod repli_de_demarrage_6452_tests {
         assert_eq!(detail_du_transport("dlna", None, Some("asio")), None);
     }
 }
+
+#[cfg(test)]
+#[path = "signal_path_dsd_pcm_8809_tests.rs"]
+mod dsd_pcm_8809_tests;

@@ -388,7 +388,7 @@ impl TidalService {
         let total = segments.segment_count;
         info!(
             track_id,
-            init_url = segments.init_url.as_str(),
+            init_url = %crate::confidentialite::masquer_url(&segments.init_url.as_str()),
             segment_count = total,
             start_number = segments.start_number,
             "tidal_dash_multi_segment_download_starting"
@@ -2150,7 +2150,7 @@ impl StreamingService for TidalService {
                 serde_json::from_str(&body).map_err(|e| format!("parse device auth: {e}"))?;
             info!(
                 user_code = %device_auth.user_code,
-                uri = %device_auth.verification_uri_complete,
+                uri = %crate::confidentialite::masquer_url(&device_auth.verification_uri_complete),
                 expires_in = device_auth.expires_in,
                 "tidal_device_auth_started"
             );
@@ -2280,7 +2280,7 @@ impl StreamingService for TidalService {
         let state = Self::generate_state();
         let authorize_url = Self::build_authorize_url(&challenge, &state);
 
-        info!(url = %authorize_url, "tidal_pkce_auth_started");
+        info!(url = %crate::confidentialite::masquer_url(&authorize_url), "tidal_pkce_auth_started");
 
         self.pending_pkce = Some(PkceState {
             code_verifier: verifier,
@@ -2456,7 +2456,7 @@ impl StreamingService for TidalService {
                     _ => {
                         tracing::info!(
                             track_id,
-                            path = %cached.url,
+                            path = %crate::confidentialite::masquer_url(&cached.url),
                             "tidal_dash_cache_stale_redownloading"
                         );
                         None
@@ -2706,14 +2706,14 @@ impl StreamingService for TidalService {
                 if url_len < 30 {
                     warn!(
                         track_id,
-                        url = dash.url.as_str(),
+                        url = %crate::confidentialite::masquer_url(&dash.url.as_str()),
                         url_len,
                         "tidal_dash_suspicious_short_url"
                     );
                 }
                 info!(
                     track_id,
-                    url = dash.url.as_str(),
+                    url = %crate::confidentialite::masquer_url(&dash.url.as_str()),
                     url_len,
                     dash_codec = dash.codec.as_deref().unwrap_or("none"),
                     dash_mime = dash.mime_type.as_deref().unwrap_or("none"),
@@ -2849,7 +2849,7 @@ impl StreamingService for TidalService {
         // where the URL might point to the manifest itself instead of audio data.
         debug!(
             track_id,
-            final_url = url.as_str(),
+            final_url = %crate::confidentialite::masquer_url(&url.as_str()),
             url_len = url.len(),
             codec,
             mime_type,

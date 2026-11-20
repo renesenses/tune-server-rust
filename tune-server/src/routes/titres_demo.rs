@@ -461,7 +461,7 @@ pub(crate) async fn installer(
         };
         if erreur.is_some() {
             echecs += 1;
-            tracing::warn!(fichier = %t.file_name, url = %t.url, erreur = ?erreur, "demo_track_rejected");
+            tracing::warn!(fichier = %t.file_name, url = %tune_core::confidentialite::masquer_url(&t.url), erreur = ?erreur, "demo_track_rejected");
         } else {
             installes += 1;
         }

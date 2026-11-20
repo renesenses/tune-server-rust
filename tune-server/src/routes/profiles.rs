@@ -1084,7 +1084,12 @@ async fn update_profile_settings(
     let key = format!("profile_{id}_settings");
     let serialized = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
     match settings.set(&key, &serialized) {
-        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => {
+            // #9143 — l'option « retirer d'Écouter plus tard » est gardée en
+            // cache par le sondeur : elle se relit après ce changement.
+            state.orchestrator.reglages_du_profil_modifies();
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     }
 }

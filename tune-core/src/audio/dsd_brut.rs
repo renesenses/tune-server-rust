@@ -39,9 +39,11 @@ pub const MIME: &str = "application/x-tune-dsd";
 /// Le motif de repos DSD, MSB-first (même valeur que `cpal` côté ASIO).
 pub const SILENCE_DSD_MSB_FIRST: u8 = 0x69;
 
-/// Les cadences que la sortie ASIO native ouvre : DSD64, DSD128, DSD256.
+/// Les cadences que la sortie ASIO native ouvre : DSD64 à DSD512, familles 44,1 et 48 kHz.
 /// Miroir de `vendor/cpal/src/host/asio/dsd.rs::DSD_RATES`.
-pub const CADENCES_DSD_NATIVES: [u32; 3] = [2_822_400, 5_644_800, 11_289_600];
+pub const CADENCES_DSD_NATIVES: [u32; 8] = [
+    2_822_400, 3_072_000, 5_644_800, 6_144_000, 11_289_600, 12_288_000, 22_579_200, 24_576_000,
+];
 
 /// L'en-tête du flux pour `cadence` (Hz, en bits par seconde et par canal) et
 /// `canaux`.

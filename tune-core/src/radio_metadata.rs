@@ -142,7 +142,7 @@ async fn fetch_radio_metadata_depuis(
                 // d'afficher en silence le morceau d'un autre canal.
                 debug!(
                     station = %station_name,
-                    url = %stream_url,
+                    url = %crate::confidentialite::masquer_url(&stream_url),
                     "radioparadise_canal_par_defaut"
                 );
                 CANAL_RADIO_PARADISE_PRINCIPAL
