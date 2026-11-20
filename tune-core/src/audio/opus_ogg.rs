@@ -344,10 +344,13 @@ mod tests {
     #[test]
     fn aller_retour_rend_la_longueur_exacte_et_le_calage_8982() {
         const TRAMES: usize = 47_123;
+        // Un glissando (200 Hz → ~1 200 Hz), pas un sinus : un signal
+        // périodique se recalerait aussi à une période près.
         let pcm: Vec<i16> = (0..TRAMES)
             .flat_map(|n| {
-                let v = ((2.0 * std::f64::consts::PI * 440.0 * n as f64 / 48000.0).sin()
-                    * 16000.0) as i16;
+                let t = n as f64 / 48000.0;
+                let phase = 2.0 * std::f64::consts::PI * (200.0 * t + 500.0 * t * t);
+                let v = (phase.sin() * 16000.0) as i16;
                 [v, v]
             })
             .collect();
@@ -380,9 +383,7 @@ mod tests {
                 .sum()
         };
         let meilleur = (-400i64..=400).min_by(|a, b| erreur(*a).total_cmp(&erreur(*b))).unwrap();
-        // Un sinus de 440 Hz se recale aussi à ±109 trames (une période) :
-        // seul le décalage nul est admis, la fenêtre de recherche couvre le
-        // pre-skip.
+        // La fenêtre de recherche (±400) couvre le pre-skip.
         assert_eq!(meilleur, 0, "décalage du décodé par rapport à la source");
     }
 

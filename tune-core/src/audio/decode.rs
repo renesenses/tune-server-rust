@@ -6321,8 +6321,9 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
     /// embarque la 1.6.1 et la lie toujours en statique — même libopus
     /// partout, désormais.
     ///
-    /// Valeurs observées : 96 960 trames, rms G = 2877,6, rms D = 1442,1,
-    /// crête = 4140, dominante 440 Hz.
+    /// Valeurs observées : 96 000 trames (2 s exactes ; 96 960 avant #8982,
+    /// pre-skip et remplissage du dernier paquet compris), rms G = 2877,6,
+    /// rms D = 1442,1, crête = 4140, dominante 440 Hz.
     #[test]
     fn decode_opus_fixture_garde_le_profil_du_signal() {
         use crate::audio::opus_ogg::{channel_f64, goertzel_power, rms};
@@ -6334,10 +6335,11 @@ nas:/volume1/music /mnt/nas nfs4 rw,relatime 0 0
 
         // Nombre de trames : contrat de découpage (pre-skip + granulepos).
         // Un remplaçant qui compte autrement doit être regardé de près, pas
-        // adopté en silence.
+        // adopté en silence. #8982 : 2 s exactes, le pre-skip (312) et le
+        // remplissage du dernier paquet (648) ne sont plus rendus.
         assert_eq!(
             d.samples_i32.len() / 2,
-            96_960,
+            96_000,
             "le nombre de trames décodées a changé — pre-skip ou fin de flux \
              traités différemment"
         );
