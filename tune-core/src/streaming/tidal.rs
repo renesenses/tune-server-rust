@@ -3936,11 +3936,6 @@ struct EnCroissance {
     start: Instant,
 }
 
-/// #7266 — la poignée du décodeur, tenue par la tâche de téléchargement. Si
-/// la tâche disparaît sans conclure (panique, arrêt du runtime, sortie
-/// imprévue), la poignée est déclarée en échec et le fichier partiel retiré :
-/// le décodeur reçoit une erreur au lieu d'attendre à vie (#8228, même garde
-/// que `copier_en_croissance`).
 /// #8795 — le fMP4 DASH en cours d'assemblage, tant qu'il n'est pas rendu à
 /// l'appelant. Abandonnée (tâche de préchargement coupée par une lecture) ou
 /// sortie sur une erreur, la garde supprime le fichier partiel : jusqu'à
@@ -4007,6 +4002,11 @@ pub(crate) mod partiels_8795 {
     }
 }
 
+/// #7266 — la poignée du décodeur, tenue par la tâche de téléchargement. Si
+/// la tâche disparaît sans conclure (panique, arrêt du runtime, sortie
+/// imprévue), la poignée est déclarée en échec et le fichier partiel retiré :
+/// le décodeur reçoit une erreur au lieu d'attendre à vie (#8228, même garde
+/// que `copier_en_croissance`).
 struct GardeCroissance {
     growth: Option<Arc<crate::audio::dash_growth::DashGrowth>>,
     suivi: Arc<crate::audio::dash_growth::SuiviDuTelechargement>,
