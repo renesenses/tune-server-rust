@@ -1164,7 +1164,11 @@ pub fn compte(settings: &SettingsRepo) -> Result<Compte, ErreurSite> {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     };
-    let (Some(acces), Some(server_id)) = (lire("mozaik_access_token"), lire("server_id")) else {
+    // #8797 : une session refusée par le site vaut « non relié » pour tous
+    // les envois au nom du compte (sauvegarde, écoutes, notes) jusqu'à la
+    // reconnexion.
+    let (Some(acces), Some(server_id)) = (super::sso::jeton_de_compte(settings), lire("server_id"))
+    else {
         return Err(ErreurSite::NonRelie);
     };
     let base = lire("mozaik_base_url")

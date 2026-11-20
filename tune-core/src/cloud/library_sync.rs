@@ -163,7 +163,11 @@ pub async fn lier_depuis_les_reglages(
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     };
-    let (Some(server_id), Some(jeton)) = (lire("server_id"), lire("mozaik_access_token")) else {
+    // #8797 : une session refusée par le site ne se présente plus.
+    let (Some(server_id), Some(jeton)) = (
+        lire("server_id"),
+        crate::cloud::sso::jeton_de_compte(&settings),
+    ) else {
         return Err("cloud link: pas de server_id ou pas de session".into());
     };
     lier_le_serveur(backend, http_client, &api_de_liaison(), &server_id, &jeton).await
@@ -203,7 +207,7 @@ pub async fn delier_le_serveur(
     };
     let (Some(server_id), Some(acces), Some(jeton)) = (
         lire("server_id"),
-        lire("mozaik_access_token"),
+        crate::cloud::sso::jeton_de_compte(settings),
         jeton_de_liaison(settings),
     ) else {
         return Ok(false);
@@ -1386,11 +1390,9 @@ pub async fn cycle(
     // #5358 : un format de synchro enrichi remet la bibliothèque une fois.
     resynchroniser_si_le_format_a_change(backend, &settings, premium);
     let server_id = settings.get("server_id").ok().flatten().unwrap_or_default();
-    let token = settings
-        .get("mozaik_access_token")
-        .ok()
-        .flatten()
-        .filter(|t| !t.trim().is_empty())?;
+    // #8797 : après un refus de la session par le site, la copie en ligne
+    // attend la reconnexion au lieu de rapporter un 401 par cycle.
+    let token = crate::cloud::sso::jeton_de_compte(&settings)?;
     if server_id.is_empty() {
         debug!("cloud_library_sync_skipped_no_server_id");
         return None;
@@ -2054,5 +2056,75 @@ mod journal_apres_scan_8239_tests {
         dates_de_fichier(&backend);
         scan(&backend, "");
         assert_eq!(en_attente(&backend), vec![]);
+    }
+}
+
+#[cfg(test)]
+mod session_refusee_8797_tests {
+    use super::*;
+    use crate::db::migrations;
+    use crate::db::sqlite::SqliteDb;
+
+    /// Un site qui compte ce qu'il reçoit, quoi qu'on lui demande.
+    async fn site_compteur() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        let appels = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let compte = appels.clone();
+        let app = axum::Router::new().fallback(move || {
+            let compte = compte.clone();
+            async move {
+                compte.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                (axum::http::StatusCode::UNAUTHORIZED, "{}")
+            }
+        });
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let adresse = ecoute.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = axum::serve(ecoute, app).await;
+        });
+        (format!("http://{adresse}/api/v1/cloud-library"), appels)
+    }
+
+    fn relie_puis_refuse() -> Arc<dyn DbBackend> {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        let b: Arc<dyn DbBackend> = Arc::new(db);
+        let s = SettingsRepo::with_backend(b.clone());
+        s.set("server_id", "srv-1").unwrap();
+        s.set("mozaik_access_token", "jeton-refuse").unwrap();
+        s.set(CLE_JETON_DE_LIAISON, "liaison").unwrap();
+        s.set(
+            crate::cloud::sso::CLE_RECONNEXION_REQUISE,
+            "2026-11-20T10:00:00+00:00",
+        )
+        .unwrap();
+        b
+    }
+
+    /// #8797 — après un refus de la session par le site, ni le cycle de la
+    /// copie en ligne, ni la liaison, ni la déliaison n'appellent le site.
+    /// Contre-épreuve : la session rouverte, le cycle et la déliaison
+    /// repartent vers le site.
+    #[tokio::test]
+    async fn apres_un_refus_de_session_la_copie_en_ligne_n_appelle_plus_le_site_8797() {
+        let (api, appels) = site_compteur().await;
+        let b = relie_puis_refuse();
+        let s = SettingsRepo::with_backend(b.clone());
+        let http = reqwest::Client::new();
+        assert!(cycle(&b, &http, &api, true).await.is_none());
+        assert!(delier_le_serveur(&s, &http, &api).await == Ok(false));
+        assert!(lier_depuis_les_reglages(&b, &http).await.is_err());
+        assert_eq!(
+            appels.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "aucun appel au site après le refus"
+        );
+
+        crate::cloud::sso::oublier_le_refus_de_session(&s);
+        let _ = delier_le_serveur(&s, &http, &api).await;
+        assert!(
+            appels.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+            "la session rouverte, la déliaison repart vers le site"
+        );
     }
 }
