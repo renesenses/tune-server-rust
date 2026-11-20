@@ -144,7 +144,7 @@
     "tr": "Upsampling: DAC'ın en yüksek hızına çok fazlı filtreler, yerel çıkış"
   },
   "plugin.description.declick": {
-    "fr": "Dé-ploc : silence en tête/queue et passages par zéro, FLAC/WAV",
+    "fr": "Declick : silence en tête/queue et passages par zéro, FLAC/WAV",
     "en": "Declick: leading/trailing silence and zero crossings, FLAC/WAV",
     "de": "Declick: Stille am Anfang/Ende und Nulldurchgänge, FLAC/WAV",
     "es": "Declick: silencio al inicio/final y pasos por cero, FLAC/WAV",
