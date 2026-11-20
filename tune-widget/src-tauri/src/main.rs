@@ -1,6 +1,8 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod decouverte;
+mod etat_serveur;
+mod ouverture_session;
 mod raccourcis;
 #[cfg(windows)]
 mod raccourcis_globaux;
@@ -553,6 +555,18 @@ async fn demarrer_serveur_si_absent(app: &tauri::AppHandle, montrer_mini: bool) 
     if server_reachable(&http, &url).await {
         return false;
     }
+    lancer_le_serveur_local(app, &http, &url, montrer_mini).await
+}
+
+/// Lance le serveur installé sur cette machine et attend jusqu'à ~30 s qu'il
+/// réponde à `url`. Commun à l'option de lancement et à l'entrée « Démarrer le
+/// serveur » du menu (#9244). L'appelant a vérifié que `url` est locale.
+async fn lancer_le_serveur_local(
+    app: &tauri::AppHandle,
+    http: &reqwest::Client,
+    url: &str,
+    montrer_mini: bool,
+) -> bool {
     // `lancer` attend la fin de `open` sous macOS : hors du fil asynchrone.
     let lancement = tokio::task::spawn_blocking(serveur_local::lancer)
         .await
@@ -573,7 +587,7 @@ async fn demarrer_serveur_si_absent(app: &tauri::AppHandle, montrer_mini: bool) 
     }
     for _ in 0..60 {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        if server_reachable(&http, &url).await {
+        if server_reachable(http, url).await {
             tracing::info!("serveur_local_pret");
             return true;
         }
@@ -607,6 +621,205 @@ async fn set_demarrer_serveur_local(app: tauri::AppHandle, actif: bool) -> Resul
 /// La case « Démarrer le serveur Tune s'il ne tourne pas » du menu de la zone
 /// de notification, gardée pour la synchroniser avec le réglage du mini-lecteur.
 struct CaseDemarrageServeur(CheckMenuItem<tauri::Wry>);
+
+/// Les entrées « état du serveur » du menu de l'icône (#9244) : la ligne
+/// d'état (inactive) et l'entrée Démarrer / Arrêter.
+struct MenuServeur {
+    etat: MenuItem<tauri::Wry>,
+    action: MenuItem<tauri::Wry>,
+    /// Une action est en cours : la surveillance ne réécrit pas le menu.
+    occupe: std::sync::atomic::AtomicBool,
+    /// Ce que le menu affiche, pour ne le réécrire qu'au changement.
+    affiche: std::sync::Mutex<Option<(String, String, bool)>>,
+}
+
+/// Période de la surveillance de l'état du serveur.
+const PERIODE_ETAT_SERVEUR: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Photographie l'état du serveur configuré (`GET /system/version`, publique).
+async fn instantane_serveur(app: &tauri::AppHandle) -> etat_serveur::Instantane {
+    use etat_serveur::Etat;
+    let (serveur, http) = {
+        let state = app.state::<AppState>();
+        let url = state.server_url.read().await.clone();
+        (url, state.http.clone())
+    };
+    let local = serveur_local::adresse_locale(&serveur);
+    let route = format!(
+        "{}{}",
+        serveur.trim_end_matches('/'),
+        etat_serveur::ROUTE_VERSION
+    );
+    let etat = match http
+        .get(&route)
+        .timeout(std::time::Duration::from_secs(2))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => Etat::EnMarche {
+            version: r
+                .json::<serde_json::Value>()
+                .await
+                .ok()
+                .as_ref()
+                .and_then(etat_serveur::version_de),
+        },
+        // Le port répond (même par une erreur) : il tourne.
+        Ok(_) => Etat::EnMarche { version: None },
+        Err(_) => Etat::Arrete,
+    };
+    // Le serveur Tune de cet utilisateur qui ÉCOUTE sur le port de l'adresse
+    // (jamais un tunnel `ssh -L`, voir `etat_serveur::pid_a_arreter`).
+    let pid_local =
+        if local && serveur_local::PRIS_EN_CHARGE && matches!(etat, Etat::EnMarche { .. }) {
+            let s = serveur.clone();
+            tokio::task::spawn_blocking(move || etat_serveur::pid_du_serveur(&s))
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
+    etat_serveur::Instantane {
+        serveur,
+        local,
+        etat,
+        pid_local,
+    }
+}
+
+/// Réécrit les deux entrées si ce qu'elles disent a changé.
+fn afficher_menu_serveur(menu: &MenuServeur, ligne: String, action: &str, actif: bool) {
+    let nouveau = (ligne, action.to_string(), actif);
+    let mut affiche = menu.affiche.lock().unwrap_or_else(|e| e.into_inner());
+    if affiche.as_ref() == Some(&nouveau) {
+        return;
+    }
+    let _ = menu.etat.set_text(&nouveau.0);
+    let _ = menu.action.set_text(&nouveau.1);
+    let _ = menu.action.set_enabled(nouveau.2);
+    *affiche = Some(nouveau);
+}
+
+/// Met le menu à jour d'après l'état réel du serveur.
+async fn rafraichir_menu_serveur(app: &tauri::AppHandle) {
+    let Some(menu) = app.try_state::<MenuServeur>() else {
+        return;
+    };
+    if menu.occupe.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let i = instantane_serveur(app).await;
+    // Une action a pu commencer pendant la photographie : son texte
+    // (« Arrêt du serveur… ») ne doit pas être écrasé par un état périmé.
+    if menu.occupe.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let (texte, actif) = etat_serveur::libelle_action(etat_serveur::action_proposee(
+        &i,
+        serveur_local::PRIS_EN_CHARGE,
+    ));
+    afficher_menu_serveur(&menu, etat_serveur::libelle_etat(&i), texte, actif);
+}
+
+/// Surveille le serveur tant que Tune Client tourne.
+async fn surveiller_serveur(app: tauri::AppHandle) {
+    loop {
+        rafraichir_menu_serveur(&app).await;
+        tokio::time::sleep(PERIODE_ETAT_SERVEUR).await;
+    }
+}
+
+/// Arrête le serveur LOCAL (#9244) : la route du serveur d'abord, le processus
+/// si elle refuse. Rend ce qui a été fait, ou pourquoi rien ne l'a été.
+async fn arreter_serveur_local(app: &tauri::AppHandle) -> Result<String, String> {
+    // Revérifié ici, quel que soit l'état affiché : jamais un serveur distant.
+    let i = instantane_serveur(app).await;
+    let pid = match (
+        etat_serveur::action_proposee(&i, serveur_local::PRIS_EN_CHARGE),
+        i.pid_local,
+    ) {
+        (etat_serveur::Action::Arreter, Some(pid)) => pid,
+        _ => {
+            return Err(format!(
+                "rien à arrêter ici ({})",
+                etat_serveur::libelle_etat(&i)
+            ))
+        }
+    };
+    let http = app.state::<AppState>().http.clone();
+    let route = format!(
+        "{}{}",
+        i.serveur.trim_end_matches('/'),
+        etat_serveur::ROUTE_ARRET
+    );
+    let statut = http
+        .post(&route)
+        .timeout(std::time::Duration::from_secs(3))
+        .send()
+        .await
+        .ok()
+        .map(|r| r.status().as_u16());
+    let fait = match etat_serveur::apres_route(statut) {
+        etat_serveur::ApresRoute::Accepte => "arrêté par POST /system/stop".to_string(),
+        etat_serveur::ApresRoute::ParLeProcessus => {
+            tracing::info!(?statut, pid, "arret_serveur_route_refusee_repli_processus");
+            let serveur = i.serveur.clone();
+            tokio::task::spawn_blocking(move || etat_serveur::arreter_le_pid(&serveur, pid))
+                .await
+                .unwrap_or_else(|e| Err(format!("tâche interrompue : {e}")))?
+        }
+    };
+    // Attendre que le port se libère et, sous macOS, que le lanceur
+    // `Tune Server.app` ait quitté (son `on idle` le fait dans les 5 s) : un
+    // « Démarrer » pendant ce délai le trouverait encore là et n'ouvrirait rien.
+    for _ in 0..30 {
+        let port_libre = !server_reachable(&http, &i.serveur).await;
+        let lanceur_parti = !tokio::task::spawn_blocking(etat_serveur::applet_presente)
+            .await
+            .unwrap_or(false);
+        if port_libre && lanceur_parti {
+            return Ok(fait);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    Err(format!("{fait}, mais le serveur répond encore après 15 s"))
+}
+
+/// L'entrée Démarrer / Arrêter du menu de l'icône.
+async fn executer_action_serveur(app: tauri::AppHandle) {
+    use std::sync::atomic::Ordering;
+    let Some(menu) = app.try_state::<MenuServeur>() else {
+        return;
+    };
+    if menu.occupe.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let i = instantane_serveur(&app).await;
+    let ligne = etat_serveur::libelle_etat(&i);
+    match etat_serveur::action_proposee(&i, serveur_local::PRIS_EN_CHARGE) {
+        etat_serveur::Action::Demarrer => {
+            afficher_menu_serveur(&menu, ligne, "Démarrage du serveur…", false);
+            let http = app.state::<AppState>().http.clone();
+            let pret = lancer_le_serveur_local(&app, &http, &i.serveur, false).await;
+            tracing::info!(pret, "serveur_demarre_depuis_le_menu");
+        }
+        etat_serveur::Action::Arreter => {
+            afficher_menu_serveur(&menu, ligne, "Arrêt du serveur…", false);
+            match arreter_serveur_local(&app).await {
+                Ok(fait) => tracing::info!(%fait, "serveur_arrete_depuis_le_menu"),
+                Err(e) => tracing::warn!(error = %e, "serveur_non_arrete"),
+            }
+        }
+        etat_serveur::Action::Aucune => {}
+    }
+    menu.occupe.store(false, Ordering::SeqCst);
+    rafraichir_menu_serveur(&app).await;
+}
+
+/// La case « Ouvrir Tune Client à l'ouverture de session » : l'état réel du
+/// système est relu après le réglage (#9244).
+struct CaseOuvertureSession(CheckMenuItem<tauri::Wry>);
 
 /// Montre la fenêtre du mode retenu (mini ou complète).
 ///
@@ -1517,7 +1730,52 @@ fn main() {
                 true,
                 None::<&str>,
             )?;
-            let menu = Menu::with_items(app, &[&open_web, &open_mini, &choisir])?;
+            // L'état du serveur et son arrêt / démarrage (#9244, fil 2966) :
+            // pas d'icône propre à Tune Server, c'est celle-ci qui le montre.
+            // Textes provisoires, remplacés par la surveillance en ~2 s.
+            let etat_serveur_item =
+                MenuItem::with_id(app, "etat_serveur", "Serveur : …", false, None::<&str>)?;
+            let action_serveur = MenuItem::with_id(
+                app,
+                "action_serveur",
+                "Arrêter le serveur",
+                false,
+                None::<&str>,
+            )?;
+            let menu = Menu::with_items(
+                app,
+                &[
+                    &etat_serveur_item,
+                    &tauri::menu::PredefinedMenuItem::separator(app)?,
+                    &open_web,
+                    &open_mini,
+                    &choisir,
+                ],
+            )?;
+            // Démarrer / Arrêter : seulement là où Tune Client sait le faire
+            // (Windows, macOS). Sous Linux, le serveur est un service système :
+            // l'entrée n'apparaît pas, la ligne d'état reste.
+            if serveur_local::PRIS_EN_CHARGE {
+                menu.insert(&action_serveur, 1)?;
+            }
+            app.manage(MenuServeur {
+                etat: etat_serveur_item,
+                action: action_serveur,
+                occupe: std::sync::atomic::AtomicBool::new(false),
+                affiche: std::sync::Mutex::new(None),
+            });
+            if ouverture_session::PRIS_EN_CHARGE {
+                let ouverture = CheckMenuItem::with_id(
+                    app,
+                    "ouverture_session",
+                    "Ouvrir Tune Client à l'ouverture de session",
+                    true,
+                    ouverture_session::active(),
+                    None::<&str>,
+                )?;
+                menu.append(&ouverture)?;
+                app.manage(CaseOuvertureSession(ouverture));
+            }
             if serveur_local::PRIS_EN_CHARGE {
                 let demarrer_serveur = CheckMenuItem::with_id(
                     app,
@@ -1564,6 +1822,22 @@ fn main() {
                             let actif = case.0.is_checked().unwrap_or(false);
                             ecrire_cfg_bool(serveur_local::CLE_CONFIG, actif);
                             tracing::info!(actif, "option_demarrer_serveur_local");
+                        }
+                    }
+                    "action_serveur" => {
+                        tauri::async_runtime::spawn(executer_action_serveur(app.clone()));
+                    }
+                    "ouverture_session" => {
+                        if let Some(case) = app.try_state::<CaseOuvertureSession>() {
+                            // La case a déjà basculé ; on la recale ensuite sur
+                            // ce que le système a réellement retenu.
+                            let voulu = case.0.is_checked().unwrap_or(false);
+                            if let Err(e) = ouverture_session::regler(voulu) {
+                                tracing::warn!(voulu, error = %e, "ouverture_session_non_reglee");
+                            }
+                            let reel = ouverture_session::active();
+                            let _ = case.0.set_checked(reel);
+                            tracing::info!(voulu, reel, "ouverture_session");
                         }
                     }
                     "open_mini" => {
@@ -1639,6 +1913,24 @@ fn main() {
             // que la fenêtre s'ouvre sur un serveur qui répond ; le
             // mini-lecteur embarqué est montré pendant l'attente, pour qu'un
             // démarrage lent ne ressemble pas à un lancement raté.
+            // L'état du serveur dans le menu, tenu à jour tant que Tune
+            // Client tourne (#9244).
+            tauri::async_runtime::spawn(surveiller_serveur(app.handle().clone()));
+
+            // #9244 — ouvert par la session (`--session`) : pas de fenêtre, ni
+            // liste des serveurs ; seulement l'icône, et le serveur local si
+            // l'option le demande. Le clic sur l'icône (ou sur le Dock) montre
+            // la fenêtre comme d'habitude.
+            if ouverture_session::lance_par_la_session(std::env::args()) {
+                tracing::info!("ouvert_par_la_session_sans_fenetre");
+                let h = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    demarrer_serveur_si_absent(&h, false).await;
+                    rafraichir_menu_serveur(&h).await;
+                });
+                return Ok(());
+            }
+
             let h = app.handle().clone();
             tauri::async_runtime::spawn(async move {
                 demarrer_serveur_si_absent(&h, true).await;

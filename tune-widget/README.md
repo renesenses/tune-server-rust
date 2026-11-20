@@ -84,6 +84,55 @@ permission: `tauri-plugin-global-shortcut` is a
 Play/Pause, Next, Previous media keys. A test keeps the plugin out of every
 other section of `Cargo.toml` and out of the capabilities.
 
+## Server status, start / stop, open at login (#9244)
+
+Tune Server has no menu bar / tray icon of its own (decision of 20 Nov 2026,
+forum thread 2966): **this** icon shows it. Tray menu, top:
+
+- a status line (disabled): `Serveur local : en marche (<version>)` /
+  `Serveur local : arrêté`, or `Serveur <host:port> : en marche / injoignable`
+  for a server on another machine. Polled every 5 s with the public
+  `GET /api/v1/system/version` (`src-tauri/src/etat_serveur.rs`);
+- `Démarrer le serveur` when the local server is stopped — same launcher as
+  the option below (`serveur_local::lancer`: `Tune Server.app` on macOS,
+  `tune-server.exe --sans-console` on Windows);
+- `Arrêter le serveur` (Windows, macOS; absent on Linux, a system service)
+  only when the process **listening on the URL's port** is one PID, named
+  `tune-server`, owned by this user (`lsof -iTCP:<port> -sTCP:LISTEN` /
+  `netstat -ano`, then `ps` / `tasklist`; `etat_serveur::pid_a_arreter`),
+  and the address is loopback. Otherwise greyed out. An `ssh -L` tunnel on
+  `localhost:8888` is never stopped — `ssh` is what listens there, and a
+  `POST /system/stop` through it would reach the remote server as a *local*
+  call. Same for a container, another user's server, or a `tune-server`
+  listening on another port.
+  Stop = `POST /api/v1/system/stop` first (the server exits by itself; its
+  guard accepts a call from this machine while authentication is off).
+  Refused (authentication on: Tune Client has no token) or no answer →
+  **that PID only**, re-checked just before: `kill -TERM <pid>` on macOS
+  (clean shutdown; the `Tune Server.app` launcher then quits on its own),
+  `taskkill /PID <pid>` on Windows, `/F` only if it is still there 3 s later
+  (a `--sans-console` server has no window to close).
+
+**Open at login** — tray checkbox `Ouvrir Tune Client à l'ouverture de
+session` (off by default; `src-tauri/src/ouverture_session.rs`). It reflects
+the system, not a copy in `config.json`:
+
+- macOS: `~/Library/LaunchAgents/fr.mozaiklabs.tune-client.plist` →
+  `open -g -b fr.mozaiklabs.tune-widget --args --session`, with
+  `AssociatedBundleIdentifiers` so that System Settings › General › Login
+  Items lists it under Tune Client;
+- Windows: value `Tune Client` of `HKCU\…\CurrentVersion\Run` →
+  `"<tune-widget.exe>" --session`; a value disabled in Task Manager
+  (`StartupApproved\Run`) counts as unchecked.
+
+Launched with `--session`, Tune Client opens no window (only the icon). With
+**`Démarrer le serveur Tune s'il ne tourne pas`** also ticked, it starts the
+local server: that is how the **server** starts with the session. On Windows,
+#8861 (open) adds the server's own `Tune Server` value under the same `Run`
+key: both can be on — the later launch finds the port held, waits, then gives up.
+
+The menus are French only, like the rest of the app's native menus.
+
 ## Release (signed + notarized)
 
 Recipe: [`.github/workflows/widget.yml`](../.github/workflows/widget.yml) —
