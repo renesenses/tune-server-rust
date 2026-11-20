@@ -3504,8 +3504,8 @@ fn decider_les_forcages(
     // panneau annonçait « DSP », « ReplayGain » et « non bit-perfect » sur des
     // octets intacts. Un fil constaté WAV (renderer sans ALAC, négociation
     // SOAP) dit le contraire et l'emporte.
-    let alac_natif_servi = alac_passthrough
-        && !output_container.is_some_and(|c| c.eq_ignore_ascii_case("wav"));
+    let alac_natif_servi =
+        alac_passthrough && !output_container.is_some_and(|c| c.eq_ignore_ascii_case("wav"));
     let flux_servi_tel_quel = dsd_brut_hors_sortie_locale || alac_natif_servi;
     let dsp_applique = dsp_enabled && !flux_servi_tel_quel;
     let dsp_contourne_par_le_dsd = dsp_enabled && dsd_brut_hors_sortie_locale;

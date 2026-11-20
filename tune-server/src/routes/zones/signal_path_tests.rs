@@ -6011,8 +6011,15 @@ fn alac_track_with_rg_tag_9177(backend: &Arc<dyn DbBackend>) -> ZoneState {
 fn alac_natif_avec_un_eq_arme_annonce_le_dsp_contourne_9177() {
     let (backend, zone) = zone_alac_natif_9177(true);
     armer_l_eq(&backend, zone.id.unwrap());
-    let sp = build_signal_path(&alac_hires_playing(), &zone, &backend, Some("WiiM Pro"), "", None)
-        .unwrap();
+    let sp = build_signal_path(
+        &alac_hires_playing(),
+        &zone,
+        &backend,
+        Some("WiiM Pro"),
+        "",
+        None,
+    )
+    .unwrap();
     assert_eq!(
         step_desc(&sp, "DSP").as_deref(),
         Some("DSP contourné (ALAC natif servi tel quel)"),
@@ -6031,8 +6038,15 @@ fn alac_natif_avec_un_eq_arme_annonce_le_dsp_contourne_9177() {
 fn sans_alac_natif_le_meme_eq_reste_annonce_applique_9177() {
     let (backend, zone) = zone_alac_natif_9177(false);
     armer_l_eq(&backend, zone.id.unwrap());
-    let sp = build_signal_path(&alac_hires_playing(), &zone, &backend, Some("WiiM Pro"), "", None)
-        .unwrap();
+    let sp = build_signal_path(
+        &alac_hires_playing(),
+        &zone,
+        &backend,
+        Some("WiiM Pro"),
+        "",
+        None,
+    )
+    .unwrap();
     let dsp = step_desc(&sp, "DSP").expect("étape DSP");
     assert!(!dsp.contains("contourné"), "{dsp}");
     assert_eq!(verdict(&sp), Some(false), "{sp}");
