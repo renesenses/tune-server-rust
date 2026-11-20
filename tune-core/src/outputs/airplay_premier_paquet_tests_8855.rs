@@ -240,9 +240,15 @@ async fn pure_verrouille_part_a_zero_et_la_piste_enchainee_garde_le_geste_8855()
     sortie.set_volume(0.50).await.unwrap();
     let enchainee = jouer_une_piste(&sortie, &url, &journal).await;
     let geste = volume(0.50);
-    assert_eq!(enchainee.iter().filter(|e| e.starts_with("VOLUME")).last(), Some(&geste));
     assert_eq!(
-        enchainee.iter().position(|e| e == "RECORD").map(|i| enchainee[i + 1].clone()),
+        enchainee.iter().filter(|e| e.starts_with("VOLUME")).last(),
+        Some(&geste)
+    );
+    assert_eq!(
+        enchainee
+            .iter()
+            .position(|e| e == "RECORD")
+            .map(|i| enchainee[i + 1].clone()),
         Some(geste.clone()),
         "{enchainee:?}"
     );
