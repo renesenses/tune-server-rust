@@ -3604,6 +3604,13 @@ pub(super) async fn submit_bug_report(
     use axum::RequestExt;
     use axum::response::IntoResponse;
 
+    // Le rapport porte l'identité du compte (jeton, clé de licence) seulement
+    // pour l'administrateur, ou depuis cette machine sans authentification.
+    // Ailleurs, il part sans identité, comme sur un serveur non relié.
+    let (mut parts, corps_brut) = req.into_parts();
+    let au_nom_du_compte = crate::auth::admin_ou_cette_machine(&mut parts, &state).await;
+    let req = axum::extract::Request::from_parts(parts, corps_brut);
+
     // #7468 — le navigateur du client qui envoie : déjà dans la requête.
     let navigateur = req
         .headers()
@@ -3641,7 +3648,8 @@ pub(super) async fn submit_bug_report(
         }
     };
 
-    let (code, corps) = envoyer_le_rapport(state, description, pieces, navigateur).await;
+    let (code, corps) =
+        envoyer_le_rapport(state, description, pieces, navigateur, au_nom_du_compte).await;
     let mut resp = (code, Json(&corps)).into_response();
     // #5068 — le délai du site, aussi sous sa forme standard.
     if let Some(secs) = corps.get("retry_after").and_then(Value::as_u64) {
@@ -3664,6 +3672,7 @@ async fn envoyer_le_rapport(
     description: String,
     pieces: PiecesJointes,
     navigateur: Option<String>,
+    au_nom_du_compte: bool,
 ) -> (axum::http::StatusCode, Value) {
     use axum::http::StatusCode;
 
@@ -3678,9 +3687,13 @@ async fn envoyer_le_rapport(
     // #7920 — TOUS les identifiants, pas seulement le premier : le jeton de
     // compte s'il existe, ET la clé de licence si elle est enregistrée. Un
     // jeton expiré ne fait plus disparaître la licence du rapport.
-    let identites = crate::routes::support::identifiants_mozaiklabs(&SettingsRepo::with_backend(
-        state.backend.clone(),
-    ));
+    let identites = if au_nom_du_compte {
+        crate::routes::support::identifiants_mozaiklabs(&SettingsRepo::with_backend(
+            state.backend.clone(),
+        ))
+    } else {
+        Vec::new()
+    };
     let Json(report) = generate_bug_report(State(state)).await;
     let report_md = report["markdown"].as_str().unwrap_or("").to_string();
     if report_md.trim().is_empty() {

@@ -81,7 +81,7 @@ pub(super) struct ActiverCorps {
 /// rend la clé de secours UNE fois ; ensuite, aucun corps n'est requis.
 /// Dépose aussitôt un premier instantané si le compte est relié.
 pub(super) async fn enable(
-    _admin: RequireAdmin,
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     corps: Option<Json<ActiverCorps>>,
 ) -> Response {
@@ -185,7 +185,10 @@ pub(super) async fn disable(_admin: RequireAdmin, State(state): State<AppState>)
 
 // ── POST /system/config-backup/cloud/backup-now ─────────────────────
 
-pub(super) async fn backup_now(_admin: RequireAdmin, State(state): State<AppState>) -> Response {
+pub(super) async fn backup_now(
+    _admin: crate::auth::AdminOuCetteMachine,
+    State(state): State<AppState>,
+) -> Response {
     if let Err(r) = garde_premium(&state).await {
         return r;
     }
@@ -223,7 +226,10 @@ pub(super) async fn backup_now(_admin: RequireAdmin, State(state): State<AppStat
 
 // ── GET /system/config-backup/cloud/snapshots ───────────────────────
 
-pub(super) async fn snapshots(_admin: RequireAdmin, State(state): State<AppState>) -> Response {
+pub(super) async fn snapshots(
+    _admin: crate::auth::AdminOuCetteMachine,
+    State(state): State<AppState>,
+) -> Response {
     if let Err(r) = garde_premium(&state).await {
         return r;
     }
