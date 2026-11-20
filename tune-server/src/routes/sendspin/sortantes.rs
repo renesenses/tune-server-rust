@@ -117,15 +117,15 @@ pub async fn composer(url: &str, mode: ModeTransition, contexte: ContexteSendspi
     let ws = match ouverture {
         Ok(Ok((ws, _))) => ws,
         Ok(Err(e)) => {
-            tracing::debug!(url, error = %e, "sendspin_sortante_injoignable");
+            tracing::debug!(url = %tune_core::confidentialite::masquer_url(&url), error = %e, "sendspin_sortante_injoignable");
             return Fin::Injoignable;
         }
         Err(_) => {
-            tracing::debug!(url, "sendspin_sortante_delai_depasse");
+            tracing::debug!(url = %tune_core::confidentialite::masquer_url(&url), "sendspin_sortante_delai_depasse");
             return Fin::Injoignable;
         }
     };
-    tracing::info!(url, "sendspin_sortante_ouverte");
+    tracing::info!(url = %tune_core::confidentialite::masquer_url(&url), "sendspin_sortante_ouverte");
     let raison = Arc::new(Mutex::new(None));
     let resultat = LIEN
         .scope(
@@ -141,7 +141,7 @@ pub async fn composer(url: &str, mode: ModeTransition, contexte: ContexteSendspi
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
-    tracing::info!(url, raison = ?raison, erreur = ?resultat.as_ref().err(), "sendspin_sortante_fermee");
+    tracing::info!(url = %tune_core::confidentialite::masquer_url(&url), raison = ?raison, erreur = ?resultat.as_ref().err(), "sendspin_sortante_fermee");
     match raison {
         Some(r) => Fin::AuRevoir(r),
         None => Fin::Coupure,
@@ -218,7 +218,7 @@ pub async fn boucle(
                     _ => suivi.echecs.saturating_add(1),
                 };
                 suivi.pas_avant = Instant::now() + delai;
-                tracing::info!(url, fin = ?fin, delai_s = delai.as_secs(), "sendspin_sortante_recomposition_planifiee");
+                tracing::info!(url = %tune_core::confidentialite::masquer_url(&url), fin = ?fin, delai_s = delai.as_secs(), "sendspin_sortante_recomposition_planifiee");
                 continue;
             }
             if maintenant < suivi.pas_avant {

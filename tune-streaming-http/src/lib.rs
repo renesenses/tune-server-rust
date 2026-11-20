@@ -2521,6 +2521,27 @@ async fn service_favorites(
     };
     match result {
         Ok(data) => Json(data).into_response(),
+        // #9082 — la liaison ne porte pas la portée de lecture des artistes
+        // suivis (compte Spotify relié avant #8579) : ce n'est ni une panne
+        // ni un jeton expiré. Liste vide qualifiée, en 200, sans tenter de
+        // rafraîchissement : l'écran charge le reste et peut proposer
+        // « Reconnecter Spotify ». Avant, le 403 de Spotify devenait un 502
+        // et une notification d'erreur à chaque lancement.
+        Err(tune_core::TuneError::Refused { code, message })
+            if code == tune_core::streaming::spotify::CODE_RECONNEXION_ARTISTES_SUIVIS =>
+        {
+            tracing::info!(service = %service, fav_type = %fav_type, code, "streaming_favorites_portee_manquante");
+            let mut donnees = presenter(json!({ "artists": [] }), &fav_type, &tri);
+            if let Some(objet) = donnees.as_object_mut() {
+                objet.insert(
+                    "portee_manquante".into(),
+                    json!(tune_core::streaming::spotify::PORTEE_ARTISTES_SUIVIS),
+                );
+                objet.insert("code".into(), json!(code));
+                objet.insert("message".into(), json!(message));
+            }
+            Json(donnees).into_response()
+        }
         Err(ref e)
             if {
                 let msg = e.to_string();
@@ -4806,6 +4827,9 @@ mod pays_du_catalogue_8481_tests;
 
 #[cfg(test)]
 mod favoris_sans_gel_7729_tests;
+
+#[cfg(test)]
+mod favoris_portee_manquante_9082_tests;
 
 #[cfg(test)]
 mod favoris_pagines_8040_tests;

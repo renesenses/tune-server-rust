@@ -513,6 +513,9 @@ pub(super) struct ContexteAlsaNatif<'a> {
     pub(super) track_artist: &'a std::sync::Mutex<Option<String>>,
     pub(super) duration_ms: &'a AtomicU64,
     pub(super) seek_offset_ms: &'a AtomicU64,
+    /// #8869 — le silence de verrouillage dont le puits est précédé.
+    pub(super) silence_de_verrouillage:
+        &'a crate::audio::silence_de_verrouillage::SilenceDeVerrouillage,
     /// #9165 — le choix de suréchantillonnage de la zone, relu à chaque
     /// frontière : armé en cours de chaîne, il s'applique à la piste suivante,
     /// qui ne s'enchaîne donc pas en natif.
@@ -639,6 +642,7 @@ pub(super) fn jouer_via_alsa_natif(mut backend: BackendAlsaNatif<'_>, ctx: Conte
         track_artist,
         duration_ms,
         seek_offset_ms,
+        silence_de_verrouillage,
         surechantillonnage,
         sortie_double,
         strict_bitperfect,
@@ -683,7 +687,10 @@ pub(super) fn jouer_via_alsa_natif(mut backend: BackendAlsaNatif<'_>, ctx: Conte
     if let Ok(mut slot) = transformations_reelles.lock() {
         *slot = Some(etage.transformations());
     }
-    let mut puits = match backend.puits() {
+    let mut puits = match backend
+        .puits()
+        .precede_du_silence(silence_de_verrouillage, sortie)
+    {
         Puits::Natif(puits) => puits,
         Puits::Flottant(_) => unreachable!("BackendAlsaNatif ne fournit qu'un puits natif"),
     };

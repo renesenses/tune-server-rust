@@ -522,7 +522,7 @@ impl PlaybackOrchestrator {
 
         info!(
             stream_id = %stream_id,
-            url = %radio_url,
+            url = %crate::confidentialite::masquer_url(&radio_url),
             "media_server_radio_decode_started"
         );
         tokio::spawn(async move {

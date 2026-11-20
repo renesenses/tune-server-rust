@@ -74,7 +74,8 @@
 //!
 //! rc9 (#7122), la carte publique anonyme, dans [`crate::globe`] : `GET
 //! /world/points`, `GET|PUT|DELETE /me/public-map-opt-out`, relayés à
-//! l'identique.
+//! l'identique. rc13 : `GET /world/circles`, les cercles du monde en points
+//! anonymes, relayé à l'identique.
 //!
 //! #6935, inviter sans e-mail, dans [`crate::sans_email`] : `POST
 //! /invitations/by-pseudo`, `GET|POST /invitation-links`, `DELETE
@@ -226,6 +227,8 @@ pub fn router(relais: Arc<Relais>, license: Arc<LicenseManager>) -> Router<()> {
         .route("/contacts/locations", get(crate::globe::lieux_des_contacts))
         // rc9 (#7122) : la carte publique anonyme et son interrupteur.
         .route("/world/points", get(crate::globe::points_du_monde))
+        // rc13 : les cercles du monde, en points anonymes.
+        .route("/world/circles", get(crate::globe::cercles_du_monde))
         .route(
             "/me/public-map-opt-out",
             get(crate::globe::mon_retrait_de_la_carte)

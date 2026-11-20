@@ -748,14 +748,14 @@ pub(crate) fn journaliser_zone_auto_retenue(id: &str, name: &str, location: &str
         info!(
             id,
             name,
-            location,
+            location = %tune_core::confidentialite::masquer_url(&location),
             "ssdp_renderer_sur_cette_machine_sans_zone_auto — renderer de cette machine, \
              la sortie locale est à utiliser ; une zone se crée à la main si besoin"
         );
     } else {
         debug!(
             id,
-            name, location, "ssdp_renderer_sur_cette_machine_sans_zone_auto"
+            name, location = %tune_core::confidentialite::masquer_url(&location), "ssdp_renderer_sur_cette_machine_sans_zone_auto"
         );
     }
 }
@@ -1122,7 +1122,7 @@ async fn handle_ssdp_discovered(
         debug!(
             id = %dev.id,
             name = %dev.name,
-            location = %loc,
+            location = %tune_core::confidentialite::masquer_url(&loc),
             "ssdp_notre_propre_renderer_ignore"
         );
         return;
@@ -1721,7 +1721,7 @@ async fn retrouver_par_unicast(
     info!(
         id = %kr.device_id,
         name = %kr.name,
-        ancienne = %kr.location,
+        ancienne = %tune_core::confidentialite::masquer_url(&kr.location),
         nouvelle = %nouvelle,
         "known_renderer_retrouve_par_msearch_unicast"
     );
@@ -1965,7 +1965,7 @@ async fn rattacher_les_renderers_connus(
                         if let IdentityVerdict::SameHardware(evidence) = verdict {
                             info!(
                                 nom = %kr.name,
-                                location = %kr.location,
+                                location = %tune_core::confidentialite::masquer_url(&kr.location),
                                 udn_memorise = %kr.device_id,
                                 udn_annonce = %observed.udn,
                                 reconnu_par = evidence.label(),
@@ -1991,7 +1991,7 @@ async fn rattacher_les_renderers_connus(
                         info!(
                             id = %kr.device_id,
                             name = %kr.name,
-                            location = %kr.location,
+                            location = %tune_core::confidentialite::masquer_url(&kr.location),
                             "known_renderer_reregistered"
                         );
                     }
@@ -1999,7 +1999,7 @@ async fn rattacher_les_renderers_connus(
                         warn!(
                             nom_attendu = %kr.name,
                             nom_trouve = %dev.name,
-                            location = %kr.location,
+                            location = %tune_core::confidentialite::masquer_url(&kr.location),
                             udn_memorise = %kr.device_id,
                             udn_annonce = %observed.udn,
                             distingue_par = evidence.label(),
@@ -2013,7 +2013,7 @@ async fn rattacher_les_renderers_connus(
                     IdentityVerdict::Undecidable => {
                         warn!(
                             nom = %kr.name,
-                            location = %kr.location,
+                            location = %tune_core::confidentialite::masquer_url(&kr.location),
                             udn_memorise = %kr.device_id,
                             udn_annonce = %observed.udn,
                             action = "l'identifiant UPnP a changé et rien ne permet de distinguer \
@@ -2028,14 +2028,14 @@ async fn rattacher_les_renderers_connus(
             None if au_demarrage => {
                 warn!(
                     id = %kr.device_id,
-                    location = %kr.location,
+                    location = %tune_core::confidentialite::masquer_url(&kr.location),
                     "known_renderer_probe_failed"
                 );
             }
             None => {
                 debug!(
                     id = %kr.device_id,
-                    location = %kr.location,
+                    location = %tune_core::confidentialite::masquer_url(&kr.location),
                     "zone_hors_ligne_renderer_toujours_injoignable"
                 );
             }

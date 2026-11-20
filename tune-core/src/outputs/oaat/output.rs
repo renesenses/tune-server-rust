@@ -838,7 +838,7 @@ impl OutputTarget for OaatOutput {
         *self.current_artist.lock().await = Some(artist.clone());
         self.duration_ms.store(track_duration_ms, Ordering::SeqCst);
 
-        info!(device = %self.name, url = %url, title = %title, "oaat: play_media");
+        info!(device = %self.name, url = %crate::confidentialite::masquer_url(&url), title = %title, "oaat: play_media");
 
         let endpoint_addr = self.endpoint_addr();
         let playing = self.playing.clone();
@@ -922,7 +922,7 @@ impl OutputTarget for OaatOutput {
         let task = tokio::spawn(async move {
             use futures_util::StreamExt;
 
-            debug!(device = %device_name, url = %url, "oaat: play_media spawned");
+            debug!(device = %device_name, url = %crate::confidentialite::masquer_url(&url), "oaat: play_media spawned");
 
             let config = ControllerConfig {
                 controller_id,
@@ -2436,19 +2436,19 @@ impl OutputTarget for OaatOutput {
                 if direct_ok {
                     return;
                 }
-                debug!(device = %device_name, "oaat: falling back to HTTP stream for {url}");
+                debug!(device = %device_name, url = %crate::confidentialite::masquer_url(&url), "oaat: falling back to HTTP stream");
             }
 
-            debug!(device = %device_name, url = %url, "oaat: fetching audio stream");
+            debug!(device = %device_name, url = %crate::confidentialite::masquer_url(&url), "oaat: fetching audio stream");
             let resp = match http_client.get(&url).send().await {
                 Ok(r) if r.status().is_success() => r,
                 Ok(r) => {
-                    error!(device = %device_name, status = %r.status(), url = %url, "oaat: HTTP error");
+                    error!(device = %device_name, status = %r.status(), url = %crate::confidentialite::masquer_url(&url), "oaat: HTTP error");
                     playing.store(false, Ordering::SeqCst);
                     return;
                 }
                 Err(e) => {
-                    error!(device = %device_name, error = %e, url = %url, "oaat: fetch failed");
+                    error!(device = %device_name, error = %e, url = %crate::confidentialite::masquer_url(&url), "oaat: fetch failed");
                     playing.store(false, Ordering::SeqCst);
                     return;
                 }

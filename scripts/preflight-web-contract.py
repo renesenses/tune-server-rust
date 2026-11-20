@@ -75,6 +75,9 @@ SOURCES_SERVEUR = [
     "tune-stream-http/src",
     "tune-streaming-http/src",
     "tune-bridge/src",
+    # Routes de test seulement (#[tokio::test] de tune-ffi/src/lib.rs, garde
+    # mobile) : scannées pour que la garde des caisses non scannées se taise.
+    "tune-ffi/src",
     "plugins",
 ]
 
