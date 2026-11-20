@@ -2262,6 +2262,9 @@ mod passthrough_sans_traitement_7986_tests;
 // #9175 — Sendspin et Devialet AIR lisent le flux traité dès qu'un traitement est actif.
 #[cfg(test)]
 mod sorties_qui_decodent_le_fichier_9175_tests;
+// Suite de #9175 — saut et reprise de bout en bout avec une vraie sortie Sendspin.
+#[cfg(test)]
+mod sendspin_relance_9175_tests;
 // #8006 — Pause et Arrêt n'attendent plus sans limite un appareil occupé.
 #[cfg(test)]
 mod sortie_occupee_8006_tests;
