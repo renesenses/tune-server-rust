@@ -149,7 +149,12 @@ fn app_et_etat(base: &str) -> (axum::Router, AppState) {
     SettingsRepo::with_backend(state.backend.clone())
         .set("mozaik_base_url", base)
         .unwrap();
-    let router = tune_server::routes::router(state.clone());
+    let router = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     (router, state)
 }
 

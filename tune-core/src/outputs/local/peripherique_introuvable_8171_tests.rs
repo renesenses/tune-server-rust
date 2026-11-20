@@ -96,3 +96,94 @@ fn dac_present_sous_son_nom_est_ouvert() {
     assert_eq!(r, DeviceResolution::Matched(DeviceMatch::ByDisplayName(1)));
     assert_eq!(ouvert_sous_windows(&r), Some(1));
 }
+
+// ---------------------------------------------------------------------------
+// Retour rc12 (fil 2708, réponse 11420) : DAC éteint, le son part encore sur
+// les haut-parleurs du PC.
+// ---------------------------------------------------------------------------
+
+const ID_DAC: &str = "wasapi:{0.0.0.00000000}.{dac-denafrips}";
+const ID_REALTEK: &str = "wasapi:{0.0.0.00000000}.{realtek}";
+
+/// LA CAUSE, rejouée : la zone du DAC porte le nom « Haut-parleurs » et
+/// l'identifiant du DAC. DAC éteint, la résolution par NOM retrouve la carte
+/// Realtek — pas un repli sur la sortie par défaut, un HOMONYME : la règle de
+/// la rc12 ne pouvait pas le voir.
+#[test]
+fn dac_eteint_le_nom_haut_parleurs_retombait_sur_la_carte_du_pc_8171() {
+    let parc = [wasapi(ID_REALTEK, "Haut-parleurs")];
+    let resolution = resolve_device(
+        "Haut-parleurs",
+        Some(ID_DAC),
+        Some(HOTE_WASAPI),
+        HOTE_WASAPI,
+        &parc,
+    );
+    assert_eq!(
+        resolution,
+        DeviceResolution::Matched(DeviceMatch::ByDisplayName(0)),
+        "la résolution par nom choisit bien la carte du PC : c'est le constat"
+    );
+    // … et la règle de l'homonyme l'écarte.
+    assert!(
+        crate::outputs::peripherique_introuvable::le_nom_designe_un_autre_endpoint(
+            Some(ID_DAC),
+            &parc[0].endpoint_id,
+            parc.iter().map(|p| p.endpoint_id.as_str()),
+        )
+    );
+}
+
+/// CONTRE-ÉPREUVE : DAC allumé, il est retrouvé par SON identifiant, quel que
+/// soit l'ordre des homonymes.
+#[test]
+fn dac_allume_retrouve_par_son_identifiant_parmi_les_homonymes_8171() {
+    for parc in [
+        [
+            wasapi(ID_REALTEK, "Haut-parleurs"),
+            wasapi(ID_DAC, "Haut-parleurs"),
+        ],
+        [
+            wasapi(ID_DAC, "Haut-parleurs"),
+            wasapi(ID_REALTEK, "Haut-parleurs"),
+        ],
+    ] {
+        let resolution = resolve_device(
+            "Haut-parleurs",
+            Some(ID_DAC),
+            Some(HOTE_WASAPI),
+            HOTE_WASAPI,
+            &parc,
+        );
+        let DeviceResolution::Matched(m) = resolution else {
+            panic!("{resolution:?}");
+        };
+        assert_eq!(parc[m.index()].endpoint_id, ID_DAC);
+        assert!(matches!(m, DeviceMatch::ByEndpointId(_)));
+    }
+}
+
+/// L'énumération sans sonde nomme les endpoints comme la découverte : mêmes
+/// rangs `(n)`, donc mêmes `local:{nom}` que ceux stockés dans les zones.
+#[test]
+fn la_liste_sans_sonde_nomme_comme_la_decouverte_8171() {
+    let parc = [
+        wasapi(ID_REALTEK, "Haut-parleurs"),
+        wasapi("wasapi:{x}.{spdif}", "Realtek Digital Output"),
+        wasapi(ID_DAC, "Haut-parleurs"),
+        wasapi("wasapi:{x}.{dac2}", "DENAFRIPS USB DAC"),
+    ];
+    let noms: Vec<String> = super::resolution::nommer_comme_la_decouverte(&parc)
+        .into_iter()
+        .map(|(nom, _, _)| nom)
+        .collect();
+    assert_eq!(
+        noms,
+        [
+            "Haut-parleurs",
+            "Realtek Digital Output",
+            "Haut-parleurs (2)",
+            "DENAFRIPS USB DAC"
+        ]
+    );
+}

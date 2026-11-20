@@ -870,6 +870,13 @@ pub(super) async fn get_config(
             "label": crate::i18n::t(&lang, &format!("settings.replayGainSource.{}", rg_source_mode.as_str())),
         }),
     );
+    // #8968 — les valeurs de `replaygain_mode` que CE serveur comprend. Un
+    // client n'offre « Auto » que s'il le lit ici : un serveur plus ancien
+    // lirait `auto` comme `off`, coupant le gain ET la campagne d'analyse.
+    config.insert(
+        "replaygain_modes".to_string(),
+        json!(tune_core::audio::replaygain::MODES_ACCEPTES),
+    );
     // Consentement de contribution. Deux valeurs, et elles ne disent pas la
     // meme chose :
     //   - `enabled`   : le choix de l'utilisateur, relu sur la valeur BRUTE en
@@ -2967,6 +2974,13 @@ pub(super) async fn get_env(State(state): State<AppState>) -> Json<Value> {
             .as_deref()
             .and_then(crate::conteneur::identifiant_court)
             .map(str::to_string),
+        // renesenses/tune-server-rust#8747 — le dossier de la base survit-il à
+        // la recréation du conteneur ? `null` hors conteneur ; sinon
+        // `{dir, kind, persistent}`. L'interface montre un bandeau quand
+        // `persistent` est faux (volume anonyme, rien de monté, tmpfs).
+        "data_persistence": crate::persistance_donnees::en_json(
+            crate::persistance_donnees::relever(&state.config.db_path).as_ref()
+        ),
     }))
 }
 
@@ -3066,11 +3080,22 @@ pub(super) struct ImportConfigQuery {
 /// écriture qui échoue en cours de route est DITE (`500`) avec ce qui était
 /// déjà appliqué, au lieu d'un `200` silencieusement incomplet.
 pub(super) async fn import_config(
-    _admin: crate::auth::RequireAdmin,
+    // Engage la machine : administrateur, ou authentification coupée,
+    // seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
+    state: State<AppState>,
+    q: Query<ImportConfigQuery>,
+    body: Json<serde_json::Map<String, Value>>,
+) -> Result<impl IntoResponse, AppError> {
+    importer_la_configuration(state, q, body).await
+}
+
+/// Le corps de l'import, partagé avec l'aperçu (qui n'écrit rien).
+async fn importer_la_configuration(
     State(state): State<AppState>,
     Query(q): Query<ImportConfigQuery>,
     Json(body): Json<serde_json::Map<String, Value>>,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<Json<Value>, AppError> {
     use tune_core::config_export as ce;
     let mut fichier = ce::lire(body).map_err(AppError::bad_request)?;
     // Mêmes clés protégées que `PATCH /system/config` : sans admin effectif,
@@ -3123,12 +3148,11 @@ pub(super) async fn import_config(
 /// `?dry_run=true`, ignorerait le paramètre et APPLIQUERAIT l'import — c'est
 /// pourquoi l'écran passe par ici.
 pub(super) async fn preview_import_config(
-    admin: crate::auth::RequireAdmin,
+    _admin: crate::auth::RequireAdmin,
     state: State<AppState>,
     Json(body): Json<serde_json::Map<String, Value>>,
 ) -> Result<impl IntoResponse, AppError> {
-    import_config(
-        admin,
+    importer_la_configuration(
         state,
         Query(ImportConfigQuery { dry_run: true }),
         Json(body),
@@ -3866,6 +3890,7 @@ pub(crate) fn retirer_un_dossier(
         "dirs": dirs,
         "orphan_tracks": plan.tracks,
         "purged": r.purgees,
+        "purge_failed": r.echecs,
         "purge_refused": false,
         "orphan_albums_removed": r.albums_orphelins,
         "orphan_artists_removed": r.artistes_orphelins,
@@ -4094,12 +4119,12 @@ pub(crate) fn regrouper_hors_perimetre(
     sortie
 }
 
-/// `(id, file_path)` de toutes les pistes LOCALES.
+/// `(id, chemin du média)` de toutes les pistes LOCALES, tranches CUE comprises.
 fn pistes_locales(state: &AppState) -> Vec<(i64, String)> {
     state
         .backend
         .query_many(
-            "SELECT id, file_path FROM tracks WHERE source = 'local' AND file_path IS NOT NULL",
+            "SELECT id, COALESCE(file_path, cue_media_path) FROM tracks WHERE source = 'local' AND COALESCE(file_path, cue_media_path) IS NOT NULL",
             &[],
         )
         .ou_defaut_journalise()
@@ -4265,6 +4290,7 @@ fn impact(state: &AppState, ids: &[i64]) -> ImpactPurge {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct ResultatPurge {
     purgees: i64,
+    echecs: i64,
     albums_orphelins: i64,
     artistes_orphelins: i64,
     favoris_rerattaches: i64,
@@ -4290,8 +4316,12 @@ fn executer_purge(state: &AppState, ids: &[i64]) -> ResultatPurge {
     let track_repo = TrackRepo::with_backend(state.backend.clone());
     let mut r = ResultatPurge::default();
     for id in ids {
-        if track_repo.delete(*id).is_ok() {
-            r.purgees += 1;
+        match track_repo.delete(*id) {
+            Ok(()) => r.purgees += 1,
+            Err(error) => {
+                r.echecs += 1;
+                tracing::error!(track_id = *id, %error, "purge_piste_echec");
+            }
         }
     }
 
@@ -4359,6 +4389,12 @@ fn executer_purge(state: &AppState, ids: &[i64]) -> ResultatPurge {
     r.paires_distinctes_rerattachees = distinctes.relinked as i64;
     r.paires_distinctes_non_resolues = distinctes.unresolved as i64;
 
+    if r.purgees > 0 {
+        state.event_bus.emit(
+            tune_core::event_types::EventType::LibraryUpdated.as_str(),
+            json!({ "source": "purge_orphelines", "purged": r.purgees }),
+        );
+    }
     r
 }
 
@@ -4556,6 +4592,7 @@ pub(super) async fn purge_orphan_tracks(
 
     Ok(Json(json!({
         "purged": r.purgees,
+        "purge_failed": r.echecs,
         "refused": false,
         "orphan_albums_removed": r.albums_orphelins,
         "orphan_artists_removed": r.artistes_orphelins,
@@ -4579,7 +4616,9 @@ pub(super) async fn purge_orphan_tracks(
 /// Honnêteté : sur une installation supervisée (systemd `Restart=always`,
 /// service Windows), le superviseur peut relancer le processus aussitôt —
 /// l'écran le dit dans la confirmation.
-pub(super) async fn stop(_admin: crate::auth::RequireAdmin) -> impl IntoResponse {
+/// Arrêter le serveur engage la machine, comme le redémarrage : même garde
+/// (administrateur, ou authentification coupée : seulement depuis cette machine).
+pub(super) async fn stop(_garde: crate::auth::AdminOuCetteMachine) -> impl IntoResponse {
     tokio::spawn(async {
         // Laisser la réponse HTTP partir avant de mourir.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -5007,6 +5046,7 @@ pub(super) async fn get_license(State(state): State<AppState>) -> Json<Value> {
 }
 
 pub(super) async fn set_license(
+    _garde: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     Json(body): Json<LicenseBody>,
 ) -> impl IntoResponse {
@@ -5039,7 +5079,10 @@ pub(super) async fn set_license(
     .into_response()
 }
 
-pub(super) async fn delete_license(State(state): State<AppState>) -> Json<Value> {
+pub(super) async fn delete_license(
+    _garde: crate::auth::AdminOuCetteMachine,
+    State(state): State<AppState>,
+) -> Json<Value> {
     let remote_released = crate::routes::cloud::retirer_la_licence(&state).await;
     Json(crate::routes::cloud::reponse_de_retrait(
         json!({ "status": "ok", "tier": "free" }),
@@ -6115,6 +6158,35 @@ mod replaygain_source_tests {
         assert!(!tune_core::audio::replaygain::services_enabled(
             &state.backend
         ));
+    }
+
+    /// #8968 — `GET /config` annonce `auto` (le client n'offre le bouton
+    /// qu'à ce prix), `auto` s'écrit et se relit, et changer de SOURCE garde
+    /// la granularité `auto` au lieu de la reculer vers la piste.
+    #[tokio::test]
+    async fn le_mode_auto_est_annonce_ecrit_et_garde_8968() {
+        let state = etat();
+        let c = config_de(&state).await;
+        assert_eq!(
+            c["replaygain_modes"],
+            serde_json::json!(["off", "track", "album", "auto"]),
+            "le serveur n'annonce pas le mode Auto"
+        );
+        patch(&state, serde_json::json!({"replaygain_mode": "auto"})).unwrap();
+        assert_eq!(
+            tune_core::audio::replaygain::ReplayGainSettings::load(&state.backend).mode,
+            tune_core::audio::replaygain::ReplayGainMode::Auto
+        );
+        patch(
+            &state,
+            serde_json::json!({"replaygain_source": "file_tags"}),
+        )
+        .unwrap();
+        assert_eq!(
+            config_de(&state).await["replaygain_mode"],
+            "auto",
+            "changer de source a reculé Auto vers la piste"
+        );
     }
 
     #[tokio::test]
@@ -7457,3 +7529,7 @@ mod confinement_chemins_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "cue_purge_8836_tests.rs"]
+mod cue_purge_8836_tests;

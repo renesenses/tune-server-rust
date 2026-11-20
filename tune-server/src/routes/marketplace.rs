@@ -465,6 +465,7 @@ async fn install_plugin(
 // ---------------------------------------------------------------------------
 
 async fn uninstall_plugin(
+    _garde: crate::auth::AdminOuCetteMachine,
     Path(slug): Path<String>,
     State(state): State<AppState>,
     headers: HeaderMap,

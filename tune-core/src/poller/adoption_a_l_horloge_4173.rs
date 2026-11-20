@@ -720,6 +720,11 @@ mod blanc_du_dmp_a6_rc2_4382;
 #[cfg(test)]
 mod bascule_sur_la_suivante_3967;
 
+/// #8863 — les grosses futures du sondage et de la préparation de la
+/// suivante restent en tas : la pile du fil de test ne déborde plus.
+#[cfg(test)]
+mod pile_du_sondeur_8863;
+
 /// #4682 — un déplacement de la barre de progression ne fausse plus
 /// l'enchaînement : ce même banc, la fin de piste rejouée après un
 /// déplacement près de la fin, et un recul après l'armement.
@@ -753,10 +758,22 @@ mod preparation_bornee_5970;
 #[cfg(test)]
 mod set_next_coupe_la_piste_6477;
 
+/// #8868 (FiiO K17, fil 2323, rc12) — la règle #6477 relue après un
+/// redémarrage, en DSF natif comme en DoP ; le renderer conforme garde son
+/// `SetNext`.
+#[cfg(test)]
+mod k17_dsf_set_next_8868;
+
 /// #6910 (fil 2412) — le suivant DSD armé sur le renderer DLNA qui annonce le
 /// DSD et `SetNext` ; la garde de #402 gardée pour les autres.
 #[cfg(test)]
 mod dsd_suivant_dlna_6910;
+
+/// #9206 (fil 2961) — le renderer qui ouvre le flux armé À la fin et bascule
+/// en retard sur son URI n'est plus coupé ; le DMP-A6 qui l'a préchargé de
+/// longue date est relancé comme avant.
+#[cfg(test)]
+mod flux_arme_ouvert_a_la_fin_9206;
 
 /// Budget du cadre de sondage du banc : il est emboîté plusieurs fois dans
 /// les scénarios d'adoption, sur la petite pile des threads de test macOS.

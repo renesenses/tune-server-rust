@@ -229,11 +229,11 @@ async fn dsd_sur_dlna_nest_pas_promis_mais_dsd_en_local_lest() {
 
 /// LE TÉMOIN — un client 0.9.131 déjà installé continue de fonctionner.
 ///
-/// L'enveloppe garde exactement ses trois clefs, et chaque ligne garde
-/// exactement les clefs de `QueueEntry`. `gapless_next` est la SEULE clef
-/// nouvelle : rien n'a été retiré, rien n'a changé de type.
+/// L’enveloppe garde ses trois champs historiques et annonce désormais la
+/// capacité de déplacement en bloc (#8849). Chaque ligne conserve les champs
+/// de QueueEntry ; gapless_next reste son seul ajout.
 #[tokio::test]
-async fn temoin_la_reponse_ne_gagne_que_gapless_next() {
+async fn temoin_les_lignes_ne_gagnent_que_gapless_next() {
     let (app, state) = app_et_etat();
     let zid = zone(&state, "Temoin", "mock", "sortie-temoin");
     brancher_sortie(&state, "sortie-temoin", "mock").await;
@@ -253,9 +253,10 @@ async fn temoin_la_reponse_ne_gagne_que_gapless_next() {
     enveloppe.sort_unstable();
     assert_eq!(
         enveloppe,
-        vec!["length", "position", "tracks"],
-        "l'enveloppe de la file ne change pas"
+        vec!["block_move_supported", "length", "position", "tracks"],
+        "l’enveloppe conserve ses champs et annonce le déplacement en bloc"
     );
+    assert_eq!(corps["block_move_supported"], true);
     assert_eq!(corps["length"], 2);
     assert_eq!(corps["position"], 0);
 

@@ -4493,3 +4493,108 @@ mod confinement_chemins_tests {
         assert_eq!(r.status(), StatusCode::OK);
     }
 }
+
+/// #8746 — l'assistant SMB peut désormais déclarer un SOUS-DOSSIER du
+/// partage comme racine de bibliothèque (variante B, décision du 15/11). Le
+/// montage reste celui du partage entier ; la garde de « Oublier ce partage »
+/// doit donc voir une racine placée SOUS le point, et elle seule.
+#[cfg(test)]
+mod tests_sous_dossier_8746 {
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    async fn oublier(app: &axum::Router, id: i64) -> (StatusCode, serde_json::Value) {
+        let rep = app
+            .clone()
+            .oneshot(
+                Request::delete(format!("/api/v1/network/smb/mounts/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let statut = rep.status();
+        let octets = axum::body::to_bytes(rep.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (statut, serde_json::from_slice(&octets).unwrap_or_default())
+    }
+
+    /// Un partage monté dont SEULE une racine sous le point est déclarée
+    /// (`<point>/Musique/Jazz`) : « Oublier » rend 409 et la nomme.
+    /// Contre-épreuve dans le même test : la racine d'un point VOISIN
+    /// (`nas_Music2/Jazz`) ne dépend pas de `nas_Music` — oubli sans 409.
+    #[tokio::test]
+    async fn une_racine_sous_le_point_bloque_l_oubli_du_partage() {
+        use tune_core::db::backend::ToSqlValue;
+        let dossier = tune_core::test_scratch::scratch_dir("tune_sous_dossier_8746");
+        let db = dossier.join("tune.db");
+        let config = crate::config::TuneConfig {
+            db_path: db.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        let etat = crate::state::AppState::new(db.to_str().unwrap(), 0, config).unwrap();
+        let backend = etat.backend.clone();
+        let point = dossier.join("montages").join("nas_Music");
+        let sous_dossier = point.join("Musique").join("Jazz");
+        std::fs::create_dir_all(&sous_dossier).unwrap();
+        let voisin = dossier.join("montages").join("nas_Music2");
+        let racine_voisine = voisin.join("Jazz");
+        std::fs::create_dir_all(&racine_voisine).unwrap();
+        let point_s = point.to_string_lossy().to_string();
+        let voisin_s = voisin.to_string_lossy().to_string();
+        let sous_s = sous_dossier.to_string_lossy().to_string();
+        let racine_voisine_s = racine_voisine.to_string_lossy().to_string();
+        let inserer = |share: &str, chemin: &str| {
+            backend
+                .execute_returning_id(
+                    "INSERT INTO network_mounts (mount_type, server, share, mount_path) VALUES ('smb', ?, ?, ?)",
+                    &[
+                        &"192.168.10.69" as &dyn ToSqlValue,
+                        &share as &dyn ToSqlValue,
+                        &chemin as &dyn ToSqlValue,
+                    ],
+                )
+                .unwrap()
+        };
+        let id = inserer("Music", &point_s);
+        let id_voisin = inserer("Music2", &voisin_s);
+        // Seul le sous-dossier est déclaré, jamais la racine du partage.
+        tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+            .set(
+                "music_dirs",
+                &serde_json::to_string(&vec![sous_s.clone()]).unwrap(),
+            )
+            .unwrap();
+        let app = crate::routes::router(etat);
+
+        let (statut, v) = oublier(&app, id).await;
+        assert_eq!(statut, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["error"], "racines_dependantes");
+        assert_eq!(v["racines"], serde_json::json!([sous_s]));
+        assert_eq!(v["message_key"], "api.network.shareHasLibraryFolders");
+
+        // Contre-épreuve : le point voisin n'a aucune racine dessous, même
+        // si `nas_Music2/Jazz` commence par le texte de `nas_Music`.
+        tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+            .set(
+                "music_dirs",
+                &serde_json::to_string(&vec![sous_s.clone(), racine_voisine_s]).unwrap(),
+            )
+            .unwrap();
+        let (statut, v) = oublier(&app, id).await;
+        assert_eq!(v["racines"], serde_json::json!([sous_s]), "{v}");
+        assert_eq!(statut, StatusCode::CONFLICT);
+        let (statut, v) = oublier(&app, id_voisin).await;
+        assert_eq!(statut, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["racines"].as_array().map(Vec::len), Some(1), "{v}");
+        assert!(
+            v["racines"][0]
+                .as_str()
+                .unwrap()
+                .ends_with("nas_Music2/Jazz"),
+            "{v}"
+        );
+    }
+}
