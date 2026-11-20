@@ -3752,8 +3752,8 @@ async fn handle_stream_par_la_route(
     connexion: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     mut req_headers: HeaderMap,
 ) -> Response {
-    let en_boucle_locale = connexion
-        .is_some_and(|axum::Extension(axum::extract::ConnectInfo(pair))| {
+    let en_boucle_locale =
+        connexion.is_some_and(|axum::Extension(axum::extract::ConnectInfo(pair))| {
             pair_en_boucle_locale(pair.ip())
         });
     if !en_boucle_locale {

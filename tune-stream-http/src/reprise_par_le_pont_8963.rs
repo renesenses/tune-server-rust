@@ -233,10 +233,9 @@ fn la_retenue_par_le_pont_est_plafonnee() {
     let session = StreamSession::new("long-8963".into(), info, false, 16);
     let avant = session.fenetre_de_retenue_effective();
     assert_eq!(session.tete_de_retenue_effective(), 0);
-    assert!(session.reserver_pour_le_pont(
-        &BUDGET,
-        tune_core::http::streamer::RETENUE_PONT_MAX_OCTETS
-    ));
+    assert!(
+        session.reserver_pour_le_pont(&BUDGET, tune_core::http::streamer::RETENUE_PONT_MAX_OCTETS)
+    );
     assert_eq!(session.fenetre_de_retenue_effective(), avant);
     assert_eq!(
         session.tete_de_retenue_effective(),
@@ -260,7 +259,9 @@ async fn la_marque_du_pont_n_est_crue_que_d_un_pair_en_boucle_locale() {
     assert!(pair_en_boucle_locale("::1".parse().unwrap()));
     assert!(pair_en_boucle_locale("::ffff:127.0.0.1".parse().unwrap()));
     assert!(!pair_en_boucle_locale("192.168.1.20".parse().unwrap()));
-    assert!(!pair_en_boucle_locale("::ffff:192.168.1.20".parse().unwrap()));
+    assert!(!pair_en_boucle_locale(
+        "::ffff:192.168.1.20".parse().unwrap()
+    ));
 }
 
 /// Le budget commun : une réservation qui ne tient plus est refusée, la
@@ -318,27 +319,39 @@ async fn au_dela_du_plafond_le_debut_de_la_piste_est_garde() {
     assert!(octets == source[44..]);
 }
 
-/// Tête et fenêtre disjointes (plafond de 1 Mo) : la reprise à 44 rend au
-/// moins toute la tête, à l'octet — de quoi démarrer, au lieu de rien.
+/// Tête et fenêtre disjointes (plafond de 1 Mo) : la retenue garde le DÉBUT
+/// de la piste, à l'octet, et la fin ; le milieu est perdu. Vérifié sur la
+/// retenue elle-même : par HTTP, la réponse à `bytes=44-` annonce toute la
+/// longueur et se ferme au bout de la tête, ce qu'un client lit plus ou
+/// moins selon la course avec la fermeture.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn une_tete_disjointe_rend_au_moins_le_debut_a_l_octet() {
+async fn une_tete_disjointe_garde_le_debut_a_l_octet() {
     static BUDGET: tune_core::http::streamer::BudgetDuPont =
         tune_core::http::streamer::BudgetDuPont::new(u64::MAX);
     let pcm = 10_000_000usize;
-    let (url, _session, source) = servir_avec("tete-disjointe-8963", pcm, true, |s| {
+    let (url, session, source) = servir_avec("tete-disjointe-8963", pcm, true, |s| {
         assert!(s.reserver_pour_le_pont(&BUDGET, 1_000_000));
     })
     .await;
     let premier = corps(demander(&url, None, false).await).await;
     assert_eq!(premier.len(), 44 + pcm);
-    let octets = match envoyer(&url, Some("bytes=44-"), false).await {
-        Ok(r) => corps(r).await,
-        Err(_) => Vec::new(),
-    };
-    assert!(
-        octets.len() >= 1_000_000 - 44,
-        "reprise à 44 : {} octets, la tête n'a pas été servie",
-        octets.len()
-    );
-    assert!(octets[..1_000_000 - 44] == source[44..1_000_000]);
+    let (debut, fin) = session.etendue_retenue();
+    assert_eq!((debut, fin), (0, 44 + pcm as u64));
+    match session.relire(44, 2_000_000) {
+        tune_core::http::streamer::Relecture::Octets(o) => {
+            assert_eq!(o.len(), 1_000_000 - 44, "toute la tête, pas plus");
+            assert!(o == source[44..1_000_000]);
+        }
+        autre => panic!("la tête n'est pas relue : {autre:?}"),
+    }
+    assert!(matches!(
+        session.relire(1_000_000, 1),
+        tune_core::http::streamer::Relecture::Evincee { .. }
+    ));
+    match session.relire(9_999_000, 1_000_000) {
+        tune_core::http::streamer::Relecture::Octets(o) => {
+            assert!(o == source[9_999_000..]);
+        }
+        autre => panic!("la fin n'est pas relue : {autre:?}"),
+    }
 }
