@@ -1496,3 +1496,7 @@ mod enrich_selection_tests_3810;
 #[cfg(test)]
 #[path = "enrich_reprise_tests_7983.rs"]
 mod enrich_reprise_tests_7983;
+
+#[cfg(test)]
+#[path = "enrich_gravure_tests_8864.rs"]
+mod enrich_gravure_tests_8864;
