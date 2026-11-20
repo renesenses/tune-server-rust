@@ -331,7 +331,7 @@ fn identifiants_prives() -> Vec<String> {
 
 /// `clé=valeur`, `clé: valeur`, `"clé":"valeur"`, `clé=Some("valeur")`. La
 /// clé est jugée par [`est_personnel`] dans la fermeture : une seule liste.
-static RE_CLE_VALEUR: LazyLock<Regex> = LazyLock::new(|| {
+pub(crate) static RE_CLE_VALEUR: LazyLock<Regex> = LazyLock::new(|| {
     re(
         r#"(?i)\b([a-z][a-z0-9_.-]*)(["']?[ \t]*[:=][ \t]*(?:Some\([ \t]*)?["']?)([^\s"',;&(){}\[\]<>]+)"#,
     )

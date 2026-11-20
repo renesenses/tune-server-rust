@@ -35,12 +35,11 @@ pub(super) const LONGUEUR_MAX: usize = 1024;
 
 const MASQUE: &str = "********";
 
-/// `pin=1234`, `password: x`, `secret_key=…`, `token "…"`.
-static RE_VALEUR_NOMMEE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?i)\b([a-z_\-]*(?:pin|pass(?:word|wd)?|secret|token|key|psk|srp|proof|salt|signature|identity)[a-z_\-]*)(["']?\s*[:=]\s*["']?)[^\s,;"'}\]]+"#,
-    )
-    .expect("motif valide")
+/// Un nom de clé qui annonce un secret : code PIN, mot de passe, secret,
+/// jeton, clé, preuve ou sel SRP, signature, identité d'appairage.
+static RE_NOM_SECRET: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)pin|pass(?:word|wd)?|secret|token|key|psk|srp|proof|salt|signature|identity")
+        .expect("motif valide")
 });
 
 /// Une suite hexa de 32 caractères ou plus, ou base64 de 40 ou plus : une
@@ -58,7 +57,16 @@ pub(super) fn nettoyer_ligne(brute: &str) -> Option<String> {
     }
     let ligne = crate::confidentialite::masquer_acces_distant(ligne);
     let ligne = crate::confidentialite::masquer_url(&ligne);
-    let ligne = RE_VALEUR_NOMMEE.replace_all(&ligne, format!("${{1}}${{2}}{MASQUE}"));
+    // `pin=1234`, `password: x`, `secret_key="…"`, `pin: Some("1234")` : la
+    // forme clé-valeur de `confidentialite` (Some(…) compris), masquée quand
+    // le nom annonce un secret.
+    let ligne = crate::confidentialite::RE_CLE_VALEUR.replace_all(&ligne, |c: &regex::Captures| {
+        if RE_NOM_SECRET.is_match(&c[1]) {
+            format!("{}{}{MASQUE}", &c[1], &c[2])
+        } else {
+            c[0].to_string()
+        }
+    });
     let ligne = RE_LONGUE_SUITE.replace_all(&ligne, MASQUE);
     Some(ligne.into_owned())
 }
@@ -128,6 +136,7 @@ pub(super) async fn relayer_vers<R: AsyncRead + Unpin>(lecteur: R, mut puits: im
         loop {
             let tampon = match lecteur.fill_buf().await {
                 Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(_) => {
                     fin_de_flux = true;
                     break;
@@ -149,18 +158,16 @@ pub(super) async fn relayer_vers<R: AsyncRead + Unpin>(lecteur: R, mut puits: im
                 break;
             }
         }
-        if !ligne.is_empty() {
-            let texte = String::from_utf8_lossy(&ligne);
+        let texte = String::from_utf8_lossy(&ligne);
+        // Le débit d'abord : une ligne tue ne paie pas le masquage.
+        if !texte.trim().is_empty()
+            && let Verdict::Relayer { tues } = debit.ligne(Instant::now())
+        {
+            if tues > 0 {
+                puits(format!("{tues} lignes tues (débit borné)"));
+            }
             if let Some(propre) = nettoyer_ligne(&texte) {
-                match debit.ligne(Instant::now()) {
-                    Verdict::Relayer { tues } => {
-                        if tues > 0 {
-                            puits(format!("{tues} lignes tues (débit borné)"));
-                        }
-                        puits(propre);
-                    }
-                    Verdict::Taire => {}
-                }
+                puits(propre);
             }
         }
         if fin_de_flux {

@@ -40,6 +40,7 @@ async fn aucun_secret_ne_passe_9015() {
         "ltpk 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
         "srp_proof=deadbeef secret_key=\"xyz\"\n",
         "token=abc123&x=1\n",
+        "pair-verify failed; pin: Some(\"4242\"), identity=Some(abcd-7f)\n",
     );
     let lignes = relaye(entree.as_bytes()).await;
     let tout = lignes.join("\n");
@@ -53,6 +54,8 @@ async fn aucun_secret_ne_passe_9015() {
         "deadbeef",
         "xyz",
         "abc123",
+        "4242",
+        "abcd-7f",
     ] {
         assert!(
             !tout.contains(secret),
