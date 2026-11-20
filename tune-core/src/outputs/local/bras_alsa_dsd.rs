@@ -415,10 +415,14 @@ pub(super) fn jouer_dsd_natif_via_alsa(entrees: EntreesDsdNatifAlsa) {
     let famines = Arc::new(AtomicU64::new(0));
     let famines_rappel = famines.clone();
     let disparu = device_gone.clone();
+    // Même promotion temps réel que les autres chemins de rendu, à la première
+    // période de chaque fil cpal neuf.
+    let mut promotion = PromotionDuFilDeRendu::nouvelle();
     let stream = match device.build_output_stream_raw(
         &config,
         cpal::SampleFormat::DsdU32,
         move |data: &mut cpal::Data, _: &cpal::OutputCallbackInfo| {
+            promotion.a_la_premiere_periode();
             let repos = paused_rappel.load(Ordering::Relaxed)
                 || silence_rappel.load(Ordering::Relaxed)
                 || fermeture_rappel.load(Ordering::Relaxed);
