@@ -75,3 +75,34 @@ async fn un_fichier_disparu_ne_relance_pas_de_telechargement_8795() {
     assert!(flux.is_none(), "fichier consommé : pas de sonde");
     assert_eq!(requetes.load(Ordering::SeqCst), 0);
 }
+
+/// Le préchauffage de la suivante ne supprime plus un fMP4 qu'une zone
+/// épingle (#8701) : c'est lui que l'entrée du cache désigne après l'avance.
+///
+/// Contre-épreuve : revenir au `remove_file` sans condition dans
+/// `consommer_le_fmp4_prechauffe` fait tomber ce test.
+#[test]
+fn le_prechauffage_garde_un_fmp4_epingle_8795() {
+    let dossier = crate::test_scratch::scratch_dir("dash-8795-prechauffe");
+    let chemin = dossier
+        .path()
+        .join("tune-dash-8795-prechauffe.mp4")
+        .to_string_lossy()
+        .to_string();
+    std::fs::write(&chemin, b"fMP4").unwrap();
+    let zone = 879_502;
+    crate::audio::dash_epingles::noter_la_piste_resolue(zone, Some(&format!("file://{chemin}")));
+    let supprime = super::consommer_le_fmp4_prechauffe(&chemin);
+    let reste = std::path::Path::new(&chemin).exists();
+    crate::audio::dash_epingles::liberer_la_zone(zone);
+    assert!(
+        !supprime && reste,
+        "le préchauffage a supprimé un fMP4 épinglé"
+    );
+
+    assert!(
+        super::consommer_le_fmp4_prechauffe(&chemin),
+        "désépinglé : consommé comme avant"
+    );
+    assert!(!std::path::Path::new(&chemin).exists());
+}

@@ -78,6 +78,25 @@ pub(super) async fn flux_de_la_sonde_apres_avance(
     flux_de_la_sonde_de_niveaux(svc, source, source_id, provider_quality).await
 }
 
+/// #8795 — le fMP4 DASH que le préchauffage de la suivante vient de
+/// transcoder. Il n'est supprimé que si aucune zone ne l'épingle (#8701) :
+/// la piste préparée par le gapless désigne ce même fichier dans le cache
+/// d'URL de TIDAL. Le supprimer rendait l'entrée « stale » juste après
+/// l'avance (`tidal_dash_cache_stale_redownloading`), d'où un second
+/// téléchargement de la piste qui joue au premier saut, et une sonde des
+/// VU-mètres muette. Un fichier épinglé reste au ramasse-miettes
+/// (`spawn_dash_temp_gc`), qui l'enlève une fois l'épingle levée.
+pub(super) fn consommer_le_fmp4_prechauffe(dash_file: &str) -> bool {
+    if crate::audio::dash_epingles::est_epingle(dash_file) {
+        debug!(
+            path = dash_file,
+            "streaming_dash_warm_next_fmp4_epingle_garde_8795"
+        );
+        return false;
+    }
+    std::fs::remove_file(dash_file).is_ok()
+}
+
 /// #5143 — LE cœur de « la prochaine piste jouable » : depuis `position`,
 /// les lignes de file bannies pour le profil des sélections automatiques
 /// (locales par `track_id`, de service par `source` + `source_id`), et où
@@ -507,8 +526,8 @@ impl PlaybackOrchestrator {
             .await;
 
             // The fMP4 has served its purpose (a warm cache-hit serves the FLAC),
-            // so consume it like the play path does.
-            let _ = std::fs::remove_file(&dash_file);
+            // so consume it like the play path does — unless a zone pins it.
+            consommer_le_fmp4_prechauffe(&dash_file);
 
             // Same guard as the play-path store: only cache when the decoded
             // reality matches the key (`quality.*` from the service API can lie);
