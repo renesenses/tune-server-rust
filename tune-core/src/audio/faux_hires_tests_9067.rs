@@ -1,8 +1,10 @@
 //! #9067 (décision de Bertrand du 19/11/2026, fil 2915) — « Source altérée »
 //! couvre tous les formats, CD compris. Un CD (16 bits, 44,1/48 kHz) n'est
 //! altéré QUE sur la signature d'un codec avec perte : une coupure EN MUR
-//! ([`en_mur`]) entre [`COUPURE_MUR_CD_MIN_HZ`] et [`COUPURE_LOSSY_MAX_HZ`] ;
-//! jamais sur une pente douce ni sur un filtre qui n'est pas un mur. Les
+//! ([`en_mur`]) à partir de [`COUPURE_MUR_CD_MIN_HZ`] et sous
+//! [`COUPURE_MUR_CD_MAX_HZ`] (20 kHz depuis le 19/11, après #9139) ; jamais
+//! sur une pente douce, ni sur un filtre qui n'est pas un mur, ni sur un mur
+//! à 20 kHz ou au-dessus (le filtre d'un vrai CD). Les
 //! règles hi-res ne changent pas. Signaux SYNTHÉTIQUES produits en mémoire
 //! (aucun fichier, aucun ffmpeg, aucun son joué).
 
@@ -167,4 +169,82 @@ fn le_verdict_effectif_d_un_cd_suit_le_mur_9067() {
     assert!(raison_de_coupure("mur_de_codec"));
     assert!(raison_de_coupure("coupure_de_codec"));
     assert!(!raison_de_coupure("bits_de_remplissage"));
+}
+
+/// La remesure et le verdict effectif d'un CD rangé `mur_de_codec` par #9139
+/// avec un mur entre 20,0 et 20,5 kHz : la borne de 20 kHz le rend conforme.
+#[test]
+fn un_mur_de_codec_range_a_20_khz_ou_plus_se_lit_conforme_9067() {
+    let effectif = verdict_effectif_sql("h");
+    let remesure = cd_a_remesurer_sql("h");
+    for sql in [&effectif, &remesure] {
+        assert!(sql.contains("h.coupure_hz, 0) >= 20000"), "{sql}");
+    }
+}
+
+/// #9067 (décision du 19/11 après #9139) — la frontière HAUTE du mur de codec
+/// d'un CD : 20 kHz, plus 20,5 kHz.
+#[test]
+fn la_borne_haute_du_mur_d_un_cd_est_20_khz_9067() {
+    assert_eq!(COUPURE_MUR_CD_MAX_HZ, 20_000.0);
+    assert!(COUPURE_MUR_CD_MIN_HZ < COUPURE_MUR_CD_MAX_HZ);
+    // Les règles hi-res gardent 20,5 kHz.
+    assert_eq!(COUPURE_LOSSY_MAX_HZ, 20_500.0);
+}
+
+/// 🟢 FRONTIÈRE — un vrai CD dont le filtre coupe EN MUR à 20,25 kHz (entre
+/// 20,0 et 20,5 kHz) : CONFORME, en 44,1 comme en 48 kHz. Ne doit plus jamais
+/// être marqué altéré.
+#[test]
+fn un_cd_avec_un_mur_a_20_25_khz_est_conforme_9067() {
+    for (sample_rate, graine) in [(44_100, 9139), (48_000, 9140)] {
+        let pcm = quantifier(&rose(sample_rate, 20_250.0, graine), 16);
+        let (m, v) = juge(&pcm, sample_rate, 16);
+        assert!(
+            m.coupure_en_mur,
+            "{sample_rate} Hz : c'est bien un mur : {m:?}"
+        );
+        coupure_vers(&m, 20_250.0);
+        assert_eq!(v, Verdict::Conforme, "{sample_rate} Hz : {m:?}");
+    }
+}
+
+/// 🔴 FRONTIÈRE — un CD coupé EN MUR à 19,5 kHz (sous la borne de 20 kHz) :
+/// altéré, raison `mur_de_codec`, en 44,1 comme en 48 kHz.
+#[test]
+fn un_cd_avec_un_mur_a_19_5_khz_reste_altere_sous_la_borne_9067() {
+    for (sample_rate, graine) in [(44_100, 9141), (48_000, 9142)] {
+        let pcm = quantifier(&rose(sample_rate, 19_500.0, graine), 16);
+        let (m, v) = juge(&pcm, sample_rate, 16);
+        assert!(m.coupure_en_mur, "{sample_rate} Hz : {m:?}");
+        coupure_vers(&m, 19_500.0);
+        assert!(
+            m.coupure_hz.is_some_and(|f| f < COUPURE_MUR_CD_MAX_HZ),
+            "{sample_rate} Hz : {m:?}"
+        );
+        assert_eq!(v.code(), "douteux", "{sample_rate} Hz : {v:?} {m:?}");
+        assert_eq!(v.code_raison(), Some(RAISON_MUR_DE_CODEC));
+    }
+}
+
+/// 🔴 CONTRE-ÉPREUVE de la frontière — avec l'ANCIENNE borne de #9139
+/// (20,5 kHz), le CD au mur de 20,25 kHz était jugé altéré : la mesure tombe
+/// dans l'ancienne plage et hors de la nouvelle. Si la borne remontait à
+/// 20,5 kHz, `un_cd_avec_un_mur_a_20_25_khz_est_conforme_9067` échouerait.
+#[test]
+fn avec_l_ancienne_borne_le_cd_a_20_25_khz_etait_altere_9067() {
+    const ANCIENNE_BORNE_HZ: f64 = 20_500.0;
+    let pcm = quantifier(&rose(44_100, 20_250.0, 9139), 16);
+    let (m, v) = juge(&pcm, 44_100, 16);
+    let f = m.coupure_hz.expect("coupure mesurée");
+    assert!(m.coupure_en_mur, "{m:?}");
+    assert!(
+        (COUPURE_MUR_CD_MIN_HZ..ANCIENNE_BORNE_HZ).contains(&f),
+        "l'ancienne règle aurait dit `mur_de_codec` : {m:?}"
+    );
+    assert!(
+        !(COUPURE_MUR_CD_MIN_HZ..COUPURE_MUR_CD_MAX_HZ).contains(&f),
+        "{m:?}"
+    );
+    assert_eq!(v, Verdict::Conforme);
 }

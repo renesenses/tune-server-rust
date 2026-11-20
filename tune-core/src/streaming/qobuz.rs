@@ -2749,6 +2749,14 @@ impl QobuzService {
             ai_generated: item["ai_generated"].as_bool(),
             // #8088 — le marquage explicite de l'album, comme celui des pistes.
             explicit: item["parental_warning"].as_bool(),
+            // Pour l'affichage sous la vignette dans une liste qui mélange
+            // plusieurs genres (#8925 et suite) — déjà dans la réponse,
+            // même chemin que `AlbumContext` plus haut.
+            genre_id: item["genre"]["id"]
+                .as_u64()
+                .map(|id| id.to_string())
+                .or_else(|| item["genre"]["id"].as_str().map(Into::into)),
+            genre_name: item["genre"]["name"].as_str().map(Into::into),
         }
     }
 
@@ -6057,6 +6065,28 @@ mod tests {
         assert_eq!(non.ai_generated, Some(false));
         let chaine = QobuzService::map_album(&json!({"id": "1", "ai_generated": "true"}));
         assert_eq!(chaine.ai_generated, None);
+    }
+
+    /// Le genre de l'album remonte pour l'afficher sous la vignette (#8925) ;
+    /// absent, il reste absent et n'apparaît pas dans le JSON.
+    #[test]
+    fn map_album_porte_le_genre_de_qobuz() {
+        let album = QobuzService::map_album(&json!({
+            "id": "1",
+            "genre": {"id": 80, "name": "Jazz"},
+        }));
+        assert_eq!(album.genre_id.as_deref(), Some("80"));
+        assert_eq!(album.genre_name.as_deref(), Some("Jazz"));
+
+        let chaine = QobuzService::map_album(&json!({"id": "1", "genre": {"id": "80"}}));
+        assert_eq!(chaine.genre_id.as_deref(), Some("80"));
+        assert_eq!(chaine.genre_name, None);
+
+        let sans = QobuzService::map_album(&json!({"id": "2"}));
+        assert_eq!(sans.genre_id, None);
+        let rendu = serde_json::to_value(&sans).unwrap();
+        assert!(rendu.get("genre_id").is_none(), "{rendu}");
+        assert!(rendu.get("genre_name").is_none(), "{rendu}");
     }
 
     /// Un favori PISTE emporte le marquage de son album imbriqué ; un favori

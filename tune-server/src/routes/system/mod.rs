@@ -112,7 +112,7 @@ pub fn router() -> Router<AppState> {
         .route("/profile", get(profile::system_profile))
         .route(
             "/config",
-            get(config::get_config).patch(config::update_config),
+            get(config::get_config_route).patch(config::update_config_route),
         )
         .route("/settings", get(config::get_settings))
         // Clés d'API PERSONNELLES (#4805, lot 1 MetaRust) : AcoustID et
