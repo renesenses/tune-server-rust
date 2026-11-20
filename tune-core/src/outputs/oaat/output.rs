@@ -1659,7 +1659,12 @@ impl OutputTarget for OaatOutput {
                                 );
                                 if !super::horloge::cadencer(
                                     start,
-                                    super::horloge::echeance_avec_avance(expected),
+                                    super::horloge::echeance_avec_avance(
+                                        expected,
+                                        std::time::Duration::from_millis(u64::from(
+                                            endpoint.info.buffer_size_ms,
+                                        )),
+                                    ),
                                 )
                                 .await
                                 {
@@ -2408,7 +2413,12 @@ impl OutputTarget for OaatOutput {
                         );
                         if !super::horloge::cadencer(
                             start,
-                            super::horloge::echeance_avec_avance(expected),
+                            super::horloge::echeance_avec_avance(
+                                expected,
+                                std::time::Duration::from_millis(u64::from(
+                                    endpoint.info.buffer_size_ms,
+                                )),
+                            ),
                         )
                         .await
                         {
@@ -2773,6 +2783,10 @@ impl OutputTarget for OaatOutput {
             // On note les paquets partis en retard ; l'envoi lui-même ne change
             // pas d'un iota.
             let mut cadence = super::helpers::MesureDeCadence::default();
+            // Un `send_audio` en échec répété ne doit pas tourner en boucle :
+            // on cesse d'envoyer jusqu'au prochain bloc HTTP, comme le `break`
+            // de l'ancienne boucle.
+            let mut suspendre_envoi = false;
             let mut watchdog = tokio::time::interval(std::time::Duration::from_secs(10));
             watchdog.tick().await; // skip first immediate tick
 
@@ -2963,6 +2977,159 @@ impl OutputTarget for OaatOutput {
                         }
                     }
 
+                    // Un paquet par tour. L'ancien `while` vidait tout le corps
+                    // HTTP déjà bufferisé avant de revenir ici : le cadencement
+                    // (avance à 4×) bloquait `endpoint_release` jusqu'à la fin.
+                    _ = std::future::ready(()), if !suspendre_envoi
+                        && buf.len() >= packet_size
+                        && playing.load(Ordering::Relaxed)
+                        && horloge_pause.autorise_lecture_amont(
+                            paused.load(Ordering::Relaxed),
+                        ) =>
+                    {
+                        'envoi: {
+                            let payload: Vec<u8> = buf.drain(..packet_size).collect();
+                            if is_flac {
+                                // Position réelle depuis les en-têtes de trames
+                                // (#2214) — et `sample_offset` cesse d'être figé
+                                // à zéro sur ce chemin.
+                                trames_flac.avaler(&payload);
+                                if trames_flac.est_synchronise() {
+                                    sample_offset = trames_flac.position_samples();
+                                }
+                            }
+                            let pts_ns = if is_dsd {
+                                stream_start_ns + (byte_offset as f64 / (cur_sample_rate as f64 * bytes_per_frame as f64) * 1e9) as u64
+                            } else {
+                                match fraction_pts.pts(
+                                    stream_start_ns,
+                                    direct_pcm_elapsed_samples(sample_offset, origine_flux),
+                                    u64::from(cur_sample_rate),
+                                ) {
+                                    Some(pts) => pts,
+                                    None => {
+                                        error!(device = %device_name, "oaat: echeance PTS HTTP non representable");
+                                        playing.store(false, Ordering::SeqCst);
+                                        return;
+                                    }
+                                }
+                            };
+                            let flags = if sample_offset == origine_flux && byte_offset == 0 {
+                                PacketFlags::FIRST_PACKET
+                            } else {
+                                PacketFlags::empty()
+                            };
+
+                            match endpoint.send_audio(stream_num, cur_format, pts_ns, sample_offset, &payload, flags).await {
+                                Ok(()) => {
+                                    fin_jouee.observer(pts_ns);
+                                    reconnect_attempts = 0;
+                                    diag.packets_sent.fetch_add(1, Ordering::Relaxed);
+                                    diag.bytes_sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                                    diag.last_packet_epoch_ms.store(
+                                        std::time::SystemTime::now()
+                                            .duration_since(std::time::UNIX_EPOCH)
+                                            .unwrap_or_default()
+                                            .as_millis() as u64,
+                                        Ordering::Relaxed,
+                                    );
+                                }
+                                Err(_) => {
+                                    if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
+                                        error!(device = %device_name, "oaat: send_audio failed, max reconnects reached");
+                                        suspendre_envoi = true;
+                                        break 'envoi;
+                                    }
+                                    reconnect_attempts += 1;
+                                    diag.reconnects.fetch_add(1, Ordering::Relaxed);
+                                    warn!(device = %device_name, attempt = reconnect_attempts, "oaat: send_audio failed, reconnecting");
+
+                                    let mut restored = payload;
+                                    restored.extend_from_slice(&buf);
+                                    buf = restored;
+
+                                    match connect_and_setup(
+                                        &config,
+                                        endpoint_addr,
+                                        &device_name,
+                                        &stream_id,
+                                        &cur_stream_info,
+                                        &refus_negociation,
+                                        &volume_annonce,
+                                    ).await {
+                                        Some(new_ep) => {
+                                            if let Ok(mut dsd) = diag.dsd.lock() { dsd.annoncer(new_ep.info.capabilities.dsd_max_rate); }
+                                            endpoint = new_ep;
+                                            surveiller_liberation(&mut endpoint, &device_name, &liberation, &commandes_liberation);
+                                            info!(device = %device_name, "oaat: reconnected, resuming stream");
+                                            break 'envoi;
+                                        }
+                                        None => {
+                                            error!(device = %device_name, "oaat: reconnection failed");
+                                            suspendre_envoi = true;
+                                            break 'envoi;
+                                        }
+                                    }
+                                }
+                            }
+
+                            if sample_offset == origine_flux && byte_offset == 0 {
+                                info!(device = %device_name, payload_bytes = payload.len(), "oaat: first audio packet sent");
+                            }
+
+                            if uses_byte_offset {
+                                byte_offset += payload.len() as u64;
+                            } else {
+                                sample_offset += PCM_SAMPLES_PER_PACKET as u64;
+                            }
+                            position_ms.store(
+                                if is_dsd { byte_offset * 1000 / (cur_sample_rate as u64 * bytes_per_frame as u64).max(1) }
+                                else { sample_offset * 1000 / cur_sample_rate.max(1) as u64 },
+                                Ordering::Relaxed,
+                            );
+
+                            // Avance plafonnée par le tampon annoncé : le ring
+                            // cpal tient ~1 s, l'excédent serait jeté.
+                            {
+                                let base_de_temps = if is_dsd {
+                                    BaseDeTempsOaat::OctetsADebitConstant
+                                } else {
+                                    BaseDeTempsOaat::Samples
+                                };
+                                let expected = super::horloge::echeance_avec_avance(
+                                    duree_audio_envoyee(
+                                        base_de_temps,
+                                        direct_pcm_elapsed_samples(sample_offset, origine_flux),
+                                        byte_offset,
+                                        cur_sample_rate,
+                                        bytes_per_frame,
+                                    ),
+                                    std::time::Duration::from_millis(u64::from(
+                                        endpoint.info.buffer_size_ms,
+                                    )),
+                                );
+                                let elapsed = start.elapsed();
+                                // #4567 — conserver la mesure du retard. Le
+                                // cadencement utilise une échéance absolue,
+                                // même si la nouvelle piste commence plus tard.
+                                if let Some(retard_ms) = cadence.observer(expected, elapsed) {
+                                    warn!(
+                                        device = %device_name,
+                                        retard_ms,
+                                        paquets = cadence.paquets,
+                                        paquets_en_retard = cadence.paquets_en_retard,
+                                        "oaat: paquet envoye en retard"
+                                    );
+                                }
+                                if !super::horloge::cadencer(start, expected).await {
+                                    error!(device = %device_name, "oaat: cadence HTTP non representable");
+                                    playing.store(false, Ordering::SeqCst);
+                                    return;
+                                }
+                            }
+                        }
+                    }
+
                     chunk = stream.next(), if horloge_pause.autorise_lecture_amont(
                         paused.load(Ordering::Relaxed),
                     ) => {
@@ -2972,6 +3139,7 @@ impl OutputTarget for OaatOutput {
                                 // retry budget so isolated transient blips don't
                                 // accumulate toward the cap over a long track.
                                 stream_retry_attempts = 0;
+                                suspendre_envoi = false;
                                 match adaptateur_pcm.push(&data) {
                                     Ok(adaptee) => buf.extend(adaptee),
                                     Err(raison) => {
@@ -3430,162 +3598,13 @@ impl OutputTarget for OaatOutput {
                                     }
                                     buf = next_buf;
                                     stream = next.stream;
+                                    suspendre_envoi = false;
                                     continue;
                                 }
                                 break;
                             }
                         }
 
-                        // Send buffered packets
-                        while buf.len() >= packet_size
-                            && playing.load(Ordering::Relaxed)
-                            && horloge_pause.autorise_lecture_amont(
-                                paused.load(Ordering::Relaxed),
-                            )
-                        {
-                            let payload: Vec<u8> = buf.drain(..packet_size).collect();
-                            if is_flac {
-                                // Position réelle depuis les en-têtes de trames
-                                // (#2214) — et `sample_offset` cesse d'être figé
-                                // à zéro sur ce chemin.
-                                trames_flac.avaler(&payload);
-                                if trames_flac.est_synchronise() {
-                                    sample_offset = trames_flac.position_samples();
-                                }
-                            }
-                            let pts_ns = if is_dsd {
-                                stream_start_ns + (byte_offset as f64 / (cur_sample_rate as f64 * bytes_per_frame as f64) * 1e9) as u64
-                            } else {
-                                match fraction_pts.pts(
-                                    stream_start_ns,
-                                    direct_pcm_elapsed_samples(sample_offset, origine_flux),
-                                    u64::from(cur_sample_rate),
-                                ) {
-                                    Some(pts) => pts,
-                                    None => {
-                                        error!(device = %device_name, "oaat: echeance PTS HTTP non representable");
-                                        playing.store(false, Ordering::SeqCst);
-                                        return;
-                                    }
-                                }
-                            };
-                            let flags = if sample_offset == origine_flux && byte_offset == 0 {
-                                PacketFlags::FIRST_PACKET
-                            } else {
-                                PacketFlags::empty()
-                            };
-
-                            match endpoint.send_audio(stream_num, cur_format, pts_ns, sample_offset, &payload, flags).await {
-                                Ok(()) => {
-                                    fin_jouee.observer(pts_ns);
-                                    reconnect_attempts = 0;
-                                    diag.packets_sent.fetch_add(1, Ordering::Relaxed);
-                                    diag.bytes_sent.fetch_add(payload.len() as u64, Ordering::Relaxed);
-                                    diag.last_packet_epoch_ms.store(
-                                        std::time::SystemTime::now()
-                                            .duration_since(std::time::UNIX_EPOCH)
-                                            .unwrap_or_default()
-                                            .as_millis() as u64,
-                                        Ordering::Relaxed,
-                                    );
-                                }
-                                Err(_) => {
-                                    // Reconnection mid-stream
-                                    if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS {
-                                        error!(device = %device_name, "oaat: send_audio failed, max reconnects reached");
-                                        break;
-                                    }
-                                    reconnect_attempts += 1;
-                                    diag.reconnects.fetch_add(1, Ordering::Relaxed);
-                                    warn!(device = %device_name, attempt = reconnect_attempts, "oaat: send_audio failed, reconnecting");
-
-                                    // Put payload back
-                                    let mut restored = payload;
-                                    restored.extend_from_slice(&buf);
-                                    buf = restored;
-
-                                    match connect_and_setup(
-                                        &config,
-                                        endpoint_addr,
-                                        &device_name,
-                                        &stream_id,
-                                        &cur_stream_info,
-                                        &refus_negociation,
-                                    &volume_annonce,
-                                    ).await {
-                                        Some(new_ep) => {
-                                            if let Ok(mut dsd) = diag.dsd.lock() { dsd.annoncer(new_ep.info.capabilities.dsd_max_rate); }
-                                            endpoint = new_ep;
-                                            surveiller_liberation(&mut endpoint, &device_name, &liberation, &commandes_liberation);
-                                            info!(device = %device_name, "oaat: reconnected, resuming stream");
-                                            continue;
-                                        }
-                                        None => {
-                                            error!(device = %device_name, "oaat: reconnection failed");
-                                            break;
-                                        }
-                                    }
-                                }
-                            }
-
-                            if sample_offset == origine_flux && byte_offset == 0 {
-                                info!(device = %device_name, payload_bytes = payload.len(), "oaat: first audio packet sent");
-                            }
-
-                            if uses_byte_offset {
-                                byte_offset += payload.len() as u64;
-                            } else {
-                                sample_offset += PCM_SAMPLES_PER_PACKET as u64;
-                            }
-                            position_ms.store(
-                                if is_dsd { byte_offset * 1000 / (cur_sample_rate as u64 * bytes_per_frame as u64).max(1) }
-                                else { sample_offset * 1000 / cur_sample_rate.max(1) as u64 },
-                                Ordering::Relaxed,
-                            );
-
-                            // Cadence temps réel, avec une avance fixe en
-                            // durée (`AVANCE_TAMPON_ENDPOINT`) : 50 paquets
-                            // ne remplissaient qu'une partie du tampon de
-                            // l'endpoint, qui attendait le reste en temps
-                            // réel avant de démarrer.
-                            {
-                                // Le cadencement aussi : caler l'envoi FLAC sur
-                                // les octets compressés envoyait un morceau très
-                                // compressé trop vite, et un peu compressé trop
-                                // lentement (#2214). Les samples réels cadencent ;
-                                // le DSD garde les octets, son débit est constant.
-                                let base_de_temps = if is_dsd {
-                                    BaseDeTempsOaat::OctetsADebitConstant
-                                } else {
-                                    BaseDeTempsOaat::Samples
-                                };
-                                let expected = super::horloge::echeance_avec_avance(duree_audio_envoyee(
-                                    base_de_temps,
-                                    direct_pcm_elapsed_samples(sample_offset, origine_flux),
-                                    byte_offset,
-                                    cur_sample_rate,
-                                    bytes_per_frame,
-                                ));
-                                let elapsed = start.elapsed();
-                                // #4567 — conserver la mesure du retard. Le
-                                // cadencement utilise une échéance absolue,
-                                // même si la nouvelle piste commence plus tard.
-                                if let Some(retard_ms) = cadence.observer(expected, elapsed) {
-                                    warn!(
-                                        device = %device_name,
-                                        retard_ms,
-                                        paquets = cadence.paquets,
-                                        paquets_en_retard = cadence.paquets_en_retard,
-                                        "oaat: paquet envoye en retard"
-                                    );
-                                }
-                                if !super::horloge::cadencer(start, expected).await {
-                                    error!(device = %device_name, "oaat: cadence HTTP non representable");
-                                    playing.store(false, Ordering::SeqCst);
-                                    return;
-                                }
-                            }
-                        }
                     }
                 }
             }
