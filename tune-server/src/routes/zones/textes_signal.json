@@ -1599,6 +1599,8 @@
     "upsampling_disabled_at_open": "Bu parçaya upsampling uygulanmadı: çalma açıldığında ayar kapalıydı",
     "upsampling_plugin_absent_at_open": "Bu parçaya upsampling uygulanmadı: çalma açıldığında eklenti yoktu ya da devre dışıydı",
     "renderer_volume": "Oynatıcı (renderer) ses düzeyi %{0}",
+    "amp_volume_db": "Amfi ses düzeyi {0} dB",
+    "air_dsd_pcm": "DSD, PCM'e dönüştürüldü (Devialet AIR'da DoP henüz etkin değil)",
     "upsampling_strict_bitperfect": "Upsampling devre dışı: bu bölgede katı bit-perfect açık ve her türlü örnekleme hızı dönüşümünü reddediyor; upsampling için bölge ayarlarından kapatın",
     "dsd_natif_local": "{0} yerel ({1})",
     "volume_dsd_natif": "Ses düzeyi uygulanmadı (yerel DSD)",
