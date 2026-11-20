@@ -173,9 +173,7 @@ mod systeme {
 
     fn prog_id_choisi() -> Option<String> {
         windows_registry::CURRENT_USER
-            .open(
-                r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice",
-            )
+            .open(r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice")
             .ok()?
             .get_string("ProgId")
             .ok()
@@ -368,7 +366,11 @@ mod tests {
     /// la clé `HKCR\<ProgId>` existe — l'association est valide.
     #[test]
     fn un_prog_id_du_store_enregistre_est_valide() {
-        let a = lire_association(Some("AppXq0fevzme2pys62n3e0fbqa7peapykr8v".into()), |_| true, |_, _| None);
+        let a = lire_association(
+            Some("AppXq0fevzme2pys62n3e0fbqa7peapykr8v".into()),
+            |_| true,
+            |_, _| None,
+        );
         assert!(association_utilisable(&a, |_| false));
         assert_eq!(decider(&a, &[], |_| false), Ouverture::ParLAssociation);
     }
@@ -376,9 +378,11 @@ mod tests {
     /// Sans choix de l'utilisateur, c'est le protocole `http` qui est lu.
     #[test]
     fn sans_prog_id_le_protocole_http_est_lu() {
-        let a = lire_association(None, |_| true, |nom, protocole| {
-            (nom == "http" && protocole).then(|| PathBuf::from(r"C:\b\nav.exe"))
-        });
+        let a = lire_association(
+            None,
+            |_| true,
+            |nom, protocole| (nom == "http" && protocole).then(|| PathBuf::from(r"C:\b\nav.exe")),
+        );
         assert_eq!(a.executable, Some(PathBuf::from(r"C:\b\nav.exe")));
         assert!(association_utilisable(&a, |_| true));
         assert!(!association_utilisable(&a, |_| false));
@@ -390,13 +394,19 @@ mod tests {
     fn une_association_valide_garde_le_navigateur_choisi_par_l_utilisateur() {
         let firefox = PathBuf::from(r"C:\Program Files\Mozilla Firefox\firefox.exe");
         let a = assoc(Some(r"C:\Program Files\BraveSoftware\brave.exe"));
-        assert_eq!(decider(&a, &[firefox], |_| true), Ouverture::ParLAssociation);
+        assert_eq!(
+            decider(&a, &[firefox], |_| true),
+            Ouverture::ParLAssociation
+        );
     }
 
     #[test]
     fn rien_a_lancer_donne_l_avis_et_jamais_start_9061() {
         let firefox = PathBuf::from(r"C:\Program Files\Mozilla Firefox\firefox.exe");
-        assert_eq!(decider(&assoc(None), &[firefox], |_| false), Ouverture::Avis);
+        assert_eq!(
+            decider(&assoc(None), &[firefox], |_| false),
+            Ouverture::Avis
+        );
         assert_eq!(decider(&assoc(None), &[], |_| true), Ouverture::Avis);
     }
 
