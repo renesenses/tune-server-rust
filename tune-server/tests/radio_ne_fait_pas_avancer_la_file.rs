@@ -99,6 +99,9 @@ async fn file_qobuz(state: &AppState, zone_id: i64) {
     ]
     .iter()
     .map(|(id, titre)| QueueInput::Streaming {
+        media_format: None,
+        sample_rate: None,
+        bit_depth: None,
         source: "qobuz".into(),
         source_id: (*id).into(),
         title: (*titre).to_string(),
@@ -253,6 +256,9 @@ async fn une_file_de_stations_garde_son_suivant() {
     ]
     .iter()
     .map(|(url, nom)| QueueInput::Streaming {
+        media_format: None,
+        sample_rate: None,
+        bit_depth: None,
         source: "radio".into(),
         source_id: (*url).into(),
         title: (*nom).to_string(),

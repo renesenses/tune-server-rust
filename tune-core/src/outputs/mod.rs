@@ -26,6 +26,8 @@ pub mod capacite_dsd_natif;
 pub mod chromecast;
 #[cfg(all(target_os = "macos", feature = "local-audio"))]
 pub mod coreaudio_exclusive;
+/// Décodage progressif d'une source HTTP (Devialet AIR, Sendspin).
+pub(crate) mod decodeur_distant;
 pub mod devialet_air;
 pub mod didl;
 pub mod dlna;

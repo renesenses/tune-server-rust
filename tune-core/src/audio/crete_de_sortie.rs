@@ -25,6 +25,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Finesse des tranches relevées, en millisecondes. Un bloc producteur couvre
 /// jusqu'à plusieurs centaines de ms ; une seule crête pour tout le bloc
@@ -56,6 +57,11 @@ struct Registre {
 #[derive(Debug, Default)]
 pub struct CretesDeSortie {
     registre: Mutex<Registre>,
+    /// 19/11/2026 — un gain SCALAIRE appliqué entre le point de relevé et le
+    /// gain de rendu : la réserve du suréchantillonneur, dont l'étage tourne
+    /// après le DSP. En millionièmes ; `0` = aucun (unité). Remis à l'unité
+    /// par [`Self::oublier`], au début de chaque flux.
+    gain_aval: AtomicU32,
 }
 
 impl CretesDeSortie {
@@ -84,6 +90,7 @@ impl CretesDeSortie {
         if trames == 0 || cadence == 0 || !debut_ms.is_finite() {
             return;
         }
+        let gain_aval = self.gain_aval();
         let canaux = echantillons.len() / trames as usize;
         if canaux == 0 {
             return;
@@ -118,8 +125,8 @@ impl CretesDeSortie {
                 epoque,
                 debut_ms: debut,
                 fin_ms: fin,
-                gauche,
-                droite,
+                gauche: gauche * gain_aval,
+                droite: droite * gain_aval,
             });
         }
     }
@@ -152,6 +159,26 @@ impl CretesDeSortie {
         let mut registre = self.registre();
         registre.tranches.clear();
         registre.epoque += 1;
+        self.gain_aval.store(0, Ordering::SeqCst);
+    }
+
+    /// 19/11/2026 — pose le gain scalaire (linéaire, ≤ 1) que le signal
+    /// subit après le relevé et avant le gain de rendu : la réserve de
+    /// l'étage du suréchantillonneur. Vaut pour les blocs relevés ensuite.
+    pub fn poser_le_gain_aval(&self, gain: f64) {
+        let millioniemes = if gain.is_finite() && gain > 0.0 && gain < 1.0 {
+            ((gain * 1_000_000.0).round() as u32).max(1)
+        } else {
+            0
+        };
+        self.gain_aval.store(millioniemes, Ordering::SeqCst);
+    }
+
+    fn gain_aval(&self) -> f32 {
+        match self.gain_aval.load(Ordering::SeqCst) {
+            0 => 1.0,
+            m => (f64::from(m) / 1_000_000.0) as f32,
+        }
     }
 }
 

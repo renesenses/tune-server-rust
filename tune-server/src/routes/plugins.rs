@@ -898,7 +898,7 @@ async fn get_plugin_brut(name: String, state: AppState) -> Json<Value> {
 /// `state.wasm_plugins`, le même que lit `loaded` dans `GET /plugins`. Sans
 /// lui, `enable` d'un wasm qui tourne réclamait un redémarrage inutile, et
 /// `disable` taisait celui qu'il faut pour le décharger (#5112).
-fn greffon_charge(state: &AppState, name: &str) -> bool {
+pub(crate) fn greffon_charge(state: &AppState, name: &str) -> bool {
     plugin_snapshot(state).iter().any(|p| p.name == name)
         || setup_report_snapshot(state)
             .loaded_after_retry
