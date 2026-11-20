@@ -332,3 +332,65 @@ async fn frequence_fixe_8428_airplay_refuse_la_cadence_mais_permet_de_l_effacer(
         assert_eq!(statut, StatusCode::OK);
     }
 }
+
+/// #8696 — période WASAPI exclusive : publiée à `null` (Auto) avec ses
+/// choix, persistée par la route, refusée hors bornes (422), et remise à Auto par `null` ou `0`
+/// en SUPPRIMANT la clé.
+#[tokio::test]
+async fn periode_wasapi_8696_est_persistee_par_la_route() {
+    let (app, state) = serveur();
+    let id = zone_dlna(&app).await;
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    let cle = tune_core::outputs::periode_reglable_8696::cle_de_zone(id);
+
+    let avant = fiche(&app, id).await;
+    assert_eq!(avant["wasapi_exclusive_period_ms"], Value::Null, "{avant}");
+    assert_eq!(
+        avant["wasapi_exclusive_period_choices_ms"],
+        json!([10, 20, 50, 100])
+    );
+    // Zone DLNA : jamais applicable, quelle que soit la plateforme.
+    assert_eq!(avant["wasapi_exclusive_period_applicable"], json!(false));
+
+    let (statut, reponse) = patch(&app, id, json!({ "wasapi_exclusive_period_ms": 50 })).await;
+    assert_eq!(statut, StatusCode::OK, "PATCH refusé : {reponse}");
+    assert_eq!(
+        fiche(&app, id).await["wasapi_exclusive_period_ms"],
+        json!(50)
+    );
+    assert_eq!(reglages.get(&cle).unwrap().as_deref(), Some("50"));
+
+    // Hors bornes : 422 en clair, et le réglage en place n'est pas touché.
+    for hors in [5000, 2] {
+        let (statut, reponse) =
+            patch(&app, id, json!({ "wasapi_exclusive_period_ms": hors })).await;
+        assert_eq!(statut, StatusCode::UNPROCESSABLE_ENTITY, "{reponse}");
+        assert!(reponse.to_string().contains("3 à 500 ms"), "{reponse}");
+        assert_eq!(reglages.get(&cle).unwrap().as_deref(), Some("50"));
+    }
+
+    // Un PATCH sans le champ ne touche pas au réglage.
+    let (statut, _) = patch(&app, id, json!({ "strict_bitperfect": false })).await;
+    assert_eq!(statut, StatusCode::OK);
+    assert_eq!(reglages.get(&cle).unwrap().as_deref(), Some("50"));
+
+    let (statut, _) = patch(&app, id, json!({ "wasapi_exclusive_period_ms": 0 })).await;
+    assert_eq!(statut, StatusCode::OK);
+    assert!(
+        reglages.get(&cle).unwrap().is_none(),
+        "0 = Auto : clé supprimée"
+    );
+
+    let (statut, _) = patch(&app, id, json!({ "wasapi_exclusive_period_ms": 20 })).await;
+    assert_eq!(statut, StatusCode::OK);
+    let (statut, _) = patch(&app, id, json!({ "wasapi_exclusive_period_ms": null })).await;
+    assert_eq!(statut, StatusCode::OK);
+    assert!(
+        reglages.get(&cle).unwrap().is_none(),
+        "null = Auto : clé supprimée"
+    );
+    assert_eq!(
+        fiche(&app, id).await["wasapi_exclusive_period_ms"],
+        Value::Null
+    );
+}

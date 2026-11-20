@@ -23,7 +23,12 @@ async fn demarrer(chemin: &str) -> (AppState, axum::Router) {
     use_scratch_plugin_data_dir();
     let state = AppState::new(chemin, 0, Default::default()).unwrap();
     let routers = tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
-    let app = tune_server::routes::router_with_plugins(state.clone(), routers);
+    let app = tune_server::routes::router_with_plugins(state.clone(), routers).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     (state, app)
 }
 

@@ -94,6 +94,15 @@ pub(super) async fn patch_zone(
         Ok(volume) => volume,
         Err(reponse) => return reponse,
     };
+    // #8987 — l'appareil demandé est tenu par une AUTRE zone active : refus
+    // nommé (409), AVANT toute commande ou écriture. Une zone supprimée qui
+    // le tient le lâchera au moment de l'écriture (`persister_…_sortie`).
+    if let Some(ref device_id) = body.output_device_id
+        && let super::zone_appareil_8987::OccupationDeLaSortie::ZoneActive { id: autre, nom } =
+            super::zone_appareil_8987::constater(&repo, id, device_id)
+    {
+        return super::zone_appareil_8987::refus_sortie_tenue(id, device_id, autre, &nom);
+    }
     // Volume et mute sont des commandes, pas de simples préférences. Le
     // renderer doit les accepter avant qu'un PATCH puisse annoncer leur
     // réussite ou laisser une valeur mensongère en base. Si le PATCH change
@@ -178,6 +187,23 @@ fn valider_le_patch(
             "fixed_sample_rate",
             &rate.to_string(),
             "unsupported PCM sample rate",
+        ));
+    }
+    // #8696 — une période WASAPI hors bornes est REFUSÉE (422), jamais bornée
+    // en silence ; `null` et `0` restent « Auto ».
+    if let Some(Some(ms)) = body.wasapi_exclusive_period_ms
+        && let Err(raison) = tune_core::outputs::periode_reglable_8696::valider_ms(ms)
+    {
+        warn!(zone_id = id, ms, raison = %raison, "zone_patch_rejected");
+        return Err(crate::message_api::refus_avec_cause(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "zone_field_invalid",
+            "api.zones.fieldInvalid",
+            &[
+                ("field", "wasapi_exclusive_period_ms".to_string()),
+                ("value", ms.to_string()),
+            ],
+            &raison,
         ));
     }
     // Les valeurs que cette route peut juger seule, avant toute écriture : un
@@ -466,11 +492,20 @@ fn persister_la_zone_et_sa_sortie(
     }
     // volume/muted ont été confirmés et persistés par l'orchestrateur ci-dessus.
     if let Some(ref device_id) = body.output_device_id {
-        ecrire!(
-            "output_device_id",
+        // #8987 — une zone supprimée (masquée) qui tient l'appareil le lâche ;
+        // l'index unique ne ressort plus jamais en 500 (fil 2708).
+        // La libération et l'écriture tiennent dans UNE transaction.
+        super::zone_appareil_8987::prendre_la_sortie_demandee(
+            repo,
+            id,
             device_id,
-            repo.update_output_device(id, device_id)
-        );
+            tune_core::audio::reglages_de_volume::Rattachement::SansPreuve {
+                origine: "update_output_device",
+                mac: None,
+            },
+        )?;
+        // #3589 — même marque d'auteur que `ecrire!`.
+        super::preconfiguration::marquer_pose(&state.backend, id, "output_device_id");
     }
     if let Some(ref ot) = body.output_type {
         ecrire!("output_type", ot, repo.update_output_type(id, ot));
@@ -958,6 +993,21 @@ async fn persister_le_son(
         };
         ecrire!("exclusive_mode", format!("{valeur:?}"), r);
     }
+    // #8696 — période WASAPI exclusive de la zone → setting
+    // zone_{id}_wasapi_periode_ms ; `null` ou `0` supprime la clé (Auto). Lue
+    // par l'orchestrateur à chaque lecture : rien à rafraîchir en vol, la
+    // période vaut à la prochaine ouverture du périphérique.
+    if let Some(valeur) = body.wasapi_exclusive_period_ms {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = tune_core::outputs::periode_reglable_8696::cle_de_zone(id);
+        // Validée par `valider_le_patch` : seul `0` reste à ramener à Auto.
+        let lue = valeur.filter(|ms| *ms > 0);
+        let r = match lue {
+            Some(ms) => settings.set(&key, &ms.to_string()),
+            None => settings.delete(&key),
+        };
+        ecrire!("wasapi_exclusive_period_ms", format!("{lue:?}"), r);
+    }
     // Trim de gain par renderer → setting zone_{id}_gain_trim_db (±12 dB, 0 = efface).
     if let Some(db) = body.gain_trim_db {
         let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -986,49 +1036,37 @@ async fn persister_le_son(
     Ok(())
 }
 
-/// Que faire du nom demandé quand le périphérique a DÉJÀ une zone ?
-/// (#1770, annexe 4)
-///
-/// ## L'asymétrie, mesurée
+/// Que faire d'un `POST /zones` quand le périphérique a DÉJÀ une zone ?
+/// (#1770, annexe 4 ; #8987)
 ///
 /// `POST /zones` porte une seule intention : « crée-moi une zone sur ce
 /// périphérique, appelle-la X ». Quand une zone existe déjà pour ce
-/// `output_device_id`, la route la rend telle quelle — `200 OK`,
-/// `zone_already_exists_returning` — et le nom demandé n'était honoré que sur
-/// la branche `is_device_hidden`. Sur une zone **visible** il était jeté
-/// **sans un mot** : ni journal, ni code d'état différent, ni champ dans la
-/// réponse. L'écran, lui, annonce « zone créée ». C'est aussi ce qui fait lire
-/// « ma zone a happé les périphériques » là où le serveur a simplement rendu
-/// une zone existante.
+/// `output_device_id`, la route la rendait telle quelle — `200 OK`,
+/// `zone_already_exists_returning` — et jetait le nom demandé. L'écran, lui,
+/// n'en savait rien : la création « passait » et aucune zone n'apparaissait
+/// (fil 2708, #8987 : « Haut-parleurs PC » demandée, zone 1 renommée
+/// « DENAFRIPS DAC USB » rendue en silence).
 ///
-/// ## Ce que cette fonction NE tranche PAS
+/// **Décision de Bertrand (17/11, #8987) : refuser clairement.** Une zone
+/// VISIBLE répond `409 zone_existe_deja` en nommant la zone existante (`id`,
+/// nom) ; le client propose de l'ouvrir ou de la renommer.
 ///
-/// Deux conduites se valent, et le choix appartient à Bertrand — c'est
-/// exactement ce que l'étiquette `keep-open` de #1770 réserve :
+/// Une zone MASQUÉE (supprimée) n'est pas une zone « qui existe » pour
+/// l'utilisateur : la recréer la ressuscite, réglages compris, sous le nom
+/// demandé — décidé de longue date, inchangé.
 ///
-/// - **honorer** le nom sur une zone visible comme sur une masquée : cohérent,
-///   mais cela renomme en silence une zone que quelqu'un d'autre écoute
-///   peut-être ;
-/// - **refuser** (`409`) en nommant la zone existante : honnête, mais c'est un
-///   contrat client qui change, et tout client déjà installé lit ce `200`
-///   comme un succès.
-///
-/// Cette fonction rend donc le comportement d'aujourd'hui, **inchangé**. Ce
-/// qu'elle apporte est ailleurs : un SEUL endroit nommé où l'arbitrage se
-/// posera, et la fin du silence sur la branche `Ecarte`. Le jour où
-/// l'arbitrage est rendu, c'est un bras du `match` de `create_zone` qui change,
-/// et les témoins de `nom_de_zone_existante_guard.rs` disent lequel.
+/// La découverte automatique ne passe pas par cette route (elle écrit par
+/// `ZoneRepo` directement) : le refus ne concerne que la demande explicite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum NomDeZoneExistante {
-    /// Le nom demandé est déjà celui de la zone : rien à décider, et surtout
-    /// rien à écrire en base.
+    /// Zone MASQUÉE qui porte déjà le nom demandé : on la ressuscite, rien à
+    /// écrire pour le nom.
     DejaLeBon,
-    /// Zone MASQUÉE ressuscitée : elle reprend le nom demandé. Décidé de
-    /// longue date (« Update name in case device was renamed »), inchangé ici.
+    /// Zone MASQUÉE ressuscitée : elle reprend le nom demandé.
     Honore,
-    /// Zone VISIBLE : le nom demandé est écarté, la zone garde le sien. C'est
-    /// le comportement d'aujourd'hui — et l'arbitrage en attente.
-    Ecarte,
+    /// Zone VISIBLE : la création est refusée (`409`), la zone existante est
+    /// nommée dans la réponse. Rien n'est écrit.
+    Refuse,
 }
 
 pub(super) fn nom_de_zone_existante(
@@ -1036,13 +1074,32 @@ pub(super) fn nom_de_zone_existante(
     nom_actuel: &str,
     nom_demande: &str,
 ) -> NomDeZoneExistante {
-    if nom_actuel == nom_demande {
+    if !zone_masquee {
+        NomDeZoneExistante::Refuse
+    } else if nom_actuel == nom_demande {
         NomDeZoneExistante::DejaLeBon
-    } else if zone_masquee {
-        NomDeZoneExistante::Honore
     } else {
-        NomDeZoneExistante::Ecarte
+        NomDeZoneExistante::Honore
     }
+}
+
+/// #8987 — le refus d'une création sur un appareil qui a déjà une zone
+/// visible : `409`, code stable `zone_existe_deja`, phrase traduite qui nomme
+/// la zone, et de quoi l'ouvrir (`zone_id`, `zone_name`).
+pub(super) fn refus_zone_existe_deja(
+    zone_id: i64,
+    nom_de_la_zone: &str,
+    device_id: &str,
+) -> axum::response::Response {
+    let mut corps = crate::message_api::corps_refus(
+        "zone_existe_deja",
+        "api.zones.deviceAlreadyHasZone",
+        &[("zone", nom_de_la_zone.to_string())],
+    );
+    corps["zone_id"] = json!(zone_id);
+    corps["zone_name"] = json!(nom_de_la_zone);
+    corps["output_device_id"] = json!(device_id);
+    (StatusCode::CONFLICT, Json(corps)).into_response()
 }
 
 pub(super) async fn create_zone(
@@ -1124,58 +1181,53 @@ pub(super) async fn create_zone(
         return (StatusCode::BAD_REQUEST, Json(corps)).into_response();
     }
 
-    // If device already has a zone (visible OR hidden), return it (no premium check needed).
-    // A previously soft-deleted zone (is_hidden=1) is resurrected so the user's
-    // prior settings (volume, DSP, gapless, etc.) are preserved.
+    // L'appareil a déjà une zone. Visible : refus `409` qui la nomme (#8987).
+    // Masquée (supprimée) : elle est ressuscitée, réglages compris (volume,
+    // DSP, gapless…), sous le nom demandé.
     if let Some(device_id) = output_device_id {
         let repo = ZoneRepo::with_backend(state.backend.clone());
         if let Ok(Some(existing)) = repo.get_by_device_id(device_id)
             && let Some(id) = existing.id
         {
-            // Unhide if the zone was soft-deleted
             let masquee = repo.is_device_hidden(device_id);
-            if masquee {
+            // #8987 — décidé AVANT toute écriture : une zone visible ne se
+            // recrée pas, elle se refuse en la nommant. UN seul endroit
+            // décide (#1770, annexe 4), et aucune branche ne se tait.
+            let decision = nom_de_zone_existante(masquee, &existing.name, &body.name);
+            if decision == NomDeZoneExistante::Refuse {
                 info!(
-                    zone_id = id,
-                    device_id, "unhiding_previously_deleted_zone_via_api"
-                );
-                if let Err(e) = repo.unhide(id) {
-                    // Rendre `200 OK` ici, c'est annoncer « la voilà » d'une
-                    // zone qui reste masquée : l'utilisateur ne la verra
-                    // nulle part et croira l'avoir créée.
-                    return echec_ecriture(id, "is_hidden", "0", e);
-                }
-                // #7937 — la zone recréée n'hérite d'aucun groupe. Sa
-                // suppression l'en retire désormais ; ceci répare celles
-                // supprimées avant ce correctif.
-                sortir_la_zone_recreee_des_groupes(&state, id);
-                if let Some(ref ot) = body.output_type {
-                    let _ = repo.update_output_type(id, ot);
-                }
-            }
-            // Le nom demandé : honoré, écarté, ou déjà le bon. UN seul
-            // endroit décide (#1770, annexe 4), et aucune des trois
-            // branches ne se tait.
-            match nom_de_zone_existante(masquee, &existing.name, &body.name) {
-                NomDeZoneExistante::Honore => {
-                    if let Err(e) = repo.update_name(id, &body.name) {
-                        // Cette branche a DÉJÀ décidé d'honorer le nom :
-                        // rendre `200 OK` avec l'ancienne fiche serait dire
-                        // « c'est fait » d'une écriture qui a échoué.
-                        return echec_ecriture(id, "name", &body.name, e);
-                    }
-                }
-                // La perte cesse d'être silencieuse. Le code d'état et la
-                // fiche rendue ne changent PAS : trancher entre « honorer »
-                // et « 409 » appartient à Bertrand.
-                NomDeZoneExistante::Ecarte => warn!(
                     zone_id = id,
                     device_id,
                     nom_demande = %body.name,
-                    nom_conserve = %existing.name,
-                    "zone_existante_nom_demande_ecarte"
-                ),
-                NomDeZoneExistante::DejaLeBon => {}
+                    zone_existante = %existing.name,
+                    "zone_existe_deja_creation_refusee"
+                );
+                return refus_zone_existe_deja(id, &existing.name, device_id);
+            }
+            info!(
+                zone_id = id,
+                device_id, "unhiding_previously_deleted_zone_via_api"
+            );
+            if let Err(e) = repo.unhide(id) {
+                // Rendre `200 OK` ici, c'est annoncer « la voilà » d'une
+                // zone qui reste masquée : l'utilisateur ne la verra
+                // nulle part et croira l'avoir créée.
+                return echec_ecriture(id, "is_hidden", "0", e);
+            }
+            // #7937 — la zone recréée n'hérite d'aucun groupe. Sa
+            // suppression l'en retire désormais ; ceci répare celles
+            // supprimées avant ce correctif.
+            sortir_la_zone_recreee_des_groupes(&state, id);
+            if let Some(ref ot) = body.output_type {
+                let _ = repo.update_output_type(id, ot);
+            }
+            if decision == NomDeZoneExistante::Honore
+                && let Err(e) = repo.update_name(id, &body.name)
+            {
+                // Cette branche a DÉJÀ décidé d'honorer le nom : rendre
+                // `200 OK` avec l'ancienne fiche serait dire « c'est fait »
+                // d'une écriture qui a échoué.
+                return echec_ecriture(id, "name", &body.name, e);
             }
             let _ = repo.update_online(id, true);
             // Le contrat client AVEC l'etat REEL. Une zone qui existe deja
@@ -1183,7 +1235,9 @@ pub(super) async fn create_zone(
             // serait un second mensonge apres le volume. `build_zone_json`
             // sait deja produire ce contrat — s'en servir evite une
             // troisieme copie a faire deriver (#2284, revue JP Robbe).
-            let v = crate::routes::playback::build_zone_json(&state, id).await;
+            let mut v = crate::routes::playback::build_zone_json(&state, id).await;
+            // #8987 — ressuscitée sous l'autre hôte audio : dit.
+            super::zone_appareil_8987::signaler_la_restauration_hors_hote(&state, id, &mut v).await;
             // Une zone masquee qui reapparait est un evenement : sans
             // annonce, les autres clients connectes ne la voient qu'au
             // prochain refetch independant.
@@ -1255,22 +1309,74 @@ pub(super) async fn create_zone(
             if let Some(host) = host {
                 let repo = ZoneRepo::with_backend(state.backend.clone());
                 if let Some(existing_id) = repo.zone_id_by_host(&host) {
-                    let _ = repo.update_online(existing_id, true);
-                    // Même contrat client que les deux autres retours
-                    // anticipés (#2284) : l'état RÉEL de la zone.
-                    let v = crate::routes::playback::build_zone_json(&state, existing_id).await;
-                    state
-                        .event_bus
-                        .emit("zone.updated", json!({ "zone_id": existing_id }));
+                    // #8987 — décision de Bertrand : la jumelle SSDP d'un
+                    // appareil qui a déjà une zone reçoit le MÊME refus nommé
+                    // que l'identité exacte, plus un 200 silencieux.
+                    let nom = repo
+                        .get(existing_id)
+                        .ok()
+                        .flatten()
+                        .map(|z| z.name)
+                        .unwrap_or_default();
                     info!(
                         zone_id = existing_id,
                         device_id,
                         host = %host,
-                        "zone_same_host_already_exists_returning"
+                        "zone_same_host_already_exists_refused"
                     );
-                    return (StatusCode::OK, Json(v)).into_response();
+                    return refus_zone_existe_deja(existing_id, &nom, device_id);
                 }
             }
+        }
+    }
+
+    // #8987 — une zone SUPPRIMÉE avait lâché cet appareil au profit d'une
+    // autre zone, qui l'a rendu depuis : c'est elle que l'utilisateur
+    // recrée. Elle reprend sa sortie (avant d'être démasquée : un refus ne
+    // laisse pas une zone visible sans sortie), ses réglages et le nom demandé.
+    if let Some(device_id) = output_device_id {
+        let repo = ZoneRepo::with_backend(state.backend.clone());
+        if let Some(id) = repo.zone_masquee_qui_tenait(device_id) {
+            info!(
+                zone_id = id,
+                device_id, "zone_supprimee_retrouvee_par_sa_sortie_liberee"
+            );
+            if let Err(reponse) = super::zone_appareil_8987::prendre_la_sortie_demandee(
+                &repo,
+                id,
+                device_id,
+                tune_core::audio::reglages_de_volume::Rattachement::MemePeripherique {
+                    origine: "recreation_sortie_liberee",
+                },
+            ) {
+                return reponse;
+            }
+            let _ = repo.oublier_la_sortie_liberee(id);
+            if let Err(e) = repo.unhide(id) {
+                return echec_ecriture(id, "is_hidden", "0", e);
+            }
+            sortir_la_zone_recreee_des_groupes(&state, id);
+            if let Some(ref ot) = body.output_type {
+                let _ = repo.update_output_type(id, ot);
+            }
+            let nom_actuel = repo
+                .get(id)
+                .ok()
+                .flatten()
+                .map(|z| z.name)
+                .unwrap_or_default();
+            if nom_de_zone_existante(true, &nom_actuel, &body.name) == NomDeZoneExistante::Honore
+                && let Err(e) = repo.update_name(id, &body.name)
+            {
+                return echec_ecriture(id, "name", &body.name, e);
+            }
+            let _ = repo.update_online(id, true);
+            let mut v = crate::routes::playback::build_zone_json(&state, id).await;
+            super::zone_appareil_8987::signaler_la_restauration_hors_hote(&state, id, &mut v).await;
+            state
+                .event_bus
+                .emit("zone.updated", json!({ "zone_id": id }));
+            return (StatusCode::OK, Json(v)).into_response();
         }
     }
 
@@ -1325,6 +1431,19 @@ pub(super) async fn create_zone(
             // Safety net: a hidden zone with this device_id blocked the INSERT.
             // Unhide it and return it instead of erroring.
             let device_id = output_device_id.unwrap_or_default();
+            // #8987 — une zone VISIBLE née entre la relecture du haut et
+            // l'INSERT (deux clics, deux clients) : même refus nommé qu'au
+            // retour anticipé, jamais une résurrection de zone visible.
+            if !repo.is_device_hidden(device_id) {
+                let nom = repo
+                    .get(id)
+                    .ok()
+                    .flatten()
+                    .map(|z| z.name)
+                    .unwrap_or_default();
+                info!(zone_id = id, device_id, "zone_existe_deja_creation_refusee");
+                return refus_zone_existe_deja(id, &nom, device_id);
+            }
             warn!(
                 zone_id = id,
                 device_id, "unique_constraint_recovery_unhiding_zone"
@@ -1343,7 +1462,8 @@ pub(super) async fn create_zone(
             }
             let _ = repo.update_online(id, true);
             // Meme contrat, meme raison qu'au-dessus (#2284).
-            let v = crate::routes::playback::build_zone_json(&state, id).await;
+            let mut v = crate::routes::playback::build_zone_json(&state, id).await;
+            super::zone_appareil_8987::signaler_la_restauration_hors_hote(&state, id, &mut v).await;
             state
                 .event_bus
                 .emit("zone.updated", json!({ "zone_id": id }));

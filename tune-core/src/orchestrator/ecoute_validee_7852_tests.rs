@@ -79,6 +79,9 @@ fn en_file(db: &Arc<dyn DbBackend>, zone_id: i64, np: &NowPlaying) {
         .append(
             zone_id,
             &[QueueInput::Streaming {
+                media_format: None,
+                sample_rate: None,
+                bit_depth: None,
                 source: np.source.clone(),
                 source_id: np.source_id.clone().unwrap(),
                 title: np.title.clone(),

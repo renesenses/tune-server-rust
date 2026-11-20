@@ -309,6 +309,51 @@ pub struct UpnpState {
     /// détection automatique — même contrat que la chaîne de lecture
     /// (`routes/playback.rs`).
     pub advertised_ip: Option<String>,
+    /// #9079 — le serveur multimédia est-il en service ? Lu par la garde des
+    /// routes `/upnp` et par l'annonceur SSDP, basculé par
+    /// POST /api/v1/upnp/config sans attendre un redémarrage.
+    pub annonce: InterrupteurServeurMedia,
+}
+
+/// #9079 — l'interrupteur du serveur multimédia, partagé entre les routes
+/// HTTP `/upnp`, l'annonceur SSDP et l'écran de configuration.
+///
+/// Avant lui, décocher « annonce du serveur multimédia » ne coupait que
+/// l'annonceur, et seulement au redémarrage : la description et le
+/// ContentDirectory répondaient toujours en HTTP, et un point de contrôle qui
+/// revalide un serveur connu par sa LOCATION (JPLAY) le gardait dans sa liste.
+#[derive(Clone, Debug)]
+pub struct InterrupteurServeurMedia {
+    actif: Arc<std::sync::atomic::AtomicBool>,
+    reveil: Arc<tokio::sync::Notify>,
+}
+
+impl InterrupteurServeurMedia {
+    pub fn new(actif: bool) -> Self {
+        Self {
+            actif: Arc::new(std::sync::atomic::AtomicBool::new(actif)),
+            reveil: Arc::new(tokio::sync::Notify::new()),
+        }
+    }
+
+    pub fn est_actif(&self) -> bool {
+        self.actif.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Pose l'état voulu ; rend `true` s'il a changé. Un changement réveille
+    /// l'annonceur, qui reprend ses NOTIFY ou retire son annonce aussitôt
+    /// au lieu d'attendre la fin de son cycle de 300 s.
+    pub fn basculer(&self, actif: bool) -> bool {
+        let avant = self.actif.swap(actif, std::sync::atomic::Ordering::SeqCst);
+        if avant != actif {
+            self.reveil.notify_one();
+        }
+        avant != actif
+    }
+
+    async fn attendre_un_changement(&self) {
+        self.reveil.notified().await;
+    }
 }
 
 impl UpnpState {
@@ -342,12 +387,16 @@ impl UpnpState {
         // l'une ni l'autre c'est `Tune (<nom>)` (#8189) : `server_name`, sinon
         // le nom de l'appareil, suffixé par l'UDN posé juste au-dessus.
         let friendly_name = nom_publie(&settings);
+        // #9079 — même règle que l'annonceur : la clé en base, sinon la
+        // variable d'environnement, sinon en service.
+        let annonce = InterrupteurServeurMedia::new(annonce_voulue(&settings));
         Self {
             backend,
             server_port,
             friendly_name,
             uuid,
             advertised_ip,
+            annonce,
         }
     }
 
@@ -4042,6 +4091,64 @@ pub fn ssdp_notify_byebye(uuid: &str) -> String {
     )
 }
 
+/// Le NOTIFY `ssdp:byebye` d'une identité (NT, USN) du MediaServer.
+pub fn ssdp_notify_byebye_for(nt: &str, usn: &str) -> String {
+    format!(
+        "NOTIFY * HTTP/1.1\r\n\
+         HOST: 239.255.255.250:1900\r\n\
+         NT: {nt}\r\n\
+         NTS: ssdp:byebye\r\n\
+         USN: {usn}\r\n\
+         \r\n"
+    )
+}
+
+/// #9079 — les `ssdp:byebye` des TROIS identités annoncées (rootdevice,
+/// MediaServer, ContentDirectory) : un point de contrôle qui a retenu l'une
+/// d'elles doit la voir partir.
+pub fn messages_byebye(uuid: &str) -> Vec<String> {
+    usn_targets(uuid)
+        .iter()
+        .map(|(nt, usn)| ssdp_notify_byebye_for(nt, usn))
+        .collect()
+}
+
+/// #9079 — retire l'annonce publiée et la rend : le répondeur M-SEARCH
+/// cesse aussitôt de répondre pour le MediaServer. `None` si rien n'était
+/// annoncé.
+pub fn retirer_l_annonce() -> Option<MediaServerAdvert> {
+    ADVERT.write().ok().and_then(|mut g| g.take())
+}
+
+/// #9079 — le serveur multimédia vient d'être coupé : plus de réponse aux
+/// M-SEARCH, et un `ssdp:byebye` multicast pour chaque identité annoncée
+/// (envoyé deux fois, l'UDP pouvant en perdre un). Rien ne part si rien
+/// n'était annoncé.
+pub async fn retirer_du_reseau() {
+    use std::net::{Ipv4Addr, SocketAddrV4};
+    use tokio::net::UdpSocket;
+
+    let Some(annonce) = retirer_l_annonce() else {
+        return;
+    };
+    let socket = match UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0)).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "ssdp_byebye_bind_failed");
+            return;
+        }
+    };
+    let dest = std::net::SocketAddr::from((Ipv4Addr::new(239, 255, 255, 250), 1900u16));
+    for _ in 0..2 {
+        for message in messages_byebye(&annonce.uuid) {
+            if let Err(e) = socket.send_to(message.as_bytes(), dest).await {
+                debug!(error = %e, "ssdp_byebye_send_error");
+            }
+        }
+    }
+    tracing::info!(uuid = %annonce.uuid, "upnp_mediaserver_byebye_sent");
+}
+
 /// Spawn a background task that periodically sends SSDP NOTIFY alive
 /// on the multicast group, advertising this server as a MediaServer.
 ///
@@ -4049,7 +4156,15 @@ pub fn ssdp_notify_byebye(uuid: &str) -> String {
 /// VPN, bascule d'interface), et tant qu'aucune IP réseau n'est détectée on
 /// n'annonce RIEN — retry court en attendant que le réseau monte, plutôt
 /// que d'annoncer un 127.0.0.1 injoignable des autres machines (#1614).
-pub async fn spawn_ssdp_advertiser(uuid: String, port: u16, advertised_ip: Option<String>) {
+///
+/// #9079 — l'annonceur suit `interrupteur` : coupé, il retire son annonce et
+/// attend d'être rallumé ; un changement le réveille en cours de cycle.
+pub async fn spawn_ssdp_advertiser(
+    uuid: String,
+    port: u16,
+    advertised_ip: Option<String>,
+    interrupteur: InterrupteurServeurMedia,
+) {
     use std::net::{Ipv4Addr, SocketAddrV4};
     use tokio::net::UdpSocket;
 
@@ -4069,6 +4184,11 @@ pub async fn spawn_ssdp_advertiser(uuid: String, port: u16, advertised_ip: Optio
         let mut network_was_up = true;
 
         loop {
+            if !interrupteur.est_actif() {
+                retirer_l_annonce();
+                interrupteur.attendre_un_changement().await;
+                continue;
+            }
             let Some(ip) = current_advert_ip(advertised_ip.as_deref()) else {
                 // Pas d'IP réseau (démarrage avant le DHCP, interfaces
                 // toutes virtuelles…) : on garde la dernière annonce connue
@@ -4089,6 +4209,9 @@ pub async fn spawn_ssdp_advertiser(uuid: String, port: u16, advertised_ip: Optio
             // découverte : c'est lui qui rend Tune visible d'un « Rechercher
             // des appareils », le NOTIFY spontané ne couvrant que l'écoute
             // passive.
+            if !interrupteur.est_actif() {
+                continue;
+            }
             if let Ok(mut guard) = ADVERT.write() {
                 *guard = Some(MediaServerAdvert {
                     uuid: uuid.clone(),
@@ -4110,7 +4233,10 @@ pub async fn spawn_ssdp_advertiser(uuid: String, port: u16, advertised_ip: Optio
             // l'expiration du CACHE-CONTROL (max-age=1800) — et dix minutes
             // entre deux annonces laissaient les contrôleurs à l'écoute
             // passive nous croire disparus.
-            tokio::time::sleep(std::time::Duration::from_secs(300)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(300)) => {}
+                _ = interrupteur.attendre_un_changement() => {}
+            }
         }
     });
 }
@@ -5868,6 +5994,57 @@ mod tests {
         assert!(msg.contains("ssdp:alive"));
         assert!(msg.contains("MediaServer:1"));
         assert!(msg.contains("uuid:1234"));
+    }
+
+    /// #9079 — un byebye par identité annoncée, et les trois identités y
+    /// sont : rootdevice, MediaServer, ContentDirectory.
+    #[test]
+    fn le_byebye_couvre_les_trois_identites() {
+        let messages = messages_byebye("uuid:9079");
+        assert_eq!(messages.len(), 3);
+        for m in &messages {
+            assert!(m.contains("NTS: ssdp:byebye"), "{m}");
+            assert!(
+                !m.contains("LOCATION"),
+                "un byebye ne porte pas de LOCATION : {m}"
+            );
+        }
+        for usn in [
+            "USN: uuid:9079::upnp:rootdevice",
+            "USN: uuid:9079::urn:schemas-upnp-org:device:MediaServer:1",
+            "USN: uuid:9079::urn:schemas-upnp-org:service:ContentDirectory:1",
+        ] {
+            assert!(messages.iter().any(|m| m.contains(usn)), "{usn} manque");
+        }
+    }
+
+    /// #9079 — l'interrupteur suit `upnp_enabled` dès la construction, et une
+    /// bascule ne compte comme changement qu'une fois.
+    #[test]
+    fn l_interrupteur_suit_le_reglage_et_signale_les_changements() {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        crate::db::settings_repo::SettingsRepo::with_backend(backend.clone())
+            .set("upnp_enabled", "false")
+            .unwrap();
+        let state = UpnpState::new(backend, 8888, None);
+        assert!(
+            !state.annonce.est_actif(),
+            "upnp_enabled=false : le serveur multimedia doit naitre coupe"
+        );
+        assert!(state.annonce.basculer(true));
+        assert!(
+            !state.annonce.basculer(true),
+            "deja actif : pas un changement"
+        );
+        let copie = state.clone();
+        assert!(copie.annonce.basculer(false));
+        assert!(
+            !state.annonce.est_actif(),
+            "les copies partagent l'interrupteur"
+        );
     }
 
     #[test]

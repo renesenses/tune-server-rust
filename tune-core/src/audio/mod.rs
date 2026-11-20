@@ -1,6 +1,8 @@
 pub mod aac_encoder;
 pub mod aiff;
 pub mod alac_encoder;
+/// #8968 — amorce et remplissage d'un AAC en MP4 (`iTunSMPB`, `elst`).
+pub(crate) mod amorce_aac;
 pub mod analyzer;
 pub mod ape;
 pub mod audiophile;
@@ -8,6 +10,8 @@ pub mod audit_integrite;
 pub mod autoeq;
 /// #6388 — la base AutoEq en ligne : index, recherche, copie locale.
 pub mod autoeq_base;
+/// #8968 — bornes d'une tranche CUE à l'échantillon près.
+pub mod bornes_cue;
 pub mod canaux_declares;
 pub mod canaux_reseau_4573;
 /// #6385 — les profils d'égaliseur OPRA (JSON), lus vers le même modèle.

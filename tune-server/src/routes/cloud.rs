@@ -196,11 +196,88 @@ pub(crate) fn page_connexion_demandee(requete: &[(String, String)]) -> PageConne
     )
 }
 
+/// Refus de la garde « administrateur ou cette machine » rendu en PAGE : relier
+/// ou délier le compte se fait par une navigation complète du navigateur, il
+/// n'y a aucune interface pour lire un corps JSON.
+fn page_refus_hors_machine(
+    headers: &HeaderMap,
+    refus: (StatusCode, Json<Value>),
+) -> axum::response::Response {
+    let (statut, Json(corps)) = refus;
+    let motif = corps["message"]
+        .as_str()
+        .or_else(|| corps["error"].as_str())
+        .unwrap_or("forbidden")
+        .to_string();
+    page_echec_compte(headers, statut, &motif)
+}
+
+type RefusDeGarde = (StatusCode, Json<Value>);
+
+/// Ce qu'une liaison au compte Mozaiklabs a le droit de toucher.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Liaison {
+    /// Le SERVEUR : session cloud globale, synchro, licence du compte.
+    /// L'administrateur, ou cette machine quand l'authentification est coupée.
+    Serveur,
+    /// Le seul PROFIL de l'appelant (authentification active, compte
+    /// standard) : identité rangée sur son profil, rien de l'état du serveur.
+    Profil(i64),
+}
+
+/// Qui relie quoi. Authentification coupée : cette machine seulement.
+/// Authentification active : l'administrateur relie le serveur, un compte
+/// standard ne relie que son propre profil.
+fn liaison_autorisee(
+    state: &AppState,
+    garde: Result<crate::auth::AdminOuCetteMachine, RefusDeGarde>,
+    appelant: Option<crate::auth::AuthUser>,
+) -> Result<Liaison, RefusDeGarde> {
+    match garde {
+        Ok(_) => Ok(Liaison::Serveur),
+        Err(refus) => match appelant {
+            Some(u) if crate::auth::authentification_active(state) && u.user_id > 0 => {
+                Ok(Liaison::Profil(u.user_id))
+            }
+            _ => Err(refus),
+        },
+    }
+}
+
+/// Le compte Mozaiklabs relié à un profil standard (jamais de jeton).
+fn cle_compte_du_profil(profil: i64) -> String {
+    format!("mozaik_compte_profil_{profil}")
+}
+
+/// Les deux attentes d'une ronde OAuth (PKCE, redirect_uri). Un profil
+/// standard a les siennes : sa ronde ne touche pas celle du serveur.
+fn cles_d_attente(liaison: Liaison) -> (String, String) {
+    match liaison {
+        Liaison::Serveur => (
+            "mozaik_pkce_pending".to_string(),
+            "mozaik_redirect_uri_pending".to_string(),
+        ),
+        Liaison::Profil(id) => (
+            format!("mozaik_pkce_pending_profil_{id}"),
+            format!("mozaik_redirect_uri_pending_profil_{id}"),
+        ),
+    }
+}
+
+/// Relier ce serveur (ou, compte standard, son propre profil) à un compte
+/// Mozaiklabs — voir [`liaison_autorisee`]. Le retour (`sso_callback`) passe
+/// la même règle.
 async fn sso_authorize(
+    garde: Result<crate::auth::AdminOuCetteMachine, RefusDeGarde>,
+    appelant: Option<crate::auth::AuthUser>,
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(requete): Query<Vec<(String, String)>>,
 ) -> impl IntoResponse {
+    let liaison = match liaison_autorisee(&state, garde, appelant) {
+        Ok(l) => l,
+        Err(refus) => return page_refus_hors_machine(&headers, refus),
+    };
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let Some(auth) = get_mozaik_auth(&settings) else {
         // sso_authorize is a full browser navigation, so degrade to a friendly
@@ -233,20 +310,33 @@ async fn sso_authorize(
     // PKCE (RFC 7636): mint a fresh verifier/challenge/state and stash the
     // verifier + state for the browser round-trip (consumed in sso_callback).
     let pkce = PkceSession::generate();
+    let (cle_pkce, cle_uri) = cles_d_attente(liaison);
     settings
-        .set(
-            "mozaik_pkce_pending",
-            &serde_json::to_string(&pkce).unwrap_or_default(),
-        )
+        .set(&cle_pkce, &serde_json::to_string(&pkce).unwrap_or_default())
         .ok();
 
     let uri = redirect_uri(&state, Some(&headers));
     // Persist the exact redirect_uri: OAuth requires the token exchange in the
     // callback to present an identical value.
-    settings.set("mozaik_redirect_uri_pending", &uri).ok();
+    settings.set(&cle_uri, &uri).ok();
+    // Une connexion en attente a une durée de vie (voir `PKCE_EN_ATTENTE_MAX`).
+    settings
+        .set(&format!("{cle_pkce}_at"), &maintenant_unix().to_string())
+        .ok();
     let page = page_connexion_demandee(&requete);
     let url = auth.authorize_url_avec_page(&uri, &pkce.challenge, &pkce.state, &page);
     Redirect::temporary(&url).into_response()
+}
+
+/// Durée de vie d'une connexion SSO en attente (secondes) : l'aller-retour
+/// par mozaiklabs.fr prend quelques secondes ; au-delà, on recommence.
+const PKCE_EN_ATTENTE_MAX: u64 = 10 * 60;
+
+fn maintenant_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 #[derive(Deserialize)]
@@ -257,10 +347,22 @@ struct CallbackQuery {
 }
 
 async fn sso_callback(
+    garde: Result<crate::auth::AdminOuCetteMachine, RefusDeGarde>,
+    appelant: Option<crate::auth::AuthUser>,
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(q): Query<CallbackQuery>,
 ) -> impl IntoResponse {
+    // Même règle qu'à l'autorisation, AVANT de lire ou consommer une attente
+    // PKCE : le navigateur qui revient de mozaiklabs.fr est celui qui a lancé
+    // la liaison (cette machine, ou une session et son cookie).
+    match liaison_autorisee(&state, garde, appelant) {
+        Ok(Liaison::Serveur) => {}
+        Ok(Liaison::Profil(profil)) => {
+            return sso_callback_profil(&state, &headers, q, profil).await;
+        }
+        Err(refus) => return page_refus_hors_machine(&headers, refus),
+    }
     // Chaque refus de cette route est une PAGE : le navigateur y arrive par la
     // redirection de mozaiklabs, il n'y a aucune interface pour lire du JSON.
     if let Some(err) = q.error {
@@ -290,12 +392,22 @@ async fn sso_callback(
 
     // Load & validate the pending PKCE session (CSRF: state must match), then
     // consume it — one-shot, cleared regardless of the exchange outcome.
+    let emise = settings
+        .get("mozaik_pkce_pending_at")
+        .ok()
+        .flatten()
+        .and_then(|s| s.trim().parse::<u64>().ok());
     let pending: Option<PkceSession> = settings
         .get("mozaik_pkce_pending")
         .ok()
         .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok());
+        .and_then(|s| serde_json::from_str(&s).ok())
+        // Sans date, ou plus vieille que dix minutes : plus valable.
+        .filter(|_| {
+            emise.is_some_and(|t| maintenant_unix().saturating_sub(t) <= PKCE_EN_ATTENTE_MAX)
+        });
     settings.set("mozaik_pkce_pending", "").ok();
+    settings.delete("mozaik_pkce_pending_at").ok();
 
     let Some(pkce) = pending else {
         return page_echec_compte(
@@ -463,7 +575,10 @@ async fn sso_callback(
         // formes que porte cette colonne dans le parc — SMALLINT (natif),
         // TEXT (base migree, `bigint -> text` est accepte) et INTEGER
         // (SQLite) — et les lecteurs passent tous par `as_i64()`.
-        let is_admin: i64 = i64::from(user.is_admin);
+        // Jamais administrateur : `CloudUser::is_admin` désigne l'équipe de
+        // mozaiklabs.fr, pas le propriétaire de CE serveur. Seul un
+        // administrateur local promeut un profil.
+        let is_admin: i64 = 0;
         state
             .backend
             .execute_returning_id(
@@ -523,7 +638,14 @@ async fn sso_callback(
         );
     }
 
-    let role = if user.is_admin { "admin" } else { "user" };
+    // Le rôle de la session est celui du profil LOCAL, jamais celui du compte
+    // mozaiklabs.fr : un administrateur local le reste, un profil créé ou
+    // relié par cette ronde est standard.
+    let role = if profil_local_est_admin(&state, profile_id) {
+        "admin"
+    } else {
+        "user"
+    };
     let jwt_secret = match settings.get("jwt_secret").ok().flatten() {
         Some(s) if !s.is_empty() => s,
         _ => {
@@ -554,8 +676,176 @@ async fn sso_callback(
     response
 }
 
-async fn sso_status(State(state): State<AppState>) -> Json<Value> {
+/// `profiles.is_admin` lu sur la base locale (SMALLINT, TEXT ou INTEGER selon
+/// le moteur : voir l'INSERT du callback).
+fn profil_local_est_admin(state: &AppState, profil: i64) -> bool {
+    use tune_core::db::backend::ToSqlValue;
+    state
+        .backend
+        .query_one(
+            "SELECT is_admin FROM profiles WHERE id = ?",
+            &[&profil as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten()
+        .and_then(|row| row.first().cloned())
+        .is_some_and(|v| {
+            v.as_bool().unwrap_or(false)
+                || v.as_i64().is_some_and(|n| n != 0)
+                || v.as_string().is_some_and(|t| {
+                    let t = t.trim();
+                    t == "1" || t.eq_ignore_ascii_case("true")
+                })
+        })
+}
+
+/// Retour du SSO pour un compte STANDARD (authentification active) : le compte
+/// Mozaiklabs est rangé sur SON profil, et c'est tout. Ni jeton global, ni
+/// `mozaik_user`, ni liaison de synchro, ni licence, ni rôle : le serveur reste
+/// relié au compte que l'administrateur a choisi.
+async fn sso_callback_profil(
+    state: &AppState,
+    headers: &HeaderMap,
+    q: CallbackQuery,
+    profil: i64,
+) -> axum::response::Response {
+    if let Some(err) = q.error {
+        return page_echec_compte(
+            headers,
+            StatusCode::BAD_REQUEST,
+            &format!("OAuth error: {err}"),
+        );
+    }
+    let Some(code) = q.code else {
+        return page_echec_compte(
+            headers,
+            StatusCode::BAD_REQUEST,
+            "missing authorization code",
+        );
+    };
     let settings = SettingsRepo::with_backend(state.backend.clone());
+    let Some(auth) = get_mozaik_auth(&settings) else {
+        return page_echec_compte(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "SSO not configured",
+        );
+    };
+    let (cle_pkce, cle_uri) = cles_d_attente(Liaison::Profil(profil));
+    let cle_date = format!("{cle_pkce}_at");
+    let emise = settings
+        .get(&cle_date)
+        .ok()
+        .flatten()
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    let pending: Option<PkceSession> = settings
+        .get(&cle_pkce)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        // Sans date, ou plus vieille que dix minutes : plus valable.
+        .filter(|_| {
+            emise.is_some_and(|t| maintenant_unix().saturating_sub(t) <= PKCE_EN_ATTENTE_MAX)
+        });
+    settings.set(&cle_pkce, "").ok();
+    settings.delete(&cle_date).ok();
+    let Some(pkce) = pending else {
+        return page_echec_compte(
+            headers,
+            StatusCode::BAD_REQUEST,
+            "no pending SSO session (restart login)",
+        );
+    };
+    if q.state.as_deref() != Some(pkce.state.as_str()) {
+        warn!(profil, "sso_state_mismatch_profil");
+        return page_echec_compte(
+            headers,
+            StatusCode::BAD_REQUEST,
+            "state mismatch (possible CSRF)",
+        );
+    }
+    let uri = settings
+        .get(&cle_uri)
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| redirect_uri(state, Some(headers)));
+    settings.set(&cle_uri, "").ok();
+    if let Some(attente) = rate_limit::active(&settings, CloudScope::UserProfile) {
+        return page_attente_compte(headers, attente.retry_after_seconds);
+    }
+    let token = match auth.exchange_code(&code, &uri, &pkce.verifier).await {
+        Ok(t) => t,
+        Err(e) => {
+            warn!(error = %e, "sso_code_exchange_failed");
+            return page_echec_compte(headers, StatusCode::BAD_GATEWAY, &e);
+        }
+    };
+    let user = match auth.get_user(&settings, &token.access_token).await {
+        ProfilCloud::Profil(u) => *u,
+        ProfilCloud::Differe {
+            retry_after_seconds,
+        } => return page_attente_compte(headers, retry_after_seconds),
+        ProfilCloud::Echec(e) => {
+            warn!(error = %e, "sso_user_fetch_failed");
+            return page_echec_compte(headers, StatusCode::BAD_GATEWAY, &e);
+        }
+    };
+    // Le jeton n'est PAS conservé : il ne sert qu'à établir l'identité.
+    drop(token);
+    enregistrer_compte_du_profil(state, profil, &user);
+    info!(profil, "sso_liaison_du_profil");
+    Redirect::temporary("/").into_response()
+}
+
+/// Range le compte Mozaiklabs sur le profil `profil` (nom affiché compris).
+fn enregistrer_compte_du_profil(
+    state: &AppState,
+    profil: i64,
+    user: &tune_core::cloud::sso::CloudUser,
+) {
+    use tune_core::db::backend::ToSqlValue;
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    settings
+        .set(
+            &cle_compte_du_profil(profil),
+            &serde_json::to_string(user).unwrap_or_default(),
+        )
+        .ok();
+    state
+        .backend
+        .execute(
+            "UPDATE profiles SET display_name = ? WHERE id = ?",
+            &[
+                &user.display_name as &dyn ToSqlValue,
+                &profil as &dyn ToSqlValue,
+            ],
+        )
+        .ok();
+}
+
+async fn sso_status(
+    garde: Result<crate::auth::AdminOuCetteMachine, RefusDeGarde>,
+    appelant: Option<crate::auth::AuthUser>,
+    State(state): State<AppState>,
+) -> Json<Value> {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    // Un compte standard voit SA liaison, pas celle du serveur.
+    if let Ok(Liaison::Profil(profil)) = liaison_autorisee(&state, garde, appelant) {
+        let user: Option<tune_core::cloud::sso::CloudUser> = settings
+            .get(&cle_compte_du_profil(profil))
+            .ok()
+            .flatten()
+            .filter(|s| !s.is_empty())
+            .and_then(|s| serde_json::from_str(&s).ok());
+        return Json(json!({
+            "configured": resolve_client_id(&settings).is_some(),
+            "connected": user.is_some(),
+            "reconnect_required": false,
+            "scope": "profile",
+            "user": user,
+        }));
+    }
     let configured = resolve_client_id(&settings).is_some();
     let connected = settings
         .get("mozaik_access_token")
@@ -585,9 +875,28 @@ async fn sso_status(State(state): State<AppState>) -> Json<Value> {
 /// stored tokens/profile and revoke the account premium. The license-key path is
 /// untouched (a keyed premium survives).
 async fn sso_disconnect(
-    _admin: crate::auth::RequireAdmin,
+    garde: Result<crate::auth::AdminOuCetteMachine, RefusDeGarde>,
+    appelant: Option<crate::auth::AuthUser>,
     State(state): State<AppState>,
-) -> Json<Value> {
+) -> axum::response::Response {
+    match liaison_autorisee(&state, garde, appelant) {
+        Ok(Liaison::Serveur) => sso_disconnect_serveur(&state).await.into_response(),
+        // Compte standard : il délie SON profil, jamais le serveur.
+        Ok(Liaison::Profil(profil)) => {
+            let settings = SettingsRepo::with_backend(state.backend.clone());
+            let (cle_pkce, cle_uri) = cles_d_attente(Liaison::Profil(profil));
+            let cle_date = format!("{cle_pkce}_at");
+            for cle in [cle_compte_du_profil(profil), cle_pkce, cle_uri, cle_date] {
+                settings.delete(&cle).ok();
+            }
+            info!(profil, "sso_deliaison_du_profil");
+            Json(json!({ "connected": false, "scope": "profile" })).into_response()
+        }
+        Err(refus) => refus.into_response(),
+    }
+}
+
+async fn sso_disconnect_serveur(state: &AppState) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     // Tune Circle (décision du 28/09/2026, #5326) : défaire la liaison chez le
     // cloud AVANT d'effacer les jetons qui la prouvent. Un échec (réseau, 404,
@@ -660,7 +969,10 @@ async fn telemetry_status(State(state): State<AppState>) -> Json<Value> {
 /// EFFECTIF, donc `false`, et l'interface voit tout de suite que son clic n'a
 /// pas pris — au lieu de basculer une case que le rafraichissement suivant
 /// remettra en place toute seule.
-async fn telemetry_enable(State(state): State<AppState>) -> Json<Value> {
+async fn telemetry_enable(
+    _garde: crate::auth::AdminOuCetteMachine,
+    State(state): State<AppState>,
+) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     settings
         .set(tune_core::cloud::telemetry::TELEMETRY_SETTING_KEY, "true")
@@ -683,7 +995,10 @@ async fn telemetry_enable(State(state): State<AppState>) -> Json<Value> {
 /// la cle de licence (trois champs, rien de descriptif) et le rafraichissement
 /// des droits premium SSO. Un opt-out ne doit jamais se payer en
 /// fonctionnalites perdues — voir `background::heartbeat_plan` (LIC-1).
-async fn telemetry_disable(State(state): State<AppState>) -> Json<Value> {
+async fn telemetry_disable(
+    _garde: crate::auth::AdminOuCetteMachine,
+    State(state): State<AppState>,
+) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     settings
         .set(tune_core::cloud::telemetry::TELEMETRY_SETTING_KEY, "false")
@@ -800,6 +1115,7 @@ struct VoteRequest {
 }
 
 async fn marketplace_vote(
+    _garde: crate::auth::AdminOuCetteMachine,
     Path(name): Path<String>,
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -828,6 +1144,7 @@ struct ArtistImageReport {
 }
 
 async fn report_artist_image(
+    _garde: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<ArtistImageReport>,
@@ -862,6 +1179,7 @@ struct CoverSubmitRequest {
 }
 
 async fn submit_community_cover(
+    _garde: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<CoverSubmitRequest>,
@@ -914,6 +1232,7 @@ struct CoverSyncRequest {
 }
 
 async fn sync_community_covers(
+    _garde: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<CoverSyncRequest>,
@@ -1150,7 +1469,9 @@ pub const MESSAGE_ACCES_PAR_COMPTE: &str =
 /// active (`RequireAdmin`), répond 409 tant que le pont est éteint ou sans
 /// jeton, et n'en fabrique JAMAIS un — c'est le rôle de `bridge_enable`.
 async fn bridge_access_link(
-    _admin: crate::auth::RequireAdmin,
+    // Le lien porte le jeton du pont : administrateur, ou authentification
+    // coupée, seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
 ) -> axum::response::Response {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -1235,7 +1556,9 @@ fn reponse_lien_d_acces(settings: &SettingsRepo, token: &str) -> axum::response:
 ///
 /// Réponse : le nouveau lien, de la forme de `bridge_access_link`.
 async fn bridge_rotate_token(
-    _admin: crate::auth::RequireAdmin,
+    // Engage la machine : administrateur, ou authentification coupée,
+    // seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
 ) -> axum::response::Response {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -1267,7 +1590,9 @@ async fn bridge_rotate_token(
 /// Active le pont. Administrateur seulement dès que l'authentification est
 /// active : la réponse porte le jeton de pont.
 async fn bridge_enable(
-    _admin: crate::auth::RequireAdmin,
+    // Ouvrir l'accès à distance engage la machine : administrateur, ou
+    // authentification coupée, seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     // Premium gate: Cloud Relay requires Premium
@@ -1314,7 +1639,9 @@ async fn bridge_enable(
 /// Éteint le pont. Administrateur seulement dès que l'authentification est
 /// active.
 async fn bridge_disable(
-    _admin: crate::auth::RequireAdmin,
+    // Engage la machine : administrateur, ou authentification coupée,
+    // seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
 ) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
@@ -1327,8 +1654,18 @@ async fn bridge_disable(
 // License
 // ---------------------------------------------------------------------------
 
-async fn license_status(State(state): State<AppState>) -> Json<Value> {
+async fn license_status(
+    garde: Result<crate::auth::AdminOuCetteMachine, (StatusCode, Json<Value>)>,
+    State(state): State<AppState>,
+) -> Json<Value> {
     let ls = state.license.license_state().await;
+    // La clé en clair ne va qu'à qui peut aussi la retirer ou la remplacer ;
+    // les autres lisent la même forme masquée que `GET /system/license`.
+    let license_key = if garde.is_ok() {
+        ls.license_key.clone()
+    } else {
+        ls.license_key.as_deref().map(cle_masquee)
+    };
     let mut features = serde_json::Map::new();
     for f in tune_core::license::Feature::all_advertised() {
         let enabled = state.license.check_feature(f).await;
@@ -1380,7 +1717,7 @@ async fn license_status(State(state): State<AppState>) -> Json<Value> {
     Json(json!({
         "tier": ls.tier,
         "premium_source": premium_source,
-        "license_key": ls.license_key,
+        "license_key": license_key,
         "expires_at": ls.expires_at,
         "last_validated": ls.last_validated,
         "hardware_fingerprint": ls.hardware_fingerprint,
@@ -1419,6 +1756,7 @@ async fn license_status(State(state): State<AppState>) -> Json<Value> {
 /// et Free, exactement comme avant. Aucune clé ne débloque quoi que ce soit
 /// sans confirmation en ligne.
 async fn license_activate(
+    _garde: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> impl IntoResponse {
@@ -1454,12 +1792,26 @@ async fn license_activate(
     .into_response()
 }
 
-async fn license_deactivate(State(state): State<AppState>) -> Json<Value> {
+async fn license_deactivate(
+    _garde: crate::auth::AdminOuCetteMachine,
+    State(state): State<AppState>,
+) -> Json<Value> {
     let remote_released = retirer_la_licence(&state).await;
     Json(reponse_de_retrait(
         json!({"status": "deactivated", "tier": "free"}),
         remote_released,
     ))
+}
+
+/// La clé de licence masquée : quatre derniers caractères visibles, comme
+/// `GET /system/license`.
+pub(crate) fn cle_masquee(k: &str) -> String {
+    let n = k.chars().count();
+    if n <= 4 {
+        return "****".to_string();
+    }
+    let fin: String = k.chars().skip(n - 4).collect();
+    format!("{}{fin}", "*".repeat(n - 4))
 }
 
 /// Retire la licence de ce serveur (#7726) : prévient d'abord mozaiklabs.fr
@@ -2753,3 +3105,7 @@ mod confinement_chemins_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "cloud_garde_compte_tests.rs"]
+mod cloud_garde_compte_tests;

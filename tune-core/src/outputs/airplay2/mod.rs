@@ -1033,7 +1033,9 @@ impl OutputTarget for Airplay2Output {
         match self
             .send(&serde_json::json!({
                 "cmd": "volume",
-                "level": volume,
+                // #8855 — le démon convertit par 20·log10 : on lui donne le
+                // niveau qui retombe sur la courbe commune (-30..0 dB).
+                "level": crate::outputs::volume_airplay_8855::niveau_pour_le_demon(volume),
             }))
             .await
         {
@@ -1059,7 +1061,7 @@ impl OutputTarget for Airplay2Output {
         match self
             .send(&serde_json::json!({
                 "cmd": "volume",
-                "level": vol,
+                "level": crate::outputs::volume_airplay_8855::niveau_pour_le_demon(vol),
             }))
             .await
         {
@@ -1414,6 +1416,16 @@ fn find_daemon_binary() -> String {
     resolve_daemon_path(exe_dir, &exe_name)
         .or_else(|| which_daemon(&exe_name))
         .unwrap_or(exe_name)
+}
+
+/// #8944 — le chemin du démon que [`Airplay2Output`] lancerait, s'il en
+/// trouve un : celui d'à côté du binaire, un emplacement connu, ou le `PATH`.
+/// Le rapport de bogue le compare à celui que la mise à jour remplace.
+pub fn chemin_du_demon_lance() -> Option<String> {
+    let exe_name = daemon_exe_name();
+    let exe = std::env::current_exe().ok();
+    let exe_dir = exe.as_deref().and_then(|p| p.parent());
+    resolve_daemon_path(exe_dir, &exe_name).or_else(|| which_daemon(&exe_name))
 }
 
 /// Check if the airplay-daemon binary is available on this system.
