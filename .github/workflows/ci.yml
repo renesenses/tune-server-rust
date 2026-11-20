@@ -238,9 +238,26 @@ jobs:
         run: python3 scripts/nouveautes-forum.py --self-test
 
       - name: Syntaxe des scripts de garde-fou
+        if: vars.SANS_DOCKER != '1'
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE:/repo" -w /repo \
             koalaman/shellcheck-alpine:v0.10.0 shellcheck --severity=warning \
+            scripts/detecter-impact-ci.sh \
+            scripts/determiner-profil-ci.sh \
+            scripts/detecter-jobs-lourds-ci.sh \
+            scripts/verifier-fermeture.sh \
+            scripts/verifier-refs-issues.sh \
+            scripts/docker-install.sh \
+            packaging/docker/entrypoint.sh \
+            packaging/docker/test-entrypoint.sh
+
+      # Runner auto-heberge sans docker (vars.SANS_DOCKER == '1') : meme
+      # shellcheck v0.10.0, en binaire epingle dans le PATH du runner.
+      - name: Syntaxe des scripts de garde-fou (sans docker)
+        if: vars.SANS_DOCKER == '1'
+        run: |
+          shellcheck --version | grep -qx 'version: 0.10.0'
+          shellcheck --severity=warning \
             scripts/detecter-impact-ci.sh \
             scripts/determiner-profil-ci.sh \
             scripts/detecter-jobs-lourds-ci.sh \
@@ -254,15 +271,35 @@ jobs:
       # setpriv/usermod/chown en root dans debian:bookworm-slim, la base de
       # Dockerfile.dist.
       - name: Entrypoint de l image Docker
+        if: vars.SANS_DOCKER != '1'
         run: bash packaging/docker/test-entrypoint.sh --conteneur
+
+      # Sans docker : la simulation (sans root) tourne ; le vrai passage en
+      # conteneur debian:bookworm-slim est SAUTE et le dit.
+      - name: Entrypoint de l image Docker (simulation, sans docker)
+        if: vars.SANS_DOCKER == '1'
+        run: |
+          echo "::warning::runner sans docker (vars.SANS_DOCKER=1) : passage en conteneur de test-entrypoint.sh saute, simulation seule"
+          bash packaging/docker/test-entrypoint.sh
 
       # Les workflows historiques portent quelques remarques shellcheck, mais
       # leur YAML et leurs expressions sont valides. On garde le controle
       # structurel et on ignore seulement ces deux familles connues.
       - name: Syntaxe des workflows GitHub
+        if: vars.SANS_DOCKER != '1'
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE:/repo" -w /repo \
             rhysd/actionlint:1.7.7 \
+            -shellcheck= \
+            -ignore 'constant.expression.*false' \
+            -ignore 'label.*macos-15-intel.*is unknown'
+
+      # Sans docker : meme actionlint 1.7.7, en binaire epingle.
+      - name: Syntaxe des workflows GitHub (sans docker)
+        if: vars.SANS_DOCKER == '1'
+        run: |
+          actionlint --version | head -1 | grep -qx '1.7.7'
+          actionlint \
             -shellcheck= \
             -ignore 'constant.expression.*false' \
             -ignore 'label.*macos-15-intel.*is unknown'
