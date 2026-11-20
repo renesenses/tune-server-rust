@@ -54,9 +54,15 @@ async fn aucun_secret_ne_passe_9015() {
         "xyz",
         "abc123",
     ] {
-        assert!(!tout.contains(secret), "secret « {secret} » relayé : {tout}");
+        assert!(
+            !tout.contains(secret),
+            "secret « {secret} » relayé : {tout}"
+        );
     }
-    assert!(tout.contains("pair-setup with pin="), "le contexte reste : {tout}");
+    assert!(
+        tout.contains("pair-setup with pin="),
+        "le contexte reste : {tout}"
+    );
     assert!(tout.contains("192.168.1.37"), "l'hôte reste : {tout}");
 }
 

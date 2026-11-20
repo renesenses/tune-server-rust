@@ -75,7 +75,9 @@ pub(super) struct Debit {
 pub(super) enum Verdict {
     /// Relayer la ligne ; `tues` lignes de la fenêtre précédente ont été
     /// tues (à dire d'abord, s'il y en a).
-    Relayer { tues: u64 },
+    Relayer {
+        tues: u64,
+    },
     Taire,
 }
 
