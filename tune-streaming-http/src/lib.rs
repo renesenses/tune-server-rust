@@ -5244,6 +5244,8 @@ mod tests_labels_6934 {
             release_type: None,
             ai_generated: None,
             explicit: None,
+            genre_id: None,
+            genre_name: None,
         }
     }
 
