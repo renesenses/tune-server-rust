@@ -329,8 +329,22 @@ pub mod sql {
         )
     }
 
+    /// #9265 — les artistes de la grille : ceux qui ont au moins un album,
+    /// SAUF un crédit composé relié à ses artistes (`artistes_des_credits`),
+    /// PLUS les artistes d'un crédit relié qui a des albums. Une seule clause
+    /// pour le total et la page : ils ne peuvent pas diverger.
+    macro_rules! artistes_de_la_grille {
+        () => {
+            "FROM artists WHERE \
+             (id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL) \
+              AND id NOT IN (SELECT credit_id FROM artistes_des_credits)) \
+             OR id IN (SELECT adc.artiste_id FROM artistes_des_credits adc \
+              JOIN albums adc_al ON adc_al.artist_id = adc.credit_id)"
+        };
+    }
+
     pub fn count() -> &'static str {
-        "SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)"
+        concat!("SELECT COUNT(*) ", artistes_de_la_grille!())
     }
 
     /// Les artistes que liste [`super::ArtistRepo::list`] (ceux qui ont au
@@ -338,7 +352,7 @@ pub mod sql {
     /// clé de tri se calcule en Rust (#4956), sur des lignes étroites — jamais
     /// sur les biographies, qui pèsent plusieurs Ko chacune.
     pub fn cles_de_tri() -> &'static str {
-        "SELECT id, name, sort_name FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)"
+        concat!("SELECT id, name, sort_name ", artistes_de_la_grille!())
     }
 
     /// Les fiches complètes d'une page d'identifiants (entiers issus de la

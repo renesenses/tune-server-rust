@@ -609,11 +609,20 @@ pub mod sql {
         )
     }
 
+    /// #9265 — l'album est à l'artiste, ou à un crédit composé relié à lui
+    /// (`artistes_des_credits`) : « A & B » figure chez A et chez B.
+    fn album_de_l_artiste(p_artiste: &str, p_credit: &str) -> String {
+        format!(
+            "(a.artist_id = {p_artiste} OR a.artist_id IN \
+             (SELECT adc.credit_id FROM artistes_des_credits adc WHERE adc.artiste_id = {p_credit}))"
+        )
+    }
+    /// Deux marqueurs : l'identifiant de l'artiste, passé deux fois.
     pub fn list_by_artist<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE a.artist_id = {} AND {} ORDER BY a.year ASC, LOWER(a.title) ASC",
+            "{} WHERE {} AND {} ORDER BY a.year ASC, LOWER(a.title) ASC",
             select_album(),
-            d.placeholder(1),
+            album_de_l_artiste(&d.placeholder(1), &d.placeholder(2)),
             crate::db::facet_filter::hidden_albums_excluded()
         )
     }
@@ -644,11 +653,14 @@ pub mod sql {
     /// discographie que rend [`list_by_artist`], et #4651 vient justement de
     /// la débarrasser des albums d'autres artistes — ces sections ne doivent
     /// pas les y ramener par la bande, ni afficher deux fois le même album.
+    ///
+    /// #9265 — la discographie compte aussi les albums des crédits composés
+    /// reliés à l'artiste : eux non plus ne reviennent pas ici.
     fn hors_discographie_mais_present<D: SqlDialect>(d: &D) -> String {
         format!(
-            "(a.artist_id IS NULL OR a.artist_id <> {}) AND {} AND {}",
-            d.placeholder(1),
-            albums_portant_une_piste_de(&d.placeholder(2)),
+            "(a.artist_id IS NULL OR NOT {}) AND {} AND {}",
+            album_de_l_artiste(&d.placeholder(1), &d.placeholder(2)),
+            albums_portant_une_piste_de(&d.placeholder(3)),
             crate::db::facet_filter::hidden_albums_excluded()
         )
     }
@@ -4861,7 +4873,7 @@ impl AlbumRepo {
 
     pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Album>, TuneError> {
         let sql = self.dialect_sql(sql::list_by_artist, sql::list_by_artist);
-        let params: [&dyn ToSqlValue; 1] = [&artist_id];
+        let params: [&dyn ToSqlValue; 2] = [&artist_id, &artist_id];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_album).collect())
     }
@@ -4879,7 +4891,7 @@ impl AlbumRepo {
             sql::list_compilations_with_artist_track,
             sql::list_compilations_with_artist_track,
         );
-        let params: [&dyn ToSqlValue; 2] = [&artist_id, &artist_id];
+        let params: [&dyn ToSqlValue; 3] = [&artist_id, &artist_id, &artist_id];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_album).collect())
     }
@@ -4892,7 +4904,7 @@ impl AlbumRepo {
             sql::list_appearances_of_artist,
             sql::list_appearances_of_artist,
         );
-        let params: [&dyn ToSqlValue; 2] = [&artist_id, &artist_id];
+        let params: [&dyn ToSqlValue; 3] = [&artist_id, &artist_id, &artist_id];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows.iter().map(row_to_album).collect())
     }

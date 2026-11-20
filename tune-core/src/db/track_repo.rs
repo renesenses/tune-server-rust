@@ -1342,9 +1342,10 @@ pub mod sql {
     /// que l'album masqué demeure jouable depuis une file ou une playlist.
     pub fn list_by_artist<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE t.artist_id = {} AND {} ORDER BY al.year, al.title, CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER)",
+            "{} WHERE (t.artist_id = {} OR t.artist_id IN (SELECT adc.credit_id FROM artistes_des_credits adc WHERE adc.artiste_id = {})) AND {} ORDER BY al.year, al.title, CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER)",
             select_track(),
             d.placeholder(1),
+            d.placeholder(2),
             crate::db::facet_filter::hidden_tracks_excluded()
         )
     }
@@ -3767,8 +3768,9 @@ impl TrackRepo {
     }
 
     pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Track>, TuneError> {
+        // #9265 — les pistes de ses crédits composés reliés comptent aussi.
         let sql = self.dialect_sql(sql::list_by_artist, sql::list_by_artist);
-        let params: [&dyn ToSqlValue; 1] = [&artist_id];
+        let params: [&dyn ToSqlValue; 2] = [&artist_id, &artist_id];
         let rows = self.db.query_many_strong(&sql, &params)?;
         Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }

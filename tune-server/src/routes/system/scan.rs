@@ -3474,6 +3474,9 @@ async fn spawn_library_scan_avec_lecteur_par(
         if orphan_artists > 0 {
             tracing::info!(orphan_artists, "post_scan_orphan_artists_cleaned");
         }
+        // #9265 — APRÈS la purge des orphelins : les crédits composés reliés
+        // aux fiches de leurs artistes, sur les noms que le scan a laissés.
+        tune_core::db::artistes_des_credits::passe_journalisee(&db, "scan");
 
         // Réconciliation des favoris : un rescan qui a recréé albums/pistes
         // sous de nouveaux rowids (racines music déplacées, library clear,

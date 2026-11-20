@@ -5285,6 +5285,18 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     if let Err(e) = db.execute_batch(super::radio_titres_diffuses::SQL_TABLE) {
         tracing::warn!(error = %e, "radio_titres_diffuses_table_failed");
     }
+    // Artistes des crédits composés (#9265) — même régime, sans numéro : les
+    // numéros SQLite 157 et suivants sont disputés dans le lot rc13. Table
+    // dérivée, recalculée au démarrage. PG : `ENSURE_TABLES` et
+    // `PG_FULL_SCHEMA`.
+    for ddl in [
+        super::artistes_des_credits::SQL_TABLE,
+        super::artistes_des_credits::SQL_INDEX,
+    ] {
+        if let Err(e) = db.execute_batch(ddl) {
+            tracing::warn!(error = %e, "artistes_des_credits_table_failed");
+        }
+    }
 
     // Registre DURABLE des serveurs multimedia (migration v101, #2219 phase 1) ;
     // re-creee inconditionnellement pour la meme raison que les tables
