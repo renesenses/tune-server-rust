@@ -733,3 +733,31 @@ fn les_noms_de_tags_sont_nfc_et_sans_caractere_de_format_9158() {
         "doublons sous toutes leurs formes"
     );
 }
+
+/// Un FLAC dont les commentaires Vorbis suivent plus d'un Mio de blocs
+/// (grosse image, bourrage) : le scan relit le fichier entier au lieu de
+/// conclure « aucune balise » et de retirer les tags.
+#[test]
+fn commentaires_au_dela_du_premier_mio_sont_lus_9158() {
+    let f = flac(
+        "tete-tronquee",
+        &[("TITLE", "So What"), ("MOOD", "Calme;Nuit")],
+    );
+    let octets = std::fs::read(&*f).unwrap();
+    assert_eq!(&octets[..4], b"fLaC");
+    // STREAMINFO (34 octets) d'abord ; on glisse 1,2 Mio de bourrage après.
+    assert_eq!(octets[4] & 0x7f, 0, "STREAMINFO en tête");
+    let fin_streaminfo = 4 + 4 + 34;
+    let n = 1_258_291usize;
+    let mut neuf = octets[..fin_streaminfo].to_vec();
+    neuf.push(1); // PADDING, pas le dernier
+    neuf.extend_from_slice(&(n as u32).to_be_bytes()[1..]);
+    neuf.extend(std::iter::repeat_n(0u8, n));
+    neuf.extend_from_slice(&octets[fin_streaminfo..]);
+    std::fs::write(&*f, &neuf).unwrap();
+    let r = reglage(serde_json::json!({ "mappings": [{ "key": "MOOD" }] }));
+    assert_eq!(
+        lus(&lire(&f, &r)),
+        Some(vec!["Calme".to_string(), "Nuit".to_string()])
+    );
+}
