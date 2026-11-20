@@ -24,7 +24,7 @@ const BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
 /// Lit `longueur` octets à partir de `debut`, et la taille totale du fichier
 /// quand le serveur la dit. Un serveur qui ignore `Range` (réponse `200`) ne
 /// sert que pour la tête : on lit alors les premiers octets et on coupe.
-async fn lire_une_plage(
+pub(super) async fn lire_une_plage(
     client: &reqwest::Client,
     url: &str,
     debut: u64,
