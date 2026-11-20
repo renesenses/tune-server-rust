@@ -27,6 +27,9 @@ async fn appel(
         None => Body::empty(),
     };
     let reponse = crate::routes::router(state.clone())
+        .layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+        ))
         .oneshot(requete.body(body).unwrap())
         .await
         .unwrap();

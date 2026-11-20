@@ -83,7 +83,12 @@ async fn bundled_wasm_uninstall_4194_removes_the_listed_installation() {
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
     let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("plugin_party_enabled", "false").unwrap();
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let (status, list) = call(&app, "GET", "/api/v1/plugins").await;
     assert_eq!(status, StatusCode::OK);
     let party = list
@@ -125,7 +130,12 @@ async fn bundled_wasm_uninstall_4194_removes_the_listed_installation() {
     );
     let restarted = AppState::new(":memory:", 0, Default::default()).unwrap();
     let (_, list) = call(
-        &tune_server::routes::router(restarted),
+        &tune_server::routes::router(restarted).layer(
+            axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                50000,
+            ))),
+        ),
         "GET",
         "/api/v1/plugins",
     )
@@ -165,7 +175,10 @@ async fn marketplace_uninstall_4194_accepts_manifest_id_and_store_slug() {
         ] {
             settings.set(key, "true").unwrap();
         }
-        let app = tune_server::routes::router(state);
+        let app =
+            tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+                std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+            ));
         let (status, body) = call(
             &app,
             "POST",
@@ -200,7 +213,10 @@ async fn bundled_uninstall_4194_preserves_files_when_storage_or_identity_is_inva
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
     let settings = SettingsRepo::with_backend(state.backend.clone());
     settings.set("marketplace_installed", "not JSON").unwrap();
-    let app = tune_server::routes::router(state);
+    let app =
+        tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+        ));
     let (status, _) = call(&app, "POST", "/api/v1/marketplace/plugins/party/uninstall").await;
     assert!(status.is_server_error());
     assert!(
@@ -244,7 +260,12 @@ async fn loaded_wasm_uninstall_4194_legacy_record_requires_restart() {
         .unwrap();
     tune_server::plugins_host::load_wasm_plugins(&state).await;
     assert!(state.wasm_plugins.get().unwrap().get("party").is_some());
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let (status, body) = call(&app, "POST", "/api/v1/marketplace/plugins/party/uninstall").await;
     assert_eq!(status, StatusCode::OK);
     assert!(
@@ -286,7 +307,10 @@ async fn i4265_la_fiche_wasm_conserve_le_verdict_du_manifeste_et_refuse_l_absenc
         }
         std::fs::write(path, manifest.to_string()).unwrap();
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
-        let app = tune_server::routes::router(state);
+        let app =
+            tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+                std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+            ));
         let (status, fiche) = call(&app, "GET", &format!("/api/v1/plugins/{id}")).await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(
@@ -296,7 +320,10 @@ async fn i4265_la_fiche_wasm_conserve_le_verdict_du_manifeste_et_refuse_l_absenc
         assert!(fiche.get("reason").is_none());
     }
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
-    let app = tune_server::routes::router(state);
+    let app =
+        tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+        ));
     let (_, fiche) = call(&app, "GET", "/api/v1/plugins/absent_i4265").await;
     assert_eq!(
         fiche["compatible"], false,

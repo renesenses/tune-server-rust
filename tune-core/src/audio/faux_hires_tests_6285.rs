@@ -114,25 +114,34 @@ fn un_cd_suréchantillonné_est_douteux_par_la_bande_6285() {
     coupure_vers(&m, 21_000.0);
 }
 
-/// 🔴 Un spectre COUPÉ à 16 kHz dans un FLAC 16/44,1 : la signature d'un MP3.
+// #9067 — le CD 16/44,1 coupé EN MUR à 16 kHz : « source altérée » depuis la
+// décision du 19/11 (il était conforme du 18 au 19/11) ; voir
+// `faux_hires_tests_9067.rs`.
+
+/// 🔴 Le même spectre coupé à 16 kHz dans un 24/44,1, qui se dit hi-res par
+/// ses bits : douteux. #9035 — la coupure seule (un filtre fixe, sans trou
+/// intermittent) ne prouve pas un codec : la raison est la COUPURE.
 #[test]
-fn un_spectre_coupe_a_16_khz_est_douteux_codec_6285() {
-    let pcm = quantifier(&rose(44_100, 16_000.0, 4), 16);
-    let (m, v) = verdict(&pcm, 44_100, 16);
+fn un_spectre_coupe_a_16_khz_est_douteux_coupure_spectrale_6285() {
+    let pcm = quantifier(&rose(44_100, 16_000.0, 4), 24);
+    let (m, v) = verdict(&pcm, 44_100, 24);
     assert!(
-        matches!(v, Verdict::Douteux(Raison::CoupureDeCodec { .. })),
-        "coupé à 16 kHz : signature d'un codec avec perte — {v:?} {m:?}"
+        matches!(v, Verdict::Douteux(Raison::CoupureSpectrale { .. })),
+        "24/44,1 coupé à 16 kHz sans signature de codec : coupure spectrale — {v:?} {m:?}"
     );
+    assert_eq!(v.code_raison(), Some("coupure_spectrale"));
+    assert!(!m.signature_codec, "{m:?}");
     coupure_vers(&m, 16_000.0);
 }
 
-/// La même coupure à 16 kHz dans un conteneur 24/96 : codec, pas CD.
+/// La même coupure à 16 kHz dans un conteneur 24/96 : sous la bande d'un CD,
+/// donc coupure spectrale, pas CD.
 #[test]
-fn un_mp3_gonfle_en_24_96_est_douteux_codec_6285() {
+fn un_spectre_coupe_a_16_khz_en_24_96_est_une_coupure_spectrale_6285() {
     let pcm = quantifier(&rose(96_000, 16_000.0, 5), 24);
     let (m, v) = verdict(&pcm, 96_000, 24);
     assert!(
-        matches!(v, Verdict::Douteux(Raison::CoupureDeCodec { .. })),
+        matches!(v, Verdict::Douteux(Raison::CoupureSpectrale { .. })),
         "{v:?} {m:?}"
     );
 }

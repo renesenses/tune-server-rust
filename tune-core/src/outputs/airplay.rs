@@ -274,7 +274,12 @@ impl AirplayOutput {
             paused: Arc::new(AtomicBool::new(false)),
             position_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
-            volume: Arc::new(Mutex::new(1.0)),
+            // #8855 — jamais la pleine échelle : `set_mute(false)` renvoie ce
+            // niveau au récepteur. La découverte le sème ensuite du volume
+            // mémorisé de la zone (`ensemencer_depuis_la_base`).
+            volume: Arc::new(Mutex::new(
+                super::airplay2::volume_de_depart_8402::VOLUME_DE_DEPART_PRUDENT,
+            )),
             volume_en_attente: Arc::new(Mutex::new(None)),
             muted: Arc::new(AtomicBool::new(false)),
             current_title: Arc::new(Mutex::new(None)),
@@ -755,14 +760,33 @@ impl AirplayOutput {
     }
 }
 
-fn linear_to_airplay_db(volume: f64) -> f64 {
-    if volume <= 0.0 {
-        -144.0
-    } else if volume >= 1.0 {
-        0.0
-    } else {
-        30.0 * (volume.ln() / std::f64::consts::LN_10)
+impl AirplayOutput {
+    /// #8855 — sème la sortie qui vient de naître du volume mémorisé de sa
+    /// zone (limite de sécurité comprise) et de sa sourdine. Sans graine, un
+    /// dé-sourdinage avant tout geste de volume renvoyait le niveau de
+    /// naissance, autrefois 1.0 (0 dB, le maximum AirPlay). La règle « PURE
+    /// verrouillé part à 0 % » de la décision du 11/11 reste propre à
+    /// AirPlay 2.
+    pub async fn ensemencer_depuis_la_base(&self, db: &Arc<dyn crate::db::backend::DbBackend>) {
+        let (volume, sourdine) =
+            super::airplay2::volume_de_depart_8402::volume_memorise_borne(db, &self.device_id);
+        *self.volume.lock().await = volume;
+        self.muted.store(sourdine, Ordering::SeqCst);
+        info!(
+            device = %self.name,
+            volume,
+            muted = sourdine,
+            "airplay: starting volume seeded"
+        );
     }
+}
+
+/// #8855 — la courbe commune à AirPlay 1 et AirPlay 2 : -30..0 dB linéaire,
+/// -144 en sourdine (voir `volume_airplay_8855`). L'ancien `30·log10` faisait
+/// partir une enceinte AirPlay 1 plus fort que le curseur, et pas au même
+/// niveau qu'en AirPlay 2.
+fn linear_to_airplay_db(volume: f64) -> f64 {
+    super::volume_airplay_8855::curseur_vers_db(volume)
 }
 
 fn build_rtp_packet(seq: u16, timestamp: u32, ssrc: u32, audio: &[u8], marqueur: bool) -> Vec<u8> {
@@ -1868,8 +1892,10 @@ mod tests {
     fn volume_conversion() {
         assert_eq!(linear_to_airplay_db(0.0), -144.0);
         assert_eq!(linear_to_airplay_db(1.0), 0.0);
-        let half = linear_to_airplay_db(0.5);
-        assert!(half < -5.0 && half > -15.0);
+        // #8855 : -30..0 dB linéaire, plancher à -30 dB.
+        assert_eq!(linear_to_airplay_db(0.5), -15.0);
+        assert_eq!(linear_to_airplay_db(0.65), -10.5);
+        assert!(linear_to_airplay_db(1e-6) >= -30.0);
     }
 
     #[test]
@@ -2274,3 +2300,7 @@ mod volume_hors_session_tests_2553;
 #[cfg(test)]
 #[path = "airplay_sourdine_hors_session_tests_8151.rs"]
 mod sourdine_hors_session_tests_8151;
+
+#[cfg(test)]
+#[path = "airplay_volume_de_depart_tests_8855.rs"]
+mod volume_de_depart_tests_8855;
