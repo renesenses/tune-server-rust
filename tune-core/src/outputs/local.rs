@@ -6990,7 +6990,7 @@ impl OutputTarget for LocalOutput {
                     if force_silent.load(Ordering::SeqCst) {
                         debug!("local_audio_http_fetch_cancelled");
                     } else {
-                        warn!(error = %e, url = %url, "local_audio_http_fetch_failed");
+                        warn!(error = %e, url = %crate::confidentialite::masquer_url(&url), "local_audio_http_fetch_failed");
                     }
                     if play_generation.load(Ordering::SeqCst) == my_generation {
                         playing.store(false, Ordering::SeqCst);
@@ -7000,7 +7000,7 @@ impl OutputTarget for LocalOutput {
             };
 
             if !response.status().is_success() && response.status().as_u16() != 206 {
-                warn!(status = %response.status(), url = %url, "local_audio_http_error");
+                warn!(status = %response.status(), url = %crate::confidentialite::masquer_url(&url), "local_audio_http_error");
                 playing.store(false, Ordering::SeqCst);
                 return;
             }
@@ -8887,7 +8887,7 @@ impl OutputTarget for LocalOutput {
 
                 info!(
                     next_title = ?next.title,
-                    next_url = %next.url,
+                    next_url = %crate::confidentialite::masquer_url(&next.url),
                     "local_audio_gapless_chaining_next_track"
                 );
                 // #6132 — piste suivante : le retard commun des sorties

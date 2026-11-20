@@ -508,7 +508,7 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
         return;
     }
 
-    info!(device = %device_name, url = %url, "local_audio_exclusive_playing");
+    info!(device = %device_name, url = %crate::confidentialite::masquer_url(&url), "local_audio_exclusive_playing");
     // CoreAudio exclusif : `resolve_output_device` retombe sur le
     // périphérique système quand le nom stocké n'existe plus (DAC
     // débranché, renommé, routage macOS changé). `opened_id` reste

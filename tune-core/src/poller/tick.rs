@@ -390,7 +390,7 @@ impl PositionPoller {
                                 zone_id,
                                 device = %device_id,
                                 verdict = ?verdict,
-                                uri = ?status.current_uri,
+                                uri = ?status.current_uri.as_deref().map(crate::confidentialite::masquer_url),
                                 "renderer_tenu_par_un_tiers — la lecture demandée ne sortira pas"
                             );
                             if let Some(ref bus) = self.event_bus {
@@ -1208,7 +1208,7 @@ impl PositionPoller {
                         warn!(
                             zone_id,
                             device = %device_id,
-                            uri = ?status.current_uri,
+                            uri = ?status.current_uri.as_deref().map(crate::confidentialite::masquer_url),
                             "renderer_cede_a_un_autre_point_de_controle — la zone lâche l'appareil sans lui envoyer d'ordre"
                         );
                         poll_states.remove(&zone_id);
@@ -2029,7 +2029,7 @@ impl PositionPoller {
                                 age_secs,
                                 position_ms = status.position_ms,
                                 position_figee_ms = adoption.position_figee_ms,
-                                uri = ?status.current_uri,
+                                uri = ?status.current_uri.as_deref().map(crate::confidentialite::masquer_url),
                                 preuve = ?adoption.preuve,
                                 "gapless_adoption_horloge_confirmee"
                             );
@@ -2042,7 +2042,7 @@ impl PositionPoller {
                                 age_secs,
                                 position_ms = status.position_ms,
                                 position_figee_ms = adoption.position_figee_ms,
-                                uri = ?status.current_uri,
+                                uri = ?status.current_uri.as_deref().map(crate::confidentialite::masquer_url),
                                 preuve = ?adoption.preuve,
                                 stream_id = %adoption.flux,
                                 flux_fini = ?adoption.flux_fini,
@@ -2932,7 +2932,7 @@ impl PositionPoller {
                                     peak_pos = ps.peak_position_ms,
                                     track_dur = track_duration_ms,
                                     stopped_ticks = ps.stopped_ticks,
-                                    current_uri = status.current_uri.as_deref().unwrap_or(""),
+                                    current_uri = %crate::confidentialite::masquer_url(&status.current_uri.as_deref().unwrap_or("")),
                                     tenue = ?tenue,
                                     audio_servi_ms = audio_servi_ms.unwrap_or(0),
                                     bytes_sent = octets_servis.unwrap_or(0),
@@ -4259,7 +4259,7 @@ impl PositionPoller {
                                 // octet tiré. Le rapport de Villerio du 17/09
                                 // s'est arrêté là.
                                 flux_arme = flux_arme_journal.as_str(),
-                                uri_courante = status.current_uri.as_deref().unwrap_or(""),
+                                uri_courante = %crate::confidentialite::masquer_url(&status.current_uri.as_deref().unwrap_or("")),
                                 octets_tires = octets_tires.unwrap_or(0),
                                 "position_past_end_advancing"
                             );

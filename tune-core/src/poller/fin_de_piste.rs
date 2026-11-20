@@ -1034,7 +1034,7 @@ impl PositionPoller {
             etat = ?status.state,
             position_ms = status.position_ms,
             position_figee_ms = adoption.position_figee_ms,
-            uri = ?status.current_uri,
+            uri = ?status.current_uri.as_deref().map(crate::confidentialite::masquer_url),
             stream_id = %adoption.flux,
             octets_tires = ?octets_tires,
             octets_depuis_adoption = ?octets_depuis_adoption,
@@ -1113,7 +1113,7 @@ impl PositionPoller {
             wall_secs = wall_elapsed,
             past_end_ticks = ps.past_end_ticks,
             stream_id = %flux,
-            uri = ?status.current_uri,
+            uri = ?status.current_uri.as_deref().map(crate::confidentialite::masquer_url),
             octets_tires = ?octets_tires,
             preuve = ?preuve,
             arm_to_advance_ms = ps
@@ -1218,7 +1218,7 @@ impl PositionPoller {
         warn!(
             zone_id,
             position_ms = status.position_ms,
-            uri = ?status.current_uri,
+            uri = ?status.current_uri.as_deref().map(crate::confidentialite::masquer_url),
             flux_fini = ?flux_fini,
             flux_arme = ?flux_arme,
             "gapless_retombee_sur_la_piste_finie_surveillee"

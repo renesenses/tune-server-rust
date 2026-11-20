@@ -486,7 +486,7 @@ pub(super) fn jouer_dsd_natif_via_alsa(entrees: EntreesDsdNatifAlsa) {
     info!(
         device = %device_name,
         pcm = %pcm,
-        url = %url,
+        url = %crate::confidentialite::masquer_url(&url),
         format = ordre.nom_alsa(),
         cadence_dsd = entete.cadence,
         cadence_de_trame,

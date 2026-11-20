@@ -506,7 +506,7 @@ impl OutputTarget for OpenHomeOutput {
         let metadata = Self::build_didl(media);
         debug!(
             device = %self.name,
-            uri = media.url,
+            uri = %crate::confidentialite::masquer_url(&media.url),
             didl = %metadata,
             "oh_insert_uri_didl"
         );
@@ -520,7 +520,7 @@ impl OutputTarget for OpenHomeOutput {
             self.playlist_seek_id(id).await?;
             self.oh_play().await?;
             self.subscribe_events().await;
-            info!(device = %self.name, url = media.url, oh_id = id, "oh_play");
+            info!(device = %self.name, url = %crate::confidentialite::masquer_url(&media.url), oh_id = id, "oh_play");
             Ok(())
         } else {
             Err("playlist insert returned no ID".into())
@@ -727,7 +727,7 @@ impl OutputTarget for OpenHomeOutput {
         let new_id = self.playlist_insert(after_id, media.url, &metadata).await?;
         if let Some(id) = new_id {
             self.pending_next_oh_ids.lock().await.push(id);
-            info!(device = %self.name, url = media.url, oh_id = id, "oh_set_next");
+            info!(device = %self.name, url = %crate::confidentialite::masquer_url(&media.url), oh_id = id, "oh_set_next");
         }
         Ok(())
     }
