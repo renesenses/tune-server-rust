@@ -28,7 +28,7 @@
 //! bras exclusifs) ne doit jamais hériter de la compensation d'une autre
 //! piste, sous peine de jouer 3 dB trop fort.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// Le gain linéaire de l'étage est rangé en millionièmes.
@@ -55,8 +55,17 @@ pub(super) struct ReserveDuSurechantillonneur {
     device_name: Arc<str>,
     /// Deux écrivains (la sortie, le fil de lecture) : chacun pose son entrée
     /// PUIS recompose sous ce verrou, si bien que le dernier à recomposer lit
-    /// les deux entrées les plus récentes.
-    verrou: Arc<Mutex<()>>,
+    /// les deux entrées les plus récentes. Il garde aussi le flux auquel
+    /// l'étage appartient (voir [`FluxOuvert`]).
+    verrou: Arc<Mutex<FluxOuvert>>,
+}
+
+/// Le flux que la sortie a ouvert en dernier : sa génération (`play_url`) et
+/// les réglages du suréchantillonneur lus à son ouverture.
+#[derive(Default)]
+struct FluxOuvert {
+    generation: u64,
+    reglages: Option<crate::audio::surechantillonnage::UpsamplerSettings>,
 }
 
 impl ReserveDuSurechantillonneur {
@@ -78,25 +87,78 @@ impl ReserveDuSurechantillonneur {
             dop_active,
             volume,
             device_name: Arc::from(device_name),
-            verrou: Arc::new(Mutex::new(())),
+            verrou: Arc::new(Mutex::new(FluxOuvert::default())),
         }
     }
 
     /// La sortie a recomposé ReplayGain, compensation de l'égaliseur et gain
     /// moyen du DSP : les ranger, puis republier.
     pub(super) fn poser_le_rendu(&self, facteur: u32, gain_moyen_dsp: u32) {
+        let _tenu = self.tenir();
         self.facteur_sans_reserve.store(facteur, Ordering::SeqCst);
         self.dsp_sans_reserve
             .store(gain_moyen_dsp, Ordering::SeqCst);
-        self.publier();
+        self.publier_sous_le_verrou();
     }
 
-    /// Le fil de lecture a ouvert (ou pas) l'étage : `Some(reserve_db)`, la
-    /// réserve qu'il applique (≤ 0) ; `None`, aucun étage sur ce flux.
-    pub(super) fn poser_l_etage(&self, reserve_db: Option<f64>) {
+    fn tenir(&self) -> std::sync::MutexGuard<'_, FluxOuvert> {
+        self.verrou.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `play_url` ouvre le flux `generation` : rien n'y porte (encore)
+    /// l'étage. La compensation retombe à l'unité, et seul le fil de CE flux
+    /// pourra la réarmer.
+    pub(super) fn ouvrir_le_flux(&self, generation: u64) {
+        let mut flux = self.tenir();
+        *flux = FluxOuvert {
+            generation,
+            reglages: None,
+        };
+        self.gain_de_l_etage.store(UNITE, Ordering::SeqCst);
+        self.publier_sous_le_verrou();
+    }
+
+    /// Le fil de lecture du flux `generation` a lu `reglages` à l'ouverture
+    /// et ouvert (`Some(reserve_db)`, réserve ≤ 0) ou non (`None`) l'étage.
+    ///
+    /// Refusé (`false`, rien ne change) quand ce flux n'est plus le flux en
+    /// cours : un fil détaché par `stop()` ou remplacé par un `play_url` plus
+    /// récent qui ouvre son étage en retard ne doit pas réarmer la
+    /// compensation du flux suivant (il jouerait jusqu'à 3 dB trop fort).
+    pub(super) fn poser_l_ouverture(
+        &self,
+        generation: u64,
+        generation_courante: &AtomicU64,
+        reglages: Option<crate::audio::surechantillonnage::UpsamplerSettings>,
+        reserve_db: Option<f64>,
+    ) -> bool {
+        let mut flux = self.tenir();
+        if flux.generation != generation || generation_courante.load(Ordering::SeqCst) != generation
+        {
+            return false;
+        }
+        flux.reglages = reglages;
         self.gain_de_l_etage
             .store(gain_en_millioniemes(reserve_db), Ordering::SeqCst);
-        self.publier();
+        self.publier_sous_le_verrou();
+        true
+    }
+
+    /// Les réglages du suréchantillonneur lus à l'ouverture du flux qui joue
+    /// (`None` : désactivé à l'ouverture, chemin sans greffon, rien ouvert).
+    pub(super) fn reglages_du_flux(
+        &self,
+    ) -> Option<crate::audio::surechantillonnage::UpsamplerSettings> {
+        self.tenir().reglages.clone()
+    }
+
+    /// Pose le gain de l'étage sans regarder le flux : témoins seulement.
+    #[cfg(test)]
+    pub(super) fn poser_l_etage(&self, reserve_db: Option<f64>) {
+        let _tenu = self.tenir();
+        self.gain_de_l_etage
+            .store(gain_en_millioniemes(reserve_db), Ordering::SeqCst);
+        self.publier_sous_le_verrou();
     }
 
     /// Le gain linéaire de l'étage ouvert, `1.0` sans étage.
@@ -104,8 +166,8 @@ impl ReserveDuSurechantillonneur {
         f64::from(self.gain_de_l_etage.load(Ordering::SeqCst)) / f64::from(UNITE)
     }
 
-    fn publier(&self) {
-        let _tenu = self.verrou.lock().unwrap_or_else(|e| e.into_inner());
+    /// À appeler en tenant [`Self::tenir`].
+    fn publier_sous_le_verrou(&self) {
         let gain = self.gain();
         let facteur = facteur_compense(self.facteur_sans_reserve.load(Ordering::SeqCst), gain);
         // Le crête-mètre (RMS, spectre) mesure AVANT l'étage : la réserve est

@@ -2442,6 +2442,32 @@ impl LocalOutput {
     }
 
     /// #7614 — le choix posé, tel que la prochaine ouverture le lira.
+    /// 19/11/2026 — les réglages du suréchantillonneur lus à l'ouverture du
+    /// flux qui JOUE (pas le choix posé pour le suivant) : c'est à eux qu'un
+    /// changement de réglage se compare pour décider d'une relance.
+    pub fn reglages_du_flux_surechantillonne(
+        &self,
+    ) -> Option<crate::audio::surechantillonnage::UpsamplerSettings> {
+        self.reserve_du_surechantillonneur.reglages_du_flux()
+    }
+
+    /// Témoins : ce qu'aurait laissé l'ouverture d'un flux avec `reglages`.
+    #[cfg(test)]
+    pub(crate) fn simuler_l_ouverture_du_surechantillonneur(
+        &self,
+        reglages: Option<crate::audio::surechantillonnage::UpsamplerSettings>,
+    ) {
+        let generation = self.play_generation.load(Ordering::SeqCst);
+        self.reserve_du_surechantillonneur
+            .ouvrir_le_flux(generation);
+        self.reserve_du_surechantillonneur.poser_l_ouverture(
+            generation,
+            &self.play_generation,
+            reglages,
+            None,
+        );
+    }
+
     pub fn surechantillonnage(
         &self,
     ) -> Option<super::super::audio::surechantillonnage::ChoixSurechantillonnage> {
@@ -6770,7 +6796,8 @@ impl OutputTarget for LocalOutput {
         // fil de lecture ne l'a pas ouvert. Sans cette remise à l'unité, un
         // chemin qui ne porte pas l'étage (natif S32, DoP, bras exclusifs)
         // hériterait de la compensation et jouerait 3 dB trop fort.
-        self.reserve_du_surechantillonneur.poser_l_etage(None);
+        self.reserve_du_surechantillonneur
+            .ouvrir_le_flux(my_generation);
         let reserve_du_surechantillonneur = self.reserve_du_surechantillonneur.clone();
         let position_ms = self.position_ms.clone();
         let mut seek_offset = self.seek_offset_ms.load(Ordering::SeqCst);
@@ -8330,12 +8357,6 @@ impl OutputTarget for LocalOutput {
                                 headroom_db = etage.reserve_db(),
                                 "local_audio_upsampler_engaged"
                             );
-                            // 19/11/2026 — la réserve est compensée dans le
-                            // gain de rendu, et le crête-mètre, qui relève
-                            // AVANT l'étage, la reporte sur ses crêtes.
-                            reserve_du_surechantillonneur.poser_l_etage(Some(etage.reserve_db()));
-                            cretes_de_sortie
-                                .poser_le_gain_aval(reserve_du_surechantillonneur.gain());
                             Some(etage)
                         }
                         Err(e) => {
@@ -8344,6 +8365,22 @@ impl OutputTarget for LocalOutput {
                         }
                     }
                 });
+            // 19/11/2026 — la réserve est compensée dans le gain de rendu, et
+            // le crête-mètre, qui relève AVANT l'étage, la reporte sur ses
+            // crêtes. Seulement si ce fil porte encore le flux en cours : un
+            // fil détaché qui ouvre en retard ne réarme rien.
+            if reserve_du_surechantillonneur.poser_l_ouverture(
+                my_generation,
+                &play_generation,
+                choix_du_surechantillonneur
+                    .as_ref()
+                    .map(|c| c.reglages.clone()),
+                etage_du_surechantillonneur
+                    .as_ref()
+                    .map(crate::audio::surechantillonnage::EtageSurechantillonneur::reserve_db),
+            ) {
+                cretes_de_sortie.poser_le_gain_aval(reserve_du_surechantillonneur.gain());
+            }
             if choix_du_surechantillonneur.is_some() && etage_du_surechantillonneur.is_none() {
                 diagnostic_surechantillonnage.noter(Some(
                     backend

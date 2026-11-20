@@ -1333,6 +1333,15 @@ pub struct PlaybackOrchestrator {
     /// Verrous std : accès très courts, jamais tenus à travers un await.
     eq_replay_gen: std::sync::Mutex<std::collections::HashMap<i64, u64>>,
     eq_replay_last: std::sync::Mutex<std::collections::HashMap<i64, std::time::Instant>>,
+    /// 19/11/2026 — zones dont un changement de réglage du suréchantillonneur
+    /// attend sa relance. Une demande plus récente (égaliseur, PURE) qui la
+    /// remplace hérite de sa règle : plancher court et report au lieu
+    /// d'abandon, puisque la réponse a déjà dit « appliqué ».
+    surech_replay_en_attente: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// 19/11/2026 — une seule relance à la fois par zone : deux relances
+    /// concurrentes (arrêt, `play`) se marcheraient dessus.
+    verrous_de_relance:
+        std::sync::Mutex<std::collections::HashMap<i64, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     /// Le traitement que chaque flux RÉSOLU porte dans ses octets (#4407) :
     /// `zone_id → [(stream_id, empreinte)]`, les plus récents en dernier,
     /// bornés à [`Self::FLUX_TRAITES_PAR_ZONE`].
@@ -2006,6 +2015,8 @@ impl PlaybackOrchestrator {
             reprises_sur_place: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_gen: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
+            surech_replay_en_attente: std::sync::Mutex::new(std::collections::HashSet::new()),
+            verrous_de_relance: std::sync::Mutex::new(std::collections::HashMap::new()),
             traitement_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_en_vol_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_net_play: Mutex::new(HashMap::new()),

@@ -1559,6 +1559,12 @@ impl PlaybackOrchestrator {
             info!(zone_id, "eq_replay_skipped_position_inconnue");
             return false;
         }
+        if raison == RaisonDeRelance::Surechantillonnage {
+            self.surech_replay_en_attente
+                .lock()
+                .unwrap()
+                .insert(zone_id);
+        }
         let generation = {
             let mut gens = self.eq_replay_gen.lock().unwrap();
             let g = gens.entry(zone_id).or_insert(0);
@@ -1586,17 +1592,22 @@ impl PlaybackOrchestrator {
             // 19/11/2026 — le suréchantillonneur a son plancher, plus court,
             // et ATTEND la fin du plancher au lieu de renoncer ; une demande
             // plus récente arrivée pendant l'attente le remplace.
+            //
+            // Une demande qui en REMPLACE une du suréchantillonneur encore en
+            // attente prend sa règle : sinon un réglage d'égaliseur sous son
+            // plancher de 5 s abandonnerait le changement promis.
+            let regle = moi.raison_effective(zone_id, raison);
             let reste_ms = {
                 let derniers = moi.eq_replay_last.lock().unwrap();
                 derniers.get(&zone_id).and_then(|t| {
-                    raison
+                    regle
                         .plancher_ms()
                         .checked_sub(t.elapsed().as_millis() as u64)
                         .filter(|reste| *reste > 0)
                 })
             };
             if let Some(reste_ms) = reste_ms {
-                if !raison.differe_sous_le_plancher() {
+                if !regle.differe_sous_le_plancher() {
                     info!(zone_id, "eq_replay_skipped_floor");
                     return;
                 }
@@ -1612,6 +1623,22 @@ impl PlaybackOrchestrator {
                     return;
                 }
             }
+            // 19/11/2026 — une seule relance à la fois par zone. Une demande
+            // arrivée pendant qu'on attendait le verrou passera après nous.
+            let verrou = moi.verrou_de_relance(zone_id);
+            let _relance_tenue = verrou.lock().await;
+            {
+                let gens = moi.eq_replay_gen.lock().unwrap();
+                if gens.get(&zone_id).copied() != Some(generation) {
+                    return;
+                }
+            }
+            // Ce qui attendait est servi par CETTE relance (elle relit tous
+            // les réglages), ou n'a plus lieu d'être si rien ne joue.
+            moi.surech_replay_en_attente
+                .lock()
+                .unwrap()
+                .remove(&zone_id);
             // #7556 — la zone a pu être arrêtée ou mise en pause pendant
             // l'anti-rebond : la relance la remettrait en lecture sans geste
             // de lecture. Un réglage ne lance JAMAIS de lecture.
@@ -1623,15 +1650,17 @@ impl PlaybackOrchestrator {
             // #8422 — la position EN COURS, pas celle du dernier relevé du
             // sondeur : le temps joué depuis compte.
             let position_ms = position_a_reprendre(&etat);
+            // 19/11/2026 — le plancher part du DÉBUT de la relance (≥ 1 s) :
+            // posé après, deux clics rapprochés lançaient deux relances.
+            moi.eq_replay_last
+                .lock()
+                .unwrap()
+                .insert(zone_id, std::time::Instant::now());
             match moi
                 .replay_zone_at_position(zone_id, position_ms, raison.code())
                 .await
             {
                 Ok(()) => {
-                    moi.eq_replay_last
-                        .lock()
-                        .unwrap()
-                        .insert(zone_id, std::time::Instant::now());
                     info!(
                         zone_id,
                         position_ms,
@@ -1651,6 +1680,35 @@ impl PlaybackOrchestrator {
             }
         });
         true
+    }
+
+    /// 19/11/2026 — la règle de plancher qui gouverne une demande : celle du
+    /// suréchantillonneur dès qu'un de ses changements attend sur la zone.
+    pub(super) fn raison_effective(
+        &self,
+        zone_id: i64,
+        raison: RaisonDeRelance,
+    ) -> RaisonDeRelance {
+        if self
+            .surech_replay_en_attente
+            .lock()
+            .unwrap()
+            .contains(&zone_id)
+        {
+            RaisonDeRelance::Surechantillonnage
+        } else {
+            raison
+        }
+    }
+
+    /// 19/11/2026 — le verrou qui sérialise les relances d'une zone.
+    pub(super) fn verrou_de_relance(&self, zone_id: i64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        self.verrous_de_relance
+            .lock()
+            .unwrap()
+            .entry(zone_id)
+            .or_default()
+            .clone()
     }
 
     /// #8422 — dire aux télécommandes qu'une bascule PURE a relancé le flux,
@@ -2569,11 +2627,16 @@ impl PlaybackOrchestrator {
         self: &std::sync::Arc<Self>,
         zone_id: i64,
     ) -> PorteeDuReglage {
-        let avant = self.choix_du_surechantillonneur_pose(zone_id).await;
         self.refresh_zone_upsampler(zone_id).await;
-        let apres = self.choix_du_surechantillonneur_pose(zone_id).await;
+        // Le nouveau choix se compare aux réglages lus à l'OUVERTURE du flux
+        // qui joue, pas au choix posé avant ce PUT : un changement fait en
+        // pause, puis un PUT identique après la reprise, doit encore relancer.
+        let change = match self.surechantillonneur_du_flux_et_choix(zone_id).await {
+            Some((du_flux, choix)) => du_flux != choix,
+            None => false,
+        };
         let portee = self
-            .portee_du_reglage_du_surechantillonneur(zone_id, avant != apres)
+            .portee_du_reglage_du_surechantillonneur(zone_id, change)
             .await;
         info!(zone_id, portee = ?portee, "upsampler_change_portee");
         if let Some(ref bus) = self.event_bus {
@@ -2607,13 +2670,17 @@ impl PlaybackOrchestrator {
         }
     }
 
-    /// Les réglages du suréchantillonneur que la sortie locale de la zone
-    /// tient en ce moment (`None` : désactivé, écarté, ou pas de sortie
-    /// locale vivante).
-    async fn choix_du_surechantillonneur_pose(
+    /// Sur la sortie locale de la zone : les réglages lus à l'ouverture du
+    /// flux qui joue, et le choix posé pour la suite. `None` sans sortie
+    /// locale vivante (le réglage n'y agit pas).
+    #[allow(clippy::type_complexity)]
+    async fn surechantillonneur_du_flux_et_choix(
         &self,
         zone_id: i64,
-    ) -> Option<crate::audio::surechantillonnage::UpsamplerSettings> {
+    ) -> Option<(
+        Option<crate::audio::surechantillonnage::UpsamplerSettings>,
+        Option<crate::audio::surechantillonnage::UpsamplerSettings>,
+    )> {
         #[cfg(not(feature = "local-audio"))]
         {
             let _ = zone_id;
@@ -2630,8 +2697,12 @@ impl PlaybackOrchestrator {
             output
                 .as_any()
                 .downcast_ref::<crate::outputs::local::LocalOutput>()
-                .and_then(|local| local.surechantillonnage())
-                .map(|choix| choix.reglages)
+                .map(|local| {
+                    (
+                        local.reglages_du_flux_surechantillonne(),
+                        local.surechantillonnage().map(|choix| choix.reglages),
+                    )
+                })
         }
     }
 

@@ -213,3 +213,28 @@ fn le_chemin_du_signal_recoit_l_ecart() {
         .avec_ecart_de_niveau_surechantillonnage(-1.234);
     assert_eq!(t.ecart_de_niveau_surechantillonnage(), Some(-1.23));
 }
+
+/// Relecture du 20/11 (3) — un fil détaché (par `stop()` ou par un
+/// `play_url` plus récent) qui ouvre son étage en retard ne réarme pas la
+/// compensation du flux suivant.
+#[test]
+fn un_fil_detache_ne_rearme_pas_la_compensation() {
+    let sortie = LocalOutput::new("Fil détaché 19-11".to_string());
+    regler_le_volume(&sortie, 0.5);
+    let sans = sortie.gain_de_rendu().load(Ordering::SeqCst);
+    let reserve = &sortie.reserve_du_surechantillonneur;
+    let generation = std::sync::atomic::AtomicU64::new(1);
+    reserve.ouvrir_le_flux(1);
+    // `stop()` a détaché le fil : la génération a avancé.
+    generation.store(2, Ordering::SeqCst);
+    assert!(!reserve.poser_l_ouverture(1, &generation, None, Some(RESERVE_DB)));
+    assert_eq!(sortie.gain_de_rendu().load(Ordering::SeqCst), sans);
+    // Un `play_url` plus récent a ouvert le flux 2 ; l'ancien fil arrive.
+    reserve.ouvrir_le_flux(2);
+    assert!(!reserve.poser_l_ouverture(1, &generation, None, Some(RESERVE_DB)));
+    assert_eq!(sortie.gain_de_rendu().load(Ordering::SeqCst), sans);
+    assert_eq!(reserve.gain(), 1.0);
+    // Le fil du flux en cours, lui, arme la compensation.
+    assert!(reserve.poser_l_ouverture(2, &generation, None, Some(RESERVE_DB)));
+    assert!(sortie.gain_de_rendu().load(Ordering::SeqCst) > sans);
+}
