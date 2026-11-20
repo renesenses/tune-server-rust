@@ -37,8 +37,11 @@ pub(crate) fn supprimee_par_l_utilisateur(motif: Option<&str>) -> bool {
     }
 }
 
-fn corps_de_la_zone(z: &ZoneMasquee, detecte: bool) -> Value {
+fn corps_de_la_zone(z: &ZoneMasquee, detecte: bool, sortie_liberee: Option<Value>) -> Value {
     json!({
+        // #8987 — la sortie lâchée au profit d'une autre zone, et qui la
+        // tient maintenant (`reprise_par`, `null` si elle est libre).
+        "sortie_liberee": sortie_liberee,
         "id": z.id,
         "name": z.name,
         "output_device_id": (!z.device_id.is_empty()).then_some(&z.device_id),
@@ -64,6 +67,7 @@ pub(crate) async fn lister(State(state): State<AppState>) -> Response {
                 .into_response();
         }
     };
+    let repo = ZoneRepo::with_backend(state.backend.clone());
     let sorties = state.outputs.lock().await;
     let items: Vec<Value> = zones
         .iter()
@@ -72,6 +76,7 @@ pub(crate) async fn lister(State(state): State<AppState>) -> Response {
             corps_de_la_zone(
                 z,
                 !z.device_id.is_empty() && sorties.get(&z.device_id).is_some(),
+                super::zone_appareil_8987::sortie_liberee_de_la_liste(&repo, z.id),
             )
         })
         .collect();
@@ -141,6 +146,9 @@ pub(crate) async fn restaurer(State(state): State<AppState>, Path(id): Path<i64>
                 .into_response();
         }
     }
+    // #8987 — la zone avait lâché sa sortie au profit d'une autre zone :
+    // libre, elle la reprend ; tenue, l'avertissement nomme qui la tient.
+    let sortie_reprise = super::zone_appareil_8987::reprendre_la_sortie_liberee(&repo, id);
     // Comme la résurrection par `POST /zones` : la zone revient en ligne si
     // son appareil est annoncé ; absent, elle attend son retour.
     let detecte = match repo.get(id) {
@@ -156,7 +164,18 @@ pub(crate) async fn restaurer(State(state): State<AppState>, Path(id): Path<i64>
     state
         .event_bus
         .emit("zone.updated", json!({ "zone_id": id }));
-    let v = crate::routes::playback::build_zone_json(&state, id).await;
+    let mut v = crate::routes::playback::build_zone_json(&state, id).await;
+    match sortie_reprise {
+        Some(avertissement) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("avertissement_restauration".into(), avertissement);
+            }
+        }
+        // #8987 — une zone ASIO restaurée sous WASAPI (ou l'inverse) : dit.
+        None => {
+            super::zone_appareil_8987::signaler_la_restauration_hors_hote(&state, id, &mut v).await
+        }
+    }
     (StatusCode::OK, Json(v)).into_response()
 }
 

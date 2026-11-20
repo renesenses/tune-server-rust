@@ -433,9 +433,11 @@ impl PlaybackOrchestrator {
     /// 2. **`source` et `source_id` ne bougent PAS.** Le renderer reconnaît sa
     ///    session en comparant `now_playing.source_id` à l'URI de la session
     ///    (`doit_reprendre`), et la reprise après pause en dépend. Le chemin
-    ///    des octets reste celui d'aujourd'hui : `url_nommee` l'emporte dans
-    ///    `resolve_direct_url_de_source`, l'URI est jouée telle quelle.
-    /// 3. **L'hôte doit être le nôtre** ([`hote_de_cette_machine`]). Un second
+    ///    des octets se décide dans `resolve_stream` : une ligne LOCALE y est
+    ///    traitée en piste locale de bout en bout (#9207) ; sinon
+    ///    `url_nommee` l'emporte et l'URI est jouée telle quelle.
+    /// 3. **L'hôte doit être le nôtre** (port compris, règle unique de
+    ///    `uri_de_notre_bibliotheque_9207`). Un second
     ///    Tune sur le même réseau publie SES `<res>` avec SON adresse, et
     ///    l'identifiant 187500 n'y désigne pas la même piste. Afficher un
     ///    titre FAUX serait pire que « Episode ». Quand l'hôte ne se
@@ -478,7 +480,8 @@ impl PlaybackOrchestrator {
     }
 
     /// La ligne `tracks` que désigne une URI audio publiée par CETTE instance
-    /// ([`track_id_dans_une_url_audio_de_tune`]), avec son identifiant.
+    /// (`id_de_notre_uri`, la même règle d'hôte et de port que la lecture
+    /// en piste locale, #9207), avec son identifiant.
     ///
     /// Le cœur de [`Self::resoudre_l_uri_en_piste_de_bibliotheque`] (#4323),
     /// partagé avec l'avance sans blanc (`advance_queue_metadata`, fil 2119) :
@@ -491,7 +494,7 @@ impl PlaybackOrchestrator {
         &self,
         uri: &str,
     ) -> Option<(i64, crate::db::models::Track)> {
-        let track_id = track_id_dans_une_url_audio_de_tune(uri)?;
+        let track_id = self.id_de_notre_uri(uri)?;
         crate::db::track_repo::TrackRepo::with_backend(self.db.clone())
             .get(track_id)
             .ok()
@@ -903,6 +906,7 @@ impl PlaybackOrchestrator {
             return self
                 .servir_le_dsd_upnp_au_reseau(
                     req,
+                    did,
                     audio_url,
                     mime_type,
                     &title,
@@ -1396,6 +1400,51 @@ impl PlaybackOrchestrator {
     /// resolution que l'appelant a portee depuis les attributs `res@` du DIDL
     /// est conservee telle quelle : c'est ce qui empeche un ALAC 24 bits d'un
     /// NAS d'etre affiche en 44,1 kHz / 16 bits.
+    /// #8956 — le conteneur et le MIME d'un DSD distant relayé BRUT vers
+    /// `device_id`.
+    ///
+    /// Le MIME est l'orthographe que le Sink du renderer publie pour CE
+    /// conteneur (`audio/x-dsf` pour un `.dsf`, `audio/x-dff` pour un `.dff`),
+    /// à défaut un générique qu'il publie, à défaut le MIME source. Le
+    /// conteneur vient de l'adresse ; quand elle ne le nomme pas et que le
+    /// Sink distingue les deux, de l'en-tête du fichier (`DSD ` / `FRM8`).
+    /// Sans réponse du renderer en cache, rien ne change.
+    async fn mime_dsd_brut_pour_le_renderer(
+        &self,
+        device_id: &str,
+        audio_url: &str,
+        mime_type: &str,
+        conteneur: &'static str,
+    ) -> (&'static str, String) {
+        let mimes_dsd = self
+            .dsd_capabilities
+            .lock()
+            .await
+            .get(device_id)
+            .map(|cap| cap.mimes_dsd.clone())
+            .unwrap_or_default();
+        if mimes_dsd.is_empty() {
+            return (conteneur, mime_type.to_string());
+        }
+        let pour = |c: &str| crate::outputs::dlna::mime_dsd_pour_conteneur(c, &mimes_dsd);
+        let nomme = crate::outputs::dlna::conteneur_dsd_de_l_url(audio_url).is_some()
+            || mime_type.to_ascii_lowercase().contains("dff")
+            || mime_type.to_ascii_lowercase().contains("dsf");
+        let conteneur = if !nomme && pour("dsf") != pour("dff") {
+            match conteneur_dsd_par_l_en_tete(audio_url).await {
+                Some(lu) => {
+                    info!(url = %audio_url, conteneur = lu, "dsd_upnp_conteneur_lu_a_l_en_tete");
+                    lu
+                }
+                None => conteneur,
+            }
+        } else {
+            conteneur
+        };
+        let mime = pour(conteneur).unwrap_or_else(|| mime_type.to_string());
+        (conteneur, mime)
+    }
+
     /// Une piste DSD de serveur média vers un renderer réseau, selon la
     /// politique de la zone ([`super::resolve_local::PolitiqueDsdReseau`]).
     ///
@@ -1413,9 +1462,11 @@ impl PlaybackOrchestrator {
     ///   en base, ou au-delà du plafond de la zone, on retombe sur le PCM ;
     /// - **PCM** : le canal WAV des services (`pretranscoder_en_flac`), dont
     ///   le décodeur aiguille `.dsf`/`.dff` vers le convertisseur DSD natif.
+    #[allow(clippy::too_many_arguments)]
     async fn servir_le_dsd_upnp_au_reseau(
         &self,
         req: &PlayRequest,
+        device_id: &str,
         audio_url: &str,
         mime_type: &str,
         title: &str,
@@ -1429,9 +1480,18 @@ impl PlaybackOrchestrator {
 
         let (url, stream_id, out_mime, out_sr, out_bd, out_ch) = match politique {
             PolitiqueDsdReseau::Brut => {
+                // #8956 — le MIME du CONTENEUR, dans l'orthographe du Sink.
+                // MinimServer sert `application/x-dsd`, que l'Atoll ST200 ne
+                // publie pas (il publie `audio/x-dsf` et `audio/x-dff`) :
+                // refus 714 à la pose, et le DSD distant ne jouait jamais.
+                // Même règle que le `.dsf` local (`dsf_mime`), mais au
+                // conteneur près.
+                let (conteneur, mime_brut) = self
+                    .mime_dsd_brut_pour_le_renderer(device_id, audio_url, mime_type, conteneur)
+                    .await;
                 let info = StreamInfo {
                     format: conteneur.to_string(),
-                    mime_type: mime_type.to_string(),
+                    mime_type: mime_brut.clone(),
                     sample_rate: dsd_rate,
                     bit_depth: 1,
                     channels: 2,
@@ -1446,16 +1506,24 @@ impl PlaybackOrchestrator {
                 let url = self
                     .streamer
                     .get_stream_url(&session_id, &server_ip, conteneur);
+                // Le `GET` relayé rendrait le `Content-Type` du serveur média
+                // (`application/x-dsd`) : un renderer qui le confronte à la
+                // DIDL (le ST200 fait un `HEAD`) doit lire la même orthographe.
+                if !mime_brut.eq_ignore_ascii_case(mime_type) {
+                    crate::http::streamer::annoncer_mime_du_flux(&session_id, &mime_brut);
+                }
                 info!(
                     zone_id = req.zone_id,
                     url = %audio_url,
                     conteneur,
+                    mime_source = mime_type,
+                    mime_annonce = %mime_brut,
                     "dsd_upnp_brut_relaye_par_tune"
                 );
                 (
                     url,
                     Some(session_id),
-                    mime_type.to_string(),
+                    mime_brut,
                     req.sample_rate,
                     req.bit_depth.map(u32::from),
                     None,
@@ -2619,6 +2687,20 @@ pub(crate) fn conteneur_dsd(url: &str, mime: &str) -> &'static str {
     }
 }
 
+/// #8956 — le conteneur d'un DSD distant d'après ses quatre premiers octets
+/// (`DSD ` → `dsf`, `FRM8` → `dff`). Une requête `Range` bornée à trois
+/// secondes ; `None` si le serveur ne répond pas ou ne sert pas du DSD.
+async fn conteneur_dsd_par_l_en_tete(url: &str) -> Option<&'static str> {
+    if !(url.starts_with("http://") || url.starts_with("https://")) {
+        return None;
+    }
+    let sonde = super::duree_du_flux_2062::lire_une_plage(crate::http::client::shared(), url, 0, 4);
+    let (tete, _) = tokio::time::timeout(std::time::Duration::from_secs(3), sonde)
+        .await
+        .ok()??;
+    crate::outputs::dlna::conteneur_dsd_de_l_en_tete(&tete)
+}
+
 /// #8428 — l'URL annonce-t-elle de l'Opus (`.opus`, `audio/opus`, ou Ogg dont
 /// le MIME porte `opus`) ? Un `.ogg` sans indication reste lu comme Vorbis.
 fn opus_annonce(conteneur: &str, mime: &str) -> bool {
@@ -2844,36 +2926,6 @@ mod temoins_de_l_url_indexee {
     }
 }
 
-/// **L'inverse de [`crate::upnp_server::track_audio_url`].**
-///
-/// Rend l'identifiant de piste quand `url` est l'adresse SOUS LAQUELLE CETTE
-/// INSTANCE publie l'audio d'une de ses pistes, et `None` dans tous les autres
-/// cas — autre hôte, autre chemin, identifiant illisible.
-///
-/// Le chemin n'est pas réécrit à la main : il est construit à partir de
-/// [`crate::upnp_server::API_PATH`], la même constante que le constructeur.
-/// Le témoin `l_aller_et_le_retour_parlent_de_la_meme_url` fait l'aller-retour
-/// sur le constructeur lui-même, pour qu'un changement de route rougisse ici
-/// plutôt que de rendre silencieusement « Episode ».
-fn track_id_dans_une_url_audio_de_tune(url: &str) -> Option<i64> {
-    let url = url.trim();
-    let sans_schema = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))?;
-    let (hote, chemin) = sans_schema.split_at(sans_schema.find('/')?);
-    if !hote_de_cette_machine(hote) {
-        return None;
-    }
-    let chemin = chemin.split(['?', '#']).next().unwrap_or(chemin);
-    chemin
-        .strip_prefix(crate::upnp_server::API_PATH)?
-        .strip_prefix("/library/tracks/")?
-        .strip_suffix("/audio")?
-        .parse::<i64>()
-        .ok()
-        .filter(|id| *id > 0)
-}
-
 /// L'hôte seul d'une URL de flux, pour le journal (#6468).
 ///
 /// L'URL d'un flux de service (Bandcamp, podcast privé, radio, onglet) porte
@@ -2885,122 +2937,4 @@ pub(crate) fn hote_pour_le_journal(url: &str) -> String {
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
         .unwrap_or_else(|| "?".to_string())
-}
-
-/// Cet hôte d'URL est-il une adresse de CETTE machine ?
-///
-/// La question tient en un mot : l'identifiant de piste porté par l'URL
-/// n'a de sens que dans la base d'un serveur donné. Un autre Tune du même
-/// réseau publie ses `<res>` avec son adresse à lui, et son `187500` est une
-/// autre piste. Répondre « non » ne coûte que le repli d'aujourd'hui ;
-/// répondre « oui » à tort afficherait un titre faux.
-///
-/// La boucle locale et `localhost` passent (c'est l'accès depuis la machine
-/// même), puis les adresses IPv4 réellement portées par les interfaces
-/// (`local_ipv4_addresses`, qui exclut la boucle — d'où le test séparé).
-/// Un NOM d'hôte ne passe pas : le résoudre demanderait un appel DNS sur le
-/// chemin de lecture, et l'échec est sans dommage.
-fn hote_de_cette_machine(hote: &str) -> bool {
-    let sans_port = match hote.strip_prefix('[') {
-        // IPv6 littéral : `[::1]:8888`
-        Some(reste) => reste.split(']').next().unwrap_or(reste),
-        None => hote.split(':').next().unwrap_or(hote),
-    };
-    if sans_port.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    let Ok(ip) = sans_port.parse::<std::net::IpAddr>() else {
-        return false;
-    };
-    if ip.is_loopback() {
-        return true;
-    }
-    match ip {
-        std::net::IpAddr::V4(v4) => crate::discovery::ssdp::local_ipv4_addresses().contains(&v4),
-        std::net::IpAddr::V6(_) => false,
-    }
-}
-
-#[cfg(test)]
-mod temoins_de_l_uri_du_renderer {
-    use super::{hote_de_cette_machine, track_id_dans_une_url_audio_de_tune};
-
-    /// L'URI que Tades a vue passer (fil 1819), à l'adresse près : une piste
-    /// de la bibliothèque, servie par Tune lui-même.
-    #[test]
-    fn une_url_de_piste_de_tune_rend_son_identifiant() {
-        for url in [
-            "http://127.0.0.1:8888/api/v1/library/tracks/187500/audio",
-            "https://127.0.0.1:8888/api/v1/library/tracks/187500/audio",
-            "http://localhost:8888/api/v1/library/tracks/187500/audio",
-            "  http://127.0.0.1/api/v1/library/tracks/187500/audio  ",
-            "http://[::1]:8888/api/v1/library/tracks/187500/audio",
-            "http://127.0.0.1:8888/api/v1/library/tracks/187500/audio?x=1",
-        ] {
-            assert_eq!(
-                track_id_dans_une_url_audio_de_tune(url),
-                Some(187_500),
-                "« {url} » désigne la piste 187500 de cette bibliothèque"
-            );
-        }
-    }
-
-    /// **La contre-épreuve.** Rien d'autre ne doit être pris pour une piste
-    /// d'ici : un titre faux serait pire que le repli « Episode ».
-    #[test]
-    fn rien_d_autre_ne_passe() {
-        for url in [
-            // Un AUTRE serveur — Tune ou non. `198.51.100.7` est réservé à la
-            // documentation (RFC 5737) : aucune interface ne le porte.
-            "http://198.51.100.7:8888/api/v1/library/tracks/187500/audio",
-            // Un nom d'hôte : non résolu, donc non reconnu.
-            "http://tune.local:8888/api/v1/library/tracks/187500/audio",
-            // Le serveur média d'un tiers.
-            "http://127.0.0.1:26125/content/c2/b16/f44100/d61-coX.flac",
-            // Nos autres routes : une radio n'est pas une piste.
-            "http://127.0.0.1:8888/api/v1/radios/12/audio.wav",
-            "http://127.0.0.1:8888/api/v1/library/tracks/187500/metadata",
-            "http://127.0.0.1:8888/api/v1/library/tracks/187500",
-            // Identifiants illisibles ou absurdes.
-            "http://127.0.0.1:8888/api/v1/library/tracks/abc/audio",
-            "http://127.0.0.1:8888/api/v1/library/tracks/0/audio",
-            "http://127.0.0.1:8888/api/v1/library/tracks/-3/audio",
-            "http://127.0.0.1:8888/api/v1/library/tracks//audio",
-            // Pas une URL du tout — le condensat d'identité de la phase 2.
-            "uuid:258FC2D5-E2C3-B734-0-123456789abc|85944171f73967e8",
-            "",
-        ] {
-            assert_eq!(
-                track_id_dans_une_url_audio_de_tune(url),
-                None,
-                "« {url} » ne désigne PAS une piste de cette bibliothèque"
-            );
-        }
-    }
-
-    /// Le chemin lu ici et le chemin publié dans la DIDL sont le MÊME contrat.
-    /// L'aller-retour passe par le constructeur : si la route
-    /// `/tracks/{id}/audio` ou `API_PATH` changeait, ce témoin rougirait — et
-    /// non l'affichage, huit mois plus tard, chez un testeur.
-    #[test]
-    fn l_aller_et_le_retour_parlent_de_la_meme_url() {
-        let url = crate::upnp_server::track_audio_url("http://127.0.0.1:8888", 187_500);
-        assert_eq!(
-            track_id_dans_une_url_audio_de_tune(&url),
-            Some(187_500),
-            "l'URL publiée dans le <res> doit se relire : {url}"
-        );
-    }
-
-    /// La boucle locale est nous ; l'adresse de documentation ne l'est pas.
-    #[test]
-    fn l_hote_se_reconnait_ou_se_tait() {
-        assert!(hote_de_cette_machine("127.0.0.1:8888"));
-        assert!(hote_de_cette_machine("127.0.0.1"));
-        assert!(hote_de_cette_machine("LocalHost:8888"));
-        assert!(hote_de_cette_machine("[::1]:8888"));
-        assert!(!hote_de_cette_machine("198.51.100.7:8888"));
-        assert!(!hote_de_cette_machine("tune.local:8888"));
-        assert!(!hote_de_cette_machine(""));
-    }
 }

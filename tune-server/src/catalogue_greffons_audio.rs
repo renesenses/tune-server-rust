@@ -427,7 +427,9 @@ async fn installer(state: &AppState, id: &str, tiers: bool, cible: &str) -> Resu
 
 /// `POST /api/v1/audio-plugins/{id}/install-from-catalog`
 pub async fn install_from_catalog(
-    _admin: RequireAdmin,
+    // Installe du code natif : administrateur, ou authentification coupée,
+    // seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Response {
@@ -669,7 +671,12 @@ mod tests {
                 .update_from_server(tune_core::license::Tier::Premium, None)
                 .await;
         }
-        let app = crate::routes::router_with_plugins(state.clone(), vec![]);
+        let app = crate::routes::router_with_plugins(state.clone(), vec![]).layer(
+            axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                50000,
+            ))),
+        );
         (state, app)
     }
 
@@ -981,7 +988,12 @@ mod tests {
             .license
             .update_from_server(tune_core::license::Tier::Premium, None)
             .await;
-        let app = crate::routes::router_with_plugins(state.clone(), vec![]);
+        let app = crate::routes::router_with_plugins(state.clone(), vec![]).layer(
+            axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                50000,
+            ))),
+        );
         let (status, corps) = installer_par_la_route(&app, "catalogue-essai-anonyme").await;
         assert_eq!(status, StatusCode::PRECONDITION_FAILED, "{corps}");
         assert_eq!(corps["error"], "not_connected", "{corps}");

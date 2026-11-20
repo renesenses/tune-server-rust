@@ -31,7 +31,13 @@
 //! Paramètres : `colonnes` (50..4000, 1000 par défaut) ; `debut_s` et `fin_s`
 //! pour une PLAGE (le zoom de l'écran) : calculée sans cache, bornée à la
 //! durée de la piste (422 si `debut_s` est au-delà, `fin_s` ramenée à la
-//! fin). L'en-tête `X-Tune-Cache` dit `hit`, `miss`, `plage` ou `hors-cache`.
+//! fin). L'en-tête `X-Tune-Cache` dit `hit`, `miss`, `plage`, `plage-hit`
+//! ou `hors-cache`.
+//!
+//! Fil du forum 2954 (rc13) : les plages du zoom passent par un petit cache
+//! EN MÉMOIRE borné ([`PLAGES_MAX`], [`PLAGES_OCTETS_MAX`]) ; une plage
+//! d'au plus `ECHANTILLONS_MAX` trames rend aussi, par canal,
+//! `echantillons` — chaque échantillon, pour le tracé au fort zoom.
 
 use std::path::{Path as CheminFs, PathBuf};
 use std::sync::Arc;
@@ -67,6 +73,76 @@ pub(crate) struct Parametres {
     pub(crate) debut_s: Option<f64>,
     #[serde(alias = "end_s")]
     pub(crate) fin_s: Option<f64>,
+}
+
+/// Les plages du zoom gardées en mémoire au plus (fil 2954), et leur poids
+/// total au plus : une plage de 1 000 colonnes stéréo pèse quelque 45 Ko,
+/// une plage d'échantillons jusqu'à 150 Ko.
+pub(crate) const PLAGES_MAX: usize = 48;
+pub(crate) const PLAGES_OCTETS_MAX: usize = 8 * 1024 * 1024;
+
+/// Un cache LRU minimal, borné en nombre et en octets.
+pub(crate) struct CachePlages {
+    entrees: std::sync::Mutex<std::collections::VecDeque<(String, Arc<Vec<u8>>)>>,
+}
+
+impl CachePlages {
+    pub(crate) const fn new() -> Self {
+        Self {
+            entrees: std::sync::Mutex::new(std::collections::VecDeque::new()),
+        }
+    }
+
+    pub(crate) fn lire(&self, cle: &str) -> Option<Vec<u8>> {
+        let mut e = self.entrees.lock().unwrap_or_else(|p| p.into_inner());
+        let i = e.iter().position(|(k, _)| k == cle)?;
+        let entree = e.remove(i)?;
+        let octets = entree.1.as_ref().clone();
+        e.push_back(entree);
+        Some(octets)
+    }
+
+    pub(crate) fn garder(&self, cle: String, octets: Vec<u8>) {
+        if octets.len() > PLAGES_OCTETS_MAX {
+            return;
+        }
+        let mut e = self.entrees.lock().unwrap_or_else(|p| p.into_inner());
+        e.retain(|(k, _)| *k != cle);
+        e.push_back((cle, Arc::new(octets)));
+        let mut total: usize = e.iter().map(|(_, o)| o.len()).sum();
+        while e.len() > PLAGES_MAX || total > PLAGES_OCTETS_MAX {
+            match e.pop_front() {
+                Some((_, o)) => total -= o.len(),
+                None => break,
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn longueur(&self) -> usize {
+        self.entrees.lock().unwrap().len()
+    }
+}
+
+pub(crate) static PLAGES: CachePlages = CachePlages::new();
+
+/// La clé d'une plage : la piste, l'empreinte du fichier (un fichier
+/// remplacé ne sert pas une plage périmée), les colonnes et la plage à la
+/// milliseconde.
+pub(crate) fn cle_de_plage(
+    id: i64,
+    chemin: &str,
+    meta: &std::fs::Metadata,
+    colonnes: usize,
+    debut_s: f64,
+    duree_s: Option<f64>,
+) -> String {
+    format!(
+        "{id}-{:016x}-{colonnes}-{}-{}",
+        spectro::empreinte_du_fichier(chemin, meta),
+        (debut_s * 1000.0).round() as i64,
+        duree_s.map_or(-1, |d| (d * 1000.0).round() as i64)
+    )
 }
 
 pub(crate) fn dossier_du_cache() -> PathBuf {
@@ -180,8 +256,18 @@ pub(crate) async fn servir_avec(
             Ok(plage) => plage,
             Err(r) => return r,
         };
+        // Fil 2954 — un petit cache EN MÉMOIRE, borné, des dernières plages :
+        // un « ÷2 » qui revient à la plage d'avant ne redécode rien.
+        let cle = cle_de_plage(id, &chemin, &meta, colonnes, debut, duree);
+        if let Some(octets) = PLAGES.lire(&cle) {
+            return reponse(octets, "plage-hit");
+        }
         return match calculer(id, chemin, None, colonnes, debut, duree, duree_piste_s).await {
-            Ok(v) => reponse(serde_json::to_vec(&v).unwrap_or_default(), "plage"),
+            Ok(v) => {
+                let octets = serde_json::to_vec(&v).unwrap_or_default();
+                PLAGES.garder(cle, octets.clone());
+                reponse(octets, "plage")
+            }
             Err(r) => r,
         };
     }
@@ -400,7 +486,7 @@ pub(crate) fn en_json(id: i64, f: &FormeOnde, debut_s: f64, duree_calcul_ms: u64
         .iter()
         .enumerate()
         .map(|(canal, v)| {
-            json!({
+            let mut voie = json!({
                 "canal": canal,
                 "crete_dbfs": db(v.crete_dbfs()),
                 "rms_dbfs": db(v.rms_dbfs()),
@@ -410,7 +496,16 @@ pub(crate) fn en_json(id: i64, f: &FormeOnde, debut_s: f64, duree_calcul_ms: u64
                 "min": colonne(&v.min),
                 "max": colonne(&v.max),
                 "rms": colonne(&v.rms),
-            })
+            });
+            // Fil 2954 — au fort zoom, les échantillons eux-mêmes.
+            if let Some(e) = &v.echantillons {
+                voie["echantillons"] = json!(
+                    e.iter()
+                        .map(|&x| arrondi(f64::from(x), 5))
+                        .collect::<Vec<_>>()
+                );
+            }
+            voie
         })
         .collect();
     json!({

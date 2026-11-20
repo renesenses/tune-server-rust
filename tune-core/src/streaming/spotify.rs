@@ -1431,11 +1431,45 @@ impl SpotifyService {
         }
     }
 
+    /// #9072 — le type de sortie d'un album Spotify, lu dans `album_type`.
+    ///
+    /// Spotify n'a que trois mots : `album`, `single` et `compilation`. Il
+    /// range sous `single` les singles ET les EP (« Growth » d'Olivia Dean,
+    /// 5 titres, et « Slowly », 1 titre, ASR rc12) : un `single` de 4 pistes
+    /// ou plus, ou dont le titre finit par « EP », est un EP. `album` et
+    /// l'absence de type passent par la règle des services
+    /// ([`crate::metadata::release_type::type_d_album_de_service`]), qui
+    /// n'écoute ici que le titre (les durées ne sont pas dans la liste).
+    /// `compilation` n'est pas un type primaire : la sortie reste sans type,
+    /// donc parmi les albums.
+    ///
+    /// Avant, `release_type` restait `None` pour tout album Spotify : EP et
+    /// singles tombaient dans « Albums principaux ».
+    fn type_de_sortie(item: &serde_json::Value) -> Option<String> {
+        use crate::metadata::release_type::{
+            EP_PISTES_MIN, TypeDeSortie, titre_annonce_un_ep, type_d_album_de_service,
+        };
+        let titre = item["name"].as_str().unwrap_or("");
+        let pistes = item["total_tracks"].as_u64().unwrap_or(0);
+        let type_spotify = item["album_type"]
+            .as_str()
+            .map(|t| t.trim().to_ascii_lowercase());
+        let type_de_sortie = match type_spotify.as_deref() {
+            Some("single") if titre_annonce_un_ep(titre) || pistes >= u64::from(EP_PISTES_MIN) => {
+                Some(TypeDeSortie::Ep)
+            }
+            Some("single") => Some(TypeDeSortie::Single),
+            Some("album") => type_d_album_de_service(Some(TypeDeSortie::Album), titre, None),
+            _ => type_d_album_de_service(None, titre, None),
+        };
+        type_de_sortie.map(|t| t.as_str().to_string())
+    }
+
     fn map_album(item: &serde_json::Value) -> StreamAlbum {
         StreamAlbum {
             ai_generated: None,
             explicit: None,
-            release_type: None,
+            release_type: Self::type_de_sortie(item),
             id: item["id"].as_str().unwrap_or("").into(),
             title: item["name"].as_str().unwrap_or("").into(),
             artist: item["artists"]
@@ -3265,6 +3299,36 @@ mod tests {
             album.cover_path.as_deref(),
             Some("http://img.spotify.com/album.jpg")
         );
+    }
+
+    /// #9072 — le cas d'ASR : « Growth » (EP, 5 titres) et « Slowly »
+    /// (single, 1 titre), que Spotify marque tous deux `single`, ne sont plus
+    /// des albums ; un `album` reste un album, une `compilation` reste sans
+    /// type (donc parmi les albums), comme une réponse sans `album_type`.
+    #[test]
+    fn map_album_lit_le_type_de_sortie_de_spotify_9072() {
+        let album = |nom: &str, album_type: Option<&str>, pistes: u64| {
+            let mut json = json!({
+                "id": "a", "name": nom, "artists": [{"name": "Olivia Dean", "id": "od"}],
+                "release_date": "2023-06-30", "total_tracks": pistes,
+            });
+            if let Some(t) = album_type {
+                json["album_type"] = json!(t);
+            }
+            SpotifyService::map_album(&json).release_type
+        };
+        assert_eq!(album("Growth", Some("single"), 5).as_deref(), Some("ep"));
+        assert_eq!(
+            album("Slowly", Some("single"), 1).as_deref(),
+            Some("single")
+        );
+        assert_eq!(album("Dive", Some("single"), 3).as_deref(), Some("single"));
+        assert_eq!(album("Dive EP", Some("single"), 3).as_deref(), Some("ep"));
+        assert_eq!(album("Messy", Some("album"), 12).as_deref(), Some("album"));
+        assert_eq!(album("Messy", Some("ALBUM"), 12).as_deref(), Some("album"));
+        assert_eq!(album("Best Of", Some("compilation"), 20), None);
+        assert_eq!(album("Sans type", None, 10), None);
+        assert_eq!(album("Sans type EP", None, 4).as_deref(), Some("ep"));
     }
 
     #[test]

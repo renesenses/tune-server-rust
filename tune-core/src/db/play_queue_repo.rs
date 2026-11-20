@@ -153,7 +153,7 @@ pub mod sql {
 
     pub fn insert_streaming<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO queue_items (zone_id, position, source_id, title, artist, album, cover_url, duration_ms, source, track_number, disc_number, album_ref, artist_ref) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            "INSERT INTO queue_items (zone_id, position, source_id, title, artist, album, cover_url, duration_ms, source, track_number, disc_number, album_ref, artist_ref, media_format, sample_rate, bit_depth) VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
             d.placeholder(1),
             d.placeholder(2),
             d.placeholder(3),
@@ -166,13 +166,16 @@ pub mod sql {
             d.placeholder(10),
             d.placeholder(11),
             d.placeholder(12),
-            d.placeholder(13)
+            d.placeholder(13),
+            d.placeholder(14),
+            d.placeholder(15),
+            d.placeholder(16)
         )
     }
 
     pub fn select_streaming<D: SqlDialect>(d: &D) -> String {
         format!(
-            "SELECT source_id, title, artist, album, cover_url, duration_ms, position, source, track_number, disc_number, album_ref, artist_ref FROM queue_items WHERE zone_id = {} AND track_id IS NULL ORDER BY position",
+            "SELECT source_id, title, artist, album, cover_url, duration_ms, position, source, track_number, disc_number, album_ref, artist_ref, media_format, sample_rate, bit_depth FROM queue_items WHERE zone_id = {} AND track_id IS NULL ORDER BY position",
             d.placeholder(1)
         )
     }
@@ -221,7 +224,7 @@ pub mod sql {
                 COALESCE(t.title, q.title), COALESCE(ar.name, q.artist), \
                 COALESCE(al.title, q.album), q.source_id, \
                 COALESCE(t.duration_ms, q.duration_ms), t.file_path, \
-                COALESCE(t.cover_path, al.cover_path, q.cover_url), t.format, t.sample_rate, t.bit_depth, \
+                COALESCE(t.cover_path, al.cover_path, q.cover_url), COALESCE(t.format, q.media_format), COALESCE(t.sample_rate, q.sample_rate), COALESCE(t.bit_depth, q.bit_depth), \
                 q.track_number, q.disc_number, q.album_ref, t.album_id, t.artist_id, q.artist_ref \
          FROM queue_items q \
          LEFT JOIN tracks t ON q.track_id = t.id \
@@ -274,6 +277,34 @@ pub mod sql {
             unified_select_base(),
             d.placeholder(1),
             d.placeholder(2)
+        )
+    }
+
+    /// #8968 — les lignes de la file autour de la ligne en cours, en UNE
+    /// requête bornée : de la précédente à celle d'après la suivante (rangs
+    /// `c-1 ..= c+2`), plus les deux premières quand `avec_la_tete` (file qui
+    /// reboucle). Rien du tout sans ligne en cours.
+    pub fn voisinage_du_courant<D: SqlDialect>(d: &D, avec_la_tete: bool) -> String {
+        let courant = |n: usize| {
+            format!(
+                "(SELECT c.position FROM queue_items c WHERE c.zone_id = {} \
+                 AND c.is_current = 1 ORDER BY c.position, c.id LIMIT 1)",
+                d.placeholder(n)
+            )
+        };
+        let tete = if avec_la_tete {
+            " OR (q.position <= 1 AND EXISTS (SELECT 1 FROM queue_items e \
+             WHERE e.zone_id = q.zone_id AND e.is_current = 1))"
+        } else {
+            ""
+        };
+        format!(
+            "{} WHERE q.zone_id = {} AND (q.position BETWEEN {} - 1 AND {} + 2{tete}) \
+             ORDER BY q.position, q.id LIMIT 8",
+            unified_select_base(),
+            d.placeholder(1),
+            courant(2),
+            courant(3),
         )
     }
 
@@ -530,6 +561,9 @@ impl QueueEntry {
     }
 }
 
+/// #8788 — conteneur, cadence et profondeur annoncés par une source de file.
+pub type StreamingQueueFormat = (Option<String>, Option<i64>, Option<i64>);
+
 /// An item to enqueue, source-agnostic. Used by the unified `insert_at`/`append`.
 // `Streaming` est construit par champs nommés dans une trentaine de fichiers de
 // quatre caisses (dont orchestrator/tests.rs, en PR ouverte) : le mettre en
@@ -557,6 +591,10 @@ pub enum QueueInput {
         /// Identifiant de l'artiste chez le service (`StreamTrack.artist_id`),
         /// quand la source l'a donné — voir [`QueueEntry::artist_ref`] (#6079).
         artist_ref: Option<String>,
+        /// Format annoncé par la source UPnP, conservé avec la piste (#8788).
+        media_format: Option<String>,
+        sample_rate: Option<u32>,
+        bit_depth: Option<u32>,
     },
 }
 
@@ -1145,6 +1183,22 @@ impl PlayQueueRepo {
         Ok((courant, rows.len() as i64))
     }
 
+    /// #8968 — voir [`sql::voisinage_du_courant`] : au plus huit lignes, une
+    /// requête, sans relire la file ni ses drapeaux.
+    pub fn voisinage_du_courant(
+        &self,
+        zone_id: i64,
+        avec_la_tete: bool,
+    ) -> Result<Vec<QueueEntry>, String> {
+        let sql = self.dialect_sql(
+            |d| sql::voisinage_du_courant(d, avec_la_tete),
+            |d| sql::voisinage_du_courant(d, avec_la_tete),
+        );
+        let params: [&dyn ToSqlValue; 3] = [&zone_id, &zone_id, &zone_id];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok(rows.iter().map(|cols| row_to_queue_entry(cols)).collect())
+    }
+
     /// The single queue entry at `position` (source-agnostic), if any.
     pub fn get_at(&self, zone_id: i64, position: i64) -> Result<Option<QueueEntry>, String> {
         let sql = self.dialect_sql(sql::get_at, sql::get_at);
@@ -1285,8 +1339,11 @@ impl PlayQueueRepo {
                         disc_number,
                         album_ref,
                         artist_ref,
+                        media_format,
+                        sample_rate,
+                        bit_depth,
                     } => {
-                        let p: [&dyn ToSqlValue; 13] = [
+                        let p: [&dyn ToSqlValue; 16] = [
                             &zone_id,
                             &pos,
                             source_id,
@@ -1300,6 +1357,9 @@ impl PlayQueueRepo {
                             disc_number,
                             album_ref,
                             artist_ref,
+                            media_format,
+                            &sample_rate.map(i64::from),
+                            &bit_depth.map(i64::from),
                         ];
                         tx.execute(&insert_streaming_sql, &p)?;
                         retenus.push(i);
@@ -1651,6 +1711,18 @@ impl PlayQueueRepo {
         album_refs: &[Option<String>],
         artist_refs: &[Option<String>],
     ) -> Result<(), String> {
+        self.set_streaming_queue_avec_formats(zone_id, tracks, album_refs, artist_refs, &[])
+    }
+
+    /// #8788 — transfert de file : les formats suivent leurs lignes.
+    pub fn set_streaming_queue_avec_formats(
+        &self,
+        zone_id: i64,
+        tracks: &[StreamingQueueItem],
+        album_refs: &[Option<String>],
+        artist_refs: &[Option<String>],
+        formats: &[StreamingQueueFormat],
+    ) -> Result<(), String> {
         let delete_local_sql = self.dialect_sql(sql::delete_for_zone, sql::delete_for_zone);
         let delete_streaming_sql = self.dialect_sql(sql::delete_streaming, sql::delete_streaming);
         let insert_streaming_sql = self.dialect_sql(sql::insert_streaming, sql::insert_streaming);
@@ -1676,7 +1748,9 @@ impl PlayQueueRepo {
                 let pos = i as i64;
                 let album_ref: Option<&str> = album_refs.get(i).and_then(|r| r.as_deref());
                 let artist_ref: Option<&str> = artist_refs.get(i).and_then(|r| r.as_deref());
-                let p: [&dyn ToSqlValue; 13] = [
+                let (media_format, sample_rate, bit_depth) =
+                    formats.get(i).cloned().unwrap_or_default();
+                let p: [&dyn ToSqlValue; 16] = [
                     &zone_id,
                     &pos,
                     source_id,
@@ -1690,6 +1764,9 @@ impl PlayQueueRepo {
                     disc_no,
                     &album_ref,
                     &artist_ref,
+                    &media_format,
+                    &sample_rate,
+                    &bit_depth,
                 ];
                 tx.execute(&insert_streaming_sql, &p)?;
             }
@@ -1758,7 +1835,7 @@ impl PlayQueueRepo {
                 // La forme en n-uplet ne porte pas de référence d'album.
                 let album_ref: Option<&str> = None;
                 let artist_ref: Option<&str> = None;
-                let p: [&dyn ToSqlValue; 13] = [
+                let p: [&dyn ToSqlValue; 16] = [
                     &zone_id,
                     &pos,
                     source_id,
@@ -1772,6 +1849,9 @@ impl PlayQueueRepo {
                     disc_no,
                     &album_ref,
                     &artist_ref,
+                    &Option::<String>::None,
+                    &Option::<i64>::None,
+                    &Option::<i64>::None,
                 ];
                 tx.execute(&insert_streaming_sql, &p)?;
             }
@@ -1799,6 +1879,9 @@ impl PlayQueueRepo {
                     "disc_number": cols.get(9).and_then(|v| v.as_i64()),
                     "album_ref": cols.get(10).and_then(|v| v.as_string()),
                     "artist_ref": cols.get(11).and_then(|v| v.as_string()),
+                    "media_format": cols.get(12).and_then(|v| v.as_string()),
+                    "sample_rate": cols.get(13).and_then(|v| v.as_i64()),
+                    "bit_depth": cols.get(14).and_then(|v| v.as_i64()),
                 })
             })
             .collect();
@@ -2294,10 +2377,9 @@ mod tests {
         let p = PostgresDialect;
         assert!(sql::insert_queue_row(&s).contains("VALUES (?, ?, ?, ?, 'local')"));
         assert!(sql::insert_queue_row(&p).contains("VALUES ($1, $2, $3, $4, 'local')"));
-        assert!(
-            sql::insert_streaming(&p)
-                .contains("VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)")
-        );
+        assert!(sql::insert_streaming(&p).contains(
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)"
+        ));
         // The new per-album numbering columns must ride along the streaming insert.
         assert!(sql::insert_streaming(&s).contains("track_number"));
         assert!(sql::insert_streaming(&s).contains("disc_number"));
@@ -2358,6 +2440,9 @@ mod tests {
     }
     fn streaming(id: &str, title: &str) -> QueueInput {
         QueueInput::Streaming {
+            media_format: None,
+            sample_rate: None,
+            bit_depth: None,
             source: "qobuz".into(),
             source_id: id.into(),
             title: title.into(),
@@ -3692,6 +3777,127 @@ mod tests {
             vec![Some(a), Some(x), None, Some(b), None],
             "x en 1, la ligne de service ajoutee en 2, la file d'origine derriere"
         );
+    }
+
+    #[test]
+    fn le_format_upnp_en_file_survit_a_la_reouverture_de_la_base_8788() {
+        let dossier = tempfile::tempdir().unwrap();
+        let chemin = dossier.path().join("file-upnp.sqlite");
+        {
+            let db = SqliteDb::open(chemin.to_str().unwrap()).unwrap();
+            db.init_schema().unwrap();
+            crate::db::migrations::run_migrations(&db).unwrap();
+            db.execute(
+                "INSERT INTO zones (id, name, output_type) VALUES (1, 'Diretta factice', 'local')",
+                &[],
+            )
+            .unwrap();
+            // Le JSON permet de soumettre le contrat voulu aussi à la version
+            // d'avant, qui ignore ces champs : rouge comportemental, pas une
+            // erreur de compilation liée à un champ Rust encore absent.
+            let entree: QueueInput = serde_json::from_value(serde_json::json!({
+                "Streaming": {
+                    "source": "upnp", "source_id": "http://127.0.0.1:9/album/2.wav",
+                    "title": "WAV suivant", "artist": "Artiste", "album": "Album",
+                    "cover_url": null, "duration_ms": 123000,
+                    "track_number": 2, "disc_number": 1, "album_ref": null, "artist_ref": null,
+                    "media_format": "wav", "sample_rate": 705600, "bit_depth": 24
+                }
+            }))
+            .unwrap();
+            PlayQueueRepo::new(db).append(1, &[entree]).unwrap();
+        }
+        let db = SqliteDb::open(chemin.to_str().unwrap()).unwrap();
+        let lignes = PlayQueueRepo::new(db).get_ordered(1).unwrap();
+        assert_eq!(lignes.len(), 1);
+        assert_eq!(
+            lignes[0].format.as_deref(),
+            Some("wav"),
+            "#8788 : le format UPnP est perdu dans la file persistée"
+        );
+        assert_eq!(
+            lignes[0].sample_rate,
+            Some(705600),
+            "#8788 : fréquence perdue"
+        );
+        assert_eq!(lignes[0].bit_depth, Some(24), "#8788 : profondeur perdue");
+    }
+    #[test]
+    fn une_ancienne_file_migree_garde_ses_titres_sans_inventer_un_format_8788() {
+        let db = SqliteDb::open(":memory:").unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        db.execute_batch(
+            "INSERT INTO zones (id, name) VALUES (1, 'Banc');
+            INSERT INTO queue_items (zone_id, position, source, source_id, title)
+            VALUES (1, 0, 'upnp', 'http://127.0.0.1:9/ancien.wav', 'Ancien');
+            ALTER TABLE queue_items DROP COLUMN media_format;
+            ALTER TABLE queue_items DROP COLUMN sample_rate;
+            ALTER TABLE queue_items DROP COLUMN bit_depth;
+            DELETE FROM _migrations WHERE version >= 155;",
+        )
+        .unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let lignes = PlayQueueRepo::new(db).get_ordered(1).unwrap();
+        assert_eq!(lignes.len(), 1);
+        assert_eq!(lignes[0].title.as_deref(), Some("Ancien"));
+        assert_eq!(lignes[0].format, None);
+        assert_eq!(lignes[0].sample_rate, None);
+        assert_eq!(lignes[0].bit_depth, None);
+    }
+    #[cfg(feature = "postgres")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pg_8788_le_format_upnp_survit_a_la_file_persistante() {
+        let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+            eprintln!("SAUT : TUNE_TEST_PG_URL non posée");
+            return;
+        };
+        let postgres = crate::db::postgres::PostgresDb::connect(&url)
+            .await
+            .unwrap();
+        crate::db::migrations::run_pg_migrations(postgres.pool())
+            .await
+            .unwrap();
+        postgres.ensure_schema().await;
+        let backend: Arc<dyn crate::db::backend::DbBackend> = Arc::new(
+            crate::db::backend::PostgresBackend::new(postgres.pool().clone()),
+        );
+        let zones = crate::db::zone_repo::ZoneRepo::with_backend(backend.clone());
+        let zone = zones
+            .create("Banc format UPnP 8788", Some("browser"), None)
+            .unwrap();
+        let entree: QueueInput = serde_json::from_value(serde_json::json!({"Streaming": {
+            "source": "upnp", "source_id": "http://127.0.0.1:9/suivante.wav",
+            "title": "Suivante", "artist": "Banc", "album": null, "cover_url": null,
+            "duration_ms": 1000, "track_number": null, "disc_number": null,
+            "album_ref": null, "artist_ref": null,
+            "media_format": "wav", "sample_rate": 705600, "bit_depth": 24
+        }}))
+        .unwrap();
+        PlayQueueRepo::with_backend(backend.clone())
+            .append(zone, &[entree])
+            .unwrap();
+        let autre_connexion = crate::db::postgres::PostgresDb::connect(&url)
+            .await
+            .unwrap();
+        let autre_backend = Arc::new(crate::db::backend::PostgresBackend::new(
+            autre_connexion.pool().clone(),
+        ));
+        let file = PlayQueueRepo::with_backend(autre_backend)
+            .get_ordered(zone)
+            .unwrap();
+        assert_eq!(file.len(), 1);
+        assert_eq!(
+            file[0].format.as_deref(),
+            Some("wav"),
+            "#8788 : PostgreSQL a perdu le format UPnP"
+        );
+        assert_eq!(file[0].sample_rate, Some(705600));
+        assert_eq!(file[0].bit_depth, Some(24));
+        backend
+            .execute("DELETE FROM zones WHERE id = $1", &[&zone])
+            .unwrap();
     }
 }
 

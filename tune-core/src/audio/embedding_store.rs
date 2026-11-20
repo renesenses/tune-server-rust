@@ -276,7 +276,9 @@ pub enum CandidatAcoustique {
 /// [`eligible_count`] doit partager le MÊME prédicat.
 ///
 /// `seuil_report` : l'estampille en deçà de laquelle un report de chemin
-/// (#1865) est périmé.
+/// (#1865) est périmé. Le même seuil périme le report « à réessayer plus
+/// tard » d'une piste en échec répété (`audio_embed_retry_later`, #9046) :
+/// sans lui, `LIMIT` sans `ORDER BY` rendait les mêmes pistes à chaque lot.
 pub fn candidats_acoustiques(
     backend: &Arc<dyn DbBackend>,
     seuil_report: &str,
@@ -296,12 +298,16 @@ pub fn candidats_acoustiques(
            AND NOT EXISTS (SELECT 1 FROM track_metadata m \
                  WHERE m.track_id = t.id AND m.key = 'audio_embed_path_unresolved' \
                    AND m.value > ?) \
+           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
+                 WHERE m.track_id = t.id AND m.key = 'audio_embed_retry_later' \
+                   AND m.value > ?) \
          LIMIT ?"
     );
     let rows = backend.query_many(
         &sql,
         &[
             &MODEL_ID as &dyn ToSqlValue,
+            &seuil_report as &dyn ToSqlValue,
             &seuil_report as &dyn ToSqlValue,
             &limite as &dyn ToSqlValue,
         ],
@@ -363,11 +369,32 @@ pub fn eligible_count(backend: &Arc<dyn DbBackend>) -> i64 {
         .unwrap_or(0)
 }
 
-/// Pistes éligibles non traitées que la passe reporte temporairement (#4187).
+/// Pistes éligibles non traitées que la passe reporte temporairement (#4187) :
+/// fichier qui ne répond pas, ou piste en échec répété mise à réessayer plus
+/// tard (`audio_embed_retry_later`, #9046). Sans ces dernières, la jauge
+/// restait figée sous 100 % « au repos » sans un mot.
 /// Le seuil et les deux prédicats de métadonnées sont ceux de la sélection
 /// des candidats : un report périmé redevient du travail à faire, et un ancien
 /// marqueur de report ne masque jamais une piste déjà traitée pour ce modèle.
 pub fn deferred_count(backend: &Arc<dyn DbBackend>, seuil_report: &str) -> i64 {
+    compter_les_reports(
+        backend,
+        seuil_report,
+        "'audio_embed_path_unresolved', 'audio_embed_retry_later'",
+    )
+}
+
+/// Parmi [`deferred_count`], les pistes reportées après des échecs répétés
+/// d'analyse (`audio_embed_retry_later`, #9046) — et non parce que leur
+/// fichier ne répond pas. La route les nomme à part (`analysis_failures`) :
+/// les dire « fichier qui ne répond pas » envoyait chercher un disque.
+pub fn retry_later_count(backend: &Arc<dyn DbBackend>, seuil_report: &str) -> i64 {
+    compter_les_reports(backend, seuil_report, "'audio_embed_retry_later'")
+}
+
+/// Pistes éligibles non traitées portant un report non périmé parmi `cles`
+/// (liste SQL de littéraux, constante du module — jamais une entrée).
+fn compter_les_reports(backend: &Arc<dyn DbBackend>, seuil_report: &str, cles: &str) -> i64 {
     // #5593 — le périmètre réglé, voir `candidats_acoustiques`.
     let perimetre = crate::taches_de_fond::perimetre::clause_clap(backend);
     backend
@@ -377,7 +404,9 @@ pub fn deferred_count(backend: &Arc<dyn DbBackend>, seuil_report: &str) -> i64 {
           AND NOT EXISTS (SELECT 1 FROM track_metadata m \
             WHERE m.track_id = t.id AND m.key = 'audio_embed_analyzed' AND m.value = ?) \
           AND EXISTS (SELECT 1 FROM track_metadata m \
-            WHERE m.track_id = t.id AND m.key = 'audio_embed_path_unresolved' AND m.value > ?)"
+            WHERE m.track_id = t.id \
+              AND m.key IN ({cles}) \
+              AND m.value > ?)"
             ),
             &[
                 &MODEL_ID as &dyn ToSqlValue,

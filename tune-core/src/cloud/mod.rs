@@ -14,6 +14,7 @@ pub mod logos_labels_partages;
 pub mod mesures_communautaires;
 pub mod metadata_proposals;
 pub mod notes_communautaires;
+pub mod plateforme;
 pub mod playlist_hub;
 pub mod plugins;
 pub mod proprietaire;
