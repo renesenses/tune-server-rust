@@ -3679,7 +3679,6 @@ impl PositionPoller {
                             self.noter_fin_tune_tested(zone_state, &device_id, pic, rendu)
                                 .await;
                             info!(zone_id, next_pos, "gapless_advance_metadata");
-                            self.constater_le_suivant_suivi(zone_id);
                             if let Err(e) = Box::pin(
                                 self.orchestrator.advance_queue_metadata(zone_id, next_pos),
                             )
@@ -3695,6 +3694,8 @@ impl PositionPoller {
                             // Identity-keyed latch re-arms on the new track;
                             // clearing also covers gapless repeat-one (#1113).
                             ps.scrobbled_key = None;
+                            // #9206 — le renderer a suivi le flux armé.
+                            self.constater_le_suivant_suivi(zone_id);
                         } else {
                             Box::pin(self.handle_track_end(zone_id, zone_state)).await;
                         }
