@@ -40,6 +40,11 @@ pub struct Resume {
     pub position_ms: i64,
     pub updated_at: String,
     pub items: Vec<QueueInput>,
+    /// Le profil qui écoutait quand la reprise a été écrite (session de la
+    /// zone). `None` : écrite avant ce champ, ou sans profil de session.
+    /// « Reprendre l'écoute » ne montre à un profil que les siennes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<i64>,
 }
 
 fn input(e: &QueueEntry) -> QueueInput {
@@ -86,6 +91,89 @@ fn decode(row: &[super::backend::SqlValue]) -> Result<Resume, String> {
     r.resume_key = row[1].as_string().unwrap_or_default();
     Ok(r)
 }
+/// Cette reprise est-elle celle du profil `profil` ?
+///
+/// Une reprise datée de son profil n'appartient qu'à lui. Une reprise sans
+/// profil (écrite avant ce champ, ou sans session) se rattache à l'historique
+/// d'écoute de son contexte : si d'autres profils l'ont écouté et pas
+/// celui-ci, elle n'est pas la sienne ; si personne n'est connu, elle reste
+/// visible (rien ne la rattache à quelqu'un).
+pub fn est_au_profil(db: &Arc<dyn DbBackend>, r: &Resume, profil: i64) -> bool {
+    if let Some(p) = r.profile_id {
+        return p == profil;
+    }
+    let e = ecouteurs_des_contextes(db, &[(r.context_type.clone(), r.context_id.clone())]);
+    rattachee_au_profil(&e, r, profil)
+}
+
+type Ecouteurs = std::collections::HashMap<(String, String), Vec<i64>>;
+
+fn rattachee_au_profil(e: &Ecouteurs, r: &Resume, profil: i64) -> bool {
+    match r.profile_id {
+        Some(p) => p == profil,
+        None => e
+            .get(&(r.context_type.clone(), r.context_id.clone()))
+            .is_none_or(|ps| ps.is_empty() || ps.contains(&profil)),
+    }
+}
+
+/// Les profils connus de l'historique pour chaque contexte, en UNE requête
+/// (par paquets de 100 contextes).
+fn ecouteurs_des_contextes(db: &Arc<dyn DbBackend>, contextes: &[(String, String)]) -> Ecouteurs {
+    let mut e: Ecouteurs = Default::default();
+    for paquet in contextes.chunks(100) {
+        let conditions = vec!["(context_type = ? AND context_id = ?)"; paquet.len()].join(" OR ");
+        let sql = format!(
+            "SELECT DISTINCT context_type, context_id, profile_id FROM listen_history \
+             WHERE profile_id IS NOT NULL AND ({conditions})"
+        );
+        let params: Vec<&dyn ToSqlValue> = paquet
+            .iter()
+            .flat_map(|(t, i)| [t as &dyn ToSqlValue, i as &dyn ToSqlValue])
+            .collect();
+        for row in db.query_many(&sql, &params).unwrap_or_default() {
+            let (Some(t), Some(i), Some(p)) = (
+                row.first().and_then(|v| v.as_string()),
+                row.get(1).and_then(|v| v.as_string()),
+                row.get(2).and_then(|v| v.as_i64()),
+            ) else {
+                continue;
+            };
+            e.entry((t, i)).or_default().push(p);
+        }
+    }
+    e
+}
+
+/// [`recent`], réduit aux reprises du profil (voir [`est_au_profil`]).
+pub fn recent_du_profil(
+    db: &Arc<dyn DbBackend>,
+    zone_id: Option<i64>,
+    limit: i64,
+    profil: i64,
+) -> Result<Vec<Resume>, String> {
+    // Les reprises des autres profils sont écartées APRÈS lecture : on en lit
+    // davantage pour que la rangée reste pleine.
+    let large = limit.saturating_mul(4).saturating_add(20);
+    let lues = recent(db, zone_id, large)?;
+    let sans_profil: Vec<(String, String)> = lues
+        .iter()
+        .filter(|r| r.profile_id.is_none())
+        .map(|r| (r.context_type.clone(), r.context_id.clone()))
+        .collect();
+    let e = if sans_profil.is_empty() {
+        Ecouteurs::default()
+    } else {
+        ecouteurs_des_contextes(db, &sans_profil)
+    };
+    let mut rs: Vec<Resume> = lues
+        .into_iter()
+        .filter(|r| rattachee_au_profil(&e, r, profil))
+        .collect();
+    rs.truncate(usize::try_from(limit.max(0)).unwrap_or(0));
+    Ok(rs)
+}
+
 pub fn recent(
     db: &Arc<dyn DbBackend>,
     zone_id: Option<i64>,
@@ -134,6 +222,22 @@ pub fn started(
     album: Option<&str>,
     cover: Option<&str>,
 ) -> Result<(), String> {
+    started_du_profil(db, zone_id, c, source, source_id, title, album, cover, None)
+}
+
+/// [`started`], la reprise datée du profil de la session (`profil`).
+#[allow(clippy::too_many_arguments)]
+pub fn started_du_profil(
+    db: &Arc<dyn DbBackend>,
+    zone_id: i64,
+    c: &ContexteEcoute<'_>,
+    source: &str,
+    source_id: Option<&str>,
+    title: &str,
+    album: Option<&str>,
+    cover: Option<&str>,
+    profil: Option<i64>,
+) -> Result<(), String> {
     let nature = c.nature.unwrap_or("track");
     if !matches!(nature, "album" | "playlist" | "track") {
         return Ok(());
@@ -160,6 +264,19 @@ pub fn started(
         return Ok(());
     };
     let service = c.service.unwrap_or(source);
+    // Sans profil de session (réécriture de fond, renderer piloté de
+    // l'extérieur), la reprise GARDE le profil qu'elle portait déjà : le
+    // rafraîchissement d'une file ne doit pas la rendre à tout le foyer.
+    let profil = match profil {
+        Some(p) => Some(p),
+        None => db
+            .query_one(
+                "SELECT payload, resume_key FROM listening_resumes WHERE zone_id = ? AND context_type = ? AND context_id = ? AND source = ?",
+                &[&zone_id as &dyn ToSqlValue, &nature, &id, &service],
+            )?
+            .and_then(|row| decode(&row).ok())
+            .and_then(|r| r.profile_id),
+    };
     let mut selected = Vec::new();
     let mut queue_row_ids = Vec::new();
     let mut position = None;
@@ -257,6 +374,7 @@ pub fn started(
         .is_some_and(|row| queue_row_ids.contains(&row));
     let r = Resume {
         resume_key: uuid::Uuid::new_v4().to_string(),
+        profile_id: profil,
         context_type: nature.into(),
         context_id: id.into(),
         source: service.into(),
@@ -675,6 +793,19 @@ pub fn podcast_started_in_context(
     position_ms: i64,
     context_id: Option<&str>,
 ) -> Result<(), String> {
+    podcast_started_du_profil(db, zone_id, np, position_ms, context_id, None)
+}
+
+/// [`podcast_started_in_context`], la reprise datée du profil de la session.
+/// Sans profil (`None`), elle garde celui qu'elle portait déjà.
+pub fn podcast_started_du_profil(
+    db: &Arc<dyn DbBackend>,
+    zone_id: i64,
+    np: &crate::playback::NowPlaying,
+    position_ms: i64,
+    context_id: Option<&str>,
+    profil: Option<i64>,
+) -> Result<(), String> {
     let Some(url) = np.source_id.as_deref().filter(|_| np.source == "podcast") else {
         return Ok(());
     };
@@ -698,8 +829,10 @@ pub fn podcast_started_in_context(
         .into_iter()
         .map(|(r, _)| r)
         .find(|r| r.context_type == "podcast" && est_l_episode(r, url));
+    let profil = profil.or_else(|| existante.as_ref().and_then(|r| r.profile_id));
     let r = Resume {
         resume_key: uuid::Uuid::new_v4().to_string(),
+        profile_id: profil,
         context_type: "podcast".into(),
         context_id: existante
             .map(|r| r.context_id)
@@ -828,7 +961,7 @@ pub fn refresh_started(
     }) {
         return Ok(());
     }
-    started(
+    started_du_profil(
         db,
         s.zone_id,
         &ContexteEcoute {
@@ -850,6 +983,7 @@ pub fn refresh_started(
         &np.title,
         np.album_title.as_deref(),
         np.cover_path.as_deref(),
+        s.session_profile_id,
     )?;
     track_position(db, s)
 }
@@ -933,6 +1067,9 @@ pub fn contexte_fini(
     Ok(retirees)
 }
 
+#[cfg(test)]
+#[path = "listening_resume_profil_tests.rs"]
+mod listening_resume_profil_tests;
 #[cfg(test)]
 #[path = "listening_resume_album_fin_tests.rs"]
 mod reprise_album_termine_7415;

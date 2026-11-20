@@ -834,8 +834,16 @@ impl PlaybackOrchestrator {
         })
         .ok();
 
-        if let Err(e) = crate::db::listening_resume::started(
-            &self.db, zone_id, &contexte, source, source_id, title, album, cover_url,
+        if let Err(e) = crate::db::listening_resume::started_du_profil(
+            &self.db,
+            zone_id,
+            &contexte,
+            source,
+            source_id,
+            title,
+            album,
+            cover_url,
+            session_profile_id,
         ) {
             tracing::warn!(zone_id, error = %e, "reprise_non_enregistree");
         }
@@ -1068,12 +1076,13 @@ impl PlaybackOrchestrator {
             // épisode navigateur : il n'existe pas encore forcément de reprise.
             // #7415 : `podcast_started_in_context` retire aussi la reprise d'un
             // épisode arrivé à sa fin (durée `np.duration_ms`).
-            let _ = crate::db::listening_resume::podcast_started_in_context(
+            let _ = crate::db::listening_resume::podcast_started_du_profil(
                 &self.db,
                 zone_id,
                 np,
                 state.position_ms,
                 state.session_context_id.as_deref(),
+                state.session_profile_id,
             );
         }
     }

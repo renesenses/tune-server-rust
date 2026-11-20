@@ -1,32 +1,110 @@
 //! #8904 — Google bloque la connexion YouTube présentée avec le client de
 //! repli « YouTube TV » public (portée `youtube` complète). La sortie est un
 //! client OAuth propre à Tune, en `youtube.readonly`, figé dans les binaires
-//! publiés par la CI. Ces essais gardent les trois points qui le rendent sûr :
+//! publiés par la CI ; le repli est RETIRÉ (décision du 17/11). Ces essais
+//! gardent :
 //!
 //! 1. le journal dit quel client est employé sans livrer l'identifiant ;
-//! 2. un compte déjà connecté par le repli reste rafraîchi par le repli (un
-//!    jeton ne se rafraîchit que chez le client qui l'a émis) ;
-//! 3. CHAQUE ligne de build qui publie un binaire reçoit les deux secrets, y
+//! 2. sans client de Tune, la connexion est refusée par un message clair et
+//!    AUCUN appel ne part vers Google ;
+//! 3. un compte connecté par le repli passe « à reconnecter » au premier
+//!    rafraîchissement, sans appel à Google, et sa ligne est effacée ;
+//! 4. CHAQUE ligne de build qui publie un binaire reçoit les deux secrets, y
 //!    compris dans le conteneur `cross` des cibles ARM.
+use std::sync::{Arc, Mutex};
+
 use serde_json::json;
 
 use super::*;
 
+const ID_TUNE: &str = "1234567890-abc.apps";
+
 fn client_tune() -> ClientOAuth {
-    ClientOAuth::resoudre((None, None), (Some("1234567890-abc.apps"), Some("s")))
+    ClientOAuth::resoudre((None, None), (Some(ID_TUNE), Some("s"))).expect("client de Tune")
+}
+
+/// Les corps des requêtes reçues par le faux Google.
+type Appels = Arc<Mutex<Vec<String>>>;
+
+/// Un faux Google OAuth local (`/device/code`, `/token`) qui note chaque
+/// requête reçue. Rend le service branché dessus et le carnet d'appels.
+async fn service_contre_un_faux_google(oauth: Option<ClientOAuth>) -> (YouTubeService, Appels) {
+    use axum::routing::post;
+    let appels: Appels = Arc::default();
+    let note = |appels: Appels, reponse: serde_json::Value| {
+        move |corps: String| {
+            let appels = appels.clone();
+            let reponse = reponse.clone();
+            async move {
+                appels.lock().unwrap().push(corps);
+                axum::Json(reponse)
+            }
+        }
+    };
+    let app = axum::Router::new()
+        .route(
+            "/device/code",
+            post(note(
+                appels.clone(),
+                json!({"device_code": "dc", "user_code": "UC-8904",
+                       "verification_url": "https://www.google.com/device",
+                       "expires_in": 1800, "interval": 5}),
+            )),
+        )
+        .route(
+            "/token",
+            post(note(
+                appels.clone(),
+                json!({"access_token": "at-neuf", "expires_in": 3600}),
+            )),
+        );
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let adresse = ecoute.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(ecoute, app).await });
+
+    let mut svc = YouTubeService::new();
+    svc.oauth = oauth;
+    svc.google_oauth_base = PointsOAuthGoogle {
+        device_code: format!("http://{adresse}/device/code"),
+        token: format!("http://{adresse}/token"),
+        // Pas de route : 404, l'adresse du compte reste inconnue, sans réseau.
+        userinfo: format!("http://{adresse}/userinfo"),
+    };
+    (svc, appels)
+}
+
+fn nombre(appels: &Appels) -> usize {
+    appels.lock().unwrap().len()
 }
 
 #[test]
-fn origine_du_client_execution_compilation_repli() {
-    let exec = ClientOAuth::resoudre((Some("id-e"), Some("s-e")), (Some("id-c"), Some("s-c")));
-    assert_eq!((exec.origine, exec.libelle()), ("execution", "tune"));
-    let compil = ClientOAuth::resoudre((None, None), (Some("id-c"), Some("s-c")));
-    assert_eq!((compil.origine, compil.libelle()), ("compilation", "tune"));
+fn origine_du_client_execution_compilation_sinon_aucun() {
+    let exec =
+        ClientOAuth::resoudre((Some("id-e"), Some("s-e")), (Some("id-c"), Some("s-c"))).unwrap();
+    assert_eq!(exec.origine, "execution");
+    let compil = ClientOAuth::resoudre((None, None), (Some("id-c"), Some("s-c"))).unwrap();
+    assert_eq!(compil.origine, "compilation");
     assert_eq!(compil.scope, GOOGLE_SCOPE_LECTURE);
-    // Secrets de CI absents : `option_env!` rend Some("") et non None.
-    let vide = ClientOAuth::resoudre((None, None), (Some(""), Some("")));
-    assert_eq!((vide.origine, vide.libelle()), ("repli", "repli"));
-    assert_eq!(vide, ClientOAuth::repli());
+    // Secrets de CI absents : `option_env!` rend Some("") et non None. Plus de
+    // repli : aucun client.
+    assert_eq!(
+        ClientOAuth::resoudre((None, None), (Some(""), Some(""))),
+        None
+    );
+}
+
+#[test]
+fn les_identifiants_du_repli_ont_quitte_le_code() {
+    // Ni l'identifiant ni le secret du client « YouTube TV », ni la portée
+    // complète, nulle part dans le module (essais compris).
+    const SOURCE: &str = include_str!("youtube.rs");
+    for retire in [
+        concat!("43212718137", "-t3p59j0tov6ak6jdsuj9leqpdmmmqpt4"),
+        concat!("GOCSPX-", "Zrl1xIm-Bf63fMFIOh2IDK1AyAFQ"),
+        concat!("\"https://www.googleapis.com/auth/", "youtube\""),
+    ] {
+        assert!(!SOURCE.contains(retire), "{retire} encore dans youtube.rs");
+    }
 }
 
 #[test]
@@ -37,40 +115,175 @@ fn l_identifiant_abrege_ne_livre_pas_l_identifiant() {
     assert!(!abrege.contains(&c.id));
 }
 
-#[test]
-fn ancienne_ligne_sans_client_est_rafraichie_par_le_repli() {
-    let mut svc = YouTubeService::new();
-    svc.oauth = client_tune();
-    svc.client_du_jeton = svc.oauth.clone();
-    assert!(svc.restore_tokens(&json!({"access_token": "at", "refresh_token": "rt"})));
-    assert!(
-        svc.client_du_jeton.repli,
-        "jeton émis par le repli avant #8904"
-    );
-    // Et l'enregistrement le dit, pour le prochain démarrage.
-    assert_eq!(svc.save_tokens().unwrap()["client_oauth"], "repli");
+/// Épreuve 1 : sans client de Tune, la connexion est refusée par le message
+/// « non configuré » et AUCUNE requête ne part vers Google.
+#[tokio::test]
+async fn sans_client_de_tune_la_connexion_est_refusee_sans_appel() {
+    let (mut svc, appels) = service_contre_un_faux_google(None).await;
+    let refus = svc
+        .authenticate(&json!({"device_flow": true}))
+        .await
+        .expect_err("connexion refusée");
+    match &refus {
+        TuneError::Refused { code, message } => {
+            assert_eq!(*code, CODE_CLIENT_OAUTH_ABSENT);
+            assert!(
+                message.contains("non configuré dans cette version"),
+                "{message}"
+            );
+        }
+        autre => panic!("refus attendu, reçu {autre:?}"),
+    }
+    assert_eq!(nombre(&appels), 0, "un appel est parti vers Google");
+    assert!(svc.pending_device_auth.is_none());
 }
 
-#[test]
-fn ligne_du_client_tune_reste_au_client_tune() {
-    let mut svc = YouTubeService::new();
-    svc.oauth = client_tune();
-    svc.client_du_jeton = ClientOAuth::repli();
-    svc.restore_tokens(
-        &json!({"access_token": "at", "refresh_token": "rt", "client_oauth": "tune"}),
+/// Contre-épreuve de l'épreuve 1 : avec le client de Tune, la même demande
+/// part bien vers Google, avec l'identifiant de TUNE et la portée lecture.
+#[tokio::test]
+async fn avec_le_client_de_tune_la_connexion_part_avec_son_identifiant() {
+    let (mut svc, appels) = service_contre_un_faux_google(Some(client_tune())).await;
+    let etat = svc
+        .authenticate(&json!({"device_flow": true}))
+        .await
+        .expect("flux ouvert");
+    assert_eq!(etat.user_code.as_deref(), Some("UC-8904"));
+    let appels = appels.lock().unwrap();
+    assert_eq!(appels.len(), 1);
+    assert!(
+        appels[0].starts_with(&format!("client_id={ID_TUNE}&")),
+        "{}",
+        appels[0]
     );
-    assert_eq!(svc.client_du_jeton, svc.oauth);
+    assert!(appels[0].ends_with("youtube.readonly"), "{}", appels[0]);
+}
+
+/// Épreuve 2 : une ligne d'avant #8914 (sans `client_oauth`), donc émise par
+/// le repli, passe « à reconnecter » au premier rafraîchissement : jetons
+/// effacés, aucun appel à Google, ligne effacée par le registre.
+#[tokio::test]
+async fn un_jeton_du_repli_passe_a_reconnecter_sans_appel() {
+    let (mut svc, appels) = service_contre_un_faux_google(Some(client_tune())).await;
+    assert!(svc.restore_tokens(&json!({
+        "access_token": "at-repli", "refresh_token": "rt-repli", "email": "a@example.invalid",
+    })));
+    assert_eq!(svc.raison_de_reconnexion(), None);
+    assert!(!svc.session_expired());
+
+    svc.post_restore().await;
+
+    assert_eq!(
+        nombre(&appels),
+        0,
+        "le jeton du repli est parti vers Google"
+    );
+    assert!(svc.access_token.is_none() && svc.refresh_token.is_none());
+    assert!(!svc.is_authenticated());
+    assert!(!svc.auth_status().await.authenticated);
+    assert_eq!(svc.raison_de_reconnexion(), Some(MESSAGE_RECONNEXION_REPLI));
+    assert!(
+        svc.session_expired(),
+        "le registre doit effacer la ligne périmée"
+    );
+    assert_eq!(svc.save_tokens(), Some(json!({})), "la ligne est écrasée");
+    // Rien ne plante ensuite : un rafraîchissement de plus ne fait rien.
+    assert!(!svc.refresh_if_needed().await.unwrap());
+    assert_eq!(nombre(&appels), 0);
+
+    // La reconnexion passe par le client de Tune et lève l'état.
+    svc.authenticate(&json!({"device_flow": true}))
+        .await
+        .unwrap();
+    assert!(appels.lock().unwrap()[0].starts_with(&format!("client_id={ID_TUNE}&")));
+    svc.authenticate(&json!({"poll": true})).await.unwrap();
+    assert!(svc.is_authenticated());
+    assert_eq!(svc.raison_de_reconnexion(), None);
     assert_eq!(svc.save_tokens().unwrap()["client_oauth"], "tune");
 }
 
+/// Épreuve 2 bis : le rafraîchissement périodique (et non celui du démarrage)
+/// aboutit au même état.
 #[tokio::test]
-async fn deconnexion_rend_le_client_du_processus() {
+async fn le_rafraichissement_periodique_d_un_jeton_du_repli_n_appelle_pas_google() {
+    let (mut svc, appels) = service_contre_un_faux_google(Some(client_tune())).await;
+    svc.restore_tokens(
+        &json!({"access_token": "at", "refresh_token": "rt", "client_oauth": "repli"}),
+    );
+    assert!(!svc.refresh_if_needed().await.unwrap());
+    assert_eq!(nombre(&appels), 0);
+    assert_eq!(svc.raison_de_reconnexion(), Some(MESSAGE_RECONNEXION_REPLI));
+}
+
+/// Contre-épreuve de l'épreuve 2 : une ligne du client de Tune est rafraîchie
+/// par lui, et le compte reste connecté.
+#[tokio::test]
+async fn un_jeton_du_client_de_tune_reste_connecte() {
+    let (mut svc, appels) = service_contre_un_faux_google(Some(client_tune())).await;
+    assert!(svc.restore_tokens(&json!({
+        "access_token": "at", "refresh_token": "rt", "client_oauth": "tune",
+    })));
+    svc.post_restore().await;
+    let appels = appels.lock().unwrap();
+    assert_eq!(appels.len(), 1);
+    assert!(
+        appels[0].starts_with(&format!("client_id={ID_TUNE}&")),
+        "{}",
+        appels[0]
+    );
+    assert_eq!(svc.access_token.as_deref(), Some("at-neuf"));
+    assert!(svc.is_authenticated());
+    assert_eq!(svc.raison_de_reconnexion(), None);
+    assert!(!svc.session_expired());
+    assert_eq!(svc.save_tokens().unwrap()["client_oauth"], "tune");
+}
+
+/// Une ligne du client de Tune relue par une version SANS client (fork) : à
+/// reconnecter avec le message « non configuré », sans appel.
+#[tokio::test]
+async fn un_jeton_de_tune_sans_client_passe_a_reconnecter() {
+    let (mut svc, appels) = service_contre_un_faux_google(None).await;
+    svc.restore_tokens(
+        &json!({"access_token": "at", "refresh_token": "rt", "client_oauth": "tune"}),
+    );
+    svc.post_restore().await;
+    assert_eq!(nombre(&appels), 0);
+    assert_eq!(
+        svc.raison_de_reconnexion(),
+        Some(MESSAGE_CLIENT_OAUTH_ABSENT)
+    );
+    assert!(svc.session_expired());
+}
+
+/// Un flux de connexion ouvert par le repli (sans marque) ne se reprend pas
+/// au redémarrage ; celui du client de Tune, si.
+#[test]
+fn un_flux_de_connexion_du_repli_ne_se_reprend_pas() {
+    let ligne = |marque: Option<&str>| {
+        let mut l = json!({"pending_device_code": "dc", "pending_user_code": "UC",
+                           "pending_elapsed_secs": 10});
+        if let Some(m) = marque {
+            l["pending_client_oauth"] = json!(m);
+        }
+        l
+    };
     let mut svc = YouTubeService::new();
-    svc.oauth = client_tune();
+    svc.oauth = Some(client_tune());
+    svc.restore_tokens(&ligne(None));
+    assert!(svc.pending_device_auth.is_none());
+    svc.restore_tokens(&ligne(Some("tune")));
+    assert!(svc.pending_device_auth.is_some());
+    assert_eq!(svc.save_tokens().unwrap()["pending_client_oauth"], "tune");
+}
+
+#[tokio::test]
+async fn deconnexion_leve_l_etat_a_reconnecter() {
+    let mut svc = YouTubeService::new();
+    svc.oauth = Some(client_tune());
     svc.restore_tokens(&json!({"access_token": "at", "refresh_token": "rt"}));
-    assert!(svc.client_du_jeton.repli);
+    assert!(svc.jeton_du_repli);
     svc.logout().await.unwrap();
-    assert_eq!(svc.client_du_jeton, svc.oauth);
+    assert!(!svc.jeton_du_repli);
+    assert_eq!(svc.raison_de_reconnexion(), None);
 }
 
 // ---------------------------------------------------------------------------

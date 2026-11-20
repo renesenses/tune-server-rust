@@ -994,6 +994,40 @@ impl PlaybackOrchestrator {
             )
             .await;
 
+        // #8404 — une lecture PLUS RÉCENTE a pris la zone pendant l'envoi.
+        //
+        // La garde de génération de `resoudre_la_demande` ne regarde qu'une
+        // fois, avant l'envoi. Or l'envoi attend : le pré-tampon DLNA (jusqu'à
+        // 4 s), le verrou d'une sortie lente. Si un second appareil lance un
+        // autre titre dans cette fenêtre, sa lecture ferme la session de
+        // celle-ci (`sessions_a_fermer_apres_remplacement`) ; celle-ci trouve
+        // alors son flux mort (#5522) et prenait le chemin du refus de
+        // sortie : zone ARRÊTÉE, « stopped » écrit en base, bandeau d'erreur
+        // fatal à tous les clients, alors que le renderer joue le titre du
+        // second appareil. Elle ne doit plus rien toucher : la gagnante
+        // pilote la zone. Avant le repli DSD ci-dessous, qui rejouerait la
+        // lecture perdante et doublerait à son tour la gagnante.
+        if !output_sent
+            && output_error.is_some()
+            && self.playback.current_play_seq(req.zone_id).await != play_gen
+        {
+            info!(
+                zone_id = req.zone_id,
+                title = %resolved.title,
+                error = output_error.as_deref().unwrap_or(""),
+                "orchestrator_play_superseded_during_output"
+            );
+            if let Some(ref sid) = resolved.stream_id {
+                self.streamer.remove_session(sid).await;
+            }
+            return Ok(PlayResult {
+                stream_url: None,
+                output_sent: false,
+                source: resolved.source,
+                error: Some(crate::orchestrator::PLAY_SUPERSEDED.into()),
+            });
+        }
+
         // #4354 — la barrière a posé un repli DSD à 176,4 kHz : rien n'est
         // parti au renderer. La session trop lente est fermée et la même
         // demande est rejouée ; la seconde résolution sert 176,4 kHz, sous
@@ -1680,6 +1714,9 @@ impl PlaybackOrchestrator {
                     }
                 }
             }
+
+            // #8404 — point d'arrêt d'essai : vide hors des tests.
+            point_d_arret_8404::traverser(req.zone_id).await;
 
             // #5522 — le producteur de la session est déjà mort (téléchargement
             // amont refusé, `abandonner_la_session_de_transcodage`) : la
@@ -2699,6 +2736,21 @@ impl PlaybackOrchestrator {
             .flatten();
         let output_type = zone_row.as_ref().and_then(|z| z.output_type.clone());
         let output_device_id = zone_row.and_then(|z| z.output_device_id);
+
+        // #8855 — une relance n'est pas une lecture neuve : une sortie
+        // AirPlay 1 en PURE verrouillé garde le niveau en cours.
+        if let Some(ref did) = output_device_id {
+            let arc = { self.outputs.lock().await.get(did.as_str()) };
+            if let Some(output) = arc {
+                let sortie = output.lock().await;
+                if let Some(airplay) = sortie
+                    .as_any()
+                    .downcast_ref::<crate::outputs::airplay::AirplayOutput>()
+                {
+                    airplay.marquer_relance_interne();
+                }
+            }
+        }
 
         // Arrêter la sortie AVANT que play() n'en crée une autre : sans ça,
         // l'ancien fil ASIO/WASAPI peut encore tenir la connexion HTTP quand la
@@ -4695,6 +4747,11 @@ pub(crate) fn sessions_a_fermer_apres_remplacement(
 
 #[cfg(test)]
 mod session_remplacee_ticket_134;
+
+// Hors `cfg(test)` : l'appel vit dans `envoyer_a_la_sortie`, et des gardes de
+// texte coupent ce fichier au premier `cfg(test)`. Le corps, lui, est vide
+// hors des tests.
+pub(super) mod point_d_arret_8404;
 
 #[cfg(feature = "local-audio")]
 impl PlaybackOrchestrator {

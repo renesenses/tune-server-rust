@@ -17,7 +17,7 @@ use axum::Json;
 use axum::extract::{Query, State};
 use serde_json::Value;
 
-use super::{HistoryParams, top_artists};
+use super::{HistoryParams, VueDuFoyer, top_artists};
 use crate::state::AppState;
 
 fn serveur() -> AppState {
@@ -52,6 +52,8 @@ fn ecoutes(state: &AppState, artiste: &str, n: usize) {
 async fn top(state: AppState, limit: i64) -> Vec<Value> {
     let Json(corps) = top_artists(
         State(state),
+        crate::routes::active_profile::ActiveProfile(1),
+        VueDuFoyer(true),
         Query(HistoryParams {
             limit: Some(limit),
             offset: None,
