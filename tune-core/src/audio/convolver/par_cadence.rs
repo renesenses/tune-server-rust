@@ -66,10 +66,7 @@ impl Variante {
             taps,
             sample_rate,
             chemin: None,
-            cle: format!(
-                "mem#{}",
-                PROCHAIN_NUMERO.fetch_add(1, Ordering::Relaxed)
-            ),
+            cle: format!("mem#{}", PROCHAIN_NUMERO.fetch_add(1, Ordering::Relaxed)),
         }
     }
 
@@ -205,8 +202,7 @@ pub fn reechantillonner_ri(taps: &[Vec<f32>], de: u32, vers: u32) -> Vec<Vec<f32
             entrelace[(marge + i) * canaux + c] = h;
         }
     }
-    let sortie =
-        crate::audio::resample::rubato_resample_track(&entrelace, de, vers, canaux as u16);
+    let sortie = crate::audio::resample::rubato_resample_track(&entrelace, de, vers, canaux as u16);
     let echelle = de as f32 / vers as f32;
     let n = sortie.len() / canaux;
     (0..canaux)
@@ -234,7 +230,8 @@ pub(super) fn ri_a_la_cadence(variante: &Variante, vers: u32) -> Arc<[Vec<f32>]>
         return ri;
     }
     let debut = std::time::Instant::now();
-    let ri: Arc<[Vec<f32>]> = reechantillonner_ri(&variante.taps, variante.sample_rate, vers).into();
+    let ri: Arc<[Vec<f32>]> =
+        reechantillonner_ri(&variante.taps, variante.sample_rate, vers).into();
     tracing::info!(
         chemin = variante.chemin.as_deref().unwrap_or("(mémoire)"),
         de = variante.sample_rate,

@@ -290,7 +290,10 @@ struct CanalDuFiltre {
 }
 
 fn vrai(v: Option<&str>) -> bool {
-    matches!(v.map(str::trim), Some("1") | Some("true") | Some("yes") | Some("oui"))
+    matches!(
+        v.map(str::trim),
+        Some("1") | Some("true") | Some("yes") | Some("oui")
+    )
 }
 
 fn dossier_ir() -> std::path::PathBuf {
@@ -350,8 +353,8 @@ fn decrire_le_jeu(settings: &SettingsRepo, zone_id: i64) -> Vec<serde_json::Valu
     jeu.chemins()
         .into_iter()
         .enumerate()
-        .map(|(i, chemin)| {
-            match tune_core::audio::convolver::Convolver::read_ir_taps(&chemin) {
+        .map(
+            |(i, chemin)| match tune_core::audio::convolver::Convolver::read_ir_taps(&chemin) {
                 Ok((taps, sr)) => json!({
                     "path": chemin,
                     "sample_rate": sr,
@@ -360,8 +363,8 @@ fn decrire_le_jeu(settings: &SettingsRepo, zone_id: i64) -> Vec<serde_json::Valu
                     "main": i == 0,
                 }),
                 Err(e) => json!({"path": chemin, "main": i == 0, "error": e}),
-            }
-        })
+            },
+        )
         .collect()
 }
 
@@ -373,7 +376,10 @@ fn cadence_du_fichier(chemin: &str) -> Option<u32> {
 }
 
 fn ecrire_supplementaires(settings: &SettingsRepo, zone_id: i64, liste: &[String]) {
-    let cle = format!("{}{zone_id}", tune_core::audio::convolver::par_cadence::CLE_JEU);
+    let cle = format!(
+        "{}{zone_id}",
+        tune_core::audio::convolver::par_cadence::CLE_JEU
+    );
     if liste.is_empty() {
         settings.delete(&cle).ok();
     } else {
@@ -405,11 +411,10 @@ async fn ajouter_au_jeu(
             .into_response();
     }
     let Some(cadence) = cadence_du_fichier(provisoire.to_str().unwrap_or("")) else {
-        let e = tune_core::audio::convolver::Convolver::read_ir_taps(
-            provisoire.to_str().unwrap_or(""),
-        )
-        .err()
-        .unwrap_or_default();
+        let e =
+            tune_core::audio::convolver::Convolver::read_ir_taps(provisoire.to_str().unwrap_or(""))
+                .err()
+                .unwrap_or_default();
         std::fs::remove_file(&provisoire).ok();
         return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
     };

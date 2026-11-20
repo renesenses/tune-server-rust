@@ -49,7 +49,9 @@ fn ecart_de_phase(a: f64, b: f64) -> f64 {
 /// fréquences où le filtre est au-dessus de −40 dB, jusqu'à `f_max`.
 fn meme_reponse(avant: &[f32], de: u32, apres: &[f32], vers: u32, f_max: f64) {
     let (_, retard) = marge_d_amorce(de, vers);
-    let freqs: Vec<f64> = (1..=200).map(|k| 20.0 * (f_max / 20.0).powf(k as f64 / 200.0)).collect();
+    let freqs: Vec<f64> = (1..=200)
+        .map(|k| 20.0 * (f_max / 20.0).powf(k as f64 / 200.0))
+        .collect();
     let r1 = fir_frequency_response(avant, de, &freqs);
     let r2 = fir_frequency_response(apres, vers, &freqs);
     let mut points = 0;
@@ -165,7 +167,11 @@ fn a_cadence_egale_le_fichier_par_cadence_remplace_le_principal_8761() {
     ecrire(&s, &dirac(16, 5), 48_000);
     let chemins = [p, absent, s].map(|c| c.to_string_lossy().into_owned());
     let jeu = ConvolverConfig::depuis_jeu(&chemins, true).unwrap();
-    assert_eq!(jeu.cadences(), vec![48_000], "fichier illisible écarté, doublon remplacé");
+    assert_eq!(
+        jeu.cadences(),
+        vec![48_000],
+        "fichier illisible écarté, doublon remplacé"
+    );
     let (choix, taps) = jeu.ri_pour(48_000).unwrap();
     assert_eq!(choix.chemin.as_deref(), Some(chemins[2].as_str()));
     assert_eq!(taps[0], dirac(16, 5));
@@ -189,7 +195,12 @@ fn le_filtre_reechantillonne_est_mis_en_cache_8761() {
 
 #[test]
 fn un_dirac_reechantillonne_garde_module_phase_et_longueur_8761() {
-    for (de, vers) in [(48_000u32, 96_000u32), (96_000, 48_000), (44_100, 48_000), (44_100, 192_000)] {
+    for (de, vers) in [
+        (48_000u32, 96_000u32),
+        (96_000, 48_000),
+        (44_100, 48_000),
+        (44_100, 192_000),
+    ] {
         let n = 4096;
         let ri = dirac(n, 1000);
         let apres = reechantillonner_ri(&[ri.clone()], de, vers);
@@ -204,7 +215,10 @@ fn un_dirac_reechantillonne_garde_module_phase_et_longueur_8761() {
             .unwrap()
             .0;
         let attendu = retard as f64 + 1000.0 * vers as f64 / de as f64;
-        assert!((pic as f64 - attendu).abs() <= 1.0, "{de}→{vers} : pic en {pic}, attendu {attendu}");
+        assert!(
+            (pic as f64 - attendu).abs() <= 1.0,
+            "{de}→{vers} : pic en {pic}, attendu {attendu}"
+        );
         let f_max = 0.45 * de.min(vers) as f64;
         meme_reponse(&ri, de, &apres[0], vers, f_max.min(20_000.0));
     }
@@ -212,7 +226,12 @@ fn un_dirac_reechantillonne_garde_module_phase_et_longueur_8761() {
 
 #[test]
 fn un_passe_bas_reechantillonne_garde_sa_reponse_8761() {
-    for (de, vers) in [(44_100u32, 96_000u32), (96_000, 44_100), (48_000, 44_100), (44_100, 88_200)] {
+    for (de, vers) in [
+        (44_100u32, 96_000u32),
+        (96_000, 44_100),
+        (48_000, 44_100),
+        (44_100, 88_200),
+    ] {
         let ri = passe_bas(1023, 6_000.0, de);
         let apres = reechantillonner_ri(&[ri.clone()], de, vers);
         meme_reponse(&ri, de, &apres[0], vers, 19_000.0);

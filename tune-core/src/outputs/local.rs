@@ -10321,9 +10321,7 @@ mod etage_exclusif_observe_7093;
 mod exclusif_par_zone_3245_tests;
 
 /// #8761 — les cadences du jeu, pour la ligne de journal de l'installation.
-fn config_chemin_pour_journal(
-    config: &crate::audio::convolver::ConvolverConfig,
-) -> String {
+fn config_chemin_pour_journal(config: &crate::audio::convolver::ConvolverConfig) -> String {
     let cadences: Vec<String> = config.cadences().iter().map(u32::to_string).collect();
     format!("jeu[{} Hz]", cadences.join(", "))
 }
