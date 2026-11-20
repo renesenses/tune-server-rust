@@ -127,6 +127,17 @@ pub struct StreamAlbum {
     /// (`PolitiqueParentale::masquer_explicite`) retire ces albums des listes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub explicit: Option<bool>,
+    /// Le genre de l'album, pour l'afficher sous la vignette dans une liste
+    /// qui mélange plusieurs genres (nouveautés de l'accueil, recherche…) —
+    /// remonté par Pascal et d'autres, repris sous #8925. Qobuz le porte sur
+    /// `genre.id`/`genre.name` de l'album (déjà lu ailleurs pour
+    /// `AlbumContext`, jamais jusqu'ici pour la liste elle-même). Les autres
+    /// services laissent `None` — une absence ne s'invente pas, même règle
+    /// que `release_type`/`ai_generated` ci-dessus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genre_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub genre_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1652,6 +1663,8 @@ mod tests {
             track_count: 5,
             quality: None,
             released_at: None,
+            genre_id: None,
+            genre_name: None,
         };
         let json = serde_json::to_value(&album).unwrap();
         assert_eq!(json["source_id"], "789");
