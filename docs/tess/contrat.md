@@ -425,6 +425,9 @@ Hors TESS, avec un motif affiché :
 ```
 
 `refusal` : `{ "status": 400|402|409, "code": "…", "detail": "…", "plugin_id": "…"|null }`.
+Le serveur y ajoute (T08, champs facultatifs) la forme des autres refus de
+l'API : `error` (= `code`), `message` (= `detail`) et, sur un 402,
+`upgrade_url`.
 
 ### Routes (T08, `tune-server/src/routes/zones/tess.rs`)
 

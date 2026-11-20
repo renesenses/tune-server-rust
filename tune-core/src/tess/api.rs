@@ -373,7 +373,14 @@ pub fn schema_json() -> Value {
                     "status": { "enum": [400, 402, 409] },
                     "code": { "enum": codes_refus },
                     "detail": { "type": "string" },
-                    "plugin_id": texte_ou_null
+                    "plugin_id": texte_ou_null,
+                    // Facultatifs (T08) : la forme des autres refus de l'API
+                    // (`premium_guard`) pour les clients qui lisent `error`
+                    // et affichent `message` ; `error` = `code`, `message` =
+                    // `detail`, `upgrade_url` sur un 402 seulement.
+                    "error": { "enum": codes_refus },
+                    "message": { "type": "string" },
+                    "upgrade_url": { "type": "string" }
                 },
                 "additionalProperties": false
             }

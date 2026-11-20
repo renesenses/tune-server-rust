@@ -133,6 +133,11 @@ fn refus_conforme(v: &Value, statut: u16, code: &str) {
     conforme_au_schema("refusal", v).unwrap_or_else(|e| panic!("{v} : {e}"));
     assert_eq!(v["status"], json!(statut), "{v}");
     assert_eq!(v["code"], json!(code), "{v}");
+    // Même forme que les autres refus de l'API (`premium_guard`).
+    assert_eq!(v["error"], json!(code), "{v}");
+    assert_eq!(v["message"], v["detail"], "{v}");
+    assert!(!v["message"].as_str().unwrap_or_default().is_empty(), "{v}");
+    assert_eq!(v["upgrade_url"].is_string(), statut == 402, "{v}");
 }
 
 fn etape<'a>(reponse: &'a Value, plugin: &str) -> &'a Value {

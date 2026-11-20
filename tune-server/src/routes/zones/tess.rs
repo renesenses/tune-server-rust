@@ -196,10 +196,29 @@ fn zone_introuvable(zone_id: i64) -> Response {
         .into_response()
 }
 
+/// Le refus du contrat (`status`, `code`, `detail`, `plugin_id`), avec les
+/// champs des autres refus de l'API (`premium_guard`) : `error` (= `code`),
+/// `message` (= `detail`) et, sur un 402, `upgrade_url`. Un client qui
+/// affiche `message` tel quel (client web, `api.ts`) dit donc pourquoi.
+pub fn corps_du_refus(r: &RefusTess) -> Value {
+    let mut v = serde_json::to_value(r).unwrap_or_else(|_| json!({}));
+    if let Some(o) = v.as_object_mut() {
+        o.insert("error".into(), json!(r.code));
+        o.insert("message".into(), json!(r.detail));
+        if r.status == 402 {
+            o.insert(
+                "upgrade_url".into(),
+                json!(tune_core::license::URL_OFFRE_PREMIUM),
+            );
+        }
+    }
+    v
+}
+
 fn refus(e: &ErreurChaine) -> Response {
     let r = RefusTess::from(e);
     let statut = StatusCode::from_u16(r.status).unwrap_or(StatusCode::CONFLICT);
-    (statut, Json(r)).into_response()
+    (statut, Json(corps_du_refus(&r))).into_response()
 }
 
 /// Une clé de la zone ne se relit pas (T02 : refus explicite, jamais une
