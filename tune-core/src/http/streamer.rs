@@ -128,6 +128,12 @@ pub struct StreamInfo {
     /// n'entre dans le flux — piste servie telle quelle (cas 3 de #2742),
     /// sortie locale, PURE, interrupteur coupé, radio, préchargement.
     pub compensation_db: Option<f64>,
+    /// #8740 — la balance (règle 2 → 2 de la zone) est CUITE dans les octets
+    /// de ce flux réseau. Même règle que [`Self::crossfeed`] : un fait du
+    /// flux, posé là où il est bâti, que le chemin du signal lit tel quel.
+    /// `false` sur une piste servie telle quelle, en PURE, en bit-perfect
+    /// strict, sur une sortie locale (qui pose la matrice elle-même).
+    pub reaffectation: bool,
     /// #6221 — le flux est un DSF FABRIQUÉ à la volée depuis un DSDIFF
     /// compressé DST (`audio::dsf_depuis_dst`) : DSD natif, décompressé sans
     /// perte, aucune conversion PCM. Même règle que [`Self::crossfeed`] : un

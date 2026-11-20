@@ -2312,6 +2312,7 @@ impl PlaybackOrchestrator {
         // la session de fichier dira si ses octets portent le crossfeed.
         // Le remux (sans traitement) ne l'appelle jamais, d'où `dash_dsp_active`.
         let dash_crossfeed = dash_dsp_active && dash_dsp.crossfeed_executable();
+        let dash_balance = dash_dsp_active && dash_dsp.reaffectation_executable();
         let dash_compensation = dash_dsp.compensation_cuite_db().filter(|_| dash_dsp_active);
         let flux = {
             let tmp_path_clone = tmp_path.clone();
@@ -2479,6 +2480,7 @@ impl PlaybackOrchestrator {
                         file_size: Some(file_size),
                         duration_ms: None,
                         crossfeed: dash_crossfeed,
+                        reaffectation: dash_balance,
                         compensation_db: dash_compensation,
                         ..Default::default()
                     };
@@ -2782,6 +2784,7 @@ impl PlaybackOrchestrator {
             // #5114 — chargé avant la session : le flux dit s'il cuit le crossfeed.
             let info = StreamInfo {
                 crossfeed: aac_dsp.is_active() && aac_dsp.crossfeed_executable(),
+                reaffectation: aac_dsp.reaffectation_executable(),
                 compensation_db: aac_dsp.compensation_cuite_db(),
                 ..info
             };
@@ -2910,6 +2913,7 @@ impl PlaybackOrchestrator {
             let https_dsp_active = https_dsp.is_active();
             // #5114 — lu avant que le porteur parte dans la tâche de décodage.
             let https_crossfeed = https_dsp_active && https_dsp.crossfeed_executable();
+            let https_balance = https_dsp_active && https_dsp.reaffectation_executable();
             let https_compensation = https_dsp
                 .compensation_cuite_db()
                 .filter(|_| https_dsp_active);
@@ -3164,6 +3168,7 @@ impl PlaybackOrchestrator {
                             file_size: Some(file_size),
                             duration_ms: None,
                             crossfeed: https_crossfeed,
+                            reaffectation: https_balance,
                             compensation_db: https_compensation,
                             ..Default::default()
                         };
@@ -3338,7 +3343,8 @@ impl PlaybackOrchestrator {
             dsp.replaygain.is_some() || dsp.eq.is_some() || dsp.convolver.is_some();
         let consenti = super::crossfeed_bibliotheque_reseau::wav_progressif_consenti(
             opt_in,
-            dsp.crossfeed.is_some(),
+            // #8740 — la balance seule vaut le même consentement.
+            dsp.crossfeed.is_some() || dsp.reaffectation.is_some(),
             autre_traitement,
         );
         let actif = dsp.is_active();

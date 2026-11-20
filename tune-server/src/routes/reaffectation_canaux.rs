@@ -12,9 +12,19 @@
 //!   (`album_{id}_channel_remap`, #5279), prioritaire sur celle de la zone.
 //!
 //! Les réponses d'une zone portent aussi `applies_to_output` (#8740) : `true`
-//! si sa sortie applique la matrice (sortie locale), `false` sinon (lecteur
-//! réseau : DLNA, Squeezebox, AirPlay, OAAT…), `null` si la zone n'a pas de
-//! sortie connue. Le réglage s'enregistre dans tous les cas.
+//! si sa sortie applique la matrice — une sortie locale, ou un lecteur réseau
+//! (DLNA, AirPlay, Chromecast, OAAT…) quand la règle est une matrice 2 → 2
+//! sans hausse de niveau, hors PURE et bit-perfect strict (rc14) ; `false`
+//! sinon, avec la raison dans `output_reason` ; `null` si la zone n'a pas de
+//! sortie connue. Sur un lecteur réseau, `requires_processed_pcm: true` : la
+//! balance ne s'entend que si Tune traite le PCM du flux (pas sur une piste
+//! servie telle quelle ni en DSD natif) ; le chemin du signal dit ce qu'il en
+//! est pour la piste en cours. Le réglage s'enregistre dans tous les cas.
+//!
+//! - `PUT /zones/{id}/balance` (#8740) : `{"balance": -100…100}`, écrit la
+//!   matrice 2 → 2 de la balance (le côté opposé seul est atténué :
+//!   `tune_core::audio::balance_reseau`). Chaque réponse de zone porte
+//!   `balance` quand la règle n'est qu'une balance, `null` sinon.
 //!
 //! Chaque réponse porte `effective` : ce que vaut la matrice (gains linéaires
 //! après normalisation, atténuation par sortie, recopie au bit près ou
@@ -44,6 +54,7 @@ pub fn router() -> Router<AppState> {
             "/zones/{id}",
             get(lire_zone).put(ecrire_zone).delete(effacer_zone),
         )
+        .route("/zones/{id}/balance", axum::routing::put(ecrire_balance))
         .route(
             "/albums/{id}",
             get(lire_album).put(ecrire_album).delete(effacer_album),
@@ -164,19 +175,48 @@ fn settings(state: &AppState) -> SettingsRepo {
 /// une zone DLNA (DrUPnP) ou Squeezebox (slim2diretta), l'écran annonçait
 /// « s'entendra à la prochaine lecture » pour un réglage qui ne s'entend
 /// jamais. `None` : zone inconnue ou sans sortie, rien à affirmer.
-fn s_applique_a_la_sortie(state: &AppState, zone_id: i64) -> Option<bool> {
+///
+/// #8740 (rc14) — un lecteur réseau l'applique désormais quand Tune traite le
+/// PCM du flux, si la règle est une matrice 2 → 2 sans hausse de niveau et
+/// que la zone n'est ni en PURE ni en bit-perfect strict
+/// (`balance_reseau::regle_reseau_with`). Rend aussi la raison d'un refus.
+fn s_applique_a_la_sortie(state: &AppState, zone_id: i64) -> (Option<bool>, Option<&'static str>) {
+    let sortie = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_device_id)
+        .filter(|id| !id.is_empty());
+    match sortie {
+        None => (None, None),
+        Some(id) if id.starts_with("local:") => (Some(true), None),
+        Some(_) => {
+            match tune_core::audio::balance_reseau::regle_reseau_with(&state.backend, zone_id) {
+                Ok(_) => (Some(true), None),
+                Err(refus) => (Some(false), Some(refus.code())),
+            }
+        }
+    }
+}
+fn sortie_reseau(state: &AppState, zone_id: i64) -> bool {
     tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
         .get(zone_id)
         .ok()
         .flatten()
         .and_then(|z| z.output_device_id)
-        .filter(|id| !id.is_empty())
-        .map(|id| id.starts_with("local:"))
+        .is_some_and(|id| !id.is_empty() && !id.starts_with("local:"))
 }
 fn forme_de_zone(state: &AppState, id: i64, reglage: Option<rc::ChannelRemapSettings>) -> Value {
+    let balance = reglage
+        .as_ref()
+        .and_then(tune_core::audio::balance_reseau::balance_du_reglage);
     let mut v = forme(&rc::cle_de_zone(id), reglage);
     v["zone_id"] = json!(id);
-    v["applies_to_output"] = json!(s_applique_a_la_sortie(state, id));
+    let (s_applique, raison) = s_applique_a_la_sortie(state, id);
+    v["applies_to_output"] = json!(s_applique);
+    v["output_reason"] = json!(raison);
+    v["requires_processed_pcm"] = json!(sortie_reseau(state, id));
+    v["balance"] = json!(balance);
     v
 }
 async fn lire_zone(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
@@ -214,6 +254,31 @@ async fn ecrire_zone(
     let mut v = forme_de_zone(&state, id, Some(reglage));
     v["applied_live"] = json!(a_chaud);
     Json(v).into_response()
+}
+
+/// #8740 — `PUT /zones/{id}/balance` : `{"balance": -100…100}`. Écrit la
+/// matrice 2 → 2 de la balance (`balance_reseau::reglage_de_balance`) à la
+/// place de la règle de la zone, puis répond comme `PUT /zones/{id}`.
+async fn ecrire_balance(
+    State(state): State<AppState>,
+    Path(id): Path<i64>,
+    headers: axum::http::HeaderMap,
+    Json(corps): Json<Value>,
+) -> Response {
+    use tune_core::audio::balance_reseau as br;
+    let b = match corps.get("balance").and_then(Value::as_i64) {
+        Some(b) if (-i64::from(br::BALANCE_MAX)..=i64::from(br::BALANCE_MAX)).contains(&b) => {
+            b as i32
+        }
+        _ => {
+            return refus(
+                "channel_remap_invalid_balance",
+                "balance : un entier de -100 à 100".into(),
+            );
+        }
+    };
+    let reglage = serde_json::to_value(br::reglage_de_balance(b)).unwrap_or_default();
+    ecrire_zone(State(state), Path(id), headers, Json(reglage)).await
 }
 
 async fn effacer_zone(State(state): State<AppState>, Path(id): Path<i64>) -> Response {
@@ -385,12 +450,14 @@ mod tests {
         assert!(!matrice_posee().await, "règle effacée : matrice retirée");
     }
 
-    /// #8740 — balance réglée sur une zone DLNA (DrUPnP) : la réponse dit
-    /// que la sortie n'applique pas la matrice, au lieu de laisser l'écran
-    /// annoncer « à la prochaine lecture ». Contre-épreuve : la même requête
-    /// sur une zone locale dit `true`, et une zone sans sortie ne dit rien.
+    /// #8740 (rc14) — balance réglée sur une zone DLNA (DrUPnP) : la sortie
+    /// réseau l'applique désormais quand Tune traite le PCM, et la réponse le
+    /// dit (`applies_to_output: true`, `requires_processed_pcm: true`).
+    /// Contre-épreuves : en PURE, en bit-perfect strict et pour une matrice
+    /// multicanale, `false` avec la raison ; une zone locale dit `true`, une
+    /// zone sans sortie ne dit rien.
     #[tokio::test]
-    async fn une_zone_reseau_dit_que_sa_sortie_n_applique_pas_la_matrice_8740() {
+    async fn une_zone_reseau_dit_si_sa_sortie_applique_la_balance_8740() {
         use tune_core::db::zone_repo::ZoneRepo;
         let state = AppState::new(":memory:", 0, Default::default()).expect("état");
         settings(&state)
@@ -404,41 +471,106 @@ mod tests {
             .create("Bureau", Some("local"), Some("local:DAC"))
             .unwrap();
         let sans_sortie = zones.create("Vide", None, None).unwrap();
-        // Balance : la droite baissée de 2 dB.
-        let balance = json!({"enabled": true, "inputs": 2, "outputs": 2,
-            "gains_db": [[0.0, null], [null, -2.0]]});
-        let ecrire = |zone: i64| {
+        async fn reponse(r: Response) -> Value {
+            assert_eq!(r.status(), StatusCode::OK);
+            let octets = axum::body::to_bytes(r.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            serde_json::from_slice::<Value>(&octets).unwrap()
+        }
+        let ecrire = |zone: i64, corps: Value| {
             let state = state.clone();
-            let balance = balance.clone();
             async move {
-                let r = ecrire_zone(
-                    State(state),
-                    Path(zone),
-                    axum::http::HeaderMap::new(),
-                    Json(balance),
+                reponse(
+                    ecrire_zone(
+                        State(state),
+                        Path(zone),
+                        axum::http::HeaderMap::new(),
+                        Json(corps),
+                    )
+                    .await,
                 )
-                .await;
-                assert_eq!(r.status(), StatusCode::OK);
-                let octets = axum::body::to_bytes(r.into_body(), usize::MAX)
-                    .await
-                    .unwrap();
-                serde_json::from_slice::<Value>(&octets).unwrap()
+                .await
             }
         };
-        let v = ecrire(dlna).await;
+        // Balance du testeur : la droite baissée de 2 dB.
+        let balance = json!({"enabled": true, "inputs": 2, "outputs": 2,
+            "gains_db": [[0.0, null], [null, -2.0]]});
+        let v = ecrire(dlna, balance.clone()).await;
         assert_eq!(v["saved"], true, "le réglage reste enregistré");
-        assert_eq!(v["applied_live"], false);
+        assert_eq!(v["applied_live"], false, "à la prochaine lecture");
         assert_eq!(
-            v["applies_to_output"], false,
-            "une sortie DLNA n'applique pas la réaffectation"
+            v["applies_to_output"], true,
+            "une sortie DLNA applique la balance quand Tune traite le PCM"
         );
+        assert_eq!(v["requires_processed_pcm"], true);
+        assert_eq!(v["balance"], -21);
+        assert!(v["output_reason"].is_null());
         let Json(lu) = lire_zone(State(state.clone()), Path(dlna)).await;
-        assert_eq!(lu["applies_to_output"], false);
-        // Contre-épreuve.
-        let v = ecrire(locale).await;
+        assert_eq!(lu["applies_to_output"], true);
+
+        // Contre-épreuve : PURE.
+        settings(&state)
+            .set(&format!("zone_{dlna}_audiophile"), r#"{"enabled":true}"#)
+            .unwrap();
+        let Json(lu) = lire_zone(State(state.clone()), Path(dlna)).await;
+        assert_eq!(lu["applies_to_output"], false, "jamais en PURE");
+        assert_eq!(lu["output_reason"], "pure_mode");
+        settings(&state)
+            .delete(&format!("zone_{dlna}_audiophile"))
+            .unwrap();
+        // Contre-épreuve : bit-perfect strict.
+        settings(&state)
+            .set(&format!("zone_{dlna}_strict_bitperfect"), "true")
+            .unwrap();
+        let Json(lu) = lire_zone(State(state.clone()), Path(dlna)).await;
+        assert_eq!(
+            lu["applies_to_output"], false,
+            "jamais en bit-perfect strict"
+        );
+        assert_eq!(lu["output_reason"], "bit_perfect_strict");
+        settings(&state)
+            .delete(&format!("zone_{dlna}_strict_bitperfect"))
+            .unwrap();
+        // Contre-épreuve : une matrice 4.0 → stéréo ne passe pas sur le flux.
+        let quad = serde_json::to_value(rc::prereglage("quad_to_stereo").unwrap()).unwrap();
+        let v = ecrire(dlna, quad).await;
+        assert_eq!(v["applies_to_output"], false);
+        assert_eq!(v["output_reason"], "network_stereo_only");
+        assert!(v["balance"].is_null(), "ce n'est pas une balance");
+
+        // Sortie locale : toujours `true`, sans exigence de PCM traité.
+        let v = ecrire(locale, balance).await;
         assert_eq!(v["applies_to_output"], true);
+        assert_eq!(v["requires_processed_pcm"], false);
         let Json(lu) = lire_zone(State(state.clone()), Path(sans_sortie)).await;
         assert!(lu["applies_to_output"].is_null(), "{lu}");
+
+        // `PUT /zones/{id}/balance` écrit la matrice de la loi choisie.
+        let v = reponse(
+            ecrire_balance(
+                State(state.clone()),
+                Path(dlna),
+                axum::http::HeaderMap::new(),
+                Json(json!({"balance": 100})),
+            )
+            .await,
+        )
+        .await;
+        assert_eq!(v["balance"], 100);
+        assert_eq!(v["applies_to_output"], true);
+        assert_eq!(
+            v["settings"]["gains_db"],
+            json!([[null, null], [null, 0.0]])
+        );
+        let refus = ecrire_balance(
+            State(state.clone()),
+            Path(dlna),
+            axum::http::HeaderMap::new(),
+            Json(json!({"balance": 101})),
+        )
+        .await;
+        assert_eq!(refus.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]
