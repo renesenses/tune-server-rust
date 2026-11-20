@@ -88,7 +88,10 @@ async fn volume_rendu_au_desourdinage(sortie: &AirplayOutput) -> String {
 async fn une_sortie_neuve_desourdinee_ne_repart_pas_a_zero_db_8855() {
     let sortie = sortie();
     let rendu = volume_rendu_au_desourdinage(&sortie).await;
-    let attendu = format!("volume: {:.1}", linear_to_airplay_db(VOLUME_DE_DEPART_PRUDENT));
+    let attendu = format!(
+        "volume: {:.1}",
+        linear_to_airplay_db(VOLUME_DE_DEPART_PRUDENT)
+    );
     assert!(
         rendu.contains(&attendu),
         "le dé-sourdinage doit rendre le niveau prudent ({attendu}) : {rendu}"

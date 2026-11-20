@@ -277,7 +277,9 @@ impl AirplayOutput {
             // #8855 — jamais la pleine échelle : `set_mute(false)` renvoie ce
             // niveau au récepteur. La découverte le sème ensuite du volume
             // mémorisé de la zone (`ensemencer_depuis_la_base`).
-            volume: Arc::new(Mutex::new(super::airplay2::volume_de_depart_8402::VOLUME_DE_DEPART_PRUDENT)),
+            volume: Arc::new(Mutex::new(
+                super::airplay2::volume_de_depart_8402::VOLUME_DE_DEPART_PRUDENT,
+            )),
             volume_en_attente: Arc::new(Mutex::new(None)),
             muted: Arc::new(AtomicBool::new(false)),
             current_title: Arc::new(Mutex::new(None)),
