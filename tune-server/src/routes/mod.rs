@@ -489,6 +489,8 @@ pub fn router_with_plugins(
             get(zones::list_zones_handler).post(zones::create_zone_handler),
         )
         .nest("/zones", zones_and_playback)
+        // TESS T08 — le catalogue ; 404 = serveur sans TESS (écran caché).
+        .route("/tess/catalog", get(zones::tess::catalogue_tess_route))
         .nest("/playlists", playlists::router())
         .nest("/radios", radios::router())
         .nest("/radio-favorites", radios::radio_favorites_router())
