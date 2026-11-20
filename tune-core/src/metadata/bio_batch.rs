@@ -363,8 +363,13 @@ async fn fetch_album_bio_lastfm(
 }
 
 fn strip_html(s: &str) -> String {
-    let re = regex::Regex::new(r"<[^>]+>").unwrap();
-    re.replace_all(s, "").trim().to_string()
+    // Last.fm sépare aussi les paragraphes par des sauts de ligne bruts.
+    // Les protéger avant le convertisseur HTML, qui replie les lignes source.
+    let html = s
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', "<br>");
+    crate::streaming::presentation_album::texte_de_presentation(&html).unwrap_or_default()
 }
 
 /// Les noms sous lesquels la clé Last.fm peut avoir été posée dans
@@ -1102,5 +1107,74 @@ mod tests_bio_lastfm {
             bio_lastfm_depuis_json(&json!({}), "/artist/bio/content", "/artist/url", "en")
                 .is_none()
         );
+    }
+}
+
+#[cfg(test)]
+mod entites_lastfm_8735_tests {
+    #[test]
+    fn paragraphes_lastfm_preserves_8735() {
+        for brut in [
+            "Para 1.\n\nPara 2 &amp; fin",
+            "Para 1.\r\n\r\nPara 2 &amp; fin",
+        ] {
+            assert_eq!(
+                super::strip_html(brut),
+                "Para 1.\n\nPara 2 & fin",
+                "les deux paragraphes Last.fm doivent rester distincts"
+            );
+        }
+    }
+
+    use super::bio_lastfm_depuis_json;
+    use crate::db::{artist_repo::ArtistRepo, sqlite::SqliteDb};
+    use serde_json::json;
+
+    const BRUT: &str = "<p>Simon &amp; Garfunkel &eacute;crivent une biographie suffisamment longue : &#233; &#xE9; &amp sans point ; &amp;amp; &inconnue;.</p>";
+    const ATTENDU: &str = "Simon & Garfunkel écrivent une biographie suffisamment longue : é é & sans point ; &amp; &inconnue;.";
+
+    #[test]
+    fn bio_artiste_enregistree_decodee_8735() {
+        let data =
+            json!({"artist":{"bio":{"content":BRUT},"url":"https://www.last.fm/music/temoin"}});
+        let bio =
+            bio_lastfm_depuis_json(&data, "/artist/bio/content", "/artist/url", "en").unwrap();
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        let repo = ArtistRepo::new(db);
+        let id = repo
+            .get_or_create("Témoin Last.fm", None, None)
+            .unwrap()
+            .id
+            .unwrap();
+        repo.update_bio_full(
+            id,
+            &bio.text,
+            &bio.source,
+            bio.source_url,
+            &bio.license,
+            &bio.lang,
+        )
+        .unwrap();
+        let relue = repo.get(id).unwrap().unwrap();
+        assert_eq!(
+            relue.bio.as_deref(),
+            Some(ATTENDU),
+            "entités Last.fm encore présentes après enregistrement"
+        );
+        let provenance = repo.bio_provenance(id).unwrap().unwrap();
+        assert_eq!(provenance["source"], "lastfm");
+    }
+
+    #[test]
+    fn bio_album_decodee_8735() {
+        let data = json!({"album":{"wiki":{"content":BRUT},"url":"https://www.last.fm/music/temoin/album"}});
+        let bio = bio_lastfm_depuis_json(&data, "/album/wiki/content", "/album/url", "fr").unwrap();
+        assert_eq!(
+            bio.text, ATTENDU,
+            "entités Last.fm encore présentes dans la bio album"
+        );
+        assert_eq!(bio.lang, "fr");
+        assert_eq!(bio.license, "CC-BY-SA-3.0");
     }
 }

@@ -361,8 +361,50 @@
     return { genre, data };
   }
 
+  // ── Raccourcis clavier DANS l'app (#9255) ────────────────────────────────
+  // Les raccourcis à ⌘ sont des équivalents de la barre des menus (côté
+  // natif, `raccourcis.rs`). L'espace ne peut pas en être un — il taperait
+  // dans les champs : c'est la page qui la traite, comme le client web
+  // (`keyboard.ts`).
+
+  /** Éléments où l'espace garde son sens : taper, cocher, presser. */
+  const CIBLES_DE_SAISIE = ['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON'];
+
+  /**
+   * L'action d'une touche pressée hors de la barre des menus, ou `null`.
+   * `e` : un `KeyboardEvent` (ou ses champs) ; `balise` : `e.target.tagName`.
+   */
+  function actionDuClavier(e, balise) {
+    if (!e || e.defaultPrevented) return null;
+    if (CIBLES_DE_SAISIE.includes(String(balise || '').toUpperCase())) return null;
+    if (e.metaKey || e.ctrlKey || e.altKey || e.shiftKey) return null;
+    if (e.code === 'Space' || e.key === ' ') return 'lecture-pause';
+    return null;
+  }
+
+  // ── Serveurs du réseau (#9255) ───────────────────────────────────────────
+
+  /**
+   * Ce qu'une ligne de la liste affiche d'un serveur trouvé
+   * (`decouverte::ServeurTrouve` : nom, url, hote, version, cle).
+   */
+  function ligneDeServeur(s) {
+    const adresse = String((s && s.url) || '').replace(/^https?:\/\//i, '');
+    const nom = (s && String(s.nom || '').trim()) || adresse;
+    const detail = [adresse, s && s.version ? `v${s.version}` : ''].filter(Boolean).join(' · ');
+    return { nom, detail };
+  }
+
+  /** Ce serveur est-il celui auquel l'app parle ? */
+  function estServeurActuel(s, actuel) {
+    return !!s && normaliserServeur(s.url) === normaliserServeur(actuel);
+  }
+
   return {
     SERVEUR_PAR_DEFAUT,
+    actionDuClavier,
+    ligneDeServeur,
+    estServeurActuel,
     normaliserServeur,
     urlDePochette,
     PAR_CATEGORIE,

@@ -203,7 +203,7 @@ jobs:
             ext: zip
 
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 75  # Build ${{ matrix.target }} — 26 min au pire, macOS x86_64
+    timeout-minutes: 120  # Build ${{ matrix.target }} — macOS x86_64 : ~90 min le 16/11 (compilation 55 min + librespot + DMG + notarisation), coupé deux fois à 75
     env:
       ARTIFACT: tune-server-${{ github.ref_name }}-${{ matrix.platform }}
       # Exposé au niveau du job pour être lisible depuis un `if:` d'étape : le
@@ -1705,8 +1705,9 @@ jobs:
   # signee et notarisee, `widget.yml`, qu'on appelle telle quelle plutot que
   # de la recopier ici — deux recettes divergeraient au premier correctif.
   #
-  # Ses artefacts (`tune-widget-<tag>-macos-*.dmg`,
-  # `tune-widget-<tag>-windows-x86_64-setup.exe`) sont ramasses par le job
+  # Ses artefacts (`tune-client-<tag>-macos-*.dmg`,
+  # `tune-client-<tag>-windows-x86_64-setup.exe` ; `tune-widget-…` jusqu'a la
+  # rc12, #9255) sont ramasses par le job
   # `release` avec les autres `*.dmg` / `*.exe`, et entrent donc dans
   # SHA256SUMS et sa signature minisign. Leur prefixe les tient hors de la
   # liste blanche `tune-server-` du client de mise a jour

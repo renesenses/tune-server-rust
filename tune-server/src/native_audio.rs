@@ -355,9 +355,9 @@ pub(crate) async fn install_package(
     }
     Ok(package)
 }
-/// Le droit qui ouvre un emplacement. Le droit gratuit (`DspEq`) n'appartient
-/// qu'à l'égaliseur, nommément ; tout autre identifiant, greffon natif tiers
-/// compris, exige le Premium.
+/// Le droit qui ouvre un emplacement. Égaliseur, canaux et crossfeed simple
+/// sont gratuits ; les autres identifiants, dont Crossfeed Pro et les
+/// greffons natifs tiers, exigent le Premium.
 pub(crate) fn feature(id: &str) -> tune_core::license::Feature {
     match id {
         "equalizer" | "channel-remap" => tune_core::license::Feature::DspEq,
@@ -653,6 +653,33 @@ mod cle_de_mozaiklabs_5149 {
 #[cfg(test)]
 #[path = "native_audio_desinstallation_6256_tests.rs"]
 mod desinstallation_6256_tests;
+
+#[cfg(test)]
+mod crossfeed_gratuit_9210_tests {
+    #[tokio::test]
+    async fn simple_autorise_pro_refuse_en_free() {
+        use tune_core::license::Feature;
+        crate::premium_audio_plugins::tests::dossier_de_donnees_jetable();
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        assert_eq!(super::feature("crossfeed-pro"), Feature::PluginMarketplace);
+        let refusal =
+            crate::premium_guard::require_premium(&state.license, super::feature("crossfeed-pro"))
+                .await
+                .unwrap_err();
+        assert_eq!(refusal.status(), axum::http::StatusCode::PAYMENT_REQUIRED);
+        assert!(
+            crate::premium_guard::require_premium(&state.license, super::feature("crossfeed"))
+                .await
+                .is_ok()
+        );
+        state.license.set_account_premium(true, None).await;
+        assert!(
+            crate::premium_guard::require_premium(&state.license, super::feature("crossfeed-pro"))
+                .await
+                .is_ok()
+        );
+    }
+}
 
 #[cfg(test)]
 #[path = "native_audio_etat_9151_tests.rs"]

@@ -458,12 +458,16 @@ INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Ja
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Groove', 'https://icecast.radiofrance.fr/fipgroove-hifi.aac', 'Groove', 'France');
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Pop', 'https://icecast.radiofrance.fr/fippop-hifi.aac', 'Pop', 'France');
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Electro', 'https://icecast.radiofrance.fr/fipelectro-hifi.aac', 'Électronique', 'France');
-INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Monde', 'https://icecast.radiofrance.fr/fipworld-hifi.aac', 'Monde', 'France');
-INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Reggae', 'https://icecast.radiofrance.fr/fipreggae-hifi.aac', 'Reggae', 'France');
-INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Nouveautés', 'https://icecast.radiofrance.fr/fipnouveautes-hifi.aac', 'Éclectique', 'France');
+INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Monde', 'https://icecast.radiofrance.fr/fipworld-hifi.aac?id=radiofrance', 'Monde', 'France');
+INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Reggae', 'https://icecast.radiofrance.fr/fipreggae-hifi.aac?id=radiofrance', 'Reggae', 'France');
+INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Nouveautés', 'https://icecast.radiofrance.fr/fipnouveautes-hifi.aac?id=radiofrance', 'Éclectique', 'France');
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Metal', 'https://icecast.radiofrance.fr/fipmetal-hifi.aac', 'Metal', 'France');
 INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Hip-Hop', 'https://icecast.radiofrance.fr/fiphiphop-hifi.aac', 'Hip-Hop', 'France');
-INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Sacré français', 'https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac', 'Chanson française', 'France');
+INSERT OR IGNORE INTO radio_stations (name, url, genre, country) VALUES ('FIP Sacré français', 'https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac?id=radiofrance', 'Chanson française', 'France');
+-- FIP Monde, FIP Reggae, FIP Nouveautés et FIP Sacré français : l'adresse publiée par leur fiche
+-- de l'annuaire (`?id=radiofrance`), sans quoi le rattrapage des logos ne les
+-- rapproche jamais (fil forum 2862). La migration 157 corrige les bases déjà
+-- semées avec l'adresse nue.
 -- 'FIP Latino' (fiplatino) and 'FIP Tout nouveau' (fiptoutnouveautoutchaud) used
 -- to be seeded here and are deliberately gone: Radio France no longer serves
 -- either slug. Both answer 404 while every other FIP webradio above answers 200
@@ -2968,6 +2972,37 @@ CREATE TABLE IF NOT EXISTS imported_plays (
         version: 156,
         name: "queue_items_format_streaming",
         up: "",
+    },
+    // Fil forum 2862 (Lio, rc12) — « FIP Monde » et « FIP Nouveautés » restent
+    // sans logo (icône générique), dans le client web comme sur iOS. Ces deux
+    // stations, « FIP Reggae » et « FIP Sacré français » viennent du semis
+    // `seed_default_radios` (33), qui écrivait l'adresse nue `…-hifi.aac`.
+    // Leur fiche de l'annuaire (S000980, S000981, S000983, S000985) publie
+    // `…-hifi.aac?id=radiofrance` (S000985 garde l'adresse nue, mais NON
+    // publiée) : le rattrapage des logos (`refresh_radio_logos`) rapproche par
+    // l'adresse publiée EXACTE, requête comprise (`flux_normalise`), ne les lie
+    // donc jamais à leur fiche, et aucun logo n'est posé. Les huit autres FIP
+    // semées ont une adresse publiée par leur fiche, et leur logo.
+    //
+    // Correctif : le semis (33) pose désormais l'adresse de la fiche, et ici
+    // les bases déjà semées : ces quatre stations prennent l'adresse publiée
+    // par leur fiche (même flux Radio France, 200 audio/aac relevé le
+    // 20/11/2026). Au relevé suivant de l'annuaire, elles sont liées par
+    // l'adresse et reçoivent le logo de la fiche, qu'elles suivront ensuite.
+    //
+    // Ciblé sur l'URL et jamais sur le nom, comme les 70, 78 et 86 : une
+    // station que l'utilisateur a repointée ailleurs n'est pas touchée.
+    // Idempotent. Sans jumelle PG : le semis des radios n'existe qu'en
+    // SQLite, comme les 70, 78 et 86.
+    Migration {
+        version: 157,
+        name: "semis_fip_adresses_de_l_annuaire",
+        up: "
+UPDATE radio_stations SET url = 'https://icecast.radiofrance.fr/fipworld-hifi.aac?id=radiofrance' WHERE url = 'https://icecast.radiofrance.fr/fipworld-hifi.aac';
+UPDATE radio_stations SET url = 'https://icecast.radiofrance.fr/fipnouveautes-hifi.aac?id=radiofrance' WHERE url = 'https://icecast.radiofrance.fr/fipnouveautes-hifi.aac';
+UPDATE radio_stations SET url = 'https://icecast.radiofrance.fr/fipreggae-hifi.aac?id=radiofrance' WHERE url = 'https://icecast.radiofrance.fr/fipreggae-hifi.aac';
+UPDATE radio_stations SET url = 'https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac?id=radiofrance' WHERE url = 'https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac';
+",
     },
 ];
 
@@ -7855,6 +7890,83 @@ mod tests {
             MIGRATIONS.iter().any(|m| m.name == nom),
             "la migration SQLite du semis a disparu ou changé de nom"
         );
+    }
+
+    /// Fil forum 2862 : FIP Monde, FIP Nouveautés et FIP Reggae étaient semées
+    /// sous une adresse que leur fiche de l'annuaire ne publie pas, et
+    /// restaient sans logo. Après la migration 157, aucune base (neuve ou
+    /// ancienne) ne garde l'adresse nue, et une station repointée ailleurs par
+    /// l'utilisateur n'est pas touchée.
+    #[test]
+    fn semis_fip_adresses_de_l_annuaire_2862() {
+        const NUES: [(&str, &str); 4] = [
+            (
+                "https://icecast.radiofrance.fr/fipworld-hifi.aac",
+                "https://icecast.radiofrance.fr/fipworld-hifi.aac?id=radiofrance",
+            ),
+            (
+                "https://icecast.radiofrance.fr/fipnouveautes-hifi.aac",
+                "https://icecast.radiofrance.fr/fipnouveautes-hifi.aac?id=radiofrance",
+            ),
+            (
+                "https://icecast.radiofrance.fr/fipreggae-hifi.aac",
+                "https://icecast.radiofrance.fr/fipreggae-hifi.aac?id=radiofrance",
+            ),
+            (
+                "https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac",
+                "https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac?id=radiofrance",
+            ),
+        ];
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        run_migrations(&db).unwrap();
+
+        let compte = |url: &str| {
+            let conn = db.connection().lock().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM radio_stations WHERE url = ?1",
+                [url],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+
+        // Base neuve : le semis puis la 157.
+        for (nue, publiee) in NUES {
+            assert_eq!(compte(nue), 0, "{nue} encore semée sur une base neuve");
+            assert_eq!(compte(publiee), 1, "{publiee} absente d'une base neuve");
+        }
+
+        // Base ancienne : les adresses nues de l'ancien semis, plus une station
+        // de l'utilisateur sur un autre flux, puis la 157 rejouée deux fois.
+        {
+            let conn = db.connection().lock().unwrap();
+            conn.execute(
+                "DELETE FROM radio_stations WHERE url LIKE '%?id=radiofrance'",
+                [],
+            )
+            .unwrap();
+            for (nue, _) in NUES {
+                conn.execute(
+                    "INSERT INTO radio_stations (name, url, genre, country) VALUES ('x', ?1, 'g', 'France')",
+                    [nue],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO radio_stations (name, url, genre, country) VALUES ('FIP Monde', 'https://mon-relais.example/fipworld.mp3', 'g', 'France')",
+                [],
+            )
+            .unwrap();
+            let m = MIGRATIONS.iter().find(|m| m.version == 157).unwrap();
+            conn.execute_batch(m.up).unwrap();
+            conn.execute_batch(m.up).unwrap();
+        }
+        for (nue, publiee) in NUES {
+            assert_eq!(compte(nue), 0, "{nue} non corrigée");
+            assert_eq!(compte(publiee), 1, "{publiee} absente après correction");
+        }
+        assert_eq!(compte("https://mon-relais.example/fipworld.mp3"), 1);
     }
 
     /// Le semis ne doit rien planter qu'une migration ultérieure arrache.

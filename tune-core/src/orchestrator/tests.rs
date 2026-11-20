@@ -9575,7 +9575,7 @@ async fn premium_sdk_free_equalizer_reaches_pcm_and_pure_still_bypasses() {
 }
 
 #[tokio::test]
-async fn audio_offer_crossfeed_hard_cut_preserves_settings_for_premium_reactivation() {
+async fn audio_offer_crossfeed_gratuit_preserves_settings_across_tiers() {
     let mut orch = test_orchestrator();
     let license = Arc::new(crate::license::LicenseManager::new_with_limit(
         orch.db.clone(),
@@ -9586,11 +9586,11 @@ async fn audio_offer_crossfeed_hard_cut_preserves_settings_for_premium_reactivat
     let saved = r#"{"enabled":true,"amount":0.37,"delay_ms":0.65}"#;
     settings.set("zone_1_crossfeed", saved).unwrap();
     crate::audio::premium_plugins::migrate_for_account(&settings, false).unwrap();
-    assert!(orch.load_crossfeed_processor(1, 48000).is_none());
-    // Even installed/enabled flags cannot grant Free accounts the processor.
+    assert!(orch.load_crossfeed_processor(1, 48000).is_some());
+    // Le compte Free a accès au même processeur.
     settings.set("plugin_crossfeed_installed", "true").unwrap();
     settings.set("plugin_crossfeed_enabled", "true").unwrap();
-    assert!(orch.load_crossfeed_processor(1, 48000).is_none());
+    assert!(orch.load_crossfeed_processor(1, 48000).is_some());
     license.set_account_premium(true, None).await;
     let mut processor = orch
         .load_crossfeed_processor(1, 48000)
@@ -9603,8 +9603,8 @@ async fn audio_offer_crossfeed_hard_cut_preserves_settings_for_premium_reactivat
     assert_ne!(pcm, before, "reactivated crossfeed must reach PCM");
     license.set_account_premium(false, None).await;
     assert!(
-        orch.load_crossfeed_processor(1, 48000).is_none(),
-        "downgrade must cut immediately"
+        orch.load_crossfeed_processor(1, 48000).is_some(),
+        "le retour en Free conserve le crossfeed simple"
     );
     assert_eq!(
         settings.get("zone_1_crossfeed").unwrap().as_deref(),
@@ -12270,6 +12270,119 @@ async fn une_source_directe_http_reste_jouable() {
 }
 
 #[tokio::test]
+async fn crossfeed_gratuit_9210_traite_en_free_et_respecte_les_choix() {
+    let mut orch = test_orchestrator();
+    let license = Arc::new(crate::license::LicenseManager::new_with_limit(
+        orch.db.clone(),
+        3,
+    ));
+    orch.license = Some(license.clone());
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(crate::audio::premium_plugins::MIGRATION, "complete")
+        .unwrap();
+    settings.set("plugin_crossfeed_installed", "true").unwrap();
+    settings.set("plugin_crossfeed_enabled", "true").unwrap();
+    let saved = r#"{"enabled":true,"amount":0.37,"delay_ms":0.65}"#;
+    settings.set("zone_1_crossfeed", saved).unwrap();
+    assert!(!license.is_premium().await);
+    let mut processor = orch
+        .load_crossfeed_processor(1, 48000)
+        .expect("crossfeed simple gratuit");
+    let mut pcm = vec![0.0; 4096];
+    pcm[0] = 1.0;
+    let before = pcm.clone();
+    processor.process_interleaved(&mut pcm);
+    assert_ne!(pcm, before, "le DSP gratuit doit traiter les échantillons");
+    settings
+        .set("zone_1_audiophile", r#"{"enabled":true}"#)
+        .unwrap();
+    assert!(
+        orch.load_crossfeed_processor(1, 48000).is_none(),
+        "PURE reste prioritaire"
+    );
+    settings
+        .set("zone_1_audiophile", r#"{"enabled":false}"#)
+        .unwrap();
+    settings.set("plugin_crossfeed_enabled", "false").unwrap();
+    assert!(orch.load_crossfeed_processor(1, 48000).is_none());
+    settings.set("plugin_crossfeed_enabled", "true").unwrap();
+    settings.set("plugin_crossfeed_installed", "false").unwrap();
+    crate::audio::premium_plugins::migrate_for_account(&settings, false).unwrap();
+    assert!(
+        orch.load_crossfeed_processor(1, 48000).is_none(),
+        "ne pas réinstaller un greffon retiré"
+    );
+    assert_eq!(
+        settings.get("zone_1_crossfeed").unwrap().as_deref(),
+        Some(saved)
+    );
+}
+
+#[tokio::test]
+async fn crossfeed_gratuit_9210_droit_annonce_et_greffons_tiers_payants() {
+    let orch = test_orchestrator();
+    let license = crate::license::LicenseManager::new_with_limit(orch.db.clone(), 3);
+    assert!(
+        license
+            .check_feature(crate::license::Feature::Crossfeed)
+            .await
+    );
+    assert!(!crate::license::Feature::all_premium().contains(&crate::license::Feature::Crossfeed));
+    assert!(
+        crate::license::Feature::all_advertised().any(|f| f == crate::license::Feature::Crossfeed)
+    );
+    assert!(
+        !license
+            .check_feature(crate::license::Feature::PluginMarketplace)
+            .await
+    );
+    assert!(!crate::audio::premium_plugins::requires_premium(
+        "crossfeed"
+    ));
+}
+
+#[tokio::test]
+async fn crossfeed_gratuit_9210_ancienne_retenue_et_desinstallation_preservees() {
+    let orch = test_orchestrator();
+    let license = crate::license::LicenseManager::new_with_limit(orch.db.clone(), 3);
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(crate::audio::premium_plugins::MIGRATION, "complete")
+        .unwrap();
+    settings.set("plugin_crossfeed_installed", "false").unwrap();
+    settings.set("plugin_crossfeed_enabled", "false").unwrap();
+    settings
+        .set(
+            "premium_audio_plugins_withheld_crossfeed",
+            "installed,enabled",
+        )
+        .unwrap();
+    crate::audio::premium_plugins::migrate_for_account(&settings, false).unwrap();
+    assert!(!crate::audio::premium_plugins::enabled(
+        &settings,
+        "crossfeed"
+    ));
+    // Comme une installation/désinstallation explicite depuis le catalogue.
+    crate::audio::premium_plugins::forget_withheld(&settings, "crossfeed").unwrap();
+    assert!(
+        settings
+            .get("premium_audio_plugins_withheld_crossfeed")
+            .unwrap()
+            .is_none()
+    );
+    license.set_account_premium(true, None).await;
+    assert!(!crate::audio::premium_plugins::installed(
+        &settings,
+        "crossfeed"
+    ));
+    assert!(!crate::audio::premium_plugins::enabled(
+        &settings,
+        "crossfeed"
+    ));
+}
+
+#[tokio::test]
 async fn le_format_upnp_suit_lecture_preparation_et_avance_de_file_8788() {
     use crate::db::play_queue_repo::{PlayQueueRepo, QueueInput};
     let orch = test_orchestrator();
@@ -12328,25 +12441,159 @@ async fn le_format_upnp_suit_lecture_preparation_et_avance_de_file_8788() {
     assert_eq!(seconde.bit_depth, Some(24));
 }
 
-/// Relecture rc13 — la licence et le greffon tiennent AUSSI le relais WAV
-/// progressif d'OAAT et du navigateur, pas seulement l'écran
-/// (`crossfeed_status_de_zone` / `avec_les_droits`).
+/// #9178 — le statut du crossfeed d'une zone OAAT ou navigateur ne la
+/// verrouille plus (`CrossfeedConstraint::NonLocalPartial`). La preuve, sur la
+/// DÉCISION réelle : ces sorties reçoivent le WAV progressif dont le relais
+/// porte le crossfeed. `armer` pose le seul crossfeed (et l'égaliseur si
+/// demandé) sur la zone.
+fn armer_crossfeed_9178(orch: &PlaybackOrchestrator, zone_id: i64, egaliseur: bool) {
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(
+            &format!("zone_{zone_id}_crossfeed"),
+            r#"{"enabled":true,"amount":0.3,"delay_ms":0.3}"#,
+        )
+        .unwrap();
+    if egaliseur {
+        settings
+            .set(
+                &format!("zone_{zone_id}_eq_profile"),
+                &serde_json::to_string(&radio_test_eq_profile()).unwrap(),
+            )
+            .unwrap();
+        settings.set("plugin_equalizer_installed", "true").unwrap();
+    }
+    assert!(
+        orch.zone_has_active_crossfeed(zone_id),
+        "montage sans crossfeed"
+    );
+}
+
+/// OAAT, crossfeed SEUL, FLAC de la bibliothèque : WAV progressif, relais
+/// armé, crossfeed exécuté.
+#[tokio::test]
+async fn oaat_porte_le_crossfeed_seul_9178() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Bureau", Some("oaat"), Some("oaat:bureau-9178"))
+        .unwrap();
+    piste_3234(
+        &orch,
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+        "flac",
+    );
+    armer_crossfeed_9178(&orch, zone_id, false);
+    let mut req = requete_locale_3234(zone_id, 1);
+    req.output_device_id = Some("oaat:bureau-9178".into());
+    let format = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(format.out_mime, "audio/wav");
+    assert!(!format.use_file_transcode, "OAAT part en session");
+    assert!(
+        orch.transcodage_decide_pour_test(&req).await.unwrap(),
+        "la piste doit passer par le relais, pas être servie telle quelle"
+    );
+    let (actif, relais, crossfeed) = orch.relais_dsp_pour_test(&req).await.unwrap();
+    assert!(
+        actif && relais && crossfeed,
+        "#9178 : OAAT doit recevoir le crossfeed par le relais ({actif}, {relais}, {crossfeed})"
+    );
+}
+
+/// Navigateur, FLAC + égaliseur + crossfeed : WAV progressif, le relais porte
+/// aussi le crossfeed.
+#[tokio::test]
+async fn navigateur_avec_un_autre_traitement_porte_le_crossfeed_9178() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Onglet", Some("browser"), Some("browser:onglet-9178"))
+        .unwrap();
+    piste_3234(
+        &orch,
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+        "flac",
+    );
+    armer_crossfeed_9178(&orch, zone_id, true);
+    let req = requete_locale_3234(zone_id, 1);
+    let format = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(format.out_mime, "audio/wav");
+    assert!(!format.use_file_transcode);
+    assert!(
+        orch.transcodage_decide_pour_test(&req).await.unwrap(),
+        "la piste doit passer par le relais, pas être servie telle quelle"
+    );
+    let (actif, relais, crossfeed) = orch.relais_dsp_pour_test(&req).await.unwrap();
+    assert!(
+        actif && relais && crossfeed,
+        "({actif}, {relais}, {crossfeed})"
+    );
+}
+
+/// Navigateur, AIFF (que `<audio>` ne lit pas) et crossfeed SEUL : converti
+/// en WAV, donc porté.
+#[tokio::test]
+async fn navigateur_aiff_porte_le_crossfeed_seul_9178() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Onglet", Some("browser"), Some("browser:onglet-aiff-9178"))
+        .unwrap();
+    piste_3234(
+        &orch,
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.aiff"),
+        "aiff",
+    );
+    armer_crossfeed_9178(&orch, zone_id, false);
+    let req = requete_locale_3234(zone_id, 1);
+    assert!(
+        orch.transcodage_decide_pour_test(&req).await.unwrap(),
+        "la piste doit passer par le relais, pas être servie telle quelle"
+    );
+    let (actif, relais, crossfeed) = orch.relais_dsp_pour_test(&req).await.unwrap();
+    assert!(
+        actif && relais && crossfeed,
+        "({actif}, {relais}, {crossfeed})"
+    );
+}
+
+/// La réserve, mesurée : navigateur, FLAC et crossfeed SEUL, la piste part
+/// telle quelle (aucune conversion), donc sans crossfeed. C'est pourquoi le
+/// motif est PARTIEL et non absent.
+#[tokio::test]
+async fn navigateur_flac_avec_le_crossfeed_seul_part_tel_quel_9178() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Onglet", Some("browser"), Some("browser:onglet-flac-9178"))
+        .unwrap();
+    piste_3234(
+        &orch,
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+        "flac",
+    );
+    armer_crossfeed_9178(&orch, zone_id, false);
+    let req = requete_locale_3234(zone_id, 1);
+    assert!(
+        !orch.transcodage_decide_pour_test(&req).await.unwrap(),
+        "un FLAC sans autre traitement est servi tel quel au navigateur"
+    );
+}
+
+/// Relecture rc13 — sur le relais WAV progressif d'OAAT et du navigateur, le
+/// crossfeed suit les MÊMES droits que l'écran : depuis #9210, le crossfeed
+/// simple est gratuit (aucune garde de licence), mais le greffon `crossfeed`
+/// reste la condition (`premium_plugins::enabled`, lu par
+/// `crossfeed_configure_with`). Les tests #9178 ci-dessus tournent sans
+/// gestionnaire de licence et avec le greffon présent ; celui-ci mesure la
+/// décision réelle (`relais_dsp_pour_test`) avec une VRAIE licence gratuite,
+/// puis greffon retiré, puis Premium.
 ///
-/// La décision du traitement se prend en UN point, `load_crossfeed_processor`
-/// → `crossfeed_configure` → `crossfeed_configure_sous_licence`, qui lit la
-/// même licence (palier effectif) et le même `premium_plugins::enabled` que la
-/// route. Ce test mesure la décision réelle (`relais_dsp_pour_test`) sur les
-/// deux sorties que #9178 déverrouille à l'écran.
-///
-/// Un égaliseur (gratuit) est posé pour que le relais soit armé dans les trois
+/// L'égaliseur (gratuit) est armé pour que le relais tourne dans les trois
 /// cas : sans lui, « pas de crossfeed » ne se distinguerait pas de « pas de
 /// relais » (le FLAC partirait tel quel vers le navigateur). Seul le crossfeed
-/// doit varier avec les droits.
+/// doit varier.
 #[tokio::test]
-async fn relais_oaat_et_navigateur_crossfeed_sous_licence_et_greffon() {
+async fn relais_oaat_et_navigateur_crossfeed_gratuit_mais_sous_greffon() {
     for (type_de_sortie, peripherique) in [
-        ("oaat", "oaat:salon-licence"),
-        ("browser", "browser:salon-licence"),
+        ("oaat", "oaat:salon-greffon"),
+        ("browser", "browser:salon-greffon"),
     ] {
         let mut orch = test_orchestrator();
         let zone_id = ZoneRepo::with_backend(orch.db.clone())
@@ -12362,25 +12609,13 @@ async fn relais_oaat_et_navigateur_crossfeed_sous_licence_et_greffon() {
         settings
             .set(crate::audio::premium_plugins::MIGRATION, "complete")
             .unwrap();
-        settings.set("plugin_equalizer_installed", "true").unwrap();
-        settings
-            .set(
-                &format!("zone_{zone_id}_eq_profile"),
-                &serde_json::to_string(&radio_test_eq_profile()).unwrap(),
-            )
-            .unwrap();
-        settings
-            .set(
-                &format!("zone_{zone_id}_crossfeed"),
-                r#"{"enabled":true,"amount":0.3,"delay_ms":0.3}"#,
-            )
-            .unwrap();
         settings.set("plugin_crossfeed_installed", "true").unwrap();
+        armer_crossfeed_9178(&orch, zone_id, true);
         let mut req = requete_locale_3234(zone_id, 1);
         req.output_device_id = Some(peripherique.into());
 
-        // 1. Palier gratuit, greffon installé : le relais tourne (égaliseur),
-        //    SANS crossfeed.
+        // 1. Palier gratuit, greffon installé : le relais porte le crossfeed
+        //    (#9210, crossfeed simple gratuit).
         orch.license = Some(Arc::new(crate::license::LicenseManager::new(
             orch.db.clone(),
         )));
@@ -12391,11 +12626,11 @@ async fn relais_oaat_et_navigateur_crossfeed_sous_licence_et_greffon() {
             "{type_de_sortie} : l'égaliseur doit armer le relais, sinon le test ne prouve rien"
         );
         assert!(
-            !crossfeed,
-            "{type_de_sortie} : sans licence Premium, le relais porte le crossfeed"
+            crossfeed,
+            "{type_de_sortie} : #9210, le crossfeed simple est gratuit, le relais doit le porter"
         );
 
-        // 2. Premium, greffon retiré : toujours pas de crossfeed.
+        // 2. Greffon retiré : plus de crossfeed, même en Premium.
         orch.license = Some(crate::license::licence_premium_pour_test(orch.db.clone()));
         settings.set("plugin_crossfeed_installed", "false").unwrap();
         let (actif, relais, crossfeed) = orch.relais_dsp_pour_test(&req).await.unwrap();
@@ -12414,7 +12649,7 @@ async fn relais_oaat_et_navigateur_crossfeed_sous_licence_et_greffon() {
         assert!(actif && relais, "{type_de_sortie} : relais armé");
         assert!(
             crossfeed,
-            "{type_de_sortie} : licence et greffon réunis, le crossfeed doit être porté"
+            "{type_de_sortie} : greffon présent, le crossfeed doit être porté"
         );
     }
 }
