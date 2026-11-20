@@ -1170,12 +1170,13 @@ pub(super) async fn play_episode(
                 .await;
             let s = state.playback.get_state(zone_id).await;
             if let Some(np) = s.now_playing.as_ref() {
-                if let Err(e) = tune_core::db::listening_resume::podcast_started_in_context(
+                if let Err(e) = tune_core::db::listening_resume::podcast_started_du_profil(
                     &state.backend,
                     zone_id,
                     np,
                     s.position_ms,
                     body.podcast_id.as_deref(),
+                    s.session_profile_id,
                 ) {
                     warn!(zone_id, error = %e, "reprise_podcast_non_enregistree");
                 }

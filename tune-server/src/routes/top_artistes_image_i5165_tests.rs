@@ -21,7 +21,7 @@ use tune_core::streaming::traits::{
     StreamingService,
 };
 
-use super::{HistoryParams, top_artists};
+use super::{HistoryParams, VueDuFoyer, top_artists};
 use crate::state::AppState;
 
 const IMAGE_SERVICE: &str = "https://static.qobuz.com/images/artists/neil-young.jpg";
@@ -155,6 +155,8 @@ fn ecoute(state: &AppState, artiste: &str, source: &str, source_id: &str) {
 async fn top(state: AppState) -> Vec<Value> {
     let Json(corps) = top_artists(
         State(state),
+        crate::routes::active_profile::ActiveProfile(1),
+        VueDuFoyer(true),
         Query(HistoryParams {
             limit: Some(20),
             offset: None,
