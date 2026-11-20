@@ -1333,6 +1333,15 @@ pub struct PlaybackOrchestrator {
     /// Verrous std : accès très courts, jamais tenus à travers un await.
     eq_replay_gen: std::sync::Mutex<std::collections::HashMap<i64, u64>>,
     eq_replay_last: std::sync::Mutex<std::collections::HashMap<i64, std::time::Instant>>,
+    /// 19/11/2026 — zones dont un changement de réglage du suréchantillonneur
+    /// attend sa relance. Une demande plus récente (égaliseur, PURE) qui la
+    /// remplace hérite de sa règle : plancher court et report au lieu
+    /// d'abandon, puisque la réponse a déjà dit « appliqué ».
+    surech_replay_en_attente: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// 19/11/2026 — une seule relance à la fois par zone : deux relances
+    /// concurrentes (arrêt, `play`) se marcheraient dessus.
+    verrous_de_relance:
+        std::sync::Mutex<std::collections::HashMap<i64, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     /// Le traitement que chaque flux RÉSOLU porte dans ses octets (#4407) :
     /// `zone_id → [(stream_id, empreinte)]`, les plus récents en dernier,
     /// bornés à [`Self::FLUX_TRAITES_PAR_ZONE`].
@@ -2006,6 +2015,8 @@ impl PlaybackOrchestrator {
             reprises_sur_place: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_gen: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
+            surech_replay_en_attente: std::sync::Mutex::new(std::collections::HashSet::new()),
+            verrous_de_relance: std::sync::Mutex::new(std::collections::HashMap::new()),
             traitement_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_en_vol_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_net_play: Mutex::new(HashMap::new()),
@@ -2083,6 +2094,17 @@ impl PlaybackOrchestrator {
     /// environ une seconde de silence — deux par cinq secondes est déjà
     /// beaucoup.
     const EQ_REPLAY_FLOOR_MS: u64 = 5_000;
+    /// Plancher entre deux relances d'une même zone pour un changement de
+    /// réglage du suréchantillonneur (décision de Bertrand du 19/11/2026).
+    ///
+    /// Plus court que [`Self::EQ_REPLAY_FLOOR_MS`] : ce geste-là sert une
+    /// écoute comparative (activé, désactivé, autre filtre), et 5 s de
+    /// plancher la rendaient impossible. Assez long pour qu'une rafale de
+    /// clics ne hache pas la lecture : la relance coûte environ une seconde
+    /// de silence, plus le reverrouillage du DAC quand la cadence change.
+    /// Et une demande trop proche n'est pas abandonnée, mais DIFFÉRÉE jusqu'à
+    /// la fin du plancher : la réponse a promis « appliqué ».
+    pub(crate) const UPSAMPLER_REPLAY_FLOOR_MS: u64 = 1_500;
 }
 
 // #8611 — contrôle parental : refus de lecture des artistes bloqués.
@@ -2242,6 +2264,9 @@ mod greffon_natif_tiers_reseau_7616_tests;
 // #6780 — PURE contourne aussi la réaffectation des canaux armée de la zone.
 #[cfg(all(test, feature = "local-audio"))]
 mod pure_reaffectation_6780_tests;
+// 19/11/2026 — un réglage du suréchantillonneur relance le flux tout de suite.
+#[cfg(all(test, feature = "local-audio"))]
+mod surechantillonnage_immediat_tests;
 // #7932 — PURE contourne aussi la réaffectation des canaux de l'album joué.
 #[cfg(all(test, feature = "local-audio"))]
 mod pure_reaffectation_album_7932_tests;

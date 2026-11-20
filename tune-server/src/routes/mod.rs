@@ -1230,9 +1230,14 @@ mod eq_refresh_guard {
         ("_crossfeed", "refresh_zone_crossfeed"),
         ("_audiophile", "apply_audiophile_change"),
         ("_mono_downmix", "refresh_zone_mono_downmix"),
-        // #7614 — le choix du suréchantillonneur ; la sortie ne l'applique
-        // qu'à la frontière de piste suivante, mais elle doit le recevoir.
-        ("_upsampler", "refresh_zone_upsampler"),
+        // #7614 — le choix du suréchantillonneur : la sortie doit le recevoir.
+        // #9218 — la route du réglage passe par `apply_upsampler_change_portee`,
+        // qui le pose (`refresh_zone_upsampler`) PUIS relance le flux.
+        // `|` sépare les rafraîchisseurs acceptés.
+        (
+            "_upsampler",
+            "refresh_zone_upsampler|apply_upsampler_change_portee",
+        ),
     ];
 
     /// REF-T (#2219) : un module de test sorti de son fichier en module enfant
@@ -1336,7 +1341,7 @@ mod eq_refresh_guard {
                         .iter()
                         .any(|(k, f, _)| k == cle && f == &nom.as_str())
                 })
-                .filter(|(_, s)| !s.contains(rafraichisseur))
+                .filter(|(_, s)| !rafraichisseur.split('|').any(|r| s.contains(r)))
                 .map(|(nom, _)| nom.as_str())
                 .collect();
             assert!(

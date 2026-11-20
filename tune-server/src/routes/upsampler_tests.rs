@@ -37,7 +37,9 @@ async fn activer_sans_premium_est_refuse_402() {
     let Json(v) = lire_zone(State(state), Path(1)).await;
     assert_eq!(v["settings"]["enabled"], false);
     assert_eq!(v["constraint"], "disabled");
-    assert_eq!(v["applies_at"], "next_track");
+    // 19/11/2026 — un changement s'applique tout de suite.
+    assert_eq!(v["applies_at"], "now");
+    assert_eq!(v["restart"], false);
 }
 
 #[tokio::test]
@@ -51,6 +53,15 @@ async fn desactiver_est_toujours_permis_et_un_reglage_invalide_refuse() {
     )
     .await;
     assert_eq!(r.status(), StatusCode::OK);
+    // 19/11/2026 — rien ne joue : le réglage vaut tout de suite, sans relance.
+    let corps: Value = serde_json::from_slice(
+        &axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(corps["applies_at"], "now", "{corps}");
+    assert_eq!(corps["restart"], false, "{corps}");
     let Json(v) = lire_zone(State(state.clone()), Path(2)).await;
     assert_eq!(v["settings"]["filter"], "precision-pm");
     assert_eq!(v["settings"]["max_ratio"], 4);
@@ -162,4 +173,34 @@ async fn une_zone_reseau_est_dite_non_prise_en_charge_8149() {
     let (state, id) = zone_prete("dlna:uuid:eversolo-dmp-a8").await;
     let Json(v) = lire_zone(State(state), Path(id)).await;
     assert_eq!(v["constraint"], "output_not_supported", "{v}");
+}
+
+/// Relecture du 20/11 (5) — sur une zone dont la sortie n'est pas locale, le
+/// réglage n'agit pas : la réponse ne dit ni « now » ni « next_track ».
+#[tokio::test]
+async fn zone_reseau_le_reglage_n_agit_jamais() {
+    let state = etat();
+    let id = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .create("Salon", Some("dlna"), Some("dlna:renderer-9218"))
+        .unwrap();
+    let r = ecrire_zone(
+        State(state.clone()),
+        Path(id),
+        HeaderMap::new(),
+        Json(json!({"enabled": false})),
+    )
+    .await;
+    assert_eq!(r.status(), StatusCode::OK);
+    let corps: Value = serde_json::from_slice(
+        &axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    // Désactivé, la contrainte dit « disabled » ; la portée, elle, suit la
+    // sortie.
+    assert_eq!(corps["constraint"], "disabled", "{corps}");
+    assert_eq!(corps["applies_at"], "never", "{corps}");
+    let Json(v) = lire_zone(State(state), Path(id)).await;
+    assert_eq!(v["applies_at"], "never");
 }
