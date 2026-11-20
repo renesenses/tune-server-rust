@@ -384,10 +384,10 @@ fn perte_du_maitre_repli_sans_saut_puis_calage_sur_un_autre_maitre() {
 }
 
 /// Lance le cadenceur sur `horloge`, reçoit `n` paquets et rend, pour
-/// chacun, (horodatage RTP, temps du maître à l'arrivée).
+/// chacun, (horodatage RTP, temps de `reference` à l'arrivée).
 fn emettre_et_recevoir(
     horloge: Arc<dyn SourceHorloge>,
-    maitre: &MaitreSimule,
+    reference: &dyn Fn() -> u64,
     n: usize,
     decalage_media: u32,
 ) -> Vec<(EnteteRtp, u64)> {
@@ -425,7 +425,7 @@ fn emettre_et_recevoir(
     let mut recus = Vec::with_capacity(n);
     for _ in 0..n {
         let k = ecoute.recv(&mut t).unwrap();
-        let arrivee = maitre.maintenant_ns();
+        let arrivee = reference();
         recus.push((EnteteRtp::lire(&t[..k]).unwrap().0, arrivee));
     }
     // Depuis l'étape E3, le fil survit à la fin d'un flux : l'arrêter.
@@ -444,17 +444,35 @@ fn l_emetteur_cale_horodate_en_temps_ptp_et_la_contre_epreuve_non() {
     attendre(LIMITE_CALAGE, || s.calee()).expect("calage");
     std::thread::sleep(Duration::from_secs(4));
 
-    // 3 s de flux. L'horodatage RTP d'un paquet est le temps du MAÎTRE à son
-    // émission × 48 kHz (+ décalage annoncé). On ne voit que l'ARRIVÉE (le
-    // temps du maître lu par le fil de réception), qui suit l'émission de
-    // quelques µs, davantage quand la machine est chargée. D'où :
-    // - jamais d'horodatage EN AVANCE sur le maître de plus d'une demi-ms ;
+    // 3 s de flux. L'horodatage RTP d'un paquet est le temps PTP du SUIVEUR
+    // à son émission × 48 kHz (+ décalage annoncé). On ne voit que l'ARRIVÉE
+    // (le même temps du suiveur, lu par le fil de réception), qui suit
+    // l'émission de quelques µs, davantage quand la machine est chargée.
+    // D'où :
+    // - jamais d'horodatage EN AVANCE de plus d'une demi-ms ;
     // - un retard médian sous une durée de paquet (48 trames) ;
     // - aucune dérive : les médianes du début et de la fin concordent.
+    //
+    // QA 18/11 — ce témoin comparait l'horodatage au temps du MAÎTRE. Il
+    // mesurait donc aussi l'écart du suiveur au maître, qui n'est pas son
+    // objet (c'est celui de `le_suiveur_se_cale_sur_un_maitre_1588_2008…`,
+    // avec son seuil justifié par #8460) : la CI du 17/11 l'a vu rouge à
+    // -1 trame (suiveur en avance de ~21 µs), et Shrek sous charge à +78 et
+    // -32 trames (suiveur décalé de 1,4 et 0,8 ms) — l'émetteur, lui, était
+    // juste. L'émetteur se juge désormais contre l'horloge qu'il doit suivre,
+    // celle du suiveur ; le lien au maître reste exigé à 10 ms près (une
+    // horloge qui ne suit pas le maître en est à ~3 h), et la contre-épreuve
+    // (horloge système) reste à ~3 h.
     let decalage = 0x1234_5678;
     let g0 = s.generation();
-    let recus = emettre_et_recevoir(s.clone(), &maitre, 3000, decalage);
+    let temps_ptp = || s.maintenant_ns();
+    let recus = emettre_et_recevoir(s.clone(), &temps_ptp, 3000, decalage);
     assert_eq!(s.generation(), g0, "ni saut ni décrochage pendant l'essai");
+    let ecart_au_maitre = ecart_ns(&maitre, &s);
+    assert!(
+        ecart_au_maitre.abs() < 10_000_000,
+        "le suiveur n'est pas en temps du maître : {ecart_au_maitre} ns"
+    );
     let retards: Vec<i32> = recus
         .iter()
         .map(|(e, a)| horodatage_rtp_decale(*a, 48_000, decalage).wrapping_sub(e.horodatage) as i32)
@@ -472,7 +490,7 @@ fn l_emetteur_cale_horodate_en_temps_ptp_et_la_contre_epreuve_non() {
     );
     eprintln!(
         "retards (trames) : médiane {med}, début {med_debut}, fin {med_fin}, \
-         max {}, avance max {avance_max}",
+         max {}, avance max {avance_max} ; suiveur − maître {ecart_au_maitre} ns",
         retards.iter().max().unwrap()
     );
     assert!(
@@ -489,8 +507,8 @@ fn l_emetteur_cale_horodate_en_temps_ptp_et_la_contre_epreuve_non() {
     }
 
     // Contre-épreuve : le même émetteur sur l'horloge système est à ~3 h du
-    // maître, soit des centaines de millions de trames.
-    let recus = emettre_et_recevoir(Arc::new(HorlogeSysteme::new()), &maitre, 50, decalage);
+    // temps PTP, soit des centaines de millions de trames.
+    let recus = emettre_et_recevoir(Arc::new(HorlogeSysteme::new()), &temps_ptp, 50, decalage);
     let (e, arrivee) = &recus[0];
     let ecart = horodatage_rtp_decale(*arrivee, 48_000, decalage).wrapping_sub(e.horodatage) as i32;
     assert!(ecart.abs() > 48_000 * 60, "écart {ecart} trames");

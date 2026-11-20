@@ -34,7 +34,8 @@ fn orchestrateur() -> PlaybackOrchestrator {
     PlaybackOrchestrator::new(
         db,
         Arc::new(PlaybackManager::new()),
-        Arc::new(AudioStreamer::new(0)),
+        // #9207 — l'URI n'est la nôtre que sur le port du serveur.
+        Arc::new(AudioStreamer::new(8888)),
         Arc::new(Mutex::new(ServiceRegistry::new())),
         Arc::new(Mutex::new(OutputRegistry::new())),
         None,

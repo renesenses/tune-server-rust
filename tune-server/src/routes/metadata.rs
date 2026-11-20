@@ -142,6 +142,12 @@ pub fn router() -> Router<AppState> {
                 .post(alertes_ignorees::ignorer)
                 .delete(alertes_ignorees::retablir),
         )
+        // #9028 — « Normal pour tout l'album » : aperçu, geste, annulation.
+        .route("/doubtful/album", get(alertes_album::apercu))
+        .route(
+            "/doubtful/ignored/album",
+            post(alertes_album::ignorer).delete(alertes_album::retablir),
+        )
         // Lookup (MusicBrainz)
         .route("/lookup/track", get(lookup_track))
         .route("/lookup/album", get(lookup_album))
@@ -1211,7 +1217,11 @@ async fn list_doubtful_metadata(
                 // distincts seulement. Le titre ne sert à rien : son préfixe
                 // « 01 - » est un numéro de piste, pas un nom, et l'album ne
                 // connaît l'artiste que 33 fois sur 1 592.
-                "file_path": t.file_path,
+                //
+                // #8957 — le chemin OUVRABLE : une piste de feuille CUE n'a pas
+                // de `file_path`, son fichier image est dans `cue_media_path`.
+                "file_path": artiste_du_dossier::chemin_ouvrable(t),
+                "path_source": artiste_du_dossier::source_du_chemin(t),
                 // #8679 — l'artiste que le dossier donne, par la règle du
                 // scan : « artiste absent des balises (dossier : …) ».
                 "folder_artist": artiste_du_dossier::artiste_du_dossier_de(t),
@@ -3137,6 +3147,9 @@ async fn merge_albums(
 #[cfg(test)]
 mod tests_fusion_compilation;
 
+mod alertes_album;
+#[cfg(test)]
+mod alertes_album_tests_9028;
 mod alertes_ignorees;
 #[cfg(test)]
 mod alertes_ignorees_tests_8958;

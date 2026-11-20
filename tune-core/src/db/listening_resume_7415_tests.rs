@@ -14,6 +14,9 @@ fn base() -> (Arc<dyn DbBackend>, i64) {
 
 fn piste(id: &str) -> QueueInput {
     QueueInput::Streaming {
+        media_format: None,
+        sample_rate: None,
+        bit_depth: None,
         source: "qobuz".into(),
         source_id: id.into(),
         title: id.into(),
@@ -31,6 +34,7 @@ fn piste(id: &str) -> QueueInput {
 fn reprise(zone: i64, id: &str, lignes: Vec<i64>) -> Resume {
     Resume {
         resume_key: format!("cle-{id}"),
+        profile_id: None,
         context_type: "album".into(),
         context_id: id.into(),
         source: "qobuz".into(),

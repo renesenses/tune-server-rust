@@ -198,6 +198,19 @@ impl TrackRepo {
         params.extend(params_filtre);
         let refs: Vec<&dyn ToSqlValue> = params.iter().map(|v| v as &dyn ToSqlValue).collect();
         let modifies = self.db.execute(&sql, &refs)? as i64;
+        // #9158 — une pose ou un retrait par filtre sont MANUELS : ils
+        // effacent la marque d'origine « scan » (`item_tags_scan`) de chaque
+        // objet désigné, comme `TagRepo::tag_item` / `untag_item`. Sans cela,
+        // un tag repris par filtre resterait « du scan » et partirait au
+        // prochain scan du fichier. Au mieux : une base sans la table
+        // n'empêche pas d'étiqueter.
+        let effacer = format!(
+            "DELETE FROM item_tags_scan WHERE tag_id = {ph_tag} AND item_type = {ph_type} \
+             AND item_id IN ({sous})"
+        );
+        if let Err(e) = self.db.execute(&effacer, &refs) {
+            tracing::debug!(error = %e, "tags_perso_marques_non_effacees_par_filtre");
+        }
         Ok(Ok(BilanEtiquetage { designes, modifies }))
     }
 }

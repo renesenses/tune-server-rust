@@ -46,7 +46,7 @@ impl TunePlugin for PremiumAudio {
             "upsampler" => {
                 "Suréchantillonnage : filtres polyphases vers la plus haute cadence du DAC, sortie locale"
             }
-            _ => "Dé-ploc : silence en tête/queue et passages par zéro, FLAC/WAV",
+            _ => "Declick : silence en tête/queue et passages par zéro, FLAC/WAV",
         }
     }
     fn default_enabled(&self) -> bool {
@@ -469,7 +469,12 @@ pub(crate) mod tests {
             !premium_plugins::enabled(&settings, "equalizer"),
             "l'égaliseur tourne d'office après le démarrage"
         );
-        let app = crate::routes::router_with_plugins(state.clone(), routers);
+        let app = crate::routes::router_with_plugins(state.clone(), routers).layer(
+            axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                50000,
+            ))),
+        );
 
         let (status, fiche) = appel(&app, "GET", "/api/v1/plugins/equalizer").await;
         assert_eq!(status, StatusCode::OK, "{fiche}");
@@ -535,7 +540,12 @@ pub(crate) mod tests {
         // Premier processus : démarré sans égaliseur, puis « Installer ».
         let state = AppState::new(&base, 0, Default::default()).unwrap();
         let routers = crate::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
-        let app = crate::routes::router_with_plugins(state.clone(), routers);
+        let app = crate::routes::router_with_plugins(state.clone(), routers).layer(
+            axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                50000,
+            ))),
+        );
         let (status, reponse) = appel(&app, "POST", "/api/v1/plugins/equalizer/install").await;
         assert_eq!(status, StatusCode::OK, "{reponse}");
         let (status, reponse) = appel(&app, "POST", "/api/v1/plugins/equalizer/enable").await;
@@ -553,7 +563,12 @@ pub(crate) mod tests {
         // Redémarrage : un nouveau processus sur la même base.
         let state = AppState::new(&base, 0, Default::default()).unwrap();
         let routers = crate::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
-        let app = crate::routes::router_with_plugins(state.clone(), routers);
+        let app = crate::routes::router_with_plugins(state.clone(), routers).layer(
+            axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                50000,
+            ))),
+        );
         let settings = SettingsRepo::with_backend(state.backend.clone());
         assert!(
             premium_plugins::enabled(&settings, "equalizer"),
@@ -579,7 +594,12 @@ pub(crate) mod tests {
         settings.set("plugin_equalizer_installed", "true").unwrap();
         settings.set("plugin_equalizer_enabled", "true").unwrap();
         let routers = crate::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
-        let app = crate::routes::router_with_plugins(state.clone(), routers);
+        let app = crate::routes::router_with_plugins(state.clone(), routers).layer(
+            axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                50000,
+            ))),
+        );
         assert!(visible_dans_la_barre(
             &fiche_du_catalogue(&app, "equalizer").await
         ));
@@ -616,7 +636,12 @@ pub(crate) mod tests {
                     .await;
             }
             assert_eq!(state.license.is_premium().await, premium);
-            let app = crate::routes::router_with_plugins(state.clone(), routers);
+            let app = crate::routes::router_with_plugins(state.clone(), routers).layer(
+                axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, 1],
+                    50000,
+                ))),
+            );
             let palier = if premium { "Premium" } else { "Free" };
             let resolution = json!({"expert_bands": 31});
             let bandes = json!({
@@ -692,7 +717,12 @@ pub(crate) mod tests {
                     "{id} actif en Free"
                 );
             }
-            let app = crate::routes::router_with_plugins(state.clone(), routers);
+            let app = crate::routes::router_with_plugins(state.clone(), routers).layer(
+                axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, 1],
+                    50000,
+                ))),
+            );
             let (status, reponse) =
                 appel(&app, "POST", "/api/v1/audio-plugins/crossfeed/uninstall").await;
             assert_eq!(status, StatusCode::OK, "{reponse}");
@@ -759,7 +789,12 @@ pub(crate) mod tests {
                 .delete(&format!("premium_audio_plugins_withheld_{id}"))
                 .unwrap();
         }
-        let app = crate::routes::router_with_plugins(state.clone(), routers);
+        let app = crate::routes::router_with_plugins(state.clone(), routers).layer(
+            axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                50000,
+            ))),
+        );
         (state, settings, app)
     }
 
@@ -885,7 +920,12 @@ pub(crate) mod tests {
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         let settings = SettingsRepo::with_backend(state.backend.clone());
         let routers = crate::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
-        let app = crate::routes::router_with_plugins(state.clone(), routers);
+        let app = crate::routes::router_with_plugins(state.clone(), routers).layer(
+            axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                50000,
+            ))),
+        );
         assert!(!state.license.is_premium().await);
 
         let (status, reponse) = appel(
@@ -1021,7 +1061,12 @@ pub(crate) mod tests {
             .license
             .update_from_server(tune_core::license::Tier::Premium, None)
             .await;
-        let app = crate::routes::router_with_plugins(state.clone(), vec![]);
+        let app = crate::routes::router_with_plugins(state.clone(), vec![]).layer(
+            axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                50000,
+            ))),
+        );
         let (status, reponse) = appel(
             &app,
             "POST",

@@ -153,6 +153,9 @@ impl TrackMetadataRepo {
 
     /// Set a single metadata field (upsert).
     pub fn set(&self, track_id: i64, key: &str, value: &str) -> Result<(), String> {
+        if crate::metadata::tags_perso::est_cle_reservee(key) {
+            return Ok(());
+        }
         let sql = self.dialect_sql(sql::upsert, sql::upsert);
         let params: [&dyn ToSqlValue; 3] = [&track_id, &key, &value];
         self.db.execute(&sql, &params)?;
@@ -166,6 +169,10 @@ impl TrackMetadataRepo {
         }
         let sql = self.dialect_sql(sql::upsert, sql::upsert);
         for (key, value) in fields {
+            // #9158 — une clé RÉSERVÉE (`@…`) ne quitte jamais la mémoire.
+            if crate::metadata::tags_perso::est_cle_reservee(key) {
+                continue;
+            }
             let params: [&dyn ToSqlValue; 3] = [&track_id, &key.as_str(), &value.as_str()];
             self.db.execute(&sql, &params)?;
         }
@@ -223,6 +230,11 @@ impl TrackMetadataRepo {
         let sql = self.dialect_sql(sql::upsert, sql::upsert);
         for (track_id, fields) in entries {
             for (key, value) in fields {
+                // #9158 — les tags lus (`@tags_perso`) vont dans `item_tags`,
+                // pas ici : une clé réservée n'est jamais rangée.
+                if crate::metadata::tags_perso::est_cle_reservee(key) {
+                    continue;
+                }
                 let params: [&dyn ToSqlValue; 3] = [track_id, &key.as_str(), &value.as_str()];
                 if let Err(e) = self.db.execute(&sql, &params) {
                     tracing::error!(error = %e, "track_metadata_upsert_failed");

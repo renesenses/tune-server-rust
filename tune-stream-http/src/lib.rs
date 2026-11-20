@@ -439,6 +439,11 @@ pub async fn handle_stream(
     let Some(session) = session else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // #8963 — tirée par le pont (relais, écoute directe) : la retenue couvre
+    // toute la piste, AVANT que cette connexion tire le canal.
+    if req_headers.contains_key(tune_core::cloud::ENTETE_RELAIS) {
+        session.noter_tirage_par_le_pont();
+    }
 
     let range_hdr = req_headers
         .get("Range")
@@ -2162,7 +2167,6 @@ fn corps_virtuel(
     length: u64,
     byte_counter: std::sync::Arc<StreamSession>,
 ) -> Body {
-    use std::sync::atomic::Ordering::Relaxed;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
     let stream_id = byte_counter.id.clone();
     tokio::task::spawn_blocking(move || {
@@ -2183,7 +2187,7 @@ fn corps_virtuel(
             let Some(morceau) = rx.recv().await else { break };
             let n = (morceau.len() as u64).min(remaining);
             remaining -= n;
-            byte_counter.bytes_sent.fetch_add(n, Relaxed);
+            byte_counter.compter_octets_servis(n);
             chrono.compter(n);
             let mut octets = bytes::Bytes::from(morceau);
             octets.truncate(n as usize);
@@ -2398,9 +2402,7 @@ where
 {
     Body::from_stream(futures_util::StreamExt::map(flux, move |morceau| {
         if let Ok(ref o) = morceau {
-            compteur
-                .bytes_sent
-                .fetch_add(o.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            compteur.compter_octets_servis(o.len() as u64);
         }
         morceau
     }))
@@ -2714,7 +2716,6 @@ fn build_file_body(
     byte_counter: std::sync::Arc<StreamSession>,
     octets_par_seconde: Option<u32>,
 ) -> Body {
-    use std::sync::atomic::Ordering::Relaxed;
     let mut chrono = ChronoServiceFichier::new(byte_counter.id.clone(), length, octets_par_seconde);
     Body::from_stream(async_stream::stream! {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -2727,7 +2728,7 @@ fn build_file_body(
             while remaining > 0 && vpos < header_len {
                 let n = ((header_len - vpos).min(remaining)) as usize;
                 let s = vpos as usize;
-                byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
+                byte_counter.compter_octets_servis(n as u64);
                 chrono.compter(n as u64);
                 let envoi = std::time::Instant::now();
                 yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&map.header[s..s + n]));
@@ -2755,7 +2756,7 @@ fn build_file_body(
                                 Ok(0) => { chrono.noter_fin(FinDuService::FichierPlusCourt); break; }
                                 Ok(n) => {
                                     remaining -= n as u64;
-                                    byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
+                                    byte_counter.compter_octets_servis(n as u64);
                                     chrono.compter(n as u64);
                                     let envoi = std::time::Instant::now();
                                     yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n]));
@@ -2786,7 +2787,7 @@ fn build_file_body(
                             Ok(0) => { chrono.noter_fin(FinDuService::FichierPlusCourt); break; }
                             Ok(n) => {
                                 remaining -= n as u64;
-                                byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
+                                byte_counter.compter_octets_servis(n as u64);
                                 chrono.compter(n as u64);
                                 let envoi = std::time::Instant::now();
                                 yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n]));
@@ -3727,11 +3728,41 @@ async fn proxy_stream(
     (StatusCode::OK, headers, body).into_response()
 }
 
+/// Le pair est-il cette machine même ?
+pub(crate) fn pair_en_boucle_locale(pair: std::net::IpAddr) -> bool {
+    match pair {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
+/// #8963 — la marque du pont ([`tune_core::cloud::ENTETE_RELAIS`]) n'est
+/// crue que d'un pair en boucle locale : le relais et l'écoute directe
+/// rejouent depuis 127.0.0.1. Posée par un appareil du réseau, ou sans
+/// adresse de pair connue, elle est retirée avant [`handle_stream`].
+async fn handle_stream_par_la_route(
+    chemin: Path<String>,
+    etat: State<SharedSessions>,
+    connexion: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    mut req_headers: HeaderMap,
+) -> Response {
+    let en_boucle_locale =
+        connexion.is_some_and(|axum::Extension(axum::extract::ConnectInfo(pair))| {
+            pair_en_boucle_locale(pair.ip())
+        });
+    if !en_boucle_locale {
+        req_headers.remove(tune_core::cloud::ENTETE_RELAIS);
+    }
+    handle_stream(chemin, etat, req_headers).await
+}
+
 pub fn router(sessions: SharedSessions) -> axum::Router {
     axum::Router::new()
         .route(
             "/stream/{stream_id}",
-            axum::routing::get(handle_stream).head(handle_head),
+            axum::routing::get(handle_stream_par_la_route).head(handle_head),
         )
         // #7807 — journal seul, aucun changement de comportement : une ligne
         // par requête du renderer (méthode, chemin, Range, agent, IP, statut,
@@ -6009,6 +6040,8 @@ mod stream_url_distant_tests {
 
 #[cfg(test)]
 mod fin_de_piste_relue_6050;
+#[cfg(test)]
+mod reprise_par_le_pont_8963;
 
 #[cfg(test)]
 mod long_wav_4016;

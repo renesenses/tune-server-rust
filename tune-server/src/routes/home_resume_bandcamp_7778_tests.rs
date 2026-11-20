@@ -147,6 +147,9 @@ async fn la_reprise_d_un_album_bandcamp_retrouve_son_titre_malgre_une_signature_
     q.append(
         zone,
         &[QueueInput::Streaming {
+            media_format: None,
+            sample_rate: None,
+            bit_depth: None,
             source: "bandcamp".into(),
             source_id: ancienne.clone(),
             title: "Titre 2".into(),

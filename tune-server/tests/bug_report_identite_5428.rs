@@ -129,7 +129,9 @@ fn app(base: &str, reglages: &[(&str, &str)]) -> axum::Router {
     for (cle, valeur) in reglages {
         settings.set(cle, valeur).unwrap();
     }
-    tune_server::routes::router(state)
+    tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+    ))
 }
 
 async fn poster(app: &axum::Router, ct: &str, corps: Vec<u8>) -> (StatusCode, Value) {
@@ -371,4 +373,40 @@ async fn avec_un_journal_le_multipart_porte_jeton_et_licence_7920() {
         Some("Bearer jeton-sso-essai")
     );
     assert_eq!(recu.license_key.as_deref(), Some("TUNE-CLE-ESSAI"));
+}
+
+/// Un autre appareil du réseau (authentification coupée) : le rapport part,
+/// mais SANS l'identité du compte — ni jeton, ni clé de licence. Seuls
+/// l'administrateur ou cette machine envoient au nom du compte.
+#[tokio::test]
+async fn depuis_un_autre_appareil_le_rapport_part_sans_identite() {
+    let site = faux_site().await;
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    settings.set("mozaik_base_url", &site.base).unwrap();
+    settings
+        .set("mozaik_access_token", "jeton-sso-essai")
+        .unwrap();
+    settings.set("license_key", "TUNE-CLE-ESSAI").unwrap();
+    settings
+        .set("hardware_fingerprint", "empreinte-essai")
+        .unwrap();
+    let app =
+        tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([192, 168, 1, 50], 50000)),
+        ));
+
+    let (code, reponse) = poster_json(&app).await;
+
+    assert_eq!(code, StatusCode::OK, "réponse : {reponse}");
+    assert_eq!(site.appels.load(Ordering::SeqCst), 1);
+    let recu = site.dernier.lock().await;
+    assert_eq!(
+        recu.authorization, None,
+        "jeton du compte envoyé depuis le réseau"
+    );
+    assert_eq!(
+        recu.license_key, None,
+        "clé de licence envoyée depuis le réseau"
+    );
 }

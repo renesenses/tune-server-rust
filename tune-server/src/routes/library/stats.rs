@@ -128,9 +128,19 @@ pub(super) async fn library_stats(State(state): State<AppState>) -> Result<Json<
     // `SUM` et des `GROUP BY` sur `tracks` : hors des fils de l'exécuteur,
     // comme les routes de #5438. Sous un disque saturé, chacune tenait un fil
     // `tokio-rt-worker` aussi longtemps qu'elle lisait.
-    super::facets::hors_executeur("library_stats", move || lire_library_stats(&state))
-        .await?
-        .map(Json)
+    //
+    // #9116 — et resservi quand tout est suspendu (scan compris), sous la
+    // même révision de bibliothèque, une minute au plus : l'écran État du
+    // serveur la sonde toutes les 5 s.
+    let s = state.clone();
+    crate::routes::system::avancement_suspendu_9116::corps_general(
+        &state.comptages.releves.stats_bibliotheque,
+        "library_stats",
+        &state.backend,
+        move || lire_library_stats(&s),
+    )
+    .await
+    .map(Json)
 }
 
 fn lire_library_stats(state: &AppState) -> Result<Value, AppError> {
@@ -221,6 +231,23 @@ fn lire_library_stats(state: &AppState) -> Result<Value, AppError> {
 pub(super) async fn completeness_stats(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
+    // #9116 — une vingtaine de comptages sur toute la bibliothèque, dont des
+    // `NOT EXISTS` sur `track_metadata`, que l'écran État du serveur relançait
+    // toutes les 5 s DANS l'exécuteur. Hors de l'exécuteur désormais, et
+    // resservi quand tout est suspendu (scan compris), sous la même révision
+    // de bibliothèque, une minute au plus.
+    let s = state.clone();
+    crate::routes::system::avancement_suspendu_9116::corps_general(
+        &state.comptages.releves.completude,
+        "completeness_stats",
+        &state.backend,
+        move || lire_completude(&s),
+    )
+    .await
+    .map(Json)
+}
+
+fn lire_completude(state: &AppState) -> Result<Value, AppError> {
     // Go through state.backend, NOT state.db: state.db is always the raw
     // SQLite handle, which on a PostgreSQL deployment is a leftover empty
     // database — every count read 0, so the four Metadata cards all showed
@@ -438,16 +465,22 @@ pub(super) async fn completeness_stats(
         corps["dynamic_range_unmanageable"] = json!(d.non_gerables());
         corps["dynamic_range_unmeasurable"] = json!(d.non_mesurables);
     }
-    Ok(Json(corps))
+    Ok(corps)
 }
 
+/// L'activité récente : l'historique du profil appelant, comme
+/// `GET /history` (ses écoutes et celles sans profil), 200 lignes au plus.
 pub(super) async fn library_activity(
     State(state): State<AppState>,
+    crate::routes::active_profile::ActiveProfile(moi): crate::routes::active_profile::ActiveProfile,
     Query(p): Query<Pagination>,
 ) -> Json<Value> {
-    let limit = p.limit.unwrap_or(20);
+    let limit = p.limit.unwrap_or(20).clamp(1, 200);
     let repo = HistoryRepo::with_backend(state.backend.clone());
-    let items = repo.recent(limit).unwrap_or_default();
+    let items = repo
+        .recent_paginated_du_profil(limit, 0, moi)
+        .map(|(items, _)| items)
+        .unwrap_or_default();
     Json(json!(items))
 }
 

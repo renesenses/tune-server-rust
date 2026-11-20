@@ -167,6 +167,9 @@ fn en_file(db: &Arc<dyn DbBackend>, zone_id: i64) {
         .append(
             zone_id,
             &[QueueInput::Streaming {
+                media_format: None,
+                sample_rate: None,
+                bit_depth: None,
                 source: "qobuz".into(),
                 source_id: "789".into(),
                 title: "En file".into(),
