@@ -637,7 +637,6 @@ impl StreamingDsp {
                 tracing::warn!(%error, canaux, "tess_network_chain_drain_failed");
             }
         }
-        drop(etages);
 
         if facteur.is_some() {
             let premier = crate::audio::ecretage::REGISTRE

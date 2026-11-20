@@ -1829,7 +1829,7 @@ impl StreamingDsp {
         let ecrits = self.traiter_par_tess(pcm, bit_depth, chaine_reseau_tess::Passage::Flux);
         // Le reste qui n'est pas une trame entière suit la sortie.
         let trame = usize::from(bit_depth / 8) * self.canaux_du_flux();
-        let utiles = if trame == 0 { lus } else { lus / trame * trame };
+        let utiles = lus.checked_div(trame).map_or(lus, |n| n * trame);
         if ecrits < utiles {
             pcm.copy_within(utiles..lus, ecrits);
             pcm.truncate(ecrits + (lus - utiles));
