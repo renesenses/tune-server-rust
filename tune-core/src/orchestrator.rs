@@ -1277,9 +1277,11 @@ pub struct PlaybackOrchestrator {
     preparations_fichiers: std::sync::Mutex<HashMap<i64, preparation_fichier_7247::Preparation>>,
     dsd_capabilities: Mutex<HashMap<String, crate::outputs::dlna::DsdCapability>>,
     /// #6910 — renderers DLNA qui ont lâché un suivant DSD armé (acquitté,
-    /// jamais suivi : HiFi Rose RS130, #402). La garde DSD leur est rendue
-    /// pour la vie du processus.
-    appareils_qui_lachent_le_dsd_suivant: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// jamais suivi : HiFi Rose RS130, #402). #9206 : la garde DSD leur est
+    /// rendue après plusieurs échecs, pour une durée bornée (voir
+    /// [`crate::playback::gapless::EchecsDsdSuivant`]).
+    appareils_qui_lachent_le_dsd_suivant:
+        std::sync::Mutex<HashMap<String, crate::playback::gapless::EchecsDsdSuivant>>,
     /// Cache of MIME types that each DLNA renderer does NOT support.
     /// Key: device_id, Value: set of unsupported MIME types (e.g. "audio/flac").
     /// Only negative results are cached — if a MIME is not in the set, it's
@@ -1333,6 +1335,15 @@ pub struct PlaybackOrchestrator {
     /// Verrous std : accès très courts, jamais tenus à travers un await.
     eq_replay_gen: std::sync::Mutex<std::collections::HashMap<i64, u64>>,
     eq_replay_last: std::sync::Mutex<std::collections::HashMap<i64, std::time::Instant>>,
+    /// 19/11/2026 — zones dont un changement de réglage du suréchantillonneur
+    /// attend sa relance. Une demande plus récente (égaliseur, PURE) qui la
+    /// remplace hérite de sa règle : plancher court et report au lieu
+    /// d'abandon, puisque la réponse a déjà dit « appliqué ».
+    surech_replay_en_attente: std::sync::Mutex<std::collections::HashSet<i64>>,
+    /// 19/11/2026 — une seule relance à la fois par zone : deux relances
+    /// concurrentes (arrêt, `play`) se marcheraient dessus.
+    verrous_de_relance:
+        std::sync::Mutex<std::collections::HashMap<i64, std::sync::Arc<tokio::sync::Mutex<()>>>>,
     /// Le traitement que chaque flux RÉSOLU porte dans ses octets (#4407) :
     /// `zone_id → [(stream_id, empreinte)]`, les plus récents en dernier,
     /// bornés à [`Self::FLUX_TRAITES_PAR_ZONE`].
@@ -1436,6 +1447,10 @@ pub struct PlaybackOrchestrator {
     /// Un champ et non un appel direct : les témoins y substituent un parc
     /// connu, faute de périphérique réel sur la machine qui les exécute.
     pub(crate) enumerer_parc_local: reenumeration_avant_refus::EnumerateurDeParcLocal,
+    /// #8171 — le système dont la règle de ré-énumération s'applique
+    /// (`std::env::consts::OS`). Un champ pour que les témoins jouent la règle
+    /// Windows depuis Linux.
+    pub(crate) systeme_du_parc_local: &'static str,
     /// #4863 — les sources PCM fournies par les greffons (lecture d'un CD…),
     /// par nom de `source`. Voir `crate::source_pcm`.
     pub(crate) sources_pcm: crate::source_pcm::SourcesPcm,
@@ -1990,9 +2005,7 @@ impl PlaybackOrchestrator {
             prefetch: Arc::new(PrefetchEngine::new()),
             preparations_fichiers: Default::default(),
             dsd_capabilities: Mutex::new(HashMap::new()),
-            appareils_qui_lachent_le_dsd_suivant: std::sync::Mutex::new(
-                std::collections::HashSet::new(),
-            ),
+            appareils_qui_lachent_le_dsd_suivant: std::sync::Mutex::new(HashMap::new()),
             dlna_unsupported_mimes: Mutex::new(HashMap::new()),
             dlna_lpcm_accepte: Mutex::new(HashMap::new()),
             dlna_canaux_max: Mutex::new(HashMap::new()),
@@ -2002,6 +2015,8 @@ impl PlaybackOrchestrator {
             reprises_sur_place: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_gen: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_replay_last: std::sync::Mutex::new(std::collections::HashMap::new()),
+            surech_replay_en_attente: std::sync::Mutex::new(std::collections::HashSet::new()),
+            verrous_de_relance: std::sync::Mutex::new(std::collections::HashMap::new()),
             traitement_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
             eq_en_vol_des_flux: std::sync::Mutex::new(std::collections::HashMap::new()),
             last_net_play: Mutex::new(HashMap::new()),
@@ -2014,6 +2029,7 @@ impl PlaybackOrchestrator {
             replis_de_peripherique_dits: std::sync::Mutex::new(HashMap::new()),
             radios_refusees: Arc::new(std::sync::Mutex::new(HashMap::new())),
             enumerer_parc_local: reenumeration_avant_refus::enumerateur_de_production(),
+            systeme_du_parc_local: std::env::consts::OS,
             sources_pcm: crate::source_pcm::SourcesPcm::default(),
             sources_url: crate::source_url::SourcesUrl::default(),
             sources_physiques: Arc::default(),
@@ -2078,6 +2094,17 @@ impl PlaybackOrchestrator {
     /// environ une seconde de silence — deux par cinq secondes est déjà
     /// beaucoup.
     const EQ_REPLAY_FLOOR_MS: u64 = 5_000;
+    /// Plancher entre deux relances d'une même zone pour un changement de
+    /// réglage du suréchantillonneur (décision de Bertrand du 19/11/2026).
+    ///
+    /// Plus court que [`Self::EQ_REPLAY_FLOOR_MS`] : ce geste-là sert une
+    /// écoute comparative (activé, désactivé, autre filtre), et 5 s de
+    /// plancher la rendaient impossible. Assez long pour qu'une rafale de
+    /// clics ne hache pas la lecture : la relance coûte environ une seconde
+    /// de silence, plus le reverrouillage du DAC quand la cadence change.
+    /// Et une demande trop proche n'est pas abandonnée, mais DIFFÉRÉE jusqu'à
+    /// la fin du plancher : la réponse a promis « appliqué ».
+    pub(crate) const UPSAMPLER_REPLAY_FLOOR_MS: u64 = 1_500;
 }
 
 // #8611 — contrôle parental : refus de lecture des artistes bloqués.
@@ -2173,6 +2200,9 @@ mod service_wav_progressif_openhome_6718;
 
 mod dsp;
 // #5662 — une commande de volume à la fois par sortie, la dernière valeur gagne.
+/// #8968 (PR 0) — banc de mesure de la jointure entre deux pistes.
+#[cfg(test)]
+mod banc_jointure_8968_tests;
 /// #8082 — flux continu entre les pistes pour les renderers DLNA.
 mod flux_continu_8082;
 mod repere_de_hausse_6721;
@@ -2237,6 +2267,9 @@ mod greffon_natif_tiers_reseau_7616_tests;
 // #6780 — PURE contourne aussi la réaffectation des canaux armée de la zone.
 #[cfg(all(test, feature = "local-audio"))]
 mod pure_reaffectation_6780_tests;
+// 19/11/2026 — un réglage du suréchantillonneur relance le flux tout de suite.
+#[cfg(all(test, feature = "local-audio"))]
+mod surechantillonnage_immediat_tests;
 // #7932 — PURE contourne aussi la réaffectation des canaux de l'album joué.
 #[cfg(all(test, feature = "local-audio"))]
 mod pure_reaffectation_album_7932_tests;
@@ -2254,6 +2287,12 @@ mod convolution_sous_licence_7632_tests;
 // #7986 — une RI que le convolveur refusera ne force pas le transcodage.
 #[cfg(test)]
 mod passthrough_sans_traitement_7986_tests;
+// #9175 — Sendspin et Devialet AIR lisent le flux traité dès qu'un traitement est actif.
+#[cfg(test)]
+mod sorties_qui_decodent_le_fichier_9175_tests;
+// Suite de #9175 — saut et reprise de bout en bout avec une vraie sortie Sendspin.
+#[cfg(test)]
+mod sendspin_relance_9175_tests;
 // #8006 — Pause et Arrêt n'attendent plus sans limite un appareil occupé.
 #[cfg(test)]
 mod sortie_occupee_8006_tests;
@@ -2267,6 +2306,8 @@ mod prefetch_fiche_qobuz_m3u_8229_tests;
 #[cfg(test)]
 mod prefetch_wav_annonce_6990_tests;
 mod resolve_direct;
+// #9207 — une URI de notre bibliothèque reçue par le renderer se joue en local.
+mod uri_de_notre_bibliotheque_9207;
 /// #2264 — la règle de version appliquée à la lecture.
 mod version_de_lecture;
 // #4894 — capacité LPCM par type de sortie, quand aucun Sink n'est sondable.
@@ -2444,6 +2485,11 @@ mod dsd_upnp_politique_de_zone_tests;
 #[cfg(test)]
 mod dsd_pret_de_sorties_8052_tests;
 
+/// #8956 — Atoll ST200 : un DSD de serveur UPnP part dans l'orthographe que
+/// le Sink publie pour son conteneur (`audio/x-dsf` / `audio/x-dff`).
+#[cfg(test)]
+mod dsd_upnp_atoll_st200_8956_tests;
+
 /// Relevé par #5119 — les bras DSF UPnP et AAC n'appliquent pas l'égaliseur
 /// d'une zone LOCALE dans son flux : mesuré sur le PCM, une passe et non deux.
 #[cfg(test)]
@@ -2465,6 +2511,9 @@ mod mesure_saut_cd_5079;
 /// FLAC (ou le catalogue) ; inconnue, elle est refusée par une erreur nommée.
 #[cfg(test)]
 mod qobuz_cadence_nulle_5283_tests;
+/// #8983 — un saut Qobuz vers une sortie locale part de la position.
+#[cfg(test)]
+mod saut_qobuz_8983_tests;
 #[cfg(test)]
 mod tidal_aac_annonce_6334_tests;
 /// #7266 — de bout en bout, un FLAC CD TIDAL en DASH jusqu'au Play reçu par

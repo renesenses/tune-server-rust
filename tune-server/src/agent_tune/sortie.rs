@@ -4,7 +4,7 @@
 //! l'agent, porteur du jeton d'appairage. Le flux, lui, ne passe pas par ici :
 //! l'agent va le chercher à l'URL que l'orchestrateur a construite.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tune_core::outputs::traits::{OutputCapabilities, OutputStatus, OutputTarget, PlayMedia};
@@ -44,6 +44,7 @@ pub struct SortieAgentTune {
     /// à 2:00 par un déplacement y commence à 0. Remis à zéro à chaque
     /// lecture, posé par [`OutputTarget::seek`].
     depart_ms: AtomicU64,
+    peripherique_rendu_en_pause: AtomicBool,
 }
 
 impl SortieAgentTune {
@@ -64,6 +65,7 @@ impl SortieAgentTune {
                 .build()
                 .unwrap_or_default(),
             depart_ms: AtomicU64::new(0),
+            peripherique_rendu_en_pause: AtomicBool::new(false),
         }
     }
 
@@ -106,10 +108,15 @@ impl SortieAgentTune {
             let motif = reponse.text().await.unwrap_or_default();
             return Err(format!("agent Tune ({code}) : {motif}"));
         }
-        reponse
+        let etat = reponse
             .json::<EtatSortieDistante>()
             .await
-            .map_err(|e| format!("réponse d'agent illisible : {e}"))
+            .map_err(|e| format!("réponse d'agent illisible : {e}"))?;
+        self.peripherique_rendu_en_pause.store(
+            etat.tenue && etat.peripherique_rendu_en_pause,
+            Ordering::SeqCst,
+        );
+        Ok(etat)
     }
 }
 
@@ -147,6 +154,8 @@ impl OutputTarget for SortieAgentTune {
         // Un flux neuf part du début de la piste, sauf si l'orchestrateur dit
         // ensuite le contraire (`seek`, juste après une relance à la position).
         self.depart_ms.store(0, Ordering::SeqCst);
+        self.peripherique_rendu_en_pause
+            .store(false, Ordering::SeqCst);
         self.envoyer(Commande::Lire {
             url: media.url.to_string(),
             mime_type: media.mime_type.to_string(),
@@ -164,7 +173,19 @@ impl OutputTarget for SortieAgentTune {
         self.envoyer(Commande::Pause).await
     }
 
+    fn device_released_on_pause(&self) -> bool {
+        self.peripherique_rendu_en_pause.load(Ordering::SeqCst)
+    }
+
     async fn resume(&self) -> Result<(), String> {
+        // #8825 — relire même sans passage du poller après la pause.
+        // Le refus avec le drapeau armé emprunte le rétablissement existant
+        // de l'orchestrateur (#6062), qui recrée les OCTETS à la position.
+        // Rejouer simplement l'URL du bail repartirait au début du flux.
+        self.lire_etat().await?;
+        if self.device_released_on_pause() {
+            return Err("agent Tune : périphérique rendu en pause, flux à rétablir".into());
+        }
         self.envoyer(Commande::Reprendre).await
     }
 

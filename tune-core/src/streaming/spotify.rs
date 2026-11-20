@@ -97,6 +97,11 @@ pub struct SpotifyService {
     /// #8766 — fin de la pénalité d'un `429` abandonné : avant elle, aucun
     /// `GET` ne repart vers Spotify.
     penalite_429: std::sync::Mutex<Option<std::time::Instant>>,
+    /// #8766 — les `GET` en vol, par chemin : deux demandes identiques
+    /// simultanées (deux bandes de l'écran sur la même rubrique) partagent
+    /// UN appel à Spotify et sa réponse. Retiré dès la réponse rendue : rien
+    /// n'est mis en cache au-delà de l'appel.
+    en_vol: std::sync::Mutex<std::collections::HashMap<String, Arc<GetEnVol>>>,
     /// #6933 — les portées que Spotify dit avoir ACCORDÉES (champ `scope`
     /// de la réponse du jeton, à l'échange comme au rafraîchissement).
     /// `None` : inconnues (liaison restaurée d'une version qui ne les gardait
@@ -303,6 +308,9 @@ pub struct ErreurApi {
     pub reessayer_apres: Option<u64>,
 }
 
+/// #8766 — un `GET` partagé par les appels simultanés au même chemin.
+type GetEnVol = tokio::sync::OnceCell<Result<serde_json::Value, ErreurApi>>;
+
 /// #8198 — statut de `/me` pour un compte que l'application n'autorise pas.
 pub const STATUT_COMPTE_NON_AUTORISE: u16 = 403;
 
@@ -409,6 +417,21 @@ impl Budget429 {
 
 /// #8766 — le début du message d'un `429` abandonné.
 const LIMITE_429: &str = "Spotify limite temporairement les demandes";
+
+/// #8154 — le texte d'un `401` de l'API Web (jeton refusé), tel que
+/// [`requete_api`] le rend.
+pub const JETON_EXPIRE: &str = "token expired";
+
+/// #8154 — le message d'action d'un jeton que Spotify refuse encore après un
+/// renouvellement : seule une reconnexion peut le lever.
+pub const MOTIF_JETON_REFUSE: &str =
+    "Spotify a refusé le jeton : reconnecter Spotify dans les Réglages.";
+
+/// #8154 — l'échec vient-il d'un jeton refusé (`401`) ? Vrai pour le texte
+/// brut de l'API Web comme pour le message d'action.
+pub fn est_un_refus_de_jeton(erreur: &str) -> bool {
+    erreur == JETON_EXPIRE || erreur == MOTIF_JETON_REFUSE
+}
 /// #8766 — plafond d'une attente demandée par `Retry-After`, en secondes.
 const RETRY_AFTER_MAX_SECS: u64 = 60;
 
@@ -759,6 +782,7 @@ impl SpotifyService {
             token_rejected: Arc::new(AtomicBool::new(false)),
             seconde_429: std::time::Duration::from_secs(1),
             penalite_429: std::sync::Mutex::new(None),
+            en_vol: std::sync::Mutex::new(std::collections::HashMap::new()),
             portees: None,
             plafond_recherche: AtomicUsize::new(PLAFOND_RECHERCHE),
             session_refusee: false,
@@ -881,9 +905,27 @@ impl SpotifyService {
     /// restant abandonne tout de suite, et la pénalité est retenue : aucun
     /// appel ne repart vers Spotify avant sa fin. L'erreur le dit en clair,
     /// statut 429 gardé ; jamais une liste vide.
+    ///
+    /// #8766 — deux appels simultanés sur le même `path` n'en font qu'un chez
+    /// Spotify ([`Self::en_vol`]) : chaque rubrique était demandée deux fois
+    /// par affichage (« ×2 »), et chaque double comptait dans la limite.
     async fn api_get_detaille(&self, path: &str) -> Result<serde_json::Value, ErreurApi> {
-        let mut budget = Budget429::nouveau(self.seconde_429);
-        self.api_get_avec_budget(path, &mut budget).await
+        let cellule = {
+            let mut en_vol = self.en_vol.lock().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(en_vol.entry(path.to_owned()).or_default())
+        };
+        let reponse = cellule
+            .get_or_init(|| async {
+                let mut budget = Budget429::nouveau(self.seconde_429);
+                self.api_get_avec_budget(path, &mut budget).await
+            })
+            .await
+            .clone();
+        let mut en_vol = self.en_vol.lock().unwrap_or_else(|e| e.into_inner());
+        if en_vol.get(path).is_some_and(|c| Arc::ptr_eq(c, &cellule)) {
+            en_vol.remove(path);
+        }
+        reponse
     }
 
     /// #8766 — [`Self::api_get_detaille`] dans un budget fourni : une liste
@@ -1272,7 +1314,7 @@ impl SpotifyService {
                     derniere_erreur = None;
                     appareil = trouve;
                 }
-                Err(e) if e == "token expired" => return Err(e),
+                Err(e) if e == JETON_EXPIRE => return Err(e),
                 // #8766 — `api_get` a déjà réessayé le 429 jusqu'au bout
                 // (`ESSAIS_429`, `Retry-After`) : redemander 20 fois de plus
                 // prolongerait la pénalité de Spotify.
@@ -1311,7 +1353,7 @@ impl SpotifyService {
             }
             401 => {
                 self.note_token_rejected();
-                Err("Spotify a refusé le jeton : reconnecter Spotify dans les Réglages.".into())
+                Err(MOTIF_JETON_REFUSE.into())
             }
             _ => {
                 let detail = resp.text().await.unwrap_or_default();
@@ -1389,11 +1431,45 @@ impl SpotifyService {
         }
     }
 
+    /// #9072 — le type de sortie d'un album Spotify, lu dans `album_type`.
+    ///
+    /// Spotify n'a que trois mots : `album`, `single` et `compilation`. Il
+    /// range sous `single` les singles ET les EP (« Growth » d'Olivia Dean,
+    /// 5 titres, et « Slowly », 1 titre, ASR rc12) : un `single` de 4 pistes
+    /// ou plus, ou dont le titre finit par « EP », est un EP. `album` et
+    /// l'absence de type passent par la règle des services
+    /// ([`crate::metadata::release_type::type_d_album_de_service`]), qui
+    /// n'écoute ici que le titre (les durées ne sont pas dans la liste).
+    /// `compilation` n'est pas un type primaire : la sortie reste sans type,
+    /// donc parmi les albums.
+    ///
+    /// Avant, `release_type` restait `None` pour tout album Spotify : EP et
+    /// singles tombaient dans « Albums principaux ».
+    fn type_de_sortie(item: &serde_json::Value) -> Option<String> {
+        use crate::metadata::release_type::{
+            EP_PISTES_MIN, TypeDeSortie, titre_annonce_un_ep, type_d_album_de_service,
+        };
+        let titre = item["name"].as_str().unwrap_or("");
+        let pistes = item["total_tracks"].as_u64().unwrap_or(0);
+        let type_spotify = item["album_type"]
+            .as_str()
+            .map(|t| t.trim().to_ascii_lowercase());
+        let type_de_sortie = match type_spotify.as_deref() {
+            Some("single") if titre_annonce_un_ep(titre) || pistes >= u64::from(EP_PISTES_MIN) => {
+                Some(TypeDeSortie::Ep)
+            }
+            Some("single") => Some(TypeDeSortie::Single),
+            Some("album") => type_d_album_de_service(Some(TypeDeSortie::Album), titre, None),
+            _ => type_d_album_de_service(None, titre, None),
+        };
+        type_de_sortie.map(|t| t.as_str().to_string())
+    }
+
     fn map_album(item: &serde_json::Value) -> StreamAlbum {
         StreamAlbum {
             ai_generated: None,
             explicit: None,
-            release_type: None,
+            release_type: Self::type_de_sortie(item),
             id: item["id"].as_str().unwrap_or("").into(),
             title: item["name"].as_str().unwrap_or("").into(),
             artist: item["artists"]
@@ -1418,6 +1494,8 @@ impl SpotifyService {
             track_count: item["total_tracks"].as_u64().unwrap_or(0) as u32,
             released_at: None,
             quality: None,
+            genre_id: None,
+            genre_name: None,
         }
     }
 
@@ -2383,6 +2461,12 @@ impl StreamingService for SpotifyService {
         drapeau.load(Ordering::Relaxed)
     }
 
+    fn limite_de_debit_restante_s(&self) -> Option<u64> {
+        let reste = self.penalite_429_restante()?;
+        let unite = self.seconde_429.as_secs_f64().max(f64::MIN_POSITIVE);
+        Some((reste.as_secs_f64() / unite).ceil().max(1.0) as u64)
+    }
+
     async fn get_featured(&self) -> Result<Vec<StreamPlaylist>, TuneError> {
         // #8399 — fermé par Spotify à cette application : rubrique vide, sans
         // nouvel appel (un 403 était rendu en « HTTP 502 » brut à l'écran).
@@ -2431,6 +2515,8 @@ impl StreamingService for SpotifyService {
         genre_id: &str,
         limit: usize,
     ) -> Result<Vec<StreamAlbum>, TuneError> {
+        // L'API Web de Spotify répond 400 « Invalid limit » au-delà de 50.
+        let limit = limit.min(50);
         let Some(data) = self
             .lire_ou_retire(
                 &format!("/browse/categories/{genre_id}/playlists?limit={limit}"),
@@ -2469,6 +2555,8 @@ impl StreamingService for SpotifyService {
                             track_count: 0,
                             released_at: None,
                             quality: None,
+                            genre_id: None,
+                            genre_name: None,
                         });
                         if albums.len() >= limit {
                             break;
@@ -3213,6 +3301,36 @@ mod tests {
             album.cover_path.as_deref(),
             Some("http://img.spotify.com/album.jpg")
         );
+    }
+
+    /// #9072 — le cas d'ASR : « Growth » (EP, 5 titres) et « Slowly »
+    /// (single, 1 titre), que Spotify marque tous deux `single`, ne sont plus
+    /// des albums ; un `album` reste un album, une `compilation` reste sans
+    /// type (donc parmi les albums), comme une réponse sans `album_type`.
+    #[test]
+    fn map_album_lit_le_type_de_sortie_de_spotify_9072() {
+        let album = |nom: &str, album_type: Option<&str>, pistes: u64| {
+            let mut json = json!({
+                "id": "a", "name": nom, "artists": [{"name": "Olivia Dean", "id": "od"}],
+                "release_date": "2023-06-30", "total_tracks": pistes,
+            });
+            if let Some(t) = album_type {
+                json["album_type"] = json!(t);
+            }
+            SpotifyService::map_album(&json).release_type
+        };
+        assert_eq!(album("Growth", Some("single"), 5).as_deref(), Some("ep"));
+        assert_eq!(
+            album("Slowly", Some("single"), 1).as_deref(),
+            Some("single")
+        );
+        assert_eq!(album("Dive", Some("single"), 3).as_deref(), Some("single"));
+        assert_eq!(album("Dive EP", Some("single"), 3).as_deref(), Some("ep"));
+        assert_eq!(album("Messy", Some("album"), 12).as_deref(), Some("album"));
+        assert_eq!(album("Messy", Some("ALBUM"), 12).as_deref(), Some("album"));
+        assert_eq!(album("Best Of", Some("compilation"), 20), None);
+        assert_eq!(album("Sans type", None, 10), None);
+        assert_eq!(album("Sans type EP", None, 4).as_deref(), Some("ep"));
     }
 
     #[test]
@@ -4244,6 +4362,10 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "spotify_reprise_429_8766_tests.rs"]
+mod reprise_429_8766_tests;
 
 #[cfg(test)]
 #[path = "spotify_recherche_7659_tests.rs"]

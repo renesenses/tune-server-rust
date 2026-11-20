@@ -151,6 +151,13 @@ jobs:
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          # QA 18/11 — trois jobs du 18/11 sont encore morts en « No space left
+          # on device » (dont deux dans « Post Run Swatinem/rust-cache »). Outils
+          # préinstallés dont AUCUNE étape de ce job ne se sert (ni Go, ni Java,
+          # ni Swift, ni PowerShell, ni Haskell/ghcup, ni navigateur) : ~10 Gio.
+          sudo rm -rf /usr/local/.ghcup /usr/share/swift /usr/local/share/powershell \
+            /usr/local/share/chromium /opt/hostedtoolcache/go /opt/hostedtoolcache/Java_* \
+            /opt/hostedtoolcache/Ruby /opt/hostedtoolcache/PyPy || true
           sudo docker image prune --all --force || true
           df -h /
 
@@ -166,11 +173,18 @@ jobs:
       - name: Ajouter de la mémoire d'échange (#8190)
         run: |
           free -h; swapon --show || true; nproc
-          sudo fallocate -l 16G /swapfile-8190
-          sudo chmod 600 /swapfile-8190
-          sudo mkswap /swapfile-8190
-          sudo swapon /swapfile-8190
-          free -h; swapon --show
+          # QA 18/11 — la mémoire d'échange va sur le disque temporaire de la
+          # machine (/mnt) quand il a la place : 16 Gio de plus pour la
+          # compilation sur /. Sinon, comme avant, sur /.
+          fichier=/swapfile-8190
+          if [ -d /mnt ] && [ "$(df --output=avail -BG /mnt | tail -1 | tr -dc 0-9)" -ge 20 ]; then
+            fichier=/mnt/swapfile-8190
+          fi
+          sudo fallocate -l 16G "$fichier"
+          sudo chmod 600 "$fichier"
+          sudo mkswap "$fichier"
+          sudo swapon "$fichier"
+          free -h; swapon --show; df -h / /mnt || true
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -211,6 +225,16 @@ jobs:
             psql -h localhost -U tune -d tune_test -v ON_ERROR_STOP=1 -q -f "$migration"
           done
 
+      - name: Format UPnP conservé dans la file PostgreSQL (#8788)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8788 -- --nocapture --test-threads=1
+
+      - name: Déplacement de bloc concurrent sur PostgreSQL (#8849)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8849 -- --nocapture --test-threads=1
+
       - name: Schema-drift regression (#1706)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
@@ -240,6 +264,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5998 -- --nocapture --test-threads=1
 
+      # #9116 — vue Répertoires : le compte d'une racine part de l'index du
+      # chemin (plan générique compris) et rend l'ancien compte. Sans cette
+      # étape, l'épreuve prendrait son saut annoncé.
+      - name: Compte de racine par l'index du chemin sur PostgreSQL (#9116)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_9116 -- --nocapture --test-threads=1
+
       # #7856 — contrôle parental : stockage, révision optimiste, droits du
       # superviseur et filtre relu de la base. Sans cette étape, l'épreuve
       # prendrait son saut annoncé.
@@ -254,6 +286,15 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_7974 -- --nocapture --test-threads=1
+
+      # #9028 — « Normal pour les N pistes de cet album » : une ligne par
+      # piste dans une transaction (tout ou rien), annulation exacte, filtre
+      # d'une piste CUE, sur un vrai PostgreSQL. Sans cette étape, l'épreuve
+      # prendrait son saut annoncé.
+      - name: Geste groupé des alertes douteuses sur PostgreSQL (#9028)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_9028 -- --nocapture --test-threads=1
 
       # #8088 — contrôle parental : `tracks.explicit` (PG 107) sur une VRAIE
       # base : écrit, relu, gardé hors scan, retiré par le scan, marques des
@@ -334,6 +375,14 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8714 -- --nocapture --test-threads=1
 
+      # #8487 — les titres diffusés par une radio, notés sous la ligne de leur
+      # station dans `radio_titres_diffuses` (table d'`ENSURE_TABLES`, sans
+      # script numéroté) : écriture, dédoublonnage et relecture sur PostgreSQL.
+      - name: Titres diffusés des radios sur PostgreSQL (#8487)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_titres_diffuses -- --nocapture --test-threads=1
+
       # #8416 — les règles « nombre d'écoutes » et « dernière écoute » des
       # listes et collections intelligentes comptent les écoutes importées
       # (`imported_plays`) comme la Bibliothèque. Sans cette étape, le témoin
@@ -350,6 +399,33 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8676 -- --nocapture --test-threads=1
+
+      # #9158 (Rob) — balises personnelles → tags Tune : pose sur la piste et
+      # l'album, idempotence, retrait des seules poses du scan, tag manuel
+      # intact, table `item_tags_scan` d'ENSURE_TABLES. Sans cette étape, le
+      # témoin prendrait son saut annoncé.
+      - name: Balises personnelles en tags Tune sur PostgreSQL (#9158)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_9158 -- --nocapture --test-threads=1
+
+      # #9044 — oublier un appareil parti du réseau : zones d'un appareil et
+      # motifs de masquage, garde-fous non oubliables, suppression définitive,
+      # retour comme neuf, zone libérée (#8987) emportée avec sa clé, sur un
+      # vrai PostgreSQL. Sans cette étape, le témoin prendrait son saut annoncé.
+      - name: Oublier un appareil sur PostgreSQL (#9044)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_9044 -- --nocapture --test-threads=1
+
+      # #9014 — rescan d'une feuille CUE dont un début a bougé : la tranche est
+      # recalée (même id, favori, liste et écoute intacts) et les bornes ne
+      # sont réécrites que si elles changent (`IS DISTINCT FROM`). Sans cette
+      # étape, le témoin prendrait son saut annoncé.
+      - name: Tranches CUE recalées au rescan sur PostgreSQL (#9014)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_9014 -- --nocapture --test-threads=1
 
       # #8280 — raisons des recommandations de l'accueil : les sources disent
       # vrai sur un vrai PostgreSQL, et la rangée tient sa mesure. Le témoin
@@ -599,6 +675,13 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_5464 -- --nocapture --test-threads=1
+
+      # #8987 — une zone supprimée (masquée) lâche sa sortie pour qu'une zone
+      # visible la prenne, sans heurter l'index unique partiel.
+      - name: Sortie libérée d'une zone supprimée sur PostgreSQL (#8987)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_8987 -- --nocapture --test-threads=1
 
       # #5519 — la sélection ReplayGain par curseur et l'écriture groupée par
       # tour (`rg_analyzed`), sur PostgreSQL : ordre du curseur, écriture
@@ -1269,3 +1352,19 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-smart-http --lib --no-default-features --features postgres pg_comptes_collections -- --nocapture --test-threads=1
+
+      # QA 18/11 — la sauvegarde du cache (« Post Run Swatinem/rust-cache »)
+      # écrit son archive sur le disque déjà plein : le 18/11, deux jobs aux
+      # tests VERTS sont morts là en « No space left on device ». Les binaires
+      # de test des crates du workspace ne sont jamais mis en cache (rust-cache
+      # les retire lui-même avant d'archiver) : les effacer ici d'abord laisse
+      # la place à l'archive, sans rien changer à ce qui est sauvegardé.
+      - name: Faire de la place pour la sauvegarde du cache
+        if: always()
+        run: |
+          df -h /
+          for crate in $(cargo metadata --no-deps --format-version 1 2>/dev/null | python3 -c 'import json,sys; print(" ".join(p["name"].replace("-","_") for p in json.load(sys.stdin)["packages"]))'); do
+            rm -rf target/debug/deps/"$crate"-* target/debug/.fingerprint/"${crate//_/-}"-* 2>/dev/null || true
+          done
+          rm -rf target/debug/incremental || true
+          df -h /

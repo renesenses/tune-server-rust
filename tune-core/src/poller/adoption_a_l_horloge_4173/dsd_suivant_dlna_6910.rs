@@ -20,9 +20,12 @@
 //! | renderer | suivant DSD |
 //! |---|---|
 //! | annonce le DSD et `SetNext` | armé |
-//! | DSD brut forcé (« natif ») sans annonce DSD | garde conservée |
+//! | DSD brut forcé (« natif ») sans annonce DSD | armé (#8969, Eversolo DMP-A8, fil 2885) |
+//! | idem, SCPD illisible | garde conservée |
+//! | idem, règle #6477 apprise (lâche la piste au `SetNext`) | pas de `SetNext` |
+//! | DSD non annoncé, zone hors « natif » | le DSD part en PCM, armé comme avant |
 //! | annonce le DSD, SCPD illisible | garde conservée |
-//! | annonce tout, ne suit pas (RS130) | une transition perdue, puis garde rendue |
+//! | annonce tout, ne suit pas (RS130) | deux transitions perdues, puis garde rendue ; à chaque échéance, un seul échec la rend, durée doublée (#9206) |
 //! | zone en DoP | armé en WAV, comme avant |
 //!
 //! ## Ce que le banc ne prouve pas
@@ -36,18 +39,19 @@ use crate::outputs::traits::{AnnonceSuivante, TransportState};
 
 const DSF: &str = "ref_dsd64_stereo.dsf";
 
-fn annonce_dsd(oui: bool) -> DsdCapability {
+pub(super) fn annonce_dsd(oui: bool) -> DsdCapability {
     DsdCapability {
         supports_dsf: oui,
         supports_dff: false,
         dsf_mime: oui.then(|| "audio/x-dsd".to_string()),
+        ..Default::default()
     }
 }
 
 impl Banc {
     /// La piste `ARMEE` devient un DSF ; la zone passe au mode DSD `mode` ;
     /// le renderer a annoncé `dsd` (GetProtocolInfo) et `suivante` (SCPD).
-    async fn monter_en_dsd(
+    pub(super) async fn monter_en_dsd(
         appareil: &str,
         mode: &str,
         dsd: DsdCapability,
@@ -93,7 +97,7 @@ impl Banc {
     }
 
     /// La fenêtre d'armement s'ouvre : quelques sondages.
-    async fn la_fenetre_d_armement(&mut self) {
+    pub(super) async fn la_fenetre_d_armement(&mut self) {
         for (position, horloge) in [(207_000, 210), (210_000, 213)] {
             self.renderer_a(position, horloge).await;
             self.tic().await;
@@ -146,12 +150,68 @@ async fn renderer_dsd_natif_qui_annonce_setnext_recoit_le_suivant_dsd() {
     );
 }
 
-/// Garde conservée : DSD brut forcé par le mode « natif » sur un renderer qui
-/// n'annonce PAS le DSD (comme l'Eversolo DMP-A8). Rien ne dit qu'il tient
-/// un suivant DSD.
+/// ⭐ #8969 (fil 2885, Eversolo DMP-A8 du .18) — épreuve. Zone en DSD
+/// « natif », renderer qui n'annonce PAS le DSD mais annonce `SetNext` : le
+/// DSF part brut à chaque piste (`dsd_natif_sans_annonce_du_renderer`), la
+/// suivante doit l'être aussi. Avant : `gapless_skipped_dsd_next_dlna
+/// raison="dsd_non_annonce"` à chaque piste, puis `SetAVTransportURI` +
+/// `Play` en fin de piste — un blanc à chaque changement de piste.
 #[tokio::test]
-async fn dsd_brut_force_sans_annonce_dsd_garde_la_garde() {
-    let appareil = "uuid:banc-6910-natif-force";
+async fn dsd_brut_force_sans_annonce_dsd_arme_la_suivante_8969() {
+    let appareil = "uuid:banc-8969-natif-force";
+    let mut banc = Banc::monter_en_dsd(
+        appareil,
+        "native",
+        annonce_dsd(false),
+        AnnonceSuivante::Annoncee,
+    )
+    .await;
+    banc.la_fenetre_d_armement().await;
+    assert_eq!(
+        banc.armees().await,
+        vec![ARMEE.to_string()],
+        "#8969 : en « natif », le DSD part brut — sa suivante doit être armée"
+    );
+    assert!(banc.poll_states[&banc.zone_id].gapless_sent);
+    assert!(
+        banc.poll_states[&banc.zone_id]
+            .gapless_dsd_skip_pos
+            .is_none()
+    );
+    let url = banc.url_armee_6910().await.unwrap_or_default();
+    assert!(
+        url.to_lowercase().ends_with(".dsf"),
+        "la suivante part en DSD brut, comme la piste en cours : {url}"
+    );
+}
+
+/// #8969 — contre-épreuve : même renderer en « natif » sans annonce DSD, mais
+/// SCPD illisible. Le « natif » ne lève que l'absence d'annonce DSD.
+#[tokio::test]
+async fn dsd_brut_force_scpd_illisible_garde_la_garde_8969() {
+    let appareil = "uuid:banc-8969-natif-scpd-inconnu";
+    let mut banc = Banc::monter_en_dsd(
+        appareil,
+        "native",
+        annonce_dsd(false),
+        AnnonceSuivante::Inconnue,
+    )
+    .await;
+    banc.la_fenetre_d_armement().await;
+    assert_eq!(banc.armees().await, Vec::<String>::new());
+    assert_eq!(
+        banc.poll_states[&banc.zone_id].gapless_dsd_skip_pos,
+        Some(1)
+    );
+}
+
+/// #8969 — contre-épreuve : renderer en « natif » sans annonce DSD dont la
+/// règle #6477 est apprise (FiiO K17 : il lâche la piste en cours dès le
+/// `SetNext`, #8868). Aucun `SetNext` : la fin de piste joue la suivante.
+#[tokio::test]
+async fn dsd_brut_force_regle_6477_apprise_pas_de_set_next_8969() {
+    let appareil = "uuid:banc-8969-natif-k17";
+    crate::outputs::dlna_repli_set_uri::memoriser_set_next_coupe_la_piste(appareil);
     let mut banc = Banc::monter_en_dsd(
         appareil,
         "native",
@@ -163,13 +223,9 @@ async fn dsd_brut_force_sans_annonce_dsd_garde_la_garde() {
     assert_eq!(
         banc.armees().await,
         Vec::<String>::new(),
-        "#402 : sans annonce DSD du renderer, le suivant DSD n'est pas armé"
+        "#6477 : plus aucun SetNext vers un renderer qui lâche la piste en cours"
     );
-    assert_eq!(
-        banc.poll_states[&banc.zone_id].gapless_dsd_skip_pos,
-        Some(1),
-        "la position écartée est verrouillée, comme avant"
-    );
+    assert!(!banc.poll_states[&banc.zone_id].gapless_sent);
 }
 
 /// Garde conservée : le renderer annonce le DSD, mais son SCPD n'a rien dit
@@ -192,9 +248,106 @@ async fn scpd_illisible_garde_la_garde() {
     );
 }
 
+impl Banc {
+    /// La piste `SUIVANTE` devient elle aussi un DSF : l'album continue en
+    /// DSD après la piste armée.
+    pub(super) async fn la_suivante_aussi_en_dsd(&mut self) {
+        let f = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
+        std::fs::copy(
+            format!("{}/tests/fixtures/dsd/{DSF}", env!("CARGO_MANIFEST_DIR")),
+            f.path(),
+        )
+        .unwrap();
+        let chemin = f.path().to_string_lossy().into_owned();
+        self.orchestrator
+            .db
+            .execute(
+                "UPDATE tracks SET file_path = ?, format = 'dsf', sample_rate = 2822400, \
+                 bit_depth = 1 WHERE title = ?",
+                &[
+                    &chemin as &dyn crate::db::backend::ToSqlValue,
+                    &SUIVANTE as &dyn crate::db::backend::ToSqlValue,
+                ],
+            )
+            .unwrap();
+        self._fichiers.push(f);
+    }
+
+    /// Le renderer joue la piste en cours à `position_ms`, durée rapportée
+    /// `duree_ms`, horloge de Tune à `horloge_secs`.
+    pub(super) async fn rs130_a(&mut self, position_ms: u64, duree_ms: u64, horloge_secs: u64) {
+        {
+            let reg = self.outputs.lock().await;
+            let arc = reg.get(&self.appareil).unwrap();
+            let sortie = arc.lock().await;
+            let mock = sortie.as_any().downcast_ref::<MockOutput>().unwrap();
+            mock.set_state(TransportState::Playing).await;
+            mock.set_duration(duree_ms);
+            mock.set_position(position_ms);
+        }
+        // La fin de piste a retiré l'état de sondage : la piste relancée en
+        // reçoit un neuf, comme après un `play()`.
+        let generation = self.playback.get_state(self.zone_id).await.track_generation;
+        let ps = self
+            .poll_states
+            .entry(self.zone_id)
+            .or_insert_with(|| ZonePollState::new(generation));
+        ps.track_started_at = Some(Instant::now() - Duration::from_secs(horloge_secs));
+        if position_ms > ps.peak_position_ms {
+            ps.peak_position_ms = position_ms;
+        }
+        ps.last_position_ms = position_ms;
+        self.tic().await;
+    }
+
+    /// Le RS130 au bout de la piste en cours : flux servi en entier, puis
+    /// arrêté à zéro sans passer au DSD armé. Rend vrai si Tune a relancé
+    /// (un `Play` de plus).
+    pub(super) async fn le_rs130_s_arrete_a_zero(&mut self) -> bool {
+        let flux = self
+            .playback
+            .get_state(self.zone_id)
+            .await
+            .now_playing
+            .and_then(|np| np.stream_id)
+            .expect("la piste en cours a un flux");
+        let total = self
+            .orchestrator
+            .streamer_total_bytes(&flux)
+            .await
+            .expect("la piste en cours a une taille connue");
+        self.le_renderer_tire(&flux, total).await;
+        let avant = self.play_complets().await.len();
+        for _ in 0..20 {
+            {
+                let reg = self.outputs.lock().await;
+                let arc = reg.get(&self.appareil).unwrap();
+                let sortie = arc.lock().await;
+                let mock = sortie.as_any().downcast_ref::<MockOutput>().unwrap();
+                mock.set_state(TransportState::Stopped).await;
+                mock.set_position(0);
+                mock.set_duration(0);
+            }
+            if let Some(ps) = self.poll_states.get_mut(&self.zone_id) {
+                ps.track_loaded_at = Instant::now() - Duration::from_secs(600);
+                if let Some(t) = ps.track_started_at {
+                    ps.track_started_at = Some(t - Duration::from_secs(1));
+                }
+            }
+            self.tic().await;
+            if self.play_complets().await.len() > avant {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// Le RS130 de #402 : il annonce tout, acquitte, puis s'arrête à zéro sans
-/// passer au DSD armé. La suivante est relancée (jamais un silence), et
-/// l'appareil retrouve la garde : une transition perdue, pas une par piste.
+/// passer au DSD armé. La suivante est relancée (jamais un silence). #9206 :
+/// ce premier échec est NOTÉ, l'appareil garde le suivant DSD ; au deuxième
+/// — la transition suivante, par le vrai `tick` — il retrouve la garde : deux
+/// transitions perdues, pas une par piste.
 #[tokio::test]
 async fn suivant_dsd_arme_non_suivi_rend_la_garde_a_l_appareil() {
     let appareil = "uuid:banc-6910-rs130";
@@ -205,60 +358,59 @@ async fn suivant_dsd_arme_non_suivi_rend_la_garde_a_l_appareil() {
         AnnonceSuivante::Annoncee,
     )
     .await;
+    banc.la_suivante_aussi_en_dsd().await;
     banc.la_fenetre_d_armement().await;
     assert_eq!(banc.armees().await, vec![ARMEE.to_string()]);
-    assert!(
-        banc.orchestrator
-            .dsd_suivant_tenu_sur_dlna(appareil, AnnonceSuivante::Annoncee)
-            .await
-    );
 
-    // La piste finie va au bout, le renderer s'arrête à zéro.
+    // Transition 1 : la piste finie va au bout, le renderer s'arrête à zéro.
     for (position, horloge) in [(225_000, 228), (236_000, 239)] {
         banc.renderer_a(position, horloge).await;
         banc.tic().await;
     }
-    let flux = banc.flux_finie.clone();
-    let total = banc
-        .orchestrator
-        .streamer_total_bytes(&flux)
-        .await
-        .expect("la piste finie a une taille connue");
-    banc.le_renderer_tire(&flux, total).await;
-    let mut relancee = false;
-    for _ in 0..20 {
-        {
-            let reg = banc.outputs.lock().await;
-            let arc = reg.get(appareil).unwrap();
-            let sortie = arc.lock().await;
-            let mock = sortie.as_any().downcast_ref::<MockOutput>().unwrap();
-            mock.set_state(TransportState::Stopped).await;
-            mock.set_position(0);
-            mock.set_duration(0);
-        }
-        if let Some(ps) = banc.poll_states.get_mut(&banc.zone_id) {
-            ps.track_loaded_at = Instant::now() - Duration::from_secs(600);
-            if let Some(t) = ps.track_started_at {
-                ps.track_started_at = Some(t - Duration::from_secs(1));
-            }
-        }
-        banc.tic().await;
-        if !banc.play_complets().await.is_empty() {
-            relancee = true;
-            break;
-        }
-    }
     assert!(
-        relancee,
+        banc.le_rs130_s_arrete_a_zero().await,
         "la suivante doit être relancée, jamais un silence"
     );
     assert_eq!(banc.play_complets().await, vec![ARMEE.to_string()]);
+    assert_eq!(
+        banc.orchestrator.echecs_dsd_suivant_pour_banc(appareil),
+        1,
+        "le suivant DSD lâché est noté"
+    );
+    assert!(
+        banc.orchestrator
+            .dsd_suivant_tenu_sur_dlna(banc.zone_id, appareil, AnnonceSuivante::Annoncee)
+            .await,
+        "#9206 : un seul suivant DSD lâché ne retire plus le sans-blanc DSD à l'appareil"
+    );
+
+    // Transition 2 : la piste armée (212 s) joue ; le suivant DSD est de
+    // nouveau armé, et de nouveau lâché.
+    banc.playback
+        .dater_le_demarrage(banc.zone_id, Duration::from_secs(300))
+        .await;
+    for (position, horloge) in [(150_000, 151), (182_000, 183), (185_000, 186)] {
+        banc.rs130_a(position, 212_000, horloge).await;
+    }
+    assert_eq!(
+        banc.armees().await,
+        vec![ARMEE.to_string(), SUIVANTE.to_string()],
+        "#9206 : le suivant DSD est encore tenté après un seul échec"
+    );
+    for (position, horloge) in [(200_000, 201), (211_000, 212)] {
+        banc.rs130_a(position, 212_000, horloge).await;
+    }
+    assert!(banc.le_rs130_s_arrete_a_zero().await);
+    assert_eq!(
+        banc.play_complets().await,
+        vec![ARMEE.to_string(), SUIVANTE.to_string()]
+    );
     assert!(
         !banc
             .orchestrator
-            .dsd_suivant_tenu_sur_dlna(appareil, AnnonceSuivante::Annoncee)
+            .dsd_suivant_tenu_sur_dlna(banc.zone_id, appareil, AnnonceSuivante::Annoncee)
             .await,
-        "#6910 : un renderer qui n'a pas suivi le DSD armé retrouve la garde de #402"
+        "#6910 : au deuxième suivant DSD lâché, le renderer retrouve la garde de #402"
     );
 }
 
@@ -353,20 +505,21 @@ mod raison_du_refus_6335 {
         assert!(ligne.contains("uuid:banc-6335-scpd-inconnu"), "{ligne}");
     }
 
-    /// DSD brut forcé sur un renderer qui ne l'annonce pas : limite de
-    /// l'appareil, dite comme telle.
+    /// #8969 — DSD brut forcé (« natif ») sur un renderer qui ne l'annonce
+    /// pas : l'absence d'annonce n'arrête plus rien, la ligne nomme la
+    /// condition qui manque VRAIMENT (ici le SCPD).
     #[tokio::test]
-    async fn dsd_non_annonce_nomme_dsd_non_annonce() {
+    async fn natif_sans_annonce_nomme_la_vraie_condition_manquante() {
         let ligne = ligne_de_refus(
             "uuid:banc-6335-natif-force",
             "native",
             annonce_dsd(false),
-            AnnonceSuivante::Annoncee,
+            AnnonceSuivante::Inconnue,
         )
         .await;
         assert!(
-            ligne.contains("dsd_non_annonce"),
-            "#6335 : le refus doit nommer l'absence d'annonce DSD : {ligne}"
+            ligne.contains("setnext_inconnu") && !ligne.contains("dsd_non_annonce"),
+            "#8969 : en « natif », le refus ne doit plus être dsd_non_annonce : {ligne}"
         );
     }
 }

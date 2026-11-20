@@ -179,6 +179,9 @@ async fn reprise_fabien_7280_titre_seul_deplace_la_vraie_sortie_factice() {
     q.append(
         zone_id,
         &[QueueInput::Streaming {
+            media_format: None,
+            sample_rate: None,
+            bit_depth: None,
             source: "qobuz".into(),
             source_id: SOURCE_ID.into(),
             title: "Titre seul".into(),
@@ -247,6 +250,9 @@ async fn reprise_fabien_7280_titre_seul_navigateur_garde_sa_position_sans_fausse
     q.append(
         zone_id,
         &[QueueInput::Streaming {
+            media_format: None,
+            sample_rate: None,
+            bit_depth: None,
             source: "qobuz".into(),
             source_id: SOURCE_ID.into(),
             title: "Titre seul".into(),

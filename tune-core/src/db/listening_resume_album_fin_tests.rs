@@ -14,6 +14,9 @@ fn base() -> (Arc<dyn DbBackend>, i64) {
 
 fn piste(id: &str) -> QueueInput {
     QueueInput::Streaming {
+        media_format: None,
+        sample_rate: None,
+        bit_depth: None,
         source: "qobuz".into(),
         source_id: id.into(),
         title: id.into(),

@@ -56,6 +56,8 @@ const PROTEGES: &[&str] = &[
     // L'adresse du serveur Snapcast : le serveur lui envoie des requêtes.
     "snapcast_host",
     "yt_dlp_path",
+    // Catalogue hérité des greffons (voir le préfixe `plugin_`).
+    "plugins",
 ];
 
 /// Préfixes protégés : authentification, licence, compte, relais, écoute à
@@ -77,6 +79,14 @@ const PREFIXES_PROTEGES: &[&str] = &[
     // #7855 : l'accès Subsonic ouvre une surface réseau, et il est Premium ;
     // il ne s'allume que par sa route dédiée.
     "subsonic_",
+    // Drapeaux des greffons (`plugin_{id}_installed`, `_enabled`, `_hidden`)
+    // et catalogue hérité : ils décident du code chargé au démarrage. Ils
+    // s'écrivent par les routes des greffons, gardées « cette machine ».
+    "plugin_",
+    // Greffons audio Premium retenus pendant une absence de licence
+    // (`premium_audio_plugins_withheld_*`) et leur migration : la licence
+    // retrouvée les rallume (`restore_withheld`).
+    "premium_audio_plugins_",
 ];
 
 /// Suffixes qui désignent un chemin, un exécutable ou l'adresse d'un service.

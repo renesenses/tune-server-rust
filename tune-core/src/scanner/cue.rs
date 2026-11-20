@@ -210,6 +210,10 @@ pub fn parse_cue_sheet(content: &str) -> CueSheet {
     // `INDEX 02`, `03`… reste à l'intérieur de la même piste et ne doit pas
     // rejouer ce rattachement.
     let mut fichier_ancre = false;
+    // #9014 — l'`INDEX 01` de la piste en cours a-t-il été lu ? Lui seul fixe
+    // le début ; un `INDEX 02`, `03`… est un SOUS-index (un mouvement, un
+    // passage repéré à l'intérieur de la piste) et ne déplace aucune borne.
+    let mut index01_vu = false;
 
     for raw in content.lines() {
         let Some((kw, rest)) = split_keyword(raw) else {
@@ -293,6 +297,7 @@ pub fn parse_cue_sheet(content: &str) -> CueSheet {
                 });
                 in_track = true;
                 fichier_ancre = false;
+                index01_vu = false;
             }
             "TITLE" => {
                 if in_track {
@@ -345,8 +350,22 @@ pub fn parse_cue_sheet(content: &str) -> CueSheet {
                     }
                     continue;
                 }
+                // #9014 — le début d'une piste est son `INDEX 01`. Un
+                // `INDEX 02`, `03`… est un sous-index À L'INTÉRIEUR de la
+                // piste : le laisser écrire `start_ms` faisait commencer la
+                // piste trop tard, et — la fin de la précédente étant ce
+                // début — la piste d'avant débordait d'autant sur celle-ci
+                // (fil 2685 : 3 min 50 s de « Let The Left Hand Know »
+                // jouées sous la piste 4). Faute d'`INDEX 01` (feuille
+                // abîmée), le premier index ≥ 01 tient lieu de début ; un
+                // `INDEX 01` écrit plus loin le remplace.
+                let est_index01 = idx.trim_start_matches('0') == "1";
+                if fichier_ancre && (index01_vu || !est_index01) {
+                    continue;
+                }
                 if let (Some(track), Some(ms)) = (sheet.tracks.last_mut(), parse_cue_time(time)) {
                     track.start_ms = ms;
+                    index01_vu = est_index01;
                     // 🔴 Le fichier d'une piste est celui qui porte son
                     // `INDEX 01`, pas celui qui était courant à sa
                     // DÉCLARATION. Dans une feuille EAC « gapless » (un `FILE`
@@ -359,10 +378,11 @@ pub fn parse_cue_sheet(content: &str) -> CueSheet {
                     // Le cas ordinaire — un seul `FILE`, des `INDEX` à de
                     // vrais décalages — n'est pas touché : `fichier_courant`
                     // y vaut la même chose aux deux instants.
-                    if !fichier_ancre {
-                        track.audio_file = fichier_courant.clone();
-                        fichier_ancre = true;
-                    }
+                    //
+                    // Un `INDEX 01` venu après un index de repli reprend
+                    // aussi le fichier : c'est lui qui décide.
+                    track.audio_file = fichier_courant.clone();
+                    fichier_ancre = true;
                 }
             }
             _ => {}
@@ -915,5 +935,73 @@ FILE "03. Sledgehammer.wav" WAVE
             b.extend_from_slice(&u.to_le_bytes());
         }
         assert_eq!(parse_cue_bytes(&b).album_title.as_deref(), Some("Écho"));
+    }
+
+    /// #9014 — la feuille du fil 2685 : la piste 5 porte `INDEX 00`, `01` et
+    /// `02`. Son début est l'`INDEX 01` ; l'`INDEX 02` est un sous-index qui
+    /// ne déplace aucune borne. La fin de la piste 4 est ce même `INDEX 01`
+    /// (règle du pré-gap inchangée : devant une piste AUDIO, l'`INDEX 00` ne
+    /// borne pas la précédente), et la piste 6 n'est pas touchée.
+    #[test]
+    fn un_index_02_ne_deplace_pas_le_debut_de_la_piste_9014() {
+        let s = parse_cue_sheet(concat!(
+            "FILE \"La Futura.flac\" WAVE\n",
+            "  TRACK 04 AUDIO\n    TITLE \"Quatre\"\n    INDEX 01 11:00:00\n",
+            "  TRACK 05 AUDIO\n    TITLE \"Let The Left Hand Know\"\n",
+            "    PERFORMER \"Billy F Gibbons\"\n",
+            "    INDEX 00 15:21:28\n    INDEX 01 15:25:03\n    INDEX 02 19:14:46\n",
+            "  TRACK 06 AUDIO\n    TITLE \"Six\"\n    INDEX 01 20:00:00\n",
+        ));
+        assert_eq!(s.tracks.len(), 3);
+        let index01 = parse_cue_time("15:25:03").unwrap();
+        assert_eq!(index01, 925_040);
+        let (quatre, cinq, six) = (&s.tracks[0], &s.tracks[1], &s.tracks[2]);
+        assert_eq!(cinq.start_ms, index01, "début de la piste 5 = son INDEX 01");
+        assert_eq!(
+            quatre.end_ms,
+            Some(index01),
+            "la piste 4 s'arrête à l'INDEX 01 de la 5, pas à son INDEX 02"
+        );
+        assert_eq!(quatre.start_ms, 660_000);
+        assert_eq!(cinq.end_ms, Some(1_200_000));
+        assert_eq!(six.start_ms, 1_200_000);
+        assert_eq!(six.end_ms, None);
+        assert!(
+            s.tracks
+                .iter()
+                .all(|t| t.audio_file.as_deref() == Some("La Futura.flac"))
+        );
+    }
+
+    /// #9014 — sans `INDEX 01`, le premier index ≥ 01 tient lieu de début ;
+    /// un `INDEX 01` écrit APRÈS un `INDEX 02` (ordre inhabituel) l'emporte.
+    #[test]
+    fn a_defaut_d_index_01_le_premier_index_tient_lieu_de_debut_9014() {
+        let sans_01 = parse_cue_sheet(
+            "FILE \"a.flac\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nINDEX 02 00:10:00\nINDEX 03 00:20:00\n",
+        );
+        assert_eq!(sans_01.tracks[1].start_ms, 10_000);
+        assert_eq!(sans_01.tracks[0].end_ms, Some(10_000));
+
+        let desordre = parse_cue_sheet(
+            "FILE \"a.flac\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00\nTRACK 02 AUDIO\nINDEX 02 00:30:00\nINDEX 01 00:10:00\nINDEX 03 00:40:00\n",
+        );
+        assert_eq!(desordre.tracks[1].start_ms, 10_000);
+        assert_eq!(desordre.tracks[0].end_ms, Some(10_000));
+    }
+
+    /// #9014 — feuille « gapless » EAC : l'`INDEX 02` d'une piste vit dans le
+    /// fichier de son `INDEX 01` ; il ne doit ni déplacer le début ni changer
+    /// le fichier de la piste.
+    #[test]
+    fn un_index_02_ne_change_pas_le_fichier_de_la_piste_9014() {
+        let s = parse_cue_sheet(concat!(
+            "FILE \"01.flac\" WAVE\nTRACK 01 AUDIO\nINDEX 01 00:00:00\n",
+            "TRACK 02 AUDIO\nINDEX 00 03:58:00\n",
+            "FILE \"02.flac\" WAVE\nINDEX 01 00:00:00\nINDEX 02 01:00:00\n",
+        ));
+        assert_eq!(s.tracks[1].audio_file.as_deref(), Some("02.flac"));
+        assert_eq!(s.tracks[1].start_ms, 0);
+        assert_eq!(s.tracks[0].end_ms, None);
     }
 }

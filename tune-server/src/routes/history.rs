@@ -102,6 +102,19 @@ async fn recent_history(
             None
         }
     };
+    // #8487 — les titres diffusés par les radios, rangés sous la ligne de
+    // leur station (`broadcast_titles`, le plus récent d'abord). Ils ne sont
+    // pas des lignes de l'historique : ni dans `total`, ni dans la pagination,
+    // ni dans aucune statistique. Une panne de lecture laisse la clé absente.
+    let stations: Vec<i64> = items
+        .iter()
+        .filter(|i| i.source == "radio" && i.context_type.as_deref() == Some("radio"))
+        .filter_map(|i| i.id)
+        .collect();
+    let mut diffuses =
+        tune_core::db::radio_titres_diffuses::pour_ecoutes(&state.backend, &stations)
+            .map_err(|e| tracing::warn!(error = %e, "titres_diffuses_illisibles"))
+            .ok();
     let items: Vec<Value> = items
         .into_iter()
         .enumerate()
@@ -109,6 +122,11 @@ async fn recent_history(
             let name = item.id.and_then(|id| names.get(&id));
             let mut value = json!(item);
             value["context_name"] = json!(name);
+            if let (Some(d), Some(id)) = (diffuses.as_mut(), item.id)
+                && stations.contains(&id)
+            {
+                value["broadcast_titles"] = json!(d.remove(&id).unwrap_or_default());
+            }
             if let Some(compte) = plays.as_ref().and_then(|p| p.get(i)) {
                 value["play_count"] = json!(compte);
             }

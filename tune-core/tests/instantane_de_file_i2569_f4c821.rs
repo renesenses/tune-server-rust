@@ -133,6 +133,9 @@ fn ouvrir(db_path: &str) -> Arc<dyn DbBackend> {
 fn album_de(n: i64) -> Vec<QueueInput> {
     (0..n)
         .map(|i| QueueInput::Streaming {
+            media_format: None,
+            sample_rate: None,
+            bit_depth: None,
             source: "qobuz".into(),
             source_id: format!("q{i}"),
             title: format!("Titre {i}"),
