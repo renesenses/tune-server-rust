@@ -64,19 +64,18 @@ async fn une_consigne_donnee_zone_arretee_part_au_debut_de_la_session_suivante_2
 
     let (mut session, recepteur) = session_et_recepteur().await;
     sortie.appliquer_le_volume_en_attente(&mut session).await;
-    // Une seconde application n'envoie plus rien : la consigne part une fois.
+    // La consigne part une fois ; la session suivante porte le volume de la
+    // zone que la sortie a retenu, le même niveau (#8855, GO du 20/11).
     sortie.appliquer_le_volume_en_attente(&mut session).await;
     drop(session);
     let requetes = recepteur.await.unwrap();
 
     let attendu = format!("volume: {:.1}", linear_to_airplay_db(0.30));
-    assert_eq!(
-        requetes.len(),
-        1,
-        "une seule commande attendue : {requetes:?}"
-    );
+    assert_eq!(requetes.len(), 2, "{requetes:?}");
     assert!(
-        requetes[0].starts_with("SET_PARAMETER ") && requetes[0].contains(&attendu),
+        requetes
+            .iter()
+            .all(|r| r.starts_with("SET_PARAMETER ") && r.contains(&attendu)),
         "la session doit porter la consigne : {requetes:?}"
     );
     assert!(sortie.volume_en_attente.lock().await.is_none());
