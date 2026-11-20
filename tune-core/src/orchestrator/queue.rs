@@ -50,6 +50,32 @@ pub(super) async fn flux_de_la_sonde_de_niveaux(
     )
 }
 
+/// La sonde de niveaux d'une piste de service devenue courante par avance
+/// sans blanc. #8795 — pour TIDAL, `get_track_url` retéléchargeait la piste
+/// qui joue entière (`tidal_dash_cache_stale_redownloading`, 81 segments et
+/// 119 Mo au fil 2836) sous le verrou du service, en même temps que le
+/// préchargement de la suivante. Décision du 20/11 : la sonde TIDAL ne vise
+/// qu'un fMP4 complet déjà au cache ou épinglé ; sinon pas de sonde (les
+/// aiguilles restent figées pour cette piste), et aucun téléchargement.
+pub(super) async fn flux_de_la_sonde_apres_avance(
+    svc: &dyn StreamingService,
+    source: &str,
+    source_id: &str,
+    provider_quality: Option<&str>,
+) -> Option<StreamUrl> {
+    if source == "tidal" {
+        let tidal = svc
+            .as_any()
+            .downcast_ref::<crate::streaming::tidal::TidalService>()?;
+        let flux = tidal.flux_complet_en_cache(source_id, provider_quality).await;
+        if flux.is_none() {
+            info!(source_id, "gapless_levels_tidal_sans_fichier_complet_8795");
+        }
+        return flux;
+    }
+    flux_de_la_sonde_de_niveaux(svc, source, source_id, provider_quality).await
+}
+
 /// #5143 — LE cœur de « la prochaine piste jouable » : depuis `position`,
 /// les lignes de file bannies pour le profil des sélections automatiques
 /// (locales par `track_id`, de service par `source` + `source_id`), et où
@@ -1427,7 +1453,7 @@ impl PlaybackOrchestrator {
                         let svc = svc.clone();
                         drop(registry);
                         let svc = svc.read().await;
-                        flux_de_la_sonde_de_niveaux(&**svc, &source, &source_id, provider_quality)
+                        flux_de_la_sonde_apres_avance(&**svc, &source, &source_id, provider_quality)
                             .await
                     };
                     let Some(data) = resolved else {
@@ -1723,3 +1749,7 @@ impl PlaybackOrchestrator {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "sonde_tidal_8795_tests.rs"]
+mod sonde_tidal_8795_tests;
