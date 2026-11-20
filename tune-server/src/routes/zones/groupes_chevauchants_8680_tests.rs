@@ -377,17 +377,56 @@ async fn une_lecture_sur_la_meneuse_ne_part_pas_en_cascade() {
     );
 }
 
-// --- #9240 : recomposer un groupe exige Premium -------------------------------
+// --- #9240 : gratuit jusqu'à 3 zones groupées, Premium au-delà ------------
+
+/// Cinq zones DLNA distinctes, sans Premium.
+async fn cinq_zones_sans_premium() -> (AppState, Vec<i64>) {
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let z = ["A", "B", "C", "D", "E"]
+        .iter()
+        .map(|n| {
+            repo.create(n, Some("dlna"), Some(&format!("uuid:9240-{n}")))
+                .unwrap()
+        })
+        .collect();
+    (state, z)
+}
+
+async fn creer(state: &AppState, zones: &[i64]) -> u16 {
+    let corps: super::CreateGroup = serde_json::from_value(json!({ "zone_ids": zones })).unwrap();
+    super::create_group(State(state.clone()), en_francais(), Json(corps))
+        .await
+        .ok()
+        .unwrap()
+        .into_response()
+        .status()
+        .as_u16()
+}
 
 #[tokio::test]
-async fn compte_gratuit_recomposer_un_groupe_est_refuse_402_9240() {
-    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
-    poser_les_groupes(&state, &[groupe(1, 1, &[1, 2])]);
-    assert_eq!(
-        patcher(&state, 1, json!({ "zone_ids": [1, 2, 3] })).await,
-        402
-    );
-    assert_eq!(lire_les_groupes(&state), vec![groupe(1, 1, &[1, 2])]);
-    // Renommer reste permis.
+async fn compte_gratuit_grouper_jusqu_a_3_zones_est_permis_9240() {
+    let (state, z) = cinq_zones_sans_premium().await;
+    assert_eq!(creer(&state, &z[..2]).await, 201);
+    assert_eq!(creer(&state, &z[..3]).await, 201);
+    assert_eq!(creer(&state, &z[..4]).await, 402);
+}
+
+#[tokio::test]
+async fn premium_grouper_4_zones_est_permis_9240() {
+    let (state, z) = cinq_zones_sans_premium().await;
+    state.license.set_account_premium(true, None).await;
+    assert_eq!(creer(&state, &z[..4]).await, 201);
+}
+
+#[tokio::test]
+async fn compte_gratuit_agrandir_refuse_reduire_permis_9240() {
+    let (state, z) = cinq_zones_sans_premium().await;
+    poser_les_groupes(&state, &[groupe(1, z[0], &z[..2])]);
+    assert_eq!(patcher(&state, 1, json!({ "zone_ids": &z[..4] })).await, 402);
+    assert_eq!(patcher(&state, 1, json!({ "zone_ids": &z[..3] })).await, 200);
+    // Un groupe de 4, formé quand le compte était Premium, se réduit.
+    poser_les_groupes(&state, &[groupe(1, z[0], &z[..4])]);
+    assert_eq!(patcher(&state, 1, json!({ "zone_ids": &z[..3] })).await, 200);
     assert_eq!(patcher(&state, 1, json!({ "name": "Rez" })).await, 200);
 }

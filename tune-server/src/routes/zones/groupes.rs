@@ -607,16 +607,6 @@ pub(super) async fn create_group(
     headers: axum::http::HeaderMap,
     Json(body): Json<CreateGroup>,
 ) -> Result<impl IntoResponse, AppError> {
-    // Premium gate: Multiroom sync requires Premium
-    if let Err(resp) = crate::premium_guard::require_premium(
-        &state.license,
-        tune_core::license::Feature::MultiroomSync,
-    )
-    .await
-    {
-        return Ok(resp);
-    }
-
     let lang = crate::i18n::lang_from_header(&headers);
     let zones = ZoneRepo::with_backend(state.backend.clone())
         .list()
@@ -625,6 +615,13 @@ pub(super) async fn create_group(
         Ok(ids) => ids,
         Err(refusal) => return Ok(group_refusal_response(&refusal, &lang)),
     };
+    // #9240 — gratuit jusqu'à 3 zones groupées, Premium au-delà (décision du
+    // 20/11/2026 ; Premium dès 2 zones auparavant).
+    if let Some(refus) =
+        crate::routes::zone_manager::refus_multiroom_sans_premium(&state, zone_ids.len(), 0).await
+    {
+        return Ok(refus);
+    }
     // #7759 — la lecture groupée n'est possible qu'en WASAPI.
     if let Some(refusal) = refus_du_groupe_asio(&state, &zone_ids, &zones).await {
         return Ok(group_refusal_response(&refusal, &lang));
@@ -738,11 +735,17 @@ pub(super) async fn patch_group(
                 groups[i]["name"] = json!(name);
             }
             if let Some(ref demandees) = body.zone_ids {
-                // #9240 — recomposer un groupe exige Premium, comme le créer
-                // (`create_group`) : sans cela, un groupe d'une zone se
-                // recomposait en multiroom sans le droit.
-                if let Some(refus) =
-                    crate::routes::zone_manager::refus_multiroom_sans_premium(&state).await
+                // #9240 — agrandir un groupe au-delà de 3 zones exige
+                // Premium, comme le créer ; le réduire, jamais.
+                let actuel = groups[i]["zone_ids"].as_array().map_or(0, |a| a.len());
+                let distinctes: std::collections::HashSet<i64> =
+                    demandees.iter().copied().collect();
+                if let Some(refus) = crate::routes::zone_manager::refus_multiroom_sans_premium(
+                    &state,
+                    distinctes.len(),
+                    actuel,
+                )
+                .await
                 {
                     return Ok(refus);
                 }

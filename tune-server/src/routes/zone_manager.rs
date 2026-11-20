@@ -66,14 +66,24 @@ pub fn router() -> Router<AppState> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// #9240 — le multiroom, OAAT compris, est une fonction Premium (décision du
-/// 20/11/2026). Même garde, même refus 402 `premium_required` (code
-/// `multiroom_sync`) que `POST /zones/group` (`zones/groupes.rs::create_group`) :
-/// ces routes la contournaient. Seules les routes qui CRÉENT un groupe ou y
-/// AJOUTENT un membre la portent ; retirer, supprimer, régler restent permis.
+/// #9240 — le multiroom (OAAT compris, et groupes DLNA, AirPlay, locaux) est
+/// gratuit jusqu'à [`tune_core::license::ZONES_GROUPEES_GRATUITES`] zones ou
+/// récepteurs dans un groupe ; au-delà, Premium (décision de Bertrand du
+/// 20/11/2026). Le refus est le 402 `premium_required` (code
+/// `multiroom_sync`) de `premium_guard`.
+///
+/// `resultant` : la taille du groupe APRÈS l'opération ; `actuel` : sa taille
+/// avant (0 à la création). Une opération qui ne fait pas grandir le groupe
+/// n'est jamais refusée : un compte redevenu gratuit peut toujours réduire un
+/// grand groupe. Les paires stéréo ne passent pas par ici (gratuites).
 pub(crate) async fn refus_multiroom_sans_premium(
     state: &AppState,
+    resultant: usize,
+    actuel: usize,
 ) -> Option<axum::response::Response> {
+    if resultant <= tune_core::license::ZONES_GROUPEES_GRATUITES || resultant <= actuel {
+        return None;
+    }
     crate::premium_guard::require_premium(
         &state.license,
         tune_core::license::Feature::MultiroomSync,
@@ -464,8 +474,9 @@ async fn create_group(
     State(state): State<AppState>,
     Json(body): Json<CreateGroupRequest>,
 ) -> impl IntoResponse {
-    // #9240 — Premium, comme `POST /zones/group`.
-    if let Some(refus) = refus_multiroom_sans_premium(&state).await {
+    // #9240 — au-delà de 3 zones, Premium (même règle que `POST /zones/group`).
+    let distinctes: std::collections::HashSet<i64> = body.zone_ids.iter().copied().collect();
+    if let Some(refus) = refus_multiroom_sans_premium(&state, distinctes.len(), 0).await {
         return refus;
     }
     // #7759 — même règle que `POST /zones/group` : la lecture groupée n'est
@@ -513,8 +524,13 @@ async fn update_group(
                 groups[i]["name"] = json!(name);
             }
             if let Some(ref zone_ids) = body.zone_ids {
-                // #9240 — recomposer un groupe exige Premium, comme le créer.
-                if let Some(refus) = refus_multiroom_sans_premium(&state).await {
+                // #9240 — l'agrandir au-delà de 3 zones exige Premium ; le
+                // réduire, jamais.
+                let actuel = groups[i]["zone_ids"].as_array().map_or(0, |a| a.len());
+                let distinctes: std::collections::HashSet<i64> = zone_ids.iter().copied().collect();
+                if let Some(refus) =
+                    refus_multiroom_sans_premium(&state, distinctes.len(), actuel).await
+                {
                     return refus;
                 }
                 // #7759 — étendre un groupe à une zone ASIO est refusé.
@@ -1166,10 +1182,6 @@ async fn create_oaat_group(
     State(state): State<AppState>,
     Json(body): Json<Value>,
 ) -> axum::response::Response {
-    // #9240 — le multiroom OAAT est Premium, comme `POST /zones/group`.
-    if let Some(refus) = refus_multiroom_sans_premium(&state).await {
-        return refus;
-    }
     let name = body["name"].as_str().unwrap_or("OAAT Group");
     let endpoints: Vec<(String, u16)> = body["endpoints"]
         .as_array()
@@ -1188,6 +1200,11 @@ async fn create_oaat_group(
             Json(json!({ "error": "at least one endpoint required" })),
         )
             .into_response();
+    }
+    // #9240 — au-delà de 3 récepteurs, Premium ; un seul récepteur est
+    // toujours permis.
+    if let Some(refus) = refus_multiroom_sans_premium(&state, endpoints.len(), 0).await {
+        return refus;
     }
 
     // Un groupe qui ne peut pas jouer ne doit pas pouvoir se créer (#1779).
@@ -1304,10 +1321,6 @@ async fn oaat_group_add_endpoint(
     Path(id): Path<String>,
     Json(body): Json<Value>,
 ) -> axum::response::Response {
-    // #9240 — ajouter un récepteur à un groupe OAAT exige Premium.
-    if let Some(refus) = refus_multiroom_sans_premium(&state).await {
-        return refus;
-    }
     let device_id = format!("oaat-group:{id}");
     let host = body["host"].as_str().unwrap_or("");
     let port = body["port"].as_u64().unwrap_or(9740) as u16;
@@ -1321,6 +1334,11 @@ async fn oaat_group_add_endpoint(
     if let Some(output) = sortie {
         let output = output.lock().await;
         if let Some(mr) = downcast_oaat_multiroom(&**output) {
+            // #9240 — un 4e récepteur exige Premium.
+            let actuel = mr.nombre_de_recepteurs().await;
+            if let Some(refus) = refus_multiroom_sans_premium(&state, actuel + 1, actuel).await {
+                return refus;
+            }
             match mr.add_endpoint(host, port).await {
                 Ok(ep_id) => {
                     info!(group = %id, endpoint_id = %ep_id, "oaat_group_endpoint_added");

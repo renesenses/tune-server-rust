@@ -1,9 +1,10 @@
-//! #9240 — le multiroom, OAAT compris, est Premium (décision du 20/11/2026) :
-//! les routes du gestionnaire de zones qui créent un groupe ou y ajoutent un
-//! membre rendent le même refus 402 que `POST /zones/group`.
+//! #9240 — le multiroom est gratuit jusqu'à 3 zones ou récepteurs dans un
+//! groupe, OAAT compris ; au-delà, Premium (décision de Bertrand du
+//! 20/11/2026). Les routes du gestionnaire de zones appliquent la règle comme
+//! `POST /zones/group` ; une réduction n'est jamais refusée.
 //!
-//! Contre-épreuve : retirer l'appel à `refus_multiroom_sans_premium` d'une
-//! route fait tomber son témoin « compte gratuit ».
+//! Contre-épreuve : neutraliser `refus_multiroom_sans_premium` fait tomber les
+//! témoins « 4 → 402 ».
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
@@ -49,11 +50,16 @@ fn est_le_refus_premium(statut: StatusCode, corps: &Value) -> bool {
         && corps["code"] == "multiroom_sync"
 }
 
-/// Un récepteur OAAT joignable : un port TCP qui accepte.
-async fn recepteur_joignable() -> (tokio::net::TcpListener, u16) {
-    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = ecoute.local_addr().unwrap().port();
-    (ecoute, port)
+/// `n` récepteurs OAAT joignables : des ports TCP qui acceptent.
+async fn recepteurs(n: usize) -> (Vec<tokio::net::TcpListener>, Value) {
+    let mut ecoutes = Vec::new();
+    let mut points = Vec::new();
+    for _ in 0..n {
+        let e = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        points.push(json!({"host": "127.0.0.1", "port": e.local_addr().unwrap().port()}));
+        ecoutes.push(e);
+    }
+    (ecoutes, json!(points))
 }
 
 fn groupes_oaat(state: &crate::state::AppState) -> usize {
@@ -64,96 +70,139 @@ fn groupes_oaat(state: &crate::state::AppState) -> usize {
         .map_or(0, |g| g.len())
 }
 
-#[tokio::test]
-async fn compte_gratuit_un_groupe_oaat_est_refuse_402_9240() {
-    let state = etat(false).await;
-    let (_ecoute, port) = recepteur_joignable().await;
-    let (statut, corps) = envoyer(
-        &state,
+async fn creer_oaat(state: &crate::state::AppState, n: usize) -> (StatusCode, Value) {
+    let (_ecoutes, points) = recepteurs(n).await;
+    envoyer(
+        state,
         "POST",
         "/oaat-groups",
-        json!({ "name": "Salon + Cuisine", "endpoints": [{"host": "127.0.0.1", "port": port}] }),
+        json!({ "name": "Maison", "endpoints": points }),
     )
-    .await;
+    .await
+}
+
+#[tokio::test]
+async fn compte_gratuit_oaat_jusqu_a_3_recepteurs_est_permis_9240() {
+    for n in [1, 2, 3] {
+        let state = etat(false).await;
+        let (statut, corps) = creer_oaat(&state, n).await;
+        assert_eq!(statut, StatusCode::OK, "{n} récepteur(s) : {corps}");
+        assert_eq!(groupes_oaat(&state), 1);
+    }
+}
+
+#[tokio::test]
+async fn compte_gratuit_oaat_4_recepteurs_est_refuse_402_9240() {
+    let state = etat(false).await;
+    let (statut, corps) = creer_oaat(&state, 4).await;
     assert!(est_le_refus_premium(statut, &corps), "{statut} {corps}");
     assert_eq!(groupes_oaat(&state), 0, "rien ne doit être enregistré");
 }
 
-/// Témoin : le même groupe, avec Premium, est créé.
 #[tokio::test]
-async fn premium_un_groupe_oaat_est_cree_9240() {
+async fn premium_oaat_4_recepteurs_est_cree_9240() {
     let state = etat(true).await;
-    let (_ecoute, port) = recepteur_joignable().await;
-    let (statut, corps) = envoyer(
-        &state,
-        "POST",
-        "/oaat-groups",
-        json!({ "name": "Salon + Cuisine", "endpoints": [{"host": "127.0.0.1", "port": port}] }),
-    )
-    .await;
+    let (statut, corps) = creer_oaat(&state, 4).await;
     assert_eq!(statut, StatusCode::OK, "{corps}");
     assert_eq!(groupes_oaat(&state), 1);
 }
 
+/// Ajouter un 4e récepteur à un groupe OAAT de 3 : Premium.
+#[cfg(feature = "oaat")]
 #[tokio::test]
-async fn compte_gratuit_ajouter_un_recepteur_oaat_est_refuse_402_9240() {
+async fn compte_gratuit_un_4e_recepteur_oaat_est_refuse_402_9240() {
     let state = etat(false).await;
+    let points: Vec<(String, u16)> = (0..3)
+        .map(|i| ("127.0.0.1".to_string(), 9_741 + i))
+        .collect();
+    let sortie = tune_core::outputs::oaat::OaatMultiroomOutput::new(
+        "Maison".into(),
+        "oaat-mr-9240".into(),
+        points,
+    );
+    state.outputs.lock().await.register(Box::new(sortie));
     let (statut, corps) = envoyer(
         &state,
         "POST",
-        "/oaat-groups/oaat-mr-1/endpoints",
-        json!({ "host": "127.0.0.1", "port": 9740 }),
+        "/oaat-groups/oaat-mr-9240/endpoints",
+        json!({ "host": "127.0.0.1", "port": 9_750 }),
     )
     .await;
-    #[cfg(feature = "oaat")]
     assert!(est_le_refus_premium(statut, &corps), "{statut} {corps}");
-    #[cfg(not(feature = "oaat"))]
-    let _ = (statut, corps);
 }
 
-/// Le gestionnaire de zones crée et recompose aussi des groupes de zones :
-/// même règle que `POST /zones/group`.
+/// Le gestionnaire de zones crée et recompose aussi des groupes de zones.
 #[tokio::test]
-async fn compte_gratuit_le_gestionnaire_ne_groupe_pas_les_zones_9240() {
+async fn compte_gratuit_le_gestionnaire_groupe_jusqu_a_3_zones_9240() {
     let state = etat(false).await;
+    for zones in [json!([1, 2]), json!([1, 2, 3])] {
+        let (statut, corps) = envoyer(
+            &state,
+            "POST",
+            "/groups",
+            json!({ "name": "G", "zone_ids": zones }),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::CREATED, "{zones} : {corps}");
+    }
     let (statut, corps) = envoyer(
         &state,
         "POST",
         "/groups",
-        json!({ "name": "Tout", "zone_ids": [1, 2] }),
+        json!({ "name": "G", "zone_ids": [1, 2, 3, 4] }),
     )
     .await;
     assert!(est_le_refus_premium(statut, &corps), "{statut} {corps}");
-
-    SettingsRepo::with_backend(state.backend.clone())
-        .set(
-            "zone_groups",
-            &json!([{ "id": 1, "name": "G1", "zone_ids": [1, 2] }]).to_string(),
-        )
-        .unwrap();
-    let (statut, corps) = envoyer(
-        &state,
-        "PATCH",
-        "/groups/1",
-        json!({ "zone_ids": [1, 2, 3] }),
-    )
-    .await;
-    assert!(est_le_refus_premium(statut, &corps), "{statut} {corps}");
-    // Renommer n'ajoute personne : permis.
-    let (statut, _) = envoyer(&state, "PATCH", "/groups/1", json!({ "name": "Rez" })).await;
-    assert_eq!(statut, StatusCode::OK);
 }
 
-/// Témoin : avec Premium, le gestionnaire crée le groupe.
 #[tokio::test]
-async fn premium_le_gestionnaire_groupe_les_zones_9240() {
+async fn premium_le_gestionnaire_groupe_4_zones_9240() {
     let state = etat(true).await;
     let (statut, corps) = envoyer(
         &state,
         "POST",
         "/groups",
-        json!({ "name": "Tout", "zone_ids": [1, 2] }),
+        json!({ "name": "G", "zone_ids": [1, 2, 3, 4] }),
     )
     .await;
     assert_eq!(statut, StatusCode::CREATED, "{corps}");
+}
+
+fn poser_un_groupe(state: &crate::state::AppState, zones: Value) {
+    SettingsRepo::with_backend(state.backend.clone())
+        .set(
+            "zone_groups",
+            &json!([{ "id": 1, "name": "G1", "zone_ids": zones }]).to_string(),
+        )
+        .unwrap();
+}
+
+/// Agrandir au-delà de 3 : Premium. Réduire un groupe de 4 (formé quand le
+/// compte était Premium) : toujours permis.
+#[tokio::test]
+async fn compte_gratuit_agrandir_refuse_reduire_permis_9240() {
+    let state = etat(false).await;
+    poser_un_groupe(&state, json!([1, 2]));
+    let (statut, corps) = envoyer(
+        &state,
+        "PATCH",
+        "/groups/1",
+        json!({ "zone_ids": [1, 2, 3, 4] }),
+    )
+    .await;
+    assert!(est_le_refus_premium(statut, &corps), "{statut} {corps}");
+    let (statut, _) = envoyer(&state, "PATCH", "/groups/1", json!({ "zone_ids": [1, 2, 3] })).await;
+    assert_eq!(statut, StatusCode::OK, "passer à 3 zones est gratuit");
+
+    poser_un_groupe(&state, json!([1, 2, 3, 4, 5]));
+    let (statut, corps) = envoyer(
+        &state,
+        "PATCH",
+        "/groups/1",
+        json!({ "zone_ids": [1, 2, 3, 4] }),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "réduire n'est jamais refusé : {corps}");
+    let (statut, _) = envoyer(&state, "PATCH", "/groups/1", json!({ "name": "Rez" })).await;
+    assert_eq!(statut, StatusCode::OK);
 }
