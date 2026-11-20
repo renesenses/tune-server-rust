@@ -474,6 +474,9 @@ async fn sortie_de_radio(lit: bool) -> (Duration, bool, bool) {
         .await
         .unwrap();
     let _ = reponse.chunk().await;
+    // La connexion du renderer arrêté reste ouverte jusqu'à la fin du test :
+    // la réponse est tenue ici, puis rendue après le verdict.
+    let mut reponse_tenue = None;
     let lecteur = if lit {
         Some(tokio::spawn(async move {
             while let Ok(Some(_)) = reponse.chunk().await {}
@@ -501,7 +504,7 @@ async fn sortie_de_radio(lit: bool) -> (Duration, bool, bool) {
             session.consommateurs_radio_tous_en_ecriture(),
             "le corps immobile doit être noté arrêté sur l'écriture"
         );
-        std::mem::forget(reponse);
+        reponse_tenue = Some(reponse);
         None
     };
     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -515,5 +518,6 @@ async fn sortie_de_radio(lit: bool) -> (Duration, bool, bool) {
     if let Some(l) = lecteur {
         l.abort();
     }
+    drop(reponse_tenue);
     resultat
 }
