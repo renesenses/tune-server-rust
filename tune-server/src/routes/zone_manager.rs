@@ -66,6 +66,22 @@ pub fn router() -> Router<AppState> {
 // Helpers
 // ---------------------------------------------------------------------------
 
+/// #9240 — le multiroom, OAAT compris, est une fonction Premium (décision du
+/// 20/11/2026). Même garde, même refus 402 `premium_required` (code
+/// `multiroom_sync`) que `POST /zones/group` (`zones/groupes.rs::create_group`) :
+/// ces routes la contournaient. Seules les routes qui CRÉENT un groupe ou y
+/// AJOUTENT un membre la portent ; retirer, supprimer, régler restent permis.
+pub(crate) async fn refus_multiroom_sans_premium(
+    state: &AppState,
+) -> Option<axum::response::Response> {
+    crate::premium_guard::require_premium(
+        &state.license,
+        tune_core::license::Feature::MultiroomSync,
+    )
+    .await
+    .err()
+}
+
 fn load_json_setting(settings: &SettingsRepo, key: &str) -> Vec<Value> {
     settings
         .get(key)
@@ -448,6 +464,10 @@ async fn create_group(
     State(state): State<AppState>,
     Json(body): Json<CreateGroupRequest>,
 ) -> impl IntoResponse {
+    // #9240 — Premium, comme `POST /zones/group`.
+    if let Some(refus) = refus_multiroom_sans_premium(&state).await {
+        return refus;
+    }
     // #7759 — même règle que `POST /zones/group` : la lecture groupée n'est
     // possible qu'en WASAPI.
     if let Some(refus) = refus_asio_du_gestionnaire(&state, &body.zone_ids).await {
@@ -493,6 +513,10 @@ async fn update_group(
                 groups[i]["name"] = json!(name);
             }
             if let Some(ref zone_ids) = body.zone_ids {
+                // #9240 — recomposer un groupe exige Premium, comme le créer.
+                if let Some(refus) = refus_multiroom_sans_premium(&state).await {
+                    return refus;
+                }
                 // #7759 — étendre un groupe à une zone ASIO est refusé.
                 if let Some(refus) = refus_asio_du_gestionnaire(&state, zone_ids).await {
                     return refus;
@@ -1141,7 +1165,11 @@ pub(crate) async fn unreachable_endpoints_avec_delai(
 async fn create_oaat_group(
     State(state): State<AppState>,
     Json(body): Json<Value>,
-) -> (StatusCode, Json<Value>) {
+) -> axum::response::Response {
+    // #9240 — le multiroom OAAT est Premium, comme `POST /zones/group`.
+    if let Some(refus) = refus_multiroom_sans_premium(&state).await {
+        return refus;
+    }
     let name = body["name"].as_str().unwrap_or("OAAT Group");
     let endpoints: Vec<(String, u16)> = body["endpoints"]
         .as_array()
@@ -1158,7 +1186,8 @@ async fn create_oaat_group(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": "at least one endpoint required" })),
-        );
+        )
+            .into_response();
     }
 
     // Un groupe qui ne peut pas jouer ne doit pas pouvoir se créer (#1779).
@@ -1184,7 +1213,8 @@ async fn create_oaat_group(
                 "message_key": "api.groups.unreachableEndpoints",
                 "unreachable_endpoints": unreachable,
             })),
-        );
+        )
+            .into_response();
     }
 
     let group_id = format!(
@@ -1229,6 +1259,7 @@ async fn create_oaat_group(
             "device_id": format!("oaat-group:{group_id}"),
         }))),
     )
+        .into_response()
 }
 
 async fn delete_oaat_group(State(state): State<AppState>, Path(id): Path<String>) -> Json<Value> {
@@ -1272,13 +1303,17 @@ async fn oaat_group_add_endpoint(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<Value>,
-) -> Json<Value> {
+) -> axum::response::Response {
+    // #9240 — ajouter un récepteur à un groupe OAAT exige Premium.
+    if let Some(refus) = refus_multiroom_sans_premium(&state).await {
+        return refus;
+    }
     let device_id = format!("oaat-group:{id}");
     let host = body["host"].as_str().unwrap_or("");
     let port = body["port"].as_u64().unwrap_or(9740) as u16;
 
     if host.is_empty() {
-        return Json(json!({ "error": "host is required" }));
+        return Json(json!({ "error": "host is required" })).into_response();
     }
 
     // #8006 — le registre est relâché avant d'attendre la sortie.
@@ -1289,14 +1324,15 @@ async fn oaat_group_add_endpoint(
             match mr.add_endpoint(host, port).await {
                 Ok(ep_id) => {
                     info!(group = %id, endpoint_id = %ep_id, "oaat_group_endpoint_added");
-                    return Json(json!({ "endpoint_id": ep_id, "host": host, "port": port }));
+                    return Json(json!({ "endpoint_id": ep_id, "host": host, "port": port }))
+                        .into_response();
                 }
-                Err(e) => return Json(json!({ "error": e })),
+                Err(e) => return Json(json!({ "error": e })).into_response(),
             }
         }
     }
 
-    Json(json!({ "error": "group not found" }))
+    Json(json!({ "error": "group not found" })).into_response()
 }
 
 #[cfg(not(feature = "oaat"))]
@@ -1426,6 +1462,9 @@ fn downcast_oaat_multiroom(
 #[cfg(test)]
 #[path = "zone_manager_8185_tests.rs"]
 mod creation_oaat_refusee_8185_tests;
+#[cfg(test)]
+#[path = "zone_manager_premium_9240_tests.rs"]
+mod multiroom_premium_9240_tests;
 
 #[cfg(test)]
 mod tests {

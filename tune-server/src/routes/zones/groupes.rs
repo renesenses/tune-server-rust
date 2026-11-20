@@ -738,6 +738,14 @@ pub(super) async fn patch_group(
                 groups[i]["name"] = json!(name);
             }
             if let Some(ref demandees) = body.zone_ids {
+                // #9240 — recomposer un groupe exige Premium, comme le créer
+                // (`create_group`) : sans cela, un groupe d'une zone se
+                // recomposait en multiroom sans le droit.
+                if let Some(refus) =
+                    crate::routes::zone_manager::refus_multiroom_sans_premium(&state).await
+                {
+                    return Ok(refus);
+                }
                 // #6132 — la sortie double suit la composition du groupe.
                 let zones = ZoneRepo::with_backend(state.backend.clone())
                     .list()
