@@ -328,6 +328,7 @@ chaîne. C'est le comportement de #7632.
 | `nothing_to_protect` | headroom automatique sans aucun traitement effectif |
 | `volume_not_software` | volume réglé par l'appareil, ou volume fixe |
 | `nothing_to_quantize` | rien ne modifie les échantillons ; le détail dit « Bit-perfect » |
+| `not_in_service` | T16 : résolu effectif, mais l'étage ne tourne pas (exécuteur ou sonde de la sortie) |
 
 ### Badge (A4)
 
@@ -338,6 +339,9 @@ chaîne. C'est le comportement de #7632.
   - avec une source DSD native.
 - **`processed_by_tess`** : « Processed by TESS · 64-bit ».
 - **`outside_tess`** : zone hors TESS.
+- **`altered_outside_tess`** (T16) : TESS ne touche à rien, mais le chemin
+  n'est pas intact (transport, source), ou une zone hors TESS dont un
+  traitement tourne malgré tout. Jamais « Bit-perfect » sur un chemin altéré.
 
 ### Comportements particuliers
 
@@ -707,6 +711,17 @@ producteur et le rendu transporte des `f64`**, et que la quantification
   préréglage), et `latency_frames`.
 - Le chemin du signal ne ment jamais : chaque étape `effective` correspond à un
   étage réellement en service.
+- Fait (T16) : `tess::chemin::chemin_du_signal` rapproche la résolution de ce
+  qui tourne (`EnService` : liste exacte de l'exécuteur, ou sonde de la sortie
+  tant que l'exécuteur n'est pas branché par zone) ; le réel l'emporte dans
+  les deux sens et chaque écart est publié dans `discrepancies`
+  (`requested_not_running`, `running_not_requested`). Le serveur l'ajoute
+  sous `signal_path.tess` (zone, liste des zones, instantané WS). Ordre
+  publié : `source → headroom → greffons (ordre réel) → upsampling → volume →
+  quantization (« Dither ») → output`, ou `… → volume → dsd_modulator →
+  output` vers DSD. Les étapes contournées gardent leur motif (`bypass_all`,
+  `pure_mode`, `dsd_source_native`, `volume_not_software`…) ; un greffon
+  décoché par la marque `inert_on_network` (D2) le dit dans `detail`.
 
 ### T19 : droits
 

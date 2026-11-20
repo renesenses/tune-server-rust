@@ -37,6 +37,10 @@ pub mod discovery;
 pub mod event_bus;
 pub mod event_types;
 pub mod favorites_sort;
+/// #6522, TESS T16 — greffon natif de test construit et chargé par le banc.
+#[cfg(any(test, feature = "services-factices"))]
+#[doc(hidden)]
+pub mod greffon_natif_de_test;
 pub mod health;
 pub mod health_monitor;
 pub mod http;
