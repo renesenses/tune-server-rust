@@ -367,8 +367,10 @@ async fn delete_playlist(
 /// Une playlist « disparue » ne se distinguait pas d'une playlist supprimée
 /// d'un clic de trop : `DELETE /playlists/{id}` est la seule voie qui efface
 /// une ligne de `playlists`, et elle ne journalisait rien. Une ligne INFO
-/// `playlist_supprimee` dit désormais quoi (identifiant, nom, nombre de
-/// lignes), pour qui (profil) et quand (l'horodatage du journal).
+/// `playlist_supprimee` dit désormais quoi (identifiant, nombre de lignes),
+/// pour qui (profil) et quand (l'horodatage du journal). Le nom de la
+/// playlist n'y figure PAS (web#3090) : il est choisi par l'utilisateur et
+/// n'a pas à sortir dans les journaux ; l'identifiant suffit à la retrouver.
 ///
 /// La playlist est lue AVANT la suppression, sous la même garde de profil :
 /// après, il n'y a plus rien à lire. Une lecture en échec ne bloque pas la
@@ -386,7 +388,6 @@ pub(crate) fn supprimer_et_journaliser(
             Some(p) => tracing::info!(
                 playlist_id = id,
                 profile_id,
-                nom = %p.name,
                 lignes = p.track_count,
                 "playlist_supprimee"
             ),
