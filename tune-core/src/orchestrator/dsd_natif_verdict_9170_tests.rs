@@ -215,7 +215,10 @@ fn une_piste_pcm_d_une_zone_native_inconnue_demande_le_sondage() {
         None,
         "piste DSD : la résolution DSD s'en charge"
     );
-    assert_eq!(demande(false, Some(AudioFormat::Flac), Some(id), natif), None);
+    assert_eq!(
+        demande(false, Some(AudioFormat::Flac), Some(id), natif),
+        None
+    );
     let connu = "9211 Z8 deja sonde";
     retenir(connu, CapaciteConnue::AlsaDsdU32 { cadences: vec![] });
     assert_eq!(
@@ -233,7 +236,9 @@ fn une_piste_pcm_d_une_zone_native_inconnue_demande_le_sondage() {
     // la demande.
     let src = std::fs::read_to_string("src/orchestrator/resolve_local.rs").unwrap();
     let appel = "if let Some(nom) = sortie_a_sonder_pour_une_piste_pcm(";
-    let i = src.find(appel).expect("la garde de #8248 n'est plus appelée");
+    let i = src
+        .find(appel)
+        .expect("la garde de #8248 n'est plus appelée");
     assert!(
         src[i..i + 600].contains("demander_sondage_a_l_ouverture(nom)"),
         "la garde de #8248 ne pose plus la demande"
