@@ -7086,8 +7086,6 @@ dependencies = [
  "unicode-normalization",
  "urlencoding",
  "uuid",
- "windows",
- "windows-registry",
  "zip",
 ]
 

@@ -28,7 +28,8 @@
 //!    adresse ouvrir.
 //!
 //! Les décisions sont des fonctions pures, éprouvées sur toutes les machines ;
-//! seuls la lecture du registre, le shell et le lancement sont propres à
+//! seuls la lecture du registre (en UTF-16, par l'API), le shell et le
+//! lancement sont propres à
 //! Windows. L'appel est bloquant : `bootstrap` le passe en `spawn_blocking`.
 
 use std::path::{Path, PathBuf};
@@ -160,27 +161,64 @@ pub(crate) fn ligne_de_l_avis(url: &str) -> String {
 mod systeme {
     use super::*;
     use std::os::windows::process::CommandExt;
-    use windows::Win32::System::Com::{
+    use tune_core::windows::Win32::Foundation::ERROR_SUCCESS;
+    use tune_core::windows::Win32::System::Com::{
         COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx,
     };
-    use windows::Win32::UI::Shell::{
+    use tune_core::windows::Win32::System::Registry::{
+        HKEY, HKEY_CLASSES_ROOT, HKEY_CURRENT_USER, KEY_READ, RRF_RT_REG_SZ, RegCloseKey,
+        RegGetValueW, RegOpenKeyExW,
+    };
+    use tune_core::windows::Win32::UI::Shell::{
         ASSOCF_IS_PROTOCOL, ASSOCF_NONE, ASSOCSTR_EXECUTABLE, AssocQueryStringW,
         SEE_MASK_FLAG_NO_UI, SEE_MASK_NOASYNC, SHELLEXECUTEINFOW, ShellExecuteExW,
     };
-    use windows::core::{HSTRING, PCWSTR, PWSTR};
+    use tune_core::windows::core::{HSTRING, PCWSTR, PWSTR};
 
     const CREATE_NO_WINDOW: u32 = crate::lancement_sans_console::CREATE_NO_WINDOW;
 
+    /// `HKCU\…\UrlAssociations\http\UserChoice`, valeur `ProgId`, lue en
+    /// UTF-16 par l'API (aucune page de code en jeu).
     fn prog_id_choisi() -> Option<String> {
-        windows_registry::CURRENT_USER
-            .open(r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice")
-            .ok()?
-            .get_string("ProgId")
-            .ok()
+        let cle = HSTRING::from(
+            r"Software\Microsoft\Windows\Shell\Associations\UrlAssociations\http\UserChoice",
+        );
+        let valeur = HSTRING::from("ProgId");
+        let mut tampon = vec![0u16; 512];
+        let mut octets = (tampon.len() * 2) as u32;
+        // SAFETY: le tampon vit le temps de l'appel ; `octets` dit sa taille.
+        let r = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                &cle,
+                &valeur,
+                RRF_RT_REG_SZ,
+                None,
+                Some(tampon.as_mut_ptr().cast()),
+                Some(&mut octets),
+            )
+        };
+        if r != ERROR_SUCCESS {
+            return None;
+        }
+        let n = (octets as usize / 2).min(tampon.len());
+        let fin = tampon[..n].iter().position(|c| *c == 0).unwrap_or(n);
+        let id = String::from_utf16_lossy(&tampon[..fin]);
+        (!id.trim().is_empty()).then_some(id)
     }
 
     fn cle_existe(prog_id: &str) -> bool {
-        windows_registry::CLASSES_ROOT.open(prog_id).is_ok()
+        let cle = HSTRING::from(prog_id);
+        let mut h = HKEY::default();
+        // SAFETY: `h` reçoit la clé ouverte, refermée aussitôt.
+        let r = unsafe { RegOpenKeyExW(HKEY_CLASSES_ROOT, &cle, None, KEY_READ, &mut h) };
+        if r == ERROR_SUCCESS {
+            // SAFETY: clé ouverte juste au-dessus.
+            let _ = unsafe { RegCloseKey(h) };
+            true
+        } else {
+            false
+        }
     }
 
     fn executable_de(nom: &str, protocole: bool) -> Option<PathBuf> {
@@ -215,7 +253,7 @@ mod systeme {
     }
 
     /// `ShellExecuteExW`, sans aucune interface d'erreur du shell.
-    fn ouvrir_par_le_shell(url: &str) -> windows::core::Result<()> {
+    fn ouvrir_par_le_shell(url: &str) -> tune_core::windows::core::Result<()> {
         // SAFETY: initialisation COM du fil courant, recommandée avant
         // `ShellExecuteExW` ; un échec (déjà initialisé autrement) est sans
         // conséquence pour une URL.

@@ -611,6 +611,13 @@ windows = { version = "0.62", features = [
     "Win32_System_Ole",
     "Win32_System_Variant",
     "Win32_System_Rpc",
+    # #9061 — tune-server ouvre l'interface par le shell Windows
+    # (`AssocQueryStringW`, `ShellExecuteExW`) et lit le choix de navigateur
+    # dans le registre, par le `windows` réexporté ici : aucune dépendance de
+    # plus dans l'arbre.
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 # #2219 — témoin de `resolve_streaming_url` par sa porte publique, avant que
