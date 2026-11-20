@@ -41,7 +41,12 @@ fn excedent_plus_court_que_le_dernier_paquet_est_du_bourrage() {
 fn manque_ou_paquet_de_trop_reste_une_faute() {
     // Contre-épreuve : un échantillon de moins, ou un paquet entier de plus.
     assert!(!longueur_conforme(Some(5_823_248), 5_823_247, 1024, false));
-    assert!(!longueur_conforme(Some(5_823_248), 5_823_248 + 1024, 1024, false));
+    assert!(!longueur_conforme(
+        Some(5_823_248),
+        5_823_248 + 1024,
+        1024,
+        false
+    ));
     assert!(!longueur_conforme(Some(4096), 4097, 0, false));
 }
 
