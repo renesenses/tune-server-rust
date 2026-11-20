@@ -83,15 +83,39 @@ async fn une_consigne_donnee_zone_arretee_part_au_debut_de_la_session_suivante_2
 }
 
 #[tokio::test]
-async fn sans_consigne_en_attente_la_session_ne_porte_aucun_volume_2395() {
-    // #2395 : Tune ne réaffirme pas un volume que personne n'a demandé.
+async fn sans_consigne_en_attente_la_session_porte_le_volume_de_la_zone_8855() {
+    // #8855 (GO du 20/11) : sans consigne, chaque piste part au volume de la
+    // zone tenu par la sortie — ici le niveau de naissance, faute de graine.
     let sortie = sortie();
+    let (mut session, recepteur) = session_et_recepteur().await;
+    sortie.appliquer_le_volume_en_attente(&mut session).await;
+    drop(session);
+    let requetes = recepteur.await.unwrap();
+    let attendu = format!(
+        "volume: {:.1}",
+        linear_to_airplay_db(
+            crate::outputs::airplay2::volume_de_depart_8402::VOLUME_DE_DEPART_PRUDENT
+        )
+    );
+    assert_eq!(requetes.len(), 1, "{requetes:?}");
+    assert!(
+        requetes[0].starts_with("SET_PARAMETER ") && requetes[0].contains(&attendu),
+        "la session doit porter le volume de la zone : {requetes:?}"
+    );
+}
+
+#[tokio::test]
+async fn en_volume_fixe_sans_consigne_la_session_ne_porte_aucun_volume_2395() {
+    // #2395 : en volume fixe, la sortie ne réaffirme rien d'elle-même ;
+    // l'orchestrateur tient le 100 % de la zone.
+    let sortie = sortie();
+    sortie.regler_selon_la_zone(false, true);
     let (mut session, recepteur) = session_et_recepteur().await;
     sortie.appliquer_le_volume_en_attente(&mut session).await;
     drop(session);
     assert!(
         recepteur.await.unwrap().is_empty(),
-        "aucune commande de volume ne doit partir sans consigne en attente"
+        "aucune commande de volume ne doit partir en volume fixe sans consigne"
     );
 }
 
