@@ -1165,3 +1165,52 @@ async fn un_refus_pour_taille_dit_la_limite_et_quoi_alleger_7286() {
         assert!(note.contains(attendu), "« {attendu} » absent de : {note}");
     }
 }
+
+/// Un instantané d'avant les noms neutres nomme le profil lié par l'adresse
+/// de son compte : la restauration le retrouve par `email` au lieu de créer
+/// un double nommé par l'adresse ; un profil à recréer prend un nom neutre.
+#[test]
+fn un_profil_nomme_par_son_adresse_se_retrouve_par_email() {
+    let source = base_neuve();
+    exec(
+        &source,
+        "INSERT INTO profiles (username, display_name, email, is_admin) \
+         VALUES ('lea@exemple.test', 'Léa', 'lea@exemple.test', 0)",
+    );
+    exec(
+        &source,
+        "INSERT INTO profiles (username, display_name, email, is_admin) \
+         VALUES ('tom@exemple.test', '', 'tom@exemple.test', 0)",
+    );
+    let contenu = construire(&source).unwrap();
+
+    let cible = base_neuve();
+    // La cible a déjà renommé Léa (passe de démarrage) ; Tom n'y est pas.
+    exec(
+        &cible,
+        "INSERT INTO profiles (username, display_name, email, is_admin) \
+         VALUES ('Léa', 'Léa', 'lea@exemple.test', 0)",
+    );
+    let avant = un_entier(&cible, "SELECT COUNT(*) FROM profiles");
+    let r = restaurer(&cible, &contenu, Mode::Merge).unwrap();
+    assert_eq!(r.profiles_created, 1, "seul Tom est recréé");
+    assert_eq!(
+        un_entier(&cible, "SELECT COUNT(*) FROM profiles"),
+        avant + 1
+    );
+    assert_eq!(
+        un_entier(
+            &cible,
+            "SELECT COUNT(*) FROM profiles WHERE username LIKE '%@%'"
+        ),
+        0,
+        "un profil nommé par une adresse a été recréé"
+    );
+    assert_eq!(
+        un_entier(
+            &cible,
+            "SELECT COUNT(*) FROM profiles WHERE username = 'tom' AND email = 'tom@exemple.test'"
+        ),
+        1
+    );
+}
