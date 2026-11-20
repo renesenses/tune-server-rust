@@ -421,7 +421,9 @@ impl StreamingService for BandcampService {
                 username: Some(compte.pseudo),
                 ..Default::default()
             }),
-            Err(EchecLiaison::PseudoInvalide) => Err(TuneError::from("username invalide")),
+            Err(e @ (EchecLiaison::PseudoInvalide | EchecLiaison::PageArtiste(_))) => {
+                Err(TuneError::from(crate::refus_de_saisie(&e).map(|(_, m)| m).unwrap_or_default()))
+            }
             Err(EchecLiaison::ProfilIntrouvable(m) | EchecLiaison::Passerelle(m)) => {
                 Err(TuneError::from(m))
             }
@@ -1224,6 +1226,19 @@ mod case_actif_fil1952 {
             (true, true),
             "compte lié : Bandcamp doit être activé ET utilisable"
         );
+    }
+
+    /// #9152 — l'adresse du profil collée entière lie le compte (elle était
+    /// refusée en local, « username invalide »), sous le seul pseudo.
+    #[tokio::test]
+    async fn lier_par_l_adresse_du_profil_lie_le_compte_9152() {
+        let b = base();
+        let racine = profil_local().await;
+        let compte = crate::lier_compte_sur(&b, "https://bandcamp.com/didierv/", &racine)
+            .await
+            .unwrap_or_else(|_| panic!("l'adresse du profil doit lier le compte"));
+        assert_eq!(compte.pseudo, "didierv");
+        assert_eq!(compte.fan_id, 897100);
     }
 
     #[tokio::test]
