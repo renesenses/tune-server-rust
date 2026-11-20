@@ -275,12 +275,7 @@ async fn en_volume_fixe_aucun_volume_ne_part_au_depart_2395() {
 /// Attend que le flux en cours finisse de lui-même (fin de file sans `stop`).
 async fn attendre_la_fin_du_flux(sortie: &AirplayOutput) {
     let limite = tokio::time::Instant::now() + Duration::from_secs(5);
-    while sortie
-        .fin_du_dernier_flux
-        .lock()
-        .unwrap()
-        .is_none()
-    {
+    while sortie.fin_du_dernier_flux.lock().unwrap().is_none() {
         assert!(tokio::time::Instant::now() < limite, "le flux ne finit pas");
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -317,7 +312,11 @@ async fn une_relance_interne_en_pure_garde_le_niveau_en_cours_8855() {
     // La marque est consommée : le `stop` suivant est celui de l'utilisateur.
     sortie.stop().await.unwrap();
     let apres_stop = jouer_une_piste(&sortie, &url, &journal).await;
-    assert_eq!(premier_volume(&apres_stop), Some(volume(0.0)), "{apres_stop:?}");
+    assert_eq!(
+        premier_volume(&apres_stop),
+        Some(volume(0.0)),
+        "{apres_stop:?}"
+    );
     sortie.stop().await.ok();
 }
 
@@ -336,7 +335,11 @@ async fn apres_une_fin_de_file_longue_la_lecture_repart_a_zero_8855() {
 
     attendre_la_fin_du_flux(&sortie).await;
     let tout_de_suite = jouer_une_piste(&sortie, &url, &journal).await;
-    assert_eq!(premier_volume(&tout_de_suite), Some(volume(0.50)), "{tout_de_suite:?}");
+    assert_eq!(
+        premier_volume(&tout_de_suite),
+        Some(volume(0.50)),
+        "{tout_de_suite:?}"
+    );
 
     attendre_la_fin_du_flux(&sortie).await;
     *sortie.fin_du_dernier_flux.lock().unwrap() = Some(
