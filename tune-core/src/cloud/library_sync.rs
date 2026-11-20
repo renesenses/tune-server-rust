@@ -2110,10 +2110,10 @@ mod session_refusee_8797_tests {
         let (api, appels) = site_compteur().await;
         let b = relie_puis_refuse();
         let s = SettingsRepo::with_backend(b.clone());
-        let http = reqwest::Client::new();
-        assert!(cycle(&b, &http, &api, true).await.is_none());
-        assert!(delier_le_serveur(&s, &http, &api).await == Ok(false));
-        assert!(lier_depuis_les_reglages(&b, &http).await.is_err());
+        let http = crate::http::client::shared();
+        assert!(cycle(&b, http, &api, true).await.is_none());
+        assert!(delier_le_serveur(&s, http, &api).await == Ok(false));
+        assert!(lier_depuis_les_reglages(&b, http).await.is_err());
         assert_eq!(
             appels.load(std::sync::atomic::Ordering::SeqCst),
             0,
@@ -2121,7 +2121,7 @@ mod session_refusee_8797_tests {
         );
 
         crate::cloud::sso::oublier_le_refus_de_session(&s);
-        let _ = delier_le_serveur(&s, &http, &api).await;
+        let _ = delier_le_serveur(&s, http, &api).await;
         assert!(
             appels.load(std::sync::atomic::Ordering::SeqCst) >= 1,
             "la session rouverte, la déliaison repart vers le site"
