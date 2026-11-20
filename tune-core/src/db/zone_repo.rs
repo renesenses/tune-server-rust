@@ -2183,22 +2183,23 @@ impl ZoneRepo {
             Engine::Sqlite => &SqliteDialect,
             Engine::Postgres => &PostgresDialect,
         };
-        let p: Vec<_> = (1..=8).map(|i| d.placeholder(i)).collect();
+        // #8920 — plus de condition sur `fixed_volume` : une zone Devialet
+        // AIR n'est jamais à volume fixe, et un drapeau hérité en base (lu
+        // faux, `row_to_zone`) ne doit pas bloquer l'adoption d'une baisse.
+        let p: Vec<_> = (1..=7).map(|i| d.placeholder(i)).collect();
         let sql = format!(
-            "UPDATE zones SET volume = {}, muted = {} WHERE id = {} AND output_type = 'devialet_air' AND output_device_id = {} AND volume = {} AND muted = {} AND fixed_volume = {} AND volume >= {}",
-            p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]
+            "UPDATE zones SET volume = {}, muted = {} WHERE id = {} AND output_type = 'devialet_air' AND output_device_id = {} AND volume = {} AND muted = {} AND volume >= {}",
+            p[0], p[1], p[2], p[3], p[4], p[5], p[6]
         );
         let ancien_mute = i64::from(zone.muted);
         let nouveau_mute = i64::from(muted);
-        let fixe = i64::from(zone.fixed_volume);
-        let params: [&dyn ToSqlValue; 8] = [
+        let params: [&dyn ToSqlValue; 7] = [
             &volume,
             &nouveau_mute,
             &id,
             &did,
             &zone.volume,
             &ancien_mute,
-            &fixe,
             &volume,
         ];
         Ok(self.db.execute(&sql, &params)? == 1)
@@ -3564,7 +3565,13 @@ fn row_to_zone(cols: &[SqlValue]) -> Zone {
         last_track_source: cols.get(12).and_then(|v| v.as_string()),
         last_track_source_id: cols.get(13).and_then(|v| v.as_string()),
         max_sample_rate: cols.get(14).and_then(|v| v.as_i64()).map(|v| v as u32),
-        fixed_volume: cols.get(15).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
+        // #8920 — une zone Devialet AIR n'est JAMAIS à volume fixe : le
+        // volume y est tenu par l'ampli, sous les limites de confort et de
+        // sécurité. Un drapeau hérité (posé avant que la route ne le refuse)
+        // est lu faux, pour TOUS les chemins qui le consultent.
+        fixed_volume: cols.get(15).and_then(|v| v.as_i64()).unwrap_or(0) != 0
+            && cols.get(2).and_then(|v| v.as_string()).as_deref()
+                != Some(crate::outputs::devialet_air::TYPE_DE_SORTIE),
         autoplay_enabled: cols.get(16).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
     }
 }

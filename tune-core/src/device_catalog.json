@@ -255,6 +255,28 @@
         { "name": "DAC202", "quirks": {} },
         { "name": "MEDUS", "quirks": {} }
       ]
+    },
+    {
+      "name": "Devialet",
+      "models": [
+        { "name": "D-Premier", "quirks": {} },
+        { "name": "D110", "quirks": {} },
+        { "name": "D170", "quirks": {} },
+        { "name": "D240", "quirks": {} },
+        { "name": "D120", "quirks": {} },
+        { "name": "D200", "quirks": {} },
+        { "name": "D250", "quirks": {} },
+        { "name": "D400", "quirks": {} },
+        { "name": "D800", "quirks": {} },
+        { "name": "D900", "quirks": {} },
+        { "name": "D1000", "quirks": {} },
+        { "name": "D140 Pro", "quirks": {} },
+        { "name": "D220 Pro", "quirks": {} },
+        { "name": "D250 Pro", "quirks": {} },
+        { "name": "D440 Pro", "quirks": {} },
+        { "name": "D1000 Pro", "quirks": {} },
+        { "name": "Astra", "quirks": {} }
+      ]
     }
   ]
 }
