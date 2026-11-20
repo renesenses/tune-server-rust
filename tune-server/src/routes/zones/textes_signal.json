@@ -93,7 +93,8 @@
     "oaat_dsd_absent": "Le récepteur n’annonce pas de prise en charge DSD : conversion en PCM.",
     "oaat_dsd_plafond": "{0} converti en PCM : le récepteur accepte au plus {1}.",
     "oaat_dsd_conteneur": "DFF converti en PCM : la voie DSD native OAAT prend en charge les fichiers DSF.",
-    "oaat_dsd_cadence": "Cadence DSD non reconnue par la voie native OAAT : conversion en PCM."
+    "oaat_dsd_cadence": "Cadence DSD non reconnue par la voie native OAAT : conversion en PCM.",
+    "wasapi_rate_fallback": "Conversion {0} → {1} kHz : le périphérique ne prend pas {0} kHz en mode WASAPI exclusif"
   },
   "en": {
     "pregain": "auto pre-gain {0} dB",
@@ -189,7 +190,8 @@
     "oaat_dsd_absent": "The receiver does not advertise DSD support: converted to PCM.",
     "oaat_dsd_plafond": "{0} converted to PCM: the receiver supports at most {1}.",
     "oaat_dsd_conteneur": "DFF converted to PCM: the OAAT native DSD path supports DSF files.",
-    "oaat_dsd_cadence": "DSD rate not recognized by the OAAT native path: converted to PCM."
+    "oaat_dsd_cadence": "DSD rate not recognized by the OAAT native path: converted to PCM.",
+    "wasapi_rate_fallback": "Conversion {0} → {1} kHz: the device does not support {0} kHz in WASAPI exclusive mode"
   },
   "de": {
     "pregain": "automatische Vorverstärkung {0} dB",
@@ -285,7 +287,8 @@
     "oaat_dsd_absent": "Der Empfänger meldet keine DSD-Unterstützung: Umwandlung in PCM.",
     "oaat_dsd_plafond": "{0} in PCM umgewandelt: Der Empfänger unterstützt höchstens {1}.",
     "oaat_dsd_conteneur": "DFF in PCM umgewandelt: Der native DSD-Pfad von OAAT unterstützt DSF-Dateien.",
-    "oaat_dsd_cadence": "DSD-Rate vom nativen OAAT-Pfad nicht erkannt: Umwandlung in PCM."
+    "oaat_dsd_cadence": "DSD-Rate vom nativen OAAT-Pfad nicht erkannt: Umwandlung in PCM.",
+    "wasapi_rate_fallback": "Wandlung {0} → {1} kHz: Das Gerät unterstützt {0} kHz im exklusiven WASAPI-Modus nicht"
   },
   "es": {
     "pregain": "preganancia automática {0} dB",
@@ -381,7 +384,8 @@
     "oaat_dsd_absent": "El receptor no anuncia compatibilidad con DSD: conversión a PCM.",
     "oaat_dsd_plafond": "{0} convertido a PCM: el receptor admite como máximo {1}.",
     "oaat_dsd_conteneur": "DFF convertido a PCM: la ruta DSD nativa de OAAT admite archivos DSF.",
-    "oaat_dsd_cadence": "La ruta nativa de OAAT no reconoce la frecuencia DSD: conversión a PCM."
+    "oaat_dsd_cadence": "La ruta nativa de OAAT no reconoce la frecuencia DSD: conversión a PCM.",
+    "wasapi_rate_fallback": "Conversión {0} → {1} kHz: el dispositivo no admite {0} kHz en modo WASAPI exclusivo"
   },
   "it": {
     "pregain": "pre-guadagno automatico {0} dB",
@@ -477,7 +481,8 @@
     "oaat_dsd_absent": "Il ricevitore non dichiara il supporto DSD: conversione in PCM.",
     "oaat_dsd_plafond": "{0} convertito in PCM: il ricevitore supporta al massimo {1}.",
     "oaat_dsd_conteneur": "DFF convertito in PCM: il percorso DSD nativo OAAT supporta i file DSF.",
-    "oaat_dsd_cadence": "Frequenza DSD non riconosciuta dal percorso nativo OAAT: conversione in PCM."
+    "oaat_dsd_cadence": "Frequenza DSD non riconosciuta dal percorso nativo OAAT: conversione in PCM.",
+    "wasapi_rate_fallback": "Conversione {0} → {1} kHz: il dispositivo non supporta {0} kHz in modalità WASAPI esclusiva"
   },
   "zh": {
     "pregain": "自动预增益 {0} dB",
@@ -573,7 +578,8 @@
     "oaat_dsd_absent": "接收器未声明支持 DSD：转换为 PCM。",
     "oaat_dsd_plafond": "{0} 已转换为 PCM：接收器最高支持 {1}。",
     "oaat_dsd_conteneur": "DFF 已转换为 PCM：OAAT 原生 DSD 路径支持 DSF 文件。",
-    "oaat_dsd_cadence": "OAAT 原生路径无法识别此 DSD 采样率：转换为 PCM。"
+    "oaat_dsd_cadence": "OAAT 原生路径无法识别此 DSD 采样率：转换为 PCM。",
+    "wasapi_rate_fallback": "转换 {0} → {1} kHz：设备在 WASAPI 独占模式下不支持 {0} kHz"
   },
   "ja": {
     "pregain": "自動プリアンプ {0} dB",
@@ -669,7 +675,8 @@
     "oaat_dsd_absent": "受信機がDSD対応を通知していないため、PCMに変換します。",
     "oaat_dsd_plafond": "{0}をPCMに変換：受信機の対応上限は{1}です。",
     "oaat_dsd_conteneur": "DFFをPCMに変換：OAATのネイティブDSD経路はDSFファイルに対応しています。",
-    "oaat_dsd_cadence": "OAATのネイティブ経路でDSDレートを認識できないため、PCMに変換します。"
+    "oaat_dsd_cadence": "OAATのネイティブ経路でDSDレートを認識できないため、PCMに変換します。",
+    "wasapi_rate_fallback": "{0} → {1} kHz に変換：デバイスは WASAPI 排他モードで {0} kHz に対応していません"
   },
   "ko": {
     "pregain": "자동 프리게인 {0} dB",
@@ -765,7 +772,8 @@
     "oaat_dsd_absent": "수신기가 DSD 지원을 알리지 않아 PCM으로 변환합니다.",
     "oaat_dsd_plafond": "{0}을 PCM으로 변환: 수신기는 최대 {1}을 지원합니다.",
     "oaat_dsd_conteneur": "DFF를 PCM으로 변환: OAAT 네이티브 DSD 경로는 DSF 파일을 지원합니다.",
-    "oaat_dsd_cadence": "OAAT 네이티브 경로가 DSD 샘플레이트를 인식하지 못해 PCM으로 변환합니다."
+    "oaat_dsd_cadence": "OAAT 네이티브 경로가 DSD 샘플레이트를 인식하지 못해 PCM으로 변환합니다.",
+    "wasapi_rate_fallback": "{0} → {1} kHz 변환: 장치가 WASAPI 독점 모드에서 {0} kHz를 지원하지 않습니다"
   },
   "ro": {
     "pregain": "pre-amplificare automată {0} dB",
@@ -861,7 +869,8 @@
     "oaat_dsd_absent": "Receptorul nu anunță suport DSD: conversie în PCM.",
     "oaat_dsd_plafond": "{0} convertit în PCM: receptorul acceptă cel mult {1}.",
     "oaat_dsd_conteneur": "DFF convertit în PCM: calea DSD nativă OAAT acceptă fișiere DSF.",
-    "oaat_dsd_cadence": "Rata DSD nu este recunoscută de calea nativă OAAT: conversie în PCM."
+    "oaat_dsd_cadence": "Rata DSD nu este recunoscută de calea nativă OAAT: conversie în PCM.",
+    "wasapi_rate_fallback": "Conversie {0} → {1} kHz: dispozitivul nu acceptă {0} kHz în modul WASAPI exclusiv"
   },
   "sv": {
     "pregain": "automatisk förförstärkning {0} dB",
@@ -957,7 +966,8 @@
     "oaat_dsd_absent": "Mottagaren anger inget DSD-stöd: konvertering till PCM.",
     "oaat_dsd_plafond": "{0} konverteras till PCM: mottagaren stöder högst {1}.",
     "oaat_dsd_conteneur": "DFF konverteras till PCM: OAAT:s inbyggda DSD-väg stöder DSF-filer.",
-    "oaat_dsd_cadence": "DSD-frekvensen känns inte igen av OAAT:s inbyggda väg: konvertering till PCM."
+    "oaat_dsd_cadence": "DSD-frekvensen känns inte igen av OAAT:s inbyggda väg: konvertering till PCM.",
+    "wasapi_rate_fallback": "Omvandling {0} → {1} kHz: enheten stöder inte {0} kHz i exklusivt WASAPI-läge"
   },
   "vi": {
     "pregain": "tiền khuếch đại tự động {0} dB",
@@ -1053,7 +1063,8 @@
     "oaat_dsd_absent": "Bộ thu không thông báo hỗ trợ DSD: chuyển đổi sang PCM.",
     "oaat_dsd_plafond": "{0} được chuyển sang PCM: bộ thu hỗ trợ tối đa {1}.",
     "oaat_dsd_conteneur": "DFF được chuyển sang PCM: đường DSD nguyên bản của OAAT hỗ trợ tệp DSF.",
-    "oaat_dsd_cadence": "Đường nguyên bản OAAT không nhận dạng tần số DSD: chuyển đổi sang PCM."
+    "oaat_dsd_cadence": "Đường nguyên bản OAAT không nhận dạng tần số DSD: chuyển đổi sang PCM.",
+    "wasapi_rate_fallback": "Chuyển đổi {0} → {1} kHz: thiết bị không hỗ trợ {0} kHz ở chế độ WASAPI độc quyền"
   },
   "hu": {
     "pregain": "automatikus előerősítés {0} dB",
@@ -1149,7 +1160,8 @@
     "oaat_dsd_absent": "A vevő nem jelzett DSD-támogatást: átalakítás PCM-re.",
     "oaat_dsd_plafond": "{0} átalakítva PCM-re: a vevő legfeljebb {1} formátumot támogat.",
     "oaat_dsd_conteneur": "DFF átalakítva PCM-re: az OAAT natív DSD útvonala DSF-fájlokat támogat.",
-    "oaat_dsd_cadence": "Az OAAT natív útvonala nem ismeri fel a DSD-frekvenciát: átalakítás PCM-re."
+    "oaat_dsd_cadence": "Az OAAT natív útvonala nem ismeri fel a DSD-frekvenciát: átalakítás PCM-re.",
+    "wasapi_rate_fallback": "Átalakítás {0} → {1} kHz: az eszköz nem támogatja a {0} kHz-et kizárólagos WASAPI módban"
   },
   "nb": {
     "pregain": "automatisk forsterkning før behandling {0} dB",
@@ -1245,7 +1257,8 @@
     "oaat_dsd_absent": "Mottakeren oppgir ikke DSD-støtte: konvertering til PCM.",
     "oaat_dsd_plafond": "{0} konverteres til PCM: mottakeren støtter maksimalt {1}.",
     "oaat_dsd_conteneur": "DFF konverteres til PCM: OAATs native DSD-bane støtter DSF-filer.",
-    "oaat_dsd_cadence": "DSD-frekvensen gjenkjennes ikke av OAATs native bane: konvertering til PCM."
+    "oaat_dsd_cadence": "DSD-frekvensen gjenkjennes ikke av OAATs native bane: konvertering til PCM.",
+    "wasapi_rate_fallback": "Konvertering {0} → {1} kHz: enheten støtter ikke {0} kHz i eksklusiv WASAPI-modus"
   },
   "pl": {
     "pregain": "automatyczne wzmocnienie wstępne {0} dB",
@@ -1341,7 +1354,8 @@
     "oaat_dsd_absent": "Odbiornik nie zgłasza obsługi DSD: konwersja do PCM.",
     "oaat_dsd_plafond": "{0} przekonwertowano do PCM: odbiornik obsługuje maksymalnie {1}.",
     "oaat_dsd_conteneur": "DFF przekonwertowano do PCM: natywna ścieżka DSD OAAT obsługuje pliki DSF.",
-    "oaat_dsd_cadence": "Natywna ścieżka OAAT nie rozpoznaje częstotliwości DSD: konwersja do PCM."
+    "oaat_dsd_cadence": "Natywna ścieżka OAAT nie rozpoznaje częstotliwości DSD: konwersja do PCM.",
+    "wasapi_rate_fallback": "Konwersja {0} → {1} kHz: urządzenie nie obsługuje {0} kHz w trybie wyłącznym WASAPI"
   },
   "el": {
     "pregain": "αυτόματη προ-ενίσχυση {0} dB",
@@ -1437,7 +1451,8 @@
     "oaat_dsd_absent": "Ο δέκτης δεν δηλώνει υποστήριξη DSD: μετατροπή σε PCM.",
     "oaat_dsd_plafond": "Το {0} μετατρέπεται σε PCM: ο δέκτης υποστηρίζει έως {1}.",
     "oaat_dsd_conteneur": "Το DFF μετατρέπεται σε PCM: η εγγενής διαδρομή DSD του OAAT υποστηρίζει αρχεία DSF.",
-    "oaat_dsd_cadence": "Η εγγενής διαδρομή OAAT δεν αναγνωρίζει τη συχνότητα DSD: μετατροπή σε PCM."
+    "oaat_dsd_cadence": "Η εγγενής διαδρομή OAAT δεν αναγνωρίζει τη συχνότητα DSD: μετατροπή σε PCM.",
+    "wasapi_rate_fallback": "Μετατροπή {0} → {1} kHz: η συσκευή δεν υποστηρίζει {0} kHz σε αποκλειστική λειτουργία WASAPI"
   },
   "tr": {
     "pregain": "otomatik ön kazanç {0} dB",
@@ -1533,6 +1548,7 @@
     "oaat_dsd_absent": "Alıcı DSD desteği bildirmiyor: PCM'ye dönüştürüldü.",
     "oaat_dsd_plafond": "{0} PCM'ye dönüştürüldü: alıcı en fazla {1} destekliyor.",
     "oaat_dsd_conteneur": "DFF, PCM'ye dönüştürüldü: OAAT yerel DSD yolu DSF dosyalarını destekler.",
-    "oaat_dsd_cadence": "DSD örnekleme hızı OAAT yerel yolu tarafından tanınmadı: PCM'ye dönüştürüldü."
+    "oaat_dsd_cadence": "DSD örnekleme hızı OAAT yerel yolu tarafından tanınmadı: PCM'ye dönüştürüldü.",
+    "wasapi_rate_fallback": "{0} → {1} kHz dönüşümü: cihaz, WASAPI özel modunda {0} kHz desteklemiyor"
   }
 }
