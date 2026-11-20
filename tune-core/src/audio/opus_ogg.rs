@@ -359,7 +359,11 @@ mod tests {
 
     /// Encode `pcm`, l'écrit, le relit par la chaîne de Tune à partir de
     /// `debut_s`.
-    fn aller_retour_8982(nom: &str, pcm: &[i16], debut_s: f64) -> crate::audio::decode::DecodedAudio {
+    fn aller_retour_8982(
+        nom: &str,
+        pcm: &[i16],
+        debut_s: f64,
+    ) -> crate::audio::decode::DecodedAudio {
         let bytes = encode_ogg_opus(pcm, 2, 192, 48000).expect("encode");
         let dir = crate::test_scratch::scratch_dir(&format!("tune-opus-8982-{nom}"));
         let path = dir.join(format!("{nom}.opus"));
@@ -371,7 +375,12 @@ mod tests {
     /// Le décalage (en trames, cherché sur ±400, pre-skip compris) qui aligne
     /// le mieux `dec[i]` sur `src[decalage_source + i]`, mesuré à partir de
     /// `dec[base]`.
-    fn meilleur_decalage_8982(src: &[i16], dec: &[i32], decalage_source: usize, base: usize) -> i64 {
+    fn meilleur_decalage_8982(
+        src: &[i16],
+        dec: &[i32],
+        decalage_source: usize,
+        base: usize,
+    ) -> i64 {
         let src = channel_f64(&src.iter().map(|&s| i32::from(s)).collect::<Vec<_>>(), 2, 0);
         let dec = channel_f64(dec, 2, 0);
         let fenetre = 4_800usize;

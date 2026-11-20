@@ -1763,17 +1763,17 @@ fn decode_opus_to_pcm(
     // pour granule `pre_skip + seek_s × 48 000`.
     let mut skip_frames: i64 = pre_skip
         + if seek_s > 0.0 {
-        let seconds = seek_s as i64;
-        let nanos = ((seek_s - seconds as f64) * 1_000_000_000.0) as u32;
-        if let Some(time) = Time::try_new(seconds, nanos) {
-            let _ = format.seek(
-                SeekMode::Coarse,
-                SeekTo::Time {
-                    time,
-                    track_id: Some(track_id),
-                },
-            );
-        }
+            let seconds = seek_s as i64;
+            let nanos = ((seek_s - seconds as f64) * 1_000_000_000.0) as u32;
+            if let Some(time) = Time::try_new(seconds, nanos) {
+                let _ = format.seek(
+                    SeekMode::Coarse,
+                    SeekTo::Time {
+                        time,
+                        track_id: Some(track_id),
+                    },
+                );
+            }
             (seek_s * 48000.0) as i64
         } else {
             0
