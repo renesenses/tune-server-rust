@@ -142,7 +142,7 @@ fn un_seul_fichier_marche_comme_avant_et_profite_du_repli_8761() {
     // maintenant, filtre rééchantillonné.
     let choix = config.choix_pour(96_000).unwrap();
     assert!(choix.reechantillonne);
-    assert_eq!(choix.decrire(), "filtre rééchantillonné de 48 à 96 kHz");
+    assert_eq!(choix.decrire(), "filtre rééchantillonné de 48 kHz à 96 kHz");
     assert_eq!(config.build_for(256, 96_000, 2).unwrap().channels(), 2);
     assert_eq!(dernier_choix(&f.as_str()), Some(choix));
     // Le refus reste possible par le réglage.

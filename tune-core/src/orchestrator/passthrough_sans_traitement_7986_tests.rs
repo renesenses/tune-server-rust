@@ -133,6 +133,12 @@ async fn un_flac_16_44_vers_une_zone_dlna_flac_sans_traitement_applicable_part_t
     let (orch, zone_id) = banc();
     let ri = ecrire_ri("ri-7986-48k", 48_000, 1);
     regler_ri(&orch, zone_id, ri.as_str().as_ref());
+    // #8761 — sans ce réglage, la RI 48 kHz serait rééchantillonnée et
+    // s'appliquerait (voir le test suivant) : le témoin de #7986 porte sur
+    // une RI qui ne s'applique PAS.
+    SettingsRepo::with_backend(orch.db.clone())
+        .set(&format!("ir_resample_{zone_id}"), "false")
+        .unwrap();
     assert!(
         orch.zone_has_active_ir(zone_id),
         "prémisse : la RI est réglée, sous licence, et le fichier existe"
@@ -152,6 +158,21 @@ async fn un_flac_16_44_vers_une_zone_dlna_flac_sans_traitement_applicable_part_t
         r.file_size,
         std::fs::metadata(FLAC).ok().map(|m| m.len()),
         "#7986 : en passthrough, la taille annoncée est celle du fichier"
+    );
+}
+
+/// #8761 — la même RI 48 kHz, rééchantillonnage permis (défaut) : elle
+/// s'applique au flux 44,1 kHz, qui est donc transcodé avec la convolution.
+#[tokio::test]
+async fn une_ri_a_une_autre_cadence_est_reechantillonnee_et_cuite_8761() {
+    let (orch, zone_id) = banc();
+    let ri = ecrire_ri("ri-8761-48k", 48_000, 1);
+    regler_ri(&orch, zone_id, ri.as_str().as_ref());
+    let (_, servi) = resoudre_le_flac(&orch, zone_id).await;
+    assert_ne!(
+        servi.as_deref(),
+        Some(FLAC),
+        "#8761 : la RI rééchantillonnée doit être cuite dans le flux"
     );
 }
 
