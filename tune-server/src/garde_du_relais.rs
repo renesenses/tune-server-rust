@@ -109,9 +109,13 @@ fn route_d_api_relayable(m: &Method, api: &str, auth_active: bool) -> bool {
         || sous(api, "/library/history")
         || sous(api, "/search")
         || sous(api, "/library/search")
-        || sous(api, "/ext/circle")
     {
         return true;
+    }
+    // Tune Circle : lecture seule à distance (décision du 19/11/2026). Ses
+    // écritures agissent au nom du compte mozaiklabs du serveur.
+    if sous(api, "/ext/circle") {
+        return lecture(m);
     }
     // Profils : lire, choisir le sien, ses favoris et ses préférences. Créer,
     // modifier ou supprimer un profil n'est pas relayable.
@@ -239,6 +243,17 @@ pub async fn garde_du_relais(
         return next.run(request).await;
     }
     tracing::info!(methode = %request.method(), "requete_relayee_refusee");
+    if chemin
+        .strip_prefix("/api/v1")
+        .is_some_and(|api| sous(api, "/ext/circle"))
+    {
+        return crate::message_api::refus(
+            StatusCode::FORBIDDEN,
+            crate::garde_du_cercle::CODE_LECTURE_SEULE_A_DISTANCE,
+            crate::garde_du_cercle::CLE_LECTURE_SEULE_A_DISTANCE,
+            &[],
+        );
+    }
     crate::message_api::refus(
         StatusCode::FORBIDDEN,
         "not_available_remotely",
@@ -333,6 +348,34 @@ mod tests {
             (Method::POST, "/api/v1/homex/continue-listening/1/resume"),
         ] {
             assert!(!ok(m.clone(), c), "{m} {c} ne doit pas être relayable");
+        }
+    }
+
+    /// Tune Circle (19/11/2026) : à distance, `/ext/circle` se lit et ne
+    /// s'écrit pas.
+    #[test]
+    fn cercle_en_lecture_seule_a_distance() {
+        for c in [
+            "/api/v1/ext/circle",
+            "/api/v1/ext/circle/",
+            "/api/v1/ext/circle/contacts/locations",
+            "/api/v1/ext/circle/playlists/3",
+        ] {
+            assert!(ok(Method::GET, c), "GET {c}");
+            assert!(ok(Method::HEAD, c), "HEAD {c}");
+        }
+        for m in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            for c in [
+                "/api/v1/ext/circle/invitations",
+                "/api/v1/ext/circle/invitations/3/accept",
+                "/api/v1/ext/circle/circles/1/sharing/members",
+                "/api/v1/ext/circle/member-of/1/show-me",
+                "/api/v1/ext/circle/me/location",
+                "/api/v1/ext/circle/playlists/3/play",
+            ] {
+                assert!(!ok(m.clone(), c), "{m} {c}");
+                assert!(!chemin_relayable(&m, c, true), "{m} {c} (auth active)");
+            }
         }
     }
 

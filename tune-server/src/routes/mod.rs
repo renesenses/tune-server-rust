@@ -689,6 +689,18 @@ pub fn router_with_plugins(
         .fold(api, |api, (plugin_name, plugin_router)| {
             let mount = format!("/ext/{plugin_name}");
             tracing::info!(plugin = %plugin_name, mount = %format!("/api/v1{mount}"), "plugin_routes_mounted");
+            // Tune Circle : les écritures au nom du compte mozaiklabs sont
+            // réservées à l'administrateur, et jamais faites à distance
+            // (`crate::garde_du_cercle`). Posée sur le routeur du greffon,
+            // donc SOUS `auth_middleware`.
+            let plugin_router = if plugin_name == "circle" {
+                plugin_router.layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
+                    crate::garde_du_cercle::garde_des_ecritures_du_cercle,
+                ))
+            } else {
+                plugin_router
+            };
             api.nest_service(&mount, plugin_router)
         });
 
