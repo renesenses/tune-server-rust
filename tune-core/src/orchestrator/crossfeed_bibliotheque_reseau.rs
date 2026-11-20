@@ -29,7 +29,7 @@
 //! Le crossfeed ne s'applique qu'UNE fois : une sortie `local:` l'applique
 //! déjà elle-même (le cumul EQ/ReplayGain de v0.9.139, voir
 //! `relais_dsp_progressif`), donc aucun des deux cas n'est ouvert pour elle.
-//! Les droits (Premium, greffon installé et activé) et le mode PURE passent
+//! Les droits (greffon installé et activé) et le mode PURE passent
 //! par `load_crossfeed_processor`, exactement comme sur le chemin des
 //! services. « Bit-perfect strict » ne refuse qu'une conversion de fréquence
 //! et ne coupe aucun traitement, sur aucun chemin : il ne gouverne donc pas

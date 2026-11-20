@@ -43,6 +43,7 @@ pub enum Feature {
     MultiroomSync,
     /// Equalizer is free; retain the historical wire name `dsp_eq`.
     DspEq,
+    /// Crossfeed simple gratuit ; code historique conservé (#9210).
     Crossfeed,
     CloudRelay,
     OaatProtocol,
@@ -92,7 +93,7 @@ pub enum Feature {
     /// 04/11/2026).
     Subsonic,
     /// « Suréchantillonnage » (#7614) : le greffon de suréchantillonnage de
-    /// la sortie locale. Premium, comme le crossfeed (Bertrand, 07/11/2026).
+    /// la sortie locale. Premium (Bertrand, 07/11/2026).
     Upsampling,
 }
 
@@ -102,7 +103,6 @@ impl Feature {
         &[
             Feature::UnlimitedZones,
             Feature::MultiroomSync,
-            Feature::Crossfeed,
             Feature::CloudRelay,
             // OAAT is free — open-source protocol, core feature. Son
             // multiroom aussi, jusqu'à `ZONES_GROUPEES_GRATUITES` récepteurs ;
@@ -138,9 +138,12 @@ impl Feature {
         ]
     }
 
-    /// Features exposed to clients, including the now-free historical EQ key.
+    /// Features exposed to clients, including the free historical EQ and crossfeed keys.
     pub fn all_advertised() -> impl Iterator<Item = Feature> {
-        Self::all_premium().iter().copied().chain([Self::DspEq])
+        Self::all_premium()
+            .iter()
+            .copied()
+            .chain([Self::DspEq, Self::Crossfeed])
     }
 
     /// Human-readable display name.
@@ -494,7 +497,8 @@ impl LicenseManager {
     /// Check whether a specific feature is enabled. All premium features require
     /// the effective Premium tier (license key or account premium).
     pub async fn check_feature(&self, feature: Feature) -> bool {
-        feature == Feature::DspEq || effective_tier(&*self.state.read().await) == Tier::Premium
+        matches!(feature, Feature::DspEq | Feature::Crossfeed)
+            || effective_tier(&*self.state.read().await) == Tier::Premium
     }
 
     /// Le plafond de zones **en vigueur** : `None` = illimité (Premium),
@@ -1479,7 +1483,7 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_twentynine_features() {
+    fn all_premium_has_twentyeight_features() {
         // Ce compte est un garde-fou volontaire : ajouter une fonctionnalité
         // premium doit être un acte conscient, pas un effet de bord. Passé de
         // 24 à 25 avec `AcousticAnalysis` (analyse CLAP), qui n'était gardée par
@@ -1490,8 +1494,9 @@ mod tests {
         // 30/10/2026) ; puis à 29 avec `Subsonic` (#7855, Bertrand,
         // 04/11/2026) ; puis revenu à 28 sans `Concerts` (#7865, Bertrand,
         // 04/11/2026 : le module n'est plus Premium) ; puis à 29 avec
-        // `Upsampling` (#7614, Bertrand, 07/11/2026).
-        assert_eq!(Feature::all_premium().len(), 29);
+        // `Upsampling` (#7614, Bertrand, 07/11/2026), puis à 28 sans
+        // le crossfeed simple (#9210, décision Bertrand du 17/11/2026).
+        assert_eq!(Feature::all_premium().len(), 28);
     }
 
     #[test]
@@ -1864,7 +1869,7 @@ mod tests {
         assert_eq!(mgr.tier().await, Tier::Free);
         assert!(!mgr.is_premium().await);
         assert!(mgr.check_feature(Feature::DspEq).await);
-        assert!(!mgr.check_feature(Feature::Crossfeed).await);
+        assert!(mgr.check_feature(Feature::Crossfeed).await);
         // Free tier is capped at the configured limit (3 here).
         assert_eq!(mgr.limite_zones().await, Some(3));
         // Le plafond mesure lui-même son assiette (#3673) : ce n'est plus

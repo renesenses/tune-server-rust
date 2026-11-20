@@ -2431,8 +2431,7 @@ impl PlaybackOrchestrator {
     /// #7632 — `None` aussi SANS le droit Premium `RoomCorrection`
     /// ([`Self::correction_ir_autorisee`]) : la convolution par RI n'est
     /// alors ni cuite dans le flux réseau, ni comptée dans son empreinte, ni
-    /// présentée comme un traitement que PURE gouverne. Même place que la
-    /// garde du crossfeed (`crossfeed_configure_sous_licence`).
+    /// présentée comme un traitement que PURE gouverne.
     pub(super) fn chemin_ir_configure(&self, zone_id: i64) -> Option<String> {
         if !self.correction_ir_autorisee() {
             return None;
@@ -2506,8 +2505,7 @@ impl PlaybackOrchestrator {
 
     /// #7632 — le droit de convoluer : Premium (`RoomCorrection`, décision du
     /// 04/11/2026). ⚠️ Un orchestrateur SANS licence n'y a pas droit : une
-    /// absence ne vaut pas Premium (contrairement au crossfeed, dont la garde
-    /// laisse passer l'orchestrateur des tests).
+    /// absence ne vaut pas Premium. Le crossfeed simple est gratuit (#9210).
     pub fn correction_ir_autorisee(&self) -> bool {
         self.license
             .as_ref()
@@ -2564,9 +2562,8 @@ impl PlaybackOrchestrator {
     /// `{ "enabled": bool, "amount": f32, "delay_ms": f32 }`. Values are clamped
     /// defensively (amount 0..0.5, delay_ms 0..5) mirroring the route validation.
     /// #7614 — le choix du greffon de suréchantillonnage de la zone, licence
-    /// comprise (Premium, comme le crossfeed). `None` sous PURE. Sans
-    /// gestionnaire de licence (les tests), aucune garde de licence, comme
-    /// [`Self::crossfeed_configure_sous_licence`].
+    /// comprise (Premium). `None` sous PURE. Sans gestionnaire de licence
+    /// (les tests), aucune garde de licence.
     pub fn choix_du_surechantillonneur(
         &self,
         zone_id: i64,
@@ -2817,31 +2814,15 @@ impl PlaybackOrchestrator {
     /// le crossfeed intégré est alors éteint, et ni l'empreinte du flux, ni la
     /// clé du cache, ni la compensation ne le comptent.
     pub(super) fn crossfeed_configure(&self, zone_id: i64) -> Option<(f32, f32)> {
-        let reglage =
-            Self::crossfeed_configure_sous_licence(&self.db, self.license.as_deref(), zone_id)?;
+        let reglage = Self::crossfeed_configure_with(&self.db, zone_id)?;
         let tiers = self.etages_tiers_configures(zone_id);
         crate::audio::crossfeed::etage_tiers_qui_remplace_le_crossfeed(&tiers)
             .is_none()
             .then_some(reglage)
     }
 
-    /// #5114 — [`Self::crossfeed_configure`] sans orchestrateur, AVEC sa
-    /// garde de licence : la même, écrite une fois, sur le même
-    /// `LicenseManager`. `None` : aucune garde, comme un orchestrateur sans
-    /// licence (les tests).
-    fn crossfeed_configure_sous_licence(
-        db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
-        license: Option<&crate::license::LicenseManager>,
-        zone_id: i64,
-    ) -> Option<(f32, f32)> {
-        if license.is_some_and(|license| !license.premium_snapshot()) {
-            return None;
-        }
-        Self::crossfeed_configure_with(db, zone_id)
-    }
-
-    /// La lecture du réglage, SANS la garde de licence : seul
-    /// [`Self::crossfeed_configure_sous_licence`] l'appelle.
+    /// Crossfeed simple gratuit (#9210) : conserver les choix d'installation
+    /// et de zone, sans garde Premium. Les étages tiers gardent leur garde.
     fn crossfeed_configure_with(
         db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
         zone_id: i64,

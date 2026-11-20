@@ -9575,7 +9575,7 @@ async fn premium_sdk_free_equalizer_reaches_pcm_and_pure_still_bypasses() {
 }
 
 #[tokio::test]
-async fn audio_offer_crossfeed_hard_cut_preserves_settings_for_premium_reactivation() {
+async fn audio_offer_crossfeed_gratuit_preserves_settings_across_tiers() {
     let mut orch = test_orchestrator();
     let license = Arc::new(crate::license::LicenseManager::new_with_limit(
         orch.db.clone(),
@@ -9586,11 +9586,11 @@ async fn audio_offer_crossfeed_hard_cut_preserves_settings_for_premium_reactivat
     let saved = r#"{"enabled":true,"amount":0.37,"delay_ms":0.65}"#;
     settings.set("zone_1_crossfeed", saved).unwrap();
     crate::audio::premium_plugins::migrate_for_account(&settings, false).unwrap();
-    assert!(orch.load_crossfeed_processor(1, 48000).is_none());
-    // Even installed/enabled flags cannot grant Free accounts the processor.
+    assert!(orch.load_crossfeed_processor(1, 48000).is_some());
+    // Le compte Free a accès au même processeur.
     settings.set("plugin_crossfeed_installed", "true").unwrap();
     settings.set("plugin_crossfeed_enabled", "true").unwrap();
-    assert!(orch.load_crossfeed_processor(1, 48000).is_none());
+    assert!(orch.load_crossfeed_processor(1, 48000).is_some());
     license.set_account_premium(true, None).await;
     let mut processor = orch
         .load_crossfeed_processor(1, 48000)
@@ -9603,8 +9603,8 @@ async fn audio_offer_crossfeed_hard_cut_preserves_settings_for_premium_reactivat
     assert_ne!(pcm, before, "reactivated crossfeed must reach PCM");
     license.set_account_premium(false, None).await;
     assert!(
-        orch.load_crossfeed_processor(1, 48000).is_none(),
-        "downgrade must cut immediately"
+        orch.load_crossfeed_processor(1, 48000).is_some(),
+        "le retour en Free conserve le crossfeed simple"
     );
     assert_eq!(
         settings.get("zone_1_crossfeed").unwrap().as_deref(),
@@ -12267,6 +12267,119 @@ async fn une_source_directe_http_reste_jouable() {
             .unwrap_or_else(|| resolu.url.clone());
         assert!(vue.starts_with("http"), "valeur rognée attendue : {vue:?}");
     }
+}
+
+#[tokio::test]
+async fn crossfeed_gratuit_9210_traite_en_free_et_respecte_les_choix() {
+    let mut orch = test_orchestrator();
+    let license = Arc::new(crate::license::LicenseManager::new_with_limit(
+        orch.db.clone(),
+        3,
+    ));
+    orch.license = Some(license.clone());
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(crate::audio::premium_plugins::MIGRATION, "complete")
+        .unwrap();
+    settings.set("plugin_crossfeed_installed", "true").unwrap();
+    settings.set("plugin_crossfeed_enabled", "true").unwrap();
+    let saved = r#"{"enabled":true,"amount":0.37,"delay_ms":0.65}"#;
+    settings.set("zone_1_crossfeed", saved).unwrap();
+    assert!(!license.is_premium().await);
+    let mut processor = orch
+        .load_crossfeed_processor(1, 48000)
+        .expect("crossfeed simple gratuit");
+    let mut pcm = vec![0.0; 4096];
+    pcm[0] = 1.0;
+    let before = pcm.clone();
+    processor.process_interleaved(&mut pcm);
+    assert_ne!(pcm, before, "le DSP gratuit doit traiter les échantillons");
+    settings
+        .set("zone_1_audiophile", r#"{"enabled":true}"#)
+        .unwrap();
+    assert!(
+        orch.load_crossfeed_processor(1, 48000).is_none(),
+        "PURE reste prioritaire"
+    );
+    settings
+        .set("zone_1_audiophile", r#"{"enabled":false}"#)
+        .unwrap();
+    settings.set("plugin_crossfeed_enabled", "false").unwrap();
+    assert!(orch.load_crossfeed_processor(1, 48000).is_none());
+    settings.set("plugin_crossfeed_enabled", "true").unwrap();
+    settings.set("plugin_crossfeed_installed", "false").unwrap();
+    crate::audio::premium_plugins::migrate_for_account(&settings, false).unwrap();
+    assert!(
+        orch.load_crossfeed_processor(1, 48000).is_none(),
+        "ne pas réinstaller un greffon retiré"
+    );
+    assert_eq!(
+        settings.get("zone_1_crossfeed").unwrap().as_deref(),
+        Some(saved)
+    );
+}
+
+#[tokio::test]
+async fn crossfeed_gratuit_9210_droit_annonce_et_greffons_tiers_payants() {
+    let orch = test_orchestrator();
+    let license = crate::license::LicenseManager::new_with_limit(orch.db.clone(), 3);
+    assert!(
+        license
+            .check_feature(crate::license::Feature::Crossfeed)
+            .await
+    );
+    assert!(!crate::license::Feature::all_premium().contains(&crate::license::Feature::Crossfeed));
+    assert!(
+        crate::license::Feature::all_advertised().any(|f| f == crate::license::Feature::Crossfeed)
+    );
+    assert!(
+        !license
+            .check_feature(crate::license::Feature::PluginMarketplace)
+            .await
+    );
+    assert!(!crate::audio::premium_plugins::requires_premium(
+        "crossfeed"
+    ));
+}
+
+#[tokio::test]
+async fn crossfeed_gratuit_9210_ancienne_retenue_et_desinstallation_preservees() {
+    let orch = test_orchestrator();
+    let license = crate::license::LicenseManager::new_with_limit(orch.db.clone(), 3);
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(crate::audio::premium_plugins::MIGRATION, "complete")
+        .unwrap();
+    settings.set("plugin_crossfeed_installed", "false").unwrap();
+    settings.set("plugin_crossfeed_enabled", "false").unwrap();
+    settings
+        .set(
+            "premium_audio_plugins_withheld_crossfeed",
+            "installed,enabled",
+        )
+        .unwrap();
+    crate::audio::premium_plugins::migrate_for_account(&settings, false).unwrap();
+    assert!(!crate::audio::premium_plugins::enabled(
+        &settings,
+        "crossfeed"
+    ));
+    // Comme une installation/désinstallation explicite depuis le catalogue.
+    crate::audio::premium_plugins::forget_withheld(&settings, "crossfeed").unwrap();
+    assert!(
+        settings
+            .get("premium_audio_plugins_withheld_crossfeed")
+            .unwrap()
+            .is_none()
+    );
+    license.set_account_premium(true, None).await;
+    assert!(!crate::audio::premium_plugins::installed(
+        &settings,
+        "crossfeed"
+    ));
+    assert!(!crate::audio::premium_plugins::enabled(
+        &settings,
+        "crossfeed"
+    ));
 }
 
 #[tokio::test]
