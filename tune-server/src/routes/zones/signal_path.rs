@@ -1386,6 +1386,13 @@ pub fn build_signal_path_lang(
         &source,
         traitements.dsp_enabled,
     );
+    // #9177 — sur un fil servi tel quel (DSD brut, ALAC natif), aucun gain
+    // ne multiplie les échantillons : l'orchestrateur ne transcode pas pour
+    // le ReplayGain (`sortie_sujette_au_traitement`). L'étape disparaît, et
+    // avec elle sa part du verdict bit-perfect.
+    if forcages.flux_servi_tel_quel {
+        traitements.replaygain_step = None;
+    }
     // #4354 — lu AVANT que `forcages` parte dans `Analyse` : le verdict PURE
     // se rend en fin de fonction, une fois les étapes décrites.
     let dsd_decime_en_pcm = forcages.dsd_decime_en_pcm;
@@ -1967,6 +1974,8 @@ fn assembler_les_etapes_lang(
     let Forcages {
         dsp_applique,
         dsp_contourne_par_le_dsd,
+        dsp_contourne_par_l_alac,
+        flux_servi_tel_quel,
         dlna_cap_16bit,
         dlna_wav24,
         dlna_force_wav,
@@ -2594,6 +2603,15 @@ fn assembler_les_etapes_lang(
             "description": ts(lang, "dsp_dsd"),
             "bit_perfect": true,
         }));
+    } else if dsp_contourne_par_l_alac {
+        // #9177 — même règle que pour le DSD : dire le contournement. L'ALAC
+        // natif demandé sur la zone part tel quel, l'égaliseur armé n'y
+        // touche pas.
+        steps.push(json!({
+            "name": "DSP",
+            "description": ts(lang, "dsp_alac"),
+            "bit_perfect": true,
+        }));
     } else if dsp_applique {
         steps.push(json!({
             "name": "DSP",
@@ -2611,7 +2629,7 @@ fn assembler_les_etapes_lang(
     // n'entend rien — c'est l'étape qui le lui dit, comme pour le DSP sur DSD.
     let correction_piece_resume = correction_piece.as_ref().map(CorrectionPiece::resume);
     if let Some(cp) = correction_piece
-        && !dsp_contourne_par_le_dsd
+        && !flux_servi_tel_quel
     {
         steps.push(json!({
             "name": "Correction de pièce",
@@ -3274,6 +3292,13 @@ fn decrire_le_transport<'a>(
 struct Forcages {
     dsp_applique: bool,
     dsp_contourne_par_le_dsd: bool,
+    /// #9177 — égaliseur armé, mais l'ALAC part tel quel (« ALAC natif »).
+    dsp_contourne_par_l_alac: bool,
+    /// #9177 — le fil porte les octets de la source sans qu'aucun étage les
+    /// touche : DSD servi brut hors sortie locale, ou ALAC natif. Aucun
+    /// traitement (égaliseur, correction de pièce, ReplayGain) n'y a lieu,
+    /// `sortie_sujette_au_traitement` en ferme la porte côté orchestrateur.
+    flux_servi_tel_quel: bool,
     dlna_cap_16bit: bool,
     /// L'opt-in 24 bits SERVI : la zone l'a demandé ET la source le porte.
     /// Décrit la profondeur du WAV, jamais le fait de forcer le WAV (#4297).
@@ -3368,9 +3393,8 @@ fn decider_les_forcages(
     // toute déduction faite ici.
     let dsd_brut_hors_sortie_locale =
         is_dsd && output_type != "local" && (wire_carries_raw_dsd(wire) || dsd_natif_oaat);
-    // « Armé » et « appliqué » ne sont pas la même chose.
-    let dsp_applique = dsp_enabled && !dsd_brut_hors_sortie_locale;
-    let dsp_contourne_par_le_dsd = dsp_enabled && dsd_brut_hors_sortie_locale;
+    // « Armé » et « appliqué » ne sont pas la même chose. Le DSP n'est
+    // décidé qu'une fois connu le passthrough ALAC, plus bas (#9177).
     // ALAC native passthrough (opt-in per zone): the orchestrator serves the ALAC
     // file straight to a renderer that decodes it (bit-perfect, no FLAC transcode).
     // Mirror the orchestrator's condition (see orchestrator.rs `alac_passthrough`)
@@ -3467,11 +3491,25 @@ fn decider_les_forcages(
         dlna_cap_16bit,
         || ZoneRepo::with_backend(backend.clone()).get_alac_passthrough(zone_id),
     );
-    // Miroir de la condition AAC de l'orchestrateur (voir orchestrator.rs).
+    // Miroir de la condition AAC de l'orchestrateur (`resolve_local.rs`),
+    // plafond de fréquence compris : il manquait ici (#9177).
     let aac_passthrough = source_format == Some(AudioFormat::Aac)
         && is_network_output
         && !dlna_force_wav
+        && max_sample_rate.is_none_or(|max| u32::try_from(sample_rate).unwrap_or(0) <= max)
         && ZoneRepo::with_backend(backend.clone()).get_aac_passthrough(zone_id);
+    // #9177 — l'ALAC natif ferme la porte du traitement comme le DSD brut
+    // (`orchestrator::regles::sortie_sujette_au_traitement`) : égaliseur, IR
+    // et ReplayGain ne forcent pas le transcodage, l'ALAC part tel quel. Le
+    // panneau annonçait « DSP », « ReplayGain » et « non bit-perfect » sur des
+    // octets intacts. Un fil constaté WAV (renderer sans ALAC, négociation
+    // SOAP) dit le contraire et l'emporte.
+    let alac_natif_servi = alac_passthrough
+        && !output_container.is_some_and(|c| c.eq_ignore_ascii_case("wav"));
+    let flux_servi_tel_quel = dsd_brut_hors_sortie_locale || alac_natif_servi;
+    let dsp_applique = dsp_enabled && !flux_servi_tel_quel;
+    let dsp_contourne_par_le_dsd = dsp_enabled && dsd_brut_hors_sortie_locale;
+    let dsp_contourne_par_l_alac = dsp_enabled && alac_natif_servi && !dsd_brut_hors_sortie_locale;
     // #3183 — la QUATRIEME copie a la main, et celle qui avait deja derive :
     // ce miroir n'appelait que `needs_transcode_for_dlna()`, la decision
     // choisit le bras Chromecast pour une zone `chromecast`. Sur une source
@@ -3526,6 +3564,8 @@ fn decider_les_forcages(
     Forcages {
         dsp_applique,
         dsp_contourne_par_le_dsd,
+        dsp_contourne_par_l_alac,
+        flux_servi_tel_quel,
         dlna_cap_16bit,
         dlna_wav24,
         dlna_force_wav,

@@ -5955,3 +5955,136 @@ fn dsd1024_se_dit_dsd1024_8248() {
     assert_eq!(dsd_family_name(22_579_200), "DSD512");
     assert_eq!(dsd_family_name(24_576_000), "DSD512");
 }
+
+// ---------------------------------------------------------------------------
+// #9177 — ALAC natif : aucun traitement n'a lieu, le panneau ne doit pas en
+// annoncer.
+// ---------------------------------------------------------------------------
+
+/// Zone DLNA, « ALAC natif » coché ou non, ALAC hi-res en lecture.
+fn zone_alac_natif_9177(alac_natif: bool) -> (Arc<dyn DbBackend>, Zone) {
+    let (backend, zone) = dlna_zone();
+    let zone_id = zone.id.unwrap();
+    ZoneRepo::with_backend(backend.clone())
+        .update_alac_passthrough(zone_id, alac_natif)
+        .unwrap();
+    let zone = ZoneRepo::with_backend(backend.clone())
+        .get(zone_id)
+        .unwrap()
+        .unwrap();
+    (backend, zone)
+}
+
+/// Une piste ALAC en base, taguée `rg_track_gain`, et l'état qui la joue.
+fn alac_track_with_rg_tag_9177(backend: &Arc<dyn DbBackend>) -> ZoneState {
+    let mut t = tune_core::db::models::Track::new("Piste".into());
+    t.format = Some("alac".into());
+    t.sample_rate = Some(96_000);
+    t.bit_depth = Some(24);
+    let tid = TrackRepo::with_backend(backend.clone()).create(&t).unwrap();
+    tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(backend.clone())
+        .set(tid, "rg_track_gain", "-4.20 dB")
+        .unwrap();
+    SettingsRepo::with_backend(backend.clone())
+        .set(tune_core::audio::replaygain::MODE_KEY, "track")
+        .unwrap();
+    ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            title: "Piste".into(),
+            track_id: Some(tid),
+            format: Some("alac".into()),
+            sample_rate: Some(96_000),
+            bit_depth: Some(24),
+            stream_id: Some("sid-1".into()),
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    }
+}
+
+/// Le cas du ticket : égaliseur armé, ALAC natif coché. L'orchestrateur sert
+/// l'ALAC tel quel (`sortie_sujette_au_traitement` fermée) ; le panneau
+/// annonçait l'égaliseur et « non bit-perfect ».
+#[test]
+fn alac_natif_avec_un_eq_arme_annonce_le_dsp_contourne_9177() {
+    let (backend, zone) = zone_alac_natif_9177(true);
+    armer_l_eq(&backend, zone.id.unwrap());
+    let sp = build_signal_path(&alac_hires_playing(), &zone, &backend, Some("WiiM Pro"), "", None)
+        .unwrap();
+    assert_eq!(
+        step_desc(&sp, "DSP").as_deref(),
+        Some("DSP contourné (ALAC natif servi tel quel)"),
+        "{sp}"
+    );
+    assert_eq!(
+        step_field(&sp, "DSP", "bit_perfect").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+    assert_eq!(verdict(&sp), Some(true), "l'ALAC part intact : {sp}");
+}
+
+/// Contre-épreuve : la même zone SANS ALAC natif transcode en FLAC pour
+/// appliquer l'égaliseur — le panneau l'annonce actif, le verdict tombe.
+#[test]
+fn sans_alac_natif_le_meme_eq_reste_annonce_applique_9177() {
+    let (backend, zone) = zone_alac_natif_9177(false);
+    armer_l_eq(&backend, zone.id.unwrap());
+    let sp = build_signal_path(&alac_hires_playing(), &zone, &backend, Some("WiiM Pro"), "", None)
+        .unwrap();
+    let dsp = step_desc(&sp, "DSP").expect("étape DSP");
+    assert!(!dsp.contains("contourné"), "{dsp}");
+    assert_eq!(verdict(&sp), Some(false), "{sp}");
+}
+
+/// ReplayGain sur ALAC natif : aucun gain ne touche les octets servis tels
+/// quels, l'étape ne doit pas apparaître ni faire tomber le verdict.
+#[test]
+fn alac_natif_n_annonce_pas_de_replaygain_9177() {
+    let (backend, zone) = zone_alac_natif_9177(true);
+    let ps = alac_track_with_rg_tag_9177(&backend);
+    let sp = build_signal_path(&ps, &zone, &backend, Some("WiiM Pro"), "", None).unwrap();
+    assert_eq!(step_desc(&sp, "ReplayGain"), None, "{sp}");
+    assert_eq!(verdict(&sp), Some(true), "{sp}");
+}
+
+/// Contre-épreuve : sans ALAC natif, le même tag ReplayGain est appliqué
+/// (transcodage FLAC) et annoncé.
+#[test]
+fn sans_alac_natif_le_replaygain_reste_annonce_9177() {
+    let (backend, zone) = zone_alac_natif_9177(false);
+    let ps = alac_track_with_rg_tag_9177(&backend);
+    let sp = build_signal_path(&ps, &zone, &backend, Some("WiiM Pro"), "", None).unwrap();
+    assert!(step_desc(&sp, "ReplayGain").is_some(), "{sp}");
+    assert_eq!(verdict(&sp), Some(false), "{sp}");
+}
+
+/// ReplayGain sur un DSD servi brut (question du ticket) : même règle.
+#[test]
+fn dsd_brut_n_annonce_pas_de_replaygain_9177() {
+    let (backend, zone) = diretta_zone();
+    let mut t = tune_core::db::models::Track::new("Locatelli".into());
+    t.format = Some("dsf".into());
+    let tid = TrackRepo::with_backend(backend.clone()).create(&t).unwrap();
+    tune_core::db::track_metadata_repo::TrackMetadataRepo::with_backend(backend.clone())
+        .set(tid, "rg_track_gain", "-4.20 dB")
+        .unwrap();
+    SettingsRepo::with_backend(backend.clone())
+        .set(tune_core::audio::replaygain::MODE_KEY, "track")
+        .unwrap();
+    let mut ps = dsd_playing();
+    if let Some(np) = ps.now_playing.as_mut() {
+        np.track_id = Some(tid);
+    }
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("Diretta Host"),
+        "",
+        Some(&wire("dsf", 5_644_800, 1)),
+    )
+    .unwrap();
+    assert_eq!(step_desc(&sp, "ReplayGain"), None, "{sp}");
+}
