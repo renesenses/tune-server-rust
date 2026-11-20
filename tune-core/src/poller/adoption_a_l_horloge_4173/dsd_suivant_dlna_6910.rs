@@ -251,7 +251,7 @@ async fn scpd_illisible_garde_la_garde() {
 impl Banc {
     /// La piste `SUIVANTE` devient elle aussi un DSF : l'album continue en
     /// DSD après la piste armée.
-    async fn la_suivante_aussi_en_dsd(&mut self) {
+    pub(super) async fn la_suivante_aussi_en_dsd(&mut self) {
         let f = tempfile::Builder::new().suffix(".dsf").tempfile().unwrap();
         std::fs::copy(
             format!("{}/tests/fixtures/dsd/{DSF}", env!("CARGO_MANIFEST_DIR")),
@@ -275,7 +275,7 @@ impl Banc {
 
     /// Le renderer joue la piste en cours à `position_ms`, durée rapportée
     /// `duree_ms`, horloge de Tune à `horloge_secs`.
-    async fn rs130_a(&mut self, position_ms: u64, duree_ms: u64, horloge_secs: u64) {
+    pub(super) async fn rs130_a(&mut self, position_ms: u64, duree_ms: u64, horloge_secs: u64) {
         {
             let reg = self.outputs.lock().await;
             let arc = reg.get(&self.appareil).unwrap();
@@ -303,7 +303,7 @@ impl Banc {
     /// Le RS130 au bout de la piste en cours : flux servi en entier, puis
     /// arrêté à zéro sans passer au DSD armé. Rend vrai si Tune a relancé
     /// (un `Play` de plus).
-    async fn le_rs130_s_arrete_a_zero(&mut self) -> bool {
+    pub(super) async fn le_rs130_s_arrete_a_zero(&mut self) -> bool {
         let flux = self
             .playback
             .get_state(self.zone_id)

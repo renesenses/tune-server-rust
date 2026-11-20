@@ -691,6 +691,16 @@ impl PlaybackOrchestrator {
             .noter_echec(std::time::Instant::now(), immediat)
     }
 
+    /// #9206 — `device_id` a suivi un suivant DSD armé : ses échecs et sa
+    /// récidive sont oubliés. Vrai s'il y avait quelque chose à oublier.
+    pub fn noter_succes_dsd_suivant(&self, device_id: &str) -> bool {
+        self.appareils_qui_lachent_le_dsd_suivant
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(device_id)
+            .is_some()
+    }
+
     /// Banc (#9206) : échecs de suivant DSD notés pour `device_id`.
     #[cfg(test)]
     pub(crate) fn echecs_dsd_suivant_pour_banc(&self, device_id: &str) -> u32 {

@@ -365,7 +365,11 @@ pub enum IssueEchecDsdSuivant {
 ///   RÉCIDIVISTE (`gardes` est conservé) : un seul échec lui rend la garde,
 ///   pour une durée doublée à chaque fois (30 min, 1 h, 2 h… plafond 8 h).
 ///   Un RS130 (#402) ne reperd donc qu'une transition par échéance, de plus
-///   en plus rares.
+///   en plus rares ;
+/// - une transition SUIVIE (le renderer passe au flux armé sans `Play`)
+///   efface toute la mémoire de l'appareil, récidive comprise
+///   (`PlaybackOrchestrator::noter_succes_dsd_suivant`) : un appareil sain
+///   n'accumule pas de faux échecs sur une séance.
 #[derive(Debug, Clone, Default)]
 pub struct EchecsDsdSuivant {
     echecs: u32,

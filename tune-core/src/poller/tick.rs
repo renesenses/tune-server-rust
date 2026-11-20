@@ -2029,6 +2029,7 @@ impl PositionPoller {
                                 preuve = ?adoption.preuve,
                                 "gapless_adoption_horloge_confirmee"
                             );
+                            self.constater_le_suivant_suivi(zone_id);
                             ps.adoption_horloge = None;
                         }
                         decisions::SuiteAdoption::Infirmee => {
@@ -2451,6 +2452,8 @@ impl PositionPoller {
                         )
                         .await;
                         info!(zone_id, next_pos, "gapless_advance_on_position_reset");
+                        // #9206 — le renderer a suivi le flux armé de lui-même.
+                        self.constater_le_suivant_suivi(zone_id);
                         let avance =
                             Box::pin(self.orchestrator.advance_queue_metadata(zone_id, next_pos))
                                 .await;
@@ -3542,6 +3545,7 @@ impl PositionPoller {
                             )
                             .await;
                             info!(zone_id, next_pos, "gapless_confirmed_advancing_metadata");
+                            self.constater_le_suivant_suivi(zone_id);
                             let avance = Box::pin(
                                 self.orchestrator.advance_queue_metadata(zone_id, next_pos),
                             )
@@ -3675,6 +3679,7 @@ impl PositionPoller {
                             self.noter_fin_tune_tested(zone_state, &device_id, pic, rendu)
                                 .await;
                             info!(zone_id, next_pos, "gapless_advance_metadata");
+                            self.constater_le_suivant_suivi(zone_id);
                             if let Err(e) = Box::pin(
                                 self.orchestrator.advance_queue_metadata(zone_id, next_pos),
                             )

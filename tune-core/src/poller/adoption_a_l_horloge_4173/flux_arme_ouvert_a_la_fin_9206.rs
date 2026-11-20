@@ -23,8 +23,8 @@
 //! - le renderer lit le flux armé à la fin : la fin épinglée est différée,
 //!   la bascule est suivie sans `Play`, aucun échec DSD n'est noté — que la
 //!   bascule se lise par l'URI ou par la seule remise à zéro de la position ;
-//! - renderer qui sonde l'en-tête au `SetNext` puis lit à la fin : daté à la
-//!   lecture, différé ;
+//! - sonde d'en-tête au `SetNext` (quelques octets comptés) puis lecture à
+//!   la fin : daté à la lecture, différé — au niveau du compteur seulement ;
 //! - contre-épreuve DMP-A6 (#4173/#4382) : flux armé lu 27 s avant la fin,
 //!   renderer épinglé sur la piste finie → relance au MÊME sondage qu'avant ;
 //! - contre-épreuve : flux lu à la fin, renderer qui ne bascule jamais →
@@ -193,8 +193,10 @@ async fn remise_a_zero_pendant_le_report_uri_restee_sur_la_piste_finie_9206() {
 }
 
 /// Renderer qui SONDE l'en-tête du flux armé au `SetNext` (quelques
-/// octets), puis le LIT à la fin : la datation suit la lecture, pas la
-/// sonde, et la fin est différée.
+/// octets COMPTÉS), puis le LIT à la fin : la datation suit la lecture.
+/// ⚠️ Banc au niveau du compteur seulement : sur le vrai service, une sonde
+/// `GET` produit un bloc de 64 Kio et franchit le seuil (non prouvé, voir
+/// `StreamSession::lecture_au_dela_de_l_en_tete`).
 #[tokio::test]
 async fn sonde_de_l_en_tete_au_set_next_puis_lecture_a_la_fin_9206() {
     let appareil = "uuid:banc-9206-sonde-en-tete";
@@ -305,6 +307,59 @@ async fn la_lecture_est_datee_au_franchissement_de_l_en_tete_9206() {
             .streamer_lecture_au_dela_de_l_en_tete_depuis_ms(&flux)
             .await
             .is_some_and(|ms| ms < 1_000)
+    );
+}
+
+/// Un échec, une réussite, un échec → pas de garde. Une transition SUIVIE
+/// (remise à zéro sur le flux armé, sans `Play`) efface la mémoire de
+/// l'appareil : deux faux échecs séparés par des réussites ne lui retirent
+/// pas le sans-blanc DSD. Le premier échec est posé tel que le constat de
+/// `tick` le pose ; la réussite et le second échec passent par le vrai `tick`.
+#[tokio::test]
+async fn un_echec_une_reussite_un_echec_pas_de_garde_9206() {
+    let appareil = "uuid:banc-9206-sain";
+    let mut banc = Banc::monter_en_dsd(
+        appareil,
+        "auto",
+        annonce_dsd(true),
+        AnnonceSuivante::Annoncee,
+    )
+    .await;
+    banc.la_suivante_aussi_en_dsd().await;
+    // Un échec plus tôt dans la séance.
+    banc.orchestrator.retenir_dsd_suivant_lache(appareil, false);
+    assert_eq!(banc.orchestrator.echecs_dsd_suivant_pour_banc(appareil), 1);
+
+    // Transition 1 RÉUSSIE : le renderer passe seul au flux armé.
+    banc.la_fenetre_d_armement().await;
+    assert_eq!(banc.armees().await, vec![ARMEE.to_string()]);
+    let url = banc.url_armee().await.expect("URL armée");
+    banc.sondage_9206(236_000, 239).await;
+    banc.le_renderer_rapporte(Some(url)).await;
+    banc.sondage_9206(1_000, 240).await;
+    verifier_la_bascule_suivie(&banc, appareil).await;
+
+    // Transition 2 RATÉE : suivant DSD armé, le renderer s'arrête à zéro.
+    banc.playback
+        .dater_le_demarrage(banc.zone_id, Duration::from_secs(300))
+        .await;
+    for (position, horloge) in [(150_000, 151), (182_000, 183), (185_000, 186)] {
+        banc.rs130_a(position, 212_000, horloge).await;
+    }
+    assert_eq!(
+        banc.armees().await,
+        vec![ARMEE.to_string(), SUIVANTE.to_string()]
+    );
+    for (position, horloge) in [(200_000, 201), (211_000, 212)] {
+        banc.rs130_a(position, 212_000, horloge).await;
+    }
+    assert!(banc.le_rs130_s_arrete_a_zero().await);
+    assert_eq!(banc.orchestrator.echecs_dsd_suivant_pour_banc(appareil), 1);
+    assert!(
+        banc.orchestrator
+            .dsd_suivant_tenu_sur_dlna(banc.zone_id, appareil, AnnonceSuivante::Annoncee)
+            .await,
+        "#9206 : un échec, une réussite, un échec — l'appareil garde le suivant DSD"
     );
 }
 

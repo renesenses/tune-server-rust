@@ -1772,6 +1772,27 @@ impl PositionPoller {
         }
     }
 
+    /// #9206 — le suivant armé de `zone_id` a été SUIVI (le renderer y est
+    /// passé sans `Play`) : si c'était un suivant DSD sur DLNA, l'appareil
+    /// est blanchi — échecs et récidive oubliés. Deux faux échecs séparés
+    /// par des transitions réussies ne font pas un récidiviste.
+    pub(super) fn constater_le_suivant_suivi(&self, zone_id: i64) {
+        let appareil = self
+            .dsd_suivant_arme
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&zone_id);
+        if let Some(appareil) = appareil
+            && self.orchestrator.noter_succes_dsd_suivant(&appareil)
+        {
+            info!(
+                zone_id,
+                device_id = %appareil,
+                "gapless_dsd_next_dlna_suivi — échecs de suivant DSD oubliés (#9206)"
+            );
+        }
+    }
+
     fn retenir_dsd_suivant_lache(
         &self,
         zone_id: i64,

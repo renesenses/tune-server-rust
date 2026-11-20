@@ -453,17 +453,23 @@ pub struct StreamSession {
     pub bytes_sent: std::sync::atomic::AtomicU64,
     /// #9206 — instant où `bytes_sent` a franchi
     /// [`OCTETS_AU_DELA_DE_L_EN_TETE`], toutes connexions confondues (posé par
-    /// [`Self::compter_octets_servis`]) : le moment où le lecteur a commencé
-    /// à LIRE les données, pas celui où il a sondé l'en-tête.
+    /// [`Self::compter_octets_servis`]).
     ///
     /// `bytes_sent` dit combien, jamais QUAND. Or c'est le « quand » qui
     /// sépare deux renderers que la fin de piste confondait : le DMP-A6
     /// (#4173) précharge le flux armé ~3 s après le `SetNext`, soit ~27 s
     /// avant la fin, et n'y passe jamais ; le lecteur du fil 2961 (Android
     /// 7.1.2, DSF natif) le lit À la fin (`bytes=0-` puis `bytes=28-`) et
-    /// bascule 1,2 s plus tard. Un renderer qui sonde l'en-tête au `SetNext`
-    /// puis lit à la fin est daté à la lecture. Vide tant que le seuil n'est
-    /// pas franchi.
+    /// bascule 1,2 s plus tard. Vide tant que le seuil n'est pas franchi.
+    ///
+    /// ⚠️ `bytes_sent` compte les octets PRODUITS par le corps HTTP (blocs de
+    /// 64 Kio de `build_file_body`), pas ceux que le lecteur a reçus : une
+    /// sonde `GET bytes=0-` refermée après quelques octets franchit quand même
+    /// le seuil. Le seuil écarte un `HEAD` et les très petits envois, pas une
+    /// sonde `GET` sur un fichier. NON PROUVÉ donc : qu'un renderer qui sonde
+    /// au `SetNext` puis lit à la fin soit daté à la lecture sur le vrai
+    /// service. Piste pour plus tard : dater la dernière requête `Range` qui
+    /// ne part pas de 0.
     pub lecture_au_dela_de_l_en_tete: std::sync::OnceLock<Instant>,
     /// #4455 — reprises `Range` d'un fichier WAV dont le premier octet ne
     /// tombe PAS sur une frontière de trame PCM. Servies telles quelles
@@ -600,9 +606,9 @@ pub struct StreamSession {
     pub producer_done: std::sync::atomic::AtomicBool,
 }
 
-/// #9206 — octets à tirer d'un flux pour qu'on le dise LU : au-delà de
-/// l'en-tête et des sondes (`bytes=0-` refermé, sonde de fin), le lecteur lit
-/// les données (`bytes=28-` d'un DSF).
+/// #9206 — octets PRODUITS sur un flux au-delà desquels on le dit lu (voir
+/// la réserve de [`StreamSession::lecture_au_dela_de_l_en_tete`] : une sonde
+/// `GET` sur un fichier produit un bloc de 64 Kio et franchit ce seuil).
 pub const OCTETS_AU_DELA_DE_L_EN_TETE: u64 = 4_096;
 
 impl StreamSession {
