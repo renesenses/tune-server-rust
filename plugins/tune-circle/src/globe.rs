@@ -9,6 +9,7 @@
 //! | `GET /contacts/locations`                | idem                                    |
 //! | `GET /world/points` (rc9, #7122)          | idem                                    |
 //! | `GET\|PUT\|DELETE /me/public-map-opt-out` (rc9, #7122) | idem                    |
+//! | `GET /world/circles` (rc13, cercles du monde) | idem                                |
 //!
 //! Même relais que les autres routes du cercle ([`crate::relais::Relais`]) :
 //! session SSO relue à chaque appel, réponses du cloud relayées à l'octet près
@@ -49,6 +50,16 @@
 //! `DELETE` = revenir, `GET` = l'état), sans corps envoyé. Mêmes états que les
 //! autres routes : `412`, `503`, et `404` sur un serveur plus ancien.
 //! `Cache-Control: no-store` partout.
+//!
+//! ## Les cercles du monde (rc13, décision de Bertrand du 20/11/2026)
+//!
+//! `GET /world/circles` : tous les cercles Tune, par pays, en tranches
+//! (`[{ country_code, circles, members }]`, « <5 », « 5-19 »…), sans nom de
+//! cercle ni de membre, sans identifiant, sans coordonnée. Le cloud fait
+//! l'anonymisation (pays de la ville du propriétaire, carte publique rc9 comme
+//! consentement, cercles de l'appelant exclus) ; le greffon relaie tel quel,
+//! avec les mêmes états (`412`, `503`, `404` sur un cloud plus ancien) et
+//! `Cache-Control: no-store`.
 
 use std::sync::Arc;
 
@@ -222,6 +233,20 @@ pub(crate) async fn points_du_monde(State(relais): State<Arc<Relais>>) -> Respon
     sans_cache(en_reponse(
         relais
             .appeler("GET /world/points", Method::GET, &["world", "points"], None)
+            .await,
+    ))
+}
+
+/// rc13 : les cercles du monde, anonymes, par pays et en tranches.
+pub(crate) async fn cercles_du_monde(State(relais): State<Arc<Relais>>) -> Response {
+    sans_cache(en_reponse(
+        relais
+            .appeler(
+                "GET /world/circles",
+                Method::GET,
+                &["world", "circles"],
+                None,
+            )
             .await,
     ))
 }
