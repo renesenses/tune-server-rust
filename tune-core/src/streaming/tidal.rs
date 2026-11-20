@@ -3977,7 +3977,10 @@ impl Drop for FichierDashPartiel {
             return;
         }
         if std::fs::remove_file(&chemin).is_ok() {
-            debug!(path = chemin.as_str(), "tidal_dash_fichier_partiel_supprime_8795");
+            debug!(
+                path = chemin.as_str(),
+                "tidal_dash_fichier_partiel_supprime_8795"
+            );
         }
     }
 }

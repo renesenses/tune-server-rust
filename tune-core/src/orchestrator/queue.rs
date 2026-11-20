@@ -67,7 +67,9 @@ pub(super) async fn flux_de_la_sonde_apres_avance(
         let tidal = svc
             .as_any()
             .downcast_ref::<crate::streaming::tidal::TidalService>()?;
-        let flux = tidal.flux_complet_en_cache(source_id, provider_quality).await;
+        let flux = tidal
+            .flux_complet_en_cache(source_id, provider_quality)
+            .await;
         if flux.is_none() {
             info!(source_id, "gapless_levels_tidal_sans_fichier_complet_8795");
         }

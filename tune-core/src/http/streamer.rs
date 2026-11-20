@@ -2633,8 +2633,7 @@ pub fn cleanup_leftover_transcode_files() {
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|m| std::time::SystemTime::now().duration_since(m).ok());
-            let epingle =
-                crate::audio::dash_epingles::est_epingle(&entry.path().to_string_lossy());
+            let epingle = crate::audio::dash_epingles::est_epingle(&entry.path().to_string_lossy());
             if dash_tidal_orphelin(name, age, epingle) && std::fs::remove_file(entry.path()).is_ok()
             {
                 count += 1;
@@ -4018,7 +4017,11 @@ mod balayage_dash_8795_tests {
             "récent : peut-être celui d'un autre serveur en cours"
         );
         assert!(!dash_tidal_orphelin(nom, None, false), "âge inconnu");
-        assert!(!dash_tidal_orphelin("tune-dash-transcode-x.mp4", VIEUX, false));
+        assert!(!dash_tidal_orphelin(
+            "tune-dash-transcode-x.mp4",
+            VIEUX,
+            false
+        ));
         assert!(!dash_tidal_orphelin("tune-dash-warm-x.mp4", VIEUX, false));
         assert!(!dash_tidal_orphelin("tune-dash-x.flac", VIEUX, false));
         assert!(!dash_tidal_orphelin("musique.mp4", VIEUX, false));

@@ -190,7 +190,10 @@ async fn banc(appareil: &str) -> (PlaybackOrchestrator, PlayRequest) {
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    assert!(tenu, "prémisse : le préchargement de LENTE tient le service");
+    assert!(
+        tenu,
+        "prémisse : le préchargement de LENTE tient le service"
+    );
     let req = PlayRequest {
         zone_id,
         output_device_id: Some(appareil.into()),

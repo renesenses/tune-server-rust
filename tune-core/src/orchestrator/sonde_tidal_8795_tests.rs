@@ -53,7 +53,11 @@ async fn un_fichier_complet_au_cache_est_sonde_sans_requete_8795() {
     let url = format!("file://{}", fichier.path().display());
     svc.mettre_au_cache_8795("88800717", "LOSSLESS", &url).await;
     let flux = flux_de_la_sonde_apres_avance(&svc, "tidal", "88800717", Some("LOSSLESS")).await;
-    assert_eq!(flux.map(|f| f.url), Some(url), "le fichier au cache est sondé");
+    assert_eq!(
+        flux.map(|f| f.url),
+        Some(url),
+        "le fichier au cache est sondé"
+    );
     assert_eq!(requetes.load(Ordering::SeqCst), 0);
 }
 
