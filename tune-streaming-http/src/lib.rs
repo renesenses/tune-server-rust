@@ -1768,6 +1768,14 @@ async fn service_status(
     // playlists) et retenait toutes les lectures arrivées après lui : les
     // widgets de l'accueil tombaient en « délai ». L'écriture n'est prise que
     // pour une connexion par interrogation, que Qobuz n'a pas.
+    // La session enregistrée n'a pas pu être relue au démarrage (clé du
+    // coffre absente, illisible ou autre) : l'écran le dit.
+    let illisible = state
+        .services
+        .lock()
+        .await
+        .session_illisible(&service)
+        .map(|r| r.as_str());
     let (mut status, a_reconnecter) = {
         let lecture = svc.read().await;
         (
@@ -1776,7 +1784,7 @@ async fn service_status(
         )
     };
     if status.authenticated || !connexion_par_interrogation(&service) {
-        return reponse_etat_du_service(&service, &status, a_reconnecter);
+        return reponse_etat_du_service(&service, &status, a_reconnecter, illisible);
     }
     let mut svc = svc.write().await;
     status = svc.auth_status().await;
@@ -1788,9 +1796,9 @@ async fn service_status(
         drop(svc);
         state.save_tokens().await;
         purge_contenu_utilisateur(&service);
-        return reponse_etat_du_service(&service, &status, None);
+        return reponse_etat_du_service(&service, &status, None, None);
     }
-    reponse_etat_du_service(&service, &status, a_reconnecter)
+    reponse_etat_du_service(&service, &status, a_reconnecter, illisible)
 }
 
 /// #8904 — pourquoi le compte d'un service est « à reconnecter », s'il l'est.
@@ -1816,6 +1824,7 @@ fn reponse_etat_du_service(
     service: &str,
     status: &tune_core::streaming::traits::AuthStatus,
     a_reconnecter: Option<&str>,
+    session_illisible: Option<&str>,
 ) -> Response {
     let mut corps = json!({
         "service": service,
@@ -1824,6 +1833,11 @@ fn reponse_etat_du_service(
         "username": status.username,
         "subscription": status.subscription,
     });
+    // La session enregistrée ne se relit pas (clé du coffre) : dit seulement
+    // quand c'est le cas, la forme habituelle ne change pas.
+    if let Some(raison) = session_illisible.filter(|_| !status.authenticated) {
+        corps["session_unreadable"] = json!(raison);
+    }
     // #8904 — seulement quand le compte est à reconnecter : la forme
     // habituelle de la réponse ne change pas.
     if let Some(raison) = a_reconnecter.filter(|_| !status.authenticated) {

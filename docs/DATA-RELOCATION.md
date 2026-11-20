@@ -11,6 +11,11 @@ musicaux**.
 
 - **Déplacé** : tout le répertoire de données — `tune.db` (+ WAL/SHM),
   `artwork_cache/`, et le contenu de `data_dir`.
+- **Déplacé aussi** : `tune-secrets.cle`, la clé maîtresse du coffre, posée à
+  côté de `tune.db` (droits 0600, même propriétaire). Elle ouvre les valeurs
+  scellées de la base : jetons des services de streaming, clés d'API
+  personnelles. Une base déplacée **sans** elle garde ses lignes, mais elles ne
+  s'ouvrent plus : chaque service affiche « session illisible, reconnectez-vous ».
 - **Pas déplacé** : le binaire, `web/`, `tune.toml` (restent sur la clé).
 - **Cible** : un simple dossier `TuneData/` à la racine du volume choisi.
   Aucune partition créée, aucune donnée existante modifiée.
@@ -90,3 +95,43 @@ absent :
 - **V2** : purge ancien emplacement depuis l'UI, stats I/O (badge « lent »
   mesuré), option à l'onboarding appliance (« où stocker les données ? »),
   et priorité basse du scanner (nice/ionice) — chantier frère du lag.
+
+## Clé du coffre (`tune-secrets.cle`)
+
+La clé maîtresse vit **à côté de la base** (dossier de `db_path`), jamais dans
+la base. Tout geste qui déplace ou copie la base doit l'emporter :
+
+- **Déplacement (appliance)** : copié par `/appliance/data/relocate`, avant la
+  vérification ; un échec de copie annule le déplacement.
+- **Migration de dossier (macOS, Windows)** : copiée avec la base ; une autre
+  clé déjà présente à la cible n'est jamais écrasée.
+- **Sauvegardes locales** (`backups/`) : une copie de la clé y est rangée ; la
+  restauration la remet si la base l'a perdue, sans jamais remplacer une clé
+  en place. Si la clé des données change (perdue puis recréée), la copie
+  rangée suit et l'ancienne est gardée à côté (`tune-secrets.cle.remplacee-…`) :
+  les sauvegardes plus anciennes ont été scellées avec elle. La restauration
+  n'accepte que les fichiers au nom des sauvegardes et à l'en-tête SQLite.
+
+> ⚠️ **Le dossier `backups/` contient la clé.** Une copie de ce dossier (vers
+> un NAS, un disque externe, un service de stockage) **suffit à ouvrir** les
+> jetons des services et les clés d'API de ces sauvegardes. Pour une copie hors
+> de la machine, excluez `tune-secrets.cle*` (et gardez la clé à part, en lieu
+> sûr), ou chiffrez la copie.
+- **Export de la base, sauvegarde chiffrée `.enc`, copie à la main** : la clé
+  n'y est **pas**. Sauvegardez `tune-secrets.cle` avec la base (même dossier),
+  ou attendez-vous à reconnecter les services après restauration ailleurs.
+
+**Droits** : la clé doit être lisible par le compte du service. Créée par
+`root` puis service lancé sous `tune`, elle est illisible : les services
+affichent « clé illisible » et rien n'est effacé ; corriger avec
+`chown tune: tune-secrets.cle && chmod 600 tune-secrets.cle`.
+
+**PostgreSQL, plusieurs serveurs sur la même base** : chaque serveur a sa clé
+dans le dossier de son `db_path`. Pour que l'un ouvre ce que l'autre a
+scellé, copiez la **même** `tune-secrets.cle` sur chacun (0600). Sinon chaque
+serveur ne lit que les sessions qu'il a écrites lui-même.
+
+**Retour à une version antérieure** : une version d'avant le scellement des
+jetons ne sait pas lire une ligne `auth_tokens_*` scellée ; les services sont
+à reconnecter (la ligne est réécrite à la connexion). Rien d'autre n'est
+perdu.

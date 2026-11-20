@@ -7396,5 +7396,23 @@
     "pl": "Zdalnie krąg jest tylko do odczytu: zmień go w sieci lokalnej.",
     "el": "Από απόσταση ο κύκλος είναι μόνο για ανάγνωση: αλλάξτε τον από το τοπικό δίκτυο.",
     "tr": "Uzaktan çevre salt okunurdur: yerel ağdan değiştirin."
+  },
+  "tidal.playback.previewOnly": {
+    "fr": "TIDAL ne sert qu'un extrait de 30 secondes de ce titre pour ce compte (abonnement ou droits du titre) : il n'est pas lu.",
+    "en": "TIDAL only serves a 30-second preview of this track for this account (subscription or track rights), so it is not played.",
+    "de": "TIDAL liefert für dieses Konto nur eine 30-Sekunden-Vorschau dieses Titels (Abonnement oder Rechte am Titel); er wird daher nicht abgespielt.",
+    "es": "TIDAL solo ofrece un fragmento de 30 segundos de este tema para esta cuenta (suscripción o derechos del tema), así que no se reproduce.",
+    "it": "TIDAL fornisce solo un'anteprima di 30 secondi di questo brano per questo account (abbonamento o diritti del brano), quindi non viene riprodotto.",
+    "zh": "TIDAL 仅为此账户提供该曲目 30 秒的试听片段（订阅或曲目版权所限），因此不会播放。",
+    "ja": "このアカウントでは、TIDAL はこの曲の 30 秒のプレビューしか提供しません（サブスクリプションまたは曲の権利のため）。そのため再生されません。",
+    "ko": "이 계정에서는 TIDAL이 이 곡의 30초 미리 듣기만 제공합니다(구독 또는 곡 권리 문제). 따라서 재생되지 않습니다.",
+    "ro": "TIDAL oferă pentru acest cont doar o previzualizare de 30 de secunde a acestei piese (abonament sau drepturi asupra piesei), așa că nu este redată.",
+    "sv": "TIDAL ger bara ett 30-sekunders smakprov av spåret för det här kontot (abonnemang eller rättigheter till spåret), så det spelas inte upp.",
+    "hu": "A TIDAL ennél a fióknál csak 30 másodperces előnézetet ad ebből a számból (előfizetés vagy a szám jogai miatt), ezért nem játssza le.",
+    "vi": "TIDAL chỉ cung cấp đoạn nghe thử 30 giây của bài này cho tài khoản này (do gói đăng ký hoặc bản quyền bài hát), nên bài không được phát.",
+    "nb": "TIDAL gir bare en 30-sekunders forhåndsvisning av sporet for denne kontoen (abonnement eller rettigheter til sporet), så det spilles ikke av.",
+    "pl": "TIDAL udostępnia temu kontu tylko 30-sekundowy fragment tego utworu (subskrypcja lub prawa do utworu), więc nie zostanie odtworzony.",
+    "el": "Το TIDAL παρέχει για αυτόν τον λογαριασμό μόνο ένα απόσπασμα 30 δευτερολέπτων αυτού του κομματιού (συνδρομή ή δικαιώματα του κομματιού), οπότε δεν αναπαράγεται.",
+    "tr": "TIDAL bu hesap için bu parçanın yalnızca 30 saniyelik önizlemesini sunuyor (abonelik veya parça hakları), bu yüzden çalınmıyor."
   }
 }

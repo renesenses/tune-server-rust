@@ -52,6 +52,22 @@ jobs:
       - name: Vérifier les notes multilingues du tag (#6856)
         run: python3 scripts/assembler-notes-release.py --tag "$GITHUB_REF_NAME" --output "$RUNNER_TEMP/RELEASE_NOTES.md"
 
+      # Les identifiants client TIDAL sont figés dans chaque binaire publié
+      # (`option_env!`, tune-core/src/streaming/tidal.rs). Sans eux, TIDAL
+      # répondrait « non configuré » chez tous les utilisateurs : sur le dépôt
+      # principal, un tag sans ces deux secrets s'arrête ici, avant toute
+      # compilation. Un fork construit quand même (TIDAL non configuré).
+      - name: Identifiants client TIDAL présents
+        if: ${{ !github.event.repository.fork }}
+        env:
+          TUNE_TIDAL_CLIENT_ID: ${{ secrets.TUNE_TIDAL_CLIENT_ID }}
+          TUNE_TIDAL_CLIENT_SECRET: ${{ secrets.TUNE_TIDAL_CLIENT_SECRET }}
+        run: |
+          if [ -z "$TUNE_TIDAL_CLIENT_ID" ] || [ -z "$TUNE_TIDAL_CLIENT_SECRET" ]; then
+            echo "::error::Secrets TUNE_TIDAL_CLIENT_ID / TUNE_TIDAL_CLIENT_SECRET absents : les binaires publiés n'auraient pas TIDAL."
+            exit 1
+          fi
+
       - name: Verify generated plugin lists
         run: python scripts/plugin-catalog.py --check
       # Symetrique de « Verify web-client version matches release tag », plus
@@ -344,6 +360,8 @@ jobs:
         env:
           TUNE_YOUTUBE_CLIENT_ID: ${{ secrets.TUNE_YOUTUBE_CLIENT_ID }}
           TUNE_YOUTUBE_CLIENT_SECRET: ${{ secrets.TUNE_YOUTUBE_CLIENT_SECRET }}
+          TUNE_TIDAL_CLIENT_ID: ${{ secrets.TUNE_TIDAL_CLIENT_ID }}
+          TUNE_TIDAL_CLIENT_SECRET: ${{ secrets.TUNE_TIDAL_CLIENT_SECRET }}
         run: cross build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features ${{ matrix.features }}
 
       # Garde-fou #3613 : la sortie audio LOCALE doit être DANS le binaire ARM
@@ -456,6 +474,8 @@ jobs:
         env:
           TUNE_YOUTUBE_CLIENT_ID: ${{ secrets.TUNE_YOUTUBE_CLIENT_ID }}
           TUNE_YOUTUBE_CLIENT_SECRET: ${{ secrets.TUNE_YOUTUBE_CLIENT_SECRET }}
+          TUNE_TIDAL_CLIENT_ID: ${{ secrets.TUNE_TIDAL_CLIENT_ID }}
+          TUNE_TIDAL_CLIENT_SECRET: ${{ secrets.TUNE_TIDAL_CLIENT_SECRET }}
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","plugins-wasm","audio-embedding","dst"]}
         run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme
 
@@ -476,6 +496,8 @@ jobs:
         env:
           TUNE_YOUTUBE_CLIENT_ID: ${{ secrets.TUNE_YOUTUBE_CLIENT_ID }}
           TUNE_YOUTUBE_CLIENT_SECRET: ${{ secrets.TUNE_YOUTUBE_CLIENT_SECRET }}
+          TUNE_TIDAL_CLIENT_ID: ${{ secrets.TUNE_TIDAL_CLIENT_ID }}
+          TUNE_TIDAL_CLIENT_SECRET: ${{ secrets.TUNE_TIDAL_CLIENT_SECRET }}
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","asio","postgres","plugins-wasm","audio-embedding","dst"]}
         run: cargo build --release --package tune-server --target ${{ matrix.target }} --no-default-features --features oaat,cloud-relay,local-audio,asio,postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme
 
@@ -487,6 +509,8 @@ jobs:
         env:
           TUNE_YOUTUBE_CLIENT_ID: ${{ secrets.TUNE_YOUTUBE_CLIENT_ID }}
           TUNE_YOUTUBE_CLIENT_SECRET: ${{ secrets.TUNE_YOUTUBE_CLIENT_SECRET }}
+          TUNE_TIDAL_CLIENT_ID: ${{ secrets.TUNE_TIDAL_CLIENT_ID }}
+          TUNE_TIDAL_CLIENT_SECRET: ${{ secrets.TUNE_TIDAL_CLIENT_SECRET }}
         # plugin-catalog: {"features":"all","base":["postgres","plugins-wasm","audio-embedding","dst"]}
         run: cargo build --release --package tune-server --target ${{ matrix.target }} --features postgres,plugins-wasm,audio-embedding,dst,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme
 

@@ -5,8 +5,113 @@ use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use super::traits::StreamingService;
+use crate::coffre::{Coffre, EtatDeLaCle, est_scelle};
 use crate::db::backend::DbBackend;
 use crate::db::settings_repo::SettingsRepo;
+
+/// Une ligne `auth_tokens_<service>` lue dans `settings`.
+#[derive(Debug, PartialEq, Eq)]
+pub enum LigneDeJetons {
+    /// Écrite en clair (version antérieure, ou processus sans coffre).
+    EnClair(String),
+    /// Scellée par le coffre, et ouverte : le JSON des jetons.
+    Scellee(String),
+    /// Scellée, mais la clé maîtresse en place ne l'ouvre pas : la raison.
+    Illisible(RaisonIllisible),
+}
+
+/// Pourquoi une ligne de jetons scellée ne s'ouvre pas. Le code (`as_str`)
+/// est publié par l'état des services (`session_unreadable`), que l'écran
+/// traduit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RaisonIllisible {
+    /// `tune-secrets.cle` absente (base déplacée ou restaurée sans elle).
+    CleAbsente,
+    /// `tune-secrets.cle` présente mais illisible (droits : créée par `root`,
+    /// service lancé sous un autre compte ; ou fichier abîmé).
+    CleIllisible,
+    /// La clé se lit, mais ce n'est pas celle qui a scellé la ligne.
+    AutreCle,
+}
+
+impl RaisonIllisible {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CleAbsente => "key_missing",
+            Self::CleIllisible => "key_unreadable",
+            Self::AutreCle => "key_mismatch",
+        }
+    }
+}
+
+impl LigneDeJetons {
+    /// Le JSON des jetons, s'il est lisible.
+    pub fn clair(&self) -> Option<&str> {
+        match self {
+            Self::EnClair(c) | Self::Scellee(c) => Some(c),
+            Self::Illisible(_) => None,
+        }
+    }
+}
+
+/// Lit une ligne de jetons stockée, scellée ou non.
+pub fn ouvrir_les_jetons(coffre: Option<&Coffre>, stockee: &str) -> LigneDeJetons {
+    if !est_scelle(stockee) {
+        return LigneDeJetons::EnClair(stockee.to_string());
+    }
+    let Some(coffre) = coffre else {
+        return LigneDeJetons::Illisible(RaisonIllisible::CleAbsente);
+    };
+    match coffre.ouvrir(stockee) {
+        Ok(clair) => LigneDeJetons::Scellee(clair),
+        Err(_) => LigneDeJetons::Illisible(match coffre.etat_de_la_cle() {
+            EtatDeLaCle::Absente => RaisonIllisible::CleAbsente,
+            EtatDeLaCle::Illisible => RaisonIllisible::CleIllisible,
+            EtatDeLaCle::Presente => RaisonIllisible::AutreCle,
+        }),
+    }
+}
+
+/// La valeur à stocker pour les jetons `clair` : scellée par le coffre s'il
+/// y en a un. Si le scellement échoue (dossier de la clé non inscriptible),
+/// la ligne reste en clair, comme avant, plutôt que de perdre la connexion.
+pub fn sceller_les_jetons(coffre: Option<&Coffre>, clair: &str) -> String {
+    match coffre.map(|c| c.sceller(clair)) {
+        Some(Ok(scelle)) => scelle,
+        Some(Err(e)) => {
+            // Une fois par processus : la cause (dossier de la clé non
+            // inscriptible) ne change pas d'une sauvegarde à l'autre.
+            static DEJA_DIT: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !DEJA_DIT.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                warn!(error = %e, "jetons_non_scelles_coffre_indisponible");
+            }
+            clair.to_string()
+        }
+        None => clair.to_string(),
+    }
+}
+
+/// Le coffre des jetons de ce processus : celui du serveur, s'il est
+/// installé (`tune-server` le pose au démarrage, à côté de la base).
+fn coffre_des_jetons() -> Option<Coffre> {
+    Coffre::du_serveur()
+}
+
+/// Lit les jetons de `cle` (`auth_tokens_<service>`) en clair, qu'ils soient
+/// stockés scellés ou non. `None` : ligne absente ou illisible.
+pub fn lire_les_jetons(settings: &SettingsRepo, cle: &str) -> Option<String> {
+    let stockee = settings.get(cle).ok().flatten()?;
+    ouvrir_les_jetons(coffre_des_jetons().as_ref(), &stockee)
+        .clair()
+        .map(str::to_string)
+}
+
+/// Écrit les jetons `clair` sous `cle`, scellés par le coffre du serveur.
+pub fn ecrire_les_jetons(settings: &SettingsRepo, cle: &str, clair: &str) {
+    let valeur = sceller_les_jetons(coffre_des_jetons().as_ref(), clair);
+    settings.set(cle, &valeur).ok();
+}
 
 /// `RwLock` et non `Mutex` : les lectures peuvent se faire en parallele.
 ///
@@ -23,6 +128,12 @@ use crate::db::settings_repo::SettingsRepo;
 /// Il n'y a donc pas de cas silencieusement faux.
 pub struct ServiceRegistry {
     services: HashMap<String, Arc<RwLock<Box<dyn StreamingService>>>>,
+    /// Les services dont la ligne de jetons, scellée, n'a pas pu être relue
+    /// au démarrage, et pourquoi. La ligne reste en place (la clé peut
+    /// revenir) ; l'écran du service le dit (`session_unreadable`) au lieu
+    /// d'un simple « non connecté ». Vidé pour un service dès qu'une nouvelle
+    /// ligne est écrite (reconnexion).
+    sessions_illisibles: std::sync::Mutex<HashMap<String, RaisonIllisible>>,
 }
 
 impl Default for ServiceRegistry {
@@ -35,6 +146,7 @@ impl ServiceRegistry {
     pub fn new() -> Self {
         Self {
             services: HashMap::new(),
+            sessions_illisibles: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -62,6 +174,28 @@ impl ServiceRegistry {
         Some(svc.clone())
     }
 
+    /// Pourquoi la session enregistrée de `name` n'a pas pu être relue, si
+    /// c'est le cas ([`RaisonIllisible::as_str`]).
+    pub fn session_illisible(&self, name: &str) -> Option<RaisonIllisible> {
+        self.sessions_illisibles
+            .lock()
+            .ok()
+            .and_then(|m| m.get(name).copied())
+    }
+
+    fn noter_session_illisible(&self, name: &str, raison: Option<RaisonIllisible>) {
+        if let Ok(mut m) = self.sessions_illisibles.lock() {
+            match raison {
+                Some(r) => {
+                    m.insert(name.to_string(), r);
+                }
+                None => {
+                    m.remove(name);
+                }
+            }
+        }
+    }
+
     pub fn list(&self) -> Vec<String> {
         self.services.keys().cloned().collect()
     }
@@ -83,12 +217,24 @@ impl ServiceRegistry {
                 // #5997 — le serveur propage lui-même les cœurs de ce service
                 // et en tient le miroir : le client ne recopie plus.
                 "favoris_miroir": svc.favoris_miroir(),
+                // La session enregistrée n'a pas pu être relue (clé du coffre
+                // absente, illisible ou autre) : code que l'écran traduit.
+                "session_unreadable": self
+                    .session_illisible(name)
+                    .filter(|_| !status.authenticated)
+                    .map(RaisonIllisible::as_str),
             }));
         }
         results
     }
 
     pub async fn save_all_tokens(&self, db: &Arc<dyn DbBackend>) {
+        self.save_all_tokens_avec(db, coffre_des_jetons().as_ref())
+            .await
+    }
+
+    /// [`Self::save_all_tokens`] avec un coffre donné (`None` : en clair).
+    pub async fn save_all_tokens_avec(&self, db: &Arc<dyn DbBackend>, coffre: Option<&Coffre>) {
         let settings = SettingsRepo::with_backend(db.clone());
         for (name, svc) in &self.services {
             let svc = svc.read().await;
@@ -98,10 +244,26 @@ impl ServiceRegistry {
                 // #8426 — chaque sauvegarde passe sur TOUS les services : une
                 // ligne inchangée n'est ni réécrite ni annoncée, sans quoi
                 // `tokens_saved` se lit pour un service que personne n'a touché.
-                if settings.get(&key).ok().flatten().as_deref() == Some(ligne.as_str()) {
+                // Le scellement change à chaque écriture (nonce) : on compare
+                // le CONTENU. Une ligne encore en clair alors qu'un coffre est
+                // là est réécrite, scellée.
+                let en_place = settings
+                    .get(&key)
+                    .ok()
+                    .flatten()
+                    .map(|v| ouvrir_les_jetons(coffre, &v));
+                if matches!(&en_place, Some(LigneDeJetons::Scellee(c)) if c == &ligne) {
                     continue;
                 }
-                settings.set(&key, &ligne).ok();
+                let valeur = sceller_les_jetons(coffre, &ligne);
+                // En clair et identique, sans scellement possible : rien à faire.
+                if matches!(&en_place, Some(LigneDeJetons::EnClair(c)) if c == &ligne)
+                    && !est_scelle(&valeur)
+                {
+                    continue;
+                }
+                settings.set(&key, &valeur).ok();
+                self.noter_session_illisible(name, None);
                 info!(service = %name, "tokens_saved");
             }
         }
@@ -171,6 +333,12 @@ impl ServiceRegistry {
     }
 
     pub async fn restore_all_tokens(&self, db: &Arc<dyn DbBackend>) {
+        self.restore_all_tokens_avec(db, coffre_des_jetons().as_ref())
+            .await
+    }
+
+    /// [`Self::restore_all_tokens`] avec un coffre donné (`None` : en clair).
+    pub async fn restore_all_tokens_avec(&self, db: &Arc<dyn DbBackend>, coffre: Option<&Coffre>) {
         let settings = SettingsRepo::with_backend(db.clone());
         for (name, svc) in &self.services {
             // Restore enabled/disabled state
@@ -200,12 +368,33 @@ impl ServiceRegistry {
 
             // Restore auth tokens
             let key = format!("auth_tokens_{name}");
-            if let Some(json_str) = settings.get(&key).ok().flatten()
-                && let Ok(tokens) = serde_json::from_str(&json_str)
+            let ligne = settings
+                .get(&key)
+                .ok()
+                .flatten()
+                .map(|v| ouvrir_les_jetons(coffre, &v));
+            if let Some(LigneDeJetons::Illisible(raison)) = ligne {
+                // Ni effacée ni réécrite : la clé maîtresse peut revenir.
+                // L'écran du service le dit (`session_unreadable`).
+                warn!(service = %name, raison = raison.as_str(), "tokens_illisibles_cle_maitresse");
+                self.noter_session_illisible(name, Some(raison));
+            }
+            let en_clair = matches!(ligne, Some(LigneDeJetons::EnClair(_)));
+            if let Some(json_str) = ligne.as_ref().and_then(LigneDeJetons::clair)
+                && let Ok(tokens) = serde_json::from_str(json_str)
             {
                 let mut svc = svc.write().await;
                 if svc.restore_tokens(&tokens) {
                     info!(service = %name, "tokens_restored");
+                    // Une ligne écrite en clair par une version antérieure est
+                    // réécrite scellée, sans déconnecter personne : les mêmes
+                    // jetons, relus à l'identique.
+                    if en_clair && coffre.is_some() {
+                        settings
+                            .set(&key, &sceller_les_jetons(coffre, json_str))
+                            .ok();
+                        info!(service = %name, "tokens_scelles");
+                    }
                     // A row in a superseded shape (today: the Qobuz plaintext
                     // password) is rewritten here rather than waiting for the
                     // next refresh — a token that never expires would leave the
@@ -213,7 +402,9 @@ impl ServiceRegistry {
                     if svc.tokens_need_rewrite()
                         && let Some(clean) = svc.save_tokens()
                     {
-                        settings.set(&key, &clean.to_string()).ok();
+                        settings
+                            .set(&key, &sceller_les_jetons(coffre, &clean.to_string()))
+                            .ok();
                         warn!(service = %name, "tokens_rewritten_dropping_stale_fields");
                     }
                     svc.post_restore().await;
@@ -258,6 +449,10 @@ mod get_actif_tests {
         assert!(registre.get_actif("inconnu").await.is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "registry_jetons_scelles_tests.rs"]
+mod jetons_scelles_tests;
 
 #[cfg(test)]
 #[path = "registry_jetons_8426_tests.rs"]

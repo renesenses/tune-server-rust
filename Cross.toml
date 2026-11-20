@@ -136,6 +136,9 @@ passthrough = [
     # le client de repli même quand la CI fournit celui de Tune.
     "TUNE_YOUTUBE_CLIENT_ID",
     "TUNE_YOUTUBE_CLIENT_SECRET",
+    # Identifiants client TIDAL, lus par `option_env!` (binaires ARM compris).
+    "TUNE_TIDAL_CLIENT_ID",
+    "TUNE_TIDAL_CLIENT_SECRET",
 ]
 [target.aarch64-unknown-linux-musl.env]
 passthrough = [
@@ -154,4 +157,7 @@ passthrough = [
     "TUNE_GIT_SHA",
     "TUNE_YOUTUBE_CLIENT_ID",
     "TUNE_YOUTUBE_CLIENT_SECRET",
+    # Identifiants client TIDAL, lus par `option_env!` (binaires ARM compris).
+    "TUNE_TIDAL_CLIENT_ID",
+    "TUNE_TIDAL_CLIENT_SECRET",
 ]

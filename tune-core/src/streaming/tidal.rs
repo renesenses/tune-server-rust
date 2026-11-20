@@ -21,11 +21,157 @@ const API_BASE: &str = "https://api.tidal.com/v1";
 const PLAFOND_RECHERCHE_TIDAL: usize = 300;
 const AUTH_BASE: &str = "https://auth.tidal.com/v1/oauth2";
 const LOGIN_BASE: &str = "https://login.tidal.com";
-/// tidalapi client — Device Code + refresh + playback work.
-/// DEvir confirmed playback works (DASH manifest). Tidal returns
-/// application/dash+xml for Hi-Res which needs XML parsing.
-const CLIENT_ID: &str = "fX2JxdmntZWK0ixT";
-const CLIENT_SECRET: &str = "1Nn9AfDAjxrgJFJbKNWLeAyKGVGmINuXPPLHVXAvxAg=";
+/// Variables des identifiants client TIDAL (identifiant et secret de
+/// l'application). Aucune valeur n'est écrite dans le dépôt : elles se lisent
+/// à l'EXÉCUTION (variable d'environnement, ou `tidal_client_id` /
+/// `tidal_client_secret` dans `tune.toml`), sinon elles sont figées à la
+/// COMPILATION par `option_env!` — les workflows de publication les
+/// fournissent depuis des secrets GitHub Actions du même nom.
+pub const ENV_CLIENT_ID: &str = "TUNE_TIDAL_CLIENT_ID";
+pub const ENV_CLIENT_SECRET: &str = "TUNE_TIDAL_CLIENT_SECRET";
+
+/// Code stable du refus « identifiants absents » (`TuneError::Refused`).
+pub const CODE_NON_CONFIGURE: &str = "tidal_non_configure";
+
+/// Le message montré quand ce binaire n'a pas d'identifiants client TIDAL.
+pub const NON_CONFIGURE: &str = "TIDAL n'est pas configuré sur ce serveur : \
+     identifiants client absents. Posez TUNE_TIDAL_CLIENT_ID et \
+     TUNE_TIDAL_CLIENT_SECRET (environnement ou tune.toml), ou installez une \
+     version publiée de Tune";
+
+/// Les identifiants client TIDAL de ce processus. Jamais affichés : `Debug`
+/// les masque, et aucun journal ne les porte.
+#[derive(Clone, PartialEq, Eq)]
+pub struct IdentifiantsTidal {
+    id: String,
+    secret: String,
+    /// `"configuration"` (environnement ou `tune.toml`) ou `"compilation"`
+    /// (figés dans le binaire par la CI). Pour le journal seulement.
+    pub origine: &'static str,
+}
+
+impl std::fmt::Debug for IdentifiantsTidal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdentifiantsTidal")
+            .field("origine", &self.origine)
+            .finish_non_exhaustive()
+    }
+}
+
+impl IdentifiantsTidal {
+    /// Configuration, puis compilation. Une paire n'est retenue que
+    /// COMPLÈTE : un identifiant sans son secret (ou l'inverse) ne fabrique
+    /// pas un client à moitié configuré, qui échouerait au premier échange.
+    /// `None` : TIDAL n'est pas configuré ([`NON_CONFIGURE`]).
+    pub fn resoudre(
+        configuration: (Option<&str>, Option<&str>),
+        compilation: (Option<&str>, Option<&str>),
+    ) -> Option<Self> {
+        let complet = |(id, secret): (Option<&str>, Option<&str>), origine| match (
+            id.map(str::trim).filter(|v| !v.is_empty()),
+            secret.map(str::trim).filter(|v| !v.is_empty()),
+        ) {
+            (Some(id), Some(secret)) => Some(Self {
+                id: id.to_string(),
+                secret: secret.to_string(),
+                origine,
+            }),
+            _ => None,
+        };
+        complet(configuration, "configuration").or_else(|| complet(compilation, "compilation"))
+    }
+
+    /// Les valeurs figées dans ce binaire à la compilation (secrets de CI).
+    pub fn de_la_compilation() -> (Option<&'static str>, Option<&'static str>) {
+        (
+            option_env!("TUNE_TIDAL_CLIENT_ID"),
+            option_env!("TUNE_TIDAL_CLIENT_SECRET"),
+        )
+    }
+
+    /// Les identifiants de ce processus : environnement, puis compilation.
+    pub fn depuis_l_environnement() -> Option<Self> {
+        let id = std::env::var(ENV_CLIENT_ID).ok();
+        let secret = std::env::var(ENV_CLIENT_SECRET).ok();
+        Self::resoudre(
+            (id.as_deref(), secret.as_deref()),
+            Self::de_la_compilation(),
+        )
+    }
+
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn secret(&self) -> &str {
+        &self.secret
+    }
+}
+
+/// Ce qu'un refus OAuth de TIDAL dit, sans rien recopier d'autre : le code
+/// `error` (et `sub_status`) du corps JSON, jamais le corps entier, qui peut
+/// porter un jeton ou l'identifiant client. Un corps qui n'est pas du JSON
+/// n'est décrit que par sa taille.
+pub(crate) fn erreur_oauth(corps: &str) -> String {
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(corps) else {
+        return format!("réponse non JSON ({} octets)", corps.len());
+    };
+    let court = |c: &serde_json::Value| -> Option<String> {
+        let t = match c {
+            serde_json::Value::String(t) => t.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            _ => return None,
+        };
+        // Un code d'erreur est un mot court ; tout le reste est écarté.
+        (t.len() <= 64
+            && t.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' ')))
+        .then_some(t)
+    };
+    match (court(&v["error"]), court(&v["sub_status"])) {
+        (Some(e), Some(s)) => format!("{e} ({s})"),
+        (Some(e), None) => e,
+        (None, Some(s)) => format!("sub_status {s}"),
+        (None, None) => "erreur sans code".into(),
+    }
+}
+
+/// Code stable d'un titre dont TIDAL ne sert qu'un extrait de 30 s. La
+/// route de lecture le reconnaît dans l'erreur et rend la phrase traduite
+/// (`tidal.playback.previewOnly`, `i18n_server.json`).
+pub const CODE_EXTRAIT_SEULEMENT: &str = "tidal_preview_only";
+
+/// L'erreur d'un titre dont TIDAL ne sert qu'un extrait : jamais lu comme un
+/// morceau entier. Commence par [`CODE_EXTRAIT_SEULEMENT`] ; le texte anglais
+/// n'est qu'un repli technique.
+pub const EXTRAIT_SEULEMENT: &str = "tidal_preview_only: TIDAL only serves a 30-second \
+     preview of this track for this account; it is not played";
+
+/// Une réponse v1 `playbackinfopostpaywall` qui n'est qu'un extrait :
+/// `assetPresentation` vaut `PREVIEW` (au lieu de `FULL`).
+pub(crate) fn est_un_extrait_v1(reponse: &serde_json::Value) -> bool {
+    reponse["assetPresentation"]
+        .as_str()
+        .is_some_and(|p| p.eq_ignore_ascii_case("PREVIEW"))
+}
+
+pub(crate) use crate::http::client::url_pour_journal;
+
+/// Les 500 premiers caractères d'un MPD pour le journal, chaque adresse
+/// réduite à son schéma et son hôte (les jetons signés vivent dans
+/// `initialization`, `media`, `BaseURL`).
+pub(crate) fn extrait_de_manifeste_pour_journal(mpd: &str) -> String {
+    let debut: String = mpd.chars().take(500).collect();
+    crate::orchestrator::sentinelle_streaming::masquer_les_requetes(&debut)
+}
+
+/// Le refus « TIDAL non configuré ».
+fn refus_non_configure() -> TuneError {
+    TuneError::Refused {
+        code: CODE_NON_CONFIGURE,
+        message: NON_CONFIGURE.into(),
+    }
+}
 const REDIRECT_URI: &str = "http://localhost:8888/api/v1/streaming/tidal/callback";
 
 /// #6784 — le rappel PKCE de TIDAL ABOUTIT-il dans le navigateur qui a fait
@@ -247,10 +393,11 @@ pub struct TidalService {
     client: Client,
     tokens: Mutex<TokenState>,
     country_code: String,
-    /// #8481 — le pays du catalogue imposé dans les Réglages (comme « PL »
-    /// dans LMS). `None` : celui du compte (`country_code`). Il prime sur le
-    /// compte dans TOUTES les requêtes, lecture comprise, et `/users/me` ne
-    /// l'écrase pas : c'est un choix de l'utilisateur, pas une donnée lue.
+    /// #8481 — le pays de NAVIGATION choisi dans les Réglages. `None` :
+    /// celui du compte (`country_code`). Il ne vaut que pour parcourir et
+    /// rechercher le catalogue ; la lecture (`playbackinfopostpaywall`) part
+    /// toujours avec le pays du compte ([`TidalService::pays_de_lecture`]).
+    /// `/users/me` ne l'écrase pas : c'est un choix de l'utilisateur.
     pays_choisi: Option<String>,
     quality: String,
     username: Option<String>,
@@ -287,6 +434,10 @@ pub struct TidalService {
     /// bancs d'essai vers un serveur factice. `None` partout ailleurs :
     /// [`AUTH_BASE`].
     auth_forcee: Option<String>,
+    /// Identifiants client TIDAL (voir [`IdentifiantsTidal`]). `None` : la
+    /// connexion et le rafraîchissement refusent avec [`NON_CONFIGURE`] ; les
+    /// jetons déjà en place ne sont ni effacés ni modifiés.
+    identifiants: Option<IdentifiantsTidal>,
 }
 
 impl Default for TidalService {
@@ -326,7 +477,38 @@ impl TidalService {
             enabled_override: None,
             base_forcee: None,
             auth_forcee: None,
+            identifiants: IdentifiantsTidal::depuis_l_environnement(),
         }
+    }
+
+    /// Les identifiants lus dans la configuration du serveur (`tune.toml`,
+    /// variables d'environnement), à défaut ceux de la compilation.
+    pub fn avec_identifiants(mut self, id: Option<&str>, secret: Option<&str>) -> Self {
+        self.identifiants =
+            IdentifiantsTidal::resoudre((id, secret), IdentifiantsTidal::de_la_compilation());
+        match &self.identifiants {
+            Some(i) => info!(origine = i.origine, "tidal_identifiants_client"),
+            None => warn!("tidal_non_configure"),
+        }
+        self
+    }
+
+    /// Vrai si ce service a des identifiants client.
+    pub fn est_configure(&self) -> bool {
+        self.identifiants.is_some()
+    }
+
+    fn identifiants(&self) -> Result<&IdentifiantsTidal, TuneError> {
+        self.identifiants.as_ref().ok_or_else(refus_non_configure)
+    }
+
+    /// Identifiants factices des bancs d'essai : jamais de vraie valeur.
+    #[cfg(any(test, feature = "services-factices"))]
+    fn identifiants_factices() -> Option<IdentifiantsTidal> {
+        IdentifiantsTidal::resoudre(
+            (Some("client-id-factice"), Some("client-secret-factice")),
+            (None, None),
+        )
     }
 
     /// #6336 — un service dont l'API et l'OAuth sont `api` et `auth`, pour
@@ -337,6 +519,7 @@ impl TidalService {
         let mut svc = Self::new();
         svc.base_forcee = Some(api);
         svc.auth_forcee = Some(auth);
+        svc.identifiants = Self::identifiants_factices();
         svc
     }
 
@@ -388,7 +571,7 @@ impl TidalService {
         let total = segments.segment_count;
         info!(
             track_id,
-            init_url = %crate::confidentialite::masquer_url(&segments.init_url.as_str()),
+            init_url = %url_pour_journal(segments.init_url.as_str()),
             segment_count = total,
             start_number = segments.start_number,
             "tidal_dash_multi_segment_download_starting"
@@ -400,7 +583,7 @@ impl TidalService {
             .get(&segments.init_url)
             .send()
             .await
-            .map_err(|e| format!("dash init download: {e}"))?
+            .map_err(|e| format!("dash init download: {}", e.without_url()))?
             // #7106 — un refus du CDN (403) n'est pas un segment d'init : sans
             // ce contrôle, son corps d'erreur ouvrait le fichier fMP4.
             .error_for_status()
@@ -412,7 +595,7 @@ impl TidalService {
             })?
             .bytes()
             .await
-            .map_err(|e| format!("dash init read: {e}"))?;
+            .map_err(|e| format!("dash init read: {}", e.without_url()))?;
 
         if init_data.len() < 8 {
             return Err(format!(
@@ -648,10 +831,10 @@ impl TidalService {
     }
 
     /// Build the Tidal authorization URL for PKCE flow.
-    fn build_authorize_url(code_challenge: &str, state: &str) -> String {
+    fn build_authorize_url(client_id: &str, code_challenge: &str, state: &str) -> String {
         format!(
             "{LOGIN_BASE}/authorize?client_id={}&response_type=code&redirect_uri={}&scope={}&code_challenge={code_challenge}&code_challenge_method=S256&state={state}",
-            urlencoding::encode(CLIENT_ID),
+            urlencoding::encode(client_id),
             urlencoding::encode(REDIRECT_URI),
             urlencoding::encode(
                 "user.read playback collection.read collection.write playlists.read playlists.write entitlements.read search.read"
@@ -665,12 +848,13 @@ impl TidalService {
         code: &str,
         code_verifier: &str,
     ) -> Result<TokenResponse, String> {
+        let identifiants = self.identifiants().map_err(|e| e.to_string())?;
         let resp = self
             .client
             .post(format!("{}/token", self.auth_base()))
             .form(&[
-                ("client_id", CLIENT_ID),
-                ("client_secret", CLIENT_SECRET),
+                ("client_id", identifiants.id()),
+                ("client_secret", identifiants.secret()),
                 ("code", code),
                 ("redirect_uri", REDIRECT_URI),
                 ("grant_type", "authorization_code"),
@@ -684,12 +868,15 @@ impl TidalService {
         let body = resp.text().await.map_err(|e| format!("read body: {e}"))?;
 
         if status != 200 {
-            warn!(status, body = %body, "tidal_pkce_token_exchange_failed");
-            return Err(format!("tidal PKCE token exchange failed: {status} {body}"));
+            let erreur = erreur_oauth(&body);
+            warn!(status, erreur = %erreur, "tidal_pkce_token_exchange_failed");
+            return Err(format!(
+                "tidal PKCE token exchange failed: {status} {erreur}"
+            ));
         }
 
         let token: TokenResponse = serde_json::from_str(&body).map_err(|e| {
-            warn!(error = %e, body = %body, "tidal_pkce_token_parse_failed");
+            warn!(error = %e, body_len = body.len(), "tidal_pkce_token_parse_failed");
             format!("token parse: {e}")
         })?;
         Ok(token)
@@ -769,14 +956,18 @@ impl TidalService {
             }
         };
 
+        // Sans identifiants, aucun échange : les jetons en place restent
+        // intacts (ni effacés, ni réécrits) jusqu'à un binaire configuré.
+        let identifiants = self.identifiants().map_err(|e| e.to_string())?;
+
         info!("tidal_auto_refresh: attempting token refresh after 401");
 
         let resp = self
             .client
             .post(format!("{}/token", self.auth_base()))
             .form(&[
-                ("client_id", CLIENT_ID),
-                ("client_secret", CLIENT_SECRET),
+                ("client_id", identifiants.id()),
+                ("client_secret", identifiants.secret()),
                 ("refresh_token", refresh_token.as_str()),
                 ("grant_type", "refresh_token"),
             ])
@@ -787,7 +978,8 @@ impl TidalService {
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
-            warn!(status, body = %body, "tidal_refresh_token_rejected");
+            let erreur = erreur_oauth(&body);
+            warn!(status, erreur = %erreur, "tidal_refresh_token_rejected");
 
             let permanently_invalid = is_refresh_permanently_invalid(status, &body);
 
@@ -1432,7 +1624,7 @@ impl TidalService {
             ("audioquality", quality),
             ("playbackmode", "STREAM"),
             ("assetpresentation", "FULL"),
-            ("countryCode", self.pays_effectif()),
+            ("countryCode", self.pays_de_lecture()),
         ];
 
         // Use a per-request timeout of 15 seconds (longer than the default
@@ -1503,7 +1695,13 @@ impl TidalService {
                         info!(track_id, quality, status, body = %body, "tidal_playback_info_error_after_refresh");
                         return Err(format!("tidal playback {status}: {body}"));
                     }
-                    return serde_json::from_str(&body).map_err(|e| format!("parse: {e}"));
+                    let parsed: serde_json::Value =
+                        serde_json::from_str(&body).map_err(|e| format!("parse: {e}"))?;
+                    if est_un_extrait_v1(&parsed) {
+                        info!(track_id, quality, "tidal_v1_extrait_seulement");
+                        return Err(EXTRAIT_SEULEMENT.into());
+                    }
+                    return Ok(parsed);
                 }
                 Ok(false) => return Err("token expired, no refresh token".into()),
                 Err(e) => return Err(format!("token expired, refresh failed: {e}")),
@@ -1518,6 +1716,11 @@ impl TidalService {
         }
         let parsed: serde_json::Value =
             serde_json::from_str(&body).map_err(|e| format!("parse: {e}"))?;
+        // Un extrait de 30 s n'est pas une lecture, quelle que soit la voie.
+        if est_un_extrait_v1(&parsed) {
+            info!(track_id, quality, "tidal_v1_extrait_seulement");
+            return Err(EXTRAIT_SEULEMENT.into());
+        }
 
         // Log key fields from the Tidal playback response (without the manifest
         // blob which is large) — this is essential for diagnosing quality issues.
@@ -1556,7 +1759,12 @@ impl TidalService {
             if let Some(cc) = me["countryCode"].as_str() {
                 self.adopter_pays(cc);
             }
-            info!(username = ?self.username, country = %self.country_code, "tidal_user_refreshed");
+            // Pas le nom du compte : c'est souvent une adresse e-mail.
+            info!(
+                compte_nomme = self.username.is_some(),
+                country = %self.country_code,
+                "tidal_user_refreshed"
+            );
         }
         // Fetch subscription type for quality diagnostics
         if let Some(uid) = self.user_id
@@ -1635,10 +1843,16 @@ impl TidalService {
         self.vider_les_caches_du_pays();
     }
 
-    /// #8481 — le pays qui part dans `countryCode` : celui que l'utilisateur
-    /// a choisi, à défaut celui du compte.
+    /// #8481 — le pays qui part dans `countryCode` pour NAVIGUER et
+    /// rechercher : celui que l'utilisateur a choisi, à défaut celui du compte.
     fn pays_effectif(&self) -> &str {
         self.pays_choisi.as_deref().unwrap_or(&self.country_code)
+    }
+
+    /// Le pays des requêtes de LECTURE : toujours celui du compte TIDAL
+    /// (session, `/users/me`), jamais le pays de navigation choisi.
+    fn pays_de_lecture(&self) -> &str {
+        &self.country_code
     }
 
     /// Les caches dont la clé ne porte pas le pays : « À la une », mixes, et
@@ -2144,6 +2358,16 @@ impl StreamingService for TidalService {
             }
         }
 
+        // Un sondage sans connexion en cours ne demande rien à TIDAL : il
+        // répond l'état, configuré ou non. Tout le reste échange avec TIDAL
+        // et exige les identifiants client — sinon un refus clair, au lieu
+        // d'un `invalid_client` venu de TIDAL.
+        let simple_sondage =
+            credentials.get("poll").is_some() && self.pending_device_auth.is_none();
+        if !simple_sondage {
+            self.identifiants()?;
+        }
+
         // --- Handle PKCE callback (code + state from OAuth redirect) ---
         if let Some(code) = credentials.get("code").and_then(|v| v.as_str()) {
             let state = credentials
@@ -2155,10 +2379,14 @@ impl StreamingService for TidalService {
 
         // --- Device Code flow (legacy fallback, explicitly requested) ---
         if credentials.get("device_flow").and_then(|v| v.as_bool()) == Some(true) {
+            let client_id = self.identifiants()?.id().to_string();
             let resp = self
                 .client
                 .post(format!("{}/device_authorization", self.auth_base()))
-                .form(&[("client_id", CLIENT_ID), ("scope", "r_usr w_usr w_sub")])
+                .form(&[
+                    ("client_id", client_id.as_str()),
+                    ("scope", "r_usr w_usr w_sub"),
+                ])
                 .send()
                 .await
                 .map_err(|e| format!("device auth: {e}"))?;
@@ -2166,15 +2394,16 @@ impl StreamingService for TidalService {
             let status_code = resp.status().as_u16();
             let body = resp.text().await.map_err(|e| format!("read body: {e}"))?;
             if status_code != 200 {
-                warn!(status = status_code, body = %body, "tidal_device_authorization_failed");
-                return Err(format!("device authorization failed: {status_code} {body}").into());
+                let erreur = erreur_oauth(&body);
+                warn!(status = status_code, erreur = %erreur, "tidal_device_authorization_failed");
+                return Err(format!("device authorization failed: {status_code} {erreur}").into());
             }
 
             let device_auth: DeviceAuthResponse =
                 serde_json::from_str(&body).map_err(|e| format!("parse device auth: {e}"))?;
+            // Ni le code d'appareil, ni le code à saisir, ni l'adresse qui
+            // le porte : le journal se joint à des rapports publics.
             info!(
-                user_code = %device_auth.user_code,
-                uri = %crate::confidentialite::masquer_url(&device_auth.verification_uri_complete),
                 expires_in = device_auth.expires_in,
                 "tidal_device_auth_started"
             );
@@ -2196,7 +2425,7 @@ impl StreamingService for TidalService {
 
         // --- Poll pending Device Code flow ---
         if self.pending_device_auth.is_some() {
-            info!(has_pending = true, device_code = ?self.pending_device_auth.as_ref().map(|p| &p.device_code), "tidal_auth_poll");
+            debug!(has_pending = true, "tidal_auth_poll");
 
             if let Some(ref pending) = self.pending_device_auth.clone() {
                 // Check if the device code has expired (Tidal typically gives 300s)
@@ -2217,12 +2446,13 @@ impl StreamingService for TidalService {
                     });
                 }
 
+                let identifiants = self.identifiants()?.clone();
                 let resp = self
                     .client
                     .post(format!("{}/token", self.auth_base()))
                     .form(&[
-                        ("client_id", CLIENT_ID),
-                        ("client_secret", CLIENT_SECRET),
+                        ("client_id", identifiants.id()),
+                        ("client_secret", identifiants.secret()),
                         ("device_code", pending.device_code.as_str()),
                         ("grant_type", "urn:ietf:params:oauth:grant-type:device_code"),
                         ("scope", "r_usr w_usr w_sub"),
@@ -2235,7 +2465,8 @@ impl StreamingService for TidalService {
                 let body = resp.text().await.unwrap_or_default();
 
                 if status_code != 200 {
-                    info!(status = status_code, body = %body, "tidal_token_exchange");
+                    let erreur = erreur_oauth(&body);
+                    info!(status = status_code, erreur = %erreur, "tidal_token_exchange");
                     // If Tidal says the device code is expired or invalid, clear it
                     // so the user can start a fresh device auth flow.
                     if body.contains("expired") || body.contains("invalid_grant") {
@@ -2302,9 +2533,11 @@ impl StreamingService for TidalService {
         let verifier = Self::generate_code_verifier();
         let challenge = Self::generate_code_challenge(&verifier);
         let state = Self::generate_state();
-        let authorize_url = Self::build_authorize_url(&challenge, &state);
+        let authorize_url =
+            Self::build_authorize_url(self.identifiants()?.id(), &challenge, &state);
 
-        info!(url = %crate::confidentialite::masquer_url(&authorize_url), "tidal_pkce_auth_started");
+        // L'adresse porte l'identifiant client et le `state` : pas au journal.
+        info!("tidal_pkce_auth_started");
 
         self.pending_pkce = Some(PkceState {
             code_verifier: verifier,
@@ -2480,7 +2713,7 @@ impl StreamingService for TidalService {
                     _ => {
                         tracing::info!(
                             track_id,
-                            path = %crate::confidentialite::masquer_url(&cached.url),
+                            path = %url_pour_journal(&cached.url),
                             "tidal_dash_cache_stale_redownloading"
                         );
                         None
@@ -2509,6 +2742,9 @@ impl StreamingService for TidalService {
 
         let mut data = None;
         let mut downgraded_fallback: Option<serde_json::Value> = None;
+        // Un extrait (`PREVIEW`) rendu par la v2 ou la v1 : si rien d'entier
+        // n'est trouvé, l'erreur le dit au lieu d'un échec générique.
+        let mut extrait_vu = false;
         // #6334 — la v2 `trackManifests` d'abord (elle rend le FLAC que la v1
         // refuse au client de Tune). Seule une réponse qui atteint la qualité
         // demandée termine la recherche. Un FLAC CD reçu après refus du Hi-Res
@@ -2524,6 +2760,7 @@ impl StreamingService for TidalService {
                 }
             }
             Err(e) => {
+                extrait_vu |= e.starts_with(manifeste_v2::PREFIXE_EXTRAIT_V2);
                 info!(
                     track_id,
                     requested = requested_quality,
@@ -2631,6 +2868,7 @@ impl StreamingService for TidalService {
                     }
                 }
                 Err(e) => {
+                    extrait_vu |= e == EXTRAIT_SEULEMENT;
                     info!(
                         track_id,
                         quality = q,
@@ -2657,7 +2895,11 @@ impl StreamingService for TidalService {
         }
 
         let data = data.ok_or_else(|| {
-            format!("tidal: no usable stream found for track {track_id} (all qualities failed)")
+            if extrait_vu {
+                EXTRAIT_SEULEMENT.to_string()
+            } else {
+                format!("tidal: no usable stream found for track {track_id} (all qualities failed)")
+            }
         })?;
 
         // #8689 — le ReplayGain publié dans la réponse de lecture (v1, ou v2
@@ -2683,19 +2925,21 @@ impl StreamingService for TidalService {
         let mut fichier_en_croissance = None;
         let (url, man_codec, man_mime) = if manifest_mime == "application/dash+xml" {
             // Log raw manifest content for debugging Hi-Res issues
+            // Le MPD porte des adresses signées (`initialization`, `media`,
+            // `BaseURL`) : l'extrait journalisé les réduit à leur hôte.
             debug!(
                 track_id,
                 manifest_len = decoded.len(),
-                manifest_content = &decoded[..decoded.len().min(500)],
+                manifest_content = %extrait_de_manifeste_pour_journal(&decoded),
                 "tidal_dash_manifest_raw"
             );
             // DASH manifest (MPD XML) — parse to extract URL, codec, and MIME type
             let dash = parse_dash_manifest(&decoded).ok_or_else(|| {
+                // En WARN, la taille seulement (l'extrait masqué est en debug).
                 warn!(
                     track_id,
                     manifest_len = decoded.len(),
-                    manifest_content = &decoded[..decoded.len().min(500)],
-                    "tidal_dash_parse_failed — full manifest logged above"
+                    "tidal_dash_parse_failed"
                 );
                 format!("tidal: could not parse DASH manifest for track {track_id}")
             })?;
@@ -2730,14 +2974,14 @@ impl StreamingService for TidalService {
                 if url_len < 30 {
                     warn!(
                         track_id,
-                        url = %crate::confidentialite::masquer_url(&dash.url.as_str()),
+                        url = %url_pour_journal(dash.url.as_str()),
                         url_len,
                         "tidal_dash_suspicious_short_url"
                     );
                 }
                 info!(
                     track_id,
-                    url = %crate::confidentialite::masquer_url(&dash.url.as_str()),
+                    url = %url_pour_journal(dash.url.as_str()),
                     url_len,
                     dash_codec = dash.codec.as_deref().unwrap_or("none"),
                     dash_mime = dash.mime_type.as_deref().unwrap_or("none"),
@@ -2873,7 +3117,7 @@ impl StreamingService for TidalService {
         // where the URL might point to the manifest itself instead of audio data.
         debug!(
             track_id,
-            final_url = %crate::confidentialite::masquer_url(&url.as_str()),
+            final_url = %url_pour_journal(url.as_str()),
             url_len = url.len(),
             codec,
             mime_type,
@@ -3871,11 +4115,14 @@ async fn telecharger_un_segment(
     seg_url: &str,
 ) -> Result<bytes::Bytes, SegmentEnEchec> {
     match client.get(seg_url).send().await {
-        Ok(resp) if resp.status().is_success() => {
-            resp.bytes().await.map_err(SegmentEnEchec::Lecture)
-        }
+        // `without_url` : l'adresse du segment porte le jeton signé du CDN,
+        // et ces erreurs finissent au journal.
+        Ok(resp) if resp.status().is_success() => resp
+            .bytes()
+            .await
+            .map_err(|e| SegmentEnEchec::Lecture(e.without_url())),
         Ok(resp) => Err(SegmentEnEchec::Statut(resp.status().as_u16())),
-        Err(e) => Err(SegmentEnEchec::Requete(e)),
+        Err(e) => Err(SegmentEnEchec::Requete(e.without_url())),
     }
 }
 
@@ -4291,16 +4538,16 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
         let resolved = resolve_tidal_url(u);
         if !resolved.starts_with("http") {
             warn!(
-                raw_base_url = u.as_str(),
-                resolved = resolved.as_str(),
+                raw_base_url = %url_pour_journal(u.as_str()),
+                resolved = %url_pour_journal(resolved.as_str()),
                 "tidal_dash_base_url_unresolvable"
             );
             return None;
         }
         if u != &resolved {
             info!(
-                raw = u.as_str(),
-                resolved = resolved.as_str(),
+                raw = %url_pour_journal(u.as_str()),
+                resolved = %url_pour_journal(resolved.as_str()),
                 "tidal_dash_relative_base_url_resolved"
             );
         }
@@ -4323,17 +4570,17 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
             let resolved = resolve_tidal_url(&expanded);
             if !resolved.starts_with("http") {
                 warn!(
-                    media_template = media.as_str(),
-                    expanded = expanded.as_str(),
-                    init_url = segment_template_init.as_deref().unwrap_or("none"),
+                    media_template = %url_pour_journal(media.as_str()),
+                    expanded = %url_pour_journal(expanded.as_str()),
+                    init_url = %url_pour_journal(segment_template_init.as_deref().unwrap_or("none")),
                     "tidal_dash_segment_template_unresolvable"
                 );
                 return None;
             }
             info!(
-                media_template = media.as_str(),
-                resolved = resolved.as_str(),
-                init_url = segment_template_init.as_deref().unwrap_or("none"),
+                media_template = %url_pour_journal(media.as_str()),
+                resolved = %url_pour_journal(resolved.as_str()),
+                init_url = %url_pour_journal(segment_template_init.as_deref().unwrap_or("none")),
                 "tidal_dash_segment_template_resolved"
             );
             resolved
@@ -4346,14 +4593,14 @@ fn parse_dash_manifest(mpd: &str) -> Option<DashManifest> {
         let resolved = resolve_tidal_url(init);
         if !resolved.starts_with("http") {
             warn!(
-                init_url = init.as_str(),
+                init_url = %url_pour_journal(init.as_str()),
                 "tidal_dash_init_only_segment_template_unresolvable"
             );
             return None;
         }
         warn!(
-            init_url = init.as_str(),
-            resolved = resolved.as_str(),
+            init_url = %url_pour_journal(init.as_str()),
+            resolved = %url_pour_journal(resolved.as_str()),
             "tidal_dash_init_only_no_media_template — URL may be header-only"
         );
         resolved
@@ -5588,9 +5835,65 @@ mod tests {
     // ---- PKCE tests ----
 
     #[test]
-    fn pkce_client_id_is_correct() {
-        // Regression test: ensure we're using our own registered Tidal app
-        assert_eq!(CLIENT_ID, "fX2JxdmntZWK0ixT");
+    fn identifiants_client_lus_de_la_configuration_puis_de_la_compilation() {
+        let conf = IdentifiantsTidal::resoudre(
+            (Some("id-conf"), Some("secret-conf")),
+            (Some("id-ci"), Some("secret-ci")),
+        )
+        .expect("configuration complète");
+        assert_eq!(
+            (conf.id(), conf.secret(), conf.origine),
+            ("id-conf", "secret-conf", "configuration")
+        );
+
+        // Une paire incomplète (ou vide) en configuration ne masque pas celle
+        // de la compilation.
+        for incomplete in [
+            (Some("id-conf"), None),
+            (None, Some("s")),
+            (Some(" "), Some("s")),
+        ] {
+            let ci = IdentifiantsTidal::resoudre(incomplete, (Some("id-ci"), Some("secret-ci")))
+                .expect("compilation");
+            assert_eq!((ci.id(), ci.origine), ("id-ci", "compilation"));
+        }
+
+        // Rien nulle part : non configuré.
+        assert!(IdentifiantsTidal::resoudre((None, None), (None, Some(""))).is_none());
+    }
+
+    #[test]
+    fn identifiants_client_jamais_affiches_par_debug() {
+        let i =
+            IdentifiantsTidal::resoudre((Some("id-temoin"), Some("secret-temoin")), (None, None))
+                .unwrap();
+        let vu = format!("{i:?}");
+        assert!(
+            !vu.contains("id-temoin") && !vu.contains("secret-temoin"),
+            "{vu}"
+        );
+    }
+
+    #[test]
+    fn erreur_oauth_ne_recopie_que_le_code() {
+        assert_eq!(
+            erreur_oauth(
+                r#"{"status":400,"error":"invalid_client","sub_status":1002,"error_description":"client_id=abc secret"}"#
+            ),
+            "invalid_client (1002)"
+        );
+        assert_eq!(
+            erreur_oauth(r#"{"access_token":"jeton-a-ne-pas-montrer"}"#),
+            "erreur sans code"
+        );
+        assert_eq!(
+            erreur_oauth("<html>jeton</html>"),
+            "réponse non JSON (18 octets)"
+        );
+        assert_eq!(
+            erreur_oauth(r#"{"error":"jeton=eyJhbGciOi/abc+def=="}"#),
+            "erreur sans code"
+        );
     }
 
     #[test]
@@ -5643,10 +5946,10 @@ mod tests {
     fn pkce_authorize_url_format() {
         let challenge = "test_challenge_abc123";
         let state = "test_state_xyz";
-        let url = TidalService::build_authorize_url(challenge, state);
+        let url = TidalService::build_authorize_url("client-id-factice", challenge, state);
 
         assert!(url.starts_with("https://login.tidal.com/authorize?"));
-        assert!(url.contains("client_id=fX2JxdmntZWK0ixT"));
+        assert!(url.contains("client_id=client-id-factice"));
         assert!(url.contains("response_type=code"));
         assert!(url.contains("redirect_uri="));
         assert!(url.contains("localhost%3A8888"));
@@ -5952,6 +6255,7 @@ impl TidalService {
     pub(crate) fn pour_un_faux_tidal(base: String) -> Self {
         let mut svc = Self::new();
         svc.base_forcee = Some(base);
+        svc.identifiants = Self::identifiants_factices();
         svc.tokens = Mutex::new(TokenState {
             access_token: Some("jeton-essai".into()),
             refresh_token: None,
@@ -6002,6 +6306,11 @@ mod pays_du_catalogue_8481_tests;
 // #6334 — lecture par `trackManifests` v2, repli v1.
 #[path = "tidal_manifeste_v2.rs"]
 mod manifeste_v2;
+
+// Identifiants client en configuration, pays de lecture, extraits v1, journal.
+#[cfg(test)]
+#[path = "tidal_configuration_tests.rs"]
+mod configuration_tests;
 
 // Go du 13/11 (#8739) — les adresses de l'audio pour une analyse, sans
 // téléchargement sous le garde du service.
@@ -6437,6 +6746,7 @@ mod retour_oauth_6784 {
     #[tokio::test]
     async fn un_sondage_n_ecrase_pas_l_autorisation_en_cours() {
         let mut svc = TidalService::new();
+        svc.identifiants = TidalService::identifiants_factices();
         let depart = svc.authenticate(&serde_json::json!({})).await.unwrap();
         assert!(depart.verification_url.is_some(), "le PKCE démarre");
         let attendu = svc.pending_pkce.as_ref().map(|p| p.state.clone());
