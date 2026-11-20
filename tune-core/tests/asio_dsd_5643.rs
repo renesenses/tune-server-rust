@@ -92,12 +92,14 @@ fn le_silence_dsd_suit_l_ordre_des_bits_du_pilote() {
 }
 
 #[test]
-fn seules_les_cadences_dsd64_128_256_sont_ouvertes() {
-    for rate in [2_822_400, 5_644_800, 11_289_600] {
+fn seules_les_cadences_dsd64_a_512_des_deux_familles_sont_ouvertes() {
+    for rate in [
+        2_822_400, 3_072_000, 5_644_800, 6_144_000, 11_289_600, 12_288_000, 22_579_200, 24_576_000,
+    ] {
         assert!(dsd::is_dsd_rate(rate), "{rate}");
     }
     for rate in [
-        0, 44_100, 176_400, 352_800, 384_000, 705_600, 1_411_200, 2_822_401, 3_072_000, 22_579_200,
+        0, 44_100, 176_400, 352_800, 384_000, 705_600, 1_411_200, 2_822_401, 22_579_201, 45_158_400,
     ] {
         assert!(!dsd::is_dsd_rate(rate), "{rate} accepté comme cadence DSD");
     }
@@ -303,5 +305,33 @@ fn asio_7372_un_refus_explicite_reste_une_capacite_connue() {
             || Some(())
         ),
         Some(vec![])
+    );
+}
+
+#[test]
+fn la_sonde_demande_le_dsd512_des_deux_familles_8789() {
+    let mut demandes = Vec::new();
+    let reconnues = dsd::probe_dsd_rates(
+        false,
+        || Some(true),
+        || Some(()),
+        |cadence| {
+            demandes.push(cadence);
+            Some(matches!(cadence, 22_579_200 | 24_576_000))
+        },
+        || Some(()),
+    );
+    assert_eq!(
+        reconnues,
+        Some(vec![22_579_200, 24_576_000]),
+        "#8789 : la sonde n'interroge jamais le pilote sur le DSD512 ; demandes={demandes:?}"
+    );
+}
+
+#[test]
+fn la_sonde_et_l_ouverture_native_acceptent_les_memes_cadences_8789() {
+    assert_eq!(
+        dsd::DSD_RATES,
+        tune_core::audio::dsd_brut::CADENCES_DSD_NATIVES
     );
 }

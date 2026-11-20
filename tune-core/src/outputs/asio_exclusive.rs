@@ -1246,7 +1246,7 @@ impl AsioDsdNatifOutput {
         ensure_com_initialized();
         if !crate::audio::dsd_brut::CADENCES_DSD_NATIVES.contains(&cadence) {
             return Err(format!(
-                "ASIO native DSD: {cadence} Hz is not a DSD64/128/256 rate"
+                "ASIO native DSD: {cadence} Hz is not a DSD64/128/256/512 rate"
             ));
         }
         let host = cpal::host_from_id(cpal::HostId::Asio)
