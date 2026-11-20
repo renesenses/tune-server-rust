@@ -207,6 +207,8 @@ pub(crate) fn album_depuis_json(album: &Value) -> StreamAlbum {
         track_count: album["track_count"].as_u64().unwrap_or(0) as u32,
         released_at: None,
         quality: Some(qualite_bandcamp()),
+        genre_id: None,
+        genre_name: None,
     }
 }
 
@@ -240,6 +242,8 @@ pub(crate) fn albums_de_collection(brut: &Value) -> Vec<StreamAlbum> {
                 track_count: 0,
                 released_at: None,
                 quality: Some(qualite_bandcamp()),
+                genre_id: None,
+                genre_name: None,
             })
         })
         .collect()
@@ -289,6 +293,8 @@ pub(crate) fn albums_de_recherche(resultats: &[Value]) -> Vec<StreamAlbum> {
                 track_count: 0,
                 released_at: None,
                 quality: Some(qualite_bandcamp()),
+                genre_id: None,
+                genre_name: None,
             })
         })
         .collect()
@@ -323,6 +329,8 @@ pub(crate) fn albums_de_discographie(racine: &str, entrees: &[Value]) -> Vec<Str
                 track_count: 0,
                 released_at: None,
                 quality: Some(qualite_bandcamp()),
+                genre_id: None,
+                genre_name: None,
             })
         })
         .collect()

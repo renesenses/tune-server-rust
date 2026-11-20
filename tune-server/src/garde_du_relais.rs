@@ -100,13 +100,17 @@ fn route_d_api_relayable(m: &Method, api: &str, auth_active: bool) -> bool {
     if sous(api, "/zones") || sous(api, "/playback") {
         return true;
     }
+    // L'historique d'écoute : en lecture seulement. L'effacer n'est jamais
+    // relayé — par le relais, `X-Profile-Id` permettrait de vider un profil
+    // après l'autre.
+    if sous(api, "/history") || sous(api, "/library/history") {
+        return lecture(m);
+    }
     // Ce que l'auditeur range lui-même.
     if sous(api, "/playlists")
         || sous(api, "/radios")
         || sous(api, "/radio-favorites")
         || sous(api, "/podcasts")
-        || sous(api, "/history")
-        || sous(api, "/library/history")
         || sous(api, "/search")
         || sous(api, "/library/search")
     {
@@ -429,6 +433,19 @@ mod tests {
             "/api/v1/libraryx",
         ] {
             assert!(!ok(Method::GET, c), "{c} ne doit pas être relayable");
+        }
+    }
+
+    #[test]
+    fn l_historique_se_lit_mais_ne_s_efface_pas_par_le_relais() {
+        for auth in [false, true] {
+            for chemin in ["/api/v1/history", "/api/v1/library/history"] {
+                assert!(chemin_relayable(&Method::GET, chemin, auth));
+                assert!(
+                    !chemin_relayable(&Method::DELETE, chemin, auth),
+                    "DELETE {chemin} relayable (auth {auth})"
+                );
+            }
         }
     }
 

@@ -740,6 +740,17 @@ fn routes_au_nom_du_compte() -> Vec<(&'static str, &'static str, Option<Value>)>
             Some(json!({ "enabled": true })),
         ),
         ("POST", "/api/v1/cloud/plugins/x/vote", Some(json!({}))),
+        // Décisions sur les propositions de métadonnées : poussées au cloud.
+        (
+            "POST",
+            "/api/v1/library/proposals/1/decision",
+            Some(json!({ "accept": true })),
+        ),
+        (
+            "POST",
+            "/api/v1/library/proposals/auto-apply",
+            Some(json!({ "enabled": true })),
+        ),
     ]
 }
 
@@ -795,5 +806,333 @@ async fn envois_au_nom_du_compte_acceptes_depuis_la_machine() {
             .unwrap()
             .as_deref(),
         Some("true")
+    );
+}
+
+/// Les envois au nom du compte (synchro de la bibliothèque, validation de la
+/// licence, sauvegarde de la configuration dans le cloud).
+fn envois_au_nom_du_compte() -> Vec<(&'static str, &'static str, Option<Value>)> {
+    vec![
+        ("POST", "/api/v1/cloud/license/validate", None),
+        ("POST", "/api/v1/cloud/library-sync/trigger", None),
+        ("POST", "/api/v1/cloud/library-sync/full-sync", None),
+        (
+            "POST",
+            "/api/v1/cloud/library-sync/reconcile",
+            Some(json!({ "apply": true })),
+        ),
+        (
+            "POST",
+            "/api/v1/system/config-backup/cloud/enable",
+            Some(json!({ "passphrase": "phrase-de-banc-assez-longue" })),
+        ),
+        (
+            "POST",
+            "/api/v1/system/config-backup/cloud/backup-now",
+            None,
+        ),
+        // Lectures avec le jeton du compte.
+        ("GET", "/api/v1/system/config-backup/cloud/snapshots", None),
+        ("GET", "/api/v1/audio-plugins/inconnu/catalog", None),
+        // Résumé hebdomadaire : l'adresse et l'envoi par mozaiklabs.fr.
+        (
+            "POST",
+            "/api/v1/digest/settings",
+            Some(json!({ "email": "intrus@exemple.test" })),
+        ),
+        ("POST", "/api/v1/digest/send", None),
+        // Proposition « Tune tested » : part avec le jeton et la clé.
+        ("POST", "/api/v1/zones/987654/tune-tested", Some(json!({}))),
+    ]
+}
+
+#[tokio::test]
+async fn les_envois_au_nom_du_compte_restent_sur_cette_machine() {
+    let b = banc();
+    for (methode, uri, corps) in envois_au_nom_du_compte() {
+        // Authentification coupée, autre appareil du réseau : refusé.
+        let (statut, texte) = appel(&b.state, LAN, None, methode, uri, corps.clone()).await;
+        assert_eq!(statut, StatusCode::FORBIDDEN, "{methode} {uri} : {texte}");
+        assert_eq!(json_de(&texte)["reason"], "not_local", "{methode} {uri}");
+        // Cette machine : la garde laisse passer (la suite peut refuser pour
+        // une autre raison — offre, réseau — mais pas « pas cette machine »).
+        let (statut, texte) = appel(&b.state, ICI, None, methode, uri, corps).await;
+        assert_ne!(
+            json_de(&texte)["reason"],
+            "not_local",
+            "{methode} {uri} : {statut} {texte}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn un_compte_standard_n_envoie_rien_au_nom_du_compte() {
+    let b = banc();
+    let (admin, invite) = activer_l_authentification(&b.state);
+    for (methode, uri, corps) in envois_au_nom_du_compte() {
+        let (statut, texte) =
+            appel(&b.state, LAN, Some(&invite), methode, uri, corps.clone()).await;
+        assert_eq!(statut, StatusCode::FORBIDDEN, "{methode} {uri} : {texte}");
+        let (statut, texte) = appel(&b.state, LAN, Some(&admin), methode, uri, corps).await;
+        assert_ne!(statut, StatusCode::FORBIDDEN, "{methode} {uri} : {texte}");
+    }
+}
+
+const COMPTE_DU_SERVEUR: &str = r#"{"id":1,"email":"proprio@exemple.test","display_name":"P","is_admin":false,"avatar_url":null}"#;
+const COMPTE_D_UN_PROFIL: &str = r#"{"id":9,"email":"voisin@exemple.test","display_name":"V","is_admin":false,"avatar_url":null}"#;
+
+fn poser_les_comptes_lies(state: &AppState) {
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    reglages
+        .set("mozaik_access_token", "jeton-de-banc")
+        .unwrap();
+    reglages.set("mozaik_user", COMPTE_DU_SERVEUR).unwrap();
+    // L'offre du compte et l'adresse du résumé : réservées comme le compte.
+    reglages.set("mozaik_premium", "true").unwrap();
+    reglages
+        .set("mozaik_premium_expires", "2099-01-01")
+        .unwrap();
+    reglages
+        .set("mozaik_modules", r#"["module-de-banc"]"#)
+        .unwrap();
+    reglages.set("digest_email", "resume@exemple.test").unwrap();
+    reglages
+        .set("mozaik_compte_profil_9", COMPTE_D_UN_PROFIL)
+        .unwrap();
+}
+
+/// Lit les comptes liés tels que les rendent `GET /system/config` et
+/// `GET /system/config/export`.
+async fn comptes_lus(state: &AppState, depuis: &str, jeton: Option<&str>) -> (bool, Option<bool>) {
+    let (statut, texte) = appel(state, depuis, jeton, "GET", "/api/v1/system/config", None).await;
+    assert_eq!(statut, StatusCode::OK, "{texte}");
+    let marques = [
+        "proprio@exemple.test",
+        "voisin@exemple.test",
+        "mozaik_premium",
+        "module-de-banc",
+        "resume@exemple.test",
+    ];
+    let lu_config = marques.iter().any(|m| texte.contains(m));
+    // Tout ou rien : qui relie le serveur voit TOUT.
+    if lu_config {
+        for m in marques {
+            assert!(texte.contains(m), "{m} manque pour qui relie le serveur");
+        }
+    }
+    let (statut, texte) = appel(
+        state,
+        depuis,
+        jeton,
+        "GET",
+        "/api/v1/system/config/export",
+        None,
+    )
+    .await;
+    // `None` : export refusé (compte standard). Un export rendu sans les
+    // comptes vaut `Some(false)`, distinct d'un refus.
+    let lu_export = (statut == StatusCode::OK).then(|| marques.iter().any(|m| texte.contains(m)));
+    (lu_config, lu_export)
+}
+
+#[tokio::test]
+async fn les_comptes_lies_ne_sortent_pas_vers_un_autre_appareil() {
+    let b = banc();
+    poser_les_comptes_lies(&b.state);
+    // Authentification coupée.
+    assert_eq!(comptes_lus(&b.state, LAN, None).await, (false, Some(false)));
+    assert_eq!(comptes_lus(&b.state, ICI, None).await, (true, Some(true)));
+    // Statut du SSO : relié, sans le compte, pour un autre appareil.
+    let (_, texte) = appel(&b.state, LAN, None, "GET", "/api/v1/cloud/sso/status", None).await;
+    let v = json_de(&texte);
+    assert_eq!(v["connected"], true, "{texte}");
+    assert!(v["user"].is_null(), "{texte}");
+    assert_eq!(v["details_hidden"], true, "{texte}");
+    let (_, texte) = appel(&b.state, ICI, None, "GET", "/api/v1/cloud/sso/status", None).await;
+    assert_eq!(json_de(&texte)["details_hidden"], false, "{texte}");
+    assert_eq!(
+        json_de(&texte)["user"]["email"],
+        "proprio@exemple.test",
+        "{texte}"
+    );
+}
+
+#[tokio::test]
+async fn un_compte_standard_ne_lit_pas_les_comptes_des_autres() {
+    let b = banc();
+    let (admin, invite) = activer_l_authentification(&b.state);
+    poser_les_comptes_lies(&b.state);
+    assert_eq!(
+        comptes_lus(&b.state, LAN, Some(&invite)).await,
+        (false, None)
+    );
+    assert_eq!(
+        comptes_lus(&b.state, LAN, Some(&admin)).await,
+        (true, Some(true))
+    );
+}
+
+#[tokio::test]
+async fn l_adresse_du_resume_ne_sort_pas_vers_un_autre_appareil() {
+    let b = banc();
+    b.state
+        .license
+        .set_account_premium(true, Some("2099-01-01T00:00:00Z".into()))
+        .await;
+    poser_les_comptes_lies(&b.state);
+    let (_, texte) = appel(&b.state, LAN, None, "GET", "/api/v1/digest/settings", None).await;
+    assert!(!texte.contains("resume@exemple.test"), "{texte}");
+    // Cette machine la voit (le témoin n'est pas vert par un refus d'offre).
+    let (_, texte) = appel(&b.state, ICI, None, "GET", "/api/v1/digest/settings", None).await;
+    assert!(texte.contains("resume@exemple.test"), "{texte}");
+}
+
+#[tokio::test]
+async fn la_liaison_ne_nomme_pas_un_profil_par_son_adresse() {
+    let b = banc();
+    let nom = tune_core::cloud::nom_de_profil::nom_libre(
+        &b.state.backend,
+        "",
+        "proprio@exemple.test",
+        None,
+    );
+    assert_eq!(nom, "proprio");
+}
+
+/// `PATCH /system/config` n'écrit pas, depuis un autre appareil sans
+/// authentification, les réglages qui font envoyer au nom du compte.
+#[tokio::test]
+async fn les_reglages_d_envoi_au_nom_du_compte_restent_sur_cette_machine() {
+    let b = banc();
+    for corps in [
+        json!({ "digest_email": "intrus@exemple.test" }),
+        json!({ "digest_enabled": "true" }),
+        json!({ "cloud_listens_upload_enabled": "true" }),
+        json!({ "cloud_community_share_enabled": "true" }),
+        json!({ "telemetry_enabled": "true" }),
+        json!({ "community_contribution_enabled": "true" }),
+        json!({ "community_measures_contribute_enabled": "true" }),
+    ] {
+        let (statut, texte) = appel(
+            &b.state,
+            LAN,
+            None,
+            "PATCH",
+            "/api/v1/system/config",
+            Some(corps.clone()),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::FORBIDDEN, "{corps} : {texte}");
+        assert_eq!(json_de(&texte)["reason"], "not_local", "{corps}");
+        let (statut, texte) = appel(
+            &b.state,
+            ICI,
+            None,
+            "PATCH",
+            "/api/v1/system/config",
+            Some(corps.clone()),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::OK, "{corps} : {texte}");
+    }
+    let reglages = SettingsRepo::with_backend(b.state.backend.clone());
+    // Un réglage ordinaire passe toujours depuis le réseau.
+    let (statut, texte) = appel(
+        &b.state,
+        LAN,
+        None,
+        "PATCH",
+        "/api/v1/system/config",
+        Some(json!({ "enrich_on_scan": "false" })),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{texte}");
+    assert_eq!(
+        reglages.get("enrich_on_scan").unwrap().as_deref(),
+        Some("false")
+    );
+}
+
+/// Un curseur ou un plancher d'envoi remis à zéro ferait tout renvoyer au
+/// compte : « éteint » ne vaut que pour les interrupteurs, et ces réglages
+/// ne s'écrivent pas depuis un autre appareil, même à zéro.
+#[tokio::test]
+async fn les_curseurs_d_envoi_ne_se_remettent_pas_a_zero_depuis_le_reseau() {
+    let b = banc();
+    let reglages = SettingsRepo::with_backend(b.state.backend.clone());
+    for cle in [
+        "cloud_listens_cursor",
+        "cloud_listens_floor",
+        "community_measures_upload_cursor",
+    ] {
+        reglages.set(cle, "4242").unwrap();
+    }
+    for corps in [
+        json!({ "cloud_listens_cursor": 0 }),
+        json!({ "cloud_listens_floor": "0" }),
+        json!({ "community_measures_upload_cursor": "" }),
+        json!({ "cloud_listens_cursor": null }),
+    ] {
+        let (statut, texte) = appel(
+            &b.state,
+            LAN,
+            None,
+            "PATCH",
+            "/api/v1/system/config",
+            Some(corps.clone()),
+        )
+        .await;
+        assert_eq!(
+            statut,
+            StatusCode::FORBIDDEN,
+            "{corps} : un curseur d'envoi s'écrit depuis le réseau : {texte}"
+        );
+    }
+    for cle in [
+        "cloud_listens_cursor",
+        "cloud_listens_floor",
+        "community_measures_upload_cursor",
+    ] {
+        assert_eq!(reglages.get(cle).unwrap().as_deref(), Some("4242"), "{cle}");
+    }
+}
+
+/// Refuser, éteindre ou fermer la question passe depuis tout appareil (rien
+/// ne part) ; la question n'est pas posée à un autre appareil.
+#[tokio::test]
+async fn refuser_l_envoi_reste_possible_depuis_un_autre_appareil() {
+    let b = banc();
+    for corps in [
+        json!({ "cloud_listens_consent": "refuse" }),
+        json!({ "cloud_listens_consent": "fermee" }),
+        json!({ "cloud_listens_upload_enabled": false }),
+        json!({ "digest_enabled": "false" }),
+    ] {
+        let (statut, texte) = appel(
+            &b.state,
+            LAN,
+            None,
+            "PATCH",
+            "/api/v1/system/config",
+            Some(corps.clone()),
+        )
+        .await;
+        assert_ne!(statut, StatusCode::FORBIDDEN, "{corps} : {texte}");
+    }
+    poser_les_comptes_lies(&b.state);
+    SettingsRepo::with_backend(b.state.backend.clone())
+        .set("server_id", "serveur-de-banc")
+        .unwrap();
+    let (_, texte) = appel(&b.state, LAN, None, "GET", "/api/v1/system/config", None).await;
+    assert_eq!(
+        json_de(&texte)["cloud_listens_consent"]["linked"],
+        false,
+        "{texte}"
+    );
+    let (_, texte) = appel(&b.state, ICI, None, "GET", "/api/v1/system/config", None).await;
+    assert_eq!(
+        json_de(&texte)["cloud_listens_consent"]["linked"],
+        true,
+        "{texte}"
     );
 }
