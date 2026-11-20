@@ -150,6 +150,11 @@ pub struct AppState {
     /// [`crate::routes::zones::relais_de_groupe_6155::DeplacementsDeGroupe`]).
     pub deplacements_de_groupe:
         Arc<crate::routes::zones::relais_de_groupe_6155::DeplacementsDeGroupe>,
+    /// #9089 — les gestes relayés à chaque suiveuse d'un groupe, numérotés :
+    /// une attente dépassée ne fait rien, et deux gestes d'une même suiveuse
+    /// ne tournent jamais à la fois (voir
+    /// [`crate::routes::zones::relais_de_groupe_6155::GestesDeSuiveuses`]).
+    pub gestes_de_suiveuses: Arc<crate::routes::zones::relais_de_groupe_6155::GestesDeSuiveuses>,
     /// mDNS scanner handle, populated by
     /// [`crate::discovery_setup::spawn_mdns_handler`] once discovery starts. Kept
     /// here (not just as a local `_mdns_handle`) so routes can list the peer Tune
@@ -768,6 +773,7 @@ impl AppState {
             media_servers: Arc::new(Mutex::new(HashMap::new())),
             derniers_seeks: Arc::new(std::sync::Mutex::new(HashMap::new())),
             deplacements_de_groupe: Arc::default(),
+            gestes_de_suiveuses: Arc::default(),
             mdns_scanner: Arc::new(std::sync::Mutex::new(None)),
             active_audio_backend: Arc::new(std::sync::RwLock::new(None)),
             annuaire_radios: Arc::new(std::sync::RwLock::new(Vec::new())),

@@ -23,6 +23,12 @@ pub(super) async fn resume_listening(
     let mut r = resumes::load(&state.backend, &body.resume_key)
         .map_err(AppError::internal)?
         .ok_or_else(|| AppError::not_found("reprise"))?;
+    // La reprise d'un AUTRE profil n'existe pas pour celui-ci, quel que soit
+    // son contexte : une reprise « titre » peut porter la file d'une playlist
+    // privée de son propriétaire.
+    if !resumes::est_au_profil(&state.backend, &r, profile.id()) {
+        return Err(AppError::not_found("reprise"));
+    }
     // C'est un nouveau geste : un seek récent du même titre ne doit pas
     // conserver son ancienne position lors du rejeu depuis le début.
     state.playback.oublier_le_deplacement(zone_id).await;
@@ -315,6 +321,52 @@ mod tests {
 #[cfg(test)]
 mod route_tests {
     use super::*;
+
+    /// La reprise d'un AUTRE profil n'existe pas pour celui-ci (404), quel
+    /// que soit son contexte — ici un « titre » dont la file viendrait d'une
+    /// playlist privée de son propriétaire.
+    #[tokio::test]
+    async fn la_reprise_d_un_autre_profil_est_introuvable() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+            .create("Salon", Some("dlna"), None)
+            .unwrap();
+        let r = resumes::Resume {
+            resume_key: "cle-du-profil-2".into(),
+            profile_id: Some(2),
+            context_type: "track".into(),
+            context_id: "42".into(),
+            source: "local".into(),
+            title: "Titre privé".into(),
+            last_track_title: "Titre privé".into(),
+            cover_path: None,
+            album_id: None,
+            position: 0,
+            shuffled: false,
+            queue_row_ids: vec![],
+            position_ms: 0,
+            updated_at: "2026-11-19T10:00:00Z".into(),
+            items: vec![],
+        };
+        resumes::save(&state.backend, zone, &r).unwrap();
+        let refus = resume_listening(
+            State(state.clone()),
+            ActiveProfile(1),
+            Path(zone),
+            axum::http::HeaderMap::new(),
+            Json(ResumeRequest {
+                resume_key: "cle-du-profil-2".into(),
+            }),
+        )
+        .await;
+        match refus {
+            Err(e) => assert_eq!(
+                axum::response::IntoResponse::into_response(e).status(),
+                axum::http::StatusCode::NOT_FOUND
+            ),
+            Ok(r) => panic!("reprise d'un autre profil acceptée : {}", r.status()),
+        }
+    }
     #[tokio::test]
     async fn reprise_fabien_7280_la_route_recale_le_vrai_controle_de_sortie_factice() {
         let _pauses = crate::pauses_de_fond_tests::isoler().await;
