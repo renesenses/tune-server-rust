@@ -24,6 +24,9 @@ use tune_core::db::sqlite::SqliteDb;
 
 fn ligne(id: usize) -> QueueInput {
     QueueInput::Streaming {
+        media_format: None,
+        sample_rate: None,
+        bit_depth: None,
         source: "qobuz".into(),
         source_id: format!("q{id}"),
         title: format!("Titre {id}"),

@@ -237,6 +237,9 @@ impl Banc {
             .append(
                 zone,
                 &[QueueInput::Streaming {
+                    media_format: None,
+                    sample_rate: None,
+                    bit_depth: None,
                     source: "bandcamp".into(),
                     source_id: source_id.into(),
                     title: "Even Thieves Couldn't Lie".into(),

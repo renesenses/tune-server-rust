@@ -118,12 +118,29 @@ fn retenir_la_perte_du_hw(device_name: &str, raison: &SansPcmMateriel) {
         SansPcmMateriel::HoteNonAlsa(_) => {
             capacite::retenir(device_name, CapaciteConnue::SortieNonAsio);
         }
+        SansPcmMateriel::PcmLogiciel(id) if pcm_logiciel_generique(id) => {
+            capacite::retenir(device_name, CapaciteConnue::SortieNonAsio);
+        }
         SansPcmMateriel::PcmLogiciel(_) => {
             capacite::retrograder_en_provisoire(device_name);
             capacite::retenir_provisoire(device_name, CapaciteConnue::SortieNonAsio);
         }
         SansPcmMateriel::Introuvable(_) => capacite::retrograder_en_provisoire(device_name),
     }
+}
+
+/// #9170 (suivi #9172) — un PCM logiciel GÉNÉRIQUE, sans carte désignée
+/// (`default`, `pipewire`, `pulse`, `dmix`, `sysdefault`, `plug`, `jack`…) :
+/// le nom de la sortie désigne le mixeur du système, jamais un DAC, et ne
+/// résoudra pas vers un `hw:` — verdict définitif, pas de re-sondage.
+///
+/// Un PCM logiciel qui désigne une carte (`default:CARD=DACZ8`,
+/// `plughw:CARD=…`, `dmix:CARD=…`) reste provisoire : la même carte expose
+/// aussi son `hw:`, que l'énumération peut préférer au sondage suivant (le
+/// cas du fil 2951).
+fn pcm_logiciel_generique(endpoint_id: &str) -> bool {
+    let pcm = crate::outputs::pseudo_peripherique_alsa::pcm_alsa(endpoint_id);
+    !pcm.is_empty() && !pcm.contains(':')
 }
 
 /// Le PCM ALSA matériel (`hw:`) qu'ouvrirait la sortie, sans repli.
@@ -183,6 +200,9 @@ pub(super) fn sonder_la_sortie(
             }
             return match raison {
                 SansPcmMateriel::HoteNonAlsa(_) => ResultatSondeDsdAlsa::PasUnPcmMateriel,
+                SansPcmMateriel::PcmLogiciel(id) if pcm_logiciel_generique(&id) => {
+                    ResultatSondeDsdAlsa::PasUnPcmMateriel
+                }
                 SansPcmMateriel::PcmLogiciel(_) => ResultatSondeDsdAlsa::PcmLogiciel,
                 SansPcmMateriel::Introuvable(_) => ResultatSondeDsdAlsa::Introuvable,
             };
@@ -620,5 +640,35 @@ mod perte_du_hw_9172 {
                 cadences: vec![DSD512]
             })
         );
+    }
+
+    /// Suivi #9172 : `default`, `pipewire`… sans carte sont définitifs ;
+    /// un PCM logiciel qui désigne une carte reste provisoire (fil 2951).
+    #[test]
+    fn un_pcm_logiciel_generique_est_definitif() {
+        use super::pcm_logiciel_generique;
+        for id in [
+            "alsa:default",
+            "pipewire",
+            "alsa:pulse",
+            "dmix",
+            "sysdefault",
+            "plug",
+        ] {
+            assert!(pcm_logiciel_generique(id), "{id} : générique attendu");
+        }
+        for id in [
+            "alsa:default:CARD=DACZ8",
+            "plughw:CARD=Z8,DEV=0",
+            "dmix:CARD=Z8,DEV=0",
+            "sysdefault:CARD=Z8",
+        ] {
+            assert!(!pcm_logiciel_generique(id), "{id} : désigne une carte");
+        }
+        let nom = "9172 sortie pipewire";
+        prouve(nom);
+        retenir_la_perte_du_hw(nom, &SansPcmMateriel::PcmLogiciel("alsa:pipewire".into()));
+        assert_eq!(connue(nom), Some(CapaciteConnue::SortieNonAsio));
+        assert!(!a_resonder(nom), "un PCM générique ne se re-sonde pas");
     }
 }

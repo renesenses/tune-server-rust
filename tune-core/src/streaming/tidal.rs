@@ -1593,6 +1593,12 @@ impl TidalService {
                     None
                 }
             },
+            // Tidal ne porte pas le genre sur l'objet album lui-même
+            // (confirmé : aucune clé `genre` dans sa réponse) — on ne le
+            // connaît qu'en ayant déjà demandé `/genres/{id}/albums`, pas
+            // comme une propriété de l'album. Une absence ne s'invente pas.
+            genre_id: None,
+            genre_name: None,
         }
     }
 

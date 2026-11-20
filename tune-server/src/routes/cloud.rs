@@ -214,6 +214,40 @@ fn page_refus_hors_machine(
 
 type RefusDeGarde = (StatusCode, Json<Value>);
 
+/// Réglages dont l'écriture fait envoyer au nom du compte par une tâche de
+/// fond (résumé hebdomadaire, écoutes envoyées au compte, partage
+/// communautaire, consentements de télémétrie et de contribution, que
+/// `POST /cloud/telemetry/enable` garde déjà) : `PATCH /system/config` ne les
+/// accepte que de qui relie le serveur (administrateur, ou cette machine sans
+/// authentification).
+pub(crate) fn fait_envoyer_au_nom_du_compte(cle: &str) -> bool {
+    let cle = cle.trim().to_ascii_lowercase();
+    cle.starts_with("digest_")
+        || cle.starts_with("cloud_listens_")
+        || cle.starts_with("cloud_community_")
+        || cle.starts_with("telemetry_")
+        || cle.starts_with("community_")
+}
+
+/// Réglages qui portent le compte Mozaiklabs : son identité (`mozaik_user`,
+/// et `mozaik_compte_profil_{id}` pour les profils), son offre
+/// (`mozaik_premium*`, `mozaik_modules`) et l'adresse du résumé
+/// hebdomadaire (`digest_email`). Ils ne sortent par les routes de lecture
+/// des réglages que pour qui relie le serveur (administrateur, ou cette
+/// machine sans authentification) ; chacun lit son propre compte par
+/// `GET /cloud/sso/status`.
+pub(crate) fn est_reserve_a_qui_relie(cle: &str) -> bool {
+    matches!(
+        cle,
+        "mozaik_user"
+            | "mozaik_premium"
+            | "mozaik_premium_expires"
+            | "mozaik_premium_checked"
+            | "mozaik_modules"
+            | "digest_email"
+    ) || cle.starts_with("mozaik_compte_profil_")
+}
+
 /// Ce qu'une liaison au compte Mozaiklabs a le droit de toucher.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Liaison {
@@ -551,7 +585,8 @@ async fn sso_callback(
             .execute(
                 "UPDATE profiles SET display_name = ? WHERE id = ?",
                 &[
-                    &user.display_name as &dyn ToSqlValue,
+                    &tune_core::cloud::nom_de_profil::nom_affiche_neutre(&user.display_name)
+                        as &dyn ToSqlValue,
                     &id as &dyn ToSqlValue,
                 ],
             )
@@ -579,11 +614,19 @@ async fn sso_callback(
         // mozaiklabs.fr, pas le propriétaire de CE serveur. Seul un
         // administrateur local promeut un profil.
         let is_admin: i64 = 0;
+        // Le nom du profil se lit partout : jamais l'adresse du compte (elle
+        // reste dans `email`). Voir `tune_core::cloud::nom_de_profil`.
+        let nom = tune_core::cloud::nom_de_profil::nom_libre(
+            &state.backend,
+            &user.display_name,
+            &user.email,
+            None,
+        );
         state
             .backend
             .execute_returning_id(
                 "INSERT INTO profiles (username, display_name, email, avatar_path, is_admin) VALUES (?, ?, ?, ?, ?)",
-                &[&user.email as &dyn ToSqlValue, &user.display_name as &dyn ToSqlValue, &user.email as &dyn ToSqlValue, &default_color as &dyn ToSqlValue, &is_admin as &dyn ToSqlValue],
+                &[&nom as &dyn ToSqlValue, &tune_core::cloud::nom_de_profil::nom_affiche_neutre(&user.display_name) as &dyn ToSqlValue, &user.email as &dyn ToSqlValue, &default_color as &dyn ToSqlValue, &is_admin as &dyn ToSqlValue],
             )
             .unwrap_or(0)
     };
@@ -817,7 +860,8 @@ fn enregistrer_compte_du_profil(
         .execute(
             "UPDATE profiles SET display_name = ? WHERE id = ?",
             &[
-                &user.display_name as &dyn ToSqlValue,
+                &tune_core::cloud::nom_de_profil::nom_affiche_neutre(&user.display_name)
+                    as &dyn ToSqlValue,
                 &profil as &dyn ToSqlValue,
             ],
         )
@@ -825,13 +869,21 @@ fn enregistrer_compte_du_profil(
 }
 
 async fn sso_status(
-    garde: Result<crate::auth::AdminOuCetteMachine, RefusDeGarde>,
+    // Lecture appelée par tous les appareils : la garde silencieuse (pas
+    // d'avertissement à chaque appel d'un autre appareil).
+    relie: crate::auth::ReliePourLesComptes,
     appelant: Option<crate::auth::AuthUser>,
     State(state): State<AppState>,
 ) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
+    let garde = if relie.0 {
+        Ok(crate::auth::AdminOuCetteMachine)
+    } else {
+        Err((StatusCode::FORBIDDEN, Json(json!({}))))
+    };
+    let liaison = liaison_autorisee(&state, garde, appelant);
     // Un compte standard voit SA liaison, pas celle du serveur.
-    if let Ok(Liaison::Profil(profil)) = liaison_autorisee(&state, garde, appelant) {
+    if let Ok(Liaison::Profil(profil)) = liaison {
         let user: Option<tune_core::cloud::sso::CloudUser> = settings
             .get(&cle_compte_du_profil(profil))
             .ok()
@@ -853,11 +905,19 @@ async fn sso_status(
         .flatten()
         .filter(|s| !s.is_empty())
         .is_some();
-    let user: Option<tune_core::cloud::sso::CloudUser> = settings
-        .get("mozaik_user")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok());
+    // Le compte du serveur (courriel, offre, modules) ne se montre qu'à qui
+    // relie le serveur : l'administrateur, ou cette machine sans
+    // authentification. Un autre appareil du réseau sait seulement si le
+    // serveur est relié.
+    let user: Option<tune_core::cloud::sso::CloudUser> = if liaison.is_ok() {
+        settings
+            .get("mozaik_user")
+            .ok()
+            .flatten()
+            .and_then(|s| serde_json::from_str(&s).ok())
+    } else {
+        None
+    };
     // #8238 : le site a refusé le renouvellement de la session. Les jetons
     // sont encore en base mais ne valent plus rien : le serveur n'est PAS
     // connecté, et l'interface propose la connexion au compte.
@@ -868,6 +928,9 @@ async fn sso_status(
         "connected": connected && !reconnect_required,
         "reconnect_required": reconnect_required,
         "user": user,
+        // Relié, mais le compte n'est pas montré à cet appareil : l'interface
+        // dit « relié » sans détails ni bouton (rien qu'elle puisse faire d'ici).
+        "details_hidden": liaison.is_err(),
     }))
 }
 
@@ -2108,7 +2171,10 @@ fn message_statut_distant(status: StatusCode) -> String {
 /// 🔴 **Répond 200 dans ses neuf sorties** : c'est le contrat, pas un oubli
 /// (#3906). La vérité vit dans le corps, et le champ qui la porte est
 /// `reason` — voir [`MotifValidation`].
-async fn license_validate(State(state): State<AppState>) -> impl IntoResponse {
+async fn license_validate(
+    _garde: crate::auth::AdminOuCetteMachine,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
     let ls = state.license.license_state().await;
     let Some(ref key) = ls.license_key else {
         return reponse_validation(
@@ -2712,6 +2778,7 @@ fn mode_demande(body: &ReconcileBody) -> tune_core::cloud::library_reconcile::Mo
 /// Manuelle et non automatique, deliberement : declencher une suppression de
 /// masse au demarrage sans l'avoir vue tourner une fois serait imprudent.
 async fn library_sync_reconcile(
+    _garde: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     body: Option<Json<ReconcileBody>>,
 ) -> impl IntoResponse {
@@ -2772,7 +2839,10 @@ async fn library_sync_reconcile(
 }
 
 /// POST /cloud/library-sync/trigger — triggers immediate sync (premium only).
-async fn library_sync_trigger(State(state): State<AppState>) -> impl IntoResponse {
+async fn library_sync_trigger(
+    _garde: crate::auth::AdminOuCetteMachine,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
     if let Err(resp) = crate::premium_guard::require_premium(
         &state.license,
         tune_core::license::Feature::CloudBackup,
@@ -2853,7 +2923,10 @@ async fn library_sync_trigger(State(state): State<AppState>) -> impl IntoRespons
 }
 
 /// POST /cloud/library-sync/full-sync — queues a full library resync (premium only).
-async fn library_sync_full(State(state): State<AppState>) -> impl IntoResponse {
+async fn library_sync_full(
+    _garde: crate::auth::AdminOuCetteMachine,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
     if let Err(resp) = crate::premium_guard::require_premium(
         &state.license,
         tune_core::license::Feature::CloudBackup,

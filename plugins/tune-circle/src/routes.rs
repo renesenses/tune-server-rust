@@ -52,16 +52,21 @@
 //! Le cercle partagé (site-mozaiklabs#568, rc13) : le propriétaire partage un
 //! cercle entre ses membres, chaque membre choisit de s'y montrer. Le droit
 //! (propriété : 404 ; membre au lien actif : 404 ; cercle non partagé : 409
-//! `circle_not_shared`) est jugé par le cloud seul et relayé avec son corps.
-//! Sans corps dans les deux sens ; `{id}` en chiffres seulement, sinon `404
-//! circle.not_found` sans appel.
+//! `circle_not_shared`, pour `PUT …/show-me` seulement — `DELETE …/show-me`
+//! rend 200, idempotent, même si le cercle n'est plus partagé) est jugé par
+//! le cloud seul et relayé avec son corps. Sans corps dans les deux sens ;
+//! `{id}` en chiffres seulement, sinon `404 circle.not_found` sans appel.
+//!
+//! Ces routes, comme toutes les écritures du greffon, sont réservées à
+//! l'administrateur du serveur et refusées à distance : la garde est posée
+//! par l'hôte (`tune_server::garde_du_cercle`).
 //!
 //! | Tune (`/api/v1/ext/circle`)                  | mozaiklabs (`/api/v1/circle`)          |
 //! |----------------------------------------------|----------------------------------------|
 //! | `PUT /circles/{id}/sharing/members`          | idem → le cercle, `members_see_each_other` |
 //! | `DELETE /circles/{id}/sharing/members`       | idem                                   |
-//! | `PUT /member-of/{id}/show-me`                | idem → l'entrée `member_of`, `show_me` |
-//! | `DELETE /member-of/{id}/show-me`             | idem                                   |
+//! | `PUT /member-of/{id}/show-me`                | idem → l'entrée `member_of`, `show_me` ; 409 si non partagé |
+//! | `DELETE /member-of/{id}/show-me`             | idem, 200 idempotent                   |
 //!
 //! rc8 (#6900), l'écran de Levente et le globe opt-in, dans [`crate::globe`] :
 //! `GET /contacts/{user_id}/library/summary`, `GET|PUT|DELETE /me/location`,

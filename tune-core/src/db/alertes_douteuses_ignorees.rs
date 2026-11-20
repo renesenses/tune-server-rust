@@ -277,6 +277,23 @@ pub fn alerte_pour(
     })
 }
 
+/// #9028 — l'alerte `raison` mémorisée pour la PISTE seule, quelle que soit
+/// sa nature : le geste groupé « Normal pour les N pistes de cet album »
+/// n'écrit QUE des lignes de pistes, pour ne couvrir que les pistes montrées
+/// (jamais une piste ajoutée ensuite, ni un homonyme du même dossier). `None`
+/// quand la piste n'a pas de clé stable.
+pub fn alerte_de_la_piste(t: &Track, raison: &str, maintenant: i64) -> Option<AlerteIgnoree> {
+    Some(AlerteIgnoree {
+        portee: Portee::Piste,
+        cle: cle_piste(t)?,
+        titre: String::new(),
+        raison: raison.to_string(),
+        cible_id: t.id,
+        libelle: Some(t.title.clone()),
+        ignoree_le: maintenant,
+    })
+}
+
 /// Marque l'alerte comme normale. Rejouée, elle ne change rien. Rend vrai si
 /// une ligne a été ajoutée.
 pub fn ignorer(db: &Arc<dyn DbBackend>, a: &AlerteIgnoree) -> Result<bool, String> {
@@ -314,6 +331,58 @@ pub fn retablir(
         &[&portee as &dyn ToSqlValue, &cle, &titre, &raison],
     )
     .map(|n| n > 0)
+}
+
+/// #9028 — [`ignorer`] pour plusieurs alertes, dans UNE transaction : tout
+/// ou rien. Rend, dans l'ordre, si chaque ligne a été ajoutée (faux : elle
+/// existait déjà).
+pub fn ignorer_lot(db: &Arc<dyn DbBackend>, lot: &[AlerteIgnoree]) -> Result<Vec<bool>, String> {
+    let mut ajoutees = Vec::with_capacity(lot.len());
+    db.write_tx(&mut |tx| {
+        ajoutees.clear();
+        for a in lot {
+            let portee = a.portee.as_str();
+            let n = tx.execute(
+                "INSERT INTO alertes_douteuses_ignorees \
+                 (portee, cle, titre, raison, cible_id, libelle, ignoree_le) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (portee, cle, titre, raison) DO NOTHING",
+                &[
+                    &portee as &dyn ToSqlValue,
+                    &a.cle,
+                    &a.titre,
+                    &a.raison,
+                    &a.cible_id,
+                    &a.libelle,
+                    &a.ignoree_le,
+                ],
+            )?;
+            ajoutees.push(n > 0);
+        }
+        Ok(())
+    })?;
+    Ok(ajoutees)
+}
+
+/// #9028 — [`retablir`] pour plusieurs choix `(portée, clé, titre, raison)`,
+/// dans UNE transaction. Rend le nombre de lignes retirées.
+pub fn retablir_lot(
+    db: &Arc<dyn DbBackend>,
+    lot: &[(Portee, String, String, String)],
+) -> Result<usize, String> {
+    let mut retirees = 0usize;
+    db.write_tx(&mut |tx| {
+        retirees = 0;
+        for (portee, cle, titre, raison) in lot {
+            let portee = portee.as_str();
+            retirees += tx.execute(
+                "DELETE FROM alertes_douteuses_ignorees \
+                 WHERE portee = ? AND cle = ? AND titre = ? AND raison = ?",
+                &[&portee as &dyn ToSqlValue, cle, titre, raison],
+            )?;
+        }
+        Ok(())
+    })?;
+    Ok(retirees)
 }
 
 /// Toutes les alertes ignorées, les plus récentes d'abord.
@@ -367,6 +436,10 @@ pub fn purger_en_fin_de_scan(db: &Arc<dyn DbBackend>, scan_complet_sain: bool, o
         Err(e) => tracing::warn!(error = %e, origine, "alertes_douteuses_ignorees_purge_echec"),
     }
 }
+
+#[cfg(test)]
+#[path = "alertes_douteuses_ignorees_tests_9028.rs"]
+mod tests_9028;
 
 #[cfg(test)]
 mod tests {

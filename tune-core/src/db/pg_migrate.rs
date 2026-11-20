@@ -929,6 +929,10 @@ ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_ref TEXT;
 -- L'artiste d'une piste de service chez son service (#6079, PG 087 / SQLite
 -- 122). En ALTER pour la même raison que juste au-dessus.
 ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS artist_ref TEXT;
+ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS media_format TEXT;
+ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS sample_rate INTEGER;
+ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS bit_depth INTEGER;
+
 -- Le conteneur de chaque élément de file (#6466, PG 092 / SQLite 128).
 ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS context_type TEXT;
 ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS context_id TEXT;
@@ -2579,6 +2583,9 @@ mod tests {
         let cible = base_jetable(&url, BASE).await;
         let sqlite = sqlite_de_depart();
         let item = |source: &str, id: &str| QueueInput::Streaming {
+            media_format: None,
+            sample_rate: None,
+            bit_depth: None,
             source: source.into(),
             source_id: id.into(),
             title: id.into(),
@@ -2593,6 +2600,7 @@ mod tests {
         };
         let reprise = Resume {
             resume_key: "cle-reprise".into(),
+            profile_id: None,
             context_type: "playlist".into(),
             context_id: "mixte".into(),
             source: "qobuz".into(),
