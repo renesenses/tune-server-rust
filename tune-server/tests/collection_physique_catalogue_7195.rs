@@ -74,7 +74,12 @@ async fn la_collection_physique_est_proposee_s_installe_et_ne_rend_jamais_le_jet
         !routeurs.iter().any(|(n, _)| n == "collection-physique"),
         "opt-in : il n'appelle pas Discogs sans qu'on l'ait installé"
     );
-    let app = tune_server::routes::router_with_plugins(etat.clone(), routeurs);
+    let app = tune_server::routes::router_with_plugins(etat.clone(), routeurs).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let f = fiche(&app)
         .await
         .expect("« collection-physique » doit être PROPOSÉ par le gestionnaire (#7195)");
@@ -95,7 +100,12 @@ async fn la_collection_physique_est_proposee_s_installe_et_ne_rend_jamais_le_jet
     // ── 2e démarrage : actif.
     let etat = demarrer(&base);
     let routeurs = tune_server::plugins::init(&etat, "http://127.0.0.1:0", vec![]).await;
-    let app = tune_server::routes::router_with_plugins(etat.clone(), routeurs);
+    let app = tune_server::routes::router_with_plugins(etat.clone(), routeurs).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let f = fiche(&app).await.expect("un greffon qui tourne est listé");
     assert_eq!(f["enabled"], true, "{f}");
 

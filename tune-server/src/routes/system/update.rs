@@ -16,7 +16,10 @@ use crate::state::AppState;
 mod installation_sure;
 
 #[path = "compagnons_8944.rs"]
-mod compagnons;
+pub(crate) mod compagnons;
+
+#[path = "greffons_livres_8955.rs"]
+mod greffons_livres;
 
 use super::paquet_macos::{self, VoieMiseAJour};
 
@@ -2421,7 +2424,9 @@ pub(super) struct UpdateChannelBody {
 /// laisserait l'écran croire que « nightly » a été retenu alors que le serveur
 /// serait resté sur `auto`.
 pub(super) async fn update_channel_set(
-    _admin: crate::auth::RequireAdmin,
+    // Engage la machine : administrateur, ou authentification coupée,
+    // seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     Json(body): Json<UpdateChannelBody>,
 ) -> impl IntoResponse {
@@ -3788,11 +3793,14 @@ fn install_unix(
     let source_web = tmp_dir.join("web");
     let cibles_web = (controles.cibles_web)(exe_dir);
     let livres = compagnons::a_installer(tmp_dir, exe_dir, "");
+    // #8955 — les greffons livrés de l'archive (`plugins/<nom>/`).
+    let greffons = greffons_livres::a_installer(tmp_dir, exe_dir);
     let taille_neuve = std::fs::metadata(new_binary)
         .map_err(|e| format!("read new binary: {e}"))?
         .len();
     let besoin = taille_neuve
         + compagnons::taille(&livres)
+        + greffons_livres::taille(&greffons)
         + installation_sure::taille_du_dossier(&source_web) * cibles_web.len() as u64
         + installation_sure::MARGE_DE_PLACE;
     installation_sure::verifier_la_place(exe_dir, besoin, controles.place_libre)?;
@@ -3828,6 +3836,17 @@ fn install_unix(
         ));
     }
 
+    // #8955 — les greffons livrés aussi, AVANT de toucher au binaire.
+    if let Err(e) = greffons_livres::preparer(&greffons, controles.copier) {
+        std::fs::remove_file(&staging).ok();
+        installation_sure::abandonner_les_web(&webs_prepares);
+        compagnons::abandonner(&livres);
+        error!(error = %e, "update_new_bundled_plugin_rejected");
+        return Err(format!(
+            "{e} — previous binary, bundled executables, plugins and web/ kept"
+        ));
+    }
+
     let sauvegarde_en_cours = old_exe == en_cours;
     let sauvegarde_faite = if sauvegarde_en_cours || !binaire.exists() {
         warn!(
@@ -3844,6 +3863,7 @@ fn install_unix(
             std::fs::remove_file(&staging).ok();
             installation_sure::abandonner_les_web(&webs_prepares);
             compagnons::abandonner(&livres);
+            greffons_livres::abandonner(&greffons);
             return Err(format!("rename current to .old: {e}"));
         }
         true
@@ -3853,9 +3873,11 @@ fn install_unix(
     // basculés après un échec.
     let restaurer = |cause: String,
                      livres_bascules: &[compagnons::LivreBascule],
+                     greffons_bascules: &[greffons_livres::GreffonBascule],
                      webs: &[installation_sure::WebBascule]|
      -> String {
         let mut non_remis = compagnons::remettre_tous(livres_bascules);
+        non_remis.extend(greffons_livres::remettre_tous(greffons_bascules));
         for b in webs.iter().rev() {
             if let Err(e) = installation_sure::remettre_un_web(b) {
                 error!(dir = %b.cible.display(), error = %e, "update_web_rollback_failed");
@@ -3898,7 +3920,13 @@ fn install_unix(
         std::fs::remove_file(&staging).ok();
         installation_sure::abandonner_les_web(&webs_prepares);
         compagnons::abandonner(&livres);
-        return Err(restaurer(format!("rename .new to current: {e}"), &[], &[]));
+        greffons_livres::abandonner(&greffons);
+        return Err(restaurer(
+            format!("rename .new to current: {e}"),
+            &[],
+            &[],
+            &[],
+        ));
     }
     installation_sure::synchroniser_dossier(exe_dir);
 
@@ -3912,11 +3940,30 @@ fn install_unix(
                 error!(error = %e, "update_bundled_executable_failed, rolling back");
                 compagnons::abandonner(&livres[i..]);
                 installation_sure::abandonner_les_web(&webs_prepares);
-                return Err(restaurer(e, &livres_bascules, &[]));
+                greffons_livres::abandonner(&greffons);
+                return Err(restaurer(e, &livres_bascules, &[], &[]));
             }
         }
     }
     installation_sure::synchroniser_dossier(exe_dir);
+
+    // #8955 — chaque greffon livré bascule ensuite ; l'ancien reste en
+    // `plugins.old/<nom>`, hors du dossier parcouru au démarrage.
+    let mut greffons_bascules = Vec::new();
+    for (i, greffon) in greffons.iter().enumerate() {
+        match greffons_livres::basculer(greffon, controles.renommer) {
+            Ok(b) => greffons_bascules.push(b),
+            Err(e) => {
+                error!(error = %e, "update_bundled_plugin_failed, rolling back");
+                greffons_livres::abandonner(&greffons[i..]);
+                installation_sure::abandonner_les_web(&webs_prepares);
+                return Err(restaurer(e, &livres_bascules, &greffons_bascules, &[]));
+            }
+        }
+    }
+    // `plugins.new/` est vide une fois tout basculé.
+    std::fs::remove_dir(exe_dir.join(greffons_livres::ATTENTE)).ok();
+    greffons_livres::journaliser(&greffons_bascules);
 
     // Chaque `web/` bascule par renommage du dossier entier ; l'ancien reste
     // en `<cible>.old`, à côté de `tune-server.old`.
@@ -3927,7 +3974,12 @@ fn install_unix(
             Err(e) => {
                 error!(error = %e, "update_web_failed, rolling back binary and web/");
                 installation_sure::abandonner_les_web(&webs_prepares[i..]);
-                return Err(restaurer(e, &livres_bascules, &webs_bascules));
+                return Err(restaurer(
+                    e,
+                    &livres_bascules,
+                    &greffons_bascules,
+                    &webs_bascules,
+                ));
             }
         }
     }
@@ -4144,6 +4196,16 @@ impl DossierWebEnAttente {
         }
     }
 
+    /// #8955 — un greffon livré : `plugins/<nom>`, posé en
+    /// `plugins.new/<nom>`, l'ancien parqué en `plugins.old/<nom>`.
+    fn du_greffon(g: &greffons_livres::GreffonLivre) -> Self {
+        Self {
+            cible: g.cible.display().to_string(),
+            neuf: g.pose.display().to_string(),
+            ancien: g.ancien.display().to_string(),
+        }
+    }
+
     /// #8944 — un exécutable livré : `airplay-daemon.exe` →
     /// `airplay-daemon.exe.new` / `airplay-daemon.exe.old`, les noms que pose
     /// [`compagnons::preparer`].
@@ -4169,6 +4231,8 @@ struct BasculeWindows {
     web_en_attente: Vec<std::path::PathBuf>,
     /// #8944 — les exécutables livrés posés en `<nom>.exe.new`.
     livres_en_attente: Vec<compagnons::ExecutableLivre>,
+    /// #8955 — les greffons livrés posés en `plugins.new/<nom>`.
+    greffons_en_attente: Vec<greffons_livres::GreffonLivre>,
 }
 
 impl BasculeWindows {
@@ -4192,6 +4256,7 @@ impl BasculeWindows {
             let _ = std::fs::remove_dir_all(cible.with_extension("new"));
         }
         compagnons::abandonner(&self.livres_en_attente);
+        greffons_livres::abandonner(&self.greffons_en_attente);
     }
 }
 
@@ -4253,6 +4318,36 @@ fn preparer_la_bascule_windows(
     info!(
         executables = livres_en_attente.len(),
         "update_win_bundled_executables_staged"
+    );
+
+    // #8955 — les greffons livrés sont posés en `plugins.new/<nom>` ; le
+    // script les bascule après `web/` (au mieux, comme les `web/` qui ne sont
+    // pas le servi), l'ancien parqué en `plugins.old/<nom>`.
+    let greffons_en_attente = greffons_livres::a_installer(tmp_dir, exe_dir);
+    let preparation_des_greffons =
+        greffons_livres::preparer(&greffons_en_attente, installation_sure::copier_durablement)
+            .and_then(|()| {
+                if greffons_en_attente.is_empty() {
+                    return Ok(());
+                }
+                for dossier in [greffons_livres::DOSSIER, greffons_livres::SAUVEGARDE] {
+                    std::fs::create_dir_all(exe_dir.join(dossier))
+                        .map_err(|e| format!("create {dossier}: {e}"))?;
+                }
+                Ok(())
+            });
+    if let Err(e) = preparation_des_greffons {
+        let _ = std::fs::remove_file(&new_staging);
+        for cible in &web_en_attente {
+            let _ = std::fs::remove_dir_all(cible.with_extension("new"));
+        }
+        compagnons::abandonner(&livres_en_attente);
+        greffons_livres::abandonner(&greffons_en_attente);
+        return Err(e);
+    }
+    info!(
+        greffons = greffons_en_attente.len(),
+        "update_win_bundled_plugins_staged"
     );
 
     // Wait for OUR specific PID to exit, not any process named tune-server.exe.
@@ -4317,6 +4412,11 @@ fn preparer_la_bascule_windows(
         &web_en_attente
             .iter()
             .map(|c| DossierWebEnAttente::de(c))
+            .chain(
+                greffons_en_attente
+                    .iter()
+                    .map(DossierWebEnAttente::du_greffon),
+            )
             .collect::<Vec<_>>(),
         &livres_en_attente
             .iter()
@@ -4329,6 +4429,7 @@ fn preparer_la_bascule_windows(
         binaire_pose: new_staging,
         web_en_attente,
         livres_en_attente,
+        greffons_en_attente,
     };
     // A stale failure marker from a previous attempt would be misleading — clear it.
     let _ = std::fs::remove_file(&err_file);

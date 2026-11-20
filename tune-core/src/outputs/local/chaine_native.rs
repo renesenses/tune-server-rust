@@ -440,6 +440,7 @@ impl ReserveDeLaChaine for ReserveHttp<'_> {
         };
         match lire_l_entete_enchainee(&mut lecteur, self.force_silent) {
             Ok(entete) => {
+                lecteur.borner(entete.restant);
                 self.en_cours = Some(suivante);
                 Suivante::Prete { lecteur, entete }
             }

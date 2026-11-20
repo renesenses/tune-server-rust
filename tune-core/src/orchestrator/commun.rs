@@ -231,6 +231,20 @@ impl PlaybackOrchestrator {
             // cherche un service nommé « bandcamp » dans le registre et
             // échoue — c'est pour ça que la vue jouait dans l'onglet plutôt
             // que dans la zone (#1768).
+            // #9207 (fil 2962) — une URI reçue par le MediaRenderer qui
+            // désigne la bibliothèque de CETTE instance se joue comme la
+            // piste locale : même chaîne que l'interface web (conversion,
+            // bit-perfect, PURE), au lieu du flux HTTP brut de notre propre
+            // route, que la sortie locale ne sait pas toujours sonder (AIFF).
+            // Toute autre URI reste un flux distant.
+            if source == "upnp"
+                && let Some(track_id) = req
+                    .source_id
+                    .as_deref()
+                    .and_then(|uri| self.piste_locale_de_notre_uri(uri))
+            {
+                return Box::pin(self.resoudre_notre_uri_en_piste_locale(req, track_id)).await;
+            }
             if source == "podcast" || source == "radio" || source == "upnp" || source == "bandcamp"
             {
                 return Box::pin(self.resolve_direct_url(req)).await;
@@ -1145,6 +1159,17 @@ impl PlaybackOrchestrator {
 
     pub async fn streamer_bytes_sent(&self, stream_id: &str) -> Option<u64> {
         self.streamer.stream_bytes_sent(stream_id).await
+    }
+
+    /// #9206 — depuis combien de millisecondes ce flux est lu au-delà de
+    /// l'en-tête (voir [`AudioStreamer::stream_lecture_au_dela_de_l_en_tete_depuis_ms`]).
+    pub async fn streamer_lecture_au_dela_de_l_en_tete_depuis_ms(
+        &self,
+        stream_id: &str,
+    ) -> Option<u64> {
+        self.streamer
+            .stream_lecture_au_dela_de_l_en_tete_depuis_ms(stream_id)
+            .await
     }
 
     /// Audio servie à ce renderer, en millisecondes (voir

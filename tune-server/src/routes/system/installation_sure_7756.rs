@@ -414,7 +414,7 @@ pub(super) fn copier_durablement(src: &Path, dst: &Path) -> io::Result<()> {
 
 /// Copie récursive de `src` vers `dst` (créé), chaque fichier par `copier`,
 /// chaque dossier synchronisé après son contenu.
-fn copier_le_dossier(
+pub(super) fn copier_le_dossier(
     src: &Path,
     dst: &Path,
     copier: fn(&Path, &Path) -> io::Result<()>,

@@ -181,6 +181,8 @@ pub(crate) struct EnteteEnchainee {
     pub(crate) octets: Vec<u8>,
     pub(crate) spec: AudioSpec,
     pub(crate) data_offset: usize,
+    /// Octets audio restant après l'amorce, ou WAV en continu sans borne.
+    pub(crate) restant: Option<u64>,
 }
 
 impl EnteteEnchainee {
@@ -254,7 +256,9 @@ pub(crate) fn lire_l_entete_enchainee<R: Read>(
         info!("local_audio_gapless_next_not_wav_falling_back");
         return Err(RefusDEnchainement::PasDuWav);
     };
+    let restant = super::borner_donnees_wav(&mut octets, data_offset);
     Ok(EnteteEnchainee {
+        restant,
         octets,
         spec,
         data_offset,

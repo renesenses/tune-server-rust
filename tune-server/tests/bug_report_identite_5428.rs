@@ -129,7 +129,9 @@ fn app(base: &str, reglages: &[(&str, &str)]) -> axum::Router {
     for (cle, valeur) in reglages {
         settings.set(cle, valeur).unwrap();
     }
-    tune_server::routes::router(state)
+    tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+    ))
 }
 
 async fn poster(app: &axum::Router, ct: &str, corps: Vec<u8>) -> (StatusCode, Value) {

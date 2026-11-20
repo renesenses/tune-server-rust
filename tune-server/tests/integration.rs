@@ -778,7 +778,10 @@ async fn telemetry_snapshot_dit_l_etat_effectif() {
 
 #[tokio::test]
 async fn telemetry_toggle() {
-    let app = make_app();
+    // La bascule se règle depuis cette machine (authentification coupée).
+    let app = make_app().layer(axum::extract::connect_info::MockConnectInfo(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+    ));
 
     // #3383 : la bascule se lit dans les DEUX sens. Ce temoin n'en verifiait
     // qu'un, et c'etait celui qui ne prouve rien — re-cocher ce qui etait deja

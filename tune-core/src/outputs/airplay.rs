@@ -274,7 +274,12 @@ impl AirplayOutput {
             paused: Arc::new(AtomicBool::new(false)),
             position_ms: Arc::new(AtomicU64::new(0)),
             duration_ms: Arc::new(AtomicU64::new(0)),
-            volume: Arc::new(Mutex::new(1.0)),
+            // #8855 — jamais la pleine échelle : `set_mute(false)` renvoie ce
+            // niveau au récepteur. La découverte le sème ensuite du volume
+            // mémorisé de la zone (`ensemencer_depuis_la_base`).
+            volume: Arc::new(Mutex::new(
+                super::airplay2::volume_de_depart_8402::VOLUME_DE_DEPART_PRUDENT,
+            )),
             volume_en_attente: Arc::new(Mutex::new(None)),
             muted: Arc::new(AtomicBool::new(false)),
             current_title: Arc::new(Mutex::new(None)),
@@ -752,6 +757,27 @@ impl AirplayOutput {
                 self.volume_en_attente.lock().await.get_or_insert(volume);
             }
         }
+    }
+}
+
+impl AirplayOutput {
+    /// #8855 — sème la sortie qui vient de naître du volume mémorisé de sa
+    /// zone (limite de sécurité comprise) et de sa sourdine. Sans graine, un
+    /// dé-sourdinage avant tout geste de volume renvoyait le niveau de
+    /// naissance, autrefois 1.0 (0 dB, le maximum AirPlay). La règle « PURE
+    /// verrouillé part à 0 % » de la décision du 11/11 reste propre à
+    /// AirPlay 2.
+    pub async fn ensemencer_depuis_la_base(&self, db: &Arc<dyn crate::db::backend::DbBackend>) {
+        let (volume, sourdine) =
+            super::airplay2::volume_de_depart_8402::volume_memorise_borne(db, &self.device_id);
+        *self.volume.lock().await = volume;
+        self.muted.store(sourdine, Ordering::SeqCst);
+        info!(
+            device = %self.name,
+            volume,
+            muted = sourdine,
+            "airplay: starting volume seeded"
+        );
     }
 }
 
@@ -2274,3 +2300,7 @@ mod volume_hors_session_tests_2553;
 #[cfg(test)]
 #[path = "airplay_sourdine_hors_session_tests_8151.rs"]
 mod sourdine_hors_session_tests_8151;
+
+#[cfg(test)]
+#[path = "airplay_volume_de_depart_tests_8855.rs"]
+mod volume_de_depart_tests_8855;

@@ -496,6 +496,9 @@ pub async fn run_with(opts: RunOptions) {
     // #8325 / ESL63P — le réglage « Balises du classique » dans son miroir en
     // mémoire AVANT le premier scan : le scan le lit à chaque fichier.
     tune_core::metadata::balises_classique::charger(&state.backend);
+    // #9158 (Rob) — le réglage « Balises personnelles → tags Tune », pour la
+    // même raison : le scan le lit à chaque fichier.
+    tune_core::metadata::tags_perso::charger(&state.backend);
 
     // Auto-scan music directories at startup — et, même sans `auto_scan`,
     // la reprise d'un scan qu'une mise à jour forcée a arrêté (#5531).
@@ -1106,6 +1109,16 @@ pub fn installer_le_journal(niveau_journal: &str) -> Option<std::path::PathBuf> 
         return Some(chemin);
     }
 
+    // #9118 — aucun fichier : l'export ne retentera pas ces chemins à chaque
+    // rapport, il ira droit aux replis (journald, syslog).
+    if !refus_du_journal.is_empty() {
+        let raison = refus_du_journal
+            .iter()
+            .map(|(chemin, e)| format!("{} : {e}", chemin.display()))
+            .collect::<Vec<_>>()
+            .join(" ; ");
+        config::retenir_le_refus_du_journal(raison);
+    }
     tracing_subscriber::fmt()
         .with_timer(timer)
         .with_ansi(la_console_veut_des_couleurs())

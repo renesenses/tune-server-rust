@@ -38,6 +38,13 @@
 //!   lettres les identifiants propres à CE serveur, retenus par
 //!   [`retenir_identifiants_du_serveur`].
 //!
+//! - les noms d'appareils, de zones et de profils (#9140) : chaque nom retenu
+//!   par [`retenir_nom_d_appareil`] (appareils et serveurs découverts depuis
+//!   le démarrage, zones, profils, nom annoncé du serveur) devient un jeton
+//!   stable, `[appareil 3]`, `[zone 2]`, `[profil 1]` ; en filet, les noms
+//!   personnels reconnus à leur forme (« X’s MacBook », « iPhone de X »,
+//!   « Xs-MacBook-Pro ») aussi. Voir le module `appareils`.
+//!
 //! Ce qui reste, parce que c'est le diagnostic : versions, OS, modèles, type de
 //! serveur, adresses IP du réseau local, ports, compteurs.
 //!
@@ -48,6 +55,9 @@ use std::sync::{LazyLock, RwLock};
 
 use regex::{Captures, Regex};
 use serde_json::Value;
+
+mod appareils;
+pub use appareils::{NUMEROTES_MAX, Registre, Seance, Sorte, est_nom_de_materiel};
 
 pub use crate::secrets::MASQUE;
 
@@ -291,6 +301,27 @@ pub fn retenir_identifiants_du_serveur(settings: &crate::db::settings_repo::Sett
     }
 }
 
+/// Retient le nom d'un appareil, d'une zone ou d'un profil : il sortira sous
+/// un jeton stable (`[appareil 3]`, `[zone 2]`) de tout ce que nettoie
+/// [`anonymiser`] (#9140). Appelé par la découverte à chaque appareil vu, et
+/// par chaque porte de sortie juste avant de nettoyer. `materiels` : les
+/// « fabricant modèle » connus — un nom qui n'est que le matériel
+/// (« Marantz NR1711 ») n'est pas retenu, c'est du diagnostic.
+pub fn retenir_nom_d_appareil(sorte: Sorte, nom: &str, materiels: &[String]) {
+    appareils::retenir(sorte, nom, materiels);
+}
+
+/// Le « fabricant modèle » d'un appareil, pour [`retenir_nom_d_appareil`].
+pub fn materiel(fabricant: Option<&str>, modele: Option<&str>) -> String {
+    [fabricant, modele]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn identifiants_prives() -> Vec<String> {
     IDENTIFIANTS_PRIVES
         .read()
@@ -514,7 +545,23 @@ pub fn anonymiser(texte: &str) -> String {
 /// [`anonymiser`], le nom d'utilisateur local donné explicitement — pour les
 /// épreuves, qui ne doivent pas dépendre du compte qui les exécute.
 pub fn anonymiser_avec(texte: &str, utilisateur: Option<&str>) -> String {
-    nettoyer(texte, utilisateur, &identifiants_prives())
+    nettoyer(
+        texte,
+        utilisateur,
+        &identifiants_prives(),
+        Some(&mut appareils::seance()),
+    )
+}
+
+/// [`anonymiser_json`] SANS la passe des noms d'appareils, de zones et de
+/// profils : pour l'assistant IA seulement, qui pseudonymise lui-même ces
+/// noms (`<appareil-1>`) et les rétablit à l'écran. Rien de ce qui part sur
+/// le forum n'y passe (le résumé joint à un rapport repasse par
+/// [`anonymiser`]).
+pub fn anonymiser_json_garder_appareils(valeur: &mut Value) {
+    let utilisateur = utilisateur_local();
+    let prives = identifiants_prives();
+    parcourir_json(valeur, &mut |s| nettoyer(s, utilisateur, &prives, None));
 }
 
 /// Masque ce qui ouvre ou désigne l'accès distant à ce serveur, et RIEN
@@ -525,14 +572,33 @@ pub fn anonymiser_avec(texte: &str, utilisateur: Option<&str>) -> String {
 /// C'est la porte commune de tout ce qui part vers le site : les mots du
 /// testeur (titre, description, sujet et corps d'un ticket) y passent seuls,
 /// le diagnostic y passe par [`anonymiser`], qui commence par elle.
+/// Le marqueur de la ligne qui porte le code d'activation de
+/// l'authentification. Le serveur l'écrit sur sa CONSOLE seulement ; toute
+/// ligne qui le porte est retirée de ce qui sort (journal servi par l'API,
+/// rapport de bogue, ticket, assistant) — cas d'une sortie d'erreur
+/// redirigée dans le fichier journal, ou d'un repli sur `journalctl`.
+pub const MARQUEUR_CODE_ACTIVATION: &str = "TUNE-ACTIVATION-CODE";
+
+/// Retire les lignes qui portent [`MARQUEUR_CODE_ACTIVATION`].
+pub fn retirer_les_codes_d_activation(texte: &str) -> String {
+    if !texte.contains(MARQUEUR_CODE_ACTIVATION) {
+        return texte.to_string();
+    }
+    texte
+        .split_inclusive('\n')
+        .filter(|ligne| !ligne.contains(MARQUEUR_CODE_ACTIVATION))
+        .collect()
+}
+
 pub fn masquer_acces_distant(texte: &str) -> String {
     acces_distant(texte, &identifiants_prives())
 }
 
 fn acces_distant(texte: &str, prives: &[String]) -> String {
+    // Le code d'activation de l'authentification ne sort jamais.
+    let mut texte = retirer_les_codes_d_activation(texte);
     // Les identifiants de ce serveur d'abord, en entier : une expression
     // plus loin pourrait n'en masquer qu'une partie.
-    let mut texte = texte.to_string();
     for id in prives {
         if let Ok(re_id) = Regex::new(&format!("(?i){}", regex::escape(id))) {
             texte = re_id.replace_all(&texte, MASQUE).into_owned();
@@ -567,8 +633,20 @@ fn acces_distant(texte: &str, prives: &[String]) -> String {
 }
 
 /// Le nettoyage complet, les identifiants de ce serveur donnés explicitement.
-fn nettoyer(texte: &str, utilisateur: Option<&str>, prives: &[String]) -> String {
+fn nettoyer(
+    texte: &str,
+    utilisateur: Option<&str>,
+    prives: &[String],
+    appareils: Option<&mut Seance>,
+) -> String {
     let t = acces_distant(texte, prives);
+    // Les noms d'appareils AVANT les MAC et le nom d'utilisateur : un nom
+    // retenu (« Salon_aabbccddeeff », « Jean’s MacBook ») ne serait plus
+    // reconnu une fois entamé par une autre passe.
+    let t = match appareils {
+        Some(noms) => noms.masquer(&t),
+        None => t,
+    };
     let t = RE_CLE_VALEUR.replace_all(&t, |c: &Captures| {
         if est_personnel(&c[1]) {
             format!("{}{}{MASQUE}", &c[1], &c[2])
@@ -627,18 +705,31 @@ pub fn anonymiser_json(valeur: &mut Value) {
 }
 
 /// [`anonymiser_json`], le nom d'utilisateur local donné explicitement.
+///
+/// Tout le document est UNE séance (#9140) : un nom d'appareil trouvé par le
+/// filet garde le même jeton d'un champ à l'autre.
 pub fn anonymiser_json_avec(valeur: &mut Value, utilisateur: Option<&str>) {
+    let prives = identifiants_prives();
+    let mut seance = appareils::seance();
+    parcourir_json(valeur, &mut |s| {
+        nettoyer(s, utilisateur, &prives, Some(&mut seance))
+    });
+}
+
+fn parcourir_json(valeur: &mut Value, nettoie: &mut dyn FnMut(&str) -> String) {
     match valeur {
-        Value::String(s) => *s = anonymiser_avec(s, utilisateur),
-        Value::Array(items) => items
-            .iter_mut()
-            .for_each(|v| anonymiser_json_avec(v, utilisateur)),
+        Value::String(s) => *s = nettoie(s),
+        Value::Array(items) => {
+            for v in items.iter_mut() {
+                parcourir_json(v, &mut *nettoie);
+            }
+        }
         Value::Object(carte) => {
             for (cle, v) in carte.iter_mut() {
                 if est_personnel(cle) && matches!(v, Value::String(_) | Value::Number(_)) {
                     *v = Value::String(MASQUE.to_string());
                 } else {
-                    anonymiser_json_avec(v, utilisateur);
+                    parcourir_json(v, &mut *nettoie);
                 }
             }
         }
@@ -661,6 +752,22 @@ pub fn anonymiser_champ(texte: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn le_code_d_activation_ne_sort_jamais() {
+        let journal = format!(
+            "INFO demarrage\n{MARQUEUR_CODE_ACTIVATION} K7QXR2MZPA — Tune : code\nERROR fin\n"
+        );
+        for sortie in [
+            anonymiser_avec(&journal, None),
+            masquer_acces_distant(&journal),
+            retirer_les_codes_d_activation(&journal),
+        ] {
+            assert!(!sortie.contains("K7QXR2MZPA"), "{sortie}");
+            assert!(sortie.contains("INFO demarrage"), "{sortie}");
+            assert!(sortie.contains("ERROR fin"), "{sortie}");
+        }
+    }
     use super::*;
     use serde_json::json;
 
@@ -865,8 +972,13 @@ mod tests {
 
     #[test]
     fn nom_d_utilisateur_local() {
+        let sortie = anonymiser_avec("Serveur Plex (Jdupont-NAS)", Some("jdupont"));
+        assert_eq!(sortie, "Serveur Plex (<utilisateur>-NAS)");
+        // #9140 — un nom de machine « MacBook-Pro-de-<nom> » part entier, sous
+        // un jeton d'appareil.
         let sortie = anonymiser_avec("Serveur Plex (MacBook-Pro-de-Jdupont)", Some("jdupont"));
-        assert_eq!(sortie, "Serveur Plex (MacBook-Pro-de-<utilisateur>)");
+        assert!(!sortie.contains("dupont"), "{sortie}");
+        assert!(sortie.starts_with("Serveur Plex ([appareil"), "{sortie}");
         // Un compte générique n'efface pas un mot du diagnostic.
         assert_eq!(anonymiser_avec("Tune music", Some("tune")), "Tune music");
     }
@@ -954,7 +1066,12 @@ mod tests {
 
     #[test]
     fn acces_distant_masque_dans_un_journal() {
-        let sortie = nettoyer(&journal_d_acces_distant(), None, &[]);
+        let sortie = nettoyer(
+            &journal_d_acces_distant(),
+            None,
+            &[],
+            Some(&mut Seance::vide()),
+        );
         for fuite in [
             SID,
             JETON,
@@ -979,7 +1096,11 @@ mod tests {
         ] {
             assert!(sortie.contains(garde), "« {garde} » a disparu :\n{sortie}");
         }
-        assert_eq!(nettoyer(&sortie, None, &[]), sortie, "non idempotent");
+        assert_eq!(
+            nettoyer(&sortie, None, &[], Some(&mut Seance::vide())),
+            sortie,
+            "non idempotent"
+        );
     }
 
     /// L'identifiant de CE serveur, retenu, part même écrit sans clé ; un
@@ -992,13 +1113,18 @@ mod tests {
             SID.to_uppercase(),
             JETON
         );
-        let sortie = nettoyer(&texte, None, &[SID.to_string(), JETON.to_string()]);
+        let sortie = nettoyer(
+            &texte,
+            None,
+            &[SID.to_string(), JETON.to_string()],
+            Some(&mut Seance::vide()),
+        );
         assert!(!sortie.to_lowercase().contains(SID), "{sortie}");
         assert!(!sortie.contains(JETON), "{sortie}");
         assert!(sortie.contains(zone), "la zone a disparu : {sortie}");
         // Sans l'identifiant retenu, un UUID v4 nu reste : c'est le registre
         // qui le masque, pas une expression.
-        let sans = nettoyer(&texte, None, &[]);
+        let sans = nettoyer(&texte, None, &[], Some(&mut Seance::vide()));
         assert!(sans.to_lowercase().contains(SID), "{sans}");
     }
 
@@ -1155,5 +1281,72 @@ mod tests {
             "{texte}"
         );
         assert!(texte.contains("INFO rien a cacher"), "{texte}");
+    }
+
+    /// #9140 — de bout en bout, par la porte du rapport : les noms retenus et
+    /// ceux du filet sortent sous un jeton, le même partout dans le document.
+    #[test]
+    fn noms_d_appareils_masques_dans_le_rapport() {
+        retenir_nom_d_appareil(Sorte::Appareil, "Ysaline’s HomePod Synth9140", &[]);
+        retenir_nom_d_appareil(Sorte::Zone, "Grenier de Wenceslas9140", &[]);
+        let mut rapport = json!({
+            "zones": {"items": [{"name": "Grenier de Wenceslas9140", "output_type": "airplay"}]},
+            "logs": "INFO raop: Ysaline's HomePod Synth9140 volume=0.5\n\
+                     INFO raop: Ysaline’s HomePod Synth9140 id=airplay-a0b1c2d3e4f5\n\
+                     INFO raop: Xavierine’s MacBook host=192.168.1.20\n\
+                     INFO zone Grenier de Wenceslas9140 prête",
+            "markdown": "- Grenier de Wenceslas9140 (airplay)\n- Xavierine’s MacBook",
+        });
+        anonymiser_json_avec(&mut rapport, None);
+        let texte = rapport.to_string();
+        for fuite in ["Ysaline", "Wenceslas", "Xavierine"] {
+            assert!(!texte.contains(fuite), "« {fuite} » sort encore : {texte}");
+        }
+        let logs = rapport["logs"].as_str().unwrap();
+        let jeton_homepod = logs
+            .split(" volume=0.5")
+            .next()
+            .unwrap()
+            .rsplit("raop: ")
+            .next()
+            .unwrap();
+        assert!(jeton_homepod.starts_with("[appareil "), "{logs}");
+        assert_eq!(
+            logs.matches(jeton_homepod).count(),
+            2,
+            "jeton instable : {logs}"
+        );
+        assert!(logs.contains("id=airplay-a0b1c2xxxxxx"), "{logs}");
+        assert!(logs.contains("host=192.168.1.20"), "{logs}");
+        let zone = rapport["zones"]["items"][0]["name"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(zone.starts_with("[zone "), "{zone}");
+        let md = rapport["markdown"].as_str().unwrap();
+        assert!(md.contains(&format!("- {zone} (airplay)")), "{md}");
+        assert!(logs.contains(&format!("zone {zone} prête")), "{logs}");
+        // Le nom trouvé par le filet garde son jeton d'un champ à l'autre.
+        let jeton_macbook = logs
+            .split(" host=192.168.1.20")
+            .next()
+            .unwrap()
+            .rsplit("raop: ")
+            .next()
+            .unwrap();
+        assert!(jeton_macbook.starts_with("[appareil "), "{logs}");
+        assert!(md.ends_with(&format!("- {jeton_macbook}")), "{md}");
+        // Idempotent.
+        let mut encore = rapport.clone();
+        anonymiser_json_avec(&mut encore, None);
+        assert_eq!(encore, rapport);
+        // La variante de l'assistant garde les noms (il les pseudonymise
+        // lui-même), mais nettoie le reste.
+        let mut assistant =
+            json!({"logs": "INFO zone Grenier de Wenceslas9140 prête token=abcdef0123456789"});
+        anonymiser_json_garder_appareils(&mut assistant);
+        let logs = assistant["logs"].as_str().unwrap();
+        assert!(logs.contains("Grenier de Wenceslas9140"), "{logs}");
+        assert!(!logs.contains("abcdef0123456789"), "{logs}");
     }
 }

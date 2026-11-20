@@ -81,6 +81,7 @@ impl Zone {
             ),
             voies_pilotees: false,
             fondu_ms: 0,
+            surechantillonnage_voulu: false,
         }
     }
 }
@@ -288,6 +289,248 @@ fn le_chemin_partage_reste_pris_hors_du_cas_natif_6734() {
     ] {
         assert_eq!(chemin_natif_s32(&conditions), Err(motif));
     }
+}
+
+/// #9165 (fil 2945) — une source PCM entière 32 bits, au volume unité, sans
+/// autre DSP : le cas même du chemin natif. Le greffon de suréchantillonnage
+/// que l'ouverture partagée porterait doit le faire céder ; sans greffon, ou
+/// quand l'ouverture partagée l'écarterait (PURE, DoP, sortie double,
+/// bit-perfect strict), le natif reste pris.
+#[test]
+fn le_greffon_arme_fait_ceder_le_chemin_natif_9165() {
+    use super::super::diagnostic_surechantillonnage_8259::{
+        GreffonAvantLeNatif, choix_admis_pour_test, greffon_avant_le_natif,
+    };
+    let zone = Zone::au_repos();
+    let s32 = spec(ProfondeurPcm::Entier32);
+    let amorce = octets_le(&mots_de_test());
+    let choix = choix_admis_pour_test();
+    let voulu = |arme: bool, pure: bool, dop: bool, double: bool, strict: bool| ConditionsDuNatif {
+        surechantillonnage_voulu: greffon_avant_le_natif(
+            arme.then_some(&choix),
+            s32,
+            &amorce,
+            pure,
+            dop,
+            double,
+            strict,
+        ) == GreffonAvantLeNatif::Voulu,
+        ..zone.conditions(s32, UNITE_DU_GAIN_DE_RENDU)
+    };
+    assert!(zone.conditions(s32, UNITE_DU_GAIN_DE_RENDU).dsp_identite);
+    assert_eq!(
+        chemin_natif_s32(&voulu(false, false, false, false, false)),
+        Ok(())
+    );
+    assert_eq!(
+        chemin_natif_s32(&voulu(true, false, false, false, false)),
+        Err(MotifDuCheminPartage::SurechantillonnageDemande),
+        "greffon armé : le chemin natif ne doit pas être pris (#9165)"
+    );
+    assert_eq!(
+        MotifDuCheminPartage::SurechantillonnageDemande.code(),
+        "surechantillonnage_demande"
+    );
+    for (pure, dop, double, strict) in [
+        (true, false, false, false),
+        (false, true, false, false),
+        (false, false, true, false),
+        (false, false, false, true),
+    ] {
+        assert_eq!(
+            chemin_natif_s32(&voulu(true, pure, dop, double, strict)),
+            Ok(()),
+            "l'ouverture partagée écarterait le greffon : rien à céder \
+             (pure={pure} dop={dop} double={double} strict={strict})"
+        );
+    }
+}
+
+/// #9165 (relecture) — la frontière de la chaîne native applique EXACTEMENT
+/// la règle de l'ouverture : un greffon que la sortie double ou le strict
+/// écartent ne coupe pas la chaîne (sinon gapless perdu à chaque piste, et
+/// rien de suréchantillonné).
+#[test]
+fn la_frontiere_applique_la_regle_de_l_ouverture_9165() {
+    use super::super::diagnostic_surechantillonnage_8259::choix_admis_pour_test;
+    let s32 = spec(ProfondeurPcm::Entier32);
+    let choix = std::sync::Mutex::new(Some(choix_admis_pour_test()));
+    let pure = AtomicBool::new(false);
+    let dop = AtomicBool::new(false);
+    let voulu = |double: bool, strict: bool| {
+        greffon_voulu_a_la_frontiere(&FrontiereDuGreffon {
+            choix: &choix,
+            spec: s32,
+            pure_bypass: &pure,
+            dop_active: &dop,
+            sortie_double: double,
+            strict_bitperfect: strict,
+        })
+    };
+    assert!(voulu(false, false));
+    assert!(!voulu(true, false), "sortie double : la chaîne continue");
+    assert!(
+        !voulu(false, true),
+        "bit-perfect strict : la chaîne continue"
+    );
+    pure.store(true, Ordering::SeqCst);
+    assert!(!voulu(false, false), "PURE contourne le greffon");
+    pure.store(false, Ordering::SeqCst);
+    dop.store(true, Ordering::SeqCst);
+    assert!(!voulu(false, false), "porteur DoP");
+    dop.store(false, Ordering::SeqCst);
+    *choix.lock().unwrap() = None;
+    assert!(!voulu(false, false), "aucun greffon armé");
+}
+
+/// #9165 — l'hôte RÉEL de la chaîne native (`HoteAlsaNatif`, `ReserveHttp`)
+/// à la frontière : greffon armé et porté → `RienEnReserve`, la suivante
+/// reste en réserve pour `play_url` ; sortie double → la réserve est bien
+/// consultée (la suivante, injoignable ici, est refusée), la chaîne n'est
+/// pas coupée par le greffon.
+#[test]
+fn la_chaine_native_cede_la_suivante_au_greffon_9165() {
+    use super::super::chaine_native::{FinDeChaine, accepter_la_suivante};
+    use super::super::diagnostic_surechantillonnage_8259::choix_admis_pour_test;
+    let zone = Zone::au_repos();
+    let s32 = spec(ProfondeurPcm::Entier32);
+    let choix = std::sync::Mutex::new(Some(choix_admis_pour_test()));
+    let unite = AtomicU32::new(UNITE_DU_GAIN_DE_RENDU);
+    let (volume, user_volume, rg) = (
+        Arc::new(AtomicU32::new(UNITE_DU_GAIN_DE_RENDU)),
+        Arc::new(AtomicU32::new(UNITE_DU_GAIN_DE_RENDU)),
+        Arc::new(AtomicU32::new(UNITE_DU_GAIN_DE_RENDU)),
+    );
+    let force_silent = Arc::new(AtomicBool::new(false));
+    let (position, duree, seek) = (AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0));
+    let (fin, generation) = (AtomicBool::new(false), AtomicU64::new(0));
+    let dop = AtomicBool::new(false);
+    let (uri, titre, artiste) = (
+        std::sync::Mutex::new(None),
+        std::sync::Mutex::new(None),
+        std::sync::Mutex::new(None),
+    );
+    let (_stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
+    for (double, attendu, reste_en_reserve) in [
+        (false, FinDeChaine::RienEnReserve, true),
+        (true, FinDeChaine::SuivanteRefusee, false),
+    ] {
+        let next_media = std::sync::Mutex::new(Some(PendingNextMedia {
+            url: "http://127.0.0.1:9/piste-suivante.wav".into(),
+            title: None,
+            artist: None,
+            duration_ms: None,
+            consigne_de_fondu: Default::default(),
+        }));
+        let mut publier = |_dop: bool, _intact: bool| {};
+        let mut hote = HoteAlsaNatif {
+            stop_rx: &stop_rx,
+            position_ms: &position,
+            publier: &mut publier,
+            greffon: FrontiereDuGreffon {
+                choix: &choix,
+                spec: s32,
+                pure_bypass: &zone.pure_bypass,
+                dop_active: &dop,
+                sortie_double: double,
+                strict_bitperfect: false,
+            },
+            reserve: ReserveHttp {
+                force_silent: &force_silent,
+                position_ms: &position,
+                next_media: &next_media,
+                en_cours: None,
+                current_uri: &uri,
+                track_title: &titre,
+                track_artist: &artiste,
+                duration_ms: &duree,
+                seek_offset_ms: &seek,
+                track_ended_naturally: &fin,
+                track_ended_generation: &generation,
+                dop_active: &dop,
+                volume: &volume,
+                user_volume: &user_volume,
+                rg_factor: &rg,
+            },
+        };
+        let mut etage = EtageNatif::monter(
+            s32,
+            FormatOuvert::new(CADENCE, 2),
+            &unite,
+            &zone.eq,
+            &zone.convolver,
+            &zone.crossfeed,
+            &zone.pure_bypass,
+            &zone.mono_downmix,
+        );
+        let issue = accepter_la_suivante(&mut hote, &mut etage).map(|_| ());
+        assert_eq!(issue, Err(attendu), "sortie double = {double}");
+        assert_eq!(
+            next_media.lock().unwrap().is_some(),
+            reste_en_reserve,
+            "sortie double = {double}"
+        );
+    }
+}
+
+/// #9165 (fil 2945, réponse 11772) — le chemin RÉEL : une sortie locale
+/// reçoit toujours un WAV entier 32 bits (`local_needs_wav` → 32), quelle que
+/// soit la source. Un FLAC 16 ou 24 bits (ou un flux Qobuz) arrive donc en
+/// `Entier32`, mots alignés à gauche, bits bas nuls : le greffon armé doit
+/// faire céder le natif exactement comme pour une vraie source 32 bits.
+#[test]
+fn une_source_16_ou_24_bits_servie_en_wav_32_bits_cede_au_greffon_9165() {
+    use super::super::diagnostic_surechantillonnage_8259::{
+        GreffonAvantLeNatif, choix_admis_pour_test, greffon_avant_le_natif,
+    };
+    let zone = Zone::au_repos();
+    let s32 = AudioSpec::nouvelle(96_000, ProfondeurPcm::Entier32, 2).unwrap();
+    let choix = choix_admis_pour_test();
+    for bits_source in [16u32, 24] {
+        let decalage = 32 - bits_source;
+        let elargis: Vec<i32> = mots_de_test()
+            .iter()
+            .map(|m| (m >> decalage) << decalage)
+            .collect();
+        assert!(elargis.iter().all(|m| m & ((1 << decalage) - 1) == 0));
+        let amorce = octets_le(&elargis);
+        let conditions = |arme: bool| ConditionsDuNatif {
+            surechantillonnage_voulu: greffon_avant_le_natif(
+                arme.then_some(&choix),
+                s32,
+                &amorce,
+                false,
+                false,
+                false,
+                false,
+            ) == GreffonAvantLeNatif::Voulu,
+            ..zone.conditions(s32, UNITE_DU_GAIN_DE_RENDU)
+        };
+        assert_eq!(
+            chemin_natif_s32(&conditions(true)),
+            Err(MotifDuCheminPartage::SurechantillonnageDemande),
+            "source {bits_source} bits servie en WAV 32 bits, greffon armé (#9165)"
+        );
+        assert_eq!(chemin_natif_s32(&conditions(false)), Ok(()));
+    }
+}
+
+/// Garde de branchement #9165 : `play_url` passe le choix de la zone aux
+/// conditions du natif, et le bras le relit à la frontière.
+#[test]
+fn play_url_passe_le_greffon_au_chemin_natif_9165() {
+    let local = include_str!("../local.rs");
+    let conditions = local
+        .find("let conditions = bras_alsa_natif::ConditionsDuNatif {")
+        .expect("conditions du natif");
+    let regle = local
+        .find("bras_alsa_natif::chemin_natif_s32(&conditions)")
+        .expect("règle du natif");
+    let voulu = local
+        .find("surechantillonnage_voulu:")
+        .expect("le choix de suréchantillonnage doit entrer dans les conditions");
+    assert!(conditions < voulu && voulu < regle);
+    assert!(local.contains("surechantillonnage: &surechantillonnage,"));
 }
 
 /// Le volume baissé EN COURS de piste sur le chemin natif : appliqué dans le
