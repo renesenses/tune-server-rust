@@ -43,12 +43,13 @@ impl PositionPoller {
                     tracing::warn!(zone_id = s.zone_id, error = %e, "reprise_contexte_non_retiree");
                 }
                 if let Some(np) = s.now_playing.as_ref().filter(|np| np.source == "podcast") {
-                    if let Err(e) = crate::db::listening_resume::podcast_started_in_context(
+                    if let Err(e) = crate::db::listening_resume::podcast_started_du_profil(
                         &self.db,
                         s.zone_id,
                         np,
                         s.position_ms,
                         s.session_context_id.as_deref(),
+                        s.session_profile_id,
                     ) {
                         tracing::warn!(zone_id = s.zone_id, error = %e, "reprise_podcast_non_enregistree");
                     }

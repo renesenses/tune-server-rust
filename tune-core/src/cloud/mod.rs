@@ -13,6 +13,7 @@ pub mod library_sync;
 pub mod logos_labels_partages;
 pub mod mesures_communautaires;
 pub mod metadata_proposals;
+pub mod nom_de_profil;
 pub mod notes_communautaires;
 pub mod plateforme;
 pub mod playlist_hub;

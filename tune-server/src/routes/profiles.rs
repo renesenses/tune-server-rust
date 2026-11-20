@@ -272,10 +272,32 @@ async fn get_active_profile(State(state): State<AppState>) -> Json<Value> {
     }))
 }
 
+/// Refus d'un geste sur un autre profil que le sien, réservé à
+/// l'administrateur quand l'authentification est active.
+fn refus_profil_d_autrui() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "admin_required",
+            "code": "admin_required",
+            "message": "Only an administrator can create, change or remove another profile.",
+        })),
+    )
+        .into_response()
+}
+
+/// Choisir le profil actif du serveur : le sien, ou n'importe lequel pour qui
+/// administre le foyer (`VueDuFoyer` : l'administrateur quand
+/// l'authentification est active, tout appelant sinon).
 async fn switch_profile(
     State(state): State<AppState>,
+    crate::routes::active_profile::ActiveProfile(moi): crate::routes::active_profile::ActiveProfile,
+    crate::routes::history::VueDuFoyer(foyer): crate::routes::history::VueDuFoyer,
     Json(body): Json<SwitchProfile>,
-) -> impl IntoResponse {
+) -> Response {
+    if body.profile_id != moi && !foyer {
+        return refus_profil_d_autrui();
+    }
     let repo = ProfileRepo::with_backend(state.backend.clone());
     match repo.get(body.profile_id) {
         Ok(Some(profile)) => {
@@ -295,13 +317,31 @@ async fn switch_profile(
     }
 }
 
-async fn deactivate_profile(State(state): State<AppState>) -> Json<Value> {
+/// Revenir au profil par défaut : même règle que [`switch_profile`] (le
+/// profil par défaut est le sien, ou l'appelant administre le foyer).
+async fn deactivate_profile(
+    State(state): State<AppState>,
+    crate::routes::active_profile::ActiveProfile(moi): crate::routes::active_profile::ActiveProfile,
+    crate::routes::history::VueDuFoyer(foyer): crate::routes::history::VueDuFoyer,
+) -> Response {
+    if moi != crate::routes::active_profile::DEFAULT_PROFILE_ID && !foyer {
+        return refus_profil_d_autrui();
+    }
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
     settings.set("active_profile_id", "1").ok();
-    Json(json!({ "active_profile_id": serde_json::Value::Null }))
+    Json(json!({ "active_profile_id": serde_json::Value::Null })).into_response()
 }
 
-async fn activate_profile(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+/// Même règle que [`switch_profile`].
+async fn activate_profile(
+    State(state): State<AppState>,
+    crate::routes::active_profile::ActiveProfile(moi): crate::routes::active_profile::ActiveProfile,
+    crate::routes::history::VueDuFoyer(foyer): crate::routes::history::VueDuFoyer,
+    Path(id): Path<i64>,
+) -> Response {
+    if id != moi && !foyer {
+        return refus_profil_d_autrui();
+    }
     let repo = ProfileRepo::with_backend(state.backend.clone());
     match repo.get(id) {
         Ok(Some(profile)) => {
@@ -328,10 +368,16 @@ async fn get_profile(State(state): State<AppState>, Path(id): Path<i64>) -> impl
     }
 }
 
+/// Créer un profil : l'administrateur quand l'authentification est active
+/// (un profil y est un compte).
 async fn create_profile(
     State(state): State<AppState>,
+    crate::routes::history::VueDuFoyer(foyer): crate::routes::history::VueDuFoyer,
     Json(body): Json<CreateProfile>,
-) -> impl IntoResponse {
+) -> Response {
+    if !foyer {
+        return refus_profil_d_autrui();
+    }
     let repo = ProfileRepo::with_backend(state.backend.clone());
 
     // Free tier: max 1 profile (the default). Premium: unlimited.
@@ -364,11 +410,17 @@ async fn create_profile(
     }
 }
 
+/// Renommer un profil : le sien, ou un autre pour l'administrateur.
 async fn update_profile(
     State(state): State<AppState>,
+    crate::routes::active_profile::ActiveProfile(moi): crate::routes::active_profile::ActiveProfile,
+    crate::routes::history::VueDuFoyer(foyer): crate::routes::history::VueDuFoyer,
     Path(id): Path<i64>,
     Json(body): Json<UpdateProfile>,
-) -> impl IntoResponse {
+) -> Response {
+    if id != moi && !foyer {
+        return refus_profil_d_autrui();
+    }
     let repo = ProfileRepo::with_backend(state.backend.clone());
     match repo.update(id, body.name.as_deref(), body.avatar_color.as_deref()) {
         Ok(_) => {
@@ -385,9 +437,19 @@ async fn update_profile(
     }
 }
 
-async fn delete_profile(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+/// Supprimer un profil : l'administrateur seulement (authentification
+/// active). Ses écoutes partent avec lui : orphelines, elles ne seraient plus
+/// visibles de personne mais compteraient encore dans le foyer.
+async fn delete_profile(
+    State(state): State<AppState>,
+    crate::routes::history::VueDuFoyer(foyer): crate::routes::history::VueDuFoyer,
+    Path(id): Path<i64>,
+) -> Response {
+    if !foyer {
+        return refus_profil_d_autrui();
+    }
     let repo = ProfileRepo::with_backend(state.backend.clone());
-    match repo.delete(id) {
+    match repo.delete_avec_ses_ecoutes(id) {
         Ok(_) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
     }
@@ -985,7 +1047,17 @@ async fn remove_facet_favorite(
 
 // --- Advanced profile routes ---
 
-async fn profile_settings(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
+/// Les préférences d'un profil : les siennes, ou celles d'un autre pour
+/// l'administrateur (authentification active).
+async fn profile_settings(
+    State(state): State<AppState>,
+    crate::routes::active_profile::ActiveProfile(moi): crate::routes::active_profile::ActiveProfile,
+    crate::routes::history::VueDuFoyer(foyer): crate::routes::history::VueDuFoyer,
+    Path(id): Path<i64>,
+) -> Response {
+    if id != moi && !foyer {
+        return refus_profil_d_autrui();
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("profile_{id}_settings");
     let value = settings
@@ -994,14 +1066,20 @@ async fn profile_settings(State(state): State<AppState>, Path(id): Path<i64>) ->
         .flatten()
         .unwrap_or_else(|| "{}".to_string());
     let parsed: Value = serde_json::from_str(&value).unwrap_or(json!({}));
-    Json(parsed)
+    Json(parsed).into_response()
 }
 
+/// Même règle que [`profile_settings`].
 async fn update_profile_settings(
     State(state): State<AppState>,
+    crate::routes::active_profile::ActiveProfile(moi): crate::routes::active_profile::ActiveProfile,
+    crate::routes::history::VueDuFoyer(foyer): crate::routes::history::VueDuFoyer,
     Path(id): Path<i64>,
     Json(body): Json<Value>,
-) -> impl IntoResponse {
+) -> Response {
+    if id != moi && !foyer {
+        return refus_profil_d_autrui();
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let key = format!("profile_{id}_settings");
     let serialized = serde_json::to_string(&body).unwrap_or_else(|_| "{}".to_string());
@@ -1016,7 +1094,16 @@ async fn update_profile_settings(
     }
 }
 
-async fn profile_stats(State(state): State<AppState>, Path(id): Path<i64>) -> impl IntoResponse {
+/// Les statistiques d'un profil nommé : même règle que `profile_history`.
+async fn profile_stats(
+    State(state): State<AppState>,
+    crate::routes::active_profile::ActiveProfile(moi): crate::routes::active_profile::ActiveProfile,
+    crate::routes::history::VueDuFoyer(foyer): crate::routes::history::VueDuFoyer,
+    Path(id): Path<i64>,
+) -> axum::response::Response {
+    if id != moi && !foyer {
+        return crate::routes::history::refus_autre_profil();
+    }
     let b = &state.backend;
 
     // Favorites by type
@@ -1138,11 +1225,20 @@ async fn profile_stats(State(state): State<AppState>, Path(id): Path<i64>) -> im
     .into_response()
 }
 
+/// L'historique d'un profil nommé : le sien, ou celui d'un autre pour qui
+/// voit le foyer (`history::VueDuFoyer` : l'administrateur quand
+/// l'authentification est active) ; 403 sinon.
 async fn profile_history(
     State(state): State<AppState>,
+    crate::routes::active_profile::ActiveProfile(moi): crate::routes::active_profile::ActiveProfile,
+    crate::routes::history::VueDuFoyer(foyer): crate::routes::history::VueDuFoyer,
     Path(id): Path<i64>,
     Query(q): Query<HistoryQuery>,
-) -> Json<Value> {
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if id != moi && !foyer {
+        return crate::routes::history::refus_autre_profil();
+    }
     let limit = q.limit.unwrap_or(50);
     let profile_filter = if id == 1 {
         "(profile_id = 1 OR profile_id IS NULL)".to_string()
@@ -1177,7 +1273,7 @@ async fn profile_history(
             })
         })
         .collect();
-    Json(json!(items))
+    Json(json!(items)).into_response()
 }
 
 async fn search_profiles(
