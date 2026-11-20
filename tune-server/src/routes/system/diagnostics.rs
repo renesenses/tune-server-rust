@@ -4282,7 +4282,7 @@ pub(super) async fn api_docs() -> Json<Value> {
         (
             "GET",
             "/library/tracks/{id}/waveform",
-            "Track waveform (200-point amplitude)",
+            "Track waveform (RMS envelope, ?points=100..2000, 200 by default)",
         ),
         (
             "GET",
