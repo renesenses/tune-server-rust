@@ -1363,6 +1363,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-smart-http --lib --no-default-features --features postgres pg_comptes_collections -- --nocapture --test-threads=1
 
+      # #9265 — grille Artistes et page artiste sur la VRAIE base PostgreSQL :
+      # les collaborations (« A & B », « A feat. C ») sont reliées à leurs
+      # artistes par la règle stricte. Sans cette étape, l'épreuve prendrait son
+      # « saut annoncé » et la garde des témoins (2816) rougirait.
+      - name: Grille Artistes et collaborations sur PostgreSQL (#9265)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_9265 -- --nocapture --test-threads=1
+
       # QA 18/11 — la sauvegarde du cache (« Post Run Swatinem/rust-cache »)
       # écrit son archive sur le disque déjà plein : le 18/11, deux jobs aux
       # tests VERTS sont morts là en « No space left on device ». Les binaires
