@@ -247,7 +247,7 @@ Enregistrée sous `zone_{id}_tess_chain` (T02), échangée par
 | `invalid_settings` | 409 | réglages non conformes au schéma (niveau hôte) |
 | `must_be_last_plugin` | 409 | greffon `last_plugin` suivi d'un autre (même décoché) |
 | `mutually_exclusive` | 409 | deux membres cochés d'un groupe en politique `refuse` (le défaut) |
-| `premium_required` | **402** | greffon Premium **coché**, ou upsampling demandé, sans Premium, hors `bypass_all` |
+| `premium_required` | **402** | greffon Premium **coché**, ou upsampling demandé, sans Premium, **`bypass_all` compris** (la chaîne garde ses maillons et les anciennes clés les reçoivent) |
 
 Ce qui dépend du flux ou de l'installation n'est **pas** refusé au `PUT`
 (canaux, paquet désinstallé, droit perdu ensuite). La résolution l'éteint
@@ -467,7 +467,13 @@ l'API : `error` (= `code`), `message` (= `detail`) et, sur un 402,
      puis 402 sur ce qui **change** : un maillon ou un upsampling identique à
      la chaîne enregistrée n'est pas revérifié (la résolution l'éteint,
      `premium_required`) ; perdre le Premium ne bloque pas l'édition du reste ;
-     une correction de pièce d'origine `estimation` (C5, sans micro) est Free ;
+     une correction de pièce d'origine `estimation` (C5, sans micro) est Free.
+     Cette exemption ne vaut que si la chaîne enregistrée n'était pas sous
+     `bypass_all` : le droit est contrôlé sous `bypass_all` comme ailleurs.
+     Un maillon absent du catalogue (paquet tiers installé mais non chargé)
+     renvoyé **inchangé** est conservé tel quel au lieu d'un 409
+     `unknown_plugin`, sous la même règle de droit (Premium, comme tout
+     greffon tiers) ; modifié, il reste refusé en 409 ;
   6. `ecrire_chaine` (sous `verrou_de_zone`), puis rafraîchissement de la
      sortie vivante pour chaque ancienne clé réécrite. Un `PUT` à la fois par
      zone, de la lecture à l'écriture.

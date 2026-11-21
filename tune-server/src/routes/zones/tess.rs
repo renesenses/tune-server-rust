@@ -25,7 +25,14 @@
 //! Un maillon (ou l'upsampling) identique à la chaîne enregistrée n'est pas
 //! revérifié au droit : il ne lève rien (la résolution l'éteint,
 //! `premium_required`), et perdre le Premium ne bloque pas l'édition du reste
-//! de la chaîne.
+//! de la chaîne. Seulement si la chaîne enregistrée n'était pas sous
+//! `bypass_all` : `ChaineTess::valider` contrôle le droit sous `bypass_all`
+//! comme ailleurs, donc une chaîne enregistrée hors `bypass_all` a passé ce
+//! contrôle (ou vient des anciennes routes, qui ont le leur).
+//!
+//! Un maillon absent du catalogue (paquet tiers installé mais non chargé)
+//! renvoyé inchangé est conservé tel quel : il est validé comme un greffon
+//! tiers ([`descripteur_tiers`], Premium) au lieu d'un 409 `unknown_plugin`.
 //!
 //! **Authentification** : celle de toutes les routes de zone (couche
 //! `auth_middleware` de `/api/v1`), rien de plus.
@@ -38,7 +45,9 @@ use axum::response::Response;
 
 use tune_core::tess::TauxDsd;
 use tune_core::tess::api::{RefusTess, ReponseCatalogue, ReponseTessZone};
-use tune_core::tess::chaine::{ChaineTess, ContexteValidation, ErreurChaine, Upsampling};
+use tune_core::tess::chaine::{
+    ChaineTess, ContexteValidation, ErreurChaine, MaillonGreffon, Upsampling,
+};
 use tune_core::tess::greffon::{
     Canaux, Catalogue, Categorie, ContraintesPlace, DescripteurGreffon, Droit,
     GROUPE_CROSSFEED_CROSSTALK, Origine, PolitiqueGroupe, Position, catalogue_de_reference,
@@ -427,21 +436,38 @@ pub fn valider_le_put(
     catalogue: &Catalogue,
     premium: bool,
 ) -> Result<(), ErreurChaine> {
+    let inchange = |m: &MaillonGreffon| {
+        enregistree
+            .plugins
+            .iter()
+            .any(|e| e.id == m.id && e.enabled == m.enabled && e.settings == m.settings)
+    };
+    // Un maillon inconnu du catalogue mais inchangé (paquet tiers installé,
+    // non chargé) est gardé : validé comme un greffon tiers.
+    let mut avec_inconnus = None;
+    for m in &chaine.plugins {
+        if catalogue.get(&m.id).is_none() && id_valide(&m.id) && inchange(m) {
+            avec_inconnus
+                .get_or_insert_with(|| catalogue.clone())
+                .plugins
+                .push(descripteur_tiers(&m.id));
+        }
+    }
+    let catalogue = avec_inconnus.as_ref().unwrap_or(catalogue);
     chaine.valider(catalogue, ContexteValidation { premium: true })?;
     if premium {
         return Ok(());
     }
+    // L'exemption « inchangé » suppose que la chaîne enregistrée a passé le
+    // contrôle du droit : jamais si elle était sous `bypass_all`.
+    let exemptable = !enregistree.bypass_all;
     let mut a_payer = chaine.clone();
     for m in &mut a_payer.plugins {
-        let inchange = enregistree
-            .plugins
-            .iter()
-            .any(|e| e.id == m.id && e.enabled == m.enabled && e.settings == m.settings);
-        if inchange || correction_estimee(m) {
+        if (exemptable && inchange(m)) || correction_estimee(m) {
             m.enabled = false;
         }
     }
-    if a_payer.fixed.upsampling == enregistree.fixed.upsampling {
+    if exemptable && a_payer.fixed.upsampling == enregistree.fixed.upsampling {
         a_payer.fixed.upsampling = Upsampling::Off {};
     }
     a_payer.valider(catalogue, ContexteValidation { premium })

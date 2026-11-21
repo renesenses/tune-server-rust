@@ -471,7 +471,10 @@ impl ChaineTess {
             if d.placement.position == Position::LastPlugin && i != dernier {
                 return Err(ErreurChaine::PasEnDernier(m.id.clone()));
             }
-            if !m.enabled || self.bypass_all {
+            // `bypass_all` ne lève aucun contrôle : la chaîne enregistrée
+            // garde ses maillons, que décocher « Bypass all » rallume, et les
+            // anciennes clés les reçoivent tels quels (`ecrire_chaine`).
+            if !m.enabled {
                 continue;
             }
             if d.entitlement.demande_le_premium() && !contexte.premium {
@@ -490,7 +493,7 @@ impl ChaineTess {
                 actifs_par_groupe.push((g.id, m.id.as_str()));
             }
         }
-        if self.fixed.upsampling.demande() && !self.bypass_all && !contexte.premium {
+        if self.fixed.upsampling.demande() && !contexte.premium {
             return Err(ErreurChaine::PremiumRequis(ID_UPSAMPLING.into()));
         }
         Ok(())
@@ -785,25 +788,25 @@ mod tests {
             GRATUIT,
         )
         .unwrap();
-        // Bypass all : rien ne traite, rien n'est refusé.
+        // 402, « Bypass all » coché ou non : le droit est contrôlé de même.
         let mut c = chaine(vec![maillon("equalizer-parametric", true)]);
         c.fixed.upsampling = pcm(None);
-        c.bypass_all = true;
-        valider(&c, GRATUIT).unwrap();
-        // Contre-épreuves : 402.
-        c.bypass_all = false;
-        let e = valider(&c, GRATUIT).unwrap_err();
-        assert_eq!(
-            e,
-            ErreurChaine::PremiumRequis("equalizer-parametric".into())
-        );
-        assert_eq!(e.statut_http(), 402);
-        c.plugins.clear();
-        assert_eq!(
-            valider(&c, GRATUIT),
-            Err(ErreurChaine::PremiumRequis("upsampling".into()))
-        );
-        valider(&c, PREMIUM).unwrap();
+        for bypass in [false, true] {
+            c.bypass_all = bypass;
+            let e = valider(&c, GRATUIT).unwrap_err();
+            assert_eq!(
+                e,
+                ErreurChaine::PremiumRequis("equalizer-parametric".into())
+            );
+            assert_eq!(e.statut_http(), 402);
+            let mut sans = c.clone();
+            sans.plugins.clear();
+            assert_eq!(
+                valider(&sans, GRATUIT),
+                Err(ErreurChaine::PremiumRequis("upsampling".into()))
+            );
+            valider(&c, PREMIUM).unwrap();
+        }
     }
 
     #[test]

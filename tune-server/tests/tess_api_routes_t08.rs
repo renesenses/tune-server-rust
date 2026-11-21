@@ -591,6 +591,132 @@ async fn perdre_le_premium_ne_bloque_pas_l_edition_du_reste_t08() {
     refus_conforme(&v, 402, "premium_required");
 }
 
+// ── Droit Premium contrôlé sous `bypass_all` ────────────────────────
+
+/// Sans Premium, « Bypass all » ne lève pas le droit : sinon un premier PUT
+/// sous bypass enregistre le maillon, et un second qui décoche le bypass le
+/// trouve « inchangé ». Convolution, égaliseur paramétrique, greffon tiers
+/// et upsampling.
+#[tokio::test]
+async fn le_droit_est_controle_sous_bypass_all_en_deux_put_t08() {
+    let b = Banc::nouveau(false).await;
+    let cas = [
+        (
+            json!({"plugins": [{"id": "convolution", "enabled": true, "settings": {"ir_path": "/x.wav"}}]}),
+            "convolution",
+        ),
+        (
+            json!({"plugins": [{"id": "equalizer-parametric", "enabled": true, "settings": profil(bandes_parametriques())}]}),
+            "equalizer-parametric",
+        ),
+        (
+            json!({"fixed": {"upsampling": {"mode": "pcm", "filter": "polyvalent"}}}),
+            "upsampling",
+        ),
+    ];
+    for (partie, greffon) in &cas {
+        for bypass in [true, false] {
+            let mut corps = partie.clone();
+            corps["version"] = json!(1);
+            corps["bypass_all"] = json!(bypass);
+            let (s, v) = b.put(corps.clone()).await;
+            assert_eq!(s, StatusCode::PAYMENT_REQUIRED, "{corps} → {v}");
+            refus_conforme(&v, 402, "premium_required");
+            assert_eq!(v["plugin_id"], json!(greffon));
+            assert!(b.enregistree().is_none(), "{corps}");
+        }
+    }
+    // Une chaîne enregistrée sous bypass (par un compte Premium) n'exempte
+    // rien une fois le Premium perdu : décocher le bypass = 402.
+    for (partie, greffon) in &cas {
+        b.premium(true).await;
+        let mut corps = partie.clone();
+        corps["version"] = json!(1);
+        corps["bypass_all"] = json!(true);
+        let (s, v) = b.put(corps.clone()).await;
+        assert_eq!(s, StatusCode::OK, "{corps} → {v}");
+        b.premium(false).await;
+        corps["bypass_all"] = json!(false);
+        let (s, v) = b.put(corps.clone()).await;
+        assert_eq!(s, StatusCode::PAYMENT_REQUIRED, "{corps} → {v}");
+        refus_conforme(&v, 402, "premium_required");
+        assert_eq!(v["plugin_id"], json!(greffon));
+        assert!(b.chaine().bypass_all, "{corps} : rien n'a été écrit");
+        // Remise à zéro pour le cas suivant (Free : rien de coché).
+        b.premium(true).await;
+        let (s, _) = b
+            .put(json!({"version": 1, "bypass_all": false, "plugins": [],
+                "fixed": {"upsampling": {"mode": "off"}}}))
+            .await;
+        assert_eq!(s, StatusCode::OK);
+        b.premium(false).await;
+    }
+    // Contre-épreuve : hors bypass, le même maillon inchangé reste exempté
+    // (perdre le Premium ne bloque pas l'édition du reste).
+    b.premium(true).await;
+    let conv = json!({"id": "convolution", "enabled": true, "settings": {"ir_path": "/x.wav"}});
+    let (s, _) = b
+        .put(json!({"version": 1, "bypass_all": false, "plugins": [conv.clone()]}))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    b.premium(false).await;
+    let (s, v) = b
+        .put(json!({"version": 1, "plugins": [conv.clone(), {"id": "crossfeed", "enabled": true}]}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    // Et le compte Premium passe partout, bypass compris.
+    b.premium(true).await;
+    let (s, v) = b
+        .put(json!({"version": 1, "bypass_all": true, "plugins": [conv]}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+}
+
+/// Un paquet tiers installé mais non chargé : absent du catalogue, son
+/// maillon s'affiche `unknown_plugin`. Renvoyé inchangé, il est conservé
+/// et le reste de la chaîne se modifie ; modifié, il reste refusé (409).
+#[tokio::test]
+async fn un_maillon_tiers_inconnu_inchange_est_conserve_t08() {
+    for premium in [true, false] {
+        let b = Banc::nouveau(premium).await;
+        b.settings()
+            .set(
+                &format!("zone_{}_native_plugin_acme-reverb", b.zone),
+                r#"{"enabled":true,"mix":0.3}"#,
+            )
+            .unwrap();
+        let (s, v) = b.get().await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(etape(&v, "acme-reverb")["reason"], json!("unknown_plugin"));
+        let mut c = v["chain"].clone();
+        c["plugins"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"id": "crossfeed", "enabled": true}));
+        let (s, v) = b.put(c.clone()).await;
+        assert_eq!(s, StatusCode::OK, "premium={premium} : {c} → {v}");
+        let chaine = b.chaine();
+        let tiers = chaine
+            .plugins
+            .iter()
+            .find(|m| m.id == "acme-reverb")
+            .expect("maillon tiers conservé");
+        assert!(tiers.enabled);
+        assert_eq!(tiers.settings, json!({"mix": 0.3}));
+        assert!(chaine.plugins.iter().any(|m| m.id == "crossfeed" && m.enabled));
+        // Contre-épreuve : un maillon inconnu modifié reste un 409.
+        let mut c2 = c.clone();
+        for m in c2["plugins"].as_array_mut().unwrap() {
+            if m["id"] == json!("acme-reverb") {
+                m["settings"] = json!({"mix": 0.9});
+            }
+        }
+        let (s, v) = b.put(c2).await;
+        assert_eq!(s, StatusCode::CONFLICT, "{v}");
+        refus_conforme(&v, 409, "unknown_plugin");
+    }
+}
+
 // ── D1 : l'origine de la correction de pièce vient du serveur ────────
 
 fn filtres_de_piece() -> Vec<tune_core::room_correction::CorrectionFilter> {
