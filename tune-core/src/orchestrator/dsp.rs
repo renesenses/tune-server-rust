@@ -2431,8 +2431,7 @@ impl PlaybackOrchestrator {
     /// #7632 — `None` aussi SANS le droit Premium `RoomCorrection`
     /// ([`Self::correction_ir_autorisee`]) : la convolution par RI n'est
     /// alors ni cuite dans le flux réseau, ni comptée dans son empreinte, ni
-    /// présentée comme un traitement que PURE gouverne. Même place que la
-    /// garde du crossfeed (`crossfeed_configure_sous_licence`).
+    /// présentée comme un traitement que PURE gouverne.
     pub(super) fn chemin_ir_configure(&self, zone_id: i64) -> Option<String> {
         if !self.correction_ir_autorisee() {
             return None;
@@ -2506,8 +2505,7 @@ impl PlaybackOrchestrator {
 
     /// #7632 — le droit de convoluer : Premium (`RoomCorrection`, décision du
     /// 04/11/2026). ⚠️ Un orchestrateur SANS licence n'y a pas droit : une
-    /// absence ne vaut pas Premium (contrairement au crossfeed, dont la garde
-    /// laisse passer l'orchestrateur des tests).
+    /// absence ne vaut pas Premium. Le crossfeed simple est gratuit (#9210).
     pub fn correction_ir_autorisee(&self) -> bool {
         self.license
             .as_ref()
@@ -2527,8 +2525,31 @@ impl PlaybackOrchestrator {
     /// Les octets de la réponse impulsionnelle, pour l'empreinte du cache de
     /// transcodage : c'est le CONTENU qui décide de la rendition, pas le nom
     /// du fichier. `None` si la zone n'en a pas ou s'il est illisible.
+    ///
+    /// #8761 — le CONTENU de tout le jeu : principal, fichiers par cadence et
+    /// réglage de repli. Sans fichier par cadence et avec le repli par défaut,
+    /// les octets sont exactement ceux d'avant (le cache existant reste bon).
     pub(super) fn octets_ir(&self, zone_id: i64) -> Option<Vec<u8>> {
-        std::fs::read(self.chemin_ir(zone_id)?).ok()
+        let jeu = self.jeu_ir(zone_id)?;
+        let mut octets = std::fs::read(&jeu.principal).ok()?;
+        for chemin in &jeu.supplementaires {
+            octets.extend_from_slice(b"|ir_jeu|");
+            octets.extend(std::fs::read(chemin).unwrap_or_default());
+        }
+        if !jeu.reechantillonner {
+            octets.extend_from_slice(b"|sans_reechantillonnage");
+        }
+        Some(octets)
+    }
+
+    /// #8761 — le jeu de réponses impulsionnelles de la zone, derrière les
+    /// mêmes gardes que [`Self::chemin_ir`] (PURE, licence).
+    pub(super) fn jeu_ir(&self, zone_id: i64) -> Option<crate::audio::convolver::JeuDeZone> {
+        let principal = self.chemin_ir(zone_id)?;
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        Some(crate::audio::convolver::JeuDeZone::avec_principal(
+            &settings, zone_id, principal,
+        ))
     }
 
     pub(super) fn load_convolver(
@@ -2538,13 +2559,12 @@ impl PlaybackOrchestrator {
         channels: u16,
     ) -> Option<crate::audio::convolver::Convolver> {
         let _e = EtapeDePreparation::debut(zone_id, "dsp_convolution");
-        let path = self.chemin_ir(zone_id)?;
-        match crate::audio::convolver::Convolver::from_wav_for(
-            &path,
-            1024,
-            sample_rate,
-            channels as usize,
-        ) {
+        let jeu = self.jeu_ir(zone_id)?;
+        let path = jeu.principal.clone();
+        match jeu
+            .charger()
+            .and_then(|c| c.build_for(1024, sample_rate, channels as usize))
+        {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!(zone_id, path, error = %e, "room_correction_ir_load_failed");
@@ -2564,9 +2584,8 @@ impl PlaybackOrchestrator {
     /// `{ "enabled": bool, "amount": f32, "delay_ms": f32 }`. Values are clamped
     /// defensively (amount 0..0.5, delay_ms 0..5) mirroring the route validation.
     /// #7614 — le choix du greffon de suréchantillonnage de la zone, licence
-    /// comprise (Premium, comme le crossfeed). `None` sous PURE. Sans
-    /// gestionnaire de licence (les tests), aucune garde de licence, comme
-    /// [`Self::crossfeed_configure_sous_licence`].
+    /// comprise (Premium). `None` sous PURE. Sans gestionnaire de licence
+    /// (les tests), aucune garde de licence.
     pub fn choix_du_surechantillonneur(
         &self,
         zone_id: i64,
@@ -2817,31 +2836,15 @@ impl PlaybackOrchestrator {
     /// le crossfeed intégré est alors éteint, et ni l'empreinte du flux, ni la
     /// clé du cache, ni la compensation ne le comptent.
     pub(super) fn crossfeed_configure(&self, zone_id: i64) -> Option<(f32, f32)> {
-        let reglage =
-            Self::crossfeed_configure_sous_licence(&self.db, self.license.as_deref(), zone_id)?;
+        let reglage = Self::crossfeed_configure_with(&self.db, zone_id)?;
         let tiers = self.etages_tiers_configures(zone_id);
         crate::audio::crossfeed::etage_tiers_qui_remplace_le_crossfeed(&tiers)
             .is_none()
             .then_some(reglage)
     }
 
-    /// #5114 — [`Self::crossfeed_configure`] sans orchestrateur, AVEC sa
-    /// garde de licence : la même, écrite une fois, sur le même
-    /// `LicenseManager`. `None` : aucune garde, comme un orchestrateur sans
-    /// licence (les tests).
-    fn crossfeed_configure_sous_licence(
-        db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
-        license: Option<&crate::license::LicenseManager>,
-        zone_id: i64,
-    ) -> Option<(f32, f32)> {
-        if license.is_some_and(|license| !license.premium_snapshot()) {
-            return None;
-        }
-        Self::crossfeed_configure_with(db, zone_id)
-    }
-
-    /// La lecture du réglage, SANS la garde de licence : seul
-    /// [`Self::crossfeed_configure_sous_licence`] l'appelle.
+    /// Crossfeed simple gratuit (#9210) : conserver les choix d'installation
+    /// et de zone, sans garde Premium. Les étages tiers gardent leur garde.
     fn crossfeed_configure_with(
         db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
         zone_id: i64,
@@ -3580,6 +3583,12 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         device_id: Option<&str>,
     ) -> OutputCommandResult<super::EnvoiDeVolume> {
+        // #8920 — jamais de plein volume vers un ampli Devialet AIR, même si
+        // une route l'oubliait : rien ne part.
+        if crate::outputs::devialet_air::reglages::zone_air(&self.db, zone_id) {
+            warn!(zone_id, "devialet_air_plein_volume_pure_refuse_8920");
+            return Ok(super::EnvoiDeVolume::AucunVolumeFixe);
+        }
         // #6721 — l'armement de PURE est confirmé par l'utilisateur : c'est
         // l'action explicite qui autorise le 100 % (la garde ne mord pas sous
         // `pure_force`).
@@ -3992,6 +4001,15 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         device_id: Option<&str>,
     ) -> OutputCommandResult<()> {
+        // #8920 — le volume fixe n'existe pas sur Devialet AIR : armer
+        // enverrait le haut de la course à l'ampli. Refus, rien ne part.
+        if crate::outputs::devialet_air::reglages::zone_air(&self.db, zone_id) {
+            warn!(zone_id, "devialet_air_volume_fixe_refuse_8920");
+            return Err(OutputCommandError::failed(
+                OutputCommand::SetVolume,
+                "fixed volume is unavailable on a Devialet AIR zone".to_string(),
+            ));
+        }
         if let Some(did) = device_id {
             let output = { self.outputs.lock().await.get(did) };
             match output {

@@ -10,7 +10,11 @@ pub mod album_repo;
 pub mod alertes_douteuses_ignorees;
 /// #8077 — les apports d'un service à un album local (SQLite 142 / PG 108).
 pub mod apports_service;
+/// #9116 — l'arbre des dossiers de la vue Répertoires, gardé en mémoire.
+pub mod arbre_des_dossiers;
 pub mod artist_repo;
+/// #9265 — les artistes des crédits composés (« A & B », « A feat. C »).
+pub mod artistes_des_credits;
 pub mod backend;
 /// Contrôle parental, étape 2 (#7974) : bail d'écoute et temps écouté.
 pub mod bail_d_ecoute;
@@ -27,6 +31,8 @@ pub mod contexte_de_file;
 pub mod disques_par_dossier;
 /// Les dossiers « Collections » suivent leurs albums (#5527, #5528).
 pub mod dossiers_des_collections;
+/// #9143 — « Écouter plus tard » rend un album écouté en entier (option).
+pub mod ecouter_plus_tard_retrait;
 /// #7763 — les écoutes importées (Roon, Plex, m3u), à part de l'historique.
 pub mod ecoutes_importees;
 pub mod edition_album;

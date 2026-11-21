@@ -7,7 +7,7 @@
 //!   l'étude, quelques secondes, hors de tout fil audio) et garde le verdict.
 //! - `GET|PUT /zones/{id}` : le réglage d'une zone (`zone_{id}_upsampler`).
 //!
-//! Droits : PAYANT, comme le crossfeed (décision de Bertrand du 07/11/2026),
+//! Droits : PAYANT (décision de Bertrand du 07/11/2026),
 //! et FACULTATIF : le greffon `upsampler` s'installe depuis le catalogue
 //! (`POST /plugins/upsampler/install`, droit `upsampling`). Lire est libre ;
 //! activer exige le Premium (402) et le greffon installé (409). Désactiver

@@ -75,7 +75,14 @@ pub fn volume_lock_override(db: &Arc<dyn DbBackend>, zone_id: i64) -> Option<boo
 /// Verrou effectif pour une zone : sa surcharge explicite, ou à défaut le
 /// réglage global historique. Une installation existante sans surcharge garde
 /// donc strictement son comportement.
+///
+/// #8920 — jamais sur une zone Devialet AIR : « plein volume en PURE »
+/// enverrait le haut de la course à l'ampli. Le volume y est tenu par
+/// l'ampli, sous les limites de confort et de sécurité, PURE ou non.
 pub fn volume_lock_enabled(db: &Arc<dyn DbBackend>, zone_id: i64) -> bool {
+    if crate::outputs::devialet_air::reglages::zone_air(db, zone_id) {
+        return false;
+    }
     volume_lock_override(db, zone_id).unwrap_or_else(|| global_volume_lock_enabled(db))
 }
 

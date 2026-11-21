@@ -7,8 +7,8 @@ source "${SCRIPT_DIR}/tune-os-password.sh"
 
 first="$(generate_password)"
 second="$(generate_password)"
-[[ "$first" =~ ^[0-9a-f]{24}$ ]]
-[[ "$second" =~ ^[0-9a-f]{24}$ ]]
+[[ "$first" =~ ^[bcdefghijklnoprstuvxy]{24}$ ]]
+[[ "$second" =~ ^[bcdefghijklnoprstuvxy]{24}$ ]]
 [[ "$first" != "$second" ]]
 
 # Generate the fixture with the same libc crypt(3) implementation that the
@@ -90,7 +90,7 @@ chage() { printf '%s\n' "$*" > "${work}/chage.args"; }
 sortie="$(reinitialiser 2>&1)"
 [[ -s "${work}/run/premier-mot-de-passe" ]] || fail "aucun mot de passe temporaire publié"
 pw="$(cat "${work}/run/premier-mot-de-passe")"
-[[ "$pw" =~ ^[0-9a-f]{24}$ ]] || fail "copie publiée hors forme"
+[[ "$pw" =~ ^[bcdefghijklnoprstuvxy]{24}$ ]] || fail "copie publiée hors forme"
 [[ "$(cat "${work}/chpasswd.in")" == "tune:${pw}" ]] || fail "chpasswd n'a pas reçu le mot de passe publié"
 [[ "$(cat "${work}/chage.args")" == "-d 0 tune" ]] || fail "mot de passe non expiré (chage -d 0)"
 [[ "$(cat "${work}/state/ssh-password-v2")" == "reset-from-console" ]] || fail "marqueur absent"

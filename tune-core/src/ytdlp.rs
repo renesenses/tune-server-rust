@@ -240,7 +240,7 @@ pub async fn download() -> Result<(PathBuf, String), String> {
         .ok_or_else(|| format!("yt-dlp: asset '{asset}' not found in latest release"))?
         .to_string();
 
-    info!(asset, url = %url, tag = %tag, "ytdlp_download_starting");
+    info!(asset, url = %crate::confidentialite::masquer_url(&url), tag = %tag, "ytdlp_download_starting");
     let bytes = client
         .get(&url)
         .send()

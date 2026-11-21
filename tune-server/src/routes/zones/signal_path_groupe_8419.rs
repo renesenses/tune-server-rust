@@ -90,10 +90,13 @@ pub(crate) async fn sorties_du_groupe(state: &AppState, zone_id: i64) -> Option<
             continue;
         };
         let ps = state.playback.get_state(id).await;
-        let renderer_label = zone
-            .output_device_id
-            .as_deref()
-            .and_then(|d| devices.iter().find(|x| x.id == d).map(|x| x.name.as_str()));
+        // #8920 — Devialet AIR : le nom de la zone et l'IP de l'ampli.
+        let libelle_air = super::signal_path::libelle_renderer_air(state, &zone).await;
+        let renderer_label = libelle_air.as_deref().or_else(|| {
+            zone.output_device_id
+                .as_deref()
+                .and_then(|d| devices.iter().find(|x| x.id == d).map(|x| x.name.as_str()))
+        });
         let wire = match ps
             .now_playing
             .as_ref()

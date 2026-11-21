@@ -617,6 +617,15 @@ pub async fn init_state(state: &AppState, config: &TuneConfig) {
             tune_core::db::rattrapage_dates_ajout_2138::rattrapage_journalise(&backend);
         });
     }
+    // #9265 — les crédits composés (« A & B », « A feat. C ») reliés aux
+    // fiches de leurs artistes, pour la grille Artistes : recalcul depuis les
+    // seuls noms, idempotent, hors du chemin du démarrage.
+    {
+        let backend = state.backend.clone();
+        tokio::task::spawn_blocking(move || {
+            tune_core::db::artistes_des_credits::passe_journalisee(&backend, "demarrage");
+        });
+    }
     // #8026 — les crédits lus dans les balises pour la musique déjà scannée :
     // une fois, dérivés de `track_metadata` (aucun fichier rouvert), puis à
     // chaque démarrage les lignes `balises` sans fiche rattachées par le nom
@@ -1398,7 +1407,14 @@ async fn restore_convolvers(state: &AppState) {
                             .as_any()
                             .downcast_ref::<tune_core::outputs::local::LocalOutput>()
                         {
-                            match local.set_convolver_ir(&ir_path) {
+                            // #8761 — le jeu entier (fichiers par cadence,
+                            // réglage de repli), pas seulement le principal.
+                            let jeu = tune_core::audio::convolver::JeuDeZone::avec_principal(
+                                &settings,
+                                zone_id,
+                                ir_path.clone(),
+                            );
+                            match jeu.charger().and_then(|c| local.set_convolver_config(c)) {
                                 Ok(()) => {
                                     info!(zone_id, ir_path = %ir_path, "convolver_restored")
                                 }

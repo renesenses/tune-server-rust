@@ -356,7 +356,7 @@ impl PlaybackOrchestrator {
         if inner == url.trim() {
             return None; // playlist pointed back at itself — nothing gained
         }
-        info!(playlist = %url, stream = %inner, "radio_playlist_dereferenced");
+        info!(playlist = %crate::confidentialite::masquer_url(&url), stream = %inner, "radio_playlist_dereferenced");
         Some(inner)
     }
 

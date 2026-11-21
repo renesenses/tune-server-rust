@@ -785,6 +785,22 @@ async fn pieces_du_banc(
     Arc<AtomicBool>,
     tokio::task::JoinHandle<()>,
 ) {
+    pieces_du_banc_securite(annonce, activee, bornes, None).await
+}
+
+/// #8920 — le même banc, avec une limite de sécurité (dB d'ampli) vue par
+/// la sortie au départ d'une lecture.
+async fn pieces_du_banc_securite(
+    annonce: super::protocole::Annonce,
+    activee: bool,
+    bornes: reglages::BornesDb,
+    securite_db: Option<f64>,
+) -> (
+    Simulateur,
+    DevialetAirOutput,
+    Arc<AtomicBool>,
+    tokio::task::JoinHandle<()>,
+) {
     let sim = Simulateur::demarrer(annonce, None).await;
     // #8536 — un port audio fixe pour tous les flux de la sortie, comme
     // 45456 en service : l'ampli renvoie les retours d'une session à
@@ -798,6 +814,8 @@ async fn pieces_du_banc(
     let drapeau = Arc::new(AtomicBool::new(activee));
     let indice = Arc::new(AtomicU8::new(9));
     let contexte = ContexteAir {
+        plafond_de_cadence: std::sync::Arc::new(|_: &str| None),
+        securite_db: std::sync::Arc::new(move |_: &str| securite_db),
         activee: {
             let d = drapeau.clone();
             Arc::new(move || d.load(Ordering::SeqCst))
@@ -1226,6 +1244,8 @@ async fn air_le_fournisseur_n_ecoute_rien_tant_que_l_option_est_desactivee() {
         .port();
     let drapeau = Arc::new(AtomicBool::new(false));
     let contexte = ContexteAir {
+        plafond_de_cadence: std::sync::Arc::new(|_: &str| None),
+        securite_db: std::sync::Arc::new(|_: &str| None),
         activee: {
             let d = drapeau.clone();
             Arc::new(move || d.load(Ordering::SeqCst))
@@ -1268,6 +1288,9 @@ mod volume_db_6918;
 
 #[path = "demarrage_borne_6911_tests.rs"]
 mod demarrage_borne_6911;
+
+#[path = "retours_8920_tests.rs"]
+mod retours_8920;
 
 // ─── #8536 — la session de la sortie, l'écoute à côté de Roon ───────────────
 

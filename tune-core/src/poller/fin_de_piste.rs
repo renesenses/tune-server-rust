@@ -43,6 +43,10 @@ impl PositionPoller {
         let fin_sur_erreur = crate::playback::radio_fin_de_file::prendre_fin_sur_erreur(zone_id);
         if !fin_sur_erreur {
             self.noter_la_ligne_courante_jouee(zone_id, zone_state.queue_position);
+            // #9143 — la fin naturelle achève la piste, même courte ou
+            // passée entre deux relevés du sondeur.
+            self.orchestrator
+                .noter_piste_achevee_pour_le_sas(zone_state, true);
         }
 
         let Some(next_pos) = Self::next_position(zone_state) else {
@@ -1030,7 +1034,7 @@ impl PositionPoller {
             etat = ?status.state,
             position_ms = status.position_ms,
             position_figee_ms = adoption.position_figee_ms,
-            uri = ?status.current_uri,
+            uri = ?status.current_uri.as_deref().map(crate::confidentialite::masquer_url),
             stream_id = %adoption.flux,
             octets_tires = ?octets_tires,
             octets_depuis_adoption = ?octets_depuis_adoption,
@@ -1109,7 +1113,7 @@ impl PositionPoller {
             wall_secs = wall_elapsed,
             past_end_ticks = ps.past_end_ticks,
             stream_id = %flux,
-            uri = ?status.current_uri,
+            uri = ?status.current_uri.as_deref().map(crate::confidentialite::masquer_url),
             octets_tires = ?octets_tires,
             preuve = ?preuve,
             arm_to_advance_ms = ps
@@ -1214,7 +1218,7 @@ impl PositionPoller {
         warn!(
             zone_id,
             position_ms = status.position_ms,
-            uri = ?status.current_uri,
+            uri = ?status.current_uri.as_deref().map(crate::confidentialite::masquer_url),
             flux_fini = ?flux_fini,
             flux_arme = ?flux_arme,
             "gapless_retombee_sur_la_piste_finie_surveillee"

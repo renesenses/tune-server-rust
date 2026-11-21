@@ -59,6 +59,10 @@ pub(crate) const ENSURE_TABLES: &[&str] = &[
     // #8487 — titres diffusés par les radios, sans script numéroté (voir
     // `radio_titres_diffuses`).
     include_str!("../../migrations/radio_titres_diffuses.sql"),
+    // #9265 — artistes des crédits composés, sans script numéroté (voir
+    // `artistes_des_credits`).
+    include_str!("../../migrations/artistes_des_credits.sql"),
+    super::artistes_des_credits::SQL_INDEX,
     "CREATE TABLE IF NOT EXISTS file_first_seen (file_path TEXT PRIMARY KEY, first_seen_at DOUBLE PRECISION NOT NULL, created_at DOUBLE PRECISION)",
     "CREATE SEQUENCE IF NOT EXISTS streaming_favorites_id_seq",
     "CREATE TABLE IF NOT EXISTS streaming_favorites (\

@@ -151,9 +151,11 @@ fn lire_library_stats(state: &AppState) -> Result<Value, AppError> {
             ("CAST(duration_ms AS bigint)", "CAST(file_size AS bigint)")
         }
     };
+    // #9265 — le nombre d'artistes suit la grille.
+    let grille = tune_core::db::artist_repo::PREDICAT_ARTISTES_DE_LA_GRILLE;
     let sql = format!(
         "SELECT \
-         (SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)), \
+         (SELECT COUNT(*) FROM artists WHERE {grille}), \
          (SELECT COUNT(*) FROM albums), \
          (SELECT COUNT(*) FROM tracks), \
          (SELECT COUNT(*) FROM zones), \
@@ -254,7 +256,10 @@ fn lire_completude(state: &AppState) -> Result<Value, AppError> {
     // the same "0/0 = 100%" figure (Fabien-4, v0.9.13). Same engine routing
     // as library_stats above; the SQL itself is dialect-neutral.
     let b = &state.backend;
-    let sql = "SELECT \
+    // #9265 — le nombre d'artistes suit la grille.
+    let grille = tune_core::db::artist_repo::PREDICAT_ARTISTES_DE_LA_GRILLE;
+    let sql = format!(
+        "SELECT \
          (SELECT COUNT(*) FROM tracks), \
          (SELECT COUNT(*) FROM tracks WHERE genre IS NOT NULL AND genre != ''), \
          (SELECT COUNT(*) FROM tracks WHERE year IS NOT NULL), \
@@ -267,8 +272,8 @@ fn lire_completude(state: &AppState) -> Result<Value, AppError> {
          (SELECT COUNT(*) FROM albums WHERE year IS NOT NULL AND year > 0), \
          (SELECT COUNT(*) FROM albums al LEFT JOIN artists ar ON ar.id = al.artist_id \
           WHERE al.artist_id IS NULL OR ar.name IS NULL OR ar.name = '' OR ar.name = 'Unknown Artist'), \
-         (SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)), \
-         (SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL) \
+         (SELECT COUNT(*) FROM artists WHERE {grille}), \
+         (SELECT COUNT(*) FROM artists WHERE {grille} \
           AND (image_path IS NULL OR image_path = '')), \
          (SELECT COUNT(DISTINCT track_id) FROM track_metadata WHERE key = 'dr_track' AND value != ''), \
          (SELECT COUNT(DISTINCT track_id) FROM track_metadata WHERE key = 'dr_source' AND value = 'analysis'), \
@@ -283,9 +288,10 @@ fn lire_completude(state: &AppState) -> Result<Value, AppError> {
                   WHERE i.track_id = s.track_id AND i.key = 'dr_indisponible')), \
          (SELECT COUNT(*) FROM tracks t WHERE (t.file_path IS NULL OR t.file_path = '') \
             AND NOT EXISTS (SELECT 1 FROM track_metadata d \
-                  WHERE d.track_id = t.id AND d.key = 'dr_track' AND TRIM(d.value) != ''))";
+                  WHERE d.track_id = t.id AND d.key = 'dr_track' AND TRIM(d.value) != ''))"
+    );
     let row = b
-        .query_one(sql, &[])
+        .query_one(&sql, &[])
         .map_err(AppError::internal)?
         .unwrap_or_default();
     let get = |i: usize| row.get(i).and_then(|v| v.as_i64()).unwrap_or(0);
@@ -484,6 +490,9 @@ pub(super) async fn library_activity(
     Json(json!(items))
 }
 
+#[cfg(test)]
+#[path = "artistes_grille_stats_9265_tests.rs"]
+mod artistes_grille_stats_9265_tests;
 #[cfg(test)]
 #[path = "totaux_8625_tests.rs"]
 mod totaux_8625_tests;

@@ -203,14 +203,23 @@ fn charge_utile(supporte: bool, etat: Option<&Etat>) -> Value {
         "enabled": etat.is_some_and(Etat::actif),
         "registered": etat.is_some_and(|e| e.inscrit),
         "disabled_by_windows": etat.is_some_and(|e| e.desactive_par_windows),
-        "command": etat.and_then(|e| e.commande.clone()),
     })
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn chemin_reg(racine: &std::path::Path) -> std::path::PathBuf {
+    racine.join("System32").join("reg.exe")
 }
 
 #[cfg(target_os = "windows")]
 fn reg(args: &[String]) -> Result<std::process::Output, String> {
     use std::os::windows::process::CommandExt;
-    std::process::Command::new("reg")
+    let racine = std::env::var_os("SystemRoot").ok_or_else(|| "SystemRoot absent".to_string())?;
+    let racine = std::path::Path::new(&racine);
+    if !racine.is_absolute() {
+        return Err("SystemRoot doit être absolu".to_string());
+    }
+    std::process::Command::new(chemin_reg(racine))
         .args(args)
         .creation_flags(crate::lancement_sans_console::CREATE_NO_WINDOW)
         .stdin(std::process::Stdio::null())
@@ -334,6 +343,24 @@ fn erreur(code: StatusCode, nom: &str, message: &str) -> Response {
 mod tests {
     use super::*;
 
+    #[test]
+    fn relecture_8861_reponse_limitee_aux_indicateurs() {
+        let e = etat(&sortie_run(&commande_de_demarrage(EXE)), "", EXE);
+        let v = charge_utile(true, Some(&e));
+        assert_eq!(
+            v,
+            json!({"supported": true, "enabled": true,
+            "registered": true, "disabled_by_windows": false})
+        );
+        assert!(charge_utile(false, None).get("command").is_none());
+    }
+
+    #[test]
+    fn relecture_8861_reg_dans_le_repertoire_systeme() {
+        let racine = std::path::Path::new("racine-windows");
+        assert_eq!(chemin_reg(racine), racine.join("System32").join("reg.exe"));
+    }
+
     const EXE: &str = r"C:\Users\sasha\AppData\Local\Programs\Tune Server\tune-server.exe";
 
     fn sortie_run(commande: &str) -> String {
@@ -381,7 +408,10 @@ mod tests {
             EXE,
         );
         assert!(!e.inscrit);
-        assert!(e.commande.is_some(), "la commande reste montrée");
+        assert!(
+            e.commande.is_some(),
+            "la commande reste disponible en interne"
+        );
     }
 
     #[test]
