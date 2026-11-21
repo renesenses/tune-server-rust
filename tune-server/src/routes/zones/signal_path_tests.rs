@@ -5355,6 +5355,84 @@ fn air_6542_flac_24_192_vers_devialet_air_affiche_le_reechantillonnage_a_96_khz(
     );
 }
 
+/// #8920 — le volume d'une zone Devialet AIR s'écrit en dB d'ampli, jamais
+/// en « % » : la consigne sur la course, ou le niveau que l'ampli rapporte
+/// (il fait foi). Contre-épreuve : une zone DLNA garde son pour-cent.
+#[test]
+fn air_8920_le_volume_du_chemin_est_en_db_d_ampli() {
+    let (backend, mut zone) = zone_devialet_air();
+    zone.volume = 40.0; // −52 dB sur la course par défaut.
+    let mut ps = flac_a(96_000);
+    let sp = build_signal_path(
+        &ps,
+        &zone,
+        &backend,
+        Some("Expert (192.168.1.42)"),
+        "none",
+        None,
+    )
+    .unwrap();
+    let volume = step_desc(&sp, "Volume").unwrap();
+    assert!(volume.contains("-52.0 dB"), "{volume}");
+    assert!(!volume.contains('%'), "{volume}");
+    assert_eq!(
+        step_desc(&sp, "Renderer").as_deref(),
+        Some("Expert (192.168.1.42)")
+    );
+    ps.device_volume_observation = Some(tune_core::playback::ObservationVolumeAppareil {
+        device_id: zone.output_device_id.clone().unwrap(),
+        volume: 0.8,
+        volume_db: -24.0,
+        muted: false,
+    });
+    let sp = build_signal_path(&ps, &zone, &backend, None, "none", None).unwrap();
+    let volume = step_desc(&sp, "Volume").unwrap();
+    assert!(volume.contains("-24.0 dB"), "l'ampli fait foi : {volume}");
+    // Haut de la course : toujours une étape, en dB (pas de « plein volume »).
+    zone.volume = 100.0;
+    ps.device_volume_observation = None;
+    let sp = build_signal_path(&ps, &zone, &backend, None, "none", None).unwrap();
+    assert!(step_desc(&sp, "Volume").unwrap().contains("-10.0 dB"));
+
+    // Contre-épreuve : DLNA, le pour-cent du renderer.
+    let repo = ZoneRepo::with_backend(backend.clone());
+    let id = repo
+        .create("Salon", Some("dlna"), Some("uuid:salon-8920"))
+        .unwrap();
+    let mut dlna = repo.get(id).unwrap().unwrap();
+    dlna.volume = 40.0;
+    let sp = build_signal_path(&ps, &dlna, &backend, None, "none", None).unwrap();
+    let volume = step_desc(&sp, "Volume").unwrap();
+    assert!(
+        volume.contains("40%") || volume.contains("40 %"),
+        "{volume}"
+    );
+    assert!(!volume.contains("dB"), "{volume}");
+}
+
+/// #8920 (décision du 17/11) — DoP n'est pas branché sur Devialet AIR : un
+/// DSD part en PCM, et le chemin le dit, même si la zone demande DoP.
+/// Contre-épreuve : un FLAC n'a pas l'étape, ni un DSD vers DLNA.
+#[test]
+fn air_8920_dsd_dit_converti_en_pcm_meme_en_dop() {
+    let (backend, zone) = zone_devialet_air();
+    ZoneRepo::with_backend(backend.clone())
+        .update_dsd_mode(zone.id.unwrap(), "dop")
+        .unwrap();
+    let sp = build_signal_path(&dsd_playing(), &zone, &backend, None, "none", None).unwrap();
+    let d = step_desc(&sp, "DSD").expect("étape DSD sur AIR");
+    assert!(d.contains("PCM") && d.contains("DoP"), "{d}");
+    let sp = build_signal_path(&flac_a(96_000), &zone, &backend, None, "none", None).unwrap();
+    assert_eq!(step_desc(&sp, "DSD"), None);
+    let repo = ZoneRepo::with_backend(backend.clone());
+    let id = repo
+        .create("Salon", Some("dlna"), Some("uuid:salon-8920-dsd"))
+        .unwrap();
+    let dlna = repo.get(id).unwrap().unwrap();
+    let sp = build_signal_path(&dsd_playing(), &dlna, &backend, None, "none", None).unwrap();
+    assert_eq!(step_desc(&sp, "DSD"), None);
+}
+
 // ── #6734 — sortie locale sans contrat : l'anneau f32 ne garde que 24 bits ──
 
 /// Le WAV 32 bits entiers du fil 2358 (test RME « 192 kHz 32 bit ADI-2 Pro

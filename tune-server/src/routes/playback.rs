@@ -8429,9 +8429,25 @@ async fn set_audiophile(
         tune_core::audio::audiophile::volume_lock_override(&state.backend, zone_id);
     let target_enabled = body.enabled.unwrap_or(current_enabled);
     let target_override = body.lock_volume.unwrap_or(current_override);
-    let target_lock = target_override.unwrap_or_else(|| {
-        tune_core::audio::audiophile::global_volume_lock_enabled(&state.backend)
-    });
+    // #8920 — « plein volume en PURE » n'existe pas sur Devialet AIR : la
+    // demande explicite est refusée, et le réglage global ne s'y applique pas
+    // (le verrou y est toujours lu faux, `audiophile::volume_lock_enabled`).
+    let zone_air = tune_core::outputs::devialet_air::reglages::zone_air(&state.backend, zone_id);
+    if zone_air && body.lock_volume == Some(Some(true)) {
+        warn!(zone_id, "devialet_air_plein_volume_pure_refuse_8920");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "full_volume_unavailable_devialet_air",
+                "message": "Full volume in PURE mode is unavailable on a Devialet AIR zone: the amplifier holds the volume, under the comfort and safety limits.",
+            })),
+        )
+            .into_response();
+    }
+    let target_lock = !zone_air
+        && target_override.unwrap_or_else(|| {
+            tune_core::audio::audiophile::global_volume_lock_enabled(&state.backend)
+        });
     let was_full_volume = current_enabled && current_lock;
     let will_be_full_volume = target_enabled && target_lock;
 

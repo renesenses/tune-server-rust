@@ -72,6 +72,13 @@ pub struct ContexteAir {
     /// #6918 — la course du curseur en dB. Relue à chaque consigne : une
     /// course changée vaut pour le geste suivant et n'envoie rien.
     pub bornes_db: Arc<dyn Fn() -> reglages::BornesDb + Send + Sync>,
+    /// #8920 — le plafond de cadence (`max_sample_rate`) des zones qui
+    /// pilotent la sortie `device_id`, s'il est réglé. Relu à chaque flux.
+    pub plafond_de_cadence: Arc<dyn Fn(&str) -> Option<u32> + Send + Sync>,
+    /// #8920 — la limite de sécurité (dB d'ampli) des zones qui pilotent la
+    /// sortie `device_id`, la plus basse, s'il y en a une. Au démarrage d'une
+    /// lecture, ou quand Tune reprend l'ampli, il ne part jamais au-dessus.
+    pub securite_db: Arc<dyn Fn(&str) -> Option<f64> + Send + Sync>,
     pub ports: Ports,
     pub cadence: Cadence,
 }
@@ -83,14 +90,59 @@ impl ContexteAir {
     pub fn depuis_la_base(db: Arc<dyn crate::db::backend::DbBackend>) -> Self {
         let db2 = db.clone();
         let db3 = db.clone();
+        let db4 = db.clone();
+        let db5 = db.clone();
         Self {
             activee: Arc::new(move || reglages::activee(&db)),
             indice_source: Arc::new(move || reglages::indice_source(&db2)),
             bornes_db: Arc::new(move || reglages::BornesDb::lues(&db3)),
+            plafond_de_cadence: Arc::new(move |did: &str| plafond_des_zones(&db4, did)),
+            securite_db: Arc::new(move |did: &str| securite_des_zones(&db5, did)),
             ports: Ports::AIR,
             cadence: Cadence::AIR,
         }
     }
+}
+
+/// #8920 — le plus bas `max_sample_rate` réglé parmi les zones Devialet AIR
+/// qui pilotent `device_id` ; `None` si aucune n'en règle.
+fn plafond_des_zones(db: &Arc<dyn crate::db::backend::DbBackend>, device_id: &str) -> Option<u32> {
+    crate::db::zone_repo::ZoneRepo::with_backend(db.clone())
+        .list()
+        .ok()?
+        .into_iter()
+        .filter(|z| {
+            reglages::est_air(z.output_type.as_deref())
+                && z.output_device_id.as_deref() == Some(device_id)
+        })
+        .filter_map(|z| z.max_sample_rate)
+        .min()
+}
+
+/// #8920 — la plus basse limite de sécurité, en dB d'ampli, parmi les zones
+/// Devialet AIR qui pilotent `device_id`. Ramenée vers le BAS sur la grille
+/// de 0,5 dB : jamais au-dessus de la limite réglée, ni du plafond.
+fn securite_des_zones(db: &Arc<dyn crate::db::backend::DbBackend>, device_id: &str) -> Option<f64> {
+    let course = reglages::BornesDb::lues(db);
+    crate::db::zone_repo::ZoneRepo::with_backend(db.clone())
+        .list()
+        .ok()?
+        .into_iter()
+        .filter(|z| {
+            reglages::est_air(z.output_type.as_deref())
+                && z.output_device_id.as_deref() == Some(device_id)
+        })
+        .filter_map(|z| crate::audio::volume_limites::lire_effectives(db, z.id?).securite)
+        .map(|s| securite_en_db(course, s))
+        .reduce(f64::min)
+}
+
+/// #8920 — une limite de sécurité (fraction de la course) en dB d'ampli,
+/// arrondie vers le bas sur la grille, jamais au-dessus du plafond.
+#[must_use]
+pub fn securite_en_db(course: reglages::BornesDb, securite: f64) -> f64 {
+    ((course.db_exacts(securite) / reglages::PAS_DB).floor() * reglages::PAS_DB)
+        .min(reglages::PLAFOND_DB)
 }
 
 #[derive(Debug, Clone)]
@@ -319,6 +371,13 @@ impl DevialetAirOutput {
         })
     }
 
+    /// #8920 — l'adresse IP sous laquelle l'ampli s'annonce, s'il est
+    /// entendu : le chemin du signal la montre à côté du nom de la zone.
+    #[must_use]
+    pub fn ip(&self) -> Option<IpAddr> {
+        self.ampli().map(|a| a.ip)
+    }
+
     fn adresse_ampli(&self, a: &AmpliVu) -> SocketAddr {
         SocketAddr::new(a.ip, self.contexte.ports.ampli)
     }
@@ -429,6 +488,38 @@ impl DevialetAirOutput {
         Ok((a, indice))
     }
 
+    /// #8920 — au démarrage d'une lecture (ou quand Tune reprend l'ampli),
+    /// l'ampli ne part jamais au-dessus de la limite de sécurité : monté à la
+    /// télécommande au-dessus d'elle, il y est ramené AVANT le premier
+    /// paquet. En cours de lecture, Tune ne le rappelle pas (l'ampli fait
+    /// foi) ; il n'envoie simplement jamais rien au-dessus de lui-même.
+    async fn ramener_sous_la_securite(&self, ampli: AmpliVu) -> Result<AmpliVu, String> {
+        let Some(securite) = (self.contexte.securite_db)(&self.device_id) else {
+            return Ok(ampli);
+        };
+        if ampli.annonce.volume_db() <= securite {
+            return Ok(ampli);
+        }
+        info!(
+            sortie = %self.nom,
+            rapporte_db = ampli.annonce.volume_db(),
+            securite_db = securite,
+            "devialet_air_depart_ramene_a_la_securite_8920"
+        );
+        self.commander(opcode::VOLUME, securite as f32).await?;
+        *self
+            .volume_voulu
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+            (self.contexte.bornes_db)().db_vers_volume(securite);
+        let _ = self
+            .attendre_l_annonce(self.contexte.cadence.attente_source, |a| {
+                a.volume_db() <= securite
+            })
+            .await;
+        Ok(self.ampli().unwrap_or(ampli))
+    }
+
     /// Interrompt le flux en cours, s'il y en a un, et rend sa position.
     async fn interrompre(&self, phase: &mut Phase) -> Option<(Media, u64)> {
         let Phase::Lecture(flux) = std::mem::take(phase) else {
@@ -454,9 +545,25 @@ impl DevialetAirOutput {
     }
 
     /// Démarre un flux de `media` depuis `debut_ms`.
-    async fn lancer(&self, phase: &mut Phase, media: Media, debut_ms: u64) -> Result<(), String> {
+    async fn lancer(
+        &self,
+        phase: &mut Phase,
+        media: Media,
+        debut_ms: u64,
+        depart_a_froid: bool,
+    ) -> Result<(), String> {
         self.exiger_l_option()?;
+        // #8920 — Tune « reprend la main » quand il doit allumer l'ampli ou
+        // lui choisir la source AIR : l'ampli n'était pas à lui.
+        let reprise_en_main = self.ampli().is_some_and(|a| {
+            !a.annonce.allume || a.annonce.source_choisie != (self.contexte.indice_source)()
+        });
         let (ampli, indice) = self.preparer_l_ampli().await?;
+        let ampli = if depart_a_froid || reprise_en_main {
+            self.ramener_sous_la_securite(ampli).await?
+        } else {
+            ampli
+        };
         // #6911 — la source est décodée au fil de l'eau, jamais téléchargée
         // en entier : une radio (`/stream/<id>.wav` sans fin) tenait ici la
         // sortie, et la zone avec elle, jusqu'au délai de 600 s du client.
@@ -470,6 +577,7 @@ impl DevialetAirOutput {
             debut_ms.saturating_sub(media.depart_du_flux_ms),
             media.duree_ms == 0,
             self.contexte.cadence.attente_premier_son,
+            (self.contexte.plafond_de_cadence)(&self.device_id),
             // Un canal ne s'ouvre qu'une fois : la cadence annoncée choisit
             // d'emblée celle qu'AIR transporte.
             media.taux.filter(|_| !media.relisible),
@@ -745,6 +853,7 @@ async fn ouvrir_la_source(
     debut_ms: u64,
     en_direct: bool,
     attente: Duration,
+    plafond: Option<u32>,
     cadence_d_un_canal: Option<u32>,
     relisible: bool,
 ) -> Result<SourceOuverte, String> {
@@ -753,7 +862,7 @@ async fn ouvrir_la_source(
     // second décodeur (rééchantillonnage) n'en recevrait que la suite. La
     // cadence annoncée par l'orchestrateur décide donc d'emblée.
     if let Some(cadence_source) = cadence_d_un_canal {
-        let cadence_envoyee = reglages::cadence_envoyee(cadence_source);
+        let cadence_envoyee = reglages::cadence_envoyee_sous(cadence_source, plafond);
         // Toujours la cadence visée, jamais `None` : la cadence annoncée
         // (`resolved.sample_rate`) peut différer de celle du flux traité
         // (plafond de zone, cadence fixe). Le décodeur ne rééchantillonne
@@ -791,7 +900,9 @@ async fn ouvrir_la_source(
             _ => "devialet_air: le décodeur n'a pas annoncé son format".into(),
         });
     };
-    let cadence_envoyee = reglages::cadence_envoyee(cadence_source);
+    // #8920 — 192 kHz au plus, et seulement si la zone le règle : sans
+    // réglage, 96 kHz sans perte comme avant.
+    let cadence_envoyee = reglages::cadence_envoyee_sous(cadence_source, plafond);
     let (rx, decodeur) = if cadence_envoyee == cadence_source {
         (rx, decodeur)
     } else {
@@ -892,10 +1003,23 @@ impl OutputTarget for DevialetAirOutput {
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
         let mut phase = self.phase.lock().await;
+        // #8920 — départ « à froid » : rien ne jouait (arrêt, ou fin non
+        // naturelle). Un enchaînement de pistes, un changement de piste en
+        // lecture ou depuis la pause ne l'est pas : l'ampli garde son niveau.
+        let depart_a_froid = matches!(
+            &*phase,
+            Phase::Arret
+                | Phase::Termine {
+                    naturelle: false,
+                    ..
+                }
+        );
         self.interrompre(&mut phase).await;
         *phase = Phase::Arret;
         self.pause_sur_un_canal.store(false, Ordering::SeqCst);
-        let lancement = self.lancer(&mut phase, Media::depuis(media), 0).await;
+        let lancement = self
+            .lancer(&mut phase, Media::depuis(media), 0, depart_a_froid)
+            .await;
         if let Err(e) = &lancement {
             warn!(sortie = %self.nom, erreur = %e, "devialet_air_demarrage_echoue");
         }
@@ -927,7 +1051,9 @@ impl OutputTarget for DevialetAirOutput {
             );
         }
         self.pause_sur_un_canal.store(false, Ordering::SeqCst);
-        let reprise = self.lancer(&mut phase, media.clone(), position_ms).await;
+        let reprise = self
+            .lancer(&mut phase, media.clone(), position_ms, false)
+            .await;
         if reprise.is_err() {
             *phase = Phase::Pause { media, position_ms };
         }
@@ -971,7 +1097,7 @@ impl OutputTarget for DevialetAirOutput {
                 // au-delà de 80 %) et passait au morceau suivant. Le motif
                 // part par `take_output_failure` : la zone s'arrête en le
                 // disant.
-                let relance = self.lancer(&mut phase, media, position_ms).await;
+                let relance = self.lancer(&mut phase, media, position_ms, false).await;
                 if let Err(e) = &relance {
                     warn!(sortie = %self.nom, position_ms, erreur = %e, "devialet_air_deplacement_echoue");
                     *self

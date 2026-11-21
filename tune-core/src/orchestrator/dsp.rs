@@ -3583,6 +3583,12 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         device_id: Option<&str>,
     ) -> OutputCommandResult<super::EnvoiDeVolume> {
+        // #8920 — jamais de plein volume vers un ampli Devialet AIR, même si
+        // une route l'oubliait : rien ne part.
+        if crate::outputs::devialet_air::reglages::zone_air(&self.db, zone_id) {
+            warn!(zone_id, "devialet_air_plein_volume_pure_refuse_8920");
+            return Ok(super::EnvoiDeVolume::AucunVolumeFixe);
+        }
         // #6721 — l'armement de PURE est confirmé par l'utilisateur : c'est
         // l'action explicite qui autorise le 100 % (la garde ne mord pas sous
         // `pure_force`).
@@ -3995,6 +4001,15 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         device_id: Option<&str>,
     ) -> OutputCommandResult<()> {
+        // #8920 — le volume fixe n'existe pas sur Devialet AIR : armer
+        // enverrait le haut de la course à l'ampli. Refus, rien ne part.
+        if crate::outputs::devialet_air::reglages::zone_air(&self.db, zone_id) {
+            warn!(zone_id, "devialet_air_volume_fixe_refuse_8920");
+            return Err(OutputCommandError::failed(
+                OutputCommand::SetVolume,
+                "fixed volume is unavailable on a Devialet AIR zone".to_string(),
+            ));
+        }
         if let Some(did) = device_id {
             let output = { self.outputs.lock().await.get(did) };
             match output {
