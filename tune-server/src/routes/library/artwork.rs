@@ -400,7 +400,7 @@ pub(super) async fn proxy_artwork(
         };
         resultat = state.relais_pochettes_lan.relayer(&demande_lan).await;
         if resultat.is_ok() {
-            tracing::debug!(url = %q.url, "artwork_proxy_pochette_bibliotheque_reseau_local");
+            tracing::debug!(url = %tune_core::confidentialite::masquer_url(&q.url), "artwork_proxy_pochette_bibliotheque_reseau_local");
         }
     } else if refus_rattrapable
         && let Some(relaye) = pochette_d_un_serveur_multimedia_decouvert(&state, &q.url).await
@@ -431,7 +431,7 @@ pub(super) async fn proxy_artwork(
         }
         Err(Echec::Refus(refus)) => {
             tracing::warn!(
-                url = %q.url,
+                url = %tune_core::confidentialite::masquer_url(&q.url),
                 signee = q.sig.is_some(),
                 exemption_didl = exemption.is_some(),
                 refus = %refus,
@@ -445,7 +445,7 @@ pub(super) async fn proxy_artwork(
                 .into_response()
         }
         Err(Echec::Amont(erreur)) => {
-            tracing::debug!(url = %q.url, erreur = %erreur, "artwork_proxy_amont");
+            tracing::debug!(url = %tune_core::confidentialite::masquer_url(&q.url), erreur = %erreur, "artwork_proxy_amont");
             StatusCode::BAD_GATEWAY.into_response()
         }
     }
@@ -549,13 +549,13 @@ async fn pochette_d_un_serveur_multimedia_decouvert(
         .await;
     Some(match resultat {
         Ok(image) => {
-            tracing::debug!(url = %url, "artwork_proxy_pochette_serveur_multimedia");
+            tracing::debug!(url = %tune_core::confidentialite::masquer_url(&url), "artwork_proxy_pochette_serveur_multimedia");
             Ok(image)
         }
         Err(EchecTelechargement::Refus(refus)) => Err(Echec::Refus(refus)),
         Err(EchecTelechargement::Amont(e)) => Err(Echec::Amont(e)),
         Err(autre) => {
-            tracing::warn!(url = %url, refus = %autre, "artwork_proxy_serveur_multimedia_reponse_refusee");
+            tracing::warn!(url = %tune_core::confidentialite::masquer_url(&url), refus = %autre, "artwork_proxy_serveur_multimedia_reponse_refusee");
             Err(Echec::Amont(autre.to_string()))
         }
     })

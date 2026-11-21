@@ -306,6 +306,17 @@ pub(super) async fn pas_de_volume(
     else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // #8920 — Devialet AIR : `step_db` est un pas en dB D'AMPLI, depuis le
+    // niveau que l'ampli rapporte (il fait foi), borné par la sécurité.
+    if let Some(d) = body.step_db
+        && body.step.is_none()
+        && tune_core::outputs::devialet_air::reglages::est_air(zone.output_type.as_deref())
+        && d.is_finite()
+        && d > 0.0
+        && d <= PAS_MAXIMAL_DB
+    {
+        return pas_de_volume_air(&state, id, &zone, signe > 0.0, d).await;
+    }
     let actuel = state.playback.get_state(id).await.volume;
     // #6787 — le pas en points se fait sur le curseur de la zone (`db60` sur
     // une sortie logicielle) ; `actuel` et la cible restent des gains.
@@ -364,6 +375,56 @@ pub(super) async fn pas_de_volume(
     // `limited` : la sécurité a retenu le pas — le client peut le dire au
     // lieu de laisser croire à un bouton cassé.
     obj.insert("limited".into(), json!(retenu + 1e-9 < cible));
+    volume_limites::publier(&mut obj, &state.backend, id);
+    Json(serde_json::Value::Object(obj)).into_response()
+}
+
+/// #8920 — le pas en dB d'ampli d'une zone Devialet AIR. Même réponse que
+/// [`pas_de_volume`], plus `device_volume_reported_db` (le niveau d'où le pas
+/// est parti) et `sent` (une commande est-elle partie ?).
+async fn pas_de_volume_air(
+    state: &AppState,
+    id: i64,
+    zone: &tune_core::db::zone_repo::Zone,
+    monter: bool,
+    pas_db: f64,
+) -> Response {
+    let pas = match state
+        .orchestrator
+        .pas_de_volume_air(id, zone.output_device_id.as_deref(), monter, pas_db)
+        .await
+    {
+        Ok(p) => p,
+        Err(error) => return crate::routes::playback::output_command_error_response(error),
+    };
+    if pas.envoye {
+        // #8165 — un pas + / − est un geste de volume : il lève la sourdine.
+        state
+            .orchestrator
+            .lever_la_sourdine_au_geste_de_volume(id, zone.output_device_id.as_deref())
+            .await;
+    }
+    let retenu = state.playback.get_state(id).await.volume;
+    let mut obj = serde_json::Map::new();
+    obj.insert("zone_id".into(), json!(id));
+    tune_core::audio::volume_scale::inserer_volume(&mut obj, retenu);
+    tune_core::audio::volume_scale::inserer_courbe(
+        &mut obj,
+        tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(zone.output_type.as_deref()),
+    );
+    tune_core::audio::volume_appareil_db::publier(
+        &mut obj,
+        &state.backend,
+        id,
+        zone.output_type.as_deref(),
+        retenu,
+    );
+    obj.insert("device_volume_reported_db".into(), json!(pas.depart_db));
+    obj.insert("sent".into(), json!(pas.envoye));
+    obj.insert(
+        "limited".into(),
+        json!(monter && (!pas.envoye || pas.retenu + 1e-9 < pas.cible)),
+    );
     volume_limites::publier(&mut obj, &state.backend, id);
     Json(serde_json::Value::Object(obj)).into_response()
 }

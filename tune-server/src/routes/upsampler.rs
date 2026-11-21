@@ -7,15 +7,20 @@
 //!   l'étude, quelques secondes, hors de tout fil audio) et garde le verdict.
 //! - `GET|PUT /zones/{id}` : le réglage d'une zone (`zone_{id}_upsampler`).
 //!
-//! Droits : PAYANT, comme le crossfeed (décision de Bertrand du 07/11/2026),
+//! Droits : PAYANT (décision de Bertrand du 07/11/2026),
 //! et FACULTATIF : le greffon `upsampler` s'installe depuis le catalogue
 //! (`POST /plugins/upsampler/install`, droit `upsampling`). Lire est libre ;
 //! activer exige le Premium (402) et le greffon installé (409). Désactiver
 //! reste toujours possible.
 //!
-//! Le réglage ne change jamais la piste en cours : l'étage d'une piste garde
-//! le choix de son ouverture, la sortie compare à la frontière suivante et
-//! rouvre. La réponse le dit (`applies_at: "next_track"`).
+//! Décision de Bertrand du 19/11/2026 (étude de la spec de Rémi, § B.2) : le
+//! réglage s'applique TOUT DE SUITE. L'étage d'une piste garde toujours le
+//! choix de son ouverture, mais `PUT /zones/{id}` relance le flux à la
+//! position en cours (environ une seconde de silence), comme la bascule PURE
+//! (#8422). La réponse le dit : `applies_at: "now"` (avec `restart: true`
+//! quand le flux est relancé), ou `"next_track"` quand rien ne peut agir
+//! avant (zone en pause, position inconnue), ou `"never"` sur une zone dont
+//! la sortie n'est pas locale.
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -121,13 +126,7 @@ fn contrainte(state: &AppState, premium: bool, zone_id: i64) -> Option<&'static 
     if let Err(ecarte) = su::choix_de_la_zone(&settings(state), premium, pure, zone_id) {
         return Some(ecarte.code());
     }
-    let peripherique = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
-        .get(zone_id)
-        .ok()
-        .flatten()
-        .and_then(|z| z.output_device_id)
-        .filter(|d| !d.is_empty());
-    if peripherique.is_some_and(|d| !d.starts_with("local:")) {
+    if sortie_non_locale(state, zone_id) {
         return Some("output_not_supported");
     }
     if tune_core::audio::bitperfect_strict::zone_enabled(&state.backend, zone_id) {
@@ -136,23 +135,59 @@ fn contrainte(state: &AppState, premium: bool, zone_id: i64) -> Option<&'static 
     None
 }
 
-async fn forme_de_zone(state: &AppState, zone_id: i64) -> Value {
+/// La zone joue sur une sortie qui n'est pas la sortie locale : le
+/// suréchantillonneur n'y agit pas.
+fn sortie_non_locale(state: &AppState, zone_id: i64) -> bool {
+    tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_device_id)
+        .filter(|d| !d.is_empty())
+        .is_some_and(|d| !d.starts_with("local:"))
+}
+
+/// Quand le réglage atteint le son, pour le client.
+fn applies_at(portee: tune_core::orchestrator::PorteeDuReglage) -> &'static str {
+    use tune_core::orchestrator::PorteeDuReglage as P;
+    match portee {
+        P::Immediate | P::Relance | P::RienNeJoue => "now",
+        P::PisteSuivante => "next_track",
+    }
+}
+
+/// `portee` : celle du `PUT` qui vient d'écrire ; `None` pour une lecture,
+/// qui dit ce que fera un changement (tout de suite).
+async fn forme_de_zone(
+    state: &AppState,
+    zone_id: i64,
+    portee: Option<tune_core::orchestrator::PorteeDuReglage>,
+) -> Value {
     let s = settings(state);
     let premium = state.license.check_feature(Feature::Upsampling).await;
     let reglages = su::reglages_de_la_zone(&s, zone_id);
+    let contrainte = contrainte(state, premium, zone_id);
+    // 19/11/2026 — sur une zone réseau le réglage n'agit pas : ni « now » ni
+    // « next_track », la contrainte dit pourquoi.
+    let quand = if sortie_non_locale(state, zone_id) {
+        "never"
+    } else {
+        portee.map_or("now", applies_at)
+    };
     json!({
         "zone_id": zone_id,
         "settings": reglages,
-        "constraint": contrainte(state, premium, zone_id),
+        "constraint": contrainte,
         "admitted_filters": su::verdict_enregistre(&s).map(|v| {
             v.filtres_admis().into_iter().map(str::to_string).collect::<Vec<_>>()
         }),
-        "applies_at": "next_track",
+        "applies_at": quand,
+        "restart": portee == Some(tune_core::orchestrator::PorteeDuReglage::Relance),
     })
 }
 
 async fn lire_zone(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
-    Json(forme_de_zone(&state, id).await)
+    Json(forme_de_zone(&state, id, None).await)
 }
 
 async fn ecrire_zone(
@@ -204,10 +239,10 @@ async fn ecrire_zone(
         )
             .into_response();
     }
-    // La sortie vivante reçoit le nouveau choix ; la piste en cours n'en
-    // est pas affectée (frontière suivante).
-    state.orchestrator.refresh_zone_upsampler(id).await;
-    Json(forme_de_zone(&state, id).await).into_response()
+    // 19/11/2026 — la sortie vivante reçoit le nouveau choix, et le flux qui
+    // joue est relancé à la position en cours pour l'entendre tout de suite.
+    let portee = state.orchestrator.apply_upsampler_change_portee(id).await;
+    Json(forme_de_zone(&state, id, Some(portee)).await).into_response()
 }
 
 #[cfg(test)]

@@ -466,9 +466,26 @@ impl TagRepo {
 
     pub fn update(&self, id: i64, name: Option<&str>, color: Option<&str>) -> Result<(), String> {
         if let Some(name) = name {
+            let ancien = self.get(id)?.map(|t| t.name);
             let sql = self.dialect_sql(sql::update_name, sql::update_name);
             let params: [&dyn ToSqlValue; 2] = [&name, &id];
             self.db.execute(&sql, &params)?;
+            // #9158 — renommer un tag (autrement qu'en casse ou en forme
+            // Unicode) le rend MANUEL partout : ses marques « scan » sont
+            // effacées. Sinon le scan suivant, qui cherche l'ancien nom lu dans
+            // le fichier, recréerait l'ancien tag et retirerait le nouveau.
+            let renomme = ancien.is_some_and(|a| {
+                crate::metadata::tags_perso::cle_de_nom(&a)
+                    != crate::metadata::tags_perso::cle_de_nom(name)
+            });
+            if renomme
+                && let Err(e) = self.db.execute(
+                    "DELETE FROM item_tags_scan WHERE tag_id = ?",
+                    &[&id as &dyn ToSqlValue],
+                )
+            {
+                tracing::debug!(error = %e, "tags_perso_marques_non_effacees_au_renommage");
+            }
         }
         if let Some(color) = color {
             let sql = self.dialect_sql(sql::update_color, sql::update_color);

@@ -106,6 +106,9 @@ fn apercu_confirme(corps: &[u8]) -> Option<Value> {
 }
 
 pub async fn proposer_tune_tested(
+    // Envoi au nom du compte (jeton, clé de licence) : administrateur, ou
+    // cette machine sans authentification.
+    _garde: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
     confirmation: axum::body::Bytes,

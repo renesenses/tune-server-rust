@@ -186,6 +186,7 @@ fn reprise_sous(
 ) -> reprises::Resume {
     reprises::Resume {
         resume_key: format!("cle-{context_type}-{context_id}"),
+        profile_id: None,
         context_type: context_type.into(),
         context_id: context_id.into(),
         source: "podcast".into(),
@@ -199,6 +200,9 @@ fn reprise_sous(
         position_ms,
         updated_at: quand.into(),
         items: vec![tune_core::db::play_queue_repo::QueueInput::Streaming {
+            media_format: None,
+            sample_rate: None,
+            bit_depth: None,
             source: "podcast".into(),
             source_id: EPISODE.into(),
             title: TITRE.into(),
@@ -311,6 +315,7 @@ fn reprise_de_service(
     let (source_id, titre, artiste, album) = piste;
     reprises::Resume {
         resume_key: format!("cle-{source}-{context_id}"),
+        profile_id: None,
         context_type: context_type.into(),
         context_id: context_id.into(),
         source: source.into(),
@@ -324,6 +329,9 @@ fn reprise_de_service(
         position_ms: 60_000,
         updated_at: quand.into(),
         items: vec![tune_core::db::play_queue_repo::QueueInput::Streaming {
+            media_format: None,
+            sample_rate: None,
+            bit_depth: None,
             source: source.into(),
             source_id: source_id.into(),
             title: titre.into(),

@@ -142,6 +142,12 @@ pub fn router() -> Router<AppState> {
                 .post(alertes_ignorees::ignorer)
                 .delete(alertes_ignorees::retablir),
         )
+        // #9028 — « Normal pour tout l'album » : aperçu, geste, annulation.
+        .route("/doubtful/album", get(alertes_album::apercu))
+        .route(
+            "/doubtful/ignored/album",
+            post(alertes_album::ignorer).delete(alertes_album::retablir),
+        )
         // Lookup (MusicBrainz)
         .route("/lookup/track", get(lookup_track))
         .route("/lookup/album", get(lookup_album))
@@ -3141,6 +3147,9 @@ async fn merge_albums(
 #[cfg(test)]
 mod tests_fusion_compilation;
 
+mod alertes_album;
+#[cfg(test)]
+mod alertes_album_tests_9028;
 mod alertes_ignorees;
 #[cfg(test)]
 mod alertes_ignorees_tests_8958;

@@ -471,6 +471,7 @@ fn verifier_source<R: Read + Seek + Send + Sync + 'static>(
     };
     let mut trames = 0u64;
     let mut trames_lien = 0u64;
+    let mut dernier_paquet = 0u64;
     loop {
         if !continuer() {
             return None;
@@ -481,7 +482,7 @@ fn verifier_source<R: Read + Seek + Send + Sync + 'static>(
             Err(Error::ResetRequired) => {
                 // Un Ogg chaîné est un fichier valide : vérifier chaque lien
                 // puis poursuivre avec les paramètres du suivant.
-                if attendues.is_some_and(|n| n != trames_lien)
+                if !longueur_conforme(attendues, trames_lien, dernier_paquet, flac.is_some())
                     || decoder.finalize().verify_ok == Some(false)
                 {
                     return Some(Resultat::defaut(
@@ -509,6 +510,7 @@ fn verifier_source<R: Read + Seek + Send + Sync + 'static>(
                     Err(e) => return Some(Resultat::defaut("decodeur", e, Some(trames), trames)),
                 };
                 trames_lien = 0;
+                dernier_paquet = 0;
                 continue;
             }
             Err(Error::IoError(e))
@@ -546,6 +548,7 @@ fn verifier_source<R: Read + Seek + Send + Sync + 'static>(
             Ok(pcm) => {
                 trames += pcm.frames() as u64;
                 trames_lien += pcm.frames() as u64;
+                dernier_paquet = pcm.frames() as u64;
             }
             Err(Error::Unsupported(_)) => {
                 return Some(Resultat::non_verifiable("codec_non_pris_en_charge", trames));
@@ -553,7 +556,7 @@ fn verifier_source<R: Read + Seek + Send + Sync + 'static>(
             Err(e) => return Some(Resultat::defaut("decodage", e, Some(trames), trames)),
         }
     }
-    if trames == 0 || attendues.is_some_and(|n| n != trames_lien) {
+    if trames == 0 || !longueur_conforme(attendues, trames_lien, dernier_paquet, flac.is_some()) {
         return Some(Resultat::defaut(
             "longueur_incorrecte",
             format!("{trames} trames décodées ; attendues : {attendues:?}"),
@@ -592,6 +595,28 @@ fn verifier_source<R: Read + Seek + Send + Sync + 'static>(
         fautes: None,
         unites_controlees: None,
     })
+}
+
+/// #8807 — les `decodees` échantillons d'un flux (ou d'un lien Ogg) tiennent
+/// la longueur `attendues` annoncée par le conteneur. Le FLAC doit tomber
+/// juste : STREAMINFO compte chaque échantillon. Ailleurs, le décodeur rend
+/// des paquets entiers (AAC : 1 024 échantillons), et le MP4 de symphonia
+/// 0.6 annonce `num_frames` sans le bourrage du dernier paquet, qu'il ne
+/// rogne pas (`trim_end` nul) : 4 692 enregistrements `.m4a` sains comptés
+/// « corrompus » sur le .18. Un excédent plus court que le dernier paquet
+/// décodé est ce bourrage. Un manque, ou un excédent d'un paquet entier ou
+/// plus, reste une faute.
+fn longueur_conforme(
+    attendues: Option<u64>,
+    decodees: u64,
+    dernier_paquet: u64,
+    flac: bool,
+) -> bool {
+    match attendues {
+        None => true,
+        Some(n) if flac => n == decodees,
+        Some(n) => decodees >= n && decodees - n < dernier_paquet.max(1),
+    }
 }
 
 /// Ce que sait le décodage complet quand le flux FLAC finit trop tôt.
@@ -1032,3 +1057,7 @@ mod tests {
 #[cfg(test)]
 #[path = "audit_integrite_tests_8403.rs"]
 mod tests_8403;
+
+#[cfg(test)]
+#[path = "audit_integrite_tests_8807.rs"]
+mod tests_8807;

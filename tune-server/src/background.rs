@@ -53,6 +53,9 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     // Fil 2137 : une gravure DR tuée par l'arrêt précédent a laissé
     // `running` en base ; on la dit `interrupted` pour débloquer le bouton.
     crate::routes::library::graver_dr::marquer_passe_interrompue_au_demarrage(&state.backend);
+    // Une fois, idempotent : les profils nommés par l'adresse de leur compte
+    // (liaisons d'avant la règle) prennent un nom neutre.
+    tune_core::cloud::nom_de_profil::renommer_les_profils_nommes_par_leur_adresse(&state.backend);
     spawn_squeezebox_poller(state);
     // #8077 — la passe de fond des apports Qobuz (15 min après, puis 6 h).
     #[cfg(not(feature = "sans-enrichissement"))]
@@ -1113,7 +1116,7 @@ fn spawn_ssdp_startup_scan(state: &AppState) {
                             name = %d.name,
                             device_id = %d.id,
                             host = %d.host,
-                            location,
+                            location = %tune_core::confidentialite::masquer_url(&location),
                             error = %e,
                             "ssdp_startup_description_injoignable"
                         );

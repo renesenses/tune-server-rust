@@ -552,6 +552,11 @@ impl SqliteDb {
 
     pub fn init_schema(&self) -> Result<(), String> {
         self.execute_batch(CORE_SCHEMA)?;
+        // #9265 — table sans numéro lue par la grille Artistes : elle doit
+        // exister dès le schéma de base (aussi posée par la passe finale de
+        // `run_migrations`).
+        self.execute_batch(super::artistes_des_credits::SQL_TABLE)?;
+        self.execute_batch(super::artistes_des_credits::SQL_INDEX)?;
         // #5192 — `IF NOT EXISTS` comme le reste : sur une base existante,
         // c'est la passe finale de `run_migrations` qui met l'index à niveau.
         self.execute_batch(
@@ -961,6 +966,9 @@ CREATE TABLE IF NOT EXISTS queue_items (
     disc_number INTEGER,
     album_ref TEXT,
     artist_ref TEXT,
+    media_format TEXT,
+    sample_rate INTEGER,
+    bit_depth INTEGER,
     context_type TEXT,
     context_id TEXT,
     context_source TEXT,

@@ -52,7 +52,11 @@ async fn sauvegarder_maintenant(corps_du_site: &'static str) -> (StatusCode, Val
         )
         .unwrap();
 
+    // Envoi au nom du compte : depuis cette machine (authentification coupée).
     let reponse = crate::routes::router(etat)
+        .layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+        ))
         .oneshot(
             Request::post("/api/v1/system/config-backup/cloud/backup-now")
                 .body(Body::empty())

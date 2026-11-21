@@ -68,6 +68,8 @@ fn album(id: &str, titre: &str, artiste: &str) -> StreamAlbum {
         track_count: 10,
         quality: None,
         released_at: None,
+        genre_id: None,
+        genre_name: None,
     }
 }
 

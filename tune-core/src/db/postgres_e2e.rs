@@ -1008,6 +1008,9 @@ async fn pg_6079_la_file_garde_l_artiste_de_service() {
         .unwrap();
     let repo = PlayQueueRepo::with_backend(db.clone());
     let ligne = |id: &str, album: Option<&str>, artiste: Option<&str>| QueueInput::Streaming {
+        media_format: None,
+        sample_rate: None,
+        bit_depth: None,
         source: "qobuz".into(),
         source_id: id.into(),
         title: format!("Titre {id}"),
@@ -1098,6 +1101,9 @@ async fn pg_6466_le_conteneur_des_elements_de_file() {
         .unwrap();
     let repo = PlayQueueRepo::with_backend(db.clone());
     let ligne = |id: &str| QueueInput::Streaming {
+        media_format: None,
+        sample_rate: None,
+        bit_depth: None,
         source: "qobuz".into(),
         source_id: id.into(),
         title: format!("Titre {id}"),

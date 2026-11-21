@@ -71,8 +71,12 @@ async fn le_retrait_upnp_previent_les_vues_de_bibliotheque_8832() {
     while let Ok(e) = evenements.try_recv() {
         types.push(e.event_type);
     }
-    assert!(
-        types.iter().any(|t| t == "library.updated"),
+    assert_eq!(
+        types
+            .iter()
+            .filter(|t| t.as_str() == "library.updated")
+            .count(),
+        1,
         "#8832 : la piste a disparu mais aucune invalidation de bibliothèque n'atteint les vues ouvertes : {types:?}"
     );
 }
@@ -198,4 +202,51 @@ async fn un_retrait_annule_ne_previent_pas_les_vues_8832() {
 #[tokio::test]
 async fn une_piste_retiree_ne_se_remplace_pas_par_la_premiere_de_l_album_8832() {
     verifier_refus_sans_perdre_la_file("album").await;
+}
+
+#[tokio::test]
+async fn le_retrait_pendant_l_attente_de_file_preserve_la_file_8832() {
+    use std::future::Future;
+    use std::task::Poll;
+
+    let (state, zone, id, gardee) = banc();
+    // La vraie route contrôle d'abord la piste, puis attend cette porte.
+    // Aucun sommeil : poller la requête la conduit jusqu'à cette attente.
+    let porte = crate::sqlite_write_gate::user_queue().await;
+    let mut lecture = Box::pin(
+        crate::routes::playback::router()
+            .with_state(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/{zone}/play"))
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(json!({"track_ids": [id]}).to_string()))
+                    .unwrap(),
+            ),
+    );
+    std::future::poll_fn(|cx| {
+        assert!(lecture.as_mut().poll(cx).is_pending());
+        assert!(crate::sqlite_write_gate::file_en_attente());
+        Poll::Ready(())
+    })
+    .await;
+    confirmer(&state, id).await;
+    drop(porte);
+    let reponse = lecture.await.unwrap();
+    let statut = reponse.status();
+    let corps: Value =
+        serde_json::from_slice(&to_bytes(reponse.into_body(), 1024 * 1024).await.unwrap()).unwrap();
+    let file = PlayQueueRepo::with_backend(state.backend.clone())
+        .get_ordered(zone)
+        .unwrap()
+        .into_iter()
+        .filter_map(|e| e.track_id)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        (statut, file),
+        (StatusCode::NOT_FOUND, vec![gardee]),
+        "#8832 : un retrait pendant l'attente de la porte efface la file précédente : {corps}"
+    );
+    assert_eq!(corps["code"], "track_missing");
 }

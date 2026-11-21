@@ -1371,12 +1371,27 @@ struct GenreAlbumsQuery {
     section: Option<String>,
 }
 
+/// Profondeur maximale servie par `/genres/{id}/albums`.
+const LIMITE_MAX_ALBUMS_GENRE: usize = 200;
+
 async fn service_genre_albums(
     State(state): State<StreamingHttpState>,
     Path((service, genre_id)): Path<(String, String)>,
     Query(q): Query<GenreAlbumsQuery>,
 ) -> Response {
-    let limit = q.limit.unwrap_or(50);
+    // Sans `?limit=`, seules les nouveautés d'un genre chez Qobuz montent à
+    // 200 : c'est le seul connecteur qui pagine en interne
+    // (`nouveautes_du_lecteur()`, par pages de 50). Spotify refuse un `limit`
+    // au-delà de 50 (400) et TIDAL plafonne ses pages, donc les autres
+    // services et les rubriques éditoriales gardent 50. Une limite explicite
+    // est bornée à `LIMITE_MAX_ALBUMS_GENRE` pour qu'un `?limit=100000` ne
+    // fasse pas paginer Qobuz indéfiniment.
+    let defaut = if q.section.is_none() && service == "qobuz" {
+        LIMITE_MAX_ALBUMS_GENRE
+    } else {
+        50
+    };
+    let limit = q.limit.unwrap_or(defaut).min(LIMITE_MAX_ALBUMS_GENRE);
     match q.section.as_deref() {
         None => with_svc_editorial_retirable!(
             &state,
@@ -1753,9 +1768,15 @@ async fn service_status(
     // playlists) et retenait toutes les lectures arrivées après lui : les
     // widgets de l'accueil tombaient en « délai ». L'écriture n'est prise que
     // pour une connexion par interrogation, que Qobuz n'a pas.
-    let mut status = svc.read().await.auth_status().await;
+    let (mut status, a_reconnecter) = {
+        let lecture = svc.read().await;
+        (
+            lecture.auth_status().await,
+            raison_de_reconnexion(&**lecture),
+        )
+    };
     if status.authenticated || !connexion_par_interrogation(&service) {
-        return reponse_etat_du_service(&service, &status);
+        return reponse_etat_du_service(&service, &status, a_reconnecter);
     }
     let mut svc = svc.write().await;
     status = svc.auth_status().await;
@@ -1767,8 +1788,19 @@ async fn service_status(
         drop(svc);
         state.save_tokens().await;
         purge_contenu_utilisateur(&service);
+        return reponse_etat_du_service(&service, &status, None);
     }
-    reponse_etat_du_service(&service, &status)
+    reponse_etat_du_service(&service, &status, a_reconnecter)
+}
+
+/// #8904 — pourquoi le compte d'un service est « à reconnecter », s'il l'est.
+/// Aujourd'hui YouTube seul : jetons du client de repli retiré, effacés.
+fn raison_de_reconnexion(
+    svc: &dyn tune_core::streaming::traits::StreamingService,
+) -> Option<&'static str> {
+    svc.as_any()
+        .downcast_ref::<tune_core::streaming::youtube::YouTubeService>()
+        .and_then(|yt| yt.raison_de_reconnexion())
 }
 
 /// Le service sait-il se connecter par interrogation (`{"poll": true}`) ?
@@ -1783,15 +1815,22 @@ fn connexion_par_interrogation(service: &str) -> bool {
 fn reponse_etat_du_service(
     service: &str,
     status: &tune_core::streaming::traits::AuthStatus,
+    a_reconnecter: Option<&str>,
 ) -> Response {
-    Json(json!({
+    let mut corps = json!({
         "service": service,
         "enabled": true,
         "authenticated": status.authenticated,
         "username": status.username,
         "subscription": status.subscription,
-    }))
-    .into_response()
+    });
+    // #8904 — seulement quand le compte est à reconnecter : la forme
+    // habituelle de la réponse ne change pas.
+    if let Some(raison) = a_reconnecter.filter(|_| !status.authenticated) {
+        corps["reconnect_required"] = json!(true);
+        corps["reconnect_reason"] = json!(raison);
+    }
+    Json(corps).into_response()
 }
 
 /// L'hôte par lequel le CLIENT a joint le serveur : `X-Forwarded-Host`
@@ -2482,6 +2521,27 @@ async fn service_favorites(
     };
     match result {
         Ok(data) => Json(data).into_response(),
+        // #9082 — la liaison ne porte pas la portée de lecture des artistes
+        // suivis (compte Spotify relié avant #8579) : ce n'est ni une panne
+        // ni un jeton expiré. Liste vide qualifiée, en 200, sans tenter de
+        // rafraîchissement : l'écran charge le reste et peut proposer
+        // « Reconnecter Spotify ». Avant, le 403 de Spotify devenait un 502
+        // et une notification d'erreur à chaque lancement.
+        Err(tune_core::TuneError::Refused { code, message })
+            if code == tune_core::streaming::spotify::CODE_RECONNEXION_ARTISTES_SUIVIS =>
+        {
+            tracing::info!(service = %service, fav_type = %fav_type, code, "streaming_favorites_portee_manquante");
+            let mut donnees = presenter(json!({ "artists": [] }), &fav_type, &tri);
+            if let Some(objet) = donnees.as_object_mut() {
+                objet.insert(
+                    "portee_manquante".into(),
+                    json!(tune_core::streaming::spotify::PORTEE_ARTISTES_SUIVIS),
+                );
+                objet.insert("code".into(), json!(code));
+                objet.insert("message".into(), json!(message));
+            }
+            Json(donnees).into_response()
+        }
         Err(ref e)
             if {
                 let msg = e.to_string();
@@ -3353,11 +3413,11 @@ mod tests_cache_utilisateur {
         async fn get_genre_albums(
             &self,
             genre_id: &str,
-            _limit: usize,
+            limit: usize,
         ) -> Result<Vec<StreamAlbum>, TuneError> {
             Ok(vec![StreamAlbum {
                 id: "n1".into(),
-                title: format!("nouveautes|{genre_id}"),
+                title: format!("nouveautes|{genre_id}|{limit}"),
                 ..StreamAlbum::default()
             }])
         }
@@ -4555,7 +4615,39 @@ mod tests_route_rubrique_par_genre {
     #[tokio::test]
     async fn sans_rubrique_la_route_rend_les_nouveautes() {
         let vus = titres("essai-genre-defaut", None, None).await;
-        assert_eq!(vus, vec![String::from("nouveautes|80")]);
+        assert_eq!(vus, vec![String::from("nouveautes|80|50")]);
+    }
+
+    /// Sans `?limit=`, Qobuz (seul à paginer en interne) sert 200 nouveautés ;
+    /// les autres services gardent 50 (Spotify refuse plus, 400).
+    #[tokio::test]
+    async fn la_limite_par_defaut_depend_du_service() {
+        assert_eq!(
+            titres("qobuz", None, None).await,
+            vec![String::from("nouveautes|80|200")]
+        );
+        assert_eq!(
+            titres("spotify", None, None).await,
+            vec![String::from("nouveautes|80|50")]
+        );
+        // Une rubrique éditoriale garde 50 même chez Qobuz.
+        assert_eq!(
+            titres("qobuz", None, Some("press-awards")).await,
+            vec![String::from("press-awards|80|50")]
+        );
+    }
+
+    /// Une limite explicite passe telle quelle, mais bornée à 200.
+    #[tokio::test]
+    async fn la_limite_explicite_est_bornee() {
+        assert_eq!(
+            titres("qobuz", Some(40), None).await,
+            vec![String::from("nouveautes|80|40")]
+        );
+        assert_eq!(
+            titres("qobuz", Some(100_000), None).await,
+            vec![String::from("nouveautes|80|200")]
+        );
     }
 }
 
@@ -4735,6 +4827,9 @@ mod pays_du_catalogue_8481_tests;
 
 #[cfg(test)]
 mod favoris_sans_gel_7729_tests;
+
+#[cfg(test)]
+mod favoris_portee_manquante_9082_tests;
 
 #[cfg(test)]
 mod favoris_pagines_8040_tests;
@@ -5173,6 +5268,8 @@ mod tests_labels_6934 {
             release_type: None,
             ai_generated: None,
             explicit: None,
+            genre_id: None,
+            genre_name: None,
         }
     }
 

@@ -163,7 +163,7 @@ pub fn corriger_le_statut(device_id: &str, statut: &mut OutputStatus) {
         tracing::info!(
             device_id,
             session = %s.plan.session_id,
-            uri,
+            uri = %crate::confidentialite::masquer_url(&uri),
             "flux_continu_quitte_par_le_renderer"
         );
         m.remove(device_id);

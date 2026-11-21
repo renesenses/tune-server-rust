@@ -7278,6 +7278,9 @@ async fn l_historique_garde_la_page_d_une_ecoute_bandcamp_2121() {
         .append(
             zone_id,
             &[QueueInput::Streaming {
+                media_format: None,
+                sample_rate: None,
+                bit_depth: None,
                 source: "bandcamp".into(),
                 source_id: "https://t4.bcbits.com/stream/e4/mp3-128/29192493?ts=1791020000".into(),
                 title: "Meet Her".into(),
@@ -9572,7 +9575,7 @@ async fn premium_sdk_free_equalizer_reaches_pcm_and_pure_still_bypasses() {
 }
 
 #[tokio::test]
-async fn audio_offer_crossfeed_hard_cut_preserves_settings_for_premium_reactivation() {
+async fn audio_offer_crossfeed_gratuit_preserves_settings_across_tiers() {
     let mut orch = test_orchestrator();
     let license = Arc::new(crate::license::LicenseManager::new_with_limit(
         orch.db.clone(),
@@ -9583,11 +9586,11 @@ async fn audio_offer_crossfeed_hard_cut_preserves_settings_for_premium_reactivat
     let saved = r#"{"enabled":true,"amount":0.37,"delay_ms":0.65}"#;
     settings.set("zone_1_crossfeed", saved).unwrap();
     crate::audio::premium_plugins::migrate_for_account(&settings, false).unwrap();
-    assert!(orch.load_crossfeed_processor(1, 48000).is_none());
-    // Even installed/enabled flags cannot grant Free accounts the processor.
+    assert!(orch.load_crossfeed_processor(1, 48000).is_some());
+    // Le compte Free a accès au même processeur.
     settings.set("plugin_crossfeed_installed", "true").unwrap();
     settings.set("plugin_crossfeed_enabled", "true").unwrap();
-    assert!(orch.load_crossfeed_processor(1, 48000).is_none());
+    assert!(orch.load_crossfeed_processor(1, 48000).is_some());
     license.set_account_premium(true, None).await;
     let mut processor = orch
         .load_crossfeed_processor(1, 48000)
@@ -9600,8 +9603,8 @@ async fn audio_offer_crossfeed_hard_cut_preserves_settings_for_premium_reactivat
     assert_ne!(pcm, before, "reactivated crossfeed must reach PCM");
     license.set_account_premium(false, None).await;
     assert!(
-        orch.load_crossfeed_processor(1, 48000).is_none(),
-        "downgrade must cut immediately"
+        orch.load_crossfeed_processor(1, 48000).is_some(),
+        "le retour en Free conserve le crossfeed simple"
     );
     assert_eq!(
         settings.get("zone_1_crossfeed").unwrap().as_deref(),
@@ -9631,7 +9634,9 @@ async fn audio_offer_crossfeed_hard_cut_preserves_settings_for_premium_reactivat
 #[tokio::test]
 async fn une_uri_de_notre_bibliotheque_n_est_plus_un_episode() {
     let device_id = "dlna-4323";
-    let orch = test_orchestrator();
+    let mut orch = test_orchestrator();
+    // #9207 — l'URI n'est la nôtre que sur le port du serveur.
+    orch.streamer = Arc::new(AudioStreamer::new(8888));
 
     orch.db
         .execute(
@@ -9649,9 +9654,14 @@ async fn une_uri_de_notre_bibliotheque_n_est_plus_un_episode() {
         .execute(
             "INSERT INTO tracks (id, title, album_id, artist_id, file_path, format, \
              duration_ms, sample_rate, bit_depth, channels) \
-             VALUES (187500, 'Quartet No. 10', 1, 1, '/aucun/chemin/4323.flac', 'flac', \
+             VALUES (187500, 'Quartet No. 10', 1, 1, ?, 'flac', \
              300000, 44100, 16, 2)",
-            &[],
+            // #9207 — la piste reconnue se résout en piste locale : son
+            // fichier doit exister.
+            &[
+                &concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac")
+                    as &dyn crate::db::backend::ToSqlValue,
+            ],
         )
         .unwrap();
 
@@ -11997,6 +12007,97 @@ async fn remplacer_la_lecture_d_une_zone_dlna_ferme_le_flux_remplace_8404() {
     );
 }
 
+/// #8404 — la course de deux `play` sur la même zone DLNA, rendue
+/// déterministe. La tablette lance la piste 1 ; pendant que sa lecture attend
+/// encore d'être envoyée au renderer (pré-tampon DLNA, sortie lente), le
+/// portable lance la piste 3, qui ferme la session de la piste 1 et part au
+/// renderer. La lecture de la tablette trouve alors son flux mort : elle
+/// arrêtait la zone, écrivait « stopped » en base et diffusait un bandeau
+/// fatal, alors que le renderer jouait la piste du portable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn une_lecture_doublee_pendant_son_envoi_n_arrete_pas_la_gagnante_8404() {
+    use crate::db::backend::ToSqlValue;
+    let device_id = "dlna-marantz-nr1200-course-8404";
+    let (orch, zone_creee, _dir) = zone_reseau_trois_pistes(device_id, false).await;
+    // Identifiant propre au test : le point d'arrêt est un registre global.
+    let zone_id: i64 = 984_404;
+    orch.db
+        .execute(
+            "UPDATE zones SET id = ? WHERE id = ?",
+            &[&zone_id as &dyn ToSqlValue, &zone_creee as &dyn ToSqlValue],
+        )
+        .unwrap();
+
+    let (arrivee, reprise) = super::transport::point_d_arret_8404::armer(zone_id);
+    let tablette = orch.play(PlayRequest {
+        zone_id,
+        track_id: Some(1),
+        source: Some("local".into()),
+        ..Default::default()
+    });
+    let portable = async {
+        // La tablette est retenue juste avant son envoi.
+        arrivee.notified().await;
+        let resultat = orch
+            .play(PlayRequest {
+                zone_id,
+                track_id: Some(3),
+                source: Some("local".into()),
+                ..Default::default()
+            })
+            .await;
+        reprise.notify_one();
+        resultat
+    };
+    let (tablette, portable) = tokio::join!(tablette, portable);
+    let portable = portable.expect("lecture du portable");
+    assert!(
+        portable.output_sent,
+        "le titre du portable part au renderer"
+    );
+    let etat = orch.playback.get_state(zone_id).await;
+    assert_eq!(
+        etat.state,
+        PlayState::Playing,
+        "la lecture doublée a arrêté la zone qui joue le titre du portable"
+    );
+    let np = etat.now_playing.expect("le titre du portable est en cours");
+    assert_eq!(np.track_id, Some(3));
+    let sid_portable = np.stream_id.expect("session du portable");
+    assert_eq!(
+        ZoneRepo::with_backend(orch.db.clone())
+            .get_last_play_state(zone_id)
+            .as_deref(),
+        Some("playing"),
+        "« stopped » écrit en base : la reprise au redémarrage perdrait la lecture"
+    );
+    let vivantes: Vec<String> = {
+        let sessions = orch.streamer.sessions_state();
+        let sessions = sessions.lock().await;
+        sessions.keys().cloned().collect()
+    };
+    assert_eq!(
+        vivantes,
+        vec![sid_portable.clone()],
+        "une seule session vivante"
+    );
+
+    let outputs = orch.outputs.lock().await;
+    let out = outputs.get(device_id).expect("sortie enregistrée");
+    let guard = out.lock().await;
+    let mock = guard.as_any().downcast_ref::<MockOutput>().expect("mock");
+    let url = mock.last_play_url().await.expect("une URL envoyée");
+    assert!(url.contains(&sid_portable), "dernière URL reçue : {url}");
+
+    let tablette = tablette.expect("la lecture doublée n'est pas une erreur");
+    assert!(!tablette.output_sent);
+    assert_eq!(
+        tablette.error.as_deref(),
+        Some(crate::orchestrator::PLAY_SUPERSEDED),
+        "la lecture de la tablette se sait doublée"
+    );
+}
+
 /// #8689 — mesure sur les échantillons, sans sortie audio ni appel réseau.
 /// Le bras réseau utilise cette même chaîne DSP pour les titres de service.
 #[tokio::test]
@@ -12165,5 +12266,390 @@ async fn une_source_directe_http_reste_jouable() {
             .clone()
             .unwrap_or_else(|| resolu.url.clone());
         assert!(vue.starts_with("http"), "valeur rognée attendue : {vue:?}");
+    }
+}
+
+#[tokio::test]
+async fn crossfeed_gratuit_9210_traite_en_free_et_respecte_les_choix() {
+    let mut orch = test_orchestrator();
+    let license = Arc::new(crate::license::LicenseManager::new_with_limit(
+        orch.db.clone(),
+        3,
+    ));
+    orch.license = Some(license.clone());
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(crate::audio::premium_plugins::MIGRATION, "complete")
+        .unwrap();
+    settings.set("plugin_crossfeed_installed", "true").unwrap();
+    settings.set("plugin_crossfeed_enabled", "true").unwrap();
+    let saved = r#"{"enabled":true,"amount":0.37,"delay_ms":0.65}"#;
+    settings.set("zone_1_crossfeed", saved).unwrap();
+    assert!(!license.is_premium().await);
+    let mut processor = orch
+        .load_crossfeed_processor(1, 48000)
+        .expect("crossfeed simple gratuit");
+    let mut pcm = vec![0.0; 4096];
+    pcm[0] = 1.0;
+    let before = pcm.clone();
+    processor.process_interleaved(&mut pcm);
+    assert_ne!(pcm, before, "le DSP gratuit doit traiter les échantillons");
+    settings
+        .set("zone_1_audiophile", r#"{"enabled":true}"#)
+        .unwrap();
+    assert!(
+        orch.load_crossfeed_processor(1, 48000).is_none(),
+        "PURE reste prioritaire"
+    );
+    settings
+        .set("zone_1_audiophile", r#"{"enabled":false}"#)
+        .unwrap();
+    settings.set("plugin_crossfeed_enabled", "false").unwrap();
+    assert!(orch.load_crossfeed_processor(1, 48000).is_none());
+    settings.set("plugin_crossfeed_enabled", "true").unwrap();
+    settings.set("plugin_crossfeed_installed", "false").unwrap();
+    crate::audio::premium_plugins::migrate_for_account(&settings, false).unwrap();
+    assert!(
+        orch.load_crossfeed_processor(1, 48000).is_none(),
+        "ne pas réinstaller un greffon retiré"
+    );
+    assert_eq!(
+        settings.get("zone_1_crossfeed").unwrap().as_deref(),
+        Some(saved)
+    );
+}
+
+#[tokio::test]
+async fn crossfeed_gratuit_9210_droit_annonce_et_greffons_tiers_payants() {
+    let orch = test_orchestrator();
+    let license = crate::license::LicenseManager::new_with_limit(orch.db.clone(), 3);
+    assert!(
+        license
+            .check_feature(crate::license::Feature::Crossfeed)
+            .await
+    );
+    assert!(!crate::license::Feature::all_premium().contains(&crate::license::Feature::Crossfeed));
+    assert!(
+        crate::license::Feature::all_advertised().any(|f| f == crate::license::Feature::Crossfeed)
+    );
+    assert!(
+        !license
+            .check_feature(crate::license::Feature::PluginMarketplace)
+            .await
+    );
+    assert!(!crate::audio::premium_plugins::requires_premium(
+        "crossfeed"
+    ));
+}
+
+#[tokio::test]
+async fn crossfeed_gratuit_9210_ancienne_retenue_et_desinstallation_preservees() {
+    let orch = test_orchestrator();
+    let license = crate::license::LicenseManager::new_with_limit(orch.db.clone(), 3);
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(crate::audio::premium_plugins::MIGRATION, "complete")
+        .unwrap();
+    settings.set("plugin_crossfeed_installed", "false").unwrap();
+    settings.set("plugin_crossfeed_enabled", "false").unwrap();
+    settings
+        .set(
+            "premium_audio_plugins_withheld_crossfeed",
+            "installed,enabled",
+        )
+        .unwrap();
+    crate::audio::premium_plugins::migrate_for_account(&settings, false).unwrap();
+    assert!(!crate::audio::premium_plugins::enabled(
+        &settings,
+        "crossfeed"
+    ));
+    // Comme une installation/désinstallation explicite depuis le catalogue.
+    crate::audio::premium_plugins::forget_withheld(&settings, "crossfeed").unwrap();
+    assert!(
+        settings
+            .get("premium_audio_plugins_withheld_crossfeed")
+            .unwrap()
+            .is_none()
+    );
+    license.set_account_premium(true, None).await;
+    assert!(!crate::audio::premium_plugins::installed(
+        &settings,
+        "crossfeed"
+    ));
+    assert!(!crate::audio::premium_plugins::enabled(
+        &settings,
+        "crossfeed"
+    ));
+}
+
+#[tokio::test]
+async fn le_format_upnp_suit_lecture_preparation_et_avance_de_file_8788() {
+    use crate::db::play_queue_repo::{PlayQueueRepo, QueueInput};
+    let orch = test_orchestrator();
+    let device = "mock-format-8788";
+    let zone = ZoneRepo::with_backend(orch.db.clone())
+        .create("Format UPnP factice", Some("mock"), Some(device))
+        .unwrap();
+    orch.outputs
+        .lock()
+        .await
+        .register(Box::new(MockOutput::new(device, "Sortie muette")));
+    let items = (0..2)
+        .map(|i| {
+            serde_json::from_value::<QueueInput>(serde_json::json!({"Streaming": {
+                "source": "upnp", "source_id": format!("http://127.0.0.1:9/ressource/{i}"),
+                "title": format!("Piste {i}"), "artist": "Banc", "album": null, "cover_url": null,
+                "duration_ms": 1000, "track_number": null, "disc_number": null,
+                "album_ref": null, "artist_ref": null,
+                "media_format": "wav", "sample_rate": 705600, "bit_depth": 24
+            }}))
+            .unwrap()
+        })
+        .collect::<Vec<_>>();
+    PlayQueueRepo::with_backend(orch.db.clone())
+        .append(zone, &items)
+        .unwrap();
+    let suivante = orch.resolve_queue_item_url(zone, 1).await.unwrap();
+    assert_eq!(
+        suivante.mime_type, "audio/wav",
+        "#8788 : le préchargement oublie le conteneur UPnP sans extension"
+    );
+    assert_eq!(
+        suivante.sample_rate,
+        Some(705600),
+        "#8788 : le préchargement oublie la cadence"
+    );
+    assert_eq!(suivante.bit_depth, Some(24));
+    orch.play_from_queue(zone, 0).await.unwrap();
+    let premiere = orch.playback.get_state(zone).await.now_playing.unwrap();
+    assert_eq!(
+        premiere.format.as_deref(),
+        Some("wav"),
+        "#8788 : Lire depuis la file oublie le conteneur"
+    );
+    assert_eq!(premiere.sample_rate, Some(705600));
+    assert_eq!(premiere.bit_depth, Some(24));
+    orch.advance_queue_metadata(zone, 1).await.unwrap();
+    let seconde = orch.playback.get_state(zone).await.now_playing.unwrap();
+    assert_eq!(seconde.title, "Piste 1");
+    assert_eq!(
+        seconde.format.as_deref(),
+        Some("wav"),
+        "#8788 : l'avance sans blanc oublie le conteneur"
+    );
+    assert_eq!(seconde.sample_rate, Some(705600));
+    assert_eq!(seconde.bit_depth, Some(24));
+}
+
+/// #9178 — le statut du crossfeed d'une zone OAAT ou navigateur ne la
+/// verrouille plus (`CrossfeedConstraint::NonLocalPartial`). La preuve, sur la
+/// DÉCISION réelle : ces sorties reçoivent le WAV progressif dont le relais
+/// porte le crossfeed. `armer` pose le seul crossfeed (et l'égaliseur si
+/// demandé) sur la zone.
+fn armer_crossfeed_9178(orch: &PlaybackOrchestrator, zone_id: i64, egaliseur: bool) {
+    let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+    settings
+        .set(
+            &format!("zone_{zone_id}_crossfeed"),
+            r#"{"enabled":true,"amount":0.3,"delay_ms":0.3}"#,
+        )
+        .unwrap();
+    if egaliseur {
+        settings
+            .set(
+                &format!("zone_{zone_id}_eq_profile"),
+                &serde_json::to_string(&radio_test_eq_profile()).unwrap(),
+            )
+            .unwrap();
+        settings.set("plugin_equalizer_installed", "true").unwrap();
+    }
+    assert!(
+        orch.zone_has_active_crossfeed(zone_id),
+        "montage sans crossfeed"
+    );
+}
+
+/// OAAT, crossfeed SEUL, FLAC de la bibliothèque : WAV progressif, relais
+/// armé, crossfeed exécuté.
+#[tokio::test]
+async fn oaat_porte_le_crossfeed_seul_9178() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Bureau", Some("oaat"), Some("oaat:bureau-9178"))
+        .unwrap();
+    piste_3234(
+        &orch,
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+        "flac",
+    );
+    armer_crossfeed_9178(&orch, zone_id, false);
+    let mut req = requete_locale_3234(zone_id, 1);
+    req.output_device_id = Some("oaat:bureau-9178".into());
+    let format = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(format.out_mime, "audio/wav");
+    assert!(!format.use_file_transcode, "OAAT part en session");
+    assert!(
+        orch.transcodage_decide_pour_test(&req).await.unwrap(),
+        "la piste doit passer par le relais, pas être servie telle quelle"
+    );
+    let (actif, relais, crossfeed) = orch.relais_dsp_pour_test(&req).await.unwrap();
+    assert!(
+        actif && relais && crossfeed,
+        "#9178 : OAAT doit recevoir le crossfeed par le relais ({actif}, {relais}, {crossfeed})"
+    );
+}
+
+/// Navigateur, FLAC + égaliseur + crossfeed : WAV progressif, le relais porte
+/// aussi le crossfeed.
+#[tokio::test]
+async fn navigateur_avec_un_autre_traitement_porte_le_crossfeed_9178() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Onglet", Some("browser"), Some("browser:onglet-9178"))
+        .unwrap();
+    piste_3234(
+        &orch,
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+        "flac",
+    );
+    armer_crossfeed_9178(&orch, zone_id, true);
+    let req = requete_locale_3234(zone_id, 1);
+    let format = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(format.out_mime, "audio/wav");
+    assert!(!format.use_file_transcode);
+    assert!(
+        orch.transcodage_decide_pour_test(&req).await.unwrap(),
+        "la piste doit passer par le relais, pas être servie telle quelle"
+    );
+    let (actif, relais, crossfeed) = orch.relais_dsp_pour_test(&req).await.unwrap();
+    assert!(
+        actif && relais && crossfeed,
+        "({actif}, {relais}, {crossfeed})"
+    );
+}
+
+/// Navigateur, AIFF (que `<audio>` ne lit pas) et crossfeed SEUL : converti
+/// en WAV, donc porté.
+#[tokio::test]
+async fn navigateur_aiff_porte_le_crossfeed_seul_9178() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Onglet", Some("browser"), Some("browser:onglet-aiff-9178"))
+        .unwrap();
+    piste_3234(
+        &orch,
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.aiff"),
+        "aiff",
+    );
+    armer_crossfeed_9178(&orch, zone_id, false);
+    let req = requete_locale_3234(zone_id, 1);
+    assert!(
+        orch.transcodage_decide_pour_test(&req).await.unwrap(),
+        "la piste doit passer par le relais, pas être servie telle quelle"
+    );
+    let (actif, relais, crossfeed) = orch.relais_dsp_pour_test(&req).await.unwrap();
+    assert!(
+        actif && relais && crossfeed,
+        "({actif}, {relais}, {crossfeed})"
+    );
+}
+
+/// La réserve, mesurée : navigateur, FLAC et crossfeed SEUL, la piste part
+/// telle quelle (aucune conversion), donc sans crossfeed. C'est pourquoi le
+/// motif est PARTIEL et non absent.
+#[tokio::test]
+async fn navigateur_flac_avec_le_crossfeed_seul_part_tel_quel_9178() {
+    let orch = test_orchestrator();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Onglet", Some("browser"), Some("browser:onglet-flac-9178"))
+        .unwrap();
+    piste_3234(
+        &orch,
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+        "flac",
+    );
+    armer_crossfeed_9178(&orch, zone_id, false);
+    let req = requete_locale_3234(zone_id, 1);
+    assert!(
+        !orch.transcodage_decide_pour_test(&req).await.unwrap(),
+        "un FLAC sans autre traitement est servi tel quel au navigateur"
+    );
+}
+
+/// Relecture rc13 — sur le relais WAV progressif d'OAAT et du navigateur, le
+/// crossfeed suit les MÊMES droits que l'écran : depuis #9210, le crossfeed
+/// simple est gratuit (aucune garde de licence), mais le greffon `crossfeed`
+/// reste la condition (`premium_plugins::enabled`, lu par
+/// `crossfeed_configure_with`). Les tests #9178 ci-dessus tournent sans
+/// gestionnaire de licence et avec le greffon présent ; celui-ci mesure la
+/// décision réelle (`relais_dsp_pour_test`) avec une VRAIE licence gratuite,
+/// puis greffon retiré, puis Premium.
+///
+/// L'égaliseur (gratuit) est armé pour que le relais tourne dans les trois
+/// cas : sans lui, « pas de crossfeed » ne se distinguerait pas de « pas de
+/// relais » (le FLAC partirait tel quel vers le navigateur). Seul le crossfeed
+/// doit varier.
+#[tokio::test]
+async fn relais_oaat_et_navigateur_crossfeed_gratuit_mais_sous_greffon() {
+    for (type_de_sortie, peripherique) in [
+        ("oaat", "oaat:salon-greffon"),
+        ("browser", "browser:salon-greffon"),
+    ] {
+        let mut orch = test_orchestrator();
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Salon", Some(type_de_sortie), Some(peripherique))
+            .unwrap();
+        piste_3234(
+            &orch,
+            concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/test.flac"),
+            "flac",
+        );
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone());
+        // Hors de la fenêtre legacy : le greffon compte par ses clés.
+        settings
+            .set(crate::audio::premium_plugins::MIGRATION, "complete")
+            .unwrap();
+        settings.set("plugin_crossfeed_installed", "true").unwrap();
+        armer_crossfeed_9178(&orch, zone_id, true);
+        let mut req = requete_locale_3234(zone_id, 1);
+        req.output_device_id = Some(peripherique.into());
+
+        // 1. Palier gratuit, greffon installé : le relais porte le crossfeed
+        //    (#9210, crossfeed simple gratuit).
+        orch.license = Some(Arc::new(crate::license::LicenseManager::new(
+            orch.db.clone(),
+        )));
+        assert!(!orch.license.as_ref().unwrap().premium_snapshot());
+        let (actif, relais, crossfeed) = orch.relais_dsp_pour_test(&req).await.unwrap();
+        assert!(
+            actif && relais,
+            "{type_de_sortie} : l'égaliseur doit armer le relais, sinon le test ne prouve rien"
+        );
+        assert!(
+            crossfeed,
+            "{type_de_sortie} : #9210, le crossfeed simple est gratuit, le relais doit le porter"
+        );
+
+        // 2. Greffon retiré : plus de crossfeed, même en Premium.
+        orch.license = Some(crate::license::licence_premium_pour_test(orch.db.clone()));
+        settings.set("plugin_crossfeed_installed", "false").unwrap();
+        let (actif, relais, crossfeed) = orch.relais_dsp_pour_test(&req).await.unwrap();
+        assert!(
+            actif && relais,
+            "{type_de_sortie} : relais armé par l'égaliseur"
+        );
+        assert!(
+            !crossfeed,
+            "{type_de_sortie} : sans le greffon, le relais porte le crossfeed"
+        );
+
+        // 3. Premium ET greffon : le relais porte le crossfeed (témoin).
+        settings.set("plugin_crossfeed_installed", "true").unwrap();
+        let (actif, relais, crossfeed) = orch.relais_dsp_pour_test(&req).await.unwrap();
+        assert!(actif && relais, "{type_de_sortie} : relais armé");
+        assert!(
+            crossfeed,
+            "{type_de_sortie} : greffon présent, le crossfeed doit être porté"
+        );
     }
 }

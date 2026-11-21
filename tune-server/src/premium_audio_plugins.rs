@@ -46,7 +46,7 @@ impl TunePlugin for PremiumAudio {
             "upsampler" => {
                 "Suréchantillonnage : filtres polyphases vers la plus haute cadence du DAC, sortie locale"
             }
-            _ => "Dé-ploc : silence en tête/queue et passages par zéro, FLAC/WAV",
+            _ => "Declick : silence en tête/queue et passages par zéro, FLAC/WAV",
         }
     }
     fn default_enabled(&self) -> bool {
@@ -128,7 +128,7 @@ pub fn descriptor(id: &str) -> Value {
             "batch",
         ),
         "declick" => ("declick", vec!["/api/v1/declick"], "declick", "batch"),
-        // #7614 — payant comme le crossfeed, facultatif comme l'égaliseur.
+        // #7614 — payant, facultatif comme l'égaliseur.
         "upsampler" => (
             "upsampler",
             vec!["/api/v1/upsampler", "/api/v1/upsampler/zones/{zone}"],
@@ -182,6 +182,23 @@ pub fn state_fields(settings: &SettingsRepo, id: &str) -> Option<serde_json::Map
         Value::Bool(premium_plugins::existing_configuration(settings, id)),
     );
     Some(fields)
+}
+/// #9151 — un emplacement audio intégré (les six de [`premium_plugins::IDS`])
+/// prend effet SANS redémarrage, dans un sens comme dans l'autre.
+///
+/// Tout ce qui le fait agir lit ses réglages à chaque appel : ses routes par
+/// [`require_installed`] (→ [`premium_plugins::enabled`]), et la chaîne
+/// audio par le même prédicat (`tune_core::audio::surechantillonnage::
+/// choix_de_la_zone`, `orchestrator/dsp.rs`). Son `setup()` (plus haut)
+/// ne fait que négocier le manifeste et monter un descripteur en lecture
+/// sous `/api/v1/ext/<id>/`, que ni le client web ni les télécommandes ne
+/// lisent. Que ce descripteur ne soit monté qu'au démarrage suivant
+/// n'empêche donc rien : annoncer `restart_required` envoyait l'utilisateur
+/// couper la musique pour rien, et le panneau « État des greffons » disait
+/// « redémarrage nécessaire » pour un suréchantillonneur qui marchait déjà
+/// (fil 2945).
+pub fn agit_sans_redemarrage(id: &str) -> bool {
+    premium_plugins::contains(id)
 }
 /// Pose les champs de [`state_fields`] à la racine d'une fiche de catalogue
 /// (objet JSON). Sans effet pour un greffon qui n'est pas audio premium.
@@ -615,6 +632,98 @@ pub(crate) mod tests {
         );
     }
 
+    /// #9151 (hifi25nl, fil 2945) — « installé mais non chargé ». Un intégré
+    /// facultatif installé EN COURS DE SESSION (upsampler payant,
+    /// channel-remap gratuit) agit tout de suite, par les routes réelles :
+    /// l'installation ne doit plus annoncer de redémarrage, ni la fiche du
+    /// catalogue, ni le panneau « État des greffons » (`GET /audio-plugins/`),
+    /// qui le disait « redémarrage nécessaire » et inactif. Désactiver ou
+    /// retirer un intégré monté au démarrage ne demande rien non plus : ses
+    /// portes se ferment aussitôt (#6924).
+    #[tokio::test]
+    async fn temoin_9151_un_integre_installe_en_cours_de_session_agit_sans_redemarrage() {
+        for id in ["upsampler", "channel-remap"] {
+            dossier_de_donnees_jetable();
+            let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+            let settings = SettingsRepo::with_backend(state.backend.clone());
+            let routers = crate::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
+            assert!(
+                !routers.iter().any(|(n, _)| n == id),
+                "banc : {id} dormant au démarrage, comme chez le testeur"
+            );
+            state
+                .license
+                .update_from_server(tune_core::license::Tier::Premium, None)
+                .await;
+            let app = crate::routes::router_with_plugins(state.clone(), routers).layer(
+                axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                    [127, 0, 0, 1],
+                    50000,
+                ))),
+            );
+            let (status, reponse) =
+                appel(&app, "POST", &format!("/api/v1/plugins/{id}/install")).await;
+            assert_eq!(status, StatusCode::OK, "{id} : installation {reponse}");
+            // La porte de ses routes est ouverte dès maintenant.
+            assert!(premium_plugins::enabled(&settings, id), "{id}");
+            assert!(
+                require_installed(&state, id, &axum::http::HeaderMap::new()).is_ok(),
+                "{id} : ses routes doivent répondre sans redémarrage"
+            );
+            assert_eq!(
+                reponse["restart_required"], false,
+                "#9151 : {id} agit déjà, l'installation ne doit pas annoncer de redémarrage — {reponse}"
+            );
+            let fiche = fiche_du_catalogue(&app, id).await;
+            assert_eq!(fiche["enabled"], true, "{fiche}");
+            assert_eq!(
+                fiche["restart_required"], false,
+                "#9151 : fiche de {id} en attente d'un redémarrage inutile — {fiche}"
+            );
+            let (status, etat) = appel(&app, "GET", "/api/v1/audio-plugins").await;
+            assert_eq!(status, StatusCode::OK, "{etat}");
+            let ligne = etat["plugins"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|p| p["id"] == id)
+                .unwrap_or_else(|| panic!("{id} absent du panneau : {etat}"))
+                .clone();
+            assert_eq!(
+                (ligne["active"].clone(), ligne["restart_required"].clone()),
+                (json!(true), json!(false)),
+                "#9151 : le panneau doit dire {id} actif, sans redémarrage — {ligne}"
+            );
+        }
+        // L'autre sens : un intégré monté au démarrage, désactivé puis retiré.
+        dossier_de_donnees_jetable();
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        settings
+            .set("plugin_channel-remap_installed", "true")
+            .unwrap();
+        settings
+            .set("plugin_channel-remap_enabled", "true")
+            .unwrap();
+        let routers = crate::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
+        assert!(
+            routers.iter().any(|(n, _)| n == "channel-remap"),
+            "banc : monté au démarrage"
+        );
+        let app = crate::routes::router_with_plugins(state.clone(), routers).layer(
+            axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                50000,
+            ))),
+        );
+        let (status, reponse) = appel(&app, "POST", "/api/v1/plugins/channel-remap/disable").await;
+        assert_eq!(status, StatusCode::OK, "{reponse}");
+        assert!(!premium_plugins::enabled(&settings, "channel-remap"));
+        assert_eq!(reponse["restart_required"], false, "{reponse}");
+        let (status, reponse) = appel(&app, "DELETE", "/api/v1/plugins/channel-remap").await;
+        assert_eq!(status, StatusCode::OK, "{reponse}");
+        assert_eq!(reponse["restart_required"], false, "{reponse}");
+    }
     /// #6974 (JeanPitre, fil 2248) — « l'égaliseur en mode Expert reste
     /// inaccessible malgré une licence Premium valide ». L'égaliseur est
     /// gratuit : ce qui ouvre ses écritures (résolution Expert, bandes de la
@@ -711,7 +820,8 @@ pub(crate) mod tests {
             let settings = SettingsRepo::with_backend(state.backend.clone());
             let routers = crate::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
             assert!(!state.license.is_premium().await);
-            for id in ["crossfeed", "converter", "declick"] {
+            assert!(premium_plugins::enabled(&settings, "crossfeed"));
+            for id in ["converter", "declick"] {
                 assert!(
                     !premium_plugins::enabled(&settings, id),
                     "{id} actif en Free"
@@ -809,10 +919,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn temoin_4861_bandeau_premium_sans_les_trois_greffons() {
         let (_state, _settings, app) = installation_touchee(true).await;
-        assert_eq!(
-            proposes(&app).await,
-            json!(["crossfeed", "converter", "declick"])
-        );
+        assert_eq!(proposes(&app).await, json!(["converter", "declick"]));
     }
 
     /// Témoin 2 : un compte Free ne reçoit jamais rien.
@@ -830,10 +937,10 @@ pub(crate) mod tests {
     async fn temoin_4861_bandeau_ignorer_est_memorise() {
         let (_state, settings, app) = installation_touchee(true).await;
         let (status, reponse) =
-            appel_avec_corps(&app, "POST", IGNORER, json!({"ids": ["crossfeed"]})).await;
+            appel_avec_corps(&app, "POST", IGNORER, json!({"ids": ["converter"]})).await;
         assert_eq!(status, StatusCode::OK, "{reponse}");
-        assert_eq!(reponse["ids"], json!(["converter", "declick"]));
-        assert_eq!(proposes(&app).await, json!(["converter", "declick"]));
+        assert_eq!(reponse["ids"], json!(["declick"]));
+        assert_eq!(proposes(&app).await, json!(["declick"]));
 
         let (status, reponse) = appel_avec_corps(
             &app,
@@ -846,11 +953,11 @@ pub(crate) mod tests {
         assert_eq!(reponse["ids"], json!([]));
         assert_eq!(proposes(&app).await, json!([]));
 
-        let (status, reponse) = appel(&app, "POST", "/api/v1/plugins/crossfeed/install").await;
+        let (status, reponse) = appel(&app, "POST", "/api/v1/plugins/converter/install").await;
         assert_eq!(status, StatusCode::OK, "{reponse}");
-        let (status, reponse) = appel(&app, "DELETE", "/api/v1/plugins/crossfeed").await;
+        let (status, reponse) = appel(&app, "DELETE", "/api/v1/plugins/converter").await;
         assert_eq!(status, StatusCode::OK, "{reponse}");
-        assert!(!premium_plugins::installed(&settings, "crossfeed"));
+        assert!(!premium_plugins::installed(&settings, "converter"));
         assert_eq!(
             proposes(&app).await,
             json!([]),
@@ -864,7 +971,7 @@ pub(crate) mod tests {
         let (_state, settings, app) = installation_touchee(true).await;
         settings.set("plugin_converter_installed", "true").unwrap();
         settings.set("plugin_converter_enabled", "true").unwrap();
-        assert_eq!(proposes(&app).await, json!(["crossfeed", "declick"]));
+        assert_eq!(proposes(&app).await, json!(["declick"]));
     }
 
     /// Témoin 5 : « Réinstaller » par la route d'installation EXISTANTE rend le
@@ -872,10 +979,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn temoin_4861_reinstaller_par_la_route_existante() {
         let (_state, settings, app) = installation_touchee(true).await;
-        assert_eq!(
-            proposes(&app).await,
-            json!(["crossfeed", "converter", "declick"])
-        );
+        assert_eq!(proposes(&app).await, json!(["converter", "declick"]));
         for id in ["crossfeed", "converter", "declick"] {
             let (status, reponse) =
                 appel(&app, "POST", &format!("/api/v1/plugins/{id}/install")).await;

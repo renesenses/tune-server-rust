@@ -524,7 +524,7 @@ impl Annuaires {
                             TTL_TROUVE
                         };
                         mettre_en_cache(cle, ttl, Some(trouve.clone()));
-                        info!(titre, source = source.cle(), flux = %trouve.url, "podcast_flux_resolu");
+                        info!(titre, source = source.cle(), flux = %crate::confidentialite::masquer_url(&trouve.url), "podcast_flux_resolu");
                         return Some(trouve);
                     }
                     Ok(false) => {}

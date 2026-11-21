@@ -687,7 +687,28 @@ pub fn restaurer(
             continue;
         };
         let affiche = p.get("display_name").and_then(Value::as_str);
-        let cible = match existants.iter().find(|e| e.name == nom).and_then(|e| e.id) {
+        // Un instantané d'avant les noms neutres (`cloud::nom_de_profil`)
+        // nomme un profil lié par l'adresse de son compte : il se rapproche
+        // alors par `email`, et un profil à recréer prend un nom neutre.
+        let par_adresse = || -> Option<i64> {
+            if !nom.contains('@') {
+                return None;
+            }
+            backend
+                .query_one(
+                    "SELECT id FROM profiles WHERE email = ?",
+                    &[&nom as &dyn ToSqlValue],
+                )
+                .ok()
+                .flatten()
+                .and_then(|row| row.first().and_then(|v| v.as_i64()))
+        };
+        let cible = match existants
+            .iter()
+            .find(|e| e.name == nom)
+            .and_then(|e| e.id)
+            .or_else(par_adresse)
+        {
             Some(id) => {
                 if mode == Mode::Replace
                     && let Some(a) = affiche
@@ -704,9 +725,27 @@ pub fn restaurer(
             None => {
                 // Ni mot de passe ni droit d'administration : ils ne
                 // voyagent pas (voir l'en-tête).
-                let id = repo.create(nom, affiche, None)?;
+                let nom_cree = if nom.contains('@') {
+                    crate::cloud::nom_de_profil::nom_libre(
+                        backend,
+                        affiche.unwrap_or(""),
+                        nom,
+                        None,
+                    )
+                } else {
+                    nom.to_string()
+                };
+                let affiche_neutre = affiche.map(crate::cloud::nom_de_profil::nom_affiche_neutre);
+                let id = repo.create(&nom_cree, affiche_neutre.as_deref(), None)?;
+                if nom.contains('@') {
+                    // Le profil reste rattaché au compte de son adresse.
+                    backend.execute(
+                        "UPDATE profiles SET email = ? WHERE id = ?",
+                        &[&nom.to_string() as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+                    )?;
+                }
                 rapport.profiles_created += 1;
-                rapport.profiles_without_password.push(nom.to_string());
+                rapport.profiles_without_password.push(nom_cree);
                 id
             }
         };
@@ -1125,7 +1164,11 @@ pub fn compte(settings: &SettingsRepo) -> Result<Compte, ErreurSite> {
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     };
-    let (Some(acces), Some(server_id)) = (lire("mozaik_access_token"), lire("server_id")) else {
+    // #8797 : une session refusée par le site vaut « non relié » pour tous
+    // les envois au nom du compte (sauvegarde, écoutes, notes) jusqu'à la
+    // reconnexion.
+    let (Some(acces), Some(server_id)) = (super::sso::jeton_de_compte(settings), lire("server_id"))
+    else {
         return Err(ErreurSite::NonRelie);
     };
     let base = lire("mozaik_base_url")

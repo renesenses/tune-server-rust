@@ -14,6 +14,9 @@ fn base() -> (Arc<dyn DbBackend>, i64) {
 
 fn piste(id: &str) -> QueueInput {
     QueueInput::Streaming {
+        media_format: None,
+        sample_rate: None,
+        bit_depth: None,
         source: "qobuz".into(),
         source_id: id.into(),
         title: id.into(),
@@ -55,6 +58,7 @@ fn prepare(avec_lignes: bool) -> (Arc<dyn DbBackend>, i64, Vec<i64>) {
     let ids: Vec<i64> = q.get_ordered(zone).unwrap().iter().map(|e| e.id).collect();
     let r = Resume {
         resume_key: "cle-A".into(),
+        profile_id: None,
         context_type: "album".into(),
         context_id: "A".into(),
         source: "qobuz".into(),

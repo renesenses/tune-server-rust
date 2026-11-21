@@ -19,6 +19,8 @@ fn album(id: &str, titre: &str, artiste: &str, artiste_id: Option<&str>, an: u32
         track_count: 8,
         quality: None,
         released_at: None,
+        genre_id: None,
+        genre_name: None,
     }
 }
 
