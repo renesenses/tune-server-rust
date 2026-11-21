@@ -2525,8 +2525,31 @@ impl PlaybackOrchestrator {
     /// Les octets de la réponse impulsionnelle, pour l'empreinte du cache de
     /// transcodage : c'est le CONTENU qui décide de la rendition, pas le nom
     /// du fichier. `None` si la zone n'en a pas ou s'il est illisible.
+    ///
+    /// #8761 — le CONTENU de tout le jeu : principal, fichiers par cadence et
+    /// réglage de repli. Sans fichier par cadence et avec le repli par défaut,
+    /// les octets sont exactement ceux d'avant (le cache existant reste bon).
     pub(super) fn octets_ir(&self, zone_id: i64) -> Option<Vec<u8>> {
-        std::fs::read(self.chemin_ir(zone_id)?).ok()
+        let jeu = self.jeu_ir(zone_id)?;
+        let mut octets = std::fs::read(&jeu.principal).ok()?;
+        for chemin in &jeu.supplementaires {
+            octets.extend_from_slice(b"|ir_jeu|");
+            octets.extend(std::fs::read(chemin).unwrap_or_default());
+        }
+        if !jeu.reechantillonner {
+            octets.extend_from_slice(b"|sans_reechantillonnage");
+        }
+        Some(octets)
+    }
+
+    /// #8761 — le jeu de réponses impulsionnelles de la zone, derrière les
+    /// mêmes gardes que [`Self::chemin_ir`] (PURE, licence).
+    pub(super) fn jeu_ir(&self, zone_id: i64) -> Option<crate::audio::convolver::JeuDeZone> {
+        let principal = self.chemin_ir(zone_id)?;
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        Some(crate::audio::convolver::JeuDeZone::avec_principal(
+            &settings, zone_id, principal,
+        ))
     }
 
     pub(super) fn load_convolver(
@@ -2536,13 +2559,12 @@ impl PlaybackOrchestrator {
         channels: u16,
     ) -> Option<crate::audio::convolver::Convolver> {
         let _e = EtapeDePreparation::debut(zone_id, "dsp_convolution");
-        let path = self.chemin_ir(zone_id)?;
-        match crate::audio::convolver::Convolver::from_wav_for(
-            &path,
-            1024,
-            sample_rate,
-            channels as usize,
-        ) {
+        let jeu = self.jeu_ir(zone_id)?;
+        let path = jeu.principal.clone();
+        match jeu
+            .charger()
+            .and_then(|c| c.build_for(1024, sample_rate, channels as usize))
+        {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!(zone_id, path, error = %e, "room_correction_ir_load_failed");

@@ -1005,23 +1005,27 @@ fn schema_incomplet(e: &str) -> bool {
 }
 
 /// Les réglages d'une zone qui vivent dans `settings` : le préfixe de
-/// convention `zone_{id}_…` et les quatre clés qui l'ignorent (calibration
+/// convention `zone_{id}_…` et les six clés qui l'ignorent (calibration
 /// DAC, pièce, réponse impulsionnelle, renderer UPnP).
-fn cles_de_zone(id: i64) -> (String, [String; 4]) {
+fn cles_de_zone(id: i64) -> (String, [String; 6]) {
     (
         format!("zone_{id}_"),
         CLES_DE_ZONE_SUFFIXEES.map(|prefixe| format!("{prefixe}{id}")),
     )
 }
 
-/// Les quatre clés de zone qui portent l'identifiant en SUFFIXE (voir
+/// Les six clés de zone qui portent l'identifiant en SUFFIXE (voir
 /// [`cles_de_zone`]). Une seule liste, lue par le report des doublons et par
 /// l'export de configuration.
-const CLES_DE_ZONE_SUFFIXEES: [&str; 4] = [
+const CLES_DE_ZONE_SUFFIXEES: [&str; 6] = [
     "dac_profile_",
     "room_profile_",
     "ir_path_",
     "upnp_renderer_udn_",
+    // #8761 — les fichiers de convolution par cadence et le réglage de repli
+    // suivent le fichier principal.
+    "ir_jeu_",
+    "ir_resample_",
 ];
 
 /// Le gabarit d'un réglage de zone rangé dans `settings` : l'identifiant de
@@ -1065,6 +1069,17 @@ fn reporter_les_cles_de_zone(
 ) -> Result<usize, String> {
     let (prefixe_doublon, exactes_doublon) = cles_de_zone(doublon);
     let (prefixe_cible, exactes_cible) = cles_de_zone(cible);
+    // #8761 — le jeu de convolution (`ir_path_`, `ir_jeu_`, `ir_resample_`)
+    // se reporte EN BLOC : une cible qui a déjà son fichier principal garde
+    // tout son jeu, sans y mêler les fichiers par cadence du doublon.
+    let jeu_de_ri = |c: &str| {
+        ["ir_path_", "ir_jeu_", "ir_resample_"]
+            .iter()
+            .any(|p| c == format!("{p}{cible}"))
+    };
+    let cible_a_son_jeu = connues
+        .get(&format!("ir_path_{cible}"))
+        .is_some_and(|v| !v.trim().is_empty());
     let mut reportees = 0usize;
     for (cle, valeur) in apportees {
         let vers = if let Some(quoi) = cle.strip_prefix(&prefixe_doublon) {
@@ -1074,6 +1089,9 @@ fn reporter_les_cles_de_zone(
         } else {
             continue;
         };
+        if cible_a_son_jeu && jeu_de_ri(&vers) {
+            continue;
+        }
         if valeur.trim().is_empty() {
             continue;
         }

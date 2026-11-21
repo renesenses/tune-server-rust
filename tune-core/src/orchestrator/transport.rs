@@ -3295,20 +3295,28 @@ impl PlaybackOrchestrator {
         let Some(chemin) = self.chemin_ir(zone_id) else {
             return false;
         };
-        let refus = match crate::audio::convolver::ConvolverConfig::from_wav(&chemin) {
+        // #8761 — le jeu entier : un fichier à la cadence du flux, ou le plus
+        // proche rééchantillonné si le réglage le permet.
+        let jeu = self
+            .jeu_ir(zone_id)
+            .map(|j| j.charger())
+            .unwrap_or_else(|| crate::audio::convolver::ConvolverConfig::from_wav(&chemin));
+        let refus = match jeu {
             Err(e) => Some(e),
-            Ok(ri) if cadence.is_some_and(|c| c != ri.sample_rate()) => Some(format!(
-                "réponse impulsionnelle à {} Hz, flux à {} Hz",
-                ri.sample_rate(),
-                cadence.unwrap_or_default()
-            )),
-            Ok(ri) if ri.source_channels() != 1 && ri.source_channels() != usize::from(canaux) => {
-                Some(format!(
-                    "réponse impulsionnelle à {} canaux, flux à {canaux} canaux",
-                    ri.source_channels()
-                ))
-            }
-            Ok(_) => None,
+            Ok(ri) => match cadence.map(|c| (c, ri.choix_pour(c))) {
+                Some((c, Err(_))) => Some(format!(
+                    "réponse impulsionnelle à {:?} Hz, flux à {c} Hz",
+                    ri.cadences()
+                )),
+                _ => {
+                    let n = cadence
+                        .and_then(|c| ri.canaux_pour(c))
+                        .unwrap_or_else(|| ri.source_channels());
+                    (n != 1 && n != usize::from(canaux)).then(|| {
+                        format!("réponse impulsionnelle à {n} canaux, flux à {canaux} canaux")
+                    })
+                }
+            },
         };
         if let Some(raison) = &refus {
             warn!(

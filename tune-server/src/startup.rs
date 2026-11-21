@@ -1407,7 +1407,14 @@ async fn restore_convolvers(state: &AppState) {
                             .as_any()
                             .downcast_ref::<tune_core::outputs::local::LocalOutput>()
                         {
-                            match local.set_convolver_ir(&ir_path) {
+                            // #8761 — le jeu entier (fichiers par cadence,
+                            // réglage de repli), pas seulement le principal.
+                            let jeu = tune_core::audio::convolver::JeuDeZone::avec_principal(
+                                &settings,
+                                zone_id,
+                                ir_path.clone(),
+                            );
+                            match jeu.charger().and_then(|c| local.set_convolver_config(c)) {
                                 Ok(()) => {
                                     info!(zone_id, ir_path = %ir_path, "convolver_restored")
                                 }
