@@ -404,35 +404,101 @@ fn une_ir_identite_rend_la_piste_entiere_si_on_draine_la_fin() {
 }
 
 /// #2210 — une chaîne gapless peut changer de cadence ou de layout sans
-/// repasser par `play_url`. Le moteur de la piste précédente doit alors
-/// disparaître ; il ne peut redevenir actif que sur un format compatible.
+/// repasser par `play_url`. Le moteur de la piste précédente ne doit jamais
+/// survivre : il est reconstruit pour le nouveau format, ou retiré.
+///
+/// #8761 (#9270) — à une autre cadence que l'IR, le moteur est désormais
+/// reconstruit avec l'IR RÉÉCHANTILLONNÉE à la cadence du flux (repli par
+/// défaut) ; le refus d'avant ne vaut plus que si `ir_resample` = `false`.
 #[test]
 fn un_changement_de_format_gapless_rebat_ou_desactive_le_convolveur() {
-    let config = std::sync::Mutex::new(Some(
-        crate::audio::convolver::ConvolverConfig::new(vec![vec![1.0, 0.5]], 48_000).unwrap(),
-    ));
+    let ir_mono =
+        crate::audio::convolver::ConvolverConfig::new(vec![vec![1.0, 0.5]], 48_000).unwrap();
+    let config = std::sync::Mutex::new(Some(ir_mono.clone()));
     let active = std::sync::Mutex::new(None);
+    let premium = AtomicBool::new(true);
 
-    assert!(rebuild_local_convolver(&config, &active, &AtomicBool::new(true), 48_000, 2).unwrap());
+    assert!(rebuild_local_convolver(&config, &active, &premium, 48_000, 2).unwrap());
     assert_eq!(active.lock().unwrap().as_ref().unwrap().channels(), 2);
 
-    let error = rebuild_local_convolver(&config, &active, &AtomicBool::new(true), 96_000, 2)
-        .expect_err("l'IR 48 kHz ne doit jamais corriger un flux 96 kHz");
+    // 96 kHz : le moteur est reconstruit, avec l'IR 48 kHz rééchantillonnée.
+    assert!(
+        rebuild_local_convolver(&config, &active, &premium, 96_000, 2).unwrap(),
+        "repli #8761 : l'IR 48 kHz rééchantillonnée doit corriger le flux 96 kHz"
+    );
+    let (choix, taps_96k) = ir_mono.ri_pour(96_000).unwrap();
+    assert!(choix.reechantillonne, "{choix:?}");
+    assert_eq!(
+        (choix.cadence_fichier, choix.cadence_flux),
+        (48_000, 96_000)
+    );
+    assert_ne!(
+        taps_96k[0],
+        vec![1.0, 0.5],
+        "le moteur 96 kHz ne doit pas reprendre les taps 48 kHz tels quels"
+    );
+    {
+        let mut guard = active.lock().unwrap();
+        let moteur = guard.as_mut().unwrap();
+        assert_eq!(moteur.channels(), 2);
+        // Un Dirac stéréo à travers le moteur actif rend l'IR qu'il porte :
+        // c'est bien l'IR rééchantillonnée, dupliquée sur les deux canaux.
+        let n = taps_96k[0].len();
+        let mut dirac = vec![0.0f32; n * 2];
+        dirac[0] = 1.0;
+        dirac[1] = 1.0;
+        moteur.process_offline(&mut dirac);
+        for (i, attendu) in taps_96k[0].iter().enumerate() {
+            for c in 0..2 {
+                let obtenu = dirac[i * 2 + c];
+                assert!(
+                    (obtenu - attendu).abs() < 1e-4,
+                    "prise {i}, canal {c} : {obtenu} au lieu de {attendu}"
+                );
+            }
+        }
+    }
+
+    // Le refus d'avant reste possible : rééchantillonnage interdit.
+    *config.lock().unwrap() = Some(ir_mono.clone().avec_reechantillonnage(false));
+    let error = rebuild_local_convolver(&config, &active, &premium, 96_000, 2)
+        .expect_err("sans rééchantillonnage, l'IR 48 kHz ne doit jamais corriger un flux 96 kHz");
     assert!(
         error.contains("48000") && error.contains("96000"),
         "{error}"
     );
     assert!(
         active.lock().unwrap().is_none(),
-        "l'ancien moteur ne doit pas survivre au changement de cadence"
+        "l'ancien moteur ne doit pas survivre au changement de cadence refusé"
     );
 
-    assert!(rebuild_local_convolver(&config, &active, &AtomicBool::new(true), 48_000, 6).unwrap());
+    // Retour à la cadence de l'IR, nouveau layout : l'IR mono est dupliquée.
+    assert!(rebuild_local_convolver(&config, &active, &premium, 48_000, 6).unwrap());
     assert_eq!(
         active.lock().unwrap().as_ref().unwrap().channels(),
         6,
         "le retour à la cadence de l'IR reconstruit le moteur au nouveau layout"
     );
+
+    // Layout incompatible (IR stéréo, flux 6 canaux) : refus, moteur retiré.
+    *config.lock().unwrap() = Some(
+        crate::audio::convolver::ConvolverConfig::new(vec![vec![1.0, 0.5], vec![0.5, 1.0]], 48_000)
+            .unwrap(),
+    );
+    let error = rebuild_local_convolver(&config, &active, &premium, 48_000, 6)
+        .expect_err("une IR stéréo ne peut pas corriger un flux 6 canaux");
+    assert!(error.contains("6 canaux"), "{error}");
+    assert!(
+        active.lock().unwrap().is_none(),
+        "le moteur 6 canaux précédent ne doit pas survivre au layout incompatible"
+    );
+
+    // Sans le droit Premium (#7632) : aucun moteur, sans erreur.
+    *config.lock().unwrap() = Some(ir_mono);
+    assert!(
+        !rebuild_local_convolver(&config, &active, &AtomicBool::new(false), 48_000, 2).unwrap()
+    );
+    assert!(active.lock().unwrap().is_none());
 }
 
 /// Et la frontière de piste : après remise à zéro, plus rien de la
