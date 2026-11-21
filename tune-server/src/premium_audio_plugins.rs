@@ -699,8 +699,12 @@ pub(crate) mod tests {
         dossier_de_donnees_jetable();
         let state = AppState::new(":memory:", 0, Default::default()).unwrap();
         let settings = SettingsRepo::with_backend(state.backend.clone());
-        settings.set("plugin_channel-remap_installed", "true").unwrap();
-        settings.set("plugin_channel-remap_enabled", "true").unwrap();
+        settings
+            .set("plugin_channel-remap_installed", "true")
+            .unwrap();
+        settings
+            .set("plugin_channel-remap_enabled", "true")
+            .unwrap();
         let routers = crate::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
         assert!(
             routers.iter().any(|(n, _)| n == "channel-remap"),
