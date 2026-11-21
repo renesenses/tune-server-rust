@@ -476,6 +476,10 @@ async fn produire_le_canal_aac(c: CanalAac) {
 mod canal_aac_fin_notee_6298_tests;
 
 #[cfg(test)]
+#[path = "suivant_prechargement_8795_tests.rs"]
+mod suivant_prechargement_8795_tests;
+
+#[cfg(test)]
 #[path = "youtube_dlna_demarrage_8228_tests.rs"]
 mod youtube_dlna_demarrage_8228_tests;
 
@@ -660,9 +664,15 @@ impl PlaybackOrchestrator {
         // #8215 / #7266 — un préchargement d'une AUTRE piste tient peut-être
         // le verrou du service le temps d'un téléchargement DASH entier : la
         // lecture ne l'attend plus, elle l'abandonne. Celui de la piste
-        // demandée est gardé (`prendre_dash_complet`, #7247).
-        self.prefetch
-            .abandonner_pour_une_autre_piste(req.zone_id, service_name, source_id);
+        // demandée est gardé (`prendre_dash_complet`, #7247), sauf — #8795 —
+        // sur une sortie qui décode pendant le téléchargement : elle joue dès
+        // le premier segment au lieu d'attendre la fin du préchargement.
+        self.prefetch.abandonner_avant_la_lecture(
+            req.zone_id,
+            service_name,
+            source_id,
+            decoder_pendant_le_telechargement(req),
+        );
         let registry = self.services.lock().await;
         let svc = registry
             .get(service_name)
