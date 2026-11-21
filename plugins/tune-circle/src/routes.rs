@@ -1034,11 +1034,8 @@ fn date_de_synchro(brute: Option<String>) -> Option<String> {
 async fn etat_de_la_copie_en_ligne(State(etat): State<Arc<EtatDeLaCopie>>) -> Response {
     let reglages = etat.relais.reglages();
     let premium = etat.license.is_premium().await;
-    let session = reglages
-        .get("mozaik_access_token")
-        .ok()
-        .flatten()
-        .is_some_and(|v| !v.trim().is_empty());
+    // #8797 : une session refusée par le site ne pousse plus rien.
+    let session = tune_core::cloud::sso::jeton_de_compte(&reglages).is_some();
     let server_id = server_id_du_serveur(&etat.relais);
     let active =
         library_sync::synchro_autorisee(premium, &reglages) && session && server_id.is_some();

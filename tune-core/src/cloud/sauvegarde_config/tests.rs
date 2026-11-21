@@ -1214,3 +1214,23 @@ fn un_profil_nomme_par_son_adresse_se_retrouve_par_email() {
         1
     );
 }
+
+/// #8797 — le compte d'une session refusée par le site vaut « non relié » :
+/// sauvegarde, écoutes, notes et écoutes de la communauté (tous lisent
+/// `compte`) ne partent plus jusqu'à la reconnexion.
+#[test]
+fn une_session_refusee_vaut_non_relie_8797() {
+    let b = base_neuve();
+    let s = reglages(&b);
+    s.set("mozaik_access_token", "jeton").unwrap();
+    s.set("server_id", "srv-1").unwrap();
+    assert!(compte(&s).is_ok());
+    s.set(
+        crate::cloud::sso::CLE_RECONNEXION_REQUISE,
+        "2026-11-20T10:00:00+00:00",
+    )
+    .unwrap();
+    assert!(matches!(compte(&s), Err(ErreurSite::NonRelie)));
+    crate::cloud::sso::oublier_le_refus_de_session(&s);
+    assert_eq!(compte(&s).unwrap().acces, "jeton");
+}
