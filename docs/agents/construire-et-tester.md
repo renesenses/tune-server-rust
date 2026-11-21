@@ -50,6 +50,11 @@ restent à vérifier sur un vrai Windows.
 
 ### Filtres et répétitions
 
+- Les fonctionnalités `journal-de-test`, `isolement-disque-de-test` et
+  `services-factices` appartiennent à `tune-core`. Pour reprendre le profil
+  Clippy de la CI avec ces fonctionnalités, sélectionner **les deux** paquets
+  (`-p tune-core -p tune-server`) ; `-p tune-server` seul est refusé par Cargo.
+
 - Filtrer par nom : `cargo test -p tune-core --lib -- <filtre1> <filtre2>`.
 - Répéter un test N fois sans recompiler : `cargo test -p tune-core --lib --no-run`,
   copier l'exécutable annoncé (`target/debug/deps/tune_core-<hash>`), puis le
