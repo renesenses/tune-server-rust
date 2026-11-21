@@ -25,6 +25,8 @@ mod deplacer_racine;
 #[cfg(test)]
 mod diagnostic_sans_ecrivain_tests;
 pub(crate) mod diagnostics;
+#[path = "executables_livres_8944.rs"]
+pub(crate) mod executables_livres;
 pub(crate) mod sauvegarde_cloud;
 // `pub(crate)` depuis #2507 : `enrich::QuotaDuJour` est la lecture unique du
 // compteur journalier, et les essais de `routes/library/artwork.rs` la lisent
@@ -108,7 +110,7 @@ pub fn router() -> Router<AppState> {
         .route("/profile", get(profile::system_profile))
         .route(
             "/config",
-            get(config::get_config).patch(config::update_config),
+            get(config::get_config_route).patch(config::update_config_route),
         )
         .route("/settings", get(config::get_settings))
         // Clés d'API PERSONNELLES (#4805, lot 1 MetaRust) : AcoustID et

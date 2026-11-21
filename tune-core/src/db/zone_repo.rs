@@ -1005,23 +1005,27 @@ fn schema_incomplet(e: &str) -> bool {
 }
 
 /// Les réglages d'une zone qui vivent dans `settings` : le préfixe de
-/// convention `zone_{id}_…` et les quatre clés qui l'ignorent (calibration
+/// convention `zone_{id}_…` et les six clés qui l'ignorent (calibration
 /// DAC, pièce, réponse impulsionnelle, renderer UPnP).
-fn cles_de_zone(id: i64) -> (String, [String; 4]) {
+fn cles_de_zone(id: i64) -> (String, [String; 6]) {
     (
         format!("zone_{id}_"),
         CLES_DE_ZONE_SUFFIXEES.map(|prefixe| format!("{prefixe}{id}")),
     )
 }
 
-/// Les quatre clés de zone qui portent l'identifiant en SUFFIXE (voir
+/// Les six clés de zone qui portent l'identifiant en SUFFIXE (voir
 /// [`cles_de_zone`]). Une seule liste, lue par le report des doublons et par
 /// l'export de configuration.
-const CLES_DE_ZONE_SUFFIXEES: [&str; 4] = [
+const CLES_DE_ZONE_SUFFIXEES: [&str; 6] = [
     "dac_profile_",
     "room_profile_",
     "ir_path_",
     "upnp_renderer_udn_",
+    // #8761 — les fichiers de convolution par cadence et le réglage de repli
+    // suivent le fichier principal.
+    "ir_jeu_",
+    "ir_resample_",
 ];
 
 /// Le gabarit d'un réglage de zone rangé dans `settings` : l'identifiant de
@@ -1065,6 +1069,17 @@ fn reporter_les_cles_de_zone(
 ) -> Result<usize, String> {
     let (prefixe_doublon, exactes_doublon) = cles_de_zone(doublon);
     let (prefixe_cible, exactes_cible) = cles_de_zone(cible);
+    // #8761 — le jeu de convolution (`ir_path_`, `ir_jeu_`, `ir_resample_`)
+    // se reporte EN BLOC : une cible qui a déjà son fichier principal garde
+    // tout son jeu, sans y mêler les fichiers par cadence du doublon.
+    let jeu_de_ri = |c: &str| {
+        ["ir_path_", "ir_jeu_", "ir_resample_"]
+            .iter()
+            .any(|p| c == format!("{p}{cible}"))
+    };
+    let cible_a_son_jeu = connues
+        .get(&format!("ir_path_{cible}"))
+        .is_some_and(|v| !v.trim().is_empty());
     let mut reportees = 0usize;
     for (cle, valeur) in apportees {
         let vers = if let Some(quoi) = cle.strip_prefix(&prefixe_doublon) {
@@ -1074,6 +1089,9 @@ fn reporter_les_cles_de_zone(
         } else {
             continue;
         };
+        if cible_a_son_jeu && jeu_de_ri(&vers) {
+            continue;
+        }
         if valeur.trim().is_empty() {
             continue;
         }
@@ -2183,22 +2201,23 @@ impl ZoneRepo {
             Engine::Sqlite => &SqliteDialect,
             Engine::Postgres => &PostgresDialect,
         };
-        let p: Vec<_> = (1..=8).map(|i| d.placeholder(i)).collect();
+        // #8920 — plus de condition sur `fixed_volume` : une zone Devialet
+        // AIR n'est jamais à volume fixe, et un drapeau hérité en base (lu
+        // faux, `row_to_zone`) ne doit pas bloquer l'adoption d'une baisse.
+        let p: Vec<_> = (1..=7).map(|i| d.placeholder(i)).collect();
         let sql = format!(
-            "UPDATE zones SET volume = {}, muted = {} WHERE id = {} AND output_type = 'devialet_air' AND output_device_id = {} AND volume = {} AND muted = {} AND fixed_volume = {} AND volume >= {}",
-            p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]
+            "UPDATE zones SET volume = {}, muted = {} WHERE id = {} AND output_type = 'devialet_air' AND output_device_id = {} AND volume = {} AND muted = {} AND volume >= {}",
+            p[0], p[1], p[2], p[3], p[4], p[5], p[6]
         );
         let ancien_mute = i64::from(zone.muted);
         let nouveau_mute = i64::from(muted);
-        let fixe = i64::from(zone.fixed_volume);
-        let params: [&dyn ToSqlValue; 8] = [
+        let params: [&dyn ToSqlValue; 7] = [
             &volume,
             &nouveau_mute,
             &id,
             &did,
             &zone.volume,
             &ancien_mute,
-            &fixe,
             &volume,
         ];
         Ok(self.db.execute(&sql, &params)? == 1)
@@ -3564,7 +3583,13 @@ fn row_to_zone(cols: &[SqlValue]) -> Zone {
         last_track_source: cols.get(12).and_then(|v| v.as_string()),
         last_track_source_id: cols.get(13).and_then(|v| v.as_string()),
         max_sample_rate: cols.get(14).and_then(|v| v.as_i64()).map(|v| v as u32),
-        fixed_volume: cols.get(15).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
+        // #8920 — une zone Devialet AIR n'est JAMAIS à volume fixe : le
+        // volume y est tenu par l'ampli, sous les limites de confort et de
+        // sécurité. Un drapeau hérité (posé avant que la route ne le refuse)
+        // est lu faux, pour TOUS les chemins qui le consultent.
+        fixed_volume: cols.get(15).and_then(|v| v.as_i64()).unwrap_or(0) != 0
+            && cols.get(2).and_then(|v| v.as_string()).as_deref()
+                != Some(crate::outputs::devialet_air::TYPE_DE_SORTIE),
         autoplay_enabled: cols.get(16).and_then(|v| v.as_i64()).unwrap_or(0) != 0,
     }
 }

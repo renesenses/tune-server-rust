@@ -583,7 +583,8 @@ fn identite(s: &SettingsRepo) -> Option<(String, String, String)> {
     };
     Some((
         lire("server_id")?,
-        lire("mozaik_access_token")?,
+        // #8797 : rien ne part après un refus de la session par le site.
+        tune_core::cloud::sso::jeton_de_compte(s)?,
         lire(CLE_JETON_DE_LIAISON)?,
     ))
 }

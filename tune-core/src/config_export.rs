@@ -966,9 +966,23 @@ pub fn appliquer(backend: &Arc<dyn DbBackend>, plan: &Plan) -> Result<Bilan, Str
                     ));
                     continue;
                 };
-                settings
-                    .set(&cle, &texte_a_ranger(v))
-                    .map_err(|e| etape(&bilan, e))?;
+                let mut texte = texte_a_ranger(v);
+                // #8761 — validation stricte des chemins du jeu de
+                // convolution : noms de fichiers que Tune range lui-même,
+                // aucun composant `..`.
+                if gabarit == "ir_jeu_{id}" {
+                    let Some(liste) =
+                        crate::audio::convolver::par_cadence::liste_du_jeu_importable(&texte)
+                    else {
+                        bilan.avertissements.push(format!(
+                            "zone '{}': setting '{gabarit}' has no valid file; skipped",
+                            zone.nom
+                        ));
+                        continue;
+                    };
+                    texte = liste;
+                }
+                settings.set(&cle, &texte).map_err(|e| etape(&bilan, e))?;
             }
         }
         if nouvelle {

@@ -1,7 +1,10 @@
 mod boucle_locale_5639;
 mod diagnostic_surechantillonnage_8259;
 mod lecture_http;
+mod reserve_du_surechantillonneur;
 mod retard_de_depart_8437;
+// #8869 — le silence de verrouillage au changement de format.
+mod silence_de_verrouillage_8869;
 use lecture_http::LecteurHttpAnnulable;
 
 use std::cell::UnsafeCell;
@@ -689,6 +692,10 @@ pub struct LocalOutput {
     /// du crête-mètre et le volume. Partagé avec le `PlaybackManager` comme
     /// `volume` (voir [`Self::gain_moyen_du_dsp`]).
     gain_moyen_dsp: Arc<AtomicU32>,
+    /// Compensation de la réserve du suréchantillonneur (19/11/2026) : c'est
+    /// elle qui publie `rg_factor` et `gain_moyen_dsp`, réserve de l'étage
+    /// ouvert comprise. Voir [`reserve_du_surechantillonneur`].
+    reserve_du_surechantillonneur: reserve_du_surechantillonneur::ReserveDuSurechantillonneur,
     /// Volume stored before mute, so unmute can restore it
     pre_mute_volume: Arc<AtomicU32>,
     muted: Arc<AtomicBool>,
@@ -878,6 +885,11 @@ pub struct LocalOutput {
     /// `sync_delay_ms` quand elle est groupée avec une zone réseau, sinon 0.
     /// Posé par l'orchestrateur à chaque lecture, lu une fois par `play_url`.
     retard_de_depart_ms: AtomicU64,
+    /// #8869 — silence de verrouillage (ms) de la zone qui va jouer. Posé par
+    /// l'orchestrateur à chaque lecture, lu une fois par `play_url`.
+    silence_de_verrouillage_ms: AtomicU32,
+    /// #8869 — le dernier format envoyé au DAC par cette sortie.
+    memoire_du_format: crate::audio::silence_de_verrouillage::MemoireDuFormat,
     /// Optional headphone crossfeed effect, applied AFTER the convolver on the
     /// local (DAC) output only. Gated by the same `pure_bypass` (skipped in
     /// PURE) and only when the stream is stereo. Set per-play by the
@@ -1235,10 +1247,7 @@ impl LocalOutput {
         // Le crête-mètre multiplie ce gain par le volume rendu : la part
         // portée par l'égaliseur, retirée du volume, revient donc ici, et le
         // produit que lit l'aiguille ne bouge pas.
-        self.gain_moyen_dsp.store(
-            (en_millemes(dsp_db) * porte_par_l_eq).clamp(0.0, 64_000.0) as u32,
-            Ordering::SeqCst,
-        );
+        let gain_moyen_dsp = (en_millemes(dsp_db) * porte_par_l_eq).clamp(0.0, 64_000.0) as u32;
         let compensation = if self.compensation_de_niveau.load(Ordering::Relaxed) {
             -dsp_db
         } else {
@@ -1257,9 +1266,12 @@ impl LocalOutput {
         // facteur a réellement bougé. Rien d'autre ne peut avoir rendu
         // `volume` périmé : ses seuls écrivains (`set_volume`, `set_mute`, la
         // bascule DoP) le recalculent eux-mêmes depuis `rg_factor`.
-        if self.rg_factor.swap(compose, Ordering::SeqCst) != compose {
-            self.recompute_effective_volume();
-        }
+        //
+        // 19/11/2026 — publié avec la compensation de la réserve du
+        // suréchantillonneur ouvert : `rg_factor` et `gain_moyen_dsp` sont
+        // écrits là, et le volume recalculé si le facteur a bougé.
+        self.reserve_du_surechantillonneur
+            .poser_le_rendu(compose, gain_moyen_dsp);
     }
 
     /// #4685 — le gain MOYEN du DSP installé, en millièmes, partagé comme
@@ -1453,6 +1465,20 @@ impl LocalOutput {
         audio_backend: &str,
     ) -> Self {
         let device_id = format!("local:{device_name}");
+        let volume = Arc::new(AtomicU32::new(UNITE_DU_GAIN_DE_RENDU));
+        let user_volume = Arc::new(AtomicU32::new(UNITE_DU_GAIN_DE_RENDU));
+        let rg_factor = Arc::new(AtomicU32::new(1000));
+        let gain_moyen_dsp = Arc::new(AtomicU32::new(1000));
+        let dop_active = Arc::new(AtomicBool::new(false));
+        let reserve_du_surechantillonneur =
+            reserve_du_surechantillonneur::ReserveDuSurechantillonneur::nouvelle(
+                rg_factor.clone(),
+                gain_moyen_dsp.clone(),
+                user_volume.clone(),
+                dop_active.clone(),
+                volume.clone(),
+                &device_name,
+            );
         Self {
             device_name,
             device_id,
@@ -1460,15 +1486,16 @@ impl LocalOutput {
             origin_host: None,
             playing: Arc::new(AtomicBool::new(false)),
             paused: Arc::new(AtomicBool::new(false)),
-            volume: Arc::new(AtomicU32::new(UNITE_DU_GAIN_DE_RENDU)),
-            user_volume: Arc::new(AtomicU32::new(UNITE_DU_GAIN_DE_RENDU)),
-            rg_factor: Arc::new(AtomicU32::new(1000)),
+            volume,
+            user_volume,
+            rg_factor,
             replaygain_seul: AtomicU32::new(1000),
             // Même défaut que le réglage de zone : une sortie construite hors
             // chemin de lecture compense aussi, mais sans DSP installé le
             // facteur vaut 1 et rien ne change.
             compensation_de_niveau: AtomicBool::new(true),
-            gain_moyen_dsp: Arc::new(AtomicU32::new(1000)),
+            gain_moyen_dsp,
+            reserve_du_surechantillonneur,
             pre_mute_volume: Arc::new(AtomicU32::new(UNITE_DU_GAIN_DE_RENDU)),
             muted: Arc::new(AtomicBool::new(false)),
             position_ms: Arc::new(AtomicU64::new(0)),
@@ -1506,6 +1533,8 @@ impl LocalOutput {
             fixed_sample_rate: AtomicU32::new(0),
             seconde_sortie: std::sync::Mutex::new(Vec::new()),
             retard_de_depart_ms: AtomicU64::new(0),
+            silence_de_verrouillage_ms: AtomicU32::new(0),
+            memoire_du_format: Default::default(),
             mono_downmix: Arc::new(AtomicBool::new(false)),
             reaffectation: Arc::new(CreneauReaffectation::vide()),
             disposition: Arc::new(std::sync::Mutex::new(None)),
@@ -1518,7 +1547,7 @@ impl LocalOutput {
             crossfeed: Arc::new(std::sync::Mutex::new(None)),
             diagnostic_surechantillonnage: Arc::default(),
             surechantillonnage: Arc::new(std::sync::Mutex::new(None)),
-            dop_active: Arc::new(AtomicBool::new(false)),
+            dop_active,
             signal_path_status: Arc::new(std::sync::Mutex::new(None)),
             transformations_reelles: Arc::new(std::sync::Mutex::new(None)),
             open_failure: Arc::new(std::sync::Mutex::new(None)),
@@ -1626,7 +1655,7 @@ impl LocalOutput {
         }
     }
 
-    /// #4176 — « Remettre à plat » : le gain gardé d'un égaliseur coupé
+    /// #6524 — « Rendre le niveau » : le gain gardé d'un égaliseur coupé
     /// remonte, progressivement, jusqu'au niveau sans égaliseur, sans la borne
     /// de volume de #6741 (voir `EqProcessor::liberer_le_gain_garde`). Sans
     /// effet si la chaîne ne porte pas d'égaliseur coupé.
@@ -1919,6 +1948,30 @@ impl LocalOutput {
 
     pub fn set_convolver_ir(&self, path: &str) -> Result<(), String> {
         let config = super::super::audio::convolver::ConvolverConfig::from_wav(path)?;
+        self.set_convolver_config(config)
+    }
+
+    /// #8761 — installer un JEU de réponses impulsionnelles (une par cadence,
+    /// rééchantillonnage en repli selon le réglage de la zone). Les cadences
+    /// usuelles absentes du jeu sont préparées en tâche de fond : un
+    /// changement de cadence entre deux pistes enchaînées trouve alors le
+    /// filtre rééchantillonné déjà en cache, sans calcul sur le fil audio.
+    pub fn set_convolver_config(
+        &self,
+        config: super::super::audio::convolver::ConvolverConfig,
+    ) -> Result<(), String> {
+        let path = config_chemin_pour_journal(&config);
+        let path = path.as_str();
+        if config.reechantillonnage_autorise() {
+            let a_chauffer = config.clone();
+            let _ = std::thread::Builder::new()
+                .name("tune-ri-prechauffe".into())
+                .spawn(move || {
+                    a_chauffer.prechauffer(
+                        &super::super::audio::convolver::par_cadence::CADENCES_USUELLES,
+                    )
+                });
+        }
         *self.convolver_config.lock().unwrap() = Some(config.clone());
         let current_format = self
             .current_format()
@@ -1943,6 +1996,8 @@ impl LocalOutput {
             path,
             device = %self.device_name,
             ir_sample_rate = config.sample_rate(),
+            ir_rates = ?config.cadences(),
+            ir_resample = config.reechantillonnage_autorise(),
             ir_channels = config.source_channels(),
             active = current_format.is_some(),
             "convolver_ir_set"
@@ -2062,6 +2117,30 @@ impl LocalOutput {
     /// voir [`crate::zones::retard_groupe_mixte_8437`]. `0` : départ immédiat.
     pub fn set_retard_de_depart_ms(&self, ms: u64) {
         self.retard_de_depart_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// #8869 — le silence de verrouillage de la zone qui va jouer (ms), voir
+    /// [`crate::audio::silence_de_verrouillage`]. `0` : aucun silence.
+    pub fn set_silence_de_verrouillage_ms(&self, ms: u32) {
+        self.silence_de_verrouillage_ms.store(
+            ms.min(crate::audio::silence_de_verrouillage::SILENCE_MAX_MS),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// #8869 — ce que le fil de lecture d'une piste emporte : le réglage lu
+    /// maintenant et la mémoire du format de cette sortie, OUBLIÉE : chaque
+    /// `play_url` rouvre le périphérique (un nouveau fil, un nouveau flux),
+    /// et un DAC se reverrouille à chaque ouverture, même au même format.
+    /// L'enchaînement sans blanc ne repasse pas par ici.
+    pub(crate) fn silence_pour_une_ouverture(
+        &self,
+    ) -> crate::audio::silence_de_verrouillage::SilenceDeVerrouillage {
+        self.memoire_du_format.oublier();
+        crate::audio::silence_de_verrouillage::SilenceDeVerrouillage::new(
+            self.silence_de_verrouillage_ms.load(Ordering::Relaxed),
+            self.memoire_du_format.clone(),
+        )
     }
 
     /// #8437 — le retard que la prochaine ouverture du flux observera.
@@ -2434,6 +2513,32 @@ impl LocalOutput {
     }
 
     /// #7614 — le choix posé, tel que la prochaine ouverture le lira.
+    /// 19/11/2026 — les réglages du suréchantillonneur lus à l'ouverture du
+    /// flux qui JOUE (pas le choix posé pour le suivant) : c'est à eux qu'un
+    /// changement de réglage se compare pour décider d'une relance.
+    pub fn reglages_du_flux_surechantillonne(
+        &self,
+    ) -> Option<crate::audio::surechantillonnage::UpsamplerSettings> {
+        self.reserve_du_surechantillonneur.reglages_du_flux()
+    }
+
+    /// Témoins : ce qu'aurait laissé l'ouverture d'un flux avec `reglages`.
+    #[cfg(test)]
+    pub(crate) fn simuler_l_ouverture_du_surechantillonneur(
+        &self,
+        reglages: Option<crate::audio::surechantillonnage::UpsamplerSettings>,
+    ) {
+        let generation = self.play_generation.load(Ordering::SeqCst);
+        self.reserve_du_surechantillonneur
+            .ouvrir_le_flux(generation);
+        self.reserve_du_surechantillonneur.poser_l_ouverture(
+            generation,
+            &self.play_generation,
+            reglages,
+            None,
+        );
+    }
+
     pub fn surechantillonnage(
         &self,
     ) -> Option<super::super::audio::surechantillonnage::ChoixSurechantillonnage> {
@@ -2667,7 +2772,23 @@ impl ResultatSondeDsdAlsa {
             Self::PcmLogiciel => {
                 capacite::retenir_provisoire(device_name, CapaciteConnue::SortieNonAsio);
             }
-            Self::Introuvable | Self::Occupe => capacite::noter_sondage_sans_reponse(device_name),
+            // Relecture #9211 — un « occupé » ou un « introuvable » vu à la
+            // RÉSOLUTION (la piste précédente tient le PCM) n'arme pas
+            // l'espacement : l'ouverture qui suit, PCM libre, doit sonder.
+            // Seuls les échecs à l'ouverture comptent
+            // ([`Self::retenir_a_l_ouverture`]).
+            Self::Introuvable | Self::Occupe => {}
+        }
+    }
+
+    /// #9170 (relecture #9211) — [`Self::retenir`] pour un sondage fait à
+    /// l'OUVERTURE d'un flux, PCM libre : là, un « occupé » (autre programme)
+    /// ou un « introuvable » est un vrai échec, qui espace le sondage suivant
+    /// (30 s, 2 min, 10 min).
+    pub fn retenir_a_l_ouverture(&self, device_name: &str) {
+        self.retenir(device_name);
+        if matches!(self, Self::Introuvable | Self::Occupe) {
+            crate::outputs::capacite_dsd_natif::noter_sondage_sans_reponse(device_name);
         }
     }
 }
@@ -2692,17 +2813,30 @@ impl SondeDsdAlsa {
     /// [`ResultatSondeDsdAlsa::retenir`] (#9170 : jamais de verdict définitif
     /// sans réponse du pilote).
     pub fn sonder_et_retenir(&self) -> ResultatSondeDsdAlsa {
+        let r = self.sonder();
+        r.retenir(&self.device_name);
+        r
+    }
+
+    /// #9170 (relecture #9211) — le sondage de l'ouverture d'un flux
+    /// (`LocalOutput::play_url`) : retenu par
+    /// [`ResultatSondeDsdAlsa::retenir_a_l_ouverture`].
+    pub fn sonder_et_retenir_a_l_ouverture(&self) -> ResultatSondeDsdAlsa {
+        let r = self.sonder();
+        r.retenir_a_l_ouverture(&self.device_name);
+        r
+    }
+
+    fn sonder(&self) -> ResultatSondeDsdAlsa {
         #[cfg(target_os = "linux")]
         {
-            let r = bras_alsa_dsd::sonder_la_sortie(
+            bras_alsa_dsd::sonder_la_sortie(
                 &self.device_name,
                 self.endpoint_id.as_deref(),
                 self.origin_host.as_deref(),
                 &self.audio_backend,
                 VOIES_SONDEES_DSD_ALSA,
-            );
-            r.retenir(&self.device_name);
-            r
+            )
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -3532,6 +3666,23 @@ fn pcm_container_bit_depth(block_align: u16, channels: u16) -> Option<u16> {
         4 => Some(32),
         _ => None,
     }
+}
+
+/// #8788 — ne livrer que le chunk audio, jamais les métadonnées qui suivent.
+/// Les deux tailles sentinelles des WAV en continu restent sans borne.
+fn borner_donnees_wav(octets: &mut Vec<u8>, data_offset: usize) -> Option<u64> {
+    let taille = u32::from_le_bytes(
+        octets
+            .get(data_offset.checked_sub(4)?..data_offset)?
+            .try_into()
+            .ok()?,
+    );
+    if taille == u32::MAX || taille == 0x7FFF_FFFF - 36 {
+        return None;
+    }
+    let deja_lus = octets.len().saturating_sub(data_offset) as u64;
+    octets.truncate(data_offset.saturating_add(taille as usize));
+    Some(u64::from(taille).saturating_sub(deja_lus))
 }
 
 fn parse_wav_header(header: &[u8]) -> Option<(u16, u32, u16, usize)> {
@@ -6677,13 +6828,15 @@ impl OutputTarget for LocalOutput {
         // relevé, la première piste DSD qui suit une piste PCM partirait en
         // DoP. Une fois par périphérique : la réponse prouvée est retenue.
         #[cfg(target_os = "linux")]
-        // #9170 — et aussi s'il n'est que provisoire (PCM logiciel observé
-        // sans réponse du pilote), passé un délai : sinon un sondage tombé
-        // au mauvais moment figeait « pas de DSD natif » jusqu'au redémarrage.
+        // #9170 (suivi #9172) — seulement si la résolution d'une piste DSD
+        // « Natif » l'a DEMANDÉ (PCM tenu, DAC introuvable, verdict
+        // provisoire) : une suite de pistes PCM ne sonde jamais, et un échec
+        // espace le sondage suivant (30 s, 2 min, 10 min).
         if crate::outputs::capacite_dsd_natif::a_resonder_a_l_ouverture(&self.device_name)
             && let Some(sonde) = self.sonde_dsd_alsa()
         {
-            let _ = tokio::task::spawn_blocking(move || sonde.sonder_et_retenir()).await;
+            let _ =
+                tokio::task::spawn_blocking(move || sonde.sonder_et_retenir_a_l_ouverture()).await;
         }
 
         // Create a FRESH force_silent flag for the new stream.
@@ -6757,6 +6910,14 @@ impl OutputTarget for LocalOutput {
         // décrivent plus rien.
         self.cretes_de_sortie.oublier();
         let cretes_de_sortie = self.cretes_de_sortie.clone();
+        // 19/11/2026 — un flux neuf ne porte pas (encore) l'étage du
+        // suréchantillonneur : sa réserve n'est plus compensée tant que le
+        // fil de lecture ne l'a pas ouvert. Sans cette remise à l'unité, un
+        // chemin qui ne porte pas l'étage (natif S32, DoP, bras exclusifs)
+        // hériterait de la compensation et jouerait 3 dB trop fort.
+        self.reserve_du_surechantillonneur
+            .ouvrir_le_flux(my_generation);
+        let reserve_du_surechantillonneur = self.reserve_du_surechantillonneur.clone();
         let position_ms = self.position_ms.clone();
         let mut seek_offset = self.seek_offset_ms.load(Ordering::SeqCst);
         let seek_offset_arc = self.seek_offset_ms.clone();
@@ -6779,6 +6940,8 @@ impl OutputTarget for LocalOutput {
         // #8437 — lu UNE fois par piste : une transition gapless ne repasse
         // pas par `play_url` et garde l'avance prise au départ.
         let retard_de_depart_ms = self.retard_de_depart_ms();
+        // #8869 — lu UNE fois par piste, comme le retard de départ.
+        let silence_de_verrouillage = self.silence_pour_une_ouverture();
         let mono_downmix = self.mono_downmix.clone();
         let reaffectation = self.reaffectation.clone();
         let disposition = self.disposition.clone();
@@ -6865,7 +7028,7 @@ impl OutputTarget for LocalOutput {
                     if force_silent.load(Ordering::SeqCst) {
                         debug!("local_audio_http_fetch_cancelled");
                     } else {
-                        warn!(error = %e, url = %url, "local_audio_http_fetch_failed");
+                        warn!(error = %e, url = %crate::confidentialite::masquer_url(&url), "local_audio_http_fetch_failed");
                     }
                     if play_generation.load(Ordering::SeqCst) == my_generation {
                         playing.store(false, Ordering::SeqCst);
@@ -6875,7 +7038,7 @@ impl OutputTarget for LocalOutput {
             };
 
             if !response.status().is_success() && response.status().as_u16() != 206 {
-                warn!(status = %response.status(), url = %url, "local_audio_http_error");
+                warn!(status = %response.status(), url = %crate::confidentialite::masquer_url(&url), "local_audio_http_error");
                 playing.store(false, Ordering::SeqCst);
                 return;
             }
@@ -6965,6 +7128,7 @@ impl OutputTarget for LocalOutput {
                         track_ended_generation,
                         dop_active,
                         chain_exhausted: chain_exhausted_ref,
+                        silence_de_verrouillage: silence_de_verrouillage.clone(),
                     });
                     return;
                 }
@@ -6994,6 +7158,7 @@ impl OutputTarget for LocalOutput {
                         dop_active,
                         chain_exhausted: chain_exhausted_ref,
                         device_gone,
+                        silence_de_verrouillage: silence_de_verrouillage.clone(),
                     });
                     return;
                 }
@@ -7583,6 +7748,32 @@ impl OutputTarget for LocalOutput {
                     Some((&reaffectation, pure_bypass.load(Ordering::Relaxed))),
                     disposition.lock().ok().and_then(|d| d.clone()).as_deref(),
                 );
+                // #8869 — au changement de format, la piste décodée est
+                // précédée du silence de verrouillage. Il ne compte ni dans
+                // la durée ni dans la position.
+                let silence_samples = crate::audio::silence_de_verrouillage::trames_pour_ms(
+                    output_sr,
+                    silence_de_verrouillage.constater(
+                        crate::audio::silence_de_verrouillage::SignatureDuFormat {
+                            cadence: output_sr,
+                            canaux: output_ch,
+                            mode: crate::audio::silence_de_verrouillage::ModeDuFlux::Pcm,
+                        },
+                    ),
+                ) * output_ch as usize;
+                let samples = if silence_samples == 0 {
+                    samples
+                } else {
+                    info!(
+                        cadence = output_sr,
+                        canaux = output_ch,
+                        echantillons = silence_samples,
+                        "local_audio_silence_de_verrouillage_compresse"
+                    );
+                    let mut precede = vec![0.0f32; silence_samples];
+                    precede.extend_from_slice(&samples);
+                    precede
+                };
 
                 // Pre-fill the ring buffer before starting the cpal stream.
                 // For compressed streams all data is already decoded, so we
@@ -7606,7 +7797,7 @@ impl OutputTarget for LocalOutput {
 
                 // Feed remaining samples to ring buffer, updating position
                 // progressively so the seek bar advances during playback.
-                let total_output_samples = samples.len() as u64;
+                let total_output_samples = (samples.len() - silence_samples) as u64;
                 let output_frames = total_output_samples / output_ch as u64;
                 let output_duration_ms = (output_frames as f64 / output_sr as f64 * 1000.0) as u64;
                 // Fil 2062 / #5550 — une piste arrivée sans durée prend celle que
@@ -7645,7 +7836,8 @@ impl OutputTarget for LocalOutput {
                             break;
                         }
                         fed_samples += chunk.len() as u64;
-                        let fed_frames = fed_samples / output_ch as u64;
+                        let fed_frames =
+                            fed_samples.saturating_sub(silence_samples as u64) / output_ch as u64;
                         let pos =
                             (fed_frames as f64 / output_sr as f64 * 1000.0) as u64 + seek_offset;
                         position_ms
@@ -7703,6 +7895,8 @@ impl OutputTarget for LocalOutput {
                 info!(device = %device_name, "local_audio_compressed_stopped");
                 return;
             };
+
+            reader.borner(borner_donnees_wav(&mut header_buf, data_offset));
 
             // Format definitif du flux PCM : c'est CE couple que voit
             // `apply_local_dsp`, donc celui auquel un EqProcessor doit etre
@@ -7866,6 +8060,7 @@ impl OutputTarget for LocalOutput {
                     track_artist: artist_ref,
                     duration_ms: duration_ms_arc,
                     seek_offset_ms: seek_offset_arc,
+                    silence_de_verrouillage: silence_de_verrouillage.clone(),
                 });
                 return;
             }
@@ -7923,6 +8118,7 @@ impl OutputTarget for LocalOutput {
                     track_artist: artist_ref,
                     duration_ms: duration_ms_arc,
                     seek_offset_ms: seek_offset_arc,
+                    silence_de_verrouillage: silence_de_verrouillage.clone(),
                 });
                 return;
             }
@@ -7975,6 +8171,7 @@ impl OutputTarget for LocalOutput {
                     track_artist: artist_ref,
                     duration_ms: duration_ms_arc,
                     seek_offset_ms: seek_offset_arc,
+                    silence_de_verrouillage: silence_de_verrouillage.clone(),
                     reglage_periode_ms: reglage_periode_wasapi_ms,
                 });
                 return;
@@ -8106,6 +8303,7 @@ impl OutputTarget for LocalOutput {
                                         track_artist: &artist_ref,
                                         duration_ms: &duration_ms_arc,
                                         seek_offset_ms: &seek_offset_arc,
+                                        silence_de_verrouillage: &silence_de_verrouillage,
                                         surechantillonnage: &surechantillonnage,
                                         sortie_double: !seconde_sortie.is_empty(),
                                         strict_bitperfect,
@@ -8323,6 +8521,22 @@ impl OutputTarget for LocalOutput {
                         }
                     }
                 });
+            // 19/11/2026 — la réserve est compensée dans le gain de rendu, et
+            // le crête-mètre, qui relève AVANT l'étage, la reporte sur ses
+            // crêtes. Seulement si ce fil porte encore le flux en cours : un
+            // fil détaché qui ouvre en retard ne réarme rien.
+            if reserve_du_surechantillonneur.poser_l_ouverture(
+                my_generation,
+                &play_generation,
+                choix_du_surechantillonneur
+                    .as_ref()
+                    .map(|c| c.reglages.clone()),
+                etage_du_surechantillonneur
+                    .as_ref()
+                    .map(crate::audio::surechantillonnage::EtageSurechantillonneur::reserve_db),
+            ) {
+                cretes_de_sortie.poser_le_gain_aval(reserve_du_surechantillonneur.gain());
+            }
             if choix_du_surechantillonneur.is_some() && etage_du_surechantillonneur.is_none() {
                 diagnostic_surechantillonnage.noter(Some(
                     backend
@@ -8451,6 +8665,10 @@ impl OutputTarget for LocalOutput {
             // rééchantillonnage, donc deux pistes de cadences différentes se
             // mélangent sans précaution. Durée nulle (défaut, PURE, flux en
             // direct) : le puits est transparent, un `ecrire` et rien d'autre.
+            //
+            // #8869 — sous le fondu, l'anneau est précédé du silence de
+            // verrouillage quand le format change.
+            backend.preceder_d_un_silence(silence_de_verrouillage.clone());
             let mut puits = match backend.puits() {
                 Puits::Flottant(puits) => {
                     Box::new(crate::audio::fondu_enchaine::PuitsDeFondu::nouveau(
@@ -8707,7 +8925,7 @@ impl OutputTarget for LocalOutput {
 
                 info!(
                     next_title = ?next.title,
-                    next_url = %next.url,
+                    next_url = %crate::confidentialite::masquer_url(&next.url),
                     "local_audio_gapless_chaining_next_track"
                 );
                 // #6132 — piste suivante : le retard commun des sorties
@@ -8745,6 +8963,7 @@ impl OutputTarget for LocalOutput {
                 else {
                     break;
                 };
+                next_reader.borner(entete_suivante.restant);
                 let nouvelle_spec = entete_suivante.spec;
                 let new_sr = nouvelle_spec.cadence();
                 let new_ch = nouvelle_spec.canaux();
@@ -9418,11 +9637,18 @@ impl OutputTarget for LocalOutput {
         // #6741 — un égaliseur coupé qui applique encore son préampli le dit :
         // le voyant nomme ce gain au lieu d'un « DSP appliqué » ambigu.
         let garde = self.preampli_garde();
+        // 19/11/2026 — l'écart de niveau qui reste, réserve compensée : il
+        // suit le volume en direct, comme le gain de rendu.
+        let ecart = self.reserve_du_surechantillonneur.ecart_de_niveau_db();
         mesure.map(|t| {
             let t = self
                 .diagnostic_surechantillonnage
                 .declarer(t)
                 .avec_fondu_enchaine(fondu);
+            let t = match ecart {
+                Some(db) => t.avec_ecart_de_niveau_surechantillonnage(db),
+                None => t,
+            };
             match garde {
                 Some(g) => t.avec_preampli_garde(g.db, g.en_retour),
                 None => t,
@@ -10105,3 +10331,9 @@ mod etage_exclusif_observe_7093;
 
 #[cfg(test)]
 mod exclusif_par_zone_3245_tests;
+
+/// #8761 — les cadences du jeu, pour la ligne de journal de l'installation.
+fn config_chemin_pour_journal(config: &crate::audio::convolver::ConvolverConfig) -> String {
+    let cadences: Vec<String> = config.cadences().iter().map(u32::to_string).collect();
+    format!("jeu[{} Hz]", cadences.join(", "))
+}

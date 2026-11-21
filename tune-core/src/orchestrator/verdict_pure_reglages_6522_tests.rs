@@ -391,13 +391,10 @@ async fn pure_sur_un_egaliseur_coupe_qui_garde_son_preampli_le_contourne_4176() 
     assert_eq!(verdict(&orch).await, SANS_OBJET);
 }
 
-/// Volume à 50 %, égaliseur joué, volume monté à 100 %, puis « Inactif » : la
-/// remontée du gain gardé s'arrête au niveau d'avant l'égaliseur (#6741), une
-/// part reste gardée. « Remettre à plat » est le réglage suivant : le gain
-/// gardé doit alors revenir à 0 dB, en rampe, et l'égaliseur coupé quitter la
-/// chaîne (verdict « inactif »).
+/// Le nouveau geste « Rendre le niveau » libère le gain retenu sans
+/// exiger une remise à plat préalable, avec la rampe existante.
 #[tokio::test]
-async fn remettre_a_plat_rend_tout_le_niveau_garde_par_l_egaliseur_coupe_4176() {
+async fn rendre_le_niveau_explicitement_libere_le_preampli_en_rampe_6524() {
     let orch = orchestrateur();
     let zone_id = zone_locale(&orch).await;
     armer_l_egaliseur(&orch, zone_id);
@@ -417,18 +414,17 @@ async fn remettre_a_plat_rend_tout_le_niveau_garde_par_l_egaliseur_coupe_4176() 
     );
     assert_eq!(verdict(&orch).await, OutputDspState::Applied);
 
-    enregistrer_l_egaliseur_coupe(&orch, zone_id, 0.0);
-    orch.refresh_zone_eq(zone_id).await;
+    assert!(orch.rendre_le_niveau_garde(zone_id).await);
     let juste_apres = avec_sortie_locale(&orch, |local| local.preampli_garde()).await;
     assert!(
         juste_apres.as_ref().is_some_and(|g| g.en_retour),
-        "« Remettre à plat » relance la remontée du gain gardé, sans saut ({juste_apres:?})"
+        "« Rendre le niveau » relance la remontée du gain gardé, sans saut ({juste_apres:?})"
     );
     avec_sortie_locale(&orch, |local| local.jouer_du_pcm_pour_test(10.0)).await;
     assert_eq!(
         preampli_garde_db(&orch).await,
         None,
-        "après « Remettre à plat », le gain gardé ({reste:?} dB) doit être rendu en entier : \
+        "après « Rendre le niveau », le gain gardé ({reste:?} dB) doit être rendu en entier : \
          le niveau ne remonte qu'à moitié (#4176)"
     );
     assert_eq!(verdict(&orch).await, OutputDspState::Inactive);
@@ -475,4 +471,48 @@ fn une_mesure_de_piece_contourne_les_traitements_puis_les_rend_8513() {
         (false, true, true, true, 80),
         "traitements non rétablis"
     );
+}
+
+/// #8917 — les clients existants peuvent encore rendre le niveau par
+/// leur action explicite « Remettre à plat », sans la nouvelle route.
+#[tokio::test]
+async fn remettre_a_plat_rend_le_niveau_aux_anciens_clients_8917() {
+    let orch = orchestrateur();
+    let zone_id = zone_locale(&orch).await;
+    armer_l_egaliseur(&orch, zone_id);
+    regler_le_volume(&orch, 0.5).await;
+    demarrer_une_piste_hors_pure(&orch, zone_id).await;
+    avec_sortie_locale(&orch, |local| local.jouer_du_pcm_pour_test(1.0)).await;
+    regler_le_volume(&orch, 1.0).await;
+    enregistrer_l_egaliseur_coupe(&orch, zone_id, 8.0);
+    orch.refresh_zone_eq(zone_id).await;
+    avec_sortie_locale(&orch, |local| local.jouer_du_pcm_pour_test(10.0)).await;
+    let avant = preampli_garde_db(&orch)
+        .await
+        .expect("prémisse : gain gardé");
+    assert!(avant < -1.0);
+    enregistrer_l_egaliseur_coupe(&orch, zone_id, 0.0);
+    orch.refresh_zone_eq(zone_id).await;
+    avec_sortie_locale(&orch, |local| local.jouer_du_pcm_pour_test(10.0)).await;
+    let apres = preampli_garde_db(&orch).await;
+    assert!(
+        apres.is_none(),
+        "#8917 : Remettre à plat laisse le niveau retenu : avant={avant}, après={apres:?}"
+    );
+    assert_eq!(verdict(&orch).await, OutputDspState::Inactive);
+}
+
+#[tokio::test]
+async fn lire_le_preampli_ne_bloque_pas_sur_une_sortie_occupee_8917() {
+    let orch = orchestrateur();
+    let zone_id = zone_locale(&orch).await;
+    let sortie = orch.outputs.lock().await.get("local:DAC").unwrap();
+    let _occupee = sortie.lock().await;
+    let lu = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        orch.preampli_garde_de_zone(zone_id),
+    )
+    .await
+    .expect("#8917 : GET attend indéfiniment la sortie occupée");
+    assert!(lu.is_none());
 }

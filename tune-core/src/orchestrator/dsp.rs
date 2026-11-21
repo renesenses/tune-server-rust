@@ -37,6 +37,11 @@ pub(crate) enum RaisonDeRelance {
     Reglage,
     /// Une bascule du mode PURE, annoncée aux télécommandes.
     BasculePure,
+    /// Un changement de réglage du suréchantillonneur (19/11/2026) : la
+    /// sortie locale rouvre son étage avec le nouveau choix, à la position
+    /// en cours. Plancher propre, plus court
+    /// (`UPSAMPLER_REPLAY_FLOOR_MS`), et différé plutôt qu'abandonné.
+    Surechantillonnage,
 }
 
 impl RaisonDeRelance {
@@ -45,7 +50,23 @@ impl RaisonDeRelance {
         match self {
             Self::Reglage => "eq_change",
             Self::BasculePure => "pure_bascule",
+            Self::Surechantillonnage => "upsampler_change",
         }
+    }
+
+    /// Le plancher entre deux relances de la même zone, en millisecondes.
+    pub(crate) fn plancher_ms(self) -> u64 {
+        match self {
+            Self::Surechantillonnage => PlaybackOrchestrator::UPSAMPLER_REPLAY_FLOOR_MS,
+            Self::Reglage | Self::BasculePure => PlaybackOrchestrator::EQ_REPLAY_FLOOR_MS,
+        }
+    }
+
+    /// Trop tôt après la relance précédente : abandonner (le réglage prendra
+    /// effet à la piste suivante) ou attendre la fin du plancher ? Seul le
+    /// suréchantillonneur attend : sa réponse a dit « appliqué ».
+    pub(crate) fn differe_sous_le_plancher(self) -> bool {
+        self == Self::Surechantillonnage
     }
 }
 
@@ -972,6 +993,59 @@ impl PlaybackOrchestrator {
         self.apply_eq_change_portee(zone_id).await == PorteeDuReglage::Immediate
     }
 
+    /// Le préampli réellement gardé par la sortie locale, sans mutation.
+    pub async fn preampli_garde_de_zone(
+        &self,
+        zone_id: i64,
+    ) -> Option<crate::audio::eq::PreampliGarde> {
+        #[cfg(feature = "local-audio")]
+        {
+            let device = self.peripherique_de_la_zone(zone_id);
+            let sortie = { self.outputs.lock().await.get(&device) }?;
+            let sortie = sortie.try_lock().ok()?;
+            sortie
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()?
+                .preampli_garde()
+        }
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            None
+        }
+    }
+
+    /// #6524 — geste explicite : libère la borne, par la rampe existante.
+    /// Aucun profil, volume ou état de transport n'est modifié ; PURE reste intact.
+    pub async fn rendre_le_niveau_garde(&self, zone_id: i64) -> bool {
+        if self.zone_audiophile(zone_id) {
+            return false;
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let device = self.peripherique_de_la_zone(zone_id);
+            let Some(sortie) = ({ self.outputs.lock().await.get(&device) }) else {
+                return false;
+            };
+            let sortie = sortie.lock().await;
+            let Some(locale) = sortie
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            else {
+                return false;
+            };
+            if locale.preampli_garde().is_none() {
+                return false;
+            }
+            locale.liberer_le_preampli_garde();
+            true
+        }
+        #[cfg(not(feature = "local-audio"))]
+        {
+            false
+        }
+    }
+
     /// [`Self::apply_eq_change`], mais qui dit QUAND le réglage atteindra le
     /// son, au lieu d'un booléen à plusieurs sens (#4680).
     ///
@@ -1538,6 +1612,12 @@ impl PlaybackOrchestrator {
             info!(zone_id, "eq_replay_skipped_position_inconnue");
             return false;
         }
+        if raison == RaisonDeRelance::Surechantillonnage {
+            self.surech_replay_en_attente
+                .lock()
+                .unwrap()
+                .insert(zone_id);
+        }
         let generation = {
             let mut gens = self.eq_replay_gen.lock().unwrap();
             let g = gens.entry(zone_id).or_insert(0);
@@ -1561,15 +1641,57 @@ impl PlaybackOrchestrator {
             // Plancher : trop tôt après le précédent, on renonce plutôt que de
             // hacher. Le réglage prendra effet à la piste suivante, ce que le
             // client sait déjà dire (`applied_live: false`).
-            {
+            //
+            // 19/11/2026 — le suréchantillonneur a son plancher, plus court,
+            // et ATTEND la fin du plancher au lieu de renoncer ; une demande
+            // plus récente arrivée pendant l'attente le remplace.
+            //
+            // Une demande qui en REMPLACE une du suréchantillonneur encore en
+            // attente prend sa règle : sinon un réglage d'égaliseur sous son
+            // plancher de 5 s abandonnerait le changement promis.
+            let regle = moi.raison_effective(zone_id, raison);
+            let reste_ms = {
                 let derniers = moi.eq_replay_last.lock().unwrap();
-                if let Some(t) = derniers.get(&zone_id)
-                    && t.elapsed().as_millis() < Self::EQ_REPLAY_FLOOR_MS as u128
-                {
+                derniers.get(&zone_id).and_then(|t| {
+                    regle
+                        .plancher_ms()
+                        .checked_sub(t.elapsed().as_millis() as u64)
+                        .filter(|reste| *reste > 0)
+                })
+            };
+            if let Some(reste_ms) = reste_ms {
+                if !regle.differe_sous_le_plancher() {
                     info!(zone_id, "eq_replay_skipped_floor");
                     return;
                 }
+                info!(
+                    zone_id,
+                    reste_ms,
+                    raison = raison.code(),
+                    "eq_replay_deferred_floor"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(reste_ms)).await;
+                let gens = moi.eq_replay_gen.lock().unwrap();
+                if gens.get(&zone_id).copied() != Some(generation) {
+                    return;
+                }
             }
+            // 19/11/2026 — une seule relance à la fois par zone. Une demande
+            // arrivée pendant qu'on attendait le verrou passera après nous.
+            let verrou = moi.verrou_de_relance(zone_id);
+            let _relance_tenue = verrou.lock().await;
+            {
+                let gens = moi.eq_replay_gen.lock().unwrap();
+                if gens.get(&zone_id).copied() != Some(generation) {
+                    return;
+                }
+            }
+            // Ce qui attendait est servi par CETTE relance (elle relit tous
+            // les réglages), ou n'a plus lieu d'être si rien ne joue.
+            moi.surech_replay_en_attente
+                .lock()
+                .unwrap()
+                .remove(&zone_id);
             // #7556 — la zone a pu être arrêtée ou mise en pause pendant
             // l'anti-rebond : la relance la remettrait en lecture sans geste
             // de lecture. Un réglage ne lance JAMAIS de lecture.
@@ -1581,15 +1703,17 @@ impl PlaybackOrchestrator {
             // #8422 — la position EN COURS, pas celle du dernier relevé du
             // sondeur : le temps joué depuis compte.
             let position_ms = position_a_reprendre(&etat);
+            // 19/11/2026 — le plancher part du DÉBUT de la relance (≥ 1 s) :
+            // posé après, deux clics rapprochés lançaient deux relances.
+            moi.eq_replay_last
+                .lock()
+                .unwrap()
+                .insert(zone_id, std::time::Instant::now());
             match moi
                 .replay_zone_at_position(zone_id, position_ms, raison.code())
                 .await
             {
                 Ok(()) => {
-                    moi.eq_replay_last
-                        .lock()
-                        .unwrap()
-                        .insert(zone_id, std::time::Instant::now());
                     info!(
                         zone_id,
                         position_ms,
@@ -1609,6 +1733,35 @@ impl PlaybackOrchestrator {
             }
         });
         true
+    }
+
+    /// 19/11/2026 — la règle de plancher qui gouverne une demande : celle du
+    /// suréchantillonneur dès qu'un de ses changements attend sur la zone.
+    pub(super) fn raison_effective(
+        &self,
+        zone_id: i64,
+        raison: RaisonDeRelance,
+    ) -> RaisonDeRelance {
+        if self
+            .surech_replay_en_attente
+            .lock()
+            .unwrap()
+            .contains(&zone_id)
+        {
+            RaisonDeRelance::Surechantillonnage
+        } else {
+            raison
+        }
+    }
+
+    /// 19/11/2026 — le verrou qui sérialise les relances d'une zone.
+    pub(super) fn verrou_de_relance(&self, zone_id: i64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+        self.verrous_de_relance
+            .lock()
+            .unwrap()
+            .entry(zone_id)
+            .or_default()
+            .clone()
     }
 
     /// #8422 — dire aux télécommandes qu'une bascule PURE a relancé le flux,
@@ -2331,8 +2484,7 @@ impl PlaybackOrchestrator {
     /// #7632 — `None` aussi SANS le droit Premium `RoomCorrection`
     /// ([`Self::correction_ir_autorisee`]) : la convolution par RI n'est
     /// alors ni cuite dans le flux réseau, ni comptée dans son empreinte, ni
-    /// présentée comme un traitement que PURE gouverne. Même place que la
-    /// garde du crossfeed (`crossfeed_configure_sous_licence`).
+    /// présentée comme un traitement que PURE gouverne.
     pub(super) fn chemin_ir_configure(&self, zone_id: i64) -> Option<String> {
         if !self.correction_ir_autorisee() {
             return None;
@@ -2406,8 +2558,7 @@ impl PlaybackOrchestrator {
 
     /// #7632 — le droit de convoluer : Premium (`RoomCorrection`, décision du
     /// 04/11/2026). ⚠️ Un orchestrateur SANS licence n'y a pas droit : une
-    /// absence ne vaut pas Premium (contrairement au crossfeed, dont la garde
-    /// laisse passer l'orchestrateur des tests).
+    /// absence ne vaut pas Premium. Le crossfeed simple est gratuit (#9210).
     pub fn correction_ir_autorisee(&self) -> bool {
         self.license
             .as_ref()
@@ -2427,8 +2578,31 @@ impl PlaybackOrchestrator {
     /// Les octets de la réponse impulsionnelle, pour l'empreinte du cache de
     /// transcodage : c'est le CONTENU qui décide de la rendition, pas le nom
     /// du fichier. `None` si la zone n'en a pas ou s'il est illisible.
+    ///
+    /// #8761 — le CONTENU de tout le jeu : principal, fichiers par cadence et
+    /// réglage de repli. Sans fichier par cadence et avec le repli par défaut,
+    /// les octets sont exactement ceux d'avant (le cache existant reste bon).
     pub(super) fn octets_ir(&self, zone_id: i64) -> Option<Vec<u8>> {
-        std::fs::read(self.chemin_ir(zone_id)?).ok()
+        let jeu = self.jeu_ir(zone_id)?;
+        let mut octets = std::fs::read(&jeu.principal).ok()?;
+        for chemin in &jeu.supplementaires {
+            octets.extend_from_slice(b"|ir_jeu|");
+            octets.extend(std::fs::read(chemin).unwrap_or_default());
+        }
+        if !jeu.reechantillonner {
+            octets.extend_from_slice(b"|sans_reechantillonnage");
+        }
+        Some(octets)
+    }
+
+    /// #8761 — le jeu de réponses impulsionnelles de la zone, derrière les
+    /// mêmes gardes que [`Self::chemin_ir`] (PURE, licence).
+    pub(super) fn jeu_ir(&self, zone_id: i64) -> Option<crate::audio::convolver::JeuDeZone> {
+        let principal = self.chemin_ir(zone_id)?;
+        let settings = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone());
+        Some(crate::audio::convolver::JeuDeZone::avec_principal(
+            &settings, zone_id, principal,
+        ))
     }
 
     pub(super) fn load_convolver(
@@ -2438,13 +2612,12 @@ impl PlaybackOrchestrator {
         channels: u16,
     ) -> Option<crate::audio::convolver::Convolver> {
         let _e = EtapeDePreparation::debut(zone_id, "dsp_convolution");
-        let path = self.chemin_ir(zone_id)?;
-        match crate::audio::convolver::Convolver::from_wav_for(
-            &path,
-            1024,
-            sample_rate,
-            channels as usize,
-        ) {
+        let jeu = self.jeu_ir(zone_id)?;
+        let path = jeu.principal.clone();
+        match jeu
+            .charger()
+            .and_then(|c| c.build_for(1024, sample_rate, channels as usize))
+        {
             Ok(c) => Some(c),
             Err(e) => {
                 tracing::warn!(zone_id, path, error = %e, "room_correction_ir_load_failed");
@@ -2464,9 +2637,8 @@ impl PlaybackOrchestrator {
     /// `{ "enabled": bool, "amount": f32, "delay_ms": f32 }`. Values are clamped
     /// defensively (amount 0..0.5, delay_ms 0..5) mirroring the route validation.
     /// #7614 — le choix du greffon de suréchantillonnage de la zone, licence
-    /// comprise (Premium, comme le crossfeed). `None` sous PURE. Sans
-    /// gestionnaire de licence (les tests), aucune garde de licence, comme
-    /// [`Self::crossfeed_configure_sous_licence`].
+    /// comprise (Premium). `None` sous PURE. Sans gestionnaire de licence
+    /// (les tests), aucune garde de licence.
     pub fn choix_du_surechantillonneur(
         &self,
         zone_id: i64,
@@ -2505,9 +2677,111 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// Décision de Bertrand du 19/11/2026 (étude de la spec de Rémi, § B.2)
+    /// — un changement de réglage du suréchantillonneur s'applique TOUT DE
+    /// SUITE : le choix est reposé sur la sortie locale
+    /// ([`Self::refresh_zone_upsampler`]) puis, si la zone joue et que ce
+    /// choix a changé, le flux est relancé à la position en cours, comme la
+    /// bascule PURE (#8422). Environ une seconde de silence, accepté pour une
+    /// écoute comparative ; plancher propre et différé
+    /// ([`RaisonDeRelance::Surechantillonnage`]).
+    ///
+    /// Rend :
+    /// - [`PorteeDuReglage::Immediate`] : rien à relancer (le choix de la
+    ///   sortie n'a pas changé, ou la zone ne joue pas sur une sortie
+    ///   locale, où le réglage n'agit pas) ;
+    /// - [`PorteeDuReglage::Relance`] : relance programmée ;
+    /// - [`PorteeDuReglage::PisteSuivante`] : zone en pause (une relance la
+    ///   remettrait en lecture, #7556) ou position inconnue (#2595) ;
+    /// - [`PorteeDuReglage::RienNeJoue`] : la prochaine lecture partira avec
+    ///   ce réglage.
+    pub async fn apply_upsampler_change_portee(
+        self: &std::sync::Arc<Self>,
+        zone_id: i64,
+    ) -> PorteeDuReglage {
+        self.refresh_zone_upsampler(zone_id).await;
+        // Le nouveau choix se compare aux réglages lus à l'OUVERTURE du flux
+        // qui joue, pas au choix posé avant ce PUT : un changement fait en
+        // pause, puis un PUT identique après la reprise, doit encore relancer.
+        let change = match self.surechantillonneur_du_flux_et_choix(zone_id).await {
+            Some((du_flux, choix)) => du_flux != choix,
+            None => false,
+        };
+        let portee = self
+            .portee_du_reglage_du_surechantillonneur(zone_id, change)
+            .await;
+        info!(zone_id, portee = ?portee, "upsampler_change_portee");
+        if let Some(ref bus) = self.event_bus {
+            bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
+        }
+        portee
+    }
+
+    async fn portee_du_reglage_du_surechantillonneur(
+        self: &std::sync::Arc<Self>,
+        zone_id: i64,
+        choix_change: bool,
+    ) -> PorteeDuReglage {
+        let etat = self.playback.get_state(zone_id).await;
+        if etat.now_playing.is_none() || etat.state == crate::playback::PlayState::Stopped {
+            return PorteeDuReglage::RienNeJoue;
+        }
+        if !choix_change {
+            return PorteeDuReglage::Immediate;
+        }
+        // #7556 — en pause, la relance remettrait la zone en lecture : le
+        // choix vaudra à la reprise d'un nouveau flux, au plus tard à la
+        // piste suivante.
+        if etat.state != crate::playback::PlayState::Playing {
+            return PorteeDuReglage::PisteSuivante;
+        }
+        if self.schedule_replay_pour(zone_id, RaisonDeRelance::Surechantillonnage) {
+            PorteeDuReglage::Relance
+        } else {
+            PorteeDuReglage::PisteSuivante
+        }
+    }
+
+    /// Sur la sortie locale de la zone : les réglages lus à l'ouverture du
+    /// flux qui joue, et le choix posé pour la suite. `None` sans sortie
+    /// locale vivante (le réglage n'y agit pas).
+    #[allow(clippy::type_complexity)]
+    async fn surechantillonneur_du_flux_et_choix(
+        &self,
+        zone_id: i64,
+    ) -> Option<(
+        Option<crate::audio::surechantillonnage::UpsamplerSettings>,
+        Option<crate::audio::surechantillonnage::UpsamplerSettings>,
+    )> {
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            None
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let device_id = self.peripherique_de_la_zone(zone_id);
+            if !device_id.starts_with("local:") {
+                return None;
+            }
+            let output_arc = { self.outputs.lock().await.get(&device_id) }?;
+            let output = output_arc.lock().await;
+            output
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+                .map(|local| {
+                    (
+                        local.reglages_du_flux_surechantillonne(),
+                        local.surechantillonnage().map(|choix| choix.reglages),
+                    )
+                })
+        }
+    }
+
     /// #7614 — repose le choix du suréchantillonneur sur la sortie locale de
-    /// la zone après un changement de réglage. La piste en cours n'en est
-    /// pas affectée : la sortie le compare à la frontière suivante.
+    /// la zone après un changement de réglage. Seul, il n'affecte pas la
+    /// piste en cours : la sortie le compare à la frontière suivante. C'est
+    /// [`Self::apply_upsampler_change_portee`] qui relance le flux.
     pub async fn refresh_zone_upsampler(&self, zone_id: i64) {
         #[cfg(not(feature = "local-audio"))]
         let _ = zone_id;
@@ -2615,31 +2889,15 @@ impl PlaybackOrchestrator {
     /// le crossfeed intégré est alors éteint, et ni l'empreinte du flux, ni la
     /// clé du cache, ni la compensation ne le comptent.
     pub(super) fn crossfeed_configure(&self, zone_id: i64) -> Option<(f32, f32)> {
-        let reglage =
-            Self::crossfeed_configure_sous_licence(&self.db, self.license.as_deref(), zone_id)?;
+        let reglage = Self::crossfeed_configure_with(&self.db, zone_id)?;
         let tiers = self.etages_tiers_configures(zone_id);
         crate::audio::crossfeed::etage_tiers_qui_remplace_le_crossfeed(&tiers)
             .is_none()
             .then_some(reglage)
     }
 
-    /// #5114 — [`Self::crossfeed_configure`] sans orchestrateur, AVEC sa
-    /// garde de licence : la même, écrite une fois, sur le même
-    /// `LicenseManager`. `None` : aucune garde, comme un orchestrateur sans
-    /// licence (les tests).
-    fn crossfeed_configure_sous_licence(
-        db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
-        license: Option<&crate::license::LicenseManager>,
-        zone_id: i64,
-    ) -> Option<(f32, f32)> {
-        if license.is_some_and(|license| !license.premium_snapshot()) {
-            return None;
-        }
-        Self::crossfeed_configure_with(db, zone_id)
-    }
-
-    /// La lecture du réglage, SANS la garde de licence : seul
-    /// [`Self::crossfeed_configure_sous_licence`] l'appelle.
+    /// Crossfeed simple gratuit (#9210) : conserver les choix d'installation
+    /// et de zone, sans garde Premium. Les étages tiers gardent leur garde.
     fn crossfeed_configure_with(
         db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
         zone_id: i64,
@@ -3378,6 +3636,12 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         device_id: Option<&str>,
     ) -> OutputCommandResult<super::EnvoiDeVolume> {
+        // #8920 — jamais de plein volume vers un ampli Devialet AIR, même si
+        // une route l'oubliait : rien ne part.
+        if crate::outputs::devialet_air::reglages::zone_air(&self.db, zone_id) {
+            warn!(zone_id, "devialet_air_plein_volume_pure_refuse_8920");
+            return Ok(super::EnvoiDeVolume::AucunVolumeFixe);
+        }
         // #6721 — l'armement de PURE est confirmé par l'utilisateur : c'est
         // l'action explicite qui autorise le 100 % (la garde ne mord pas sous
         // `pure_force`).
@@ -3790,6 +4054,15 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         device_id: Option<&str>,
     ) -> OutputCommandResult<()> {
+        // #8920 — le volume fixe n'existe pas sur Devialet AIR : armer
+        // enverrait le haut de la course à l'ampli. Refus, rien ne part.
+        if crate::outputs::devialet_air::reglages::zone_air(&self.db, zone_id) {
+            warn!(zone_id, "devialet_air_volume_fixe_refuse_8920");
+            return Err(OutputCommandError::failed(
+                OutputCommand::SetVolume,
+                "fixed volume is unavailable on a Devialet AIR zone".to_string(),
+            ));
+        }
         if let Some(did) = device_id {
             let output = { self.outputs.lock().await.get(did) };
             match output {

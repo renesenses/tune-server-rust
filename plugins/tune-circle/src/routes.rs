@@ -52,16 +52,21 @@
 //! Le cercle partagé (site-mozaiklabs#568, rc13) : le propriétaire partage un
 //! cercle entre ses membres, chaque membre choisit de s'y montrer. Le droit
 //! (propriété : 404 ; membre au lien actif : 404 ; cercle non partagé : 409
-//! `circle_not_shared`) est jugé par le cloud seul et relayé avec son corps.
-//! Sans corps dans les deux sens ; `{id}` en chiffres seulement, sinon `404
-//! circle.not_found` sans appel.
+//! `circle_not_shared`, pour `PUT …/show-me` seulement — `DELETE …/show-me`
+//! rend 200, idempotent, même si le cercle n'est plus partagé) est jugé par
+//! le cloud seul et relayé avec son corps. Sans corps dans les deux sens ;
+//! `{id}` en chiffres seulement, sinon `404 circle.not_found` sans appel.
+//!
+//! Ces routes, comme toutes les écritures du greffon, sont réservées à
+//! l'administrateur du serveur et refusées à distance : la garde est posée
+//! par l'hôte (`tune_server::garde_du_cercle`).
 //!
 //! | Tune (`/api/v1/ext/circle`)                  | mozaiklabs (`/api/v1/circle`)          |
 //! |----------------------------------------------|----------------------------------------|
 //! | `PUT /circles/{id}/sharing/members`          | idem → le cercle, `members_see_each_other` |
 //! | `DELETE /circles/{id}/sharing/members`       | idem                                   |
-//! | `PUT /member-of/{id}/show-me`                | idem → l'entrée `member_of`, `show_me` |
-//! | `DELETE /member-of/{id}/show-me`             | idem                                   |
+//! | `PUT /member-of/{id}/show-me`                | idem → l'entrée `member_of`, `show_me` ; 409 si non partagé |
+//! | `DELETE /member-of/{id}/show-me`             | idem, 200 idempotent                   |
 //!
 //! rc8 (#6900), l'écran de Levente et le globe opt-in, dans [`crate::globe`] :
 //! `GET /contacts/{user_id}/library/summary`, `GET|PUT|DELETE /me/location`,
@@ -69,7 +74,8 @@
 //!
 //! rc9 (#7122), la carte publique anonyme, dans [`crate::globe`] : `GET
 //! /world/points`, `GET|PUT|DELETE /me/public-map-opt-out`, relayés à
-//! l'identique.
+//! l'identique. rc13 : `GET /world/circles`, les cercles du monde en points
+//! anonymes, relayé à l'identique.
 //!
 //! #6935, inviter sans e-mail, dans [`crate::sans_email`] : `POST
 //! /invitations/by-pseudo`, `GET|POST /invitation-links`, `DELETE
@@ -221,6 +227,8 @@ pub fn router(relais: Arc<Relais>, license: Arc<LicenseManager>) -> Router<()> {
         .route("/contacts/locations", get(crate::globe::lieux_des_contacts))
         // rc9 (#7122) : la carte publique anonyme et son interrupteur.
         .route("/world/points", get(crate::globe::points_du_monde))
+        // rc13 : les cercles du monde, en points anonymes.
+        .route("/world/circles", get(crate::globe::cercles_du_monde))
         .route(
             "/me/public-map-opt-out",
             get(crate::globe::mon_retrait_de_la_carte)
@@ -1026,11 +1034,8 @@ fn date_de_synchro(brute: Option<String>) -> Option<String> {
 async fn etat_de_la_copie_en_ligne(State(etat): State<Arc<EtatDeLaCopie>>) -> Response {
     let reglages = etat.relais.reglages();
     let premium = etat.license.is_premium().await;
-    let session = reglages
-        .get("mozaik_access_token")
-        .ok()
-        .flatten()
-        .is_some_and(|v| !v.trim().is_empty());
+    // #8797 : une session refusée par le site ne pousse plus rien.
+    let session = tune_core::cloud::sso::jeton_de_compte(&reglages).is_some();
     let server_id = server_id_du_serveur(&etat.relais);
     let active =
         library_sync::synchro_autorisee(premium, &reglages) && session && server_id.is_some();

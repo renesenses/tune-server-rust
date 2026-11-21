@@ -36,6 +36,16 @@ nohup cargo test -p tune-server --lib <filtre> > target/x.log 2>&1 &
 | `cargo clippy -p tune-core --lib --tests` | environ 6 min 40 après les tests | |
 | `cargo clippy -p tune-server --tests` | environ 8 min | |
 
+## Banc de cadences sur Windows
+
+Le job `windows-pr` compile et exécute aussi
+`scripts/banc-cadences-windows-8671.rs` avec `rustc --edition 2024 --test`.
+Le banc importe les trois modules de production (formats, masques et cadences)
+et leurs tests ; aucune logique n'est recopiée. Il ne dépend ni d'un compte
+ni d'un périphérique audio. Il vérifie la négociation sur Windows, sans prouver
+l'ouverture d'un pilote réel ni le décodage complet. Les tests Cargo du cœur
+couvrent séparément le décodeur, le mode strict et la fréquence fixe.
+
 ## Lancer peu de tests
 
 - Filtrer par nom : `cargo test -p tune-core --lib -- <filtre1> <filtre2>`.

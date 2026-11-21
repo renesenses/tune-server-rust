@@ -1255,6 +1255,11 @@ pub fn spawn_auto_scan(db: Arc<dyn DbBackend>, event_bus: Arc<EventBus>) -> Arc<
             );
             let pruned = bilan.removed + bilan_promotions.removed;
             db_delete_failed = bilan.db_delete_failed + bilan_promotions.db_delete_failed;
+            hors_perimetre += crate::routes::system::scan::compter_cue_hors_perimetre_8836(
+                &*db,
+                &music_dirs,
+                None,
+            );
             if hors_perimetre > 0 {
                 tracing::warn!(
                     hors_perimetre,

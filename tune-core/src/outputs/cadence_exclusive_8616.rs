@@ -149,7 +149,7 @@ mod tests {
                 refus()
             }
         })
-        .unwrap();
+        .expect("un pilote 48 kHz doit accepter la piste CD");
         assert_eq!(
             cible,
             Some(48_000),

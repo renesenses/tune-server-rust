@@ -234,3 +234,25 @@ async fn inscription_http_presente_la_liaison_du_serveur_7282() {
     );
     serveur.abort();
 }
+
+/// #8797 — après un refus de la session par le site, la clé ne s'inscrit
+/// pas (aucun appel au site) ; elle s'inscrit dès la reconnexion.
+#[tokio::test]
+async fn apres_un_refus_de_session_la_cle_ne_s_inscrit_pas_8797() {
+    let b = base();
+    cle_du_serveur(&b).unwrap();
+    relie(&b);
+    reglages(&b)
+        .set(
+            crate::cloud::sso::CLE_RECONNEXION_REQUISE,
+            "2026-11-20T10:00:00+00:00",
+        )
+        .unwrap();
+    let site = FauxSite::default();
+    assert_eq!(inscrire_si_besoin(&b, &site).await, Ok(false));
+    assert!(site.recus.lock().unwrap().is_empty(), "aucun appel au site");
+    // Contre-épreuve : la reconnexion lève le refus, l'inscription part.
+    crate::cloud::sso::oublier_le_refus_de_session(&reglages(&b));
+    assert_eq!(inscrire_si_besoin(&b, &site).await, Ok(true));
+    assert_eq!(site.recus.lock().unwrap().len(), 1);
+}

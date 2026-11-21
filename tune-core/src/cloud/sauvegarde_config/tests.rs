@@ -1165,3 +1165,72 @@ async fn un_refus_pour_taille_dit_la_limite_et_quoi_alleger_7286() {
         assert!(note.contains(attendu), "« {attendu} » absent de : {note}");
     }
 }
+
+/// Un instantané d'avant les noms neutres nomme le profil lié par l'adresse
+/// de son compte : la restauration le retrouve par `email` au lieu de créer
+/// un double nommé par l'adresse ; un profil à recréer prend un nom neutre.
+#[test]
+fn un_profil_nomme_par_son_adresse_se_retrouve_par_email() {
+    let source = base_neuve();
+    exec(
+        &source,
+        "INSERT INTO profiles (username, display_name, email, is_admin) \
+         VALUES ('lea@exemple.test', 'Léa', 'lea@exemple.test', 0)",
+    );
+    exec(
+        &source,
+        "INSERT INTO profiles (username, display_name, email, is_admin) \
+         VALUES ('tom@exemple.test', '', 'tom@exemple.test', 0)",
+    );
+    let contenu = construire(&source).unwrap();
+
+    let cible = base_neuve();
+    // La cible a déjà renommé Léa (passe de démarrage) ; Tom n'y est pas.
+    exec(
+        &cible,
+        "INSERT INTO profiles (username, display_name, email, is_admin) \
+         VALUES ('Léa', 'Léa', 'lea@exemple.test', 0)",
+    );
+    let avant = un_entier(&cible, "SELECT COUNT(*) FROM profiles");
+    let r = restaurer(&cible, &contenu, Mode::Merge).unwrap();
+    assert_eq!(r.profiles_created, 1, "seul Tom est recréé");
+    assert_eq!(
+        un_entier(&cible, "SELECT COUNT(*) FROM profiles"),
+        avant + 1
+    );
+    assert_eq!(
+        un_entier(
+            &cible,
+            "SELECT COUNT(*) FROM profiles WHERE username LIKE '%@%'"
+        ),
+        0,
+        "un profil nommé par une adresse a été recréé"
+    );
+    assert_eq!(
+        un_entier(
+            &cible,
+            "SELECT COUNT(*) FROM profiles WHERE username = 'tom' AND email = 'tom@exemple.test'"
+        ),
+        1
+    );
+}
+
+/// #8797 — le compte d'une session refusée par le site vaut « non relié » :
+/// sauvegarde, écoutes, notes et écoutes de la communauté (tous lisent
+/// `compte`) ne partent plus jusqu'à la reconnexion.
+#[test]
+fn une_session_refusee_vaut_non_relie_8797() {
+    let b = base_neuve();
+    let s = reglages(&b);
+    s.set("mozaik_access_token", "jeton").unwrap();
+    s.set("server_id", "srv-1").unwrap();
+    assert!(compte(&s).is_ok());
+    s.set(
+        crate::cloud::sso::CLE_RECONNEXION_REQUISE,
+        "2026-11-20T10:00:00+00:00",
+    )
+    .unwrap();
+    assert!(matches!(compte(&s), Err(ErreurSite::NonRelie)));
+    crate::cloud::sso::oublier_le_refus_de_session(&s);
+    assert_eq!(compte(&s).unwrap().acces, "jeton");
+}

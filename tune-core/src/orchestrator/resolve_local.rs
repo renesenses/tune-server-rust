@@ -663,7 +663,8 @@ impl PlaybackOrchestrator {
             .appareils_qui_lachent_le_dsd_suivant
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(device_id);
+            .get_mut(device_id)
+            .is_some_and(|m| m.garde_active(std::time::Instant::now()));
         crate::playback::gapless::refus_dsd_suivant_sur_dlna(
             annonce_dsd,
             natif_force,
@@ -672,13 +673,42 @@ impl PlaybackOrchestrator {
         )
     }
 
-    /// #6910 — `device_id` a lâché un suivant DSD armé : la garde de #402 lui
-    /// est rendue jusqu'au redémarrage. Vrai à la première fois seulement.
-    pub fn retenir_dsd_suivant_lache(&self, device_id: &str) -> bool {
+    /// #6910 — `device_id` a lâché un suivant DSD armé. #9206 : la garde de
+    /// #402 ne lui est rendue qu'au deuxième échec (ou tout de suite si
+    /// `immediat` : il a dit lui-même avoir perdu la suivante, ou s'il est
+    /// récidiviste), pour un temps (voir
+    /// [`crate::playback::gapless::EchecsDsdSuivant`]).
+    pub fn retenir_dsd_suivant_lache(
+        &self,
+        device_id: &str,
+        immediat: bool,
+    ) -> crate::playback::gapless::IssueEchecDsdSuivant {
         self.appareils_qui_lachent_le_dsd_suivant
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(device_id.to_string())
+            .entry(device_id.to_string())
+            .or_default()
+            .noter_echec(std::time::Instant::now(), immediat)
+    }
+
+    /// #9206 — `device_id` a suivi un suivant DSD armé : ses échecs et sa
+    /// récidive sont oubliés. Vrai s'il y avait quelque chose à oublier.
+    pub fn noter_succes_dsd_suivant(&self, device_id: &str) -> bool {
+        self.appareils_qui_lachent_le_dsd_suivant
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(device_id)
+            .is_some()
+    }
+
+    /// Banc (#9206) : échecs de suivant DSD notés pour `device_id`.
+    #[cfg(test)]
+    pub(crate) fn echecs_dsd_suivant_pour_banc(&self, device_id: &str) -> u32 {
+        self.appareils_qui_lachent_le_dsd_suivant
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(device_id)
+            .map_or(0, |m| m.echecs())
     }
 
     /// Banc : ce que le `GetProtocolInfo` du renderer aurait dit du DSD.
@@ -1308,6 +1338,20 @@ impl PlaybackOrchestrator {
         };
         let mut transport = transport_dsd(is_local_output, is_network_output, &dsd_mode);
 
+        // #8248 / #9170 (suivi #9172) — une piste PCM sur une zone « Natif »
+        // dont la sortie n'a jamais été sondée : la prochaine ouverture de
+        // flux (PCM libre) la sondera une fois, pour que la PREMIÈRE piste DSD
+        // qui suit parte déjà en natif. Une zone qui n'est pas « Natif » ne
+        // demande rien : ses pistes PCM ne sondent jamais.
+        if let Some(nom) = sortie_a_sonder_pour_une_piste_pcm(
+            is_local_output,
+            source_format,
+            req.output_device_id.as_deref(),
+            || ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(req.zone_id),
+        ) {
+            crate::outputs::capacite_dsd_natif::demander_sondage_a_l_ouverture(nom);
+        }
+
         // #5643 — « natif » sur une sortie locale ASIO dont le pilote déclare
         // le DSD à la cadence du fichier : du DSD natif, pour de vrai. Sinon
         // `NatifServiEnDop`, comme avant, avec le motif au journal.
@@ -1355,7 +1399,7 @@ impl PlaybackOrchestrator {
                             fin_ms: None,
                         },
                     };
-                    return self
+                    let servi = self
                         .servir_le_dsd_natif(
                             req,
                             track,
@@ -1365,6 +1409,12 @@ impl PlaybackOrchestrator {
                             fenetre,
                         )
                         .await;
+                    // #9170 — échec avant le bras : le natif attendu ne
+                    // partira pas, il ne doit pas rester en attente.
+                    if !matches!(servi, Ok(Some(_))) {
+                        crate::outputs::capacite_dsd_natif::effacer_transport_reel(req.zone_id);
+                    }
+                    return servi;
                 }
                 Err(motif) => motif_natif = Some(motif),
             }
@@ -2292,6 +2342,16 @@ impl PlaybackOrchestrator {
                         let r = tokio::task::spawn_blocking(move || sonde.sonder_et_retenir())
                             .await
                             .unwrap_or(ResultatSondeDsdAlsa::Occupe);
+                        // #9170 (suivi #9172, relecture #9211) — rien appris
+                        // (PCM tenu par la piste précédente, DAC introuvable,
+                        // verdict provisoire) : la demande est posée, SANS
+                        // armer l'espacement (`ResultatSondeDsdAlsa::retenir`
+                        // n'en arme aucun) — l'ouverture de CETTE piste, PCM
+                        // libre, sonde donc, et la suivante peut partir en
+                        // natif. Seuls les échecs à l'ouverture espacent.
+                        if !matches!(r, ResultatSondeDsdAlsa::Sonde { .. }) {
+                            capacite::demander_sondage_a_l_ouverture(&nom);
+                        }
                         return sortie_alsa_apres_sonde(r);
                     }
                 }
@@ -2475,8 +2535,19 @@ impl PlaybackOrchestrator {
             track.channels as u32,
         );
         let dop_rate = crate::audio::dsd_to_dop::DsdToDoP::dop_rate(dsd_rate);
-        // Réutilise le plafond déjà combiné avec le quirk catalogue.
-        let zone_max_sr = zone_max_sample_rate;
+        // #8789 — en local, ne pas ouvrir un porteur DoP au-delà du DSD256.
+        // Les deux familles gardent leur DSD256 (705,6 / 768 kHz). Le plafond
+        // de zone peut encore abaisser cette borne ; le chemin natif est séparé.
+        let zone_max_sr = if is_local_output {
+            let plafond_dop = if dsd_rate.is_multiple_of(48_000) {
+                768_000
+            } else {
+                705_600
+            };
+            Some(zone_max_sample_rate.unwrap_or(plafond_dop).min(plafond_dop))
+        } else {
+            zone_max_sample_rate
+        };
         if let Some(max_sr) = zone_max_sr {
             if dop_rate > max_sr {
                 // #3973 — le DoP dépasse le plafond : le chemin ordinaire
@@ -2815,6 +2886,38 @@ impl PlaybackOrchestrator {
     /// correctif restaient VERTES, la garde de site comprise, parce
     /// qu'aucune ne regardait le porteur réellement construit. Celle-ci le
     /// regarde.
+    /// #9178 — la piste sera-t-elle transcodée (`needs_transcode`) ou servie
+    /// telle quelle ? Le relais ne porte le crossfeed que dans le premier cas.
+    #[cfg(test)]
+    pub(super) async fn transcodage_decide_pour_test(
+        &self,
+        req: &PlayRequest,
+    ) -> Result<bool, String> {
+        let track_id = req.track_id.ok_or("no track_id for local playback")?;
+        let track = TrackRepo::with_backend(self.db.clone())
+            .get(track_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("track not found")?;
+        let file_path = track.file_path.clone().ok_or("track has no file_path")?;
+        let fmt = track.format.clone().unwrap_or_else(|| "flac".into());
+        let source_format = AudioFormat::from_extension(&fmt);
+        let is_dsd_source = source_format == Some(AudioFormat::Dsd);
+        match self
+            .decider_la_lecture_locale(
+                req,
+                &track,
+                file_path,
+                fmt,
+                source_format,
+                is_dsd_source,
+                None,
+            )
+            .await?
+        {
+            DecisionOuResolu::Decision(d) => Ok(d.needs_transcode),
+            DecisionOuResolu::Resolu(_) => Ok(false),
+        }
+    }
     #[cfg(test)]
     pub(super) async fn relais_dsp_pour_test(
         &self,
@@ -5240,6 +5343,23 @@ fn noter_transport_reel_dsd(req: &PlayRequest, transport: TransportReelDsd) {
     if let Some(sortie) = req.output_device_id.as_deref() {
         crate::outputs::capacite_dsd_natif::noter_transport_reel(req.zone_id, sortie, transport);
     }
+}
+
+/// #8248 / #9170 (relecture #9211) — la sortie dont une piste NON DSD doit
+/// demander le sondage à l'ouverture : sortie locale jamais sondée, zone
+/// réglée « Natif » (`dsd_mode`, lu seulement si tout le reste le permet).
+pub(super) fn sortie_a_sonder_pour_une_piste_pcm<'a>(
+    is_local_output: bool,
+    source_format: Option<AudioFormat>,
+    output_device_id: Option<&'a str>,
+    dsd_mode: impl FnOnce() -> String,
+) -> Option<&'a str> {
+    if !is_local_output || source_format == Some(AudioFormat::Dsd) {
+        return None;
+    }
+    let nom = output_device_id?.strip_prefix("local:")?;
+    (crate::outputs::capacite_dsd_natif::connue(nom).is_none() && dsd_mode() == "native")
+        .then_some(nom)
 }
 
 /// #9170 — ce qu'un sondage DSD natif ALSA permet pour la piste qui se

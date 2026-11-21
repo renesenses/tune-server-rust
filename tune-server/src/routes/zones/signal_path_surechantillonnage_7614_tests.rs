@@ -269,3 +269,77 @@ fn diagnostic_8259_machine_absente_expliquee_dans_toutes_les_langues() {
         );
     }
 }
+
+/// Décision de Bertrand du 19/11/2026 — la réserve est compensée dans le gain
+/// de rendu ; le chemin du signal dit ce qui reste d'écart avec la lecture
+/// sans suréchantillonnage : rien, une partie, ou la réserve entière à 100 %.
+fn chemin_avec_ecart(ecart_db: Option<f64>) -> Value {
+    let (backend, zone, mut ps) = zone_locale();
+    activer(&backend, zone.id.unwrap());
+    let t = TransformationsReelles::nouvelles(
+        AudioSpec::nouvelle(44_100, ProfondeurPcm::Entier16, 2).unwrap(),
+        FormatOuvert::new(352_800, 2),
+        false,
+    )
+    .avec_surechantillonnage("polyvalent", -3.0);
+    ps.transformations_reelles = Some(match ecart_db {
+        Some(db) => t.avec_ecart_de_niveau_surechantillonnage(db),
+        None => t,
+    });
+    chemin(&backend, &zone, &ps)
+}
+
+#[test]
+fn reserve_compensee_le_chemin_dit_niveau_egal() {
+    let sp = chemin_avec_ecart(Some(0.0));
+    let e = etape(&sp, "upsampling").unwrap();
+    assert_eq!(e["level_matched"], true);
+    assert_eq!(e["level_gap_db"], 0.0);
+    assert_eq!(sp["upsampling"]["level_matched"], true);
+    let note = e["level_note"].as_str().unwrap();
+    assert!(e["description"].as_str().unwrap().ends_with(note), "{e}");
+}
+
+#[test]
+fn a_100_pour_cent_le_chemin_dit_pourquoi_rien_n_est_compense() {
+    let sp = chemin_avec_ecart(Some(-3.0));
+    let e = etape(&sp, "upsampling").unwrap();
+    assert_eq!(e["level_matched"], false);
+    assert_eq!(e["level_gap_db"], -3.0);
+    let note = e["level_note"].as_str().unwrap();
+    assert!(note.contains("100") && note.contains("3.0"), "{note}");
+    assert_eq!(sp["upsampling"]["level_note"], note);
+}
+
+#[test]
+fn la_note_de_niveau_est_traduite_cote_serveur() {
+    assert_eq!(
+        note_de_niveau_du_surechantillonneur("fr", -3.0, Some(0.0)),
+        Some((
+            true,
+            "niveau égal à la lecture sans suréchantillonnage (réserve compensée par le volume)"
+                .to_string()
+        ))
+    );
+    let (egal, partielle) = note_de_niveau_du_surechantillonneur("fr", -3.0, Some(-1.0)).unwrap();
+    assert!(!egal);
+    assert!(
+        partielle.starts_with("réserve compensée en partie : 1.0 dB"),
+        "{partielle}"
+    );
+    let (_, pleine) = note_de_niveau_du_surechantillonneur("de", -3.0, Some(-3.0)).unwrap();
+    assert!(
+        pleine.starts_with("Reserve nicht ausgeglichen: Lautstärke bei 100 %"),
+        "{pleine}"
+    );
+    assert!(pleine.contains("mindestens 3.0 dB"), "{pleine}");
+    // La sortie ne dit pas l'écart : rien n'est affirmé.
+    assert_eq!(note_de_niveau_du_surechantillonneur("fr", -3.0, None), None);
+    let sp = chemin_avec_ecart(None);
+    assert!(
+        etape(&sp, "upsampling")
+            .unwrap()
+            .get("level_note")
+            .is_none()
+    );
+}

@@ -2399,9 +2399,12 @@ pub(crate) fn releve_portraits_d_artistes(
     cache_dir: &std::path::Path,
 ) -> Option<PortraitsDArtistes> {
     let lignes = backend
+        // #9265 — les portraits des artistes de la GRILLE.
         .query_many(
-            "SELECT image_path, image_source FROM artists \
-             WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)",
+            &format!(
+                "SELECT image_path, image_source FROM artists WHERE {}",
+                tune_core::db::artist_repo::PREDICAT_ARTISTES_DE_LA_GRILLE
+            ),
             &[],
         )
         .ok()?;
@@ -2705,6 +2708,14 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
             .collect()
     };
 
+    // #8944 — l'état des exécutables livrés (date, taille, empreinte), lu
+    // hors du fil asynchrone : il lit et hache chaque fichier de 64 Mio au
+    // plus (cinq au pire, `executables_livres::EMPREINTE_MAX_OCTETS`).
+    let (executables_livres, demon_lance) =
+        tokio::task::spawn_blocking(super::executables_livres::relever_l_installation)
+            .await
+            .unwrap_or_default();
+
     // Build markdown text
     let ring_starvation = releve_famine_anneau(&state).await;
     let dsp_egaliseur = releve_dsp_egaliseur(&state).await;
@@ -2752,6 +2763,15 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         asio_warm_scan.state, asio_warm_scan.message
     ));
     md.push('\n');
+
+    // #8944 — un démon AirPlay 2 resté à sa première version se voit ici,
+    // sans le déduire de la forme d'un message d'erreur (fil 2878).
+    if !executables_livres.is_empty() {
+        md.push_str(&super::executables_livres::section_markdown(
+            &executables_livres,
+            demon_lance.as_ref(),
+        ));
+    }
 
     md.push_str("## Library\n");
     md.push_str(&format!("- Tracks: {tracks}\n"));
@@ -3257,6 +3277,11 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
         },
         "zone_settings_ignored": zone_settings_ignored,
         "asio_warm_scan": asio_warm_scan,
+        // #8944 — le pendant JSON de la section « Bundled executables ».
+        "bundled_executables": super::executables_livres::json(
+            &executables_livres,
+            demon_lance.as_ref(),
+        ),
         "streaming_services": service_status,
         "network": {
             "discovered_devices": devices.len(),
@@ -3582,6 +3607,13 @@ pub(super) async fn submit_bug_report(
     use axum::RequestExt;
     use axum::response::IntoResponse;
 
+    // Le rapport porte l'identité du compte (jeton, clé de licence) seulement
+    // pour l'administrateur, ou depuis cette machine sans authentification.
+    // Ailleurs, il part sans identité, comme sur un serveur non relié.
+    let (mut parts, corps_brut) = req.into_parts();
+    let au_nom_du_compte = crate::auth::admin_ou_cette_machine(&mut parts, &state).await;
+    let req = axum::extract::Request::from_parts(parts, corps_brut);
+
     // #7468 — le navigateur du client qui envoie : déjà dans la requête.
     let navigateur = req
         .headers()
@@ -3619,7 +3651,8 @@ pub(super) async fn submit_bug_report(
         }
     };
 
-    let (code, corps) = envoyer_le_rapport(state, description, pieces, navigateur).await;
+    let (code, corps) =
+        envoyer_le_rapport(state, description, pieces, navigateur, au_nom_du_compte).await;
     let mut resp = (code, Json(&corps)).into_response();
     // #5068 — le délai du site, aussi sous sa forme standard.
     if let Some(secs) = corps.get("retry_after").and_then(Value::as_u64) {
@@ -3642,6 +3675,7 @@ async fn envoyer_le_rapport(
     description: String,
     pieces: PiecesJointes,
     navigateur: Option<String>,
+    au_nom_du_compte: bool,
 ) -> (axum::http::StatusCode, Value) {
     use axum::http::StatusCode;
 
@@ -3656,9 +3690,13 @@ async fn envoyer_le_rapport(
     // #7920 — TOUS les identifiants, pas seulement le premier : le jeton de
     // compte s'il existe, ET la clé de licence si elle est enregistrée. Un
     // jeton expiré ne fait plus disparaître la licence du rapport.
-    let identites = crate::routes::support::identifiants_mozaiklabs(&SettingsRepo::with_backend(
-        state.backend.clone(),
-    ));
+    let identites = if au_nom_du_compte {
+        crate::routes::support::identifiants_mozaiklabs(&SettingsRepo::with_backend(
+            state.backend.clone(),
+        ))
+    } else {
+        Vec::new()
+    };
     let Json(report) = generate_bug_report(State(state)).await;
     let report_md = report["markdown"].as_str().unwrap_or("").to_string();
     if report_md.trim().is_empty() {
@@ -4282,7 +4320,7 @@ pub(super) async fn api_docs() -> Json<Value> {
         (
             "GET",
             "/library/tracks/{id}/waveform",
-            "Track waveform (200-point amplitude)",
+            "Track waveform (RMS envelope, ?points=100..2000, 200 by default)",
         ),
         (
             "GET",
