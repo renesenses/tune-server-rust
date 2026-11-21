@@ -468,8 +468,8 @@ l'API : `error` (= `code`), `message` (= `detail`) et, sur un 402,
      la chaîne enregistrée n'est pas revérifié (la résolution l'éteint,
      `premium_required`) ; perdre le Premium ne bloque pas l'édition du reste ;
      une correction de pièce d'origine `estimation` (C5, sans micro) est Free.
-     Cette exemption ne vaut que si la chaîne enregistrée n'était pas sous
-     `bypass_all` : le droit est contrôlé sous `bypass_all` comme ailleurs.
+     Le droit étant contrôlé sous `bypass_all` comme ailleurs, l'exemption
+     vaut aussi pour une chaîne enregistrée sous `bypass_all`.
      Un maillon absent du catalogue (paquet tiers installé mais non chargé)
      renvoyé **inchangé** est conservé tel quel au lieu d'un 409
      `unknown_plugin`, sous la même règle de droit (Premium, comme tout

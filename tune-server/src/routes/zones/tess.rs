@@ -25,10 +25,9 @@
 //! Un maillon (ou l'upsampling) identique à la chaîne enregistrée n'est pas
 //! revérifié au droit : il ne lève rien (la résolution l'éteint,
 //! `premium_required`), et perdre le Premium ne bloque pas l'édition du reste
-//! de la chaîne. Seulement si la chaîne enregistrée n'était pas sous
-//! `bypass_all` : `ChaineTess::valider` contrôle le droit sous `bypass_all`
-//! comme ailleurs, donc une chaîne enregistrée hors `bypass_all` a passé ce
-//! contrôle (ou vient des anciennes routes, qui ont le leur).
+//! de la chaîne. `ChaineTess::valider` contrôle le droit sous `bypass_all`
+//! comme ailleurs : toute chaîne enregistrée par un `PUT` a passé ce contrôle
+//! (ou vient des anciennes routes, qui ont le leur), bypass compris.
 //!
 //! Un maillon absent du catalogue (paquet tiers installé mais non chargé)
 //! renvoyé inchangé est conservé tel quel : il est validé comme un greffon
@@ -458,16 +457,17 @@ pub fn valider_le_put(
     if premium {
         return Ok(());
     }
-    // L'exemption « inchangé » suppose que la chaîne enregistrée a passé le
-    // contrôle du droit : jamais si elle était sous `bypass_all`.
-    let exemptable = !enregistree.bypass_all;
+    // Un maillon (ou l'upsampling) inchangé est exempté, `bypass_all` ou
+    // non : `ChaineTess::valider` contrôlant le droit sous `bypass_all`, la
+    // chaîne enregistrée l'a passé (ou vient des anciennes routes, qui ont le
+    // leur). Perdre le Premium ne bloque donc aucun geste sur le reste.
     let mut a_payer = chaine.clone();
     for m in &mut a_payer.plugins {
-        if (exemptable && inchange(m)) || correction_estimee(m) {
+        if inchange(m) || correction_estimee(m) {
             m.enabled = false;
         }
     }
-    if exemptable && a_payer.fixed.upsampling == enregistree.fixed.upsampling {
+    if a_payer.fixed.upsampling == enregistree.fixed.upsampling {
         a_payer.fixed.upsampling = Upsampling::Off {};
     }
     a_payer.valider(catalogue, ContexteValidation { premium })

@@ -626,8 +626,9 @@ async fn le_droit_est_controle_sous_bypass_all_en_deux_put_t08() {
             assert!(b.enregistree().is_none(), "{corps}");
         }
     }
-    // Une chaîne enregistrée sous bypass (par un compte Premium) n'exempte
-    // rien une fois le Premium perdu : décocher le bypass = 402.
+    // Une chaîne enregistrée sous bypass par un compte Premium, Premium
+    // perdu : renvoyée inchangée, bypass décoché, elle passe (le droit a été
+    // contrôlé à l'écriture) ; la résolution éteint le maillon.
     for (partie, greffon) in &cas {
         b.premium(true).await;
         let mut corps = partie.clone();
@@ -638,18 +639,28 @@ async fn le_droit_est_controle_sous_bypass_all_en_deux_put_t08() {
         b.premium(false).await;
         corps["bypass_all"] = json!(false);
         let (s, v) = b.put(corps.clone()).await;
-        assert_eq!(s, StatusCode::PAYMENT_REQUIRED, "{corps} → {v}");
-        refus_conforme(&v, 402, "premium_required");
-        assert_eq!(v["plugin_id"], json!(greffon));
-        assert!(b.chaine().bypass_all, "{corps} : rien n'a été écrit");
-        // Remise à zéro pour le cas suivant (Free : rien de coché).
-        b.premium(true).await;
+        assert_eq!(s, StatusCode::OK, "{corps} → {v}");
+        assert!(!b.chaine().bypass_all, "{corps}");
+        match *greffon {
+            // Sans Premium, la lecture le montre converti en graphique (P2) ;
+            // la chaîne enregistrée le garde.
+            "equalizer-parametric" => assert!(
+                b.chaine().plugins.iter().any(|m| m.id == *greffon && m.enabled),
+                "{corps}"
+            ),
+            "upsampling" => {}
+            _ => {
+                let e = etape(&v, greffon);
+                assert_eq!(e["effective"], json!(false), "{v}");
+                assert_eq!(e["reason"], json!("premium_required"), "{v}");
+            }
+        }
+        // Remise à zéro pour le cas suivant.
         let (s, _) = b
             .put(json!({"version": 1, "bypass_all": false, "plugins": [],
                 "fixed": {"upsampling": {"mode": "off"}}}))
             .await;
         assert_eq!(s, StatusCode::OK);
-        b.premium(false).await;
     }
     // Contre-épreuve : hors bypass, le même maillon inchangé reste exempté
     // (perdre le Premium ne bloque pas l'édition du reste).
@@ -670,6 +681,58 @@ async fn le_droit_est_controle_sous_bypass_all_en_deux_put_t08() {
         .put(json!({"version": 1, "bypass_all": true, "plugins": [conv]}))
         .await;
     assert_eq!(s, StatusCode::OK, "{v}");
+}
+
+/// Ancien compte Premium : chaîne sous bypass avec deux maillons Premium
+/// cochés et l'upsampling, puis Premium perdu. Chaque geste de l'écran
+/// renvoie la chaîne entière : aucun ne prend de 402.
+#[tokio::test]
+async fn premium_perdu_sous_bypass_ne_bloque_aucun_geste_t08() {
+    let b = Banc::nouveau(true).await;
+    let conv = json!({"id": "convolution", "enabled": true, "settings": {"ir_path": "/x.wav"}});
+    let eq = json!({"id": "equalizer-parametric", "enabled": true, "settings": profil(bandes_parametriques())});
+    let up = json!({"mode": "pcm", "filter": "polyvalent"});
+    let (s, v) = b
+        .put(json!({"version": 1, "bypass_all": true, "plugins": [conv.clone(), eq.clone()],
+            "fixed": {"upsampling": up.clone()}}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    b.premium(false).await;
+    // Décocher le bypass, la chaîne entière renvoyée.
+    let (s, v) = b
+        .put(json!({"version": 1, "bypass_all": false, "plugins": [conv.clone(), eq.clone()],
+            "fixed": {"upsampling": up.clone()}}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(!b.chaine().bypass_all);
+    assert_eq!(etape(&v, "convolution")["reason"], json!("premium_required"), "{v}");
+    // L'égaliseur paramétrique est lu converti (P2) ; enregistré tel quel.
+    assert!(
+        b.chaine()
+            .plugins
+            .iter()
+            .any(|m| m.id == "equalizer-parametric" && m.enabled)
+    );
+    // Déplacer, décocher, retirer : 200.
+    for plugins in [
+        json!([eq.clone(), conv.clone()]),
+        json!([eq.clone(), {"id": "convolution", "enabled": false, "settings": {"ir_path": "/x.wav"}}]),
+        json!([eq.clone()]),
+    ] {
+        let (s, v) = b
+            .put(json!({"version": 1, "bypass_all": false, "plugins": plugins,
+                "fixed": {"upsampling": up.clone()}}))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{plugins} → {v}");
+    }
+    // Contre-épreuve : recocher un maillon Premium retiré reste un 402.
+    let (s, v) = b
+        .put(json!({"version": 1, "bypass_all": false, "plugins": [eq, conv],
+            "fixed": {"upsampling": up}}))
+        .await;
+    assert_eq!(s, StatusCode::PAYMENT_REQUIRED, "{v}");
+    refus_conforme(&v, 402, "premium_required");
+    assert_eq!(v["plugin_id"], json!("convolution"));
 }
 
 /// Un paquet tiers installé mais non chargé : absent du catalogue, son
