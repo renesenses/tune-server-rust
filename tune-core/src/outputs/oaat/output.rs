@@ -17,6 +17,10 @@ mod volume_7333_tests;
 #[cfg(all(test, feature = "oaat"))]
 #[path = "reprise_sans_session_8726_tests.rs"]
 mod reprise_sans_session_8726_tests;
+// #9091 — une annonce mDNS expirée ne coupe pas une session vivante.
+#[cfg(all(test, feature = "oaat"))]
+#[path = "session_active_9091_tests.rs"]
+mod session_active_9091_tests;
 
 #[cfg(feature = "oaat")]
 use super::helpers::{
@@ -445,6 +449,23 @@ impl OaatOutput {
 
     pub fn a_la_meme_adresse(&self, host: &str, port: u16) -> bool {
         self.host == host && self.port == port
+    }
+    /// #9091 — l'adresse du port de contrôle de l'endpoint, telle que mDNS
+    /// l'a résolue. La découverte la sonde en TCP quand l'annonce expire.
+    pub fn adresse_de_controle(&self) -> (&str, u16) {
+        (&self.host, self.port)
+    }
+    /// #9091 — une session OAAT est-elle vivante sur cette sortie ?
+    ///
+    /// Vrai pendant la lecture (`playing`) et tant que la tâche de lecture
+    /// lit son canal de commandes, pause comprise : c'est elle qui tient la
+    /// connexion de contrôle et l'horloge vers l'endpoint. Une annonce mDNS
+    /// expirée pendant ce temps ne prouve pas que l'appareil est parti
+    /// (multicast filtré par Docker ou un commutateur) : la découverte garde
+    /// alors la zone au lieu de couper la lecture.
+    #[cfg(feature = "oaat")]
+    pub fn session_active(&self) -> bool {
+        self.playing.load(Ordering::SeqCst) || !self.sans_session_de_lecture()
     }
 
     /// Arm a start position for the next play_media (orchestrator seek path).
