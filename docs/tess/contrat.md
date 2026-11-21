@@ -144,6 +144,10 @@ enceintes) agit en sens contraire du crossfeed (pour casque).
     `params.replaced_by`.
   - Priorités : `crosstalk` (3) > crossfeed tiers `crossfeed-*` (2) >
     `crossfeed` intégré (1). À égalité, le premier dans la chaîne l'emporte.
+- **Politique `refuse`** : décidée le 18/11 pour le groupe crossfeed. L'API
+  (T08, `catalogue_tess`) l'applique : un `PUT` qui coche deux membres est
+  refusé en 409 `mutually_exclusive`. La résolution garde la priorité
+  ci-dessus pour une chaîne ancienne.
 - **Politique `priority`** : reste disponible pour un groupe qui la déclare
   (jamais de refus, la résolution tranche).
 - **Zones existantes (T02)** : la migration ne refuse jamais une zone où
@@ -243,7 +247,7 @@ Enregistrée sous `zone_{id}_tess_chain` (T02), échangée par
 | `invalid_settings` | 409 | réglages non conformes au schéma (niveau hôte) |
 | `must_be_last_plugin` | 409 | greffon `last_plugin` suivi d'un autre (même décoché) |
 | `mutually_exclusive` | 409 | deux membres cochés d'un groupe en politique `refuse` (le défaut) |
-| `premium_required` | **402** | greffon Premium **coché**, ou upsampling demandé, sans Premium, hors `bypass_all` |
+| `premium_required` | **402** | greffon Premium **coché**, ou upsampling demandé, sans Premium, **`bypass_all` compris** (la chaîne garde ses maillons et les anciennes clés les reçoivent) |
 
 Ce qui dépend du flux ou de l'installation n'est **pas** refusé au `PUT`
 (canaux, paquet désinstallé, droit perdu ensuite). La résolution l'éteint
@@ -425,6 +429,57 @@ Hors TESS, avec un motif affiché :
 ```
 
 `refusal` : `{ "status": 400|402|409, "code": "…", "detail": "…", "plugin_id": "…"|null }`.
+Le serveur y ajoute (T08, champs facultatifs) la forme des autres refus de
+l'API : `error` (= `code`), `message` (= `detail`) et, sur un 402,
+`upgrade_url`.
+
+### Routes (T08, `tune-server/src/routes/zones/tess.rs`)
+
+- **Authentification** : celle de toutes les routes de zone (couche
+  `auth_middleware` de `/api/v1`).
+- **`GET /tess/catalog`** → `catalog_response` :
+  `{ contract_version, premium, catalog, plugins: [ { id, entitled, available, reason } ] }`.
+  - `catalog` : la référence, les **schémas de réglages des caisses du SDK**
+    (`sdk/tune-plugin-*/schemas/config.json`, sans `enabled`, porté par le
+    maillon), les paquets natifs tiers chargés (Premium), et le groupe
+    crossfeed en politique **`refuse`** (décision du 18/11).
+  - `reason` : `plugin_unavailable` (pas installé, désactivé ou pas branché,
+    comme `declick-live` aujourd'hui) avant `premium_required`.
+  - 200 = la capacité TESS ; 404 = serveur sans TESS.
+- **`GET /zones/{id}/tess`** : la chaîne lue par `lire_zone` (P2 appliqué sans
+  Premium), résolue avec le transport, la source qui joue, le mode Pure, le
+  volume (logiciel, appareil ou fixe) et la disponibilité de chaque greffon.
+  Zone inconnue : 404 `{"error": "zone_not_found"}`.
+- **`PUT /zones/{id}/tess`**, dans cet ordre :
+  1. corps lu strictement (`depuis_corps`) : 400 `invalid_body` ;
+  2. **fusion** : un champ absent du corps garde sa valeur enregistrée
+     (`fixed` champ par champ ; `plugins`, s'il est présent, remplace la
+     liste). Un client qui ignore un champ plus récent ne l'efface donc pas ;
+  3. P2 inverse (et D1) : sans Premium, le graphique converti renvoyé tel
+     quel redevient le paramétrique, ou la correction de pièce mesurée,
+     enregistré ; un graphique modifié le remplace ;
+  4. **origine D1** : l'`origin` d'un `room-correction` est réécrite par le
+     serveur d'après `room_profile_{id}` (`origines_par_le_serveur`), jamais
+     crue du corps. Les marques de lecture (`replaced_in_group`,
+     `inert_on_network`) sont tenues par `ecrire_chaine` ; elles ne marquent
+     que des maillons décochés et ne lèvent aucun droit ;
+  5. validation : 409 (forme, exclusivité du groupe crossfeed, version),
+     puis 402 sur ce qui **change** : un maillon ou un upsampling identique à
+     la chaîne enregistrée n'est pas revérifié (la résolution l'éteint,
+     `premium_required`) ; perdre le Premium ne bloque pas l'édition du reste ;
+     une correction de pièce d'origine `estimation` (C5, sans micro) est Free.
+     Le droit étant contrôlé sous `bypass_all` comme ailleurs, l'exemption
+     vaut aussi pour une chaîne enregistrée sous `bypass_all`.
+     Un maillon absent du catalogue (paquet tiers installé mais non chargé)
+     renvoyé **inchangé** est conservé tel quel au lieu d'un 409
+     `unknown_plugin`, sous la même règle de droit (Premium, comme tout
+     greffon tiers) ; modifié, il reste refusé en 409 ;
+  6. `ecrire_chaine` (sous `verrou_de_zone`), puis rafraîchissement de la
+     sortie vivante pour chaque ancienne clé réécrite. Un `PUT` à la fois par
+     zone, de la lecture à l'écriture.
+  - Une chaîne enregistrée d'une version plus récente n'est pas réécrite :
+    409 `unsupported_version`.
+- `active_preset` : lu sous `zone_{id}_tess_active_preset` (posé par T17).
 
 ## 8. Engagements des lots suivants
 
@@ -658,7 +713,7 @@ producteur et le rendu transporte des `f64`**, et que la quantification
 - `exclusive_group` dans le manifeste des paquets.
 - Le préfixe `crossfeed-` reste reconnu pour les paquets déjà publiés.
 
-### T08 : API
+### T08 : API (fait, § 7)
 
 - Les routes ; le corps du `PUT` passe par `depuis_corps` puis `valider`.
 - Les schémas de réglages des caisses du SDK dans le catalogue.
