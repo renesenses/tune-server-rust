@@ -28,13 +28,22 @@ impl std::fmt::Display for Tier {
     }
 }
 
+/// #9240 — nombre de zones (ou de récepteurs OAAT) qu'un groupe peut compter
+/// sans Premium. Au-delà, [`Feature::MultiroomSync`].
+pub const ZONES_GROUPEES_GRATUITES: usize = 3;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Feature {
     UnlimitedZones,
+    /// Le multiroom AU-DELÀ de [`ZONES_GROUPEES_GRATUITES`] zones ou
+    /// récepteurs dans un groupe (décision de Bertrand du 20/11/2026, #9240).
+    /// Jusque-là, grouper est gratuit : OAAT compris, et groupes DLNA,
+    /// AirPlay, locaux. Les paires stéréo restent gratuites.
     MultiroomSync,
     /// Equalizer is free; retain the historical wire name `dsp_eq`.
     DspEq,
+    /// Crossfeed simple gratuit ; code historique conservé (#9210).
     Crossfeed,
     CloudRelay,
     OaatProtocol,
@@ -84,7 +93,7 @@ pub enum Feature {
     /// 04/11/2026).
     Subsonic,
     /// « Suréchantillonnage » (#7614) : le greffon de suréchantillonnage de
-    /// la sortie locale. Premium, comme le crossfeed (Bertrand, 07/11/2026).
+    /// la sortie locale. Premium (Bertrand, 07/11/2026).
     Upsampling,
 }
 
@@ -94,9 +103,10 @@ impl Feature {
         &[
             Feature::UnlimitedZones,
             Feature::MultiroomSync,
-            Feature::Crossfeed,
             Feature::CloudRelay,
-            // OAAT is free — open-source protocol, core feature
+            // OAAT is free — open-source protocol, core feature. Son
+            // multiroom aussi, jusqu'à `ZONES_GROUPEES_GRATUITES` récepteurs ;
+            // au-delà, c'est `MultiroomSync` (#9240).
             // Feature::OaatProtocol,
             Feature::CloudBackup,
             Feature::SyncedLyrics,
@@ -128,9 +138,12 @@ impl Feature {
         ]
     }
 
-    /// Features exposed to clients, including the now-free historical EQ key.
+    /// Features exposed to clients, including the free historical EQ and crossfeed keys.
     pub fn all_advertised() -> impl Iterator<Item = Feature> {
-        Self::all_premium().iter().copied().chain([Self::DspEq])
+        Self::all_premium()
+            .iter()
+            .copied()
+            .chain([Self::DspEq, Self::Crossfeed])
     }
 
     /// Human-readable display name.
@@ -167,7 +180,7 @@ impl Feature {
             Feature::DacCalibration => "DAC Calibration",
             Feature::BatchConverter => "Batch Audio Converter",
             Feature::PlaylistsHub => "Playlists Hub",
-            Feature::Declick => "Dé-ploc",
+            Feature::Declick => "Declick",
         }
     }
 
@@ -230,7 +243,7 @@ impl Feature {
         match self {
             // Features licensed by Premium but NOT yet available/functional
             // (product decision — Bertrand). These show a red cross in the UI.
-            // Note: Dé-ploc IS available, so it is deliberately NOT listed here.
+            // Note: Declick IS available, so it is deliberately NOT listed here.
             // AES67 (#7336) : expérimentale dans la rc10, désactivée par défaut,
             // jamais essayée sur un vrai récepteur Dante/Ravenna.
             // Subsonic (#7855) : le socle seul (étape 1 sur 3), sans écran de
@@ -484,7 +497,8 @@ impl LicenseManager {
     /// Check whether a specific feature is enabled. All premium features require
     /// the effective Premium tier (license key or account premium).
     pub async fn check_feature(&self, feature: Feature) -> bool {
-        feature == Feature::DspEq || effective_tier(&*self.state.read().await) == Tier::Premium
+        matches!(feature, Feature::DspEq | Feature::Crossfeed)
+            || effective_tier(&*self.state.read().await) == Tier::Premium
     }
 
     /// Le plafond de zones **en vigueur** : `None` = illimité (Premium),
@@ -1469,7 +1483,7 @@ mod tests {
     }
 
     #[test]
-    fn all_premium_has_twentynine_features() {
+    fn all_premium_has_twentyeight_features() {
         // Ce compte est un garde-fou volontaire : ajouter une fonctionnalité
         // premium doit être un acte conscient, pas un effet de bord. Passé de
         // 24 à 25 avec `AcousticAnalysis` (analyse CLAP), qui n'était gardée par
@@ -1480,8 +1494,9 @@ mod tests {
         // 30/10/2026) ; puis à 29 avec `Subsonic` (#7855, Bertrand,
         // 04/11/2026) ; puis revenu à 28 sans `Concerts` (#7865, Bertrand,
         // 04/11/2026 : le module n'est plus Premium) ; puis à 29 avec
-        // `Upsampling` (#7614, Bertrand, 07/11/2026).
-        assert_eq!(Feature::all_premium().len(), 29);
+        // `Upsampling` (#7614, Bertrand, 07/11/2026), puis à 28 sans
+        // le crossfeed simple (#9210, décision Bertrand du 17/11/2026).
+        assert_eq!(Feature::all_premium().len(), 28);
     }
 
     #[test]
@@ -1854,7 +1869,7 @@ mod tests {
         assert_eq!(mgr.tier().await, Tier::Free);
         assert!(!mgr.is_premium().await);
         assert!(mgr.check_feature(Feature::DspEq).await);
-        assert!(!mgr.check_feature(Feature::Crossfeed).await);
+        assert!(mgr.check_feature(Feature::Crossfeed).await);
         // Free tier is capped at the configured limit (3 here).
         assert_eq!(mgr.limite_zones().await, Some(3));
         // Le plafond mesure lui-même son assiette (#3673) : ce n'est plus
@@ -2501,4 +2516,27 @@ pub(crate) fn licence_premium_pour_test(db: Arc<dyn DbBackend>) -> Arc<LicenseMa
     let licence = Arc::new(LicenseManager::new(db));
     assert!(licence.premium_snapshot(), "licence de test non Premium");
     licence
+}
+
+#[cfg(test)]
+mod declick_nom_9213_tests {
+    use super::*;
+
+    #[test]
+    fn le_nom_affiche_est_declick() {
+        assert_eq!(Feature::Declick.display_name(), "Declick");
+    }
+
+    #[tokio::test]
+    async fn le_code_et_le_droit_premium_restent_inchanges() {
+        assert_eq!(Feature::Declick.code(), "declick");
+        assert!(Feature::all_premium().contains(&Feature::Declick));
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let licence = LicenseManager::new(Arc::new(db));
+        assert!(!licence.check_feature(Feature::Declick).await);
+        licence.set_account_premium(true, None).await;
+        assert!(licence.check_feature(Feature::Declick).await);
+    }
 }

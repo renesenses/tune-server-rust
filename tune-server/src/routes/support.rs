@@ -533,9 +533,9 @@ pub(crate) fn identifiants_mozaiklabs(settings: &SettingsRepo) -> Vec<support::S
     let mut identifiants = Vec::new();
 
     // Chemin 1 : token OAuth premium (login SSO dans Tune).
-    if let Some(token) = settings.get("mozaik_access_token").ok().flatten()
-        && !token.is_empty()
-    {
+    // #8797 : pas après un refus de la session par le site — le jeton ne
+    // vaut plus rien et la clé de licence (ou l'envoi anonyme) prend le relais.
+    if let Some(token) = tune_core::cloud::sso::jeton_de_compte(settings) {
         identifiants.push(support::SupportAuth::Bearer(token));
     }
 
@@ -647,6 +647,40 @@ fn finish(result: support::SupportResult, headers: &HeaderMap) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// #8797 — après un refus de la session par le site, le jeton du compte
+    /// n'est plus présenté ; la clé de licence reste. Contre-épreuve : sans
+    /// refus, le jeton passe en premier.
+    #[test]
+    fn apres_un_refus_de_session_seule_la_cle_est_presentee_8797() {
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        tune_core::db::migrations::run_migrations(&db).unwrap();
+        let s = SettingsRepo::with_backend(std::sync::Arc::new(db));
+        s.set("mozaik_access_token", "jeton").unwrap();
+        s.set("license_key", "TUNE-TEST").unwrap();
+        s.set("hardware_fingerprint", "empreinte").unwrap();
+        let bearer = |ids: &[support::SupportAuth]| {
+            ids.iter()
+                .any(|i| matches!(i, support::SupportAuth::Bearer(_)))
+        };
+        let avant = identifiants_mozaiklabs(&s);
+        assert!(matches!(
+            avant.first(),
+            Some(support::SupportAuth::Bearer(_))
+        ));
+        assert_eq!(avant.len(), 2);
+        s.set(
+            tune_core::cloud::sso::CLE_RECONNEXION_REQUISE,
+            "2026-11-20T10:00:00+00:00",
+        )
+        .unwrap();
+        let apres = identifiants_mozaiklabs(&s);
+        assert!(!bearer(&apres), "le jeton refusé ne doit plus partir");
+        assert!(matches!(
+            apres.as_slice(),
+            [support::SupportAuth::License { .. }]
+        ));
+    }
 
     #[test]
     fn ext_of_extracts_lowercased_extension() {

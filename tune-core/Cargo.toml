@@ -611,6 +611,13 @@ windows = { version = "0.62", features = [
     "Win32_System_Ole",
     "Win32_System_Variant",
     "Win32_System_Rpc",
+    # #9061 — tune-server ouvre l'interface par le shell Windows
+    # (`AssocQueryStringW`, `ShellExecuteExW`) et lit le choix de navigateur
+    # dans le registre, par le `windows` réexporté ici : aucune dépendance de
+    # plus dans l'arbre.
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 # #2219 — témoin de `resolve_streaming_url` par sa porte publique, avant que
@@ -889,3 +896,9 @@ path = "tests/pochettes_compilations_6077.rs"
 [[test]]
 name = "journal_apres_scan_pg_8239"
 path = "tests/journal_apres_scan_pg_8239.rs"
+
+# #8904 : yt-dlp n'hérite pas des variables du client OAuth de Tune. Binaire
+# à part : l'essai pose ces variables dans l'environnement du processus.
+[[test]]
+name = "ytdlp_sans_oauth_8904"
+path = "tests/ytdlp_sans_oauth_8904.rs"

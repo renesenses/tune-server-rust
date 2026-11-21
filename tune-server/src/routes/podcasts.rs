@@ -481,7 +481,7 @@ async fn subscribe(
         let entete = match podcast_par_adresse::lire_le_flux(&state.http_client, &feed_url).await {
             Ok(entete) => entete,
             Err(e) => {
-                warn!(feed_url = %feed_url, code = e.code(), error = ?e, "podcast_ajout_par_adresse_refuse");
+                warn!(feed_url = %tune_core::confidentialite::masquer_url(&feed_url), code = e.code(), error = ?e, "podcast_ajout_par_adresse_refuse");
                 return echec_d_ajout_par_adresse(&lang, &e).into_response();
             }
         };
@@ -532,7 +532,7 @@ async fn subscribe(
                 .and_then(|r| r.first().and_then(|v| v.as_i64()));
             info!(
                 title = %title,
-                feed_url = %feed_url,
+                feed_url = %tune_core::confidentialite::masquer_url(&feed_url),
                 creation,
                 id,
                 "podcast_subscribed"
@@ -808,7 +808,7 @@ async fn episodes_by_feed_url(
             ))
         }
         Err(e) => {
-            warn!(feed_url = %feed_url, error = %e, "podcast_episodes_fetch_failed");
+            warn!(feed_url = %tune_core::confidentialite::masquer_url(&feed_url), error = %e, "podcast_episodes_fetch_failed");
             Err(AppError::internal(e))
         }
     }
@@ -1170,12 +1170,13 @@ pub(super) async fn play_episode(
                 .await;
             let s = state.playback.get_state(zone_id).await;
             if let Some(np) = s.now_playing.as_ref() {
-                if let Err(e) = tune_core::db::listening_resume::podcast_started_in_context(
+                if let Err(e) = tune_core::db::listening_resume::podcast_started_du_profil(
                     &state.backend,
                     zone_id,
                     np,
                     s.position_ms,
                     body.podcast_id.as_deref(),
+                    s.session_profile_id,
                 ) {
                     warn!(zone_id, error = %e, "reprise_podcast_non_enregistree");
                 }
@@ -1227,11 +1228,11 @@ pub(crate) async fn mettre_vignette_en_cache(state: &AppState, url: &str) -> Opt
     .await
     {
         Ok(adresse) => {
-            info!(url, adresse = %adresse, "podcast_vignette_en_cache");
+            info!(url = %tune_core::confidentialite::masquer_url(&url), adresse = %adresse, "podcast_vignette_en_cache");
             Some(adresse)
         }
         Err(e) => {
-            warn!(url, erreur = %e, "podcast_vignette_non_mise_en_cache");
+            warn!(url = %tune_core::confidentialite::masquer_url(&url), erreur = %e, "podcast_vignette_non_mise_en_cache");
             None
         }
     }
@@ -1315,8 +1316,12 @@ fn suivre_image_du_flux(state: &AppState, feed_url: &str, image: &str) {
             "UPDATE podcast_subscriptions SET image_url = ? WHERE feed_url = ?",
             &[&neuve as &dyn ToSqlValue, &feed as &dyn ToSqlValue],
         ) {
-            Ok(_) => info!(feed_url, ancienne = ?stockee, image, "podcast_image_du_flux_changee"),
-            Err(e) => warn!(feed_url, erreur = %e, "podcast_image_du_flux_non_enregistree"),
+            Ok(_) => {
+                info!(feed_url = %tune_core::confidentialite::masquer_url(&feed_url), ancienne = ?stockee, image, "podcast_image_du_flux_changee")
+            }
+            Err(e) => {
+                warn!(feed_url = %tune_core::confidentialite::masquer_url(&feed_url), erreur = %e, "podcast_image_du_flux_non_enregistree")
+            }
         }
     }
     let cache = crate::routes::library::artwork_cache_dir();
@@ -1468,7 +1473,7 @@ async fn rf_episodes(
         )
         .into_response()),
         Err(e) => {
-            warn!(show = %q.show_url, error = %e, "rf_episodes_failed");
+            warn!(show = %tune_core::confidentialite::masquer_url(&q.show_url), error = %e, "rf_episodes_failed");
             Err(AppError::internal(e))
         }
     }
@@ -1562,7 +1567,7 @@ async fn type_de_l_hebergeur(client: &reqwest::Client, url: &str) -> Option<Stri
     match tokio::time::timeout(DELAI_TYPE_DE_L_HEBERGEUR, demander_le_type(client, url)).await {
         Ok(t) => t,
         Err(_) => {
-            warn!(url, "podcast_type_hebergeur_delai_depasse");
+            warn!(url = %tune_core::confidentialite::masquer_url(&url), "podcast_type_hebergeur_delai_depasse");
             None
         }
     }

@@ -219,3 +219,33 @@ async fn un_vrai_refus_d_identifiants_au_relais_reste_un_refus_d_identifiants() 
         .expect_err("le relais refuse les identifiants");
     assert!(matches!(err, TuneError::Credentials(_)), "{err:?}");
 }
+
+#[tokio::test]
+async fn un_401_propre_au_relais_apres_akamai_garde_son_origine_8867() {
+    let direct = direct_bloque_par_akamai(Default::default()).await;
+    let app = axum::Router::new().fallback(|| async {
+        (
+            axum::http::StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"status": "error", "code": 401,
+                "message": "Unauthorized"})),
+        )
+            .into_response()
+    });
+    let relais = ecouter(app).await;
+    let mut svc = service(&direct, &relais);
+
+    let err = svc
+        .authenticate(&identifiants())
+        .await
+        .expect_err("le relais refuse les identifiants");
+    assert!(
+        matches!(
+            err,
+            TuneError::Refused {
+                code: "qobuz_relay_login_refused",
+                ..
+            }
+        ),
+        "{err:?}"
+    );
+}

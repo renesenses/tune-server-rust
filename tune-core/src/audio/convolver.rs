@@ -14,15 +14,29 @@ use realfft::{ComplexToReal, RealFftPlanner, RealToComplex};
 use std::collections::VecDeque;
 use std::sync::Arc;
 
+/// #8761 — jeu de RI par cadence et rééchantillonnage en repli.
+pub mod par_cadence;
+pub use par_cadence::{ChoixRi, JeuDeZone};
+
 /// Réponse impulsionnelle en domaine temporel, indépendante d'un flux.
 ///
 /// La configuration conserve volontairement les taps et leur cadence source :
 /// une instance [`Convolver`] est un état de traitement lié à un nombre de
 /// canaux et doit être reconstruite quand le format du flux change (#2210).
+///
+/// #8761 — elle porte un JEU de réponses, une par cadence (la principale en
+/// tête), et le droit de rééchantillonner en repli (voir [`par_cadence`]).
 #[derive(Clone)]
 pub struct ConvolverConfig {
     impulse_response: Arc<[Vec<f32>]>,
     sample_rate: u32,
+    /// Toutes les réponses du jeu, une par cadence, la principale en tête.
+    variantes: Arc<[par_cadence::Variante]>,
+    /// Rééchantillonner le fichier le plus proche quand aucune cadence ne
+    /// correspond (défaut). Faux : le refus d'avant #8761.
+    reechantillonner: bool,
+    /// Le chemin du fichier principal : clé de l'état effectif publié.
+    cle_jeu: Option<String>,
 }
 
 impl ConvolverConfig {
@@ -33,30 +47,158 @@ impl ConvolverConfig {
         if impulse_response.is_empty() || impulse_response.iter().any(Vec::is_empty) {
             return Err("la réponse impulsionnelle doit contenir des taps sur chaque canal".into());
         }
+        par_cadence::ri_admise(&impulse_response, sample_rate)?;
+        let taps: Arc<[Vec<f32>]> = impulse_response.into();
         Ok(Self {
-            impulse_response: impulse_response.into(),
+            variantes: vec![par_cadence::Variante::en_memoire(taps.clone(), sample_rate)].into(),
+            impulse_response: taps,
             sample_rate,
+            reechantillonner: true,
+            cle_jeu: None,
         })
     }
 
     pub fn from_wav(path: &str) -> Result<Self, String> {
-        let (impulse_response, sample_rate) = Convolver::read_wav_ir(path)?;
-        Self::new(impulse_response, sample_rate)
+        Self::depuis_jeu(&[path.to_string()], true)
+    }
+
+    /// #8761 — charger un jeu : `chemins[0]` est le fichier principal (son
+    /// échec est une erreur), les suivants sont les fichiers par cadence (un
+    /// fichier illisible y est écarté avec un avertissement, sans priver la
+    /// zone des autres). À cadence égale, le DERNIER fichier de la liste
+    /// l'emporte : un fichier déposé « pour 48 kHz » remplace le principal
+    /// s'il est lui aussi à 48 kHz.
+    pub fn depuis_jeu(chemins: &[String], reechantillonner: bool) -> Result<Self, String> {
+        let (principal, autres) = chemins
+            .split_first()
+            .ok_or("aucun fichier de réponse impulsionnelle")?;
+        let tete = par_cadence::Variante::depuis_fichier(principal)?;
+        let mut variantes = vec![tete.clone()];
+        for chemin in autres {
+            match par_cadence::Variante::depuis_fichier(chemin) {
+                Ok(v) => {
+                    variantes.retain(|x| x.sample_rate != v.sample_rate);
+                    variantes.push(v);
+                }
+                Err(e) => tracing::warn!(chemin, error = %e, "convolver_ir_du_jeu_ecartee"),
+            }
+        }
+        Ok(Self {
+            impulse_response: tete.taps.clone(),
+            sample_rate: tete.sample_rate,
+            variantes: variantes.into(),
+            reechantillonner,
+            cle_jeu: Some(principal.clone()),
+        })
+    }
+
+    /// Ajouter une RI en mémoire au jeu (tests, outils) ; même règle de
+    /// remplacement à cadence égale que [`Self::depuis_jeu`].
+    pub fn avec_variante(mut self, taps: Vec<Vec<f32>>, sample_rate: u32) -> Result<Self, String> {
+        let autre = Self::new(taps, sample_rate)?;
+        let mut v: Vec<_> = self
+            .variantes
+            .iter()
+            .filter(|x| x.sample_rate != sample_rate)
+            .cloned()
+            .collect();
+        v.extend(autre.variantes.iter().cloned());
+        self.variantes = v.into();
+        Ok(self)
+    }
+
+    pub fn avec_reechantillonnage(mut self, autorise: bool) -> Self {
+        self.reechantillonner = autorise;
+        self
+    }
+
+    pub fn reechantillonnage_autorise(&self) -> bool {
+        self.reechantillonner
     }
 
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
     }
 
+    /// Les cadences du jeu, dans l'ordre du jeu (principale en tête).
+    pub fn cadences(&self) -> Vec<u32> {
+        self.variantes.iter().map(|v| v.sample_rate).collect()
+    }
+
     pub fn source_channels(&self) -> usize {
         self.impulse_response.len()
     }
 
+    /// Quel fichier servirait un flux à `cible` Hz, SANS rien calculer.
+    /// `Err` : aucun fichier à cette cadence et rééchantillonnage refusé.
+    pub fn choix_pour(&self, cible: u32) -> Result<ChoixRi, String> {
+        let (i, raison) = par_cadence::planifier(&self.variantes, cible)
+            .ok_or("aucun fichier de réponse impulsionnelle")?;
+        let v = &self.variantes[i];
+        if v.sample_rate != cible && !self.reechantillonner {
+            let cadences = self
+                .cadences()
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "Réponse impulsionnelle à {cadences} Hz incompatible avec le flux à {cible} Hz ; réexportez le filtre à {cible} Hz (ou autorisez le rééchantillonnage)"
+            ));
+        }
+        Ok(ChoixRi {
+            cadence_flux: cible,
+            cadence_fichier: v.sample_rate,
+            chemin: v.chemin.clone(),
+            reechantillonne: v.sample_rate != cible,
+            raison,
+        })
+    }
+
+    /// Le nombre de canaux de la RI qui servirait un flux à `cible` Hz.
+    pub fn canaux_pour(&self, cible: u32) -> Option<usize> {
+        par_cadence::planifier(&self.variantes, cible).map(|(i, _)| self.variantes[i].taps.len())
+    }
+
+    /// Le nombre de prises du FICHIER qui servirait un flux à `cible` Hz
+    /// (avant tout rééchantillonnage).
+    pub fn prises_pour(&self, cible: u32) -> Option<usize> {
+        par_cadence::planifier(&self.variantes, cible)
+            .and_then(|(i, _)| self.variantes[i].taps.first().map(Vec::len))
+    }
+
+    /// Les taps qui serviraient un flux à `cible` Hz (rééchantillonnés et mis
+    /// en cache au besoin), avec le choix.
+    pub fn ri_pour(&self, cible: u32) -> Result<(ChoixRi, Arc<[Vec<f32>]>), String> {
+        let choix = self.choix_pour(cible)?;
+        let (i, _) = par_cadence::planifier(&self.variantes, cible)
+            .ok_or("aucun fichier de réponse impulsionnelle")?;
+        let taps = par_cadence::ri_a_la_cadence(&self.variantes[i], cible)?;
+        Ok((choix, taps))
+    }
+
+    /// Préparer le cache pour ces cadences (en tâche de fond chez l'appelant),
+    /// pour qu'un changement de cadence en lecture ne paie pas le calcul.
+    pub fn prechauffer(&self, cadences: &[u32]) {
+        if !self.reechantillonner {
+            return;
+        }
+        for &c in cadences {
+            if let Some((i, _)) = par_cadence::planifier(&self.variantes, c) {
+                if let Err(e) = par_cadence::ri_a_la_cadence(&self.variantes[i], c) {
+                    tracing::warn!(cadence = c, error = %e, "convolver_ir_prechauffe_ecartee");
+                }
+            }
+        }
+    }
+
     /// Bâtir le moteur pour le format réellement négocié.
     ///
-    /// Aucun rééchantillonnage silencieux : l'utilisateur reçoit la cadence à
-    /// laquelle réexporter son filtre. Une IR mono est explicitement dupliquée
-    /// sur tous les canaux ; tout autre écart de layout est refusé.
+    /// #8761 — le fichier du jeu à la cadence du flux ; à défaut, le plus
+    /// proche rééchantillonné (une fois, mis en cache), sauf si le réglage le
+    /// refuse : l'utilisateur reçoit alors la cadence à laquelle réexporter
+    /// son filtre. Une IR mono est explicitement dupliquée sur tous les
+    /// canaux ; tout autre écart de layout est refusé.
     pub fn build_for(
         &self,
         block_size: usize,
@@ -66,22 +208,18 @@ impl ConvolverConfig {
         if target_channels == 0 {
             return Err("le flux ne contient aucun canal audio".into());
         }
-        if self.sample_rate != target_sample_rate {
-            return Err(format!(
-                "Réponse impulsionnelle à {} Hz incompatible avec le flux à {target_sample_rate} Hz ; réexportez le filtre à {target_sample_rate} Hz",
-                self.sample_rate
-            ));
-        }
-        let adapted = if self.impulse_response.len() == target_channels {
-            self.impulse_response.to_vec()
-        } else if self.impulse_response.len() == 1 {
-            vec![self.impulse_response[0].clone(); target_channels]
+        let (choix, taps) = self.ri_pour(target_sample_rate)?;
+        let adapted = if taps.len() == target_channels {
+            taps.to_vec()
+        } else if taps.len() == 1 {
+            vec![taps[0].clone(); target_channels]
         } else {
             return Err(format!(
                 "Réponse impulsionnelle à {} canaux incompatible avec le flux à {target_channels} canaux ; fournissez une IR mono ou une IR à {target_channels} canaux",
-                self.impulse_response.len()
+                taps.len()
             ));
         };
+        par_cadence::noter_le_choix(self.cle_jeu.as_deref(), &choix);
         Ok(Convolver::new(&adapted, block_size))
     }
 }
@@ -414,8 +552,8 @@ impl Convolver {
         Ok(sr_g)
     }
 
-    /// Load an IR for a specific stream rate + channel count. Requires the IR's
-    /// sample rate to match (resampling is a follow-up); a mono IR is duplicated
+    /// Load an IR for a specific stream rate + channel count. #8761 : an IR at
+    /// another rate is resampled (cached); a mono IR is duplicated
     /// to the stream's channel count. Used by the transcode path so the FIR can
     /// apply to network renderers, not just the local output.
     pub fn from_wav_for(
@@ -1103,10 +1241,15 @@ mod tests {
             } else {
                 48_000
             };
+            // #8761 — par défaut, l'autre cadence est servie par le filtre
+            // rééchantillonné ; le refus d'avant reste celui du réglage.
+            assert_eq!(config.build_for(4, other_rate, 2).unwrap().channels(), 2);
             let error = config
+                .clone()
+                .avec_reechantillonnage(false)
                 .build_for(4, other_rate, 2)
                 .err()
-                .expect("une cadence différente doit être refusée");
+                .expect("une cadence différente doit être refusée sans rééchantillonnage");
             assert!(error.contains(&sample_rate.to_string()), "{error}");
             assert!(error.contains(&other_rate.to_string()), "{error}");
             assert!(error.contains("réexportez"), "{error}");

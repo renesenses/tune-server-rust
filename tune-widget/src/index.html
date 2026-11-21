@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Tune Widget</title>
+  <title>Tune Client</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -73,7 +73,17 @@
 
     <div id="settings-panel" style="display:none">
       <h3>Réglages</h3>
-      <label for="server-url">Serveur Tune</label>
+      <!-- Les Tune Server du réseau local (mDNS `_tune-server._tcp`, #9255).
+           Ouvert tout seul au lancement quand aucun serveur ne répond et
+           qu'il n'y en a pas UN seul à adopter. -->
+      <div id="serveurs-reseau">
+        <div class="titre-serveurs">
+          <label>Serveurs Tune du réseau</label>
+          <button id="btn-rechercher-serveurs" title="Chercher à nouveau">Rechercher</button>
+        </div>
+        <div id="liste-serveurs" role="listbox" aria-label="Serveurs Tune du réseau"></div>
+      </div>
+      <label for="server-url">Ou une adresse</label>
       <div id="server-config">
         <input type="text" id="server-url" placeholder="localhost:8888" autocomplete="off">
         <button id="btn-connect">OK</button>

@@ -757,7 +757,7 @@ impl SpotifyService {
         let redirect_uri = effective_redirect_uri(redirect_uri, api_port);
         if let Some(refus) = refus_redirection(&redirect_uri) {
             warn!(
-                redirect_uri = %redirect_uri,
+                redirect_uri = %crate::confidentialite::masquer_url(&redirect_uri),
                 refus = refus.code(),
                 "spotify_redirect_uri_refusee: Spotify n'accepte en http:// que \
                  http://127.0.0.1:<port> ou http://[::1]:<port> ; sinon HTTPS"
@@ -1097,7 +1097,10 @@ impl SpotifyService {
     /// #8050 — tous les artistes suivis. `/me/following` pagine par curseur
     /// (`artists.cursors.after`), pas par décalage ; mêmes gardes que
     /// [`Self::lire_toutes_les_pages`].
-    async fn lire_tous_les_artistes_suivis(&self) -> Result<Vec<serde_json::Value>, String> {
+    ///
+    /// #9082 — l'erreur garde son statut HTTP ([`ErreurApi`]) : un `403`
+    /// « Insufficient client scope » se distingue ainsi d'une panne.
+    async fn lire_tous_les_artistes_suivis(&self) -> Result<Vec<serde_json::Value>, ErreurApi> {
         let mut items: Vec<serde_json::Value> = Vec::new();
         let mut vus: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut apres: Option<String> = None;
@@ -1116,8 +1119,7 @@ impl SpotifyService {
                     ),
                     &mut budget,
                 )
-                .await
-                .map_err(|e| e.message)?;
+                .await?;
             let page = &data["artists"];
             let lot = page["items"].as_array().cloned().unwrap_or_default();
             let recus = lot.len();
@@ -1494,6 +1496,8 @@ impl SpotifyService {
             track_count: item["total_tracks"].as_u64().unwrap_or(0) as u32,
             released_at: None,
             quality: None,
+            genre_id: None,
+            genre_name: None,
         }
     }
 
@@ -2513,6 +2517,8 @@ impl StreamingService for SpotifyService {
         genre_id: &str,
         limit: usize,
     ) -> Result<Vec<StreamAlbum>, TuneError> {
+        // L'API Web de Spotify répond 400 « Invalid limit » au-delà de 50.
+        let limit = limit.min(50);
         let Some(data) = self
             .lire_ou_retire(
                 &format!("/browse/categories/{genre_id}/playlists?limit={limit}"),
@@ -2551,6 +2557,8 @@ impl StreamingService for SpotifyService {
                             track_count: 0,
                             released_at: None,
                             quality: None,
+                            genre_id: None,
+                            genre_name: None,
                         });
                         if albums.len() >= limit {
                             break;
@@ -2598,9 +2606,20 @@ impl StreamingService for SpotifyService {
             .collect())
     }
     async fn get_user_artists(&self) -> Result<Vec<StreamArtist>, TuneError> {
+        // #9082 — une liaison antérieure à #8579 ne porte pas
+        // `user-follow-read` : `/me/following` rendrait 403 à chaque
+        // ouverture de Streaming. Refus au code stable AVANT l'appel.
+        if self.porte(PORTEE_ARTISTES_SUIVIS) == Some(false) {
+            return Err(refus_reconnexion_artistes_suivis());
+        }
         // #8050 — tous les curseurs, pas seulement les 50 premiers.
-        let items = self.lire_tous_les_artistes_suivis().await?;
-        Ok(items.iter().map(Self::map_artist).collect())
+        match self.lire_tous_les_artistes_suivis().await {
+            Ok(items) => Ok(items.iter().map(Self::map_artist).collect()),
+            Err(e) if refus_de_portee_artistes_suivis(&e, self.porte(PORTEE_ARTISTES_SUIVIS)) => {
+                Err(refus_reconnexion_artistes_suivis())
+            }
+            Err(e) => Err(e.message.into()),
+        }
     }
 
     async fn refresh_if_needed(&mut self) -> Result<bool, TuneError> {
@@ -2776,6 +2795,35 @@ pub fn motif_appareil_absent(nom: &str) -> String {
 /// #8579 — code stable du refus « reconnecter Spotify pour gérer les
 /// favoris » : la liaison du compte ne porte pas la portée d'écriture.
 pub const CODE_RECONNEXION_FAVORIS: &str = "spotify_reconnexion_favoris";
+
+/// #9082 — code stable du refus « reconnecter Spotify pour afficher les
+/// artistes suivis » : la liaison du compte ne porte pas
+/// [`PORTEE_ARTISTES_SUIVIS`]. La route des favoris en fait une liste vide
+/// qualifiée (200), et non un 502 : ce n'est pas une panne.
+pub const CODE_RECONNEXION_ARTISTES_SUIVIS: &str = "spotify_reconnexion_artistes_suivis";
+
+/// #9082 — la portée qu'exige la lecture des artistes suivis
+/// (`/me/following`).
+pub const PORTEE_ARTISTES_SUIVIS: &str = "user-follow-read";
+
+fn refus_reconnexion_artistes_suivis() -> TuneError {
+    refus(
+        CODE_RECONNEXION_ARTISTES_SUIVIS,
+        format!(
+            "spotify: la liaison du compte ne porte pas la portee {PORTEE_ARTISTES_SUIVIS} ; \
+             reconnecter Spotify une fois pour afficher les artistes suivis"
+        ),
+    )
+}
+
+/// #9082 — un refus de `/me/following` vaut-il « portée manquante » ? Un
+/// `403` dont Spotify dit qu'il tient à la portée (« Insufficient client
+/// scope »), ou tout `403` quand on ignore les portées de la liaison
+/// (`porte = None`). Avec la portée accordée, un autre `403` reste l'erreur
+/// de Spotify.
+fn refus_de_portee_artistes_suivis(e: &ErreurApi, porte: Option<bool>) -> bool {
+    e.statut == Some(403) && (porte.is_none() || e.message.to_lowercase().contains("scope"))
+}
 
 /// La portée qu'exige l'écriture d'un favori de ce type.
 fn portee_du_favori(fav_type: &str) -> &'static str {
@@ -4392,6 +4440,9 @@ mod titres_phares_8485_tests;
 #[path = "spotify_albums_artiste_8479_tests.rs"]
 mod albums_artiste_8479_tests;
 
+#[cfg(test)]
+#[path = "spotify_artistes_suivis_portee_9082_tests.rs"]
+mod artistes_suivis_portee_9082_tests;
 #[cfg(test)]
 #[path = "spotify_favoris_bibliotheque_2026_tests.rs"]
 mod favoris_bibliotheque_2026_tests;

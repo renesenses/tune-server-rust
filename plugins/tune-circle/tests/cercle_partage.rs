@@ -114,15 +114,20 @@ async fn le_membre_se_montre_puis_se_retire() {
 }
 
 #[tokio::test]
-async fn le_409_circle_not_shared_et_le_404_hors_membre_sont_relayes() {
+async fn le_409_du_put_le_200_idempotent_du_delete_et_le_404_hors_membre_sont_relayes() {
     let faux = demarrer().await;
     range_chez_alice(&faux);
     let app = app(base(&faux.base, Some(JETON)));
+    // 409 pour se montrer dans un cercle non partagé…
+    let r = appel(&app, "PUT", "/member-of/6/show-me", None).await;
+    assert_eq!(r.statut, StatusCode::CONFLICT);
+    assert_eq!(r.json(), json!({ "error": "circle_not_shared" }));
+    // … mais se retirer est idempotent : 200, relayé tel quel.
+    let r = appel(&app, "DELETE", "/member-of/6/show-me", None).await;
+    assert_eq!(r.statut, StatusCode::OK);
+    assert_eq!(r.json()["show_me"], json!(false));
+    assert_eq!(r.json()["circle_id"], json!(6));
     for m in ["PUT", "DELETE"] {
-        let r = appel(&app, m, "/member-of/6/show-me", None).await;
-        assert_eq!(r.statut, StatusCode::CONFLICT, "{m}");
-        assert_eq!(r.json(), json!({ "error": "circle_not_shared" }), "{m}");
-
         let r = appel(&app, m, "/member-of/99/show-me", None).await;
         assert_eq!(r.statut, StatusCode::NOT_FOUND, "{m}");
         assert_eq!(r.json(), json!({ "error": "not_found" }), "{m}");

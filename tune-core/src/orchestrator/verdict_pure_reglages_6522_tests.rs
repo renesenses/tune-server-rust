@@ -391,9 +391,8 @@ async fn pure_sur_un_egaliseur_coupe_qui_garde_son_preampli_le_contourne_4176() 
     assert_eq!(verdict(&orch).await, SANS_OBJET);
 }
 
-/// Volume monté pendant l'égaliseur : le gain gardé reste borné après
-/// coupure et remise à plat. Seul « Rendre le niveau » libère cette borne,
-/// par la rampe existante, sans marche (#6524, décision du 14/11).
+/// Le nouveau geste « Rendre le niveau » libère le gain retenu sans
+/// exiger une remise à plat préalable, avec la rampe existante.
 #[tokio::test]
 async fn rendre_le_niveau_explicitement_libere_le_preampli_en_rampe_6524() {
     let orch = orchestrateur();
@@ -415,8 +414,6 @@ async fn rendre_le_niveau_explicitement_libere_le_preampli_en_rampe_6524() {
     );
     assert_eq!(verdict(&orch).await, OutputDspState::Applied);
 
-    enregistrer_l_egaliseur_coupe(&orch, zone_id, 0.0);
-    orch.refresh_zone_eq(zone_id).await;
     assert!(orch.rendre_le_niveau_garde(zone_id).await);
     let juste_apres = avec_sortie_locale(&orch, |local| local.preampli_garde()).await;
     assert!(
@@ -476,10 +473,10 @@ fn une_mesure_de_piece_contourne_les_traitements_puis_les_rend_8513() {
     );
 }
 
-/// Décision du 14/11 : remettre les bandes à plat ne vaut pas un accord
-/// pour dépasser le niveau d'avant l'égaliseur. Le bouton distinct le fera.
+/// #8917 — les clients existants peuvent encore rendre le niveau par
+/// leur action explicite « Remettre à plat », sans la nouvelle route.
 #[tokio::test]
-async fn remettre_a_plat_ne_libere_pas_le_preampli_sans_geste_explicite_6524() {
+async fn remettre_a_plat_rend_le_niveau_aux_anciens_clients_8917() {
     let orch = orchestrateur();
     let zone_id = zone_locale(&orch).await;
     armer_l_egaliseur(&orch, zone_id);
@@ -499,8 +496,23 @@ async fn remettre_a_plat_ne_libere_pas_le_preampli_sans_geste_explicite_6524() {
     avec_sortie_locale(&orch, |local| local.jouer_du_pcm_pour_test(10.0)).await;
     let apres = preampli_garde_db(&orch).await;
     assert!(
-        apres.is_some_and(|db| (db - avant).abs() < 0.01),
-        "#6524 : Remettre à plat rend le niveau sans accord explicite : avant={avant}, après={apres:?}"
+        apres.is_none(),
+        "#8917 : Remettre à plat laisse le niveau retenu : avant={avant}, après={apres:?}"
     );
-    assert_eq!(verdict(&orch).await, OutputDspState::Applied);
+    assert_eq!(verdict(&orch).await, OutputDspState::Inactive);
+}
+
+#[tokio::test]
+async fn lire_le_preampli_ne_bloque_pas_sur_une_sortie_occupee_8917() {
+    let orch = orchestrateur();
+    let zone_id = zone_locale(&orch).await;
+    let sortie = orch.outputs.lock().await.get("local:DAC").unwrap();
+    let _occupee = sortie.lock().await;
+    let lu = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        orch.preampli_garde_de_zone(zone_id),
+    )
+    .await
+    .expect("#8917 : GET attend indéfiniment la sortie occupée");
+    assert!(lu.is_none());
 }

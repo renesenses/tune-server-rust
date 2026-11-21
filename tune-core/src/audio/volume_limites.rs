@@ -123,12 +123,23 @@ impl ModeSansLimite {
 
 /// Le mode qui suspend les limites de `zone_id`, s'il y en a un. Le volume
 /// fixe passe avant PURE (il court-circuite déjà tout `set_volume`).
+///
+/// #8920 — jamais sur une zone Devialet AIR : le volume y est TOUJOURS une
+/// commande à l'ampli, PURE ou non (sans DSP, la zone est de fait en PURE),
+/// et les limites de confort et de sécurité sont précisément ce qui le
+/// borne. Une telle zone n'est jamais à volume fixe (`row_to_zone`).
 pub fn mode_sans_limite(db: &Arc<dyn DbBackend>, zone_id: i64) -> Option<ModeSansLimite> {
-    let fixe = crate::db::zone_repo::ZoneRepo::with_backend(db.clone())
+    let zone = crate::db::zone_repo::ZoneRepo::with_backend(db.clone())
         .get(zone_id)
         .ok()
-        .flatten()
-        .is_some_and(|z| z.fixed_volume);
+        .flatten();
+    if zone
+        .as_ref()
+        .is_some_and(|z| crate::outputs::devialet_air::reglages::est_air(z.output_type.as_deref()))
+    {
+        return None;
+    }
+    let fixe = zone.is_some_and(|z| z.fixed_volume);
     if fixe {
         Some(ModeSansLimite::VolumeFixe)
     } else if crate::audio::audiophile::zone_enabled(db, zone_id) {

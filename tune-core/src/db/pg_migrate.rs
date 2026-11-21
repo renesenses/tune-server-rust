@@ -325,6 +325,10 @@ const TABLES_NON_COPIEES: &[(&str, &str)] = &[
         "compteur de révision de la bibliothèque (#7619) : une seule ligne, recréée par sa propre installation côté PostgreSQL ; une révision neuve invalide les caches clients, ce qui est voulu après une bascule",
     ),
     (
+        "library_paths_revision",
+        "compteur de révision de l'arbre des dossiers (#9116) : une seule ligne, recréée par sa propre installation côté PostgreSQL ; une révision neuve invalide les caches clients, ce qui est voulu après une bascule",
+    ),
+    (
         "albums_fts",
         "index plein texte FTS5 de SQLite, sans equivalent a copier en PostgreSQL",
     ),
@@ -338,6 +342,11 @@ const TABLES_NON_COPIEES: &[(&str, &str)] = &[
         "upnp_catalog_revision",
         "compteur de revision du catalogue UPnP, remis a zero par le script PG 066 ; \
          les clients UPnP relisent le catalogue",
+    ),
+    (
+        "artistes_des_credits",
+        "artistes des crédits composés (#9265) : dérivée des seuls noms d'artistes, \
+         recalculée au démarrage suivant",
     ),
     (
         "enrich_tentatives",
@@ -929,6 +938,10 @@ ALTER TABLE listen_history ADD COLUMN IF NOT EXISTS album_ref TEXT;
 -- L'artiste d'une piste de service chez son service (#6079, PG 087 / SQLite
 -- 122). En ALTER pour la même raison que juste au-dessus.
 ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS artist_ref TEXT;
+ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS media_format TEXT;
+ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS sample_rate INTEGER;
+ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS bit_depth INTEGER;
+
 -- Le conteneur de chaque élément de file (#6466, PG 092 / SQLite 128).
 ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS context_type TEXT;
 ALTER TABLE queue_items ADD COLUMN IF NOT EXISTS context_id TEXT;
@@ -1281,6 +1294,16 @@ CREATE TABLE IF NOT EXISTS radio_titres_diffuses (
  pochette TEXT,
  PRIMARY KEY (ecoute_id, diffuse_le)
 );
+-- Artistes des crédits composés (#9265). Sans script numéroté : présente
+-- ici (bascule) ET dans `ENSURE_TABLES`, mêmes types
+-- (migrations/artistes_des_credits.sql). Non copiée (TABLES_NON_COPIEES).
+CREATE TABLE IF NOT EXISTS artistes_des_credits (
+ credit_id BIGINT NOT NULL,
+ artiste_id BIGINT NOT NULL,
+ rang BIGINT NOT NULL DEFAULT 0,
+ PRIMARY KEY (credit_id, artiste_id)
+);
+CREATE INDEX IF NOT EXISTS idx_artistes_des_credits_artiste ON artistes_des_credits(artiste_id);
 -- « Pas pour moi » de l'accueil (web#916, SQLite 145 / PG 111), par profil.
 CREATE TABLE IF NOT EXISTS suggestions_ecartees (
     profile_id BIGINT NOT NULL DEFAULT 1,
@@ -2579,6 +2602,9 @@ mod tests {
         let cible = base_jetable(&url, BASE).await;
         let sqlite = sqlite_de_depart();
         let item = |source: &str, id: &str| QueueInput::Streaming {
+            media_format: None,
+            sample_rate: None,
+            bit_depth: None,
             source: source.into(),
             source_id: id.into(),
             title: id.into(),
@@ -2593,6 +2619,7 @@ mod tests {
         };
         let reprise = Resume {
             resume_key: "cle-reprise".into(),
+            profile_id: None,
             context_type: "playlist".into(),
             context_id: "mixte".into(),
             source: "qobuz".into(),

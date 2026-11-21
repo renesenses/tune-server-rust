@@ -526,6 +526,9 @@ impl AlarmScheduler {
                 EntryContent::Local(track_id) => Some(QueueInput::Local { track_id }),
                 EntryContent::Missing(_) => None,
                 EntryContent::Service(t) => Some(QueueInput::Streaming {
+                    media_format: None,
+                    sample_rate: None,
+                    bit_depth: None,
                     source: t.source,
                     source_id: t.source_id,
                     title: t.title,

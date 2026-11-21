@@ -449,8 +449,33 @@ pub struct StreamSession {
     /// Alimentée sous le verrou du récepteur (`recv_chunk_retenu`), donc dans
     /// l'ordre exact du canal ; bornée par `fenetre_de_retenue`.
     retenue: std::sync::Mutex<RetenueDuCanal>,
+    /// #8963 — une connexion arrivée par le pont (relais ou écoute directe,
+    /// en-tête [`crate::cloud::ENTETE_RELAIS`]) a tiré ce flux, et ces octets
+    /// de retenue lui ont été accordés sur le budget commun du pont : voir
+    /// [`StreamSession::reserver_pour_le_pont`]. Rendus quand la session meurt.
+    reservation_du_pont: std::sync::OnceLock<(&'static BudgetDuPont, u64)>,
     pub created_at: Instant,
     pub bytes_sent: std::sync::atomic::AtomicU64,
+    /// #9206 — instant où `bytes_sent` a franchi
+    /// [`OCTETS_AU_DELA_DE_L_EN_TETE`], toutes connexions confondues (posé par
+    /// [`Self::compter_octets_servis`]).
+    ///
+    /// `bytes_sent` dit combien, jamais QUAND. Or c'est le « quand » qui
+    /// sépare deux renderers que la fin de piste confondait : le DMP-A6
+    /// (#4173) précharge le flux armé ~3 s après le `SetNext`, soit ~27 s
+    /// avant la fin, et n'y passe jamais ; le lecteur du fil 2961 (Android
+    /// 7.1.2, DSF natif) le lit À la fin (`bytes=0-` puis `bytes=28-`) et
+    /// bascule 1,2 s plus tard. Vide tant que le seuil n'est pas franchi.
+    ///
+    /// ⚠️ `bytes_sent` compte les octets PRODUITS par le corps HTTP (blocs de
+    /// 64 Kio de `build_file_body`), pas ceux que le lecteur a reçus : une
+    /// sonde `GET bytes=0-` refermée après quelques octets franchit quand même
+    /// le seuil. Le seuil écarte un `HEAD` et les très petits envois, pas une
+    /// sonde `GET` sur un fichier. NON PROUVÉ donc : qu'un renderer qui sonde
+    /// au `SetNext` puis lit à la fin soit daté à la lecture sur le vrai
+    /// service. Piste pour plus tard : dater la dernière requête `Range` qui
+    /// ne part pas de 0.
+    pub lecture_au_dela_de_l_en_tete: std::sync::OnceLock<Instant>,
     /// #4455 — reprises `Range` d'un fichier WAV dont le premier octet ne
     /// tombe PAS sur une frontière de trame PCM. Servies telles quelles
     /// (le fichier est adressable à l'octet), mais un renderer qui les
@@ -505,6 +530,16 @@ pub struct StreamSession {
     /// counter surfaces that case for diagnostics (a renderer that re-requests
     /// without closing its first connection — DMP-A8 FIP silent-after-reconnect).
     pub active_consumers: std::sync::atomic::AtomicU32,
+    /// #8926 — connexions radio dont le corps a remis un bloc à hyper et
+    /// n'a pas été relancé depuis : le renderer ne lit plus (tampon TCP
+    /// plein). Un tel corps ne peut pas voir qu'on le congédie avant que le
+    /// renderer ne lise de nouveau. Tenu par `RadioConsumerGuard`.
+    pub consommateurs_radio_en_ecriture: std::sync::atomic::AtomicU32,
+    /// #8926 — la TÊTE du direct : les premiers blocs PCM tirés du canal
+    /// d'une radio, au plus [`TETE_DU_DIRECT_SECONDES`]. Une sonde `Lavf`
+    /// emporte l'avance (réserve de #1628 + rafale d'icecast) puis se ferme ;
+    /// la lecture qui suit la reçoit de nouveau, d'un trait.
+    tete_du_direct: std::sync::Mutex<TeteDuDirect>,
     /// The local-output watchdog is armed at most once for this session. A
     /// session prepared for gapless remains unarmed until its URL is actually
     /// handed to the local output.
@@ -586,7 +621,34 @@ pub struct StreamSession {
     pub producer_done: std::sync::atomic::AtomicBool,
 }
 
+/// #9206 — octets PRODUITS sur un flux au-delà desquels on le dit lu (voir
+/// la réserve de [`StreamSession::lecture_au_dela_de_l_en_tete`] : une sonde
+/// `GET` sur un fichier produit un bloc de 64 Kio et franchit ce seuil).
+pub const OCTETS_AU_DELA_DE_L_EN_TETE: u64 = 4_096;
+
 impl StreamSession {
+    /// Compte `n` octets servis au lecteur — seul point d'écriture de
+    /// `bytes_sent` côté service HTTP — et date le franchissement de
+    /// [`OCTETS_AU_DELA_DE_L_EN_TETE`] (#9206).
+    pub fn compter_octets_servis(&self, n: u64) {
+        let avant = self
+            .bytes_sent
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        if avant.saturating_add(n) > OCTETS_AU_DELA_DE_L_EN_TETE
+            && self.lecture_au_dela_de_l_en_tete.get().is_none()
+        {
+            let _ = self.lecture_au_dela_de_l_en_tete.set(Instant::now());
+        }
+    }
+
+    /// #9206 — depuis combien de millisecondes le lecteur lit au-delà de
+    /// l'en-tête ; `None` tant que le seuil n'est pas franchi.
+    pub fn lecture_au_dela_de_l_en_tete_depuis_ms(&self) -> Option<u64> {
+        self.lecture_au_dela_de_l_en_tete
+            .get()
+            .map(|t| t.elapsed().as_millis() as u64)
+    }
+
     /// Une session-CANAL : la conversion à la volée (DSD→WAV), dont les octets
     /// ne se lisent qu'une fois. Ni fichier sur disque (Range réel), ni
     /// mandataire (Range relayé en amont), ni radio (déjà annoncée live).
@@ -776,6 +838,7 @@ impl StreamSession {
             retenue: std::sync::Mutex::new(RetenueDuCanal::default()),
             created_at: Instant::now(),
             bytes_sent: std::sync::atomic::AtomicU64::new(0),
+            lecture_au_dela_de_l_en_tete: std::sync::OnceLock::new(),
             ranges_hors_trame: std::sync::atomic::AtomicU32::new(0),
             longueur_amont: std::sync::atomic::AtomicU64::new(0),
             requetes_mandataire: std::sync::atomic::AtomicU32::new(0),
@@ -784,6 +847,8 @@ impl StreamSession {
             gc_active_at_ms: std::sync::atomic::AtomicU64::new(0),
             fichiers_prepares: std::sync::atomic::AtomicU32::new(0),
             active_consumers: std::sync::atomic::AtomicU32::new(0),
+            consommateurs_radio_en_ecriture: std::sync::atomic::AtomicU32::new(0),
+            tete_du_direct: std::sync::Mutex::new(TeteDuDirect::default()),
             consumer_watch_armed: std::sync::atomic::AtomicBool::new(false),
             consumer_epoch: std::sync::atomic::AtomicU64::new(0),
             channel_was_full: std::sync::atomic::AtomicBool::new(false),
@@ -796,11 +861,149 @@ impl StreamSession {
             first_request: std::sync::Arc::new(tokio::sync::Notify::new()),
             data_ready: std::sync::Arc::new(tokio::sync::Notify::new()),
             producer_done: std::sync::atomic::AtomicBool::new(false),
+            reservation_du_pont: std::sync::OnceLock::new(),
         }
+    }
+
+    /// #8963 — note qu'une connexion venue du pont tire ce flux. À appeler
+    /// AVANT de tirer le canal : la retenue s'élargit pour les blocs suivants,
+    /// sur le budget commun [`BUDGET_DU_PONT`].
+    pub fn noter_tirage_par_le_pont(&self) {
+        self.reserver_pour_le_pont(&BUDGET_DU_PONT, RETENUE_PONT_MAX_OCTETS);
+    }
+
+    /// Réserve sur `budget` la retenue du pont de cette session : toute la
+    /// piste si elle tient sous `plafond`, sinon `plafond` octets gardés
+    /// depuis son DÉBUT. Rend `true` si la session a (ou avait déjà) sa
+    /// réservation. Rien pour une longueur inconnue (radio), ni quand la
+    /// fenêtre ordinaire couvre déjà la piste, ni quand le budget est épuisé
+    /// — la fenêtre ordinaire s'applique alors.
+    pub fn reserver_pour_le_pont(&self, budget: &'static BudgetDuPont, plafond: u64) -> bool {
+        if self.reservation_du_pont.get().is_some() {
+            return true;
+        }
+        let Some(total) = self.info.wav_content_length() else {
+            return false;
+        };
+        let n = total.min(plafond);
+        if total <= self.info.fenetre_de_retenue() || n == 0 {
+            return false;
+        }
+        if !budget.reserver(n) {
+            tracing::warn!(
+                stream_id = %self.id,
+                demande = n,
+                utilise = budget.utilise(),
+                plafond = budget.plafond(),
+                "retenue_du_pont_refusee — budget commun des flux tirés par le pont épuisé : \
+                 fenêtre ordinaire (#8963)"
+            );
+            return false;
+        }
+        if self.reservation_du_pont.set((budget, n)).is_err() {
+            // Une autre connexion a réservé entre-temps : on rend la nôtre.
+            budget.rendre(n);
+        }
+        true
+    }
+
+    /// `(fenêtre glissante, tête gardée depuis 0)` de la retenue de cette
+    /// session.
+    fn parametres_de_retenue(&self) -> (u64, u64) {
+        let base = self.info.fenetre_de_retenue();
+        match (
+            self.reservation_du_pont.get(),
+            self.info.wav_content_length(),
+        ) {
+            (Some(&(_, n)), Some(total)) if n >= total => (base.max(n), 0),
+            (Some(&(_, n)), Some(_)) => (base, n),
+            _ => (base, 0),
+        }
+    }
+
+    /// La fenêtre de retenue de CETTE session.
+    ///
+    /// #8963 (fil 2880, téléphone en 5G par le pont, rc12) : une conversion
+    /// FLAC 88,2/24 → WAV 88,2/16 de 73 Mo a été tirée EN ENTIER en 1,4 s —
+    /// le relais pousse au débit de la liaison montante, pas à celui du
+    /// lecteur. Neuf secondes plus tard le téléphone reprenait en
+    /// `bytes=44-`, juste après l'en-tête : la retenue (180 s, soit 63,5 Mo à
+    /// ce débit) ne commençait plus qu'à 9,8 Mo. Connexion fermée sans un
+    /// octet, puis 404 à chaque redémarrage (#6050) : la piste était perdue.
+    ///
+    /// Tirée par le pont, une piste de longueur CONNUE est donc retenue en
+    /// entier, jusqu'à [`RETENUE_PONT_MAX_OCTETS`] ; au-delà, ses premiers
+    /// [`RETENUE_PONT_MAX_OCTETS`] sont gardés en plus de la fenêtre
+    /// ordinaire ([`StreamSession::tete_de_retenue_effective`]). Une radio
+    /// (longueur inconnue), toute session locale, et toute session refusée
+    /// par le budget commun gardent la fenêtre de toujours.
+    pub fn fenetre_de_retenue_effective(&self) -> u64 {
+        self.parametres_de_retenue().0
+    }
+
+    /// #8963 — octets gardés depuis le DÉBUT de la piste, en plus de la
+    /// fenêtre glissante : 0 hors du pont, ou quand la fenêtre couvre tout.
+    pub fn tete_de_retenue_effective(&self) -> u64 {
+        self.parametres_de_retenue().1
     }
 
     pub async fn recv_chunk(&self) -> Option<Vec<u8>> {
         self.rx.lock().await.recv().await
+    }
+
+    /// #8926 — tire un bloc du canal d'une radio et, tant que la tête du
+    /// direct n'est pas pleine, l'y garde. Sous le verrou du récepteur : la
+    /// tête contient, dans l'ordre exact du canal, tout ce qui en est sorti.
+    pub async fn recv_chunk_radio(&self) -> Option<Vec<u8>> {
+        let mut rx = self.rx.lock().await;
+        let bloc = rx.recv().await?;
+        let plafond = self.plafond_de_la_tete();
+        if let Ok(mut tete) = self.tete_du_direct.lock() {
+            tete.garder(&bloc, plafond);
+        }
+        Some(bloc)
+    }
+
+    /// #8926 — ce que la tête du direct peut rejouer à une lecture qui
+    /// demande le DÉBUT. Pris sous le verrou du récepteur, après que la
+    /// connexion a réclamé le canal : aucun bloc ne peut sortir du canal
+    /// entre le dernier bloc rendu ici et le premier que cette connexion
+    /// tirera elle-même — ni trou ni doublon à la jonction.
+    pub async fn tete_du_direct(&self) -> TeteRejouable {
+        let _rx = self.rx.lock().await;
+        match self.tete_du_direct.lock() {
+            Ok(tete) if tete.depassee => TeteRejouable::Depassee,
+            Ok(tete) => TeteRejouable::Blocs(tete.blocs.clone()),
+            Err(_) => TeteRejouable::Blocs(Vec::new()),
+        }
+    }
+
+    fn plafond_de_la_tete(&self) -> u64 {
+        let info = self.effective_output_info();
+        let debit =
+            u64::from(info.sample_rate) * u64::from(info.channels) * u64::from(info.bit_depth / 8);
+        debit.max(1) * TETE_DU_DIRECT_SECONDES
+    }
+
+    /// #8926 — le corps radio vient de remettre un bloc à hyper (`entre`) ou
+    /// d'être relancé par lui (`!entre`).
+    pub fn noter_ecriture_radio(&self, entre: bool) {
+        use std::sync::atomic::Ordering::SeqCst;
+        if entre {
+            self.consommateurs_radio_en_ecriture.fetch_add(1, SeqCst);
+        } else {
+            let _ = self
+                .consommateurs_radio_en_ecriture
+                .fetch_update(SeqCst, SeqCst, |n| n.checked_sub(1));
+        }
+    }
+
+    /// #8926 — vrai quand CHAQUE connexion encore accrochée à cette radio est
+    /// arrêtée sur l'écriture : le renderer ne lit plus rien.
+    pub fn consommateurs_radio_tous_en_ecriture(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let actifs = self.active_consumers.load(SeqCst);
+        actifs > 0 && self.consommateurs_radio_en_ecriture.load(SeqCst) >= actifs
     }
 
     /// #5426 — tire un bloc du canal, le POSITIONNE et le RETIENT, sous le
@@ -868,9 +1071,9 @@ impl StreamSession {
         preparer(debut, &mut bloc);
         self.octets_du_canal
             .fetch_add(bloc.len() as u64, std::sync::atomic::Ordering::SeqCst);
-        let fenetre = self.info.fenetre_de_retenue();
+        let (fenetre, tete) = self.parametres_de_retenue();
         if let Ok(mut r) = self.retenue.lock() {
-            r.ajouter(debut, bloc.clone(), fenetre);
+            r.ajouter(debut, bloc.clone(), fenetre, tete);
         }
         (debut, bloc)
     }
@@ -899,10 +1102,21 @@ impl StreamSession {
     }
 
     /// `[début, fin)` de ce que la retenue peut rejouer.
+    ///
+    /// #8963 — avec une tête gardée (pont, piste plus longue que le plafond),
+    /// le début vaut 0 : une reprise y est servie depuis la tête, et la suite
+    /// depuis la fenêtre si elles se touchent.
     pub fn etendue_retenue(&self) -> (u64, u64) {
         self.retenue
             .lock()
-            .map(|r| (r.debut, r.debut + r.taille))
+            .map(|r| {
+                let fin = (r.debut + r.taille).max(r.tete.len() as u64);
+                if r.tete.is_empty() {
+                    (r.debut, fin)
+                } else {
+                    (0, fin)
+                }
+            })
             .unwrap_or((0, 0))
     }
 
@@ -1110,6 +1324,48 @@ pub enum Relecture {
 }
 
 /// #5426 — fenêtre glissante des derniers blocs tirés du canal.
+/// #8926 — durée d'audio que la tête du direct d'une radio peut rejouer.
+///
+/// Sur le .18 (17/11, FIP → Eversolo DMP-A8), la sonde `Lavf` a emporté
+/// 1 058 924 octets, 5,5 s à 48 kHz/16 bits, avant de se fermer. Huit secondes
+/// la couvrent avec de la marge ; au-delà, la tête est abandonnée (mémoire
+/// rendue) et une lecture qui revient au début reçoit le direct, comme avant :
+/// une reprise après de longues secondes d'écoute ne réentend jamais le début.
+pub const TETE_DU_DIRECT_SECONDES: u64 = 8;
+
+#[derive(Default)]
+struct TeteDuDirect {
+    blocs: Vec<Vec<u8>>,
+    taille: u64,
+    depassee: bool,
+}
+
+impl TeteDuDirect {
+    fn garder(&mut self, bloc: &[u8], plafond: u64) {
+        if self.depassee {
+            return;
+        }
+        if self.taille + bloc.len() as u64 > plafond {
+            self.depassee = true;
+            self.blocs = Vec::new();
+            self.taille = 0;
+            return;
+        }
+        self.taille += bloc.len() as u64;
+        self.blocs.push(bloc.to_vec());
+    }
+}
+
+/// #8926 — ce que rend [`StreamSession::tete_du_direct`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TeteRejouable {
+    /// Les blocs déjà tirés du canal, depuis le premier (vide : rien n'est
+    /// encore sorti du canal, c'est la première connexion).
+    Blocs(Vec<Vec<u8>>),
+    /// Plus de [`TETE_DU_DIRECT_SECONDES`] sont déjà sorties : on ne rejoue rien.
+    Depassee,
+}
+
 #[derive(Default)]
 struct RetenueDuCanal {
     /// Position dans le flux du premier octet retenu.
@@ -1117,10 +1373,19 @@ struct RetenueDuCanal {
     blocs: std::collections::VecDeque<Vec<u8>>,
     taille: u64,
     fin: Option<u64>,
+    /// #8963 — les premiers octets du flux, gardés hors de la fenêtre
+    /// glissante (pont, piste plus longue que le plafond).
+    tete: Vec<u8>,
 }
 
 impl RetenueDuCanal {
-    fn ajouter(&mut self, position: u64, bloc: Vec<u8>, fenetre: u64) {
+    fn ajouter(&mut self, position: u64, bloc: Vec<u8>, fenetre: u64, tete_max: u64) {
+        let long = self.tete.len() as u64;
+        if long < tete_max && position <= long && position + bloc.len() as u64 > long {
+            let depuis = (long - position) as usize;
+            let jusqu = ((tete_max - position).min(bloc.len() as u64)) as usize;
+            self.tete.extend_from_slice(&bloc[depuis..jusqu]);
+        }
         if position != self.debut + self.taille {
             // Un bloc tiré hors de la retenue (autre voie de lecture) : la
             // continuité est rompue, on repart de celui-ci.
@@ -1139,6 +1404,11 @@ impl RetenueDuCanal {
     }
 
     fn relire(&self, position: u64, max: usize) -> Relecture {
+        if position < self.tete.len() as u64 && position < self.debut {
+            let depuis = position as usize;
+            let jusqu = (depuis + max).min(self.tete.len());
+            return Relecture::Octets(self.tete[depuis..jusqu].to_vec());
+        }
         let fin = self.debut + self.taille;
         if position >= fin {
             return Relecture::AuBout;
@@ -1174,6 +1444,68 @@ impl RetenueDuCanal {
 pub const RETENUE_SECONDES: u64 = 180;
 pub const RETENUE_MIN_OCTETS: u64 = 8 * 1024 * 1024;
 pub const RETENUE_MAX_OCTETS: u64 = 64 * 1024 * 1024;
+/// #8963 — une piste tirée par le pont est retenue en entier jusqu'à ce
+/// plafond : 12 min de WAV 88,2/16, 25 min de CD. Au-delà, ce sont ses
+/// premiers octets qui sont gardés, en plus de la fenêtre ordinaire : une
+/// reprise juste après l'en-tête (`bytes=44-`) reste servie.
+pub const RETENUE_PONT_MAX_OCTETS: u64 = 256 * 1024 * 1024;
+
+/// #8963 — ce que TOUTES les sessions tirées par le pont peuvent retenir
+/// ensemble au-delà de la fenêtre ordinaire. Au-delà, une nouvelle session
+/// garde la fenêtre ordinaire.
+pub const BUDGET_PONT_OCTETS: u64 = 384 * 1024 * 1024;
+
+/// Le budget commun des retenues du pont.
+pub static BUDGET_DU_PONT: BudgetDuPont = BudgetDuPont::new(BUDGET_PONT_OCTETS);
+
+/// Un budget d'octets partagé, réservé et rendu sans verrou.
+#[derive(Debug)]
+pub struct BudgetDuPont {
+    utilise: std::sync::atomic::AtomicU64,
+    plafond: u64,
+}
+
+impl BudgetDuPont {
+    pub const fn new(plafond: u64) -> Self {
+        Self {
+            utilise: std::sync::atomic::AtomicU64::new(0),
+            plafond,
+        }
+    }
+
+    /// Réserve `n` octets s'ils tiennent sous le plafond, tout ou rien.
+    pub fn reserver(&self, n: u64) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.utilise
+            .fetch_update(SeqCst, SeqCst, |u| {
+                u.checked_add(n).filter(|total| *total <= self.plafond)
+            })
+            .is_ok()
+    }
+
+    pub fn rendre(&self, n: u64) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let _ = self
+            .utilise
+            .fetch_update(SeqCst, SeqCst, |u| Some(u.saturating_sub(n)));
+    }
+
+    pub fn utilise(&self) -> u64 {
+        self.utilise.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn plafond(&self) -> u64 {
+        self.plafond
+    }
+}
+
+impl Drop for StreamSession {
+    fn drop(&mut self) {
+        if let Some(&(budget, n)) = self.reservation_du_pont.get() {
+            budget.rendre(n);
+        }
+    }
+}
 
 impl StreamInfo {
     /// Taille de la fenêtre de retenue de ce flux — voir [`RETENUE_SECONDES`].
@@ -1564,6 +1896,12 @@ impl AudioStreamer {
             port,
             abandonnees: Arc::new(std::sync::Mutex::new(std::collections::VecDeque::new())),
         }
+    }
+
+    /// Le port HTTP du serveur, celui des URL `/stream/...` qu'il publie.
+    /// #9207 — sert aussi à reconnaître une URI de NOTRE bibliothèque.
+    pub fn port(&self) -> u16 {
+        self.port
     }
 
     /// #6658 — note que la session `stream_id` est retirée parce que son
@@ -2098,6 +2436,19 @@ impl AudioStreamer {
             .map(|s| s.bytes_sent.load(std::sync::atomic::Ordering::Relaxed))
     }
 
+    /// #9206 — depuis combien de millisecondes ce flux est lu au-delà de
+    /// l'en-tête (voir [`StreamSession::lecture_au_dela_de_l_en_tete`]).
+    /// `None` : session inconnue ou seuil pas franchi.
+    pub async fn stream_lecture_au_dela_de_l_en_tete_depuis_ms(
+        &self,
+        stream_id: &str,
+    ) -> Option<u64> {
+        let sessions = self.sessions.lock().await;
+        sessions
+            .get(stream_id)?
+            .lecture_au_dela_de_l_en_tete_depuis_ms()
+    }
+
     /// 🔴 #4480 — combien de MILLISECONDES D'AUDIO ont été servies à ce
     /// renderer, décalage de recherche compris.
     ///
@@ -2272,11 +2623,47 @@ pub fn cleanup_leftover_transcode_files() {
             && std::fs::remove_file(entry.path()).is_ok()
         {
             count += 1;
+            continue;
+        }
+        // #8795 — un fMP4 DASH de TIDAL laissé par un arrêt brutal ou par
+        // un téléchargement coupé.
+        if let Some(name) = entry.file_name().to_str() {
+            let age = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|m| std::time::SystemTime::now().duration_since(m).ok());
+            let epingle = crate::audio::dash_epingles::est_epingle(&entry.path().to_string_lossy());
+            if dash_tidal_orphelin(name, age, epingle) && std::fs::remove_file(entry.path()).is_ok()
+            {
+                count += 1;
+            }
         }
     }
     if count > 0 {
         info!(count, "leftover_transcode_files_cleaned_up");
     }
+}
+
+/// #8795 — `tune-dash-<uuid>.mp4` que le démarrage peut supprimer : ni
+/// épinglé par une zone (#8701), ni récent. Aucune lecture de ce processus
+/// n'a encore commencé au démarrage ; l'âge minimal (le même que le
+/// ramasse-miettes périodique, bien au-delà du TTL de 240 s du cache d'URL)
+/// épargne le fichier qu'un AUTRE serveur du même compte assemble ou lit en
+/// ce moment. Les pré-transcodages (`tune-dash-transcode-`) et les rendus
+/// du préchauffage (`tune-dash-warm-`) ne sont pas des `.mp4` DASH.
+pub(crate) fn dash_tidal_orphelin(
+    nom: &str,
+    age: Option<std::time::Duration>,
+    epingle: bool,
+) -> bool {
+    const AGE_MIN: std::time::Duration = std::time::Duration::from_secs(600);
+    nom.starts_with("tune-dash-")
+        && nom.ends_with(".mp4")
+        && !nom.starts_with("tune-dash-transcode-")
+        && !nom.starts_with("tune-dash-warm-")
+        && !epingle
+        && age.is_some_and(|a| a > AGE_MIN)
 }
 
 // ─── Helpers (framework-agnostic) ───────────────────────────────
@@ -3599,5 +3986,44 @@ mod tests {
             ..aac
         };
         assert_eq!(avec_taille.debit_nominal_octets_par_seconde(), Some(40_000));
+    }
+}
+
+#[cfg(test)]
+mod balayage_dash_8795_tests {
+    use super::dash_tidal_orphelin;
+    use std::time::Duration;
+
+    const VIEUX: Option<Duration> = Some(Duration::from_secs(3600));
+
+    /// Contre-épreuve : retirer la clause `tune-dash-` de
+    /// `cleanup_leftover_transcode_files` laisse ces fichiers au démarrage ;
+    /// rendre `true` sans condition fait tomber les cas épargnés.
+    #[test]
+    fn un_fmp4_dash_vieux_et_libre_est_balaye_8795() {
+        assert!(dash_tidal_orphelin(
+            "tune-dash-3f2a9c1e-0000-4000-8000-000000000000.mp4",
+            VIEUX,
+            false
+        ));
+    }
+
+    #[test]
+    fn epingle_recent_ou_autre_fichier_est_epargne_8795() {
+        let nom = "tune-dash-3f2a9c1e-0000-4000-8000-000000000000.mp4";
+        assert!(!dash_tidal_orphelin(nom, VIEUX, true), "épinglé (#8701)");
+        assert!(
+            !dash_tidal_orphelin(nom, Some(Duration::from_secs(30)), false),
+            "récent : peut-être celui d'un autre serveur en cours"
+        );
+        assert!(!dash_tidal_orphelin(nom, None, false), "âge inconnu");
+        assert!(!dash_tidal_orphelin(
+            "tune-dash-transcode-x.mp4",
+            VIEUX,
+            false
+        ));
+        assert!(!dash_tidal_orphelin("tune-dash-warm-x.mp4", VIEUX, false));
+        assert!(!dash_tidal_orphelin("tune-dash-x.flac", VIEUX, false));
+        assert!(!dash_tidal_orphelin("musique.mp4", VIEUX, false));
     }
 }

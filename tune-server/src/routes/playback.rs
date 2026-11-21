@@ -651,6 +651,9 @@ pub(crate) fn entrees_de_file(
             // #6179 — une piste introuvable n'a rien à jouer.
             EntryContent::Missing(_) => None,
             EntryContent::Service(s) => Some(QueueInput::Streaming {
+                media_format: None,
+                sample_rate: None,
+                bit_depth: None,
                 source: s.source.clone(),
                 source_id: s.source_id.clone(),
                 title: s.title.clone(),
@@ -1945,6 +1948,10 @@ struct QueueClearQuery {
 
 #[derive(Deserialize)]
 struct QueueAddRequest {
+    /// #8788 — qualité annoncée par le serveur multimédia.
+    media_format: Option<String>,
+    sample_rate: Option<u32>,
+    bit_depth: Option<u32>,
     #[serde(default)]
     track_ids: Vec<i64>,
     track_id: Option<i64>,
@@ -2042,6 +2049,10 @@ fn contexte_d_ajout(
 
 #[derive(Deserialize)]
 struct StreamingTrackItem {
+    /// #8788 — qualité annoncée par le serveur multimédia.
+    media_format: Option<String>,
+    sample_rate: Option<u32>,
+    bit_depth: Option<u32>,
     source: String,
     source_id: String,
     title: Option<String>,
@@ -3844,6 +3855,9 @@ async fn play_sans_conteneur_de_file(
         });
         // #6399 — lu avant que `body` ne parte dans la demande de lecture.
         let tete_de_liste = body.queue_follows;
+        let format_de_la_ligne = body.media_format.clone();
+        let cadence_de_la_ligne = body.sample_rate;
+        let profondeur_de_la_ligne = body.bit_depth.map(u32::from);
         // #6380 (Sandro, fil 2404, rc7, Qobuz sur Diretta Renderer) : le bouton
         // Lecture du client web, zone arrêtée sur une piste de SERVICE, envoie
         // `{source, source_id}` — c'est CETTE branche, pas le corps vide. Sans
@@ -3935,6 +3949,9 @@ async fn play_sans_conteneur_de_file(
                         if let Err(e) = queue_repo.append(
                             zone_id,
                             &[QueueInput::Streaming {
+                                media_format: format_de_la_ligne,
+                                sample_rate: cadence_de_la_ligne,
+                                bit_depth: profondeur_de_la_ligne,
                                 source: source_for_q.clone().unwrap_or_else(|| "streaming".into()),
                                 // Web#1926 : un titre Bandcamp seul garde la
                                 // page de son album, envoyée par le client ou
@@ -4684,6 +4701,18 @@ async fn reprendre_la_zone(
                         .get("album_ref")
                         .and_then(|v| v.as_str())
                         .map(String::from),
+                    media_format: first
+                        .get("media_format")
+                        .and_then(|v| v.as_str())
+                        .map(String::from),
+                    sample_rate: first
+                        .get("sample_rate")
+                        .and_then(|v| v.as_u64())
+                        .and_then(|v| u32::try_from(v).ok()),
+                    bit_depth: first
+                        .get("bit_depth")
+                        .and_then(|v| v.as_u64())
+                        .and_then(|v| u16::try_from(v).ok()),
                     ..Default::default()
                 };
                 return match state.orchestrator.play(orch_req).await {
@@ -6059,13 +6088,13 @@ async fn completer_references_de_service(
     source_id: &str,
     album: Option<String>,
     artiste: Option<String>,
-) -> (Option<String>, Option<String>) {
+) -> (Option<String>, Option<String>, Option<i64>) {
     if (album.is_some() && artiste.is_some()) || source == "bandcamp" {
-        return (album, artiste);
+        return (album, artiste, None);
     }
     // Le service SANS garder le registre verrouillé pendant la requête.
     let Some(svc) = state.services.lock().await.get(source) else {
-        return (album, artiste);
+        return (album, artiste, None);
     };
     let svc = svc.read().await;
     match tokio::time::timeout(DELAI_FICHE_POUR_LES_REFERENCES, svc.get_track(source_id)).await {
@@ -6076,6 +6105,10 @@ async fn completer_references_de_service(
             artiste.or_else(|| {
                 crate::routes::zones::identifiant_de_service_sur(t.artist_id.as_deref())
             }),
+            (t.id == source_id)
+                .then(|| i64::try_from(t.duration_ms).ok())
+                .flatten()
+                .filter(|d| *d > 0),
         ),
         Ok(Err(e)) => {
             tracing::debug!(
@@ -6084,14 +6117,14 @@ async fn completer_references_de_service(
                 error = %e,
                 "file_references_de_service_fiche_refusee_6079"
             );
-            (album, artiste)
+            (album, artiste, None)
         }
         Err(_) => {
             warn!(
                 source,
                 source_id, "file_references_de_service_fiche_trop_lente_6079"
             );
-            (album, artiste)
+            (album, artiste, None)
         }
     }
 }
@@ -6263,7 +6296,7 @@ async fn queue_add(
         let artiste_demande =
             crate::routes::zones::identifiant_de_service_sur(body.artist_id_service.as_deref())
                 .or(meta.artist_id_service);
-        let (album_ref, artist_ref) = completer_references_de_service(
+        let (album_ref, artist_ref, duree_fiche) = completer_references_de_service(
             &state,
             source,
             source_id,
@@ -6272,6 +6305,9 @@ async fn queue_add(
         )
         .await;
         inputs.push(QueueInput::Streaming {
+            media_format: body.media_format.clone(),
+            sample_rate: body.sample_rate,
+            bit_depth: body.bit_depth,
             album_ref,
             source: source.clone(),
             source_id: source_id.clone(),
@@ -6279,7 +6315,11 @@ async fn queue_add(
             artist: meta.artist,
             album: meta.album,
             cover_url: meta.cover,
-            duration_ms: meta.duration_ms,
+            duration_ms: if meta.duration_ms > 0 {
+                meta.duration_ms
+            } else {
+                duree_fiche.unwrap_or(meta.duration_ms)
+            },
             track_number: meta.track_number,
             disc_number: meta.disc_number,
             artist_ref,
@@ -6312,6 +6352,9 @@ async fn queue_add(
         // fiche demandée en plus ici : un lot de trente titres coûterait
         // trente requêtes. Un client qui veut ses lignes complètes les envoie.
         inputs.push(QueueInput::Streaming {
+            media_format: item.media_format.clone(),
+            sample_rate: item.sample_rate,
+            bit_depth: item.bit_depth,
             album_ref: crate::routes::zones::album_de_service_de_la_demande(
                 &state,
                 &item.source,
@@ -6457,6 +6500,9 @@ async fn queue_add(
         .update_queue_info(zone_id, current_pos, total)
         .await;
     persist_queue_async(&state, zone_id);
+    if count > 0 {
+        duree_favori_8848::completer(&state, zone_id, &inputs);
+    }
     // Le succès aussi doit laisser une trace : c'est elle qui permet de dire à
     // un utilisateur « votre ajout est bien arrivé, à telle position » plutôt
     // que de lui demander de réessayer. `position` vaut `None` pour un ajout
@@ -7531,6 +7577,19 @@ pub(crate) async fn do_transfer(
     target_zone: i64,
     stop_source: bool,
 ) -> axum::response::Response {
+    do_transfer_decale(state, from_zone, target_zone, stop_source, 0).await
+}
+
+/// [`do_transfer`], la cible reprenant `decalage_ms` en arrière (positif) ou en
+/// avant (négatif) de la position de la source : la jonction d'une suiveuse
+/// de groupe qui porte un décalage manuel (#9089, fil 2757).
+pub(crate) async fn do_transfer_decale(
+    state: &AppState,
+    from_zone: i64,
+    target_zone: i64,
+    stop_source: bool,
+    decalage_ms: i64,
+) -> axum::response::Response {
     let current = state.playback.get_state(from_zone).await;
     if current.now_playing.is_none() {
         return (
@@ -7587,11 +7646,22 @@ pub(crate) async fn do_transfer(
             .iter()
             .map(|item| item["artist_ref"].as_str().map(String::from))
             .collect();
-        if let Err(e) = queue_repo.set_streaming_queue_avec_references(
+        let formats = streaming_items
+            .iter()
+            .map(|item| {
+                (
+                    item["media_format"].as_str().map(String::from),
+                    item["sample_rate"].as_i64(),
+                    item["bit_depth"].as_i64(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if let Err(e) = queue_repo.set_streaming_queue_avec_formats(
             target_zone,
             &tracks,
             &album_refs,
             &artist_refs,
+            &formats,
         ) {
             warn!(from_zone, target_zone, error = %e, "transfer_streaming_queue_failed");
         }
@@ -7635,6 +7705,16 @@ pub(crate) async fn do_transfer(
     let source_paused = current.state == tune_core::playback::PlayState::Paused;
 
     let np = current.now_playing.unwrap();
+    // #9089 — la suiveuse décalée rejoint sa meneuse à sa propre position.
+    let source_position_ms = if decalage_ms == 0 {
+        source_position_ms
+    } else {
+        tune_core::zones::decalage_de_groupe_9089::position_de_la_suiveuse(
+            source_position_ms,
+            decalage_ms,
+            np.duration_ms,
+        )
+    };
     let target_db_zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
         .get(target_zone)
         .ok()
@@ -8387,9 +8467,25 @@ async fn set_audiophile(
         tune_core::audio::audiophile::volume_lock_override(&state.backend, zone_id);
     let target_enabled = body.enabled.unwrap_or(current_enabled);
     let target_override = body.lock_volume.unwrap_or(current_override);
-    let target_lock = target_override.unwrap_or_else(|| {
-        tune_core::audio::audiophile::global_volume_lock_enabled(&state.backend)
-    });
+    // #8920 — « plein volume en PURE » n'existe pas sur Devialet AIR : la
+    // demande explicite est refusée, et le réglage global ne s'y applique pas
+    // (le verrou y est toujours lu faux, `audiophile::volume_lock_enabled`).
+    let zone_air = tune_core::outputs::devialet_air::reglages::zone_air(&state.backend, zone_id);
+    if zone_air && body.lock_volume == Some(Some(true)) {
+        warn!(zone_id, "devialet_air_plein_volume_pure_refuse_8920");
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "full_volume_unavailable_devialet_air",
+                "message": "Full volume in PURE mode is unavailable on a Devialet AIR zone: the amplifier holds the volume, under the comfort and safety limits.",
+            })),
+        )
+            .into_response();
+    }
+    let target_lock = !zone_air
+        && target_override.unwrap_or_else(|| {
+            tune_core::audio::audiophile::global_volume_lock_enabled(&state.backend)
+        });
     let was_full_volume = current_enabled && current_lock;
     let will_be_full_volume = target_enabled && target_lock;
 
@@ -9256,6 +9352,9 @@ mod contrat_suivant_radio_tests {
         let items: Vec<QueueInput> = ["a", "b", "c"]
             .iter()
             .map(|id| QueueInput::Streaming {
+                media_format: None,
+                sample_rate: None,
+                bit_depth: None,
                 source: source.into(),
                 source_id: (*id).into(),
                 title: (*id).to_string(),
@@ -10682,6 +10781,9 @@ mod vider_la_file_arrete_le_peripherique_3669 {
             .append(
                 zone_id,
                 &[QueueInput::Streaming {
+                    media_format: None,
+                    sample_rate: None,
+                    bit_depth: None,
                     source: "qobuz".into(),
                     source_id: "a1".into(),
                     title: "Piste".into(),
@@ -10819,6 +10921,9 @@ mod vider_la_suite_4169 {
 
     fn service(id: &str) -> QueueInput {
         QueueInput::Streaming {
+            media_format: None,
+            sample_rate: None,
+            bit_depth: None,
             source: "qobuz".into(),
             source_id: id.into(),
             title: format!("Piste {id}"),
@@ -11684,6 +11789,9 @@ mod precedent_aleatoire_tests {
         let longueur = 20i64;
         let items: Vec<QueueInput> = (0..longueur)
             .map(|i| QueueInput::Streaming {
+                media_format: None,
+                sample_rate: None,
+                bit_depth: None,
                 source: "qobuz".into(),
                 source_id: format!("t{i}"),
                 title: format!("t{i}"),
@@ -11783,6 +11891,9 @@ mod precedent_zone_navigateur_tests {
         let items: Vec<QueueInput> = ["a", "b", "c"]
             .iter()
             .map(|id| QueueInput::Streaming {
+                media_format: None,
+                sample_rate: None,
+                bit_depth: None,
                 source: "qobuz".into(),
                 source_id: (*id).into(),
                 title: (*id).to_string(),
@@ -11911,6 +12022,16 @@ mod remplacement_volontaire_7247_tests;
 #[cfg(test)]
 #[path = "playback/preampli_garde_6524_tests.rs"]
 mod preampli_garde_6524_tests;
+
+#[cfg(test)]
+#[path = "playback/favori_direct_duree_8848_tests.rs"]
+mod favori_direct_duree_8848_tests;
+
+#[path = "playback/duree_favori_8848.rs"]
+mod duree_favori_8848;
+
+#[cfg(test)]
+mod format_upnp_8788_tests;
 
 #[cfg(test)]
 #[path = "playback/deplacement_bloc_8849_tests.rs"]
