@@ -993,6 +993,59 @@ impl PlaybackOrchestrator {
         self.apply_eq_change_portee(zone_id).await == PorteeDuReglage::Immediate
     }
 
+    /// Le préampli réellement gardé par la sortie locale, sans mutation.
+    pub async fn preampli_garde_de_zone(
+        &self,
+        zone_id: i64,
+    ) -> Option<crate::audio::eq::PreampliGarde> {
+        #[cfg(feature = "local-audio")]
+        {
+            let device = self.peripherique_de_la_zone(zone_id);
+            let sortie = { self.outputs.lock().await.get(&device) }?;
+            let sortie = sortie.try_lock().ok()?;
+            sortie
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()?
+                .preampli_garde()
+        }
+        #[cfg(not(feature = "local-audio"))]
+        {
+            let _ = zone_id;
+            None
+        }
+    }
+
+    /// #6524 — geste explicite : libère la borne, par la rampe existante.
+    /// Aucun profil, volume ou état de transport n'est modifié ; PURE reste intact.
+    pub async fn rendre_le_niveau_garde(&self, zone_id: i64) -> bool {
+        if self.zone_audiophile(zone_id) {
+            return false;
+        }
+        #[cfg(feature = "local-audio")]
+        {
+            let device = self.peripherique_de_la_zone(zone_id);
+            let Some(sortie) = ({ self.outputs.lock().await.get(&device) }) else {
+                return false;
+            };
+            let sortie = sortie.lock().await;
+            let Some(locale) = sortie
+                .as_any()
+                .downcast_ref::<crate::outputs::local::LocalOutput>()
+            else {
+                return false;
+            };
+            if locale.preampli_garde().is_none() {
+                return false;
+            }
+            locale.liberer_le_preampli_garde();
+            true
+        }
+        #[cfg(not(feature = "local-audio"))]
+        {
+            false
+        }
+    }
+
     /// [`Self::apply_eq_change`], mais qui dit QUAND le réglage atteindra le
     /// son, au lieu d'un booléen à plusieurs sens (#4680).
     ///
