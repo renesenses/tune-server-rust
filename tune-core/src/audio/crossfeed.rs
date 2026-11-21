@@ -1360,8 +1360,18 @@ mod tests {
              mais reste vide, donc muet — un `None` permanent est plus \
              sournois qu'un champ supprimé, car il compile et se teste vert"
         );
+        // TESS T04 — l'étage est exécuté par la chaîne réseau en `f64` : son
+        // adaptateur reçoit le crossfeed du porteur ET figure parmi les étages
+        // que l'exécuteur appelle.
+        const CHAINE_RESEAU: &str = include_str!("../orchestrator/chaine_reseau_tess.rs");
         assert!(
-            ORCHESTRATEUR.contains("cf.process_pcm(pcm, bit_depth, self.channels)"),
+            CHAINE_RESEAU.contains("moteur: crossfeed,")
+                && CHAINE_RESEAU.contains(
+                    "let mut etages: [&mut dyn EtageTess; 3] = [&mut a_eq, &mut a_conv, &mut a_cf];"
+                )
+                && CHAINE_RESEAU.contains(
+                    "par_tranches_f32(&mut t[..trames * 2], 2, |f| c.process_interleaved(f));"
+                ),
             "`StreamingDsp::process` n'applique plus le crossfeed : il est \
              chargé, transporté, et jeté sans être exécuté"
         );
