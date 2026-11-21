@@ -283,6 +283,38 @@ fn params_upsampling(u: &Upsampling) -> Option<Value> {
     }
 }
 
+/// Les membres décochés marqués [`super::migration::MARQUE_REMPLACE`] dont le
+/// gagnant nommé ne traite pas dans cette résolution : absent ou décoché, ou
+/// coché mais éteint faute de paquet chargé (`plugin_unavailable`) ou de
+/// Premium (`premium_required`). Un gagnant éteint par un blocage global
+/// (Pure, Bypass all, DSD natif, hors TESS) n'en fait pas revenir : le
+/// remplaçant le serait tout autant. Rend `(indice, gagnant)`.
+fn membres_remplacants(
+    maillons: &[MaillonGreffon],
+    greffons: &[EtapeResolue],
+) -> Vec<(usize, String)> {
+    maillons
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| !m.enabled)
+        .filter_map(|(i, m)| {
+            let gagnant = m
+                .settings
+                .get(super::migration::MARQUE_REMPLACE)
+                .and_then(Value::as_str)?;
+            let gagnant_traite = maillons.iter().zip(greffons).any(|(w, e)| {
+                w.id == gagnant
+                    && w.enabled
+                    && !matches!(
+                        e.reason,
+                        Some(MotifEtape::PluginUnavailable | MotifEtape::PremiumRequired)
+                    )
+            });
+            (!gagnant_traite).then(|| (i, gagnant.to_owned()))
+        })
+        .collect()
+}
+
 impl ChaineTess {
     /// Résout la chaîne pour une zone et un flux. Ne rejette jamais.
     pub fn resoudre(&self, catalogue: &Catalogue, ctx: &ContexteExecution<'_>) -> Resolution {
@@ -315,14 +347,36 @@ impl ChaineTess {
             .map(|s| serde_json::to_value(s).unwrap_or(Value::Null));
 
         // Greffons.
-        let mut canaux = ctx.source.and_then(|s| s.canaux());
-        let mut greffons: Vec<EtapeResolue> = Vec::with_capacity(self.plugins.len());
-        for m in &self.plugins {
-            greffons.push(self.resoudre_greffon(m, catalogue, ctx, &mut canaux));
-            if let Some(e) = greffons.last_mut()
-                && e.requested
-            {
-                bloque(e);
+        let resoudre_les_greffons = |maillons: &[MaillonGreffon]| -> Vec<EtapeResolue> {
+            let mut canaux = ctx.source.and_then(|s| s.canaux());
+            maillons
+                .iter()
+                .map(|m| {
+                    let mut e = self.resoudre_greffon(m, catalogue, ctx, &mut canaux);
+                    if e.requested {
+                        bloque(&mut e);
+                    }
+                    e
+                })
+                .collect()
+        };
+        let mut greffons = resoudre_les_greffons(&self.plugins);
+        // Groupe crossfeed (suivi de #9088, principes du 18/11 : « aucun
+        // changement audible dû à la migration », « rien de Premium sans
+        // payer ») : un membre que la migration a décoché au profit d'un
+        // gagnant qui ne traite pas ICI — paquet non chargé, Premium absent,
+        // ou gagnant décoché — reprend sa place, comme dans l'ancien moteur.
+        let remplacants = membres_remplacants(&self.plugins, &greffons);
+        if !remplacants.is_empty() {
+            let mut maillons = self.plugins.clone();
+            for (i, _) in &remplacants {
+                maillons[*i].enabled = true;
+            }
+            greffons = resoudre_les_greffons(&maillons);
+            for (i, gagnant) in remplacants {
+                if greffons[i].effective {
+                    greffons[i].detail = Some(format!("Stands in for {gagnant}"));
+                }
             }
         }
         // Groupes exclusifs : le plus prioritaire des effectifs l'emporte.

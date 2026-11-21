@@ -514,6 +514,14 @@ producteur et le rendu transporte des `f64`**, et que la quantification
   `"replaced_in_group": "<gagnant>"` ; leur ancienne clé reste cochée (l'ancien
   moteur applique déjà la priorité). Si le gagnant n'est plus coché (ancienne
   route), le membre écarté est recoché, puis la règle s'applique de nouveau.
+  **À la résolution** (suivi de #9088), un membre ainsi marqué dont le gagnant
+  ne traite pas — éteint `premium_required` (compte gratuit) ou
+  `plugin_unavailable` (paquet installé mais non chargé, disponibilité lue par
+  `natifs_tiers::actif`), ou absent, ou décoché — redevient effectif, avec le
+  détail `Stands in for <gagnant>` : l'ancien moteur jouait alors ce membre,
+  et le gagnant Premium reste éteint. Un gagnant éteint par un blocage global
+  (Pure, Bypass all, DSD natif, hors TESS) ou par `stereo_only` ne fait rien
+  revenir. La chaîne enregistrée ne change pas.
 - **P2** : à la lecture sans Premium, un `equalizer-parametric` **coché**
   devient un `equalizer-graphic` au plus près, sur la grille réglée
   (`eq_expert_bands`), ±12 dB au plus ; deux courbes si les canaux diffèrent.

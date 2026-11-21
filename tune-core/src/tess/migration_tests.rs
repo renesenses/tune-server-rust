@@ -2057,6 +2057,176 @@ fn groupe_b_un_membre_ecarte_revient_quand_son_gagnant_disparait() {
     );
 }
 
+// ── Suivi de #9088 : le membre écarté reprend sa place quand son gagnant
+// ne traite pas (Premium absent, paquet non chargé) ─────────────────────
+
+/// Crossfeed (simple) et Crosstalk cochés, tous deux installés : la
+/// migration garde Crosstalk et décoche le crossfeed, marqué.
+fn crossfeed_et_crosstalk_migres(s: &SettingsRepo, z: i64) -> ChaineTess {
+    installer(s, &["crossfeed", "crosstalk"]);
+    s.set(
+        &format!("zone_{z}_crossfeed"),
+        r#"{"enabled":true,"amount":0.3}"#,
+    )
+    .unwrap();
+    s.set(
+        &format!("zone_{z}_native_plugin_crosstalk"),
+        r#"{"enabled":true,"span_deg":30}"#,
+    )
+    .unwrap();
+    let c = migrer_zone(s, z).unwrap().chaine;
+    assert_eq!(ids(&c), vec![("crossfeed", false), ("crosstalk", true)]);
+    assert_eq!(
+        maillon(&c, "crossfeed").settings["replaced_in_group"],
+        json!("crosstalk")
+    );
+    c
+}
+
+fn etape_de(
+    r: &crate::tess::resolution::Resolution,
+    id: &str,
+) -> crate::tess::resolution::EtapeResolue {
+    r.etapes
+        .iter()
+        .find(|e| e.plugin_id.as_deref() == Some(id))
+        .unwrap()
+        .clone()
+}
+
+#[test]
+fn groupe_b_compte_gratuit_le_crossfeed_remplace_crosstalk_sans_premium() {
+    let (_b, s) = base();
+    let c = crossfeed_et_crosstalk_migres(&s, 43);
+    let dispo = |_: &str| true;
+    // Compte gratuit : Crosstalk (Premium) ne traite pas ; l'ancien moteur
+    // jouait le crossfeed simple, la chaîne migrée aussi.
+    let r = c.resoudre(&catalogue_de_reference(), &contexte_gratuit(&dispo));
+    let ct = etape_de(&r, "crosstalk");
+    assert!(!ct.effective);
+    assert_eq!(ct.reason, Some(MotifEtape::PremiumRequired));
+    let cf = etape_de(&r, "crossfeed");
+    assert!(cf.effective, "{cf:?}");
+    assert_eq!(cf.reason, None);
+    assert_eq!(cf.detail.as_deref(), Some("Stands in for crosstalk"));
+    assert_ne!(r.badge, crate::tess::resolution::Badge::BitPerfect);
+    // Rien de Premium sans payer : Crosstalk reste éteint.
+    assert_eq!(
+        r.etapes
+            .iter()
+            .filter(|e| e.effective && e.plugin_id.is_some())
+            .filter_map(|e| e.plugin_id.as_deref())
+            .collect::<Vec<_>>(),
+        vec!["crossfeed"]
+    );
+    // La chaîne enregistrée n'en dépend pas : toujours Crosstalk coché.
+    assert_eq!(
+        ids(&lire_zone(&s, 43, false).unwrap().chaine),
+        vec![("crossfeed", false), ("crosstalk", true)]
+    );
+}
+
+#[test]
+fn groupe_b_compte_premium_crosstalk_traite_et_le_crossfeed_reste_ecarte() {
+    let (_b, s) = base();
+    let c = crossfeed_et_crosstalk_migres(&s, 44);
+    let dispo = |_: &str| true;
+    let r = c.resoudre(&catalogue_de_reference(), &contexte_premium(&dispo));
+    assert!(etape_de(&r, "crosstalk").effective);
+    let cf = etape_de(&r, "crossfeed");
+    assert!(!cf.effective);
+    assert_eq!(cf.reason, Some(MotifEtape::ReplacedInGroup));
+    assert_eq!(cf.params, Some(json!({"replaced_by": "crosstalk"})));
+}
+
+#[test]
+fn groupe_b_crosstalk_installe_mais_non_charge_le_crossfeed_traite() {
+    let (_b, s) = base();
+    let c = crossfeed_et_crosstalk_migres(&s, 45);
+    // Premium, mais la bibliothèque Crosstalk n'est pas chargée.
+    let non_charge = |id: &str| id != "crosstalk";
+    let r = c.resoudre(&catalogue_de_reference(), &contexte_premium(&non_charge));
+    assert_eq!(
+        etape_de(&r, "crosstalk").reason,
+        Some(MotifEtape::PluginUnavailable)
+    );
+    assert!(etape_de(&r, "crossfeed").effective);
+
+    // Même règle avec la VRAIE disponibilité (`natifs_tiers::actif`) d'un
+    // paquet installé que ce processus n'a jamais chargé : Crossfeed Pro.
+    let (_b, s) = base();
+    let z = 46;
+    installer(&s, &["crossfeed", "crossfeed-pro"]);
+    s.set(&format!("zone_{z}_crossfeed"), r#"{"enabled":true}"#)
+        .unwrap();
+    s.set(
+        &format!("zone_{z}_native_plugin_crossfeed-pro"),
+        r#"{"enabled":true,"profile":"hd800"}"#,
+    )
+    .unwrap();
+    assert!(tune_plugin_native::provider("crossfeed-pro").is_none());
+    let c = migrer_zone(&s, z).unwrap().chaine;
+    assert_eq!(ids(&c), vec![("crossfeed", false), ("crossfeed-pro", true)]);
+    let catalogue = catalogue_de_reference();
+    let reel = |id: &str| match catalogue.get(id).map(|d| d.origin) {
+        Some(crate::tess::greffon::Origine::Package) => crate::audio::natifs_tiers::actif(&s, id),
+        Some(_) => true,
+        None => false,
+    };
+    let r = c.resoudre(&catalogue, &contexte_premium(&reel));
+    assert_eq!(
+        etape_de(&r, "crossfeed-pro").reason,
+        Some(MotifEtape::PluginUnavailable)
+    );
+    assert!(etape_de(&r, "crossfeed").effective);
+}
+
+#[test]
+fn groupe_b_contre_epreuves_le_membre_ecarte_ne_revient_pas_a_tort() {
+    let (_b, s) = base();
+    let c = crossfeed_et_crosstalk_migres(&s, 47);
+    let dispo = |_: &str| true;
+    // Pure : tout est contourné, le crossfeed ne revient pas.
+    let mut x = contexte_gratuit(&dispo);
+    x.pure = true;
+    let r = c.resoudre(&catalogue_de_reference(), &x);
+    assert!(
+        r.etapes
+            .iter()
+            .all(|e| e.plugin_id.is_none() || !e.effective)
+    );
+    assert_eq!(
+        etape_de(&r, "crossfeed").reason,
+        Some(MotifEtape::ReplacedInGroup)
+    );
+    // Flux 5.1 : Crosstalk éteint pour un motif qui frapperait aussi le
+    // crossfeed (stéréo seulement) : le crossfeed reste écarté.
+    let mut x = contexte_premium(&dispo);
+    x.source = Some(SourceFlux::Pcm {
+        sample_rate_hz: 48_000,
+        bits: 24,
+        channels: 6,
+    });
+    let r = c.resoudre(&catalogue_de_reference(), &x);
+    assert_eq!(
+        etape_de(&r, "crosstalk").reason,
+        Some(MotifEtape::StereoOnly)
+    );
+    assert_eq!(
+        etape_de(&r, "crossfeed").reason,
+        Some(MotifEtape::ReplacedInGroup)
+    );
+    // Décoché par l'utilisateur (aucune marque) : il reste décoché, même
+    // quand Crosstalk ne traite pas.
+    let mut sans_marque = c.clone();
+    sans_marque.plugins[0].settings = json!({"amount": 0.3});
+    let r = sans_marque.resoudre(&catalogue_de_reference(), &contexte_gratuit(&dispo));
+    let cf = etape_de(&r, "crossfeed");
+    assert!(!cf.effective);
+    assert!(!cf.requested);
+    assert_eq!(cf.reason, None);
+}
+
 // ── D1 : l'origine appartient au serveur ────────────────────────────
 
 #[test]
