@@ -1391,6 +1391,9 @@ pub struct PlaybackOrchestrator {
     /// de zones (`zone_groups`) ne compte qu'une écoute par titre. Voir
     /// `ecoute_validee_7852`.
     ecoutes_ecrites: std::sync::Mutex<HashMap<i64, ecoute_validee_7852::EcouteEcrite>>,
+    /// #9143 — le décompte, par zone, des pistes achevées de l'album en
+    /// session, pour le retrait automatique d'« Écouter plus tard ».
+    sas_retrait: Arc<crate::db::ecouter_plus_tard_retrait::SasRetrait>,
     /// #7974 — le suivi du bail d'écoute de chaque zone en lecture. Voir
     /// `bail_parental_7974`.
     ///
@@ -2023,6 +2026,7 @@ impl PlaybackOrchestrator {
             annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
             ecoutes_en_attente: std::sync::Mutex::new(HashMap::new()),
             ecoutes_ecrites: std::sync::Mutex::new(HashMap::new()),
+            sas_retrait: Arc::new(crate::db::ecouter_plus_tard_retrait::SasRetrait::new()),
             suivis_de_bail: std::sync::Mutex::new(HashMap::new()),
             confirmations_du_lecteur: std::sync::Mutex::new(Default::default()),
             #[cfg(feature = "local-audio")]
@@ -2149,6 +2153,43 @@ mod resolve_stream;
 pub mod sentinelle_streaming;
 // #6130 — quitter une radio sur une sortie DLNA : Stop, puis attendre le renderer.
 mod sortie_de_radio_dlna_6130;
+// #8926 — le banc du démarrage d'une radio (tune-stream-http) : le vrai
+// décodeur et la vraie attente de sortie de radio, sans orchestrateur.
+#[doc(hidden)]
+pub mod banc_radio_8926 {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use crate::http::streamer::StreamSession;
+
+    /// Le décodeur de production d'une radio vers DLNA (WAV 16 bits), tel que
+    /// `servir_la_radio_au_reseau` le lance.
+    pub fn decoder_la_station(
+        url: String,
+        tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+        data_ready: Arc<tokio::sync::Notify>,
+        session: Arc<StreamSession>,
+    ) -> Result<(), String> {
+        super::radio::decode_radio_stream_to_pcm(
+            url, tx, data_ready, session, None, None, false, None,
+        )
+    }
+
+    /// L'attente de `dlna_sortie_de_radio` après le congé du direct : rend
+    /// (durée, délai dépassé, renderer qui ne lit plus).
+    pub async fn attendre_le_depart(
+        sessions: &[Arc<StreamSession>],
+        delai: Duration,
+    ) -> (Duration, bool, bool) {
+        let fin =
+            super::sortie_de_radio_dlna_6130::attendre_le_depart_des_consommateurs(sessions, delai)
+                .await;
+        (fin.attente, fin.delai_depasse, fin.renderer_ne_lit_plus)
+    }
+
+    pub const DELAI_FERMETURE_RADIO: Duration =
+        super::sortie_de_radio_dlna_6130::DELAI_FERMETURE_RADIO;
+}
 // #6130 — le contexte d'un flux de conversion, pour son journal.
 mod contexte_de_conversion_6130;
 // #4366 — 403 YouTube : rafraîchir yt-dlp, puis une seule relance.

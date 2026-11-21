@@ -468,7 +468,7 @@ async fn avtransport_control(
                     {
                         Ok(()) => {
                             memoriser_lecture_renderer(&state, zone_id, &session).await;
-                            info!(zone_id, uri = %session.uri, "upnp_renderer_play_resumed");
+                            info!(zone_id, uri = %tune_core::confidentialite::masquer_url(&session.uri), "upnp_renderer_play_resumed");
                             upnp_renderer::empty_response("Play")
                         }
                         Err(e) => {
@@ -525,7 +525,7 @@ async fn avtransport_control(
                         // aucun son ». Le refus remonte comme un échec.
                         Ok(result) if result.sortie_refusee().is_some() => {
                             let motif = result.sortie_refusee().unwrap_or_default();
-                            warn!(zone_id, uri = %session.uri, error = %motif, "upnp_renderer_play_refused_by_output");
+                            warn!(zone_id, uri = %tune_core::confidentialite::masquer_url(&session.uri), error = %motif, "upnp_renderer_play_refused_by_output");
                             tune_core::upnp_server::soap_fault(701, motif)
                         }
                         Ok(result) => {
@@ -540,7 +540,7 @@ async fn avtransport_control(
                                     prendre_la_file_pour_la_courante(&state, zone_id).await;
                                 }
                             }
-                            info!(zone_id, uri = %session.uri, "upnp_renderer_play");
+                            info!(zone_id, uri = %tune_core::confidentialite::masquer_url(&session.uri), "upnp_renderer_play");
                             upnp_renderer::empty_response("Play")
                         }
                         Err(e) => {
@@ -1494,7 +1494,7 @@ async fn enchainer_la_suivante(state: &AppState, zone_id: i64) -> Option<Result<
                 Err(error)
             } else {
                 memoriser_lecture_renderer(state, zone_id, &promoted).await;
-                info!(zone_id, uri = %promoted.uri, "upnp_renderer_gapless_advance");
+                info!(zone_id, uri = %tune_core::confidentialite::masquer_url(&promoted.uri), "upnp_renderer_gapless_advance");
                 Ok(())
             }
         }

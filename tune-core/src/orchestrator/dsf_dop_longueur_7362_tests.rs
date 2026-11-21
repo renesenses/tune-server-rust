@@ -255,7 +255,7 @@ async fn un_dsd_local_a_six_pour_cent_ne_sort_pas_en_dop_8813() {
     );
 }
 
-async fn verifier_baisse_dop_en_cours_8813(en_pause: bool) {
+async fn verifier_baisse_dop_en_cours_8813(en_pause: bool, sourdine: bool) {
     let orch = orchestrateur();
     let dir = tempfile::tempdir().unwrap();
     let fichier = dir.path().join("dop-en-cours.dsf");
@@ -301,7 +301,11 @@ async fn verifier_baisse_dop_en_cours_8813(en_pause: bool) {
     if en_pause {
         orch.pause(zone, Some(appareil)).await.unwrap();
     }
-    orch.set_volume(zone, 0.06, Some(appareil)).await.unwrap();
+    if sourdine {
+        orch.set_mute(zone, true, Some(appareil)).await.unwrap();
+    } else {
+        orch.set_volume(zone, 0.06, Some(appareil)).await.unwrap();
+    }
     if en_pause {
         assert_eq!(
             orch.playback.get_state(zone).await.state,
@@ -329,10 +333,16 @@ async fn verifier_baisse_dop_en_cours_8813(en_pause: bool) {
         .await;
     assert_eq!(
         appels, 2,
-        "#8813 : le DoP reste ouvert malgré la baisse du volume (pause={en_pause})"
+        "#8813/#8842 : le DoP reste ouvert malgré l’atténuation (pause={en_pause}, sourdine={sourdine})"
     );
     let etat = orch.playback.get_state(zone).await;
-    assert!((etat.volume - 0.06).abs() < 1e-6);
+    if sourdine {
+        assert!(etat.muted, "la sourdine reste active après la relecture");
+        assert!(sortie.lock().await.get_status().await.unwrap().muted);
+        assert!((etat.volume - 1.0).abs() < 1e-6);
+    } else {
+        assert!((etat.volume - 0.06).abs() < 1e-6);
+    }
     assert!(etat.position_ms >= 2000, "la reprise garde la position");
     let np = etat.now_playing.unwrap();
     let session = orch
@@ -365,12 +375,12 @@ async fn verifier_baisse_dop_en_cours_8813(en_pause: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn baisser_le_volume_pendant_le_dop_recree_du_pcm_8813() {
-    verifier_baisse_dop_en_cours_8813(false).await;
+    verifier_baisse_dop_en_cours_8813(false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn baisser_le_volume_en_pause_ne_relance_pas_et_reprend_en_pcm_8813() {
-    verifier_baisse_dop_en_cours_8813(true).await;
+    verifier_baisse_dop_en_cours_8813(true, false).await;
 }
 
 async fn verifier_politique_dop_8813(cas: &str, dop_attendu: bool) {
@@ -726,4 +736,121 @@ async fn baisser_le_volume_d_un_dop_upnp_sans_extension_garde_le_format_8813() {
         "#8813 : le flux de remplacement contient encore du DoP"
     );
     serveur.abort();
+}
+
+async fn verifier_plafond_dop_local_8789(cadence: u32, strict: bool, dop_attendu: bool) {
+    let orch = orchestrateur();
+    let dir = tempfile::tempdir().unwrap();
+    let fichier = dir.path().join("plafond-dop.dsf");
+    ecrire_dsf_temoin_7362(&fichier, 16);
+    let mut octets = std::fs::read(&fichier).unwrap();
+    octets[56..60].copy_from_slice(&cadence.to_le_bytes());
+    std::fs::write(&fichier, octets).unwrap();
+    let mut piste = crate::db::models::Track::new("DSD plafond".into());
+    piste.file_path = Some(fichier.to_string_lossy().into_owned());
+    piste.format = Some("dsf".into());
+    piste.sample_rate = Some(cadence as i32);
+    piste.bit_depth = Some(1);
+    piste.channels = 2;
+    piste.duration_ms = i64::from(16 * 4096 * 8 * 1000u32 / cadence);
+    let id = crate::db::track_repo::TrackRepo::with_backend(orch.db.clone())
+        .create(&piste)
+        .unwrap();
+    let zone = 8_789_000 + i64::from(cadence / 1000) + if strict { 100_000 } else { 0 };
+    let appareil = format!("local:plafond-dop-8789-{zone}");
+    orch.db.execute("INSERT INTO zones (id,name,output_type,output_device_id) VALUES (?, 'Banc muet', 'local', ?)", &[&zone, &appareil]).unwrap();
+    let zones = crate::db::zone_repo::ZoneRepo::with_backend(orch.db.clone());
+    zones.update_dsd_mode(zone, "dop").unwrap();
+    zones.update_volume(zone, 100.0).unwrap();
+    orch.playback.set_volume(zone, 1.0).await;
+    if strict {
+        crate::db::settings_repo::SettingsRepo::with_backend(orch.db.clone())
+            .set(&crate::audio::bitperfect_strict::cle_de_zone(zone), "true")
+            .unwrap();
+    }
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new(&appareil, "Sans carte son").with_type("local"),
+    ));
+    let resultat = orch
+        .play(PlayRequest {
+            zone_id: zone,
+            output_device_id: Some(appareil),
+            track_id: Some(id),
+            source: Some("local".into()),
+            ..Default::default()
+        })
+        .await;
+    if strict {
+        assert!(
+            resultat
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.contains("bitperfect_strict_refused")),
+            "#8789 : le strict accepte un DoP au-delà du DSD256 : {resultat:?}"
+        );
+        return;
+    }
+    resultat.expect("lecture factice");
+    let np = orch.playback.get_state(zone).await.now_playing.unwrap();
+    let sid = np.stream_id.as_deref().expect("session servie");
+    let info = orch.streamer.stream_output_wire(sid).await.unwrap();
+    let attendue = if dop_attendu { cadence / 16 } else { 352_800 };
+    let bits = if dop_attendu { 24 } else { 32 };
+    assert_eq!(
+        (info.sample_rate, info.bit_depth),
+        (attendue, bits),
+        "#8789 : le DSD512 tente encore une cadence DoP impossible au lieu du PCM"
+    );
+    let session = orch
+        .streamer
+        .sessions_state()
+        .lock()
+        .await
+        .get(sid)
+        .cloned()
+        .unwrap();
+    let entete = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut v = Vec::new();
+        while v.len() < 44 {
+            v.extend(session.recv_chunk().await.expect("octets servis"));
+        }
+        v
+    })
+    .await
+    .unwrap();
+    assert_eq!(&entete[..4], b"RIFF");
+    assert_eq!(
+        u32::from_le_bytes(entete[24..28].try_into().unwrap()),
+        attendue
+    );
+    assert_eq!(
+        u16::from_le_bytes(entete[34..36].try_into().unwrap()),
+        bits as u16
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn le_dsd512_local_sans_plafond_se_replie_en_pcm_8789() {
+    for cadence in [22_579_200, 24_576_000] {
+        verifier_plafond_dop_local_8789(cadence, false, false).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn le_strict_refuse_le_dop_au_dela_du_dsd256_8789() {
+    for cadence in [22_579_200, 24_576_000] {
+        verifier_plafond_dop_local_8789(cadence, true, false).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn le_dop_dsd256_des_deux_familles_reste_permis_8789() {
+    for cadence in [11_289_600, 12_288_000] {
+        verifier_plafond_dop_local_8789(cadence, false, true).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sourdine_pendant_le_dop_recree_du_pcm_8842() {
+    verifier_baisse_dop_en_cours_8813(false, true).await;
 }

@@ -386,3 +386,75 @@ async fn une_tache_de_telechargement_disparue_libere_le_lecteur_7266() {
     assert!(fin.is_err());
     assert!(!suivi.en_cours() && !suivi.est_complet());
 }
+
+// ── #8795 : fichier partiel d'un téléchargement abandonné ───────────────
+
+/// Une tâche de préchargement abandonnée en plein téléchargement (Suivant
+/// sur une sortie locale) ne laisse pas son fMP4 partiel sur le disque.
+///
+/// Contre-épreuve : un `rendre()` juste après `armer` (garde désarmée) fait
+/// tomber ce test.
+#[tokio::test]
+async fn un_telechargement_abandonne_ne_laisse_pas_son_fichier_8795() {
+    let (base, compteurs) = faux_cdn(None).await;
+    let tache = tokio::spawn(async move {
+        TidalService::new()
+            .download_dash_segments(&segments(&base), "8795-abandon")
+            .await
+    });
+    for _ in 0..200 {
+        if compteurs.demandes.load(Ordering::SeqCst) > 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let chemin = partiels_8795::chemin("8795-abandon").expect("fichier partiel créé");
+    assert!(
+        std::path::Path::new(&chemin).exists(),
+        "prémisse : partiel sur le disque"
+    );
+    tache.abort();
+    let _ = tache.await;
+    assert!(
+        !std::path::Path::new(&chemin).exists(),
+        "le fMP4 partiel d'un téléchargement abandonné reste sur le disque (#8795)"
+    );
+}
+
+/// Un téléchargement mené à son terme garde son fichier : il appartient au
+/// cache d'URL ou au préchargement.
+#[tokio::test]
+async fn un_telechargement_complet_garde_son_fichier_8795() {
+    let (base, _) = faux_cdn(None).await;
+    let chemin = TidalService::new()
+        .download_dash_segments(&segments(&base), "8795-complet")
+        .await
+        .unwrap();
+    assert!(std::path::Path::new(&chemin).exists());
+    let _ = std::fs::remove_file(&chemin);
+}
+
+/// Un fichier épinglé par une zone (#8701) n'est jamais supprimé par la
+/// garde, même armée.
+#[test]
+fn la_garde_epargne_un_fichier_epingle_8795() {
+    let dossier = crate::test_scratch::scratch_dir("dash-8795-epingle");
+    let chemin = dossier
+        .path()
+        .join("tune-dash-8795-epingle.mp4")
+        .to_string_lossy()
+        .to_string();
+    std::fs::write(&chemin, b"partiel").unwrap();
+    let zone = 879_501;
+    crate::audio::dash_epingles::noter_la_piste_resolue(zone, Some(&format!("file://{chemin}")));
+    drop(FichierDashPartiel::armer(&chemin, "8795-epingle"));
+    let reste = std::path::Path::new(&chemin).exists();
+    crate::audio::dash_epingles::liberer_la_zone(zone);
+    assert!(reste, "la garde a supprimé un fichier épinglé");
+
+    drop(FichierDashPartiel::armer(&chemin, "8795-epingle"));
+    assert!(
+        !std::path::Path::new(&chemin).exists(),
+        "désépinglé et non rendu : supprimé"
+    );
+}

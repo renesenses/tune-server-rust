@@ -92,3 +92,62 @@ fn l_etat_sort_dans_le_statut_serialise() {
         "absent plutôt que faux : {json}"
     );
 }
+
+/// Chaque fil de rendu cpal demande l'ordonnancement temps réel : tout appel
+/// à `build_output_stream`/`build_output_stream_raw` des sorties locales doit
+/// armer une sentinelle neuve et l'appeler en tête de son rappel. La sortie
+/// double (seconde sortie B) et le DSD natif ALSA en étaient privés.
+#[test]
+fn chaque_fil_de_rendu_cpal_demande_le_temps_reel() {
+    let sources: [(&str, &str); 5] = [
+        ("local.rs", include_str!("../local.rs")),
+        ("local/backend.rs", include_str!("backend.rs")),
+        (
+            "local/bras_alsa_natif.rs",
+            include_str!("bras_alsa_natif.rs"),
+        ),
+        ("local/bras_alsa_dsd.rs", include_str!("bras_alsa_dsd.rs")),
+        (
+            "local/sortie_double_locale.rs",
+            include_str!("sortie_double_locale.rs"),
+        ),
+    ];
+    let mut appels = 0;
+    let mut fautifs = Vec::new();
+    for (nom, source) in sources {
+        let lignes: Vec<&str> = source.lines().collect();
+        for (i, ligne) in lignes.iter().enumerate() {
+            let code = ligne.trim_start();
+            if code.starts_with("//") {
+                continue;
+            }
+            if !(code.contains(".build_output_stream(")
+                || code.contains(".build_output_stream_raw("))
+            {
+                continue;
+            }
+            appels += 1;
+            let avant = &lignes[i.saturating_sub(12)..i];
+            let armee = avant
+                .iter()
+                .any(|l| l.contains("let mut promotion = PromotionDuFilDeRendu::nouvelle();"));
+            // Le rappel ouvre deux ou trois lignes plus bas ; sa première
+            // instruction est la demande.
+            let apres = &lignes[i + 1..(i + 6).min(lignes.len())];
+            let demandee = apres
+                .iter()
+                .any(|l| l.trim() == "promotion.a_la_premiere_periode();");
+            if !(armee && demandee) {
+                fautifs.push(format!("{nom}:{}", i + 1));
+            }
+        }
+    }
+    assert_eq!(
+        appels, 6,
+        "six ouvertures de flux cpal attendues dans les sorties locales"
+    );
+    assert!(
+        fautifs.is_empty(),
+        "fil de rendu sans promotion temps réel : {fautifs:?}"
+    );
+}

@@ -181,11 +181,9 @@ async fn status(_admin: RequireAdmin, State(state): State<AppState>) -> Response
     let tiers = third_party_ids().into_iter().map(|id| (id, true));
     let mut plugins = Vec::new();
     for (id, third_party) in integres.chain(tiers) {
-        // #9151 — ce que ce processus a réellement monté (routes
-        // `/api/v1/ext/<id>`), et le droit que les routes exigent.
-        let charge = crate::routes::plugins::greffon_charge(&state, &id);
+        // #9151 — le droit que les routes exigent.
         let licence = state.license.check_feature(feature(&id)).await;
-        plugins.push(fiche_d_etat(&settings, &id, third_party, charge, licence));
+        plugins.push(fiche_d_etat(&settings, &id, third_party, licence));
     }
     Json(json!({"abi":1,"target":tune_plugin_native::package::host_target(),"trust_configured":trusted_keys().is_ok_and(|v|!v.is_empty()),"plugins":plugins})).into_response()
 }
@@ -199,18 +197,16 @@ async fn status(_admin: RequireAdmin, State(state): State<AppState>) -> Response
 /// point 3). D'où quatre champs :
 /// - `engine` : `"native"` (paquet chargé), `"bundled"` (intégré, moteur
 ///   embarqué) ou `null` (greffon tiers sans bibliothèque chargée) ;
-/// - `restart_required` : voulu actif mais pas encore monté par ce
-///   processus. Un intégré facultatif (`upsampler`, `channel-remap`)
-///   installé en cours de session a ses réglages à `true`, mais ses routes
-///   `/api/v1/ext/<id>` ne se montent qu'au démarrage (`setup_all`) ; un
-///   tiers ne charge sa bibliothèque qu'au démarrage ;
+/// - `restart_required` : voulu actif mais pas encore en service. Seul un
+///   tiers est dans ce cas : il ne charge sa bibliothèque qu'au démarrage.
+///   Un intégré agit dès l'installation, ses portes lisant ses réglages à
+///   chaque appel ([`crate::premium_audio_plugins::agit_sans_redemarrage`]) :
+///   l'upsampler installé en cours de session marche aussitôt, et n'attend
+///   aucun redémarrage (#9151) ;
 /// - `licensed` : le droit que ses routes exigent (`require_premium`) ;
 /// - `active` : voulu ([`premium_plugins::enabled`] pour un intégré,
-///   [`natifs_tiers::actif`] pour un tiers), monté (`charge`) ET couvert par
-///   la licence. Faux tant qu'un redémarrage est attendu.
-///
-/// `charge` : [`crate::routes::plugins::greffon_charge`] pour un intégré
-/// (sans effet pour un tiers, dont le chargement est `native_loaded`).
+///   [`natifs_tiers::actif`] — demandé ET chargé — pour un tiers) ET couvert
+///   par la licence.
 ///
 /// [`premium_plugins::enabled`]: tune_core::audio::premium_plugins::enabled
 /// [`natifs_tiers::actif`]: tune_core::audio::natifs_tiers::actif
@@ -218,7 +214,6 @@ pub(crate) fn fiche_d_etat(
     settings: &tune_core::db::settings_repo::SettingsRepo,
     id: &str,
     third_party: bool,
-    charge: bool,
     licence: bool,
 ) -> serde_json::Value {
     // `version` : celle du catalogue à l'installation, `null` pour un
@@ -237,10 +232,8 @@ pub(crate) fn fiche_d_etat(
             tune_core::audio::natifs_tiers::actif(settings, id),
         )
     } else {
-        (
-            tune_core::audio::premium_plugins::enabled(settings, id),
-            charge,
-        )
+        let voulu = tune_core::audio::premium_plugins::enabled(settings, id);
+        (voulu, voulu)
     };
     // Un échec de chargement n'attend pas un redémarrage : il le dit par `error`.
     let restart_required = voulu && !monte && error.is_none();
@@ -355,9 +348,9 @@ pub(crate) async fn install_package(
     }
     Ok(package)
 }
-/// Le droit qui ouvre un emplacement. Le droit gratuit (`DspEq`) n'appartient
-/// qu'à l'égaliseur, nommément ; tout autre identifiant, greffon natif tiers
-/// compris, exige le Premium.
+/// Le droit qui ouvre un emplacement. Égaliseur, canaux et crossfeed simple
+/// sont gratuits ; les autres identifiants, dont Crossfeed Pro et les
+/// greffons natifs tiers, exigent le Premium.
 pub(crate) fn feature(id: &str) -> tune_core::license::Feature {
     match id {
         "equalizer" | "channel-remap" => tune_core::license::Feature::DspEq,
@@ -653,6 +646,33 @@ mod cle_de_mozaiklabs_5149 {
 #[cfg(test)]
 #[path = "native_audio_desinstallation_6256_tests.rs"]
 mod desinstallation_6256_tests;
+
+#[cfg(test)]
+mod crossfeed_gratuit_9210_tests {
+    #[tokio::test]
+    async fn simple_autorise_pro_refuse_en_free() {
+        use tune_core::license::Feature;
+        crate::premium_audio_plugins::tests::dossier_de_donnees_jetable();
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        assert_eq!(super::feature("crossfeed-pro"), Feature::PluginMarketplace);
+        let refusal =
+            crate::premium_guard::require_premium(&state.license, super::feature("crossfeed-pro"))
+                .await
+                .unwrap_err();
+        assert_eq!(refusal.status(), axum::http::StatusCode::PAYMENT_REQUIRED);
+        assert!(
+            crate::premium_guard::require_premium(&state.license, super::feature("crossfeed"))
+                .await
+                .is_ok()
+        );
+        state.license.set_account_premium(true, None).await;
+        assert!(
+            crate::premium_guard::require_premium(&state.license, super::feature("crossfeed-pro"))
+                .await
+                .is_ok()
+        );
+    }
+}
 
 #[cfg(test)]
 #[path = "native_audio_etat_9151_tests.rs"]

@@ -356,7 +356,7 @@ impl PlaybackOrchestrator {
         if inner == url.trim() {
             return None; // playlist pointed back at itself — nothing gained
         }
-        info!(playlist = %url, stream = %inner, "radio_playlist_dereferenced");
+        info!(playlist = %crate::confidentialite::masquer_url(&url), stream = %inner, "radio_playlist_dereferenced");
         Some(inner)
     }
 
@@ -1159,6 +1159,13 @@ impl PlaybackOrchestrator {
         ZoneRepo::with_backend(self.db.clone())
             .update_muted(zone_id, muted)
             .map_err(|message| OutputCommandError::failed(OutputCommand::SetMute, message))?;
+        // #8842 — une sourdine logicielle exige du PCM : ne jamais modifier
+        // les marqueurs du DoP qui était déjà en lecture.
+        if muted {
+            self.proteger_le_dop_en_lecture(zone_id)
+                .await
+                .map_err(|message| OutputCommandError::failed(OutputCommand::SetMute, message))?;
+        }
         Ok(())
     }
 

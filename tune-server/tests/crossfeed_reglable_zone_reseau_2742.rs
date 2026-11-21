@@ -142,15 +142,23 @@ async fn une_zone_reseau_sans_opt_in_laisse_regler_intensite_et_retard() {
     );
 }
 
-/// Contre-témoin : les DROITS verrouillent toujours, sur la même zone. Le
-/// correctif ne lève que le verrou de l'opt-in, pas celui de la licence.
+/// #9210 : le crossfeed simple reste réglable en Free sur la même zone.
 #[tokio::test]
-async fn sans_premium_la_meme_zone_reste_verrouillee_par_les_droits() {
+async fn sans_premium_la_meme_zone_garde_le_crossfeed_simple_gratuit() {
     let (app, _, reseau) = app(false).await;
     let corps = lire(&app, reseau).await;
     let st = &corps["crossfeed_status"];
-    assert_eq!(st["unavailable"].as_bool(), Some(true), "{st}");
-    assert_eq!(st["reason"].as_str(), Some("premium_required"), "{st}");
+    assert_eq!(st["unavailable"].as_bool(), Some(false), "{st}");
+    let (status, ecrit) = ecrire(&app, reseau).await;
+    assert_eq!(status, StatusCode::OK, "{ecrit}");
+    assert_eq!(
+        ecrit["crossfeed_status"]["effective"].as_bool(),
+        Some(true),
+        "{ecrit}"
+    );
+    let relu = lire(&app, reseau).await;
+    assert_eq!(relu["crossfeed"]["amount"].as_f64(), Some(0.4), "{relu}");
+    assert_eq!(relu["crossfeed"]["delay_ms"].as_f64(), Some(0.7), "{relu}");
 }
 
 /// Contre-témoin : la sortie locale reste nominale, sans motif.

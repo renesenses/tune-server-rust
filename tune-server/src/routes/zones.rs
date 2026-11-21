@@ -271,6 +271,13 @@ struct PatchZone {
     /// être atténué. Activé par défaut, sans effet sous PURE ou strict.
     dsd_volume_protection: Option<bool>,
 
+    /// #8869 — silence de verrouillage (ms, 0 à 2000) inséré devant le flux
+    /// d'une sortie LOCALE quand son format change (cadence, canaux, PCM /
+    /// DoP / DSD natif). Persisté en setting
+    /// `zone_{id}_silence_verrouillage_ms` ; `0` supprime la clé (défaut).
+    /// Borné côté serveur. Pris en compte à la lecture suivante.
+    silence_verrouillage_ms: Option<i64>,
+
     /// #3245 — mode exclusif de CETTE zone, pour l'appareil local qu'elle
     /// joue. Persisté en setting `zone_{id}_exclusive_mode`. `null` efface :
     /// la zone suit à nouveau le réglage de machine `local_exclusive_mode`.
@@ -460,6 +467,15 @@ fn inject_device_identity(
     obj.insert(
         "dsd_volume_protection".into(),
         json!(tune_core::audio::dop_ecarte_7265::protection_du_niveau_active(backend, zone_id)),
+    );
+
+    // #8869 — TOUJOURS publié : sa présence dit au client que ce serveur
+    // connaît le réglage.
+    obj.insert(
+        "silence_verrouillage_ms".into(),
+        json!(tune_core::audio::silence_de_verrouillage::lire(
+            backend, zone_id
+        )),
     );
     // #8696 — la période WASAPI exclusive réglée sur la zone. TOUJOURS
     // publiée : `null` dit « Auto », et sa présence dit au client que ce

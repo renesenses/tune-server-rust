@@ -296,6 +296,44 @@ impl Default for TidalService {
 }
 
 impl TidalService {
+    /// #8795 — le fMP4 DASH COMPLET de `track_id` déjà au cache d'URL (y
+    /// compris au-delà du TTL quand une zone l'épingle, #8701), sans rien
+    /// télécharger ni rien demander à TIDAL. `None` : pas d'entrée, une
+    /// adresse signée (pas un fichier), un fichier absent ou vide, ou un
+    /// téléchargement encore en cours. La sonde des VU-mètres d'une piste
+    /// avancée sans blanc s'en contente : sans fichier complet, les aiguilles
+    /// restent figées plutôt que de retélécharger la piste qui joue.
+    pub async fn flux_complet_en_cache(
+        &self,
+        track_id: &str,
+        quality: Option<&str>,
+    ) -> Option<StreamUrl> {
+        let requested_quality = quality.unwrap_or(self.quality.as_str());
+        let cache = self.url_cache.lock().await;
+        let entree = cache.get(&format!("{track_id}:{requested_quality}"))?;
+        let chemin = entree.url.strip_prefix("file://")?;
+        let plein = std::fs::metadata(chemin).is_ok_and(|m| m.len() > 0);
+        let complet = entree.suivi.as_ref().is_none_or(|s| s.est_complet());
+        (plein && complet).then(|| entree.stream_url())
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn mettre_au_cache_8795(&self, track_id: &str, quality: &str, url: &str) {
+        self.url_cache.lock().await.set(
+            format!("{track_id}:{quality}"),
+            CachedUrl {
+                url: url.to_string(),
+                mime_type: "audio/mp4".into(),
+                codec: "FLAC".into(),
+                sample_rate: 44_100,
+                bit_depth: 16,
+                bitrate: None,
+                created: Instant::now(),
+                suivi: None,
+            },
+        );
+    }
+
     pub fn new() -> Self {
         Self {
             client: crate::http::client::builder()
@@ -388,7 +426,7 @@ impl TidalService {
         let total = segments.segment_count;
         info!(
             track_id,
-            init_url = segments.init_url.as_str(),
+            init_url = %crate::confidentialite::masquer_url(&segments.init_url.as_str()),
             segment_count = total,
             start_number = segments.start_number,
             "tidal_dash_multi_segment_download_starting"
@@ -433,6 +471,10 @@ impl TidalService {
             .to_string_lossy()
             .to_string();
 
+        // #8795 — jusqu'à ce qu'il soit rendu, le fichier est partiel : une
+        // tâche abandonnée (Suivant pendant un préchargement) ou une erreur
+        // en cours de route le supprime au lieu de le laisser sur le disque.
+        let mut partiel = FichierDashPartiel::armer(&tmp_path, track_id);
         {
             use std::io::Write;
             let mut file =
@@ -536,6 +578,8 @@ impl TidalService {
                         track_id: track_id.to_string(),
                         start,
                     }));
+                    // La suite appartient à `GardeCroissance`.
+                    partiel.rendre();
                     return Ok((tmp_path, Some(suivi)));
                 }
                 Some(raison) => {
@@ -593,6 +637,7 @@ impl TidalService {
             "tidal_dash_multi_segment_download_complete"
         );
 
+        partiel.rendre();
         Ok((tmp_path, None))
     }
 
@@ -2003,6 +2048,30 @@ impl TidalService {
             .unwrap_or_default()
     }
 
+    /// #9119 — le refus que TIDAL rend À LA PLACE d'une liste.
+    ///
+    /// `api_get` lit le corps de toute réponse autre que 401 : un 404 ou un
+    /// 400 de TIDAL arrive ici sous la forme `{"status": 404, "subStatus":
+    /// 2001, "userMessage": "…"}`. Lu comme une liste, il donnait `items`
+    /// absent, donc une liste VIDE servie en 200 : un genre que TIDAL refuse
+    /// pour le pays du catalogue (« Polish » avec `countryCode=PL`)
+    /// s'affichait vide, sans erreur ni trace. `None` pour une vraie liste,
+    /// même vide.
+    fn refus_de_tidal(data: &serde_json::Value) -> Option<String> {
+        if !data["items"].is_null() {
+            return None;
+        }
+        let statut = data["status"].as_u64().filter(|s| *s >= 400)?;
+        let message = data["userMessage"]
+            .as_str()
+            .filter(|m| !m.is_empty())
+            .unwrap_or("refus sans message");
+        let sous_statut = data["subStatus"]
+            .as_u64()
+            .map(|s| format!(" ({s})"))
+            .unwrap_or_default();
+        Some(format!("tidal {statut}{sous_statut}: {message}"))
+    }
     fn map_genre(item: &serde_json::Value) -> StreamGenre {
         StreamGenre {
             id: item["path"].as_str().unwrap_or("").into(),
@@ -2150,7 +2219,7 @@ impl StreamingService for TidalService {
                 serde_json::from_str(&body).map_err(|e| format!("parse device auth: {e}"))?;
             info!(
                 user_code = %device_auth.user_code,
-                uri = %device_auth.verification_uri_complete,
+                uri = %crate::confidentialite::masquer_url(&device_auth.verification_uri_complete),
                 expires_in = device_auth.expires_in,
                 "tidal_device_auth_started"
             );
@@ -2280,7 +2349,7 @@ impl StreamingService for TidalService {
         let state = Self::generate_state();
         let authorize_url = Self::build_authorize_url(&challenge, &state);
 
-        info!(url = %authorize_url, "tidal_pkce_auth_started");
+        info!(url = %crate::confidentialite::masquer_url(&authorize_url), "tidal_pkce_auth_started");
 
         self.pending_pkce = Some(PkceState {
             code_verifier: verifier,
@@ -2456,7 +2525,7 @@ impl StreamingService for TidalService {
                     _ => {
                         tracing::info!(
                             track_id,
-                            path = %cached.url,
+                            path = %crate::confidentialite::masquer_url(&cached.url),
                             "tidal_dash_cache_stale_redownloading"
                         );
                         None
@@ -2706,14 +2775,14 @@ impl StreamingService for TidalService {
                 if url_len < 30 {
                     warn!(
                         track_id,
-                        url = dash.url.as_str(),
+                        url = %crate::confidentialite::masquer_url(&dash.url.as_str()),
                         url_len,
                         "tidal_dash_suspicious_short_url"
                     );
                 }
                 info!(
                     track_id,
-                    url = dash.url.as_str(),
+                    url = %crate::confidentialite::masquer_url(&dash.url.as_str()),
                     url_len,
                     dash_codec = dash.codec.as_deref().unwrap_or("none"),
                     dash_mime = dash.mime_type.as_deref().unwrap_or("none"),
@@ -2849,7 +2918,7 @@ impl StreamingService for TidalService {
         // where the URL might point to the manifest itself instead of audio data.
         debug!(
             track_id,
-            final_url = url.as_str(),
+            final_url = %crate::confidentialite::masquer_url(&url.as_str()),
             url_len = url.len(),
             codec,
             mime_type,
@@ -3049,11 +3118,55 @@ impl StreamingService for TidalService {
                 urlencoding::encode(genre_id)
             ))
             .await?;
+        // #9119 — un refus de TIDAL est une erreur, pas un genre vide.
+        if let Some(refus) = Self::refus_de_tidal(&data) {
+            warn!(genre = %genre_id, pays = %self.pays_effectif(), refus = %refus, "tidal_genre_albums_refuse");
+            return Err(TuneError::Streaming(refus));
+        }
         let albums = data["items"]
             .as_array()
             .map(|items| items.iter().map(Self::map_album).collect())
             .unwrap_or_default();
         Ok(albums)
+    }
+    /// #9119 — les playlists éditoriales d'un genre TIDAL
+    /// (`/genres/{path}/playlists`), que l'écran Genres demande à côté des
+    /// albums (`/featured-playlists?genre=`, #5313). Sans elles, un genre que
+    /// TIDAL ne garnit que de playlists — les genres locaux qu'ajoute le pays
+    /// du catalogue — ouvrait une page vide.
+    ///
+    /// Seule la forme « genre sans tag » est servie ; les autres rendent ce
+    /// qu'elles rendaient (liste vide). Une playlist de genre est un
+    /// complément : un refus de TIDAL laisse la bande absente, il ne fait pas
+    /// échouer l'écran (les albums du genre disent déjà l'erreur).
+    async fn get_featured_playlists(
+        &self,
+        tag: Option<&str>,
+        genre: Option<&str>,
+    ) -> Result<Vec<StreamPlaylist>, TuneError> {
+        let (None, Some(genre_id)) = (tag, genre.filter(|g| !g.is_empty())) else {
+            return Ok(vec![]);
+        };
+        let data = self
+            .api_get(&format!(
+                "/genres/{}/playlists?limit=50",
+                urlencoding::encode(genre_id)
+            ))
+            .await?;
+        if let Some(refus) = Self::refus_de_tidal(&data) {
+            warn!(genre = %genre_id, pays = %self.pays_effectif(), refus = %refus, "tidal_genre_playlists_refuse");
+            return Ok(vec![]);
+        }
+        Ok(data["items"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(Self::map_playlist)
+                    .filter(|p| !p.id.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     async fn get_featured_sections(&self) -> Result<Vec<FeaturedSection>, TuneError> {
@@ -3821,6 +3934,72 @@ struct EnCroissance {
     written: u64,
     track_id: String,
     start: Instant,
+}
+
+/// #8795 — le fMP4 DASH en cours d'assemblage, tant qu'il n'est pas rendu à
+/// l'appelant. Abandonnée (tâche de préchargement coupée par une lecture) ou
+/// sortie sur une erreur, la garde supprime le fichier partiel : jusqu'à
+/// ~150 Mo en Hi-Res restaient sinon dans le dossier temporaire jusqu'au
+/// passage du ramasse-miettes. Un fichier rendu (`rendre`) n'est jamais
+/// touché : il appartient alors au cache d'URL, au préchargement
+/// (`dash_complet`) ou à la garde de croissance. Un fichier épinglé par une
+/// zone (#8701) ne l'est pas non plus.
+struct FichierDashPartiel {
+    chemin: Option<String>,
+}
+
+impl FichierDashPartiel {
+    fn armer(chemin: &str, _track_id: &str) -> Self {
+        #[cfg(test)]
+        partiels_8795::noter(_track_id, chemin);
+        Self {
+            chemin: Some(chemin.to_string()),
+        }
+    }
+
+    /// Le fichier est complet ou confié à un autre propriétaire.
+    fn rendre(&mut self) {
+        self.chemin = None;
+    }
+}
+
+impl Drop for FichierDashPartiel {
+    fn drop(&mut self) {
+        let Some(chemin) = self.chemin.take() else {
+            return;
+        };
+        if crate::audio::dash_epingles::est_epingle(&chemin) {
+            return;
+        }
+        if std::fs::remove_file(&chemin).is_ok() {
+            debug!(
+                path = chemin.as_str(),
+                "tidal_dash_fichier_partiel_supprime_8795"
+            );
+        }
+    }
+}
+
+/// Témoins : le chemin du fichier partiel de chaque `track_id` d'essai.
+#[cfg(test)]
+pub(crate) mod partiels_8795 {
+    use std::sync::Mutex;
+    static CHEMINS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+    pub(crate) fn noter(track_id: &str, chemin: &str) {
+        CHEMINS
+            .lock()
+            .unwrap()
+            .push((track_id.to_string(), chemin.to_string()));
+    }
+    pub(crate) fn chemin(track_id: &str) -> Option<String> {
+        CHEMINS
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|(t, _)| t == track_id)
+            .map(|(_, c)| c.clone())
+    }
 }
 
 /// #7266 — la poignée du décodeur, tenue par la tâche de téléchargement. Si
@@ -5921,6 +6100,10 @@ mod pour_vous_8935_tests;
 #[cfg(test)]
 #[path = "tidal_mixes_7822_tests.rs"]
 mod mixes_7822_tests;
+// #9119 — genres du pays du catalogue : refus de TIDAL et playlists du genre.
+#[cfg(test)]
+#[path = "tidal_genres_du_pays_9119_tests.rs"]
+mod genres_du_pays_9119_tests;
 
 // #8481 — le pays du catalogue choisi dans les Réglages.
 #[cfg(test)]

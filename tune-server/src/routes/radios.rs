@@ -478,7 +478,7 @@ fn suggestions_du_catalogue(
         proposees = retenues.len(),
         par_diffuseur,
         par_nom = retenues.len() - par_diffuseur,
-        url_refusee = %url_refusee,
+        url_refusee = %tune_core::confidentialite::masquer_url(&url_refusee),
         "radio_refus_suggestion_catalogue_3664"
     );
 
@@ -1643,7 +1643,7 @@ async fn media_server_radio_audio_head(
             tracing::debug!(
                 radio_id = id,
                 radio = %station.name,
-                amont = %station.url,
+                amont = %tune_core::confidentialite::masquer_url(&station.url),
                 "media_server_radio_head"
             );
             tune_stream_http::live_radio_head_response("audio/wav", &req_headers)
@@ -1702,7 +1702,7 @@ async fn media_server_radio_audio(
     tracing::info!(
         radio_id = id,
         radio = %radio.name,
-        amont = %url,
+        amont = %tune_core::confidentialite::masquer_url(&url),
         stream_id = %stream_id,
         "media_server_radio_stream_started"
     );
@@ -1716,7 +1716,7 @@ async fn media_server_radio_audio(
     tracing::info!(
         radio_id = id,
         radio = %radio.name,
-        amont = %url,
+        amont = %tune_core::confidentialite::masquer_url(&url),
         statut = response.status().as_u16(),
         "media_server_radio_stream_reponse"
     );
@@ -1818,7 +1818,7 @@ async fn create_radio(
     };
     if let Some(existante) = station_du_meme_flux(&connues, &url) {
         tracing::info!(
-            url = %url,
+            url = %tune_core::confidentialite::masquer_url(&url),
             id = ?existante.id,
             station = %existante.name,
             "radio_creation_flux_deja_present"
@@ -2381,7 +2381,7 @@ async fn add_from_web(
             );
         }
         tracing::info!(
-            url = %url,
+            url = %tune_core::confidentialite::masquer_url(&url),
             station = %existante.name,
             "radio_add_from_web_deja_presente"
         );
@@ -2845,7 +2845,7 @@ async fn import_radios_m3u(
             Ok((_, true)) => bilan.imported += 1,
             Ok((_, false)) => bilan.deja_present(),
             Err(e) => {
-                tracing::debug!(url = %entry.path, error = %e, "radio_import_m3u_entry_failed");
+                tracing::debug!(url = %tune_core::confidentialite::masquer_url(&entry.path), error = %e, "radio_import_m3u_entry_failed");
                 // Et pas seulement dans le journal : l'échec d'écriture est
                 // rendu à l'appelant comme les autres rejets.
                 bilan.rejeter(index, &name, &station.url, CODE_ECHEC_ECRITURE, e);
@@ -4604,3 +4604,7 @@ mod tests_recherche_diffuseur_6964;
 #[cfg(test)]
 #[path = "radios_logo_de_lancement_7051_tests.rs"]
 mod tests_logo_de_lancement_7051;
+
+#[cfg(test)]
+#[path = "radios_logos_fip_2862_tests.rs"]
+mod tests_logos_fip_2862;
