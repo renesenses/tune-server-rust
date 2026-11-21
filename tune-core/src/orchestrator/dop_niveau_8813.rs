@@ -114,6 +114,12 @@ impl PlaybackOrchestrator {
     /// Une commande de réglage ne réveille jamais une zone en pause. La
     /// reprise vérifiera à nouveau la protection avant le Resume matériel.
     pub async fn proteger_le_dop_en_lecture(&self, zone_id: i64) -> Result<bool, String> {
+        // #8842/#8863 — le sondeur peut corriger le volume. Ne pas emboîter
+        // toute la relance DoP et ses gardes dans sa future de tick.
+        Box::pin(self.proteger_le_dop_en_lecture_sous_verrou(zone_id)).await
+    }
+
+    async fn proteger_le_dop_en_lecture_sous_verrou(&self, zone_id: i64) -> Result<bool, String> {
         // #8842 — partager la garde des autres relances, puis relire l’état :
         // une commande précédente a pu déjà remplacer le DoP par du PCM.
         let verrou = self.verrou_de_relance(zone_id);

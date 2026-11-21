@@ -579,6 +579,10 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 signal_path,
             )
             .await;
+            // TESS T16 — la vue TESS (A4), rapprochée de ce qui tourne.
+            let signal_path =
+                super::avec_le_chemin_tess(&state.license, &state.backend, z, &ps, signal_path)
+                    .await;
             obj.insert("signal_path".into(), json!(signal_path));
             // #8419 — en lecture groupée, chaque sortie et son étage final.
             super::signal_path_groupe_8419::injecter_les_sorties_du_groupe(&state, zone_id, obj)
@@ -830,6 +834,15 @@ pub(crate) async fn get_zone(
                 let signal_path = super::signal_path_selon_la_sortie(
                     &state,
                     zone.output_device_id.as_deref(),
+                    signal_path,
+                )
+                .await;
+                // TESS T16 — voir la note au site jumeau (`list_zones`).
+                let signal_path = super::avec_le_chemin_tess(
+                    &state.license,
+                    &state.backend,
+                    &zone,
+                    &ps,
                     signal_path,
                 )
                 .await;

@@ -1,0 +1,37 @@
+{
+  "id": "declick-live",
+  "sdk": {
+    "major": 0,
+    "minor": 1
+  },
+  "kind": "dsp",
+  "config_version": 1,
+  "entitlement": "declick",
+  "distribution": "source",
+  "capabilities": [
+    {
+      "id": "audio-process",
+      "version": {
+        "major": 0,
+        "minor": 1
+      },
+      "required": true
+    },
+    {
+      "id": "zone-settings",
+      "version": {
+        "major": 0,
+        "minor": 1
+      },
+      "required": true
+    },
+    {
+      "id": "audio-live-update",
+      "version": {
+        "major": 0,
+        "minor": 1
+      },
+      "required": false
+    }
+  ]
+}

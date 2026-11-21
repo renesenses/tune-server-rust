@@ -652,6 +652,11 @@ pub fn router() -> Router<AppState> {
         )
         .route("/{id}/muted", put(update_muted))
         .route("/{id}/dsp", get(get_zone_dsp).put(set_zone_dsp))
+        // TESS T08 — la chaîne de la zone, son état réel et le catalogue.
+        .route(
+            "/{id}/tess",
+            get(tess::get_zone_tess).put(tess::put_zone_tess),
+        )
         .route("/{id}/eq/response", get(eq_response))
         .route("/{id}/convolver/response", get(convolver_response))
         .route("/{id}/renderer-capabilities", post(renderer_capabilities))
@@ -750,6 +755,9 @@ pub(crate) async fn zones_a_montrer(state: &AppState) -> Vec<Zone> {
 
 mod dsp;
 pub use dsp::*;
+
+// TESS T08 — `GET/PUT /zones/{id}/tess` et `GET /tess/catalog`.
+pub mod tess;
 
 mod lecture;
 pub use lecture::*;
@@ -1812,9 +1820,16 @@ mod signal_path;
 pub(crate) mod signal_path_groupe_8419;
 pub(crate) mod textes_signal;
 pub use signal_path::*;
+// TESS T16 — le bloc `tess` du chemin du signal (maquette A4).
+mod chemin_tess_t16;
+pub use chemin_tess_t16::avec_le_chemin_tess;
 
 mod ecriture;
 pub use ecriture::*;
+// Après `mod ecriture;` : le garde-fou eq_refresh_guard lit les 3 lignes
+// qui précèdent un `mod` pour reconnaître un module de test.
+#[cfg(test)]
+mod chemin_tess_t16_tests;
 
 mod peripheriques;
 mod preconfiguration;

@@ -911,3 +911,17 @@ async fn le_dsd_natif_reste_hors_de_la_protection_dop_relecture_8842() {
         );
     }
 }
+
+#[tokio::test]
+async fn la_future_de_protection_reste_bornee_pile_dop_8842() {
+    let orch = orchestrateur();
+    // La future est construite, jamais exécutée : le volume du sondeur ne
+    // doit pas embarquer toute la machine d'état de la relance DoP.
+    let protection = orch.proteger_le_dop_en_lecture(0);
+    let taille = std::mem::size_of_val(&protection);
+    assert!(
+        taille <= 128,
+        "#8842 : la future de protection DoP occupe {taille} octets (plafond 128) ; \
+         elle gonfle les réglages et la future du sondeur"
+    );
+}

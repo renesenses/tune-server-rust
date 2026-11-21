@@ -1,5 +1,5 @@
 [workspace]
-members = ["tune-plugin-sdk", "tune-plugin-testkit", "cargo-tune-plugin", "tune-plugin-audio-support", "tune-plugin-equalizer", "tune-plugin-crossfeed", "tune-plugin-converter", "tune-plugin-declick", "tune-plugin-channel-remap", "tune-plugin-abi", "tune-plugin-native", "tune-plugin-surechantillonnage"]
+members = ["tune-plugin-sdk", "tune-plugin-testkit", "cargo-tune-plugin", "tune-plugin-audio-support", "tune-plugin-equalizer", "tune-plugin-crossfeed", "tune-plugin-converter", "tune-plugin-declick", "tune-plugin-channel-remap", "tune-plugin-abi", "tune-plugin-native", "tune-plugin-surechantillonnage", "tune-plugin-declick-live"]
 resolver = "2"
 
 [workspace.package]
@@ -19,4 +19,9 @@ tune-plugin-testkit = { path = "tune-plugin-testkit" }
 # 16 coefficients et leur phase minimale par FFT ; sans optimisation, les
 # tests de la crate prennent plusieurs minutes.
 [profile.dev.package.tune-plugin-surechantillonnage]
+opt-level = 2
+
+# TESS T13 : le corpus synthétique (piano, cymbales, clavecin) et le
+# détecteur font des centaines de millions d'opérations par test.
+[profile.dev.package.tune-plugin-declick-live]
 opt-level = 2

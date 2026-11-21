@@ -138,8 +138,9 @@ const SELECTEURS_HORS_LIB: &[&str] = &["--test", "--bench", "--example", "--bin"
 /// Il ne peut que DESCENDRE au fil des rattachements. Le 06/09/2026 il valait
 /// trente ; #3519 et #3520 en ont retiré sept ; #3569 en a retiré dix-huit ;
 /// #3715 en retire les DEUX derniers qui fussent réductibles. Les trois qui
-/// restent sont irréductibles.
-const TEMOINS_SAUTES_TOLERES: usize = 3;
+/// restaient sont irréductibles. TESS T02 (#9025) en ajoute un quatrième,
+/// irréductible lui aussi : la relecture d'une copie de base réelle.
+const TEMOINS_SAUTES_TOLERES: usize = 4;
 
 /// `(fichier, variable, témoins, raison)`.
 ///
@@ -173,6 +174,12 @@ const SAUTS_CONNUS: &[(&str, &str, &[&str], &str)] = &[
         "TUNE_REAL_DB",
         &["merge_scattered_on_a_real_database"],
         "Demande une base de production copiée à la main. Saut assumé.",
+    ),
+    (
+        "tune-core/src/tess/migration_tests.rs",
+        "TUNE_T02_COPIE",
+        &["i3_relecture_d_une_copie_de_base_reelle"],
+        "TESS T02 (#9025) : relit une COPIE de base réelle de testeur, fournie par Bertrand (procédure dans la PR). Rien à embarquer. Saut assumé.",
     ),
 ];
 

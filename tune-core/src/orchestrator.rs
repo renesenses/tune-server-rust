@@ -1721,6 +1721,9 @@ struct StreamingDsp {
     /// du flux ([`Self::process_flux`]). `None` tant que le flux n'a pas
     /// commencé : la première trame est armée à `latency_frames()`.
     convolveur_reste_a_jeter: Option<usize>,
+    /// TESS T04 — l'exécuteur de la chaîne, la quantification finale et leurs
+    /// tampons ([`chaine_reseau_tess`]).
+    tess: chaine_reseau_tess::EtatTess,
 }
 
 impl StreamingDsp {
@@ -1801,90 +1804,68 @@ impl StreamingDsp {
         )
     }
 
-    /// Applique les trois étages EN PLACE.
+    /// Applique la chaîne EN PLACE, sur une piste ENTIÈRE (bras DASH et HTTPS,
+    /// transcodage de fichier) : même longueur en sortie.
+    ///
+    /// TESS T04 — le bloc est décodé une fois en `f64`, passe par l'exécuteur
+    /// TESS et n'est quantifié qu'UNE fois, à la fin
+    /// ([`chaine_reseau_tess`]). Avant, chaque étage requantifiait.
     ///
     /// Sans étage actif, `pcm` n'est pas touché d'un octet : c'est le témoin
     /// anti-régression de l'immense majorité des zones, qui doivent continuer à
-    /// entendre exactement les mêmes échantillons qu'avant ce correctif.
+    /// entendre exactement les mêmes échantillons qu'avant.
     fn process(&mut self, pcm: &mut [u8], bit_depth: u16) {
         // #4407 — l'égaliseur déposé en vol prend la relève à CE bloc.
         if let Some(poste) = self.en_vol.as_ref() {
             poste.relever(&mut self.eq, self.sample_rate, self.channels);
         }
-        if let Some(factor) = self.replaygain {
-            crate::audio::replaygain::apply_gain_pcm(pcm, bit_depth, factor);
+        if !self.is_active() {
+            return;
         }
-        if let Some(eq) = self.eq.as_mut() {
-            eq.process_pcm(pcm, bit_depth);
-        }
-        if let Some(conv) = self.convolver.as_mut() {
-            conv.process_pcm(pcm, bit_depth);
-        }
-        self.etages_apres_convolveur(pcm, bit_depth);
-    }
-
-    /// Les étages qui suivent le convolveur, dans l'ordre de [`Self::process`].
-    fn etages_apres_convolveur(&mut self, pcm: &mut [u8], bit_depth: u16) {
-        // Le crossfeed en DERNIER, comme sur la sortie locale, où il est
-        // appliqué après le convolveur (`local.rs`) : il élargit ou resserre
-        // l'image d'un signal déjà corrigé, il ne corrige pas.
-        if let Some(cf) = self.crossfeed.as_mut() {
-            cf.process_pcm(pcm, bit_depth, self.channels);
-        }
-        // #5071 — la compensation APRÈS tous les étages : elle rend le niveau
-        // moyen qu'ils ont retiré, et sa borne lit la crête qu'ils ont laissée.
-        if let Some(comp) = self.compensation.as_mut() {
-            comp.process_pcm(pcm, bit_depth);
-        }
+        self.traiter_par_tess(pcm, bit_depth, chaine_reseau_tess::Passage::Piste);
     }
 
     /// #7642 — [`Self::process`] pour un flux livré en tampons SUCCESSIFS
     /// (relais du bras progressif).
     ///
-    /// `process` convient à un appel unique sur la piste entière (bras DASH
-    /// et HTTPS) ; enchaîné tampon après tampon, son convolveur, traité comme
-    /// une piste entière à chaque appel, coupait la queue de l'IR à chaque
-    /// frontière (voir `Convolver::process_pcm_en_flux`). Ici le convolveur
-    /// garde son état d'un tampon à l'autre ; le tampon peut raccourcir au
-    /// début du flux, et [`Self::terminer_flux`] rend la fin retenue. Sans
-    /// convolveur, identique à `process` octet pour octet.
+    /// Le convolveur garde son état d'un tampon à l'autre ; l'amorce de sa
+    /// latence est retirée en tête de flux (le tampon peut raccourcir), et
+    /// [`Self::terminer_flux`] rend la fin retenue. Sans convolveur, chaque
+    /// tampon garde sa longueur.
     fn process_flux(&mut self, pcm: &mut Vec<u8>, bit_depth: u16) {
-        let Some(conv) = self.convolver.as_mut() else {
-            self.process(pcm, bit_depth);
-            return;
-        };
-        let reste = self
-            .convolveur_reste_a_jeter
-            .get_or_insert_with(|| conv.latency_frames());
-        // Les étages d'avant le convolveur, dans l'ordre de `process`.
         if let Some(poste) = self.en_vol.as_ref() {
             poste.relever(&mut self.eq, self.sample_rate, self.channels);
         }
-        if let Some(factor) = self.replaygain {
-            crate::audio::replaygain::apply_gain_pcm(pcm, bit_depth, factor);
+        if !self.is_active() {
+            return;
         }
-        if let Some(eq) = self.eq.as_mut() {
-            eq.process_pcm(pcm, bit_depth);
+        let lus = pcm.len();
+        let ecrits = self.traiter_par_tess(pcm, bit_depth, chaine_reseau_tess::Passage::Flux);
+        // Le reste qui n'est pas une trame entière suit la sortie.
+        let trame = usize::from(bit_depth / 8) * self.canaux_du_flux();
+        let utiles = lus.checked_div(trame).map_or(lus, |n| n * trame);
+        if ecrits < utiles {
+            pcm.copy_within(utiles..lus, ecrits);
+            pcm.truncate(ecrits + (lus - utiles));
         }
-        conv.process_pcm_en_flux(pcm, bit_depth, reste);
-        self.etages_apres_convolveur(pcm, bit_depth);
     }
 
     /// #7642 — fin du flux de [`Self::process_flux`] : les trames que la
     /// latence du convolveur retenait encore, passées par les étages qui le
     /// suivent. Vide sans convolveur.
     fn terminer_flux(&mut self, bit_depth: u16) -> Vec<u8> {
-        let Some(conv) = self.convolver.as_mut() else {
+        let Some(conv) = self.convolver.as_ref() else {
             return Vec::new();
         };
-        let reste = self
-            .convolveur_reste_a_jeter
-            .get_or_insert_with(|| conv.latency_frames());
-        let mut queue = conv.terminer_pcm_en_flux(bit_depth, reste);
-        self.etages_apres_convolveur(&mut queue, bit_depth);
+        let trame = usize::from(bit_depth / 8) * self.canaux_du_flux();
+        let mut queue = vec![0u8; conv.latency_frames() * trame];
+        let ecrits = self.traiter_par_tess(&mut queue, bit_depth, chaine_reseau_tess::Passage::Fin);
+        queue.truncate(ecrits);
         queue
     }
 }
+
+mod chaine_reseau_tess;
 
 mod session;
 pub(crate) use session::*;

@@ -1301,6 +1301,15 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
             signal_path,
         )
         .await;
+        // TESS T16 — la vue TESS (A4), rapprochée de ce qui tourne.
+        let signal_path = crate::routes::zones::avec_le_chemin_tess(
+            &state.license,
+            &state.backend,
+            zone,
+            &zone_state,
+            signal_path,
+        )
+        .await;
         v.as_object_mut()
             .unwrap()
             .insert("signal_path".into(), json!(signal_path));

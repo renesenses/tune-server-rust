@@ -42,6 +42,10 @@ pub mod discovery;
 pub mod event_bus;
 pub mod event_types;
 pub mod favorites_sort;
+/// #6522, TESS T16 — greffon natif de test construit et chargé par le banc.
+#[cfg(any(test, feature = "services-factices"))]
+#[doc(hidden)]
+pub mod greffon_natif_de_test;
 pub mod health;
 pub mod health_monitor;
 pub mod http;
@@ -113,6 +117,9 @@ pub mod taches_de_fond;
 /// pour le pourquoi (issue #2156 : une erreur persistante sur `accept()`
 /// saturait un coeur et remplissait le disque au repos).
 pub mod temporisation_reseau;
+/// TESS (Tune Engine for Sound Shaping) : le contrat, types seulement (lot
+/// T01) ; voir `docs/tess/contrat.md`.
+pub mod tess;
 /// Chemins temporaires uniques par appel — voir le module pour le pourquoi
 /// (issue #2864 : deux tests du même binaire se volaient leur fichier).
 ///
