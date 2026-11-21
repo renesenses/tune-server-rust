@@ -1459,9 +1459,8 @@ impl PlaybackOrchestrator {
         // Décider avant de créer la session, sans toucher aux marqueurs.
         if source_format == Some(AudioFormat::Dsd)
             && is_local_output
-            && transport != TransportDsd::Pcm
             && self
-                .attenuation_logicielle_demandee_pour_dop(req.zone_id, req.piste_rg())
+                .attenuation_logicielle_demandee_pour_dop(req.zone_id, transport, req.piste_rg())
                 .await
         {
             let ecart = crate::audio::dop_ecarte_7265::DopEcarte::AttenuationLogicielle;

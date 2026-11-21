@@ -512,6 +512,9 @@ impl OutputTarget for MockOutput {
             entree.notify_one();
             feu_vert.notified().await;
         }
+        // Le nouveau flux n’a pas encore de constat DoP ; les témoins qui
+        // servent du DoP le posent ensuite, comme le détecteur de LocalOutput.
+        self.dop_actif.store(false, Ordering::SeqCst);
         *self.state.lock().await = if self.lecture_en_transition.load(Ordering::Relaxed) {
             TransportState::Transitioning
         } else {
@@ -558,7 +561,8 @@ impl OutputTarget for MockOutput {
     }
 
     async fn stop(&self) -> Result<(), String> {
-        self.dop_actif.store(false, Ordering::SeqCst);
+        // Comme LocalOutput : le dernier constat DoP persiste jusqu’à
+        // l’ouverture du flux suivant, pas seulement jusqu’au stop.
         *self.state.lock().await = TransportState::Stopped;
         self.position_ms.store(0, Ordering::Relaxed);
         self.stop_calls.fetch_add(1, Ordering::Relaxed);

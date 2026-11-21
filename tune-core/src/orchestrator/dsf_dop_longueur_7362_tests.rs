@@ -255,7 +255,7 @@ async fn un_dsd_local_a_six_pour_cent_ne_sort_pas_en_dop_8813() {
     );
 }
 
-async fn verifier_baisse_dop_en_cours_8813(en_pause: bool, sourdine: bool) {
+async fn verifier_baisse_dop_en_cours_8813(en_pause: bool, sourdine: bool, rapproches: bool) {
     let orch = orchestrateur();
     let dir = tempfile::tempdir().unwrap();
     let fichier = dir.path().join("dop-en-cours.dsf");
@@ -301,7 +301,18 @@ async fn verifier_baisse_dop_en_cours_8813(en_pause: bool, sourdine: bool) {
     if en_pause {
         orch.pause(zone, Some(appareil)).await.unwrap();
     }
-    if sourdine {
+    if rapproches {
+        // La première commande attend les 300 ms de fermeture de la sortie.
+        // La seconde arrive dans cette fenêtre, où le vrai constat DoP reste
+        // actif malgré stop. Aucun délai arbitraire dans le témoin.
+        let (volume, mute) = tokio::join!(
+            orch.set_volume(zone, 0.06, Some(appareil)),
+            orch.set_mute(zone, true, Some(appareil)),
+        );
+        volume.expect("#8842 : volume refusé par une relance concurrente");
+        mute.expect("#8842 : sourdine refusée par une relance concurrente");
+        assert!(orch.playback.get_state(zone).await.muted);
+    } else if sourdine {
         orch.set_mute(zone, true, Some(appareil)).await.unwrap();
     } else {
         orch.set_volume(zone, 0.06, Some(appareil)).await.unwrap();
@@ -333,7 +344,7 @@ async fn verifier_baisse_dop_en_cours_8813(en_pause: bool, sourdine: bool) {
         .await;
     assert_eq!(
         appels, 2,
-        "#8813/#8842 : le DoP reste ouvert malgré l’atténuation (pause={en_pause}, sourdine={sourdine})"
+        "#8813/#8842 : une seule relance PCM attendue (pause={en_pause}, sourdine={sourdine}, rapproches={rapproches})"
     );
     let etat = orch.playback.get_state(zone).await;
     if sourdine {
@@ -375,12 +386,12 @@ async fn verifier_baisse_dop_en_cours_8813(en_pause: bool, sourdine: bool) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn baisser_le_volume_pendant_le_dop_recree_du_pcm_8813() {
-    verifier_baisse_dop_en_cours_8813(false, false).await;
+    verifier_baisse_dop_en_cours_8813(false, false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn baisser_le_volume_en_pause_ne_relance_pas_et_reprend_en_pcm_8813() {
-    verifier_baisse_dop_en_cours_8813(true, false).await;
+    verifier_baisse_dop_en_cours_8813(true, false, false).await;
 }
 
 async fn verifier_politique_dop_8813(cas: &str, dop_attendu: bool) {
@@ -600,6 +611,7 @@ async fn le_preampli_garde_apres_coupure_de_l_eq_protege_aussi_le_dop_8813() {
     assert!(
         orch.attenuation_logicielle_demandee_pour_dop(
             zone,
+            crate::orchestrator::TransportDsd::Dop,
             crate::audio::replaygain::PisteRg::AUCUNE
         )
         .await,
@@ -852,5 +864,50 @@ async fn le_dop_dsd256_des_deux_familles_reste_permis_8789() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sourdine_pendant_le_dop_recree_du_pcm_8842() {
-    verifier_baisse_dop_en_cours_8813(false, true).await;
+    verifier_baisse_dop_en_cours_8813(false, true, false).await;
+}
+
+#[tokio::test]
+async fn volume_et_sourdine_rapproches_ne_relancent_le_dop_qu_une_fois_relecture_8842() {
+    verifier_baisse_dop_en_cours_8813(false, false, true).await;
+}
+
+#[tokio::test]
+async fn sourdine_en_pause_attend_la_reprise_en_pcm_8842() {
+    verifier_baisse_dop_en_cours_8813(true, true, false).await;
+}
+
+#[tokio::test]
+async fn le_dsd_natif_reste_hors_de_la_protection_dop_relecture_8842() {
+    use crate::orchestrator::TransportDsd;
+    let orch = orchestrateur();
+    let zones = crate::db::zone_repo::ZoneRepo::with_backend(orch.db.clone());
+    let zone = zones
+        .create("Natif atténué", Some("local"), Some("local:natif-8842"))
+        .unwrap();
+    zones.update_volume(zone, 50.0).unwrap();
+    orch.playback.set_volume(zone, 0.5).await;
+    for transport in [TransportDsd::Natif, TransportDsd::Pcm] {
+        assert!(
+            !orch
+                .attenuation_logicielle_demandee_pour_dop(
+                    zone,
+                    transport,
+                    crate::audio::replaygain::PisteRg::AUCUNE,
+                )
+                .await,
+            "#8842 : un transport hors DoP est converti pour son volume : {transport:?}",
+        );
+    }
+    for transport in [TransportDsd::Dop, TransportDsd::NatifServiEnDop] {
+        assert!(
+            orch.attenuation_logicielle_demandee_pour_dop(
+                zone,
+                transport,
+                crate::audio::replaygain::PisteRg::AUCUNE,
+            )
+            .await,
+            "la protection DoP à 50 % reste active : {transport:?}"
+        );
+    }
 }

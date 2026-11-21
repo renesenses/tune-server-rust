@@ -1,12 +1,18 @@
 //! Protection du niveau demandé avant de choisir le transport DoP local.
-use super::PlaybackOrchestrator;
+use super::{PlaybackOrchestrator, TransportDsd};
 
 impl PlaybackOrchestrator {
     pub(super) async fn attenuation_logicielle_demandee_pour_dop(
         &self,
         zone_id: i64,
+        transport: TransportDsd,
         piste: crate::audio::replaygain::PisteRg<'_>,
     ) -> bool {
+        // #8842 — le DSD réellement natif garde son comportement : cette
+        // protection ne concerne que les porteurs DoP.
+        if !matches!(transport, TransportDsd::Dop | TransportDsd::NatifServiEnDop) {
+            return false;
+        }
         if self.zone_audiophile(zone_id)
             || crate::audio::bitperfect_strict::zone_enabled(&self.db, zone_id)
             || !crate::audio::dop_ecarte_7265::protection_du_niveau_active(&self.db, zone_id)
@@ -88,7 +94,7 @@ impl PlaybackOrchestrator {
             return false;
         };
         if !self
-            .attenuation_logicielle_demandee_pour_dop(zone_id, np.piste_rg())
+            .attenuation_logicielle_demandee_pour_dop(zone_id, TransportDsd::Dop, np.piste_rg())
             .await
         {
             return false;
@@ -108,6 +114,10 @@ impl PlaybackOrchestrator {
     /// Une commande de réglage ne réveille jamais une zone en pause. La
     /// reprise vérifiera à nouveau la protection avant le Resume matériel.
     pub async fn proteger_le_dop_en_lecture(&self, zone_id: i64) -> Result<bool, String> {
+        // #8842 — partager la garde des autres relances, puis relire l’état :
+        // une commande précédente a pu déjà remplacer le DoP par du PCM.
+        let verrou = self.verrou_de_relance(zone_id);
+        let _relance_tenue = verrou.lock().await;
         let etat = self.playback.get_state(zone_id).await;
         if etat.state != crate::playback::PlayState::Playing
             || !self.dop_actif_a_proteger(zone_id).await
