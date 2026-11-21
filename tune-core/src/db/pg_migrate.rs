@@ -344,6 +344,11 @@ const TABLES_NON_COPIEES: &[(&str, &str)] = &[
          les clients UPnP relisent le catalogue",
     ),
     (
+        "artistes_des_credits",
+        "artistes des crédits composés (#9265) : dérivée des seuls noms d'artistes, \
+         recalculée au démarrage suivant",
+    ),
+    (
         "enrich_tentatives",
         "trace des tentatives d'enrichissement (#7983) : la passe la reconstitue ; \
          perdue, elle retente seulement les pistes déjà vues",
@@ -1289,6 +1294,16 @@ CREATE TABLE IF NOT EXISTS radio_titres_diffuses (
  pochette TEXT,
  PRIMARY KEY (ecoute_id, diffuse_le)
 );
+-- Artistes des crédits composés (#9265). Sans script numéroté : présente
+-- ici (bascule) ET dans `ENSURE_TABLES`, mêmes types
+-- (migrations/artistes_des_credits.sql). Non copiée (TABLES_NON_COPIEES).
+CREATE TABLE IF NOT EXISTS artistes_des_credits (
+ credit_id BIGINT NOT NULL,
+ artiste_id BIGINT NOT NULL,
+ rang BIGINT NOT NULL DEFAULT 0,
+ PRIMARY KEY (credit_id, artiste_id)
+);
+CREATE INDEX IF NOT EXISTS idx_artistes_des_credits_artiste ON artistes_des_credits(artiste_id);
 -- « Pas pour moi » de l'accueil (web#916, SQLite 145 / PG 111), par profil.
 CREATE TABLE IF NOT EXISTS suggestions_ecartees (
     profile_id BIGINT NOT NULL DEFAULT 1,

@@ -2399,9 +2399,12 @@ pub(crate) fn releve_portraits_d_artistes(
     cache_dir: &std::path::Path,
 ) -> Option<PortraitsDArtistes> {
     let lignes = backend
+        // #9265 — les portraits des artistes de la GRILLE.
         .query_many(
-            "SELECT image_path, image_source FROM artists \
-             WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)",
+            &format!(
+                "SELECT image_path, image_source FROM artists WHERE {}",
+                tune_core::db::artist_repo::PREDICAT_ARTISTES_DE_LA_GRILLE
+            ),
             &[],
         )
         .ok()?;

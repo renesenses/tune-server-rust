@@ -13,6 +13,8 @@ pub mod apports_service;
 /// #9116 — l'arbre des dossiers de la vue Répertoires, gardé en mémoire.
 pub mod arbre_des_dossiers;
 pub mod artist_repo;
+/// #9265 — les artistes des crédits composés (« A & B », « A feat. C »).
+pub mod artistes_des_credits;
 pub mod backend;
 /// Contrôle parental, étape 2 (#7974) : bail d'écoute et temps écouté.
 pub mod bail_d_ecoute;
