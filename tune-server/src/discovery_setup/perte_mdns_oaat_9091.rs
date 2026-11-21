@@ -17,18 +17,27 @@
 //! répondait sur son port de contrôle.
 //!
 //! Une sortie OAAT perdue en mDNS reste donc inscrite, et sa zone en ligne,
-//! tant que l'endpoint accepte une connexion TCP sur son port de contrôle
-//! (sonde bornée par [`Reglages::delai_sonde`]), sondé à CHAQUE passage, toutes
-//! les [`Reglages::periode`].
+//! tant que :
+//! - une session est vivante (`OaatOutput::session_active`) : AUCUNE sonde
+//!   n'est alors envoyée ;
+//! - ou, sans session, l'endpoint accepte une connexion TCP sur son port de
+//!   contrôle (sonde bornée par [`Reglages::delai_sonde`]).
 //!
-//! Une sonde en échec retire la sortie (arrêt + zone hors ligne) :
-//! - tout de suite sans session ;
-//! - après [`ECHECS_AVANT_RETRAIT_EN_SESSION`] échecs de suite si une session
-//!   est vivante (`OaatOutput::session_active`). Une session ne prouve pas à
-//!   elle seule la présence : l'audio part en UDP (l'envoi réussit vers un
-//!   hôte mort) et la perte du TCP de contrôle n'est que journalisée par
-//!   `oaat-controller`. Une sonde réussie remet le compteur à zéro.
+//! Pourquoi pas de sonde en session : l'endpoint OAAT ne sert qu'UNE
+//! connexion de contrôle et n'appelle pas `accept()` pendant une session
+//! (`oaat-endpoint/src/transport.rs`). Chaque sonde resterait dans sa file
+//! d'attente ; la file pleine (~129 sondes, ~65 min), les SYN sont jetés, la
+//! sonde finit en délai dépassé et la garde couperait une lecture saine.
 //!
+//! LIMITE CONNUE (rc13) : un endpoint débranché en pleine session n'est pas
+//! détecté par cette garde. L'audio part en UDP (l'envoi réussit vers un hôte
+//! mort) et la perte du TCP de contrôle n'est que journalisée par
+//! `oaat-controller` : la zone reste « en lecture » (ou « en pause ») jusqu'au
+//! Stop, puis la garde sonde et retire au premier échec. Le correctif propre
+//! (indicateur « contrôle perdu » exposé par `oaat-controller`, ou sonde sans
+//! connexion TCP) est prévu en rc14.
+//!
+//! La décision est réévaluée toutes les [`Reglages::periode`].
 //! Une nouvelle annonce mDNS lève la garde
 //! ([`GardesOaat::annonce_retrouvee`]) : la découverte reprend alors la main
 //! et conserve la sortie qui joue (`enregistrer_la_sortie_mdns_et_sa_zone`).
@@ -67,25 +76,29 @@ impl Reglages {
     };
 }
 
-/// Sondes en échec DE SUITE au-delà desquelles une sortie en session est
-/// retirée (3 passages, soit ~1 min en production).
-pub(super) const ECHECS_AVANT_RETRAIT_EN_SESSION: u32 = 3;
-/// Passages « sortie occupée » de suite au-delà desquels on alerte.
-pub(super) const PASSAGES_OCCUPEE_AVANT_ALERTE: u32 = 3;
+/// Premier passage « sortie occupée » de suite qui alerte ; ensuite une
+/// alerte tous les [`ALERTE_OCCUPEE_TOUS_LES`] passages.
+pub(super) const PREMIERE_ALERTE_OCCUPEE: u32 = 4;
+pub(super) const ALERTE_OCCUPEE_TOUS_LES: u32 = 10;
+
+/// M2 — faut-il alerter au `n`-ième passage « occupée » de suite ? Au 4e,
+/// puis au 14e, 24e… : pas à chaque passage.
+pub(super) fn alerter_sortie_occupee(n: u32) -> bool {
+    n >= PREMIERE_ALERTE_OCCUPEE && (n - PREMIERE_ALERTE_OCCUPEE) % ALERTE_OCCUPEE_TOUS_LES == 0
+}
 
 /// Ce que la garde décide à chaque passage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Decision {
-    /// Sonde en échec, mais une session OAAT est vivante : on patiente
-    /// jusqu'à [`ECHECS_AVANT_RETRAIT_EN_SESSION`] échecs de suite.
+    /// Une session OAAT est vivante : la zone est gardée SANS sonde (voir
+    /// la limite connue en tête du module).
     GarderSessionActive,
     /// L'endpoint accepte une connexion sur son port de contrôle.
     GarderEndpointJoignable,
     /// La sortie est verrouillée (lecture qui démarre, arrêt en cours) :
     /// on ne tranche pas sans la lire, on repasse plus tard.
     GarderSortieOccupee,
-    /// Sonde en échec sans session, ou trop d'échecs de suite en session :
-    /// vraie absence.
+    /// Sans session, sonde en échec : vraie absence.
     Retirer,
 }
 
@@ -222,8 +235,9 @@ pub(super) struct Passage {
 }
 
 /// Un passage, depuis l'état lu de la sortie (`None` : verrou non obtenu).
-/// La sonde part à CHAQUE passage, session ou non : une session ne prouve
-/// pas la présence (audio en UDP, perte du contrôle seulement journalisée).
+/// En session, AUCUNE sonde : l'endpoint ne lit pas sa file de connexions
+/// de contrôle pendant une session (voir la tête du module). Sans session,
+/// une sonde ; le premier échec retire.
 pub(super) async fn passer(
     etat: Option<&EtatDeSortie>,
     compteurs: &mut Compteurs,
@@ -237,6 +251,13 @@ pub(super) async fn passer(
         };
     };
     compteurs.occupee = 0;
+    if etat.session_active {
+        compteurs.echecs_de_sonde = 0;
+        return Passage {
+            decision: Decision::GarderSessionActive,
+            sonde: None,
+        };
+    }
     let sonde = match &etat.adresse {
         Some((hote, port)) => sonder_le_port_de_controle(hote, *port, reglages.delai_sonde).await,
         None => Sonde::Erreur("adresse de contrôle inconnue".into()),
@@ -249,14 +270,8 @@ pub(super) async fn passer(
         };
     }
     compteurs.echecs_de_sonde += 1;
-    let decision =
-        if etat.session_active && compteurs.echecs_de_sonde < ECHECS_AVANT_RETRAIT_EN_SESSION {
-            Decision::GarderSessionActive
-        } else {
-            Decision::Retirer
-        };
     Passage {
-        decision,
+        decision: Decision::Retirer,
         sonde: Some(sonde),
     }
 }
@@ -340,8 +355,7 @@ async fn garder(ctx: ContextePerte, id: String, sortie: Sortie, generation: u64)
                 "mdns_oaat_sonde_en_echec"
             );
         }
-        if decision == Decision::GarderSortieOccupee
-            && compteurs.occupee > PASSAGES_OCCUPEE_AVANT_ALERTE
+        if decision == Decision::GarderSortieOccupee && alerter_sortie_occupee(compteurs.occupee)
         {
             warn!(
                 id = %id,
@@ -611,57 +625,39 @@ mod tests {
         }
     }
 
-    /// M1 — Pi débranché pendant une radio : la session reste « vivante »
-    /// (audio UDP, contrôle perdu seulement journalisé). La zone est gardée
-    /// aux passages 1 et 2, puis retirée au 3e : elle ne reste plus « en
-    /// lecture » indéfiniment.
+    /// D1 — en session, aucune sonde : l'endpoint ne lit pas sa file de
+    /// connexions de contrôle pendant une session. Le port ÉCOUTE mais
+    /// n'accepte jamais ; après de nombreux passages, la zone est toujours
+    /// gardée et AUCUNE connexion n'attend dans la file.
     #[tokio::test]
-    async fn perte_9091_session_active_port_ferme_retiree_au_troisieme_passage() {
-        let etat = etat_sur(port_ferme().await, true);
+    async fn perte_9091_session_active_aucune_sonde_sur_de_nombreux_passages() {
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let etat = etat_sur(ecoute.local_addr().unwrap().port(), true);
         let mut c = Compteurs::default();
-        for n in 1..ECHECS_AVANT_RETRAIT_EN_SESSION {
+        for n in 1..=200 {
             let p = passer(Some(&etat), &mut c, reglages_rapides()).await;
             assert_eq!(p.decision, Decision::GarderSessionActive, "passage {n}");
-            assert_eq!(p.sonde, Some(Sonde::Refusee), "la cause est connue");
+            assert_eq!(p.sonde, None, "passage {n} : aucune sonde en session");
         }
-        let p = passer(Some(&etat), &mut c, reglages_rapides()).await;
-        assert_eq!(
-            p.decision,
-            Decision::Retirer,
-            "3 sondes en échec de suite : la session ne suffit plus"
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), ecoute.accept())
+                .await
+                .is_err(),
+            "D1 : une sonde en session remplirait la file de l'endpoint"
         );
-        assert_eq!(c.echecs_de_sonde, ECHECS_AVANT_RETRAIT_EN_SESSION);
     }
 
-    /// Une sonde réussie entre deux échecs remet le compteur à zéro.
+    /// Même en session avec un port fermé, la zone reste gardée : la session
+    /// suffit (limite connue M1, correctif en rc14).
     #[tokio::test]
-    async fn perte_9091_session_active_sonde_reussie_remet_le_compteur_a_zero() {
-        let ferme = etat_sur(port_ferme().await, true);
-        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let ouvert = etat_sur(ecoute.local_addr().unwrap().port(), true);
-        let r = reglages_rapides();
+    async fn perte_9091_session_active_port_ferme_toujours_gardee() {
+        let etat = etat_sur(port_ferme().await, true);
         let mut c = Compteurs::default();
-        for _ in 0..2 {
-            assert_eq!(
-                passer(Some(&ferme), &mut c, r).await.decision,
-                Decision::GarderSessionActive
-            );
+        for n in 1..=10 {
+            let p = passer(Some(&etat), &mut c, reglages_rapides()).await;
+            assert_eq!(p.decision, Decision::GarderSessionActive, "passage {n}");
         }
-        let p = passer(Some(&ouvert), &mut c, r).await;
-        assert_eq!(p.decision, Decision::GarderEndpointJoignable);
-        assert_eq!(c.echecs_de_sonde, 0, "sonde réussie : compteur à zéro");
-        for n in 1..ECHECS_AVANT_RETRAIT_EN_SESSION {
-            assert_eq!(
-                passer(Some(&ferme), &mut c, r).await.decision,
-                Decision::GarderSessionActive,
-                "échec {n} après la remise à zéro : encore gardée"
-            );
-        }
-        assert_eq!(
-            passer(Some(&ferme), &mut c, r).await.decision,
-            Decision::Retirer
-        );
-        drop(ecoute);
+        assert_eq!(c.echecs_de_sonde, 0);
     }
 
     /// Sans session, le premier échec retire.
@@ -674,6 +670,17 @@ mod tests {
         assert_eq!(p.sonde, Some(Sonde::Refusee));
     }
 
+    /// Sans session, une sonde réussie garde la zone.
+    #[tokio::test]
+    async fn perte_9091_sans_session_sonde_reussie_garde() {
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let etat = etat_sur(ecoute.local_addr().unwrap().port(), false);
+        let mut c = Compteurs::default();
+        let p = passer(Some(&etat), &mut c, reglages_rapides()).await;
+        assert_eq!(p.decision, Decision::GarderEndpointJoignable);
+        assert_eq!(p.sonde, Some(Sonde::Reussie));
+    }
+
     /// M2 — la sortie verrouillée est comptée de suite ; une lecture
     /// réussie remet le compte à zéro.
     #[tokio::test]
@@ -684,7 +691,8 @@ mod tests {
             assert_eq!(p.decision, Decision::GarderSortieOccupee);
             assert_eq!(c.occupee, n);
         }
-        assert!(c.occupee > PASSAGES_OCCUPEE_AVANT_ALERTE, "seuil d'alerte franchi");
+        let alertes: Vec<u32> = (1..=40).filter(|n| alerter_sortie_occupee(*n)).collect();
+        assert_eq!(alertes, vec![4, 14, 24, 34], "au 4e passage, puis tous les 10");
         let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let etat = etat_sur(ecoute.local_addr().unwrap().port(), false);
         passer(Some(&etat), &mut c, reglages_rapides()).await;
