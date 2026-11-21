@@ -4,7 +4,7 @@ BEGIN;
 INSERT INTO settings (key, value) VALUES ('alarms_timezone', '')
 ON CONFLICT (key) DO NOTHING;
 
-INSERT INTO schema_version (version, name) VALUES (121, 'alarms_timezone')
+INSERT INTO schema_version (version, name) VALUES (124, 'alarms_timezone')
 ON CONFLICT (version) DO NOTHING;
 
 COMMIT;

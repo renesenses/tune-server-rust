@@ -1,6 +1,8 @@
 pub mod aac_encoder;
 pub mod aiff;
 pub mod alac_encoder;
+/// #8968 — amorce et remplissage d'un AAC en MP4 (`iTunSMPB`, `elst`).
+pub(crate) mod amorce_aac;
 pub mod analyzer;
 pub mod ape;
 pub mod audiophile;
@@ -8,6 +10,8 @@ pub mod audit_integrite;
 pub mod autoeq;
 /// #6388 — la base AutoEq en ligne : index, recherche, copie locale.
 pub mod autoeq_base;
+/// #8968 — bornes d'une tranche CUE à l'échantillon près.
+pub mod bornes_cue;
 pub mod canaux_declares;
 pub mod canaux_reseau_4573;
 /// #6385 — les profils d'égaliseur OPRA (JSON), lus vers le même modèle.
@@ -158,6 +162,8 @@ pub mod sacd;
 /// #5297 — une piste d'ISO SACD emprunte le chemin DSD existant (PCM, DoP).
 #[cfg(test)]
 mod sacd_lecture_5297_tests;
+/// #8869 — silence de verrouillage au changement de format (réglage de zone).
+pub mod silence_de_verrouillage;
 /// Rampe de gain anti-« ploc » à la pause / reprise / arrêt (#1590).
 pub mod soft_mute;
 /// Le spectrogramme d'une piste en PNG, calculé sur le PCM décodé (#7857).

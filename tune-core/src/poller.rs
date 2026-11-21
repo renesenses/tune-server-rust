@@ -635,6 +635,10 @@ pub struct PositionPoller {
     /// #6541 — dernier volume rapporté au-dessus de la limite de sécurité,
     /// par zone : la consigne n'est recommandée qu'une fois par valeur.
     volumes_plafonnes: std::sync::Mutex<std::collections::HashMap<i64, f64>>,
+    /// #8920 — Devialet AIR : dernier niveau annoncé (dB d'ampli) au-dessus
+    /// de la limite de sécurité et déjà ramené, par zone : un rappel par
+    /// dépassement, jamais à chaque tour.
+    rappels_air_securite: std::sync::Mutex<std::collections::HashMap<i64, f64>>,
     /// #5662 — zones dont le renderer annonce 100 % sans que Tune l'adopte :
     /// l'épisode est dit une fois (`volume_100_ignore_constate`).
     volumes_100_ignores: std::sync::Mutex<std::collections::HashSet<i64>>,
@@ -684,6 +688,7 @@ impl PositionPoller {
             relances_demarrage_fige: std::sync::Mutex::new(std::collections::HashMap::new()),
             zones_a_position_prouvee: std::sync::Mutex::new(std::collections::HashSet::new()),
             volumes_plafonnes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            rappels_air_securite: std::sync::Mutex::new(std::collections::HashMap::new()),
             volumes_100_ignores: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
@@ -1177,6 +1182,10 @@ mod contrat_radio_locale_6233;
 mod etat_air_6912;
 #[cfg(test)]
 mod etat_air_6912_tests;
+/// #8920 — Devialet AIR monté à la télécommande au-dessus de la limite de
+/// sécurité : le sondeur le ramène à la limite, une fois par dépassement.
+/// Témoins dans `etat_air_6912_tests` (même banc).
+mod rappel_securite_air_8920;
 /// #6739 — un relevé du volume de l'appareil ne fait jamais grimper la
 /// consigne par cliquet ; #7379 — il est suivi sous le plafond de suivi.
 mod releve_ne_monte_pas_6739;
@@ -1252,6 +1261,10 @@ mod gapless_stage_expiry_tests;
 #[cfg(test)]
 mod radio_metadata_deviceless_tests;
 
+/// #8487 — les titres diffusés notés sous leur station, de bout en bout.
+#[cfg(test)]
+mod titres_diffuses_8487_tests;
+
 /// AutoPlay : suivre la source de ce qu'on ecoute (#1553).
 ///
 /// Sandro, 0.9.70 : en ecoute Qobuz, l'autoplay enchainait des titres LOCAUX,
@@ -1260,7 +1273,7 @@ mod radio_metadata_deviceless_tests;
 /// bibliotheque garnie.
 #[cfg(test)]
 mod autoplay_source_tests;
-// Fil 2694 — la radio de fin de file activée par défaut, ses gardes, sa marque.
+// Fil 2694 — la radio de fin de file (défaut coupé depuis #8974), ses gardes, sa marque.
 #[cfg(test)]
 mod radio_fin_de_file_2694_tests;
 

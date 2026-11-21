@@ -1,6 +1,6 @@
 {
-  "productName": "Tune Widget",
-  "version": "0.1.6",
+  "productName": "Tune Client",
+  "version": "0.1.7",
   "identifier": "fr.mozaiklabs.tune-widget",
   "build": {
     "frontendDist": "../src"
@@ -10,7 +10,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Tune Widget",
+        "title": "Tune Client",
         "width": 320,
         "height": 520,
         "resizable": false,

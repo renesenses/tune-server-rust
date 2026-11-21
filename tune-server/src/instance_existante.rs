@@ -110,10 +110,10 @@ pub(crate) fn sonder_tune_sur_le_port(port: u16) -> Option<String> {
 pub(crate) fn ouvrir_le_navigateur(url: &str) {
     #[cfg(target_os = "macos")]
     let _ = std::process::Command::new("open").arg(url).spawn();
+    // #9061 — sous Windows, jamais `start` à l'aveugle : sans navigateur par
+    // défaut, il n'en sortait que « Application introuvable ».
     #[cfg(target_os = "windows")]
-    let _ = std::process::Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .spawn();
+    crate::navigateur_windows::ouvrir(url);
     #[cfg(target_os = "linux")]
     let _ = std::process::Command::new("xdg-open").arg(url).spawn();
     #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]

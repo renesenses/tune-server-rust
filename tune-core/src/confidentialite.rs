@@ -15,7 +15,9 @@
 //!
 //! Ce qui est masqué :
 //! - les adresses électroniques, en clair ou encodées (`%40`) → `<email>` ;
-//! - les identifiants d'une URL (`scheme://user:pass@hôte`) ;
+//! - les identifiants d'une URL (`scheme://user:pass@hôte`) et la valeur de ses
+//!   paramètres sensibles (`?user=…&pass=…`), par [`masquer_url`], qui sert
+//!   aussi aux lignes du journal lui-même ;
 //! - les chemins personnels `/Users/<nom>`, `/home/<nom>`, `C:\Users\<nom>` → `~` ;
 //! - les valeurs des clés secrètes (`token`, `secret`, `password`, `sig`,
 //!   `hmac`, `serial`, `username`…) écrites `clé=valeur`, `clé: valeur` ou en
@@ -36,6 +38,13 @@
 //!   lettres les identifiants propres à CE serveur, retenus par
 //!   [`retenir_identifiants_du_serveur`].
 //!
+//! - les noms d'appareils, de zones et de profils (#9140) : chaque nom retenu
+//!   par [`retenir_nom_d_appareil`] (appareils et serveurs découverts depuis
+//!   le démarrage, zones, profils, nom annoncé du serveur) devient un jeton
+//!   stable, `[appareil 3]`, `[zone 2]`, `[profil 1]` ; en filet, les noms
+//!   personnels reconnus à leur forme (« X’s MacBook », « iPhone de X »,
+//!   « Xs-MacBook-Pro ») aussi. Voir le module `appareils`.
+//!
 //! Ce qui reste, parce que c'est le diagnostic : versions, OS, modèles, type de
 //! serveur, adresses IP du réseau local, ports, compteurs.
 //!
@@ -46,6 +55,9 @@ use std::sync::{LazyLock, RwLock};
 
 use regex::{Captures, Regex};
 use serde_json::Value;
+
+mod appareils;
+pub use appareils::{NUMEROTES_MAX, Registre, Seance, Sorte, est_nom_de_materiel};
 
 pub use crate::secrets::MASQUE;
 
@@ -122,10 +134,12 @@ fn re(motif: &str) -> Regex {
     Regex::new(motif).expect("motif de confidentialité valide")
 }
 
-/// `scheme://utilisateur:motdepasse@` — avant l'adresse électronique, qui
-/// sinon prendrait `motdepasse@hôte.fr` pour une adresse.
+/// `scheme://utilisateur:motdepasse@` (ou `scheme://jeton@`) — avant
+/// l'adresse électronique, qui sinon prendrait `motdepasse@hôte.fr` pour une
+/// adresse. L'information d'utilisateur s'arrête au premier `/`, `?` ou `#` :
+/// un `@` plus loin (`?email=a@b.fr`) n'en fait pas partie.
 static RE_URL_IDENTIFIANTS: LazyLock<Regex> =
-    LazyLock::new(|| re(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s:@]+:[^/\s@]+@"));
+    LazyLock::new(|| re(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@?#]+@"));
 
 /// JSON Web Token : trois segments base64url dont les deux premiers
 /// commencent par `eyJ` (`{"`).
@@ -138,13 +152,111 @@ static RE_JWT: LazyLock<Regex> =
 static RE_PORTEUR: LazyLock<Regex> =
     LazyLock::new(|| re(r"(?i)\b(bearer|basic)\s+([A-Za-z0-9._~+/=-]{6,})"));
 
-/// Paramètres d'URL sensibles, quel que soit leur nom de clé ailleurs — en
-/// requête (`?`, `&`) comme en fragment (`#token=…`).
+/// Noms de paramètres d'URL dont la VALEUR ne sort jamais : identifiants,
+/// mots de passe, jetons, clés, signatures, sessions. Comparés en entier et
+/// sans égard à la casse (`Pass=`, `API_KEY=`) ; le nom reste écrit, seule
+/// la valeur devient [`MASQUE`]. Une seule liste, lue par [`masquer_url`].
+pub const PARAMETRES_URL_SENSIBLES: &[&str] = &[
+    "user",
+    "username",
+    "user_name",
+    "login",
+    "pass",
+    "passwd",
+    "password",
+    "pwd",
+    "token",
+    "access_token",
+    "refresh_token",
+    "id_token",
+    "auth_token",
+    "user_auth_token",
+    "__token__",
+    "key",
+    "api_key",
+    "apikey",
+    "secret",
+    "client_secret",
+    "app_secret",
+    "sig",
+    "request_sig",
+    "signature",
+    "x-amz-signature",
+    "x-amz-credential",
+    "x-amz-security-token",
+    "hdnea",
+    "hdntl",
+    "hmac",
+    "auth",
+    "session",
+    "session_id",
+    "sessionid",
+    "sid",
+    "code",
+    "state",
+    "identity",
+];
+
+/// Paramètres d'URL sensibles ([`PARAMETRES_URL_SENSIBLES`]) — en requête
+/// (`?`, `&`, le `;` d'un `&amp;`) comme en fragment (`#token=…`). La valeur
+/// s'arrête au paramètre suivant, à un blanc, ou au guillemet qui ferme un
+/// champ de journal (`url="…&pass=x"`).
 static RE_PARAMETRE_URL: LazyLock<Regex> = LazyLock::new(|| {
-    re(
-        r"(?i)([?&#](?:code|state|key|token|sig|hmac|auth|access_token|refresh_token|user_auth_token|app_secret|request_sig|password|session|identity)=)[^&\s#]+",
-    )
+    let noms = PARAMETRES_URL_SENSIBLES
+        .iter()
+        .map(|n| regex::escape(n))
+        .collect::<Vec<_>>()
+        .join("|");
+    re(&format!(r#"(?i)([?&#;](?:{noms})=)[^&\s#"'<>]+"#))
 });
+
+/// Masque les identifiants d'une URL — ou de toutes les URL d'un texte — en
+/// gardant le reste lisible pour le diagnostic :
+/// - l'information d'utilisateur : `scheme://user:pass@hôte` → `scheme://********@hôte` ;
+/// - la valeur des paramètres sensibles ([`PARAMETRES_URL_SENSIBLES`]) :
+///   `?user=bob&pass=x&format=mp3` → `?user=********&pass=********&format=mp3`.
+///
+/// Toute ligne de journal qui porte une adresse de flux ou d'API passe par
+/// ici, et le nettoyage des exports ([`anonymiser`], [`masquer_acces_distant`])
+/// aussi : une seule règle. Ne panique jamais — un texte qui n'est pas une
+/// URL ressort tel quel — et est idempotente.
+pub fn masquer_url(url: &str) -> String {
+    let t = RE_URL_IDENTIFIANTS.replace_all(url, format!("${{1}}{MASQUE}@"));
+    RE_PARAMETRE_URL
+        .replace_all(&t, format!("${{1}}{MASQUE}"))
+        .into_owned()
+}
+
+/// Un écrivain de journal qui passe chaque écriture par [`masquer_url`] avant
+/// de la confier à l'écrivain d'origine.
+///
+/// `tracing-subscriber` formate un événement entier puis l'écrit d'un seul
+/// `write_all` : une écriture est une ligne complète, le motif la voit en
+/// entier. C'est le filet des lignes qui citent une adresse sans passer par
+/// [`masquer_url`] (le texte d'une erreur HTTP, qui reprend l'URL demandée).
+pub struct EcrivainMasque<W>(pub W);
+
+impl<W: std::io::Write> std::io::Write for EcrivainMasque<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let a_regarder = buf.windows(3).any(|w| w == b"://")
+            || buf.iter().any(|b| matches!(b, b'?' | b'&' | b'#' | b';'));
+        if !a_regarder {
+            return self.0.write(buf);
+        }
+        match std::str::from_utf8(buf) {
+            Ok(texte) => {
+                self.0.write_all(masquer_url(texte).as_bytes())?;
+                Ok(buf.len())
+            }
+            // Un caractère coupé en deux écritures : rien à reconnaître.
+            Err(_) => self.0.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
 
 /// Adresse du pont : `bridge.mozaiklabs.fr/<identifiant>/…`. Le chemin désigne
 /// un serveur précis ; seul l'hôte reste.
@@ -189,6 +301,27 @@ pub fn retenir_identifiants_du_serveur(settings: &crate::db::settings_repo::Sett
     }
 }
 
+/// Retient le nom d'un appareil, d'une zone ou d'un profil : il sortira sous
+/// un jeton stable (`[appareil 3]`, `[zone 2]`) de tout ce que nettoie
+/// [`anonymiser`] (#9140). Appelé par la découverte à chaque appareil vu, et
+/// par chaque porte de sortie juste avant de nettoyer. `materiels` : les
+/// « fabricant modèle » connus — un nom qui n'est que le matériel
+/// (« Marantz NR1711 ») n'est pas retenu, c'est du diagnostic.
+pub fn retenir_nom_d_appareil(sorte: Sorte, nom: &str, materiels: &[String]) {
+    appareils::retenir(sorte, nom, materiels);
+}
+
+/// Le « fabricant modèle » d'un appareil, pour [`retenir_nom_d_appareil`].
+pub fn materiel(fabricant: Option<&str>, modele: Option<&str>) -> String {
+    [fabricant, modele]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 fn identifiants_prives() -> Vec<String> {
     IDENTIFIANTS_PRIVES
         .read()
@@ -198,7 +331,7 @@ fn identifiants_prives() -> Vec<String> {
 
 /// `clé=valeur`, `clé: valeur`, `"clé":"valeur"`, `clé=Some("valeur")`. La
 /// clé est jugée par [`est_personnel`] dans la fermeture : une seule liste.
-static RE_CLE_VALEUR: LazyLock<Regex> = LazyLock::new(|| {
+pub(crate) static RE_CLE_VALEUR: LazyLock<Regex> = LazyLock::new(|| {
     re(
         r#"(?i)\b([a-z][a-z0-9_.-]*)(["']?[ \t]*[:=][ \t]*(?:Some\([ \t]*)?["']?)([^\s"',;&(){}\[\]<>]+)"#,
     )
@@ -412,7 +545,23 @@ pub fn anonymiser(texte: &str) -> String {
 /// [`anonymiser`], le nom d'utilisateur local donné explicitement — pour les
 /// épreuves, qui ne doivent pas dépendre du compte qui les exécute.
 pub fn anonymiser_avec(texte: &str, utilisateur: Option<&str>) -> String {
-    nettoyer(texte, utilisateur, &identifiants_prives())
+    nettoyer(
+        texte,
+        utilisateur,
+        &identifiants_prives(),
+        Some(&mut appareils::seance()),
+    )
+}
+
+/// [`anonymiser_json`] SANS la passe des noms d'appareils, de zones et de
+/// profils : pour l'assistant IA seulement, qui pseudonymise lui-même ces
+/// noms (`<appareil-1>`) et les rétablit à l'écran. Rien de ce qui part sur
+/// le forum n'y passe (le résumé joint à un rapport repasse par
+/// [`anonymiser`]).
+pub fn anonymiser_json_garder_appareils(valeur: &mut Value) {
+    let utilisateur = utilisateur_local();
+    let prives = identifiants_prives();
+    parcourir_json(valeur, &mut |s| nettoyer(s, utilisateur, &prives, None));
 }
 
 /// Masque ce qui ouvre ou désigne l'accès distant à ce serveur, et RIEN
@@ -423,14 +572,33 @@ pub fn anonymiser_avec(texte: &str, utilisateur: Option<&str>) -> String {
 /// C'est la porte commune de tout ce qui part vers le site : les mots du
 /// testeur (titre, description, sujet et corps d'un ticket) y passent seuls,
 /// le diagnostic y passe par [`anonymiser`], qui commence par elle.
+/// Le marqueur de la ligne qui porte le code d'activation de
+/// l'authentification. Le serveur l'écrit sur sa CONSOLE seulement ; toute
+/// ligne qui le porte est retirée de ce qui sort (journal servi par l'API,
+/// rapport de bogue, ticket, assistant) — cas d'une sortie d'erreur
+/// redirigée dans le fichier journal, ou d'un repli sur `journalctl`.
+pub const MARQUEUR_CODE_ACTIVATION: &str = "TUNE-ACTIVATION-CODE";
+
+/// Retire les lignes qui portent [`MARQUEUR_CODE_ACTIVATION`].
+pub fn retirer_les_codes_d_activation(texte: &str) -> String {
+    if !texte.contains(MARQUEUR_CODE_ACTIVATION) {
+        return texte.to_string();
+    }
+    texte
+        .split_inclusive('\n')
+        .filter(|ligne| !ligne.contains(MARQUEUR_CODE_ACTIVATION))
+        .collect()
+}
+
 pub fn masquer_acces_distant(texte: &str) -> String {
     acces_distant(texte, &identifiants_prives())
 }
 
 fn acces_distant(texte: &str, prives: &[String]) -> String {
+    // Le code d'activation de l'authentification ne sort jamais.
+    let mut texte = retirer_les_codes_d_activation(texte);
     // Les identifiants de ce serveur d'abord, en entier : une expression
     // plus loin pourrait n'en masquer qu'une partie.
-    let mut texte = texte.to_string();
     for id in prives {
         if let Ok(re_id) = Regex::new(&format!("(?i){}", regex::escape(id))) {
             texte = re_id.replace_all(&texte, MASQUE).into_owned();
@@ -443,7 +611,7 @@ fn acces_distant(texte: &str, prives: &[String]) -> String {
             format!("{}/{MASQUE}", &c[1])
         }
     });
-    let t = RE_URL_IDENTIFIANTS.replace_all(&t, format!("${{1}}{MASQUE}@"));
+    let t = masquer_url(&t);
     let t = RE_JWT.replace_all(&t, MASQUE);
     let t = RE_PORTEUR.replace_all(&t, |c: &Captures| {
         let jeton = &c[2];
@@ -453,7 +621,6 @@ fn acces_distant(texte: &str, prives: &[String]) -> String {
             c[0].to_string()
         }
     });
-    let t = RE_PARAMETRE_URL.replace_all(&t, format!("${{1}}{MASQUE}"));
     RE_CLE_VALEUR
         .replace_all(&t, |c: &Captures| {
             if est_acces_distant(&c[1]) {
@@ -466,8 +633,20 @@ fn acces_distant(texte: &str, prives: &[String]) -> String {
 }
 
 /// Le nettoyage complet, les identifiants de ce serveur donnés explicitement.
-fn nettoyer(texte: &str, utilisateur: Option<&str>, prives: &[String]) -> String {
+fn nettoyer(
+    texte: &str,
+    utilisateur: Option<&str>,
+    prives: &[String],
+    appareils: Option<&mut Seance>,
+) -> String {
     let t = acces_distant(texte, prives);
+    // Les noms d'appareils AVANT les MAC et le nom d'utilisateur : un nom
+    // retenu (« Salon_aabbccddeeff », « Jean’s MacBook ») ne serait plus
+    // reconnu une fois entamé par une autre passe.
+    let t = match appareils {
+        Some(noms) => noms.masquer(&t),
+        None => t,
+    };
     let t = RE_CLE_VALEUR.replace_all(&t, |c: &Captures| {
         if est_personnel(&c[1]) {
             format!("{}{}{MASQUE}", &c[1], &c[2])
@@ -526,18 +705,31 @@ pub fn anonymiser_json(valeur: &mut Value) {
 }
 
 /// [`anonymiser_json`], le nom d'utilisateur local donné explicitement.
+///
+/// Tout le document est UNE séance (#9140) : un nom d'appareil trouvé par le
+/// filet garde le même jeton d'un champ à l'autre.
 pub fn anonymiser_json_avec(valeur: &mut Value, utilisateur: Option<&str>) {
+    let prives = identifiants_prives();
+    let mut seance = appareils::seance();
+    parcourir_json(valeur, &mut |s| {
+        nettoyer(s, utilisateur, &prives, Some(&mut seance))
+    });
+}
+
+fn parcourir_json(valeur: &mut Value, nettoie: &mut dyn FnMut(&str) -> String) {
     match valeur {
-        Value::String(s) => *s = anonymiser_avec(s, utilisateur),
-        Value::Array(items) => items
-            .iter_mut()
-            .for_each(|v| anonymiser_json_avec(v, utilisateur)),
+        Value::String(s) => *s = nettoie(s),
+        Value::Array(items) => {
+            for v in items.iter_mut() {
+                parcourir_json(v, &mut *nettoie);
+            }
+        }
         Value::Object(carte) => {
             for (cle, v) in carte.iter_mut() {
                 if est_personnel(cle) && matches!(v, Value::String(_) | Value::Number(_)) {
                     *v = Value::String(MASQUE.to_string());
                 } else {
-                    anonymiser_json_avec(v, utilisateur);
+                    parcourir_json(v, &mut *nettoie);
                 }
             }
         }
@@ -560,6 +752,22 @@ pub fn anonymiser_champ(texte: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn le_code_d_activation_ne_sort_jamais() {
+        let journal = format!(
+            "INFO demarrage\n{MARQUEUR_CODE_ACTIVATION} K7QXR2MZPA — Tune : code\nERROR fin\n"
+        );
+        for sortie in [
+            anonymiser_avec(&journal, None),
+            masquer_acces_distant(&journal),
+            retirer_les_codes_d_activation(&journal),
+        ] {
+            assert!(!sortie.contains("K7QXR2MZPA"), "{sortie}");
+            assert!(sortie.contains("INFO demarrage"), "{sortie}");
+            assert!(sortie.contains("ERROR fin"), "{sortie}");
+        }
+    }
     use super::*;
     use serde_json::json;
 
@@ -764,8 +972,13 @@ mod tests {
 
     #[test]
     fn nom_d_utilisateur_local() {
+        let sortie = anonymiser_avec("Serveur Plex (Jdupont-NAS)", Some("jdupont"));
+        assert_eq!(sortie, "Serveur Plex (<utilisateur>-NAS)");
+        // #9140 — un nom de machine « MacBook-Pro-de-<nom> » part entier, sous
+        // un jeton d'appareil.
         let sortie = anonymiser_avec("Serveur Plex (MacBook-Pro-de-Jdupont)", Some("jdupont"));
-        assert_eq!(sortie, "Serveur Plex (MacBook-Pro-de-<utilisateur>)");
+        assert!(!sortie.contains("dupont"), "{sortie}");
+        assert!(sortie.starts_with("Serveur Plex ([appareil"), "{sortie}");
         // Un compte générique n'efface pas un mot du diagnostic.
         assert_eq!(anonymiser_avec("Tune music", Some("tune")), "Tune music");
     }
@@ -853,7 +1066,12 @@ mod tests {
 
     #[test]
     fn acces_distant_masque_dans_un_journal() {
-        let sortie = nettoyer(&journal_d_acces_distant(), None, &[]);
+        let sortie = nettoyer(
+            &journal_d_acces_distant(),
+            None,
+            &[],
+            Some(&mut Seance::vide()),
+        );
         for fuite in [
             SID,
             JETON,
@@ -878,7 +1096,11 @@ mod tests {
         ] {
             assert!(sortie.contains(garde), "« {garde} » a disparu :\n{sortie}");
         }
-        assert_eq!(nettoyer(&sortie, None, &[]), sortie, "non idempotent");
+        assert_eq!(
+            nettoyer(&sortie, None, &[], Some(&mut Seance::vide())),
+            sortie,
+            "non idempotent"
+        );
     }
 
     /// L'identifiant de CE serveur, retenu, part même écrit sans clé ; un
@@ -891,13 +1113,18 @@ mod tests {
             SID.to_uppercase(),
             JETON
         );
-        let sortie = nettoyer(&texte, None, &[SID.to_string(), JETON.to_string()]);
+        let sortie = nettoyer(
+            &texte,
+            None,
+            &[SID.to_string(), JETON.to_string()],
+            Some(&mut Seance::vide()),
+        );
         assert!(!sortie.to_lowercase().contains(SID), "{sortie}");
         assert!(!sortie.contains(JETON), "{sortie}");
         assert!(sortie.contains(zone), "la zone a disparu : {sortie}");
         // Sans l'identifiant retenu, un UUID v4 nu reste : c'est le registre
         // qui le masque, pas une expression.
-        let sans = nettoyer(&texte, None, &[]);
+        let sans = nettoyer(&texte, None, &[], Some(&mut Seance::vide()));
         assert!(sans.to_lowercase().contains(SID), "{sans}");
     }
 
@@ -944,5 +1171,182 @@ mod tests {
         ] {
             assert!(sortie.contains(garde), "« {garde} » a disparu : {sortie}");
         }
+    }
+
+    // ---- masquer_url : la règle unique des URL journalisées ----
+
+    #[test]
+    fn masquer_url_masque_l_information_d_utilisateur() {
+        assert_eq!(
+            masquer_url("http://jdupont:s3cret@flux.example.test:8000/live.mp3"),
+            format!("http://{MASQUE}@flux.example.test:8000/live.mp3")
+        );
+        // Un jeton seul, sans mot de passe, est aussi une information d'utilisateur.
+        assert_eq!(
+            masquer_url("https://abc123jeton@cdn.example.test/a.flac"),
+            format!("https://{MASQUE}@cdn.example.test/a.flac")
+        );
+        // Un `@` dans la requête n'est pas une information d'utilisateur.
+        assert_eq!(
+            masquer_url("https://hote.test/p?format=mp3&contact=a@b.test"),
+            "https://hote.test/p?format=mp3&contact=a@b.test"
+        );
+    }
+
+    #[test]
+    fn masquer_url_masque_les_parametres_sensibles_quelle_que_soit_la_casse() {
+        let url = "http://streams.example.test/live/jazz_128?User=alice&PASS=secret&Token=t0k&api_KEY=k&sig=s&Format=mp3";
+        let propre = masquer_url(url);
+        assert_eq!(
+            propre,
+            format!(
+                "http://streams.example.test/live/jazz_128?User={MASQUE}&PASS={MASQUE}&Token={MASQUE}&api_KEY={MASQUE}&sig={MASQUE}&Format=mp3"
+            )
+        );
+        for nom in PARAMETRES_URL_SENSIBLES {
+            let u = format!("https://h.test/x?a=1&{nom}=valeur-secrete&b=2");
+            let p = masquer_url(&u);
+            assert!(
+                !p.contains("valeur-secrete"),
+                "« {nom} » n'est pas masqué : {p}"
+            );
+            assert!(p.contains(&format!("&{nom}={MASQUE}&b=2")), "{p}");
+        }
+        // Fragment, `&amp;` et champ de journal entre guillemets.
+        assert_eq!(
+            masquer_url(r#"url="https://h.test/x?a=1&amp;pass=zz" suite"#),
+            format!(r#"url="https://h.test/x?a=1&amp;pass={MASQUE}" suite"#)
+        );
+        assert_eq!(
+            masquer_url("https://h.test/#access_token=abc&x=1"),
+            format!("https://h.test/#access_token={MASQUE}&x=1")
+        );
+    }
+
+    #[test]
+    fn masquer_url_laisse_intacte_une_url_sans_secret() {
+        for url in [
+            "http://ice.example.test:8000/radio.mp3",
+            "https://api.example.test/v1/tracks/123?format=flac&quality=27&passage=1&user_id=42",
+            "http://192.168.1.20:49152/desc.xml",
+            "",
+            "pas une url du tout",
+        ] {
+            assert_eq!(masquer_url(url), url);
+        }
+    }
+
+    #[test]
+    fn masquer_url_ne_panique_pas_et_reste_idempotente() {
+        for brut in [
+            "://@",
+            "http://",
+            "?pass=",
+            "?pass",
+            "http://@@@/?&&&pass==x#user=#",
+            "héhé://ü:ö@ä/?pass=ß",
+            "\u{0}\u{ffff}?token=\u{1F3B5}",
+        ] {
+            let une = masquer_url(brut);
+            assert_eq!(
+                masquer_url(&une),
+                une,
+                "masquer deux fois change « {brut} »"
+            );
+        }
+        assert!(!masquer_url("héhé://ü:ö@ä/?pass=ß").contains('ß'));
+    }
+
+    #[test]
+    fn l_export_masque_les_parametres_d_une_url_de_flux() {
+        let ligne = "INFO radio_local_decode_stream_connected url=http://s.example.test/a?user=alice&pass=secret content_type=audio/mpeg";
+        for sortie in [anonymiser_avec(ligne, None), masquer_acces_distant(ligne)] {
+            assert!(!sortie.contains("secret"), "{sortie}");
+            assert!(!sortie.contains("alice"), "{sortie}");
+            assert!(sortie.contains("content_type=audio/mpeg"), "{sortie}");
+        }
+    }
+
+    #[test]
+    fn l_ecrivain_masque_chaque_ligne_ecrite() {
+        use std::io::Write;
+        let mut sortie = EcrivainMasque(Vec::new());
+        sortie
+            .write_all(b"WARN radio HTTP fetch failed: error sending request for url (http://u:p@h.test/s?pass=secret)\n")
+            .unwrap();
+        sortie.write_all(b"INFO rien a cacher\n").unwrap();
+        let texte = String::from_utf8(sortie.0).unwrap();
+        assert!(
+            !texte.contains("secret") && !texte.contains("u:p@"),
+            "{texte}"
+        );
+        assert!(texte.contains("INFO rien a cacher"), "{texte}");
+    }
+
+    /// #9140 — de bout en bout, par la porte du rapport : les noms retenus et
+    /// ceux du filet sortent sous un jeton, le même partout dans le document.
+    #[test]
+    fn noms_d_appareils_masques_dans_le_rapport() {
+        retenir_nom_d_appareil(Sorte::Appareil, "Ysaline’s HomePod Synth9140", &[]);
+        retenir_nom_d_appareil(Sorte::Zone, "Grenier de Wenceslas9140", &[]);
+        let mut rapport = json!({
+            "zones": {"items": [{"name": "Grenier de Wenceslas9140", "output_type": "airplay"}]},
+            "logs": "INFO raop: Ysaline's HomePod Synth9140 volume=0.5\n\
+                     INFO raop: Ysaline’s HomePod Synth9140 id=airplay-a0b1c2d3e4f5\n\
+                     INFO raop: Xavierine’s MacBook host=192.168.1.20\n\
+                     INFO zone Grenier de Wenceslas9140 prête",
+            "markdown": "- Grenier de Wenceslas9140 (airplay)\n- Xavierine’s MacBook",
+        });
+        anonymiser_json_avec(&mut rapport, None);
+        let texte = rapport.to_string();
+        for fuite in ["Ysaline", "Wenceslas", "Xavierine"] {
+            assert!(!texte.contains(fuite), "« {fuite} » sort encore : {texte}");
+        }
+        let logs = rapport["logs"].as_str().unwrap();
+        let jeton_homepod = logs
+            .split(" volume=0.5")
+            .next()
+            .unwrap()
+            .rsplit("raop: ")
+            .next()
+            .unwrap();
+        assert!(jeton_homepod.starts_with("[appareil "), "{logs}");
+        assert_eq!(
+            logs.matches(jeton_homepod).count(),
+            2,
+            "jeton instable : {logs}"
+        );
+        assert!(logs.contains("id=airplay-a0b1c2xxxxxx"), "{logs}");
+        assert!(logs.contains("host=192.168.1.20"), "{logs}");
+        let zone = rapport["zones"]["items"][0]["name"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(zone.starts_with("[zone "), "{zone}");
+        let md = rapport["markdown"].as_str().unwrap();
+        assert!(md.contains(&format!("- {zone} (airplay)")), "{md}");
+        assert!(logs.contains(&format!("zone {zone} prête")), "{logs}");
+        // Le nom trouvé par le filet garde son jeton d'un champ à l'autre.
+        let jeton_macbook = logs
+            .split(" host=192.168.1.20")
+            .next()
+            .unwrap()
+            .rsplit("raop: ")
+            .next()
+            .unwrap();
+        assert!(jeton_macbook.starts_with("[appareil "), "{logs}");
+        assert!(md.ends_with(&format!("- {jeton_macbook}")), "{md}");
+        // Idempotent.
+        let mut encore = rapport.clone();
+        anonymiser_json_avec(&mut encore, None);
+        assert_eq!(encore, rapport);
+        // La variante de l'assistant garde les noms (il les pseudonymise
+        // lui-même), mais nettoie le reste.
+        let mut assistant =
+            json!({"logs": "INFO zone Grenier de Wenceslas9140 prête token=abcdef0123456789"});
+        anonymiser_json_garder_appareils(&mut assistant);
+        let logs = assistant["logs"].as_str().unwrap();
+        assert!(logs.contains("Grenier de Wenceslas9140"), "{logs}");
+        assert!(!logs.contains("abcdef0123456789"), "{logs}");
     }
 }

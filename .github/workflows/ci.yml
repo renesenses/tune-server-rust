@@ -35,7 +35,7 @@ jobs:
   # manuel reste toujours complet.
   impact:
     name: Impact et garde-fous légers
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.classer.outputs.rust }}
@@ -54,6 +54,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+      - name: Vérifier les payloads de promotion (200 Kio, aucun réseau)
+        run: python3 scripts/test-promotion-payloads-8902.py
+
       - name: Verify generated plugin lists
         run: python scripts/plugin-catalog.py --check
 
@@ -138,9 +141,10 @@ jobs:
       # reste (push du lot ou de main, nuit, lancement manuel, PR vers main,
       # etiquette `ci:full`) lance tout. Une PR vers rc/* allume les familles
       # dont un check est requis sur rc/* (audit, FFI) plus Windows et macOS.
-      # Jeu livre, embedding et librespot restent EN PLUS soumis a
-      # `full` (profil rapide des PR vers batch/* et rc/* : sautes comme
-      # avant cette etape, quel que soit le diff). Un job saute est
+      # Jeu livre et librespot restent EN PLUS soumis a `full` (profil
+      # rapide des PR vers batch/* et rc/* : sautes comme avant cette etape,
+      # quel que soit le diff). Embedding ne l'est plus (#9046) : il tourne
+      # des que le diff le touche. Un job saute est
       # « skipped », que GitHub compte comme reussi pour un controle requis :
       # aucun controle requis ne disparait. Fail-closed : base introuvable,
       # diff impossible ou sortie incomplete => tout allume.
@@ -234,9 +238,26 @@ jobs:
         run: python3 scripts/nouveautes-forum.py --self-test
 
       - name: Syntaxe des scripts de garde-fou
+        if: vars.SANS_DOCKER != '1'
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE:/repo" -w /repo \
             koalaman/shellcheck-alpine:v0.10.0 shellcheck --severity=warning \
+            scripts/detecter-impact-ci.sh \
+            scripts/determiner-profil-ci.sh \
+            scripts/detecter-jobs-lourds-ci.sh \
+            scripts/verifier-fermeture.sh \
+            scripts/verifier-refs-issues.sh \
+            scripts/docker-install.sh \
+            packaging/docker/entrypoint.sh \
+            packaging/docker/test-entrypoint.sh
+
+      # Runner auto-heberge sans docker (vars.SANS_DOCKER == '1') : meme
+      # shellcheck v0.10.0, en binaire epingle dans le PATH du runner.
+      - name: Syntaxe des scripts de garde-fou (sans docker)
+        if: vars.SANS_DOCKER == '1'
+        run: |
+          shellcheck --version | grep -qx 'version: 0.10.0'
+          shellcheck --severity=warning \
             scripts/detecter-impact-ci.sh \
             scripts/determiner-profil-ci.sh \
             scripts/detecter-jobs-lourds-ci.sh \
@@ -250,15 +271,35 @@ jobs:
       # setpriv/usermod/chown en root dans debian:bookworm-slim, la base de
       # Dockerfile.dist.
       - name: Entrypoint de l image Docker
+        if: vars.SANS_DOCKER != '1'
         run: bash packaging/docker/test-entrypoint.sh --conteneur
+
+      # Sans docker : la simulation (sans root) tourne ; le vrai passage en
+      # conteneur debian:bookworm-slim est SAUTE et le dit.
+      - name: Entrypoint de l image Docker (simulation, sans docker)
+        if: vars.SANS_DOCKER == '1'
+        run: |
+          echo "::warning::runner sans docker (vars.SANS_DOCKER=1) : passage en conteneur de test-entrypoint.sh saute, simulation seule"
+          bash packaging/docker/test-entrypoint.sh
 
       # Les workflows historiques portent quelques remarques shellcheck, mais
       # leur YAML et leurs expressions sont valides. On garde le controle
       # structurel et on ignore seulement ces deux familles connues.
       - name: Syntaxe des workflows GitHub
+        if: vars.SANS_DOCKER != '1'
         run: |
           docker run --rm -v "$GITHUB_WORKSPACE:/repo" -w /repo \
             rhysd/actionlint:1.7.7 \
+            -shellcheck= \
+            -ignore 'constant.expression.*false' \
+            -ignore 'label.*macos-15-intel.*is unknown'
+
+      # Sans docker : meme actionlint 1.7.7, en binaire epingle.
+      - name: Syntaxe des workflows GitHub (sans docker)
+        if: vars.SANS_DOCKER == '1'
+        run: |
+          actionlint --version | head -1 | grep -qx '1.7.7'
+          actionlint \
             -shellcheck= \
             -ignore 'constant.expression.*false' \
             -ignore 'label.*macos-15-intel.*is unknown'
@@ -267,7 +308,7 @@ jobs:
     name: Format
     needs: impact
     if: needs.impact.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 15  # fmt — 27 s observe
     steps:
       - uses: actions/checkout@v4
@@ -281,8 +322,8 @@ jobs:
     name: Test
     needs: impact
     if: needs.impact.outputs.rust == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 75  # test — 37 à 45 min observées début novembre (45 dépassé, PR #7711 et #7727)
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
+    timeout-minutes: ${{ vars.RUNNER_LINUX && 180 || 75 }}  # test — 37 à 45 min observées début novembre (45 dépassé, PR #7711 et #7727) ; > 75 min sur Shrek à 4 cœurs (run 44792749729) : 180 sur runner auto-hébergé
     # 02/11 (train rc10) : le runner tuait le job en pleine compilation (143)
     # ou le coupait a 45 min. Sans info de debogage et a 2 compilations en
     # parallele, memoire et disque restent sous les limites du runner.
@@ -398,8 +439,8 @@ jobs:
     name: Test (jeu de fonctionnalites livre)
     needs: impact
     if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true' && needs.impact.outputs.livre == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 45  # test-shipped-features — ~5 min observe
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
+    timeout-minutes: 75  # compilation + suite complete : coupures observees a 45 min
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -455,8 +496,13 @@ jobs:
   audio-embedding:
     name: Audio embedding feature
     needs: impact
-    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true' && needs.impact.outputs.embedding == 'true'
-    runs-on: ubuntu-latest
+    # #9046 — plus soumis a `full` : sur une PR vers batch/* (profil rapide),
+    # le job etait TOUJOURS saute, et aucun test du module `embedding` (tout
+    # entier sous `audio-embedding`) ne tournait en CI, meme quand la PR ne
+    # touchait que lui. Le classifieur n'allume `embedding` que si le diff
+    # touche `*embedding*` / `*onnx*` : le profil rapide reste rapide ailleurs.
+    if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.embedding == 'true'
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 45  # audio-embedding — ~5 min observe
     steps:
       - uses: actions/checkout@v4
@@ -526,7 +572,7 @@ jobs:
   windows-pr:
     name: Windows + ASIO (compilation PR)
     needs: impact
-    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true' && needs.impact.outputs.windows == 'true'
+    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true' && needs.impact.outputs.windows == 'true' && vars.SANS_WINDOWS != '1'
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
@@ -570,7 +616,7 @@ jobs:
     name: macOS (compilation PR)
     needs: impact
     if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true' && needs.impact.outputs.macos == 'true'
-    runs-on: macos-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_MACOS || '"macos-latest"') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -614,7 +660,7 @@ jobs:
             os: windows-latest
             artifact: tune-server-windows-x86_64
 
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (startsWith(matrix.os, 'ubuntu-') && fromJSON(vars.RUNNER_LINUX || toJSON(matrix.os))) || (matrix.os == 'macos-latest' && fromJSON(vars.RUNNER_MACOS || '"macos-latest"')) || matrix.os }}
     timeout-minutes: 60  # build — 18 min au pire observe
     steps:
       - uses: actions/checkout@v4
@@ -815,7 +861,7 @@ jobs:
     name: Clippy
     needs: impact
     if: needs.impact.outputs.rust == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 45  # clippy — 4 min observe (2 min avant #2865)
     steps:
       - uses: actions/checkout@v4
@@ -909,14 +955,16 @@ jobs:
       # #6336 : `services-factices` (tune-core), même motif : substituts de test seulement.
       # #6785 : `ecoute-directe` (tune-core, tune-server), HORS défaut : le P2P n'est
       # dans aucun binaire livré ; nommé ici pour que la porte lise son code.
-      # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","audio-embedding","plugins-wasm","dst","journal-de-test","isolement-disque-de-test","services-factices","ecoute-directe"],"packages":"workspace"}
-      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-laissez-passer -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon -p tune-cd -p tune-entree-audio -p tune-playlists-converter -p tune-circle -p tune-assistant-ia -p tune-collection-physique -p tune-mon-theme -p tune-aes67 -p tune-calibration -p tune-calibration-greffon -p tune-mpris --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,plugins-wasm,dst,journal-de-test,isolement-disque-de-test,services-factices,ecoute-directe,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme -- -D clippy::correctness
+      # #9045 : `sans-enrichissement` (tune-server), HORS défaut : le build « sans enrichissement »
+      # de tune-diretta la prend ; nommée ici pour que la porte lise son code.
+      # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","local-audio","postgres","audio-embedding","plugins-wasm","dst","journal-de-test","isolement-disque-de-test","services-factices","ecoute-directe","sans-enrichissement"],"packages":"workspace"}
+      - run: cargo clippy -p tune-core -p tune-http-types -p tune-smart-http -p tune-stream-http -p tune-streaming-http -p tune-server -p tune-output-api -p tune-cli -p tune-ffi -p tune-bridge -p tune-laissez-passer -p tune-plugin-runtime-wasm -p tune-dj -p tune-karaoke -p tune-bandcamp -p tune-concerts -p tune-pont-roon -p tune-cd -p tune-entree-audio -p tune-playlists-converter -p tune-circle -p tune-assistant-ia -p tune-collection-physique -p tune-mon-theme -p tune-aes67 -p tune-calibration -p tune-calibration-greffon -p tune-mpris --all-targets --no-default-features --features oaat,cloud-relay,local-audio,postgres,audio-embedding,plugins-wasm,dst,journal-de-test,isolement-disque-de-test,services-factices,ecoute-directe,sans-enrichissement,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme -- -D clippy::correctness
 
   audit:
     name: Security Audit
     needs: impact
     if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.audit == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 15  # audit — 10 s observe
     # Blocking: a security advisory must fail CI, not be swallowed. The wasmtime
     # advisories that forced continue-on-error are fixed (bump to 47.0.3).
@@ -969,7 +1017,26 @@ jobs:
           # dependance a ete remplacee par `opus` / `opusic-sys`, maintenus
           # (#2251). Il n'y a plus d'avis a taire. RUSTSEC-2026-0459 (SQLite
           # < 3.54) a quitte la liste avec #8196 : SQLite 3.54.0 est embarque.
-          ignore: RUSTSEC-2024-0436,RUSTSEC-2024-0384
+          #
+          # RUSTSEC-2026-0543 (chrono non maintenu, publie le 17/11/2026) :
+          # aucune version corrigee, migration vers jiff/time a planifier.
+          # Justification dans .cargo/audit.toml.
+          ignore: RUSTSEC-2024-0436,RUSTSEC-2024-0384,RUSTSEC-2026-0543
+      # QA 18/11 — sur 14 jours, ~96 échecs de cette porte. Relu sur les 21
+      # journaux encore disponibles : AUCUN faux rouge. Deux vrais avis, chacun
+      # rougissant toutes les PR jusqu'à son traitement : RUSTSEC-2026-0538
+      # (quinn-udp, vulnérabilité, 13/11, corrigé par mise à jour) et
+      # RUSTSEC-2026-0543 (chrono non maintenu, 16-17/11, excepté par
+      # 928b920c0). La porte reste donc BLOQUANTE. Mais l'action n'écrit l'avis
+      # que dans le résumé du run (« 1 entries found ») : le journal ne disait
+      # pas LEQUEL, et chaque PR rouge se lisait comme une panne. En cas
+      # d'échec, cette étape écrit l'avis dans le journal. `cargo audit` nu lit
+      # `.cargo/audit.toml` (même liste d'exceptions, `deny = ["warnings"]`,
+      # tenue identique par `les_trois_listes_dexceptions_rustsec_sont_identiques`) :
+      # aucune liste de plus à faire dériver.
+      - name: Dire quel avis bloque (si l'audit a échoué)
+        if: failure()
+        run: cargo audit || true
       # Cet outil est exclu du workspace et possède son propre verrou.
       # L'audit de la racine ne couvre donc pas ses dépendances (#6503).
       - name: Auditer le verrou du moissonneur Roon
@@ -992,7 +1059,7 @@ jobs:
     # garde-fou (#1751) a refuse le tag, correctement, mais le signal n'est
     # jamais remonte jusqu'ici.
     #
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -1079,7 +1146,7 @@ jobs:
           - {target: x86_64-apple-darwin, os: macos-15-intel, cross: false}
           - {target: aarch64-apple-darwin, os: macos-latest, cross: false}
           - {target: x86_64-pc-windows-msvc, os: windows-latest, cross: false}
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ (startsWith(matrix.os, 'ubuntu-') && fromJSON(vars.RUNNER_LINUX || toJSON(matrix.os))) || (matrix.os == 'macos-latest' && fromJSON(vars.RUNNER_MACOS || '"macos-latest"')) || matrix.os }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -1164,7 +1231,7 @@ jobs:
       - audit
       - ffi
       - librespot
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 2
     steps:
       - name: Refuser une branche autre qu'une RC

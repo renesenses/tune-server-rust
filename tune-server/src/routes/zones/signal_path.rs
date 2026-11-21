@@ -122,6 +122,11 @@ pub(super) struct CorrectionPiece {
     pub reason: Option<String>,
     pub ir_sample_rate: Option<u32>,
     pub taps: Option<usize>,
+    /// #8761 — la cadence vers laquelle le fichier a été rééchantillonné
+    /// (`None` : fichier pris à sa cadence).
+    pub resampled_to: Option<u32>,
+    /// #8761 — les cadences des fichiers du jeu de la zone.
+    pub ir_files: Vec<u32>,
 }
 
 impl CorrectionPiece {
@@ -134,6 +139,8 @@ impl CorrectionPiece {
             "reason": self.reason,
             "ir_sample_rate": self.ir_sample_rate,
             "taps": self.taps,
+            "resampled_to": self.resampled_to,
+            "ir_files": self.ir_files,
         })
     }
 }
@@ -146,8 +153,9 @@ fn latence_convolueur_ms(sample_rate: u32) -> f64 {
 
 /// L'étape « Correction de pièce » (#7632) : `None` sans `ir_path_{zone}`.
 /// Le fichier est LU (cadence, taps) pour dire si le convolueur l'applique
-/// au flux courant — la même règle que `ConvolverConfig::build_for` : pas de
-/// rééchantillonnage, donc cadence de l'IR = cadence du flux, sinon rien.
+/// au flux courant — la même règle que `ConvolverConfig::build_for` (#8761) :
+/// le fichier du jeu à la cadence du flux, sinon le plus proche
+/// rééchantillonné, sinon (rééchantillonnage refusé par la zone) rien.
 pub(super) fn zone_correction_piece_lang(
     lang: &str,
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
@@ -174,6 +182,8 @@ pub(super) fn zone_correction_piece_lang(
                 reason: Some(e),
                 ir_sample_rate: None,
                 taps: None,
+                resampled_to: None,
+                ir_files: Vec::new(),
             });
         }
     };
@@ -186,6 +196,55 @@ pub(super) fn zone_correction_piece_lang(
             reason: Some("pure".into()),
             ir_sample_rate: ir_sr,
             taps,
+            resampled_to: None,
+            ir_files: Vec::new(),
+        });
+    }
+    // #8761 — le jeu par cadence : un fichier à la cadence du fil, ou le plus
+    // proche rééchantillonné (sauf refus réglé). Seul un refus laisse la
+    // piste sans correction.
+    let jeu = tune_core::audio::convolver::JeuDeZone::lire(
+        &tune_core::db::settings_repo::SettingsRepo::with_backend(backend.clone()),
+        zone_id,
+    )
+    .and_then(|j| j.charger().ok());
+    let ir_files: Vec<u32> = jeu.as_ref().map(|j| j.cadences()).unwrap_or_default();
+    if let (Some(fil), Some(jeu)) = (wire_sample_rate, jeu.as_ref())
+        && let Ok(choix) = jeu.choix_pour(fil)
+    {
+        let taps = jeu.prises_pour(fil).or(taps);
+        let description = if choix.reechantillonne {
+            fs(
+                lang,
+                "correction_piece_reechantillonnee",
+                &[
+                    &taps.map(|t| t.to_string()).unwrap_or_else(|| "?".into()),
+                    &choix.cadence_fichier.to_string(),
+                    &fil.to_string(),
+                    &format!("{:.0}", latence_convolueur_ms(fil)),
+                ],
+            )
+        } else {
+            fs(
+                lang,
+                "correction_piece_active",
+                &[
+                    &taps.map(|t| t.to_string()).unwrap_or_else(|| "?".into()),
+                    &fil.to_string(),
+                    &format!("{:.0}", latence_convolueur_ms(fil)),
+                ],
+            )
+        };
+        return Some(CorrectionPiece {
+            kind: "ir",
+            status: "applied",
+            applied: true,
+            description,
+            reason: None,
+            ir_sample_rate: Some(choix.cadence_fichier),
+            taps,
+            resampled_to: choix.reechantillonne.then_some(fil),
+            ir_files,
         });
     }
     if let (Some(fil), Some(ir)) = (wire_sample_rate, ir_sr)
@@ -203,6 +262,8 @@ pub(super) fn zone_correction_piece_lang(
             reason: Some(format!("ir_sample_rate {ir} != stream_sample_rate {fil}")),
             ir_sample_rate: ir_sr,
             taps,
+            resampled_to: None,
+            ir_files: Vec::new(),
         });
     }
     let cadence = wire_sample_rate.or(ir_sr).unwrap_or(48_000);
@@ -222,6 +283,8 @@ pub(super) fn zone_correction_piece_lang(
         reason: None,
         ir_sample_rate: ir_sr,
         taps,
+        resampled_to: None,
+        ir_files: Vec::new(),
     })
 }
 
@@ -292,6 +355,8 @@ fn correction_piece_egaliseur_lang(
         reason,
         ir_sample_rate: None,
         taps: None,
+        resampled_to: None,
+        ir_files: Vec::new(),
     })
 }
 
@@ -646,7 +711,7 @@ pub(super) fn zone_replaygain_step_lang(
     {
         return None;
     }
-    replaygain_step_hors_pure_lang(lang, backend, piste)
+    replaygain_step_hors_pure_lang(lang, backend, zone_id, piste)
 }
 
 /// L'étape ReplayGain telle qu'elle serait HORS PURE — le corps de
@@ -655,15 +720,19 @@ pub(super) fn zone_replaygain_step_lang(
 fn replaygain_step_hors_pure_lang(
     lang: &str,
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
     piste: tune_core::audio::replaygain::PisteRg<'_>,
 ) -> Option<ReplayGainStep> {
     use tune_core::audio::replaygain::{
-        GainSource, ReplayGainSettings, RetenueAntiEcretage, gain_de_piste, gain_factor_with_peak,
-        stored_gain_source,
+        GainSource, ReplayGainMode, ReplayGainSettings, RetenueAntiEcretage, gain_de_piste,
+        gain_factor_with_peak, granularite_de_zone, stored_gain_source,
     };
     let settings = ReplayGainSettings::load(backend);
+    // #8968 — `Auto` se résout par la file de la zone, comme à la lecture.
+    let auto = settings.mode == ReplayGainMode::Auto;
+    let mode = granularite_de_zone(backend, zone_id, piste, settings.mode);
     // #8689 — un titre Qobuz / TIDAL : le gain que le service publie.
-    let (gain, source, peak_kind) = gain_de_piste(backend, piste, settings.mode)?;
+    let (gain, source, peak_kind) = gain_de_piste(backend, piste, mode)?;
     let (factor, retenue) = gain_factor_with_peak(gain, settings, peak_kind);
     let peak_headroom_db = peak_kind.headroom_db(settings);
     let alters_audio = (factor - 1.0).abs() > 1e-6;
@@ -681,6 +750,12 @@ fn replaygain_step_hors_pure_lang(
         tune_core::audio::replaygain::ReplayGainMode::Album => "album",
         _ => "track",
     };
+    // #8968 — le libellé dit aussi que c'est le mode Auto qui a choisi.
+    let label_affiche = if auto {
+        format!("{label}, auto")
+    } else {
+        label.to_string()
+    };
     // La provenance porte sur la granularité qui a fourni la valeur, pas sur
     // le mode demandé. Une base illisible ne doit rien inventer : on retombe
     // sur la description d'avant, sans mention d'origine.
@@ -694,14 +769,18 @@ fn replaygain_step_hors_pure_lang(
         // pré-ampli — ce que l'auditeur a réglé, pas ce que le garde-fou en a
         // fait.
         let demande_db = gain.gain_db + settings.preamp_db;
-        fs(lang, "rg_refused", &[label, &format!("{demande_db:+.1}")])
+        fs(
+            lang,
+            "rg_refused",
+            &[label_affiche.as_str(), &format!("{demande_db:+.1}")],
+        )
     } else {
         match origin {
             Some(src) => format!(
-                "ReplayGain ({label}, {applied_db:+.1} dB, {})",
+                "ReplayGain ({label_affiche}, {applied_db:+.1} dB, {})",
                 ts(lang, src.as_str())
             ),
-            None => format!("ReplayGain ({label}, {applied_db:+.1} dB)"),
+            None => format!("ReplayGain ({label_affiche}, {applied_db:+.1} dB)"),
         }
     };
     if peak_headroom_db > 0.0 {
@@ -716,6 +795,7 @@ fn replaygain_step_hors_pure_lang(
     Some(ReplayGainStep {
         description,
         granularity: label,
+        auto,
         source: origin.map(GainSource::as_str),
         clipping_guard: retenue.as_str(),
         // Un refus ne touche pas un échantillon : le fil reste intact.
@@ -745,7 +825,7 @@ pub(super) fn replaygain_ignore_par_pure(
     if !tune_core::audio::audiophile::zone_enabled(backend, zone_id) {
         return None;
     }
-    let rg = replaygain_step_hors_pure_lang("fr", backend, piste)?;
+    let rg = replaygain_step_hors_pure_lang("fr", backend, zone_id, piste)?;
     if !rg.alters_audio {
         return None;
     }
@@ -764,21 +844,27 @@ pub(super) fn replaygain_ignore_par_pure(
 /// l'appelant.
 pub(super) fn replaygain_sans_gain_tague(
     backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
     piste: tune_core::audio::replaygain::PisteRg<'_>,
 ) -> Option<Value> {
-    use tune_core::audio::replaygain::{ReplayGainMode, ReplayGainSettings, gain_de_piste};
+    use tune_core::audio::replaygain::{
+        ReplayGainMode, ReplayGainSettings, gain_de_piste, granularite_de_zone,
+    };
     let settings = ReplayGainSettings::load(backend);
     if settings.mode == ReplayGainMode::Off || !piste.est_identifiee() {
         return None;
     }
-    if gain_de_piste(backend, piste, settings.mode).is_some() {
+    let mode = granularite_de_zone(backend, zone_id, piste, settings.mode);
+    if gain_de_piste(backend, piste, mode).is_some() {
         return None;
     }
     Some(json!({
-        "mode": match settings.mode {
+        "mode": match mode {
             ReplayGainMode::Album => "album",
             _ => "track",
         },
+        // #8968 — additif : le réglage est `auto`.
+        "auto": settings.mode == ReplayGainMode::Auto,
         "preamp_db": (settings.preamp_db * 100.0).round() / 100.0 + 0.0,
     }))
 }
@@ -791,6 +877,9 @@ pub(super) struct ReplayGainStep {
     description: String,
     /// `"track"` ou `"album"` — celle qui a fourni la valeur.
     granularity: &'static str,
+    /// #8968 — vrai quand le réglage est `auto` : `granularity` est alors le
+    /// choix fait pour cette piste d'après la file.
+    auto: bool,
     /// `"file_tags"` ou `"analysis"`, absent si la base n'a pas répondu.
     source: Option<&'static str>,
     /// `"none"` / `"tagged_peak"` / `"refused_no_peak"` (#4072) : ce que
@@ -1293,6 +1382,59 @@ pub(super) fn libelle_de_transport(output_type: &str) -> &str {
     }
 }
 
+/// #8920 — le niveau d'une zone Devialet AIR en dB d'ampli : celui que
+/// l'ampli rapporte (il fait foi), sinon la consigne lue sur la course.
+/// `None` pour toute autre sortie (`course` absente).
+fn volume_air_db(
+    ps: &ZoneState,
+    zone: &Zone,
+    course: Option<tune_core::outputs::devialet_air::reglages::BornesDb>,
+) -> Option<f64> {
+    let course = course?;
+    let rapporte = ps
+        .device_volume_observation
+        .as_ref()
+        .filter(|o| zone.output_device_id.as_deref() == Some(o.device_id.as_str()))
+        .map(|o| o.volume_db)
+        .filter(|db| db.is_finite());
+    Some(rapporte.unwrap_or_else(|| course.volume_vers_db((zone.volume / 100.0).clamp(0.0, 1.0))))
+}
+
+/// #8920 — l'étiquette du renderer d'une zone Devialet AIR : « nom de la
+/// zone (IP de l'ampli) ». L'identifiant de sortie (`devialet-air:<mac>`)
+/// qui s'affichait était illisible. Sans l'IP (ampli muet, sortie occupée) :
+/// le nom de la zone seul. `None` pour toute autre sortie.
+pub(crate) async fn libelle_renderer_air(
+    state: &crate::state::AppState,
+    zone: &Zone,
+) -> Option<String> {
+    use tune_core::outputs::devialet_air::{DevialetAirOutput, reglages};
+    if !reglages::est_air(zone.output_type.as_deref()) {
+        return None;
+    }
+    let arc = match zone.output_device_id.as_deref() {
+        Some(did) => state.outputs.lock().await.get(did),
+        None => None,
+    };
+    let ip = arc.and_then(|a| {
+        a.try_lock().ok().and_then(|sortie| {
+            sortie
+                .as_any()
+                .downcast_ref::<DevialetAirOutput>()
+                .and_then(DevialetAirOutput::ip)
+        })
+    });
+    Some(libelle_air(&zone.name, ip))
+}
+
+/// #8920 — « nom de la zone (IP) », ou le nom seul.
+pub(crate) fn libelle_air(nom_de_zone: &str, ip: Option<std::net::IpAddr>) -> String {
+    match ip {
+        Some(ip) => format!("{nom_de_zone} ({ip})"),
+        None => nom_de_zone.to_string(),
+    }
+}
+
 pub fn build_signal_path_lang(
     lang: &str,
     ps: &ZoneState,
@@ -1362,6 +1504,13 @@ pub fn build_signal_path_lang(
         &source,
         traitements.dsp_enabled,
     );
+    // #9177 — sur un fil servi tel quel (DSD brut, ALAC natif), aucun gain
+    // ne multiplie les échantillons : l'orchestrateur ne transcode pas pour
+    // le ReplayGain (`sortie_sujette_au_traitement`). L'étape disparaît, et
+    // avec elle sa part du verdict bit-perfect.
+    if forcages.flux_servi_tel_quel {
+        traitements.replaygain_step = None;
+    }
     // #4354 — lu AVANT que `forcages` parte dans `Analyse` : le verdict PURE
     // se rend en fin de fonction, une fois les étapes décrites.
     let dsd_decime_en_pcm = forcages.dsd_decime_en_pcm;
@@ -1511,7 +1660,9 @@ pub fn build_signal_path_lang(
         // ReplayGain disparaissait sans un mot, et un préampli réglé
         // semblait sans effet. Clé ABSENTE sous PURE, en mode off ou quand
         // la piste a un gain.
-        if !pure && let Some(rg) = replaygain_sans_gain_tague(backend, np.piste_rg()) {
+        if !pure
+            && let Some(rg) = replaygain_sans_gain_tague(backend, zone_id_courant, np.piste_rg())
+        {
             v["replaygain_untagged"] = rg;
         }
         // #6946 — Spotify : le format et le débit reçus, et pourquoi pas
@@ -1528,14 +1679,48 @@ pub fn build_signal_path_lang(
     })
 }
 
+/// 19/11/2026 — ce que la compensation de la réserve laisse d'écart avec la
+/// lecture sans suréchantillonnage, en clair et traduit : niveaux égaux,
+/// compensée en partie (volume entre −3 et 0 dB), ou rien de compensé
+/// (volume à 100 %, le niveau se règle au DAC ou au préampli). `None` quand
+/// la sortie ne dit pas l'écart.
+pub(super) fn note_de_niveau_du_surechantillonneur(
+    lang: &str,
+    reserve_db: f64,
+    ecart_db: Option<f64>,
+) -> Option<(bool, String)> {
+    let ecart = ecart_db?;
+    // Au centième de dB près : l'écart est rangé en centièmes.
+    if ecart > -0.01 {
+        return Some((true, fs(lang, "upsampling_level_matched", &[])));
+    }
+    let ecart_txt = format!("{:.1}", -ecart);
+    if ecart <= reserve_db + 0.01 {
+        return Some((
+            false,
+            fs(
+                lang,
+                "upsampling_level_full_volume",
+                &[&ecart_txt, &format!("{:.1}", -reserve_db)],
+            ),
+        ));
+    }
+    Some((false, fs(lang, "upsampling_level_partial", &[&ecart_txt])))
+}
+
 /// #7614 — l'étape du greffon de suréchantillonnage quand il porte la
 /// cadence : jamais bit-perfect, filtre et réserve de niveau affichés.
+///
+/// 19/11/2026 — et ce que la compensation de cette réserve laisse d'écart
+/// avec la lecture sans lui (`level_gap_db`, `level_matched`), dit aussi
+/// dans la description.
 pub(super) fn etape_du_surechantillonneur_lang(
     lang: &str,
     de: u32,
     vers: u32,
     filtre: &str,
     reserve_db: f64,
+    ecart_db: Option<f64>,
 ) -> Value {
     let khz = |hz: u32| {
         let k = f64::from(hz) / 1000.0;
@@ -1545,24 +1730,36 @@ pub(super) fn etape_du_surechantillonneur_lang(
             format!("{k:.1}")
         }
     };
-    json!({
+    let mut description = fs(
+        lang,
+        "upsampling",
+        &[
+            &format!("{} kHz \u{2192} {} kHz", khz(de), khz(vers)),
+            filtre,
+            &format!("{reserve_db:.2}"),
+        ],
+    );
+    let note = note_de_niveau_du_surechantillonneur(lang, reserve_db, ecart_db);
+    if let Some((_, texte)) = &note {
+        description.push_str(" \u{b7} ");
+        description.push_str(texte);
+    }
+    let mut etape = json!({
         "name": "Upsampler",
         "code": "upsampling",
         "from_hz": de,
         "to_hz": vers,
         "filter": filtre,
         "headroom_db": reserve_db,
-        "description": fs(
-            lang,
-            "upsampling",
-            &[
-                &format!("{} kHz \u{2192} {} kHz", khz(de), khz(vers)),
-                filtre,
-                &format!("{reserve_db:.2}"),
-            ],
-        ),
+        "description": description,
         "bit_perfect": false,
-    })
+    });
+    if let (Some(ecart), Some((egal, texte))) = (ecart_db, note) {
+        etape["level_gap_db"] = json!(ecart);
+        etape["level_matched"] = json!(egal);
+        etape["level_note"] = json!(texte);
+    }
+    etape
 }
 
 /// #7614 — le greffon de suréchantillonnage RÉGLÉ sur la zone mais qui ne
@@ -1582,16 +1779,24 @@ pub(super) fn etat_du_surechantillonneur_lang(
     if let Some((filtre, reserve_db)) = transformations_reelles.and_then(|t| t.surechantillonnage())
     {
         let t = transformations_reelles?;
-        return Some((
-            json!({
-                "active": true,
-                "from_hz": t.entree().cadence(),
-                "to_hz": t.ouvert().cadence,
-                "filter": filtre,
-                "headroom_db": reserve_db,
-            }),
-            Value::Null,
-        ));
+        let mut etat = json!({
+            "active": true,
+            "from_hz": t.entree().cadence(),
+            "to_hz": t.ouvert().cadence,
+            "filter": filtre,
+            "headroom_db": reserve_db,
+        });
+        // 19/11/2026 — l'écart de niveau qui reste, réserve compensée.
+        let ecart = t.ecart_de_niveau_surechantillonnage();
+        if let (Some(ecart), Some((egal, texte))) = (
+            ecart,
+            note_de_niveau_du_surechantillonneur(lang, reserve_db, ecart),
+        ) {
+            etat["level_gap_db"] = json!(ecart);
+            etat["level_matched"] = json!(egal);
+            etat["level_note"] = json!(texte);
+        }
+        return Some((etat, Value::Null));
     }
     if !reglages.enabled {
         return None;
@@ -1665,6 +1870,10 @@ fn texte_du_refus_surechantillonnage(raison: &str) -> &'static str {
         "source_rate_unknown" | "source_probe_incomplete" => "upsampling_source_unknown",
         "output_path_not_supported" => "upsampling_output_path",
         "dop" => "upsampling_dop",
+        // #9165 — les chemins Linux sans étage nomment leur cause, au lieu du
+        // « chemin de sortie » réservé aux bras exclusifs macOS/Windows.
+        "dsd" => "upsampling_dsd",
+        "compressed_stream" => "upsampling_compressed_stream",
         "multiple_outputs" => "upsampling_multiple_outputs",
         "output_rate_open_failed" | "filter_initialization_failed" => "upsampling_opening_failed",
         _ => "upsampling_not_applied",
@@ -1867,6 +2076,20 @@ fn assembler_les_etapes_lang(
         variante_hls_refusee,
         ..
     } = analyse.source;
+    // #8809 — nommer le fil PCM observé, dans l’étape ET dans le résumé.
+    // Le mode demandé ne prouve ni du DoP ni du DSD natif.
+    let output_format_name = if output_type == "local"
+        && is_dsd
+        && !ps.dop_active
+        && wire_sample_rate
+            .zip(wire_bit_depth)
+            .is_some_and(|(rate, bits)| {
+                rate > 0 && bits > 0 && !is_dsd_resolution(rate as i32, i32::from(bits))
+            }) {
+        "PCM"
+    } else {
+        output_format_name
+    };
     let Traitements {
         eq_step_description,
         replaygain_step,
@@ -1878,11 +2101,14 @@ fn assembler_les_etapes_lang(
         ui_volume,
         volume_full,
         correction_piece,
+        course_air,
         ..
     } = analyse.traitements;
     let Forcages {
         dsp_applique,
         dsp_contourne_par_le_dsd,
+        dsp_contourne_par_l_alac,
+        flux_servi_tel_quel,
         dlna_cap_16bit,
         dlna_wav24,
         dlna_force_wav,
@@ -2292,6 +2518,7 @@ fn assembler_les_etapes_lang(
             t.ouvert().cadence,
             filtre,
             reserve_db,
+            t.ecart_de_niveau_surechantillonnage(),
         ));
     } else if let Some(t) = reel.filter(|t| t.reechantillonnage()) {
         let src_khz = t.entree().cadence() / 1000;
@@ -2358,6 +2585,8 @@ fn assembler_les_etapes_lang(
             // afficher, ces champs permettent au client de composer le sien
             // (icône, traduction) sans analyser une chaîne française.
             "granularity": rg.granularity,
+            // #8968 — additif : la granularité vient du mode Auto.
+            "auto": rg.auto,
             "gain_source": rg.source,
             // #4072 : ce que l'anti-écrêtage a retenu, et ce que l'étage a
             // écrêté depuis le démarrage (portée processus, dite dans l'objet).
@@ -2420,7 +2649,12 @@ fn assembler_les_etapes_lang(
         // ici. #8569 — une sortie qui annonce `can_set_volume == false`
         // (volume décoratif Diretta, #8538) la perd en sortie de
         // constructeur : `sans_volume_d_une_sortie_non_reglable`.
-        let description = if tune_core::orchestrator::is_network_output_type(Some(output_type)) {
+        let description = if let Some(db) = volume_air_db(ps, zone, course_air) {
+            // #8920 — Devialet AIR : le niveau de l'ampli en dB (celui qu'il
+            // rapporte, sinon la consigne sur la course) ; un « 9 % » n'y
+            // veut rien dire.
+            fs(lang, "amp_volume_db", &[&format!("{db:.1}")])
+        } else if tune_core::orchestrator::is_network_output_type(Some(output_type)) {
             fs(lang, "renderer_volume", &[&pourcent])
         } else {
             format!("Volume {pourcent}%")
@@ -2507,6 +2741,15 @@ fn assembler_les_etapes_lang(
             "description": ts(lang, "dsp_dsd"),
             "bit_perfect": true,
         }));
+    } else if dsp_contourne_par_l_alac {
+        // #9177 — même règle que pour le DSD : dire le contournement. L'ALAC
+        // natif demandé sur la zone part tel quel, l'égaliseur armé n'y
+        // touche pas.
+        steps.push(json!({
+            "name": "DSP",
+            "description": ts(lang, "dsp_alac"),
+            "bit_perfect": true,
+        }));
     } else if dsp_applique {
         steps.push(json!({
             "name": "DSP",
@@ -2524,7 +2767,7 @@ fn assembler_les_etapes_lang(
     // n'entend rien — c'est l'étape qui le lui dit, comme pour le DSP sur DSD.
     let correction_piece_resume = correction_piece.as_ref().map(CorrectionPiece::resume);
     if let Some(cp) = correction_piece
-        && !dsp_contourne_par_le_dsd
+        && !flux_servi_tel_quel
     {
         steps.push(json!({
             "name": "Correction de pièce",
@@ -2738,6 +2981,17 @@ fn assembler_les_etapes_lang(
         ),
     }));
 
+    // #8920 (décision du 17/11) — Devialet AIR : le DoP n'est pas branché
+    // tant qu'il n'a pas été essayé sur un ampli ; la sortie convertit TOUT
+    // DSD en PCM, même si la zone demande DoP. L'étape le dit en clair.
+    if is_dsd && tune_core::outputs::devialet_air::reglages::est_air(zone.output_type.as_deref()) {
+        steps.push(json!({
+            "name": "DSD",
+            "code": "air_dsd_pcm",
+            "description": ts(lang, "air_dsd_pcm"),
+            "bit_perfect": false,
+        }));
+    }
     let renderer_name = renderer_label
         .or(zone.output_device_id.as_deref())
         .unwrap_or(output_type);
@@ -3187,6 +3441,13 @@ fn decrire_le_transport<'a>(
 struct Forcages {
     dsp_applique: bool,
     dsp_contourne_par_le_dsd: bool,
+    /// #9177 — égaliseur armé, mais l'ALAC part tel quel (« ALAC natif »).
+    dsp_contourne_par_l_alac: bool,
+    /// #9177 — le fil porte les octets de la source sans qu'aucun étage les
+    /// touche : DSD servi brut hors sortie locale, ou ALAC natif. Aucun
+    /// traitement (égaliseur, correction de pièce, ReplayGain) n'y a lieu,
+    /// `sortie_sujette_au_traitement` en ferme la porte côté orchestrateur.
+    flux_servi_tel_quel: bool,
     dlna_cap_16bit: bool,
     /// L'opt-in 24 bits SERVI : la zone l'a demandé ET la source le porte.
     /// Décrit la profondeur du WAV, jamais le fait de forcer le WAV (#4297).
@@ -3281,9 +3542,8 @@ fn decider_les_forcages(
     // toute déduction faite ici.
     let dsd_brut_hors_sortie_locale =
         is_dsd && output_type != "local" && (wire_carries_raw_dsd(wire) || dsd_natif_oaat);
-    // « Armé » et « appliqué » ne sont pas la même chose.
-    let dsp_applique = dsp_enabled && !dsd_brut_hors_sortie_locale;
-    let dsp_contourne_par_le_dsd = dsp_enabled && dsd_brut_hors_sortie_locale;
+    // « Armé » et « appliqué » ne sont pas la même chose. Le DSP n'est
+    // décidé qu'une fois connu le passthrough ALAC, plus bas (#9177).
     // ALAC native passthrough (opt-in per zone): the orchestrator serves the ALAC
     // file straight to a renderer that decodes it (bit-perfect, no FLAC transcode).
     // Mirror the orchestrator's condition (see orchestrator.rs `alac_passthrough`)
@@ -3380,11 +3640,25 @@ fn decider_les_forcages(
         dlna_cap_16bit,
         || ZoneRepo::with_backend(backend.clone()).get_alac_passthrough(zone_id),
     );
-    // Miroir de la condition AAC de l'orchestrateur (voir orchestrator.rs).
+    // Miroir de la condition AAC de l'orchestrateur (`resolve_local.rs`),
+    // plafond de fréquence compris : il manquait ici (#9177).
     let aac_passthrough = source_format == Some(AudioFormat::Aac)
         && is_network_output
         && !dlna_force_wav
+        && max_sample_rate.is_none_or(|max| u32::try_from(sample_rate).unwrap_or(0) <= max)
         && ZoneRepo::with_backend(backend.clone()).get_aac_passthrough(zone_id);
+    // #9177 — l'ALAC natif ferme la porte du traitement comme le DSD brut
+    // (`orchestrator::regles::sortie_sujette_au_traitement`) : égaliseur, IR
+    // et ReplayGain ne forcent pas le transcodage, l'ALAC part tel quel. Le
+    // panneau annonçait « DSP », « ReplayGain » et « non bit-perfect » sur des
+    // octets intacts. Un fil constaté WAV (renderer sans ALAC, négociation
+    // SOAP) dit le contraire et l'emporte.
+    let alac_natif_servi =
+        alac_passthrough && !output_container.is_some_and(|c| c.eq_ignore_ascii_case("wav"));
+    let flux_servi_tel_quel = dsd_brut_hors_sortie_locale || alac_natif_servi;
+    let dsp_applique = dsp_enabled && !flux_servi_tel_quel;
+    let dsp_contourne_par_le_dsd = dsp_enabled && dsd_brut_hors_sortie_locale;
+    let dsp_contourne_par_l_alac = dsp_enabled && alac_natif_servi && !dsd_brut_hors_sortie_locale;
     // #3183 — la QUATRIEME copie a la main, et celle qui avait deja derive :
     // ce miroir n'appelait que `needs_transcode_for_dlna()`, la decision
     // choisit le bras Chromecast pour une zone `chromecast`. Sur une source
@@ -3439,6 +3713,8 @@ fn decider_les_forcages(
     Forcages {
         dsp_applique,
         dsp_contourne_par_le_dsd,
+        dsp_contourne_par_l_alac,
+        flux_servi_tel_quel,
         dlna_cap_16bit,
         dlna_wav24,
         dlna_force_wav,
@@ -3487,6 +3763,9 @@ struct Traitements {
     volume_full: bool,
     /// #7632 — la correction de pièce de la zone (`ir_path_{zone}`), décrite.
     correction_piece: Option<CorrectionPiece>,
+    /// #8920 — la course en dB d'une zone Devialet AIR : son volume s'écrit
+    /// en dB d'ampli. `None` pour toute autre sortie.
+    course_air: Option<tune_core::outputs::devialet_air::reglages::BornesDb>,
 }
 
 /// Relève les traitements armés sur la zone, la sonde locale primant sur les réglages.
@@ -3571,7 +3850,13 @@ fn relever_les_traitements_lang(
     let ui_volume =
         tune_core::audio::volume_scale::EchelleDeVolume::de_la_sortie(zone.output_type.as_deref())
             .position(gain);
-    let volume_full = zone.fixed_volume || gain >= 1.0 || gain <= 0.0; // 0.0 means no software vol set
+    // #8920 — Devialet AIR : le volume est toujours une commande à l'ampli,
+    // en dB ; le haut et le bas de la course sont des niveaux comme les autres.
+    let course_air = tune_core::audio::volume_appareil_db::course_de_la_sortie(
+        backend,
+        zone.output_type.as_deref(),
+    );
+    let volume_full = course_air.is_none() && (zone.fixed_volume || gain >= 1.0 || gain <= 0.0); // 0.0 means no software vol set
     Traitements {
         configured_dsp_enabled,
         dsp_enabled,
@@ -3584,6 +3869,7 @@ fn relever_les_traitements_lang(
         crossfeed_du_flux,
         ui_volume,
         volume_full,
+        course_air,
         correction_piece: zone_correction_piece_lang(
             lang,
             backend,
@@ -4050,3 +4336,7 @@ mod repli_de_demarrage_6452_tests {
         assert_eq!(detail_du_transport("dlna", None, Some("asio")), None);
     }
 }
+
+#[cfg(test)]
+#[path = "signal_path_dsd_pcm_8809_tests.rs"]
+mod dsd_pcm_8809_tests;

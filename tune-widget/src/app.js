@@ -129,7 +129,8 @@ async function init(zoneChoisie) {
       const paused = (data.zones || []).find(z => z.state === 'paused');
       state.zone_id = paused ? paused.zone_id : ((data.zones && data.zones[0]) ? data.zones[0].zone_id : 1);
     }
-    // Les raccourcis globaux (côté natif) visent la zone affichée ici.
+    // Les raccourcis de la barre des menus (côté natif) visent la zone
+    // affichée ici.
     invoke('select_zone', { zoneId: state.zone_id })?.catch?.(() => {});
     applyZoneData(data);
   } catch (e) {
@@ -434,21 +435,105 @@ $('search-input').addEventListener('keydown', (e) => {
 
 // Settings
 const mainEls = ['cover-container', 'track-info', 'progress-container', 'controls', 'volume-container', 'search-container'];
-$('btn-settings').onclick = () => { $('search-input').value = ''; fermerRecherche(); mainEls.forEach(id => $(id).style.display = 'none'); $('settings-panel').style.display = 'block'; $('server-url').value = SERVER.replace(/^https?:\/\//, ''); };
+$('btn-settings').onclick = () => { $('search-input').value = ''; fermerRecherche(); mainEls.forEach(id => $(id).style.display = 'none'); $('settings-panel').style.display = 'block'; $('server-url').value = SERVER.replace(/^https?:\/\//, ''); lireOptionDemarrage(); };
 $('btn-settings-back').onclick = () => { $('settings-panel').style.display = 'none'; mainEls.forEach(id => $(id).style.display = ''); };
-$('btn-connect').onclick = () => {
-  const v = $('server-url').value.trim();
-  if (!v) return;
-  SERVER = C.normaliserServeur(v);
+// Se connecter à un serveur, de la liste ou tapé (#9255). Le côté natif le
+// retient, puis bascule la fenêtre sur ce serveur dans le mode retenu : la
+// vue mini du serveur remplace alors ce mini-lecteur embarqué.
+async function connecterA(url, cle) {
+  const adresse = C.normaliserServeur(url);
+  if (!adresse) return;
+  SERVER = adresse;
   localStorage.setItem('tune-server', SERVER);
-  // Le côté natif (raccourcis, fenêtre complète) suit la même adresse.
-  invoke('set_server_url', { url: SERVER })?.catch?.(() => {});
   if (ws) ws.close();
   $('settings-panel').style.display = 'none';
   mainEls.forEach(id => $(id).style.display = '');
+  try {
+    const retenue = await invoke('choisir_serveur', { url: adresse, cle: cle || null });
+    if (retenue) SERVER = C.normaliserServeur(retenue);
+  } catch (e) {
+    console.error('choisir_serveur:', e);
+  }
   init();
+}
+$('btn-connect').onclick = () => {
+  const v = $('server-url').value.trim();
+  if (v) connecterA(v, null);
 };
+
+// La liste des serveurs Tune du réseau (mDNS `_tune-server._tcp`), parcourue
+// côté natif pendant ~3 s.
+let rechercheServeurs = null;
+async function chercherServeurs() {
+  if (rechercheServeurs) return rechercheServeurs;
+  const liste = $('liste-serveurs');
+  const bouton = $('btn-rechercher-serveurs');
+  bouton.disabled = true;
+  liste.innerHTML = '<div class="serveurs-etat">Recherche sur le réseau…</div>';
+  rechercheServeurs = (async () => {
+    let trouves = [];
+    try { trouves = (await invoke('decouvrir_serveurs')) || []; } catch (e) { console.error('decouvrir_serveurs:', e); }
+    liste.innerHTML = '';
+    if (!trouves.length) {
+      const vide = document.createElement('div');
+      vide.className = 'serveurs-etat';
+      vide.textContent = 'Aucun serveur trouvé. Vérifiez que Tune Server tourne, ou tapez son adresse ci-dessous.';
+      liste.appendChild(vide);
+    }
+    for (const s of trouves) {
+      const { nom, detail } = C.ligneDeServeur(s);
+      const b = document.createElement('button');
+      b.className = 'serveur' + (C.estServeurActuel(s, SERVER) ? ' actuel' : '');
+      b.setAttribute('role', 'option');
+      const n = document.createElement('div');
+      n.className = 'serveur-nom';
+      n.textContent = nom;
+      const d = document.createElement('div');
+      d.className = 'serveur-detail';
+      d.textContent = detail;
+      b.append(n, d);
+      b.onclick = () => connecterA(s.url, s.cle);
+      liste.appendChild(b);
+    }
+    bouton.disabled = false;
+    rechercheServeurs = null;
+  })();
+  return rechercheServeurs;
+}
+$('btn-rechercher-serveurs').onclick = () => chercherServeurs();
+
+// Ouvre les Réglages sur la liste : au lancement sans serveur joignable, et
+// par « Choisir un serveur… » (barre des menus, menu de l'icône).
+function ouvrirChoixServeur() {
+  $('btn-settings').click();
+  chercherServeurs();
+}
+window.__TAURI__?.event?.listen?.('choisir-serveur', () => ouvrirChoixServeur());
+
+// Espace = lecture / pause, hors des champs (#9255). Les raccourcis à ⌘
+// sont dans la barre des menus, côté natif.
+document.addEventListener('keydown', (e) => {
+  if (C.actionDuClavier(e, e.target && e.target.tagName) === 'lecture-pause') {
+    e.preventDefault();
+    $('btn-play').click();
+  }
+});
 $('server-url').addEventListener('keydown', e => { if (e.key === 'Enter') $('btn-connect').click(); });
+// Option « Démarrer le serveur Tune s'il ne tourne pas » (fil 2868), lue et
+// écrite côté natif : c'est lui qui lance le serveur, au démarrage du widget.
+// Hors Tauri (page ouverte dans un navigateur), la case reste sans effet.
+// Relue à chaque ouverture des Réglages : le menu de la zone de notification
+// peut l'avoir changée entre-temps. `null` (Linux) ou hors Tauri : masquée.
+async function lireOptionDemarrage() {
+  const actif = await invoke('get_demarrer_serveur_local')?.catch?.(() => null);
+  const pris = actif === true || actif === false;
+  $('option-demarrage').style.display = pris ? '' : 'none';
+  $('demarrer-serveur').checked = actif === true;
+}
+lireOptionDemarrage();
+$('demarrer-serveur').onchange = (e) => {
+  invoke('set_demarrer_serveur_local', { actif: e.target.checked })?.catch?.(() => {});
+};
 
 // Position interpolation
 setInterval(() => {
@@ -498,15 +583,20 @@ function connectWS() {
 // Fallback polling every 10s (in case WS fails)
 setInterval(refresh, 10000);
 
-// Start : l'adresse retenue par le côté natif l'emporte sur le défaut, pas
-// sur celle que l'utilisateur a tapée dans ce panneau.
+// Start : l'adresse retenue par le côté natif l'emporte — c'est lui qui
+// adopte un serveur trouvé sur le réseau au lancement (#9255), et tout ce qui
+// est choisi ici lui est transmis (`choisir_serveur`). Hors Tauri (page
+// ouverte dans un navigateur), celle tapée ici.
 (async () => {
-  if (!localStorage.getItem('tune-server')) {
-    try {
-      const natif = C.normaliserServeur(await invoke('get_server_url'));
-      if (natif) SERVER = natif;
-    } catch {}
-  }
+  try {
+    const natif = C.normaliserServeur(await invoke('get_server_url'));
+    if (natif) {
+      SERVER = natif;
+      localStorage.setItem('tune-server', SERVER);
+    }
+  } catch {}
   init();
   connectWS();
+  // La liste demandée avant que cette page ne soit prête (lancement).
+  try { if (await invoke('choix_serveur_demande')) ouvrirChoixServeur(); } catch {}
 })();

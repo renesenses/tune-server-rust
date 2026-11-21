@@ -28,6 +28,13 @@ pub(crate) struct FauxEversolo {
     pub(crate) sans_sourdine: bool,
     /// Lève sa sourdine sur `SetVolume`, comme certains firmwares.
     pub(crate) set_volume_leve_la_sourdine: bool,
+    /// #8685 — BASCULE sa sourdine à chaque `SetMute`, quelle que soit la
+    /// valeur demandée : un ordre redondant l'inverse.
+    pub(crate) set_mute_bascule: bool,
+    /// #8685 — acquitte `SetMute` sans rien changer.
+    pub(crate) set_mute_ignore: bool,
+    /// #8685 — ne sait pas répondre à `GetMute` (réponse sans `CurrentMute`).
+    pub(crate) sans_get_mute: bool,
     pub(crate) volume: Arc<Mutex<u32>>,
     pub(crate) muet: Arc<Mutex<bool>>,
     /// Ce que l'appareil a reçu, dans l'ordre : `SetMute(1)`, `SetVolume(30)`…
@@ -190,8 +197,20 @@ async fn rc_interne(s: &FauxEversolo, corps: &str) -> axum::response::Response {
             if s.sans_sourdine {
                 return enveloppe(REFUS_401).into_response();
             }
-            *s.muet.lock().await = m == "1";
+            if s.set_mute_bascule {
+                let mut muet = s.muet.lock().await;
+                *muet = !*muet;
+            } else if !s.set_mute_ignore {
+                *s.muet.lock().await = m == "1";
+            }
             enveloppe("<u:SetMuteResponse/>").into_response()
+        }
+        "GetMute" if !s.sans_get_mute => {
+            let m = u8::from(*s.muet.lock().await);
+            enveloppe(&format!(
+                "<u:GetMuteResponse><CurrentMute>{m}</CurrentMute></u:GetMuteResponse>"
+            ))
+            .into_response()
         }
         "GetVolume" => {
             let n = *s.volume.lock().await;

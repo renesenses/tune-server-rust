@@ -81,7 +81,7 @@ pub(super) struct ActiverCorps {
 /// rend la clé de secours UNE fois ; ensuite, aucun corps n'est requis.
 /// Dépose aussitôt un premier instantané si le compte est relié.
 pub(super) async fn enable(
-    _admin: RequireAdmin,
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     corps: Option<Json<ActiverCorps>>,
 ) -> Response {
@@ -185,7 +185,10 @@ pub(super) async fn disable(_admin: RequireAdmin, State(state): State<AppState>)
 
 // ── POST /system/config-backup/cloud/backup-now ─────────────────────
 
-pub(super) async fn backup_now(_admin: RequireAdmin, State(state): State<AppState>) -> Response {
+pub(super) async fn backup_now(
+    _admin: crate::auth::AdminOuCetteMachine,
+    State(state): State<AppState>,
+) -> Response {
     if let Err(r) = garde_premium(&state).await {
         return r;
     }
@@ -223,7 +226,10 @@ pub(super) async fn backup_now(_admin: RequireAdmin, State(state): State<AppStat
 
 // ── GET /system/config-backup/cloud/snapshots ───────────────────────
 
-pub(super) async fn snapshots(_admin: RequireAdmin, State(state): State<AppState>) -> Response {
+pub(super) async fn snapshots(
+    _admin: crate::auth::AdminOuCetteMachine,
+    State(state): State<AppState>,
+) -> Response {
     if let Err(r) = garde_premium(&state).await {
         return r;
     }
@@ -270,7 +276,9 @@ pub(super) struct RestaurerCorps {
 /// Restaure un instantané. Le secret, s'il faut, voyage dans le CORPS, jamais
 /// dans l'URL, et n'est ni journalisé ni rendu.
 pub(super) async fn restore(
-    _admin: RequireAdmin,
+    // Engage la machine : administrateur, ou authentification coupée,
+    // seulement depuis cette machine.
+    _admin: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     Json(corps): Json<RestaurerCorps>,
 ) -> Response {
@@ -306,8 +314,16 @@ pub(super) async fn restore(
             return erreur(StatusCode::UNPROCESSABLE_ENTITY, "backup_unreadable");
         }
     };
+    // Les clés protégées (authentification, greffons, chemins, relais…) ne
+    // passent qu'avec un administrateur authentifié, comme pour l'import
+    // local (`config_backup::import`).
+    let mut contenu = contenu;
+    let ecartees = ecarter_du_contenu(&state, &mut contenu);
     let rapport = match sc::restaurer(&state.backend, &contenu, corps.mode) {
-        Ok(r) => r,
+        Ok(mut r) => {
+            r.warnings.extend(ecartees);
+            r
+        }
         Err(e) => {
             warn!(error = %e, "sauvegarde_cloud_restauration_echec");
             return (
@@ -339,6 +355,58 @@ pub(super) async fn restore(
         "report": rapport,
     }))
     .into_response()
+}
+
+/// Retire du contenu d'un instantané les réglages protégés quand
+/// l'administrateur n'est pas authentifié ; rend les avertissements.
+pub(crate) fn ecarter_du_contenu(state: &AppState, contenu: &mut Value) -> Vec<String> {
+    let Some(reglages) = contenu.get_mut("settings").and_then(Value::as_object_mut) else {
+        return Vec::new();
+    };
+    let mut liste: Vec<(String, Value)> = std::mem::take(reglages).into_iter().collect();
+    let ecartees = super::config::ecarter_les_cles_protegees(state, &mut liste);
+    *reglages = liste.into_iter().collect();
+    ecartees
+}
+
+#[cfg(test)]
+mod tests_cles_protegees {
+    use super::*;
+
+    fn contenu() -> Value {
+        json!({
+            "format": "x",
+            "settings": {
+                "theme": "dark",
+                "plugin_bandcamp_installed": "true",
+                "premium_audio_plugins_withheld_equalizer": "installed,enabled",
+                "auth_enabled": "false",
+                "jwt_secret": "secret-de-l-instantane",
+            }
+        })
+    }
+
+    #[test]
+    fn sans_administrateur_les_cles_protegees_ne_sont_pas_restaurees() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let mut c = contenu();
+        let avertissements = ecarter_du_contenu(&state, &mut c);
+        let reglages = c["settings"].as_object().unwrap();
+        assert_eq!(reglages.len(), 1, "{reglages:?}");
+        assert!(reglages.contains_key("theme"));
+        assert_eq!(avertissements.len(), 4, "{avertissements:?}");
+    }
+
+    #[test]
+    fn avec_l_administrateur_authentifie_tout_est_restaure() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        SettingsRepo::with_backend(state.backend.clone())
+            .set("auth_enabled", "true")
+            .unwrap();
+        let mut c = contenu();
+        assert!(ecarter_du_contenu(&state, &mut c).is_empty());
+        assert_eq!(c["settings"].as_object().unwrap().len(), 5);
+    }
 }
 
 /// La passe de fond : toutes les [`sc::CADENCE_MINUTES`], premier tour deux

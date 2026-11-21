@@ -12,9 +12,11 @@
 //! restent allumés pour la télécommande du lendemain. Avec
 //! `action: "poweroff"` (décision de Bertrand du 11/11, réponse forum 10786),
 //! le planificateur arrête d'abord la lecture puis éteint la MACHINE, par le
-//! crochet [`Extinction`] que lui donne le serveur. Ce crochet est la seule
-//! fonction d'extinction du serveur (`routes::appliance::ordonner`) : elle
-//! refuse hors Tune OS, où Tune n'est pas seul sur la machine.
+//! crochet [`Extinction`] que lui donne le serveur
+//! (`extinction_hote::extinction_programmee`) : Tune OS par sa fonction
+//! d'extinction, et depuis #8909 un hôte Linux, macOS ou Windows hors
+//! conteneur. Un échec (polkit qui refuse…) est gardé sous [`CLE_ECHEC`] pour
+//! que l'écran le dise ([`lire_echec_extinction`]).
 //!
 //! Le réglage est rangé dans `settings` sous [`CLE`], en JSON.
 
@@ -32,6 +34,45 @@ use crate::playback::PlayState;
 /// Clé du réglage dans la table `settings`.
 pub const CLE: &str = "scheduled_stop";
 
+/// Clé du dernier échec d'extinction programmée (#8909).
+pub const CLE_ECHEC: &str = "scheduled_stop_poweroff_error";
+
+/// Le dernier échec d'extinction programmée, tel que l'API le rend.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EchecExtinction {
+    /// Heure locale du serveur de l'échéance, `AAAA-MM-JJTHH:MM:SS`.
+    pub at: String,
+    /// Code stable du refus (`polkit_denied`…).
+    #[serde(default)]
+    pub code: String,
+    /// Le message du refus, en clair (sortie d'erreur comprise).
+    pub error: String,
+}
+
+/// Lit le dernier échec d'extinction. Absent ou illisible → `None`.
+pub fn lire_echec_extinction(db: &Arc<dyn DbBackend>) -> Option<EchecExtinction> {
+    let brut = SettingsRepo::with_backend(db.clone())
+        .get_sans_ecrivain(CLE_ECHEC)
+        .ok()??;
+    serde_json::from_str(&brut).ok()
+}
+
+/// Oublie le dernier échec d'extinction (journalisé s'il ne part pas).
+pub fn effacer_echec_extinction(db: &Arc<dyn DbBackend>) {
+    if let Err(e) = SettingsRepo::with_backend(db.clone()).delete(CLE_ECHEC) {
+        warn!(error = %e, "scheduled_poweroff_error_clear_failed");
+    }
+}
+
+fn noter_echec_extinction(db: &Arc<dyn DbBackend>, echec: &EchecExtinction) {
+    let Ok(json) = serde_json::to_string(echec) else {
+        return;
+    };
+    if let Err(e) = SettingsRepo::with_backend(db.clone()).set(CLE_ECHEC, &json) {
+        warn!(error = %e, "scheduled_poweroff_error_write_failed");
+    }
+}
+
 /// Le planificateur relit le réglage toutes les 20 s : une minute `HH:MM`
 /// est toujours vue au moins deux fois, jamais manquée.
 const INTERVALLE_S: u64 = 20;
@@ -47,10 +88,32 @@ pub enum ActionArret {
     Poweroff,
 }
 
-/// Le crochet d'extinction de la machine, fourni par le serveur. Rend
-/// l'erreur telle quelle (refus hors Tune OS, `systemctl` qui échoue).
-pub type Extinction =
-    Arc<dyn Fn() -> futures_util::future::BoxFuture<'static, Result<(), String>> + Send + Sync>;
+/// Le refus du crochet d'extinction : un code stable (`polkit_denied`,
+/// `auth_required`, `mode_mismatch`…) et le message en clair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RefusExtinction {
+    pub code: String,
+    pub message: String,
+}
+
+impl From<&str> for RefusExtinction {
+    /// Un refus sans code particulier (`failed`).
+    fn from(message: &str) -> Self {
+        RefusExtinction {
+            code: "failed".into(),
+            message: message.into(),
+        }
+    }
+}
+
+/// Le crochet d'extinction de la machine, fourni par le serveur. Il reçoit
+/// le mode d'extinction RANGÉ avec le réglage ([`ArretProgramme::poweroff_mode`],
+/// validé par la route à la pose) et rend le refus tel quel.
+pub type Extinction = Arc<
+    dyn Fn(Option<String>) -> futures_util::future::BoxFuture<'static, Result<(), RefusExtinction>>
+        + Send
+        + Sync,
+>;
 
 /// Le réglage tel qu'il est rangé et tel que l'API le rend.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,6 +132,12 @@ pub struct ArretProgramme {
     /// d'avant l'option).
     #[serde(default)]
     pub action: ActionArret,
+    /// #8909 — le mode d'extinction validé à la pose (`"tune_os"`, `"host"`),
+    /// écrit par la route seule, jamais repris du client. À l'échéance,
+    /// l'extinction n'a lieu que si le mode courant de la machine est le
+    /// même : un réglage restauré ou importé d'ailleurs n'éteint rien.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poweroff_mode: Option<String>,
 }
 
 fn tous_les_jours() -> String {
@@ -263,21 +332,34 @@ impl PlanificateurArretProgramme {
         *derniere = Some(minute);
         let arretees = self.arreter(&reglage).await;
         if reglage.action == ActionArret::Poweroff {
-            self.eteindre().await;
+            self.eteindre(maintenant, reglage.poweroff_mode.clone())
+                .await;
         }
         arretees
     }
 
-    /// Éteint la machine par le crochet du serveur. Un refus (hors Tune OS)
-    /// ou un échec ne remonte nulle part ailleurs que dans le journal.
-    async fn eteindre(&self) {
+    /// Éteint la machine par le crochet du serveur. Un refus (conteneur,
+    /// polkit…) ou un échec est journalisé ET gardé pour l'écran (#8909) ;
+    /// une extinction partie efface l'échec précédent.
+    async fn eteindre(&self, maintenant: NaiveDateTime, mode_range: Option<String>) {
         let Some(extinction) = &self.extinction else {
             warn!("scheduled_poweroff_unavailable: no power-off hook");
             return;
         };
         info!("scheduled_poweroff_requested");
-        if let Err(e) = extinction().await {
-            warn!(error = %e, "scheduled_poweroff_failed");
+        match extinction(mode_range).await {
+            Ok(()) => effacer_echec_extinction(&self.db),
+            Err(e) => {
+                warn!(code = %e.code, error = %e.message, "scheduled_poweroff_failed");
+                noter_echec_extinction(
+                    &self.db,
+                    &EchecExtinction {
+                        at: maintenant.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                        code: e.code,
+                        error: e.message,
+                    },
+                );
+            }
         }
     }
 

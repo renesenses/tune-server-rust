@@ -50,6 +50,53 @@ pub(super) async fn flux_de_la_sonde_de_niveaux(
     )
 }
 
+/// La sonde de niveaux d'une piste de service devenue courante par avance
+/// sans blanc. #8795 — pour TIDAL, `get_track_url` retéléchargeait la piste
+/// qui joue entière (`tidal_dash_cache_stale_redownloading`, 81 segments et
+/// 119 Mo au fil 2836) sous le verrou du service, en même temps que le
+/// préchargement de la suivante. Décision du 20/11 : la sonde TIDAL ne vise
+/// qu'un fMP4 complet déjà au cache ou épinglé ; sinon pas de sonde (les
+/// aiguilles restent figées pour cette piste), et aucun téléchargement.
+pub(super) async fn flux_de_la_sonde_apres_avance(
+    svc: &dyn StreamingService,
+    source: &str,
+    source_id: &str,
+    provider_quality: Option<&str>,
+) -> Option<StreamUrl> {
+    if source == "tidal" {
+        let tidal = svc
+            .as_any()
+            .downcast_ref::<crate::streaming::tidal::TidalService>()?;
+        let flux = tidal
+            .flux_complet_en_cache(source_id, provider_quality)
+            .await;
+        if flux.is_none() {
+            info!(source_id, "gapless_levels_tidal_sans_fichier_complet_8795");
+        }
+        return flux;
+    }
+    flux_de_la_sonde_de_niveaux(svc, source, source_id, provider_quality).await
+}
+
+/// #8795 — le fMP4 DASH que le préchauffage de la suivante vient de
+/// transcoder. Il n'est supprimé que si aucune zone ne l'épingle (#8701) :
+/// la piste préparée par le gapless désigne ce même fichier dans le cache
+/// d'URL de TIDAL. Le supprimer rendait l'entrée « stale » juste après
+/// l'avance (`tidal_dash_cache_stale_redownloading`), d'où un second
+/// téléchargement de la piste qui joue au premier saut, et une sonde des
+/// VU-mètres muette. Un fichier épinglé reste au ramasse-miettes
+/// (`spawn_dash_temp_gc`), qui l'enlève une fois l'épingle levée.
+pub(super) fn consommer_le_fmp4_prechauffe(dash_file: &str) -> bool {
+    if crate::audio::dash_epingles::est_epingle(dash_file) {
+        debug!(
+            path = dash_file,
+            "streaming_dash_warm_next_fmp4_epingle_garde_8795"
+        );
+        return false;
+    }
+    std::fs::remove_file(dash_file).is_ok()
+}
+
 /// #5143 — LE cœur de « la prochaine piste jouable » : depuis `position`,
 /// les lignes de file bannies pour le profil des sélections automatiques
 /// (locales par `track_id`, de service par `source` + `source_id`), et où
@@ -479,8 +526,8 @@ impl PlaybackOrchestrator {
             .await;
 
             // The fMP4 has served its purpose (a warm cache-hit serves the FLAC),
-            // so consume it like the play path does.
-            let _ = std::fs::remove_file(&dash_file);
+            // so consume it like the play path does — unless a zone pins it.
+            consommer_le_fmp4_prechauffe(&dash_file);
 
             // Same guard as the play-path store: only cache when the decoded
             // reality matches the key (`quality.*` from the service API can lie);
@@ -729,8 +776,7 @@ impl PlaybackOrchestrator {
     }
 
     pub async fn play_from_queue(&self, zone_id: i64, position: i64) -> Result<PlayResult, String> {
-        self.play_from_queue_inner(zone_id, position, true, Entree::Geste, None)
-            .await
+        Box::pin(self.play_from_queue_inner(zone_id, position, true, Entree::Geste, None)).await
     }
 
     /// Reprendre un contexte à sa position explicite (#7280).
@@ -742,15 +788,14 @@ impl PlaybackOrchestrator {
         seek_ms: u64,
     ) -> Result<PlayResult, String> {
         self.playback.oublier_le_deplacement(zone_id).await;
-        let result = self
-            .play_from_queue_inner(
-                zone_id,
-                position,
-                true,
-                Entree::RepriseDeContexte,
-                Some(seek_ms),
-            )
-            .await?;
+        let result = Box::pin(self.play_from_queue_inner(
+            zone_id,
+            position,
+            true,
+            Entree::RepriseDeContexte,
+            Some(seek_ms),
+        ))
+        .await?;
         let zone = ZoneRepo::with_backend(self.db.clone()).get(zone_id)?;
         let browser_ready = zone
             .as_ref()
@@ -788,7 +833,7 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         position: i64,
     ) -> Result<PlayResult, String> {
-        self.play_from_queue_inner(zone_id, position, true, Entree::FinDePiste, None)
+        Box::pin(self.play_from_queue_inner(zone_id, position, true, Entree::FinDePiste, None))
             .await
     }
 
@@ -807,8 +852,7 @@ impl PlaybackOrchestrator {
         zone_id: i64,
         position: i64,
     ) -> Result<PlayResult, String> {
-        self.play_from_queue_inner(zone_id, position, false, Entree::Geste, None)
-            .await
+        Box::pin(self.play_from_queue_inner(zone_id, position, false, Entree::Geste, None)).await
     }
 
     /// #7846 (fil 2648) — le transfert vers une sortie qui DÉCODE elle-même
@@ -827,9 +871,14 @@ impl PlaybackOrchestrator {
         position: i64,
         seek_ms: u64,
     ) -> Result<PlayResult, String> {
-        let result = self
-            .play_from_queue_inner(zone_id, position, false, Entree::Geste, Some(seek_ms))
-            .await?;
+        let result = Box::pin(self.play_from_queue_inner(
+            zone_id,
+            position,
+            false,
+            Entree::Geste,
+            Some(seek_ms),
+        ))
+        .await?;
         if seek_ms > 0 && result.output_sent {
             self.playback.seek(zone_id, seek_ms as i64).await;
             if let Some(zone) = ZoneRepo::with_backend(self.db.clone()).get(zone_id)? {
@@ -890,9 +939,9 @@ impl PlaybackOrchestrator {
                 duration_ms: entry.duration_ms,
                 seek_ms,
                 temp_file_path: None,
-                sample_rate: None,
-                bit_depth: None,
-                media_format: None,
+                sample_rate: entry.sample_rate.and_then(|v| u32::try_from(v).ok()),
+                bit_depth: entry.bit_depth.and_then(|v| u16::try_from(v).ok()),
+                media_format: entry.format.clone(),
                 track_number: entry.track_number.map(|n| n as u32),
                 disc_number: entry.disc_number.map(|n| n as u32),
                 album_ref: None,
@@ -967,9 +1016,9 @@ impl PlaybackOrchestrator {
                 duration_ms,
                 seek_ms,
                 temp_file_path: None,
-                sample_rate: None,
-                bit_depth: None,
-                media_format: None,
+                sample_rate: entry.sample_rate.and_then(|v| u32::try_from(v).ok()),
+                bit_depth: entry.bit_depth.and_then(|v| u16::try_from(v).ok()),
+                media_format: entry.format.clone(),
                 track_number: entry.track_number.map(|n| n as u32),
                 disc_number: entry.disc_number.map(|n| n as u32),
                 album_ref: entry.album_ref.clone(),
@@ -982,7 +1031,7 @@ impl PlaybackOrchestrator {
         self.playback
             .update_queue_info(zone_id, position, total)
             .await;
-        self.play_par_l_entree(req, historique, entree).await
+        Box::pin(self.play_par_l_entree(req, historique, entree)).await
     }
 
     /// Précharge, en tâche de fond, la piste qui suit la piste COURANTE de la
@@ -1154,9 +1203,13 @@ impl PlaybackOrchestrator {
             let (format, sample_rate, bit_depth, bitrate_kbps) = match qualite {
                 Some(q) => (q.format, q.sample_rate, q.bit_depth, q.bitrate_kbps),
                 None => (
-                    fiche.format.clone(),
-                    fiche.sample_rate,
-                    fiche.bit_depth,
+                    fiche.format.clone().or_else(|| entry.format.clone()),
+                    fiche
+                        .sample_rate
+                        .or_else(|| entry.sample_rate.and_then(|v| u32::try_from(v).ok())),
+                    fiche
+                        .bit_depth
+                        .or_else(|| entry.bit_depth.and_then(|v| u32::try_from(v).ok())),
                     fiche.bitrate_kbps,
                 ),
             };
@@ -1327,9 +1380,13 @@ impl PlaybackOrchestrator {
             } else {
                 true
             };
+            // #9142 — une tranche de feuille CUE n'a pas de `file_path` : ses
+            // bornes donnent le média et le début de la tranche.
+            let bornes_cue = track.as_ref().and_then(|t| t.bornes_cue());
             let a_mesurer = fichier_a_mesurer_apres_avance(
                 format.as_deref(),
                 track.and_then(|t| t.file_path),
+                bornes_cue,
                 la_sortie_mesure,
             );
             // Génération épinglée ici : l'avance vient d'avoir lieu, c'est
@@ -1350,8 +1407,19 @@ impl PlaybackOrchestrator {
                     (None, true) => "non_lance_sans_fichier",
                 },
             );
-            if let Some(path) = a_mesurer {
-                spawn_local_file_levels_decode(bus, self.playback.clone(), zone_id, play_seq, path);
+            if let Some((path, debut_fichier_ms)) = a_mesurer {
+                // Les fenêtres sont datées depuis 0, la position dans la
+                // PISTE ; le fichier, lui, se décode depuis le début de la
+                // tranche (0 pour une piste ordinaire).
+                spawn_local_file_levels_decode_depuis(
+                    bus,
+                    self.playback.clone(),
+                    zone_id,
+                    play_seq,
+                    path,
+                    debut_fichier_ms,
+                    0,
+                );
             }
         } else if let (Some(bus), Some(source_id)) =
             (self.event_bus.clone(), advance_source_id.clone())
@@ -1406,7 +1474,7 @@ impl PlaybackOrchestrator {
                         let svc = svc.clone();
                         drop(registry);
                         let svc = svc.read().await;
-                        flux_de_la_sonde_de_niveaux(&**svc, &source, &source_id, provider_quality)
+                        flux_de_la_sonde_apres_avance(&**svc, &source, &source_id, provider_quality)
                             .await
                     };
                     let Some(data) = resolved else {
@@ -1507,7 +1575,7 @@ impl PlaybackOrchestrator {
                 disc_number: None,
                 album_ref: None,
             };
-            let resolved = self.resolve_stream(&req).await?;
+            let resolved = Box::pin(self.resolve_stream(&req)).await?;
             if let Some(ref sid) = resolved.stream_id {
                 self.gapless_sessions
                     .lock()
@@ -1588,14 +1656,14 @@ impl PlaybackOrchestrator {
             duration_ms: duration,
             seek_ms: None,
             temp_file_path: None,
-            sample_rate: None,
-            bit_depth: None,
-            media_format: None,
+            sample_rate: entry.sample_rate.and_then(|v| u32::try_from(v).ok()),
+            bit_depth: entry.bit_depth.and_then(|v| u16::try_from(v).ok()),
+            media_format: entry.format.clone(),
             track_number: None,
             disc_number: None,
             album_ref: entry.album_ref.clone(),
         };
-        let resolved = self.resolve_stream(&req).await?;
+        let resolved = Box::pin(self.resolve_stream(&req)).await?;
         if let Some(ref sid) = resolved.stream_id {
             self.gapless_sessions
                 .lock()
@@ -1702,3 +1770,7 @@ impl PlaybackOrchestrator {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "sonde_tidal_8795_tests.rs"]
+mod sonde_tidal_8795_tests;

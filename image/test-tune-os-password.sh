@@ -7,8 +7,8 @@ source "${SCRIPT_DIR}/tune-os-password.sh"
 
 first="$(generate_password)"
 second="$(generate_password)"
-[[ "$first" =~ ^[0-9a-f]{24}$ ]]
-[[ "$second" =~ ^[0-9a-f]{24}$ ]]
+[[ "$first" =~ ^[bcdefghijklnoprstuvxy]{24}$ ]]
+[[ "$second" =~ ^[bcdefghijklnoprstuvxy]{24}$ ]]
 [[ "$first" != "$second" ]]
 
 # Generate the fixture with the same libc crypt(3) implementation that the
@@ -90,12 +90,23 @@ chage() { printf '%s\n' "$*" > "${work}/chage.args"; }
 sortie="$(reinitialiser 2>&1)"
 [[ -s "${work}/run/premier-mot-de-passe" ]] || fail "aucun mot de passe temporaire publié"
 pw="$(cat "${work}/run/premier-mot-de-passe")"
-[[ "$pw" =~ ^[0-9a-f]{24}$ ]] || fail "copie publiée hors forme"
+[[ "$pw" =~ ^[bcdefghijklnoprstuvxy]{24}$ ]] || fail "copie publiée hors forme"
 [[ "$(cat "${work}/chpasswd.in")" == "tune:${pw}" ]] || fail "chpasswd n'a pas reçu le mot de passe publié"
 [[ "$(cat "${work}/chage.args")" == "-d 0 tune" ]] || fail "mot de passe non expiré (chage -d 0)"
 [[ "$(cat "${work}/state/ssh-password-v2")" == "reset-from-console" ]] || fail "marqueur absent"
 [[ "$sortie" != *"$pw"* ]] || fail "mot de passe écrit sur la sortie (journal)"
 grep -q "$pw" "${work}/issue.d/90-tune-initial-password.issue" || fail "avis de console absent"
+mode="$(stat -c %a "${work}/issue.d/90-tune-initial-password.issue" 2>/dev/null \
+    || stat -f %Lp "${work}/issue.d/90-tune-initial-password.issue")"
+[[ "$mode" == 600 ]] || fail "avis de console lisible au-delà de root (mode $mode)"
+compgen -G "${work}/issue.d/90-tune-initial-password.issue.*" > /dev/null \
+    && fail "fichier temporaire de l'avis resté"
+# Un avis déjà présent, d'une version précédente, en 0644 : remplacé en 0600.
+chmod 0644 "${work}/issue.d/90-tune-initial-password.issue"
+reinitialiser > /dev/null 2>&1
+mode="$(stat -c %a "${work}/issue.d/90-tune-initial-password.issue" 2>/dev/null \
+    || stat -f %Lp "${work}/issue.d/90-tune-initial-password.issue")"
+[[ "$mode" == 600 ]] || fail "avis existant laissé lisible au-delà de root (mode $mode)"
 REINITIALISER
 
 # main must be reached exactly as in production (#5617): the server pipes

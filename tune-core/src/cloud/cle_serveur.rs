@@ -220,7 +220,11 @@ async fn inscrire(
             .map(|v| v.trim().to_string())
             .filter(|v| !v.is_empty())
     };
-    let (Some(server_id), Some(jeton)) = (lire("server_id"), lire("mozaik_access_token")) else {
+    // #8797 : après un refus de la session par le site, rien ne part.
+    let (Some(server_id), Some(jeton)) = (
+        lire("server_id"),
+        crate::cloud::sso::jeton_de_compte(&reglages),
+    ) else {
         return Ok(false);
     };
     let Some(jeton_de_liaison) = lire(crate::cloud::library_sync::CLE_JETON_DE_LIAISON) else {

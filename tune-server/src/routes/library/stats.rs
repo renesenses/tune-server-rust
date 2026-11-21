@@ -128,9 +128,19 @@ pub(super) async fn library_stats(State(state): State<AppState>) -> Result<Json<
     // `SUM` et des `GROUP BY` sur `tracks` : hors des fils de l'exécuteur,
     // comme les routes de #5438. Sous un disque saturé, chacune tenait un fil
     // `tokio-rt-worker` aussi longtemps qu'elle lisait.
-    super::facets::hors_executeur("library_stats", move || lire_library_stats(&state))
-        .await?
-        .map(Json)
+    //
+    // #9116 — et resservi quand tout est suspendu (scan compris), sous la
+    // même révision de bibliothèque, une minute au plus : l'écran État du
+    // serveur la sonde toutes les 5 s.
+    let s = state.clone();
+    crate::routes::system::avancement_suspendu_9116::corps_general(
+        &state.comptages.releves.stats_bibliotheque,
+        "library_stats",
+        &state.backend,
+        move || lire_library_stats(&s),
+    )
+    .await
+    .map(Json)
 }
 
 fn lire_library_stats(state: &AppState) -> Result<Value, AppError> {
@@ -141,9 +151,11 @@ fn lire_library_stats(state: &AppState) -> Result<Value, AppError> {
             ("CAST(duration_ms AS bigint)", "CAST(file_size AS bigint)")
         }
     };
+    // #9265 — le nombre d'artistes suit la grille.
+    let grille = tune_core::db::artist_repo::PREDICAT_ARTISTES_DE_LA_GRILLE;
     let sql = format!(
         "SELECT \
-         (SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)), \
+         (SELECT COUNT(*) FROM artists WHERE {grille}), \
          (SELECT COUNT(*) FROM albums), \
          (SELECT COUNT(*) FROM tracks), \
          (SELECT COUNT(*) FROM zones), \
@@ -221,13 +233,33 @@ fn lire_library_stats(state: &AppState) -> Result<Value, AppError> {
 pub(super) async fn completeness_stats(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, AppError> {
+    // #9116 — une vingtaine de comptages sur toute la bibliothèque, dont des
+    // `NOT EXISTS` sur `track_metadata`, que l'écran État du serveur relançait
+    // toutes les 5 s DANS l'exécuteur. Hors de l'exécuteur désormais, et
+    // resservi quand tout est suspendu (scan compris), sous la même révision
+    // de bibliothèque, une minute au plus.
+    let s = state.clone();
+    crate::routes::system::avancement_suspendu_9116::corps_general(
+        &state.comptages.releves.completude,
+        "completeness_stats",
+        &state.backend,
+        move || lire_completude(&s),
+    )
+    .await
+    .map(Json)
+}
+
+fn lire_completude(state: &AppState) -> Result<Value, AppError> {
     // Go through state.backend, NOT state.db: state.db is always the raw
     // SQLite handle, which on a PostgreSQL deployment is a leftover empty
     // database — every count read 0, so the four Metadata cards all showed
     // the same "0/0 = 100%" figure (Fabien-4, v0.9.13). Same engine routing
     // as library_stats above; the SQL itself is dialect-neutral.
     let b = &state.backend;
-    let sql = "SELECT \
+    // #9265 — le nombre d'artistes suit la grille.
+    let grille = tune_core::db::artist_repo::PREDICAT_ARTISTES_DE_LA_GRILLE;
+    let sql = format!(
+        "SELECT \
          (SELECT COUNT(*) FROM tracks), \
          (SELECT COUNT(*) FROM tracks WHERE genre IS NOT NULL AND genre != ''), \
          (SELECT COUNT(*) FROM tracks WHERE year IS NOT NULL), \
@@ -240,8 +272,8 @@ pub(super) async fn completeness_stats(
          (SELECT COUNT(*) FROM albums WHERE year IS NOT NULL AND year > 0), \
          (SELECT COUNT(*) FROM albums al LEFT JOIN artists ar ON ar.id = al.artist_id \
           WHERE al.artist_id IS NULL OR ar.name IS NULL OR ar.name = '' OR ar.name = 'Unknown Artist'), \
-         (SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)), \
-         (SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL) \
+         (SELECT COUNT(*) FROM artists WHERE {grille}), \
+         (SELECT COUNT(*) FROM artists WHERE {grille} \
           AND (image_path IS NULL OR image_path = '')), \
          (SELECT COUNT(DISTINCT track_id) FROM track_metadata WHERE key = 'dr_track' AND value != ''), \
          (SELECT COUNT(DISTINCT track_id) FROM track_metadata WHERE key = 'dr_source' AND value = 'analysis'), \
@@ -256,9 +288,10 @@ pub(super) async fn completeness_stats(
                   WHERE i.track_id = s.track_id AND i.key = 'dr_indisponible')), \
          (SELECT COUNT(*) FROM tracks t WHERE (t.file_path IS NULL OR t.file_path = '') \
             AND NOT EXISTS (SELECT 1 FROM track_metadata d \
-                  WHERE d.track_id = t.id AND d.key = 'dr_track' AND TRIM(d.value) != ''))";
+                  WHERE d.track_id = t.id AND d.key = 'dr_track' AND TRIM(d.value) != ''))"
+    );
     let row = b
-        .query_one(sql, &[])
+        .query_one(&sql, &[])
         .map_err(AppError::internal)?
         .unwrap_or_default();
     let get = |i: usize| row.get(i).and_then(|v| v.as_i64()).unwrap_or(0);
@@ -438,19 +471,28 @@ pub(super) async fn completeness_stats(
         corps["dynamic_range_unmanageable"] = json!(d.non_gerables());
         corps["dynamic_range_unmeasurable"] = json!(d.non_mesurables);
     }
-    Ok(Json(corps))
+    Ok(corps)
 }
 
+/// L'activité récente : l'historique du profil appelant, comme
+/// `GET /history` (ses écoutes et celles sans profil), 200 lignes au plus.
 pub(super) async fn library_activity(
     State(state): State<AppState>,
+    crate::routes::active_profile::ActiveProfile(moi): crate::routes::active_profile::ActiveProfile,
     Query(p): Query<Pagination>,
 ) -> Json<Value> {
-    let limit = p.limit.unwrap_or(20);
+    let limit = p.limit.unwrap_or(20).clamp(1, 200);
     let repo = HistoryRepo::with_backend(state.backend.clone());
-    let items = repo.recent(limit).unwrap_or_default();
+    let items = repo
+        .recent_paginated_du_profil(limit, 0, moi)
+        .map(|(items, _)| items)
+        .unwrap_or_default();
     Json(json!(items))
 }
 
+#[cfg(test)]
+#[path = "artistes_grille_stats_9265_tests.rs"]
+mod artistes_grille_stats_9265_tests;
 #[cfg(test)]
 #[path = "totaux_8625_tests.rs"]
 mod totaux_8625_tests;

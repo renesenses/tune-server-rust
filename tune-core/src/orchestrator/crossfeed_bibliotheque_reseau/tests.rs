@@ -498,12 +498,10 @@ async fn le_chemin_des_services_garde_une_seule_passe_2742() {
     porte_le_crossfeed_une_fois("services", &s);
 }
 
-/// #5114 — licence ÉCHUE : l'orchestrateur ne charge plus le crossfeed, le
-/// flux n'en porte donc pas (mesuré), ne l'annonce pas, et la compensation
-/// qu'il ANNONCE (#5146) est exactement celle de l'égaliseur seul — au lieu
-/// de compter aussi le gain moyen d'un crossfeed absent.
+/// #9210 — le crossfeed simple et sa compensation restent identiques en
+/// compte Free. Le témoin sans crossfeed garde une compensation différente.
 #[tokio::test]
-async fn licence_echue_ni_crossfeed_servi_ni_compense_5114() {
+async fn crossfeed_gratuit_9210_flux_et_compensation_identiques_en_free() {
     let mut m = monter(Renderer::AnnonceLeLpcm, None).await;
     armer_l_egaliseur(&m);
     let premium = jouer(&m, None).await;
@@ -518,10 +516,10 @@ async fn licence_echue_ni_crossfeed_servi_ni_compense_5114() {
         !m.orch.license.as_ref().unwrap().premium_snapshot(),
         "le témoin exige une licence échue"
     );
-    assert!(m.orch.crossfeed_configure(m.zone_id).is_none());
+    assert!(m.orch.crossfeed_configure(m.zone_id).is_some());
     let echue = jouer(&m, None).await;
     journal("licence échue", &echue);
-    ne_porte_aucun_crossfeed("licence échue", &echue);
+    porte_le_crossfeed_une_fois("compte Free", &echue);
     let echue_db = echue
         .annonce_compensation
         .expect("l'égaliseur, gratuit, reste compensé");
@@ -541,13 +539,13 @@ async fn licence_echue_ni_crossfeed_servi_ni_compense_5114() {
          égaliseur seul {egaliseur_seul_db:.2} dB"
     );
     assert!(
-        (echue_db - egaliseur_seul_db).abs() < 1e-9,
-        "licence échue : le flux doit annoncer la compensation de l'égaliseur seul \
-         ({egaliseur_seul_db:.2} dB), il annonce {echue_db:.2} dB"
+        (echue_db - premium_db).abs() < 1e-9,
+        "compte Free : compensation identique au compte Premium \
+         ({premium_db:.2} dB), il annonce {echue_db:.2} dB"
     );
     assert!(
-        premium_db - echue_db > 0.05,
-        "le témoin exige un crossfeed qui déplace la cible : {premium_db:.2} / {echue_db:.2} dB"
+        echue_db - egaliseur_seul_db > 0.05,
+        "le témoin exige un crossfeed qui déplace la cible : {echue_db:.2} / {egaliseur_seul_db:.2} dB"
     );
 }
 

@@ -418,7 +418,7 @@ impl RadioFranceApi {
         }
 
         debug!(
-            show = show_url,
+            show = %crate::confidentialite::masquer_url(&show_url),
             episodes = episodes.len(),
             "radiofrance_episodes_fetched"
         );

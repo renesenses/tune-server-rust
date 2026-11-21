@@ -9,9 +9,6 @@
     "core:window:allow-set-position",
     "core:window:allow-center",
     "core:window:allow-is-visible",
-    "core:tray:default",
-    "global-shortcut:allow-register",
-    "global-shortcut:allow-unregister",
-    "shell:allow-open"
+    "core:tray:default"
   ]
 }
