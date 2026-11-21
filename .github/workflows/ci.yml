@@ -572,7 +572,7 @@ jobs:
   windows-pr:
     name: Windows + ASIO (compilation PR)
     needs: impact
-    if: (github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true' && needs.impact.outputs.windows == 'true') && vars.SANS_WINDOWS != '1'
+    if: github.event_name == 'pull_request' && needs.impact.outputs.rust == 'true' && needs.impact.outputs.windows == 'true' && vars.SANS_WINDOWS != '1'
     runs-on: windows-latest
     timeout-minutes: 30
     steps:
