@@ -355,8 +355,7 @@ async fn garder(ctx: ContextePerte, id: String, sortie: Sortie, generation: u64)
                 "mdns_oaat_sonde_en_echec"
             );
         }
-        if decision == Decision::GarderSortieOccupee && alerter_sortie_occupee(compteurs.occupee)
-        {
+        if decision == Decision::GarderSortieOccupee && alerter_sortie_occupee(compteurs.occupee) {
             warn!(
                 id = %id,
                 passages = compteurs.occupee,
@@ -692,7 +691,11 @@ mod tests {
             assert_eq!(c.occupee, n);
         }
         let alertes: Vec<u32> = (1..=40).filter(|n| alerter_sortie_occupee(*n)).collect();
-        assert_eq!(alertes, vec![4, 14, 24, 34], "au 4e passage, puis tous les 10");
+        assert_eq!(
+            alertes,
+            vec![4, 14, 24, 34],
+            "au 4e passage, puis tous les 10"
+        );
         let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let etat = etat_sur(ecoute.local_addr().unwrap().port(), false);
         passer(Some(&etat), &mut c, reglages_rapides()).await;
