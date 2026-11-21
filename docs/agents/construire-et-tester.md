@@ -36,6 +36,19 @@ nohup cargo test -p tune-server --lib <filtre> > target/x.log 2>&1 &
 | `cargo clippy -p tune-core --lib --tests` | environ 6 min 40 après les tests | |
 | `cargo clippy -p tune-server --tests` | environ 8 min | |
 
+## Batterie complète et capacité du cache
+
+Constat du 21/11/2026 sur Shrek : construire tous les exécutables de tests de
+`tune-core` et `tune-server` en une commande a rempli le tmpfs de 64 Gio,
+malgré plus de 40 Gio libres au départ (cible dédiée : environ 46 Gio).
+La garde d’admission ne réserve pas l’espace consommé ensuite par les liens.
+Pour une validation complète, exécuter les bibliothèques, les binaires, puis
+les cibles d’intégration par groupes de huit avec `cargo test -j4 --test …`,
+et enfin les doctests. Conserver les mêmes features et tous les résultats.
+Retirer seulement les exécutables de chaque groupe terminé dans sa propre
+cible, en gardant les bibliothèques compilées pour les groupes suivants.
+Ne pas abaisser le seuil de stockage et ne pas purger les cibles d’autrui.
+
 ## Lancer peu de tests
 
 - Filtrer par nom : `cargo test -p tune-core --lib -- <filtre1> <filtre2>`.
