@@ -215,3 +215,17 @@ gapless qui vérifie le refus d’une autre cadence doit donc choisir
 réglage par défaut. Conserver ses assertions de refus et d’effacement du
 moteur, et couvrir séparément le changement de cadence autorisé. Vu dans
 le job audio-embedding de #8912 après intégration des historiques de lots.
+
+### Épreuves de concurrence sous charge : synchronisation communautaire (#6702)
+
+Le plafond d'une seconde entre deux battements mélangeait un blocage de
+l'exécuteur avec les retards dus à la charge du runner. Le témoin
+`les_lots_ne_tiennent_pas_le_fil_du_sondeur_6702` observe désormais les
+accès à une vraie base SQLite : ils doivent quitter l'unique worker async,
+et les 1 000 écritures doivent rester en transactions de 50 au plus.
+Il n'utilise ni attente de démarrage fixe ni seuil de durée matériel.
+Les épreuves distinctes de contenu, d'idempotence et d'index restent conservées.
+Pour la contre-épreuve, exécuter `appliquer_un_lot` directement à la place du
+`spawn_blocking` dans `appliquer_les_enrichissements` : le témoin doit nommer
+l'écriture sur le fil du sondeur. Restaurer la production par copie, puis
+rejouer vingt fois le témoin sous charge ; ne pas modifier ses assertions.
