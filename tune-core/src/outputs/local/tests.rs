@@ -408,8 +408,12 @@ fn une_ir_identite_rend_la_piste_entiere_si_on_draine_la_fin() {
 /// disparaître ; il ne peut redevenir actif que sur un format compatible.
 #[test]
 fn un_changement_de_format_gapless_rebat_ou_desactive_le_convolveur() {
+    // #8761 autorise le rééchantillonnage par défaut. Ce témoin garde le
+    // refus explicite et la désactivation du moteur en mode strict.
     let config = std::sync::Mutex::new(Some(
-        crate::audio::convolver::ConvolverConfig::new(vec![vec![1.0, 0.5]], 48_000).unwrap(),
+        crate::audio::convolver::ConvolverConfig::new(vec![vec![1.0, 0.5]], 48_000)
+            .unwrap()
+            .avec_reechantillonnage(false),
     ));
     let active = std::sync::Mutex::new(None);
 
@@ -433,6 +437,26 @@ fn un_changement_de_format_gapless_rebat_ou_desactive_le_convolveur() {
         6,
         "le retour à la cadence de l'IR reconstruit le moteur au nouveau layout"
     );
+}
+
+/// #8761 — le réglage par défaut reconstruit le moteur à la nouvelle
+/// cadence. Il ne doit pas rester soumis au refus du mode strict ci-dessus.
+#[test]
+fn un_changement_de_format_gapless_reechantillonne_si_autorise_8761() {
+    let config = std::sync::Mutex::new(Some(
+        crate::audio::convolver::ConvolverConfig::new(vec![vec![1.0, 0.5]], 48_000).unwrap(),
+    ));
+    let active = std::sync::Mutex::new(None);
+    for (cadence, canaux) in [(48_000, 2), (96_000, 2), (48_000, 6)] {
+        assert!(
+            rebuild_local_convolver(&config, &active, &AtomicBool::new(true), cadence, canaux)
+                .expect("le rééchantillonnage autorisé doit reconstruire le moteur gapless")
+        );
+        assert_eq!(
+            active.lock().unwrap().as_ref().unwrap().channels(),
+            canaux as usize
+        );
+    }
 }
 
 /// Et la frontière de piste : après remise à zéro, plus rien de la

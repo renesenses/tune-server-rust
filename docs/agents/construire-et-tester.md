@@ -206,3 +206,12 @@ ni dans `tune-remote-flutter` main `3c0a582ba4d4e0b4e72515aed43aa76adf4cd1a9`
 donc pas de parseur existant à adapter ou à présenter comme testé. Le témoin
 API serveur parse réellement les réponses avec `DateTime::parse_from_rfc3339`.
 Un futur affichage natif devra conserver l'instant et tenir compte du décalage.
+
+### Convolveur après intégration de #8761
+
+`ConvolverConfig::new` autorise désormais le rééchantillonnage. Le témoin
+gapless qui vérifie le refus d’une autre cadence doit donc choisir
+`avec_reechantillonnage(false)` ; sinon il attend une erreur contraire au
+réglage par défaut. Conserver ses assertions de refus et d’effacement du
+moteur, et couvrir séparément le changement de cadence autorisé. Vu dans
+le job audio-embedding de #8912 après intégration des historiques de lots.
