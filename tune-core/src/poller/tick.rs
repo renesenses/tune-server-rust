@@ -1,6 +1,10 @@
 use super::*;
 
 impl PositionPoller {
+    /// #8863 — les relances de lecture (fin de piste, adoption, repli) sont
+    /// attendues en tas (`Box::pin`) : en ligne, leurs futures s'emboîtaient
+    /// sur la pile du sondeur jusqu'au débordement (épreuve :
+    /// `adoption_a_l_horloge_4173::pile_du_sondeur_8863`).
     pub(super) async fn tick(
         &self,
         poll_states: &mut HashMap<i64, ZonePollState>,
@@ -11,7 +15,7 @@ impl PositionPoller {
         for s in &states {
             // #7974 — le temps écouté des profils supervisés (pause exclue) et
             // l'arrêt annoncé en fin de bail.
-            self.orchestrator.decompter_le_bail(s).await;
+            Box::pin(self.orchestrator.decompter_le_bail(s)).await;
             if s.state == PlayState::Playing && s.position_ms > 0 {
                 // #7852 — le point de décision unique de l'écoute validée :
                 // historique, compteur d'écoutes et « Reprendre l'écoute »
@@ -19,6 +23,9 @@ impl PositionPoller {
                 // Avant `track_position`, qui ne fait que suivre une reprise
                 // déjà créée.
                 self.orchestrator.valider_l_ecoute(s);
+                // #9143 — une piste au-delà de 90 % compte pour l'écoute
+                // complète de son album (retrait d'« Écouter plus tard »).
+                self.orchestrator.noter_piste_achevee_pour_le_sas(s, false);
                 if let Err(e) = crate::db::listening_resume::track_position(&self.db, s) {
                     tracing::warn!(zone_id = s.zone_id, error = %e, "reprise_titre_non_enregistree");
                 }
@@ -36,12 +43,13 @@ impl PositionPoller {
                     tracing::warn!(zone_id = s.zone_id, error = %e, "reprise_contexte_non_retiree");
                 }
                 if let Some(np) = s.now_playing.as_ref().filter(|np| np.source == "podcast") {
-                    if let Err(e) = crate::db::listening_resume::podcast_started_in_context(
+                    if let Err(e) = crate::db::listening_resume::podcast_started_du_profil(
                         &self.db,
                         s.zone_id,
                         np,
                         s.position_ms,
                         s.session_context_id.as_deref(),
+                        s.session_profile_id,
                     ) {
                         tracing::warn!(zone_id = s.zone_id, error = %e, "reprise_podcast_non_enregistree");
                     }
@@ -53,7 +61,7 @@ impl PositionPoller {
             .nettoyer_preparations_absentes(&states)
             .await;
         for etat in &states {
-            self.orchestrator.maintenir_preparation_fichier(etat).await;
+            Box::pin(self.orchestrator.maintenir_preparation_fichier(etat)).await;
         }
 
         poll_states.retain(|zone_id, _| {
@@ -321,9 +329,13 @@ impl PositionPoller {
             // #7418 — l'appareil qui avait mis la zone en pause rejoue notre
             // flux (Play à la télécommande) : la zone reprend avec lui. Passé
             // à autre chose, ou resté en pause trop longtemps : arrêt complet.
-            if self
-                .suivre_l_appareil_apres_sa_pause(zone_id, &device_id, &status, &fresh_states)
-                .await
+            if Box::pin(self.suivre_l_appareil_apres_sa_pause(
+                zone_id,
+                &device_id,
+                &status,
+                &fresh_states,
+            ))
+            .await
             {
                 continue;
             }
@@ -378,7 +390,7 @@ impl PositionPoller {
                                 zone_id,
                                 device = %device_id,
                                 verdict = ?verdict,
-                                uri = ?status.current_uri,
+                                uri = ?status.current_uri.as_deref().map(crate::confidentialite::masquer_url),
                                 "renderer_tenu_par_un_tiers — la lecture demandée ne sortira pas"
                             );
                             if let Some(ref bus) = self.event_bus {
@@ -613,12 +625,12 @@ impl PositionPoller {
                     // le lecteur n'a pas demandé la suite (signal `ended` /
                     // `completed` perdu ou jamais branché) : on enchaîne ici,
                     // comme pour toute sortie à la fin d'une piste.
-                    if self.enchainer_la_zone_navigateur_finie(zone_state).await {
+                    if Box::pin(self.enchainer_la_zone_navigateur_finie(zone_state)).await {
                         poll_states.remove(&zone_id);
                         continue;
                     }
 
-                    if self.abandonner_lecture_sans_destination(zone_state).await {
+                    if Box::pin(self.abandonner_lecture_sans_destination(zone_state)).await {
                         poll_states.remove(&zone_id);
                     }
                     continue;
@@ -929,7 +941,7 @@ impl PositionPoller {
                     poll_states.remove(&zone_id);
                     // Fil 2694 — fin sur ERREUR : pas de radio de fin de file.
                     crate::playback::radio_fin_de_file::noter_fin_sur_erreur(zone_id);
-                    self.handle_track_end(zone_id, zone_state).await;
+                    Box::pin(self.handle_track_end(zone_id, zone_state)).await;
                     continue;
                 }
                 if let Some(msg) = failure {
@@ -952,11 +964,25 @@ impl PositionPoller {
                         // #3973 — un refus « bit-perfect strict » arrive en
                         // sentinelle : il part avec son code et ses deux
                         // fréquences, et la phrase française en repli.
-                        let charge = match crate::audio::bitperfect_strict::RefusBitPerfect::depuis_sentinelle(&msg) {
-                            Some(refus) => crate::audio::bitperfect_strict::charge_utile_de_refus(
-                                zone_id, &refus,
-                            ),
-                            None => serde_json::json!({
+                        // #8696 — un flux qui a plus de voies que la
+                        // sortie exclusive : code et paramètres, phrase en
+                        // français en repli.
+                        let bitperfect =
+                            crate::audio::bitperfect_strict::RefusBitPerfect::depuis_sentinelle(
+                                &msg,
+                            );
+                        let voies_en_trop =
+                            crate::outputs::voies_en_trop_8696::VoiesEnTrop::depuis_sentinelle(
+                                &msg,
+                            );
+                        let charge = match (bitperfect, voies_en_trop) {
+                            (Some(refus), _) => {
+                                crate::audio::bitperfect_strict::charge_utile_de_refus(
+                                    zone_id, &refus,
+                                )
+                            }
+                            (None, Some(voies)) => voies.charge_utile(zone_id),
+                            (None, None) => serde_json::json!({
                                 "zone_id": zone_id,
                                 "error": msg,
                                 "fatal": true,
@@ -966,9 +992,7 @@ impl PositionPoller {
                     }
                     poll_states.remove(&zone_id);
                     let device_id_ref = self.get_zone_device_id(zone_id);
-                    self.orchestrator
-                        .stop(zone_id, device_id_ref.as_deref())
-                        .await;
+                    Box::pin(self.orchestrator.stop(zone_id, device_id_ref.as_deref())).await;
                     continue;
                 }
                 // #6790 — la sortie s'est mise en pause d'elle-même (un
@@ -983,7 +1007,7 @@ impl PositionPoller {
                         "zone_en_pause_la_sortie_a_rendu_l_appareil"
                     );
                     poll_states.remove(&zone_id);
-                    let _ = self.orchestrator.pause(zone_id, None).await;
+                    let _ = Box::pin(self.orchestrator.pause(zone_id, None)).await;
                     continue;
                 }
             }
@@ -1136,7 +1160,7 @@ impl PositionPoller {
                             );
                             ps.wall_clock_end_fired = true;
                             ps.transition(fsm::Transition::FinParHorlogeMurale);
-                            self.handle_track_end(zone_id, zone_state).await;
+                            Box::pin(self.handle_track_end(zone_id, zone_state)).await;
                         }
                         continue;
                     }
@@ -1184,11 +1208,11 @@ impl PositionPoller {
                         warn!(
                             zone_id,
                             device = %device_id,
-                            uri = ?status.current_uri,
+                            uri = ?status.current_uri.as_deref().map(crate::confidentialite::masquer_url),
                             "renderer_cede_a_un_autre_point_de_controle — la zone lâche l'appareil sans lui envoyer d'ordre"
                         );
                         poll_states.remove(&zone_id);
-                        self.orchestrator.ceder_la_zone_a_un_tiers(zone_id).await;
+                        Box::pin(self.orchestrator.ceder_la_zone_a_un_tiers(zone_id)).await;
                         if let Some(ref bus) = self.event_bus {
                             bus.emit("zone.updated", serde_json::json!({ "zone_id": zone_id }));
                         }
@@ -1230,10 +1254,11 @@ impl PositionPoller {
                             .streamer
                             .oublier_plage_hors_fichier(&sid)
                             .await;
-                        if self
-                            .orchestrator
-                            .reprendre_apres_plage_hors_fichier(zone_id, &device_id)
-                            .await
+                        if Box::pin(
+                            self.orchestrator
+                                .reprendre_apres_plage_hors_fichier(zone_id, &device_id),
+                        )
+                        .await
                         {
                             poll_states.remove(&zone_id);
                             continue;
@@ -1511,8 +1536,10 @@ impl PositionPoller {
                 // distincts pour un seul probleme (#1522, #1492).
                 //
                 // La garde sur le peripherique de sortie, elle, est tombee
-                // avec #1536.
-                self.refresh_radio_metadata(zone_id, zone_state).await;
+                // avec #1536. Seule la NOTE du titre dans l'historique (#8487)
+                // attend un renderer qui joue.
+                self.refresh_radio_metadata_et_noter(zone_id, zone_state, !radio_stopped)
+                    .await;
 
                 // Sync metrics and skip the rest of the loop (no gapless/track-end).
                 self.shared_metrics.lock().await.insert(
@@ -1596,7 +1623,9 @@ impl PositionPoller {
                                         };
                                         // Reconnecting the *same* station — do
                                         // not add a duplicate listen-history row.
-                                        match self.orchestrator.play_without_history(req).await {
+                                        match Box::pin(self.orchestrator.play_without_history(req))
+                                            .await
+                                        {
                                             // #3756 — `play()` rend `Ok` dès que
                                             // l'ORDRE est accepté. Le décodage
                                             // d'une radio tourne, lui, dans une
@@ -1648,9 +1677,7 @@ impl PositionPoller {
                         ps.transition(fsm::Transition::RadioAbandonnee);
                         poll_states.remove(&zone_id);
                         let device_id_ref = self.get_zone_device_id(zone_id);
-                        self.orchestrator
-                            .stop(zone_id, device_id_ref.as_deref())
-                            .await;
+                        Box::pin(self.orchestrator.stop(zone_id, device_id_ref.as_deref())).await;
                     } else {
                         debug!(
                             zone_id,
@@ -1668,10 +1695,12 @@ impl PositionPoller {
             if let Some(position) =
                 crate::orchestrator::seek_natif_6059::constater(zone_id, &status)
             {
-                if let Err(e) = self
-                    .orchestrator
-                    .replay_zone_at_position(zone_id, position, "seek_ignore_6059")
-                    .await
+                if let Err(e) = Box::pin(self.orchestrator.replay_zone_at_position(
+                    zone_id,
+                    position,
+                    "seek_ignore_6059",
+                ))
+                .await
                 {
                     warn!(zone_id, error = %e, "seek_natif_rattrapage_echoue");
                 }
@@ -2000,10 +2029,11 @@ impl PositionPoller {
                                 age_secs,
                                 position_ms = status.position_ms,
                                 position_figee_ms = adoption.position_figee_ms,
-                                uri = ?status.current_uri,
+                                uri = ?status.current_uri.as_deref().map(crate::confidentialite::masquer_url),
                                 preuve = ?adoption.preuve,
                                 "gapless_adoption_horloge_confirmee"
                             );
+                            self.constater_le_suivant_suivi(zone_id);
                             ps.adoption_horloge = None;
                         }
                         decisions::SuiteAdoption::Infirmee => {
@@ -2012,7 +2042,7 @@ impl PositionPoller {
                                 age_secs,
                                 position_ms = status.position_ms,
                                 position_figee_ms = adoption.position_figee_ms,
-                                uri = ?status.current_uri,
+                                uri = ?status.current_uri.as_deref().map(crate::confidentialite::masquer_url),
                                 preuve = ?adoption.preuve,
                                 stream_id = %adoption.flux,
                                 flux_fini = ?adoption.flux_fini,
@@ -2022,15 +2052,16 @@ impl PositionPoller {
                                 "gapless_adoption_horloge_infirmee_relance"
                             );
                             ps.adoption_horloge = None;
+                            // #9206 — le renderer n'a pas suivi le flux armé.
+                            self.constater_le_suivant_non_suivi(zone_id);
                             poll_states.remove(&zone_id);
                             let position = zone_state.queue_position;
                             if let Err(e) =
-                                self.orchestrator.play_from_queue(zone_id, position).await
+                                Box::pin(self.orchestrator.play_from_queue(zone_id, position)).await
                             {
                                 warn!(zone_id, position, error = %e, "gapless_adoption_relance_echouee");
                                 let device_id_ref = self.get_zone_device_id(zone_id);
-                                self.orchestrator
-                                    .stop(zone_id, device_id_ref.as_deref())
+                                Box::pin(self.orchestrator.stop(zone_id, device_id_ref.as_deref()))
                                     .await;
                             }
                             continue;
@@ -2072,10 +2103,11 @@ impl PositionPoller {
                     position_ms = status.position_ms,
                     "flux_continu_passage_de_piste"
                 );
-                match self
-                    .orchestrator
-                    .avancer_dans_le_flux_continu(zone_id, &device_id, &piste)
-                    .await
+                match Box::pin(
+                    self.orchestrator
+                        .avancer_dans_le_flux_continu(zone_id, &device_id, &piste),
+                )
+                .await
                 {
                     Ok(()) => {
                         ps.gapless_sent = false;
@@ -2426,10 +2458,15 @@ impl PositionPoller {
                         )
                         .await;
                         info!(zone_id, next_pos, "gapless_advance_on_position_reset");
-                        let avance = self
-                            .orchestrator
-                            .advance_queue_metadata(zone_id, next_pos)
-                            .await;
+                        // #9206 — le renderer a suivi le flux armé de lui-même.
+                        // Pas s'il nomme encore la piste finie (#5411) : l'avance
+                        // n'est que provisoire, la surveillance tranchera.
+                        if rejeu.is_none() {
+                            self.constater_le_suivant_suivi(zone_id);
+                        }
+                        let avance =
+                            Box::pin(self.orchestrator.advance_queue_metadata(zone_id, next_pos))
+                                .await;
                         if let Err(e) = &avance {
                             warn!(zone_id, error = %e, "gapless_advance_failed");
                         }
@@ -2895,7 +2932,7 @@ impl PositionPoller {
                                     peak_pos = ps.peak_position_ms,
                                     track_dur = track_duration_ms,
                                     stopped_ticks = ps.stopped_ticks,
-                                    current_uri = status.current_uri.as_deref().unwrap_or(""),
+                                    current_uri = %crate::confidentialite::masquer_url(&status.current_uri.as_deref().unwrap_or("")),
                                     tenue = ?tenue,
                                     audio_servi_ms = audio_servi_ms.unwrap_or(0),
                                     bytes_sent = octets_servis.unwrap_or(0),
@@ -2922,6 +2959,10 @@ impl PositionPoller {
                             // natural end so the poller re-triggers play instead
                             // of accumulating stopped_ticks until force_stop.
                             // (DEvir QA B-05: repeat mode doesn't work on DLNA)
+                            // #9031 — seulement quand la durée est inconnue :
+                            // une durée connue passe par `peak_reached_end`,
+                            // sinon un `Stopped` passager en pleine piste
+                            // (UAPP) faisait sauter au titre suivant.
                             let repeat_active =
                                 matches!(zone_state.repeat, RepeatMode::One | RepeatMode::All);
                             let natural_end = decisions::natural_end(
@@ -3513,11 +3554,14 @@ impl PositionPoller {
                                 std::mem::take(&mut ps.tune_tested_rendu_ms),
                             )
                             .await;
+                            // #9206 — voir la retombée de position : pas de
+                            // constat de suivi sur une avance provisoire.
+                            let suivi_avere = rejeu.is_none();
                             info!(zone_id, next_pos, "gapless_confirmed_advancing_metadata");
-                            let avance = self
-                                .orchestrator
-                                .advance_queue_metadata(zone_id, next_pos)
-                                .await;
+                            let avance = Box::pin(
+                                self.orchestrator.advance_queue_metadata(zone_id, next_pos),
+                            )
+                            .await;
                             if let Err(e) = &avance {
                                 warn!(zone_id, error = %e, "gapless_confirmed_advance_failed");
                             }
@@ -3528,6 +3572,9 @@ impl PositionPoller {
                             // Identity-keyed latch re-arms on the new track;
                             // clearing also covers gapless repeat-one (#1113).
                             ps.scrobbled_key = None;
+                            if suivi_avere {
+                                self.constater_le_suivant_suivi(zone_id);
+                            }
                         }
                     }
                     if ps.track_started_at.is_none() {
@@ -3647,10 +3694,10 @@ impl PositionPoller {
                             self.noter_fin_tune_tested(zone_state, &device_id, pic, rendu)
                                 .await;
                             info!(zone_id, next_pos, "gapless_advance_metadata");
-                            if let Err(e) = self
-                                .orchestrator
-                                .advance_queue_metadata(zone_id, next_pos)
-                                .await
+                            if let Err(e) = Box::pin(
+                                self.orchestrator.advance_queue_metadata(zone_id, next_pos),
+                            )
+                            .await
                             {
                                 warn!(zone_id, error = %e, "gapless_advance_failed");
                             }
@@ -3662,8 +3709,10 @@ impl PositionPoller {
                             // Identity-keyed latch re-arms on the new track;
                             // clearing also covers gapless repeat-one (#1113).
                             ps.scrobbled_key = None;
+                            // #9206 — le renderer a suivi le flux armé.
+                            self.constater_le_suivant_suivi(zone_id);
                         } else {
-                            self.handle_track_end(zone_id, zone_state).await;
+                            Box::pin(self.handle_track_end(zone_id, zone_state)).await;
                         }
                     } else if {
                         // Une preparation trop vieille ne vaut plus rien : son
@@ -3831,9 +3880,13 @@ impl PositionPoller {
                                 // `armer_le_flux_suivant`) ; sa durée est dite
                                 // au journal dès qu'elle dépasse le seuil.
                                 let t_prep = Instant::now();
-                                let preparation = self
-                                    .prepare_gapless(zone_id, zone_state, &device_id, fin_estimee)
-                                    .await;
+                                let preparation = Box::pin(self.prepare_gapless(
+                                    zone_id,
+                                    zone_state,
+                                    &device_id,
+                                    fin_estimee,
+                                ))
+                                .await;
                                 let prep_ms = t_prep.elapsed().as_millis() as u64;
                                 if prep_ms >= decisions::PREPARATION_GAPLESS_LENTE_MS {
                                     info!(
@@ -4096,7 +4149,41 @@ impl PositionPoller {
                         // L'appareil qui n'annonce rien, qui ne retient rien,
                         // ou qui refuse le `Next` garde le repli d'aujourd'hui
                         // sans qu'une seule ligne change pour lui.
+                        // #9206 (fil 2961) — le renderer vient d'OUVRIR le
+                        // flux armé et le lit (`bytes=0-` puis `bytes=28-`),
+                        // mais nomme encore la piste finie : il bascule, son
+                        // URI retarde. Conclure ici coupait la transition (~2,5 s
+                        // de blanc) et lui retirait le sans-blanc DSD. Pour un
+                        // suivant DSD, la fin est différée, au plus
+                        // `FENETRE_BASCULE_SUR_FLUX_ARME_MS` après le début de
+                        // la lecture ; un flux lu de longue date (DMP-A6,
+                        // #4173) ne diffère rien.
+                        let suivant_dsd_arme = self
+                            .dsd_suivant_arme
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .contains_key(&zone_id);
+                        let lecture_armee_depuis_ms = match flux_arme.as_deref() {
+                            Some(f)
+                                if ps.past_end_ticks >= seuil_ticks
+                                    && suivant_dsd_arme
+                                    && enchainement == decisions::EnchainementArme::Aucun =>
+                            {
+                                self.orchestrator
+                                    .streamer_lecture_au_dela_de_l_en_tete_depuis_ms(f)
+                                    .await
+                            }
+                            _ => None,
+                        };
+                        let bascule_en_cours = ps.past_end_ticks >= seuil_ticks
+                            && decisions::bascule_en_cours_sur_le_flux_arme(
+                                enchainement,
+                                suivant_dsd_arme,
+                                octets_tires,
+                                lecture_armee_depuis_ms,
+                            );
                         let enchainement = if ps.past_end_ticks >= seuil_ticks
+                            && !bascule_en_cours
                             && decisions::bascule_sur_la_suivante_autorisee(
                                 is_dlna,
                                 ps.suivante_preparee,
@@ -4114,10 +4201,23 @@ impl PositionPoller {
                         // ci-dessous consomme `flux_arme`, et c'est justement
                         // sa présence ou son absence qui nomme la branche.
                         let flux_arme_journal = flux_arme.clone().unwrap_or_default();
-                        if let Some(flux) =
+                        if bascule_en_cours {
+                            info!(
+                                zone_id,
+                                position_ms = status.position_ms,
+                                track_dur = track_duration_ms,
+                                past_end_ticks = ps.past_end_ticks,
+                                epingle_piste_finie,
+                                flux_arme = flux_arme_journal.as_str(),
+                                uri_courante = status.current_uri.as_deref().unwrap_or(""),
+                                octets_tires = octets_tires.unwrap_or(0),
+                                lu_depuis_ms = lecture_armee_depuis_ms.unwrap_or(0),
+                                "fin_differee_flux_arme_ouvert"
+                            );
+                        } else if let Some(flux) =
                             flux_arme.filter(|_| enchainement != decisions::EnchainementArme::Aucun)
                         {
-                            self.adopter_l_enchainement_a_l_horloge(
+                            Box::pin(self.adopter_l_enchainement_a_l_horloge(
                                 zone_id,
                                 zone_state,
                                 &status,
@@ -4127,7 +4227,7 @@ impl PositionPoller {
                                 octets_tires,
                                 track_duration_ms,
                                 wall_elapsed,
-                            )
+                            ))
                             .await;
                         } else if ps.past_end_ticks >= seuil_ticks {
                             let motif_de_la_fin = if conclu_par_epingle {
@@ -4159,7 +4259,7 @@ impl PositionPoller {
                                 // octet tiré. Le rapport de Villerio du 17/09
                                 // s'est arrêté là.
                                 flux_arme = flux_arme_journal.as_str(),
-                                uri_courante = status.current_uri.as_deref().unwrap_or(""),
+                                uri_courante = %crate::confidentialite::masquer_url(&status.current_uri.as_deref().unwrap_or("")),
                                 octets_tires = octets_tires.unwrap_or(0),
                                 "position_past_end_advancing"
                             );
@@ -4426,8 +4526,7 @@ impl PositionPoller {
             // #7418 — la zone suit la pause de son appareil, comme #6790.
             if pause_de_l_appareil {
                 poll_states.remove(&zone_id);
-                self.suivre_la_pause_de_l_appareil(zone_id, &device_id)
-                    .await;
+                Box::pin(self.suivre_la_pause_de_l_appareil(zone_id, &device_id)).await;
                 continue;
             }
 
@@ -4446,7 +4545,7 @@ impl PositionPoller {
                 // command cannot free the DAC, and must not restart the loop.
                 poll_states.remove(&zone_id);
                 let appareil = self.get_zone_device_id(zone_id);
-                self.orchestrator.stop(zone_id, appareil.as_deref()).await;
+                Box::pin(self.orchestrator.stop(zone_id, appareil.as_deref())).await;
                 if let Some(ref bus) = self.event_bus {
                     bus.emit(
                         "zone.playback_error",
@@ -4530,25 +4629,20 @@ impl PositionPoller {
                     // les Stop sans les exécuter, seul Pause→Stop le libère
                     // (constaté par SOAP direct sur le DMP-A8). Best-effort :
                     // un appareil sain n'en souffre pas.
-                    if let Err(error) = self
-                        .orchestrator
-                        .pause(zone_id, device_id_ref.as_deref())
-                        .await
+                    if let Err(error) =
+                        Box::pin(self.orchestrator.pause(zone_id, device_id_ref.as_deref())).await
                     {
                         warn!(zone_id, error = %error, "demarrage_mort_pause_echouee");
                     }
-                    self.orchestrator
-                        .stop(zone_id, device_id_ref.as_deref())
-                        .await;
+                    Box::pin(self.orchestrator.stop(zone_id, device_id_ref.as_deref())).await;
                     let position = zone_state.queue_position;
-                    match self.orchestrator.play_from_queue(zone_id, position).await {
+                    match Box::pin(self.orchestrator.play_from_queue(zone_id, position)).await {
                         Ok(_) => {
                             warn!(zone_id, position, "demarrage_mort_relance_automatique");
                         }
                         Err(e) => {
                             warn!(zone_id, position, error = %e, "demarrage_mort_relance_echouee");
-                            self.orchestrator
-                                .stop(zone_id, device_id_ref.as_deref())
+                            Box::pin(self.orchestrator.stop(zone_id, device_id_ref.as_deref()))
                                 .await;
                         }
                     }
@@ -4564,19 +4658,17 @@ impl PositionPoller {
                     // renderer ait pu ouvrir le flux
                     // (`seek_output_after_replay`). Son succès se constate
                     // ensuite sur la position MESURÉE, pas sur l'acquittement.
-                    self.orchestrator
-                        .stop(zone_id, device_id_ref.as_deref())
-                        .await;
+                    Box::pin(self.orchestrator.stop(zone_id, device_id_ref.as_deref())).await;
                     let position = zone_state.queue_position;
-                    match self.orchestrator.play_from_queue(zone_id, position).await {
-                        Ok(_) => match self
-                            .orchestrator
-                            .sauter_apres_reprise_de_renderer_cale(
+                    match Box::pin(self.orchestrator.play_from_queue(zone_id, position)).await {
+                        Ok(_) => match Box::pin(
+                            self.orchestrator.sauter_apres_reprise_de_renderer_cale(
                                 zone_id,
                                 device_id_ref.as_deref(),
                                 position_ms,
-                            )
-                            .await
+                            ),
+                        )
+                        .await
                         {
                             Ok(()) => {
                                 let generation =
@@ -4608,15 +4700,13 @@ impl PositionPoller {
                                 // l'appareil laisse la piste jouer depuis son
                                 // début, avec un message non fatal ; tout
                                 // autre échec coupe la zone, comme avant.
-                                if self
-                                    .orchestrator
-                                    .conclure_saut_de_reprise_echoue(
-                                        zone_id,
-                                        device_id_ref.as_deref(),
-                                        position_ms,
-                                        &e,
-                                    )
-                                    .await
+                                if Box::pin(self.orchestrator.conclure_saut_de_reprise_echoue(
+                                    zone_id,
+                                    device_id_ref.as_deref(),
+                                    position_ms,
+                                    &e,
+                                ))
+                                .await
                                 {
                                     // Une seule tentative : la reprise compte
                                     // pour la lecture RELANCÉE, un nouveau
@@ -4634,15 +4724,12 @@ impl PositionPoller {
                         },
                         Err(e) => {
                             warn!(zone_id, position, error = %e, "renderer_cale_reprise_echouee");
-                            self.orchestrator
-                                .stop(zone_id, device_id_ref.as_deref())
+                            Box::pin(self.orchestrator.stop(zone_id, device_id_ref.as_deref()))
                                 .await;
                         }
                     }
                 } else {
-                    self.orchestrator
-                        .stop(zone_id, device_id_ref.as_deref())
-                        .await;
+                    Box::pin(self.orchestrator.stop(zone_id, device_id_ref.as_deref())).await;
                 }
             } else if track_ended {
                 // Une fin avec progression réellement observée, pas un play
@@ -4704,7 +4791,7 @@ impl PositionPoller {
                     self.constater_le_suivant_non_suivi(zone_id);
                 }
                 poll_states.remove(&zone_id);
-                self.handle_track_end(zone_id, zone_state).await;
+                Box::pin(self.handle_track_end(zone_id, zone_state)).await;
             }
         }
         // REF-9 (#2219) — l'invariant, en fin de tour et sous debug seulement :

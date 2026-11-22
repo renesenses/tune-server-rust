@@ -1,12 +1,10 @@
 //! #1770, annexe 4 — le nom demandé à `POST /zones` quand le périphérique a
 //! déjà une zone.
 //!
-//! Ces témoins verrouillent le comportement **d'aujourd'hui**, pas une
-//! préférence : l'arbitrage entre « honorer le nom sur une zone visible » et
-//! « refuser en 409 » appartient à Bertrand (`keep-open` sur #1770). Le jour où
-//! il est rendu, c'est le témoin `une_zone_locale_visible_garde_son_nom` qui
-//! rougit — et c'est voulu : il force la conversation au lieu de laisser un
-//! contrat client changer en passant.
+//! L'arbitrage est rendu (Bertrand, 17/11, #8987) : une zone VISIBLE refuse
+//! la création en `409 zone_existe_deja`, en la nommant ; une zone MASQUÉE
+//! (supprimée) ressuscite sous le nom demandé. Ces témoins verrouillent ce
+//! contrat.
 
 use crate::state::AppState;
 use tune_core::db::zone_repo::ZoneRepo;
@@ -16,15 +14,14 @@ use super::ecriture::{NomDeZoneExistante, nom_de_zone_existante};
 #[test]
 fn le_nom_deja_porte_ne_decide_rien() {
     assert_eq!(
-        nom_de_zone_existante(false, "Salon", "Salon"),
-        NomDeZoneExistante::DejaLeBon,
-        "le nom demandé est déjà celui de la zone : rien à écrire, et surtout \
-         rien à signaler comme perdu"
-    );
-    assert_eq!(
         nom_de_zone_existante(true, "Salon", "Salon"),
         NomDeZoneExistante::DejaLeBon,
-        "masquée ou non, un nom identique ne déclenche aucune écriture"
+        "zone masquée sous le même nom : elle ressuscite, aucun nom à écrire"
+    );
+    assert_eq!(
+        nom_de_zone_existante(false, "Salon", "Salon"),
+        NomDeZoneExistante::Refuse,
+        "#8987 — une zone visible refuse la création, même sous le même nom"
     );
 }
 
@@ -39,18 +36,17 @@ fn une_zone_masquee_reprend_le_nom_demande() {
 }
 
 #[test]
-fn une_zone_visible_ecarte_le_nom_demande() {
+fn une_zone_visible_refuse_la_creation() {
     assert_eq!(
         nom_de_zone_existante(false, "Salon", "Bureau"),
-        NomDeZoneExistante::Ecarte,
-        "comportement d'aujourd'hui, inchangé — mais nommé, et désormais dit \
-         dans le journal (#1770 annexe 4)"
+        NomDeZoneExistante::Refuse,
+        "#8987 — décision de Bertrand : 409 qui nomme la zone existante, plus \
+         de nom écarté en silence"
     );
 }
 
-/// La même intention utilisateur — « crée une zone sur ce périphérique et
-/// appelle-la X » — n'a pas le même effet selon que la zone était masquée ou
-/// visible. C'est l'asymétrie que décrit l'annexe 4, mesurée par la route.
+/// #8987 — « crée une zone sur ce périphérique et appelle-la X » quand une zone
+/// VISIBLE le porte : `409`, la zone existante nommée, rien d'écrit.
 #[tokio::test]
 async fn une_zone_locale_visible_garde_son_nom() {
     use axum::response::IntoResponse;
@@ -73,16 +69,14 @@ async fn une_zone_locale_visible_garde_son_nom() {
 
     assert_eq!(
         resp.status(),
-        axum::http::StatusCode::OK,
-        "le code d'état ne change PAS : trancher entre 200 et 409 est \
-         l'arbitrage réservé à Bertrand (#1770, `keep-open`)"
+        axum::http::StatusCode::CONFLICT,
+        "#8987 — une zone visible refuse la création (409), elle n'est plus \
+         rendue en 200 avec le nom demandé écarté"
     );
     assert_eq!(
         repo.get(id).unwrap().unwrap().name,
         "Salon",
-        "le nom demandé est écarté sur une zone visible — comportement \
-         d'aujourd'hui. Si ce témoin rougit, l'arbitrage de l'annexe 4 a été \
-         tranché : dites-le sur #1770 avant de le corriger"
+        "le refus n'écrit rien : la zone garde son nom"
     );
     assert_eq!(
         repo.list().unwrap().len(),
@@ -176,10 +170,10 @@ fn create_zone_n_avale_plus_l_echec_du_renommage() {
         "create_zone ne passe plus par la règle : l'arbitrage de l'annexe 4 \
          n'a plus d'endroit unique où se poser"
     );
-    let dit = format!("\"zone_existante_nom_demande_{}\"", "ecarte");
+    let dit = format!("{}(", "refus_zone_existe_deja");
     assert!(
         corps.contains(&dit),
-        "la perte du nom sur une zone visible est redevenue silencieuse — \
-         c'est précisément le défaut de l'annexe 4"
+        "create_zone ne refuse plus nommément la création sur une zone \
+         visible : le silence de #8987 revient"
     );
 }

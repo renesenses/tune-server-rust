@@ -267,7 +267,9 @@ mod tests {
     fn embedded_policy_never_reintroduces_the_public_password() {
         assert!(PASSWORD_SCRIPT.contains("password_matches_legacy"));
         assert!(PASSWORD_SCRIPT.contains("chage -d 0"));
-        assert!(PASSWORD_SCRIPT.contains("openssl rand -hex 12"));
+        assert!(PASSWORD_SCRIPT.contains("PASSWORD_ALPHABET=\"bcdefghijklnoprstuvxy\""));
+        assert!(PASSWORD_SCRIPT.contains("/dev/urandom"));
+        assert!(!PASSWORD_SCRIPT.contains("openssl rand -hex"));
         assert!(!PASSWORD_SCRIPT.contains("tune:tune"));
     }
 }

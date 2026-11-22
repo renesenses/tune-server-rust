@@ -140,9 +140,19 @@ async fn handle_bridge(mut socket: WebSocket, state: AppState) {
         }
     });
 
+    // Activation de l'authentification : la clé d'API qui a ouvert cette
+    // connexion est effacée ; la connexion se ferme.
+    let mut fermeture = state.fermeture_websockets.subscribe();
     // Reader loop: process bridge messages
     loop {
-        match ws_rx.next().await {
+        let suivant = tokio::select! {
+            _ = fermeture.changed() => {
+                info!("bridge_ws_fermee_activation_authentification");
+                break;
+            }
+            m = ws_rx.next() => m,
+        };
+        match suivant {
             Some(Ok(axum::extract::ws::Message::Text(text))) => {
                 let msg: serde_json::Value = match serde_json::from_str(&text) {
                     Ok(v) => v,

@@ -78,9 +78,30 @@ pub fn activer(db: &Arc<dyn DbBackend>, actif: bool) -> Result<(), String> {
     SettingsRepo::with_backend(db.clone()).set(REGLAGE_ACTIF, if actif { "true" } else { "false" })
 }
 
+/// #9035 — une piste dont la mesure rangée porte l'ancien code
+/// `coupure_de_codec` (déduit de la seule fréquence) est remesurée une fois :
+/// la nouvelle mesure le remplace par `coupure_spectrale`,
+/// `signature_de_codec`, … — jamais plus par lui —, la piste sort donc des
+/// candidates après un passage. Les autres mesures ne sont pas touchées.
+///
+/// #9067 (décision du 19/11, « Source altérée ») — les CD sont remesurés
+/// aussi, mais seulement les lignes que la nouvelle règle (mur de codec) peut
+/// changer : voir [`super::faux_hires::cd_a_remesurer_sql`]. Les lignes
+/// `coupure_de_codec` des fichiers hi-res le restent comme avant (#9035).
+/// Une ligne remesurée n'est plus candidate : la boucle ne tourne pas.
+fn a_remesurer() -> String {
+    format!(
+        "EXISTS (SELECT 1 FROM hires_verifications h WHERE h.track_id = t.id AND \
+         ((h.raison = '{codec}' AND (h.sample_rate > 48000 OR h.bits_declares > 16)) \
+          OR {cd}))",
+        codec = super::faux_hires::RAISON_HERITEE_CODEC,
+        cd = super::faux_hires::cd_a_remesurer_sql("h"),
+    )
+}
+
 /// Le prédicat des candidats : pistes LOCALES sans perte, avec un chemin, pas
-/// encore mesurées, dans le périmètre des analyses. Partagé par la sélection
-/// et le compteur, comme celui des autres passes.
+/// encore mesurées (ou à remesurer, #9035), dans le périmètre des analyses.
+/// Partagé par la sélection et le compteur, comme celui des autres passes.
 fn where_candidats(db: &Arc<dyn DbBackend>) -> String {
     let formats: Vec<String> = FORMATS_SANS_PERTE
         .iter()
@@ -89,7 +110,9 @@ fn where_candidats(db: &Arc<dyn DbBackend>) -> String {
     format!(
         "{local} AND t.file_path IS NOT NULL AND t.file_path <> '' \
          AND LOWER(COALESCE(t.format, '')) IN ({formats}) \
-         AND NOT EXISTS (SELECT 1 FROM hires_verifications h WHERE h.track_id = t.id){perimetre}",
+         AND (NOT EXISTS (SELECT 1 FROM hires_verifications h WHERE h.track_id = t.id) \
+              OR {a_remesurer}){perimetre}",
+        a_remesurer = a_remesurer(),
         local = crate::db::track_repo::sql::PISTE_LOCALE,
         formats = formats.join(", "),
         perimetre = crate::taches_de_fond::perimetre::clause_decodage(db),
@@ -127,14 +150,16 @@ pub struct Candidat {
     pub duree_ms: i64,
 }
 
-/// Les `n` prochains candidats.
+/// Les `n` prochains candidats : les pistes jamais mesurées d'abord, les
+/// remesures de #9035 ensuite (priorité basse).
 pub fn prochains_candidats(db: &Arc<dyn DbBackend>, n: usize) -> Vec<Candidat> {
     let n = n as i64;
     db.query_many(
         &format!(
             "SELECT t.id, t.file_path, COALESCE(t.duration_ms, 0) FROM tracks t \
-             WHERE {} ORDER BY t.id LIMIT {}",
+             WHERE {} ORDER BY CASE WHEN {} THEN 1 ELSE 0 END, t.id LIMIT {}",
             where_candidats(db),
+            a_remesurer(),
             ph(db.engine(), 1)
         ),
         &[&n as &dyn ToSqlValue],
@@ -214,18 +239,68 @@ pub fn mesurer_un_fichier(chemin: &str, duree_ms: i64) -> Result<Mesure, String>
 /// Range le verdict d'une piste. Une piste illisible est rangée aussi
 /// (`non_concluant`, raison `decodage_impossible`) : sinon elle serait
 /// reprise à chaque lot, indéfiniment.
+///
+/// #9035 — sauf une REMESURE de l'ancien `coupure_de_codec` : illisible, elle
+/// garde son verdict douteux et passe en `coupure_spectrale`.
 pub fn enregistrer(
     db: &Arc<dyn DbBackend>,
     track_id: i64,
     resultat: &Result<Mesure, String>,
 ) -> Result<(), String> {
     let e = db.engine();
+    // #9067 — la REMESURE d'un CD (règle du 19/11) qui ne peut pas lire le
+    // fichier : il n'a jamais été montré altéré sans mur (verdict effectif
+    // `conforme`), il le reste, marqué pour ne plus être candidat.
+    if resultat.is_err() {
+        let gardee = db.execute(
+            &format!(
+                "UPDATE hires_verifications SET verdict = 'conforme', raison = '{}' \
+                 WHERE track_id = {} AND {}",
+                super::faux_hires::RAISON_CD_SANS_MUR,
+                ph(e, 1),
+                super::faux_hires::cd_a_remesurer_sql("hires_verifications")
+            ),
+            &[&track_id as &dyn ToSqlValue],
+        )?;
+        if gardee > 0 {
+            return Ok(());
+        }
+    }
+    // #9035 — une REMESURE (ligne `coupure_de_codec`) qui ne peut pas lire le
+    // fichier (NAS en veille, disque débranché) ne perd pas la mesure réelle :
+    // le verdict douteux et sa coupure restent, seule la raison devient
+    // `coupure_spectrale` (ce que l'ancien code voulait dire). Jamais
+    // `non_concluant` : l'album ne doit pas basculer de « douteux » à
+    // « vérifié » faute d'avoir pu relire un fichier. La ligne n'est plus
+    // candidate (pas de boucle de remesure sur un fichier absent).
+    if resultat.is_err() {
+        let gardee = db.execute(
+            &format!(
+                "UPDATE hires_verifications SET raison = 'coupure_spectrale' \
+                 WHERE track_id = {} AND raison = '{}'",
+                ph(e, 1),
+                super::faux_hires::RAISON_HERITEE_CODEC
+            ),
+            &[&track_id as &dyn ToSqlValue],
+        )?;
+        if gardee > 0 {
+            return Ok(());
+        }
+    }
     let (verdict, raison, coupure, bits, rate, bits_declares) = match resultat {
         Ok(m) => {
             let v = juger(m);
+            // #9067 — un CD conforme malgré une coupure suspecte (pas de mur)
+            // garde une trace, jamais publiée, de la règle qui l'a jugé.
+            let raison = v.code_raison().map(str::to_string).or_else(|| {
+                (v == Verdict::Conforme
+                    && m.coupure_hz
+                        .is_some_and(|f| f < super::faux_hires::COUPURE_LOSSY_MAX_HZ))
+                .then(|| super::faux_hires::RAISON_CD_SANS_MUR.to_string())
+            });
             (
                 v.code().to_string(),
-                v.code_raison().map(str::to_string),
+                raison,
                 m.coupure_hz,
                 m.bits_effectifs.map(|b| b as i64),
                 Some(m.sample_rate as i64),
@@ -351,36 +426,64 @@ pub async fn courir(db: Arc<dyn DbBackend>) {
     }
 }
 
-/// Le verdict d'un ALBUM à partir de ceux de ses pistes : « douteux » dès
-/// qu'une piste l'est (avec la raison la plus fréquente), « vérifié » si
-/// toutes ses pistes mesurées le sont, « non analysé » sans aucune mesure,
-/// « conforme » sinon (qualité CD, rien de suspect).
-pub fn verdict_d_album(pistes: &[(String, Option<String>)]) -> (String, Option<String>) {
-    if pistes.is_empty() {
-        return ("non_analyse".into(), None);
-    }
-    let douteuses: Vec<&Option<String>> = pistes
+/// #9035 — combien de pistes d'un album sont DOUTEUSES (« source altérée »),
+/// sur combien de pistes mesurées : « 3 pistes sur 10 ». #9067 (19/11) — la
+/// source altérée couvre tous les formats : toutes les pistes mesurées
+/// concluantes comptent (vérifiées, conformes ou douteuses), un CD conforme
+/// aussi. Un album ne peut donc pas être altéré par une piste sur dix.
+pub fn pistes_en_cause(pistes: &[(String, Option<String>)]) -> (usize, usize) {
+    let douteuses = pistes.iter().filter(|(v, _)| v == "douteux").count();
+    let mesurees = pistes
+        .iter()
+        .filter(|(v, _)| v == "verifie" || v == "conforme" || v == "douteux")
+        .count();
+    (douteuses, mesurees)
+}
+
+/// #9035 — la raison la plus fréquente parmi les pistes DOUTEUSES (l'ancien
+/// `coupure_de_codec` compte comme la coupure qu'il était, voir
+/// `raison_publiee`) ; `None` sans piste douteuse.
+pub fn raison_des_douteuses(pistes: &[(String, Option<String>)]) -> Option<String> {
+    let mut comptes: std::collections::BTreeMap<String, usize> = Default::default();
+    for r in pistes
         .iter()
         .filter(|(v, _)| v == "douteux")
-        .map(|(_, r)| r)
-        .collect();
-    if !douteuses.is_empty() {
-        let mut comptes: std::collections::BTreeMap<String, usize> = Default::default();
-        for r in douteuses.into_iter().flatten() {
-            *comptes.entry(r.clone()).or_default() += 1;
-        }
-        let raison = comptes.into_iter().max_by_key(|(_, n)| *n).map(|(r, _)| r);
-        return ("douteux".into(), raison);
+        .filter_map(|(_, r)| r.as_deref())
+    {
+        *comptes
+            .entry(super::faux_hires::raison_publiee(r).to_string())
+            .or_default() += 1;
     }
-    let mesurees: Vec<&String> = pistes
+    comptes.into_iter().max_by_key(|(_, n)| *n).map(|(r, _)| r)
+}
+
+/// #9035 (décision de Bertrand du 18/11/2026, fil 2902) — un album est
+/// douteux quand AU MOINS LA MOITIÉ de ses pistes mesurées le sont. Deux
+/// bonus douteux sur dix pistes ne font pas un album douteux : l'album le dit
+/// (« 2 pistes douteuses », [`pistes_en_cause`]) sans en porter le verdict.
+pub fn album_majoritairement_douteux(douteuses: usize, mesurees: usize) -> bool {
+    douteuses > 0 && 2 * douteuses >= mesurees
+}
+
+/// Le verdict d'un ALBUM à partir de ceux de ses pistes : « douteux » quand
+/// au moins la moitié de ses pistes mesurées le sont (#9035, avec la raison
+/// la plus fréquente) ; sinon, les pistes douteuses mises de côté,
+/// « vérifié » si toutes les autres pistes mesurées le sont, « conforme »
+/// s'il en reste une conforme, « non analysé » sans aucune mesure.
+pub fn verdict_d_album(pistes: &[(String, Option<String>)]) -> (String, Option<String>) {
+    let (douteuses, mesurees) = pistes_en_cause(pistes);
+    if album_majoritairement_douteux(douteuses, mesurees) {
+        return ("douteux".into(), raison_des_douteuses(pistes));
+    }
+    let autres: Vec<&String> = pistes
         .iter()
         .map(|(v, _)| v)
-        .filter(|v| *v != "non_concluant")
+        .filter(|v| *v != "non_concluant" && *v != "douteux")
         .collect();
-    if mesurees.is_empty() {
+    if autres.is_empty() {
         return ("non_analyse".into(), None);
     }
-    if mesurees.iter().all(|v| *v == "verifie") {
+    if autres.iter().all(|v| *v == "verifie") {
         return ("verifie".into(), None);
     }
     ("conforme".into(), None)

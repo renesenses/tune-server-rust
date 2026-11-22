@@ -36,7 +36,7 @@ permissions:
 jobs:
   refs:
     name: Issues déclarées corrigées
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     # Sans plafond, un blocage tourne SIX HEURES avant que GitHub ne le tue.
     # Trois releases l'ont paye (0.9.86, 0.9.87, 0.9.88).
     timeout-minutes: 5

@@ -60,7 +60,8 @@ mod tests {
     }
 
     /// Le branchement : `WasapiExclusiveOutput::new` passe par cette règle et
-    /// ne retient plus la minimale en premier.
+    /// ne retient plus la minimale en premier. #8696 : par
+    /// `periode_reglable_8696::periode_retenue_100ns`, qui l'appelle.
     #[test]
     fn l_ouverture_exclusive_passe_par_la_regle() {
         // Comparé sans blancs et sans la parenthèse fermante : rustfmt coupe
@@ -68,9 +69,17 @@ mod tests {
         let source: String = include_str!("wasapi_exclusive.rs")
             .split_whitespace()
             .collect();
+        let reglable: String = include_str!("periode_reglable_8696.rs")
+            .split_whitespace()
+            .collect();
         assert!(
-            source.contains("periode_exclusive_100ns(default_period,min_period"),
-            "wasapi_exclusive.rs doit choisir sa période par periode_exclusive_100ns"
+            source.contains("periode_retenue_100ns(default_period,min_period"),
+            "wasapi_exclusive.rs doit choisir sa période par periode_retenue_100ns"
+        );
+        assert!(
+            reglable
+                .contains("periode_exclusive_4357::periode_exclusive_100ns(par_defaut,minimale)"),
+            "la période réglable doit partir de la règle de #4357"
         );
         assert!(
             !source.contains("letperiod=ifmin_period>0{"),

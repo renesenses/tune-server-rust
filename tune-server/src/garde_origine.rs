@@ -81,6 +81,15 @@ pub const ORIGINES_NATIVES: &[&str] = &[
     "https://tauri.localhost",
 ];
 
+/// Ce qui, sous [`CATALOGUE_PUBLIC`], n'est pas du catalogue mais
+/// l'activité des profils (historique d'écoute, propositions de
+/// métadonnées) : jamais lisible depuis une autre origine.
+pub const HORS_CATALOGUE: &[&str] = &[
+    "/api/v1/library/history",
+    "/api/v1/library/activity",
+    "/api/v1/library/proposals",
+];
+
 /// Variable d'environnement des origines supplémentaires de confiance.
 pub const VARIABLE_ORIGINES: &str = "TUNE_ALLOWED_ORIGINS";
 
@@ -444,7 +453,14 @@ pub fn cors_autorise(origine: &HeaderValue, parts: &Parts) -> bool {
         return false;
     }
     // Le catalogue, en lecture seule, pour le parcours d'un autre serveur.
-    if parts.uri.path().starts_with(CATALOGUE_PUBLIC) {
+    let chemin = parts.uri.path();
+    if chemin.starts_with(CATALOGUE_PUBLIC)
+        && !HORS_CATALOGUE.iter().any(|h| {
+            chemin
+                .strip_prefix(h)
+                .is_some_and(|reste| reste.is_empty() || reste.starts_with('/'))
+        })
+    {
         return true;
     }
     // La sonde et « Mes radios », pour la page des radios du site, et pour
@@ -718,6 +734,30 @@ mod tests {
         let p = parts(
             Method::GET,
             "/api/v1/library/albums",
+            &[("host", "192.168.1.18:8888")],
+        );
+        assert!(cors_autorise(&o, &p));
+    }
+
+    /// L'historique d'écoute n'est pas du catalogue : une page d'une autre
+    /// origine ne le lit pas, même en `GET`.
+    #[test]
+    fn l_historique_n_est_pas_lisible_depuis_une_autre_origine() {
+        let o = HeaderValue::from_static("http://site-tiers.example");
+        for chemin in [
+            "/api/v1/library/history",
+            "/api/v1/library/history/export",
+            "/api/v1/library/history/dashboard",
+            "/api/v1/library/proposals",
+            "/api/v1/library/activity",
+        ] {
+            let p = parts(Method::GET, chemin, &[("host", "192.168.1.18:8888")]);
+            assert!(!cors_autorise(&o, &p), "{chemin} lisible par un site tiers");
+        }
+        // Le catalogue, lui, reste lisible (parcours d'un autre serveur).
+        let p = parts(
+            Method::GET,
+            "/api/v1/library/historyx",
             &[("host", "192.168.1.18:8888")],
         );
         assert!(cors_autorise(&o, &p));

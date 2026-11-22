@@ -51,7 +51,10 @@ pub fn cle_reglages_du_profil(profile_id: i64) -> String {
     format!("profile_{profile_id}_settings")
 }
 
-fn reglages_du_profil(db: &Arc<dyn DbBackend>, profile_id: i64) -> serde_json::Map<String, Value> {
+pub(crate) fn reglages_du_profil(
+    db: &Arc<dyn DbBackend>,
+    profile_id: i64,
+) -> serde_json::Map<String, Value> {
     SettingsRepo::with_backend(db.clone())
         .get(&cle_reglages_du_profil(profile_id))
         .ok()

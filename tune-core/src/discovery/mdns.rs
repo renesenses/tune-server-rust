@@ -662,6 +662,9 @@ async fn handle_event(
             st.service_to_device
                 .insert(info.get_fullname().to_string(), dev_id.clone());
             st.devices.insert(dev_id.clone(), device.clone());
+            // #9140 — retenu dès la découverte : `mdns_device_lost name=…` et
+            // les lignes d'un appareil parti restent masquées dans un rapport.
+            crate::discovery::device::retenir_pour_la_confidentialite(&device);
             drop(st);
 
             if is_new {

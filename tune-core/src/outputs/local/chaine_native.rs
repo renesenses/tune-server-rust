@@ -432,7 +432,7 @@ impl ReserveDeLaChaine for ReserveHttp<'_> {
         };
         info!(
             next_title = ?suivante.title,
-            next_url = %suivante.url,
+            next_url = %crate::confidentialite::masquer_url(&suivante.url),
             "local_audio_gapless_chaining_next_track"
         );
         let Some(mut lecteur) = ouvrir_la_piste_suivante(&suivante.url, self.force_silent) else {
@@ -440,6 +440,7 @@ impl ReserveDeLaChaine for ReserveHttp<'_> {
         };
         match lire_l_entete_enchainee(&mut lecteur, self.force_silent) {
             Ok(entete) => {
+                lecteur.borner(entete.restant);
                 self.en_cours = Some(suivante);
                 Suivante::Prete { lecteur, entete }
             }

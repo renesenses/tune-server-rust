@@ -242,3 +242,37 @@ test('la liste des zones accepte le tableau que rend GET /zones', () => {
   assert.equal(C.listeDeZones({ zones: [{ id: 1 }, { id: 2 }] }).length, 2);
   assert.deepEqual(C.listeDeZones(null), []);
 });
+
+// ── Raccourcis clavier dans l'app (#9255) ──────────────────────────────────
+// Plus aucun raccourci global : l'espace est traitée par la page, hors des
+// champs, et jamais avec un modificateur (⌘ + touche = barre des menus).
+test('espace = lecture / pause, hors des champs et sans modificateur', () => {
+  const espace = { key: ' ', code: 'Space' };
+  assert.equal(C.actionDuClavier(espace, 'BODY'), 'lecture-pause');
+  assert.equal(C.actionDuClavier(espace, 'div'), 'lecture-pause');
+  // Taper une espace dans la recherche, presser un bouton : pas de lecture.
+  for (const balise of ['INPUT', 'TEXTAREA', 'SELECT', 'BUTTON', 'input']) {
+    assert.equal(C.actionDuClavier(espace, balise), null, balise);
+  }
+  for (const mod of ['metaKey', 'ctrlKey', 'altKey', 'shiftKey']) {
+    assert.equal(C.actionDuClavier({ ...espace, [mod]: true }, 'BODY'), null, mod);
+  }
+  // Déjà traitée par un autre écouteur : on ne la rejoue pas.
+  assert.equal(C.actionDuClavier({ ...espace, defaultPrevented: true }, 'BODY'), null);
+  // Les autres touches ne sont pas à nous.
+  assert.equal(C.actionDuClavier({ key: 'k', code: 'KeyK' }, 'BODY'), null);
+  assert.equal(C.actionDuClavier({ key: 'ArrowRight', code: 'ArrowRight' }, 'BODY'), null);
+  assert.equal(C.actionDuClavier(null, 'BODY'), null);
+});
+
+// ── Serveurs du réseau (#9255, fil 2968) ───────────────────────────────────
+// Forme de `decouverte::ServeurTrouve` (sérialisé par Tauri).
+test('une ligne de la liste des serveurs', () => {
+  const s = { nom: 'Tune (salon)', url: 'http://192.168.1.18:8888', hote: 'salon.local', version: '1.0.0-rc13', cle: 'Tune (salon)._tune-server._tcp.local.' };
+  assert.deepEqual(C.ligneDeServeur(s), { nom: 'Tune (salon)', detail: '192.168.1.18:8888 · v1.0.0-rc13' });
+  // Sans nom ni version : l'adresse seule.
+  assert.deepEqual(C.ligneDeServeur({ url: 'http://10.0.0.2:8888', nom: ' ' }), { nom: '10.0.0.2:8888', detail: '10.0.0.2:8888' });
+  assert.equal(C.estServeurActuel(s, '192.168.1.18:8888/'), true);
+  assert.equal(C.estServeurActuel(s, 'http://localhost:8888'), false);
+  assert.equal(C.estServeurActuel(null, 'http://localhost:8888'), false);
+});

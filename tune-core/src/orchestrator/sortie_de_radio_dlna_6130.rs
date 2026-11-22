@@ -46,6 +46,20 @@ pub(crate) const DELAI_FERMETURE_RADIO: Duration = Duration::from_secs(2);
 const DELAI_DU_STOP: Duration = Duration::from_secs(2);
 /// Pas de sondage du compteur de consommateurs.
 const PAS_DE_SONDAGE: Duration = Duration::from_millis(20);
+/// #8926 — durée pendant laquelle toutes les connexions radio restantes
+/// doivent rester arrêtées sur l'écriture pour qu'on cesse d'attendre.
+///
+/// Journal du .18 (14/11 → 17/11, DMP-A8) : 21 sorties de radio, 11 closes en
+/// 20–21 ms (le corps tournait encore, il a vu le congé au sondage suivant),
+/// 10 en 2 002–2 014 ms avec `consommateurs_restants=1`, et AUCUNE entre les
+/// deux. Dans ces dix cas le corps de la radio a remis son dernier bloc à
+/// hyper et n'est plus relancé : le renderer, arrêté, ne lit plus, son tampon
+/// TCP est plein. Le congé de #7021 (`congedier_les_consommateurs`) ne peut
+/// pas l'atteindre avant qu'il lise de nouveau, ce que le DMP-A8 ne fait
+/// qu'au `Play` suivant. Les 2 s d'attente n'y changeaient rien : le direct
+/// est déjà coupé côté serveur (plus un octet de PCM ne part après le congé),
+/// seule la fermeture TCP reste à venir.
+const CONFIRMATION_ECRITURE_BLOQUEE: Duration = Duration::from_millis(300);
 
 /// Ce qu'a donné la sortie de radio, tel que journalisé.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,6 +67,16 @@ pub(crate) struct BilanSortieDeRadio {
     pub stop_envoye: bool,
     pub radio_fermee_en_ms: u64,
     pub delai_depasse: bool,
+    /// #8926 — l'attente a cessé parce que le renderer ne lit plus rien.
+    pub renderer_ne_lit_plus: bool,
+}
+
+/// Ce que rend [`attendre_le_depart_des_consommateurs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FinDAttente {
+    pub attente: Duration,
+    pub delai_depasse: bool,
+    pub renderer_ne_lit_plus: bool,
 }
 
 /// Consommateurs HTTP encore accrochés à ces sessions.
@@ -63,19 +87,54 @@ fn consommateurs(sessions: &[Arc<StreamSession>]) -> u32 {
         .sum()
 }
 
-/// Attendre que plus personne ne lise ces sessions, au plus `delai`.
-/// Rend la durée d'attente et si le délai a été dépassé.
+/// #8926 — toutes les connexions encore accrochées à ces sessions sont des
+/// connexions radio arrêtées sur l'écriture.
+fn renderer_arrete_sur_l_ecriture(sessions: &[Arc<StreamSession>]) -> bool {
+    let restantes: Vec<&Arc<StreamSession>> = sessions
+        .iter()
+        .filter(|s| s.active_consumers.load(Ordering::SeqCst) > 0)
+        .collect();
+    !restantes.is_empty()
+        && restantes
+            .iter()
+            .all(|s| s.is_radio && s.consommateurs_radio_tous_en_ecriture())
+}
+
+/// Attendre que plus personne ne lise ces sessions, au plus `delai`. Cesse
+/// aussi d'attendre quand le renderer ne lit plus rien depuis
+/// [`CONFIRMATION_ECRITURE_BLOQUEE`] (#8926).
 pub(crate) async fn attendre_le_depart_des_consommateurs(
     sessions: &[Arc<StreamSession>],
     delai: Duration,
-) -> (Duration, bool) {
+) -> FinDAttente {
     let debut = Instant::now();
+    let mut bloque_depuis: Option<Instant> = None;
     loop {
         if consommateurs(sessions) == 0 {
-            return (debut.elapsed(), false);
+            return FinDAttente {
+                attente: debut.elapsed(),
+                delai_depasse: false,
+                renderer_ne_lit_plus: false,
+            };
+        }
+        if renderer_arrete_sur_l_ecriture(sessions) {
+            let depuis = *bloque_depuis.get_or_insert_with(Instant::now);
+            if depuis.elapsed() >= CONFIRMATION_ECRITURE_BLOQUEE {
+                return FinDAttente {
+                    attente: debut.elapsed(),
+                    delai_depasse: false,
+                    renderer_ne_lit_plus: true,
+                };
+            }
+        } else {
+            bloque_depuis = None;
         }
         if debut.elapsed() >= delai {
-            return (debut.elapsed(), true);
+            return FinDAttente {
+                attente: debut.elapsed(),
+                delai_depasse: true,
+                renderer_ne_lit_plus: false,
+            };
         }
         tokio::time::sleep(PAS_DE_SONDAGE).await;
     }
@@ -144,12 +203,12 @@ impl PlaybackOrchestrator {
             s.congedier_les_consommateurs();
             congedies += 1;
         }
-        let (attente, delai_depasse) =
-            attendre_le_depart_des_consommateurs(&sessions, DELAI_FERMETURE_RADIO).await;
+        let fin = attendre_le_depart_des_consommateurs(&sessions, DELAI_FERMETURE_RADIO).await;
         let bilan = BilanSortieDeRadio {
             stop_envoye,
-            radio_fermee_en_ms: attente.as_millis() as u64,
-            delai_depasse,
+            radio_fermee_en_ms: fin.attente.as_millis() as u64,
+            delai_depasse: fin.delai_depasse,
+            renderer_ne_lit_plus: fin.renderer_ne_lit_plus,
         };
         info!(
             zone_id,
@@ -157,8 +216,13 @@ impl PlaybackOrchestrator {
             stop_envoye = bilan.stop_envoye,
             radio_fermee_en_ms = bilan.radio_fermee_en_ms,
             delai_depasse = bilan.delai_depasse,
+            renderer_ne_lit_plus = bilan.renderer_ne_lit_plus,
             radios_fermees_par_le_serveur = congedies,
             consommateurs_restants = consommateurs(&sessions),
+            consommateurs_en_ecriture = sessions
+                .iter()
+                .map(|s| s.consommateurs_radio_en_ecriture.load(Ordering::Relaxed))
+                .sum::<u32>(),
             "dlna_sortie_de_radio"
         );
         Some(bilan)

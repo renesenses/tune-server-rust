@@ -267,6 +267,7 @@ mod tests {
             friendly_name: "test".into(),
             uuid: "test".into(),
             advertised_ip: None,
+            annonce: tune_core::upnp_server::InterrupteurServeurMedia::new(true),
         })
     }
 

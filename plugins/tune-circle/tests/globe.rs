@@ -131,6 +131,21 @@ async fn points(State(e): State<Etat>, h: HeaderMap) -> Response {
     Json(points_attendus()).into_response()
 }
 
+/// rc13 : les cercles du monde, tels que le cloud les anonymise.
+fn cercles_attendus() -> Value {
+    json!([
+        { "lat": 46.0, "lon": 5.0, "circles": "5-19" },
+        { "lat": 51.0, "lon": 4.5, "circles": "<5" }
+    ])
+}
+
+async fn cercles(State(e): State<Etat>, h: HeaderMap) -> Response {
+    if let Some(r) = autorise(&e, &h) {
+        return r;
+    }
+    Json(cercles_attendus()).into_response()
+}
+
 async fn lire_retrait(State(e): State<Etat>, h: HeaderMap) -> Response {
     if let Some(r) = autorise(&e, &h) {
         return r;
@@ -172,6 +187,7 @@ async fn demarrer() -> (String, Etat) {
         )
         .route("/api/v1/circle/contacts/locations", get(lieux))
         .route("/api/v1/circle/world/points", get(points))
+        .route("/api/v1/circle/world/circles", get(cercles))
         .route(
             "/api/v1/circle/me/public-map-opt-out",
             get(lire_retrait).put(poser_retrait).delete(lever_retrait),
@@ -185,13 +201,14 @@ async fn demarrer() -> (String, Etat) {
     (format!("http://{adresse}"), etat)
 }
 
-const ROUTES: [(&str, &str); 9] = [
+const ROUTES: [(&str, &str); 10] = [
     ("GET", "/contacts/7/library/summary"),
     ("GET", "/me/location"),
     ("PUT", "/me/location"),
     ("DELETE", "/me/location"),
     ("GET", "/contacts/locations"),
     ("GET", "/world/points"),
+    ("GET", "/world/circles"),
     ("GET", "/me/public-map-opt-out"),
     ("PUT", "/me/public-map-opt-out"),
     ("DELETE", "/me/public-map-opt-out"),
@@ -375,6 +392,21 @@ async fn la_carte_publique_est_relayee_telle_quelle_et_sans_cache() {
         "no-store",
         "la carte publique ne reste dans aucun cache"
     );
+}
+
+#[tokio::test]
+async fn les_cercles_du_monde_sont_relayes_tels_quels_et_sans_cache() {
+    let (url, etat) = demarrer().await;
+    let app = app(base(&url, Some(JETON)));
+    let r = appel(&app, "GET", "/world/circles", None).await;
+    assert_eq!(r.statut, StatusCode::OK);
+    assert_eq!(r.json(), cercles_attendus());
+    assert_eq!(
+        r.entetes.get(header::CACHE_CONTROL).unwrap(),
+        "no-store",
+        "les cercles du monde ne restent dans aucun cache"
+    );
+    assert_eq!(etat.lock().unwrap().appels, 1);
 }
 
 #[tokio::test]

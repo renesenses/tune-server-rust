@@ -2206,6 +2206,8 @@ impl PlaybackManager {
             state.shuffle_order.clear();
             state.shuffle_index = -1;
         }
+        // #8968 — le mode ReplayGain Auto donne le gain de piste en aléatoire.
+        crate::audio::replaygain::auto::noter_aleatoire(zone_id, enabled);
         if !enabled {
             self.oublier_l_ordre_d_origine(zone_id);
         }
@@ -2230,6 +2232,9 @@ impl PlaybackManager {
                 })
                 .repeat = mode;
         }
+        // #8968 — la suivante de la dernière ligne n'est la première que si
+        // toute la file se répète (mode ReplayGain Auto).
+        crate::audio::replaygain::auto::noter_boucle(zone_id, mode == RepeatMode::All);
         self.emit(PlaybackEvent {
             event: "repeat".into(),
             zone_id,
@@ -2500,6 +2505,21 @@ impl PlaybackManager {
         // file EST l'ordre joué. Le tirage refait à chaque changement de
         // longueur rebattait les titres déjà joués et envoyait un « Lire
         // ensuite » n'importe où.
+    }
+
+    /// Applique une permutation de file au curseur sans modifier le transport.
+    pub async fn reordonner_curseur_de_file(&self, zone_id: i64, avant: &[i64], apres: &[i64]) {
+        let mut zones = self.zones.lock().await;
+        if let Some(state) = zones.get_mut(&zone_id) {
+            if let Some(id) = usize::try_from(state.queue_position)
+                .ok()
+                .and_then(|i| avant.get(i))
+                && let Some(position) = apres.iter().position(|nouveau| nouveau == id)
+            {
+                state.queue_position = position as i64;
+            }
+            state.queue_length = apres.len() as i64;
+        }
     }
 
     /// #6526 — l'ordre d'origine retenu pour la zone (vide = rien à rétablir).

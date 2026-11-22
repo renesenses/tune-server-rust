@@ -276,7 +276,7 @@ fn la_route_dit_l_alerte_et_les_profils_7371() {
         EXE,
         &sans_variable,
     );
-    let corps = charge_utile(true, Some(&etat));
+    let corps = charge_utile(true, Some(&etat), true);
     assert_eq!(corps["windows"], true);
     assert_eq!(corps["alerte"], true);
     assert_eq!(
@@ -293,7 +293,7 @@ fn la_route_dit_l_alerte_et_les_profils_7371() {
     );
     assert_eq!(corps["releve"]["regle_presente"], true);
 
-    let hors_windows = charge_utile(false, None);
+    let hors_windows = charge_utile(false, None, false);
     assert_eq!(hors_windows["alerte"], false);
     assert!(hors_windows["releve"].is_null());
 }
@@ -304,8 +304,29 @@ async fn la_route_hors_windows_ne_releve_rien_7371() {
     if cfg!(target_os = "windows") {
         return;
     }
-    let axum::Json(corps) = route_etat().await;
-    assert_eq!(corps, charge_utile(false, None));
+    use tower::ServiceExt;
+    let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    let app = crate::routes::router_with_plugins(state, vec![]).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [192, 168, 1, 20],
+            50000,
+        ))),
+    );
+    let reponse = app
+        .oneshot(
+            axum::http::Request::builder()
+                .uri("/api/v1/system/pare-feu")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reponse.status(), axum::http::StatusCode::OK);
+    let octets = axum::body::to_bytes(reponse.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    let corps: serde_json::Value = serde_json::from_slice(&octets).unwrap();
+    assert_eq!(corps, charge_utile(false, None, false));
 }
 
 /// Le cache de la route : servi tant qu'il a moins de 30 s, relu ensuite

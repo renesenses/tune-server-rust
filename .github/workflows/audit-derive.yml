@@ -70,7 +70,7 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   contre-epreuve:
     name: Contre-épreuve du détecteur
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -84,7 +84,7 @@ jobs:
     # changé, et un audit rouge à cause d'une dérive préexistante ferait échouer
     # une PR qui n'y est pour rien.
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4

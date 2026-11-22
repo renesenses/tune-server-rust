@@ -39,7 +39,7 @@ async fn request(app: &axum::Router, method: &str, path: &str, body: Value) -> (
 }
 
 #[tokio::test]
-async fn audio_offer_free_eq_and_premium_four_survive_real_startup() {
+async fn audio_offer_free_eq_crossfeed_and_paid_plugins_survive_real_startup() {
     crate::use_scratch_plugin_data_dir();
     // An entitlement inversion in ANY shipping manifest must fail this witness.
     for (raw, expected) in [
@@ -49,7 +49,7 @@ async fn audio_offer_free_eq_and_premium_four_survive_real_startup() {
         ),
         (
             include_str!("../../sdk/tune-plugin-crossfeed/manifest.json"),
-            "crossfeed",
+            "free",
         ),
         (
             include_str!("../../sdk/tune-plugin-converter/manifest.json"),
@@ -90,7 +90,7 @@ async fn audio_offer_free_eq_and_premium_four_survive_real_startup() {
         for id in ["equalizer", "crossfeed", "converter", "declick"] {
             assert_eq!(
                 loaded.iter().any(|p| p.name == id),
-                premium || id == "equalizer",
+                premium || matches!(id, "equalizer" | "crossfeed"),
                 "default delivery: {id}, premium={premium}"
             );
         }
@@ -98,7 +98,12 @@ async fn audio_offer_free_eq_and_premium_four_survive_real_startup() {
             tune_plugin_native::provider("equalizer").is_none(),
             "fixture must prove bundled EQ with no package"
         );
-        let app = tune_server::routes::router_with_plugins(state.clone(), routers);
+        let app = tune_server::routes::router_with_plugins(state.clone(), routers).layer(
+            axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                50000,
+            ))),
+        );
         let eq =
             json!({"enabled":true,"bands":[{"freq":1000.0,"gain":3.0,"q":1.41,"type":"peak"}]});
         let (status, response) = request(
@@ -120,10 +125,7 @@ async fn audio_offer_free_eq_and_premium_four_survive_real_startup() {
         let dsp = format!("/api/v1/zones/{zone}/dsp");
         let (_, response) = request(&app, "GET", &dsp, Value::Null).await;
         assert_eq!(response["crossfeed_status"]["requested"], true);
-        assert_eq!(response["crossfeed_status"]["effective"], premium);
-        if !premium {
-            assert_eq!(response["crossfeed_status"]["reason"], "premium_required");
-        }
+        assert_eq!(response["crossfeed_status"]["effective"], true);
         let (status, _) = request(
             &app,
             "PUT",
@@ -131,29 +133,33 @@ async fn audio_offer_free_eq_and_premium_four_survive_real_startup() {
             json!({"crossfeed":{"enabled":true,"amount":0.2,"delay_ms":0.4}}),
         )
         .await;
-        assert_eq!(
-            status,
-            if premium {
-                StatusCode::OK
-            } else {
-                StatusCode::PAYMENT_REQUIRED
-            }
-        );
+        assert_eq!(status, StatusCode::OK);
+        let (_, response) = request(&app, "GET", &dsp, Value::Null).await;
+        assert_eq!(response["crossfeed_status"]["effective"], true);
+        assert_eq!(response["crossfeed"]["amount"], 0.2);
+        let (status, response) = request(
+            &app,
+            "POST",
+            "/api/v1/crossfeed/presets",
+            json!({"name":"Free crossfeed", "amount":0.2, "delay_ms":0.4}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{response}");
         if !premium {
-            assert_eq!(
-                settings.get(&key).unwrap().as_deref(),
-                Some(saved),
-                "hard cut must retain the exact old settings"
-            );
-            state.license.set_account_premium(true, None).await;
+            let (status, response) =
+                request(&app, "DELETE", "/api/v1/plugins/crossfeed", Value::Null).await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+            let (_, response) = request(&app, "GET", &dsp, Value::Null).await;
+            assert_eq!(response["crossfeed_status"]["effective"], false);
             let (status, response) =
                 request(&app, "POST", "/api/v1/plugins/crossfeed/install", json!({})).await;
-            assert_eq!(status, StatusCode::OK, "reactivation: {response}");
+            assert_eq!(status, StatusCode::OK, "installation gratuite : {response}");
             let (_, response) = request(&app, "GET", &dsp, Value::Null).await;
             assert_eq!(response["crossfeed_status"]["effective"], true);
-            assert_eq!(response["crossfeed"]["amount"], 0.37);
-            assert_eq!(settings.get(&key).unwrap().as_deref(), Some(saved));
-            state.license.set_account_premium(false, None).await;
+            assert_eq!(
+                response["crossfeed"]["amount"], 0.2,
+                "réglage gardé après réinstallation"
+            );
         }
         // A real, tiny PCM WAV; Premium must start and complete both jobs.
         let dir = tempfile::tempdir().unwrap();

@@ -26,6 +26,29 @@ pub mod sql {
         )
     }
 
+    /// #8892 — la fiche d'un titre de service, mémorisée sur UNE ligne de
+    /// playlist (sa clé primaire, dans la playlist affichée) à chaque
+    /// résolution réussie : un titre devenu indisponible garde l'artiste,
+    /// l'album, la pochette et la durée de sa dernière fiche. Un paramètre
+    /// nul garde la valeur enregistrée ; le titre n'est jamais touché.
+    pub fn memoriser_fiche_de_ligne<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "UPDATE playlist_tracks SET artist = COALESCE({}, artist), \
+             album = COALESCE({}, album), \
+             album_source_id = COALESCE({}, album_source_id), \
+             cover_url = COALESCE({}, cover_url), \
+             duration_ms = COALESCE({}, duration_ms) \
+             WHERE id = {} AND playlist_id = {}",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+            d.placeholder(6),
+            d.placeholder(7)
+        )
+    }
+
     pub fn create<D: SqlDialect>(d: &D) -> String {
         format!(
             "INSERT INTO playlists (name, description, profile_id) VALUES ({}, {}, {})",
@@ -312,6 +335,18 @@ pub struct ServiceEntry {
     pub album_source_id: Option<String>,
     pub duration_ms: Option<i64>,
     pub cover_url: Option<String>,
+}
+
+/// #8892 — ce qu'une résolution réussie apprend d'un titre de service, à
+/// mémoriser sur ses lignes de playlist
+/// ([`PlaylistRepo::memoriser_fiche_de_service`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FicheDeService {
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub album_source_id: Option<String>,
+    pub cover_url: Option<String>,
+    pub duration_ms: Option<i64>,
 }
 
 impl ServiceEntry {
@@ -1061,6 +1096,65 @@ impl PlaylistRepo {
             &source_id,
         ];
         self.db.execute(&sql, &params)
+    }
+
+    /// #8892 — mémorise, en UNE transaction, la fiche de chaque ligne
+    /// `(entry_id, fiche)` de la playlist `playlist_id` (clé primaire : pas
+    /// de parcours de `playlist_tracks`). Les champs `None` ou vides gardent
+    /// la valeur enregistrée ; une durée nulle aussi. Rend le nombre de
+    /// lignes réécrites.
+    pub fn memoriser_fiches_de_lignes(
+        &self,
+        playlist_id: i64,
+        fiches: &[(i64, FicheDeService)],
+    ) -> Result<usize, String> {
+        let texte = |v: &Option<String>| {
+            v.as_deref()
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_owned)
+        };
+        let lignes: Vec<_> = fiches
+            .iter()
+            .map(|(entry_id, f)| {
+                (
+                    *entry_id,
+                    texte(&f.artist),
+                    texte(&f.album),
+                    texte(&f.album_source_id),
+                    texte(&f.cover_url),
+                    f.duration_ms.filter(|d| *d > 0),
+                )
+            })
+            .filter(|(_, a, b, c, d, e)| {
+                a.is_some() || b.is_some() || c.is_some() || d.is_some() || e.is_some()
+            })
+            .collect();
+        if lignes.is_empty() {
+            return Ok(0);
+        }
+        let sql = self.dialect_sql(sql::memoriser_fiche_de_ligne, sql::memoriser_fiche_de_ligne);
+        let mut ecrites = 0usize;
+        {
+            let ecrites = &mut ecrites;
+            self.db.write_tx(&mut |tx| {
+                *ecrites = 0;
+                for (entry_id, artist, album, album_source_id, cover_url, duration_ms) in &lignes {
+                    let params: [&dyn ToSqlValue; 7] = [
+                        artist,
+                        album,
+                        album_source_id,
+                        cover_url,
+                        duration_ms,
+                        entry_id,
+                        &playlist_id,
+                    ];
+                    *ecrites += tx.execute(&sql, &params)?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(ecrites)
     }
 
     /// La playlist porte-t-elle au moins un titre de service ?

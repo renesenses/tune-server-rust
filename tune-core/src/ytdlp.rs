@@ -240,7 +240,7 @@ pub async fn download() -> Result<(PathBuf, String), String> {
         .ok_or_else(|| format!("yt-dlp: asset '{asset}' not found in latest release"))?
         .to_string();
 
-    info!(asset, url = %url, tag = %tag, "ytdlp_download_starting");
+    info!(asset, url = %crate::confidentialite::masquer_url(&url), tag = %tag, "ytdlp_download_starting");
     let bytes = client
         .get(&url)
         .send()
@@ -269,13 +269,28 @@ pub async fn download() -> Result<(PathBuf, String), String> {
     Ok((dest, tag))
 }
 
+/// #8904 — les variables du client OAuth Google de Tune. yt-dlp ne les lit
+/// pas, mais il n'en hérite pas non plus : la lecture par yt-dlp reste
+/// séparée de la connexion au compte.
+pub const VARIABLES_OAUTH_RETIREES: [&str; 2] = [
+    crate::streaming::youtube::ENV_CLIENT_ID,
+    crate::streaming::youtube::ENV_CLIENT_SECRET,
+];
+
+/// #8904 — la commande qui lance yt-dlp (`binaire`), SANS les variables du
+/// client OAuth de Tune dans son environnement. Tout lancement de yt-dlp
+/// passe par elle.
+pub fn commande(binaire: &Path) -> tokio::process::Command {
+    let mut commande = tokio::process::Command::new(binaire);
+    for variable in VARIABLES_OAUTH_RETIREES {
+        commande.env_remove(variable);
+    }
+    commande
+}
+
 /// Query `yt-dlp --version` for the given binary (best-effort).
 pub async fn version_of(path: &Path) -> Option<String> {
-    let out = tokio::process::Command::new(path)
-        .arg("--version")
-        .output()
-        .await
-        .ok()?;
+    let out = commande(path).arg("--version").output().await.ok()?;
     if !out.status.success() {
         warn!("ytdlp_version_query_failed");
         return None;

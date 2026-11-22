@@ -57,6 +57,21 @@ This documents the dedicated-volume workaround reported in server issue
 [#7028](https://github.com/renesenses/tune-server-rust/issues/7028). A new DSM
 installation has not been reproduced as part of this documentation change.
 
+## Keep your data across image updates
+
+Tune keeps its database, settings and streaming-service logins in `/data`.
+In Container Manager, open the stopped container's **Edit › Volume settings ›
+Add folder**, choose a folder such as `/volume1/docker/tune/data`, and set the
+mount path to `/data` (read/write). Without it, Docker uses an anonymous
+volume, and **Image › Update** recreates the container with a new, empty one:
+library folders and streaming connections are gone (forum thread 2798,
+[#8747](https://github.com/renesenses/tune-server-rust/issues/8747)).
+
+Since 1.0.0-rc13 Tune warns about it: a banner in Settings, a
+`donnees_non_persistantes` line in the container log, and a `Data dir` line
+in the bug report. The previous anonymous volume is usually still on the NAS
+(`docker volume ls -f dangling=true` over SSH) until it is pruned.
+
 ## SMB share mounted on the NAS
 
 A Samba share mounted on the NAS (File Station › Mount Remote Folder) does not

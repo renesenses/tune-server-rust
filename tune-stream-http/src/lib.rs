@@ -38,6 +38,20 @@ struct RadioConsumerGuard {
     /// first). That is an expected, internal end — not a client disconnect — so
     /// the Drop path stays quiet about it.
     superseded: bool,
+    /// #8926 — ce corps a remis un bloc à hyper et attend d'être relancé
+    /// (voir `StreamSession::noter_ecriture_radio`).
+    en_ecriture: bool,
+}
+
+impl RadioConsumerGuard {
+    /// #8926 — à poser AVANT de remettre un bloc à hyper (`true`) et dès que
+    /// le corps est relancé (`false`).
+    fn ecriture(&mut self, entre: bool) {
+        if self.en_ecriture != entre {
+            self.en_ecriture = entre;
+            self.session.noter_ecriture_radio(entre);
+        }
+    }
 }
 
 /// Can this renderer consume a live radio stream as a chunked, length-less
@@ -212,6 +226,7 @@ impl RadioConsumerGuard {
             started: std::time::Instant::now(),
             completed: false,
             superseded: false,
+            en_ecriture: false,
         }
     }
 }
@@ -219,6 +234,8 @@ impl RadioConsumerGuard {
 impl Drop for RadioConsumerGuard {
     fn drop(&mut self) {
         use std::sync::atomic::Ordering::Relaxed;
+        // Un corps lâché pendant qu'il attendait hyper ne l'attend plus.
+        self.ecriture(false);
         let remaining = self
             .session
             .active_consumers
@@ -439,6 +456,11 @@ pub async fn handle_stream(
     let Some(session) = session else {
         return StatusCode::NOT_FOUND.into_response();
     };
+    // #8963 — tirée par le pont (relais, écoute directe) : la retenue couvre
+    // toute la piste, AVANT que cette connexion tire le canal.
+    if req_headers.contains_key(tune_core::cloud::ENTETE_RELAIS) {
+        session.noter_tirage_par_le_pont();
+    }
 
     let range_hdr = req_headers
         .get("Range")
@@ -1262,6 +1284,71 @@ pub async fn handle_stream(
             // one stops without pulling a further chunk, so no chunk is split,
             // lost, or duplicated at the hand-off.
             let my_epoch = session.claim_channel_consumer();
+
+            // ── #8926 — la sonde de `Lavf` ne doit plus emporter l'avance ──
+            //
+            // .18, 17/11, FIP → Eversolo DMP-A8 : le renderer ouvre le flux
+            // (`bytes=0-`), en tire 1 058 924 octets en 1,49 s — la réserve
+            // de 3 s de #1628 et la rafale d'icecast, 5,5 s d'audio — puis se
+            // ferme et revient avec `bytes=0-`. Cette seconde connexion, la
+            // vraie lecture, ne recevait que le DIRECT : l'avance était
+            // partie dans la sonde, le renderer remplissait sa mémoire au
+            // rythme réel avant de jouer. Une lecture qui demande le début
+            // reçoit donc d'abord la tête du direct, d'un trait — ce que fait
+            // le « burst-on-connect » d'icecast —, puis la suite du canal,
+            // sans trou ni doublon (voir `StreamSession::tete_du_direct`). La
+            // première connexion n'y voit rien (la tête est vide) ; une reprise
+            // `bytes=N-` non plus (#3513 : un navigateur qui reprend après
+            // l'en-tête ne doit pas réentendre ce qu'il a déjà joué).
+            if reprise_bornee.is_none() && range_demande.unwrap_or(0) == 0 {
+                match session.tete_du_direct().await {
+                    tune_core::http::streamer::TeteRejouable::Blocs(blocs) if !blocs.is_empty() => {
+                        info!(
+                            stream_id = %session.id,
+                            blocs = blocs.len(),
+                            octets = blocs.iter().map(Vec::len).sum::<usize>(),
+                            agent = %agent_journal,
+                            "radio_tete_du_direct_rejouee — une lecture demande le DÉBUT après \
+                             qu'une connexion précédente a tiré l'avance : elle la reçoit d'un \
+                             trait, puis le direct (#8926)"
+                        );
+                        for mut chunk in blocs {
+                            if !session.is_current_channel_consumer(my_epoch) {
+                                break;
+                            }
+                            if remplissage_de_phase > 0 {
+                                let mut complet = vec![0u8; remplissage_de_phase];
+                                complet.extend_from_slice(&chunk);
+                                chunk = complet;
+                                remplissage_de_phase = 0;
+                            }
+                            guard.ecriture(true);
+                            if has_icy {
+                                for part in decoupe_icy(
+                                    &chunk,
+                                    &mut bytes_since_meta,
+                                    &bloc_icy_courant,
+                                ) {
+                                    yield Ok(part);
+                                }
+                            } else {
+                                yield Ok(bytes::Bytes::from(chunk));
+                            }
+                            guard.ecriture(false);
+                        }
+                    }
+                    tune_core::http::streamer::TeteRejouable::Depassee => {
+                        info!(
+                            stream_id = %session.id,
+                            agent = %agent_journal,
+                            "radio_tete_du_direct_depassee — plus de {} s déjà servies : \
+                             la lecture reprend au direct (#8926)",
+                            tune_core::http::streamer::TETE_DU_DIRECT_SECONDES
+                        );
+                    }
+                    _ => {}
+                }
+            }
             loop {
                 // Subscribe to the supersede signal and register the waiter
                 // BEFORE checking the epoch. The epoch bump in
@@ -1292,7 +1379,7 @@ pub async fn handle_stream(
                     // drop the recv future unread, leaving the chunk in the
                     // channel for the new owner.
                     _ = &mut superseded => continue,
-                    maybe_chunk = session.recv_chunk() => {
+                    maybe_chunk = session.recv_chunk_radio() => {
                         match maybe_chunk {
                             // Le direct passe TOUJOURS par cette boucle-ci, ICY
                             // ou pas : c'est elle qui tient le canal PCM à un
@@ -1309,6 +1396,7 @@ pub async fn handle_stream(
                                     chunk = complet;
                                     remplissage_de_phase = 0;
                                 }
+                                guard.ecriture(true);
                                 if has_icy {
                                     for part in decoupe_icy(
                                         &chunk,
@@ -1320,6 +1408,7 @@ pub async fn handle_stream(
                                 } else {
                                     yield Ok(bytes::Bytes::from(chunk));
                                 }
+                                guard.ecriture(false);
                             }
                             None => {
                                 // recv returned None → the PCM channel was closed
@@ -2162,7 +2251,6 @@ fn corps_virtuel(
     length: u64,
     byte_counter: std::sync::Arc<StreamSession>,
 ) -> Body {
-    use std::sync::atomic::Ordering::Relaxed;
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
     let stream_id = byte_counter.id.clone();
     tokio::task::spawn_blocking(move || {
@@ -2183,7 +2271,7 @@ fn corps_virtuel(
             let Some(morceau) = rx.recv().await else { break };
             let n = (morceau.len() as u64).min(remaining);
             remaining -= n;
-            byte_counter.bytes_sent.fetch_add(n, Relaxed);
+            byte_counter.compter_octets_servis(n);
             chrono.compter(n);
             let mut octets = bytes::Bytes::from(morceau);
             octets.truncate(n as usize);
@@ -2398,9 +2486,7 @@ where
 {
     Body::from_stream(futures_util::StreamExt::map(flux, move |morceau| {
         if let Ok(ref o) = morceau {
-            compteur
-                .bytes_sent
-                .fetch_add(o.len() as u64, std::sync::atomic::Ordering::Relaxed);
+            compteur.compter_octets_servis(o.len() as u64);
         }
         morceau
     }))
@@ -2714,7 +2800,6 @@ fn build_file_body(
     byte_counter: std::sync::Arc<StreamSession>,
     octets_par_seconde: Option<u32>,
 ) -> Body {
-    use std::sync::atomic::Ordering::Relaxed;
     let mut chrono = ChronoServiceFichier::new(byte_counter.id.clone(), length, octets_par_seconde);
     Body::from_stream(async_stream::stream! {
         use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -2727,7 +2812,7 @@ fn build_file_body(
             while remaining > 0 && vpos < header_len {
                 let n = ((header_len - vpos).min(remaining)) as usize;
                 let s = vpos as usize;
-                byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
+                byte_counter.compter_octets_servis(n as u64);
                 chrono.compter(n as u64);
                 let envoi = std::time::Instant::now();
                 yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&map.header[s..s + n]));
@@ -2755,7 +2840,7 @@ fn build_file_body(
                                 Ok(0) => { chrono.noter_fin(FinDuService::FichierPlusCourt); break; }
                                 Ok(n) => {
                                     remaining -= n as u64;
-                                    byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
+                                    byte_counter.compter_octets_servis(n as u64);
                                     chrono.compter(n as u64);
                                     let envoi = std::time::Instant::now();
                                     yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n]));
@@ -2786,7 +2871,7 @@ fn build_file_body(
                             Ok(0) => { chrono.noter_fin(FinDuService::FichierPlusCourt); break; }
                             Ok(n) => {
                                 remaining -= n as u64;
-                                byte_counter.bytes_sent.fetch_add(n as u64, Relaxed);
+                                byte_counter.compter_octets_servis(n as u64);
                                 chrono.compter(n as u64);
                                 let envoi = std::time::Instant::now();
                                 yield Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(&buf[..n]));
@@ -3033,11 +3118,11 @@ async fn send_with_reresolve(
         // Decide whether this attempt needs a fresh URL.
         let needs_reresolve = match &outcome {
             Err(e) => {
-                warn!(error = %e, url = %url, "proxy_upstream_error");
+                warn!(error = %e, url = %tune_core::confidentialite::masquer_url(&url), "proxy_upstream_error");
                 true
             }
             Ok(r) if is_expired_url_status(r.status()) => {
-                warn!(status = %r.status(), url = %url, "proxy_upstream_expired_status");
+                warn!(status = %r.status(), url = %tune_core::confidentialite::masquer_url(&url), "proxy_upstream_expired_status");
                 true
             }
             Ok(_) => false,
@@ -3062,7 +3147,7 @@ async fn send_with_reresolve(
                 warn!(
                     status = %r.status(),
                     amont = %r.url().host_str().unwrap_or("?"),
-                    url = %url,
+                    url = %tune_core::confidentialite::masquer_url(&url),
                     start = ?start,
                     "proxy_upstream_expired_no_reresolver"
                 );
@@ -3070,7 +3155,7 @@ async fn send_with_reresolve(
             return Err(());
         };
         if attempts >= PROXY_MAX_RERESOLVES {
-            warn!(url = %url, "proxy_reresolve_giveup");
+            warn!(url = %tune_core::confidentialite::masquer_url(&url), "proxy_reresolve_giveup");
             return Err(());
         }
         attempts += 1;
@@ -3381,7 +3466,7 @@ async fn proxy_stream(
 
     if let Some(start) = resume_start {
         info!(
-            url = upstream_url,
+            url = %tune_core::confidentialite::masquer_url(&upstream_url),
             start, is_lavf, "proxy_forward_resume_range"
         );
     }
@@ -3593,7 +3678,7 @@ async fn proxy_stream(
         if let Some(cl) = content_length {
             headers.insert("Content-Length", HeaderValue::from(cl));
         }
-        info!(url = upstream_url, start, "proxy_resume_206_from_cdn");
+        info!(url = %tune_core::confidentialite::masquer_url(&upstream_url), start, "proxy_resume_206_from_cdn");
 
         let body = resumable_proxy_body(
             client,
@@ -3635,7 +3720,7 @@ async fn proxy_stream(
             HeaderValue::from_str(&format!("bytes {n}-{}/{}", cl - 1, cl)).unwrap(),
         );
         info!(
-            url = upstream_url,
+            url = %tune_core::confidentialite::masquer_url(&upstream_url),
             start = n,
             total = cl,
             "proxy_206_par_saut_local"
@@ -3665,7 +3750,7 @@ async fn proxy_stream(
         headers.insert("Content-Range", HeaderValue::from_static("bytes 0-*/*"));
         headers.insert("Transfer-Encoding", HeaderValue::from_static("chunked"));
 
-        info!(url = upstream_url, "proxy_radio_206_open_ended");
+        info!(url = %tune_core::confidentialite::masquer_url(&upstream_url), "proxy_radio_206_open_ended");
 
         let flux = async_stream::stream! {
             let mut stream = upstream_resp.bytes_stream();
@@ -3727,11 +3812,41 @@ async fn proxy_stream(
     (StatusCode::OK, headers, body).into_response()
 }
 
+/// Le pair est-il cette machine même ?
+pub(crate) fn pair_en_boucle_locale(pair: std::net::IpAddr) -> bool {
+    match pair {
+        std::net::IpAddr::V4(v4) => v4.is_loopback(),
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
+        }
+    }
+}
+
+/// #8963 — la marque du pont ([`tune_core::cloud::ENTETE_RELAIS`]) n'est
+/// crue que d'un pair en boucle locale : le relais et l'écoute directe
+/// rejouent depuis 127.0.0.1. Posée par un appareil du réseau, ou sans
+/// adresse de pair connue, elle est retirée avant [`handle_stream`].
+async fn handle_stream_par_la_route(
+    chemin: Path<String>,
+    etat: State<SharedSessions>,
+    connexion: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
+    mut req_headers: HeaderMap,
+) -> Response {
+    let en_boucle_locale =
+        connexion.is_some_and(|axum::Extension(axum::extract::ConnectInfo(pair))| {
+            pair_en_boucle_locale(pair.ip())
+        });
+    if !en_boucle_locale {
+        req_headers.remove(tune_core::cloud::ENTETE_RELAIS);
+    }
+    handle_stream(chemin, etat, req_headers).await
+}
+
 pub fn router(sessions: SharedSessions) -> axum::Router {
     axum::Router::new()
         .route(
             "/stream/{stream_id}",
-            axum::routing::get(handle_stream).head(handle_head),
+            axum::routing::get(handle_stream_par_la_route).head(handle_head),
         )
         // #7807 — journal seul, aucun changement de comportement : une ligne
         // par requête du renderer (méthode, chemin, Range, agent, IP, statut,
@@ -6009,6 +6124,8 @@ mod stream_url_distant_tests {
 
 #[cfg(test)]
 mod fin_de_piste_relue_6050;
+#[cfg(test)]
+mod reprise_par_le_pont_8963;
 
 #[cfg(test)]
 mod long_wav_4016;
@@ -7310,6 +7427,10 @@ mod safari_radio_5975_tests {
 
 #[cfg(test)]
 mod reprise_chunkee_aac_6990;
+
+// #8926 — banc du démarrage d'une radio : faux icecast, faux renderer Lavf.
+#[cfg(test)]
+mod radio_demarrage_8926;
 
 #[cfg(test)]
 mod multichannel_7275_tests;

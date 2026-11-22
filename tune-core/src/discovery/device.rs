@@ -225,6 +225,19 @@ pub fn dedup_devices(devices: Vec<DiscoveredDevice>) -> Vec<DiscoveredDevice> {
     result
 }
 
+/// #9140 — retient le nom annoncé d'un appareil découvert pour le nettoyage
+/// de ce qui sort (`confidentialite::anonymiser`) ; un nom qui n'est que son
+/// matériel (« fabricant modèle ») n'est pas retenu.
+pub fn retenir_pour_la_confidentialite(device: &DiscoveredDevice) {
+    let materiel =
+        crate::confidentialite::materiel(device.manufacturer.as_deref(), device.model.as_deref());
+    crate::confidentialite::retenir_nom_d_appareil(
+        crate::confidentialite::Sorte::Appareil,
+        &device.name,
+        &[materiel],
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

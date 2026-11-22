@@ -31,6 +31,7 @@ pub fn router() -> Router<AppState> {
         .route("/ir/upload/{zone_id}", post(upload_ir_handler))
         .route("/ir/clear/{zone_id}", post(clear_ir_handler))
         .route("/ir/status/{zone_id}", get(ir_status_handler))
+        .route("/ir/options/{zone_id}", post(ir_options_handler))
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +283,208 @@ struct CanalDuFiltre {
     /// `left` ou `right` pour deposer UN canal ; absent = le fichier porte deja
     /// la correction complete (mono duplique, ou stereo tel quel).
     channel: Option<String>,
+    /// #8761 — `1`/`true` : AJOUTER ce fichier au jeu de la zone, pour SA
+    /// cadence (lue dans l'en-tete WAV), au lieu de remplacer le fichier
+    /// principal. Un fichier deja present a la meme cadence est remplace.
+    per_rate: Option<String>,
+}
+
+fn vrai(v: Option<&str>) -> bool {
+    matches!(
+        v.map(str::trim),
+        Some("1") | Some("true") | Some("yes") | Some("oui")
+    )
+}
+
+fn dossier_ir() -> std::path::PathBuf {
+    std::path::PathBuf::from(std::env::var("TUNE_DATA_DIR").unwrap_or_else(|_| ".".into()))
+        .join("ir")
+}
+
+/// #8761 — reinstaller sur la sortie LOCALE de la zone le jeu tel que les
+/// reglages le decrivent (principal, fichiers par cadence, repli). Sans
+/// fichier principal, la convolution est retiree. Rien a faire pour une
+/// zone reseau : le transcodage relit le jeu a chaque piste.
+#[cfg(feature = "local-audio")]
+async fn installer_le_jeu_local(
+    state: &AppState,
+    zone_id: i64,
+    device_id: &str,
+) -> Result<(), String> {
+    if !device_id.starts_with("local:") {
+        return Ok(());
+    }
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let jeu = tune_core::audio::convolver::JeuDeZone::lire(&settings, zone_id);
+    let outputs = state.outputs.lock().await;
+    if let Some(output) = outputs.get(device_id) {
+        let output = output.lock().await;
+        if let Some(local) = output
+            .as_any()
+            .downcast_ref::<tune_core::outputs::local::LocalOutput>()
+        {
+            return match jeu {
+                Some(jeu) => local.set_convolver_config(jeu.charger()?),
+                None => {
+                    local.clear_convolver();
+                    Ok(())
+                }
+            };
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "local-audio"))]
+async fn installer_le_jeu_local(
+    _state: &AppState,
+    _zone_id: i64,
+    _device_id: &str,
+) -> Result<(), String> {
+    Ok(())
+}
+
+/// #8761 — les fichiers du jeu de la zone, decrits (cadence, canaux, taps),
+/// le principal en tete. Un fichier illisible est decrit avec son erreur.
+fn decrire_le_jeu(settings: &SettingsRepo, zone_id: i64) -> Vec<serde_json::Value> {
+    let Some(jeu) = tune_core::audio::convolver::JeuDeZone::lire(settings, zone_id) else {
+        return Vec::new();
+    };
+    jeu.chemins()
+        .into_iter()
+        .enumerate()
+        .map(
+            |(i, chemin)| match tune_core::audio::convolver::Convolver::read_ir_taps(&chemin) {
+                Ok((taps, sr)) => json!({
+                    "path": chemin,
+                    "sample_rate": sr,
+                    "channels": taps.len(),
+                    "taps": taps.first().map(Vec::len).unwrap_or(0),
+                    "main": i == 0,
+                }),
+                Err(e) => json!({"path": chemin, "main": i == 0, "error": e}),
+            },
+        )
+        .collect()
+}
+
+/// Cadence d'un fichier de reponse impulsionnelle, `None` s'il est illisible.
+fn cadence_du_fichier(chemin: &str) -> Option<u32> {
+    tune_core::audio::convolver::Convolver::read_ir_taps(chemin)
+        .ok()
+        .map(|(_, sr)| sr)
+}
+
+/// #8761 — valider un fichier depose AVANT de l'enregistrer : lisible, et
+/// dans les bornes (frequence de 8 a 768 kHz, canaux, prises). Rend sa
+/// frequence.
+fn valider_le_depot(chemin: &std::path::Path) -> Result<u32, String> {
+    tune_core::audio::convolver::ConvolverConfig::from_wav(chemin.to_str().unwrap_or(""))
+        .map(|c| c.sample_rate())
+}
+
+/// #8761 — un nom provisoire UNIQUE pour un depot : deux depots simultanes
+/// sur la meme zone ne s'ecrasent pas.
+fn chemin_provisoire(ir_dir: &std::path::Path, zone_id: i64) -> std::path::PathBuf {
+    static NUMERO: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NUMERO.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    ir_dir.join(format!(
+        "depot_zone_{zone_id}_{}_{t}_{n}.tmp",
+        std::process::id()
+    ))
+}
+
+fn ecrire_supplementaires(settings: &SettingsRepo, zone_id: i64, liste: &[String]) {
+    let cle = format!(
+        "{}{zone_id}",
+        tune_core::audio::convolver::par_cadence::CLE_JEU
+    );
+    if liste.is_empty() {
+        settings.delete(&cle).ok();
+    } else {
+        settings
+            .set(&cle, &serde_json::to_string(liste).unwrap_or_default())
+            .ok();
+    }
+}
+
+/// #8761 — `POST /room-correction/ir/upload/{zone}?per_rate=1` : le fichier
+/// est range sous sa cadence et ajoute au jeu. Sans fichier principal, il le
+/// devient (les consommateurs qui ne connaissent que `ir_path_{zone}` le
+/// voient). A cadence egale, il remplace le fichier precedent du jeu.
+async fn ajouter_au_jeu(
+    state: &AppState,
+    zone_id: i64,
+    device_id: &str,
+    is_local: bool,
+    body: &[u8],
+) -> axum::response::Response {
+    let ir_dir = dossier_ir();
+    std::fs::create_dir_all(&ir_dir).ok();
+    let provisoire = chemin_provisoire(&ir_dir, zone_id);
+    if let Err(e) = std::fs::write(&provisoire, body) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("write IR: {e}")})),
+        )
+            .into_response();
+    }
+    let cadence = match valider_le_depot(&provisoire) {
+        Ok(c) => c,
+        Err(e) => {
+            std::fs::remove_file(&provisoire).ok();
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+        }
+    };
+    let chemin = ir_dir.join(format!("zone_{zone_id}_sr{cadence}.wav"));
+    if let Err(e) = std::fs::rename(&provisoire, &chemin) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("write IR: {e}")})),
+        )
+            .into_response();
+    }
+    let chemin = chemin.to_str().unwrap_or("").to_string();
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let principal = settings
+        .get(&format!("ir_path_{zone_id}"))
+        .ok()
+        .flatten()
+        .filter(|p| !p.is_empty() && std::path::Path::new(p).exists());
+    match principal {
+        None => {
+            settings.set(&format!("ir_path_{zone_id}"), &chemin).ok();
+        }
+        Some(principal) if principal != chemin => {
+            let mut liste =
+                tune_core::audio::convolver::JeuDeZone::lire_supplementaires(&settings, zone_id);
+            // Un seul fichier par cadence dans la liste : l'ancien de meme
+            // cadence (meme nom, ou nom d'avant) cede la place.
+            liste.retain(|p| p != &chemin && cadence_du_fichier(p) != Some(cadence));
+            liste.push(chemin.clone());
+            ecrire_supplementaires(&settings, zone_id, &liste);
+        }
+        Some(_) => {}
+    }
+    if let Err(e) = installer_le_jeu_local(state, zone_id, device_id).await {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "zone_id": zone_id,
+        "ir_path": chemin,
+        "sample_rate": cadence,
+        "size_bytes": body.len(),
+        "active": true,
+        "per_rate": true,
+        "files": decrire_le_jeu(&settings, zone_id),
+        "applies_to": if is_local { "local" } else { "network (transcode)" },
+    }))
+    .into_response()
 }
 
 /// `POST /room-correction/ir/upload/{zone_id}` — upload a WAV impulse response
@@ -321,12 +524,15 @@ async fn upload_ir_handler(
     let device_id = zone.output_device_id.unwrap_or_default();
     let is_local = device_id.starts_with("local:");
 
+    if vrai(canal.per_rate.as_deref()) && canal.channel.as_deref().is_none_or(str::is_empty) {
+        return ajouter_au_jeu(&state, zone_id, &device_id, is_local, &body).await;
+    }
+
     // Persist the IR to disk.
-    let ir_dir =
-        std::path::PathBuf::from(std::env::var("TUNE_DATA_DIR").unwrap_or_else(|_| ".".into()))
-            .join("ir");
+    let ir_dir = dossier_ir();
     std::fs::create_dir_all(&ir_dir).ok();
     let ir_path = ir_dir.join(format!("zone_{zone_id}.wav"));
+    let provisoire = chemin_provisoire(&ir_dir, zone_id);
     let cote = match canal.channel.as_deref() {
         None | Some("") => None,
         Some("left") | Some("l") | Some("gauche") => Some("L"),
@@ -379,11 +585,26 @@ async fn upload_ir_handler(
         if let Err(e) = tune_core::audio::convolver::Convolver::combiner_en_stereo(
             gauche.to_str().unwrap_or(""),
             droite.to_str().unwrap_or(""),
-            ir_path.to_str().unwrap_or(""),
+            provisoire.to_str().unwrap_or(""),
         ) {
+            std::fs::remove_file(&provisoire).ok();
             return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
         }
-    } else if let Err(e) = std::fs::write(&ir_path, &body) {
+    } else if let Err(e) = std::fs::write(&provisoire, &body) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("write IR: {e}")})),
+        )
+            .into_response();
+    }
+    // #8761 — valider AVANT de remplacer le fichier et d'ecrire le reglage :
+    // un fichier refuse ne laisse ni reglage ni ancien filtre ecrase.
+    if let Err(e) = valider_le_depot(&provisoire) {
+        std::fs::remove_file(&provisoire).ok();
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+    }
+    if let Err(e) = std::fs::rename(&provisoire, &ir_path) {
+        std::fs::remove_file(&provisoire).ok();
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("write IR: {e}")})),
@@ -395,27 +616,27 @@ async fn upload_ir_handler(
     // Store the path so the TRANSCODE path picks it up too: the orchestrator's
     // convolver applies the FIR to the bytes served to a network renderer
     // (DLNA/UPnP/AirPlay). Room correction is no longer local-output only.
-    SettingsRepo::with_backend(state.backend.clone())
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    settings
         .set(&format!("ir_path_{zone_id}"), &ir_path_str)
         .ok();
+    // #8761 — un fichier par cadence de MEME cadence que le nouveau principal
+    // l'emporterait sur lui (le dernier du jeu gagne) : il est retire.
+    if let Some(cadence) = cadence_du_fichier(&ir_path_str) {
+        let mut liste =
+            tune_core::audio::convolver::JeuDeZone::lire_supplementaires(&settings, zone_id);
+        let avant = liste.len();
+        liste.retain(|p| cadence_du_fichier(p) != Some(cadence));
+        if liste.len() != avant {
+            ecrire_supplementaires(&settings, zone_id, &liste);
+        }
+    }
 
     // A LOCAL output additionally gets the convolver installed immediately (it
     // runs its own real-time convolver rather than going through the transcode).
-    #[cfg(feature = "local-audio")]
-    {
-        if is_local {
-            let outputs = state.outputs.lock().await;
-            if let Some(output) = outputs.get(&device_id) {
-                let output = output.lock().await;
-                if let Some(local) = output
-                    .as_any()
-                    .downcast_ref::<tune_core::outputs::local::LocalOutput>()
-                    && let Err(e) = local.set_convolver_ir(&ir_path_str)
-                {
-                    return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
-                }
-            }
-        }
+    // #8761 — le jeu entier : les fichiers par cadence deja deposes restent.
+    if let Err(e) = installer_le_jeu_local(&state, zone_id, &device_id).await {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
     }
 
     Json(json!({
@@ -430,10 +651,21 @@ async fn upload_ir_handler(
     .into_response()
 }
 
+/// Le filtre a retirer : une cadence (#8761), ou tout le jeu.
+#[derive(Deserialize, Default)]
+struct CadenceARetirer {
+    rate: Option<u32>,
+}
+
 /// `POST /room-correction/ir/clear/{zone_id}` — remove FIR convolution
+///
+/// #8761 — `?rate=96000` ne retire que le fichier de cette cadence. Si c'est
+/// le principal et qu'il reste d'autres fichiers, le premier d'entre eux
+/// devient le principal.
 async fn clear_ir_handler(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
+    Query(cible): Query<CadenceARetirer>,
 ) -> impl IntoResponse {
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     let zone = match zone_repo.get(zone_id) {
@@ -448,42 +680,137 @@ async fn clear_ir_handler(
     };
 
     let device_id = zone.output_device_id.unwrap_or_default();
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let ir_dir = dossier_ir();
+    let principal_par_defaut = ir_dir.join(format!("zone_{zone_id}.wav"));
+    // Validation stricte des chemins : on n'efface que ce que Tune a lui-meme
+    // range dans son dossier `ir/` pour CETTE zone (dossier parent compare
+    // apres resolution, nom exact `zone_{id}.wav` ou `zone_{id}_sr{N}.wav`).
+    let effacer = |chemin: &str| {
+        let p = std::path::Path::new(chemin);
+        if tune_core::audio::convolver::par_cadence::chemin_du_jeu_effacable(p, &ir_dir, zone_id) {
+            std::fs::remove_file(p).ok();
+        } else {
+            tracing::warn!(
+                zone_id,
+                chemin,
+                "convolver_ir_suppression_refusee_hors_dossier"
+            );
+        }
+    };
+    let mut supplementaires =
+        tune_core::audio::convolver::JeuDeZone::lire_supplementaires(&settings, zone_id);
+
+    if let Some(rate) = cible.rate {
+        let principal = settings
+            .get(&format!("ir_path_{zone_id}"))
+            .ok()
+            .flatten()
+            .filter(|p| !p.is_empty());
+        supplementaires.retain(|p| {
+            let garde = cadence_du_fichier(p) != Some(rate);
+            if !garde {
+                effacer(p);
+            }
+            garde
+        });
+        let principal_retire = principal
+            .as_deref()
+            .is_some_and(|p| cadence_du_fichier(p) == Some(rate));
+        if principal_retire {
+            if let Some(p) = principal.as_deref() {
+                effacer(p);
+            }
+            if supplementaires.is_empty() {
+                settings.delete(&format!("ir_path_{zone_id}")).ok();
+            } else {
+                let nouveau = supplementaires.remove(0);
+                settings.set(&format!("ir_path_{zone_id}"), &nouveau).ok();
+            }
+        }
+        ecrire_supplementaires(&settings, zone_id, &supplementaires);
+        if let Err(e) = installer_le_jeu_local(&state, zone_id, &device_id).await {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response();
+        }
+        return Json(json!({
+            "ok": true,
+            "zone_id": zone_id,
+            "rate": rate,
+            "files": decrire_le_jeu(&settings, zone_id),
+        }))
+        .into_response();
+    }
 
     // Drop the stored path (network/transcode) + the file for any zone.
-    SettingsRepo::with_backend(state.backend.clone())
-        .delete(&format!("ir_path_{zone_id}"))
-        .ok();
-    let ir_path =
-        std::path::PathBuf::from(std::env::var("TUNE_DATA_DIR").unwrap_or_else(|_| ".".into()))
-            .join("ir")
-            .join(format!("zone_{zone_id}.wav"));
-    std::fs::remove_file(&ir_path).ok();
+    settings.delete(&format!("ir_path_{zone_id}")).ok();
+    std::fs::remove_file(&principal_par_defaut).ok();
     // Et les deux depots par canal, sinon un « effacer » suivi d'un depot d'un
     // seul cote ressusciterait l'ancien filtre de l'autre.
     for cote in ["L", "R"] {
-        let mut p = ir_path.clone();
-        p.set_file_name(format!("zone_{zone_id}_{cote}.wav"));
-        std::fs::remove_file(&p).ok();
+        std::fs::remove_file(ir_dir.join(format!("zone_{zone_id}_{cote}.wav"))).ok();
     }
+    // #8761 — et tout le jeu par cadence.
+    for p in &supplementaires {
+        effacer(p);
+    }
+    for sr in tune_core::audio::convolver::par_cadence::CADENCES_USUELLES {
+        std::fs::remove_file(ir_dir.join(format!("zone_{zone_id}_sr{sr}.wav"))).ok();
+    }
+    ecrire_supplementaires(&settings, zone_id, &[]);
 
     // A local output also drops its live convolver.
-    #[cfg(feature = "local-audio")]
-    {
-        if device_id.starts_with("local:") {
-            let outputs = state.outputs.lock().await;
-            if let Some(output) = outputs.get(&device_id) {
-                let output = output.lock().await;
-                if let Some(local) = output
-                    .as_any()
-                    .downcast_ref::<tune_core::outputs::local::LocalOutput>()
-                {
-                    local.clear_convolver();
-                }
-            }
-        }
-    }
-    let _ = &device_id;
+    let _ = installer_le_jeu_local(&state, zone_id, &device_id).await;
     Json(json!({"ok": true, "zone_id": zone_id})).into_response()
+}
+
+/// Les options de la convolution d'une zone (#8761).
+#[derive(Deserialize)]
+struct OptionsDeConvolution {
+    /// Rééchantillonner le fichier le plus proche quand aucun fichier du jeu
+    /// n'est a la cadence du flux (defaut : oui).
+    resample: Option<bool>,
+}
+
+/// `POST /room-correction/ir/options/{zone_id}` — `{"resample": false}`
+/// refuse le reechantillonnage en repli (la piste joue alors sans
+/// correction, comme avant #8761) ; `true` le retablit.
+async fn ir_options_handler(
+    State(state): State<AppState>,
+    Path(zone_id): Path<i64>,
+    Json(options): Json<OptionsDeConvolution>,
+) -> impl IntoResponse {
+    let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    let Ok(Some(zone)) = zone_repo.get(zone_id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "zone not found"})),
+        )
+            .into_response();
+    };
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let cle = format!(
+        "{}{zone_id}",
+        tune_core::audio::convolver::par_cadence::CLE_REECHANTILLONNAGE
+    );
+    match options.resample {
+        Some(false) => {
+            settings.set(&cle, "false").ok();
+        }
+        Some(true) => {
+            settings.delete(&cle).ok();
+        }
+        None => {}
+    }
+    let device_id = zone.output_device_id.unwrap_or_default();
+    let installe = installer_le_jeu_local(&state, zone_id, &device_id).await;
+    let resample = settings.get(&cle).ok().flatten().as_deref() != Some("false");
+    Json(json!({
+        "ok": true,
+        "zone_id": zone_id,
+        "resample": resample,
+        "warning": installe.err(),
+    }))
+    .into_response()
 }
 
 /// `GET /room-correction/ir/status/{zone_id}` — check if FIR is active
@@ -503,6 +830,26 @@ async fn ir_status_handler(
         .ok()
         .flatten();
     let has_setting = ir_path.as_deref().map(|p| !p.is_empty()).unwrap_or(false);
+    // #8761 — le jeu par cadence, le repli, et le fichier REELLEMENT employe
+    // pour le dernier flux (sortie locale ou transcodage reseau).
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let files = decrire_le_jeu(&settings, zone_id);
+    let resample = tune_core::audio::convolver::JeuDeZone::lire(&settings, zone_id)
+        .is_none_or(|j| j.reechantillonner);
+    let in_use = ir_path
+        .as_deref()
+        .filter(|p| !p.is_empty())
+        .and_then(tune_core::audio::convolver::par_cadence::dernier_choix)
+        .map(|c| {
+            json!({
+                "stream_sample_rate": c.cadence_flux,
+                "file_sample_rate": c.cadence_fichier,
+                "path": c.chemin,
+                "resampled": c.reechantillonne,
+                "reason": c.raison,
+                "description": c.decrire(),
+            })
+        });
 
     // Local outputs run a live convolver; a network zone applies the IR on the
     // transcode path, so the stored path is the source of truth there.
@@ -520,6 +867,9 @@ async fn ir_status_handler(
                         "active": local.has_convolver() || has_setting,
                         "zone_id": zone_id,
                         "ir_path": ir_path,
+                        "files": files,
+                        "resample": resample,
+                        "in_use": in_use,
                     }))
                     .into_response();
                 }
@@ -527,5 +877,13 @@ async fn ir_status_handler(
         }
     }
     let _ = &device_id;
-    Json(json!({"active": has_setting, "zone_id": zone_id, "ir_path": ir_path})).into_response()
+    Json(json!({
+        "active": has_setting,
+        "zone_id": zone_id,
+        "ir_path": ir_path,
+        "files": files,
+        "resample": resample,
+        "in_use": in_use,
+    }))
+    .into_response()
 }

@@ -1531,7 +1531,10 @@ impl WavPackDecoder {
         let info = parse_wavpack(path)?;
         let reader =
             BufReader::new(ouvrir_fichier(path).map_err(|e| format!("wavpack open: {e}"))?);
-        let skip_samples = (seek_s.max(0.0) * info.sample_rate as f64) as u64;
+        // #8968 — plancher tolérant : un départ exact `n / cadence` (tranche
+        // CUE d'une image WavPack) tombe sur `n`, pas sur `n − 1`.
+        let skip_samples =
+            (seek_s.max(0.0) * info.sample_rate as f64 + super::decode::PLANCHER_TOLERANT) as u64;
         Ok(Self {
             reader,
             info,
@@ -1663,7 +1666,8 @@ pub fn decode_wavpack_to_pcm(
         .map_err(|e| format!("seek: {e}"))?;
 
     let skip_samples = if seek_s > 0.0 {
-        (seek_s * source_rate as f64) as u64
+        // #8968 — plancher tolérant, comme `WavPackDecoder::open`.
+        (seek_s * source_rate as f64 + super::decode::PLANCHER_TOLERANT) as u64
     } else {
         0
     };

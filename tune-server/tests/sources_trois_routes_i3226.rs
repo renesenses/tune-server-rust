@@ -174,6 +174,8 @@ impl StreamingService for Doublure {
             track_count: 9,
             quality: None,
             released_at: None,
+            genre_id: None,
+            genre_name: None,
         }])
     }
 

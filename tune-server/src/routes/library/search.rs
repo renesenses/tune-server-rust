@@ -23,6 +23,45 @@ pub(super) struct AcousticQuery {
     pub query: String,
     /// Max tracks to return (clamped 1..=200; default 50).
     pub limit: Option<i64>,
+    /// #9157 — `true` par défaut : la sélection est tirée au hasard, pondérée
+    /// par la proximité, dans le vivier des pistes les plus proches, et change
+    /// donc à chaque rappel d'une ambiance. `false` rend l'ancien classement
+    /// déterministe (les `limit` plus proches, dans l'ordre).
+    #[serde(default, alias = "varier")]
+    pub vary: Option<bool>,
+    /// #9157 — graine du tirage (tests, ou rejouer une sélection). Absente :
+    /// graine tirée de l'aléa du système. Ignorée quand `vary` vaut `false`.
+    #[serde(default, alias = "graine")]
+    pub seed: Option<u64>,
+}
+
+/// #9157 — profondeur de classement à demander puis ordre à appliquer.
+/// Sans variation : `limit * 2` (sur-échantillonnage du dédoublonnage), ordre
+/// du cosinus. Avec : tout le vivier, remis dans un ordre tiré au hasard et
+/// pondéré par la proximité ; les `limit` premières après dédoublonnage sont
+/// alors un tirage sans remise dans ce vivier.
+#[cfg_attr(not(feature = "audio-embedding"), allow(dead_code))]
+fn profondeur_sans_genre(limit: usize, vary: bool) -> usize {
+    if vary {
+        tune_core::audio::embedding_store::taille_du_vivier(limit).max(limit * 2)
+    } else {
+        limit * 2
+    }
+}
+
+#[cfg_attr(not(feature = "audio-embedding"), allow(dead_code))]
+fn varier_si_demande(
+    ranked: Vec<(i64, f32)>,
+    limit: usize,
+    vary: bool,
+    seed: Option<u64>,
+) -> Vec<(i64, f32)> {
+    use tune_core::audio::embedding_store;
+    if !vary {
+        return ranked;
+    }
+    let graine = seed.unwrap_or_else(embedding_store::graine_au_hasard);
+    embedding_store::varier_le_classement(ranked, embedding_store::taille_du_vivier(limit), graine)
 }
 
 /// Clé de dédoublonnage d'un enregistrement : titre normalisé (casse/espaces),
@@ -370,12 +409,17 @@ pub(super) async fn acoustic_search(
     // Croiser exige le cosinus des pistes étiquetées où qu'elles soient dans
     // le classement : on le garde alors en entier (il est déjà calculé en
     // entier par `rank_by_vector`, seule la troncature change).
+    let vary = body.vary.unwrap_or(true);
     let profondeur = if etiquetees.is_empty() {
-        limit * 2
+        profondeur_sans_genre(limit, vary)
     } else {
         usize::MAX
     };
     let ranked = embedding_store::rank_by_vector(&state.backend, &qvec, profondeur, None);
+    // #9157 — une ambiance rappelée tire une autre sélection dans son vivier.
+    // Avec un genre reconnu, le vivier permuté reste en tête du classement
+    // complet : `croiser` y prend les pistes du genre puis la découverte.
+    let ranked = varier_si_demande(ranked, limit, vary, body.seed);
     if ranked.is_empty() && etiquetees.is_empty() {
         // Une liste vide couvrait deux situations opposées : bibliothèque pas
         // encore analysée, ou requête sans correspondance. L'utilisateur ne
@@ -482,6 +526,73 @@ pub(super) async fn acoustic_search(
 }
 
 #[cfg(test)]
+mod tests_9157 {
+    use super::{AcousticQuery, profondeur_sans_genre, varier_si_demande};
+
+    /// Classement de 600 pistes, du plus proche (id 1) au plus lointain.
+    fn classement(n: usize) -> Vec<(i64, f32)> {
+        (0..n)
+            .map(|i| (i as i64 + 1, 0.4 - 0.0005 * i as f32))
+            .collect()
+    }
+
+    /// Ce que la route garde après variation : les `limit` premières (le
+    /// dédoublonnage n'a rien à retirer ici).
+    fn appel(vary: bool, seed: Option<u64>) -> Vec<i64> {
+        let limit = 50;
+        let mut ranked = classement(600);
+        ranked.truncate(profondeur_sans_genre(limit, vary));
+        varier_si_demande(ranked, limit, vary, seed)
+            .into_iter()
+            .take(limit)
+            .map(|(id, _)| id)
+            .collect()
+    }
+
+    fn triee(mut v: Vec<i64>) -> Vec<i64> {
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn par_defaut_le_corps_demande_la_variation() {
+        let q: AcousticQuery = serde_json::from_str(r#"{"query":"jazz"}"#).unwrap();
+        assert_eq!(q.vary.unwrap_or(true), true);
+        assert_eq!(q.seed, None);
+        let q: AcousticQuery =
+            serde_json::from_str(r#"{"query":"jazz","varier":false,"graine":7}"#).unwrap();
+        assert_eq!((q.vary, q.seed), (Some(false), Some(7)));
+        let q: AcousticQuery =
+            serde_json::from_str(r#"{"query":"jazz","vary":false,"seed":7}"#).unwrap();
+        assert_eq!((q.vary, q.seed), (Some(false), Some(7)));
+    }
+
+    #[test]
+    fn deux_appels_donnent_deux_selections_toutes_dans_le_vivier() {
+        let a = appel(true, None);
+        let b = appel(true, None);
+        assert_eq!(a.len(), 50);
+        assert_ne!(triee(a.clone()), triee(b.clone()));
+        let vivier = tune_core::audio::embedding_store::taille_du_vivier(50) as i64;
+        assert!(a.iter().chain(b.iter()).all(|id| (1..=vivier).contains(id)));
+    }
+
+    #[test]
+    fn la_meme_graine_redonne_la_meme_selection() {
+        assert_eq!(appel(true, Some(42)), appel(true, Some(42)));
+        assert_ne!(triee(appel(true, Some(42))), triee(appel(true, Some(43))));
+    }
+
+    #[test]
+    fn contre_epreuve_vary_false_garde_l_ancien_classement() {
+        let attendu: Vec<i64> = (1..=50).collect();
+        assert_eq!(appel(false, None), attendu);
+        assert_eq!(appel(false, Some(42)), attendu);
+        assert_eq!(profondeur_sans_genre(50, false), 100);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::{dedup_key, dedup_ranked_tracks};
     use tune_core::db::models::Track;
@@ -567,8 +678,43 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
     // (racines exclues) : une piste hors périmètre n'est plus
     // du travail, ni à faire ni fait. Sans périmètre, ce sont les compteurs
     // d'avant, à l'identique.
+    //
+    // #9116 — les cinq compteurs de la jauge parcourent la bibliothèque : ils
+    // sont comptés ENSEMBLE hors de l'exécuteur, et figés pendant la pause de
+    // l'analyse acoustique tant que la bibliothèque garde la même révision
+    // (`avancement_suspendu_9116`).
     #[cfg(feature = "audio-embedding")]
-    let analysed = tune_core::audio::embedding_store::analysed_count_in_scope(&state.backend);
+    let [analysed, eligible, processed, deferred, apres_echecs] = {
+        let b = state.backend.clone();
+        state
+            .comptages
+            .releves
+            .acoustique
+            .lire(
+                "acoustic_status",
+                tune_core::taches_de_fond::est_en_pause(
+                    tune_core::taches_de_fond::Tache::Acoustique,
+                ),
+                crate::routes::system::avancement_suspendu_9116::revision_de(&state.backend),
+                move || {
+                    use tune_core::audio::embedding_store as es;
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_secs() as i64;
+                    let seuil = tune_core::library::local_path::deferral_threshold(now);
+                    [
+                        es::analysed_count_in_scope(&b),
+                        es::eligible_count(&b),
+                        es::processed_count_in_scope(&b),
+                        es::deferred_count(&b, &seuil),
+                        es::retry_later_count(&b, &seuil),
+                    ]
+                },
+            )
+            .await
+            .unwrap_or([0; 5])
+    };
     #[cfg(not(feature = "audio-embedding"))]
     let analysed = 0_i64;
 
@@ -576,8 +722,6 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
     // pas la bibliothèque entière (le DSD et les pistes sans fichier local en
     // sont exclus). Sans lui, l'interface n'avait qu'un compteur qui montait
     // sans qu'on sache vers quoi.
-    #[cfg(feature = "audio-embedding")]
-    let eligible = tune_core::audio::embedding_store::eligible_count(&state.backend);
     #[cfg(not(feature = "audio-embedding"))]
     let eligible = 0_i64;
 
@@ -586,8 +730,6 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
     // échecs, et confondre les deux figeait la jauge sous 100 % à jamais
     // (#1819). C'est `processed` qui doit piloter la barre : il atteint le
     // dénominateur quand il ne reste plus rien à faire.
-    #[cfg(feature = "audio-embedding")]
-    let processed = tune_core::audio::embedding_store::processed_count_in_scope(&state.backend);
     #[cfg(not(feature = "audio-embedding"))]
     let processed = 0_i64;
 
@@ -601,23 +743,14 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
     // Une piste dont le fichier ne répond pas est reportée, jamais marquée
     // analysée. Elle sort du travail disponible pendant le même délai que
     // la requête des candidats, et reste comptée séparément (#4187).
-    #[cfg(feature = "audio-embedding")]
-    let deferred = {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        tune_core::audio::embedding_store::deferred_count(
-            &state.backend,
-            &tune_core::library::local_path::deferral_threshold(now),
-        )
-    };
+    // Les pistes en échec répété mises « à réessayer plus tard » y sont
+    // comptées aussi (#9046).
     #[cfg(not(feature = "audio-embedding"))]
-    let deferred = 0_i64;
+    let (deferred, apres_echecs) = (0_i64, 0_i64);
     let total_eligible = eligible;
     let eligible = (total_eligible - deferred).max(0);
     let pending = (eligible - processed).max(0);
-    let waiting_reason = (pending == 0 && deferred > 0).then_some("unresolved_paths");
+    let waiting_reason = raison_d_attente(pending, deferred, apres_echecs);
 
     let throttle = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
         .get("audio_embedding_throttle")
@@ -685,7 +818,8 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
         "enabled": enabled,
         "model_ready": model_ready,
         "model_fetch": model_fetch,
-        // « playback » | « thermal » | « low_memory » | « not_premium » | null
+        // « playback » | « thermal » | « low_memory » | « not_premium »
+        // | « library_scan » | « paused » | « model_unavailable » (#9046) | null
         "paused_reason": paused_reason,
         // Embeddings réellement écrits pour le modèle courant.
         "analysed_tracks": analysed,
@@ -703,12 +837,45 @@ pub(super) async fn acoustic_status(State(state): State<AppState>) -> Json<Value
         // Population totale, y compris les chemins temporairement reportés.
         "total_eligible_tracks": total_eligible,
         "deferred_tracks": deferred,
+        // #9046 — parmi `deferred_tracks`, celles reportées après des échecs
+        // répétés d'analyse (pas un fichier qui ne répond pas).
+        "retry_later_tracks": apres_echecs,
+        // « unresolved_paths » | « analysis_failures » (#9046) | null
         "waiting_reason": waiting_reason,
         "throttle": throttle,
         // Une requete libre en francais est-elle traduite avant d'atteindre la
         // tour texte ? `false` = elle part brute, et l'ecran doit le dire.
         "translation_available": translation_available,
     }))
+}
+
+/// Pourquoi il ne reste rien à faire maintenant alors que la passe n'est pas
+/// finie. `unresolved_paths` dès qu'un fichier ne répond pas (le geste est
+/// côté disque) ; `analysis_failures` quand SEULES des pistes en échec
+/// répété d'analyse attendent leur nouvel essai (#9046).
+fn raison_d_attente(pending: i64, deferred: i64, apres_echecs: i64) -> Option<&'static str> {
+    if pending > 0 || deferred <= 0 {
+        return None;
+    }
+    if deferred > apres_echecs {
+        Some("unresolved_paths")
+    } else {
+        Some("analysis_failures")
+    }
+}
+
+#[cfg(test)]
+mod raison_d_attente_9046 {
+    use super::raison_d_attente;
+
+    #[test]
+    fn les_echecs_d_analyse_ne_se_disent_pas_fichier_absent() {
+        assert_eq!(raison_d_attente(0, 3, 3), Some("analysis_failures"));
+        assert_eq!(raison_d_attente(0, 3, 1), Some("unresolved_paths"));
+        assert_eq!(raison_d_attente(0, 3, 0), Some("unresolved_paths"));
+        assert_eq!(raison_d_attente(2, 3, 3), None);
+        assert_eq!(raison_d_attente(0, 0, 0), None);
+    }
 }
 
 #[cfg(all(test, feature = "audio-embedding"))]
@@ -749,6 +916,30 @@ mod acoustic_reports_4187 {
         assert_eq!(body["eligible_tracks"], 2);
         assert_eq!(body["pending_tracks"], 1);
         assert_eq!(body["waiting_reason"], Value::Null);
+    }
+
+    /// #9046 — une piste en échec répété d'analyse n'est pas « un fichier qui
+    /// ne répond pas ».
+    #[tokio::test]
+    async fn la_route_9046_nomme_les_echecs_d_analyse_a_part() {
+        use tune_core::db::{models::Track, track_repo::TrackRepo};
+        use tune_core::library::local_path::deferral_stamp;
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let tracks = TrackRepo::with_backend(state.backend.clone());
+        let mut track = Track::new("Plante".into());
+        track.format = Some("flac".into());
+        track.file_path = Some("/x/plante.flac".into());
+        let plante = tracks.create(&track).unwrap();
+        let date = deferral_stamp(chrono::Utc::now().timestamp());
+        state.backend.execute("INSERT INTO track_metadata (track_id, key, value) VALUES (?, 'audio_embed_retry_later', ?)", &[&plante, &date]).unwrap();
+        let Json(body) = acoustic_status(State(state)).await;
+        assert_eq!(body["deferred_tracks"], 1);
+        assert_eq!(body["retry_later_tracks"], 1);
+        assert_eq!(body["pending_tracks"], 0);
+        assert_eq!(
+            body["waiting_reason"], "analysis_failures",
+            "une inférence qui plante n'est pas un fichier qui ne répond pas"
+        );
     }
 }
 

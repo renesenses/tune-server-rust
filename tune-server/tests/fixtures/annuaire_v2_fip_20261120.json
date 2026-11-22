@@ -1,0 +1,1059 @@
+{
+ "version": 2,
+ "count": 13,
+ "radios": [
+  {
+   "id": 2,
+   "external_id": "S000973",
+   "source": "radio-metadata",
+   "status": "active",
+   "name": "FIP",
+   "description": "La radio musicale la plus éclectique. The most eclectic radio out there!",
+   "website_url": "https://www.fip.fr",
+   "country": "FR",
+   "logo_url": "/storage/radio-logos/radio-metadata/S000973-527b076ef8e2.webp",
+   "radio_metadata_key": "fip",
+   "stream_url": "https://icecast.radiofrance.fr/fip-hifi.aac",
+   "v1_stream_url": "https://icecast.radiofrance.fr/fip-hifi.aac",
+   "quality": "aac192",
+   "genre": "eclectic",
+   "genres": [
+    "eclectic"
+   ],
+   "categories": [
+    {
+     "id": 25,
+     "external_id": "C000038",
+     "name": "Eclectic",
+     "slug": "eclectic"
+    }
+   ],
+   "keywords": [
+    "Radio France"
+   ],
+   "streams": [
+    {
+     "id": 1,
+     "external_id": "ML000001",
+     "url": "https://icecast.radiofrance.fr/fip-hifi.aac",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": null,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": true,
+     "origin": "mozaiklabs"
+    },
+    {
+     "id": 1776,
+     "external_id": "S000973-02",
+     "url": "https://icecast.radiofrance.fr/fip-hifi.aac?id=radiofrance",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 1777,
+     "external_id": "S000973-03",
+     "url": "https://icecast.radiofrance.fr/fip-midfi.mp3?id=radiofrance",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 128,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    }
+   ],
+   "avg_rating": 5,
+   "rating_count": 2,
+   "popularity": 1,
+   "latitude": 48.8534,
+   "longitude": 2.3488,
+   "geo_edited_at": null,
+   "retired_at": null,
+   "updated_at": "2026-11-18T00:32:07+01:00"
+  },
+  {
+   "id": 3,
+   "external_id": "S000978",
+   "source": "radio-metadata",
+   "status": "active",
+   "name": "FIP: Jazz",
+   "description": "D’Avishai Cohen à Herbie Hancock, de Nina Simone à Christian Scott, retrouvez le swing de FIP dans une sélection musicale qui traverse les genres et les époques.",
+   "website_url": "https://www.fip.fr/jazz/webradio",
+   "country": "FR",
+   "logo_url": "/storage/radio-logos/radio-metadata/S000978-00a0e51deb0b.webp",
+   "radio_metadata_key": "fipjazz",
+   "stream_url": "https://icecast.radiofrance.fr/fipjazz-hifi.aac",
+   "v1_stream_url": "https://icecast.radiofrance.fr/fipjazz-hifi.aac",
+   "quality": "aac192",
+   "genre": "jazz",
+   "genres": [
+    "jazz"
+   ],
+   "categories": [
+    {
+     "id": 39,
+     "external_id": "C000065",
+     "name": "Jazz",
+     "slug": "jazz"
+    }
+   ],
+   "keywords": [
+    "Radio France"
+   ],
+   "streams": [
+    {
+     "id": 2,
+     "external_id": "ML000002",
+     "url": "https://icecast.radiofrance.fr/fipjazz-hifi.aac",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": null,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": true,
+     "origin": "mozaiklabs"
+    },
+    {
+     "id": 1787,
+     "external_id": "S000978-01",
+     "url": "http://direct.fipradio.fr/live/fip-webradio2.mp3",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 128,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 1788,
+     "external_id": "S000978-02",
+     "url": "https://icecast.radiofrance.fr/fipjazz-hifi.aac?id=radiofrance",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 1789,
+     "external_id": "S000978-03",
+     "url": "https://icecast.radiofrance.fr/fipjazz-midfi.mp3?id=radiofrance",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 128,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    }
+   ],
+   "avg_rating": 5,
+   "rating_count": 1,
+   "popularity": 4,
+   "latitude": 48.8534,
+   "longitude": 2.3488,
+   "geo_edited_at": null,
+   "retired_at": null,
+   "updated_at": "2026-11-18T01:43:29+01:00"
+  },
+  {
+   "id": 19,
+   "external_id": "S000974",
+   "source": "radio-metadata",
+   "status": "active",
+   "name": "FIP: Cultes",
+   "description": "En illimité, une webradio dédiée uniquement aux titres cultes qui ont fait l’histoire et continuent de faire vibrer le présent. De Blur à Bowie, d’Aretha Franklin à Amy Winehouse, du thème du Mépris à Purple Rain...",
+   "website_url": "https://www.radiofrance.fr/fip/radio-cultes",
+   "country": "FR",
+   "logo_url": "/storage/radio-logos/radio-metadata/S000974-fc7e6bb8b38a.webp",
+   "radio_metadata_key": "fipcultes",
+   "stream_url": "https://icecast.radiofrance.fr/fipcultes-hifi.aac",
+   "v1_stream_url": "https://icecast.radiofrance.fr/fipcultes-hifi.aac",
+   "quality": "aac192",
+   "genre": "eclectic",
+   "genres": [
+    "eclectic"
+   ],
+   "categories": [
+    {
+     "id": 25,
+     "external_id": "C000038",
+     "name": "Eclectic",
+     "slug": "eclectic"
+    }
+   ],
+   "keywords": [
+    "Radio France"
+   ],
+   "streams": [
+    {
+     "id": 18,
+     "external_id": "ML000018",
+     "url": "https://icecast.radiofrance.fr/fipcultes-hifi.aac",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": null,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": true,
+     "origin": "mozaiklabs"
+    },
+    {
+     "id": 1778,
+     "external_id": "S000974-01",
+     "url": "https://icecast.radiofrance.fr/fipcultes-hifi.aac?id=radiofrance",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 1779,
+     "external_id": "S000974-02",
+     "url": "http://radio-metadata.fr:8000/fipcultes",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    }
+   ],
+   "avg_rating": 0,
+   "rating_count": 0,
+   "popularity": 2,
+   "latitude": 48.8534,
+   "longitude": 2.3488,
+   "geo_edited_at": null,
+   "retired_at": null,
+   "updated_at": "2026-11-10T09:30:03+01:00"
+  },
+  {
+   "id": 20,
+   "external_id": "S000976",
+   "source": "radio-metadata",
+   "status": "active",
+   "name": "FIP: Groove",
+   "description": "De Gil Scott Heron à De La Soul, d’Amy Winehouse à Marvin Gaye, gardez le rythme de FIP dans une sélection musicale qui traverse les genres et les époques.",
+   "website_url": "https://www.fip.fr/groove/webradio",
+   "country": "FR",
+   "logo_url": "/storage/radio-logos/radio-metadata/S000976-99b0a74036f4.webp",
+   "radio_metadata_key": "fipgroove",
+   "stream_url": "https://icecast.radiofrance.fr/fipgroove-hifi.aac",
+   "v1_stream_url": "https://icecast.radiofrance.fr/fipgroove-hifi.aac",
+   "quality": "aac192",
+   "genre": "rnb",
+   "genres": [
+    "rnb"
+   ],
+   "categories": [
+    {
+     "id": 28,
+     "external_id": "C000093",
+     "name": "R&B",
+     "slug": "r&b"
+    },
+    {
+     "id": 25,
+     "external_id": "C000038",
+     "name": "Eclectic",
+     "slug": "eclectic"
+    }
+   ],
+   "keywords": [
+    "Radio France"
+   ],
+   "streams": [
+    {
+     "id": 19,
+     "external_id": "ML000019",
+     "url": "https://icecast.radiofrance.fr/fipgroove-hifi.aac",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": null,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": true,
+     "origin": "mozaiklabs"
+    },
+    {
+     "id": 1782,
+     "external_id": "S000976-01",
+     "url": "https://icecast.radiofrance.fr/fipgroove-hifi.aac?id=radiofrance",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 1783,
+     "external_id": "S000976-02",
+     "url": "https://icecast.radiofrance.fr/fipgroove-midfi.mp3?id=radiofrance",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 128,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 9211,
+     "external_id": "S000976-06",
+     "url": "http://direct.fipradio.fr/live/fipgroove-hifi.aac",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    }
+   ],
+   "avg_rating": 0,
+   "rating_count": 0,
+   "popularity": 2,
+   "latitude": 48.8534,
+   "longitude": 2.3488,
+   "geo_edited_at": null,
+   "retired_at": null,
+   "updated_at": "2026-11-10T09:30:23+01:00"
+  },
+  {
+   "id": 21,
+   "external_id": "S000979",
+   "source": "radio-metadata",
+   "status": "active",
+   "name": "FIP: Metal",
+   "description": "Découvrez la sélection de musiques metal des programmateurs de FIP. Une sélection éclectique à travers les genres : thrash metal, hard rock, death metal...",
+   "website_url": "https://www.radiofrance.fr/fip/radio-metal",
+   "country": "FR",
+   "logo_url": "/storage/radio-logos/radio-metadata/S000979-09083ec69cd0.webp",
+   "radio_metadata_key": "fipmetal",
+   "stream_url": "https://icecast.radiofrance.fr/fipmetal-hifi.aac",
+   "v1_stream_url": "https://icecast.radiofrance.fr/fipmetal-hifi.aac",
+   "quality": "aac224",
+   "genre": "metal",
+   "genres": [
+    "metal"
+   ],
+   "categories": [
+    {
+     "id": 48,
+     "external_id": "C000371",
+     "name": "Metal",
+     "slug": "metal"
+    }
+   ],
+   "keywords": [
+    "Radio France"
+   ],
+   "streams": [
+    {
+     "id": 1790,
+     "external_id": "S000979-01",
+     "url": "https://icecast.radiofrance.fr/fipmetal-midfi.mp3",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 128,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 1791,
+     "external_id": "S000979-02",
+     "url": "https://icecast.radiofrance.fr/fipmetal-hifi.aac",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 224,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": true,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 20,
+     "external_id": "ML000020",
+     "url": "https://icecast.radiofrance.fr/fipmetal-hifi.aac",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": null,
+     "restricted_to_countries": null,
+     "is_published": false,
+     "is_primary": false,
+     "origin": "mozaiklabs"
+    }
+   ],
+   "avg_rating": 0,
+   "rating_count": 0,
+   "popularity": 2,
+   "latitude": 48.8534,
+   "longitude": 2.3488,
+   "geo_edited_at": null,
+   "retired_at": null,
+   "updated_at": "2026-11-18T06:26:04+01:00"
+  },
+  {
+   "id": 26,
+   "external_id": "S000984",
+   "source": "radio-metadata",
+   "status": "active",
+   "name": "FIP: Rock",
+   "description": "De Bowie à Radiohead, de Lou Reed à Miossec, FIP mêle le rock à la pop dans une sélection musicale qui traverse les genres et les époques.",
+   "website_url": "https://www.fip.fr/rock/webradio",
+   "country": "FR",
+   "logo_url": "/storage/radio-logos/radio-metadata/S000984-a4e4222f84cc.webp",
+   "radio_metadata_key": "fiprock",
+   "stream_url": "https://icecast.radiofrance.fr/fiprock-hifi.aac",
+   "v1_stream_url": "https://icecast.radiofrance.fr/fiprock-hifi.aac",
+   "quality": "aac192",
+   "genre": "rock",
+   "genres": [
+    "rock"
+   ],
+   "categories": [
+    {
+     "id": 45,
+     "external_id": "C000369",
+     "name": "Rock",
+     "slug": "rock"
+    }
+   ],
+   "keywords": [
+    "Radio France"
+   ],
+   "streams": [
+    {
+     "id": 25,
+     "external_id": "ML000025",
+     "url": "https://icecast.radiofrance.fr/fiprock-hifi.aac",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": null,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": true,
+     "origin": "mozaiklabs"
+    },
+    {
+     "id": 1801,
+     "external_id": "S000984-01",
+     "url": "https://icecast.radiofrance.fr/fiprock-midfi.mp3?id=radiofrance",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 128,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 1802,
+     "external_id": "S000984-02",
+     "url": "https://icecast.radiofrance.fr/fiprock-hifi.aac?id=radiofrance",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 1803,
+     "external_id": "S000984-03",
+     "url": "http://direct.fipradio.fr/live/fip-webradio1.mp3",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 128,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    }
+   ],
+   "avg_rating": 0,
+   "rating_count": 0,
+   "popularity": 1,
+   "latitude": 48.8534,
+   "longitude": 2.3488,
+   "geo_edited_at": null,
+   "retired_at": null,
+   "updated_at": "2026-11-10T09:31:31+01:00"
+  },
+  {
+   "id": 27,
+   "external_id": "S000975",
+   "source": "radio-metadata",
+   "status": "active",
+   "name": "FIP: Electro",
+   "description": "La radio électro du service public.",
+   "website_url": "https://www.fip.fr/electro/webradio",
+   "country": "FR",
+   "logo_url": "/storage/radio-logos/radio-metadata/S000975-04a454cd6af8.webp",
+   "radio_metadata_key": "fipelectro",
+   "stream_url": "https://icecast.radiofrance.fr/fipelectro-hifi.aac",
+   "v1_stream_url": "https://icecast.radiofrance.fr/fipelectro-hifi.aac",
+   "quality": "aac192",
+   "genre": "electronic",
+   "genres": [
+    "electronic"
+   ],
+   "categories": [
+    {
+     "id": 34,
+     "external_id": "C000040",
+     "name": "Electronic",
+     "slug": "electronic"
+    }
+   ],
+   "keywords": [
+    "Radio France"
+   ],
+   "streams": [
+    {
+     "id": 1780,
+     "external_id": "S000975-01",
+     "url": "https://icecast.radiofrance.fr/fipelectro-midfi.mp3",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 128,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 1781,
+     "external_id": "S000975-02",
+     "url": "https://icecast.radiofrance.fr/fipelectro-hifi.aac",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": true,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 26,
+     "external_id": "ML000026",
+     "url": "https://icecast.radiofrance.fr/fipelectro-hifi.aac",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": null,
+     "restricted_to_countries": null,
+     "is_published": false,
+     "is_primary": false,
+     "origin": "mozaiklabs"
+    }
+   ],
+   "avg_rating": 0,
+   "rating_count": 0,
+   "popularity": 3,
+   "latitude": 48.8534,
+   "longitude": 2.3488,
+   "geo_edited_at": null,
+   "retired_at": null,
+   "updated_at": "2026-11-10T09:30:16+01:00"
+  },
+  {
+   "id": 28,
+   "external_id": "S000977",
+   "source": "radio-metadata",
+   "status": "active",
+   "name": "FIP: Hip-Hop",
+   "description": "Découvrez la radio hip-hop par les programmateurs de FIP, gratuitement et sans pub. Découvrez une sélection éclectique de classiques et nouveautés du genre.",
+   "website_url": "https://www.radiofrance.fr/fip/radio-hip-hop",
+   "country": "FR",
+   "logo_url": "/storage/radio-logos/radio-metadata/S000977-fbc324a37236.webp",
+   "radio_metadata_key": "fiphiphop",
+   "stream_url": "https://icecast.radiofrance.fr/fiphiphop-hifi.aac",
+   "v1_stream_url": "https://icecast.radiofrance.fr/fiphiphop-hifi.aac",
+   "quality": "aac192",
+   "genre": "rnb",
+   "genres": [
+    "rnb",
+    "hiphop"
+   ],
+   "categories": [
+    {
+     "id": 28,
+     "external_id": "C000093",
+     "name": "R&B",
+     "slug": "r&b"
+    },
+    {
+     "id": 29,
+     "external_id": "C000094",
+     "name": "Rap",
+     "slug": "rap"
+    }
+   ],
+   "keywords": [
+    "Radio France"
+   ],
+   "streams": [
+    {
+     "id": 1785,
+     "external_id": "S000977-01",
+     "url": "https://icecast.radiofrance.fr/fiphiphop-hifi.aac",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": true,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 1786,
+     "external_id": "S000977-02",
+     "url": "https://icecast.radiofrance.fr/fiphiphop-midfi.mp3",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 128,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 27,
+     "external_id": "ML000027",
+     "url": "https://icecast.radiofrance.fr/fiphiphop-hifi.aac",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": null,
+     "restricted_to_countries": null,
+     "is_published": false,
+     "is_primary": false,
+     "origin": "mozaiklabs"
+    }
+   ],
+   "avg_rating": 0,
+   "rating_count": 0,
+   "popularity": 2,
+   "latitude": 48.8534,
+   "longitude": 2.3488,
+   "geo_edited_at": null,
+   "retired_at": null,
+   "updated_at": "2026-11-10T09:30:32+01:00"
+  },
+  {
+   "id": 30,
+   "external_id": "S000985",
+   "source": "radio-metadata",
+   "status": "active",
+   "name": "FIP: Sacré Français!",
+   "description": "Découvrez le meilleur de la musique francophone gratuitement et sans pub : de Brassens à Orelsan, du Canada à l'Afrique, écoutez la sélection à la française des programmateurs de Fip.",
+   "website_url": "https://www.radiofrance.fr/fip/radio-sacre-francais",
+   "country": "FR",
+   "logo_url": "/storage/radio-logos/radio-metadata/S000985-ded84e398a9b.webp",
+   "radio_metadata_key": "fipsacrefrancais",
+   "stream_url": "https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac?id=radiofrance",
+   "v1_stream_url": "https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac?id=radiofrance",
+   "quality": "aac192",
+   "genre": "eclectic",
+   "genres": [
+    "eclectic"
+   ],
+   "categories": [
+    {
+     "id": 25,
+     "external_id": "C000038",
+     "name": "Eclectic",
+     "slug": "eclectic"
+    }
+   ],
+   "keywords": [
+    "Radio France"
+   ],
+   "streams": [
+    {
+     "id": 29,
+     "external_id": "ML000029",
+     "url": "https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 128,
+     "sample_rate": null,
+     "restricted_to_countries": [],
+     "is_published": false,
+     "is_primary": false,
+     "origin": "mozaiklabs"
+    },
+    {
+     "id": 1804,
+     "external_id": "S000985-01",
+     "url": "https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac?id=radiofrance",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": true,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 1805,
+     "external_id": "S000985-02",
+     "url": "https://icecast.radiofrance.fr/fipsacrefrancais-midfi.mp3?id=radiofrance",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 128,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    }
+   ],
+   "avg_rating": 0,
+   "rating_count": 0,
+   "popularity": 3,
+   "latitude": 48.8534,
+   "longitude": 2.3488,
+   "geo_edited_at": null,
+   "retired_at": null,
+   "updated_at": "2026-11-18T01:35:27+01:00"
+  },
+  {
+   "id": 1021,
+   "external_id": "S000980",
+   "source": "radio-metadata",
+   "status": "active",
+   "name": "FIP: Monde",
+   "description": "D’Ibrahim Maalouf à Tony Allen, de Vaudou Game à Bebel Gilberto, franchissez les frontières de FIP dans une sélection musicale qui traverse les genres et les époques.",
+   "website_url": "https://www.fip.fr/musiques-du-monde/webradio",
+   "country": "FR",
+   "logo_url": "/storage/radio-logos/radio-metadata/S000980.webp",
+   "radio_metadata_key": "fipmonde",
+   "stream_url": "https://icecast.radiofrance.fr/fipworld-hifi.aac?id=radiofrance",
+   "v1_stream_url": "https://icecast.radiofrance.fr/fipworld-hifi.aac?id=radiofrance",
+   "quality": "aac192",
+   "genre": "eclectic",
+   "genres": [
+    "eclectic"
+   ],
+   "categories": [
+    {
+     "id": 25,
+     "external_id": "C000038",
+     "name": "Eclectic",
+     "slug": "eclectic"
+    }
+   ],
+   "keywords": [
+    "Radio France"
+   ],
+   "streams": [
+    {
+     "id": 1792,
+     "external_id": "S000980-01",
+     "url": "https://icecast.radiofrance.fr/fipworld-midfi.mp3?id=radiofrance",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 128,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 1793,
+     "external_id": "S000980-02",
+     "url": "http://direct.fipradio.fr/live/fip-webradio4.mp3",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 128,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 1794,
+     "external_id": "S000980-03",
+     "url": "https://icecast.radiofrance.fr/fipworld-hifi.aac?id=radiofrance",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": true,
+     "origin": "radio-metadata"
+    }
+   ],
+   "avg_rating": 0,
+   "rating_count": 0,
+   "popularity": 2,
+   "latitude": 48.8534,
+   "longitude": 2.3488,
+   "geo_edited_at": null,
+   "retired_at": null,
+   "updated_at": "2026-11-10T09:30:57+01:00"
+  },
+  {
+   "id": 1022,
+   "external_id": "S000981",
+   "source": "radio-metadata",
+   "status": "active",
+   "name": "FIP: Nouveautés",
+   "description": "Faites le plein de nouveautés avec les meilleures sorties musicales sélectionnées par FIP.",
+   "website_url": "https://www.fip.fr/tout-nouveau-tout-fip/webradio",
+   "country": "FR",
+   "logo_url": "/storage/radio-logos/radio-metadata/S000981.webp",
+   "radio_metadata_key": "fipnouveaute",
+   "stream_url": "https://icecast.radiofrance.fr/fipnouveautes-hifi.aac?id=radiofrance",
+   "v1_stream_url": "https://icecast.radiofrance.fr/fipnouveautes-hifi.aac?id=radiofrance",
+   "quality": "aac192",
+   "genre": "pop",
+   "genres": [
+    "pop",
+    "rock"
+   ],
+   "categories": [
+    {
+     "id": 47,
+     "external_id": "C000370",
+     "name": "Pop",
+     "slug": "pop"
+    },
+    {
+     "id": 45,
+     "external_id": "C000369",
+     "name": "Rock",
+     "slug": "rock"
+    },
+    {
+     "id": 25,
+     "external_id": "C000038",
+     "name": "Eclectic",
+     "slug": "eclectic"
+    }
+   ],
+   "keywords": [
+    "Radio France"
+   ],
+   "streams": [
+    {
+     "id": 1795,
+     "external_id": "S000981-01",
+     "url": "http://direct.fipradio.fr/live/fip-webradio5.mp3",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 128,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 1796,
+     "external_id": "S000981-02",
+     "url": "https://icecast.radiofrance.fr/fipnouveautes-midfi.mp3?id=radiofrance",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 128,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 1797,
+     "external_id": "S000981-03",
+     "url": "https://icecast.radiofrance.fr/fipnouveautes-hifi.aac?id=radiofrance",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": true,
+     "origin": "radio-metadata"
+    }
+   ],
+   "avg_rating": 0,
+   "rating_count": 0,
+   "popularity": 1,
+   "latitude": 48.8534,
+   "longitude": 2.3488,
+   "geo_edited_at": null,
+   "retired_at": null,
+   "updated_at": "2026-11-10T09:31:05+01:00"
+  },
+  {
+   "id": 1023,
+   "external_id": "S000982",
+   "source": "radio-metadata",
+   "status": "active",
+   "name": "FIP: Pop",
+   "description": "Découvrez une sélection unique de musiques Pop allant de l'indie-rock à la synth-wave en passant par de la brit-pop à la scène francaise. Avec des artistes incontournables tels que Tame Impala, Jeanne Added, Blur ou Vampire Weekend...",
+   "website_url": "https://www.fip.fr/pop",
+   "country": "FR",
+   "logo_url": "/storage/radio-logos/radio-metadata/S000982.webp",
+   "radio_metadata_key": "fippop",
+   "stream_url": "https://icecast.radiofrance.fr/fippop-hifi.aac",
+   "v1_stream_url": "https://icecast.radiofrance.fr/fippop-hifi.aac",
+   "quality": "aac192",
+   "genre": "pop",
+   "genres": [
+    "pop"
+   ],
+   "categories": [
+    {
+     "id": 47,
+     "external_id": "C000370",
+     "name": "Pop",
+     "slug": "pop"
+    }
+   ],
+   "keywords": [
+    "Radio France"
+   ],
+   "streams": [
+    {
+     "id": 1798,
+     "external_id": "S000982-01",
+     "url": "https://icecast.radiofrance.fr/fippop-hifi.aac",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": true,
+     "origin": "radio-metadata"
+    }
+   ],
+   "avg_rating": 0,
+   "rating_count": 0,
+   "popularity": 2,
+   "latitude": 48.8534,
+   "longitude": 2.3488,
+   "geo_edited_at": null,
+   "retired_at": null,
+   "updated_at": "2026-11-10T09:31:13+01:00"
+  },
+  {
+   "id": 1024,
+   "external_id": "S000983",
+   "source": "radio-metadata",
+   "status": "active",
+   "name": "FIP: Reggae",
+   "description": "Des Toots à Biga Ranx, des Clash à DJ Vadim, un voyage vers Zion et au-delà.\n[ avec métadonnées expérimentales sur le flux AAC 191kHz - with experimental metadata on AAC 191kHz stream ]",
+   "website_url": "https://www.fip.fr/reggae/webradio",
+   "country": "FR",
+   "logo_url": "/storage/radio-logos/radio-metadata/S000983.webp",
+   "radio_metadata_key": "fipreggae",
+   "stream_url": "https://icecast.radiofrance.fr/fipreggae-hifi.aac?id=radiofrance",
+   "v1_stream_url": "https://icecast.radiofrance.fr/fipreggae-hifi.aac?id=radiofrance",
+   "quality": "aac192",
+   "genre": "reggae",
+   "genres": [
+    "reggae"
+   ],
+   "categories": [
+    {
+     "id": 36,
+     "external_id": "C000095",
+     "name": "Reggae",
+     "slug": "reggae"
+    }
+   ],
+   "keywords": [
+    "Radio France"
+   ],
+   "streams": [
+    {
+     "id": 1799,
+     "external_id": "S000983-01",
+     "url": "https://icecast.radiofrance.fr/fipreggae-midfi.mp3?id=radiofrance",
+     "format": "MP3",
+     "is_hls": false,
+     "bitrate": 128,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": false,
+     "origin": "radio-metadata"
+    },
+    {
+     "id": 1800,
+     "external_id": "S000983-02",
+     "url": "https://icecast.radiofrance.fr/fipreggae-hifi.aac?id=radiofrance",
+     "format": "AAC",
+     "is_hls": false,
+     "bitrate": 192,
+     "sample_rate": 48000,
+     "restricted_to_countries": null,
+     "is_published": true,
+     "is_primary": true,
+     "origin": "radio-metadata"
+    }
+   ],
+   "avg_rating": 0,
+   "rating_count": 0,
+   "popularity": 1,
+   "latitude": 48.8534,
+   "longitude": 2.3488,
+   "geo_edited_at": null,
+   "retired_at": null,
+   "updated_at": "2026-11-10T09:31:22+01:00"
+  }
+ ]
+}

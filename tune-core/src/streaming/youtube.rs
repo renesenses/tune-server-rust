@@ -26,27 +26,40 @@ const STREAM_URL_TTL_SECS: u64 = 18_000;
 const YTDLP_TIMEOUT_SECS: u64 = 90;
 
 // InnerTube is periodically closed to unauthenticated clients. Do not pay the
-// same two known failures for every track when yt-dlp is available, but keep
-// probing periodically so a temporary YouTube outage does not become a
-// permanent session-wide fallback.
+// same two known failures for every track, but keep probing periodically so
+// a temporary YouTube outage does not become a permanent session-wide
+// fallback. #8913 — this holds without yt-dlp too: the refusal then comes
+// at once, named (`CODE_LECTURE_YOUTUBE_INACTIVE`).
 const NATIVE_FAILURE_THRESHOLD: u32 = 2;
 const NATIVE_CIRCUIT_COOLDOWN_SECS: u64 = 15 * 60;
+
+/// #8913 — le code stable du refus « lecture YouTube non activée » : yt-dlp
+/// n'est pas installé, et les voies natives ne servent pas la piste. La route
+/// de lecture le reconnaît dans le message (`TuneError::Streaming`) et rend un
+/// 409 traduit (`message_key`), avec l'action qui active la lecture YouTube,
+/// au lieu du 502 `upstream_error` brut.
+pub const CODE_LECTURE_YOUTUBE_INACTIVE: &str = "youtube_playback_disabled";
+
+/// Le message de ce refus : le code stable en tête, puis la phrase technique
+/// (anglaise) qui reste lisible dans le journal.
+fn erreur_lecture_youtube_inactive() -> String {
+    format!(
+        "{CODE_LECTURE_YOUTUBE_INACTIVE}: YouTube playback is not enabled — turn it on in \
+         Settings (downloads the yt-dlp helper)"
+    )
+}
 
 // ---------------------------------------------------------------------------
 // Google OAuth 2.0 — Device Code Flow
 // ---------------------------------------------------------------------------
 
-/// Client de REPLI : le client « YouTube TV » public, qui n'appartient pas à
-/// Tune. Il ne sert que si aucun client à nous n'est configuré (voir
-/// [`ClientOAuth::resoudre`]).
-const GOOGLE_CLIENT_ID: &str =
-    "43212718137-t3p59j0tov6ak6jdsuj9leqpdmmmqpt4.apps.googleusercontent.com";
-const GOOGLE_CLIENT_SECRET: &str = "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";
+// #8904 (décision du 17/11) — le client de repli « YouTube TV » public, qui
+// n'appartient pas à Tune (portée `youtube` complète), est RETIRÉ. Seul le
+// client OAuth de Tune ([`ClientOAuth`]) se présente à Google ; sans lui, la
+// connexion au compte est refusée par un message clair.
 const GOOGLE_DEVICE_CODE_URL: &str = "https://oauth2.googleapis.com/device/code";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
-/// Portée du client de repli, inchangée : c'est celle que les comptes déjà
-/// connectés ont accordée.
-const GOOGLE_SCOPE: &str = "https://www.googleapis.com/auth/youtube";
+const GOOGLE_USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v3/userinfo";
 /// Portée de NOTRE client : Tune ne fait que LIRE le compte (#5247).
 const GOOGLE_SCOPE_LECTURE: &str = "https://www.googleapis.com/auth/youtube.readonly";
 
@@ -63,18 +76,62 @@ pub struct ClientOAuth {
     pub id: String,
     pub secret: String,
     pub scope: &'static str,
-    /// Vrai pour le client de repli (YouTube TV public).
-    pub repli: bool,
+    /// D'où vient le client : `"execution"` (variables d'environnement du
+    /// processus) ou `"compilation"` (figé dans le binaire par la CI). Pour le
+    /// journal seulement (#8904).
+    pub origine: &'static str,
+}
+
+/// #8904 — ce que la ligne de jetons enregistre pour un jeton émis par le
+/// client de Tune. Une ligne sans cette marque date du client de repli retiré.
+const MARQUE_CLIENT_TUNE: &str = "tune";
+
+/// #8904 — code stable du refus de connexion d'une version sans client OAuth.
+pub const CODE_CLIENT_OAUTH_ABSENT: &str = "youtube_oauth_client_missing";
+
+/// #8904 — le refus d'une connexion sans client OAuth de Tune (fork, build
+/// local sans les secrets de la CI).
+pub const MESSAGE_CLIENT_OAUTH_ABSENT: &str = "Client OAuth YouTube non configuré dans cette version de Tune : \
+     la connexion au compte YouTube n'est pas disponible.";
+
+/// #8904 — le compte avait été connecté avec le client de repli retiré.
+pub const MESSAGE_RECONNEXION_REPLI: &str = "Compte YouTube à reconnecter : il avait été connecté avec un ancien \
+     client OAuth, retiré de Tune. Reconnectez-le dans les Réglages.";
+
+/// Les deux points d'accès OAuth de Google employés par la connexion.
+#[derive(Debug, Clone)]
+struct PointsOAuthGoogle {
+    device_code: String,
+    token: String,
+    userinfo: String,
+}
+
+impl Default for PointsOAuthGoogle {
+    fn default() -> Self {
+        Self {
+            device_code: GOOGLE_DEVICE_CODE_URL.into(),
+            token: GOOGLE_TOKEN_URL.into(),
+            userinfo: GOOGLE_USERINFO_URL.into(),
+        }
+    }
+}
+
+fn refus_client_oauth_absent() -> TuneError {
+    TuneError::Refused {
+        code: CODE_CLIENT_OAUTH_ABSENT,
+        message: MESSAGE_CLIENT_OAUTH_ABSENT.into(),
+    }
 }
 
 impl ClientOAuth {
-    /// Exécution, puis compilation, puis repli. Une paire n'est retenue que
-    /// COMPLÈTE : un identifiant sans son secret (ou l'inverse) ne fabrique
-    /// pas un client à moitié configuré, qui échouerait au premier échange.
+    /// Exécution, puis compilation, sinon AUCUN client (#8904 : plus de
+    /// repli). Une paire n'est retenue que COMPLÈTE : un identifiant sans son
+    /// secret (ou l'inverse) ne fabrique pas un client à moitié configuré, qui
+    /// échouerait au premier échange.
     pub fn resoudre(
         execution: (Option<&str>, Option<&str>),
         compilation: (Option<&str>, Option<&str>),
-    ) -> Self {
+    ) -> Option<Self> {
         let complet = |(id, secret): (Option<&str>, Option<&str>)| match (
             id.map(str::trim).filter(|v| !v.is_empty()),
             secret.map(str::trim).filter(|v| !v.is_empty()),
@@ -82,24 +139,27 @@ impl ClientOAuth {
             (Some(id), Some(secret)) => Some((id.to_string(), secret.to_string())),
             _ => None,
         };
-        match complet(execution).or_else(|| complet(compilation)) {
-            Some((id, secret)) => Self {
-                id,
-                secret,
-                scope: GOOGLE_SCOPE_LECTURE,
-                repli: false,
-            },
-            None => Self {
-                id: GOOGLE_CLIENT_ID.into(),
-                secret: GOOGLE_CLIENT_SECRET.into(),
-                scope: GOOGLE_SCOPE,
-                repli: true,
-            },
-        }
+        let tune = |(id, secret): (String, String), origine| Self {
+            id,
+            secret,
+            scope: GOOGLE_SCOPE_LECTURE,
+            origine,
+        };
+        complet(execution)
+            .map(|paire| tune(paire, "execution"))
+            .or_else(|| complet(compilation).map(|paire| tune(paire, "compilation")))
+    }
+
+    /// Les huit premiers caractères de l'identifiant, suivis de « … » : assez
+    /// pour reconnaître le client dans un rapport, pas assez pour le recopier.
+    pub fn id_abrege(&self) -> String {
+        let debut: String = self.id.chars().take(8).collect();
+        format!("{debut}…")
     }
 
     /// Le client de ce processus : environnement, puis valeurs de compilation.
-    pub fn depuis_l_environnement() -> Self {
+    /// `None` : aucun client de Tune dans cette version (#8904).
+    pub fn depuis_l_environnement() -> Option<Self> {
         let id = std::env::var(ENV_CLIENT_ID).ok();
         let secret = std::env::var(ENV_CLIENT_SECRET).ok();
         Self::resoudre(
@@ -606,8 +666,19 @@ pub struct YouTubeService {
     ytm_base: String,
     /// Racine de l'API YouTube Data v3. `YT_API_BASE` en production.
     data_api_base: String,
-    /// Client OAuth Google de la connexion au compte (#5247).
-    oauth: ClientOAuth,
+    /// Client OAuth Google de Tune pour la connexion au compte (#5247).
+    /// `None` : cette version n'en a pas (#8904), la connexion est refusée.
+    oauth: Option<ClientOAuth>,
+    /// #8904 — les jetons restaurés ont été émis par le client de repli
+    /// retiré (ligne sans la marque [`MARQUE_CLIENT_TUNE`]). Au premier
+    /// rafraîchissement, ils sont effacés et le compte passe « à reconnecter ».
+    jeton_du_repli: bool,
+    /// #8904 — pourquoi le compte est « à reconnecter » (message pour
+    /// l'utilisateur), jusqu'à la prochaine connexion ou déconnexion.
+    a_reconnecter: Option<&'static str>,
+    /// Points d'accès OAuth de Google. Ceux de Google en production ; un
+    /// serveur local dans les essais (#8904), qui compte les appels.
+    google_oauth_base: PointsOAuthGoogle,
     enabled_override: Option<bool>,
 
     // -- OAuth state ----------------------------------------------------------
@@ -638,6 +709,19 @@ impl YouTubeService {
         let api_key = std::env::var("TUNE_YOUTUBE_API_KEY")
             .ok()
             .filter(|k| !k.is_empty());
+        let oauth = ClientOAuth::depuis_l_environnement();
+        // #8904 — quel client est présenté à Google, sans l'identifiant entier.
+        match &oauth {
+            Some(c) => info!(
+                origine = c.origine,
+                id = %c.id_abrege(),
+                scope = c.scope,
+                "youtube_client_oauth"
+            ),
+            None => warn!(
+                "youtube_client_oauth_absent : connexion au compte YouTube indisponible dans cette version"
+            ),
+        }
 
         Self {
             client: crate::http::client::builder()
@@ -656,11 +740,10 @@ impl YouTubeService {
             api_key,
             ytm_base: YTM_API_BASE.into(),
             data_api_base: YT_API_BASE.into(),
-            oauth: {
-                let c = ClientOAuth::depuis_l_environnement();
-                info!(repli = c.repli, scope = c.scope, "youtube_client_oauth");
-                c
-            },
+            oauth,
+            jeton_du_repli: false,
+            a_reconnecter: None,
+            google_oauth_base: PointsOAuthGoogle::default(),
             enabled_override: None,
             // OAuth — not authenticated until user completes Device Code flow
             access_token: None,
@@ -849,6 +932,8 @@ impl YouTubeService {
                             track_count: 0,
                             quality: None,
                             released_at: None,
+                            genre_id: None,
+                            genre_name: None,
                         });
                     }
                     "youtube#channel" => {
@@ -1194,46 +1279,43 @@ impl YouTubeService {
     // yt-dlp stream URL extraction (fallback)
     // ------------------------------------------------------------------
 
-    /// Extract audio stream URL via yt-dlp subprocess (fallback).
-    ///
-    /// Used when native `/player` API extraction fails (e.g., geo-restricted
-    /// content, age-gated videos). Requires `yt-dlp` installed on PATH.
-    /// Ce que yt-dlp rend : l'URL, et les en-têtes qui vont avec.
-    ///
-    /// #4366 — `--get-url` ne rendait que l'URL. Le format choisi porte aussi
-    /// un `http_headers` (User-Agent en tête), et l'URL `googlevideo` est
-    /// servie à qui les rejoue. Les demander coûte un `--print` de plus, sur
-    /// le même appel.
-    async fn extract_audio_url_ytdlp(&self, track_id: &str) -> Result<FluxYoutube, String> {
-        // Managed yt-dlp binary (auto-provisioned via the "Enable YouTube
-        // playback" button). None means the user hasn't enabled it yet.
-        let ytdlp = crate::ytdlp::binary().ok_or_else(|| {
-            "YouTube playback is not enabled — turn it on in Settings \
-             (downloads the yt-dlp helper)"
-                .to_string()
-        })?;
-        extraire_par_ytdlp(&ytdlp, track_id).await
-    }
-
     /// Extract audio stream URL with native API as primary + yt-dlp fallback.
     async fn extract_audio_url(&self, track_id: &str) -> Result<FluxYoutube, String> {
-        // Bypass is useful only when the fallback actually exists. Without the
-        // managed helper, always retain the chance that this particular track
-        // still works through InnerTube.
-        let ytdlp_available = crate::ytdlp::binary().is_some();
-        let native_decision = if ytdlp_available {
-            self.native_extraction_circuit
-                .lock()
-                .await
-                .decide(Instant::now())
-        } else {
-            NativeAttemptDecision::Attempt
-        };
+        // Managed yt-dlp binary (auto-provisioned via the "Enable YouTube
+        // playback" button). None means the user hasn't enabled it yet.
+        self.extraire_flux(track_id, crate::ytdlp::binary()).await
+    }
+
+    /// La résolution d'une piste, yt-dlp désigné par l'appelant (`None` :
+    /// lecture YouTube non activée). Séparée de [`Self::extract_audio_url`]
+    /// pour que les essais n'aient pas à toucher au binaire global.
+    ///
+    /// #8913 — le disjoncteur des voies natives (`NativeExtractionCircuit`)
+    /// vaut AUSSI sans yt-dlp. Avant, sans lui, chaque piste refaisait les
+    /// deux appels `/player` que Google refuse depuis août (#2162 : 48 sur
+    /// 48), pour finir sur le même refus. Désormais, après
+    /// `NATIVE_FAILURE_THRESHOLD` refus de suite, les voies natives sont
+    /// sautées et une seule sonde les réessaie toutes les
+    /// `NATIVE_CIRCUIT_COOLDOWN_SECS` : si Google en rouvre une, la sonde
+    /// réussit et referme le disjoncteur. Sans yt-dlp, le refus porte le
+    /// code stable [`CODE_LECTURE_YOUTUBE_INACTIVE`], que la route de lecture
+    /// rend en 409 traduit avec de quoi activer la lecture YouTube.
+    pub(crate) async fn extraire_flux(
+        &self,
+        track_id: &str,
+        ytdlp: Option<std::path::PathBuf>,
+    ) -> Result<FluxYoutube, String> {
+        let native_decision = self
+            .native_extraction_circuit
+            .lock()
+            .await
+            .decide(Instant::now());
 
         if native_decision == NativeAttemptDecision::Probe {
             info!(track_id, "ytm_native_circuit_probe_started");
         }
 
+        let mut echec_natif = None;
         if matches!(
             native_decision,
             NativeAttemptDecision::Attempt | NativeAttemptDecision::Probe
@@ -1257,14 +1339,30 @@ impl YouTubeService {
                         .await
                         .record_failure(Instant::now());
                     info!(track_id, error = %e, "ytm_native_extraction_failed_trying_ytdlp");
+                    echec_natif = Some(e);
                 }
             }
         } else {
-            info!(track_id, "ytm_native_circuit_open_using_ytdlp");
+            info!(
+                track_id,
+                ytdlp = ytdlp.is_some(),
+                "ytm_native_circuit_open_skipping_native"
+            );
         }
 
-        // Fallback: yt-dlp subprocess
-        match self.extract_audio_url_ytdlp(track_id).await {
+        let Some(ytdlp) = ytdlp else {
+            warn!(
+                track_id,
+                native_error = echec_natif.as_deref().unwrap_or("skipped (circuit open)"),
+                "youtube_playback_not_enabled"
+            );
+            return Err(erreur_lecture_youtube_inactive());
+        };
+
+        // Fallback: yt-dlp subprocess. #4366 — il rend l'URL ET les en-têtes
+        // du format choisi (User-Agent en tête) : `googlevideo` ne sert l'URL
+        // qu'à qui les rejoue.
+        match extraire_par_ytdlp(&ytdlp, track_id).await {
             Ok(url) => Ok(url),
             Err(ytdlp_err) => {
                 warn!(track_id, error = %ytdlp_err, "youtube_all_extraction_methods_failed");
@@ -1314,14 +1412,15 @@ impl YouTubeService {
 
     /// Start Google OAuth Device Code flow.
     async fn start_device_code_flow(&mut self) -> Result<AuthStatus, TuneError> {
+        let Some(oauth) = self.oauth.clone() else {
+            warn!("youtube_connexion_refusee_client_oauth_absent");
+            return Err(refus_client_oauth_absent());
+        };
         let resp = self
             .client
-            .post(GOOGLE_DEVICE_CODE_URL)
+            .post(&self.google_oauth_base.device_code)
             .header("Content-Type", "application/x-www-form-urlencoded")
-            .body(format!(
-                "client_id={}&scope={}",
-                self.oauth.id, self.oauth.scope
-            ))
+            .body(format!("client_id={}&scope={}", oauth.id, oauth.scope))
             .send()
             .await
             .map_err(|e| {
@@ -1356,7 +1455,7 @@ impl YouTubeService {
         let expires_in = data["expires_in"].as_u64().unwrap_or(1800);
         let interval = data["interval"].as_u64().unwrap_or(5);
 
-        info!(user_code = %user_code, url = %verification_url, "youtube_device_code_started");
+        info!(user_code = %user_code, url = %crate::confidentialite::masquer_url(&verification_url), "youtube_device_code_started");
 
         self.pending_device_auth = Some(PendingDeviceAuth {
             device_code: device_code.clone(),
@@ -1393,17 +1492,23 @@ impl YouTubeService {
         }
 
         let device_code = pending.device_code.clone();
+        let Some(oauth) = self.oauth.clone() else {
+            self.pending_device_auth = None;
+            self.device_auth_started = None;
+            self.ligne_a_ecraser = true;
+            return Err(refus_client_oauth_absent());
+        };
 
         let resp = self
             .client
-            .post(GOOGLE_TOKEN_URL)
+            .post(&self.google_oauth_base.token)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(format!(
                 "client_id={}\
                  &client_secret={}\
                  &device_code={device_code}\
                  &grant_type={GOOGLE_DEVICE_GRANT_TYPE}",
-                self.oauth.id, self.oauth.secret
+                oauth.id, oauth.secret
             ))
             .send()
             .await
@@ -1461,6 +1566,8 @@ impl YouTubeService {
 
         self.access_token = Some(access_token);
         self.refresh_token = refresh_token;
+        self.jeton_du_repli = false;
+        self.a_reconnecter = None;
         self.token_expires = Some(Instant::now() + Duration::from_secs(expires_in));
         self.pending_device_auth = None;
         self.device_auth_started = None;
@@ -1484,19 +1591,29 @@ impl YouTubeService {
             Some(rt) => rt.clone(),
             None => return Ok(false),
         };
+        // #8904 — un jeton du client de repli retiré ne se rafraîchit plus
+        // avec lui : le compte passe « à reconnecter ».
+        if self.jeton_du_repli {
+            self.passer_a_reconnecter(MESSAGE_RECONNEXION_REPLI);
+            return Ok(false);
+        }
+        let Some(oauth) = self.oauth.clone() else {
+            self.passer_a_reconnecter(MESSAGE_CLIENT_OAUTH_ABSENT);
+            return Ok(false);
+        };
 
         info!("youtube_refreshing_access_token");
 
         let resp = self
             .client
-            .post(GOOGLE_TOKEN_URL)
+            .post(&self.google_oauth_base.token)
             .header("Content-Type", "application/x-www-form-urlencoded")
             .body(format!(
                 "client_id={}\
                  &client_secret={}\
                  &refresh_token={refresh_token}\
                  &grant_type=refresh_token",
-                self.oauth.id, self.oauth.secret
+                oauth.id, oauth.secret
             ))
             .send()
             .await
@@ -1544,6 +1661,32 @@ impl YouTubeService {
         }
     }
 
+    /// #8904 — efface les jetons sans appeler Google et passe le compte « à
+    /// reconnecter » : la ligne enregistrée sera écrasée (ou supprimée par
+    /// le registre, voir `session_expired`), la reconnexion passera par le
+    /// client de Tune.
+    fn passer_a_reconnecter(&mut self, raison: &'static str) {
+        warn!(
+            email = ?self.email,
+            jeton_du_repli = self.jeton_du_repli,
+            client_tune = self.oauth.is_some(),
+            "youtube_compte_a_reconnecter : jetons effacés, reconnexion demandée (#8904)"
+        );
+        self.access_token = None;
+        self.refresh_token = None;
+        self.token_expires = None;
+        self.email = None;
+        self.jeton_du_repli = false;
+        self.a_reconnecter = Some(raison);
+        self.ligne_a_ecraser = true;
+    }
+
+    /// #8904 — pourquoi le compte est « à reconnecter », s'il l'est : le
+    /// message à montrer à l'utilisateur.
+    pub fn raison_de_reconnexion(&self) -> Option<&'static str> {
+        self.a_reconnecter
+    }
+
     /// Fetch user info (email) from Google UserInfo API.
     async fn fetch_user_info(&mut self) {
         let Some(ref token) = self.access_token else {
@@ -1551,7 +1694,7 @@ impl YouTubeService {
         };
         let resp = self
             .client
-            .get("https://www.googleapis.com/oauth2/v3/userinfo")
+            .get(&self.google_oauth_base.userinfo)
             .header("Authorization", format!("Bearer {token}"))
             .send()
             .await;
@@ -1730,6 +1873,8 @@ impl YouTubeService {
             track_count: content["itemCount"].as_u64().unwrap_or(0) as u32,
             quality: None,
             released_at: None,
+            genre_id: None,
+            genre_name: None,
         }
     }
 
@@ -1909,6 +2054,8 @@ impl YouTubeService {
             track_count,
             quality: None,
             released_at: None,
+            genre_id: None,
+            genre_name: None,
         }
     }
 
@@ -2032,6 +2179,8 @@ impl YouTubeService {
                         track_count: 0,
                         quality: None,
                         released_at: None,
+                        genre_id: None,
+                        genre_name: None,
                     });
                 } else if !video_id.is_empty() {
                     tracks.push(StreamTrack {
@@ -2234,6 +2383,8 @@ impl YouTubeService {
                             track_count: 0,
                             quality: None,
                             released_at: None,
+                            genre_id: None,
+                            genre_name: None,
                         });
                     }
                 } else if section_type.contains("artist") {
@@ -2739,6 +2890,8 @@ impl YouTubeService {
             track_count: 0, // Set from tracks count
             quality: None,
             released_at: None,
+            genre_id: None,
+            genre_name: None,
         })
     }
 
@@ -2849,6 +3002,8 @@ impl YouTubeService {
                             track_count: 0,
                             quality: None,
                             released_at: None,
+                            genre_id: None,
+                            genre_name: None,
                         });
                     }
                 }
@@ -3076,6 +3231,8 @@ impl YouTubeService {
                             track_count: 0,
                             quality: None,
                             released_at: None,
+                            genre_id: None,
+                            genre_name: None,
                         });
                     }
                 }
@@ -3132,6 +3289,18 @@ fn artiste_de_chaine(chaine: &str) -> String {
         .to_string()
 }
 
+/// #8904 — essais seulement : l'URL que rend yt-dlp (`binaire`) pour
+/// `track_id`, par le même chemin que la lecture.
+#[doc(hidden)]
+pub async fn url_par_ytdlp_pour_essai(
+    binaire: &std::path::Path,
+    track_id: &str,
+) -> Result<String, String> {
+    extraire_par_ytdlp(binaire, track_id)
+        .await
+        .map(|flux| flux.url)
+}
+
 /// #6967 — l'URL du flux par yt-dlp (`ytdlp`, le binaire), servable : on
 /// ne rend la main qu'à l'instant où YouTube la sert.
 async fn extraire_par_ytdlp(
@@ -3142,7 +3311,8 @@ async fn extraire_par_ytdlp(
 
     let output = tokio::time::timeout(
         Duration::from_secs(YTDLP_TIMEOUT_SECS),
-        tokio::process::Command::new(ytdlp)
+        // #8904 — sans les variables du client OAuth de Tune.
+        crate::ytdlp::commande(ytdlp)
             .args([
                 // #6967 — Opus d'abord, AAC en repli : voir le sélecteur.
                 "-f",
@@ -3483,6 +3653,8 @@ impl StreamingService for YouTubeService {
         self.refresh_token = None;
         self.token_expires = None;
         self.email = None;
+        self.jeton_du_repli = false;
+        self.a_reconnecter = None;
         self.pending_device_auth = None;
         self.device_auth_started = None;
         self.ligne_a_ecraser = true;
@@ -4135,6 +4307,11 @@ impl StreamingService for YouTubeService {
         if let Some(ref email) = self.email {
             obj["email"] = json!(email);
         }
+        if (self.access_token.is_some() || self.refresh_token.is_some()) && !self.jeton_du_repli {
+            // #8904 — jeton émis par le client de Tune. Sans cette marque, la
+            // ligne est lue comme venue du client de repli retiré.
+            obj["client_oauth"] = json!(MARQUE_CLIENT_TUNE);
+        }
 
         // Persist pending device code so a server restart doesn't lose the flow
         if let Some(ref pending) = self.pending_device_auth
@@ -4146,6 +4323,7 @@ impl StreamingService for YouTubeService {
             obj["pending_verification_url"] = json!(pending.verification_url);
             obj["pending_interval"] = json!(pending.interval);
             obj["pending_elapsed_secs"] = json!(elapsed);
+            obj["pending_client_oauth"] = json!(MARQUE_CLIENT_TUNE);
         }
 
         Some(obj)
@@ -4162,12 +4340,26 @@ impl StreamingService for YouTubeService {
         if let Some(rt) = tokens["refresh_token"].as_str() {
             self.refresh_token = Some(rt.to_string());
         }
+        // #8904 — une ligne sans la marque du client de Tune date du client
+        // de repli retiré : le premier rafraîchissement l'effacera.
+        self.jeton_du_repli = (self.access_token.is_some() || self.refresh_token.is_some())
+            && tokens["client_oauth"].as_str() != Some(MARQUE_CLIENT_TUNE);
+        if self.jeton_du_repli {
+            warn!(
+                "youtube_jeton_du_client_de_repli_restaure : reconnexion au premier rafraîchissement"
+            );
+        }
         if let Some(email) = tokens["email"].as_str() {
             self.email = Some(email.to_string());
         }
 
-        // Restore pending device code flow if it hasn't expired
-        if let Some(dc) = tokens["pending_device_code"].as_str() {
+        // Restore pending device code flow if it hasn't expired. #8904 : un
+        // flux ouvert par le client de repli retiré (sans la marque) ou dans
+        // une version sans client de Tune ne se reprend pas.
+        if let Some(dc) = tokens["pending_device_code"].as_str()
+            && self.oauth.is_some()
+            && tokens["pending_client_oauth"].as_str() == Some(MARQUE_CLIENT_TUNE)
+        {
             let elapsed = tokens["pending_elapsed_secs"].as_u64().unwrap_or(0);
             // Device codes typically live 30 min; discard if > 25 min old.
             if elapsed < 1500 {
@@ -4199,7 +4391,19 @@ impl StreamingService for YouTubeService {
         has_tokens
     }
 
+    /// #8904 — les jetons ont été effacés et le compte est « à reconnecter » :
+    /// la ligne enregistrée ne vaut plus rien.
+    fn session_expired(&self) -> bool {
+        self.a_reconnecter.is_some() && self.access_token.is_none() && self.refresh_token.is_none()
+    }
+
     async fn post_restore(&mut self) {
+        // #8904 — un jeton du client de repli retiré, même sans jeton de
+        // rafraîchissement, n'est pas gardé.
+        if self.jeton_du_repli && self.refresh_token.is_none() {
+            self.passer_a_reconnecter(MESSAGE_RECONNEXION_REPLI);
+            return;
+        }
         // If we have a refresh token, eagerly refresh to validate the tokens.
         if self.refresh_token.is_some() && self.access_token.is_some() {
             match self.do_refresh_token().await {
@@ -4227,20 +4431,17 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    // #5247 — le client OAuth de Tune remplace le client TV public dès qu'il
-    // est configuré, et seulement s'il l'est entièrement.
+    // #5247, #8904 — le client OAuth de Tune est le SEUL : sans lui
+    // (entièrement configuré), aucun client, plus de repli.
     #[test]
-    fn client_oauth_repli_sans_configuration() {
-        let c = ClientOAuth::resoudre((None, None), (None, None));
-        assert!(c.repli);
-        assert_eq!(c.id, GOOGLE_CLIENT_ID);
-        assert_eq!(c.scope, GOOGLE_SCOPE);
+    fn client_oauth_absent_sans_configuration() {
+        assert_eq!(ClientOAuth::resoudre((None, None), (None, None)), None);
     }
 
     #[test]
     fn client_oauth_de_tune_en_lecture_seule() {
-        let c = ClientOAuth::resoudre((Some(" id-tune "), Some("secret-tune")), (None, None));
-        assert!(!c.repli);
+        let c = ClientOAuth::resoudre((Some(" id-tune "), Some("secret-tune")), (None, None))
+            .expect("client de Tune");
         assert_eq!(
             (c.id.as_str(), c.secret.as_str()),
             ("id-tune", "secret-tune")
@@ -4253,14 +4454,18 @@ mod tests {
         let c = ClientOAuth::resoudre(
             (Some("id-exec"), Some("secret-exec")),
             (Some("id-build"), Some("secret-build")),
-        );
+        )
+        .unwrap();
         assert_eq!(c.id, "id-exec");
         // Un identifiant d'exécution SANS secret ne casse pas le client de
         // compilation : il est ignoré.
-        let c = ClientOAuth::resoudre((Some("id-exec"), None), (Some("id-build"), Some("s")));
+        let c =
+            ClientOAuth::resoudre((Some("id-exec"), None), (Some("id-build"), Some("s"))).unwrap();
         assert_eq!(c.id, "id-build");
-        let c = ClientOAuth::resoudre((Some("id-exec"), Some("  ")), (None, None));
-        assert!(c.repli);
+        assert_eq!(
+            ClientOAuth::resoudre((Some("id-exec"), Some("  ")), (None, None)),
+            None
+        );
     }
 
     #[test]
@@ -4739,3 +4944,11 @@ mod opus_recherche_6967_tests;
 #[cfg(test)]
 #[path = "youtube_playlist_vl_8426_tests.rs"]
 mod playlist_vl_8426_tests;
+
+#[cfg(test)]
+#[path = "youtube_client_oauth_8904_tests.rs"]
+mod client_oauth_8904_tests;
+
+#[cfg(test)]
+#[path = "youtube_lecture_inactive_8913_tests.rs"]
+mod lecture_inactive_8913_tests;

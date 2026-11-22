@@ -45,6 +45,9 @@ fn app_with_plugin(state: &AppState, name: &str) -> axum::Router {
         state.clone(),
         vec![(name.to_string(), victim_router())],
     )
+    .layer(axum::extract::connect_info::MockConnectInfo(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+    ))
 }
 
 fn enable_auth(state: &AppState) {
@@ -345,13 +348,13 @@ async fn the_enabled_setting_keeps_a_plugin_out() {
     // L'Assistant IA (chantier assistant-ia), quand sa feature est compilée,
     // est chargé par défaut comme l'égaliseur gratuit : rien ne part tant
     // qu'aucune clé n'est posée.
-    let mut attendus = vec!["equalizer"];
+    let mut attendus = vec!["equalizer", "crossfeed"];
     if cfg!(feature = "assistant-ia") {
         attendus.push("assistant-ia");
     }
     assert_eq!(
         names, attendus,
-        "FREE EQ and the AI assistant load by default; the explicitly disabled injected plugin must stay absent"
+        "FREE EQ, simple crossfeed and the AI assistant load by default; the explicitly disabled injected plugin must stay absent"
     );
 }
 
@@ -370,8 +373,8 @@ async fn an_injected_plugin_loads_and_mounts_its_router() {
     mounts.sort_unstable();
     assert_eq!(
         mounts,
-        avec_assistant_ia(&["equalizer", "injected"]),
-        "FREE EQ, the AI assistant and the injected plugin each contribute their own router"
+        avec_assistant_ia(&["crossfeed", "equalizer", "injected"]),
+        "FREE EQ, simple crossfeed, the AI assistant and the injected plugin each contribute their own router"
     );
 
     let mut names: Vec<&str> = state
@@ -382,10 +385,18 @@ async fn an_injected_plugin_loads_and_mounts_its_router() {
         .map(|p| p.name.as_str())
         .collect();
     names.sort_unstable();
-    assert_eq!(names, avec_assistant_ia(&["equalizer", "injected"]));
+    assert_eq!(
+        names,
+        avec_assistant_ia(&["crossfeed", "equalizer", "injected"])
+    );
 
     // End to end: the router it registered actually serves, under its own name.
-    let app = tune_server::routes::router_with_plugins(state.clone(), routers);
+    let app = tune_server::routes::router_with_plugins(state.clone(), routers).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let (status, body) = body_of(&app, "/api/v1/ext/injected/ping").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "pong");
@@ -428,7 +439,12 @@ async fn rest_reports_only_plugins_that_actually_loaded() {
     );
 
     // And the REST view agrees.
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let (status, body) = body_of(&app, "/api/v1/plugins").await;
     assert_eq!(status, StatusCode::OK);
     let list: Value = serde_json::from_str(&body).unwrap();
@@ -512,7 +528,12 @@ async fn opt_in_plugin_is_listed_as_installable_not_loaded() {
         .expect("optin doit être proposé à l'installation");
     assert!(optin.opt_in);
 
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let (status, body) = body_of(&app, "/api/v1/plugins").await;
     assert_eq!(status, StatusCode::OK);
     let list: Value = serde_json::from_str(&body).unwrap();
@@ -564,7 +585,12 @@ async fn opt_in_plugin_loads_after_install() {
         "optin ne doit plus être dormant une fois installé (dormants : {dormant:?})"
     );
 
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let (_status, body) = body_of(&app, "/api/v1/plugins").await;
     let list: Value = serde_json::from_str(&body).unwrap();
     let entry = list
@@ -604,7 +630,12 @@ async fn activer_un_greffon_dormant_annonce_le_redemarrage() {
     let state = new_state();
     // Pas installé : `setup_all` le laisse dormant, il ne tourne pas.
     tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
 
     let (status, body) = post_json(&app, "/api/v1/plugins/optin/enable", "{}").await;
     assert_eq!(status, StatusCode::OK);
@@ -634,7 +665,12 @@ async fn reactiver_un_greffon_deja_charge_ne_demande_aucun_redemarrage() {
         .set("plugin_optin_installed", "true")
         .unwrap();
     tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
 
     let (status, body) = post_json(&app, "/api/v1/plugins/optin/enable", "{}").await;
     assert_eq!(status, StatusCode::OK);
@@ -655,7 +691,12 @@ async fn desactiver_un_greffon_charge_annonce_le_redemarrage() {
         .set("plugin_optin_installed", "true")
         .unwrap();
     tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
 
     let (status, body) = post_json(&app, "/api/v1/plugins/optin/disable", "{}").await;
     assert_eq!(status, StatusCode::OK);
@@ -686,7 +727,12 @@ async fn la_fiche_d_un_greffon_installe_non_charge_annonce_le_redemarrage() {
         .set("plugin_optin_installed", "true")
         .unwrap();
 
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let (_status, body) = body_of(&app, "/api/v1/plugins").await;
     let list: Value = serde_json::from_str(&body).unwrap();
     let entry = list
@@ -720,7 +766,12 @@ async fn dj_is_not_offered_in_the_plugin_manager() {
     let state = new_state();
     tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
 
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let (status, body) = body_of(&app, "/api/v1/plugins").await;
     assert_eq!(status, StatusCode::OK);
     let list: Value = serde_json::from_str(&body).unwrap();
@@ -762,7 +813,12 @@ async fn uncatalogued_dj_still_loads_when_installed_by_hand() {
         routers.iter().map(|(n, _)| n).collect::<Vec<_>>()
     );
 
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let (_status, body) = body_of(&app, "/api/v1/plugins").await;
     let list: Value = serde_json::from_str(&body).unwrap();
     let entry = list
@@ -822,7 +878,12 @@ async fn un_nom_de_greffon_inconnu_n_ecrit_rien_et_le_dit() {
 
     let state = new_state();
     tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
 
     let (status, body) = post_json(&app, "/api/v1/plugins/lyrics/install", "{}").await;
     assert_eq!(
@@ -848,7 +909,12 @@ async fn la_mise_a_jour_refuse_aussi_un_nom_inconnu() {
 
     let state = new_state();
     tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
 
     let (status, body) = post_json(&app, "/api/v1/plugins/karaoke-python/update", "{}").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "corps : {body}");
@@ -867,7 +933,12 @@ async fn un_greffon_compile_s_installe_toujours() {
 
     let state = new_state();
     tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
 
     let (status, body) = post_json(&app, "/api/v1/plugins/optin/install", "{}").await;
     assert_eq!(status, StatusCode::OK, "corps : {body}");
@@ -908,7 +979,12 @@ async fn un_greffon_hors_catalogue_reste_installable_par_son_nom() {
          (chargés : {charges:?}, proposés : {proposes:?})"
     );
 
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let (status, body) = post_json(&app, "/api/v1/plugins/horscatalogue/install", "{}").await;
     assert_eq!(
         status,
@@ -1004,7 +1080,12 @@ async fn le_gestionnaire_ne_propose_plus_les_fiches_de_l_ere_python() {
     tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(Uncatalogued)]).await;
     semer_les_fiches_heritees(&state);
 
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let (status, body) = body_of(&app, "/api/v1/plugins").await;
     assert_eq!(status, StatusCode::OK);
     let liste: Value = serde_json::from_str(&body).unwrap();
@@ -1086,7 +1167,12 @@ async fn aucune_fiche_de_la_liste_ne_sort_sans_compatible() {
     // celle qui ressort de la clef de réglages `plugins` (#2132).
     semer_les_fiches_heritees(&state);
 
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let (status, body) = body_of(&app, "/api/v1/plugins").await;
     assert_eq!(status, StatusCode::OK);
     let liste: Value = serde_json::from_str(&body).unwrap();
@@ -1134,7 +1220,12 @@ async fn la_liste_n_annonce_plus_xtune_4908() {
     tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(Loads)]).await;
     semer_les_fiches_heritees(&state);
 
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let (status, body) = body_of(&app, "/api/v1/plugins").await;
     assert_eq!(status, StatusCode::OK);
     let liste: Value = serde_json::from_str(&body).unwrap();
@@ -1166,7 +1257,12 @@ async fn la_fiche_unitaire_porte_aussi_compatible() {
     let state = new_state();
     tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(Loads)]).await;
 
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
 
     // Chargé.
     let (status, body) = body_of(&app, "/api/v1/plugins/loads").await;
@@ -1195,7 +1291,12 @@ async fn l_alias_system_plugins_trie_comme_la_liste() {
     tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(Uncatalogued)]).await;
     semer_les_fiches_heritees(&state);
 
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let (status, body) = body_of(&app, "/api/v1/system/plugins").await;
     assert_eq!(status, StatusCode::OK);
     let liste: Value = serde_json::from_str(&body).unwrap();
@@ -1232,7 +1333,12 @@ async fn une_fiche_installee_avant_le_garde_fou_est_dite_indisponible() {
     settings.set("plugin_lyrics_enabled", "true").unwrap();
     tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![Box::new(OptIn)]).await;
 
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let (status, body) = body_of(&app, "/api/v1/plugins/lyrics").await;
     assert_eq!(status, StatusCode::OK);
     let fiche: Value = serde_json::from_str(&body).unwrap();
@@ -1276,7 +1382,12 @@ async fn un_greffon_reel_en_attente_de_redemarrage_reste_installe() {
     settings.set("plugin_optin_installed", "true").unwrap();
     settings.set("plugin_optin_enabled", "true").unwrap();
 
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let (status, body) = body_of(&app, "/api/v1/plugins/optin").await;
     assert_eq!(status, StatusCode::OK);
     let fiche: Value = serde_json::from_str(&body).unwrap();
@@ -1293,7 +1404,12 @@ async fn i4265_fiche_absente_et_installation_portent_le_meme_motif() {
     use_scratch_plugin_data_dir();
     let state = new_state();
     tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let mut noms = vec!["absent_i4265"];
     if !cfg!(feature = "bandcamp") {
         noms.push("bandcamp");
@@ -1342,7 +1458,12 @@ async fn i4265_les_reglages_herites_ne_rendent_pas_un_absent_compatible() {
             )
             .unwrap();
         let avant = reglages_d_installation(&state, "absent_i4265");
-        let app = tune_server::routes::router(state.clone());
+        let app = tune_server::routes::router(state.clone()).layer(
+            axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                50000,
+            ))),
+        );
         let (_, body) = body_of(&app, "/api/v1/plugins/absent_i4265").await;
         let fiche: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(
@@ -1367,7 +1488,10 @@ async fn i4265_les_greffons_charges_et_dormants_restent_compatibles() {
         vec![Box::new(Loads), Box::new(OptIn)],
     )
     .await;
-    let app = tune_server::routes::router(state);
+    let app =
+        tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+        ));
     for (nom, attendu) in [("loads", "loaded"), ("optin", "not_installed")] {
         let (status, body) = body_of(&app, &format!("/api/v1/plugins/{nom}")).await;
         assert_eq!(status, StatusCode::OK);

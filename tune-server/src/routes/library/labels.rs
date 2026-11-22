@@ -1580,6 +1580,8 @@ mod tests {
             track_count: 1,
             quality: None,
             released_at: None,
+            genre_id: None,
+            genre_name: None,
         }
     }
 

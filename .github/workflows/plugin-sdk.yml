@@ -42,8 +42,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+        os: ${{ fromJSON(vars.SANS_WINDOWS == '1' && '["ubuntu-latest","macos-latest"]' || '["ubuntu-latest","macos-latest","windows-latest"]') }}
+    runs-on: ${{ (startsWith(matrix.os, 'ubuntu-') && fromJSON(vars.RUNNER_LINUX || toJSON(matrix.os))) || (matrix.os == 'macos-latest' && fromJSON(vars.RUNNER_MACOS || '"macos-latest"')) || matrix.os }}
     timeout-minutes: 25
     env:
       CARGO_TARGET_DIR: ${{ github.workspace }}/sdk/target

@@ -268,7 +268,7 @@ impl RelayClient {
             let mut attempt: u32 = 0;
             loop {
                 info!(
-                    relay_url = %client.relay_url,
+                    relay_url = %crate::confidentialite::masquer_url(&client.relay_url),
                     server_id = %client.server_id,
                     attempt = attempt,
                     "connecting to relay"
@@ -928,6 +928,13 @@ pub(crate) async fn pomper_le_flux(
     if let Some(ua) = user_agent {
         req = req.header("user-agent", ua);
     }
+    // #8963 — un flux `/stream/…` tiré par le pont le dit, comme l'écoute
+    // directe : sa session retient alors toute la piste, que le relais pousse
+    // bien plus vite que le téléphone ne la lit. Pas sur la piste d'un cercle
+    // (`/api/v1/…/audio`) : la marque y changerait le contrôle d'accès.
+    if chemin_de_flux_racine(url) {
+        req = req.header(ENTETE_RELAIS, "1");
+    }
 
     // Un serveur local qui ne répond pas ne retient pas la tâche indéfiniment.
     let envoi = match tokio::time::timeout(flux.patience, req.send()).await {
@@ -1025,6 +1032,13 @@ pub(crate) async fn pomper_le_flux(
             }
         }
     }
+}
+
+/// `http://hôte:port/stream/…` : le corps d'une piste servi à la racine.
+pub(crate) fn chemin_de_flux_racine(url: &str) -> bool {
+    url.split_once("://")
+        .and_then(|(_, reste)| reste.split_once('/'))
+        .is_some_and(|(_, chemin)| chemin.starts_with("stream/"))
 }
 
 /// Emet une trame vers le relais SANS retenir le verrou du canal pendant
@@ -3050,6 +3064,71 @@ mod nom_annonce_7044_tests {
         assert_eq!(
             choisir_le_nom(Some("   "), "MacBook-Pro".into()),
             "MacBook-Pro"
+        );
+    }
+}
+
+/// #8963 — un flux `/stream/…` tiré par le pont porte la marque du pont ; la
+/// piste d'un cercle (`/api/v1/…/audio`) ne la porte pas.
+#[cfg(test)]
+mod marque_du_pont_sur_les_flux_8963 {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn seul_le_chemin_stream_a_la_racine_compte() {
+        assert!(chemin_de_flux_racine(
+            "http://127.0.0.1:8888/stream/abc.wav"
+        ));
+        assert!(chemin_de_flux_racine("http://127.0.0.1:8888/stream/abc"));
+        assert!(!chemin_de_flux_racine(
+            "http://127.0.0.1:8888/api/v1/library/tracks/42/audio"
+        ));
+        assert!(!chemin_de_flux_racine(
+            "http://127.0.0.1:8888/api/v1/stream/x"
+        ));
+        assert!(!chemin_de_flux_racine("http://127.0.0.1:8888/streamx"));
+        assert!(!chemin_de_flux_racine("pas une url"));
+    }
+
+    /// Rend les en-têtes de la requête reçue, en minuscules.
+    async fn requete_recue(chemin: &str) -> String {
+        let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = ecoute.local_addr().unwrap().port();
+        let serveur = tokio::spawn(async move {
+            let (mut s, _) = ecoute.accept().await.unwrap();
+            let mut brut = vec![0u8; 8192];
+            let n = s.read(&mut brut).await.unwrap();
+            let _ = s
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                .await;
+            String::from_utf8_lossy(&brut[..n]).to_ascii_lowercase()
+        });
+        let (tx, mut rx) = mpsc::channel::<Trame>(64);
+        let ws_tx = Arc::new(tokio::sync::Mutex::new(Some(tx)));
+        let sans_vrac = Arc::new(tokio::sync::Mutex::new(None));
+        let flux = client_de_flux(Duration::from_secs(5));
+        let url = format!("http://127.0.0.1:{port}{chemin}");
+        let _ = pomper_le_flux(&flux, &url, None, None, "t", &ws_tx, &sans_vrac).await;
+        while rx.try_recv().is_ok() {}
+        serveur.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn le_flux_d_une_zone_porte_la_marque_du_pont() {
+        let r = requete_recue("/stream/abc.wav").await;
+        assert!(
+            r.contains(&format!("{ENTETE_RELAIS}: 1")),
+            "la session ne saurait pas qu'elle est tirée par le pont : {r}"
+        );
+    }
+
+    #[tokio::test]
+    async fn la_piste_d_un_cercle_ne_porte_pas_la_marque() {
+        let r = requete_recue("/api/v1/library/tracks/42/audio").await;
+        assert!(
+            !r.contains(ENTETE_RELAIS),
+            "la marque changerait le contrôle d'accès de l'API : {r}"
         );
     }
 }

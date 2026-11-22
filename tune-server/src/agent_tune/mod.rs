@@ -181,6 +181,10 @@ pub struct EtatSortieDistante {
     /// a été reprise sur place — l'état est alors rendu « arrêté ».
     pub tenue: bool,
     pub statut: tune_core::outputs::traits::OutputStatus,
+    /// #8825 — le maître doit recréer le flux à la position conservée.
+    /// Un agent plus ancien ne publie pas ce champ.
+    #[serde(default)]
+    pub peripherique_rendu_en_pause: bool,
 }
 
 /// L'identité de ce serveur : un identifiant stable, créé au premier besoin,

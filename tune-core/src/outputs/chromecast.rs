@@ -876,7 +876,7 @@ impl OutputTarget for ChromecastOutput {
                     .map(|age| age.as_millis());
                 info!(
                     device = %name,
-                    url,
+                    url = %crate::confidentialite::masquer_url(&url),
                     session_reused,
                     raison,
                     depuis_arret_ms = ?depuis_arret_ms,
@@ -1286,7 +1286,7 @@ impl OutputTarget for ChromecastOutput {
             if erreur_nouvelle {
                 tracing::warn!(
                     device = %name,
-                    url = current_uri.as_deref().unwrap_or(""),
+                    url = %crate::confidentialite::masquer_url(&current_uri.as_deref().unwrap_or("")),
                     media_session_id = entry.media_session_id,
                     "chromecast_media_error"
                 );

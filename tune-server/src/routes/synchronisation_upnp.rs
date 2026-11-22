@@ -334,7 +334,7 @@ pub async fn act(State(state): State<AppState>, Json(request): Json<Action>) -> 
                     )),
                 ));
             }
-            let removed = hors_executeur(&state, &source, |db, s| remove_missing(db, s, true))
+            let removed = retirer_et_prevenir(&state, &source, true)
                 .await
                 .map_err(error)?;
             source.report["supprimees"] = json!(removed);
@@ -370,6 +370,24 @@ async fn hors_executeur<T: Send + 'static>(
     tokio::task::spawn_blocking(move || f(db.as_ref(), &source))
         .await
         .map_err(|e| format!("tâche de synchronisation perdue : {e}"))?
+}
+
+/// #8832 — invalider les vues seulement après le retrait effectivement validé.
+/// Confirmation et synchronisation automatique passent par le même chemin.
+async fn retirer_et_prevenir(
+    state: &AppState,
+    source: &Source,
+    confirme: bool,
+) -> Result<usize, String> {
+    let removed =
+        hors_executeur(state, source, move |db, s| remove_missing(db, s, confirme)).await?;
+    if removed > 0 {
+        state.event_bus.emit_typed(
+            tune_core::event_types::EventType::LibraryUpdated,
+            json!({"source": "upnp", "source_key": source.key, "removed": removed}),
+        );
+    }
+    Ok(removed)
 }
 
 fn member_ids(tx: &dyn DbTxHandle, key: &str) -> Result<Vec<i64>, String> {
@@ -653,9 +671,8 @@ async fn run_one(state: AppState, key: String) {
             {
                 source.status = "confirmation".into();
             } else {
-                source.report["supprimees"] = json!(
-                    hors_executeur(&state, &source, |db, s| remove_missing(db, s, false)).await?
-                );
+                source.report["supprimees"] =
+                    json!(retirer_et_prevenir(&state, &source, false).await?);
                 source.pending.clear();
                 source.status = "ready".into();
             }
@@ -812,3 +829,7 @@ mod identites_upnp_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "piste_upnp_disparue_8832_tests.rs"]
+mod piste_upnp_disparue_8832_tests;

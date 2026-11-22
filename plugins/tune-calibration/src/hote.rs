@@ -54,6 +54,12 @@ pub trait HoteZone: Send + Sync {
     /// Arrête la zone, comme le bouton Stop.
     fn arreter(&self, zone_id: i64);
     fn traitements(&self, zone_id: i64) -> TraitementsDeZone;
+    /// #9066 — le type de sortie de la zone (`local`, `dlna`, `airplay`…),
+    /// pour dire clairement qu'une sortie réseau ne se mesure pas. `None` :
+    /// inconnu.
+    fn type_de_sortie(&self, _zone_id: i64) -> Option<String> {
+        None
+    }
     /// Enregistre le profil de pièce de la zone (`room_profile_{zone}`, C2) :
     /// il ne touche pas au son tant qu'on ne l'applique pas par
     /// `POST /room-correction/profiles/{zone}/apply`.
@@ -171,6 +177,14 @@ impl HoteZone for HoteOrchestrateur {
             pure,
             volume_fixe,
         }
+    }
+
+    fn type_de_sortie(&self, zone_id: i64) -> Option<String> {
+        ZoneRepo::with_backend(self.backend.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .and_then(|z| z.output_type)
     }
 
     fn enregistrer_profil_piece(&self, profil: &RoomProfile) -> Result<(), String> {

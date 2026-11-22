@@ -702,6 +702,7 @@ pub(super) async fn passe(State(state): State<AppState>) -> Json<Value> {
 
 /// Au démarrage : une passe quinze minutes après, puis toutes les six heures,
 /// tant que Qobuz est connecté.
+#[cfg_attr(feature = "sans-enrichissement", allow(dead_code))]
 pub(crate) fn armer_la_passe(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {

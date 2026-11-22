@@ -56,6 +56,10 @@ use tower::ServiceExt;
 
 fn app() -> axum::Router {
     let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    // La cible existe : ce témoin mesure le contrat suivant, pas une piste disparue.
+    state.backend.execute_batch(
+        "INSERT INTO tracks (id, title, file_path, source, duration_ms, format) VALUES (1, 'Piste synthétique 1', '/fixture-8832/1.flac', 'local', 300000, 'flac'), (2, 'Piste synthétique 2', '/fixture-8832/2.flac', 'local', 300000, 'flac'), (3, 'Piste synthétique 3', '/fixture-8832/3.flac', 'local', 300000, 'flac');"
+    ).expect("pistes synthétiques sans fichier audio");
     tune_server::routes::router(state)
 }
 

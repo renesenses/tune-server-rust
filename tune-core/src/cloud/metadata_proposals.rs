@@ -340,7 +340,8 @@ pub fn spawn(backend: Arc<dyn DbBackend>, license: Arc<crate::license::LicenseMa
             if license.is_premium().await {
                 let settings = SettingsRepo::with_backend(backend.clone());
                 let server_id = settings.get("server_id").ok().flatten().unwrap_or_default();
-                let token = settings.get("mozaik_access_token").ok().flatten();
+                // #8797 : rien ne part après un refus de la session.
+                let token = crate::cloud::sso::jeton_de_compte(&settings);
 
                 if let (Some(token), false) = (token, server_id.is_empty()) {
                     let now = chrono::Utc::now().to_rfc3339();

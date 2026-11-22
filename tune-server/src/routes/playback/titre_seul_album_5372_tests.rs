@@ -223,6 +223,9 @@ async fn un_titre_deja_en_file_ne_relit_pas_son_album() {
         .append(
             zid,
             &[QueueInput::Streaming {
+                media_format: None,
+                sample_rate: None,
+                bit_depth: None,
                 source: "qobuz".into(),
                 source_id: "t3".into(),
                 title: "Titre 3".into(),

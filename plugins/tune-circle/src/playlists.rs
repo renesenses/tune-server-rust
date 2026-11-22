@@ -763,6 +763,9 @@ fn en_file(trouvee: &Trouvee) -> Option<QueueInput> {
             piste.id.map(|track_id| QueueInput::Local { track_id })
         }
         Trouvee::Service { service, piste, .. } => Some(QueueInput::Streaming {
+            media_format: None,
+            sample_rate: None,
+            bit_depth: None,
             source: service.clone(),
             source_id: piste.id.clone(),
             title: piste.title.clone(),

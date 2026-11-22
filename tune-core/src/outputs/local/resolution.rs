@@ -358,6 +358,55 @@ pub(super) fn enumerer_les_candidates(
         .unzip()
 }
 
+/// #8171 — les endpoints WASAPI tels que la découverte les NOMME (puits
+/// écartés, rangs `(n)` posés par [`disambiguate_display_name`]), sans sonder
+/// leurs formats : `(nom, identifiant d'endpoint, hôte)`.
+///
+/// C'est l'énumération à la demande d'une zone locale qu'on allait refuser
+/// (`orchestrator::reenumeration_avant_refus`). Elle lit ce que lit déjà
+/// chaque ouverture partagée ([`find_device_with_fallback`]) : la liste des
+/// endpoints, leur nom et leur identifiant — ni `supported_output_configs`, ni
+/// pilote ASIO. Elle peut donc tourner pendant qu'une autre sortie joue, ce
+/// que l'énumération complète ne peut pas (DEvir).
+///
+/// Sous Windows, la découverte ne fusionne aucun homonyme (voir `parc.rs`,
+/// branche `not(target_os = "linux")`) : les rangs calculés ici sont ceux
+/// qu'elle a stockés dans les zones. Hors Windows : liste vide, la règle ne
+/// s'y applique pas.
+pub fn sorties_wasapi_sans_sonder() -> Vec<(String, String, String)> {
+    #[cfg(target_os = "windows")]
+    {
+        let Ok(host) = cpal::host_from_id(cpal::HostId::Wasapi) else {
+            return Vec::new();
+        };
+        let (_, identites) = enumerer_les_candidates(&host);
+        nommer_comme_la_decouverte(&identites)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        Vec::new()
+    }
+}
+
+/// Les noms d'affichage que la découverte aurait donnés à ces identités, dans
+/// leur ordre : la même convention `(n)`, en un seul endroit.
+#[cfg_attr(not(any(test, target_os = "windows")), allow(dead_code))]
+pub(super) fn nommer_comme_la_decouverte(
+    identites: &[DeviceIdentity],
+) -> Vec<(String, String, String)> {
+    let mut vus = std::collections::HashSet::new();
+    identites
+        .iter()
+        .map(|identite| {
+            (
+                disambiguate_display_name(&identite.raw_name, &mut vus),
+                identite.endpoint_id.clone(),
+                identite.host.clone(),
+            )
+        })
+        .collect()
+}
+
 /// #8173 — une zone locale est disponible EXACTEMENT quand l'ouverture
 /// retrouverait son périphérique, et indisponible sinon.
 ///
@@ -396,15 +445,45 @@ pub(super) fn zone_locale_disponible(
     open_host: &str,
     candidates: &[DeviceIdentity],
 ) -> bool {
-    matches!(
-        resolve_device(
-            requested,
-            requested_endpoint_id,
-            requested_host,
-            open_host,
-            candidates
-        ),
-        DeviceResolution::Matched(_)
+    match resolve_device(
+        requested,
+        requested_endpoint_id,
+        requested_host,
+        open_host,
+        candidates,
+    ) {
+        // #8171 — la même règle que l'ouverture : un homonyme ne rend pas la
+        // zone disponible.
+        DeviceResolution::Matched(matched) => {
+            !homonyme_d_un_autre_endpoint(matched, requested_endpoint_id, candidates)
+        }
+        _ => false,
+    }
+}
+
+/// #8171 — sous la conduite Windows (refus), un appariement par NOM qui mène
+/// à un autre endpoint WASAPI que celui de la zone, absent, est refusé.
+/// L'appariement par identifiant (`DeviceMatch::ByEndpointId`) reste souverain.
+fn homonyme_d_un_autre_endpoint(
+    matched: DeviceMatch,
+    endpoint_de_la_zone: Option<&str>,
+    candidates: &[DeviceIdentity],
+) -> bool {
+    if matches!(matched, DeviceMatch::ByEndpointId(_)) {
+        return false;
+    }
+    if crate::outputs::peripherique_introuvable::conduite_si_introuvable(std::env::consts::OS)
+        != crate::outputs::peripherique_introuvable::ConduiteSiIntrouvable::Refuser
+    {
+        return false;
+    }
+    let Some(retenue) = candidates.get(matched.index()) else {
+        return false;
+    };
+    crate::outputs::peripherique_introuvable::le_nom_designe_un_autre_endpoint(
+        endpoint_de_la_zone,
+        &retenue.endpoint_id,
+        candidates.iter().map(|c| c.endpoint_id.as_str()),
     )
 }
 
@@ -498,6 +577,35 @@ pub(super) fn find_device_with_fallback(
 
     if let DeviceResolution::Matched(matched) = resolution {
         let index = matched.index();
+        // #8171 (retour rc12) — un homonyme n'est pas l'appareil de la zone.
+        // Voir `le_nom_designe_un_autre_endpoint` : DAC éteint, son nom
+        // « Haut-parleurs » ne mène plus qu'à la carte du PC.
+        if homonyme_d_un_autre_endpoint(matched, endpoint_id, &identities) {
+            let available: Vec<String> = identities
+                .iter()
+                .map(|identity| format!("{} [{}]", identity.raw_name, identity.endpoint_id))
+                .collect();
+            warn!(
+                requested = %device_name,
+                requested_endpoint_id = endpoint_id.unwrap_or("<aucun>"),
+                homonyme = %identities[index].raw_name,
+                homonyme_endpoint_id = %identities[index].endpoint_id,
+                open_host = %open_host,
+                available = ?available,
+                fallback_reason = LocalDeviceFallback::NotFoundRefused.code(),
+                "audio_device_name_now_designates_another_endpoint_refused — \
+                 the zone's endpoint is absent and its name now designates another \
+                 device; refusing to play there"
+            );
+            note_device_outcome(
+                observed_backend_name(),
+                device_name,
+                "",
+                None,
+                Some(LocalDeviceFallback::NotFoundRefused),
+            );
+            return None;
+        }
         if let DeviceMatch::ByAlsaHardwarePcm { greffon, .. } = matched {
             // Une décision qui change ce qui sera OUVERT ne passe jamais en
             // silence (#3209, #1655). Même famille de marqueur que la

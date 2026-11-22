@@ -19,6 +19,10 @@ ignore = [
     # instant 0.1 — unmaintained (RUSTSEC-2024-0384), superseded by web-time.
     # Transitive only. No vulnerability; a native build never hits its wasm path.
     "RUSTSEC-2024-0384",
+    # chrono 0.4.45 - non maintenu (RUSTSEC-2026-0543, publie le 17/11/2026).
+    # Informatif, aucune version corrigee ; dependance directe du workspace.
+    # Migration vers jiff/time a planifier. Voir .cargo/audit.toml.
+    "RUSTSEC-2026-0543",
     # RETIRÉ (#2251) — audiopus_sys 0.2.2 / RUSTSEC-2026-0150 : la dépendance
     # n'existe plus. `tune-core` passe désormais par `opus 0.4.0` (liaison sûre)
     # au-dessus d'`opusic-sys 0.7.5`, qui embarque libopus 1.6.1 ; les deux sont

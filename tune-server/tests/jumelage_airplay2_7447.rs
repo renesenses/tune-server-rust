@@ -295,10 +295,13 @@ async fn un_appareil_servi_en_airplay1_dit_pourquoi_il_ne_peut_etre_jumele_7447(
 
 #[tokio::test]
 async fn une_zone_se_cree_sur_un_recepteur_airplay2_decouvert_7447() {
-    let dossier = tune_core::test_scratch::scratch_dir("tune-7447-zone");
-    let app = tune_server::routes::router(etat_avec_airplay2(&dossier).await);
-
+    // Un serveur neuf par genre : depuis #8987, une seconde « Nouvelle zone »
+    // sur le MÊME appareil est refusée en 409 `zone_existe_deja` (décision
+    // de Bertrand). Ce témoin ne mesurait la seconde création que grâce au
+    // 200 silencieux qui rendait la zone du premier tour.
     for (nom, genre) in [("Salon témoin", "airplay2"), ("Bureau témoin", "airplay")] {
+        let dossier = tune_core::test_scratch::scratch_dir(&format!("tune-7447-zone-{genre}"));
+        let app = tune_server::routes::router(etat_avec_airplay2(&dossier).await);
         let (statut, corps) = appeler(
             &app,
             "POST",
@@ -311,5 +314,16 @@ async fn une_zone_se_cree_sur_un_recepteur_airplay2_decouvert_7447() {
             "la zone {genre} sur {APPAREIL} doit se créer : {statut} {corps}"
         );
         assert!(corps["id"].as_i64().is_some(), "{corps}");
+        // Et la seconde demande sur ce même appareil le dit, en nommant la zone.
+        let (statut, refus) = appeler(
+            &app,
+            "POST",
+            "/api/v1/zones",
+            Some(json!({"name": "Doublon", "output_type": genre, "output_device_id": APPAREIL})),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::CONFLICT, "{refus}");
+        assert_eq!(refus["code"], "zone_existe_deja", "{refus}");
+        assert_eq!(refus["zone_id"], corps["id"], "{refus}");
     }
 }

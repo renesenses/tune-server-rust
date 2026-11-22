@@ -487,7 +487,12 @@ async fn list_plugins_brut(state: &AppState) -> Vec<Value> {
             // redémarrage est un FAIT de cette ligne, pas une supposition de
             // l'écran. Sans lui, deux fiches dans le même état répondaient
             // différemment selon leur nature, et seule la wasm le disait.
-            "restart_required": installed,
+            //
+            // #9151 — sauf pour un emplacement audio intégré : ses routes et
+            // la chaîne audio lisent ses réglages à chaque appel, il agit dès
+            // l'installation (`premium_audio_plugins::agit_sans_redemarrage`).
+            "restart_required": installed
+                && !crate::premium_audio_plugins::agit_sans_redemarrage(&info.name),
             // Dormant, mais compilé dans CE binaire : c'est exactement la
             // fiche sur laquelle l'écran doit proposer « Installer ». La dire
             // incompatible grisait le seul bouton qui la rende utile.
@@ -898,7 +903,7 @@ async fn get_plugin_brut(name: String, state: AppState) -> Json<Value> {
 /// `state.wasm_plugins`, le même que lit `loaded` dans `GET /plugins`. Sans
 /// lui, `enable` d'un wasm qui tourne réclamait un redémarrage inutile, et
 /// `disable` taisait celui qu'il faut pour le décharger (#5112).
-fn greffon_charge(state: &AppState, name: &str) -> bool {
+pub(crate) fn greffon_charge(state: &AppState, name: &str) -> bool {
     plugin_snapshot(state).iter().any(|p| p.name == name)
         || setup_report_snapshot(state)
             .loaded_after_retry
@@ -944,6 +949,7 @@ fn wasm_charge(_state: &AppState, _name: &str) -> bool {
 /// greffon déjà absent, ne demande aucun redémarrage — et le prétendre
 /// enverrait couper la musique pour rien.
 async fn enable_plugin(
+    _garde: crate::auth::AdminOuCetteMachine,
     Path(name): Path<String>,
     State(state): State<AppState>,
 ) -> axum::response::Response {
@@ -954,7 +960,8 @@ async fn enable_plugin(
     let key = format!("plugin_{name}_enabled");
     settings.set(&key, "true").ok();
     crate::plugins::demasquer_greffon(&settings, &name);
-    let restart_required = !greffon_charge(&state, &name);
+    let restart_required = !greffon_charge(&state, &name)
+        && !crate::premium_audio_plugins::agit_sans_redemarrage(&name);
     Json(json!({ "name": name, "enabled": true, "restart_required": restart_required }))
         .into_response()
 }
@@ -962,13 +969,18 @@ async fn enable_plugin(
 /// Le pendant de [`enable_plugin`] : un greffon qui tourne continue de tourner
 /// jusqu'au prochain démarrage, ses routes montées et son abonnement au bus
 /// actif. Le dire est la même dette que ci-dessus.
-async fn disable_plugin(Path(name): Path<String>, State(state): State<AppState>) -> Json<Value> {
+async fn disable_plugin(
+    _garde: crate::auth::AdminOuCetteMachine,
+    Path(name): Path<String>,
+    State(state): State<AppState>,
+) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     // Choix explicite : le retour du Premium ne doit pas l'annuler (#4861).
     tune_core::audio::premium_plugins::forget_withheld(&settings, &name).ok();
     let key = format!("plugin_{name}_enabled");
     settings.set(&key, "false").ok();
-    let restart_required = greffon_charge(&state, &name);
+    let restart_required = greffon_charge(&state, &name)
+        && !crate::premium_audio_plugins::agit_sans_redemarrage(&name);
     Json(json!({ "name": name, "enabled": false, "restart_required": restart_required }))
 }
 
@@ -1045,7 +1057,12 @@ fn greffon_inconnu(name: &str) -> axum::response::Response {
         .into_response()
 }
 
+/// Installer, mettre à jour, activer, désactiver ou retirer un greffon
+/// change le code que le serveur exécute : garde `AdminOuCetteMachine`
+/// (administrateur, ou authentification coupée : seulement depuis cette
+/// machine), comme les installations de la boutique.
 async fn install_plugin(
+    _garde: crate::auth::AdminOuCetteMachine,
     Path(name): Path<String>,
     State(state): State<AppState>,
     Json(_body): Json<InstallRequest>,
@@ -1074,10 +1091,15 @@ async fn install_plugin(
     settings.set(&enabled_key, "true").ok();
     // A shipped plugin uninstalled earlier comes back.
     crate::plugins::demasquer_greffon(&settings, &name);
-    Json(json!({ "name": name, "status": "installed", "restart_required": true })).into_response()
+    // #9151 — un emplacement audio intégré (upsampler, channel-remap…) agit
+    // dès maintenant : ses portes lisent les deux réglages posés ci-dessus.
+    let restart_required = !crate::premium_audio_plugins::agit_sans_redemarrage(&name);
+    Json(json!({ "name": name, "status": "installed", "restart_required": restart_required }))
+        .into_response()
 }
 
 async fn update_plugin(
+    _garde: crate::auth::AdminOuCetteMachine,
     Path(name): Path<String>,
     State(state): State<AppState>,
 ) -> axum::response::Response {
@@ -1133,13 +1155,15 @@ pub(crate) fn desinstaller_natif(
         "disabled": true,
         // Il tourne jusqu'au prochain démarrage ; s'il ne tourne déjà plus,
         // rien à redémarrer.
-        "restart_required": greffon_charge(state, name),
+        "restart_required": greffon_charge(state, name)
+            && !crate::premium_audio_plugins::agit_sans_redemarrage(name),
         "message": crate::i18n::t(lang, "plugin.uninstall.native_disabled"),
     }))
     .into_response()
 }
 
 async fn delete_plugin(
+    _garde: crate::auth::AdminOuCetteMachine,
     Path(name): Path<String>,
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1164,7 +1188,10 @@ async fn delete_plugin(
     // A compiled-in plugin (DJ/Karaoke) has no dir to remove, but if it was
     // installed it is loaded and running now — the startup gate only drops it
     // next boot, so a restart is still required.
-    let was_installed = settings.get(&key).ok().flatten().as_deref() == Some("true");
+    // #9151 — un emplacement audio intégré, lui, s'arrête sur-le-champ : ses
+    // portes relisent les clés effacées ci-dessous.
+    let was_installed = settings.get(&key).ok().flatten().as_deref() == Some("true")
+        && !crate::premium_audio_plugins::agit_sans_redemarrage(&name);
     // Choix explicite : le retour du Premium ne doit pas l'annuler (#4861).
     tune_core::audio::premium_plugins::forget_withheld(&settings, &name).ok();
     settings.delete(&key).ok();

@@ -639,6 +639,80 @@ fn borne_valide(max_limit: Option<i64>) -> Result<Option<i64>, AppError> {
     }
 }
 
+/// Code stable du refus « nom déjà pris » (forum, 21/11/2026 : « Bug
+/// collections intelligentes, erreur peut-être liée au nom de plus de 3
+/// mots »). Le client le traduit (`erreursServeur.smart_collection_name_taken`).
+pub(crate) const CODE_NOM_PRIS: &str = "smart_collection_name_taken";
+
+/// Le refus « nom déjà pris » : un 409, jamais un 500.
+///
+/// 🔴 LE DÉFAUT. SQLite porte `idx_smart_collections_name` (migration 49,
+/// `dedupe_smart_collections_unique_name`), un index UNIQUE sur `name`. La
+/// création d'une collection sous un nom déjà pris remontait la violation
+/// telle quelle (`internal_error`, « UNIQUE constraint failed:
+/// smart_collections.name ») ; le renommage AVALAIT l'erreur (`.ok()`) et
+/// rendait 200 avec l'ancien nom, ce qui faisait croire à une troncature.
+///
+/// La comparaison est celle de l'index : EXACTE (collation BINARY de SQLite,
+/// `=` de PostgreSQL) — « Jazz » et « jazz » coexistent, et « Jazz » et
+/// « Jazz  » aussi (l’éditeur du client retire les espaces autour avant
+/// d’envoyer ; les propositions de l’assistant IA, non).
+fn refus_nom_pris(nom: &str) -> AppError {
+    let message = format!("Une collection intelligente porte déjà le nom « {nom} »");
+    tracing::warn!(error = %message, "conflict");
+    AppError {
+        status: StatusCode::CONFLICT,
+        message,
+        code: Some(CODE_NOM_PRIS.into()),
+    }
+}
+
+/// La violation d'unicité du nom, telle que la rendent les deux moteurs :
+/// SQLite (« UNIQUE constraint failed: smart_collections.name ») et
+/// PostgreSQL (« duplicate key value violates unique constraint
+/// "idx_smart_collections_name" », si l'index y est posé un jour).
+fn est_violation_du_nom(erreur: &str) -> bool {
+    erreur.contains("UNIQUE constraint failed: smart_collections.name")
+        || (erreur.contains("duplicate key value") && erreur.contains("smart_collections_name"))
+}
+
+/// Traduit l'échec d'une écriture du nom : 409 si c'est l'unicité, 500 sinon.
+fn erreur_d_ecriture_du_nom(nom: &str, erreur: String) -> AppError {
+    if est_violation_du_nom(&erreur) {
+        refus_nom_pris(nom)
+    } else {
+        AppError::internal(erreur)
+    }
+}
+
+/// Refuse AVANT toute écriture un nom déjà porté par UNE AUTRE collection.
+///
+/// Nécessaire sur PostgreSQL, dont le schéma n'a pas l'index unique de
+/// SQLite : sans cette vérification, le doublon y passait sans bruit. Sur
+/// SQLite, l'index reste le dernier rempart (deux créations simultanées),
+/// rattrapé par `erreur_d_ecriture_du_nom`.
+fn verifier_nom_libre(
+    state: &SmartHttpState,
+    nom: &str,
+    sauf_id: Option<i64>,
+) -> Result<(), AppError> {
+    let ligne = match sauf_id {
+        Some(id) => state.backend.query_one(
+            "SELECT id FROM smart_collections WHERE name = $1 AND id <> $2",
+            &[&nom as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+        ),
+        None => state.backend.query_one(
+            "SELECT id FROM smart_collections WHERE name = $1",
+            &[&nom as &dyn ToSqlValue],
+        ),
+    }
+    .map_err(AppError::internal)?;
+    match ligne {
+        Some(_) => Err(refus_nom_pris(nom)),
+        None => Ok(()),
+    }
+}
+
 async fn create_collection(
     State(state): State<SmartHttpState>,
     Json(body): Json<CreateCollection>,
@@ -663,6 +737,7 @@ async fn create_collection(
         &rules_json,
     )
     .map_err(AppError::bad_request)?;
+    verifier_nom_libre(&state, &body.name, None)?;
 
     let id = state
         .backend
@@ -684,7 +759,7 @@ async fn create_collection(
                 &expression as &dyn ToSqlValue,
             ],
         )
-        .map_err(AppError::internal)?;
+        .map_err(|e| erreur_d_ecriture_du_nom(&body.name, e))?;
 
     // Relire l'objet persisté au lieu de fabriquer une réponse partielle :
     // le client réutilise immédiatement ce contrat et `created_at` fait partie
@@ -764,11 +839,21 @@ async fn update_collection(
         )
         .map_err(AppError::bad_request)?;
     }
+    // Un nom déjà pris est refusé AVANT toute écriture (409), pour la même
+    // raison que la borne : la mise à jour écrit champ par champ.
     if let Some(ref name) = body.name {
-        state.backend.execute(
-            "UPDATE smart_collections SET name = $1, updated_at = CURRENT_TIMESTAMP WHERE id = $2",
-            &[name as &dyn ToSqlValue, &id as &dyn ToSqlValue],
-        ).ok();
+        verifier_nom_libre(&state, name, Some(id))?;
+    }
+    if let Some(ref name) = body.name {
+        // L'échec n'est plus avalé : un `.ok()` rendait 200 avec l'ancien nom.
+        state
+            .backend
+            .execute(
+                "UPDATE smart_collections SET name = $1, updated_at = CURRENT_TIMESTAMP \
+                 WHERE id = $2",
+                &[name as &dyn ToSqlValue, &id as &dyn ToSqlValue],
+            )
+            .map_err(|e| erreur_d_ecriture_du_nom(name, e))?;
     }
     if let Some(ref rules) = body.rules {
         let rules_json = rules.to_string();
@@ -1912,6 +1997,11 @@ async fn apercu_des_albums(
 #[cfg(test)]
 #[path = "expression_7872_tests.rs"]
 mod expression_7872_tests;
+
+// Forum 21/11/2026 — un nom déjà pris rend 409 `smart_collection_name_taken`.
+#[cfg(test)]
+#[path = "nom_deja_pris_tests.rs"]
+mod nom_deja_pris_tests;
 
 // Recette du 13/11 (n° 73) — comptes en une passe et index des règles.
 #[cfg(test)]

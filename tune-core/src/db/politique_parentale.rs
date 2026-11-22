@@ -813,6 +813,17 @@ pub fn piste_locale_bloquee(
     Ok(bloques_parmi(db, filtre, SQL_ARTISTES_DES_PISTES, &[track_id])?.contains(&track_id))
 }
 
+/// #8611 — parmi les pistes locales `ids`, celles d'un artiste bloqué
+/// (artiste de la piste, de l'album, ou balise `ALBUMARTIST`), par
+/// identifiant comme par nom. Lectures par clé primaire, par lots.
+pub fn pistes_locales_bloquees(
+    db: &Arc<dyn DbBackend>,
+    filtre: &Filtre,
+    ids: &[i64],
+) -> Result<HashSet<i64>, String> {
+    bloques_parmi(db, filtre, SQL_ARTISTES_DES_PISTES, ids)
+}
+
 /// #8611 — parmi des favoris de la bibliothèque (`item_type`, `item_id`),
 /// ceux qui désignent un artiste bloqué, un de ses albums ou une de ses
 /// pistes. Trois lectures ciblées au plus, par clé primaire.

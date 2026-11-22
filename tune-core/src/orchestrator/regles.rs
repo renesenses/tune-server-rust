@@ -1378,12 +1378,29 @@ pub fn est_source_dsd(format: Option<&str>) -> bool {
 /// décodage retiré pour débloquer Zicmu (`dsd_streaming_send_timeout`, #2280).
 /// On ne le paie que si la sortie publie vraiment des niveaux ; les autres
 /// formats gardent leur comportement, sans nouvelle condition.
+///
+/// #9142 — rend le fichier ET le décalage où commencer le décodage (son
+/// horloge à lui). Une piste virtuelle de feuille CUE n'a pas de `file_path`
+/// (identité dans `(cue_media_path, cue_start_ms)`, cf. `Track::bornes_cue`) :
+/// ne lire que `file_path` laissait toutes les pistes 2..n d'un album CUE
+/// enchaîné sans blanc sans aucun forwarder (`non_lance_sans_fichier`, fil
+/// 2943). Même repli, même précédence que la lecture explicite
+/// (`resolve_local`, #3631) : `file_path` s'il existe, sinon le média de la
+/// feuille ; le début de la tranche dès que la piste en est une. La fin de la
+/// tranche n'a pas à borner le décodage : l'avance suivante coupe ce
+/// forwarder par `bump_levels_gen`, et le frein le cale sur la position.
 pub(crate) fn fichier_a_mesurer_apres_avance(
     format: Option<&str>,
     file_path: Option<String>,
+    bornes_cue: Option<(String, u64, Option<u64>)>,
     la_sortie_mesure: bool,
-) -> Option<String> {
-    file_path.filter(|_| !est_source_dsd(format) || la_sortie_mesure)
+) -> Option<(String, u64)> {
+    if est_source_dsd(format) && !la_sortie_mesure {
+        return None;
+    }
+    let debut_ms = bornes_cue.as_ref().map(|(_, debut, _)| *debut).unwrap_or(0);
+    let chemin = file_path.or_else(|| bornes_cue.map(|(media, _, _)| media))?;
+    Some((chemin, debut_ms))
 }
 
 /// Decode an infinite radio HTTP stream to PCM and send chunks through the

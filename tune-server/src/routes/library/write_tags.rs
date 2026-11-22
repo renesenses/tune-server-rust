@@ -85,7 +85,7 @@ pub(crate) fn remettre_la_ligne_en_phase(
         return;
     };
     let pistes = tune_core::db::track_repo::TrackRepo::with_backend(backend.clone());
-    if let Err(e) = pistes.update_mtime_and_size(chemin, mtime, taille as i64) {
+    if let Err(e) = pistes.update_mtime_and_size_after_tag_write(chemin, mtime, taille as i64) {
         warn!(chemin = %chemin, error = %e, "write_tags_ligne_non_remise_en_phase");
     }
 }

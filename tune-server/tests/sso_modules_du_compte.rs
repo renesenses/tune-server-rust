@@ -95,7 +95,16 @@ fn serveur_froid(base_url: &str) -> (axum::Router, AppState, tune_core::test_scr
         None,
         "l'état de départ doit être froid : aucun compte lié"
     );
-    (tune_server::routes::router(state.clone()), state, base)
+    (
+        tune_server::routes::router(state.clone()).layer(
+            axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+                [127, 0, 0, 1],
+                50000,
+            ))),
+        ),
+        state,
+        base,
+    )
 }
 
 async fn appeler(app: &axum::Router, req: Request<Body>) -> (StatusCode, Value) {

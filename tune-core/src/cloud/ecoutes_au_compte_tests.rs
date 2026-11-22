@@ -906,3 +906,45 @@ async fn la_source_part_avec_l_ecoute_8645() {
         .collect();
     assert_eq!(sources, ["podcast", "local"]);
 }
+
+/// #8797 — après un refus de la session par le site, aucune écoute ne part
+/// (le jeton refusé n'est plus présenté) ; la reconnexion rouvre l'envoi.
+#[tokio::test]
+async fn apres_un_refus_de_session_aucune_ecoute_ne_part_8797() {
+    let (url, site) = faux_site().await;
+    let b = base();
+    bibliotheque(&b);
+    ecoute(
+        &b,
+        1,
+        "So What",
+        Some(10),
+        "local",
+        "2026-10-18T20:00:00Z",
+        Some(3),
+    );
+    relier(&b, &url);
+    activer(&b);
+    reglages(&b)
+        .set(
+            crate::cloud::sso::CLE_RECONNEXION_REQUISE,
+            "2026-11-20T10:00:00+00:00",
+        )
+        .unwrap();
+    assert_eq!(
+        passe(&b, &http(), maintenant()).await,
+        Issue::Rien("account_not_linked")
+    );
+    {
+        let site = site.lock().unwrap();
+        assert!(site.corps.is_empty(), "le site a reçu : {:?}", site.corps);
+        assert_eq!(site.liaisons, 0);
+    }
+    // Contre-épreuve : reconnecté, l'écoute part.
+    crate::cloud::sso::oublier_le_refus_de_session(&reglages(&b));
+    assert!(matches!(
+        passe(&b, &http(), maintenant()).await,
+        Issue::Envoye { ecoutes: 1, .. }
+    ));
+    assert_eq!(site.lock().unwrap().corps.len(), 1);
+}

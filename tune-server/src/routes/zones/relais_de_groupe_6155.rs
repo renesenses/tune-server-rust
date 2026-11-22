@@ -63,6 +63,7 @@ use tune_core::db::backend::DbBackend;
 use tune_core::db::settings_repo::SettingsRepo;
 use tune_core::db::zone_repo::ZoneRepo;
 use tune_core::playback::{PlayState, ZoneState};
+use tune_core::zones::decalage_de_groupe_9089;
 
 use crate::state::AppState;
 
@@ -375,54 +376,194 @@ pub(crate) async fn lancer_en_tete_du_groupe<R: axum::response::IntoResponse>(
 ///
 /// Appelé par le relais à chaque geste de la meneuse, et par `create_group`
 /// quand le groupe se forme autour d'une zone qui joue déjà.
+///
+/// #9089 — une suiveuse qui porte un décalage positif reçoit son geste plus
+/// tard, dans une tâche détachée (le relais n'attend pas). Chaque geste prend
+/// un ticket de [`GestesDeSuiveuses`] : un geste plus récent rend caduque
+/// l'attente du précédent, et les gestes d'une même suiveuse passent un à un
+/// (jamais deux transferts à la fois). La décision est reprise sous le
+/// ticket, sur le groupe et l'état relus.
 pub(crate) async fn aligner_les_suiveuses(state: &AppState, meneuse: i64) {
     let suiveuses = zones_suiveuses(&groupes_enregistres(state), meneuse);
     if suiveuses.is_empty() {
         return;
     }
-    let tete = Instantane::de(&state.playback.get_state(meneuse).await);
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    let etat_tete = state.playback.get_state(meneuse).await;
+    let tete = Instantane::de(&etat_tete);
     for suiveuse in suiveuses {
         let etat = Instantane::de(&state.playback.get_state(suiveuse).await);
         let Some(geste) = geste_pour_la_suiveuse(&tete, &etat) else {
             continue;
         };
-        info!(meneuse, suiveuse, geste = ?geste, "zone_group_follower_aligned");
-        let device_id = ZoneRepo::with_backend(state.backend.clone())
-            .get(suiveuse)
-            .ok()
-            .flatten()
-            .and_then(|z| z.output_device_id);
-        let resultat = match geste {
-            Geste::Rejoindre => {
-                let reponse =
-                    crate::routes::playback::do_transfer(state, meneuse, suiveuse, false).await;
-                if reponse.status().is_success() {
-                    Ok(())
-                } else {
-                    Err(format!("transfer status {}", reponse.status()))
-                }
-            }
-            Geste::Pause => state
-                .orchestrator
-                .pause(suiveuse, device_id.as_deref())
-                .await
-                .map_err(|e| format!("{e:?}")),
-            Geste::Reprise => state
-                .orchestrator
-                .resume(suiveuse, device_id.as_deref())
-                .await
-                .map_err(|e| format!("{e:?}")),
-            Geste::Arret => {
-                state
-                    .orchestrator
-                    .stop(suiveuse, device_id.as_deref())
-                    .await;
-                Ok(())
-            }
-        };
-        if let Err(error) = resultat {
-            warn!(meneuse, suiveuse, geste = ?geste, %error, "zone_group_follower_failed");
+        let decalage_ms = decalage_de_groupe_9089::lire(&reglages, suiveuse);
+        let attente_ms = attente_avant_le_geste_ms(geste, etat_tete.position_ms, decalage_ms);
+        let ticket = state.gestes_de_suiveuses.nouveau_ticket(suiveuse);
+        if attente_ms == 0 {
+            aligner_sous_ticket(state, meneuse, suiveuse, ticket).await;
+            continue;
         }
+        info!(
+            meneuse,
+            suiveuse,
+            geste = ?geste,
+            decalage_ms,
+            attente_ms,
+            "zone_group_follower_offset_wait"
+        );
+        let state = state.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(attente_ms)).await;
+            aligner_sous_ticket(&state, meneuse, suiveuse, ticket).await;
+        });
+    }
+}
+
+/// [`aligner_les_suiveuses`] pour les bancs d'intégration (`tests/`), qui
+/// rejouent deux `started` rapprochés (#9089).
+#[doc(hidden)]
+pub async fn aligner_les_suiveuses_pour_test(state: &AppState, meneuse: i64) {
+    aligner_les_suiveuses(state, meneuse).await;
+}
+
+/// #9089 — le geste d'une suiveuse, sous son ticket : rien si un geste plus
+/// récent l'a dépassé, si la zone ne suit plus `meneuse` (dégroupée, ou
+/// devenue meneuse par une lecture lancée sur elle, #7717), ou si l'état relu
+/// ne demande plus rien. Le décalage est relu au même moment.
+async fn aligner_sous_ticket(state: &AppState, meneuse: i64, suiveuse: i64, ticket: TicketDeGeste) {
+    let _un_a_la_fois = ticket.file.un_a_la_fois.lock().await;
+    if !ticket.est_le_dernier() {
+        info!(meneuse, suiveuse, "zone_group_follower_gesture_superseded");
+        return;
+    }
+    if !zones_suiveuses(&groupes_enregistres(state), meneuse).contains(&suiveuse) {
+        info!(meneuse, suiveuse, "zone_group_follower_left_group");
+        return;
+    }
+    let tete = Instantane::de(&state.playback.get_state(meneuse).await);
+    let etat = Instantane::de(&state.playback.get_state(suiveuse).await);
+    let Some(geste) = geste_pour_la_suiveuse(&tete, &etat) else {
+        return;
+    };
+    let decalage_ms =
+        decalage_de_groupe_9089::lire(&SettingsRepo::with_backend(state.backend.clone()), suiveuse);
+    executer_le_geste(state, meneuse, suiveuse, geste, decalage_ms).await;
+}
+
+/// #9089 (relecture de #9155) — les gestes relayés à chaque suiveuse, par
+/// numéro de génération, sur le modèle de [`DeplacementsDeGroupe`] : seul le
+/// dernier s'applique, et ils passent un à un.
+#[derive(Default)]
+pub struct GestesDeSuiveuses {
+    par_suiveuse: std::sync::Mutex<std::collections::HashMap<i64, Arc<FileDeGestes>>>,
+}
+
+#[derive(Default)]
+struct FileDeGestes {
+    derniere: std::sync::atomic::AtomicU64,
+    un_a_la_fois: tokio::sync::Mutex<()>,
+}
+
+/// Un geste destiné à une suiveuse, numéroté à sa décision.
+pub(crate) struct TicketDeGeste {
+    file: Arc<FileDeGestes>,
+    generation: u64,
+}
+
+impl GestesDeSuiveuses {
+    /// Numérote un nouveau geste pour `suiveuse` : il dépasse tous les
+    /// précédents.
+    pub(crate) fn nouveau_ticket(&self, suiveuse: i64) -> TicketDeGeste {
+        let file = self
+            .par_suiveuse
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(suiveuse)
+            .or_default()
+            .clone();
+        let generation = file
+            .derniere
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        TicketDeGeste { file, generation }
+    }
+}
+
+impl TicketDeGeste {
+    fn est_le_dernier(&self) -> bool {
+        self.file.derniere.load(std::sync::atomic::Ordering::SeqCst) == self.generation
+    }
+}
+
+/// #9089 — l'attente avant de faire suivre `geste` à une suiveuse décalée de
+/// `decalage_ms`, la meneuse étant à `position_meneuse_ms`.
+pub(crate) fn attente_avant_le_geste_ms(
+    geste: Geste,
+    position_meneuse_ms: i64,
+    decalage_ms: i64,
+) -> u64 {
+    match geste {
+        Geste::Rejoindre => decalage_de_groupe_9089::attente_avant_de_rejoindre_ms(
+            position_meneuse_ms.max(0) as u64,
+            decalage_ms,
+        ),
+        Geste::Pause | Geste::Reprise => {
+            decalage_de_groupe_9089::attente_avant_un_geste_ms(decalage_ms)
+        }
+        // L'arrêt a déjà son délai de grâce (`DELAI_AVANT_D_ARRETER`).
+        Geste::Arret => 0,
+    }
+}
+
+async fn executer_le_geste(
+    state: &AppState,
+    meneuse: i64,
+    suiveuse: i64,
+    geste: Geste,
+    decalage_ms: i64,
+) {
+    info!(meneuse, suiveuse, geste = ?geste, decalage_ms, "zone_group_follower_aligned");
+    let device_id = ZoneRepo::with_backend(state.backend.clone())
+        .get(suiveuse)
+        .ok()
+        .flatten()
+        .and_then(|z| z.output_device_id);
+    let resultat = match geste {
+        Geste::Rejoindre => {
+            let reponse = crate::routes::playback::do_transfer_decale(
+                state,
+                meneuse,
+                suiveuse,
+                false,
+                decalage_ms,
+            )
+            .await;
+            if reponse.status().is_success() {
+                Ok(())
+            } else {
+                Err(format!("transfer status {}", reponse.status()))
+            }
+        }
+        Geste::Pause => state
+            .orchestrator
+            .pause(suiveuse, device_id.as_deref())
+            .await
+            .map_err(|e| format!("{e:?}")),
+        Geste::Reprise => state
+            .orchestrator
+            .resume(suiveuse, device_id.as_deref())
+            .await
+            .map_err(|e| format!("{e:?}")),
+        Geste::Arret => {
+            state
+                .orchestrator
+                .stop(suiveuse, device_id.as_deref())
+                .await;
+            Ok(())
+        }
+    };
+    if let Err(error) = resultat {
+        warn!(meneuse, suiveuse, geste = ?geste, %error, "zone_group_follower_failed");
     }
 }
 
@@ -641,10 +782,17 @@ pub async fn deplacer_les_suiveuses(
     if suiveuses.is_empty() {
         return;
     }
-    let tete = Instantane::de(&state.playback.get_state(meneuse).await);
+    let etat_tete = state.playback.get_state(meneuse).await;
+    let duree_ms = etat_tete
+        .now_playing
+        .as_ref()
+        .map(|np| np.duration_ms)
+        .unwrap_or(0);
+    let tete = Instantane::de(&etat_tete);
     if tete.piste.is_none() {
         return;
     }
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
     for suiveuse in suiveuses {
         if !demande.est_la_derniere() {
             info!(meneuse, position_ms, "zone_group_follower_seek_superseded");
@@ -659,7 +807,17 @@ pub async fn deplacer_les_suiveuses(
             .ok()
             .flatten()
             .and_then(|z| z.output_device_id);
-        info!(meneuse, suiveuse, position_ms, "zone_group_follower_seeked");
+        // #9089 — la suiveuse décalée garde son décalage après le déplacement.
+        let decalage_ms = decalage_de_groupe_9089::lire(&reglages, suiveuse);
+        let position_ms = if decalage_ms == 0 {
+            position_ms
+        } else {
+            decalage_de_groupe_9089::position_de_la_suiveuse(position_ms, decalage_ms, duree_ms)
+        };
+        info!(
+            meneuse,
+            suiveuse, position_ms, decalage_ms, "zone_group_follower_seeked"
+        );
         if let Err(error) = state
             .orchestrator
             .seek(suiveuse, position_ms, device_id.as_deref())

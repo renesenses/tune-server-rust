@@ -23,6 +23,14 @@ fn new_state() -> AppState {
     AppState::new(":memory:", 0, Default::default()).unwrap()
 }
 
+/// Routeur appelé « de cette machine » (bouclage), comme l'interface locale :
+/// l'installation d'un greffon l'exige quand l'authentification est coupée.
+fn routeur_local(state: AppState) -> axum::Router {
+    tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+        std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+    ))
+}
+
 async fn appel(app: &axum::Router, methode: &str, chemin: &str) -> (StatusCode, Value) {
     let req = Request::builder()
         .method(methode)
@@ -63,7 +71,7 @@ async fn fiche(app: &axum::Router, id: &str) -> Option<Value> {
 async fn karaoke_est_propose_non_installe() {
     let state = new_state();
     tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
-    let app = tune_server::routes::router(state.clone());
+    let app = routeur_local(state.clone());
     for id in IDS {
         let f = fiche(&app, id)
             .await
@@ -83,7 +91,7 @@ async fn cocher_installe_et_annonce_le_redemarrage_decocher_retire() {
     for id in IDS {
         let state = new_state();
         tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
-        let app = tune_server::routes::router(state.clone());
+        let app = routeur_local(state.clone());
         let reglages = SettingsRepo::with_backend(state.backend.clone());
         let cle = format!("plugin_{id}_installed");
         assert_eq!(
@@ -139,7 +147,7 @@ async fn l_installation_decide_du_chargement_avec_contre_epreuve() {
             routeurs.iter().any(|(n, _)| n == id),
             "« {id} » coché doit monter son routeur"
         );
-        let app = tune_server::routes::router(avec.clone());
+        let app = routeur_local(avec.clone());
         let f = fiche(&app, id).await.expect("chargé donc listé");
         assert_eq!(f["installed"], true, "{f}");
         assert_eq!(f["enabled"], true, "{f}");
@@ -166,7 +174,7 @@ async fn l_installation_decide_du_chargement_avec_contre_epreuve() {
 async fn dj_n_est_pas_propose_mais_se_charge_a_la_main() {
     let state = new_state();
     tune_server::plugins::init(&state, "http://127.0.0.1:0", vec![]).await;
-    let app = tune_server::routes::router(state.clone());
+    let app = routeur_local(state.clone());
     assert!(
         fiche(&app, "dj").await.is_none(),
         "DJ ne doit pas figurer au catalogue"

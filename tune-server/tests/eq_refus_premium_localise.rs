@@ -1,4 +1,4 @@
-//! EQ is free (#4363). Crossfeed keeps its separate Premium entitlement.
+//! EQ et crossfeed simple gratuits ; refus localisés du suréchantillonneur Premium.
 //! Preserve #2419's localized refusal witnesses on the paid operation;
 //! exercise real routes, persisted settings, mixed-request atomicity and presets.
 
@@ -10,6 +10,7 @@ use tower::ServiceExt;
 const ZONE: i64 = 1;
 const EQ: &str = "/api/v1/zones/1/eq";
 const DSP: &str = "/api/v1/zones/1/dsp";
+const UPSAMPLER: &str = "/api/v1/upsampler/zones/1";
 
 /// Un serveur en mémoire **sans licence** — le palier Free, celui du ticket.
 async fn app_gratuit() -> axum::Router {
@@ -33,6 +34,9 @@ fn installer_l_egaliseur(state: &tune_server::state::AppState) {
     tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
         .set("plugin_equalizer_installed", "true")
         .unwrap();
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    settings.set("plugin_crossfeed_installed", "true").unwrap();
+    settings.set("plugin_crossfeed_enabled", "true").unwrap();
 }
 
 async fn lire(app: &axum::Router, chemin: &str) -> (StatusCode, Value) {
@@ -157,11 +161,11 @@ async fn premium_sdk_free_equalizer_writes_and_reads_real_bands() {
     assert_eq!(status, StatusCode::CREATED, "FREE preset refused: {value}");
     let (_, config) = lire(&app, "/api/v1/system/config").await;
     assert_eq!(config["premium_features"]["dsp_eq"], true, "{config}");
-    assert_eq!(config["premium_features"]["crossfeed"], false, "{config}");
+    assert_eq!(config["premium_features"]["crossfeed"], true, "{config}");
 }
 
 #[tokio::test]
-async fn premium_sdk_mixed_free_request_refuses_crossfeed_without_writing_eq() {
+async fn premium_sdk_mixed_free_request_writes_eq_and_crossfeed() {
     let app = app_gratuit().await;
     let profile = tune_core::audio::eq::EqProfile {
         enabled: true,
@@ -175,13 +179,10 @@ async fn premium_sdk_mixed_free_request_refuses_crossfeed_without_writing_eq() {
         Some("fr"),
     )
     .await;
-    assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{value}");
-    assert_eq!(value["code"], "crossfeed");
-    let (_, stored) = lire(&app, EQ).await;
-    assert_eq!(
-        stored["enabled"], false,
-        "mixed request partially persisted EQ: {stored}"
-    );
+    assert_eq!(status, StatusCode::OK, "{value}");
+    let (_, stored) = lire(&app, DSP).await;
+    assert_eq!(stored["eq_profile"]["bass_gain_db"], 4.0);
+    assert_eq!(stored["crossfeed"]["enabled"], true);
     let (status, value) = ecrire_put(&app, DSP, json!({"eq_profile": profile}), Some("fr")).await;
     assert_eq!(
         status,
@@ -208,20 +209,20 @@ async fn la_phrase_du_refus_suit_l_entete_accept_language() {
 
     let (_, fr) = ecrire_put(
         &app,
-        DSP,
-        json!({"crossfeed":{"enabled":true}}),
+        UPSAMPLER,
+        json!({"enabled":true}),
         Some("fr-FR,fr;q=0.9"),
     )
     .await;
-    let (_, de) = ecrire_put(&app, DSP, json!({"crossfeed":{"enabled":true}}), Some("de")).await;
+    let (_, de) = ecrire_put(&app, UPSAMPLER, json!({"enabled":true}), Some("de")).await;
     let (_, en) = ecrire_put(
         &app,
-        DSP,
-        json!({"crossfeed":{"enabled":true}}),
+        UPSAMPLER,
+        json!({"enabled":true}),
         Some("en-US,en;q=0.8"),
     )
     .await;
-    let (_, ja) = ecrire_put(&app, DSP, json!({"crossfeed":{"enabled":true}}), Some("ja")).await;
+    let (_, ja) = ecrire_put(&app, UPSAMPLER, json!({"enabled":true}), Some("ja")).await;
 
     let phrase = |v: &Value| v["message"].as_str().unwrap_or_default().to_string();
 
@@ -250,10 +251,10 @@ async fn la_phrase_du_refus_suit_l_entete_accept_language() {
     // Le nom du droit reste un nom de produit, il traverse les traductions.
     for v in [&fr, &de, &en, &ja] {
         assert!(
-            phrase(v).contains("Crossfeed"),
+            phrase(v).contains("Upsampling"),
             "le refus doit nommer le droit manquant : {v}"
         );
-        assert_eq!(v["code"], "crossfeed", "le code ne se traduit PAS : {v}");
+        assert_eq!(v["code"], "upsampling", "le code ne se traduit PAS : {v}");
     }
 }
 
@@ -263,13 +264,7 @@ async fn la_phrase_du_refus_suit_l_entete_accept_language() {
 #[tokio::test]
 async fn une_locale_inconnue_retombe_sur_l_anglais() {
     let app = app_gratuit().await;
-    let (_, corps) = ecrire_put(
-        &app,
-        DSP,
-        json!({"crossfeed":{"enabled":true}}),
-        Some("kl-GL"),
-    )
-    .await;
+    let (_, corps) = ecrire_put(&app, UPSAMPLER, json!({"enabled":true}), Some("kl-GL")).await;
     let phrase = corps["message"].as_str().unwrap_or_default();
 
     assert!(
@@ -287,7 +282,7 @@ async fn une_locale_inconnue_retombe_sur_l_anglais() {
 #[tokio::test]
 async fn un_refus_sans_entete_de_langue_reste_une_phrase() {
     let app = app_gratuit().await;
-    let (status, corps) = ecrire_put(&app, DSP, json!({"crossfeed":{"enabled":true}}), None).await;
+    let (status, corps) = ecrire_put(&app, UPSAMPLER, json!({"enabled":true}), None).await;
 
     assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
     let phrase = corps["message"].as_str().unwrap_or_default();
@@ -296,25 +291,24 @@ async fn un_refus_sans_entete_de_langue_reste_une_phrase() {
         !phrase.contains("premium.required"),
         "clé de traduction non résolue : {corps}"
     );
-    assert_eq!(corps["code"], "crossfeed");
+    assert_eq!(corps["code"], "upsampling");
 }
 
-/// `PUT /zones/{id}/dsp` est l'autre moitié du même écran : son refus se lit
-/// dans la même langue, avec le même code. Deux routes, un seul contrat.
+/// La route du suréchantillonneur conserve un refus Premium localisé,
+/// même si l'égaliseur et le crossfeed simple sont gratuits.
 #[tokio::test]
-async fn le_refus_du_dsp_de_zone_se_lit_comme_celui_de_l_egaliseur() {
+async fn le_refus_du_surechantillonneur_reste_localise() {
     let app = app_gratuit().await;
-    let (status, corps) =
-        ecrire_put(&app, DSP, json!({"crossfeed":{"enabled":true}}), Some("de")).await;
+    let (status, corps) = ecrire_put(&app, UPSAMPLER, json!({"enabled":true}), Some("de")).await;
 
     assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "corps : {corps}");
     assert_eq!(corps["error"], "premium_required");
-    assert_eq!(corps["code"], "crossfeed");
+    assert_eq!(corps["code"], "upsampling");
     assert!(
         corps["message"]
             .as_str()
             .is_some_and(|m| m.contains("erfordert Tune Premium")),
-        "le refus du DSP doit suivre la langue lui aussi : {corps}"
+        "le refus du suréchantillonneur doit suivre la langue : {corps}"
     );
 }
 

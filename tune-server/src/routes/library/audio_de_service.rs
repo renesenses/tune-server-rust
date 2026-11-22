@@ -80,15 +80,18 @@ impl PisteDeService {
     /// `None` : piste locale, service non pris en charge, ou piste sans
     /// identifiant de service.
     pub(crate) fn de(track: &Track) -> Option<Self> {
-        let service = track.source.trim();
+        Self::du_service(&track.source, track.source_id.as_deref()?)
+    }
+
+    /// La même chose depuis le service et l'identifiant chez lui, pour une
+    /// piste qui n'est pas en bibliothèque (la piste Qobuz ou TIDAL en
+    /// lecture : `current_track.source` et `source_id`).
+    pub(crate) fn du_service(service: &str, id_service: &str) -> Option<Self> {
+        let service = service.trim();
         if !SERVICES_ANALYSABLES.contains(&service) {
             return None;
         }
-        let id = track
-            .source_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())?;
+        let id = Some(id_service.trim()).filter(|s| !s.is_empty())?;
         let qualite = StreamingQualityPreference::Hires.service_token(service)?;
         Some(Self {
             service: service.to_string(),
@@ -130,6 +133,9 @@ pub(crate) enum Refus {
     DelaiDepasse,
     /// Tout autre échec de la résolution ou du téléchargement.
     TelechargementImpossible,
+    /// Téléchargé en entier, mais le décodeur n'en tire rien (format non
+    /// pris en charge, fichier abîmé) : le retélécharger n'y changerait rien.
+    FichierIllisible,
     /// Une plage (zoom) ou un autre nombre de colonnes : pour une piste de
     /// service, seule la piste entière au nombre par défaut se calcule (un
     /// zoom retéléchargerait la piste entière à chaque fois).
@@ -148,13 +154,14 @@ impl Refus {
             Self::TropVolumineux => "trop_volumineux",
             Self::DelaiDepasse => "delai_depasse",
             Self::TelechargementImpossible => "telechargement_impossible",
+            Self::FichierIllisible => "fichier_illisible",
             Self::ZoomNonDisponible => "zoom_non_disponible",
         }
     }
 
     /// Le texte de `error`. « track has no local file » reste celui d'une
     /// piste sans service analysable : un écran d'avant le reconnaît.
-    fn message(self) -> &'static str {
+    pub(crate) fn message(self) -> &'static str {
         match self {
             Self::NonPrisEnCharge | Self::SourceReseau => "track has no local file",
             Self::ServiceInactif => "streaming service disabled",
@@ -164,6 +171,7 @@ impl Refus {
             Self::TropVolumineux => "track too large to download for analysis",
             Self::DelaiDepasse => "download for analysis timed out",
             Self::TelechargementImpossible => "download for analysis failed",
+            Self::FichierIllisible => "downloaded audio could not be decoded",
             Self::ZoomNonDisponible => {
                 "only the whole track at the default size is available for a streaming track"
             }

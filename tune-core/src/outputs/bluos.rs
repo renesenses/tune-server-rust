@@ -64,11 +64,11 @@ impl BluosOutput {
                     );
                     info!(
                         device = %self.name,
-                        url = media.url,
+                        url = %crate::confidentialite::masquer_url(&media.url),
                         title = media.title.unwrap_or(""),
                         artist = media.artist.unwrap_or(""),
                         album = media.album.unwrap_or(""),
-                        image = media.cover_url.unwrap_or(""),
+                        image = %crate::confidentialite::masquer_url(&media.cover_url.unwrap_or("")),
                         mode = "play_url",
                         "bluos_play"
                     );
@@ -95,7 +95,7 @@ impl BluosOutput {
         if xml_text(&corps, "state") == Some("pause") {
             warn!(
                 device = %self.name,
-                url = media.url,
+                url = %crate::confidentialite::masquer_url(&media.url),
                 reply = %truncate_body(&corps),
                 "bluos_play_url_rejected"
             );
@@ -106,7 +106,7 @@ impl BluosOutput {
         }
         info!(
             device = %self.name,
-            url = media.url,
+            url = %crate::confidentialite::masquer_url(&media.url),
             title = media.title.unwrap_or(""),
             mode = "play_url",
             "bluos_play"
@@ -398,7 +398,7 @@ impl OutputTarget for BluosOutput {
             // a l'utilisateur, pas au diagnostic.
             warn!(
                 device = %self.name,
-                add_url = %add_url,
+                add_url = %crate::confidentialite::masquer_url(&add_url),
                 status = %add_status,
                 reply = %truncate_body(&add_body),
                 "bluos_add_http_error"
@@ -440,7 +440,7 @@ impl OutputTarget for BluosOutput {
                 // lecteur, un caractere qui casse le decoupage des parametres,
                 // une pochette trop longue… Trois allers-retours avec Bilou
                 // (17/08/2026) se sont arretes faute de cette ligne.
-                add_url = %add_url,
+                add_url = %crate::confidentialite::masquer_url(&add_url),
                 add_reply = %truncate_body(&add_body),
                 play_reply = %truncate_body(&play_body),
                 "bluos_add_rejected_empty_queue"
@@ -453,11 +453,11 @@ impl OutputTarget for BluosOutput {
         }
         info!(
             device = %self.name,
-            url = media.url,
+            url = %crate::confidentialite::masquer_url(&media.url),
             title = media.title.unwrap_or(""),
             artist = media.artist.unwrap_or(""),
             album = media.album.unwrap_or(""),
-            image = media.cover_url.unwrap_or(""),
+            image = %crate::confidentialite::masquer_url(&media.cover_url.unwrap_or("")),
             "bluos_play"
         );
         Ok(())
@@ -606,7 +606,7 @@ impl OutputTarget for BluosOutput {
         if !add_status.is_success() {
             warn!(
                 device = %self.name,
-                add_url = %add_url,
+                add_url = %crate::confidentialite::masquer_url(&add_url),
                 status = %add_status,
                 reply = %truncate_body(&add_body),
                 "bluos_add_http_error_gapless"
@@ -628,7 +628,7 @@ impl OutputTarget for BluosOutput {
             // meme diagnostic est impossible ici.
             warn!(
                 device = %self.name,
-                add_url = %add_url,
+                add_url = %crate::confidentialite::masquer_url(&add_url),
                 reply = %truncate_body(&add_body),
                 "bluos_set_next_queue_still_empty"
             );
@@ -637,11 +637,11 @@ impl OutputTarget for BluosOutput {
         }
         info!(
             device = %self.name,
-            url = media.url,
+            url = %crate::confidentialite::masquer_url(&media.url),
             title = media.title.unwrap_or(""),
             artist = media.artist.unwrap_or(""),
             album = media.album.unwrap_or(""),
-            image = media.cover_url.unwrap_or(""),
+            image = %crate::confidentialite::masquer_url(&media.cover_url.unwrap_or("")),
             "bluos_set_next"
         );
         Ok(())

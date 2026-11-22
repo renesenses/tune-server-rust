@@ -377,6 +377,9 @@ async fn le_demarrage_sur_sortie_locale_dit_ses_trois_durees_au_niveau_livre() {
         .append(
             zone_id,
             &[QueueInput::Streaming {
+                media_format: None,
+                sample_rate: None,
+                bit_depth: None,
                 source: SERVICE.into(),
                 source_id: PISTE.into(),
                 title: "Titre en file".into(),

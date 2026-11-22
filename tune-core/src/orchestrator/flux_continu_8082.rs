@@ -9,6 +9,12 @@
 //! WAV (`audio::wav_continu`). Au premier changement de format, la suite
 //! s'arrête : la piste qui suit reprend le chemin normal (`SetNext`).
 //!
+//! #8968 — une tranche CUE d'une image sans perte y entre aussi : ses bornes
+//! sont converties à l'échantillon près (`audio::bornes_cue`), et la tranche
+//! n'a pas besoin du passthrough (une tranche se transcode toujours) : il
+//! suffit que la tranche soit le SEUL motif de transcodage (aucun
+//! traitement), voir `resolve_local`.
+//!
 //! Le suivi de piste (titre, pochette, historique) passe par le plan posé sur
 //! l'appareil (`outputs::dlna_flux_continu`) et par
 //! [`PlaybackOrchestrator::avancer_dans_le_flux_continu`]. Un déplacement dans
@@ -39,20 +45,34 @@ pub(crate) struct FluxContinuPrepare {
     pub trames_avant_depart: u64,
 }
 
-/// Une piste admise : lossless entier, ni tranche CUE, ni image, fichier
-/// présent. Rend son chemin sur disque.
+/// Les bornes d'une tranche CUE telles que la base les range : début et fin
+/// en millisecondes dans le fichier image (`cue_start_ms`, `cue_end_ms`),
+/// converties à l'échantillon près par `audio::bornes_cue` (#8968).
+pub(crate) type TrancheMs = (u64, Option<u64>);
+
+/// Une piste admise dans le flux continu.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Admise {
+    /// Le fichier sur disque (l'image, pour une tranche CUE).
+    pub chemin: String,
+    /// La tranche à servir, pour une piste de feuille CUE.
+    pub tranche: Option<TrancheMs>,
+}
+
+/// Une piste admise : lossless entier, fichier présent, ni image ISO ni
+/// image CDDA. #8968 — une tranche CUE d'une image sans perte est admise :
+/// ses bornes se convertissent à l'échantillon près, et deux tranches
+/// contiguës du même fichier se servent alors sans le moindre raccord.
 pub(crate) fn chemin_admissible(
     db: &Arc<dyn crate::db::backend::DbBackend>,
     track_id: i64,
-) -> Option<String> {
+) -> Option<Admise> {
     let mut piste = crate::db::track_repo::TrackRepo::with_backend(db.clone())
         .get(track_id)
         .ok()
         .flatten()?;
     crate::library::exemplaires::appliquer_a_la_lecture(&**db, &mut piste);
-    if piste.bornes_cue().is_some() {
-        return None;
-    }
+    let bornes = piste.bornes_cue();
     let format = piste
         .format
         .as_deref()
@@ -69,38 +89,88 @@ pub(crate) fn chemin_admissible(
     ) {
         return None;
     }
-    let chemin =
-        crate::library::local_path::resolve_existing_local_path(piste.file_path.as_deref()?)?;
+    let stocke = match (piste.file_path.as_deref(), &bornes) {
+        (Some(p), _) => p.to_string(),
+        (None, Some((media, _, _))) => media.clone(),
+        (None, None) => return None,
+    };
+    let chemin = crate::library::local_path::resolve_existing_local_path(&stocke)?;
     if crate::audio::iso9660::est_chemin_virtuel(&chemin)
         || crate::audio::image_cdda::est_image_cdda(Path::new(&chemin))
     {
         return None;
     }
-    Some(chemin)
+    Some(Admise {
+        chemin,
+        tranche: bornes.map(|(_, debut, fin)| (debut, fin)),
+    })
 }
 
-/// Assemble la suite à partir de la piste en cours (déjà sondée) et des
-/// candidates suivantes `(position, track_id, chemin)`, dans l'ordre de la
-/// file. S'arrête au premier format différent, à la première illisible, ou au
-/// plafond RIFF. Bloquant (sondes de fichiers).
+/// La portion `[début, fin)` du fichier, en trames, qu'une piste sert : le
+/// fichier entier, ou la tranche CUE à l'échantillon près.
+fn portion(
+    sonde: &wav_continu::PisteSondee,
+    tranche: Option<TrancheMs>,
+) -> Result<(u64, u64), String> {
+    let Some((debut_ms, fin_ms)) = tranche else {
+        return Ok((0, sonde.trames));
+    };
+    let (debut, fin) =
+        crate::audio::bornes_cue::tranche_en_echantillons(debut_ms, fin_ms, sonde.format.cadence);
+    let fin = fin.unwrap_or(sonde.trames).min(sonde.trames);
+    if debut >= fin {
+        return Err(format!(
+            "tranche CUE vide ou hors du fichier ({debut}..{fin} sur {} trames)",
+            sonde.trames
+        ));
+    }
+    Ok((debut, fin))
+}
+
+/// [`assembler_avec_tranches`] pour des fichiers entiers.
+#[cfg(test)]
 pub(crate) fn assembler(
     premiere: (i64, i64, PathBuf),
     depart_ms: u64,
     suivantes: Vec<(i64, i64, PathBuf)>,
 ) -> Result<FluxContinuPrepare, String> {
+    assembler_avec_tranches(
+        (premiere.0, premiere.1, premiere.2, None),
+        depart_ms,
+        suivantes
+            .into_iter()
+            .map(|(p, t, c)| (p, t, c, None))
+            .collect(),
+    )
+}
+
+/// Assemble la suite à partir de la piste en cours (déjà sondée) et des
+/// candidates suivantes `(position, track_id, chemin, tranche CUE)`, dans
+/// l'ordre de la file. S'arrête au premier format différent, à la première
+/// illisible, ou au plafond RIFF. Bloquant (sondes de fichiers).
+///
+/// `depart_ms` se compte depuis le début de la PREMIÈRE PISTE (de sa tranche,
+/// pour une piste CUE).
+pub(crate) fn assembler_avec_tranches(
+    premiere: (i64, i64, PathBuf, Option<TrancheMs>),
+    depart_ms: u64,
+    suivantes: Vec<(i64, i64, PathBuf, Option<TrancheMs>)>,
+) -> Result<FluxContinuPrepare, String> {
     let sonde = wav_continu::sonder(&premiere.2)?;
     let format: FormatPcm = sonde.format;
+    let (debut, fin) = portion(&sonde, premiere.3)?;
+    let longueur = fin - debut;
     let depart = (depart_ms.saturating_mul(u64::from(format.cadence)) / 1000)
-        .min(sonde.trames.saturating_sub(1));
+        .min(longueur.saturating_sub(1));
     let max = WavContinu::trames_max(&format);
-    let mut cumul = sonde.trames - depart;
+    let mut cumul = longueur - depart;
     let mut segments = vec![Segment {
         fichier: premiere.2,
-        depart,
-        trames: sonde.trames - depart,
+        depart: debut + depart,
+        trames: longueur - depart,
     }];
     let mut lignes = vec![(premiere.0, premiere.1)];
-    for (position, track_id, chemin) in suivantes {
+    for (position, track_id, chemin, tranche) in suivantes {
         if segments.len() >= PISTES_MAX {
             break;
         }
@@ -125,15 +195,26 @@ pub(crate) fn assembler(
             );
             break;
         }
-        if cumul.saturating_add(s.trames) > max {
+        let (debut, fin) = match portion(&s, tranche) {
+            Ok(p) => p,
+            Err(motif) => {
+                info!(
+                    position,
+                    track_id, motif, "flux_continu_suite_arretee_piste_non_admise"
+                );
+                break;
+            }
+        };
+        let trames = fin - debut;
+        if cumul.saturating_add(trames) > max {
             info!(position, "flux_continu_suite_arretee_plafond_riff");
             break;
         }
-        cumul += s.trames;
+        cumul += trames;
         segments.push(Segment {
             fichier: chemin,
-            depart: 0,
-            trames: s.trames,
+            depart: debut,
+            trames,
         });
         lignes.push((position, track_id));
     }
@@ -212,7 +293,7 @@ impl PlaybackOrchestrator {
         if courante.track_id != Some(track_id) {
             return None;
         }
-        chemin_admissible(&self.db, track_id)?;
+        let admise = chemin_admissible(&self.db, track_id)?;
         let mut suivantes = Vec::new();
         for k in 1..PISTES_MAX as i64 {
             let pos = p + k;
@@ -238,20 +319,21 @@ impl PlaybackOrchestrator {
             {
                 break;
             }
-            let Some(chemin) = chemin_admissible(&self.db, tid) else {
+            let Some(suivante) = chemin_admissible(&self.db, tid) else {
                 break;
             };
-            suivantes.push((pos, tid, PathBuf::from(chemin)));
+            suivantes.push((pos, tid, PathBuf::from(suivante.chemin), suivante.tranche));
         }
         if suivantes.is_empty() {
             return None;
         }
-        let premiere = (p, track_id, PathBuf::from(file_path));
+        let premiere = (p, track_id, PathBuf::from(file_path), admise.tranche);
         let depart_ms = seek_ms.unwrap_or(0);
-        let prepare =
-            tokio::task::spawn_blocking(move || assembler(premiere, depart_ms, suivantes))
-                .await
-                .ok()?;
+        let prepare = tokio::task::spawn_blocking(move || {
+            assembler_avec_tranches(premiere, depart_ms, suivantes)
+        })
+        .await
+        .ok()?;
         match prepare {
             Ok(f) if f.lignes.len() >= 2 => Some(f),
             Ok(_) => {

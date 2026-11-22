@@ -434,3 +434,105 @@ fn l_en_tete_suivant_se_lit_et_se_type_5204() {
         RefusDEnchainement::Interrompu
     );
 }
+
+/// #8788 — les tags placés APRÈS data ne sont pas des échantillons. Le
+/// lecteur partagé et les bras exclusifs prennent cette même amorce.
+#[test]
+fn le_wav_enchaine_ne_joue_pas_le_chunk_list_apres_data_8788() {
+    let audio = pcm(6 * 16, 7);
+    let mut fichier = wav(705_600, 24, 2, &audio);
+    fichier.extend_from_slice(b"LIST");
+    fichier.extend_from_slice(&18u32.to_le_bytes());
+    fichier.extend_from_slice(b"INFOISFT");
+    fichier.extend_from_slice(&6u32.to_le_bytes());
+    fichier.extend_from_slice(b"Codex\0");
+    let taille_riff = fichier.len() as u32 - 8;
+    fichier[4..8].copy_from_slice(&taille_riff.to_le_bytes());
+    let mut lecteur = Cursor::new(fichier);
+    let entete = lire_l_entete_enchainee(&mut lecteur, &AtomicBool::new(false)).unwrap();
+    assert_eq!(
+        entete.amorce(),
+        audio,
+        "#8788 : les métadonnées LIST après data sont livrées comme du PCM"
+    );
+}
+
+#[test]
+fn un_wav_data_vide_ne_joue_pas_ses_metadonnees_8788() {
+    let mut fichier = wav(44_100, 16, 2, &[]);
+    fichier.extend_from_slice(b"LIST");
+    fichier.extend_from_slice(&4u32.to_le_bytes());
+    fichier.extend_from_slice(b"INFO");
+    let taille_riff = fichier.len() as u32 - 8;
+    fichier[4..8].copy_from_slice(&taille_riff.to_le_bytes());
+    let entete =
+        lire_l_entete_enchainee(&mut Cursor::new(fichier), &AtomicBool::new(false)).unwrap();
+    assert!(
+        entete.amorce().is_empty(),
+        "#8788 : un data vide devient du bruit de métadonnées"
+    );
+}
+
+#[test]
+fn le_wav_http_s_arrete_a_data_apres_plusieurs_lectures_8788() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    for enchaine in [false, true] {
+        for taille_inconnue in [None, Some(u32::MAX), Some(0x7FFF_FFFF - 36)] {
+            let audio = pcm(12_000, 11);
+            let mut fichier = wav(705_600, 24, 2, &audio);
+            if let Some(taille) = taille_inconnue {
+                fichier[40..44].copy_from_slice(&taille.to_le_bytes());
+            } else {
+                fichier.extend_from_slice(b"LIST");
+                fichier.extend_from_slice(&4u32.to_le_bytes());
+                fichier.extend_from_slice(b"INFO");
+                let taille_riff = fichier.len() as u32 - 8;
+                fichier[4..8].copy_from_slice(&taille_riff.to_le_bytes());
+            }
+            let serveur = TcpListener::bind("127.0.0.1:0").unwrap();
+            let adresse = serveur.local_addr().unwrap();
+            let fil = std::thread::spawn(move || {
+                let (mut socket, _) = serveur.accept().unwrap();
+                socket
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .unwrap();
+                // Une requête TCP peut arriver en plusieurs lectures.
+                let mut demande = Vec::new();
+                while !demande.ends_with(b"\r\n\r\n") {
+                    let mut octet = [0];
+                    socket.read_exact(&mut octet).unwrap();
+                    demande.push(octet[0]);
+                    assert!(demande.len() <= 4096, "requête HTTP factice trop longue");
+                }
+                let mut reponse = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: audio/wav\r\nConnection: close\r\n\r\n", fichier.len()).into_bytes();
+                reponse.extend(fichier);
+                socket.write_all(&reponse).unwrap();
+            });
+            let arret = Arc::new(AtomicBool::new(false));
+            let mut lecteur = super::lecture_http::LecteurHttpAnnulable::ouvrir(
+                &format!("http://{adresse}/piste.wav"),
+                arret.clone(),
+            )
+            .unwrap();
+            let mut rendu = if enchaine {
+                let entete = lire_l_entete_enchainee(&mut lecteur, &arret).unwrap();
+                lecteur.borner(entete.restant);
+                entete.amorce().to_vec()
+            } else {
+                let mut entete = vec![0; 4096];
+                let n = lecteur.read(&mut entete).unwrap();
+                entete.truncate(n);
+                let (_, _, _, debut) = parse_wav_header(&entete).unwrap();
+                lecteur.borner(super::borner_donnees_wav(&mut entete, debut));
+                entete[debut..].to_vec()
+            };
+            lecteur.read_to_end(&mut rendu).unwrap();
+            fil.join().unwrap();
+            assert_eq!(
+                rendu, audio,
+                "#8788 : le lecteur HTTP livre des tags ou tronque le WAV en continu (enchaîné={enchaine}, taille={taille_inconnue:?})"
+            );
+        }
+    }
+}

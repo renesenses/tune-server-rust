@@ -13,6 +13,16 @@
 //! la consigne, aucune amplitude ne dépasse `plafond` (−6 dBFS par défaut,
 //! non négociable, note §5 risque 5). Une consigne au-dessus est écrêtée et
 //! comptée (`consignes_ecretees`), ce que les essais vérifient.
+//!
+//! #9066 — le générateur est CADENCÉ sur l'écoute ([`Deroule::cadencer_sur_l_ecoute`]) :
+//! il n'a jamais plus d'une courte avance (quelques centaines de ms) sur ce
+//! que le micro a capté depuis l'ouverture. Sans cette borne, la pompe le tirait
+//! aussi vite que le chemin de lecture acceptait : canal de la session (256
+//! tronçons de 10 ms ici), tampons HTTP, anneau de la sortie locale (2 s).
+//! Tout ce silence d'avance passait AVANT le balayage complet, qui sortait
+//! des enceintes après la fin de la fenêtre d'écoute (« rapport
+//! crête/bruit », fil 2914). La lecture musicale n'est pas touchée : seul ce
+//! `Read` attend.
 
 use std::io::{self, Read};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -141,6 +151,26 @@ impl Plan {
     }
 }
 
+/// #9066 — l'horloge de l'écoute : le nombre de trames captées par le micro
+/// depuis le début de la capture. C'est elle, et non l'horloge murale, qui
+/// règle le débit du générateur : la mesure attend des TRAMES captées.
+pub type HorlogeDEcoute = Arc<dyn Fn() -> u64 + Send + Sync>;
+
+/// #9066 — attente maximale du générateur pour un bloc, si l'écoute ne
+/// progresse plus (capture arrêtée en fin de mesure, micro décroché). Au-delà,
+/// un bloc de SILENCE part : la pompe ne reste jamais bloquée (son verrou de
+/// lecture est attendu par l'arrêt de la zone), et le segment en cours
+/// n'avance pas — aucune salve ni aucun balayage ne sort en rafales de clics
+/// au volume de mesure pendant que personne n'écoute.
+const ATTENTE_MAX_PAR_BLOC: Duration = Duration::from_millis(100);
+
+#[derive(Clone)]
+struct Cadence {
+    horloge: HorlogeDEcoute,
+    /// Avance permise sur l'écoute, en trames.
+    avance: u64,
+}
+
 struct EtatDeroule {
     en_attente: Option<Consigne>,
     emissions: Vec<Emission>,
@@ -159,6 +189,9 @@ pub struct Deroule {
     signal: Condvar,
     annule: AtomicBool,
     pub consignes_ecretees: AtomicU64,
+    /// #9066 — le débit du générateur, réglé sur l'écoute. `None` : tiré
+    /// librement (essais unitaires du générateur seul).
+    cadence: Mutex<Option<Cadence>>,
     /// Balayages pré-calculés à amplitude 1 ; l'amplitude s'applique à la
     /// copie, au moment de jouer.
     salve_unitaire: Sweep,
@@ -187,6 +220,7 @@ impl Deroule {
             signal: Condvar::new(),
             annule: AtomicBool::new(false),
             consignes_ecretees: AtomicU64::new(0),
+            cadence: Mutex::new(None),
             salve_unitaire,
             balayage_unitaire,
         })
@@ -204,6 +238,24 @@ impl Deroule {
 
     pub fn balayage(&self) -> &Sweep {
         &self.balayage_unitaire
+    }
+
+    /// #9066 — règle le débit du générateur sur l'écoute : à tout instant, il
+    /// n'a pas rendu plus de `avance_trames` au-delà de ce que `horloge` a
+    /// compté depuis sa première lecture. À poser AVANT que la zone n'ouvre
+    /// le flux.
+    pub fn cadencer_sur_l_ecoute(&self, horloge: HorlogeDEcoute, avance_trames: u64) {
+        *self.cadence.lock().unwrap_or_else(|e| e.into_inner()) = Some(Cadence {
+            horloge,
+            avance: avance_trames,
+        });
+    }
+
+    fn cadence(&self) -> Option<Cadence> {
+        self.cadence
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// Donne une consigne ; la précédente non encore prise est remplacée.
@@ -310,6 +362,9 @@ pub struct Generateur {
     trames_rendues: u64,
     trames_max: u64,
     reste: Vec<u8>,
+    /// #9066 — l'horloge de l'écoute lue à la première lecture : l'origine
+    /// commune du flux et de l'écoute.
+    origine_ecoute: Option<u64>,
 }
 
 impl Generateur {
@@ -326,6 +381,7 @@ impl Generateur {
             trames_rendues: 0,
             trames_max,
             reste: Vec::new(),
+            origine_ecoute: None,
         }
     }
 
@@ -388,6 +444,44 @@ impl Generateur {
         }
     }
 
+    /// #9066 — attend que l'écoute permette `bloc` trames de plus. Voir
+    /// [`Deroule::cadencer_sur_l_ecoute`] et [`ATTENTE_MAX_PAR_BLOC`].
+    /// `false` : l'écoute n'a pas suivi à temps, le bloc doit être du silence.
+    fn attendre_l_ecoute(&mut self, bloc: u64) -> bool {
+        let Some(cadence) = self.deroule.cadence() else {
+            return true;
+        };
+        let origine = *self
+            .origine_ecoute
+            .get_or_insert_with(|| (cadence.horloge)());
+        let echeance = Instant::now() + ATTENTE_MAX_PAR_BLOC;
+        loop {
+            let ecoute = (cadence.horloge)().saturating_sub(origine);
+            if self.trames_rendues + bloc <= ecoute + cadence.avance
+                || self.deroule.annulee()
+                || self.deroule.fini()
+            {
+                return true;
+            }
+            if Instant::now() >= echeance {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    /// #9066 — `n` trames de silence au plus (dans la longueur promise), sans
+    /// prendre de consigne ni avancer le segment en cours.
+    fn silence(&mut self, n: usize) -> Vec<u8> {
+        if self.deroule.annulee() || (self.deroule.fini() && self.segment.is_none()) {
+            return Vec::new();
+        }
+        let n = (n as u64).min(self.trames_max.saturating_sub(self.trames_rendues));
+        self.trames_rendues += n;
+        self.deroule.verrou().trames_rendues = self.trames_rendues;
+        vec![0u8; (n * self.deroule.plan.format.octets_par_trame()) as usize]
+    }
+
     /// Produit `n` trames au plus, en octets.
     fn produire(&mut self, n: usize) -> Vec<u8> {
         let mut sortie =
@@ -439,7 +533,11 @@ impl Read for Generateur {
         if self.reste.is_empty() {
             // Des blocs de 10 ms : une consigne est prise au bloc suivant.
             let bloc = (self.deroule.plan.format.frequence / 100).max(1) as usize;
-            self.reste = self.produire(bloc);
+            self.reste = if self.attendre_l_ecoute(bloc as u64) {
+                self.produire(bloc)
+            } else {
+                self.silence(bloc)
+            };
             if self.reste.is_empty() {
                 let mut e = self.deroule.verrou();
                 e.fini = true;
@@ -566,6 +664,71 @@ mod tests {
         assert_eq!(em.debut_trame, 4_800);
         assert_eq!(em.trames, 48_000);
         assert_eq!(em.niveau_dbfs, -30.0);
+    }
+
+    /// #9066 — cadencé sur l'écoute, le générateur ne prend pas plus que
+    /// l'avance permise, quoi que la pompe lui demande ; il suit l'écoute
+    /// quand elle avance.
+    #[test]
+    fn cadence_sur_l_ecoute_le_generateur_ne_prend_pas_d_avance_9066() {
+        let d = Deroule::new(plan());
+        let ecoute = Arc::new(AtomicU64::new(1_000));
+        let e = ecoute.clone();
+        d.cadencer_sur_l_ecoute(Arc::new(move || e.load(Ordering::SeqCst)), 4_800);
+        let mut g = Generateur::new(d.clone());
+        let mut buf = vec![0u8; 32 * 1024];
+        // L'écoute ne bouge pas : 100 ms d'avance, puis seulement le repli
+        // lent (un bloc par attente maximale).
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_millis(250) {
+            assert!(g.read(&mut buf).unwrap() > 0);
+        }
+        let rendues = d.trames_rendues();
+        assert!(
+            (4_800..=4_800 + 4 * 480).contains(&rendues),
+            "{rendues} trames rendues pour 4 800 permises"
+        );
+        // L'écoute avance d'une seconde : le générateur suit, sans plus.
+        ecoute.fetch_add(48_000, Ordering::SeqCst);
+        while d.trames_rendues() < 48_000 + 4_800 {
+            assert!(g.read(&mut buf).unwrap() > 0);
+        }
+        assert!(d.trames_rendues() <= 48_000 + 4_800 + 4 * 480);
+    }
+
+    /// #9066 (relecture) — micro figé pendant une salve : passé l'avance
+    /// permise, le repli ne rend que du SILENCE, et le segment n'avance pas.
+    /// Avant, chaque repli laissait partir 10 ms de salve : des rafales de
+    /// clics au volume de mesure.
+    #[test]
+    fn micro_fige_le_repli_rend_du_silence_sans_avancer_le_segment_9066() {
+        let d = Deroule::new(plan());
+        d.cadencer_sur_l_ecoute(Arc::new(|| 0), 9_600);
+        d.consigner(Consigne::Salve { niveau_dbfs: -12.0 });
+        let mut g = Generateur::new(d.clone());
+        let mut lu = Vec::new();
+        let mut buf = vec![0u8; 32 * 1024];
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_millis(350) {
+            let n = g.read(&mut buf).unwrap();
+            assert!(n > 0);
+            lu.extend_from_slice(&buf[..n]);
+        }
+        // 200 ms permises : au-delà du fondu d'entrée de la salve (~100 ms).
+        let octets_permis = 9_600 * 6;
+        assert!(
+            lu.len() > octets_permis,
+            "aucun repli : {} octets",
+            lu.len()
+        );
+        assert!(crete_24(&lu[..octets_permis]) > 0.05, "la salve est partie");
+        assert_eq!(
+            crete_24(&lu[octets_permis..]),
+            0.0,
+            "du signal est sorti pendant que le micro était figé"
+        );
+        // Le segment est resté là où l'écoute l'a laissé.
+        assert_eq!(g.segment.as_ref().map(|s| s.position), Some(9_600));
     }
 
     #[test]

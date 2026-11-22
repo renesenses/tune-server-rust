@@ -55,7 +55,7 @@ jobs:
   # ───────────────────────────────────────────────────────────────────────────
   contre-epreuve:
     name: Contre-épreuve de la garde de topologie
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -71,7 +71,7 @@ jobs:
     name: Base de la PR
     needs: contre-epreuve
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -134,7 +134,7 @@ jobs:
   lots-orphelins:
     name: Lots en avance sur main sans PR
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4

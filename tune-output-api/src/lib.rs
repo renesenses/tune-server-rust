@@ -2028,6 +2028,11 @@ pub struct TransformationsReelles {
     surechantillonnage: Option<(&'static str, i32)>,
     /// Motif observé à l'ouverture lorsque le suréchantillonneur ne tourne pas.
     refus_surechantillonnage: Option<&'static str>,
+    /// tune-server-rust, 19/11/2026 — l'écart de niveau qui RESTE, en
+    /// centièmes de dB (≤ 0), entre la lecture avec le suréchantillonneur et
+    /// la même sans lui, une fois sa réserve compensée dans le gain de rendu.
+    /// `None` quand il ne tourne pas ou que la sortie ne le dit pas.
+    ecart_de_niveau_surechantillonnage: Option<i32>,
 }
 
 impl TransformationsReelles {
@@ -2045,6 +2050,7 @@ impl TransformationsReelles {
             preampli_garde: None,
             surechantillonnage: None,
             refus_surechantillonnage: None,
+            ecart_de_niveau_surechantillonnage: None,
         }
     }
 
@@ -2071,6 +2077,27 @@ impl TransformationsReelles {
     pub fn surechantillonnage(&self) -> Option<(&'static str, f64)> {
         self.surechantillonnage
             .map(|(filtre, centiemes)| (filtre, f64::from(centiemes) / 100.0))
+    }
+
+    /// tune-server-rust, 19/11/2026 — la même déclaration, en disant l'écart
+    /// de niveau (dB, ≤ 0) qui reste entre la lecture avec le
+    /// suréchantillonneur et sans lui, réserve compensée : `0` quand les
+    /// niveaux sont égaux, la réserve entière quand le volume est à 100 %.
+    /// Sans effet quand le suréchantillonneur ne tourne pas. Additif.
+    #[must_use]
+    pub fn avec_ecart_de_niveau_surechantillonnage(mut self, ecart_db: f64) -> Self {
+        self.ecart_de_niveau_surechantillonnage = (self.surechantillonnage.is_some()
+            && ecart_db.is_finite())
+        .then(|| (ecart_db.min(0.0) * 100.0).round() as i32);
+        self
+    }
+
+    /// tune-server-rust, 19/11/2026 — voir
+    /// [`Self::avec_ecart_de_niveau_surechantillonnage`].
+    #[must_use]
+    pub fn ecart_de_niveau_surechantillonnage(&self) -> Option<f64> {
+        self.ecart_de_niveau_surechantillonnage
+            .map(|centiemes| f64::from(centiemes) / 100.0)
     }
 
     /// Diagnostic additif : il ne change aucun verdict ni aucune transformation.

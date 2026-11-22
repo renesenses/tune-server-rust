@@ -256,6 +256,45 @@ pub fn sql_pistes_du_dossier(engine: Engine, depart_enfant: usize) -> String {
     )
 }
 
+/// #9116 — combien de pistes sous un dossier, en s'arrêtant à `plafond` :
+/// `SELECT COUNT(*)` d'au plus `plafond` entrées de [`INDEX_CHEMIN_DOSSIER_SQLITE`]
+/// (plage de [`plage_du_dossier`], paramètres 1 et 2 = [`bornes_du_dossier`]).
+/// Sert à décider, sans arbre exact, si la plage récursive de
+/// [`sql_pistes_du_dossier`] est bon marché (un album) ou non (un disque
+/// entier) — sans jamais parcourir plus de `plafond` entrées.
+pub fn sql_compter_sous_dossier_plafonne(engine: Engine, plafond: usize) -> String {
+    let (p1, p2) = match engine {
+        Engine::Postgres => ("$1", "$2"),
+        Engine::Sqlite => ("?1", "?2"),
+    };
+    let plage = plage_du_dossier(engine, CHEMIN_DE_LA_PISTE, p1, p2);
+    format!("SELECT COUNT(*) FROM (SELECT 1 FROM tracks WHERE {plage} LIMIT {plafond}) AS s")
+}
+
+/// #9116 — les mêmes colonnes, dans le même ordre et triées de même, que
+/// [`sql_pistes_du_dossier`], mais pour `n` identifiants (`?1`…`?n`) : les
+/// pistes directes d'un dossier, que [`super::arbre_des_dossiers`] connaît
+/// déjà. Plus de plage récursive sur tout ce qui est sous le dossier.
+pub fn sql_pistes_par_ids(engine: Engine, n: usize) -> String {
+    let marques: Vec<String> = (1..=n)
+        .map(|i| match engine {
+            Engine::Postgres => format!("${i}"),
+            Engine::Sqlite => format!("?{i}"),
+        })
+        .collect();
+    format!(
+        "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, \
+               t.disc_number, t.track_number, t.duration_ms, t.file_path, \
+               t.format, t.sample_rate, t.bit_depth, t.genre, t.year, al.cover_path, \
+               COALESCE(t.file_path, t.cue_media_path) \
+               FROM tracks t LEFT JOIN albums al ON t.album_id = al.id \
+               LEFT JOIN artists ar ON t.artist_id = ar.id \
+               WHERE t.id IN ({}) \
+               ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title",
+        marques.join(", ")
+    )
+}
+
 /// Le texte SQL de [`compter_pistes_par_sous_dossier`]. Paramètres, dans
 /// l'ordre : le motif de [`folder_like_pattern`], le séparateur, puis les deux
 /// bornes de [`bornes_du_dossier`]. Public pour que les tests lisent le plan
@@ -359,6 +398,54 @@ pub fn compter_pistes_par_sous_dossier(
         comptes,
         replier_la_casse: !postgres,
     })
+}
+
+/// #9116 — le texte SQL de [`compter_pistes_sous_dossier`]. Paramètres : le
+/// motif de [`folder_like_pattern`], puis (PostgreSQL seulement) les deux
+/// bornes de [`bornes_du_dossier`]. Public pour que les témoins lisent le plan
+/// de la requête même que la route exécute.
+///
+/// Le résultat est celui de la route d'avant, à l'unité près, sur les deux
+/// moteurs (`file_path LIKE …` : une tranche CUE n'y est pas comptée) ; seul le
+/// chemin d'accès change, moteur par moteur, MESURÉ (banc
+/// `banc_repertoires_9116`, 544 147 pistes, une racine qui couvre toute la
+/// bibliothèque) :
+///
+/// * **SQLite** : le `LIKE` seul se lit dans l'index de `file_path`, sans
+///   toucher la table (`SCAN tracks USING COVERING INDEX`) — 84 ms. La plage de
+///   [`plage_du_dossier`] y COÛTE plus (259 ms) : l'index du chemin n'est pas
+///   couvrant et chaque entrée relit sa ligne. La requête reste donc telle
+///   quelle ; c'est le cache par révision de la route qui supprime la relecture.
+/// * **PostgreSQL** : un `LIKE $1` préparé ne peut partir d'aucun index (plan
+///   générique) et parcourt la table ; la plage sur
+///   [`INDEX_CHEMIN_DOSSIER_PG`] le borne, le `LIKE` reste la garde exacte.
+pub fn sql_compter_pistes_sous_dossier(engine: Engine) -> String {
+    let esc = like_escape_clause();
+    match engine {
+        Engine::Sqlite => format!("SELECT COUNT(*) FROM tracks WHERE file_path LIKE ?1{esc}"),
+        Engine::Postgres => {
+            let plage = plage_du_dossier(engine, CHEMIN_DE_LA_PISTE, "$2", "$3");
+            format!("SELECT COUNT(*) FROM tracks WHERE {plage} AND file_path LIKE $1{esc}")
+        }
+    }
+}
+
+/// #9116 (fil 2935) — le nombre de pistes sous `dossier`, récursivement :
+/// le compte d'une racine de la vue Répertoires (`GET /library/browse`).
+/// Voir [`sql_compter_pistes_sous_dossier`] pour le chemin d'accès.
+pub fn compter_pistes_sous_dossier(backend: &dyn DbBackend, dossier: &str) -> Result<i64, String> {
+    let motif = folder_like_pattern(dossier);
+    let (bas, haut) = bornes_du_dossier(dossier);
+    let params: [&dyn ToSqlValue; 3] = [&motif, &bas, &haut];
+    let n = match backend.engine() {
+        Engine::Sqlite => 1,
+        Engine::Postgres => 3,
+    };
+    let sql = sql_compter_pistes_sous_dossier(backend.engine());
+    Ok(backend
+        .query_one(&sql, &params[..n])?
+        .and_then(|r| r.first().and_then(|v| v.as_i64()))
+        .unwrap_or(0))
 }
 
 /// Un dossier tel que le lisent les requêtes « exactes » du parcours par
@@ -1255,9 +1342,10 @@ pub mod sql {
     /// que l'album masqué demeure jouable depuis une file ou une playlist.
     pub fn list_by_artist<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE t.artist_id = {} AND {} ORDER BY al.year, al.title, CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER)",
+            "{} WHERE (t.artist_id = {} OR t.artist_id IN (SELECT adc.credit_id FROM artistes_des_credits adc WHERE adc.artiste_id = {})) AND {} ORDER BY al.year, al.title, CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER)",
             select_track(),
             d.placeholder(1),
+            d.placeholder(2),
             crate::db::facet_filter::hidden_tracks_excluded()
         )
     }
@@ -2529,6 +2617,40 @@ impl TrackRepo {
         Ok(self.db.execute(&sql, &params)? as u64)
     }
 
+    /// #9014 — pose les BORNES d'une tranche CUE déjà en base, et seulement
+    /// si elles changent. Rend le nombre de lignes modifiées (0 ou 1).
+    ///
+    /// [`Self::update`] n'écrit pas les colonnes `cue_*`. Or la fin d'une
+    /// tranche dépend de la piste SUIVANTE : quand le début de celle-ci bouge
+    /// (feuille retouchée, ou parseur corrigé comme pour l'`INDEX 02`), la
+    /// ligne gardait l'ancienne fin et jouait le début de la piste d'après.
+    /// Et une tranche recalée (voir `cue_bibliotheque::tranche_deplacee`)
+    /// doit recevoir son nouveau début.
+    ///
+    /// Conditionnelle (`IS NOT` / `IS DISTINCT FROM`) : un rescan sans
+    /// changement ne touche aucune ligne, donc ne relance pas le déclencheur
+    /// plein texte `tracks_fts_update` sous SQLite.
+    pub fn poser_bornes_de_tranche(
+        &self,
+        id: i64,
+        debut_ms: i64,
+        fin_ms: Option<i64>,
+    ) -> Result<usize, TuneError> {
+        let sql = match self.db.engine() {
+            Engine::Postgres => {
+                "UPDATE tracks SET cue_start_ms = $1, cue_end_ms = $2 \
+                 WHERE id = $3 AND (cue_start_ms IS DISTINCT FROM $1 \
+                 OR cue_end_ms IS DISTINCT FROM $2)"
+            }
+            Engine::Sqlite => {
+                "UPDATE tracks SET cue_start_ms = ?1, cue_end_ms = ?2 \
+                 WHERE id = ?3 AND (cue_start_ms IS NOT ?1 OR cue_end_ms IS NOT ?2)"
+            }
+        };
+        let params: [&dyn ToSqlValue; 3] = [&debut_ms, &fin_ms, &id];
+        self.db.execute(sql, &params).map_err(TuneError::Db)
+    }
+
     /// #5073 — les tranches que la base porte pour ce fichier image, en
     /// `(id, cue_start_ms)` : ce qu'une feuille relue confronte à ce qu'elle
     /// décrit désormais (`cue_bibliotheque::relire_le_dossier`).
@@ -3355,6 +3477,32 @@ impl TrackRepo {
         mtime: f64,
         file_size: i64,
     ) -> Result<(), TuneError> {
+        self.update_file_stats(file_path, mtime, file_size, false)
+    }
+
+    /// Remet en phase une écriture de balises faite par Tune (#8864).
+    ///
+    /// L'appelant a vérifié que le fichier correspondait à sa ligne AVANT
+    /// l'écriture. Taille, date et marque d'enrichissement encore valide
+    /// avancent ensemble ; l'issue et le délai des 503 restent intacts.
+    /// Réservé à une base migrée et aux réécritures internes : un scan qui
+    /// importe une modification extérieure ne doit pas employer ce chemin.
+    pub fn update_mtime_and_size_after_tag_write(
+        &self,
+        file_path: &str,
+        mtime: f64,
+        file_size: i64,
+    ) -> Result<(), TuneError> {
+        self.update_file_stats(file_path, mtime, file_size, true)
+    }
+
+    fn update_file_stats(
+        &self,
+        file_path: &str,
+        mtime: f64,
+        file_size: i64,
+        preserve_enrichment: bool,
+    ) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::update_mtime_and_size, sql::update_mtime_and_size);
         // #4546 : c'est ici que la retouche d'étiquettes avance le `mtime`.
         if let Some(chemin) = chemin_local(Some(file_path)) {
@@ -3365,7 +3513,32 @@ impl TrackRepo {
             );
         }
         let params: [&dyn ToSqlValue; 3] = [&mtime, &file_size, &file_path];
-        self.db.execute(&sql, &params)?;
+        if !preserve_enrichment {
+            self.db.execute(&sql, &params)?;
+            return Ok(());
+        }
+        let (p1, p2) = self.marqueurs2();
+        // Seule une marque encore valable avant la réécriture suit la date.
+        // Un scan extérieur qui l'avait déjà périmée reste visible.
+        let suivre = format!(
+            "UPDATE enrich_tentatives SET mtime_vu = CAST(CAST({p1} AS DOUBLE PRECISION) AS TEXT) \
+             WHERE track_id IN (SELECT t.id FROM tracks t WHERE t.file_path = {p2} \
+             AND COALESCE(enrich_tentatives.mtime_vu, '') = \
+                 COALESCE(CAST(t.file_mtime AS TEXT), ''))"
+        );
+        self.db.write_tx(&mut |tx| {
+            // SQLite sérialise déjà les écritures ; PostgreSQL doit empêcher
+            // un scan de modifier ces lignes entre la marque et leur date.
+            if self.db.engine() == Engine::Postgres {
+                tx.query_many(
+                    "SELECT id FROM tracks WHERE file_path = $1 FOR UPDATE",
+                    &[&file_path],
+                )?;
+            }
+            tx.execute(&suivre, &[&mtime, &file_path])?;
+            tx.execute(&sql, &params)?;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -3595,8 +3768,9 @@ impl TrackRepo {
     }
 
     pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Track>, TuneError> {
+        // #9265 — les pistes de ses crédits composés reliés comptent aussi.
         let sql = self.dialect_sql(sql::list_by_artist, sql::list_by_artist);
-        let params: [&dyn ToSqlValue; 1] = [&artist_id];
+        let params: [&dyn ToSqlValue; 2] = [&artist_id, &artist_id];
         let rows = self.db.query_many_strong(&sql, &params)?;
         Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }
@@ -4040,13 +4214,22 @@ impl TrackRepo {
     /// est jointe par `AND` **autour de la parenthèse entière**. Sans elle,
     /// `A AND B OR C OR D` se lirait `(A AND B) OR C OR D` et ne filtrerait
     /// rien du tout.
+    ///
+    /// #8958 — chaque raison porte son propre filtre des alertes marquées
+    /// normales ([`alertes_douteuses_ignorees::clause_non_ignoree`]) : une
+    /// piste dont l'artiste manque ET qui est très courte reste listée tant
+    /// qu'une des deux alertes n'est pas ignorée.
     fn where_doubtful() -> String {
+        use crate::db::alertes_douteuses_ignorees::clause_non_ignoree;
         format!(
             "WHERE {piste_locale} \
-               AND ((ar.name IS NULL OR ar.name = '' OR ar.name = 'Unknown Artist') \
-                OR (t.duration_ms > 0 AND t.duration_ms < 5000) \
-                OR (al.title IS NULL OR al.title = ''))",
+               AND (((ar.name IS NULL OR ar.name = '' OR ar.name = 'Unknown Artist') AND {sans_artiste}) \
+                OR (t.duration_ms > 0 AND t.duration_ms < 5000 AND {tres_courte}) \
+                OR ((al.title IS NULL OR al.title = '') AND {sans_album}))",
             piste_locale = sql::PISTE_LOCALE,
+            sans_artiste = clause_non_ignoree("missing_artist"),
+            tres_courte = clause_non_ignoree("very_short"),
+            sans_album = clause_non_ignoree("missing_album"),
         )
     }
 
@@ -7943,6 +8126,10 @@ mod tests_notes_du_profil_7594 {
 #[cfg(test)]
 #[path = "track_repo_repertoires_5998_tests.rs"]
 mod repertoires_5998_tests;
+
+#[cfg(test)]
+#[path = "track_repo_racines_9116_tests.rs"]
+mod racines_9116_tests;
 
 #[cfg(test)]
 #[path = "track_repo_ordre_fichiers_6222_tests.rs"]

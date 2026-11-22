@@ -218,7 +218,7 @@ impl OutputTarget for SqueezeboxOutput {
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
-        info!(player = %self.device_id, url = media.url, "squeezebox_play");
+        info!(player = %self.device_id, url = %crate::confidentialite::masquer_url(&media.url), "squeezebox_play");
 
         // Power on the player first
         if let Err(e) = self.player_command("power 1") {
