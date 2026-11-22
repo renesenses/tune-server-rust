@@ -44,6 +44,7 @@ pub mod facet_filter;
 pub mod facettes_classiques;
 pub mod favorite_facets_repo;
 pub mod favorites_reconcile;
+pub mod fil_de_fond;
 /// #5314 — le genre posé sur un album vaut pour ses pistes.
 pub mod genre_album_pistes;
 /// Albums masqués (#1391) — marqueurs réconciliés, sur le modèle des favoris.

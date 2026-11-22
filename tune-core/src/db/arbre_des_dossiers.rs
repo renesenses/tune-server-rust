@@ -458,23 +458,10 @@ fn lancer_en_fond(db: &Arc<dyn DbBackend>) -> bool {
         let _fin = fin;
         let _ = lire(db.as_ref());
     };
-    match tokio::runtime::Handle::try_current() {
-        Ok(executeur) => {
-            drop(executeur.spawn_blocking(travail));
-        }
-        Err(_) => {
-            // Hors de tout exécuteur (outil, test synchrone) : un fil à lui.
-            // En cas d'échec, la fermeture abandonnée relâche `EN_FOND`.
-            if let Err(e) = std::thread::Builder::new()
-                .name("arbre-dossiers".into())
-                .spawn(travail)
-            {
-                tracing::warn!(error = %e, "arbre_des_dossiers_fil_impossible");
-                return false;
-            }
-        }
-    }
-    true
+    // Hors de tout exécuteur (outil, test synchrone) : un fil à lui, avec un
+    // exécuteur dédié (#9260). En cas d'échec, la fermeture abandonnée
+    // relâche `EN_FOND`.
+    crate::db::fil_de_fond::lancer("arbre-dossiers", travail)
 }
 
 /// Pour les témoins (ici et dans tune-server) : retient toute construction

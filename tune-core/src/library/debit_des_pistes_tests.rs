@@ -319,3 +319,93 @@ fn le_reglage_coupe_la_passe_6332() {
         "réglage coupé : aucune passe lancée"
     );
 }
+
+/// #9260 — lance la passe de fond et attend qu'elle ait complété `id` et
+/// relâché `EN_COURS`. Un drapeau resté pris (le fil nu mort sous
+/// PostgreSQL) fait échouer à l'échéance.
+fn lancer_et_attendre(db: &Arc<dyn DbBackend>, id: i64, attendu: i32) {
+    let debut = std::time::Instant::now();
+    let mut lancee = false;
+    loop {
+        let pris = EN_COURS.load(Ordering::SeqCst);
+        let lu = debit(db, id);
+        if lu == Some(attendu) && !pris {
+            return;
+        }
+        assert!(
+            debut.elapsed() < Duration::from_secs(30),
+            "#9260 : passe des débits jamais aboutie (lancée : {lancee}, \
+             débit : {lu:?}, EN_COURS resté pris : {pris})"
+        );
+        if !pris && lu.is_none() {
+            lancee |= lancer_en_fond(db.clone(), || false);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// SQLite, sans exécuteur Tokio (le repli du fil à lui) : non-régression.
+#[test]
+fn sqlite_la_passe_de_fond_aboutit_9260() {
+    let db = base_sqlite();
+    let dsf = piste(&db, "/m/9260/a.dsf", "dsf", None);
+    lancer_et_attendre(&db, dsf, 5644);
+}
+
+/// SQLite, dans un exécuteur Tokio (le pool bloquant) : non-régression.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sqlite_la_passe_de_fond_aboutit_sous_tokio_9260() {
+    tokio::task::spawn_blocking(|| {
+        let db = base_sqlite();
+        let dsf = piste(&db, "/m/9260/b.dsf", "dsf", None);
+        lancer_et_attendre(&db, dsf, 5644);
+    })
+    .await
+    .unwrap();
+}
+
+/// Une panique de la passe relâche `EN_COURS` (garde `Drop`).
+#[test]
+fn une_panique_relache_en_cours_9260() {
+    let resultat = std::panic::catch_unwind(|| {
+        let fin = FinDeLaPasse;
+        EN_COURS.store(true, Ordering::SeqCst);
+        let _fin = fin;
+        panic!("panique voulue (#9260)");
+    });
+    assert!(resultat.is_err());
+    assert!(
+        !EN_COURS.load(Ordering::SeqCst),
+        "#9260 : EN_COURS resté pris après une panique"
+    );
+}
+
+/// PostgreSQL : le défaut lui-même. Sans le correctif, le fil nu panique à
+/// la première requête et `EN_COURS` ne retombe jamais.
+#[cfg(feature = "postgres")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pg_9260_la_passe_des_debits_aboutit() {
+    let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
+        eprintln!("SAUT : TUNE_TEST_PG_URL non posée");
+        return;
+    };
+    let pool = sqlx::PgPool::connect(&url).await.expect("connexion PG");
+    for sql in crate::db::postgres::ENSURE_TABLES
+        .iter()
+        .chain(crate::db::postgres::ENSURE_COLUMNS.iter())
+    {
+        let _ = sqlx::raw_sql(*sql).execute(&pool).await;
+    }
+    crate::db::migrations::run_pg_migrations(&pool)
+        .await
+        .unwrap_or_else(|e| panic!("run_pg_migrations : {e}"));
+    let db: Arc<dyn DbBackend> = Arc::new(crate::db::backend::PostgresBackend::new(pool));
+    tokio::task::spawn_blocking(move || {
+        db.execute("TRUNCATE TABLE tracks RESTART IDENTITY CASCADE", &[])
+            .unwrap();
+        let dsf = piste(&db, "/m/9260/pg.dsf", "dsf", None);
+        lancer_et_attendre(&db, dsf, 5644);
+    })
+    .await
+    .unwrap();
+}

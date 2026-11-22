@@ -628,6 +628,16 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_le_debit_aller_retour_et_complement_6332 -- --nocapture --test-threads=1
 
+      # #9260 — les fils de fond `cles-de-tri` et `debit-des-pistes` sur une
+      # VRAIE base : lancés sur un fil std nu, le moteur PostgreSQL y paniquait
+      # (« there is no reactor running ») et leur drapeau restait pris. Les
+      # témoins vident `tracks` et partagent un état global : seuls, dans leur
+      # étape. Sans elle, ils prendraient leur saut annoncé.
+      - name: Fils de fond clés de tri et débits sur PostgreSQL (#9260)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_9260 -- --nocapture --test-threads=1
+
       # #7288 — le vrai `pg_dump` de la sauvegarde locale contre une VRAIE
       # base : le fichier produit est un dump custom. Sans cette étape, le
       # témoin prendrait son saut annoncé.
