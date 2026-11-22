@@ -7,23 +7,22 @@
 //! d'écriture, attendait la fin des 1000 écritures (23 à 52 s), puis
 //! rattrapait ses tours en rafale.
 //!
-//! ⚠️ Base de FICHIER : le banc mesure le verrou d'écriture réel.
+//! ⚠️ Base de FICHIER : le banc observe les transactions réelles.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::cell::Cell;
+use std::sync::Mutex;
+use std::thread::{self, ThreadId};
 
 use super::*;
+use crate::db::backend::{DbTxHandle, SqlValue};
+use crate::db::engine::Engine;
 use crate::db::sqlite::SqliteDb;
-use crate::db::zone_repo::ZoneRepo;
-
-/// Banc : assez de pistes pour qu'un balayage complet coûte, comme sur le .18.
-const PISTES_DU_BANC: i64 = 60_000;
 
 /// Contenu : la boucle d'avant balaie la table 1000 fois, on la garde petite.
 const PISTES_DU_CONTENU: i64 = 5_000;
 
-/// Les épreuves de ce module passent l'une après l'autre : le banc mesure des
-/// délais, une épreuve voisine qui écrase le processeur le fausserait.
+/// Les épreuves historiques de contenu restent sérialisées entre elles.
+/// La preuve de déport des écritures ne dépend plus de délais muraux.
 static UNE_A_LA_FOIS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 fn base(epreuve: &str, pistes: i64) -> (crate::test_scratch::ScratchDir, Arc<dyn DbBackend>) {
@@ -121,64 +120,131 @@ fn contenu(db: &Arc<dyn DbBackend>) -> Vec<String> {
     .collect()
 }
 
-/// Le banc : un sondeur factice (intervalle de 500 ms, rafale comme le vrai)
-/// enregistre la position d'une zone par le verrou d'écriture pendant que la
-/// synchronisation, lancée par `tokio::spawn` comme en production, applique
-/// 1000 enrichissements. Rend le pire écart entre deux tours du sondeur, la
-/// durée de l'application et le nombre de tours.
-async fn banc_du_sondeur() -> (Duration, Duration, i64) {
-    let (_dossier, db) = base("banc", PISTES_DU_BANC);
-    let arret = Arc::new(AtomicBool::new(false));
-    let sondeur = {
-        let db = db.clone();
-        let arret = arret.clone();
-        tokio::spawn(async move {
-            let mut iv = tokio::time::interval(Duration::from_millis(500));
-            iv.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Burst);
-            iv.tick().await;
-            let mut dernier = Instant::now();
-            let mut pire = Duration::ZERO;
-            let mut tours = 0i64;
-            while !arret.load(Ordering::Acquire) {
-                iv.tick().await;
-                ZoneRepo::with_backend(db.clone())
-                    .save_playback_position(1, tours * 1000, None, None, None)
-                    .ok();
-                let maintenant = Instant::now();
-                pire = pire.max(maintenant - dernier);
-                dernier = maintenant;
-                tours += 1;
-            }
-            (pire, tours)
+/// Observe les vraies écritures sans remplacer SQLite ni la boucle de production.
+/// Un délai mural mélangeait le blocage du sondeur avec la charge du runner.
+/// Ici, chaque accès SQL vérifie qu'il a quitté l'unique fil d'exécution async.
+struct BaseObservee {
+    db: Arc<dyn DbBackend>,
+    fil_async: ThreadId,
+    tailles: Arc<Mutex<Vec<usize>>>,
+}
+impl BaseObservee {
+    fn verifier_fil(&self) {
+        assert_ne!(
+            thread::current().id(),
+            self.fil_async,
+            "#6702 : une écriture communautaire occupe le fil du sondeur"
+        );
+    }
+}
+impl DbBackend for BaseObservee {
+    fn engine(&self) -> Engine {
+        self.db.engine()
+    }
+    fn execute(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<usize, String> {
+        self.verifier_fil();
+        self.db.execute(sql, params)
+    }
+    fn last_insert_rowid(&self) -> i64 {
+        self.db.last_insert_rowid()
+    }
+    fn query_one(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Option<Vec<SqlValue>>, String> {
+        self.verifier_fil();
+        self.db.query_one(sql, params)
+    }
+    fn query_many(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Vec<Vec<SqlValue>>, String> {
+        self.verifier_fil();
+        self.db.query_many(sql, params)
+    }
+    fn execute_batch(&self, sql: &str) -> Result<(), String> {
+        self.verifier_fil();
+        self.db.execute_batch(sql)
+    }
+    fn write_tx(
+        &self,
+        f: &mut dyn FnMut(&dyn DbTxHandle) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.verifier_fil();
+        self.db.write_tx(&mut |tx| {
+            let observe = TransactionObservee {
+                tx,
+                ecritures: Cell::new(0),
+            };
+            f(&observe)?;
+            self.tailles.lock().unwrap().push(observe.ecritures.get());
+            Ok(())
         })
-    };
-    tokio::time::sleep(Duration::from_millis(700)).await;
-
-    let debut = Instant::now();
-    let synchro = {
-        let db = db.clone();
-        tokio::spawn(async move { appliquer_les_enrichissements(&db, enrichissements()).await })
-    };
-    let applied = synchro.await.unwrap();
-    let duree = debut.elapsed();
-
-    tokio::time::sleep(Duration::from_millis(700)).await;
-    arret.store(true, Ordering::Release);
-    let (pire, tours) = sondeur.await.unwrap();
-    assert_eq!(applied, 1000, "1000 enrichissements appliqués sans erreur");
-    (pire, duree, tours)
+    }
+}
+struct TransactionObservee<'a> {
+    tx: &'a dyn DbTxHandle,
+    ecritures: Cell<usize>,
+}
+impl DbTxHandle for TransactionObservee<'_> {
+    fn execute(&self, sql: &str, params: &[&dyn ToSqlValue]) -> Result<usize, String> {
+        let result = self.tx.execute(sql, params)?;
+        self.ecritures.set(self.ecritures.get() + 1);
+        Ok(result)
+    }
+    fn query_one(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Option<Vec<SqlValue>>, String> {
+        self.tx.query_one(sql, params)
+    }
+    fn query_many(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSqlValue],
+    ) -> Result<Vec<Vec<SqlValue>>, String> {
+        self.tx.query_many(sql, params)
+    }
+    fn last_insert_rowid(&self) -> i64 {
+        self.tx.last_insert_rowid()
+    }
 }
 
-/// Un seul fil d'exécuteur : le travail synchrone de la synchronisation ne
-/// doit pas le tenir. Le sondeur ne reste jamais bloqué plus d'une seconde.
+/// Un seul worker : les requêtes doivent se faire hors de ce fil, par lots
+/// de cinquante au plus. La charge de la machine ne change pas ces propriétés.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn le_sondeur_n_est_jamais_bloque_plus_d_une_seconde_6702() {
-    let _seul = UNE_A_LA_FOIS.lock().await;
-    let (pire, duree, tours) = banc_du_sondeur().await;
+async fn les_lots_ne_tiennent_pas_le_fil_du_sondeur_6702() {
+    let (_dossier, db) = base("fil-du-sondeur", PISTES_DU_CONTENU);
+    let tailles = Arc::new(Mutex::new(Vec::new()));
+    let observees = tailles.clone();
+    let applied = tokio::spawn(async move {
+        let backend: Arc<dyn DbBackend> = Arc::new(BaseObservee {
+            db,
+            // Capturé sur le worker, pas sur le fil qui pilote #[tokio::test].
+            fil_async: thread::current().id(),
+            tailles: observees,
+        });
+        appliquer_les_enrichissements(&backend, enrichissements()).await
+    })
+    .await
+    .expect("la synchronisation ne doit pas écrire sur le fil du sondeur");
+    assert_eq!(applied, 1000, "1000 enrichissements appliqués sans erreur");
+    let tailles = tailles.lock().unwrap();
     assert!(
-        pire < Duration::from_secs(1),
-        "sondeur bloqué {pire:?} pendant l'application de 1000 enrichissements \
-         (application {duree:?}, {tours} tours)"
+        tailles.len() > 1,
+        "les enrichissements tiennent une seule transaction"
+    );
+    assert!(
+        tailles.iter().all(|&n| n > 0 && n <= 50),
+        "transaction trop longue : {tailles:?}"
+    );
+    assert_eq!(
+        tailles.iter().sum::<usize>(),
+        1000,
+        "écritures sorties des transactions courtes"
     );
 }
 
