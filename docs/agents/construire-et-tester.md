@@ -49,6 +49,10 @@ nohup cargo test -p tune-server --lib <filtre> > target/x.log 2>&1 &
 - `cargo test -p tune-smart-http` en entier : 198 tests, quelques secondes une
   fois compilé.
 
+Les témoins rendus déterministes et leurs contre-épreuves sont documentés dans
+[les notes par test](epreuves-instables/), une note par PR pour éviter les conflits
+entre validations indépendantes.
+
 ## Écrire un test dans tune-server
 
 - `tune-server` a `autotests = false` : un nouveau fichier de `tests/` exige un
@@ -166,17 +170,17 @@ fusion : lire la PR de groupe qui cite la PR unitaire
 `git diff --stat <commit unitaire> origin/<lot> -- <fichiers de la PR>` : une
 sortie vide veut dire que le contenu est fusionné.
 
-### Scan ciblé #8083 : isoler la porte globale des scans
+### ReplayGain #7724 : isoler les états du processus
 
-Le témoin d’ajout de dossier passe seul mais pouvait échouer dans la suite
-parallèle : la preuve de #9078 avait déjà identifié un autre détenteur du droit
-de scanner global. Le verrou de test ne couvre pas la durée de vie de toutes
-les tâches lancées ailleurs. Le même cas #8083 tourne désormais dans un
-processus neuf et vérifie qu’un test a réellement réussi, sans cas ignoré.
-La vraie route, les FLAC, les événements de progression et toutes les assertions
-de portée et de préservation des autres racines restent inchangés. La
-contre-épreuve remplace seulement la cible de `add_music_dir` par `None` ;
-un scan global doit encore faire échouer le témoin.
+Le verrou local de `replaygain_lancer_tests_6778` ne sérialise pas les autres
+modules qui modifient la pause, la campagne ou le rang global. Le témoin #7724
+pouvait donc recevoir `refused/paused` au lieu de `already_running`, voire
+quitter sans vérifier la route. Il lance désormais exactement son propre cas
+dans un nouveau processus et exige un test réussi, aucun ignoré. Ne pas
+remettre un retour anticipé en cas de pause. Le nom passé à `--exact` exclut
+le préfixe de caisse de `module_path!()` ; vérifier le compteur évite un faux
+vert à zéro test. La contre-épreuve métier retire seulement la condition du
+rang dans `replaygain_analyze` ; les assertions restent inchangées.
 
 ### Épreuves de concurrence sous charge : synchronisation communautaire (#6702)
 
