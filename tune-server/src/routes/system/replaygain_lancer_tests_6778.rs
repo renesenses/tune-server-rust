@@ -125,6 +125,37 @@ async fn lancer(state: &AppState) -> (StatusCode, Value) {
 /// lance et réveille la boucle.
 #[tokio::test]
 async fn la_route_montee_lance_la_passe_et_reveille_la_boucle_6778() {
+    // Le mutex de ce module ne protège pas des autres bancs qui changent
+    // PAUSES, la campagne ou le rang. Un processus neuf possède ces états.
+    const ENFANT: &str = "TUNE_TEST_REPLAYGAIN_6778_ENFANT";
+    if std::env::var_os(ENFANT).is_none() {
+        let nom = concat!(
+            module_path!(),
+            "::la_route_montee_lance_la_passe_et_reveille_la_boucle_6778"
+        );
+        let (_, nom) = nom.split_once("::").expect("nom sans préfixe de caisse");
+        let sortie = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([nom, "--exact", "--nocapture", "--test-threads=1"])
+            .env(ENFANT, std::process::id().to_string())
+            .output()
+            .expect("lancer le témoin ReplayGain isolé");
+        let stdout = String::from_utf8_lossy(&sortie.stdout);
+        let stderr = String::from_utf8_lossy(&sortie.stderr);
+        assert!(
+            sortie.status.success(),
+            "#6778 : témoin isolé en échec\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed; 0 failed; 0 ignored"),
+            "#6778 : le processus enfant doit exécuter exactement le témoin\n{stdout}\n{stderr}"
+        );
+        return;
+    }
+    assert_ne!(
+        std::env::var(ENFANT).unwrap(),
+        std::process::id().to_string(),
+        "#6778 : les états globaux doivent appartenir à un autre processus"
+    );
     use tune_core::audio::replaygain as rg;
     let _garde = ETAT_GLOBAL.lock().await;
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
@@ -137,16 +168,11 @@ async fn la_route_montee_lance_la_passe_et_reveille_la_boucle_6778() {
     SettingsRepo::with_backend(state.backend.clone())
         .set(rg::MODE_KEY, "track")
         .unwrap();
-    // Le miroir des pauses et la campagne sont globaux au processus : un
-    // autre banc peut les tenir. Le témoin ne conclut que s'ils sont libres.
-    let libre = || {
+    assert!(
         !tune_core::taches_de_fond::est_en_pause(tune_core::taches_de_fond::Tache::ReplayGain)
-            && !rg::progression::releve().actif
-    };
-    if !libre() {
-        eprintln!("#6778 : pause ou campagne tenue par un autre banc, témoin monté sauté");
-        return;
-    }
+            && !rg::progression::releve().actif,
+        "#6778 : le processus isolé ne doit pas hériter d'une pause ou campagne étrangère"
+    );
     let (s, c) = lancer(&state).await;
     assert_eq!(s, StatusCode::OK, "{c}");
     assert_eq!(c["status"], "nothing_to_do", "{c}");
@@ -161,9 +187,6 @@ async fn la_route_montee_lance_la_passe_et_reveille_la_boucle_6778() {
 
     let avant = rg::reessai::nombre_de_reveils();
     let (s, c) = lancer(&state).await;
-    if !libre() {
-        return;
-    }
     assert_eq!(s, StatusCode::ACCEPTED, "{c}");
     assert_eq!(c["status"], "started");
     assert_eq!(c["candidates"], 1);

@@ -165,3 +165,14 @@ fusion : lire la PR de groupe qui cite la PR unitaire
 (`gh pr view <groupe> --json state,mergeCommit`), puis
 `git diff --stat <commit unitaire> origin/<lot> -- <fichiers de la PR>` : une
 sortie vide veut dire que le contenu est fusionné.
+
+### ReplayGain #6778 : le réveil appartient au processus du témoin
+
+La route montée partage les pauses, la campagne et le compteur de réveils avec
+les autres tests. Son verrou de module ne protège pas ces voisins : une pause
+peut changer la réponse, et un réveil étranger peut satisfaire l’assertion.
+Le témoin #6778 s’exécute désormais seul dans un processus neuf, avec le nom
+exact du cas et une vérification du compteur de tests exécutés. Il conserve
+toutes les réponses attendues et l’assertion du réveil ; aucun abandon anticipé
+en cas d’état étranger. La contre-épreuve retire seulement l’appel de réveil
+dans `replaygain_analyze` : répondre 202 sans réveiller doit toujours rougir.
