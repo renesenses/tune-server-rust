@@ -78,6 +78,33 @@ pub fn reconnexion_requise(settings: &SettingsRepo) -> bool {
         .flatten()
         .is_some_and(|v| !v.trim().is_empty())
 }
+/// #8797 — l'instant (RFC 3339) où le site a refusé la session, tant que
+/// la reconnexion est requise. C'est la valeur de [`CLE_RECONNEXION_REQUISE`].
+pub fn reconnexion_requise_depuis(settings: &SettingsRepo) -> Option<String> {
+    settings
+        .get(CLE_RECONNEXION_REQUISE)
+        .ok()
+        .flatten()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+/// #8797 — le jeton d'accès du compte, s'il peut encore être présenté au
+/// site : `None` sans session, et `None` aussi après un refus du site
+/// ([`reconnexion_requise`]). Le jeton reste en base (la reconnexion ne doit
+/// rien effacer), mais il ne vaut plus rien : le présenter ne rapporterait
+/// qu'un 401 de plus au site. Tout appelant qui parle au site au nom du
+/// compte lit le jeton ICI, jamais `mozaik_access_token` directement.
+pub fn jeton_de_compte(settings: &SettingsRepo) -> Option<String> {
+    if reconnexion_requise(settings) {
+        return None;
+    }
+    settings
+        .get("mozaik_access_token")
+        .ok()
+        .flatten()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
 
 /// Enregistre la session neuve d'une connexion SSO, SOUS le verrou des
 /// renouvellements (#8238) : un renouvellement parti avec l'ancien jeton de
@@ -1266,6 +1293,33 @@ mod tests_renouvellement_8238 {
             s.get("mozaik_refresh_token").unwrap().as_deref(),
             Some("rt-neuf")
         );
+    }
+
+    /// #8797 — après un refus du site, le jeton du compte n'est plus rendu
+    /// aux appelants (il reste en base), et l'instant du refus est lisible.
+    #[tokio::test]
+    async fn apres_un_refus_le_jeton_n_est_plus_presente_8797() {
+        let s = settings();
+        let (adresse, _, _) = banc("autre", None).await;
+        connecte(&s, &adresse);
+        assert_eq!(jeton_de_compte(&s).as_deref(), Some("at-0"));
+        assert_eq!(reconnexion_requise_depuis(&s), None);
+        assert_eq!(renouveler_la_session(&s, "at-0").await, None);
+        assert_eq!(jeton_de_compte(&s), None);
+        assert_eq!(
+            s.get("mozaik_access_token").unwrap().as_deref(),
+            Some("at-0"),
+            "le jeton reste en base : la reconnexion n'efface rien"
+        );
+        let depuis = reconnexion_requise_depuis(&s).expect("instant du refus");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&depuis).is_ok(),
+            "{depuis}"
+        );
+        // Contre-épreuve : une nouvelle connexion rend le jeton neuf.
+        ouvrir_la_session(&s, "at-neuf", Some("rt-neuf")).await;
+        assert_eq!(jeton_de_compte(&s).as_deref(), Some("at-neuf"));
+        assert_eq!(reconnexion_requise_depuis(&s), None);
     }
 
     /// Même course par le vrai chemin de la connexion : `ouvrir_la_session`

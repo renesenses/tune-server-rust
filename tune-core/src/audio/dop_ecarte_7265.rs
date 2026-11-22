@@ -54,6 +54,8 @@ pub enum AccueilDuDop {
 /// Pourquoi le DoP a été écarté pour cette piste.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DopEcarte {
+    /// #8813 — le DoP ignorerait le niveau logiciel demandé.
+    AttenuationLogicielle,
     /// Le pilote refuse le DoP en exclusif.
     ExclusifRefuse { cadence_dop: u32, voies: u16 },
     /// Le mixeur partagé de Windows n'est pas au format du DoP.
@@ -70,6 +72,7 @@ impl DopEcarte {
     #[must_use]
     pub fn code(&self) -> &'static str {
         match self {
+            Self::AttenuationLogicielle => "dop_ignore_attenuation_logicielle",
             Self::ExclusifRefuse { .. } => "dop_refuse_par_le_pilote_en_exclusif",
             Self::MixeurPartage { .. } => "dop_incompatible_avec_le_mixeur_partage",
         }
@@ -79,6 +82,7 @@ impl DopEcarte {
     #[must_use]
     pub fn raison(&self) -> String {
         match self {
+            Self::AttenuationLogicielle => "Converti en PCM : le DoP ignorerait le volume logiciel, le préampli ou ReplayGain demandé pour cette zone".into(),
             Self::ExclusifRefuse { cadence_dop, voies } => format!(
                 "Converti en PCM : la sortie WASAPI exclusive n'accepte pas le DoP \
                  ({} kHz, 24 bits, {voies} voies) ; le DAC ne l'annonce pas",
@@ -313,4 +317,22 @@ mod tests {
         oublier(zone);
         assert!(ecart_de_la_zone(zone).is_none());
     }
+}
+
+/// #8813 — protection activée par défaut ; une désactivation explicite est
+/// conservée, sans modifier le choix DSD (auto, DoP ou natif) de la zone.
+pub fn cle_protection_du_niveau(zone_id: i64) -> String {
+    format!("zone_{zone_id}_dsd_volume_protection")
+}
+
+pub fn protection_du_niveau_active(
+    db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    zone_id: i64,
+) -> bool {
+    crate::db::settings_repo::SettingsRepo::with_backend(db.clone())
+        .get(&cle_protection_du_niveau(zone_id))
+        .ok()
+        .flatten()
+        .as_deref()
+        != Some("false")
 }

@@ -31,10 +31,27 @@ readonly ISSUE_NOTICE="/etc/issue.d/90-tune-initial-password.issue"
 readonly RUNTIME_DIR="/run/tune"
 readonly RUNTIME_SECRET="${RUNTIME_DIR}/premier-mot-de-passe"
 
+# The 21 lowercase letters that sit on the same key on a French AZERTY and a
+# US QWERTY keyboard: no digit (Shift on AZERTY), no a q z w m. The console
+# may be in either layout, the physical keyboard of either kind.
+readonly PASSWORD_ALPHABET="bcdefghijklnoprstuvxy"
+readonly PASSWORD_LENGTH=24
+
 generate_password() {
-    # 96 random bits, rendered as 24 shell/keyboard-friendly hexadecimal
-    # characters. openssl is present with openssh-server on every Tune image.
-    openssl rand -hex 12
+    # 24 symbols out of 21: 105 bits (24 hexadecimal characters were 96).
+    # Bytes from the kernel CSPRNG; only 0..251 are kept (252 = 12 * 21), so
+    # that the modulo carries no bias.
+    local out="" bytes b
+    while (( ${#out} < PASSWORD_LENGTH )); do
+        bytes="$(od -An -v -N64 -tu1 /dev/urandom)" || return 1
+        [[ -n "${bytes// /}" ]] || return 1
+        for b in $bytes; do
+            (( b < 252 )) || continue
+            out+="${PASSWORD_ALPHABET:b % 21:1}"
+            if (( ${#out} == PASSWORD_LENGTH )); then break; fi
+        done
+    done
+    printf '%s\n' "$out"
 }
 
 password_matches_legacy() {
@@ -73,7 +90,7 @@ EOF
 rotate_and_expire() {
     local reason="$1" password
     password="$(generate_password)"
-    [[ ${#password} -eq 24 ]] || {
+    [[ "$password" =~ ^[bcdefghijklnoprstuvxy]{24}$ ]] || {
         echo "Tune OS: impossible de générer un mot de passe temporaire" >&2
         return 1
     }

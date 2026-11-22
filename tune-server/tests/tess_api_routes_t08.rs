@@ -645,7 +645,10 @@ async fn le_droit_est_controle_sous_bypass_all_en_deux_put_t08() {
             // Sans Premium, la lecture le montre converti en graphique (P2) ;
             // la chaîne enregistrée le garde.
             "equalizer-parametric" => assert!(
-                b.chaine().plugins.iter().any(|m| m.id == *greffon && m.enabled),
+                b.chaine()
+                    .plugins
+                    .iter()
+                    .any(|m| m.id == *greffon && m.enabled),
                 "{corps}"
             ),
             "upsampling" => {}
@@ -693,19 +696,27 @@ async fn premium_perdu_sous_bypass_ne_bloque_aucun_geste_t08() {
     let eq = json!({"id": "equalizer-parametric", "enabled": true, "settings": profil(bandes_parametriques())});
     let up = json!({"mode": "pcm", "filter": "polyvalent"});
     let (s, v) = b
-        .put(json!({"version": 1, "bypass_all": true, "plugins": [conv.clone(), eq.clone()],
-            "fixed": {"upsampling": up.clone()}}))
+        .put(
+            json!({"version": 1, "bypass_all": true, "plugins": [conv.clone(), eq.clone()],
+            "fixed": {"upsampling": up.clone()}}),
+        )
         .await;
     assert_eq!(s, StatusCode::OK, "{v}");
     b.premium(false).await;
     // Décocher le bypass, la chaîne entière renvoyée.
     let (s, v) = b
-        .put(json!({"version": 1, "bypass_all": false, "plugins": [conv.clone(), eq.clone()],
-            "fixed": {"upsampling": up.clone()}}))
+        .put(
+            json!({"version": 1, "bypass_all": false, "plugins": [conv.clone(), eq.clone()],
+            "fixed": {"upsampling": up.clone()}}),
+        )
         .await;
     assert_eq!(s, StatusCode::OK, "{v}");
     assert!(!b.chaine().bypass_all);
-    assert_eq!(etape(&v, "convolution")["reason"], json!("premium_required"), "{v}");
+    assert_eq!(
+        etape(&v, "convolution")["reason"],
+        json!("premium_required"),
+        "{v}"
+    );
     // L'égaliseur paramétrique est lu converti (P2) ; enregistré tel quel.
     assert!(
         b.chaine()
@@ -720,15 +731,19 @@ async fn premium_perdu_sous_bypass_ne_bloque_aucun_geste_t08() {
         json!([eq.clone()]),
     ] {
         let (s, v) = b
-            .put(json!({"version": 1, "bypass_all": false, "plugins": plugins,
-                "fixed": {"upsampling": up.clone()}}))
+            .put(
+                json!({"version": 1, "bypass_all": false, "plugins": plugins,
+                "fixed": {"upsampling": up.clone()}}),
+            )
             .await;
         assert_eq!(s, StatusCode::OK, "{plugins} → {v}");
     }
     // Contre-épreuve : recocher un maillon Premium retiré reste un 402.
     let (s, v) = b
-        .put(json!({"version": 1, "bypass_all": false, "plugins": [eq, conv],
-            "fixed": {"upsampling": up}}))
+        .put(
+            json!({"version": 1, "bypass_all": false, "plugins": [eq, conv],
+            "fixed": {"upsampling": up}}),
+        )
         .await;
     assert_eq!(s, StatusCode::PAYMENT_REQUIRED, "{v}");
     refus_conforme(&v, 402, "premium_required");
@@ -766,7 +781,12 @@ async fn un_maillon_tiers_inconnu_inchange_est_conserve_t08() {
             .expect("maillon tiers conservé");
         assert!(tiers.enabled);
         assert_eq!(tiers.settings, json!({"mix": 0.3}));
-        assert!(chaine.plugins.iter().any(|m| m.id == "crossfeed" && m.enabled));
+        assert!(
+            chaine
+                .plugins
+                .iter()
+                .any(|m| m.id == "crossfeed" && m.enabled)
+        );
         // Contre-épreuve : un maillon inconnu modifié reste un 409.
         let mut c2 = c.clone();
         for m in c2["plugins"].as_array_mut().unwrap() {

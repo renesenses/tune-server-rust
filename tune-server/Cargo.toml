@@ -1836,6 +1836,14 @@ name = "pg_requete_avancee_7872"
 path = "tests/pg_requete_avancee_7872.rs"
 required-features = ["postgres"]
 
+# Forum 21/11/2026 — un nom de collection intelligente déjà pris rend 409
+# `smart_collection_name_taken` sur PostgreSQL aussi, dont le schéma n'a pas
+# l'index unique de SQLite.
+[[test]]
+name = "pg_nom_de_collection_deja_pris"
+path = "tests/pg_nom_de_collection_deja_pris.rs"
+required-features = ["postgres"]
+
 # #8077 — les apports Qobuz d'un album local (rapprochement, garde « compléter
 # seulement », retrait), sur SQLite puis sur PostgreSQL (migration 108), par le
 # vrai routeur et une doublure de l'API Qobuz. `autotests = false` : sans ces

@@ -90,13 +90,20 @@ pub(super) async fn database_status(
     let version = super::version_de_schema(&state);
     let latest = super::version_de_schema_cible(engine);
     let (up_to_date, schema_ahead) = etat_du_schema(version, latest);
-    let row = state.backend.query_one(
-        "SELECT \
-         (SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)), \
-         (SELECT COUNT(*) FROM albums), \
-         (SELECT COUNT(*) FROM tracks)",
-        &[],
-    ).map_err(AppError::internal)?;
+    // #9265 — le nombre d'artistes suit la grille.
+    let row = state
+        .backend
+        .query_one(
+            &format!(
+                "SELECT \
+             (SELECT COUNT(*) FROM artists WHERE {}), \
+             (SELECT COUNT(*) FROM albums), \
+             (SELECT COUNT(*) FROM tracks)",
+                tune_core::db::artist_repo::PREDICAT_ARTISTES_DE_LA_GRILLE
+            ),
+            &[],
+        )
+        .map_err(AppError::internal)?;
     let (artists, albums, tracks) = row
         .map(|r| {
             (

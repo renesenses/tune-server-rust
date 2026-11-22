@@ -1153,7 +1153,7 @@ impl OutputTarget for AirplayOutput {
             .fin_du_dernier_flux
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
-        info!(device = %self.name, url = media.url, "airplay_play");
+        info!(device = %self.name, url = %crate::confidentialite::masquer_url(&media.url), "airplay_play");
         Ok(())
     }
 

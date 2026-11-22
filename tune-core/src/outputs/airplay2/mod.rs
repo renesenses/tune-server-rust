@@ -22,6 +22,7 @@ pub mod composant_manquant_7084;
 mod piste_suivante_8420;
 mod reprise_apres_coupure_7921;
 mod session_en_panne_7823;
+mod stderr_du_demon_9015;
 pub mod volume_de_depart_8402;
 
 const DAEMON_BINARY: &str = "airplay-daemon";
@@ -163,7 +164,9 @@ fn commande_du_demon_avec(binary: &str, identites: Option<PathBuf>) -> Command {
     commande
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
+        // #9015 — relayée au journal par `stderr_du_demon_9015`, nettoyée et
+        // bornée ; jetée, elle cachait pourquoi une connexion n'aboutissait pas.
+        .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     if let Some(dossier) = identites {
         commande.env(identites_du_demon_8347::VARIABLE, dossier);
@@ -494,6 +497,9 @@ impl Airplay2Output {
 
         let stdin = child.stdin.take().ok_or("no stdin")?;
         let stdout = child.stdout.take().ok_or("no stdout")?;
+        if let Some(stderr) = child.stderr.take() {
+            stderr_du_demon_9015::relayer(stderr, self.name.clone());
+        }
 
         // Wait for "ready" event
         let mut reader = BufReader::new(stdout);

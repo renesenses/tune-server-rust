@@ -2287,6 +2287,10 @@ impl PlaybackOrchestrator {
         local_out.set_retard_de_depart_ms(
             crate::zones::retard_groupe_mixte_8437::retard_de_depart_de_la_zone(&self.db, zone_id),
         );
+        // #8869 — et le silence de verrouillage de la zone.
+        local_out.set_silence_de_verrouillage_ms(crate::audio::silence_de_verrouillage::lire(
+            &self.db, zone_id,
+        ));
         {
             let mut outputs = self.outputs.lock().await;
             outputs.register(Box::new(local_out));
@@ -2520,6 +2524,11 @@ impl PlaybackOrchestrator {
                     // lecture comme le strict : `play_url` la lit une fois.
                     local_output.set_secondes_sorties(secondes_sorties);
                     local_output.set_retard_de_depart_ms(retard_de_depart_ms);
+                    // #8869 — le silence de verrouillage de la zone, lu à
+                    // chaque lecture : `play_url` le lit une fois.
+                    local_output.set_silence_de_verrouillage_ms(
+                        crate::audio::silence_de_verrouillage::lire(&self.db, zone_id),
+                    );
                     // #6522, #6524 — ce que PURE contourne, lu dans les
                     // réglages : la chaîne posée plus bas sera vide en PURE.
                     self.poser_ce_que_pure_contourne(zone_id, track_id, local_output);
@@ -3286,20 +3295,28 @@ impl PlaybackOrchestrator {
         let Some(chemin) = self.chemin_ir(zone_id) else {
             return false;
         };
-        let refus = match crate::audio::convolver::ConvolverConfig::from_wav(&chemin) {
+        // #8761 — le jeu entier : un fichier à la cadence du flux, ou le plus
+        // proche rééchantillonné si le réglage le permet.
+        let jeu = self
+            .jeu_ir(zone_id)
+            .map(|j| j.charger())
+            .unwrap_or_else(|| crate::audio::convolver::ConvolverConfig::from_wav(&chemin));
+        let refus = match jeu {
             Err(e) => Some(e),
-            Ok(ri) if cadence.is_some_and(|c| c != ri.sample_rate()) => Some(format!(
-                "réponse impulsionnelle à {} Hz, flux à {} Hz",
-                ri.sample_rate(),
-                cadence.unwrap_or_default()
-            )),
-            Ok(ri) if ri.source_channels() != 1 && ri.source_channels() != usize::from(canaux) => {
-                Some(format!(
-                    "réponse impulsionnelle à {} canaux, flux à {canaux} canaux",
-                    ri.source_channels()
-                ))
-            }
-            Ok(_) => None,
+            Ok(ri) => match cadence.map(|c| (c, ri.choix_pour(c))) {
+                Some((c, Err(_))) => Some(format!(
+                    "réponse impulsionnelle à {:?} Hz, flux à {c} Hz",
+                    ri.cadences()
+                )),
+                _ => {
+                    let n = cadence
+                        .and_then(|c| ri.canaux_pour(c))
+                        .unwrap_or_else(|| ri.source_channels());
+                    (n != 1 && n != usize::from(canaux)).then(|| {
+                        format!("réponse impulsionnelle à {n} canaux, flux à {canaux} canaux")
+                    })
+                }
+            },
         };
         if let Some(raison) = &refus {
             warn!(
@@ -3840,7 +3857,11 @@ impl PlaybackOrchestrator {
                     "reprise_par_nouveau_flux_apres_longue_pause"
                 );
             }
-            let peripherique_rendu = peripherique_rendu || memoire_du_lecteur_douteuse;
+            // #8813 — une baisse pendant la pause doit recréer le flux en
+            // PCM, sans avoir relancé la lecture au moment du réglage.
+            let peripherique_rendu = peripherique_rendu
+                || memoire_du_lecteur_douteuse
+                || self.dop_actif_a_proteger(zone_id).await;
             let decision = reprise_de_session(
                 est_radio,
                 rejouable,

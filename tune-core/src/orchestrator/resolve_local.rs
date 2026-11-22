@@ -1455,6 +1455,23 @@ impl PlaybackOrchestrator {
                 }
             }
         }
+        // #8813 — un porteur DoP ne sait pas appliquer le niveau logiciel.
+        // Décider avant de créer la session, sans toucher aux marqueurs.
+        if source_format == Some(AudioFormat::Dsd)
+            && is_local_output
+            && self
+                .attenuation_logicielle_demandee_pour_dop(req.zone_id, transport, req.piste_rg())
+                .await
+        {
+            let ecart = crate::audio::dop_ecarte_7265::DopEcarte::AttenuationLogicielle;
+            warn!(
+                zone_id = req.zone_id,
+                motif = ecart.code(),
+                "dsd_dop_ecarte_converti_en_pcm"
+            );
+            crate::audio::dop_ecarte_7265::enregistrer(req.zone_id, ecart);
+            transport = TransportDsd::Pcm;
+        }
         let dop_requested = transport != TransportDsd::Pcm;
         // #9170 — « Natif » réglé, la piste DSD part autrement : l'écran des
         // réglages doit dire ce qui est réellement parti (DoP ou PCM), pas
@@ -2472,8 +2489,19 @@ impl PlaybackOrchestrator {
             track.channels as u32,
         );
         let dop_rate = crate::audio::dsd_to_dop::DsdToDoP::dop_rate(dsd_rate);
-        // Réutilise le plafond déjà combiné avec le quirk catalogue.
-        let zone_max_sr = zone_max_sample_rate;
+        // #8789 — en local, ne pas ouvrir un porteur DoP au-delà du DSD256.
+        // Les deux familles gardent leur DSD256 (705,6 / 768 kHz). Le plafond
+        // de zone peut encore abaisser cette borne ; le chemin natif est séparé.
+        let zone_max_sr = if is_local_output {
+            let plafond_dop = if dsd_rate.is_multiple_of(48_000) {
+                768_000
+            } else {
+                705_600
+            };
+            Some(zone_max_sample_rate.unwrap_or(plafond_dop).min(plafond_dop))
+        } else {
+            zone_max_sample_rate
+        };
         if let Some(max_sr) = zone_max_sr {
             if dop_rate > max_sr {
                 // #3973 — le DoP dépasse le plafond : le chemin ordinaire
@@ -2810,6 +2838,38 @@ impl PlaybackOrchestrator {
     /// correctif restaient VERTES, la garde de site comprise, parce
     /// qu'aucune ne regardait le porteur réellement construit. Celle-ci le
     /// regarde.
+    /// #9178 — la piste sera-t-elle transcodée (`needs_transcode`) ou servie
+    /// telle quelle ? Le relais ne porte le crossfeed que dans le premier cas.
+    #[cfg(test)]
+    pub(super) async fn transcodage_decide_pour_test(
+        &self,
+        req: &PlayRequest,
+    ) -> Result<bool, String> {
+        let track_id = req.track_id.ok_or("no track_id for local playback")?;
+        let track = TrackRepo::with_backend(self.db.clone())
+            .get(track_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("track not found")?;
+        let file_path = track.file_path.clone().ok_or("track has no file_path")?;
+        let fmt = track.format.clone().unwrap_or_else(|| "flac".into());
+        let source_format = AudioFormat::from_extension(&fmt);
+        let is_dsd_source = source_format == Some(AudioFormat::Dsd);
+        match self
+            .decider_la_lecture_locale(
+                req,
+                &track,
+                file_path,
+                fmt,
+                source_format,
+                is_dsd_source,
+                None,
+            )
+            .await?
+        {
+            DecisionOuResolu::Decision(d) => Ok(d.needs_transcode),
+            DecisionOuResolu::Resolu(_) => Ok(false),
+        }
+    }
     #[cfg(test)]
     pub(super) async fn relais_dsp_pour_test(
         &self,

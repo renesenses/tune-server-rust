@@ -894,6 +894,7 @@ async fn sso_status(
             "configured": resolve_client_id(&settings).is_some(),
             "connected": user.is_some(),
             "reconnect_required": false,
+            "reconnect_required_since": null,
             "scope": "profile",
             "user": user,
         }));
@@ -922,11 +923,15 @@ async fn sso_status(
     // sont encore en base mais ne valent plus rien : le serveur n'est PAS
     // connecté, et l'interface propose la connexion au compte.
     let reconnect_required = connected && tune_core::cloud::sso::reconnexion_requise(&settings);
-
+    // #8797 : l'instant du refus, pour que l'interface puisse le dire.
+    let reconnect_required_since = reconnect_required
+        .then(|| tune_core::cloud::sso::reconnexion_requise_depuis(&settings))
+        .flatten();
     Json(json!({
         "configured": configured,
         "connected": connected && !reconnect_required,
         "reconnect_required": reconnect_required,
+        "reconnect_required_since": reconnect_required_since,
         "user": user,
         // Relié, mais le compte n'est pas montré à cet appareil : l'interface
         // dit « relié » sans détails ni bouton (rien qu'elle puisse faire d'ici).
@@ -2717,12 +2722,8 @@ async fn library_sync_status(State(state): State<AppState>) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let pending = tune_core::cloud::library_sync::pending_count(&state.backend);
     let last_sync = settings.get("cloud_library_last_sync").ok().flatten();
-    let has_token = settings
-        .get("mozaik_access_token")
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty())
-        .is_some();
+    // #8797 : après un refus de la session, la synchro attend la reconnexion.
+    let has_token = tune_core::cloud::sso::jeton_de_compte(&settings).is_some();
     let is_premium = state.license.is_premium().await;
 
     Json(json!({
@@ -2795,8 +2796,9 @@ async fn library_sync_reconcile(
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let server_id = settings.get("server_id").ok().flatten().unwrap_or_default();
-    let token = match settings.get("mozaik_access_token").ok().flatten() {
-        Some(t) if !t.is_empty() => t,
+    // #8797 : une session refusée par le site ne se présente plus.
+    let token = match tune_core::cloud::sso::jeton_de_compte(&settings) {
+        Some(t) => t,
         _ => {
             return (
                 StatusCode::PRECONDITION_FAILED,
@@ -2854,8 +2856,9 @@ async fn library_sync_trigger(
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let server_id = settings.get("server_id").ok().flatten().unwrap_or_default();
-    let token = match settings.get("mozaik_access_token").ok().flatten() {
-        Some(t) if !t.is_empty() => t,
+    // #8797 : une session refusée par le site ne se présente plus.
+    let token = match tune_core::cloud::sso::jeton_de_compte(&settings) {
+        Some(t) => t,
         _ => {
             return (
                 StatusCode::PRECONDITION_FAILED,
@@ -2938,8 +2941,9 @@ async fn library_sync_full(
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let server_id = settings.get("server_id").ok().flatten().unwrap_or_default();
-    let token = match settings.get("mozaik_access_token").ok().flatten() {
-        Some(t) if !t.is_empty() => t,
+    // #8797 : une session refusée par le site ne se présente plus.
+    let token = match tune_core::cloud::sso::jeton_de_compte(&settings) {
+        Some(t) => t,
         _ => {
             return (
                 StatusCode::PRECONDITION_FAILED,

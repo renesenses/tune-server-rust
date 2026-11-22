@@ -464,11 +464,11 @@ impl UpnpEventListener {
         {
             Ok(r) if r.status().is_success() => true,
             Ok(r) => {
-                debug!(url = event_sub_url, status = %r.status(), "oh_subscribe_rejected");
+                debug!(url = %crate::confidentialite::masquer_url(&event_sub_url), status = %r.status(), "oh_subscribe_rejected");
                 false
             }
             Err(e) => {
-                debug!(url = event_sub_url, error = %e, "oh_subscribe_failed");
+                debug!(url = %crate::confidentialite::masquer_url(&event_sub_url), error = %e, "oh_subscribe_failed");
                 false
             }
         };
@@ -495,7 +495,7 @@ impl UpnpEventListener {
             .await
             .insert(path_id.clone(), event_sub_url.to_string());
 
-        debug!(url = event_sub_url, path_id = %path_id, "oh_subscribed");
+        debug!(url = %crate::confidentialite::masquer_url(&event_sub_url), path_id = %path_id, "oh_subscribed");
         Some(path_id)
     }
 
@@ -620,11 +620,11 @@ async fn renew_all(
         let tenu = match result {
             Ok(resp) if resp.status().is_success() => true,
             Ok(resp) => {
-                debug!(url = event_url, status = %resp.status(), "oh_renew_rejected");
+                debug!(url = %crate::confidentialite::masquer_url(&event_url), status = %resp.status(), "oh_renew_rejected");
                 false
             }
             Err(e) => {
-                debug!(url = event_url, error = %e, "oh_renew_failed");
+                debug!(url = %crate::confidentialite::masquer_url(&event_url), error = %e, "oh_renew_failed");
                 false
             }
         };

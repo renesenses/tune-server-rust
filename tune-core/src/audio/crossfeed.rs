@@ -437,8 +437,9 @@ pub enum CrossfeedConstraint {
     /// Entitled, but the provider is disabled, uninstalled, or failed to load.
     PluginUnavailable,
     /// La zone ne joue ni par une sortie LOCALE, ni par une sortie RÉSEAU :
-    /// OAAT, navigateur, sorties PULL, ou zone dont aucun périphérique n'est
-    /// résolu (elle ne joue nulle part).
+    /// sorties PULL, ou zone dont aucun périphérique n'est résolu (elle ne
+    /// joue nulle part). OAAT et le navigateur n'y sont plus depuis #9178
+    /// ([`Self::NonLocalPartial`]).
     ///
     /// Depuis LAT-F1 ce motif ne couvre plus les zones réseau — elles ont leurs
     /// deux motifs propres. Il reste la réponse PRUDENTE pour les familles dont
@@ -494,6 +495,22 @@ pub enum CrossfeedConstraint {
     /// intacte (−∞) pour une piste de la bibliothèque, servie verbatim
     /// (`tune-core/tests/crossfeed_renderer_sans_lpcm_2742.rs`).
     NetworkRendererNoLpcm,
+    /// #9178 — zone OAAT ou navigateur : ni locale, ni réseau, mais servie
+    /// par le bras WAV progressif dont le relais porte toute la chaîne de la
+    /// zone, crossfeed compris (`load_streaming_dsp`, `relais_dsp_progressif`).
+    ///
+    /// - OAAT : toute piste de la bibliothèque part en WAV progressif
+    ///   (`oaat_needs_wav`), le crossfeed seul suffit à armer le relais ;
+    /// - navigateur : seulement quand la piste est convertie en WAV (format
+    ///   que `<audio>` ne lit pas, ou égaliseur, correction de pièce,
+    ///   ReplayGain actifs) ; un FLAC sans autre traitement part tel quel ;
+    /// - les flux des services (Qobuz, Tidal, YouTube) chargent la même
+    ///   chaîne sur ces deux sorties.
+    ///
+    /// Les pistes servies telles quelles partent sans lui : motif PARTIEL,
+    /// qui ne VERROUILLE pas le contrôle ([`Self::verrouille`]). Mesuré par
+    /// `orchestrator::tests::*_9178` sur la décision réelle.
+    NonLocalPartial,
 }
 
 impl CrossfeedConstraint {
@@ -506,6 +523,7 @@ impl CrossfeedConstraint {
             Self::PureMode => "pure_mode",
             Self::NetworkProgressiveOff => "network_progressive_off",
             Self::NetworkRendererNoLpcm => "network_renderer_no_lpcm",
+            Self::NonLocalPartial => "non_local_partial",
         }
     }
 
@@ -549,6 +567,12 @@ impl CrossfeedConstraint {
                  n'annonce pas savoir lire le PCM non compressé, et le flux \
                  progressif qui les traiterait ne peut pas lui être servi."
             }
+            Self::NonLocalPartial => {
+                "Sur cette zone, le crossfeed s'applique aux pistes que Tune \
+                 traite au fil de l'eau avant l'envoi : les flux Qobuz, Tidal \
+                 et YouTube, et les pistes de votre bibliothèque converties en \
+                 PCM. Les pistes servies telles quelles partent sans lui."
+            }
         }
     }
 
@@ -564,19 +588,20 @@ impl CrossfeedConstraint {
     pub fn verrouille(self) -> bool {
         !matches!(
             self,
-            Self::NetworkProgressiveOff | Self::NetworkRendererNoLpcm
+            Self::NetworkProgressiveOff | Self::NetworkRendererNoLpcm | Self::NonLocalPartial
         )
     }
 
     /// Toutes les variantes. Sert la contre-épreuve permanente : une contrainte
     /// ajoutée sans code ni libellé fait tomber le test qui parcourt cette liste.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::PremiumRequired,
         Self::PluginUnavailable,
         Self::NonLocalOutput,
         Self::PureMode,
         Self::NetworkProgressiveOff,
         Self::NetworkRendererNoLpcm,
+        Self::NonLocalPartial,
     ];
 }
 
@@ -693,6 +718,42 @@ pub fn crossfeed_status(
         unavailable,
         reason,
         detail: reason.map(CrossfeedConstraint::detail),
+    }
+}
+
+/// #9178 — la sortie reçoit-elle le flux traité au fil de l'eau, crossfeed
+/// compris, pour une partie au moins de ce qu'elle joue ? OAAT (reconnue à
+/// son périphérique `oaat:` / `oaat-group:`, comme le fait l'orchestrateur,
+/// ou à son type) et le navigateur.
+///
+/// Les sorties PULL (`airplay2`, `diretta`, `hqplayer`, `sendspin`,
+/// `devialet_air`, greffons) n'y sont pas : leurs pistes de la bibliothèque
+/// passent par le bras FICHIER, qui ne cuit le crossfeed que vers une zone
+/// réseau (`crossfeed_cuit_dans_le_fichier`).
+pub fn sortie_porte_le_flux_traite(
+    output_type: Option<&str>,
+    output_device_id: Option<&str>,
+) -> bool {
+    output_device_id.is_some_and(|d| d.starts_with("oaat:") || d.starts_with("oaat-group:"))
+        || matches!(output_type, Some("oaat") | Some("browser"))
+}
+
+/// #9178 — sur une sortie qui porte le flux traité
+/// ([`sortie_porte_le_flux_traite`]), `NonLocalOutput` verrouillait le
+/// contrôle d'un effet qui s'entend. Il devient la réserve
+/// [`CrossfeedConstraint::NonLocalPartial`], qui laisse le réglage actif.
+/// Tout autre statut passe inchangé (PURE garde la priorité).
+pub fn avec_le_flux_traite(sortie: CrossfeedStatus, porte_le_flux_traite: bool) -> CrossfeedStatus {
+    if !porte_le_flux_traite || sortie.reason != Some(CrossfeedConstraint::NonLocalOutput) {
+        return sortie;
+    }
+    let reason = CrossfeedConstraint::NonLocalPartial;
+    CrossfeedStatus {
+        requested: sortie.requested,
+        effective: sortie.requested,
+        unavailable: false,
+        reason: Some(reason),
+        detail: Some(reason.detail()),
     }
 }
 
@@ -1004,6 +1065,7 @@ mod tests {
                     c,
                     CrossfeedConstraint::NetworkProgressiveOff
                         | CrossfeedConstraint::NetworkRendererNoLpcm
+                        | CrossfeedConstraint::NonLocalPartial
                 ),
                 "{c:?}"
             );
@@ -1560,3 +1622,6 @@ mod famille_du_crossfeed_tests {
         );
     }
 }
+#[cfg(test)]
+#[path = "crossfeed_flux_traite_9178_tests.rs"]
+mod flux_traite_9178_tests;

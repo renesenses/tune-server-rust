@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Fusionné par Tauri dans le Info.plist du paquet (#9255). La SEULE
+       autorisation que Tune Client demande : le réseau local, pour trouver
+       les Tune Server (mDNS `_tune-server._tcp`) et leur parler. Même texte
+       et même mécanisme que Tune Server (release.yml, #4949). -->
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Tune Client trouve les serveurs Tune de votre réseau local et s'y connecte. Tune Client finds the Tune servers on your local network and connects to them.</string>
+  <key>NSBonjourServices</key>
+  <array>
+    <string>_tune-server._tcp</string>
+  </array>
+</dict>
+</plist>

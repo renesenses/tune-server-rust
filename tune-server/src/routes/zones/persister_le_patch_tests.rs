@@ -236,6 +236,36 @@ async fn bitperfect_strict_3973_est_persiste_par_la_route() {
     );
 }
 
+/// #8869 — silence de verrouillage : publié à 0 par défaut, borné à 2000 ms
+/// par la route, persisté sous `zone_{id}_silence_verrouillage_ms`, et 0
+/// SUPPRIME la clé.
+#[tokio::test]
+async fn silence_de_verrouillage_8869_est_persiste_borne_par_la_route() {
+    let (app, state) = serveur();
+    let id = zone_dlna(&app).await;
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    let cle = tune_core::audio::silence_de_verrouillage::cle_de_zone(id);
+
+    assert_eq!(fiche(&app, id).await["silence_verrouillage_ms"], json!(0));
+
+    let (statut, reponse) = patch(&app, id, json!({ "silence_verrouillage_ms": 750 })).await;
+    assert_eq!(statut, StatusCode::OK, "PATCH refusé : {reponse}");
+    assert_eq!(fiche(&app, id).await["silence_verrouillage_ms"], json!(750));
+    assert_eq!(reglages.get(&cle).unwrap().as_deref(), Some("750"));
+
+    let (statut, _) = patch(&app, id, json!({ "silence_verrouillage_ms": 9000 })).await;
+    assert_eq!(statut, StatusCode::OK);
+    assert_eq!(
+        fiche(&app, id).await["silence_verrouillage_ms"],
+        json!(2000)
+    );
+
+    let (statut, _) = patch(&app, id, json!({ "silence_verrouillage_ms": 0 })).await;
+    assert_eq!(statut, StatusCode::OK);
+    assert_eq!(fiche(&app, id).await["silence_verrouillage_ms"], json!(0));
+    assert!(reglages.get(&cle).unwrap().is_none(), "0 SUPPRIME la clé");
+}
+
 /// #2991 — « Envoyer le titre radio par DLNA » : absent = `off`, `next` et
 /// `reload` se persistent et se relisent, `off` supprime la clé, une voie
 /// inconnue est refusée sans rien écrire.
@@ -301,6 +331,97 @@ async fn frequence_fixe_8428_airplay_refuse_la_cadence_mais_permet_de_l_effacer(
         let (statut, _) = patch(&app, id, json!({"fixed_sample_rate": null})).await;
         assert_eq!(statut, StatusCode::OK);
     }
+}
+
+#[tokio::test]
+async fn protection_du_niveau_dsd_8813_est_active_par_defaut_et_persistante() {
+    let (app, state) = serveur();
+    let id = zone_dlna(&app).await;
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    let cle = tune_core::audio::dop_ecarte_7265::cle_protection_du_niveau(id);
+    assert_eq!(fiche(&app, id).await["dsd_volume_protection"], json!(true));
+    let (statut, reponse) = patch(&app, id, json!({"dsd_volume_protection": false})).await;
+    assert_eq!(statut, StatusCode::OK, "{reponse}");
+    assert_eq!(fiche(&app, id).await["dsd_volume_protection"], json!(false));
+    assert_eq!(reglages.get(&cle).unwrap().as_deref(), Some("false"));
+    let (statut, reponse) = patch(&app, id, json!({"dsd_volume_protection": true})).await;
+    assert_eq!(statut, StatusCode::OK, "{reponse}");
+    assert_eq!(fiche(&app, id).await["dsd_volume_protection"], json!(true));
+    assert!(
+        reglages.get(&cle).unwrap().is_none(),
+        "activer retrouve le défaut sûr"
+    );
+}
+
+#[tokio::test]
+async fn activer_la_protection_dsd_8813_remplace_le_dop_attenue_en_cours() {
+    let (app, state) = serveur();
+    let appareil = "local:protection-api-8813";
+    let zones = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
+    let zone = zones
+        .create("DoP factice API", Some("local"), Some(appareil))
+        .unwrap();
+    zones.update_dsd_mode(zone, "dop").unwrap();
+    zones.update_volume(zone, 6.0).unwrap();
+    state.playback.set_volume(zone, 0.06).await;
+    SettingsRepo::with_backend(state.backend.clone())
+        .set(
+            &tune_core::audio::dop_ecarte_7265::cle_protection_du_niveau(zone),
+            "false",
+        )
+        .unwrap();
+    let chemin = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../tune-core/tests/fixtures/dsd/ref_dsd64_stereo.dsf");
+    let mut piste = tune_core::db::models::Track::new("Témoin API DSD".into());
+    piste.file_path = Some(chemin.to_string_lossy().into_owned());
+    piste.format = Some("dsf".into());
+    piste.sample_rate = Some(2_822_400);
+    piste.bit_depth = Some(1);
+    piste.channels = 2;
+    piste.duration_ms = 1000;
+    let id = tune_core::db::track_repo::TrackRepo::with_backend(state.backend.clone())
+        .create(&piste)
+        .unwrap();
+    state.outputs.lock().await.register(Box::new(
+        tune_core::outputs::mock::MockOutput::new(appareil, "Sans son").with_type("local"),
+    ));
+    state
+        .orchestrator
+        .play(tune_core::orchestrator::PlayRequest {
+            zone_id: zone,
+            output_device_id: Some(appareil.into()),
+            track_id: Some(id),
+            source: Some("local".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let sortie = state.outputs.lock().await.get(appareil).unwrap();
+    sortie
+        .lock()
+        .await
+        .as_any()
+        .downcast_ref::<tune_core::outputs::mock::MockOutput>()
+        .unwrap()
+        .poser_dop_actif(true);
+    let (statut, reponse) = patch(&app, zone, json!({"dsd_volume_protection": true})).await;
+    assert_eq!(statut, StatusCode::OK, "{reponse}");
+    let appels = sortie
+        .lock()
+        .await
+        .as_any()
+        .downcast_ref::<tune_core::outputs::mock::MockOutput>()
+        .unwrap()
+        .play_call_count()
+        .await;
+    assert_eq!(
+        appels, 2,
+        "#8813 : activer la protection laisse le DoP atténué en cours"
+    );
+    assert_eq!(
+        fiche(&app, zone).await["dsd_volume_protection"],
+        json!(true)
+    );
 }
 
 /// #8696 — période WASAPI exclusive : publiée à `null` (Auto) avec ses

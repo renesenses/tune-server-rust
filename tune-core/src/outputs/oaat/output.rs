@@ -17,6 +17,10 @@ mod volume_7333_tests;
 #[cfg(all(test, feature = "oaat"))]
 #[path = "reprise_sans_session_8726_tests.rs"]
 mod reprise_sans_session_8726_tests;
+// #9091 — une annonce mDNS expirée ne coupe pas une session vivante.
+#[cfg(all(test, feature = "oaat"))]
+#[path = "session_active_9091_tests.rs"]
+mod session_active_9091_tests;
 
 #[cfg(feature = "oaat")]
 use super::helpers::{
@@ -446,6 +450,23 @@ impl OaatOutput {
     pub fn a_la_meme_adresse(&self, host: &str, port: u16) -> bool {
         self.host == host && self.port == port
     }
+    /// #9091 — l'adresse du port de contrôle de l'endpoint, telle que mDNS
+    /// l'a résolue. La découverte la sonde en TCP quand l'annonce expire.
+    pub fn adresse_de_controle(&self) -> (&str, u16) {
+        (&self.host, self.port)
+    }
+    /// #9091 — une session OAAT est-elle vivante sur cette sortie ?
+    ///
+    /// Vrai pendant la lecture (`playing`) et tant que la tâche de lecture
+    /// lit son canal de commandes, pause comprise : c'est elle qui tient la
+    /// connexion de contrôle et l'horloge vers l'endpoint. Une annonce mDNS
+    /// expirée pendant ce temps ne prouve pas que l'appareil est parti
+    /// (multicast filtré par Docker ou un commutateur) : la découverte garde
+    /// alors la zone au lieu de couper la lecture.
+    #[cfg(feature = "oaat")]
+    pub fn session_active(&self) -> bool {
+        self.playing.load(Ordering::SeqCst) || !self.sans_session_de_lecture()
+    }
 
     /// Arm a start position for the next play_media (orchestrator seek path).
     pub fn set_pending_start_position_ms(&self, ms: u64) {
@@ -838,7 +859,7 @@ impl OutputTarget for OaatOutput {
         *self.current_artist.lock().await = Some(artist.clone());
         self.duration_ms.store(track_duration_ms, Ordering::SeqCst);
 
-        info!(device = %self.name, url = %url, title = %title, "oaat: play_media");
+        info!(device = %self.name, url = %crate::confidentialite::masquer_url(&url), title = %title, "oaat: play_media");
 
         let endpoint_addr = self.endpoint_addr();
         let playing = self.playing.clone();
@@ -922,7 +943,7 @@ impl OutputTarget for OaatOutput {
         let task = tokio::spawn(async move {
             use futures_util::StreamExt;
 
-            debug!(device = %device_name, url = %url, "oaat: play_media spawned");
+            debug!(device = %device_name, url = %crate::confidentialite::masquer_url(&url), "oaat: play_media spawned");
 
             let config = ControllerConfig {
                 controller_id,
@@ -2436,19 +2457,19 @@ impl OutputTarget for OaatOutput {
                 if direct_ok {
                     return;
                 }
-                debug!(device = %device_name, "oaat: falling back to HTTP stream for {url}");
+                debug!(device = %device_name, url = %crate::confidentialite::masquer_url(&url), "oaat: falling back to HTTP stream");
             }
 
-            debug!(device = %device_name, url = %url, "oaat: fetching audio stream");
+            debug!(device = %device_name, url = %crate::confidentialite::masquer_url(&url), "oaat: fetching audio stream");
             let resp = match http_client.get(&url).send().await {
                 Ok(r) if r.status().is_success() => r,
                 Ok(r) => {
-                    error!(device = %device_name, status = %r.status(), url = %url, "oaat: HTTP error");
+                    error!(device = %device_name, status = %r.status(), url = %crate::confidentialite::masquer_url(&url), "oaat: HTTP error");
                     playing.store(false, Ordering::SeqCst);
                     return;
                 }
                 Err(e) => {
-                    error!(device = %device_name, error = %e, url = %url, "oaat: fetch failed");
+                    error!(device = %device_name, error = %e, url = %crate::confidentialite::masquer_url(&url), "oaat: fetch failed");
                     playing.store(false, Ordering::SeqCst);
                     return;
                 }

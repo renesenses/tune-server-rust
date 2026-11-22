@@ -260,6 +260,9 @@ pub(super) struct EntreesDsdNatifAlsa {
     pub(super) dop_active: Arc<AtomicBool>,
     pub(super) chain_exhausted: Arc<AtomicBool>,
     pub(super) device_gone: Arc<AtomicBool>,
+    /// #8869 — le silence de verrouillage dont le flux est précédé.
+    pub(super) silence_de_verrouillage:
+        crate::audio::silence_de_verrouillage::SilenceDeVerrouillage,
 }
 
 /// Ce que le rappel écrit dans un tampon `DSD_U32` : le motif de repos tant
@@ -328,6 +331,7 @@ pub(super) fn jouer_dsd_natif_via_alsa(entrees: EntreesDsdNatifAlsa) {
         dop_active,
         chain_exhausted,
         device_gone,
+        silence_de_verrouillage,
     } = entrees;
     let canaux = usize::from(entete.canaux);
 
@@ -415,10 +419,14 @@ pub(super) fn jouer_dsd_natif_via_alsa(entrees: EntreesDsdNatifAlsa) {
     let famines = Arc::new(AtomicU64::new(0));
     let famines_rappel = famines.clone();
     let disparu = device_gone.clone();
+    // Même promotion temps réel que les autres chemins de rendu, à la première
+    // période de chaque fil cpal neuf.
+    let mut promotion = PromotionDuFilDeRendu::nouvelle();
     let stream = match device.build_output_stream_raw(
         &config,
         cpal::SampleFormat::DsdU32,
         move |data: &mut cpal::Data, _: &cpal::OutputCallbackInfo| {
+            promotion.a_la_premiere_periode();
             let repos = paused_rappel.load(Ordering::Relaxed)
                 || silence_rappel.load(Ordering::Relaxed)
                 || fermeture_rappel.load(Ordering::Relaxed);
@@ -478,7 +486,7 @@ pub(super) fn jouer_dsd_natif_via_alsa(entrees: EntreesDsdNatifAlsa) {
     info!(
         device = %device_name,
         pcm = %pcm,
-        url = %url,
+        url = %crate::confidentialite::masquer_url(&url),
         format = ordre.nom_alsa(),
         cadence_dsd = entete.cadence,
         cadence_de_trame,
@@ -496,6 +504,15 @@ pub(super) fn jouer_dsd_natif_via_alsa(entrees: EntreesDsdNatifAlsa) {
     // Et la zone qui attendait ce natif l'affiche, maintenant qu'il est réel.
     crate::outputs::capacite_dsd_natif::confirmer_transport_natif(&format!("local:{device_name}"));
 
+    // #8869 — au changement de format, du repos DSD avant le premier octet.
+    super::silence_de_verrouillage_8869::pousser_dans_l_anneau_dsd(
+        &silence_de_verrouillage,
+        &anneau,
+        entete.cadence,
+        entete.canaux,
+        octets_par_trame,
+        || force_silent.load(Ordering::Relaxed) || device_gone.load(Ordering::Relaxed),
+    );
     // ── Alimentation : DsdU8 → mots DSD_U32 → anneau. ──
     let mut mots: Vec<u8> = Vec::new();
     empaqueteur.pousser(header_buf.get(ENTETE_LEN..).unwrap_or_default(), &mut mots);

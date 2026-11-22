@@ -297,12 +297,12 @@ impl HqplayerOutput {
     async fn retirer_la_suivante(&self, uri: &str) -> Result<(), String> {
         let playlist = self.command(r#"<PlaylistGet picture="0" />"#).await?;
         let Some(index) = index_dans_la_playlist(&playlist, uri) else {
-            info!(device = %self.name, uri, "hqplayer_suivante_perimee_absente");
+            info!(device = %self.name, uri = %crate::confidentialite::masquer_url(&uri), "hqplayer_suivante_perimee_absente");
             return Ok(());
         };
         let xml = format!(r#"<PlaylistRemove index="{}" />"#, escape_xml(&index));
         self.action(&xml).await?;
-        info!(device = %self.name, uri, index, "hqplayer_suivante_perimee_retiree");
+        info!(device = %self.name, uri = %crate::confidentialite::masquer_url(&uri), index, "hqplayer_suivante_perimee_retiree");
         Ok(())
     }
 
@@ -886,7 +886,7 @@ impl OutputTarget for HqplayerOutput {
     }
 
     async fn play_media(&self, media: &PlayMedia<'_>) -> Result<(), String> {
-        info!(device = %self.name, url = media.url, "hqplayer_play");
+        info!(device = %self.name, url = %crate::confidentialite::masquer_url(&media.url), "hqplayer_play");
         // #4851 — `clear="1"` vide la playlist : plus de suivante posée.
         self.enchainement().suivante = None;
 
@@ -984,7 +984,7 @@ impl OutputTarget for HqplayerOutput {
         let precedente = self.enchainement().suivante.clone();
         if let Some(precedente) = precedente {
             if precedente == media.url {
-                debug!(device = %self.name, url = media.url, "hqplayer_suivante_deja_posee");
+                debug!(device = %self.name, url = %crate::confidentialite::masquer_url(&media.url), "hqplayer_suivante_deja_posee");
                 return Ok(());
             }
             self.retirer_la_suivante(&precedente).await?;
@@ -996,7 +996,7 @@ impl OutputTarget for HqplayerOutput {
             e
         })?;
         self.enchainement().suivante = Some(media.url.to_string());
-        info!(device = %self.name, url = media.url, "hqplayer_suivante_posee");
+        info!(device = %self.name, url = %crate::confidentialite::masquer_url(&media.url), "hqplayer_suivante_posee");
         Ok(())
     }
 

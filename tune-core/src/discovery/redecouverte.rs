@@ -119,7 +119,7 @@ pub async fn rechercher_location_par_unicast(
                     continue;
                 };
                 if device_id_from_usn(&resp.usn).eq_ignore_ascii_case(device_id) {
-                    debug!(de = %de, location = %resp.location, "redecouverte_msearch_reponse");
+                    debug!(de = %de, location = %crate::confidentialite::masquer_url(&resp.location), "redecouverte_msearch_reponse");
                     return Some(resp.location);
                 }
                 debug!(de = %de, usn = %resp.usn, "redecouverte_msearch_autre_usn_ignore");
@@ -211,7 +211,7 @@ pub async fn redecouvrir(
     let urls = relire_urls_de_controle(&location).await?;
     info!(
         id = %device_id,
-        location = %urls.location,
+        location = %crate::confidentialite::masquer_url(&urls.location),
         av_transport = %urls.av_transport,
         "dlna_redecouverte_urls_relues"
     );
