@@ -446,13 +446,24 @@ async fn remplacer_le_chemin_refuse_un_prefixe_qui_n_est_pas_un_dossier() {
     crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
     let b = banc();
     let piste = piste_du_banc(&b);
-    let fichier_dehors = b.dehors.join("secret.flac").to_string_lossy().into_owned();
+    // Un dossier hors de la bibliothèque que le périmètre ACCEPTE (sous le
+    // répertoire courant, pas sous `/var/folders` ni le dossier temporaire),
+    // et un fichier dedans : seul le contrôle « dossier » peut refuser.
+    let scratch = tune_core::test_scratch::scratch_dir_in(
+        std::env::current_dir().unwrap(),
+        "confinement-deplacer-fichier",
+    );
+    let dossier_dehors = scratch.path().join("Ailleurs");
+    std::fs::create_dir_all(&dossier_dehors).unwrap();
+    let fichier_dehors = dossier_dehors.join("secret.bin");
+    std::fs::write(&fichier_dehors, b"x").unwrap();
+    let fichier_dehors = fichier_dehors.to_string_lossy().into_owned();
     #[allow(unused_mut)]
     let mut cas = vec![
         // Ancien = le fichier d'une piste, nouveau = un fichier.
         (piste.clone(), fichier_dehors.clone()),
         // Ancien = le fichier d'une piste, nouveau = un dossier.
-        (piste.clone(), b.dehors.to_string_lossy().into_owned()),
+        (piste.clone(), dossier_dehors.to_string_lossy().into_owned()),
         // Ancien = un dossier, nouveau = un fichier.
         (
             b.musique.to_string_lossy().into_owned(),
@@ -462,7 +473,11 @@ async fn remplacer_le_chemin_refuse_un_prefixe_qui_n_est_pas_un_dossier() {
     // Nouveau = un lien, dans le dossier voisin, qui mène sous /etc.
     #[cfg(unix)]
     {
-        let lien = b.dehors.join("lien-systeme");
+        // Dans un dossier à part : un lien vers /etc rend son dossier
+        // « trop large » aux yeux du périmètre, ce qui fausserait le cas 2.
+        let liens = scratch.path().join("Liens");
+        std::fs::create_dir_all(&liens).unwrap();
+        let lien = liens.join("lien-systeme");
         std::os::unix::fs::symlink("/etc", &lien).unwrap();
         cas.push((
             b.musique.to_string_lossy().into_owned(),
