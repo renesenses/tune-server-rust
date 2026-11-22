@@ -166,7 +166,11 @@ async fn une_source_en_404_arrete_la_zone_avec_un_bandeau_9315() {
         "#9315 : UN bandeau doit dire que la source a refusé : {bandeaux:?}"
     );
     let b = &bandeaux[0];
-    assert_eq!(b["code"], source_en_erreur_9315::CODE_SOURCE_EN_ERREUR, "{b}");
+    assert_eq!(
+        b["code"],
+        source_en_erreur_9315::CODE_SOURCE_EN_ERREUR,
+        "{b}"
+    );
     assert_eq!(b["params"]["status"], 404, "{b}");
     assert_eq!(b["params"]["title"], TITRE, "{b}");
     assert_eq!(b["fatal"], true, "{b}");

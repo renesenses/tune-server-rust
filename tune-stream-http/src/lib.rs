@@ -3500,7 +3500,9 @@ async fn proxy_stream(
     // panne de la source.
     if statut_amont_en_echec(upstream_resp.status()) {
         let statut = upstream_resp.status().as_u16();
-        let servis = session.bytes_sent.load(std::sync::atomic::Ordering::Relaxed);
+        let servis = session
+            .bytes_sent
+            .load(std::sync::atomic::Ordering::Relaxed);
         warn!(
             stream_id = %session.id,
             statut,

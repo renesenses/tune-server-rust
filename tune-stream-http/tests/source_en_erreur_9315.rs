@@ -95,7 +95,12 @@ async fn get(sessions: &SharedSessions, id: &str) -> (u16, Vec<u8>) {
 
 async fn verifier_l_erreur(statut_source: &'static str, attendu: u16) {
     let id = format!("relais-9315-{attendu}");
-    let amont = source(statut_source, "text/html", PAGE_D_ERREUR.as_bytes().to_vec()).await;
+    let amont = source(
+        statut_source,
+        "text/html",
+        PAGE_D_ERREUR.as_bytes().to_vec(),
+    )
+    .await;
     let (sessions, session) = session_relayee(&id, amont).await;
     let (statut, octets) = get(&sessions, &id).await;
     assert_eq!(
