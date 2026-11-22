@@ -177,7 +177,11 @@ async fn source_503_puis_200(audio: Vec<u8>) -> String {
                     requete.push(octet[0]);
                 }
                 let (statut, type_, corps): (&str, &str, Vec<u8>) = if rang == 0 {
-                    ("503 Service Unavailable", "text/html", PAGE_D_ERREUR.as_bytes().to_vec())
+                    (
+                        "503 Service Unavailable",
+                        "text/html",
+                        PAGE_D_ERREUR.as_bytes().to_vec(),
+                    )
                 } else {
                     ("200 OK", "audio/mp4", audio)
                 };

@@ -3495,7 +3495,10 @@ async fn proxy_stream(
                 // #9315 — 403/410 sans nouvelle résolution : noté comme toute
                 // erreur de la source, tant que rien n'a été servi.
                 if let Some(statut) = statut
-                    && session.bytes_sent.load(std::sync::atomic::Ordering::Relaxed) == 0
+                    && session
+                        .bytes_sent
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        == 0
                 {
                     session.signaler_erreur_amont(statut);
                 }
