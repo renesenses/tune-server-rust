@@ -713,6 +713,18 @@ fn verifier_nom_libre(
     }
 }
 
+/// Le nom que porte la collection `id` en base (`None` si elle n'existe pas).
+fn nom_actuel(state: &SmartHttpState, id: i64) -> Result<Option<String>, AppError> {
+    Ok(state
+        .backend
+        .query_one(
+            "SELECT name FROM smart_collections WHERE id = $1",
+            &[&id as &dyn ToSqlValue],
+        )
+        .map_err(AppError::internal)?
+        .and_then(|r| r.first().and_then(|v| v.as_string())))
+}
+
 async fn create_collection(
     State(state): State<SmartHttpState>,
     Json(body): Json<CreateCollection>,
@@ -841,7 +853,15 @@ async fn update_collection(
     }
     // Un nom déjà pris est refusé AVANT toute écriture (409), pour la même
     // raison que la borne : la mise à jour écrit champ par champ.
-    if let Some(ref name) = body.name {
+    //
+    // #9314 — seulement si le nom CHANGE. L'éditeur renvoie le nom à chaque
+    // enregistrement, même inchangé. Sous PostgreSQL, sans index unique, deux
+    // homonymes ont pu s'enregistrer avant #9280 : chacun trouvait l'autre, et
+    // aucun ne pouvait plus changer une règle ni une description. Garder son
+    // nom ne crée aucun doublon nouveau.
+    if let Some(ref name) = body.name
+        && nom_actuel(&state, id)?.as_deref() != Some(name.as_str())
+    {
         verifier_nom_libre(&state, name, Some(id))?;
     }
     if let Some(ref name) = body.name {

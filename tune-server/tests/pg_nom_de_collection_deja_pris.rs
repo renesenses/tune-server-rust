@@ -123,3 +123,70 @@ async fn pg_nom_de_collection_deja_pris_rend_409() {
 
     menage(&state);
 }
+
+/// #9314 — deux homonymes DÉJÀ en base PostgreSQL (enregistrés avant #9280,
+/// le schéma n'ayant pas d'index unique) : chacun reste modifiable tant qu'il
+/// garde son nom. Avant le correctif, chaque enregistrement de l'éditeur, qui
+/// renvoie le nom inchangé, rendait 409.
+#[tokio::test(flavor = "multi_thread")]
+async fn pg_9314_deux_homonymes_deja_enregistres_restent_modifiables() {
+    let Some(url) = std::env::var("TUNE_TEST_PG_URL").ok() else {
+        eprintln!("TUNE_TEST_PG_URL absente — épreuve PostgreSQL sautée");
+        return;
+    };
+    const MARQUE_9314: &str = "homonymes9314";
+    let state = etat_postgres(&url);
+    let menage_9314 = |state: &AppState| {
+        let sql = format!("DELETE FROM smart_collections WHERE name LIKE '{MARQUE_9314}%'");
+        state
+            .backend
+            .execute(&sql, &[])
+            .unwrap_or_else(|e| panic!("ménage « {sql} » : {e}"));
+    };
+    menage_9314(&state);
+    let nom = format!("{MARQUE_9314} Rock progressif");
+    let inserer = |nom: &str| {
+        state
+            .backend
+            .execute_returning_id(
+                "INSERT INTO smart_collections (name, rules) VALUES (?, '[]')",
+                &[&nom as &dyn ToSqlValue],
+            )
+            .expect("homonyme")
+    };
+    let id_a = inserer(&nom);
+    let id_b = inserer(&nom);
+    assert_eq!(combien_s_appellent(&state, &nom), 2, "les deux homonymes");
+    let route = "/api/v1/library/smart-collections";
+
+    for id in [id_a, id_b] {
+        let (statut, v) = appel(
+            &state,
+            "PUT",
+            &format!("{route}/{id}"),
+            json!({"name": nom, "description": "règles revues", "rules": []}),
+        )
+        .await;
+        assert_eq!(
+            statut,
+            StatusCode::OK,
+            "#9314 : un homonyme qui garde son nom doit rester modifiable : {v}"
+        );
+        assert_eq!(v["description"], "règles revues", "{v}");
+    }
+
+    // Renommer une autre collection vers ce nom reste refusé.
+    let autre = format!("{MARQUE_9314} Piano solo");
+    let id_c = inserer(&autre);
+    let (statut, v) = appel(
+        &state,
+        "PUT",
+        &format!("{route}/{id_c}"),
+        json!({"name": nom}),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::CONFLICT, "{v}");
+    assert_eq!(combien_s_appellent(&state, &autre), 1);
+
+    menage_9314(&state);
+}
