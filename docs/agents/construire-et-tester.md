@@ -49,6 +49,10 @@ nohup cargo test -p tune-server --lib <filtre> > target/x.log 2>&1 &
 - `cargo test -p tune-smart-http` en entier : 198 tests, quelques secondes une
   fois compilé.
 
+Les témoins rendus déterministes et leurs contre-épreuves sont documentés dans
+[les notes par test](epreuves-instables/), une note par PR pour éviter les conflits
+entre validations indépendantes.
+
 ## Écrire un test dans tune-server
 
 - `tune-server` a `autotests = false` : un nouveau fichier de `tests/` exige un
@@ -176,6 +180,17 @@ exact du cas et une vérification du compteur de tests exécutés. Il conserve
 toutes les réponses attendues et l’assertion du réveil ; aucun abandon anticipé
 en cas d’état étranger. La contre-épreuve retire seulement l’appel de réveil
 dans `replaygain_analyze` : répondre 202 sans réveiller doit toujours rougir.
+### ReplayGain #7724 : isoler les états du processus
+
+Le verrou local de `replaygain_lancer_tests_6778` ne sérialise pas les autres
+modules qui modifient la pause, la campagne ou le rang global. Le témoin #7724
+pouvait donc recevoir `refused/paused` au lieu de `already_running`, voire
+quitter sans vérifier la route. Il lance désormais exactement son propre cas
+dans un nouveau processus et exige un test réussi, aucun ignoré. Ne pas
+remettre un retour anticipé en cas de pause. Le nom passé à `--exact` exclut
+le préfixe de caisse de `module_path!()` ; vérifier le compteur évite un faux
+vert à zéro test. La contre-épreuve métier retire seulement la condition du
+rang dans `replaygain_analyze` ; les assertions restent inchangées.
 
 ### Épreuves de concurrence sous charge : synchronisation communautaire (#6702)
 
