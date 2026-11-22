@@ -17,6 +17,8 @@ pub mod choix_de_pressage;
 pub mod coffrets;
 pub mod completude;
 pub mod credits_balises;
+/// Réglage « Balises personnelles → tags Tune » (#9158, Rob).
+pub mod tags_perso;
 // « Joue avec » de la page artiste (#7768).
 #[cfg(test)]
 mod credits_balises_tests_7766;
@@ -2863,6 +2865,15 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
         "tagless_fallback_metadata"
     );
 
+    // #8968 — durée JOUÉE d'un AAC en MP4 (amorce et remplissage retirés),
+    // comme dans `try_read_metadata_unsanitized`.
+    let duree_ms = format
+        .as_deref()
+        .filter(|f| *f == "aac")
+        .and(props.sample_rate())
+        .and_then(|sr| crate::audio::amorce_aac::duree_jouee_ms(path, sr))
+        .unwrap_or(props.duration().as_millis() as u64);
+
     TrackMetadata {
         title,
         album,
@@ -2892,7 +2903,7 @@ fn tagless_fallback(path: &Path, props: &lofty::properties::FileProperties) -> T
             .or_else(|| crate::audio::iso9660::taille_et_mtime(path).map(|(t, _)| t)),
         sample_rate: props.sample_rate(),
         channels: props.channels().map(|c| c as u16),
-        duration_ms: Some(props.duration().as_millis() as u64),
+        duration_ms: Some(duree_ms),
         bit_depth: props.bit_depth().map(|b| b as u16).or(probed_bit_depth),
         bpm: None,
         // Aucun tag lu sur ce chemin : ABSENCE, et non « tag a zero ».
@@ -3458,6 +3469,43 @@ fn raw_vorbis_comment(path: &Path, field_name: &str) -> Option<String> {
 /// This matters at scan time: looking for four Dynamic Range spellings with four
 /// separate calls costs four 1 MB reads on *every* file, and the files that have
 /// none — the vast majority — pay the full price every time.
+/// La tête Vorbis lue par [`read_vorbis_header`] : au plus tant d'octets.
+const TETE_VORBIS_OCTETS: usize = 1024 * 1024;
+
+/// #9158 — la tête lue contient-elle À COUP SÛR tous les commentaires Vorbis ?
+///
+/// Oui si le fichier entier tient dans la tête, ou si c'est un FLAC dont le
+/// bloc VORBIS_COMMENT finit dans la tête (ou qui n'en a pas). Non sinon : un
+/// FLAC dont une grosse image (PICTURE) ou un bourrage précède les
+/// commentaires, et tout Ogg (Vorbis, Opus) tronqué — ses balises peuvent
+/// suivre un METADATA_BLOCK_PICTURE en base64 de plusieurs Mio. Une balise
+/// absente d'une tête incomplète n'est PAS absente du fichier.
+fn tete_vorbis_complete(data: &[u8]) -> bool {
+    if data.len() < TETE_VORBIS_OCTETS {
+        return true;
+    }
+    if !data.starts_with(b"fLaC") {
+        return false;
+    }
+    let mut pos = 4usize;
+    loop {
+        let Some(h) = data.get(pos..pos + 4) else {
+            return false;
+        };
+        let dernier = h[0] & 0x80 != 0;
+        let genre = h[0] & 0x7f;
+        let longueur = u32::from_be_bytes([0, h[1], h[2], h[3]]) as usize;
+        let fin = pos + 4 + longueur;
+        if genre == 4 {
+            return fin <= data.len();
+        }
+        if dernier {
+            return true;
+        }
+        pos = fin;
+    }
+}
+
 fn read_vorbis_header(path: &Path) -> Option<Vec<u8>> {
     let ext = path.extension()?.to_str()?.to_lowercase();
     if !matches!(ext.as_str(), "flac" | "ogg" | "oga" | "opus") {
@@ -3465,13 +3513,12 @@ fn read_vorbis_header(path: &Path) -> Option<Vec<u8>> {
     }
     // Vorbis comments live in the file header; a bounded prefix read finds them
     // without slurping a multi-GB hi-res FLAC into RAM.
-    const HEADER_BYTES: u64 = 1024 * 1024;
     let mut data = Vec::new();
     {
         use std::io::Read;
         crate::audio::iso9660::ouvrir_fichier(path)
             .ok()?
-            .take(HEADER_BYTES)
+            .take(TETE_VORBIS_OCTETS as u64)
             .read_to_end(&mut data)
             .ok()?;
     }
@@ -4261,6 +4308,17 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
                     lofty_dur,
                     props.audio_bitrate(),
                 ))
+            } else if m4a_probe.as_ref().is_some_and(|(f, _)| f == "aac") {
+                // #8968 — lofty lit la durée dans `mdhd`, amorce et
+                // remplissage de l'encodeur compris (6,06 s pour 6 s jouées).
+                // La lecture les retire désormais : la bibliothèque affiche
+                // la durée JOUÉE quand le conteneur la dit.
+                Some(
+                    props
+                        .sample_rate()
+                        .and_then(|sr| crate::audio::amorce_aac::duree_jouee_ms(path, sr))
+                        .unwrap_or(lofty_dur),
+                )
             } else {
                 Some(lofty_dur)
             }
@@ -4434,6 +4492,18 @@ pub fn read_extended_metadata(path: &Path) -> HashMap<String, String> {
 pub fn read_extended_metadata_selon(
     path: &Path,
     classique: &balises_classique::BalisesClassique,
+) -> HashMap<String, String> {
+    read_extended_metadata_avec(path, classique, &tags_perso::courante())
+}
+
+/// [`read_extended_metadata_selon`] avec, en plus, un réglage « Balises
+/// personnelles → tags Tune » explicite (#9158, Rob) : les témoins le passent
+/// sans toucher au miroir global. Réglage vide (défaut) : lecture identique à
+/// celle d'avant, aucune clé [`tags_perso::CLE_LUE`].
+pub fn read_extended_metadata_avec(
+    path: &Path,
+    classique: &balises_classique::BalisesClassique,
+    perso: &tags_perso::TagsPerso,
 ) -> HashMap<String, String> {
     use balises_classique::{BalisesClassique, STANDARD_CHEF, STANDARD_MOUVEMENT, STANDARD_OEUVRE};
     use lofty::file::{AudioFile, TaggedFileExt};
@@ -4627,6 +4697,10 @@ pub fn read_extended_metadata_selon(
     // qu'en dernier recours ; une date qui ne commence pas par une année est
     // écartée (`balises_brutes::date_valide`).
     {
+        // #9158 — une lecture brute RATÉE n'est pas un fichier sans balise :
+        // les tags du scan ne sont pas retirés (piste sautée, comme la passe
+        // « Appliquer »).
+        let mut brutes_lues = true;
         let brutes: Vec<(String, String)> = match header.as_deref() {
             Some(h) => balises_brutes::CLES_DATE_ORIGINALE
                 .iter()
@@ -4642,6 +4716,8 @@ pub fn read_extended_metadata_selon(
                         .cles_brutes()
                         .into_iter()
                         .chain(std::iter::once(credits_balises::CLE_BAND.to_string()))
+                        // #9158 — les clés des balises personnelles réglées.
+                        .chain(perso.cles())
                         .flat_map(|k| {
                             find_vorbis_comments(h, &k, usize::MAX)
                                 .into_iter()
@@ -4649,9 +4725,13 @@ pub fn read_extended_metadata_selon(
                         }),
                 )
                 .collect(),
-            None => balises_brutes::lire_balises_du_fichier(path)
-                .map(|b| b.paires())
-                .unwrap_or_default(),
+            None => match balises_brutes::lire_balises_du_fichier(path) {
+                Ok(b) => b.paires(),
+                Err(_) => {
+                    brutes_lues = false;
+                    Vec::new()
+                }
+            },
         };
         if let Some(v) = balises_brutes::date_originale_parmi(&brutes).or_else(|| {
             get(ItemKey::OriginalReleaseDate).and_then(|v| balises_brutes::date_valide(&v))
@@ -4660,6 +4740,30 @@ pub fn read_extended_metadata_selon(
         }
         if let Some(v) = balises_brutes::version_parmi(&brutes) {
             meta.insert("version".into(), v);
+        }
+        // #9158 — les balises personnelles qui deviennent des tags Tune.
+        // Présente, même vide, dès qu'une correspondance existe : une liste
+        // vide RETIRE les tags que le scan avait posés.
+        //
+        // Tête Vorbis INCOMPLÈTE (commentaires au-delà du premier Mio : grosse
+        // image avant eux, Ogg/Opus) : les balises personnelles sont relues
+        // dans le fichier entier, comme la passe « Appliquer » ; sans quoi le
+        // scan retirerait des tags que le fichier porte. Échec de cette
+        // relecture = lecture ratée (rien n'est touché).
+        let relues: Option<Vec<(String, String)>> = (!perso.est_vide()
+            && brutes_lues
+            && header.as_deref().is_some_and(|h| !tete_vorbis_complete(h)))
+        .then(|| {
+            balises_brutes::lire_balises_du_fichier(path)
+                .map(|b| b.paires())
+                .unwrap_or_else(|_| {
+                    brutes_lues = false;
+                    Vec::new()
+                })
+        });
+        let pour_perso = relues.as_deref().unwrap_or(&brutes[..]);
+        if let Some(v) = tags_perso::valeur_lue(perso, brutes_lues.then_some(pour_perso)) {
+            meta.insert(tags_perso::CLE_LUE.into(), v);
         }
         // #7766 — ce que lofty ne range sous aucun `ItemKey` : l'ensemble ou
         // l'orchestre (ENSEMBLE, ORCHESTRA), la liste des musiciens ID3v2.4

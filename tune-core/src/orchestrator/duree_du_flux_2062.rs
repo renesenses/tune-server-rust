@@ -24,7 +24,7 @@ const BUDGET: std::time::Duration = std::time::Duration::from_secs(4);
 /// Lit `longueur` octets à partir de `debut`, et la taille totale du fichier
 /// quand le serveur la dit. Un serveur qui ignore `Range` (réponse `200`) ne
 /// sert que pour la tête : on lit alors les premiers octets et on coupe.
-async fn lire_une_plage(
+pub(super) async fn lire_une_plage(
     client: &reqwest::Client,
     url: &str,
     debut: u64,
@@ -116,7 +116,7 @@ impl PlaybackOrchestrator {
         let Some(ms) = deduire_la_duree_du_flux(audio_url).await else {
             info!(
                 zone_id = req.zone_id,
-                url = %audio_url,
+                url = %crate::confidentialite::masquer_url(&audio_url),
                 "upnp_duree_du_flux_introuvable"
             );
             return req.duration_ms;
@@ -125,7 +125,7 @@ impl PlaybackOrchestrator {
             zone_id = req.zone_id,
             track_id = ?req.track_id,
             duration_ms = ms,
-            url = %audio_url,
+            url = %crate::confidentialite::masquer_url(&audio_url),
             "upnp_duree_deduite_du_flux"
         );
         self.ranger_la_duree_deduite(req, ms);

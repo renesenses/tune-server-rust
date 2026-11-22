@@ -67,7 +67,10 @@ async fn joue(niveaux: &Niveaux) -> Option<f64> {
     niveaux.lock().await.last().copied()
 }
 
+/// `b` est le curseur : le démon reçoit son niveau sur la courbe commune
+/// (#8855).
 fn proche(a: Option<f64>, b: f64) -> bool {
+    let b = crate::outputs::volume_airplay_8855::niveau_pour_le_demon(b);
     a.is_some_and(|a| (a - b).abs() < 1e-6)
 }
 

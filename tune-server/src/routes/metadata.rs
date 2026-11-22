@@ -135,6 +135,19 @@ pub fn router() -> Router<AppState> {
             "/doubtful/artist-from-folder",
             post(artiste_du_dossier::ecrire_artiste_du_dossier),
         )
+        // #8958 — marquer une alerte comme normale, revoir, annuler.
+        .route(
+            "/doubtful/ignored",
+            get(alertes_ignorees::lister)
+                .post(alertes_ignorees::ignorer)
+                .delete(alertes_ignorees::retablir),
+        )
+        // #9028 — « Normal pour tout l'album » : aperçu, geste, annulation.
+        .route("/doubtful/album", get(alertes_album::apercu))
+        .route(
+            "/doubtful/ignored/album",
+            post(alertes_album::ignorer).delete(alertes_album::retablir),
+        )
         // Lookup (MusicBrainz)
         .route("/lookup/track", get(lookup_track))
         .route("/lookup/album", get(lookup_album))
@@ -1159,6 +1172,8 @@ async fn batch_rename_artist(
 }
 
 async fn list_doubtful_metadata(
+    // #8958 — l'écran n'offre « C'est normal » qu'à qui peut l'écrire.
+    admin: Result<crate::auth::RequireAdmin, (StatusCode, Json<serde_json::Value>)>,
     State(state): State<AppState>,
     Query(p): Query<PaginationParams>,
 ) -> impl IntoResponse {
@@ -1167,23 +1182,27 @@ async fn list_doubtful_metadata(
     let track_repo = TrackRepo::with_backend(state.backend.clone());
     let total = track_repo.count_doubtful().unwrap_or(0);
     let tracks = track_repo.list_doubtful(limit, offset).unwrap_or_default();
+    // #8958 — une piste reste listée tant qu'UNE de ses alertes n'est pas
+    // marquée normale (filtre SQL) ; les alertes ignorées sont retirées de
+    // ses raisons ici.
+    let ignorees = alertes_ignorees::Ignorees::charger(&state.backend);
     let items: Vec<serde_json::Value> = tracks
         .iter()
         .map(|t| {
-            let mut reasons = Vec::new();
-            if t.artist_name
-                .as_ref()
-                .map(|a| a.is_empty() || a == "Unknown Artist")
-                .unwrap_or(true)
-            {
-                reasons.push("missing_artist");
-            }
-            if t.duration_ms > 0 && t.duration_ms < 5000 {
-                reasons.push("very_short");
-            }
-            if t.album_title.as_ref().map(|a| a.is_empty()).unwrap_or(true) {
-                reasons.push("missing_album");
-            }
+            // La règle de `where_doubtful`, partagée avec le POST de #8958.
+            let mut reasons = tune_core::db::alertes_douteuses_ignorees::raisons_de(t);
+            reasons.retain(|r| !ignorees.contient(t, r));
+            // #8958 — où « Marquer comme normale » mémoriserait chaque
+            // alerte : l'écran le dit sur le bouton.
+            let ignore_scopes: serde_json::Map<String, serde_json::Value> = reasons
+                .iter()
+                .map(|r| {
+                    (
+                        r.to_string(),
+                        json!(alertes_ignorees::portee_de(t, r).as_str()),
+                    )
+                })
+                .collect();
             json!({
                 "id": t.id,
                 "title": t.title,
@@ -1198,15 +1217,22 @@ async fn list_doubtful_metadata(
                 // distincts seulement. Le titre ne sert à rien : son préfixe
                 // « 01 - » est un numéro de piste, pas un nom, et l'album ne
                 // connaît l'artiste que 33 fois sur 1 592.
-                "file_path": t.file_path,
+                //
+                // #8957 — le chemin OUVRABLE : une piste de feuille CUE n'a pas
+                // de `file_path`, son fichier image est dans `cue_media_path`.
+                "file_path": artiste_du_dossier::chemin_ouvrable(t),
+                "path_source": artiste_du_dossier::source_du_chemin(t),
                 // #8679 — l'artiste que le dossier donne, par la règle du
                 // scan : « artiste absent des balises (dossier : …) ».
                 "folder_artist": artiste_du_dossier::artiste_du_dossier_de(t),
+                "album_id": t.album_id,
+                "ignore_scopes": ignore_scopes,
             })
         })
         .collect();
     Json(json!({
         "items": items,
+        "can_ignore": admin.is_ok(),
         "total": total,
         "limit": limit,
         "offset": offset,
@@ -3121,6 +3147,12 @@ async fn merge_albums(
 #[cfg(test)]
 mod tests_fusion_compilation;
 
+mod alertes_album;
+#[cfg(test)]
+mod alertes_album_tests_9028;
+mod alertes_ignorees;
+#[cfg(test)]
+mod alertes_ignorees_tests_8958;
 mod artiste_du_dossier;
 
 #[cfg(test)]

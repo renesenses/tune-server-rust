@@ -12,7 +12,9 @@ use tune_calibration_greffon::fournisseur::FournisseurBalayage;
 use tune_calibration_greffon::generateur::Consigne;
 use tune_calibration_greffon::hote::TraitementsDeZone;
 use tune_calibration_greffon::mesure::{Controleur, Demande, Etat, FREQUENCE_MESURE};
-use tune_calibration_greffon::simulation::{Boucle, HoteSimule, MicroSimule, PieceEnDirect};
+use tune_calibration_greffon::simulation::{
+    Boucle, CheminDeLecture, HoteSimule, MicroSimule, PieceEnDirect,
+};
 use tune_entree_audio::peripheriques::Peripheriques;
 
 const MICRO: &str = "UMIK-1 simulé";
@@ -201,6 +203,115 @@ fn une_piece_simulee_est_mesuree_de_bout_en_bout() {
     assert!(m.ri_wav().is_some());
     let av = m.avancement();
     assert!(av.progression > 0.0);
+}
+
+/// #9066 (fil 2914) — la zone passe par le chemin d'une vraie sortie
+/// locale : la vraie pompe (`source_pcm::pomper`), le canal de 256 tronçons
+/// de la session, puis l'anneau de 2 s de la sortie. Ce chemin laissait le
+/// générateur prendre ~4,5 s de silence d'avance pendant l'analyse de la
+/// salve ; le balayage complet sortait après la fin de la fenêtre d'écoute
+/// (1 s + 3,5 s) et la mesure était refusée sur le « rapport crête/bruit ».
+/// La salve, elle, partait avant que l'avance ne s'accumule — exactement ce
+/// que le testeur a entendu. Cadencé sur l'écoute, le balayage arrive à
+/// l'heure et la RI retrouve le retard de la pièce.
+#[test]
+fn le_balayage_sort_pendant_l_ecoute_malgre_le_chemin_de_lecture_9066() {
+    let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
+    let boucle = Boucle::avec_tampon(
+        PieceEnDirect::depuis(&sim, 1.0),
+        VITESSE,
+        2 * FREQUENCE_MESURE as usize,
+    );
+    let fournisseur = FournisseurBalayage::new();
+    let hote = HoteSimule::avec_chemin(
+        fournisseur.clone(),
+        boucle.clone(),
+        Some(50.0),
+        CheminDeLecture::session_de_source_pcm(),
+    );
+    let micro: Arc<dyn Peripheriques> = Arc::new(MicroSimule {
+        nom: MICRO.into(),
+        frequence: FREQUENCE_MESURE,
+        boucle,
+        demarrages: Default::default(),
+    });
+    let dossier = tune_core::test_scratch::scratch_dir("tune-calibration-chemin-9066");
+    let controleur = Controleur::new(
+        micro,
+        hote.clone(),
+        fournisseur,
+        dossier.path().to_path_buf(),
+    );
+    let mut d = demande(9);
+    d.duree_s = 1.0;
+    let id = controleur.lancer(d).expect("lancée");
+    let etat = attendre_fin(&controleur, &id, Duration::from_secs(120));
+    let m = controleur.mesure(&id).unwrap();
+    assert_eq!(etat, Etat::Terminee, "{:?}", m.avancement());
+    let r = m.resultat().expect("résultat");
+    assert_eq!(r.salves.len(), 1, "{:?}", r.salves);
+    // Vol acoustique (12 ms) plus l'avance permise sur l'écoute (300 ms),
+    // par blocs de 10 ms : rien de l'anneau ni du canal.
+    assert!(
+        (12.0..=12.0 + 300.0 + 30.0).contains(&r.ri.retard_ms),
+        "retard {} ms",
+        r.ri.retard_ms
+    );
+    assert!(r.ri.rsb_db > 50.0, "RSB {}", r.ri.rsb_db);
+    assert_eq!(hote.journal().arrets, 1);
+}
+
+/// #9066 (relecture) — le micro se fige pendant le balayage, sans erreur
+/// (USB décroché, veille) : la mesure s'arrête en deux secondes en nommant
+/// le micro, au lieu d'attendre une minute puis « capture trop lente ».
+#[test]
+fn un_micro_fige_arrete_la_mesure_tot_en_le_disant_9066() {
+    let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
+    let boucle = Boucle::new(PieceEnDirect::depuis(&sim, 1.0), VITESSE);
+    let fournisseur = FournisseurBalayage::new();
+    let hote = HoteSimule::new(fournisseur.clone(), boucle.clone(), Some(50.0));
+    let micro: Arc<dyn Peripheriques> = Arc::new(MicroSimule {
+        nom: MICRO.into(),
+        frequence: FREQUENCE_MESURE,
+        boucle: boucle.clone(),
+        demarrages: Default::default(),
+    });
+    let dossier = tune_core::test_scratch::scratch_dir("tune-calibration-micro-fige-9066");
+    let controleur = Controleur::new(
+        micro,
+        hote.clone(),
+        fournisseur,
+        dossier.path().to_path_buf(),
+    );
+    let id = controleur.lancer(demande(10)).expect("lancée");
+    let e = attendre_etat(
+        &controleur,
+        &id,
+        |e| matches!(e, Etat::Balayage { .. }),
+        Duration::from_secs(60),
+    );
+    assert!(matches!(e, Etat::Balayage { .. }), "{e:?}");
+    boucle.fige.store(true, std::sync::atomic::Ordering::SeqCst);
+    let t0 = Instant::now();
+    let etat = attendre_fin(&controleur, &id, Duration::from_secs(20));
+    match &etat {
+        Etat::Erreur { message } => {
+            assert!(
+                message.contains("ne capte plus") && message.contains(MICRO),
+                "{message}"
+            )
+        }
+        autre => panic!("{autre:?}"),
+    }
+    assert!(t0.elapsed() < Duration::from_secs(8), "{:?}", t0.elapsed());
+    assert_eq!(hote.journal().arrets, 1);
+    // Le code stable et le micro ouvert (#9070), pour que l'écran traduise.
+    let av = controleur.mesure(&id).unwrap().avancement();
+    assert_eq!(av.code, Some("micro_fige"));
+    assert!(av.peripherique.is_some(), "{av:?}");
+    let json = serde_json::to_value(&av).unwrap();
+    assert_eq!(json["code"], "micro_fige", "{json}");
+    assert_eq!(json["etat"], "erreur", "{json}");
 }
 
 /// Garde-fou du niveau joué : une pièce trop sourde (enceinte presque
@@ -913,4 +1024,54 @@ fn la_simulation_sans_micro_est_premium_et_ne_propose_que_des_coupes_prudentes()
     assert_eq!(j.profils[0].name, format!("Estimation {id}"));
     assert!(j.profils[0].filters.iter().all(|f| f.gain_db <= 0.0));
     assert!(j.joues.is_empty(), "une simulation a joué quelque chose");
+}
+
+/// #9070 (fil 2770) — l'UMIK-1 s'ouvrait en ALSA direct mais ne remettait
+/// aucune trame : la mesure attendait une minute et finissait en « capture
+/// trop lente : 0 trames sur 216000 attendues », après avoir joué une salve.
+/// Elle échoue désormais en ~4 s, AVANT toute salve, avec un code que
+/// l'écran traduit et le périphérique ouvert.
+#[test]
+fn un_micro_qui_ne_renvoie_rien_arrete_la_mesure_en_quatre_secondes_9070() {
+    use std::sync::atomic::Ordering;
+    let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
+    let boucle = Boucle::new(PieceEnDirect::depuis(&sim, 1.0), VITESSE);
+    let fournisseur = FournisseurBalayage::new();
+    let hote = HoteSimule::new(fournisseur.clone(), boucle, Some(50.0));
+    let micro = tune_entree_audio::simule::Simulees::avec(MICRO, FREQUENCE_MESURE);
+    micro.sans_trames.store(true, Ordering::SeqCst);
+    let dossier = tune_core::test_scratch::scratch_dir("tune-calibration-muet-9070");
+    let controleur = Controleur::new(
+        micro,
+        hote.clone(),
+        fournisseur,
+        dossier.path().to_path_buf(),
+    );
+    let t0 = Instant::now();
+    let id = controleur.lancer(demande(4)).expect("lancée");
+    let etat = attendre_fin(&controleur, &id, Duration::from_secs(20));
+    let duree = t0.elapsed();
+    let Etat::Erreur { message } = etat else {
+        panic!("#9070 : erreur attendue, obtenu {etat:?}");
+    };
+    assert!(
+        message.contains("ne renvoie aucun son") && message.contains(MICRO),
+        "{message}"
+    );
+    assert!(
+        duree < Duration::from_secs(10),
+        "#9070 : la mesure a attendu {duree:?} un micro muet (attendu ~4 s)"
+    );
+    let av = controleur.mesure(&id).unwrap().avancement();
+    assert_eq!(av.code, Some("micro_muet"));
+    assert_eq!(
+        av.peripherique.as_deref(),
+        Some(format!("simule:{MICRO}").as_str())
+    );
+    let j = hote.journal();
+    assert!(
+        j.joues.is_empty(),
+        "une salve a été jouée vers un micro muet"
+    );
+    assert!(j.volumes.is_empty(), "le volume de la zone a été touché");
 }

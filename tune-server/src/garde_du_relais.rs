@@ -84,24 +84,42 @@ const SEGMENTS_DE_COMPTE: &[&str] = &[
     "debug",
 ];
 
+/// `/home/continue-listening/{zone}/resume`, la zone en chiffres seulement.
+fn reprise_d_une_ecoute(api: &str) -> bool {
+    let segments: Vec<&str> = api.split('/').skip(1).collect();
+    matches!(
+        segments.as_slice(),
+        ["home", "continue-listening", zone, "resume"]
+            if !zone.is_empty() && zone.bytes().all(|b| b.is_ascii_digit())
+    )
+}
+
 /// Une route de l'API (`/api/v1` retiré) relayable ?
 fn route_d_api_relayable(m: &Method, api: &str, auth_active: bool) -> bool {
     // Lecture, file, volume, transfert : tout ce qui pilote une zone.
     if sous(api, "/zones") || sous(api, "/playback") {
         return true;
     }
+    // L'historique d'écoute : en lecture seulement. L'effacer n'est jamais
+    // relayé — par le relais, `X-Profile-Id` permettrait de vider un profil
+    // après l'autre.
+    if sous(api, "/history") || sous(api, "/library/history") {
+        return lecture(m);
+    }
     // Ce que l'auditeur range lui-même.
     if sous(api, "/playlists")
         || sous(api, "/radios")
         || sous(api, "/radio-favorites")
         || sous(api, "/podcasts")
-        || sous(api, "/history")
-        || sous(api, "/library/history")
         || sous(api, "/search")
         || sous(api, "/library/search")
-        || sous(api, "/ext/circle")
     {
         return true;
+    }
+    // Tune Circle : lecture seule à distance (décision du 19/11/2026). Ses
+    // écritures agissent au nom du compte mozaiklabs du serveur.
+    if sous(api, "/ext/circle") {
+        return lecture(m);
     }
     // Profils : lire, choisir le sien, ses favoris et ses préférences. Créer,
     // modifier ou supprimer un profil n'est pas relayable.
@@ -146,6 +164,11 @@ fn route_d_api_relayable(m: &Method, api: &str, auth_active: bool) -> bool {
             ("POST", "/auth/login") | ("POST", "/auth/logout") | ("GET", "/auth/me")
         )
     {
+        return true;
+    }
+    // Reprendre une écoute de l'accueil dans une zone : le même geste que
+    // `/zones/*`. Cette seule route sous `/home` s'ouvre en écriture.
+    if m == Method::POST && reprise_d_une_ecoute(api) {
         return true;
     }
     if !lecture(m) {
@@ -224,6 +247,17 @@ pub async fn garde_du_relais(
         return next.run(request).await;
     }
     tracing::info!(methode = %request.method(), "requete_relayee_refusee");
+    if chemin
+        .strip_prefix("/api/v1")
+        .is_some_and(|api| sous(api, "/ext/circle"))
+    {
+        return crate::message_api::refus(
+            StatusCode::FORBIDDEN,
+            crate::garde_du_cercle::CODE_LECTURE_SEULE_A_DISTANCE,
+            crate::garde_du_cercle::CLE_LECTURE_SEULE_A_DISTANCE,
+            &[],
+        );
+    }
     crate::message_api::refus(
         StatusCode::FORBIDDEN,
         "not_available_remotely",
@@ -257,6 +291,8 @@ mod tests {
             (Method::GET, "/api/v1/streaming/qobuz/album/1"),
             (Method::GET, "/api/v1/system/health"),
             (Method::GET, "/api/v1/home/shortcuts"),
+            (Method::GET, "/api/v1/home/continue-listening"),
+            (Method::POST, "/api/v1/home/continue-listening/3/resume"),
             (Method::GET, "/stream/2338763c.flac"),
             (Method::HEAD, "/stream/2338763c.flac"),
             (Method::GET, "/ws"),
@@ -274,6 +310,77 @@ mod tests {
         assert!(!ok(Method::POST, "/api/v1/home/shortcuts"));
         assert!(!ok(Method::PATCH, "/api/v1/system/config"));
         assert!(!ok(Method::GET, "/api/v1/system/config"));
+    }
+
+    /// #9154 — seule la reprise d'une écoute s'ouvre en écriture sous
+    /// `/home`, par POST et au motif exact.
+    #[test]
+    fn reprise_d_une_ecoute_seule_ouverte_en_ecriture_sous_home() {
+        assert!(ok(
+            Method::POST,
+            "/api/v1/home/continue-listening/12/resume"
+        ));
+        for (m, c) in [
+            (Method::PUT, "/api/v1/home/continue-listening/12/resume"),
+            (Method::DELETE, "/api/v1/home/continue-listening/12/resume"),
+            (Method::PATCH, "/api/v1/home/continue-listening/12/resume"),
+            (Method::POST, "/api/v1/home/continue-listening"),
+            (Method::POST, "/api/v1/home/continue-listening/12"),
+            (Method::POST, "/api/v1/home/continue-listening/12/resume/"),
+            (Method::POST, "/api/v1/home/continue-listening/12/resume/x"),
+            (Method::POST, "/api/v1/home/continue-listening//resume"),
+            (Method::POST, "/api/v1/home/continue-listening/abc/resume"),
+            (Method::POST, "/api/v1/home/continue-listening/-1/resume"),
+            (Method::POST, "/api/v1/home/continue-listening/1%2f2/resume"),
+            (
+                Method::POST,
+                "/api/v1/home/continue-listening/..%2f..%2fsystem/resume",
+            ),
+            (Method::POST, "/api/v1/home/continue-listening/../resume"),
+            (Method::POST, "//api/v1/home/continue-listening/1/resume"),
+            (Method::POST, "/api/v1//home/continue-listening/1/resume"),
+            (Method::POST, "/api/v1/Home/continue-listening/1/resume"),
+            (Method::POST, "/api/v1/home/Continue-Listening/1/resume"),
+            (Method::POST, "/api/v1/home/continue-listening/1/RESUME"),
+            (Method::POST, "/API/V1/home/continue-listening/1/resume"),
+            (Method::POST, "/api/v1/home/shortcuts"),
+            (Method::POST, "/api/v1/home"),
+            (Method::POST, "/api/v1/home/"),
+            (Method::POST, "/api/v1/home/recommendations"),
+            (Method::POST, "/api/v1/home/dismissed-suggestions"),
+            (Method::POST, "/api/v1/home/dismissed-suggestions/restore"),
+            (Method::POST, "/api/v1/homex/continue-listening/1/resume"),
+        ] {
+            assert!(!ok(m.clone(), c), "{m} {c} ne doit pas être relayable");
+        }
+    }
+
+    /// Tune Circle (19/11/2026) : à distance, `/ext/circle` se lit et ne
+    /// s'écrit pas.
+    #[test]
+    fn cercle_en_lecture_seule_a_distance() {
+        for c in [
+            "/api/v1/ext/circle",
+            "/api/v1/ext/circle/",
+            "/api/v1/ext/circle/contacts/locations",
+            "/api/v1/ext/circle/playlists/3",
+        ] {
+            assert!(ok(Method::GET, c), "GET {c}");
+            assert!(ok(Method::HEAD, c), "HEAD {c}");
+        }
+        for m in [Method::POST, Method::PUT, Method::PATCH, Method::DELETE] {
+            for c in [
+                "/api/v1/ext/circle/invitations",
+                "/api/v1/ext/circle/invitations/3/accept",
+                "/api/v1/ext/circle/circles/1/sharing/members",
+                "/api/v1/ext/circle/member-of/1/show-me",
+                "/api/v1/ext/circle/me/location",
+                "/api/v1/ext/circle/playlists/3/play",
+            ] {
+                assert!(!ok(m.clone(), c), "{m} {c}");
+                assert!(!chemin_relayable(&m, c, true), "{m} {c} (auth active)");
+            }
+        }
     }
 
     #[test]
@@ -326,6 +433,19 @@ mod tests {
             "/api/v1/libraryx",
         ] {
             assert!(!ok(Method::GET, c), "{c} ne doit pas être relayable");
+        }
+    }
+
+    #[test]
+    fn l_historique_se_lit_mais_ne_s_efface_pas_par_le_relais() {
+        for auth in [false, true] {
+            for chemin in ["/api/v1/history", "/api/v1/library/history"] {
+                assert!(chemin_relayable(&Method::GET, chemin, auth));
+                assert!(
+                    !chemin_relayable(&Method::DELETE, chemin, auth),
+                    "DELETE {chemin} relayable (auth {auth})"
+                );
+            }
         }
     }
 

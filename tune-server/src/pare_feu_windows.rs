@@ -92,8 +92,79 @@ pub fn lire_les_regles(json: &str) -> Result<Vec<RegleDePareFeu>, String> {
 /// Deux chemins Windows désignent-ils le même fichier ? Insensible à la casse
 /// et aux séparateurs, variables `%NOM%` résolues par `variable`.
 fn meme_chemin(regle: &str, exe: &str, variable: &dyn Fn(&str) -> Option<String>) -> bool {
-    let normaliser = |s: &str| s.trim().replace('/', "\\").to_lowercase();
-    normaliser(&developper(regle, variable)) == normaliser(exe)
+    normaliser_chemin(&developper(regle, variable)) == normaliser_chemin(exe)
+}
+
+/// #9083 — la forme de comparaison d'un chemin Windows : sans guillemets,
+/// séparateurs `\`, sans préfixe « verbatim » (`\\?\`, `\??\`, `\\?\UNC\`),
+/// en minuscules. `std::env::current_exe()` et `std::fs::canonicalize`
+/// rendent ce préfixe ; une règle ne l'écrit jamais. Sans cette
+/// normalisation, la même autorisation se lisait « autre chemin ».
+fn normaliser_chemin(chemin: &str) -> String {
+    let c = chemin.trim().trim_matches('"').trim().replace('/', "\\");
+    let c = if let Some(reste) = c
+        .strip_prefix(r"\\?\UNC\")
+        .or_else(|| c.strip_prefix(r"\\?\unc\"))
+    {
+        format!(r"\\{reste}")
+    } else if let Some(reste) = c.strip_prefix(r"\\?\").or_else(|| c.strip_prefix(r"\??\")) {
+        reste.to_string()
+    } else {
+        c
+    };
+    c.to_lowercase()
+}
+
+/// #9083 — ramène l'exécutable lancé et le programme de chaque règle à leur
+/// chemin RÉEL avant toute comparaison : variables `%NOM%` développées, puis
+/// `canonique` (sous Windows, `std::fs::canonicalize`) qui résout les noms
+/// courts 8.3 (`THIERR~1`), les liens et jonctions, les lecteurs `subst` —
+/// tout ce qui fait qu'un même fichier s'écrit de deux façons, par exemple
+/// quand Tune est lancé par un raccourci vers un fichier `.cmd`. Un chemin
+/// que `canonique` ne sait pas résoudre (fichier disparu) reste tel quel, et
+/// le préfixe verbatim est retiré pour l'affichage. Pur, testé partout.
+pub fn resoudre_les_chemins(
+    regles: &[RegleDePareFeu],
+    exe: &str,
+    variable: &dyn Fn(&str) -> Option<String>,
+    canonique: &dyn Fn(&str) -> Option<String>,
+) -> (Vec<RegleDePareFeu>, String) {
+    let resoudre = |chemin: &str| {
+        let developpe = developper(chemin.trim().trim_matches('"'), variable);
+        let reel = canonique(&developpe).unwrap_or(developpe);
+        sans_prefixe_verbatim(&reel)
+    };
+    let regles = regles
+        .iter()
+        .map(|r| RegleDePareFeu {
+            program: resoudre(&r.program),
+            ..r.clone()
+        })
+        .collect();
+    (regles, resoudre(exe))
+}
+
+/// #9083 — un chemin peut-il être ouvert pour être résolu ? Seulement un
+/// chemin local à lettre de lecteur (`X:\…`, éventuellement `\\?\X:\…`).
+/// Tout ce qui commence par `\\` après cela — partage réseau `\\hôte\…`,
+/// `\\?\UNC\…`, périphérique `\\.\…` — ne l'est jamais : un hôte
+/// injoignable ferait attendre le relevé. Pur, testé partout.
+pub fn canonicalisable(chemin: &str) -> bool {
+    let c = chemin.trim().trim_matches('"').replace('/', "\\");
+    let c = c.strip_prefix(r"\\?\").unwrap_or(&c);
+    let b = c.as_bytes();
+    b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'\\'
+}
+
+/// Retire `\\?\` (ou `\\?\UNC\` → `\\`) d'un chemin, casse conservée.
+fn sans_prefixe_verbatim(chemin: &str) -> String {
+    if let Some(reste) = chemin.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{reste}")
+    } else if let Some(reste) = chemin.strip_prefix(r"\\?\") {
+        reste.to_string()
+    } else {
+        chemin.to_string()
+    }
 }
 
 /// Développe les `%NOM%` d'un chemin de règle (Windows en écrit parfois).
@@ -408,6 +479,37 @@ pub struct EtatDuPareFeu {
     pub profils_pare_feu_coupe: Vec<ProfilReseau>,
     /// Un pare-feu tiers est inscrit : on ne sait pas ce qu'il filtre.
     pub pare_feu_tiers: bool,
+    /// #9083 — l'exécutable lancé, tel que les règles lui ont été comparées.
+    pub programme: String,
+    /// #9083 — POURQUOI un profil actif n'est pas couvert (`None` s'ils le
+    /// sont tous) : l'écran nomme la cause au lieu de répéter une consigne
+    /// déjà suivie.
+    pub cause: Option<CauseNonCouvert>,
+    /// #9083 — les règles `Block` sur l'exécutable lancé qui visent un profil
+    /// actif non couvert (noms affichés). Elles l'emportent sur toute
+    /// autorisation ; quand elles en contredisent une, « Autoriser une
+    /// application » montre la case cochée et ne les montre pas.
+    pub regles_bloquantes: Vec<String>,
+    /// #9083 — les chemins d'un `tune-server` autorisé pour un profil actif
+    /// non couvert, quand ce n'est PAS l'exécutable lancé.
+    pub chemins_autorises_ailleurs: Vec<String>,
+}
+
+/// #9083 — la cause d'un profil actif non couvert, de la plus précise à la
+/// plus générale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CauseNonCouvert {
+    /// Une règle entrante `Block` vise l'exécutable lancé sur ce profil, ET
+    /// le contredit : il y est aussi autorisé (case cochée, filtré quand même).
+    RegleDeBlocage,
+    /// Aucune autorisation pour l'exécutable lancé sur ce profil, mais une
+    /// pour un autre chemin de `tune-server` (autre copie, ancien dossier).
+    AutreChemin,
+    /// L'exécutable lancé est autorisé, mais pas pour ce profil.
+    ProfilNonCouvert,
+    /// Aucune règle entrante pour `tune-server`.
+    AucuneRegle,
 }
 
 impl EtatDuPareFeu {
@@ -468,7 +570,7 @@ pub fn etat_du_pare_feu(
         .collect();
     let (porteuses, autres) = releve.partager();
     let profils_actifs = profils_de(&porteuses);
-    let profils_non_couverts = profils_actifs
+    let profils_non_couverts: Vec<ProfilReseau> = profils_actifs
         .iter()
         .copied()
         .filter(|&p| releve.pare_feu_actif(p) && !profils_couverts.contains(&p))
@@ -481,14 +583,72 @@ pub fn etat_du_pare_feu(
         .into_iter()
         .filter(|&p| !releve.pare_feu_actif(p))
         .collect();
+    let regle_presente = les_notres.iter().any(|r| r.action == AUTORISER);
+
+    // #9083 — nommer la cause, profil actif non couvert par profil actif non
+    // couvert. Les règles d'un AUTRE programme ne bloquent ni n'autorisent
+    // celui qui tourne : elles ne servent qu'à le dire.
+    let vise_un_non_couvert = |r: &RegleDePareFeu| {
+        profils_non_couverts
+            .iter()
+            .any(|&p: &ProfilReseau| porte_sur(r, p))
+    };
+    let mut regles_bloquantes: Vec<String> = les_notres
+        .iter()
+        .filter(|r| r.action == BLOQUER && vise_un_non_couvert(r))
+        .map(|r| r.display_name.clone())
+        .collect();
+    regles_bloquantes.sort();
+    regles_bloquantes.dedup();
+    let mut chemins_autorises_ailleurs: Vec<String> = regles
+        .iter()
+        .filter(|r| r.direction == ENTRANT && r.enabled == ACTIVEE && r.action == AUTORISER)
+        .filter(|r| !meme_chemin(&r.program, exe, variable))
+        .filter(|r| vise_un_non_couvert(r))
+        .map(|r| developper(r.program.trim().trim_matches('"'), variable))
+        .collect();
+    chemins_autorises_ailleurs.sort_by_key(|c| normaliser_chemin(c));
+    chemins_autorises_ailleurs.dedup_by_key(|c| normaliser_chemin(c));
+    let autorise_ici_pour_un_non_couvert = les_notres
+        .iter()
+        .any(|r| r.action == AUTORISER && vise_un_non_couvert(r));
+    // Une règle `Block` est LA cause quand elle contredit une autorisation
+    // du programme lancé sur le même profil : c'est le cas invisible dans
+    // « Autoriser une application » (case cochée, et filtré quand même).
+    // Sans autorisation sur ce profil, la case y est décochée, et la
+    // consigne « autorisez » reste la bonne : le `Block` que Windows pose
+    // pour une case laissée vide n'est pas une surprise.
+    let blocage_contredit_une_autorisation = profils_non_couverts.iter().any(|&p| {
+        les_notres
+            .iter()
+            .any(|r| r.action == BLOQUER && porte_sur(r, p))
+            && les_notres
+                .iter()
+                .any(|r| r.action == AUTORISER && porte_sur(r, p))
+    });
+    let cause = if profils_non_couverts.is_empty() {
+        None
+    } else if blocage_contredit_une_autorisation {
+        Some(CauseNonCouvert::RegleDeBlocage)
+    } else if !autorise_ici_pour_un_non_couvert && !chemins_autorises_ailleurs.is_empty() {
+        Some(CauseNonCouvert::AutreChemin)
+    } else if regle_presente {
+        Some(CauseNonCouvert::ProfilNonCouvert)
+    } else {
+        Some(CauseNonCouvert::AucuneRegle)
+    };
     EtatDuPareFeu {
         profils_actifs,
-        regle_presente: les_notres.iter().any(|r| r.action == AUTORISER),
+        regle_presente,
         profils_couverts,
         profils_non_couverts,
         profils_autres_reseaux,
         profils_pare_feu_coupe,
         pare_feu_tiers: releve.pare_feu_tiers > 0,
+        programme: exe.to_string(),
+        cause,
+        regles_bloquantes,
+        chemins_autorises_ailleurs,
     }
 }
 
@@ -503,6 +663,9 @@ pub fn journaliser_l_etat(etat: &EtatDuPareFeu, exe: &str) {
             rule_present = etat.regle_presente,
             covered_profiles = ?etat.profils_couverts,
             uncovered_profiles = ?etat.profils_non_couverts,
+            cause = ?etat.cause,
+            block_rules = ?etat.regles_bloquantes,
+            allowed_other_paths = ?etat.chemins_autorises_ailleurs,
             "windows_firewall_profile_not_covered — the active network profile is not \
              covered by Tune's inbound firewall rule: DLNA discovery and remote access are \
              filtered. Set the network to Private, or allow tune-server.exe in 'Allow an app \
@@ -567,18 +730,59 @@ static CACHE: std::sync::LazyLock<tokio::sync::Mutex<CacheDuReleve>> =
     std::sync::LazyLock::new(Default::default);
 
 /// Le corps de `GET /api/v1/system/pare-feu`. Contrat additif.
-pub fn charge_utile(windows: bool, etat: Option<&EtatDuPareFeu>) -> serde_json::Value {
+///
+/// `detail` : l'appelant est l'administrateur, ou cette machine. Sinon les
+/// chemins complets (`programme`, `chemins_autorises_ailleurs`), qui portent
+/// le nom du compte Windows, sont réduits à leur nom de fichier.
+pub fn charge_utile(
+    windows: bool,
+    etat: Option<&EtatDuPareFeu>,
+    detail: bool,
+) -> serde_json::Value {
+    let vu = etat.map(|e| {
+        if detail {
+            e.clone()
+        } else {
+            EtatDuPareFeu {
+                programme: nom_de_fichier(&e.programme),
+                chemins_autorises_ailleurs: e
+                    .chemins_autorises_ailleurs
+                    .iter()
+                    .map(|c| nom_de_fichier(c))
+                    .collect(),
+                ..e.clone()
+            }
+        }
+    });
     serde_json::json!({
         "windows": windows,
-        "releve": etat,
+        "releve": vu,
         "alerte": etat.is_some_and(EtatDuPareFeu::alerte),
     })
+}
+
+/// Le dernier composant d'un chemin Windows (`\` ou `/`).
+fn nom_de_fichier(chemin: &str) -> String {
+    chemin
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(chemin)
+        .to_string()
 }
 
 /// `GET /api/v1/system/pare-feu` — l'écran des zones l'affiche quand le
 /// profil actif n'est pas couvert (#7371). Relevé de nouveau au-delà de
 /// [`DUREE_DU_CACHE`].
-pub async fn route_etat() -> axum::Json<serde_json::Value> {
+pub async fn route_etat(
+    axum::extract::State(etat_app): axum::extract::State<crate::state::AppState>,
+    mut parties: axum::http::request::Parts,
+) -> axum::Json<serde_json::Value> {
+    // Hors Windows, rien à relever ni à protéger.
+    if !cfg!(target_os = "windows") {
+        let _ = (&etat_app, &mut parties);
+        return axum::Json(charge_utile(false, None, false));
+    }
+    let detail = crate::auth::admin_ou_cette_machine(&mut parties, &etat_app).await;
     #[cfg(target_os = "windows")]
     let etat = etat_avec_cache(
         &CACHE,
@@ -597,7 +801,11 @@ pub async fn route_etat() -> axum::Json<serde_json::Value> {
     .await;
     #[cfg(not(target_os = "windows"))]
     let etat: Option<EtatDuPareFeu> = None;
-    axum::Json(charge_utile(cfg!(target_os = "windows"), etat.as_ref()))
+    axum::Json(charge_utile(
+        cfg!(target_os = "windows"),
+        etat.as_ref(),
+        detail,
+    ))
 }
 
 /// #7371 — pour chaque interface connectée : catégorie, connectivité IPv4,
@@ -650,8 +858,69 @@ async fn relever_les_regles() -> Result<Vec<RegleDePareFeu>, String> {
 async fn relever_l_etat(regles: &[RegleDePareFeu], exe: &str) -> Result<EtatDuPareFeu, String> {
     let releve = lire_le_releve_reseau(&lancer_powershell(SCRIPT_PROFILS_RESEAU).await?)?;
     let variable = |nom: &str| std::env::var(nom).ok();
-    Ok(etat_du_pare_feu(regles, &releve, exe, &variable))
+    let (regles, exe) = resoudre_les_chemins_a_l_ecart(regles, exe).await;
+    Ok(etat_du_pare_feu(&regles, &releve, &exe, &variable))
 }
+
+/// #9083 — le chemin réel d'un fichier LOCAL (noms courts 8.3, liens,
+/// `subst` résolus). `None` si le fichier n'existe pas, ne se lit pas, ou
+/// n'est pas sur un disque local : un partage réseau (`\\hôte\…`,
+/// `\\?\UNC\…`) ou un lecteur réseau mappé n'est JAMAIS ouvert — il reste
+/// comparé sous sa forme textuelle normalisée.
+#[cfg(target_os = "windows")]
+fn canonique_windows(chemin: &str) -> Option<String> {
+    if !canonicalisable(chemin) || lecteur_reseau(chemin) {
+        return None;
+    }
+    std::fs::canonicalize(chemin)
+        .ok()
+        .map(|p| p.display().to_string())
+}
+
+/// La lettre de lecteur d'un chemin `X:\…` désigne-t-elle un lecteur réseau
+/// mappé (`GetDriveTypeW` = `DRIVE_REMOTE`) ? Ne touche pas au partage.
+#[cfg(target_os = "windows")]
+fn lecteur_reseau(chemin: &str) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    let Some(lettre) = chemin.trim().chars().next() else {
+        return false;
+    };
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDriveTypeW(lp_root_path_name: *const u16) -> u32;
+    }
+    const DRIVE_REMOTE: u32 = 4;
+    let racine: Vec<u16> = std::ffi::OsString::from(format!("{lettre}:\\"))
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY : chaîne UTF-16 terminée par un zéro, vivante pendant l'appel.
+    unsafe { GetDriveTypeW(racine.as_ptr()) == DRIVE_REMOTE }
+}
+
+/// #9083 — la résolution des chemins hors des workers de tokio : les appels
+/// au système de fichiers sont bloquants. Au-delà de [`DELAI_DE_RESOLUTION`],
+/// ou en cas d'échec, les chemins sont comparés sous leur forme textuelle.
+#[cfg(target_os = "windows")]
+async fn resoudre_les_chemins_a_l_ecart(
+    regles: &[RegleDePareFeu],
+    exe: &str,
+) -> (Vec<RegleDePareFeu>, String) {
+    let variable = |nom: &str| std::env::var(nom).ok();
+    let (copie, exe_copie) = (regles.to_vec(), exe.to_string());
+    let tache = tokio::task::spawn_blocking(move || {
+        let variable = |nom: &str| std::env::var(nom).ok();
+        resoudre_les_chemins(&copie, &exe_copie, &variable, &canonique_windows)
+    });
+    match tokio::time::timeout(DELAI_DE_RESOLUTION, tache).await {
+        Ok(Ok(resolu)) => resolu,
+        _ => resoudre_les_chemins(regles, exe, &variable, &|_| None),
+    }
+}
+
+/// Le temps laissé à la résolution des chemins avant de s'en passer.
+#[cfg(target_os = "windows")]
+const DELAI_DE_RESOLUTION: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// Lance le relevé en tâche de fond, une fois. Sans effet hors Windows.
 pub fn lancer_le_releve() {
@@ -669,8 +938,10 @@ pub fn lancer_le_releve() {
             }
         };
         let variable = |nom: &str| std::env::var(nom).ok();
-        let v = verdict(&regles, &exe, &variable);
-        journaliser(&v, &exe, regles.len());
+        // #9083 — comparer des chemins RÉELS (8.3, liens, préfixe verbatim).
+        let (resolues, exe_reel) = resoudre_les_chemins_a_l_ecart(&regles, &exe).await;
+        let v = verdict(&resolues, &exe_reel, &variable);
+        journaliser(&v, &exe_reel, regles.len());
         // #7371 — le profil du réseau actif, et ce que la règle en couvre ;
         // le résultat amorce le cache de la route.
         let (regles, exe) = (&regles, &exe);
@@ -698,6 +969,10 @@ pub fn lancer_le_releve() {
 #[cfg(test)]
 #[path = "pare_feu_profil_reseau_7371_tests.rs"]
 mod profil_reseau_7371_tests;
+
+#[cfg(test)]
+#[path = "pare_feu_cause_9083_tests.rs"]
+mod cause_9083_tests;
 
 #[cfg(test)]
 mod tests {

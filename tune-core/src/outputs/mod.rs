@@ -10,6 +10,8 @@ pub mod asio_blocage_4556;
 pub mod asio_exclusive;
 #[cfg(any(all(target_os = "windows", feature = "asio"), test))]
 pub(crate) mod quantification_au_rendu_7703;
+/// #8855 — la conversion curseur → dB commune à AirPlay 1 et AirPlay 2.
+pub mod volume_airplay_8855;
 // #6133 — silence ASIO avant libération ; sans Windows+asio, seul le banc s'en sert.
 pub mod bluos;
 pub mod bridge;
@@ -24,6 +26,8 @@ pub mod capacite_dsd_natif;
 pub mod chromecast;
 #[cfg(all(target_os = "macos", feature = "local-audio"))]
 pub mod coreaudio_exclusive;
+/// Décodage progressif d'une source HTTP (Devialet AIR, Sendspin).
+pub(crate) mod decodeur_distant;
 pub mod devialet_air;
 pub mod didl;
 pub mod dlna;
@@ -50,6 +54,8 @@ mod dlna_volume_apres_uri_tests_6008;
 pub mod dsd_natif_oaat_8647;
 pub mod repli_dsd_oaat_8486;
 // #8151 — la sourdine tient à chaque nouvelle piste.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) mod cadence_exclusive_8616;
 #[cfg(test)]
 pub(crate) mod dlna_sourdine_8151_tests;
 #[cfg(feature = "local-audio")]
@@ -63,6 +69,10 @@ pub mod local;
 /// déroule la négociation pour chaque masque : jugé par `cargo test`.
 #[cfg(any(target_os = "windows", test))]
 pub(crate) mod masque_de_canaux_4357;
+/// #8696 — la mesure des réveils en retard : histogramme en périodes, temps
+/// perdu dans le rendu ou dans l'attente, avance de l'appareil. Public : le
+/// rapport de bogue lit ses libellés.
+pub mod mesure_du_retard_8696;
 pub mod mock;
 /// #3837 — la négociation de format de la sortie WASAPI exclusive. Sans FFI
 /// ni `cfg` de plateforme dans son corps : aucun job de CI n'exécute WASAPI,
@@ -74,8 +84,12 @@ pub mod oaat;
 pub mod oh_events;
 pub mod openhome;
 pub mod openhome_pins;
-#[cfg(any(target_os = "windows", test))]
+/// #4357 — la période WASAPI exclusive par défaut. Hors `cfg` depuis #8696 :
+/// la période réglable s'appuie dessus, et la fiche de zone la lit partout.
 pub(crate) mod periode_exclusive_4357;
+/// #8696 — la période WASAPI exclusive réglable (zone ou variable
+/// d'environnement), avec repli sur la période par défaut du pilote.
+pub mod periode_reglable_8696;
 /// #8171 — la conduite du chemin partagé quand le périphérique d'une zone est
 /// introuvable. Hors de `local-audio`, même raison que le module suivant.
 pub mod peripherique_introuvable;
@@ -113,6 +127,9 @@ pub mod squeezebox;
 #[cfg(test)]
 mod suivante_verifiee_3967;
 pub mod traits;
+/// #8696 — le refus clair d'un flux multicanal vers une sortie WASAPI
+/// exclusive qui a moins de voies (sentinelle relue par le poller).
+pub mod voies_en_trop_8696;
 #[cfg(all(target_os = "windows", feature = "local-audio"))]
 #[allow(unsafe_op_in_unsafe_fn)]
 pub mod wasapi_exclusive;

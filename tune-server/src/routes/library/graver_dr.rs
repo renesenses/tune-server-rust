@@ -282,15 +282,33 @@ pub(crate) fn marquer_passe_interrompue_au_demarrage(
 ///
 /// `status` vaut `idle`, `running`, `done`, `interrupted` (voir
 /// [`ETAT_INTERROMPU`]) ou `cancelled` (voir [`ETAT_ANNULE`]).
+///
+/// #8872 — l'inventaire relit TOUTES les pistes mesurées (jointure
+/// `track_metadata`) et compte celles qui portent déjà leur DR : 66 s sur une
+/// bibliothèque de 572 000 pistes (fil 2863). Lu dans le gestionnaire async,
+/// il tenait un fil de l'exécuteur pendant tout ce temps, et l'écran le
+/// redemande à chaque rafraîchissement : avec 4 fils, le reste du serveur
+/// (et les requêtes relayées par le pont) n'était plus servi. Il est lu hors
+/// de l'exécuteur, comme les comptages de #8805 et #9116.
 pub(crate) async fn statut(State(state): State<AppState>) -> Json<Value> {
-    let (inv, _) = inventaire(&state);
-    let mut v = statut_courant(&state);
+    let lecture = tokio::task::spawn_blocking(move || statut_complet(&state)).await;
+    Json(lecture.unwrap_or_else(|e| {
+        warn!(error = %e, "graver_dr_statut_lecture_interrompue");
+        json!({"status": "idle", "error": "lecture interrompue"})
+    }))
+}
+
+/// Le corps de `GET /library/dr/gravure`, lu en synchrone : à n'appeler que
+/// hors de l'exécuteur (voir [`statut`]).
+fn statut_complet(state: &AppState) -> Value {
+    let (inv, _) = inventaire(state);
+    let mut v = statut_courant(state);
     v["a_graver"] = json!(inv.a_graver);
     v["hors_format"] = json!(inv.hors_format);
-    v["dans_les_fichiers"] = json!(deja_dans_les_fichiers(&state));
+    v["dans_les_fichiers"] = json!(deja_dans_les_fichiers(state));
     v[crate::routes::ecriture_fichiers::CHAMP_REPONSE] =
-        json!(crate::routes::ecriture_fichiers::autorisee(&state));
-    Json(v)
+        json!(crate::routes::ecriture_fichiers::autorisee(state));
+    v
 }
 
 /// Fil 2134 (Levente Toth) — après la gravure, la ligne de la piste reprend
@@ -308,7 +326,7 @@ fn remettre_la_ligne_en_phase(pistes: &tune_core::db::track_repo::TrackRepo, che
     else {
         return;
     };
-    if let Err(e) = pistes.update_mtime_and_size(chemin, mtime, taille as i64) {
+    if let Err(e) = pistes.update_mtime_and_size_after_tag_write(chemin, mtime, taille as i64) {
         warn!(chemin = %chemin, error = %e, "dr_ligne_non_remise_en_phase");
     }
 }
@@ -700,8 +718,6 @@ pub(crate) async fn lancer(State(state): State<AppState>) -> axum::response::Res
         )
             .into_response();
     }
-    let (inv, candidates) = inventaire(&state);
-    let total = candidates.len();
 
     // Garde RAII prise AVANT le spawn : entre ce point et le premier tour de
     // boucle, un second POST verrait déjà « en cours ».
@@ -710,6 +726,20 @@ pub(crate) async fn lancer(State(state): State<AppState>) -> axum::response::Res
         "Gravure du Dynamic Range dans les fichiers…",
         "maintenance",
     );
+    // #8872 — l'inventaire hors de l'exécuteur, comme dans [`statut`]. La
+    // garde est prise AVANT : pendant cette lecture, un second POST voit déjà
+    // « en cours ».
+    let lecteur = state.clone();
+    let Ok((inv, candidates)) = tokio::task::spawn_blocking(move || inventaire(&lecteur)).await
+    else {
+        warn!("graver_dr_inventaire_interrompu");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"status": "idle", "error": "inventaire interrompu"})),
+        )
+            .into_response();
+    };
+    let total = candidates.len();
     let taches = state.background_tasks.clone();
     let backend = state.backend.clone();
     ecrire_statut(&backend, &Compteurs::default().statut("running", total));
@@ -1455,3 +1485,7 @@ mod tests_arret_7719 {
         assert_eq!(lire_statut(&s), arretee);
     }
 }
+
+#[cfg(test)]
+#[path = "graver_dr_executeur_tests_8872.rs"]
+mod executeur_tests_8872;

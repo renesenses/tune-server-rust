@@ -1994,10 +1994,7 @@
         "source",
         "plays"
       ],
-      "champs_optionnels": [
-        "source_id",
-        "album_id_service"
-      ]
+      "champs_optionnels": []
     },
     {
       "route": "/library/history/tracks/{}/plays",

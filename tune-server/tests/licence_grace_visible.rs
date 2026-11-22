@@ -64,7 +64,12 @@ fn app_premium_validated_days_ago(
     // Le LicenseManager lit les settings à sa construction : rouvrir la MÊME
     // base rejoue le démarrage d'une machine restée hors ligne.
     let state = AppState::new(&db_path, 0, Default::default()).unwrap();
-    (tune_server::routes::router(state), base)
+    (
+        tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+        )),
+        base,
+    )
 }
 
 async fn get_json(app: &axum::Router, path: &str) -> (StatusCode, Value) {
@@ -89,7 +94,12 @@ const STATUS: &str = "/api/v1/cloud/license/status";
 async fn le_statut_porte_toujours_le_champ_de_grace() {
     // Même sur une installation gratuite, le champ existe (à `null`) : le client
     // n'a pas à deviner si le serveur en face sait répondre.
-    let app = tune_server::routes::router(new_state());
+    let app = tune_server::routes::router(new_state()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     let (status, body) = get_json(&app, STATUS).await;
     assert_eq!(status, StatusCode::OK);
     assert!(

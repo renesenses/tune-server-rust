@@ -2,6 +2,24 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
+tokio::task_local! {
+    static CHEMIN_REQUETE: String;
+}
+
+/// Conserve le gabarit de route pendant la requête, sans paramètres ni query.
+/// Le contexte est propre à la tâche, y compris lorsque deux requêtes alternent.
+pub async fn avec_chemin_requete(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let path = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|p| p.as_str().to_owned())
+        .unwrap_or_else(|| "route_non_reconnue".to_owned());
+    CHEMIN_REQUETE.scope(path, next.run(request)).await
+}
+
 pub struct AppError {
     pub status: StatusCode,
     pub message: String,
@@ -11,7 +29,14 @@ pub struct AppError {
 impl AppError {
     pub fn not_found(msg: impl Into<String>) -> Self {
         let msg = msg.into();
-        tracing::warn!(error = %msg, "not_found");
+        if CHEMIN_REQUETE
+            .try_with(|path| {
+                tracing::warn!(error = %msg, path = %path, "not_found");
+            })
+            .is_err()
+        {
+            tracing::warn!(error = %msg, "not_found");
+        }
         Self {
             status: StatusCode::NOT_FOUND,
             message: msg,
@@ -115,3 +140,6 @@ impl From<reqwest::Error> for AppError {
         Self::internal(format!("http: {e}"))
     }
 }
+
+#[cfg(test)]
+mod chemin_8901_tests;

@@ -1,4 +1,4 @@
-//! Host policy for the four extracted premium features. Configuration keys
+//! Host policy for the extracted audio features. Configuration keys
 //! remain unchanged. The migration marker distinguishes legacy installations
 //! from an intentional uninstall; absent flags must never reinstall a plugin.
 //!
@@ -25,7 +25,7 @@ use crate::db::settings_repo::SettingsRepo;
 /// #6044 — `channel-remap` (réaffectation des canaux) est GRATUIT et
 /// facultatif, comme l'égaliseur : décision de Bertrand du 10/10/2026.
 ///
-/// #7614 — `upsampler` (suréchantillonnage) est PAYANT, comme le crossfeed
+/// #7614 — `upsampler` (suréchantillonnage) est PAYANT
 /// (décision de Bertrand du 07/11/2026), mais FACULTATIF comme l'égaliseur :
 /// arrivé après la migration, il ne s'installe que depuis le catalogue, et
 /// le bandeau « Réinstaller » ne le propose jamais.
@@ -44,9 +44,9 @@ pub const UPSAMPLER: &str = "upsampler";
 fn facultatif(id: &str) -> bool {
     id == UPSAMPLER
 }
-/// Les greffons gratuits : droit `DspEq`, jamais posés par la migration.
+/// Les greffons gratuits. Le crossfeed conserve sa migration historique.
 pub fn gratuit(id: &str) -> bool {
-    matches!(id, "equalizer" | "channel-remap")
+    matches!(id, "equalizer" | "channel-remap" | "crossfeed")
 }
 pub const MIGRATION: &str = "premium_audio_plugins_migration_v1";
 /// Préfixe de la clé de retenue d'un greffon payant (#4861). Sa valeur liste
@@ -65,7 +65,7 @@ pub fn requires_premium(id: &str) -> bool {
 /// Les greffons que la migration embarque-active elle-même. L'égaliseur n'en
 /// fait plus partie : il s'installe depuis le catalogue.
 fn installed_by_migration(id: &str) -> bool {
-    contains(id) && !gratuit(id) && !facultatif(id)
+    contains(id) && (!gratuit(id) || id == "crossfeed") && !facultatif(id)
 }
 fn flag(settings: &SettingsRepo, id: &str, suffix: &str) -> Option<String> {
     settings
@@ -204,7 +204,7 @@ pub fn restore_withheld(
 /// Un choix explicite de l'utilisateur (désinstallation, désactivation) sur un
 /// greffon payant efface sa retenue : le retour du Premium ne l'annulera pas.
 pub fn forget_withheld(settings: &SettingsRepo, id: &str) -> Result<(), String> {
-    if requires_premium(id) {
+    if contains(id) {
         settings.delete(&withheld_key(id))?;
     }
     Ok(())
@@ -233,7 +233,10 @@ pub fn reinstall_candidates(settings: &SettingsRepo) -> Result<Vec<&'static str>
     Ok(IDS
         .into_iter()
         .filter(|id| {
-            installed_by_migration(id) && !installed(settings, id) && !dismissed.contains(id)
+            installed_by_migration(id)
+                && requires_premium(id)
+                && !installed(settings, id)
+                && !dismissed.contains(id)
         })
         .collect())
 }
@@ -281,7 +284,7 @@ mod tests {
         s.set(&format!("plugin_{id}_installed"), "true").unwrap();
         s.set(&format!("plugin_{id}_enabled"), "true").unwrap();
     }
-    const PAYANTS: [&str; 3] = ["crossfeed", "converter", "declick"];
+    const PAYANTS: [&str; 2] = ["converter", "declick"];
     /// #4861 : un premier démarrage vu comme Free (licence pas encore
     /// revalidée), puis un démarrage Premium, rend les trois greffons payants
     /// installés et actifs.
@@ -490,10 +493,18 @@ mod tests {
             let s = settings();
             migrate_for_account(&s, premium).unwrap();
             for id in ["crossfeed", "converter", "declick"] {
-                assert_eq!(enabled(&s, id), premium, "{id} premium={premium}");
+                assert_eq!(
+                    enabled(&s, id),
+                    premium || id == "crossfeed",
+                    "{id} premium={premium}"
+                );
                 assert_eq!(
                     s.get(&format!("plugin_{id}_installed")).unwrap().as_deref(),
-                    Some(if premium { "true" } else { "false" }),
+                    Some(if premium || id == "crossfeed" {
+                        "true"
+                    } else {
+                        "false"
+                    }),
                     "{id} premium={premium}"
                 );
                 assert!(!install_proposed(&s, id));
@@ -544,7 +555,7 @@ mod tests {
         assert!(install_proposed(&s, "equalizer"));
         assert!(!enabled(&s, "converter"));
         assert!(!requires_premium("equalizer"));
-        assert!(requires_premium("crossfeed"));
+        assert!(!requires_premium("crossfeed"));
         assert_eq!(
             s.get("zone_1_eq_profile").unwrap().as_deref(),
             Some("existing-free-profile")

@@ -1,4 +1,5 @@
-//! Volume des raccourcis globaux, au contrat du serveur (#1274, #6787).
+//! Volume des raccourcis du menu (⌘↑ / ⌘↓, #9255), au contrat du serveur
+//! (#1274, #6787).
 //!
 //! `volume` est TOUJOURS un gain linéaire 0..1, en lecture comme en écriture.
 //! Le serveur lit tout nombre `> 1.0` comme un pourcentage et le reste comme

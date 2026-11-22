@@ -76,8 +76,26 @@ fn releve_json(r: &Releve) -> Value {
 ///   jauge le dit déjà (`remaining`). `null` quand il n'est pas compté.
 pub(crate) async fn dynamic_range_progress(State(state): State<AppState>) -> Json<Value> {
     let releve = state.passe_dr.releve();
-    let candidates = (!releve.actif)
-        .then(|| tune_core::audio::replaygain::compter_les_candidats_dr(&state.backend));
+    // #9116 — compté hors de l'exécuteur, et figé pendant la pause de la
+    // plage dynamique tant que la bibliothèque garde la même révision.
+    let candidates = if releve.actif {
+        None
+    } else {
+        let b = state.backend.clone();
+        state
+            .comptages
+            .releves
+            .dr_candidats
+            .lire(
+                "dynamic_range_progress",
+                tune_core::taches_de_fond::est_en_pause(
+                    tune_core::taches_de_fond::Tache::PlageDynamique,
+                ),
+                crate::routes::system::avancement_suspendu_9116::revision_de(&state.backend),
+                move || tune_core::audio::replaygain::compter_les_candidats_dr(&b),
+            )
+            .await
+    };
     let mut body = releve_json(&releve);
     if let Some(obj) = body.as_object_mut() {
         // #5246 — la plage dynamique ne dépend plus du réglage ReplayGain.

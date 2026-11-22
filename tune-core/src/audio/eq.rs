@@ -439,7 +439,7 @@ impl EqProcessor {
         self.borne_de_remontee.min(1.0).max(g)
     }
 
-    /// #4176 — « Remettre à plat » sur un égaliseur coupé : le geste explicite
+    /// #6524 — « Rendre le niveau » sur un égaliseur coupé : le geste explicite
     /// qui rend le niveau. Le gain gardé remonte jusqu'au signal sec, même si
     /// le volume a été monté pendant que l'égaliseur jouait (la borne de
     /// #6741 ne s'applique plus), par la même rampe progressive de

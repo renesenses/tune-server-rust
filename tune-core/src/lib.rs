@@ -17,6 +17,11 @@ pub mod chemin_sur;
 pub mod chemins_de_travail;
 pub mod cles_api;
 pub mod cloud;
+/// #9061 — le crate `windows` de tune-core, pour les appels Win32 de
+/// tune-server (shell, registre) sans seconde dépendance.
+#[cfg(windows)]
+#[doc(hidden)]
+pub use windows;
 pub mod coffre;
 pub mod collaborative;
 pub mod confidentialite;

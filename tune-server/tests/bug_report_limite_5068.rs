@@ -67,7 +67,10 @@ async fn envoyer(base: &str) -> (StatusCode, HeaderMap, Value) {
     SettingsRepo::with_backend(state.backend.clone())
         .set("mozaik_base_url", base)
         .unwrap();
-    let app = tune_server::routes::router(state);
+    let app =
+        tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+        ));
     let resp = app
         .oneshot(
             Request::post("/api/v1/system/bug-report/submit")

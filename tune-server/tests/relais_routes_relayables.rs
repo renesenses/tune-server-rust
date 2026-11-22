@@ -214,3 +214,71 @@ async fn l_exemption_didl_ne_s_applique_pas_au_relais() {
         "exemption DIDL ouverte au relais"
     );
 }
+
+/// #9154 — « Reprendre l'écoute » de l'accueil passe par le relais, comme les
+/// routes `/zones/*` ; les autres écritures sous `/home` restent locales.
+#[tokio::test]
+async fn reprise_d_une_ecoute_relayee_sans_ouvrir_le_reste_de_home() {
+    let state = new_state();
+    let app = app(&state, LOCAL);
+    let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .create("Salon", None, None)
+        .unwrap();
+
+    // La garde laisse passer : le gestionnaire répond lui-même (reprise
+    // inconnue), exactement comme sans relais.
+    let chemin = format!("/api/v1/home/continue-listening/{zone}/resume");
+    let corps = Some(r#"{"resume_key":"inconnue"}"#);
+    let (relaye, corps_relaye) = appel(&app, Method::POST, &chemin, true, corps).await;
+    let (local, _) = appel(&app, Method::POST, &chemin, false, corps).await;
+    assert!(
+        !corps_relaye.contains("not_available_remotely"),
+        "reprise refusée par le relais : {corps_relaye}"
+    );
+    assert_eq!(relaye, StatusCode::NOT_FOUND, "{corps_relaye}");
+    assert_eq!(relaye, local, "le relais change la réponse de la reprise");
+
+    // Les voisines en écriture, et les chemins piégés, restent refusés.
+    let refusees: [(Method, String, Option<&str>); 7] = [
+        (Method::POST, "/api/v1/home/shortcuts".into(), Some("{}")),
+        (
+            Method::POST,
+            "/api/v1/home/dismissed-suggestions".into(),
+            Some(r#"{"kind":"album","key":"1"}"#),
+        ),
+        (
+            Method::POST,
+            "/api/v1/home/dismissed-suggestions/restore".into(),
+            Some("{}"),
+        ),
+        (Method::PUT, chemin.clone(), corps),
+        (
+            Method::POST,
+            format!("/api/v1/home/continue-listening/{zone}/..%2f..%2fdismissed-suggestions"),
+            corps,
+        ),
+        (
+            Method::POST,
+            format!("/api/v1//home/continue-listening/{zone}/resume"),
+            corps,
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/HOME/continue-listening/{zone}/resume"),
+            corps,
+        ),
+    ];
+    for (m, c, corps) in &refusees {
+        let (st, rep) = appel(&app, m.clone(), c, true, *corps).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{m} {c} par le relais : {rep}");
+        assert!(rep.contains("not_available_remotely"), "{rep}");
+    }
+    // Témoin : sans relais, les voisines atteignent bien leur gestionnaire.
+    for (m, c, corps) in &refusees[..3] {
+        let (st, rep) = appel(&app, m.clone(), c, false, *corps).await;
+        assert!(
+            !rep.contains("not_available_remotely"),
+            "{m} {c} en local (témoin) : {st} {rep}"
+        );
+    }
+}

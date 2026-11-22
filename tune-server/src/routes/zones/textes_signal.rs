@@ -18,6 +18,7 @@ fn reconnue(value: &str) -> Option<&'static str> {
         crate::i18n::alias_langue(value.trim().split(['-', '_']).next()?.to_ascii_lowercase());
     [
         "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "vi", "hu", "nb", "pl", "el",
+        "tr",
     ]
     .into_iter()
     .find(|l| *l == base)
@@ -108,8 +109,8 @@ pub(crate) async fn avec_langue(
 mod tests {
     use super::*;
     #[test]
-    fn quinze_catalogues_complets_et_parametres_identiques() {
-        assert_eq!(CATALOGUE.len(), 15);
+    fn seize_catalogues_complets_et_parametres_identiques() {
+        assert_eq!(CATALOGUE.len(), 16);
         fn parametres(s: &str) -> Vec<&str> {
             let mut v = s
                 .split('{')

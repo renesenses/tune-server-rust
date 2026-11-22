@@ -35,6 +35,9 @@ pub mod plage_dynamique;
 /// jauge doit dire après un redémarrage, quand la campagne repart de zéro.
 pub mod bibliotheque;
 
+/// #8968 — le mode Auto : gain d'album entre pistes consécutives d'un même
+/// album, gain de piste sinon.
+pub mod auto;
 /// #5519 — le gain APPROCHÉ tiré d'un rapport `foo_dr.txt`, plafonné par la
 /// crête, quand la piste n'a aucun ReplayGain. Jamais écrit dans un fichier.
 pub mod gain_approche;
@@ -2951,6 +2954,8 @@ pub fn source_mode_settings(
     // repli est `track`, la granularité par défaut de l'interface.
     let granularite = match granularite {
         ReplayGainMode::Album => "album",
+        // #8968 — `auto` est une granularité à part entière : la garder.
+        ReplayGainMode::Auto => "auto",
         _ => "track",
     };
     match mode {
@@ -2996,13 +3001,23 @@ pub enum ReplayGainMode {
     /// Per-album gain: the relative dynamics between tracks of an album are
     /// preserved, which is what a classical or concept album needs.
     Album,
+    /// #8968 — album gain when the track has a queue neighbour (previous or
+    /// next) from the same album, track gain otherwise, and always track gain
+    /// in shuffle. Resolved per zone by [`auto::granularite`] BEFORE any gain
+    /// is read: an unresolved `Auto` reads as `Track`.
+    Auto,
 }
+
+/// #8968 — les valeurs de `replaygain_mode` que ce serveur comprend, dans
+/// l'ordre de l'interface. Publiées par `GET /config` (`replaygain_modes`).
+pub const MODES_ACCEPTES: [&str; 4] = ["off", "track", "album", "auto"];
 
 impl ReplayGainMode {
     pub fn from_setting(raw: &str) -> Self {
         match raw.trim().to_lowercase().as_str() {
             "track" => Self::Track,
             "album" => Self::Album,
+            "auto" => Self::Auto,
             _ => Self::Off,
         }
     }
@@ -3682,18 +3697,41 @@ pub fn facteur_de_zone(
     if service_contourne(backend, zone_id, piste) {
         1.0
     } else {
-        facteur_de_lecture(backend, piste)
+        facteur_en_contexte(backend, Some(zone_id), piste)
     }
+}
+
+/// #8968 — la granularité EFFECTIVE du réglage pour une piste d'une zone :
+/// le mode réglé, sauf `Auto`, résolu par la file de la zone
+/// ([`auto::granularite`]).
+pub fn granularite_de_zone(
+    backend: &Arc<dyn DbBackend>,
+    zone_id: i64,
+    piste: PisteRg<'_>,
+    mode: ReplayGainMode,
+) -> ReplayGainMode {
+    auto::granularite(backend, Some(zone_id), piste, mode)
 }
 
 /// [`playback_factor`] pour toute piste identifiée (#8689) : `1.0` quand
 /// ReplayGain est coupé, sans piste, ou sans gain connu.
+///
+/// Sans zone, le mode `Auto` n'a pas de file pour juger : gain de piste.
 pub fn facteur_de_lecture(backend: &Arc<dyn DbBackend>, piste: PisteRg<'_>) -> f64 {
+    facteur_en_contexte(backend, None, piste)
+}
+
+fn facteur_en_contexte(
+    backend: &Arc<dyn DbBackend>,
+    zone_id: Option<i64>,
+    piste: PisteRg<'_>,
+) -> f64 {
     if !piste.est_identifiee() {
         return 1.0;
     }
     let settings = ReplayGainSettings::load(backend);
-    match gain_de_piste(backend, piste, settings.mode) {
+    let mode = auto::granularite(backend, zone_id, piste, settings.mode);
+    match gain_de_piste(backend, piste, mode) {
         Some((gain, _, kind)) => gain_factor_with_peak(gain, settings, kind).0,
         None => 1.0,
     }

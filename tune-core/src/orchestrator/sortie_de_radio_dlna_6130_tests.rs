@@ -444,3 +444,36 @@ async fn un_renderer_qui_garde_la_radio_apres_stop_est_deconnecte_par_le_serveur
         .expect("le corps radio doit être terminé")
         .unwrap();
 }
+
+/// #8926 — le cas des 2 s du .18 (17/11 11:15:05, `radio_fermee_en_ms=2011
+/// delai_depasse=true consommateurs_restants=1`, et 9 autres du 14 au 17/11) :
+/// la connexion de la radio est toujours là, son corps a remis un bloc à hyper
+/// et n'est plus relancé — le renderer arrêté ne lit plus. Le congé ne
+/// l'atteint pas ; attendre 2 s n'y change rien. La sortie doit partir après
+/// la confirmation de 300 ms, pas au bout du délai.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn un_renderer_arrete_sur_l_ecriture_ne_retient_plus_la_sortie_8926() {
+    let mut b = banc(None).await;
+    fip_en_cours(&mut b).await;
+    let radio = b.radio.lock().unwrap().clone().expect("session radio");
+    // Le corps de la radio attend hyper : `RadioConsumerGuard::ecriture(true)`.
+    radio.noter_ecriture_radio(true);
+
+    b.orch
+        .play(piste(b.zone_id, PISTE_A))
+        .await
+        .expect("le titre doit partir");
+
+    let j = journal(&b);
+    assert_eq!(noms(&j), vec!["stop", "play_media"]);
+    let ecart = j[1].quand.duration_since(j[0].quand);
+    assert!(
+        ecart < Duration::from_millis(1_000),
+        "renderer arrêté sur l'écriture : la sortie de radio a encore attendu {ecart:?} \
+         (le délai de 2 s de #6130 au lieu de la confirmation de 300 ms)"
+    );
+    assert!(
+        ecart >= Duration::from_millis(250),
+        "la confirmation de 300 ms doit être laissée ({ecart:?})"
+    );
+}

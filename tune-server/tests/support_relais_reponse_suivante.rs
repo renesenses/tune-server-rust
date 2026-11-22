@@ -220,7 +220,12 @@ fn corps_multipart(nom_fichier: &str) -> String {
 }
 
 async fn repondre_au_ticket(state: &AppState, content_type: &str, corps: String) -> StatusCode {
-    let app: Router = tune_server::routes::router(state.clone());
+    let app: Router = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     app.oneshot(
         Request::post(REPONSE)
             .header(header::CONTENT_TYPE, content_type)

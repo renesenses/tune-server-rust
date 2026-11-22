@@ -36,6 +36,7 @@ struct Strict {
     set_next: Arc<Mutex<Vec<String>>>,
     get_protocol_info: Arc<AtomicU32>,
     current_uri: Arc<Mutex<String>>,
+    transport: Arc<Mutex<String>>,
 }
 
 impl Strict {
@@ -50,6 +51,7 @@ impl Strict {
             set_next: Arc::default(),
             get_protocol_info: Arc::default(),
             current_uri: Arc::default(),
+            transport: Arc::new(Mutex::new("STOPPED".into())),
         }
     }
 }
@@ -116,10 +118,14 @@ async fn av(State(s): State<Strict>, corps: String) -> axum::response::Response 
             }
             enveloppe("<u:SetNextAVTransportURIResponse/>").into_response()
         }
-        "GetTransportInfo" => enveloppe(
-            "<u:GetTransportInfoResponse><CurrentTransportState>STOPPED</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus><CurrentSpeed>1</CurrentSpeed></u:GetTransportInfoResponse>",
-        )
-        .into_response(),
+        "Stop" => {
+            *s.transport.lock().await = "STOPPED".into();
+            enveloppe("<u:StopResponse/>").into_response()
+        }
+        "GetTransportInfo" => {
+            let transport = s.transport.lock().await.clone();
+            enveloppe(&format!("<u:GetTransportInfoResponse><CurrentTransportState>{transport}</CurrentTransportState><CurrentTransportStatus>OK</CurrentTransportStatus><CurrentSpeed>1</CurrentSpeed></u:GetTransportInfoResponse>")).into_response()
+        }
         "GetMediaInfo" => {
             let uri = s.current_uri.lock().await.clone();
             enveloppe(&format!(
@@ -548,4 +554,55 @@ async fn un_profil_relu_apres_redemarrage_puis_refuse_est_oublie_en_base() {
     assert_eq!(repli::profil_memorise(udn, "audio/flac"), None);
     vie.abort();
     vie2.abort();
+}
+
+/// #8834 — seuls les modèles retenus sautent sans couper le renderer.
+#[tokio::test]
+async fn musicbook_saute_sans_stop_dmp_a8_et_inconnu_gardent_l_arret_8834() {
+    for (modele, sans_stop) in [
+        (Some("musicbook:source"), true),
+        (Some("DMP-A8"), false),
+        (None, false),
+    ] {
+        let etat = Strict::new(&["audio/flac"], &["http-get:*:audio/flac:*"], 501);
+        *etat.transport.lock().await = "PLAYING".into();
+        *etat.current_uri.lock().await = "http://127.0.0.1/ancienne.flac".into();
+        let udn = format!("uuid:saut-8834-{}", modele.unwrap_or("inconnu"));
+        let (sortie, vie) = demarrer(etat.clone(), &udn).await;
+        let sortie = sortie.with_modele(modele.map(str::to_owned));
+        let result = sortie
+            .play_media(&piste("http://127.0.0.1/nouvelle.flac"))
+            .await;
+        let actions = etat.actions.lock().await.clone();
+        vie.abort();
+        result.unwrap();
+        let pose = actions
+            .iter()
+            .position(|a| a == "SetAVTransportURI")
+            .unwrap();
+        if sans_stop {
+            assert!(
+                !actions.iter().any(|a| a == "Stop"),
+                "#8834 : un Stop coupe le Musicbook avant le saut : {actions:?}"
+            );
+            assert!(
+                !actions[..pose].iter().any(|a| a == "GetTransportInfo"),
+                "aucune attente d'arrêt sans pré-Stop"
+            );
+        } else {
+            assert!(
+                actions[..pose].iter().any(|a| a == "Stop"),
+                "{modele:?} doit garder son pré-Stop"
+            );
+            assert!(
+                actions[..pose].iter().any(|a| a == "GetTransportInfo"),
+                "{modele:?} attend l'arrêt effectif"
+            );
+        }
+        assert!(actions.iter().any(|a| a == "Play"));
+        assert_eq!(
+            *etat.current_uri.lock().await,
+            "http://127.0.0.1/nouvelle.flac"
+        );
+    }
 }

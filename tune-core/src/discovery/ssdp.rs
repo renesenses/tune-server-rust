@@ -1238,7 +1238,7 @@ pub async fn probe_renderer(dev_id: &str, location: &str) -> Option<DiscoveredDe
         Err(e) => {
             debug!(
                 id = %dev_id,
-                location = %location,
+                location = %crate::confidentialite::masquer_url(&location),
                 error = %e,
                 "probe_renderer_description_failed"
             );
@@ -1257,7 +1257,7 @@ pub async fn probe_renderer(dev_id: &str, location: &str) -> Option<DiscoveredDe
         // se lit, mais il ne décrit pas un lecteur.
         debug!(
             id = %dev_id,
-            location = %location,
+            location = %crate::confidentialite::masquer_url(&location),
             device_type = %desc.device_type,
             friendly_name = %desc.friendly_name,
             "probe_renderer_not_a_renderer"
@@ -1394,7 +1394,7 @@ async fn classer_la_reponse(
         && is_virtual_ip(ip)
     {
         debug!(
-            location = %resp.location,
+            location = %crate::confidentialite::masquer_url(&resp.location),
             ip = %ip,
             "ssdp_response_rejected_virtual_ip_in_location"
         );
@@ -1449,15 +1449,15 @@ async fn classer_la_reponse(
         if l_adresse_repond_encore(&ancienne_location).await {
             debug!(
                 id = %dev_id,
-                connue = %ancienne_location,
-                autre = %resp.location,
+                connue = %crate::confidentialite::masquer_url(&ancienne_location),
+                autre = %crate::confidentialite::masquer_url(&resp.location),
                 "ssdp_seconde_location_ignoree_l_ancienne_repond"
             );
         } else {
             info!(
                 id = %dev_id,
-                ancienne = %ancienne_location,
-                nouvelle = %resp.location,
+                ancienne = %crate::confidentialite::masquer_url(&ancienne_location),
+                nouvelle = %crate::confidentialite::masquer_url(&resp.location),
                 "ssdp_location_changee_appareil_reenregistre"
             );
             return Some((dev_id, resp));
@@ -1553,6 +1553,9 @@ async fn enregistrer_l_appareil(
             st.miss_count.remove(&dev_id);
             st.devices.insert(dev_id.clone(), device.clone());
             drop(st);
+            // #9140 — retenu dès la découverte : un appareil perdu avant le rapport
+            // reste masqué dans les lignes de journal qui le nomment.
+            crate::discovery::device::retenir_pour_la_confidentialite(&device);
 
             info!(id = %dev_id, name = %device.name, "ssdp_device_discovered");
             let _ = event_tx
@@ -1604,6 +1607,9 @@ async fn enregistrer_l_appareil(
                     st.miss_count.remove(&dev_id);
                     st.devices.insert(dev_id.clone(), device.clone());
                     drop(st);
+                    // #9140 — retenu dès la découverte : un appareil perdu avant le rapport
+                    // reste masqué dans les lignes de journal qui le nomment.
+                    crate::discovery::device::retenir_pour_la_confidentialite(&device);
 
                     info!(id = %dev_id, name = %probe.name, "ssdp_minimal_dmr_discovered");
                     let _ = event_tx
@@ -1634,7 +1640,7 @@ async fn enregistrer_l_appareil(
                 // indiagnosticable pour cette seule raison.
                 warn!(
                     id = %dev_id,
-                    location = %resp.location,
+                    location = %crate::confidentialite::masquer_url(&resp.location),
                     error = %e,
                     "ssdp_device_create_failed"
                 );
@@ -1761,11 +1767,21 @@ async fn inscrire_le_serveur_multimedia(
         // Le registre de fraîcheur, sans lequel rien n'expire (#2139).
         st.media_servers.insert(dev_id.to_string(), ms.clone());
     }
+    // #9140 — le nom d'un serveur multimédia (« Serveur Plex de … ») est
+    // retenu pour le nettoyage de ce qui sort.
+    crate::confidentialite::retenir_nom_d_appareil(
+        crate::confidentialite::Sorte::Appareil,
+        &ms.name,
+        &[crate::confidentialite::materiel(
+            Some(&ms.manufacturer),
+            Some(&ms.model),
+        )],
+    );
     info!(
         id = %dev_id,
         name = %ms.name,
-        location = %ms.location,
-        cd_url = %ms.content_directory_url,
+        location = %crate::confidentialite::masquer_url(&ms.location),
+        cd_url = %crate::confidentialite::masquer_url(&ms.content_directory_url),
         "ssdp_media_server_discovered"
     );
     let _ = event_tx.send(SsdpEvent::MediaServerDiscovered(ms)).await;
@@ -1815,7 +1831,7 @@ async fn oublier_les_absents(
                 info!(
                     id = %dev_id,
                     name = %device.name,
-                    location = %location.as_deref().unwrap_or("inconnue"),
+                    location = %crate::confidentialite::masquer_url(&location.as_deref().unwrap_or("inconnue")),
                     "ssdp_device_lost"
                 );
                 drop(st);

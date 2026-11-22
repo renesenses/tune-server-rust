@@ -101,7 +101,12 @@ pub(crate) async fn demarrer(
         active,
         "banc : Party doit être chargé si et seulement s'il est actif au démarrage"
     );
-    let app = tune_server::routes::router(state.clone());
+    let app = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     (state, app, env)
 }
 

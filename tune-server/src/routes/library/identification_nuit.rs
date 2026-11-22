@@ -335,6 +335,7 @@ fn heure_et_date_locales() -> (u8, String) {
 }
 
 /// Câblée au démarrage par `background.rs`.
+#[cfg_attr(feature = "sans-enrichissement", allow(dead_code))]
 pub(crate) fn spawn_passe_de_nuit(state: &AppState) {
     let state = state.clone();
     tokio::spawn(async move {

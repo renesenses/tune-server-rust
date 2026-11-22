@@ -164,9 +164,79 @@ impl Tampon {
     }
 }
 
+/// #9070 — attente maximale de la PREMIÈRE trame après l'ouverture. Un
+/// pilote remet sa première période en quelques dizaines de millisecondes ;
+/// un micro qui ne rend rien au bout de quatre secondes ne rendra rien (cpal
+/// est ouvert sans délai : son fil attend sans fin et ne signale rien).
+/// Quatre et non deux : l'attente précède toute salve, elle ne coûte rien, et
+/// elle laisse de la marge à une machine chargée (Raspberry Pi, USB partagé).
+pub const DELAI_PREMIERE_TRAME: Duration = Duration::from_secs(4);
+
+/// #9070 — pourquoi une capture n'a rien rendu dans le délai.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SansTrame {
+    /// Ouverte, mais aucune trame : le micro « ne renvoie aucun son ».
+    Muette {
+        nom: String,
+        /// L'identifiant du périphérique ouvert (`alsa:dsnoop:CARD=…`).
+        peripherique: String,
+        delai: Duration,
+    },
+    /// Le pilote a fermé la capture avant toute trame.
+    Interrompue(Fin),
+}
+
+impl SansTrame {
+    /// Le code stable que l'écran traduit (`micro_muet`).
+    pub fn code(&self) -> Option<&'static str> {
+        match self {
+            SansTrame::Muette { .. } => Some("micro_muet"),
+            SansTrame::Interrompue(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for SansTrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SansTrame::Muette {
+                nom,
+                peripherique,
+                delai,
+            } => {
+                write!(
+                    f,
+                    "le micro « {nom} » ne renvoie aucun son (périphérique {peripherique}, \
+                     aucune trame en {:.0} s) : vérifiez qu'il est bien branché",
+                    delai.as_secs_f64()
+                )?;
+                match crate::peripheriques::entree_materielle_alsa(peripherique) {
+                    Some(hw) if !peripherique.starts_with("alsa:hw:") => {
+                        write!(f, " et choisissez l'entrée matérielle {hw}")
+                    }
+                    // Déjà l'accès direct : rien de mieux à conseiller (une
+                    // carte tenue par un autre logiciel refuse l'ouverture,
+                    // elle ne rend pas zéro trame). Le rapport de diagnostic
+                    // porte le journal qui dira pourquoi.
+                    Some(_) => write!(
+                        f,
+                        " ; s'il l'est, envoyez un rapport de diagnostic depuis l'écran Support"
+                    ),
+                    None => Ok(()),
+                }
+            }
+            SansTrame::Interrompue(fin) => {
+                write!(f, "capture interrompue avant la première trame : {fin:?}")
+            }
+        }
+    }
+}
+
 /// Une capture démarrée vers un [`Tampon`].
 pub struct CaptureVersTampon {
     nom: String,
+    /// #9070 — l'identifiant du périphérique ouvert.
+    peripherique: String,
     tampon: Arc<Tampon>,
     anneau: Arc<Anneau>,
     arret: Mutex<Option<Box<dyn Arret>>>,
@@ -233,6 +303,7 @@ impl CaptureVersTampon {
         };
         tracing::info!(
             entree = %capture.nom,
+            peripherique = %capture.id,
             frequence = format.frequence,
             bits = format.bits,
             canaux = format.canaux,
@@ -241,6 +312,7 @@ impl CaptureVersTampon {
         );
         Ok(Self {
             nom: capture.nom,
+            peripherique: capture.id,
             tampon,
             anneau,
             arret: Mutex::new(Some(capture.arret)),
@@ -255,6 +327,35 @@ impl CaptureVersTampon {
 
     pub fn tampon(&self) -> &Arc<Tampon> {
         &self.tampon
+    }
+
+    /// #9070 — l'identifiant du périphérique ouvert.
+    pub fn peripherique(&self) -> &str {
+        &self.peripherique
+    }
+
+    /// #9070 — attend la première trame, `delai` au plus
+    /// ([`DELAI_PREMIERE_TRAME`]). Une capture ouverte qui ne rend rien —
+    /// pas même des zéros — échoue ici, vite et en nommant le PCM, au lieu
+    /// de laisser l'analyseur attendre ses trames une minute.
+    pub fn attendre_la_premiere_trame(&self, delai: Duration) -> Result<(), SansTrame> {
+        match self.tampon.attendre_trames(1, delai) {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => {
+                tracing::warn!(
+                    entree = %self.nom,
+                    peripherique = %self.peripherique,
+                    delai_ms = delai.as_millis() as u64,
+                    "calibration_capture_sans_trame"
+                );
+                Err(SansTrame::Muette {
+                    nom: self.nom.clone(),
+                    peripherique: self.peripherique.clone(),
+                    delai,
+                })
+            }
+            Err(fin) => Err(SansTrame::Interrompue(fin)),
+        }
     }
 
     /// Débordements de l'anneau : des trames perdues entre le pilote et le
@@ -329,6 +430,78 @@ mod tests {
         assert_eq!(c.tampon().trames(), 48_000);
         assert!(c.tampon().trames_ecartees() > 0);
         assert!(c.tampon().fin().is_none());
+        c.arreter();
+    }
+
+    /// #9070 (fil 2770) — un micro ouvert qui ne remet aucune trame : la
+    /// capture échoue en ~4 s, en nommant le périphérique ouvert, au lieu
+    /// d'attendre une minute « 0 trames sur 216000 ».
+    #[test]
+    fn un_micro_sans_trame_echoue_en_quatre_secondes_9070() {
+        let s = Simulees::avec("Umik-1", 48_000);
+        s.sans_trames.store(true, Ordering::SeqCst);
+        let p: Arc<dyn Peripheriques> = s;
+        let c = CaptureVersTampon::demarrer(&p, "Umik-1", 5.0).unwrap();
+        assert_eq!(c.peripherique(), "simule:Umik-1");
+        let t0 = Instant::now();
+        let e = c
+            .attendre_la_premiere_trame(DELAI_PREMIERE_TRAME)
+            .expect_err("#9070 : un micro qui ne rend aucune trame doit échouer");
+        let duree = t0.elapsed();
+        assert!(
+            duree >= Duration::from_millis(3_900) && duree < Duration::from_secs(8),
+            "échec en {duree:?}, attendu ~4 s"
+        );
+        assert_eq!(e.code(), Some("micro_muet"));
+        let m = e.to_string();
+        assert!(
+            m.contains("ne renvoie aucun son") && m.contains("simule:Umik-1"),
+            "{m}"
+        );
+        c.arreter();
+    }
+
+    /// Le message conseille l'entrée matérielle de la carte quand le PCM
+    /// ouvert ne l'est pas.
+    #[test]
+    fn le_message_nomme_l_entree_materielle_9070() {
+        let m = SansTrame::Muette {
+            nom: "Umik-1  Gain: 18dB, USB Audio".into(),
+            peripherique: "alsa:dsnoop:CARD=U18dB,DEV=0".into(),
+            delai: DELAI_PREMIERE_TRAME,
+        }
+        .to_string();
+        assert!(m.contains("alsa:dsnoop:CARD=U18dB,DEV=0"), "{m}");
+        assert!(m.contains("entrée matérielle hw:CARD=U18dB,DEV=0"), "{m}");
+        let m = SansTrame::Muette {
+            nom: "Micro".into(),
+            peripherique: "coreaudio:X".into(),
+            delai: DELAI_PREMIERE_TRAME,
+        }
+        .to_string();
+        assert!(!m.contains("hw:"), "{m}");
+        // Déjà en accès direct : pas de conseil circulaire, ni de PipeWire.
+        let m = SansTrame::Muette {
+            nom: "Umik-1".into(),
+            peripherique: "alsa:hw:CARD=U18dB,DEV=0".into(),
+            delai: DELAI_PREMIERE_TRAME,
+        }
+        .to_string();
+        assert!(!m.contains("choisissez"), "{m}");
+        assert!(!m.contains("PipeWire"), "{m}");
+        assert!(m.contains("rapport de diagnostic"), "{m}");
+    }
+
+    /// Un micro qui rend des trames (même des zéros) passe aussitôt.
+    #[test]
+    fn un_micro_qui_rend_des_trames_passe_aussitot_9070() {
+        let s = Simulees::avec("Micro USB", 48_000);
+        s.rendre_des_zeros("Micro USB");
+        let p: Arc<dyn Peripheriques> = s;
+        let c = CaptureVersTampon::demarrer(&p, "Micro USB", 5.0).unwrap();
+        let t0 = Instant::now();
+        c.attendre_la_premiere_trame(DELAI_PREMIERE_TRAME).unwrap();
+        assert!(t0.elapsed() < Duration::from_millis(1_000));
         c.arreter();
     }
 

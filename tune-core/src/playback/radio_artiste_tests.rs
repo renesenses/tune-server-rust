@@ -557,6 +557,8 @@ impl StreamingService for ServiceSimule {
             quality: None,
             released_at: None,
             release_type: None,
+            genre_id: None,
+            genre_name: None,
         };
         let mut v: Vec<StreamAlbum> = (0..30)
             .map(|n| album(&format!("al{n}"), "Graine", Some("g")))

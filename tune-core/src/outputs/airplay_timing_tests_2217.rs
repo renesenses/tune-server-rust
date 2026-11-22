@@ -225,9 +225,10 @@ async fn timing_answers_before_setup_ack_and_ignores_invalid_packets_then_stop_r
     timing_exchange(ports, false).await;
     output.stop().await.unwrap();
     assert_released(ports);
+    // #8855 (GO du 20/11) : le volume de la zone part après RECORD.
     assert_eq!(
         server.await.unwrap(),
-        ["ANNOUNCE", "SETUP", "RECORD", "TEARDOWN"]
+        ["ANNOUNCE", "SETUP", "RECORD", "SET_PARAMETER", "TEARDOWN"]
     );
 }
 
@@ -272,7 +273,11 @@ async fn dropping_output_aborts_timing_responder_and_releases_ports() {
     .await
     .expect("Drop must abort the timing task");
     assert_released(ports);
-    assert_eq!(server.await.unwrap(), ["ANNOUNCE", "SETUP", "RECORD"]);
+    // #8855 (GO du 20/11) : le volume de la zone part après RECORD.
+    assert_eq!(
+        server.await.unwrap(),
+        ["ANNOUNCE", "SETUP", "RECORD", "SET_PARAMETER"]
+    );
 }
 
 #[tokio::test]

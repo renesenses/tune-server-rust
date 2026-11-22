@@ -17,6 +17,9 @@
 //! La marque ne vaut que pour le fichier vu : `mtime_vu` garde la date de
 //! modification du fichier au moment de la tentative. Un fichier modifié, puis
 //! relu par un scan, redevient candidat.
+//! Les réécritures internes de balises font suivre une marque encore valide
+//! avec la date de la piste, dans la même transaction (#8864). Elles ne
+//! recréent pas une marque périmée et ne réinitialisent pas les réessais.
 //!
 //! Table sans numéro de migration, sur le modèle de `politiques_parentales` :
 //! créée par la passe finale de `run_migrations` (SQLite) et par

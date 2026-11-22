@@ -46,6 +46,8 @@ impl Banc {
             annonce.mac_texte(),
             ecoute.clone(),
             air::ContexteAir {
+                plafond_de_cadence: std::sync::Arc::new(|_: &str| None),
+                securite_db: std::sync::Arc::new(|_: &str| None),
                 activee: Arc::new(|| true),
                 indice_source: Arc::new(|| 9),
                 bornes_db: Arc::new(|| air::reglages::BornesDb::PAR_DEFAUT),
@@ -317,4 +319,121 @@ async fn le_repli_du_statut_air_n_est_pas_adopte_comme_une_annonce_6912() {
             .releve_adoptable(b.id, "dlna-autre", Some(0.5), 0.2, 0.5),
         Some(super::releve_ne_monte_pas_6739::SuiteDuReleve::Adopter(0.2))
     );
+}
+
+// ─── #8920 — ampli monté à la télécommande au-dessus de la sécurité ─────────
+
+impl Banc {
+    fn poser_la_securite(&self, securite: &str) {
+        crate::db::settings_repo::SettingsRepo::with_backend(self.poller.db.clone())
+            .set(
+                &crate::audio::volume_limites::cle_securite(self.id),
+                securite,
+            )
+            .unwrap();
+    }
+    /// Les commandes VOLUME reçues par l'ampli simulé, en dB (chaque
+    /// commande part deux fois, comme Roon).
+    fn volumes_commandes(&self) -> Vec<f32> {
+        self.commandes.set_nonblocking(false).unwrap();
+        self.commandes
+            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .unwrap();
+        let mut vus = Vec::new();
+        let mut o = [0; 2048];
+        while let Ok((n, _)) = self.commandes.recv_from(&mut o) {
+            let c = protocole::analyser_commande(&o[..n]).unwrap();
+            assert_eq!(c.opcode, protocole::opcode::VOLUME, "{c:?}");
+            vus.push(c.valeur);
+        }
+        self.commandes.set_nonblocking(true).unwrap();
+        vus
+    }
+}
+
+#[tokio::test]
+async fn air_monte_a_la_telecommande_au_dessus_de_la_securite_est_ramene_8920() {
+    let mut b = Banc::nouveau().await;
+    // Course par défaut : 0,5 = −45 dB. Consigne plus basse que la limite.
+    b.poser_la_securite("0.5");
+    b.poller.playback.set_volume(b.id, 0.3).await;
+    ZoneRepo::with_backend(b.poller.db.clone())
+        .update_volume(b.id, 30.0)
+        .unwrap();
+    b.annoncer(-24.0, false);
+    b.observer().await;
+    let envoyes = b.volumes_commandes();
+    assert!(
+        !envoyes.is_empty() && envoyes.iter().all(|v| (*v - -45.0).abs() < 1e-6),
+        "l'ampli à −24 dB doit être ramené à la sécurité (−45 dB) : {envoyes:?}"
+    );
+    let s = b.poller.playback.get_state(b.id).await;
+    assert!(
+        (s.volume - 0.5).abs() < 1e-9,
+        "la consigne publiée doit devenir la limite : {}",
+        s.volume
+    );
+    assert!((b.zone().volume - 50.0).abs() < 1e-6, "{}", b.zone().volume);
+
+    // Une seule fois par dépassement : l'ampli qui ne suit pas n'est pas
+    // relancé au tour suivant.
+    b.poller.playback.ecouler_la_grace_de_volume(b.id).await;
+    b.observer().await;
+    b.aucune_commande();
+
+    // Revenu à la limite : l'épisode se referme, rien ne part.
+    b.annoncer(-45.0, false);
+    b.observer().await;
+    b.aucune_commande();
+    // Nouveau geste au-dessus : rappelé à son tour.
+    b.annoncer(-30.0, false);
+    b.observer().await;
+    let envoyes = b.volumes_commandes();
+    assert!(
+        !envoyes.is_empty() && envoyes.iter().all(|v| (*v - -45.0).abs() < 1e-6),
+        "un nouveau dépassement doit être rappelé : {envoyes:?}"
+    );
+}
+
+#[tokio::test]
+async fn air_en_pure_est_ramene_aussi_8920() {
+    // Sur AIR, PURE garde les limites (`mode_sans_limite`) : le rappel vaut.
+    let mut b = Banc::nouveau().await;
+    b.poser_la_securite("0.5");
+    crate::db::settings_repo::SettingsRepo::with_backend(b.poller.db.clone())
+        .set(&format!("zone_{}_audiophile", b.id), r#"{"enabled":true}"#)
+        .unwrap();
+    b.annoncer(-24.0, false);
+    b.observer().await;
+    let envoyes = b.volumes_commandes();
+    assert!(
+        !envoyes.is_empty() && envoyes.iter().all(|v| (*v - -45.0).abs() < 1e-6),
+        "PURE sur AIR : la sécurité tient, l'ampli est ramené : {envoyes:?}"
+    );
+}
+
+#[tokio::test]
+async fn air_sous_la_securite_n_est_pas_touche_8920() {
+    // Contre-épreuve : sous la limite (et à la limite), rien ne part.
+    for annonce_db in [-50.0, -45.0] {
+        let mut b = Banc::nouveau().await;
+        b.poser_la_securite("0.5");
+        b.annoncer(annonce_db, false);
+        b.observer().await;
+        b.aucune_commande();
+        let s = b.poller.playback.get_state(b.id).await;
+        assert!(s.volume <= 0.5 + 1e-9, "{}", s.volume);
+    }
+}
+
+#[tokio::test]
+async fn air_sans_limite_n_est_pas_ramene_8920() {
+    // Contre-épreuve : sans limite réglée, l'ampli à −24 dB reste où il est.
+    let mut b = Banc::nouveau().await;
+    b.annoncer(-24.0, false);
+    b.observer().await;
+    b.aucune_commande();
+    let s = b.poller.playback.get_state(b.id).await;
+    assert_eq!(s.volume, 0.5);
+    assert_eq!(b.zone().volume, 50.0);
 }

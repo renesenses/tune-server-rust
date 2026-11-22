@@ -113,7 +113,7 @@ class PluginCatalog(unittest.TestCase):
     def test_shipping_manifests_match_the_commercial_offer(self):
         # Independent business oracle: never derive expected access from the
         # manifest under test. The SDK workflow runs this before expensive builds.
-        for plugin, entitlement in {"equalizer": "free", "crossfeed": "crossfeed",
+        for plugin, entitlement in {"equalizer": "free", "crossfeed": "free",
                                     "converter": "batch_converter", "declick": "declick"}.items():
             manifest = json.loads((self.root / f"sdk/tune-plugin-{plugin}/manifest.json").read_text(encoding="utf-8"))
             self.assertEqual(manifest["entitlement"], entitlement, plugin)

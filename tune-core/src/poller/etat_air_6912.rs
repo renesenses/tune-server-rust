@@ -59,6 +59,14 @@ impl PositionPoller {
         }) else {
             return;
         };
+        // #8920 — au-dessus de la limite de sécurité, l'ampli y est ramené.
+        // Le verrou de la file est rendu AVANT : `set_volume` le reprend.
+        if !zone.fixed_volume && self.depassement_air_a_rappeler(zone_id, &observation) {
+            drop(attente);
+            self.rappeler_air_a_la_securite(zone_id, did, &observation)
+                .await;
+            return;
+        }
         let volume = if zone.fixed_volume {
             actuel.volume
         } else {

@@ -321,6 +321,60 @@ async fn le_fichier_n_est_ecrit_que_si_le_reglage_est_coche_8679() {
     assert_eq!(r["files_scheduled"], 2, "{r}");
 }
 
+/// #8957 (fil 2685, rc12) — une piste de feuille CUE signalée « artiste
+/// manquant » : la liste donne le chemin du fichier IMAGE (plus de « Chemin
+/// indisponible ») et l'artiste de son dossier ; l'écriture se fait en base,
+/// jamais dans l'image, qui porte toutes les pistes de la feuille.
+///
+/// Contre-épreuve : rendre `t.file_path` seul (le code d'avant) donne
+/// `file_path: null` et `folder_artist: null` pour cette piste.
+#[tokio::test]
+async fn une_piste_de_feuille_cue_donne_le_chemin_de_son_image_8957() {
+    let state = etat();
+    let db = &state.backend;
+    let album = inserer(
+        db,
+        "INSERT INTO albums (title) VALUES (?1)",
+        &[&"Live cue8957".to_string()],
+    );
+    let image = "/srv/cue8957/Miles Davis cue8957/Live cue8957/image.flac".to_string();
+    let piste = inserer(
+        db,
+        "INSERT INTO tracks (title, album_id, source, file_path, cue_media_path, cue_start_ms) \
+         VALUES ('x', ?1, 'local', NULL, ?2, 0)",
+        &[&album, &image],
+    );
+
+    let (code, v) = par_la_route(&state, "GET", "/doubtful?limit=100", "").await;
+    assert_eq!(code, StatusCode::OK);
+    let item = v["items"]
+        .as_array()
+        .expect("items")
+        .iter()
+        .find(|i| i["id"] == piste)
+        .cloned()
+        .expect("la piste CUE est listée");
+    assert_eq!(item["file_path"], image.as_str(), "{item}");
+    assert_eq!(item["path_source"], "cue_image", "{item}");
+    assert_eq!(item["folder_artist"], "Miles Davis cue8957", "{item}");
+
+    crate::routes::ecriture_fichiers::activer_pour_test(db);
+    let (_, r) = par_la_route(
+        &state,
+        "POST",
+        "/doubtful/artist-from-folder",
+        &format!(r#"{{"track_ids":[{piste}]}}"#),
+    )
+    .await;
+    assert_eq!(r["updated"], 1, "{r}");
+    assert_eq!(
+        r["files_scheduled"], 0,
+        "l'image d'une feuille CUE ne se grave pas pour une seule piste : {r}"
+    );
+    let artiste = artiste_de_piste(db, piste).expect("artiste posé en base");
+    assert_eq!(nom_d_artiste(db, artiste), "Miles Davis cue8957");
+}
+
 #[tokio::test]
 async fn une_liste_vide_est_refusee_8679() {
     let state = etat();

@@ -169,17 +169,14 @@ impl HorlogeVirtuelle {
         self.0.corrections.fetch_add(1, Ordering::AcqRel);
         Time::from_nanos(u64::try_from(maintenant.max(0)).unwrap_or(0))
     }
-}
 
-impl Clock for HorlogeVirtuelle {
-    type Error = TempsNegatif;
-
-    fn now(&self) -> Time {
-        Time::from_nanos(self.maintenant_ns())
-    }
-
-    fn step_clock(&mut self, offset: DureePtp) -> Result<Time, Self::Error> {
-        let m = self.0.monotone.ns();
+    /// QA 18/11 — le saut, à un instant monotone explicite (comme
+    /// [`Self::regler_frequence_a`]) : le témoin compare le temps virtuel
+    /// avant et après le saut AU MÊME instant, sans deux lectures d'horloge
+    /// séparées par l'ordonnanceur. Sous charge, `step_clock` + `info!`
+    /// entre deux lectures prenaient jusqu'à 253 ms (CI du 17/11), et
+    /// l'écart mesuré sortait de sa tolérance de 50 ms.
+    fn sauter_a(&self, offset: DureePtp, m: u64) -> Result<Time, TempsNegatif> {
         let mut f = self.formule();
         Self::rebaser(&mut f, m);
         let nouveau = f.base_virtuelle + offset.nanos_rounded();
@@ -201,6 +198,19 @@ impl Clock for HorlogeVirtuelle {
             "aes67_ptp_saut_d_horloge"
         );
         Ok(Time::from_nanos(u64::try_from(nouveau).unwrap_or(u64::MAX)))
+    }
+}
+
+impl Clock for HorlogeVirtuelle {
+    type Error = TempsNegatif;
+
+    fn now(&self) -> Time {
+        Time::from_nanos(self.maintenant_ns())
+    }
+
+    fn step_clock(&mut self, offset: DureePtp) -> Result<Time, Self::Error> {
+        let m = self.0.monotone.ns();
+        self.sauter_a(offset, m)
     }
 
     fn set_frequency(&mut self, ppm: f64) -> Result<Time, Self::Error> {
@@ -239,20 +249,29 @@ mod tests {
 
     #[test]
     fn un_saut_decale_le_temps_et_avance_la_generation() {
-        let (mut h, g) = horloge();
-        let avant = h.maintenant_ns();
-        h.step_clock(DureePtp::from_secs(1000)).unwrap();
-        let apres = h.maintenant_ns();
-        let ecart = apres - avant;
-        assert!(
-            (1_000_000_000_000..1_000_050_000_000).contains(&ecart),
-            "{ecart}"
+        // QA 18/11 — avant et après le saut se lisent au MÊME instant
+        // monotone `m` : l'écart vaut le saut, exactement, quelle que soit la
+        // charge (il était lu entre deux appels d'horloge, et un passage de
+        // l'ordonnanceur de 253 ms le faisait sortir de ±50 ms en CI).
+        let (h, g) = horloge();
+        let m = h.0.monotone.ns();
+        let avant = h.formule().virtuel(m);
+        let apres = i128::from(ns_de(h.sauter_a(DureePtp::from_secs(1000), m).unwrap()));
+        assert_eq!(
+            apres - avant,
+            1_000_000_000_000,
+            "le saut décale de 1000 s, ni plus ni moins"
         );
-        h.step_clock(DureePtp::from_millis(-500)).unwrap();
-        assert!(h.maintenant_ns() < apres);
+        assert_eq!(h.formule().virtuel(m), apres, "et la formule le garde");
+        let recul = i128::from(ns_de(h.sauter_a(DureePtp::from_millis(-500), m).unwrap()));
+        assert_eq!(apres - recul, 500_000_000);
         assert_eq!(g.load(Ordering::Acquire), 2);
         assert_eq!(h.sauts(), 2);
-        assert!(h.step_clock(DureePtp::from_secs(-4_000_000_000)).is_err());
+        // Le chemin public (`Clock::step_clock`) passe par le même saut.
+        let mut h2 = h.clone();
+        assert!(h2.step_clock(DureePtp::from_secs(-4_000_000_000)).is_err());
+        assert!(h2.step_clock(DureePtp::from_secs(1)).is_ok());
+        assert_eq!(h.sauts(), 3);
     }
 
     #[test]

@@ -129,8 +129,9 @@ fn routes_d_administration() -> Vec<(Method, &'static str, Option<&'static str>)
             "/api/v1/appliance/wifi/forget",
             Some(r#"{"ssid":"Maison"}"#),
         ),
-        // A5
-        (Method::POST, "/api/v1/cloud/sso/disconnect", None),
+        // A5 : `sso/disconnect` n'est plus réservé à l'administrateur — un compte
+        // standard délie SON profil (voir
+        // `un_compte_standard_ne_delie_que_son_propre_profil`).
         // B4
         (Method::GET, "/api/v1/multi-server/servers", None),
         (
@@ -217,6 +218,15 @@ fn actions_machine() -> Vec<(Method, &'static str, Option<&'static str>)> {
 
 /// Les routes qui, passée la garde, ne partent pas en ligne : témoins « la
 /// garde passe » sans appel à la boutique.
+/// La garde « cette machine » est-elle passée ? Son refus porte
+/// `auth_required` ; le gestionnaire de l'arrêt programmé, lui, refuse
+/// d'éteindre un HÔTE ordinaire sans authentification active (#8909) avec son
+/// propre message — garde passée, refus du gestionnaire.
+fn garde_passee(rep: &str) -> bool {
+    !rep.contains("auth_required")
+        || rep.contains(tune_server::extinction_hote::REFUS_SANS_AUTHENTIFICATION)
+}
+
 fn actions_machine_hors_ligne() -> Vec<(Method, &'static str, Option<&'static str>)> {
     actions_machine()
         .into_iter()
@@ -263,15 +273,26 @@ async fn l_administrateur_passe_la_garde_de_chaque_route() {
 async fn seul_le_retour_du_sso_reste_public() {
     let state = new_state();
     enable_auth(&state);
-    let (st, rep) = appel(
-        &state,
-        Method::GET,
-        "/api/v1/cloud/sso/callback?error=access_denied",
-        None,
-        None,
-    )
-    .await;
-    assert_ne!(st, StatusCode::UNAUTHORIZED, "callback : {rep}");
+    // Le retour passe la couche d'authentification (le navigateur revient de
+    // mozaiklabs.fr) : c'est le gestionnaire qui répond, par une PAGE.
+    // Sans la session qui a lancé la liaison, il refuse ; avec elle
+    // (administrateur ou compte standard, cookie ou jeton), il traite le
+    // retour — ici le refus du fournisseur.
+    let retour = "/api/v1/cloud/sso/callback?error=access_denied";
+    let (st, rep) = appel(&state, Method::GET, retour, None, None).await;
+    assert!(
+        rep.contains("<!doctype html>"),
+        "page du gestionnaire : {st} {rep}"
+    );
+    assert!(
+        !rep.contains("OAuth error"),
+        "sans session, le retour n'est pas traité : {rep}"
+    );
+    for jeton in [tok("admin", 1), tok("user", 2)] {
+        let (st, rep) = appel(&state, Method::GET, retour, Some(&jeton), None).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "avec la session : {rep}");
+        assert!(rep.contains("OAuth error: access_denied"), "{rep}");
+    }
     for (m, chemin) in [
         (Method::POST, "/api/v1/cloud/sso/disconnect"),
         (Method::GET, "/api/v1/cloud/sso/status"),
@@ -437,7 +458,7 @@ async fn sans_authentification_les_actions_machine_viennent_de_cette_machine() {
     // du gestionnaire : 404 hors appliance, 400 poweroff hors Tune OS).
     for (m, chemin, corps) in actions_machine_hors_ligne() {
         let (st, rep) = appel(&state, m.clone(), chemin, None, corps).await;
-        assert!(!rep.contains("auth_required"), "{m} {chemin} : {rep}");
+        assert!(garde_passee(&rep), "{m} {chemin} : {rep}");
         assert_ne!(st, StatusCode::UNAUTHORIZED, "{m} {chemin} : {rep}");
     }
 }
@@ -451,10 +472,7 @@ async fn sans_authentification_le_bouclage_ipv6_est_cette_machine() {
         for (m, chemin, corps) in actions_machine_hors_ligne() {
             let (st, _, rep) =
                 appel_depuis(&state, adresse, m.clone(), chemin, None, corps, &[]).await;
-            assert!(
-                !rep.contains("auth_required"),
-                "{adresse} {m} {chemin} : {rep}"
-            );
+            assert!(garde_passee(&rep), "{adresse} {m} {chemin} : {rep}");
             assert_ne!(
                 st,
                 StatusCode::UNAUTHORIZED,
@@ -713,14 +731,38 @@ async fn sous_authentification_seul_l_administrateur_cree_un_compte() {
     );
 }
 
-/// Témoin : authentification coupée, le premier compte de
-/// l'onboarding reste possible, depuis n'importe quel hôte, avec sa session.
+/// Témoin : authentification coupée, le premier compte de l'onboarding reste
+/// possible DEPUIS CETTE MACHINE, avec sa session. Depuis un autre hôte, un
+/// compte créé par un tiers survivrait à l'activation : refusé.
 #[tokio::test]
 async fn sans_authentification_le_premier_compte_s_inscrit_toujours() {
     let state = new_state();
-    let (st, entetes, rep) = appel_depuis(
+    let (st, _, rep) = appel_depuis(
         &state,
         AUTRE_HOTE_DU_LAN,
+        Method::POST,
+        INSCRIPTION,
+        None,
+        Some(CORPS_INSCRIPTION),
+        &[],
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "depuis le LAN : {rep}");
+    assert!(rep.contains("not_local"), "{rep}");
+    let (st, _, rep) = appel_depuis(
+        &state,
+        CETTE_MACHINE,
+        Method::POST,
+        INSCRIPTION,
+        None,
+        Some(CORPS_INSCRIPTION),
+        &[("x-forwarded-for", "192.168.1.50")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "derrière un mandataire : {rep}");
+    let (st, entetes, rep) = appel_depuis(
+        &state,
+        CETTE_MACHINE,
         Method::POST,
         INSCRIPTION,
         None,
@@ -1081,4 +1123,520 @@ async fn l_adresse_snapcast_est_un_reglage_protege() {
     assert!(rep.contains("snapcast_host"), "{rep}");
     let reglages = SettingsRepo::with_backend(state.backend.clone());
     assert_eq!(reglages.get("snapcast_host").ok().flatten(), None);
+}
+
+/// Actions qui engagent la machine ou le code exécuté et qui n'avaient que
+/// `RequireAdmin` (ou aucune garde) : arrêt du serveur, greffons (installation,
+/// mise à jour, activation, désactivation, retrait), retrait d'un thème,
+/// greffons audio natifs, ouverture de l'accès à distance. Les noms
+/// n'existent pas : passé la garde, chaque gestionnaire refuse sans rien
+/// toucher.
+fn actions_machine_gardees_a_leur_tour() -> Vec<(Method, &'static str, Option<&'static str>)> {
+    vec![
+        (Method::POST, "/api/v1/system/stop", None),
+        (
+            Method::POST,
+            "/api/v1/plugins/greffon-inexistant-gardes/install",
+            Some("{}"),
+        ),
+        (
+            Method::POST,
+            "/api/v1/plugins/greffon-inexistant-gardes/update",
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/v1/plugins/greffon-inexistant-gardes/enable",
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/v1/plugins/greffon-inexistant-gardes/disable",
+            None,
+        ),
+        (
+            Method::DELETE,
+            "/api/v1/plugins/greffon-inexistant-gardes",
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/v1/marketplace/plugins/greffon-inexistant-gardes/uninstall",
+            None,
+        ),
+        (
+            Method::DELETE,
+            "/api/v1/skins/theme-inexistant-gardes",
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/v1/audio-plugins/greffon-inexistant-gardes/install",
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/v1/audio-plugins/greffon-inexistant-gardes/install-from-catalog",
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/v1/audio-plugins/greffon-inexistant-gardes/rollback",
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/v1/audio-plugins/greffon-inexistant-gardes/uninstall",
+            Some("{}"),
+        ),
+        (Method::POST, "/api/v1/cloud/bridge/enable", None),
+        // Décision du 18/11 : restaurations / imports de configuration, pont,
+        // canal de mise à jour.
+        (Method::POST, "/api/v1/cloud/bridge/disable", None),
+        (Method::POST, "/api/v1/cloud/bridge/rotate-token", None),
+        (Method::POST, "/api/v1/system/config/import", Some("{}")),
+        (
+            Method::POST,
+            "/api/v1/system/config-backup/import",
+            Some("{}"),
+        ),
+        (
+            Method::POST,
+            "/api/v1/system/config-backup/cloud/restore",
+            Some("{}"),
+        ),
+        (
+            Method::PUT,
+            "/api/v1/system/update/channel",
+            Some(r#"{"channel":"stable"}"#),
+        ),
+        // Le lien d'accès porte le jeton du pont.
+        (Method::GET, "/api/v1/cloud/bridge/access-link", None),
+    ]
+}
+
+/// Passé la garde, l'arrêt quitte le processus : jamais exécuté sous test.
+fn sans_l_arret(
+    routes: Vec<(Method, &'static str, Option<&'static str>)>,
+) -> Vec<(Method, &'static str, Option<&'static str>)> {
+    routes
+        .into_iter()
+        .filter(|(_, chemin, _)| !chemin.ends_with("/system/stop"))
+        .collect()
+}
+
+#[tokio::test]
+async fn sans_authentification_arret_et_greffons_refuses_depuis_le_reseau_local() {
+    let state = new_state();
+    for (m, chemin, corps) in actions_machine_gardees_a_leur_tour() {
+        let (st, _, rep) = appel_depuis(
+            &state,
+            AUTRE_HOTE_DU_LAN,
+            m.clone(),
+            chemin,
+            None,
+            corps,
+            &[],
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::FORBIDDEN,
+            "{m} {chemin} depuis le LAN : {rep}"
+        );
+        assert!(rep.contains("auth_required"), "{m} {chemin} : {rep}");
+        assert!(rep.contains("not_local"), "{m} {chemin} : {rep}");
+
+        // Relayé : vu de 127.0.0.1, émis ailleurs. Jamais local.
+        let (st, _, rep) = appel_depuis(
+            &state,
+            CETTE_MACHINE,
+            m.clone(),
+            chemin,
+            None,
+            corps,
+            &[("x-tune-relais", "1")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{m} {chemin} relayé : {rep}");
+    }
+    // Rien n'a été écrit par les appels refusés.
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    for cle in [
+        "plugin_greffon-inexistant-gardes_installed",
+        "plugin_greffon-inexistant-gardes_enabled",
+    ] {
+        assert_eq!(reglages.get(cle).ok().flatten(), None, "{cle}");
+    }
+}
+
+#[tokio::test]
+async fn sans_authentification_arret_et_greffons_acceptes_depuis_cette_machine() {
+    let state = new_state();
+    for adresse in [CETTE_MACHINE, "[::1]:50000"] {
+        for (m, chemin, corps) in sans_l_arret(actions_machine_gardees_a_leur_tour()) {
+            let (st, _, rep) =
+                appel_depuis(&state, adresse, m.clone(), chemin, None, corps, &[]).await;
+            assert!(
+                !rep.contains("auth_required"),
+                "{adresse} {m} {chemin} : {rep}"
+            );
+            assert_ne!(
+                st,
+                StatusCode::UNAUTHORIZED,
+                "{adresse} {m} {chemin} : {rep}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn avec_authentification_arret_et_greffons_exigent_l_administrateur() {
+    let state = new_state();
+    enable_auth(&state);
+    let standard = tok("user", 2);
+    for (m, chemin, corps) in actions_machine_gardees_a_leur_tour() {
+        // Depuis le réseau local comme depuis cette machine : le rôle décide.
+        for adresse in [AUTRE_HOTE_DU_LAN, CETTE_MACHINE] {
+            let (st, _, rep) = appel_depuis(
+                &state,
+                adresse,
+                m.clone(),
+                chemin,
+                Some(&standard),
+                corps,
+                &[],
+            )
+            .await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{adresse} {m} {chemin} : {rep}");
+            assert!(rep.contains("admin role required"), "{m} {chemin} : {rep}");
+            let (st, _, rep) =
+                appel_depuis(&state, adresse, m.clone(), chemin, None, corps, &[]).await;
+            assert_eq!(
+                st,
+                StatusCode::UNAUTHORIZED,
+                "{adresse} {m} {chemin} sans jeton : {rep}"
+            );
+        }
+    }
+    // L'administrateur passe la garde, y compris depuis un autre hôte du LAN.
+    let admin = tok("admin", 1);
+    for (m, chemin, corps) in sans_l_arret(actions_machine_gardees_a_leur_tour()) {
+        let (st, _, rep) = appel_depuis(
+            &state,
+            AUTRE_HOTE_DU_LAN,
+            m.clone(),
+            chemin,
+            Some(&admin),
+            corps,
+            &[],
+        )
+        .await;
+        assert_ne!(st, StatusCode::UNAUTHORIZED, "{m} {chemin} : {rep}");
+        assert!(!rep.contains("admin role required"), "{m} {chemin} : {rep}");
+        assert!(!rep.contains("auth_required"), "{m} {chemin} : {rep}");
+    }
+}
+
+/// Les drapeaux des greffons ne s'écrivent plus par l'écriture générique des
+/// réglages sans administrateur : ce serait la porte de côté des routes
+/// d'installation.
+#[tokio::test]
+async fn les_drapeaux_des_greffons_sont_des_reglages_proteges() {
+    let state = new_state();
+    for corps in [
+        r#"{"plugin_bandcamp_installed":"true"}"#,
+        r#"{"plugin_bandcamp_enabled":"true"}"#,
+        r#"{"plugin_bandcamp_hidden":"false"}"#,
+        r#"{"plugins":"[]"}"#,
+        // Greffons Premium retenus : la licence retrouvée les rallumerait.
+        r#"{"premium_audio_plugins_withheld_equalizer":"installed,enabled"}"#,
+        r#"{"premium_audio_plugins_migration_v1":""}"#,
+    ] {
+        let (st, rep) = appel(
+            &state,
+            Method::PATCH,
+            "/api/v1/system/config",
+            None,
+            Some(corps),
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{corps} : {rep}");
+        assert!(rep.contains("protected_settings"), "{corps} : {rep}");
+    }
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    assert_eq!(
+        reglages.get("plugin_bandcamp_installed").ok().flatten(),
+        None
+    );
+}
+
+/// Derrière un mandataire inverse local, tout appel arrive de 127.0.0.1 : la
+/// présence d'un en-tête de mandataire retire la preuve « cette machine ».
+#[tokio::test]
+async fn derriere_un_mandataire_le_bouclage_ne_vaut_plus_cette_machine() {
+    let state = new_state();
+    for (entete, valeur) in [
+        ("x-forwarded-for", "192.168.1.50"),
+        ("forwarded", "for=192.168.1.50"),
+        ("x-real-ip", "192.168.1.50"),
+        ("via", "1.1 caddy"),
+        ("cf-connecting-ip", "203.0.113.9"),
+        ("x-forwarded-host", "tune.example.org"),
+        ("x-forwarded-proto", "https"),
+        ("x-forwarded-port", "443"),
+        ("x-client-ip", "192.168.1.50"),
+        ("fastly-client-ip", "203.0.113.9"),
+        ("tailscale-user-login", "intrus@example.org"),
+        // Un `Host` qui ne nomme pas cette machine : relais TCP, proxy DSM…
+        ("host", "nas.local:8888"),
+        ("host", "192.168.1.10:8888"),
+    ] {
+        for (m, chemin, corps) in [
+            (Method::POST, "/api/v1/system/stop", None),
+            (
+                Method::POST,
+                "/api/v1/plugins/greffon-inexistant-gardes/install",
+                Some("{}"),
+            ),
+            (
+                Method::POST,
+                "/api/v1/auth/activation",
+                Some(r#"{"password":"tiers-1234"}"#),
+            ),
+        ] {
+            let (st, _, rep) = appel_depuis(
+                &state,
+                CETTE_MACHINE,
+                m.clone(),
+                chemin,
+                None,
+                corps,
+                &[(entete, valeur)],
+            )
+            .await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{entete} {m} {chemin} : {rep}");
+        }
+    }
+    assert!(!tune_server::auth::authentification_active(&state));
+    // Témoin : sans en-tête, la même machine passe la garde.
+    let (_, _, rep) = appel_depuis(
+        &state,
+        CETTE_MACHINE,
+        Method::POST,
+        "/api/v1/plugins/greffon-inexistant-gardes/install",
+        None,
+        Some("{}"),
+        &[],
+    )
+    .await;
+    assert!(!rep.contains("auth_required"), "{rep}");
+}
+
+#[test]
+fn un_mandataire_declare_retire_la_preuve_du_bouclage() {
+    use tune_server::auth::mandataire_declare;
+    assert!(!mandataire_declare(None, None));
+    assert!(!mandataire_declare(Some(""), Some(" , ")));
+    assert!(mandataire_declare(Some("https://tune.example.org"), None));
+    assert!(mandataire_declare(None, Some("tune.example.org")));
+}
+
+/// Changer l'apparence active pour tous : administrateur quand
+/// l'authentification est active.
+#[tokio::test]
+async fn le_theme_actif_exige_l_administrateur() {
+    let state = new_state();
+    enable_auth(&state);
+    let (st, rep) = appel(
+        &state,
+        Method::POST,
+        "/api/v1/skins/active",
+        Some(&tok("user", 2)),
+        Some(r#"{"skin_id":"theme-inexistant"}"#),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "{rep}");
+    assert!(rep.contains("admin role required"), "{rep}");
+    let (st, rep) = appel(
+        &state,
+        Method::POST,
+        "/api/v1/skins/active",
+        Some(&tok("admin", 1)),
+        Some(r#"{"skin_id":"theme-inexistant"}"#),
+    )
+    .await;
+    assert_eq!(st, StatusCode::NOT_FOUND, "{rep}");
+}
+
+/// Un `Host` de bouclage (avec ou sans port, IPv4, IPv6, `localhost`) reste
+/// « cette machine ».
+#[tokio::test]
+async fn un_host_de_bouclage_reste_cette_machine() {
+    let state = new_state();
+    for hote in [
+        "localhost:8888",
+        "127.0.0.1:8888",
+        "[::1]:8888",
+        "localhost",
+        "LOCALHOST.",
+    ] {
+        let (st, _, rep) = appel_depuis(
+            &state,
+            CETTE_MACHINE,
+            Method::POST,
+            "/api/v1/plugins/greffon-inexistant-gardes/install",
+            None,
+            Some("{}"),
+            &[("host", hote)],
+        )
+        .await;
+        assert!(!rep.contains("auth_required"), "{hote} : {st} {rep}");
+    }
+}
+
+#[test]
+fn les_noms_d_hote_de_bouclage() {
+    use tune_server::auth::hote_de_bouclage;
+    for oui in [
+        "localhost",
+        "localhost:8888",
+        "LOCALHOST",
+        "LocalHost:8888",
+        "localhost.",
+        "localhost.:8888",
+        "127.0.0.1",
+        "127.0.0.1:80",
+        "127.42.0.7:8888",
+        "[::1]",
+        "[::1]:8888",
+        "[0:0:0:0:0:0:0:1]:8888",
+    ] {
+        assert!(hote_de_bouclage(oui), "{oui}");
+    }
+    for non in [
+        "nas.local",
+        "nas.local:8888",
+        "192.168.1.10:8888",
+        "[fd00::4]:8888",
+        "localhost.example.org",
+        "localhost.evil",
+        "localhost.evil:8888",
+        "app.localhost",
+        "127.0.0.1.nip.io",
+        // Formes abrégées ou octales : refusées (le navigateur les normalise).
+        "127.1",
+        "0177.0.0.1",
+        "user@localhost",
+        "user@localhost:8888",
+        "[::1",
+        "",
+    ] {
+        assert!(!hote_de_bouclage(non), "{non}");
+    }
+}
+
+/// HTTP/1.0 n'est jamais « cette machine » : c'est l'empreinte de nginx par
+/// défaut (`proxy_http_version 1.0`, `Host` réécrit, sans `X-Forwarded-*`).
+/// HTTP/1.1 sans `Host` reste accepté.
+#[tokio::test]
+async fn http_1_0_n_est_jamais_cette_machine() {
+    let state = new_state();
+    let pair: SocketAddr = CETTE_MACHINE.parse().unwrap();
+    let envoyer = |version: axum::http::Version, hote: Option<&'static str>| {
+        let state = state.clone();
+        async move {
+            let app: Router = tune_server::routes::router(state).layer(MockConnectInfo(pair));
+            let mut req = Request::builder()
+                .method(Method::POST)
+                .uri("/api/v1/plugins/greffon-inexistant-gardes/install")
+                .version(version)
+                .header(header::CONTENT_TYPE, "application/json");
+            if let Some(h) = hote {
+                req = req.header(header::HOST, h);
+            }
+            let resp = app
+                .oneshot(req.body(Body::from("{}")).unwrap())
+                .await
+                .unwrap();
+            let st = resp.status();
+            let octets = axum::body::to_bytes(resp.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (st, String::from_utf8_lossy(&octets).to_string())
+        }
+    };
+    for hote in [None, Some("127.0.0.1"), Some("localhost:8888")] {
+        let (st, rep) = envoyer(axum::http::Version::HTTP_10, hote).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "HTTP/1.0 {hote:?} : {rep}");
+        assert!(rep.contains("not_local"), "{rep}");
+    }
+    let (_, rep) = envoyer(axum::http::Version::HTTP_11, None).await;
+    assert!(!rep.contains("auth_required"), "HTTP/1.1 sans Host : {rep}");
+    let (_, rep) = envoyer(axum::http::Version::HTTP_11, Some("localhost:8888")).await;
+    assert!(
+        !rep.contains("auth_required"),
+        "HTTP/1.1 Host localhost : {rep}"
+    );
+}
+
+/// Un compte standard qui appelle `sso/disconnect` ne délie que SON profil :
+/// jamais le compte relié au serveur, jamais un autre profil.
+#[tokio::test]
+async fn un_compte_standard_ne_delie_que_son_propre_profil() {
+    let state = new_state();
+    enable_auth(&state);
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    // Le serveur est relié ; les profils 2 et 3 aussi, chacun au sien.
+    reglages
+        .set("mozaik_access_token", "JETON-DU-SERVEUR-FAUX")
+        .unwrap();
+    reglages
+        .set("mozaik_user", r#"{"email":"proprio@example.org"}"#)
+        .unwrap();
+    reglages
+        .set("mozaik_compte_profil_2", r#"{"email":"deux@example.org"}"#)
+        .unwrap();
+    reglages
+        .set("mozaik_compte_profil_3", r#"{"email":"trois@example.org"}"#)
+        .unwrap();
+    let (st, rep) = appel(
+        &state,
+        Method::POST,
+        "/api/v1/cloud/sso/disconnect",
+        Some(&tok("user", 2)),
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{rep}");
+    assert!(rep.contains("\"scope\":\"profile\""), "{rep}");
+    assert_eq!(
+        reglages.get("mozaik_compte_profil_2").unwrap(),
+        None,
+        "son profil est délié"
+    );
+    assert!(
+        reglages.get("mozaik_compte_profil_3").unwrap().is_some(),
+        "l'autre profil reste relié"
+    );
+    assert_eq!(
+        reglages.get("mozaik_access_token").unwrap().as_deref(),
+        Some("JETON-DU-SERVEUR-FAUX"),
+        "le serveur reste relié"
+    );
+    assert!(
+        reglages.get("mozaik_user").unwrap().is_some(),
+        "le compte du serveur reste"
+    );
+    // Sans jeton : 401, rien ne bouge.
+    let (st, _) = appel(
+        &state,
+        Method::POST,
+        "/api/v1/cloud/sso/disconnect",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(st, StatusCode::UNAUTHORIZED);
+    assert!(reglages.get("mozaik_compte_profil_3").unwrap().is_some());
 }

@@ -40,6 +40,9 @@
 //! d'un service) est refusé (403 `parental_content_blocked`) quand l'appelant
 //! se nomme (`X-Profile-Id` ou session) : un renderer qui tire le flux sans
 //! se nommer joue ce que l'orchestrateur, gardé lui aussi, lui a envoyé.
+//! #9207 — une URI de cette bibliothèque reçue par le MediaRenderer de Tune
+//! ne repasse pas par cette route : la piste reconnue est traitée en piste
+//! locale de bout en bout par l'orchestrateur, règles de zone comprises.
 //!
 //! Le profil appelant est celui d'[`ActiveProfile`] : avec l'authentification
 //! active, celui du compte connecté.

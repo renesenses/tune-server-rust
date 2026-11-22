@@ -52,6 +52,10 @@ pub struct QueueSnapshot {
 /// One entry of the ordered unified queue snapshot (local or streaming).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct QueueSnapshotItem {
+    /// #8788 — format de la source UPnP ; absent des anciens instantanés.
+    pub media_format: Option<String>,
+    pub sample_rate: Option<u32>,
+    pub bit_depth: Option<u32>,
     pub track_id: Option<i64>,
     pub source: Option<String>,
     pub source_id: Option<String>,
@@ -118,6 +122,10 @@ impl From<ContexteSauvegarde> for crate::db::contexte_de_file::ContexteDeFile {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StreamingQueueEntry {
+    /// #8788 — format de la source UPnP ; absent des anciens instantanés.
+    pub media_format: Option<String>,
+    pub sample_rate: Option<u32>,
+    pub bit_depth: Option<u32>,
     pub source_id: String,
     pub title: String,
     pub artist_name: String,
@@ -220,6 +228,13 @@ pub fn save_queue_avec_ordre_d_origine(
     let streaming_tracks: Vec<StreamingQueueEntry> = streaming_items
         .iter()
         .map(|item| StreamingQueueEntry {
+            media_format: item["media_format"].as_str().map(String::from),
+            sample_rate: item["sample_rate"]
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok()),
+            bit_depth: item["bit_depth"]
+                .as_u64()
+                .and_then(|v| u32::try_from(v).ok()),
             source_id: item["source_id"].as_str().unwrap_or_default().to_string(),
             title: item["title"].as_str().unwrap_or_default().to_string(),
             artist_name: item["artist_name"].as_str().unwrap_or_default().to_string(),
@@ -248,6 +263,9 @@ pub fn save_queue_avec_ordre_d_origine(
         .iter()
         .zip(contextes)
         .map(|(e, contexte)| QueueSnapshotItem {
+            media_format: e.format.clone(),
+            sample_rate: e.sample_rate.and_then(|v| u32::try_from(v).ok()),
+            bit_depth: e.bit_depth.and_then(|v| u32::try_from(v).ok()),
             contexte,
             track_id: e.track_id,
             source: e.source.clone(),
@@ -476,6 +494,9 @@ pub fn restore_all_queues(db: &Arc<dyn DbBackend>, db_path: &str) -> BilanRestau
                     }
                 } else if let Some(sid) = &it.source_id {
                     inputs.push(QueueInput::Streaming {
+                        media_format: it.media_format.clone(),
+                        sample_rate: it.sample_rate,
+                        bit_depth: it.bit_depth,
                         source: it.source.clone().unwrap_or_else(|| "streaming".into()),
                         source_id: sid.clone(),
                         title: it.title.clone().unwrap_or_default(),
@@ -499,6 +520,9 @@ pub fn restore_all_queues(db: &Arc<dyn DbBackend>, db_path: &str) -> BilanRestau
             }
             for t in &snapshot.streaming_tracks {
                 inputs.push(QueueInput::Streaming {
+                    media_format: t.media_format.clone(),
+                    sample_rate: t.sample_rate,
+                    bit_depth: t.bit_depth,
                     source: t.source.clone().unwrap_or_else(|| "streaming".into()),
                     source_id: t.source_id.clone(),
                     title: t.title.clone(),
@@ -665,6 +689,9 @@ mod tests {
             local_track_ids: vec![10, 20, 30],
             current_position: 1,
             streaming_tracks: vec![StreamingQueueEntry {
+                media_format: None,
+                sample_rate: None,
+                bit_depth: None,
                 source_id: "tidal:123".into(),
                 title: "Song".into(),
                 artist_name: "Artist".into(),
@@ -821,6 +848,9 @@ mod tests {
             &[
                 QueueInput::Local { track_id: 1 },
                 QueueInput::Streaming {
+                    media_format: None,
+                    sample_rate: None,
+                    bit_depth: None,
                     source: "qobuz".into(),
                     source_id: "q1".into(),
                     title: "Q1".into(),
@@ -941,5 +971,61 @@ mod tests {
             bilan.pistes_restaurees,
             bilan.pistes_absentes,
         )
+    }
+    #[test]
+    fn l_instantane_de_file_garde_le_format_upnp_au_redemarrage_8788() {
+        for ancien_format in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let chemin = dir.path().join("tune.db");
+            let chemin = chemin.to_str().unwrap();
+            let sqlite = SqliteDb::open_in_memory().unwrap();
+            sqlite.init_schema().unwrap();
+            crate::db::migrations::run_migrations(&sqlite).unwrap();
+            let db: Arc<dyn DbBackend> = Arc::new(sqlite);
+            db.execute(
+                "INSERT INTO zones (id, name, output_type) VALUES (1, 'Banc', 'browser')",
+                &[],
+            )
+            .unwrap();
+            let entree: QueueInput = serde_json::from_value(serde_json::json!({"Streaming": {
+                "source": "upnp", "source_id": "http://127.0.0.1:9/suivante.wav",
+                "title": "Suivante", "artist": "Banc", "album": null, "cover_url": null,
+                "duration_ms": 1000, "track_number": null, "disc_number": null,
+                "album_ref": null, "artist_ref": null,
+                "media_format": "wav", "sample_rate": 705600, "bit_depth": 24
+            }}))
+            .unwrap();
+            let repo = PlayQueueRepo::with_backend(db.clone());
+            repo.append(1, &[entree]).unwrap();
+            save_queue(
+                &db,
+                chemin,
+                1,
+                &ZoneState {
+                    zone_id: 1,
+                    queue_length: 1,
+                    ..Default::default()
+                },
+            );
+            if ancien_format {
+                let fichier = queue_file_path(chemin, 1);
+                let mut json: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&fichier).unwrap()).unwrap();
+                json["items"] = serde_json::json!([]);
+                std::fs::write(fichier, serde_json::to_vec(&json).unwrap()).unwrap();
+            }
+            repo.clear(1).unwrap();
+            let bilan = restore_all_queues(&db, chemin);
+            assert_eq!(bilan.zones_en_echec, 0);
+            let file = repo.get_ordered(1).unwrap();
+            assert_eq!(file.len(), 1);
+            assert_eq!(
+                file[0].format.as_deref(),
+                Some("wav"),
+                "#8788 : l'instantané efface le format UPnP au redémarrage (ancien={ancien_format})"
+            );
+            assert_eq!(file[0].sample_rate, Some(705600));
+            assert_eq!(file[0].bit_depth, Some(24));
+        }
     }
 }

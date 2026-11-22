@@ -12,6 +12,7 @@
 //! son drapeau qu'à l'ouverture (`prendre_le_depart_muet`).
 
 use super::*;
+use crate::outputs::airplay::AirplayOutput;
 use crate::outputs::airplay2::Airplay2Output;
 use crate::outputs::airplay2::volume_de_depart_8402::pure_verrouille;
 use crate::outputs::traits::OutputTarget;
@@ -24,7 +25,7 @@ pub(super) fn charge_du_depart_muet(zone_id: i64) -> serde_json::Value {
     serde_json::json!({
         "zone_id": zone_id,
         "code": CODE_DEPART_A_ZERO_PURE,
-        "error": "AirPlay 2: this zone's volume is locked by PURE, so playback started \
+        "error": "AirPlay: this zone's volume is locked by PURE, so playback started \
                   at 0 % to protect your ears and speakers. Turn the volume up on the \
                   device or in Tune.",
         // La zone JOUE : seul le niveau de départ est en cause.
@@ -42,16 +43,30 @@ impl PlaybackOrchestrator {
     ) {
         if let Some(airplay2) = sortie.as_any().downcast_ref::<Airplay2Output>() {
             airplay2.tenir_le_volume_de_la_zone(pure_verrouille(&self.db, zone_id));
+        } else if let Some(airplay) = sortie.as_any().downcast_ref::<AirplayOutput>() {
+            // #8855 (GO du 20/11) — AirPlay 1 : mêmes règles PURE, et le
+            // volume fixe garde son comportement #2395.
+            let volume_fixe = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .is_some_and(|zone| zone.fixed_volume);
+            airplay.regler_selon_la_zone(pure_verrouille(&self.db, zone_id), volume_fixe);
         }
     }
 
     /// Après une piste partie : la session s'est-elle ouverte à 0 % ? Le
     /// dire à toutes les télécommandes.
     pub(super) fn dire_le_depart_muet_d_airplay2(&self, zone_id: i64, sortie: &dyn OutputTarget) {
-        let Some(airplay2) = sortie.as_any().downcast_ref::<Airplay2Output>() else {
-            return;
+        let depart_muet = if let Some(airplay2) = sortie.as_any().downcast_ref::<Airplay2Output>() {
+            airplay2.prendre_le_depart_muet()
+        } else if let Some(airplay) = sortie.as_any().downcast_ref::<AirplayOutput>() {
+            // #8855 — AirPlay 1, même annonce.
+            airplay.prendre_le_depart_muet()
+        } else {
+            false
         };
-        if !airplay2.prendre_le_depart_muet() {
+        if !depart_muet {
             return;
         }
         warn!(zone_id, "airplay2_depart_a_zero_annonce");

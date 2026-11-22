@@ -55,6 +55,49 @@ pub fn message_peripherique_introuvable(demande: &str, flux: &str) -> String {
     )
 }
 
+/// #8171 (retour rc12, fil 2708) — le NOM de la zone désigne-t-il désormais
+/// un AUTRE endpoint WASAPI que le sien ?
+///
+/// Le cas : Windows nomme « Haut-parleurs » aussi bien la carte Realtek que
+/// le DAC USB sous son pilote générique. La zone du DAC a été créée DAC
+/// allumé, sous « Haut-parleurs », et connaît l'identifiant de son endpoint.
+/// DAC éteint, cet identifiant manque à l'énumération ; l'appariement par
+/// identifiant échoue, et celui par NOM retrouve… les haut-parleurs du PC,
+/// seuls à porter encore ce nom. La zone du DAC jouait donc sur les
+/// haut-parleurs, bien que la rc12 ait supprimé le repli sur la sortie par
+/// défaut : ce n'était pas un repli, c'était un homonyme.
+///
+/// Un identifiant WASAPI (`wasapi:{0.0.0.00000000}.{guid}`) ne désigne
+/// jamais un autre endpoint (voir `outputs::identite_de_sortie`) : un nom qui
+/// mène à un AUTRE identifiant, pendant que celui de la zone est absent, mène
+/// à un autre appareil. La règle ne mord que dans ce cas précis :
+///
+/// - la zone connaît un identifiant WASAPI, absent de l'énumération ;
+/// - la candidate retenue par le nom porte un identifiant WASAPI différent.
+///
+/// Identifiant inconnu, d'une autre famille (ALSA, ASIO, CoreAudio) ou
+/// présent : `false`, la résolution d'avant est inchangée.
+pub fn le_nom_designe_un_autre_endpoint<'a>(
+    endpoint_de_la_zone: Option<&str>,
+    endpoint_retenu_par_le_nom: &str,
+    endpoints_presents: impl IntoIterator<Item = &'a str>,
+) -> bool {
+    let est_wasapi = |id: &str| id.trim().to_ascii_lowercase().starts_with("wasapi:");
+    let Some(zone) = endpoint_de_la_zone
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && est_wasapi(id))
+    else {
+        return false;
+    };
+    let retenu = endpoint_retenu_par_le_nom.trim();
+    if retenu.is_empty() || !est_wasapi(retenu) || retenu.eq_ignore_ascii_case(zone) {
+        return false;
+    }
+    !endpoints_presents
+        .into_iter()
+        .any(|present| present.trim().eq_ignore_ascii_case(zone))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -138,6 +181,90 @@ mod tests {
         assert!(
             refus.contains("audio_device_not_found_refused"),
             "#8171 : le refus doit être journalisé, avec la liste des périphériques vus"
+        );
+    }
+
+    const DAC: &str = "wasapi:{0.0.0.00000000}.{dac-denafrips}";
+    const REALTEK: &str = "wasapi:{0.0.0.00000000}.{realtek}";
+
+    /// LE témoin du retour rc12 : DAC éteint, sa zone « Haut-parleurs »
+    /// connaît l'endpoint du DAC, et seul le Realtek porte encore ce nom.
+    #[test]
+    fn dac_eteint_le_nom_ne_mene_plus_qu_aux_haut_parleurs_du_pc_8171() {
+        assert!(le_nom_designe_un_autre_endpoint(
+            Some(DAC),
+            REALTEK,
+            [REALTEK]
+        ));
+    }
+
+    /// CONTRE-ÉPREUVES : la résolution d'avant, inchangée.
+    #[test]
+    fn hors_du_cas_precis_la_resolution_par_nom_est_inchangee_8171() {
+        // DAC allumé : son identifiant est présent (l'appariement par
+        // identifiant a d'ailleurs déjà gagné).
+        assert!(!le_nom_designe_un_autre_endpoint(
+            Some(DAC),
+            REALTEK,
+            [REALTEK, DAC]
+        ));
+        // Même endpoint des deux côtés.
+        assert!(!le_nom_designe_un_autre_endpoint(Some(DAC), DAC, [REALTEK]));
+        // La zone ne connaît pas d'identifiant (zone d'avant #2269).
+        assert!(!le_nom_designe_un_autre_endpoint(None, REALTEK, [REALTEK]));
+        assert!(!le_nom_designe_un_autre_endpoint(
+            Some("  "),
+            REALTEK,
+            [REALTEK]
+        ));
+        // Familles dont l'identifiant n'identifie pas l'appareil.
+        assert!(!le_nom_designe_un_autre_endpoint(
+            Some("alsa:hw:CARD=2,DEV=0"),
+            "alsa:hw:CARD=3,DEV=0",
+            ["alsa:hw:CARD=3,DEV=0"]
+        ));
+        assert!(!le_nom_designe_un_autre_endpoint(
+            Some("asio:Combo384 ASIO 1.03"),
+            "asio:Realtek ASIO",
+            ["asio:Realtek ASIO"]
+        ));
+        // Candidate sans identifiant : on ne conclut rien.
+        assert!(!le_nom_designe_un_autre_endpoint(Some(DAC), "", [""]));
+    }
+
+    /// GARDE DE SITE — la règle est consultée par l'ouverture partagée ET par
+    /// la disponibilité (#8173 : une seule règle pour les deux), sous la
+    /// conduite Windows, et seulement pour un appariement qui n'est pas celui
+    /// de l'identifiant.
+    #[test]
+    fn ouverture_et_disponibilite_consultent_la_regle_de_l_homonyme_8171() {
+        let source = include_str!("local/resolution.rs");
+        let corps_de = |fonction: &str| -> &str {
+            let debut = source.find(fonction).expect(fonction);
+            let corps = &source[debut..];
+            &corps[..corps.find("\n}\n").expect("fin de fonction")]
+        };
+        for fonction in [
+            "pub(super) fn find_device_with_fallback(",
+            "pub(super) fn zone_locale_disponible(",
+        ] {
+            assert!(
+                corps_de(fonction).contains("homonyme_d_un_autre_endpoint("),
+                "{fonction} ne consulte pas la règle de l'homonyme"
+            );
+        }
+        let regle = corps_de("fn homonyme_d_un_autre_endpoint(");
+        assert!(
+            regle.contains("le_nom_designe_un_autre_endpoint("),
+            "{regle}"
+        );
+        assert!(
+            regle.contains("DeviceMatch::ByEndpointId"),
+            "l'appariement par identifiant doit rester souverain"
+        );
+        assert!(
+            regle.contains("conduite_si_introuvable(std::env::consts::OS)"),
+            "la règle ne vaut que sous la conduite Windows (refus)"
         );
     }
 }

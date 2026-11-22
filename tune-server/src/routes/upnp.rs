@@ -15,7 +15,8 @@ pub fn router() -> Router<AppState> {
 /// GET /api/v1/upnp/status — report whether the UPnP MediaServer is active.
 async fn upnp_status(State(state): State<AppState>) -> Json<serde_json::Value> {
     let upnp = state.upnp.as_ref();
-    let enabled = upnp.is_some();
+    // #9079 — monté ne veut pas dire en service : l'interrupteur décide.
+    let enabled = upnp.is_some_and(|u| u.annonce.est_actif());
     let uuid = upnp.map(|u| u.uuid.clone()).unwrap_or_default();
     let friendly_name = upnp
         .map(|u| u.friendly_name.clone())
@@ -55,6 +56,16 @@ async fn set_upnp_config(
         settings
             .set("upnp_enabled", if enabled { "true" } else { "false" })
             .ok();
+        // #9079 — la bascule prend effet tout de suite, et non plus au
+        // redémarrage : routes /upnp en 404, plus de réponse aux M-SEARCH et
+        // `ssdp:byebye` des trois identités quand on coupe ; l'annonceur
+        // reprend ses NOTIFY quand on rallume.
+        if let Some(ref upnp) = state.upnp
+            && upnp.annonce.basculer(enabled)
+            && !enabled
+        {
+            tune_core::upnp_server::retirer_du_reseau().await;
+        }
     }
     if let Some(name) = body.get("friendly_name").and_then(|v| v.as_str()) {
         settings.set("upnp_friendly_name", name).ok();

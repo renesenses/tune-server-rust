@@ -43,6 +43,10 @@ impl PositionPoller {
         let fin_sur_erreur = crate::playback::radio_fin_de_file::prendre_fin_sur_erreur(zone_id);
         if !fin_sur_erreur {
             self.noter_la_ligne_courante_jouee(zone_id, zone_state.queue_position);
+            // #9143 — la fin naturelle achève la piste, même courte ou
+            // passée entre deux relevés du sondeur.
+            self.orchestrator
+                .noter_piste_achevee_pour_le_sas(zone_state, true);
         }
 
         let Some(next_pos) = Self::next_position(zone_state) else {
@@ -76,10 +80,7 @@ impl PositionPoller {
         // 108 items still queued, leaving nothing but a WARN behind. Walk
         // forward over the dead items, announce each one, and stop only when
         // the queue really is exhausted (or the failures look systemic).
-        if self
-            .avancer_avec_reprises(zone_id, zone_state, next_pos)
-            .await
-        {
+        if Box::pin(self.avancer_avec_reprises(zone_id, zone_state, next_pos)).await {
             return;
         }
         self.orchestrator.stop(zone_id, device_id.as_deref()).await;
@@ -186,9 +187,9 @@ impl PositionPoller {
             return;
         }
         let mode = ZoneRepo::with_backend(self.db.clone()).get_autoplay_mode(zone_id);
-        // Fil 2694 (Ilan) — la radio de fin de file, activée par défaut depuis
-        // la rc12, ne s'invite pas là où la fin est voulue (« Vider la
-        // file », réveil), ni après une piste en ERREUR, ni sur une zone qui
+        // Fil 2694 (Ilan) — la radio de fin de file (activée par défaut en
+        // rc12, désactivée par défaut depuis #8974) ne s'invite pas là où
+        // la fin est voulue (« Vider la file », réveil), ni après une piste en ERREUR, ni sur une zone qui
         // en SUIT une autre (la meneuse lance la radio, le relais la
         // propage), ni quand le lot précédent n'a joué aucun titre en entier,
         // ni sous contrôle parental. Les consignes de fin sont consommées
@@ -392,7 +393,9 @@ impl PositionPoller {
                         crate::db::play_queue_repo::PlayQueueRepo::with_backend(self.db.clone());
                     if queue_repo.append_tracks(zone_id, &ids).is_ok() {
                         let new_pos = zone_state.queue_position + 1;
-                        if let Err(e) = self.orchestrator.play_from_queue(zone_id, new_pos).await {
+                        if let Err(e) =
+                            Box::pin(self.orchestrator.play_from_queue(zone_id, new_pos)).await
+                        {
                             warn!(zone_id, error = %e, "autoplay_play_failed");
                             self.orchestrator.stop(zone_id, device_id).await;
                         }
@@ -455,7 +458,9 @@ impl PositionPoller {
                         source = %source,
                         "autoplay_streaming_radio_started_preferred"
                     );
-                    if let Err(e) = self.orchestrator.play_from_queue(zone_id, new_pos).await {
+                    if let Err(e) =
+                        Box::pin(self.orchestrator.play_from_queue(zone_id, new_pos)).await
+                    {
                         warn!(zone_id, error = %e, "autoplay_play_failed");
                         self.orchestrator.stop(zone_id, device_id).await;
                     }
@@ -529,7 +534,9 @@ impl PositionPoller {
                         source = %source,
                         "autoplay_streaming_radio_started"
                     );
-                    if let Err(e) = self.orchestrator.play_from_queue(zone_id, new_pos).await {
+                    if let Err(e) =
+                        Box::pin(self.orchestrator.play_from_queue(zone_id, new_pos)).await
+                    {
                         warn!(zone_id, error = %e, "autoplay_play_failed");
                         self.orchestrator.stop(zone_id, device_id).await;
                     }
@@ -570,7 +577,8 @@ impl PositionPoller {
                 // Play the first generated track (next position after current)
                 let new_pos = zone_state.queue_position + 1;
                 info!(zone_id, new_pos, "autoplay_starting_generated_track");
-                if let Err(e) = self.orchestrator.play_from_queue(zone_id, new_pos).await {
+                if let Err(e) = Box::pin(self.orchestrator.play_from_queue(zone_id, new_pos)).await
+                {
                     warn!(zone_id, error = %e, "autoplay_play_failed");
                     self.orchestrator.stop(zone_id, device_id).await;
                 }
@@ -664,7 +672,7 @@ impl PositionPoller {
             count = items.len(),
             "radio_artiste_rechargee"
         );
-        if let Err(e) = self.orchestrator.play_from_queue(zone_id, position).await {
+        if let Err(e) = Box::pin(self.orchestrator.play_from_queue(zone_id, position)).await {
             warn!(zone_id, error = %e, "radio_artiste_lecture_echouee");
             self.orchestrator.stop(zone_id, device_id).await;
         }
@@ -720,7 +728,7 @@ impl PositionPoller {
                     );
                 }
                 let ajoutees = ids.len();
-                match self.orchestrator.play_from_queue(zone_id, position).await {
+                match Box::pin(self.orchestrator.play_from_queue(zone_id, position)).await {
                     Ok(_) => return ajoutees,
                     Err(e) => {
                         warn!(zone_id, mode = mode.as_str(), error = %e, "autoplay_play_failed");
@@ -786,10 +794,11 @@ impl PositionPoller {
         let mut skipped = 0u32;
         let mut injouables = 0u32;
         loop {
-            match self
-                .orchestrator
-                .play_from_queue_en_fin_de_piste(zone_id, attempt_pos)
-                .await
+            match Box::pin(
+                self.orchestrator
+                    .play_from_queue_en_fin_de_piste(zone_id, attempt_pos),
+            )
+            .await
             {
                 Ok(_) => {
                     if skipped > 0 {
@@ -1025,7 +1034,7 @@ impl PositionPoller {
             etat = ?status.state,
             position_ms = status.position_ms,
             position_figee_ms = adoption.position_figee_ms,
-            uri = ?status.current_uri,
+            uri = ?status.current_uri.as_deref().map(crate::confidentialite::masquer_url),
             stream_id = %adoption.flux,
             octets_tires = ?octets_tires,
             octets_depuis_adoption = ?octets_depuis_adoption,
@@ -1104,7 +1113,7 @@ impl PositionPoller {
             wall_secs = wall_elapsed,
             past_end_ticks = ps.past_end_ticks,
             stream_id = %flux,
-            uri = ?status.current_uri,
+            uri = ?status.current_uri.as_deref().map(crate::confidentialite::masquer_url),
             octets_tires = ?octets_tires,
             preuve = ?preuve,
             arm_to_advance_ms = ps
@@ -1135,10 +1144,8 @@ impl PositionPoller {
         {
             Some(next_pos) => {
                 info!(zone_id, next_pos, "gapless_advance_metadata");
-                if let Err(e) = self
-                    .orchestrator
-                    .advance_queue_metadata(zone_id, next_pos)
-                    .await
+                if let Err(e) =
+                    Box::pin(self.orchestrator.advance_queue_metadata(zone_id, next_pos)).await
                 {
                     warn!(zone_id, error = %e, "gapless_advance_failed");
                 }
@@ -1166,7 +1173,7 @@ impl PositionPoller {
                 });
             }
             None => {
-                self.handle_track_end(zone_id, zone_state).await;
+                Box::pin(self.handle_track_end(zone_id, zone_state)).await;
             }
         }
     }
@@ -1211,7 +1218,7 @@ impl PositionPoller {
         warn!(
             zone_id,
             position_ms = status.position_ms,
-            uri = ?status.current_uri,
+            uri = ?status.current_uri.as_deref().map(crate::confidentialite::masquer_url),
             flux_fini = ?flux_fini,
             flux_arme = ?flux_arme,
             "gapless_retombee_sur_la_piste_finie_surveillee"
@@ -1353,23 +1360,21 @@ impl PositionPoller {
             }
         };
         if prefers_local_file {
-            return self
-                .armer_le_fichier_local(zone_id, next_pos, device_id, arme)
-                .await;
+            return Box::pin(self.armer_le_fichier_local(zone_id, next_pos, device_id, arme)).await;
         }
 
         // v0.9 gapless characterization: time the next-track resolution and
         // surface failures at warn. These paths were debug-only, so streaming
         // gapless instability (Tidal DASH download slowness, URL/token issues)
         // was invisible in production journald. Logging only — no behaviour change.
-        self.armer_le_flux_suivant(
+        Box::pin(self.armer_le_flux_suivant(
             zone_id,
             next_pos,
             device_id,
             arme,
             consigne_de_fondu,
             fin_estimee,
-        )
+        ))
         .await
     }
 
@@ -1587,7 +1592,9 @@ impl PositionPoller {
                     // end-of-track instead (a small gap, never a cut). Local
                     // output keeps its internal DSD gapless chain untouched.
                     //
-                    // #6910 — sauf renderer qui annonce le DSD (GetProtocolInfo)
+                    // #6910 — sauf renderer qui annonce le DSD (GetProtocolInfo),
+                    // ou reçoit le DSD brut parce que la zone est en « natif »
+                    // (#8969, Eversolo DMP-A8),
                     // ET `SetNextAVTransportURI` (SCPD) et n'a pas déjà lâché un
                     // suivant DSD : le blanc entre deux pistes enchaînées sur le
                     // disque (fil 2412). Un renderer qui annonce tout et ne suit
@@ -1606,7 +1613,7 @@ impl PositionPoller {
                             // réponse ou SCPD jamais lu par Tune.
                             if let Some(refus) = self
                                 .orchestrator
-                                .refus_dsd_suivant_sur_dlna(device_id, annonce_suivante)
+                                .refus_dsd_suivant_sur_dlna(zone_id, device_id, annonce_suivante)
                                 .await
                             {
                                 info!(
@@ -1623,7 +1630,7 @@ impl PositionPoller {
                                 zone_id,
                                 device_id,
                                 mime = %resolved.mime_type,
-                                "gapless_dsd_next_dlna_arme — le renderer annonce le DSD et SetNextAVTransportURI"
+                                "gapless_dsd_next_dlna_arme — le renderer reçoit le DSD brut (annoncé, ou zone en « natif ») et annonce SetNextAVTransportURI"
                             );
                             dsd_arme = true;
                         }
@@ -1750,7 +1757,7 @@ impl PositionPoller {
         if tenue == crate::outputs::traits::SuivantePreparee::Perdue {
             notes.remove(&zone_id);
             drop(notes);
-            self.retenir_dsd_suivant_lache(zone_id, device_id, "suivante_perdue");
+            self.retenir_dsd_suivant_lache(zone_id, device_id, "suivante_perdue", true);
             return;
         }
         notes.insert(zone_id, device_id.to_string());
@@ -1765,18 +1772,64 @@ impl PositionPoller {
             .unwrap_or_else(|e| e.into_inner())
             .remove(&zone_id);
         if let Some(appareil) = appareil {
-            self.retenir_dsd_suivant_lache(zone_id, &appareil, "avance_bloquee");
+            self.retenir_dsd_suivant_lache(zone_id, &appareil, "avance_bloquee", false);
         }
     }
 
-    fn retenir_dsd_suivant_lache(&self, zone_id: i64, device_id: &str, motif: &str) {
-        if self.orchestrator.retenir_dsd_suivant_lache(device_id) {
+    /// #9206 — le suivant armé de `zone_id` a été SUIVI (le renderer y est
+    /// passé sans `Play`) : si c'était un suivant DSD sur DLNA, l'appareil
+    /// est blanchi — échecs et récidive oubliés. Deux faux échecs séparés
+    /// par des transitions réussies ne font pas un récidiviste.
+    pub(super) fn constater_le_suivant_suivi(&self, zone_id: i64) {
+        let appareil = self
+            .dsd_suivant_arme
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&zone_id);
+        if let Some(appareil) = appareil
+            && self.orchestrator.noter_succes_dsd_suivant(&appareil)
+        {
             info!(
+                zone_id,
+                device_id = %appareil,
+                "gapless_dsd_next_dlna_suivi — échecs de suivant DSD oubliés (#9206)"
+            );
+        }
+    }
+
+    fn retenir_dsd_suivant_lache(
+        &self,
+        zone_id: i64,
+        device_id: &str,
+        motif: &str,
+        immediat: bool,
+    ) {
+        use crate::playback::gapless::IssueEchecDsdSuivant;
+        match self
+            .orchestrator
+            .retenir_dsd_suivant_lache(device_id, immediat)
+        {
+            IssueEchecDsdSuivant::Note { echecs } => info!(
                 zone_id,
                 device_id,
                 motif,
-                "gapless_dsd_next_dlna_non_suivi — garde DSD rendue à cet appareil jusqu'au redémarrage"
-            );
+                echecs,
+                "gapless_dsd_next_dlna_echec_note — suivant DSD encore tenté (#9206)"
+            ),
+            IssueEchecDsdSuivant::GardeRendue {
+                echecs,
+                garde,
+                duree,
+            } => info!(
+                zone_id,
+                device_id,
+                motif,
+                echecs,
+                garde,
+                duree_secs = duree.as_secs(),
+                "gapless_dsd_next_dlna_non_suivi — garde DSD rendue à cet appareil, réessai après le délai"
+            ),
+            IssueEchecDsdSuivant::DejaGarde => {}
         }
     }
 }

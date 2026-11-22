@@ -79,8 +79,13 @@ async fn get_artist_bio(client: &reqwest::Client, artist: &str, api_key: &str) -
 }
 
 fn strip_html(s: &str) -> String {
-    let re = regex::Regex::new(r"<[^>]+>").unwrap();
-    re.replace_all(s, "").trim().to_string()
+    // Last.fm sépare aussi les paragraphes par des sauts de ligne bruts.
+    // Les protéger avant le convertisseur HTML, qui replie les lignes source.
+    let html = s
+        .replace("\r\n", "\n")
+        .replace('\r', "\n")
+        .replace('\n', "<br>");
+    crate::streaming::presentation_album::texte_de_presentation(&html).unwrap_or_default()
 }
 
 pub struct LastfmEnricher {
@@ -263,5 +268,33 @@ mod tests {
     async fn no_title_no_tags() {
         let tags = get_lastfm_tags("", "Artist", "fake-key").await;
         assert!(tags.tags.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod entites_resume_8735_tests {
+    #[test]
+    fn paragraphes_lastfm_preserves_8735() {
+        for brut in [
+            "Para 1.\n\nPara 2 &amp; fin",
+            "Para 1.\r\n\r\nPara 2 &amp; fin",
+        ] {
+            assert_eq!(
+                super::strip_html(brut),
+                "Para 1.\n\nPara 2 & fin",
+                "les deux paragraphes Last.fm doivent rester distincts"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_lastfm_decode_8735() {
+        assert_eq!(
+            super::strip_html(
+                "<b>Simon &amp; Garfunkel</b> : &eacute; &#233; &#xE9; &amp sans point ; &amp;amp; &inconnue;"
+            ),
+            "Simon & Garfunkel : é é é & sans point ; &amp; &inconnue;",
+            "entités Last.fm encore présentes dans le résumé"
+        );
     }
 }

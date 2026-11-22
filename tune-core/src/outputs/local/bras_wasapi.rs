@@ -111,6 +111,12 @@ pub(super) struct EntreesWasapi {
     pub(super) track_artist: Arc<std::sync::Mutex<Option<String>>>,
     pub(super) duration_ms: Arc<AtomicU64>,
     pub(super) seek_offset_ms: Arc<AtomicU64>,
+    /// #8869 — le silence de verrouillage dont le flux est précédé.
+    pub(super) silence_de_verrouillage:
+        crate::audio::silence_de_verrouillage::SilenceDeVerrouillage,
+    /// #8696 — la période WASAPI exclusive réglée sur la zone, en ms ; `0` =
+    /// Auto. Lue UNE fois par piste par `play_url`.
+    pub(super) reglage_periode_ms: u32,
 }
 
 /// WASAPI en mode exclusif événementiel : le backend de tous les DAC Windows
@@ -160,13 +166,14 @@ impl BackendWasapi<'_> {
     }
 }
 
-impl<'a> BackendLocal<'a> for BackendWasapi<'a> {
-    /// `WasapiExclusiveOutput::new` : résolution de l'endpoint,
-    /// `Initialize(EXCLUSIVE | EVENTCALLBACK)` au format source, avec la
-    /// reprise alignée de #2208. Un refus est
-    /// [`RefusDOuverture::OuvertureExclusiveRefusee`] pour `"WASAPI"` — le
-    /// même `record_exclusive_open_failure` qu'avant, par `rapporter`.
-    fn ouvrir(demande: &DemandeDOuverture<'a>) -> Result<Self, RefusDOuverture> {
+impl<'a> BackendWasapi<'a> {
+    /// [`BackendLocal::ouvrir`], à la période WASAPI exclusive réglée sur la
+    /// zone (#8696) : `0` = Auto (variable d'environnement
+    /// `TUNE_WASAPI_EXCLUSIVE_PERIOD_MS`, sinon période du pilote).
+    fn ouvrir_a_la_periode(
+        demande: &DemandeDOuverture<'a>,
+        reglage_periode_ms: u32,
+    ) -> Result<Self, RefusDOuverture> {
         let sample_rate = demande.spec.cadence();
         let bit_depth = demande.spec.profondeur().bits_declares();
         // WASAPI ouvre à la cadence source, sans repli de cadence.
@@ -209,6 +216,7 @@ impl<'a> BackendLocal<'a> for BackendWasapi<'a> {
                     u32::from(voies),
                     ring.clone(),
                     demande.paused.clone(),
+                    reglage_periode_ms,
                 ) {
                     Ok(wasapi) => Some((wasapi, ring)),
                     Err(erreur) => {
@@ -236,6 +244,7 @@ impl<'a> BackendLocal<'a> for BackendWasapi<'a> {
                     u32::from(channels),
                     ring.clone(),
                     demande.paused.clone(),
+                    reglage_periode_ms,
                 )
                 .map(|wasapi| (wasapi, ring))
             }
@@ -264,6 +273,17 @@ impl<'a> BackendLocal<'a> for BackendWasapi<'a> {
                 erreur: e,
             }),
         }
+    }
+}
+
+impl<'a> BackendLocal<'a> for BackendWasapi<'a> {
+    /// `WasapiExclusiveOutput::new` : résolution de l'endpoint,
+    /// `Initialize(EXCLUSIVE | EVENTCALLBACK)` au format source, avec la
+    /// reprise alignée de #2208. Un refus est
+    /// [`RefusDOuverture::OuvertureExclusiveRefusee`] pour `"WASAPI"` — le
+    /// même `record_exclusive_open_failure` qu'avant, par `rapporter`.
+    fn ouvrir(demande: &DemandeDOuverture<'a>) -> Result<Self, RefusDOuverture> {
+        Self::ouvrir_a_la_periode(demande, 0)
     }
 
     /// Le format que `Initialize(EXCLUSIVE)` a accepté : la cadence de la
@@ -459,6 +479,8 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
         track_artist,
         duration_ms,
         seek_offset_ms,
+        silence_de_verrouillage,
+        reglage_periode_ms,
     } = entrees;
 
     let sample_rate = spec.cadence();
@@ -507,7 +529,7 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
         soft_mute,
         position_ms: &position_ms,
     };
-    let mut backend = match BackendWasapi::ouvrir(&demande) {
+    let mut backend = match BackendWasapi::ouvrir_a_la_periode(&demande, reglage_periode_ms) {
         Ok(backend) => backend,
         Err(refus) => {
             // #4176 — seul le flux COURANT a le droit d'écrire l'échec dans le
@@ -583,7 +605,10 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
     .avec_l_adaptation_des_canaux(&reaffectation, &disposition)
     .avec_publication(&transformations_reelles)
     .avec_le_gain_au_rendu(backend.anneau());
-    let mut puits = match backend.puits() {
+    let mut puits = match backend
+        .puits()
+        .precede_du_silence(&silence_de_verrouillage, backend.format_ouvert())
+    {
         Puits::Natif(puits) => puits,
         Puits::Flottant(_) => unreachable!("BackendWasapi ne fournit qu'un puits natif"),
     };

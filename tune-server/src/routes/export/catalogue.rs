@@ -21,7 +21,7 @@
 //! - `quality` : `dsd`, `hires`, `cd`, `lossy`, plusieurs séparés par des
 //!   virgules (OU entre eux, comme les pastilles de la Bibliothèque) ;
 //! - `format` : `FLAC`, `WAV`…, plusieurs séparés par des virgules, sans casse ;
-//! - `hires_verdict` (rc12) : `verifie`, `douteux`, `conforme`, `non_analyse`,
+//! - `hires_verdict` (rc12) : `verifie`, `douteux` (alias `altere`, #9067), `conforme`, `non_analyse`,
 //!   plusieurs séparés par des virgules — le verdict des faux hi-res PUBLIÉ,
 //!   comme `GET /library/albums?hires_verdict=` (« douteux » masqué ne rend
 //!   rien). Il est une valeur de plus de la facette Qualité : OU avec
@@ -326,8 +326,9 @@ pub fn rendre_html(lignes: &[LigneCatalogue], f: &FiltresCatalogue, date: &str) 
         q.extend(f.hires_verdicts.iter().map(|v| match (v.as_str(), f.lang) {
             ("verifie", Langue::Fr) => "Hi-Res vérifié".to_string(),
             ("verifie", Langue::En) => "Verified Hi-Res".to_string(),
-            ("douteux", Langue::Fr) => "Hi-Res douteux".to_string(),
-            ("douteux", Langue::En) => "Doubtful Hi-Res".to_string(),
+            // #9067 (19/11) — « Source altérée », tous formats ; `altere` en alias.
+            ("douteux" | "altere", Langue::Fr) => "Source altérée".to_string(),
+            ("douteux" | "altere", Langue::En) => "Altered source".to_string(),
             (autre, _) => format!("Hi-Res : {}", echapper(autre)),
         }));
         filtres.push(format!("{} : {}", l.qualite, q.join(", ")));

@@ -35,6 +35,7 @@ async fn la_route_historique_sert_l_album_du_service_d_un_titre_lance_hors_album
 
     let Json(body) = recent_history(
         State(state),
+        crate::routes::active_profile::ActiveProfile(1),
         Query(HistoryParams {
             limit: Some(20),
             offset: Some(0),

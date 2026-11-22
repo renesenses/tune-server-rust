@@ -607,7 +607,7 @@ async fn lrclib_search(
         urlencoding::encode(artist),
         urlencoding::encode(track_name),
     );
-    debug!(url = %url, "lrclib_search");
+    debug!(url = %crate::confidentialite::masquer_url(&url), "lrclib_search");
     let resp = client
         .get(&url)
         .header("User-Agent", format!("Tune/{}", crate::version()))
@@ -655,7 +655,7 @@ async fn lrclib_get(
         url.push_str(&format!("&duration={dur}"));
     }
 
-    debug!(url = %url, "lrclib_fetch");
+    debug!(url = %crate::confidentialite::masquer_url(&url), "lrclib_fetch");
 
     let resp = client
         .get(&url)

@@ -22,7 +22,7 @@
 //! en greffon (#4363, préavis #4440) ne la perd pas.
 //!
 //! Droits : lister est libre (comme `/eq/presets`) ; enregistrer et supprimer
-//! demandent le crossfeed Premium ET le greffon installé, comme
+//! demandent le greffon installé (gratuit depuis #9210), comme
 //! `PUT /zones/{id}/dsp` quand il porte un `crossfeed`.
 
 use axum::extract::{Path, State};

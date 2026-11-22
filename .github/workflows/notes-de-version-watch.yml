@@ -65,7 +65,7 @@ jobs:
   contre-epreuve:
     name: Contre-épreuve du périmètre
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -84,7 +84,7 @@ jobs:
   forme:
     name: Contre-épreuve de la forme des notes
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -97,7 +97,7 @@ jobs:
     # changé, et une lacune préexistante ferait échouer une PR qui n'y est pour
     # rien. La veille garde ses déclencheurs d'origine.
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4

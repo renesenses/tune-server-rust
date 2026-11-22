@@ -282,7 +282,7 @@ async fn relocation_full_flow() {
             unit_body.contains("What=/dev/disk/by-uuid/TEST-UUID"),
             "{unit_body}"
         );
-        assert!(unit_body.contains("Options=nofail"));
+        assert!(unit_body.contains("Options=nofail,nosuid,nodev"));
     } else {
         // Hors root : le serveur n'écrit RIEN dans /etc/systemd/system (il
         // ne le pourrait pas) ; il confie l'UUID et le point de montage à

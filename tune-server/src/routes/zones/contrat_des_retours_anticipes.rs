@@ -38,9 +38,11 @@ fn les_retours_anticipes_passent_par_le_contrat() {
     assert_eq!(
         corps.matches("build_zone_json(").count(),
         3,
-        "les TROIS retours anticipés doivent passer par le contrat client : \
-         zone déjà associée au device, zone du même hôte sous une autre \
-         identité SSDP (#1281), et rattrapage après collision UNIQUE"
+        "les TROIS retours anticipés en 200 doivent passer par le contrat \
+         client : zone supprimée ressuscitée sur son appareil, zone supprimée \
+         retrouvée par la sortie qu'elle avait lâchée (#8987), et rattrapage \
+         après collision UNIQUE. Une zone visible (même appareil ou même \
+         hôte, #1281) répond désormais 409 (#8987)"
     );
     assert!(
         !corps.contains("serde_json::to_value(z)"),
@@ -153,10 +155,13 @@ async fn le_contrat_de_lecture_dit_l_aleatoire_et_la_repetition_du_moteur() {
 /// creating a zone and it duplicates the zone output » : POST /zones avec
 /// l'identité jumelle ne dédoublonnait que par `output_device_id` exact et
 /// créait une deuxième zone pour le même renderer physique. Le regroupement
-/// par hôte de la découverte doit s'appliquer ici aussi : la zone existante
-/// est rendue (200), rien n'est créé.
+/// par hôte de la découverte doit s'appliquer ici aussi : rien n'est créé.
+///
+/// #8987 — décision de Bertrand : la zone existante n'est plus rendue en 200
+/// silencieux, la création est refusée en `409 zone_existe_deja` qui la nomme,
+/// comme pour l'identité exacte.
 #[tokio::test]
-async fn poster_la_seconde_identite_ssdp_rend_la_zone_existante() {
+async fn poster_la_seconde_identite_ssdp_refuse_en_nommant_la_zone_existante() {
     use axum::response::IntoResponse;
 
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
@@ -194,9 +199,16 @@ async fn poster_la_seconde_identite_ssdp_rend_la_zone_existante() {
 
     assert_eq!(
         resp.status(),
-        axum::http::StatusCode::OK,
-        "la zone existante du même hôte est rendue, pas créée (201)"
+        axum::http::StatusCode::CONFLICT,
+        "#8987 — la jumelle SSDP reçoit le même refus que l'identité exacte"
     );
+    let octets = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    let corps: serde_json::Value = serde_json::from_slice(&octets).unwrap();
+    assert_eq!(corps["code"], "zone_existe_deja", "{corps}");
+    assert_eq!(corps["zone_id"], zid, "{corps}");
+    assert_eq!(corps["zone_name"], "buchardt A700", "{corps}");
     assert_eq!(
         repo.list().unwrap().len(),
         1,

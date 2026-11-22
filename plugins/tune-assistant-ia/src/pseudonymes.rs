@@ -2,11 +2,13 @@
 //! (décision de Bertrand du 23/10/2026, étude #6834 § 1.4).
 //!
 //! `tune_core::confidentialite::anonymiser` a été écrit pour le forum : il
-//! masque les jetons, les clés, le nom d'utilisateur et les chemins
-//! personnels, mais il GARDE volontairement les adresses IP du réseau local
-//! et les noms que les appareils annoncent — ils servent au diagnostic sur le
-//! forum. Pour un fournisseur tiers, cette passe-ci s'ajoute (elle tourne
-//! APRÈS `anonymiser`) et remplace :
+//! masque les jetons, les clés, le nom d'utilisateur, les chemins personnels
+//! et, depuis #9140, les noms d'appareils et de zones (jeton `[appareil 3]`,
+//! irréversible). Il GARDE les adresses IP du réseau local. L'assistant passe
+//! par sa variante `anonymiser_json_garder_appareils`, qui laisse les noms
+//! d'appareils et de zones à CETTE passe-ci : elle les remplace par des
+//! pseudonymes qu'elle sait rétablir à l'écran. Pour un fournisseur tiers,
+//! cette passe-ci s'ajoute donc (elle tourne APRÈS) et remplace :
 //!
 //! - les noms CONNUS — zones, appareils, hôtes, titres, artistes, albums —
 //!   que l'hôte fournit ([`Pseudonymiseur::noms`]), par `<zone-1>`,

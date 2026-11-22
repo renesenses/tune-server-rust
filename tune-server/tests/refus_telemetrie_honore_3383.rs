@@ -20,7 +20,7 @@
 //! Un témoin qui appellerait `TelemetryReporter::is_enabled_for` sur un réglage
 //! qu'il aurait posé lui-même resterait VERT le jour où quelqu'un débranche la
 //! route — c'est-à-dire exactement le défaut d'origine, « écrit mais pas
-//! branché ». Ici, on monte `tune_server::routes::router(state)` et on envoie
+//! branché ». Ici, on monte `tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 50000))))` et on envoie
 //! de vraies requêtes HTTP : le refus doit traverser le handler, le
 //! `SettingsRepo`, puis être relu par les gardes d'envoi réelles.
 //!
@@ -47,7 +47,12 @@ use tune_server::state::AppState;
 
 fn banc() -> (axum::Router, AppState) {
     let state = AppState::new(":memory:", 0, Default::default()).expect("AppState sur SQLite");
-    let router = tune_server::routes::router(state.clone());
+    let router = tune_server::routes::router(state.clone()).layer(
+        axum::extract::connect_info::MockConnectInfo(std::net::SocketAddr::from((
+            [127, 0, 0, 1],
+            50000,
+        ))),
+    );
     (router, state)
 }
 

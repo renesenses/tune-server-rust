@@ -48,6 +48,7 @@ fn language_directive(lang: &str) -> &'static str {
         }
         "pl" => "Reply to the user in Polish unless they clearly write in another language.",
         "el" => "Reply to the user in Greek unless they clearly write in another language.",
+        "tr" => "Reply to the user in Turkish unless they clearly write in another language.",
         _ => "Reply to the user in French unless they clearly write in another language.",
     }
 }
@@ -1158,6 +1159,7 @@ mod language_directive_tests {
         assert!(language_directive("nb").contains("Norwegian"));
         assert!(language_directive("pl").contains("Polish"));
         assert!(language_directive("el").contains("Greek"));
+        assert!(language_directive("tr").contains("Turkish"));
     }
 }
 

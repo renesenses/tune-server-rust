@@ -73,7 +73,10 @@ async fn desinstaller_un_greffon_natif_le_desactive_durablement() {
         .plugin_names
         .set(vec!["assistant-ia".into(), "dj".into()])
         .unwrap();
-    let app = tune_server::routes::router(state);
+    let app =
+        tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+        ));
 
     let (_, liste) = call(&app, "GET", "/api/v1/plugins").await;
     assert_eq!(fiche(&liste, "assistant-ia").unwrap()["installed"], true);
@@ -144,7 +147,10 @@ async fn apres_redemarrage_la_fiche_est_disponible_et_installer_la_retablit() {
         .set("plugin_assistant-ia_enabled", "false")
         .unwrap();
     settings.set("plugin_assistant-ia_hidden", "true").unwrap();
-    let app = tune_server::routes::router(state);
+    let app =
+        tune_server::routes::router(state).layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from(([127, 0, 0, 1], 50000)),
+        ));
 
     let (_, liste) = call(&app, "GET", "/api/v1/plugins").await;
     let f = fiche(&liste, "assistant-ia").expect("toujours listé");

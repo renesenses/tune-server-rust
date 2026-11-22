@@ -387,11 +387,20 @@ async fn un_refus_d_identifiants_smb_arrete_l_echelle_et_le_dit_6336() {
     )
     .await;
     assert_eq!(statut, StatusCode::INTERNAL_SERVER_ERROR, "{corps}");
-    // #8069 : `error` porte un code, la phrase affichée est dans `message`
-    // (le client n'affiche que `message`) — la vraie cause y reste citée.
+    // #8069 : `error` porte un code ; la phrase affichée est dans `message`,
+    // traduite (`message_key`, sans quoi le client montre son message
+    // générique) ; la vraie cause est rendue à part, dans `cause`.
     assert_eq!(corps["error"], "identifiants_refuses", "{corps}");
+    assert_eq!(
+        corps["message_key"], "api.network.smbMountCredentialsRefused",
+        "{corps}"
+    );
     assert!(
-        corps["message"]
+        corps["message"].as_str().is_some_and(|m| !m.is_empty()),
+        "{corps}"
+    );
+    assert!(
+        corps["cause"]
             .as_str()
             .is_some_and(|m| m.contains("Permission denied")),
         "la vraie cause doit être rendue : {corps}"

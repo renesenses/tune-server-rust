@@ -58,7 +58,16 @@ fn admin_errors_disabled() -> Json<Value> {
 /// errors, and return the most recent `max_lines` of them (newest first).
 /// Returns `None` if the file can't be opened/read.
 fn read_error_tail(log_path: &str, max_lines: usize) -> Option<(Vec<String>, String)> {
-    read_error_tail_windowed(log_path, max_lines, ERROR_LOG_TAIL_BYTES)
+    // Jamais la ligne du code d'activation de l'authentification.
+    read_error_tail_windowed(log_path, max_lines, ERROR_LOG_TAIL_BYTES).map(|(lignes, src)| {
+        (
+            lignes
+                .into_iter()
+                .filter(|l| !l.contains(tune_core::confidentialite::MARQUEUR_CODE_ACTIVATION))
+                .collect(),
+            src,
+        )
+    })
 }
 
 fn read_error_tail_windowed(

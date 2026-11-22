@@ -232,3 +232,99 @@ async fn les_statistiques_d_ecoute_ignorent_la_station_7965() {
         "/dashboard/stats compte la station : {ds}"
     );
 }
+
+/// #8487 — les titres diffusés par la station se rangent SOUS sa ligne
+/// (`broadcast_titles`) ; ils ne sont ni des lignes de l'historique (le total
+/// ne bouge pas) ni des écoutes pour les statistiques, et l'effacement de
+/// l'historique les emporte.
+#[tokio::test]
+async fn les_titres_diffuses_se_rangent_sous_la_station_hors_statistiques_8487() {
+    use tune_core::db::radio_titres_diffuses::{Notation, noter};
+    let (state, app) = ecouter_l_episode_et_la_station().await;
+    let h = appel(&app, "/library/history?limit=50", None).await;
+    let zone = h["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["source"] == "radio")
+        .and_then(|i| i["zone_id"].as_i64())
+        .expect("la ligne de la station porte sa zone");
+    for (ms, artiste, titre) in [
+        (1_000, "King Gizzard & the Lizard Wizard", "Rattlesnake"),
+        (2_000, "King Gizzard & the Lizard Wizard", "Rattlesnake"),
+        (3_000, "Fontaines D.C.", "Starburster"),
+    ] {
+        noter(
+            &state.backend,
+            zone,
+            FLUX,
+            "FIP",
+            Some(artiste),
+            titre,
+            None,
+            ms,
+        )
+        .unwrap();
+    }
+    assert_eq!(
+        noter(&state.backend, zone, FLUX, "FIP", None, "FIP", None, 4_000).unwrap(),
+        Notation::PasUnTitre
+    );
+
+    let h = appel(&app, "/library/history?limit=50", None).await;
+    assert_eq!(
+        h["total"], 2,
+        "les titres diffusés ne sont pas des lignes : {h}"
+    );
+    let items = h["items"].as_array().unwrap();
+    let station = items.iter().find(|i| i["source"] == "radio").unwrap();
+    assert_eq!(
+        station["broadcast_titles"],
+        json!([
+            {"zone_id": zone, "title": "Starburster", "artist_name": "Fontaines D.C.",
+             "cover_url": null, "played_at": "1970-01-01T00:00:03Z"},
+            {"zone_id": zone, "title": "Rattlesnake", "artist_name": "King Gizzard & the Lizard Wizard",
+             "cover_url": null, "played_at": "1970-01-01T00:00:01Z"},
+        ]),
+        "{h}"
+    );
+    let episode = items.iter().find(|i| i["source"] == "podcast").unwrap();
+    assert!(episode.get("broadcast_titles").is_none(), "{episode}");
+
+    state.license.set_account_premium(true, None).await;
+    for route in [
+        "/library/history/dashboard?period=all",
+        "/library/history/top-tracks",
+        "/library/history/top-artists",
+        "/stats/listening?limit=10",
+        "/dashboard/top-tracks",
+        "/dashboard/stats",
+        "/profiles/1/stats",
+        "/library/stats",
+    ] {
+        let v = appel(&app, route, None).await;
+        assert!(
+            !v.to_string().contains("Rattlesnake") && !v.to_string().contains("Fontaines"),
+            "{route} compte un titre diffusé : {v}"
+        );
+    }
+    let d = appel(&app, "/library/history/dashboard?period=all", None).await;
+    assert_eq!(d["totals"]["plays"], 1, "{d}");
+
+    let req = Request::builder()
+        .uri("/api/v1/library/history")
+        .method("DELETE")
+        .body(Body::empty())
+        .unwrap();
+    app.clone().oneshot(req).await.unwrap();
+    let restant = state
+        .backend
+        .query_one("SELECT COUNT(*) FROM radio_titres_diffuses", &[])
+        .unwrap()
+        .and_then(|r| r.first().and_then(|v| v.as_i64()));
+    assert_eq!(
+        restant,
+        Some(0),
+        "effacer l'historique emporte les titres diffusés"
+    );
+}

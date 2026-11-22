@@ -554,6 +554,12 @@ pub fn resolve_web_dir() -> std::path::PathBuf {
 /// Creates the parent directory. Note: append-only, no rotation (same as the
 /// pre-existing macOS/Windows behavior); rotation is a separate follow-up.
 pub fn default_log_file_path() -> std::path::PathBuf {
+    // #8946 — le fichier que l'écrivain a RÉELLEMENT ouvert, s'il a dû se
+    // replier : le lecteur (« Exporter le journal », rapport de bogue) doit
+    // lire celui-là, pas l'emplacement refusé.
+    if let Some(retenu) = JOURNAL_RETENU.get() {
+        return retenu.clone();
+    }
     let lire = |nom: &str| std::env::var(nom).ok();
     let path = chemin_du_journal(
         &lire,
@@ -566,6 +572,71 @@ pub fn default_log_file_path() -> std::path::PathBuf {
         let _ = std::fs::create_dir_all(dir);
     }
     path
+}
+
+/// #8946 — le journal effectivement ouvert par [`crate::bootstrap::installer_le_journal`]
+/// quand ce n'est pas l'emplacement par défaut. Posé une fois, au démarrage.
+static JOURNAL_RETENU: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Retient le fichier que l'écrivain a ouvert : [`default_log_file_path`] le
+/// rendra désormais, lecteur compris.
+pub(crate) fn retenir_le_journal(chemin: PathBuf) {
+    let _ = JOURNAL_RETENU.set(chemin);
+}
+
+/// #9118 — la raison pour laquelle AUCUN fichier de journal n'a pu être ouvert
+/// au démarrage (emplacement par défaut et replis tous refusés). Posée une
+/// fois par [`crate::bootstrap::installer_le_journal`] ; le journal ne va
+/// alors que sur la sortie standard (journald, `docker logs`).
+static JOURNAL_REFUSE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Retient que l'écrivain n'a pu ouvrir aucun fichier, et pourquoi.
+pub(crate) fn retenir_le_refus_du_journal(raison: String) {
+    let _ = JOURNAL_REFUSE.set(raison);
+}
+
+/// #9118 — `Some(raison)` quand l'écrivain n'a ouvert aucun fichier : le
+/// lecteur n'a plus à retenter, à chaque export, un chemin que le démarrage a
+/// déjà vu refuser (un `WARN … Permission denied` par rapport, qui a fait
+/// croire à un `~` non développé alors que le `~` n'est que l'anonymisation
+/// du rapport).
+pub(crate) fn refus_du_journal_au_demarrage() -> Option<String> {
+    JOURNAL_REFUSE.get().cloned()
+}
+
+/// #8946 — où écrire le journal quand l'emplacement par défaut est refusé.
+///
+/// Tune OS (fil 2882, rc12) : `tune.service` tourne avec `ProtectHome=yes`, et
+/// le chemin par défaut est sous `$HOME` (`~/.local/state/tune`). Le service
+/// ne peut ni y créer le dossier ni y ouvrir le fichier : AUCUN fichier de
+/// journal n'était écrit, et chaque export relevait `Permission denied`
+/// (`log_export_fichier_illisible_replis_tentes`) avant de retomber sur
+/// journalctl. Les droits ne sont pas élargis : on écrit là où le service a
+/// déjà le droit d'écrire.
+///
+/// UN SEUL repli : `$TUNE_DATA_DIR/logs/tune-server.log`, le dossier de
+/// données, que l'unité ouvre en écriture (`ReadWritePaths=/opt/tune/data` sur
+/// Tune OS). Le dossier est créé en 0700 et le fichier en 0600
+/// ([`crate::journal::ouvrir_le_premier_journal`]).
+///
+/// ⛔ Pas de repli sous `temp_dir()` : hors Tune OS c'est un `/tmp` PARTAGÉ
+/// entre comptes (pas de `PrivateTmp`), où un autre compte peut poser le
+/// dossier ou un lien d'avance, et où la rotation `.1` se joue en deux temps.
+/// Si le chemin par défaut et le dossier de données sont refusés, le journal
+/// ne va QUE sur la sortie standard (journald, `docker logs`), et
+/// `journal_emplacement_refuse` dit pourquoi.
+pub(crate) fn replis_du_journal(lire: &dyn Fn(&str) -> Option<String>) -> Vec<PathBuf> {
+    lire("TUNE_DATA_DIR")
+        .filter(|s| !s.is_empty())
+        .map(|donnees| PathBuf::from(donnees).join("logs").join("tune-server.log"))
+        .into_iter()
+        .collect()
+}
+
+/// [`replis_du_journal`] pour ce processus.
+pub(crate) fn replis_du_journal_courants() -> Vec<PathBuf> {
+    let lire = |nom: &str| std::env::var(nom).ok();
+    replis_du_journal(&lire)
 }
 
 /// L'emplacement **par défaut** du journal, `TUNE_LOG_FILE` mis de côté.
@@ -967,6 +1038,32 @@ pub fn appliquer_plan_base_macos(config: &mut TuneConfig, plan: PlanBaseMacos) {
 #[cfg(test)]
 mod listen_socket_tests {
     use super::*;
+
+    /// #8946 — le SEUL repli du journal est le dossier de données (ouvert en
+    /// écriture par l'unité de Tune OS) ; jamais `temp_dir()`, un `/tmp`
+    /// partagé hors Tune OS. Sans `TUNE_DATA_DIR`, aucun repli : la sortie
+    /// standard seule.
+    ///
+    /// Contre-épreuve : remettre le repli `temp_dir()/tune-<uid>` (première
+    /// version de la PR) donne deux replis, et un repli sans `TUNE_DATA_DIR`.
+    #[test]
+    fn le_seul_repli_du_journal_est_le_dossier_de_donnees_8946() {
+        let avec = |nom: &str| (nom == "TUNE_DATA_DIR").then(|| "/opt/tune/data".to_string());
+        assert_eq!(
+            replis_du_journal(&avec),
+            vec![PathBuf::from("/opt/tune/data/logs/tune-server.log")]
+        );
+        let vide = |nom: &str| (nom == "TUNE_DATA_DIR").then(String::new);
+        assert!(
+            replis_du_journal(&vide).is_empty(),
+            "TUNE_DATA_DIR vide ignoré"
+        );
+        let rien = |_: &str| None;
+        assert!(
+            replis_du_journal(&rien).is_empty(),
+            "aucun repli dans le dossier temporaire du système"
+        );
+    }
 
     /// L'hôte sait-il vraiment JOINDRE `::1` ?
     ///

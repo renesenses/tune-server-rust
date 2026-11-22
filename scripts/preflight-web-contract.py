@@ -78,6 +78,10 @@ SOURCES_SERVEUR = [
     # Routes de test seulement (#[tokio::test] de tune-ffi/src/lib.rs, garde
     # mobile) : scannées pour que la garde des caisses non scannées se taise.
     "tune-ffi/src",
+    # Routes de test seulement (chemin_8901_tests.rs, erreurs not_found
+    # nommées) : même raison que tune-ffi, sans quoi la garde des caisses non
+    # scannées rend 2 et bloque le préflight de release.yml.
+    "tune-http-types/src",
     "plugins",
 ]
 

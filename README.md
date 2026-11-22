@@ -76,6 +76,16 @@ docker run -d \
   renesenses/tune:latest
 ```
 
+**Never start the container without a volume on `/data`.** The database,
+settings and streaming-service logins all live there. Without
+`-v tune-data:/data` (or a host folder), Docker creates an *anonymous* volume,
+and a recreated container (a new `docker run`, an update tool, Synology
+Container Manager's *Image › Update*) gets a new, empty one: Tune starts over
+from scratch. Since 1.0.0-rc13 (#8747) Tune detects it at startup: the log
+says `donnees_non_persistantes`, the bug report has a `Data dir` line, and
+Settings show a warning banner. A lost anonymous volume usually still exists
+on the host until it is pruned: `docker volume ls -f dangling=true`.
+
 `--device /dev/snd --group-add audio` give the container the host's sound
 devices, for local output to a USB DAC plugged into this machine. Drop both
 lines on a host without `/dev/snd` (Docker Desktop on macOS/Windows, a headless

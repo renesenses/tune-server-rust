@@ -56,6 +56,9 @@ async fn chaque_ligne_de_file_designe_son_artiste() {
                     track_id: avec_artiste,
                 },
                 QueueInput::Streaming {
+                    media_format: None,
+                    sample_rate: None,
+                    bit_depth: None,
                     source: "qobuz".into(),
                     source_id: "q-1".into(),
                     title: "Blue in Green".into(),

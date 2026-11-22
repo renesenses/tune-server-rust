@@ -165,6 +165,15 @@ pub fn oublier_la_zone(zone_id: i64) {
     noter_etat_de_lecture(zone_id, "stopped");
 }
 
+/// CETTE zone joue-t-elle selon le témoin en mémoire (tune-server-rust#9046) ?
+/// Le verrou n'est tenu que le temps de la lecture.
+pub fn la_zone_joue(zone_id: i64) -> bool {
+    ZONES_QUI_JOUENT
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&zone_id)
+}
+
 /// Une zone joue-t-elle ? Lecture atomique, gratuite.
 pub fn lecture_en_cours() -> bool {
     LECTURE.load(Ordering::Relaxed)
@@ -444,4 +453,19 @@ pub fn oublier_la_lecture_pour_les_essais() {
     DEPUIS.store(0, Ordering::Relaxed);
     vider_les_cedees();
     politique::oublier_pour_les_essais();
+}
+
+#[cfg(test)]
+mod tests_9046 {
+    /// #9046 — le témoin d'UNE zone. Identifiant propre à l'essai : aucun
+    /// autre essai ne le note, le résultat ne dépend pas du parallélisme.
+    #[test]
+    fn la_zone_joue_lit_le_temoin_de_cette_zone_9046() {
+        assert!(!super::la_zone_joue(904_699));
+        super::noter_etat_de_lecture(904_699, "playing");
+        let joue = super::la_zone_joue(904_699);
+        super::noter_etat_de_lecture(904_699, "stopped");
+        assert!(joue);
+        assert!(!super::la_zone_joue(904_699));
+    }
 }

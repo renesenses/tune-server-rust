@@ -226,23 +226,30 @@ pub fn est_dsd(marqueur: &str) -> bool {
 /// Vrai **seulement** si les trois conditions tiennent :
 ///
 /// 1. le renderer annonce le DSD dans son `GetProtocolInfo` — un sondage
-///    CONCLUANT (`Some(true)`) ; `None` (pas sondé, sondage échoué) et
-///    `Some(false)` (DSD brut forcé par le mode « natif » sur un renderer qui
-///    ne l'annonce pas, comme l'Eversolo DMP-A8) gardent la garde ;
+///    CONCLUANT (`Some(true)`) — OU la zone est en mode DSD « natif »
+///    (`natif_force`) et le sondage a conclu (`Some(false)`) : le DSD brut part
+///    alors QUAND MÊME pour chaque piste (`should_dsd_passthrough`), le
+///    renderer le joue déjà, et lui refuser la suivante ne laissait qu'un blanc
+///    à chaque piste (Eversolo DMP-A8, fil 2885, #8969). `None` (pas sondé,
+///    sondage échoué) garde la garde ;
 /// 2. son SCPD d'AVTransport annonce `SetNextAVTransportURI`
 ///    ([`AnnonceSuivante::Annoncee`]) ; `Inconnue` garde la garde ;
-/// 3. il n'a pas déjà lâché un suivant DSD armé depuis le démarrage de Tune
-///    (`deja_lache`) : un renderer comme le RS130, qui annonce les deux et ne
-///    suit pas, ne perd qu'UNE transition, puis retrouve la garde.
+/// 3. il n'est pas sous la garde rendue aux renderers qui lâchent le suivant
+///    DSD armé (`deja_lache`, voir [`EchecsDsdSuivant`]) : un renderer comme le
+///    RS130, qui annonce les deux et ne suit pas, perd
+///    [`ECHECS_DSD_SUIVANT_AVANT_GARDE`] transitions, puis retrouve la garde ;
+///    à chaque échéance il retente, et un seul échec la lui rend, pour une
+///    durée doublée.
 ///
 /// Une seule définition, lue par le sondeur (`prepare_gapless`) et par la
 /// promesse de la file ([`enchainement_sans_blanc`]).
 pub fn dsd_suivant_tenu_sur_dlna(
     annonce_dsd: Option<bool>,
+    natif_force: bool,
     annonce_suivante: AnnonceSuivante,
     deja_lache: bool,
 ) -> bool {
-    refus_dsd_suivant_sur_dlna(annonce_dsd, annonce_suivante, deja_lache).is_none()
+    refus_dsd_suivant_sur_dlna(annonce_dsd, natif_force, annonce_suivante, deja_lache).is_none()
 }
 
 /// #6335 — POURQUOI un suivant DSD n'est pas armé sur un renderer DLNA.
@@ -255,14 +262,16 @@ pub fn dsd_suivant_tenu_sur_dlna(
 pub enum RefusDsdSuivant {
     /// `GetProtocolInfo` pas sondé, ou sondage sans réponse (`None`).
     DsdNonSonde,
-    /// Le renderer n'annonce pas le DSD (`Some(false)`).
+    /// Le renderer n'annonce pas le DSD (`Some(false)`) et la zone n'est pas
+    /// en mode « natif » : le DSD n'est pas envoyé brut à ce renderer.
     DsdNonAnnonce,
     /// SCPD d'AVTransport ni connu ni lu : Tune ne sait pas si
     /// `SetNextAVTransportURI` est permis.
     SuivanteInconnue,
     /// Le SCPD d'AVTransport ne porte pas `SetNextAVTransportURI`.
     SuivanteNonAnnoncee,
-    /// Le renderer a déjà lâché un suivant DSD armé depuis le démarrage.
+    /// Le renderer a lâché des suivants DSD armés : la garde lui est rendue
+    /// pour un temps (voir [`EchecsDsdSuivant`]).
     DejaLache,
 }
 
@@ -281,15 +290,23 @@ impl RefusDsdSuivant {
 
 /// #6335 — la première des trois conditions de [`dsd_suivant_tenu_sur_dlna`]
 /// qui manque, `None` si le suivant DSD peut être armé.
+///
+/// `natif_force` : la zone est en mode DSD « natif » — réglage explicite qui
+/// envoie le DSD brut même au renderer qui ne l'annonce pas (#8969). Il ne
+/// lève que `Some(false)` : un sondage sans réponse (`None`) garde la garde.
+/// Les deux autres conditions tiennent toujours, et un renderer qui lâche le
+/// suivant DSD armé retrouve la garde (`deja_lache`) : une transition perdue,
+/// puis la garde.
 pub fn refus_dsd_suivant_sur_dlna(
     annonce_dsd: Option<bool>,
+    natif_force: bool,
     annonce_suivante: AnnonceSuivante,
     deja_lache: bool,
 ) -> Option<RefusDsdSuivant> {
     match annonce_dsd {
         None => return Some(RefusDsdSuivant::DsdNonSonde),
-        Some(false) => return Some(RefusDsdSuivant::DsdNonAnnonce),
-        Some(true) => {}
+        Some(false) if !natif_force => return Some(RefusDsdSuivant::DsdNonAnnonce),
+        Some(_) => {}
     }
     match annonce_suivante {
         AnnonceSuivante::Inconnue => return Some(RefusDsdSuivant::SuivanteInconnue),
@@ -297,6 +314,139 @@ pub fn refus_dsd_suivant_sur_dlna(
         AnnonceSuivante::Annoncee => {}
     }
     deja_lache.then_some(RefusDsdSuivant::DejaLache)
+}
+
+/// #9206 — échecs constatés avant de rendre la garde DSD à un appareil la
+/// PREMIÈRE fois.
+///
+/// #6910 la rendait au premier : une seule fausse conclusion (fil 2961, une
+/// fin coupée pendant que le renderer basculait sur le flux armé) supprimait
+/// le sans-blanc DSD pour toute la session, alors que la transition d'avant
+/// venait d'enchaîner sans blanc. Après une première garde, l'appareil est
+/// récidiviste : un seul échec la lui rend (voir [`EchecsDsdSuivant`]).
+pub const ECHECS_DSD_SUIVANT_AVANT_GARDE: u32 = 2;
+
+/// #9206 — fenêtre dans laquelle les échecs se cumulent avant la première
+/// garde ; un échec isolé plus ancien est oublié. Large (une séance
+/// d'écoute) : deux échecs séparés par une longue piste comptent.
+pub const FENETRE_ECHECS_DSD_SUIVANT: std::time::Duration =
+    std::time::Duration::from_secs(6 * 60 * 60);
+
+/// #9206 — durée de la PREMIÈRE garde ; passé ce délai, le suivant DSD est
+/// de nouveau tenté (au lieu de « jusqu'au redémarrage »). Chaque récidive
+/// la double, jusqu'à [`DUREE_GARDE_DSD_SUIVANT_MAX`].
+pub const DUREE_GARDE_DSD_SUIVANT: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
+/// #9206 — plafond de la garde d'un récidiviste.
+pub const DUREE_GARDE_DSD_SUIVANT_MAX: std::time::Duration =
+    std::time::Duration::from_secs(8 * 60 * 60);
+
+/// #9206 — ce qu'un échec constaté change pour l'appareil.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IssueEchecDsdSuivant {
+    /// Échec noté, la garde n'est pas (encore) rendue.
+    Note { echecs: u32 },
+    /// La garde est rendue pour `duree` (la `garde`-ième fois).
+    GardeRendue {
+        echecs: u32,
+        garde: u32,
+        duree: std::time::Duration,
+    },
+    /// La garde était déjà rendue : rien ne change.
+    DejaGarde,
+}
+
+/// #6910 / #9206 — la mémoire, par appareil, des suivants DSD armés et lâchés.
+///
+/// - première garde : [`ECHECS_DSD_SUIVANT_AVANT_GARDE`] échecs dans
+///   [`FENETRE_ECHECS_DSD_SUIVANT`], ou un seul si l'appareil avoue avoir
+///   perdu la suivante ;
+/// - la garde échoit : l'appareil retente le suivant DSD, mais reste
+///   RÉCIDIVISTE (`gardes` est conservé) : un seul échec lui rend la garde,
+///   pour une durée doublée à chaque fois (30 min, 1 h, 2 h… plafond 8 h).
+///   Un RS130 (#402) ne reperd donc qu'une transition par échéance, de plus
+///   en plus rares ;
+/// - une transition SUIVIE (le renderer passe au flux armé sans `Play`)
+///   efface toute la mémoire de l'appareil, récidive comprise
+///   (`PlaybackOrchestrator::noter_succes_dsd_suivant`) : un appareil sain
+///   n'accumule pas de faux échecs sur une séance.
+#[derive(Debug, Clone, Default)]
+pub struct EchecsDsdSuivant {
+    echecs: u32,
+    premier_echec: Option<std::time::Instant>,
+    garde_depuis: Option<std::time::Instant>,
+    /// Gardes déjà rendues à cet appareil depuis le démarrage.
+    gardes: u32,
+}
+
+impl EchecsDsdSuivant {
+    /// Durée de la `garde`-ième garde (1 = la première).
+    pub fn duree_de_la_garde(garde: u32) -> std::time::Duration {
+        let facteur = 1u32 << garde.saturating_sub(1).min(16);
+        DUREE_GARDE_DSD_SUIVANT
+            .saturating_mul(facteur)
+            .min(DUREE_GARDE_DSD_SUIVANT_MAX)
+    }
+
+    /// La garde est-elle rendue à `maintenant` ? Une garde échue est levée et
+    /// ses échecs oubliés ; la récidive (`gardes`) est retenue.
+    pub fn garde_active(&mut self, maintenant: std::time::Instant) -> bool {
+        match self.garde_depuis {
+            Some(t)
+                if maintenant.saturating_duration_since(t)
+                    < Self::duree_de_la_garde(self.gardes) =>
+            {
+                true
+            }
+            Some(_) => {
+                self.garde_depuis = None;
+                self.echecs = 0;
+                self.premier_echec = None;
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Note un échec. `immediat` : l'appareil a dit lui-même avoir perdu la
+    /// suivante (`SuivantePreparee::Perdue`) — preuve suffisante à elle seule.
+    pub fn noter_echec(
+        &mut self,
+        maintenant: std::time::Instant,
+        immediat: bool,
+    ) -> IssueEchecDsdSuivant {
+        if self.garde_active(maintenant) {
+            return IssueEchecDsdSuivant::DejaGarde;
+        }
+        if self
+            .premier_echec
+            .is_some_and(|t| maintenant.saturating_duration_since(t) >= FENETRE_ECHECS_DSD_SUIVANT)
+        {
+            self.echecs = 0;
+            self.premier_echec = None;
+        }
+        self.echecs = self.echecs.saturating_add(1);
+        self.premier_echec.get_or_insert(maintenant);
+        let recidiviste = self.gardes > 0;
+        if immediat || recidiviste || self.echecs >= ECHECS_DSD_SUIVANT_AVANT_GARDE {
+            self.gardes = self.gardes.saturating_add(1);
+            self.garde_depuis = Some(maintenant);
+            IssueEchecDsdSuivant::GardeRendue {
+                echecs: self.echecs,
+                garde: self.gardes,
+                duree: Self::duree_de_la_garde(self.gardes),
+            }
+        } else {
+            IssueEchecDsdSuivant::Note {
+                echecs: self.echecs,
+            }
+        }
+    }
+
+    /// Échecs notés depuis la dernière garde (banc).
+    pub fn echecs(&self) -> u32 {
+        self.echecs
+    }
 }
 
 /// Ce qu'une ligne de file peut promettre à la ligne **affichée** juste après elle.
@@ -492,22 +642,158 @@ mod tests {
     #[test]
     fn dsd_suivant_tenu_exige_les_trois_conditions_6910() {
         use AnnonceSuivante::*;
-        assert!(dsd_suivant_tenu_sur_dlna(Some(true), Annoncee, false));
-        // DSD non sondé, ou brut forcé sur un renderer qui ne l'annonce pas.
-        assert!(!dsd_suivant_tenu_sur_dlna(None, Annoncee, false));
-        assert!(!dsd_suivant_tenu_sur_dlna(Some(false), Annoncee, false));
+        assert!(dsd_suivant_tenu_sur_dlna(
+            Some(true),
+            false,
+            Annoncee,
+            false
+        ));
+        // DSD non sondé, ou non annoncé hors mode « natif ».
+        assert!(!dsd_suivant_tenu_sur_dlna(None, false, Annoncee, false));
+        assert!(!dsd_suivant_tenu_sur_dlna(
+            Some(false),
+            false,
+            Annoncee,
+            false
+        ));
         // SCPD illisible ou action absente.
-        assert!(!dsd_suivant_tenu_sur_dlna(Some(true), Inconnue, false));
-        assert!(!dsd_suivant_tenu_sur_dlna(Some(true), NonAnnoncee, false));
+        assert!(!dsd_suivant_tenu_sur_dlna(
+            Some(true),
+            false,
+            Inconnue,
+            false
+        ));
+        assert!(!dsd_suivant_tenu_sur_dlna(
+            Some(true),
+            false,
+            NonAnnoncee,
+            false
+        ));
         // Le renderer a déjà lâché un suivant DSD armé (RS130, #402).
-        assert!(!dsd_suivant_tenu_sur_dlna(Some(true), Annoncee, true));
+        assert!(!dsd_suivant_tenu_sur_dlna(
+            Some(true),
+            false,
+            Annoncee,
+            true
+        ));
+    }
+
+    /// #8969 (fil 2885, Eversolo DMP-A8) — zone en DSD « natif » : le DSD brut
+    /// part même sans annonce du renderer, la suivante l'est aussi. Le natif ne
+    /// lève QUE le `Some(false)` : sondage sans réponse, SCPD sans `SetNext`
+    /// ou renderer qui a déjà lâché un suivant DSD gardent la garde.
+    #[test]
+    fn natif_force_leve_seulement_le_dsd_non_annonce_8969() {
+        use AnnonceSuivante::*;
+        assert!(dsd_suivant_tenu_sur_dlna(
+            Some(false),
+            true,
+            Annoncee,
+            false
+        ));
+        assert!(!dsd_suivant_tenu_sur_dlna(None, true, Annoncee, false));
+        assert!(!dsd_suivant_tenu_sur_dlna(
+            Some(false),
+            true,
+            Inconnue,
+            false
+        ));
+        assert!(!dsd_suivant_tenu_sur_dlna(
+            Some(false),
+            true,
+            NonAnnoncee,
+            false
+        ));
+        assert!(!dsd_suivant_tenu_sur_dlna(
+            Some(false),
+            true,
+            Annoncee,
+            true
+        ));
+        assert_eq!(
+            refus_dsd_suivant_sur_dlna(Some(false), true, Annoncee, true)
+                .map(RefusDsdSuivant::raison),
+            Some("deja_lache")
+        );
+    }
+
+    /// #9206 — un seul échec ne rend plus la garde ; le deuxième, si ; la
+    /// garde échoit, l'appareil retente ; récidiviste, un échec la lui rend
+    /// aussitôt, pour une durée doublée, plafonnée.
+    #[test]
+    fn la_garde_dsd_suit_deux_echecs_puis_la_recidive_9206() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut m = EchecsDsdSuivant::default();
+        assert_eq!(
+            m.noter_echec(t0, false),
+            IssueEchecDsdSuivant::Note { echecs: 1 }
+        );
+        assert!(!m.garde_active(t0), "un seul échec ne rend pas la garde");
+        // Deux échecs séparés d'une longue piste (> 30 min) comptent.
+        let t1 = t0 + Duration::from_secs(45 * 60);
+        assert_eq!(
+            m.noter_echec(t1, false),
+            IssueEchecDsdSuivant::GardeRendue {
+                echecs: 2,
+                garde: 1,
+                duree: DUREE_GARDE_DSD_SUIVANT
+            }
+        );
+        assert!(m.garde_active(t1));
+        assert_eq!(m.noter_echec(t1, false), IssueEchecDsdSuivant::DejaGarde);
+        assert!(m.garde_active(t1 + DUREE_GARDE_DSD_SUIVANT - Duration::from_secs(1)));
+        let t2 = t1 + DUREE_GARDE_DSD_SUIVANT;
+        assert!(
+            !m.garde_active(t2),
+            "la garde échoit : plus de « jusqu'au redémarrage »"
+        );
+        // Récidive : un seul échec, garde doublée.
+        assert_eq!(
+            m.noter_echec(t2, false),
+            IssueEchecDsdSuivant::GardeRendue {
+                echecs: 1,
+                garde: 2,
+                duree: DUREE_GARDE_DSD_SUIVANT * 2
+            }
+        );
+        assert!(m.garde_active(t2 + DUREE_GARDE_DSD_SUIVANT));
+        assert!(!m.garde_active(t2 + DUREE_GARDE_DSD_SUIVANT * 2));
+        assert_eq!(
+            EchecsDsdSuivant::duree_de_la_garde(10),
+            DUREE_GARDE_DSD_SUIVANT_MAX,
+            "plafond"
+        );
+    }
+
+    /// #9206 — deux échecs trop éloignés ne se cumulent pas ; la suivante
+    /// que l'appareil dit avoir perdue rend la garde tout de suite.
+    #[test]
+    fn echecs_isoles_oublies_et_perte_avouee_immediate_9206() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut m = EchecsDsdSuivant::default();
+        m.noter_echec(t0, false);
+        assert_eq!(
+            m.noter_echec(
+                t0 + FENETRE_ECHECS_DSD_SUIVANT + Duration::from_secs(1),
+                false
+            ),
+            IssueEchecDsdSuivant::Note { echecs: 1 }
+        );
+        let mut avoue = EchecsDsdSuivant::default();
+        assert!(matches!(
+            avoue.noter_echec(t0, true),
+            IssueEchecDsdSuivant::GardeRendue { garde: 1, .. }
+        ));
+        assert!(avoue.garde_active(t0));
     }
 
     /// #6335 — le refus nomme la condition qui manque, une par cas.
     #[test]
     fn le_refus_dsd_suivant_nomme_la_condition_manquante_6335() {
         use AnnonceSuivante::*;
-        let r = |dsd, suivante, lache| refus_dsd_suivant_sur_dlna(dsd, suivante, lache);
+        let r = |dsd, suivante, lache| refus_dsd_suivant_sur_dlna(dsd, false, suivante, lache);
         assert_eq!(r(Some(true), Annoncee, false), None);
         assert_eq!(
             r(None, Annoncee, false).map(RefusDsdSuivant::raison),
