@@ -92,7 +92,10 @@ async fn un_abonnement_dont_le_flux_est_en_404_repond_502_9317() {
         .backend
         .execute_returning_id(
             "INSERT INTO podcast_subscriptions (feed_url, title) VALUES (?, ?)",
-            &[&flux as &dyn ToSqlValue, &"Émission 9317" as &dyn ToSqlValue],
+            &[
+                &flux as &dyn ToSqlValue,
+                &"Émission 9317" as &dyn ToSqlValue,
+            ],
         )
         .expect("abonnement enregistré");
     let (statut, corps) = get(&state, &format!("/api/v1/podcasts/episodes/{id}")).await;

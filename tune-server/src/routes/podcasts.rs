@@ -1740,6 +1740,9 @@ mod historique_7965_tests;
 #[path = "podcasts/adresses_de_la_selection_6925_tests.rs"]
 mod adresses_de_la_selection_6925_tests;
 #[cfg(test)]
+#[path = "podcasts/episodes_en_echec_9317_tests.rs"]
+mod episodes_en_echec_9317_tests;
+#[cfg(test)]
 #[path = "podcasts/positions_des_episodes_8170_tests.rs"]
 mod positions_des_episodes_8170_tests;
 #[cfg(test)]
@@ -1751,6 +1754,3 @@ mod reprise_par_adresse_8085_tests;
 #[cfg(test)]
 #[path = "podcasts/type_de_l_episode_7894_tests.rs"]
 mod type_de_l_episode_7894_tests;
-#[cfg(test)]
-#[path = "podcasts/episodes_en_echec_9317_tests.rs"]
-mod episodes_en_echec_9317_tests;
