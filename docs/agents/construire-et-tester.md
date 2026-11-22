@@ -165,3 +165,15 @@ fusion : lire la PR de groupe qui cite la PR unitaire
 (`gh pr view <groupe> --json state,mergeCommit`), puis
 `git diff --stat <commit unitaire> origin/<lot> -- <fichiers de la PR>` : une
 sortie vide veut dire que le contenu est fusionné.
+
+### ReplayGain #7724 : isoler les états du processus
+
+Le verrou local de `replaygain_lancer_tests_6778` ne sérialise pas les autres
+modules qui modifient la pause, la campagne ou le rang global. Le témoin #7724
+pouvait donc recevoir `refused/paused` au lieu de `already_running`, voire
+quitter sans vérifier la route. Il lance désormais exactement son propre cas
+dans un nouveau processus et exige un test réussi, aucun ignoré. Ne pas
+remettre un retour anticipé en cas de pause. Le nom passé à `--exact` exclut
+le préfixe de caisse de `module_path!()` ; vérifier le compteur évite un faux
+vert à zéro test. La contre-épreuve métier retire seulement la condition du
+rang dans `replaygain_analyze` ; les assertions restent inchangées.
