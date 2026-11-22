@@ -187,3 +187,54 @@ fn la_violation_de_l_index_se_lit_comme_un_409() {
     let e = super::erreur_d_ecriture_du_nom(NOM_PRIS, "disk I/O error".into());
     assert_eq!(e.status, StatusCode::INTERNAL_SERVER_ERROR);
 }
+
+/// #9314 — deux homonymes DÉJÀ en base, comme sous PostgreSQL avant #9280
+/// (pas d'index unique) : chacun reste modifiable tant qu'il garde son nom.
+///
+/// L'index de SQLite est retiré pour reproduire la base PostgreSQL ; c'est la
+/// même route et la même vérification qui s'exécutent. Le renommage vers le
+/// nom d'une autre collection reste refusé.
+#[tokio::test]
+async fn deux_homonymes_deja_enregistres_restent_modifiables() {
+    let etat = etat();
+    etat.backend
+        .execute("DROP INDEX IF EXISTS idx_smart_collections_name", &[])
+        .expect("index retiré, comme sous PostgreSQL");
+    let inserer = |nom: &str| {
+        etat.backend
+            .execute_returning_id(
+                "INSERT INTO smart_collections (name, rules) VALUES ($1, '[]')",
+                &[&nom as &dyn ToSqlValue],
+            )
+            .expect("homonyme")
+    };
+    let id_a = inserer(NOM_PRIS);
+    let id_b = inserer(NOM_PRIS);
+
+    // Ce qu'envoie l'éditeur : le nom inchangé, avec les champs modifiés.
+    for id in [id_a, id_b] {
+        let (statut, v) = modifier(
+            &etat,
+            id,
+            json!({"name": NOM_PRIS, "description": "règles revues", "rules": []}),
+        )
+        .await;
+        assert_eq!(
+            statut,
+            StatusCode::OK,
+            "#9314 : un homonyme qui garde son nom doit rester modifiable : {v}"
+        );
+        assert_eq!(v["description"], "règles revues", "{v}");
+    }
+
+    // Renommer une troisième collection vers ce nom reste refusé.
+    let id_c = inserer("Piano solo");
+    let (statut, v) = modifier(&etat, id_c, json!({"name": NOM_PRIS})).await;
+    assert_eq!(statut, StatusCode::CONFLICT, "{v}");
+    assert_eq!(nom_en_base(&etat, id_c), "Piano solo");
+
+    // Et un homonyme peut prendre un nom libre, ce qui règle le doublon.
+    let (statut, v) = modifier(&etat, id_b, json!({"name": "Jazz vocal, bis"})).await;
+    assert_eq!(statut, StatusCode::OK, "{v}");
+    assert_eq!(nom_en_base(&etat, id_b), "Jazz vocal, bis");
+}
