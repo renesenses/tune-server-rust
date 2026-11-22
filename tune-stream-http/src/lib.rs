@@ -3112,7 +3112,7 @@ async fn send_with_reresolve(
     url: String,
     start: Option<u64>,
     reresolve: &Option<ReresolveFn>,
-) -> Result<(reqwest::Response, String), ()> {
+) -> Result<(reqwest::Response, String), Option<u16>> {
     let mut url = url;
     let mut attempts: u32 = 0;
     loop {
@@ -3159,11 +3159,13 @@ async fn send_with_reresolve(
                     "proxy_upstream_expired_no_reresolver"
                 );
             }
-            return Err(());
+            // #9315 — le 403/410 d'une source sans nouvelle résolution
+            // (épisode de podcast retiré) remonte à l'appelant, qui le note.
+            return Err(outcome.as_ref().ok().map(|r| r.status().as_u16()));
         };
         if attempts >= PROXY_MAX_RERESOLVES {
             warn!(url = %tune_core::confidentialite::masquer_url(&url), "proxy_reresolve_giveup");
-            return Err(());
+            return Err(None);
         }
         attempts += 1;
         match reresolve().await {
@@ -3173,7 +3175,7 @@ async fn send_with_reresolve(
             }
             Err(e) => {
                 warn!(error = %e, attempts, "proxy_reresolve_failed");
-                return Err(());
+                return Err(None);
             }
         }
     }
@@ -3279,7 +3281,7 @@ fn resumable_proxy_body(
                     bilan.fin = "amont_mauvais_statut";
                     break;
                 }
-                Err(()) => {
+                Err(_) => {
                     warn!(pos, "proxy_resume_upstream_failed");
                     bilan.fin = "amont_injoignable";
                     break;
@@ -3489,7 +3491,16 @@ async fn proxy_stream(
         match send_with_reresolve(client, upstream_url.to_string(), resume_start, &reresolve).await
         {
             Ok(pair) => pair,
-            Err(()) => return StatusCode::BAD_GATEWAY.into_response(),
+            Err(statut) => {
+                // #9315 — 403/410 sans nouvelle résolution : noté comme toute
+                // erreur de la source, tant que rien n'a été servi.
+                if let Some(statut) = statut
+                    && session.bytes_sent.load(std::sync::atomic::Ordering::Relaxed) == 0
+                {
+                    session.signaler_erreur_amont(statut);
+                }
+                return StatusCode::BAD_GATEWAY.into_response();
+            }
         };
     // #9315 — un statut non 2xx de la source n'est pas de l'audio. Le relayer
     // tel quel faisait « démarrer » la zone sur le corps d'une page d'erreur
@@ -3515,6 +3526,11 @@ async fn proxy_stream(
             session.signaler_erreur_amont(statut);
         }
         return StatusCode::BAD_GATEWAY.into_response();
+    }
+    // #9315 — la source rend de nouveau de l'audio (le renderer a réessayé
+    // après le 502) : l'erreur notée ne vaut plus.
+    if upstream_resp.status().is_success() {
+        session.effacer_erreur_amont();
     }
     // Persist a re-resolved URL so later resumes start from the fresh signature.
     {

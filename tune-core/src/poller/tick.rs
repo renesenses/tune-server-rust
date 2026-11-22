@@ -1272,10 +1272,17 @@ impl PositionPoller {
             // Le mandataire a rendu 502 au renderer et noté le statut sur la
             // session : la zone ne jouera rien. Elle s'arrête ICI, avec le
             // bandeau, au lieu de « démarrer » puis de se taire.
+            //
+            // Seulement pour un épisode de podcast (le cas du forum) : Qobuz,
+            // TIDAL et UPnP gardent leur conduite (arrêt ou piste suivante),
+            // qui est un choix produit. Et seulement si AUCUN octet n'a été
+            // servi : un renderer qui a réessayé et reçu l'audio joue.
             if zone_state.state == PlayState::Playing
                 && let Some(np) = zone_state.now_playing.as_ref()
+                && np.source == "podcast"
                 && let Some(sid) = np.stream_id.as_deref()
                 && let Some(statut) = self.orchestrator.streamer.erreur_amont(sid).await
+                && self.orchestrator.streamer.stream_bytes_sent(sid).await == Some(0)
             {
                 let titre = np.title.clone();
                 poll_states.remove(&zone_id);

@@ -10,9 +10,20 @@
 //! session pour le sondeur. Contre-témoin : une source saine (200) est
 //! relayée comme avant, sans rien noter.
 //!
-//! Contre-épreuve : retirer le bloc `statut_amont_en_echec` de
-//! `proxy_stream` (tune-stream-http/src/lib.rs) fait tomber les deux témoins
-//! d'erreur (200 et la page d'erreur relayée).
+//! Suite de la revue :
+//!  - 410 (ou 403) d'une source SANS nouvelle résolution : `send_with_reresolve`
+//!    rendait `Err(())` et le statut se perdait ⇒ noté lui aussi ;
+//!  - 503 puis 200 (le renderer réessaie après le 502) : l'erreur notée
+//!    s'efface au premier 2xx, sans quoi le sondeur arrêterait une zone qui
+//!    JOUE.
+//!
+//! Contre-épreuves :
+//!  - retirer le bloc `statut_amont_en_echec` de `proxy_stream` fait tomber
+//!    les témoins 404 et 503 (200 et la page d'erreur relayée) ;
+//!  - rendre `Err(None)` dans la branche `proxy_upstream_expired_no_reresolver`
+//!    fait tomber le témoin 410 ;
+//!  - retirer `effacer_erreur_amont` de `proxy_stream` fait tomber le témoin
+//!    503 puis 200.
 //!
 //! `tune-stream-http` n'a PAS `autotests = false` : ce fichier est compilé
 //! sans déclaration `[[test]]`.
@@ -137,4 +148,68 @@ async fn une_source_saine_est_relayee_comme_avant_9315() {
     assert_eq!(statut, 200);
     assert_eq!(octets, audio, "les octets de la source passent verbatim");
     assert_eq!(session.erreur_amont(), None);
+}
+
+#[tokio::test]
+async fn une_source_en_410_sans_nouvelle_resolution_est_notee_9315() {
+    verifier_l_erreur("410 Gone", 410).await;
+}
+
+/// Une source qui répond 503 à la PREMIÈRE requête, puis 200 avec `audio`.
+async fn source_503_puis_200(audio: Vec<u8>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!(
+        "http://{}/podcast/episode-9315-reprise.m4a",
+        listener.local_addr().unwrap()
+    );
+    let vues = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let audio = audio.clone();
+            let rang = vues.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::spawn(async move {
+                let mut requete = Vec::new();
+                let mut octet = [0u8; 1];
+                while !requete.ends_with(b"\r\n\r\n") && requete.len() < 16_384 {
+                    if socket.read_exact(&mut octet).await.is_err() {
+                        return;
+                    }
+                    requete.push(octet[0]);
+                }
+                let (statut, type_, corps): (&str, &str, Vec<u8>) = if rang == 0 {
+                    ("503 Service Unavailable", "text/html", PAGE_D_ERREUR.as_bytes().to_vec())
+                } else {
+                    ("200 OK", "audio/mp4", audio)
+                };
+                let entete = format!(
+                    "HTTP/1.1 {statut}\r\nContent-Type: {type_}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    corps.len()
+                );
+                let _ = socket.write_all(entete.as_bytes()).await;
+                let _ = socket.write_all(&corps).await;
+                let _ = socket.shutdown().await;
+            });
+        }
+    });
+    url
+}
+
+#[tokio::test]
+async fn une_erreur_suivie_d_un_succes_s_efface_9315() {
+    let audio: Vec<u8> = (0..32_000).map(|i| (i % 251) as u8).collect();
+    let amont = source_503_puis_200(audio.clone()).await;
+    let (sessions, session) = session_relayee("relais-9315-reprise", amont).await;
+
+    let (statut, _) = get(&sessions, "relais-9315-reprise").await;
+    assert_eq!(statut, 502);
+    assert_eq!(session.erreur_amont(), Some(503));
+
+    let (statut, octets) = get(&sessions, "relais-9315-reprise").await;
+    assert_eq!(statut, 200, "le renderer réessaie et reçoit l'audio");
+    assert_eq!(octets, audio);
+    assert_eq!(
+        session.erreur_amont(),
+        None,
+        "#9315 : la source rend de nouveau l'audio, l'erreur notée ne vaut plus"
+    );
 }

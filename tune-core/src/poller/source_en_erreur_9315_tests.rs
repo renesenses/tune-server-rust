@@ -6,10 +6,16 @@
 //!  1. source en 404 notée sur la session : au premier tour, la zone
 //!     s'arrête avec UN bandeau fatal `source_http_error` (statut, titre) ;
 //!  2. CONTRE-TÉMOIN : la même zone, sans erreur notée, continue de jouer
-//!     sans bandeau.
+//!     sans bandeau ;
+//!  3. erreur notée PUIS audio servi (le renderer a réessayé après le 502) :
+//!     la zone continue, même si l'erreur n'a pas encore été effacée ;
+//!  4. erreur notée puis effacée par un 2xx de la source : la zone continue.
 //!
-//! Contre-épreuve : retirer le bloc « #9315 » de `tick.rs` fait tomber le
-//! témoin 1 (aucun bandeau, la zone reste en lecture).
+//! Contre-épreuves :
+//!  - retirer le bloc « #9315 » de `tick.rs` fait tomber le témoin 1 (aucun
+//!    bandeau, la zone reste en lecture) ;
+//!  - retirer la condition `stream_bytes_sent(sid) == Some(0)` du bloc fait
+//!    tomber le témoin 3 (la zone qui joue est arrêtée).
 use super::*;
 use crate::db::migrations::run_migrations;
 use crate::db::sqlite::SqliteDb;
@@ -133,6 +139,16 @@ impl Banc {
             .signaler_erreur_amont(statut);
     }
 
+    async fn session(&self) -> Arc<crate::http::streamer::StreamSession> {
+        self.streamer
+            .sessions_state()
+            .lock()
+            .await
+            .get(&self.session)
+            .cloned()
+            .expect("la session du mandataire existe")
+    }
+
     async fn tic(&mut self) {
         self.poller
             .tick(&mut self.poll_states, &mut self.idle, &Instant::now())
@@ -190,6 +206,39 @@ async fn une_source_en_404_arrete_la_zone_avec_un_bandeau_9315() {
 async fn sans_erreur_de_la_source_la_zone_continue_9315() {
     let mut banc = Banc::monter().await;
     banc.sortie_en_lecture().await;
+    banc.tic().await;
+    assert!(banc.bandeaux().is_empty());
+    assert_eq!(
+        banc.playback.get_state(banc.zone_id).await.state,
+        PlayState::Playing
+    );
+}
+
+#[tokio::test]
+async fn une_erreur_suivie_d_audio_servi_laisse_jouer_9315() {
+    let mut banc = Banc::monter().await;
+    banc.sortie_en_lecture().await;
+    banc.noter_l_erreur_de_la_source(503).await;
+    // Le renderer a réessayé et reçu l'audio.
+    banc.session().await.compter_octets_servis(64 * 1024);
+    banc.tic().await;
+    assert!(
+        banc.bandeaux().is_empty(),
+        "#9315 : aucun bandeau pour une zone qui reçoit l'audio"
+    );
+    assert_eq!(
+        banc.playback.get_state(banc.zone_id).await.state,
+        PlayState::Playing,
+        "#9315 : la zone qui joue n'est pas arrêtée"
+    );
+}
+
+#[tokio::test]
+async fn une_erreur_effacee_par_un_succes_laisse_jouer_9315() {
+    let mut banc = Banc::monter().await;
+    banc.sortie_en_lecture().await;
+    banc.noter_l_erreur_de_la_source(503).await;
+    banc.session().await.effacer_erreur_amont();
     banc.tic().await;
     assert!(banc.bandeaux().is_empty());
     assert_eq!(

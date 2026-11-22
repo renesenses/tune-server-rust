@@ -815,6 +815,13 @@ impl StreamSession {
             .store(statut, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// #9315 — la source a de nouveau répondu 2xx : l'erreur notée ne vaut
+    /// plus (un renderer qui réessaie après un 502 et reçoit l'audio).
+    pub fn effacer_erreur_amont(&self) {
+        self.erreur_amont
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// #9315 — le statut d'erreur de la source, s'il a été noté.
     pub fn erreur_amont(&self) -> Option<u16> {
         match self.erreur_amont.load(std::sync::atomic::Ordering::Relaxed) {
