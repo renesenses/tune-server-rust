@@ -826,7 +826,7 @@ async fn podcast_episodes(
                 let episodes = flux.episodes;
                 Ok(Json(json!({"podcast_id": podcast_id, "feed_url": feed_url, "count": episodes.len(), "episodes": episodes})).into_response())
             }
-            Err(e) => Ok(Json(json!({"podcast_id": podcast_id, "error": e})).into_response()),
+            Err(e) => Err(flux_en_echec(feed_url, e)),
         };
     }
     let feed_url = {
@@ -865,10 +865,27 @@ async fn podcast_episodes(
             let count = episodes.len();
             Ok(Json(json!({"podcast_id": podcast_id, "feed_url": feed_url, "count": count, "episodes": episodes})).into_response())
         }
-        Err(e) => Ok(
-            Json(json!({"podcast_id": podcast_id, "feed_url": feed_url, "error": e}))
-                .into_response(),
-        ),
+        Err(e) => Err(flux_en_echec(&feed_url, e)),
+    }
+}
+
+/// #9317 — code stable d'un flux d'épisodes que l'éditeur n'a pas rendu.
+pub(super) const CODE_FLUX_EN_ECHEC: &str = "podcast_episodes_indisponibles";
+
+/// #9317 — le flux RSS de l'éditeur n'a pas répondu (404, 5xx, réseau) :
+/// c'est l'amont qui échoue, la route le dit par un 502 et le corps habituel
+/// `{error, code}`. Elle répondait 200 `{error}` : le client web, qui lit
+/// `data.episodes || data`, avalait l'erreur et affichait « Aucun épisode ».
+fn flux_en_echec(feed_url: &str, e: String) -> AppError {
+    warn!(
+        feed_url = %tune_core::confidentialite::masquer_url(feed_url),
+        error = %e,
+        "podcast_episodes_fetch_failed"
+    );
+    AppError {
+        status: StatusCode::BAD_GATEWAY,
+        message: e,
+        code: Some(CODE_FLUX_EN_ECHEC.into()),
     }
 }
 /// #7717 — un épisode lancé sur une zone est un lancement.
@@ -1734,3 +1751,6 @@ mod reprise_par_adresse_8085_tests;
 #[cfg(test)]
 #[path = "podcasts/type_de_l_episode_7894_tests.rs"]
 mod type_de_l_episode_7894_tests;
+#[cfg(test)]
+#[path = "podcasts/episodes_en_echec_9317_tests.rs"]
+mod episodes_en_echec_9317_tests;
