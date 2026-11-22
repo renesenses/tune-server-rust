@@ -3,7 +3,7 @@
 //! compte des DR déjà gravés étaient lus en synchrone dans le gestionnaire
 //! async. `POST` (lancer) lisait le même inventaire de la même façon.
 //!
-//! L'épreuve est celle de #8805 : sur une vraie base de fichier, un fil à part
+//! L'épreuve POST est celle de #8805 : sur une vraie base de fichier, un fil à part
 //! tient TOUTES les connexions de lecture pendant [`DETENTION`], et les routes
 //! sont appelées pendant ce temps sur un exécuteur `current_thread`. Une route
 //! qui attendrait sa connexion SUR ce fil arrêterait aussi le métronome qui
@@ -86,22 +86,84 @@ fn base() -> (tempfile::TempDir, AppState) {
     (dir, state)
 }
 
-/// TÉMOIN #8872 — le statut de la gravure ne fige pas l'exécuteur pendant
-/// que l'inventaire attend la base.
+/// Observe le vrai accès SQLite sans confondre charge du runner et blocage.
+struct StatutHorsExecuteur {
+    reel: Arc<dyn tune_core::db::backend::DbBackend>,
+    executeur: std::thread::ThreadId,
+    lectures: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl tune_core::db::backend::DbBackend for StatutHorsExecuteur {
+    fn engine(&self) -> tune_core::db::engine::Engine {
+        self.reel.engine()
+    }
+    fn execute(
+        &self,
+        sql: &str,
+        params: &[&dyn tune_core::db::backend::ToSqlValue],
+    ) -> Result<usize, String> {
+        self.reel.execute(sql, params)
+    }
+    fn last_insert_rowid(&self) -> i64 {
+        self.reel.last_insert_rowid()
+    }
+    fn query_one(
+        &self,
+        sql: &str,
+        params: &[&dyn tune_core::db::backend::ToSqlValue],
+    ) -> Result<Option<Vec<tune_core::db::backend::SqlValue>>, String> {
+        if sql == "SELECT COUNT(*) FROM track_metadata WHERE key = 'dr_source' AND value = 'tag'" {
+            self.lectures.fetch_add(1, Ordering::SeqCst);
+            assert_ne!(
+                std::thread::current().id(),
+                self.executeur,
+                "#8872 : le comptage GET occupe le fil de l'exécuteur"
+            );
+        }
+        self.reel.query_one(sql, params)
+    }
+    fn query_many(
+        &self,
+        sql: &str,
+        params: &[&dyn tune_core::db::backend::ToSqlValue],
+    ) -> Result<Vec<Vec<tune_core::db::backend::SqlValue>>, String> {
+        if sql == super::sql_candidates() {
+            self.lectures.fetch_add(1, Ordering::SeqCst);
+            assert_ne!(
+                std::thread::current().id(),
+                self.executeur,
+                "#8872 : l'inventaire GET occupe le fil de l'exécuteur"
+            );
+        }
+        self.reel.query_many(sql, params)
+    }
+    fn write_tx(
+        &self,
+        f: &mut dyn FnMut(&dyn tune_core::db::backend::DbTxHandle) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.reel.write_tx(f)
+    }
+    fn execute_batch(&self, sql: &str) -> Result<(), String> {
+        self.reel.execute_batch(sql)
+    }
+}
+
+/// TÉMOIN #8872 — les deux requêtes coûteuses quittent le worker async unique.
 #[tokio::test(flavor = "current_thread")]
 async fn le_statut_de_la_gravure_ne_fige_pas_l_executeur_8872() {
-    let (_dir, state) = base();
-    let (trou, duree, v) =
-        sous_lecteurs_tenus(&state, |s| async move { super::statut(State(s)).await.0 }).await;
-    assert!(
-        duree >= DETENTION - Duration::from_millis(500),
-        "la route n'a pas attendu les lecteurs ({duree:?}) : l'épreuve ne prouve rien"
+    let (_dir, mut state) = base();
+    let lectures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    state.backend = Arc::new(StatutHorsExecuteur {
+        reel: state.backend.clone(),
+        executeur: std::thread::current().id(),
+        lectures: lectures.clone(),
+    });
+    let v = super::statut(State(state)).await.0;
+    assert_eq!(
+        lectures.load(Ordering::SeqCst),
+        2,
+        "inventaire et comptage réels doivent être observés"
     );
-    assert!(
-        trou < TROU_MAX,
-        "#8872 : GET /library/dr/gravure a figé l'exécuteur {trou:?}"
-    );
-    // La réponse reste entière : rien à graver sur une base vide.
     assert_eq!(v["status"], "idle", "{v}");
     assert_eq!(v["a_graver"], 0, "{v}");
     assert_eq!(v["hors_format"], 0, "{v}");
