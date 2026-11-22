@@ -172,11 +172,24 @@ async fn lancer_la_gravure_ne_fige_pas_l_executeur_8872() {
         executeur: std::thread::current().id(),
         lectures: lectures.clone(),
     });
-    let statut = super::lancer(State(state)).await.into_response().status();
+    let statut = super::lancer(State(state.clone()))
+        .await
+        .into_response()
+        .status();
     assert_eq!(statut, axum::http::StatusCode::ACCEPTED);
     assert_eq!(
         lectures.load(Ordering::SeqCst),
         1,
         "l'inventaire réel doit être observé"
     );
+    // Attendre la garde de la passe vide avant de fermer la base et son
+    // dossier, notamment sous Windows où les connexions retiennent le fichier.
+    while state
+        .background_tasks
+        .snapshot()
+        .iter()
+        .any(|t| t.id == super::TACHE_GRAVER_DR)
+    {
+        tokio::task::yield_now().await;
+    }
 }
