@@ -1313,17 +1313,28 @@ pub fn build_album_query(
         // sa forme TEXTUELLE, comme dans les playlists (#1008) : `LOWER()` d'un
         // entier passe sur SQLite mais PostgreSQL le refuse (`function
         // lower(integer) does not exist`) et l'aperçu tombait.
+        //
+        // #9283 (forum, « Blue Öyster Cult ») — un texte se compare SANS ses
+        // accents, des DEUX côtés, comme la recherche de la bibliothèque
+        // (`LOWER(unaccent(col)) LIKE LOWER(unaccent(?))`). Sans quoi la
+        // règle ne trouvait pas un nom écrit autrement en base : sans accent,
+        // ou avec la lettre décomposée (NFD, « O » suivi du tréma combinant)
+        // que portent des balises écrites sous macOS. Et le `LOWER()` de
+        // SQLite, ASCII seulement, laissait « Ö » et « ö » différents.
+        // `unaccent` est la fonction de PostgreSQL et, sous SQLite, celle
+        // qu'enregistre `tune_core::db::sqlite` (`fold_diacritics`).
         let motif = |m: &str| {
             if is_text {
-                format!("LOWER({col}) LIKE LOWER('{m}'){esc_clause}")
+                format!("LOWER(unaccent({col})) LIKE LOWER(unaccent('{m}')){esc_clause}")
             } else {
                 format!("CAST({col} AS TEXT) LIKE '{m}'{esc_clause}")
             }
         };
 
         let cond = match op {
-            "=" if is_text => format!("LOWER({col}) = LOWER('{esc}')"),
-            "!=" if is_text => format!("LOWER({col}) != LOWER('{esc}')"),
+            // #9283 — mêmes accents des deux côtés que pour les motifs.
+            "=" if is_text => format!("LOWER(unaccent({col})) = LOWER(unaccent('{esc}'))"),
+            "!=" if is_text => format!("LOWER(unaccent({col})) != LOWER(unaccent('{esc}'))"),
             "contains" => motif(&format!("%{esc_like}%")),
             // #6250 — « ne contient pas » : le complément EXACT de « contient »,
             // qui retient un album dès qu'UNE ligne (album × piste) contient.
@@ -2003,6 +2014,11 @@ mod expression_7872_tests;
 #[path = "nom_deja_pris_tests.rs"]
 mod nom_deja_pris_tests;
 
+// #9283 — une règle accentuée trouve l'artiste quelle que soit sa graphie.
+#[cfg(test)]
+#[path = "accents_regles_9283_tests.rs"]
+mod accents_regles_9283_tests;
+
 // Recette du 13/11 (n° 73) — comptes en une passe et index des règles.
 #[cfg(test)]
 #[path = "comptes_en_une_passe_tests.rs"]
@@ -2244,7 +2260,7 @@ mod tests {
         let rules = r#"[{"field":"artist_name","op":"=","value":"John Coltrane"}]"#;
         let (where_clause, _, _) = build_album_query(rules, "all", "random", "desc", None, &ctx);
         assert!(
-            where_clause.contains("LOWER(ar.name) = LOWER('John Coltrane')"),
+            where_clause.contains("LOWER(unaccent(ar.name)) = LOWER(unaccent('John Coltrane'))"),
             "{where_clause}"
         );
     }

@@ -1904,6 +1904,14 @@ name = "pg_motifs_collections_6271"
 path = "tests/pg_motifs_collections_6271.rs"
 required-features = ["postgres"]
 
+# #9283 — une règle accentuée (« Blue Öyster Cult ») trouve l'artiste quelle
+# que soit sa graphie en base, sur PostgreSQL. `autotests = false` plus haut :
+# sans cette cible, jamais compilé.
+[[test]]
+name = "pg_collection_accents_9283"
+path = "tests/pg_collection_accents_9283.rs"
+required-features = ["postgres"]
+
 # #6250 — la règle « ne contient pas » (collections et playlists) sur
 # PostgreSQL : les deux aperçus par le vrai routeur.
 [[test]]

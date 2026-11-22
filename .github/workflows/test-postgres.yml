@@ -1264,6 +1264,15 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_motifs_collections_6271 -- --nocapture --test-threads=1
 
+      # #9283 — une règle accentuée (« Blue Öyster Cult ») trouve l'artiste
+      # sans accent, composé (NFC) ou décomposé (NFD) : `unaccent` des deux
+      # côtés, par le vrai routeur. Sans cette étape, l'épreuve prendrait son
+      # « saut annoncé ».
+      - name: Accents des règles de collections sur PostgreSQL (#9283)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test pg_collection_accents_9283 -- --nocapture --test-threads=1
+
       # #6250 — « ne contient pas » : `NOT EXISTS` sur les pistes de l'album
       # dans les collections, négation tolérante au NULL dans les playlists.
       # Sans cette étape, l'épreuve prendrait son « saut annoncé ».
