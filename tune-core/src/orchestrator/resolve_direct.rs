@@ -592,10 +592,13 @@ impl PlaybackOrchestrator {
             // #9336 — reportée sur l'emplacement ACTUEL du serveur (par son
             // UDN, au registre) : l'instantané garde l'adresse de
             // l'indexation, morte si le serveur a changé d'IP depuis.
-            req.track_id.and_then(|id| {
-                self.url_de_lecture_indexee(id)
-                    .map(|url| self.url_sur_l_emplacement_actuel(id, url))
-            })
+            match req
+                .track_id
+                .and_then(|id| self.url_de_lecture_indexee(id).map(|url| (id, url)))
+            {
+                Some((id, url)) => Some(self.url_sur_l_emplacement_actuel(id, url).await),
+                None => None,
+            }
         } else {
             None
         };
