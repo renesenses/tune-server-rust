@@ -49,6 +49,10 @@ nohup cargo test -p tune-server --lib <filtre> > target/x.log 2>&1 &
 - `cargo test -p tune-smart-http` en entier : 198 tests, quelques secondes une
   fois compilé.
 
+Les témoins rendus déterministes et leurs contre-épreuves sont documentés dans
+[les notes par test](epreuves-instables/), une note par PR pour éviter les conflits
+entre validations indépendantes.
+
 ## Écrire un test dans tune-server
 
 - `tune-server` a `autotests = false` : un nouveau fichier de `tests/` exige un
