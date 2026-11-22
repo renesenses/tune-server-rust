@@ -2103,6 +2103,11 @@ impl PlaybackOrchestrator {
     /// DLNA n'ouvre souvent pas le HTTPS d'un hébergeur, le mandataire si.
     /// Aucun transcodage : les octets passent verbatim, le conteneur suit
     /// l'URL et le MIME annoncé.
+    ///
+    /// #9316 — `sample_rate` et `bit_depth` sont ceux que l'appelant CONNAÎT.
+    /// Inconnus, ils restent à 0 (« inconnu » pour le chemin du signal, qui
+    /// ne retient que des valeurs renseignées) : le repli 44 100 Hz / 16 bits
+    /// d'avant affichait un épisode AAC 48 kHz en « 44kHz/16bit ».
     pub async fn relayer_un_flux_distant(
         &self,
         audio_url: &str,
@@ -2115,8 +2120,8 @@ impl PlaybackOrchestrator {
         let info = StreamInfo {
             format: conteneur.to_string(),
             mime_type: mime_type.to_string(),
-            sample_rate: sample_rate.unwrap_or(44_100),
-            bit_depth: bit_depth.unwrap_or(16),
+            sample_rate: sample_rate.unwrap_or(0),
+            bit_depth: bit_depth.unwrap_or(0),
             channels: 2,
             file_size: None,
             duration_ms: duration_ms.map(|d| d as u64),

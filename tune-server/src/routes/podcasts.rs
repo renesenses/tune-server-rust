@@ -980,6 +980,9 @@ pub(super) async fn play_episode(
                         &body.audio_url,
                         mime_type,
                         body.duration_ms.map(|d| d as i64),
+                        // #9316 — ni le flux RSS ni la requête ne disent la
+                        // fréquence ni la résolution de l'épisode : inconnues,
+                        // elles ne sont pas inventées.
                         None,
                         None,
                     )
