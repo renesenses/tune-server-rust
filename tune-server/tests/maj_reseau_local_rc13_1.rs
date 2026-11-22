@@ -424,7 +424,7 @@ async fn tune_os_avec_relais_du_port_80_la_mise_a_jour_passe() {
     );
     let message = corps["message"].as_str().unwrap_or_default();
     assert!(
-        message.contains("Tune OS"),
+        message.contains("Tune-OS") && message.contains("Administrator"),
         "phrase allemande attendue : {message}"
     );
 }
