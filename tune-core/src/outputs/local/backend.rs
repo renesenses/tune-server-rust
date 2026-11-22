@@ -1105,7 +1105,7 @@ impl<'a> BackendCpal<'a> {
                 let famine_cb = ring_cb.starvation();
                 let mut promotion = PromotionDuFilDeRendu::nouvelle();
                 let recopie_cb = recopie.clone();
-                let unite_cb = AtomicU32::new(1000);
+                let unite_cb = AtomicU32::new(UNITE_DU_GAIN_DE_RENDU);
                 device.build_output_stream(
                     cfg,
                     move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {

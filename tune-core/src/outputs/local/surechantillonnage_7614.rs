@@ -339,7 +339,7 @@ fn le_paquet_auto_passe_par_le_rendu_local_et_le_volume_entier() {
     let mut mots = vec![1i32; n + 32];
     super::rendre_pcm_entier_quantifie(
         &ring,
-        &AtomicU32::new(500),
+        &AtomicU32::new(super::UNITE_DU_GAIN_DE_RENDU / 2),
         &AtomicBool::new(false),
         &AtomicBool::new(false),
         &AtomicBool::new(true),

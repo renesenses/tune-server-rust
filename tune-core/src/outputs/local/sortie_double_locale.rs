@@ -217,7 +217,7 @@ pub(super) fn rendre_la_periode_de_a(
             data,
         );
     }
-    let lus = render_local_shared_f32_callback(
+    render_local_shared_f32_callback(
         ring,
         unite,
         paused,
@@ -244,7 +244,12 @@ pub(super) fn rendre_la_periode_de_a(
             *s *= v;
         }
     }
-    if lus > 0 { data.len() } else { 0 }
+    // La ligne à retard peut rendre les dernières trames après que l'anneau
+    // s'est vidé. Garder les voies ensemble et laisser son silence final intact.
+    let voies = ramp.dop.canaux();
+    data.chunks_exact(voies)
+        .rposition(|trame| trame.iter().any(|&mot| mot != 0.0))
+        .map_or(0, |i| (i + 1) * voies)
 }
 
 /// Le gain de B, en millièmes : le curseur de la zone B composé avec le
