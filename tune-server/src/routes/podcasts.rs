@@ -106,8 +106,15 @@ fn pays_d_une_etiquette(etiquette: &str) -> Option<String> {
     if langue.is_empty() || langue == "c" || langue == "posix" {
         return None;
     }
-    if let Some(region) = morceaux.find_map(code_pays) {
+    let suite: Vec<&str> = morceaux.collect();
+    if let Some(region) = suite.iter().copied().find_map(code_pays) {
         return Some(region);
+    }
+    // `zh-Hant` sans région (la langue de l'interface, rc14) : le chinois
+    // traditionnel, Taïwan par défaut (sous-étiquette probable du CLDR), et
+    // non la Chine continentale du simple `zh`.
+    if langue == "zh" && suite.iter().any(|m| m.eq_ignore_ascii_case("hant")) {
+        return Some("tw".to_string());
     }
     pays_de_la_langue(&langue).map(str::to_string)
 }
@@ -1667,6 +1674,10 @@ mod tests {
         // Une langue sans région : son pays par défaut ; le poids q compte.
         assert_eq!(p(None, None, Some("en;q=0.2, sv;q=0.9"), None).0, "se");
         assert_eq!(p(None, None, Some("zh-Hant-TW"), None).0, "tw");
+        // `zh-Hant` seul (la langue de l'interface, rc14) : Taïwan, pas la Chine.
+        assert_eq!(p(None, None, Some("zh-Hant"), None).0, "tw");
+        assert_eq!(p(None, None, Some("zh-Hant-HK"), None).0, "hk");
+        assert_eq!(p(None, None, Some("zh"), None).0, "cn");
         assert_eq!(
             p(None, None, None, Some("fr_FR.UTF-8")),
             ("fr".into(), OriginePaysPodcasts::Systeme)

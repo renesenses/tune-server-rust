@@ -139,7 +139,7 @@ fn refus_bitperfect_strict(
     // Virgule décimale sauf là où l'usage est le point.
     let khz = |hz: u32| {
         let texte = tune_core::audio::bitperfect_strict::khz(hz);
-        if matches!(lang, "en" | "zh" | "ja" | "ko") {
+        if matches!(lang, "en" | "zh" | "zh-Hant" | "ja" | "ko") {
             texte.replace(',', ".")
         } else {
             texte
