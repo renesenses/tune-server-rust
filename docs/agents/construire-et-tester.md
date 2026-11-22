@@ -49,6 +49,10 @@ nohup cargo test -p tune-server --lib <filtre> > target/x.log 2>&1 &
 - `cargo test -p tune-smart-http` en entier : 198 tests, quelques secondes une
   fois compilé.
 
+Les témoins rendus déterministes et leurs contre-épreuves sont documentés dans
+[les notes par test](epreuves-instables/), une note par PR pour éviter les conflits
+entre validations indépendantes.
+
 ## Écrire un test dans tune-server
 
 - `tune-server` a `autotests = false` : un nouveau fichier de `tests/` exige un
@@ -166,6 +170,18 @@ fusion : lire la PR de groupe qui cite la PR unitaire
 `git diff --stat <commit unitaire> origin/<lot> -- <fichiers de la PR>` : une
 sortie vide veut dire que le contenu est fusionné.
 
+### ReplayGain #7724 : isoler les états du processus
+
+Le verrou local de `replaygain_lancer_tests_6778` ne sérialise pas les autres
+modules qui modifient la pause, la campagne ou le rang global. Le témoin #7724
+pouvait donc recevoir `refused/paused` au lieu de `already_running`, voire
+quitter sans vérifier la route. Il lance désormais exactement son propre cas
+dans un nouveau processus et exige un test réussi, aucun ignoré. Ne pas
+remettre un retour anticipé en cas de pause. Le nom passé à `--exact` exclut
+le préfixe de caisse de `module_path!()` ; vérifier le compteur évite un faux
+vert à zéro test. La contre-épreuve métier retire seulement la condition du
+rang dans `replaygain_analyze` ; les assertions restent inchangées.
+
 ### Épreuves de concurrence sous charge : synchronisation communautaire (#6702)
 
 Le plafond d'une seconde entre deux battements mélangeait un blocage de
@@ -179,15 +195,3 @@ Pour la contre-épreuve, exécuter `appliquer_un_lot` directement à la place du
 `spawn_blocking` dans `appliquer_les_enrichissements` : le témoin doit nommer
 l'écriture sur le fil du sondeur. Restaurer la production par copie, puis
 rejouer vingt fois le témoin sous charge ; ne pas modifier ses assertions.
-
-### Inventaire DR POST #8872 : observer le fil SQLite
-
-Le métronome sous lecteurs occupés pouvait dépasser 600 ms à cause de la
-charge du runner. Le témoin POST observe désormais la vraie requête
-`sql_candidates` sur SQLite : elle doit être appelée une fois, hors du fil
-unique de l’exécuteur, et la route doit toujours répondre 202. Les lectures
-de réglages ne sont pas assimilées à cet inventaire coûteux. Aucun délai
-mural n’entre dans le verdict. Le témoin GET reste distinct.
-Pour la contre-épreuve, remplacer seulement le `spawn_blocking` de `lancer`
-par l’appel direct d’`inventaire` : le témoin doit nommer le fil de l’exécuteur.
-Restaurer la production par copie, puis vingt passages sous charge.
