@@ -203,9 +203,9 @@ pub(super) fn rendre_la_periode_de_a(
     min_buffer_samples: usize,
     data: &mut [f32],
     info: &cpal::OutputCallbackInfo,
-) {
+) -> usize {
     if !emplacement.est_actif() {
-        render_local_shared_f32_callback(
+        return render_local_shared_f32_callback(
             ring,
             volume,
             paused,
@@ -216,9 +216,8 @@ pub(super) fn rendre_la_periode_de_a(
             min_buffer_samples,
             data,
         );
-        return;
     }
-    render_local_shared_f32_callback(
+    let lus = render_local_shared_f32_callback(
         ring,
         unite,
         paused,
@@ -245,6 +244,7 @@ pub(super) fn rendre_la_periode_de_a(
             *s *= v;
         }
     }
+    if lus > 0 { data.len() } else { 0 }
 }
 
 /// Le gain de B, en millièmes : le curseur de la zone B composé avec le

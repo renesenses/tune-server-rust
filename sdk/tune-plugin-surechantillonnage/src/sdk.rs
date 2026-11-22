@@ -39,10 +39,25 @@ pub const DEFAULT_FILTER: &str = "polyvalent";
 /// Highest integer ratio: 44.1 → 705.6 and 48 → 768 kHz.
 pub const MAX_INTEGER_RATIO: u32 = 16;
 
+/// Existing saved settings remain manual until Auto is explicitly selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UpsamplerMode {
+    #[default]
+    Manual,
+    Auto,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UpsamplerSettings {
     pub enabled: bool,
+    pub mode: UpsamplerMode,
+    pub profile: String,
+    pub device: Option<String>,
+    pub brand: Option<String>,
+    pub family: Option<String>,
+    pub interface: Option<String>,
     pub filter: String,
     /// Ceiling on the output rate, in Hz; `None` = highest the sink accepts.
     pub max_rate_hz: Option<u32>,
@@ -55,6 +70,12 @@ impl Default for UpsamplerSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            mode: UpsamplerMode::Manual,
+            profile: "natural".into(),
+            device: None,
+            brand: None,
+            family: None,
+            interface: None,
             filter: DEFAULT_FILTER.to_string(),
             max_rate_hz: None,
             max_ratio: None,
@@ -68,6 +89,9 @@ pub fn settings(s: &Settings) -> Result<UpsamplerSettings, Error> {
     } else {
         UpsamplerSettings::deserialize(s).map_err(|_| Error::InvalidSettings)?
     };
+    if s.mode == UpsamplerMode::Auto && s.profile.trim().is_empty() {
+        return Err(Error::InvalidSettings);
+    }
     if !OFFERED_FILTERS.contains(&s.filter.as_str()) {
         return Err(Error::InvalidSettings);
     }
@@ -229,11 +253,18 @@ impl RateChangerFactory for Upsampler {
         if !s.enabled || !matches!(input.encoding(), SampleEncoding::F32 | SampleEncoding::F64) {
             return Ok(None);
         }
+        if s.mode == UpsamplerMode::Auto {
+            return Err(Error::InvalidSettings);
+        }
         Ok(choose_rate_for(input.sample_rate(), accepted, &s))
     }
 
     fn prepare(&self, request: RateRequest, s: &Settings) -> Result<Box<dyn RateChanger>, Error> {
         let s = settings(s)?;
+        // Le catalogue et la sonde appartiennent à l'hôte. Auto passe par avec_conception.
+        if s.mode == UpsamplerMode::Auto {
+            return Err(Error::InvalidSettings);
+        }
         Ok(Box::new(Instance::new(request, &s.filter)?))
     }
 }
@@ -274,6 +305,23 @@ impl Instance {
     /// Prépare une conception résolue par l'hôte, hors du rappel audio.
     /// La limite de portée borne les allocations des catalogues externes.
     pub fn avec_conception(request: RateRequest, conception: Conception) -> Result<Self, Error> {
+        Self::preparer_conception(request, conception, None)
+    }
+
+    /// Utilise les coefficients FIR déjà calculés par le greffon.
+    pub fn avec_noyau(
+        request: RateRequest,
+        conception: Conception,
+        coefficients: Vec<f64>,
+    ) -> Result<Self, Error> {
+        Self::preparer_conception(request, conception, Some(coefficients))
+    }
+
+    fn preparer_conception(
+        request: RateRequest,
+        conception: Conception,
+        coefficients: Option<Vec<f64>>,
+    ) -> Result<Self, Error> {
         use crate::conception::Fenetre;
         let fenetre_valide = match conception.fenetre {
             Fenetre::Kaiser { beta } => beta.is_finite() && (0.0..=100.0).contains(&beta),
@@ -298,9 +346,18 @@ impl Instance {
             return Err(Error::UnsupportedFormat);
         }
         let channels = usize::from(request.input.channels());
-        let engine = Surechantillonneur::nouveau(&conception, de, vers, channels)
-            .map_err(|_| Error::UnsupportedFormat)?;
         let ratio = (vers / de) as usize;
+        let engine = if let Some(h) = coefficients {
+            let taille = conception.portee * ratio;
+            if !(taille..=taille + 1).contains(&h.len()) {
+                return Err(Error::InvalidSettings);
+            }
+            let plan = conception::plan(de, vers).map_err(|_| Error::UnsupportedFormat)?;
+            Surechantillonneur::avec_noyau(&conception, plan, channels, h)
+        } else {
+            Surechantillonneur::nouveau(&conception, de, vers, channels)
+        }
+        .map_err(|_| Error::UnsupportedFormat)?;
         let peak = engine
             .noyau_etage1()
             .iter()
@@ -439,12 +496,7 @@ impl RateChanger for Instance {
     }
 
     fn reset(&mut self, _: ResetReason) {
-        let (de, vers) = (self.request.input.sample_rate(), self.request.output_rate);
-        // Rebuilding clears history and phase; it allocates, which `reset`
-        // allows (control/producer thread, never the device callback).
-        if let Ok(engine) = Surechantillonneur::nouveau(&self.conception, de, vers, self.channels) {
-            self.engine = engine;
-        }
+        self.engine.reinitialiser();
         self.limiter.oublier();
         self.tail_left = u64::from(self.latency);
         self.pending = 0;

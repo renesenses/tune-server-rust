@@ -39,6 +39,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(catalogue))
         .route("/machine-test", post(tester_la_machine))
+        .route("/zones/{id}/auto", get(lire_decision_auto))
         .route("/zones/{id}", get(lire_zone).put(ecrire_zone))
 }
 
@@ -77,6 +78,7 @@ async fn etat(state: &AppState) -> Value {
         "premium": state.license.check_feature(Feature::Upsampling).await,
         "installed": tune_core::audio::premium_plugins::enabled(&s, su::ID),
         "machine_test": su::verdict_enregistre(&s),
+        "auto_available": tune_core::audio::natifs_tiers::actif(&s,su::ID_PRO),
     })
 }
 
@@ -85,6 +87,11 @@ async fn catalogue(State(state): State<AppState>) -> Json<Value> {
     v["filters"] = filtres();
     v["ratios"] = json!(greffon::OFFERED_RATIOS);
     v["default_filter"] = json!(greffon::DEFAULT_FILTER);
+    if v["premium"] == true && v["auto_available"] == true {
+        v["auto_choices"] = tune_plugin_native::provider(su::ID_PRO)
+            .and_then(|p| p.options_pcm().ok())
+            .unwrap_or(Value::Null);
+    }
     Json(v)
 }
 
@@ -152,6 +159,7 @@ fn applies_at(portee: tune_core::orchestrator::PorteeDuReglage) -> &'static str 
     use tune_core::orchestrator::PorteeDuReglage as P;
     match portee {
         P::Immediate | P::Relance | P::RienNeJoue => "now",
+        P::EnNegociation => "pending",
         P::PisteSuivante => "next_track",
     }
 }
@@ -186,6 +194,11 @@ async fn forme_de_zone(
     })
 }
 
+async fn lire_decision_auto(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
+    let decision = state.orchestrator.decision_auto_du_flux(id).await;
+    Json(json!({"zone_id":id,"decision":decision}))
+}
+
 async fn lire_zone(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     Json(forme_de_zone(&state, id, None).await)
 }
@@ -217,7 +230,15 @@ async fn ecrire_zone(
         {
             return r;
         }
-        if let Err(r) = crate::premium_audio_plugins::require_installed(&state, su::ID, &headers) {
+        if let Err(r) = crate::premium_audio_plugins::require_installed(
+            &state,
+            if reglages.mode == greffon::UpsamplerMode::Auto {
+                su::ID_PRO
+            } else {
+                su::ID
+            },
+            &headers,
+        ) {
             return r;
         }
         // Étape I5 : au premier usage, la machine est mesurée avant que le

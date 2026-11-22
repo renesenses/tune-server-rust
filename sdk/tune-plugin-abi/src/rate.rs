@@ -130,6 +130,16 @@ pub unsafe fn call(factory: &dyn RateChangerFactory, raw: *mut Request) -> i32 {
                 3 => ResetReason::Stop,
                 _ => return Err(Error::InvalidSettings),
             }),
+            UPDATE => {
+                let settings = serde_json::from_slice(unsafe { r.data.bytes()? })
+                    .map_err(|_| Error::InvalidSettings)?;
+                stage.update(&settings)?;
+            }
+            DIAGNOSTICS => {
+                r.reply = Buffer::owned(
+                    serde_json::to_vec(&stage.diagnostics()).map_err(|_| Error::HostFailure)?,
+                );
+            }
             _ => return Err(Error::CapabilityMissing),
         }
         Ok(())
@@ -138,12 +148,18 @@ pub unsafe fn call(factory: &dyn RateChangerFactory, raw: *mut Request) -> i32 {
 
 #[macro_export]
 macro_rules! export_rate {
-    ($factory:expr, $manifest:expr) => {
+    ($factory:expr, $manifest:expr $(, finalizer = $finalizer:expr)?) => {
         mod native_export_rate {
             unsafe extern "C" fn manifest() -> $crate::Buffer {
                 $crate::Buffer::owned($manifest.as_bytes().to_vec())
             }
             unsafe extern "C" fn call(r: *mut $crate::Request) -> i32 {
+                $(
+                    if !r.is_null() && unsafe {r.cast::<u32>().read()} == size_of::<$crate::Request>() as u32 &&
+                        matches!(unsafe {(*r).operation},$crate::finish::OPTIONS|$crate::finish::CREATE_FINALIZER|$crate::finish::FINISH_PCM|$crate::finish::DROP_FINALIZER){
+                        return unsafe {$crate::finish::call(&$finalizer,r)};
+                    }
+                )?
                 unsafe { $crate::rate::call(&$factory, r) }
             }
             static API: $crate::Api = $crate::Api {

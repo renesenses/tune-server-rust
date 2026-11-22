@@ -397,6 +397,8 @@ pub(super) struct BackendCpal<'a> {
     position_ms: &'a AtomicU64,
     /// #7614 — la cadence ouverte POUR le greffon de suréchantillonnage,
     /// quand il a négocié une cadence et que le flux s'y est ouvert.
+    pub(super) quantification_active: Arc<AtomicBool>,
+    pub(super) plan_natif: Option<crate::audio::surechantillonnage::PlanNatif>,
     cadence_du_surechantillonneur: Option<u32>,
     refus_du_surechantillonneur: Option<&'static str>,
     /// #6132 — l'hôte ouvert, pour ouvrir la seconde sortie sur le même.
@@ -577,6 +579,24 @@ pub(super) fn cadence_pour_le_surechantillonneur(
     }
 }
 
+fn profondeur_pcm_acceptee(device: &cpal::Device, canaux: u16, cadence: u32) -> Option<u16> {
+    device
+        .supported_output_configs()
+        .ok()?
+        .filter(|c| {
+            c.channels() == canaux
+                && c.min_sample_rate() <= cadence
+                && c.max_sample_rate() >= cadence
+        })
+        .filter_map(|c| match c.sample_format() {
+            cpal::SampleFormat::I16 => Some(16),
+            cpal::SampleFormat::I32 => Some(32),
+            cpal::SampleFormat::F32 => Some(24), // mantisse du transport flottant
+            _ => None,                           // formats que cette cascade ne sait pas ouvrir
+        })
+        .max()
+}
+
 /// #9165 — la part de [`cadence_pour_le_surechantillonneur`] qui se juge
 /// SANS périphérique, par la même fonction : bit-perfect strict, source déjà
 /// au plus haut des cadences candidates, verdict de la machine, plafonds des
@@ -589,6 +609,18 @@ pub(super) fn surechantillonneur_possible_sans_peripherique(
     strict_bitperfect: bool,
     source_sr: u32,
 ) -> Result<(), RefusDeCadenceDuGreffon> {
+    if choix.reglages.mode == crate::audio::surechantillonnage::greffon::UpsamplerMode::Auto {
+        if strict_bitperfect {
+            return Err(RefusDeCadenceDuGreffon::BitPerfectStrict);
+        }
+        if source_sr == 0 {
+            return Err(RefusDeCadenceDuGreffon::SourceInconnue);
+        }
+        if tune_plugin_native::provider(crate::audio::surechantillonnage::ID_PRO).is_none() {
+            return Err(RefusDeCadenceDuGreffon::Auto("auto_plugin_unavailable"));
+        }
+        return Ok(());
+    }
     cadence_pour_le_surechantillonneur(
         choix,
         super::resolution::SampleRateEvidence::Measured,
@@ -604,6 +636,7 @@ pub(super) fn surechantillonneur_possible_sans_peripherique(
 /// précédente : le journal dit où la chaîne s'arrête.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum RefusDeCadenceDuGreffon {
+    Auto(&'static str),
     /// Bit-perfect strict : la zone refuse toute conversion.
     BitPerfectStrict,
     /// La liste de cadences du périphérique est supposée, pas mesurée.
@@ -612,19 +645,26 @@ pub(super) enum RefusDeCadenceDuGreffon {
     SourceInconnue,
     /// Aucun multiple entier de la source n'est accepté par l'énumération
     /// du périphérique. `candidates` : ce qui lui a été demandé.
-    AucuneCandidateAcceptee { candidates: Vec<u32> },
+    AucuneCandidateAcceptee {
+        candidates: Vec<u32>,
+    },
     /// Le périphérique accepte `acceptees`, mais le test de la machine
     /// n'admet le filtre réglé vers aucune d'elles.
-    RefuseesParLaMachine { acceptees: Vec<u32> },
+    RefuseesParLaMachine {
+        acceptees: Vec<u32>,
+    },
     /// Des cadences `admises` existent, mais les plafonds des réglages
     /// (cadence ou rapport maximal) les écartent toutes.
-    HorsDesPlafondsDesReglages { admises: Vec<u32> },
+    HorsDesPlafondsDesReglages {
+        admises: Vec<u32>,
+    },
 }
 
 impl RefusDeCadenceDuGreffon {
     /// Code stable, pour le journal.
     pub(super) fn code(&self) -> &'static str {
         match self {
+            Self::Auto(code) => code,
             Self::BitPerfectStrict => "strict_bitperfect",
             Self::CadencesNonMesurees => "rates_not_measured",
             Self::SourceInconnue => "source_rate_unknown",
@@ -736,6 +776,7 @@ impl<'a> BackendCpal<'a> {
         // #4953 — la liste de cadences de CE périphérique est-elle une mesure ?
         // Retenu hors du bloc de décision, comme `pcm_ouvert`.
         let cadences_mesurees: bool;
+        let mut plan_natif = None;
         let mut cadence_du_surechantillonneur: Option<u32> = None;
         let output_config = 'decision: {
             // First, get the device's default config (reflects actual
@@ -797,33 +838,65 @@ impl<'a> BackendCpal<'a> {
             // à cette cadence, c'est lui qui la porte (rubato ne tourne pas).
             let pour_le_greffon = surechantillonnage
                 .and_then(|choix| {
-                    cadence_pour_le_surechantillonneur(
-                        choix,
-                        rate_evidence,
-                        demande.strict_bitperfect,
-                        sample_rate,
-                        |r| {
-                            find_matching_config(&device, channels, r)
-                                .is_some_and(|c| c.sample_rate == r)
-                        },
-                    )
-                    .inspect_err(|refus| {
-                        refus_du_surechantillonneur = Some(refus.code());
-                        // #8149 — la raison du refus, et ce que cpal
-                        // énumère : sans elles, un « non appliqué » de
-                        // terrain ne se départage pas.
-                        info!(
-                            source_sr = sample_rate,
-                            backend = %host_id_name,
-                            endpoint_id = %opened_endpoint_id,
-                            channels,
-                            raison = refus.code(),
-                            detail = ?refus,
-                            plages = %plages_enumerees(&device),
-                            "local_audio_upsampler_rate_refused"
-                        );
-                    })
-                    .ok()
+                    let resultat = if choix.reglages.mode
+                        == crate::audio::surechantillonnage::greffon::UpsamplerMode::Auto
+                    {
+                        if demande.strict_bitperfect {
+                            Err(RefusDeCadenceDuGreffon::BitPerfectStrict)
+                        } else if !rate_evidence.is_measured() {
+                            Err(RefusDeCadenceDuGreffon::CadencesNonMesurees)
+                        } else {
+                            let formats = crate::audio::surechantillonnage::CADENCES_CANDIDATES
+                                .iter()
+                                .filter_map(|&r| {
+                                    profondeur_pcm_acceptee(&device, channels, r)
+                                        .map(|bits| (r, bits))
+                                })
+                                .collect::<Vec<_>>();
+                            choix
+                                .plan_natif(
+                                    sample_rate,
+                                    demande.spec.profondeur().bits_declares(),
+                                    channels,
+                                    &formats,
+                                )
+                                .map(|p| {
+                                    let rate = p.rate;
+                                    plan_natif = Some(p);
+                                    rate
+                                })
+                                .map_err(RefusDeCadenceDuGreffon::Auto)
+                        }
+                    } else {
+                        cadence_pour_le_surechantillonneur(
+                            choix,
+                            rate_evidence,
+                            demande.strict_bitperfect,
+                            sample_rate,
+                            |r| {
+                                find_matching_config(&device, channels, r)
+                                    .is_some_and(|c| c.sample_rate == r)
+                            },
+                        )
+                    };
+                    resultat
+                        .inspect_err(|refus| {
+                            refus_du_surechantillonneur = Some(refus.code());
+                            // #8149 — la raison du refus, et ce que cpal
+                            // énumère : sans elles, un « non appliqué » de
+                            // terrain ne se départage pas.
+                            info!(
+                                source_sr = sample_rate,
+                                backend = %host_id_name,
+                                endpoint_id = %opened_endpoint_id,
+                                channels,
+                                raison = refus.code(),
+                                detail = ?refus,
+                                plages = %plages_enumerees(&device),
+                                "local_audio_upsampler_rate_refused"
+                            );
+                        })
+                        .ok()
                 })
                 .and_then(|r| {
                     find_matching_config(&device, channels, r)
@@ -1004,6 +1077,19 @@ impl<'a> BackendCpal<'a> {
         // garbage audio from reaching the DAC during track transitions.
         let data_started_shared = Arc::new(AtomicBool::new(false));
         let recopie = super::sortie_double_locale::emplacement_vide();
+        let quantification_active = Arc::new(AtomicBool::new(false));
+        let quantification_auto = |cfg: &cpal::StreamConfig, bits: u16| {
+            let Some(plan) = plan_natif.as_ref().filter(|p| p.rate == cfg.sample_rate) else {
+                return Ok(None);
+            };
+            if cfg.channels != channels {
+                return Err(cpal::BuildStreamError::StreamConfigNotSupported);
+            }
+            plan.library
+                .prepare_final_pcm(plan.input, plan.rate, bits, &plan.settings)
+                .map(|q| Some((quantification_active.clone(), q)))
+                .map_err(|_| cpal::BuildStreamError::StreamConfigNotSupported)
+        };
         let build_stream =
             |cfg: &cpal::StreamConfig,
              ring_cb: Arc<RingBuf>,
@@ -1013,6 +1099,7 @@ impl<'a> BackendCpal<'a> {
              ds_cb: Arc<AtomicBool>,
              min_buf: usize,
              soft_mute_cb: crate::audio::soft_mute::SoftMuteGate| {
+                let mut quantification = quantification_auto(cfg, 24)?;
                 let mut ramp_cb = soft_mute_cb.ramp(cfg.sample_rate, cfg.channels);
                 // Prélevé AVANT la fermeture de rendu (#3205).
                 let famine_cb = ring_cb.starvation();
@@ -1029,7 +1116,7 @@ impl<'a> BackendCpal<'a> {
                         // dans les deux. #6132 — sans seconde sortie,
                         // `rendre_la_periode_de_a` l'appelle tel quel ; avec,
                         // au volume unité, puis recopie, puis volume de A.
-                        super::sortie_double_locale::rendre_la_periode_de_a(
+                        let actifs = super::sortie_double_locale::rendre_la_periode_de_a(
                             &recopie_cb,
                             &unite_cb,
                             &ring_cb,
@@ -1043,6 +1130,25 @@ impl<'a> BackendCpal<'a> {
                             data,
                             info,
                         );
+                        if let Some((active, q)) = quantification.as_mut() {
+                            if active.load(Ordering::Acquire) && vol_cb.load(Ordering::Relaxed) != 0
+                            {
+                                for chunk in data[..actifs].chunks_mut(256) {
+                                    let mut mots = [0.0f64; 256];
+                                    let bloc = &mut mots[..chunk.len()];
+                                    for (dst, src) in bloc.iter_mut().zip(chunk.iter()) {
+                                        *dst = f64::from(*src);
+                                    }
+                                    if q.process(bloc).is_err() {
+                                        chunk.fill(0.0);
+                                    } else {
+                                        for (dst, src) in chunk.iter_mut().zip(bloc.iter()) {
+                                            *dst = *src as f32;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     },
                     make_stream_error_cb(device_gone.clone(), famine_cb),
                     None,
@@ -1082,13 +1188,58 @@ impl<'a> BackendCpal<'a> {
                 min_buffer,
                 soft_mute.clone(),
             );
-            (stream_result, ring_buf)
+            // Un DAC peut accepter le flottant à la cadence source et exiger
+            // l'entier à la cadence Auto. Essayer le plan avant de le dégrader.
+            if stream_result.is_err()
+                && plan_natif
+                    .as_ref()
+                    .is_some_and(|p| p.rate == cfg.sample_rate)
+            {
+                for bits in [32, 16] {
+                    let Ok(q) = quantification_auto(cfg, bits) else {
+                        continue;
+                    };
+                    let essai = if bits == 32 {
+                        build_int_stream::<i32>(
+                            &device,
+                            cfg,
+                            ring_buf.clone(),
+                            volume.clone(),
+                            paused.clone(),
+                            silent_cb_outer.clone(),
+                            data_started_shared.clone(),
+                            min_buffer,
+                            device_gone.clone(),
+                            soft_mute.clone(),
+                            q,
+                        )
+                    } else {
+                        build_int_stream::<i16>(
+                            &device,
+                            cfg,
+                            ring_buf.clone(),
+                            volume.clone(),
+                            paused.clone(),
+                            silent_cb_outer.clone(),
+                            data_started_shared.clone(),
+                            min_buffer,
+                            device_gone.clone(),
+                            soft_mute.clone(),
+                            q,
+                        )
+                    };
+                    if essai.is_ok() {
+                        return (essai, ring_buf, false);
+                    }
+                }
+            }
+            (stream_result, ring_buf, true)
         };
         let par_la_matrice = config_de_la_matrice
             .as_ref()
             .and_then(|cfg| match ouvrir_a(cfg) {
-                (Ok(s), ring) => Some((s, cfg.clone(), ring)),
-                (Err(e), _) => {
+                (Ok(s), ring, recopie) => Some((s, cfg.clone(), ring, recopie)),
+                (Err(e), _, _) => {
                     info!(
                         device = %device_name,
                         voies = cfg.channels,
@@ -1098,15 +1249,14 @@ impl<'a> BackendCpal<'a> {
                     None
                 }
             });
-        let (stream_result, output_config, ring_buf) = match par_la_matrice {
-            Some((s, cfg, ring)) => (Ok(s), cfg, ring),
+        let (stream_result, output_config, ring_buf, mut recopie_possible) = match par_la_matrice {
+            Some((s, cfg, ring, recopie)) => (Ok(s), cfg, ring, recopie),
             None => {
-                let (stream_result, ring_buf) = ouvrir_a(&output_config);
-                (stream_result, output_config, ring_buf)
+                let (stream_result, ring_buf, recopie) = ouvrir_a(&output_config);
+                (stream_result, output_config, ring_buf, recopie)
             }
         };
 
-        let mut recopie_possible = true;
         let (stream, actual_config, ring) = match stream_result {
             Ok(s) => (s, output_config, ring_buf),
             Err(first_err) => {
@@ -1171,6 +1321,11 @@ impl<'a> BackendCpal<'a> {
                                         (cand.sample_rate as usize) * (cand.channels as usize) / 5;
                                     let min_buf = garde_de_prechargement(cand, min_buf_ms);
                                     for is_i32 in [true, false] {
+                                        let Ok(quantification) =
+                                            quantification_auto(cand, if is_i32 { 32 } else { 16 })
+                                        else {
+                                            continue;
+                                        };
                                         starvation.begin_stream(cand.sample_rate, cand.channels);
                                         let r =
                                             Arc::new(RingBuf::new_metered(cap, starvation.clone()));
@@ -1188,6 +1343,7 @@ impl<'a> BackendCpal<'a> {
                                                 min_buf,
                                                 device_gone.clone(),
                                                 soft_mute.clone(),
+                                                quantification,
                                             )
                                         } else {
                                             build_int_stream::<i16>(
@@ -1201,6 +1357,7 @@ impl<'a> BackendCpal<'a> {
                                                 min_buf,
                                                 device_gone.clone(),
                                                 soft_mute.clone(),
+                                                quantification,
                                             )
                                         };
                                         match res {
@@ -1298,6 +1455,8 @@ impl<'a> BackendCpal<'a> {
             starvation,
             position_ms: demande.position_ms,
             cadence_du_surechantillonneur,
+            quantification_active,
+            plan_natif,
             refus_du_surechantillonneur,
             host,
             recopie,

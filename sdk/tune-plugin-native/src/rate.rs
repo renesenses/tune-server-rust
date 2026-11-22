@@ -92,6 +92,22 @@ pub struct NativeRate {
     written: u64,
 }
 impl NativeRate {
+    pub fn update(&mut self, settings: &Settings) -> Result<(), Error> {
+        let mut r = abi::Request::new(abi::UPDATE);
+        r.handle = self.handle;
+        let mut json = serde_json::to_vec(settings).map_err(|_| Error::InvalidSettings)?;
+        r.data = abi::Buffer {
+            data: json.as_mut_ptr(),
+            len: json.len() as u64,
+        };
+        self.library.call(&mut r)
+    }
+    pub fn diagnostics(&self) -> Result<Settings, Error> {
+        let mut r = abi::Request::new(abi::DIAGNOSTICS);
+        r.handle = self.handle;
+        self.library.call(&mut r)?;
+        self.library.reply(r.reply)
+    }
     pub fn latency_frames(&self) -> u32 {
         self.latency
     }
@@ -105,7 +121,7 @@ impl NativeRate {
             return Err(Error::InvalidFormat);
         }
         if input.frames() > self.request.max_input_frames
-            || output.frames() != self.request.max_output_frames()
+            || output.frames() < self.request.max_output_frames()
         {
             return Err(Error::BlockTooLarge);
         }
@@ -113,6 +129,8 @@ impl NativeRate {
         r.handle = self.handle;
         r.data = bytes(input);
         r.reply = bytes(output);
+        r.reply.len = (r.reply.len / output.frames().max(1) as u64)
+            * output.frames().min(self.request.max_output_frames()) as u64;
         r.zone_id = context.zone_id;
         r.generation = context.generation;
         r.position_frames = context.position_frames;
@@ -141,6 +159,8 @@ impl NativeRate {
         let mut r = abi::Request::new(abi::DRAIN);
         r.handle = self.handle;
         r.reply = bytes(output);
+        r.reply.len = (r.reply.len / output.frames().max(1) as u64)
+            * output.frames().min(self.request.max_output_frames()) as u64;
         self.library.call(&mut r)?;
         if r.other > output.frames() as u64 {
             return Err(Error::InvalidState);
@@ -168,6 +188,68 @@ impl NativeRate {
 impl Drop for NativeRate {
     fn drop(&mut self) {
         let mut r = abi::Request::new(abi::DESTROY);
+        r.handle = self.handle;
+        let _ = self.library.call(&mut r);
+    }
+}
+
+/// Owned by one device callback. Construction and destruction run outside rendering.
+pub struct NativeFinalPcm {
+    library: Arc<Library>,
+    handle: u64,
+}
+impl Library {
+    pub fn options_pcm(&self) -> Result<Settings, Error> {
+        if self.api().kind != abi::rate::KIND {
+            return Err(Error::CapabilityMissing);
+        }
+        let mut r = abi::Request::new(abi::finish::OPTIONS);
+        self.call(&mut r)?;
+        self.reply(r.reply)
+    }
+    pub fn prepare_final_pcm(
+        self: &Arc<Self>,
+        input: AudioFormat,
+        rate: u32,
+        transport_bits: u16,
+        settings: &Settings,
+    ) -> Result<NativeFinalPcm, Error> {
+        if self.api().kind != abi::rate::KIND {
+            return Err(Error::CapabilityMissing);
+        }
+        let mut r = abi::Request::new(abi::finish::CREATE_FINALIZER);
+        r.format = abi::Format::from_audio(input);
+        r.other = u64::from(rate);
+        r.flags = u32::from(transport_bits);
+        let mut raw = serde_json::to_vec(settings).map_err(|_| Error::InvalidSettings)?;
+        r.data = abi::Buffer {
+            data: raw.as_mut_ptr(),
+            len: raw.len() as u64,
+        };
+        self.call(&mut r)?;
+        if r.handle == 0 {
+            return Err(Error::InvalidState);
+        }
+        Ok(NativeFinalPcm {
+            library: self.clone(),
+            handle: r.handle,
+        })
+    }
+}
+impl NativeFinalPcm {
+    pub fn process(&mut self, words: &mut [f64]) -> Result<(), Error> {
+        let mut r = abi::Request::new(abi::finish::FINISH_PCM);
+        r.handle = self.handle;
+        r.data = abi::Buffer {
+            data: words.as_mut_ptr().cast(),
+            len: size_of_val(words) as u64,
+        };
+        self.library.call(&mut r)
+    }
+}
+impl Drop for NativeFinalPcm {
+    fn drop(&mut self) {
+        let mut r = abi::Request::new(abi::finish::DROP_FINALIZER);
         r.handle = self.handle;
         let _ = self.library.call(&mut r);
     }

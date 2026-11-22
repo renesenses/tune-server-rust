@@ -109,6 +109,9 @@ impl Library {
             _ => Ok(()),
         }
     }
+    pub fn is_rate_changer(&self) -> bool {
+        self.api().kind == abi::rate::KIND
+    }
     fn api(&self) -> &abi::Api {
         let _pin = &self.library;
         unsafe { &*self.api }
