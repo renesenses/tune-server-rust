@@ -530,7 +530,7 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                 .as_ref()
                 .and_then(|np| np.stream_id.as_deref())
             {
-                Some(sid) => state.streamer.stream_output_wire(sid).await,
+                Some(sid) => state.streamer.fil_du_chemin_du_signal(sid).await,
                 None => None,
             };
             inject_source_channels(obj, ps.now_playing.as_ref(), wire.as_ref());
@@ -781,7 +781,7 @@ pub(crate) async fn get_zone(
                     .as_ref()
                     .and_then(|np| np.stream_id.as_deref())
                 {
-                    Some(sid) => state.streamer.stream_output_wire(sid).await,
+                    Some(sid) => state.streamer.fil_du_chemin_du_signal(sid).await,
                     None => None,
                 };
                 inject_source_channels(obj, ps.now_playing.as_ref(), wire.as_ref());

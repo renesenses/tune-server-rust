@@ -1260,7 +1260,7 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
             .as_ref()
             .and_then(|np| np.stream_id.as_deref())
         {
-            Some(sid) => state.streamer.stream_output_wire(sid).await,
+            Some(sid) => state.streamer.fil_du_chemin_du_signal(sid).await,
             None => None,
         };
         // #5353 — le backend de la sortie de CETTE zone, et le signalement

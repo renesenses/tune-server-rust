@@ -136,7 +136,7 @@ async fn build_snapshot(state: &AppState, lang: &str) -> serde_json::Value {
             .as_ref()
             .and_then(|np| np.stream_id.as_deref())
         {
-            Some(sid) => state.streamer.stream_output_wire(sid).await,
+            Some(sid) => state.streamer.fil_du_chemin_du_signal(sid).await,
             None => None,
         };
         // #5353 — le backend de la sortie de CETTE zone.

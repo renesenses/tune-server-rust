@@ -99,3 +99,90 @@ async fn un_podcast_relaye_au_format_connu_l_affiche_9316() {
     );
     assert!(!texte.contains("44kHz"), "{chemin}");
 }
+
+/// Fil 9316 (suite, décision du 22/11) — la sonde des VU-mètres mesure le
+/// flux relayé : une fois le format connu, le chemin du signal l'affiche.
+///
+/// Sonde factice : l'observateur que `play_episode` remet à la sonde
+/// (`observateur_du_format_relaye`) est appelé avec ce qu'elle aurait lu,
+/// 48 kHz / 24 bits. Le fil est lu comme le lisent les routes de zone
+/// (`fil_du_chemin_du_signal`).
+///
+/// Contre-épreuve : sans la publication (`publier_le_format_mesure` vidé),
+/// le chemin reste « inconnu » et ce témoin tombe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn un_podcast_relaye_affiche_le_format_mesure_par_la_sonde_9316() {
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    let (_, session) = state
+        .orchestrator
+        .relayer_un_flux_distant(EPISODE, "audio/aac", Some(1_800_000), None, None)
+        .await;
+    let repo = ZoneRepo::with_backend(state.backend.clone());
+    let id = repo
+        .create(
+            "Salon 9316 mesure",
+            Some("dlna"),
+            Some("uuid:renderer-9316m"),
+        )
+        .unwrap();
+    let zone = repo.get(id).unwrap().unwrap();
+    let ps = ZoneState {
+        state: PlayState::Playing,
+        now_playing: Some(NowPlaying {
+            title: "Concert du soir".into(),
+            source: "podcast".into(),
+            source_id: Some(EPISODE.into()),
+            format: Some("aac".into()),
+            stream_id: Some(session.clone()),
+            duration_ms: 1_800_000,
+            ..Default::default()
+        }),
+        volume: 1.0,
+        ..Default::default()
+    };
+    let chemin = |fil: StreamInfo| {
+        build_signal_path_pub(
+            &ps,
+            &zone,
+            &state.backend,
+            Some("Renderer 9316"),
+            "",
+            Some(&fil),
+        )
+        .expect("une zone en lecture a un chemin du signal")
+        .to_string()
+    };
+
+    // Avant la mesure : inconnu, rien d'inventé.
+    let avant = state
+        .streamer
+        .fil_du_chemin_du_signal(&session)
+        .await
+        .unwrap();
+    let texte = chemin(avant);
+    assert!(
+        !texte.contains("48kHz") && !texte.contains("44kHz"),
+        "{texte}"
+    );
+
+    let sonde = state
+        .orchestrator
+        .observateur_du_format_relaye(&session)
+        .await
+        .expect("la session relayée existe");
+    sonde(48_000, Some(24));
+
+    let apres = state
+        .streamer
+        .fil_du_chemin_du_signal(&session)
+        .await
+        .unwrap();
+    assert_eq!((apres.sample_rate, apres.bit_depth), (48_000, 24));
+    let texte = chemin(apres);
+    assert!(
+        texte.contains("48kHz"),
+        "fil 9316 : la fréquence mesurée s'affiche : {texte}"
+    );
+    assert!(texte.contains("24bit"), "{texte}");
+    assert!(!texte.contains("44kHz"), "{texte}");
+}

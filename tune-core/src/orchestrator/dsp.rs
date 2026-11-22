@@ -337,6 +337,19 @@ impl PlaybackOrchestrator {
         url: String,
         codec_hint: String,
     ) {
+        self.spawn_proxy_levels_probe_observee(zone_id, url, codec_hint, None)
+            .await;
+    }
+
+    /// [`Self::spawn_proxy_levels_probe`], avec un observateur du format que
+    /// la sonde lit dans le conteneur (fil 9316, suite : podcast relayé).
+    pub(super) async fn spawn_proxy_levels_probe_observee(
+        &self,
+        zone_id: i64,
+        url: String,
+        codec_hint: String,
+        au_format: Option<super::ObservateurDeFormat>,
+    ) {
         let Some(bus) = self
             .event_bus
             .clone()
@@ -354,6 +367,7 @@ impl PlaybackOrchestrator {
             url,
             codec_hint,
             play_seq,
+            au_format,
         );
     }
 

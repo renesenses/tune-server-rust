@@ -479,7 +479,7 @@ async fn levels_probe_decodes_http_stream_into_windows() {
     let reported = Arc::new(std::sync::atomic::AtomicI64::new(600_000));
     let url = format!("http://{addr}/probe.wav");
     tokio::task::spawn_blocking(move || {
-        super::decode_http_stream_for_levels(url, "wav".into(), tx, reported)
+        super::decode_http_stream_for_levels(url, "wav".into(), tx, reported, None)
             .expect("probe decodes the served WAV")
     })
     .await
@@ -561,7 +561,7 @@ async fn levels_chain_emits_audio_levels_on_bus() {
         super::spawn_paced_levels_forwarder(bus.clone(), playback.clone(), zone_id, play_seq, 0);
     let reported = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let probe = tokio::task::spawn_blocking(move || {
-        super::decode_http_stream_for_levels(url, "wav".into(), levels_tx, reported)
+        super::decode_http_stream_for_levels(url, "wav".into(), levels_tx, reported, None)
     });
 
     let mut n = 0u32;
@@ -890,7 +890,7 @@ async fn diag_probe_emits_bus_events() {
         super::spawn_paced_levels_forwarder(bus.clone(), playback.clone(), zone_id, play_seq, 0);
     let reported = Arc::new(std::sync::atomic::AtomicI64::new(0));
     let probe = tokio::task::spawn_blocking(move || {
-        super::decode_http_stream_for_levels(url, "flac".into(), levels_tx, reported)
+        super::decode_http_stream_for_levels(url, "flac".into(), levels_tx, reported, None)
     });
 
     // Compte les audio_levels émis sur ~4 s (cadence réelle ≈ 25/s).

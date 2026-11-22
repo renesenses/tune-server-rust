@@ -1496,7 +1496,7 @@ impl PlaybackOrchestrator {
                         );
                     } else {
                         spawn_proxy_levels_probe_task(
-                            playback, bus, zone_id, data.url, codec, play_seq,
+                            playback, bus, zone_id, data.url, codec, play_seq, None,
                         );
                     }
                 });

@@ -1169,7 +1169,12 @@ pub(super) async fn play_episode(
             // sonde, les VU-mètres restaient à 0 pendant tout l'épisode.
             state
                 .orchestrator
-                .sonder_les_niveaux_d_un_episode(zone_id, &body.audio_url, mime_type)
+                .sonder_les_niveaux_d_un_episode(
+                    zone_id,
+                    &body.audio_url,
+                    mime_type,
+                    relais.as_ref().map(|(_, session)| session.as_str()),
+                )
                 .await;
             let s = state.playback.get_state(zone_id).await;
             if let Some(np) = s.now_playing.as_ref() {

@@ -396,6 +396,13 @@ pub struct StreamSession {
     pub detected_sample_rate: std::sync::atomic::AtomicU32,
     pub detected_channels: std::sync::atomic::AtomicU16,
     detected_bit_depth: std::sync::atomic::AtomicU16,
+    /// Fil 9316 (suite) — le format qu'une sonde des VU-mètres a MESURÉ sur
+    /// les octets d'un flux relayé tel quel (podcast vers un renderer
+    /// réseau) : `(fréquence, profondeur)`, profondeur `0` si le codec n'en
+    /// a pas (AAC, MP3). Posé une fois, lu par le seul chemin du signal
+    /// ([`AudioStreamer::fil_du_chemin_du_signal`]) : rien de ce qui sert ou
+    /// annonce l'audio ne le lit, le flux servi reste verbatim.
+    format_mesure_du_relais: std::sync::OnceLock<(u32, u16)>,
     pub wav_header_included: std::sync::atomic::AtomicBool,
     /// L'en-tête WAV tel que le décodeur l'a émis — pour le REJOUER.
     ///
@@ -739,6 +746,39 @@ impl StreamSession {
             .unwrap_or_else(|e| e.into_inner()) = Some(observateur);
     }
 
+    /// Fil 9316 (suite) — publie le format qu'une sonde a mesuré sur ce flux
+    /// relayé. Une fréquence nulle ne dit rien : ignorée. Seule la première
+    /// mesure compte (thread-safe : `OnceLock`).
+    pub fn publier_le_format_mesure(&self, sample_rate: u32, bit_depth: Option<u16>) {
+        if sample_rate == 0 {
+            return;
+        }
+        let _ = self
+            .format_mesure_du_relais
+            .set((sample_rate, bit_depth.unwrap_or(0)));
+    }
+
+    /// Fil 9316 (suite) — le format mesuré par la sonde, une fois connu.
+    pub fn format_mesure(&self) -> Option<(u32, u16)> {
+        self.format_mesure_du_relais.get().copied()
+    }
+
+    /// Ce que le chemin du signal affiche : le fil, complété par la mesure de
+    /// la sonde là où le fil ne sait rien (0). Une valeur connue du fil n'est
+    /// jamais remplacée.
+    pub(crate) fn info_du_chemin_du_signal(&self) -> StreamInfo {
+        let mut info = self.effective_output_info();
+        if let Some((sample_rate, bit_depth)) = self.format_mesure() {
+            if info.sample_rate == 0 {
+                info.sample_rate = sample_rate;
+            }
+            if info.bit_depth == 0 {
+                info.bit_depth = bit_depth;
+            }
+        }
+        info
+    }
+
     pub(crate) fn effective_output_info(&self) -> StreamInfo {
         let mut info = self.info.clone();
         if self.is_radio {
@@ -830,6 +870,7 @@ impl StreamSession {
             detected_sample_rate: std::sync::atomic::AtomicU32::new(0),
             detected_channels: std::sync::atomic::AtomicU16::new(0),
             detected_bit_depth: std::sync::atomic::AtomicU16::new(0),
+            format_mesure_du_relais: std::sync::OnceLock::new(),
             wav_header_included: std::sync::atomic::AtomicBool::new(false),
             wav_header_stash: std::sync::OnceLock::new(),
             contexte_de_conversion: std::sync::OnceLock::new(),
@@ -2369,6 +2410,29 @@ impl AudioStreamer {
             .await
             .get(stream_id)
             .map(|s| s.effective_output_info())
+    }
+
+    /// Fil 9316 (suite) — le fil de [`Self::stream_output_wire`], complété
+    /// par le format que la sonde des VU-mètres a mesuré sur un flux relayé
+    /// (podcast). Réservé au chemin du signal : les autres lecteurs du fil
+    /// (annonce DIDL, contrat de signal, transport) gardent
+    /// `stream_output_wire`, inchangé.
+    pub async fn fil_du_chemin_du_signal(&self, stream_id: &str) -> Option<StreamInfo> {
+        self.sessions
+            .lock()
+            .await
+            .get(stream_id)
+            .map(|s| s.info_du_chemin_du_signal())
+    }
+
+    /// Fil 9316 (suite) — la session, sans la retenir en vie : une sonde qui
+    /// survit à sa session n'empêche pas sa libération.
+    pub async fn session_faible(&self, stream_id: &str) -> Option<std::sync::Weak<StreamSession>> {
+        self.sessions
+            .lock()
+            .await
+            .get(stream_id)
+            .map(Arc::downgrade)
     }
 
     pub(crate) async fn retenir_fichier_prepare(&self, sid: &str) -> Option<BailFichierPrepare> {

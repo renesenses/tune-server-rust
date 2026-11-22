@@ -1067,11 +1067,17 @@ fn reference_du_frein(position_rapportee_ms: i64, consomme_ms: i64) -> i64 {
 /// observateur, son échec (CDN, codec inconnu) laisse juste les VU muets.
 /// S'arrête dès que le forwarder de niveaux disparaît (stop / piste
 /// remplacée : le récepteur du canal est lâché).
+///
+/// `au_format` (fil 9316, suite) reçoit UNE fois ce que la sonde lit dans le
+/// conteneur : la fréquence (seulement si le conteneur la déclare — jamais le
+/// repli 44 100 du fenêtrage) et la profondeur, `None` pour un codec qui n'en
+/// a pas. Pur observateur, lui aussi : le flux servi n'en sait rien.
 fn decode_http_stream_for_levels(
     url: String,
     codec_hint: String,
     levels_tx: tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
     reported_position_ms: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    au_format: Option<ObservateurDeFormat>,
 ) -> Result<(), String> {
     use symphonia::core::audio::conv::IntoSample;
     use symphonia::core::codecs::CodecParameters;
@@ -1128,6 +1134,15 @@ fn decode_http_stream_for_levels(
         .map(|c| c.count() as u16)
         .unwrap_or(2);
     let sample_rate = audio_params.sample_rate.unwrap_or(44100);
+    if let (Some(observer), Some(mesure)) = (au_format, audio_params.sample_rate) {
+        observer(
+            mesure,
+            audio_params
+                .bits_per_sample
+                .and_then(|b| u16::try_from(b).ok())
+                .filter(|b| *b > 0),
+        );
+    }
 
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
@@ -1206,6 +1221,10 @@ fn decode_http_stream_for_levels(
 /// changé entre-temps, le forwarder adoptait la génération de la NOUVELLE
 /// piste et survivait au lieu de mourir, publiant le PCM de l'ancienne sur
 /// l'horloge de la nouvelle (#1110).
+/// Fil 9316 (suite) — reçoit `(fréquence, profondeur)` lus par la sonde des
+/// niveaux dans le conteneur du flux. Voir [`decode_http_stream_for_levels`].
+pub type ObservateurDeFormat = Box<dyn FnOnce(u32, Option<u16>) + Send>;
+
 fn spawn_proxy_levels_probe_task(
     playback: Arc<PlaybackManager>,
     bus: Arc<EventBus>,
@@ -1213,6 +1232,7 @@ fn spawn_proxy_levels_probe_task(
     url: String,
     codec_hint: String,
     play_seq: u64,
+    au_format: Option<ObservateurDeFormat>,
 ) {
     tokio::spawn(async move {
         let (levels_tx, consomme_ms) =
@@ -1240,7 +1260,7 @@ fn spawn_proxy_levels_probe_task(
         });
 
         let result = tokio::task::spawn_blocking(move || {
-            decode_http_stream_for_levels(url, codec_hint, levels_tx, reported)
+            decode_http_stream_for_levels(url, codec_hint, levels_tx, reported, au_format)
         })
         .await;
         match result {
@@ -2108,6 +2128,9 @@ mod contenu_explicite_8088_tests;
 pub mod ecoute_validee_7852;
 #[cfg(test)]
 mod ecoute_validee_7852_tests;
+// Fil 9316 (suite) — podcast relayé : format mesuré par la sonde des niveaux.
+#[cfg(test)]
+mod format_du_relais_9316_tests;
 // #8076 — FLAC local vers DLNA en PURE : voie servie et échantillons exacts.
 #[cfg(test)]
 mod gapless_dlna_pure_8076_tests;

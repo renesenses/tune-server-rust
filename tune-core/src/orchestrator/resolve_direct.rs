@@ -2154,15 +2154,52 @@ impl PlaybackOrchestrator {
     /// le flux joué n'est pas touché. À appeler une fois la lecture lancée
     /// (et l'éventuelle reprise posée) : la sonde s'attache à la piste en
     /// cours de la zone.
+    ///
+    /// Fil 9316 (suite) — `session_relayee` : la session du mandataire qui
+    /// relaie l'épisode, quand il y en a une. La sonde y publie la fréquence
+    /// et la profondeur qu'elle lit dans le conteneur, pour le seul chemin du
+    /// signal ; les octets servis ne changent pas.
     pub async fn sonder_les_niveaux_d_un_episode(
         &self,
         zone_id: i64,
         audio_url: &str,
         mime_type: &str,
+        session_relayee: Option<&str>,
     ) {
         let codec = conteneur_depuis_url(audio_url, mime_type);
-        self.spawn_proxy_levels_probe(zone_id, audio_url.to_string(), codec.to_string())
-            .await;
+        let au_format = match session_relayee {
+            Some(sid) => self.observateur_du_format_relaye(sid).await,
+            None => None,
+        };
+        self.spawn_proxy_levels_probe_observee(
+            zone_id,
+            audio_url.to_string(),
+            codec.to_string(),
+            au_format,
+        )
+        .await;
+    }
+
+    /// Fil 9316 (suite) — l'observateur que la sonde des niveaux appelle une
+    /// fois le format du flux lu : il le publie sur la session relayée
+    /// `session_id` ([`crate::http::streamer::StreamSession::publier_le_format_mesure`]),
+    /// tenue faiblement. `None` si la session n'existe pas.
+    pub async fn observateur_du_format_relaye(
+        &self,
+        session_id: &str,
+    ) -> Option<super::ObservateurDeFormat> {
+        let session = self.streamer.session_faible(session_id).await?;
+        Some(Box::new(move |sample_rate, bit_depth| {
+            if let Some(session) = session.upgrade() {
+                session.publier_le_format_mesure(sample_rate, bit_depth);
+                info!(
+                    stream_id = %session.id,
+                    sample_rate,
+                    bit_depth = bit_depth.unwrap_or(0),
+                    "format_du_relais_mesure"
+                );
+            }
+        }))
     }
     async fn relayer_direct_au_navigateur(&self, req: &PlayRequest, d: Directe<'_>) -> FluxDirect {
         let Directe {
