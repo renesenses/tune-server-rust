@@ -270,6 +270,14 @@ pub async fn auth_middleware(
         && (method == axum::http::Method::GET || method == axum::http::Method::HEAD)
         && tune_core::upnp_server::est_ressource_didl(path)
         && appelant_sur_le_reseau_local(&request)
+        // Un appelant qui porte un jeton VALIDE (le cookie de session du
+        // navigateur, qu'une balise `<img>` envoie d'elle-même) n'est pas un
+        // renderer : il passe par le contrôle de jeton ci-dessous, comme
+        // n'importe quelle requête authentifiée. Sans cela, le client web du
+        // LAN entrait par l'exemption et le relais de pochettes lui exigeait
+        // une signature qu'il n'a jamais portée. Un jeton absent ou invalide
+        // garde l'exemption telle qu'elle était.
+        && !porte_un_jeton_valide(&request, &settings)
     {
         // #4260 : le gestionnaire du relais de pochettes doit savoir que
         // l'appel est entré SANS jeton, par cette exemption — il exige alors
@@ -310,6 +318,23 @@ pub async fn auth_middleware(
             }
         }
         None => (StatusCode::UNAUTHORIZED, "authentication required").into_response(),
+    }
+}
+
+/// Le jeton de la requête (en-tête ou cookie `tune_session`) est-il accepté
+/// par le contrôle qui suit l'exemption DIDL ? Mêmes règles que ce contrôle :
+/// clé d'API égale au réglage, ou JWT vérifié avec `jwt_secret`.
+fn porte_un_jeton_valide(request: &Request, settings: &SettingsRepo) -> bool {
+    match extract_token_from_request(request) {
+        Some(tok) if tok.starts_with("ApiKey:") => {
+            let stored = settings.get("api_key").ok().flatten().unwrap_or_default();
+            !stored.is_empty() && tok[7..] == stored
+        }
+        Some(tok) => match settings.get("jwt_secret").ok().flatten() {
+            Some(secret) if !secret.is_empty() => verify_jwt(&tok, &secret).is_ok(),
+            _ => false,
+        },
+        None => false,
     }
 }
 
