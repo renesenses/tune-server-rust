@@ -1856,6 +1856,10 @@ pub mod relais_de_groupe_6155;
 #[cfg(test)]
 mod signal_path_tests;
 
+// #9316 — un podcast relayé n'affiche plus un 44,1 kHz / 16 bits inventé.
+#[cfg(test)]
+mod signal_path_podcast_relaye_9316_tests;
+
 // #5081 — l'ombre de la tête sur l'étape crossfeed du chemin du signal.
 #[cfg(test)]
 mod signal_path_ombre_5081_tests;
