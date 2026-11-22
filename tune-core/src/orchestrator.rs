@@ -2704,6 +2704,10 @@ mod reprise_au_redemarrage_6380;
 /// réseau à la position de la pause.
 #[cfg(test)]
 mod reprise_dlna_position_2095;
+/// #8967 — Lecture sur une zone navigateur dont la session a expiré
+/// pendant la pause : la piste repart au lieu d'une erreur.
+#[cfg(test)]
+mod reprise_navigateur_8967_tests;
 /// Fil 2125 — le saut de la reprise après décrochage attend que le renderer
 /// ait ouvert le flux.
 #[cfg(test)]
