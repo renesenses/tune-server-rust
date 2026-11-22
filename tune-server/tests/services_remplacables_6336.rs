@@ -802,6 +802,37 @@ fn la_feature_des_services_factices_n_atteint_aucun_binaire_publie_6336() {
 /// #7250 — le vrai connecteur, la route et son cache gardent les 357 favoris.
 #[tokio::test]
 async fn favoris_tidal_plafonnes_route_et_cache_7250() {
+    // Le cache utilisateur est global : le test de connexion TIDAL voisin
+    // le purge après authentification. Chaque banc garde ici son processus.
+    const ENFANT: &str = "TUNE_TEST_FAVORIS_TIDAL_7250_ENFANT";
+    if std::env::var_os(ENFANT).is_none() {
+        let nom = concat!(
+            module_path!(),
+            "::favoris_tidal_plafonnes_route_et_cache_7250"
+        );
+        let (_, nom) = nom.split_once("::").expect("nom sans préfixe de caisse");
+        let sortie = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([nom, "--exact", "--nocapture", "--test-threads=1"])
+            .env(ENFANT, std::process::id().to_string())
+            .output()
+            .expect("lancer le témoin TIDAL isolé");
+        let stdout = String::from_utf8_lossy(&sortie.stdout);
+        let stderr = String::from_utf8_lossy(&sortie.stderr);
+        assert!(
+            sortie.status.success(),
+            "#7250 : témoin isolé en échec\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed; 0 failed; 0 ignored"),
+            "#7250 : le processus enfant doit exécuter exactement le témoin\n{stdout}\n{stderr}"
+        );
+        return;
+    }
+    assert_ne!(
+        std::env::var(ENFANT).unwrap(),
+        std::process::id().to_string(),
+        "#7250 : les états globaux doivent appartenir à un autre processus"
+    );
     use axum::extract::Query;
     use std::collections::HashMap;
     use std::sync::{
