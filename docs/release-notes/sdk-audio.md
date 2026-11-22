@@ -1,3 +1,5 @@
+> Fragment historique de la livraison SDK initiale. Pour rc13, la décision #9210 du 17/11/2026 le remplace sur le crossfeed : « Le crossfeed simple devient gratuit ; Crossfeed Pro reste Premium. » Ne pas réutiliser les annonces de coupure FREE ci-dessous pour rc13.
+
 <!-- Prepared release-note fragment: integrate into the next SDK release, not v0.9.154. -->
 
 <!-- lang:fr -->

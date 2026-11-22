@@ -94,3 +94,19 @@ header[data-tauri-drag-region] > * { cursor: default; }
 #btn-settings-back:hover { color: #fff; border-color: #6b7280; }
 #server-status { color: #22c55e; font-size: 8px; }
 #server-status.offline { color: #ef4444; }
+
+/* Liste des serveurs du réseau (#9255). */
+#serveurs-reseau { margin-bottom: 12px; }
+.titre-serveurs { display: flex; align-items: center; justify-content: space-between; margin-bottom: 4px; }
+.titre-serveurs label { margin-bottom: 0 !important; }
+#btn-rechercher-serveurs { background: none; border: 1px solid #374151; color: #9ca3af; border-radius: 6px; padding: 2px 8px; font-size: 11px; cursor: pointer; }
+#btn-rechercher-serveurs:hover:not(:disabled) { color: #fff; border-color: #6b7280; }
+#btn-rechercher-serveurs:disabled { opacity: .5; cursor: default; }
+#liste-serveurs { background: #1f2937; border: 1px solid #374151; border-radius: 8px; max-height: 220px; overflow-y: auto; }
+.serveur { display: block; width: 100%; text-align: left; background: none; border: 0; border-bottom: 1px solid #374151; color: #e5e7eb; padding: 7px 10px; cursor: pointer; font: inherit; }
+.serveur:last-child { border-bottom: 0; }
+.serveur:hover, .serveur:focus { background: #374151; outline: none; }
+.serveur.actuel .serveur-nom::after { content: " ✓"; color: #22c55e; }
+.serveur-nom { font-size: 13px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.serveur-detail { font-size: 11px; color: #9ca3af; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.serveurs-etat { font-size: 12px; color: #6b7280; padding: 10px; text-align: center; }

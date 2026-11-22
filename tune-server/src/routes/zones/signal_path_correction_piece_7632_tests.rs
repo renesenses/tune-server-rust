@@ -116,6 +116,55 @@ fn une_ri_a_la_cadence_du_flux_est_dite_appliquee_7632() {
     assert_eq!(e["bit_perfect"], false, "{e}");
 }
 
+/// #8761 — une RI à une autre cadence que le fil est RÉÉCHANTILLONNÉE (par
+/// défaut) : l'étape la dit appliquée, et dit de quelle cadence elle vient.
+#[test]
+fn une_ri_a_une_autre_cadence_est_dite_reechantillonnee_8761() {
+    let (backend, zone, ps) = zone_en_lecture();
+    let ri = tune_core::test_scratch::scratch_file("ri-8761-cadence", ".wav");
+    ecrire_ri(ri.path(), 48_000, 256);
+    regler(
+        &backend,
+        &format!("ir_path_{}", zone.id.unwrap()),
+        &ri.as_str(),
+    );
+
+    let sp = chemin(&backend, &zone, &ps);
+    let rc = &sp["room_correction"];
+    assert_eq!(rc["status"], "applied", "{rc}");
+    assert_eq!(rc["applied"], true, "{rc}");
+    assert_eq!(rc["ir_sample_rate"], 48_000, "{rc}");
+    assert_eq!(rc["resampled_to"], FIL_HZ, "{rc}");
+    let e = etape(&sp).expect("l'étape Correction de pièce manque");
+    assert_eq!(e["status"], "applied", "{e}");
+    assert_eq!(e["bit_perfect"], false, "{e}");
+}
+
+/// #8761 — avec un fichier par cadence, celui du fil est pris tel quel.
+#[test]
+fn le_fichier_a_la_cadence_du_fil_est_pris_8761() {
+    let (backend, zone, ps) = zone_en_lecture();
+    let a = tune_core::test_scratch::scratch_file("ri-8761-48", ".wav");
+    let b = tune_core::test_scratch::scratch_file("ri-8761-96", ".wav");
+    ecrire_ri(a.path(), 48_000, 256);
+    ecrire_ri(b.path(), FIL_HZ, 512);
+    let zid = zone.id.unwrap();
+    regler(&backend, &format!("ir_path_{zid}"), &a.as_str());
+    regler(
+        &backend,
+        &format!("ir_jeu_{zid}"),
+        &serde_json::to_string(&[b.as_str()]).unwrap(),
+    );
+
+    let sp = chemin(&backend, &zone, &ps);
+    let rc = &sp["room_correction"];
+    assert_eq!(rc["status"], "applied", "{rc}");
+    assert_eq!(rc["ir_sample_rate"], FIL_HZ, "{rc}");
+    assert_eq!(rc["taps"], 512, "{rc}");
+    assert!(rc["resampled_to"].is_null(), "{rc}");
+    assert_eq!(rc["ir_files"], json!([48_000, FIL_HZ]), "{rc}");
+}
+
 #[test]
 fn une_ri_a_la_mauvaise_cadence_est_dite_retiree_7632() {
     let (backend, zone, ps) = zone_en_lecture();
@@ -125,6 +174,13 @@ fn une_ri_a_la_mauvaise_cadence_est_dite_retiree_7632() {
         &backend,
         &format!("ir_path_{}", zone.id.unwrap()),
         &ri.as_str(),
+    );
+    // #8761 — le retrait n'a plus lieu que si la zone refuse le
+    // rééchantillonnage.
+    regler(
+        &backend,
+        &format!("ir_resample_{}", zone.id.unwrap()),
+        "false",
     );
 
     let sp = chemin(&backend, &zone, &ps);

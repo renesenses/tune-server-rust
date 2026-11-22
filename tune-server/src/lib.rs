@@ -52,6 +52,8 @@ pub mod gel_executeur;
 mod instance_existante;
 /// #6253 — `--sans-console` : relance sans fenêtre de terminal (Windows).
 pub(crate) mod lancement_sans_console;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod navigateur_windows;
 pub use tune_http_types::error;
 #[cfg(feature = "local-audio")]
 pub mod exclusif_par_zone_3245;

@@ -1,4 +1,4 @@
-//! Premium crossfeed; historical Mid-preserving algorithm.
+//! Free simple crossfeed; historical Mid-preserving algorithm.
 #![cfg_attr(not(feature = "native"), forbid(unsafe_code))]
 #![deny(unsafe_op_in_unsafe_fn)]
 mod engine;

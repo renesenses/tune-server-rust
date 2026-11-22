@@ -352,3 +352,36 @@ async fn un_refus_ordinaire_du_retour_est_une_page() {
         page.corps
     );
 }
+
+/// #8797 — `GET /cloud/sso/status` rend l'instant du refus de la session
+/// (`reconnect_required_since`) pour que l'interface puisse le dire ; `null`
+/// tant que la session vaut.
+#[tokio::test]
+async fn le_statut_donne_l_instant_du_refus_de_session_8797() {
+    let (app, state, _dir) = serveur("http://127.0.0.1:9");
+    reglages(&state)
+        .set("mozaik_access_token", "jeton-acces")
+        .unwrap();
+    let lire_statut = |page: Page| -> serde_json::Value {
+        assert_eq!(page.statut, StatusCode::OK, "{}", page.corps);
+        serde_json::from_str(&page.corps).unwrap()
+    };
+    let avant = lire_statut(lire(&app, "/api/v1/cloud/sso/status").await);
+    assert_eq!(avant["connected"], json!(true));
+    assert_eq!(avant["reconnect_required"], json!(false));
+    assert_eq!(avant["reconnect_required_since"], json!(null));
+
+    reglages(&state)
+        .set(
+            tune_core::cloud::sso::CLE_RECONNEXION_REQUISE,
+            "2026-11-20T10:00:00+00:00",
+        )
+        .unwrap();
+    let apres = lire_statut(lire(&app, "/api/v1/cloud/sso/status").await);
+    assert_eq!(apres["connected"], json!(false));
+    assert_eq!(apres["reconnect_required"], json!(true));
+    assert_eq!(
+        apres["reconnect_required_since"],
+        json!("2026-11-20T10:00:00+00:00")
+    );
+}

@@ -145,3 +145,11 @@ instead made Tune pick 44.1 kHz, which the measurement refuses.
 Not proven without the microphone: the real UMIK-1 under Tune OS. The
 end-to-end test runs CPAL's real ALSA path against a private ALSA PCM
 restricted to S24_3LE / 2 ch / 48 kHz.
+
+## #8789 — probe native DSD512 in both rate families
+
+The native rate table now covers DSD64–512 at 44.1 and 48 kHz multiples.
+The existing probe still asks the driver about each rate and restores PCM;
+adding a candidate does not declare hardware support. The portable ASIO
+fixture checks a driver accepting only DSD512 and equality with Tune's native
+opening table. Actual Windows driver behaviour remains to be verified.

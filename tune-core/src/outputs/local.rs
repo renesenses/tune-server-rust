@@ -3,6 +3,8 @@ mod diagnostic_surechantillonnage_8259;
 mod lecture_http;
 mod reserve_du_surechantillonneur;
 mod retard_de_depart_8437;
+// #8869 — le silence de verrouillage au changement de format.
+mod silence_de_verrouillage_8869;
 use lecture_http::LecteurHttpAnnulable;
 
 use std::cell::UnsafeCell;
@@ -888,6 +890,11 @@ pub struct LocalOutput {
     /// `sync_delay_ms` quand elle est groupée avec une zone réseau, sinon 0.
     /// Posé par l'orchestrateur à chaque lecture, lu une fois par `play_url`.
     retard_de_depart_ms: AtomicU64,
+    /// #8869 — silence de verrouillage (ms) de la zone qui va jouer. Posé par
+    /// l'orchestrateur à chaque lecture, lu une fois par `play_url`.
+    silence_de_verrouillage_ms: AtomicU32,
+    /// #8869 — le dernier format envoyé au DAC par cette sortie.
+    memoire_du_format: crate::audio::silence_de_verrouillage::MemoireDuFormat,
     /// Optional headphone crossfeed effect, applied AFTER the convolver on the
     /// local (DAC) output only. Gated by the same `pure_bypass` (skipped in
     /// PURE) and only when the stream is stereo. Set per-play by the
@@ -1531,6 +1538,8 @@ impl LocalOutput {
             fixed_sample_rate: AtomicU32::new(0),
             seconde_sortie: std::sync::Mutex::new(Vec::new()),
             retard_de_depart_ms: AtomicU64::new(0),
+            silence_de_verrouillage_ms: AtomicU32::new(0),
+            memoire_du_format: Default::default(),
             mono_downmix: Arc::new(AtomicBool::new(false)),
             reaffectation: Arc::new(CreneauReaffectation::vide()),
             disposition: Arc::new(std::sync::Mutex::new(None)),
@@ -1944,6 +1953,30 @@ impl LocalOutput {
 
     pub fn set_convolver_ir(&self, path: &str) -> Result<(), String> {
         let config = super::super::audio::convolver::ConvolverConfig::from_wav(path)?;
+        self.set_convolver_config(config)
+    }
+
+    /// #8761 — installer un JEU de réponses impulsionnelles (une par cadence,
+    /// rééchantillonnage en repli selon le réglage de la zone). Les cadences
+    /// usuelles absentes du jeu sont préparées en tâche de fond : un
+    /// changement de cadence entre deux pistes enchaînées trouve alors le
+    /// filtre rééchantillonné déjà en cache, sans calcul sur le fil audio.
+    pub fn set_convolver_config(
+        &self,
+        config: super::super::audio::convolver::ConvolverConfig,
+    ) -> Result<(), String> {
+        let path = config_chemin_pour_journal(&config);
+        let path = path.as_str();
+        if config.reechantillonnage_autorise() {
+            let a_chauffer = config.clone();
+            let _ = std::thread::Builder::new()
+                .name("tune-ri-prechauffe".into())
+                .spawn(move || {
+                    a_chauffer.prechauffer(
+                        &super::super::audio::convolver::par_cadence::CADENCES_USUELLES,
+                    )
+                });
+        }
         *self.convolver_config.lock().unwrap() = Some(config.clone());
         let current_format = self
             .current_format()
@@ -1968,6 +2001,8 @@ impl LocalOutput {
             path,
             device = %self.device_name,
             ir_sample_rate = config.sample_rate(),
+            ir_rates = ?config.cadences(),
+            ir_resample = config.reechantillonnage_autorise(),
             ir_channels = config.source_channels(),
             active = current_format.is_some(),
             "convolver_ir_set"
@@ -2087,6 +2122,30 @@ impl LocalOutput {
     /// voir [`crate::zones::retard_groupe_mixte_8437`]. `0` : départ immédiat.
     pub fn set_retard_de_depart_ms(&self, ms: u64) {
         self.retard_de_depart_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// #8869 — le silence de verrouillage de la zone qui va jouer (ms), voir
+    /// [`crate::audio::silence_de_verrouillage`]. `0` : aucun silence.
+    pub fn set_silence_de_verrouillage_ms(&self, ms: u32) {
+        self.silence_de_verrouillage_ms.store(
+            ms.min(crate::audio::silence_de_verrouillage::SILENCE_MAX_MS),
+            Ordering::Relaxed,
+        );
+    }
+
+    /// #8869 — ce que le fil de lecture d'une piste emporte : le réglage lu
+    /// maintenant et la mémoire du format de cette sortie, OUBLIÉE : chaque
+    /// `play_url` rouvre le périphérique (un nouveau fil, un nouveau flux),
+    /// et un DAC se reverrouille à chaque ouverture, même au même format.
+    /// L'enchaînement sans blanc ne repasse pas par ici.
+    pub(crate) fn silence_pour_une_ouverture(
+        &self,
+    ) -> crate::audio::silence_de_verrouillage::SilenceDeVerrouillage {
+        self.memoire_du_format.oublier();
+        crate::audio::silence_de_verrouillage::SilenceDeVerrouillage::new(
+            self.silence_de_verrouillage_ms.load(Ordering::Relaxed),
+            self.memoire_du_format.clone(),
+        )
     }
 
     /// #8437 — le retard que la prochaine ouverture du flux observera.
@@ -6919,6 +6978,8 @@ impl OutputTarget for LocalOutput {
         // #8437 — lu UNE fois par piste : une transition gapless ne repasse
         // pas par `play_url` et garde l'avance prise au départ.
         let retard_de_depart_ms = self.retard_de_depart_ms();
+        // #8869 — lu UNE fois par piste, comme le retard de départ.
+        let silence_de_verrouillage = self.silence_pour_une_ouverture();
         let mono_downmix = self.mono_downmix.clone();
         let reaffectation = self.reaffectation.clone();
         let disposition = self.disposition.clone();
@@ -7005,7 +7066,7 @@ impl OutputTarget for LocalOutput {
                     if force_silent.load(Ordering::SeqCst) {
                         debug!("local_audio_http_fetch_cancelled");
                     } else {
-                        warn!(error = %e, url = %url, "local_audio_http_fetch_failed");
+                        warn!(error = %e, url = %crate::confidentialite::masquer_url(&url), "local_audio_http_fetch_failed");
                     }
                     if play_generation.load(Ordering::SeqCst) == my_generation {
                         playing.store(false, Ordering::SeqCst);
@@ -7015,7 +7076,7 @@ impl OutputTarget for LocalOutput {
             };
 
             if !response.status().is_success() && response.status().as_u16() != 206 {
-                warn!(status = %response.status(), url = %url, "local_audio_http_error");
+                warn!(status = %response.status(), url = %crate::confidentialite::masquer_url(&url), "local_audio_http_error");
                 playing.store(false, Ordering::SeqCst);
                 return;
             }
@@ -7105,6 +7166,7 @@ impl OutputTarget for LocalOutput {
                         track_ended_generation,
                         dop_active,
                         chain_exhausted: chain_exhausted_ref,
+                        silence_de_verrouillage: silence_de_verrouillage.clone(),
                     });
                     return;
                 }
@@ -7134,6 +7196,7 @@ impl OutputTarget for LocalOutput {
                         dop_active,
                         chain_exhausted: chain_exhausted_ref,
                         device_gone,
+                        silence_de_verrouillage: silence_de_verrouillage.clone(),
                     });
                     return;
                 }
@@ -7723,6 +7786,32 @@ impl OutputTarget for LocalOutput {
                     Some((&reaffectation, pure_bypass.load(Ordering::Relaxed))),
                     disposition.lock().ok().and_then(|d| d.clone()).as_deref(),
                 );
+                // #8869 — au changement de format, la piste décodée est
+                // précédée du silence de verrouillage. Il ne compte ni dans
+                // la durée ni dans la position.
+                let silence_samples = crate::audio::silence_de_verrouillage::trames_pour_ms(
+                    output_sr,
+                    silence_de_verrouillage.constater(
+                        crate::audio::silence_de_verrouillage::SignatureDuFormat {
+                            cadence: output_sr,
+                            canaux: output_ch,
+                            mode: crate::audio::silence_de_verrouillage::ModeDuFlux::Pcm,
+                        },
+                    ),
+                ) * output_ch as usize;
+                let samples = if silence_samples == 0 {
+                    samples
+                } else {
+                    info!(
+                        cadence = output_sr,
+                        canaux = output_ch,
+                        echantillons = silence_samples,
+                        "local_audio_silence_de_verrouillage_compresse"
+                    );
+                    let mut precede = vec![0.0f32; silence_samples];
+                    precede.extend_from_slice(&samples);
+                    precede
+                };
 
                 // Pre-fill the ring buffer before starting the cpal stream.
                 // For compressed streams all data is already decoded, so we
@@ -7746,7 +7835,7 @@ impl OutputTarget for LocalOutput {
 
                 // Feed remaining samples to ring buffer, updating position
                 // progressively so the seek bar advances during playback.
-                let total_output_samples = samples.len() as u64;
+                let total_output_samples = (samples.len() - silence_samples) as u64;
                 let output_frames = total_output_samples / output_ch as u64;
                 let output_duration_ms = (output_frames as f64 / output_sr as f64 * 1000.0) as u64;
                 // Fil 2062 / #5550 — une piste arrivée sans durée prend celle que
@@ -7785,7 +7874,8 @@ impl OutputTarget for LocalOutput {
                             break;
                         }
                         fed_samples += chunk.len() as u64;
-                        let fed_frames = fed_samples / output_ch as u64;
+                        let fed_frames =
+                            fed_samples.saturating_sub(silence_samples as u64) / output_ch as u64;
                         let pos =
                             (fed_frames as f64 / output_sr as f64 * 1000.0) as u64 + seek_offset;
                         position_ms
@@ -8008,6 +8098,7 @@ impl OutputTarget for LocalOutput {
                     track_artist: artist_ref,
                     duration_ms: duration_ms_arc,
                     seek_offset_ms: seek_offset_arc,
+                    silence_de_verrouillage: silence_de_verrouillage.clone(),
                 });
                 return;
             }
@@ -8065,6 +8156,7 @@ impl OutputTarget for LocalOutput {
                     track_artist: artist_ref,
                     duration_ms: duration_ms_arc,
                     seek_offset_ms: seek_offset_arc,
+                    silence_de_verrouillage: silence_de_verrouillage.clone(),
                 });
                 return;
             }
@@ -8117,6 +8209,7 @@ impl OutputTarget for LocalOutput {
                     track_artist: artist_ref,
                     duration_ms: duration_ms_arc,
                     seek_offset_ms: seek_offset_arc,
+                    silence_de_verrouillage: silence_de_verrouillage.clone(),
                     reglage_periode_ms: reglage_periode_wasapi_ms,
                 });
                 return;
@@ -8248,6 +8341,7 @@ impl OutputTarget for LocalOutput {
                                         track_artist: &artist_ref,
                                         duration_ms: &duration_ms_arc,
                                         seek_offset_ms: &seek_offset_arc,
+                                        silence_de_verrouillage: &silence_de_verrouillage,
                                         surechantillonnage: &surechantillonnage,
                                         sortie_double: !seconde_sortie.is_empty(),
                                         strict_bitperfect,
@@ -8609,6 +8703,10 @@ impl OutputTarget for LocalOutput {
             // rééchantillonnage, donc deux pistes de cadences différentes se
             // mélangent sans précaution. Durée nulle (défaut, PURE, flux en
             // direct) : le puits est transparent, un `ecrire` et rien d'autre.
+            //
+            // #8869 — sous le fondu, l'anneau est précédé du silence de
+            // verrouillage quand le format change.
+            backend.preceder_d_un_silence(silence_de_verrouillage.clone());
             let mut puits = match backend.puits() {
                 Puits::Flottant(puits) => {
                     Box::new(crate::audio::fondu_enchaine::PuitsDeFondu::nouveau(
@@ -8865,7 +8963,7 @@ impl OutputTarget for LocalOutput {
 
                 info!(
                     next_title = ?next.title,
-                    next_url = %next.url,
+                    next_url = %crate::confidentialite::masquer_url(&next.url),
                     "local_audio_gapless_chaining_next_track"
                 );
                 // #6132 — piste suivante : le retard commun des sorties
@@ -10271,3 +10369,9 @@ mod etage_exclusif_observe_7093;
 
 #[cfg(test)]
 mod exclusif_par_zone_3245_tests;
+
+/// #8761 — les cadences du jeu, pour la ligne de journal de l'installation.
+fn config_chemin_pour_journal(config: &crate::audio::convolver::ConvolverConfig) -> String {
+    let cadences: Vec<String> = config.cadences().iter().map(u32::to_string).collect();
+    format!("jeu[{} Hz]", cadences.join(", "))
+}

@@ -22,8 +22,10 @@ pub const ASIO_ST_DSD_INT8_MSB1: i32 = 33;
 /// `ASIOSTDSDInt8NER8`: 8-bit DSD words, one sample per byte.
 pub const ASIO_ST_DSD_INT8_NER8: i32 = 40;
 
-/// DSD rates accepted for native output: DSD64, DSD128, DSD256.
-pub const DSD_RATES: [u32; 3] = [2_822_400, 5_644_800, 11_289_600];
+/// Native DSD rates: DSD64 through DSD512, in the 44.1 and 48 kHz families.
+pub const DSD_RATES: [u32; 8] = [
+    2_822_400, 3_072_000, 5_644_800, 6_144_000, 11_289_600, 12_288_000, 22_579_200, 24_576_000,
+];
 
 /// DSD idle pattern, MSB first (the `DsdU8` convention).
 pub const DSD_SILENCE_MSB_FIRST: u8 = 0x69;

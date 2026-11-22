@@ -111,6 +111,25 @@ pub fn nom_de_tri_de_l_artiste_d_album<'a>(
 /// portability. The search() FTS predicate dispatches through
 /// `dialect.fts_where` so the same call emits the SQLite FTS5
 /// subquery or the Postgres `@@` tsvector predicate.
+/// #9265 — les artistes de la grille : ceux qui ont au moins un album,
+/// SAUF un crédit composé relié à ses artistes (`artistes_des_credits`),
+/// PLUS les artistes d'un crédit relié qui a des albums. Prédicat sur
+/// `artists` (colonne `id` sans alias), entre parenthèses. Une seule clause
+/// pour la grille, son total et les statistiques : ils ne peuvent pas
+/// diverger.
+macro_rules! predicat_artistes_de_la_grille {
+    () => {
+        "((id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL) \
+          AND id NOT IN (SELECT credit_id FROM artistes_des_credits)) \
+         OR id IN (SELECT adc.artiste_id FROM artistes_des_credits adc \
+          JOIN albums adc_al ON adc_al.artist_id = adc.credit_id))"
+    };
+}
+
+/// Voir [`predicat_artistes_de_la_grille`] : à placer après
+/// `FROM artists WHERE`, sans alias sur `artists`.
+pub const PREDICAT_ARTISTES_DE_LA_GRILLE: &str = predicat_artistes_de_la_grille!();
+
 pub mod sql {
     use super::SqlDialect;
 
@@ -329,8 +348,14 @@ pub mod sql {
         )
     }
 
+    macro_rules! artistes_de_la_grille {
+        () => {
+            concat!("FROM artists WHERE ", predicat_artistes_de_la_grille!())
+        };
+    }
+
     pub fn count() -> &'static str {
-        "SELECT COUNT(*) FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)"
+        concat!("SELECT COUNT(*) ", artistes_de_la_grille!())
     }
 
     /// Les artistes que liste [`super::ArtistRepo::list`] (ceux qui ont au
@@ -338,7 +363,7 @@ pub mod sql {
     /// clé de tri se calcule en Rust (#4956), sur des lignes étroites — jamais
     /// sur les biographies, qui pèsent plusieurs Ko chacune.
     pub fn cles_de_tri() -> &'static str {
-        "SELECT id, name, sort_name FROM artists WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)"
+        concat!("SELECT id, name, sort_name ", artistes_de_la_grille!())
     }
 
     /// Les fiches complètes d'une page d'identifiants (entiers issus de la

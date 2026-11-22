@@ -518,10 +518,13 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
                     z.output_type.as_deref(),
                 ),
             );
-            let renderer_label = z
-                .output_device_id
-                .as_deref()
-                .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
+            // #8920 — Devialet AIR : le nom de la zone et l'IP de l'ampli.
+            let libelle_air = super::signal_path::libelle_renderer_air(&state, z).await;
+            let renderer_label = libelle_air.as_deref().or_else(|| {
+                z.output_device_id
+                    .as_deref()
+                    .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()))
+            });
             let wire = match ps
                 .now_playing
                 .as_ref()
@@ -766,10 +769,13 @@ pub(crate) async fn get_zone(
                 let devices = state.scanner.devices().await;
                 let registered_output_ids: std::collections::HashSet<String> =
                     state.outputs.lock().await.list().into_iter().collect();
-                let renderer_label = zone
-                    .output_device_id
-                    .as_deref()
-                    .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()));
+                // #8920 — Devialet AIR : le nom de la zone et l'IP de l'ampli.
+                let libelle_air = super::signal_path::libelle_renderer_air(&state, &zone).await;
+                let renderer_label = libelle_air.as_deref().or_else(|| {
+                    zone.output_device_id
+                        .as_deref()
+                        .and_then(|id| devices.iter().find(|d| d.id == id).map(|d| d.name.as_str()))
+                });
                 let wire = match ps
                     .now_playing
                     .as_ref()
