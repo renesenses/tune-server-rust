@@ -28,7 +28,13 @@ async fn chemin_du_podcast_relaye(
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
     let (_, session) = state
         .orchestrator
-        .relayer_un_flux_distant(EPISODE, "audio/aac", Some(1_800_000), sample_rate, bit_depth)
+        .relayer_un_flux_distant(
+            EPISODE,
+            "audio/aac",
+            Some(1_800_000),
+            sample_rate,
+            bit_depth,
+        )
         .await;
     let fil = state
         .orchestrator
