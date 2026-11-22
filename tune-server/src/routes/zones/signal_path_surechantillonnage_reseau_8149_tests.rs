@@ -201,3 +201,51 @@ fn le_texte_de_la_cadence_fixe_existe_dans_toutes_les_langues_8428() {
         assert!(v.is_some_and(|v| !v.is_empty()), "manque en {lang}");
     }
 }
+
+#[test]
+fn cadence_8671_chemin_explique_le_repli_mesure() {
+    let (backend, zone, ps) = zone("local");
+    let mut fil = StreamInfo {
+        format: "wav".into(),
+        mime_type: "audio/wav".into(),
+        sample_rate: 48_000,
+        bit_depth: 32,
+        channels: 2,
+        repli_pcm_exclusif: Some((44_100, 48_000)),
+        ..Default::default()
+    };
+    let sp = build_signal_path(&ps, &zone, &backend, Some("Casque"), "local", Some(&fil)).unwrap();
+    let steps = sp["steps"].as_array().unwrap();
+    let e = steps
+        .iter()
+        .find(|e| e["reason"] == "wasapi_exclusive_rate_unsupported")
+        .expect("le chemin doit expliquer le refus de cadence WASAPI");
+    assert_eq!(e["from_hz"], 44_100);
+    assert_eq!(e["to_hz"], 48_000);
+    assert_eq!(e["bit_perfect"], false);
+    assert!(e["description"].as_str().unwrap().contains("WASAPI"));
+    assert_eq!(
+        steps
+            .iter()
+            .filter(|e| e["code"] == "rate_conversion")
+            .count(),
+        1
+    );
+    fil.repli_pcm_exclusif = None;
+    let sp = build_signal_path(&ps, &zone, &backend, Some("Casque"), "local", Some(&fil)).unwrap();
+    assert!(
+        !sp["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["reason"] == "wasapi_exclusive_rate_unsupported")
+    );
+    let textes: serde_json::Map<String, Value> =
+        serde_json::from_str(include_str!("textes_signal.json")).unwrap();
+    for (lang, t) in &textes {
+        let v = t["wasapi_rate_fallback"]
+            .as_str()
+            .expect("traduction du repli");
+        assert!(v.contains("{0}") && v.contains("{1}"), "{lang}");
+    }
+}

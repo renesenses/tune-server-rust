@@ -596,6 +596,14 @@ jobs:
           # remplacer ce cache de confiance.
           key: x86_64-pc-windows-msvc
           save-if: false
+      - name: Tester les cadences exclusives sans périphérique (#8671)
+        shell: pwsh
+        run: |
+          $banc = Join-Path $env:RUNNER_TEMP "cadences-exclusives-8671.exe"
+          rustc --edition 2024 --test scripts/banc-cadences-windows-8671.rs -o $banc
+          if ($LASTEXITCODE -ne 0) { throw "Compilation du banc de cadences impossible" }
+          & $banc --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Échec des témoins de cadences exclusives" }
       - name: Windows livré sans ASIO
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","postgres","plugins-wasm"]}
         run: cargo check --package tune-server --target x86_64-pc-windows-msvc --no-default-features --features oaat,cloud-relay,postgres,plugins-wasm,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme

@@ -100,6 +100,9 @@ pub struct VarianteRefusee {
 
 #[derive(Debug, Clone, Default)]
 pub struct StreamInfo {
+    /// Cadences refusée puis acceptée par la sonde WASAPI exclusive (#8671).
+    /// Fait du flux produit, jamais déduit de la seule configuration.
+    pub repli_pcm_exclusif: Option<(u32, u32)>,
     /// Some (even before probing) for decoded radio; None for other sessions.
     pub radio_source: Option<RadioSourceInfo>,
     pub format: String,

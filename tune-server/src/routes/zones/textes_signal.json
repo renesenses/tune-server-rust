@@ -100,7 +100,8 @@
     "oaat_dsd_cadence": "Cadence DSD non reconnue par la voie native OAAT : conversion en PCM.",
     "upsampling_level_matched": "niveau égal à la lecture sans suréchantillonnage (réserve compensée par le volume)",
     "upsampling_level_partial": "réserve compensée en partie : {0} dB sous la lecture sans suréchantillonnage, volume trop haut pour tout compenser",
-    "upsampling_level_full_volume": "réserve non compensée : volume à 100 %, {0} dB sous la lecture sans suréchantillonnage ; pour comparer à niveau égal, baissez le volume de Tune d'au moins {1} dB et réglez le niveau au DAC ou au préampli"
+    "upsampling_level_full_volume": "réserve non compensée : volume à 100 %, {0} dB sous la lecture sans suréchantillonnage ; pour comparer à niveau égal, baissez le volume de Tune d'au moins {1} dB et réglez le niveau au DAC ou au préampli",
+    "wasapi_rate_fallback": "Conversion {0} → {1} kHz : le périphérique ne prend pas {0} kHz en mode WASAPI exclusif"
   },
   "en": {
     "pregain": "auto pre-gain {0} dB",
@@ -203,7 +204,8 @@
     "oaat_dsd_cadence": "DSD rate not recognized by the OAAT native path: converted to PCM.",
     "upsampling_level_matched": "level matched to playback without upsampling (headroom compensated by the volume)",
     "upsampling_level_partial": "headroom partly compensated: {0} dB below playback without upsampling, volume too high to compensate fully",
-    "upsampling_level_full_volume": "headroom not compensated: volume at 100%, {0} dB below playback without upsampling; for a level-matched comparison, lower Tune's volume by at least {1} dB and set the level on the DAC or preamp"
+    "upsampling_level_full_volume": "headroom not compensated: volume at 100%, {0} dB below playback without upsampling; for a level-matched comparison, lower Tune's volume by at least {1} dB and set the level on the DAC or preamp",
+    "wasapi_rate_fallback": "Conversion {0} → {1} kHz: the device does not support {0} kHz in WASAPI exclusive mode"
   },
   "de": {
     "pregain": "automatische Vorverstärkung {0} dB",
@@ -306,7 +308,8 @@
     "oaat_dsd_cadence": "DSD-Rate vom nativen OAAT-Pfad nicht erkannt: Umwandlung in PCM.",
     "upsampling_level_matched": "Pegel gleich wie bei Wiedergabe ohne Upsampling (Reserve über die Lautstärke ausgeglichen)",
     "upsampling_level_partial": "Reserve teilweise ausgeglichen: {0} dB unter der Wiedergabe ohne Upsampling, Lautstärke zu hoch für vollen Ausgleich",
-    "upsampling_level_full_volume": "Reserve nicht ausgeglichen: Lautstärke bei 100 %, {0} dB unter der Wiedergabe ohne Upsampling; für einen pegelgleichen Vergleich die Lautstärke von Tune um mindestens {1} dB senken und den Pegel am DAC oder Vorverstärker einstellen"
+    "upsampling_level_full_volume": "Reserve nicht ausgeglichen: Lautstärke bei 100 %, {0} dB unter der Wiedergabe ohne Upsampling; für einen pegelgleichen Vergleich die Lautstärke von Tune um mindestens {1} dB senken und den Pegel am DAC oder Vorverstärker einstellen",
+    "wasapi_rate_fallback": "Wandlung {0} → {1} kHz: Das Gerät unterstützt {0} kHz im exklusiven WASAPI-Modus nicht"
   },
   "es": {
     "pregain": "preganancia automática {0} dB",
@@ -409,7 +412,8 @@
     "oaat_dsd_cadence": "La ruta nativa de OAAT no reconoce la frecuencia DSD: conversión a PCM.",
     "upsampling_level_matched": "nivel igual a la reproducción sin sobremuestreo (reserva compensada por el volumen)",
     "upsampling_level_partial": "reserva compensada en parte: {0} dB por debajo de la reproducción sin sobremuestreo, volumen demasiado alto para compensarla del todo",
-    "upsampling_level_full_volume": "reserva no compensada: volumen al 100 %, {0} dB por debajo de la reproducción sin sobremuestreo; para comparar al mismo nivel, baje el volumen de Tune al menos {1} dB y ajuste el nivel en el DAC o el preamplificador"
+    "upsampling_level_full_volume": "reserva no compensada: volumen al 100 %, {0} dB por debajo de la reproducción sin sobremuestreo; para comparar al mismo nivel, baje el volumen de Tune al menos {1} dB y ajuste el nivel en el DAC o el preamplificador",
+    "wasapi_rate_fallback": "Conversión {0} → {1} kHz: el dispositivo no admite {0} kHz en modo WASAPI exclusivo"
   },
   "it": {
     "pregain": "pre-guadagno automatico {0} dB",
@@ -512,7 +516,8 @@
     "oaat_dsd_cadence": "Frequenza DSD non riconosciuta dal percorso nativo OAAT: conversione in PCM.",
     "upsampling_level_matched": "livello uguale alla riproduzione senza sovracampionamento (riserva compensata dal volume)",
     "upsampling_level_partial": "riserva compensata in parte: {0} dB sotto la riproduzione senza sovracampionamento, volume troppo alto per compensarla del tutto",
-    "upsampling_level_full_volume": "riserva non compensata: volume al 100%, {0} dB sotto la riproduzione senza sovracampionamento; per confrontare a pari livello, abbassa il volume di Tune di almeno {1} dB e regola il livello sul DAC o sul preamplificatore"
+    "upsampling_level_full_volume": "riserva non compensata: volume al 100%, {0} dB sotto la riproduzione senza sovracampionamento; per confrontare a pari livello, abbassa il volume di Tune di almeno {1} dB e regola il livello sul DAC o sul preamplificatore",
+    "wasapi_rate_fallback": "Conversione {0} → {1} kHz: il dispositivo non supporta {0} kHz in modalità WASAPI esclusiva"
   },
   "zh": {
     "pregain": "自动预增益 {0} dB",
@@ -615,7 +620,8 @@
     "oaat_dsd_cadence": "OAAT 原生路径无法识别此 DSD 采样率：转换为 PCM。",
     "upsampling_level_matched": "电平与不升频播放一致（余量已由音量补偿）",
     "upsampling_level_partial": "余量仅部分补偿：比不升频播放低 {0} dB，音量过高，无法完全补偿",
-    "upsampling_level_full_volume": "余量未补偿：音量为 100%，比不升频播放低 {0} dB；如需等电平比较，请将 Tune 音量至少降低 {1} dB，并在 DAC 或前级上调节电平"
+    "upsampling_level_full_volume": "余量未补偿：音量为 100%，比不升频播放低 {0} dB；如需等电平比较，请将 Tune 音量至少降低 {1} dB，并在 DAC 或前级上调节电平",
+    "wasapi_rate_fallback": "转换 {0} → {1} kHz：设备在 WASAPI 独占模式下不支持 {0} kHz"
   },
   "ja": {
     "pregain": "自動プリアンプ {0} dB",
@@ -718,7 +724,8 @@
     "oaat_dsd_cadence": "OAATのネイティブ経路でDSDレートを認識できないため、PCMに変換します。",
     "upsampling_level_matched": "アップサンプリングなしの再生と同じレベル（ヘッドルームは音量で補正済み）",
     "upsampling_level_partial": "ヘッドルームは一部のみ補正：アップサンプリングなしの再生より {0} dB 低く、音量が高すぎて完全には補正できません",
-    "upsampling_level_full_volume": "ヘッドルーム未補正：音量 100%、アップサンプリングなしの再生より {0} dB 低い状態です。同じレベルで比較するには、Tune の音量を {1} dB 以上下げ、DAC またはプリアンプでレベルを調整してください"
+    "upsampling_level_full_volume": "ヘッドルーム未補正：音量 100%、アップサンプリングなしの再生より {0} dB 低い状態です。同じレベルで比較するには、Tune の音量を {1} dB 以上下げ、DAC またはプリアンプでレベルを調整してください",
+    "wasapi_rate_fallback": "{0} → {1} kHz に変換：デバイスは WASAPI 排他モードで {0} kHz に対応していません"
   },
   "ko": {
     "pregain": "자동 프리게인 {0} dB",
@@ -821,7 +828,8 @@
     "oaat_dsd_cadence": "OAAT 네이티브 경로가 DSD 샘플레이트를 인식하지 못해 PCM으로 변환합니다.",
     "upsampling_level_matched": "업샘플링 없는 재생과 같은 레벨 (헤드룸을 볼륨으로 보정함)",
     "upsampling_level_partial": "헤드룸 일부만 보정됨: 업샘플링 없는 재생보다 {0} dB 낮음, 볼륨이 너무 높아 완전히 보정할 수 없음",
-    "upsampling_level_full_volume": "헤드룸 보정 안 됨: 볼륨 100%, 업샘플링 없는 재생보다 {0} dB 낮음. 같은 레벨로 비교하려면 Tune 볼륨을 {1} dB 이상 낮추고 DAC 또는 프리앰프에서 레벨을 맞추세요"
+    "upsampling_level_full_volume": "헤드룸 보정 안 됨: 볼륨 100%, 업샘플링 없는 재생보다 {0} dB 낮음. 같은 레벨로 비교하려면 Tune 볼륨을 {1} dB 이상 낮추고 DAC 또는 프리앰프에서 레벨을 맞추세요",
+    "wasapi_rate_fallback": "{0} → {1} kHz 변환: 장치가 WASAPI 독점 모드에서 {0} kHz를 지원하지 않습니다"
   },
   "ro": {
     "pregain": "pre-amplificare automată {0} dB",
@@ -924,7 +932,8 @@
     "oaat_dsd_cadence": "Rata DSD nu este recunoscută de calea nativă OAAT: conversie în PCM.",
     "upsampling_level_matched": "nivel egal cu redarea fără supraeșantionare (rezervă compensată prin volum)",
     "upsampling_level_partial": "rezervă compensată parțial: cu {0} dB sub redarea fără supraeșantionare, volum prea mare pentru compensare completă",
-    "upsampling_level_full_volume": "rezervă necompensată: volum la 100%, cu {0} dB sub redarea fără supraeșantionare; pentru o comparație la nivel egal, coborâți volumul Tune cu cel puțin {1} dB și reglați nivelul din DAC sau preamplificator"
+    "upsampling_level_full_volume": "rezervă necompensată: volum la 100%, cu {0} dB sub redarea fără supraeșantionare; pentru o comparație la nivel egal, coborâți volumul Tune cu cel puțin {1} dB și reglați nivelul din DAC sau preamplificator",
+    "wasapi_rate_fallback": "Conversie {0} → {1} kHz: dispozitivul nu acceptă {0} kHz în modul WASAPI exclusiv"
   },
   "sv": {
     "pregain": "automatisk förförstärkning {0} dB",
@@ -1027,7 +1036,8 @@
     "oaat_dsd_cadence": "DSD-frekvensen känns inte igen av OAAT:s inbyggda väg: konvertering till PCM.",
     "upsampling_level_matched": "samma nivå som uppspelning utan uppsampling (marginalen kompenseras av volymen)",
     "upsampling_level_partial": "marginalen delvis kompenserad: {0} dB under uppspelning utan uppsampling, volymen är för hög för full kompensation",
-    "upsampling_level_full_volume": "marginalen inte kompenserad: volym på 100 %, {0} dB under uppspelning utan uppsampling; för en jämförelse på samma nivå, sänk Tunes volym med minst {1} dB och ställ in nivån på DAC:n eller förförstärkaren"
+    "upsampling_level_full_volume": "marginalen inte kompenserad: volym på 100 %, {0} dB under uppspelning utan uppsampling; för en jämförelse på samma nivå, sänk Tunes volym med minst {1} dB och ställ in nivån på DAC:n eller förförstärkaren",
+    "wasapi_rate_fallback": "Omvandling {0} → {1} kHz: enheten stöder inte {0} kHz i exklusivt WASAPI-läge"
   },
   "vi": {
     "pregain": "tiền khuếch đại tự động {0} dB",
@@ -1130,7 +1140,8 @@
     "oaat_dsd_cadence": "Đường nguyên bản OAAT không nhận dạng tần số DSD: chuyển đổi sang PCM.",
     "upsampling_level_matched": "mức âm bằng khi phát không nâng tần số lấy mẫu (khoảng dự trữ được bù bằng âm lượng)",
     "upsampling_level_partial": "khoảng dự trữ chỉ được bù một phần: thấp hơn {0} dB so với khi phát không nâng tần số lấy mẫu, âm lượng quá cao để bù hết",
-    "upsampling_level_full_volume": "khoảng dự trữ không được bù: âm lượng 100%, thấp hơn {0} dB so với khi phát không nâng tần số lấy mẫu; để so sánh cùng mức âm, hãy giảm âm lượng Tune ít nhất {1} dB và chỉnh mức trên DAC hoặc tiền khuếch đại"
+    "upsampling_level_full_volume": "khoảng dự trữ không được bù: âm lượng 100%, thấp hơn {0} dB so với khi phát không nâng tần số lấy mẫu; để so sánh cùng mức âm, hãy giảm âm lượng Tune ít nhất {1} dB và chỉnh mức trên DAC hoặc tiền khuếch đại",
+    "wasapi_rate_fallback": "Chuyển đổi {0} → {1} kHz: thiết bị không hỗ trợ {0} kHz ở chế độ WASAPI độc quyền"
   },
   "hu": {
     "pregain": "automatikus előerősítés {0} dB",
@@ -1233,7 +1244,8 @@
     "oaat_dsd_cadence": "Az OAAT natív útvonala nem ismeri fel a DSD-frekvenciát: átalakítás PCM-re.",
     "upsampling_level_matched": "a szint megegyezik a felülmintavételezés nélküli lejátszáséval (a tartalékot a hangerő kompenzálja)",
     "upsampling_level_partial": "a tartalék csak részben kompenzált: {0} dB-lel a felülmintavételezés nélküli lejátszás alatt, a hangerő túl magas a teljes kompenzációhoz",
-    "upsampling_level_full_volume": "a tartalék nincs kompenzálva: hangerő 100%, {0} dB-lel a felülmintavételezés nélküli lejátszás alatt; azonos szintű összehasonlításhoz csökkentse a Tune hangerejét legalább {1} dB-lel, és a szintet a DAC-on vagy az előerősítőn állítsa be"
+    "upsampling_level_full_volume": "a tartalék nincs kompenzálva: hangerő 100%, {0} dB-lel a felülmintavételezés nélküli lejátszás alatt; azonos szintű összehasonlításhoz csökkentse a Tune hangerejét legalább {1} dB-lel, és a szintet a DAC-on vagy az előerősítőn állítsa be",
+    "wasapi_rate_fallback": "Átalakítás {0} → {1} kHz: az eszköz nem támogatja a {0} kHz-et kizárólagos WASAPI módban"
   },
   "nb": {
     "pregain": "automatisk forsterkning før behandling {0} dB",
@@ -1336,7 +1348,8 @@
     "oaat_dsd_cadence": "DSD-frekvensen gjenkjennes ikke av OAATs native bane: konvertering til PCM.",
     "upsampling_level_matched": "samme nivå som avspilling uten oppsampling (reserven kompenseres av volumet)",
     "upsampling_level_partial": "reserven delvis kompensert: {0} dB under avspilling uten oppsampling, volumet er for høyt til full kompensasjon",
-    "upsampling_level_full_volume": "reserven ikke kompensert: volum på 100 %, {0} dB under avspilling uten oppsampling; for en sammenligning på samme nivå, senk Tunes volum med minst {1} dB og still inn nivået på DAC-en eller forforsterkeren"
+    "upsampling_level_full_volume": "reserven ikke kompensert: volum på 100 %, {0} dB under avspilling uten oppsampling; for en sammenligning på samme nivå, senk Tunes volum med minst {1} dB og still inn nivået på DAC-en eller forforsterkeren",
+    "wasapi_rate_fallback": "Konvertering {0} → {1} kHz: enheten støtter ikke {0} kHz i eksklusiv WASAPI-modus"
   },
   "pl": {
     "pregain": "automatyczne wzmocnienie wstępne {0} dB",
@@ -1439,7 +1452,8 @@
     "oaat_dsd_cadence": "Natywna ścieżka OAAT nie rozpoznaje częstotliwości DSD: konwersja do PCM.",
     "upsampling_level_matched": "poziom równy odtwarzaniu bez nadpróbkowania (zapas skompensowany głośnością)",
     "upsampling_level_partial": "zapas skompensowany częściowo: {0} dB poniżej odtwarzania bez nadpróbkowania, głośność zbyt wysoka na pełną kompensację",
-    "upsampling_level_full_volume": "zapas nieskompensowany: głośność 100%, {0} dB poniżej odtwarzania bez nadpróbkowania; aby porównać przy równym poziomie, zmniejsz głośność Tune o co najmniej {1} dB i ustaw poziom na DAC-u lub przedwzmacniaczu"
+    "upsampling_level_full_volume": "zapas nieskompensowany: głośność 100%, {0} dB poniżej odtwarzania bez nadpróbkowania; aby porównać przy równym poziomie, zmniejsz głośność Tune o co najmniej {1} dB i ustaw poziom na DAC-u lub przedwzmacniaczu",
+    "wasapi_rate_fallback": "Konwersja {0} → {1} kHz: urządzenie nie obsługuje {0} kHz w trybie wyłącznym WASAPI"
   },
   "el": {
     "pregain": "αυτόματη προ-ενίσχυση {0} dB",
@@ -1542,7 +1556,8 @@
     "oaat_dsd_cadence": "Η εγγενής διαδρομή OAAT δεν αναγνωρίζει τη συχνότητα DSD: μετατροπή σε PCM.",
     "upsampling_level_matched": "ίδια στάθμη με την αναπαραγωγή χωρίς υπερδειγματοληψία (το περιθώριο αντισταθμίζεται από την ένταση)",
     "upsampling_level_partial": "το περιθώριο αντισταθμίστηκε εν μέρει: {0} dB κάτω από την αναπαραγωγή χωρίς υπερδειγματοληψία, η ένταση είναι πολύ υψηλή για πλήρη αντιστάθμιση",
-    "upsampling_level_full_volume": "το περιθώριο δεν αντισταθμίστηκε: ένταση στο 100%, {0} dB κάτω από την αναπαραγωγή χωρίς υπερδειγματοληψία· για σύγκριση στην ίδια στάθμη, χαμηλώστε την ένταση του Tune τουλάχιστον {1} dB και ρυθμίστε τη στάθμη στο DAC ή στον προενισχυτή"
+    "upsampling_level_full_volume": "το περιθώριο δεν αντισταθμίστηκε: ένταση στο 100%, {0} dB κάτω από την αναπαραγωγή χωρίς υπερδειγματοληψία· για σύγκριση στην ίδια στάθμη, χαμηλώστε την ένταση του Tune τουλάχιστον {1} dB και ρυθμίστε τη στάθμη στο DAC ή στον προενισχυτή",
+    "wasapi_rate_fallback": "Μετατροπή {0} → {1} kHz: η συσκευή δεν υποστηρίζει {0} kHz σε αποκλειστική λειτουργία WASAPI"
   },
   "tr": {
     "pregain": "otomatik ön kazanç {0} dB",
@@ -1645,6 +1660,7 @@
     "oaat_dsd_cadence": "DSD örnekleme hızı OAAT yerel yolu tarafından tanınmadı: PCM'ye dönüştürüldü.",
     "upsampling_level_matched": "seviye, üst örneklemesiz çalma ile aynı (pay, ses düzeyiyle telafi edildi)",
     "upsampling_level_partial": "pay kısmen telafi edildi: üst örneklemesiz çalmadan {0} dB düşük, ses düzeyi tam telafi için çok yüksek",
-    "upsampling_level_full_volume": "pay telafi edilmedi: ses düzeyi %100, üst örneklemesiz çalmadan {0} dB düşük; eşit seviyede karşılaştırmak için Tune ses düzeyini en az {1} dB düşürün ve seviyeyi DAC'ta veya ön amfide ayarlayın"
+    "upsampling_level_full_volume": "pay telafi edilmedi: ses düzeyi %100, üst örneklemesiz çalmadan {0} dB düşük; eşit seviyede karşılaştırmak için Tune ses düzeyini en az {1} dB düşürün ve seviyeyi DAC'ta veya ön amfide ayarlayın",
+    "wasapi_rate_fallback": "{0} → {1} kHz dönüşümü: cihaz, WASAPI özel modunda {0} kHz desteklemiyor"
   }
 }
