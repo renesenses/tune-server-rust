@@ -306,8 +306,9 @@ fn publier_sans_ecraser(
         .map_err(io)?;
     tmp.write_all(contenu)
         .and_then(|()| tmp.flush())
-        .and_then(|()| tmp.as_file().sync_all())
         .map_err(io)?;
+    donner_le_mode_public(tmp.as_file(), cible);
+    tmp.as_file().sync_all().map_err(io)?;
 
     let tmp = match mode {
         PublicationLrc::Atomique => match tmp.persist_noclobber(cible) {
@@ -353,6 +354,33 @@ fn publier_sans_ecraser(
         return Err(io(e.error));
     }
     Ok(())
+}
+
+/// Mode du `.lrc` publié : celui d'un fichier ordinaire (0644), comme
+/// l'ancien `create_new`. `tempfile` crée son temporaire en 0600, et le
+/// renommage garderait ce mode : le `.lrc` deviendrait illisible depuis un
+/// partage Samba, un NAS ou pour un autre utilisateur (relecture rc14).
+#[cfg(unix)]
+const MODE_DU_LRC: u32 = 0o644;
+
+/// Pose [`MODE_DU_LRC`] sur le temporaire **avant** sa publication : le
+/// fichier final naît lisible, sans fenêtre en 0600. Un système de fichiers
+/// qui refuse `chmod` (exFAT, certains SMB) n'empêche pas l'écriture : il
+/// impose de toute façon son propre mode.
+fn donner_le_mode_public(fichier: &std::fs::File, cible: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = fichier.set_permissions(std::fs::Permissions::from_mode(MODE_DU_LRC)) {
+            tracing::debug!(
+                cible = %cible.display(),
+                erreur = %e,
+                "lrc_mode_public_refuse_par_le_systeme_de_fichiers"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (fichier, cible);
 }
 
 #[cfg(test)]
@@ -739,6 +767,29 @@ mod tests {
             "[00:01.00] repli\n"
         );
         assert!(temporaires_restants(dir.path()).is_empty());
+    }
+
+    /// Le `.lrc` publié est lisible par tous (0644), sur les deux voies :
+    /// le temporaire de `tempfile` naît en 0600 et le renommage garderait
+    /// ce mode (relecture rc14 de #9347).
+    #[cfg(unix)]
+    #[test]
+    fn le_lrc_publie_est_lisible_par_tous_sur_les_deux_voies() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [PublicationLrc::Atomique, PublicationLrc::RepliSeul] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let cible = dir.path().join("Song.lrc");
+            publier_sans_ecraser(&cible, b"[00:01.00] mode\n", mode).unwrap();
+            let droits = std::fs::metadata(&cible).unwrap().permissions().mode() & 0o777;
+            assert_eq!(droits, 0o644, "{mode:?} : mode {droits:o}");
+        }
+        // Et par l'entrée publique, à côté d'un vrai fichier audio.
+        let dir = tempfile::TempDir::new().unwrap();
+        let audio = dir.path().join("Song.flac");
+        std::fs::write(&audio, b"fLaC").unwrap();
+        let cible = write_sidecar_lrc(audio.to_str().unwrap(), "[00:01.00] mode").unwrap();
+        let droits = std::fs::metadata(&cible).unwrap().permissions().mode() & 0o777;
+        assert_eq!(droits, 0o644, "write_sidecar_lrc : mode {droits:o}");
     }
 
     /// Et le garde-fou tient : un fichier audio qu'aucune graphie ne trouve
