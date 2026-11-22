@@ -3093,6 +3093,13 @@ fn is_expired_url_status(status: reqwest::StatusCode) -> bool {
     status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::GONE
 }
 
+/// #9315 — la source a-t-elle répondu par une ERREUR, et non par de l'audio ?
+/// Tout statut hors 2xx, sauf 416 : une plage hors du fichier a sa propre
+/// réponse (#6612), transmise au renderer.
+fn statut_amont_en_echec(status: reqwest::StatusCode) -> bool {
+    !status.is_success() && status != reqwest::StatusCode::RANGE_NOT_SATISFIABLE
+}
+
 /// Send a GET for `url` (optionally with `Range: bytes={start}-`) and, if the
 /// request fails to send OR the CDN answers with an expiry status (403/410),
 /// re-resolve a fresh signed URL via `reresolve` and retry — bounded by
@@ -3484,6 +3491,29 @@ async fn proxy_stream(
             Ok(pair) => pair,
             Err(()) => return StatusCode::BAD_GATEWAY.into_response(),
         };
+    // #9315 — un statut non 2xx de la source n'est pas de l'audio. Le relayer
+    // tel quel faisait « démarrer » la zone sur le corps d'une page d'erreur
+    // (404 d'un éditeur de podcasts), et elle s'arrêtait 77 s plus tard sans
+    // un mot. Le renderer reçoit un 502 ; tant que rien n'a été servi, la
+    // session note le statut, et le sondeur arrête la zone avec un bandeau.
+    // Le 416 garde sa voie, plus bas : c'est une réponse de plage, pas une
+    // panne de la source.
+    if statut_amont_en_echec(upstream_resp.status()) {
+        let statut = upstream_resp.status().as_u16();
+        let servis = session.bytes_sent.load(std::sync::atomic::Ordering::Relaxed);
+        warn!(
+            stream_id = %session.id,
+            statut,
+            amont = %upstream_resp.url().host_str().unwrap_or("?"),
+            servis,
+            range = range_value.as_deref().unwrap_or("-"),
+            "proxy_amont_en_erreur — 502 au renderer, rien n'est relayé comme de l'audio"
+        );
+        if servis == 0 {
+            session.signaler_erreur_amont(statut);
+        }
+        return StatusCode::BAD_GATEWAY.into_response();
+    }
     // Persist a re-resolved URL so later resumes start from the fresh signature.
     {
         let mut pu = session.proxy_url.lock().await;

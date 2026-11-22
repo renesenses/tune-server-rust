@@ -1153,6 +1153,12 @@ mod fichier_abime_8483;
 #[cfg(test)]
 mod fichier_abime_8483_tests;
 
+/// #9315 — la source d'un flux relayé a répondu par une erreur HTTP : arrêt
+/// de la zone avec bandeau.
+mod source_en_erreur_9315;
+#[cfg(test)]
+mod source_en_erreur_9315_tests;
+
 /// #5522 — piste « en lecture » dont la position reste à 0 : une relance,
 /// puis l'arrêt avec bandeau.
 mod demarrage_fige_5522;
