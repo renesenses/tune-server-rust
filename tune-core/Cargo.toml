@@ -377,6 +377,12 @@ path = "tests/niveaux_sortie_locale_3682.rs"
 name = "replaygain_progression_4144"
 path = "tests/replaygain_progression_4144.rs"
 
+# #9171 — le total recompté quand un scan ajoute des pistes (état global :
+# une cible à elle seule).
+[[test]]
+name = "replaygain_total_recompte_9171"
+path = "tests/replaygain_total_recompte_9171.rs"
+
 # #2373 T2 — la reconciliation du catalogue en ligne, exercee A BLANC, n'ecrit
 # rien. `autotests = false` en tete de ce manifeste : sans cette cible, le
 # fichier ne serait JAMAIS compile et la porte rendrait un vert contre rien.
