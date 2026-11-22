@@ -274,6 +274,10 @@ async fn une_zone_avec_appareil_nait_toujours() {
 #[tokio::test]
 async fn une_zone_orpheline_deja_en_base_reste_signalee_et_refusee() {
     let (app, state) = serveur();
+    // La cible existe : ce témoin mesure le contrat suivant, pas une piste disparue.
+    state.backend.execute_batch(
+        "INSERT INTO tracks (id, title, file_path, source, duration_ms, format) VALUES (1, 'Piste synthétique 1', '/fixture-8832/1.flac', 'local', 300000, 'flac');"
+    ).expect("pistes synthétiques sans fichier audio");
     let repo = ZoneRepo::with_backend(state.backend.clone());
     let zone_id = repo.create("Volumio", Some("local"), None).unwrap();
 
