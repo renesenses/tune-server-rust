@@ -292,8 +292,11 @@ async fn pg_comptes_collections_en_une_passe() {
             .unwrap();
     });
     let sep = if url.contains('?') { '&' } else { '?' };
+    // `public` en second : l'extension `unaccent`, dont se servent les règles
+    // de texte des collections (#9283), y est installée. Les tables du banc,
+    // créées sans schéma, restent dans le schéma d'essai.
     let pg = tune_core::db::postgres::PostgresDb::connect(&format!(
-        "{url}{sep}options=-csearch_path%3D{schema}"
+        "{url}{sep}options=-csearch_path%3D{schema},public"
     ))
     .await
     .expect("connexion au schéma d'essai");
