@@ -2671,6 +2671,13 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        // #9362 — toute écriture et `get_entries` nomment `added_at` (124).
+        sqlx::raw_sql(include_str!(
+            "../../migrations/postgres/124_playlist_tracks_date_d_ajout.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
         let backend: Arc<dyn DbBackend> =
             Arc::new(crate::db::backend::PostgresBackend::new(pool.clone()));
         let locale: i64 = sqlx::query_scalar(
@@ -2717,6 +2724,23 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(copiee, (Some(1000), "bandcamp".to_string()));
+        // #9362 — la 124 convertit le TEXT de la bascule, rejouée sans effet.
+        const MIGRATION_124: &str =
+            include_str!("../../migrations/postgres/124_playlist_tracks_date_d_ajout.sql");
+        sqlx::raw_sql(MIGRATION_124).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_124).execute(&pool).await.unwrap();
+        let type_date: String = sqlx::query_scalar(
+            "SELECT data_type::text FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = 'playlist_tracks' \
+               AND column_name = 'added_at'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            type_date, "bigint",
+            "la 124 convertit added_at de la bascule"
+        );
         assert!(
             sqlx::raw_sql(
                 "INSERT INTO playlist_tracks (id, playlist_id, track_id, position, source, source_id) \
