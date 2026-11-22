@@ -1911,6 +1911,9 @@ mod signal_path_volume_non_reglable_8569_tests;
 // #8647 — un DSD servi en natif par OAAT se dit « DSD256 natif (OAAT) ».
 #[cfg(test)]
 mod signal_path_dsd_natif_oaat_8647_tests;
+// #9331 — la voie mandataire (podcast relayé tel quel) n'affiche aucun traitement.
+#[cfg(test)]
+mod signal_path_mandataire_9331_tests;
 
 /// #1499 — une zone qui « joue » sans destination doit le dire.
 ///

@@ -134,6 +134,13 @@ pub struct StreamInfo {
     /// fait du flux, posé là où il est bâti, lu tel quel par le chemin du
     /// signal (« DST décompressé → DSF »). `false` partout ailleurs.
     pub dsd_reconstruit_depuis_dst: bool,
+    /// #9331 — le flux est une URL distante RELAYÉE telle quelle par le
+    /// mandataire (`relayer_un_flux_distant` : épisode de podcast vers un
+    /// renderer réseau, flux direct vers un onglet). Aucun étage ne touche
+    /// ses octets : ni égaliseur, ni correction de pièce, ni ReplayGain.
+    /// Même règle que [`Self::crossfeed`] : un fait du flux, posé là où il
+    /// est bâti, lu tel quel par le chemin du signal. `false` partout ailleurs.
+    pub relaye_tel_quel: bool,
 }
 
 /// #6221 — un fichier VIRTUEL servi par la branche fichier (`serve_file`) :
