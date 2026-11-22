@@ -165,3 +165,15 @@ fusion : lire la PR de groupe qui cite la PR unitaire
 (`gh pr view <groupe> --json state,mergeCommit`), puis
 `git diff --stat <commit unitaire> origin/<lot> -- <fichiers de la PR>` : une
 sortie vide veut dire que le contenu est fusionné.
+
+### Scan ciblé #8083 : isoler la porte globale des scans
+
+Le témoin d’ajout de dossier passe seul mais pouvait échouer dans la suite
+parallèle : la preuve de #9078 avait déjà identifié un autre détenteur du droit
+de scanner global. Le verrou de test ne couvre pas la durée de vie de toutes
+les tâches lancées ailleurs. Le même cas #8083 tourne désormais dans un
+processus neuf et vérifie qu’un test a réellement réussi, sans cas ignoré.
+La vraie route, les FLAC, les événements de progression et toutes les assertions
+de portée et de préservation des autres racines restent inchangés. La
+contre-épreuve remplace seulement la cible de `add_music_dir` par `None` ;
+un scan global doit encore faire échouer le témoin.
