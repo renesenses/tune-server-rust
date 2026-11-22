@@ -166,7 +166,9 @@ const EXEMPLES_MAX: usize = 10;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Refus {
-    /// Préfixe vide, racine seule (`/`), relatif ou contenant `..`.
+    /// Préfixe vide, racine seule (`/`), relatif ou contenant `..` ; ancien
+    /// préfixe égal au chemin d'un fichier de la base ; nouveau préfixe qui
+    /// n'est pas un dossier existant.
     InvalidPrefix,
     /// Ancien et nouveau désignent le même chemin.
     SamePrefix,
@@ -301,6 +303,43 @@ fn remplacer_avec(valeur: &str, prefixe_de_valeur: &str, p: &Prefixes) -> Option
 
 fn litteral(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Les colonnes de [`COLONNES`] qui portent un DOSSIER : seule une valeur
+/// de l'une d'elles peut être égale à l'ancien préfixe. Toutes les autres
+/// portent un fichier.
+const COLONNES_DE_DOSSIER: &[(&str, &str)] =
+    &[("albums", "folder_path"), ("album_preferred_roots", "root")];
+
+/// L'ancien préfixe est-il le chemin complet d'un FICHIER connu de la base
+/// (piste, exemplaire, support CUE, image…) ? Un préfixe est un dossier :
+/// remplacer le chemin d'un seul fichier n'est pas ce geste, et la réponse
+/// est alors [`Refus::InvalidPrefix`].
+pub fn prefixe_designe_un_fichier(db: &dyn DbBackend, p: &Prefixes) -> Result<bool, String> {
+    let cle = litteral(&p.cle_ancien());
+    for c in COLONNES {
+        if !c.prefixe_de_valeur.is_empty()
+            || COLONNES_DE_DOSSIER.contains(&(c.table, c.colonne))
+            || !colonne_presente(db, c)
+        {
+            continue;
+        }
+        let compare = match p.style_ancien {
+            Style::Unix => c.colonne.to_string(),
+            Style::Windows => format!("REPLACE({}, '\\', '/')", c.colonne),
+        };
+        let n = compter(
+            db,
+            &format!(
+                "SELECT COUNT(*) FROM {} WHERE {} IS NOT NULL AND {compare} = {cle}",
+                c.table, c.colonne
+            ),
+        )?;
+        if n > 0 {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// Les deux fragments SQL d'une colonne : (condition « sous l'ancien préfixe
@@ -635,7 +674,9 @@ pub fn apercu(
         .map(|(_, _, r)| r)
         .collect();
 
-    let refusal = if tracks == 0 {
+    let refusal = if prefixe_designe_un_fichier(db, p)? {
+        Some(Refus::InvalidPrefix)
+    } else if tracks == 0 {
         Some(Refus::NoTracks)
     } else if found == 0 {
         Some(Refus::NoneFound)

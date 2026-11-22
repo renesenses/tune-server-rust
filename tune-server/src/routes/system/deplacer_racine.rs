@@ -12,7 +12,11 @@
 //! pendant un scan : le droit de scanner est tenu tout le temps de l'écriture,
 //! aucun scan ne peut donc démarrer au milieu.
 //!
-//! Les deux routes sont réservées à l'administrateur. Pas de rescan : les
+//! Les deux routes sont réservées à l'administrateur quand l'authentification
+//! est active, et à un appel de cette machine sinon (`AdminOuCetteMachine`).
+//! L'ancien et le nouveau préfixe sont des DOSSIERS : l'ancien n'est jamais
+//! le chemin d'un fichier de la base, le nouveau est un dossier existant,
+//! contrôlé sous sa forme canonique (liens symboliques résolus). Pas de rescan : les
 //! chemins réécrits sont ceux du disque. L'opération est journalisée (journal
 //! `tracing` et réglage `library_root_moves_journal`) et se défait par la même
 //! opération en sens inverse.
@@ -25,7 +29,7 @@ use serde_json::json;
 
 use tune_core::library::deplacer_racine::{self, Apercu, Prefixes};
 
-use crate::auth::RequireAdmin;
+use crate::auth::AdminOuCetteMachine;
 use crate::state::AppState;
 
 #[derive(Deserialize)]
@@ -67,6 +71,47 @@ fn refus_du_perimetre(state: &AppState, p: &Prefixes) -> Option<Response> {
     })
 }
 
+/// Les deux préfixes sont des dossiers. Le nouveau existe sur cette machine
+/// et est un dossier, et sa forme canonique (liens symboliques résolus) passe
+/// le même périmètre que sa forme écrite. L'ancien n'est pas le chemin d'un
+/// fichier de la base (il peut ne plus exister ici : base restaurée depuis
+/// une autre machine).
+fn refus_des_dossiers(state: &AppState, p: &Prefixes) -> Option<Response> {
+    let canonique = match std::fs::canonicalize(&p.nouveau) {
+        Ok(c) if c.is_dir() => c,
+        _ => {
+            return Some(refus(
+                StatusCode::BAD_REQUEST,
+                deplacer_racine::Refus::InvalidPrefix,
+            ));
+        }
+    };
+    let canonique = canonique.to_string_lossy().into_owned();
+    if let Some(motif) = super::config::refus_de_racine_de_musique(state, &canonique) {
+        return Some(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": motif, "path": p.nouveau, "can_apply": false })),
+            )
+                .into_response(),
+        );
+    }
+    match deplacer_racine::prefixe_designe_un_fichier(state.backend.as_ref(), p) {
+        Ok(false) => None,
+        Ok(true) => Some(refus(
+            StatusCode::BAD_REQUEST,
+            deplacer_racine::Refus::InvalidPrefix,
+        )),
+        Err(e) => Some(
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e, "can_apply": false })),
+            )
+                .into_response(),
+        ),
+    }
+}
+
 async fn calculer_l_apercu(state: &AppState, p: Prefixes) -> Result<Apercu, String> {
     let db = state.backend.clone();
     tokio::task::spawn_blocking(move || {
@@ -83,7 +128,7 @@ async fn calculer_l_apercu(state: &AppState, p: Prefixes) -> Result<Apercu, Stri
 
 /// `POST /system/music-dirs/move/preview`.
 pub(super) async fn apercu(
-    _admin: RequireAdmin,
+    _garde: AdminOuCetteMachine,
     State(state): State<AppState>,
     Json(corps): Json<CorpsDeplacement>,
 ) -> Response {
@@ -91,7 +136,7 @@ pub(super) async fn apercu(
         Ok(p) => p,
         Err(r) => return refus(StatusCode::BAD_REQUEST, r),
     };
-    if let Some(r) = refus_du_perimetre(&state, &p) {
+    if let Some(r) = refus_du_perimetre(&state, &p).or_else(|| refus_des_dossiers(&state, &p)) {
         return r;
     }
     match calculer_l_apercu(&state, p).await {
@@ -106,7 +151,7 @@ pub(super) async fn apercu(
 
 /// `POST /system/music-dirs/move`.
 pub(super) async fn appliquer(
-    _admin: RequireAdmin,
+    _garde: AdminOuCetteMachine,
     State(state): State<AppState>,
     Json(corps): Json<CorpsDeplacement>,
 ) -> Response {
@@ -114,7 +159,7 @@ pub(super) async fn appliquer(
         Ok(p) => p,
         Err(r) => return refus(StatusCode::BAD_REQUEST, r),
     };
-    if let Some(r) = refus_du_perimetre(&state, &p) {
+    if let Some(r) = refus_du_perimetre(&state, &p).or_else(|| refus_des_dossiers(&state, &p)) {
         return r;
     }
     // Le droit de scanner, tenu jusqu'à la fin de l'écriture.

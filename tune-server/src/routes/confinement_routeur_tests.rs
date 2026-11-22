@@ -369,3 +369,197 @@ async fn b1_remplacer_le_chemin_ne_mene_pas_hors_du_perimetre() {
     .await;
     assert_eq!(statut, StatusCode::OK, "{corps}");
 }
+
+// ─── « Remplacer le chemin » : dossiers seulement, et la garde ─────────────
+
+async fn appel_depuis(
+    state: &AppState,
+    adresse: [u8; 4],
+    uri: &str,
+    corps: Value,
+) -> (StatusCode, String) {
+    let requete = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header("content-type", "application/json")
+        .body(Body::from(corps.to_string()))
+        .unwrap();
+    let reponse = crate::routes::router(state.clone())
+        .layer(axum::extract::connect_info::MockConnectInfo(
+            std::net::SocketAddr::from((adresse, 50000)),
+        ))
+        .oneshot(requete)
+        .await
+        .unwrap();
+    let statut = reponse.status();
+    let octets = to_bytes(reponse.into_body(), usize::MAX).await.unwrap();
+    (statut, String::from_utf8_lossy(&octets).into_owned())
+}
+
+/// Une piste sous la musique du banc, avec son fichier.
+fn piste_du_banc(b: &super::Banc) -> String {
+    let chemin = b.dedans("/Album/01.flac");
+    std::fs::write(&chemin, b"x").unwrap();
+    b.state
+        .backend
+        .execute("INSERT INTO artists (id, name) VALUES (1, 'A')", &[])
+        .unwrap();
+    b.state
+        .backend
+        .execute(
+            "INSERT INTO albums (id, title, artist_id) VALUES (1, 'Album', 1)",
+            &[],
+        )
+        .unwrap();
+    b.state
+        .backend
+        .execute(
+            &format!(
+                "INSERT INTO tracks (id, title, artist_id, album_id, track_number, file_path) \
+                 VALUES (1, 'T', 1, 1, 1, '{chemin}')"
+            ),
+            &[],
+        )
+        .unwrap();
+    chemin
+}
+
+fn chemin_de_la_piste(state: &AppState) -> String {
+    state
+        .backend
+        .query_one("SELECT file_path FROM tracks WHERE id = 1", &[])
+        .unwrap()
+        .unwrap()[0]
+        .as_string()
+        .unwrap()
+}
+
+const ROUTES_DEPLACER: [(&str, Option<u64>); 2] = [
+    ("/api/v1/system/music-dirs/move/preview", None),
+    ("/api/v1/system/music-dirs/move", Some(1)),
+];
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn remplacer_le_chemin_refuse_un_prefixe_qui_n_est_pas_un_dossier() {
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
+    crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
+    let b = banc();
+    let piste = piste_du_banc(&b);
+    let fichier_dehors = b.dehors.join("secret.flac").to_string_lossy().into_owned();
+    #[allow(unused_mut)]
+    let mut cas = vec![
+        // Ancien = le fichier d'une piste, nouveau = un fichier.
+        (piste.clone(), fichier_dehors.clone()),
+        // Ancien = le fichier d'une piste, nouveau = un dossier.
+        (piste.clone(), b.dehors.to_string_lossy().into_owned()),
+        // Ancien = un dossier, nouveau = un fichier.
+        (
+            b.musique.to_string_lossy().into_owned(),
+            fichier_dehors.clone(),
+        ),
+    ];
+    // Nouveau = un lien, dans le dossier voisin, qui mène sous /etc.
+    #[cfg(unix)]
+    {
+        let lien = b.dehors.join("lien-systeme");
+        std::os::unix::fs::symlink("/etc", &lien).unwrap();
+        cas.push((
+            b.musique.to_string_lossy().into_owned(),
+            lien.to_string_lossy().into_owned(),
+        ));
+    }
+    for (ancien, nouveau) in &cas {
+        for (route, confirm) in ROUTES_DEPLACER {
+            let (statut, corps) = appel_depuis(
+                &b.state,
+                [127, 0, 0, 1],
+                route,
+                json!({
+                    "old_prefix": ancien,
+                    "new_prefix": nouveau,
+                    "confirm_tracks": confirm,
+                }),
+            )
+            .await;
+            assert_eq!(
+                statut,
+                StatusCode::BAD_REQUEST,
+                "{route} {ancien:?} -> {nouveau:?} : {corps}"
+            );
+            assert_eq!(chemin_de_la_piste(&b.state), piste, "{route} {ancien:?}");
+        }
+    }
+    crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn remplacer_le_chemin_refuse_le_reseau_sans_authentification() {
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
+    crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
+    let b = banc();
+    let piste = piste_du_banc(&b);
+    // Hors de `/var/folders` (macOS) : sous le répertoire courant.
+    let scratch = tune_core::test_scratch::scratch_dir_in(
+        std::env::current_dir().unwrap(),
+        "confinement-deplacer-bibli",
+    );
+    let ailleurs = scratch.path().join("Bibli");
+    std::fs::create_dir_all(ailleurs.join("Album")).unwrap();
+    std::fs::write(ailleurs.join("Album/01.flac"), b"x").unwrap();
+    for (route, confirm) in ROUTES_DEPLACER {
+        let (statut, corps) = appel_depuis(
+            &b.state,
+            [192, 168, 1, 50],
+            route,
+            json!({
+                "old_prefix": b.musique,
+                "new_prefix": ailleurs,
+                "confirm_tracks": confirm,
+            }),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::FORBIDDEN, "{route} : {corps}");
+        assert_eq!(chemin_de_la_piste(&b.state), piste, "{route}");
+    }
+    crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(clippy::await_holding_lock)]
+async fn remplacer_le_chemin_deplace_toujours_une_racine_vers_un_dossier() {
+    let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
+    crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
+    let b = banc();
+    piste_du_banc(&b);
+    // Hors de `/var/folders` (macOS) : sous le répertoire courant.
+    let scratch = tune_core::test_scratch::scratch_dir_in(
+        std::env::current_dir().unwrap(),
+        "confinement-deplacer-bibli",
+    );
+    let ailleurs = scratch.path().join("Bibli");
+    std::fs::create_dir_all(ailleurs.join("Album")).unwrap();
+    std::fs::write(ailleurs.join("Album/01.flac"), b"x").unwrap();
+    let ailleurs = ailleurs.to_string_lossy().into_owned();
+    for (route, confirm) in ROUTES_DEPLACER {
+        let (statut, corps) = appel_depuis(
+            &b.state,
+            [127, 0, 0, 1],
+            route,
+            json!({
+                "old_prefix": b.musique,
+                "new_prefix": ailleurs,
+                "confirm_tracks": confirm,
+            }),
+        )
+        .await;
+        assert_eq!(statut, StatusCode::OK, "{route} : {corps}");
+    }
+    assert_eq!(
+        chemin_de_la_piste(&b.state),
+        format!("{ailleurs}/Album/01.flac")
+    );
+    assert_eq!(racines(&b.state), vec![ailleurs]);
+    crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
+}
