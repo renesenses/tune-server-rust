@@ -16,7 +16,7 @@
 //! est active, et à un appel de cette machine sinon (`AdminOuCetteMachine`).
 //! L'ancien et le nouveau préfixe sont des DOSSIERS : l'ancien n'est jamais
 //! le chemin d'un fichier de la base, le nouveau est un dossier existant,
-//! contrôlé sous sa forme canonique (liens symboliques résolus). Pas de rescan : les
+//! et son périmètre est contrôlé sous sa forme canonique. Pas de rescan : les
 //! chemins réécrits sont ceux du disque. L'opération est journalisée (journal
 //! `tracing` et réglage `library_root_moves_journal`) et se défait par la même
 //! opération en sens inverse.
@@ -72,31 +72,25 @@ fn refus_du_perimetre(state: &AppState, p: &Prefixes) -> Option<Response> {
 }
 
 /// Les deux préfixes sont des dossiers. Le nouveau existe sur cette machine
-/// et est un dossier, et sa forme canonique (liens symboliques résolus) passe
-/// le même périmètre que sa forme écrite. L'ancien n'est pas le chemin d'un
-/// fichier de la base (il peut ne plus exister ici : base restaurée depuis
-/// une autre machine).
-fn refus_des_dossiers(state: &AppState, p: &Prefixes) -> Option<Response> {
-    let canonique = match std::fs::canonicalize(&p.nouveau) {
-        Ok(c) if c.is_dir() => c,
-        _ => {
-            return Some(refus(
-                StatusCode::BAD_REQUEST,
-                deplacer_racine::Refus::InvalidPrefix,
-            ));
+/// et est un dossier (`is_dir` suit les liens ; le périmètre, forme
+/// canonique comprise, est déjà vérifié par [`refus_du_perimetre`]). Pas de
+/// `canonicalize` ici : sous Windows il rend `\\?\C:\…`, que le périmètre
+/// refuse. L'ancien n'est pas le chemin d'un fichier de la base (il peut ne
+/// plus exister ici : base restaurée depuis une autre machine). Disque et
+/// base hors de la boucle asynchrone, comme [`calculer_l_apercu`].
+async fn refus_des_dossiers(state: &AppState, p: &Prefixes) -> Option<Response> {
+    let db = state.backend.clone();
+    let p = p.clone();
+    let verdict = tokio::task::spawn_blocking(move || {
+        if !std::path::Path::new(&p.nouveau).is_dir() {
+            return Ok(true);
         }
-    };
-    let canonique = canonique.to_string_lossy().into_owned();
-    if let Some(motif) = super::config::refus_de_racine_de_musique(state, &canonique) {
-        return Some(
-            (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": motif, "path": p.nouveau, "can_apply": false })),
-            )
-                .into_response(),
-        );
-    }
-    match deplacer_racine::prefixe_designe_un_fichier(state.backend.as_ref(), p) {
+        deplacer_racine::prefixe_designe_un_fichier(db.as_ref(), &p)
+    })
+    .await
+    .map_err(|e| e.to_string())
+    .and_then(|r| r);
+    match verdict {
         Ok(false) => None,
         Ok(true) => Some(refus(
             StatusCode::BAD_REQUEST,
@@ -136,7 +130,10 @@ pub(super) async fn apercu(
         Ok(p) => p,
         Err(r) => return refus(StatusCode::BAD_REQUEST, r),
     };
-    if let Some(r) = refus_du_perimetre(&state, &p).or_else(|| refus_des_dossiers(&state, &p)) {
+    if let Some(r) = refus_du_perimetre(&state, &p) {
+        return r;
+    }
+    if let Some(r) = refus_des_dossiers(&state, &p).await {
         return r;
     }
     match calculer_l_apercu(&state, p).await {
@@ -159,7 +156,10 @@ pub(super) async fn appliquer(
         Ok(p) => p,
         Err(r) => return refus(StatusCode::BAD_REQUEST, r),
     };
-    if let Some(r) = refus_du_perimetre(&state, &p).or_else(|| refus_des_dossiers(&state, &p)) {
+    if let Some(r) = refus_du_perimetre(&state, &p) {
+        return r;
+    }
+    if let Some(r) = refus_des_dossiers(&state, &p).await {
         return r;
     }
     // Le droit de scanner, tenu jusqu'à la fin de l'écriture.
