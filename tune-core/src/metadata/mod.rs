@@ -3851,6 +3851,8 @@ pub fn try_read_metadata(path: &Path) -> Result<TrackMetadata, String> {
 }
 
 // Only the failed-Lofty Ogg fallback needs this extra content check (#4412).
+// #9332 — the MP3 fallback too: an ID3v2 tag (cover included) with no MPEG
+// frame after it made lofty fail, and the filename fallback indexed it.
 // A bound reached while reading a large header is inconclusive, not invalid audio.
 const OGG_FALLBACK_PROBE_BYTES: u64 = 1024 * 1024;
 
@@ -3877,15 +3879,23 @@ fn ogg_fallback_has_audio(path: &Path) -> Option<bool> {
     // Only an actual BOS page (including its CRC) makes exhaustion inconclusive.
     // A large HTML dump must not inherit the exception for large Ogg comments.
     // Searching also preserves leading junk/ID3 that the existing probe tolerates.
-    let bounded_ogg =
-        bytes.len() == OGG_FALLBACK_PROBE_BYTES as usize && has_valid_ogg_bos_page(&bytes);
+    // #9332 — the probe hint follows the file (`mp3`); an MP3 whose tag
+    // fills the whole bound (huge cover) is inconclusive, never refused.
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("ogg")
+        .to_ascii_lowercase();
+    let ogg = matches!(ext.as_str(), "ogg" | "oga" | "opus");
+    let bounded = bytes.len() == OGG_FALLBACK_PROBE_BYTES as usize;
+    let bounded_ogg = bounded && (!ogg || has_valid_ogg_bos_page(&bytes));
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // Non-seekable: no tail scan. The mapper recognizes Opus without asking
         // for its external decoder, and no complete audio decode is performed.
         let source = ReadOnlySource::new(std::io::Cursor::new(bytes));
         let mss = MediaSourceStream::new(Box::new(source), Default::default());
         let mut hint = Hint::new();
-        hint.with_extension("ogg");
+        hint.with_extension(if ogg { "ogg" } else { &ext });
         symphonia::default::get_probe()
             .probe(
                 &hint,
@@ -3948,6 +3958,9 @@ fn has_valid_ogg_bos_page(bytes: &[u8]) -> bool {
 
 #[cfg(test)]
 mod ogg_fallback_tests_4412;
+
+#[cfg(test)]
+mod mp3_sans_trame_tests_9332;
 
 #[cfg(test)]
 mod sans_balise_tests_4412;
@@ -4049,6 +4062,14 @@ fn try_read_metadata_unsanitized(path: &Path) -> Result<TrackMetadata, String> {
                     && ogg_fallback_has_audio(path) == Some(false)
                 {
                     return Err(format!("Ogg audio probe failed after metadata error: {e}"));
+                }
+                // #9332 — même sonde pour un MP3 que lofty refuse : sans
+                // aucune trame audio (balise ID3v2 seule), il est écarté et
+                // nommé dans le rapport, comme l'Ogg sans audio (#4412).
+                if ext.eq_ignore_ascii_case("mp3") && ogg_fallback_has_audio(path) == Some(false) {
+                    return Err(format!(
+                        "MP3 sans aucune trame audio après l'erreur de métadonnées : {e}"
+                    ));
                 }
                 tracing::debug!(
                     path = %path.display(),
