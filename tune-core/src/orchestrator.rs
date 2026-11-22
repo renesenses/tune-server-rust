@@ -2329,6 +2329,8 @@ mod prefetch_fiche_qobuz_m3u_8229_tests;
 #[cfg(test)]
 mod prefetch_wav_annonce_6990_tests;
 mod resolve_direct;
+// #9336 — une piste indexée se joue à l'adresse actuelle de son serveur.
+mod adresse_actuelle_du_serveur_9336;
 // #9207 — une URI de notre bibliothèque reçue par le renderer se joue en local.
 mod uri_de_notre_bibliotheque_9207;
 /// #2264 — la règle de version appliquée à la lecture.

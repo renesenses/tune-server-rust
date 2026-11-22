@@ -589,7 +589,13 @@ impl PlaybackOrchestrator {
             .filter(|u| est_une_url_http(u))
             .map(str::to_string);
         let url_indexee = if url_nommee.is_none() && source_apparente == "upnp" {
-            req.track_id.and_then(|id| self.url_de_lecture_indexee(id))
+            // #9336 — reportée sur l'emplacement ACTUEL du serveur (par son
+            // UDN, au registre) : l'instantané garde l'adresse de
+            // l'indexation, morte si le serveur a changé d'IP depuis.
+            req.track_id.and_then(|id| {
+                self.url_de_lecture_indexee(id)
+                    .map(|url| self.url_sur_l_emplacement_actuel(id, url))
+            })
         } else {
             None
         };
