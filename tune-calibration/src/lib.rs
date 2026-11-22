@@ -18,6 +18,7 @@ pub mod fft;
 pub mod fir;
 pub mod level;
 pub mod mic_cal;
+pub mod positions;
 pub mod rew;
 pub mod sim;
 pub mod sweep;

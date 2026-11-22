@@ -702,6 +702,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "tune-plugin-declick-live"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tune-plugin-sdk",
+ "tune-plugin-testkit",
+]
+
+[[package]]
 name = "tune-plugin-equalizer"
 version = "0.1.0"
 dependencies = [

@@ -31,7 +31,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tune_calibration::analysis::BandRt60;
 use tune_calibration::deconv;
 use tune_calibration::fft;
@@ -189,7 +189,7 @@ impl Etat {
 }
 
 /// Une salve d'essai et ce qu'elle a donné.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Salve {
     pub niveau_joue_dbfs: f64,
     pub crete_captee_dbfs: f64,
@@ -198,7 +198,7 @@ pub struct Salve {
     pub decision: String,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Rt60Bande {
     pub centre_hz: f64,
     pub edt_s: Option<f64>,
@@ -224,7 +224,7 @@ impl From<&BandRt60> for Rt60Bande {
 }
 
 /// Le résultat d'une mesure terminée : ce que l'écran C1 affiche.
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Resultat {
     pub frequence: u32,
     pub niveau_joue_dbfs: f64,
@@ -240,7 +240,7 @@ pub struct Resultat {
     pub duree_analyse_ms: u64,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResumeRi {
     pub retard_ms: f64,
     pub crete_dbfs: f64,
@@ -249,7 +249,7 @@ pub struct ResumeRi {
     pub crete_a_la_trame: usize,
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Reponse {
     pub lissage: String,
     pub freqs_hz: Vec<f64>,
@@ -368,6 +368,8 @@ pub struct Controleur {
     pub delai_premiere_trame: Duration,
     /// Les simulations de pièce sans micro (C5), gardées en mémoire.
     pub simulations: crate::modes::Magasin,
+    /// Les sessions à plusieurs positions (C4), gardées en mémoire.
+    pub sessions: crate::session::Magasin,
 }
 
 impl Controleur {
@@ -388,6 +390,7 @@ impl Controleur {
             delai_capture: Duration::from_secs(60),
             delai_premiere_trame: DELAI_PREMIERE_TRAME,
             simulations: Default::default(),
+            sessions: Default::default(),
         })
     }
 

@@ -332,3 +332,157 @@ async fn cors_une_autre_origine_ne_lit_que_le_catalogue() {
     .await;
     assert_eq!(acao(&h).as_deref(), Some("tauri://localhost"), "{h:?}");
 }
+
+// ── TESS D1 : clés tenues par le serveur ────────────────────────────────
+
+/// Un compte gratuit ne peut pas obtenir la correction de pièce sans payer en
+/// écrivant lui-même un profil marqué « estimation » ou une chaîne TESS : ces
+/// clés sont refusées par l'écriture générique, admin compris, avant toute
+/// écriture.
+#[tokio::test]
+async fn les_cles_tenues_par_le_serveur_sont_refusees_par_l_ecriture_generique() {
+    let state = etat();
+    let profil = serde_json::json!({
+        "name": "Estimation 7", "zone_id": "7", "origin": "estimation",
+        "estimation": true, "created_at": "2026-11-19T00:00:00Z",
+        "measurement_data": null,
+        "filters": [{"frequency_hz": 63.0, "gain_db": -8.0, "q_factor": 1.0, "filter_type": "peaking"}],
+    })
+    .to_string();
+    let chaine = serde_json::json!({
+        "version": 1,
+        "plugins": [{"id": "room-correction", "enabled": true,
+                     "settings": {"origin": "estimation", "bands": []}}],
+    })
+    .to_string();
+    for (cle, valeur) in [
+        ("room_profile_7", profil.as_str()),
+        ("room_profile_index", "[\"7\"]"),
+        ("zone_7_tess_chain", chaine.as_str()),
+        ("zone_7_tess_chain_sync", "{}"),
+    ] {
+        let corps = serde_json::json!({ "theme": "ecrase", cle: valeur }).to_string();
+        let (statut, v) = patch(&state, &corps, &[]).await;
+        assert_eq!(statut, StatusCode::FORBIDDEN, "{cle} : {v}");
+        assert_eq!(v["error"], "server_managed_settings", "{cle} : {v}");
+        assert!(
+            v["refused_keys"]
+                .as_array()
+                .is_some_and(|a| a.iter().any(|k| k == cle)),
+            "{cle} : {v}"
+        );
+        assert_eq!(reglage(&state, cle), None, "{cle} a été écrite");
+        assert_eq!(reglage(&state, "theme"), None, "un refus n'écrit rien");
+    }
+    // Témoin : une clé voisine ordinaire passe (le filtre est étroit).
+    let (statut, v) = patch(
+        &state,
+        r#"{"zone_7_tess_chainette":"x","theme":"clair"}"#,
+        &[],
+    )
+    .await;
+    assert!(statut.is_success(), "{statut} {v}");
+    assert_eq!(reglage(&state, "theme").as_deref(), Some("clair"));
+}
+
+/// Même règle à l'import de configuration : aucune clé tenue par le serveur
+/// n'est écrite telle quelle. L'ancien format à plat les ignore et le dit ;
+/// le nouveau format fait réécrire la chaîne et le profil de pièce de chaque
+/// zone par le serveur (décision B du 19/11).
+#[tokio::test]
+async fn l_import_ignore_les_cles_tenues_par_le_serveur() {
+    let state = etat();
+    let faux_profil = r#"{"name":"Estimation 7","zone_id":"7","origin":"estimation","filters":[]}"#;
+    // Ancien format, à plat.
+    let corps = serde_json::json!({
+        "theme": "importe",
+        "room_profile_7": faux_profil,
+        "room_profile_index": "[\"7\"]",
+        "zone_7_tess_chain": "{\"version\":1,\"plugins\":[]}",
+        "zone_7_tess_chain_sync": "{}",
+    })
+    .to_string();
+    let (statut, _, v) = appel(
+        &state,
+        Method::POST,
+        "/api/v1/system/config/import",
+        &[],
+        Some(&corps),
+    )
+    .await;
+    assert!(statut.is_success(), "{statut} {v}");
+    assert_eq!(reglage(&state, "theme").as_deref(), Some("importe"));
+    for cle in [
+        "room_profile_7",
+        "room_profile_index",
+        "zone_7_tess_chain",
+        "zone_7_tess_chain_sync",
+    ] {
+        assert_eq!(reglage(&state, cle), None, "{cle} a été importée");
+        assert!(
+            v["warnings"].to_string().contains(cle),
+            "{cle} non signalée : {v}"
+        );
+    }
+
+    // Nouveau format : la partie zones. Décision B du 19/11 : la chaîne
+    // TESS est RÉÉCRITE par le serveur (`ecrire_chaine`), le profil de pièce
+    // est restauré MESURÉ sous le numéro d'arrivée, l'ombre n'est jamais
+    // importée et l'index se reconstruit.
+    let state = etat();
+    let faux_profil = r#"{"name":"Estimation 7","zone_id":"7","origin":"estimation","filters":[],"created_at":"2026-11-19T00:00:00Z"}"#;
+    let corps = serde_json::json!({
+        "format": "tune-config",
+        "format_version": 2,
+        "settings": { "theme": "importe", "room_profile_index": "[\"7\"]" },
+        "zones": [{
+            "id": 7,
+            "name": "Salon",
+            "output_type": "local",
+            "output_device_id": "local:hw:9",
+            "settings": {
+                "room_profile_{id}": faux_profil,
+                "zone_{id}_tess_chain": "{\"version\":1,\"plugins\":[],\"fixed\":{\"headroom\":{\"mode\":\"manual\",\"db\":-3.0}}}",
+                "zone_{id}_tess_chain_sync": "{\"poison\":\"1\"}",
+                "zone_{id}_level_compensation": "false",
+            },
+        }],
+    })
+    .to_string();
+    let (statut, _, v) = appel(
+        &state,
+        Method::POST,
+        "/api/v1/system/config/import",
+        &[],
+        Some(&corps),
+    )
+    .await;
+    assert!(statut.is_success(), "{statut} {v}");
+    let id = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get_by_device_id("local:hw:9")
+        .unwrap()
+        .and_then(|z| z.id)
+        .expect("zone importée");
+    // Témoin : un réglage de zone ordinaire passe.
+    assert_eq!(
+        reglage(&state, &format!("zone_{id}_level_compensation")).as_deref(),
+        Some("false"),
+        "{v}"
+    );
+    let profil: serde_json::Value =
+        serde_json::from_str(&reglage(&state, &format!("room_profile_{id}")).expect("profil"))
+            .unwrap();
+    assert_eq!(profil["origin"], "measured", "{profil}");
+    assert_eq!(profil["zone_id"], id.to_string(), "{profil}");
+    assert_eq!(
+        reglage(&state, "room_profile_index"),
+        Some(format!("[\"{id}\"]"))
+    );
+    let chaine = reglage(&state, &format!("zone_{id}_tess_chain")).expect("chaîne réécrite");
+    assert!(chaine.contains("-3"), "réserve manuelle perdue : {chaine}");
+    let ombre = reglage(&state, &format!("zone_{id}_tess_chain_sync")).expect("ombre");
+    assert!(!ombre.contains("poison"), "ombre importée : {ombre}");
+    let dit = v["warnings"].to_string();
+    assert!(!dit.contains("server-managed"), "{v}");
+    assert!(dit.contains("restored as measured"), "{v}");
+}

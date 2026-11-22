@@ -145,6 +145,16 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
+      # Disque (#9025, 18/11) : sans informations de débogage, un binaire de
+      # test garde encore sa table des symboles, ~40 % de sa taille (mesuré
+      # sur Shrek : 319 -> 193 Mio pour la lib de test de tune-core). Avec
+      # ~270 binaires d'essai de tune-server à ~300 Mio chacun, `target/`
+      # touchait les ~93 Gio libres du runner (109 Gio moins 16 Gio
+      # d'échange) : disque plein à l'étape tune-smart-http, ou machine
+      # perdue pendant l'étape 8. Les messages de panique gardent fichier et
+      # ligne (`Location`) ; seules les piles d'appel perdent leurs noms.
+      CARGO_PROFILE_DEV_STRIP: "symbols"
+      CARGO_PROFILE_TEST_STRIP: "symbols"
 
     steps:
       - uses: actions/checkout@v4
@@ -209,8 +219,36 @@ jobs:
       # Cout mesure sur Shrek (arbre chaud) : 4 min 47 pour tune-core seul,
       # 5 min 36 pour les deux, soit +49 s. La compilation de `tune-server` est
       # ensuite REUTILISEE par l'etape « Routes de tune-server » plus bas.
+      # Mémoire (#9025 suite, mesuré sur Shrek le 19/11, rustc 1.100, réglages
+      # de ce job) : les quatre rustc lourds de l'étape suivante sont
+      #   tune-core lib 5,5 Gio · tune-core lib de TEST 10,3 Gio
+      #   tune-server lib 5,6 Gio · tune-server lib de TEST 8,0 Gio
+      # À CARGO_BUILD_JOBS=3, cargo les lance EN MÊME TEMPS : pic simultané de
+      # 20,8 à 21,2 Gio (187 s au-dessus de 16 Gio sur Shrek, bien plus sur la
+      # machine gratuite), pour 16 Gio de RAM : l'échange tourne à vide et
+      # GitHub perd la machine. À l'exécution, aucun binaire de test ne
+      # dépasse 0,6 Gio (260 cibles de tune-server, 84 de tune-core mesurées).
+      # On sépare donc la compilation en deux temps, SANS changer les
+      # features (même commande `cargo test`, donc mêmes empreintes, rien
+      # n'est recompilé à l'étape suivante) :
+      # 1. dépendances + les deux bibliothèques (une petite cible d'essai
+      #    suffit à les tirer) : pic mesuré 7,2 Gio ;
+      # 2. les cibles lourdes une par une (-j1) : pic 10,2 Gio. Coût : ~+15 min
+      #    sur Shrek (1 592 s au lieu de 706 s pour cette compilation).
+      # `cargo build --lib` ne convient PAS : sans les dev-dependencies, la
+      # résolution des features change et tout tune-core est recompilé.
+      - name: Précompiler les bibliothèques (mémoire, #9025)
+        run: cargo test --no-run --no-fail-fast -p tune-core -p tune-server --no-default-features --features postgres,oaat --test annee_repli_album
+      - name: Précompiler les libs de test une à une (mémoire, #9025)
+        run: cargo test --no-run --no-fail-fast -j1 -p tune-core -p tune-server --no-default-features --features postgres,oaat --lib --bins
       - name: Tests tune-core et tune-server avec PostgreSQL
         run: cargo test --no-fail-fast -p tune-core -p tune-server --no-default-features --features postgres,oaat
+
+      # Disque (#9025) : la place restante après la plus grosse compilation,
+      # lisible même quand la suite échoue.
+      - name: Place disque après les tests de tune-core et tune-server
+        if: always()
+        run: df -h / && du -sh target 2>/dev/null || true
 
       # Real-schema regression for #1706: the self-healing DDL in
       # `ensure_schema` and migration 026 can only be proven against an actual
@@ -247,7 +285,7 @@ jobs:
       - name: Schema-drift regression (#1706)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
-        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_1706 -- --nocapture
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_1706 -- --nocapture
 
       # #5997 — miroir des favoris de service : écriture pour tous les profils,
       # alignement (INSERT … SELECT … ON CONFLICT), retrait au rafraîchissement,
@@ -506,7 +544,7 @@ jobs:
       - name: « Continuer l'écoute » sur PostgreSQL (#2860)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
-        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_2860 -- --nocapture
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_2860 -- --nocapture
 
       # Fil 2130 — « Reprendre l'écoute » tombait en « (delai) » : la jointure
       # en OR du second rang prenait 25,7 s sur PostgreSQL. Réécrite en deux
@@ -719,7 +757,7 @@ jobs:
       - name: Contexte de lecture sur PostgreSQL (#2441)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
-        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_2441 -- --nocapture
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_2441 -- --nocapture
 
       - name: Noms de contexte historique sur PostgreSQL (#4036)
         env:
@@ -785,12 +823,12 @@ jobs:
       - name: Volume fixe et restauration de sauvegarde (#2395)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
-        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_config_backup -- --nocapture
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_config_backup -- --nocapture
 
       - name: Parité du schéma PG (#2111)
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
-        run: cargo test --no-fail-fast -p tune-core --no-default-features --features postgres pg_schema_parity -- --nocapture
+        run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_schema_parity -- --nocapture
 
       # #3715 — le garde que #2995 demandait a son point 3, ENFIN execute.
       #
@@ -1365,6 +1403,15 @@ jobs:
         env:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-server --lib --no-default-features --features postgres,oaat pg_4201 -- --nocapture --test-threads=1
+
+      # Disque (#9025) : plus aucune étape ne relance tune-server ; ses
+      # ~270 binaires d'essai (~50 Gio même sans symboles) laissent la place
+      # à la compilation de tune-core que demande tune-smart-http.
+      - name: Libérer target/ des binaires de tune-server
+        run: |
+          df -h /
+          cargo clean -p tune-server
+          df -h /
 
       # Recette du 13/11 (n° 73) — la liste des collections intelligentes lit
       # ses deux comptes (albums, pistes) en UNE requête : elle rend sur la

@@ -1073,8 +1073,16 @@ fn import_settings(
     let mut count = 0;
     let mut sans_zone = 0usize;
     let mut volume_ecarte = 0usize;
+    let mut tenus_par_le_serveur: Vec<&str> = Vec::new();
     for (key, value) in settings_list {
         if is_sensitive(key) || crate::playback::radio_fin_de_file::cle_de_marques(key) {
+            continue;
+        }
+        // TESS D1 : la chaîne TESS (reconstruite depuis les anciennes clés)
+        // et un profil de pièce glissé hors de sa section ne passent pas par
+        // les réglages généraux.
+        if crate::tess::migration::cle_tenue_par_le_serveur(key) {
+            tenus_par_le_serveur.push(key);
             continue;
         }
         if let Some((source, gabarit)) = crate::db::zone_repo::gabarit_de_cle_de_zone(key) {
@@ -1135,6 +1143,12 @@ fn import_settings(
             ecartes = volume_ecarte,
             "config_import_reglages_de_volume_ecartes"
         );
+    }
+    if !tenus_par_le_serveur.is_empty() {
+        warnings.push(format!(
+            "server-managed setting(s) skipped (room correction profiles and TESS chains are written by their own routes): {}",
+            tenus_par_le_serveur.join(", ")
+        ));
     }
     Ok(count)
 }
@@ -1521,20 +1535,58 @@ fn import_eq_presets(
     Ok(count)
 }
 
+/// Restaure les profils de pièce d'une sauvegarde.
+///
+/// TESS D1 : l'origine d'un profil (`measured` ou `estimation`, qui décide du
+/// droit Premium) est enregistrée par le serveur à la création ; celle d'un
+/// fichier de sauvegarde ne se vérifie pas. Un profil restauré l'est donc
+/// toujours comme MESURÉ (Premium ; converti, jamais détruit, pour un compte
+/// gratuit), et la restauration le dit quand le fichier prétendait autre
+/// chose. Seules les clés de profil de pièce sont écrites par cette section.
 fn import_room_profiles(
     backend: &Arc<dyn DbBackend>,
     profiles: &[Value],
-    _warnings: &mut Vec<String>,
+    warnings: &mut Vec<String>,
 ) -> Result<usize, String> {
     let settings = SettingsRepo::with_backend(backend.clone());
     let mut count = 0;
     for p in profiles {
         let key = p["key"].as_str().unwrap_or_default();
         let value = p["value"].as_str().unwrap_or_default();
-        if !key.is_empty() {
-            settings.set(key, value)?;
-            count += 1;
+        if key.is_empty() {
+            continue;
         }
+        if !is_room_profile_key(key) {
+            warnings.push(format!(
+                "room profile section: '{key}' is not a room correction profile key; skipped"
+            ));
+            continue;
+        }
+        let a_ecrire = if key == "room_profile_index" {
+            value.to_string()
+        } else {
+            let Ok(Value::Object(mut profil)) = serde_json::from_str::<Value>(value) else {
+                warnings.push(format!(
+                    "room correction profile '{key}' is not readable; skipped"
+                ));
+                continue;
+            };
+            if crate::tess::migration::origine_de_la_piece(&Value::Object(profil.clone()))
+                != crate::room_correction::ORIGINE_MESUREE
+            {
+                warnings.push(format!(
+                    "room correction profile '{key}': restored as measured (the origin of a profile is recorded by the server, not read from a backup)"
+                ));
+            }
+            profil.remove("estimation");
+            profil.insert(
+                "origin".into(),
+                Value::String(crate::room_correction::ORIGINE_MESUREE.into()),
+            );
+            Value::Object(profil).to_string()
+        };
+        settings.set(key, &a_ecrire)?;
+        count += 1;
     }
     Ok(count)
 }
@@ -1826,6 +1878,67 @@ mod tests {
     /// A backup written before #5669 carries none of these fields: it is
     /// still accepted, with today's defaults (every day, no holiday skip,
     /// single zone).
+    /// TESS D1 : une sauvegarde ne lève pas le droit Premium. Un profil de
+    /// pièce restauré l'est comme MESURÉ, quoi que dise le fichier ; la
+    /// section des profils n'écrit que des clés de profil ; la chaîne TESS et
+    /// un profil glissé dans les réglages généraux sont ignorés. La
+    /// restauration le dit.
+    #[test]
+    fn la_restauration_ne_leve_pas_le_droit_premium_de_la_correction_de_piece() {
+        let estimation = serde_json::json!({
+            "name": "Estimation 3", "zone_id": "3", "origin": "estimation",
+            "estimation": true, "created_at": "2026-11-19T00:00:00Z",
+            "measurement_data": null, "filters": [],
+        })
+        .to_string();
+        let snapshot: ConfigSnapshot = serde_json::from_value(serde_json::json!({
+            "version": "1.0.0",
+            "created_at": "2026-11-19T00:00:00Z",
+            "zones": [],
+            "settings": [
+                ["theme", "restaure"],
+                ["room_profile_9", estimation.clone()],
+                ["room_profile_index", "[\"9\"]"],
+            ],
+            "playlists": [], "favorites": [], "radio_stations": [], "alarms": [],
+            "eq_presets": [],
+            "room_profiles": [
+                {"key": "room_profile_3", "value": estimation},
+                {"key": "jwt_secret", "value": "impose"},
+            ],
+            "streaming_tokens": []
+        }))
+        .unwrap();
+        let dst = fresh_backend();
+        let report = import_config(&dst, snapshot).unwrap();
+        let s = SettingsRepo::with_backend(dst.clone());
+        assert_eq!(s.get("theme").unwrap().as_deref(), Some("restaure"));
+        // Le profil de sa section est restauré, mais comme mesuré.
+        let profil: Value =
+            serde_json::from_str(&s.get("room_profile_3").unwrap().expect("profil restauré"))
+                .unwrap();
+        assert_eq!(profil["origin"], "measured", "{profil}");
+        assert!(profil.get("estimation").is_none(), "{profil}");
+        assert_eq!(
+            crate::tess::migration::origine_de_la_piece(&profil),
+            crate::room_correction::ORIGINE_MESUREE
+        );
+        // Hors de sa section : ignoré ; et la section n'écrit rien d'autre.
+        assert_eq!(s.get("room_profile_9").unwrap(), None);
+        assert_eq!(s.get("room_profile_index").unwrap(), None);
+        assert_eq!(s.get("jwt_secret").unwrap(), None);
+        let dit = report.warnings.join(" | ");
+        assert!(
+            dit.contains("room_profile_3") && dit.contains("measured"),
+            "{dit}"
+        );
+        assert!(
+            dit.contains("room_profile_9") && dit.contains("server-managed"),
+            "{dit}"
+        );
+        assert!(dit.contains("jwt_secret"), "{dit}");
+    }
+
     #[test]
     fn alarm_from_backup_without_new_fields_gets_defaults_5669() {
         let snapshot: ConfigSnapshot = serde_json::from_value(serde_json::json!({

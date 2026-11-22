@@ -8,7 +8,7 @@ use chrono::{
 pub const ALARM_TIMEZONE_KEY: &str = "alarms_timezone";
 
 pub fn validate_alarm_timezone(zone: &str) -> Result<(), String> {
-    if zone.is_empty() || zone.parse::<chrono_tz::Tz>().is_ok() {
+    if zone.is_empty() || jiff::tz::TimeZone::get(zone).is_ok() {
         Ok(())
     } else {
         Err(format!("alarms_timezone : fuseau IANA inconnu ({zone})"))
@@ -20,11 +20,16 @@ pub fn read_alarm_timezone(db: &dyn DbBackend) -> Result<String, String> {
         "SELECT value FROM settings WHERE key = 'alarms_timezone'",
         &[],
     )?;
-    Ok(row
+    let zone = row
         .as_ref()
         .and_then(|r| r.first())
         .and_then(|v| v.as_string())
-        .unwrap_or_default())
+        .unwrap_or_default();
+    if let Err(error) = validate_alarm_timezone(&zone) {
+        tracing::warn!(timezone = %zone, error = %error, "alarm_timezone_invalid_fallback_system");
+        return Ok(String::new());
+    }
+    Ok(zone)
 }
 
 pub fn alarm_local_time(
@@ -34,7 +39,7 @@ pub fn alarm_local_time(
     local_time(&read_alarm_timezone(db)?, instant)
 }
 
-fn occurrence(
+fn raw_occurrence(
     zone: &str,
     date: NaiveDate,
     time: NaiveTime,
@@ -45,12 +50,52 @@ fn occurrence(
             .from_local_datetime(&naive)
             .map(|t| t.with_timezone(&Utc)));
     }
-    let tz = zone
-        .parse::<chrono_tz::Tz>()
-        .map_err(|_| format!("alarms_timezone : fuseau IANA inconnu ({zone})"))?;
-    Ok(tz
-        .from_local_datetime(&naive)
-        .map(|t| t.with_timezone(&Utc)))
+    let tz = jiff::tz::TimeZone::get(zone).map_err(|e| e.to_string())?;
+    let civil = naive
+        .to_string()
+        .parse::<jiff::civil::DateTime>()
+        .map_err(|e| e.to_string())?;
+    let ambiguous = tz.to_ambiguous_timestamp(civil);
+    let to_chrono = |ts: jiff::Timestamp| {
+        DateTime::from_timestamp(ts.as_second(), ts.subsec_nanosecond() as u32)
+            .ok_or_else(|| "alarms_timezone : instant hors limites".to_string())
+    };
+    use jiff::tz::AmbiguousOffset;
+    Ok(match ambiguous.offset() {
+        AmbiguousOffset::Gap { .. } => LocalResult::None,
+        AmbiguousOffset::Fold { .. } => LocalResult::Ambiguous(
+            to_chrono(ambiguous.earlier().map_err(|e| e.to_string())?)?,
+            to_chrono(ambiguous.later().map_err(|e| e.to_string())?)?,
+        ),
+        AmbiguousOffset::Unambiguous { .. } => LocalResult::Single(to_chrono(
+            ambiguous.unambiguous().map_err(|e| e.to_string())?,
+        )?),
+    })
+}
+
+/// Une heure effacée par un changement d'heure sonne à la première minute
+/// valide du même jour, et non à l'heure décalée de la durée du saut.
+fn occurrence(
+    zone: &str,
+    date: NaiveDate,
+    time: NaiveTime,
+) -> Result<LocalResult<DateTime<Utc>>, String> {
+    let mut candidate = NaiveDateTime::new(date, time);
+    loop {
+        let result = raw_occurrence(zone, date, candidate.time())?;
+        if !matches!(result, LocalResult::None) {
+            return Ok(result);
+        }
+        let Some(next) = candidate.checked_add_signed(chrono::Duration::minutes(1)) else {
+            return Ok(LocalResult::None);
+        };
+        // Un jour entièrement supprimé n'a aucune occurrence. Ne pas attribuer
+        // au jour suivant les règles de jours/fériés du jour disparu.
+        if next.date() != date {
+            return Ok(LocalResult::None);
+        }
+        candidate = next;
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -87,12 +132,11 @@ pub(super) fn decision(
     let Some(time) = alarm_time(alarm) else {
         return Ok(Decision::Wait);
     };
-    let absent = matches!(occurrence(zone, now.date_naive(), time)?, LocalResult::None);
-    if absent {
-        if now.time() < time {
-            return Ok(Decision::Wait);
-        }
-    } else if (now.hour(), now.minute()) != (time.hour(), time.minute()) {
+    let Some(candidate) = occurrence(zone, now.date_naive(), time)?.earliest() else {
+        return Ok(Decision::Wait);
+    };
+    let effective = local_time(zone, candidate)?;
+    if (now.hour(), now.minute()) != (effective.hour(), effective.minute()) {
         return Ok(Decision::Wait);
     }
     if !super::resolve_alarm_days(alarm).contains(&now.weekday().num_days_from_monday()) {
@@ -104,9 +148,6 @@ pub(super) fn decision(
     if flag(alarm, "skip_holidays") && super::is_french_holiday(now.year(), now.month(), now.day())
     {
         return Ok(Decision::Skip("holiday"));
-    }
-    if absent {
-        return Ok(Decision::Skip("nonexistent_local_time"));
     }
     Ok(Decision::Ring)
 }
@@ -154,10 +195,13 @@ pub(super) fn local_time(
     if zone.is_empty() {
         return Ok(instant.with_timezone(&Local).fixed_offset());
     }
-    let tz = zone
-        .parse::<chrono_tz::Tz>()
-        .map_err(|_| format!("alarms_timezone : fuseau IANA inconnu ({zone})"))?;
-    Ok(instant.with_timezone(&tz).fixed_offset())
+    let tz = jiff::tz::TimeZone::get(zone).map_err(|e| e.to_string())?;
+    let timestamp =
+        jiff::Timestamp::new(instant.timestamp(), instant.timestamp_subsec_nanos() as i32)
+            .map_err(|e| e.to_string())?;
+    let offset = FixedOffset::east_opt(tz.to_offset(timestamp).seconds())
+        .ok_or_else(|| "alarms_timezone : décalage hors limites".to_string())?;
+    Ok(instant.with_timezone(&offset))
 }
 
 #[cfg(test)]
@@ -268,18 +312,30 @@ mod schedule_tests {
         );
     }
     #[test]
-    fn reveil_8838_heure_absente_sautee_et_prochaine_occurrence() {
+    fn reveil_8838_heure_absente_sonne_a_la_premiere_minute_valide() {
         let a = alarm("02:30");
         assert_eq!(
             decision(&a, "Europe/Paris", utc("2026-03-29T01:00:00Z")).unwrap(),
-            Decision::Skip("nonexistent_local_time")
+            Decision::Ring
         );
         assert_eq!(
             next_alarm_at(&a, "Europe/Paris", utc("2026-03-29T00:00:00Z"))
                 .unwrap()
                 .unwrap(),
-            "2026-03-30T02:30:00+02:00"
+            "2026-03-29T03:00:00+02:00"
         );
+        assert_eq!(
+            decision(&a, "Europe/Paris", utc("2026-03-29T00:59:00Z")).unwrap(),
+            Decision::Wait
+        );
+        assert_eq!(
+            decision(&a, "Europe/Paris", utc("2026-03-29T01:30:00Z")).unwrap(),
+            Decision::Wait
+        );
+    }
+    #[test]
+    fn reveil_8838_heure_repetee_ne_propose_pas_la_seconde_occurrence() {
+        let a = alarm("02:30");
         assert_eq!(
             next_alarm_at(&a, "Europe/Paris", utc("2026-10-25T00:31:00Z"))
                 .unwrap()
@@ -293,6 +349,33 @@ mod schedule_tests {
 mod database_tests {
     use super::*;
     use crate::db::{migrations, settings_repo::SettingsRepo, sqlite::SqliteDb};
+    #[test]
+    fn reveil_8838_fuseau_stocke_invalide_replie_sur_systeme() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        let repo = SettingsRepo::new(db.clone());
+        repo.set(ALARM_TIMEZONE_KEY, "Europe/Inconnue").unwrap();
+        assert_eq!(
+            read_alarm_timezone(&db).unwrap(),
+            "",
+            "un fuseau restauré illisible doit utiliser le système"
+        );
+        let instant: DateTime<Utc> = "2026-11-17T10:10:00Z".parse().unwrap();
+        assert_eq!(
+            alarm_local_time(&db, instant).unwrap(),
+            instant.with_timezone(&Local).fixed_offset()
+        );
+        assert_eq!(
+            repo.get(ALARM_TIMEZONE_KEY).unwrap().as_deref(),
+            Some("Europe/Inconnue")
+        );
+        db.execute_batch("DROP TABLE settings").unwrap();
+        assert!(
+            read_alarm_timezone(&db).is_err(),
+            "une erreur SQL ne doit pas devenir un repli de fuseau"
+        );
+    }
     #[test]
     fn reveil_8838_reglage_persistant_et_migration_sans_decalage() {
         let db = SqliteDb::open_in_memory().unwrap();

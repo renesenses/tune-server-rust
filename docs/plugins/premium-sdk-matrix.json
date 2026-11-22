@@ -929,6 +929,32 @@
         "sdk/tune-plugin-declick/src/lib.rs"
       ],
       "qualification_note": "Production acceptance pending; implementation and executable witnesses do not certify every device/backend."
+    },
+    {
+      "id": "shared.f64-negotiation",
+      "feature": "shared",
+      "requirement": "TESS T05: F64 blocks only for a DSP plugin that requests audio-f64 (ABI 1 unchanged); existing F32 plugins converted at their boundary and unchanged; a plugin that requests audio-f64 but refuses F64 is refused at load.",
+      "baseline_files": [
+        "tune-core/src/audio/eq.rs",
+        "tune-core/src/audio/crossfeed.rs"
+      ],
+      "sdk_status": "contract_test",
+      "production_status": "pending",
+      "witnesses": [
+        "sdk/tune-plugin-sdk/tests/contracts.rs::f64_is_a_negotiated_optional_capability",
+        "sdk/tune-plugin-native/tests/f64.rs::un_greffon_f32_signe_et_installe_tourne_inchange_par_la_conversion_a_sa_frontiere",
+        "sdk/tune-plugin-native/tests/f64.rs::un_greffon_qui_demande_audio_f64_recoit_bien_du_f64",
+        "sdk/tune-plugin-native/tests/f64.rs::contre_epreuve_un_greffon_qui_declare_f64_sans_l_implementer_est_refuse_au_chargement",
+        "sdk/tune-plugin-native/tests/native.rs::reference_f32_plugins_run_unchanged_behind_the_f64_boundary"
+      ],
+      "implementation": "implemented",
+      "implementation_files": [
+        "sdk/tune-plugin-sdk/src/manifest.rs",
+        "sdk/tune-plugin-native/src/stage.rs",
+        "sdk/tune-plugin-native/src/lib.rs",
+        "sdk/tune-plugin-testkit/src/lib.rs"
+      ],
+      "qualification_note": "Production acceptance pending: the Tune pipeline still feeds f32 to native stages until the TESS executor (T03/T14) calls process_f64."
     }
   ]
 }

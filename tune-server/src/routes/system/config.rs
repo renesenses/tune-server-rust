@@ -1846,6 +1846,33 @@ pub(super) fn refus_des_cles_protegees<'a>(
     )
 }
 
+/// TESS D1 : refuse en bloc (`403 server_managed_settings`), avant toute
+/// écriture, les clés que seul le serveur écrit
+/// (`tune_core::tess::migration::cle_tenue_par_le_serveur`).
+fn refus_des_cles_tenues_par_le_serveur<'a>(
+    cles: impl IntoIterator<Item = &'a str>,
+) -> Option<axum::response::Response> {
+    let refusees: Vec<&str> = cles
+        .into_iter()
+        .filter(|c| tune_core::tess::migration::cle_tenue_par_le_serveur(c))
+        .collect();
+    if refusees.is_empty() {
+        return None;
+    }
+    tracing::warn!(cles = %refusees.join(","), "reglages_tenus_par_le_serveur_refuses");
+    Some(
+        (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "server_managed_settings",
+                "message": "Room correction profiles and TESS chains are written by their own routes only.",
+                "refused_keys": refusees,
+            })),
+        )
+            .into_response(),
+    )
+}
+
 /// Retire d'un import les clés protégées quand l'admin n'est pas effectif, et
 /// rend les avertissements à joindre à la réponse.
 pub(super) fn ecarter_les_cles_protegees<T>(
@@ -1983,6 +2010,12 @@ pub(super) async fn update_config(
     // désactivée, `RequireAdmin` laisse passer tout appelant : ces clés-là sont
     // alors refusées, en bloc, avant toute écriture.
     if let Some(refus) = refus_des_cles_protegees(&state, values.keys().map(String::as_str)) {
+        return Ok(refus);
+    }
+    // TESS D1 : le profil de pièce (dont l'origine décide du droit Premium)
+    // et la chaîne TESS de chaque zone ne s'écrivent que par leurs routes,
+    // jamais par l'écriture générique, admin compris.
+    if let Some(refus) = refus_des_cles_tenues_par_le_serveur(values.keys().map(String::as_str)) {
         return Ok(refus);
     }
     // Sécurité — `music_dirs` reste écrivable ici (aller-retour de

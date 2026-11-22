@@ -178,3 +178,31 @@ fusion : lire la PR de groupe qui cite la PR unitaire
 (`gh pr view <groupe> --json state,mergeCommit`), puis
 `git diff --stat <commit unitaire> origin/<lot> -- <fichiers de la PR>` : une
 sortie vide veut dire que le contenu est fusionné.
+
+### Réveils et arrêt programmé : fuseaux (#8838, relecture #8912)
+
+Le réglage IANA `alarms_timezone` est résolu par Jiff, avec la base IANA
+embarquée (`tzdb-bundle-always`) également sous Linux : une image minimale
+sans `tzdata` conserve les fuseaux explicites. Sa valeur vide conserve
+le fuseau système. Une valeur invalide provenant d'une restauration est lue
+comme le mode système, sans réécrire la base, avec l'avertissement
+`alarm_timezone_invalid_fallback_system`. Une erreur SQL reste une erreur.
+L'API refuse toujours un nouveau fuseau invalide à l'enregistrement.
+
+Une heure inexistante au printemps est reportée à la première minute valide
+du même jour : `02:30` à Paris le 29 mars 2026 donne `03:00`, et non `03:30`.
+La prochaine occurrence annoncée suit la même règle que le déclenchement.
+Les jours cochés et les jours fériés restent appliqués. Une date entièrement
+supprimée n'emprunte pas le lendemain ; une heure répétée à l'automne garde
+la déduplication par réveil et date locale. Aucun appel au périphérique n'est
+nécessaire pour les tests `8838` des bibliothèques core et serveur.
+
+Les champs `next_fired_at` et `next_stop_at` portent un instant RFC 3339 avec
+son décalage (`2026-03-29T03:00:00+02:00`), ou `null` sans occurrence.
+Vérification des remotes au 22 novembre 2026 : aucun lecteur de `next_stop_at`
+n'existe dans `tune-remote-ios` main `36998e9438fe82081d0b7e120ed9b26b666d7a67`
+ni dans `tune-remote-flutter` main `3c0a582ba4d4e0b4e72515aed43aa76adf4cd1a9`
+(`git grep` de `next_stop_at`, `nextStopAt`, `next_stop`, `nextStop`). Il n'y a
+donc pas de parseur existant à adapter ou à présenter comme testé. Le témoin
+API serveur parse réellement les réponses avec `DateTime::parse_from_rfc3339`.
+Un futur affichage natif devra conserver l'instant et tenir compte du décalage.

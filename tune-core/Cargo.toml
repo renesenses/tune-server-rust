@@ -104,7 +104,7 @@ zeroize = "1"
 data-encoding = "2.11"
 blowfish = { workspace = true }
 chrono = { workspace = true }
-chrono-tz = { workspace = true }
+jiff = { workspace = true }
 cbc = { workspace = true }
 regex = { workspace = true }
 csv = { workspace = true }

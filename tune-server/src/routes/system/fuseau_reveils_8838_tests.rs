@@ -103,3 +103,43 @@ async fn arret_8838_api_annonce_le_meme_fuseau_et_la_prochaine_heure() {
     use chrono::Timelike;
     assert_eq!((next.hour(), next.minute()), (23, 0));
 }
+
+#[tokio::test]
+async fn fuseau_stocke_invalide_ne_casse_pas_les_listes_8838() {
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    SettingsRepo::with_backend(state.backend.clone())
+        .set("alarms_timezone", "Europe/Inconnue")
+        .unwrap();
+    state
+        .backend
+        .execute_batch(
+            "INSERT INTO alarms (time, days_of_week, enabled) VALUES ('11:10', '1111111', 1);",
+        )
+        .unwrap();
+    let reglage =
+        serde_json::from_value(json!({"enabled":true,"time":"23:00","days_of_week":"1111111"}))
+            .unwrap();
+    tune_core::arret_programme::ecrire(&state.backend, reglage).unwrap();
+    let (status, alarms) = request(&state, "GET", "/api/v1/alarms", Value::Null).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "un fuseau restauré illisible rend la liste des réveils indisponible"
+    );
+    assert_eq!(alarms[0]["timezone"], "");
+    chrono::DateTime::parse_from_rfc3339(alarms[0]["next_fired_at"].as_str().unwrap()).unwrap();
+    let (status, stop) = request(
+        &state,
+        "GET",
+        "/api/v1/system/settings/scheduled-stop",
+        Value::Null,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "un fuseau restauré illisible rend l'arrêt programmé indisponible"
+    );
+    assert_eq!(stop["timezone"], "");
+    chrono::DateTime::parse_from_rfc3339(stop["next_stop_at"].as_str().unwrap()).unwrap();
+}
