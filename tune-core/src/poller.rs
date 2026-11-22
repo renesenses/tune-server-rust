@@ -1163,6 +1163,10 @@ mod source_en_erreur_9315_tests;
 /// puis l'arrêt avec bandeau.
 mod demarrage_fige_5522;
 
+/// #9043 — barre de progression « collée à la fin » dès le départ d'une
+/// piste : diagnostic, une ligne par piste.
+mod barre_au_bout_9043;
+
 /// #5522 — le banc : vrai sondeur, sortie factice figée à 0.
 #[cfg(test)]
 mod demarrage_fige_5522_tests;
