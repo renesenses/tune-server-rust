@@ -2253,7 +2253,12 @@ pub fn decode_http_range_to_pcm_streaming_seeked(
     seek_s: f64,
 ) -> Result<(u16, u32), String> {
     let source_name = format!("flux-distant.{codec_hint}");
-    decode_to_pcm_streaming_inner(
+    // #8983 — la source `Range` d'un service (Qobuz, Tidal) : un saut qui
+    // échoue ne doit pas laisser partir un flux qui ne commence pas à
+    // `seek_s` (la sortie locale le croit pré-positionné). L'erreur rendue
+    // précède l'en-tête WAV : l'appelant reprend par le téléchargement
+    // complet, où le saut se fait dans le fichier.
+    decode_to_pcm_streaming_inner_avec(
         &source_name,
         target_sample_rate,
         target_channels,
@@ -2264,6 +2269,7 @@ pub fn decode_http_range_to_pcm_streaming_seeked(
         Some(levels_tx),
         seek_s,
         Some(Box::new(source)),
+        SautDemande::Exige,
     )
 }
 
@@ -2387,6 +2393,17 @@ pub fn decode_source_to_pcm_streaming(
     )
 }
 
+/// #8983 — ce que le décodeur fait quand le démultiplexeur refuse le saut.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SautDemande {
+    /// Comportement historique : le décodage continue d'où il en est (un
+    /// appelant qui sait écarter lui-même les trames en trop).
+    AuMieux,
+    /// Le flux doit commencer à `seek_s` : un refus du saut rend une erreur
+    /// AVANT l'en-tête WAV (`echec_avant_le_premier_octet`).
+    Exige,
+}
+
 // Cœur commun des variantes publiques ci-dessus, qui lui passent leurs
 // paramètres tels quels ; même choix que decode_ape_streaming.
 #[allow(clippy::too_many_arguments)]
@@ -2401,6 +2418,35 @@ fn decode_to_pcm_streaming_inner(
     levels_tx: Option<tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>>,
     seek_s: f64,
     source_override: Option<Box<dyn MediaSource>>,
+) -> Result<(u16, u32), String> {
+    decode_to_pcm_streaming_inner_avec(
+        file_path,
+        target_sample_rate,
+        target_channels,
+        target_bit_depth,
+        tx,
+        chunk_size,
+        data_ready,
+        levels_tx,
+        seek_s,
+        source_override,
+        SautDemande::AuMieux,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn decode_to_pcm_streaming_inner_avec(
+    file_path: &str,
+    target_sample_rate: Option<u32>,
+    target_channels: Option<u32>,
+    target_bit_depth: Option<u16>,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    data_ready: Option<std::sync::Arc<tokio::sync::Notify>>,
+    levels_tx: Option<tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>>,
+    seek_s: f64,
+    source_override: Option<Box<dyn MediaSource>>,
+    saut: SautDemande,
 ) -> Result<(u16, u32), String> {
     if target_sample_rate == Some(0) {
         return Err("stream target sample rate must be greater than zero".into());
@@ -2892,7 +2938,20 @@ fn decode_to_pcm_streaming_inner(
                 );
             }
             Err(e) => {
-                debug!(file = file_path, seek_s, error = %e, "streaming_decode_seek_failed");
+                // #8983 — journalisé en WARN : le flux ne commence alors pas
+                // à la position que la barre affiche.
+                tracing::warn!(
+                    file = file_path,
+                    seek_s,
+                    error = %e,
+                    saut = ?saut,
+                    "streaming_decode_seek_failed"
+                );
+                if saut == SautDemande::Exige {
+                    return Err(format!(
+                        "{PREFIXE_ECHEC_DE_SONDE}seek to {seek_s:.3}s refused: {e}"
+                    ));
+                }
             }
         }
     }
