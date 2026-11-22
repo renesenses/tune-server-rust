@@ -350,7 +350,48 @@ async fn graver_tags_refuse_le_fichier_en_lecture_seule_6635() {
     let flac = banc.dir.join("01.flac");
     std::fs::set_permissions(&flac, std::fs::Permissions::from_mode(0o444)).unwrap();
     let octets = std::fs::read(&flac).unwrap();
-    let statut = graver(&banc.state, false).await;
+    // S’abonner AVANT le lancement : la fin peut précéder le premier recv.
+    // Le retrait de la garde suit l’écriture réelle du statut final en base.
+    let mut evenements = banc.state.event_bus.subscribe();
+    let reponse = write_tags_to_files(
+        State(banc.state.clone()),
+        Json(WriteTagsRequest {
+            only_missing: false,
+            track_ids: None,
+            album_id: Some(1),
+        }),
+    )
+    .await;
+    assert_eq!(reponse.status(), StatusCode::ACCEPTED);
+    tokio::time::timeout(std::time::Duration::from_secs(120), async {
+        while banc
+            .state
+            .background_tasks
+            .snapshot()
+            .iter()
+            .any(|t| t.id == "write_tags")
+        {
+            evenements
+                .recv()
+                .await
+                .expect("signal de fin de la gravure");
+        }
+    })
+    .await
+    .expect("#6635 : la tâche de gravure ne libère pas sa garde de fin");
+    let reglages =
+        tune_core::db::settings_repo::SettingsRepo::with_backend(banc.state.backend.clone());
+    let statut: Value = serde_json::from_str(
+        &reglages
+            .get("write_tags_status")
+            .unwrap()
+            .expect("statut de gravure écrit"),
+    )
+    .unwrap();
+    assert_eq!(
+        statut["status"], "done",
+        "#6635 : fin de gravure effective — {statut}"
+    );
     std::fs::set_permissions(&flac, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(
         std::fs::read(&flac).unwrap(),
