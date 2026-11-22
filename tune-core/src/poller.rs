@@ -893,6 +893,15 @@ impl PositionPoller {
                 zone.as_ref().map(|z| z.name.as_str()).unwrap_or("?")
             )
         };
+        // Diagnostic rc14 (#8963) : à l'abandon, le téléphone parlait-il
+        // encore au serveur par le pont, et quel flux le pont a-t-il demandé
+        // en dernier ? Voir `cloud::activite_du_relais`.
+        let flux_en_cours = zone_state
+            .now_playing
+            .as_ref()
+            .and_then(|np| np.stream_id.as_deref())
+            .map(crate::cloud::activite_du_relais::identifiant_court);
+        let derniere_demande = crate::cloud::activite_du_relais::derniere_demande_de_flux_relayee();
         warn!(
             zone_id,
             navigateur,
@@ -901,6 +910,12 @@ impl PositionPoller {
                 .as_ref()
                 .map(|np| np.title.as_str())
                 .unwrap_or(""),
+            flux = ?flux_en_cours,
+            octets_servis = ?octets_servis,
+            depuis_requete_relayee_ms =
+                ?crate::cloud::activite_du_relais::depuis_la_derniere_requete_relayee_ms(),
+            depuis_demande_de_flux_relayee_ms = ?derniere_demande.as_ref().map(|(ms, _)| *ms),
+            dernier_flux_demande_par_le_pont = ?derniere_demande.map(|(_, id)| id),
             "lecture_sans_destination_abandonnee"
         );
         if let Some(ref bus) = self.event_bus {

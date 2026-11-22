@@ -26,11 +26,63 @@ fn erreur(e: String) -> axum::response::Response {
     (status, Json(json!({"error": e}))).into_response()
 }
 
+/// Diagnostic rc14 (#9273) : par le pont, `browser-next` répond 409 à chaque
+/// piste alors qu'en local il rend la suivante. Le motif seul ne dit pas
+/// laquelle des conditions de l'orchestrateur a refusé (état de la zone, flux
+/// en cours, ligne de file) : la ligne dit aussi ce que le serveur voyait.
+/// Identifiants de flux tronqués.
+async fn journaliser_le_refus(
+    state: &AppState,
+    zone_id: i64,
+    geste: &str,
+    courant: &str,
+    motif: &str,
+    relayee: bool,
+) {
+    let etat = state.playback.get_state(zone_id).await;
+    let np = etat.now_playing.as_ref();
+    let en_cours = np.and_then(|np| np.stream_id.as_deref());
+    let court = tune_core::cloud::activite_du_relais::identifiant_court;
+    // `browser_queue_changed` : la ligne de file sous le curseur n'est pas
+    // celle qui joue. Dire laquelle des deux conditions manque, et si la
+    // règle de version (#2264) a remplacé la piste lancée.
+    let ligne = PlayQueueRepo::with_backend(state.backend.clone())
+        .get_at(zone_id, etat.queue_position)
+        .ok()
+        .flatten();
+    let ligne_courante = ligne.as_ref().map(|l| l.is_current);
+    let meme_piste = ligne.as_ref().zip(np).map(|(l, np)| {
+        // Même règle que l'orchestrateur (`suivante_navigateur`).
+        l.track_id == np.track_id && (l.track_id.is_some() || l.source_id == np.source_id)
+    });
+    let version = np
+        .and_then(|np| np.version.as_ref())
+        .map(|v| format!("{}:{}", v.origin, v.rule));
+    info!(
+        zone_id,
+        geste,
+        motif,
+        relayee,
+        etat = ?etat.state,
+        flux_demande = %court(courant),
+        flux_en_cours = ?en_cours.map(court),
+        meme_flux = en_cours == Some(courant),
+        source = np.map(|np| np.source.as_str()).unwrap_or("-"),
+        position_file = etat.queue_position,
+        ligne_courante = ?ligne_courante,
+        meme_piste = ?meme_piste,
+        version = ?version,
+        "browser_next_refuse"
+    );
+}
+
 pub(super) async fn preparer(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<PreparationRequest>,
 ) -> axum::response::Response {
+    let relayee = crate::garde_du_relais::requete_relayee(&headers);
     match state
         .orchestrator
         .preparer_suivante_navigateur(zone_id, &body.current_stream_id)
@@ -43,15 +95,28 @@ pub(super) async fn preparer(
         }))
         .into_response(),
         Ok(None) => Json(json!({"next": null})).into_response(),
-        Err(e) => erreur(e),
+        Err(e) => {
+            journaliser_le_refus(
+                &state,
+                zone_id,
+                "preparer",
+                &body.current_stream_id,
+                &e,
+                relayee,
+            )
+            .await;
+            erreur(e)
+        }
     }
 }
 
 pub(super) async fn adopter(
     State(state): State<AppState>,
     Path(zone_id): Path<i64>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<AdoptionRequest>,
 ) -> axum::response::Response {
+    let relayee = crate::garde_du_relais::requete_relayee(&headers);
     let verrou = verrou_du_suivant(zone_id);
     let _decision = verrou.lock().await;
     match state
@@ -65,7 +130,18 @@ pub(super) async fn adopter(
         .await
     {
         Ok(()) => Json(json!({"status": "adopted"})).into_response(),
-        Err(e) => erreur(e),
+        Err(e) => {
+            journaliser_le_refus(
+                &state,
+                zone_id,
+                "adopter",
+                &body.current_stream_id,
+                &e,
+                relayee,
+            )
+            .await;
+            erreur(e)
+        }
     }
 }
 
@@ -152,6 +228,104 @@ mod tests {
         let status = resp.status();
         let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
         (status, serde_json::from_slice(&bytes).unwrap_or_default())
+    }
+
+    #[derive(Clone, Default)]
+    struct Journal(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Journal {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Journal {
+        type Writer = Journal;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+    impl Journal {
+        fn ligne(&self, motif: &str) -> String {
+            let texte = String::from_utf8_lossy(&self.0.lock().unwrap()).into_owned();
+            texte
+                .lines()
+                .find(|l| l.contains(motif))
+                .map(str::to_owned)
+                .unwrap_or_else(|| panic!("aucune ligne « {motif} » : {texte}"))
+        }
+    }
+
+    /// Diagnostic rc14 (#9273) : un refus de `browser-next` arrivé par le
+    /// pont dit son motif, qu'il est relayé, et ce que le serveur voyait (flux
+    /// en cours ou non). Une route refusée au relais dit son chemin (#8963).
+    #[tokio::test]
+    async fn refus_relaye_journalise_motif_et_etat_9273() {
+        tune_core::journal_de_test::fiabiliser_la_capture();
+        let journal = Journal::default();
+        let _garde = tracing::subscriber::set_default(
+            tracing_subscriber::fmt()
+                .with_writer(journal.clone())
+                .with_ansi(false)
+                .with_max_level(tracing::Level::INFO)
+                .finish(),
+        );
+        let (state, zone, _dir, sid) = banc().await;
+        let app = crate::routes::router(state.clone());
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/api/v1/zones/{zone}/browser-next"))
+                    .header("content-type", "application/json")
+                    .header(tune_core::cloud::ENTETE_RELAIS, "1")
+                    .body(Body::from(
+                        json!({"current_stream_id": "0123456789abcdef"}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let l = journal.ligne("browser_next_refuse");
+        for attendu in [
+            "motif=\"browser_current_changed\"",
+            "relayee=true",
+            "geste=\"preparer\"",
+            "meme_flux=false",
+            "ligne_courante=Some(true)",
+            "meme_piste=Some(true)",
+            "flux_demande=01234567",
+            &format!(
+                "flux_en_cours=Some(\"{}\")",
+                tune_core::cloud::activite_du_relais::identifiant_court(&sid)
+            ),
+        ] {
+            assert!(l.contains(attendu), "« {attendu} » absent : {l}");
+        }
+        assert!(
+            !l.contains("0123456789abcdef"),
+            "l'identifiant entier du flux est recopié : {l}"
+        );
+
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/api/v1/system/logs?token=secret")
+                    .header(tune_core::cloud::ENTETE_RELAIS, "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let l = journal.ligne("requete_relayee_refusee");
+        assert!(l.contains("chemin=/api/v1/system/logs"), "{l}");
+        assert!(!l.contains("secret"), "la requête est recopiée : {l}");
     }
 
     #[tokio::test]
