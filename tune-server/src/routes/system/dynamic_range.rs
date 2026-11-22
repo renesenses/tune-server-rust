@@ -344,6 +344,34 @@ mod tests_4185 {
     /// passage qui a bien retiré la piste des candidats.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn lance_puis_refuse_le_doublon_puis_finit() {
+        // Les pauses et les rangs de fond sont globaux au processus. Un autre
+        // module peut les modifier pendant que ce témoin attend la lecture.
+        const ENFANT: &str = "TUNE_TEST_DR_4185_ENFANT";
+        if std::env::var_os(ENFANT).is_none() {
+            let nom = concat!(module_path!(), "::lance_puis_refuse_le_doublon_puis_finit");
+            let (_, nom) = nom.split_once("::").expect("nom sans préfixe de caisse");
+            let sortie = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([nom, "--exact", "--nocapture", "--test-threads=1"])
+                .env(ENFANT, std::process::id().to_string())
+                .output()
+                .expect("lancer le témoin DR isolé");
+            let stdout = String::from_utf8_lossy(&sortie.stdout);
+            let stderr = String::from_utf8_lossy(&sortie.stderr);
+            assert!(
+                sortie.status.success(),
+                "#4185 : témoin isolé en échec\n{stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.contains("1 passed; 0 failed; 0 ignored"),
+                "#4185 : le processus enfant doit exécuter exactement le témoin\n{stdout}\n{stderr}"
+            );
+            return;
+        }
+        assert_ne!(
+            std::env::var(ENFANT).unwrap(),
+            std::process::id().to_string(),
+            "#4185 : les états globaux doivent appartenir à un autre processus"
+        );
         let state = etat_arme();
         piste_candidate(&state, 42, "/nulle/part.flac");
         piste_candidate(&state, 43, "/nulle/part/2.flac");
@@ -390,7 +418,10 @@ mod tests_4185 {
         }
         let Json(p) = dynamic_range_progress(State(state.clone())).await;
         assert_eq!(p["active"], true);
-        assert_eq!(p["waiting_reason"], "playback", "{p}");
+        assert_eq!(
+            p["waiting_reason"], "playback",
+            "#4185 : la jauge doit nommer la lecture, pas une pause étrangère : {p}"
+        );
         assert_eq!(
             p["candidates"],
             Value::Null,
