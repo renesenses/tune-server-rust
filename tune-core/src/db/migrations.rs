@@ -3004,7 +3004,39 @@ UPDATE radio_stations SET url = 'https://icecast.radiofrance.fr/fipreggae-hifi.a
 UPDATE radio_stations SET url = 'https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac?id=radiofrance' WHERE url = 'https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac';
 ",
     },
+    // #9362 (fil forum 3000, accord de Bertrand du 22/11, rc15) — la date
+    // d'ajout d'une ligne À SA PLAYLIST : `playlist_tracks.added_at`, en
+    // secondes depuis l'époque Unix (même unité que `missing_since`). Le
+    // client trie une playlist « par date d'ajout » sur elle.
+    //
+    // NULL pour l'existant : aucune base ne gardait cette date, et en
+    // inventer une (la date de la migration, l'ordre des `id`) ferait passer
+    // pour connue une date qui ne l'est pas. Pas de DEFAULT non plus :
+    // SQLite refuse un défaut non constant à un `ADD COLUMN`, et une réécriture
+    // de l'ordre (`PlaylistRepo::rewrite_entries`) doit pouvoir recopier un
+    // NULL tel quel. Chaque écriture de `PlaylistRepo` pose donc la date
+    // elle-même : l'heure de l'ajout pour une ligne neuve, la date d'avant
+    // pour une ligne recopiée.
+    //
+    // Colonne posée dans le bloc de version et dans la passe finale, PAS dans
+    // `up` : même règle qu'à la 126. Jumelle PG : 124. Numérotée 158 / PG 124
+    // le 22/11 sur `batch/tri-playlist-rc15-20261122` (base : main après la
+    // promotion rc13). #8912 (158 / PG 124) et #9065 (158 / PG 125), en PR,
+    // réclament les mêmes numéros : celle qui fusionne après l'autre se
+    // renumérote (gardes `migration_count_matches` et
+    // `pg_migrations_are_contiguous_and_include_numeric_heals`).
+    Migration {
+        version: 158,
+        name: "playlist_tracks_date_d_ajout",
+        up: "",
+    },
 ];
+
+/// Pose `playlist_tracks.added_at` (#9362) — bloc de version de la 158 et
+/// passe finale. Sans défaut : NULL = date d'ajout inconnue.
+pub(crate) fn date_d_ajout_des_lignes_de_playlist(db: &SqliteDb) {
+    add_column_if_missing(db, "playlist_tracks", "added_at", "INTEGER");
+}
 
 /// #8788 — le format des pistes UPnP, migration 156 et réparation idempotente.
 fn format_des_elements_de_file(db: &SqliteDb) {
@@ -4596,6 +4628,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
             // la passe de fond le lit.
             pays_des_editions(db);
         }
+        if migration.version == 158 {
+            // #9362 — la date d'ajout d'une ligne à sa playlist. NULL pour
+            // l'existant : elle n'était gardée nulle part.
+            date_d_ajout_des_lignes_de_playlist(db);
+        }
         if migration.version == 137 {
             // #7765 — la source des crédits, puis l'attribution UNE fois des
             // lignes existantes. L'index vient APRES la colonne qu'il nomme.
@@ -5439,6 +5476,11 @@ pub fn run_migrations(db: &SqliteDb) -> Result<(), String> {
     // retire le temps de recreer la table. Erreur RENDUE : sans lui, une
     // suppression de piste laisserait des lignes introuvables SANS identite.
     db.execute_batch(SQL_DECLENCHEUR_PLAYLISTS_ORPHELINES)?;
+    // La date d'ajout d'une ligne à sa playlist (migration 158, #9362) — posée
+    // ICI aussi : toute insertion de `PlaylistRepo` et `get_entries` la
+    // NOMMENT, et une base arrivée sans elle ne pourrait plus rien ajouter à
+    // une playlist. APRÈS la 125, qui recrée la table sans elle. PG : 124.
+    date_d_ajout_des_lignes_de_playlist(db);
 
     // v0.9 — unify play_queue + streaming_queue into queue_items. Idempotent and
     // reads streaming_queue (just ensured above), so it is safe on fresh DBs and
@@ -6437,6 +6479,13 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         123,
         "queue_items_format_streaming",
         include_str!("../../migrations/postgres/123_queue_items_format_streaming.sql"),
+    ), // Jumelle de la SQLite 158 (#9362) : la date d'ajout d'une ligne à sa
+    // playlist, BIGINT, NULL pour l'existant ; convertie depuis le TEXT d'une
+    // base de bascule.
+    (
+        124,
+        "playlist_tracks_date_d_ajout",
+        include_str!("../../migrations/postgres/124_playlist_tracks_date_d_ajout.sql"),
     ),
 ];
 
@@ -10474,7 +10523,9 @@ mod tests {
         // SQLite 155. Migration de DONNÉES : annule la bascule de la 118
         // (neutralisée) là où elle a eu lieu, DEFAULT '0'.
         // 123 : format des pistes UPnP en file (#8788), SQLite 156.
-        assert_eq!(pg_latest_version(), 123, "latest PG migration must be 123");
+        // 124 : `playlist_tracks_date_d_ajout` (#9362), jumelle de la SQLite
+        // 158 : la date d'ajout d'une ligne à sa playlist, BIGINT.
+        assert_eq!(pg_latest_version(), 124, "latest PG migration must be 124");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

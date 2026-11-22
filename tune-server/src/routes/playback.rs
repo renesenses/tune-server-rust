@@ -12034,6 +12034,7 @@ mod lecture_d_une_playlist_a_lignes_introuvables_6179 {
             id,
             position: id,
             content,
+            added_at: None,
         }
     }
 

@@ -868,6 +868,10 @@ CREATE TABLE IF NOT EXISTS playlist_tracks (
     audio_fingerprint TEXT,
     mbid TEXT,
     missing_since INTEGER,
+    -- #9362 : date d'ajout de la ligne a sa playlist (secondes Unix), NULL
+    -- quand elle est inconnue. Migration SQLite 158, PG 124. DERNIERE colonne :
+    -- une base migree l'ajoute en fin de table (`ADD COLUMN`).
+    added_at INTEGER,
     CHECK ((track_id IS NOT NULL AND source IS NULL AND source_id IS NULL)
         OR (track_id IS NULL AND source IS NOT NULL AND source_id IS NOT NULL)
         OR (track_id IS NULL AND source IS NULL AND source_id IS NULL))

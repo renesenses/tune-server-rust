@@ -3047,6 +3047,7 @@
         "year",
         "label",
         "composer",
+        "playlist_added_at",
         "isrc",
         "bpm",
         "rating",
