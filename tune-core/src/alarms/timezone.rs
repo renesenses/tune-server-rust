@@ -26,7 +26,17 @@ pub fn read_alarm_timezone(db: &dyn DbBackend) -> Result<String, String> {
         .and_then(|v| v.as_string())
         .unwrap_or_default();
     if let Err(error) = validate_alarm_timezone(&zone) {
-        tracing::warn!(timezone = %zone, error = %error, "alarm_timezone_invalid_fallback_system");
+        // Le planificateur relit ce réglage toutes les trente secondes.
+        // Une valeur restaurée invalide ne doit pas remplir le journal.
+        static SIGNALEES: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        let premiere = SIGNALEES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(zone.clone());
+        if premiere {
+            tracing::warn!(timezone = %zone, error = %error, "alarm_timezone_invalid_fallback_system");
+        }
         return Ok(String::new());
     }
     Ok(zone)
@@ -99,7 +109,7 @@ fn occurrence(
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum Decision {
+pub(crate) enum Decision {
     Wait,
     Ring,
     Skip(&'static str),
@@ -123,7 +133,7 @@ fn alarm_time(alarm: &serde_json::Value) -> Option<NaiveTime> {
 
 /// Une décision pour l’occurrence du jour ; le planificateur garde les ids
 /// consommés jusqu’au changement de date locale (y compris l’heure répétée).
-pub(super) fn decision(
+pub(crate) fn decision(
     alarm: &serde_json::Value,
     zone: &str,
     instant: DateTime<Utc>,
@@ -188,7 +198,7 @@ pub fn next_alarm_at(
     Ok(None)
 }
 
-pub(super) fn local_time(
+pub(crate) fn local_time(
     zone: &str,
     instant: DateTime<Utc>,
 ) -> Result<DateTime<FixedOffset>, String> {
@@ -376,6 +386,53 @@ mod database_tests {
             "une erreur SQL ne doit pas devenir un repli de fuseau"
         );
     }
+    #[test]
+    fn relecture_8912_fuseau_invalide_un_avertissement_par_valeur() {
+        #[derive(Clone)]
+        struct Journal(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Journal {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        let repo = SettingsRepo::new(db.clone());
+        let octets = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let journal = octets.clone();
+        let abonne = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || Journal(journal.clone()))
+            .finish();
+        tracing::subscriber::with_default(abonne, || {
+            for (index, zone) in ["Invalide/Relecture8912_A", "Invalide/Relecture8912_B"]
+                .into_iter()
+                .enumerate()
+            {
+                repo.set(ALARM_TIMEZONE_KEY, zone).unwrap();
+                for _ in 0..2 {
+                    assert_eq!(read_alarm_timezone(&db).unwrap(), "");
+                }
+                let texte = String::from_utf8(octets.lock().unwrap().clone()).unwrap();
+                assert_eq!(
+                    texte
+                        .matches("alarm_timezone_invalid_fallback_system")
+                        .count(),
+                    index + 1,
+                    "#8912 : deux lectures ne doivent produire qu’un avertissement par valeur — {texte}"
+                );
+                assert_eq!(repo.get(ALARM_TIMEZONE_KEY).unwrap().as_deref(), Some(zone));
+            }
+        });
+    }
+
     #[test]
     fn reveil_8838_reglage_persistant_et_migration_sans_decalage() {
         let db = SqliteDb::open_in_memory().unwrap();

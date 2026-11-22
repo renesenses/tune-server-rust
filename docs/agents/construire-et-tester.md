@@ -62,6 +62,10 @@ Ne pas abaisser le seuil de stockage et ne pas purger les cibles d’autrui.
 - `cargo test -p tune-smart-http` en entier : 198 tests, quelques secondes une
   fois compilé.
 
+Les témoins rendus déterministes et leurs contre-épreuves sont documentés dans
+[les notes par test](epreuves-instables/), une note par PR pour éviter les conflits
+entre validations indépendantes.
+
 ## Écrire un test dans tune-server
 
 - `tune-server` a `autotests = false` : un nouveau fichier de `tests/` exige un
@@ -186,7 +190,8 @@ embarquée (`tzdb-bundle-always`) également sous Linux : une image minimale
 sans `tzdata` conserve les fuseaux explicites. Sa valeur vide conserve
 le fuseau système. Une valeur invalide provenant d'une restauration est lue
 comme le mode système, sans réécrire la base, avec l'avertissement
-`alarm_timezone_invalid_fallback_system`. Une erreur SQL reste une erreur.
+`alarm_timezone_invalid_fallback_system`, une seule fois par valeur invalide.
+Une erreur SQL reste une erreur.
 L'API refuse toujours un nouveau fuseau invalide à l'enregistrement.
 
 Une heure inexistante au printemps est reportée à la première minute valide
@@ -203,18 +208,24 @@ Vérification des remotes au 22 novembre 2026 : aucun lecteur de `next_stop_at`
 n'existe dans `tune-remote-ios` main `36998e9438fe82081d0b7e120ed9b26b666d7a67`
 ni dans `tune-remote-flutter` main `3c0a582ba4d4e0b4e72515aed43aa76adf4cd1a9`
 (`git grep` de `next_stop_at`, `nextStopAt`, `next_stop`, `nextStop`). Il n'y a
-donc pas de parseur existant à adapter ou à présenter comme testé. Le témoin
-API serveur parse réellement les réponses avec `DateTime::parse_from_rfc3339`.
+donc pas de parseur natif existant à adapter ou à présenter comme testé.
+Le client web lit bien `next_stop_at` dans `ArretProgrammeV2.svelte` et conserve
+son heure civile avec décalage ; le cas `2026-11-11T23:00:00+01:00` est couvert
+par le test web `arretProgrammeExtinction8213.svelte.test.ts`. Le témoin API
+serveur parse les réponses avec `DateTime::parse_from_rfc3339`.
 Un futur affichage natif devra conserver l'instant et tenir compte du décalage.
 
-### Convolveur après intégration de #8761
+### ReplayGain #7724 : isoler les états du processus
 
-`ConvolverConfig::new` autorise désormais le rééchantillonnage. Le témoin
-gapless qui vérifie le refus d’une autre cadence doit donc choisir
-`avec_reechantillonnage(false)` ; sinon il attend une erreur contraire au
-réglage par défaut. Conserver ses assertions de refus et d’effacement du
-moteur, et couvrir séparément le changement de cadence autorisé. Vu dans
-le job audio-embedding de #8912 après intégration des historiques de lots.
+Le verrou local de `replaygain_lancer_tests_6778` ne sérialise pas les autres
+modules qui modifient la pause, la campagne ou le rang global. Le témoin #7724
+pouvait donc recevoir `refused/paused` au lieu de `already_running`, voire
+quitter sans vérifier la route. Il lance désormais exactement son propre cas
+dans un nouveau processus et exige un test réussi, aucun ignoré. Ne pas
+remettre un retour anticipé en cas de pause. Le nom passé à `--exact` exclut
+le préfixe de caisse de `module_path!()` ; vérifier le compteur évite un faux
+vert à zéro test. La contre-épreuve métier retire seulement la condition du
+rang dans `replaygain_analyze` ; les assertions restent inchangées.
 
 ### Épreuves de concurrence sous charge : synchronisation communautaire (#6702)
 

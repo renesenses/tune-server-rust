@@ -297,15 +297,42 @@ impl PlanificateurArretProgramme {
         instant: chrono::DateTime<chrono::Utc>,
         derniere: &mut Option<String>,
     ) -> Vec<i64> {
-        let maintenant = match crate::alarms::alarm_local_time(self.db.as_ref(), instant) {
+        let zone = match crate::alarms::read_alarm_timezone(self.db.as_ref()) {
+            Ok(zone) => zone,
+            Err(error) => {
+                warn!(error, "scheduled_stop_timezone_unreadable");
+                return Vec::new();
+            }
+        };
+        let maintenant = match crate::alarms::alarm_time_in_zone(&zone, instant) {
             Ok(local) => local,
             Err(error) => {
                 warn!(error, "scheduled_stop_timezone_unreadable");
                 return Vec::new();
             }
         };
+        let Some(reglage) = lire(&self.db) else {
+            return Vec::new();
+        };
+        // Même occurrence réelle que le réveil et que next_stop_at : une
+        // heure effacée au printemps est reportée à la première minute valide.
+        let horaire = serde_json::json!({
+            "enabled": reglage.enabled,
+            "time": reglage.time,
+            "days_of_week": reglage.days_of_week,
+        });
+        match crate::alarms::alarm_decision(&horaire, &zone, instant) {
+            Ok(crate::alarms::AlarmDecision::Ring) => {}
+            Ok(_) => return Vec::new(),
+            Err(error) => {
+                warn!(error, "scheduled_stop_timezone_unreadable");
+                return Vec::new();
+            }
+        }
         let avant = derniere.clone();
-        let arretees = self.passage(maintenant.naive_local(), derniere).await;
+        let arretees = self
+            .appliquer_echeance(maintenant.naive_local(), derniere, &reglage)
+            .await;
         if *derniere != avant {
             info!(utc = %instant, local_time = %maintenant, "scheduled_stop_due");
         }
@@ -325,12 +352,22 @@ impl PlanificateurArretProgramme {
         if !reglage.echeance(maintenant) {
             return Vec::new();
         }
+        self.appliquer_echeance(maintenant, derniere, &reglage)
+            .await
+    }
+
+    async fn appliquer_echeance(
+        &self,
+        maintenant: NaiveDateTime,
+        derniere: &mut Option<String>,
+        reglage: &ArretProgramme,
+    ) -> Vec<i64> {
         let minute = maintenant.format("%Y-%m-%d %H:%M").to_string();
         if derniere.as_deref() == Some(minute.as_str()) {
             return Vec::new();
         }
         *derniere = Some(minute);
-        let arretees = self.arreter(&reglage).await;
+        let arretees = self.arreter(reglage).await;
         if reglage.action == ActionArret::Poweroff {
             self.eteindre(maintenant, reglage.poweroff_mode.clone())
                 .await;

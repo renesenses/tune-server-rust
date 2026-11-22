@@ -13,6 +13,9 @@ pub use timezone::{
     ALARM_TIMEZONE_KEY, alarm_local_time, next_alarm_at, read_alarm_timezone,
     validate_alarm_timezone,
 };
+pub(crate) use timezone::{
+    Decision as AlarmDecision, decision as alarm_decision, local_time as alarm_time_in_zone,
+};
 
 const POLL_INTERVAL_SECS: u64 = 30;
 const SNOOZE_DEFAULT_MIN: i64 = 5;

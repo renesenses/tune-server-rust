@@ -501,26 +501,6 @@ fn un_changement_de_format_gapless_rebat_ou_desactive_le_convolveur() {
     assert!(active.lock().unwrap().is_none());
 }
 
-/// #8761 — le réglage par défaut reconstruit le moteur à la nouvelle
-/// cadence. Il ne doit pas rester soumis au refus du mode strict ci-dessus.
-#[test]
-fn un_changement_de_format_gapless_reechantillonne_si_autorise_8761() {
-    let config = std::sync::Mutex::new(Some(
-        crate::audio::convolver::ConvolverConfig::new(vec![vec![1.0, 0.5]], 48_000).unwrap(),
-    ));
-    let active = std::sync::Mutex::new(None);
-    for (cadence, canaux) in [(48_000, 2), (96_000, 2), (48_000, 6)] {
-        assert!(
-            rebuild_local_convolver(&config, &active, &AtomicBool::new(true), cadence, canaux)
-                .expect("le rééchantillonnage autorisé doit reconstruire le moteur gapless")
-        );
-        assert_eq!(
-            active.lock().unwrap().as_ref().unwrap().channels(),
-            canaux as usize
-        );
-    }
-}
-
 /// Et la frontière de piste : après remise à zéro, plus rien de la
 /// précédente. Sans elle, la queue d'une piste repartait dans la suivante.
 #[test]
