@@ -3655,7 +3655,14 @@ fn decider_les_forcages(
     // SOAP) dit le contraire et l'emporte.
     let alac_natif_servi =
         alac_passthrough && !output_container.is_some_and(|c| c.eq_ignore_ascii_case("wav"));
-    let flux_servi_tel_quel = dsd_brut_hors_sortie_locale || alac_natif_servi;
+    // #9331 — la voie mandataire (`relayer_un_flux_distant`) : un épisode de
+    // podcast relayé tel quel vers un renderer DLNA affichait « EQ actif »
+    // sur la foi du réglage de la zone, alors qu'aucun étage ne décode ces
+    // octets. Constaté sur la session (`StreamInfo::relaye_tel_quel`), pas
+    // déduit.
+    let relaye_par_le_mandataire = wire.is_some_and(|w| w.relaye_tel_quel);
+    let flux_servi_tel_quel =
+        dsd_brut_hors_sortie_locale || alac_natif_servi || relaye_par_le_mandataire;
     let dsp_applique = dsp_enabled && !flux_servi_tel_quel;
     let dsp_contourne_par_le_dsd = dsp_enabled && dsd_brut_hors_sortie_locale;
     let dsp_contourne_par_l_alac = dsp_enabled && alac_natif_servi && !dsd_brut_hors_sortie_locale;

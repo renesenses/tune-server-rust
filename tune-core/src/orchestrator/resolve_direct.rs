@@ -2120,6 +2120,9 @@ impl PlaybackOrchestrator {
             channels: 2,
             file_size: None,
             duration_ms: duration_ms.map(|d| d as u64),
+            // #9331 — relayé verbatim : le chemin du signal n'y affiche aucun
+            // traitement.
+            relaye_tel_quel: true,
             ..Default::default()
         };
         let session_id = self
