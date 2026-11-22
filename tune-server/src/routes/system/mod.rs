@@ -20,6 +20,8 @@ pub(crate) use config::refus_de_racine_de_musique;
 mod config_backup;
 mod convert;
 mod database;
+/// #8054 — « Démarrer Tune avec Windows » (clé Run de l’utilisateur).
+pub(crate) mod demarrage_avec_windows;
 /// #8676 — « Remplacer le chemin » : déplacer la racine de la bibliothèque.
 mod deplacer_racine;
 #[cfg(test)]
@@ -241,6 +243,11 @@ pub fn router() -> Router<AppState> {
         // Le PASSE des passes automatiques, la ou `/background-tasks` ne dit
         // que leur present (#2080). Survit au redemarrage, borne en taille.
         .route("/task-runs", get(diagnostics::task_runs))
+        // #8054 — démarrage automatique à l’ouverture de session Windows.
+        .route(
+            "/autostart",
+            get(demarrage_avec_windows::get_autostart).put(demarrage_avec_windows::set_autostart),
+        )
         .route("/restart", post(config::restart))
         .route("/stop", post(config::stop))
         .route("/database/status", get(database::database_status))

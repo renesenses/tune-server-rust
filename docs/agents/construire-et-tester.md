@@ -38,6 +38,23 @@ nohup cargo test -p tune-server --lib <filtre> > target/x.log 2>&1 &
 
 ## Lancer peu de tests
 
+### Installeur Windows
+
+`cargo check` pour Windows ne compile pas le script NSIS de livraison.
+`python3 scripts/verifier-installeur-windows.py --makensis /chemin/vers/makensis`
+extrait ce script de `release.yml` et compile ses variantes avec et sans les
+outils facultatifs. Le job `windows-pr` exécute aussi ce banc sur Windows.
+Les fichiers embarqués sont factices ; aucun installeur ni serveur n'est
+exécuté. Le démarrage à l'ouverture de session et les choix de l'utilisateur
+restent à vérifier sur un vrai Windows.
+
+### Filtres et répétitions
+
+- Les fonctionnalités `journal-de-test`, `isolement-disque-de-test` et
+  `services-factices` appartiennent à `tune-core`. Pour reprendre le profil
+  Clippy de la CI avec ces fonctionnalités, sélectionner **les deux** paquets
+  (`-p tune-core -p tune-server`) ; `-p tune-server` seul est refusé par Cargo.
+
 - Filtrer par nom : `cargo test -p tune-core --lib -- <filtre1> <filtre2>`.
 - Répéter un test N fois sans recompiler : `cargo test -p tune-core --lib --no-run`,
   copier l'exécutable annoncé (`target/debug/deps/tune_core-<hash>`), puis le

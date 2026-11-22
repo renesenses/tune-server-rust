@@ -577,6 +577,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Compiler l'installeur NSIS de livraison (#8861)
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "Installation de NSIS en échec" }
+          python scripts/verifier-installeur-windows.py --makensis "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          if ($LASTEXITCODE -ne 0) { throw "Compilation de l'installeur NSIS en échec" }
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: x86_64-pc-windows-msvc
