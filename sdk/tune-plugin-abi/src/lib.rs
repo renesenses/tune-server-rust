@@ -10,6 +10,7 @@ use std::{
 };
 use tune_plugin_sdk::{Error, Settings, audio::*};
 pub mod batch;
+pub mod rate;
 pub const ABI_VERSION: u32 = 1;
 pub const DSP: u32 = 1;
 pub const BATCH: u32 = 2;

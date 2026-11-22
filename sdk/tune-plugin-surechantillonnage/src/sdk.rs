@@ -267,6 +267,28 @@ impl Instance {
         if !OFFERED_FILTERS.contains(&filter) {
             return Err(Error::InvalidSettings);
         }
+        let conception = conception::par_id(filter).ok_or(Error::InvalidSettings)?;
+        Self::avec_conception(request, conception)
+    }
+
+    /// Prépare une conception résolue par l'hôte, hors du rappel audio.
+    /// La limite de portée borne les allocations des catalogues externes.
+    pub fn avec_conception(request: RateRequest, conception: Conception) -> Result<Self, Error> {
+        use crate::conception::Fenetre;
+        let fenetre_valide = match conception.fenetre {
+            Fenetre::Kaiser { beta } => beta.is_finite() && (0.0..=100.0).contains(&beta),
+            Fenetre::Gaussienne { alpha } => alpha.is_finite() && alpha > 0.0 && alpha <= 100.0,
+            Fenetre::BlackmanHarris => true,
+        };
+        if !(2..=65_536).contains(&conception.portee)
+            || !conception.coupure.is_finite()
+            || conception.coupure <= 0.0
+            || conception.coupure > 0.5
+            || !fenetre_valide
+        {
+            return Err(Error::InvalidSettings);
+        }
+        RateRequest::new(request.input, request.output_rate, request.max_input_frames)?;
         let encoding = request.input.encoding();
         if !matches!(encoding, SampleEncoding::F32 | SampleEncoding::F64) {
             return Err(Error::UnsupportedFormat);
@@ -275,7 +297,6 @@ impl Instance {
         if choose_rate(de, &[vers], None) != Some(vers) {
             return Err(Error::UnsupportedFormat);
         }
-        let conception = conception::par_id(filter).ok_or(Error::InvalidSettings)?;
         let channels = usize::from(request.input.channels());
         let engine = Surechantillonneur::nouveau(&conception, de, vers, channels)
             .map_err(|_| Error::UnsupportedFormat)?;
