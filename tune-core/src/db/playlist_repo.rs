@@ -475,7 +475,7 @@ impl EntryContent {
     /// La clef de dédoublonnage : un `tracks.id`, ou la paire du service. Une
     /// ligne introuvable n'est le doublon d'aucune autre : sa clef porte son
     /// chemin et son titre, sous une source qu'aucun service ne prend.
-    fn cle(&self) -> (Option<i64>, Option<(String, String)>) {
+    fn cle(&self) -> CleDeLigne {
         match self {
             Self::Local(id) => (Some(*id), None),
             Self::Service(s) => (None, Some((s.source.clone(), s.source_id.clone()))),
@@ -1410,12 +1410,12 @@ fn maintenant_unix() -> i64 {
 /// toujours pu porter deux fois la même piste) rendent leurs dates dans
 /// l'ordre. Un contenu inconnu d'avant est un AJOUT : l'heure.
 struct DatesDAjout {
-    par_contenu: std::collections::HashMap<
-        (Option<i64>, Option<(String, String)>),
-        std::collections::VecDeque<Option<i64>>,
-    >,
+    par_contenu: std::collections::HashMap<CleDeLigne, std::collections::VecDeque<Option<i64>>>,
     maintenant: i64,
 }
+
+/// La clef de dédoublonnage d'une ligne ([`EntryContent::cle`]).
+type CleDeLigne = (Option<i64>, Option<(String, String)>);
 
 impl DatesDAjout {
     fn de(lignes: impl IntoIterator<Item = PlaylistEntry>) -> Self {
