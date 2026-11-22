@@ -179,3 +179,15 @@ Pour la contre-épreuve, exécuter `appliquer_un_lot` directement à la place du
 `spawn_blocking` dans `appliquer_les_enrichissements` : le témoin doit nommer
 l'écriture sur le fil du sondeur. Restaurer la production par copie, puis
 rejouer vingt fois le témoin sous charge ; ne pas modifier ses assertions.
+
+### Inventaire DR POST #8872 : observer le fil SQLite
+
+Le métronome sous lecteurs occupés pouvait dépasser 600 ms à cause de la
+charge du runner. Le témoin POST observe désormais la vraie requête
+`sql_candidates` sur SQLite : elle doit être appelée une fois, hors du fil
+unique de l’exécuteur, et la route doit toujours répondre 202. Les lectures
+de réglages ne sont pas assimilées à cet inventaire coûteux. Aucun délai
+mural n’entre dans le verdict. Le témoin GET reste distinct.
+Pour la contre-épreuve, remplacer seulement le `spawn_blocking` de `lancer`
+par l’appel direct d’`inventaire` : le témoin doit nommer le fil de l’exécuteur.
+Restaurer la production par copie, puis vingt passages sous charge.

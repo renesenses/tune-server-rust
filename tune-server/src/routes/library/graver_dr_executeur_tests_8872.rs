@@ -3,7 +3,7 @@
 //! compte des DR déjà gravés étaient lus en synchrone dans le gestionnaire
 //! async. `POST` (lancer) lisait le même inventaire de la même façon.
 //!
-//! L'épreuve est celle de #8805 : sur une vraie base de fichier, un fil à part
+//! L'épreuve GET est celle de #8805 : sur une vraie base de fichier, un fil à part
 //! tient TOUTES les connexions de lecture pendant [`DETENTION`], et les routes
 //! sont appelées pendant ce temps sur un exécuteur `current_thread`. Une route
 //! qui attendrait sa connexion SUR ce fil arrêterait aussi le métronome qui
@@ -108,22 +108,75 @@ async fn le_statut_de_la_gravure_ne_fige_pas_l_executeur_8872() {
     assert_eq!(v["dans_les_fichiers"], 0, "{v}");
 }
 
-/// TÉMOIN #8872 — lancer la gravure lit le même inventaire, hors de
-/// l'exécuteur lui aussi, et la passe démarre toujours.
+/// Observe le vrai accès SQLite sans confondre charge du runner et blocage.
+struct InventaireHorsExecuteur {
+    reel: Arc<dyn tune_core::db::backend::DbBackend>,
+    executeur: std::thread::ThreadId,
+    lectures: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl tune_core::db::backend::DbBackend for InventaireHorsExecuteur {
+    fn engine(&self) -> tune_core::db::engine::Engine {
+        self.reel.engine()
+    }
+    fn execute(
+        &self,
+        sql: &str,
+        params: &[&dyn tune_core::db::backend::ToSqlValue],
+    ) -> Result<usize, String> {
+        self.reel.execute(sql, params)
+    }
+    fn last_insert_rowid(&self) -> i64 {
+        self.reel.last_insert_rowid()
+    }
+    fn query_one(
+        &self,
+        sql: &str,
+        params: &[&dyn tune_core::db::backend::ToSqlValue],
+    ) -> Result<Option<Vec<tune_core::db::backend::SqlValue>>, String> {
+        self.reel.query_one(sql, params)
+    }
+    fn query_many(
+        &self,
+        sql: &str,
+        params: &[&dyn tune_core::db::backend::ToSqlValue],
+    ) -> Result<Vec<Vec<tune_core::db::backend::SqlValue>>, String> {
+        if sql == super::sql_candidates() {
+            self.lectures.fetch_add(1, Ordering::SeqCst);
+            assert_ne!(
+                std::thread::current().id(),
+                self.executeur,
+                "#8872 : l'inventaire POST occupe le fil de l'exécuteur"
+            );
+        }
+        self.reel.query_many(sql, params)
+    }
+    fn write_tx(
+        &self,
+        f: &mut dyn FnMut(&dyn tune_core::db::backend::DbTxHandle) -> Result<(), String>,
+    ) -> Result<(), String> {
+        self.reel.write_tx(f)
+    }
+    fn execute_batch(&self, sql: &str) -> Result<(), String> {
+        self.reel.execute_batch(sql)
+    }
+}
+
+/// TÉMOIN #8872 — l'inventaire réel doit quitter le worker async unique.
 #[tokio::test(flavor = "current_thread")]
 async fn lancer_la_gravure_ne_fige_pas_l_executeur_8872() {
-    let (_dir, state) = base();
-    let (trou, duree, statut) = sous_lecteurs_tenus(&state, |s| async move {
-        super::lancer(State(s)).await.into_response().status()
-    })
-    .await;
-    assert!(
-        duree >= DETENTION - Duration::from_millis(500),
-        "la route n'a pas attendu les lecteurs ({duree:?}) : l'épreuve ne prouve rien"
-    );
-    assert!(
-        trou < TROU_MAX,
-        "#8872 : POST /library/dr/gravure a figé l'exécuteur {trou:?}"
-    );
+    let (_dir, mut state) = base();
+    let lectures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    state.backend = Arc::new(InventaireHorsExecuteur {
+        reel: state.backend.clone(),
+        executeur: std::thread::current().id(),
+        lectures: lectures.clone(),
+    });
+    let statut = super::lancer(State(state)).await.into_response().status();
     assert_eq!(statut, axum::http::StatusCode::ACCEPTED);
+    assert_eq!(
+        lectures.load(Ordering::SeqCst),
+        1,
+        "l'inventaire réel doit être observé"
+    );
 }
