@@ -312,3 +312,27 @@ fn play_url_prend_le_silence_d_une_ouverture() {
         "play_url doit lire le silence d'une OUVERTURE"
     );
 }
+
+#[test]
+fn bascule_dop_vers_pcm_precedee_de_silence_8842() {
+    let memoire = MemoireDuFormat::default();
+    let dop = pcm_bytes_to_f32(&dop_octets(400), 24);
+    jouer_flottant(&memoire, 100, 176_400, &dop);
+    // Même cadence : c'est bien le passage DoP -> PCM qui impose le silence.
+    let pcm = musique(400);
+    let recu = jouer_flottant(&memoire, 100, 176_400, &pcm);
+    let silence = 17_640 * 2;
+    assert_eq!(
+        recu.len(),
+        silence + pcm.len(),
+        "#8842 : silence absent après DoP"
+    );
+    assert!(recu[..silence].iter().all(|&s| s == 0.0));
+    assert_eq!(&recu[silence..], &pcm);
+    // Le rendu retrouve le gain nul de la sourdine dès que le flux est PCM.
+    assert_eq!(effective_volume_units(0, 1000, false), 0);
+    assert_eq!(
+        effective_volume_units(0, 1000, true),
+        UNITE_DU_GAIN_DE_RENDU
+    );
+}

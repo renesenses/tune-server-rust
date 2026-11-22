@@ -950,14 +950,17 @@ impl PlaybackOrchestrator {
                 remis_a_plat,
                 "zone_eq_refreshed_live"
             );
-            RapportEqAChaud {
+            let rapport = RapportEqAChaud {
                 device_id,
                 echec: None,
                 format: Some((taux, canaux)),
                 eq_actif: actif,
                 preamp_db,
                 preamp_db_droite,
-            }
+            };
+            drop(output);
+            let _ = self.proteger_le_dop_en_lecture(zone_id).await;
+            rapport
         }
     }
 
@@ -3058,6 +3061,8 @@ impl PlaybackOrchestrator {
             self.playback
                 .brancher_le_gain_de_sortie(zone_id, local_output.gain_de_rendu());
             info!(zone_id, device_id = %device_id, rg, "zone_replaygain_refreshed_live");
+            drop(output);
+            let _ = self.proteger_le_dop_en_lecture(zone_id).await;
             true
         }
     }
@@ -3979,6 +3984,11 @@ impl PlaybackOrchestrator {
         };
         // La sortie est libre : la demande la plus récente peut partir.
         file.reveil.notify_waiters();
+        if issue.is_ok() {
+            self.proteger_le_dop_en_lecture(zone_id)
+                .await
+                .map_err(|message| OutputCommandError::failed(OutputCommand::SetVolume, message))?;
+        }
         issue
     }
     /// Arme le volume fixe : commande le plein volume au périphérique, **une

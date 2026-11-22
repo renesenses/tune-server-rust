@@ -3857,7 +3857,11 @@ impl PlaybackOrchestrator {
                     "reprise_par_nouveau_flux_apres_longue_pause"
                 );
             }
-            let peripherique_rendu = peripherique_rendu || memoire_du_lecteur_douteuse;
+            // #8813 — une baisse pendant la pause doit recréer le flux en
+            // PCM, sans avoir relancé la lecture au moment du réglage.
+            let peripherique_rendu = peripherique_rendu
+                || memoire_du_lecteur_douteuse
+                || self.dop_actif_a_proteger(zone_id).await;
             let decision = reprise_de_session(
                 est_radio,
                 rejouable,

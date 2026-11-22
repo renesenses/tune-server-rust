@@ -267,6 +267,10 @@ struct PatchZone {
     /// signal. Pris en compte à la lecture suivante.
     strict_bitperfect: Option<bool>,
 
+    /// #8813 — convertir le DoP local en PCM si le niveau logiciel doit
+    /// être atténué. Activé par défaut, sans effet sous PURE ou strict.
+    dsd_volume_protection: Option<bool>,
+
     /// #8869 — silence de verrouillage (ms, 0 à 2000) inséré devant le flux
     /// d'une sortie LOCALE quand son format change (cadence, canaux, PCM /
     /// DoP / DSD natif). Persisté en setting
@@ -460,6 +464,11 @@ fn inject_device_identity(
             backend, zone_id
         )),
     );
+    obj.insert(
+        "dsd_volume_protection".into(),
+        json!(tune_core::audio::dop_ecarte_7265::protection_du_niveau_active(backend, zone_id)),
+    );
+
     // #8869 — TOUJOURS publié : sa présence dit au client que ce serveur
     // connaît le réglage.
     obj.insert(

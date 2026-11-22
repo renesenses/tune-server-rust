@@ -1011,6 +1011,25 @@ async fn persister_le_son(
         };
         ecrire!("strict_bitperfect", enabled, r);
     }
+    if let Some(enabled) = body.dsd_volume_protection {
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        let key = tune_core::audio::dop_ecarte_7265::cle_protection_du_niveau(id);
+        let r = if enabled {
+            settings.delete(&key)
+        } else {
+            settings.set(&key, "false")
+        };
+        ecrire!("dsd_volume_protection", enabled, r);
+        if enabled && let Err(message) = state.orchestrator.proteger_le_dop_en_lecture(id).await {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": message, "code": "dsd_volume_protection_failed"
+                })),
+            )
+                .into_response());
+        }
+    }
     // #8869 — silence de verrouillage → setting zone_{id}_silence_verrouillage_ms,
     // borné à 0..=2000 ; 0 supprime la clé. Lu à chaque lecture.
     if let Some(ms) = body.silence_verrouillage_ms {
