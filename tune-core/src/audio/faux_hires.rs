@@ -41,9 +41,11 @@
 //! 44,1/48 kHz) n'est altéré que sur la signature d'un codec avec perte : une
 //! coupure EN MUR ([`en_mur`] : au moins [`MUR_DB`] de chute dans les
 //! [`MUR_LARGEUR_HZ`] au-dessus du bord) entre [`COUPURE_MUR_CD_MIN_HZ`] et
-//! [`COUPURE_LOSSY_MAX_HZ`] (un MP3 à 128 kbit/s coupe vers 16 kHz, à 320 vers
+//! [`COUPURE_MUR_CD_MAX_HZ`] (un MP3 à 128 kbit/s coupe vers 16 kHz, à 320 vers
 //! 19-20 kHz) ; JAMAIS sur une pente douce avant 20 kHz (vieille bande, master
-//! sombre), ni sur une coupure qui n'est pas un mur. Les règles des fichiers
+//! sombre), ni sur une coupure qui n'est pas un mur, ni sur un mur à 20 kHz ou
+//! au-dessus (le filtre anti-repliement d'un vrai CD, décision du 19/11 après
+//! #9139 : quitte à laisser passer certains MP3 à 320 kbit/s). Les règles des fichiers
 //! qui se disent hi-res ne changent pas. Le mot rangé et publié reste
 //! `douteux` (compatibilité des clients) ; la raison d'un CD altéré est
 //! [`Raison::MurDeCodec`].
@@ -95,11 +97,20 @@ const SILENCE_DB: f64 = -150.0;
 pub const COUPURE_LOSSY_MAX_HZ: f64 = 20_500.0;
 
 /// #9067 — un CD n'est « source altérée » que si sa coupure en mur tombe à
-/// partir de cette fréquence (et sous [`COUPURE_LOSSY_MAX_HZ`]) : la plage des
+/// partir de cette fréquence (et sous [`COUPURE_MUR_CD_MAX_HZ`]) : la plage des
 /// passe-bas d'encodeur (MP3/AAC de 96 à 320 kbit/s, 15 à 20 kHz). Plus bas,
 /// un mur est plus souvent un filtre de restauration (transfert de 78 tours)
 /// qu'un encodeur : le CD reste conforme.
 pub const COUPURE_MUR_CD_MIN_HZ: f64 = 15_000.0;
+
+/// #9067 — la borne HAUTE (exclue) du mur de codec d'un CD : un mur à
+/// 20 kHz ou au-dessus laisse le CD conforme. Décision de Bertrand du 19/11
+/// (après #9139, qui bornait à [`COUPURE_LOSSY_MAX_HZ`], 20,5 kHz) : le filtre
+/// anti-repliement d'un vrai CD coupe souvent entre 20,0 et 20,5 kHz, et un
+/// vrai CD ne doit JAMAIS être marqué altéré, quitte à laisser passer certains
+/// MP3 à 320 kbit/s (passe-bas vers 20 kHz). Les règles hi-res gardent
+/// [`COUPURE_LOSSY_MAX_HZ`].
+pub const COUPURE_MUR_CD_MAX_HZ: f64 = 20_000.0;
 
 /// #9067 — la largeur, en Hz, au-dessus du bord d'une coupure, au-delà de
 /// laquelle un MUR est déjà tombé de [`MUR_DB`].
@@ -202,8 +213,8 @@ pub enum Raison {
     /// avec un encodeur avec perte ([`trous_de_codec`]) ; pas une preuve.
     SignatureDeCodec { coupure_hz: f64 },
     /// #9067 — un CD (16 bits, 48 kHz au plus) coupé EN MUR à une fréquence
-    /// de passe-bas d'encodeur ([`COUPURE_MUR_CD_MIN_HZ`] à
-    /// [`COUPURE_LOSSY_MAX_HZ`]) : la signature d'un codec avec perte.
+    /// de passe-bas d'encodeur ([`COUPURE_MUR_CD_MIN_HZ`] inclus à
+    /// [`COUPURE_MUR_CD_MAX_HZ`] exclu) : la signature d'un codec avec perte.
     MurDeCodec { coupure_hz: f64 },
 }
 
@@ -211,7 +222,8 @@ pub enum Raison {
 pub const RAISON_MUR_DE_CODEC: &str = "mur_de_codec";
 
 /// #9067 — la raison rangée sur un CD `conforme` dont une coupure suspecte a
-/// été mesurée SANS mur (pente, filtre doux) : jamais publiée (un conforme n'a
+/// été mesurée SANS mur de codec (pente, filtre doux, ou mur hors de
+/// [`COUPURE_MUR_CD_MIN_HZ`]..[`COUPURE_MUR_CD_MAX_HZ`]) : jamais publiée (un conforme n'a
 /// pas de raison), elle dit seulement que la ligne a été jugée par la règle de
 /// #9067 et qu'il ne faut pas la remesurer.
 pub const RAISON_CD_SANS_MUR: &str = "coupure_sans_mur";
@@ -238,32 +250,50 @@ fn cd_sql(a: &str) -> String {
 /// plus) n'est « source altérée » (`douteux`) que par un mur de codec
 /// ([`RAISON_MUR_DE_CODEC`], décision du 19/11) : une ligne `douteux` rangée
 /// pour un CD sous une autre raison (avant #9067, sur la seule coupure) se lit
-/// `conforme` jusqu'à sa remesure (`faux_hires_passe::A_REMESURER`).
+/// `conforme` jusqu'à sa remesure (`faux_hires_passe::A_REMESURER`). De même
+/// une ligne `mur_de_codec` rangée avec un mur à [`COUPURE_MUR_CD_MAX_HZ`] ou
+/// au-dessus (jugée par #9139 avec la borne de 20,5 kHz) : un vrai CD n'est
+/// jamais montré altéré.
 pub fn verdict_effectif_sql(alias: &str) -> String {
     format!(
         "(CASE WHEN {a}.verdict = 'douteux' AND {cd} \
-         AND COALESCE({a}.raison, '') <> '{mur}' \
+         AND {plus_altere} \
          THEN 'conforme' ELSE {a}.verdict END)",
         a = alias,
         cd = cd_sql(alias),
+        plus_altere = cd_douteux_plus_altere_sql(alias),
+    )
+}
+
+/// #9067 — sur une ligne CD rangée `douteux`, la raison ne tient plus sous la
+/// règle actuelle : une autre raison qu'un mur de codec (avant #9067), ou un
+/// mur de codec à [`COUPURE_MUR_CD_MAX_HZ`] ou au-dessus (borne de 20,5 kHz
+/// de #9139, abaissée le 19/11). En SQL sur l'alias `a`.
+fn cd_douteux_plus_altere_sql(a: &str) -> String {
+    format!(
+        "(COALESCE({a}.raison, '') <> '{mur}' \
+         OR COALESCE({a}.coupure_hz, 0) >= {max})",
         mur = RAISON_MUR_DE_CODEC,
+        max = COUPURE_MUR_CD_MAX_HZ,
     )
 }
 
 /// #9067 — la ligne d'un CD est-elle à REMESURER par la règle du 19/11 ? En
 /// SQL sur l'alias `a` : un CD rangé `douteux` sous une autre raison qu'un mur
-/// de codec (jugé sur la seule coupure, avant #9067), ou rangé `conforme` avec
-/// une coupure suspecte et sans raison (jugé du 18 au 19/11, sans regarder le
-/// mur). Une fois remesurée, la ligne porte [`RAISON_MUR_DE_CODEC`] ou
+/// de codec (jugé sur la seule coupure, avant #9067) ou sur un mur à
+/// [`COUPURE_MUR_CD_MAX_HZ`] ou au-dessus (borne de 20,5 kHz de #9139), ou
+/// rangé `conforme` avec une coupure sous 20,5 kHz ([`COUPURE_LOSSY_MAX_HZ`])
+/// et sans raison (jugé du 18 au 19/11, sans regarder le mur). Une fois
+/// remesurée, la ligne porte [`RAISON_MUR_DE_CODEC`] (mur sous 20 kHz) ou
 /// [`RAISON_CD_SANS_MUR`] et n'est plus candidate.
 pub fn cd_a_remesurer_sql(alias: &str) -> String {
     format!(
-        "({cd} AND (({a}.verdict = 'douteux' AND COALESCE({a}.raison, '') <> '{mur}') \
+        "({cd} AND (({a}.verdict = 'douteux' AND {plus_altere}) \
          OR ({a}.verdict = 'conforme' AND {a}.raison IS NULL \
              AND {a}.coupure_hz IS NOT NULL AND {a}.coupure_hz < {lossy})))",
         a = alias,
         cd = cd_sql(alias),
-        mur = RAISON_MUR_DE_CODEC,
+        plus_altere = cd_douteux_plus_altere_sql(alias),
         lossy = COUPURE_LOSSY_MAX_HZ,
     )
 }
@@ -938,12 +968,13 @@ pub fn juger(m: &Mesure) -> Verdict {
         // #9067 (décision de Bertrand du 19/11, fil 2915) — un CD (16 bits,
         // 48 kHz au plus) n'est « source altérée » QUE sur la signature d'un
         // codec avec perte : une coupure EN MUR dans la plage des passe-bas
-        // d'encodeur. Une pente douce, un filtre doux ou un mur plus bas que
-        // [`COUPURE_MUR_CD_MIN_HZ`] le laissent conforme.
+        // d'encodeur. Une pente douce, un filtre doux, un mur plus bas que
+        // [`COUPURE_MUR_CD_MIN_HZ`] ou à [`COUPURE_MUR_CD_MAX_HZ`] et au-dessus
+        // (le filtre d'un vrai CD) le laissent conforme.
         Some(f)
             if !se_dit_hires
                 && m.coupure_en_mur
-                && (COUPURE_MUR_CD_MIN_HZ..COUPURE_LOSSY_MAX_HZ).contains(&f) =>
+                && (COUPURE_MUR_CD_MIN_HZ..COUPURE_MUR_CD_MAX_HZ).contains(&f) =>
         {
             Verdict::Douteux(Raison::MurDeCodec { coupure_hz: f })
         }

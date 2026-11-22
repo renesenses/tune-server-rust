@@ -1,4 +1,5 @@
-//! La zone que visent les raccourcis globaux et les touches média (#8531).
+//! La zone que visent les raccourcis du menu (#9255 ; avant : les raccourcis
+//! globaux et les touches média, #8531).
 //!
 //! La page signale la zone qu'elle affiche (`/__widget/zone/<id>`, ou la
 //! commande `select_zone` de l'interface embarquée). Tant qu'elle n'a rien

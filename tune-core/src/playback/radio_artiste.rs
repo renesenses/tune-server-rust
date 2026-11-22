@@ -138,6 +138,9 @@ impl Candidat {
                 track_id: *track_id,
             },
             Candidat::Service { source, piste } => QueueInput::Streaming {
+                media_format: None,
+                sample_rate: None,
+                bit_depth: None,
                 source: source.clone(),
                 source_id: piste.id.clone(),
                 title: piste.title.clone(),

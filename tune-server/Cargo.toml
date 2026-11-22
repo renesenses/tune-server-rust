@@ -1826,6 +1826,14 @@ name = "pg_requete_avancee_7872"
 path = "tests/pg_requete_avancee_7872.rs"
 required-features = ["postgres"]
 
+# Forum 21/11/2026 — un nom de collection intelligente déjà pris rend 409
+# `smart_collection_name_taken` sur PostgreSQL aussi, dont le schéma n'a pas
+# l'index unique de SQLite.
+[[test]]
+name = "pg_nom_de_collection_deja_pris"
+path = "tests/pg_nom_de_collection_deja_pris.rs"
+required-features = ["postgres"]
+
 # #8077 — les apports Qobuz d'un album local (rapprochement, garde « compléter
 # seulement », retrait), sur SQLite puis sur PostgreSQL (migration 108), par le
 # vrai routeur et une doublure de l'API Qobuz. `autotests = false` : sans ces
@@ -2156,6 +2164,11 @@ path = "tests/ecoutes_communaute_6738.rs"
 [[test]]
 name = "groupe_dlna_joue_sur_les_deux_6155"
 path = "tests/groupe_dlna_joue_sur_les_deux_6155.rs"
+
+# #9089 — décalage manuel d'une suiveuse de groupe (route, départ, déplacements).
+[[test]]
+name = "decalage_de_groupe_9089"
+path = "tests/decalage_de_groupe_9089.rs"
 
 # #7717 — une lecture lancée sur une zone d'un groupe, par n'importe quel
 # client, part sur toutes ses zones (Chromecast comprise).

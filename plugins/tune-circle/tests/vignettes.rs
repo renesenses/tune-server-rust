@@ -312,6 +312,30 @@ async fn reglage_coupe_rien_ne_part() {
     assert_eq!((f.manifestes, f.envois.len(), f.effacements), (0, 0, 0));
 }
 
+/// #8797 — après un refus de la session par le site, aucune vignette ne
+/// part (ni manifeste, ni envoi) ; contre-épreuve : reconnecté, le passage
+/// reprend.
+#[tokio::test]
+async fn session_refusee_rien_ne_part_8797() {
+    let banc = demarrer().await;
+    let dossier = dossier_de_pochettes();
+    let backend = bibliotheque(&banc, &dossier, 3);
+    let s = SettingsRepo::with_backend(backend.clone());
+    s.set(
+        tune_core::cloud::sso::CLE_RECONNEXION_REQUISE,
+        "2026-11-20T10:00:00+00:00",
+    )
+    .unwrap();
+    let bilan = vignettes_de(&banc, &backend, &dossier).passage().await;
+    assert!(bilan.rien);
+    {
+        let f = banc.etat.lock().unwrap();
+        assert_eq!((f.manifestes, f.envois.len(), f.effacements), (0, 0, 0));
+    }
+    tune_core::cloud::sso::oublier_le_refus_de_session(&s);
+    vignettes_de(&banc, &backend, &dossier).passage().await;
+    assert!(banc.etat.lock().unwrap().manifestes >= 1);
+}
 // 2. Ce qui part -------------------------------------------------------------
 
 #[tokio::test]

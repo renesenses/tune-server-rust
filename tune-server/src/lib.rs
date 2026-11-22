@@ -39,6 +39,8 @@ pub mod dossiers_inscriptibles;
 pub mod extinction_hote;
 /// Plancher de fils de travail du moteur tokio (fil 2124, #5677).
 pub mod fils_de_travail;
+/// Tune Circle : écritures réservées à l'administrateur, lecture seule à distance.
+pub mod garde_du_cercle;
 /// Ce qu'une requête rejouée par le relais ou l'écoute directe peut atteindre.
 pub mod garde_du_relais;
 /// #7077 — garde : aucune phrase française dans les champs exposés de l'API.
@@ -50,6 +52,8 @@ pub mod gel_executeur;
 mod instance_existante;
 /// #6253 — `--sans-console` : relance sans fenêtre de terminal (Windows).
 pub(crate) mod lancement_sans_console;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod navigateur_windows;
 pub use tune_http_types::error;
 #[cfg(feature = "local-audio")]
 pub mod exclusif_par_zone_3245;

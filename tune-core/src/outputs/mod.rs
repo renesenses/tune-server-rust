@@ -26,6 +26,8 @@ pub mod capacite_dsd_natif;
 pub mod chromecast;
 #[cfg(all(target_os = "macos", feature = "local-audio"))]
 pub mod coreaudio_exclusive;
+/// Décodage progressif d'une source HTTP (Devialet AIR, Sendspin).
+pub(crate) mod decodeur_distant;
 pub mod devialet_air;
 pub mod didl;
 pub mod dlna;
@@ -52,6 +54,8 @@ mod dlna_volume_apres_uri_tests_6008;
 pub mod dsd_natif_oaat_8647;
 pub mod repli_dsd_oaat_8486;
 // #8151 — la sourdine tient à chaque nouvelle piste.
+#[cfg(any(target_os = "windows", test))]
+pub(crate) mod cadence_exclusive_8616;
 #[cfg(test)]
 pub(crate) mod dlna_sourdine_8151_tests;
 #[cfg(feature = "local-audio")]

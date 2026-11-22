@@ -234,7 +234,7 @@ fn chemins_de_l_album(state: &AppState, album_id: i64) -> Vec<String> {
         .backend
         .query_many(
             &format!(
-                "SELECT file_path FROM tracks WHERE album_id = {p1} AND file_path IS NOT NULL \
+                "SELECT COALESCE(file_path, cue_media_path) FROM tracks WHERE album_id = {p1} AND COALESCE(file_path, cue_media_path) IS NOT NULL \
                  AND (source IS NULL OR source = 'local')"
             ),
             &[&album_id as &dyn ToSqlValue],
@@ -540,5 +540,18 @@ mod tests {
         let corps: Value = serde_json::from_slice(&octets).expect("json");
         assert_eq!(corps["available"], false);
         assert_eq!(corps["reason"], "reveal_remote_client");
+    }
+}
+
+#[cfg(test)]
+mod cue_8836_tests {
+    use super::*;
+    #[tokio::test]
+    async fn le_dossier_de_l_album_cue_vient_du_media_8836() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        state.backend.execute_batch("INSERT INTO albums (id, title) VALUES (7, 'Album CUE'); INSERT INTO tracks (title, album_id, source, cue_media_path, cue_start_ms) VALUES ('A', 7, 'local', '/musique/album/image.flac', 0), ('B', 7, 'local', '/musique/album/image.flac', 60000);").unwrap();
+        let paths = chemins_de_l_album(&state, 7);
+        assert_eq!(paths.len(), 2);
+        assert_eq!(dossier_commun(&paths).as_deref(), Some("/musique/album"));
     }
 }

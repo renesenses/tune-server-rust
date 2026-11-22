@@ -7,6 +7,8 @@ use std::sync::Mutex;
 struct Etat {
     demande: Option<&'static str>,
     piste: Option<&'static str>,
+    /// #9165 — un choix était armé à l'ouverture de la piste.
+    choix_present: bool,
 }
 
 #[derive(Default)]
@@ -24,6 +26,7 @@ impl Diagnostic {
     /// Appelé sous le verrou du choix : la raison et le choix sont du même instant.
     pub(super) fn ouvrir(&self, choix_present: bool) {
         if let Ok(mut e) = self.etat.lock() {
+            e.choix_present = choix_present;
             e.piste = if choix_present {
                 // Les chemins qui n'ouvrent pas d'étage ne doivent pas promettre
                 // un traitement à la piste suivante. CPAL affine cette raison.
@@ -31,6 +34,18 @@ impl Diagnostic {
             } else {
                 e.demande
             };
+        }
+    }
+
+    /// #9165 — un chemin qui n'ouvre pas d'étage nomme SA cause (DSD natif,
+    /// flux compressé décodé en entier) au lieu du « chemin de sortie » posé
+    /// d'office, réservé aux bras exclusifs macOS/Windows. Sans choix armé,
+    /// la raison de la demande (licence, test de la machine…) reste.
+    pub(super) fn chemin_sans_etage(&self, raison: &'static str) {
+        if let Ok(mut e) = self.etat.lock()
+            && e.choix_present
+        {
+            e.piste = Some(raison);
         }
     }
 
@@ -42,6 +57,86 @@ impl Diagnostic {
 
     pub(super) fn declarer(&self, t: TransformationsReelles) -> TransformationsReelles {
         t.avec_refus_surechantillonnage(self.etat.lock().ok().and_then(|e| e.piste))
+    }
+}
+
+/// #9165 — ce que l'ouverture partagée ferait du greffon, jugé AVANT le
+/// chemin natif S32 de Linux, par les mêmes règles : les gardes de
+/// l'ouverture ([`refus_a_l_ouverture`]), puis la part de la négociation de
+/// cadence qui se juge sans périphérique (bit-perfect strict, cadences
+/// candidates, verdict de la machine, plafonds).
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GreffonAvantLeNatif {
+    /// Aucun choix armé pour la zone.
+    Absent,
+    /// Le chemin partagé porterait l'étage : le natif doit céder.
+    Voulu,
+    /// Armé, mais l'ouverture partagée l'écarterait : la raison, pour le
+    /// chemin du signal quand le natif est pris.
+    Ecarte(&'static str),
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub(super) fn greffon_avant_le_natif(
+    choix: Option<&crate::audio::surechantillonnage::ChoixSurechantillonnage>,
+    spec: AudioSpec,
+    amorce: &[u8],
+    pure: bool,
+    dop: bool,
+    sortie_double: bool,
+    strict_bitperfect: bool,
+) -> GreffonAvantLeNatif {
+    let Some(choix) = choix else {
+        return GreffonAvantLeNatif::Absent;
+    };
+    if let Some(raison) = refus_a_l_ouverture(spec, amorce, pure, dop, sortie_double) {
+        return GreffonAvantLeNatif::Ecarte(raison);
+    }
+    match super::backend::surechantillonneur_possible_sans_peripherique(
+        choix,
+        strict_bitperfect,
+        spec.cadence(),
+    ) {
+        Ok(()) => GreffonAvantLeNatif::Voulu,
+        Err(refus) => GreffonAvantLeNatif::Ecarte(refus.code()),
+    }
+}
+
+/// Un choix que le test de la machine admet vers toutes les cadences de
+/// référence, filtre et plafonds par défaut.
+#[cfg(test)]
+pub(super) fn choix_admis_pour_test() -> crate::audio::surechantillonnage::ChoixSurechantillonnage {
+    use crate::audio::surechantillonnage::{
+        ChoixSurechantillonnage, MesureMachine, UpsamplerSettings, VerdictMachine,
+    };
+    let reglages = UpsamplerSettings {
+        enabled: true,
+        ..Default::default()
+    };
+    let results = [
+        (44_100, 352_800),
+        (44_100, 705_600),
+        (48_000, 384_000),
+        (48_000, 768_000),
+    ]
+    .into_iter()
+    .map(|(from_hz, to_hz)| MesureMachine {
+        filter: reglages.filter.clone(),
+        from_hz,
+        to_hz,
+        realtime_factor: 10.0,
+        admitted: true,
+    })
+    .collect();
+    ChoixSurechantillonnage {
+        reglages,
+        verdict: VerdictMachine {
+            simd_path: "scalaire".into(),
+            margin: 1.0,
+            results,
+            measured_at: 0,
+        },
     }
 }
 
@@ -144,6 +239,72 @@ mod tests {
         );
         d.noter(None);
         assert!(d.declarer(mesure()).refus_surechantillonnage().is_none());
+    }
+
+    #[test]
+    fn diagnostic_9165_les_chemins_sans_etage_nomment_leur_cause() {
+        let d = Diagnostic::default();
+        // Choix armé : la valeur d'office cède à la cause du chemin.
+        d.ouvrir(true);
+        assert_eq!(
+            d.declarer(mesure()).refus_surechantillonnage(),
+            Some("output_path_not_supported")
+        );
+        d.chemin_sans_etage("dsd");
+        assert_eq!(d.declarer(mesure()).refus_surechantillonnage(), Some("dsd"));
+        d.ouvrir(true);
+        d.chemin_sans_etage("compressed_stream");
+        assert_eq!(
+            d.declarer(mesure()).refus_surechantillonnage(),
+            Some("compressed_stream")
+        );
+        // Sans choix armé, la raison de la demande n'est pas réécrite.
+        d.demander(Some("premium_required"));
+        d.ouvrir(false);
+        d.chemin_sans_etage("dsd");
+        assert_eq!(
+            d.declarer(mesure()).refus_surechantillonnage(),
+            Some("premium_required")
+        );
+    }
+
+    #[test]
+    fn greffon_avant_le_natif_9165_suit_les_regles_de_l_ouverture() {
+        use GreffonAvantLeNatif::{Absent, Ecarte, Voulu};
+        let choix = choix_admis_pour_test();
+        let s32 = AudioSpec::depuis_entete(96_000, 32, 2).unwrap();
+        let juger = |spec, pure, dop, double, strict| {
+            greffon_avant_le_natif(Some(&choix), spec, &[], pure, dop, double, strict)
+        };
+        assert_eq!(
+            greffon_avant_le_natif(None, s32, &[], false, false, false, false),
+            Absent
+        );
+        assert_eq!(juger(s32, false, false, false, false), Voulu);
+        assert_eq!(juger(s32, true, false, false, false), Ecarte("pure"));
+        assert_eq!(juger(s32, false, true, false, false), Ecarte("dop"));
+        assert_eq!(
+            juger(s32, false, false, true, false),
+            Ecarte("multiple_outputs")
+        );
+        // Bit-perfect strict : l'ouverture partagée refuserait le greffon.
+        assert_eq!(
+            juger(s32, false, false, false, true),
+            Ecarte("strict_bitperfect")
+        );
+        // Source déjà au plus haut des cadences candidates.
+        let s768 = AudioSpec::depuis_entete(768_000, 32, 2).unwrap();
+        assert_eq!(
+            juger(s768, false, false, false, false),
+            Ecarte("no_candidate_rate_accepted_by_device")
+        );
+        // Machine qui n'admet rien.
+        let mut refuse = choix.clone();
+        refuse.verdict.results.clear();
+        assert_eq!(
+            greffon_avant_le_natif(Some(&refuse), s32, &[], false, false, false, false),
+            Ecarte("machine_test_rejects_accepted_rates")
+        );
     }
 
     #[test]

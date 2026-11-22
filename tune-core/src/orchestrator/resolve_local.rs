@@ -1,4 +1,5 @@
 use super::*;
+use crate::outputs::capacite_dsd_natif::TransportReelDsd;
 
 // Durée client des seuls canaux PCM qui commencent déjà à une position.
 // Le flux/DIDL conserve sa durée restante (#6630). Ce registre ne participe
@@ -662,7 +663,8 @@ impl PlaybackOrchestrator {
             .appareils_qui_lachent_le_dsd_suivant
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .contains(device_id);
+            .get_mut(device_id)
+            .is_some_and(|m| m.garde_active(std::time::Instant::now()));
         crate::playback::gapless::refus_dsd_suivant_sur_dlna(
             annonce_dsd,
             natif_force,
@@ -671,13 +673,42 @@ impl PlaybackOrchestrator {
         )
     }
 
-    /// #6910 — `device_id` a lâché un suivant DSD armé : la garde de #402 lui
-    /// est rendue jusqu'au redémarrage. Vrai à la première fois seulement.
-    pub fn retenir_dsd_suivant_lache(&self, device_id: &str) -> bool {
+    /// #6910 — `device_id` a lâché un suivant DSD armé. #9206 : la garde de
+    /// #402 ne lui est rendue qu'au deuxième échec (ou tout de suite si
+    /// `immediat` : il a dit lui-même avoir perdu la suivante, ou s'il est
+    /// récidiviste), pour un temps (voir
+    /// [`crate::playback::gapless::EchecsDsdSuivant`]).
+    pub fn retenir_dsd_suivant_lache(
+        &self,
+        device_id: &str,
+        immediat: bool,
+    ) -> crate::playback::gapless::IssueEchecDsdSuivant {
         self.appareils_qui_lachent_le_dsd_suivant
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(device_id.to_string())
+            .entry(device_id.to_string())
+            .or_default()
+            .noter_echec(std::time::Instant::now(), immediat)
+    }
+
+    /// #9206 — `device_id` a suivi un suivant DSD armé : ses échecs et sa
+    /// récidive sont oubliés. Vrai s'il y avait quelque chose à oublier.
+    pub fn noter_succes_dsd_suivant(&self, device_id: &str) -> bool {
+        self.appareils_qui_lachent_le_dsd_suivant
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(device_id)
+            .is_some()
+    }
+
+    /// Banc (#9206) : échecs de suivant DSD notés pour `device_id`.
+    #[cfg(test)]
+    pub(crate) fn echecs_dsd_suivant_pour_banc(&self, device_id: &str) -> u32 {
+        self.appareils_qui_lachent_le_dsd_suivant
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(device_id)
+            .map_or(0, |m| m.echecs())
     }
 
     /// Banc : ce que le `GetProtocolInfo` du renderer aurait dit du DSD.
@@ -1307,6 +1338,20 @@ impl PlaybackOrchestrator {
         };
         let mut transport = transport_dsd(is_local_output, is_network_output, &dsd_mode);
 
+        // #8248 / #9170 (suivi #9172) — une piste PCM sur une zone « Natif »
+        // dont la sortie n'a jamais été sondée : la prochaine ouverture de
+        // flux (PCM libre) la sondera une fois, pour que la PREMIÈRE piste DSD
+        // qui suit parte déjà en natif. Une zone qui n'est pas « Natif » ne
+        // demande rien : ses pistes PCM ne sondent jamais.
+        if let Some(nom) = sortie_a_sonder_pour_une_piste_pcm(
+            is_local_output,
+            source_format,
+            req.output_device_id.as_deref(),
+            || ZoneRepo::with_backend(self.db.clone()).get_dsd_mode(req.zone_id),
+        ) {
+            crate::outputs::capacite_dsd_natif::demander_sondage_a_l_ouverture(nom);
+        }
+
         // #5643 — « natif » sur une sortie locale ASIO dont le pilote déclare
         // le DSD à la cadence du fichier : du DSD natif, pour de vrai. Sinon
         // `NatifServiEnDop`, comme avant, avec le motif au journal.
@@ -1325,6 +1370,14 @@ impl PlaybackOrchestrator {
             ) {
                 Ok(()) => {
                     transport = TransportDsd::Natif;
+                    // #9170 — décidé, pas encore réel : le bras le confirme
+                    // quand le flux démarre, ou l'efface s'il échoue.
+                    if let Some(sortie) = req.output_device_id.as_deref() {
+                        crate::outputs::capacite_dsd_natif::noter_natif_en_attente(
+                            req.zone_id,
+                            sortie,
+                        );
+                    }
                     let (cadence, canaux) = entete.unwrap_or_default();
                     info!(
                         zone_id = req.zone_id,
@@ -1346,7 +1399,7 @@ impl PlaybackOrchestrator {
                             fin_ms: None,
                         },
                     };
-                    return self
+                    let servi = self
                         .servir_le_dsd_natif(
                             req,
                             track,
@@ -1356,6 +1409,12 @@ impl PlaybackOrchestrator {
                             fenetre,
                         )
                         .await;
+                    // #9170 — échec avant le bras : le natif attendu ne
+                    // partira pas, il ne doit pas rester en attente.
+                    if !matches!(servi, Ok(Some(_))) {
+                        crate::outputs::capacite_dsd_natif::effacer_transport_reel(req.zone_id);
+                    }
+                    return servi;
                 }
                 Err(motif) => motif_natif = Some(motif),
             }
@@ -1397,6 +1456,13 @@ impl PlaybackOrchestrator {
             }
         }
         let dop_requested = transport != TransportDsd::Pcm;
+        // #9170 — « Natif » réglé, la piste DSD part autrement : l'écran des
+        // réglages doit dire ce qui est réellement parti (DoP ou PCM), pas
+        // seulement ce que la sortie accepterait.
+        let natif_demande_en_local = motif_natif.is_some();
+        if natif_demande_en_local && !dop_requested {
+            noter_transport_reel_dsd(req, TransportReelDsd::Pcm);
+        }
 
         // #2369 — « natif » sur une sortie locale N'EST PAS natif.
         //
@@ -1464,7 +1530,7 @@ impl PlaybackOrchestrator {
             // zone repartait de la position visée — d'où une fin de piste
             // déclarée bien avant la fin de l'audio entendu (Levente, fil 2305).
             let tranche = tranche_dop(tranche_cue, req.seek_ms);
-            return self
+            let anticipe = self
                 .anticiper_le_dop(
                     req.zone_id,
                     track,
@@ -1476,6 +1542,19 @@ impl PlaybackOrchestrator {
                     req.seek_ms,
                 )
                 .await;
+            if natif_demande_en_local {
+                match &anticipe {
+                    Ok(Some(_)) => noter_transport_reel_dsd(req, TransportReelDsd::Dop),
+                    // DoP hors plafond : le chemin ordinaire convertit en PCM.
+                    Ok(None) => noter_transport_reel_dsd(req, TransportReelDsd::Pcm),
+                    // Refus (bit-perfect strict) : rien n'est parti, l'ancien
+                    // transport ne doit pas rester affiché.
+                    Err(_) => {
+                        crate::outputs::capacite_dsd_natif::effacer_transport_reel(req.zone_id);
+                    }
+                }
+            }
+            return anticipe;
         }
         Ok(None)
     }
@@ -2132,6 +2211,69 @@ impl PlaybackOrchestrator {
         }
     }
 
+    /// #8616 — sonde limitée à WASAPI exclusif, hors des verrous asynchrones.
+    async fn cadence_pcm_exclusive(
+        &self,
+        device_id: Option<&str>,
+        cadence: u32,
+        voies: u16,
+        plafond: Option<u32>,
+        repli: bool,
+    ) -> Result<Option<u32>, String> {
+        #[cfg(test)]
+        if let Some(acceptees) =
+            device_id.and_then(|id| cadences_pcm_de_test().lock().unwrap().get(id).cloned())
+        {
+            return crate::outputs::cadence_exclusive_8616::choisir_cadence(
+                cadence,
+                voies,
+                plafond,
+                repli,
+                |hz, _, _| {
+                    if acceptees.contains(&hz) {
+                        crate::outputs::negociation_format_exclusif_3837::ResultatSonde::Accepte
+                    } else {
+                        crate::outputs::negociation_format_exclusif_3837::ResultatSonde::Refuse {
+                            hr: 0x88890008u32 as i32,
+                            propose: None,
+                        }
+                    }
+                },
+            );
+        }
+        #[cfg(all(feature = "local-audio", target_os = "windows"))]
+        {
+            let Some(id) = device_id else {
+                return Ok(None);
+            };
+            let Some(sortie) = ({ self.outputs.lock().await.get(id) }) else {
+                return Ok(None);
+            };
+            let endpoint = {
+                let sortie = sortie.lock().await;
+                sortie
+                    .as_any()
+                    .downcast_ref::<crate::outputs::local::LocalOutput>()
+                    .and_then(crate::outputs::local::LocalOutput::endpoint_pcm_exclusif)
+            };
+            let Some(endpoint) = endpoint else {
+                return Ok(None);
+            };
+            tokio::task::spawn_blocking(move || {
+                crate::outputs::wasapi_exclusive::sonder_la_cadence_pcm(
+                    endpoint, cadence, voies, plafond, repli,
+                )
+            })
+            .await
+            .unwrap_or(Ok(None))
+        }
+        #[cfg(not(all(feature = "local-audio", target_os = "windows")))]
+        {
+            let _ = (device_id, cadence, voies, plafond, repli);
+            Ok(None)
+        }
+    }
+
     /// #5643 — ce que la sortie locale `device_id` permet en DSD natif.
     ///
     /// Le bras se lit sur la sortie elle-même (`sort_par_asio_exclusif`, la
@@ -2172,15 +2314,22 @@ impl PlaybackOrchestrator {
                 #[cfg(target_os = "linux")]
                 {
                     use crate::outputs::local::ResultatSondeDsdAlsa;
-                    match capacite::connue(&nom) {
-                        Some(CapaciteConnue::AlsaDsdU32 { cadences }) => {
-                            return SortieDsdLocale::Alsa {
-                                cadences,
-                                voies: crate::outputs::local::VOIES_SONDEES_DSD_ALSA,
-                            };
+                    // #9170 — une capacité provisoire (PCM logiciel observé
+                    // sans réponse du pilote) se re-sonde ici, à chaque piste
+                    // DSD « Natif » : elle ne fige plus la sortie en DoP.
+                    if !capacite::a_resonder(&nom) {
+                        match capacite::connue(&nom) {
+                            Some(CapaciteConnue::AlsaDsdU32 { cadences }) => {
+                                return SortieDsdLocale::Alsa {
+                                    cadences,
+                                    voies: crate::outputs::local::VOIES_SONDEES_DSD_ALSA,
+                                };
+                            }
+                            Some(CapaciteConnue::SortieNonAsio) => {
+                                return SortieDsdLocale::NonAsio;
+                            }
+                            _ => {}
                         }
-                        Some(CapaciteConnue::SortieNonAsio) => return SortieDsdLocale::NonAsio,
-                        _ => {}
                     }
                     let sonde = {
                         let sortie = sortie.lock().await;
@@ -2190,16 +2339,20 @@ impl PlaybackOrchestrator {
                             .and_then(crate::outputs::local::LocalOutput::sonde_dsd_alsa)
                     };
                     if let Some(sonde) = sonde {
-                        match tokio::task::spawn_blocking(move || sonde.sonder_et_retenir())
+                        let r = tokio::task::spawn_blocking(move || sonde.sonder_et_retenir())
                             .await
-                            .unwrap_or(ResultatSondeDsdAlsa::Occupe)
-                        {
-                            ResultatSondeDsdAlsa::Sonde { cadences, voies } => {
-                                return SortieDsdLocale::Alsa { cadences, voies };
-                            }
-                            ResultatSondeDsdAlsa::Occupe => return SortieDsdLocale::AlsaNonSondee,
-                            ResultatSondeDsdAlsa::PasUnPcmMateriel => {}
+                            .unwrap_or(ResultatSondeDsdAlsa::Occupe);
+                        // #9170 (suivi #9172, relecture #9211) — rien appris
+                        // (PCM tenu par la piste précédente, DAC introuvable,
+                        // verdict provisoire) : la demande est posée, SANS
+                        // armer l'espacement (`ResultatSondeDsdAlsa::retenir`
+                        // n'en arme aucun) — l'ouverture de CETTE piste, PCM
+                        // libre, sonde donc, et la suivante peut partir en
+                        // natif. Seuls les échecs à l'ouverture espacent.
+                        if !matches!(r, ResultatSondeDsdAlsa::Sonde { .. }) {
+                            capacite::demander_sondage_a_l_ouverture(&nom);
                         }
+                        return sortie_alsa_apres_sonde(r);
                     }
                 }
                 capacite::retenir(&nom, CapaciteConnue::SortieNonAsio);
@@ -2382,8 +2535,19 @@ impl PlaybackOrchestrator {
             track.channels as u32,
         );
         let dop_rate = crate::audio::dsd_to_dop::DsdToDoP::dop_rate(dsd_rate);
-        // Réutilise le plafond déjà combiné avec le quirk catalogue.
-        let zone_max_sr = zone_max_sample_rate;
+        // #8789 — en local, ne pas ouvrir un porteur DoP au-delà du DSD256.
+        // Les deux familles gardent leur DSD256 (705,6 / 768 kHz). Le plafond
+        // de zone peut encore abaisser cette borne ; le chemin natif est séparé.
+        let zone_max_sr = if is_local_output {
+            let plafond_dop = if dsd_rate.is_multiple_of(48_000) {
+                768_000
+            } else {
+                705_600
+            };
+            Some(zone_max_sample_rate.unwrap_or(plafond_dop).min(plafond_dop))
+        } else {
+            zone_max_sample_rate
+        };
         if let Some(max_sr) = zone_max_sr {
             if dop_rate > max_sr {
                 // #3973 — le DoP dépasse le plafond : le chemin ordinaire
@@ -2697,7 +2861,9 @@ impl PlaybackOrchestrator {
             .await?
         {
             DecisionOuResolu::Decision(decision) => {
-                let format = self.decider_le_format_de_sortie(req, &decision, None)?;
+                let format = self
+                    .decider_le_format_de_sortie(req, &decision, None)
+                    .await?;
                 Ok(self.chemin_du_rendu_en_cache(req, &decision, &format))
             }
             DecisionOuResolu::Resolu(_) => Err("résolu sans transcodage".into()),
@@ -2720,6 +2886,38 @@ impl PlaybackOrchestrator {
     /// correctif restaient VERTES, la garde de site comprise, parce
     /// qu'aucune ne regardait le porteur réellement construit. Celle-ci le
     /// regarde.
+    /// #9178 — la piste sera-t-elle transcodée (`needs_transcode`) ou servie
+    /// telle quelle ? Le relais ne porte le crossfeed que dans le premier cas.
+    #[cfg(test)]
+    pub(super) async fn transcodage_decide_pour_test(
+        &self,
+        req: &PlayRequest,
+    ) -> Result<bool, String> {
+        let track_id = req.track_id.ok_or("no track_id for local playback")?;
+        let track = TrackRepo::with_backend(self.db.clone())
+            .get(track_id)
+            .map_err(|e| e.to_string())?
+            .ok_or("track not found")?;
+        let file_path = track.file_path.clone().ok_or("track has no file_path")?;
+        let fmt = track.format.clone().unwrap_or_else(|| "flac".into());
+        let source_format = AudioFormat::from_extension(&fmt);
+        let is_dsd_source = source_format == Some(AudioFormat::Dsd);
+        match self
+            .decider_la_lecture_locale(
+                req,
+                &track,
+                file_path,
+                fmt,
+                source_format,
+                is_dsd_source,
+                None,
+            )
+            .await?
+        {
+            DecisionOuResolu::Decision(d) => Ok(d.needs_transcode),
+            DecisionOuResolu::Resolu(_) => Ok(false),
+        }
+    }
     #[cfg(test)]
     pub(super) async fn relais_dsp_pour_test(
         &self,
@@ -2749,7 +2947,9 @@ impl PlaybackOrchestrator {
             DecisionOuResolu::Decision(d) => d,
             DecisionOuResolu::Resolu(_) => return Err("résolu sans transcodage".into()),
         };
-        let format = self.decider_le_format_de_sortie(req, &decision, None)?;
+        let format = self
+            .decider_le_format_de_sortie(req, &decision, None)
+            .await?;
         let dsp = self.load_streaming_dsp(
             req.zone_id,
             req.piste_rg(),
@@ -2772,7 +2972,7 @@ impl PlaybackOrchestrator {
     /// `bascule` (#8558) : la piste est trop lourde pour le bras fichier et le
     /// renderer accepte le WAV — cible WAV en session progressive, à la
     /// profondeur dite. `None` : la décision d'avant, inchangée.
-    fn decider_le_format_de_sortie(
+    async fn decider_le_format_de_sortie(
         &self,
         req: &PlayRequest,
         decision: &DecisionLocale,
@@ -2936,10 +3136,12 @@ impl PlaybackOrchestrator {
                 out_sr = cible;
             }
         }
-        if !decision.dsd_passthrough
-            && let Some(rate) =
-                crate::audio::frequence_fixe::cible(&self.db, req.zone_id, zone_max_sample_rate)?
-        {
+        let frequence_fixe = if decision.dsd_passthrough {
+            None
+        } else {
+            crate::audio::frequence_fixe::cible(&self.db, req.zone_id, zone_max_sample_rate)?
+        };
+        if let Some(rate) = frequence_fixe {
             // Un DSD hors famille (48 kHz sous DSD64) est décimé dans sa
             // famille puis rééchantillonné vers `rate` par le décodeur
             // (`dsd_to_pcm::cadence_de_decimation`) : le flux sort bien à `rate`.
@@ -2954,6 +3156,42 @@ impl PlaybackOrchestrator {
                 );
             }
             out_sr = rate;
+        }
+        let mut repli_pcm_exclusif = None;
+        // #8616 — le porteur PCM est produit à la cadence acceptée, pas seulement
+        // étiqueté autrement à l'ouverture WASAPI. Le chemin du signal reçoit
+        // cette même cadence via StreamInfo et la session de transcodage.
+        if local_needs_wav {
+            if let Some(cible) = self
+                .cadence_pcm_exclusive(
+                    req.output_device_id.as_deref(),
+                    out_sr,
+                    channels,
+                    zone_max_sample_rate,
+                    frequence_fixe.is_none(),
+                )
+                .await?
+            {
+                if let Some(refus) = crate::audio::bitperfect_strict::decision_bitperfect(
+                    out_sr,
+                    cible,
+                    crate::audio::bitperfect_strict::zone_enabled(&self.db, req.zone_id),
+                )
+                .refus()
+                {
+                    return Err(refus.sentinelle());
+                }
+                if cible != out_sr {
+                    info!(
+                        zone_id = req.zone_id,
+                        source_rate = out_sr,
+                        target_rate = cible,
+                        "wasapi_exclusive_cadence_refusee_repli_pcm"
+                    );
+                    repli_pcm_exclusif = Some((out_sr, cible));
+                    out_sr = cible;
+                }
+            }
         }
         let out_bd: u16 = if local_needs_wav {
             // Local output (cpal/WASAPI): always use 32-bit WAV.
@@ -3167,6 +3405,7 @@ impl PlaybackOrchestrator {
         );
 
         let info = StreamInfo {
+            repli_pcm_exclusif,
             format: out_ext.clone(),
             mime_type: out_mime.clone(),
             sample_rate: out_sr,
@@ -3575,7 +3814,9 @@ impl PlaybackOrchestrator {
         decision: &DecisionLocale,
     ) -> Result<FormatDeSortie, String> {
         use super::bascule_progressive_8558 as b;
-        let mut format = self.decider_le_format_de_sortie(req, decision, None)?;
+        let mut format = self
+            .decider_le_format_de_sortie(req, decision, None)
+            .await?;
         self.ajuster_m4a_au_sink(req, decision, &mut format).await?;
         if format.conteneur_natif || format.l16 || !format.use_file_transcode {
             return Ok(format);
@@ -3656,7 +3897,9 @@ impl PlaybackOrchestrator {
             profondeur = ?profondeur,
             "bras_fichier_trop_lourd_session_progressive_8558"
         );
-        let mut format = self.decider_le_format_de_sortie(req, decision, Some(profondeur))?;
+        let mut format = self
+            .decider_le_format_de_sortie(req, decision, Some(profondeur))
+            .await?;
         self.ajuster_m4a_au_sink(req, decision, &mut format).await?;
         Ok(format)
     }
@@ -4861,6 +5104,35 @@ impl PlaybackOrchestrator {
             // restent exclus par `sortie_tire_le_flux` : eux décodent déjà.
             let output_decodes_server_side =
                 !(is_network_output || is_browser_output || sortie_tire_le_flux);
+            // #9117 — le DSD servi tel quel (DSF/DFF vers un renderer qui
+            // annonce le DSD) n'est pas décodé « au fil des valeurs taguées »
+            // comme le PCM ci-dessous (`Some(sr)` vaudrait 2,8 MHz), mais il
+            // n'est plus laissé sans niveaux : la sonde du DoP et du DSD natif
+            // (#6456, #7775) le convertit en PCM à la cadence que choisit le
+            // convertisseur, freinée sur la lecture, pour les seules aiguilles.
+            // Le flux envoyé au renderer ne change pas.
+            if skip_passthrough_levels
+                && !output_decodes_server_side
+                && self.levels_attach_allowed(req.zone_id)
+                && let Some(ref bus) = self.event_bus
+            {
+                let play_seq = self.playback.current_play_seq(req.zone_id).await;
+                info!(
+                    zone_id = req.zone_id,
+                    play_seq,
+                    file = %file_path,
+                    "dsd_passthrough_niveaux_sonde"
+                );
+                spawn_local_file_levels_decode_depuis(
+                    bus.clone(),
+                    self.playback.clone(),
+                    req.zone_id,
+                    play_seq,
+                    file_path.clone(),
+                    0,
+                    0,
+                );
+            }
             if !skip_passthrough_levels
                 && !output_decodes_server_side
                 && self.levels_attach_allowed(req.zone_id)
@@ -5065,6 +5337,60 @@ pub(super) fn sonder_l_entete_dsd(file_path: &str) -> Option<(u32, u32)> {
     }
 }
 
+/// #9170 — retient ce qui part réellement pour la piste DSD de la zone
+/// (lu par les réglages, `dsd_transport`). Sans sortie nommée, rien.
+fn noter_transport_reel_dsd(req: &PlayRequest, transport: TransportReelDsd) {
+    if let Some(sortie) = req.output_device_id.as_deref() {
+        crate::outputs::capacite_dsd_natif::noter_transport_reel(req.zone_id, sortie, transport);
+    }
+}
+
+/// #8248 / #9170 (relecture #9211) — la sortie dont une piste NON DSD doit
+/// demander le sondage à l'ouverture : sortie locale jamais sondée, zone
+/// réglée « Natif » (`dsd_mode`, lu seulement si tout le reste le permet).
+pub(super) fn sortie_a_sonder_pour_une_piste_pcm<'a>(
+    is_local_output: bool,
+    source_format: Option<AudioFormat>,
+    output_device_id: Option<&'a str>,
+    dsd_mode: impl FnOnce() -> String,
+) -> Option<&'a str> {
+    if !is_local_output || source_format == Some(AudioFormat::Dsd) {
+        return None;
+    }
+    let nom = output_device_id?.strip_prefix("local:")?;
+    (crate::outputs::capacite_dsd_natif::connue(nom).is_none() && dsd_mode() == "native")
+        .then_some(nom)
+}
+
+/// #9170 — ce qu'un sondage DSD natif ALSA permet pour la piste qui se
+/// résout. Seul le pilote dit « pas de DSD » (`Sonde` sans cadence, jugé par
+/// `decider_dsd_natif_local`) ; un PCM logiciel ou un hôte non ALSA n'a pas
+/// de bras natif ; un périphérique introuvable (DAC débranché, pas encore
+/// énuméré, repli sur le défaut) ou occupé laisse la capacité INCONNUE : la
+/// piste part en DoP sans que rien ne soit retenu, et la suivante re-sonde.
+#[cfg(feature = "local-audio")]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(super) fn sortie_alsa_apres_sonde(
+    r: crate::outputs::local::ResultatSondeDsdAlsa,
+) -> SortieDsdLocale {
+    use crate::outputs::local::ResultatSondeDsdAlsa;
+    match r {
+        ResultatSondeDsdAlsa::Sonde { cadences, voies } => {
+            SortieDsdLocale::Alsa { cadences, voies }
+        }
+        ResultatSondeDsdAlsa::Occupe | ResultatSondeDsdAlsa::Introuvable => {
+            SortieDsdLocale::AlsaNonSondee
+        }
+        ResultatSondeDsdAlsa::PasUnPcmMateriel | ResultatSondeDsdAlsa::PcmLogiciel => {
+            SortieDsdLocale::NonAsio
+        }
+    }
+}
+
+#[cfg(all(test, feature = "local-audio"))]
+#[path = "dsd_natif_verdict_9170_tests.rs"]
+mod dsd_natif_verdict_9170_tests;
+
 #[cfg(test)]
 mod tranche_dop_tests_6456 {
     use super::{TrancheCue, duree_servie_du_dop, tranche_dop};
@@ -5187,6 +5513,18 @@ mod duree_relue_5975_tests;
 #[cfg(test)]
 #[path = "niveaux_du_dsd_natif_7775.rs"]
 mod niveaux_du_dsd_natif_7775;
+
+#[cfg(test)]
+pub(super) fn cadences_pcm_de_test()
+-> &'static std::sync::Mutex<std::collections::HashMap<String, Vec<u32>>> {
+    static T: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, Vec<u32>>>> =
+        std::sync::OnceLock::new();
+    T.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+#[path = "niveaux_dsd_passthrough_reseau_9117.rs"]
+mod niveaux_dsd_passthrough_reseau_9117;
 
 #[cfg(test)]
 #[path = "saut_local_8983_tests.rs"]

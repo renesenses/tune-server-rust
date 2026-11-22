@@ -147,6 +147,58 @@ fn main() {
         );
     }
 
+    // #9116, suite — l'arbre des dossiers : construit une fois, puis chaque
+    // niveau de la descente lu en mémoire. En regard, ce que la route d'avant
+    // payait par niveau : comptes des sous-dossiers + pistes directes (plage
+    // récursive), sans cache.
+    use tune_core::db::arbre_des_dossiers as ad;
+    let (arbre, t_froid) = ms(|| ad::construire(b.as_ref()).unwrap());
+    let t_constr = mediane(3, || ms(|| ad::construire(b.as_ref()).unwrap()).1);
+    println!(
+        "ARBRE : {} chemins, {} dossiers, {:.1} Mio ({:.1} octets/chemin), construit froid {t_froid:.0} ms, médiane {t_constr:.0} ms",
+        arbre.nb_chemins(),
+        arbre.nb_dossiers(),
+        arbre.octets() as f64 / 1_048_576.0,
+        arbre.octets() as f64 / arbre.nb_chemins() as f64
+    );
+    for dossier in [
+        racine.to_string(),
+        format!("{racine}/Artiste 2500"),
+        format!("{racine}/Artiste 2500/Album 3"),
+    ] {
+        let sep = std::path::MAIN_SEPARATOR.to_string();
+        let motif = tr::folder_like_pattern(&dossier);
+        let (bas, haut) = tr::bornes_du_dossier(&dossier);
+        let sql = tr::sql_pistes_du_dossier(Engine::Sqlite, dossier.chars().count() + 2);
+        let avant = || {
+            let c = tr::compter_pistes_par_sous_dossier(b.as_ref(), &dossier).unwrap();
+            let p = b
+                .query_many(&sql, &[&motif as &dyn ToSqlValue, &sep, &bas, &haut])
+                .unwrap();
+            (c.nb_dossiers_peuples(), p.len())
+        };
+        let t_avant = mediane(3, || ms(avant).1);
+        let apres = || {
+            let v = arbre.dossier(&dossier);
+            let ids = v.pistes_directes().to_vec();
+            let p = if ids.is_empty() {
+                0
+            } else {
+                let q = tr::sql_pistes_par_ids(Engine::Sqlite, ids.len());
+                let params: Vec<&dyn ToSqlValue> =
+                    ids.iter().map(|i| i as &dyn ToSqlValue).collect();
+                b.query_many(&q, &params).unwrap().len()
+            };
+            (v.nb_sous_dossiers(), p)
+        };
+        let t_apres = mediane(5, || ms(apres).1);
+        println!(
+            "NIVEAU {dossier} : avant {t_avant:.1} ms {:?}, arbre {t_apres:.3} ms {:?}",
+            avant(),
+            apres()
+        );
+    }
+
     // Les jauges d'avancement : ce que coûtait CHAQUE sondage (5 s) avec
     // toutes les passes en pause, et que la pause fige désormais.
     use tune_core::audio::replaygain as rg;

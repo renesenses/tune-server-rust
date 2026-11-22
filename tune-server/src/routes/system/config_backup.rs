@@ -64,6 +64,17 @@ fn snapshot_download(snapshot: &ConfigSnapshot) -> axum::response::Response {
         .into_response()
 }
 
+/// Sans authentification, un autre appareil du réseau passe `RequireAdmin` :
+/// les comptes Mozaiklabs liés (`cloud::est_reserve_a_qui_relie`) ne lui sont pas
+/// exportés.
+fn sans_comptes_lies(snapshot: &mut ConfigSnapshot, relie: crate::auth::ReliePourLesComptes) {
+    if !relie.0 {
+        snapshot
+            .settings
+            .retain(|(cle, _)| !crate::routes::cloud::est_reserve_a_qui_relie(cle));
+    }
+}
+
 // ── GET /system/config-backup/export ────────────────────────────────
 
 /// Export the server configuration as a JSON download, **without** streaming
@@ -76,6 +87,7 @@ fn snapshot_download(snapshot: &ConfigSnapshot) -> axum::response::Response {
 /// Tokens now need [`export_sealed`], which takes a passphrase.
 pub(super) async fn export(
     _admin: RequireAdmin,
+    relie: crate::auth::ReliePourLesComptes,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     if let Err(r) =
@@ -85,7 +97,10 @@ pub(super) async fn export(
     }
 
     match tune_core::config_backup::export_config(&state.backend) {
-        Ok(snapshot) => snapshot_download(&snapshot),
+        Ok(mut snapshot) => {
+            sans_comptes_lies(&mut snapshot, relie);
+            snapshot_download(&snapshot)
+        }
         Err(e) => {
             warn!(error = %e, "config_backup_export_failed");
             (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
@@ -108,6 +123,7 @@ pub(super) struct SealedExportRequest {
 /// that lands in access logs and browser history.
 pub(super) async fn export_sealed(
     _admin: RequireAdmin,
+    relie: crate::auth::ReliePourLesComptes,
     State(state): State<AppState>,
     Json(body): Json<SealedExportRequest>,
 ) -> impl IntoResponse {
@@ -125,7 +141,10 @@ pub(super) async fn export_sealed(
     }
 
     match tune_core::config_backup::export_config_sealed(&state.backend, &body.passphrase) {
-        Ok(snapshot) => snapshot_download(&snapshot),
+        Ok(mut snapshot) => {
+            sans_comptes_lies(&mut snapshot, relie);
+            snapshot_download(&snapshot)
+        }
         Err(e) => {
             warn!(error = %e, "config_backup_sealed_export_failed");
             (StatusCode::BAD_REQUEST, Json(json!({"error": e}))).into_response()

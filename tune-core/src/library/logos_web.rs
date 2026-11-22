@@ -1160,7 +1160,7 @@ impl CatalogueLogosWeb {
             let acceptable = crate::library::artwork::sniff_image_ext(&octets).is_some()
                 && dimensions(&octets).is_some_and(|(l, h)| image_de_site_acceptable(l, h));
             if !acceptable {
-                tracing::debug!(url = %url, "logo_label_site_image_ecartee");
+                tracing::debug!(url = %crate::confidentialite::masquer_url(&url), "logo_label_site_image_ecartee");
                 continue;
             }
             *self

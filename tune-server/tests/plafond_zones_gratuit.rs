@@ -50,7 +50,12 @@ const PHRASE_EN_DUR: &str = "Free tier is limited";
 /// Le plafond par défaut de `TuneConfig` est 3 — la valeur que la page
 /// tarifaire annonce.
 fn etat_gratuit() -> tune_server::state::AppState {
-    tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap()
+    let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    // La cible existe : ce témoin mesure le contrat suivant, pas une piste disparue.
+    state.backend.execute_batch(
+        "INSERT INTO tracks (id, title, file_path, source, duration_ms, format) VALUES (1, 'Piste synthétique 1', '/fixture-8832/1.flac', 'local', 300000, 'flac');"
+    ).expect("pistes synthétiques sans fichier audio");
+    state
 }
 
 /// Crée `n` zones en ligne. Elles naissent **dormantes** : découvertes sur le
@@ -280,6 +285,10 @@ async fn le_plafond_suit_la_configuration_partout() {
         ..Default::default()
     };
     let state = tune_server::state::AppState::new(":memory:", 0, config).unwrap();
+    // La cible existe : ce témoin mesure le contrat suivant, pas une piste disparue.
+    state.backend.execute_batch(
+        "INSERT INTO tracks (id, title, file_path, source, duration_ms, format) VALUES (1, 'Piste synthétique 1', '/fixture-8832/1.flac', 'local', 300000, 'flac');"
+    ).expect("pistes synthétiques sans fichier audio");
     let ids = zones_dormantes(&state, 2);
     activer(&state, ids[0]);
     let app = tune_server::routes::router(state);
@@ -543,6 +552,10 @@ async fn un_plafond_non_standard_traverse_aussi_le_statut_de_licence() {
         ..Default::default()
     };
     let state = tune_server::state::AppState::new(":memory:", 0, config).unwrap();
+    // La cible existe : ce témoin mesure le contrat suivant, pas une piste disparue.
+    state.backend.execute_batch(
+        "INSERT INTO tracks (id, title, file_path, source, duration_ms, format) VALUES (1, 'Piste synthétique 1', '/fixture-8832/1.flac', 'local', 300000, 'flac');"
+    ).expect("pistes synthétiques sans fichier audio");
     let ids = zones_dormantes(&state, 3);
     for id in &ids[..2] {
         activer(&state, *id);

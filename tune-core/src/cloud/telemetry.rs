@@ -113,10 +113,22 @@ struct HeartbeatPayload {
     albums_with_bio: i64,
     os: String,
     arch: String,
+    /// Systeme PRECIS (« Ubuntu 24.04.1 LTS », « Windows 11 23H2 »,
+    /// « macOS 15.4 ») — voir [`super::plateforme`]. Rien d'identifiant.
+    os_version: Option<String>,
+    /// `docker`, `tune-os`, `homebrew`, `windows-installer`, `macos-app`,
+    /// `ios-app`, `android-app`, `package` ou `other`.
+    install_kind: &'static str,
+    /// Modele de la carte sous Linux ARM (« Raspberry Pi 5 Model B Rev 1.0 »),
+    /// `null` ailleurs.
+    device_model: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tune_tested: Option<super::tune_tested_auto::Contribution>,
 }
 
+/// `detection` rend la plateforme ([`super::plateforme::plateforme`] en
+/// production). Elle n'est appelée qu'APRÈS le consentement : en cas de
+/// refus, aucun fichier n'est lu et, sous Windows, aucun `reg.exe` ne part.
 fn charge_utile(
     settings: &SettingsRepo,
     services: Vec<String>,
@@ -124,10 +136,12 @@ fn charge_utile(
     artists_with_bio: i64,
     albums_with_bio: i64,
     web_dir: &std::path::Path,
+    detection: impl FnOnce() -> &'static super::plateforme::Plateforme,
 ) -> Option<HeartbeatPayload> {
     if !TelemetryReporter::is_enabled_for(settings) {
         return None;
     }
+    let plateforme = detection();
     Some(HeartbeatPayload {
         server_id: super::tune_tested_auto::pseudonyme_serveur(
             &TelemetryReporter::get_or_create_server_id(settings),
@@ -140,6 +154,9 @@ fn charge_utile(
         albums_with_bio,
         os: std::env::consts::OS.to_string(),
         arch: std::env::consts::ARCH.to_string(),
+        os_version: plateforme.os_version.clone(),
+        install_kind: plateforme.install_kind,
+        device_model: plateforme.device_model.clone(),
         tune_tested: super::tune_tested_auto::contribution(settings),
     })
 }
@@ -247,6 +264,11 @@ impl TelemetryReporter {
             .count_with_bio()
             .unwrap_or(0);
 
+        // Systeme precis, mode d'installation et modele de carte : calcules
+        // paresseusement, une seule fois (`OnceLock`), hors de l'executeur
+        // (sous Windows, `reg.exe`) — et seulement ici, APRES la garde de
+        // consentement du debut de `send`.
+        let _ = tokio::task::spawn_blocking(super::plateforme::plateforme).await;
         let Some(payload) = charge_utile(
             &settings,
             connected_services,
@@ -254,6 +276,7 @@ impl TelemetryReporter {
             artists_with_bio,
             albums_with_bio,
             web_dir,
+            super::plateforme::plateforme,
         ) else {
             return;
         };
@@ -343,7 +366,16 @@ mod tests {
         settings.set("server_id", brut).unwrap();
         settings.set(TELEMETRY_SETTING_KEY, "true").unwrap();
         let web_dir = tempfile::tempdir().unwrap();
-        let payload = charge_utile(&settings, Vec::new(), 0, 0, 0, web_dir.path()).unwrap();
+        let payload = charge_utile(
+            &settings,
+            Vec::new(),
+            0,
+            0,
+            0,
+            web_dir.path(),
+            super::super::plateforme::plateforme,
+        )
+        .unwrap();
         let json = serde_json::to_value(payload).unwrap();
         assert_eq!(
             json["server_id"],
@@ -353,11 +385,56 @@ mod tests {
             !json.to_string().contains(brut),
             "le battement ne doit jamais exporter l'identité brute"
         );
+        // Systeme precis : les trois champs partent, figes sur la detection
+        // du demarrage.
+        let p = super::super::plateforme::plateforme();
+        assert_eq!(json["install_kind"], p.install_kind);
+        assert_eq!(json["os_version"], serde_json::json!(p.os_version));
+        assert_eq!(json["device_model"], serde_json::json!(p.device_model));
+        assert!(json.get("hostname").is_none());
         settings.set(TELEMETRY_SETTING_KEY, "false").unwrap();
         assert!(
-            charge_utile(&settings, Vec::new(), 0, 0, 0, web_dir.path()).is_none(),
+            charge_utile(
+                &settings,
+                Vec::new(),
+                0,
+                0,
+                0,
+                web_dir.path(),
+                super::super::plateforme::plateforme
+            )
+            .is_none(),
             "refus : aucune charge utile"
         );
+    }
+
+    /// Refus de la telemetrie : la detection de la plateforme n'est JAMAIS
+    /// appelee (aucun fichier lu, aucun `reg.exe`). Contre-epreuve : une fois
+    /// la telemetrie acceptee, elle l'est exactement une fois.
+    #[test]
+    fn refus_aucune_detection_de_plateforme() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let settings = SettingsRepo::with_backend(fresh_db());
+        let web_dir = tempfile::tempdir().unwrap();
+        let appels = AtomicUsize::new(0);
+        let detection = || {
+            appels.fetch_add(1, Ordering::SeqCst);
+            super::super::plateforme::plateforme()
+        };
+
+        settings.set(TELEMETRY_SETTING_KEY, "false").unwrap();
+        assert!(charge_utile(&settings, Vec::new(), 0, 0, 0, web_dir.path(), detection).is_none());
+        assert_eq!(appels.load(Ordering::SeqCst), 0, "refus : aucune detection");
+
+        settings.set(TELEMETRY_SETTING_KEY, "true").unwrap();
+        // `TUNE_TELEMETRY=false` dans l'environnement du test refuserait aussi :
+        // la contre-epreuve n'a de sens que si l'exploitant n'a rien coupe.
+        if TelemetryReporter::is_enabled() {
+            assert!(
+                charge_utile(&settings, Vec::new(), 0, 0, 0, web_dir.path(), detection).is_some()
+            );
+            assert_eq!(appels.load(Ordering::SeqCst), 1, "acceptee : une detection");
+        }
     }
 
     #[test]

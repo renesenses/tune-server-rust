@@ -621,3 +621,56 @@ fn les_lignes_d_un_cd_a_rejuger_sont_remesurees_9067() {
         ("conforme".into(), Some("coupure_sans_mur".into()))
     );
 }
+
+/// #9067 (décision du 19/11 après #9139) — la borne haute du mur de codec d'un
+/// CD passe de 20,5 à 20 kHz. Une ligne CD rangée `mur_de_codec` par #9139
+/// avec un mur entre 20,0 et 20,5 kHz est REMESURÉE une fois et devient
+/// conforme ; un mur de codec à 19,5 kHz reste tel quel (pas candidat).
+#[test]
+fn un_mur_de_codec_range_entre_20_et_20_5_khz_est_remesure_9067() {
+    let db = base();
+    for id in 1..=2 {
+        piste(&db, id, &format!("/m/b/{id}.flac"), "flac", "local");
+    }
+    for (id, coupure) in [(1i64, 20_250.0f64), (2, 19_500.0)] {
+        db.execute(
+            "INSERT INTO hires_verifications (track_id, verdict, raison, coupure_hz, sample_rate, bits_declares) \
+             VALUES (?1, 'douteux', 'mur_de_codec', ?2, 44100, 16)",
+            &[&id as &dyn ToSqlValue, &coupure],
+        )
+        .unwrap();
+    }
+    let ids: Vec<i64> = prochains_candidats(&db, 20)
+        .iter()
+        .map(|c| c.track_id)
+        .collect();
+    assert_eq!(ids, vec![1], "seul le mur à 20,25 kHz est à rejuger");
+    let mur = Mesure {
+        sample_rate: 44_100,
+        bits_declares: 16,
+        bits_effectifs: Some(16),
+        coupure_hz: Some(20_250.0),
+        fenetres_jugees: 4,
+        fenetres_coupees: vec![
+            crate::audio::faux_hires::FenetreCoupee {
+                debut_s: 0.0,
+                fin_s: 1.0,
+                coupure_hz: 20_250.0,
+            };
+            4
+        ],
+        coupure_en_mur: true,
+        ..Default::default()
+    };
+    enregistrer(&db, 1, &Ok(mur)).unwrap();
+    assert_eq!(compter_les_candidats(&db), 0);
+    let r = db
+        .query_one(
+            "SELECT verdict, raison FROM hires_verifications WHERE track_id = 1",
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(r[0].as_string().as_deref(), Some("conforme"));
+    assert_eq!(r[1].as_string().as_deref(), Some("coupure_sans_mur"));
+}

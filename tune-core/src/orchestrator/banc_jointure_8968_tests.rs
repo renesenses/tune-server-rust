@@ -781,22 +781,18 @@ fn banc_8968_aac_elst_decodage_complet() {
     paire_decodage_complet("m4a-elst", SEUIL_AVEC_PERTE, Attendu::SansBlanc);
 }
 
-/// Opus : contrairement à ce que supposait l'étude de #8968, le décodeur de
-/// Tune (`decode_opus_to_pcm`, libopus) n'applique NI le pre-skip de
-/// `OpusHead` (312 trames d'amorce rendues) NI la granule de la dernière page
-/// (le remplissage du dernier paquet de 960 rendu). Mesuré par ce banc ; le
-/// correctif n'est dans aucune des PR 1 et 2 de #8968.
-const OPUS_PRE_SKIP: &str =
-    "Opus : pre-skip et granule de fin non appliqués (hors PR 1 et 2 de #8968)";
-
+/// Opus : le décodeur de Tune (`decode_opus_to_pcm`, libopus) applique le
+/// pre-skip de `OpusHead` (312 trames d'amorce) et la granule de la dernière
+/// page (le remplissage du dernier paquet de 960) depuis #8982 ; avant, ce
+/// banc mesurait +533 à +1 264 trames de trop et 312 de décalage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn banc_8968_opus_piste_a_piste() {
-    paire_piste_a_piste("opus", SEUIL_AVEC_PERTE, Attendu::EchecConnu(OPUS_PRE_SKIP)).await;
+    paire_piste_a_piste("opus", SEUIL_AVEC_PERTE, Attendu::SansBlanc).await;
 }
 
 #[test]
 fn banc_8968_opus_decodage_complet() {
-    paire_decodage_complet("opus", SEUIL_AVEC_PERTE, Attendu::EchecConnu(OPUS_PRE_SKIP));
+    paire_decodage_complet("opus", SEUIL_AVEC_PERTE, Attendu::SansBlanc);
 }
 
 #[test]

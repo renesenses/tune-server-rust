@@ -1,4 +1,7 @@
-use axum::extract::{Path, Query, State};
+use axum::extract::{FromRequestParts, Path, Query, State};
+use axum::http::StatusCode;
+use axum::http::request::Parts;
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -8,7 +11,104 @@ use tune_http_types::panne_sql::OuDefautJournalise;
 use tune_core::db::history_repo::HistoryRepo;
 use tune_core::db::track_repo::TrackRepo;
 
+use crate::routes::active_profile::ActiveProfile;
 use crate::state::AppState;
+
+/// L'appelant peut-il regarder l'historique de TOUT le foyer, ou d'un autre
+/// profil que le sien ? Authentification active : l'administrateur seulement.
+/// Coupée : tout appelant — `X-Profile-Id` y est la seule identité (voir
+/// `ActiveProfile`) : refuser un autre profil n'y protégerait rien et
+/// changerait les statistiques de tous les foyers sans compte.
+///
+/// Une VUE (statistiques, carte de chaleur, historique d'un profil nommé).
+/// Effacer tout le foyer demande davantage : [`FoyerEntierEffacable`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct VueDuFoyer(pub bool);
+
+impl FromRequestParts<AppState> for VueDuFoyer {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(
+            <crate::auth::RequireAdmin as FromRequestParts<AppState>>::from_request_parts(
+                parts, state,
+            )
+            .await
+            .is_ok(),
+        ))
+    }
+}
+
+/// Effacer l'historique de TOUT le foyer : l'administrateur (authentification
+/// active) ou un appel de cette machine (authentification coupée) — la garde
+/// des actions d'administration — et JAMAIS une requête relayée, même d'un
+/// administrateur.
+#[derive(Debug, Clone, Copy)]
+struct FoyerEntierEffacable(bool);
+
+impl FromRequestParts<AppState> for FoyerEntierEffacable {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if crate::garde_du_relais::requete_relayee(&parts.headers) {
+            return Ok(Self(false));
+        }
+        Ok(Self(
+            crate::auth::admin_ou_cette_machine(parts, state).await,
+        ))
+    }
+}
+
+/// Le refus d'une vue sur un autre profil que celui de l'appelant.
+pub(crate) fn refus_autre_profil() -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "error": "profile_forbidden",
+            "code": "profile_forbidden",
+            "message": "Only an administrator can view another profile's history.",
+        })),
+    )
+        .into_response()
+}
+
+/// Le profil dont une vue d'historique rend les écoutes : `None` = tout le
+/// foyer, sinon `(profil, communes)`. Un profil demandé autre que le sien
+/// n'est servi qu'à [`VueDuFoyer`] (`Err` sinon), en égalité stricte (la vue
+/// « statistiques de ce profil ») ; sans demande, le foyer pour
+/// [`VueDuFoyer`], et pour les autres leur profil AVEC les écoutes sans
+/// profil — exactement ce que montre leur liste.
+pub(crate) fn profil_de_la_vue(
+    demande: Option<i64>,
+    moi: i64,
+    foyer: bool,
+) -> Result<Option<(i64, bool)>, ()> {
+    match demande {
+        Some(p) if p == moi || foyer => Ok(Some((p, false))),
+        Some(_) => Err(()),
+        None if foyer => Ok(None),
+        None => Ok(Some((moi, true))),
+    }
+}
+
+/// Le profil d'un classement (`top-*`) : le foyer pour [`VueDuFoyer`], le
+/// profil de l'appelant (avec les écoutes sans profil) pour les autres.
+pub(crate) fn profil_du_classement(moi: i64, foyer: bool) -> Option<i64> {
+    (!foyer).then_some(moi)
+}
+
+#[derive(Deserialize)]
+struct ClearParams {
+    /// `household` : tout le foyer ([`FoyerEntierEffacable`]). Absent : le
+    /// profil de l'appelant.
+    scope: Option<String>,
+}
 
 #[derive(Deserialize)]
 struct HistoryParams {
@@ -32,6 +132,7 @@ struct SlotParams {
     weekday: i64,
     hour: i64,
     limit: Option<i64>,
+    profile_id: Option<i64>,
 }
 
 pub fn router() -> Router<AppState> {
@@ -64,32 +165,53 @@ async fn track_plays(State(state): State<AppState>, Path(id): Path<i64>) -> Json
 }
 
 /// Tracks listened during one weekday×hour heatmap cell (drill-down).
-async fn slot_tracks(State(state): State<AppState>, Query(p): Query<SlotParams>) -> Json<Value> {
+/// Même portée que le tableau de bord ([`profil_de_la_vue`]).
+async fn slot_tracks(
+    State(state): State<AppState>,
+    ActiveProfile(moi): ActiveProfile,
+    VueDuFoyer(foyer): VueDuFoyer,
+    Query(p): Query<SlotParams>,
+) -> Response {
+    let Ok(profil) = profil_de_la_vue(p.profile_id, moi, foyer) else {
+        return refus_autre_profil();
+    };
     let period = p.period.as_deref().unwrap_or("30d");
     let limit = p.limit.unwrap_or(50).clamp(1, 500);
     let repo = HistoryRepo::with_backend(state.backend.clone());
-    match repo.history_at_slot(period, p.weekday, p.hour, limit) {
+    let (profil, communes) = match profil {
+        Some((p, c)) => (Some(p), c),
+        None => (None, false),
+    };
+    match repo.history_at_slot(period, p.weekday, p.hour, limit, profil, communes) {
         Ok(items) => Json(json!({
             "weekday": p.weekday,
             "hour": p.hour,
             "period": period,
             "tracks": items,
-        })),
+        }))
+        .into_response(),
         Err(e) => {
             tracing::warn!(error = %e, weekday = p.weekday, hour = p.hour, "history_slot_failed");
             Json(json!({ "weekday": p.weekday, "hour": p.hour, "period": period, "tracks": [] }))
+                .into_response()
         }
     }
 }
 
+/// L'historique du profil de l'appelant (`ActiveProfile`) : ses écoutes et
+/// celles sans profil, jamais celles d'un autre profil. Un administrateur
+/// regarde un autre profil en le désignant (`X-Profile-Id`).
 async fn recent_history(
     State(state): State<AppState>,
+    ActiveProfile(moi): ActiveProfile,
     Query(p): Query<HistoryParams>,
 ) -> Json<Value> {
     let limit = p.limit.unwrap_or(50);
     let offset = p.offset.unwrap_or(0);
     let repo = HistoryRepo::with_backend(state.backend.clone());
-    let (items, total) = repo.recent_paginated(limit, offset).unwrap_or_default();
+    let (items, total) = repo
+        .recent_paginated_du_profil(limit, offset, moi)
+        .unwrap_or_default();
     let ids: Vec<i64> = items.iter().filter_map(|item| item.id).collect();
     let names = repo.playlist_context_names(&ids).ou_defaut_journalise();
     // #7769 — le nombre d'écoutes, compté comme la Bibliothèque. Si la base
@@ -144,22 +266,82 @@ async fn recent_history(
     }))
 }
 
-async fn clear_history(State(state): State<AppState>) -> Json<Value> {
+/// Efface l'historique du profil de l'appelant : ses écoutes, et celles sans
+/// profil (ce que montre aussi sa liste) seulement pour [`VueDuFoyer`] — un
+/// compte standard n'efface pas l'historique commun. `?scope=household` efface tout le foyer :
+/// [`FoyerEntierEffacable`] seulement, 403 sinon (jamais de repli silencieux
+/// sur le profil, l'appelant a demandé autre chose).
+async fn clear_history(
+    State(state): State<AppState>,
+    ActiveProfile(moi): ActiveProfile,
+    FoyerEntierEffacable(foyer_permis): FoyerEntierEffacable,
+    VueDuFoyer(communes_permises): VueDuFoyer,
+    entetes: axum::http::HeaderMap,
+    Query(q): Query<ClearParams>,
+) -> Response {
+    // Jamais par le relais (déjà hors de `chemin_relayable`) : par lui,
+    // `X-Profile-Id` permettrait de vider un profil après l'autre.
+    if crate::garde_du_relais::requete_relayee(&entetes) {
+        tracing::warn!(profil = moi, "effacement_de_l_historique_relaye_refuse");
+        return (
+            StatusCode::FORBIDDEN,
+            Json(json!({
+                "error": "not_local",
+                "code": "not_local",
+                "message": "Listening history cannot be cleared over remote access.",
+            })),
+        )
+            .into_response();
+    }
     let repo = HistoryRepo::with_backend(state.backend.clone());
-    match repo.clear() {
-        Ok(()) => Json(json!({ "status": "ok" })),
+    let foyer = match q.scope.as_deref() {
+        None | Some("") | Some("profile") => false,
+        Some("household") if foyer_permis => true,
+        Some("household") => {
+            tracing::warn!(profil = moi, "effacement_de_l_historique_du_foyer_refuse");
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "admin_required",
+                    "code": "admin_required",
+                    "message": "Only an administrator, on this machine or signed in, can clear the whole household history.",
+                })),
+            )
+                .into_response();
+        }
+        Some(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": "invalid_scope" })),
+            )
+                .into_response();
+        }
+    };
+    let resultat = if foyer {
+        repo.clear()
+    } else {
+        repo.clear_du_profil(moi, communes_permises)
+    };
+    let scope = if foyer { "household" } else { "profile" };
+    match resultat {
+        Ok(()) => Json(json!({ "status": "ok", "scope": scope })).into_response(),
         Err(e) => {
-            tracing::error!(error = %e, "clear_history_failed");
-            Json(json!({ "status": "error", "detail": e }))
+            tracing::error!(error = %e, scope, "clear_history_failed");
+            Json(json!({ "status": "error", "detail": e })).into_response()
         }
     }
 }
 
-async fn top_albums(State(state): State<AppState>, Query(p): Query<HistoryParams>) -> Json<Value> {
+async fn top_albums(
+    State(state): State<AppState>,
+    ActiveProfile(moi): ActiveProfile,
+    VueDuFoyer(foyer): VueDuFoyer,
+    Query(p): Query<HistoryParams>,
+) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
     let repo = HistoryRepo::with_backend(state.backend.clone());
     let items: Vec<Value> = repo
-        .top_albums(limit)
+        .top_albums_du_profil(limit, profil_du_classement(moi, foyer))
         .unwrap_or_default()
         .into_iter()
         .map(|(title, artist, plays)| {
@@ -169,15 +351,34 @@ async fn top_albums(State(state): State<AppState>, Query(p): Query<HistoryParams
     Json(json!(items))
 }
 
-async fn top_tracks(State(state): State<AppState>, Query(p): Query<HistoryParams>) -> Json<Value> {
+async fn top_tracks(
+    State(state): State<AppState>,
+    ActiveProfile(moi): ActiveProfile,
+    VueDuFoyer(foyer): VueDuFoyer,
+    Query(p): Query<HistoryParams>,
+) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
     let repo = HistoryRepo::with_backend(state.backend.clone());
-    let items = repo.top_tracks(limit).unwrap_or_default();
+    let items = repo
+        .top_tracks_du_profil(limit, profil_du_classement(moi, foyer))
+        .unwrap_or_default();
     Json(json!(items))
 }
 
-async fn top_artists(State(state): State<AppState>, Query(p): Query<HistoryParams>) -> Json<Value> {
+async fn top_artists(
+    State(state): State<AppState>,
+    ActiveProfile(moi): ActiveProfile,
+    VueDuFoyer(foyer): VueDuFoyer,
+    Query(p): Query<HistoryParams>,
+) -> Json<Value> {
     let limit = p.limit.unwrap_or(20);
+    let du_profil = match profil_du_classement(moi, foyer) {
+        Some(p) => format!(
+            " AND {}",
+            tune_core::db::history_repo::filtre_de_profil("", p, true)
+        ),
+        None => String::new(),
+    };
     let engine = state.backend.engine();
     let p1 = if engine == tune_core::db::engine::Engine::Postgres {
         "$1"
@@ -210,7 +411,7 @@ async fn top_artists(State(state): State<AppState>, Query(p): Query<HistoryParam
          FROM (SELECT LOWER(artist_name) AS cle, MIN(artist_name) AS artist_name, \
                       COUNT(*) AS plays \
                FROM listen_history \
-               WHERE artist_name IS NOT NULL AND {d_artiste} \
+               WHERE artist_name IS NOT NULL AND {d_artiste}{du_profil} \
                GROUP BY LOWER(artist_name) \
                ORDER BY plays DESC, cle \
                LIMIT {p1}) h \
@@ -450,28 +651,39 @@ mod images_d_artistes_de_service {
     }
 }
 
-// View scope, NOT action identity: this handler reads the profile from the
-// explicit `?profile_id=` query param and deliberately does NOT use the
-// `ActiveProfile` extractor. A present param means "this profile's stats"
-// (strict, NULL rows excluded in full_dashboard); an absent param means "the
-// household total" (all rows, NULL included). Adding a header fallback here
-// would flip that default to per-profile the moment api.ts starts sending
-// X-Profile-Id on every request. See ActiveProfile's convention doc.
-async fn dashboard(State(state): State<AppState>, Query(p): Query<DashboardParams>) -> Json<Value> {
+// View scope: `?profile_id=` means "this profile's stats" (strict, NULL rows
+// excluded in full_dashboard); an absent param means "the household total"
+// (all rows, NULL included) — but only for a caller who may see the household
+// ([`VueDuFoyer`]: admin with auth on, anyone with auth off). Any other caller
+// gets their own profile (`ActiveProfile`), and naming another profile is a
+// 403 (`profil_de_la_vue`).
+async fn dashboard(
+    State(state): State<AppState>,
+    ActiveProfile(moi): ActiveProfile,
+    VueDuFoyer(foyer): VueDuFoyer,
+    Query(p): Query<DashboardParams>,
+) -> Response {
+    let Ok(profile_id) = profil_de_la_vue(p.profile_id, moi, foyer) else {
+        return refus_autre_profil();
+    };
     let period = p.period.as_deref().unwrap_or("30d");
     let top_n = p.top_n.unwrap_or(10);
     let repo = HistoryRepo::with_backend(state.backend.clone());
     // #7634 — une quinzaine d'agrégats synchrones sur l'historique : hors de
     // l'exécuteur async, pour ne pas immobiliser un fil de travail pendant
     // tout le calcul (les autres requêtes de la page attendaient derrière).
-    let (periode, zone_id, profile_id) = (period.to_string(), p.zone_id, p.profile_id);
+    let (periode, zone_id) = (period.to_string(), p.zone_id);
+    let (profile_id, communes) = match profile_id {
+        Some((p, c)) => (Some(p), c),
+        None => (None, false),
+    };
     let calcul = tokio::task::spawn_blocking(move || {
-        repo.full_dashboard(&periode, zone_id, profile_id, top_n)
+        repo.full_dashboard_avec_communes(&periode, zone_id, profile_id, top_n, communes)
     })
     .await
     .unwrap_or_else(|e| Err(format!("full_dashboard interrompu : {e}")));
     match calcul {
-        Ok(data) => Json(json!(data)),
+        Ok(data) => Json(json!(data)).into_response(),
         Err(e) => {
             tracing::error!(error = %e, period, "full_dashboard_failed");
             Json(json!({
@@ -487,17 +699,22 @@ async fn dashboard(State(state): State<AppState>, Query(p): Query<DashboardParam
                 "by_source": [],
                 "completion": { "completed": 0, "skipped": 0, "avg_listened_ms": 0, "avg_track_duration_ms": 0 }
             }))
+            .into_response()
         }
     }
 }
 
+/// L'export CSV de l'historique du profil de l'appelant, comme la liste.
 async fn export_csv(
     State(state): State<AppState>,
+    ActiveProfile(moi): ActiveProfile,
     Query(p): Query<HistoryParams>,
 ) -> impl axum::response::IntoResponse {
     let limit = p.limit.unwrap_or(10000);
     let repo = HistoryRepo::with_backend(state.backend.clone());
-    let (items, _) = repo.recent_paginated(limit, 0).unwrap_or_default();
+    let (items, _) = repo
+        .recent_paginated_du_profil(limit, 0, moi)
+        .unwrap_or_default();
 
     let mut csv = String::from("title,artist,album,source,duration_ms,listened_at,zone_id\n");
     for item in &items {
@@ -527,6 +744,10 @@ async fn export_csv(
 }
 
 #[cfg(test)]
+#[path = "historique_par_profil_tests.rs"]
+mod historique_par_profil_tests;
+
+#[cfg(test)]
 #[path = "historique_album_de_service_7778_tests.rs"]
 mod historique_album_de_service_7778_tests;
 
@@ -551,6 +772,7 @@ mod historique_4041_tests {
         ).unwrap();
         let Json(body) = recent_history(
             State(state),
+            ActiveProfile(1),
             Query(HistoryParams {
                 limit: Some(20),
                 offset: Some(0),

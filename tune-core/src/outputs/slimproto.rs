@@ -176,7 +176,7 @@ impl OutputTarget for SlimProtoOutput {
             tracing::warn!(
                 device_id = %self.device_id,
                 mime = media.mime_type,
-                url = media.url,
+                url = %crate::confidentialite::masquer_url(&media.url),
                 %motif,
                 "slimproto_flux_refuse"
             );

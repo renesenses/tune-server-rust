@@ -1818,7 +1818,9 @@ fn selectionner_lignes(
 #[cfg(feature = "assistant-ia")]
 pub(crate) async fn journal_pour_assistant(max_lines: usize) -> Vec<String> {
     let Json(mut journaux) = collect_recent_logs(max_lines).await;
-    tune_core::confidentialite::anonymiser_json(&mut journaux);
+    // #9140 — sans la passe des noms d'appareils : le greffon les pseudonymise
+    // lui-même et les rétablit à l'écran.
+    tune_core::confidentialite::anonymiser_json_garder_appareils(&mut journaux);
     journaux["logs"]
         .as_str()
         .unwrap_or("")
@@ -1827,9 +1829,11 @@ pub(crate) async fn journal_pour_assistant(max_lines: usize) -> Vec<String> {
         .collect()
 }
 
-pub(super) async fn logs(Query(q): Query<LogsQuery>) -> Json<Value> {
+pub(super) async fn logs(State(state): State<AppState>, Query(q): Query<LogsQuery>) -> Json<Value> {
     // #5124 — « Exporter les journaux » : le fichier finit collé dans un fil.
     // Même nettoyage que le rapport de bogue, par la même fonction.
+    // #9140 — les noms d'appareils et de zones d'abord retenus.
+    state.retenir_noms_d_appareils().await;
     let Json(mut journaux) = collect_recent_logs(q.lines.unwrap_or(1000)).await;
     tune_core::confidentialite::anonymiser_json(&mut journaux);
     Json(journaux)
@@ -1921,9 +1925,31 @@ async fn collect_recent_logs_brut(max_lines: usize) -> Json<Value> {
     let log_path = crate::config::default_log_file_path()
         .to_string_lossy()
         .into_owned();
+    collect_recent_logs_depuis(
+        max_lines,
+        log_path,
+        crate::config::refus_du_journal_au_demarrage(),
+    )
+    .await
+}
+
+/// [`collect_recent_logs_brut`], chemin du journal et refus du démarrage
+/// passés — ce que le test de #9118 éprouve.
+///
+/// #9118 — quand le démarrage n'a pu ouvrir AUCUN fichier de journal
+/// (`refus_au_demarrage`), le fichier n'est plus relu : chaque export levait
+/// un `WARN log_export_fichier_illisible_replis_tentes … Permission denied`
+/// sur un chemin déjà refusé, et l'anonymisation du rapport (`/home/x` →
+/// `~`) le faisait lire comme un `~` non développé. On va droit aux replis ;
+/// si eux aussi échouent, la réponse dit le refus du démarrage.
+async fn collect_recent_logs_depuis(
+    max_lines: usize,
+    log_path: String,
+    refus_au_demarrage: Option<String>,
+) -> Json<Value> {
     // #6866 — l'erreur d'un fichier présent mais illisible, gardée pour la fin :
     // elle ne dispense plus des replis.
-    let mut fichier_illisible: Option<String> = None;
+    let mut fichier_illisible: Option<String> = refus_au_demarrage;
 
     // Read only a bounded tail, off the async runtime. Reading the whole file
     // with read_to_string both blocked a Tokio worker (same trap as
@@ -1931,7 +1957,7 @@ async fn collect_recent_logs_brut(max_lines: usize) -> Json<Value> {
     // file had grown large — and that failure fell through to the misleading
     // "No log file found" fallback, exporting an empty log (Yacine, DS418j
     // 1 GB RAM).
-    {
+    if fichier_illisible.is_none() {
         let path = log_path.clone();
         // On lit CANDIDATE_FACTOR fois plus de lignes que demandé, puis on
         // sélectionne : rebalancer suppose d'avoir le choix, et prendre
@@ -2373,9 +2399,12 @@ pub(crate) fn releve_portraits_d_artistes(
     cache_dir: &std::path::Path,
 ) -> Option<PortraitsDArtistes> {
     let lignes = backend
+        // #9265 — les portraits des artistes de la GRILLE.
         .query_many(
-            "SELECT image_path, image_source FROM artists \
-             WHERE id IN (SELECT DISTINCT artist_id FROM albums WHERE artist_id IS NOT NULL)",
+            &format!(
+                "SELECT image_path, image_source FROM artists WHERE {}",
+                tune_core::db::artist_repo::PREDICAT_ARTISTES_DE_LA_GRILLE
+            ),
             &[],
         )
         .ok()?;
@@ -2529,6 +2558,8 @@ fn lignes_zones_masquees(
 /// Generate a bug report with comprehensive diagnostic data.
 /// Returns JSON that can also be rendered as markdown by the client.
 pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<Value> {
+    // #9140 — les noms d'appareils et de zones sortent sous un jeton stable.
+    state.retenir_noms_d_appareils().await;
     tune_core::confidentialite::retenir_identifiants_du_serveur(&SettingsRepo::with_backend(
         state.backend.clone(),
     ));
@@ -2677,6 +2708,14 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
             .collect()
     };
 
+    // #8944 — l'état des exécutables livrés (date, taille, empreinte), lu
+    // hors du fil asynchrone : il lit et hache chaque fichier de 64 Mio au
+    // plus (cinq au pire, `executables_livres::EMPREINTE_MAX_OCTETS`).
+    let (executables_livres, demon_lance) =
+        tokio::task::spawn_blocking(super::executables_livres::relever_l_installation)
+            .await
+            .unwrap_or_default();
+
     // Build markdown text
     let ring_starvation = releve_famine_anneau(&state).await;
     let dsp_egaliseur = releve_dsp_egaliseur(&state).await;
@@ -2724,6 +2763,15 @@ pub(super) async fn generate_bug_report(State(state): State<AppState>) -> Json<V
         asio_warm_scan.state, asio_warm_scan.message
     ));
     md.push('\n');
+
+    // #8944 — un démon AirPlay 2 resté à sa première version se voit ici,
+    // sans le déduire de la forme d'un message d'erreur (fil 2878).
+    if !executables_livres.is_empty() {
+        md.push_str(&super::executables_livres::section_markdown(
+            &executables_livres,
+            demon_lance.as_ref(),
+        ));
+    }
 
     md.push_str("## Library\n");
     md.push_str(&format!("- Tracks: {tracks}\n"));
@@ -3229,6 +3277,11 @@ jamais par bloc. Les echantillons ne sont pas modifies par le comptage)\n\n",
         },
         "zone_settings_ignored": zone_settings_ignored,
         "asio_warm_scan": asio_warm_scan,
+        // #8944 — le pendant JSON de la section « Bundled executables ».
+        "bundled_executables": super::executables_livres::json(
+            &executables_livres,
+            demon_lance.as_ref(),
+        ),
         "streaming_services": service_status,
         "network": {
             "discovered_devices": devices.len(),
@@ -3554,6 +3607,13 @@ pub(super) async fn submit_bug_report(
     use axum::RequestExt;
     use axum::response::IntoResponse;
 
+    // Le rapport porte l'identité du compte (jeton, clé de licence) seulement
+    // pour l'administrateur, ou depuis cette machine sans authentification.
+    // Ailleurs, il part sans identité, comme sur un serveur non relié.
+    let (mut parts, corps_brut) = req.into_parts();
+    let au_nom_du_compte = crate::auth::admin_ou_cette_machine(&mut parts, &state).await;
+    let req = axum::extract::Request::from_parts(parts, corps_brut);
+
     // #7468 — le navigateur du client qui envoie : déjà dans la requête.
     let navigateur = req
         .headers()
@@ -3591,7 +3651,8 @@ pub(super) async fn submit_bug_report(
         }
     };
 
-    let (code, corps) = envoyer_le_rapport(state, description, pieces, navigateur).await;
+    let (code, corps) =
+        envoyer_le_rapport(state, description, pieces, navigateur, au_nom_du_compte).await;
     let mut resp = (code, Json(&corps)).into_response();
     // #5068 — le délai du site, aussi sous sa forme standard.
     if let Some(secs) = corps.get("retry_after").and_then(Value::as_u64) {
@@ -3614,6 +3675,7 @@ async fn envoyer_le_rapport(
     description: String,
     pieces: PiecesJointes,
     navigateur: Option<String>,
+    au_nom_du_compte: bool,
 ) -> (axum::http::StatusCode, Value) {
     use axum::http::StatusCode;
 
@@ -3628,9 +3690,13 @@ async fn envoyer_le_rapport(
     // #7920 — TOUS les identifiants, pas seulement le premier : le jeton de
     // compte s'il existe, ET la clé de licence si elle est enregistrée. Un
     // jeton expiré ne fait plus disparaître la licence du rapport.
-    let identites = crate::routes::support::identifiants_mozaiklabs(&SettingsRepo::with_backend(
-        state.backend.clone(),
-    ));
+    let identites = if au_nom_du_compte {
+        crate::routes::support::identifiants_mozaiklabs(&SettingsRepo::with_backend(
+            state.backend.clone(),
+        ))
+    } else {
+        Vec::new()
+    };
     let Json(report) = generate_bug_report(State(state)).await;
     let report_md = report["markdown"].as_str().unwrap_or("").to_string();
     if report_md.trim().is_empty() {
@@ -4254,7 +4320,7 @@ pub(super) async fn api_docs() -> Json<Value> {
         (
             "GET",
             "/library/tracks/{id}/waveform",
-            "Track waveform (200-point amplitude)",
+            "Track waveform (RMS envelope, ?points=100..2000, 200 by default)",
         ),
         (
             "GET",
@@ -6140,3 +6206,54 @@ mod volume_des_zones_au_rapport_7841 {
 #[cfg(test)]
 #[path = "diagnostics_oaat_8006_tests.rs"]
 mod registre_libre_pendant_le_diagnostic_8006;
+
+#[cfg(test)]
+mod tests_journal_refuse_au_demarrage_9118 {
+    use super::collect_recent_logs_depuis;
+
+    /// #9118 — le démarrage n'a pu ouvrir aucun fichier de journal : l'export
+    /// ne relit pas ce chemin (un `WARN … Permission denied` par rapport), il
+    /// va droit aux replis. Le fichier témoin est LISIBLE ici : s'il est lu,
+    /// c'est que le refus du démarrage a été ignoré.
+    #[tokio::test]
+    async fn un_journal_refuse_au_demarrage_n_est_plus_relu() {
+        let dossier = tempfile::tempdir().unwrap();
+        let chemin = dossier.path().join("tune-server.log");
+        std::fs::write(
+            &chemin,
+            "2026-11-18T10:00:00Z  INFO m: temoin-9118-ne-doit-pas-etre-lu\n",
+        )
+        .unwrap();
+        let chemin = chemin.to_string_lossy().into_owned();
+
+        let axum::Json(v) = collect_recent_logs_depuis(
+            50,
+            chemin.clone(),
+            Some(format!("{chemin} : Permission denied (os error 13)")),
+        )
+        .await;
+
+        let logs = v["logs"].as_str().unwrap_or_default();
+        assert!(
+            !logs.contains("temoin-9118-ne-doit-pas-etre-lu"),
+            "un chemin refusé au démarrage ne doit pas être relu : {v}"
+        );
+        if v["source"] == "file_unreadable" {
+            assert!(logs.contains("Permission denied"), "le refus est dit : {v}");
+        }
+    }
+
+    /// Sans refus au démarrage, le fichier est lu comme avant.
+    #[tokio::test]
+    async fn sans_refus_le_fichier_est_lu() {
+        let dossier = tempfile::tempdir().unwrap();
+        let chemin = dossier.path().join("tune-server.log");
+        std::fs::write(&chemin, "2026-11-18T10:00:00Z  INFO m: temoin-9118-lu\n").unwrap();
+        let chemin = chemin.to_string_lossy().into_owned();
+
+        let axum::Json(v) = collect_recent_logs_depuis(50, chemin.clone(), None).await;
+
+        assert_eq!(v["source"], "file", "{v}");
+        assert!(v["logs"].as_str().unwrap().contains("temoin-9118-lu"));
+    }
+}

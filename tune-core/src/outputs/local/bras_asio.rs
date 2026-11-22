@@ -128,6 +128,9 @@ pub(super) struct EntreesAsio {
     pub(super) track_artist: Arc<std::sync::Mutex<Option<String>>>,
     pub(super) duration_ms: Arc<AtomicU64>,
     pub(super) seek_offset_ms: Arc<AtomicU64>,
+    /// #8869 — le silence de verrouillage dont le flux est précédé.
+    pub(super) silence_de_verrouillage:
+        crate::audio::silence_de_verrouillage::SilenceDeVerrouillage,
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -690,6 +693,7 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
         track_artist,
         duration_ms,
         seek_offset_ms,
+        silence_de_verrouillage,
     } = entrees;
 
     info!(
@@ -806,7 +810,10 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
     let volume_de_l_etage = AtomicU32::new(VOLUME_A_L_UNITE);
     let anneau_natif = backend.sortie.native_ring().clone();
     // D1 : le backend dit quel puits il fournit ; la route suit.
-    let mut route = match backend.puits() {
+    let mut route = match backend
+        .puits()
+        .precede_du_silence(&silence_de_verrouillage, backend.format_ouvert())
+    {
         Puits::Natif(puits) => Route::Native {
             etage: EtageNatifAsio {
                 // #6230 — l'étage natif porte les voies de `sortie`, et le
@@ -902,7 +909,7 @@ pub(super) fn jouer_via_asio(entrees: EntreesAsio) {
         );
     }
 
-    info!(device = %device_name, url = %url, "local_audio_asio_exclusive_playing");
+    info!(device = %device_name, url = %crate::confidentialite::masquer_url(&url), "local_audio_asio_exclusive_playing");
     // ASIO exclusif : résolution par sous-chaîne, et `"default"`
     // prend le premier pilote listé. `opened_id` reste `None` :
     // ASIO n'expose aucun identifiant d'endpoint.
@@ -1257,6 +1264,9 @@ pub(super) struct EntreesDsdNatif {
     pub(super) track_ended_generation: Arc<AtomicU64>,
     pub(super) dop_active: Arc<AtomicBool>,
     pub(super) chain_exhausted: Arc<AtomicBool>,
+    /// #8869 — le silence de verrouillage dont le flux est précédé.
+    pub(super) silence_de_verrouillage:
+        crate::audio::silence_de_verrouillage::SilenceDeVerrouillage,
 }
 
 /// Joue un flux DSD brut sur le pilote ASIO basculé en DSD natif, jusqu'à la
@@ -1288,6 +1298,7 @@ pub(super) fn jouer_dsd_natif_via_asio(entrees: EntreesDsdNatif) {
         track_ended_generation,
         dop_active,
         chain_exhausted,
+        silence_de_verrouillage,
     } = entrees;
     let canaux = usize::from(entete.canaux);
 
@@ -1334,7 +1345,7 @@ pub(super) fn jouer_dsd_natif_via_asio(entrees: EntreesDsdNatif) {
     }
     info!(
         device = %device_name,
-        url = %url,
+        url = %crate::confidentialite::masquer_url(&url),
         cadence = entete.cadence,
         canaux,
         "local_audio_asio_dsd_natif_playing"
@@ -1342,6 +1353,17 @@ pub(super) fn jouer_dsd_natif_via_asio(entrees: EntreesDsdNatif) {
     note_opened_device("ASIO", &device_name, sortie.opened_device_name(), None);
 
     let anneau = sortie.anneau().clone();
+    // #8869 — au changement de format, du repos DSD avant le premier octet.
+    super::silence_de_verrouillage_8869::pousser_dans_l_anneau_dsd(
+        &silence_de_verrouillage,
+        &anneau,
+        entete.cadence,
+        entete.canaux,
+        canaux,
+        // `force_silent` seul : `stop_rx` se consomme, la boucle qui suit
+        // doit encore le voir.
+        || force_silent.load(Ordering::Relaxed),
+    );
     let etat_de_l_anneau = || (anneau.disponible(), anneau.contenance());
     let mut source = SourcePompee::demarrer(reader, &etat_de_l_anneau);
 

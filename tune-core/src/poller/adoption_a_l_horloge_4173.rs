@@ -769,6 +769,12 @@ mod k17_dsf_set_next_8868;
 #[cfg(test)]
 mod dsd_suivant_dlna_6910;
 
+/// #9206 (fil 2961) — le renderer qui ouvre le flux armé À la fin et bascule
+/// en retard sur son URI n'est plus coupé ; le DMP-A6 qui l'a préchargé de
+/// longue date est relancé comme avant.
+#[cfg(test)]
+mod flux_arme_ouvert_a_la_fin_9206;
+
 /// Budget du cadre de sondage du banc : il est emboîté plusieurs fois dans
 /// les scénarios d'adoption, sur la petite pile des threads de test macOS.
 /// Le cadre doit rester léger (4 Kio au plus), sans embarquer les quelque

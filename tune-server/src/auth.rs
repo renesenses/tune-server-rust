@@ -815,6 +815,25 @@ pub async fn admin_ou_cette_machine(parts: &mut Parts, state: &AppState) -> bool
     appel_depuis_cette_machine(parts, state).await
 }
 
+/// Extracteur infaillible : `true` pour l'administrateur (authentification
+/// active) ou un appel de cette machine (authentification coupée) — ceux qui
+/// relient le serveur, et seuls à lire les comptes Mozaiklabs liés. Même règle
+/// que [`admin_ou_cette_machine`], sans rejet ni trace : pour des routes de
+/// lecture appelées en boucle par tous les appareils.
+#[derive(Debug, Clone, Copy)]
+pub struct ReliePourLesComptes(pub bool);
+
+impl FromRequestParts<AppState> for ReliePourLesComptes {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        Ok(Self(admin_ou_cette_machine(parts, state).await))
+    }
+}
+
 /// En-têtes qu'un mandataire inverse ajoute en relayant une requête.
 const ENTETES_DE_MANDATAIRE: &[&str] = &[
     "forwarded",

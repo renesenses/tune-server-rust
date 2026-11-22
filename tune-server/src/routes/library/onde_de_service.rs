@@ -1,4 +1,4 @@
-//! L'enveloppe de la barre de progression (200 points, Discussion #8269)
+//! L'enveloppe de la barre de progression (1 000 points depuis le fil 2954, Discussion #8269)
 //! pour une piste QOBUZ ou TIDAL en lecture — go de Bertrand du 17/11/2026,
 //! rc13.
 //!
@@ -18,7 +18,7 @@
 //! le fichier d'un service en cours de lecture (un fMP4 peut être encore en
 //! croissance). Une piste se télécharge donc UNE fois pour son analyse, et
 //! plus jamais ensuite : l'enveloppe est gardée sur le disque
-//! (`<cache des pochettes>/ondes-service/<clé>.json`, clé du service, de
+//! (`<cache des pochettes>/ondes-service/<clé>-p<points>.json`, clé du service, de
 //! l'identifiant et de la qualité, comme la fiche technique).
 //!
 //! DEUX GARDES (décision de Bertrand du 17/11/2026, option C) : rien n'est
@@ -62,8 +62,11 @@ use super::audio_de_service::{self as service, Limites, PisteDeService, Refus};
 use crate::routes::active_profile::ActiveProfile;
 use crate::state::AppState;
 
-/// Le nombre de points de l'enveloppe : celui de `/library/tracks/{id}/waveform`.
-pub(crate) const POINTS: usize = 200;
+/// Le nombre de points de l'enveloppe : la résolution fine de
+/// `/library/tracks/{id}/waveform?points=` (fil du forum 2954). Le client la
+/// réduit à la largeur de sa barre ; un client qui en attendait 200 dessine
+/// ce qu'il reçoit (route apparue en rc13, aucun client publié ne l'appelle).
+pub(crate) const POINTS: usize = tune_core::audio::analyzer::ONDE_POINTS_FIN;
 
 /// Calculs en route au plus, toutes pistes confondues. Au-delà, la demande
 /// répond « pas encore » sans rien lancer : l'écran redemandera.
@@ -192,7 +195,9 @@ impl Ondes {
     }
 
     fn chemin(&self, cle: &str) -> PathBuf {
-        self.dossier.join(format!("{cle}.json"))
+        // La résolution est dans le nom : une enveloppe de 200 points
+        // d'avant le fil 2954 n'est pas resservie pour une de 1 000.
+        self.dossier.join(format!("{cle}-p{POINTS}.json"))
     }
 
     fn lire(&self, cle: &str) -> Option<Vec<f32>> {
@@ -203,7 +208,7 @@ impl Ondes {
 
     fn ecrire(&self, cle: &str, points: &[f32]) {
         let cible = self.chemin(cle);
-        let provisoire = self.dossier.join(format!("{cle}.json.part"));
+        let provisoire = self.dossier.join(format!("{cle}-p{POINTS}.json.part"));
         let issue = std::fs::create_dir_all(&self.dossier)
             .and_then(|()| {
                 std::fs::write(&provisoire, serde_json::to_vec(points).unwrap_or_default())

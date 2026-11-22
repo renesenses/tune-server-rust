@@ -16,7 +16,7 @@ use crate::state::AppState;
 mod installation_sure;
 
 #[path = "compagnons_8944.rs"]
-mod compagnons;
+pub(crate) mod compagnons;
 
 #[path = "greffons_livres_8955.rs"]
 mod greffons_livres;

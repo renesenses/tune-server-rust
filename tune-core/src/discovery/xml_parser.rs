@@ -707,7 +707,7 @@ fn report_unreadable_description(
     };
     let diag = describe_unreadable_body(body);
     warn!(
-        location = %location,
+        location = %crate::confidentialite::masquer_url(&location),
         statut = statut,
         type_mime = %type_mime,
         corps = %diag.kind.label(),

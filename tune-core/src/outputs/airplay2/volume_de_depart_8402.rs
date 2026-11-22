@@ -59,6 +59,22 @@ pub(super) fn sans_demon(erreur: &str) -> bool {
 /// limite de sécurité (#6541). Jamais au-dessus du volume mémorisé. Sans zone
 /// connue : [`VOLUME_DE_DEPART_PRUDENT`].
 pub fn volume_de_depart(db: &Arc<dyn DbBackend>, device_id: &str) -> (f64, bool) {
+    volume_de_depart_selon(db, device_id, true)
+}
+
+/// #8855 — la même graine sans la règle PURE verrouillé (décision du 11/11,
+/// propre à AirPlay 2) : le volume mémorisé de la zone, trim positif ignoré,
+/// borné par la limite de sécurité ; pleine échelle en volume fixe ; sans
+/// zone connue, [`VOLUME_DE_DEPART_PRUDENT`]. Sert à la sortie AirPlay 1.
+pub fn volume_memorise_borne(db: &Arc<dyn DbBackend>, device_id: &str) -> (f64, bool) {
+    volume_de_depart_selon(db, device_id, false)
+}
+
+fn volume_de_depart_selon(
+    db: &Arc<dyn DbBackend>,
+    device_id: &str,
+    depart_muet_si_pure: bool,
+) -> (f64, bool) {
     let zone = match crate::db::zone_repo::ZoneRepo::with_backend(db.clone())
         .get_by_device_id(device_id)
     {
@@ -74,7 +90,7 @@ pub fn volume_de_depart(db: &Arc<dyn DbBackend>, device_id: &str) -> (f64, bool)
     if zone.fixed_volume {
         return (1.0, zone.muted);
     }
-    if pure_verrouille(db, zone_id) {
+    if depart_muet_si_pure && pure_verrouille(db, zone_id) {
         return (0.0, zone.muted);
     }
     let memorise = (zone.volume / 100.0).clamp(0.0, 1.0);

@@ -785,6 +785,22 @@ async fn pieces_du_banc(
     Arc<AtomicBool>,
     tokio::task::JoinHandle<()>,
 ) {
+    pieces_du_banc_securite(annonce, activee, bornes, None).await
+}
+
+/// #8920 — le même banc, avec une limite de sécurité (dB d'ampli) vue par
+/// la sortie au départ d'une lecture.
+async fn pieces_du_banc_securite(
+    annonce: super::protocole::Annonce,
+    activee: bool,
+    bornes: reglages::BornesDb,
+    securite_db: Option<f64>,
+) -> (
+    Simulateur,
+    DevialetAirOutput,
+    Arc<AtomicBool>,
+    tokio::task::JoinHandle<()>,
+) {
     let sim = Simulateur::demarrer(annonce, None).await;
     // #8536 — un port audio fixe pour tous les flux de la sortie, comme
     // 45456 en service : l'ampli renvoie les retours d'une session à
@@ -798,6 +814,8 @@ async fn pieces_du_banc(
     let drapeau = Arc::new(AtomicBool::new(activee));
     let indice = Arc::new(AtomicU8::new(9));
     let contexte = ContexteAir {
+        plafond_de_cadence: std::sync::Arc::new(|_: &str| None),
+        securite_db: std::sync::Arc::new(move |_: &str| securite_db),
         activee: {
             let d = drapeau.clone();
             Arc::new(move || d.load(Ordering::SeqCst))
@@ -1102,6 +1120,96 @@ async fn air_pause_envoie_un_arret_et_la_reprise_ouvre_un_flux_neuf() {
     assert_eq!(s.arrets.len(), 2);
 }
 
+/// #9175 — un flux TRAITÉ servi par un canal (`byte_seekable == false`, pas de
+/// fichier d'origine) ne se lit qu'une fois. La sortie ne le rouvre ni à la
+/// reprise, ni au saut : elle dit à la zone de le relancer à la position
+/// (`device_released_on_pause`), et compte depuis le début de la piste quand
+/// la zone lui apprend où le flux relancé commence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn air_un_flux_traite_en_canal_se_relance_par_la_zone_9175() {
+    let b = banc(annonce_de_test(), true).await;
+    let dossier = crate::test_scratch::scratch_dir("devialet-air-canal-9175");
+    let (chemin, _) = wav_16_bits(&dossier, 44_100, 88_200);
+    let canal = PlayMedia {
+        url: &chemin,
+        file_path: None,
+        byte_seekable: false,
+        mime_type: "audio/wav",
+        duration_ms: Some(2_000),
+        ..Default::default()
+    };
+    b.sortie.play_media(&canal).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let saut = b.sortie.seek(1_000).await;
+    assert!(
+        saut.is_err(),
+        "#9175 : un canal ne se rouvre pas à la position, la zone doit le relancer"
+    );
+    assert_eq!(
+        b.sortie.get_status().await.unwrap().state,
+        TransportState::Playing,
+        "le refus du saut ne coupe pas la lecture"
+    );
+
+    // La zone a relancé le flux à 60 s : il commence là dans la piste.
+    b.sortie.noter_le_depart_du_flux(60_000, None).await;
+    let st = b.sortie.get_status().await.unwrap();
+    assert!(
+        st.position_ms >= 60_000,
+        "#9175 : position comptée depuis le début de la piste ({})",
+        st.position_ms
+    );
+    assert_eq!(st.duration_ms, 62_000, "durée de la piste, pas du reste");
+
+    b.sortie.pause().await.unwrap();
+    assert!(
+        b.sortie.device_released_on_pause(),
+        "#9175 : en pause sur un canal, la reprise doit relancer le flux"
+    );
+    assert!(
+        b.sortie.resume().await.is_err(),
+        "#9175 : la sortie ne rouvre pas un canal à la reprise"
+    );
+    b.sortie.stop().await.unwrap();
+    assert!(!b.sortie.device_released_on_pause());
+
+    // Contre-épreuve : la même piste servie par son fichier se rouvre.
+    b.sortie.play_media(&media(&chemin)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    b.sortie.pause().await.unwrap();
+    assert!(!b.sortie.device_released_on_pause());
+    b.sortie.resume().await.unwrap();
+    b.sortie.stop().await.unwrap();
+}
+
+/// Suite de #9175 — sur un canal, la cadence ANNONCÉE (48 kHz) peut différer
+/// de celle du flux réellement servi (44,1 kHz : plafond, cadence fixe). Le
+/// décodeur doit viser la cadence d'AIR et rééchantillonner, pas refuser la
+/// lecture (« flux à 48000 Hz attendu »).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn air_un_canal_a_une_autre_cadence_que_l_annoncee_joue_quand_meme_9175() {
+    let b = banc(annonce_de_test(), true).await;
+    let dossier = crate::test_scratch::scratch_dir("devialet-air-canal-cadence-9175");
+    let (chemin, _) = wav_16_bits(&dossier, 44_100, 44_100);
+    let canal = PlayMedia {
+        url: &chemin,
+        file_path: None,
+        byte_seekable: false,
+        mime_type: "audio/wav",
+        sample_rate: Some(48_000),
+        duration_ms: Some(1_000),
+        ..Default::default()
+    };
+    let lecture = b.sortie.play_media(&canal).await;
+    assert!(
+        lecture.is_ok(),
+        "suite de #9175 : un canal dont la cadence diffère de l'annonce doit être \
+         rééchantillonné, pas refusé : {lecture:?}"
+    );
+    b.sortie.stop().await.unwrap();
+}
+
 /// #6923 — un déplacement dont le flux neuf ne part pas laisse la sortie
 /// arrêtée. Elle doit le DIRE (`take_output_failure`), sinon le sondeur
 /// prend cet arrêt pour une fin de piste et passe au morceau suivant.
@@ -1136,6 +1244,8 @@ async fn air_le_fournisseur_n_ecoute_rien_tant_que_l_option_est_desactivee() {
         .port();
     let drapeau = Arc::new(AtomicBool::new(false));
     let contexte = ContexteAir {
+        plafond_de_cadence: std::sync::Arc::new(|_: &str| None),
+        securite_db: std::sync::Arc::new(|_: &str| None),
         activee: {
             let d = drapeau.clone();
             Arc::new(move || d.load(Ordering::SeqCst))
@@ -1178,6 +1288,9 @@ mod volume_db_6918;
 
 #[path = "demarrage_borne_6911_tests.rs"]
 mod demarrage_borne_6911;
+
+#[path = "retours_8920_tests.rs"]
+mod retours_8920;
 
 // ─── #8536 — la session de la sortie, l'écoute à côté de Roon ───────────────
 

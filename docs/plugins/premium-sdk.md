@@ -1,4 +1,4 @@
-# SDK audio : égaliseur FREE et trois greffons Premium — #4363
+# SDK audio : droits des greffons — #4363, #9210
 
 L'égaliseur, le crossfeed, le convertisseur et Dé-ploc disposent de projets SDK indépendants, de templates exécutables et d'une distribution native signée. Les façades Tune gardent les points d'insertion audio et les API existantes. Le spectre reste produit par l'hôte, même lorsque les quatre plugins sont désinstallés.
 
@@ -33,7 +33,7 @@ Le [catalogue unique](../../sdk/plugins.json) alimente 19 listes explicites dans
 
 L’égaliseur est accessible aux comptes FREE, y compris ses profils, presets et mutations HTTP. La capacité historique `dsp_eq` reste annoncée vraie ; le crossfeed possède désormais sa propre capacité `crossfeed`. PURE conserve son bypass. La migration active l’EQ gratuit sans écraser une désactivation explicite.
 
-**Décision actée : coupure nette du crossfeed FREE.** La lecture et les mutations sont refusées immédiatement, sans délai ni mode d’édition FREE. Les réglages restent intégralement en base ; le passage à Premium puis la réactivation dans les greffons les retrouve. `GET /zones/{id}/dsp` publie `premium_required`, conserve `requested` et rend `effective:false`. Les trois écrans expliquent la coupure et la conservation des réglages. Convertisseur et Dé-ploc restent Premium. La [note de version préparée](../release-notes/sdk-audio.md) accompagne les deux PR destinées au lot, sans modifier la release en cours.
+**Décision rc13 du 17 novembre 2026 (#9210) : le crossfeed simple devient gratuit ; Crossfeed Pro reste Premium.** Le traitement, les réglages, les préréglages et l'installation du simple crossfeed sont accessibles en FREE. La capacité historique `crossfeed` reste annoncée. Les réglages et les choix d'installation/activation sont conservés ; une désinstallation ou désactivation explicite n'est pas annulée. PURE et les contraintes de format restent prioritaires. Convertisseur et Dé-ploc restent Premium. Cette décision remplace la coupure FREE documentée pour la livraison SDK initiale.
 
 ## Livraison et migration
 
@@ -49,6 +49,6 @@ Les tâches déjà lancées terminent ou sont annulées explicitement. Un journa
 
 **4 644 864 octets identiques** dans la preuve DSP initiale (SHA-256 `cc87f7716466f522bd095a5d0aa76f7860be493fc128ae33c032a25ac0c4e49d`). La parité compare trois exécutions indépendantes : source historique extraite par `git show`, bibliothèque SDK et façades chargeant les vraies bibliothèques natives. Les tests de contrat vérifient les buffers, transitions, codecs hôtes, métadonnées, annulation, publication et erreurs. Les tests de paquets signent avec une clé publique de fixture non installée en production et vérifient succès puis refus d'altération.
 
-Le témoin `audio_offer_free_eq_and_premium_four_survive_real_startup` démarre le chargeur réel sans paquet natif, vérifie les quatre manifests contre la règle commerciale indépendante, exécute l’EQ et les presets FREE/Premium, refuse les trois outils Premium à FREE et termine deux véritables tâches WAV avec Premium. Il vérifie aussi la conservation exacte du crossfeed lors du refus puis sa réactivation. Le témoin de l’orchestrateur vérifie le refus FREE même avec les drapeaux d’installation forcés, puis le traitement PCM Premium et la nouvelle coupure après rétrogradation.
+Le témoin `audio_offer_free_eq_crossfeed_and_paid_plugins_survive_real_startup` démarre le chargeur réel sans paquet natif et vérifie les manifests, les réglages et préréglages gratuits, ainsi que la désinstallation/réinstallation du crossfeed simple en FREE. Convertisseur et Dé-ploc restent refusés en FREE ; leurs tâches WAV sont vérifiées en Premium. Les témoins de l'orchestrateur vérifient le traitement PCM en FREE, le bypass PURE et la conservation des choix utilisateur ; le banc natif garde le refus de Crossfeed Pro sans Premium. Les preuves antérieures ci-dessous décrivent la politique historique de leur commit.
 
 Les preuves locales sont consignées dans [premium-sdk-evidence.md](premium-sdk-evidence.md). La CI SDK utilise trois OS. Les tests matériels CoreAudio/WASAPI, les cibles réseau, la charge multi-zone et l'écoute restent des portes de qualification de release : une compilation Linux ou une capture PCM ne vaut pas leur acceptation. Aucun merge, déploiement, publication ni changement des clés de confiance n'est inclus dans cette implémentation.

@@ -104,7 +104,7 @@ chrono = "0.4"
 cbc = "0.1"
 regex = "1"
 csv = "1"
-symphonia = { version = "0.6", features = ["mp3", "flac", "wav", "aac", "alac", "vorbis", "pcm", "isomp4", "ogg", "mkv"] }
+symphonia = { version = "0.6", features = ["mp3", "flac", "wav", "aiff", "aac", "alac", "vorbis", "pcm", "isomp4", "ogg", "mkv"] }
 # Rubato 3.0.0, normalisation compensee du sinc (#4079). Voir vendor/rubato/TUNE-PATCH.md.
 rubato = { path = "vendor/rubato" }
 # libopus — liaison sûre `opus` (SpaceManiac/opus-rs) au-dessus d'`opusic-sys`

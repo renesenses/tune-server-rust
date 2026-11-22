@@ -66,6 +66,10 @@ pub(super) struct ConditionsDuNatif {
     /// Durée du fondu enchaîné réglée sur la sortie (ms) : la chaîne native
     /// ne fond pas, elle enchaîne.
     pub(super) fondu_ms: u32,
+    /// #9165 — le greffon de suréchantillonnage est armé pour la zone et
+    /// porterait ce flux sur le chemin partagé
+    /// (`diagnostic_surechantillonnage_8259::greffon_avant_le_natif`).
+    pub(super) surechantillonnage_voulu: bool,
 }
 
 /// Pourquoi le chemin natif S32 n'est pas pris — journalisé tel quel.
@@ -82,6 +86,10 @@ pub(super) enum MotifDuCheminPartage {
     VoiesPilotees,
     /// Un fondu enchaîné est réglé.
     FonduEnchaine,
+    /// #9165 — le greffon de suréchantillonnage est armé : seul le chemin
+    /// partagé porte son étage. Sans ce motif, une source S32 au volume unité
+    /// partait en natif et le greffon était ignoré en silence.
+    SurechantillonnageDemande,
 }
 
 impl MotifDuCheminPartage {
@@ -92,6 +100,7 @@ impl MotifDuCheminPartage {
             Self::DspActif => "dsp_actif",
             Self::VoiesPilotees => "voies_pilotees",
             Self::FonduEnchaine => "fondu_enchaine",
+            Self::SurechantillonnageDemande => "surechantillonnage_demande",
         }
     }
 }
@@ -110,6 +119,9 @@ pub(super) fn chemin_natif_s32(c: &ConditionsDuNatif) -> Result<(), MotifDuChemi
     if !c.dsp_identite {
         return Err(MotifDuCheminPartage::DspActif);
     }
+    if c.surechantillonnage_voulu {
+        return Err(MotifDuCheminPartage::SurechantillonnageDemande);
+    }
     if c.voies_pilotees {
         return Err(MotifDuCheminPartage::VoiesPilotees);
     }
@@ -117,6 +129,38 @@ pub(super) fn chemin_natif_s32(c: &ConditionsDuNatif) -> Result<(), MotifDuChemi
         return Err(MotifDuCheminPartage::FonduEnchaine);
     }
     Ok(())
+}
+
+/// #9165 — à une frontière de la chaîne native : le greffon, armé depuis,
+/// serait-il porté par le chemin partagé ? EXACTEMENT la règle de
+/// l'ouverture (`greffon_avant_le_natif`) : PURE, DoP, sortie double,
+/// bit-perfect strict et cadences l'écartent pareil. Sans quoi un greffon
+/// écarté couperait la chaîne à chaque piste, `play_url` reprendrait le
+/// natif, et le gapless serait perdu sans rien suréchantillonner. La
+/// suivante enchaînée a le format du flux ouvert : `spec` est le sien, et
+/// une source 32 bits n'a pas d'amorce à sonder.
+pub(super) fn greffon_voulu_a_la_frontiere(f: &FrontiereDuGreffon<'_>) -> bool {
+    let choix = f.choix.lock().ok().and_then(|c| c.clone());
+    super::diagnostic_surechantillonnage_8259::greffon_avant_le_natif(
+        choix.as_ref(),
+        f.spec,
+        &[],
+        f.pure_bypass.load(Ordering::Relaxed),
+        f.dop_active.load(Ordering::Relaxed),
+        f.sortie_double,
+        f.strict_bitperfect,
+    ) == super::diagnostic_surechantillonnage_8259::GreffonAvantLeNatif::Voulu
+}
+
+/// #9165 — ce que la frontière relit, et ce que l'ouverture avait fixé.
+pub(super) struct FrontiereDuGreffon<'a> {
+    pub(super) choix:
+        &'a std::sync::Mutex<Option<crate::audio::surechantillonnage::ChoixSurechantillonnage>>,
+    pub(super) spec: AudioSpec,
+    pub(super) pure_bypass: &'a AtomicBool,
+    pub(super) dop_active: &'a AtomicBool,
+    pub(super) sortie_double: bool,
+    pub(super) strict_bitperfect: bool,
 }
 
 /// Le verdict que le bras publie après chaque poussée : l'étage dit si ses
@@ -469,6 +513,18 @@ pub(super) struct ContexteAlsaNatif<'a> {
     pub(super) track_artist: &'a std::sync::Mutex<Option<String>>,
     pub(super) duration_ms: &'a AtomicU64,
     pub(super) seek_offset_ms: &'a AtomicU64,
+    /// #8869 — le silence de verrouillage dont le puits est précédé.
+    pub(super) silence_de_verrouillage:
+        &'a crate::audio::silence_de_verrouillage::SilenceDeVerrouillage,
+    /// #9165 — le choix de suréchantillonnage de la zone, relu à chaque
+    /// frontière : armé en cours de chaîne, il s'applique à la piste suivante,
+    /// qui ne s'enchaîne donc pas en natif.
+    pub(super) surechantillonnage:
+        &'a std::sync::Mutex<Option<crate::audio::surechantillonnage::ChoixSurechantillonnage>>,
+    /// #6132 — la zone recopie vers des sorties suiveuses (fixé à l'ouverture).
+    pub(super) sortie_double: bool,
+    /// Bit-perfect strict de la zone (fixé à l'ouverture).
+    pub(super) strict_bitperfect: bool,
 }
 
 /// Ce que la chaîne native emprunte au bras : témoins d'arrêt, publication,
@@ -478,6 +534,7 @@ struct HoteAlsaNatif<'a, F: FnMut(bool, bool)> {
     position_ms: &'a AtomicU64,
     publier: &'a mut F,
     reserve: ReserveHttp<'a>,
+    greffon: FrontiereDuGreffon<'a>,
 }
 
 impl<F: FnMut(bool, bool)> ReserveDeLaChaine for HoteAlsaNatif<'_, F> {
@@ -488,6 +545,13 @@ impl<F: FnMut(bool, bool)> ReserveDeLaChaine for HoteAlsaNatif<'_, F> {
     }
 
     fn preparer_la_suivante(&mut self) -> Suivante<Self::Lecteur> {
+        // #9165 — le greffon armé en cours de chaîne : la suivante reste en
+        // réserve, la piste courante finit, et la fin naturelle la rouvre par
+        // `play_url`, où le chemin partagé porte l'étage.
+        if greffon_voulu_a_la_frontiere(&self.greffon) {
+            info!("local_audio_alsa_natif_s32_chaine_cede_au_surechantillonneur");
+            return Suivante::Aucune;
+        }
         self.reserve.preparer_la_suivante()
     }
 
@@ -578,6 +642,10 @@ pub(super) fn jouer_via_alsa_natif(mut backend: BackendAlsaNatif<'_>, ctx: Conte
         track_artist,
         duration_ms,
         seek_offset_ms,
+        silence_de_verrouillage,
+        surechantillonnage,
+        sortie_double,
+        strict_bitperfect,
     } = ctx;
     let sortie = backend.format_ouvert();
     info!(
@@ -619,7 +687,10 @@ pub(super) fn jouer_via_alsa_natif(mut backend: BackendAlsaNatif<'_>, ctx: Conte
     if let Ok(mut slot) = transformations_reelles.lock() {
         *slot = Some(etage.transformations());
     }
-    let mut puits = match backend.puits() {
+    let mut puits = match backend
+        .puits()
+        .precede_du_silence(silence_de_verrouillage, sortie)
+    {
         Puits::Natif(puits) => puits,
         Puits::Flottant(_) => unreachable!("BackendAlsaNatif ne fournit qu'un puits natif"),
     };
@@ -689,6 +760,14 @@ pub(super) fn jouer_via_alsa_natif(mut backend: BackendAlsaNatif<'_>, ctx: Conte
         stop_rx,
         position_ms,
         publier: &mut publier_le_verdict,
+        greffon: FrontiereDuGreffon {
+            choix: surechantillonnage,
+            spec,
+            pure_bypass,
+            dop_active,
+            sortie_double,
+            strict_bitperfect,
+        },
         reserve: ReserveHttp {
             force_silent,
             position_ms,

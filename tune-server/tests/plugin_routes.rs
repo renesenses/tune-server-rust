@@ -348,13 +348,13 @@ async fn the_enabled_setting_keeps_a_plugin_out() {
     // L'Assistant IA (chantier assistant-ia), quand sa feature est compilée,
     // est chargé par défaut comme l'égaliseur gratuit : rien ne part tant
     // qu'aucune clé n'est posée.
-    let mut attendus = vec!["equalizer"];
+    let mut attendus = vec!["equalizer", "crossfeed"];
     if cfg!(feature = "assistant-ia") {
         attendus.push("assistant-ia");
     }
     assert_eq!(
         names, attendus,
-        "FREE EQ and the AI assistant load by default; the explicitly disabled injected plugin must stay absent"
+        "FREE EQ, simple crossfeed and the AI assistant load by default; the explicitly disabled injected plugin must stay absent"
     );
 }
 
@@ -373,8 +373,8 @@ async fn an_injected_plugin_loads_and_mounts_its_router() {
     mounts.sort_unstable();
     assert_eq!(
         mounts,
-        avec_assistant_ia(&["equalizer", "injected"]),
-        "FREE EQ, the AI assistant and the injected plugin each contribute their own router"
+        avec_assistant_ia(&["crossfeed", "equalizer", "injected"]),
+        "FREE EQ, simple crossfeed, the AI assistant and the injected plugin each contribute their own router"
     );
 
     let mut names: Vec<&str> = state
@@ -385,7 +385,10 @@ async fn an_injected_plugin_loads_and_mounts_its_router() {
         .map(|p| p.name.as_str())
         .collect();
     names.sort_unstable();
-    assert_eq!(names, avec_assistant_ia(&["equalizer", "injected"]));
+    assert_eq!(
+        names,
+        avec_assistant_ia(&["crossfeed", "equalizer", "injected"])
+    );
 
     // End to end: the router it registered actually serves, under its own name.
     let app = tune_server::routes::router_with_plugins(state.clone(), routers).layer(

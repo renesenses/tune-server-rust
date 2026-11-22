@@ -74,6 +74,10 @@ fn use_scratch_plugin_data_dir() {
 
 #[path = "circle_plugin.rs"]
 mod circle_plugin;
+// Tune Circle (19/11/2026) : écritures réservées à l'administrateur, lecture
+// seule à distance.
+#[path = "circle_ecritures_admin.rs"]
+mod circle_ecritures_admin;
 // #5018 — le greffon `circle` au catalogue (feature `circle`, dans `default`).
 #[cfg(feature = "circle")]
 #[path = "circle_catalogue_5018.rs"]

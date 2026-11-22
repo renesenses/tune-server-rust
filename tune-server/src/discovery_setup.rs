@@ -39,6 +39,10 @@ mod deblocage_rejoue_la_decouverte_7508_tests;
 #[cfg(all(test, feature = "oaat"))]
 #[path = "deux_pi_verox_oaat_airplay_tests_6947.rs"]
 mod deux_pi_verox_oaat_airplay_tests_6947;
+// #9091 — une annonce mDNS expirée ne retire pas une sortie OAAT vivante.
+#[cfg(feature = "oaat")]
+#[path = "discovery_setup/perte_mdns_oaat_9091.rs"]
+mod perte_mdns_oaat_9091;
 
 /// Resolve a UPnP service `controlURL` (from the device description) into an
 /// absolute URL usable by the SOAP client.
@@ -748,14 +752,14 @@ pub(crate) fn journaliser_zone_auto_retenue(id: &str, name: &str, location: &str
         info!(
             id,
             name,
-            location,
+            location = %tune_core::confidentialite::masquer_url(&location),
             "ssdp_renderer_sur_cette_machine_sans_zone_auto — renderer de cette machine, \
              la sortie locale est à utiliser ; une zone se crée à la main si besoin"
         );
     } else {
         debug!(
             id,
-            name, location, "ssdp_renderer_sur_cette_machine_sans_zone_auto"
+            name, location = %tune_core::confidentialite::masquer_url(&location), "ssdp_renderer_sur_cette_machine_sans_zone_auto"
         );
     }
 }
@@ -1122,7 +1126,7 @@ async fn handle_ssdp_discovered(
         debug!(
             id = %dev.id,
             name = %dev.name,
-            location = %loc,
+            location = %tune_core::confidentialite::masquer_url(&loc),
             "ssdp_notre_propre_renderer_ignore"
         );
         return;
@@ -1721,7 +1725,7 @@ async fn retrouver_par_unicast(
     info!(
         id = %kr.device_id,
         name = %kr.name,
-        ancienne = %kr.location,
+        ancienne = %tune_core::confidentialite::masquer_url(&kr.location),
         nouvelle = %nouvelle,
         "known_renderer_retrouve_par_msearch_unicast"
     );
@@ -1965,7 +1969,7 @@ async fn rattacher_les_renderers_connus(
                         if let IdentityVerdict::SameHardware(evidence) = verdict {
                             info!(
                                 nom = %kr.name,
-                                location = %kr.location,
+                                location = %tune_core::confidentialite::masquer_url(&kr.location),
                                 udn_memorise = %kr.device_id,
                                 udn_annonce = %observed.udn,
                                 reconnu_par = evidence.label(),
@@ -1991,7 +1995,7 @@ async fn rattacher_les_renderers_connus(
                         info!(
                             id = %kr.device_id,
                             name = %kr.name,
-                            location = %kr.location,
+                            location = %tune_core::confidentialite::masquer_url(&kr.location),
                             "known_renderer_reregistered"
                         );
                     }
@@ -1999,7 +2003,7 @@ async fn rattacher_les_renderers_connus(
                         warn!(
                             nom_attendu = %kr.name,
                             nom_trouve = %dev.name,
-                            location = %kr.location,
+                            location = %tune_core::confidentialite::masquer_url(&kr.location),
                             udn_memorise = %kr.device_id,
                             udn_annonce = %observed.udn,
                             distingue_par = evidence.label(),
@@ -2013,7 +2017,7 @@ async fn rattacher_les_renderers_connus(
                     IdentityVerdict::Undecidable => {
                         warn!(
                             nom = %kr.name,
-                            location = %kr.location,
+                            location = %tune_core::confidentialite::masquer_url(&kr.location),
                             udn_memorise = %kr.device_id,
                             udn_annonce = %observed.udn,
                             action = "l'identifiant UPnP a changé et rien ne permet de distinguer \
@@ -2028,14 +2032,14 @@ async fn rattacher_les_renderers_connus(
             None if au_demarrage => {
                 warn!(
                     id = %kr.device_id,
-                    location = %kr.location,
+                    location = %tune_core::confidentialite::masquer_url(&kr.location),
                     "known_renderer_probe_failed"
                 );
             }
             None => {
                 debug!(
                     id = %kr.device_id,
-                    location = %kr.location,
+                    location = %tune_core::confidentialite::masquer_url(&kr.location),
                     "zone_hors_ligne_renderer_toujours_injoignable"
                 );
             }
@@ -2114,6 +2118,15 @@ pub fn spawn_mdns_handler(
     let db = state.backend.clone();
     let event_bus = state.event_bus.clone();
     let playback = state.playback.clone();
+    // #9091 — la garde des sorties OAAT perdues en mDNS.
+    #[cfg(feature = "oaat")]
+    let perte_oaat = perte_mdns_oaat_9091::ContextePerte {
+        outputs: outputs.clone(),
+        db: db.clone(),
+        event_bus: event_bus.clone(),
+        gardes: Default::default(),
+        reglages: perte_mdns_oaat_9091::Reglages::PRODUCTION,
+    };
     tokio::spawn(async move {
         use tune_core::discovery::device::OutputType;
         use tune_core::discovery::mdns::MdnsEvent;
@@ -2135,6 +2148,12 @@ pub fn spawn_mdns_handler(
                     if appareil_ignore(&db, &dev) {
                         debug!(id = %dev.id, name = %dev.name, host = %dev.host, "mdns_appareil_ignore");
                         continue;
+                    }
+                    // #9091 — l'appareil gardé après une perte mDNS s'est
+                    // réannoncé : la découverte reprend la main.
+                    #[cfg(feature = "oaat")]
+                    if perte_oaat.gardes.annonce_retrouvee(&dev.id) {
+                        info!(id = %dev.id, name = %dev.name, "mdns_oaat_retrouve_garde_levee");
                     }
                     // Set when an AirPlay 2 device falls back to the legacy
                     // AirPlay output (daemon unavailable / deviceid unknown):
@@ -2249,6 +2268,9 @@ pub fn spawn_mdns_handler(
                                 )
                                 .avec_appairage_airplay2_requis(appairage_requis)
                                 .avec_composant_airplay2_manquant(composant_manquant);
+                                // #8855 — comme AirPlay 2 (#8402) : elle part du
+                                // volume mémorisé de sa zone, jamais de 0 dB.
+                                ap.ensemencer_depuis_la_base(&db).await;
                                 (Some(Box::new(ap)), "airplay")
                             }
                         }
@@ -2359,19 +2381,10 @@ pub fn spawn_mdns_handler(
                     }
                 }
                 MdnsEvent::DeviceLost(id) => {
-                    let mut reg = outputs.lock().await;
-                    // #8029 — retirée, la sortie est aussi arrêtée (démon
-                    // AirPlay 2, tâches réseau).
-                    tune_core::outputs::registry::arreter_les_sorties_retirees_en_tache(
-                        reg.remove(&id),
-                    );
-                    drop(reg);
-                    set_zone_online(&event_bus, &db, &id, false);
-                    event_bus.emit_typed(
-                        EventType::DeviceLost,
-                        serde_json::json!({ "device_id": id }),
-                    );
-                    info!(id = %id, "mdns_output_removed_zone_offline");
+                    #[cfg(feature = "oaat")]
+                    traiter_la_perte_mdns(&perte_oaat, id).await;
+                    #[cfg(not(feature = "oaat"))]
+                    retirer_la_sortie_mdns_perdue(&outputs, &db, &event_bus, &id).await;
                 }
             }
         }
@@ -2392,6 +2405,35 @@ pub fn spawn_mdns_handler(
     handle
 }
 
+/// `MdnsEvent::DeviceLost` : une sortie OAAT passe par la garde de #9091
+/// (session vivante ou port de contrôle qui répond : la zone reste) ; les
+/// autres sont retirées tout de suite.
+#[cfg(feature = "oaat")]
+async fn traiter_la_perte_mdns(ctx: &perte_mdns_oaat_9091::ContextePerte, id: String) {
+    if perte_mdns_oaat_9091::prendre_en_charge(ctx, &id).await {
+        return;
+    }
+    retirer_la_sortie_mdns_perdue(&ctx.outputs, &ctx.db, &ctx.event_bus, &id).await;
+}
+/// Le retrait d'une sortie perdue en mDNS : arrêtée, retirée, zone hors ligne.
+async fn retirer_la_sortie_mdns_perdue(
+    outputs: &Arc<tokio::sync::Mutex<OutputRegistry>>,
+    db: &Arc<dyn DbBackend>,
+    event_bus: &Arc<EventBus>,
+    id: &str,
+) {
+    let mut reg = outputs.lock().await;
+    // #8029 — retirée, la sortie est aussi arrêtée (démon AirPlay 2, tâches
+    // réseau).
+    tune_core::outputs::registry::arreter_les_sorties_retirees_en_tache(reg.remove(id));
+    drop(reg);
+    set_zone_online(event_bus, db, id, false);
+    event_bus.emit_typed(
+        EventType::DeviceLost,
+        serde_json::json!({ "device_id": id }),
+    );
+    info!(id = %id, "mdns_output_removed_zone_offline");
+}
 /// Enregistre la sortie d'un appareil annoncé par mDNS, puis rattache ou crée
 /// sa zone : reconnexion, montée de priorité, ré-ancrages, dédoublonnage entre
 /// protocoles et création automatique.

@@ -117,6 +117,9 @@ pub(super) struct EntreesCoreAudio {
     pub(super) track_artist: Arc<std::sync::Mutex<Option<String>>>,
     pub(super) duration_ms: Arc<AtomicU64>,
     pub(super) seek_offset_ms: Arc<AtomicU64>,
+    /// #8869 — le silence de verrouillage dont le flux est précédé.
+    pub(super) silence_de_verrouillage:
+        crate::audio::silence_de_verrouillage::SilenceDeVerrouillage,
 }
 
 /// Le puits du bras CoreAudio : l'anneau flottant de l'`ExclusiveOutput`, que
@@ -430,6 +433,7 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
         track_artist,
         duration_ms,
         seek_offset_ms,
+        silence_de_verrouillage,
     } = entrees;
     // `frame_bytes` était la largeur de trame que la boucle propre du bras
     // recalculait à chaque lecture ; l'étage la déduit de `spec`.
@@ -504,7 +508,7 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
         return;
     }
 
-    info!(device = %device_name, url = %url, "local_audio_exclusive_playing");
+    info!(device = %device_name, url = %crate::confidentialite::masquer_url(&url), "local_audio_exclusive_playing");
     // CoreAudio exclusif : `resolve_output_device` retombe sur le
     // périphérique système quand le nom stocké n'existe plus (DAC
     // débranché, renommé, routage macOS changé). `opened_id` reste
@@ -570,7 +574,10 @@ pub(super) fn jouer_via_coreaudio(entrees: EntreesCoreAudio) {
     };
     let mut etage =
         etage_exclusif_observe_7093::EtageObserve::nouveau(etage, &transformations_reelles);
-    let mut puits = match backend.puits() {
+    let mut puits = match backend
+        .puits()
+        .precede_du_silence(&silence_de_verrouillage, backend.format_ouvert())
+    {
         Puits::Flottant(puits) => puits,
         Puits::Natif(_) => unreachable!("BackendCoreAudio ne fournit qu'un puits flottant (D1)"),
     };

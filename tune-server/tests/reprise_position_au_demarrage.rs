@@ -18,7 +18,7 @@
 //! que la route atteint la position restaurée ; ne pas le voir pour une AUTRE
 //! piste prouve qu'elle ne déborde pas sur son voisin.
 //!
-//! La résolution du flux échoue ici — base `:memory:`, aucune piste, aucune
+//! La résolution du flux échoue ici — base `:memory:`, pistes sans fichier, aucune
 //! sortie. Sans effet sur ce qui est mesuré : l'ancrage précède l'appel à
 //! l'orchestrateur, exactement comme `set_session_context` de #1361.
 //!
@@ -37,6 +37,10 @@ const POSITION_RESTAUREE: i64 = 151_000;
 
 fn app_et_etat() -> (axum::Router, AppState) {
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    // La cible existe : ce témoin mesure le contrat suivant, pas une piste disparue.
+    state.backend.execute_batch(
+        "INSERT INTO tracks (id, title, file_path, source, duration_ms, format) VALUES (42, 'Piste synthétique 42', '/fixture-8832/42.flac', 'local', 300000, 'flac'), (43, 'Piste synthétique 43', '/fixture-8832/43.flac', 'local', 300000, 'flac');"
+    ).expect("pistes synthétiques sans fichier audio");
     let router = tune_server::routes::router(state.clone());
     (router, state)
 }

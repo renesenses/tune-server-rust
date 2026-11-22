@@ -1,0 +1,48 @@
+Tune 1.0.0-rc11, a Tune 1.0 tizenegyedik kiadásjelöltje.
+
+- **Szobakorrekció**: egy alapértelmezés szerint kikapcsolt bővítmény mikrofonnal méri a szobát (sweep, impulzusválasz, RT60), vagy mikrofon nélkül szimulálja a basszusmódusait, majd célgörbét és csak csillapító automatikus hangszínszabályzót javasol, zónánként egy profillal; Premium nélkül az impulzusválaszos konvolúció fokozatosan kikapcsol.
+- **Szülői felügyelet**: profilonkénti szabályok a Beállítások › Profilok alatt, explicit tartalom elrejtése, időablakok és hallgatási keret.
+- **Felülmintavételezés**: egy Premium, kiváló minőségű felülmintavételező bővítmény csatlakozik a helyi kimenethez, zónánkénti beállítással.
+- **Speciális lekérdezés**: kérdezze le a könyvtárat egy kifejezéssel, ugyanazzal, amely az intelligens gyűjteményeket definiálja.
+- **Albumonként egy oldal**: az album verziói csoportosítva vannak, és az album oldalán választhatók; új DSD-minőség és többcsatornás szűrők, valamint a csatornák száma jelenik meg.
+- **Jegyzetek és statisztikák**: személyes jegyzetek Markdownban és könyvtárstatisztikák megoszlás szerint.
+- **Katalógus és spektrogram**: exportálja a könyvtárat nyomtatható HTML-katalógusként az aktuális szűrőkkel; jelenítse meg egy szám spektrogramját a menüjéből; egy gomb leállítja a DR-elemzést két szám között.
+- **Világtérképek**: országtérkép és országszűrő a Könyvtárban; a földgömb megrajzolja a határokat, a partokat és a nagy folyókat, és ráhúzáskor kiírja az országot.
+- **Podcastok**: adjon hozzá podcastot az RSS-csatorna címével.
+- **TIDAL-mixek**: a Streaming › TIDAL „Mixeid” sora megjeleníti és lejátssza a fiók személyes mixeit.
+- **Hangszínszabályzó-import**: importáljon hangszínszabályzó-fájlt (AutoEq, Equalizer APO, OPRA) a sávok előnézetével az alkalmazás előtt.
+- **Életrajzok**: hivatkozások a Tune előadóira és albumaira, valamint a forrásra; az életrajzok és az albumjegyzetek igény szerint kiegészülnek a Qobuzból, bármi felülírása nélkül és visszavonhatóan.
+- **Lejátszási listák**: cserélje le a nem elérhető szolgáltatási számot a helyén, és javítsa meg a listát.
+- **Tune Circle**: írjon egy egész körnek az Üzenetekben; az általános körök és a szál hozzájárulása a közvetítőn keresztül megy.
+- **Fizikai gyűjtemény**: minden lemez borítója, keresés a streamingszolgáltatásokban, böngészés mappák, műfajok és stílusok szerint.
+- **Rádió**: szűrés a legalacsonyabb adásfolyam-minőségre a „További szűrőkben”, a „Saját rádiók” elválik az „Utoljára hallgatottaktól”, az alapértelmezett adásfolyam mindig lejátszható a hallgatási országban.
+- **Tune tested**: a Tune egy óra hibamentes hallgatás után külön gombbal felajánlja egy eszköz hozzáadását; a katalógusban már szereplő eszköz egy háztartást ad hozzá.
+- **Könyvtár**: „A szolgáltatások kedvenceivel bővített könyvtár” beállítás, alapértelmezés szerint bekapcsolva; gyorsabb keresés szókezdet szerint; a rácskeresés minden szót megkövetel; Tól / Ig időszak az évek idővonalán; simább számgörgetés.
+- **Számlisták**: az oszlopok sorrendje módosítható, és minden képernyő megjegyzi; a lejátszási lista képernyője borítókat, bélyegképméretet és tömör fejlécet kap; forrásjelvények a Lejátszási lista-kezelőben.
+- **Kezdőlap és folytatás**: válassza ki a hallgatási áttekintés paneljeit; a „Hallgatás folytatása” fajtánként mutat alcímet, a podcastot címmel és borítóval folytatja (DLNA-zónán a mentett pozíciótól való folytatás a következő verzióban érkezik), ismétlődések nélkül.
+- **Előzmények**: egy hallgatás csak 30 s vagy a szám fele után számít; a Leállítás utáni „Lejátszás” megtartja az aktuális albumot vagy listát; a podcastepizódok és a rádiók az állomás nevét viselik.
+- **Hallgatási statisztikák**: az importált hallgatások (Roon, Plex, m3u) beleszámítanak a legtöbbet hallgatottakba; az intelligens listák és az Előzmények úgy számolnak, mint a Könyvtár; egy Qobuz-hallgatás már nem számít az azonos nevű helyi albumhoz.
+- **Crosstalk és hangszínszabályzó**: szétválasztás / színezés görbe és hangfalválasz a beállítóképernyőn, célszétválasztás 1 dB-től; a paraméteres grafikon alapértelmezés szerint rögzített (Szerkesztés / Kész), csatornánként egy színnel.
+- **Bővítmények**: „Bővítmények állapota” panel a rendszergazdának; egy katalóguslap és a helyi bővítménye már egyetlen bővítmény.
+- **Értesítések**: a hibák megmaradnak, ráhúzáskor szünetelnek, és csoportosítva jelennek meg; az utolsó beégetett hibaüzenetek le vannak fordítva; a kivétel nyers szövege a „Részletek” alá van csukva.
+- **Háttérelemzések**: megjelenik az előrehaladás, az elsőbbség alacsony, az alapérték óvatos a beolvasás után; a gazdagítás ott folytatja, ahol abbahagyta, és 503 után újrapróbál; a kiadói logók „Menet indítása” szünetelés közben is hat.
+- **Támogatás és távoli elérés**: a hibajelentés naplókat csatol; a hivatkozás, a QR-kód és a másolás gomb visszatér a Beállítások › Távoli elérés alá.
+- **Lejátszás**: az átkódolás okai megnevezettek, és a FLAC változtatás nélkül érkezik, ha semmi sem érvényes; a Következő és az Előző átugorja a szolgáltatás által elutasított számokat.
+- **Hibajavítás, AirPlay 2**: a „Pair” gomb az AirPlay 2 összetevőn át párosít, vagy megnevezi az okot; a PIN-kódra várás már nem blokkolja a lejátszást, az ablak bezárása megszakítja; a munkamenet szünet után újranyílik; a pozíció halad, és a szünet már nem ismétlődik; az összetevő 64 bites Raspberry Pi-re is létezik.
+- **Hibajavítás, DLNA és OpenHome**: szünetmentes DSD-számok, gyorsabb „következő”, az eszközön végzett szünetet tiszteletben tartja, a gép saját kimenete már nem jelenik meg kétszer, OpenHome-hangerő várakozás nélkül, a Kazoo által betöltött lista megmarad, gyorsabb Play TIDAL CD-nél.
+- **Hibajavítás, hangerő**: egy új helyi kimenet már nem teljes kivezérléssel indul; a némítás feloldása után a csúszka visszatér az előző hangerőre; a csúszka minden állása külön szintet ad; a WASAPI- és ASIO-hangerő azonnal hallható; a Tune a biztonsági plafon alatt követi az eszközt.
+- **Hibajavítás, Windows**: a parancsikon konzolablak nélkül nyílik; a kimenet által nem vihető DoP PCM-ként megy ki; a hálózati felderítés átjut a tűzfalon; az olvashatatlan hőmérséklet már nem fékezi az elemzéseket; a frissítés kilépéskor indítja az átváltó szkriptet.
+- **Hibajavítás, frissítések és licenc**: Unixon az új bináris és a webes felület ellenőrzése megtörténik a régiek lecserélése előtt, a hiba pedig egyértelmű; a licenc eltávolítása a gépet a webhelyen is felszabadítja.
+- **Hibajavítás, könyvtár**: egy UPnP-szerver fotói és videói már nem kerülnek be; egy FLAC + CUE doboz egyetlen albumot alkot; a DSD- és CD-kiadás két album marad; a kézzel készített válogatás már nem esik szét; a törölt lejátszási lista nem jön létre újra beolvasáskor; az előadói címke nélküli újraolvasás már nem teszi az albumot „Unknown Artist” alá; egy mappa hozzáadása csak azt a mappát olvassa be.
+- **Hibajavítás, borítók és elemzések**: végső esetben a mappa legnagyobb képe; hamis Hi-Res elemzés a szám teljes hosszán; szünetmentes MP3; az integritásellenőrzés már nem nyilvánít csonkoltnak ép FLAC-fájlokat.
+- **Hibajavítás, streamingszolgáltatások**: a Spotify-keresés találatot ad, az elutasítás már nem néma, a kedvencek átlépik az 50 számot; a TIDAL › Kedvencek már nem fagyasztja le a Tune-t; a kedvencek nélküli Qobuz-fiók gyorsan adja vissza az üres listát; az átalakított szám elindul Safariban.
+- **Hibajavítás, hálózat és tárolás**: a felderítés folytatódik, ha a hálózat a Tune után érkezik; a sikertelen SMB-csatolás megmondja az okot, Dockerben is; a biztonsági mentés sikerül PostgreSQL-en; a CD-kimásolás elutasít egy megtelt vagy nem írható célt; a Tune a Squeezebox-portokat a gépen futó Lyrion-szervernek hagyja.
+- **Hibajavítás, képernyők**: a Koncertek képernyő licenc nélkül nyílik; a „Csoportosítás megszüntetése” újra megjelenik; a Most szól követi az albumváltást; a lejárt streaming-munkamenet megtartja az „Újracsatlakozás” fület; az Új ébresztő látható marad.
+- **Hibajavítás, Raspberry Pi 5**: az Active Cooler ventilátora újra forog (új Tune OS-lemezkép).
+- **Biztonság**: megerősítő javítások; hitelesítés nélküli szerveren a konfiguráció titkokkal együtt, titkosítatlanul történő exportálása elutasításra kerül (használja a jelmondattal titkosított biztonsági mentést).
+
+## Ismert problémák
+
+- **Némítás DLNA-zónán**: a némított zóna hanggal indulhat újra, amikor új szám indul. A javításig némítás helyett halkítsa le a hangerőt (következő verzió).
+- **Podcastepizód folytatása**: DLNA-zónán a folytatott epizód az elejéről indul (következő verzió).
+- **Tune Circle**: azok a körök, amelyeknek tagja, vagy amelyekbe meghívást kapott, még nem jelennek meg a listában úgy, mint az Ön által létrehozottak (következő verzió).

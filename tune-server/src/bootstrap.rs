@@ -323,8 +323,12 @@ pub async fn run_with(opts: RunOptions) {
                                 config.port
                             );
                             eprintln!("{phrase}");
-                            info!(%url, port = config.port, "instance_existante_ouverte — {phrase}");
-                            ie::ouvrir_le_navigateur(&url);
+                            info!(url = %tune_core::confidentialite::masquer_url(&url), port = config.port, "instance_existante_ouverte — {phrase}");
+                            let ouvrir = url.clone();
+                            let _ = tokio::task::spawn_blocking(move || {
+                                ie::ouvrir_le_navigateur(&ouvrir)
+                            })
+                            .await;
                             std::process::exit(0);
                         }
                         if let Some(version) = en_place.as_deref() {
@@ -496,6 +500,9 @@ pub async fn run_with(opts: RunOptions) {
     // #8325 / ESL63P — le réglage « Balises du classique » dans son miroir en
     // mémoire AVANT le premier scan : le scan le lit à chaque fichier.
     tune_core::metadata::balises_classique::charger(&state.backend);
+    // #9158 (Rob) — le réglage « Balises personnelles → tags Tune », pour la
+    // même raison : le scan le lit à chaque fichier.
+    tune_core::metadata::tags_perso::charger(&state.backend);
 
     // Auto-scan music directories at startup — et, même sans `auto_scan`,
     // la reprise d'un scan qu'une mise à jour forcée a arrêté (#5531).
@@ -702,8 +709,12 @@ pub async fn run_with(opts: RunOptions) {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             }
             let url = format!("http://localhost:{port}");
-            info!(url = %url, "opening_browser");
-            crate::instance_existante::ouvrir_le_navigateur(&url);
+            info!(url = %tune_core::confidentialite::masquer_url(&url), "opening_browser");
+            // Registre, shell, lancement : bloquant (#9061).
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::instance_existante::ouvrir_le_navigateur(&url)
+            })
+            .await;
         });
     }
 
@@ -1063,7 +1074,11 @@ pub fn installer_le_journal(niveau_journal: &str) -> Option<std::path::PathBuf> 
         let file_layer = tracing_subscriber::fmt::layer()
             .with_timer(file_timer)
             .with_ansi(false)
-            .with_writer(std::sync::Mutex::new(file));
+            // Aucun identifiant d'une URL (`user:pass@`, `?pass=…`) n'entre
+            // dans le fichier, quelle que soit la ligne qui la cite.
+            .with_writer(std::sync::Mutex::new(
+                tune_core::confidentialite::EcrivainMasque(file),
+            ));
 
         // La sortie de la console pointe-t-elle déjà sur CE fichier ? Alors la
         // couche console n'ajouterait rien qu'un doublon : on ne la pose pas.
@@ -1076,8 +1091,10 @@ pub fn installer_le_journal(niveau_journal: &str) -> Option<std::path::PathBuf> 
         // L'ancien nom `stderr_layer` disait le contraire et n'a jamais été
         // vrai.
         let console_ferait_doublon = crate::journal::la_console_ecrit_deja_dans(&chemin);
-        let console_layer = (!console_ferait_doublon)
-            .then(|| couche_console(timer, la_console_veut_des_couleurs()));
+        let console_layer = (!console_ferait_doublon).then(|| {
+            couche_console(timer, la_console_veut_des_couleurs())
+                .with_writer(|| tune_core::confidentialite::EcrivainMasque(std::io::stdout()))
+        });
 
         tracing_subscriber::registry()
             .with(env_filter)
@@ -1100,10 +1117,21 @@ pub fn installer_le_journal(niveau_journal: &str) -> Option<std::path::PathBuf> 
         return Some(chemin);
     }
 
+    // #9118 — aucun fichier : l'export ne retentera pas ces chemins à chaque
+    // rapport, il ira droit aux replis (journald, syslog).
+    if !refus_du_journal.is_empty() {
+        let raison = refus_du_journal
+            .iter()
+            .map(|(chemin, e)| format!("{} : {e}", chemin.display()))
+            .collect::<Vec<_>>()
+            .join(" ; ");
+        config::retenir_le_refus_du_journal(raison);
+    }
     tracing_subscriber::fmt()
         .with_timer(timer)
         .with_ansi(la_console_veut_des_couleurs())
         .with_env_filter(env_filter)
+        .with_writer(|| tune_core::confidentialite::EcrivainMasque(std::io::stdout()))
         .init();
     dire_les_refus(None);
     None

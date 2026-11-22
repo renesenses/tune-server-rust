@@ -10,8 +10,11 @@ use axum::http::{Request, StatusCode};
 use serde_json::{Value, json};
 use tower::ServiceExt;
 
-fn routeur() -> axum::Router {
+async fn routeur() -> axum::Router {
     let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+    // #9240 — créer un groupe OAAT exige Premium ; ces témoins portent sur
+    // le refus des récepteurs injoignables, pas sur le droit.
+    state.license.set_account_premium(true, None).await;
     super::router().with_state(state)
 }
 
@@ -42,7 +45,7 @@ async fn envoyer(
 
 #[tokio::test]
 async fn un_groupe_refuse_ne_repond_plus_200_8185() {
-    let app = routeur();
+    let app = routeur().await;
     // Port 1 de la boucle locale : rien n'y écoute (voir `port_ferme`).
     let (statut, corps) = envoyer(
         &app,
@@ -69,7 +72,7 @@ async fn un_groupe_refuse_ne_repond_plus_200_8185() {
 
 #[tokio::test]
 async fn un_groupe_sans_membre_est_refuse_par_un_400_8185() {
-    let app = routeur();
+    let app = routeur().await;
     let (statut, corps) = envoyer(
         &app,
         "POST",
@@ -94,7 +97,7 @@ async fn un_groupe_accepte_repond_200_et_apparait_dans_la_liste_8185() {
             }
         }
     });
-    let app = routeur();
+    let app = routeur().await;
     let (statut, corps) = envoyer(
         &app,
         "POST",

@@ -263,6 +263,9 @@ async fn banc(url: &str, echecs_401: usize) -> Banc {
 
 fn entree(source: &str, titre: &str, duree_ms: i64) -> QueueInput {
     QueueInput::Streaming {
+        media_format: None,
+        sample_rate: None,
+        bit_depth: None,
         source: source.into(),
         source_id: PISTE.into(),
         title: titre.into(),

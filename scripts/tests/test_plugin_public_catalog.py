@@ -27,7 +27,7 @@ class PublicCatalogTests(unittest.TestCase):
         self.assertIsNone(entries["bandcamp"]["min_tune_version"])
         self.assertFalse(entries["circle"]["default_enabled"])
         self.assertIn("Réaffectation", entries["channel-remap"]["description"])
-        self.assertIn("Dé-ploc", entries["declick"]["description"])
+        self.assertIn("Declick", entries["declick"]["description"])
         self.assertNotIn("dj", entries)
         self.assertNotIn("karaoke", entries)
 

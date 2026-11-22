@@ -111,6 +111,9 @@ pub(super) struct EntreesWasapi {
     pub(super) track_artist: Arc<std::sync::Mutex<Option<String>>>,
     pub(super) duration_ms: Arc<AtomicU64>,
     pub(super) seek_offset_ms: Arc<AtomicU64>,
+    /// #8869 — le silence de verrouillage dont le flux est précédé.
+    pub(super) silence_de_verrouillage:
+        crate::audio::silence_de_verrouillage::SilenceDeVerrouillage,
     /// #8696 — la période WASAPI exclusive réglée sur la zone, en ms ; `0` =
     /// Auto. Lue UNE fois par piste par `play_url`.
     pub(super) reglage_periode_ms: u32,
@@ -476,6 +479,7 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
         track_artist,
         duration_ms,
         seek_offset_ms,
+        silence_de_verrouillage,
         reglage_periode_ms,
     } = entrees;
 
@@ -601,7 +605,10 @@ pub(super) fn jouer_via_wasapi(entrees: EntreesWasapi) {
     .avec_l_adaptation_des_canaux(&reaffectation, &disposition)
     .avec_publication(&transformations_reelles)
     .avec_le_gain_au_rendu(backend.anneau());
-    let mut puits = match backend.puits() {
+    let mut puits = match backend
+        .puits()
+        .precede_du_silence(&silence_de_verrouillage, backend.format_ouvert())
+    {
         Puits::Natif(puits) => puits,
         Puits::Flottant(_) => unreachable!("BackendWasapi ne fournit qu'un puits natif"),
     };

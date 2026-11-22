@@ -284,6 +284,8 @@ enum AttemptError {
     Http { status: u16, body: String },
     /// Body of a successful response failed to parse — final, no fallback.
     Json(String),
+    /// Réponse de connexion 200, sans jeton utilisable.
+    MissingToken,
 }
 
 impl AttemptError {
@@ -293,7 +295,7 @@ impl AttemptError {
         match self {
             Self::Network(_) => true,
             Self::Http { status, .. } => *status >= 500 || self.refus_de_peripherie(),
-            Self::Json(_) => false,
+            Self::Json(_) | Self::MissingToken => false,
         }
     }
 
@@ -325,7 +327,7 @@ impl AttemptError {
     fn statut_http(&self) -> Option<u16> {
         match self {
             Self::Http { status, .. } => Some(*status),
-            Self::Network(_) | Self::Json(_) => None,
+            Self::Network(_) | Self::Json(_) | Self::MissingToken => None,
         }
     }
 }
@@ -345,8 +347,17 @@ fn corps_de_peripherie(body: &str) -> bool {
 /// réseau ». Une vraie réponse de l'API au secours (401 identifiants, 400
 /// application…) l'emporte toujours : elle seule parle du compte.
 fn echec_le_plus_parlant(primaire: AttemptError, secours: AttemptError) -> AttemptError {
-    if primaire.refus_de_peripherie() && secours.transient() && !secours.refus_de_peripherie() {
-        info!(error = %secours, "qobuz_fallback_failed_after_edge_refusal");
+    echec_et_origine_les_plus_parlants((primaire, ()), (secours, ())).0
+}
+
+/// L'origine accompagne exactement l'erreur retenue, sans recopier sa priorité.
+fn echec_et_origine_les_plus_parlants<T>(
+    primaire: (AttemptError, T),
+    secours: (AttemptError, T),
+) -> (AttemptError, T) {
+    if primaire.0.refus_de_peripherie() && secours.0.transient() && !secours.0.refus_de_peripherie()
+    {
+        info!(error = %secours.0, "qobuz_fallback_failed_after_edge_refusal");
         primaire
     } else {
         secours
@@ -389,6 +400,13 @@ const MOTIF_RESEAU_REFUSE: &str = "qobuz login: Qobuz refuses connections from t
 /// même refus de l'application. Tout autre 401 reste un refus d'identifiants,
 /// comme avant : on ne requalifie que les messages reconnus.
 fn erreur_de_connexion(err: &AttemptError) -> TuneError {
+    if matches!(err, AttemptError::MissingToken) {
+        return TuneError::Refused {
+            code: "qobuz_login_incomplete",
+            message: "Qobuz login incomplete: response contains no usable authentication token"
+                .into(),
+        };
+    }
     if application_refusee(err) {
         return TuneError::AppRefused(MOTIF_APPLICATION_REFUSEE.to_string());
     }
@@ -402,6 +420,36 @@ fn erreur_de_connexion(err: &AttemptError) -> TuneError {
         Some(401) => TuneError::Credentials("qobuz login: invalid credentials".to_string()),
         _ => TuneError::Other(format!("qobuz login: {err}")),
     }
+}
+
+/// Le relais peut rendre son propre 401 : son origine ne prouve pas que
+/// Qobuz a refusé le mot de passe. Les refus d'application reconnus restent
+/// distincts (#8134).
+fn erreur_connexion_origine(err: &AttemptError, origine: &str) -> TuneError {
+    if origine == "relais"
+        && err.statut_http() == Some(401)
+        && !application_refusee(err)
+        && !identifiants_refuses_par_qobuz(err)
+    {
+        return TuneError::Refused {
+            code: "qobuz_relay_login_refused",
+            message: "Qobuz login refused through the relay; the origin does not establish that the password is incorrect".into(),
+        };
+    }
+    erreur_de_connexion(err)
+}
+
+/// Le relais peut transmettre tel quel le refus explicite de Qobuz.
+fn identifiants_refuses_par_qobuz(err: &AttemptError) -> bool {
+    let AttemptError::Http { status: 401, body } = err else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| value["message"].as_str().map(str::to_owned))
+        .is_some_and(|message| {
+            message.eq_ignore_ascii_case("Invalid username/email and password combination")
+        })
 }
 
 /// Le texte de [`TuneError::AppRefused`] pour Qobuz : il dit que le mot de
@@ -430,6 +478,9 @@ fn application_refusee(err: &AttemptError) -> bool {
 
 /// La nature d'un échec de connexion, pour le journal (`qobuz_login_failed`).
 fn nature_echec_connexion(err: &AttemptError) -> &'static str {
+    if matches!(err, AttemptError::MissingToken) {
+        return "jeton_absent";
+    }
     if application_refusee(err) {
         "application_refusee"
     } else if err.refus_de_peripherie() {
@@ -458,6 +509,7 @@ impl std::fmt::Display for AttemptError {
             Self::Network(e) => write!(f, "{e}"),
             Self::Http { status, body } => write!(f, "{status} {body}"),
             Self::Json(e) => write!(f, "json: {e}"),
+            Self::MissingToken => write!(f, "jeton absent"),
         }
     }
 }
@@ -2749,6 +2801,14 @@ impl QobuzService {
             ai_generated: item["ai_generated"].as_bool(),
             // #8088 — le marquage explicite de l'album, comme celui des pistes.
             explicit: item["parental_warning"].as_bool(),
+            // Pour l'affichage sous la vignette dans une liste qui mélange
+            // plusieurs genres (#8925 et suite) — déjà dans la réponse,
+            // même chemin que `AlbumContext` plus haut.
+            genre_id: item["genre"]["id"]
+                .as_u64()
+                .map(|id| id.to_string())
+                .or_else(|| item["genre"]["id"].as_str().map(Into::into)),
+            genre_name: item["genre"]["name"].as_str().map(Into::into),
         }
     }
 
@@ -3171,9 +3231,17 @@ impl QobuzService {
             return Err(AttemptError::Http { status, body });
         }
 
-        resp.json()
+        let data: serde_json::Value = resp
+            .json()
             .await
-            .map_err(|e| AttemptError::Json(e.to_string()))
+            .map_err(|e| AttemptError::Json(e.to_string()))?;
+        if data["user_auth_token"]
+            .as_str()
+            .is_none_or(|token| token.trim().is_empty())
+        {
+            return Err(AttemptError::MissingToken);
+        }
+        Ok(data)
     }
 
     /// Login following the configured endpoint order. Direct-first by default so
@@ -3193,14 +3261,14 @@ impl QobuzService {
 
         let (data, retenue) = match self.connexion_avec(&candidate.0, username, password).await {
             Ok(d) => (d, candidate),
-            Err(err) => {
-                self.journaliser_echec_connexion(&candidate.0, &err);
+            Err((err, origine)) => {
+                self.journaliser_echec_connexion(&candidate.0, &err, origine);
                 // #8134 — Qobuz peut refuser une application avec le message
                 // d'un mauvais mot de passe : seule la comparaison avec
                 // l'application précédente, même mot de passe, les distingue.
                 let refus = matches!(err.statut_http(), Some(400 | 401));
                 let Some(repli) = repli.filter(|_| refus) else {
-                    return Err(erreur_de_connexion(&err));
+                    return Err(erreur_connexion_origine(&err, origine));
                 };
                 match self.connexion_avec(&repli.0, username, password).await {
                     Ok(d) => {
@@ -3211,9 +3279,9 @@ impl QobuzService {
                         );
                         (d, repli)
                     }
-                    Err(e) => {
-                        self.journaliser_echec_connexion(&repli.0, &e);
-                        return Err(erreur_de_connexion(&e));
+                    Err((e, origine)) => {
+                        self.journaliser_echec_connexion(&repli.0, &e, origine);
+                        return Err(erreur_connexion_origine(&e, origine));
                     }
                 }
             }
@@ -3239,27 +3307,38 @@ impl QobuzService {
         app_id: &str,
         username: &str,
         password: &str,
-    ) -> Result<serde_json::Value, AttemptError> {
+    ) -> Result<serde_json::Value, (AttemptError, &'static str)> {
         let (primary, fallback) = self.bases_ordonnees();
+        let (origine_primaire, origine_secours) = if self.proxy_first {
+            ("relais", "direct")
+        } else {
+            ("direct", "relais")
+        };
         match self.login_at(primary, app_id, username, password).await {
             Err(err) if err.transient() => {
                 log_fallback(self.proxy_first, "/user/login", &err);
                 self.login_at(fallback, app_id, username, password)
                     .await
-                    .map_err(|e| echec_le_plus_parlant(err, e))
+                    .map_err(|e| {
+                        echec_et_origine_les_plus_parlants(
+                            (err, origine_primaire),
+                            (e, origine_secours),
+                        )
+                    })
             }
-            autre => autre,
+            autre => autre.map_err(|e| (e, origine_primaire)),
         }
     }
 
     /// Une ligne qui dit, sans relire le corps de Qobuz, si c'est le compte ou
     /// l'application qui est refusé, et avec quel `app_id` (six caractères).
-    fn journaliser_echec_connexion(&self, app_id: &str, err: &AttemptError) {
+    fn journaliser_echec_connexion(&self, app_id: &str, err: &AttemptError, origine: &str) {
         let nature = nature_echec_connexion(err);
         let app_id = prefixe_app_id(app_id);
         if nature == "application_refusee" {
             warn!(
                 nature,
+                origine,
                 app_id = %app_id,
                 error = %err,
                 conseil = "Qobuz refuse l'application (app_id), pas le mot de passe : \
@@ -3267,7 +3346,7 @@ impl QobuzService {
                 "qobuz_login_failed"
             );
         } else {
-            info!(nature, app_id = %app_id, error = %err, "qobuz_login_failed");
+            info!(nature, origine, app_id = %app_id, error = %err, "qobuz_login_failed");
         }
     }
 
@@ -6057,6 +6136,28 @@ mod tests {
         assert_eq!(non.ai_generated, Some(false));
         let chaine = QobuzService::map_album(&json!({"id": "1", "ai_generated": "true"}));
         assert_eq!(chaine.ai_generated, None);
+    }
+
+    /// Le genre de l'album remonte pour l'afficher sous la vignette (#8925) ;
+    /// absent, il reste absent et n'apparaît pas dans le JSON.
+    #[test]
+    fn map_album_porte_le_genre_de_qobuz() {
+        let album = QobuzService::map_album(&json!({
+            "id": "1",
+            "genre": {"id": 80, "name": "Jazz"},
+        }));
+        assert_eq!(album.genre_id.as_deref(), Some("80"));
+        assert_eq!(album.genre_name.as_deref(), Some("Jazz"));
+
+        let chaine = QobuzService::map_album(&json!({"id": "1", "genre": {"id": "80"}}));
+        assert_eq!(chaine.genre_id.as_deref(), Some("80"));
+        assert_eq!(chaine.genre_name, None);
+
+        let sans = QobuzService::map_album(&json!({"id": "2"}));
+        assert_eq!(sans.genre_id, None);
+        let rendu = serde_json::to_value(&sans).unwrap();
+        assert!(rendu.get("genre_id").is_none(), "{rendu}");
+        assert!(rendu.get("genre_name").is_none(), "{rendu}");
     }
 
     /// Un favori PISTE emporte le marquage de son album imbriqué ; un favori
@@ -9868,3 +9969,7 @@ mod tests_nouveautes_du_lecteur_8646 {
         assert_eq!(album.quality.expect("qualité").sample_rate, 192_000);
     }
 }
+
+#[cfg(test)]
+#[path = "qobuz_connexion_8867_tests.rs"]
+mod connexion_8867_tests;

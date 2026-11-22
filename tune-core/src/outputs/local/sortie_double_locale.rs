@@ -479,10 +479,14 @@ pub(super) fn ouvrir_la_seconde_sortie(
     let mut demarre = false;
     let mut gain_precedent: Option<f32> = None;
     let nom_erreur = nom.to_string();
+    // Le fil de rendu de B est un fil cpal neuf : même promotion temps réel
+    // que celui de A, à sa première période.
+    let mut promotion = PromotionDuFilDeRendu::nouvelle();
     let flux = device
         .build_output_stream(
             &config,
             move |data: &mut [f32], info: &cpal::OutputCallbackInfo| {
+                promotion.a_la_premiere_periode();
                 let latence_b = latence_du_rappel(info);
                 anneau_cb
                     .periode_annoncee

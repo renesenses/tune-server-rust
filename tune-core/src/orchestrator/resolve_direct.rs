@@ -433,9 +433,11 @@ impl PlaybackOrchestrator {
     /// 2. **`source` et `source_id` ne bougent PAS.** Le renderer reconnaît sa
     ///    session en comparant `now_playing.source_id` à l'URI de la session
     ///    (`doit_reprendre`), et la reprise après pause en dépend. Le chemin
-    ///    des octets reste celui d'aujourd'hui : `url_nommee` l'emporte dans
-    ///    `resolve_direct_url_de_source`, l'URI est jouée telle quelle.
-    /// 3. **L'hôte doit être le nôtre** ([`hote_de_cette_machine`]). Un second
+    ///    des octets se décide dans `resolve_stream` : une ligne LOCALE y est
+    ///    traitée en piste locale de bout en bout (#9207) ; sinon
+    ///    `url_nommee` l'emporte et l'URI est jouée telle quelle.
+    /// 3. **L'hôte doit être le nôtre** (port compris, règle unique de
+    ///    `uri_de_notre_bibliotheque_9207`). Un second
     ///    Tune sur le même réseau publie SES `<res>` avec SON adresse, et
     ///    l'identifiant 187500 n'y désigne pas la même piste. Afficher un
     ///    titre FAUX serait pire que « Episode ». Quand l'hôte ne se
@@ -478,7 +480,8 @@ impl PlaybackOrchestrator {
     }
 
     /// La ligne `tracks` que désigne une URI audio publiée par CETTE instance
-    /// ([`track_id_dans_une_url_audio_de_tune`]), avec son identifiant.
+    /// (`id_de_notre_uri`, la même règle d'hôte et de port que la lecture
+    /// en piste locale, #9207), avec son identifiant.
     ///
     /// Le cœur de [`Self::resoudre_l_uri_en_piste_de_bibliotheque`] (#4323),
     /// partagé avec l'avance sans blanc (`advance_queue_metadata`, fil 2119) :
@@ -491,7 +494,7 @@ impl PlaybackOrchestrator {
         &self,
         uri: &str,
     ) -> Option<(i64, crate::db::models::Track)> {
-        let track_id = track_id_dans_une_url_audio_de_tune(uri)?;
+        let track_id = self.id_de_notre_uri(uri)?;
         crate::db::track_repo::TrackRepo::with_backend(self.db.clone())
             .get(track_id)
             .ok()
@@ -631,7 +634,7 @@ impl PlaybackOrchestrator {
             info!(
                 track_id = ?req.track_id,
                 zone_id = req.zone_id,
-                url = %raw_url,
+                url = %crate::confidentialite::masquer_url(&raw_url),
                 "upnp_url_de_lecture_lue_dans_l_instantane"
             );
         }
@@ -656,7 +659,7 @@ impl PlaybackOrchestrator {
             warn!(
                 track_id,
                 zone_id = req.zone_id,
-                url = %raw_url,
+                url = %crate::confidentialite::masquer_url(&raw_url),
                 raison = absent.raison.code(),
                 depuis_secs = absent.depuis_secs,
                 "upnp_refus_serveur_source_absent"
@@ -697,11 +700,11 @@ impl PlaybackOrchestrator {
                 .await
             {
                 Ok(flux) => {
-                    info!(zone_id = req.zone_id, page = %audio_url, "bandcamp_page_de_piste_resolue");
+                    info!(zone_id = req.zone_id, page = %crate::confidentialite::masquer_url(&audio_url), "bandcamp_page_de_piste_resolue");
                     Some((flux, audio_url.to_string()))
                 }
                 Err(e) => {
-                    warn!(zone_id = req.zone_id, page = %audio_url, error = %e, "bandcamp_page_de_piste_illisible");
+                    warn!(zone_id = req.zone_id, page = %crate::confidentialite::masquer_url(&audio_url), error = %e, "bandcamp_page_de_piste_illisible");
                     return Err(format!(
                         "Lecture impossible : la page Bandcamp {audio_url} ne donne pas de flux jouable ({e})"
                     ));
@@ -891,7 +894,7 @@ impl PlaybackOrchestrator {
             info!(
                 zone_id = req.zone_id,
                 track_id = ?req.track_id,
-                url = %audio_url,
+                url = %crate::confidentialite::masquer_url(&audio_url),
                 mime = mime_type,
                 politique = politique.as_str(),
                 "dsd_upnp_politique_de_zone"
@@ -978,7 +981,7 @@ impl PlaybackOrchestrator {
         if opus && crate::audio::frequence_fixe::cible(&self.db, req.zone_id, plafond)?.is_some() {
             info!(
                 zone_id = req.zone_id,
-                url = %audio_url,
+                url = %crate::confidentialite::masquer_url(&audio_url),
                 mime = mime_type,
                 "frequence_fixe_ecartee_pour_l_opus_d_une_url_directe"
             );
@@ -1430,7 +1433,11 @@ impl PlaybackOrchestrator {
         let conteneur = if !nomme && pour("dsf") != pour("dff") {
             match conteneur_dsd_par_l_en_tete(audio_url).await {
                 Some(lu) => {
-                    info!(url = %audio_url, conteneur = lu, "dsd_upnp_conteneur_lu_a_l_en_tete");
+                    info!(
+                        url = %crate::confidentialite::masquer_url(&audio_url),
+                        conteneur = lu,
+                        "dsd_upnp_conteneur_lu_a_l_en_tete"
+                    );
                     lu
                 }
                 None => conteneur,
@@ -1511,7 +1518,7 @@ impl PlaybackOrchestrator {
                 }
                 info!(
                     zone_id = req.zone_id,
-                    url = %audio_url,
+                    url = %crate::confidentialite::masquer_url(&audio_url),
                     conteneur,
                     mime_source = mime_type,
                     mime_annonce = %mime_brut,
@@ -1653,7 +1660,7 @@ impl PlaybackOrchestrator {
         }
         info!(
             zone_id = req.zone_id,
-            url = %audio_url,
+            url = %crate::confidentialite::masquer_url(&audio_url),
             sample_rate = sr,
             bit_depth = bd,
             "dsd_upnp_decodage_progressif_en_wav"
@@ -1688,9 +1695,11 @@ impl PlaybackOrchestrator {
             })
             .await;
             match result {
-                Ok(Ok(_)) => debug!(url = %url, "dsd_upnp_wav_channel_complete"),
+                Ok(Ok(_)) => {
+                    debug!(url = %crate::confidentialite::masquer_url(&url), "dsd_upnp_wav_channel_complete")
+                }
                 Ok(Err(e)) => {
-                    warn!(url = %url, error = %e, "dsd_upnp_wav_channel_decode_failed");
+                    warn!(url = %crate::confidentialite::masquer_url(&url), error = %e, "dsd_upnp_wav_channel_decode_failed");
                     if let Some(ref bus) = err_bus {
                         bus.emit(
                             "zone.playback_error",
@@ -1705,7 +1714,9 @@ impl PlaybackOrchestrator {
                         );
                     }
                 }
-                Err(e) => warn!(url = %url, error = %e, "dsd_upnp_wav_channel_task_panic"),
+                Err(e) => {
+                    warn!(url = %crate::confidentialite::masquer_url(&url), error = %e, "dsd_upnp_wav_channel_task_panic")
+                }
             }
         });
 
@@ -1735,7 +1746,7 @@ impl PlaybackOrchestrator {
         }) else {
             warn!(
                 zone_id = req.zone_id,
-                url = %audio_url,
+                url = %crate::confidentialite::masquer_url(&audio_url),
                 "dsd_upnp_dop_sans_ligne_en_base_repli_pcm"
             );
             return Ok(None);
@@ -1773,7 +1784,7 @@ impl PlaybackOrchestrator {
                 }
                 resolu.source = "upnp".into();
                 resolu.origin_url = Some(audio_url.to_string());
-                info!(zone_id = req.zone_id, url = %audio_url, "dsd_upnp_dop");
+                info!(zone_id = req.zone_id, url = %crate::confidentialite::masquer_url(&audio_url), "dsd_upnp_dop");
                 Ok(Some(resolu))
             }
             autre => {
@@ -1874,22 +1885,22 @@ impl PlaybackOrchestrator {
         let source_range = match sonde {
             Ok(Ok(Ok(source))) => Some(source),
             Ok(Ok(Err(e))) => {
-                debug!(url = %audio_url, error = %e, "frequence_fixe_url_directe_sans_range");
+                debug!(url = %crate::confidentialite::masquer_url(&audio_url), error = %e, "frequence_fixe_url_directe_sans_range");
                 None
             }
             Ok(Err(e)) => {
-                warn!(url = %audio_url, error = %e, "frequence_fixe_url_directe_sonde_paniquee");
+                warn!(url = %crate::confidentialite::masquer_url(&audio_url), error = %e, "frequence_fixe_url_directe_sonde_paniquee");
                 None
             }
             Err(_) => {
-                warn!(url = %audio_url, "frequence_fixe_url_directe_sonde_range_trop_longue");
+                warn!(url = %crate::confidentialite::masquer_url(&audio_url), "frequence_fixe_url_directe_sonde_range_trop_longue");
                 None
             }
         };
         if source_range.is_none() && seek_s > 0.0 {
             warn!(
                 zone_id = req.zone_id,
-                url = %audio_url,
+                url = %crate::confidentialite::masquer_url(&audio_url),
                 seek_s,
                 "frequence_fixe_url_directe_saut_ignore_sans_range"
             );
@@ -1897,7 +1908,7 @@ impl PlaybackOrchestrator {
         }
         info!(
             zone_id = req.zone_id,
-            url = %audio_url,
+            url = %crate::confidentialite::masquer_url(&audio_url),
             conteneur = %conteneur,
             cadence,
             bit_depth = bd,
@@ -1941,9 +1952,11 @@ impl PlaybackOrchestrator {
             })
             .await;
             match result {
-                Ok(Ok(_)) => debug!(url = %url, "frequence_fixe_url_directe_terminee"),
+                Ok(Ok(_)) => {
+                    debug!(url = %crate::confidentialite::masquer_url(&url), "frequence_fixe_url_directe_terminee")
+                }
                 Ok(Err(e)) => {
-                    warn!(url = %url, error = %e, "frequence_fixe_url_directe_decodage_echoue");
+                    warn!(url = %crate::confidentialite::masquer_url(&url), error = %e, "frequence_fixe_url_directe_decodage_echoue");
                     if let Some(ref bus) = err_bus {
                         bus.emit(
                             "zone.playback_error",
@@ -1957,7 +1970,7 @@ impl PlaybackOrchestrator {
                     }
                 }
                 Err(e) => {
-                    warn!(url = %url, error = %e, "frequence_fixe_url_directe_tache_paniquee")
+                    warn!(url = %crate::confidentialite::masquer_url(&url), error = %e, "frequence_fixe_url_directe_tache_paniquee")
                 }
             }
         });
@@ -2017,7 +2030,7 @@ impl PlaybackOrchestrator {
         if entete.is_none() {
             warn!(
                 zone_id = req.zone_id,
-                url = %audio_url,
+                url = %crate::confidentialite::masquer_url(&audio_url),
                 "dsd_upnp_sortie_locale_entete_illisible"
             );
         }
@@ -2065,7 +2078,7 @@ impl PlaybackOrchestrator {
                 resolu.origin_url = Some(audio_url.to_string());
                 info!(
                     zone_id = req.zone_id,
-                    url = %audio_url,
+                    url = %crate::confidentialite::masquer_url(&audio_url),
                     entete_lue = entete.is_some(),
                     mime = %resolu.mime_type,
                     sample_rate = ?resolu.sample_rate,
@@ -2923,36 +2936,6 @@ mod temoins_de_l_url_indexee {
     }
 }
 
-/// **L'inverse de [`crate::upnp_server::track_audio_url`].**
-///
-/// Rend l'identifiant de piste quand `url` est l'adresse SOUS LAQUELLE CETTE
-/// INSTANCE publie l'audio d'une de ses pistes, et `None` dans tous les autres
-/// cas — autre hôte, autre chemin, identifiant illisible.
-///
-/// Le chemin n'est pas réécrit à la main : il est construit à partir de
-/// [`crate::upnp_server::API_PATH`], la même constante que le constructeur.
-/// Le témoin `l_aller_et_le_retour_parlent_de_la_meme_url` fait l'aller-retour
-/// sur le constructeur lui-même, pour qu'un changement de route rougisse ici
-/// plutôt que de rendre silencieusement « Episode ».
-fn track_id_dans_une_url_audio_de_tune(url: &str) -> Option<i64> {
-    let url = url.trim();
-    let sans_schema = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))?;
-    let (hote, chemin) = sans_schema.split_at(sans_schema.find('/')?);
-    if !hote_de_cette_machine(hote) {
-        return None;
-    }
-    let chemin = chemin.split(['?', '#']).next().unwrap_or(chemin);
-    chemin
-        .strip_prefix(crate::upnp_server::API_PATH)?
-        .strip_prefix("/library/tracks/")?
-        .strip_suffix("/audio")?
-        .parse::<i64>()
-        .ok()
-        .filter(|id| *id > 0)
-}
-
 /// L'hôte seul d'une URL de flux, pour le journal (#6468).
 ///
 /// L'URL d'un flux de service (Bandcamp, podcast privé, radio, onglet) porte
@@ -2964,122 +2947,4 @@ pub(crate) fn hote_pour_le_journal(url: &str) -> String {
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
         .unwrap_or_else(|| "?".to_string())
-}
-
-/// Cet hôte d'URL est-il une adresse de CETTE machine ?
-///
-/// La question tient en un mot : l'identifiant de piste porté par l'URL
-/// n'a de sens que dans la base d'un serveur donné. Un autre Tune du même
-/// réseau publie ses `<res>` avec son adresse à lui, et son `187500` est une
-/// autre piste. Répondre « non » ne coûte que le repli d'aujourd'hui ;
-/// répondre « oui » à tort afficherait un titre faux.
-///
-/// La boucle locale et `localhost` passent (c'est l'accès depuis la machine
-/// même), puis les adresses IPv4 réellement portées par les interfaces
-/// (`local_ipv4_addresses`, qui exclut la boucle — d'où le test séparé).
-/// Un NOM d'hôte ne passe pas : le résoudre demanderait un appel DNS sur le
-/// chemin de lecture, et l'échec est sans dommage.
-fn hote_de_cette_machine(hote: &str) -> bool {
-    let sans_port = match hote.strip_prefix('[') {
-        // IPv6 littéral : `[::1]:8888`
-        Some(reste) => reste.split(']').next().unwrap_or(reste),
-        None => hote.split(':').next().unwrap_or(hote),
-    };
-    if sans_port.eq_ignore_ascii_case("localhost") {
-        return true;
-    }
-    let Ok(ip) = sans_port.parse::<std::net::IpAddr>() else {
-        return false;
-    };
-    if ip.is_loopback() {
-        return true;
-    }
-    match ip {
-        std::net::IpAddr::V4(v4) => crate::discovery::ssdp::local_ipv4_addresses().contains(&v4),
-        std::net::IpAddr::V6(_) => false,
-    }
-}
-
-#[cfg(test)]
-mod temoins_de_l_uri_du_renderer {
-    use super::{hote_de_cette_machine, track_id_dans_une_url_audio_de_tune};
-
-    /// L'URI que Tades a vue passer (fil 1819), à l'adresse près : une piste
-    /// de la bibliothèque, servie par Tune lui-même.
-    #[test]
-    fn une_url_de_piste_de_tune_rend_son_identifiant() {
-        for url in [
-            "http://127.0.0.1:8888/api/v1/library/tracks/187500/audio",
-            "https://127.0.0.1:8888/api/v1/library/tracks/187500/audio",
-            "http://localhost:8888/api/v1/library/tracks/187500/audio",
-            "  http://127.0.0.1/api/v1/library/tracks/187500/audio  ",
-            "http://[::1]:8888/api/v1/library/tracks/187500/audio",
-            "http://127.0.0.1:8888/api/v1/library/tracks/187500/audio?x=1",
-        ] {
-            assert_eq!(
-                track_id_dans_une_url_audio_de_tune(url),
-                Some(187_500),
-                "« {url} » désigne la piste 187500 de cette bibliothèque"
-            );
-        }
-    }
-
-    /// **La contre-épreuve.** Rien d'autre ne doit être pris pour une piste
-    /// d'ici : un titre faux serait pire que le repli « Episode ».
-    #[test]
-    fn rien_d_autre_ne_passe() {
-        for url in [
-            // Un AUTRE serveur — Tune ou non. `198.51.100.7` est réservé à la
-            // documentation (RFC 5737) : aucune interface ne le porte.
-            "http://198.51.100.7:8888/api/v1/library/tracks/187500/audio",
-            // Un nom d'hôte : non résolu, donc non reconnu.
-            "http://tune.local:8888/api/v1/library/tracks/187500/audio",
-            // Le serveur média d'un tiers.
-            "http://127.0.0.1:26125/content/c2/b16/f44100/d61-coX.flac",
-            // Nos autres routes : une radio n'est pas une piste.
-            "http://127.0.0.1:8888/api/v1/radios/12/audio.wav",
-            "http://127.0.0.1:8888/api/v1/library/tracks/187500/metadata",
-            "http://127.0.0.1:8888/api/v1/library/tracks/187500",
-            // Identifiants illisibles ou absurdes.
-            "http://127.0.0.1:8888/api/v1/library/tracks/abc/audio",
-            "http://127.0.0.1:8888/api/v1/library/tracks/0/audio",
-            "http://127.0.0.1:8888/api/v1/library/tracks/-3/audio",
-            "http://127.0.0.1:8888/api/v1/library/tracks//audio",
-            // Pas une URL du tout — le condensat d'identité de la phase 2.
-            "uuid:258FC2D5-E2C3-B734-0-123456789abc|85944171f73967e8",
-            "",
-        ] {
-            assert_eq!(
-                track_id_dans_une_url_audio_de_tune(url),
-                None,
-                "« {url} » ne désigne PAS une piste de cette bibliothèque"
-            );
-        }
-    }
-
-    /// Le chemin lu ici et le chemin publié dans la DIDL sont le MÊME contrat.
-    /// L'aller-retour passe par le constructeur : si la route
-    /// `/tracks/{id}/audio` ou `API_PATH` changeait, ce témoin rougirait — et
-    /// non l'affichage, huit mois plus tard, chez un testeur.
-    #[test]
-    fn l_aller_et_le_retour_parlent_de_la_meme_url() {
-        let url = crate::upnp_server::track_audio_url("http://127.0.0.1:8888", 187_500);
-        assert_eq!(
-            track_id_dans_une_url_audio_de_tune(&url),
-            Some(187_500),
-            "l'URL publiée dans le <res> doit se relire : {url}"
-        );
-    }
-
-    /// La boucle locale est nous ; l'adresse de documentation ne l'est pas.
-    #[test]
-    fn l_hote_se_reconnait_ou_se_tait() {
-        assert!(hote_de_cette_machine("127.0.0.1:8888"));
-        assert!(hote_de_cette_machine("127.0.0.1"));
-        assert!(hote_de_cette_machine("LocalHost:8888"));
-        assert!(hote_de_cette_machine("[::1]:8888"));
-        assert!(!hote_de_cette_machine("198.51.100.7:8888"));
-        assert!(!hote_de_cette_machine("tune.local:8888"));
-        assert!(!hote_de_cette_machine(""));
-    }
 }

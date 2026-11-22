@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
@@ -175,6 +175,14 @@ pub struct Faux {
     pub conflits_a_simuler: usize,
     /// Ajout groupé : après ce nombre d'ajouts acceptés, le cloud rend 429.
     pub ajouts_avant_refus: Option<usize>,
+    // Cercle partagé (site-mozaiklabs#568) ------------------------------------
+    /// Les cercles du détenteur partagés entre leurs membres.
+    pub cercles_entre_membres: Vec<i64>,
+    /// Chaque geste reçu sur `…/sharing/members` et `…/show-me` :
+    /// `"PUT /circles/1/sharing/members"`, avec le corps brut reçu.
+    pub gestes_entre_membres: Vec<(String, Vec<u8>)>,
+    /// Ces deux routes rendent ce refus (statut, motif) au lieu de juger.
+    pub refus_entre_membres: Option<(u16, &'static str)>,
 }
 
 pub type Partage = Arc<Mutex<Faux>>;
@@ -255,6 +263,9 @@ impl Faux {
             renonciations: Vec::new(),
             conflits_a_simuler: 0,
             ajouts_avant_refus: None,
+            cercles_entre_membres: Vec::new(),
+            gestes_entre_membres: Vec::new(),
+            refus_entre_membres: None,
         }
     }
 
@@ -1421,6 +1432,80 @@ async fn membres_d_un_rayon_de(
     }
 }
 
+// Cercle partagé (site-mozaiklabs#568) ----------------------------------------
+
+/// Compte le geste et rend le refus forcé, s'il y en a un.
+fn geste_entre_membres(
+    f: &mut Faux,
+    m: &Method,
+    chemin: String,
+    corps: &Bytes,
+) -> Option<Response> {
+    f.gestes_entre_membres
+        .push((format!("{m} {chemin}"), corps.to_vec()));
+    f.refus_entre_membres
+        .map(|(statut, motif)| refus(StatusCode::from_u16(statut).unwrap(), motif))
+}
+
+/// `PUT|DELETE /circles/{id}/sharing/members` (propriétaire) : le cercle tel
+/// que `GET /` le liste, avec `members_see_each_other` ; 404 hors des siens.
+async fn partager_entre_membres(
+    m: Method,
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    corps: Bytes,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let mut f = e.lock().unwrap();
+    if let Some(r) =
+        geste_entre_membres(&mut f, &m, format!("/circles/{id}/sharing/members"), &corps)
+    {
+        return r;
+    }
+    let Some(k) = position(&f.circles, "id", &id) else {
+        return introuvable();
+    };
+    let n = f.circles[k]["id"].as_i64().unwrap();
+    f.cercles_entre_membres.retain(|c| *c != n);
+    if m == Method::PUT {
+        f.cercles_entre_membres.push(n);
+    }
+    let mut cercle = f.circles[k].clone();
+    cercle["members_see_each_other"] = json!(m == Method::PUT);
+    Json(cercle).into_response()
+}
+
+/// `PUT|DELETE /member-of/{id}/show-me` (membre) : l'entrée `member_of`,
+/// avec `show_me` ; 404 hors membre. Comme le site : 409 `circle_not_shared`
+/// pour `PUT` seulement, `DELETE` rend 200 (idempotent) même sur un cercle
+/// qui n'est plus partagé.
+async fn me_montrer(
+    m: Method,
+    State(e): State<Partage>,
+    h: HeaderMap,
+    Path(id): Path<String>,
+    corps: Bytes,
+) -> Response {
+    if let Some(r) = garde(&e, &h) {
+        return r;
+    }
+    let mut f = e.lock().unwrap();
+    if let Some(r) = geste_entre_membres(&mut f, &m, format!("/member-of/{id}/show-me"), &corps) {
+        return r;
+    }
+    let Some(k) = position(&f.member_of, "circle_id", &id) else {
+        return introuvable();
+    };
+    if m == Method::PUT && f.member_of[k]["members_see_each_other"] != json!(true) {
+        return refus(StatusCode::CONFLICT, "circle_not_shared");
+    }
+    f.member_of[k]["show_me"] = json!(m == Method::PUT);
+    Json(f.member_of[k].clone()).into_response()
+}
+
 pub const MESSAGE_SERVER_ID: &str = "The server id field must be a string.";
 
 /// `POST /oauth/token`, `grant_type=refresh_token` : fait tourner la paire.
@@ -1466,6 +1551,14 @@ pub async fn demarrer() -> Serveur {
         .route(
             "/api/v1/circle/circles/{id}/sharing/library",
             put(partager).delete(ne_plus_partager),
+        )
+        .route(
+            "/api/v1/circle/circles/{id}/sharing/members",
+            put(partager_entre_membres).delete(partager_entre_membres),
+        )
+        .route(
+            "/api/v1/circle/member-of/{id}/show-me",
+            put(me_montrer).delete(me_montrer),
         )
         .route("/api/v1/circle/shared-with-me", get(partagent_avec_moi))
         .route(

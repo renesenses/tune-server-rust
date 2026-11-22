@@ -9,7 +9,6 @@ edition = "2021"
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
-tauri-plugin-global-shortcut = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
@@ -24,11 +23,27 @@ tracing-subscriber = { version = "0.3", default-features = false, features = ["f
 tracing-appender = "0.2"
 urlencoding = "2"
 url = "2"
+# Découverte des Tune Server du réseau local (#9255) : la même caisse que le
+# serveur (`tune-core`), qui les annonce sur `_tune-server._tcp`.
+mdns-sd = "0.20"
 
 # Option « démarrer le serveur local » : le dossier d'installation de Tune
 # Server se lit dans la clé de désinstallation écrite par son installeur.
+# Plein écran natif de la fenêtre complète (#9255) : `collectionBehavior` de
+# NSWindow, que Tauri n'expose pas. Déjà dans l'arbre par Tauri.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"
+# Raccourcis GLOBAUX, sous Windows seulement (#8531, relecture de #9257) :
+# sous macOS, le greffon déclencherait la demande d'Accessibilité (#9255).
+tauri-plugin-global-shortcut = "2"
+
+# Les bancs lisent les raccourcis du menu avec l'analyseur de Tauri lui-même
+# (`muda`, déjà dans l'arbre par Tauri).
+[dev-dependencies]
+muda = "0.19"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

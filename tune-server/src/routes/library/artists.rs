@@ -209,6 +209,12 @@ pub(super) async fn absorber_artiste(
     }
     match repo.absorber(cible, doublon) {
         Ok(rapport) => {
+            // #9265 — un crédit composé relié au doublon se relie à la cible.
+            // Lecture et écriture synchrones : hors de l'exécuteur.
+            let backend = state.backend.clone();
+            tokio::task::spawn_blocking(move || {
+                tune_core::db::artistes_des_credits::passe_journalisee(&backend, "absorption");
+            });
             state.event_bus.emit(
                 tune_core::event_types::EventType::LibraryUpdated.as_str(),
                 json!({ "source": "artists_absorber", "cible": cible, "doublon": doublon }),

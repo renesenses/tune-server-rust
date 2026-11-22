@@ -285,7 +285,28 @@ pub(super) fn refus_backend_non_supporte(demande: &str) -> String {
          'supported_audio_backends' in GET /system/config."
     )
 }
+pub(super) async fn get_config_route(
+    relie: crate::auth::ReliePourLesComptes,
+    headers: axum::http::HeaderMap,
+    profile: ActiveProfile,
+    state: State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    lire_la_config(relie.0, headers, profile, state).await
+}
+
+/// Lecture des réglages SANS les comptes Mozaiklabs liés (voir
+/// `cloud::est_reserve_a_qui_relie`) : la vue de qui ne relie pas le serveur.
+#[cfg(test)]
 pub(super) async fn get_config(
+    headers: axum::http::HeaderMap,
+    profile: ActiveProfile,
+    state: State<AppState>,
+) -> Result<Json<Value>, AppError> {
+    lire_la_config(false, headers, profile, state).await
+}
+
+async fn lire_la_config(
+    montrer_les_comptes_lies: bool,
     headers: axum::http::HeaderMap,
     profile: ActiveProfile,
     State(state): State<AppState>,
@@ -324,6 +345,11 @@ pub(super) async fn get_config(
         // Voir `BACKEND_ACTIF_PAS_UN_REGLAGE` : une ligne écrite sous ce nom
         // n'est le réglage de personne, et la publier ici la ferait passer
         // pour le réglage auprès du client qui lit ce nom en premier.
+        // Comptes Mozaiklabs liés (serveur et profils) : réservés à qui relie
+        // le serveur. Voir `cloud::est_reserve_a_qui_relie`.
+        if !montrer_les_comptes_lies && crate::routes::cloud::est_reserve_a_qui_relie(&k) {
+            continue;
+        }
         if k == BACKEND_ACTIF_PAS_UN_REGLAGE {
             tracing::warn!(
                 cle = BACKEND_ACTIF_PAS_UN_REGLAGE,
@@ -921,7 +947,10 @@ pub(super) async fn get_config(
     {
         use tune_core::cloud::ecoutes_au_compte as ec;
         let etat = ec::consentement(&settings);
-        let relie = tune_core::cloud::sauvegarde_config::compte(&settings).is_ok();
+        // Un autre appareil (authentification coupée) ne peut pas répondre
+        // « oui » (voir `update_config_route`) : la question ne s'y pose pas.
+        let relie = montrer_les_comptes_lies
+            && tune_core::cloud::sauvegarde_config::compte(&settings).is_ok();
         config.insert(
             ec::CLE_ACTIVATION.to_string(),
             json!(etat == ec::Consentement::Accepte),
@@ -1850,6 +1879,90 @@ fn touche_le_replaygain(cles_posees: &[String]) -> bool {
     cles_posees.iter().any(|c| c.starts_with("replaygain_"))
 }
 
+/// Les INTERRUPTEURS d'envoi au nom du compte : seuls réglages de
+/// `cloud::fait_envoyer_au_nom_du_compte` qu'un autre appareil peut écrire, et
+/// seulement pour éteindre ([`n_envoie_rien`]). Liste fermée : curseurs,
+/// planchers, empreintes et adresses (`cloud_listens_cursor`,
+/// `cloud_listens_floor`, `community_measures_upload_cursor`, `digest_email`…)
+/// restent à qui relie le serveur — remis à zéro, un curseur ferait tout
+/// renvoyer.
+const INTERRUPTEURS_D_ENVOI: &[&str] = &[
+    tune_core::cloud::ecoutes_au_compte::CLE_ACTIVATION,
+    tune_core::cloud::ecoutes_au_compte::CLE_REPONSE,
+    tune_core::cloud::notes_communautaires::CLE_PARTAGE,
+    tune_core::cloud::telemetry::TELEMETRY_SETTING_KEY,
+    tune_core::cloud::consent::CONTRIBUTION_SETTING_KEY,
+    tune_core::cloud::consent::SYNC_SETTING_KEY,
+    tune_core::cloud::mesures_communautaires::CLE_CONTRIBUTION,
+    tune_core::cloud::mesures_communautaires::CLE_RECEPTION,
+    "digest_enabled",
+];
+
+/// Un autre appareil peut-il écrire `cle` = `v` ? Hors des réglages d'envoi
+/// au nom du compte, oui ; parmi eux, seulement éteindre un interrupteur.
+fn ecriture_permise_hors_machine(cle: &str, v: &Value) -> bool {
+    if !crate::routes::cloud::fait_envoyer_au_nom_du_compte(cle) {
+        return true;
+    }
+    let cle = cle.trim().to_ascii_lowercase();
+    INTERRUPTEURS_D_ENVOI.contains(&cle.as_str()) && n_envoie_rien(v)
+}
+
+/// Valeur qui éteint ou refuse (rien ne part) : `false`, `0`, vide,
+/// `refuse`, `fermee`, `off`.
+fn n_envoie_rien(v: &Value) -> bool {
+    match v {
+        Value::Null | Value::Bool(false) => true,
+        Value::Number(n) => n.as_i64() == Some(0),
+        Value::String(s) => matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "" | "false" | "0" | "off" | "refuse" | "fermee"
+        ),
+        _ => false,
+    }
+}
+
+/// `PATCH /system/config` : les réglages qui font envoyer au nom du compte
+/// (`cloud::fait_envoyer_au_nom_du_compte`) ne s'écrivent que par qui relie le
+/// serveur ; le reste suit [`update_config`].
+pub(super) async fn update_config_route(
+    admin: crate::auth::RequireAdmin,
+    relie: crate::auth::ReliePourLesComptes,
+    headers: axum::http::HeaderMap,
+    profile: ActiveProfile,
+    state: State<AppState>,
+    body: Json<ConfigPatch>,
+) -> Result<axum::response::Response, AppError> {
+    if !relie.0 {
+        let refusees: Vec<&str> = body
+            .0
+            .0
+            .iter()
+            // Éteindre, refuser ou fermer la question (interrupteurs
+            // seulement) ne fait rien envoyer : ces valeurs passent depuis
+            // tout appareil.
+            .filter(|(c, v)| !ecriture_permise_hors_machine(c, v))
+            .map(|(c, _)| c.as_str())
+            .collect();
+        if !refusees.is_empty() {
+            return Ok((
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "auth_required",
+                    "reason": "not_local",
+                    "message": "These settings make the server send on behalf of the Mozaiklabs account: \
+                                change them on this machine, or enable authentication and sign in as an administrator.",
+                    "refused_keys": refusees,
+                })),
+            )
+                .into_response());
+        }
+    }
+    update_config(admin, headers, profile, state, body)
+        .await
+        .map(IntoResponse::into_response)
+}
+
 pub(super) async fn update_config(
     _admin: crate::auth::RequireAdmin,
     headers: axum::http::HeaderMap,
@@ -2453,10 +2566,16 @@ mod envoi_des_ecoutes_tests_6510 {
         let corps = corps.map(|c| c.to_string()).unwrap_or_default();
         let response = crate::routes::router(state.clone())
             .oneshot(
+                // Ces réglages font envoyer au nom du compte : ils
+                // s'écrivent depuis cette machine (`ReliePourLesComptes`).
                 Request::builder()
                     .method(methode)
                     .uri("/api/v1/system/config")
                     .header("content-type", "application/json")
+                    .extension(axum::extract::ConnectInfo(std::net::SocketAddr::from((
+                        [127, 0, 0, 1],
+                        51000,
+                    ))))
                     .body(Body::from(corps))
                     .unwrap(),
             )
@@ -3034,6 +3153,7 @@ pub(super) struct ExportConfigQuery {
 /// pour les seuls réglages ; les réglages de zone n'en portent jamais.
 pub(super) async fn export_config(
     _admin: crate::auth::RequireAdmin,
+    relie: crate::auth::ReliePourLesComptes,
     State(state): State<AppState>,
     Query(q): Query<ExportConfigQuery>,
 ) -> axum::response::Response {
@@ -3049,7 +3169,16 @@ pub(super) async fn export_config(
         .into_response();
     }
     match tune_core::config_export::exporter(&state.backend, q.include_secrets) {
-        Ok(v) => Json(v).into_response(),
+        Ok(mut v) => {
+            // Sans authentification, un autre appareil du réseau passe
+            // `RequireAdmin` : les comptes liés ne lui sont pas exportés.
+            if !relie.0 {
+                if let Some(Value::Object(carte)) = v.get_mut("settings") {
+                    carte.retain(|cle, _| !crate::routes::cloud::est_reserve_a_qui_relie(cle));
+                }
+            }
+            Json(v).into_response()
+        }
         Err(e) => AppError::internal(format!("configuration export failed: {e}")).into_response(),
     }
 }
@@ -3890,6 +4019,7 @@ pub(crate) fn retirer_un_dossier(
         "dirs": dirs,
         "orphan_tracks": plan.tracks,
         "purged": r.purgees,
+        "purge_failed": r.echecs,
         "purge_refused": false,
         "orphan_albums_removed": r.albums_orphelins,
         "orphan_artists_removed": r.artistes_orphelins,
@@ -4118,12 +4248,12 @@ pub(crate) fn regrouper_hors_perimetre(
     sortie
 }
 
-/// `(id, file_path)` de toutes les pistes LOCALES.
+/// `(id, chemin du média)` de toutes les pistes LOCALES, tranches CUE comprises.
 fn pistes_locales(state: &AppState) -> Vec<(i64, String)> {
     state
         .backend
         .query_many(
-            "SELECT id, file_path FROM tracks WHERE source = 'local' AND file_path IS NOT NULL",
+            "SELECT id, COALESCE(file_path, cue_media_path) FROM tracks WHERE source = 'local' AND COALESCE(file_path, cue_media_path) IS NOT NULL",
             &[],
         )
         .ou_defaut_journalise()
@@ -4289,6 +4419,7 @@ fn impact(state: &AppState, ids: &[i64]) -> ImpactPurge {
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct ResultatPurge {
     purgees: i64,
+    echecs: i64,
     albums_orphelins: i64,
     artistes_orphelins: i64,
     favoris_rerattaches: i64,
@@ -4314,8 +4445,12 @@ fn executer_purge(state: &AppState, ids: &[i64]) -> ResultatPurge {
     let track_repo = TrackRepo::with_backend(state.backend.clone());
     let mut r = ResultatPurge::default();
     for id in ids {
-        if track_repo.delete(*id).is_ok() {
-            r.purgees += 1;
+        match track_repo.delete(*id) {
+            Ok(()) => r.purgees += 1,
+            Err(error) => {
+                r.echecs += 1;
+                tracing::error!(track_id = *id, %error, "purge_piste_echec");
+            }
         }
     }
 
@@ -4383,6 +4518,12 @@ fn executer_purge(state: &AppState, ids: &[i64]) -> ResultatPurge {
     r.paires_distinctes_rerattachees = distinctes.relinked as i64;
     r.paires_distinctes_non_resolues = distinctes.unresolved as i64;
 
+    if r.purgees > 0 {
+        state.event_bus.emit(
+            tune_core::event_types::EventType::LibraryUpdated.as_str(),
+            json!({ "source": "purge_orphelines", "purged": r.purgees }),
+        );
+    }
     r
 }
 
@@ -4580,6 +4721,7 @@ pub(super) async fn purge_orphan_tracks(
 
     Ok(Json(json!({
         "purged": r.purgees,
+        "purge_failed": r.echecs,
         "refused": false,
         "orphan_albums_removed": r.albums_orphelins,
         "orphan_artists_removed": r.artistes_orphelins,
@@ -7516,3 +7658,7 @@ mod confinement_chemins_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "cue_purge_8836_tests.rs"]
+mod cue_purge_8836_tests;

@@ -1047,7 +1047,7 @@ fn appliquer_reponse_comprise(
         ReprobeFailure::NotARenderer => warn!(
             uuid = %dev.uuid,
             nom = %dev.name,
-            location = %dev.location,
+            location = %tune_core::confidentialite::masquer_url(&dev.location),
             host = %dev.host,
             action = "l'appareil a répondu mais n'expose plus AVTransport : \
                       son entrée est retirée. S'il doit jouer, vérifiez son \
@@ -1064,7 +1064,7 @@ fn appliquer_reponse_comprise(
         } => warn!(
             nom_attendu = %dev.name,
             nom_trouve = %observed_name,
-            location = %dev.location,
+            location = %tune_core::confidentialite::masquer_url(&dev.location),
             udn_memorise = %dev.uuid,
             udn_annonce = %observed_udn,
             distingue_par = evidence.label(),
@@ -1077,7 +1077,7 @@ fn appliquer_reponse_comprise(
         // Ni preuve d'identite, ni preuve de substitution. On ne detruit rien.
         ReprobeFailure::IdentityUnclear { observed_udn } => warn!(
             nom = %dev.name,
-            location = %dev.location,
+            location = %tune_core::confidentialite::masquer_url(&dev.location),
             udn_memorise = %dev.uuid,
             udn_annonce = %observed_udn,
             action = "l'identifiant UPnP a changé et rien ne permet de distinguer \
@@ -1269,7 +1269,7 @@ pub(crate) async fn register_discovered_dlna(
         IdentityVerdict::SameHardware(evidence) => {
             info!(
                 nom = %desc.friendly_name,
-                location = %dev.location,
+                location = %tune_core::confidentialite::masquer_url(&dev.location),
                 udn_memorise = %dev.uuid,
                 udn_annonce = %desc.udn,
                 reconnu_par = evidence.label(),

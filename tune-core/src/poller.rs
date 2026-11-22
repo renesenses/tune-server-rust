@@ -635,6 +635,10 @@ pub struct PositionPoller {
     /// #6541 — dernier volume rapporté au-dessus de la limite de sécurité,
     /// par zone : la consigne n'est recommandée qu'une fois par valeur.
     volumes_plafonnes: std::sync::Mutex<std::collections::HashMap<i64, f64>>,
+    /// #8920 — Devialet AIR : dernier niveau annoncé (dB d'ampli) au-dessus
+    /// de la limite de sécurité et déjà ramené, par zone : un rappel par
+    /// dépassement, jamais à chaque tour.
+    rappels_air_securite: std::sync::Mutex<std::collections::HashMap<i64, f64>>,
     /// #5662 — zones dont le renderer annonce 100 % sans que Tune l'adopte :
     /// l'épisode est dit une fois (`volume_100_ignore_constate`).
     volumes_100_ignores: std::sync::Mutex<std::collections::HashSet<i64>>,
@@ -684,6 +688,7 @@ impl PositionPoller {
             relances_demarrage_fige: std::sync::Mutex::new(std::collections::HashMap::new()),
             zones_a_position_prouvee: std::sync::Mutex::new(std::collections::HashSet::new()),
             volumes_plafonnes: std::sync::Mutex::new(std::collections::HashMap::new()),
+            rappels_air_securite: std::sync::Mutex::new(std::collections::HashMap::new()),
             volumes_100_ignores: std::sync::Mutex::new(std::collections::HashSet::new()),
         }
     }
@@ -1177,6 +1182,10 @@ mod contrat_radio_locale_6233;
 mod etat_air_6912;
 #[cfg(test)]
 mod etat_air_6912_tests;
+/// #8920 — Devialet AIR monté à la télécommande au-dessus de la limite de
+/// sécurité : le sondeur le ramène à la limite, une fois par dépassement.
+/// Témoins dans `etat_air_6912_tests` (même banc).
+mod rappel_securite_air_8920;
 /// #6739 — un relevé du volume de l'appareil ne fait jamais grimper la
 /// consigne par cliquet ; #7379 — il est suivi sous le plafond de suivi.
 mod releve_ne_monte_pas_6739;

@@ -253,3 +253,64 @@ pub fn volume_vers_db(volume: f64) -> f64 {
 pub fn db_vers_volume(db: f64) -> f64 {
     BornesDb::PAR_DEFAUT.db_vers_volume(db)
 }
+
+// ─── #8920 — retours d'un testeur Devialet Expert (rc12) ────────────────────
+
+/// #8920 — la sortie `output_type` est-elle une sortie Devialet AIR ?
+#[must_use]
+pub fn est_air(output_type: Option<&str>) -> bool {
+    output_type == Some(super::sortie::TYPE_DE_SORTIE)
+}
+
+/// #8920 — la zone `zone_id` pilote-t-elle une sortie Devialet AIR ? Zone
+/// inconnue ou base illisible : non.
+pub fn zone_air(db: &Arc<dyn DbBackend>, zone_id: i64) -> bool {
+    crate::db::zone_repo::ZoneRepo::with_backend(db.clone())
+        .get(zone_id)
+        .ok()
+        .flatten()
+        .is_some_and(|z| est_air(z.output_type.as_deref()))
+}
+
+/// #8920 — la plus haute cadence que AIR transporte : 192 kHz, au prix d'une
+/// décimation des résidus (codec avec perte au-delà de 96 kHz). Aucun
+/// réglage au-dessus n'est accepté pour une zone Devialet AIR.
+pub const FREQUENCE_MAX_AIR: u32 = 192_000;
+
+/// #8920 — la plus haute cadence que AIR transporte SANS perte, et la
+/// cadence plafond tant que la zone n'en règle pas d'autre (décision du
+/// 19/10, inchangée).
+pub const FREQUENCE_MAX_SANS_PERTE: u32 = 96_000;
+
+/// #8920 — les seuls modes DSD d'une zone Devialet AIR : DSD64 en DoP, ou
+/// conversion en PCM.
+pub const MODES_DSD_AIR: [&str; 2] = ["dop", "pcm"];
+
+/// #8920 — la cadence envoyée pour une source à `source` Hz sous le plafond
+/// de la zone (`max_sample_rate`).
+///
+/// - Sans plafond réglé : [`cadence_envoyee`], 96 kHz sans perte au plus.
+/// - Avec un plafond : la cadence de la source si AIR la connaît et qu'elle
+///   tient sous le plafond (jamais au-dessus de [`FREQUENCE_MAX_AIR`]) ;
+///   sinon la plus haute cadence AIR de la même famille (44,1 ou 48 kHz) qui
+///   y tient. Un plafond sous 44,1 kHz ne descend pas sous la plus basse
+///   cadence AIR de la famille.
+#[must_use]
+pub fn cadence_envoyee_sous(source: u32, plafond: Option<u32>) -> u32 {
+    let Some(plafond) = plafond else {
+        return cadence_envoyee(source);
+    };
+    let plafond = plafond.min(FREQUENCE_MAX_AIR);
+    let frequences = super::protocole::FREQUENCES;
+    if frequences.contains(&source) && source <= plafond {
+        return source;
+    }
+    let famille_44 = source != 0 && source % 11_025 == 0;
+    let de_la_famille = |f: &u32| (*f % 11_025 == 0) == famille_44;
+    frequences
+        .iter()
+        .copied()
+        .filter(|f| de_la_famille(f) && *f <= plafond)
+        .max()
+        .unwrap_or(if famille_44 { 44_100 } else { 48_000 })
+}

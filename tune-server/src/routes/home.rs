@@ -227,7 +227,7 @@ async fn home_page(
     let ecartees = super::accueil_justifie::ecartees_du_profil(&state, &profile);
     // No zone filter for the aggregated home page — show all zones.
     let en_cours = lectures_en_cours(&state).await;
-    let continue_items = reprises_du_profil(&state, &ecartees, 10, None, &en_cours)?;
+    let continue_items = reprises_du_profil(&state, &ecartees, 10, None, &en_cours, profile.id())?;
     // L'accueil agrege garde SA fenetre de 7 jours : c'est une vignette, pas
     // l'onglet. La fenetre choisie vit sur `/home/recently-added` (#3039).
     let recent_items = fetch_recently_added(&state, 20, borne_basse_de_fenetre(None)?)?;
@@ -318,7 +318,7 @@ async fn continue_listening(
     // the client sends the CURRENT active zone, not a stored zone from
     // history (DEvir QA B-09).
     let en_cours = lectures_en_cours(&state).await;
-    let items = reprises_du_profil(&state, &ecartees, limit, p.zone_id, &en_cours)?;
+    let items = reprises_du_profil(&state, &ecartees, limit, p.zone_id, &en_cours, profile.id())?;
     Ok(Json(json!(items)))
 }
 
@@ -336,11 +336,21 @@ fn reprises_du_profil(
     limit: i64,
     zone_id: Option<i64>,
     en_cours: &[LectureEnCours],
+    profil: i64,
 ) -> Result<Vec<Value>, AppError> {
+    // Les reprises d'un profil ne se montrent qu'à lui : les autres profils
+    // du foyer n'y lisent ni titres ni pochettes (ni playlists privées).
+    let profil = Some(profil);
     if ecartees.est_vide() {
-        return continuer_l_ecoute(state, limit, zone_id, en_cours);
+        return continuer_l_ecoute(state, limit, zone_id, en_cours, profil);
     }
-    let mut items = continuer_l_ecoute(state, limit + marge_d_ecarts(ecartees), zone_id, en_cours)?;
+    let mut items = continuer_l_ecoute(
+        state,
+        limit + marge_d_ecarts(ecartees),
+        zone_id,
+        en_cours,
+        profil,
+    )?;
     items.retain(|i| !super::accueil_justifie::reprise_ecartee(ecartees, i));
     items.truncate(usize::try_from(limit.max(0)).unwrap_or(0));
     Ok(items)
@@ -402,7 +412,7 @@ fn fetch_continue_listening(
     limit: i64,
     zone_id: Option<i64>,
 ) -> Result<Vec<Value>, AppError> {
-    continuer_l_ecoute(state, limit, zone_id, &[])
+    continuer_l_ecoute(state, limit, zone_id, &[], None)
 }
 
 /// #8085 — ce qu'une zone joue EN CE MOMENT : son contexte de session et
@@ -520,15 +530,23 @@ fn piste_de_reprise(r: &tune_core::db::listening_resume::Resume) -> Option<Piste
     }
 }
 
+/// `profil` : `Some(p)` ne garde que les reprises et l'historique du profil
+/// `p` (voir `listening_resume::est_au_profil`) ; `None` (témoins) : tout.
 fn continuer_l_ecoute(
     state: &AppState,
     limit: i64,
     zone_id: Option<i64>,
     en_cours: &[LectureEnCours],
+    profil: Option<i64>,
 ) -> Result<Vec<Value>, AppError> {
     let limit = limit.clamp(1, 200);
-    let fresh = tune_core::db::listening_resume::recent(&state.backend, zone_id, limit)
-        .map_err(AppError::internal)?;
+    let fresh = match profil {
+        Some(p) => {
+            tune_core::db::listening_resume::recent_du_profil(&state.backend, zone_id, limit, p)
+        }
+        None => tune_core::db::listening_resume::recent(&state.backend, zone_id, limit),
+    }
+    .map_err(AppError::internal)?;
     let mut seen = std::collections::HashSet::new();
     let mut items: Vec<Value> = Vec::new();
     for r in fresh {
@@ -556,7 +574,7 @@ fn continuer_l_ecoute(
             // web#916 — la raison d'une reprise : la date de sa dernière écoute.
             "raison": super::accueil_justifie::raison_reprise(Some(&r.updated_at))}));
     }
-    for old in fetch_continue_listening_borne(state, limit, zone_id, BORNE_SECOND_RANG)? {
+    for old in fetch_continue_listening_borne(state, limit, zone_id, BORNE_SECOND_RANG, profil)? {
         let nature = old["context_type"].as_str().unwrap_or("album");
         if !matches!(nature, "album" | "playlist" | "track" | "podcast") {
             continue;
@@ -634,15 +652,23 @@ fn fetch_continue_listening_borne(
     limit: i64,
     zone_id: Option<i64>,
     borne: std::time::Duration,
+    profil: Option<i64>,
 ) -> Result<Vec<Value>, AppError> {
     let engine = state.backend.engine();
     // When a zone_id filter is provided, only show entries that were listened
     // to on that zone.  This ensures the "continue listening" section matches
     // the user's currently selected zone (B-09 fix).
-    let zone_filter = match zone_id {
+    let mut zone_filter = match zone_id {
         Some(zid) => format!("AND lh.zone_id = {zid} "),
         None => String::new(),
     };
+    // L'historique d'un AUTRE profil ne remonte pas ici (les lignes sans
+    // profil, d'avant l'attribution ou sans session, restent communes).
+    if let Some(p) = profil {
+        zone_filter.push_str(&format!(
+            "AND (lh.profile_id = {p} OR lh.profile_id IS NULL) "
+        ));
+    }
 
     let mut items = contextes_recents(state, limit, &zone_filter);
 
@@ -1196,6 +1222,28 @@ mod tests_homonymes {
                 ],
             )
             .unwrap();
+    }
+
+    /// L'historique d'un AUTRE profil ne fait pas remonter son album dans
+    /// « Reprendre l'écoute » ; le profil qui a écouté le retrouve.
+    #[test]
+    fn l_historique_d_un_autre_profil_ne_remonte_pas() {
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        let (_police, pulp) = deux_live(&state, None);
+        ecoute(&state, "Common People", Some("Pulp"), Some(pulp));
+        state
+            .backend
+            .execute("UPDATE listen_history SET profile_id = 2", &[])
+            .unwrap();
+        let Ok(du_1) = continuer_l_ecoute(&state, 10, None, &[], Some(1)) else {
+            panic!("la requete doit repondre")
+        };
+        assert!(du_1.is_empty(), "album d'un autre profil rendu : {du_1:?}");
+        let Ok(du_2) = continuer_l_ecoute(&state, 10, None, &[], Some(2)) else {
+            panic!("la requete doit repondre")
+        };
+        assert_eq!(du_2.len(), 1, "{du_2:?}");
+        assert_eq!(du_2[0]["album_id"].as_i64(), Some(pulp));
     }
 
     /// Le defaut de Tades (#2731, fil 1600) : ecouter le « Live » de Pulp
@@ -4406,7 +4454,8 @@ mod tests_borne_2130 {
         );
 
         // Hors borne : le premier rang seul.
-        let Ok(partiel) = fetch_continue_listening_borne(&state, 10, None, Duration::ZERO) else {
+        let Ok(partiel) = fetch_continue_listening_borne(&state, 10, None, Duration::ZERO, None)
+        else {
             panic!("la section doit repondre meme quand le second rang traine")
         };
         assert_eq!(

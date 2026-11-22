@@ -94,6 +94,10 @@ pub(super) fn decoder_opus_en_croissance(
         .default_track(TrackType::Audio)
         .ok_or("opus: no audio track")?;
     let mut track_id = track.id;
+    // #8982 — pre-skip d'`OpusHead` (rangé par symphonia dans `track.delay`,
+    // jamais retiré des paquets) : trames d'amorce de l'encodeur à ne pas
+    // servir, comme sur le chemin intégral (`decode_opus_to_pcm`).
+    let mut a_sauter: usize = track.delay.unwrap_or(0) as usize;
     let ch_src: usize = match &track.codec_params {
         Some(CodecParameters::Audio(p)) => p.channels.as_ref().map(|c| c.count()).unwrap_or(2),
         _ => 2,
@@ -140,6 +144,7 @@ pub(super) fn decoder_opus_en_croissance(
                     if paquet.track_id != track_id || paquet.data.is_empty() {
                         continue;
                     }
+                    let fin_utile = usize::try_from(paquet.trim_end.get()).unwrap_or(usize::MAX);
                     let n = match decoder.decode(&paquet.data, &mut tampon, false) {
                         Ok(n) => n.min(tampon.len() / ch_src),
                         Err(e) => {
@@ -147,8 +152,17 @@ pub(super) fn decoder_opus_en_croissance(
                             continue;
                         }
                     };
-                    trames_rendues += n as u64;
-                    let echantillons = remapper(&tampon[..n * ch_src], ch_src, ch_out);
+                    // Remplissage du dernier paquet (granule de fin), puis
+                    // pre-skip en tête (#8982).
+                    let n = n.saturating_sub(fin_utile);
+                    let debut = a_sauter.min(n);
+                    a_sauter -= debut;
+                    if debut == n {
+                        continue;
+                    }
+                    trames_rendues += (n - debut) as u64;
+                    let echantillons =
+                        remapper(&tampon[debut * ch_src..n * ch_src], ch_src, ch_out);
                     en_attente.extend(convert_pcm_bit_depth(&echantillons, 16, output_bd));
                 }
                 Ok(None) => fin = true,
@@ -172,6 +186,7 @@ pub(super) fn decoder_opus_en_croissance(
                         continue;
                     }
                     track_id = piste.id;
+                    a_sauter = piste.delay.unwrap_or(0) as usize;
                     decoder = OpusDecoder::new(CADENCE_OPUS, canaux)
                         .map_err(|e| format!("opus decoder init: {e}"))?;
                 }

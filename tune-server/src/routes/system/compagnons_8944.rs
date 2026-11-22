@@ -51,7 +51,7 @@ use super::installation_sure::{self, Controles, a_cote};
 /// release, sans suffixe de plateforme. Ajouter un exécutable à l'archive
 /// (`release.yml`) sans l'ajouter ici le laisse figé chez les utilisateurs
 /// mis à jour par le bouton.
-pub(super) const EXECUTABLES_LIVRES: [&str; 4] =
+pub(crate) const EXECUTABLES_LIVRES: [&str; 4] =
     ["airplay-daemon", "librespot", "ffmpeg", "fpcalc"];
 
 /// Le marqueur qui dit de laisser `nom` tel qu'il est (ou absent).

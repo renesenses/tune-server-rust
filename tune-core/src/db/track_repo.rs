@@ -256,6 +256,45 @@ pub fn sql_pistes_du_dossier(engine: Engine, depart_enfant: usize) -> String {
     )
 }
 
+/// #9116 — combien de pistes sous un dossier, en s'arrêtant à `plafond` :
+/// `SELECT COUNT(*)` d'au plus `plafond` entrées de [`INDEX_CHEMIN_DOSSIER_SQLITE`]
+/// (plage de [`plage_du_dossier`], paramètres 1 et 2 = [`bornes_du_dossier`]).
+/// Sert à décider, sans arbre exact, si la plage récursive de
+/// [`sql_pistes_du_dossier`] est bon marché (un album) ou non (un disque
+/// entier) — sans jamais parcourir plus de `plafond` entrées.
+pub fn sql_compter_sous_dossier_plafonne(engine: Engine, plafond: usize) -> String {
+    let (p1, p2) = match engine {
+        Engine::Postgres => ("$1", "$2"),
+        Engine::Sqlite => ("?1", "?2"),
+    };
+    let plage = plage_du_dossier(engine, CHEMIN_DE_LA_PISTE, p1, p2);
+    format!("SELECT COUNT(*) FROM (SELECT 1 FROM tracks WHERE {plage} LIMIT {plafond}) AS s")
+}
+
+/// #9116 — les mêmes colonnes, dans le même ordre et triées de même, que
+/// [`sql_pistes_du_dossier`], mais pour `n` identifiants (`?1`…`?n`) : les
+/// pistes directes d'un dossier, que [`super::arbre_des_dossiers`] connaît
+/// déjà. Plus de plage récursive sur tout ce qui est sous le dossier.
+pub fn sql_pistes_par_ids(engine: Engine, n: usize) -> String {
+    let marques: Vec<String> = (1..=n)
+        .map(|i| match engine {
+            Engine::Postgres => format!("${i}"),
+            Engine::Sqlite => format!("?{i}"),
+        })
+        .collect();
+    format!(
+        "SELECT t.id, t.title, t.album_id, al.title, t.artist_id, ar.name, \
+               t.disc_number, t.track_number, t.duration_ms, t.file_path, \
+               t.format, t.sample_rate, t.bit_depth, t.genre, t.year, al.cover_path, \
+               COALESCE(t.file_path, t.cue_media_path) \
+               FROM tracks t LEFT JOIN albums al ON t.album_id = al.id \
+               LEFT JOIN artists ar ON t.artist_id = ar.id \
+               WHERE t.id IN ({}) \
+               ORDER BY CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER), t.title",
+        marques.join(", ")
+    )
+}
+
 /// Le texte SQL de [`compter_pistes_par_sous_dossier`]. Paramètres, dans
 /// l'ordre : le motif de [`folder_like_pattern`], le séparateur, puis les deux
 /// bornes de [`bornes_du_dossier`]. Public pour que les tests lisent le plan
@@ -1303,9 +1342,10 @@ pub mod sql {
     /// que l'album masqué demeure jouable depuis une file ou une playlist.
     pub fn list_by_artist<D: SqlDialect>(d: &D) -> String {
         format!(
-            "{} WHERE t.artist_id = {} AND {} ORDER BY al.year, al.title, CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER)",
+            "{} WHERE (t.artist_id = {} OR t.artist_id IN (SELECT adc.credit_id FROM artistes_des_credits adc WHERE adc.artiste_id = {})) AND {} ORDER BY al.year, al.title, CAST(t.disc_number AS INTEGER), CAST(t.track_number AS INTEGER)",
             select_track(),
             d.placeholder(1),
+            d.placeholder(2),
             crate::db::facet_filter::hidden_tracks_excluded()
         )
     }
@@ -3437,6 +3477,32 @@ impl TrackRepo {
         mtime: f64,
         file_size: i64,
     ) -> Result<(), TuneError> {
+        self.update_file_stats(file_path, mtime, file_size, false)
+    }
+
+    /// Remet en phase une écriture de balises faite par Tune (#8864).
+    ///
+    /// L'appelant a vérifié que le fichier correspondait à sa ligne AVANT
+    /// l'écriture. Taille, date et marque d'enrichissement encore valide
+    /// avancent ensemble ; l'issue et le délai des 503 restent intacts.
+    /// Réservé à une base migrée et aux réécritures internes : un scan qui
+    /// importe une modification extérieure ne doit pas employer ce chemin.
+    pub fn update_mtime_and_size_after_tag_write(
+        &self,
+        file_path: &str,
+        mtime: f64,
+        file_size: i64,
+    ) -> Result<(), TuneError> {
+        self.update_file_stats(file_path, mtime, file_size, true)
+    }
+
+    fn update_file_stats(
+        &self,
+        file_path: &str,
+        mtime: f64,
+        file_size: i64,
+        preserve_enrichment: bool,
+    ) -> Result<(), TuneError> {
         let sql = self.dialect_sql(sql::update_mtime_and_size, sql::update_mtime_and_size);
         // #4546 : c'est ici que la retouche d'étiquettes avance le `mtime`.
         if let Some(chemin) = chemin_local(Some(file_path)) {
@@ -3447,7 +3513,32 @@ impl TrackRepo {
             );
         }
         let params: [&dyn ToSqlValue; 3] = [&mtime, &file_size, &file_path];
-        self.db.execute(&sql, &params)?;
+        if !preserve_enrichment {
+            self.db.execute(&sql, &params)?;
+            return Ok(());
+        }
+        let (p1, p2) = self.marqueurs2();
+        // Seule une marque encore valable avant la réécriture suit la date.
+        // Un scan extérieur qui l'avait déjà périmée reste visible.
+        let suivre = format!(
+            "UPDATE enrich_tentatives SET mtime_vu = CAST(CAST({p1} AS DOUBLE PRECISION) AS TEXT) \
+             WHERE track_id IN (SELECT t.id FROM tracks t WHERE t.file_path = {p2} \
+             AND COALESCE(enrich_tentatives.mtime_vu, '') = \
+                 COALESCE(CAST(t.file_mtime AS TEXT), ''))"
+        );
+        self.db.write_tx(&mut |tx| {
+            // SQLite sérialise déjà les écritures ; PostgreSQL doit empêcher
+            // un scan de modifier ces lignes entre la marque et leur date.
+            if self.db.engine() == Engine::Postgres {
+                tx.query_many(
+                    "SELECT id FROM tracks WHERE file_path = $1 FOR UPDATE",
+                    &[&file_path],
+                )?;
+            }
+            tx.execute(&suivre, &[&mtime, &file_path])?;
+            tx.execute(&sql, &params)?;
+            Ok(())
+        })?;
         Ok(())
     }
 
@@ -3677,8 +3768,9 @@ impl TrackRepo {
     }
 
     pub fn list_by_artist(&self, artist_id: i64) -> Result<Vec<Track>, TuneError> {
+        // #9265 — les pistes de ses crédits composés reliés comptent aussi.
         let sql = self.dialect_sql(sql::list_by_artist, sql::list_by_artist);
-        let params: [&dyn ToSqlValue; 1] = [&artist_id];
+        let params: [&dyn ToSqlValue; 2] = [&artist_id, &artist_id];
         let rows = self.db.query_many_strong(&sql, &params)?;
         Ok(rows.iter().map(|cols| row_to_track(cols)).collect())
     }

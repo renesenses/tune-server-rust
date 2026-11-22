@@ -101,6 +101,23 @@ impl OaatMultiroomOutput {
         self.endpoints.len()
     }
 
+    /// #9240 — le nombre de récepteurs du groupe, ceux de sa création ET
+    /// ceux ajoutés depuis (`add_endpoint` ne touche pas `endpoints`), sans
+    /// compter deux fois la même adresse.
+    #[cfg(feature = "oaat")]
+    pub async fn nombre_de_recepteurs(&self) -> usize {
+        let zone = self.zone.lock().await;
+        let mut adresses: std::collections::HashSet<String> = self
+            .endpoints
+            .iter()
+            .map(|(h, p)| format!("{h}:{p}"))
+            .collect();
+        for s in zone.endpoint_snapshots() {
+            adresses.insert(s.addr.to_string());
+        }
+        adresses.len()
+    }
+
     /// Add an endpoint dynamically (late-join if streaming).
     #[cfg(feature = "oaat")]
     pub async fn add_endpoint(&self, host: &str, port: u16) -> Result<String, String> {

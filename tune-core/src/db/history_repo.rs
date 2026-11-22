@@ -139,6 +139,39 @@ pub mod sql {
         )
     }
 
+    /// Les écoutes que voit un profil : les siennes et celles qui n'ont pas
+    /// de profil (d'avant l'attribution, ou lancées sans session), communes à
+    /// tous — la règle de « Reprendre l'écoute »
+    /// (`home::fetch_continue_listening_borne`). `profil` est un entier :
+    /// rien d'autre n'entre dans le texte de la requête.
+    pub fn ecoutes_du_profil(profil: i64) -> String {
+        format!("(h.profile_id = {profil} OR h.profile_id IS NULL)")
+    }
+
+    /// [`recent_paginated`] restreinte aux écoutes que voit `profil`.
+    pub fn recent_paginated_du_profil<D: SqlDialect>(d: &D, profil: i64) -> String {
+        // `JOINTURE_PISTE` n'a qu'un ` ORDER BY ` (garde
+        // `jointure_piste_a_un_seul_tri`) : le filtre ne peut pas se perdre.
+        let jointure = JOINTURE_PISTE.replacen(
+            " ORDER BY ",
+            &format!(" AND {} ORDER BY ", ecoutes_du_profil(profil)),
+            1,
+        );
+        format!(
+            "SELECT {RECORD_COLS_RESOLUS}{jointure} LIMIT {} OFFSET {}",
+            d.placeholder(1),
+            d.placeholder(2)
+        )
+    }
+
+    /// [`count_listed`] restreint aux écoutes que voit `profil`.
+    pub fn count_listed_du_profil(profil: i64) -> String {
+        format!(
+            "SELECT COUNT(*) FROM listen_history h WHERE {LIGNE_LISTEE} AND {}",
+            ecoutes_du_profil(profil)
+        )
+    }
+
     /// Le nombre d'écoutes affiché (Bibliothèque, administration, profil
     /// partagé) : comme les autres statistiques, sans la radio (#7965).
     pub fn count_all() -> &'static str {
@@ -634,12 +667,50 @@ pub mod sql {
 
     #[cfg(test)]
     #[test]
+    fn jointure_piste_a_un_seul_tri() {
+        assert_eq!(JOINTURE_PISTE.matches(" ORDER BY ").count(), 1);
+        assert!(
+            recent_paginated_du_profil(&crate::db::engine::SqliteDialect, 7)
+                .contains("AND (h.profile_id = 7 OR h.profile_id IS NULL) ORDER BY")
+        );
+    }
+
+    #[cfg(test)]
+    #[test]
     fn jointure_piste_reprend_ligne_listee() {
         assert!(
             JOINTURE_PISTE.contains(&format!("WHERE {LIGNE_LISTEE} ")),
             "la liste et son total (#7965) doivent garder la même condition"
         );
     }
+}
+
+/// La condition d'une vue d'UN profil sur `listen_history` (`alias` : `""`
+/// ou `"h."`) : ses écoutes seules, ou avec les écoutes sans profil
+/// (`communes`, la règle de la liste : [`sql::ecoutes_du_profil`]).
+pub fn filtre_de_profil(alias: &str, profil: i64, communes: bool) -> String {
+    if communes {
+        format!("({alias}profile_id = {profil} OR {alias}profile_id IS NULL)")
+    } else {
+        format!("{alias}profile_id = {profil}")
+    }
+}
+
+/// Ajoute la condition des écoutes que voit `profil` (avec les communes)
+/// juste avant l'unique ` GROUP BY ` d'une requête de classement sans alias.
+/// Sans `GROUP BY` unique, erreur : le filtre ne se perd jamais en silence.
+fn du_profil_avant_le_regroupement(sql: String, profil: Option<i64>) -> Result<String, String> {
+    let Some(p) = profil else {
+        return Ok(sql);
+    };
+    if sql.matches(" GROUP BY ").count() != 1 {
+        return Err("classement : filtre de profil introuvable".into());
+    }
+    Ok(sql.replacen(
+        " GROUP BY ",
+        &format!(" AND {} GROUP BY ", filtre_de_profil("", p, true)),
+        1,
+    ))
 }
 
 /// Écart de durée sous lequel une écoute locale nommée pareil est celle d'une
@@ -859,6 +930,30 @@ impl HistoryRepo {
         Ok((rows.iter().map(|cols| row_to_listen(cols)).collect(), total))
     }
 
+    /// La liste de l'historique d'UN profil : ses écoutes et les écoutes sans
+    /// profil ([`sql::ecoutes_du_profil`]), avec leur total.
+    pub fn recent_paginated_du_profil(
+        &self,
+        limit: i64,
+        offset: i64,
+        profil: i64,
+    ) -> Result<(Vec<ListenRecord>, i64), String> {
+        let total = match self
+            .db
+            .query_one(&sql::count_listed_du_profil(profil), &[])?
+        {
+            None => 0,
+            Some(cols) => cols.first().and_then(|v| v.as_i64()).unwrap_or(0),
+        };
+        let sql = self.dialect_sql(
+            |d| sql::recent_paginated_du_profil(d, profil),
+            |d| sql::recent_paginated_du_profil(d, profil),
+        );
+        let params: [&dyn ToSqlValue; 2] = [&limit, &offset];
+        let rows = self.db.query_many(&sql, &params)?;
+        Ok((rows.iter().map(|cols| row_to_listen(cols)).collect(), total))
+    }
+
     /// Current names of unambiguous local playlist contexts (#4036).
     ///
     /// Resolve the requested history IDs in one query, without changing the
@@ -899,7 +994,35 @@ impl HistoryRepo {
     }
 
     pub fn top_tracks(&self, limit: i64) -> Result<Vec<serde_json::Value>, String> {
+        self.top_tracks_du_profil(limit, None)
+    }
+
+    /// [`Self::top_tracks`] des écoutes que voit `profil`
+    /// ([`sql::ecoutes_du_profil`]) ; `None` : tout le foyer. Les écoutes
+    /// importées, qui n'ont pas de profil, comptent comme communes.
+    pub fn top_tracks_du_profil(
+        &self,
+        limit: i64,
+        profil: Option<i64>,
+    ) -> Result<Vec<serde_json::Value>, String> {
         let sql = self.dialect_sql(sql::top_tracks, sql::top_tracks);
+        let sql = match profil {
+            None => sql,
+            Some(p) => {
+                let musique = format!(
+                    "FROM listen_history h WHERE {} ",
+                    ecoute_de_musique("h.source")
+                );
+                if sql.matches(&musique).count() != 1 {
+                    return Err("top_tracks : filtre de profil introuvable".into());
+                }
+                sql.replacen(
+                    &musique,
+                    &format!("{musique}AND {} ", sql::ecoutes_du_profil(p)),
+                    1,
+                )
+            }
+        };
         let params: [&dyn ToSqlValue; 1] = [&limit];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows
@@ -1218,7 +1341,17 @@ impl HistoryRepo {
     }
 
     pub fn top_artists(&self, limit: i64) -> Result<Vec<(String, i64)>, String> {
+        self.top_artists_du_profil(limit, None)
+    }
+
+    /// [`Self::top_artists`] des écoutes que voit `profil` ; `None` : le foyer.
+    pub fn top_artists_du_profil(
+        &self,
+        limit: i64,
+        profil: Option<i64>,
+    ) -> Result<Vec<(String, i64)>, String> {
         let sql = self.dialect_sql(sql::top_artists, sql::top_artists);
+        let sql = du_profil_avant_le_regroupement(sql, profil)?;
         let params: [&dyn ToSqlValue; 1] = [&limit];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows
@@ -1233,7 +1366,17 @@ impl HistoryRepo {
     }
 
     pub fn top_albums(&self, limit: i64) -> Result<Vec<(String, Option<String>, i64)>, String> {
+        self.top_albums_du_profil(limit, None)
+    }
+
+    /// [`Self::top_albums`] des écoutes que voit `profil` ; `None` : le foyer.
+    pub fn top_albums_du_profil(
+        &self,
+        limit: i64,
+        profil: Option<i64>,
+    ) -> Result<Vec<(String, Option<String>, i64)>, String> {
         let sql = self.dialect_sql(sql::top_albums, sql::top_albums);
+        let sql = du_profil_avant_le_regroupement(sql, profil)?;
         let params: [&dyn ToSqlValue; 1] = [&limit];
         let rows = self.db.query_many(&sql, &params)?;
         Ok(rows
@@ -1249,10 +1392,21 @@ impl HistoryRepo {
     }
 
     pub fn listening_history(&self, days: i64) -> Result<Vec<(String, i64, i64)>, String> {
+        self.listening_history_du_profil(days, None)
+    }
+
+    /// [`Self::listening_history`] des écoutes que voit `profil` ; `None` :
+    /// le foyer.
+    pub fn listening_history_du_profil(
+        &self,
+        days: i64,
+        profil: Option<i64>,
+    ) -> Result<Vec<(String, i64, i64)>, String> {
         let sql = self.dialect_sql(
             |d| sql::listening_history(d, days),
             |d| sql::listening_history(d, days),
         );
+        let sql = du_profil_avant_le_regroupement(sql, profil)?;
         let rows = self.db.query_many(&sql, &[])?;
         Ok(rows
             .into_iter()
@@ -1272,6 +1426,25 @@ impl HistoryRepo {
         self.db.write_tx(&mut |tx| {
             tx.execute("DELETE FROM radio_titres_diffuses", &[])?;
             tx.execute("DELETE FROM listen_history", &[])?;
+            Ok(())
+        })
+    }
+
+    /// Efface les écoutes de `profil`, et avec `communes` celles sans profil
+    /// ([`filtre_de_profil`]), titres diffusés compris. Les écoutes des
+    /// AUTRES profils restent.
+    pub fn clear_du_profil(&self, profil: i64, communes: bool) -> Result<(), String> {
+        let filtre = filtre_de_profil("h.", profil, communes);
+        let titres = format!(
+            "DELETE FROM radio_titres_diffuses WHERE ecoute_id IN \
+             (SELECT h.id FROM listen_history h WHERE {filtre})"
+        );
+        let ecoutes = format!(
+            "DELETE FROM listen_history WHERE id IN (SELECT h.id FROM listen_history h WHERE {filtre})"
+        );
+        self.db.write_tx(&mut |tx| {
+            tx.execute(&titres, &[])?;
+            tx.execute(&ecoutes, &[])?;
             Ok(())
         })
     }
@@ -1542,6 +1715,20 @@ impl HistoryRepo {
         profile_id: Option<i64>,
         top_n: i64,
     ) -> Result<DashboardData, String> {
+        self.full_dashboard_avec_communes(period, zone_id, profile_id, top_n, false)
+    }
+
+    /// [`Self::full_dashboard`] ; `communes` : la vue d'un profil compte aussi
+    /// les écoutes sans profil ([`sql::ecoutes_du_profil`]), comme sa liste —
+    /// la vue qu'un compte standard reçoit sans avoir demandé de profil.
+    pub fn full_dashboard_avec_communes(
+        &self,
+        period: &str,
+        zone_id: Option<i64>,
+        profile_id: Option<i64>,
+        top_n: i64,
+        communes: bool,
+    ) -> Result<DashboardData, String> {
         let days: Option<i64> = match period {
             // "today" is sent by the UI's first period chip. Without this arm it
             // fell through to `other`, where "today".parse::<i64>() fails → None
@@ -1611,7 +1798,7 @@ impl HistoryRepo {
         // global and those NULL rows keep counting. See the record_listen
         // ownership chain (session → trigger owner → NULL).
         if let Some(pid) = profile_id {
-            simple_conditions.push(format!("profile_id = {pid}"));
+            simple_conditions.push(filtre_de_profil("", pid, communes));
         }
         let simple_where = format!("WHERE {}", simple_conditions.join(" AND "));
 
@@ -1624,7 +1811,7 @@ impl HistoryRepo {
             aliased_conditions.push(format!("h.zone_id = {zid}"));
         }
         if let Some(pid) = profile_id {
-            aliased_conditions.push(format!("h.profile_id = {pid}"));
+            aliased_conditions.push(filtre_de_profil("h.", pid, communes));
         }
         let where_clause = format!("WHERE {}", aliased_conditions.join(" AND "));
 
@@ -2236,6 +2423,8 @@ impl HistoryRepo {
         weekday: i64,
         hour: i64,
         limit: i64,
+        profile_id: Option<i64>,
+        communes: bool,
     ) -> Result<Vec<SlotTrack>, String> {
         let days: Option<i64> = match period {
             "today" => Some(1),
@@ -2267,6 +2456,11 @@ impl HistoryRepo {
             "(CASE WHEN {extract_dow} = 0 THEN 7 ELSE {extract_dow} END) = {weekday}"
         ));
         conditions.push(format!("{hour_expr} = {hour}"));
+        // Même règle que `full_dashboard` : la case d'un profil ne compte que
+        // ses écoutes (égalité stricte) ; sans profil, tout le foyer.
+        if let Some(pid) = profile_id {
+            conditions.push(filtre_de_profil("", pid, communes));
+        }
         let where_clause = format!("WHERE {}", conditions.join(" AND "));
         let sql = format!(
             "SELECT track_id, title, artist_name, album_title, album_id, source, \

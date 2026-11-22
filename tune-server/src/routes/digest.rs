@@ -48,7 +48,10 @@ async fn preview(State(state): State<AppState>) -> Result<Json<Value>, AppError>
 // POST /digest/send — generate digest + push to mozaiklabs.fr for emailing
 // ---------------------------------------------------------------------------
 
-async fn send(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+async fn send(
+    _garde: crate::auth::AdminOuCetteMachine,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
     if !state.license.check_feature(Feature::WeeklyDigest).await {
         return Ok(Json(json!({
             "error": "premium_required",
@@ -135,7 +138,10 @@ async fn send(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
 // GET /digest/settings — read preferences
 // ---------------------------------------------------------------------------
 
-async fn get_settings(State(state): State<AppState>) -> Result<Json<Value>, AppError> {
+async fn get_settings(
+    relie: crate::auth::ReliePourLesComptes,
+    State(state): State<AppState>,
+) -> Result<Json<Value>, AppError> {
     if !state.license.check_feature(Feature::WeeklyDigest).await {
         return Ok(Json(json!({
             "error": "premium_required",
@@ -155,11 +161,16 @@ async fn get_settings(State(state): State<AppState>) -> Result<Json<Value>, AppE
         .ok()
         .flatten()
         .unwrap_or_else(|| "monday".to_string());
-    let email = settings
-        .get("digest_email")
-        .ok()
-        .flatten()
-        .unwrap_or_default();
+    // L'adresse ne se montre qu'à qui relie le serveur.
+    let email = if relie.0 {
+        settings
+            .get("digest_email")
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
 
     Ok(Json(json!({
         "enabled": enabled == "true",
@@ -180,6 +191,7 @@ struct DigestSettings {
 }
 
 async fn save_settings(
+    _garde: crate::auth::AdminOuCetteMachine,
     State(state): State<AppState>,
     Json(body): Json<DigestSettings>,
 ) -> Result<Json<Value>, AppError> {

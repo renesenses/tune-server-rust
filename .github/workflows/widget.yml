@@ -1,6 +1,7 @@
 name: Widget Release
 
-# Tune Widget is a Tauri desktop mini-player, isolated from the server
+# Tune Client (named « Tune Widget » until rc12, #9255) is a Tauri desktop
+# client — mini-player and full window, isolated from the server
 # workspace (root Cargo.toml `exclude = ["tune-widget"]`). It ships on its
 # own cadence, NOT with every server `v*` tag — trigger with a `widget-v*`
 # tag or run manually. Reuses the same Apple signing/notarization secrets as
@@ -243,10 +244,12 @@ jobs:
           Remove-Item $pfx -Force
 
       # Avec `release_tag`, le fichier prend le nom de la release :
-      # `Tune Widget_0.1.5_aarch64.dmg` ne dit ni a quelle version de Tune il
+      # `Tune Client_0.1.5_aarch64.dmg` ne dit ni a quelle version de Tune il
       # appartient, ni en quoi il differe du `.dmg` du serveur pose a cote.
-      # Le prefixe `tune-widget-` le tient aussi hors de la liste blanche
+      # Le prefixe `tune-client-` le tient aussi hors de la liste blanche
       # `tune-server-` du client de mise a jour et de la page /download.
+      # Jusqu'a la rc12, l'app s'appelait « Tune Widget » et ses fichiers
+      # `tune-widget-<tag>-…` (#9255, fil du forum 2968).
       - name: Collect DMG
         if: runner.os == 'macOS'
         env:
@@ -264,7 +267,7 @@ jobs:
               x86_64-apple-darwin) plateforme=macos-x86_64 ;;
               *) echo "::error::cible macOS inconnue : $TARGET"; exit 1 ;;
             esac
-            cp "${dmgs[0]}" "../../dist/tune-widget-${RELEASE_TAG}-${plateforme}.dmg"
+            cp "${dmgs[0]}" "../../dist/tune-client-${RELEASE_TAG}-${plateforme}.dmg"
           else
             cp "${dmgs[@]}" ../../dist/
           fi
@@ -293,7 +296,7 @@ jobs:
             $exes = @(Get-ChildItem ..\..\dist\*.exe)
             if ($exes.Count -ne 1) { throw "$($exes.Count) installeurs .exe, un seul attendu" }
             Get-ChildItem ..\..\dist\*.msi -ErrorAction SilentlyContinue | Remove-Item
-            Rename-Item $exes[0].FullName "tune-widget-$($env:RELEASE_TAG)-windows-x86_64-setup.exe"
+            Rename-Item $exes[0].FullName "tune-client-$($env:RELEASE_TAG)-windows-x86_64-setup.exe"
             $found = Get-ChildItem ..\..\dist
           }
           $found | ForEach-Object { "{0}  {1:N0} octets" -f $_.Name, $_.Length }

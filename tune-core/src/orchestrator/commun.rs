@@ -231,6 +231,20 @@ impl PlaybackOrchestrator {
             // cherche un service nommé « bandcamp » dans le registre et
             // échoue — c'est pour ça que la vue jouait dans l'onglet plutôt
             // que dans la zone (#1768).
+            // #9207 (fil 2962) — une URI reçue par le MediaRenderer qui
+            // désigne la bibliothèque de CETTE instance se joue comme la
+            // piste locale : même chaîne que l'interface web (conversion,
+            // bit-perfect, PURE), au lieu du flux HTTP brut de notre propre
+            // route, que la sortie locale ne sait pas toujours sonder (AIFF).
+            // Toute autre URI reste un flux distant.
+            if source == "upnp"
+                && let Some(track_id) = req
+                    .source_id
+                    .as_deref()
+                    .and_then(|uri| self.piste_locale_de_notre_uri(uri))
+            {
+                return Box::pin(self.resoudre_notre_uri_en_piste_locale(req, track_id)).await;
+            }
             if source == "podcast" || source == "radio" || source == "upnp" || source == "bandcamp"
             {
                 return Box::pin(self.resolve_direct_url(req)).await;
@@ -342,7 +356,7 @@ impl PlaybackOrchestrator {
         if inner == url.trim() {
             return None; // playlist pointed back at itself — nothing gained
         }
-        info!(playlist = %url, stream = %inner, "radio_playlist_dereferenced");
+        info!(playlist = %crate::confidentialite::masquer_url(&url), stream = %inner, "radio_playlist_dereferenced");
         Some(inner)
     }
 
@@ -820,8 +834,16 @@ impl PlaybackOrchestrator {
         })
         .ok();
 
-        if let Err(e) = crate::db::listening_resume::started(
-            &self.db, zone_id, &contexte, source, source_id, title, album, cover_url,
+        if let Err(e) = crate::db::listening_resume::started_du_profil(
+            &self.db,
+            zone_id,
+            &contexte,
+            source,
+            source_id,
+            title,
+            album,
+            cover_url,
+            session_profile_id,
         ) {
             tracing::warn!(zone_id, error = %e, "reprise_non_enregistree");
         }
@@ -1054,12 +1076,13 @@ impl PlaybackOrchestrator {
             // épisode navigateur : il n'existe pas encore forcément de reprise.
             // #7415 : `podcast_started_in_context` retire aussi la reprise d'un
             // épisode arrivé à sa fin (durée `np.duration_ms`).
-            let _ = crate::db::listening_resume::podcast_started_in_context(
+            let _ = crate::db::listening_resume::podcast_started_du_profil(
                 &self.db,
                 zone_id,
                 np,
                 state.position_ms,
                 state.session_context_id.as_deref(),
+                state.session_profile_id,
             );
         }
     }
@@ -1145,6 +1168,17 @@ impl PlaybackOrchestrator {
 
     pub async fn streamer_bytes_sent(&self, stream_id: &str) -> Option<u64> {
         self.streamer.stream_bytes_sent(stream_id).await
+    }
+
+    /// #9206 — depuis combien de millisecondes ce flux est lu au-delà de
+    /// l'en-tête (voir [`AudioStreamer::stream_lecture_au_dela_de_l_en_tete_depuis_ms`]).
+    pub async fn streamer_lecture_au_dela_de_l_en_tete_depuis_ms(
+        &self,
+        stream_id: &str,
+    ) -> Option<u64> {
+        self.streamer
+            .stream_lecture_au_dela_de_l_en_tete_depuis_ms(stream_id)
+            .await
     }
 
     /// Audio servie à ce renderer, en millisecondes (voir

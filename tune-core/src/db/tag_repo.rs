@@ -466,9 +466,26 @@ impl TagRepo {
 
     pub fn update(&self, id: i64, name: Option<&str>, color: Option<&str>) -> Result<(), String> {
         if let Some(name) = name {
+            let ancien = self.get(id)?.map(|t| t.name);
             let sql = self.dialect_sql(sql::update_name, sql::update_name);
             let params: [&dyn ToSqlValue; 2] = [&name, &id];
             self.db.execute(&sql, &params)?;
+            // #9158 — renommer un tag (autrement qu'en casse ou en forme
+            // Unicode) le rend MANUEL partout : ses marques « scan » sont
+            // effacées. Sinon le scan suivant, qui cherche l'ancien nom lu dans
+            // le fichier, recréerait l'ancien tag et retirerait le nouveau.
+            let renomme = ancien.is_some_and(|a| {
+                crate::metadata::tags_perso::cle_de_nom(&a)
+                    != crate::metadata::tags_perso::cle_de_nom(name)
+            });
+            if renomme
+                && let Err(e) = self.db.execute(
+                    "DELETE FROM item_tags_scan WHERE tag_id = ?",
+                    &[&id as &dyn ToSqlValue],
+                )
+            {
+                tracing::debug!(error = %e, "tags_perso_marques_non_effacees_au_renommage");
+            }
         }
         if let Some(color) = color {
             let sql = self.dialect_sql(sql::update_color, sql::update_color);
@@ -494,6 +511,10 @@ impl TagRepo {
         let sql = self.dialect_sql(sql::delete_by_id, sql::delete_by_id);
         let params: [&dyn ToSqlValue; 1] = [&id];
         self.db.execute(&sql, &params)?;
+        // #9158 — les marques d'origine du tag supprimé (au mieux).
+        let _ = self
+            .db
+            .execute("DELETE FROM item_tags_scan WHERE tag_id = ?", &params);
         Ok(())
     }
 
@@ -549,7 +570,21 @@ impl TagRepo {
         let sql = self.dialect_sql(sql::tag_item, sql::tag_item);
         let params: [&dyn ToSqlValue; 3] = [&tag_id, &item_type, &item_id];
         self.db.execute(&sql, &params)?;
+        self.effacer_marque_du_scan(&params);
         Ok(())
+    }
+
+    /// #9158 — une pose ou un retrait MANUELS effacent la marque d'origine
+    /// « scan » (`item_tags_scan`) : la pose devient manuelle, et le scan ne
+    /// la retirera plus. Au mieux : une base sans la table (montée à la
+    /// main) n'empêche pas d'étiqueter.
+    fn effacer_marque_du_scan(&self, params: &[&dyn ToSqlValue; 3]) {
+        if let Err(e) = self
+            .db
+            .execute(super::tags_perso_repo::SQL_EFFACER_MARQUE, params)
+        {
+            tracing::debug!(error = %e, "tags_perso_marque_non_effacee");
+        }
     }
 
     /// Retire une étiquette d'un objet.
@@ -562,6 +597,7 @@ impl TagRepo {
         let sql = self.dialect_sql(sql::untag_item, sql::untag_item);
         let params: [&dyn ToSqlValue; 3] = [&tag_id, &item_type, &item_id];
         self.db.execute(&sql, &params)?;
+        self.effacer_marque_du_scan(&params);
         Ok(())
     }
 
@@ -667,6 +703,7 @@ impl TagRepo {
         for &item_id in item_ids {
             let params: [&dyn ToSqlValue; 3] = [&tag_id, &item_type, &item_id];
             self.db.execute(&sql, &params)?;
+            self.effacer_marque_du_scan(&params);
             count += 1;
         }
         Ok(count)
@@ -683,6 +720,7 @@ impl TagRepo {
         for &item_id in item_ids {
             let params: [&dyn ToSqlValue; 3] = [&tag_id, &item_type, &item_id];
             self.db.execute(&sql, &params)?;
+            self.effacer_marque_du_scan(&params);
             count += 1;
         }
         Ok(count)

@@ -370,6 +370,9 @@ impl FournisseurDUrl for FauxFournisseur {
 
 fn ligne(reference: &str, titre: &str, artiste: &str) -> QueueInput {
     QueueInput::Streaming {
+        media_format: None,
+        sample_rate: None,
+        bit_depth: None,
         source: SOURCE.into(),
         source_id: reference.into(),
         title: titre.into(),
