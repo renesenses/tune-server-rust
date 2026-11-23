@@ -1637,7 +1637,7 @@ mod tests {
 
         assert!(
             paquets.len() > 50,
-            "le banc doit dépasser le pré-remplissage de 50 paquets pour juger le cadencement ({} paquets)",
+            "le banc doit envoyer assez de paquets pour juger le cadencement ({} paquets)",
             paquets.len()
         );
 
@@ -1679,7 +1679,8 @@ mod tests {
             "les PTS doivent couvrir le reste servi, sans saut ({etendue_pts_ms} ms pour {RESTE_MS} ms)"
         );
 
-        // 3. Cadencement temps réel après le pré-remplissage.
+        // 3. Cadencement. Le mock n'annonce que 100 ms de tampon : l'avance
+        // est plafonnée à ça, donc 2 s d'audio partent près du temps réel.
         let duree_envoi = paquets.last().unwrap().0 - paquets[0].0;
         assert!(
             duree_envoi >= std::time::Duration::from_millis(1_000),
