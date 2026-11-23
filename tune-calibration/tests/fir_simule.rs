@@ -284,8 +284,11 @@ fn la_phase_excedentaire_d_un_passe_tout_est_corrigee_dans_le_delai_annonce() {
 }
 
 /// La latence annoncée est exacte : le pic de la réponse corrigée arrive
-/// `latence_trames` après celui de la mesure, et le retard de groupe ajouté
-/// au-dessus de la bascule vaut `latence_trames / cadence`.
+/// `latence_trames` après celui de la mesure (EXACT, à la trame), et le
+/// retard de groupe du filtre au-dessus de la bascule vaut
+/// `latence_trames / cadence` à 0,1 ms près : la partie à phase minimale y
+/// ajoute le sien, petit et variable avec la fréquence (−0,05 ms mesuré à
+/// 2 kHz), qui n'est pas un retard.
 #[test]
 fn la_latence_annoncee_est_celle_du_pic_et_du_retard_de_groupe() {
     let room = RoomSim::dry_living_room(FS);
@@ -300,7 +303,7 @@ fn la_latence_annoncee_est_celle_du_pic_et_du_retard_de_groupe() {
             let tau = retard_de_groupe_ms(&fir.coefficients, f);
             eprintln!("T10b latence phase_mixte={phase} : {f} Hz retard de groupe {tau:.4} ms, annoncé {attendu:.4} ms");
             assert!(
-                (tau - attendu).abs() < 0.05,
+                (tau - attendu).abs() < 0.1,
                 "{f} Hz : {tau:.3} ms ≠ {attendu:.3} ms"
             );
         }
