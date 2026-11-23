@@ -570,6 +570,7 @@ static FENETRE: Fenetre = Fenetre::new(PLAFOND_PAR_MINUTE, Duration::from_secs(6
 /// La réponse si elle est un succès, `None` sinon — en silence (`debug`).
 async fn obtenir(
     source: Source<'_>,
+    client: &reqwest::Client,
     url: reqwest::Url,
     agent: Option<&str>,
 ) -> Option<reqwest::Response> {
@@ -582,7 +583,7 @@ async fn obtenir(
         FENETRE.passer().await;
         limiteur.acquire(cle).await;
     }
-    let requete = crate::http::client::shared()
+    let requete = client
         .get(url)
         .timeout(DELAI_APPEL)
         .header(reqwest::header::USER_AGENT, agent.unwrap_or(AGENT_API));
@@ -598,8 +599,10 @@ async fn obtenir(
         limiteur.constater_reponse(cle, &reponse);
     }
     if !reponse.status().is_success() {
-        // Un 404 est une réponse (pas de page) ; le reste est un incident.
-        if reponse.status() != reqwest::StatusCode::NOT_FOUND {
+        // Un 404 est une réponse (pas de page), une redirection refusée par
+        // la politique du client aussi ; le reste est un incident.
+        if reponse.status() != reqwest::StatusCode::NOT_FOUND && !reponse.status().is_redirection()
+        {
             noter_incident();
         }
         debug!(statut = reponse.status().as_u16(), "cover_plus_refus");
@@ -615,7 +618,7 @@ pub(crate) async fn appeler(
     params: &[(&str, &str)],
 ) -> Option<Vec<Value>> {
     let url = reqwest::Url::parse_with_params(&format!("{}{chemin}", source.base), params).ok()?;
-    let reponse = obtenir(source, url, None).await?;
+    let reponse = obtenir(source, crate::http::client::shared(), url, None).await?;
     let corps: Value = match reponse.json().await {
         Ok(v) => v,
         Err(_) => {

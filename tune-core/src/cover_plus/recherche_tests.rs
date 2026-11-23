@@ -80,6 +80,11 @@ async fn faux_itunes(
                                 .to_string(),
                         );
                         journal.lock().unwrap().push(q);
+                        // `/artist/redir-<adresse encodée>` : une redirection.
+                        if let Some(cible) = nom.strip_prefix("redir-") {
+                            use axum::response::IntoResponse;
+                            return axum::response::Redirect::temporary(cible).into_response();
+                        }
                         let og = match nom.as_str() {
                             "generique" => {
                                 Some("https://music.apple.example/assets/meta/apple-music.png")
@@ -88,7 +93,9 @@ async fn faux_itunes(
                             "ailleurs" => Some("https://img.exemple.net/photo/1200x630cw.png"),
                             _ => Some("https://is1.mzstatic.com/photo/1200x630cw.png"),
                         };
-                        axum::response::Html(page_artiste(og))
+                        axum::response::IntoResponse::into_response(axum::response::Html(
+                            page_artiste(og),
+                        ))
                     }
                 },
             ),
@@ -944,5 +951,65 @@ async fn une_recherche_qui_panique_libere_sa_cle() {
     assert!(
         cache().titres.get(&cle2).is_some(),
         "le résultat est retenu"
+    );
+}
+
+/// Une page d'artiste qui redirige HORS de sa racine (music.apple.com, ici
+/// celle du faux service) n'est pas suivie : la redirection est refusée, la
+/// page d'ailleurs n'est jamais demandée, et c'est le logo. Contre-épreuve :
+/// une redirection qui reste sous la racine est suivie, et donne la photo.
+#[tokio::test]
+async fn une_redirection_hors_de_music_apple_com_est_refusee() {
+    // L'« ailleurs » : un second service local, qui note ce qu'on lui demande.
+    let (base_ailleurs, journal_ailleurs) = faux_itunes(|_, _| Vec::new()).await;
+    let encoder = |u: &str| {
+        u.replace('%', "%25")
+            .replace('/', "%2F")
+            .replace(':', "%3A")
+    };
+    let dehors = format!(
+        "redir-{}",
+        encoder(&format!("{base_ailleurs}/artist/fuite"))
+    );
+
+    let cellule: Base = Arc::default();
+    let c = cellule.clone();
+    let (base, journal) = faux_itunes(move |_, q| {
+        if q.get("entity").map(String::as_str) == Some("musicArtist") {
+            let nom = q.get("term").cloned().unwrap_or_default();
+            let base = c.get().expect("base posée").clone();
+            let page = if nom.contains("dehors") {
+                dehors.clone()
+            } else {
+                format!("redir-{}", encoder(&format!("{base}/artist/photo")))
+            };
+            vec![artiste(&c, &nom, &page)]
+        } else {
+            Vec::new()
+        }
+    })
+    .await;
+    cellule.set(base.clone()).unwrap();
+
+    let prep = preparer("Pixies dehors 8452 - Hey", "Radio 8452 redir");
+    assert_eq!(
+        chercher(source(&base), &prep, "US", "Radio 8452 redir", true).await,
+        None,
+        "une redirection hors de la racine ne donne pas de photo"
+    );
+    assert!(
+        journal_ailleurs.lock().unwrap().is_empty(),
+        "la page d'ailleurs ne doit jamais être demandée : {:?}",
+        journal_ailleurs.lock().unwrap()
+    );
+
+    // Contre-épreuve : sous la racine, la redirection est suivie.
+    let prep = preparer("Pixies dedans 8452 - Hey", "Radio 8452 redir bis");
+    let t = chercher(source(&base), &prep, "US", "Radio 8452 redir bis", true).await;
+    assert_eq!(
+        t.map(|t| t.origine),
+        Some(Origine::PhotoArtiste),
+        "{:?}",
+        recherches(&journal)
     );
 }

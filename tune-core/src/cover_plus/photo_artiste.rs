@@ -194,7 +194,13 @@ impl Photo {
 
 async fn lire_la_page(source: Source<'_>, adresse: &str) -> Option<String> {
     let url = reqwest::Url::parse(adresse).ok()?;
-    let mut reponse = super::obtenir(source, url, Some(AGENT_PAGE)).await?;
+    let racine = racine_des_pages(source);
+    let client = client_de_page(racine.clone())?;
+    let mut reponse = super::obtenir(source, &client, url, Some(AGENT_PAGE)).await?;
+    // Défense en profondeur : la page lue est bien sous la racine permise.
+    if !reponse.url().as_str().starts_with(&racine) {
+        return None;
+    }
     let mut octets = Vec::new();
     loop {
         match reponse.chunk().await {
@@ -220,6 +226,33 @@ fn page_admise(source: Source<'_>, page: &str) -> bool {
         || source
             .racine_factice()
             .is_some_and(|r| page.starts_with(&format!("{r}/")))
+}
+
+/// La racine sous laquelle une page d'artiste peut être lue, redirections
+/// comprises : music.apple.com, ou la racine d'un faux service d'épreuve.
+fn racine_des_pages(source: Source<'_>) -> String {
+    source
+        .racine_factice()
+        .map(|r| format!("{r}/"))
+        .unwrap_or_else(|| PAGES_APPLE.to_string())
+}
+
+/// Un client pour la page d'artiste : il ne suit une redirection que si
+/// elle reste sous `racine` (et 5 au plus). Une redirection qui en sort est
+/// refusée : la réponse 3xx revient telle quelle, et le logo reste affiché.
+/// Construit à la demande : une page au plus par artiste, et par titre.
+fn client_de_page(racine: String) -> Option<reqwest::Client> {
+    crate::http::client::builder()
+        .timeout(super::DELAI_APPEL)
+        .redirect(reqwest::redirect::Policy::custom(move |essai| {
+            if essai.previous().len() < 5 && essai.url().as_str().starts_with(&racine) {
+                essai.follow()
+            } else {
+                essai.stop()
+            }
+        }))
+        .build()
+        .ok()
 }
 
 /// La photo ne vient que du CDN d'Apple, `*.mzstatic.com`, en `https://`.
