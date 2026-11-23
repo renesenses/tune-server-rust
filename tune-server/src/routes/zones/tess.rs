@@ -351,6 +351,14 @@ async fn reponse_de_zone(
         greffon_disponible: &disponible,
         pure: lecture.pure,
         volume,
+        // TESS T12c — le ReplayGain de la piste en cours change-t-il ses
+        // échantillons ? (le même facteur que la lecture, `facteur_de_zone`).
+        replaygain_actif: etat.now_playing.as_ref().is_some_and(|np| {
+            (tune_core::audio::replaygain::facteur_de_zone(&state.backend, zone_id, np.piste_rg())
+                - 1.0)
+                .abs()
+                > 1e-6
+        }),
     };
     let actif = settings
         .get(&cle_prereglage_actif(zone_id))

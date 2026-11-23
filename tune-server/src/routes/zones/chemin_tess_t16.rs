@@ -224,6 +224,13 @@ pub(crate) fn chemin_tess_de_la_zone(
         greffon_disponible: &disponible,
         pure: lecture.pure,
         volume,
+        // TESS T12c — le ReplayGain de la piste en cours change-t-il ses
+        // échantillons ? (le même facteur que la lecture, `facteur_de_zone`).
+        replaygain_actif: ps.now_playing.as_ref().is_some_and(|np| {
+            (tune_core::audio::replaygain::facteur_de_zone(backend, zid, np.piste_rg()) - 1.0)
+                .abs()
+                > 1e-6
+        }),
     };
     let resolution = lecture.chaine.resoudre(&catalogue, &ctx);
     let en_service = en_service_d_apres_le_chemin(sp, volume_logiciel);

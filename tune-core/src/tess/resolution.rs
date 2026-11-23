@@ -212,6 +212,11 @@ pub struct ContexteExecution<'a> {
     /// `strict_bitperfect`).
     pub pure: bool,
     pub volume: VolumeZone,
+    /// TESS T12c — le ReplayGain change les échantillons de la piste en cours
+    /// (`audio::replaygain::facteur_de_zone` ≠ 1). Sur HQPlayer et l'autre
+    /// transport hors TESS, il fait passer la piste par le flux traité, comme
+    /// l'égaliseur. Faux sans piste.
+    pub replaygain_actif: bool,
 }
 
 /// Une étape du chemin du signal, résolue.
@@ -444,7 +449,8 @@ impl ChaineTess {
         }
 
         if traitements_de_zone_conserves {
-            let flux_force = greffons.iter().any(|e| {
+            let flux_force = ctx.replaygain_actif
+                || greffons.iter().any(|e| {
                 e.effective
                     && e.plugin_id
                         .as_deref()
@@ -683,6 +689,7 @@ mod tests {
                 control: ControleVolume::Software,
                 db: -18.0,
             },
+            replaygain_actif: false,
         }
     }
 
@@ -865,6 +872,32 @@ mod tests {
             let mut x = ctx(transport);
             x.pure = true;
             assert_eq!(effectives(&resoudre(&c, &x)), [Source, Output]);
+        }
+    }
+
+    /// TESS T12c — le ReplayGain SEUL fait aussi passer la piste par le flux
+    /// traité sur HQPlayer et l'autre transport hors TESS : le crossfeed coché
+    /// y est alors exécuté par le relais, et le bloc TESS doit le dire.
+    /// Contre-épreuve : sans ReplayGain, le crossfeed seul reste hors TESS.
+    #[test]
+    fn hors_tess_le_replaygain_seul_entraine_le_crossfeed_t12c() {
+        let c = ChaineTess {
+            plugins: vec![maillon("crossfeed", true)],
+            ..ChaineTess::default()
+        };
+        for transport in [TransportZone::HqPlayer, TransportZone::Diretta] {
+            let mut x = ctx(transport);
+            x.replaygain_actif = true;
+            let cf = greffon(&resoudre(&c, &x), "crossfeed").clone();
+            assert!(cf.effective, "{transport:?} : ReplayGain actif → crossfeed appliqué");
+            let cf = greffon(&resoudre(&c, &ctx(transport)), "crossfeed").clone();
+            assert!(!cf.effective, "{transport:?}");
+            assert_eq!(cf.reason, Some(MotifEtape::OutsideTess));
+            // Pure : rien, ReplayGain ou pas.
+            let mut x = ctx(transport);
+            x.replaygain_actif = true;
+            x.pure = true;
+            assert!(!greffon(&resoudre(&c, &x), "crossfeed").effective);
         }
     }
 
