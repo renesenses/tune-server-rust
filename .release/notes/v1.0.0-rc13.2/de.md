@@ -7,4 +7,4 @@ Tune 1.0.0-rc13.2, Korrekturversion der rc13.1.
 - Das mozaiklabs.fr-Konto kann jetzt von jedem Browser im lokalen Netzwerk (iPad, Telefon) verknüpft werden, solange noch kein Konto verknüpft ist.
 - Vom lokalen Netzwerk aus kann auch dasselbe Konto erneut verbunden werden. Es durch ein anderes Konto zu ersetzen oder die Verknüpfung aufzuheben, bleibt dem Server-Rechner oder einem Administrator vorbehalten. Name und E-Mail-Adresse des verknüpften Kontos sind im lokalen Netzwerk sichtbar.
 - Windows: Die Aktualisierung aus Tune heraus funktioniert wieder. Seit rc13 und rc13.1 musste man das Installationsprogramm verwenden.
-- Tune OS in rc12, das sich nicht mehr aktualisiert: Das Werkzeug „Débloquer Tune“ (Windows, macOS) startet die Aktualisierung ohne jeden Befehl. Es wird separat heruntergeladen: https://github.com/renesenses/tune-server-rust/releases/tag/debloquer-tune-v1
+- Tune-OS-Server, die auf rc12 stehen geblieben sind und sich nicht mehr aktualisieren: Das neue Werkzeug „Débloquer Tune“ (Windows, Mac) behebt das mit wenigen Klicks, ganz ohne Befehle. Download: https://github.com/renesenses/tune-server-rust/releases/tag/debloquer-tune-v1
