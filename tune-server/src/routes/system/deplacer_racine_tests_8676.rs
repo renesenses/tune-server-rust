@@ -23,6 +23,34 @@ fn demande(ancien: &str, nouveau: &str, confirm: Option<u64>) -> Json<CorpsDepla
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::await_holding_lock)]
 async fn remplacer_le_chemin_par_les_routes_8676() {
+    // Le droit de scanner est global au processus, même avec une base propre.
+    // Les scans de fond des autres bancs peuvent survivre à leur mutex local.
+    const ENFANT: &str = "TUNE_TEST_DEPLACER_8676_ENFANT";
+    if std::env::var_os(ENFANT).is_none() {
+        let nom = concat!(module_path!(), "::remplacer_le_chemin_par_les_routes_8676");
+        let (_, nom) = nom.split_once("::").expect("nom sans préfixe de caisse");
+        let sortie = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([nom, "--exact", "--nocapture", "--test-threads=1"])
+            .env(ENFANT, std::process::id().to_string())
+            .output()
+            .expect("lancer le témoin déplacement isolé");
+        let stdout = String::from_utf8_lossy(&sortie.stdout);
+        let stderr = String::from_utf8_lossy(&sortie.stderr);
+        assert!(
+            sortie.status.success(),
+            "#8676 : témoin isolé en échec\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed; 0 failed; 0 ignored"),
+            "#8676 : le processus enfant doit exécuter exactement le témoin\n{stdout}\n{stderr}"
+        );
+        return;
+    }
+    assert_ne!(
+        std::env::var(ENFANT).unwrap(),
+        std::process::id().to_string(),
+        "#8676 : les états globaux doivent appartenir à un autre processus"
+    );
     let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
 
@@ -141,7 +169,11 @@ async fn remplacer_le_chemin_par_les_routes_8676() {
         .await,
     )
     .await;
-    assert_eq!(s, StatusCode::CONFLICT, "{a}");
+    assert_eq!(
+        s,
+        StatusCode::CONFLICT,
+        "#8676 : une confirmation périmée doit être refusée — {a}"
+    );
     assert_eq!(a["confirm_tracks_required"], 3);
     let chemin = |id: i64| {
         db.query_one(

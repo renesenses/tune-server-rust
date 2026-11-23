@@ -1,82 +1,13 @@
-//! #8872 (fil 2863, 572 000 pistes, Windows) — `GET /library/dr/gravure`
-//! tenait un fil de l'exécuteur 66 s : l'inventaire des pistes mesurées et le
-//! compte des DR déjà gravés étaient lus en synchrone dans le gestionnaire
-//! async. `POST` (lancer) lisait le même inventaire de la même façon.
+//! #8872 — GET et POST gardent leurs vrais accès SQLite hors du worker async.
 //!
-//! L'épreuve POST est celle de #8805 : sur une vraie base de fichier, un fil à part
-//! tient TOUTES les connexions de lecture pendant [`DETENTION`], et les routes
-//! sont appelées pendant ce temps sur un exécuteur `current_thread`. Une route
-//! qui attendrait sa connexion SUR ce fil arrêterait aussi le métronome qui
-//! tourne à côté.
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
-
+//! Un même observateur délègue à la vraie base de fichier et vérifie le fil
+//! des requêtes coûteuses : inventaire pour POST, inventaire et compte pour
+//! GET. Aucun métronome mural ne confond charge du runner et blocage.
+use crate::state::AppState;
 use axum::extract::State;
 use axum::response::IntoResponse;
-
-use crate::state::AppState;
-
-/// Durée pendant laquelle les connexions de lecture sont tenues.
-const DETENTION: Duration = Duration::from_millis(2_000);
-/// Le plus grand trou toléré entre deux battements du métronome.
-const TROU_MAX: Duration = Duration::from_millis(600);
-/// Connexions du pool de lecture SQLite (`READ_POOL_SIZE`, privé).
-const LECTEURS: usize = 3;
-
-fn metronome() -> (Arc<AtomicBool>, Arc<AtomicU64>, tokio::task::JoinHandle<()>) {
-    let arret = Arc::new(AtomicBool::new(false));
-    let trou_max_ms = Arc::new(AtomicU64::new(0));
-    let (a, t) = (arret.clone(), trou_max_ms.clone());
-    let tache = tokio::spawn(async move {
-        let mut dernier = Instant::now();
-        while !a.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(20)).await;
-            let ecart = dernier.elapsed().as_millis() as u64;
-            t.fetch_max(ecart, Ordering::SeqCst);
-            dernier = Instant::now();
-        }
-    });
-    (arret, trou_max_ms, tache)
-}
-
-fn tenir_les_lecteurs(state: &AppState) -> std::thread::JoinHandle<()> {
-    let tenant = state.clone();
-    let (pris_tx, pris_rx) = std::sync::mpsc::channel();
-    let fil = std::thread::spawn(move || {
-        let db = tenant.db.as_ref().expect("moteur SQLite");
-        let gardes: Vec<_> = (0..LECTEURS).map(|_| db.read_connection()).collect();
-        pris_tx.send(()).unwrap();
-        std::thread::sleep(DETENTION);
-        drop(gardes);
-    });
-    pris_rx.recv().expect("les lecteurs sont tenus");
-    fil
-}
-
-/// Mesure le plus grand trou du métronome pendant `route`, lancée alors que
-/// les lecteurs sont tenus. Rend `(trou, durée de la route, réponse)`.
-async fn sous_lecteurs_tenus<F, Fut, T>(state: &AppState, route: F) -> (Duration, Duration, T)
-where
-    F: FnOnce(AppState) -> Fut,
-    Fut: std::future::Future<Output = T> + Send + 'static,
-    T: Send + 'static,
-{
-    let (arret, trou_max_ms, tache) = metronome();
-    tokio::time::sleep(Duration::from_millis(60)).await;
-    let lecteurs = tenir_les_lecteurs(state);
-    let debut = Instant::now();
-    let reponse = tokio::spawn(route(state.clone())).await.unwrap();
-    let duree = debut.elapsed();
-    arret.store(true, Ordering::SeqCst);
-    tache.await.unwrap();
-    lecteurs.join().unwrap();
-    (
-        Duration::from_millis(trou_max_ms.load(Ordering::SeqCst)),
-        duree,
-        reponse,
-    )
-}
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 fn base() -> (tempfile::TempDir, AppState) {
     let dir = tempfile::tempdir().unwrap();
@@ -87,13 +18,14 @@ fn base() -> (tempfile::TempDir, AppState) {
 }
 
 /// Observe le vrai accès SQLite sans confondre charge du runner et blocage.
-struct StatutHorsExecuteur {
+struct BaseHorsExecuteur {
     reel: Arc<dyn tune_core::db::backend::DbBackend>,
     executeur: std::thread::ThreadId,
+    route: &'static str,
     lectures: Arc<std::sync::atomic::AtomicUsize>,
 }
 
-impl tune_core::db::backend::DbBackend for StatutHorsExecuteur {
+impl tune_core::db::backend::DbBackend for BaseHorsExecuteur {
     fn engine(&self) -> tune_core::db::engine::Engine {
         self.reel.engine()
     }
@@ -117,7 +49,8 @@ impl tune_core::db::backend::DbBackend for StatutHorsExecuteur {
             assert_ne!(
                 std::thread::current().id(),
                 self.executeur,
-                "#8872 : le comptage GET occupe le fil de l'exécuteur"
+                "#8872 : le comptage {} occupe le fil de l'exécuteur",
+                self.route
             );
         }
         self.reel.query_one(sql, params)
@@ -132,7 +65,8 @@ impl tune_core::db::backend::DbBackend for StatutHorsExecuteur {
             assert_ne!(
                 std::thread::current().id(),
                 self.executeur,
-                "#8872 : l'inventaire GET occupe le fil de l'exécuteur"
+                "#8872 : l'inventaire {} occupe le fil de l'exécuteur",
+                self.route
             );
         }
         self.reel.query_many(sql, params)
@@ -153,9 +87,10 @@ impl tune_core::db::backend::DbBackend for StatutHorsExecuteur {
 async fn le_statut_de_la_gravure_ne_fige_pas_l_executeur_8872() {
     let (_dir, mut state) = base();
     let lectures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    state.backend = Arc::new(StatutHorsExecuteur {
+    state.backend = Arc::new(BaseHorsExecuteur {
         reel: state.backend.clone(),
         executeur: std::thread::current().id(),
+        route: "GET",
         lectures: lectures.clone(),
     });
     let v = super::statut(State(state)).await.0;
@@ -170,22 +105,39 @@ async fn le_statut_de_la_gravure_ne_fige_pas_l_executeur_8872() {
     assert_eq!(v["dans_les_fichiers"], 0, "{v}");
 }
 
-/// TÉMOIN #8872 — lancer la gravure lit le même inventaire, hors de
-/// l'exécuteur lui aussi, et la passe démarre toujours.
+/// TÉMOIN #8872 — l'inventaire réel doit quitter le worker async unique.
 #[tokio::test(flavor = "current_thread")]
 async fn lancer_la_gravure_ne_fige_pas_l_executeur_8872() {
-    let (_dir, state) = base();
-    let (trou, duree, statut) = sous_lecteurs_tenus(&state, |s| async move {
-        super::lancer(State(s)).await.into_response().status()
-    })
-    .await;
-    assert!(
-        duree >= DETENTION - Duration::from_millis(500),
-        "la route n'a pas attendu les lecteurs ({duree:?}) : l'épreuve ne prouve rien"
-    );
-    assert!(
-        trou < TROU_MAX,
-        "#8872 : POST /library/dr/gravure a figé l'exécuteur {trou:?}"
-    );
+    let (_dir, mut state) = base();
+    let lectures = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    state.backend = Arc::new(BaseHorsExecuteur {
+        reel: state.backend.clone(),
+        executeur: std::thread::current().id(),
+        route: "POST",
+        lectures: lectures.clone(),
+    });
+    let statut = super::lancer(State(state.clone()))
+        .await
+        .into_response()
+        .status();
     assert_eq!(statut, axum::http::StatusCode::ACCEPTED);
+    assert_eq!(
+        lectures.load(Ordering::SeqCst),
+        1,
+        "l'inventaire réel doit être observé"
+    );
+    // Attendre la garde de la passe vide avant de fermer la base et son
+    // dossier, notamment sous Windows où les connexions retiennent le fichier.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        while state
+            .background_tasks
+            .snapshot()
+            .iter()
+            .any(|t| t.id == super::TACHE_GRAVER_DR)
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("#8872 : la passe ne libère pas sa garde de fin");
 }

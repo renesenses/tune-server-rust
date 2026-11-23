@@ -24,6 +24,8 @@ mod bascule_progressive_8558;
 const DUPLICATE_NET_PLAY_WINDOW: std::time::Duration = std::time::Duration::from_secs(12);
 
 mod radio;
+// #9346 — la chaîne de la zone (convolution, crossfeed) sur une radio servie.
+mod chaine_radio_9346;
 /// Réexport PUBLIC, et un seul : `tune-server` refuse désormais à
 /// l'ENREGISTREMENT une adresse de station qui rend une page web, avec le même
 /// verdict que la lecture (#3578). Le reste de ce module reste interne.
@@ -2313,6 +2315,9 @@ mod passthrough_sans_traitement_7986_tests;
 // #9175 — Sendspin et Devialet AIR lisent le flux traité dès qu'un traitement est actif.
 #[cfg(test)]
 mod sorties_qui_decodent_le_fichier_9175_tests;
+// #9176 — OAAT ne lit plus le WAV en direct quand la zone traite le flux.
+#[cfg(test)]
+mod oaat_lecture_directe_9176_tests;
 // Suite de #9175 — saut et reprise de bout en bout avec une vraie sortie Sendspin.
 #[cfg(test)]
 mod sendspin_relance_9175_tests;

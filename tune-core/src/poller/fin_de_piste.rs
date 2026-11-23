@@ -1979,6 +1979,37 @@ mod autoplay_2271_tests {
 
     #[tokio::test]
     async fn autoplay_2271_random_modes_start_without_seed_and_after_streaming() {
+        // Les consignes de fin de piste sont globales, indexées par zone.
+        // Les bancs SQLite indépendants recréent tous leur première zone.
+        const ENFANT: &str = "TUNE_TEST_AUTOPLAY_2271_ENFANT";
+        if std::env::var_os(ENFANT).is_none() {
+            let nom = concat!(
+                module_path!(),
+                "::autoplay_2271_random_modes_start_without_seed_and_after_streaming"
+            );
+            let (_, nom) = nom.split_once("::").expect("nom sans préfixe de caisse");
+            let sortie = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([nom, "--exact", "--nocapture", "--test-threads=1"])
+                .env(ENFANT, std::process::id().to_string())
+                .output()
+                .expect("lancer le témoin autoplay isolé");
+            let stdout = String::from_utf8_lossy(&sortie.stdout);
+            let stderr = String::from_utf8_lossy(&sortie.stderr);
+            assert!(
+                sortie.status.success(),
+                "#2271 : témoin isolé en échec\n{stdout}\n{stderr}"
+            );
+            assert!(
+                stdout.contains("1 passed; 0 failed; 0 ignored"),
+                "#2271 : le processus enfant doit exécuter exactement le témoin\n{stdout}\n{stderr}"
+            );
+            return;
+        }
+        assert_ne!(
+            std::env::var(ENFANT).unwrap(),
+            std::process::id().to_string(),
+            "#2271 : les états globaux doivent appartenir à un autre processus"
+        );
         for mode in [
             AutoplayMode::RandomAlbum,
             AutoplayMode::RandomArtist,
