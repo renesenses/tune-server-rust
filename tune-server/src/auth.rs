@@ -176,7 +176,7 @@ fn get_or_create_jwt_secret(settings: &SettingsRepo) -> String {
 pub(crate) fn est_route_publique(method: &axum::http::Method, path: &str) -> bool {
     let is_extension_route = path.starts_with("/ext/") || path.starts_with("/api/v1/ext/");
     !is_extension_route
-    && (path.contains("/system/health")
+        && (path.contains("/system/health")
         || path.contains("/system/version")
         // NB : /system/profile (fiche support) n'est volontairement PAS
         // dans cette allowlist : la fiche expose music_dirs et l'IP LAN,
