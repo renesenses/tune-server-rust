@@ -103,6 +103,9 @@ pub const HOTES_AUTORISES: &[&str] = &[
     "bbci.co.uk",
     "bbc.co.uk",
     "radio-browser.info",
+    // iHeart : la pochette que ses flux annoncent (`amgArtworkURL`), relayée
+    // par Cover+ (#8452).
+    "iheart.com",
 ];
 
 /// Nombre maximal de redirections suivies à la main.
@@ -1111,6 +1114,9 @@ mod tests {
         assert!(hote_autorise("MOZAIKLABS.FR.", &[]));
         assert!(hote_autorise("ia800300.us.archive.org", &[]));
         assert!(hote_autorise("lastfm.freetls.fastly.net", &[]));
+        // #8452 — la pochette d'un flux iHeart, relayée par Cover+.
+        assert!(hote_autorise("i.iheart.com", &[]));
+        assert!(!hote_autorise("iheart.com.exemple.net", &[]));
         assert!(!hote_autorise("fastly.net", &[]));
         assert!(!hote_autorise("qobuz.com.evil.example", &[]));
         assert!(!hote_autorise("notqobuz.com", &[]));

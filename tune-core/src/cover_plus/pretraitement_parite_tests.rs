@@ -176,12 +176,12 @@ const CAS: &[Cas] = &[
         pochette_fournie: None,
     },
     Cas {
-        brut: "Lizzo - text=\"About Damn Time\" song_spot=\"M\" amgArtworkURL=\"https://i.iheart.example/a.jpg\"",
+        brut: "Lizzo - text=\"About Damn Time\" song_spot=\"M\" amgArtworkURL=\"https://i.iheart.com/a.jpg\"",
         station: "KIIS",
         ignorer: false,
         requetes: &["Lizzo About Damn Time"],
         hypotheses: &[("Lizzo", "About Damn Time"), ("About Damn Time", "Lizzo")],
-        pochette_fournie: Some("https://i.iheart.example/a.jpg"),
+        pochette_fournie: Some("https://i.iheart.com/a.jpg"),
     },
     Cas {
         brut: "KIIS - text=\"Win tickets\" song_spot=\"T\"",

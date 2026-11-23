@@ -153,16 +153,48 @@ fn pas_de_decoupe_sur_un_tiret_sans_espaces() {
 #[test]
 fn format_iheart() {
     let p = preparer(
-        r#"Lizzo - text="About Damn Time" song_spot="M" amgArtworkURL="https://i.iheart.example/a.jpg""#,
+        r#"Lizzo - text="About Damn Time" song_spot="M" amgArtworkURL="https://i.iheart.com/a.jpg""#,
         "KIIS",
     );
     assert_eq!(p.hypotheses[0], paire("Lizzo", "About Damn Time"));
     assert_eq!(
         p.pochette_fournie.as_deref(),
-        Some("https://i.iheart.example/a.jpg")
+        Some("https://i.iheart.com/a.jpg")
     );
     let p = preparer(r#"KIIS - text="Win tickets" song_spot="T""#, "KIIS");
     assert!(p.ignorer.is_some());
+}
+
+/// La pochette d'un flux iHeart n'est gardée que si le relais des pochettes
+/// l'accepte : `https://` sur `*.iheart.com`. Sinon elle s'afficherait
+/// cassée, avec le label « Cover+ ».
+#[test]
+fn pochette_iheart_https_et_hote_iheart_seulement() {
+    for bonne in [
+        "https://i.iheart.com/v3/re/a.jpg",
+        "https://iheart.com/a.jpg",
+    ] {
+        assert!(
+            super::pretraitement::pochette_iheart_admise(bonne),
+            "{bonne}"
+        );
+    }
+    for mauvaise in [
+        "http://i.iheart.com/a.jpg",
+        "https://i.iheart.example/a.jpg",
+        "https://iheart.com.exemple.net/a.jpg",
+        "https://exemple.net/iheart.com/a.jpg",
+        "javascript:alert(1)",
+        "",
+    ] {
+        assert!(
+            !super::pretraitement::pochette_iheart_admise(mauvaise),
+            "{mauvaise}"
+        );
+        let brut =
+            format!(r#"Lizzo - text="About Damn Time" song_spot="M" amgArtworkURL="{mauvaise}""#);
+        assert_eq!(preparer(&brut, "KIIS").pochette_fournie, None, "{mauvaise}");
+    }
 }
 
 #[test]

@@ -491,13 +491,13 @@ async fn le_logo_generique_d_apple_n_est_pas_une_photo_et_le_flux_iheart_prend_l
     .await;
     cellule.set(base.clone()).unwrap();
     let prep = preparer(
-        r#"Lizzo - text="About Damn Time" song_spot="M" amgArtworkURL="https://i.iheart.example/a.jpg""#,
+        r#"Lizzo - text="About Damn Time" song_spot="M" amgArtworkURL="https://i.iheart.com/a.jpg""#,
         "KIIS 8452",
     );
     assert_eq!(
         chercher(source(&base), &prep, "US", "KIIS 8452", true).await,
         Some(Trouvaille {
-            url: "https://i.iheart.example/a.jpg".into(),
+            url: "https://i.iheart.com/a.jpg".into(),
             origine: Origine::PochetteDuFlux,
         })
     );

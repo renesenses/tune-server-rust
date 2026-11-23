@@ -110,6 +110,18 @@ struct Iheart {
     pochette_fournie: Option<String>,
 }
 
+/// La pochette qu'un flux iHeart annonce n'est gardée que si elle vient
+/// d'iHeart, en `https://` : `*.iheart.com` (admis par le relais des
+/// pochettes, `artwork_proxy::HOTES_AUTORISES`). Toute autre adresse serait
+/// refusée par le relais et s'afficherait cassée, label « Cover+ » compris.
+pub fn pochette_iheart_admise(adresse: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(adresse.trim()) else {
+        return false;
+    };
+    let hote = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    url.scheme() == "https" && (hote == "iheart.com" || hote.ends_with(".iheart.com"))
+}
+
 fn iheart(t: &str) -> Option<Iheart> {
     let m = IHEART_TEXT.captures(t)?;
     let tout = m.get(0)?;
@@ -126,7 +138,7 @@ fn iheart(t: &str) -> Option<Iheart> {
         .captures(t)
         .and_then(|c| c.get(1))
         .map(|s| s.as_str().to_string())
-        .filter(|a| a.starts_with("http"));
+        .filter(|a| pochette_iheart_admise(a));
     Some(Iheart {
         artiste,
         titre: m.get(1).map(|s| s.as_str().trim().to_string())?,
