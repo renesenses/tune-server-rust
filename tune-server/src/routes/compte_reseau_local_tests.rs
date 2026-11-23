@@ -1078,6 +1078,29 @@ async fn reseau_local_une_autorisation_inter_sites_est_refusee() {
     }
 }
 
+// ─── Relecture C : HTTP/1.0 ─────────────────────────────────────────────────
+
+/// 22. Une requête HTTP/1.0 (signe d'un mandataire) n'ouvre pas la garde du
+/// compte au réseau local : 403, rien de préparé.
+#[tokio::test]
+async fn reseau_local_en_http_1_0_la_liaison_est_refusee() {
+    let b = banc();
+    let adresse: SocketAddr = LAN.parse().unwrap();
+    let reponse = crate::routes::router(b.state.clone())
+        .oneshot(
+            Request::get(AUTORISER)
+                .version(axum::http::Version::HTTP_10)
+                .extension(ConnectInfo(adresse))
+                .header("host", "192.168.1.10:8888")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(reponse.status(), StatusCode::FORBIDDEN);
+    assert!(attente_du_serveur(&b.state).is_empty(), "rien de préparé");
+}
+
 /// Les phrases du refus de liaison existent dans les seize langues.
 #[test]
 fn les_phrases_du_refus_de_liaison_existent_dans_les_seize_langues() {
