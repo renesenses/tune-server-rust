@@ -5,4 +5,6 @@ Tune 1.0.0-rc13.2, version corrective de la rc13.1.
 - Connexion : le mot de passe du compte administrateur est vérifié de la même façon sur la machine du serveur et sur le réseau local ; message d'erreur plus clair (identifiant : default).
 - Si vous ne pouvez plus vous connecter, utilisez l'identifiant default et le dernier mot de passe saisi sur la machine du serveur.
 - Le compte mozaiklabs.fr peut maintenant être relié depuis n'importe quel navigateur du réseau local (iPad, téléphone), quand aucun compte n'est encore relié.
+- Depuis le réseau local, on peut aussi reconnecter le même compte. Le remplacer par un autre, ou le délier, reste réservé à la machine du serveur ou à un administrateur. Le nom et l'adresse e-mail du compte relié sont visibles depuis le réseau local.
 - Windows : la mise à jour depuis Tune refonctionne. Depuis la rc13 et la rc13.1, il fallait passer par l'installateur.
+- Serveurs Tune OS restés en rc12 qui ne se mettent plus à jour : le nouvel outil « Débloquer Tune » (Windows, Mac) règle le problème en quelques clics, sans aucune commande. Si la base vient d'un autre ordinateur et n'a pas de compte default, il demande l'identifiant et le mot de passe de votre compte administrateur. Téléchargement : https://github.com/renesenses/tune-server-rust/releases/tag/debloquer-tune-v1
