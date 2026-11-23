@@ -459,3 +459,147 @@ fn cas_limites() {
     assert_eq!(pcm, src);
     let _ = Passage::Piste;
 }
+
+/// TESS T06 — l'égaliseur et le crossfeed du porteur RÉSEAU (OAAT, DLNA,
+/// transcodage) en `f64` de bout en bout. Une source 32 bits traverse
+/// ReplayGain, égaliseur, crossfeed et compensation : le signal ne traverse
+/// AUCUNE frontière `f32` (sonde des adaptateurs), et ce qui atteint la
+/// quantification unique colle à 1e-12 près à la référence calculée hors
+/// chaîne (moteurs `f64` du SDK appelés directement). CONTRE-ÉPREUVES : avec
+/// le convolveur (`f32` jusqu'à T09b), la sonde voit sa frontière ; et
+/// l'ancien chemin `f32` des deux moteurs s'écarte de la référence.
+#[test]
+fn t06_egaliseur_et_crossfeed_en_f64_sur_la_chaine_reseau() {
+    use crate::audio::eq::{EqBandSpec, EqProcessor, EqProfile};
+    let bits = 32;
+    let src = source(bits, 2 * 6_000, 0.6, 97);
+    let x = lire(&src, bits);
+    let profil = EqProfile {
+        enabled: true,
+        bands: vec![
+            EqBandSpec {
+                freq: 90.0,
+                gain: 5.0,
+                q: 0.8,
+                band_type: "peak".into(),
+                ..Default::default()
+            },
+            EqBandSpec {
+                freq: 4_000.0,
+                gain: -3.5,
+                q: 2.0,
+                band_type: "peak".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let facteur = 0.8;
+    let neuf = || {
+        let mut d = porteur(Some(facteur));
+        d.eq = Some(EqProcessor::new(&profil, 48_000, 2));
+        d.crossfeed = Some(CrossfeedProcessor::new(48_000, 0.3, 0.3));
+        d
+    };
+    let mut chaine = neuf();
+    let mut pcm = src.clone();
+    let mut vu = Vec::new();
+    let frontieres = crate::tess::sonde_f32::compter(|| {
+        vu = sonde::voir(|| chaine.process(&mut pcm, bits));
+    });
+    assert_eq!(
+        frontieres, 0,
+        "{frontieres} frontières f32 dans la chaîne réseau"
+    );
+
+    // Référence hors chaîne : gain, puis les moteurs f64 du SDK.
+    let mut reference: Vec<f64> = x.iter().map(|v| v * facteur).collect();
+    let mut eq_ref = tune_plugin_equalizer::EqProcessor::new(&profil, 48_000, 2);
+    let mut cf_ref = tune_plugin_crossfeed::CrossfeedProcessor::new(48_000, 0.3, 0.3);
+    eq_ref.process_interleaved_f64(&mut reference);
+    cf_ref.process_interleaved_f64(&mut reference);
+    let e = ecart_max(&vu, &reference);
+    assert!(
+        e < 1e-12,
+        "écart {e:e} : la chaîne réseau n'est pas en 64 bits"
+    );
+
+    // Contre-épreuve 1 : l'ancien chemin f32 des deux moteurs.
+    let mut ancien: Vec<f32> = x.iter().map(|v| (v * facteur) as f32).collect();
+    tune_plugin_equalizer::EqProcessor::new(&profil, 48_000, 2).process_interleaved(&mut ancien);
+    tune_plugin_crossfeed::CrossfeedProcessor::new(48_000, 0.3, 0.3)
+        .process_interleaved(&mut ancien);
+    let ancien: Vec<f64> = ancien.into_iter().map(f64::from).collect();
+    let e_ancien = ecart_max(&ancien, &reference);
+    assert!(e_ancien > 1e-10, "le banc ne discrimine pas ({e_ancien:e})");
+    // … et il reste inaudible (−120 dBFS).
+    assert!(e_ancien < 1e-6, "écart f32↔f64 {e_ancien:e}");
+
+    // T09b : avec le convolveur aussi, AUCUNE frontière f32 (il est en f64
+    // natif depuis T09b ; avant, la sonde y voyait son adaptateur).
+    let mut avec_conv = neuf();
+    avec_conv.convolver = Some(Convolver::new(
+        &[vec![0.5f32, 0.25, 0.125], vec![0.5f32, 0.25, 0.125]],
+        64,
+    ));
+    let mut pcm = src.clone();
+    let frontieres = crate::tess::sonde_f32::compter(|| avec_conv.process(&mut pcm, bits));
+    assert_eq!(
+        frontieres, 0,
+        "{frontieres} frontières f32 avec le convolveur"
+    );
+    // Contre-épreuve 2 : la sonde voit bien une frontière quand il y en a une.
+    let vue = crate::tess::sonde_f32::compter(|| {
+        crate::tess::sonde_f32::noter();
+        avec_conv.process(&mut pcm, bits);
+    });
+    assert_eq!(vue, 1, "la sonde ne compte pas les frontières");
+}
+
+/// Garde-fou mémoire (relecture de #9414) : une piste compensée plus longue
+/// que le seuil — 10 min en 192 kHz stéréo, 230 M échantillons, ≈ 1,8 Go en
+/// `f64` — reste en `f32` même quand l'égaliseur rend des valeurs que le
+/// `f32` n'atteint pas exactement, et la place est RÉSERVÉE d'emblée (aucune
+/// capacité doublée par `extend`). En deçà du seuil, la piste passe en `f64`,
+/// exacte, avec la même réservation. Le seuil est réduit ici pour ne pas
+/// allouer 1 Go dans un test.
+#[test]
+fn t06_une_longue_piste_compensee_reste_en_f32_et_reserve_sa_place() {
+    use super::{SEUIL_STOCKAGE_F64, Stockage};
+    const TOTAL: usize = 48_000;
+    // Des valeurs d'égaliseur : aucune n'est un f32 exact.
+    let y: Vec<f64> = (0..TOTAL)
+        .map(|i| 0.3 * (i as f64 * 0.0123).sin() + 1e-10)
+        .collect();
+    assert!(y.iter().all(|&x| f64::from(x as f32) != x));
+
+    // Au-delà du seuil : f32, place réservée, arrondi au plus proche.
+    let mut long = Stockage::pour(TOTAL, TOTAL / 2);
+    for m in y.chunks(4_801) {
+        long.ajouter(m);
+    }
+    match &long {
+        Stockage::F32 { v, .. } => {
+            assert_eq!(v.len(), TOTAL);
+            assert_eq!(v.capacity(), TOTAL, "place non réservée");
+            assert!(v.iter().zip(&y).all(|(a, b)| *a == *b as f32));
+        }
+        Stockage::F64(_) => panic!("piste longue passée en f64 : 8 octets par échantillon"),
+    }
+
+    // En deçà du seuil : f64 exact, place réservée.
+    assert!(TOTAL < SEUIL_STOCKAGE_F64);
+    let mut court = Stockage::pour(TOTAL, SEUIL_STOCKAGE_F64);
+    for m in y.chunks(4_801) {
+        court.ajouter(m);
+    }
+    match &court {
+        Stockage::F64(v) => {
+            assert_eq!(v, &y);
+            assert_eq!(v.capacity(), TOTAL, "place non réservée");
+        }
+        Stockage::F32 { .. } => panic!("piste courte arrondie en f32"),
+    }
+    // Et le seuil de production borne une piste de 10 min en 192 kHz.
+    assert!(192_000 * 2 * 600 > SEUIL_STOCKAGE_F64);
+}

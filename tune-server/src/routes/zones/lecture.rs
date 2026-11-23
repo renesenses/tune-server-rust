@@ -458,6 +458,7 @@ pub(super) async fn list_zones(State(state): State<AppState>) -> Json<Value> {
             );
             obj.insert("current_track".into(), json!(ps.now_playing));
             inject_metadata_anchor(obj, &ps);
+            inject_dsd_porte(obj, "current_track", &ps);
             inject_session_context(obj, &ps);
             obj.insert(
                 "device_volume_observation".into(),
@@ -728,6 +729,7 @@ pub(crate) async fn get_zone(
                     json!(mode_exclusif_applique(&state, zone.output_device_id.as_deref()).await),
                 );
                 inject_metadata_anchor(obj, &ps);
+                inject_dsd_porte(obj, "current_track", &ps);
                 inject_session_context(obj, &ps);
                 obj.insert(
                     "device_volume_observation".into(),

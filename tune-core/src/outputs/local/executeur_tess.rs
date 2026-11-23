@@ -12,15 +12,13 @@
 //!   lit l'ordre d'une [`ChaineTess`] (la clé `zone_{id}_tess_chain` arrive
 //!   avec T02 ; le branchement par zone suit dans ce lot).
 //! - **« Bypass all »** : aucun étage n'est appelé, l'entrée ressort à l'octet.
-//! - **Adaptateurs provisoires `f32` ↔ `f64`** : l'égaliseur et
-//!   le crossfeed (natifs tiers compris) gardent leurs moteurs `f32` sous leurs
-//!   verrous historiques. Chaque adaptateur convertit à SA frontière, par
-//!   morceaux d'une pile fixe (aucune allocation de l'adaptateur), et rend des
-//!   `f64`. T05 et T06 les remplacent par des étages `f64` natifs. Le
-//!   convolveur, lui, est un étage `f64` natif depuis T09b.
-//!   Parce que tout ce qu'un moteur `f32` rend est exactement représentable en
-//!   `f64`, la chaîne est **bit pour bit** celle d'avant tant que les étages
-//!   sont ceux d'avant (non-régression prouvée par les témoins ci-dessous).
+//! - **Moteurs de référence en `f64` natif (T06, T09b)** : l'égaliseur
+//!   (graphique, paramétrique, casque), le crossfeed et le convolveur reçoivent
+//!   le tampon `f64` de l'exécuteur tel quel, sous leurs verrous historiques ;
+//!   un natif tiers `F32` est converti à SA frontière par l'hôte natif (T05).
+//!   Le témoin `crate::tess::sonde_f32` compte ces frontières. Par rapport à
+//!   la chaîne `f32` d'avant, seul l'arrondi change (un à la frontière au lieu
+//!   d'un par étage) : quelques ULP `f32`, sous −126 dBFS (témoins ci-dessous).
 //! - **Repli mono** : premier étage en `f64` natif. Il reste le DERNIER des
 //!   étages (#2362 ; rattaché à `channel-remap`, place `last_plugin`).
 //! - **Points d'insertion de T07** : les étages fixes (headroom avec
@@ -142,9 +140,6 @@ impl OrdreLocal {
 pub(super) const TRANCHE: usize = 1 << 16;
 
 thread_local! {
-    /// Tampon de conversion des adaptateurs `f32` : grandit jusqu'au plus grand
-    /// bloc vu (au plus [`TRANCHE`]), puis n'alloue plus.
-    static TAMPON_F32: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     /// Tampon `f64` du décodage et de l'entrée `f32` : même règle.
     static TAMPON_F64: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
 }
@@ -175,23 +170,9 @@ fn avec_tampon<T: Copy + Default>(
     });
 }
 
-/// Fait passer `tampon` par un moteur `f32` : un seul appel par tranche
-/// (donc un seul par bloc du producteur), converti dans le tampon du fil.
-fn par_tranches_f32(tampon: &mut [f64], canaux: usize, mut moteur: impl FnMut(&mut [f32])) {
-    for morceau in tampon.chunks_mut(pas_de_tranche(canaux)) {
-        avec_tampon(&TAMPON_F32, morceau.len(), |f| {
-            for (d, s) in f.iter_mut().zip(morceau.iter()) {
-                *d = *s as f32;
-            }
-            moteur(f);
-            for (d, s) in morceau.iter_mut().zip(f.iter()) {
-                *d = f64::from(*s);
-            }
-        });
-    }
-}
-
-/// Adaptateur provisoire de l'égaliseur (`f32`) : à porter en `f64` par T06.
+/// L'égaliseur (graphique, paramétrique, casque AutoEQ et OPRA : un seul
+/// moteur), en `f64` natif depuis TESS T06 : le tampon de l'exécuteur lui est
+/// passé tel quel, sans aucun aller-retour par `f32`.
 struct AdaptateurEgaliseur<'a> {
     moteur: Option<&'a Mutex<Option<EqProcessor>>>,
     canaux: usize,
@@ -215,9 +196,7 @@ impl EtageTess for AdaptateurEgaliseur<'_> {
             && let Ok(mut e) = m.lock()
             && let Some(p) = e.as_mut()
         {
-            par_tranches_f32(&mut t[..trames * self.canaux], self.canaux, |f| {
-                p.process_interleaved(f);
-            });
+            p.process_interleaved_f64(&mut t[..trames * self.canaux]);
             // #5215 — l'égaliseur coupé a fini son fondu et ne garde aucun
             // préampli : on le retire, la chaîne redevient celle d'un EQ absent.
             if p.est_neutre_au_repos() {
@@ -279,8 +258,9 @@ impl EtageTess for AdaptateurConvolution<'_> {
     fn definir_bypass(&mut self, _: bool) {}
 }
 
-/// Adaptateur provisoire du crossfeed et des natifs tiers (`f32`), stéréo
-/// seulement : à porter en `f64` par T05/T14.
+/// Le crossfeed (v1 intégré, en `f64` natif depuis TESS T06) et les natifs
+/// tiers (convertis à LEUR frontière s'ils sont des paquets `F32`, T05),
+/// stéréo seulement.
 struct AdaptateurCrossfeed<'a> {
     moteur: &'a Mutex<Option<CrossfeedProcessor>>,
     canaux: usize,
@@ -305,7 +285,7 @@ impl EtageTess for AdaptateurCrossfeed<'_> {
         if let Ok(mut cf) = self.moteur.lock()
             && let Some(c) = cf.as_mut()
         {
-            par_tranches_f32(&mut t[..trames * 2], 2, |f| c.process_interleaved(f));
+            c.process_interleaved_f64(&mut t[..trames * 2]);
         }
         Ok(())
     }

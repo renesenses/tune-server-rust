@@ -5903,12 +5903,21 @@ impl EtageDeConversion<'_> {
             // #7614 — le greffon porte la cadence ; rubato ne tourne pas.
             mots = etage.traiter(&mots);
         } else if self.needs_resample {
+            let debut = std::time::Instant::now();
             mots = rubato_resample_chunk(
                 &mut self.resampler,
                 &mots,
                 self.sortie.canaux,
                 false,
                 &mut self.resample_leftover,
+            );
+            // #9391 — un rééchantillonnage qui mange le temps réel se dit.
+            crate::audio::resample::surveiller_le_cout(
+                "sortie_locale",
+                debut,
+                mots.len(),
+                self.sortie.canaux,
+                self.sortie.cadence,
             );
         }
         mots
@@ -8304,6 +8313,9 @@ impl OutputTarget for LocalOutput {
                     // partagé : le natif lui cède, comme à un DSP actif.
                     surechantillonnage_voulu: greffon
                         == diagnostic_surechantillonnage_8259::GreffonAvantLeNatif::Voulu,
+                    // #9187 — les sorties suiveuses (#6132) ne sont branchées
+                    // que sur le chemin partagé : le natif leur cède.
+                    sortie_double: !seconde_sortie.is_empty(),
                 };
                 match bras_alsa_natif::chemin_natif_s32(&conditions) {
                     Ok(()) => {
