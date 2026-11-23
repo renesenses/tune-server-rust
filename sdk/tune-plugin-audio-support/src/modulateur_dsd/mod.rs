@@ -39,9 +39,11 @@
 //!
 //! Dither : ±0,1 laissait des tons de repos sur une entrée continue faible
 //! (raie à −125,7 dB pour un continu de 3e-3, −121,9 dB sans dither) ; ±0,2
-//! les ramène à −136,6 dB pour moins de 1 dB de bruit en bande en plus, et la
-//! boucle reste stable sur les pires cas (crête intersample tenue à 60 % :
-//! entrée du quantificateur ≤ 1,06, aucune remise à zéro).
+//! les ramène à −136,6 dB. Le prix, mesuré au banc : le plancher sur silence
+//! passe de −126,4 à −121,5 dB en DSD64 (−170,9 à −165,9 dB en DSD128,
+//! inchangé en DSD256), et l'entrée du quantificateur monte (≤ 1,06 en DSD64,
+//! ≤ 1,48 en DSD256 sur la crête intersample tenue à 60 %), toujours loin du
+//! seuil d'instabilité ([`SEUIL_INSTABILITE`]) : aucune remise à zéro.
 //!
 //! Aucune allocation dans [`ModulateurDsd::traiter`].
 
