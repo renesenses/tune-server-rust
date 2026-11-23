@@ -34,3 +34,38 @@ fn la_balise_og_image() {
     );
     assert_eq!(og_image("<head></head>"), None);
 }
+
+/// Apple peut changer sa page : la lecture tolère l'ordre des attributs, les
+/// guillemets simples, `name=` et les entités, et refuse ce qui n'est pas
+/// une adresse `https://`.
+#[test]
+fn la_balise_og_image_lue_avec_tolerance() {
+    let attendu = Some("https://img.example/1200x630cw.png");
+    for html in [
+        r#"<meta content="https://img.example/1200x630cw.png" property="og:image">"#,
+        r#"<meta property='og:image' content='https://img.example/1200x630cw.png' />"#,
+        r#"<META NAME="og:image" CONTENT="https://img.example/1200x630cw.png">"#,
+        "<meta\n  property=\"og:image\"\n  content=\"https://img.example/1200x630cw.png\"\n>",
+    ] {
+        assert_eq!(og_image(html).as_deref(), attendu, "{html}");
+    }
+    assert_eq!(
+        og_image(r#"<meta property="og:image" content="https://img.example/a.png?x=1&amp;y=2">"#)
+            .as_deref(),
+        Some("https://img.example/a.png?x=1&y=2")
+    );
+    for html in [
+        r#"<meta property="og:image" content="http://img.example/a.png">"#,
+        r#"<meta property="og:image" content="javascript:alert(1)">"#,
+        r#"<meta property="og:image" content="">"#,
+        r#"<meta property="og:image">"#,
+        r#"<meta property="og:image" content="https://img.example/<script>">"#,
+        "<html><head><title>Nouvelle page</title></head></html>",
+        "",
+    ] {
+        assert_eq!(og_image(html), None, "{html}");
+    }
+    // Une page énorme et sans balise : aucune panique, aucun résultat.
+    let enorme = "<div>".repeat(200_000);
+    assert_eq!(og_image(&enorme), None);
+}

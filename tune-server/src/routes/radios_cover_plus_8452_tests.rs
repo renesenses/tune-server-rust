@@ -101,22 +101,31 @@ async fn station_inconnue_404() {
 }
 
 #[tokio::test]
-async fn livre_eteint_l_interrupteur_du_serveur_l_allume() {
+async fn allume_par_defaut_l_interrupteur_du_serveur_l_eteint() {
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
     let app = crate::routes::router(state.clone());
 
     let (s, v) = appel(&app, "GET", "/api/v1/radios/cover-plus", None).await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(v, json!({"enabled": false, "artist_photo": true}), "livré éteint");
+    assert_eq!(v, json!({"enabled": true, "artist_photo": true}), "allumé par défaut (rc14)");
 
     let (s, v) = appel(
+        &app,
+        "PUT",
+        "/api/v1/radios/cover-plus",
+        Some(json!({"enabled": false})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v, json!({"enabled": false, "artist_photo": true}));
+    assert!(!tune_core::cover_plus::actif_globalement(&state.backend));
+    let (_, v) = appel(
         &app,
         "PUT",
         "/api/v1/radios/cover-plus",
         Some(json!({"enabled": true})),
     )
     .await;
-    assert_eq!(s, StatusCode::OK);
     assert_eq!(v, json!({"enabled": true, "artist_photo": true}));
     assert!(tune_core::cover_plus::actif_globalement(&state.backend));
 

@@ -36,11 +36,19 @@ async fn faux_itunes(
     let reponse = Arc::new(reponse);
     let route = |chemin: &'static str| {
         let (journal, reponse) = (journal.clone(), reponse.clone());
-        axum::routing::get(move |Query(q): Query<HashMap<String, String>>| {
+        axum::routing::get(move |Query(q): Query<HashMap<String, String>>, entetes: axum::http::HeaderMap| {
             let (journal, reponse) = (journal.clone(), reponse.clone());
             async move {
                 let mut q = q;
                 q.insert("_chemin".into(), chemin.into());
+                q.insert(
+                    "_agent".into(),
+                    entetes
+                        .get("user-agent")
+                        .and_then(|v| v.to_str().ok())
+                        .unwrap_or_default()
+                        .to_string(),
+                );
                 journal.lock().unwrap().push(q.clone());
                 let results = reponse(chemin, &q);
                 axum::Json(json!({ "resultCount": results.len(), "results": results }))
@@ -201,8 +209,8 @@ fn db() -> Arc<dyn DbBackend> {
     db.init_schema().unwrap();
     crate::db::migrations::run_migrations(&db).unwrap();
     let db: Arc<dyn DbBackend> = Arc::new(db);
-    // Cover+ part éteint : les épreuves l'allument, sauf celle qui garde
-    // l'extinction.
+    // Cover+ est allumé par défaut (rc14) ; on le pose quand même, pour que
+    // l'épreuve ne dépende pas d'une variable d'environnement.
     regler_globalement(&db, true).unwrap();
     db
 }
@@ -600,11 +608,22 @@ async fn la_photo_suit_l_ordre_qui_reussit_sur_la_station() {
 }
 
 #[tokio::test]
-async fn livre_eteint_rien_n_est_cherche() {
+async fn allume_par_defaut_et_l_interrupteur_coupe_tout() {
+    // Une base neuve : allumé (accord de Bertrand du 23/11, rc14).
+    let neuve = SqliteDb::open_in_memory().unwrap();
+    neuve.init_schema().unwrap();
+    crate::db::migrations::run_migrations(&neuve).unwrap();
+    let neuve: Arc<dyn DbBackend> = Arc::new(neuve);
+    if std::env::var(ENV_ACTIF).is_err() {
+        assert!(actif_globalement(&neuve));
+    }
+    // L'interrupteur du serveur, coupé : rien n'est cherché.
     let (base, journal) = faux_itunes(|_, _| Vec::new()).await;
     let db = db();
     regler_globalement(&db, false).unwrap();
-    assert!(!actif_globalement(&db));
+    if std::env::var(ENV_ACTIF).is_err() {
+        assert!(!actif_globalement(&db));
+    }
     let t = TitreEnCours {
         station_id: None,
         station_nom: "Radio Cover+ 8452 eteint",
@@ -616,12 +635,6 @@ async fn livre_eteint_rien_n_est_cherche() {
     assert_eq!(pochette_du_titre_par(&db, &t, source(&base)), Decision::Rien);
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(journal.lock().unwrap().is_empty());
-    // Une base neuve : éteint.
-    let neuve = SqliteDb::open_in_memory().unwrap();
-    neuve.init_schema().unwrap();
-    crate::db::migrations::run_migrations(&neuve).unwrap();
-    let neuve: Arc<dyn DbBackend> = Arc::new(neuve);
-    assert!(!actif_globalement(&neuve));
 }
 
 /// Le débit (§ 3.1) : les appels passent par le limiteur iTunes partagé, un
@@ -643,5 +656,100 @@ async fn les_appels_passent_par_le_limiteur_partage() {
         debut.elapsed() >= Duration::from_millis(2900),
         "deux appels en {:?} : le limiteur n'a pas été traversé",
         debut.elapsed()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// rc14 — les garde-fous : budget d'appels, agent générique, délai court
+// ---------------------------------------------------------------------------
+
+/// Un changement de titre coûte quelques appels au plus : une chaîne en
+/// trois parties avec un remix, introuvable partout, ouvrirait sinon cinq
+/// recherches de morceaux (remixeur, deux parties, complète, puis deux aux
+/// États-Unis) et deux d'artiste.
+#[tokio::test]
+async fn un_titre_coute_quelques_appels_au_plus() {
+    let (base, journal) = faux_itunes(|_, _| Vec::new()).await;
+    let prep = preparer(
+        "Lisa Leblanc - Pourquoi faire aujourd'hui (Poirier remix) - Highways 8452",
+        "Radio 8452 budget",
+    );
+    let _ = chercher(source(&base), &prep, "CA", "Radio 8452 budget", true).await;
+    let appels = recherches(&journal);
+    let morceaux = appels
+        .iter()
+        .filter(|q| q.get("entity").map(String::as_str) == Some("song"))
+        .count();
+    assert!(morceaux <= 4, "{morceaux} recherches de morceaux : {appels:?}");
+    assert!(appels.len() <= 7, "{} appels pour un titre : {appels:?}", appels.len());
+    // Seuls l'artiste, le titre, la boutique et les paramètres d'iTunes
+    // partent : rien qui désigne l'auditeur.
+    for q in &appels {
+        for cle in q.keys() {
+            assert!(
+                ["term", "entity", "country", "limit", "id", "_chemin", "_agent"]
+                    .contains(&cle.as_str()),
+                "paramètre inattendu « {cle} » : {q:?}"
+            );
+        }
+    }
+}
+
+/// L'agent des appels à l'API est générique : ni version, ni machine.
+#[tokio::test]
+async fn les_appels_portent_un_agent_generique() {
+    let (base, journal) = faux_itunes(|_, _| Vec::new()).await;
+    let _ = appeler(source(&base), "/search", &[("term", "Air Sexy Boy")]).await;
+    let appels = recherches(&journal);
+    assert_eq!(appels.len(), 1);
+    assert_eq!(appels[0]["_agent"], "Mozilla/5.0 (compatible; Tune)");
+}
+
+/// Un service qui ne répond pas ne retient pas la recherche : le délai d'un
+/// appel est court, l'échec silencieux (`None`).
+#[tokio::test]
+async fn un_service_muet_ne_retient_pas_la_recherche() {
+    let app = axum::Router::new().route(
+        "/search",
+        axum::routing::get(|| async {
+            tokio::time::sleep(Duration::from_secs(120)).await;
+            "{}"
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let debut = std::time::Instant::now();
+    let r = tokio::time::timeout(
+        Duration::from_secs(12),
+        appeler(source(&base), "/search", &[("term", "a")]),
+    )
+    .await;
+    assert!(
+        matches!(r, Ok(None)),
+        "l'appel devait abandonner seul, vite et sans résultat ({:?})",
+        debut.elapsed()
+    );
+}
+
+/// Une page d'artiste dont Apple a changé la forme : pas de photo, le logo
+/// de la station (`None`), sans panique.
+#[tokio::test]
+async fn une_page_d_artiste_changee_rend_le_logo() {
+    let cellule: Base = Arc::default();
+    let c = cellule.clone();
+    let (base, _) = faux_itunes(move |_, q| {
+        if q.get("entity").map(String::as_str) == Some("musicArtist") {
+            vec![artiste(&c, "Pixies 8452", "sans")]
+        } else {
+            Vec::new()
+        }
+    })
+    .await;
+    cellule.set(base.clone()).unwrap();
+    let prep = preparer("Pixies 8452 - Where Is My Mind", "Radio 8452 page");
+    assert_eq!(
+        chercher(source(&base), &prep, "US", "Radio 8452 page", true).await,
+        None
     );
 }
