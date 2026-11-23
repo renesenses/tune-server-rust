@@ -5183,6 +5183,18 @@ async fn le_refus_de_sortie_tenue_porte_son_motif_et_la_zone_qui_la_tient() {
         ev.data
     );
     assert_eq!(ev.data["holder_zone_id"], zone_b, "{}", ev.data);
+    // Rc14 — de quoi composer la phrase dans la langue de l'interface : la
+    // phrase de l'événement est en français.
+    assert_eq!(ev.data["params"]["holder"], "NanoPlayer", "{}", ev.data);
+    assert_eq!(ev.data["params"]["zone"], "NanoPlayer", "{}", ev.data);
+    assert_eq!(ev.data["params"]["variant"], "same_name", "{}", ev.data);
+    assert!(
+        ev.data["params"]["device"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()),
+        "{}",
+        ev.data
+    );
     let message = ev.data["message"].as_str().unwrap_or_default();
     assert!(
         message.contains("déjà") && !message.starts_with("zone_output_unavailable"),
