@@ -278,7 +278,12 @@ fn l_ecart_avec_l_ancien_chemin_est_inaudible_et_le_bruit_baisse() {
 
 /// La boucle `f32` d'AVANT T06, recopiée telle quelle (sans ombre) :
 /// l'oracle du bit près.
-fn ancienne_boucle_f32(amount: f32, delay_ms: f32, samples: &mut [f32], etat: &mut (Vec<f32>, Vec<f32>, usize)) {
+fn ancienne_boucle_f32(
+    amount: f32,
+    delay_ms: f32,
+    samples: &mut [f32],
+    etat: &mut (Vec<f32>, Vec<f32>, usize),
+) {
     let d = ((delay_ms.clamp(0.0, 5.0) / 1000.0) * SR as f32).round() as usize;
     if etat.0.len() != d {
         *etat = (vec![0.0; d], vec![0.0; d], 0);
@@ -431,7 +436,10 @@ fn banc_cpu_crossfeed_96_khz() {
     let mut alea = Alea(11);
     let x: Vec<f64> = (0..2 * BLOC * 64).map(|_| 0.3 * alea.suivant()).collect();
     let blocs = SECONDES * SR96 as usize / BLOC;
-    for (nom, ombre) in [("sans ombre", None), ("avec ombre", Some(OmbreDeTete::default()))] {
+    for (nom, ombre) in [
+        ("sans ombre", None),
+        ("avec ombre", Some(OmbreDeTete::default())),
+    ] {
         let mesurer = |f: &mut dyn FnMut(usize)| {
             let mut meilleur = f64::MAX;
             for _ in 0..3 {

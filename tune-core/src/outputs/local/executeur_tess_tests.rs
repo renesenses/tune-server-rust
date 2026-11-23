@@ -332,7 +332,11 @@ fn l_entree_f32_historique_rend_les_memes_bits() {
     let mut y = source;
     ancien_apply_local_dsp(&mut y, &a.eq, &a.conv, &a.cf, &a.pure, &a.mono, 2, false);
     assert!(ecart_f32(&x, &y) <= ECART_T06, "{:e}", ecart_f32(&x, &y));
-    assert_ne!(bits_f32(&x), bits_f32(&y), "T06 : l'égaliseur doit être en f64");
+    assert_ne!(
+        bits_f32(&x),
+        bits_f32(&y),
+        "T06 : l'égaliseur doit être en f64"
+    );
     let qx = crate::outputs::local::flush_local_dsp(&n.conv, &n.cf, &n.pure, &n.mono, 2, false);
     let qy = ancien_flush_local_dsp(&a.conv, &a.cf, &a.mono, 2);
     assert_eq!(qx.len(), qy.len());
@@ -719,7 +723,10 @@ fn le_chemin_natif_rend_les_mots_d_avant() {
                     .max()
                     .unwrap_or(0);
                 assert_eq!(natif.samples.len(), attendu.len());
-                assert!(pire <= tolerance, "{bits} bits : écart {pire} > {tolerance}");
+                assert!(
+                    pire <= tolerance,
+                    "{bits} bits : écart {pire} > {tolerance}"
+                );
             }
         }
     }
@@ -890,7 +897,10 @@ fn t06_aucune_frontiere_f32_pour_l_egaliseur_et_le_crossfeed() {
     let n = crate::tess::sonde_f32::compter(|| {
         sans.nouveau(&source, 24, OrdreLocal::HISTORIQUE, 1_000);
     });
-    assert_eq!(n, 0, "{n} frontières f32 traversées par l'égaliseur ou le crossfeed");
+    assert_eq!(
+        n, 0,
+        "{n} frontières f32 traversées par l'égaliseur ou le crossfeed"
+    );
     let avec_conv = Chaine::new(true, true, true, true);
     let n = crate::tess::sonde_f32::compter(|| {
         avec_conv.nouveau(&source, 24, OrdreLocal::HISTORIQUE, 1_000);
@@ -950,7 +960,10 @@ fn t06_soixante_quatre_bits_reels_egaliseur_et_crossfeed_sur_la_chaine_locale() 
     };
     let chaine = Chaine::new(true, false, true, true);
     let e = ecart(&chaine.nouveau(&source, 32, OrdreLocal::HISTORIQUE, 1_024));
-    assert!(e < 1e-12, "écart {e:e} : la chaîne locale n'est pas en 64 bits");
+    assert!(
+        e < 1e-12,
+        "écart {e:e} : la chaîne locale n'est pas en 64 bits"
+    );
 
     let chaine = Chaine::new(true, false, true, true);
     let ancien: Vec<f64> = chaine

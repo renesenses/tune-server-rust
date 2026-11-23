@@ -152,5 +152,9 @@ fn la_facade_ne_repasse_jamais_par_f32() {
     let mut y = x.clone();
     e.process_interleaved_f64(&mut y);
     let hors_grille = y.iter().filter(|&&v| f64::from(v as f32) != v).count();
-    assert!(hors_grille > y.len() * 9 / 10, "{hors_grille} sur {}", y.len());
+    assert!(
+        hors_grille > y.len() * 9 / 10,
+        "{hors_grille} sur {}",
+        y.len()
+    );
 }

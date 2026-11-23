@@ -3,11 +3,11 @@
 //! the same persisted profile and producer locations (including radio).
 use super::ecretage::{CompteurDEcretage, EtageEcretant, Portee, REGISTRE, dire_fin, dire_premier};
 use std::sync::atomic::{AtomicBool, Ordering};
+use tune_plugin_audio_support::echantillon::Echantillon;
 pub use tune_plugin_equalizer::{
     DEBIT_DE_REFERENCE_HZ, EqBandSpec, EqProcessStats, EqProfile, HeadroomMode, ListeningMode,
     RoomSize, SpeakerPlacement,
 };
-use tune_plugin_audio_support::echantillon::Echantillon;
 use tune_plugin_native::stage::Stage;
 /// #5215 — durée de la rampe qui accompagne une bascule d'égaliseur EN VOL.
 ///
@@ -103,10 +103,8 @@ trait EchantillonHote: Echantillon {
     /// `min(n / d, 1)`, calculé dans ce type (en `f32` comme avant pour
     /// `f32`).
     fn rapport_borne(n: usize, d: usize) -> Self;
-    fn moteur_integre(
-        p: &mut tune_plugin_equalizer::EqProcessor,
-        s: &mut [Self],
-    ) -> EqProcessStats;
+    fn moteur_integre(p: &mut tune_plugin_equalizer::EqProcessor, s: &mut [Self])
+    -> EqProcessStats;
     fn moteur_natif(
         p: &mut Stage,
         s: &mut [Self],

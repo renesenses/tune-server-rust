@@ -507,7 +507,10 @@ fn t06_egaliseur_et_crossfeed_en_f64_sur_la_chaine_reseau() {
     let frontieres = crate::tess::sonde_f32::compter(|| {
         vu = sonde::voir(|| chaine.process(&mut pcm, bits));
     });
-    assert_eq!(frontieres, 0, "{frontieres} frontières f32 dans la chaîne réseau");
+    assert_eq!(
+        frontieres, 0,
+        "{frontieres} frontières f32 dans la chaîne réseau"
+    );
 
     // Référence hors chaîne : gain, puis les moteurs f64 du SDK.
     let mut reference: Vec<f64> = x.iter().map(|v| v * facteur).collect();
@@ -516,7 +519,10 @@ fn t06_egaliseur_et_crossfeed_en_f64_sur_la_chaine_reseau() {
     eq_ref.process_interleaved_f64(&mut reference);
     cf_ref.process_interleaved_f64(&mut reference);
     let e = ecart_max(&vu, &reference);
-    assert!(e < 1e-12, "écart {e:e} : la chaîne réseau n'est pas en 64 bits");
+    assert!(
+        e < 1e-12,
+        "écart {e:e} : la chaîne réseau n'est pas en 64 bits"
+    );
 
     // Contre-épreuve 1 : l'ancien chemin f32 des deux moteurs.
     let mut ancien: Vec<f32> = x.iter().map(|v| (v * facteur) as f32).collect();
@@ -537,5 +543,8 @@ fn t06_egaliseur_et_crossfeed_en_f64_sur_la_chaine_reseau() {
     ));
     let mut pcm = src.clone();
     let frontieres = crate::tess::sonde_f32::compter(|| avec_conv.process(&mut pcm, bits));
-    assert!(frontieres > 0, "la sonde ne voit pas l'adaptateur f32 du convolveur");
+    assert!(
+        frontieres > 0,
+        "la sonde ne voit pas l'adaptateur f32 du convolveur"
+    );
 }

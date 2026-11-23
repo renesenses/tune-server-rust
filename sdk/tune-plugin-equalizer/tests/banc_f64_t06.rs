@@ -287,7 +287,11 @@ fn db(x: f64) -> f64 {
 fn soixante_quatre_bits_reels_contre_la_reference_hors_ligne() {
     let mut echecs = Vec::new();
     for (nom_p, p) in profils() {
-        let seuil = if nom_p.starts_with("graphique 31") { 1e-11 } else { 1e-12 };
+        let seuil = if nom_p.starts_with("graphique 31") {
+            1e-11
+        } else {
+            1e-12
+        };
         for (nom_s, x) in signaux() {
             let r = reference(&p, &x);
             let y64 = par_f64(&p, &x, 333);
@@ -304,7 +308,9 @@ fn soixante_quatre_bits_reels_contre_la_reference_hors_ligne() {
                 echecs.push(format!("{nom_p} / {nom_s} : écart f64 {e64:e} ≥ {seuil:e}"));
             }
             if e32 <= 1e-10 {
-                echecs.push(format!("{nom_p} / {nom_s} : le banc ne discrimine pas (f32 à {e32:e})"));
+                echecs.push(format!(
+                    "{nom_p} / {nom_s} : le banc ne discrimine pas (f32 à {e32:e})"
+                ));
             }
         }
     }
@@ -403,7 +409,10 @@ fn le_mode_realiste_et_son_limiteur_suivent_en_f64() {
         let y64 = par_f64(&p, &x, 777);
         let y32 = par_f32(&p, &x, 777);
         let ecart = ecart_max(&y64, &y32);
-        println!("T06 EQ réaliste {nom_s:<12} f32↔f64 max {:>7.1} dBFS", db(ecart));
+        println!(
+            "T06 EQ réaliste {nom_s:<12} f32↔f64 max {:>7.1} dBFS",
+            db(ecart)
+        );
         assert!(db(ecart) < -120.0, "{nom_s} : {} dBFS", db(ecart));
     }
 }
@@ -416,8 +425,14 @@ fn le_chemin_f32_reste_au_bit_pres() {
     for (_, p) in profils() {
         for (_, x) in signaux() {
             let x32: Vec<f64> = x.iter().map(|&v| f64::from(v as f32)).collect();
-            let y64: Vec<f32> = par_f64(&p, &x32, 512).into_iter().map(|v| v as f32).collect();
-            let y32: Vec<f32> = par_f32(&p, &x32, 512).into_iter().map(|v| v as f32).collect();
+            let y64: Vec<f32> = par_f64(&p, &x32, 512)
+                .into_iter()
+                .map(|v| v as f32)
+                .collect();
+            let y32: Vec<f32> = par_f32(&p, &x32, 512)
+                .into_iter()
+                .map(|v| v as f32)
+                .collect();
             assert_eq!(
                 y64.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                 y32.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
@@ -501,7 +516,11 @@ fn un_reglage_change_en_lecture_ne_claque_pas_en_f64() {
     let y64 = rendre64();
     let y32 = rendre32();
     let ecart = ecart_max(&y64, &y32);
-    assert!(db(ecart) < -120.0, "transition f64 ≠ f32 : {} dBFS", db(ecart));
+    assert!(
+        db(ecart) < -120.0,
+        "transition f64 ≠ f32 : {} dBFS",
+        db(ecart)
+    );
     // Différence seconde du canal gauche : un clic est une pointe.
     let d2 = |y: &[f64], de: usize, a: usize| {
         (de.max(2)..a)

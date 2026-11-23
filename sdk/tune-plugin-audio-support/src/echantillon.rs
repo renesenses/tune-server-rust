@@ -90,7 +90,15 @@ mod tests {
     /// `f32` des moteurs identique au bit près.
     #[test]
     fn un_f32_range_en_f64_revient_exact() {
-        for x in [0.0_f32, -0.0, 1.0, -1.0, 1e-38, 0.123_456_79, f32::MIN_POSITIVE] {
+        for x in [
+            0.0_f32,
+            -0.0,
+            1.0,
+            -1.0,
+            1e-38,
+            0.123_456_79,
+            f32::MIN_POSITIVE,
+        ] {
             assert_eq!(f32::depuis_f64(x.vers_f64()).to_bits(), x.to_bits());
         }
     }
