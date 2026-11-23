@@ -1216,8 +1216,12 @@ mod tests {
         let id = "catalogue-essai-desactive";
         let (state, _app) = serveur("http://127.0.0.1:9", true, false).await;
         let settings = SettingsRepo::with_backend(state.backend.clone());
-        settings.set(&format!("plugin_{id}_installed"), "true").unwrap();
-        settings.set(&format!("plugin_{id}_enabled"), "false").unwrap();
+        settings
+            .set(&format!("plugin_{id}_installed"), "true")
+            .unwrap();
+        settings
+            .set(&format!("plugin_{id}_enabled"), "false")
+            .unwrap();
         assert_eq!(
             crate::native_audio::activer_apres_installation(&state, id).await,
             (false, None)
