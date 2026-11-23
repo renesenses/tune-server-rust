@@ -1047,6 +1047,37 @@ async fn un_retour_rejoue_sur_cette_machine_garde_la_regle_du_reseau_local() {
     assert_eq!(courriel_relie(&b.state), "tiers@exemple.test");
 }
 
+// ─── Relecture B : pas d'autorisation lancée d'un autre site ────────────────
+
+/// 21. Du réseau local, une autorisation lancée par la page d'un autre site
+/// (`Sec-Fetch-Site: cross-site` ou `same-site`) : 403, rien de préparé. Une
+/// navigation de Tune (`same-origin`), saisie à la main (`none`) ou sans
+/// l'en-tête passe.
+#[tokio::test]
+async fn reseau_local_une_autorisation_inter_sites_est_refusee() {
+    for (site, attendu) in [
+        ("cross-site", StatusCode::FORBIDDEN),
+        ("same-site", StatusCode::FORBIDDEN),
+        ("same-origin", StatusCode::TEMPORARY_REDIRECT),
+        ("none", StatusCode::TEMPORARY_REDIRECT),
+    ] {
+        let b = banc();
+        let (statut, page) = get(
+            &b.state,
+            LAN,
+            AUTORISER,
+            &[HOTE, ("sec-fetch-site", site)],
+        )
+        .await;
+        assert_eq!(statut, attendu, "{site} — {page}");
+        assert_eq!(
+            attente_du_serveur(&b.state).is_empty(),
+            attendu == StatusCode::FORBIDDEN,
+            "{site} : préparé seulement si accepté"
+        );
+    }
+}
+
 /// Les phrases du refus de liaison existent dans les seize langues.
 #[test]
 fn les_phrases_du_refus_de_liaison_existent_dans_les_seize_langues() {
