@@ -136,7 +136,11 @@ fn unpack(bytes: &[u8], target: &str) -> Result<(Package, BTreeMap<String, Vec<u
     if expected_kind.is_some_and(|kind| kind != package.manifest.kind) {
         return Err("plugin kind differs from the feature slot".into());
     }
-    let caps = tune_plugin_sdk::manifest::reference_host_capabilities();
+    let mut caps = tune_plugin_sdk::manifest::reference_host_capabilities();
+    caps.insert(
+        tune_plugin_sdk::rate::AUDIO_RATE_CHANGE.to_owned(),
+        tune_plugin_sdk::manifest::SDK_VERSION,
+    );
     package
         .manifest
         .negotiate(&caps)

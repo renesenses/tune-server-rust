@@ -176,6 +176,13 @@ impl Etage {
         }
     }
 
+    fn reinitialiser(&mut self) {
+        self.hist.fill(0.);
+        self.w = 0;
+        self.entrees = 0;
+        self.prochaine_pos = 0;
+    }
+
     pub fn portee(&self) -> usize {
         self.portee
     }
@@ -238,6 +245,21 @@ impl Surechantillonneur {
         }
         let plan = conception::plan(de, vers)?;
         let noyau1 = conception.noyau(plan.l1);
+        Self::avec_noyau(conception, plan, canaux, noyau1)
+    }
+
+    pub(crate) fn avec_noyau(
+        conception: &Conception,
+        plan: Plan,
+        canaux: usize,
+        mut noyau1: Vec<f64>,
+    ) -> Result<Self, String> {
+        if canaux == 0 || noyau1.is_empty() || !noyau1.iter().all(|v| v.is_finite()) {
+            return Err("noyau ou canaux invalides".into());
+        }
+        // Le dernier coefficient d’un noyau impair reste dans sa phase ;
+        // le stockage SIMD complète les phases les plus courtes avec des zéros.
+        noyau1.resize(noyau1.len().next_multiple_of(plan.l1), 0.);
         let etage1 = Etage::nouveau(&noyau1, plan.l1, 1, canaux);
         let etage2 = if plan.deux_etages() {
             let (h, _) = conception::etage_deux(&plan);
@@ -254,6 +276,14 @@ impl Surechantillonneur {
             etage2,
             inter: Vec::new(),
         })
+    }
+
+    pub(crate) fn reinitialiser(&mut self) {
+        self.etage1.reinitialiser();
+        if let Some(etage) = &mut self.etage2 {
+            etage.reinitialiser();
+        }
+        self.inter.clear();
     }
 
     pub fn conception(&self) -> &Conception {

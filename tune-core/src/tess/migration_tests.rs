@@ -2653,3 +2653,46 @@ fn d1_une_chaine_de_version_future_est_relue_avec_l_origine_du_serveur() {
     assert!(!l.conversion_piece);
     assert!(correction_estimee(&l.chaine.plugins[0]));
 }
+
+#[test]
+fn auto_pcm_conserve_les_declarations_dans_les_deux_sens_de_migration() {
+    let (_b, s) = base();
+    let zone = 76_142_211;
+    let cle = format!("zone_{zone}_upsampler");
+    let reglages = json!({"enabled":true,"filter":"precision","mode":"auto",
+        "profile":"p-a","declarations":{"a":[1,null,{"b":true}]},"max_ratio":8,"max_rate_hz":384000});
+    s.set(&cle, &reglages.to_string()).unwrap();
+    let mut chaine = lire_zone(&s, zone, true).unwrap().chaine;
+    match &mut chaine.fixed.upsampling {
+        Upsampling::Auto {
+            profile,
+            declarations,
+            max_ratio,
+            max_rate_hz,
+        } => {
+            assert_eq!(profile, "p-a");
+            assert_eq!(
+                &*declarations,
+                reglages["declarations"].as_object().unwrap()
+            );
+            assert_eq!(*max_ratio, Some(8));
+            assert_eq!(*max_rate_hz, Some(384000));
+            *profile = "p-b".into();
+        }
+        autre => panic!("la migration doit conserver le mode Auto : {autre:?}"),
+    }
+    ecrire_chaine(&s, zone, &chaine).unwrap();
+    let relus: Value = serde_json::from_str(&s.get(&cle).unwrap().unwrap()).unwrap();
+    assert_eq!(relus["mode"], "auto");
+    assert_eq!(relus["profile"], "p-b");
+    assert_eq!(
+        relus["filter"], "precision",
+        "le réglage manuel reste mémorisé"
+    );
+    for champ in ["declarations", "max_ratio", "max_rate_hz"] {
+        assert_eq!(
+            relus[champ], reglages[champ],
+            "déclaration perdue : {champ}"
+        );
+    }
+}
