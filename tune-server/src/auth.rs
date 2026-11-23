@@ -129,6 +129,9 @@ pub fn verify_jwt(token: &str, secret: &str) -> Result<JwtClaims, String> {
 /// Préfixe des inscriptions de sessions longues dans `settings`.
 pub const PREFIXE_SESSION_LONGUE: &str = "auth_session_token:";
 
+/// Sessions longues gardées par compte ; la plus ancienne part au-delà.
+pub const MAX_SESSIONS_LONGUES_PAR_COMPTE: usize = 20;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SessionLongue {
     user_id: i64,
@@ -1558,8 +1561,19 @@ async fn login(
             relais: crate::garde_du_relais::requete_relayee(&headers),
             empreinte,
         };
-        // Les expirées partent au passage.
-        let _ = sessions_longues(&settings);
+        // Les expirées partent au passage ; au-delà du plafond par compte,
+        // les plus anciennes aussi.
+        let mut du_compte: Vec<(String, SessionLongue)> = sessions_longues(&settings)
+            .into_iter()
+            .filter(|(_, s)| s.user_id == profile_id)
+            .collect();
+        du_compte.sort_by_key(|(_, s)| s.created_at);
+        let en_trop = (du_compte.len() + 1).saturating_sub(MAX_SESSIONS_LONGUES_PAR_COMPTE);
+        for (ancien, _) in du_compte.iter().take(en_trop) {
+            settings
+                .delete(&format!("{PREFIXE_SESSION_LONGUE}{ancien}"))
+                .ok();
+        }
         if let Err(e) = inscrire_session_longue(&settings, &sid, &session) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1605,7 +1619,40 @@ async fn login(
 // POST /auth/logout
 // ---------------------------------------------------------------------------
 
-async fn logout() -> impl IntoResponse {
+async fn logout(State(state): State<AppState>, headers: axum::http::HeaderMap) -> impl IntoResponse {
+    // La session longue présentée (en-tête ou cookie) est désinscrite : son
+    // jeton ne vaut plus rien après la déconnexion.
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    if let Some(secret) = settings.get("jwt_secret").ok().flatten().filter(|s| !s.is_empty()) {
+        let mut presentes: Vec<String> = Vec::new();
+        if let Some(t) = headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+        {
+            presentes.push(t.to_string());
+        }
+        if let Some(c) = headers
+            .get(axum::http::header::COOKIE)
+            .and_then(|v| v.to_str().ok())
+        {
+            presentes.extend(
+                c.split(';')
+                    .filter_map(|p| p.trim().strip_prefix("tune_session="))
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_string),
+            );
+        }
+        for jeton in presentes {
+            if let Ok(claims) = verify_jwt(&jeton, &secret)
+                && let Some(sid) = claims.sid
+            {
+                settings
+                    .delete(&format!("{PREFIXE_SESSION_LONGUE}{sid}"))
+                    .ok();
+            }
+        }
+    }
     let cookie = "tune_session=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0";
     let mut response = Json(json!({"ok": true})).into_response();
     response
