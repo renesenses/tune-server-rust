@@ -673,7 +673,7 @@ fn le_geste_du_producteur_est_la_chaine_testee() {
 /// inchangé en PURE et sans étage ; avec un étage, les mots d'avant — depuis
 /// T06 (crossfeed en `f64`), à l'arrondi près : le dither du bloc est semé
 /// par ses échantillons, un seul ULP `f32` d'écart change donc sa suite ;
-/// l'écart reste sous 2 LSB à 16 et 24 bits, sous 2⁻²¹ à 32 bits.
+/// l'écart reste sous 2 LSB à 16 bits, 4 LSB à 24 bits et 2⁻²¹ à 32 bits.
 #[test]
 fn le_chemin_natif_rend_les_mots_d_avant() {
     use crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU;
@@ -714,6 +714,8 @@ fn le_chemin_natif_rend_les_mots_d_avant() {
                 assert_eq!(natif.samples, attendu, "{bits} bits, pure={pure}, cf={cf}");
             } else {
                 let decalage = 32 - u32::from(bits);
+                // 2 LSB à 16 bits ; 2⁻²¹ de pleine échelle au-delà, soit
+                // 4 LSB à 24 bits.
                 let tolerance = (2i64 << decalage).max((ECART_T06 * 2_147_483_648.0) as i64);
                 let pire = natif
                     .samples

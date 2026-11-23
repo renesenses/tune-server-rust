@@ -548,3 +548,51 @@ fn t06_egaliseur_et_crossfeed_en_f64_sur_la_chaine_reseau() {
         "la sonde ne voit pas l'adaptateur f32 du convolveur"
     );
 }
+
+/// Garde-fou mémoire (relecture de #9414) : une piste compensée plus longue
+/// que le seuil — 10 min en 192 kHz stéréo, 230 M échantillons, ≈ 1,8 Go en
+/// `f64` — reste en `f32` même quand l'égaliseur rend des valeurs que le
+/// `f32` n'atteint pas exactement, et la place est RÉSERVÉE d'emblée (aucune
+/// capacité doublée par `extend`). En deçà du seuil, la piste passe en `f64`,
+/// exacte, avec la même réservation. Le seuil est réduit ici pour ne pas
+/// allouer 1 Go dans un test.
+#[test]
+fn t06_une_longue_piste_compensee_reste_en_f32_et_reserve_sa_place() {
+    use super::{SEUIL_STOCKAGE_F64, Stockage};
+    const TOTAL: usize = 48_000;
+    // Des valeurs d'égaliseur : aucune n'est un f32 exact.
+    let y: Vec<f64> = (0..TOTAL)
+        .map(|i| 0.3 * (i as f64 * 0.0123).sin() + 1e-10)
+        .collect();
+    assert!(y.iter().all(|&x| f64::from(x as f32) != x));
+
+    // Au-delà du seuil : f32, place réservée, arrondi au plus proche.
+    let mut long = Stockage::pour(TOTAL, TOTAL / 2);
+    for m in y.chunks(4_801) {
+        long.ajouter(m);
+    }
+    match &long {
+        Stockage::F32 { v, .. } => {
+            assert_eq!(v.len(), TOTAL);
+            assert_eq!(v.capacity(), TOTAL, "place non réservée");
+            assert!(v.iter().zip(&y).all(|(a, b)| *a == *b as f32));
+        }
+        Stockage::F64(_) => panic!("piste longue passée en f64 : 8 octets par échantillon"),
+    }
+
+    // En deçà du seuil : f64 exact, place réservée.
+    assert!(TOTAL < SEUIL_STOCKAGE_F64);
+    let mut court = Stockage::pour(TOTAL, SEUIL_STOCKAGE_F64);
+    for m in y.chunks(4_801) {
+        court.ajouter(m);
+    }
+    match &court {
+        Stockage::F64(v) => {
+            assert_eq!(v, &y);
+            assert_eq!(v.capacity(), TOTAL, "place non réservée");
+        }
+        Stockage::F32 { .. } => panic!("piste courte arrondie en f32"),
+    }
+    // Et le seuil de production borne une piste de 10 min en 192 kHz.
+    assert!(192_000 * 2 * 600 > SEUIL_STOCKAGE_F64);
+}
