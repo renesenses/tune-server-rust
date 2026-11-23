@@ -279,15 +279,11 @@ fn params_upsampling(u: &Upsampling) -> Option<Value> {
         })),
         Upsampling::Auto {
             profile,
-            device,
-            brand,
-            family,
-            interface,
+            declarations,
             max_ratio,
             max_rate_hz,
         } => Some(json!({
-            "target":"pcm","mode":"auto","profile":profile,"device":device,"brand":brand,
-            "family":family,"interface":interface,"max_ratio":max_ratio,"max_rate_hz":max_rate_hz
+            "target":"pcm","mode":"auto","profile":profile,"declarations":declarations,"max_ratio":max_ratio,"max_rate_hz":max_rate_hz
         })),
         Upsampling::Dsd { rate, filter } => {
             Some(json!({ "target": "dsd", "rate": rate, "filter": filter }))

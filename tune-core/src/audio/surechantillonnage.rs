@@ -266,7 +266,7 @@ impl ChoixSurechantillonnage {
         let input = AudioFormat::new(source, layout, SampleEncoding::F32)
             .map_err(|_| "auto_invalid_pcm_format")?;
         let r = &self.reglages;
-        let settings = serde_json::json!({"profile":r.profile,"device":r.device,"brand":r.brand,"family":r.family,"interface":r.interface,
+        let settings = serde_json::json!({"profile":r.profile,"declarations":r.declarations,
             "max_ratio":r.max_ratio,"max_rate_hz":r.max_rate_hz,"source_bits":bits,
             "formats":formats.iter().map(|(rate,bits)|serde_json::json!({"rate":rate,"bits":bits})).collect::<Vec<_>>(),
             "gmacs_per_core":gmacs_par_coeur(&self.verdict).ok_or("auto_machine_not_measured")?});
@@ -403,11 +403,10 @@ impl EtageSurechantillonneur {
             return;
         }
         let mut settings = sonde.clone();
-        if let (Some(obj), Ok(serde_json::Value::Object(v))) =
-            (settings.as_object_mut(), serde_json::to_value(r))
-        {
-            obj.extend(v);
-        }
+        settings["profile"] = serde_json::json!(r.profile);
+        settings["declarations"] = serde_json::json!(r.declarations);
+        settings["max_ratio"] = serde_json::json!(r.max_ratio);
+        settings["max_rate_hz"] = serde_json::json!(r.max_rate_hz);
         match instance.update(&settings) {
             Ok(()) => {
                 self.publication_apres =

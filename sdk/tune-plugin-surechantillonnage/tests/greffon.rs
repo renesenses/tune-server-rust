@@ -444,12 +444,39 @@ fn les_reglages_historiques_restent_manuels_et_les_declarations_auto_survivent()
     let ancien =
         parse_settings(&json!({"enabled":true,"filter":"precision","max_ratio":8})).unwrap();
     assert_eq!(ancien.mode, UpsamplerMode::Manual);
-    assert_eq!(ancien.filter, "precision");
-    let auto = parse_settings(&json!({"enabled":true,"mode":"auto","profile":"impact",
-        "device":"modele-du-banc","brand":"marque-du-banc","family":"famille-du-banc","interface":"usb"})).unwrap();
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Legacy {
+        enabled: bool,
+        filter: String,
+        max_ratio: Option<u32>,
+        max_rate_hz: Option<u32>,
+    }
+    let mut manuel = serde_json::to_value(&ancien).unwrap();
+    for _ in 0..2 {
+        let normalized = parse_settings(&manuel).unwrap();
+        let old: Legacy =
+            serde_json::from_value(serde_json::to_value(normalized).unwrap()).unwrap();
+        assert!(old.enabled);
+        assert_eq!(old.filter, "precision");
+        assert_eq!(old.max_ratio, Some(8));
+        assert_eq!(old.max_rate_hz, None);
+        manuel["mode"] = json!("manual");
+        manuel["profile"] = json!("p-b");
+        manuel["declarations"] = json!({"b":2});
+    }
+    assert!(
+        parse_settings(&json!({"mode":"auto"}))
+            .unwrap()
+            .profile
+            .is_empty()
+    );
+    let auto = parse_settings(&json!({"enabled":true,"mode":"auto","profile":"p-a",
+        "declarations":{"a":["x",false,null]}}))
+    .unwrap();
     assert_eq!(auto.mode, UpsamplerMode::Auto);
-    assert_eq!(auto.profile, "impact");
-    assert_eq!(auto.family.as_deref(), Some("famille-du-banc"));
+    assert_eq!(auto.profile, "p-a");
+    assert_eq!(auto.declarations["a"], json!(["x", false, null]));
     let relu = parse_settings(&serde_json::to_value(&auto).unwrap()).unwrap();
     assert_eq!(auto, relu);
     assert!(parse_settings(&json!({"mode":"inconnu"})).is_err());

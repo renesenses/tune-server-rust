@@ -48,16 +48,23 @@ pub enum UpsamplerMode {
     Auto,
 }
 
+impl UpsamplerMode {
+    fn is_manual(&self) -> bool {
+        *self == Self::Manual
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct UpsamplerSettings {
     pub enabled: bool,
+    #[serde(skip_serializing_if = "UpsamplerMode::is_manual")]
     pub mode: UpsamplerMode,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub profile: String,
-    pub device: Option<String>,
-    pub brand: Option<String>,
-    pub family: Option<String>,
-    pub interface: Option<String>,
+    /// Plugin-owned settings, forwarded and persisted unchanged.
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+    pub declarations: serde_json::Map<String, serde_json::Value>,
     pub filter: String,
     /// Ceiling on the output rate, in Hz; `None` = highest the sink accepts.
     pub max_rate_hz: Option<u32>,
@@ -71,11 +78,8 @@ impl Default for UpsamplerSettings {
         Self {
             enabled: false,
             mode: UpsamplerMode::Manual,
-            profile: "natural".into(),
-            device: None,
-            brand: None,
-            family: None,
-            interface: None,
+            profile: String::new(),
+            declarations: Default::default(),
             filter: DEFAULT_FILTER.to_string(),
             max_rate_hz: None,
             max_ratio: None,
@@ -84,13 +88,14 @@ impl Default for UpsamplerSettings {
 }
 
 pub fn settings(s: &Settings) -> Result<UpsamplerSettings, Error> {
-    let s = if s.is_null() {
+    let mut s = if s.is_null() {
         UpsamplerSettings::default()
     } else {
         UpsamplerSettings::deserialize(s).map_err(|_| Error::InvalidSettings)?
     };
-    if s.mode == UpsamplerMode::Auto && s.profile.trim().is_empty() {
-        return Err(Error::InvalidSettings);
+    if s.mode == UpsamplerMode::Manual {
+        s.profile.clear();
+        s.declarations.clear();
     }
     if !OFFERED_FILTERS.contains(&s.filter.as_str()) {
         return Err(Error::InvalidSettings);

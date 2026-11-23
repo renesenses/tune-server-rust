@@ -101,15 +101,10 @@ pub enum Upsampling {
     },
     /// PCM local résolu à partir du catalogue et de la sonde.
     Auto {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         profile: String,
-        #[serde(default)]
-        device: Option<String>,
-        #[serde(default)]
-        brand: Option<String>,
-        #[serde(default)]
-        family: Option<String>,
-        #[serde(default)]
-        interface: Option<String>,
+        #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+        declarations: serde_json::Map<String, serde_json::Value>,
         #[serde(default)]
         max_ratio: Option<u32>,
         #[serde(default)]
@@ -435,14 +430,10 @@ impl ChaineTess {
                 Ok(())
             }
             Upsampling::Auto {
-                profile,
                 max_ratio,
                 max_rate_hz,
                 ..
             } => {
-                if profile.trim().is_empty() {
-                    return Err(ErreurChaine::UpsamplingInvalide("profile"));
-                }
                 if max_ratio.is_some_and(|r| !OFFERED_RATIOS.contains(&r)) {
                     return Err(ErreurChaine::UpsamplingInvalide("max_ratio"));
                 }

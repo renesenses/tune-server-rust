@@ -795,10 +795,7 @@ fn appliquer(chaine: &mut ChaineTess, partie: &Partie, valeur: Decodee, ctx: &Co
             {
                 Upsampling::Auto {
                     profile: s.profile.clone(),
-                    device: s.device.clone(),
-                    brand: s.brand.clone(),
-                    family: s.family.clone(),
-                    interface: s.interface.clone(),
+                    declarations: s.declarations.clone(),
                     max_ratio: s.max_ratio,
                     max_rate_hz: s.max_rate_hz,
                 }
@@ -1592,20 +1589,14 @@ fn projeter_surechantillonnage(chaine: &ChaineTess, courant: Option<&str>) -> Ec
         },
         Upsampling::Auto {
             profile,
-            device,
-            brand,
-            family,
-            interface,
+            declarations,
             max_ratio,
             max_rate_hz,
         } => UpsamplerSettings {
             enabled: true,
             mode: crate::audio::surechantillonnage::greffon::UpsamplerMode::Auto,
             profile: profile.clone(),
-            device: device.clone(),
-            brand: brand.clone(),
-            family: family.clone(),
-            interface: interface.clone(),
+            declarations: declarations.clone(),
             max_ratio: *max_ratio,
             max_rate_hz: *max_rate_hz,
             filter: actuel

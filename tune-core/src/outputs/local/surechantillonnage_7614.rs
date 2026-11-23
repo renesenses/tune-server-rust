@@ -308,7 +308,7 @@ fn le_paquet_auto_passe_par_le_rendu_local_et_le_volume_entier() {
     tune_plugin_native::register(library).unwrap();
     let mut choix = choix(true);
     choix.reglages.mode = UpsamplerMode::Auto;
-    choix.reglages.profile = "impact".into();
+    choix.reglages.profile = std::env::var("TUNE_TEST_PROFILE_A").unwrap();
     choix.verdict.results[0].realtime_factor = 1000.;
     let plan = choix.plan_natif(48000, 24, 2, &[(96000, 24)]).unwrap();
     assert_eq!(plan.rate, 96000);
@@ -320,7 +320,7 @@ fn le_paquet_auto_passe_par_le_rendu_local_et_le_volume_entier() {
     let rendu = etage.traiter(&source);
     assert_eq!(rendu.len(), source.len() * 2);
     assert!(rendu.iter().any(|v| *v > 0.05));
-    choix.reglages.profile = "texture".into();
+    choix.reglages.profile = std::env::var("TUNE_TEST_PROFILE_B").unwrap();
     etage.proposer_transition(Some(&choix));
     let rendu = etage.traiter(&source);
     let apres = etage.decision_apres_transition(rendu.len() / 2).unwrap();
