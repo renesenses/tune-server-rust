@@ -963,6 +963,42 @@ async fn deux_retours_simultanes_une_seule_liaison_coherente() {
     );
 }
 
+// ─── Relecture D4 : pas de déliaison venue d'un autre site ──────────────────
+
+/// 19. Un `POST /cloud/sso/disconnect` venu d'un autre site (page piégée
+/// ouverte sur un appareil du réseau local, ou sur cette machine) : 403, le
+/// compte reste relié.
+#[tokio::test]
+async fn une_deliaison_venue_d_un_autre_site_est_refusee() {
+    let b = banc();
+    relier_le_proprietaire(&b.state);
+    let autre_site = [
+        ("origin", "https://evil.example"),
+        ("sec-fetch-site", "cross-site"),
+    ];
+    for (depuis, hote) in [(LAN, HOTE), (ICI, ("host", "127.0.0.1:8888"))] {
+        let (statut, texte) = post(
+            &b.state,
+            depuis,
+            DISCONNECT,
+            &[hote, autre_site[0], autre_site[1]],
+        )
+        .await;
+        assert_eq!(statut, StatusCode::FORBIDDEN, "{depuis} — {texte}");
+        // Refusé par la garde d'origine, avant même la garde de la route.
+        assert_eq!(json_de(&texte)["error"], "cross_site_request", "{texte}");
+        assert_eq!(courriel_relie(&b.state), "proprio@exemple.test", "{depuis}");
+        assert_eq!(
+            reglages(&b.state)
+                .get("mozaik_access_token")
+                .unwrap()
+                .as_deref(),
+            Some("jeton-du-proprietaire"),
+            "{depuis}"
+        );
+    }
+}
+
 /// Les phrases du refus de liaison existent dans les seize langues.
 #[test]
 fn les_phrases_du_refus_de_liaison_existent_dans_les_seize_langues() {
