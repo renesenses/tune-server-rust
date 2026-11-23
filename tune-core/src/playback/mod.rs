@@ -146,6 +146,16 @@ pub struct NowPlaying {
     /// substitution). `#[serde(default)]` : un client plus ancien l'ignore.
     #[serde(default)]
     pub version: Option<VersionJouee>,
+    /// #8452 — la pochette d'une webradio a été retrouvée par Cover+
+    /// (d'après le titre ICY et iTunes), et non donnée par la station :
+    /// l'écran l'accompagne du label « Cover+ ». `false` partout ailleurs.
+    #[serde(default)]
+    pub cover_plus: bool,
+    /// #8452 — d'où vient l'image Cover+ : `itunes` (pochette du morceau),
+    /// `artist_photo` (photo de l'artiste, repli) ou `stream` (pochette
+    /// fournie par un flux iHeart). Absent quand `cover_plus` est faux.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cover_plus_source: Option<String>,
 }
 
 /// La piste DEMANDÉE quand la règle en a fait jouer une autre (#2264).
@@ -243,6 +253,8 @@ impl NowPlaying {
                 .filter(|b| *b > 0),
             channels: u16::try_from(track.channels).ok().filter(|n| *n > 0),
             version: None,
+            cover_plus: false,
+            cover_plus_source: None,
         }
     }
 }

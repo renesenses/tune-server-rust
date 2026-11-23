@@ -1490,6 +1490,8 @@ impl PlaybackOrchestrator {
             // #2264 — posé par `play_inner` après la composition : c'est la
             // décision de `appliquer_la_regle_de_version`.
             version: None,
+            cover_plus: false,
+            cover_plus_source: None,
         }
     }
 

@@ -1414,6 +1414,10 @@ mod bascule_des_niveaux_tests {
 #[cfg(test)]
 mod repli_logo_station_tests;
 
+/// #8452 — Cover+ au site d'appel : le sondeur radio affiche la pochette
+/// retrouvée, et le logo quand la station coupe Cover+.
+#[cfg(test)]
+mod cover_plus_8452_tests;
 /// #7051 — une station jouée depuis l'annuaire, hors de « Mes radios », garde
 /// son logo quand le premier titre du flux arrive (Radio Bergeijk, fil 2443).
 #[cfg(test)]

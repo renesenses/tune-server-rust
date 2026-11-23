@@ -1162,6 +1162,9 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
             // sérialisent `NowPlaying` entier et le portent déjà ; celle-ci,
             // écrite à la main, l'aurait tu jusqu'au prochain évènement.
             "bitrate_kbps": np.bitrate_kbps,
+            // #8452 — le label « Cover+ » de la pochette d'une webradio.
+            "cover_plus": np.cover_plus,
+            "cover_plus_source": np.cover_plus_source,
         })),
         "position_ms": zone_state.position_ms,
         "queue_length": zone_state.queue_length,

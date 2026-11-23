@@ -1,0 +1,36 @@
+//! #8452 — le repli « photo de l'artiste » (§ 3.6), hors réseau. Les
+//! épreuves face à un faux iTunes sont dans `recherche_tests.rs`.
+
+use super::photo_artiste::*;
+
+#[test]
+fn premier_nom_d_une_collaboration() {
+    assert_eq!(premier_nom("MOGWAI [+] IGGY POP"), "MOGWAI");
+    assert_eq!(premier_nom("X Feat. Y"), "X");
+    assert_eq!(premier_nom("Lady Gaga, Bruno Mars"), "Lady Gaga");
+    assert_eq!(premier_nom("Simon & Garfunkel"), "Simon");
+    assert_eq!(premier_nom("Daft Punk"), "Daft Punk");
+}
+
+#[test]
+fn le_bandeau_devient_un_carre() {
+    assert_eq!(
+        carre("https://is1-ssl.mzstatic.example/image/thumb/ab/1200x630cw.png", 600),
+        "https://is1-ssl.mzstatic.example/image/thumb/ab/600x600cc.jpg"
+    );
+    assert_eq!(
+        carre("https://is1-ssl.mzstatic.example/image/thumb/ab/1200x630cw.png", 1200),
+        "https://is1-ssl.mzstatic.example/image/thumb/ab/1200x1200cc.jpg"
+    );
+    assert_eq!(carre("https://x.example/a.gif", 600), "https://x.example/a.gif");
+}
+
+#[test]
+fn la_balise_og_image() {
+    let html = r#"<head><meta property="og:title" content="Air"><meta property="og:image" content="https://img.example/1200x630cw.png"></head>"#;
+    assert_eq!(
+        og_image(html).as_deref(),
+        Some("https://img.example/1200x630cw.png")
+    );
+    assert_eq!(og_image("<head></head>"), None);
+}
