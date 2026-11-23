@@ -102,10 +102,8 @@ fn regle_armee_non_appliquee_faute_de_voies_le_dit_6230() {
     assert!(
         zone_reaffectation_ignoree(&state.backend, 7, "local", None, Some(&reel(2, 2))).is_none()
     );
-    // Sortie réseau, ou sortie qui n'a rien déclaré : rien.
-    assert!(
-        zone_reaffectation_ignoree(&state.backend, 7, "dlna", None, Some(&reel(4, 8))).is_none()
-    );
+    // Sortie locale qui n'a rien déclaré : rien. (La sortie réseau se dit
+    // depuis #9179, voir plus bas.)
     assert!(zone_reaffectation_ignoree(&state.backend, 7, "local", None, None).is_none());
     // PURE : la règle ne s'applique pas, et ce n'est pas un défaut à signaler.
     tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
@@ -135,4 +133,54 @@ fn grille_6_vers_2_ouverte_en_2_voies_est_annoncee_appliquee_6230() {
         .expect("2 voies refusées : la règle ignorée se dit");
     assert!(refus.contains("non appliquée"), "{refus}");
     assert!(refus.contains("6 voies"), "{refus}");
+}
+
+/// #9179 — une règle armée sur une zone RÉSEAU (DLNA, OAAT, AirPlay…) : seule
+/// la sortie locale applique la matrice, et le chemin du signal le dit
+/// (`channel_remap_not_applied`, « sortie réseau ») au lieu de se taire.
+#[test]
+fn regle_armee_sur_une_sortie_reseau_le_dit_9179() {
+    let state = etat_avec(7, rc::prereglage("swap_lr"));
+    for sortie in ["dlna", "oaat", "airplay", "slimproto"] {
+        let etape = zone_reaffectation_ignoree(&state.backend, 7, sortie, None, None)
+            .unwrap_or_else(|| panic!("{sortie} : la règle armée non appliquée doit se dire"));
+        assert!(etape.contains("2 → 2"), "{sortie} : {etape}");
+        assert!(etape.contains("non appliquée"), "{sortie} : {etape}");
+        assert!(etape.contains("sortie réseau"), "{sortie} : {etape}");
+        assert!(etape.contains("de la zone"), "{sortie} : {etape}");
+        // Jamais annoncée comme appliquée sur ce chemin.
+        assert!(
+            zone_reaffectation_step(&state.backend, 7, sortie, None, None).is_none(),
+            "{sortie}"
+        );
+    }
+    // La sortie a mesuré la source : une grille 4 → 6 sur un quadri se dit.
+    let quad = etat_avec(7, rc::prereglage("quad_to_5_1"));
+    let etape = zone_reaffectation_ignoree(&quad.backend, 7, "dlna", None, Some(&reel(4, 8)))
+        .expect("grille 4 → 6, source 4.0, sortie réseau : à dire");
+    assert!(etape.contains("4 → 6"), "{etape}");
+    // Une règle de zone multicanale ne s'annonce pas sur une piste stéréo.
+    assert!(zone_reaffectation_ignoree(&quad.backend, 7, "dlna", None, None).is_none());
+    // Greffon désinstallé, aucun réglage, ou PURE : rien à dire.
+    let vide = etat_avec(7, None);
+    assert!(zone_reaffectation_ignoree(&vide.backend, 7, "dlna", None, None).is_none());
+    tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone())
+        .set("zone_7_audiophile", r#"{"enabled": true}"#)
+        .unwrap();
+    assert!(zone_reaffectation_ignoree(&state.backend, 7, "dlna", None, None).is_none());
+}
+
+/// #9179 — toutes les langues du chemin du signal portent le texte réseau.
+#[test]
+fn le_texte_reseau_existe_dans_toutes_les_langues_9179() {
+    let textes: serde_json::Value =
+        serde_json::from_str(include_str!("textes_signal.json")).unwrap();
+    for (langue, table) in textes.as_object().unwrap() {
+        let t = table["matrix_not_applied_network"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{langue} : matrix_not_applied_network manque"));
+        for marque in ["{0}", "{1}", "{2}"] {
+            assert!(t.contains(marque), "{langue} : {marque} manque dans {t}");
+        }
+    }
 }
