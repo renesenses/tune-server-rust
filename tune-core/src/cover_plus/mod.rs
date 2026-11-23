@@ -358,6 +358,34 @@ fn retenir_titre(cle: String, trouvaille: Option<Trouvaille>, incident: bool) {
     );
 }
 
+/// Tient une clé dans `en_cours` le temps d'une recherche. Rendue par
+/// [`GardeEnCours::retenir`], elle pose le résultat ; lâchée sans lui
+/// (panique, tâche annulée), elle retire seulement la clé, pour que le titre
+/// soit recherché au prochain passage.
+pub(crate) struct GardeEnCours {
+    cle: Option<String>,
+}
+
+impl GardeEnCours {
+    pub(crate) fn new(cle: String) -> Self {
+        Self { cle: Some(cle) }
+    }
+
+    pub(crate) fn retenir(mut self, trouvaille: Option<Trouvaille>, incident: bool) {
+        if let Some(cle) = self.cle.take() {
+            retenir_titre(cle, trouvaille, incident);
+        }
+    }
+}
+
+impl Drop for GardeEnCours {
+    fn drop(&mut self) {
+        if let Some(cle) = self.cle.take() {
+            cache().en_cours.remove(&cle);
+        }
+    }
+}
+
 /// Noter qu'une hypothèse a concordé sur cette station : 0 pour « artiste -
 /// titre » (1re partie, 2e partie), 1 pour l'inverse.
 fn noter_ordre(station: &str, hypothese: usize) {
@@ -939,6 +967,10 @@ fn pochette_du_titre_par(
             let station = t.station_nom.to_string();
             match tokio::runtime::Handle::try_current() {
                 Ok(rt) => {
+                    // Si la tâche panique ou est annulée, la garde retire la
+                    // clé de `en_cours` : le titre n'y reste pas bloqué « en
+                    // cours » pour toujours.
+                    let garde = GardeEnCours::new(cle);
                     rt.spawn(async move {
                         let recherche =
                             chercher_et_compter(source, &prep, &boutique, &station, photo_permise);
@@ -955,7 +987,7 @@ fn pochette_du_titre_par(
                             incident,
                             "cover_plus_recherche_terminee"
                         );
-                        retenir_titre(cle, trouvee, incident);
+                        garde.retenir(trouvee, incident);
                     });
                 }
                 Err(_) => {

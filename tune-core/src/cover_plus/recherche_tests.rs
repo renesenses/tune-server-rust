@@ -926,3 +926,29 @@ async fn page_et_photo_d_apple_seulement() {
         "une photo hors de *.mzstatic.com n'est pas affichée"
     );
 }
+
+/// Une recherche qui panique ne laisse pas sa chaîne « en cours » pour
+/// toujours : la garde retire la clé, le titre est recherché au passage
+/// suivant. Contre-épreuve : rendue normalement, la garde pose le résultat.
+#[tokio::test]
+async fn une_recherche_qui_panique_libere_sa_cle() {
+    let cle = "test-8452-panique".to_string();
+    cache().en_cours.insert(cle.clone());
+    let garde = GardeEnCours::new(cle.clone());
+    let tache = tokio::spawn(async move {
+        let _garde = garde;
+        panic!("recherche Cover+ en échec (épreuve)");
+    });
+    assert!(tache.await.is_err());
+    assert!(!cache().en_cours.contains(&cle), "la clé doit être libérée");
+    assert!(cache().titres.get(&cle).is_none(), "rien n'est retenu");
+
+    let cle2 = "test-8452-garde-rendue".to_string();
+    cache().en_cours.insert(cle2.clone());
+    GardeEnCours::new(cle2.clone()).retenir(None, false);
+    assert!(!cache().en_cours.contains(&cle2));
+    assert!(
+        cache().titres.get(&cle2).is_some(),
+        "le résultat est retenu"
+    );
+}
