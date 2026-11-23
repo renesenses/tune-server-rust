@@ -275,14 +275,13 @@ pub fn new_streaming_resampler(
     }
     let ratio = to_sr as f64 / from_sr as f64;
     let params = parametres_sinc(from_sr, to_sr);
-    info!(
-        from_sr,
-        to_sr,
-        sinc_len = params.sinc_len,
-        f_cutoff = params.f_cutoff,
-        "sinc_resampler_params"
-    );
-    Async::<f32>::new_sinc(
+    let sinc_len = params.sinc_len;
+    let f_cutoff = params.f_cutoff;
+    // #9391 — le temps de construction (table sinc) se lit dans la même
+    // ligne : un démarrage lent de piste convertie doit pouvoir l'écarter ou
+    // l'accuser.
+    let debut = std::time::Instant::now();
+    let construit = Async::<f32>::new_sinc(
         ratio,
         1.1,
         &params,
@@ -290,7 +289,98 @@ pub fn new_streaming_resampler(
         channels as usize,
         FixedAsync::Input,
     )
-    .map_err(|e| format!("create sinc resampler {from_sr} -> {to_sr} Hz: {e}"))
+    .map_err(|e| format!("create sinc resampler {from_sr} -> {to_sr} Hz: {e}"));
+    info!(
+        from_sr,
+        to_sr,
+        sinc_len,
+        f_cutoff,
+        construction_ms = debut.elapsed().as_millis() as u64,
+        "sinc_resampler_params"
+    );
+    construit
+}
+
+// ─────────── #9391 — le coût du rééchantillonnage, au fil de l'eau ───────────
+
+/// Au plus une ligne `reechantillonnage_lent_9391` par fenêtre, tous flux
+/// confondus : la mesure est faite à chaque bloc, le journal ne doit pas
+/// l'être.
+const FENETRE_DU_COUT_MS: u64 = 10_000;
+/// Un bloc qui coûte plus de la moitié de la durée qu'il produit laisse trop
+/// peu de marge au reste de la machine : au-delà du temps réel, la piste ne
+/// peut plus démarrer ni tenir.
+pub const PART_DU_TEMPS_REEL_SIGNALEE: f64 = 0.5;
+/// En dessous, la mesure d'un bloc est trop courte pour dire quoi que ce soit.
+const AUDIO_MINIMAL_MESURE: std::time::Duration = std::time::Duration::from_millis(20);
+
+static DERNIER_COUT_SIGNALE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// La durée d'audio que représentent `echantillons` entrelacés.
+#[must_use]
+pub fn duree_audio(echantillons: usize, canaux: u16, cadence: u32) -> std::time::Duration {
+    if canaux == 0 || cadence == 0 {
+        return std::time::Duration::ZERO;
+    }
+    let trames = echantillons / canaux as usize;
+    std::time::Duration::from_secs_f64(trames as f64 / cadence as f64)
+}
+
+/// #9391 — la part du temps réel que coûte un bloc, quand elle mérite d'être
+/// dite (au-delà de [`PART_DU_TEMPS_REEL_SIGNALEE`]).
+#[must_use]
+pub fn part_du_temps_reel_a_signaler(
+    calcul: std::time::Duration,
+    audio: std::time::Duration,
+) -> Option<f64> {
+    if audio < AUDIO_MINIMAL_MESURE {
+        return None;
+    }
+    let part = calcul.as_secs_f64() / audio.as_secs_f64();
+    (part > PART_DU_TEMPS_REEL_SIGNALEE).then_some(part)
+}
+
+/// #9391 — mesure un bloc rééchantillonné et dit, au plus une fois par
+/// fenêtre, quand il coûte trop cher : `part` > 1 veut dire plus lent que le
+/// temps réel. `contexte` nomme le site (sortie locale, décodeur en flux).
+pub fn surveiller_le_cout(
+    contexte: &'static str,
+    debut: std::time::Instant,
+    echantillons_produits: usize,
+    canaux: u16,
+    cadence_de_sortie: u32,
+) {
+    let calcul = debut.elapsed();
+    let audio = duree_audio(echantillons_produits, canaux, cadence_de_sortie);
+    let Some(part) = part_du_temps_reel_a_signaler(calcul, audio) else {
+        return;
+    };
+    let maintenant = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    let dernier = DERNIER_COUT_SIGNALE_MS.load(std::sync::atomic::Ordering::Relaxed);
+    if maintenant.saturating_sub(dernier) < FENETRE_DU_COUT_MS
+        || DERNIER_COUT_SIGNALE_MS
+            .compare_exchange(
+                dernier,
+                maintenant,
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+    {
+        return;
+    }
+    warn!(
+        contexte,
+        cadence_de_sortie,
+        canaux,
+        calcul_ms = calcul.as_millis() as u64,
+        audio_ms = audio.as_millis() as u64,
+        part_du_temps_reel = part,
+        "reechantillonnage_lent_9391"
+    );
 }
 
 /// Resample a complete buffer of interleaved f32 samples using rubato sinc.
@@ -1712,5 +1802,44 @@ mod piste_entiere_tests {
              rubato_resample_track, qui retire le delai de groupe. La \
              variante en flux ajoute ~2×delay trames A CHAQUE PISTE (#2246)."
         );
+    }
+}
+
+#[cfg(test)]
+mod cout_du_reechantillonnage_9391_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn la_duree_audio_se_lit_en_trames() {
+        assert_eq!(duree_audio(96_000 * 2, 2, 96_000), Duration::from_secs(1));
+        assert_eq!(duree_audio(1000, 0, 48_000), Duration::ZERO);
+    }
+
+    /// #9391 — un bloc qui coûte plus de la moitié de l'audio qu'il produit
+    /// est signalé ; un bloc bon marché ou trop court ne l'est pas.
+    #[test]
+    fn seul_un_bloc_trop_cher_est_signale() {
+        let audio = Duration::from_millis(340);
+        assert_eq!(
+            part_du_temps_reel_a_signaler(Duration::from_millis(30), audio),
+            None
+        );
+        let part = part_du_temps_reel_a_signaler(Duration::from_millis(680), audio).unwrap();
+        assert!((part - 2.0).abs() < 1e-9, "{part}");
+        assert_eq!(
+            part_du_temps_reel_a_signaler(Duration::from_millis(50), Duration::from_millis(5)),
+            None
+        );
+    }
+
+    /// Le 192 kHz vers 44,1 kHz qui motive #9391 : la table se construit, et
+    /// son temps de construction est mesurable (journalisé par
+    /// `sinc_resampler_params`).
+    #[test]
+    fn le_reechantillonneur_192_vers_44_1_se_construit_9391() {
+        let debut = std::time::Instant::now();
+        new_streaming_resampler(192_000, 44_100, 2).expect("rééchantillonneur");
+        assert!(debut.elapsed() < Duration::from_secs(30));
     }
 }

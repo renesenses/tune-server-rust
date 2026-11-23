@@ -309,6 +309,11 @@ impl RadioRepo {
         let sql = self.dialect_sql(sql::delete, sql::delete);
         let params: [&dyn ToSqlValue; 1] = [&id];
         self.db.execute(&sql, &params)?;
+        // #8452 — le réglage Cover+ de la station part avec elle : une
+        // station recréée sous le même identifiant n'hérite pas d'un « off ».
+        if let Err(e) = crate::cover_plus::regler_la_station(&self.db, id, true) {
+            tracing::debug!(station = id, erreur = %e, "cover_plus_reglage_station_non_efface");
+        }
         Ok(())
     }
 

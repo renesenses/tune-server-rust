@@ -5158,6 +5158,75 @@ async fn le_rebond_vers_une_sortie_deja_tenue_par_une_autre_zone_refuse_sans_err
     );
 }
 
+/// Forum rc14 (deux zones pour un même appareil) — le refus de #5464 était
+/// muet à l'écran : sans motif, le client web remplaçait la phrase par son
+/// bandeau générique « appareil introuvable ». Le refus porte maintenant le
+/// motif `output_held_by_other_zone` et la zone qui tient la sortie, par la
+/// sentinelle (409) comme par `zone.playback_error`, sans rien fusionner.
+#[tokio::test]
+async fn le_refus_de_sortie_tenue_porte_son_motif_et_la_zone_qui_la_tient() {
+    let bus = Arc::new(EventBus::new());
+    let mut orch = test_orchestrator();
+    orch.event_bus = Some(bus.clone());
+    let mut rx = bus.subscribe();
+    poser_l_index_unique_des_zones(&orch);
+    let repo = ZoneRepo::with_backend(orch.db.clone());
+    let zone_b = repo
+        .create("NanoPlayer", Some("local"), Some("local:NanoPlayer"))
+        .unwrap();
+    let zone_a = stale_network_zone(&orch, "NanoPlayer");
+    orch.outputs.lock().await.register(Box::new(
+        MockOutput::new("local:NanoPlayer", "NanoPlayer").with_type("local"),
+    ));
+
+    let zone = repo.get(zone_a).unwrap().unwrap();
+    let err = orch
+        .gate_or_rebind_offline_zone(zone_a, &zone)
+        .await
+        .expect_err("sortie tenue par une autre zone : refus");
+    let attendu = format!("zone_output_unavailable:output_held_by_other_zone:{zone_b}:");
+    assert!(err.starts_with(&attendu), "err = {err}");
+
+    let ev = loop {
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("un zone.playback_error doit partir")
+            .unwrap();
+        if ev.event_type == "zone.playback_error" {
+            break ev;
+        }
+    };
+    assert_eq!(
+        ev.data["reason"], "output_held_by_other_zone",
+        "{}",
+        ev.data
+    );
+    assert_eq!(ev.data["holder_zone_id"], zone_b, "{}", ev.data);
+    // Rc14 — de quoi composer la phrase dans la langue de l'interface : la
+    // phrase de l'événement est en français.
+    assert_eq!(ev.data["params"]["holder"], "NanoPlayer", "{}", ev.data);
+    assert_eq!(ev.data["params"]["zone"], "NanoPlayer", "{}", ev.data);
+    assert_eq!(ev.data["params"]["variant"], "same_name", "{}", ev.data);
+    assert!(
+        ev.data["params"]["device"]
+            .as_str()
+            .is_some_and(|d| !d.is_empty()),
+        "{}",
+        ev.data
+    );
+    let message = ev.data["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("déjà") && !message.starts_with("zone_output_unavailable"),
+        "la phrase, sans sentinelle : {}",
+        ev.data
+    );
+
+    let a = repo.get(zone_a).unwrap().unwrap();
+    assert_eq!(a.output_device_id.as_deref(), Some("dlna-vanished-host"));
+    let b = repo.get(zone_b).unwrap().unwrap();
+    assert_eq!(b.output_device_id.as_deref(), Some("local:NanoPlayer"));
+}
+
 /// #5464 — même collision, mais la sortie est retenue par une zone SUPPRIMÉE
 /// (masquée : sa ligne garde `output_device_id`, l'index la compte). Le refus
 /// ne doit pas inviter à lancer la lecture sur une zone que l'auditeur ne

@@ -54,9 +54,19 @@ impl AppError {
         }
     }
 
+    /// #9343 — comme [`AppError::not_found`], le journal nomme la route quand
+    /// l'erreur naît pendant une requête : « internal_error error=Read-only
+    /// file system (os error 30) » seul ne disait pas quel bouton avait échoué.
     pub fn internal(msg: impl Into<String>) -> Self {
         let msg = msg.into();
-        tracing::warn!(error = %msg, "internal_error");
+        if CHEMIN_REQUETE
+            .try_with(|path| {
+                tracing::warn!(error = %msg, path = %path, "internal_error");
+            })
+            .is_err()
+        {
+            tracing::warn!(error = %msg, "internal_error");
+        }
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: msg,
@@ -92,6 +102,38 @@ impl AppError {
             message: msg,
             code: Some("service_unavailable".into()),
         }
+    }
+}
+
+/// #9343 — le message d'une erreur d'entrée-sortie, qui nomme TOUJOURS
+/// l'opération et le chemin. `From<io::Error>` ne connaît ni l'un ni l'autre :
+/// tout geste sur un fichier passe par ici plutôt que par `?`.
+///
+/// Un système de fichiers en lecture seule (EROFS, « os error 30 ») reçoit
+/// un message dédié : c'est presque toujours un chemin mal ancré (relatif au
+/// répertoire courant `/` d'un service macOS, volume monté en lecture seule),
+/// et l'utilisateur doit savoir QUEL dossier refuse l'écriture.
+pub fn message_d_entree_sortie(
+    operation: &str,
+    chemin: &std::path::Path,
+    erreur: &std::io::Error,
+) -> String {
+    if erreur.kind() == std::io::ErrorKind::ReadOnlyFilesystem {
+        format!(
+            "{operation}: {} is on a read-only file system ({erreur}); \
+             Tune cannot write there",
+            chemin.display()
+        )
+    } else {
+        format!("{operation}: {}: {erreur}", chemin.display())
+    }
+}
+
+impl AppError {
+    /// Erreur 500 d'entrée-sortie, avec l'opération et le chemin
+    /// ([`message_d_entree_sortie`]).
+    pub fn io(operation: &str, chemin: &std::path::Path, erreur: &std::io::Error) -> Self {
+        Self::internal(message_d_entree_sortie(operation, chemin, erreur))
     }
 }
 

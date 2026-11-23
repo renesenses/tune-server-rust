@@ -90,6 +90,8 @@ pub mod profil_par_appareil;
 pub mod profiles;
 pub mod radios;
 pub mod radios_annuaire;
+/// #8452 — Cover+ par station.
+pub mod radios_cover_plus_8452;
 pub mod radios_criteres_7466;
 pub mod radios_libelles;
 pub mod room_calibration;

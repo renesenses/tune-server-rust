@@ -1389,12 +1389,26 @@ fn section_fournisseurs_de_sortie(instantane: &Value) -> String {
     for f in fournisseurs {
         let nom = f["provider"].as_str().unwrap_or("?");
         let appareils = f["devices"].as_u64().unwrap_or(0);
+        // #9380 — « active, 0 device(s) » figurait dans TOUTES les fiches,
+        // option coupée comprise : il faisait croire à une panne chez qui n'a
+        // aucun appareil, et ne disait rien chez qui en a un. Le fournisseur
+        // qui sait dire sa recherche la dit.
+        let recherche = &f["discovery"];
+        let resume = recherche["summary"].as_str().filter(|s| !s.is_empty());
         match f["refusal"]["code"].as_str() {
             Some(code) => md.push_str(&format!(
                 "- {nom}: **idle — {code}** ({})\n",
                 f["refusal"]["message"].as_str().unwrap_or("")
             )),
-            None => md.push_str(&format!("- {nom}: active, {appareils} device(s)\n")),
+            None if recherche["enabled"].as_bool() == Some(false) => {
+                md.push_str(&format!("- {nom}: {}\n", resume.unwrap_or("option off")));
+            }
+            None => match resume {
+                Some(resume) if appareils == 0 => {
+                    md.push_str(&format!("- {nom}: no device found — {resume}\n"));
+                }
+                _ => md.push_str(&format!("- {nom}: active, {appareils} device(s)\n")),
+            },
         }
     }
     md.push('\n');
@@ -5442,6 +5456,67 @@ mod fournisseurs_de_sortie {
         assert!(!md.contains("No linked Mozaiklabs account"), "{md}");
         assert!(md.contains("Licensed modules: diretta"), "{md}");
         assert!(md.contains("diretta: active, 0 device(s)"), "{md}");
+    }
+
+    /// #9380 — option coupée : aucun appareil n'est attendu, la fiche ne doit
+    /// pas afficher « active, 0 device(s) », qui se lisait comme une panne
+    /// dans les rapports de testeurs sans ampli Devialet.
+    #[test]
+    fn option_coupee_ne_se_lit_pas_comme_une_panne_9380() {
+        let instantane = serde_json::json!({
+            "account_linked": true,
+            "licensed_modules": [],
+            "providers": [{
+                "provider": "devialet_air",
+                "required_module": null,
+                "devices": 0,
+                "refusal": null,
+                "discovery": {
+                    "enabled": false,
+                    "listening": false,
+                    "summary": "option off — nothing is searched, no amplifier expected",
+                },
+            }],
+        });
+        let md = section_fournisseurs_de_sortie(&instantane);
+        assert!(!md.contains("active, 0 device(s)"), "{md}");
+        assert!(
+            md.contains("- devialet_air: option off — nothing is searched, no amplifier expected"),
+            "{md}"
+        );
+    }
+
+    /// #9380 — option activée et aucun ampli : la fiche dit ce que l'écoute a
+    /// reçu (rien, ou des datagrammes d'une forme inconnue) au lieu du seul
+    /// compte, qui ne départageait pas réseau muet et ampli incompris.
+    #[test]
+    fn option_activee_sans_ampli_dit_ce_que_l_ecoute_a_recu_9380() {
+        let instantane = serde_json::json!({
+            "account_linked": true,
+            "licensed_modules": [],
+            "providers": [{
+                "provider": "devialet_air",
+                "required_module": null,
+                "devices": 0,
+                "refusal": null,
+                "discovery": {
+                    "enabled": true,
+                    "listening": true,
+                    "datagrams": 40,
+                    "ignored": 40,
+                    "summary": "listening on UDP 45454: 40 datagram(s) received, 0 valid announcement(s), 40 ignored (last ignored: 361 bytes, header \"Da\", taille 361 au lieu de 345)",
+                },
+            }],
+        });
+        let md = section_fournisseurs_de_sortie(&instantane);
+        assert!(!md.contains("active, 0 device(s)"), "{md}");
+        assert!(
+            md.contains(
+                "- devialet_air: no device found — listening on UDP 45454: 40 datagram(s) received"
+            ),
+            "{md}"
+        );
+        assert!(md.contains("last ignored: 361 bytes"), "{md}");
     }
 
     /// Aucun fournisseur hors-arbre (le cas du binaire public, et l'état avant

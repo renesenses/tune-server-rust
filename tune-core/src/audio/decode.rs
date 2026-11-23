@@ -554,12 +554,21 @@ impl StreamingPcmAdapter {
         let depth = self.bit_depth.clamp(8, 32);
         let full_scale = (1i64 << (depth - 1)) as f32;
         let normalized: Vec<f32> = samples.iter().map(|&s| s as f32 / full_scale).collect();
+        let debut = std::time::Instant::now();
         let mut output = super::resample::rubato_resample_chunk(
             &mut self.resampler,
             &normalized,
             self.output_channels,
             flush,
             &mut self.resample_leftover,
+        );
+        // #9391 — même mesure que la sortie locale, côté décodeur en flux.
+        super::resample::surveiller_le_cout(
+            "decodeur_en_flux",
+            debut,
+            output.len(),
+            self.output_channels,
+            self.output_rate,
         );
 
         // A sinc resampler emits its group delay at the head and a padded tail

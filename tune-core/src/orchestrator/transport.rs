@@ -209,37 +209,60 @@ pub(crate) fn message_de_refus_de_zone(
 /// - l'autre zone a un autre nom : on la nomme, c'est là qu'il faut lancer ;
 /// - l'autre zone est SUPPRIMÉE (masquée) : on ne propose pas d'y lancer la
 ///   lecture, l'auditeur ne la voit plus.
+///
+/// Forum rc14 — la sentinelle porte le motif
+/// [`crate::outputs::sortie_tenue_par_une_autre_zone::MOTIF`] et la zone qui
+/// tient la sortie : sans motif, le client web remplaçait cette phrase par son
+/// bandeau générique « l'appareil est introuvable ».
 pub(crate) fn message_de_sortie_deja_tenue(
     zone_name: &str,
     sortie: &str,
+    autre_zone_id: i64,
     autre_zone: &str,
     autre_supprimee: bool,
 ) -> String {
-    const SENTINELLE: &str = "zone_output_unavailable:";
+    use crate::outputs::sortie_tenue_par_une_autre_zone::{Forme, SortieTenue, sentinelle};
     let appareil = nom_lisible_de_l_appareil(sortie).unwrap_or_else(|| zone_name.to_string());
     let debut = format!(
-        "{SENTINELLE}La sortie de la zone « {zone_name} » a disparu. Une sortie « {appareil} » \
+        "La sortie de la zone « {zone_name} » a disparu. Une sortie « {appareil} » \
          est bien présente, mais"
     );
-    if autre_supprimee {
-        format!(
-            "{debut} elle est déjà attachée à une zone supprimée, « {autre_zone} », et deux \
-             zones ne peuvent pas partager une sortie. Choisissez une autre sortie dans les \
-             réglages de la zone « {zone_name} »."
+    let (variant, phrase) = if autre_supprimee {
+        (
+            Forme::Deleted,
+            format!(
+                "{debut} elle est déjà attachée à une zone supprimée, « {autre_zone} », et deux \
+                 zones ne peuvent pas partager une sortie. Choisissez une autre sortie dans les \
+                 réglages de la zone « {zone_name} »."
+            ),
         )
     } else if autre_zone.eq_ignore_ascii_case(zone_name) {
-        format!(
-            "{debut} une autre zone nommée elle aussi « {zone_name} » l'utilise déjà, et deux \
-             zones ne peuvent pas partager une sortie. Lancez la lecture depuis cette autre \
-             zone, ou choisissez une autre sortie dans les réglages de celle-ci."
+        (
+            Forme::SameName,
+            format!(
+                "{debut} une autre zone nommée elle aussi « {zone_name} » l'utilise déjà, et deux \
+                 zones ne peuvent pas partager une sortie. Lancez la lecture depuis cette autre \
+                 zone, ou choisissez une autre sortie dans les réglages de celle-ci."
+            ),
         )
     } else {
-        format!(
-            "{debut} la zone « {autre_zone} » l'utilise déjà, et deux zones ne peuvent pas \
-             partager une sortie. Lancez la lecture depuis « {autre_zone} », ou choisissez une \
-             autre sortie dans les réglages de la zone « {zone_name} »."
+        (
+            Forme::Other,
+            format!(
+                "{debut} la zone « {autre_zone} » l'utilise déjà, et deux zones ne peuvent pas \
+                 partager une sortie. Lancez la lecture depuis « {autre_zone} », ou choisissez une \
+                 autre sortie dans les réglages de la zone « {zone_name} »."
+            ),
         )
-    }
+    };
+    sentinelle(&SortieTenue {
+        zone_qui_tient: autre_zone_id,
+        variant,
+        zone: zone_name.to_string(),
+        device: appareil,
+        holder: autre_zone.to_string(),
+        phrase,
+    })
 }
 
 /// Le message ET le code d'un refus de zone hors ligne, en fonction pure.
@@ -811,23 +834,43 @@ impl PlaybackOrchestrator {
             .flatten()
             .filter(|z| z.id.is_some_and(|id| id != zone_id))?;
         let supprimee = repo.is_device_hidden(sortie);
-        let msg = message_de_sortie_deja_tenue(&zone.name, sortie, &occupante.name, supprimee);
+        let occupante_id = occupante.id.unwrap_or_default();
+        let msg = message_de_sortie_deja_tenue(
+            &zone.name,
+            sortie,
+            occupante_id,
+            &occupante.name,
+            supprimee,
+        );
         warn!(
             zone_id,
             zone_name = %zone.name,
             stale_device_id = dev_id,
             target_device_id = sortie,
-            holder_zone_id = occupante.id.unwrap_or_default(),
+            holder_zone_id = occupante_id,
             holder_hidden = supprimee,
             "zone_rebind_target_held_by_other_zone"
         );
-        if let Some(ref bus) = self.event_bus {
+        if let Some(ref bus) = self.event_bus
+            && let Some(refus) =
+                crate::outputs::sortie_tenue_par_une_autre_zone::depuis_sentinelle(&msg)
+        {
             bus.emit(
                 "zone.playback_error",
                 serde_json::json!({
                     "zone_id": zone_id,
-                    "error": phrase_sans_sentinelle(&msg),
+                    "error": refus.phrase,
                     "code": "zone_output_unavailable",
+                    // Forum rc14 — le motif fait afficher CE refus au client,
+                    // pas son bandeau « appareil introuvable ». La phrase est
+                    // en français : le client la compose dans la langue de
+                    // l'interface à partir du motif et de `params`
+                    // (`erreursServeur.output_held_by_other_zone…`).
+                    "message": refus.phrase,
+                    "params": refus.params_json(),
+                    "reason": crate::outputs::sortie_tenue_par_une_autre_zone::MOTIF,
+                    "holder_zone_id": occupante_id,
+                    "holder_hidden": supprimee,
                     "fatal": true,
                 }),
             );
@@ -1490,6 +1533,8 @@ impl PlaybackOrchestrator {
             // #2264 — posé par `play_inner` après la composition : c'est la
             // décision de `appliquer_la_regle_de_version`.
             version: None,
+            cover_plus: false,
+            cover_plus_source: None,
         }
     }
 
@@ -1551,24 +1596,31 @@ impl PlaybackOrchestrator {
                 .await;
             // #9175 — Sendspin et Devialet AIR décodent `file_path` quand il
             // est là : ne le leur donner que si le flux servi EST ce fichier.
-            let type_de_sortie = self.output_type_of(device_id).await;
             let fichier_pour_la_sortie = self
                 .fichier_d_origine_pour_la_sortie(
-                    type_de_sortie.as_deref(),
+                    self.output_type_of(device_id).await.as_deref(),
                     resolved.stream_id.as_deref(),
                     local_file_path.as_deref(),
                 )
                 .await;
-            // TESS T12a (#9176) — OAAT lit le fichier en direct derrière ses
-            // propres gardes : seulement quand la chaîne de la zone ne
-            // toucherait à rien, sinon le flux servi (et traité) fait foi.
-            let fichier_pour_la_sortie = fichier_pour_la_sortie.filter(|fichier| {
-                type_de_sortie.as_deref() != Some("oaat")
-                    || oaat_lit_le_fichier(
-                        fichier,
-                        self.chaine_du_flux_active(req.zone_id, req.piste_rg()),
-                    )
-            });
+            // #9176 — OAAT lit un WAV directement sur le disque : sur une zone
+            // qui traite le flux, ce fichier contournerait le traitement.
+            let fichier_pour_la_sortie = match fichier_pour_la_sortie {
+                Some(f)
+                    if est_sortie_oaat(Some(device_id.as_str()))
+                        && !oaat_peut_lire_le_fichier(&f, || {
+                            self.zone_traite_le_flux_pcm(req, resolved)
+                        }) =>
+                {
+                    info!(
+                        zone_id = req.zone_id,
+                        device_id = %device_id,
+                        "oaat_lecture_directe_refusee_traitement_actif"
+                    );
+                    None
+                }
+                autre => autre,
+            };
             let media = crate::outputs::traits::PlayMedia {
                 url: &resolved.url,
                 mime_type: &resolved.mime_type,
@@ -2345,6 +2397,30 @@ impl PlaybackOrchestrator {
         (false, Some(format!("Device not found: {device_id}")))
     }
 
+    /// #9176 — la zone traite-t-elle le flux PCM servi à une sortie réseau ?
+    ///
+    /// Les mêmes étages que [`StreamingDsp::is_active`], lus par leurs sondes
+    /// bon marché (aucun convolveur bâti) : égaliseur, correction de pièce à la
+    /// cadence du flux, ReplayGain qui change les échantillons, crossfeed. La
+    /// compensation n'existe qu'avec l'égaliseur ou le crossfeed. En PURE,
+    /// chaque sonde rend faux.
+    pub(super) fn zone_traite_le_flux_pcm(
+        &self,
+        req: &PlayRequest,
+        resolved: &ResolvedStream,
+    ) -> bool {
+        let zone_id = req.zone_id;
+        let canaux = resolved
+            .channels
+            .and_then(|c| u16::try_from(c).ok())
+            .filter(|c| *c > 0)
+            .unwrap_or(2);
+        self.zone_has_active_eq(zone_id)
+            || self.zone_has_active_crossfeed(zone_id)
+            || self.zone_replaygain_changes_audio(zone_id, req.piste_rg())
+            || self.zone_ir_s_appliquerait(zone_id, resolved.sample_rate, canaux)
+    }
+
     /// #9175 — le `PlayMedia::file_path` remis à la sortie `output_type`.
     ///
     /// L'orchestrateur connaît le fichier de TOUTE piste locale, quelle que
@@ -2363,9 +2439,8 @@ impl PlaybackOrchestrator {
     /// Un fait du flux, pas une déduction des réglages : c'est ce que le
     /// chemin du signal annonce qui part alors vraiment.
     ///
-    /// Les autres sorties gardent le fichier tel quel : OAAT le lit derrière
-    /// ses propres gardes, et seulement sans chaîne active (TESS T12a,
-    /// [`oaat_lit_le_fichier`]) ; les autres ne le lisent pas.
+    /// Les autres sorties gardent le fichier tel quel : OAAT est filtré par
+    /// [`oaat_peut_lire_le_fichier`] (#9176), les autres ne le lisent pas.
     pub(super) async fn fichier_d_origine_pour_la_sortie(
         &self,
         output_type: Option<&str>,
@@ -3276,21 +3351,6 @@ impl PlaybackOrchestrator {
     /// True when the zone has an uploaded room-correction IR and is not in PURE
     /// mode. Cheap settings read (like `zone_has_active_eq`) used to force the
     /// transcode path so the FIR reaches network renderers, not just local.
-    /// TESS T12a — un étage du flux réseau toucherait-il les échantillons de
-    /// cette piste ? Les mêmes questions que la décision de lecture (PURE,
-    /// droits et greffons compris) : égaliseur, correction de pièce, étage
-    /// casque (crossfeed et greffons natifs tiers), ReplayGain.
-    pub(super) fn chaine_du_flux_active(
-        &self,
-        zone_id: i64,
-        piste: crate::audio::replaygain::PisteRg<'_>,
-    ) -> bool {
-        self.zone_has_active_eq(zone_id)
-            || self.zone_has_active_ir(zone_id)
-            || self.zone_has_active_crossfeed(zone_id)
-            || self.zone_replaygain_changes_audio(zone_id, piste)
-    }
-
     pub(super) fn zone_has_active_ir(&self, zone_id: i64) -> bool {
         if self.zone_audiophile(zone_id) {
             return false;
@@ -3459,6 +3519,15 @@ impl PlaybackOrchestrator {
             .ok();
         self.playback.pause(zone_id).await;
         Ok(IssueDePause::EnPause)
+    }
+
+    /// #8967 — la zone est-elle lue par un onglet (`output_type = "browser"`) ?
+    fn zone_lue_par_le_navigateur(&self, zone_id: i64) -> bool {
+        ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .is_some_and(|z| z.output_type.as_deref() == Some("browser"))
     }
 
     /// Dire à l'auditeur que la session n'a pas survécu à la pause — sur les
@@ -3961,6 +4030,37 @@ impl PlaybackOrchestrator {
                                 ));
                             }
                         }
+                    }
+                    // #8967 (FabienM, fil 2864) — zone NAVIGATEUR : pas de
+                    // périphérique, l'onglet tire `stream_url` lui-même. Sa
+                    // session expirée, on la recrée comme le fait déjà le
+                    // réglage d'égaliseur sur ce chemin : même piste, file
+                    // intacte, sans ligne d'historique. Le départ est la
+                    // dernière position que le lecteur a rapportée
+                    // (`browser-playing`, toutes les cinq secondes), sinon 0 :
+                    // rien d'autre n'écrit la position d'une zone sans
+                    // sortie. La réponse porte le nouveau `stream_url`, que le
+                    // client recharge parce qu'il a changé.
+                    (RepriseDeSession::RetablirALaPosition, None)
+                        if self.zone_lue_par_le_navigateur(zone_id) =>
+                    {
+                        info!(zone_id, position_ms, "resume_browser_session_restore");
+                        return match self
+                            .replay_zone_at_position(
+                                zone_id,
+                                position_ms,
+                                "reprise_navigateur_session_expiree",
+                            )
+                            .await
+                        {
+                            Ok(()) => Ok(()),
+                            Err(e) => Err(self.dire_session_perdue(
+                                zone_id,
+                                &np.title,
+                                position_mesuree,
+                                session_message(&np.title, position_mesuree, Some(&e)),
+                            )),
+                        };
                     }
                     (RepriseDeSession::Expliquer, _)
                     | (RepriseDeSession::RetablirALaPosition, None) => {
@@ -4864,21 +4964,20 @@ fn message_flux_non_ouvert(resolved: &ResolvedStream) -> String {
     )
 }
 
-/// TESS T12a (#9176) — OAAT peut-il lire `fichier` en direct ?
+/// #9176 — OAAT peut-il lire `fichier` lui-même, au lieu du flux servi ?
 ///
-/// La lecture directe d'OAAT (`outputs/oaat/output.rs`, `play_media`) décode
-/// le fichier de la bibliothèque elle-même : elle ne voit RIEN de la chaîne de
-/// la zone (égaliseur, correction de pièce, ReplayGain, crossfeed, greffons
-/// natifs tiers, compensation), que seul le flux servi porte. Elle reste donc
-/// réservée à une zone dont la chaîne ne toucherait à rien (aucun étage actif,
-/// ou mode Pure : bit-perfect, sans conversion) et au DSD natif (DSF, DFF),
-/// que la chaîne PCM ne traite pas et qu'OAAT sait seul transporter tel quel.
-pub(super) fn oaat_lit_le_fichier(fichier: &str, chaine_active: bool) -> bool {
+/// La sortie OAAT lit en direct un WAV (`entete_est_wav`) ou un DSF en DSD
+/// natif. Le DSD natif ne passe par aucun traitement PCM (c'est voulu) : le
+/// fichier reste remis, et la sortie décide elle-même de son repli. Pour tout
+/// autre fichier, la lecture directe n'est permise que si la zone ne traite pas
+/// le flux (`flux_traite` : égaliseur, correction de pièce, ReplayGain,
+/// crossfeed ; faux en PURE). Sinon la sortie lit `url`, le flux traité.
+pub(super) fn oaat_peut_lire_le_fichier(fichier: &str, flux_traite: impl FnOnce() -> bool) -> bool {
     let dsd = std::path::Path::new(fichier)
         .extension()
         .and_then(|e| e.to_str())
         .is_some_and(|e| e.eq_ignore_ascii_case("dsf") || e.eq_ignore_ascii_case("dff"));
-    !chaine_active || dsd
+    dsd || !flux_traite()
 }
 
 /// #9175 — les sorties qui décodent elles-mêmes `PlayMedia::file_path` quand

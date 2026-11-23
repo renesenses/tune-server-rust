@@ -24,6 +24,8 @@ mod bascule_progressive_8558;
 const DUPLICATE_NET_PLAY_WINDOW: std::time::Duration = std::time::Duration::from_secs(12);
 
 mod radio;
+// #9346 — la chaîne de la zone (convolution, crossfeed) sur une radio servie.
+mod chaine_radio_9346;
 /// Réexport PUBLIC, et un seul : `tune-server` refuse désormais à
 /// l'ENREGISTREMENT une adresse de station qui rend une page web, avec le même
 /// verdict que la lecture (#3578). Le reste de ce module reste interne.
@@ -2313,6 +2315,9 @@ mod passthrough_sans_traitement_7986_tests;
 // #9175 — Sendspin et Devialet AIR lisent le flux traité dès qu'un traitement est actif.
 #[cfg(test)]
 mod sorties_qui_decodent_le_fichier_9175_tests;
+// #9176 — OAAT ne lit plus le WAV en direct quand la zone traite le flux.
+#[cfg(test)]
+mod oaat_lecture_directe_9176_tests;
 // TESS T12 — faux serveur `/stream` des bancs de bout en bout (vraies sorties).
 #[cfg(test)]
 pub(crate) mod faux_serveur_de_flux_tess;
@@ -2338,6 +2343,8 @@ mod prefetch_fiche_qobuz_m3u_8229_tests;
 #[cfg(test)]
 mod prefetch_wav_annonce_6990_tests;
 mod resolve_direct;
+// #9336 — une piste indexée se joue à l'adresse actuelle de son serveur.
+mod adresse_actuelle_du_serveur_9336;
 // #9207 — une URI de notre bibliothèque reçue par le renderer se joue en local.
 mod uri_de_notre_bibliotheque_9207;
 /// #2264 — la règle de version appliquée à la lecture.
@@ -2713,6 +2720,10 @@ mod reprise_au_redemarrage_6380;
 /// réseau à la position de la pause.
 #[cfg(test)]
 mod reprise_dlna_position_2095;
+/// #8967 — Lecture sur une zone navigateur dont la session a expiré
+/// pendant la pause : la piste repart au lieu d'une erreur.
+#[cfg(test)]
+mod reprise_navigateur_8967_tests;
 /// Fil 2125 — le saut de la reprise après décrochage attend que le renderer
 /// ait ouvert le flux.
 #[cfg(test)]

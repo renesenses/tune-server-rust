@@ -1006,7 +1006,15 @@ pub(crate) fn user_plugins_dir() -> Option<PathBuf> {
         std::env::var("TUNE_PLUGINS_USER_DIR").ok(),
         std::env::var("TUNE_PLUGINS_DIR").ok(),
         std::env::var("TUNE_DATA_DIR").ok(),
-        std::env::var("TUNE_DB_PATH").ok(),
+        // #9343 — la base RETENUE au démarrage d'abord : sous macOS, sans
+        // `TUNE_DB_PATH`, elle est sous `Application Support`. Avant, aucun
+        // dossier de données n'était connu et l'installation visait le
+        // `plugins/` relatif au répertoire courant, `/` pour un LaunchAgent
+        // (lecture seule). Les greffons déjà installés sous l'ancienne racine
+        // restent lus : `plugin_roots` parcourt aussi [`plugins_dir`].
+        crate::chemins_de_donnees::base_retenue()
+            .map(str::to_owned)
+            .or_else(|| std::env::var("TUNE_DB_PATH").ok()),
         &cwd,
     )
 }
