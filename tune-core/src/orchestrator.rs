@@ -24,6 +24,8 @@ mod bascule_progressive_8558;
 const DUPLICATE_NET_PLAY_WINDOW: std::time::Duration = std::time::Duration::from_secs(12);
 
 mod radio;
+// #9346 — la chaîne de la zone (convolution, crossfeed) sur une radio servie.
+mod chaine_radio_9346;
 /// Réexport PUBLIC, et un seul : `tune-server` refuse désormais à
 /// l'ENREGISTREMENT une adresse de station qui rend une page web, avec le même
 /// verdict que la lecture (#3578). Le reste de ce module reste interne.
