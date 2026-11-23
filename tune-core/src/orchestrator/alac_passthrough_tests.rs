@@ -336,8 +336,10 @@ async fn un_alac_au_dessus_du_plafond_est_negocie_comme_sans_opt_in() {
 
 /// Écart n° 2 : sur une zone `diretta`, la case « ALAC direct » ne change
 /// rien — et c'est voulu. Sans traitement, le fichier part tel quel (la
-/// sortie le décode elle-même). Depuis TESS T12c (décision Q8), cette sortie est
-/// hors TESS : même avec un égaliseur armé, le fichier part tel quel.
+/// sortie le décode elle-même) ; avec un égaliseur armé, il est transcodé
+/// pour que l'égaliseur s'entende (#1393). Lister `diretta` parmi les sorties
+/// réseau rendrait le second cas muet : `alac_passthrough` vrai, égaliseur
+/// calculé puis jeté.
 #[tokio::test]
 async fn sur_une_zone_diretta_la_case_alac_direct_ne_change_rien() {
     let b = banc("diretta", "diretta-banc-3183");
@@ -356,12 +358,11 @@ async fn sur_une_zone_diretta_la_case_alac_direct_ne_change_rien() {
         std::fs::metadata(ALAC_16_44).ok().map(|m| m.len())
     );
 
-    // TESS T12c (décision Q8) : sortie HORS TESS, l'égaliseur armé ne
-    // lui est plus appliqué ; le fichier part toujours tel quel.
     b.armer_l_eq();
     let avec_eq = b.resoudre(id).await;
     assert_eq!(
-        avec_eq.mime_type, "audio/mp4",
-        "sortie hors TESS (Q8) : aucun étage de la chaîne, le fichier part tel quel"
+        avec_eq.mime_type, "audio/flac",
+        "égaliseur armé : la sortie PULL doit recevoir le flux traité, case ou \
+         pas (#1393) — `diretta` n'est pas une sortie réseau (#3183, écart n° 2)"
     );
 }

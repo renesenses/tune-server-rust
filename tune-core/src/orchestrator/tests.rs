@@ -991,11 +991,11 @@ fn pull_output_dsp_transcode_classification() {
         false,
         flac
     ));
-    // TESS T12c (décision Q8) : les sorties hors TESS le sont, aucun
-    // étage de la chaîne ne leur est appliqué.
+    // TESS T12c (décision du 23/11) : HQPlayer et l'autre transport hors
+    // TESS gardent l'égaliseur et le ReplayGain (#1216).
     for hors_tess in ["diretta", "hqplayer"] {
         assert!(
-            !pull_output_needs_dsp_transcode(Some(hors_tess), false, false, flac),
+            pull_output_needs_dsp_transcode(Some(hors_tess), false, false, flac),
             "{hors_tess}"
         );
     }
@@ -1086,12 +1086,8 @@ fn is_pull_dsp_output_type_est_la_part_type_de_pull_output_needs_dsp_transcode()
         "diretta",
         "un-greffon-hors-depot",
     ] {
-        // TESS T12c — seule exception : les sorties hors TESS restent des
-        // sorties PULL (transport bit-perfect, #2189), mais hors TESS (Q8) :
-        // aucun traitement ne leur est forcé.
-        let hors_tess = matches!(t, "hqplayer" | "diretta");
         assert_eq!(
-            is_pull_dsp_output_type(Some(t)) && !hors_tess,
+            is_pull_dsp_output_type(Some(t)),
             pull_output_needs_dsp_transcode(Some(t), false, false, flac),
             "{t} : le prédicat extrait doit rendre exactement ce que \
              rendait la condition d'origine"

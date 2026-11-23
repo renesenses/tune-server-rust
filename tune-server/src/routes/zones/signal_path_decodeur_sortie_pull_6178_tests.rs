@@ -217,14 +217,12 @@ fn local_sans_sonde_garde_son_libelle_de_volume_8462() {
     );
 }
 
-/// Dès que Tune touche le signal pour une sortie PULL (ReplayGain), il
-/// décode : l'étape revient. TESS T12c (décision Q8) : HQPlayer est hors
-/// TESS, aucun étage ne lui est appliqué ; le témoin passe donc par une
-/// sortie PULL de greffon.
+/// Dès que Tune touche le signal pour HQPlayer (ReplayGain), il décode : l'étape
+/// revient.
 #[test]
 fn hqplayer_avec_replaygain_retrouve_son_decodeur() {
     let sp = chemin_de(
-        "un-greffon-pull",
+        "hqplayer",
         &[(tune_core::audio::replaygain::MODE_KEY, "track")],
     );
     assert!(
@@ -233,21 +231,4 @@ fn hqplayer_avec_replaygain_retrouve_son_decodeur() {
         noms(&sp)
     );
     assert_eq!(noms(&sp).get(1).map(String::as_str), Some("Decoder"));
-}
-
-/// TESS T12c (décision Q8) — HQPlayer est hors TESS : un ReplayGain armé ne
-/// lui est pas appliqué, le panneau ne l'annonce pas et le flux reste
-/// bit-perfect.
-#[test]
-fn hqplayer_hors_tess_le_replaygain_n_est_pas_annonce_t12c() {
-    let sp = chemin_de(
-        "hqplayer",
-        &[(tune_core::audio::replaygain::MODE_KEY, "track")],
-    );
-    assert!(
-        !noms(&sp).contains(&"ReplayGain".to_string()),
-        "hors TESS : {:?}",
-        noms(&sp)
-    );
-    assert_eq!(sp["bit_perfect"], true, "{sp}");
 }

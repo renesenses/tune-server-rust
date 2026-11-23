@@ -969,20 +969,8 @@ pub(super) fn pull_output_needs_dsp_transcode(
     is_pull_dsp_output_type(output_type)
         && !is_local
         && !is_oaat
-        && !sortie_hors_tess(output_type)
         && source_format.is_some()
         && source_format != Some(AudioFormat::Dsd)
-}
-
-/// TESS T12c (décision Q8) — les transports hors TESS de `TransportZone`
-/// (HQPlayer et l'autre) appliquent leur propre traitement ou transportent le
-/// flux tel quel : aucun étage de la chaîne n'y est appliqué, le flux part tel
-/// quel, et l'écran TESS en donne le motif (`tess::zones::MotifHorsTess`).
-pub(super) fn sortie_hors_tess(output_type: Option<&str>) -> bool {
-    matches!(
-        crate::tess::TransportZone::depuis_type_de_sortie(output_type),
-        crate::tess::TransportZone::HqPlayer | crate::tess::TransportZone::Diretta
-    )
 }
 
 /// TESS T12c — les sorties qui vont chercher le flux elles-mêmes et dont

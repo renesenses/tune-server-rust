@@ -281,15 +281,12 @@ fn le_meme_eq_sur_un_fil_pcm_reste_annonce_applique() {
     )
     .unwrap();
 
-    // TESS T12c (décision Q8) : cette sortie est hors TESS, l'égaliseur ne
-    // lui est plus appliqué (`pull_output_needs_dsp_transcode`) ; le panneau
-    // ne l'annonce donc pas, même sur un fil PCM.
-    assert_eq!(
-        step_desc(&sp, "DSP"),
-        None,
-        "hors TESS, aucun égaliseur annoncé : {sp}"
+    let dsp = step_desc(&sp, "DSP").expect("l'étape DSP doit rester présente sur du PCM");
+    assert!(
+        dsp.starts_with("EQ actif"),
+        "sur un fil PCM l'EQ est réellement appliqué : {dsp}"
     );
-    assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(true));
+    assert_eq!(sp.get("bit_perfect").and_then(Value::as_bool), Some(false));
 }
 
 #[test]
@@ -2540,13 +2537,12 @@ async fn alac_direct_sur_une_zone_diretta_suit_l_orchestrateur_avec_et_sans_eq()
     assert_eq!(verdict(&sp), Some(true), "fil intact : {sp}");
     assert_eq!(transcoder_desc(&sp), None, "{sp}");
 
-    // TESS T12c (décision Q8) : sortie hors TESS, l'égaliseur armé ne lui
-    // est plus appliqué ; le fichier part tel quel et le panneau le dit.
     armer_l_eq(&backend, zone_id);
     let avec_eq = decision(&backend, zone_id, track_id).await;
     assert_eq!(
-        avec_eq.mime_type, "audio/mp4",
-        "hors TESS (Q8) : le fichier part tel quel, égaliseur armé ou pas"
+        avec_eq.mime_type, "audio/flac",
+        "égaliseur armé : la sortie PULL reçoit le flux traité, case ou pas \
+         (#1393) — `diretta` n'est pas une sortie réseau (#3183, écart n° 2)"
     );
     let sp = build_signal_path(
         &en_lecture(track_id, "alac", 44_100, 16),
@@ -2557,8 +2553,9 @@ async fn alac_direct_sur_une_zone_diretta_suit_l_orchestrateur_avec_et_sans_eq()
         None,
     )
     .unwrap();
-    assert_eq!(verdict(&sp), Some(true), "hors TESS, fil intact : {sp}");
-    assert_eq!(step_desc(&sp, "DSP"), None, "{sp}");
+    assert_eq!(verdict(&sp), Some(false), "l'EQ touche le flux : {sp}");
+    let dsp = step_desc(&sp, "DSP").expect("l'étape DSP doit être présente");
+    assert!(dsp.starts_with("EQ actif"), "{dsp}");
 }
 
 // ------------------------------------------------------------------

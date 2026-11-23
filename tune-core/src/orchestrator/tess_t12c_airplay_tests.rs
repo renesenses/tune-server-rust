@@ -1,9 +1,10 @@
 //! TESS T12c — AirPlay (flux fabriqué par Tune) sous la chaîne TESS, et les
-//! exclusions hors TESS (décision Q8).
+//! sorties hors TESS (décision Q8, amendée le 23/11 : elles gardent
+//! l'égaliseur et le ReplayGain).
 //!
 //! 1. Décision réelle (`decider_la_lecture_locale`) : sur une zone AirPlay 2
 //!    ou Devialet AIR, le crossfeed SEUL force le flux traité par le relais ;
-//!    sur les sorties hors TESS, un égaliseur armé ne force plus rien.
+//!    sur les sorties hors TESS, un égaliseur armé s'applique toujours.
 //! 2. De bout en bout, sur les OCTETS : la vraie porte de lecture
 //!    (`PlaybackOrchestrator::play`), la vraie sortie AirPlay 1
 //!    ([`AirplayOutput`]), un faux récepteur RTSP/RTP sur la boucle locale qui
@@ -132,11 +133,12 @@ async fn crossfeed_seul_force_le_flux_traite_sur_airplay_et_air_t12c() {
     }
 }
 
-/// 🔴 → 🟢 Les sorties hors TESS (Q8) : un égaliseur armé ne
-/// force plus le transcodage, la piste part telle quelle. Avant T12c, il les
-/// transcodait (#1216).
+/// 🔴 → 🟢 Décision du 23/11 : HQPlayer et l'autre transport hors TESS
+/// GARDENT l'égaliseur et le ReplayGain (#1216). Égaliseur armé : la piste
+/// passe par le relais, qui l'exécute. Rouge sur la première version de T12c,
+/// qui les retirait.
 #[tokio::test]
-async fn hqplayer_et_diretta_hors_tess_rien_n_est_applique_t12c() {
+async fn hqplayer_avec_egaliseur_l_applique_t12c() {
     for (type_, appareil) in [
         ("hqplayer", "hqplayer:salon-t12c"),
         ("diretta", "diretta:salon-t12c"),
@@ -147,12 +149,20 @@ async fn hqplayer_et_diretta_hors_tess_rien_n_est_applique_t12c() {
             .unwrap();
         let (wav, _) = banc::wav_gauche_seule("t12c-hors-tess", CADENCE, 4_410);
         let track_id = banc::inscrire_la_piste(&orch.db, wav.as_str().as_ref(), CADENCE, 100);
-        armer_l_egaliseur(&orch, zone_id);
-        banc::armer_le_crossfeed(&orch, zone_id);
         let req = demande(zone_id, appareil, track_id);
         assert!(
             !orch.transcodage_decide_pour_test(&req).await.unwrap(),
-            "T12c ({type_}) : hors TESS, aucun étage ne doit être appliqué"
+            "{type_} : sans traitement, la piste part telle quelle"
+        );
+        armer_l_egaliseur(&orch, zone_id);
+        assert!(
+            orch.transcodage_decide_pour_test(&req).await.unwrap(),
+            "{type_} : l'égaliseur armé doit s'appliquer (#1216, décision du 23/11)"
+        );
+        let (actif, relais, _) = orch.relais_dsp_pour_test(&req).await.unwrap();
+        assert!(
+            actif && relais,
+            "{type_} : le relais doit exécuter l'égaliseur ({actif}, {relais})"
         );
     }
 }
