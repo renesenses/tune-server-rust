@@ -788,10 +788,21 @@ impl PlaybackOrchestrator {
         // par la demande quand elle la porte ; sinon, pour une piste Bandcamp,
         // celle que la file ou les favoris connaissent déjà — une avance
         // gapless ou une annonce différée n'ont pas la demande sous la main.
+        //
+        // Fil 3009, point 15 — pour toute autre piste de SERVICE, l'album que
+        // la file, les favoris ou une écoute précédente connaissent : sans
+        // lui, `/library/history` ne sert pas d'`album_id_service`, et la
+        // vignette de « Récemment écoutés » n'a ni cœur, ni « … », ni
+        // étiquettes. Une piste de la bibliothèque n'en a pas besoin.
         let album_ref = ecoute.album_ref.clone().or_else(|| {
-            source_id.filter(|_| source == "bandcamp").and_then(|sid| {
+            let sid = source_id?;
+            if source == "bandcamp" {
                 crate::db::reference_d_album::reference_d_album_bandcamp(&self.db, sid)
-            })
+            } else if ecoute.track_id.is_none() && source != "local" {
+                crate::db::reference_d_album::reference_d_album_de_service(&self.db, source, sid)
+            } else {
+                None
+            }
         });
         // The owning profile is resolved by the caller from the zone's session
         // (set by the play handler from X-Profile-Id, inherited by autoplay /
