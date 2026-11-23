@@ -4,3 +4,4 @@ Tune 1.0.0-rc13.1, az rc13 javító kiadása.
 
 - A helyi hálózatról indított frissítés már nem kér hitelesítést.
 - Érthető üzenet, ha egy művelet korlátozott: melyik, miért, és mi a teendő.
+- A rádiók és a szolgáltatások borítói ismét megjelennek, ha a hitelesítés be van kapcsolva.
