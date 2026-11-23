@@ -1004,3 +1004,51 @@ async fn authentification_comme_les_autres_routes_de_zone_t08() {
         assert_eq!(st, StatusCode::OK, "{m} {uri} {v}");
     }
 }
+
+/// T12b — une zone de la famille UPnP publie la voie de sa chaîne
+/// (`delivery`), conforme au schéma ; une zone locale ne la publie pas.
+/// Rien n'a joué : l'état ne SONDE pas (relecture du 23/11). DLNA et OpenHome
+/// restent `unknown` (aucune réponse mémorisée), donc un crossfeed seul n'y
+/// est pas promis ; BluOS et Chromecast acceptent le LPCM 16 bits par type,
+/// SlimProto le refuse.
+#[tokio::test]
+async fn la_famille_upnp_publie_la_voie_de_sa_chaine_t12b() {
+    for (sortie, appareil, lpcm, voie, crossfeed) in [
+        ("dlna", "uuid:absent-t12b", "unknown", "untouched", false),
+        ("openhome", "uuid:oh-absent-t12b", "unknown", "untouched", false),
+        ("bluos", "bluos:absent-t12b", "accepted", "progressive_lpcm", true),
+        ("chromecast", "cast:absent-t12b", "accepted", "progressive_lpcm", true),
+        ("slimproto", "slim:absent-t12b", "refused", "untouched", false),
+    ] {
+        let b = Banc::avec_sortie(true, sortie, appareil).await;
+        let (s, v) = b.get().await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        conforme_au_schema("zone_response", &v).unwrap_or_else(|e| panic!("{sortie} {e} : {v}"));
+        assert_eq!(v["delivery"]["route"], json!("untouched"), "{sortie} : {v}");
+        assert_eq!(v["delivery"]["reason"], json!("nothing_to_process"), "{v}");
+        let (s, v) = b
+            .brut(
+                Method::PUT,
+                &format!("/api/v1/zones/{}/dsp", b.zone),
+                Some(
+                    json!({"crossfeed": {"enabled": true, "amount": 0.35, "delay_ms": 0.3}})
+                        .to_string(),
+                ),
+                None,
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let (_, v) = b.get().await;
+        conforme_au_schema("zone_response", &v).unwrap();
+        assert_eq!(v["delivery"]["route"], json!(voie), "{sortie} : {v}");
+        assert_eq!(v["delivery"]["renderer_lpcm"], json!(lpcm), "{sortie} : {v}");
+        assert_eq!(etape(&v, "crossfeed")["effective"], json!(crossfeed), "{sortie} : {v}");
+        if !crossfeed {
+            assert_eq!(etape(&v, "crossfeed")["reason"], json!("renderer_without_lpcm"), "{v}");
+        }
+    }
+    // Contre-épreuve : une zone locale n'a pas de `delivery`.
+    let b = Banc::nouveau(true).await;
+    let (_, v) = b.get().await;
+    assert!(v.get("delivery").is_none(), "{v}");
+}

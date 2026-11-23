@@ -2123,6 +2123,11 @@ mod ecoute_validee_7852_tests;
 // #8076 — FLAC local vers DLNA en PURE : voie servie et échantillons exacts.
 #[cfg(test)]
 mod gapless_dlna_pure_8076_tests;
+// TESS T12b — la famille UPnP : faits du lecteur pour l'état effectif.
+mod acheminement_upnp_t12b;
+#[cfg(test)]
+mod acheminement_upnp_t12b_tests;
+pub use acheminement_upnp_t12b::PisteEnCours;
 // #7965 — radios (au nom de la station) et podcasts dans l'historique.
 mod historique_radio_podcast_7965;
 #[cfg(test)]

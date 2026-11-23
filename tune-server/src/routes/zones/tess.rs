@@ -343,6 +343,12 @@ async fn reponse_de_zone(
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let etat = state.playback.get_state(zone_id).await;
     let volume = volume_de(state, zone).await;
+    // T12b — famille UPnP : la voie de la chaîne vers ce lecteur (relais
+    // progressif LPCM, transcodage, ou aucune), établie par la même sonde et
+    // les mêmes réglages que la lecture. `None` hors famille UPnP. Avant le
+    // contexte : il emprunte une fermeture qui ne traverse pas un `await`.
+    let piste = piste_en_cours(&etat);
+    let lecteur = state.orchestrator.faits_upnp_de_zone(zone_id, &piste).await;
     let disponible = |id: &str| greffon_disponible(&settings, id);
     let ctx = ContexteExecution {
         transport: TransportZone::depuis_type_de_sortie(zone.output_type.as_deref()),
@@ -357,7 +363,34 @@ async fn reponse_de_zone(
         .ok()
         .flatten()
         .filter(|p| !p.is_empty());
-    ReponseTessZone::depuis(zone_id, lecture.chaine, actif, catalogue, &ctx)
+    ReponseTessZone::depuis_avec_le_lecteur(
+        zone_id,
+        lecture.chaine,
+        actif,
+        catalogue,
+        &ctx,
+        lecteur.as_ref(),
+    )
+}
+
+/// T12b — ce qui joue, pour les faits du lecteur ; rien quand la zone est
+/// arrêtée (la règle de la bibliothèque, la plus prudente, s'applique alors).
+fn piste_en_cours(etat: &tune_core::playback::ZoneState) -> tune_core::orchestrator::PisteEnCours {
+    let np = etat
+        .now_playing
+        .as_ref()
+        .filter(|_| etat.state != tune_core::playback::PlayState::Stopped);
+    match np {
+        None => Default::default(),
+        Some(np) => tune_core::orchestrator::PisteEnCours {
+            track_id: np.track_id,
+            source: Some(np.source.clone()),
+            source_id: np.source_id.clone(),
+            format: np.format.clone(),
+            bit_depth: np.bit_depth,
+            stream_id: np.stream_id.clone(),
+        },
+    }
 }
 
 fn zone_de(state: &AppState, zone_id: i64) -> Result<Zone, Response> {

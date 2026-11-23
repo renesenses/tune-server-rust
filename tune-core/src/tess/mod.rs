@@ -36,6 +36,8 @@ pub mod greffon;
 pub mod migration;
 pub mod prereglages;
 pub mod quantification;
+/// TESS sur la famille UPnP : voie, réserves par lecteur, motifs (lot T12b).
+pub mod reseau_upnp;
 pub mod resolution;
 #[cfg(test)]
 pub(crate) mod sonde_f32;
