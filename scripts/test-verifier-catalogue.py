@@ -18,8 +18,9 @@ spec.loader.exec_module(garde)
 class GardeCatalogue(unittest.TestCase):
     def test_fichiers_suivis_depuis_un_sous_dossier(self):
         profil = hashlib.sha256(b"exemplealpha").hexdigest()
+        second = hashlib.sha256(b"exemplegamma").hexdigest()
         axe = hashlib.sha256(b"exemplebeta").hexdigest()
-        with tempfile.TemporaryDirectory() as dossier, patch.object(garde, "PROFILS", {profil}), patch.object(garde, "AXES", {axe}):
+        with tempfile.TemporaryDirectory() as dossier, patch.object(garde, "PROFILS", {profil, second}), patch.object(garde, "AXES", {axe}):
             racine = Path(dossier)
             subprocess.run(["git", "init", "-q", dossier], check=True)
             docs = racine / "notes"
@@ -37,6 +38,7 @@ class GardeCatalogue(unittest.TestCase):
                     '{"declarations": {\n "exemplebeta": "valeur"\n}}',
                     'pub struct UpsamplerSettings { pub exemplebeta: String }',
                     '"exemplealpha"',
+                    "const MOTIFS = /exemplealpha|exemplegamma/;",
                     '{"exemplebeta":"valeur"}',
                 ):
                     with self.subTest(contenu=contenu), contextlib.redirect_stderr(io.StringIO()) as erreurs:

@@ -1,4 +1,5 @@
 """Contrôle du vocabulaire du catalogue dans les fichiers suivis par Git."""
+from functools import lru_cache
 import hashlib
 import os
 from pathlib import Path
@@ -71,11 +72,28 @@ CHAMP = re.compile(r"""(?<!\w)["']?(?P<cle>[A-Za-z_][A-Za-z_0-9]*)["']?\s*:(?!:)
 PUCES = re.compile(r"(?:[-*][ \t]+" + MOT + r"[ \t]*(?:\r?\n[ \t]*|$))+")
 
 
+# Une garde ou un export peut énumérer les identifiants sans nommer le
+# catalogue. Reconnaître aussi ces listes littérales et alternatives de regex.
+LISTE = re.compile(r"""\b[A-Za-z]+(?:["'`]?[ \t]*[,|][ \t]*["'`]?[A-Za-z]+\b){1,}""")
+
+
+@lru_cache(maxsize=8192)
+def empreinte(mot):
+    return hashlib.sha256(mot.lower().encode("utf-8")).hexdigest()
+
+
 def correspond(mot, empreintes):
-    return hashlib.sha256(mot.lower().encode("utf-8")).hexdigest() in empreintes
+    return empreinte(mot) in empreintes
 
 
 def infractions(texte):
+    for liste in LISTE.finditer(texte):
+        mots = set(JETON.findall(liste.group().lower()))
+        for groupe in (PROFILS, AXES):
+            if sum(correspond(mot, groupe) for mot in mots) >= 2:
+                yield texte.count("\n", 0, liste.start()) + 1
+                break
+
     exemple = EXEMPLE.fullmatch(texte)
     if exemple:
         groupe = exemple.lastgroup
