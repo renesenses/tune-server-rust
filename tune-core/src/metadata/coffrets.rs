@@ -374,35 +374,82 @@ pub fn titre_commun(titres: &[String]) -> Option<String> {
 /// Fil 3012 — les titres d'origine des disques d'un coffret composé à la
 /// main désignent-ils les disques d'UNE SEULE sortie ?
 ///
-/// Vrai quand, une fois retiré leur marqueur de disque (« Physical Graffiti
-/// (Disc 1) », « …, CD2 », « 101 - Disc A »), tous les titres disent le même
-/// socle (casse, espaces doublés et année de tête ignorés, comme
-/// [`cle_de_socle`]) — ou quand ils sont tous identiques. C'est alors un
-/// album à plusieurs disques que l'utilisateur a réuni à la main, ce qu'un
-/// coffret automatique aurait fait.
+/// Vrai seulement quand CHAQUE titre porte un marqueur de disque
+/// (« Physical Graffiti (Disc 1) », « …, CD2 », « 101 - Disc A »), que ces
+/// marqueurs sont tous DIFFÉRENTS, et qu'une fois retirés, tous les titres
+/// disent le même socle (casse et espaces doublés ignorés, comme
+/// [`cle_de_socle`]). C'est alors un album à plusieurs disques réuni à la
+/// main, ce qu'un coffret automatique aurait fait.
 ///
-/// Faux pour deux éditions réunies en un coffret (« …(Stereo) [DSD64…] » et
-/// « …(Multichannel) [DSD64…] », #8953) ou pour un coffret de plusieurs
-/// albums : leurs socles diffèrent. Faux aussi sous deux titres : on ne
-/// conclut rien d'un seul disque.
+/// 🔴 Relecture de #9421 — le risque même de #8953 : deux ÉDITIONS réunies
+/// sous un même titre ne doivent pas passer pour une sortie. D'où :
+///
+/// - des titres tous identiques, SANS marqueur (« The Dark Side Of The
+///   Moon » ×2), ne prouvent rien : faux ;
+/// - deux fois le même marqueur (« Disc 1 » ×2) : deux éditions, faux ;
+/// - l'ANNÉE de tête que [`cle_de_socle`] retire (« 1973 - … » contre
+///   « 2023 - … ») départage : deux années différentes, faux.
+///
+/// Faux aussi pour deux éditions de titres différents (« …(Stereo)
+/// [DSD64…] » et « …(Multichannel) [DSD64…] », #8953), pour un coffret de
+/// plusieurs albums, et sous deux titres.
 pub fn disques_d_une_meme_sortie(titres: &[String]) -> bool {
     if titres.len() < 2 {
         return false;
     }
-    let cles: Vec<String> = titres
-        .iter()
-        .map(|t| cle_de_socle(&socle_sans_disque(t)))
-        .collect();
-    !cles[0].is_empty() && cles.iter().all(|c| *c == cles[0])
+    let mut socles: Vec<String> = Vec::with_capacity(titres.len());
+    let mut marqueurs: Vec<String> = Vec::with_capacity(titres.len());
+    let mut annees: Vec<String> = Vec::new();
+    for t in titres {
+        let Some((socle, marqueur)) = socle_et_marqueur(t) else {
+            return false;
+        };
+        if marqueurs.contains(&marqueur) {
+            return false;
+        }
+        marqueurs.push(marqueur);
+        if let Some(a) = annee_de_tete(&socle) {
+            annees.push(a);
+        }
+        socles.push(cle_de_socle(&socle));
+    }
+    !socles[0].is_empty()
+        && socles.iter().all(|c| *c == socles[0])
+        && annees.iter().all(|a| *a == annees[0])
 }
 
-/// Le titre sans son marqueur de disque, chiffré ([`marqueur_du_nom`]) ou
-/// lettré ([`socle_disque_lettre`]) ; le titre entier sinon.
-fn socle_sans_disque(titre: &str) -> String {
+/// Le socle et le marqueur de disque d'un titre : chiffré
+/// ([`marqueur_du_nom`], « 2 ») ou lettré ([`socle_disque_lettre`], « b »).
+/// `None` sans marqueur.
+fn socle_et_marqueur(titre: &str) -> Option<(String, String)> {
     marqueur_du_nom(titre)
-        .map(|(socle, _)| socle)
-        .or_else(|| socle_disque_lettre(titre))
-        .unwrap_or_else(|| titre.trim().to_string())
+        .map(|(socle, n)| (socle, n.to_string()))
+        .or_else(|| {
+            let socle = socle_disque_lettre(titre)?;
+            let lettre = titre
+                .trim_end()
+                .trim_end_matches([')', ']'])
+                .trim_end()
+                .chars()
+                .next_back()?
+                .to_ascii_lowercase();
+            Some((socle, lettre.to_string()))
+        })
+}
+
+/// L'année que le rangement met en tête d'un socle (« 1975 - Titre ») : les
+/// quatre chiffres que [`cle_de_socle`] retire, ou `None`.
+fn annee_de_tete(socle: &str) -> Option<String> {
+    let s = socle.trim();
+    let tete: String = s.chars().take(4).collect();
+    if tete.len() != 4 || !tete.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let reste = s[4..].trim_start();
+    reste
+        .strip_prefix(['-', '_', '.', '\u{2013}', '\u{2014}'])
+        .filter(|r| !r.trim().is_empty())
+        .map(|_| tete)
 }
 
 /// « 101 - Disc A », « Titre (Disc B) », « Titre [CD C] » : un mot de
@@ -591,7 +638,6 @@ mod tests {
                 "Physical Graffiti [Disc 2]",
             ][..],
             &["101 - Disc A", "101 - Disc B"][..],
-            &["Physical Graffiti", "Physical Graffiti"][..],
         ] {
             assert!(disques_d_une_meme_sortie(&t(titres)), "{titres:?}");
         }
@@ -611,6 +657,44 @@ mod tests {
         ] {
             assert!(!disques_d_une_meme_sortie(&t(titres)), "{titres:?}");
         }
+    }
+
+    /// Relecture de #9421 (D1) — deux éditions sous un même titre, sans
+    /// marqueur de disque : rien ne prouve une seule sortie.
+    #[test]
+    fn deux_dsotm_identiques_sans_marqueur_sont_exclus_9421() {
+        assert!(!disques_d_une_meme_sortie(&t(&[
+            "The Dark Side Of The Moon",
+            "The Dark Side Of The Moon",
+        ])));
+        // Le même marqueur deux fois : deux éditions du disque 1.
+        assert!(!disques_d_une_meme_sortie(&t(&[
+            "The Dark Side Of The Moon (Disc 1)",
+            "The Dark Side Of The Moon (Disc 1)",
+        ])));
+        // Contre-épreuve : avec des marqueurs distincts, c'est une sortie.
+        assert!(disques_d_une_meme_sortie(&t(&[
+            "The Dark Side Of The Moon (Disc 1)",
+            "The Dark Side Of The Moon (Disc 2)",
+        ])));
+    }
+
+    /// Relecture de #9421 (D1) — l'année de tête départage deux éditions.
+    #[test]
+    fn dsotm_1973_contre_2023_est_exclu_9421() {
+        assert!(!disques_d_une_meme_sortie(&t(&[
+            "1973 - The Dark Side Of The Moon (Disc 1)",
+            "2023 - The Dark Side Of The Moon (Disc 2)",
+        ])));
+        // Contre-épreuve : la même année, ou une seule année connue, passe.
+        assert!(disques_d_une_meme_sortie(&t(&[
+            "1973 - The Dark Side Of The Moon (Disc 1)",
+            "1973 - The Dark Side Of The Moon (Disc 2)",
+        ])));
+        assert!(disques_d_une_meme_sortie(&t(&[
+            "1973 - The Dark Side Of The Moon (Disc 1)",
+            "The Dark Side Of The Moon (Disc 2)",
+        ])));
     }
 
     fn alb(id: i64, titre: &str, dossier: &str) -> AlbumAGrouper {

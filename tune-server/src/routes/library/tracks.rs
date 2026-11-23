@@ -1917,6 +1917,12 @@ pub(super) async fn track_metadata_put(
 
     // Fil 3012 — le master Discogs, rangé en chiffres ; vide : effacé. Vérifié
     // AVANT toute écriture.
+    //
+    // ⚠️ Relecture de #9421 (D2) — la base seule : un fichier qui porte la
+    // balise DISCOGS_MASTER_ID la reposera au prochain scan de la piste,
+    // comme pour VERSION. Pour imposer une autre valeur malgré les balises,
+    // la poser sur l'ALBUM (`PUT /albums/{id}/metadata`) : elle prime, et
+    // aucun scan de piste ne la réécrit.
     let effacer_master = match dm::preparer_ecriture(&mut body) {
         Err(message) => {
             return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
