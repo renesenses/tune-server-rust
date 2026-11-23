@@ -3476,6 +3476,15 @@ impl PlaybackOrchestrator {
         Ok(IssueDePause::EnPause)
     }
 
+    /// #8967 — la zone est-elle lue par un onglet (`output_type = "browser"`) ?
+    fn zone_lue_par_le_navigateur(&self, zone_id: i64) -> bool {
+        ZoneRepo::with_backend(self.db.clone())
+            .get(zone_id)
+            .ok()
+            .flatten()
+            .is_some_and(|z| z.output_type.as_deref() == Some("browser"))
+    }
+
     /// Dire à l'auditeur que la session n'a pas survécu à la pause — sur les
     /// DEUX canaux, parce qu'aucun des deux ne suffit seul.
     ///
@@ -3976,6 +3985,37 @@ impl PlaybackOrchestrator {
                                 ));
                             }
                         }
+                    }
+                    // #8967 (FabienM, fil 2864) — zone NAVIGATEUR : pas de
+                    // périphérique, l'onglet tire `stream_url` lui-même. Sa
+                    // session expirée, on la recrée comme le fait déjà le
+                    // réglage d'égaliseur sur ce chemin : même piste, file
+                    // intacte, sans ligne d'historique. Le départ est la
+                    // dernière position que le lecteur a rapportée
+                    // (`browser-playing`, toutes les cinq secondes), sinon 0 :
+                    // rien d'autre n'écrit la position d'une zone sans
+                    // sortie. La réponse porte le nouveau `stream_url`, que le
+                    // client recharge parce qu'il a changé.
+                    (RepriseDeSession::RetablirALaPosition, None)
+                        if self.zone_lue_par_le_navigateur(zone_id) =>
+                    {
+                        info!(zone_id, position_ms, "resume_browser_session_restore");
+                        return match self
+                            .replay_zone_at_position(
+                                zone_id,
+                                position_ms,
+                                "reprise_navigateur_session_expiree",
+                            )
+                            .await
+                        {
+                            Ok(()) => Ok(()),
+                            Err(e) => Err(self.dire_session_perdue(
+                                zone_id,
+                                &np.title,
+                                position_mesuree,
+                                session_message(&np.title, position_mesuree, Some(&e)),
+                            )),
+                        };
                     }
                     (RepriseDeSession::Expliquer, _)
                     | (RepriseDeSession::RetablirALaPosition, None) => {
