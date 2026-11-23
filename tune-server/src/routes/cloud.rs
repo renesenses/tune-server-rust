@@ -417,16 +417,12 @@ async fn sso_authorize(
     // verifier + state for the browser round-trip (consumed in sso_callback).
     let pkce = PkceSession::generate();
     let (cle_pkce, cle_uri) = cles_d_attente(liaison);
+    // D'où la ronde est lancée (relecture A), DANS l'attente même : une seule
+    // écriture, la marque ne peut pas se séparer de son PKCE, même avec deux
+    // autorisations simultanées (machine et réseau local).
     settings
-        .set(&cle_pkce, &serde_json::to_string(&pkce).unwrap_or_default())
+        .set(&cle_pkce, &attente_a_stocker(&pkce, par_le_reseau_local))
         .ok();
-    // D'où la ronde est lancée : le retour en garde la règle (relecture A).
-    let cle_lan = cle_lancee_du_reseau_local(&cle_pkce);
-    if par_le_reseau_local {
-        settings.set(&cle_lan, "1").ok();
-    } else {
-        settings.delete(&cle_lan).ok();
-    }
 
     let uri = redirect_uri(&state, Some(&headers));
     // Persist the exact redirect_uri: OAuth requires the token exchange in the
@@ -473,18 +469,12 @@ fn prendre_l_attente_pkce(
     state_recu: Option<&str>,
 ) -> Result<AttenteConsommee, AttentePkce> {
     let cle_date = format!("{cle_pkce}_at");
-    let cle_lan = cle_lancee_du_reseau_local(cle_pkce);
-    let lancee_du_reseau_local = settings
-        .get(&cle_lan)
-        .ok()
-        .flatten()
-        .is_some_and(|v| v.trim() == "1");
     let emise = settings
         .get(&cle_date)
         .ok()
         .flatten()
         .and_then(|s| s.trim().parse::<u64>().ok());
-    let pending: Option<PkceSession> = settings
+    let pending: Option<AttenteStockee> = settings
         .get(cle_pkce)
         .ok()
         .flatten()
@@ -495,14 +485,17 @@ fn prendre_l_attente_pkce(
         });
     #[cfg(test)]
     if let Some(p) = &pending {
-        rendez_vous_de_test::apres_lecture(&p.state);
+        rendez_vous_de_test::apres_lecture(&p.pkce.state);
     }
     let consommer = || {
         settings.set(cle_pkce, "").ok();
         settings.delete(&cle_date).ok();
-        settings.delete(&cle_lan).ok();
     };
-    let Some(pkce) = pending else {
+    let Some(AttenteStockee {
+        pkce,
+        lancee_du_reseau_local,
+    }) = pending
+    else {
         consommer();
         return Err(AttentePkce::Absente);
     };
@@ -535,10 +528,23 @@ struct AttenteConsommee {
     lancee_du_reseau_local: bool,
 }
 
-/// La marque « ronde lancée du réseau local », posée à côté de l'attente
-/// PKCE et effacée avec elle.
-fn cle_lancee_du_reseau_local(cle_pkce: &str) -> String {
-    format!("{cle_pkce}_lan")
+/// L'attente PKCE telle qu'elle est rangée : le PKCE et, dans le même JSON,
+/// la marque « ronde lancée du réseau local » (`lan`, absente = faux pour
+/// une attente écrite avant elle).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AttenteStockee {
+    #[serde(flatten)]
+    pkce: PkceSession,
+    #[serde(rename = "lan", default)]
+    lancee_du_reseau_local: bool,
+}
+
+fn attente_a_stocker(pkce: &PkceSession, lancee_du_reseau_local: bool) -> String {
+    serde_json::to_string(&AttenteStockee {
+        pkce: pkce.clone(),
+        lancee_du_reseau_local,
+    })
+    .unwrap_or_default()
 }
 
 fn maintenant_unix() -> u64 {
