@@ -65,6 +65,8 @@ pub mod lien_de_partage;
 pub mod memoire_a_froid;
 /// #7077 — code stable + phrase traduite pour les corps de l'API.
 pub mod message_api;
+/// rc14 — refus des actions de la machine : phrases courtes, lien d'aide.
+pub mod refus_machine;
 /// #4677 — relevé, au démarrage, des règles du pare-feu Windows pour
 /// `tune-server.exe` (lecture seule, une ligne de journal).
 pub mod pare_feu_windows;
