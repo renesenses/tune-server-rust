@@ -1856,6 +1856,10 @@ pub mod relais_de_groupe_6155;
 #[cfg(test)]
 mod signal_path_tests;
 
+// #9316 — un podcast relayé n'affiche plus un 44,1 kHz / 16 bits inventé.
+#[cfg(test)]
+mod signal_path_podcast_relaye_9316_tests;
+
 // #5081 — l'ombre de la tête sur l'étape crossfeed du chemin du signal.
 #[cfg(test)]
 mod signal_path_ombre_5081_tests;
@@ -1907,6 +1911,9 @@ mod signal_path_volume_non_reglable_8569_tests;
 // #8647 — un DSD servi en natif par OAAT se dit « DSD256 natif (OAAT) ».
 #[cfg(test)]
 mod signal_path_dsd_natif_oaat_8647_tests;
+// #9331 — la voie mandataire (podcast relayé tel quel) n'affiche aucun traitement.
+#[cfg(test)]
+mod signal_path_mandataire_9331_tests;
 
 /// #1499 — une zone qui « joue » sans destination doit le dire.
 ///

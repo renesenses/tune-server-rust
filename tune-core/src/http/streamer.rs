@@ -134,6 +134,13 @@ pub struct StreamInfo {
     /// fait du flux, posé là où il est bâti, lu tel quel par le chemin du
     /// signal (« DST décompressé → DSF »). `false` partout ailleurs.
     pub dsd_reconstruit_depuis_dst: bool,
+    /// #9331 — le flux est une URL distante RELAYÉE telle quelle par le
+    /// mandataire (`relayer_un_flux_distant` : épisode de podcast vers un
+    /// renderer réseau, flux direct vers un onglet). Aucun étage ne touche
+    /// ses octets : ni égaliseur, ni correction de pièce, ni ReplayGain.
+    /// Même règle que [`Self::crossfeed`] : un fait du flux, posé là où il
+    /// est bâti, lu tel quel par le chemin du signal. `false` partout ailleurs.
+    pub relaye_tel_quel: bool,
 }
 
 /// #6221 — un fichier VIRTUEL servi par la branche fichier (`serve_file`) :
@@ -504,6 +511,11 @@ pub struct StreamSession {
     /// par le sondeur, qui fait alors reprendre la zone par un NOUVEAU flux à
     /// la position mémorisée (voir `PlaybackOrchestrator::reprendre_apres_plage_hors_fichier`).
     plage_hors_fichier_a_ms: std::sync::atomic::AtomicU64,
+    /// #9315 — statut HTTP non 2xx que la SOURCE a rendu au mandataire avant
+    /// qu'un seul octet ait été servi ; `0` = aucun. Posé par
+    /// `tune-stream-http`, lu par le sondeur, qui arrête la zone avec un
+    /// bandeau au lieu de la laisser « démarrer » sur un flux mort.
+    erreur_amont: std::sync::atomic::AtomicU16,
     /// Comptabilité du ramasse-miettes — voir `cleanup_stale_sessions_with`.
     ///
     /// `bytes_sent` est monotone et alimenté par TOUS les chemins de sortie
@@ -804,6 +816,27 @@ impl StreamSession {
             .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// #9315 — la source a répondu `statut` (non 2xx) au mandataire.
+    pub fn signaler_erreur_amont(&self, statut: u16) {
+        self.erreur_amont
+            .store(statut, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// #9315 — la source a de nouveau répondu 2xx : l'erreur notée ne vaut
+    /// plus (un renderer qui réessaie après un 502 et reçoit l'audio).
+    pub fn effacer_erreur_amont(&self) {
+        self.erreur_amont
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// #9315 — le statut d'erreur de la source, s'il a été noté.
+    pub fn erreur_amont(&self) -> Option<u16> {
+        match self.erreur_amont.load(std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            statut => Some(statut),
+        }
+    }
+
     pub fn new(id: String, info: StreamInfo, bit_perfect: bool, buffer_size: usize) -> Self {
         let (tx, rx) = mpsc::channel(buffer_size);
         let keep_alive = tx.clone();
@@ -843,6 +876,7 @@ impl StreamSession {
             longueur_amont: std::sync::atomic::AtomicU64::new(0),
             requetes_mandataire: std::sync::atomic::AtomicU32::new(0),
             plage_hors_fichier_a_ms: std::sync::atomic::AtomicU64::new(0),
+            erreur_amont: std::sync::atomic::AtomicU16::new(0),
             gc_seen_bytes: std::sync::atomic::AtomicU64::new(0),
             gc_active_at_ms: std::sync::atomic::AtomicU64::new(0),
             fichiers_prepares: std::sync::atomic::AtomicU32::new(0),
@@ -2011,6 +2045,12 @@ impl AudioStreamer {
     pub async fn age_plage_hors_fichier(&self, stream_id: &str) -> Option<std::time::Duration> {
         let sessions = self.sessions.lock().await;
         sessions.get(stream_id)?.age_plage_hors_fichier()
+    }
+
+    /// #9315 — le statut d'erreur que la source a rendu à cette session.
+    pub async fn erreur_amont(&self, stream_id: &str) -> Option<u16> {
+        let sessions = self.sessions.lock().await;
+        sessions.get(stream_id)?.erreur_amont()
     }
 
     /// #6612 — oublie la plage hors fichier de cette session.
