@@ -121,6 +121,24 @@ fn sante() -> std::sync::MutexGuard<'static, Sante> {
     SANTE.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Le premier nom d'une collaboration.
+pub fn premier_nom(nom: &str) -> String {
+    COLLAB
+        .splitn(nom, 2)
+        .next()
+        .unwrap_or(nom)
+        .trim()
+        .to_string()
+}
+
+/// Le bandeau `og:image` recadré au carré : `…/1200x630cw.png` →
+/// `…/600x600cc.jpg`. Une adresse d'une autre forme est rendue telle quelle.
+pub fn carre(url: &str, taille: u32) -> String {
+    CARRE
+        .replace(url, format!("/{taille}x{taille}cc.jpg").as_str())
+        .into_owned()
+}
+
 /// La balise `og:image` d'une page, si elle désigne une adresse `https://`.
 /// Toute autre forme rend `None` : jamais de panique, jamais d'adresse
 /// douteuse affichée.
