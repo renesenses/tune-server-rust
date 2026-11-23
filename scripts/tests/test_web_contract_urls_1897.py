@@ -206,6 +206,18 @@ class CommentairesDesTypes(unittest.TestCase):
         )
         self.assertEqual(e["champs_obligatoires"], ["lien", "requis"])
 
+    # Relecture de #9435 : une accolade dans une JSDoc ne ferme pas le type.
+    def test_temoin_accolade_dans_un_commentaire_ne_tronque_pas_le_type(self):
+        types = {"types.ts": """
+export interface Enveloppe {
+  /** Forme `{ items }` ; l'ancienne était `}` seule. */
+  items: string[];
+  total: number;
+}
+"""}
+        e = self.contrat("fetchJSON<Enveloppe>(`${BASE}/enveloppe`);", types)
+        self.assertEqual(e["champs_obligatoires"], ["items", "total"])
+
 
 # Suffixe de requête porté par une constante locale (carte a10e41183, #9362).
 #
@@ -251,6 +263,76 @@ class SuffixeDeRequeteLocal(UrlsContrat):
               return fetchJSON<Track[]>(`${BASE}/radios${suite}`);
             }""",
             "/radios{}",
+        )
+
+    # Relecture de #9435 : une RÉAFFECTATION après la déclaration peut faire
+    # du suffixe un segment de chemin ; le retirer masquerait la vraie route.
+    def test_contre_temoin_reaffectation_composee(self):
+        self.exige(
+            """export function f(x?: string) {
+              let q = x ? `?x=${x}` : '';
+              q += '/extra';
+              return fetchJSON<Track[]>(`${BASE}/radios${q}`);
+            }""",
+            "/radios{}",
+        )
+
+    def test_contre_temoin_reaffectation_simple(self):
+        self.exige(
+            """export function f(x?: string) {
+              let q = x ? `?x=${x}` : '';
+              if (x === 'a') q = '/x';
+              return fetchJSON<Track[]>(`${BASE}/radios${q}`);
+            }""",
+            "/radios{}",
+        )
+
+    def test_temoin_comparaison_n_est_pas_une_reaffectation(self):
+        self.exige(
+            """export function f(x?: string) {
+              const q = x ? `?x=${x}` : '';
+              if (q === '' || q == null) console.log(q);
+              return fetchJSON<Track[]>(`${BASE}/radios${q}`);
+            }""",
+            "/radios",
+        )
+
+    # Une méthode d'objet est une fonction : sa constante n'appartient pas à
+    # la méthode voisine.
+    def test_contre_temoin_constante_d_une_methode_voisine(self):
+        self.exige(
+            """export const api = {
+              a(d?: string) {
+                const suite = d ? `?d=${d}` : '';
+                return suite;
+              },
+              b() {
+                return fetchJSON<Track[]>(`${BASE}/radios${suite}`);
+              },
+            };""",
+            "/radios{}",
+        )
+
+    def test_temoin_un_bloc_if_ne_borne_pas_la_fonction(self):
+        self.exige(
+            """export function f(d?: string) {
+              const suite = d ? `?d=${d}` : '';
+              if (d) {
+                return fetchJSON<Track[]>(`${BASE}/radios${suite}`);
+              }
+            }""",
+            "/radios",
+        )
+
+    # `/${suite}` est un segment de chemin, même si la constante ressemble à
+    # une requête : la garde qui le protège doit rester (mutant tué).
+    def test_contre_temoin_suffixe_apres_une_barre_reste_un_parametre(self):
+        self.exige(
+            """export function f(d?: string) {
+              const suite = d ? `?d=${d}` : '';
+              return fetchJSON<Track[]>(`${BASE}/radios/${suite}`);
+            }""",
+            "/radios/{}",
         )
 
 
