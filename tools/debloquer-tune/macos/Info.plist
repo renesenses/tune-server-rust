@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>fr</string>
+  <key>CFBundleDisplayName</key>
+  <string>Débloquer Tune</string>
+  <key>CFBundleName</key>
+  <string>Débloquer Tune</string>
+  <key>CFBundleExecutable</key>
+  <string>debloquer-tune</string>
+  <key>CFBundleIdentifier</key>
+  <string>fr.mozaiklabs.debloquer-tune</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>__VERSION__</string>
+  <key>CFBundleVersion</key>
+  <string>__VERSION__</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>11.0</string>
+  <!-- Aucune fenêtre : l'interface est la page ouverte dans le navigateur.
+       L'outil s'arrête seul quand la page est fermée (5 min sans signe de vie). -->
+  <key>LSUIElement</key>
+  <true/>
+  <!-- macOS 15+ : sans ces deux clés, la découverte mDNS et l'accès au Tune du
+       réseau local sont refusés en silence. -->
+  <key>NSLocalNetworkUsageDescription</key>
+  <string>Débloquer Tune parle à votre serveur Tune sur le réseau local pour activer l'authentification et lancer sa mise à jour. / Unblock Tune talks to your Tune server on the local network to turn on authentication and start its update.</string>
+  <key>NSBonjourServices</key>
+  <array>
+    <string>_tune-server._tcp</string>
+  </array>
+</dict>
+</plist>

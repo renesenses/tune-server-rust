@@ -1056,6 +1056,9 @@ jobs:
       # L'audit de la racine ne couvre donc pas ses dépendances (#6503).
       - name: Auditer le verrou du moissonneur Roon
         run: cargo audit --file tools/moissonneur-roon/Cargo.lock --deny warnings
+      # Même raison pour « Débloquer Tune », lui aussi hors workspace.
+      - name: Auditer le verrou de Débloquer Tune
+        run: cargo audit --file tools/debloquer-tune/Cargo.lock --deny warnings
 
   ffi:
     name: FFI mobile (compilation)
