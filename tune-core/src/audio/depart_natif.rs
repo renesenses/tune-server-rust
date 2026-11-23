@@ -371,6 +371,125 @@ fn flac(f: &mut File, taille: u64, position_ms: u64) -> Option<DepartNatif> {
     })
 }
 
+// ──────────────────────── SEEKTABLE (#9174) ────────────────────────
+
+/// Un point d'index toutes les 10 s, comme `flac` par défaut.
+const INTERVALLE_SEEKTABLE_S: u64 = 10;
+
+/// #9174 — le même FLAC, avec une SEEKTABLE (un point toutes les 10 s)
+/// juste après STREAMINFO ; une SEEKTABLE déjà présente est remplacée.
+///
+/// Le FLAC pré-transcodé pour un navigateur tiré à distance (encodeur natif,
+/// remux DASH) n'en a pas : un `Range` au milieu du fichier ne tombe pas sur
+/// une trame et le `<audio>` cale (0.9.42). Les décalages sont ceux des
+/// en-têtes de trame RÉELS (synchro, CRC-8, signature de la première trame,
+/// numéros strictement croissants d'au plus une taille de bloc).
+///
+/// `None` quand ce n'est pas un FLAC lisible : l'appelant sert l'original.
+pub fn avec_seektable(flac: &[u8]) -> Option<Vec<u8>> {
+    if flac.get(..4)? != b"fLaC" {
+        return None;
+    }
+    let mut blocs: Vec<(u8, &[u8])> = Vec::new();
+    let mut pos = 4usize;
+    loop {
+        let h = flac.get(pos..pos + 4)?;
+        let dernier = h[0] & 0x80 != 0;
+        let len = u32::from_be_bytes([0, h[1], h[2], h[3]]) as usize;
+        blocs.push((h[0] & 0x7F, flac.get(pos + 4..pos + 4 + len)?));
+        pos += 4 + len;
+        if dernier {
+            break;
+        }
+    }
+    let debut_trames = pos;
+    let (kind0, si) = *blocs.first()?;
+    if kind0 != 0 {
+        return None;
+    }
+    let info = lire_streaminfo(si)?;
+    if info.cadence == 0 {
+        return None;
+    }
+    let pas_max = if info.bloc_max > 0 {
+        info.bloc_max as u64
+    } else {
+        u16::MAX as u64 + 1
+    };
+    let intervalle = INTERVALLE_SEEKTABLE_S * info.cadence as u64;
+
+    // Les trames, dans l'ordre : (décalage depuis la première, échantillon).
+    let mut trames: Vec<(u64, u64)> = Vec::new();
+    let mut signature = None;
+    let mut i = debut_trames;
+    while i + 1 < flac.len() {
+        if flac[i] == 0xFF
+            && (flac[i + 1] & 0xFE) == 0xF8
+            && let Some((s, sig)) = premier_echantillon_de_trame(&flac[i..], &info)
+            && signature.is_none_or(|attendue| attendue == sig)
+            && trames
+                .last()
+                .is_none_or(|&(_, prec)| s > prec && s - prec <= pas_max)
+        {
+            signature = Some(sig);
+            trames.push(((i - debut_trames) as u64, s));
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    if trames.is_empty() {
+        return None;
+    }
+    let total = if info.total > 0 {
+        info.total
+    } else {
+        trames.last()?.1 + pas_max
+    };
+    let mut points = Vec::new();
+    let mut prochain = 0u64;
+    for (k, &(decalage, s)) in trames.iter().enumerate() {
+        if s < prochain {
+            continue;
+        }
+        let suivant = trames.get(k + 1).map_or(total, |t| t.1);
+        let dans_la_trame = suivant.saturating_sub(s).min(u16::MAX as u64) as u16;
+        points.extend_from_slice(&s.to_be_bytes());
+        points.extend_from_slice(&decalage.to_be_bytes());
+        points.extend_from_slice(&dans_la_trame.to_be_bytes());
+        prochain = (s / intervalle + 1) * intervalle;
+    }
+
+    let mut gardes: Vec<(u8, &[u8])> = Vec::with_capacity(blocs.len() + 1);
+    gardes.push(blocs[0]);
+    gardes.push((3, &points));
+    gardes.extend(blocs[1..].iter().copied().filter(|(k, _)| *k != 3));
+    let mut out = Vec::with_capacity(flac.len() + points.len() + 4);
+    out.extend_from_slice(b"fLaC");
+    let n = gardes.len();
+    for (k, (kind, corps)) in gardes.into_iter().enumerate() {
+        let drapeau = if k + 1 == n { 0x80 } else { 0 };
+        out.push(drapeau | kind);
+        out.extend_from_slice(&(corps.len() as u32).to_be_bytes()[1..]);
+        out.extend_from_slice(corps);
+    }
+    out.extend_from_slice(&flac[debut_trames..]);
+    Some(out)
+}
+
+/// #9174 — [`avec_seektable`] sur un fichier : le réécrit indexé et rend sa
+/// nouvelle taille. Un fichier que l'index ne sait pas lire reste tel quel.
+pub fn indexer_un_flac(chemin: &str) -> Result<u64, String> {
+    let brut = std::fs::read(chemin).map_err(|e| format!("seektable read: {e}"))?;
+    match avec_seektable(&brut) {
+        Some(indexe) => {
+            std::fs::write(chemin, &indexe).map_err(|e| format!("seektable write: {e}"))?;
+            Ok(indexe.len() as u64)
+        }
+        None => Ok(brut.len() as u64),
+    }
+}
+
 // ───────────────────────────── AIFF ─────────────────────────────
 
 /// Un flottant IEEE 754 étendu 80 bits (cadence AIFF).

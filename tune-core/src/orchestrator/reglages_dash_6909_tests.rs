@@ -56,21 +56,21 @@ fn le_wav_force_par_la_zone_l_emporte_sur_la_sonde_et_sur_le_flac_natif() {
         plafond_16: false,
     };
     // Un renderer qui annonce `audio/flac` : la sonde n'est même pas posée.
-    assert_eq!(format_dash_impose(false, wav, false, false), Some("wav"));
-    assert_eq!(format_dash_impose(false, wav, false, true), Some("wav"));
+    assert_eq!(format_dash_impose(false, wav, false, false, false), Some("wav"));
+    assert_eq!(format_dash_impose(false, wav, false, true, false), Some("wav"));
     // Sans réglage, rien n'est imposé : la sonde décide, comme avant.
     assert_eq!(
-        format_dash_impose(false, ReglagesDash::default(), false, false),
+        format_dash_impose(false, ReglagesDash::default(), false, false, false),
         None
     );
     assert_eq!(
-        format_dash_impose(false, ReglagesDash::default(), false, true),
+        format_dash_impose(false, ReglagesDash::default(), false, true, false),
         Some("flac")
     );
     assert_eq!(
-        format_dash_impose(true, ReglagesDash::default(), false, true),
+        format_dash_impose(true, ReglagesDash::default(), false, true, false),
         Some("wav"),
-        "navigateur : toujours WAV"
+        "navigateur en local : toujours WAV"
     );
 }
 

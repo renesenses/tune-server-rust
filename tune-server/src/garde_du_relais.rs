@@ -239,6 +239,17 @@ pub async fn garde_du_relais(
     request: Request,
     next: Next,
 ) -> Response {
+    // #9174 — d'où écoute le lecteur d'une zone navigateur : un flux tiré par
+    // le relais part en FLAC indexé, pas en WAV.
+    if let Some((zone, a_distance)) =
+        tune_core::orchestrator::flux_a_distance_9174::provenance_d_une_requete_de_zone(
+            request.method().as_str(),
+            request.uri().path(),
+            requete_relayee(request.headers()),
+        )
+    {
+        state.orchestrator.noter_provenance_de_zone(zone, a_distance);
+    }
     if !requete_relayee(request.headers()) {
         return next.run(request).await;
     }
