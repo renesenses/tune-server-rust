@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use tracing::warn;
 
-use super::ecoute::Ecoute;
+use super::ecoute::{BilanEcoute, Ecoute};
 use super::sortie::{ContexteAir, DevialetAirOutput};
 use crate::outputs::traits::{OutputProvider, OutputTarget, ProviderContext};
 
@@ -60,6 +60,37 @@ pub fn nom_de_zone(nom_annonce: &str) -> String {
     }
 }
 
+/// #9380 — la phrase du rapport quand aucun ampli n'est présent : ce que
+/// l'écoute a reçu, sans laisser croire à une panne quand rien n'est attendu.
+#[must_use]
+pub fn resume_du_bilan(activee: bool, en_ecoute: bool, port: u16, bilan: &BilanEcoute) -> String {
+    if !activee {
+        return "option off — nothing is searched, no amplifier expected".to_string();
+    }
+    if let Some(erreur) = &bilan.ouverture_refusee {
+        return format!("cannot listen on UDP {port}: {erreur}");
+    }
+    if !en_ecoute {
+        return format!("not listening on UDP {port} yet");
+    }
+    if bilan.datagrammes == 0 {
+        return format!(
+            "listening on UDP {port}, nothing received (no amplifier announcement reaches this computer)"
+        );
+    }
+    let mut phrase = format!(
+        "listening on UDP {port}: {} datagram(s) received, {} valid announcement(s), {} ignored",
+        bilan.datagrammes, bilan.annonces, bilan.ecartes
+    );
+    if let Some(e) = &bilan.dernier_ecarte {
+        phrase.push_str(&format!(
+            " (last ignored: {} bytes, header \"{}\", {})",
+            e.taille, e.entete, e.raison
+        ));
+    }
+    phrase
+}
+
 #[async_trait::async_trait]
 impl OutputProvider for FournisseurDevialetAir {
     fn provider_name(&self) -> &str {
@@ -92,5 +123,27 @@ impl OutputProvider for FournisseurDevialetAir {
                 )) as Box<dyn OutputTarget>
             })
             .collect()
+    }
+
+    fn discovery_report(&self) -> Option<serde_json::Value> {
+        let activee = (self.contexte.activee)();
+        let en_ecoute = self.ecoute.en_ecoute();
+        let bilan = self.ecoute.bilan();
+        let port = self.contexte.ports.annonces;
+        Some(serde_json::json!({
+            "enabled": activee,
+            "listening": en_ecoute,
+            "port": port,
+            "datagrams": bilan.datagrammes,
+            "announcements": bilan.annonces,
+            "ignored": bilan.ecartes,
+            "last_ignored": bilan.dernier_ecarte.as_ref().map(|e| serde_json::json!({
+                "size": e.taille,
+                "header": e.entete,
+                "reason": e.raison,
+            })),
+            "listen_error": bilan.ouverture_refusee,
+            "summary": resume_du_bilan(activee, en_ecoute, port, &bilan),
+        }))
     }
 }

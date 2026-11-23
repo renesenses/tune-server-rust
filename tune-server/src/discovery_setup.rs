@@ -3431,13 +3431,19 @@ pub fn spawn_output_providers(
             let mut statuts = Vec::with_capacity(providers.len());
             for provider in &providers {
                 let trouves = provider.discover(&ctx).await;
-                statuts.push(statut_du_fournisseur(
+                let mut statut = statut_du_fournisseur(
                     provider.provider_name(),
                     provider.required_module(),
                     trouves.len(),
                     &ctx.licensed_modules,
                     compte_lie,
-                ));
+                );
+                // #9380 — ce que le fournisseur dit de sa recherche (option
+                // coupée, rien reçu, formes inconnues), lu par le rapport.
+                if let Some(recherche) = provider.discovery_report() {
+                    statut["discovery"] = recherche;
+                }
+                statuts.push(statut);
                 for output in trouves {
                     let dev_id = output.device_id().to_string();
                     let name = output.name().to_string();
