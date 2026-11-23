@@ -207,17 +207,40 @@ def champs_du_bloc(bloc: str) -> tuple[list[str], list[str]]:
 
 
 def corps_apres_accolade(texte: str, debut: int) -> str | None:
-    """Le contenu entre l'accolade ouvrante en `debut` et sa fermante."""
+    """Le contenu entre l'accolade ouvrante en `debut` et sa fermante.
+
+    Les accolades des commentaires et des chaînes ne comptent pas : un `}` dans
+    une JSDoc (« l'ancienne forme était `}` ») tronquait le type, et ses
+    champs suivants disparaissaient de la carte (relecture de #9435).
+    """
     if debut >= len(texte) or texte[debut] != "{":
         return None
-    profondeur = 0
-    for i in range(debut, len(texte)):
-        if texte[i] == "{":
+    profondeur, i = 0, debut
+    while i < len(texte):
+        car = texte[i]
+        if car in "'\"`":
+            fin = i + 1
+            while fin < len(texte) and texte[fin] != car and texte[fin] != "\n":
+                fin += 2 if texte[fin] == "\\" else 1
+            i = fin + 1
+            continue
+        if texte.startswith("//", i):
+            fin = texte.find("\n", i)
+            i = len(texte) if fin < 0 else fin
+            continue
+        if texte.startswith("/*", i):
+            fin = texte.find("*/", i + 2)
+            if fin < 0:
+                return None
+            i = fin + 2
+            continue
+        if car == "{":
             profondeur += 1
-        elif texte[i] == "}":
+        elif car == "}":
             profondeur -= 1
             if profondeur == 0:
                 return texte[debut + 1 : i]
+        i += 1
     return None
 
 
@@ -342,7 +365,17 @@ def suffixe_requete_conditionnel(expression: str) -> bool:
 
 
 # Le début de la fonction de l'appel : la constante doit y être déclarée.
-DEBUT_DE_FONCTION = re.compile(r"^[ \t]*(?:export\s|(?:async\s+)?function\s)", re.M)
+# Une méthode d'objet (`a(d) {`) et une fonction fléchée à corps (`=> {`)
+# bornent aussi : sans cela, la méthode `b()` lisait la constante de sa
+# voisine `a()` (relecture de #9435). Les mots-clés de contrôle (`if (…) {`,
+# `for`, `while`, `switch`, `catch`) ouvrent un bloc, pas une fonction.
+DEBUT_DE_FONCTION = re.compile(
+    r"^[ \t]*(?:export\s|(?:async\s+)?function[\s*]"
+    r"|(?:async\s+)?(?!(?:if|for|while|switch|catch|with|return|function)\b)"
+    r"[A-Za-z_$][\w$]*\s*\([^()\n]*\)\s*(?::[^{\n]*)?\{[ \t]*$)"
+    r"|=>[ \t]*\{[ \t]*$",
+    re.M,
+)
 
 # `const suite = dossier ? `?${…}` : '';` — une constante locale d'une ligne.
 MOTIF_CONSTANTE_LOCALE = r"\b(?:const|let)\s+{nom}\s*=\s*(?P<expr>[^\n]*?);[ \t]*(?://[^\n]*)?$"
@@ -370,7 +403,17 @@ def sans_suffixe_de_requete_local(route: str, avant: str) -> str:
     motif = re.compile(MOTIF_CONSTANTE_LOCALE.format(nom=re.escape(m.group("nom"))), re.M)
     declarations = list(motif.finditer(fonction))
     if len(declarations) != 1:
-        return route  # absente, ou réaffectée : rien de sûr à lire
+        return route  # absente, ou redéclarée : rien de sûr à lire
+    # Une RÉAFFECTATION (`q += '/extra'`, `q = '/x'`, `q++`) peut faire du
+    # suffixe un segment de chemin : on refuse dès qu'il y en a une hors de la
+    # déclaration (relecture de #9435). `==`, `===` et `=>` n'affectent rien.
+    affectation = re.compile(
+        r"(?<![\w$.])" + re.escape(m.group("nom"))
+        + r"\s*(?:(?:\+|-|\*|/|%|\*\*|<<|>>>?|&|\||\^|&&|\|\||\?\?)?=(?![=>])|\+\+|--)"
+    )
+    for a in affectation.finditer(fonction):
+        if not declarations[0].start() <= a.start() < declarations[0].end():
+            return route
     if not suffixe_requete_conditionnel(declarations[0].group("expr")):
         return route
     return route[:m.start()]
