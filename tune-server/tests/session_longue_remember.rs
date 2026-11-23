@@ -259,3 +259,167 @@ async fn changer_le_mot_de_passe_invalide_la_session_longue() {
         .unwrap();
     assert_eq!(moi(&state, &long).await, StatusCode::UNAUTHORIZED);
 }
+
+async fn appel_avec(
+    state: &AppState,
+    methode: Method,
+    chemin: &str,
+    entetes: &[(&str, String)],
+) -> StatusCode {
+    let pair: SocketAddr = DISTANT.parse().unwrap();
+    let app: Router = tune_server::routes::router(state.clone()).layer(MockConnectInfo(pair));
+    let mut req = Request::builder().method(methode).uri(chemin);
+    for (k, v) in entetes {
+        req = req.header(*k, v.as_str());
+    }
+    app.oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+async fn long_de(state: &AppState, nom: &str) -> String {
+    connexion(state, nom, r#","remember":true"#).await["token"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+fn sessions_inscrites(state: &AppState) -> usize {
+    SettingsRepo::with_backend(state.backend.clone())
+        .par_prefixe("auth_session_token:")
+        .unwrap()
+        .len()
+}
+
+#[tokio::test]
+async fn la_deconnexion_desinscrit_la_session_longue_bearer_ou_cookie() {
+    let state = preparer();
+    let par_entete = long_de(&state, "alice").await;
+    let par_cookie = long_de(&state, "alice").await;
+    assert_eq!(moi(&state, &par_entete).await, StatusCode::OK);
+    assert_eq!(moi(&state, &par_cookie).await, StatusCode::OK);
+
+    let st = appel_avec(
+        &state,
+        Method::POST,
+        "/api/v1/auth/logout",
+        &[("authorization", format!("Bearer {par_entete}"))],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(moi(&state, &par_entete).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(moi(&state, &par_cookie).await, StatusCode::OK, "l'autre reste");
+
+    let st = appel_avec(
+        &state,
+        Method::POST,
+        "/api/v1/auth/logout",
+        &[("cookie", format!("theme=sombre; tune_session={par_cookie}"))],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(moi(&state, &par_cookie).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(sessions_inscrites(&state), 0);
+}
+
+#[tokio::test]
+async fn le_nombre_de_sessions_longues_par_compte_est_plafonne() {
+    let state = preparer();
+    let autre = long_de(&state, "proprio").await;
+    let premiere = long_de(&state, "alice").await;
+    let mut derniere = String::new();
+    for _ in 0..20 {
+        derniere = long_de(&state, "alice").await;
+    }
+    assert_eq!(sessions_inscrites(&state), 21, "20 pour alice + 1 pour proprio");
+    assert_eq!(moi(&state, &premiere).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(moi(&state, &derniere).await, StatusCode::OK);
+    assert_eq!(moi(&state, &autre).await, StatusCode::OK, "autre compte intact");
+}
+
+#[tokio::test]
+async fn retrograder_l_admin_invalide_sa_session_longue() {
+    let state = preparer();
+    let long = long_de(&state, "proprio").await;
+    assert_eq!(moi(&state, &long).await, StatusCode::OK);
+    state
+        .backend
+        .execute("UPDATE profiles SET is_admin = 0 WHERE username = 'proprio'", &[])
+        .unwrap();
+    assert_eq!(moi(&state, &long).await, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn supprimer_le_compte_invalide_sa_session_longue() {
+    let state = preparer();
+    let long = long_de(&state, "alice").await;
+    assert_eq!(moi(&state, &long).await, StatusCode::OK);
+    state
+        .backend
+        .execute("DELETE FROM profiles WHERE username = 'alice'", &[])
+        .unwrap();
+    assert_eq!(moi(&state, &long).await, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn websocket_jeton_en_parametre_et_cookie_suivent_la_revocation() {
+    let state = preparer();
+    let long = long_de(&state, "alice").await;
+    let vide = axum::http::HeaderMap::new();
+    let mut cookie = axum::http::HeaderMap::new();
+    cookie.insert(
+        header::COOKIE,
+        format!("tune_session={long}").parse().unwrap(),
+    );
+    assert!(tune_server::auth::ws_authorized(&state, &vide, Some(&long)));
+    assert!(tune_server::auth::ws_authorized(&state, &cookie, None));
+
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    for (cle, _) in reglages.par_prefixe("auth_session_token:").unwrap() {
+        reglages.delete(&cle).unwrap();
+    }
+    assert!(!tune_server::auth::ws_authorized(&state, &vide, Some(&long)));
+    assert!(!tune_server::auth::ws_authorized(&state, &cookie, None));
+}
+
+#[tokio::test]
+async fn le_relais_n_ouvre_pas_les_routes_des_sessions() {
+    let state = preparer();
+    let admin = connexion(&state, "proprio", "").await["token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let _ = long_de(&state, "alice").await;
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    let cle = reglages.par_prefixe("auth_session_token:").unwrap()[0].0.clone();
+    let id = cle.trim_start_matches("auth_session_token:").to_string();
+    let relaye = |j: &str| {
+        vec![
+            ("authorization", format!("Bearer {j}")),
+            (tune_core::cloud::ENTETE_RELAIS, "1".to_string()),
+        ]
+    };
+
+    let st = appel_avec(&state, Method::GET, "/api/v1/auth/sessions", &relaye(&admin)).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "liste par le relais");
+    let st = appel_avec(
+        &state,
+        Method::DELETE,
+        &format!("/api/v1/auth/sessions/{id}"),
+        &relaye(&admin),
+    )
+    .await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "révocation par le relais");
+    assert_eq!(sessions_inscrites(&state), 1, "rien n'a été révoqué");
+
+    // Témoin : sans le relais, la même liste répond.
+    let st = appel_avec(
+        &state,
+        Method::GET,
+        "/api/v1/auth/sessions",
+        &[("authorization", format!("Bearer {admin}"))],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+}
