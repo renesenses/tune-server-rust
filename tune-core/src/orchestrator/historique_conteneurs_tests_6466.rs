@@ -626,3 +626,116 @@ async fn reprise_fabien_7280_melange_client_avant_confirmation_ne_cree_pas_de_re
     );
     assert_eq!(rows[0].last_track_title, "Release My Heart");
 }
+
+/// 🔴 Fil 3009, point 4 (FabienM, rc13) — « Reprise d'un album ou d'une
+/// playlist : l'historique affiche les titres en 1re ligne, il manque le
+/// conteneur de la reprise ». Un album lancé par « Lire » laisse ses lignes de
+/// file à NULL : son conteneur est la SESSION de la zone, tenue en mémoire.
+/// Le serveur redémarre, la session est perdue, la lecture reprend la file :
+/// les titres repris doivent rester rangés dans l'album.
+///
+/// Contre-épreuve (mesurée) : sans le repli de `contexte_de_l_ecoute` sur
+/// `contexte_de_la_ligne_reprise`, la ligne reprise s'écrit sans conteneur.
+#[tokio::test]
+async fn la_reprise_apres_redemarrage_reste_dans_son_album_3009() {
+    let b = Banc::monter().await;
+    b.lire_l_album(b.salon).await;
+    b.jouer(b.salon, 0).await;
+    // Le redémarrage : la session de la zone est perdue, la file reste.
+    b.orch
+        .playback
+        .set_session_context(b.salon, None, None, None, None, None)
+        .await;
+    b.jouer(b.salon, 1).await;
+    assert_eq!(
+        b.historique(),
+        vec![
+            (
+                "Even Thieves Come Clean".into(),
+                b.salon,
+                Some("album".into()),
+                Some("album-1".into())
+            ),
+            (
+                "Release My Heart".into(),
+                b.salon,
+                Some("album".into()),
+                Some("album-1".into())
+            ),
+        ],
+        "le titre repris doit rester rangé dans son album"
+    );
+}
+
+/// Le pendant : une ligne qui n'appartient à aucune reprise enregistrée
+/// (jamais démarrée dans un conteneur) reste au premier niveau.
+#[tokio::test]
+async fn sans_reprise_enregistree_rien_n_est_invente_3009() {
+    let b = Banc::monter().await;
+    PlayQueueRepo::with_backend(b.db.clone())
+        .append(b.salon, &[piste("x:1", "Seule")])
+        .unwrap();
+    b.jouer(b.salon, 0).await;
+    assert_eq!(b.historique(), vec![("Seule".into(), b.salon, None, None)]);
+}
+
+/// Relecture du 23/11 — une écoute de RADIO (zone sans session : la station a
+/// effacé celle de l'album, #6465) ne lit aucune reprise, et ne consomme pas
+/// la recherche de la zone.
+#[tokio::test]
+async fn une_ecoute_de_radio_ne_lit_aucune_reprise_3009() {
+    let b = Banc::monter().await;
+    b.lire_l_album(b.salon).await;
+    b.jouer(b.salon, 0).await;
+    b.orch.playback.effacer_contexte_de_session(b.salon).await;
+    b.orch
+        .playback
+        .play(
+            b.salon,
+            crate::playback::NowPlaying {
+                title: "FIP".into(),
+                source: "radio".into(),
+                source_id: Some("https://radio.invalid/fip".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+    let etat = b.orch.playback.get_state(b.salon).await;
+    let contexte = b
+        .orch
+        .contexte_de_l_ecoute(&etat, None, Some("https://radio.invalid/fip"));
+    assert_eq!(contexte.0, None, "une radio n'est rangée dans aucun album");
+    assert!(
+        !b.orch
+            .zones_reprise_cherchee
+            .lock()
+            .unwrap()
+            .contains(&b.salon),
+        "aucune reprise n'a été lue pour une écoute de radio"
+    );
+}
+
+/// Relecture du 23/11 — la recherche n'a lieu qu'UNE fois par zone depuis le
+/// démarrage : trouvée, l'album redevient la session de la zone.
+#[tokio::test]
+async fn la_reprise_n_est_cherchee_qu_une_fois_par_zone_3009() {
+    let b = Banc::monter().await;
+    b.lire_l_album(b.salon).await;
+    b.jouer(b.salon, 0).await;
+    b.orch.playback.effacer_contexte_de_session(b.salon).await;
+    b.jouer(b.salon, 1).await;
+    assert!(
+        b.orch
+            .zones_reprise_cherchee
+            .lock()
+            .unwrap()
+            .contains(&b.salon)
+    );
+    tokio::task::yield_now().await;
+    let etat = b.orch.playback.get_state(b.salon).await;
+    assert_eq!(
+        etat.session_context_type.as_deref(),
+        Some("album"),
+        "le conteneur retrouvé redevient la session de la zone"
+    );
+}
