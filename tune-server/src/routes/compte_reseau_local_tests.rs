@@ -865,6 +865,104 @@ async fn reseau_local_delier_puis_relier_un_autre_compte_est_refuse() {
     assert_eq!(courriel_relie(&b.state), "proprio@exemple.test");
 }
 
+// ─── Relecture D2/D3 : un retour à la fois ──────────────────────────────────
+
+/// Un faux mozaiklabs.fr à deux comptes : le code `a` donne le jeton
+/// `jeton-a` et le compte `a@exemple.test` (id 101), le code `b` le jeton
+/// `jeton-b` et le compte `b@exemple.test` (id 102).
+async fn faux_mozaiklabs_a_deux_comptes() -> String {
+    use axum::routing::{get, post};
+    let app = axum::Router::new()
+        .route(
+            "/oauth/token",
+            post(
+                |axum::Form(f): axum::Form<std::collections::HashMap<String, String>>| async move {
+                    let code = f.get("code").cloned().unwrap_or_default();
+                    axum::Json(serde_json::json!({
+                        "access_token": format!("jeton-{code}"),
+                        "refresh_token": format!("renouv-{code}"),
+                        "expires_in": 3600
+                    }))
+                },
+            ),
+        )
+        .route(
+            "/api/v1/user",
+            get(|entetes: axum::http::HeaderMap| async move {
+                let jeton = entetes
+                    .get("authorization")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or_default()
+                    .trim_start_matches("Bearer ")
+                    .to_string();
+                let (id, qui) = if jeton == "jeton-a" {
+                    (101, "a")
+                } else {
+                    (102, "b")
+                };
+                axum::Json(serde_json::json!({
+                    "id": id,
+                    "email": format!("{qui}@exemple.test"),
+                    "display_name": qui,
+                    "is_admin": false,
+                    "avatar_url": null
+                }))
+            }),
+        )
+        .fallback(|| async { StatusCode::NOT_FOUND });
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let adresse = ecoute.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(ecoute, app).await.ok();
+    });
+    format!("http://{adresse}")
+}
+
+/// 18. Deux retours SIMULTANÉS de la même liaison (même `state`, codes
+/// différents), forcés à lire l'attente en même temps : une seule liaison
+/// aboutit, et la fin est cohérente (le jeton et l'identité du même compte).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn deux_retours_simultanes_une_seule_liaison_coherente() {
+    let b = banc();
+    let base = faux_mozaiklabs_a_deux_comptes().await;
+    reglages(&b.state).set("mozaik_base_url", &base).unwrap();
+    let hote = [("host", "127.0.0.1:8888")];
+    let (statut, page) = get(&b.state, ICI, AUTORISER, &hote).await;
+    assert_eq!(statut, StatusCode::TEMPORARY_REDIRECT, "{page}");
+    let etat = json_de(&attente_du_serveur(&b.state))["state"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    super::rendez_vous_de_test::armer(&etat);
+
+    let retour = |code: &'static str| {
+        let state = b.state.clone();
+        let uri = format!("/api/v1/cloud/sso/callback?code={code}&state={etat}");
+        tokio::spawn(async move { get(&state, ICI, &uri, &[("host", "127.0.0.1:8888")]).await })
+    };
+    let (ra, rb) = tokio::join!(retour("a"), retour("b"));
+    let (sa, pa) = ra.unwrap();
+    let (sb, pb) = rb.unwrap();
+    let reussis = [sa, sb]
+        .iter()
+        .filter(|s| **s == StatusCode::TEMPORARY_REDIRECT)
+        .count();
+    assert_eq!(
+        reussis, 1,
+        "le `state` ne sert qu'une fois : {sa} {pa} / {sb} {pb}"
+    );
+    let jeton = reglages(&b.state)
+        .get("mozaik_access_token")
+        .unwrap()
+        .unwrap_or_default();
+    let courriel = courriel_relie(&b.state);
+    assert!(
+        (jeton == "jeton-a" && courriel == "a@exemple.test")
+            || (jeton == "jeton-b" && courriel == "b@exemple.test"),
+        "jeton {jeton} avec le compte {courriel}"
+    );
+}
+
 /// Les phrases du refus de liaison existent dans les seize langues.
 #[test]
 fn les_phrases_du_refus_de_liaison_existent_dans_les_seize_langues() {

@@ -428,6 +428,16 @@ enum AttentePkce {
     EtatDifferent,
 }
 
+/// Une seule ronde de liaison à la fois dans le processus (relecture D2/D3) :
+/// tenu par chaque retour (`sso_callback`, `sso_callback_profil`) depuis la
+/// consommation de l'attente PKCE jusqu'à l'écriture de l'identité du compte.
+/// Lire puis effacer l'attente devient ainsi atomique (un `state` ne sert
+/// qu'une fois, même à deux retours simultanés), et le contrôle du compte
+/// obtenu, la session et `mozaik_user` s'écrivent d'un seul tenant : jamais le
+/// jeton d'un compte avec l'identité d'un autre.
+static VERROU_DE_LIAISON: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
 /// Lit l'attente PKCE `cle_pkce` et ne la CONSOMME (usage unique) que si le
 /// `state` reçu est exactement le sien. Un `state` faux la laisse en place :
 /// un retour forgé ne doit pas annuler une liaison en cours. Une attente
@@ -452,6 +462,10 @@ fn prendre_l_attente_pkce(
         .filter(|_| {
             emise.is_some_and(|t| maintenant_unix().saturating_sub(t) <= PKCE_EN_ATTENTE_MAX)
         });
+    #[cfg(test)]
+    if let Some(p) = &pending {
+        rendez_vous_de_test::apres_lecture(&p.state);
+    }
     let consommer = || {
         settings.set(cle_pkce, "").ok();
         settings.delete(&cle_date).ok();
@@ -530,6 +544,8 @@ async fn sso_callback(
     // consume it — one-shot, cleared regardless of the exchange outcome. A
     // wrong `state` leaves it in place: it must not cancel a pending link.
     let (cle_pkce, _) = cles_d_attente(Liaison::Serveur);
+    // Tenu jusqu'à l'écriture de `mozaik_user` (voir `VERROU_DE_LIAISON`).
+    let ronde = VERROU_DE_LIAISON.lock().await;
     let pkce = match prendre_l_attente_pkce(&settings, &cle_pkce, q.state.as_deref()) {
         Ok(pkce) => pkce,
         Err(AttentePkce::Absente) => {
@@ -635,6 +651,7 @@ async fn sso_callback(
             &serde_json::to_string(&user).unwrap_or_default(),
         )
         .ok();
+    drop(ronde);
 
     // Liaison du serveur au compte (#5325), à chaque connexion : le cloud
     // délivre un jeton que `library_sync` présente sur chaque `sync`. En tâche
@@ -873,6 +890,8 @@ async fn sso_callback_profil(
         );
     };
     let (cle_pkce, cle_uri) = cles_d_attente(Liaison::Profil(profil));
+    // Tenu jusqu'à l'écriture du compte du profil (voir `VERROU_DE_LIAISON`).
+    let ronde = VERROU_DE_LIAISON.lock().await;
     let pkce = match prendre_l_attente_pkce(&settings, &cle_pkce, q.state.as_deref()) {
         Ok(pkce) => pkce,
         Err(AttentePkce::Absente) => {
@@ -921,6 +940,7 @@ async fn sso_callback_profil(
     // Le jeton n'est PAS conservé : il ne sert qu'à établir l'identité.
     drop(token);
     enregistrer_compte_du_profil(state, profil, &user);
+    drop(ronde);
     info!(profil, "sso_liaison_du_profil");
     Redirect::temporary("/").into_response()
 }
@@ -3278,3 +3298,30 @@ mod cloud_garde_compte_tests;
 #[cfg(test)]
 #[path = "compte_reseau_local_tests.rs"]
 mod compte_reseau_local_tests;
+
+/// Rendez-vous de test : fait se croiser deux retours entre la LECTURE et
+/// l'EFFACEMENT d'une attente PKCE, pour prouver que `VERROU_DE_LIAISON` les
+/// sépare. Armé pour un seul `state` : les autres tests n'y passent pas. Sans
+/// partenaire, il rend la main au bout de 500 ms.
+#[cfg(test)]
+pub(super) mod rendez_vous_de_test {
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
+
+    static ETAT: Mutex<(Option<String>, usize)> = Mutex::new((None, 0));
+    static SIGNAL: Condvar = Condvar::new();
+
+    pub fn armer(state: &str) {
+        *ETAT.lock().unwrap() = (Some(state.to_string()), 0);
+    }
+
+    pub fn apres_lecture(state: &str) {
+        let mut etat = ETAT.lock().unwrap();
+        if etat.0.as_deref() != Some(state) {
+            return;
+        }
+        etat.1 += 1;
+        SIGNAL.notify_all();
+        let _ = SIGNAL.wait_timeout_while(etat, Duration::from_millis(500), |e| e.1 < 2);
+    }
+}
