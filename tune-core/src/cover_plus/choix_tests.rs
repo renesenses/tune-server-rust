@@ -325,12 +325,36 @@ fn un_vrai_album_live_plutot_qu_un_bonus_live() {
 /// § 3.4, critère 2 : « Various Artists » et best-of passent derrière.
 #[test]
 fn compilation_et_best_of_passent_derriere() {
-    let mut compil = morceau("Chicago", "Beginnings", "Soft Rock 70s", "compil", "1960-01-01", 40, 100);
+    let mut compil = morceau(
+        "Chicago",
+        "Beginnings",
+        "Soft Rock 70s",
+        "compil",
+        "1960-01-01",
+        40,
+        100,
+    );
     compil["collectionArtistName"] = json!("Various Artists");
     let r = vec![
         compil,
-        morceau("Chicago", "Beginnings", "Greatest Hits 1969-1974", "best", "1965-01-01", 12, 101),
-        morceau("Chicago", "Beginnings", "The Chicago Transit Authority", "cta", "1969-04-28", 12, 102),
+        morceau(
+            "Chicago",
+            "Beginnings",
+            "Greatest Hits 1969-1974",
+            "best",
+            "1965-01-01",
+            12,
+            101,
+        ),
+        morceau(
+            "Chicago",
+            "Beginnings",
+            "The Chicago Transit Authority",
+            "cta",
+            "1969-04-28",
+            12,
+            102,
+        ),
     ];
     let v = classer(&r, "Chicago", "Beginnings", None);
     assert!(v[0].url.contains("/cta/"), "{v:?}");

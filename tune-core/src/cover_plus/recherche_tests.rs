@@ -36,24 +36,26 @@ async fn faux_itunes(
     let reponse = Arc::new(reponse);
     let route = |chemin: &'static str| {
         let (journal, reponse) = (journal.clone(), reponse.clone());
-        axum::routing::get(move |Query(q): Query<HashMap<String, String>>, entetes: axum::http::HeaderMap| {
-            let (journal, reponse) = (journal.clone(), reponse.clone());
-            async move {
-                let mut q = q;
-                q.insert("_chemin".into(), chemin.into());
-                q.insert(
-                    "_agent".into(),
-                    entetes
-                        .get("user-agent")
-                        .and_then(|v| v.to_str().ok())
-                        .unwrap_or_default()
-                        .to_string(),
-                );
-                journal.lock().unwrap().push(q.clone());
-                let results = reponse(chemin, &q);
-                axum::Json(json!({ "resultCount": results.len(), "results": results }))
-            }
-        })
+        axum::routing::get(
+            move |Query(q): Query<HashMap<String, String>>, entetes: axum::http::HeaderMap| {
+                let (journal, reponse) = (journal.clone(), reponse.clone());
+                async move {
+                    let mut q = q;
+                    q.insert("_chemin".into(), chemin.into());
+                    q.insert(
+                        "_agent".into(),
+                        entetes
+                            .get("user-agent")
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                    journal.lock().unwrap().push(q.clone());
+                    let results = reponse(chemin, &q);
+                    axum::Json(json!({ "resultCount": results.len(), "results": results }))
+                }
+            },
+        )
     };
     let pages_journal = journal.clone();
     let app = axum::Router::new()
@@ -79,7 +81,9 @@ async fn faux_itunes(
                         );
                         journal.lock().unwrap().push(q);
                         let og = match nom.as_str() {
-                            "generique" => Some("https://music.apple.example/assets/meta/apple-music.png"),
+                            "generique" => {
+                                Some("https://music.apple.example/assets/meta/apple-music.png")
+                            }
                             "sans" => None,
                             _ => Some("https://is1.mzstatic.example/photo/1200x630cw.png"),
                         };
@@ -128,7 +132,9 @@ async fn boutique_de_la_station_puis_etats_unis_et_pochette_agrandie() {
     })
     .await;
     let prep = preparer("Roy Haynes - How Deep Is the Ocean", "FIP Jazz");
-    let url = chercher(source(&base), &prep, "FR", "FIP Jazz", false).await.map(|t| t.url);
+    let url = chercher(source(&base), &prep, "FR", "FIP Jazz", false)
+        .await
+        .map(|t| t.url);
     assert_eq!(
         url.as_deref(),
         Some("https://is1.mzstatic.example/ooa/600x600bb.jpg")
@@ -165,7 +171,9 @@ async fn la_discographie_classe_les_pochettes() {
     })
     .await;
     let prep = preparer("Weather Report - Black Market", "Jazz Radio 8452");
-    let url = chercher(source(&base), &prep, "US", "Jazz Radio 8452", false).await.map(|t| t.url);
+    let url = chercher(source(&base), &prep, "US", "Jazz Radio 8452", false)
+        .await
+        .map(|t| t.url);
     assert_eq!(
         url.as_deref(),
         Some("https://is1.mzstatic.example/bm/600x600bb.jpg")
@@ -183,7 +191,10 @@ async fn la_discographie_classe_les_pochettes() {
 async fn ce_qui_n_est_pas_un_morceau_ne_coute_aucun_appel() {
     let (base, journal) = faux_itunes(|_, _| Vec::new()).await;
     let prep = preparer("STOP ADBREAK 1", "Radio 8452");
-    assert_eq!(chercher(source(&base), &prep, "FR", "Radio 8452", true).await, None);
+    assert_eq!(
+        chercher(source(&base), &prep, "FR", "Radio 8452", true).await,
+        None
+    );
     assert!(journal.lock().unwrap().is_empty());
 }
 
@@ -201,7 +212,10 @@ async fn sans_concordance_pas_de_pochette() {
     })
     .await;
     let prep = preparer("Noname - Diddy Bop", "Radio 8452 bis");
-    assert_eq!(chercher(source(&base), &prep, "US", "Radio 8452 bis", false).await, None);
+    assert_eq!(
+        chercher(source(&base), &prep, "US", "Radio 8452 bis", false).await,
+        None
+    );
 }
 
 fn db() -> Arc<dyn DbBackend> {
@@ -365,9 +379,18 @@ async fn la_requete_du_remixeur_ne_part_que_dans_la_boutique_de_la_station() {
     assert_eq!(
         vus,
         vec![
-            ("CA".into(), "Lisa Leblanc Pourquoi faire aujourd'hui poirier".into()),
-            ("CA".into(), "Lisa Leblanc Pourquoi faire aujourd'hui".into()),
-            ("US".into(), "Lisa Leblanc Pourquoi faire aujourd'hui".into()),
+            (
+                "CA".into(),
+                "Lisa Leblanc Pourquoi faire aujourd'hui poirier".into()
+            ),
+            (
+                "CA".into(),
+                "Lisa Leblanc Pourquoi faire aujourd'hui".into()
+            ),
+            (
+                "US".into(),
+                "Lisa Leblanc Pourquoi faire aujourd'hui".into()
+            ),
         ]
     );
 }
@@ -413,7 +436,10 @@ async fn sans_pochette_la_photo_de_l_artiste_au_nom_exact() {
         .filter(|q| q["_chemin"] == "/artist")
         .collect();
     assert_eq!(pages.len(), 1);
-    assert_eq!(pages[0]["nom"], "tank", "jamais la page de « Tank And The Bangas »");
+    assert_eq!(
+        pages[0]["nom"], "tank",
+        "jamais la page de « Tank And The Bangas »"
+    );
     assert!(pages[0]["agent"].contains("Safari"), "{:?}", pages[0]);
     let artistes: Vec<_> = recherches(&journal)
         .into_iter()
@@ -444,7 +470,9 @@ async fn tank_ne_vaut_pas_tank_and_the_bangas() {
         None
     );
     assert!(
-        recherches(&journal).iter().all(|q| q["_chemin"] != "/artist"),
+        recherches(&journal)
+            .iter()
+            .all(|q| q["_chemin"] != "/artist"),
         "aucune page lue"
     );
 }
@@ -547,9 +575,23 @@ async fn sans_separateur_seule_l_egalite_exacte_compte() {
     let (base, _) = faux_itunes(|_, q| {
         if q.get("entity").map(String::as_str) == Some("song") {
             vec![
-                morceau("Air", "Sexy Boy (Remix)", "Remixes", "remix", "2000-01-01", 1),
+                morceau(
+                    "Air",
+                    "Sexy Boy (Remix)",
+                    "Remixes",
+                    "remix",
+                    "2000-01-01",
+                    1,
+                ),
                 morceau("Air", "Sexy Boy", "Moon Safari", "moon", "1998-01-16", 2),
-                morceau("Airbag", "Sexy Boy Blues", "Autre", "autre", "1990-01-01", 3),
+                morceau(
+                    "Airbag",
+                    "Sexy Boy Blues",
+                    "Autre",
+                    "autre",
+                    "1990-01-01",
+                    3,
+                ),
             ]
         } else {
             Vec::new()
@@ -573,7 +615,10 @@ async fn la_photo_suit_l_ordre_qui_reussit_sur_la_station() {
     let cellule: Base = Arc::default();
     let c = cellule.clone();
     let (base, journal) = faux_itunes(move |_, q| {
-        match (q.get("entity").map(String::as_str), q.get("term").map(String::as_str)) {
+        match (
+            q.get("entity").map(String::as_str),
+            q.get("term").map(String::as_str),
+        ) {
             (Some("song"), Some("GOOD TIMES BAD TIMES LED ZEPPELIN")) => vec![morceau(
                 "Led Zeppelin",
                 "Good Times Bad Times",
@@ -592,7 +637,10 @@ async fn la_photo_suit_l_ordre_qui_reussit_sur_la_station() {
     let t = chercher(source(&base), &prep, "FR", station, true).await;
     assert_eq!(t.map(|t| t.origine), Some(Origine::Pochette));
     let prep = preparer("WHERE IS MY MIND - PIXIES", station);
-    assert_eq!(artiste_pour_la_photo(station, &prep).as_deref(), Some("PIXIES"));
+    assert_eq!(
+        artiste_pour_la_photo(station, &prep).as_deref(),
+        Some("PIXIES")
+    );
     let t = chercher(source(&base), &prep, "FR", station, true).await;
     assert_eq!(t.map(|t| t.origine), Some(Origine::PhotoArtiste));
     assert!(
@@ -632,7 +680,10 @@ async fn allume_par_defaut_et_l_interrupteur_coupe_tout() {
         titre: "Kelly Watch the Stars",
         pochette_station: None,
     };
-    assert_eq!(pochette_du_titre_par(&db, &t, source(&base)), Decision::Rien);
+    assert_eq!(
+        pochette_du_titre_par(&db, &t, source(&base)),
+        Decision::Rien
+    );
     tokio::time::sleep(Duration::from_millis(50)).await;
     assert!(journal.lock().unwrap().is_empty());
 }
@@ -680,15 +731,24 @@ async fn un_titre_coute_quelques_appels_au_plus() {
         .iter()
         .filter(|q| q.get("entity").map(String::as_str) == Some("song"))
         .count();
-    assert!(morceaux <= 4, "{morceaux} recherches de morceaux : {appels:?}");
-    assert!(appels.len() <= 7, "{} appels pour un titre : {appels:?}", appels.len());
+    assert!(
+        morceaux <= 4,
+        "{morceaux} recherches de morceaux : {appels:?}"
+    );
+    assert!(
+        appels.len() <= 7,
+        "{} appels pour un titre : {appels:?}",
+        appels.len()
+    );
     // Seuls l'artiste, le titre, la boutique et les paramètres d'iTunes
     // partent : rien qui désigne l'auditeur.
     for q in &appels {
         for cle in q.keys() {
             assert!(
-                ["term", "entity", "country", "limit", "id", "_chemin", "_agent"]
-                    .contains(&cle.as_str()),
+                [
+                    "term", "entity", "country", "limit", "id", "_chemin", "_agent"
+                ]
+                .contains(&cle.as_str()),
                 "paramètre inattendu « {cle} » : {q:?}"
             );
         }

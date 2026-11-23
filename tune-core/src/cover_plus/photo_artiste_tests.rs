@@ -15,14 +15,23 @@ fn premier_nom_d_une_collaboration() {
 #[test]
 fn le_bandeau_devient_un_carre() {
     assert_eq!(
-        carre("https://is1-ssl.mzstatic.example/image/thumb/ab/1200x630cw.png", 600),
+        carre(
+            "https://is1-ssl.mzstatic.example/image/thumb/ab/1200x630cw.png",
+            600
+        ),
         "https://is1-ssl.mzstatic.example/image/thumb/ab/600x600cc.jpg"
     );
     assert_eq!(
-        carre("https://is1-ssl.mzstatic.example/image/thumb/ab/1200x630cw.png", 1200),
+        carre(
+            "https://is1-ssl.mzstatic.example/image/thumb/ab/1200x630cw.png",
+            1200
+        ),
         "https://is1-ssl.mzstatic.example/image/thumb/ab/1200x1200cc.jpg"
     );
-    assert_eq!(carre("https://x.example/a.gif", 600), "https://x.example/a.gif");
+    assert_eq!(
+        carre("https://x.example/a.gif", 600),
+        "https://x.example/a.gif"
+    );
 }
 
 #[test]

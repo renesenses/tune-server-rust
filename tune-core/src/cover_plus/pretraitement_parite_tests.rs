@@ -20,15 +20,28 @@ const CAS: &[Cas] = &[
         station: "Oüi FM: Alternatif",
         ignorer: false,
         requetes: &["GOOD TIMES BAD TIMES LED ZEPPELIN"],
-        hypotheses: &[("GOOD TIMES BAD TIMES", "LED ZEPPELIN"), ("LED ZEPPELIN", "GOOD TIMES BAD TIMES")],
+        hypotheses: &[
+            ("GOOD TIMES BAD TIMES", "LED ZEPPELIN"),
+            ("LED ZEPPELIN", "GOOD TIMES BAD TIMES"),
+        ],
         pochette_fournie: None,
     },
     Cas {
         brut: "Vienna Scientists - Menheads - Get This Text On Television - 674FM",
         station: "674FM",
         ignorer: false,
-        requetes: &["Vienna Scientists Menheads", "Vienna Scientists Menheads Get This Text On Television"],
-        hypotheses: &[("Vienna Scientists", "Menheads"), ("Menheads", "Vienna Scientists"), ("Vienna Scientists", "Get This Text On Television"), ("Menheads", "Get This Text On Television"), ("Get This Text On Television", "Vienna Scientists"), ("Get This Text On Television", "Menheads")],
+        requetes: &[
+            "Vienna Scientists Menheads",
+            "Vienna Scientists Menheads Get This Text On Television",
+        ],
+        hypotheses: &[
+            ("Vienna Scientists", "Menheads"),
+            ("Menheads", "Vienna Scientists"),
+            ("Vienna Scientists", "Get This Text On Television"),
+            ("Menheads", "Get This Text On Television"),
+            ("Get This Text On Television", "Vienna Scientists"),
+            ("Get This Text On Television", "Menheads"),
+        ],
         pochette_fournie: None,
     },
     Cas {
@@ -36,7 +49,10 @@ const CAS: &[Cas] = &[
         station: "KJZZ",
         ignorer: false,
         requetes: &["Charlie Byrd Freddie's Tune"],
-        hypotheses: &[("Charlie Byrd", "Freddie's Tune"), ("Freddie's Tune", "Charlie Byrd")],
+        hypotheses: &[
+            ("Charlie Byrd", "Freddie's Tune"),
+            ("Freddie's Tune", "Charlie Byrd"),
+        ],
         pochette_fournie: None,
     },
     Cas {
@@ -44,7 +60,10 @@ const CAS: &[Cas] = &[
         station: "X",
         ignorer: false,
         requetes: &["Stand By Me Ben E. King"],
-        hypotheses: &[("Stand By Me", "Ben E. King"), ("Ben E. King", "Stand By Me")],
+        hypotheses: &[
+            ("Stand By Me", "Ben E. King"),
+            ("Ben E. King", "Stand By Me"),
+        ],
         pochette_fournie: None,
     },
     Cas {
@@ -52,7 +71,10 @@ const CAS: &[Cas] = &[
         station: "X",
         ignorer: false,
         requetes: &["Smokie Living Next Door To Alice"],
-        hypotheses: &[("Smokie", "Living Next Door To Alice"), ("Living Next Door To Alice", "Smokie")],
+        hypotheses: &[
+            ("Smokie", "Living Next Door To Alice"),
+            ("Living Next Door To Alice", "Smokie"),
+        ],
         pochette_fournie: None,
     },
     Cas {
@@ -60,15 +82,28 @@ const CAS: &[Cas] = &[
         station: "NOVO3",
         ignorer: false,
         requetes: &["Smokie Living Next Door To Alice"],
-        hypotheses: &[("Smokie", "Living Next Door To Alice"), ("Living Next Door To Alice", "Smokie")],
+        hypotheses: &[
+            ("Smokie", "Living Next Door To Alice"),
+            ("Living Next Door To Alice", "Smokie"),
+        ],
         pochette_fournie: None,
     },
     Cas {
         brut: "Heinrich Bach - 02 - Vox Luminis - Kyrie a 6",
         station: "X",
         ignorer: false,
-        requetes: &["Heinrich Bach Vox Luminis", "Heinrich Bach Vox Luminis Kyrie a 6"],
-        hypotheses: &[("Heinrich Bach", "Vox Luminis"), ("Vox Luminis", "Heinrich Bach"), ("Heinrich Bach", "Kyrie a 6"), ("Vox Luminis", "Kyrie a 6"), ("Kyrie a 6", "Heinrich Bach"), ("Kyrie a 6", "Vox Luminis")],
+        requetes: &[
+            "Heinrich Bach Vox Luminis",
+            "Heinrich Bach Vox Luminis Kyrie a 6",
+        ],
+        hypotheses: &[
+            ("Heinrich Bach", "Vox Luminis"),
+            ("Vox Luminis", "Heinrich Bach"),
+            ("Heinrich Bach", "Kyrie a 6"),
+            ("Vox Luminis", "Kyrie a 6"),
+            ("Kyrie a 6", "Heinrich Bach"),
+            ("Kyrie a 6", "Vox Luminis"),
+        ],
         pochette_fournie: None,
     },
     Cas {
@@ -84,7 +119,16 @@ const CAS: &[Cas] = &[
         station: "X",
         ignorer: false,
         requetes: &["Daft Punk Get Lucky"],
-        hypotheses: &[("Daft Punk", "Get Lucky (feat. Pharrell Williams) [Radio Edit]"), ("Get Lucky (feat. Pharrell Williams) [Radio Edit]", "Daft Punk")],
+        hypotheses: &[
+            (
+                "Daft Punk",
+                "Get Lucky (feat. Pharrell Williams) [Radio Edit]",
+            ),
+            (
+                "Get Lucky (feat. Pharrell Williams) [Radio Edit]",
+                "Daft Punk",
+            ),
+        ],
         pochette_fournie: None,
     },
     Cas {
@@ -92,7 +136,10 @@ const CAS: &[Cas] = &[
         station: "X",
         ignorer: false,
         requetes: &["Simon & Garfunkel The Boxer"],
-        hypotheses: &[("Simon & Garfunkel", "The Boxer"), ("The Boxer", "Simon & Garfunkel")],
+        hypotheses: &[
+            ("Simon & Garfunkel", "The Boxer"),
+            ("The Boxer", "Simon & Garfunkel"),
+        ],
         pochette_fournie: None,
     },
     Cas {
@@ -100,15 +147,24 @@ const CAS: &[Cas] = &[
         station: "X",
         ignorer: false,
         requetes: &["Mogwai Punk Rock"],
-        hypotheses: &[("Mogwai feat. Iggy Pop", "Punk Rock"), ("Punk Rock", "Mogwai feat. Iggy Pop")],
+        hypotheses: &[
+            ("Mogwai feat. Iggy Pop", "Punk Rock"),
+            ("Punk Rock", "Mogwai feat. Iggy Pop"),
+        ],
         pochette_fournie: None,
     },
     Cas {
         brut: "Lisa Leblanc - Pourquoi faire aujourd'hui (Poirier remix)",
         station: "X",
         ignorer: false,
-        requetes: &["Lisa Leblanc Pourquoi faire aujourd'hui poirier", "Lisa Leblanc Pourquoi faire aujourd'hui"],
-        hypotheses: &[("Lisa Leblanc", "Pourquoi faire aujourd'hui (Poirier remix)"), ("Pourquoi faire aujourd'hui (Poirier remix)", "Lisa Leblanc")],
+        requetes: &[
+            "Lisa Leblanc Pourquoi faire aujourd'hui poirier",
+            "Lisa Leblanc Pourquoi faire aujourd'hui",
+        ],
+        hypotheses: &[
+            ("Lisa Leblanc", "Pourquoi faire aujourd'hui (Poirier remix)"),
+            ("Pourquoi faire aujourd'hui (Poirier remix)", "Lisa Leblanc"),
+        ],
         pochette_fournie: None,
     },
     Cas {
@@ -156,7 +212,10 @@ const CAS: &[Cas] = &[
         station: "X",
         ignorer: false,
         requetes: &["Stromae Alors on danse dubdogz", "Stromae Alors on danse"],
-        hypotheses: &[("Stromae", "Alors on danse (Dubdogz Remix)"), ("Alors on danse (Dubdogz Remix)", "Stromae")],
+        hypotheses: &[
+            ("Stromae", "Alors on danse (Dubdogz Remix)"),
+            ("Alors on danse (Dubdogz Remix)", "Stromae"),
+        ],
         pochette_fournie: None,
     },
     Cas {
@@ -172,7 +231,10 @@ const CAS: &[Cas] = &[
         station: "X",
         ignorer: false,
         requetes: &["Jay-Z Empire State of Mind"],
-        hypotheses: &[("Jay-Z", "Empire State of Mind"), ("Empire State of Mind", "Jay-Z")],
+        hypotheses: &[
+            ("Jay-Z", "Empire State of Mind"),
+            ("Empire State of Mind", "Jay-Z"),
+        ],
         pochette_fournie: None,
     },
     Cas {
@@ -196,7 +258,10 @@ const CAS: &[Cas] = &[
         station: "KJZZ",
         ignorer: false,
         requetes: &["Roy Haynes How Deep is the Ocean?"],
-        hypotheses: &[("Roy Haynes", "How Deep is the Ocean?"), ("How Deep is the Ocean?", "Roy Haynes")],
+        hypotheses: &[
+            ("Roy Haynes", "How Deep is the Ocean?"),
+            ("How Deep is the Ocean?", "Roy Haynes"),
+        ],
         pochette_fournie: None,
     },
     Cas {
@@ -236,7 +301,10 @@ const CAS: &[Cas] = &[
         station: "Queen FM",
         ignorer: false,
         requetes: &["Queen Bohemian Rhapsody"],
-        hypotheses: &[("Queen", "Bohemian Rhapsody"), ("Bohemian Rhapsody", "Queen")],
+        hypotheses: &[
+            ("Queen", "Bohemian Rhapsody"),
+            ("Bohemian Rhapsody", "Queen"),
+        ],
         pochette_fournie: None,
     },
     Cas {
@@ -340,7 +408,10 @@ const CAS: &[Cas] = &[
         station: "X",
         ignorer: false,
         requetes: &["MOGWAI IGGY POP Punk Rock"],
-        hypotheses: &[("MOGWAI [+] IGGY POP", "Punk Rock"), ("Punk Rock", "MOGWAI [+] IGGY POP")],
+        hypotheses: &[
+            ("MOGWAI [+] IGGY POP", "Punk Rock"),
+            ("Punk Rock", "MOGWAI [+] IGGY POP"),
+        ],
         pochette_fournie: None,
     },
     Cas {
@@ -356,7 +427,10 @@ const CAS: &[Cas] = &[
         station: "X",
         ignorer: false,
         requetes: &["WHERE IS MY MIND PIXIES"],
-        hypotheses: &[("WHERE IS MY MIND", "PIXIES"), ("PIXIES", "WHERE IS MY MIND")],
+        hypotheses: &[
+            ("WHERE IS MY MIND", "PIXIES"),
+            ("PIXIES", "WHERE IS MY MIND"),
+        ],
         pochette_fournie: None,
     },
     Cas {
@@ -372,7 +446,10 @@ const CAS: &[Cas] = &[
         station: "X",
         ignorer: false,
         requetes: &["Barry Can't Swim When Will We Land"],
-        hypotheses: &[("Barry Can't Swim", "When Will We Land"), ("When Will We Land", "Barry Can't Swim")],
+        hypotheses: &[
+            ("Barry Can't Swim", "When Will We Land"),
+            ("When Will We Land", "Barry Can't Swim"),
+        ],
         pochette_fournie: None,
     },
     Cas {

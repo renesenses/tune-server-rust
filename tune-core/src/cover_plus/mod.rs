@@ -380,7 +380,11 @@ fn noter_ordre(station: &str, hypothese: usize) {
 /// défaut la 1re partie.
 pub fn artiste_pour_la_photo(station: &str, prep: &Preparation) -> Option<String> {
     let (premiere, seconde) = prep.hypotheses.first()?;
-    let n = cache().ordres.get(&norme(station)).copied().unwrap_or([0, 0]);
+    let n = cache()
+        .ordres
+        .get(&norme(station))
+        .copied()
+        .unwrap_or([0, 0]);
     Some(if n[1] > n[0] {
         seconde.clone()
     } else {
@@ -443,12 +447,10 @@ fn prendre_un_appel() -> bool {
                 let Some(apres) = r.checked_sub(1) else {
                     return false;
                 };
-                match c.reste.compare_exchange_weak(
-                    r,
-                    apres,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
+                match c
+                    .reste
+                    .compare_exchange_weak(r, apres, Ordering::Relaxed, Ordering::Relaxed)
+                {
                     Ok(_) => return true,
                     Err(vu) => r = vu,
                 }
@@ -729,7 +731,11 @@ async fn photo_en_cache(source: Source<'_>, nom: &str, boutique: &str) -> Option
         return p;
     }
     let p = photo_artiste::photo_artiste(source, nom, boutique).await;
-    debug!(trouvee = p.trouvee(), raison = p.raison, "cover_plus_photo_artiste");
+    debug!(
+        trouvee = p.trouvee(),
+        raison = p.raison,
+        "cover_plus_photo_artiste"
+    );
     // Une panne (réseau, budget, repli suspendu) ne dit rien de l'artiste :
     // elle n'est pas retenue ici ; le cache des titres borne les essais.
     if !p.passagere {
@@ -784,8 +790,7 @@ pub(crate) async fn chercher_et_compter(
     // l'artiste (§ 2.2, étape 7 ; § 3.6, point 5).
     let mut incident_photo = false;
     if photo_permise && let Some(nom) = artiste_pour_la_photo(station, prep) {
-        let (photo, inc) =
-            avec_budget(BUDGET_PHOTO, photo_en_cache(source, &nom, boutique)).await;
+        let (photo, inc) = avec_budget(BUDGET_PHOTO, photo_en_cache(source, &nom, boutique)).await;
         incident_photo = inc;
         if let Some(url) = photo {
             return (
@@ -935,13 +940,8 @@ fn pochette_du_titre_par(
             match tokio::runtime::Handle::try_current() {
                 Ok(rt) => {
                     rt.spawn(async move {
-                        let recherche = chercher_et_compter(
-                            source,
-                            &prep,
-                            &boutique,
-                            &station,
-                            photo_permise,
-                        );
+                        let recherche =
+                            chercher_et_compter(source, &prep, &boutique, &station, photo_permise);
                         // Jamais plus de DELAI_RECHERCHE : au-delà, l'échec
                         // est un incident, retenu un temps puis retenté.
                         let (trouvee, incident) =
@@ -974,11 +974,11 @@ mod choix_tests;
 #[path = "photo_artiste_tests.rs"]
 mod photo_artiste_tests;
 #[cfg(test)]
-#[path = "pretraitement_tests.rs"]
-mod pretraitement_tests;
-#[cfg(test)]
 #[path = "pretraitement_parite_tests.rs"]
 mod pretraitement_parite_tests;
+#[cfg(test)]
+#[path = "pretraitement_tests.rs"]
+mod pretraitement_tests;
 #[cfg(test)]
 #[path = "recherche_tests.rs"]
 mod recherche_tests;

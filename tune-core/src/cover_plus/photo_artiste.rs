@@ -149,7 +149,9 @@ pub fn og_image(html: &str) -> Option<String> {
         let url = brut.replace("&amp;", "&");
         let valide = url.starts_with("https://")
             && url.len() <= 2048
-            && !url.chars().any(|c| c.is_whitespace() || c == '<' || c == '>');
+            && !url
+                .chars()
+                .any(|c| c.is_whitespace() || c == '<' || c == '>');
         valide.then_some(url)
     })
 }
@@ -238,12 +240,10 @@ pub async fn photo_artiste(source: Source<'_>, nom: &str, boutique: &str) -> Pho
         else {
             return Photo::panne("iTunes en échec");
         };
-        let Some(franc) = resultats.iter().find(|x| {
-            meme_nom(
-                x.get("artistName").and_then(Value::as_str).unwrap_or(""),
-                n,
-            )
-        }) else {
+        let Some(franc) = resultats
+            .iter()
+            .find(|x| meme_nom(x.get("artistName").and_then(Value::as_str).unwrap_or(""), n))
+        else {
             continue;
         };
         let Some(page) = franc.get("artistLinkUrl").and_then(Value::as_str) else {

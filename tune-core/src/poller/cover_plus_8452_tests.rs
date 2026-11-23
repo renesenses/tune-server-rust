@@ -142,7 +142,13 @@ async fn la_pochette_cover_plus_remplace_le_logo_et_porte_son_label() {
     station_en_base(&b.db, nom, &url);
     let pochette = "https://is1.mzstatic.example/moon/600x600bb.jpg";
     crate::cover_plus::regler_globalement(&b.db, true).unwrap();
-    crate::cover_plus::semer(Some("France"), nom, "Air", "Sexy Boy", Some(trouvaille(pochette)));
+    crate::cover_plus::semer(
+        Some("France"),
+        nom,
+        "Air",
+        "Sexy Boy",
+        Some(trouvaille(pochette)),
+    );
 
     let np = jouer_puis_sonder(&b, 1, nom, &url).await;
     assert_eq!(np.title, "Sexy Boy");
@@ -168,7 +174,9 @@ async fn station_coupee_le_logo_reste_sans_label() {
         nom,
         "Air",
         "Sexy Boy",
-        Some(trouvaille("https://is1.mzstatic.example/moon/600x600bb.jpg")),
+        Some(trouvaille(
+            "https://is1.mzstatic.example/moon/600x600bb.jpg",
+        )),
     );
     crate::cover_plus::regler_la_station(&b.db, id, false).unwrap();
 
@@ -191,7 +199,10 @@ async fn sans_pochette_connue_le_logo_de_la_station() {
     assert_eq!(np.cover_path.as_deref(), Some(LOGO));
     assert!(!np.cover_plus);
     assert!(
-        serde_json::to_value(&np).unwrap().get("cover_plus_source").is_none(),
+        serde_json::to_value(&np)
+            .unwrap()
+            .get("cover_plus_source")
+            .is_none(),
         "pas de source sans image Cover+"
     );
 }
@@ -206,7 +217,13 @@ async fn au_changement_de_titre_l_image_precedente_s_en_va() {
     station_en_base(&b.db, nom, &url_a);
     crate::cover_plus::regler_globalement(&b.db, true).unwrap();
     let pochette = "https://is1.mzstatic.example/moon/600x600bb.jpg";
-    crate::cover_plus::semer(Some("France"), nom, "Air", "Sexy Boy", Some(trouvaille(pochette)));
+    crate::cover_plus::semer(
+        Some("France"),
+        nom,
+        "Air",
+        "Sexy Boy",
+        Some(trouvaille(pochette)),
+    );
     let np = jouer_puis_sonder(&b, 4, nom, &url_a).await;
     assert_eq!(np.cover_path.as_deref(), Some(pochette));
 
@@ -225,6 +242,10 @@ async fn au_changement_de_titre_l_image_precedente_s_en_va() {
     b.poller.refresh_radio_metadata(4, &etat).await;
     let np = b.playback.get_state(4).await.now_playing.unwrap();
     assert_eq!(np.title, "Kelly Watch the Stars");
-    assert_eq!(np.cover_path.as_deref(), Some(LOGO), "le logo, pas la pochette d'avant");
+    assert_eq!(
+        np.cover_path.as_deref(),
+        Some(LOGO),
+        "le logo, pas la pochette d'avant"
+    );
     assert!(!np.cover_plus);
 }

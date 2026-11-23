@@ -107,7 +107,11 @@ async fn allume_par_defaut_l_interrupteur_du_serveur_l_eteint() {
 
     let (s, v) = appel(&app, "GET", "/api/v1/radios/cover-plus", None).await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(v, json!({"enabled": true, "artist_photo": true}), "allumé par défaut (rc14)");
+    assert_eq!(
+        v,
+        json!({"enabled": true, "artist_photo": true}),
+        "allumé par défaut (rc14)"
+    );
 
     let (s, v) = appel(
         &app,
