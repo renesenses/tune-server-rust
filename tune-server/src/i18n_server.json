@@ -7631,6 +7631,24 @@
     "zh": "此管理操作",
     "tr": "Bu yönetim işlemi"
   },
+  "api.auth.invalidCredentials": {
+    "fr": "Identifiant ou mot de passe incorrect",
+    "en": "Incorrect username or password",
+    "de": "Benutzername oder Passwort falsch",
+    "es": "Usuario o contraseña incorrectos",
+    "it": "Nome utente o password non corretti",
+    "zh": "用户名或密码错误",
+    "ja": "ユーザー名またはパスワードが正しくありません",
+    "ko": "사용자 이름 또는 비밀번호가 올바르지 않습니다",
+    "ro": "Nume de utilizator sau parolă incorectă",
+    "sv": "Felaktigt användarnamn eller lösenord",
+    "hu": "Hibás felhasználónév vagy jelszó",
+    "vi": "Tên người dùng hoặc mật khẩu không đúng",
+    "nb": "Feil brukernavn eller passord",
+    "pl": "Nieprawidłowa nazwa użytkownika lub hasło",
+    "el": "Λάθος όνομα χρήστη ή κωδικός πρόσβασης",
+    "tr": "Kullanıcı adı veya parola yanlış"
+  },
   "api.machine.reservedOutsideLanAccount": {
     "fr": "{action} : sans authentification, le compte mozaiklabs.fr ne se relie que depuis le réseau local, et cette demande vient d'ailleurs (accès à distance, mandataire inverse ou VPN). Faites-le depuis un appareil du réseau local, ou activez l'authentification dans les réglages et connectez-vous.",
     "en": "{action}: without authentication, the mozaiklabs.fr account can only be linked from the local network, and this request comes from elsewhere (remote access, reverse proxy or VPN). Do it from a device on the local network, or enable authentication in the settings and sign in.",
