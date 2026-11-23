@@ -967,31 +967,18 @@ impl FromRequestParts<AppState> for AdminOuCetteMachine {
             mandataire,
             "action_machine_refusee_hors_de_cette_machine_sans_authentification"
         );
-        // Le refus dit ce que le serveur a vu : l'exploitant comprend tout de
-        // suite pourquoi « depuis cette machine » n'a pas été reconnu.
-        let (motif, message) = if relais_port_80 {
-            (
-                "port80_relay",
-                "This appliance relays port 80 to the server from 127.0.0.1, so a local \
-                 call cannot be told apart from the network: enable authentication and \
-                 sign in as an administrator (or rebuild the Tune OS image).",
-            )
+        // Le refus dit ce que le serveur a vu (`reason`, `caller`), en une
+        // phrase courte et traduite, avec le lien d'aide (rc14).
+        let motif = if relais_port_80 {
+            "port80_relay"
         } else {
-            (
-                "not_local",
-                "This action requires authentication to be enabled, or a call from this \
-                 machine (localhost).",
-            )
+            "not_local"
         };
         Err((
             StatusCode::FORBIDDEN,
-            Json(json!({
-                "error": "auth_required",
-                "reason": motif,
-                "message": message,
-                "caller": appelant,
-                "relayed": relaye,
-            })),
+            Json(crate::refus_machine::corps_refus_hors_machine(
+                motif, &appelant, relaye,
+            )),
         ))
     }
 }
@@ -1703,8 +1690,8 @@ fn code_valable(c: &CodeActivation) -> bool {
 }
 
 /// Émet un code, s'il n'y en a pas déjà un de valable, et l'écrit sur la
-/// CONSOLE du serveur (sortie d'erreur : `docker logs`, `journalctl -u tune`,
-/// en SSH sur Tune OS ; sous Windows sans console, le fichier journal) — jamais dans le journal de `tracing`, que l'API sert
+/// CONSOLE du serveur (sortie d'erreur : `docker logs`, `journalctl -u
+/// tune-server`, Cockpit sur Tune OS ; sous Windows sans console, le fichier journal) — jamais dans le journal de `tracing`, que l'API sert
 /// (`/system/logs`, rapports de bogue). La ligne porte
 /// [`tune_core::confidentialite::MARQUEUR_CODE_ACTIVATION`], que tous les
 /// lecteurs de journaux retirent (cas d'une sortie d'erreur redirigée dans le
@@ -1853,11 +1840,7 @@ fn renouveler_les_secrets(settings: &SettingsRepo) {
 fn refus_activation_hors_machine() -> Response {
     (
         StatusCode::FORBIDDEN,
-        Json(json!({
-            "error": "activation_code_required",
-            "reason": "not_local",
-            "message": "Enabling authentication from another device requires the one-time code written to the server console (POST /auth/activation/code; docker logs, journalctl -u tune — on Tune OS over SSH —, or the log file on Windows), or a call from this machine.",
-        })),
+        Json(crate::refus_machine::corps_refus_activation_hors_machine()),
     )
         .into_response()
 }
