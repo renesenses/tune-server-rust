@@ -156,6 +156,64 @@ fn get_or_create_jwt_secret(settings: &SettingsRepo) -> String {
 // Middleware — auth layer applied to the API router
 // ---------------------------------------------------------------------------
 
+/// Les routes que la couche d'authentification laisse passer SANS jeton
+/// quand `auth_enabled = true` (hors exemption DIDL, qui dépend aussi de
+/// l'adresse de l'appelant et reste dans le middleware).
+///
+/// Sortie du middleware pour qu'une épreuve puisse la confronter aux sondes
+/// qui vivent hors du code Rust — le `HEALTHCHECK` des images Docker en tête,
+/// qui appelait `/system/stats`, absente de cette liste : sous
+/// authentification, la sonde prenait un 401 et Docker déclarait « unhealthy »
+/// un conteneur qui servait parfaitement.
+///
+/// Public allowlist. Health/version/ws/sso stay open. For /auth/ we no
+/// longer blanket-public the whole namespace (the old `contains("/auth/")`):
+/// the privileged endpoints — /auth/token, /auth/api-key, POST /auth/config —
+/// MUST require a valid admin token even when auth is enabled, otherwise
+/// enabling auth is defeated (an anonymous caller could mint a year-long JWT,
+/// rotate the API key, or turn auth back off). Only the genuinely-public
+/// handshakes are listed; everything else falls through to the token check.
+pub(crate) fn est_route_publique(method: &axum::http::Method, path: &str) -> bool {
+    let is_extension_route = path.starts_with("/ext/") || path.starts_with("/api/v1/ext/");
+    !is_extension_route
+    && (path.contains("/system/health")
+        || path.contains("/system/version")
+        // NB : /system/profile (fiche support) n'est volontairement PAS
+        // dans cette allowlist : la fiche expose music_dirs et l'IP LAN,
+        // trop large pour un appel anonyme quand l'auth est activée. Elle
+        // requiert donc un token — n'importe quel rôle, pas de RequireAdmin :
+        // l'écran Support est consulté par un utilisateur authentifié,
+        // jamais de façon anonyme.
+        // /system/peer-info EST public, et il doit l'etre : c'est la
+        // poignee de main entre deux serveurs Tune. Un serveur protege
+        // etait jusqu'ici IMPOSSIBLE a ajouter comme pair — l'autre bout
+        // appelle cette route sans jeton (fetch_peer_info, admin.rs), et
+        // il n'a aucun moyen d'en obtenir un.
+        //
+        // Contrairement a /system/profile juste au-dessus, la surface est
+        // etroite et delibere : nom choisi par l'utilisateur, version,
+        // nombre de pistes, nombre de zones. Ni music_dirs, ni IP, ni
+        // chemin de fichier, ni reglage. C'est ce qu'un serveur affiche
+        // deja de lui-meme dans la liste « serveurs du reseau » d'en face.
+        //
+        // GET seulement : la route est en lecture, et un POST homonyme
+        // futur ne doit pas heriter de cette ouverture.
+        || (method == axum::http::Method::GET
+            && (path == "/system/peer-info" || path == "/api/v1/system/peer-info"))
+        // Seul le retour du SSO est public (A5) : chemin exact, GET. Le
+        // navigateur y revient de mozaiklabs.fr ; `authorize`, `status`
+        // et `disconnect` demandent une session (le cookie la porte).
+        || (method == axum::http::Method::GET
+            && (path == "/cloud/sso/callback" || path == "/api/v1/cloud/sso/callback"))
+        || path == "/ws"
+        // #8189 — la passerelle des sources réseau : un renderer n'a pas
+        // de session. Le gestionnaire exige le jeton signé, propre au
+        // fichier et de courte durée ; GET et HEAD seulement.
+        || ((method == axum::http::Method::GET || method == axum::http::Method::HEAD)
+            && crate::routes::sources_reseau::est_route_passerelle(path))
+        || is_public_auth_route(&method, path))
+}
+
 pub async fn auth_middleware(
     State(state): State<AppState>,
     mut request: Request,
@@ -189,51 +247,7 @@ pub async fn auth_middleware(
     let method = request.method().clone();
     let is_extension_route = path.starts_with("/ext/") || path.starts_with("/api/v1/ext/");
 
-    // Public allowlist. Health/version/ws/sso stay open. For /auth/ we no
-    // longer blanket-public the whole namespace (the old `contains("/auth/")`):
-    // the privileged endpoints — /auth/token, /auth/api-key, POST /auth/config —
-    // MUST require a valid admin token even when auth is enabled, otherwise
-    // enabling auth is defeated (an anonymous caller could mint a year-long JWT,
-    // rotate the API key, or turn auth back off). Only the genuinely-public
-    // handshakes are listed; everything else falls through to the token check.
-    if !is_extension_route
-        && (path.contains("/system/health")
-            || path.contains("/system/version")
-            // NB : /system/profile (fiche support) n'est volontairement PAS
-            // dans cette allowlist : la fiche expose music_dirs et l'IP LAN,
-            // trop large pour un appel anonyme quand l'auth est activée. Elle
-            // requiert donc un token — n'importe quel rôle, pas de RequireAdmin :
-            // l'écran Support est consulté par un utilisateur authentifié,
-            // jamais de façon anonyme.
-            // /system/peer-info EST public, et il doit l'etre : c'est la
-            // poignee de main entre deux serveurs Tune. Un serveur protege
-            // etait jusqu'ici IMPOSSIBLE a ajouter comme pair — l'autre bout
-            // appelle cette route sans jeton (fetch_peer_info, admin.rs), et
-            // il n'a aucun moyen d'en obtenir un.
-            //
-            // Contrairement a /system/profile juste au-dessus, la surface est
-            // etroite et delibere : nom choisi par l'utilisateur, version,
-            // nombre de pistes, nombre de zones. Ni music_dirs, ni IP, ni
-            // chemin de fichier, ni reglage. C'est ce qu'un serveur affiche
-            // deja de lui-meme dans la liste « serveurs du reseau » d'en face.
-            //
-            // GET seulement : la route est en lecture, et un POST homonyme
-            // futur ne doit pas heriter de cette ouverture.
-            || (method == axum::http::Method::GET
-                && (path == "/system/peer-info" || path == "/api/v1/system/peer-info"))
-            // Seul le retour du SSO est public (A5) : chemin exact, GET. Le
-            // navigateur y revient de mozaiklabs.fr ; `authorize`, `status`
-            // et `disconnect` demandent une session (le cookie la porte).
-            || (method == axum::http::Method::GET
-                && (path == "/cloud/sso/callback" || path == "/api/v1/cloud/sso/callback"))
-            || path == "/ws"
-            // #8189 — la passerelle des sources réseau : un renderer n'a pas
-            // de session. Le gestionnaire exige le jeton signé, propre au
-            // fichier et de courte durée ; GET et HEAD seulement.
-            || ((method == axum::http::Method::GET || method == axum::http::Method::HEAD)
-                && crate::routes::sources_reseau::est_route_passerelle(path))
-            || is_public_auth_route(&method, path))
-    {
+    if est_route_publique(&method, path) {
         return next.run(request).await;
     }
 
@@ -2245,3 +2259,7 @@ mod tests {
         ));
     }
 }
+
+#[cfg(test)]
+#[path = "auth_sondes_docker_tests.rs"]
+mod sondes_docker_tests;
