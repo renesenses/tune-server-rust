@@ -215,6 +215,27 @@ async fn un_state_faux_n_annule_pas_la_liaison_en_cours() {
     assert!(attente_du_serveur(&b.state).is_empty(), "attente consommée");
 }
 
+/// 1 quater. Depuis le réseau local, un `Host` que le serveur n'accepte pas
+/// (nom étranger) est refusé : rien n'est préparé. La garde d'origine répond
+/// 421 avant la route ; `appel_depuis_le_reseau_local` refuse aussi ce `Host`.
+#[tokio::test]
+async fn reseau_local_avec_un_host_non_accepte_la_liaison_est_refusee() {
+    let b = banc();
+    let (statut, page) = get(
+        &b.state,
+        "192.168.1.50:52000",
+        AUTORISER,
+        &[("host", "evil.example")],
+    )
+    .await;
+    assert_eq!(
+        statut,
+        StatusCode::MISDIRECTED_REQUEST,
+        "host: evil.example — {page}"
+    );
+    assert!(attente_du_serveur(&b.state).is_empty(), "rien de préparé");
+}
+
 /// 1 bis. Le statut montre le compte relié au réseau local : le menu du compte
 /// (nom, courriel, photo de profil) n'est plus « relié, sans détails ».
 #[tokio::test]
