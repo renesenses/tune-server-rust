@@ -213,11 +213,13 @@ async fn hqplayer_sur_du_flac_sans_traitement_est_bit_perfect() {
 
 /// ⭐ LE TÉMOIN — la même zone, le même fichier, un égaliseur ARMÉ.
 ///
-/// Là, `pull_output_needs_dsp_transcode` force pour de vrai le chemin
-/// transcodé (c'est #1430) : le verdict DOIT tomber. Ce témoin est ce qui
-/// interdit la correction paresseuse « bit-perfect partout ».
+/// TESS T12c (décision Q8) : HQPlayer est HORS TESS, aucun étage de la chaîne
+/// ne lui est appliqué (`pull_output_needs_dsp_transcode`). Le fichier part
+/// octet pour octet, égaliseur armé ou pas : le verdict reste `true` et
+/// aucun DSP n'est annoncé. La contre-épreuve « bit-perfect partout » est
+/// tenue par le témoin AirPlay 2 ci-dessous, où l'égaliseur s'applique.
 #[tokio::test]
-async fn temoin_hqplayer_avec_un_eq_arme_nest_pas_bit_perfect() {
+async fn temoin_hqplayer_avec_un_eq_arme_reste_bit_perfect_hors_tess_t12c() {
     let (app, state) = app();
     let id = creer_zone(&app, "Salon HQPlayer", "hqplayer").await;
     armer_l_eq(&state, id);
@@ -227,11 +229,29 @@ async fn temoin_hqplayer_avec_un_eq_arme_nest_pas_bit_perfect() {
 
     assert_eq!(
         sp["bit_perfect"].as_bool(),
-        Some(false),
-        "un EQ armé sur une sortie PULL est réellement appliqué — \
-         l'orchestrateur force le transcodage. Le verdict doit tomber. \
-         Chemin : {sp}"
+        Some(true),
+        "HQPlayer hors TESS (Q8) : l'égaliseur armé n'est pas appliqué, le \
+         fichier part tel quel. Chemin : {sp}"
     );
+    assert!(
+        !sp["steps"]
+            .as_array()
+            .is_some_and(|e| e.iter().any(|s| s["name"] == "DSP")),
+        "hors TESS, aucun DSP annoncé : {sp}"
+    );
+}
+
+/// Contre-épreuve de Q8 : sur AirPlay 2 (dans TESS), le même égaliseur
+/// armé est appliqué et annoncé.
+#[tokio::test]
+async fn temoin_airplay2_avec_un_eq_arme_l_annonce_t12c() {
+    let (app, state) = app();
+    let id = creer_zone(&app, "Sonos Era 100", "airplay2").await;
+    armer_l_eq(&state, id);
+    jouer_du_flac(&state, id).await;
+
+    let sp = chemin_du_signal(&app, id).await;
+
     assert!(
         etape(&sp, "DSP").starts_with("EQ actif"),
         "l'étape DSP doit nommer le traitement qui a lieu : {sp}"
