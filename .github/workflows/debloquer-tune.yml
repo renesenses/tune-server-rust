@@ -199,6 +199,15 @@ jobs:
           security import "$RUNNER_TEMP/certificate.p12" -k "$KC" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions "$KC"
           rm "$RUNNER_TEMP/certificate.p12"
+          # Autorités intermédiaires Developer ID d'Apple (publiques) : les
+          # runners GitHub les ont d'office, pas un Mac sans Xcode complet.
+          # Sans elles : « unable to build chain to self-signed root »,
+          # errSecInternalComponent, et 0 identité valide.
+          for ca in DeveloperIDG2CA DeveloperIDCA; do
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/$ca.cer" "https://www.apple.com/certificateauthority/$ca.cer"
+            security import "$RUNNER_TEMP/$ca.cer" -k "$KC" -t cert 2>&1 | grep -v 'already exists' || true
+            rm -f "$RUNNER_TEMP/$ca.cer"
+          done
           # Ajouté à la liste de recherche, SANS devenir le trousseau par
           # défaut : la session ouverte sur le Mac n'est pas touchée.
           # shellcheck disable=SC2046
