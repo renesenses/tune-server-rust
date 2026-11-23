@@ -45,10 +45,12 @@ const TRAMES: usize = 26_460;
 
 /// Les paquets audio reçus : `(sample_offset, format, charge utile)`.
 type Paquets = Arc<std::sync::Mutex<Vec<(u64, AudioFormat, Vec<u8>)>>>;
+/// L'instant du premier paquet audio reçu.
+type Premier = Arc<std::sync::Mutex<Option<std::time::Instant>>>;
 
 /// Un faux point d'arrivée OAAT : il accepte toute proposition de format et
 /// garde chaque paquet audio (hors FEC). Rend le port de contrôle.
-async fn faux_recepteur_oaat(paquets: Paquets) -> u16 {
+async fn faux_recepteur_oaat(paquets: Paquets, premier: Premier) -> u16 {
     let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port_controle = tcp.local_addr().unwrap().port();
     let audio = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -69,6 +71,10 @@ async fn faux_recepteur_oaat(paquets: Paquets) -> u16 {
             if h.flags.contains(PacketFlags::FEC) {
                 continue;
             }
+            premier
+                .lock()
+                .unwrap()
+                .get_or_insert_with(std::time::Instant::now);
             let fin = (AUDIO_HEADER_SIZE + usize::from(h.payload_len)).min(n);
             paquets.lock().unwrap().push((
                 h.sample_offset,
@@ -197,6 +203,8 @@ struct Lecture {
     bits: u32,
     source: Vec<[i16; 2]>,
     file_path_remis: bool,
+    /// `play` → premier paquet audio reçu.
+    premier_paquet: Duration,
 }
 
 /// Une lecture de bout en bout ; rend ce que le faux récepteur a reçu.
@@ -227,7 +235,8 @@ async fn jouer(chaine: Chaine) -> Lecture {
     orch.license = Some(crate::license::licence_premium_pour_test(db.clone()));
 
     let paquets: Paquets = Arc::new(std::sync::Mutex::new(Vec::new()));
-    let port = faux_recepteur_oaat(paquets.clone()).await;
+    let premier: Premier = Arc::new(std::sync::Mutex::new(None));
+    let port = faux_recepteur_oaat(paquets.clone(), premier.clone()).await;
     let sortie = OaatOutput::new(
         "Banc T12a".into(),
         "127.0.0.1".into(),
@@ -270,6 +279,7 @@ async fn jouer(chaine: Chaine) -> Lecture {
         "prémisse : chaîne {chaine:?}"
     );
 
+    let depart = std::time::Instant::now();
     let r = orch
         .play(PlayRequest {
             zone_id,
@@ -315,6 +325,11 @@ async fn jouer(chaine: Chaine) -> Lecture {
         bits,
         source,
         file_path_remis: direct,
+        premier_paquet: premier
+            .lock()
+            .unwrap()
+            .expect("aucun paquet")
+            .saturating_duration_since(depart),
     }
 }
 
@@ -325,7 +340,10 @@ async fn jouer(chaine: Chaine) -> Lecture {
 async fn crossfeed_sur_oaat_allume_la_voie_droite_t12a() {
     let l = jouer(Chaine::Crossfeed).await;
     let c = banc::constater(&l.trames, l.bits, &l.source, 1.0);
-    println!("T12a crossfeed OAAT : {c:?}, lecture directe = {}", l.file_path_remis);
+    println!(
+        "T12a crossfeed OAAT : {c:?}, lecture directe = {}, premier paquet {:?}",
+        l.file_path_remis, l.premier_paquet
+    );
     assert!(
         !l.file_path_remis,
         "#9176 : chaîne active, OAAT ne doit pas lire le fichier en direct"
@@ -333,6 +351,13 @@ async fn crossfeed_sur_oaat_allume_la_voie_droite_t12a() {
     assert!(
         c.droite_max > 500,
         "#9176 : le crossfeed doit allumer la voie droite reçue par OAAT ({c:?})"
+    );
+    // Latence : le flux traité part au fil de l'eau, comme la lecture
+    // directe (même plafond que le témoin de démarrage #7331).
+    assert!(
+        l.premier_paquet < Duration::from_millis(2_500),
+        "premier paquet {:?} après play avec la chaîne",
+        l.premier_paquet
     );
 }
 
@@ -370,7 +395,10 @@ async fn pure_sur_oaat_rien_n_est_traite_t12a() {
 async fn sans_chaine_oaat_recoit_la_source_t12a() {
     let l = jouer(Chaine::Aucune).await;
     let c = banc::constater(&l.trames, l.bits, &l.source, 1.0);
-    println!("T12a sans chaîne OAAT : {c:?}, lecture directe = {}", l.file_path_remis);
+    println!(
+        "T12a sans chaîne OAAT : {c:?}, lecture directe = {}, premier paquet {:?}",
+        l.file_path_remis, l.premier_paquet
+    );
     assert!(c.identique, "{c:?}");
 }
 
