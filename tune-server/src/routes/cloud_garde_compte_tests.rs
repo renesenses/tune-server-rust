@@ -3,7 +3,9 @@
 //! (`crate::routes::router`, préfixe `/api/v1`), l'adresse de l'appelant posée
 //! en extension `ConnectInfo` comme le fait le service de production.
 //!
-//! - authentification coupée, appel du réseau local → 403 `not_local` ;
+//! - authentification coupée, appel du réseau local → 403 `not_local` (licence,
+//!   déliaison) ; la LIAISON du compte, elle, s'ouvre au réseau local en rc14
+//!   (voir `compte_reseau_local_tests.rs`) ;
 //! - authentification coupée, appel de cette machine → accepté ;
 //! - authentification active, administrateur → accepté (même du réseau) ;
 //! - authentification active, compte standard → 403.
@@ -126,8 +128,12 @@ async fn reseau_local_sans_authentification_refuse_not_local() {
     assert_eq!(ls.license_key.as_deref(), Some(CLE));
 }
 
+/// rc14 — sans authentification, le réseau local relie le compte (même règle
+/// que la mise à jour en rc13.1). Une attente lancée depuis la machine ne se
+/// consomme toujours qu'avec SON `state` : un retour au `state` faux, même du
+/// réseau local, est refusé par le contrôle du `state` et ne relie rien.
 #[tokio::test]
-async fn reseau_local_sans_authentification_ne_relie_pas_de_compte() {
+async fn reseau_local_sans_authentification_relie_le_compte() {
     let b = banc();
     let reglages = SettingsRepo::with_backend(b.state.backend.clone());
 
@@ -140,43 +146,26 @@ async fn reseau_local_sans_authentification_ne_relie_pas_de_compte() {
         None,
     )
     .await;
-    assert_eq!(statut, StatusCode::FORBIDDEN, "{page}");
-    assert!(page.contains("<html"), "le refus est une page : {page}");
+    assert_eq!(statut, StatusCode::TEMPORARY_REDIRECT, "{page}");
     assert!(
-        page.contains("localhost"),
-        "la page dit quoi faire : {page}"
-    );
-    assert_eq!(
-        reglages
+        !reglages
             .get("mozaik_pkce_pending")
             .unwrap()
-            .unwrap_or_default(),
-        "",
-        "aucune autorisation n'a été préparée"
+            .unwrap_or_default()
+            .is_empty(),
+        "l'autorisation est préparée"
     );
 
-    // Une autorisation lancée depuis la machine reste en attente : un retour
-    // présenté depuis le réseau ne doit ni l'accepter ni la consommer.
-    let (statut, _) = appel(
+    let (statut, page) = appel(
         &b.state,
-        ICI,
+        LAN,
         None,
         "GET",
-        "/api/v1/cloud/sso/authorize",
+        "/api/v1/cloud/sso/callback?code=code-du-tiers&state=faux",
         None,
     )
     .await;
-    assert_eq!(statut, StatusCode::TEMPORARY_REDIRECT);
-    let attente = reglages.get("mozaik_pkce_pending").unwrap().unwrap();
-    let etat = json_de(&attente)["state"].as_str().unwrap().to_string();
-    let uri = format!("/api/v1/cloud/sso/callback?code=code-du-tiers&state={etat}");
-    let (statut, page) = appel(&b.state, LAN, None, "GET", &uri, None).await;
-    assert_eq!(statut, StatusCode::FORBIDDEN, "{page}");
-    assert_eq!(
-        reglages.get("mozaik_pkce_pending").unwrap().as_deref(),
-        Some(attente.as_str()),
-        "l'attente de la machine n'est pas consommée"
-    );
+    assert_eq!(statut, StatusCode::BAD_REQUEST, "{page}");
     assert!(reglages.get("mozaik_access_token").unwrap().is_none());
 }
 
@@ -942,12 +931,14 @@ async fn les_comptes_lies_ne_sortent_pas_vers_un_autre_appareil() {
     // Authentification coupée.
     assert_eq!(comptes_lus(&b.state, LAN, None).await, (false, Some(false)));
     assert_eq!(comptes_lus(&b.state, ICI, None).await, (true, Some(true)));
-    // Statut du SSO : relié, sans le compte, pour un autre appareil.
+    // Statut du SSO : rc14, le réseau local relie le compte, il le voit donc
+    // (menu du compte, photo de profil). Les réglages et l'export ci-dessus ne
+    // le livrent toujours pas ; le relais et les mandataires n'en voient que
+    // « relié » (voir `compte_reseau_local_tests.rs`).
     let (_, texte) = appel(&b.state, LAN, None, "GET", "/api/v1/cloud/sso/status", None).await;
     let v = json_de(&texte);
     assert_eq!(v["connected"], true, "{texte}");
-    assert!(v["user"].is_null(), "{texte}");
-    assert_eq!(v["details_hidden"], true, "{texte}");
+    assert_eq!(v["details_hidden"], false, "{texte}");
     let (_, texte) = appel(&b.state, ICI, None, "GET", "/api/v1/cloud/sso/status", None).await;
     assert_eq!(json_de(&texte)["details_hidden"], false, "{texte}");
     assert_eq!(

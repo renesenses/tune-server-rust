@@ -3186,3 +3186,7 @@ mod confinement_chemins_tests {
 #[cfg(test)]
 #[path = "cloud_garde_compte_tests.rs"]
 mod cloud_garde_compte_tests;
+
+#[cfg(test)]
+#[path = "compte_reseau_local_tests.rs"]
+mod compte_reseau_local_tests;
