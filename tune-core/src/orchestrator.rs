@@ -2101,6 +2101,9 @@ impl PlaybackOrchestrator {
     pub(crate) const UPSAMPLER_REPLAY_FLOOR_MS: u64 = 1_500;
 }
 
+// Fil 3009, point 15 — l'album de service d'une écoute, repris de la file.
+#[cfg(test)]
+mod album_de_l_ecoute_de_service_3009_tests;
 // #8611 — contrôle parental : refus de lecture des artistes bloqués.
 pub mod artiste_bloque_8611;
 #[cfg(test)]
