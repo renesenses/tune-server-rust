@@ -99,3 +99,18 @@ fn des_pages_meconnaissables_suspendent_le_repli() {
     assert!(s.suspendu(t0 + SUSPENSION - std::time::Duration::from_secs(1)));
     assert!(!s.suspendu(t0 + SUSPENSION), "la suspension a une fin");
 }
+
+#[test]
+fn la_photo_vient_du_cdn_d_apple_seulement() {
+    assert!(image_admise(
+        "https://is1-ssl.mzstatic.com/image/thumb/a/600x600cc.jpg"
+    ));
+    for mauvaise in [
+        "http://is1-ssl.mzstatic.com/a.jpg",
+        "https://mzstatic.com.exemple.net/a.jpg",
+        "https://img.exemple.net/mzstatic.com/a.jpg",
+        "pas une adresse",
+    ] {
+        assert!(!image_admise(mauvaise), "{mauvaise}");
+    }
+}

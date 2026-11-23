@@ -85,7 +85,8 @@ async fn faux_itunes(
                                 Some("https://music.apple.example/assets/meta/apple-music.png")
                             }
                             "sans" => None,
-                            _ => Some("https://is1.mzstatic.example/photo/1200x630cw.png"),
+                            "ailleurs" => Some("https://img.exemple.net/photo/1200x630cw.png"),
+                            _ => Some("https://is1.mzstatic.com/photo/1200x630cw.png"),
                         };
                         axum::response::Html(page_artiste(og))
                     }
@@ -427,7 +428,7 @@ async fn sans_pochette_la_photo_de_l_artiste_au_nom_exact() {
     assert_eq!(
         t,
         Trouvaille {
-            url: "https://is1.mzstatic.example/photo/600x600cc.jpg".into(),
+            url: "https://is1.mzstatic.com/photo/600x600cc.jpg".into(),
             origine: Origine::PhotoArtiste,
         }
     );
@@ -877,4 +878,51 @@ async fn le_budget_epuise_ne_laisse_plus_rien_partir() {
     .await;
     assert_eq!(recherches(&journal).len(), 2);
     assert!(!incident, "le budget n'est pas un incident");
+}
+
+/// La page d'artiste ne se lit que sur music.apple.com, et la photo ne vient
+/// que de `*.mzstatic.com` : une adresse d'ailleurs, même rendue par iTunes,
+/// rend le logo de la station, sans aucun appel vers elle.
+#[tokio::test]
+async fn page_et_photo_d_apple_seulement() {
+    let (base, journal) = faux_itunes(move |_, q| {
+        if q.get("entity").map(String::as_str) == Some("musicArtist") {
+            vec![json!({
+                "wrapperType": "artist", "artistName": "Pixies 8452 ext", "artistId": 4243,
+                "artistLinkUrl": "https://exemple.net/artist/pixies",
+            })]
+        } else {
+            Vec::new()
+        }
+    })
+    .await;
+    let prep = preparer("Pixies 8452 ext - Hey", "Radio 8452 hote");
+    assert_eq!(
+        chercher(source(&base), &prep, "US", "Radio 8452 hote", true).await,
+        None
+    );
+    assert!(
+        !recherches(&journal)
+            .iter()
+            .any(|q| q["_chemin"] == "/artist"),
+        "aucune page lue hors de music.apple.com"
+    );
+
+    let cellule: Base = Arc::default();
+    let c = cellule.clone();
+    let (base, _) = faux_itunes(move |_, q| {
+        if q.get("entity").map(String::as_str) == Some("musicArtist") {
+            vec![artiste(&c, "Pixies 8452 img", "ailleurs")]
+        } else {
+            Vec::new()
+        }
+    })
+    .await;
+    cellule.set(base.clone()).unwrap();
+    let prep = preparer("Pixies 8452 img - Hey", "Radio 8452 image");
+    assert_eq!(
+        chercher(source(&base), &prep, "US", "Radio 8452 image", true).await,
+        None,
+        "une photo hors de *.mzstatic.com n'est pas affichée"
+    );
 }

@@ -211,6 +211,22 @@ async fn lire_la_page(source: Source<'_>, adresse: &str) -> Option<String> {
     Some(String::from_utf8_lossy(&octets).into_owned())
 }
 
+/// La page d'artiste ne se lit que sur `https://music.apple.com/`. Les
+/// épreuves, qui dressent un faux service, lisent aussi sous sa racine.
+fn page_admise(source: Source<'_>, page: &str) -> bool {
+    page.starts_with("https://music.apple.com/")
+        || (source.base != super::ITUNES_BASE && page.starts_with(&format!("{}/", source.base)))
+}
+
+/// La photo ne vient que du CDN d'Apple, `*.mzstatic.com`, en `https://`.
+pub fn image_admise(adresse: &str) -> bool {
+    let Ok(url) = reqwest::Url::parse(adresse) else {
+        return false;
+    };
+    let hote = url.host_str().unwrap_or_default().to_ascii_lowercase();
+    url.scheme() == "https" && (hote == "mzstatic.com" || hote.ends_with(".mzstatic.com"))
+}
+
 /// La photo de l'artiste `nom`, dans la boutique `boutique`.
 pub async fn photo_artiste(source: Source<'_>, nom: &str, boutique: &str) -> Photo {
     let nom = nom.trim();
@@ -249,6 +265,9 @@ pub async fn photo_artiste(source: Source<'_>, nom: &str, boutique: &str) -> Pho
         let Some(page) = franc.get("artistLinkUrl").and_then(Value::as_str) else {
             return Photo::sans("artiste sans page");
         };
+        if !page_admise(source, page) {
+            return Photo::sans("page d'artiste hors de music.apple.com");
+        }
         let Some(html) = lire_la_page(source, page).await else {
             return Photo::panne("page artiste illisible");
         };
@@ -259,6 +278,7 @@ pub async fn photo_artiste(source: Source<'_>, nom: &str, boutique: &str) -> Pho
             Some(og) if og.contains(GENERIQUE) => {
                 Photo::sans("pas de photo chez Apple (logo générique)")
             }
+            Some(og) if !image_admise(&og) => Photo::sans("photo hors de *.mzstatic.com"),
             Some(og) => Photo {
                 url: Some(carre(&og, 600)),
                 raison: "",
