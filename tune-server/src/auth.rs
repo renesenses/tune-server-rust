@@ -1167,13 +1167,12 @@ impl FromRequestParts<AppState> for AdminOuReseauLocalPourLaMiseAJour {
 ///   ([`appel_depuis_le_reseau_local`]) ; jamais le relais distant, un
 ///   mandataire inverse ni une adresse hors réseau local.
 ///
-/// Décision du 23/11 : depuis le réseau local, la liaison n'est acceptée que
-/// si AUCUN compte n'est encore relié au serveur. Remplacer un compte relié
-/// reste à cette machine ou à l'administrateur. Ce contrôle dépend de l'état
-/// du compte et du moment de la ronde : la garde dit seulement par
-/// où l'appel est passé (`par_le_reseau_local`), et `routes::cloud` refait le
-/// contrôle à l'autorisation ET au retour, juste avant d'enregistrer la
-/// session ([`refus_compte_deja_relie`]).
+/// Décision du 23/11 (option C) : depuis le réseau local, la liaison relie un
+/// serveur sans compte, ou reconnecte le MÊME compte ; remplacer le compte
+/// relié par un autre reste à cette machine ou à l'administrateur. Le compte
+/// n'est connu qu'après l'échange du code : la garde dit seulement par où
+/// l'appel est passé (`par_le_reseau_local`), et `routes::cloud` juge au
+/// retour, juste avant d'enregistrer la session ([`refus_compte_deja_relie`]).
 ///
 /// La ronde OAuth garde ses propres verrous (PKCE, `state` à usage unique,
 /// `redirect_uri` mémorisée).
@@ -1211,9 +1210,9 @@ impl FromRequestParts<AppState> for AdminOuReseauLocalPourLeCompte {
     }
 }
 
-/// Refus de LIER depuis le réseau local, sans authentification, un serveur
-/// qui a déjà un compte mozaiklabs.fr (décision du 23/11) : le remplacer reste
-/// à cette machine ou à l'administrateur. Motif `account_already_linked`,
+/// Refus de LIER depuis le réseau local, sans authentification, un AUTRE
+/// compte mozaiklabs.fr que celui déjà relié au serveur (décision du 23/11) :
+/// le remplacer reste à cette machine ou à l'administrateur. Motif `account_already_linked`,
 /// phrase `api.machine.accountAlreadyLinked` dans la langue de l'interface.
 pub fn refus_compte_deja_relie(entetes: &axum::http::HeaderMap) -> (StatusCode, Json<Value>) {
     tracing::warn!("liaison_du_compte_refusee_depuis_le_reseau_local_compte_deja_relie");

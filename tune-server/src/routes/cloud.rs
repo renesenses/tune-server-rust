@@ -227,15 +227,41 @@ fn compte_du_serveur_relie(settings: &SettingsRepo) -> bool {
     })
 }
 
-/// Décision du 23/11 : sans authentification, le réseau local ne relie le
-/// serveur que si aucun compte ne l'est encore. Cette machine et
-/// l'administrateur le peuvent toujours (remplacement compris).
-fn remplacement_refuse(
+/// Deux comptes mozaiklabs.fr sont-ils le même ? L'identifiant stable du site
+/// d'abord ; à défaut (identifiant absent ou nul), le courriel normalisé
+/// (espaces retirés, minuscules).
+fn meme_compte(
+    en_base: &tune_core::cloud::sso::CloudUser,
+    obtenu: &tune_core::cloud::sso::CloudUser,
+) -> bool {
+    if en_base.id > 0 && obtenu.id > 0 {
+        return en_base.id == obtenu.id;
+    }
+    let normal = |e: &str| e.trim().to_lowercase();
+    let courriel = normal(&en_base.email);
+    !courriel.is_empty() && courriel == normal(&obtenu.email)
+}
+
+/// Décisions du 23/11 (option C) : sans authentification, le réseau local
+/// relie le serveur s'il n'a aucun compte, ou RECONNECTE le compte déjà relié
+/// (même compte, session renouvelée, « reconnexion requise » comprise). Il ne
+/// le remplace jamais par un autre compte : c'est à cette machine ou à
+/// l'administrateur. Jugé APRÈS l'échange du code, sur le compte obtenu ; un
+/// compte relié dont l'identité est illisible n'est pas « le même ».
+fn autre_compte_refuse(
     settings: &SettingsRepo,
     par_le_reseau_local: bool,
-    liaison: Liaison,
+    obtenu: &tune_core::cloud::sso::CloudUser,
 ) -> bool {
-    par_le_reseau_local && liaison == Liaison::Serveur && compte_du_serveur_relie(settings)
+    if !par_le_reseau_local || !compte_du_serveur_relie(settings) {
+        return false;
+    }
+    let en_base: Option<tune_core::cloud::sso::CloudUser> = settings
+        .get("mozaik_user")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    !en_base.is_some_and(|u| meme_compte(&u, obtenu))
 }
 
 /// Réglages dont l'écriture fait envoyer au nom du compte par une tâche de
@@ -285,8 +311,8 @@ enum Liaison {
 
 /// Qui relie quoi. Authentification coupée : cette machine ou le réseau local
 /// (`AdminOuReseauLocalPourLeCompte`) relie le serveur ; depuis le réseau
-/// local, la liaison suppose qu'aucun compte n'est encore relié
-/// ([`compte_du_serveur_relie`]). La déliaison reste à cette machine
+/// local, seulement s'il n'a pas de compte ou pour reconnecter le même
+/// ([`autre_compte_refuse`]). La déliaison reste à cette machine
 /// (`AdminOuCetteMachine`).
 /// Authentification active : l'administrateur relie le serveur, un compte
 /// standard ne relie que son propre profil.
@@ -336,15 +362,11 @@ async fn sso_authorize(
     headers: HeaderMap,
     Query(requete): Query<Vec<(String, String)>>,
 ) -> impl IntoResponse {
-    let par_le_reseau_local = garde.as_ref().is_ok_and(|g| g.par_le_reseau_local);
     let liaison = match liaison_autorisee(&state, garde, appelant) {
         Ok(l) => l,
         Err(refus) => return page_refus_hors_machine(&headers, refus),
     };
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    if remplacement_refuse(&settings, par_le_reseau_local, liaison) {
-        return page_refus_hors_machine(&headers, crate::auth::refus_compte_deja_relie(&headers));
-    }
     let Some(auth) = get_mozaik_auth(&settings) else {
         // sso_authorize is a full browser navigation, so degrade to a friendly
         // HTML page instead of raw JSON when Cloud SSO isn't provisioned on this
@@ -496,13 +518,6 @@ async fn sso_callback(
     };
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    // Le contrôle du 23/11 est REFAIT au retour : deux liaisons lancées du
-    // réseau local quand aucun compte n'était relié, la première finie relie
-    // le serveur, la seconde n'a plus le droit de le remplacer. L'attente
-    // PKCE n'est pas touchée.
-    if remplacement_refuse(&settings, par_le_reseau_local, Liaison::Serveur) {
-        return page_refus_hors_machine(&headers, crate::auth::refus_compte_deja_relie(&headers));
-    }
     let Some(auth) = get_mozaik_auth(&settings) else {
         return page_echec_compte(
             &headers,
@@ -589,10 +604,11 @@ async fn sso_callback(
         }
     };
 
-    // Et une dernière fois après l'échange avec mozaiklabs.fr (quelques
-    // secondes) : une liaison finie entre-temps n'est pas remplacée. Avant
+    // Décision du 23/11 (option C) : depuis le réseau local, le compte obtenu
+    // doit être celui déjà relié, s'il y en a un. Jugé ici, après l'échange et
+    // la relecture du profil (on connaît enfin le compte), et avant
     // l'adoption ci-dessous : un retour refusé n'écrit rien.
-    if remplacement_refuse(&settings, par_le_reseau_local, Liaison::Serveur) {
+    if autre_compte_refuse(&settings, par_le_reseau_local, &user) {
         return page_refus_hors_machine(&headers, crate::auth::refus_compte_deja_relie(&headers));
     }
 

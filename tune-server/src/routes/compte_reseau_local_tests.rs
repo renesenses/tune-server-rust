@@ -14,9 +14,10 @@
 //! 3. authentification active, sans jeton : refusé, depuis le réseau local
 //!    comme depuis la machine ;
 //! 4. décisions du 23/11 :
-//!    - depuis le réseau local, la liaison n'est acceptée que si AUCUN compte
-//!      n'est relié ; cette machine remplace toujours le compte. Le contrôle
-//!      est refait au retour, avant et après l'échange avec mozaiklabs.fr ;
+//!    - depuis le réseau local, la liaison relie un serveur sans compte, ou
+//!      reconnecte le MÊME compte (option C) ; un autre compte est refusé
+//!      après l'échange du code, sans rien écrire. Cette machine remplace
+//!      toujours le compte ;
 //!    - la déliaison (`POST /cloud/sso/disconnect`) reste à cette machine ou à
 //!      l'administrateur : réseau local, relais et mandataire refusés,
 //!      authentification active sans jeton refusée.
@@ -444,39 +445,22 @@ async fn reseau_local_aucun_compte_relie_la_liaison_passe() {
     assert!(!attente_du_serveur(&b.state).is_empty(), "liaison préparée");
 }
 
-/// 6. Réseau local, un compte déjà relié : refusé (403, motif
-/// `account_already_linked`, phrase claire), rien de préparé, le compte reste.
+/// 6. Réseau local, un compte déjà relié : l'AUTORISATION passe (option C,
+/// la reconnexion du même compte doit pouvoir partir) ; le compte obtenu sera
+/// jugé au retour.
 #[tokio::test]
-async fn reseau_local_compte_deja_relie_la_liaison_est_refusee() {
+async fn reseau_local_compte_deja_relie_l_autorisation_passe() {
     let b = banc();
     relier_le_proprietaire(&b.state);
-    let (statut, page) = get(
-        &b.state,
-        LAN,
-        AUTORISER,
-        &[HOTE, ("accept-language", "fr-FR,fr;q=0.9")],
-    )
-    .await;
-    assert_eq!(statut, StatusCode::FORBIDDEN, "{page}");
-    assert!(page.contains("<html"), "le refus est une page : {page}");
-    assert!(
-        page.contains("déjà relié à ce serveur") && page.contains("machine du serveur"),
-        "phrase française attendue — {page}"
-    );
-    assert!(attente_du_serveur(&b.state).is_empty(), "rien de préparé");
+    let (statut, page) = get(&b.state, LAN, AUTORISER, &[HOTE]).await;
+    assert_eq!(statut, StatusCode::TEMPORARY_REDIRECT, "{page}");
+    assert!(!attente_du_serveur(&b.state).is_empty(), "liaison préparée");
     assert_eq!(courriel_relie(&b.state), "proprio@exemple.test");
 
-    // Le motif dédié, lisible par un client (JSON de la garde).
+    // Le motif dédié du refus, lisible par un client (JSON de la garde).
     let refus = crate::auth::refus_compte_deja_relie(&axum::http::HeaderMap::new());
     assert_eq!(refus.0, StatusCode::FORBIDDEN);
     assert_eq!(refus.1.0["reason"], "account_already_linked");
-
-    // Même un compte dont la session est périmée (« reconnexion requise ») :
-    // son identité suffit, il reste le compte du serveur.
-    let b = banc();
-    reglages(&b.state).set("mozaik_user", COMPTE).unwrap();
-    let (statut, page) = get(&b.state, LAN, AUTORISER, &[HOTE]).await;
-    assert_eq!(statut, StatusCode::FORBIDDEN, "identité seule — {page}");
 }
 
 /// 7. Cette machine, un compte déjà relié : la liaison passe (remplacement
@@ -491,8 +475,9 @@ async fn cette_machine_compte_deja_relie_la_liaison_passe() {
 }
 
 /// 8. La course : une liaison lancée du réseau local quand aucun compte
-/// n'était relié, puis un compte relié avant son retour. Le retour est
-/// refusé, même avec le bon `state`, et le compte relié n'est pas remplacé.
+/// n'était relié, puis un AUTRE compte relié avant son retour. Le retour est
+/// refusé après l'échange (le compte obtenu n'est pas celui relié), même avec
+/// le bon `state`, et le compte relié n'est pas remplacé.
 #[tokio::test]
 async fn reseau_local_le_retour_refait_le_controle() {
     let b = banc();
@@ -516,12 +501,6 @@ async fn reseau_local_le_retour_refait_le_controle() {
     )
     .await;
     assert_eq!(statut, StatusCode::FORBIDDEN, "retour — {page}");
-    // Refusé dès l'entrée du retour : l'attente n'est pas consommée et le code
-    // n'est pas échangé (aucun jeton émis pour rien).
-    assert!(
-        !attente_du_serveur(&b.state).is_empty(),
-        "le contrôle a lieu avant l'échange du code"
-    );
     assert_eq!(courriel_relie(&b.state), "proprio@exemple.test");
     assert_eq!(
         reglages(&b.state)
@@ -714,6 +693,175 @@ async fn authentification_active_sans_jeton_la_deliaison_est_refusee() {
             "sans jeton depuis {depuis} — {texte}"
         );
     }
+    assert_eq!(courriel_relie(&b.state), "proprio@exemple.test");
+}
+
+// ─── Décision du 23/11, option C : reconnexion du même compte ───────────────
+
+/// Une ronde complète (autorisation puis retour au bon `state`) depuis
+/// `depuis`, avec ces en-têtes ; rend le statut et le corps du retour.
+async fn ronde(state: &AppState, depuis: &str, entetes: &[(&str, &str)]) -> (StatusCode, String) {
+    let (statut, page) = get(state, depuis, AUTORISER, entetes).await;
+    assert_eq!(
+        statut,
+        StatusCode::TEMPORARY_REDIRECT,
+        "autorisation — {page}"
+    );
+    let etat = json_de(&attente_du_serveur(state))["state"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    get(
+        state,
+        depuis,
+        &format!("/api/v1/cloud/sso/callback?code=c&state={etat}"),
+        entetes,
+    )
+    .await
+}
+
+/// Le compte que rend `faux_mozaiklabs("tiers@exemple.test")` (id 77).
+const COMPTE_TIERS: &str = r#"{"id":77,"email":"tiers@exemple.test","display_name":"T","is_admin":false,"avatar_url":null}"#;
+
+/// 14. Réseau local, le MÊME compte déjà relié, ou en « reconnexion
+/// requise » : la ronde passe et la session est renouvelée.
+#[tokio::test]
+async fn reseau_local_le_meme_compte_se_reconnecte() {
+    for reconnexion_requise in [false, true] {
+        let b = banc();
+        let base = super::cloud_garde_compte_tests::faux_mozaiklabs("tiers@exemple.test").await;
+        let r = reglages(&b.state);
+        r.set("mozaik_base_url", &base).unwrap();
+        r.set("mozaik_access_token", "ancien-jeton").unwrap();
+        r.set("mozaik_user", COMPTE_TIERS).unwrap();
+        if reconnexion_requise {
+            r.set(
+                tune_core::cloud::sso::CLE_RECONNEXION_REQUISE,
+                "2026-11-20T10:00:00Z",
+            )
+            .unwrap();
+        }
+        let (statut, page) = ronde(&b.state, LAN, &[HOTE]).await;
+        assert_eq!(
+            statut,
+            StatusCode::TEMPORARY_REDIRECT,
+            "reconnexion requise : {reconnexion_requise} — {page}"
+        );
+        assert_eq!(
+            r.get("mozaik_access_token").unwrap().as_deref(),
+            Some("jeton-tiers"),
+            "jeton renouvelé"
+        );
+        assert!(
+            !tune_core::cloud::sso::reconnexion_requise(&r),
+            "« reconnexion requise » levée"
+        );
+        assert_eq!(courriel_relie(&b.state), "tiers@exemple.test");
+    }
+}
+
+/// 15. Sans identifiant stable en base, le courriel normalisé tranche : même
+/// courriel (casse et espaces près) = même compte ; autre courriel = refus.
+#[tokio::test]
+async fn reseau_local_a_defaut_d_identifiant_le_courriel_tranche() {
+    for (courriel_en_base, attendu) in [
+        ("  Tiers@Exemple.TEST ", StatusCode::TEMPORARY_REDIRECT),
+        ("autre@exemple.test", StatusCode::FORBIDDEN),
+    ] {
+        let b = banc();
+        let base = super::cloud_garde_compte_tests::faux_mozaiklabs("tiers@exemple.test").await;
+        let r = reglages(&b.state);
+        r.set("mozaik_base_url", &base).unwrap();
+        r.set("mozaik_access_token", "ancien-jeton").unwrap();
+        r.set(
+            "mozaik_user",
+            &serde_json::json!({"id": 0, "email": courriel_en_base, "display_name": "T",
+                "is_admin": false, "avatar_url": null})
+            .to_string(),
+        )
+        .unwrap();
+        let (statut, page) = ronde(&b.state, LAN, &[HOTE]).await;
+        assert_eq!(statut, attendu, "{courriel_en_base:?} — {page}");
+    }
+}
+
+/// 16. Réseau local, un AUTRE compte que celui relié : refusé (403,
+/// `account_already_linked`, phrase claire) et rien n'est écrit : ni session,
+/// ni identité, ni propriétaire adopté, ni profil créé.
+#[tokio::test]
+async fn reseau_local_un_autre_compte_est_refuse_et_rien_n_est_ecrit() {
+    let b = banc();
+    let base = super::cloud_garde_compte_tests::faux_mozaiklabs("tiers@exemple.test").await;
+    let r = reglages(&b.state);
+    r.set("mozaik_base_url", &base).unwrap();
+    relier_le_proprietaire(&b.state);
+    r.set("mozaik_refresh_token", "renouv-du-proprietaire")
+        .unwrap();
+    // Le profil du propriétaire existe : une adoption l'écrirait.
+    use tune_core::db::backend::{DbBackend as _, ToSqlValue};
+    b.state
+        .backend
+        .execute(
+            "UPDATE profiles SET email = ? WHERE id = 1",
+            &[&"proprio@exemple.test" as &dyn ToSqlValue],
+        )
+        .unwrap();
+    let profils = |state: &AppState| {
+        state
+            .backend
+            .query_one("SELECT COUNT(*) FROM profiles", &[])
+            .unwrap()
+            .and_then(|l| l.first().and_then(|v| v.as_i64()))
+    };
+    let avant = profils(&b.state);
+
+    let (statut, page) = ronde(
+        &b.state,
+        LAN,
+        &[HOTE, ("accept-language", "fr-FR,fr;q=0.9")],
+    )
+    .await;
+    assert_eq!(statut, StatusCode::FORBIDDEN, "{page}");
+    assert!(page.contains("<html"), "le refus est une page : {page}");
+    assert!(
+        page.contains("déjà relié à ce serveur") && page.contains("machine du serveur"),
+        "phrase française attendue — {page}"
+    );
+    assert_eq!(
+        r.get("mozaik_access_token").unwrap().as_deref(),
+        Some("jeton-du-proprietaire")
+    );
+    assert_eq!(
+        r.get("mozaik_refresh_token").unwrap().as_deref(),
+        Some("renouv-du-proprietaire")
+    );
+    assert_eq!(courriel_relie(&b.state), "proprio@exemple.test");
+    assert!(
+        r.get(tune_core::cloud::proprietaire::CLE_PROPRIETAIRE)
+            .unwrap()
+            .is_none(),
+        "aucune adoption"
+    );
+    assert_eq!(profils(&b.state), avant, "aucun profil créé");
+
+    // Cette machine, elle, remplace le compte.
+    let (statut, page) = ronde(&b.state, ICI, &[("host", "127.0.0.1:8888")]).await;
+    assert_eq!(statut, StatusCode::TEMPORARY_REDIRECT, "machine — {page}");
+    assert_eq!(courriel_relie(&b.state), "tiers@exemple.test");
+}
+
+/// 17. « Délier puis relier » depuis le réseau local : la déliaison est
+/// refusée, et la liaison d'un autre compte aussi ; le compte reste.
+#[tokio::test]
+async fn reseau_local_delier_puis_relier_un_autre_compte_est_refuse() {
+    let b = banc();
+    let base = super::cloud_garde_compte_tests::faux_mozaiklabs("tiers@exemple.test").await;
+    reglages(&b.state).set("mozaik_base_url", &base).unwrap();
+    relier_le_proprietaire(&b.state);
+    let (statut, texte) = post(&b.state, LAN, DISCONNECT, &[HOTE]).await;
+    assert_eq!(statut, StatusCode::FORBIDDEN, "déliaison — {texte}");
+    let (statut, page) = ronde(&b.state, LAN, &[HOTE]).await;
+    assert_eq!(statut, StatusCode::FORBIDDEN, "liaison — {page}");
     assert_eq!(courriel_relie(&b.state), "proprio@exemple.test");
 }
 
