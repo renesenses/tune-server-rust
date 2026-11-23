@@ -202,11 +202,7 @@ impl Chaine {
             executer_chaine_locale(&mut f, &self.moteurs(), ordre, 2, false);
             sortie.extend_from_slice(&f);
         }
-        sortie.extend(
-            vidanger_chaine_locale(&self.moteurs(), ordre, 2, false)
-                .into_iter()
-                .map(f64::from),
-        );
+        sortie.extend(vidanger_chaine_locale_f64(&self.moteurs(), ordre, 2, false));
         sortie
     }
 
@@ -827,4 +823,122 @@ pub(in crate::outputs::local) fn comparer_un_etage_casque_a_l_ancien(
         blocs += 1;
     }
     blocs
+}
+
+// ---------------------------------------------------------------------------
+// TESS T09b — la convolution, étage `f64` natif de la chaîne locale
+// ---------------------------------------------------------------------------
+
+/// Les prises du convolveur de test, en `f64`, par canal.
+fn prises_du_convolveur() -> [Vec<f64>; 2] {
+    let mut g = vec![0.0f64; 96];
+    g[0] = f64::from(0.8f32);
+    g[7] = f64::from(0.3f32);
+    g[40] = f64::from(-0.2f32);
+    let mut d = vec![0.0f64; 96];
+    d[0] = f64::from(0.7f32);
+    d[11] = f64::from(0.25f32);
+    d[63] = f64::from(0.1f32);
+    [g, d]
+}
+
+/// « 64 bits réels » AVEC la convolution : une source 32 bits traverse
+/// l'étage de convolution de la chaîne locale (adaptateur, exécuteur,
+/// vidange) et colle à la convolution DIRECTE calculée en double précision à
+/// moins de 1e-12. Aucune conversion `f32` entre le décodage et la sortie de
+/// la chaîne. CONTRE-ÉPREUVE : l'ancien chemin (`f32` entre étages) échoue au
+/// même banc.
+#[test]
+fn soixante_quatre_bits_reels_avec_la_convolution_t09b() {
+    let m = mots(6_000, 32);
+    let source = octets(&m, 32);
+    let trames = m.len() / 2;
+    let h = prises_du_convolveur();
+    let mut reference = vec![0.0f64; (trames + 64) * 2];
+    for c in 0..2 {
+        for n in 0..trames + 64 {
+            let mut acc = 0.0f64;
+            for (k, hk) in h[c].iter().enumerate() {
+                if n >= k && n - k < trames {
+                    acc += hk * f64::from(m[(n - k) * 2 + c]) / 2_147_483_648.0;
+                }
+            }
+            reference[n * 2 + c] = acc;
+        }
+    }
+    let ecart = |sortie: &[f64]| {
+        // La sortie de la chaîne porte la latence d'un bloc (64 trames) en
+        // tête ; la vidange rend la queue.
+        sortie[64 * 2..]
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max)
+    };
+    let chaine = Chaine::new(false, true, false, false);
+    let nouveau = chaine.nouveau(&source, 32, OrdreLocal::HISTORIQUE, 1_000);
+    assert_eq!(nouveau.len(), trames * 2 + 64 * 2);
+    let e = ecart(&nouveau);
+    assert!(
+        e < 1e-12,
+        "écart {e:e} : la convolution locale n'est pas en 64 bits"
+    );
+
+    let chaine = Chaine::new(false, true, false, false);
+    let ancien: Vec<f64> = chaine
+        .ancien(&source, 32, 1_000)
+        .into_iter()
+        .map(f64::from)
+        .collect();
+    let e_ancien = ecart(&ancien);
+    assert!(
+        e_ancien >= 1e-12,
+        "le banc ne discrimine pas : l'ancien chemin f32 passe ({e_ancien:e})"
+    );
+}
+
+/// La latence de l'étage de convolution est ANNONCÉE à l'exécuteur, et c'est
+/// la vraie : une impulsion ressort exactement `latence_totale_trames()`
+/// trames plus tard (pic de la réponse en tête).
+#[test]
+fn la_convolution_annonce_sa_latence_exacte_a_l_executeur_t09b() {
+    let conv = Mutex::new(Some(convolveur()));
+    let mut etage = AdaptateurConvolution {
+        moteur: &conv,
+        canaux: 2,
+    };
+    let mut ex = Executeur::new();
+    let format = FormatFlux {
+        channels: 2,
+        sample_rate_hz: 48_000,
+    };
+    let mut etages: [&mut dyn EtageTess; 1] = [&mut etage];
+    ex.preparer(&mut etages, format, 512, false).unwrap();
+    assert_eq!(ex.latence_totale_trames(), 64);
+    let mut x = vec![0.0f64; 512 * 2];
+    x[0] = 1.0;
+    x[1] = 1.0;
+    let sortie = ex.traiter(&mut etages, &mut x, 512).unwrap();
+    let pic = sortie
+        .echantillons
+        .chunks(2)
+        .position(|t| t[0].abs() > 0.5)
+        .unwrap();
+    assert_eq!(pic as u64, 64, "le pic sort à la latence annoncée");
+    assert!(
+        (sortie.echantillons[pic * 2] - f64::from(0.8f32)).abs() < 1e-14,
+        "gain du pic gauche"
+    );
+}
+
+/// Aucune allocation dans le traitement AVEC la convolution (T09b : le moteur
+/// `f64` réserve ses tampons FFT à la construction).
+#[test]
+fn le_traitement_avec_convolution_n_alloue_pas_t09b() {
+    let chaine = Chaine::new(true, true, true, true);
+    let mut f = crate::outputs::local::pcm_bytes_to_f64(&octets(&mots(512, 24), 24), 24);
+    executer_chaine_locale(&mut f, &chaine.moteurs(), OrdreLocal::HISTORIQUE, 2, false);
+    super::super::ringbuf_tests::assert_no_allocation(|| {
+        executer_chaine_locale(&mut f, &chaine.moteurs(), OrdreLocal::HISTORIQUE, 2, false);
+    });
 }

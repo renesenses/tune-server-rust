@@ -1981,6 +1981,7 @@ impl LocalOutput {
         let current_format = self
             .current_format()
             .filter(|_| self.convolution_autorisee.load(Ordering::Relaxed));
+        let fondu = Self::trames_de_fondu(current_format);
         let active = match current_format {
             Some((sample_rate, channels)) => {
                 match config.build_for(1024, sample_rate, channels as usize) {
@@ -1988,15 +1989,16 @@ impl LocalOutput {
                     Err(error) => {
                         // La configuration reste mémorisée pour une prochaine
                         // piste compatible, mais l'ancien moteur ne doit jamais
-                        // continuer à corriger le format courant.
-                        *self.convolver.lock().unwrap() = None;
+                        // continuer à corriger le format courant : il s'éteint
+                        // (en fondu s'il joue, T09b).
+                        self.installer_moteur(None, fondu);
                         return Err(error);
                     }
                 }
             }
             None => None,
         };
-        *self.convolver.lock().unwrap() = active;
+        self.installer_moteur(active, fondu);
         tracing::info!(
             path,
             device = %self.device_name,
@@ -2012,8 +2014,43 @@ impl LocalOutput {
 
     pub fn clear_convolver(&self) {
         *self.convolver_config.lock().unwrap() = None;
-        *self.convolver.lock().unwrap() = None;
+        // T09b — flux en cours, le filtre retiré s'éteint en fondu (le moteur
+        // reste un simple retard jusqu'à la piste suivante, qui ne le
+        // reconstruit pas) : ni clic ni saut de temps.
+        self.installer_moteur(None, Self::trames_de_fondu(self.current_format()));
         tracing::info!(device = %self.device_name, "convolver_cleared");
+    }
+
+    /// T09b — durée des fondus de changement de filtre : 20 ms à la cadence du
+    /// flux en cours ; 0 sans flux (remplacement immédiat, rien ne joue).
+    fn trames_de_fondu(format: Option<(u32, u16)>) -> usize {
+        format
+            .map(|(taux, _)| (taux as usize / 50).max(1))
+            .unwrap_or(0)
+    }
+
+    /// T09b — poser le moteur de convolution SANS discontinuité.
+    ///
+    /// Flux en cours (`fondu > 0`) et moteur en service : un nouveau filtre
+    /// le remplace par [`Convolver::remplacer_en_fondu`] (réchauffe muette,
+    /// puis fondu de 20 ms à latence égale) ; un retrait l'éteint en fondu
+    /// ([`Convolver::eteindre_en_fondu`]). Sinon (rien ne joue, ou moteur
+    /// incompatible : canaux ou bloc), remplacement direct, comme avant.
+    fn installer_moteur(
+        &self,
+        nouveau: Option<super::super::audio::convolver::Convolver>,
+        fondu: usize,
+    ) {
+        let mut actif = self.convolver.lock().unwrap();
+        match (actif.as_mut(), nouveau) {
+            (Some(ancien), Some(n)) if fondu > 0 => {
+                if let Err(n) = ancien.remplacer_en_fondu(n, fondu) {
+                    *actif = Some(n);
+                }
+            }
+            (Some(ancien), None) if fondu > 0 => ancien.eteindre_en_fondu(fondu),
+            (_, n) => *actif = n,
+        }
     }
 
     /// #7632 — accorder ou retirer le droit de convoluer (Premium

@@ -25,9 +25,10 @@
 //! - **Étages fixes en `f64` natif** : le ReplayGain (point d'insertion du
 //!   headroom de T07, AVANT l'exécuteur) et la compensation (#5071, APRÈS,
 //!   juste avant la quantification) sont de simples gains, appliqués en `f64`.
-//! - **Adaptateurs provisoires `f32` ↔ `f64`** pour l'égaliseur, le convolveur
-//!   et le crossfeed, comme sur la sortie locale (T03) : leurs moteurs ont des
-//!   entrées `f32`. T05, T06, T09b et T14 les remplacent par des étages `f64`.
+//! - **Adaptateurs provisoires `f32` ↔ `f64`** pour l'égaliseur et le
+//!   crossfeed, comme sur la sortie locale (T03) : leurs moteurs ont des
+//!   entrées `f32`. T05, T06 et T14 les remplacent par des étages `f64`. Le
+//!   convolveur est un étage `f64` natif depuis T09b.
 //!   Aucune AUTRE conversion `f32` ni entière n'existe entre deux étages.
 //! - **Bit-perfect** : sans étage actif, le porteur ne touche pas un octet
 //!   ([`StreamingDsp::is_active`]) ; avec des étages qui rendent des mots
@@ -208,7 +209,8 @@ impl EtageTess for AdaptateurEgaliseur<'_> {
     fn definir_bypass(&mut self, _: bool) {}
 }
 
-/// Adaptateur provisoire du convolveur (`f32`) : à porter en `f64` par T09b.
+/// TESS T09b — l'étage de convolution en `f64` natif (le moteur calcule en
+/// double précision et reçoit le tampon de la chaîne sans conversion).
 ///
 /// Le moteur rend la trame `i` à la position `i + latence` : la latence est
 /// DÉCLARÉE à l'exécuteur, l'hôte retire l'amorce en tête de flux, et la queue
@@ -238,9 +240,7 @@ impl EtageTess for AdaptateurConvolution<'_> {
         if let Some(c) = self.moteur.as_mut() {
             self.queue_restante
                 .get_or_insert_with(|| c.latency_frames());
-            par_tranches_f32(&mut t[..trames * self.canaux], self.canaux, |f| {
-                c.process_interleaved(f);
-            });
+            c.process_interleaved_f64(&mut t[..trames * self.canaux]);
         }
         Ok(())
     }
@@ -258,7 +258,7 @@ impl EtageTess for AdaptateurConvolution<'_> {
         }
         let n = trames * canaux;
         sortie[..n].fill(0.0);
-        par_tranches_f32(&mut sortie[..n], canaux, |f| c.process_interleaved(f));
+        c.process_interleaved_f64(&mut sortie[..n]);
         *restant -= trames;
         Ok(trames)
     }
