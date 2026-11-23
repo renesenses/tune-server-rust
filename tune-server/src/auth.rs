@@ -1156,20 +1156,32 @@ impl FromRequestParts<AppState> for AdminOuReseauLocalPourLaMiseAJour {
     }
 }
 
-/// Garde de la LIAISON du compte mozaiklabs.fr (`GET /cloud/sso/authorize` et
-/// son retour `GET /cloud/sso/callback`), même règle que la mise à jour
+/// Garde du compte mozaiklabs.fr du serveur : sa LIAISON
+/// (`GET /cloud/sso/authorize` et son retour `GET /cloud/sso/callback`) et sa
+/// DÉLIAISON (`POST /cloud/sso/disconnect`), même règle que la mise à jour
 /// ([`AdminOuReseauLocalPourLaMiseAJour`]) :
 ///
-/// - authentification active : l'administrateur (un compte standard relie son
-///   propre profil, voir `routes::cloud::liaison_autorisee`) ;
+/// - authentification active : l'administrateur (un compte standard relie ou
+///   délie son propre profil, voir `routes::cloud::liaison_autorisee`) ;
 /// - authentification coupée : cette machine, ou le RÉSEAU LOCAL
 ///   ([`appel_depuis_le_reseau_local`]) ; jamais le relais distant, un
 ///   mandataire inverse ni une adresse hors réseau local.
 ///
+/// Décision du 23/11 : depuis le réseau local, la liaison n'est acceptée que
+/// si AUCUN compte n'est encore relié au serveur. Remplacer un compte relié
+/// reste à cette machine ou à l'administrateur. Ce contrôle dépend de la route
+/// (la déliaison, elle, suppose un compte relié) : la garde dit seulement par
+/// où l'appel est passé (`par_le_reseau_local`), et `routes::cloud` refait le
+/// contrôle à l'autorisation ET au retour, juste avant d'enregistrer la
+/// session ([`refus_compte_deja_relie`]).
+///
 /// La ronde OAuth garde ses propres verrous (PKCE, `state` à usage unique,
-/// `redirect_uri` mémorisée) : ouvrir la garde au réseau local ne change rien
-/// à qui peut finir une liaison commencée.
-pub struct AdminOuReseauLocalPourLeCompte;
+/// `redirect_uri` mémorisée).
+pub struct AdminOuReseauLocalPourLeCompte {
+    /// Vrai quand seul le réseau local a ouvert la garde (ni administrateur,
+    /// ni cette machine).
+    pub par_le_reseau_local: bool,
+}
 
 impl FromRequestParts<AppState> for AdminOuReseauLocalPourLeCompte {
     type Rejection = (StatusCode, Json<Value>);
@@ -1178,22 +1190,48 @@ impl FromRequestParts<AppState> for AdminOuReseauLocalPourLeCompte {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
+        let admin_ou_machine = Self {
+            par_le_reseau_local: false,
+        };
         if authentification_active(state) {
             return <RequireAdmin as FromRequestParts<AppState>>::from_request_parts(parts, state)
                 .await
-                .map(|_| Self);
+                .map(|_| admin_ou_machine);
         }
         if appel_depuis_cette_machine(parts, state).await {
-            return Ok(Self);
+            return Ok(admin_ou_machine);
         }
         if appel_depuis_le_reseau_local(parts, state).await {
-            tracing::info!(
-                "liaison_du_compte_acceptee_depuis_le_reseau_local_sans_authentification"
-            );
-            return Ok(Self);
+            tracing::info!("compte_accepte_depuis_le_reseau_local_sans_authentification");
+            return Ok(Self {
+                par_le_reseau_local: true,
+            });
         }
         Err(refus_action_reservee(parts, state, Refus::CompteHorsDuReseauLocal).await)
     }
+}
+
+/// Refus de LIER depuis le réseau local, sans authentification, un serveur
+/// qui a déjà un compte mozaiklabs.fr (décision du 23/11) : le remplacer reste
+/// à cette machine ou à l'administrateur. Motif `account_already_linked`,
+/// phrase `api.machine.accountAlreadyLinked` dans la langue de l'interface.
+pub fn refus_compte_deja_relie(entetes: &axum::http::HeaderMap) -> (StatusCode, Json<Value>) {
+    tracing::warn!("liaison_du_compte_refusee_depuis_le_reseau_local_compte_deja_relie");
+    let lang = crate::i18n::lang_from_header(entetes);
+    (
+        StatusCode::FORBIDDEN,
+        Json(crate::message_api::avec_message_en(
+            json!({
+                "error": "auth_required",
+                "code": "auth_required",
+                "reason": "account_already_linked",
+                "action": "account",
+            }),
+            &lang,
+            "api.machine.accountAlreadyLinked",
+            &[],
+        )),
+    )
 }
 
 /// Extracteur infaillible, même règle que [`AdminOuReseauLocalPourLeCompte`]

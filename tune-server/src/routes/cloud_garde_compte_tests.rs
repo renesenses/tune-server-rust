@@ -3,9 +3,9 @@
 //! (`crate::routes::router`, préfixe `/api/v1`), l'adresse de l'appelant posée
 //! en extension `ConnectInfo` comme le fait le service de production.
 //!
-//! - authentification coupée, appel du réseau local → 403 `not_local` (licence,
-//!   déliaison) ; la LIAISON du compte, elle, s'ouvre au réseau local en rc14
-//!   (voir `compte_reseau_local_tests.rs`) ;
+//! - authentification coupée, appel du réseau local → 403 `not_local`
+//!   (licence) ; la LIAISON et la DÉLIAISON du compte, elles, s'ouvrent au
+//!   réseau local en rc14 (voir `compte_reseau_local_tests.rs`) ;
 //! - authentification coupée, appel de cette machine → accepté ;
 //! - authentification active, administrateur → accepté (même du réseau) ;
 //! - authentification active, compte standard → 403.
@@ -97,7 +97,9 @@ fn json_de(texte: &str) -> Value {
     serde_json::from_str(texte).unwrap_or(Value::Null)
 }
 
-/// Les routes JSON qui engagent le compte ou la licence.
+/// Les routes JSON de la licence, réservées à l'administrateur ou à cette
+/// machine. La déliaison du compte (`POST /cloud/sso/disconnect`) n'y est
+/// plus : elle passe au réseau local (décision du 23/11).
 fn routes_json() -> Vec<(&'static str, &'static str, Option<Value>)> {
     vec![
         (
@@ -108,7 +110,6 @@ fn routes_json() -> Vec<(&'static str, &'static str, Option<Value>)> {
         ("POST", "/api/v1/cloud/license/deactivate", None),
         ("POST", "/api/v1/system/license", Some(json!({ "key": "" }))),
         ("DELETE", "/api/v1/system/license", None),
-        ("POST", "/api/v1/cloud/sso/disconnect", None),
     ]
 }
 
@@ -513,11 +514,12 @@ async fn compte_standard_ne_relie_que_son_profil() {
 
 #[tokio::test]
 async fn sans_session_ni_machine_aucune_liaison_de_profil() {
-    // Authentification coupée : pas de mode « profil », la machine seulement.
+    // Authentification coupée : pas de mode « profil ». La déliaison du
+    // réseau local délie le SERVEUR (décision du 23/11), jamais un profil.
     let b = banc();
     let (statut, _) = appel(&b.state, LAN, None, "GET", "/api/v1/cloud/sso/status", None).await;
     assert_eq!(statut, StatusCode::OK);
-    let (statut, _) = appel(
+    let (statut, texte) = appel(
         &b.state,
         LAN,
         None,
@@ -526,14 +528,15 @@ async fn sans_session_ni_machine_aucune_liaison_de_profil() {
         None,
     )
     .await;
-    assert_eq!(statut, StatusCode::FORBIDDEN);
+    assert_eq!(statut, StatusCode::OK);
+    assert_eq!(json_de(&texte)["scope"], Value::Null, "{texte}");
 }
 
 // ─── Ronde SSO complète contre un faux mozaiklabs.fr ────────────────────────
 
 /// Un faux mozaiklabs.fr : jeton, puis profil `is_admin: true` (l'équipe du
 /// site) avec le courriel donné.
-async fn faux_mozaiklabs(courriel: &'static str) -> String {
+pub(super) async fn faux_mozaiklabs(courriel: &'static str) -> String {
     use axum::routing::{get, post};
     let app = axum::Router::new()
         .route(
@@ -568,7 +571,7 @@ async fn faux_mozaiklabs(courriel: &'static str) -> String {
 }
 
 /// Lance une ronde complète depuis `depuis` ; rend (statut, Set-Cookie).
-async fn ronde_complete(
+pub(super) async fn ronde_complete(
     state: &AppState,
     depuis: &str,
     jeton: Option<&str>,

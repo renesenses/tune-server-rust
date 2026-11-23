@@ -7631,6 +7631,24 @@
     "zh": "{action}：未启用身份验证时，mozaiklabs.fr 账户只能从本地网络关联，而此请求来自其他位置（远程访问、反向代理或 VPN）。请从本地网络中的设备操作，或在设置中启用身份验证并登录。",
     "tr": "{action}: kimlik doğrulama olmadan mozaiklabs.fr hesabı yalnızca yerel ağdan bağlanabilir; bu istek ise başka bir yerden geliyor (uzaktan erişim, ters vekil sunucu ya da VPN). Bunu yerel ağdaki bir cihazdan yapın ya da ayarlardan kimlik doğrulamayı etkinleştirip oturum açın."
   },
+  "api.machine.accountAlreadyLinked": {
+    "fr": "Un compte mozaiklabs.fr est déjà relié à ce serveur ; pour le changer, déliez-le d'abord ou passez par l'administrateur.",
+    "en": "A mozaiklabs.fr account is already linked to this server; to change it, unlink it first or ask the administrator.",
+    "de": "Mit diesem Server ist bereits ein mozaiklabs.fr-Konto verknüpft; um es zu ändern, heben Sie zuerst die Verknüpfung auf oder wenden Sie sich an den Administrator.",
+    "es": "Ya hay una cuenta de mozaiklabs.fr vinculada a este servidor; para cambiarla, desvincúlela primero o pídaselo al administrador.",
+    "it": "Un account mozaiklabs.fr è già collegato a questo server; per cambiarlo, scollegalo prima oppure rivolgiti all'amministratore.",
+    "el": "Ένας λογαριασμός mozaiklabs.fr είναι ήδη συνδεδεμένος με αυτόν τον διακομιστή· για να τον αλλάξετε, αποσυνδέστε τον πρώτα ή απευθυνθείτε στον διαχειριστή.",
+    "hu": "Ehhez a szerverhez már kapcsolva van egy mozaiklabs.fr-fiók; a cseréjéhez előbb bontsa a kapcsolatot, vagy forduljon a rendszergazdához.",
+    "ja": "このサーバーにはすでに mozaiklabs.fr アカウントが連携されています。変更するには、まず連携を解除するか、管理者に依頼してください。",
+    "ko": "이 서버에는 이미 mozaiklabs.fr 계정이 연결되어 있습니다. 변경하려면 먼저 연결을 해제하거나 관리자에게 요청하세요.",
+    "nb": "En mozaiklabs.fr-konto er allerede koblet til denne serveren; for å bytte den, koble den fra først eller gå via administratoren.",
+    "pl": "Do tego serwera jest już połączone konto mozaiklabs.fr; aby je zmienić, najpierw je odłącz albo poproś administratora.",
+    "ro": "Un cont mozaiklabs.fr este deja conectat la acest server; pentru a-l schimba, deconectați-l mai întâi sau apelați la administrator.",
+    "sv": "Ett mozaiklabs.fr-konto är redan kopplat till den här servern; för att byta det, koppla först bort det eller vänd dig till administratören.",
+    "vi": "Máy chủ này đã được liên kết với một tài khoản mozaiklabs.fr; để thay đổi, hãy hủy liên kết trước hoặc nhờ quản trị viên.",
+    "zh": "此服务器已关联一个 mozaiklabs.fr 账户；如需更换，请先解除关联，或请管理员操作。",
+    "tr": "Bu sunucuya zaten bir mozaiklabs.fr hesabı bağlı; değiştirmek için önce bağlantısını kaldırın ya da yöneticiye başvurun."
+  },
   "api.machine.action.account": {
     "fr": "Relier le compte mozaiklabs.fr",
     "en": "Link the mozaiklabs.fr account",

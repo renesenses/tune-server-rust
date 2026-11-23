@@ -214,6 +214,30 @@ fn page_refus_hors_machine(
 
 type RefusDeGarde = (StatusCode, Json<Value>);
 
+/// Un compte mozaiklabs.fr est-il relié au serveur ? Sa session (jeton) ou son
+/// identité est en base, même périmée (« reconnexion requise ») : c'est encore
+/// le compte du serveur, que seule la déliaison efface.
+fn compte_du_serveur_relie(settings: &SettingsRepo) -> bool {
+    ["mozaik_access_token", "mozaik_user"].iter().any(|cle| {
+        settings
+            .get(cle)
+            .ok()
+            .flatten()
+            .is_some_and(|v| !v.trim().is_empty())
+    })
+}
+
+/// Décision du 23/11 : sans authentification, le réseau local ne relie le
+/// serveur que si aucun compte ne l'est encore. Cette machine et
+/// l'administrateur le peuvent toujours (remplacement compris).
+fn remplacement_refuse(
+    settings: &SettingsRepo,
+    par_le_reseau_local: bool,
+    liaison: Liaison,
+) -> bool {
+    par_le_reseau_local && liaison == Liaison::Serveur && compte_du_serveur_relie(settings)
+}
+
 /// Réglages dont l'écriture fait envoyer au nom du compte par une tâche de
 /// fond (résumé hebdomadaire, écoutes envoyées au compte, partage
 /// communautaire, consentements de télémétrie et de contribution, que
@@ -260,8 +284,9 @@ enum Liaison {
 }
 
 /// Qui relie quoi. Authentification coupée : cette machine ou le réseau local
-/// (`AdminOuReseauLocalPourLeCompte`) relie le serveur ; la déliaison reste à
-/// cette machine (`AdminOuCetteMachine`).
+/// (`AdminOuReseauLocalPourLeCompte`) relie et délie le serveur ; depuis le
+/// réseau local, la liaison suppose qu'aucun compte n'est encore relié
+/// ([`compte_du_serveur_relie`]).
 /// Authentification active : l'administrateur relie le serveur, un compte
 /// standard ne relie que son propre profil.
 fn liaison_autorisee<G>(
@@ -310,11 +335,15 @@ async fn sso_authorize(
     headers: HeaderMap,
     Query(requete): Query<Vec<(String, String)>>,
 ) -> impl IntoResponse {
+    let par_le_reseau_local = garde.as_ref().is_ok_and(|g| g.par_le_reseau_local);
     let liaison = match liaison_autorisee(&state, garde, appelant) {
         Ok(l) => l,
         Err(refus) => return page_refus_hors_machine(&headers, refus),
     };
     let settings = SettingsRepo::with_backend(state.backend.clone());
+    if remplacement_refuse(&settings, par_le_reseau_local, liaison) {
+        return page_refus_hors_machine(&headers, crate::auth::refus_compte_deja_relie(&headers));
+    }
     let Some(auth) = get_mozaik_auth(&settings) else {
         // sso_authorize is a full browser navigation, so degrade to a friendly
         // HTML page instead of raw JSON when Cloud SSO isn't provisioned on this
@@ -439,6 +468,7 @@ async fn sso_callback(
     // Même règle qu'à l'autorisation, AVANT de lire ou consommer une attente
     // PKCE : le navigateur qui revient de mozaiklabs.fr est celui qui a lancé
     // la liaison (cette machine, ou une session et son cookie).
+    let par_le_reseau_local = garde.as_ref().is_ok_and(|g| g.par_le_reseau_local);
     match liaison_autorisee(&state, garde, appelant) {
         Ok(Liaison::Serveur) => {}
         Ok(Liaison::Profil(profil)) => {
@@ -465,6 +495,13 @@ async fn sso_callback(
     };
 
     let settings = SettingsRepo::with_backend(state.backend.clone());
+    // Le contrôle du 23/11 est REFAIT au retour : deux liaisons lancées du
+    // réseau local quand aucun compte n'était relié, la première finie relie
+    // le serveur, la seconde n'a plus le droit de le remplacer. L'attente
+    // PKCE n'est pas touchée.
+    if remplacement_refuse(&settings, par_le_reseau_local, Liaison::Serveur) {
+        return page_refus_hors_machine(&headers, crate::auth::refus_compte_deja_relie(&headers));
+    }
     let Some(auth) = get_mozaik_auth(&settings) else {
         return page_echec_compte(
             &headers,
@@ -557,6 +594,12 @@ async fn sso_callback(
     // portait un avant que `owner_profile_id` n'existe. La placer plus bas la
     // ferait lire le compte qui vient d'arriver, c'est-à-dire adopter le
     // nouveau venu : exactement ce qu'elle est là pour empêcher.
+    // Et une dernière fois après l'échange avec mozaiklabs.fr (quelques
+    // secondes) : une liaison finie entre-temps n'est pas remplacée.
+    if remplacement_refuse(&settings, par_le_reseau_local, Liaison::Serveur) {
+        return page_refus_hors_machine(&headers, crate::auth::refus_compte_deja_relie(&headers));
+    }
+
     tune_core::cloud::proprietaire::adopter_le_compte_lie(&settings, &state.backend);
 
     // Store cloud tokens in settings. #8238 : une session neuve lève
@@ -965,8 +1008,12 @@ async fn sso_status(
 /// POST /cloud/sso/disconnect — log out of the mozaiklabs.fr account: drop the
 /// stored tokens/profile and revoke the account premium. The license-key path is
 /// untouched (a keyed premium survives).
+///
+/// Décision du 23/11 : même garde que la liaison
+/// (`AdminOuReseauLocalPourLeCompte`). Sans authentification, un appareil du
+/// réseau local délie le serveur ; le relais distant et un mandataire, non.
 async fn sso_disconnect(
-    garde: Result<crate::auth::AdminOuCetteMachine, RefusDeGarde>,
+    garde: Result<crate::auth::AdminOuReseauLocalPourLeCompte, RefusDeGarde>,
     appelant: Option<crate::auth::AuthUser>,
     State(state): State<AppState>,
 ) -> axum::response::Response {

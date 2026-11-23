@@ -13,7 +13,13 @@
 //!    n'est préparée ; le statut n'y montre toujours que « relié » ;
 //! 3. authentification active, sans jeton : refusé, depuis le réseau local
 //!    comme depuis la machine ;
-//! 4. la déliaison reste réservée à cette machine (inchangé).
+//! 4. décisions du 23/11 :
+//!    - depuis le réseau local, la liaison n'est acceptée que si AUCUN compte
+//!      n'est relié ; cette machine remplace toujours le compte. Le contrôle
+//!      est refait au retour, avant et après l'échange avec mozaiklabs.fr ;
+//!    - la déliaison (`POST /cloud/sso/disconnect`) passe sous la même garde :
+//!      réseau local accepté, relais et mandataire refusés, authentification
+//!      active sans jeton refusée.
 
 use std::net::SocketAddr;
 
@@ -82,18 +88,43 @@ async fn get(
     (statut, String::from_utf8_lossy(&octets).into_owned())
 }
 
-async fn post(state: &AppState, depuis: &str, uri: &str) -> StatusCode {
+async fn post(
+    state: &AppState,
+    depuis: &str,
+    uri: &str,
+    entetes: &[(&str, &str)],
+) -> (StatusCode, String) {
     let adresse: SocketAddr = depuis.parse().unwrap();
-    crate::routes::router(state.clone())
-        .oneshot(
-            Request::post(uri)
-                .extension(ConnectInfo(adresse))
-                .body(Body::empty())
-                .unwrap(),
-        )
+    let mut requete = Request::post(uri).extension(ConnectInfo(adresse));
+    for (nom, valeur) in entetes {
+        requete = requete.header(*nom, *valeur);
+    }
+    let reponse = crate::routes::router(state.clone())
+        .oneshot(requete.body(Body::empty()).unwrap())
         .await
+        .unwrap();
+    let statut = reponse.status();
+    let octets = to_bytes(reponse.into_body(), usize::MAX).await.unwrap();
+    (statut, String::from_utf8_lossy(&octets).into_owned())
+}
+
+/// Le compte déjà relié au serveur (jeton et identité).
+fn relier_le_proprietaire(state: &AppState) {
+    let r = reglages(state);
+    r.set("mozaik_access_token", "jeton-du-proprietaire")
+        .unwrap();
+    r.set("mozaik_user", COMPTE).unwrap();
+}
+
+fn courriel_relie(state: &AppState) -> String {
+    let compte = reglages(state)
+        .get("mozaik_user")
         .unwrap()
-        .status()
+        .unwrap_or_default();
+    json_de(&compte)["email"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 fn json_de(texte: &str) -> Value {
@@ -397,19 +428,293 @@ async fn authentification_active_sans_jeton_la_liaison_est_refusee() {
     }
 }
 
-/// 4. La déliaison n'est pas rouverte : elle reste à cette machine.
+// ─── Décision du 23/11 : pas de remplacement depuis le réseau local ─────────
+
+const LAN: &str = "192.168.1.50:52000";
+const HOTE: (&str, &str) = ("host", "192.168.1.10:8888");
+const DISCONNECT: &str = "/api/v1/cloud/sso/disconnect";
+
+/// 5. Réseau local, aucun compte relié : la liaison passe (307) et elle est
+/// préparée.
 #[tokio::test]
-async fn la_deliaison_reste_reservee_a_cette_machine() {
+async fn reseau_local_aucun_compte_relie_la_liaison_passe() {
     let b = banc();
-    assert_eq!(
-        post(
-            &b.state,
-            "192.168.1.50:52000",
-            "/api/v1/cloud/sso/disconnect"
-        )
-        .await,
-        StatusCode::FORBIDDEN
+    let (statut, page) = get(&b.state, LAN, AUTORISER, &[HOTE]).await;
+    assert_eq!(statut, StatusCode::TEMPORARY_REDIRECT, "{page}");
+    assert!(!attente_du_serveur(&b.state).is_empty(), "liaison préparée");
+}
+
+/// 6. Réseau local, un compte déjà relié : refusé (403, motif
+/// `account_already_linked`, phrase claire), rien de préparé, le compte reste.
+#[tokio::test]
+async fn reseau_local_compte_deja_relie_la_liaison_est_refusee() {
+    let b = banc();
+    relier_le_proprietaire(&b.state);
+    let (statut, page) = get(
+        &b.state,
+        LAN,
+        AUTORISER,
+        &[HOTE, ("accept-language", "fr-FR,fr;q=0.9")],
+    )
+    .await;
+    assert_eq!(statut, StatusCode::FORBIDDEN, "{page}");
+    assert!(page.contains("<html"), "le refus est une page : {page}");
+    assert!(
+        page.contains("déjà relié à ce serveur") && page.contains("déliez-le"),
+        "phrase française attendue — {page}"
     );
+    assert!(attente_du_serveur(&b.state).is_empty(), "rien de préparé");
+    assert_eq!(courriel_relie(&b.state), "proprio@exemple.test");
+
+    // Le motif dédié, lisible par un client (JSON de la garde).
+    let refus = crate::auth::refus_compte_deja_relie(&axum::http::HeaderMap::new());
+    assert_eq!(refus.0, StatusCode::FORBIDDEN);
+    assert_eq!(refus.1.0["reason"], "account_already_linked");
+
+    // Même un compte dont la session est périmée (« reconnexion requise ») :
+    // son identité suffit, il reste le compte du serveur.
+    let b = banc();
+    reglages(&b.state).set("mozaik_user", COMPTE).unwrap();
+    let (statut, page) = get(&b.state, LAN, AUTORISER, &[HOTE]).await;
+    assert_eq!(statut, StatusCode::FORBIDDEN, "identité seule — {page}");
+}
+
+/// 7. Cette machine, un compte déjà relié : la liaison passe (remplacement
+/// permis depuis la machine).
+#[tokio::test]
+async fn cette_machine_compte_deja_relie_la_liaison_passe() {
+    let b = banc();
+    relier_le_proprietaire(&b.state);
+    let (statut, page) = get(&b.state, ICI, AUTORISER, &[("host", "127.0.0.1:8888")]).await;
+    assert_eq!(statut, StatusCode::TEMPORARY_REDIRECT, "{page}");
+    assert!(!attente_du_serveur(&b.state).is_empty(), "liaison préparée");
+}
+
+/// 8. La course : une liaison lancée du réseau local quand aucun compte
+/// n'était relié, puis un compte relié avant son retour. Le retour est
+/// refusé, même avec le bon `state`, et le compte relié n'est pas remplacé.
+#[tokio::test]
+async fn reseau_local_le_retour_refait_le_controle() {
+    let b = banc();
+    let base = super::cloud_garde_compte_tests::faux_mozaiklabs("tiers@exemple.test").await;
+    reglages(&b.state).set("mozaik_base_url", &base).unwrap();
+    let (statut, page) = get(&b.state, LAN, AUTORISER, &[HOTE]).await;
+    assert_eq!(statut, StatusCode::TEMPORARY_REDIRECT, "{page}");
+    let etat = json_de(&attente_du_serveur(&b.state))["state"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // L'autre liaison, finie entre-temps.
+    relier_le_proprietaire(&b.state);
+
+    let (statut, page) = get(
+        &b.state,
+        LAN,
+        &format!("/api/v1/cloud/sso/callback?code=c&state={etat}"),
+        &[HOTE],
+    )
+    .await;
+    assert_eq!(statut, StatusCode::FORBIDDEN, "retour — {page}");
+    // Refusé dès l'entrée du retour : l'attente n'est pas consommée et le code
+    // n'est pas échangé (aucun jeton émis pour rien).
+    assert!(
+        !attente_du_serveur(&b.state).is_empty(),
+        "le contrôle a lieu avant l'échange du code"
+    );
+    assert_eq!(courriel_relie(&b.state), "proprio@exemple.test");
+    assert_eq!(
+        reglages(&b.state)
+            .get("mozaik_access_token")
+            .unwrap()
+            .as_deref(),
+        Some("jeton-du-proprietaire")
+    );
+}
+
+/// Un faux mozaiklabs.fr dont l'échange du code « laisse finir » une autre
+/// liaison pendant qu'il répond (le compte du propriétaire est relié dans la
+/// base à cet instant).
+async fn faux_mozaiklabs_pendant_une_autre_liaison(state: &AppState) -> String {
+    use axum::routing::{get, post};
+    let backend = state.backend.clone();
+    let app = axum::Router::new()
+        .route(
+            "/oauth/token",
+            post(move || {
+                let r = SettingsRepo::with_backend(backend.clone());
+                async move {
+                    r.set("mozaik_access_token", "jeton-du-proprietaire")
+                        .unwrap();
+                    r.set("mozaik_user", COMPTE).unwrap();
+                    axum::Json(serde_json::json!({
+                        "access_token": "jeton-tiers",
+                        "refresh_token": "renouv-tiers",
+                        "expires_in": 3600
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/api/v1/user",
+            get(|| async {
+                axum::Json(serde_json::json!({
+                    "id": 77,
+                    "email": "tiers@exemple.test",
+                    "display_name": "Tiers",
+                    "is_admin": false,
+                    "avatar_url": null
+                }))
+            }),
+        )
+        .fallback(|| async { StatusCode::NOT_FOUND });
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let adresse = ecoute.local_addr().unwrap();
+    tokio::spawn(async move {
+        axum::serve(ecoute, app).await.ok();
+    });
+    format!("http://{adresse}")
+}
+
+/// 9. La course, au plus près : l'autre liaison finit PENDANT l'échange du
+/// code. Le contrôle refait juste avant d'enregistrer la session refuse.
+#[tokio::test]
+async fn reseau_local_une_liaison_finie_pendant_l_echange_n_est_pas_remplacee() {
+    let b = banc();
+    let base = faux_mozaiklabs_pendant_une_autre_liaison(&b.state).await;
+    reglages(&b.state).set("mozaik_base_url", &base).unwrap();
+    let (statut, page) = get(&b.state, LAN, AUTORISER, &[HOTE]).await;
+    assert_eq!(statut, StatusCode::TEMPORARY_REDIRECT, "{page}");
+    let etat = json_de(&attente_du_serveur(&b.state))["state"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let (statut, page) = get(
+        &b.state,
+        LAN,
+        &format!("/api/v1/cloud/sso/callback?code=c&state={etat}"),
+        &[HOTE],
+    )
+    .await;
+    assert_eq!(statut, StatusCode::FORBIDDEN, "retour — {page}");
+    assert_eq!(courriel_relie(&b.state), "proprio@exemple.test");
+    assert_eq!(
+        reglages(&b.state)
+            .get("mozaik_access_token")
+            .unwrap()
+            .as_deref(),
+        Some("jeton-du-proprietaire")
+    );
+}
+
+/// 10. Témoin de la ronde : du réseau local, sans compte relié, la ronde
+/// complète relie bien le serveur (le contrôle ne bloque pas le cas permis).
+#[tokio::test]
+async fn reseau_local_aucun_compte_la_ronde_complete_relie() {
+    let b = banc();
+    let base = super::cloud_garde_compte_tests::faux_mozaiklabs("tiers@exemple.test").await;
+    reglages(&b.state).set("mozaik_base_url", &base).unwrap();
+    let (statut, _) =
+        super::cloud_garde_compte_tests::ronde_complete(&b.state, LAN, None, "mozaik_pkce_pending")
+            .await;
+    assert_eq!(statut, StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(courriel_relie(&b.state), "tiers@exemple.test");
+}
+
+// ─── Décision du 23/11 : délier depuis le réseau local ──────────────────────
+
+/// 11. Réseau local, sans authentification : la déliaison passe et efface le
+/// compte du serveur.
+#[tokio::test]
+async fn reseau_local_sans_authentification_la_deliaison_passe() {
+    let b = banc();
+    relier_le_proprietaire(&b.state);
+    let (statut, texte) = post(&b.state, LAN, DISCONNECT, &[HOTE]).await;
+    assert_eq!(statut, StatusCode::OK, "{texte}");
+    assert_eq!(json_de(&texte)["connected"], false, "{texte}");
+    assert!(
+        reglages(&b.state)
+            .get("mozaik_access_token")
+            .unwrap()
+            .is_none()
+    );
+    assert!(reglages(&b.state).get("mozaik_user").unwrap().is_none());
+}
+
+/// 12. Relais distant, mandataire, CGNAT : la déliaison est refusée, le
+/// compte reste relié.
+#[tokio::test]
+async fn hors_du_reseau_local_la_deliaison_est_refusee() {
+    let b = banc();
+    relier_le_proprietaire(&b.state);
+    let cas: [(&str, &[(&str, &str)]); 5] = [
+        (
+            ICI,
+            &[
+                (tune_core::cloud::ENTETE_RELAIS, "1"),
+                ("host", "127.0.0.1:8888"),
+            ],
+        ),
+        (LAN, &[(tune_core::cloud::ENTETE_RELAIS, "1"), HOTE]),
+        (
+            ICI,
+            &[
+                ("host", "127.0.0.1:8888"),
+                ("x-forwarded-for", "203.0.113.9"),
+            ],
+        ),
+        (
+            "192.168.1.2:52000",
+            &[
+                ("host", "tune.local:8888"),
+                ("x-forwarded-for", "203.0.113.9"),
+            ],
+        ),
+        ("100.101.102.103:52000", &[HOTE]),
+    ];
+    for (depuis, entetes) in cas {
+        let (statut, texte) = post(&b.state, depuis, DISCONNECT, entetes).await;
+        assert_eq!(
+            statut,
+            StatusCode::FORBIDDEN,
+            "{depuis} {entetes:?} — {texte}"
+        );
+        // Le relais distant est arrêté plus tôt par sa propre garde
+        // (`not_available_remotely`) ; les autres par la garde du compte.
+        let v = json_de(&texte);
+        assert!(
+            v["error"] == "not_available_remotely" || v["reason"] == "not_local_network",
+            "{depuis} {entetes:?} — {texte}"
+        );
+    }
+    assert_eq!(courriel_relie(&b.state), "proprio@exemple.test");
+    assert_eq!(
+        reglages(&b.state)
+            .get("mozaik_access_token")
+            .unwrap()
+            .as_deref(),
+        Some("jeton-du-proprietaire")
+    );
+}
+
+/// 13. Authentification active, sans jeton : la déliaison est refusée (401),
+/// réseau local ou machine.
+#[tokio::test]
+async fn authentification_active_sans_jeton_la_deliaison_est_refusee() {
+    let b = banc();
+    relier_le_proprietaire(&b.state);
+    let r = reglages(&b.state);
+    r.set("jwt_secret", "secret-de-banc").unwrap();
+    r.set("auth_enabled", "true").unwrap();
+    for depuis in [LAN, ICI] {
+        let (statut, texte) = post(&b.state, depuis, DISCONNECT, &[HOTE]).await;
+        assert_eq!(
+            statut,
+            StatusCode::UNAUTHORIZED,
+            "sans jeton depuis {depuis} — {texte}"
+        );
+    }
+    assert_eq!(courriel_relie(&b.state), "proprio@exemple.test");
 }
 
 /// Les phrases du refus de liaison existent dans les seize langues.
@@ -431,6 +736,13 @@ fn les_phrases_du_refus_de_liaison_existent_dans_les_seize_langues() {
             .as_str()
             .unwrap_or_default();
         assert!(!a.trim().is_empty(), "action.account/{l} absente");
+        let d = catalogue["api.machine.accountAlreadyLinked"][l]
+            .as_str()
+            .unwrap_or_default();
+        assert!(
+            d.contains("mozaiklabs.fr"),
+            "accountAlreadyLinked/{l} : {d:?}"
+        );
     }
     assert_eq!(
         crate::auth::action_du_chemin("/api/v1/cloud/sso/authorize"),
