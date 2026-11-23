@@ -159,11 +159,98 @@ async fn hqplayer_avec_egaliseur_l_applique_t12c() {
             orch.transcodage_decide_pour_test(&req).await.unwrap(),
             "{type_} : l'égaliseur armé doit s'appliquer (#1216, décision du 23/11)"
         );
-        let (actif, relais, _) = orch.relais_dsp_pour_test(&req).await.unwrap();
+        let (actif, relais, crossfeed) = orch.relais_dsp_pour_test(&req).await.unwrap();
         assert!(
             actif && relais,
             "{type_} : le relais doit exécuter l'égaliseur ({actif}, {relais})"
         );
+        assert!(!crossfeed, "{type_} : crossfeed non coché");
+        assert!(orch.zone_traite_le_flux_hors_tess(zone_id), "{type_}");
+        // Crossfeed avec l'égaliseur : le même relais l'exécute aussi.
+        banc::armer_le_crossfeed(&orch, zone_id);
+        let (actif, relais, crossfeed) = orch.relais_dsp_pour_test(&req).await.unwrap();
+        assert!(
+            actif && relais && crossfeed,
+            "{type_} : avec l'égaliseur, le crossfeed passe par le relais \
+             ({actif}, {relais}, {crossfeed})"
+        );
+    }
+}
+
+/// Une réponse impulsionnelle WAV float 32 mono à 44,1 kHz (la cadence du
+/// flux) : un Dirac de gain 0,5, que le convolveur accepte.
+fn ecrire_ri() -> crate::test_scratch::ScratchFile {
+    let f = crate::test_scratch::scratch_file("ri-t12c-44k", ".wav");
+    let taps = 32usize;
+    let donnees = taps * 4;
+    let mut wav = Vec::with_capacity(44 + donnees);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&((36 + donnees) as u32).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&3u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&CADENCE.to_le_bytes());
+    wav.extend_from_slice(&(CADENCE * 4).to_le_bytes());
+    wav.extend_from_slice(&4u16.to_le_bytes());
+    wav.extend_from_slice(&32u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(donnees as u32).to_le_bytes());
+    for i in 0..taps {
+        let v: f32 = if i == 0 { 0.5 } else { 0.0 };
+        wav.extend_from_slice(&v.to_le_bytes());
+    }
+    std::fs::write(f.path(), wav).unwrap();
+    f
+}
+
+/// Décision du 23/11 — la correction de pièce et le ReplayGain restent
+/// appliqués sur HQPlayer et l'autre transport hors TESS, comme l'égaliseur.
+#[tokio::test]
+async fn hqplayer_correction_de_piece_et_replaygain_s_appliquent_t12c() {
+    for (type_, appareil) in [
+        ("hqplayer", "hqplayer:salon-rc-t12c"),
+        ("diretta", "diretta:salon-rc-t12c"),
+    ] {
+        // Correction de pièce.
+        let orch = orchestrateur(Arc::new(crate::http::streamer::AudioStreamer::new(0)));
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Hors TESS RC T12c", Some(type_), Some(appareil))
+            .unwrap();
+        let (wav, _) = banc::wav_gauche_seule("t12c-hors-tess-rc", CADENCE, 4_410);
+        let track_id = banc::inscrire_la_piste(&orch.db, wav.as_str().as_ref(), CADENCE, 100);
+        let req = demande(zone_id, appareil, track_id);
+        let ri = ecrire_ri();
+        SettingsRepo::with_backend(orch.db.clone())
+            .set(&format!("ir_path_{zone_id}"), ri.as_str().as_ref())
+            .unwrap();
+        assert!(orch.zone_has_active_ir(zone_id), "prémisse : RI réglée");
+        assert!(
+            orch.transcodage_decide_pour_test(&req).await.unwrap(),
+            "{type_} : la correction de pièce doit s'appliquer (décision du 23/11)"
+        );
+        assert!(orch.zone_traite_le_flux_hors_tess(zone_id), "{type_}");
+
+        // ReplayGain : un gain tagué sur la piste ET le mode armé.
+        let orch = orchestrateur(Arc::new(crate::http::streamer::AudioStreamer::new(0)));
+        let zone_id = ZoneRepo::with_backend(orch.db.clone())
+            .create("Hors TESS RG T12c", Some(type_), Some(appareil))
+            .unwrap();
+        let (wav, _) = banc::wav_gauche_seule("t12c-hors-tess-rg", CADENCE, 4_410);
+        let track_id = banc::inscrire_la_piste(&orch.db, wav.as_str().as_ref(), CADENCE, 100);
+        let req = demande(zone_id, appareil, track_id);
+        assert!(!orch.transcodage_decide_pour_test(&req).await.unwrap());
+        crate::db::track_metadata_repo::TrackMetadataRepo::with_backend(orch.db.clone())
+            .set(track_id, "rg_track_gain", "-6.00 dB")
+            .unwrap();
+        SettingsRepo::with_backend(orch.db.clone())
+            .set(crate::audio::replaygain::MODE_KEY, "track")
+            .unwrap();
+        assert!(
+            orch.transcodage_decide_pour_test(&req).await.unwrap(),
+            "{type_} : le ReplayGain doit s'appliquer (décision du 23/11)"
+        );
+        assert!(orch.zone_traite_le_flux_hors_tess(zone_id), "{type_}");
     }
 }
 

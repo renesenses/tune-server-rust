@@ -28,7 +28,24 @@ use super::chaine::{
     VERSION_CHAINE,
 };
 use super::greffon::{Canaux, Catalogue};
-use super::zones::{Applicabilite, TransportZone};
+use super::zones::{Applicabilite, MotifHorsTess, TransportZone};
+
+/// TESS T12c (décision du 23/11) — sur HQPlayer et sur l'autre transport hors
+/// TESS, Tune garde les traitements de zone d'avant TESS (#1216) : un de ces
+/// greffons actif fait passer la piste par le flux traité de Tune.
+const GREFFONS_QUI_FORCENT_LE_FLUX: [&str; 5] = [
+    super::migration::ID_EQ_GRAPHIQUE,
+    super::migration::ID_EQ_PARAMETRIQUE,
+    super::migration::ID_EQ_CASQUE,
+    super::migration::ID_CORRECTION_PIECE,
+    super::migration::ID_CONVOLUTION,
+];
+
+/// TESS T12c — les greffons que le flux traité de Tune n'exécute pas (le
+/// relais ne porte ni le repli mono ni la réaffectation des canaux) : ils
+/// restent hors TESS sur ces sorties, même quand le flux est traité.
+const GREFFONS_HORS_DU_FLUX_TRAITE: [&str; 2] =
+    [super::migration::ID_MONO, super::migration::ID_REAFFECTATION];
 
 /// Code stable d'une étape du chemin du signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -340,6 +357,19 @@ impl ChaineTess {
                 e.eteindre(*m, d.clone());
             }
         };
+        // TESS T12c (décision du 23/11) : HQPlayer et l'autre transport hors
+        // TESS gardent l'égaliseur, la correction de pièce et le ReplayGain ;
+        // leurs greffons sont résolus normalement, puis seuls ceux que le flux
+        // traité n'exécute pas — ou TOUS, quand aucun greffon ne force ce
+        // flux (crossfeed seul) — sont éteints hors TESS.
+        let traitements_de_zone_conserves = matches!(
+            &applicabilite,
+            Applicabilite::OutsideTess {
+                reason: MotifHorsTess::HqplayerOwnProcessing | MotifHorsTess::DirettaOutsideTess,
+                ..
+            }
+        ) && !ctx.pure
+            && !ctx.source.is_some_and(|s| s.dsd_hors_traitement());
 
         let mut source = etape(CodeEtape::Source, true);
         source.params = ctx
@@ -353,7 +383,7 @@ impl ChaineTess {
                 .iter()
                 .map(|m| {
                     let mut e = self.resoudre_greffon(m, catalogue, ctx, &mut canaux);
-                    if e.requested {
+                    if e.requested && !traitements_de_zone_conserves {
                         bloque(&mut e);
                     }
                     e
@@ -410,6 +440,24 @@ impl ChaineTess {
                     Some(format!("Replaced by {id}")),
                 );
                 greffons[i].params = Some(json!({ "replaced_by": id }));
+            }
+        }
+
+        if traitements_de_zone_conserves {
+            let flux_force = greffons.iter().any(|e| {
+                e.effective
+                    && e.plugin_id
+                        .as_deref()
+                        .is_some_and(|id| GREFFONS_QUI_FORCENT_LE_FLUX.contains(&id))
+            });
+            for e in greffons.iter_mut().filter(|e| e.requested) {
+                let hors_du_flux = e
+                    .plugin_id
+                    .as_deref()
+                    .is_some_and(|id| GREFFONS_HORS_DU_FLUX_TRAITE.contains(&id));
+                if !flux_force || hors_du_flux {
+                    bloque(e);
+                }
             }
         }
 
@@ -761,15 +809,20 @@ mod tests {
             rate: TauxDsd::Dsd64,
             filter: "polyvalent".into(),
         };
-        let r = resoudre(&c, &ctx(TransportZone::HqPlayer));
+        // Crossfeed SEUL : rien ne force le flux traité, rien n'est appliqué.
+        let mut seul = c.clone();
+        for m in &mut seul.plugins {
+            m.enabled = m.id == "crossfeed";
+        }
+        let r = resoudre(&seul, &ctx(TransportZone::HqPlayer));
         assert_eq!(r.headroom_db, 0.0, "pas de headroom annoncé hors TESS");
         assert_eq!(r.volume.placement, None, "ni d'ordre DSD");
         assert_eq!(r.badge, Badge::OutsideTess);
         assert_eq!(effectives(&r), [Source, Output]);
-        let conv = greffon(&r, "convolution");
-        assert!(conv.requested && !conv.effective);
-        assert_eq!(conv.reason, Some(MotifEtape::OutsideTess));
-        assert!(conv.detail.as_deref().unwrap().contains("HQPlayer"));
+        let cf = greffon(&r, "crossfeed");
+        assert!(cf.requested && !cf.effective);
+        assert_eq!(cf.reason, Some(MotifEtape::OutsideTess));
+        assert!(cf.detail.as_deref().unwrap().contains("HQPlayer"));
         // Contre-épreuve : la même chaîne sur OAAT est appliquée.
         let r = resoudre(&c, &ctx(TransportZone::Oaat));
         assert_eq!(r.headroom_db, HEADROOM_AUTO_DB);
@@ -777,6 +830,42 @@ mod tests {
             r.volume.placement,
             Some(PlacementVolume::BeforeDsdModulator)
         );
+    }
+
+    /// TESS T12c (décision du 23/11) — HQPlayer et l'autre transport hors TESS
+    /// GARDENT l'égaliseur et la correction de pièce : ils sont annoncés
+    /// appliqués, et le crossfeed (porté par le même flux traité) aussi. Le
+    /// repli mono, que ce flux n'exécute pas, reste hors TESS ; tout comme le
+    /// headroom, le suréchantillonnage et le volume logiciel.
+    #[test]
+    fn hors_tess_l_egaliseur_et_la_correction_restent_appliques_t12c() {
+        for transport in [TransportZone::HqPlayer, TransportZone::Diretta] {
+            let c = ChaineTess {
+                plugins: vec![
+                    maillon("room-correction", true),
+                    maillon("equalizer-parametric", true),
+                    maillon("crossfeed", true),
+                    maillon("mono-downmix", true),
+                ],
+                ..ChaineTess::default()
+            };
+            let r = resoudre(&c, &ctx(transport));
+            assert_eq!(r.badge, Badge::OutsideTess, "{transport:?}");
+            for id in ["room-correction", "equalizer-parametric", "crossfeed"] {
+                assert!(
+                    greffon(&r, id).effective,
+                    "{transport:?} : {id} doit être annoncé appliqué"
+                );
+            }
+            let mono = greffon(&r, "mono-downmix");
+            assert!(!mono.effective, "{transport:?}");
+            assert_eq!(mono.reason, Some(MotifEtape::OutsideTess));
+            assert_eq!(r.headroom_db, 0.0);
+            // Pure : rien n'est appliqué, comme dans le son.
+            let mut x = ctx(transport);
+            x.pure = true;
+            assert_eq!(effectives(&resoudre(&c, &x)), [Source, Output]);
+        }
     }
 
     #[test]

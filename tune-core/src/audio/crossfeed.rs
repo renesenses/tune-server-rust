@@ -511,6 +511,12 @@ pub enum CrossfeedConstraint {
     /// qui ne VERROUILLE pas le contrôle ([`Self::verrouille`]). Mesuré par
     /// `orchestrator::tests::*_9178` sur la décision réelle.
     NonLocalPartial,
+    /// TESS T12c (décision du 23/11) — zone HORS TESS (HQPlayer et l'autre
+    /// transport) dont aucun traitement de zone conservé (égaliseur,
+    /// correction de pièce, ReplayGain) ne fait passer les pistes par le flux
+    /// traité : le crossfeed seul n'y est pas appliqué. Avec l'un d'eux, le
+    /// statut devient [`Self::NonLocalPartial`] ([`avec_la_sortie_hors_tess`]).
+    OutsideTess,
 }
 
 impl CrossfeedConstraint {
@@ -524,6 +530,7 @@ impl CrossfeedConstraint {
             Self::NetworkProgressiveOff => "network_progressive_off",
             Self::NetworkRendererNoLpcm => "network_renderer_no_lpcm",
             Self::NonLocalPartial => "non_local_partial",
+            Self::OutsideTess => "outside_tess",
         }
     }
 
@@ -538,13 +545,16 @@ impl CrossfeedConstraint {
                 "Le greffon crossfeed est indisponible. Réactivez-le dans les greffons ; vos réglages sont conservés."
             }
             Self::NonLocalOutput => {
-                "Cette sortie lit elle-même le fichier de la piste (HQPlayer et \
-                 les autres sorties hors TESS) : le crossfeed seul n'y est pas \
-                 appliqué. Il ne s'y entend que lorsqu'un égaliseur, une \
-                 correction de pièce ou un ReplayGain actif fait passer la \
-                 piste par le flux traité de Tune. Pour l'entendre toujours, \
-                 écoutez sur une zone où Tune fabrique le flux (sortie locale, \
-                 OAAT, AirPlay, DLNA…)."
+                "Cette sortie ne reçoit pas le flux que Tune traite au fil de \
+                 l'eau : le crossfeed n'y est pas appliqué. Le réglage est \
+                 enregistré mais n'atteint pas le son."
+            }
+            Self::OutsideTess => {
+                "Cette zone est hors TESS : sa sortie applique son propre \
+                 traitement ou reçoit le fichier tel quel. Le crossfeed seul n'y \
+                 est pas appliqué ; il ne l'est qu'avec un égaliseur, une \
+                 correction de pièce ou un ReplayGain actif, qui font passer la \
+                 piste par le flux traité de Tune. Le réglage est enregistré."
             }
             Self::PureMode => {
                 "Le mode PURE garde le chemin bit-perfect : aucun traitement ne \
@@ -596,7 +606,7 @@ impl CrossfeedConstraint {
 
     /// Toutes les variantes. Sert la contre-épreuve permanente : une contrainte
     /// ajoutée sans code ni libellé fait tomber le test qui parcourt cette liste.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::PremiumRequired,
         Self::PluginUnavailable,
         Self::NonLocalOutput,
@@ -604,6 +614,7 @@ impl CrossfeedConstraint {
         Self::NetworkProgressiveOff,
         Self::NetworkRendererNoLpcm,
         Self::NonLocalPartial,
+        Self::OutsideTess,
     ];
 }
 
@@ -810,6 +821,40 @@ pub fn avec_toute_la_chaine(
     }
 }
 
+/// TESS T12c (décision du 23/11) — sur une sortie hors TESS (HQPlayer et
+/// l'autre transport, `hors_tess` fourni par l'appelant), `NonLocalOutput`
+/// devient :
+///
+/// - [`CrossfeedConstraint::NonLocalPartial`] (contrôle actif) quand un
+///   traitement de zone conservé fait passer les pistes par le flux traité
+///   (`flux_traite`), qui porte aussi le crossfeed ;
+/// - [`CrossfeedConstraint::OutsideTess`] (verrouillé) sinon : le crossfeed
+///   seul n'y est pas appliqué.
+///
+/// Tout autre statut passe inchangé (PURE garde la priorité).
+pub fn avec_la_sortie_hors_tess(
+    sortie: CrossfeedStatus,
+    hors_tess: bool,
+    flux_traite: bool,
+) -> CrossfeedStatus {
+    if !hors_tess || sortie.reason != Some(CrossfeedConstraint::NonLocalOutput) {
+        return sortie;
+    }
+    let reason = if flux_traite {
+        CrossfeedConstraint::NonLocalPartial
+    } else {
+        CrossfeedConstraint::OutsideTess
+    };
+    let unavailable = reason.verrouille();
+    CrossfeedStatus {
+        requested: sortie.requested,
+        effective: sortie.requested && !unavailable,
+        unavailable,
+        reason: Some(reason),
+        detail: Some(reason.detail()),
+    }
+}
+
 /// Ajoute les DROITS (licence, greffon) au statut que la sortie impose — #4511.
 ///
 /// L'ordre des motifs est une promesse faite à l'utilisateur : on nomme d'abord
@@ -830,7 +875,10 @@ pub fn avec_les_droits(
     premium: bool,
     greffon_actif: bool,
 ) -> CrossfeedStatus {
-    if matches!(sortie.reason, Some(CrossfeedConstraint::NonLocalOutput)) {
+    if matches!(
+        sortie.reason,
+        Some(CrossfeedConstraint::NonLocalOutput | CrossfeedConstraint::OutsideTess)
+    ) {
         return sortie;
     }
     let droit = if !premium {
