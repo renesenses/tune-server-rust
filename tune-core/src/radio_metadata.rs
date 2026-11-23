@@ -1203,12 +1203,18 @@ async fn fetch_icy_metadata_dans(
 ) -> Option<IcyMetadata> {
     let client = crate::http::client::builder().timeout(delai).build().ok()?;
 
-    let resp = client
+    let resp = match client
         .get(stream_url)
         .header("Icy-MetaData", "1")
         .send()
         .await
-        .ok()?;
+    {
+        Ok(r) => r,
+        // #8452 (Cover+, § 1.1) — certains serveurs SHOUTcast répondent par
+        // la ligne d'état `ICY 200 OK`, que le client HTTP refuse : on relit
+        // alors le flux avec un lecteur tolérant.
+        Err(_) => return fetch_icy_tolerant(stream_url, delai).await,
+    };
 
     let station = resp
         .headers()
@@ -1237,6 +1243,115 @@ async fn fetch_icy_metadata_dans(
     // morceau par morceau et l'on s'arrête au premier bloc titré, ou au
     // plafond d'octets, ou au délai du client — jamais plus.
     lire_titre_icy(resp, icy_metaint, station).await
+}
+
+/// #8452 (Cover+, spécification § 1.1) — un lecteur ICY TOLÉRANT, pour les
+/// serveurs SHOUTcast qui répondent `ICY 200 OK` au lieu de `HTTP/1.x 200 OK`.
+///
+/// Le client HTTP refuse cette ligne d'état ; ce lecteur parle HTTP/1.0 sur
+/// une connexion TCP nue, accepte les deux formes de ligne d'état, puis lit
+/// le flux avec le même découpeur ([`LecteurIcy`]), le même décodage (UTF-8,
+/// puis Latin-1) et les mêmes plafonds que le lecteur ordinaire. Seulement
+/// en `http://` : ces vieux serveurs ne parlent pas TLS. Il ne sert QUE de
+/// repli quand le client HTTP a échoué : aucune connexion de plus dans le
+/// cas ordinaire.
+async fn fetch_icy_tolerant(stream_url: &str, delai: std::time::Duration) -> Option<IcyMetadata> {
+    tokio::time::timeout(delai, lire_icy_tolerant(stream_url))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// La ligne d'état et les en-têtes d'une réponse ICY ou HTTP/1.x, si elle
+/// est un succès (`200`). Clés en minuscules.
+fn entetes_icy_tolerants(tete: &str) -> Option<std::collections::HashMap<String, String>> {
+    let mut lignes = tete.lines();
+    let statut = lignes.next()?;
+    let mut mots = statut.split_whitespace();
+    let protocole = mots.next()?;
+    let code = mots.next()?;
+    if !(protocole.eq_ignore_ascii_case("ICY") || protocole.starts_with("HTTP/1.")) || code != "200"
+    {
+        return None;
+    }
+    Some(
+        lignes
+            .filter_map(|l| l.split_once(':'))
+            .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+            .collect(),
+    )
+}
+
+async fn lire_icy_tolerant(stream_url: &str) -> Option<IcyMetadata> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let url = reqwest::Url::parse(stream_url).ok()?;
+    if url.scheme() != "http" {
+        return None;
+    }
+    let hote = url.host_str()?;
+    let port = url.port_or_known_default()?;
+    let chemin = match url.query() {
+        Some(q) => format!("{}?{q}", url.path()),
+        None => url.path().to_string(),
+    };
+    let hote_entete = match url.port() {
+        Some(p) => format!("{hote}:{p}"),
+        None => hote.to_string(),
+    };
+    let mut flux = tokio::net::TcpStream::connect((hote, port)).await.ok()?;
+    let requete = format!(
+        "GET {chemin} HTTP/1.0\r\nHost: {hote_entete}\r\nIcy-MetaData: 1\r\nUser-Agent: Tune\r\nConnection: close\r\n\r\n"
+    );
+    flux.write_all(requete.as_bytes()).await.ok()?;
+
+    // L'en-tête, borné : un serveur qui n'en finit pas n'est pas un flux.
+    let mut tampon: Vec<u8> = Vec::new();
+    let mut morceau = vec![0u8; 16 * 1024];
+    let fin_tete = loop {
+        let n = flux.read(&mut morceau).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        tampon.extend_from_slice(&morceau[..n]);
+        if let Some(i) = tampon.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        if tampon.len() > 64 * 1024 {
+            return None;
+        }
+    };
+    let entetes = entetes_icy_tolerants(&String::from_utf8_lossy(&tampon[..fin_tete]))?;
+    let station = entetes.get("icy-name").cloned();
+    let metaint = entetes
+        .get("icy-metaint")
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|m| *m > 0)?;
+    let plafond = metaint
+        .saturating_add(1 + 255 * 16)
+        .saturating_mul(ICY_PERIODES_MAX)
+        .min(ICY_OCTETS_MAX);
+    let mut lecteur = LecteurIcy::new(metaint);
+    let mut lus = tampon.len() - fin_tete;
+    for bloc in lecteur.pousser(&tampon[fin_tete..]) {
+        if let Some(meta) = parse_icy_string(&decoder_bloc_icy(&bloc), station.clone()) {
+            return Some(meta);
+        }
+    }
+    while lus < plafond {
+        let n = flux.read(&mut morceau).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        lus += n;
+        for bloc in lecteur.pousser(&morceau[..n]) {
+            if let Some(meta) = parse_icy_string(&decoder_bloc_icy(&bloc), station.clone()) {
+                return Some(meta);
+            }
+        }
+    }
+    debug!(lus, plafond, "icy_tolerant_aucun_titre_sous_le_plafond");
+    None
 }
 
 /// Lit un flux ICY au fil de l'eau jusqu'au premier bloc qui porte un titre.
@@ -3614,3 +3729,7 @@ mod tests_icy_direct_6373 {
 #[cfg(test)]
 #[path = "radio_metadata_relais_ordre_tests.rs"]
 mod tests_relais_avant_diffuseur_6516;
+
+#[cfg(test)]
+#[path = "radio_metadata_icy_tolerant_8452_tests.rs"]
+mod tests_icy_tolerant_8452;

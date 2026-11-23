@@ -1532,6 +1532,8 @@ pub fn router() -> Router<AppState> {
         .route("/refresh-logos", post(refresh_logos_handler))
         // #6516 — l'annuaire radio-metadata.fr complet, servi depuis le cache.
         .merge(super::radios_annuaire::router())
+        // #8452 — Cover+ par station.
+        .merge(super::radios_cover_plus_8452::router())
         .route("/add", get(add_from_web))
         .route(
             "/{id}",
