@@ -215,11 +215,14 @@ fn un_echec_de_web_remet_aussi_les_greffons_8955() {
     assert_eq!(lire(&inst.opt.join("web/index.html")), "<html>rc12</html>");
 }
 
-/// Une copie ratée d'un greffon refuse toute la mise à jour avant de
-/// toucher au binaire : rien n'a bougé.
+/// Fil 3014 — un greffon qui ne peut pas être posé (« Accès refusé » à
+/// chaque essai) ne bloque PAS la mise à jour : le serveur, `web/` et les
+/// autres greffons sont mis à jour, lui garde sa version, et le marqueur du
+/// démarrage suivant le nomme. Avant le correctif, toute la mise à jour était
+/// refusée (« Install failed: stage plugin … »).
 #[cfg(unix)]
 #[test]
-fn une_copie_ratee_d_un_greffon_laisse_tout_comme_avant_8955() {
+fn un_greffon_refuse_n_empeche_pas_la_mise_a_jour_3014() {
     let inst = Installation::nouvelle();
     let mut c = controles();
     c.copier = |de, vers| {
@@ -227,19 +230,144 @@ fn une_copie_ratee_d_un_greffon_laisse_tout_comme_avant_8955() {
             .to_string_lossy()
             .contains("plugins.new/playlists-converter")
         {
-            return Err(io::Error::other("disque plein simulé"));
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
         }
         installation_sure::copier_durablement(de, vers)
     };
 
-    let e = inst.installer(&c).unwrap_err();
+    inst.installer(&c)
+        .expect("un greffon refusé ne doit pas bloquer la mise à jour");
 
-    assert!(e.contains("plugins"), "{e}");
-    inst.greffons_anciens();
     assert_eq!(
         std::fs::read(inst.opt.join("tune-server")).unwrap(),
-        b"#!/bin/sh\necho rc12\n"
+        elf("tune-server neuf"),
+        "le serveur n'a pas été mis à jour"
     );
+    assert_eq!(lire(&inst.opt.join("web/index.html")), "<html>rc13</html>");
+    assert_eq!(
+        lire(&inst.opt.join("plugins/party/main.wasm")),
+        "party neuf, plus long",
+        "l'autre greffon livré n'a pas été mis à jour"
+    );
+    assert!(
+        !inst.opt.join("plugins/playlists-converter").exists(),
+        "le greffon refusé ne doit pas être posé à moitié"
+    );
+    assert_eq!(inst.noms_dans_plugins(), ["mien", "party"]);
+    assert!(!inst.opt.join(ATTENTE).exists(), "plugins.new traîne");
+    let marque = lire(&inst.opt.join(MARQUE_GARDES));
+    assert!(
+        marque.contains("playlists-converter") && marque.contains("kept"),
+        "{marque}"
+    );
+}
+
+/// Fil 3014 — un refus passager (antivirus qui tient le fichier tout juste
+/// écrit) est réessayé : au troisième essai la copie passe, et le greffon est
+/// bien mis à jour, sans marqueur.
+#[cfg(unix)]
+#[test]
+fn un_refus_passager_est_reessaye_3014() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static REFUS: AtomicU32 = AtomicU32::new(0);
+    let inst = Installation::nouvelle();
+    let mut c = controles();
+    c.copier = |de, vers| {
+        if vers.ends_with("plugins.new/party/main.wasm") && REFUS.fetch_add(1, Ordering::SeqCst) < 2
+        {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        installation_sure::copier_durablement(de, vers)
+    };
+
+    inst.installer(&c).expect("installation");
+
+    assert_eq!(REFUS.load(Ordering::SeqCst), 3, "trois essais attendus");
+    assert_eq!(
+        lire(&inst.opt.join("plugins/party/main.wasm")),
+        "party neuf, plus long"
+    );
+    assert_eq!(
+        lire(&inst.opt.join("plugins/playlists-converter/main.wasm")),
+        "convertisseur"
+    );
+    assert!(!inst.opt.join(MARQUE_GARDES).exists());
+}
+
+/// Fil 3014 — une bascule de greffon refusée ne défait plus la mise à jour :
+/// le greffon garde sa version, le reste est mis à jour.
+#[cfg(unix)]
+#[test]
+fn une_bascule_de_greffon_refusee_n_empeche_pas_la_mise_a_jour_3014() {
+    let inst = Installation::nouvelle();
+    let mut c = controles();
+    c.renommer = |de, vers| {
+        if de.ends_with("plugins/party") {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        std::fs::rename(de, vers)
+    };
+
+    inst.installer(&c).expect("installation");
+
+    assert_eq!(
+        std::fs::read(inst.opt.join("tune-server")).unwrap(),
+        elf("tune-server neuf")
+    );
+    assert_eq!(lire(&inst.opt.join("plugins/party/main.wasm")), "party ancien");
+    assert_eq!(
+        lire(&inst.opt.join("plugins/playlists-converter/main.wasm")),
+        "convertisseur"
+    );
+    assert!(lire(&inst.opt.join(MARQUE_GARDES)).contains("party"));
+    assert!(!inst.opt.join(ATTENTE).exists(), "plugins.new traîne");
+}
+
+/// Fil 3014, la cause : sous Windows, synchroniser un dossier copié (ouvert
+/// comme un fichier) échoue toujours en « Accès refusé ». Ce refus-là ne
+/// doit pas faire échouer la copie sous Windows ; ailleurs, il reste une
+/// erreur.
+#[test]
+fn la_synchro_de_dossier_refusee_par_windows_est_toleree_3014() {
+    let refus = || Err(io::Error::from(io::ErrorKind::PermissionDenied));
+    assert!(installation_sure::synchro_toleree(refus(), true).is_ok());
+    assert!(installation_sure::synchro_toleree(refus(), false).is_err());
+    assert!(installation_sure::synchro_toleree(Err(io::Error::other("disque")), true).is_err());
+    assert!(installation_sure::synchro_toleree(Ok(()), false).is_ok());
+}
+
+/// Fil 3014, la préparation Windows : un greffon refusé n'est pas rendu au
+/// script (qui ne bascule que les posés), l'autre l'est, rien n'échoue.
+#[test]
+fn la_preparation_windows_garde_le_greffon_refuse_3014() {
+    let inst = Installation::nouvelle();
+    let poses = super::super::preparer_les_greffons_windows(&inst.extraction, &inst.opt, |de, vers| {
+        if vers.to_string_lossy().contains("party") {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        installation_sure::copier_durablement(de, vers)
+    });
+
+    let cibles: Vec<PathBuf> = poses.into_iter().map(|g| g.cible).collect();
+    assert_eq!(cibles, [inst.opt.join("plugins").join("playlists-converter")]);
+    assert!(!inst.opt.join(ATTENTE).join("party").exists());
+    assert!(lire(&inst.opt.join(MARQUE_GARDES)).contains("party"));
+}
+
+/// Fil 3014, sous Windows pour de vrai : la copie d'un dossier de greffon
+/// réussit (elle échouait toujours sur la synchronisation du dossier).
+#[cfg(windows)]
+#[test]
+fn copier_un_dossier_de_greffon_reussit_sous_windows_3014() {
+    let inst = Installation::nouvelle();
+    let vers = inst.opt.join("copie-party");
+    installation_sure::copier_le_dossier(
+        &inst.extraction.join("plugins").join("party"),
+        &vers,
+        installation_sure::copier_durablement,
+    )
+    .expect("Accès refusé sur la synchronisation du dossier ?");
+    assert_eq!(lire(&vers.join("main.wasm")), "party neuf, plus long");
 }
 
 /// Seuls les dossiers de l'archive qui portent un `manifest.json` sont des

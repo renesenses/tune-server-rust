@@ -115,43 +115,170 @@ fn verifier_la_copie(source: &Path, copie: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Pose et vérifie chaque `plugins.new/<nom>`, sans toucher à `plugins/`. Au
-/// premier échec, tout ce qui a été posé est retiré.
+/// Fil 3014 — combien de fois une opération refusée sur un greffon est tentée.
+const ESSAIS: u32 = 5;
+
+/// L'attente avant le `essai`-ième nouvel essai (courte en test).
+fn attente(essai: u32) -> std::time::Duration {
+    if cfg!(test) {
+        std::time::Duration::from_millis(1)
+    } else {
+        std::time::Duration::from_millis(200 * u64::from(essai))
+    }
+}
+
+/// Un refus qui peut n'être que passager sous Windows : un antivirus ou
+/// l'indexeur tient un fichier tout juste écrit (ERROR_ACCESS_DENIED, ou
+/// ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION).
+fn refus_passager(e: &io::Error) -> bool {
+    e.kind() == io::ErrorKind::PermissionDenied
+        || (cfg!(windows) && matches!(e.raw_os_error(), Some(32 | 33)))
+}
+
+/// `op`, retentée quelques fois, avec une courte attente, tant qu'elle
+/// rencontre un refus passager.
+fn avec_essais<T>(quoi: &Path, mut op: impl FnMut() -> io::Result<T>) -> io::Result<T> {
+    let mut essai = 1;
+    loop {
+        match op() {
+            Err(e) if essai < ESSAIS && refus_passager(&e) => {
+                warn!(
+                    chemin = %quoi.display(),
+                    essai,
+                    error = %e,
+                    "update_greffon_livre_refus_nouvel_essai"
+                );
+                std::thread::sleep(attente(essai));
+                essai += 1;
+            }
+            resultat => return resultat,
+        }
+    }
+}
+
+/// Retire l'attribut lecture seule de `chemin` et de tout ce qu'il contient :
+/// sous Windows, un fichier en lecture seule ne se supprime ni ne s'écrase.
+/// Sans effet ailleurs (c'est le dossier parent qui y décide).
+fn retirer_la_lecture_seule(chemin: &Path) {
+    #[cfg(windows)]
+    {
+        let Ok(meta) = std::fs::symlink_metadata(chemin) else {
+            return;
+        };
+        if meta.is_dir() {
+            if let Ok(entrees) = std::fs::read_dir(chemin) {
+                for entree in entrees.flatten() {
+                    retirer_la_lecture_seule(&entree.path());
+                }
+            }
+        }
+        let mut droits = meta.permissions();
+        if droits.readonly() {
+            #[allow(clippy::permissions_set_readonly_false)]
+            droits.set_readonly(false);
+            std::fs::set_permissions(chemin, droits).ok();
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = chemin;
+}
+
+/// Supprime le dossier `chemin` s'il existe, lecture seule retirée d'abord,
+/// avec quelques essais sur un refus passager.
+pub(super) fn effacer(chemin: &Path) -> io::Result<()> {
+    avec_essais(chemin, || {
+        if std::fs::symlink_metadata(chemin).is_err() {
+            return Ok(());
+        }
+        retirer_la_lecture_seule(chemin);
+        std::fs::remove_dir_all(chemin)
+    })
+}
+
+/// Pose et vérifie un `plugins.new/<nom>`, sans toucher à `plugins/`.
+fn poser(g: &GreffonLivre, copier: fn(&Path, &Path) -> io::Result<()>) -> Result<(), String> {
+    if let Some(parent) = g.pose.parent() {
+        avec_essais(parent, || std::fs::create_dir_all(parent))
+            .map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    effacer(&g.pose).map_err(|e| format!("clear staged plugin {}: {e}", g.pose.display()))?;
+    // Une copie refusée est reprise depuis le début : `copier_le_dossier`
+    // crée le dossier, il faut donc retirer la copie partielle d'abord.
+    avec_essais(&g.pose, || {
+        effacer(&g.pose)?;
+        installation_sure::copier_le_dossier(&g.source, &g.pose, copier)
+    })
+    .map_err(|e| format!("stage plugin {}: {e}", g.pose.display()))?;
+    verifier_la_copie(&g.source, &g.pose)
+}
+
+/// Ce que la préparation a posé, et ce qu'elle a dû laisser.
+#[derive(Debug, Default)]
+pub(super) struct Preparation {
+    /// Les greffons posés en `plugins.new/<nom>`, prêts à basculer.
+    pub poses: Vec<GreffonLivre>,
+    /// Une ligne par greffon qui n'a PAS pu être posé : il garde sa version
+    /// actuelle.
+    pub gardes: Vec<String>,
+}
+
+/// Pose et vérifie chaque `plugins.new/<nom>`, sans toucher à `plugins/`.
+///
+/// Fil 3014 — un greffon ne bloque JAMAIS la mise à jour : celui qui ne peut
+/// pas être posé (après quelques essais) est retiré de `plugins.new/`, garde
+/// sa version actuelle et figure dans [`Preparation::gardes`] ; le serveur,
+/// `web/` et les autres greffons sont mis à jour quand même.
 pub(super) fn preparer(
     greffons: &[GreffonLivre],
     copier: fn(&Path, &Path) -> io::Result<()>,
-) -> Result<(), String> {
-    for (i, g) in greffons.iter().enumerate() {
-        let resultat = (|| {
-            if let Some(parent) = g.pose.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("create {}: {e}", parent.display()))?;
+) -> Preparation {
+    let mut preparation = Preparation::default();
+    for g in greffons {
+        match poser(g, copier) {
+            Ok(()) => preparation.poses.push(g.clone()),
+            Err(e) => {
+                effacer(&g.pose).ok();
+                let nom = g.cible.file_name().unwrap_or_default().to_string_lossy();
+                warn!(
+                    greffon = %nom,
+                    error = %e,
+                    "update_greffon_livre_garde_a_sa_version — la mise à jour continue sans lui"
+                );
+                preparation
+                    .gardes
+                    .push(format!("plugin {nom} kept at its current version ({e})"));
             }
-            if std::fs::symlink_metadata(&g.pose).is_ok() {
-                std::fs::remove_dir_all(&g.pose)
-                    .map_err(|e| format!("clear staged plugin {}: {e}", g.pose.display()))?;
-            }
-            installation_sure::copier_le_dossier(&g.source, &g.pose, copier)
-                .map_err(|e| format!("stage plugin {}: {e}", g.pose.display()))?;
-            verifier_la_copie(&g.source, &g.pose)
-        })();
-        if let Err(e) = resultat {
-            std::fs::remove_dir_all(&g.pose).ok();
-            abandonner(&greffons[..i]);
-            return Err(e);
         }
     }
     if let Some(parent) = greffons.first().and_then(|g| g.pose.parent()) {
-        installation_sure::synchroniser_dossier(parent);
+        if preparation.poses.is_empty() {
+            std::fs::remove_dir(parent).ok();
+        } else {
+            installation_sure::synchroniser_dossier(parent);
+        }
     }
-    Ok(())
+    preparation
+}
+
+/// Fil 3014 — le marqueur qui dit, au démarrage suivant, quels greffons
+/// livrés ont gardé leur version (lu par `record_post_update_result`).
+pub(super) const MARQUE_GARDES: &str = "tune-update-plugins-kept.txt";
+
+/// Écrit (ou retire, s'il n'y a rien) le marqueur des greffons gardés.
+pub(super) fn noter_les_gardes(exe_dir: &Path, gardes: &[String]) {
+    let marque = exe_dir.join(MARQUE_GARDES);
+    if gardes.is_empty() {
+        std::fs::remove_file(marque).ok();
+    } else if let Err(e) = std::fs::write(&marque, gardes.join("\n")) {
+        warn!(marque = %marque.display(), error = %e, "update_greffons_gardes_marque_non_ecrite");
+    }
 }
 
 /// Retire les copies posées et non basculées (et `plugins.new/` s'il est
 /// vide).
 pub(super) fn abandonner(greffons: &[GreffonLivre]) {
     for g in greffons {
-        std::fs::remove_dir_all(&g.pose).ok();
+        effacer(&g.pose).ok();
     }
     if let Some(parent) = greffons.first().and_then(|g| g.pose.parent()) {
         std::fs::remove_dir(parent).ok();
@@ -178,10 +305,8 @@ pub(super) fn basculer(
         std::fs::create_dir_all(dossier)
             .map_err(|e| format!("create {}: {e}", dossier.display()))?;
     }
-    if std::fs::symlink_metadata(&g.ancien).is_ok() {
-        std::fs::remove_dir_all(&g.ancien)
-            .map_err(|e| format!("clear plugin backup {}: {e}", g.ancien.display()))?;
-    }
+    effacer(&g.ancien)
+        .map_err(|e| format!("clear plugin backup {}: {e}", g.ancien.display()))?;
     let ancien_garde = std::fs::symlink_metadata(&g.cible).is_ok();
     if ancien_garde {
         renommer(&g.cible, &g.ancien)
@@ -209,7 +334,7 @@ pub(super) fn remettre_tous(bascules: &[GreffonBascule]) -> Vec<String> {
     let mut non_remis = Vec::new();
     for b in bascules.iter().rev() {
         let resultat = (|| {
-            std::fs::remove_dir_all(&b.cible).map_err(|e| e.to_string())?;
+            effacer(&b.cible).map_err(|e| e.to_string())?;
             if b.ancien_garde {
                 std::fs::rename(&b.ancien, &b.cible).map_err(|e| e.to_string())?;
             }
