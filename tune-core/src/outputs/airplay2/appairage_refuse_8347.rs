@@ -76,6 +76,19 @@ impl Airplay2Output {
     /// suivre, et la cause brute du démon.
     pub(super) fn message_refus_d_appairage(&self, cause: &str) -> String {
         let etape = etape_refusee(cause).unwrap_or_else(|| "pairing".to_string());
+        // #9379 — une Apple TV (TXT `flags` bit 9) n'a pas de code par
+        // défaut : elle n'accepte qu'un appairage unique avec le code
+        // qu'elle affiche. Le transitoire et `3939` échouent toujours.
+        if self.code_a_l_ecran {
+            return format!(
+                "AirPlay 2 receiver \"{}\" refused pairing ({etape}): this receiver \
+                 (an Apple TV, for example) only accepts a one-time pairing with the \
+                 code it shows on screen, so Tune's default AirPlay 2 code can never \
+                 work. Use \"Pair\" on the zone and type the code shown on the TV; \
+                 later sessions reuse that pairing. Receiver error: {cause}",
+                self.name
+            );
+        }
         format!(
             "AirPlay 2 receiver \"{}\" refused pairing ({etape}): it did not accept \
              Tune's default AirPlay 2 code. If this speaker or its app uses an \
@@ -148,6 +161,40 @@ mod tests {
             "fixture-8347".into(),
             "00:11:22:33:44:55".into(),
         )
+    }
+
+    /// #9379 — le refus d'une Apple TV (rapport de Sheev, rc13) : la phrase
+    /// envoie vers « Pair » et le code affiché, pas vers un code par défaut.
+    #[test]
+    fn refus_d_une_apple_tv_renvoie_au_code_affiche_9379() {
+        const SHEEV: &str = "connect failed: transient pairing: Pairing error: Protocol error: \
+            M2 has wrong state value; pair-setup with 3939: Pairing error: receiver refused \
+            Pair-setup M4: TLV error 2 (authentication), retry after 2 s";
+        let atv = Airplay2Output::new(
+            "salon".into(),
+            "127.0.0.1".into(),
+            7000,
+            "airplay-2E:C8:42:93:79:01".into(),
+            "2E:C8:42:93:79:01".into(),
+        )
+        .avec_code_a_l_ecran(true);
+        let message = atv.message_refus_d_appairage(SHEEV);
+        assert!(
+            message.contains("refused pairing (pair-setup M4)"),
+            "{message}"
+        );
+        assert!(message.contains("code it shows on screen"), "{message}");
+        assert!(message.contains("\"Pair\""), "{message}");
+        assert!(
+            !message.contains("did not accept Tune's default"),
+            "{message}"
+        );
+        // Contre-épreuve : sans le bit, la phrase de #8347 reste.
+        let message = mania().message_refus_d_appairage(SHEEV);
+        assert!(
+            message.contains("did not accept Tune's default AirPlay 2 code"),
+            "{message}"
+        );
     }
 
     fn piste() -> PlayMedia<'static> {
