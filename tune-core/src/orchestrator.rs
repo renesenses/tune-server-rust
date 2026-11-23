@@ -993,6 +993,32 @@ fn spawn_local_file_levels_decode_depuis(
     debut_fichier_ms: u64,
     depart_ms: u64,
 ) {
+    spawn_local_file_levels_decode_tranche(
+        bus,
+        playback,
+        zone_id,
+        play_seq,
+        path,
+        debut_fichier_ms,
+        None,
+        depart_ms,
+    );
+}
+
+/// #9184 — [`spawn_local_file_levels_decode_depuis`], borné à la FIN d'une
+/// tranche d'image SACD (`fin_iso_ms`, horloge de la zone) : la mesure
+/// s'arrête avec la piste au lieu de courir sur le reste du disque.
+#[allow(clippy::too_many_arguments)]
+fn spawn_local_file_levels_decode_tranche(
+    bus: Arc<EventBus>,
+    playback: Arc<PlaybackManager>,
+    zone_id: i64,
+    play_seq: u64,
+    path: String,
+    debut_fichier_ms: u64,
+    fin_iso_ms: Option<u64>,
+    depart_ms: u64,
+) {
     let depart_ms = i64::try_from(depart_ms).unwrap_or(i64::MAX);
     tokio::spawn(async move {
         let cadence = playback.clone();
@@ -1002,16 +1028,13 @@ fn spawn_local_file_levels_decode_depuis(
             spawn_braked_levels_sink_depuis(cadence, zone_id, levels_tx, consomme_ms, depart_ms);
         let ready = std::sync::Arc::new(tokio::sync::Notify::new());
         let result = tokio::task::spawn_blocking(move || {
-            crate::audio::decode::decode_to_pcm_streaming_seeked(
+            decoder_pour_les_niveaux(
                 &path,
-                None,
-                None,
-                None,
+                debut_fichier_ms,
+                fin_iso_ms,
                 sink_tx,
-                LEVELS_DECODE_CHUNK,
                 ready,
                 relais_tx,
-                debut_fichier_ms as f64 / 1000.0,
             )
         })
         .await;
@@ -1023,6 +1046,45 @@ fn spawn_local_file_levels_decode_depuis(
             Ok(Ok(_)) => {}
         }
     });
+}
+
+/// Le décodage (bloquant) du décodage-pour-niveaux d'un fichier : depuis
+/// `debut_fichier_ms`, et jusqu'à `fin_iso_ms` pour une image SACD (#9184 :
+/// le lecteur de l'image s'arrête à la trame de fin de la piste). Sans fin,
+/// ou pour un autre fichier, jusqu'au bout du fichier, comme avant.
+pub(crate) fn decoder_pour_les_niveaux(
+    path: &str,
+    debut_fichier_ms: u64,
+    fin_iso_ms: Option<u64>,
+    sink_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ready: std::sync::Arc<tokio::sync::Notify>,
+    relais_tx: tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+) -> Result<(u16, u32), String> {
+    let debut_s = debut_fichier_ms as f64 / 1000.0;
+    match fin_iso_ms {
+        Some(fin) if crate::audio::sacd::est_extension_iso(std::path::Path::new(path)) => {
+            crate::audio::decode::decode_iso_sacd_tranche_streaming(
+                path,
+                sink_tx,
+                LEVELS_DECODE_CHUNK,
+                ready,
+                relais_tx,
+                debut_s,
+                fin as f64 / 1000.0,
+            )
+        }
+        _ => crate::audio::decode::decode_to_pcm_streaming_seeked(
+            path,
+            None,
+            None,
+            None,
+            sink_tx,
+            LEVELS_DECODE_CHUNK,
+            ready,
+            relais_tx,
+            debut_s,
+        ),
+    }
 }
 
 /// Avance maximale du décodage-pour-niveaux d'une session proxy sur la

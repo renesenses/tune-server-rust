@@ -373,6 +373,20 @@ async fn preparer_dsf_depuis_iso(
     .map_err(|e| e.to_string())?
 }
 
+/// #9184 — la fenêtre du décodage-pour-niveaux d'un passthrough DSD, sur
+/// l'horloge du fichier : `(début, fin)`. Une tranche d'ISO SACD servie en
+/// DSF virtuel se mesure de son début à sa fin dans l'image ; tout autre
+/// passthrough sert un fichier entier, mesuré de 0 au bout.
+pub(super) fn fenetre_des_niveaux_du_passthrough(
+    dsf_depuis_iso: bool,
+    tranche_cue: Option<TrancheCue>,
+) -> (u64, Option<u64>) {
+    match tranche_cue.filter(|_| dsf_depuis_iso) {
+        Some(t) => (t.debut_ms, t.duree_ms.map(|d| t.debut_ms + d)),
+        None => (0, None),
+    }
+}
+
 /// #5975 — la durée qui fixe la longueur annoncée d'une conversion.
 ///
 /// Une base qui n'a pas su lire la durée (0) laisse la conversion WAV sans
@@ -5148,20 +5162,18 @@ impl PlaybackOrchestrator {
                     file = %file_path,
                     "dsd_passthrough_niveaux_sonde"
                 );
-                // #9184 — une tranche d'ISO se mesure depuis son début dans
-                // l'image, pas depuis le début du disque.
-                let debut_dans_le_fichier = if dsf_depuis_iso.is_some() {
-                    tranche_cue.map_or(0, |t| t.debut_ms)
-                } else {
-                    0
-                };
-                spawn_local_file_levels_decode_depuis(
+                // #9184 — une tranche d'ISO se mesure de son début à sa fin
+                // dans l'image, ni depuis le début du disque, ni au-delà.
+                let (debut_dans_le_fichier, fin_dans_le_fichier) =
+                    fenetre_des_niveaux_du_passthrough(dsf_depuis_iso.is_some(), tranche_cue);
+                spawn_local_file_levels_decode_tranche(
                     bus.clone(),
                     self.playback.clone(),
                     req.zone_id,
                     play_seq,
                     file_path.clone(),
                     debut_dans_le_fichier,
+                    fin_dans_le_fichier,
                     0,
                 );
             }
