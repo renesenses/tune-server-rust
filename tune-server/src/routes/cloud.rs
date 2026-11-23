@@ -367,6 +367,23 @@ async fn sso_authorize(
         Ok(l) => l,
         Err(refus) => return page_refus_hors_machine(&headers, refus),
     };
+    // Relecture B : du réseau local, la liaison ne part que d'une navigation
+    // de Tune lui-même (`same-origin`), saisie à la main (`none`) ou d'un
+    // client sans l'en-tête ; jamais d'une page d'un autre site. Le retour,
+    // lui, est légitimement inter-sites (il revient de mozaiklabs.fr).
+    if par_le_reseau_local && autorisation_inter_sites(&headers) {
+        warn!("sso_authorize_inter_sites_refuse_depuis_le_reseau_local");
+        return page_refus_hors_machine(
+            &headers,
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "cross_site_request",
+                    "message": "Cross-site request refused.",
+                })),
+            ),
+        );
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let Some(auth) = get_mozaik_auth(&settings) else {
         // sso_authorize is a full browser navigation, so degrade to a friendly
@@ -497,6 +514,16 @@ fn prendre_l_attente_pkce(
         pkce,
         lancee_du_reseau_local,
     })
+}
+
+/// `Sec-Fetch-Site: cross-site` ou `same-site` : la navigation vient d'une
+/// page d'un autre site (ou d'un autre port, sous-domaine du même site).
+fn autorisation_inter_sites(entetes: &HeaderMap) -> bool {
+    entetes
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .is_some_and(|v| v == "cross-site" || v == "same-site")
 }
 
 /// Une attente PKCE consommée, et d'où sa ronde a été LANCÉE.
