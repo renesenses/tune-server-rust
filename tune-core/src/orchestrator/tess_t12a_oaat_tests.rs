@@ -211,9 +211,7 @@ struct Lecture {
 /// Une lecture de bout en bout ; rend ce que le faux récepteur a reçu.
 async fn jouer(chaine: Chaine) -> Lecture {
     let _tiers = matches!(chaine, Chaine::GreffonTiers).then(|| {
-        crate::greffon_natif_de_test::enregistrer_les_bibliotheques_de_test(&[
-            "gain-essai-t12a",
-        ])
+        crate::greffon_natif_de_test::enregistrer_les_bibliotheques_de_test(&["gain-essai-t12a"])
     });
     let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
     db.init_schema().unwrap();
@@ -320,7 +318,10 @@ async fn jouer(chaine: Chaine) -> Lecture {
     }
     let _ = sortie_reelle.lock().await.stop().await;
     let (trames, bits) = trames_recues(&paquets);
-    assert!(!trames.is_empty(), "le faux récepteur n'a rien reçu ({chaine:?})");
+    assert!(
+        !trames.is_empty(),
+        "le faux récepteur n'a rien reçu ({chaine:?})"
+    );
     Lecture {
         trames,
         bits,

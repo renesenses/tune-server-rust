@@ -782,7 +782,10 @@ pub fn sortie_porte_toute_la_chaine(
 /// (`NonLocalOutput`) est levé : le réglage est honoré tel quel, sans motif,
 /// comme sur une sortie locale. Tout autre statut passe inchangé (PURE garde
 /// la priorité, les droits viennent après : [`avec_les_droits`]).
-pub fn avec_toute_la_chaine(sortie: CrossfeedStatus, porte_toute_la_chaine: bool) -> CrossfeedStatus {
+pub fn avec_toute_la_chaine(
+    sortie: CrossfeedStatus,
+    porte_toute_la_chaine: bool,
+) -> CrossfeedStatus {
     if !porte_toute_la_chaine || sortie.reason != Some(CrossfeedConstraint::NonLocalOutput) {
         return sortie;
     }
