@@ -341,19 +341,22 @@ fn la_bascule_n_alloue_rien_dans_traiter() {
 
 #[test]
 fn la_reponse_reechantillonnee_de_44_1_a_96_khz_garde_sa_phase_a_1_degre() {
-    // Une réponse de pièce à 44,1 kHz : impulsion directe, résonance à
-    // 60 Hz amortie, écho. Rééchantillonnée vers 96 kHz par le repli de
-    // #8761 (rubato sinc, noyau symétrique, marges retirées).
+    // Une réponse de pièce à 44,1 kHz : impulsion directe, champ diffus en
+    // décroissance exponentielle (passe-bas à un pôle : partie réelle
+    // positive, donc aucun creux où la phase ne serait pas définie), écho à
+    // 6,8 ms. Rééchantillonnée vers 96 kHz par le repli de #8761 (rubato
+    // sinc, noyau symétrique, marges retirées).
     let de = 44_100u32;
     let vers = 96_000u32;
     let n = 8192;
     let ri: Vec<f32> = (0..n)
         .map(|i| {
             let t = i as f64 / de as f64;
-            let mut v = 0.6 * (-(t / 0.05)).exp() * (2.0 * std::f64::consts::PI * 60.0 * t).sin();
-            if i == 0 {
-                v += 0.8;
-            }
+            let mut v = if i == 0 {
+                0.8
+            } else {
+                0.3 * (-(t / 0.01)).exp()
+            };
             if i == 300 {
                 v += 0.2;
             }
@@ -361,7 +364,8 @@ fn la_reponse_reechantillonnee_de_44_1_a_96_khz_garde_sa_phase_a_1_degre() {
         })
         .collect();
     let rr = par_cadence::reechantillonner_ri(&[ri.clone()], de, vers);
-    let freqs = log_freq_grid(120, 20.0, 20_000.0);
+    // Bande utile : jusqu'à 0,45 × 44,1 kHz (19,8 kHz), comme le témoin de #8761.
+    let freqs = log_freq_grid(120, 20.0, 0.45 * de as f64);
     let avant = fir_frequency_response(&ri, de, &freqs);
     let apres = fir_frequency_response(&rr[0], vers, &freqs);
     let mut pire_phase = 0.0f64;

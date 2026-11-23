@@ -269,6 +269,23 @@ fn la_chaine_d_avant_rend_les_memes_bits_que_l_ancien_chemin() {
                 let n =
                     frontiere_f32(&nouveau.nouveau(&source, bits, OrdreLocal::HISTORIQUE, bloc));
                 let a = ancien.ancien(&source, bits, bloc);
+                if conv && mono && !cf {
+                    // T09b — la convolution est un étage f64 natif : le repli
+                    // mono qui la suit directement reçoit ses échantillons
+                    // EXACTS, là où l'ancien chemin les arrondissait en f32
+                    // avant de les sommer. Seul l'arrondi final diffère :
+                    // au plus un ULP f32, jamais plus.
+                    assert_eq!(n.len(), a.len());
+                    for (i, (x, y)) in n.iter().zip(&a).enumerate() {
+                        let ulp = f32::EPSILON * x.abs().max(y.abs()).max(f32::MIN_POSITIVE);
+                        assert!(
+                            (x - y).abs() <= ulp,
+                            "{bits} bits, bloc {bloc}, conv+mono : écart {} > 1 ULP en {i}",
+                            (x - y).abs()
+                        );
+                    }
+                    continue;
+                }
                 assert_eq!(
                     bits_f32(&n),
                     bits_f32(&a),

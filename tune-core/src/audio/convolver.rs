@@ -405,7 +405,12 @@ impl<T: Flottant> Convolver<T> {
             channels,
             prises: impulse_response.iter().map(Vec::len).max().unwrap_or(0),
             ir_partitions,
-            input_buf: vec![Vec::with_capacity(block_size); channels],
+            // Une capacité PAR canal : `vec![v; n]` clone `v`, et le clone
+            // d'un vecteur vide n'a aucune capacité (le premier bloc aurait
+            // alloué dans le fil audio).
+            input_buf: (0..channels)
+                .map(|_| Vec::with_capacity(block_size))
+                .collect(),
             fdl,
             fdl_pos: 0,
             overlap: vec![vec![zero; fft_size - block_size]; channels],
