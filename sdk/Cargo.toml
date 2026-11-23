@@ -25,3 +25,8 @@ opt-level = 2
 # détecteur font des centaines de millions d'opérations par test.
 [profile.dev.package.tune-plugin-declick-live]
 opt-level = 2
+
+# TESS T11b : les témoins du modulateur DSD modulent des millions
+# d'échantillons à 1 bit et font des FFT de 2^20 points.
+[profile.dev.package.tune-plugin-audio-support]
+opt-level = 2

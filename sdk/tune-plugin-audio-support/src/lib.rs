@@ -3,4 +3,5 @@
 pub mod dither;
 pub mod ecretage;
 pub mod limiteur;
+pub mod modulateur_dsd;
 pub mod niveau_moyen;
