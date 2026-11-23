@@ -428,6 +428,25 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
         )
             .into_response();
     }
+    // Forum rc14 — la sortie vivante du même nom est tenue par une AUTRE
+    // zone (#5464). Le motif fait afficher la phrase du serveur, qui nomme
+    // cette zone ; sans lui, le client web la remplaçait par son bandeau
+    // générique « l'appareil est introuvable ». Testé AVANT le refus
+    // ordinaire, dont le préfixe est aussi le sien.
+    if let Some((zone_qui_tient, msg)) =
+        tune_core::outputs::sortie_tenue_par_une_autre_zone::depuis_sentinelle(&e)
+    {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "zone_output_unavailable",
+                "reason": tune_core::outputs::sortie_tenue_par_une_autre_zone::MOTIF,
+                "holder_zone_id": zone_qui_tient,
+                "message": msg,
+            })),
+        )
+            .into_response();
+    }
     if let Some(msg) = e.strip_prefix("zone_output_unavailable:") {
         return (
             StatusCode::CONFLICT,
@@ -9890,6 +9909,26 @@ mod tests {
         assert!(
             body.get("reason").is_none(),
             "un refus ordinaire ne doit pas se voir coller un motif ASIO : {body}"
+        );
+    }
+
+    /// Forum rc14 — deux zones pour un même appareil : le refus « sortie tenue
+    /// par une autre zone » rend son motif et la zone qui tient la sortie, et
+    /// la phrase traverse sans sentinelle. Sans motif, le client web affichait
+    /// son bandeau générique « appareil introuvable » à la place.
+    #[tokio::test]
+    async fn le_refus_de_sortie_tenue_par_une_autre_zone_porte_son_motif() {
+        let (status, body) = parts(
+            "zone_output_unavailable:output_held_by_other_zone:7:La zone « Salon : NanoPlayer » l'utilise déjà.",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "zone_output_unavailable");
+        assert_eq!(body["reason"], "output_held_by_other_zone", "{body}");
+        assert_eq!(body["holder_zone_id"], 7, "{body}");
+        assert_eq!(
+            body["message"], "La zone « Salon : NanoPlayer » l'utilise déjà.",
+            "{body}"
         );
     }
 

@@ -115,6 +115,8 @@ pub mod sendspin;
 #[cfg_attr(not(all(target_os = "windows", feature = "asio")), allow(dead_code))]
 pub(crate) mod silence_avant_liberation_6133;
 pub mod slimproto;
+/// Forum rc14 — le refus « sortie tenue par une autre zone » porte son motif.
+pub mod sortie_tenue_par_une_autre_zone;
 /// #6132 — la sortie double : le même flux sur deux périphériques locaux,
 /// l'horloge du second asservie au premier. Hors `cfg` : la règle se juge par
 /// `cargo test` sous Linux, sur deux périphériques simulés.

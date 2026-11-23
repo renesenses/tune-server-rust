@@ -209,19 +209,24 @@ pub(crate) fn message_de_refus_de_zone(
 /// - l'autre zone a un autre nom : on la nomme, c'est là qu'il faut lancer ;
 /// - l'autre zone est SUPPRIMÉE (masquée) : on ne propose pas d'y lancer la
 ///   lecture, l'auditeur ne la voit plus.
+///
+/// Forum rc14 — la sentinelle porte le motif
+/// [`crate::outputs::sortie_tenue_par_une_autre_zone::MOTIF`] et la zone qui
+/// tient la sortie : sans motif, le client web remplaçait cette phrase par son
+/// bandeau générique « l'appareil est introuvable ».
 pub(crate) fn message_de_sortie_deja_tenue(
     zone_name: &str,
     sortie: &str,
+    autre_zone_id: i64,
     autre_zone: &str,
     autre_supprimee: bool,
 ) -> String {
-    const SENTINELLE: &str = "zone_output_unavailable:";
     let appareil = nom_lisible_de_l_appareil(sortie).unwrap_or_else(|| zone_name.to_string());
     let debut = format!(
-        "{SENTINELLE}La sortie de la zone « {zone_name} » a disparu. Une sortie « {appareil} » \
+        "La sortie de la zone « {zone_name} » a disparu. Une sortie « {appareil} » \
          est bien présente, mais"
     );
-    if autre_supprimee {
+    let phrase = if autre_supprimee {
         format!(
             "{debut} elle est déjà attachée à une zone supprimée, « {autre_zone} », et deux \
              zones ne peuvent pas partager une sortie. Choisissez une autre sortie dans les \
@@ -239,7 +244,8 @@ pub(crate) fn message_de_sortie_deja_tenue(
              partager une sortie. Lancez la lecture depuis « {autre_zone} », ou choisissez une \
              autre sortie dans les réglages de la zone « {zone_name} »."
         )
-    }
+    };
+    crate::outputs::sortie_tenue_par_une_autre_zone::sentinelle(autre_zone_id, &phrase)
 }
 
 /// Le message ET le code d'un refus de zone hors ligne, en fonction pure.
@@ -282,6 +288,10 @@ pub(crate) fn refus_de_zone_hors_ligne(
 /// première laisserait donc repasser la seconde en entier dans la bulle.
 pub(crate) fn phrase_sans_sentinelle(msg: &str) -> &str {
     if let Some((_, phrase)) = crate::outputs::asio_blocage_4556::depuis_sentinelle(msg) {
+        return phrase;
+    }
+    if let Some((_, phrase)) = crate::outputs::sortie_tenue_par_une_autre_zone::depuis_sentinelle(msg)
+    {
         return phrase;
     }
     msg.strip_prefix("zone_output_unavailable:").unwrap_or(msg)
@@ -811,13 +821,20 @@ impl PlaybackOrchestrator {
             .flatten()
             .filter(|z| z.id.is_some_and(|id| id != zone_id))?;
         let supprimee = repo.is_device_hidden(sortie);
-        let msg = message_de_sortie_deja_tenue(&zone.name, sortie, &occupante.name, supprimee);
+        let occupante_id = occupante.id.unwrap_or_default();
+        let msg = message_de_sortie_deja_tenue(
+            &zone.name,
+            sortie,
+            occupante_id,
+            &occupante.name,
+            supprimee,
+        );
         warn!(
             zone_id,
             zone_name = %zone.name,
             stale_device_id = dev_id,
             target_device_id = sortie,
-            holder_zone_id = occupante.id.unwrap_or_default(),
+            holder_zone_id = occupante_id,
             holder_hidden = supprimee,
             "zone_rebind_target_held_by_other_zone"
         );
@@ -828,6 +845,14 @@ impl PlaybackOrchestrator {
                     "zone_id": zone_id,
                     "error": phrase_sans_sentinelle(&msg),
                     "code": "zone_output_unavailable",
+                    // Forum rc14 — le motif fait afficher CETTE phrase au
+                    // client, pas son bandeau « appareil introuvable ».
+                    // `message` : c'est le champ que lit le client quand le
+                    // refus porte un motif (`lireMessageServeur`).
+                    "message": phrase_sans_sentinelle(&msg),
+                    "reason": crate::outputs::sortie_tenue_par_une_autre_zone::MOTIF,
+                    "holder_zone_id": occupante_id,
+                    "holder_hidden": supprimee,
                     "fatal": true,
                 }),
             );
