@@ -188,9 +188,10 @@ pub fn recent_du_profil(
 ///
 /// La reprise ENREGISTRÉE, elle, survit : chaque contexte démarré range les
 /// lignes de file qui lui appartiennent (`queue_row_ids`). Ce repli rend le
-/// conteneur de la reprise qui contient la ligne jouée à `position`, si cette
-/// ligne désigne bien la piste jouée. Ni titre seul, ni podcast : rien n'est
-/// inventé.
+/// conteneur de la DERNIÈRE reprise de la zone si elle contient la ligne jouée
+/// à `position` et que cette ligne désigne bien la piste jouée. Album ou
+/// playlist seulement (ni radio, ni titre seul, ni podcast) : rien n'est
+/// inventé. L'appelant ne la consulte qu'une fois par zone après le démarrage.
 pub fn contexte_de_la_ligne_reprise(
     db: &Arc<dyn DbBackend>,
     zone_id: i64,
@@ -216,11 +217,22 @@ pub fn contexte_de_la_ligne_reprise(
     if !meme_piste {
         return None;
     }
-    let r = recent(db, Some(zone_id), 200)
-        .ok()?
-        .into_iter()
-        .find(|r| r.queue_row_ids.contains(&id))?;
-    if matches!(r.context_type.as_str(), "" | "track" | "podcast") || r.context_id.is_empty() {
+    // UNE seule reprise lue : la plus récente de la zone, celle que la
+    // lecture interrompue par le redémarrage écrivait.
+    let r = db
+        .query_one(
+            "SELECT payload, resume_key FROM listening_resumes WHERE zone_id = ? ORDER BY updated_at DESC, resume_key LIMIT 1",
+            &[&zone_id as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten()
+        .and_then(|row| decode(&row).ok())?;
+    // Un album ou une playlist seulement : une radio (#6465), un titre seul,
+    // un podcast ne rangent jamais une écoute dans leur conteneur.
+    if !matches!(r.context_type.as_str(), "album" | "playlist")
+        || r.context_id.is_empty()
+        || !r.queue_row_ids.contains(&id)
+    {
         return None;
     }
     let texte = |s: &str| (!s.trim().is_empty()).then(|| s.to_string());

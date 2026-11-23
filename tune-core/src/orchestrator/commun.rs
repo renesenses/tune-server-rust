@@ -716,8 +716,21 @@ impl PlaybackOrchestrator {
             return (Some(c.nature), c.id, c.service, c.titre, c.pochette);
         }
         // Fil 3009, point 4 — sans session (perdue au redémarrage), le
-        // conteneur de la reprise enregistrée qui contient cette ligne.
+        // conteneur de la reprise enregistrée qui contient cette ligne. UNE
+        // recherche par zone depuis le démarrage (`zones_reprise_cherchee`),
+        // jamais pour une radio ni un podcast ; trouvé, il redevient la
+        // session de la zone, et les titres suivants le reprennent sans relire
+        // la base.
         if etat.session_context_type.is_none()
+            && !etat
+                .now_playing
+                .as_ref()
+                .is_some_and(|np| matches!(np.source.as_str(), "radio" | "podcast"))
+            && self
+                .zones_reprise_cherchee
+                .lock()
+                .map(|mut z| z.insert(etat.zone_id))
+                .unwrap_or(false)
             && let Some(c) = crate::db::listening_resume::contexte_de_la_ligne_reprise(
                 &self.db,
                 etat.zone_id,
@@ -726,6 +739,20 @@ impl PlaybackOrchestrator {
                 source_id,
             )
         {
+            let playback = self.playback.clone();
+            let (zone, contexte) = (etat.zone_id, c.clone());
+            tokio::spawn(async move {
+                playback
+                    .set_session_context(
+                        zone,
+                        Some(contexte.nature),
+                        contexte.id,
+                        contexte.service,
+                        contexte.titre,
+                        contexte.pochette,
+                    )
+                    .await;
+            });
             return (Some(c.nature), c.id, c.service, c.titre, c.pochette);
         }
         (

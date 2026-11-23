@@ -678,3 +678,64 @@ async fn sans_reprise_enregistree_rien_n_est_invente_3009() {
     b.jouer(b.salon, 0).await;
     assert_eq!(b.historique(), vec![("Seule".into(), b.salon, None, None)]);
 }
+
+/// Relecture du 23/11 — une écoute de RADIO (zone sans session : la station a
+/// effacé celle de l'album, #6465) ne lit aucune reprise, et ne consomme pas
+/// la recherche de la zone.
+#[tokio::test]
+async fn une_ecoute_de_radio_ne_lit_aucune_reprise_3009() {
+    let b = Banc::monter().await;
+    b.lire_l_album(b.salon).await;
+    b.jouer(b.salon, 0).await;
+    b.orch.playback.effacer_contexte_de_session(b.salon).await;
+    b.orch
+        .playback
+        .play(
+            b.salon,
+            crate::playback::NowPlaying {
+                title: "FIP".into(),
+                source: "radio".into(),
+                source_id: Some("https://radio.invalid/fip".into()),
+                ..Default::default()
+            },
+        )
+        .await;
+    let etat = b.orch.playback.get_state(b.salon).await;
+    let contexte = b
+        .orch
+        .contexte_de_l_ecoute(&etat, None, Some("https://radio.invalid/fip"));
+    assert_eq!(contexte.0, None, "une radio n'est rangée dans aucun album");
+    assert!(
+        !b.orch
+            .zones_reprise_cherchee
+            .lock()
+            .unwrap()
+            .contains(&b.salon),
+        "aucune reprise n'a été lue pour une écoute de radio"
+    );
+}
+
+/// Relecture du 23/11 — la recherche n'a lieu qu'UNE fois par zone depuis le
+/// démarrage : trouvée, l'album redevient la session de la zone.
+#[tokio::test]
+async fn la_reprise_n_est_cherchee_qu_une_fois_par_zone_3009() {
+    let b = Banc::monter().await;
+    b.lire_l_album(b.salon).await;
+    b.jouer(b.salon, 0).await;
+    b.orch.playback.effacer_contexte_de_session(b.salon).await;
+    b.jouer(b.salon, 1).await;
+    assert!(
+        b.orch
+            .zones_reprise_cherchee
+            .lock()
+            .unwrap()
+            .contains(&b.salon)
+    );
+    tokio::task::yield_now().await;
+    let etat = b.orch.playback.get_state(b.salon).await;
+    assert_eq!(
+        etat.session_context_type.as_deref(),
+        Some("album"),
+        "le conteneur retrouvé redevient la session de la zone"
+    );
+}

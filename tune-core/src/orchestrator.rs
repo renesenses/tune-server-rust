@@ -1387,6 +1387,12 @@ pub struct PlaybackOrchestrator {
     ///
     /// Verrou std : accès très courts, jamais tenus à travers un await.
     ecoutes_en_attente: std::sync::Mutex<HashMap<i64, ecoute_validee_7852::EcouteEnAttente>>,
+    /// Fil 3009, point 4 — les zones dont la reprise enregistrée a déjà été
+    /// cherchée depuis le démarrage (`contexte_de_l_ecoute`) : une fois par
+    /// zone, jamais à chaque écoute sans session.
+    ///
+    /// Verrou std : accès très courts, jamais tenus à travers un await.
+    pub(crate) zones_reprise_cherchee: std::sync::Mutex<std::collections::HashSet<i64>>,
     /// #8107 — la dernière écoute écrite par chaque zone, pour qu'un groupe
     /// de zones (`zone_groups`) ne compte qu'une écoute par titre. Voir
     /// `ecoute_validee_7852`.
@@ -2006,6 +2012,7 @@ impl PlaybackOrchestrator {
             last_net_play: Mutex::new(HashMap::new()),
             annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
             ecoutes_en_attente: std::sync::Mutex::new(HashMap::new()),
+            zones_reprise_cherchee: std::sync::Mutex::new(std::collections::HashSet::new()),
             ecoutes_ecrites: std::sync::Mutex::new(HashMap::new()),
             sas_retrait: Arc::new(crate::db::ecouter_plus_tard_retrait::SasRetrait::new()),
             suivis_de_bail: std::sync::Mutex::new(HashMap::new()),
