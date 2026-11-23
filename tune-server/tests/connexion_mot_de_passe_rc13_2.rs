@@ -111,7 +111,14 @@ async fn connexion(state: &AppState, adresse: &str, nom: &str, mot: &str) -> (St
 
 async fn activer(state: &AppState) {
     let corps = serde_json::json!({ "password": MOT_DE_PASSE }).to_string();
-    let (st, v) = appel(state, CETTE_MACHINE, "/api/v1/auth/activation", &corps, None).await;
+    let (st, v) = appel(
+        state,
+        CETTE_MACHINE,
+        "/api/v1/auth/activation",
+        &corps,
+        None,
+    )
+    .await;
     assert_eq!(st, StatusCode::OK, "activation : {v}");
     assert!(tune_server::auth::authentification_active(state));
 }
@@ -137,13 +144,20 @@ fn refus_lisible(v: &Value) {
 async fn activation_puis_mauvais_mot_de_passe_sur_cette_machine(state: &AppState, lan: &str) {
     activer(state).await;
     let (st, v) = connexion(state, CETTE_MACHINE, "default", MAUVAIS).await;
-    assert_eq!(st, StatusCode::UNAUTHORIZED, "mauvais mot de passe accepté : {v}");
+    assert_eq!(
+        st,
+        StatusCode::UNAUTHORIZED,
+        "mauvais mot de passe accepté : {v}"
+    );
     refus_lisible(&v);
     assert!(
         mot_de_passe_enregistre(state, MOT_DE_PASSE),
         "le mot de passe d'activation doit rester celui du compte"
     );
-    assert!(!mot_de_passe_enregistre(state, MAUVAIS), "le mauvais mot de passe a été enregistré");
+    assert!(
+        !mot_de_passe_enregistre(state, MAUVAIS),
+        "le mauvais mot de passe a été enregistré"
+    );
     // Le vrai mot de passe ouvre toujours la session, ici et depuis le LAN.
     for adresse in [CETTE_MACHINE, lan] {
         let (st, v) = connexion(state, adresse, "default", MOT_DE_PASSE).await;
@@ -172,7 +186,11 @@ async fn profil_sans_mot_de_passe_authentification_coupee(state: &AppState, lan:
     assert_eq!(hachages(state), (None, None));
     let (st, v) = connexion(state, lan, "default", "tiers-1234").await;
     assert_eq!(st, StatusCode::OK, "{v}");
-    assert_eq!(hachages(state), (None, None), "rien n'est enregistré depuis le LAN");
+    assert_eq!(
+        hachages(state),
+        (None, None),
+        "rien n'est enregistré depuis le LAN"
+    );
     let (st, v) = connexion(state, CETTE_MACHINE, "default", "premier-1234").await;
     assert_eq!(st, StatusCode::OK, "{v}");
     assert!(mot_de_passe_enregistre(state, "premier-1234"));
@@ -201,7 +219,10 @@ async fn base_rc12_ancien_hachage(state: &AppState, lan: &str) {
     }
     let (st, v) = connexion(state, lan, "default", "ancien-1234").await;
     assert_eq!(st, StatusCode::OK, "{v}");
-    assert!(mot_de_passe_enregistre(state, "ancien-1234"), "converti après vérification");
+    assert!(
+        mot_de_passe_enregistre(state, "ancien-1234"),
+        "converti après vérification"
+    );
     let (st, _) = connexion(state, CETTE_MACHINE, "default", MAUVAIS).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
     assert!(mot_de_passe_enregistre(state, "ancien-1234"));
@@ -284,7 +305,14 @@ async fn le_refus_parle_la_langue_de_la_requete() {
     let state = etat_sqlite();
     activer(&state).await;
     let corps = serde_json::json!({ "username": "default", "password": MAUVAIS }).to_string();
-    let (st, v) = appel(&state, CETTE_MACHINE, "/api/v1/auth/login", &corps, Some("fr-FR,fr;q=0.9")).await;
+    let (st, v) = appel(
+        &state,
+        CETTE_MACHINE,
+        "/api/v1/auth/login",
+        &corps,
+        Some("fr-FR,fr;q=0.9"),
+    )
+    .await;
     assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
     assert_eq!(v["error"], "invalid credentials");
     assert_eq!(v["message"], "Identifiant ou mot de passe incorrect", "{v}");

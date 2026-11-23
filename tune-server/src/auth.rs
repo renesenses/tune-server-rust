@@ -1520,9 +1520,8 @@ async fn login(
     // Try argon2 hash first (password_hash_v2), then fall back to SHA-256 (password_hash)
     let valid_v2 = nouveau_hachage.is_some_and(|h| verify_password(&body.password, h));
     let valid_ancien = !valid_v2
-        && ancien_hachage.is_some_and(|h| {
-            format!("{:x}", Sha256::digest(body.password.as_bytes())) == h
-        });
+        && ancien_hachage
+            .is_some_and(|h| format!("{:x}", Sha256::digest(body.password.as_bytes())) == h);
 
     if !(valid_v2 || valid_ancien || premiere_connexion) {
         record_login_failure(ip, operateur);
