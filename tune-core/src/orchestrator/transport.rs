@@ -1558,6 +1558,24 @@ impl PlaybackOrchestrator {
                     local_file_path.as_deref(),
                 )
                 .await;
+            // #9176 — OAAT lit un WAV directement sur le disque : sur une zone
+            // qui traite le flux, ce fichier contournerait le traitement.
+            let fichier_pour_la_sortie = match fichier_pour_la_sortie {
+                Some(f)
+                    if est_sortie_oaat(Some(device_id.as_str()))
+                        && !oaat_peut_lire_le_fichier(&f, || {
+                            self.zone_traite_le_flux_pcm(req, resolved)
+                        }) =>
+                {
+                    info!(
+                        zone_id = req.zone_id,
+                        device_id = %device_id,
+                        "oaat_lecture_directe_refusee_traitement_actif"
+                    );
+                    None
+                }
+                autre => autre,
+            };
             let media = crate::outputs::traits::PlayMedia {
                 url: &resolved.url,
                 mime_type: &resolved.mime_type,
@@ -2334,6 +2352,30 @@ impl PlaybackOrchestrator {
         (false, Some(format!("Device not found: {device_id}")))
     }
 
+    /// #9176 — la zone traite-t-elle le flux PCM servi à une sortie réseau ?
+    ///
+    /// Les mêmes étages que [`StreamingDsp::is_active`], lus par leurs sondes
+    /// bon marché (aucun convolveur bâti) : égaliseur, correction de pièce à la
+    /// cadence du flux, ReplayGain qui change les échantillons, crossfeed. La
+    /// compensation n'existe qu'avec l'égaliseur ou le crossfeed. En PURE,
+    /// chaque sonde rend faux.
+    pub(super) fn zone_traite_le_flux_pcm(
+        &self,
+        req: &PlayRequest,
+        resolved: &ResolvedStream,
+    ) -> bool {
+        let zone_id = req.zone_id;
+        let canaux = resolved
+            .channels
+            .and_then(|c| u16::try_from(c).ok())
+            .filter(|c| *c > 0)
+            .unwrap_or(2);
+        self.zone_has_active_eq(zone_id)
+            || self.zone_has_active_crossfeed(zone_id)
+            || self.zone_replaygain_changes_audio(zone_id, req.piste_rg())
+            || self.zone_ir_s_appliquerait(zone_id, resolved.sample_rate, canaux)
+    }
+
     /// #9175 — le `PlayMedia::file_path` remis à la sortie `output_type`.
     ///
     /// L'orchestrateur connaît le fichier de TOUTE piste locale, quelle que
@@ -2352,8 +2394,8 @@ impl PlaybackOrchestrator {
     /// Un fait du flux, pas une déduction des réglages : c'est ce que le
     /// chemin du signal annonce qui part alors vraiment.
     ///
-    /// Les autres sorties gardent le fichier tel quel : OAAT le lit derrière
-    /// ses propres gardes (#9176), les autres ne le lisent pas.
+    /// Les autres sorties gardent le fichier tel quel : OAAT est filtré par
+    /// [`oaat_peut_lire_le_fichier`] (#9176), les autres ne le lisent pas.
     pub(super) async fn fichier_d_origine_pour_la_sortie(
         &self,
         output_type: Option<&str>,
@@ -4835,6 +4877,22 @@ fn message_flux_non_ouvert(resolved: &ResolvedStream) -> String {
         "Le flux de « {} » n'a pas pu être ouvert auprès du service ({}).",
         resolved.title, resolved.source
     )
+}
+
+/// #9176 — OAAT peut-il lire `fichier` lui-même, au lieu du flux servi ?
+///
+/// La sortie OAAT lit en direct un WAV (`entete_est_wav`) ou un DSF en DSD
+/// natif. Le DSD natif ne passe par aucun traitement PCM (c'est voulu) : le
+/// fichier reste remis, et la sortie décide elle-même de son repli. Pour tout
+/// autre fichier, la lecture directe n'est permise que si la zone ne traite pas
+/// le flux (`flux_traite` : égaliseur, correction de pièce, ReplayGain,
+/// crossfeed ; faux en PURE). Sinon la sortie lit `url`, le flux traité.
+pub(super) fn oaat_peut_lire_le_fichier(fichier: &str, flux_traite: impl FnOnce() -> bool) -> bool {
+    let dsd = std::path::Path::new(fichier)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("dsf") || e.eq_ignore_ascii_case("dff"));
+    dsd || !flux_traite()
 }
 
 /// #9175 — les sorties qui décodent elles-mêmes `PlayMedia::file_path` quand
