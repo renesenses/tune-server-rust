@@ -964,13 +964,18 @@ enum Refus {
     /// Installation d'une mise à jour sans authentification, appel venu
     /// d'ailleurs que du réseau local (accès à distance, mandataire, VPN).
     HorsDuReseauLocal,
+    /// Liaison du compte mozaiklabs.fr sans authentification, appel venu
+    /// d'ailleurs que du réseau local.
+    CompteHorsDuReseauLocal,
 }
 
 /// L'action que nomme le refus, d'après le chemin appelé : la clé de son
 /// libellé dans `i18n_server.json` (`api.machine.action.<clé>`).
 pub fn action_du_chemin(chemin: &str) -> &'static str {
     let c = chemin.to_ascii_lowercase();
-    if c.contains("/update/channel") {
+    if c.contains("/cloud/sso") {
+        "account"
+    } else if c.contains("/update/channel") {
         "updateChannel"
     } else if c.contains("/update") {
         "update"
@@ -1017,13 +1022,16 @@ async fn refus_action_reservee(
         relaye,
         relais_port_80,
         mandataire,
-        hors_du_reseau_local = refus == Refus::HorsDuReseauLocal,
+        hors_du_reseau_local = refus != Refus::HorsDeCetteMachine,
         "action_machine_refusee_hors_de_cette_machine_sans_authentification"
     );
     // Le refus dit ce que le serveur a vu : l'exploitant comprend tout de
     // suite pourquoi « depuis cette machine » n'a pas été reconnu.
     let (motif, cle) = match refus {
         Refus::HorsDuReseauLocal => ("not_local_network", "api.machine.reservedOutsideLan"),
+        Refus::CompteHorsDuReseauLocal => {
+            ("not_local_network", "api.machine.reservedOutsideLanAccount")
+        }
         Refus::HorsDeCetteMachine if relais_port_80 => {
             ("port80_relay", "api.machine.reservedPort80Relay")
         }
@@ -1145,6 +1153,69 @@ impl FromRequestParts<AppState> for AdminOuReseauLocalPourLaMiseAJour {
             return Ok(Self);
         }
         Err(refus_action_reservee(parts, state, Refus::HorsDuReseauLocal).await)
+    }
+}
+
+/// Garde de la LIAISON du compte mozaiklabs.fr (`GET /cloud/sso/authorize` et
+/// son retour `GET /cloud/sso/callback`), même règle que la mise à jour
+/// ([`AdminOuReseauLocalPourLaMiseAJour`]) :
+///
+/// - authentification active : l'administrateur (un compte standard relie son
+///   propre profil, voir `routes::cloud::liaison_autorisee`) ;
+/// - authentification coupée : cette machine, ou le RÉSEAU LOCAL
+///   ([`appel_depuis_le_reseau_local`]) ; jamais le relais distant, un
+///   mandataire inverse ni une adresse hors réseau local.
+///
+/// La ronde OAuth garde ses propres verrous (PKCE, `state` à usage unique,
+/// `redirect_uri` mémorisée) : ouvrir la garde au réseau local ne change rien
+/// à qui peut finir une liaison commencée.
+pub struct AdminOuReseauLocalPourLeCompte;
+
+impl FromRequestParts<AppState> for AdminOuReseauLocalPourLeCompte {
+    type Rejection = (StatusCode, Json<Value>);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if authentification_active(state) {
+            return <RequireAdmin as FromRequestParts<AppState>>::from_request_parts(parts, state)
+                .await
+                .map(|_| Self);
+        }
+        if appel_depuis_cette_machine(parts, state).await {
+            return Ok(Self);
+        }
+        if appel_depuis_le_reseau_local(parts, state).await {
+            tracing::info!("liaison_du_compte_acceptee_depuis_le_reseau_local_sans_authentification");
+            return Ok(Self);
+        }
+        Err(refus_action_reservee(parts, state, Refus::CompteHorsDuReseauLocal).await)
+    }
+}
+
+/// Extracteur infaillible, même règle que [`AdminOuReseauLocalPourLeCompte`]
+/// sans rejet ni trace : `GET /cloud/sso/status` montre le compte relié
+/// (nom, courriel, photo) à qui peut le relier. Sans authentification, un
+/// appareil du réseau local voit donc le compte du serveur, et le menu du
+/// compte (photo de profil comprise) fonctionne ; le relais distant et les
+/// mandataires n'en voient toujours que « relié ».
+#[derive(Debug, Clone, Copy)]
+pub struct ReliePourLeCompteDuReseauLocal(pub bool);
+
+impl FromRequestParts<AppState> for ReliePourLeCompteDuReseauLocal {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if admin_ou_cette_machine(parts, state).await {
+            return Ok(Self(true));
+        }
+        Ok(Self(
+            !authentification_active(state) && appel_depuis_le_reseau_local(parts, state).await,
+        ))
     }
 }
 

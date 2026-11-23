@@ -259,12 +259,14 @@ enum Liaison {
     Profil(i64),
 }
 
-/// Qui relie quoi. Authentification coupée : cette machine seulement.
+/// Qui relie quoi. Authentification coupée : cette machine ou le réseau local
+/// (`AdminOuReseauLocalPourLeCompte`) relie le serveur ; la déliaison reste à
+/// cette machine (`AdminOuCetteMachine`).
 /// Authentification active : l'administrateur relie le serveur, un compte
 /// standard ne relie que son propre profil.
-fn liaison_autorisee(
+fn liaison_autorisee<G>(
     state: &AppState,
-    garde: Result<crate::auth::AdminOuCetteMachine, RefusDeGarde>,
+    garde: Result<G, RefusDeGarde>,
     appelant: Option<crate::auth::AuthUser>,
 ) -> Result<Liaison, RefusDeGarde> {
     match garde {
@@ -302,7 +304,7 @@ fn cles_d_attente(liaison: Liaison) -> (String, String) {
 /// Mozaiklabs — voir [`liaison_autorisee`]. Le retour (`sso_callback`) passe
 /// la même règle.
 async fn sso_authorize(
-    garde: Result<crate::auth::AdminOuCetteMachine, RefusDeGarde>,
+    garde: Result<crate::auth::AdminOuReseauLocalPourLeCompte, RefusDeGarde>,
     appelant: Option<crate::auth::AuthUser>,
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -381,7 +383,7 @@ struct CallbackQuery {
 }
 
 async fn sso_callback(
-    garde: Result<crate::auth::AdminOuCetteMachine, RefusDeGarde>,
+    garde: Result<crate::auth::AdminOuReseauLocalPourLeCompte, RefusDeGarde>,
     appelant: Option<crate::auth::AuthUser>,
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -871,13 +873,13 @@ fn enregistrer_compte_du_profil(
 async fn sso_status(
     // Lecture appelée par tous les appareils : la garde silencieuse (pas
     // d'avertissement à chaque appel d'un autre appareil).
-    relie: crate::auth::ReliePourLesComptes,
+    relie: crate::auth::ReliePourLeCompteDuReseauLocal,
     appelant: Option<crate::auth::AuthUser>,
     State(state): State<AppState>,
 ) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let garde = if relie.0 {
-        Ok(crate::auth::AdminOuCetteMachine)
+        Ok(())
     } else {
         Err((StatusCode::FORBIDDEN, Json(json!({}))))
     };
@@ -907,9 +909,9 @@ async fn sso_status(
         .filter(|s| !s.is_empty())
         .is_some();
     // Le compte du serveur (courriel, offre, modules) ne se montre qu'à qui
-    // relie le serveur : l'administrateur, ou cette machine sans
-    // authentification. Un autre appareil du réseau sait seulement si le
-    // serveur est relié.
+    // relie le serveur : l'administrateur, ou, sans authentification, cette
+    // machine et le réseau local. Le relais distant et un mandataire savent
+    // seulement si le serveur est relié.
     let user: Option<tune_core::cloud::sso::CloudUser> = if liaison.is_ok() {
         settings
             .get("mozaik_user")
