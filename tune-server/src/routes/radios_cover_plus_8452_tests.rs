@@ -144,3 +144,39 @@ async fn allume_par_defaut_l_interrupteur_du_serveur_l_eteint() {
     assert_eq!(v, json!({"enabled": true, "artist_photo": false}));
     assert!(!tune_core::cover_plus::photo_artiste_active(&state.backend));
 }
+
+/// Supprimer une station efface aussi son réglage Cover+ : une station
+/// recréée sous le même identifiant (SQLite réutilise le plus grand) repart
+/// cochée, pas « off ». Contre-épreuve : avant la suppression, il est bien
+/// « off ».
+#[tokio::test]
+async fn supprimer_la_station_efface_son_reglage_cover_plus() {
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    let id = RadioRepo::with_backend(state.backend.clone())
+        .create(&station())
+        .unwrap();
+    let app = crate::routes::router(state.clone());
+    let (s, _) = appel(
+        &app,
+        "PUT",
+        &format!("/api/v1/radios/{id}/cover-plus"),
+        Some(json!({"enabled": false})),
+    )
+    .await;
+    assert_eq!(s, StatusCode::OK);
+    let cle = tune_core::cover_plus::cle_reglage_station(id);
+    let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    assert!(reglages.get(&cle).unwrap().is_some(), "« off » posé");
+
+    let (s, _) = appel(&app, "DELETE", &format!("/api/v1/radios/{id}"), None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    assert_eq!(
+        reglages.get(&cle).unwrap(),
+        None,
+        "le réglage part avec la station"
+    );
+    assert!(tune_core::cover_plus::actif_pour_la_station(
+        &state.backend,
+        Some(id)
+    ));
+}
