@@ -47,7 +47,10 @@ fn l_etage_de_reaffectation_rend_la_matrice_en_f64_dans_l_executeur() {
             assert_eq!(s.format.channels, m.sorties());
             sortie.extend_from_slice(s.echantillons);
         }
-        assert_eq!(sortie, attendu, "{id} : l'étage n'est pas la matrice en f64");
+        assert_eq!(
+            sortie, attendu,
+            "{id} : l'étage n'est pas la matrice en f64"
+        );
 
         let x32: Vec<f32> = x.iter().map(|&v| v as f32).collect();
         let ancien: Vec<f64> = m.appliquer_f32(&x32).into_iter().map(f64::from).collect();
