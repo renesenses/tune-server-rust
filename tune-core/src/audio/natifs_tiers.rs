@@ -181,6 +181,9 @@ pub fn etages_configures(settings: &SettingsRepo, zone_id: i64) -> Vec<(String, 
             .into_iter()
             .filter(|id| demande(settings, id))
             .filter_map(|id| {
+                if tune_plugin_native::provider(&id).is_some_and(|p| p.is_rate_changer()) {
+                    return None;
+                }
                 let reglage = reglage_de_zone(settings, zone_id, &id)?;
                 (reglage.get("enabled").and_then(Value::as_bool) == Some(true))
                     .then_some((id, reglage))

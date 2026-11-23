@@ -13,14 +13,13 @@
 //! activer exige le Premium (402) et le greffon installé (409). Désactiver
 //! reste toujours possible.
 //!
-//! Décision de Bertrand du 19/11/2026 (étude de la spec de Rémi, § B.2) : le
-//! réglage s'applique TOUT DE SUITE. L'étage d'une piste garde toujours le
-//! choix de son ouverture, mais `PUT /zones/{id}` relance le flux à la
-//! position en cours (environ une seconde de silence), comme la bascule PURE
-//! (#8422). La réponse le dit : `applies_at: "now"` (avec `restart: true`
-//! quand le flux est relancé), ou `"next_track"` quand rien ne peut agir
-//! avant (zone en pause, position inconnue), ou `"never"` sur une zone dont
-//! la sortie n'est pas locale.
+//! La réponse au PUT précise quand le réglage atteint le son (`applies_at`).
+//! `now` permet de confirmer l’application, avec `restart: true` si le flux
+//! a repris à la position courante. En lecture, un changement de profil Auto
+//! vers Auto renvoie `pending` pendant la négociation par le fil audio.
+//! Manuel vers Auto renvoie `next_track` et laisse finir la piste en cours.
+//! `next_track` vaut aussi si l’application doit attendre la prochaine
+//! ouverture du flux. Une sortie non locale renvoie `never`.
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -39,6 +38,7 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/", get(catalogue))
         .route("/machine-test", post(tester_la_machine))
+        .route("/zones/{id}/auto", get(lire_decision_auto))
         .route("/zones/{id}", get(lire_zone).put(ecrire_zone))
 }
 
@@ -77,6 +77,7 @@ async fn etat(state: &AppState) -> Value {
         "premium": state.license.check_feature(Feature::Upsampling).await,
         "installed": tune_core::audio::premium_plugins::enabled(&s, su::ID),
         "machine_test": su::verdict_enregistre(&s),
+        "auto_available": tune_core::audio::natifs_tiers::actif(&s,su::ID_PRO),
     })
 }
 
@@ -85,6 +86,11 @@ async fn catalogue(State(state): State<AppState>) -> Json<Value> {
     v["filters"] = filtres();
     v["ratios"] = json!(greffon::OFFERED_RATIOS);
     v["default_filter"] = json!(greffon::DEFAULT_FILTER);
+    if v["premium"] == true && v["auto_available"] == true {
+        v["auto_choices"] = tune_plugin_native::provider(su::ID_PRO)
+            .and_then(|p| p.options_pcm().ok())
+            .unwrap_or(Value::Null);
+    }
     Json(v)
 }
 
@@ -152,6 +158,7 @@ fn applies_at(portee: tune_core::orchestrator::PorteeDuReglage) -> &'static str 
     use tune_core::orchestrator::PorteeDuReglage as P;
     match portee {
         P::Immediate | P::Relance | P::RienNeJoue => "now",
+        P::EnNegociation => "pending",
         P::PisteSuivante => "next_track",
     }
 }
@@ -186,6 +193,11 @@ async fn forme_de_zone(
     })
 }
 
+async fn lire_decision_auto(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
+    let decision = state.orchestrator.decision_auto_du_flux(id).await;
+    Json(json!({"zone_id":id,"decision":decision}))
+}
+
 async fn lire_zone(State(state): State<AppState>, Path(id): Path<i64>) -> Json<Value> {
     Json(forme_de_zone(&state, id, None).await)
 }
@@ -217,7 +229,15 @@ async fn ecrire_zone(
         {
             return r;
         }
-        if let Err(r) = crate::premium_audio_plugins::require_installed(&state, su::ID, &headers) {
+        if let Err(r) = crate::premium_audio_plugins::require_installed(
+            &state,
+            if reglages.mode == greffon::UpsamplerMode::Auto {
+                su::ID_PRO
+            } else {
+                su::ID
+            },
+            &headers,
+        ) {
             return r;
         }
         // Étape I5 : au premier usage, la machine est mesurée avant que le

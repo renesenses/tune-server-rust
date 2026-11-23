@@ -10,6 +10,7 @@ use tune_plugin_abi as abi;
 use tune_plugin_sdk::{Error, Settings, audio::*, batch::*};
 mod batch_host;
 pub mod package;
+pub mod rate;
 
 pub struct Library {
     library: libloading::Library,
@@ -39,7 +40,7 @@ impl Library {
         let api = unsafe { &*pointer };
         if api.size != std::mem::size_of::<abi::Api>() as u32
             || api.version != abi::ABI_VERSION
-            || ![abi::DSP, abi::BATCH].contains(&api.kind)
+            || ![abi::DSP, abi::BATCH, abi::rate::KIND].contains(&api.kind)
         {
             return Err("incompatible audio ABI".into());
         }
@@ -55,8 +56,16 @@ impl Library {
         manifest
             .validate()
             .map_err(|e| format!("manifest: {e:?}"))?;
-        if (api.kind == abi::DSP) != (manifest.kind == tune_plugin_sdk::manifest::PluginKind::Dsp) {
+        if (api.kind != abi::BATCH) != (manifest.kind == tune_plugin_sdk::manifest::PluginKind::Dsp)
+        {
             return Err("manifest kind differs from ABI".into());
+        }
+        let requires_rate = manifest
+            .capabilities
+            .iter()
+            .any(|c| c.required && c.id == tune_plugin_sdk::rate::AUDIO_RATE_CHANGE);
+        if (api.kind == abi::rate::KIND) != requires_rate {
+            return Err("manifest rate capability differs from ABI".into());
         }
         let library = Arc::new(Self {
             library,
@@ -99,6 +108,9 @@ impl Library {
             Err(e) if refuses(&e) => Err(LIAR.into()),
             _ => Ok(()),
         }
+    }
+    pub fn is_rate_changer(&self) -> bool {
+        self.api().kind == abi::rate::KIND
     }
     fn api(&self) -> &abi::Api {
         let _pin = &self.library;

@@ -205,7 +205,11 @@ pub fn choix_de_la_zone(
     if !premium {
         return Err(Ecarte::PremiumRequis);
     }
-    if !crate::audio::premium_plugins::enabled(settings, ID) {
+    let installe = match reglages.mode {
+        greffon::UpsamplerMode::Manual => crate::audio::premium_plugins::enabled(settings, ID),
+        greffon::UpsamplerMode::Auto => crate::audio::natifs_tiers::actif(settings, ID_PRO),
+    };
+    if !installe {
         return Err(Ecarte::GreffonNonInstalle);
     }
     if pure {
@@ -215,13 +219,78 @@ pub fn choix_de_la_zone(
     Ok(ChoixSurechantillonnage { reglages, verdict })
 }
 
+pub const ID_PRO: &str = "upsampler-pro";
+
+pub struct PlanNatif {
+    pub(crate) library: std::sync::Arc<tune_plugin_native::Library>,
+    pub(crate) settings: serde_json::Value,
+    pub(crate) input: AudioFormat,
+    pub(crate) rate: u32,
+}
+
+fn gmacs_par_coeur(verdict: &crate::audio::surechantillonnage::VerdictMachine) -> Option<f64> {
+    verdict
+        .results
+        .iter()
+        .filter_map(|mesure| {
+            if !mesure.realtime_factor.is_finite()
+                || mesure.realtime_factor <= 0.0
+                || mesure.from_hz == 0
+                || mesure.to_hz <= mesure.from_hz
+            {
+                return None;
+            }
+            let conception = tune_plugin_surechantillonnage::par_id(&mesure.filter)?;
+            let debit =
+                mesure.realtime_factor * conception.portee as f64 * f64::from(mesure.to_hz) * 2.0
+                    / 1e9;
+            (debit.is_finite() && debit > 0.0).then_some(debit)
+        })
+        .reduce(f64::min)
+}
+
 impl ChoixSurechantillonnage {
+    pub fn plan_natif(
+        &self,
+        source: u32,
+        bits: u16,
+        canaux: u16,
+        formats: &[(u32, u16)],
+    ) -> Result<PlanNatif, &'static str> {
+        let library = tune_plugin_native::provider(ID_PRO).ok_or("auto_plugin_unavailable")?;
+        let layout = match canaux {
+            1 => ChannelLayout::Mono,
+            2 => ChannelLayout::Stereo,
+            n => ChannelLayout::Discrete(n),
+        };
+        let input = AudioFormat::new(source, layout, SampleEncoding::F32)
+            .map_err(|_| "auto_invalid_pcm_format")?;
+        let r = &self.reglages;
+        let settings = serde_json::json!({"profile":r.profile,"declarations":r.declarations,
+            "max_ratio":r.max_ratio,"max_rate_hz":r.max_rate_hz,"source_bits":bits,
+            "formats":formats.iter().map(|(rate,bits)|serde_json::json!({"rate":rate,"bits":bits})).collect::<Vec<_>>(),
+            "gmacs_per_core":gmacs_par_coeur(&self.verdict).ok_or("auto_machine_not_measured")?});
+        let rates = formats.iter().map(|(rate, _)| *rate).collect::<Vec<_>>();
+        let rate = library
+            .negotiate_rate(input, &rates, &settings)
+            .map_err(|_| "auto_negotiation_failed")?
+            .ok_or("auto_no_feasible_choice")?;
+        Ok(PlanNatif {
+            library,
+            settings,
+            input,
+            rate,
+        })
+    }
     /// La cadence de sortie retenue pour une source à `source`, parmi
     /// `acceptees` (MESURÉES par la sortie) : la plus haute que le filtre
     /// choisi tient sur cette machine, multiple entier de la source, sous
     /// les plafonds des réglages. `None` : rien d'utile, la sortie garde son
     /// chemin.
     pub fn negocier(&self, source: u32, acceptees: &[u32]) -> Option<u32> {
+        if self.reglages.mode == greffon::UpsamplerMode::Auto {
+            return None;
+        }
         let admises: Vec<u32> = acceptees
             .iter()
             .copied()
@@ -238,7 +307,8 @@ const BLOC_MAX: usize = 4096;
 /// L'étage que le producteur de la sortie locale fait tourner : entrée et
 /// sortie en `f32` entrelacés, au nombre de canaux OUVERT.
 pub struct EtageSurechantillonneur {
-    instance: Instance,
+    instance: Rendu,
+    publication_apres: Option<usize>,
     canaux: usize,
     rapport: usize,
     entree: Vec<f32>,
@@ -250,12 +320,32 @@ pub struct EtageSurechantillonneur {
     reglages: UpsamplerSettings,
 }
 
+enum Rendu {
+    Manuel(Instance),
+    Natif(
+        tune_plugin_native::rate::NativeRate,
+        f64,
+        serde_json::Value,
+        UpsamplerSettings,
+    ),
+}
+
 impl EtageSurechantillonneur {
     pub fn nouveau(
         reglages: &UpsamplerSettings,
         de: u32,
         vers: u32,
         canaux: u16,
+    ) -> Result<Self, String> {
+        Self::preparer(reglages, de, vers, canaux, None)
+    }
+
+    pub fn preparer(
+        reglages: &UpsamplerSettings,
+        de: u32,
+        vers: u32,
+        canaux: u16,
+        plan: Option<&PlanNatif>,
     ) -> Result<Self, String> {
         let layout = match canaux {
             1 => ChannelLayout::Mono,
@@ -266,10 +356,31 @@ impl EtageSurechantillonneur {
             AudioFormat::new(de, layout, SampleEncoding::F32).map_err(|e| format!("{e:?}"))?;
         let requete =
             RateRequest::new(format_entree, vers, BLOC_MAX).map_err(|e| format!("{e:?}"))?;
-        let instance = Instance::new(requete, &reglages.filter).map_err(|e| format!("{e:?}"))?;
+        let instance = match reglages.mode {
+            greffon::UpsamplerMode::Manual => {
+                Rendu::Manuel(Instance::new(requete, &reglages.filter).map_err(|e| e.to_string())?)
+            }
+            greffon::UpsamplerMode::Auto => {
+                let plan = plan
+                    .filter(|p| p.input == format_entree && p.rate == vers)
+                    .ok_or("auto_opened_format_mismatch")?;
+                let native = plan
+                    .library
+                    .prepare_rate(requete, &plan.settings)
+                    .map_err(|e| e.to_string())?;
+                let gain = native
+                    .diagnostics()
+                    .map_err(|e| e.to_string())?
+                    .get("headroom_db")
+                    .and_then(|v| v.as_f64())
+                    .ok_or("auto_headroom_missing")?;
+                Rendu::Natif(native, gain, plan.settings.clone(), reglages.clone())
+            }
+        };
         let rapport = (vers / de) as usize;
         let n = usize::from(canaux);
         Ok(Self {
+            publication_apres: None,
             format_sortie: requete.output_format(),
             instance,
             canaux: n,
@@ -281,12 +392,67 @@ impl EtageSurechantillonneur {
         })
     }
 
+    pub fn proposer_transition(&mut self, choix: Option<&ChoixSurechantillonnage>) {
+        let Rendu::Natif(instance, _, sonde, derniere) = &mut self.instance else {
+            return;
+        };
+        let Some(r) = choix.map(|c| &c.reglages) else {
+            return;
+        };
+        if r.mode != greffon::UpsamplerMode::Auto || r == derniere {
+            return;
+        }
+        let mut settings = sonde.clone();
+        settings["profile"] = serde_json::json!(r.profile);
+        settings["declarations"] = serde_json::json!(r.declarations);
+        settings["max_ratio"] = serde_json::json!(r.max_ratio);
+        settings["max_rate_hz"] = serde_json::json!(r.max_rate_hz);
+        match instance.update(&settings) {
+            Ok(()) => {
+                self.publication_apres =
+                    Some((self.format_sortie.sample_rate() as usize).div_ceil(50));
+                *derniere = r.clone();
+                self.reglages = r.clone();
+                *sonde = settings;
+            }
+            Err(tune_plugin_sdk::Error::InvalidState) => {} // Le fondu précédent doit finir.
+            Err(_) => {
+                *derniere = r.clone();
+            } // Cadence, réserve ou charge incompatibles.
+        }
+    }
+    pub fn decision_apres_transition(&mut self, trames: usize) -> Option<serde_json::Value> {
+        let n = self.publication_apres?;
+        if trames < n {
+            self.publication_apres = Some(n - trames);
+            return None;
+        }
+        self.publication_apres = None;
+        self.decision_auto()
+    }
+
+    pub fn doit_proposer(&self, r: &UpsamplerSettings) -> bool {
+        matches!(&self.instance,Rendu::Natif(_,_,_,derniere) if r.mode==greffon::UpsamplerMode::Auto && r!=derniere)
+    }
+    pub fn decision_auto(&self) -> Option<serde_json::Value> {
+        if let Rendu::Natif(instance, ..) = &self.instance {
+            instance.diagnostics().ok()?.get("decision").cloned()
+        } else {
+            None
+        }
+    }
     pub fn filtre(&self) -> &'static str {
-        self.instance.filter_id()
+        match &self.instance {
+            Rendu::Manuel(i) => i.filter_id(),
+            Rendu::Natif(..) => "auto",
+        }
     }
 
     pub fn reserve_db(&self) -> f64 {
-        20.0 * self.instance.gain().log10()
+        match &self.instance {
+            Rendu::Manuel(i) => 20.0 * i.gain().log10(),
+            Rendu::Natif(_, db, ..) => *db,
+        }
     }
 
     pub fn cadence_entree(&self) -> u32 {
@@ -318,7 +484,7 @@ impl EtageSurechantillonneur {
             }
             self.entree[..trames * ch].copy_from_slice(&morceau[..trames * ch]);
             let ecrites = {
-                let Ok(entree) = AudioBlock::new(
+                let Ok(mut entree) = AudioBlock::new(
                     self.format_entree,
                     SamplesMut::F32(&mut self.entree[..trames * ch]),
                     BLOC_MAX,
@@ -333,15 +499,16 @@ impl EtageSurechantillonneur {
                 ) else {
                     continue;
                 };
-                match self.instance.process(
-                    &entree,
-                    &mut sortie,
-                    BlockContext {
-                        zone_id: 0,
-                        generation: 0,
-                        position_frames: 0,
-                    },
-                ) {
+                let ctx = BlockContext {
+                    zone_id: 0,
+                    generation: 0,
+                    position_frames: 0,
+                };
+                let rapport = match &mut self.instance {
+                    Rendu::Manuel(i) => i.process(&entree, &mut sortie, ctx),
+                    Rendu::Natif(i, ..) => i.process(&mut entree, &mut sortie, ctx),
+                };
+                match rapport {
                     Ok(r) => r.frames_written,
                     Err(e) => {
                         tracing::warn!(error = ?e, "upsampler_block_refused");
@@ -368,7 +535,10 @@ impl EtageSurechantillonneur {
                 ) else {
                     break;
                 };
-                match self.instance.drain(&mut sortie) {
+                match match &mut self.instance {
+                    Rendu::Manuel(i) => i.drain(&mut sortie),
+                    Rendu::Natif(i, ..) => i.drain(&mut sortie),
+                } {
                     Ok(r) => r,
                     Err(_) => break,
                 }
@@ -378,7 +548,12 @@ impl EtageSurechantillonneur {
                 break;
             }
         }
-        self.instance.reset(ResetReason::Stop);
+        match &mut self.instance {
+            Rendu::Manuel(i) => i.reset(ResetReason::Stop),
+            Rendu::Natif(i, ..) => {
+                let _ = i.reset(ResetReason::Stop);
+            }
+        }
         rendu
     }
 }

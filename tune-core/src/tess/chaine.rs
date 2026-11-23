@@ -99,6 +99,17 @@ pub enum Upsampling {
         #[serde(default)]
         max_rate_hz: Option<u32>,
     },
+    /// PCM local résolu à partir du catalogue et de la sonde.
+    Auto {
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        profile: String,
+        #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+        declarations: serde_json::Map<String, serde_json::Value>,
+        #[serde(default)]
+        max_ratio: Option<u32>,
+        #[serde(default)]
+        max_rate_hz: Option<u32>,
+    },
     /// Vers DSD : le volume passe juste avant le modulateur (exception de Q9).
     Dsd {
         rate: TauxDsd,
@@ -411,6 +422,19 @@ impl ChaineTess {
                 if !filtre_ok(filter) {
                     return Err(ErreurChaine::UpsamplingInvalide("filter"));
                 }
+                if max_ratio.is_some_and(|r| !OFFERED_RATIOS.contains(&r)) {
+                    return Err(ErreurChaine::UpsamplingInvalide("max_ratio"));
+                }
+                if max_rate_hz.is_some_and(|r| !(1..=CADENCE_MAX_HZ).contains(&r)) {
+                    return Err(ErreurChaine::UpsamplingInvalide("max_rate_hz"));
+                }
+                Ok(())
+            }
+            Upsampling::Auto {
+                max_ratio,
+                max_rate_hz,
+                ..
+            } => {
                 if max_ratio.is_some_and(|r| !OFFERED_RATIOS.contains(&r)) {
                     return Err(ErreurChaine::UpsamplingInvalide("max_ratio"));
                 }
