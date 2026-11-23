@@ -245,6 +245,39 @@ async fn ancien_hachage_vide_et_nouveau_hachage(state: &AppState, lan: &str) {
     assert!(mot_de_passe_enregistre(state, MOT_DE_PASSE));
 }
 
+/// Un hachage illisible (`password_hash_v2 = "garbage"`) ou fait d'espaces est
+/// un mot de passe enregistré : aucune session, rien d'enregistré, sur cette
+/// machine comme depuis le LAN, authentification active ou coupée.
+async fn hachages_illisibles(state: &AppState, lan: &str) {
+    for (ancien, nouveau) in [
+        (None, Some("garbage")),
+        (None, Some("   ")),
+        (Some("   "), None),
+    ] {
+        poser_hachages(state, ancien, nouveau);
+        let attendu = (ancien.map(str::to_string), nouveau.map(str::to_string));
+        for active in [true, false] {
+            poser_authentification(state, active);
+            let adresses: &[&str] = if active { &[CETTE_MACHINE, lan] } else { &[CETTE_MACHINE] };
+            for adresse in adresses {
+                for mot in [MAUVAIS, "garbage", "   "] {
+                    let (st, v) = connexion(state, adresse, "default", mot).await;
+                    assert_eq!(
+                        st,
+                        StatusCode::UNAUTHORIZED,
+                        "{ancien:?}/{nouveau:?}, auth {active}, {adresse}, « {mot} » : {v}"
+                    );
+                    assert_eq!(
+                        hachages(state),
+                        attendu,
+                        "{ancien:?}/{nouveau:?}, auth {active}, {adresse} : rien ne doit être enregistré"
+                    );
+                }
+            }
+        }
+    }
+}
+
 /// Un autre profil sans mot de passe n'ouvre jamais de session par ce chemin.
 async fn autre_profil_sans_mot_de_passe(state: &AppState, lan: &str) {
     state
@@ -292,6 +325,11 @@ async fn sqlite_base_rc12_ancien_hachage() {
 #[tokio::test]
 async fn sqlite_ancien_hachage_vide_et_nouveau_hachage() {
     ancien_hachage_vide_et_nouveau_hachage(&etat_sqlite(), "192.168.1.65:50000").await;
+}
+
+#[tokio::test]
+async fn sqlite_hachages_illisibles() {
+    hachages_illisibles(&etat_sqlite(), "192.168.1.67:50000").await;
 }
 
 #[tokio::test]
@@ -358,5 +396,7 @@ async fn postgres_memes_scenarios() {
     ancien_hachage_vide_et_nouveau_hachage(&state, "10.0.0.75:50000").await;
     remettre_a_zero(&state);
     autre_profil_sans_mot_de_passe(&state, "10.0.0.76:50000").await;
+    remettre_a_zero(&state);
+    hachages_illisibles(&state, "10.0.0.77:50000").await;
     remettre_a_zero(&state);
 }
