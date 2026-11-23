@@ -1004,7 +1004,7 @@ async fn une_deliaison_venue_d_un_autre_site_est_refusee() {
 /// 20. Autorisation lancée du réseau local, retour REJOUÉ sur cette machine
 /// (lien ou image ouverts sur le serveur, qui y portent le `code` et le
 /// `state`) avec un AUTRE compte : 403 `account_already_linked`, rien n'est
-/// écrit. La marque de la ronde est effacée avec l'attente.
+/// écrit.
 #[tokio::test]
 async fn un_retour_rejoue_sur_cette_machine_garde_la_regle_du_reseau_local() {
     let b = banc();
@@ -1033,10 +1033,7 @@ async fn un_retour_rejoue_sur_cette_machine_garde_la_regle_du_reseau_local() {
         r.get("mozaik_access_token").unwrap().as_deref(),
         Some("jeton-du-proprietaire")
     );
-    assert!(
-        r.get("mozaik_pkce_pending_lan").unwrap().is_none(),
-        "marque effacée avec l'attente"
-    );
+    assert!(attente_du_serveur(&b.state).is_empty(), "attente consommée");
 
     // Témoin : une ronde LANCÉE de cette machine y remplace toujours le
     // compte, même après une ronde du réseau local restée en plan.
@@ -1045,6 +1042,62 @@ async fn un_retour_rejoue_sur_cette_machine_garde_la_regle_du_reseau_local() {
     let (statut, page) = ronde(&b.state, ICI, &ici).await;
     assert_eq!(statut, StatusCode::TEMPORARY_REDIRECT, "machine — {page}");
     assert_eq!(courriel_relie(&b.state), "tiers@exemple.test");
+}
+
+/// 20 bis. Autorisations ENTRELACÉES, de cette machine et du réseau local
+/// (dont des simultanées) : à la fin, la marque `lan` de l'attente en place
+/// correspond toujours à l'origine de SON `state`. La marque est dans le JSON
+/// même de l'attente, écrite d'un seul coup avec le PKCE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn autorisations_entrelacees_la_marque_suit_son_pkce() {
+    let b = banc();
+    let state_de = |page_location: &str| {
+        page_location
+            .split("state=")
+            .nth(1)
+            .map(|r| r.split('&').next().unwrap_or_default().to_string())
+            .unwrap_or_default()
+    };
+    let autoriser = |depuis: &'static str, hote: &'static str| {
+        let state = b.state.clone();
+        tokio::spawn(async move {
+            let adresse: SocketAddr = depuis.parse().unwrap();
+            let reponse = crate::routes::router(state)
+                .oneshot(
+                    Request::get(AUTORISER)
+                        .extension(ConnectInfo(adresse))
+                        .header("host", hote)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(reponse.status(), StatusCode::TEMPORARY_REDIRECT);
+            let lieu = reponse.headers()["location"].to_str().unwrap().to_string();
+            (lieu, depuis == LAN)
+        })
+    };
+    let mut origines = std::collections::HashMap::new();
+    for tour in 0..12 {
+        let (ra, rb) = tokio::join!(
+            autoriser(ICI, "127.0.0.1:8888"),
+            autoriser(LAN, "192.168.1.10:8888")
+        );
+        for (lieu, lan) in [ra.unwrap(), rb.unwrap()] {
+            origines.insert(
+                urlencoding::decode(&state_de(&lieu)).unwrap().into_owned(),
+                lan,
+            );
+        }
+        let attente = json_de(&attente_du_serveur(&b.state));
+        let etat = attente["state"].as_str().unwrap().to_string();
+        let lan = attente["lan"].as_bool().unwrap_or(false);
+        assert_eq!(
+            Some(&lan),
+            origines.get(&etat),
+            "tour {tour} : la marque de l'attente en place ({lan}) suit son state"
+        );
+    }
 }
 
 // ─── Relecture B : pas d'autorisation lancée d'un autre site ────────────────
