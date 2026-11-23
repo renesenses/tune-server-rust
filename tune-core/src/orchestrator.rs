@@ -2529,14 +2529,14 @@ mod double_dsp_dsf_aac_sortie_locale_tests;
 /// fabriqué à la volée ; sans DSD annoncé, en PCM comme avant.
 #[cfg(test)]
 mod dst_en_dsf_6221_tests;
-/// #9184 — une piste d'ISO SACD vers un renderer qui annonce le DSD part en
-/// DSF virtuel bâti sur la tranche ; mode « pcm » ou sans DSD, en PCM.
-#[cfg(test)]
-mod iso_sacd_dsf_9184_tests;
 /// #4378 — un DSDIFF compressé DST ne part jamais brut vers un renderer
 /// réseau, même en DSD « natif » : il passe par le décodeur.
 #[cfg(test)]
 mod dst_jamais_brut_au_renderer_4378_tests;
+/// #9184 — une piste d'ISO SACD vers un renderer qui annonce le DSD part en
+/// DSF virtuel bâti sur la tranche ; mode « pcm » ou sans DSD, en PCM.
+#[cfg(test)]
+mod iso_sacd_dsf_9184_tests;
 
 #[cfg(test)]
 mod mesure_saut_cd_5079;
