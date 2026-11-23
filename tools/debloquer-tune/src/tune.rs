@@ -256,7 +256,9 @@ pub fn debloquer(c: &ClientTune, d: &Demande) -> Result<Resultat, Echec> {
         Etat::Recent => Err(echec("version_recente")),
         Etat::VersionInconnue => Err(echec("version_inconnue")),
         Etat::ADebloquer => {
-            if d.nouveau && d.mot_de_passe.chars().count() < LONGUEUR_MINIMALE {
+            // Quel que soit `nouveau` : si `default` n'a pas de mot de passe,
+            // celui-ci DEVIENT le sien. Le drapeau vient de la page.
+            if d.mot_de_passe.chars().count() < LONGUEUR_MINIMALE {
                 return Err(echec("mot_de_passe_trop_court"));
             }
             if d.mot_de_passe.is_empty() {

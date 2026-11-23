@@ -293,6 +293,21 @@ fn rc12_mot_de_passe_trop_court_rien_n_est_ecrit() {
 }
 
 #[test]
+fn rc12_mot_de_passe_court_refuse_meme_sans_le_drapeau_nouveau() {
+    // La page n'est pas crue sur parole : `nouveau: false` envoyé sur un
+    // `default` revendicable poserait sinon un mot de passe de 3 caractères.
+    let f = FauxTune::demarrer("1.0.0-rc12", false, None);
+    let e = tune::debloquer(&f.client(), &demande("abc", false, false)).unwrap_err();
+    assert_eq!(e.code, "mot_de_passe_trop_court");
+    assert!(
+        f.ecritures().is_empty(),
+        "aucun appel en écriture : {:?}",
+        f.ecritures()
+    );
+    assert!(f.m.lock().unwrap().mdp_default.is_none());
+}
+
+#[test]
 fn rc12_default_a_deja_un_mot_de_passe_on_le_demande_puis_on_reprend() {
     let f = FauxTune::demarrer("1.0.0-rc12", false, Some("ancien-secret"));
     let c = f.client();

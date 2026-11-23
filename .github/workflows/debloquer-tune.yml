@@ -22,10 +22,16 @@ name: Débloquer Tune
 #    n'existent pas : le .exe part non signé et SmartScreen s'affiche
 #    (« Informations complémentaires › Exécuter quand même »).
 #
-# Lancement (manuel seulement) :
+# Sur PR : les tests seuls. Build, signature et publication : lancement manuel :
 #   gh workflow run debloquer-tune.yml -R renesenses/tune-server-rust -f publier=true
 
 on:
+  # Sur PR : le job de TESTS seulement (les jobs de build et de publication
+  # sont réservés au lancement manuel, voir leurs `if:`).
+  pull_request:
+    paths:
+      - "tools/debloquer-tune/**"
+      - ".github/workflows/debloquer-tune.yml"
   workflow_dispatch:
     inputs:
       publier:
@@ -71,10 +77,9 @@ jobs:
   windows:
     name: Windows x86_64
     needs: tests
+    if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     timeout-minutes: 30  # ~3 min de compilation
-    env:
-      WIN_SIGN_CERT_BASE64: ${{ secrets.WIN_SIGN_CERT_BASE64 }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -94,10 +99,20 @@ jobs:
         run: |
           mkdir -p sortie
           cp tools/debloquer-tune/target/x86_64-pc-windows-msvc/release/debloquer-tune.exe sortie/Debloquer-Tune-windows-x86_64.exe
+      # Le secret ne vit QUE dans ces deux étapes : celle-ci n'en sort qu'un
+      # oui/non, la suivante signe.
+      - name: Certificat présent ?
+        id: certificat
+        shell: bash
+        env:
+          WIN_SIGN_CERT_BASE64: ${{ secrets.WIN_SIGN_CERT_BASE64 }}
+        run: |
+          if [ -n "$WIN_SIGN_CERT_BASE64" ]; then echo "present=oui" >> "$GITHUB_OUTPUT"; else echo "present=non" >> "$GITHUB_OUTPUT"; fi
       # Même étape que release.yml (« Sign Windows binaries »), sur ce seul .exe.
       - name: Signer (si le certificat est présent)
-        if: env.WIN_SIGN_CERT_BASE64 != ''
+        if: steps.certificat.outputs.present == 'oui'
         env:
+          WIN_SIGN_CERT_BASE64: ${{ secrets.WIN_SIGN_CERT_BASE64 }}
           WIN_SIGN_CERT_PWD: ${{ secrets.WIN_SIGN_CERT_PWD }}
         shell: pwsh
         run: |
@@ -114,7 +129,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "signature invalide : $t" }
           Remove-Item $pfx -Force
       - name: Non signé
-        if: env.WIN_SIGN_CERT_BASE64 == ''
+        if: steps.certificat.outputs.present != 'oui'
         shell: bash
         run: echo "::warning::WIN_SIGN_CERT_BASE64 absent — Debloquer-Tune-windows-x86_64.exe part NON signé (SmartScreen s'affichera)."
       - uses: actions/upload-artifact@v4
@@ -126,6 +141,7 @@ jobs:
   macos:
     name: macOS (app universelle)
     needs: tests
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ${{ fromJSON(vars.RUNNER_MACOS || '"macos-14"') }}
     timeout-minutes: 45  # ~4 min de compilation + notarisation (souvent 2-10 min)
     steps:
@@ -164,6 +180,9 @@ jobs:
         run: |
           if [ -z "$APPLE_CERTIFICATE_P12" ]; then echo "Pas de certificat"; exit 0; fi
           echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
+          # Un trousseau laissé par un lancement interrompu ferait échouer
+          # `create-keychain` (runner Mac auto-hébergé : il persiste).
+          security delete-keychain debloquer.keychain 2>/dev/null || true
           security create-keychain -p actions debloquer.keychain
           security default-keychain -s debloquer.keychain
           security unlock-keychain -p actions debloquer.keychain
@@ -230,6 +249,13 @@ jobs:
           xcrun stapler validate "$APP"
           spctl --assess --type execute --verbose=2 "$APP"
           ditto -c -k --keepParent "$APP" "$ZIP"
+      # Toujours, même en échec : le trousseau importé ne doit pas survivre au
+      # job, et le trousseau par défaut redevient celui de la session.
+      - name: Nettoyer le trousseau
+        if: always()
+        run: |
+          security default-keychain -s "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null || true
+          security delete-keychain debloquer.keychain 2>/dev/null || true
       - uses: actions/upload-artifact@v4
         with:
           name: debloquer-tune-macos
@@ -239,7 +265,7 @@ jobs:
   publier:
     name: Publier sur debloquer-tune-v1
     needs: [windows, macos]
-    if: inputs.publier
+    if: github.event_name == 'workflow_dispatch' && inputs.publier
     runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 15
     permissions:

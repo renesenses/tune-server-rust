@@ -6,7 +6,7 @@ description = "Débloque la mise à jour d'un serveur Tune OS en rc12 : active l
 license = "MIT OR Apache-2.0"
 publish = false
 
-# HORS du workspace du serveur (voir `exclude` dans le Cargo.toml racine), avec
+# HORS du workspace du serveur (table `[workspace]` vide ci-dessous), avec
 # son propre Cargo.lock : c'est un outil de l'utilisateur, posé sur SON
 # ordinateur, pas une pièce du serveur. Même doctrine que tools/moissonneur-roon.
 #
