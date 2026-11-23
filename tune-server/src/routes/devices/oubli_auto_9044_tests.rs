@@ -14,6 +14,8 @@ use super::*;
 use crate::routes::devices::oubli_9044;
 use crate::routes::devices::{DiscoveredDlnaDevice, load_discovered_dlna, persist_discovered_dlna};
 
+const Z: chrono::Duration = chrono::Duration::zero();
+
 fn t0() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 11, 23, 12, 0, 0).unwrap()
 }
@@ -38,7 +40,7 @@ fn absence(id: &str, jours: i64) -> Absence {
 
 #[test]
 fn le_premier_balayage_date_le_depart_et_le_retour_l_efface() {
-    let p = planifier(&[], &[], &[etat("a", true), etat("b", false)], t0(), 30);
+    let p = planifier(&[], &[], &[etat("a", true), etat("b", false)], t0(), 30, Z);
     assert_eq!(
         p.absences,
         vec![Absence {
@@ -54,6 +56,7 @@ fn le_premier_balayage_date_le_depart_et_le_retour_l_efface() {
         &[etat("a", true), etat("b", false)],
         t0(),
         30,
+        Z,
     );
     assert_eq!(p.absences, vec![absence("a", 3)]);
 }
@@ -62,25 +65,25 @@ fn le_premier_balayage_date_le_depart_et_le_retour_l_efface() {
 fn oublie_au_bout_de_la_duree_jamais_avant_jamais_sous_une_lecture_ni_un_manuel() {
     let appareils = [etat("a", true)];
     assert!(
-        planifier(&[absence("a", 29)], &[], &appareils, t0(), 30)
+        planifier(&[absence("a", 29)], &[], &appareils, t0(), 30, Z)
             .a_oublier
             .is_empty()
     );
     assert_eq!(
-        planifier(&[absence("a", 30)], &[], &appareils, t0(), 30).a_oublier,
+        planifier(&[absence("a", 30)], &[], &appareils, t0(), 30, Z).a_oublier,
         vec!["a".to_string()]
     );
     let mut joue = etat("a", true);
     joue.en_lecture = true;
     assert!(
-        planifier(&[absence("a", 90)], &[], &[joue], t0(), 30)
+        planifier(&[absence("a", 90)], &[], &[joue], t0(), 30, Z)
             .a_oublier
             .is_empty()
     );
     let mut manuel = etat("a", true);
     manuel.manuel = true;
     assert!(
-        planifier(&[absence("a", 90)], &[], &[manuel], t0(), 30)
+        planifier(&[absence("a", 90)], &[], &[manuel], t0(), 30, Z)
             .a_oublier
             .is_empty()
     );
@@ -90,16 +93,16 @@ fn oublie_au_bout_de_la_duree_jamais_avant_jamais_sous_une_lecture_ni_un_manuel(
         le: horodatage(t0()),
         auto: true,
     };
-    let p = planifier(&[absence("a", 90)], &[deja.clone()], &appareils, t0(), 30);
+    let p = planifier(&[absence("a", 90)], &[deja.clone()], &appareils, t0(), 30, Z);
     assert!(p.a_oublier.is_empty());
     // Revenu : la marque s'efface.
-    let p = planifier(&[], &[deja], &[etat("a", false)], t0(), 30);
+    let p = planifier(&[], &[deja], &[etat("a", false)], t0(), 30, Z);
     assert_eq!(p.revenus, vec!["a".to_string()]);
 }
 
 #[test]
 fn zero_jour_n_oublie_jamais_rien() {
-    let p = planifier(&[absence("a", 3650)], &[], &[etat("a", true)], t0(), 0);
+    let p = planifier(&[absence("a", 3650)], &[], &[etat("a", true)], t0(), 0, Z);
     assert!(p.a_oublier.is_empty());
     assert_eq!(p.absences, vec![absence("a", 3650)], "le départ reste daté");
 }
@@ -184,7 +187,9 @@ async fn temoin_oubli_automatique_apres_la_duree() {
     let oublies = balayer(&state, t0()).await;
 
     assert_eq!(oublies, vec![PARTI.to_string()]);
-    assert!(!dlna_connu(&state), "plus re-sondé au démarrage");
+    // Relecture #9044 : l'oubli AUTOMATIQUE laisse le magasin DLNA (#6299) —
+    // sans lui, un appareil qui s'annonce mal en SSDP ne revenait plus.
+    assert!(dlna_connu(&state), "magasin DLNA vidé par l'oubli automatique");
     let o = lire_oublis(&settings);
     assert_eq!(o.len(), 1);
     assert!(o[0].auto);
@@ -192,6 +197,70 @@ async fn temoin_oubli_automatique_apres_la_duree() {
         repo.get(zid).unwrap().is_some(),
         "la zone n'est jamais supprimée"
     );
+}
+
+/// Témoin 6 (relecture) — le temps où le serveur était éteint ne compte pas :
+/// daté 10 j avant un arrêt de 3 semaines, l'appareil n'est PAS oublié au
+/// redémarrage.
+#[tokio::test]
+async fn temoin_redemarrage_l_arret_ne_compte_pas() {
+    let (_d, state, _repo, settings, _zid) = banc();
+    let arret_debut = t0() - chrono::Duration::days(21);
+    settings
+        .update_json_list::<Absence, _, _>(CLE_ABSENCES, |l| {
+            *l = vec![Absence {
+                device_id: PARTI.into(),
+                depuis: horodatage(arret_debut - chrono::Duration::days(10)),
+            }];
+            Ok(())
+        })
+        .unwrap();
+    settings
+        .set(CLE_DERNIER_BALAYAGE, &horodatage(arret_debut))
+        .unwrap();
+
+    assert!(balayer(&state, t0()).await.is_empty(), "oublié à cause de l'arrêt");
+    assert!(lire_oublis(&settings).is_empty());
+    let a = lire_absences(&settings);
+    assert_eq!(
+        a,
+        vec![Absence {
+            device_id: PARTI.into(),
+            depuis: horodatage(t0() - chrono::Duration::days(10)),
+        }],
+        "la date de départ est décalée de l'arrêt"
+    );
+    // Balayages normaux ensuite : 20 jours de plus → 30 j → oublié.
+    let mut t = t0();
+    settings.set(CLE_DERNIER_BALAYAGE, &horodatage(t)).unwrap();
+    t = t + chrono::Duration::days(20);
+    settings
+        .set(CLE_DERNIER_BALAYAGE, &horodatage(t - chrono::Duration::minutes(15)))
+        .unwrap();
+    assert_eq!(balayer(&state, t).await, vec![PARTI.to_string()]);
+}
+
+#[test]
+fn le_temps_d_arret_ne_compte_qu_au_dela_de_deux_intervalles() {
+    assert_eq!(temps_d_arret(None, t0()), Z);
+    assert_eq!(temps_d_arret(Some(t0() - chrono::Duration::minutes(29)), t0()), Z);
+    assert_eq!(
+        temps_d_arret(Some(t0() - chrono::Duration::hours(5)), t0()),
+        chrono::Duration::hours(5)
+    );
+    assert_eq!(temps_d_arret(Some(t0() + chrono::Duration::hours(1)), t0()), Z, "horloge reculée");
+}
+
+/// Relecture — l'oubli automatique n'écrase pas un oubli manuel posé entre
+/// la lecture et l'écriture.
+#[tokio::test]
+async fn l_oubli_automatique_garde_la_marque_manuelle() {
+    let (_d, _state, _repo, settings, _zid) = banc();
+    marquer_oublie(&settings, PARTI, t0(), false).unwrap();
+    assert!(!marquer_oublie_si_absent(&settings, PARTI, t0()).unwrap());
+    let o = lire_oublis(&settings);
+    assert_eq!(o.len(), 1);
+    assert!(!o[0].auto, "la marque manuelle a été écrasée");
 }
 
 /// Témoin 2 — oubli manuel, sans `with_zone` : 200, l'appareil est oublié,

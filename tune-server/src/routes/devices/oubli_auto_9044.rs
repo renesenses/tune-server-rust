@@ -12,12 +12,19 @@
 //!   les appareils connus par leur zone à ceux que le réseau annonce — même
 //!   règle que `GET /devices/absent`. Le premier balayage qui voit un appareil
 //!   absent date son départ ; celui qui le revoit efface la date. La précision
-//!   est donc d'un quart d'heure, et un serveur éteint ne date rien : une
-//!   absence ne commence à compter qu'une fois le serveur là pour la voir.
+//!   est donc d'un quart d'heure.
+//! * **Serveur éteint** : le temps où il ne tournait pas ne compte PAS. Le
+//!   balayage garde l'heure du précédent ([`CLE_DERNIER_BALAYAGE`]) ; si
+//!   l'écart dépasse deux intervalles (arrêt, veille, horloge reculée), toutes
+//!   les dates de départ sont décalées de cet écart. Un appareil daté 10 jours
+//!   avant un arrêt de 3 semaines compte toujours 10 jours au redémarrage.
 //! * **Oubli automatique** : absent depuis `appareils_oubli_auto_jours` jours
-//!   (30 par défaut, 0 = jamais), l'appareil est OUBLIÉ : retiré du registre
-//!   des sorties et du magasin des DLNA découverts (#6299, plus de re-sondage
-//!   au démarrage), retiré de la liste des absents, et marqué « oublié ».
+//!   (30 par défaut, 0 = jamais), l'appareil est OUBLIÉ : il est marqué
+//!   « oublié » et quitte la liste des absents à oublier. Rien d'autre n'est
+//!   retiré : ni le registre des sorties (un absent n'y est pas, et le retirer
+//!   courrait après un retour simultané), ni le magasin des DLNA découverts
+//!   (#6299) — sans lui, un appareil qui s'annonce mal en SSDP ne revenait
+//!   plus. L'oubli À LA MAIN, lui, les retire (geste de l'utilisateur).
 //! * **Jamais rien d'autre.** L'oubli automatique ne supprime AUCUNE zone,
 //!   aucun réglage (égaliseur, TESS, limites, volume…), ni un appareil ajouté
 //!   à la main (`POST /devices/add` : c'est un réglage de l'utilisateur, il
@@ -67,6 +74,8 @@ pub const CLE_JOURS: &str = "appareils_oubli_auto_jours";
 pub const CLE_ABSENCES: &str = "appareils_absents_depuis";
 /// Les appareils oubliés : `[{device_id, le, auto}]`.
 pub const CLE_OUBLIES: &str = "appareils_oublies";
+/// L'heure du dernier balayage (RFC 3339), pour ne pas compter un arrêt.
+pub const CLE_DERNIER_BALAYAGE: &str = "appareils_dernier_balayage";
 
 pub const JOURS_PAR_DEFAUT: u32 = 30;
 pub const JOURS_MAX: u32 = 365;
@@ -142,19 +151,40 @@ pub struct Plan {
     pub a_oublier: Vec<String>,
 }
 
+/// Le temps à NE PAS compter depuis le balayage précédent : tout l'écart
+/// s'il dépasse deux intervalles (le serveur ne tournait pas), zéro sinon.
+/// Une horloge reculée (`maintenant` avant le précédent) ne décale rien.
+pub fn temps_d_arret(precedent: Option<DateTime<Utc>>, maintenant: DateTime<Utc>) -> chrono::Duration {
+    let Some(p) = precedent else {
+        return chrono::Duration::zero();
+    };
+    let ecart = maintenant - p;
+    let seuil = chrono::Duration::from_std(ENTRE_DEUX_BALAYAGES * 2).unwrap_or_default();
+    if ecart > seuil { ecart } else { chrono::Duration::zero() }
+}
+
 /// Le balayage, sans effet : pure fonction du passé, du présent et du
 /// réglage. `jours == 0` : rien n'est oublié (les départs sont quand même
-/// datés, pour l'affichage).
+/// datés, pour l'affichage). `arret` : le temps où le serveur ne tournait
+/// pas ([`temps_d_arret`]), retranché de chaque absence déjà datée.
 pub fn planifier(
     absences: &[Absence],
     oublis: &[Oubli],
     appareils: &[EtatAppareil],
     maintenant: DateTime<Utc>,
     jours: u32,
+    arret: chrono::Duration,
 ) -> Plan {
-    let depuis: HashMap<&str, &str> = absences
+    let decalees: Vec<(String, String)> = absences
         .iter()
-        .map(|a| (a.device_id.as_str(), a.depuis.as_str()))
+        .filter_map(|a| {
+            let d = lire_date(&a.depuis)? + arret;
+            Some((a.device_id.clone(), horodatage(d.min(maintenant))))
+        })
+        .collect();
+    let depuis: HashMap<&str, &str> = decalees
+        .iter()
+        .map(|(id, d)| (id.as_str(), d.as_str()))
         .collect();
     let oublies: HashSet<&str> = oublis.iter().map(|o| o.device_id.as_str()).collect();
     let mut plan = Plan::default();
@@ -217,6 +247,26 @@ pub fn marquer_oublie(
     })
 }
 
+/// Oubli AUTOMATIQUE : pose la marque si personne ne l'a posée entre-temps
+/// (un oubli manuel garde la sienne). Rend `true` si elle est posée.
+pub fn marquer_oublie_si_absent(
+    settings: &SettingsRepo,
+    device_id: &str,
+    maintenant: DateTime<Utc>,
+) -> Result<bool, String> {
+    settings.update_json_list::<Oubli, _, _>(CLE_OUBLIES, |l| {
+        if l.iter().any(|o| o.device_id == device_id) {
+            return Ok(false);
+        }
+        l.push(Oubli {
+            device_id: device_id.to_string(),
+            le: horodatage(maintenant),
+            auto: true,
+        });
+        Ok(true)
+    })
+}
+
 /// Effacer toute trace de `device_id` (retour sur le réseau, ou zone
 /// supprimée par l'utilisateur).
 pub fn effacer_les_traces(settings: &SettingsRepo, device_id: &str) -> Result<(), String> {
@@ -267,22 +317,39 @@ pub async fn balayer(state: &AppState, maintenant: DateTime<Utc>) -> Vec<String>
             device_id,
         });
     }
-    let plan = planifier(
-        &lire_absences(&settings),
-        &lire_oublis(&settings),
-        &appareils,
-        maintenant,
-        jours_avant_oubli(&settings),
-    );
-    let absences = plan.absences.clone();
-    if let Err(e) = settings.update_json_list::<Absence, _, _>(CLE_ABSENCES, |l| {
-        *l = absences;
-        Ok(())
+    let jours = jours_avant_oubli(&settings);
+    let precedent = settings
+        .get(CLE_DERNIER_BALAYAGE)
+        .ok()
+        .flatten()
+        .and_then(|v| lire_date(&v));
+    let arret = temps_d_arret(precedent, maintenant);
+    if arret > chrono::Duration::zero() {
+        info!(heures = arret.num_hours(), "appareils_balayage_temps_d_arret_non_compte");
+    }
+    // Le plan se calcule DANS la transaction des départs : un oubli ou une
+    // suppression manuelle qui passe entre-temps n'est pas écrasé (même
+    // verrou de clé), et la liste des oubliés est relue au dernier moment.
+    let plan = match settings.update_json_list::<Absence, _, _>(CLE_ABSENCES, |l| {
+        let plan = planifier(l, &lire_oublis(&settings), &appareils, maintenant, jours, arret);
+        *l = plan.absences.clone();
+        Ok(plan)
     }) {
-        warn!(error = %e, "appareils_balayage_absences_non_ecrites");
+        Ok(p) => p,
+        Err(e) => {
+            warn!(error = %e, "appareils_balayage_absences_non_ecrites");
+            return Vec::new();
+        }
+    };
+    if let Err(e) = settings.set(CLE_DERNIER_BALAYAGE, &horodatage(maintenant)) {
+        warn!(error = %e, "appareils_balayage_heure_non_ecrite");
     }
     for device_id in &plan.revenus {
-        if let Err(e) = effacer_les_traces(&settings, device_id) {
+        let efface = settings.update_json_list::<Oubli, _, _>(CLE_OUBLIES, |l| {
+            l.retain(|o| &o.device_id != device_id);
+            Ok(())
+        });
+        if let Err(e) = efface {
             warn!(device_id, error = %e, "appareil_revenu_marque_restee");
         } else {
             info!(device_id, "appareil_oublie_revenu");
@@ -291,12 +358,14 @@ pub async fn balayer(state: &AppState, maintenant: DateTime<Utc>) -> Vec<String>
     }
     let mut oublies = Vec::new();
     for device_id in plan.a_oublier {
-        let retiree = state.outputs.lock().await.remove(&device_id);
-        tune_core::outputs::registry::arreter_les_sorties_retirees(retiree).await;
-        super::forget_discovered_dlna(&state.backend, &device_id);
-        if let Err(e) = marquer_oublie(&settings, &device_id, maintenant, true) {
-            warn!(device_id, error = %e, "appareil_oubli_auto_non_ecrit");
-            continue;
+        // La marque seule : ni registre, ni magasin DLNA (voir l'en-tête).
+        match marquer_oublie_si_absent(&settings, &device_id, maintenant) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                warn!(device_id, error = %e, "appareil_oubli_auto_non_ecrit");
+                continue;
+            }
         }
         info!(device_id, "appareil_oublie_automatiquement");
         emettre_zones(state, &zones, &device_id);
