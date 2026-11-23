@@ -112,3 +112,44 @@ fn la_route_applique_le_flux_traite_avant_les_droits_9178() {
     let droits = corps.find("avec_les_droits(").expect("droits");
     assert!(sortie < flux && flux < droits);
 }
+
+/// TESS T12a — OAAT porte TOUTE la chaîne : le refus « non mesuré » est
+/// levé, le réglage est honoré tel quel, sans motif (comme une sortie locale).
+#[test]
+fn oaat_porte_toute_la_chaine_sans_motif_t12a() {
+    for (type_, appareil) in [
+        (Some("oaat"), Some("oaat:salon")),
+        (None, Some("oaat-group:maison")),
+    ] {
+        assert!(sortie_porte_toute_la_chaine(type_, appareil), "{type_:?}");
+        let s = avec_toute_la_chaine(non_locale(true), true);
+        assert_eq!(s.reason, None, "T12a : plus de motif sur OAAT");
+        assert!(s.effective && !s.unavailable);
+        let s = avec_toute_la_chaine(non_locale(false), true);
+        assert!(!s.effective && !s.unavailable && s.reason.is_none());
+    }
+}
+
+/// Contre-épreuve T12a : le navigateur garde sa réserve partielle, les
+/// sorties PULL leur verrou, et PURE la priorité.
+#[test]
+fn seule_oaat_porte_toute_la_chaine_t12a() {
+    for (type_, appareil) in [
+        (Some("browser"), Some("browser:onglet")),
+        (Some("airplay2"), Some("airplay:salon")),
+        (Some("devialet_air"), Some("devialet:x")),
+        (Some("hqplayer"), Some("hqplayer:x")),
+        (Some("diretta"), Some("diretta:x")),
+        (None, None),
+    ] {
+        assert!(!sortie_porte_toute_la_chaine(type_, appareil), "{type_:?}");
+    }
+    let pure = crossfeed_status(true, false, false, true, false, false);
+    assert_eq!(
+        avec_toute_la_chaine(pure, true).reason,
+        Some(CrossfeedConstraint::PureMode)
+    );
+    // Les droits viennent après : sans Premium, le motif est le droit.
+    let s = avec_les_droits(avec_toute_la_chaine(non_locale(true), true), false, true);
+    assert_eq!(s.reason, Some(CrossfeedConstraint::PremiumRequired));
+}
