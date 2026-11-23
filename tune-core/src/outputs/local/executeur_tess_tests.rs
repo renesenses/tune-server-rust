@@ -666,7 +666,10 @@ fn le_geste_du_producteur_est_la_chaine_testee() {
 }
 
 /// Le chemin natif exclusif (`prepare_windows_native_pcm`) : bit-perfect
-/// inchangé en PURE et sans étage ; avec un étage, les mots d'avant.
+/// inchangé en PURE et sans étage ; avec un étage, les mots d'avant — depuis
+/// T06 (crossfeed en `f64`), à l'arrondi près : le dither du bloc est semé
+/// par ses échantillons, un seul ULP `f32` d'écart change donc sa suite ;
+/// l'écart reste sous 2 LSB à 16 et 24 bits, sous 2⁻²¹ à 32 bits.
 #[test]
 fn le_chemin_natif_rend_les_mots_d_avant() {
     use crate::audio::volume_scale::UNITE_DU_GAIN_DE_RENDU;
@@ -703,7 +706,21 @@ fn le_chemin_natif_rend_les_mots_d_avant() {
                 pure || !cf,
                 "{bits} bits, pure={pure}, cf={cf}"
             );
-            assert_eq!(natif.samples, attendu, "{bits} bits, pure={pure}, cf={cf}");
+            if pure || !cf {
+                assert_eq!(natif.samples, attendu, "{bits} bits, pure={pure}, cf={cf}");
+            } else {
+                let decalage = 32 - u32::from(bits);
+                let tolerance = (2i64 << decalage).max((ECART_T06 * 2_147_483_648.0) as i64);
+                let pire = natif
+                    .samples
+                    .iter()
+                    .zip(&attendu)
+                    .map(|(x, y)| (i64::from(*x) - i64::from(*y)).abs())
+                    .max()
+                    .unwrap_or(0);
+                assert_eq!(natif.samples.len(), attendu.len());
+                assert!(pire <= tolerance, "{bits} bits : écart {pire} > {tolerance}");
+            }
         }
     }
 }
@@ -759,8 +776,9 @@ fn mono_et_multicanal_rendent_les_bits_d_avant() {
 /// Bascules en cours de lecture, entre deux blocs : repli mono, PURE, relève
 /// d'égaliseur (nouveau profil fondu), COUPURE de l'égaliseur (fondu, le
 /// préampli reste gardé, #5215), « Remettre à plat » demandé PENDANT ce fondu
-/// (#4176 : la remontée part à la fin du fondu), puis retrait au repos. Mêmes bits que l'ancien chemin à chaque bloc,
-/// et l'égaliseur est retiré au même bloc.
+/// (#4176 : la remontée part à la fin du fondu), puis retrait au repos. Les
+/// sons de l'ancien chemin à chaque bloc (T06 : à 2⁻²¹ près, l'égaliseur et
+/// le crossfeed calculent en `f64`), et l'égaliseur est retiré au même bloc.
 #[test]
 fn les_bascules_en_cours_de_lecture_rendent_les_bits_d_avant() {
     let source = octets(&mots(4_410 * 300, 24), 24);
@@ -815,11 +833,8 @@ fn les_bascules_en_cours_de_lecture_rendent_les_bits_d_avant() {
                 _ => {}
             }
         }
-        assert_eq!(
-            bits_f32(&n.bloc_nouveau(bloc, 24, 2)),
-            bits_f32(&a.bloc_ancien(bloc, 24, 2)),
-            "bloc {i}"
-        );
+        let e = ecart_f32(&n.bloc_nouveau(bloc, 24, 2), &a.bloc_ancien(bloc, 24, 2));
+        assert!(e <= ECART_T06, "bloc {i} : écart {e:e}");
         if retraits.0.is_none() && n.eq.lock().unwrap().is_none() {
             retraits.0 = Some(i);
         }

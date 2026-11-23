@@ -88,7 +88,8 @@ fn d2_max(y: &[f64], de: usize, a: usize) -> f64 {
 
 /// Les gestes en vol de la façade : activation (+12 dB, fondu de 300 ms),
 /// coupure (préampli gardé puis remontée, #6741 avec borne posée), gros
-/// changement de réglage (fondu), et compensation portée (#5227). Pour
+/// changement de réglage (fondu), et activation avec compensation portée
+/// (#5227). Pour
 /// chacun : le chemin `f64` rend la même chose que le chemin `f32` sous
 /// −120 dBFS, et la différence seconde du fondu ne dépasse pas celle du
 /// signal établi de part et d'autre (aucun clic).
@@ -113,7 +114,7 @@ fn les_gestes_en_vol_se_jouent_en_f64_comme_en_f32_et_sans_clic() {
         ("+3 → +12 dB", Some(|| egaliseur(3.0)), |p| {
             EqProcessor::prendre_la_releve(Some(egaliseur(12.0)), p)
         }),
-        ("compensation portée", Some(|| egaliseur(6.0)), |p| {
+        ("activation compensée", None, |p| {
             let mut n = egaliseur(6.0);
             n.porter_la_compensation(1.6);
             EqProcessor::prendre_la_releve(Some(n), p)
