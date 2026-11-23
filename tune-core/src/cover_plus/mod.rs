@@ -113,7 +113,7 @@ pub const AGENT_API: &str = "Mozilla/5.0 (compatible; Tune)";
 // Réglages
 // ---------------------------------------------------------------------------
 
-/// Le réglage qui ALLUME Cover+ sur ce serveur. Absent : éteint.
+/// Le réglage qui allume ou éteint Cover+ sur ce serveur. Absent : allumé.
 pub const CLE_ACTIF: &str = "cover_plus.actif";
 /// Le réglage du repli « photo de l'artiste ». Absent : actif (quand Cover+
 /// l'est).
