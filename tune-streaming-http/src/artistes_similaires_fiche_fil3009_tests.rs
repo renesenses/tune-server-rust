@@ -13,12 +13,14 @@ use tune_core::streaming::traits::{
     AuthStatus, SearchResults, StreamAlbum, StreamArtist, StreamPlaylist, StreamTrack, StreamUrl,
 };
 
+/// Ce que `get_similar_artists` a reçu : (identifiant, borne).
+type Demandes = Arc<MutexStd<Vec<(String, usize)>>>;
+
 struct ServiceVoisins {
     nom: String,
     /// Le service déclare-t-il la capacité ?
     sait: bool,
-    /// Ce que `get_similar_artists` a reçu : (identifiant, borne).
-    demandes: Arc<MutexStd<Vec<(String, usize)>>>,
+    demandes: Demandes,
 }
 
 fn artiste(id: &str, nom: &str) -> StreamArtist {
@@ -119,7 +121,7 @@ impl StreamingService for ServiceVoisins {
 
 /// Chaque essai a son nom de service : les caches de ce module sont des
 /// `static` partagés par tout le processus de test.
-fn app(nom: &str, sait: bool) -> (Router, Arc<MutexStd<Vec<(String, usize)>>>) {
+fn app(nom: &str, sait: bool) -> (Router, Demandes) {
     let backend: Arc<dyn DbBackend> =
         Arc::new(SqliteDb::open_in_memory().expect("sqlite en memoire"));
     let demandes = Arc::new(MutexStd::new(Vec::new()));
