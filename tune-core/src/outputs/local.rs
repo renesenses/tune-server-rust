@@ -2042,15 +2042,20 @@ impl LocalOutput {
         fondu: usize,
     ) {
         let mut actif = self.convolver.lock().unwrap();
-        match (actif.as_mut(), nouveau) {
-            (Some(ancien), Some(n)) if fondu > 0 => {
-                if let Err(n) = ancien.remplacer_en_fondu(n, fondu) {
-                    *actif = Some(n);
+        if fondu > 0
+            && let Some(ancien) = actif.as_mut()
+        {
+            match nouveau {
+                Some(n) => {
+                    if let Err(n) = ancien.remplacer_en_fondu(n, fondu) {
+                        *actif = Some(n);
+                    }
                 }
+                None => ancien.eteindre_en_fondu(fondu),
             }
-            (Some(ancien), None) if fondu > 0 => ancien.eteindre_en_fondu(fondu),
-            (_, n) => *actif = n,
+            return;
         }
+        *actif = nouveau;
     }
 
     /// #7632 — accorder ou retirer le droit de convoluer (Premium
