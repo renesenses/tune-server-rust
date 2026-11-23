@@ -177,6 +177,19 @@ pub(crate) fn empreinte_stable(chemin: &str, meta: &std::fs::Metadata) -> u64 {
     h
 }
 
+/// Une onde que le client peut dessiner : au moins deux nombres finis, dont
+/// un au-dessus de zéro — la règle de `normaliserOnde` côté web.
+pub(crate) fn onde_dessinable(onde: &Value) -> bool {
+    let Some(points) = onde.as_array() else {
+        return false;
+    };
+    points.len() >= 2
+        && points
+            .iter()
+            .all(|v| v.as_f64().is_some_and(f64::is_finite))
+        && points.iter().any(|v| v.as_f64().is_some_and(|x| x > 0.0))
+}
+
 fn reponse(id: i64, onde: Value) -> Response {
     let points = onde.as_array().map_or(0, Vec::len);
     Json(json!({ "track_id": id, "waveform": onde, "points": points })).into_response()
@@ -264,11 +277,21 @@ pub(crate) async fn servir_avec(
     let en_base = points == ONDE_POINTS_ANCIEN;
     let repo = TrackRepo::with_backend(state.backend.clone());
 
-    if en_base && let Ok(Some(cached)) = repo.get_waveform(id) {
-        return reponse(
-            id,
-            serde_json::from_str::<Value>(&cached).unwrap_or(Value::Null),
-        );
+    // #9248 — une onde en base qui ne se dessine pas (toute plate, vide,
+    // illisible) n'est pas resservie : elle est recalculée et remplacée.
+    // Le décodeur APE maison de juin-juillet 2026 rendait du SILENCE
+    // (23ad9561b) ; une onde de 200 zéros mise en base à cette époque était
+    // resservie à vie, sans une ligne de journal, et le client web l'écarte
+    // (« une enveloppe toute plate ne dit rien ») : pas d'onde pour une piste
+    // qui se joue très bien.
+    if en_base
+        && let Ok(Some(cached)) = repo.get_waveform(id)
+        && let Ok(onde) = serde_json::from_str::<Value>(&cached)
+    {
+        if onde_dessinable(&onde) {
+            return reponse(id, onde);
+        }
+        tracing::info!(track_id = id, "onde_lecture_cache_en_base_plat_recalcule");
     }
 
     let track = match repo.get(id) {
