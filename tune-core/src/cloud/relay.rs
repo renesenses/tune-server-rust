@@ -627,6 +627,7 @@ impl RelayClient {
                 let places = self.places_de_requetes.clone();
                 let id_clone = id.clone();
                 let methode = method.to_string();
+                let chemin_relaye = path.to_string();
                 tokio::spawn(async move {
                     let debut = std::time::Instant::now();
                     // #7799 — la place est prise pour la lecture LOCALE
@@ -652,6 +653,15 @@ impl RelayClient {
                             lue.as_ref().map(|(s, _, _)| *s).unwrap_or(502),
                             lue.as_ref().map(|(_, _, o)| o.len()).unwrap_or(0),
                             debut.elapsed(),
+                        );
+                    }
+                    // Diagnostic rc14 (#8963) : quelles adresses de flux sont
+                    // parties vers le téléphone, et quelle zone il relit.
+                    if let Ok((_, _, octets)) = lue.as_ref() {
+                        super::activite_du_relais::noter_reponse_relayee(
+                            &methode,
+                            &chemin_relaye,
+                            octets,
                         );
                     }
                     let resp = match lue {
@@ -734,6 +744,21 @@ impl RelayClient {
             }
             MESSAGE_FLUX_DE_CERCLE => {
                 self.servir_un_flux_de_cercle(&v).await;
+            }
+            // Diagnostic rc14 (#8963) : un client (l'application) a ouvert un
+            // WebSocket à travers le pont. Ce serveur ne lui relaie AUCUN
+            // évènement (`relay.client_message` n'est pas servi) : à
+            // distance, le téléphone n'apprend l'adresse d'un flux que par
+            // les réponses de l'API. Le dire au journal, sans rien changer.
+            "relay.client_connected" | "relay.client_disconnected" => {
+                let connecte = msg_type == "relay.client_connected";
+                let ouverts = super::activite_du_relais::noter_client_ws(connecte);
+                info!(
+                    connecte,
+                    websockets_par_le_pont = ouverts,
+                    evenements_relayes = false,
+                    "relay_client_websocket"
+                );
             }
             _ => {}
         }
