@@ -93,7 +93,7 @@ fn nom_invalide() -> Response {
 }
 
 /// Une modification de la liste à la fois (lecture, changement, écriture).
-fn verrou_de_la_liste() -> &'static tokio::sync::Mutex<()> {
+pub fn verrou_de_la_liste() -> &'static tokio::sync::Mutex<()> {
     static VERROU: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     VERROU.get_or_init(Default::default)
 }
@@ -324,7 +324,27 @@ pub async fn regler_le_mode(State(state): State<AppState>, corps: Bytes) -> Resp
     if let Err(e) = prereglages::ecrire(&settings, &liste) {
         return stockage(e);
     }
+    drop(_garde);
+    // Passer en « Immediately » : ce qui attendait la prochaine lecture
+    // atteint la sortie vivante maintenant, et la file se vide.
+    if mode.immediat() {
+        appliquer_toute_l_attente(&state).await;
+    }
     Json(liste).into_response()
+}
+
+/// Sert tout ce qui attend une prochaine lecture, zone par zone (sous le
+/// verrou des `PUT` de chaque zone), et vide la file.
+async fn appliquer_toute_l_attente(state: &AppState) {
+    let zones: Vec<i64> = en_attente()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .copied()
+        .collect();
+    for zone_id in zones {
+        appliquer_a_la_lecture(state, zone_id).await;
+    }
 }
 
 // ── Chargement sur une zone ─────────────────────────────────────────
@@ -369,9 +389,14 @@ pub async fn appliquer_prereglage(
         Err(r) => return r,
     };
     let settings = settings_de(&state);
-    let liste = match prereglages::lire(&settings) {
-        Ok(l) => l,
-        Err(e) => return stockage(e),
+    // Lue sous le verrou de la liste : jamais une liste à moitié modifiée
+    // par un renommage ou une suppression concurrents.
+    let liste = {
+        let _garde = verrou_de_la_liste().lock().await;
+        match prereglages::lire(&settings) {
+            Ok(l) => l,
+            Err(e) => return stockage(e),
+        }
     };
     let Some(p) = liste.get(&preset_id).cloned() else {
         return introuvable(&preset_id);
@@ -419,10 +444,15 @@ pub(super) fn oublier_le_prereglage_s_il_differe(
     let Some(actif) = settings.get(&cle).ok().flatten().filter(|a| !a.is_empty()) else {
         return;
     };
+    // La chaîne ENREGISTRÉE (sans les droits) : sur un compte gratuit, la vue
+    // convertie (P2) ne doit pas faire croire que la chaîne a changé.
+    let enregistree = lire_zone(&settings, zone_id, true)
+        .map(|l| l.chaine)
+        .unwrap_or_else(|_| chaine.clone());
     let decrit = prereglages::lire(&settings)
         .ok()
         .and_then(|l| l.get(&actif).cloned())
-        .is_some_and(|p| sans_champs_du_serveur(&p.chain) == sans_champs_du_serveur(chaine));
+        .is_some_and(|p| sans_champs_du_serveur(&p.chain) == sans_champs_du_serveur(&enregistree));
     if !decrit {
         let _ = settings.delete(&cle);
     }
@@ -504,6 +534,10 @@ pub(super) async fn appliquer_selon_le_mode(
 /// réseau, lui, vient d'être fabriqué avec les clés déjà écrites : rien à
 /// relancer (jamais de relance juste après un démarrage).
 pub async fn appliquer_a_la_lecture(state: &AppState, zone_id: i64) {
+    // Sous le verrou des `PUT` de la zone : un `PUT` (ou un chargement) en
+    // cours écrit ses clés et décide de leur sort avant que la file soit lue.
+    let verrou = verrou_des_put(zone_id);
+    let _garde = verrou.lock().await;
     let cles = prendre_en_attente(zone_id);
     if cles.is_empty() {
         return;
@@ -511,14 +545,18 @@ pub async fn appliquer_a_la_lecture(state: &AppState, zone_id: i64) {
     let Ok(zone) = zone_de(state, zone_id) else {
         return;
     };
-    let locale = zone
-        .output_device_id
-        .as_deref()
-        .is_none_or(|d| d.starts_with("local:"));
+    let locale = sortie_locale(&zone);
     if locale {
         rafraichir(state, &zone, &cles).await;
     }
     info!(zone_id, cles = ?cles, locale, "tess_applique_au_demarrage");
+}
+
+/// La zone sort-elle sur une sortie locale ? Lu dans `output_type` (absent =
+/// locale), comme le volume de TESS : une zone réseau sans appareil connu
+/// n'est pas locale.
+pub fn sortie_locale(zone: &Zone) -> bool {
+    zone.output_type.as_deref().unwrap_or("local") == "local"
 }
 
 /// Écoute les démarrages de lecture (`started`) pour le mode

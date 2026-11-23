@@ -392,7 +392,7 @@ pub async fn get_zone_tess(State(state): State<AppState>, Path(id): Path<i64>) -
 /// écriture (comparaison des marques et des maillons inchangés). L'écriture
 /// elle-même prend en plus [`verrou_de_zone`] (dans [`ecrire_chaine`]), qui
 /// l'ordonne avec la migration de T03.
-pub(super) fn verrou_des_put(zone_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+pub fn verrou_des_put(zone_id: i64) -> Arc<tokio::sync::Mutex<()>> {
     static VERROUS: OnceLock<std::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>> =
         OnceLock::new();
     let mut table = VERROUS

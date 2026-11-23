@@ -93,6 +93,8 @@ pub enum ErreurPreReglage {
     IdEnDouble(String),
     #[error("le préréglage {0} n'a pas de nom")]
     NomVide(String),
+    #[error("le nom du préréglage {0} dépasse 80 caractères ou contient un caractère de contrôle")]
+    NomInvalide(String),
     #[error("le préréglage Pure doit rester sans traitement")]
     PureModifie,
 }
@@ -116,6 +118,10 @@ impl PreReglages {
             }
             if p.name.trim().is_empty() {
                 return Err(ErreurPreReglage::NomVide(p.id.clone()));
+            }
+            // Même règle que la route (un fichier importé ne la contourne pas).
+            if nom_valide(&p.name).is_none() {
+                return Err(ErreurPreReglage::NomInvalide(p.id.clone()));
             }
             if p.id == ID_PREREGLAGE_PURE && p.chain != PreReglage::pure().chain {
                 return Err(ErreurPreReglage::PureModifie);
@@ -460,5 +466,34 @@ mod tests {
         assert_eq!(nom_valide("a\nb"), None);
         assert!(nom_valide(&"é".repeat(NOM_MAX)).is_some());
         assert_eq!(nom_valide(&"é".repeat(NOM_MAX + 1)), None);
+    }
+
+    #[test]
+    fn verifier_borne_le_nom_comme_la_route_suite_t17() {
+        let base = || {
+            let mut l = PreReglages::default();
+            l.presets.push(soiree());
+            l
+        };
+        for mauvais in [
+            "é".repeat(NOM_MAX + 1),
+            "a\u{7}b".into(),
+            "Soir\nMatin".into(),
+        ] {
+            let mut l = base();
+            l.presets[1].name = mauvais.clone();
+            assert_eq!(
+                l.verifier(),
+                Err(ErreurPreReglage::NomInvalide("evening-listening".into())),
+                "{mauvais:?}"
+            );
+            // L'import (même lecture) l'écarte aussi.
+            assert!(lire_texte(&serde_json::to_string(&l).unwrap()).is_err());
+        }
+        // Contre-épreuve : 80 caractères, espaces de bord compris, passent.
+        let mut l = base();
+        l.presets[1].name = format!(" {} ", "é".repeat(NOM_MAX));
+        l.verifier().unwrap();
+        lire_texte(&serde_json::to_string(&l).unwrap()).unwrap();
     }
 }

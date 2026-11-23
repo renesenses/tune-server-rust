@@ -382,8 +382,9 @@ ordre et tous leurs réglages.
   Chaîne vide et `bypass_all`. Il peut être supprimé, pas modifié.
 - **Charger un préréglage remplace la chaîne de la zone.** W4 propose
   d'enregistrer la chaîne courante avant.
-- **`verifier` refuse** : un id invalide ou en double, un nom vide, un Pure
-  modifié.
+- **`verifier` refuse** : un id invalide ou en double, un nom vide, un nom de
+  plus de 80 caractères ou avec un caractère de contrôle (même règle que la
+  route, donc aussi à l'import), un Pure modifié.
 - **Droits** : ils sont vérifiés au **chargement**. Un préréglage Premium reste
   enregistré sur un compte redevenu gratuit.
 
@@ -420,8 +421,12 @@ ordre et tous leurs réglages.
   (`preset_not_found` en 404, `invalid_name`, `invalid_body`,
   `invalid_apply_mode` en 400).
 - **Préréglage actif et `PUT`** : un `PUT /zones/{id}/tess` dont la chaîne
-  écrite ne correspond plus au préréglage actif (comparée sans les champs du
-  serveur) efface `active_preset` ; renvoyée telle quelle, il reste.
+  ENREGISTRÉE (lue sans les droits, donc jamais la vue convertie P2 d'un
+  compte gratuit) ne correspond plus au préréglage actif (comparée sans les
+  champs du serveur) efface `active_preset` ; renvoyée telle quelle, il reste.
+- Passer en `immediately` sert aussitôt ce qui attendait la prochaine lecture
+  et vide la file. Le démarrage de lecture lit la file sous le verrou des
+  `PUT` de la zone ; « locale » se lit dans `output_type` (absent = locale).
 - **Mode d'application**, suivi par le `PUT` comme par le chargement :
   - `immediately` : la sortie vivante est rafraîchie tout de suite (à chaud en
     local ; relance du flux réseau à la position, #8422 : anti-rebond,

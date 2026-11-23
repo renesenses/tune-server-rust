@@ -18,7 +18,10 @@ use tune_core::db::zone_repo::ZoneRepo;
 use tune_core::tess::api::conforme_au_schema;
 use tune_core::tess::migration::lire_zone;
 use tune_core::tess::{ChaineTess, cle_chaine_zone};
-use tune_server::routes::zones::tess_prereglages::{appliquer_a_la_lecture, cles_en_attente};
+use tune_server::routes::zones::tess::verrou_des_put;
+use tune_server::routes::zones::tess_prereglages::{
+    appliquer_a_la_lecture, cles_en_attente, sortie_locale, verrou_de_la_liste,
+};
 
 struct Banc {
     state: tune_server::state::AppState,
@@ -550,4 +553,123 @@ async fn au_prochain_demarrage_rien_n_interrompt_la_lecture_t17() {
     b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
         .await;
     assert!(cles_en_attente(b.zone).is_empty());
+}
+
+// ── Suites de relecture (T17) ───────────────────────────────────────
+
+async fn mode(b: &Banc, m: &str) {
+    let (s, v) = b
+        .brut(
+            Method::PUT,
+            "/api/v1/tess/apply-mode",
+            Some(json!({"apply_mode": m})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+}
+
+#[tokio::test]
+async fn la_lecture_attend_le_put_en_cours_de_la_zone_suite_t17() {
+    let b = Banc::avec_sortie(true, "local", "local:Realtek HD", 50).await;
+    mode(&b, "at_next_playback").await;
+    b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
+        .await;
+    assert!(!cles_en_attente(b.zone).is_empty());
+    // Un PUT tient la zone : le démarrage de lecture attend, la file reste.
+    let verrou = verrou_des_put(b.zone);
+    let garde = verrou.lock().await;
+    let state = b.state.clone();
+    let zone = b.zone;
+    let tache = tokio::spawn(async move { appliquer_a_la_lecture(&state, zone).await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !cles_en_attente(b.zone).is_empty(),
+        "la file a été lue pendant le PUT"
+    );
+    drop(garde);
+    tache.await.unwrap();
+    assert!(cles_en_attente(b.zone).is_empty());
+}
+
+#[tokio::test]
+async fn une_zone_reseau_sans_appareil_n_est_pas_locale_suite_t17() {
+    let b = Banc::nouveau(true).await;
+    let repo = ZoneRepo::with_backend(b.state.backend.clone());
+    let reseau = repo.create("Salon DLNA", Some("dlna"), None).unwrap();
+    assert!(!sortie_locale(&repo.get(reseau).unwrap().unwrap()));
+    // Contre-épreuves : locale déclarée, ou type absent (locale par défaut).
+    assert!(sortie_locale(&repo.get(b.zone).unwrap().unwrap()));
+    let sans_type = repo.create("Sans type", None, None).unwrap();
+    assert!(sortie_locale(&repo.get(sans_type).unwrap().unwrap()));
+}
+
+#[tokio::test]
+async fn repasser_en_immediat_vide_la_file_suite_t17() {
+    let b = Banc::avec_sortie(true, "local", "local:Realtek HD", 60).await;
+    mode(&b, "at_next_playback").await;
+    b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
+        .await;
+    assert!(!cles_en_attente(b.zone).is_empty());
+    // Contre-épreuve : reposer le même mode ne sert rien.
+    mode(&b, "at_next_playback").await;
+    assert!(!cles_en_attente(b.zone).is_empty());
+    mode(&b, "immediately").await;
+    assert!(cles_en_attente(b.zone).is_empty());
+}
+
+#[tokio::test]
+async fn charger_lit_la_liste_sous_son_verrou_suite_t17() {
+    let b = Banc::nouveau(true).await;
+    b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
+        .await;
+    b.enregistrer("Headphones").await;
+    let app = b.app.clone();
+    let uri = format!("/api/v1/zones/{}/tess/presets/headphones/apply", b.zone);
+    let garde = verrou_de_la_liste().lock().await;
+    let tache = tokio::spawn(async move {
+        app.oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !tache.is_finished(),
+        "chargé pendant qu'on modifiait la liste"
+    );
+    drop(garde);
+    assert_eq!(tache.await.unwrap(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn un_put_identique_sur_un_compte_gratuit_garde_l_actif_suite_t17() {
+    let b = Banc::nouveau(true).await;
+    b.put_chaine(json!({"version": 1, "plugins": [parametrique()]}))
+        .await;
+    b.enregistrer("Studio").await;
+    b.premium(false).await;
+    // Le GET gratuit montre le paramétrique converti en graphique (P2).
+    let vue = b.get_zone().await;
+    assert_eq!(
+        vue["chain"]["plugins"][0]["id"],
+        json!("equalizer-graphic"),
+        "{vue}"
+    );
+    assert_eq!(vue["active_preset"], json!("studio"));
+    // Renvoyée telle quelle, la chaîne ne change pas : l'actif reste.
+    let (s, v) = b.put_chaine(vue["chain"].clone()).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(b.chaine().plugins[0].id, "equalizer-parametric");
+    assert_eq!(b.get_zone().await["active_preset"], json!("studio"));
+    // Contre-épreuve : décocher l'oublie.
+    let mut autre = vue["chain"].clone();
+    autre["plugins"][0]["enabled"] = json!(false);
+    b.put_chaine(autre).await;
+    assert_eq!(b.get_zone().await["active_preset"], Value::Null);
 }
