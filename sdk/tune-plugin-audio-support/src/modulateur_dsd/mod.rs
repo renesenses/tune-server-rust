@@ -110,9 +110,15 @@ pub enum ErreurModulateur {
     CanauxInvalides(u16),
     Conception,
     /// L'entrée n'est pas faite de trames entières (`échantillons`, `canaux`).
-    TramesIncompletes { echantillons: usize, canaux: usize },
+    TramesIncompletes {
+        echantillons: usize,
+        canaux: usize,
+    },
     /// Le tampon de sortie est trop court (`besoin`, `recu` octets).
-    TamponTropCourt { besoin: usize, recu: usize },
+    TamponTropCourt {
+        besoin: usize,
+        recu: usize,
+    },
 }
 
 impl std::fmt::Display for ErreurModulateur {
@@ -127,7 +133,10 @@ impl std::fmt::Display for ErreurModulateur {
             Self::TramesIncompletes {
                 echantillons,
                 canaux,
-            } => write!(f, "{echantillons} samples are not whole {canaux}-channel frames"),
+            } => write!(
+                f,
+                "{echantillons} samples are not whole {canaux}-channel frames"
+            ),
             Self::TamponTropCourt { besoin, recu } => {
                 write!(f, "output buffer holds {recu} bytes, {besoin} needed")
             }
