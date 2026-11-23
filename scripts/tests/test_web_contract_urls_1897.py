@@ -129,5 +129,130 @@ class UrlsContrat(unittest.TestCase):
         self.assertEqual(len(nr), 1)
 
 
+# Les commentaires d'un type ne déclarent aucun champ (carte a10e41183, #9362).
+#
+# `StreamingPlaylist` documente `editable` par « `false` : il la suit seulement
+# (éditoriale, autre compte) ; absent : le serveur ne le dit pas ». Le `;` de
+# la PROSE coupait le bloc, et « absent : le serveur… » était lu comme un champ
+# obligatoire. `GET /system/env` héritait de même d'`absent` par la doc de
+# `data_persistence`. Le serveur n'a jamais rendu ce champ : le banc
+# `web_response_contracts` rougissait sur une exigence que le client n'a pas.
+TYPES_DOCUMENTES = {"types.ts": """
+export interface StreamingPlaylist {
+  source_id: string;
+  /**
+   * `false` : il la suit seulement (éditoriale, autre compte) ; absent : le
+   * serveur ne le dit pas.
+   */
+  editable?: boolean | null;
+  // repli ; absent : serveur plus ancien
+  source: string;
+}
+export interface AvecVraiChamp {
+  /** Témoin ; absent : ce mot n'est ici qu'un commentaire. */
+  absent: boolean;
+  source_id: string;
+}
+"""}
+
+
+class CommentairesDesTypes(unittest.TestCase):
+    def extraire(self, appel, types=TYPES_DOCUMENTES):
+        with contextlib.redirect_stderr(io.StringIO()):
+            return cartographe.carte(types, appel)
+
+    def contrat(self, appel, types=TYPES_DOCUMENTES):
+        entries, non_resolus = self.extraire(appel, types)
+        self.assertFalse(non_resolus, non_resolus)
+        self.assertEqual(len(entries), 1, entries)
+        return entries[0]
+
+    def test_temoin_la_prose_d_un_commentaire_n_est_pas_un_champ(self):
+        e = self.contrat("fetchJSON<StreamingPlaylist[]>(`${BASE}/streaming/${s}/mixes`);")
+        self.assertEqual(e["champs_obligatoires"], ["source_id", "source"],
+                         "un mot de commentaire est exigé du serveur")
+        self.assertEqual(e["champs_optionnels"], ["editable"])
+
+    def test_temoin_type_en_ligne_documente(self):
+        e = self.contrat("""fetchJSON<{
+            TUNE_PORT?: string;
+            /**
+             * `null` hors conteneur ; absent : serveur plus ancien.
+             */
+            data_persistence?: string | null;
+        }>(`${BASE}/system/env`);""")
+        self.assertEqual(e["champs_obligatoires"], [],
+                         "GET /system/env n'exige aucun champ du serveur")
+
+    @staticmethod
+    def manquants(entree, reponse):
+        """Ce que le banc reprocherait à la réponse : les obligatoires absents."""
+        return [c for c in entree["champs_obligatoires"] if c not in reponse]
+
+    def test_temoin_une_reponse_sans_le_mot_du_commentaire_est_conforme(self):
+        e = self.contrat("fetchJSON<StreamingPlaylist[]>(`${BASE}/streaming/${s}/mixes`);")
+        self.assertEqual(self.manquants(e, {"source_id": "1", "source": "qobuz"}), [])
+
+    def test_contre_temoin_un_vrai_champ_obligatoire_reste_exige(self):
+        # Même nom, mais DÉCLARÉ : le retirer du serveur doit toujours rougir.
+        e = self.contrat("fetchJSON<AvecVraiChamp>(`${BASE}/avec/vrai-champ`);")
+        self.assertEqual(e["champs_obligatoires"], ["absent", "source_id"])
+        self.assertEqual(self.manquants(e, {"source_id": "1"}), ["absent"],
+                         "une réponse privée d'un vrai champ obligatoire doit échouer")
+
+    def test_contre_temoin_une_chaine_avec_double_barre_n_est_pas_un_commentaire(self):
+        e = self.contrat(
+            "fetchJSON<{ lien: 'http://x' | 'https://y'; requis: string }>(`${BASE}/liens`);"
+        )
+        self.assertEqual(e["champs_obligatoires"], ["lien", "requis"])
+
+
+# Suffixe de requête porté par une constante locale (carte a10e41183, #9362).
+#
+# `getArtistTracks` est passée de `…/tracks` à `…/tracks${suite}`, avec
+# `const suite = dossier ? `?${…}` : '';`. La carte nommait alors la route
+# `/library/artists/{}/tracks{}`, que le serveur ne sert pas, et perdait le
+# contrat de `/library/artists/{}/tracks` : `library_1897` paniquait.
+class SuffixeDeRequeteLocal(UrlsContrat):
+    def test_temoin_constante_locale_de_requete(self):
+        self.exige(
+            """export function getArtistTracks(id: number, dossier?: string | null) {
+              const suite = dossier ? `?${new URLSearchParams({ folder: dossier })}` : '';
+              return fetchJSON<Track[]>(`${BASE}/library/artists/${id}/tracks${suite}`);
+            }""",
+            "/library/artists/{}/tracks",
+        )
+
+    def test_temoin_requete_locale_dans_un_retour_de_fonction(self):
+        self.exige(
+            """export function onde(id: number, points?: number): Promise<{ id: number; title: string }> {
+              const q = points ? `?points=${Math.round(points)}` : '';
+              return fetchJSON(`${BASE}/library/tracks/${id}/waveform${q}`);
+            }""",
+            "/library/tracks/{}/waveform",
+        )
+
+    def test_contre_temoin_constante_qui_change_le_chemin(self):
+        self.exige(
+            """export function f(id: number, x?: boolean) {
+              const suite = x ? '/extra' : '';
+              return fetchJSON<Track[]>(`${BASE}/radios${suite}`);
+            }""",
+            "/radios{}",
+        )
+
+    def test_contre_temoin_constante_d_une_autre_fonction(self):
+        self.exige(
+            """export function a(d?: string) {
+              const suite = d ? `?d=${d}` : '';
+              return suite;
+            }
+            export function b() {
+              return fetchJSON<Track[]>(`${BASE}/radios${suite}`);
+            }""",
+            "/radios{}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
