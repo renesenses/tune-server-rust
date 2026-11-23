@@ -78,9 +78,9 @@ impl OrdreLocal {
     /// L'ordre d'une suite d'identifiants de greffons TESS.
     ///
     /// - Les trois façades d'égaliseur visent le même moteur ; la famille
-    ///   crossfeed (`crossfeed`, `crossfeed-*`, `crosstalk`) vise le
-    ///   `CrossfeedProcessor`, qui porte aussi les natifs tiers ; la première
-    ///   occurrence fixe la place.
+    ///   crossfeed (`crossfeed`, `crossfeed-*`, `crosstalk`) et tout natif
+    ///   tiers (T14) visent le `CrossfeedProcessor`, qui les porte ; la
+    ///   première occurrence fixe la place.
     /// - Un étage que la liste ne nomme pas garde sa place historique
     ///   relative, après ceux qu'elle nomme : un moteur posé par les anciennes
     ///   clés n'est jamais retiré en silence.
@@ -104,6 +104,10 @@ impl OrdreLocal {
                 "convolution" | "room-correction" => EtageLocal::Convolution,
                 "crossfeed" | "crosstalk" => EtageLocal::Crossfeed,
                 _ if id.starts_with("crossfeed-") => EtageLocal::Crossfeed,
+                // TESS T14 — un natif tiers (absent du catalogue de
+                // référence) vit dans l'étage casque : il le place, comme
+                // les membres de la famille du crossfeed.
+                _ if est_un_natif_tiers(id) => EtageLocal::Crossfeed,
                 _ => continue,
             };
             placer(e, &mut etages);
@@ -130,6 +134,14 @@ impl OrdreLocal {
     pub(crate) fn bypass_all(&self) -> bool {
         self.bypass_all
     }
+}
+
+/// TESS T14 — `id` est-il un greffon natif tiers : un identifiant que l'hôte
+/// accepte pour un paquet tiers et que le catalogue de référence ne connaît
+/// pas ?
+fn est_un_natif_tiers(id: &str) -> bool {
+    crate::audio::natifs_tiers::identifiant_admissible(id)
+        && crate::tess::catalogue_de_reference().get(id).is_none()
 }
 
 /// Taille maximale, en échantillons, d'une tranche traitée d'un seul tenant
@@ -271,8 +283,10 @@ impl EtageTess for AdaptateurConvolution<'_> {
     fn definir_bypass(&mut self, _: bool) {}
 }
 
-/// Adaptateur provisoire du crossfeed et des natifs tiers (`f32`), stéréo
-/// seulement : à porter en `f64` par T05/T14.
+/// L'étage casque : le crossfeed et les natifs tiers, stéréo seulement.
+/// TESS T14 : les natifs tiers travaillent sur les `f64` de la chaîne, F64
+/// négocié greffon par greffon ; seul le moteur intégré du crossfeed reste
+/// en `f32`, converti à sa frontière par tranches (découpage d'avant).
 struct AdaptateurCrossfeed<'a> {
     moteur: &'a Mutex<Option<CrossfeedProcessor>>,
     canaux: usize,
@@ -297,7 +311,13 @@ impl EtageTess for AdaptateurCrossfeed<'_> {
         if let Ok(mut cf) = self.moteur.lock()
             && let Some(c) = cf.as_mut()
         {
-            par_tranches_f32(&mut t[..trames * 2], 2, |f| c.process_interleaved(f));
+            let t = &mut t[..trames * 2];
+            if c.moteur_en_f32() {
+                par_tranches_f32(t, 2, |f| c.process_moteur_f32(f));
+            } else {
+                c.process_moteur_f64(t);
+            }
+            c.process_tiers_f64(t);
         }
         Ok(())
     }

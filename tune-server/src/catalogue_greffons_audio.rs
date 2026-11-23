@@ -15,7 +15,9 @@
 //!    confiance ([`crate::native_audio::trusted_keys`] : la clé des greffons de
 //!    Mozaiklabs, intégrée, plus celles de l'opérateur) ;
 //! 5. l'installation par le chemin commun à l'envoi direct
-//!    ([`crate::native_audio::install_package`]), active au prochain démarrage.
+//!    ([`crate::native_audio::install_package`]) ; un greffon tiers est actif
+//!    aussitôt, sans redémarrage (TESS T14), un emplacement intégré au
+//!    prochain démarrage.
 //!
 //! Le site ne fait que DISTRIBUER : la confiance vient de la signature, jamais
 //! du canal. Un paquet dont la signature n'est pas de confiance est refusé
@@ -428,10 +430,17 @@ async fn installer(state: &AppState, id: &str, tiers: bool, cible: &str) -> Resu
     )
     .await
     .map_err(Refus::Installation)?;
+    // TESS T14 — un greffon tiers agit sans redémarrage.
+    let (restart_required, activation_error) = if tiers {
+        crate::native_audio::activer_apres_installation(state, id).await
+    } else {
+        (true, None)
+    };
     Ok(json!({
         "id": id,
         "installed": true,
-        "restart_required": true,
+        "restart_required": restart_required,
+        "activation_error": activation_error,
         "target": paquet.target,
         "version": fiche.version,
         "source": "catalog",
@@ -1124,5 +1133,79 @@ mod tests {
         let (status, etat) = lire_le_catalogue(&app, id).await;
         assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "{etat}");
         assert!(site.vus.lock().unwrap().is_empty(), "le site a été appelé");
+    }
+
+    /// Un VRAI greffon natif tiers (bibliothèque construite par le banc,
+    /// `tune_core::greffon_natif_de_test`), empaqueté et signé par la clé de
+    /// test. Le manifeste est celui que la bibliothèque embarque.
+    fn fiche_d_un_vrai_greffon(id: &str, dossier: &std::path::Path) -> Catalogue {
+        let binaire =
+            tune_core::greffon_natif_de_test::construire_les_bibliotheques_de_test(dossier, &[id])
+                .remove(0);
+        let manifeste = std::fs::read_to_string(
+            dossier
+                .join(format!("tune-plugin-essai-{id}"))
+                .join("manifest.json"),
+        )
+        .unwrap();
+        let manifest: tune_plugin_sdk::manifest::Manifest =
+            serde_json::from_str(&manifeste).unwrap();
+        let octets = tune_plugin_native::package::pack(
+            manifest,
+            &binaire,
+            tune_plugin_native::package::host_target(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        Catalogue::Fiche {
+            signature: signer(&octets),
+            sha256: format!("{:x}", Sha256::digest(&octets)),
+            octets,
+        }
+    }
+
+    /// TESS T14 — activation sans redémarrage : un greffon natif tiers
+    /// installé depuis le catalogue est chargé et inscrit aussitôt ; la route
+    /// ne demande plus de redémarrage et l'état le dit actif.
+    #[tokio::test]
+    async fn t14_un_greffon_tiers_installe_agit_sans_redemarrage() {
+        let id = "catalogue-essai-chaud";
+        let dossier = tempfile::tempdir().unwrap();
+        let site = site_factice(fiche_d_un_vrai_greffon(id, dossier.path()), false).await;
+        let base = site.base.lock().unwrap().clone();
+        let (state, app) = serveur(&base, true, false).await;
+        assert!(tune_plugin_native::provider(id).is_none());
+        let (status, corps) = installer_par_la_route(&app, id).await;
+        assert_eq!(status, StatusCode::OK, "{corps}");
+        assert_eq!(corps["restart_required"], false, "{corps}");
+        assert_eq!(corps["activation_error"], Value::Null, "{corps}");
+        assert!(
+            tune_plugin_native::provider(id).is_some(),
+            "le greffon n'est pas inscrit au registre"
+        );
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        assert!(tune_core::audio::natifs_tiers::actif(&settings, id));
+        let fiche = crate::native_audio::fiche_d_etat(&settings, id, true, true);
+        assert_eq!(fiche["active"], true, "{fiche}");
+        assert_eq!(fiche["restart_required"], false, "{fiche}");
+        tune_plugin_native::unregister(id);
+    }
+
+    /// Contre-épreuve : un paquet signé dont la bibliothèque ne se charge pas
+    /// n'est pas déclaré actif ; la route garde « redémarrage requis », dit
+    /// pourquoi, et n'inscrit AUCUN échec qui éteindrait une version déjà en
+    /// service.
+    #[tokio::test]
+    async fn t14_contre_epreuve_une_bibliotheque_illisible_n_est_pas_activee() {
+        let id = "catalogue-essai-chaud-illisible";
+        let site = site_factice(fiche_signee(id), false).await;
+        let base = site.base.lock().unwrap().clone();
+        let (_state, app) = serveur(&base, true, false).await;
+        let (status, corps) = installer_par_la_route(&app, id).await;
+        assert_eq!(status, StatusCode::OK, "{corps}");
+        assert_eq!(corps["restart_required"], true, "{corps}");
+        assert!(corps["activation_error"].is_string(), "{corps}");
+        assert!(tune_plugin_native::provider(id).is_none());
+        assert!(tune_plugin_native::failure(id).is_none());
     }
 }

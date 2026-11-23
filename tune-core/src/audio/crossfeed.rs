@@ -341,6 +341,25 @@ impl CrossfeedProcessor {
         self.gain_moyen_db
     }
     pub fn process_interleaved(&mut self, samples: &mut [f32]) {
+        self.process_moteur_f32(samples);
+        for etage in &mut self.tiers {
+            if let Err(error) = etage.stage.process_f32(samples) {
+                tracing::error!(plugin = %etage.id, %error, "native_third_party_processing_failed");
+            }
+        }
+    }
+
+    /// TESS T14 — le moteur du crossfeed intégré ne travaille qu'en `f32` :
+    /// l'appelant `f64` (exécuteur TESS) lui passe des tranches `f32`
+    /// ([`Self::process_moteur_f32`]) ; tout le reste prend le chemin `f64`
+    /// ([`Self::process_moteur_f64`], [`Self::process_tiers_f64`]).
+    pub fn moteur_en_f32(&self) -> bool {
+        matches!(self.engine, CrossfeedEngine::Bundled(_))
+    }
+
+    /// Le crossfeed seul (moteur intégré ou paquet natif), sans les étages
+    /// tiers, sur des `f32`.
+    pub fn process_moteur_f32(&mut self, samples: &mut [f32]) {
         match &mut self.engine {
             CrossfeedEngine::Bundled(p) => p.process_interleaved(samples),
             CrossfeedEngine::Native(p) => {
@@ -350,11 +369,57 @@ impl CrossfeedProcessor {
             }
             CrossfeedEngine::Unavailable | CrossfeedEngine::Aucun => {}
         }
+    }
+
+    /// TESS T14 — le crossfeed seul sur des `f64`. Un paquet natif reçoit
+    /// ses `f64` tels quels s'il a négocié le F64 (`audio-f64`, T05), sinon
+    /// il est converti à SA frontière. Le moteur intégré (`f32`) est converti
+    /// par morceaux fixes, sans allocation ; l'exécuteur, lui, l'appelle par
+    /// [`Self::process_moteur_f32`] pour garder son découpage d'avant.
+    pub fn process_moteur_f64(&mut self, samples: &mut [f64]) {
+        match &mut self.engine {
+            CrossfeedEngine::Bundled(p) => {
+                let mut tampon = [0.0f32; 1024];
+                for morceau in samples.chunks_mut(tampon.len()) {
+                    let f = &mut tampon[..morceau.len()];
+                    for (d, s) in f.iter_mut().zip(morceau.iter()) {
+                        *d = *s as f32;
+                    }
+                    p.process_interleaved(f);
+                    for (d, s) in morceau.iter_mut().zip(f.iter()) {
+                        *d = f64::from(*s);
+                    }
+                }
+            }
+            CrossfeedEngine::Native(p) => {
+                if let Err(error) = p.process_f64(samples) {
+                    tracing::error!(%error,"native_crossfeed_processing_failed");
+                }
+            }
+            CrossfeedEngine::Unavailable | CrossfeedEngine::Aucun => {}
+        }
+    }
+
+    /// TESS T14 — les étages des greffons natifs tiers sur des `f64`, dans
+    /// l'ordre des identifiants. F64 NÉGOCIÉ greffon par greffon
+    /// (`tune_plugin_native::stage::Stage::process_f64`) : un greffon qui a
+    /// demandé `audio-f64` reçoit les `f64` de la chaîne sans aucune
+    /// conversion ; un greffon `f32` est converti à sa frontière, exactement
+    /// comme avant (mêmes valeurs, même découpage de 4 096 trames).
+    pub fn process_tiers_f64(&mut self, samples: &mut [f64]) {
         for etage in &mut self.tiers {
-            if let Err(error) = etage.stage.process_f32(samples) {
+            if let Err(error) = etage.stage.process_f64(samples) {
                 tracing::error!(plugin = %etage.id, %error, "native_third_party_processing_failed");
             }
         }
+    }
+
+    /// Diagnostic : `(identifiant, traite le F64 lui-même)` par étage tiers.
+    pub fn etages_tiers_en_f64(&self) -> Vec<(String, bool)> {
+        self.tiers
+            .iter()
+            .map(|t| (t.id.clone(), t.stage.processes_f64_natively()))
+            .collect()
     }
     pub fn process_pcm(&mut self, pcm: &mut [u8], bit_depth: u16, channels: u16) {
         if channels != 2 {
