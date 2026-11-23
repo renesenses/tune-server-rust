@@ -84,7 +84,10 @@ fn armer_l_egaliseur(orch: &PlaybackOrchestrator, zone_id: i64) {
         &serde_json::to_string(&profil).unwrap(),
     )
     .unwrap();
-    assert!(orch.zone_has_active_eq(zone_id), "prémisse : égaliseur actif");
+    assert!(
+        orch.zone_has_active_eq(zone_id),
+        "prémisse : égaliseur actif"
+    );
 }
 
 // ── 1. La décision réelle ──────────────────────────────────────────────
@@ -390,7 +393,10 @@ async fn crossfeed_sur_airplay_allume_la_voie_droite_t12c() {
 async fn pure_sur_airplay_rien_n_est_traite_t12c() {
     let l = jouer_sur_airplay(Chaine::CrossfeedSousPure).await;
     let c = banc::constater(&l.trames, 16, &l.source, 1.0);
-    println!("T12c Pure AirPlay 1 : {c:?}, premier paquet {:?}", l.premier_paquet);
+    println!(
+        "T12c Pure AirPlay 1 : {c:?}, premier paquet {:?}",
+        l.premier_paquet
+    );
     assert!(c.identique, "Pure : la source à l'échantillon près ({c:?})");
 }
 

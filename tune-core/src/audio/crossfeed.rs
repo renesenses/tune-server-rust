@@ -741,7 +741,11 @@ pub fn sortie_porte_le_flux_traite(
     output_device_id.is_some_and(|d| d.starts_with("oaat:") || d.starts_with("oaat-group:"))
         || matches!(
             output_type,
-            Some("oaat") | Some("browser") | Some("airplay") | Some("airplay2") | Some("devialet_air")
+            Some("oaat")
+                | Some("browser")
+                | Some("airplay")
+                | Some("airplay2")
+                | Some("devialet_air")
         )
 }
 
