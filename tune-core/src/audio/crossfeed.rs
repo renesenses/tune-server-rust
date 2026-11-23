@@ -701,10 +701,11 @@ pub fn crossfeed_status(
         }
     } else {
         // Ni locale, ni réseau : OAAT, navigateur, sorties PULL, zone sans
-        // périphérique résolu. Elles ne sont PAS couvertes par ce correctif —
-        // certaines traversent probablement le relais (OAAT transcode en WAV
-        // par session), mais ce n'est pas mesuré, et annoncer « disponible »
-        // sans preuve est exactement le défaut de #2742 pris à l'envers.
+        // périphérique résolu. La réponse prudente par défaut ; les sorties
+        // dont le chemin est MESURÉ la lèvent ensuite : OAAT
+        // ([`avec_toute_la_chaine`], TESS T12a) et le navigateur
+        // ([`avec_le_flux_traite`], #9178). Annoncer « disponible » sans
+        // preuve serait le défaut de #2742 pris à l'envers.
         Some(CrossfeedConstraint::NonLocalOutput)
     };
     // Un motif n'est pas forcément un verrou (#2742, 23/09) : sous
