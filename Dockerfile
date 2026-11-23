@@ -52,7 +52,7 @@ RUN cargo install cargo-about --version 0.9.3 --locked && \
 # touch a placeholder so a local build still succeeds (AirPlay 2 then falls back
 # to legacy AirPlay 1). The release path (Dockerfile.dist) requires it.
 RUN cargo install --git https://github.com/renesenses/airplay2-rs \
-      --rev 2ae92906c2110977905726caf66c32411f3bc3d9 airplay-daemon --locked \
+      --rev 6961b4fc28cf43749aa9796b396fde9192d76801 airplay-daemon --locked \
     || touch /usr/local/cargo/bin/airplay-daemon
 
 # Build real source — clean dummy artifacts to force recompilation
