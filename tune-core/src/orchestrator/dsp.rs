@@ -337,24 +337,46 @@ impl PlaybackOrchestrator {
         url: String,
         codec_hint: String,
     ) {
-        let Some(bus) = self
-            .event_bus
-            .clone()
-            .filter(|_| self.levels_attach_allowed(zone_id))
-        else {
+        let Some(bus) = self.event_bus.clone() else {
             return;
         };
+        if !self.levels_attach_allowed(zone_id) {
+            // #9450 — session PRÉ-ARMÉE (piste suivante d'une avance sans
+            // blanc) : pas de forwarder avant l'avance, mais la prise se
+            // branche dès maintenant — le renderer tire le début de la piste
+            // avant l'avance — et attend `advance_queue_metadata`.
+            if let Some(sid) = crate::http::streamer::stream_id_de_l_url(&url)
+                && let Some(lecteur) = self
+                    .streamer
+                    .brancher_la_prise_des_niveaux(sid, Box::new(|| false))
+                    .await
+            {
+                crate::http::prise_des_niveaux_9450::garer(sid, lecteur);
+            }
+            return;
+        }
         // Épinglé ICI, pas dans la tâche : c'est la piste dont on vient de
         // décider les niveaux (#1110).
         let play_seq = self.playback.current_play_seq(zone_id).await;
+        // #9450 — une session mandataire de Tune se lit par sa prise : la
+        // sonde n'ouvre plus de seconde connexion `/stream/<id>`, que le
+        // mandataire doublait d'une seconde connexion au CDN. Une autre
+        // adresse (épisode, Bandcamp) s'ouvre comme avant.
+        let source = match crate::http::streamer::stream_id_de_l_url(&url) {
+            Some(sid) if self.streamer.session_alive(sid).await => {
+                super::SourceDesNiveaux::Prise(self.streamer.clone(), sid.to_string())
+            }
+            _ => super::SourceDesNiveaux::Url(url),
+        };
         spawn_proxy_levels_probe_task(
             self.playback.clone(),
             bus,
             zone_id,
-            url,
+            source,
             codec_hint,
             play_seq,
-        );
+        )
+        .await;
     }
 
     /// Serve prefetched PCM data as a WAV stream session.
@@ -4134,3 +4156,7 @@ impl Drop for EtapeDePreparation {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "sonde_niveaux_mandataire_9450_tests.rs"]
+mod sonde_niveaux_mandataire_9450_tests;

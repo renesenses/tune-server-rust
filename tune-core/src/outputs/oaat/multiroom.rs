@@ -397,6 +397,7 @@ impl OutputTarget for OaatMultiroomOutput {
 
             // Fetch audio stream
             let http_client = crate::http::client::builder()
+                .user_agent(crate::http::client::agent_interne("oaat-multiroom"))
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_default();

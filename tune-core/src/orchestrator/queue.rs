@@ -1449,7 +1449,23 @@ impl PlaybackOrchestrator {
                     "non_lance_source_sans_sonde"
                 },
             );
-            if advance_source != "local" && advance_source != "radio" {
+            // #9450 — la session adoptée est une session mandataire dont la
+            // prise a été garée à la préparation : la sonde lit ce que le
+            // renderer a tiré et tire encore, sans nouvelle connexion au CDN.
+            let garee = advance_stream_id
+                .as_deref()
+                .and_then(crate::http::prise_des_niveaux_9450::reprendre);
+            if let Some(lecteur) = garee {
+                spawn_proxy_levels_probe_task(
+                    self.playback.clone(),
+                    bus,
+                    zone_id,
+                    super::SourceDesNiveaux::Garee(lecteur),
+                    String::new(),
+                    play_seq,
+                )
+                .await;
+            } else if advance_source != "local" && advance_source != "radio" {
                 let services = self.services.clone();
                 let playback = self.playback.clone();
                 let db = self.db.clone();
@@ -1496,8 +1512,14 @@ impl PlaybackOrchestrator {
                         );
                     } else {
                         spawn_proxy_levels_probe_task(
-                            playback, bus, zone_id, data.url, codec, play_seq,
-                        );
+                            playback,
+                            bus,
+                            zone_id,
+                            super::SourceDesNiveaux::Url(data.url),
+                            codec,
+                            play_seq,
+                        )
+                        .await;
                     }
                 });
             }

@@ -1095,6 +1095,7 @@ impl OutputTarget for OaatOutput {
             let mut fin_jouee = super::fin_jouee_7330::FinJouee::default();
 
             let http_client = crate::http::client::builder()
+                .user_agent(crate::http::client::agent_interne("oaat"))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_default();

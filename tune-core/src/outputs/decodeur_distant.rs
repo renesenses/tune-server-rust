@@ -86,7 +86,7 @@ pub(crate) fn ouvrir_decodeur_distant(
                 match par_range {
                     Some(source) => (Box::new(source), depuis_s),
                     None => {
-                        let reponse = crate::http::client::blocking_builder()
+                        let reponse = crate::http::client::blocking_builder_pour(&url, "decodeur")
                             .timeout(None)
                             .connect_timeout(Duration::from_secs(10))
                             .build()

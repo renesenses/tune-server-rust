@@ -3206,8 +3206,10 @@ fn resumable_proxy_body(
     bilan: BilanDeConnexion,
     limite: Option<u64>,
 ) -> Body {
+    let compteur_du_flux = compteur.clone();
     let flux = async_stream::stream! {
         use futures_util::StreamExt;
+        let compteur = compteur_du_flux;
         // Le bilan ENTIER entre dans le flux : capturer seulement ses champs
         // `Copy` (capture disjointe) compterait sur une copie, et le bilan
         // serait écrit, vide, dès la réponse rendue.
@@ -3225,6 +3227,11 @@ fn resumable_proxy_body(
             loop {
                 match stream.next().await {
                     Some(Ok(chunk)) => {
+                        // #9450 — la sonde de niveaux lit ces octets-ci : elle
+                        // n'ouvre plus de seconde connexion amont.
+                        compteur
+                            .prise_des_niveaux
+                            .nourrir(pos, &chunk, compteur.longueur_amont());
                         pos += chunk.len() as u64;
                         if a_sauter > 0 {
                             let n = chunk.len() as u64;
@@ -6212,6 +6219,8 @@ mod conteneur_flac_neuf_8076;
 /// contrat fichier : Content-Length, Range, 416.
 #[cfg(test)]
 mod fichier_virtuel_6221;
+#[cfg(test)]
+mod mandataire_une_connexion_9450;
 #[cfg(test)]
 mod plages_avplayer_b209;
 

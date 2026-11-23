@@ -1075,6 +1075,31 @@ fn decode_http_stream_for_levels(
     levels_tx: tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
     reported_position_ms: std::sync::Arc<std::sync::atomic::AtomicI64>,
 ) -> Result<(), String> {
+    // Pas de timeout total : la connexion vit toute la piste (le débit est
+    // volontairement bridé au rythme de lecture, jamais idle assez longtemps
+    // pour un drop keep-alive CDN).
+    let response = crate::http::client::blocking_builder()
+        .user_agent(crate::http::client::agent_interne("niveaux"))
+        .timeout(None)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .build()
+        .and_then(|c| c.get(&url).send())
+        .map_err(|e| format!("levels probe fetch failed: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("levels probe HTTP error: {}", response.status()));
+    }
+    decode_source_for_levels(response, codec_hint, levels_tx, reported_position_ms)
+}
+
+/// Le décodage-pour-niveaux lui-même, sur une source déjà ouverte : la
+/// réponse HTTP de [`decode_http_stream_for_levels`], ou la prise d'une
+/// session mandataire (#9450, [`crate::http::prise_des_niveaux_9450`]).
+fn decode_source_for_levels<R: std::io::Read + Send + Sync + 'static>(
+    lecture: R,
+    codec_hint: String,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+    reported_position_ms: std::sync::Arc<std::sync::atomic::AtomicI64>,
+) -> Result<(), String> {
     use symphonia::core::audio::conv::IntoSample;
     use symphonia::core::codecs::CodecParameters;
     use symphonia::core::codecs::audio::AudioDecoderOptions;
@@ -1084,20 +1109,7 @@ fn decode_http_stream_for_levels(
     use symphonia::core::meta::MetadataOptions;
     use tracing::debug;
 
-    // Pas de timeout total : la connexion vit toute la piste (le débit est
-    // volontairement bridé au rythme de lecture, jamais idle assez longtemps
-    // pour un drop keep-alive CDN).
-    let response = crate::http::client::blocking_builder()
-        .timeout(None)
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .build()
-        .and_then(|c| c.get(&url).send())
-        .map_err(|e| format!("levels probe fetch failed: {e}"))?;
-    if !response.status().is_success() {
-        return Err(format!("levels probe HTTP error: {}", response.status()));
-    }
-
-    let source = ReadOnlySource::new(response);
+    let source = ReadOnlySource::new(lecture);
     let mss = MediaSourceStream::new(Box::new(source), Default::default());
     let mut hint = Hint::new();
     if !codec_hint.is_empty() {
@@ -1208,17 +1220,53 @@ fn decode_http_stream_for_levels(
 /// changé entre-temps, le forwarder adoptait la génération de la NOUVELLE
 /// piste et survivait au lieu de mourir, publiant le PCM de l'ancienne sur
 /// l'horloge de la nouvelle (#1110).
-fn spawn_proxy_levels_probe_task(
+/// D'où la sonde de niveaux tire ses octets.
+pub(crate) enum SourceDesNiveaux {
+    /// Une adresse à ouvrir (CDN d'un épisode, Bandcamp, avance gapless).
+    Url(String),
+    /// #9450 — une session mandataire de Tune : la sonde lit ce que le
+    /// renderer tire, sans ouvrir de connexion. Le lecteur est créé par la
+    /// tâche, avec l'arrêt sur le forwarder.
+    Prise(Arc<AudioStreamer>, String),
+    /// #9450 — la prise garée d'une session pré-armée, reprise à l'avance
+    /// sans blanc ([`crate::http::prise_des_niveaux_9450::garer`]).
+    Garee(crate::http::prise_des_niveaux_9450::LecteurDePrise),
+}
+
+async fn spawn_proxy_levels_probe_task(
     playback: Arc<PlaybackManager>,
     bus: Arc<EventBus>,
     zone_id: i64,
-    url: String,
+    source: SourceDesNiveaux,
     codec_hint: String,
     play_seq: u64,
 ) {
+    let (levels_tx, consomme_ms) =
+        spawn_paced_levels_forwarder_mesure(bus, playback.clone(), zone_id, play_seq, 0);
+    // #9450 — branchée ICI, avant le retour : l'appelant n'a pas encore rendu
+    // l'URL au renderer, ses premiers octets passent donc par la prise.
+    let prise = match source {
+        SourceDesNiveaux::Url(url) => Err(url),
+        SourceDesNiveaux::Garee(mut lecteur) => {
+            let tx = levels_tx.clone();
+            lecteur.poser_l_arret(Box::new(move || tx.is_closed()));
+            Ok(lecteur)
+        }
+        SourceDesNiveaux::Prise(streamer, stream_id) => {
+            let tx = levels_tx.clone();
+            match streamer
+                .brancher_la_prise_des_niveaux(&stream_id, Box::new(move || tx.is_closed()))
+                .await
+            {
+                Some(lecteur) => Ok(lecteur),
+                None => {
+                    debug!(zone_id, stream_id = %stream_id, "proxy_levels_probe_sans_session");
+                    return;
+                }
+            }
+        }
+    };
     tokio::spawn(async move {
-        let (levels_tx, consomme_ms) =
-            spawn_paced_levels_forwarder_mesure(bus, playback.clone(), zone_id, play_seq, 0);
         let reported = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
 
         let sampler_pos = reported.clone();
@@ -1241,8 +1289,9 @@ fn spawn_proxy_levels_probe_task(
             }
         });
 
-        let result = tokio::task::spawn_blocking(move || {
-            decode_http_stream_for_levels(url, codec_hint, levels_tx, reported)
+        let result = tokio::task::spawn_blocking(move || match prise {
+            Ok(lecteur) => decode_source_for_levels(lecteur, codec_hint, levels_tx, reported),
+            Err(url) => decode_http_stream_for_levels(url, codec_hint, levels_tx, reported),
         })
         .await;
         match result {

@@ -1309,9 +1309,12 @@ async fn copier_le_flux(
     ));
 
     let copie = async {
-        let mut reponse = crate::http::client::long_timeout()
-            .get(url)
-            .send()
+        let mut reponse = crate::http::client::marquer_si_flux_de_tune(
+            crate::http::client::long_timeout().get(url),
+            url,
+            "airplay2",
+        )
+        .send()
             .await
             .map_err(|e| crate::http::client::decrire_erreur_http(&e))?;
         let statut = reponse.status();
