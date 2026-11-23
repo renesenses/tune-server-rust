@@ -387,6 +387,56 @@ ordre et tous leurs réglages.
 - **Droits** : ils sont vérifiés au **chargement**. Un préréglage Premium reste
   enregistré sur un compte redevenu gratuit.
 
+### Routes (T17, `tune-server/src/routes/zones/tess_prereglages.rs`)
+
+- **Stockage** : un seul réglage global, `tess_presets` (la liste et
+  `apply_mode`), écrit après `verifier`. Absent : Pure seul, `immediately`.
+  Le préréglage actif d'une zone : `zone_{id}_tess_active_preset`.
+- **`GET /tess/presets`** → `presets`.
+- **`POST /tess/presets`** ← `{ "name", "zone_id" }` (chaîne ENREGISTRÉE de
+  la zone, neutre vis-à-vis du droit) ou `{ "name", "chain" }` (lue
+  strictement, forme vérifiée en 409, droits au chargement) → **201**, le
+  préréglage. Identifiant tiré du nom, rendu unique (`-2`, `-3`…) ; `pure`
+  reste réservé. Nom : 1 à 80 caractères, une ligne, sinon 400
+  `invalid_name`. Enregistré depuis une zone, il y devient « ACTIVE ». Les
+  champs tenus par le serveur (`origin`, `inert_on_network`,
+  `replaced_in_group`) ne sont pas gardés : ils sont recalculés au
+  chargement.
+- **`PATCH /tess/presets/{preset_id}`** ← `{ "name" }` : renomme, l'id ne
+  change pas. **`DELETE /tess/presets/{preset_id}`** → 204 (Pure compris) ;
+  les zones qui l'avaient chargé ne le marquent plus.
+- **`PUT /tess/apply-mode`** ← `{ "apply_mode": "immediately" | "at_next_playback" }`
+  → `presets` ; toute autre valeur : 400 `invalid_apply_mode`.
+- **`POST /zones/{id}/tess/presets/{preset_id}/apply`** : la chaîne du
+  préréglage passe par la voie du `PUT /zones/{id}/tess` (lecture stricte,
+  P2 inverse, origine D1, validation 409 puis **402 sur ce qui change** :
+  jamais un droit Premium offert), puis le préréglage devient « ACTIVE ».
+  Réponse : `{ "preset_id", "apply_mode", "not_applied": [ { "plugin_id",
+  "reason", "detail" } ], "zone": zone_response }`. `not_applied` liste les
+  greffons cochés du préréglage que la résolution n'applique pas sur cette
+  zone, avec le motif de l'étape (`outside_tess`, `stereo_only`,
+  `plugin_unavailable`…). Un refus garde la forme `refusal`.
+- Erreurs propres aux préréglages : `{ "error", "message", "preset_id" }`
+  (`preset_not_found` en 404, `invalid_name`, `invalid_body`,
+  `invalid_apply_mode` en 400).
+- **Préréglage actif et `PUT`** : un `PUT /zones/{id}/tess` dont la chaîne
+  écrite ne correspond plus au préréglage actif (comparée sans les champs du
+  serveur) efface `active_preset` ; renvoyée telle quelle, il reste.
+- **Mode d'application**, suivi par le `PUT` comme par le chargement :
+  - `immediately` : la sortie vivante est rafraîchie tout de suite (à chaud en
+    local ; relance du flux réseau à la position, #8422 : anti-rebond,
+    plancher et verrou de relance, donc une seule relance par rafale) ;
+  - `at_next_playback` (ou valeur inconnue) : les anciennes clés sont écrites
+    (le prochain flux réseau part avec), la sortie vivante n'est pas touchée ;
+    ce qui reste à rafraîchir sur une sortie locale l'est au prochain
+    démarrage de lecture de la zone (événement `started`). Sur une sortie
+    réseau, rien n'est relancé au démarrage : le flux vient d'être fabriqué
+    avec les nouvelles clés.
+- **Export / import** : `tess_presets` part avec les réglages globaux ; à
+  l'import, une liste illisible ou incohérente est écartée avec un
+  avertissement (celle de la machine reste). `zone_{id}_tess_active_preset`
+  voyage dans sa zone.
+
 ## 6. Zones (`tess::zones`, Q8)
 
 TESS s'applique partout où Tune **fabrique** le flux :
@@ -479,7 +529,8 @@ l'API : `error` (= `code`), `message` (= `detail`) et, sur un 402,
      zone, de la lecture à l'écriture.
   - Une chaîne enregistrée d'une version plus récente n'est pas réécrite :
     409 `unsupported_version`.
-- `active_preset` : lu sous `zone_{id}_tess_active_preset` (posé par T17).
+- `active_preset` : lu sous `zone_{id}_tess_active_preset` (posé par T17,
+  § 5 « Routes »). Le `PUT` suit le mode d'application (§ 5).
 
 ## 8. Engagements des lots suivants
 
