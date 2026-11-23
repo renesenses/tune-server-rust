@@ -538,11 +538,11 @@ impl CrossfeedConstraint {
                 "Le greffon crossfeed est indisponible. Réactivez-le dans les greffons ; vos réglages sont conservés."
             }
             Self::NonLocalOutput => {
-                "Le crossfeed est un effet de casque : il n'est appliqué que par \
-                 une sortie LOCALE (DAC USB ou carte son de la machine). Cette \
-                 zone ne joue pas par une sortie locale, le réglage est \
-                 enregistré mais n'atteint pas le son. Pour l'entendre, écoutez \
-                 sur une zone à sortie locale."
+                "Cette sortie reçoit le flux tel quel et le traite elle-même \
+                 (HQPlayer, Diretta et autres sorties hors TESS) : le crossfeed \
+                 n'y est pas appliqué. Le réglage est enregistré mais n'atteint \
+                 pas le son. Pour l'entendre, écoutez sur une zone où Tune \
+                 fabrique le flux (sortie locale, OAAT, AirPlay, DLNA…)."
             }
             Self::PureMode => {
                 "Le mode PURE garde le chemin bit-perfect : aucun traitement ne \
