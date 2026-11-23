@@ -1,0 +1,464 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Débloquer Tune</title>
+<style>
+:root {
+  --fond: #f4f7f6; --carte: #ffffff; --texte: #1c2321; --doux: #5b6b67;
+  --noir: #050a08; --vert: #26a69a; --vert-fonce: #1f6f66; --citron: #7cb342;
+  --cyan: #00bcd4; --lien: #0097a7; --rouge: #c62828; --ambre: #b26a00;
+  --bord: #dbe5e2;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --fond: #0b1210; --carte: #121c19; --texte: #e6efec; --doux: #9db0ab;
+    --lien: #4dd0e1; --bord: #24332f; --vert-fonce: #4db6ac; --rouge: #ef9a9a; --ambre: #ffcc80; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--fond); color: var(--texte);
+  font: 16px/1.55 "Helvetica Neue", Helvetica, Arial, sans-serif; }
+header { background: var(--noir); color: #fff; padding: 22px 16px 18px;
+  border-bottom: 5px solid transparent;
+  border-image: linear-gradient(90deg, #f2d43a, #7cb342 30%, #26a69a 65%, #00bcd4) 1; }
+header .in, main { max-width: 640px; margin: 0 auto; }
+header h1 { margin: 0; font-size: 24px; }
+header p { margin: 4px 0 0; color: var(--cyan); font-size: 14px; letter-spacing: .03em; }
+main { padding: 20px 16px 48px; }
+.carte { background: var(--carte); border: 1px solid var(--bord); border-radius: 10px; padding: 18px; margin-bottom: 16px; }
+h2 { font-size: 18px; margin: 0 0 10px; color: var(--vert-fonce); }
+p { margin: 8px 0; }
+.doux { color: var(--doux); font-size: 14px; }
+label { display: block; font-weight: 600; margin: 12px 0 4px; }
+input { width: 100%; font: inherit; padding: 10px 12px; border: 1px solid var(--bord); border-radius: 8px;
+  background: var(--fond); color: var(--texte); }
+input:focus { outline: 2px solid var(--cyan); border-color: transparent; }
+button { font: inherit; font-weight: 600; border: 0; border-radius: 8px; padding: 11px 18px; cursor: pointer;
+  background: var(--vert); color: #fff; margin-top: 14px; }
+button:hover { background: var(--vert-fonce); }
+button.second { background: transparent; color: var(--lien); border: 1px solid var(--bord); }
+button.danger { background: var(--ambre); }
+button:disabled { opacity: .5; cursor: default; }
+.liste { list-style: none; padding: 0; margin: 10px 0 0; }
+.liste button { width: 100%; text-align: left; margin: 6px 0 0; background: var(--fond); color: var(--texte);
+  border: 1px solid var(--bord); }
+.liste button:hover { border-color: var(--vert); background: var(--fond); }
+.liste small { color: var(--doux); font-weight: 400; display: block; }
+.etapes { list-style: none; padding: 0; margin: 8px 0; }
+.etapes li { padding: 6px 0 6px 30px; position: relative; color: var(--doux); }
+.etapes li::before { content: ""; position: absolute; left: 4px; top: 11px; width: 14px; height: 14px; border-radius: 50%;
+  border: 2px solid var(--bord); }
+.etapes li.fait { color: var(--texte); }
+.etapes li.fait::before { background: var(--citron); border-color: var(--citron); }
+.etapes li.encours { color: var(--texte); font-weight: 600; }
+.etapes li.encours::before { border-color: var(--cyan); border-top-color: transparent; animation: tour 1s linear infinite; }
+@keyframes tour { to { transform: rotate(360deg); } }
+.alerte { border-left: 4px solid var(--rouge); padding: 8px 12px; background: var(--fond); border-radius: 4px; }
+.info { border-left: 4px solid var(--cyan); padding: 8px 12px; background: var(--fond); border-radius: 4px; }
+.ok { border-left: 4px solid var(--citron); padding: 8px 12px; background: var(--fond); border-radius: 4px; }
+code { font: 14px Menlo, Consolas, monospace; background: var(--fond); padding: 1px 5px; border-radius: 4px; border: 1px solid var(--bord); }
+a { color: var(--lien); }
+.cache { display: none; }
+footer { max-width: 640px; margin: 0 auto; padding: 0 16px 24px; color: var(--doux); font-size: 13px; }
+</style>
+</head>
+<body>
+<header><div class="in"><h1 data-t="titre"></h1><p data-t="soustitre"></p></div></header>
+<main>
+  <!-- 1. Trouver le Tune -->
+  <section id="v-trouver" class="carte">
+    <h2 data-t="trouver_titre"></h2>
+    <p data-t="trouver_intro"></p>
+    <p id="recherche" class="doux" data-t="recherche"></p>
+    <ul id="trouves" class="liste"></ul>
+    <p id="aucun" class="doux cache" data-t="aucun"></p>
+    <button id="b-rechercher" class="second cache" data-t="rechercher"></button>
+    <label for="adresse" data-t="adresse_label"></label>
+    <input id="adresse" inputmode="url" autocomplete="off" spellcheck="false" placeholder="192.168.1.18">
+    <p class="doux" data-t="adresse_aide"></p>
+    <button id="b-adresse" data-t="continuer"></button>
+    <p id="err-trouver" class="alerte cache" role="alert"></p>
+  </section>
+
+  <!-- 2. État du Tune -->
+  <section id="v-etat" class="carte cache">
+    <h2 data-t="etat_titre"></h2>
+    <p id="etat-resume"></p>
+
+    <div id="f-nouveau" class="cache">
+      <p data-t="nouveau_intro"></p>
+      <p class="info" data-t="nouveau_identifiant"></p>
+      <label for="mdp1" data-t="mdp_nouveau"></label>
+      <input id="mdp1" type="password" autocomplete="new-password">
+      <label for="mdp2" data-t="mdp_confirmer"></label>
+      <input id="mdp2" type="password" autocomplete="new-password">
+      <p class="doux" data-t="mdp_regle"></p>
+      <button id="b-nouveau" data-t="activer_et_maj"></button>
+    </div>
+
+    <div id="f-existant" class="cache">
+      <p id="existant-intro"></p>
+      <label for="ident" data-t="identifiant"></label>
+      <input id="ident" value="default" autocomplete="username" spellcheck="false">
+      <label for="mdp0" data-t="mdp_actuel"></label>
+      <input id="mdp0" type="password" autocomplete="current-password">
+      <button id="b-existant" data-t="mettre_a_jour"></button>
+    </div>
+
+    <div id="f-recent" class="cache">
+      <p class="ok" data-t="recent"></p>
+      <p><a id="lien-fil" target="_blank" rel="noopener noreferrer" data-t="lien_fil"></a></p>
+    </div>
+
+    <div id="f-inconnue" class="cache"><p class="alerte" data-t="inconnue"></p></div>
+
+    <p id="err-etat" class="alerte cache" role="alert"></p>
+    <button id="b-autre" class="second" data-t="autre_tune"></button>
+  </section>
+
+  <!-- 3. Progression -->
+  <section id="v-progres" class="carte cache">
+    <h2 data-t="progres_titre"></h2>
+    <ul class="etapes">
+      <li id="e-connexion" data-t="e_connexion"></li>
+      <li id="e-auth" data-t="e_auth"></li>
+      <li id="e-demande" data-t="e_demande"></li>
+      <li id="e-installe"><span data-t="e_installe"></span> <span id="phase" class="doux"></span></li>
+      <li id="e-redemarre" data-t="e_redemarre"></li>
+      <li id="e-version" data-t="e_version"></li>
+    </ul>
+    <div id="f-lecture" class="cache">
+      <p class="info" data-t="lecture"></p>
+      <button id="b-lecture" class="danger" data-t="lecture_bouton"></button>
+    </div>
+    <div id="f-analyse" class="cache">
+      <p class="info" data-t="analyse"></p>
+      <button id="b-analyse" data-t="analyse_bouton"></button>
+    </div>
+    <p id="err-progres" class="alerte cache" role="alert"></p>
+    <button id="b-recommencer" class="second cache" data-t="recommencer"></button>
+  </section>
+
+  <!-- 4. Fin -->
+  <section id="v-fin" class="carte cache">
+    <h2 data-t="fin_titre"></h2>
+    <p class="ok" id="fin-texte"></p>
+    <p data-t="fin_connexion"></p>
+    <p class="info" data-t="fin_iphone"></p>
+    <p id="err-fin" class="alerte cache" role="alert"></p>
+    <p class="doux" data-t="fin_quitter"></p>
+    <button id="b-quitter" class="second" data-t="quitter"></button>
+  </section>
+</main>
+<footer data-t="pied"></footer>
+
+<script>
+"use strict";
+const FIL = "https://mozaiklabs.fr/forum/threads/rc13-mise-a-jour-bloquee-ou-actions-refusees-activez-lauthentification-update-blocked-turn-on-authentication-3eAFTN";
+const T = {
+fr: {
+  titre: "Débloquer Tune",
+  soustitre: "Mozaiklabs · mise à jour d’un serveur Tune OS",
+  trouver_titre: "1. Trouver votre Tune",
+  trouver_intro: "Cet outil active l’authentification de votre serveur Tune, puis lance sa mise à jour. Il ne parle qu’à votre Tune, sur votre réseau local : rien n’est envoyé ailleurs, rien n’est enregistré.",
+  recherche: "Recherche des serveurs Tune sur le réseau…",
+  aucun: "Aucun serveur Tune n’a répondu. Saisissez son adresse ci-dessous.",
+  rechercher: "Chercher à nouveau",
+  adresse_label: "Ou saisissez l’adresse de votre Tune",
+  adresse_aide: "L’adresse IP affichée par votre box ou dans l’app, par exemple 192.168.1.18.",
+  continuer: "Continuer",
+  etat_titre: "2. Votre Tune",
+  resume: "{nom} — version {version}",
+  nouveau_intro: "L’authentification de ce Tune est coupée : c’est ce qui bloque sa mise à jour. Choisissez un mot de passe pour l’activer.",
+  nouveau_identifiant: "Ce mot de passe servira ensuite à vous connecter à Tune avec l’identifiant default. Notez-le.",
+  mdp_nouveau: "Nouveau mot de passe",
+  mdp_confirmer: "Le même, une seconde fois",
+  mdp_regle: "8 caractères au moins.",
+  activer_et_maj: "Activer l’authentification et mettre à jour",
+  existant_actif: "L’authentification de ce Tune est déjà active. Saisissez le mot de passe du compte administrateur pour lancer la mise à jour.",
+  existant_requis: "Le compte default de ce Tune a déjà un mot de passe. Saisissez-le : il sera conservé, et servira à activer l’authentification.",
+  identifiant: "Identifiant",
+  mdp_actuel: "Mot de passe",
+  mettre_a_jour: "Mettre à jour",
+  recent: "Ce Tune a déjà une version récente (rc13 ou plus) : cet outil n’a rien à y faire. Si sa mise à jour est refusée, suivez le fil épinglé du forum.",
+  lien_fil: "Ouvrir le fil épinglé du forum",
+  inconnue: "La version de ce serveur n’a pas pu être reconnue : par prudence, cet outil ne fait rien. Écrivez-nous sur le forum.",
+  autre_tune: "Choisir un autre Tune",
+  progres_titre: "3. Mise à jour",
+  e_connexion: "Connexion au compte administrateur",
+  e_auth: "Authentification activée",
+  e_demande: "Mise à jour demandée",
+  e_installe: "Téléchargement et installation",
+  e_redemarre: "Redémarrage du serveur",
+  e_version: "Nouvelle version en marche",
+  lecture: "De la musique est en cours de lecture. La mise à jour l’arrêtera.",
+  lecture_bouton: "Arrêter la lecture et mettre à jour",
+  analyse: "Une analyse de la bibliothèque est en cours. Elle sera arrêtée proprement et reprendra après le redémarrage, sans repasser sur les fichiers déjà analysés.",
+  analyse_bouton: "Continuer la mise à jour",
+  recommencer: "Recommencer",
+  deja_a_jour: "Ce Tune était déjà à jour.",
+  fin_titre: "C’est fait",
+  fin_ok: "Votre Tune est passé en version {version}.",
+  fin_deja: "Votre Tune est à jour (version {version}).",
+  fin_connexion: "Connectez-vous désormais à Tune avec l’identifiant default et votre mot de passe.",
+  fin_iphone: "Attention : l’app iPhone ne se connecte pas tant que l’authentification est active.",
+  fin_quitter: "Vous pouvez fermer cette page : l’outil s’arrête tout seul.",
+  quitter: "Quitter",
+  pied: "Débloquer Tune · Mozaiklabs · aucune donnée collectée, aucun mot de passe enregistré.",
+  phase_downloading: "téléchargement…", phase_verifying: "vérification…", phase_extracting: "extraction…",
+  phase_installing: "installation…", phase_installing_bundle: "installation…", phase_restarting: "redémarrage…",
+  phase_restart_pending_playback: "en attente de la fin de la lecture…",
+  err: {
+    adresse_vide: "Saisissez l’adresse de votre Tune.",
+    adresse_invalide: "Cette adresse n’est pas valide.",
+    adresse_introuvable: "Cette adresse est introuvable sur le réseau.",
+    adresse_hors_reseau_local: "Cette adresse n’est pas sur votre réseau local : par sécurité, l’outil refuse.",
+    injoignable: "Le Tune ne répond pas à cette adresse. Vérifiez qu’il est allumé et sur le même réseau que cet ordinateur.",
+    pas_un_tune: "Un appareil répond à cette adresse, mais ce n’est pas un serveur Tune.",
+    mot_de_passe_trop_court: "Le mot de passe doit faire 8 caractères au moins.",
+    mots_de_passe_differents: "Les deux mots de passe ne sont pas identiques.",
+    mot_de_passe_vide: "Saisissez le mot de passe.",
+    mot_de_passe_incorrect: "Identifiant ou mot de passe incorrect.",
+    trop_de_tentatives: "Trop de tentatives : patientez quelques minutes, puis réessayez.",
+    pas_administrateur: "Ce compte n’est pas administrateur : rien n’a été modifié.",
+    connexion_refusee: "Le Tune a refusé la connexion.",
+    activation_refusee: "Le Tune a refusé d’activer l’authentification.",
+    activation_non_confirmee: "L’activation de l’authentification n’a pas pu être confirmée.",
+    version_recente: "Ce Tune a une version récente : l’outil ne fait rien.",
+    version_inconnue: "Version non reconnue : l’outil ne fait rien.",
+    installation_refusee: "Le Tune a refusé la mise à jour.",
+    installation_echouee: "La mise à jour a échoué.",
+    echec_phase: "La mise à jour a échoué pendant l’installation.",
+    delai: "Le Tune n’est pas revenu après 15 minutes. Attendez encore un peu, puis ouvrez Tune dans votre navigateur.",
+    reseau: "L’outil ne répond plus. Relancez Débloquer Tune.",
+    autre: "Erreur inattendue."
+  }
+},
+en: {
+  titre: "Unblock Tune",
+  soustitre: "Mozaiklabs · updating a Tune OS server",
+  trouver_titre: "1. Find your Tune",
+  trouver_intro: "This tool turns on authentication on your Tune server, then starts its update. It only talks to your Tune, on your local network: nothing is sent anywhere else, nothing is stored.",
+  recherche: "Looking for Tune servers on the network…",
+  aucun: "No Tune server answered. Type its address below.",
+  rechercher: "Search again",
+  adresse_label: "Or type your Tune’s address",
+  adresse_aide: "The IP address shown by your router or in the app, for example 192.168.1.18.",
+  continuer: "Continue",
+  etat_titre: "2. Your Tune",
+  resume: "{nom} — version {version}",
+  nouveau_intro: "Authentication is turned off on this Tune, and that is what blocks its update. Choose a password to turn it on.",
+  nouveau_identifiant: "You will then sign in to Tune with the username default and this password. Write it down.",
+  mdp_nouveau: "New password",
+  mdp_confirmer: "Same password again",
+  mdp_regle: "At least 8 characters.",
+  activer_et_maj: "Turn on authentication and update",
+  existant_actif: "Authentication is already on for this Tune. Enter the administrator password to start the update.",
+  existant_requis: "The default account on this Tune already has a password. Enter it: it is kept as is, and used to turn on authentication.",
+  identifiant: "Username",
+  mdp_actuel: "Password",
+  mettre_a_jour: "Update",
+  recent: "This Tune already runs a recent version (rc13 or later): this tool has nothing to do here. If its update is refused, follow the pinned forum thread.",
+  lien_fil: "Open the pinned forum thread",
+  inconnue: "This server’s version could not be recognised. To be safe, this tool does nothing. Please write to us on the forum.",
+  autre_tune: "Choose another Tune",
+  progres_titre: "3. Update",
+  e_connexion: "Signing in as administrator",
+  e_auth: "Authentication turned on",
+  e_demande: "Update requested",
+  e_installe: "Download and install",
+  e_redemarre: "Server restart",
+  e_version: "New version running",
+  lecture: "Music is playing. The update will stop it.",
+  lecture_bouton: "Stop playback and update",
+  analyse: "A library scan is running. It will be stopped cleanly and will resume after the restart, skipping the files already scanned.",
+  analyse_bouton: "Continue the update",
+  recommencer: "Start over",
+  deja_a_jour: "This Tune was already up to date.",
+  fin_titre: "Done",
+  fin_ok: "Your Tune now runs version {version}.",
+  fin_deja: "Your Tune is up to date (version {version}).",
+  fin_connexion: "From now on, sign in to Tune with the username default and your password.",
+  fin_iphone: "Note: the iPhone app does not connect while authentication is on.",
+  fin_quitter: "You can close this page: the tool stops by itself.",
+  quitter: "Quit",
+  pied: "Unblock Tune · Mozaiklabs · no data collected, no password stored.",
+  phase_downloading: "downloading…", phase_verifying: "verifying…", phase_extracting: "extracting…",
+  phase_installing: "installing…", phase_installing_bundle: "installing…", phase_restarting: "restarting…",
+  phase_restart_pending_playback: "waiting for playback to end…",
+  err: {
+    adresse_vide: "Type your Tune’s address.",
+    adresse_invalide: "This address is not valid.",
+    adresse_introuvable: "This address cannot be found on the network.",
+    adresse_hors_reseau_local: "This address is not on your local network: for safety, the tool refuses it.",
+    injoignable: "Tune does not answer at this address. Check that it is on, and on the same network as this computer.",
+    pas_un_tune: "A device answers at this address, but it is not a Tune server.",
+    mot_de_passe_trop_court: "The password must be at least 8 characters long.",
+    mots_de_passe_differents: "The two passwords do not match.",
+    mot_de_passe_vide: "Enter the password.",
+    mot_de_passe_incorrect: "Wrong username or password.",
+    trop_de_tentatives: "Too many attempts: wait a few minutes, then try again.",
+    pas_administrateur: "This account is not an administrator: nothing was changed.",
+    connexion_refusee: "Tune refused the sign-in.",
+    activation_refusee: "Tune refused to turn on authentication.",
+    activation_non_confirmee: "Turning on authentication could not be confirmed.",
+    version_recente: "This Tune runs a recent version: the tool does nothing.",
+    version_inconnue: "Unrecognised version: the tool does nothing.",
+    installation_refusee: "Tune refused the update.",
+    installation_echouee: "The update failed.",
+    echec_phase: "The update failed during installation.",
+    delai: "Tune has not come back after 15 minutes. Wait a little longer, then open Tune in your browser.",
+    reseau: "The tool no longer answers. Start Unblock Tune again.",
+    autre: "Unexpected error."
+  }
+}
+};
+const L = (navigator.language || "en").toLowerCase().startsWith("fr") ? "fr" : "en";
+document.documentElement.lang = L;
+const t = (k, v) => { let s = T[L][k] || k; for (const n in (v || {})) s = s.replace("{" + n + "}", v[n]); return s; };
+const $ = (id) => document.getElementById(id);
+document.querySelectorAll("[data-t]").forEach((e) => { e.textContent = t(e.dataset.t); });
+document.title = t("titre");
+$("lien-fil").href = FIL;
+
+const BASE = location.pathname; // /s/<jeton>/
+async function api(action, corps) {
+  try {
+    const r = await fetch(BASE + "api/" + action, {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(corps || {})
+    });
+    if (!r.ok) return { ok: false, erreur: { code: "reseau" } };
+    return await r.json();
+  } catch (_) { return { ok: false, erreur: { code: "reseau" } }; }
+}
+function texteErreur(e) {
+  const m = T[L].err[e && e.code] || T[L].err.autre;
+  return e && e.detail ? m + " (" + e.detail + ")" : m;
+}
+function montrerErreur(id, e) { const p = $(id); p.textContent = texteErreur(e); p.classList.remove("cache"); }
+function cacher(...ids) { ids.forEach((i) => $(i).classList.add("cache")); }
+function montrer(...ids) { ids.forEach((i) => $(i).classList.remove("cache")); }
+function vue(id) { cacher("v-trouver", "v-etat", "v-progres", "v-fin"); montrer(id); window.scrollTo(0, 0); }
+
+setInterval(() => { api("presence"); }, 30000);
+
+// ---- 1. Trouver ----
+let tune = null; // {base, nom, version, etat}
+let mdp = "", ident = "default";
+async function rechercher() {
+  $("trouves").innerHTML = ""; montrer("recherche"); cacher("aucun", "b-rechercher");
+  const r = await api("decouvrir");
+  cacher("recherche"); montrer("b-rechercher");
+  const liste = (r.ok && r.trouves) || [];
+  if (!liste.length) { montrer("aucun"); return; }
+  for (const s of liste) {
+    const li = document.createElement("li"), b = document.createElement("button"), sm = document.createElement("small");
+    b.textContent = s.nom; sm.textContent = s.base.replace("http://", "") + (s.version ? " · " + s.version : "");
+    b.appendChild(sm); b.onclick = () => diagnostiquer(s.base, s.nom); li.appendChild(b); $("trouves").appendChild(li);
+  }
+}
+async function diagnostiquer(adresse, nom) {
+  cacher("err-trouver");
+  const r = await api("diagnostiquer", { adresse });
+  if (!r.ok) { vue("v-trouver"); montrerErreur("err-trouver", r.erreur); return; }
+  const d = r.diagnostic;
+  tune = { base: d.base, nom: nom || d.base.replace("http://", ""), version: d.version, etat: d.etat };
+  afficherEtat(d.etat);
+}
+$("b-rechercher").onclick = rechercher;
+$("b-adresse").onclick = () => diagnostiquer($("adresse").value.trim());
+$("adresse").addEventListener("keydown", (e) => { if (e.key === "Enter") $("b-adresse").click(); });
+
+// ---- 2. État ----
+function afficherEtat(etat, existantRequis) {
+  vue("v-etat");
+  $("etat-resume").textContent = t("resume", { nom: tune.nom, version: tune.version });
+  cacher("f-nouveau", "f-existant", "f-recent", "f-inconnue", "err-etat");
+  if (etat === "a_debloquer" && !existantRequis) { montrer("f-nouveau"); $("mdp1").focus(); }
+  else if (etat === "a_debloquer" || etat === "auth_active") {
+    $("existant-intro").textContent = t(existantRequis ? "existant_requis" : "existant_actif");
+    $("ident").disabled = !!existantRequis; if (existantRequis) $("ident").value = "default";
+    montrer("f-existant"); $("mdp0").focus();
+  }
+  else if (etat === "recent") montrer("f-recent");
+  else montrer("f-inconnue");
+}
+$("b-autre").onclick = () => { tune = null; vue("v-trouver"); };
+$("b-nouveau").onclick = () => {
+  const a = $("mdp1").value, b = $("mdp2").value;
+  cacher("err-etat");
+  if ([...a].length < 8) return montrerErreur("err-etat", { code: "mot_de_passe_trop_court" });
+  if (a !== b) return montrerErreur("err-etat", { code: "mots_de_passe_differents" });
+  mdp = a; ident = "default"; lancer(true, false);
+};
+$("b-existant").onclick = () => {
+  cacher("err-etat");
+  if (!$("mdp0").value) return montrerErreur("err-etat", { code: "mot_de_passe_vide" });
+  mdp = $("mdp0").value; ident = $("ident").value.trim() || "default"; lancer(false, false);
+};
+
+// ---- 3. Progression ----
+function etape(id, classe) { const e = $(id); e.classList.remove("fait", "encours"); if (classe) e.classList.add(classe); }
+function remettreEtapes() { ["e-connexion", "e-auth", "e-demande", "e-installe", "e-redemarre", "e-version"].forEach((i) => etape(i)); $("phase").textContent = ""; }
+async function lancer(nouveau, force) {
+  const avecAuth = tune.etat === "a_debloquer";
+  if (!force) { remettreEtapes(); $("e-auth").classList.toggle("cache", !avecAuth); }
+  vue("v-progres"); cacher("f-lecture", "f-analyse", "err-progres", "b-recommencer");
+  etape("e-connexion", "encours");
+  const r = await api("debloquer", { base: tune.base, identifiant: ident, mot_de_passe: mdp, nouveau, force });
+  if (!r.ok) {
+    const c = r.erreur && r.erreur.code;
+    if (c === "mot_de_passe_existant_requis") { afficherEtat("a_debloquer", true); return; }
+    if (["mot_de_passe_incorrect", "mot_de_passe_trop_court", "mot_de_passe_vide", "trop_de_tentatives", "pas_administrateur"].includes(c)) {
+      afficherEtat(tune.etat, tune.etat === "a_debloquer" && !nouveau); montrerErreur("err-etat", r.erreur); return;
+    }
+    etape("e-connexion"); montrerErreur("err-progres", r.erreur); montrer("b-recommencer"); return;
+  }
+  const res = r.resultat;
+  for (const [s, id] of [["connexion", "e-connexion"], ["authentification_activee", "e-auth"], ["mise_a_jour_demandee", "e-demande"]])
+    if (res.etapes.includes(s)) etape(id, "fait");
+  // Désormais, l'authentification est active : une relance passe par la connexion.
+  tune.etat = "auth_active";
+  if (res.issue === "lecture_en_cours") { montrer("f-lecture"); return; }
+  if (res.issue === "analyse_en_cours") { montrer("f-analyse"); return; }
+  if (res.issue === "deja_a_jour") { fin(tune.version, true); return; }
+  suivre(res.version_depart);
+}
+$("b-lecture").onclick = () => lancer(false, true);
+$("b-analyse").onclick = () => lancer(false, true);
+$("b-recommencer").onclick = () => { if (tune) afficherEtat(tune.etat); else vue("v-trouver"); };
+
+async function suivre(depart) {
+  etape("e-installe", "encours");
+  const debut = Date.now();
+  let aDisparu = false;
+  for (;;) {
+    await new Promise((ok) => setTimeout(ok, 2500));
+    if (Date.now() - debut > 15 * 60 * 1000) { montrerErreur("err-progres", { code: "delai" }); montrer("b-recommencer"); return; }
+    const r = await api("suivre", { base: tune.base });
+    if (!r.ok) { montrerErreur("err-progres", r.erreur); return; }
+    const s = r.suivi;
+    if (!s.joignable) { aDisparu = true; etape("e-installe", "fait"); etape("e-redemarre", "encours"); $("phase").textContent = ""; continue; }
+    if (s.echec) { etape("e-installe"); montrerErreur("err-progres", { code: "echec_phase", detail: s.echec }); montrer("b-recommencer"); return; }
+    if (s.version && s.version !== depart) {
+      etape("e-installe", "fait"); etape("e-redemarre", "fait"); etape("e-version", "fait");
+      fin(s.version, false); return;
+    }
+    if (s.phase) $("phase").textContent = t("phase_" + s.phase) === "phase_" + s.phase ? s.phase : t("phase_" + s.phase);
+    if (s.phase === "restarting") { etape("e-installe", "fait"); etape("e-redemarre", "encours"); }
+    if (aDisparu && !s.en_cours) { etape("e-redemarre", "fait"); etape("e-version", "encours"); }
+  }
+}
+
+// ---- 4. Fin ----
+function fin(version, deja) {
+  vue("v-fin");
+  $("fin-texte").textContent = t(deja ? "fin_deja" : "fin_ok", { version });
+  mdp = ""; $("mdp0").value = ""; $("mdp1").value = ""; $("mdp2").value = "";
+}
+$("b-quitter").onclick = async () => { await api("quitter"); window.close(); document.body.innerHTML = ""; };
+
+rechercher();
+</script>
+</body>
+</html>
