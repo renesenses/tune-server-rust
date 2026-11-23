@@ -999,6 +999,54 @@ async fn une_deliaison_venue_d_un_autre_site_est_refusee() {
     }
 }
 
+// ─── Relecture A : la règle suit la ronde, pas seulement le retour ──────────
+
+/// 20. Autorisation lancée du réseau local, retour REJOUÉ sur cette machine
+/// (lien ou image ouverts sur le serveur, qui y portent le `code` et le
+/// `state`) avec un AUTRE compte : 403 `account_already_linked`, rien n'est
+/// écrit. La marque de la ronde est effacée avec l'attente.
+#[tokio::test]
+async fn un_retour_rejoue_sur_cette_machine_garde_la_regle_du_reseau_local() {
+    let b = banc();
+    let base = super::cloud_garde_compte_tests::faux_mozaiklabs("tiers@exemple.test").await;
+    let r = reglages(&b.state);
+    r.set("mozaik_base_url", &base).unwrap();
+    relier_le_proprietaire(&b.state);
+
+    let (statut, page) = get(&b.state, LAN, AUTORISER, &[HOTE]).await;
+    assert_eq!(statut, StatusCode::TEMPORARY_REDIRECT, "{page}");
+    let etat = json_de(&attente_du_serveur(&b.state))["state"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let ici = [("host", "127.0.0.1:8888")];
+    let (statut, page) = get(
+        &b.state,
+        ICI,
+        &format!("/api/v1/cloud/sso/callback?code=c&state={etat}"),
+        &ici,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::FORBIDDEN, "retour rejoué — {page}");
+    assert_eq!(courriel_relie(&b.state), "proprio@exemple.test");
+    assert_eq!(
+        r.get("mozaik_access_token").unwrap().as_deref(),
+        Some("jeton-du-proprietaire")
+    );
+    assert!(
+        r.get("mozaik_pkce_pending_lan").unwrap().is_none(),
+        "marque effacée avec l'attente"
+    );
+
+    // Témoin : une ronde LANCÉE de cette machine y remplace toujours le
+    // compte, même après une ronde du réseau local restée en plan.
+    let (statut, _) = get(&b.state, LAN, AUTORISER, &[HOTE]).await;
+    assert_eq!(statut, StatusCode::TEMPORARY_REDIRECT);
+    let (statut, page) = ronde(&b.state, ICI, &ici).await;
+    assert_eq!(statut, StatusCode::TEMPORARY_REDIRECT, "machine — {page}");
+    assert_eq!(courriel_relie(&b.state), "tiers@exemple.test");
+}
+
 /// Les phrases du refus de liaison existent dans les seize langues.
 #[test]
 fn les_phrases_du_refus_de_liaison_existent_dans_les_seize_langues() {
