@@ -538,11 +538,13 @@ impl CrossfeedConstraint {
                 "Le greffon crossfeed est indisponible. Réactivez-le dans les greffons ; vos réglages sont conservés."
             }
             Self::NonLocalOutput => {
-                "Cette sortie reçoit le flux tel quel et le traite elle-même \
-                 (HQPlayer et les autres sorties hors TESS) : le crossfeed \
-                 n'y est pas appliqué. Le réglage est enregistré mais n'atteint \
-                 pas le son. Pour l'entendre, écoutez sur une zone où Tune \
-                 fabrique le flux (sortie locale, OAAT, AirPlay, DLNA…)."
+                "Cette sortie lit elle-même le fichier de la piste (HQPlayer et \
+                 les autres sorties hors TESS) : le crossfeed seul n'y est pas \
+                 appliqué. Il ne s'y entend que lorsqu'un égaliseur, une \
+                 correction de pièce ou un ReplayGain actif fait passer la \
+                 piste par le flux traité de Tune. Pour l'entendre toujours, \
+                 écoutez sur une zone où Tune fabrique le flux (sortie locale, \
+                 OAAT, AirPlay, DLNA…)."
             }
             Self::PureMode => {
                 "Le mode PURE garde le chemin bit-perfect : aucun traitement ne \
