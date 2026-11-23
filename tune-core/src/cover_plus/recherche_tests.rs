@@ -753,3 +753,68 @@ async fn une_page_d_artiste_changee_rend_le_logo() {
         None
     );
 }
+
+/// La fenêtre propre à Cover+ : `plafond` appels sur la durée, puis
+/// l'attente jusqu'à ce que le plus ancien sorte.
+#[test]
+fn la_fenetre_borne_les_appels_par_minute() {
+    const { assert!(PLAFOND_PAR_MINUTE < 20) };
+    let f = Fenetre::new(3, Duration::from_secs(60));
+    let t0 = std::time::Instant::now();
+    for _ in 0..3 {
+        assert_eq!(f.essayer(t0), Ok(()));
+    }
+    let attente = f.essayer(t0 + Duration::from_secs(10)).unwrap_err();
+    assert_eq!(attente, Duration::from_secs(50));
+    assert_eq!(f.essayer(t0 + Duration::from_secs(60)), Ok(()));
+}
+
+/// Un incident (service en panne) n'est retenu qu'un temps : la chaîne est
+/// retentée une fois l'échéance passée. Une non-concordance, elle, l'est
+/// pour toujours.
+#[tokio::test]
+async fn un_incident_est_retenu_un_temps_seulement() {
+    let app = axum::Router::new().route(
+        "/search",
+        axum::routing::get(|| async { axum::http::StatusCode::SERVICE_UNAVAILABLE }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let prep = preparer("Air - Playground Love 8452", "Radio 8452 panne");
+    let (t, incident) =
+        chercher_et_compter(source(&base), &prep, "FR", "Radio 8452 panne", true).await;
+    assert_eq!(t, None);
+    assert!(incident, "un 503 est un incident");
+
+    let (base_vide, _) = faux_itunes(|_, _| Vec::new()).await;
+    let (t, incident) =
+        chercher_et_compter(source(&base_vide), &prep, "FR", "Radio 8452 panne", false).await;
+    assert_eq!(t, None);
+    assert!(!incident, "une réponse vide est une non-concordance");
+
+    // Dans le cache : l'incident expire, la non-concordance non.
+    let cle = "test-8452-incident".to_string();
+    retenir_titre(cle.clone(), None, true);
+    let r = cache().titres.get(&cle).cloned().unwrap();
+    assert!(r.jusqu_a.is_some_and(|t| t > Instant::now()));
+    let cle2 = "test-8452-non-concordance".to_string();
+    retenir_titre(cle2.clone(), None, false);
+    assert!(cache().titres.get(&cle2).unwrap().jusqu_a.is_none());
+}
+
+/// Le budget d'une phase : épuisé, plus aucun appel ne part.
+#[tokio::test]
+async fn le_budget_epuise_ne_laisse_plus_rien_partir() {
+    let (base, journal) = faux_itunes(|_, _| Vec::new()).await;
+    let src = source(&base);
+    let ((), incident) = avec_budget(2, async move {
+        for i in 0..5 {
+            let terme = format!("x{i}");
+            let _ = appeler(src, "/search", &[("term", terme.as_str())]).await;
+        }
+    })
+    .await;
+    assert_eq!(recherches(&journal).len(), 2);
+    assert!(!incident, "le budget n'est pas un incident");
+}

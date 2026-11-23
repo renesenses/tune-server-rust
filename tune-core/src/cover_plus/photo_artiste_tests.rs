@@ -69,3 +69,24 @@ fn la_balise_og_image_lue_avec_tolerance() {
     let enorme = "<div>".repeat(200_000);
     assert_eq!(og_image(&enorme), None);
 }
+
+/// Des pages méconnaissables d'affilée suspendent le repli quelques heures ;
+/// une page reconnue remet le compte à zéro.
+#[test]
+fn des_pages_meconnaissables_suspendent_le_repli() {
+    let t0 = std::time::Instant::now();
+    let mut s = Sante::new();
+    for _ in 0..ECHECS_AVANT_SUSPENSION - 1 {
+        s.constater(false, t0);
+    }
+    assert!(!s.suspendu(t0));
+    s.constater(true, t0);
+    for _ in 0..ECHECS_AVANT_SUSPENSION - 1 {
+        s.constater(false, t0);
+    }
+    assert!(!s.suspendu(t0), "une page reconnue remet le compte à zéro");
+    s.constater(false, t0);
+    assert!(s.suspendu(t0));
+    assert!(s.suspendu(t0 + SUSPENSION - std::time::Duration::from_secs(1)));
+    assert!(!s.suspendu(t0 + SUSPENSION), "la suspension a une fin");
+}

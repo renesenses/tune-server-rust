@@ -8,7 +8,7 @@
 //! Corps : `{"enabled": bool}`, dans les deux sens.
 //!
 //! Et l'interrupteur du serveur, `GET` et `PUT /radios/cover-plus` : Cover+
-//! est livré ÉTEINT (`enabled: false`) ; `artist_photo` coupe le seul repli
+//! est allumé par défaut depuis la rc14 (`enabled: true`) ; `artist_photo` coupe le seul repli
 //! « photo de l'artiste », qui lit une page web d'Apple et non une API. Corps
 //! `{"enabled": bool?, "artist_photo": bool?}` ; la réponse rend les deux.
 //! Une erreur de base rend un 500 sans texte (journalisé côté serveur) : il

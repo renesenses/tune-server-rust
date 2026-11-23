@@ -1,8 +1,9 @@
 //! Cover+ (#8452) — la pochette du titre en cours d'une webradio qui n'en
 //! publie pas, retrouvée d'après sa métadonnée ICY et l'API iTunes Search.
 //!
-//! Proposition de radio-metadata.fr du 11/11/2026, retenue par Bertrand pour
-//! la rc13. Spécification et code de référence :
+//! Proposition de Rémi (radio-metadata.fr) du 11/11/2026 ; entrée dans la
+//! rc14 en version complète, repli « photo de l'artiste » compris (accord de
+//! Bertrand du 23/11/2026). Spécification et code de référence :
 //! `cover-plus-specification.md`, `pretraitement.py`, `itunes_choix.py`,
 //! `photo_artiste.py`. Ce module en est le portage en Rust ; aucun Python
 //! n'est livré.
@@ -25,26 +26,40 @@
 //!
 //! iTunes tolère environ 20 appels par minute et par adresse IP. Le serveur
 //! Tune tourne chez l'auditeur : ses appels partent donc de SON adresse,
-//! jamais d'un service central (§ 3.1). Ils passent par le limiteur iTunes
-//! PARTAGÉ du serveur ([`crate::library::images_rapides::Hote::Itunes`], un
-//! appel toutes les 3 s, soit 20 par minute), le même que la passe des
-//! pochettes de la bibliothèque : les deux ensemble ne dépassent pas le
-//! plafond. Le client HTTP est le client partagé, jamais un client propre.
+//! jamais d'un service central (§ 3.1). Trois bornes s'empilent :
+//! - le limiteur iTunes PARTAGÉ du serveur
+//!   ([`crate::library::images_rapides::Hote::Itunes`], un appel toutes les
+//!   3 s), le même que la passe des pochettes de la bibliothèque : les deux
+//!   ensemble ne dépassent pas 20 appels par minute ;
+//! - une fenêtre propre à Cover+ : [`PLAFOND_PAR_MINUTE`] appels sur 60 s
+//!   glissantes, pour laisser de la place à la bibliothèque ;
+//! - un budget par changement de titre : [`BUDGET_POCHETTE`] appels pour la
+//!   pochette, [`BUDGET_PHOTO`] pour le repli « photo », jamais plus.
+//!
+//! Chaque appel a un délai court ([`DELAI_APPEL`]) et la recherche entière un
+//! délai d'ensemble ([`DELAI_RECHERCHE`]). Un échec est silencieux (journal
+//! `debug` seulement) : le logo reste affiché, la lecture n'attend rien.
+//! Seuls l'artiste, le titre et la boutique partent chez Apple, avec un
+//! User-Agent générique ([`AGENT_API`]) : aucune donnée de l'auditeur.
 //!
 //! ## Le repli « photo de l'artiste »
 //!
 //! Sans pochette concordante, Cover+ cherche une photo de l'artiste (§ 3.6,
 //! [`photo_artiste`]). Elle se lit dans la balise `og:image` d'une page web de
 //! music.apple.com, PAS dans une API : si Apple change sa page, ce repli cesse
-//! de fonctionner sans prévenir. Il a donc son propre interrupteur
+//! de fonctionner sans prévenir. Une page méconnaissable rend le logo de la
+//! station, sans panique ni nouvel essai en boucle ; après plusieurs pages
+//! méconnaissables d'affilée, le repli se suspend de lui-même quelques
+//! heures (voir [`photo_artiste`]). Il a aussi son propre interrupteur
 //! ([`photo_artiste_active`]), qu'on coupe sans toucher au reste.
 //!
-//! ## Livré éteint
+//! ## Réglages
 //!
-//! Cover+ part éteint ([`actif_globalement`]) : réglage `cover_plus.actif`
-//! (route `PUT /radios/cover-plus`), ou variable d'environnement
-//! `TUNE_COVER_PLUS=1`. Une fois allumé, chaque station de « Mes radios » l'a
-//! par défaut, et peut le couper (`PUT /radios/{id}/cover-plus`).
+//! Cover+ est allumé par défaut ([`actif_globalement`]) : réglage
+//! `cover_plus.actif` (route `PUT /radios/cover-plus`), ou variable
+//! d'environnement `TUNE_COVER_PLUS=0` pour l'éteindre sur tout le serveur.
+//! Chaque station de « Mes radios » l'a par défaut (case cochée), et peut le
+//! couper (`PUT /radios/{id}/cover-plus`).
 
 pub mod choix;
 pub mod photo_artiste;
@@ -52,7 +67,9 @@ pub mod pretraitement;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::hash::Hash;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 use tracing::debug;
@@ -72,6 +89,25 @@ const CACHE_TITRES_MAX: usize = 4096;
 const CACHE_DISQUES_MAX: usize = 512;
 const CACHE_PHOTOS_MAX: usize = 1024;
 const CACHE_ORDRES_MAX: usize = 1024;
+
+/// Délai d'un appel (iTunes ou page d'artiste), réponse lue comprise.
+pub const DELAI_APPEL: Duration = Duration::from_secs(6);
+/// Délai de la recherche entière d'un titre, attente du limiteur comprise :
+/// au-delà, le titre a sans doute changé ; on garde le logo.
+pub const DELAI_RECHERCHE: Duration = Duration::from_secs(90);
+/// Appels au plus pour la pochette d'un titre (§ 3.2, étapes 1 à 4).
+pub const BUDGET_POCHETTE: u32 = 4;
+/// Appels au plus pour le repli « photo de l'artiste » (§ 3.6).
+pub const BUDGET_PHOTO: u32 = 3;
+/// Appels Cover+ au plus sur 60 s glissantes, sous les 20 d'Apple.
+pub const PLAFOND_PAR_MINUTE: usize = 15;
+/// Une recherche tombée sur un incident (réseau, délai, refus d'Apple) est
+/// retenue ce temps-là, puis retentée une fois si le titre repasse : jamais
+/// de boucle, et une panne passagère ne condamne pas un titre pour toujours.
+pub const INCIDENT_RETENU: Duration = Duration::from_secs(30 * 60);
+/// L'agent des appels à l'API : générique, rien qui désigne l'auditeur ni
+/// sa machine.
+pub const AGENT_API: &str = "Mozilla/5.0 (compatible; Tune)";
 
 // ---------------------------------------------------------------------------
 // Réglages
@@ -113,9 +149,9 @@ fn poser(db: &Arc<dyn DbBackend>, cle: &str, valeur: bool) -> Result<(), String>
     SettingsRepo::with_backend(db.clone()).set(cle, if valeur { "1" } else { "0" })
 }
 
-/// Cover+ est-il allumé sur ce serveur ? Éteint par défaut (livré éteint).
+/// Cover+ est-il allumé sur ce serveur ? Allumé par défaut (rc14).
 pub fn actif_globalement(db: &Arc<dyn DbBackend>) -> bool {
-    interrupteur(db, CLE_ACTIF, ENV_ACTIF, false)
+    interrupteur(db, CLE_ACTIF, ENV_ACTIF, true)
 }
 
 /// Allumer ou éteindre Cover+ sur ce serveur.
@@ -266,9 +302,18 @@ impl<K: Eq + Hash + Clone, V> Borne<K, V> {
     }
 }
 
+/// Ce que le cache retient d'une chaîne ICY.
+#[derive(Clone)]
+struct Retenu {
+    /// La trouvaille, ou `None` : non-concordance (retenue pour toujours) ou
+    /// incident (retenu jusqu'à `jusqu_a`).
+    trouvaille: Option<Trouvaille>,
+    jusqu_a: Option<Instant>,
+}
+
 struct Cache {
-    /// Chaque chaîne ICY vue : sa trouvaille, ou `None` (échec retenu).
-    titres: Borne<String, Option<Trouvaille>>,
+    /// Chaque chaîne ICY vue : sa trouvaille, ou son échec.
+    titres: Borne<String, Retenu>,
     en_cours: HashSet<String>,
     /// Discographie d'un artiste, par boutique (§ 3.2, étape 4).
     disques: Borne<(i64, String), Disques>,
@@ -297,10 +342,20 @@ fn cle_de_cache(boutique: &str, station: &str, chaine: &str) -> String {
     format!("{boutique}\u{1f}{}\u{1f}{chaine}", norme(station))
 }
 
-fn retenir_titre(cle: String, trouvaille: Option<Trouvaille>) {
+/// Retenir le résultat d'une recherche. `incident` : la recherche n'a pas
+/// pu aller au bout (réseau, délai, refus) ; l'échec n'est alors retenu que
+/// [`INCIDENT_RETENU`].
+fn retenir_titre(cle: String, trouvaille: Option<Trouvaille>, incident: bool) {
+    let jusqu_a = (trouvaille.is_none() && incident).then(|| Instant::now() + INCIDENT_RETENU);
     let mut c = cache();
     c.en_cours.remove(&cle);
-    c.titres.insert(cle, trouvaille);
+    c.titres.insert(
+        cle,
+        Retenu {
+            trouvaille,
+            jusqu_a,
+        },
+    );
 }
 
 /// Noter qu'une hypothèse a concordé sur cette station : 0 pour « artiste -
@@ -353,25 +408,139 @@ impl Source<'static> {
     };
 }
 
-/// Une requête `GET`, par le limiteur iTunes partagé quand la source le
-/// demande. La réponse si elle est un succès, `None` sinon.
+/// Le compte des appels d'une phase de recherche : ce qui reste du budget,
+/// et si un incident (réseau, délai, refus) l'a interrompue.
+#[derive(Debug)]
+pub(crate) struct Compte {
+    reste: AtomicU32,
+    incident: AtomicBool,
+}
+
+impl Compte {
+    pub(crate) fn new(budget: u32) -> Arc<Self> {
+        Arc::new(Self {
+            reste: AtomicU32::new(budget),
+            incident: AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) fn incident(&self) -> bool {
+        self.incident.load(Ordering::Relaxed)
+    }
+}
+
+tokio::task_local! {
+    static COMPTE: Arc<Compte>;
+}
+
+/// Prendre un appel sur le budget de la phase en cours. Hors d'une phase
+/// (appel direct d'une épreuve), rien n'est compté.
+fn prendre_un_appel() -> bool {
+    COMPTE
+        .try_with(|c| {
+            let mut r = c.reste.load(Ordering::Relaxed);
+            loop {
+                let Some(apres) = r.checked_sub(1) else {
+                    return false;
+                };
+                match c.reste.compare_exchange_weak(
+                    r,
+                    apres,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                ) {
+                    Ok(_) => return true,
+                    Err(vu) => r = vu,
+                }
+            }
+        })
+        .unwrap_or(true)
+}
+
+fn noter_incident() {
+    let _ = COMPTE.try_with(|c| c.incident.store(true, Ordering::Relaxed));
+}
+
+/// Mener `phase` avec un budget de `budget` appels. Rend son résultat et
+/// le compte (incident ou non).
+async fn avec_budget<T>(budget: u32, phase: impl std::future::Future<Output = T>) -> (T, bool) {
+    let compte = Compte::new(budget);
+    let r = COMPTE.scope(compte.clone(), phase).await;
+    (r, compte.incident())
+}
+
+/// Une fenêtre glissante : `plafond` passages au plus par `duree`.
+pub(crate) struct Fenetre {
+    passages: Mutex<VecDeque<Instant>>,
+    plafond: usize,
+    duree: Duration,
+}
+
+impl Fenetre {
+    pub(crate) const fn new(plafond: usize, duree: Duration) -> Self {
+        Self {
+            passages: Mutex::new(VecDeque::new()),
+            plafond,
+            duree,
+        }
+    }
+
+    /// Passer à l'instant `maintenant`, ou le temps à attendre.
+    pub(crate) fn essayer(&self, maintenant: Instant) -> Result<(), Duration> {
+        let mut p = self.passages.lock().unwrap_or_else(|e| e.into_inner());
+        while p
+            .front()
+            .is_some_and(|t| maintenant.saturating_duration_since(*t) >= self.duree)
+        {
+            p.pop_front();
+        }
+        if p.len() < self.plafond {
+            p.push_back(maintenant);
+            return Ok(());
+        }
+        let plus_ancien = *p.front().expect("fenêtre pleine, donc non vide");
+        Err((plus_ancien + self.duree).saturating_duration_since(maintenant))
+    }
+
+    pub(crate) async fn passer(&self) {
+        loop {
+            match self.essayer(Instant::now()) {
+                Ok(()) => return,
+                Err(attente) => tokio::time::sleep(attente.max(Duration::from_millis(50))).await,
+            }
+        }
+    }
+}
+
+/// La fenêtre de Cover+ : [`PLAFOND_PAR_MINUTE`] appels sur 60 s.
+static FENETRE: Fenetre = Fenetre::new(PLAFOND_PAR_MINUTE, Duration::from_secs(60));
+
+/// Une requête `GET`, par le limiteur iTunes partagé et la fenêtre de
+/// Cover+ quand la source le demande, sur le budget de la phase en cours.
+/// La réponse si elle est un succès, `None` sinon — en silence (`debug`).
 async fn obtenir(
     source: Source<'_>,
     url: reqwest::Url,
     agent: Option<&str>,
 ) -> Option<reqwest::Response> {
+    if !prendre_un_appel() {
+        debug!("cover_plus_budget_epuise");
+        return None;
+    }
     let (limiteur, cle) = crate::library::images_rapides::Hote::Itunes.limiteur();
     if source.limiter {
+        FENETRE.passer().await;
         limiteur.acquire(cle).await;
     }
-    let mut requete = crate::http::client::shared().get(url);
-    if let Some(a) = agent {
-        requete = requete.header(reqwest::header::USER_AGENT, a);
-    }
+    let requete = crate::http::client::shared()
+        .get(url)
+        .timeout(DELAI_APPEL)
+        .header(reqwest::header::USER_AGENT, agent.unwrap_or(AGENT_API));
     let reponse = match requete.send().await {
         Ok(r) => r,
         Err(e) => {
-            debug!(erreur = %e, "cover_plus_injoignable");
+            noter_incident();
+            debug!(erreur = %crate::http::client::decrire_erreur_http(&e), "cover_plus_injoignable");
             return None;
         }
     };
@@ -379,6 +548,10 @@ async fn obtenir(
         limiteur.constater_reponse(cle, &reponse);
     }
     if !reponse.status().is_success() {
+        // Un 404 est une réponse (pas de page) ; le reste est un incident.
+        if reponse.status() != reqwest::StatusCode::NOT_FOUND {
+            noter_incident();
+        }
         debug!(statut = reponse.status().as_u16(), "cover_plus_refus");
         return None;
     }
@@ -392,7 +565,15 @@ pub(crate) async fn appeler(
     params: &[(&str, &str)],
 ) -> Option<Vec<Value>> {
     let url = reqwest::Url::parse_with_params(&format!("{}{chemin}", source.base), params).ok()?;
-    let corps: Value = obtenir(source, url, None).await?.json().await.ok()?;
+    let reponse = obtenir(source, url, None).await?;
+    let corps: Value = match reponse.json().await {
+        Ok(v) => v,
+        Err(_) => {
+            noter_incident();
+            debug!("cover_plus_reponse_illisible");
+            return None;
+        }
+    };
     corps.get("results")?.as_array().cloned()
 }
 
@@ -549,9 +730,12 @@ async fn photo_en_cache(source: Source<'_>, nom: &str, boutique: &str) -> Option
     }
     let p = photo_artiste::photo_artiste(source, nom, boutique).await;
     debug!(trouvee = p.trouvee(), raison = p.raison, "cover_plus_photo_artiste");
-    let url = p.url;
-    cache().photos.insert(cle, url.clone());
-    url
+    // Une panne (réseau, budget, repli suspendu) ne dit rien de l'artiste :
+    // elle n'est pas retenue ici ; le cache des titres borne les essais.
+    if !p.passagere {
+        cache().photos.insert(cle, p.url.clone());
+    }
+    p.url
 }
 
 /// La cascade complète pour une chaîne déjà préparée (§ 3.2) : la pochette
@@ -565,30 +749,60 @@ pub async fn chercher(
     station: &str,
     photo_permise: bool,
 ) -> Option<Trouvaille> {
+    chercher_et_compter(source, prep, boutique, station, photo_permise)
+        .await
+        .0
+}
+
+/// [`chercher`], et si un incident a interrompu la recherche. Chaque phase
+/// a son budget d'appels ([`BUDGET_POCHETTE`], [`BUDGET_PHOTO`]).
+pub(crate) async fn chercher_et_compter(
+    source: Source<'_>,
+    prep: &Preparation,
+    boutique: &str,
+    station: &str,
+    photo_permise: bool,
+) -> (Option<Trouvaille>, bool) {
     if prep.ignorer.is_some() {
-        return None;
+        return (None, false);
     }
-    if let Some(url) = chercher_la_pochette(source, prep, boutique, station).await {
-        return Some(Trouvaille {
-            url,
-            origine: Origine::Pochette,
-        });
+    let (pochette, incident) = avec_budget(
+        BUDGET_POCHETTE,
+        chercher_la_pochette(source, prep, boutique, station),
+    )
+    .await;
+    if let Some(url) = pochette {
+        return (
+            Some(Trouvaille {
+                url,
+                origine: Origine::Pochette,
+            }),
+            false,
+        );
     }
     // Pas de photo pour une chaîne sans séparateur : on ne sait pas qui est
     // l'artiste (§ 2.2, étape 7 ; § 3.6, point 5).
-    if photo_permise
-        && let Some(nom) = artiste_pour_la_photo(station, prep)
-        && let Some(url) = photo_en_cache(source, &nom, boutique).await
-    {
-        return Some(Trouvaille {
-            url,
-            origine: Origine::PhotoArtiste,
-        });
+    let mut incident_photo = false;
+    if photo_permise && let Some(nom) = artiste_pour_la_photo(station, prep) {
+        let (photo, inc) =
+            avec_budget(BUDGET_PHOTO, photo_en_cache(source, &nom, boutique)).await;
+        incident_photo = inc;
+        if let Some(url) = photo {
+            return (
+                Some(Trouvaille {
+                    url,
+                    origine: Origine::PhotoArtiste,
+                }),
+                false,
+            );
+        }
     }
-    prep.pochette_fournie.clone().map(|url| Trouvaille {
+    let fournie = prep.pochette_fournie.clone().map(|url| Trouvaille {
         url,
         origine: Origine::PochetteDuFlux,
-    })
+    });
+    let incident = (incident || incident_photo) && fournie.is_none();
+    (fournie, incident)
 }
 
 // ---------------------------------------------------------------------------
@@ -647,7 +861,11 @@ fn decider(db: &Arc<dyn DbBackend>, t: &TitreEnCours<'_>) -> Result<Decision, Bo
     let cle = cle_de_cache(&boutique, t.station_nom, &chaine);
     {
         let mut c = cache();
-        let connue = c.titres.get(&cle).cloned();
+        let connue = c
+            .titres
+            .get(&cle)
+            .filter(|r| r.jusqu_a.is_none_or(|t| Instant::now() < t))
+            .map(|r| r.trouvaille.clone());
         match connue {
             Some(Some(trouvaille)) => return Ok(Decision::Pochette(trouvaille)),
             Some(None) => return Ok(Decision::Introuvable),
@@ -668,14 +886,15 @@ fn decider(db: &Arc<dyn DbBackend>, t: &TitreEnCours<'_>) -> Result<Decision, Bo
 /// Le point d'entrée du sondeur radio : l'image Cover+ du titre en cours si
 /// elle est déjà connue, sinon `EnCours` et une recherche en tâche de fond.
 pub fn pochette_du_titre(db: &Arc<dyn DbBackend>, t: &TitreEnCours<'_>) -> Decision {
-    // Les épreuves de `tune-core` passent par ici sans le savoir (le sondeur
+    // Les épreuves de `tune-core`, et celles de `tune-server` (qui allument
+    // `services-factices`), passent par ici sans le savoir (le sondeur
     // radio) : elles parlent à une adresse morte, jamais à iTunes.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "services-factices"))]
     let source = Source {
         base: "http://127.0.0.1:9",
         limiter: false,
     };
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "services-factices")))]
     let source = Source::ITUNES;
     pochette_du_titre_par(db, t, source)
 }
@@ -695,7 +914,7 @@ pub(crate) fn semer(
         station,
         &chaine_du_titre(Some(artiste), titre),
     );
-    retenir_titre(cle, trouvaille);
+    retenir_titre(cle, trouvaille, false);
 }
 
 fn pochette_du_titre_par(
@@ -716,14 +935,27 @@ fn pochette_du_titre_par(
             match tokio::runtime::Handle::try_current() {
                 Ok(rt) => {
                     rt.spawn(async move {
-                        let trouvee =
-                            chercher(source, &prep, &boutique, &station, photo_permise).await;
+                        let recherche = chercher_et_compter(
+                            source,
+                            &prep,
+                            &boutique,
+                            &station,
+                            photo_permise,
+                        );
+                        // Jamais plus de DELAI_RECHERCHE : au-delà, l'échec
+                        // est un incident, retenu un temps puis retenté.
+                        let (trouvee, incident) =
+                            match tokio::time::timeout(DELAI_RECHERCHE, recherche).await {
+                                Ok(r) => r,
+                                Err(_) => (None, true),
+                            };
                         debug!(
                             station = %station,
                             origine = trouvee.as_ref().map(|t| t.origine.code()),
+                            incident,
                             "cover_plus_recherche_terminee"
                         );
-                        retenir_titre(cle, trouvee);
+                        retenir_titre(cle, trouvee, incident);
                     });
                 }
                 Err(_) => {

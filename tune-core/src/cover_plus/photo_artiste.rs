@@ -24,8 +24,20 @@
 //!
 //! L'image `og:image` est un bandeau 1200x630 ; `600x600cc.jpg` la recadre au
 //! carré.
+//!
+//! ## Si Apple change sa page
+//!
+//! La lecture est tolérante (ordre des attributs, guillemets, `name=` au lieu
+//! de `property=`, entités `&amp;`) et n'accepte qu'une adresse `https://`.
+//! Une page méconnaissable rend « pas de photo » : le logo de la station
+//! reste affiché, rien ne panique, et la photo n'est pas redemandée pour cet
+//! artiste. Après [`ECHECS_AVANT_SUSPENSION`] pages méconnaissables
+//! d'affilée, le repli se suspend [`SUSPENSION`] : plus aucun appel ne part
+//! vers une page qu'on ne sait plus lire.
 
 use std::sync::LazyLock;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use regex::Regex;
 use serde_json::Value;
@@ -50,34 +62,78 @@ static COLLAB: LazyLock<Regex> = LazyLock::new(|| {
 static CARRE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"/\d+x\d+[a-z]*\.(?:png|jpg|webp)$").expect("motif Cover+ valide")
 });
-static OG_IMAGE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r#"<meta property="og:image" content="([^"]+)""#).expect("motif Cover+ valide")
+/// Une balise `<meta …>` qui désigne `og:image`, quels que soient l'ordre
+/// de ses attributs et ses guillemets.
+static META_OG_IMAGE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)<meta\b[^>]*?\b(?:property|name)\s*=\s*["']og:image["'][^>]*>"#)
+        .expect("motif Cover+ valide")
+});
+static CONTENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r#"(?is)\bcontent\s*=\s*(?:"([^"]*)"|'([^']*)')"#).expect("motif Cover+ valide")
 });
 
-/// Le premier nom d'une collaboration.
-pub fn premier_nom(nom: &str) -> String {
-    COLLAB
-        .splitn(nom, 2)
-        .next()
-        .unwrap_or(nom)
-        .trim()
-        .to_string()
+/// Pages méconnaissables d'affilée avant de suspendre le repli.
+pub const ECHECS_AVANT_SUSPENSION: u32 = 5;
+/// Durée de la suspension du repli après une série de pages méconnaissables.
+pub const SUSPENSION: Duration = Duration::from_secs(6 * 3600);
+
+/// La santé de la lecture des pages : échecs d'analyse d'affilée, et la
+/// fin de la suspension en cours.
+#[derive(Debug, Default)]
+pub(crate) struct Sante {
+    echecs: u32,
+    suspendu_jusqu_a: Option<Instant>,
 }
 
-/// Le bandeau `og:image` recadré au carré : `…/1200x630cw.png` →
-/// `…/600x600cc.jpg`. Une adresse d'une autre forme est rendue telle quelle.
-pub fn carre(url: &str, taille: u32) -> String {
-    CARRE
-        .replace(url, format!("/{taille}x{taille}cc.jpg").as_str())
-        .into_owned()
+impl Sante {
+    pub(crate) const fn new() -> Self {
+        Self {
+            echecs: 0,
+            suspendu_jusqu_a: None,
+        }
+    }
+
+    /// Le repli est-il suspendu à l'instant `maintenant` ?
+    pub(crate) fn suspendu(&self, maintenant: Instant) -> bool {
+        self.suspendu_jusqu_a.is_some_and(|t| maintenant < t)
+    }
+
+    /// Une page a été lue : reconnue (`true` : photo ou logo générique) ou
+    /// méconnaissable.
+    pub(crate) fn constater(&mut self, reconnue: bool, maintenant: Instant) {
+        if reconnue {
+            self.echecs = 0;
+            self.suspendu_jusqu_a = None;
+            return;
+        }
+        self.echecs = self.echecs.saturating_add(1);
+        if self.echecs >= ECHECS_AVANT_SUSPENSION {
+            self.echecs = 0;
+            self.suspendu_jusqu_a = Some(maintenant + SUSPENSION);
+            tracing::debug!("cover_plus_photo_artiste_suspendue");
+        }
+    }
 }
 
-/// La balise `og:image` d'une page.
+static SANTE: Mutex<Sante> = Mutex::new(Sante::new());
+
+fn sante() -> std::sync::MutexGuard<'static, Sante> {
+    SANTE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// La balise `og:image` d'une page, si elle désigne une adresse `https://`.
+/// Toute autre forme rend `None` : jamais de panique, jamais d'adresse
+/// douteuse affichée.
 pub fn og_image(html: &str) -> Option<String> {
-    OG_IMAGE
-        .captures(html)
-        .and_then(|c| c.get(1))
-        .map(|m| m.as_str().to_string())
+    META_OG_IMAGE.find_iter(html).find_map(|balise| {
+        let c = CONTENT.captures(balise.as_str())?;
+        let brut = c.get(1).or_else(|| c.get(2))?.as_str().trim();
+        let url = brut.replace("&amp;", "&");
+        let valide = url.starts_with("https://")
+            && url.len() <= 2048
+            && !url.chars().any(|c| c.is_whitespace() || c == '<' || c == '>');
+        valide.then_some(url)
+    })
 }
 
 /// Le compte rendu d'une recherche de photo.
@@ -87,6 +143,9 @@ pub struct Photo {
     pub url: Option<String>,
     /// Pourquoi il n'y en a pas.
     pub raison: &'static str,
+    /// L'échec tient à une panne (réseau, budget, suspension), pas à
+    /// l'artiste : il ne doit pas être retenu pour cet artiste.
+    pub passagere: bool,
 }
 
 impl Photo {
@@ -95,7 +154,19 @@ impl Photo {
     }
 
     fn sans(raison: &'static str) -> Self {
-        Self { url: None, raison }
+        Self {
+            url: None,
+            raison,
+            passagere: false,
+        }
+    }
+
+    fn panne(raison: &'static str) -> Self {
+        Self {
+            url: None,
+            raison,
+            passagere: true,
+        }
     }
 }
 
@@ -103,10 +174,18 @@ async fn lire_la_page(source: Source<'_>, adresse: &str) -> Option<String> {
     let url = reqwest::Url::parse(adresse).ok()?;
     let mut reponse = super::obtenir(source, url, Some(AGENT_PAGE)).await?;
     let mut octets = Vec::new();
-    while let Some(morceau) = reponse.chunk().await.ok().flatten() {
-        octets.extend_from_slice(&morceau);
-        if octets.len() >= PAGE_MAX {
-            break;
+    loop {
+        match reponse.chunk().await {
+            Ok(Some(morceau)) => {
+                octets.extend_from_slice(&morceau);
+                if octets.len() >= PAGE_MAX {
+                    break;
+                }
+            }
+            Ok(None) => break,
+            // Coupure en cours de lecture : ce qu'on a suffit souvent (la
+            // balise est dans l'en-tête), sinon l'analyse le dira.
+            Err(_) => break,
         }
     }
     Some(String::from_utf8_lossy(&octets).into_owned())
@@ -117,6 +196,9 @@ pub async fn photo_artiste(source: Source<'_>, nom: &str, boutique: &str) -> Pho
     let nom = nom.trim();
     if nom.is_empty() {
         return Photo::sans("aucun nom d'artiste");
+    }
+    if sante().suspendu(Instant::now()) {
+        return Photo::panne("repli suspendu : page d'Apple méconnaissable");
     }
     let mut noms = vec![nom.to_string()];
     let p = premier_nom(nom);
@@ -136,7 +218,7 @@ pub async fn photo_artiste(source: Source<'_>, nom: &str, boutique: &str) -> Pho
         )
         .await
         else {
-            return Photo::sans("iTunes en échec");
+            return Photo::panne("iTunes en échec");
         };
         let Some(franc) = resultats.iter().find(|x| {
             meme_nom(
@@ -150,9 +232,11 @@ pub async fn photo_artiste(source: Source<'_>, nom: &str, boutique: &str) -> Pho
             return Photo::sans("artiste sans page");
         };
         let Some(html) = lire_la_page(source, page).await else {
-            return Photo::sans("page artiste illisible");
+            return Photo::panne("page artiste illisible");
         };
-        return match og_image(&html) {
+        let og = og_image(&html);
+        sante().constater(og.is_some(), Instant::now());
+        return match og {
             None => Photo::sans("page sans og:image"),
             Some(og) if og.contains(GENERIQUE) => {
                 Photo::sans("pas de photo chez Apple (logo générique)")
@@ -160,6 +244,7 @@ pub async fn photo_artiste(source: Source<'_>, nom: &str, boutique: &str) -> Pho
             Some(og) => Photo {
                 url: Some(carre(&og, 600)),
                 raison: "",
+                passagere: false,
             },
         };
     }
