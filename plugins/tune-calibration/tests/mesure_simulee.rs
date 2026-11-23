@@ -1348,24 +1348,18 @@ fn anciennes_mesures_relues_sans_perte_et_positions_identiques() {
         &format!("/sessions/{sid}/correction"),
         Some(serde_json::json!({})),
     );
-    // La relecture est exacte au niveau du document (ci-dessus). Entre la
-    // mesure EN MÉMOIRE et sa relecture depuis du texte, serde_json (sans
-    // `float_roundtrip`) peut décaler un flottant d'un ULP : l'ajustement de
-    // l'égaliseur, itératif, peut alors bouger d'un cheveu. Même nombre de
-    // bandes, mêmes fréquences à 1 % près, gains à 0,1 dB près.
+    // La courbe passée par le client JSON doit conserver exactement les
+    // entrées du calcul itératif de l'égaliseur.
     let r_memoire = b.controleur.mesure(&id).unwrap().resultat().unwrap();
     let relu: Vec<f64> = serde_json::from_value(v1["reponse"]["db"].clone()).unwrap();
-    let ulp = r_memoire
-        .reponse
-        .db
-        .iter()
-        .zip(&relu)
-        .filter(|(a, b)| a != b)
-        .count();
-    println!(
-        "T10a relecture v1 : {ulp} valeur(s) sur {} décalée(s) d'un ULP par le texte",
-        relu.len()
-    );
+    assert_eq!(r_memoire.reponse.db.len(), relu.len());
+    for (i, (avant, apres)) in r_memoire.reponse.db.iter().zip(&relu).enumerate() {
+        assert_eq!(
+            avant.to_bits(),
+            apres.to_bits(),
+            "relecture JSON de la fréquence d’indice {i} : {avant:?} / {apres:?}"
+        );
+    }
     let bm = p_mesure["bandes"].as_array().unwrap();
     let bs = p_session["bandes"].as_array().unwrap();
     assert_eq!(bm.len(), bs.len(), "{bm:?} / {bs:?}");
