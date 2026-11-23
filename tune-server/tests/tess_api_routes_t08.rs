@@ -1004,3 +1004,46 @@ async fn authentification_comme_les_autres_routes_de_zone_t08() {
         assert_eq!(st, StatusCode::OK, "{m} {uri} {v}");
     }
 }
+
+/// T12b — une zone de la famille UPnP publie la voie de sa chaîne
+/// (`delivery`), conforme au schéma ; une zone locale ne la publie pas.
+/// Lecteur absent du registre : présumé capable (convention de
+/// `dlna_accepte_lpcm`), donc un crossfeed seul part en relais progressif.
+#[tokio::test]
+async fn la_famille_upnp_publie_la_voie_de_sa_chaine_t12b() {
+    for (sortie, appareil) in [
+        ("dlna", "uuid:absent-t12b"),
+        ("openhome", "uuid:oh-absent-t12b"),
+        ("bluos", "bluos:absent-t12b"),
+        ("chromecast", "cast:absent-t12b"),
+        ("slimproto", "slim:absent-t12b"),
+    ] {
+        let b = Banc::avec_sortie(true, sortie, appareil).await;
+        let (s, v) = b.get().await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        conforme_au_schema("zone_response", &v).unwrap_or_else(|e| panic!("{sortie} {e} : {v}"));
+        assert_eq!(v["delivery"]["route"], json!("untouched"), "{sortie} : {v}");
+        assert_eq!(v["delivery"]["reason"], json!("nothing_to_process"), "{v}");
+        let (s, v) = b
+            .brut(
+                Method::PUT,
+                &format!("/api/v1/zones/{}/dsp", b.zone),
+                Some(
+                    json!({"crossfeed": {"enabled": true, "amount": 0.35, "delay_ms": 0.3}})
+                        .to_string(),
+                ),
+                None,
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let (_, v) = b.get().await;
+        conforme_au_schema("zone_response", &v).unwrap();
+        assert_eq!(v["delivery"]["route"], json!("progressive_lpcm"), "{sortie} : {v}");
+        assert_eq!(v["delivery"]["renderer_lpcm"], json!("accepted"), "{v}");
+        assert_eq!(etape(&v, "crossfeed")["effective"], json!(true), "{v}");
+    }
+    // Contre-épreuve : une zone locale n'a pas de `delivery`.
+    let b = Banc::nouveau(true).await;
+    let (_, v) = b.get().await;
+    assert!(v.get("delivery").is_none(), "{v}");
+}

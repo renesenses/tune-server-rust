@@ -83,6 +83,10 @@ pub enum MotifEtape {
     /// l'exécuteur (ou la sonde de la sortie) dit avoir réellement en service
     /// prime sur la résolution (`tess::chemin`).
     NotInService,
+    /// T12b — famille UPnP : le lecteur n'annonce pas le LPCM et rien
+    /// n'impose de convertir la piste ; l'étage casque (crossfeed, greffons
+    /// natifs tiers) ne l'atteint pas (`tess::reseau_upnp`).
+    RendererWithoutLpcm,
     #[serde(other)]
     Unknown,
 }
@@ -313,6 +317,52 @@ fn membres_remplacants(
             (!gagnant_traite).then(|| (i, gagnant.to_owned()))
         })
         .collect()
+}
+
+impl Resolution {
+    /// T12b — après qu'un transport a éteint des greffons
+    /// (`tess::reseau_upnp::appliquer`), redit ce qui en dépend : le headroom
+    /// automatique n'a plus rien à protéger, la quantification plus rien à
+    /// requantifier, et le badge redevient « Bit-perfect » quand plus rien ne
+    /// modifie les échantillons. Mêmes règles que [`ChaineTess::resoudre`].
+    pub fn recalculer_les_etapes_finales(&mut self) {
+        let effective = |c: CodeEtape, e: &[EtapeResolue]| {
+            e.iter().any(|x| x.code == c && x.effective)
+        };
+        let traitement = effective(CodeEtape::Plugin, &self.etapes)
+            || effective(CodeEtape::Upsampling, &self.etapes);
+        if let Some(h) = self
+            .etapes
+            .iter_mut()
+            .find(|e| e.code == CodeEtape::Headroom)
+        {
+            let auto = h.params.as_ref().and_then(|p| p.get("mode")).and_then(Value::as_str)
+                == Some("auto");
+            if h.effective && auto && !traitement {
+                h.eteindre(MotifEtape::NothingToProtect, None);
+                self.headroom_db = 0.0;
+            }
+        }
+        let modifie = effective(CodeEtape::Headroom, &self.etapes)
+            || traitement
+            || effective(CodeEtape::Volume, &self.etapes);
+        if let Some(q) = self
+            .etapes
+            .iter_mut()
+            .find(|e| e.code == CodeEtape::Quantization)
+            && !modifie
+            && q.effective
+        {
+            q.eteindre(MotifEtape::NothingToQuantize, Some("Bit-perfect".into()));
+        }
+        if self.badge != Badge::OutsideTess {
+            self.badge = if modifie {
+                Badge::ProcessedByTess
+            } else {
+                Badge::BitPerfect
+            };
+        }
+    }
 }
 
 impl ChaineTess {
