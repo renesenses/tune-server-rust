@@ -2072,6 +2072,16 @@ impl TidalService {
             .unwrap_or_default();
         Some(format!("tidal {statut}{sous_statut}: {message}"))
     }
+    /// Le refus dit « cette catégorie n'existe pas dans ce catalogue » :
+    /// un 404, ou un `userMessage` en « … not found » (« Category not
+    /// found »). Un 400, un 403 ou un 5xx restent des erreurs.
+    fn categorie_absente(data: &serde_json::Value) -> bool {
+        Self::refus_de_tidal(data).is_some()
+            && (data["status"].as_u64() == Some(404)
+                || data["userMessage"]
+                    .as_str()
+                    .is_some_and(|m| m.to_ascii_lowercase().contains("not found")))
+    }
     fn map_genre(item: &serde_json::Value) -> StreamGenre {
         StreamGenre {
             id: item["path"].as_str().unwrap_or("").into(),
@@ -3118,8 +3128,16 @@ impl StreamingService for TidalService {
                 urlencoding::encode(genre_id)
             ))
             .await?;
-        // #9119 — un refus de TIDAL est une erreur, pas un genre vide.
+        // #9119 — un refus de TIDAL est une erreur, pas un genre vide…
+        // sauf la catégorie ABSENTE du catalogue de ce pays (404,
+        // « Category not found ») : le genre n'a pas d'albums ici, ses
+        // playlists peuvent exister. Une liste vide laisse l'écran partiel ;
+        // une erreur faisait lever un bandeau rouge « Category not found ».
         if let Some(refus) = Self::refus_de_tidal(&data) {
+            if Self::categorie_absente(&data) {
+                warn!(genre = %genre_id, pays = %self.pays_effectif(), refus = %refus, "tidal_genre_albums_absent_du_pays");
+                return Ok(vec![]);
+            }
             warn!(genre = %genre_id, pays = %self.pays_effectif(), refus = %refus, "tidal_genre_albums_refuse");
             return Err(TuneError::Streaming(refus));
         }

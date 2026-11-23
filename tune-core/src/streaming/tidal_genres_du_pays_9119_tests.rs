@@ -23,20 +23,25 @@ async fn faux_tidal() -> (TidalService, Journal) {
             "{genre}/{nature}?countryCode={}",
             q.get("countryCode").cloned().unwrap_or_default()
         ));
-        let refus = |statut: StatusCode, sous: u64| {
+        let refus_dit = |statut: StatusCode, sous: u64, message: &str| {
             (
                 statut,
                 axum::Json(serde_json::json!({
                     "status": statut.as_u16(),
                     "subStatus": sous,
-                    "userMessage": "The requested resource could not be found",
+                    "userMessage": message,
                 })),
             )
                 .into_response()
         };
+        let refus = |statut: StatusCode, sous: u64| {
+            refus_dit(statut, sous, "The requested resource could not be found")
+        };
         match (genre.as_str(), nature.as_str()) {
-            // Le genre local : pas d'albums, des playlists.
-            ("Polish", "albums") => refus(StatusCode::NOT_FOUND, 2001),
+            // Le genre local : pas d'albums dans ce catalogue, des playlists.
+            ("Polish", "albums") => refus_dit(StatusCode::NOT_FOUND, 2001, "Category not found"),
+            // Un vrai refus (droits) : il reste une erreur.
+            ("Interdit", "albums") => refus_dit(StatusCode::FORBIDDEN, 4005, "Not allowed"),
             ("Polish", "playlists") => axum::Json(serde_json::json!({
                 "limit": 50, "offset": 0, "totalNumberOfItems": 2,
                 "items": [
@@ -74,16 +79,66 @@ async fn faux_tidal() -> (TidalService, Journal) {
 #[tokio::test]
 async fn un_genre_refuse_par_tidal_est_une_erreur_pas_une_page_vide_9119() {
     let (svc, journal) = faux_tidal().await;
-    let resultat = svc.get_genre_albums("Polish", 50).await;
+    let resultat = svc.get_genre_albums("Interdit", 50).await;
     match resultat {
-        Err(TuneError::Streaming(m)) => assert!(m.contains("404"), "statut de TIDAL : {m}"),
+        Err(TuneError::Streaming(m)) => assert!(m.contains("403"), "statut de TIDAL : {m}"),
         autre => panic!("le refus de TIDAL doit remonter, pas {autre:?}"),
     }
     assert_eq!(
         journal.lock().unwrap().as_slice(),
-        ["Polish/albums?countryCode=PL"],
+        ["Interdit/albums?countryCode=PL"],
         "le pays du catalogue part dans la requête"
     );
+}
+
+/// Une catégorie absente du catalogue du pays (TIDAL : 404 « Category not
+/// found ») n'est pas une panne : le genre n'a pas d'albums ICI, ses
+/// playlists existent. L'écran est partiel, sans erreur.
+#[tokio::test]
+async fn une_categorie_absente_du_pays_donne_un_ecran_partiel_sans_erreur() {
+    let (svc, journal) = faux_tidal().await;
+    let albums = svc
+        .get_genre_albums("Polish", 50)
+        .await
+        .expect("« Category not found » n'est pas une erreur de l'écran");
+    assert!(albums.is_empty());
+    let playlists = svc
+        .get_featured_playlists(None, Some("Polish"))
+        .await
+        .expect("playlists du genre");
+    assert_eq!(playlists.len(), 1, "l'écran garde sa bande de playlists");
+    // Une rubrique du genre passe par le même chemin.
+    assert!(
+        svc.get_genre_section("Polish", "new-releases", 50)
+            .await
+            .expect("rubrique absente = vide")
+            .is_empty()
+    );
+    assert_eq!(
+        journal.lock().unwrap().as_slice(),
+        [
+            "Polish/albums?countryCode=PL",
+            "Polish/playlists?countryCode=PL",
+            "Polish/albums?countryCode=PL",
+        ],
+        "le pays du catalogue part dans chaque requête"
+    );
+}
+
+#[test]
+fn seule_l_absence_est_une_categorie_absente() {
+    use serde_json::json;
+    assert!(TidalService::categorie_absente(
+        &json!({"status": 404, "subStatus": 2001, "userMessage": "Category not found"})
+    ));
+    assert!(TidalService::categorie_absente(
+        &json!({"status": 400, "userMessage": "Category not found"})
+    ));
+    assert!(!TidalService::categorie_absente(
+        &json!({"status": 403, "userMessage": "Not allowed"})
+    ));
+    assert!(!TidalService::categorie_absente(&json!({"status": 500})));
+    assert!(!TidalService::categorie_absente(&json!({"items": []})));
 }
 
 #[tokio::test]
