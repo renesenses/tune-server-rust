@@ -178,17 +178,32 @@ jobs:
           APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
+          set -euo pipefail
           if [ -z "$APPLE_CERTIFICATE_P12" ]; then echo "Pas de certificat"; exit 0; fi
+          # Chemin ABSOLU dans $RUNNER_TEMP : un nom nu (« debloquer.keychain »)
+          # se crée dans ~/Library/Keychains de l'utilisateur du service, que
+          # le runner auto-hébergé n'a pas le droit d'écrire
+          # (SecKeychainCreate : UNIX[Permission denied], code 173).
+          KC="$RUNNER_TEMP/debloquer.keychain-db"
+          echo "KC=$KC" >> "$GITHUB_ENV"
+          # Liste de recherche d'origine, rétablie par « Nettoyer le trousseau ».
+          security list-keychains -d user | tr -d '"' | sed 's/^ *//' > "$RUNNER_TEMP/trousseaux-origine.txt"
           echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
           # Un trousseau laissé par un lancement interrompu ferait échouer
-          # `create-keychain` (runner Mac auto-hébergé : il persiste).
-          security delete-keychain debloquer.keychain 2>/dev/null || true
-          security create-keychain -p actions debloquer.keychain
-          security default-keychain -s debloquer.keychain
-          security unlock-keychain -p actions debloquer.keychain
-          security import "$RUNNER_TEMP/certificate.p12" -k debloquer.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
-          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions debloquer.keychain
+          # `create-keychain`.
+          security delete-keychain "$KC" 2>/dev/null || true
+          security create-keychain -p actions "$KC"
+          # Verrouillage automatique après 6 h, pas à la mise en veille.
+          security set-keychain-settings -lut 21600 "$KC"
+          security unlock-keychain -p actions "$KC"
+          security import "$RUNNER_TEMP/certificate.p12" -k "$KC" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k actions "$KC"
           rm "$RUNNER_TEMP/certificate.p12"
+          # Ajouté à la liste de recherche, SANS devenir le trousseau par
+          # défaut : la session ouverte sur le Mac n'est pas touchée.
+          # shellcheck disable=SC2046
+          security list-keychains -d user -s "$KC" $(cat "$RUNNER_TEMP/trousseaux-origine.txt")
+          security find-identity -v -p codesigning "$KC"
       - name: Signer, notariser, agrafer
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
@@ -208,13 +223,18 @@ jobs:
             exit 0
           fi
           IDENTITY="Developer ID Application: Bertrand Clech ($APPLE_TEAM_ID)"
+          # Trousseau du job (étape « Importer le certificat ») : codesign y
+          # cherche l'identité. notarytool (clé API ou identifiant Apple) et
+          # stapler n'en lisent aucun.
+          TROUSSEAU=()
+          if [ -n "${KC:-}" ]; then TROUSSEAU=(--keychain "$KC"); fi
           # Même reprise que release.yml : sans réponse du serveur
           # d'horodatage, codesign rend 0 sans horodatage et --verify rejette.
           ok=0
           for i in 1 2 3 4 5; do
             if codesign --force --options runtime --timestamp \
                  --identifier fr.mozaiklabs.debloquer-tune \
-                 --sign "$IDENTITY" "$APP" \
+                 --sign "$IDENTITY" "${TROUSSEAU[@]}" "$APP" \
                && codesign --verify --strict --deep --verbose=2 "$APP"; then
               ok=1; break
             fi
@@ -250,12 +270,16 @@ jobs:
           spctl --assess --type execute --verbose=2 "$APP"
           ditto -c -k --keepParent "$APP" "$ZIP"
       # Toujours, même en échec : le trousseau importé ne doit pas survivre au
-      # job, et le trousseau par défaut redevient celui de la session.
+      # job, et la liste de recherche redevient celle d'origine.
       - name: Nettoyer le trousseau
         if: always()
         run: |
-          security default-keychain -s "$HOME/Library/Keychains/login.keychain-db" 2>/dev/null || true
-          security delete-keychain debloquer.keychain 2>/dev/null || true
+          if [ -s "$RUNNER_TEMP/trousseaux-origine.txt" ]; then
+            # shellcheck disable=SC2046
+            security list-keychains -d user -s $(cat "$RUNNER_TEMP/trousseaux-origine.txt") || true
+          fi
+          security delete-keychain "$RUNNER_TEMP/debloquer.keychain-db" 2>/dev/null || true
+          rm -f "$RUNNER_TEMP/trousseaux-origine.txt" "$RUNNER_TEMP/certificate.p12"
       - uses: actions/upload-artifact@v4
         with:
           name: debloquer-tune-macos
