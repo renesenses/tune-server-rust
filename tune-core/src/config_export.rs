@@ -47,6 +47,10 @@
 //!   [`crate::tess::migration::ecrire_chaine`] sous le numéro d'arrivée
 //!   (origine et marques recalculées par le serveur) ; son ombre ne voyage
 //!   pas. Le profil de pièce de la zone est restauré comme MESURÉ (D1).
+//! - TESS T17 : les préréglages de chaîne (`tess_presets`, globaux) partent
+//!   avec les réglages ; à l'import, une liste illisible ou incohérente est
+//!   écartée avec un avertissement. Le préréglage actif de chaque zone
+//!   (`zone_{id}_tess_active_preset`) voyage dans sa zone.
 //!
 //! # Aperçu
 //!
@@ -891,6 +895,18 @@ pub fn planifier(backend: &Arc<dyn DbBackend>, fichier: &Fichier) -> Result<Plan
         // L'index des profils de pièce se reconstruit avec les profils
         // restaurés dans leur zone (format 2) : ignoré sans avertissement.
         if fichier.format_version >= 2 && cle == "room_profile_index" {
+            continue;
+        }
+        // TESS T17 : la liste des préréglages part comme tout réglage global,
+        // mais une liste qui ne se relit pas (ou incohérente) n'écrase pas
+        // celle de la machine. Les droits se vérifient au chargement : un
+        // préréglage Premium importé n'ouvre rien.
+        if cle == crate::tess::prereglages::CLE_PREREGLAGES
+            && let Err(e) = crate::tess::prereglages::lire_texte(&texte_json(brute))
+        {
+            avertissements.push(format!(
+                "TESS presets are not readable ({e}); the presets of this server are kept"
+            ));
             continue;
         }
         // TESS D1 : mêmes clés que celles que `PATCH /system/config` refuse.

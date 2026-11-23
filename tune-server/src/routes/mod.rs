@@ -521,6 +521,21 @@ pub fn router_with_plugins(
         .nest("/zones", zones_and_playback)
         // TESS T08 — le catalogue ; 404 = serveur sans TESS (écran caché).
         .route("/tess/catalog", get(zones::tess::catalogue_tess_route))
+        // TESS T17 — préréglages de chaîne (globaux) et mode d'application.
+        .route(
+            "/tess/presets",
+            get(zones::tess_prereglages::lister_prereglages)
+                .post(zones::tess_prereglages::enregistrer_prereglage),
+        )
+        .route(
+            "/tess/presets/{preset_id}",
+            axum::routing::patch(zones::tess_prereglages::renommer_prereglage)
+                .delete(zones::tess_prereglages::supprimer_prereglage),
+        )
+        .route(
+            "/tess/apply-mode",
+            axum::routing::put(zones::tess_prereglages::regler_le_mode),
+        )
         .nest("/playlists", playlists::router())
         .nest("/radios", radios::router())
         .nest("/radio-favorites", radios::radio_favorites_router())

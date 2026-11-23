@@ -657,6 +657,11 @@ pub fn router() -> Router<AppState> {
             "/{id}/tess",
             get(tess::get_zone_tess).put(tess::put_zone_tess),
         )
+        // TESS T17 — charger un préréglage sur la zone (même voie que le PUT).
+        .route(
+            "/{id}/tess/presets/{preset_id}/apply",
+            post(tess_prereglages::appliquer_prereglage),
+        )
         .route("/{id}/eq/response", get(eq_response))
         .route("/{id}/convolver/response", get(convolver_response))
         .route("/{id}/renderer-capabilities", post(renderer_capabilities))
@@ -758,6 +763,8 @@ pub use dsp::*;
 
 // TESS T08 — `GET/PUT /zones/{id}/tess` et `GET /tess/catalog`.
 pub mod tess;
+// TESS T17 — préréglages de chaîne globaux et mode d'application.
+pub mod tess_prereglages;
 
 mod lecture;
 pub use lecture::*;
