@@ -177,7 +177,9 @@ pub fn noter_client_ws(connecte: bool) -> i64 {
         CLIENTS_WS.fetch_add(1, Ordering::Relaxed) + 1
     } else {
         let avant = CLIENTS_WS
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some((n - 1).max(0)))
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+                Some((n - 1).max(0))
+            })
             .unwrap_or(0);
         (avant - 1).max(0)
     }
@@ -278,7 +280,10 @@ mod tests {
     #[test]
     fn le_silence_du_telephone_se_classe_8963() {
         // Rien relayé depuis la lecture (dernière requête il y a 60 s, lecture il y a 12 s).
-        assert_eq!(silence_du_telephone(12_000, Some(60_000), None, None), "pont_muet");
+        assert_eq!(
+            silence_du_telephone(12_000, Some(60_000), None, None),
+            "pont_muet"
+        );
         assert_eq!(silence_du_telephone(12_000, None, None, None), "pont_muet");
         // Le téléphone parle, l'adresse est partie, rien n'est tiré.
         assert_eq!(
