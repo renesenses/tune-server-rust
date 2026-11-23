@@ -65,6 +65,7 @@
 //! processor to the new one, both fed the same (shared) history: no step.
 
 use crate::ombre::{FiltreOmbre, OmbreDeTete};
+use tune_plugin_audio_support::echantillon::Echantillon;
 
 /// Hard ceiling on the crossfeed delay, in milliseconds.
 ///
@@ -89,9 +90,13 @@ pub struct CrossfeedProcessor {
     /// Delay applied to the crossfed term, in samples (0 = instantaneous).
     delay_samples: usize,
     /// Left-channel delay line (ring buffer of the dry left signal).
-    ring_l: Vec<f32>,
+    ///
+    /// TESS T06 — rangée en `f64` : le chemin `f64` n'y perd rien, et un
+    /// échantillon `f32` y revient exact (le chemin `f32` reste celui d'avant
+    /// au bit près).
+    ring_l: Vec<f64>,
     /// Right-channel delay line (ring buffer of the dry right signal).
-    ring_r: Vec<f32>,
+    ring_r: Vec<f64>,
     /// Shared read/write cursor into both ring buffers.
     pos: usize,
     /// #5081 — débit, pour la durée du fondu.
@@ -162,13 +167,16 @@ impl CrossfeedProcessor {
     /// Les échantillons retardés `(Ld, Rd)` de la trame `(l, r)`, ligne à
     /// retard avancée.
     #[inline]
-    fn retarder(&mut self, l: f32, r: f32) -> (f32, f32) {
+    fn retarder<T: Echantillon>(&mut self, l: T, r: T) -> (T, T) {
         if self.delay_samples == 0 {
             return (l, r);
         }
-        let d = (self.ring_l[self.pos], self.ring_r[self.pos]);
-        self.ring_l[self.pos] = l;
-        self.ring_r[self.pos] = r;
+        let d = (
+            T::depuis_f64(self.ring_l[self.pos]),
+            T::depuis_f64(self.ring_r[self.pos]),
+        );
+        self.ring_l[self.pos] = l.vers_f64();
+        self.ring_r[self.pos] = r.vers_f64();
         self.pos += 1;
         if self.pos >= self.delay_samples {
             self.pos = 0;
@@ -179,12 +187,12 @@ impl CrossfeedProcessor {
     /// #5081 — le terme croisé `c` de la trame (`L_out = l + c`,
     /// `R_out = r − c`), filtre et fondu compris.
     #[inline]
-    fn terme_croise(&mut self, l: f32, r: f32) -> f64 {
+    fn terme_croise<T: Echantillon>(&mut self, l: T, r: T) -> f64 {
         let neuf = if self.amount == 0.0 {
             0.0
         } else {
             let (ld, rd) = self.retarder(l, r);
-            let difference = f64::from(rd - ld);
+            let difference = (rd - ld).vers_f64();
             let filtree = match &mut self.filtre {
                 Some(f) => f.traiter(difference),
                 None => difference,
@@ -212,6 +220,19 @@ impl CrossfeedProcessor {
     /// number of stereo frames). The caller (`local.rs`) additionally gates this
     /// on `channels == 2`, so non-stereo audio never reaches here.
     pub fn process_interleaved(&mut self, samples: &mut [f32]) {
+        self.traiter_entrelace(samples);
+    }
+
+    /// TESS T06 — [`Self::process_interleaved`] sur un tampon stéréo
+    /// **`f64`** entrelacé, tel que l'exécuteur TESS le tient : même
+    /// algorithme (différence retardée, ombre de la tête, fondu de réglage,
+    /// garde-fou à ±1), calculé en `f64` de bout en bout, sans aucun arrondi
+    /// vers `f32`.
+    pub fn process_interleaved_f64(&mut self, samples: &mut [f64]) {
+        self.traiter_entrelace(samples);
+    }
+
+    fn traiter_entrelace<T: Echantillon>(&mut self, samples: &mut [T]) {
         // Not a whole number of stereo frames → cannot interpret as L/R pairs.
         if !samples.len().is_multiple_of(2) {
             return;
@@ -225,13 +246,14 @@ impl CrossfeedProcessor {
         if self.filtre.is_some() || self.fondu.is_some() {
             for trame in samples.as_chunks_mut::<2>().0 {
                 let (l, r) = (trame[0], trame[1]);
-                let c = self.terme_croise(l, r) as f32;
-                trame[0] = (l + c).clamp(-1.0, 1.0);
-                trame[1] = (r - c).clamp(-1.0, 1.0);
+                let c = T::depuis_f64(self.terme_croise(l, r));
+                trame[0] = (l + c).borner_unite();
+                trame[1] = (r - c).borner_unite();
             }
             return;
         }
 
+        let amount = T::depuis_f32(self.amount);
         let frames = samples.len() / 2;
         for f in 0..frames {
             let li = 2 * f;
@@ -243,10 +265,13 @@ impl CrossfeedProcessor {
             let (ld, rd) = if self.delay_samples == 0 {
                 (l, r)
             } else {
-                let d = (self.ring_l[self.pos], self.ring_r[self.pos]);
+                let d = (
+                    T::depuis_f64(self.ring_l[self.pos]),
+                    T::depuis_f64(self.ring_r[self.pos]),
+                );
                 // Store the CURRENT dry sample AFTER reading the delayed one.
-                self.ring_l[self.pos] = l;
-                self.ring_r[self.pos] = r;
+                self.ring_l[self.pos] = l.vers_f64();
+                self.ring_r[self.pos] = r.vers_f64();
                 self.pos += 1;
                 if self.pos >= self.delay_samples {
                     self.pos = 0;
@@ -254,12 +279,12 @@ impl CrossfeedProcessor {
                 d
             };
 
-            let l_out = l + self.amount * (rd - ld);
-            let r_out = r + self.amount * (ld - rd);
+            let l_out = l + amount * (rd - ld);
+            let r_out = r + amount * (ld - rd);
 
             // Guard against any overshoot before it hits the DAC.
-            samples[li] = l_out.clamp(-1.0, 1.0);
-            samples[ri] = r_out.clamp(-1.0, 1.0);
+            samples[li] = l_out.borner_unite();
+            samples[ri] = r_out.borner_unite();
         }
     }
 

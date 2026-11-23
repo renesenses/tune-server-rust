@@ -25,10 +25,12 @@
 //! - **Étages fixes en `f64` natif** : le ReplayGain (point d'insertion du
 //!   headroom de T07, AVANT l'exécuteur) et la compensation (#5071, APRÈS,
 //!   juste avant la quantification) sont de simples gains, appliqués en `f64`.
-//! - **Adaptateurs provisoires `f32` ↔ `f64`** pour l'égaliseur, le convolveur
-//!   et le crossfeed, comme sur la sortie locale (T03) : leurs moteurs ont des
-//!   entrées `f32`. T05, T06, T09b et T14 les remplacent par des étages `f64`.
-//!   Aucune AUTRE conversion `f32` ni entière n'existe entre deux étages.
+//! - **Moteurs de référence en `f64` natif (T06)** : l'égaliseur et le
+//!   crossfeed reçoivent le tampon `f64` de l'exécuteur tel quel. Seul le
+//!   convolveur garde un adaptateur provisoire `f32` ↔ `f64` (T09b le porte) ;
+//!   un natif tiers `F32` est converti à SA frontière (T05). Aucune AUTRE
+//!   conversion `f32` ni entière n'existe entre deux étages
+//!   (`crate::tess::sonde_f32` le vérifie en test).
 //! - **Bit-perfect** : sans étage actif, le porteur ne touche pas un octet
 //!   ([`StreamingDsp::is_active`]) ; avec des étages qui rendent des mots
 //!   exacts, la quantification les rend à l'identité, sans dither (règle de
@@ -39,11 +41,11 @@
 //! - **Compensation, piste entière** : la piste ENTIÈRE est un seul bloc
 //!   (#5071) — le gain est borné par la crête de la piste traitée. La sortie de
 //!   la chaîne est donc gardée jusqu'à la fin de la piste ([`Stockage`]) : en
-//!   `f32` quand chaque échantillon y est EXACT (c'est le cas tant qu'un
-//!   adaptateur `f32` est le dernier étage, ce qui est toujours vrai quand la
-//!   compensation existe : elle exige un égaliseur ou un crossfeed), en `f64`
-//!   sinon. Aucune précision n'est jamais perdue, et la mémoire reste celle
-//!   d'avant (le convolveur faisait déjà une copie `f32` de la piste).
+//!   `f32` quand chaque échantillon y est EXACT (dernier étage actif = le
+//!   convolveur `f32`), en `f64` sinon. Aucune précision n'est jamais perdue.
+//!   Depuis T06, l'égaliseur et le crossfeed rendent des `f64` : une piste
+//!   compensée est alors gardée en `f64`, deux fois la mémoire de l'ancienne
+//!   copie `f32` (≈ 200 Mo pour 5 min à 44,1 kHz stéréo).
 
 use std::cell::RefCell;
 
@@ -141,6 +143,8 @@ thread_local! {
 /// Fait passer `tampon` par un moteur `f32` : un seul appel par tranche,
 /// converti dans le tampon du fil.
 fn par_tranches_f32(tampon: &mut [f64], canaux: usize, mut moteur: impl FnMut(&mut [f32])) {
+    #[cfg(test)]
+    crate::tess::sonde_f32::noter();
     let pas = pas_de_tranche(canaux);
     for morceau in tampon.chunks_mut(pas) {
         TAMPON_F32.with(|cellule| {
@@ -175,7 +179,8 @@ fn pas_de_tranche(canaux: usize) -> usize {
     ((TRANCHE / canaux) * canaux).max(canaux)
 }
 
-/// Adaptateur provisoire de l'égaliseur (`f32`) : à porter en `f64` par T06.
+/// L'égaliseur (graphique, paramétrique, casque AutoEQ et OPRA), en `f64`
+/// natif depuis TESS T06 : aucun aller-retour par `f32`.
 struct AdaptateurEgaliseur<'a> {
     moteur: &'a mut Option<EqProcessor>,
     canaux: usize,
@@ -191,14 +196,11 @@ impl EtageTess for AdaptateurEgaliseur<'_> {
     }
     fn traiter_sur_place(&mut self, t: &mut [f64], trames: usize) -> Result<(), ErreurEtage> {
         verifier_tampon(t.len(), trames, self.canaux as u16)?;
-        // Un égaliseur coupé qui a fini son fondu ne fait rien (#5215) : pas
-        // de passage par le `f32` pour rien.
+        // Un égaliseur coupé qui a fini son fondu ne fait rien (#5215).
         if let Some(p) = self.moteur.as_mut()
             && !p.est_neutre_au_repos()
         {
-            par_tranches_f32(&mut t[..trames * self.canaux], self.canaux, |f| {
-                p.process_interleaved(f);
-            });
+            p.process_interleaved_f64(&mut t[..trames * self.canaux]);
         }
         Ok(())
     }
@@ -268,8 +270,9 @@ impl EtageTess for AdaptateurConvolution<'_> {
     fn definir_bypass(&mut self, _: bool) {}
 }
 
-/// Adaptateur provisoire du crossfeed et des natifs tiers (`f32`), stéréo
-/// seulement : à porter en `f64` par T05/T14.
+/// Le crossfeed (v1 intégré, en `f64` natif depuis TESS T06) et les natifs
+/// tiers (convertis à LEUR frontière s'ils sont des paquets `F32`, T05),
+/// stéréo seulement.
 struct AdaptateurCrossfeed<'a> {
     moteur: &'a mut Option<CrossfeedProcessor>,
     /// Le porteur dit-il traiter de la stéréo ? (`StreamingDsp::channels`,
@@ -292,7 +295,7 @@ impl EtageTess for AdaptateurCrossfeed<'_> {
             return Ok(());
         }
         if let Some(c) = self.moteur.as_mut() {
-            par_tranches_f32(&mut t[..trames * 2], 2, |f| c.process_interleaved(f));
+            c.process_interleaved_f64(&mut t[..trames * 2]);
         }
         Ok(())
     }

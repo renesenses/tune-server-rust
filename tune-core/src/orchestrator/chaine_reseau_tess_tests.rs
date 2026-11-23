@@ -459,3 +459,83 @@ fn cas_limites() {
     assert_eq!(pcm, src);
     let _ = Passage::Piste;
 }
+
+/// TESS T06 — l'égaliseur et le crossfeed du porteur RÉSEAU (OAAT, DLNA,
+/// transcodage) en `f64` de bout en bout. Une source 32 bits traverse
+/// ReplayGain, égaliseur, crossfeed et compensation : le signal ne traverse
+/// AUCUNE frontière `f32` (sonde des adaptateurs), et ce qui atteint la
+/// quantification unique colle à 1e-12 près à la référence calculée hors
+/// chaîne (moteurs `f64` du SDK appelés directement). CONTRE-ÉPREUVES : avec
+/// le convolveur (`f32` jusqu'à T09b), la sonde voit sa frontière ; et
+/// l'ancien chemin `f32` des deux moteurs s'écarte de la référence.
+#[test]
+fn t06_egaliseur_et_crossfeed_en_f64_sur_la_chaine_reseau() {
+    use crate::audio::eq::{EqBandSpec, EqProcessor, EqProfile};
+    let bits = 32;
+    let src = source(bits, 2 * 6_000, 0.6, 97);
+    let x = lire(&src, bits);
+    let profil = EqProfile {
+        enabled: true,
+        bands: vec![
+            EqBandSpec {
+                freq: 90.0,
+                gain: 5.0,
+                q: 0.8,
+                band_type: "peak".into(),
+                ..Default::default()
+            },
+            EqBandSpec {
+                freq: 4_000.0,
+                gain: -3.5,
+                q: 2.0,
+                band_type: "peak".into(),
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    };
+    let facteur = 0.8;
+    let neuf = || {
+        let mut d = porteur(Some(facteur));
+        d.eq = Some(EqProcessor::new(&profil, 48_000, 2));
+        d.crossfeed = Some(CrossfeedProcessor::new(48_000, 0.3, 0.3));
+        d
+    };
+    let mut chaine = neuf();
+    let mut pcm = src.clone();
+    let mut vu = Vec::new();
+    let frontieres = crate::tess::sonde_f32::compter(|| {
+        vu = sonde::voir(|| chaine.process(&mut pcm, bits));
+    });
+    assert_eq!(frontieres, 0, "{frontieres} frontières f32 dans la chaîne réseau");
+
+    // Référence hors chaîne : gain, puis les moteurs f64 du SDK.
+    let mut reference: Vec<f64> = x.iter().map(|v| v * facteur).collect();
+    let mut eq_ref = tune_plugin_equalizer::EqProcessor::new(&profil, 48_000, 2);
+    let mut cf_ref = tune_plugin_crossfeed::CrossfeedProcessor::new(48_000, 0.3, 0.3);
+    eq_ref.process_interleaved_f64(&mut reference);
+    cf_ref.process_interleaved_f64(&mut reference);
+    let e = ecart_max(&vu, &reference);
+    assert!(e < 1e-12, "écart {e:e} : la chaîne réseau n'est pas en 64 bits");
+
+    // Contre-épreuve 1 : l'ancien chemin f32 des deux moteurs.
+    let mut ancien: Vec<f32> = x.iter().map(|v| (v * facteur) as f32).collect();
+    tune_plugin_equalizer::EqProcessor::new(&profil, 48_000, 2).process_interleaved(&mut ancien);
+    tune_plugin_crossfeed::CrossfeedProcessor::new(48_000, 0.3, 0.3)
+        .process_interleaved(&mut ancien);
+    let ancien: Vec<f64> = ancien.into_iter().map(f64::from).collect();
+    let e_ancien = ecart_max(&ancien, &reference);
+    assert!(e_ancien > 1e-10, "le banc ne discrimine pas ({e_ancien:e})");
+    // … et il reste inaudible (−120 dBFS).
+    assert!(e_ancien < 1e-6, "écart f32↔f64 {e_ancien:e}");
+
+    // Contre-épreuve 2 : la sonde voit la frontière du convolveur f32.
+    let mut avec_conv = neuf();
+    avec_conv.convolver = Some(Convolver::new(
+        &[vec![0.5f32, 0.25, 0.125], vec![0.5f32, 0.25, 0.125]],
+        64,
+    ));
+    let mut pcm = src.clone();
+    let frontieres = crate::tess::sonde_f32::compter(|| avec_conv.process(&mut pcm, bits));
+    assert!(frontieres > 0, "la sonde ne voit pas l'adaptateur f32 du convolveur");
+}

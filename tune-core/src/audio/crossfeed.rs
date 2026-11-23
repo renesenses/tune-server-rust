@@ -356,6 +356,28 @@ impl CrossfeedProcessor {
             }
         }
     }
+    /// TESS T06 — [`Self::process_interleaved`] sur le tampon stéréo **`f64`**
+    /// de l'exécuteur TESS. Le crossfeed intégré (v1, gratuit) calcule en
+    /// `f64` de bout en bout ; un greffon natif — crossfeed signé ou natif
+    /// tiers — reçoit le `f64` tel quel s'il demande `audio-f64`, sinon il est
+    /// converti à SA frontière (T05, `Stage::process_f64`), jamais entre deux
+    /// étages intégrés.
+    pub fn process_interleaved_f64(&mut self, samples: &mut [f64]) {
+        match &mut self.engine {
+            CrossfeedEngine::Bundled(p) => p.process_interleaved_f64(samples),
+            CrossfeedEngine::Native(p) => {
+                if let Err(error) = p.process_f64(samples) {
+                    tracing::error!(%error,"native_crossfeed_processing_failed");
+                }
+            }
+            CrossfeedEngine::Unavailable | CrossfeedEngine::Aucun => {}
+        }
+        for etage in &mut self.tiers {
+            if let Err(error) = etage.stage.process_f64(samples) {
+                tracing::error!(plugin = %etage.id, %error, "native_third_party_processing_failed");
+            }
+        }
+    }
     pub fn process_pcm(&mut self, pcm: &mut [u8], bit_depth: u16, channels: u16) {
         if channels != 2 {
             return;
@@ -1431,9 +1453,7 @@ mod tests {
                 && CHAINE_RESEAU.contains(
                     "let mut etages: [&mut dyn EtageTess; 3] = [&mut a_eq, &mut a_conv, &mut a_cf];"
                 )
-                && CHAINE_RESEAU.contains(
-                    "par_tranches_f32(&mut t[..trames * 2], 2, |f| c.process_interleaved(f));"
-                ),
+                && CHAINE_RESEAU.contains("c.process_interleaved_f64(&mut t[..trames * 2]);"),
             "`StreamingDsp::process` n'applique plus le crossfeed : il est \
              chargé, transporté, et jeté sans être exécuté"
         );
