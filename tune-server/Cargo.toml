@@ -300,6 +300,12 @@ path = "tests/pont_administration.rs"
 name = "relais_routes_relayables"
 path = "tests/relais_routes_relayables.rs"
 
+# Session « rester connecté » (remember) des remotes : 30 jours, révocable.
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "session_longue_remember"
+path = "tests/session_longue_remember.rs"
+
 # #3326 — le mode de transition (un `client/hello` en clair). `autotests =
 # false` plus haut : sans cette cible, le fichier ne serait JAMAIS compilé, et
 # la contre-épreuve qui garde le chemin chiffré ne serait exécutée par personne.
