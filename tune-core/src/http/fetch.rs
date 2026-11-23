@@ -99,6 +99,13 @@ impl RateLimiter {
         }
     }
 
+    /// Prochain départ permis. Une doublure séquentielle peut ainsi observer
+    /// l'espacement des autorisations sans y mêler le temps de transport HTTP.
+    #[cfg(feature = "services-factices")]
+    pub fn prochain_creneau(&self, key: &str) -> Option<Instant> {
+        self.etats().get(key).map(|etat| etat.prochain)
+    }
+
     /// L'intervalle courant de `key` — l'intervalle de base tant qu'aucun
     /// refus n'est venu.
     pub fn intervalle_courant(&self, key: &str) -> Duration {

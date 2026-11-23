@@ -35,12 +35,23 @@ fn snapshot_at(directory: &Path, kind: &str, id: &str, value: &Value) -> Result<
     if value["job_id"] != id {
         return Err("job snapshot id mismatch".into());
     }
-    fs::create_dir_all(directory).map_err(|e| e.to_string())?;
-    let mut file = tempfile::NamedTempFile::new_in(directory).map_err(|e| e.to_string())?;
-    serde_json::to_writer(&mut file, value).map_err(|e| e.to_string())?;
-    file.flush().map_err(|e| e.to_string())?;
-    file.as_file().sync_all().map_err(|e| e.to_string())?;
-    file.persist(path).map_err(|e| e.to_string())?;
+    // #9343 — chaque échec nomme le chemin : « Read-only file system (os
+    // error 30) » seul ne disait pas que le journal visait `/plugins/audio`.
+    let es = |operation: &str, chemin: &Path, e: &std::io::Error| {
+        tune_http_types::error::message_d_entree_sortie(operation, chemin, e)
+    };
+    fs::create_dir_all(directory).map_err(|e| es("create job journal folder", directory, &e))?;
+    let mut file = tempfile::NamedTempFile::new_in(directory)
+        .map_err(|e| es("write job journal", directory, &e))?;
+    serde_json::to_writer(&mut file, value)
+        .map_err(|e| format!("write job journal {}: {e}", path.display()))?;
+    file.flush()
+        .map_err(|e| es("write job journal", &path, &e))?;
+    file.as_file()
+        .sync_all()
+        .map_err(|e| es("write job journal", &path, &e))?;
+    file.persist(&path)
+        .map_err(|e| es("write job journal", &path, &e.error))?;
     Ok(())
 }
 pub fn write(
@@ -91,6 +102,20 @@ pub fn recovered(kind: &str, id: &str) -> Option<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// #9343 — un journal impossible à écrire nomme le dossier visé.
+    #[test]
+    fn un_echec_d_ecriture_nomme_le_dossier_du_journal() {
+        let directory = tempfile::tempdir().unwrap();
+        let fichier = directory.path().join("pas-un-dossier");
+        fs::write(&fichier, b"x").unwrap();
+        let jobs = fichier.join("jobs");
+        let id = uuid::Uuid::new_v4().to_string();
+        let erreur = write_at(&jobs, "converter", &id, "running", 1, 0).unwrap_err();
+        assert!(
+            erreur.contains(&jobs.display().to_string()),
+            "le chemin manque : {erreur}"
+        );
+    }
     #[test]
     fn premium_sdk_journal_survives_worker_loss_without_claiming_resumed_artifacts() {
         let directory = tempfile::tempdir().unwrap();

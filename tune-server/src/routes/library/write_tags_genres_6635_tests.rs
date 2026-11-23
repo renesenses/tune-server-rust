@@ -342,6 +342,39 @@ async fn graver_tags_refuse_le_fichier_en_cours_de_lecture_6635() {
     assert!(restes(banc.dir.path()).is_empty());
 }
 
+async fn attendre_fin_gravure(
+    taches: &crate::background_tasks::BackgroundTasks,
+    evenements: &mut tokio::sync::broadcast::Receiver<tune_core::event_bus::TuneEvent>,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    while taches.snapshot().iter().any(|t| t.id == "write_tags") {
+        match evenements.recv().await {
+            Ok(_) | Err(RecvError::Lagged(_)) => {}
+            Err(RecvError::Closed) => panic!("bus fermé avant la fin de la gravure"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn attendre_fin_gravure_sur_un_bus_sature_6635() {
+    use std::sync::Arc;
+    use tokio::sync::broadcast::error::TryRecvError;
+    let bus = Arc::new(tune_core::event_bus::EventBus::new());
+    let taches = crate::background_tasks::BackgroundTasks::new(Arc::clone(&bus));
+    let garde = taches.begin("write_tags", "Gravure", "library");
+    let mut evenements = bus.subscribe();
+    let mut temoin = bus.subscribe();
+    for _ in 0..257 {
+        bus.emit("library.scan.progress", Value::Null);
+    }
+    assert!(matches!(temoin.try_recv(), Err(TryRecvError::Lagged(_))));
+    let attente = attendre_fin_gravure(&taches, &mut evenements);
+    tokio::pin!(attente);
+    assert!(futures_util::poll!(&mut attente).is_pending());
+    drop(garde);
+    attente.await;
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn graver_tags_refuse_le_fichier_en_lecture_seule_6635() {
@@ -350,7 +383,38 @@ async fn graver_tags_refuse_le_fichier_en_lecture_seule_6635() {
     let flac = banc.dir.join("01.flac");
     std::fs::set_permissions(&flac, std::fs::Permissions::from_mode(0o444)).unwrap();
     let octets = std::fs::read(&flac).unwrap();
-    let statut = graver(&banc.state, false).await;
+    // S’abonner AVANT le lancement : la fin peut précéder le premier recv.
+    // Le retrait de la garde suit l’écriture réelle du statut final en base.
+    let mut evenements = banc.state.event_bus.subscribe();
+    let reponse = write_tags_to_files(
+        State(banc.state.clone()),
+        Json(WriteTagsRequest {
+            only_missing: false,
+            track_ids: None,
+            album_id: Some(1),
+        }),
+    )
+    .await;
+    assert_eq!(reponse.status(), StatusCode::ACCEPTED);
+    tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        attendre_fin_gravure(&banc.state.background_tasks, &mut evenements),
+    )
+    .await
+    .expect("#6635 : la tâche de gravure ne libère pas sa garde de fin");
+    let reglages =
+        tune_core::db::settings_repo::SettingsRepo::with_backend(banc.state.backend.clone());
+    let statut: Value = serde_json::from_str(
+        &reglages
+            .get("write_tags_status")
+            .unwrap()
+            .expect("statut de gravure écrit"),
+    )
+    .unwrap();
+    assert_eq!(
+        statut["status"], "done",
+        "#6635 : fin de gravure effective — {statut}"
+    );
     std::fs::set_permissions(&flac, std::fs::Permissions::from_mode(0o644)).unwrap();
     assert_eq!(
         std::fs::read(&flac).unwrap(),

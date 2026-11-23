@@ -78,8 +78,31 @@ impl PositionPoller {
                 // La pochette du titre quand la station la donne, le
                 // logo sinon. Bertrand : « mettre la pochette de
                 // l'album et non le logo de la radio ».
-                let pochette =
-                    vignette_du_pas_radio(meta.cover_url.as_deref(), logo_station.as_deref());
+                //
+                // #8452 — Cover+ : la station ne donne pas de pochette, on
+                // la cherche d'après le titre (ICY → iTunes). Jamais
+                // attendue : tant qu'elle n'est pas trouvée, le logo.
+                let cover_plus = crate::cover_plus::pochette_du_titre(
+                    &self.db,
+                    &crate::cover_plus::TitreEnCours {
+                        station_id: station.as_ref().and_then(|s| s.id),
+                        station_nom: &station_name,
+                        station_pays: station.as_ref().and_then(|s| s.country.as_deref()),
+                        artiste: meta.artist.as_deref(),
+                        titre: &meta.title,
+                        pochette_station: meta.cover_url.as_deref(),
+                    },
+                );
+                let (pochette, origine_cover_plus) = match cover_plus {
+                    crate::cover_plus::Decision::Pochette(t) => {
+                        (Some(t.url), Some(t.origine.code().to_string()))
+                    }
+                    _ => (
+                        vignette_du_pas_radio(meta.cover_url.as_deref(), logo_station.as_deref()),
+                        None,
+                    ),
+                };
+                let par_cover_plus = origine_cover_plus.is_some();
                 // #8487 — le titre diffusé est noté sous la ligne de sa
                 // station, hors statistiques, à chaque lecture et pas
                 // seulement au changement : un titre lu avant que la station
@@ -109,7 +132,8 @@ impl PositionPoller {
                 }
                 let title_changed = np.title != meta.title
                     || np.artist_name != meta.artist
-                    || np.cover_path != pochette;
+                    || np.cover_path != pochette
+                    || np.cover_plus != par_cover_plus;
                 if title_changed {
                     let new_np = crate::playback::NowPlaying {
                         track_id: None,
@@ -117,6 +141,8 @@ impl PositionPoller {
                         artist_name: meta.artist,
                         album_title: Some(station_name.clone()),
                         cover_path: pochette,
+                        cover_plus: par_cover_plus,
+                        cover_plus_source: origine_cover_plus,
                         duration_ms: 0,
                         source: "radio".into(),
                         source_id: np.source_id.clone(),

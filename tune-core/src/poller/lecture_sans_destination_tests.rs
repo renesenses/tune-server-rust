@@ -352,3 +352,64 @@ fn une_sonde_de_plage_ne_fait_pas_une_destination_6066() {
         );
     }
 }
+
+/// Diagnostic rc14 (#8963) : l'abandon d'une zone navigateur dit si le pont
+/// a relayé quelque chose, et quel flux il a demandé en dernier. C'est ce qui
+/// départage « le téléphone ne dit plus rien », « il parle sans demander le
+/// flux » et « il demande un autre flux ».
+#[tokio::test]
+async fn labandon_dit_ce_que_le_pont_a_relaye_8963() {
+    #[derive(Clone, Default)]
+    struct Journal(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Journal {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Journal {
+        type Writer = Journal;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+    crate::journal_de_test::fiabiliser_la_capture();
+    let journal = Journal::default();
+    let _garde = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish(),
+    );
+    crate::cloud::activite_du_relais::noter_requete_relayee();
+    crate::cloud::activite_du_relais::noter_demande_de_flux_relayee("feedbeef0011.wav");
+
+    let banc = Banc::monter().await;
+    let zone_id = banc.zone_en_lecture("Ce téléphone", "browser", 0).await;
+    let zs = banc.instantane(zone_id, Duration::from_secs(30)).await;
+    assert!(banc.poller.abandonner_lecture_sans_destination(&zs).await);
+
+    let texte = String::from_utf8_lossy(&journal.0.lock().unwrap()).into_owned();
+    let ligne = texte
+        .lines()
+        .find(|l| l.contains("lecture_sans_destination_abandonnee"))
+        .unwrap_or_else(|| panic!("aucune ligne d'abandon : {texte}"));
+    for attendu in [
+        "depuis_requete_relayee_ms=Some(",
+        "depuis_demande_de_flux_relayee_ms=Some(",
+        "octets_servis=",
+        "flux=",
+    ] {
+        assert!(ligne.contains(attendu), "« {attendu} » absent : {ligne}");
+    }
+    // Un test voisin peut noter une autre demande entre-temps : seul le
+    // format court est garanti.
+    assert!(
+        !ligne.contains("feedbeef0011"),
+        "l'identifiant entier du flux est recopié : {ligne}"
+    );
+}
