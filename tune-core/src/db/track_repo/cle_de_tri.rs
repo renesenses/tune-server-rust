@@ -286,27 +286,39 @@ impl TrackRepo {
             etat.jeton_du_dernier_complet = jeton;
         }
         let repo = TrackRepo::with_backend(self.db.clone());
-        let lance = std::thread::Builder::new()
-            .name("cles-de-tri".into())
-            .spawn(move || {
-                let debut = Instant::now();
-                match repo.rafraichir_cles_de_tri(false) {
-                    Ok(n) => tracing::info!(
-                        ecrites = n,
-                        ms = debut.elapsed().as_millis() as u64,
-                        "cles_de_tri_rafraichies"
-                    ),
-                    Err(e) => tracing::warn!(error = %e, "cles_de_tri_rafraichissement_echec"),
-                }
-                if let Ok(mut etat) = ETAT_DES_CLES.lock() {
-                    etat.complet_en_cours = false;
-                    etat.dernier_complet = Some(Instant::now());
-                }
-            });
-        if lance.is_err()
-            && let Ok(mut etat) = ETAT_DES_CLES.lock()
-        {
-            etat.complet_en_cours = false;
+        let mut fin = FinDuRafraichissement { parti: false };
+        // #9260 — hors d'un fil nu : le moteur PostgreSQL y paniquait, et le
+        // drapeau restait pris pour toute la vie du processus.
+        crate::db::fil_de_fond::lancer("cles-de-tri", move || {
+            fin.parti = true;
+            let _fin = fin;
+            let debut = Instant::now();
+            match repo.rafraichir_cles_de_tri(false) {
+                Ok(n) => tracing::info!(
+                    ecrites = n,
+                    ms = debut.elapsed().as_millis() as u64,
+                    "cles_de_tri_rafraichies"
+                ),
+                Err(e) => tracing::warn!(error = %e, "cles_de_tri_rafraichissement_echec"),
+            }
+        });
+    }
+}
+
+/// #9260 — relâche `complet_en_cours` quand le rafraîchissement de fond se
+/// termine, panique comprise, ou quand il n'a jamais pu partir (fermeture
+/// abandonnée). Un rafraîchissement parti, même mort, compte comme le
+/// dernier : il ne se relance pas en boucle.
+struct FinDuRafraichissement {
+    parti: bool,
+}
+
+impl Drop for FinDuRafraichissement {
+    fn drop(&mut self) {
+        let mut etat = ETAT_DES_CLES.lock().unwrap_or_else(|e| e.into_inner());
+        etat.complet_en_cours = false;
+        if self.parti {
+            etat.dernier_complet = Some(Instant::now());
         }
     }
 }
@@ -473,3 +485,7 @@ mod tests {
         assert!(Curseur::decoder("pas-un-curseur!").is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "cles_de_tri_en_fond_9260_tests.rs"]
+mod en_fond_9260;

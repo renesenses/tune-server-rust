@@ -266,23 +266,29 @@ pub fn lancer_en_fond(db: Arc<dyn DbBackend>, occupe: fn() -> bool) -> bool {
     if EN_COURS.swap(true, Ordering::SeqCst) {
         return false;
     }
-    let lance = std::thread::Builder::new()
-        .name("debit-des-pistes".into())
-        .spawn(move || {
-            let debut = Instant::now();
-            while occupe() && debut.elapsed() < ATTENTE_DU_DROIT {
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            if !occupe() {
-                completer_les_debits(db.as_ref(), occupe);
-            }
-            EN_COURS.store(false, Ordering::SeqCst);
-        });
-    if lance.is_err() {
+    let fin = FinDeLaPasse;
+    // #9260 — hors d'un fil nu : le moteur PostgreSQL y paniquait, et
+    // `EN_COURS` restait pris pour toute la vie du processus.
+    crate::db::fil_de_fond::lancer("debit-des-pistes", move || {
+        let _fin = fin;
+        let debut = Instant::now();
+        while occupe() && debut.elapsed() < ATTENTE_DU_DROIT {
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        if !occupe() {
+            completer_les_debits(db.as_ref(), occupe);
+        }
+    })
+}
+
+/// #9260 — remet [`EN_COURS`] à faux quand la passe se termine, panique
+/// comprise, ou quand elle n'a jamais pu partir (fermeture abandonnée).
+struct FinDeLaPasse;
+
+impl Drop for FinDeLaPasse {
+    fn drop(&mut self) {
         EN_COURS.store(false, Ordering::SeqCst);
-        return false;
     }
-    true
 }
 
 #[cfg(test)]
