@@ -35,8 +35,13 @@
 //! Mesurées sur le prototype avant d'être figées (le banc les rejoue,
 //! `examples/banc_modulateur_dsd.rs`) : ordre 7 et `HINF` = 1,5 donnent
 //! 3 dB de bruit en moins mais décrochent dès 60 % de modulation ; `HINF` =
-//! 1,3 reste stable jusqu'à 68 % avec le dither, soit plus de 2,7 dB de marge
-//! au-dessus du limiteur.
+//! 1,3 reste stable au limiteur (60 %).
+//!
+//! Dither : ±0,1 laissait des tons de repos sur une entrée continue faible
+//! (raie à −125,7 dB pour un continu de 3e-3, −121,9 dB sans dither) ; ±0,2
+//! les ramène à −136,6 dB pour moins de 1 dB de bruit en bande en plus, et la
+//! boucle reste stable sur les pires cas (crête intersample tenue à 60 % :
+//! entrée du quantificateur ≤ 1,06, aucune remise à zéro).
 //!
 //! Aucune allocation dans [`ModulateurDsd::traiter`].
 
@@ -59,7 +64,7 @@ pub const NIVEAU_REFERENCE: f64 = 0.5;
 /// Plafond de modulation à l'entrée de la boucle.
 pub const LIMITE_MODULATION: f64 = 0.6;
 /// Amplitude crête du dither TPDF devant le quantificateur.
-pub const DITHER: f64 = 0.1;
+pub const DITHER: f64 = 0.2;
 /// Au-delà, la boucle est jugée instable et remise à zéro.
 pub const SEUIL_INSTABILITE: f64 = 4.0;
 /// Durée de la rampe de volume.

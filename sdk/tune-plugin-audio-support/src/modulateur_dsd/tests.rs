@@ -325,19 +325,20 @@ fn emballage_et_signe() {
 }
 
 /// Le dither casse les tons de repos d'un modulateur à 1 bit. Entrée
-/// continue faible (−60 dBFS) : sans dither, la boucle tombe dans un cycle
-/// limite qui sort des raies dans la bande audio ; avec le dither, plus de
-/// raie au-dessus de −135 dB. CONTRE-ÉPREUVE dans le même test : dither à 0,
-/// même entrée, la raie dépasse le seuil.
+/// continue faible (3e-3, soit −50 dBFS) : sans dither, la boucle tombe dans
+/// un cycle limite qui sort une raie à −122 dB dans la bande audio ; avec le
+/// dither, plus de raie au-dessus de −130 dB (mesuré : −136,6 dB).
+/// CONTRE-ÉPREUVE dans le même test : dither à 0, même entrée, la raie
+/// dépasse le seuil.
 #[test]
 fn le_dither_casse_les_tons_de_repos() {
-    const SEUIL_DB: f64 = -135.0;
+    const SEUIL_DB: f64 = -130.0;
     let fs_dsd = 2_822_400.0;
     let raie = |dither: f64| {
         let mut m =
             ModulateurDsd::avec_reglages(FS, 2, CadenceDsd::Dsd64, HINF, dither).unwrap();
         let n = trames_pour(&m, N_FFT);
-        let octets = moduler(&mut m, &vec![1e-3; n * 2]);
+        let octets = moduler(&mut m, &vec![3e-3; n * 2]);
         analyser(&fin_du_canal(&octets, 2, N_FFT), fs_dsd, None).raie_max_db
     };
     let avec = raie(DITHER);
