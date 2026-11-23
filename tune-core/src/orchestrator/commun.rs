@@ -715,6 +715,19 @@ impl PlaybackOrchestrator {
         ) {
             return (Some(c.nature), c.id, c.service, c.titre, c.pochette);
         }
+        // Fil 3009, point 4 — sans session (perdue au redémarrage), le
+        // conteneur de la reprise enregistrée qui contient cette ligne.
+        if etat.session_context_type.is_none()
+            && let Some(c) = crate::db::listening_resume::contexte_de_la_ligne_reprise(
+                &self.db,
+                etat.zone_id,
+                etat.queue_position,
+                track_id,
+                source_id,
+            )
+        {
+            return (Some(c.nature), c.id, c.service, c.titre, c.pochette);
+        }
         (
             etat.session_context_type.clone(),
             etat.session_context_id.clone(),
