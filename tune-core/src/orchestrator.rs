@@ -2324,7 +2324,7 @@ pub(crate) mod faux_serveur_de_flux_tess;
 // TESS T12a — la chaîne TESS sur OAAT, vérifiée sur un faux récepteur (#9176).
 #[cfg(all(test, feature = "oaat"))]
 mod tess_t12a_oaat_tests;
-// TESS T12c — AirPlay sous la chaîne TESS, HQPlayer et Diretta hors TESS.
+// TESS T12c — AirPlay sous la chaîne TESS, sorties hors TESS (Q8).
 #[cfg(test)]
 mod tess_t12c_airplay_tests;
 // Suite de #9175 — saut et reprise de bout en bout avec une vraie sortie Sendspin.

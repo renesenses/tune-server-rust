@@ -3711,7 +3711,7 @@ fn decider_les_forcages(
     // octets. Constaté sur la session (`StreamInfo::relaye_tel_quel`), pas
     // déduit.
     let relaye_par_le_mandataire = wire.is_some_and(|w| w.relaye_tel_quel);
-    // TESS T12c (décision Q8) — HQPlayer et Diretta sont hors TESS : aucun
+    // TESS T12c (décision Q8) — les sorties hors TESS : aucun
     // étage de la chaîne ne leur est appliqué (`orchestrator::regles::
     // pull_output_needs_dsp_transcode`), le panneau ne l'annonce donc pas.
     let sortie_hors_tess = matches!(output_type, "hqplayer" | "diretta");

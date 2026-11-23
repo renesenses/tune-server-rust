@@ -974,10 +974,10 @@ pub(super) fn pull_output_needs_dsp_transcode(
         && source_format != Some(AudioFormat::Dsd)
 }
 
-/// TESS T12c (décision Q8) — HQPlayer et Diretta sont HORS TESS : HQPlayer
-/// applique son propre traitement, Diretta transporte le flux tel quel jusqu'à
-/// son hôte. Aucun étage de la chaîne n'y est appliqué (le flux part tel
-/// quel), et l'écran TESS en donne le motif (`tess::zones::MotifHorsTess`).
+/// TESS T12c (décision Q8) — les transports hors TESS de `TransportZone`
+/// (HQPlayer et l'autre) appliquent leur propre traitement ou transportent le
+/// flux tel quel : aucun étage de la chaîne n'y est appliqué, le flux part tel
+/// quel, et l'écran TESS en donne le motif (`tess::zones::MotifHorsTess`).
 pub(super) fn sortie_hors_tess(output_type: Option<&str>) -> bool {
     matches!(
         crate::tess::TransportZone::depuis_type_de_sortie(output_type),

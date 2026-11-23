@@ -1,9 +1,9 @@
 //! TESS T12c — AirPlay (flux fabriqué par Tune) sous la chaîne TESS, et les
-//! exclusions HQPlayer et Diretta (décision Q8).
+//! exclusions hors TESS (décision Q8).
 //!
 //! 1. Décision réelle (`decider_la_lecture_locale`) : sur une zone AirPlay 2
 //!    ou Devialet AIR, le crossfeed SEUL force le flux traité par le relais ;
-//!    sur HQPlayer et Diretta, un égaliseur armé ne force plus rien.
+//!    sur les sorties hors TESS, un égaliseur armé ne force plus rien.
 //! 2. De bout en bout, sur les OCTETS : la vraie porte de lecture
 //!    (`PlaybackOrchestrator::play`), la vraie sortie AirPlay 1
 //!    ([`AirplayOutput`]), un faux récepteur RTSP/RTP sur la boucle locale qui
@@ -129,7 +129,7 @@ async fn crossfeed_seul_force_le_flux_traite_sur_airplay_et_air_t12c() {
     }
 }
 
-/// 🔴 → 🟢 HQPlayer et Diretta sont hors TESS (Q8) : un égaliseur armé ne
+/// 🔴 → 🟢 Les sorties hors TESS (Q8) : un égaliseur armé ne
 /// force plus le transcodage, la piste part telle quelle. Avant T12c, il les
 /// transcodait (#1216).
 #[tokio::test]

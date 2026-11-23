@@ -991,7 +991,7 @@ fn pull_output_dsp_transcode_classification() {
         false,
         flac
     ));
-    // TESS T12c (décision Q8) : HQPlayer et Diretta sont HORS TESS, aucun
+    // TESS T12c (décision Q8) : les sorties hors TESS le sont, aucun
     // étage de la chaîne ne leur est appliqué.
     for hors_tess in ["diretta", "hqplayer"] {
         assert!(
@@ -1086,7 +1086,7 @@ fn is_pull_dsp_output_type_est_la_part_type_de_pull_output_needs_dsp_transcode()
         "diretta",
         "un-greffon-hors-depot",
     ] {
-        // TESS T12c — seule exception : HQPlayer et Diretta restent des
+        // TESS T12c — seule exception : les sorties hors TESS restent des
         // sorties PULL (transport bit-perfect, #2189), mais hors TESS (Q8) :
         // aucun traitement ne leur est forcé.
         let hors_tess = matches!(t, "hqplayer" | "diretta");
