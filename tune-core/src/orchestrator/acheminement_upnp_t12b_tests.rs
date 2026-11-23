@@ -268,7 +268,11 @@ impl Servi {
     /// Les échantillons décodés et leur nombre de trames.
     fn pcm(&self) -> (Vec<i32>, u64) {
         let dir = tempfile::tempdir().unwrap();
-        let ext = if self.mime.contains("wav") { "wav" } else { "flac" };
+        let ext = if self.mime.contains("wav") {
+            "wav"
+        } else {
+            "flac"
+        };
         let f = dir.path().join(format!("servi.{ext}"));
         std::fs::write(&f, &self.octets).unwrap();
         let d = crate::audio::decode::decode_to_pcm(&f.to_string_lossy(), None, None, 0.0, 0.0)
@@ -425,7 +429,11 @@ fn la_voie_publiee_est_celle_de_la_lecture_case_par_case() {
         };
         let r = chaine.resoudre(&catalogue_de_reference(), &ctx);
         for rg in [false, true] {
-            for lpcm in [LpcmDuLecteur::Accepted, LpcmDuLecteur::Refused, LpcmDuLecteur::Unknown] {
+            for lpcm in [
+                LpcmDuLecteur::Accepted,
+                LpcmDuLecteur::Refused,
+                LpcmDuLecteur::Unknown,
+            ] {
                 for opt_in in [false, true] {
                     for (origine, decodable) in [
                         (OrigineDuFlux::Library, true),
@@ -480,9 +488,17 @@ async fn en_pure_le_faux_lecteur_recoit_la_source_a_l_octet() {
     let (fichier, pcm_source, trames) = source(PISTE_24.0);
 
     let s = jouer(&b, id).await;
-    assert_eq!(s.voie, voie::FICHIER_TEL_QUEL, "Pure : le fichier, octet pour octet");
+    assert_eq!(
+        s.voie,
+        voie::FICHIER_TEL_QUEL,
+        "Pure : le fichier, octet pour octet"
+    );
     assert!(!s.progressif);
-    assert_eq!(sha(&s.octets), sha(&fichier), "sha256 servi = sha256 source");
+    assert_eq!(
+        sha(&s.octets),
+        sha(&fichier),
+        "sha256 servi = sha256 source"
+    );
     let (pcm, n) = s.pcm();
     assert_eq!(n, trames);
     assert!(pcm == pcm_source);
@@ -535,7 +551,11 @@ async fn un_lecteur_l16_seul_recoit_un_repli_propre_en_24_bits() {
     b.opt_in();
 
     let f24 = b.faits(24).await;
-    assert_eq!(f24.lpcm, LpcmDuLecteur::Refused, "sonde concluante, pas de L24");
+    assert_eq!(
+        f24.lpcm,
+        LpcmDuLecteur::Refused,
+        "sonde concluante, pas de L24"
+    );
     assert_eq!(f24.lpcm_bits, 24);
     let s = jouer(&b, id24).await;
     assert!(!s.progressif, "aucun WAV 24 bits vers un lecteur L16");

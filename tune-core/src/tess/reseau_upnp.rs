@@ -160,7 +160,10 @@ enum Famille {
 
 fn famille(id: &str) -> Famille {
     match id {
-        "equalizer-graphic" | "equalizer-parametric" | "equalizer-headphone" | "convolution"
+        "equalizer-graphic"
+        | "equalizer-parametric"
+        | "equalizer-headphone"
+        | "convolution"
         | "room-correction" => Famille::Reencodage,
         "mono-downmix" | "channel-remap" => Famille::HorsRelais,
         _ => Famille::Casque,
@@ -177,7 +180,8 @@ fn greffons_effectifs(r: &Resolution) -> impl Iterator<Item = &EtapeResolue> {
 /// sans orchestrateur.
 pub fn acheminer(r: &Resolution, f: &FaitsUpnp) -> AcheminementUpnp {
     let reencodage = f.replaygain_actif
-        || greffons_effectifs(r).any(|e| famille(e.plugin_id.as_deref().unwrap_or("")) == Famille::Reencodage);
+        || greffons_effectifs(r)
+            .any(|e| famille(e.plugin_id.as_deref().unwrap_or("")) == Famille::Reencodage);
     let casque = greffons_effectifs(r)
         .any(|e| famille(e.plugin_id.as_deref().unwrap_or("")) == Famille::Casque);
     let lpcm = f.lpcm == LpcmDuLecteur::Accepted;
@@ -261,12 +265,12 @@ pub fn appliquer(r: &mut Resolution, a: &AcheminementUpnp) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tess::TauxDsd;
     use crate::tess::chaine::{ChaineTess, MaillonGreffon};
     use crate::tess::greffon::catalogue_de_reference;
     use crate::tess::resolution::{
         Badge, ContexteExecution, ControleVolume, LectureDsd, SourceFlux, VolumeZone,
     };
-    use crate::tess::TauxDsd;
     use serde_json::Value;
 
     fn tout(_: &str) -> bool {
@@ -327,7 +331,10 @@ mod tests {
 
     #[test]
     fn rien_a_traiter_reste_intact_quel_que_soit_le_lecteur() {
-        for (ids, pure) in [(&[][..], false), (&["equalizer-graphic", "crossfeed"][..], true)] {
+        for (ids, pure) in [
+            (&[][..], false),
+            (&["equalizer-graphic", "crossfeed"][..], true),
+        ] {
             let r = resoudre(ids, pure, PCM24);
             for l in [Accepted, Refused, Unknown] {
                 for arme in [false, true] {
@@ -358,24 +365,57 @@ mod tests {
     fn matrice_de_la_bibliotheque() {
         // (greffons, LPCM, opt-in) → voie attendue
         let cas: &[(&[&str], LpcmDuLecteur, bool, VoieUpnp)] = &[
-            (&["equalizer-graphic"], Accepted, true, VoieUpnp::ProgressiveLpcm),
-            (&["equalizer-graphic"], Accepted, false, VoieUpnp::FileTranscode),
-            (&["equalizer-graphic"], Refused, true, VoieUpnp::FileTranscode),
-            (&["equalizer-graphic"], Unknown, true, VoieUpnp::FileTranscode),
+            (
+                &["equalizer-graphic"],
+                Accepted,
+                true,
+                VoieUpnp::ProgressiveLpcm,
+            ),
+            (
+                &["equalizer-graphic"],
+                Accepted,
+                false,
+                VoieUpnp::FileTranscode,
+            ),
+            (
+                &["equalizer-graphic"],
+                Refused,
+                true,
+                VoieUpnp::FileTranscode,
+            ),
+            (
+                &["equalizer-graphic"],
+                Unknown,
+                true,
+                VoieUpnp::FileTranscode,
+            ),
             (&["convolution"], Refused, false, VoieUpnp::FileTranscode),
             (&["crossfeed"], Accepted, false, VoieUpnp::ProgressiveLpcm),
             (&["crossfeed"], Refused, true, VoieUpnp::Untouched),
             (&["crossfeed"], Unknown, false, VoieUpnp::Untouched),
             (&["crosstalk"], Refused, false, VoieUpnp::Untouched),
-            (&["equalizer-graphic", "crossfeed"], Accepted, false, VoieUpnp::FileTranscode),
-            (&["equalizer-graphic", "crossfeed"], Refused, false, VoieUpnp::FileTranscode),
+            (
+                &["equalizer-graphic", "crossfeed"],
+                Accepted,
+                false,
+                VoieUpnp::FileTranscode,
+            ),
+            (
+                &["equalizer-graphic", "crossfeed"],
+                Refused,
+                false,
+                VoieUpnp::FileTranscode,
+            ),
         ];
         for (ids, l, arme, voie) in cas {
             let r = resoudre(ids, false, PCM24);
             let a = acheminer(&r, &faits(*l, *arme, Library));
             assert_eq!(a.route, *voie, "{ids:?} {l:?} arme={arme}");
             if *voie != VoieUpnp::ProgressiveLpcm {
-                assert!(a.reason.is_some() && a.detail.is_some(), "{ids:?} : motif publié");
+                assert!(
+                    a.reason.is_some() && a.detail.is_some(),
+                    "{ids:?} : motif publié"
+                );
             }
         }
     }
@@ -420,7 +460,11 @@ mod tests {
             assert_eq!(g.detail.as_deref(), Some(DETAIL_SANS_LPCM));
             assert_eq!(r.badge, Badge::BitPerfect, "{id}");
             assert_eq!(r.headroom_db, 0.0, "{id}");
-            let h = r.etapes.iter().find(|e| e.code == CodeEtape::Headroom).unwrap();
+            let h = r
+                .etapes
+                .iter()
+                .find(|e| e.code == CodeEtape::Headroom)
+                .unwrap();
             assert_eq!(h.reason, Some(MotifEtape::NothingToProtect), "{id}");
             let q = r
                 .etapes

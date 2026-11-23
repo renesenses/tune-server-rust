@@ -361,10 +361,7 @@ async fn reponse_de_zone(
     // progressif LPCM, transcodage, ou aucune), établie par la même sonde et
     // les mêmes réglages que la lecture. `None` hors famille UPnP.
     let piste = piste_en_cours(&etat);
-    let lecteur = state
-        .orchestrator
-        .faits_upnp_de_zone(zone_id, &piste)
-        .await;
+    let lecteur = state.orchestrator.faits_upnp_de_zone(zone_id, &piste).await;
     ReponseTessZone::depuis_avec_le_lecteur(
         zone_id,
         lecture.chaine,

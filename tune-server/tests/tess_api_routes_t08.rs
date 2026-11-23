@@ -1038,7 +1038,11 @@ async fn la_famille_upnp_publie_la_voie_de_sa_chaine_t12b() {
         assert_eq!(s, StatusCode::OK, "{v}");
         let (_, v) = b.get().await;
         conforme_au_schema("zone_response", &v).unwrap();
-        assert_eq!(v["delivery"]["route"], json!("progressive_lpcm"), "{sortie} : {v}");
+        assert_eq!(
+            v["delivery"]["route"],
+            json!("progressive_lpcm"),
+            "{sortie} : {v}"
+        );
         assert_eq!(v["delivery"]["renderer_lpcm"], json!("accepted"), "{v}");
         assert_eq!(etape(&v, "crossfeed")["effective"], json!(true), "{v}");
     }

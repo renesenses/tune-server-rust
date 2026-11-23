@@ -21,8 +21,8 @@ use serde_json::{Map, Value, json};
 use super::VERSION_CONTRAT;
 use super::chaine::{ChaineTess, ErreurChaine};
 use super::greffon::Catalogue;
-use super::resolution::{Badge, ContexteExecution, EtapeResolue, EtatVolume, MotifEtape};
 use super::reseau_upnp::{AcheminementUpnp, FaitsUpnp, acheminer, appliquer, famille_upnp};
+use super::resolution::{Badge, ContexteExecution, EtapeResolue, EtatVolume, MotifEtape};
 use super::zones::{Applicabilite, TransportZone};
 
 /// La réponse de `GET /zones/{id}/tess` (et d'un `PUT` accepté).
@@ -696,7 +696,11 @@ mod tests {
             service_decodable_au_fil: true,
         };
         for t in TransportZone::ALL {
-            for c in [ChaineTess::default(), chaine_complete(), casque_seul.clone()] {
+            for c in [
+                ChaineTess::default(),
+                chaine_complete(),
+                casque_seul.clone(),
+            ] {
                 let r = ReponseTessZone::depuis_avec_le_lecteur(
                     12,
                     c.clone(),
