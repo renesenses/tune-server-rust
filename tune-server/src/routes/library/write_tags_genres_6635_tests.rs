@@ -342,6 +342,39 @@ async fn graver_tags_refuse_le_fichier_en_cours_de_lecture_6635() {
     assert!(restes(banc.dir.path()).is_empty());
 }
 
+async fn attendre_fin_gravure(
+    taches: &crate::background_tasks::BackgroundTasks,
+    evenements: &mut tokio::sync::broadcast::Receiver<tune_core::event_bus::TuneEvent>,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    while taches.snapshot().iter().any(|t| t.id == "write_tags") {
+        match evenements.recv().await {
+            Ok(_) | Err(RecvError::Lagged(_)) => {}
+            Err(RecvError::Closed) => panic!("bus fermé avant la fin de la gravure"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn attendre_fin_gravure_sur_un_bus_sature_6635() {
+    use std::sync::Arc;
+    use tokio::sync::broadcast::error::TryRecvError;
+    let bus = Arc::new(tune_core::event_bus::EventBus::new());
+    let taches = crate::background_tasks::BackgroundTasks::new(Arc::clone(&bus));
+    let garde = taches.begin("write_tags", "Gravure", "library");
+    let mut evenements = bus.subscribe();
+    let mut temoin = bus.subscribe();
+    for _ in 0..257 {
+        bus.emit("library.scan.progress", Value::Null);
+    }
+    assert!(matches!(temoin.try_recv(), Err(TryRecvError::Lagged(_))));
+    let attente = attendre_fin_gravure(&taches, &mut evenements);
+    tokio::pin!(attente);
+    assert!(futures_util::poll!(&mut attente).is_pending());
+    drop(garde);
+    attente.await;
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn graver_tags_refuse_le_fichier_en_lecture_seule_6635() {
@@ -363,20 +396,10 @@ async fn graver_tags_refuse_le_fichier_en_lecture_seule_6635() {
     )
     .await;
     assert_eq!(reponse.status(), StatusCode::ACCEPTED);
-    tokio::time::timeout(std::time::Duration::from_secs(120), async {
-        while banc
-            .state
-            .background_tasks
-            .snapshot()
-            .iter()
-            .any(|t| t.id == "write_tags")
-        {
-            evenements
-                .recv()
-                .await
-                .expect("signal de fin de la gravure");
-        }
-    })
+    tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        attendre_fin_gravure(&banc.state.background_tasks, &mut evenements),
+    )
     .await
     .expect("#6635 : la tâche de gravure ne libère pas sa garde de fin");
     let reglages =
