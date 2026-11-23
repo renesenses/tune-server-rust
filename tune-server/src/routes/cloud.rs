@@ -362,6 +362,7 @@ async fn sso_authorize(
     headers: HeaderMap,
     Query(requete): Query<Vec<(String, String)>>,
 ) -> impl IntoResponse {
+    let par_le_reseau_local = garde.as_ref().is_ok_and(|g| g.par_le_reseau_local);
     let liaison = match liaison_autorisee(&state, garde, appelant) {
         Ok(l) => l,
         Err(refus) => return page_refus_hors_machine(&headers, refus),
@@ -402,6 +403,13 @@ async fn sso_authorize(
     settings
         .set(&cle_pkce, &serde_json::to_string(&pkce).unwrap_or_default())
         .ok();
+    // D'où la ronde est lancée : le retour en garde la règle (relecture A).
+    let cle_lan = cle_lancee_du_reseau_local(&cle_pkce);
+    if par_le_reseau_local {
+        settings.set(&cle_lan, "1").ok();
+    } else {
+        settings.delete(&cle_lan).ok();
+    }
 
     let uri = redirect_uri(&state, Some(&headers));
     // Persist the exact redirect_uri: OAuth requires the token exchange in the
@@ -446,8 +454,14 @@ fn prendre_l_attente_pkce(
     settings: &SettingsRepo,
     cle_pkce: &str,
     state_recu: Option<&str>,
-) -> Result<PkceSession, AttentePkce> {
+) -> Result<AttenteConsommee, AttentePkce> {
     let cle_date = format!("{cle_pkce}_at");
+    let cle_lan = cle_lancee_du_reseau_local(cle_pkce);
+    let lancee_du_reseau_local = settings
+        .get(&cle_lan)
+        .ok()
+        .flatten()
+        .is_some_and(|v| v.trim() == "1");
     let emise = settings
         .get(&cle_date)
         .ok()
@@ -469,6 +483,7 @@ fn prendre_l_attente_pkce(
     let consommer = || {
         settings.set(cle_pkce, "").ok();
         settings.delete(&cle_date).ok();
+        settings.delete(&cle_lan).ok();
     };
     let Some(pkce) = pending else {
         consommer();
@@ -478,7 +493,25 @@ fn prendre_l_attente_pkce(
         return Err(AttentePkce::EtatDifferent);
     }
     consommer();
-    Ok(pkce)
+    Ok(AttenteConsommee {
+        pkce,
+        lancee_du_reseau_local,
+    })
+}
+
+/// Une attente PKCE consommée, et d'où sa ronde a été LANCÉE.
+struct AttenteConsommee {
+    pkce: PkceSession,
+    /// L'autorisation a été ouverte par le réseau local (relecture A) : le
+    /// retour garde la règle du réseau local même s'il arrive de cette
+    /// machine (un lien ou une image qui y rejoue le `code` et le `state`).
+    lancee_du_reseau_local: bool,
+}
+
+/// La marque « ronde lancée du réseau local », posée à côté de l'attente
+/// PKCE et effacée avec elle.
+fn cle_lancee_du_reseau_local(cle_pkce: &str) -> String {
+    format!("{cle_pkce}_lan")
 }
 
 fn maintenant_unix() -> u64 {
@@ -546,8 +579,9 @@ async fn sso_callback(
     let (cle_pkce, _) = cles_d_attente(Liaison::Serveur);
     // Tenu jusqu'à l'écriture de `mozaik_user` (voir `VERROU_DE_LIAISON`).
     let ronde = VERROU_DE_LIAISON.lock().await;
-    let pkce = match prendre_l_attente_pkce(&settings, &cle_pkce, q.state.as_deref()) {
-        Ok(pkce) => pkce,
+    let (pkce, lancee_du_reseau_local) =
+        match prendre_l_attente_pkce(&settings, &cle_pkce, q.state.as_deref()) {
+        Ok(a) => (a.pkce, a.lancee_du_reseau_local),
         Err(AttentePkce::Absente) => {
             return page_echec_compte(
                 &headers,
@@ -564,6 +598,10 @@ async fn sso_callback(
             );
         }
     };
+    // Relecture A : la règle du réseau local suit la RONDE, pas seulement le
+    // retour. Une autorisation lancée du réseau local, rejouée sur cette
+    // machine (lien, image), reste jugée comme venue du réseau local.
+    let par_le_reseau_local = par_le_reseau_local || lancee_du_reseau_local;
 
     // Reuse the exact redirect_uri minted at authorize time (must match); fall
     // back to deriving it from this request's Host if the pending value is gone.
@@ -893,7 +931,7 @@ async fn sso_callback_profil(
     // Tenu jusqu'à l'écriture du compte du profil (voir `VERROU_DE_LIAISON`).
     let ronde = VERROU_DE_LIAISON.lock().await;
     let pkce = match prendre_l_attente_pkce(&settings, &cle_pkce, q.state.as_deref()) {
-        Ok(pkce) => pkce,
+        Ok(a) => a.pkce,
         Err(AttentePkce::Absente) => {
             return page_echec_compte(
                 headers,
