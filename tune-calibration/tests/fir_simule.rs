@@ -165,6 +165,19 @@ fn le_fir_mesure_tient_aussi_dans_la_piece_reverberante() {
     );
     let e_sans = ecart(&ir, &[1.0], 0, &cible, None);
     eprintln!("T10b réverbérante : écart max {e:.3} dB avec FIR, {e_sans:.3} dB sans");
+    let grille = LogResponse::grid(20.0, 20_000.0, 48);
+    let r = lissage_variable(
+        &reponse_corrigee(&ir, &fir.coefficients, 0, &grille),
+        6,
+        3,
+        300.0,
+    );
+    for (f, m) in r.freqs.iter().zip(&r.magnitude_db) {
+        let d = m - cible.level_db(*f) - fir.decalage_cible_db;
+        if (BANDE.0..=BANDE.1).contains(f) && d.abs() > 1.0 {
+            eprintln!("T10b réverbérante : {f:.1} Hz écart {d:+.2} dB");
+        }
+    }
     assert!(e < TOLERANCE_DB, "écart {e:.2} dB");
     assert!(e_sans > TOLERANCE_DB);
 }
