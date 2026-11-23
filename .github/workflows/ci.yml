@@ -57,6 +57,12 @@ jobs:
       - name: Vérifier les payloads de promotion (200 Kio, aucun réseau)
         run: python3 scripts/test-promotion-payloads-8902.py
 
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Vérifier le contrat public dans tout le dépôt
+        run: |
+          rustc --edition=2024 --test sdk/tune-plugin-surechantillonnage/tests/catalogue_prive.rs -o "$RUNNER_TEMP/garde-catalogue"
+          "$RUNNER_TEMP/garde-catalogue"
+
       - name: Verify generated plugin lists
         run: python scripts/plugin-catalog.py --check
 
