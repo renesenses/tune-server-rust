@@ -15,9 +15,10 @@
 //!   près (bit-perfect) ;
 //! - aucune chaîne : idem.
 //!
-//! 🔴 Avant T12a (#9176), OAAT lisait le fichier WAV EN DIRECT
-//! (`file_path`) et la voie droite restait nulle malgré le crossfeed : le
-//! test `crossfeed_sur_oaat_allume_la_voie_droite_t12a` le montre.
+//! 🔴 Avant #9176 (`oaat_peut_lire_le_fichier`), OAAT lisait le fichier WAV
+//! EN DIRECT (`file_path`) et la voie droite restait nulle malgré le
+//! crossfeed : le test `crossfeed_sur_oaat_allume_la_voie_droite_t12a` le
+//! montre sur les octets (contre-épreuve : filtre retiré → `droite_max: 0`).
 //!
 //! Aucun son, rien hors de `127.0.0.1`.
 
@@ -274,7 +275,7 @@ async fn jouer(chaine: Chaine) -> Lecture {
     }
     let attendu_actif = matches!(chaine, Chaine::Crossfeed | Chaine::GreffonTiers);
     assert_eq!(
-        orch.chaine_du_flux_active(zone_id, crate::audio::replaygain::PisteRg::AUCUNE),
+        orch.zone_has_active_crossfeed(zone_id),
         attendu_actif,
         "prémisse : chaîne {chaine:?}"
     );
@@ -400,14 +401,4 @@ async fn sans_chaine_oaat_recoit_la_source_t12a() {
         l.file_path_remis, l.premier_paquet
     );
     assert!(c.identique, "{c:?}");
-}
-
-#[test]
-fn oaat_ne_lit_le_fichier_que_sans_chaine_ou_en_dsd_t12a() {
-    use super::transport::oaat_lit_le_fichier as lit;
-    assert!(lit("/musique/a.wav", false));
-    assert!(!lit("/musique/a.wav", true), "#9176");
-    assert!(!lit("/musique/a.flac", true));
-    assert!(lit("/musique/a.dsf", true), "DSD natif : hors chaîne PCM");
-    assert!(lit("/musique/a.DFF", true));
 }

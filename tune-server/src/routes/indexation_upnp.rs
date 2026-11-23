@@ -959,6 +959,13 @@ fn ecrire(
     let albums_repo = AlbumRepo::with_backend(state.backend.clone());
     let artistes_repo = ArtistRepo::with_backend(state.backend.clone());
     let meta_repo = TrackMetadataRepo::with_backend(state.backend.clone());
+    // #9336 — l'hôte d'annonce du serveur AU MOMENT de l'indexation. La
+    // lecture ne reportera l'URL sur une nouvelle adresse que si elle
+    // pointait sur cet hôte-là (un serveur peut servir ses fichiers depuis un
+    // autre hôte que sa description).
+    let hote_d_annonce =
+        tune_core::db::media_server_repo::MediaServerRepo::with_backend(state.backend.clone())
+            .hote_d_annonce(udn);
 
     let mut plan = match identites::preparer(state, udn, pistes) {
         Ok(plan) => plan,
@@ -1232,6 +1239,12 @@ fn ecrire(
         instantane.insert(CLE_OBJECT_ID.to_string(), piste.object_id.clone());
         instantane.insert(CLE_SERVEUR.to_string(), udn.to_string());
         instantane.insert(CLE_SERVEUR_NOM.to_string(), nom_du_serveur.to_string());
+        if let Some(hote) = &hote_d_annonce {
+            instantane.insert(
+                tune_core::db::media_server_repo::CLE_HOTE_D_ANNONCE_UPNP.to_string(),
+                hote.clone(),
+            );
+        }
         if let Err(e) = meta_repo.set_batch(id, &instantane) {
             bilan
                 .erreurs
@@ -1641,6 +1654,67 @@ mod tests {
         assert_eq!(bilan.mises_a_jour, 4);
         assert_eq!(ordre(&repo), attendu);
         assert_eq!(zeros(&state), Some(0));
+    }
+
+    /// #9336 — l'indexation range l'hôte d'annonce du serveur (celui de sa
+    /// `LOCATION`) à côté de l'URL de lecture : la lecture ne reportera
+    /// l'URL que si elle pointait sur cet hôte-là.
+    #[test]
+    fn l_indexation_range_l_hote_d_annonce_9336() {
+        use tune_core::db::media_server_repo::{
+            CLE_HOTE_D_ANNONCE_UPNP, MediaServerRepo, ObservationServeurRecue,
+        };
+        let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+        MediaServerRepo::with_backend(state.backend.clone())
+            .enregistrer_observation(&ObservationServeurRecue {
+                udn: "uuid:nas-9336".into(),
+                name: "NAS".into(),
+                device_type: "upnp_media_server".into(),
+                location: "http://192.168.1.15:8200/rootDesc.xml".into(),
+                host: Some("192.168.1.15".into()),
+                port: Some(8200),
+                ..Default::default()
+            })
+            .unwrap();
+        let piste = PisteDistante {
+            object_id: "o1".into(),
+            titre: "Une".into(),
+            artiste: Some("Artiste".into()),
+            album: Some("Album".into()),
+            url_de_lecture: Some("http://192.168.1.15:8200/MediaItems/1.flac".into()),
+            pochette: None,
+            duree_ms: Some(1000),
+            taille: Some(1000),
+            sample_rate: None,
+            bit_depth: None,
+            channels: None,
+            protocol_info: None,
+            numero_de_piste: Some(1),
+            numero_de_disque: Some(1),
+            annee: None,
+            genres: Vec::new(),
+        };
+        let mut bilan = Bilan::default();
+        ecrire(
+            &state,
+            "uuid:nas-9336",
+            "NAS",
+            &[piste],
+            &mut bilan,
+            &HashMap::new(),
+        );
+        assert!(bilan.erreurs.is_empty(), "{:?}", bilan.erreurs);
+        let hote = state
+            .backend
+            .query_one(
+                &format!(
+                    "SELECT value FROM track_metadata WHERE key = '{CLE_HOTE_D_ANNONCE_UPNP}'"
+                ),
+                &[],
+            )
+            .unwrap()
+            .and_then(|l| l.first().and_then(|v| v.as_string()));
+        assert_eq!(hote.as_deref(), Some("192.168.1.15"));
     }
 
     /// b209 — réindexer une source identique ne fait pas avancer le

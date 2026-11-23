@@ -54,6 +54,7 @@ mod instance_existante;
 pub(crate) mod lancement_sans_console;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod navigateur_windows;
+pub mod retard_de_l_executeur_9391;
 pub use tune_http_types::error;
 #[cfg(feature = "local-audio")]
 pub mod exclusif_par_zone_3245;

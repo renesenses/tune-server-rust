@@ -263,8 +263,9 @@ async fn start_job(
         output_dir: output_dir.clone(),
     }));
 
+    // #9343 — la route et le chemin dans le message, pas « os error 30 » seul.
     crate::audio_job_journal::write("declick", &job_id, "running", total, 0)
-        .map_err(AppError::internal)?;
+        .map_err(|e| AppError::internal(format!("POST /declick/start: {e}")))?;
     let store = job_store();
     {
         let mut map = store.lock().await;

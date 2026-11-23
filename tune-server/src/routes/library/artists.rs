@@ -824,6 +824,10 @@ pub(super) fn site_dans_la_langue(site: Option<&Value>, demandee: &str) -> bool 
     site.is_some_and(|out| a_une_bio(out) && reponse_dans_la_langue(out, demandee))
 }
 
+/// La langue de repli préférée quand la langue demandée manque : l'anglais,
+/// avant toute autre langue disponible.
+pub(super) const REPLI_PREFERE: &str = "en";
+
 /// [`choisir_apres_le_site`], avec le texte éditorial d'un service de
 /// streaming connecté (#8022, `service`, déjà sous la forme d'un corps de
 /// réponse) inséré dans l'ordre : (a) site dans la langue ; (b) service dans
@@ -852,18 +856,27 @@ pub(super) fn choisir_apres_le_site_et_le_service(
     {
         return Issue::DansLaLangue(out.clone());
     }
+    // Les replis possibles, dans l'ordre d'avant : bio stockée, site, service.
+    let mut replis: Vec<Value> = Vec::new();
     if let Some(corps) = autre_langue_stockee {
-        return Issue::Repli(corps);
+        replis.push(corps);
     }
-    if let Some(out) = site
-        && let Some(langue) = langue_annoncee(&out)
-    {
-        return Issue::Repli(avec_repli(out, demandee, &langue));
+    for out in [site, service].into_iter().flatten() {
+        if let Some(langue) = langue_annoncee(&out) {
+            replis.push(avec_repli(out, demandee, &langue));
+        }
     }
-    if let Some(out) = service
-        && let Some(langue) = langue_annoncee(&out)
-    {
-        return Issue::Repli(avec_repli(out, demandee, &langue));
+    // Ordre attendu : langue de l'interface > anglais > autre. Une interface
+    // allemande à qui il ne reste qu'une bio stockée en français et un article
+    // anglais du site recevait le français, parce que la bio stockée passait
+    // toujours en premier (Manfred : Amy Winehouse, Accademia Bizantina).
+    let anglais = replis.iter().position(|r| {
+        r.pointer("/repli/langue_disponible")
+            .and_then(Value::as_str)
+            .is_some_and(|l| langue_convient(Some(l), REPLI_PREFERE))
+    });
+    if let Some(i) = anglais.or((!replis.is_empty()).then_some(0)) {
+        return Issue::Repli(replis.swap_remove(i));
     }
     Issue::Vide(sans_bio_dans_la_langue(
         cle,
@@ -2019,6 +2032,51 @@ mod tests_langue_bio {
             stocke_fr(),
             Some("Texte fr."),
             None,
+        ) else {
+            panic!("repli attendu")
+        };
+        assert_eq!(out["bio"], "Texte fr.");
+        assert_eq!(out["repli"]["langue_disponible"], "fr");
+    }
+
+    /// Interface allemande, bio stockée en français, site en anglais :
+    /// l'anglais passe avant le français (langue de l'interface > anglais > autre).
+    #[test]
+    fn interface_allemande_l_anglais_du_site_passe_avant_le_francais_stocke() {
+        let prov = json!({"source": "wikipedia", "lang": "fr"});
+        let stocke =
+            bio_stockee_dans_une_autre_langue("artist", "A", Some("Texte fr."), Some(&prov), "de");
+        let Issue::Repli(out) = choisir_apres_le_site(
+            "artist",
+            "A",
+            "de",
+            Some(rep("Text.", Some("en"))),
+            stocke,
+            Some("Texte fr."),
+            Some(&prov),
+        ) else {
+            panic!("repli attendu")
+        };
+        assert_eq!(out["bio"], "Text.");
+        assert_eq!(out["repli"]["langue_disponible"], "en");
+        assert_eq!(out["repli"]["langue_demandee"], "de");
+    }
+
+    /// Contre-épreuve : sans anglais nulle part, la bio stockée reste le repli
+    /// (avant le site dans une troisième langue).
+    #[test]
+    fn interface_allemande_sans_anglais_la_bio_stockee_reste_le_repli() {
+        let prov = json!({"source": "wikipedia", "lang": "fr"});
+        let stocke =
+            bio_stockee_dans_une_autre_langue("artist", "A", Some("Texte fr."), Some(&prov), "de");
+        let Issue::Repli(out) = choisir_apres_le_site(
+            "artist",
+            "A",
+            "de",
+            Some(rep("Testo.", Some("it"))),
+            stocke,
+            Some("Texte fr."),
+            Some(&prov),
         ) else {
             panic!("repli attendu")
         };

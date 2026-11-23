@@ -766,7 +766,7 @@ pub fn avec_le_flux_traite(sortie: CrossfeedStatus, porte_le_flux_traite: bool) 
 /// toute piste de la bibliothèque part en WAV progressif (`oaat_needs_wav`)
 /// par le relais qui porte la chaîne de la zone, et la lecture directe du
 /// fichier n'est plus permise qu'à une zone sans étage actif (#9176,
-/// `orchestrator::transport::oaat_lit_le_fichier`). Les flux des services
+/// `orchestrator::transport::oaat_peut_lire_le_fichier`). Les flux des services
 /// passent par `load_streaming_dsp`, comme partout. Il ne reste hors chaîne
 /// que le DSD natif, comme sur une sortie locale.
 pub fn sortie_porte_toute_la_chaine(
