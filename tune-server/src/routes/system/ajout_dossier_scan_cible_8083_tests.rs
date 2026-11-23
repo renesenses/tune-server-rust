@@ -88,6 +88,37 @@ fn chemin(p: &Path) -> String {
 // le droit de scanner est global au processus (voir `serialiser_les_scans_de_test`).
 #[allow(clippy::await_holding_lock)]
 async fn ajouter_un_dossier_ne_scanne_que_ce_dossier_8083() {
+    // Le droit de scanner et les tâches de fond sont globaux. Le verrou
+    // de test ne suffit pas à isoler les scans lancés par les autres modules.
+    const ENFANT: &str = "TUNE_TEST_SCAN_8083_ENFANT";
+    if std::env::var_os(ENFANT).is_none() {
+        let nom = concat!(
+            module_path!(),
+            "::ajouter_un_dossier_ne_scanne_que_ce_dossier_8083"
+        );
+        let (_, nom) = nom.split_once("::").expect("nom sans préfixe de caisse");
+        let sortie = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([nom, "--exact", "--nocapture", "--test-threads=1"])
+            .env(ENFANT, std::process::id().to_string())
+            .output()
+            .expect("lancer le témoin de scan isolé");
+        let stdout = String::from_utf8_lossy(&sortie.stdout);
+        let stderr = String::from_utf8_lossy(&sortie.stderr);
+        assert!(
+            sortie.status.success(),
+            "#8083 : témoin isolé en échec\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed; 0 failed; 0 ignored"),
+            "#8083 : le processus enfant doit exécuter exactement le témoin\n{stdout}\n{stderr}"
+        );
+        return;
+    }
+    assert_ne!(
+        std::env::var(ENFANT).unwrap(),
+        std::process::id().to_string(),
+        "#8083 : les états globaux doivent appartenir à un autre processus"
+    );
     let _seul = crate::routes::system::scan::serialiser_les_scans_de_test_sans_bloquer().await;
     crate::routes::system::scan::attendre_que_le_droit_de_scanner_soit_libre().await;
 
