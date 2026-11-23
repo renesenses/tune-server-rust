@@ -292,18 +292,29 @@ pub fn la_console_ecrit_deja_dans(_chemin: &std::path::Path) -> bool {
     false
 }
 
-/// #8946 — le fichier de journal, ouvert en ajout ; CRÉÉ en 0600 sous Unix.
+/// #8946 — le fichier de journal, ouvert en ajout ; en 0600 sous Unix.
 ///
 /// Le journal porte des chemins de la bibliothèque, des noms d'appareils, des
-/// adresses : il n'a pas à être lisible par les autres comptes. Le mode ne
-/// joue qu'à la création (un fichier existant garde le sien), donc au premier
-/// démarrage et à chaque rotation.
+/// adresses : il n'a pas à être lisible par les autres comptes. Créé en 0600 ;
+/// un fichier existant plus ouvert (laissé par une version antérieure, ou créé
+/// par une redirection du lanceur) est ramené à 0600 à l'ouverture, quand ce
+/// compte en est le propriétaire.
 fn ouvrir_en_ajout(chemin: &std::path::Path) -> io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    options.open(chemin)
+    let fichier = options.open(chemin)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Ok(meta) = fichier.metadata()
+            && meta.permissions().mode() & 0o077 != 0
+        {
+            let _ = fichier.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+    }
+    Ok(fichier)
 }
 
 /// Le dossier du journal, créé en 0700 sous Unix (seuls les dossiers CRÉÉS
@@ -409,6 +420,24 @@ mod tests {
     /// test, panique comprise. C'est cette famille qui pesait le plus lourd
     /// dans #3030 : 1 657 des 3 204 résidus de `/tmp` étaient des
     /// `tune-journal-*`.
+    /// Un journal existant en 0644 (version antérieure, redirection du
+    /// lanceur) est ramené à 0600 à l'ouverture.
+    #[cfg(unix)]
+    #[test]
+    fn un_journal_existant_trop_ouvert_est_ramene_a_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = dossier("journal-0600");
+        let chemin = d.path().join("tune-server.log");
+        std::fs::write(&chemin, b"ancienne ligne\n").expect("fichier existant");
+        std::fs::set_permissions(&chemin, std::fs::Permissions::from_mode(0o644)).expect("0644");
+
+        let (ouvert, refus) = ouvrir_le_premier_journal([chemin.clone()], 1024 * 1024);
+        assert!(refus.is_empty(), "{refus:?}");
+        assert!(ouvert.is_some());
+        let mode = std::fs::metadata(&chemin).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
     fn dossier(nom: &str) -> tune_core::test_scratch::ScratchDir {
         tune_core::test_scratch::scratch_dir(&format!("tune-journal-{nom}"))
     }

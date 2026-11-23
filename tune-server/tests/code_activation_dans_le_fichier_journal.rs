@@ -4,8 +4,8 @@
 //! (Daphile, `nohup`, certains services).
 //!
 //! Et il ne sort de la machine par aucun chemin : ni par les routes qui
-//! servent le journal, ni par le rapport de bogue envoyé au site, ni par la
-//! porte commune de ce qui part vers le site.
+//! servent le journal, ni par le rapport de bogue envoyé au site (journal
+//! joint compris), ni par la porte commune de ce qui part vers le site.
 //!
 //! Cible à part : elle installe le VRAI abonné `tracing` du serveur
 //! (`bootstrap::installer_le_journal`) et pose `TUNE_LOG_FILE` pour tout le
@@ -175,17 +175,68 @@ async fn le_code_est_dans_le_fichier_journal_et_nulle_part_ailleurs() {
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{rep}");
-    let recus = recus.lock().await;
-    assert_eq!(recus.len(), 1, "le rapport n'est pas parti");
-    assert!(
-        recus[0].contains("temoin-apres"),
-        "le journal doit être joint au rapport : {}",
-        recus[0]
-    );
-    assert!(
-        !recus[0].contains(&code) && !recus[0].contains(MARQUEUR_CODE_ACTIVATION),
-        "le rapport envoyé au site porte le code"
-    );
+    {
+        let recus = recus.lock().await;
+        assert_eq!(recus.len(), 1, "le rapport n'est pas parti");
+        assert!(
+            recus[0].contains("temoin-apres"),
+            "le journal doit être joint au rapport : {}",
+            recus[0]
+        );
+        assert!(
+            !recus[0].contains(&code) && !recus[0].contains(MARQUEUR_CODE_ACTIVATION),
+            "le rapport envoyé au site porte le code"
+        );
+    }
+
+    // 3 bis. Le fichier journal brut joint au rapport (`attachments[]`) :
+    //        il part, sans la ligne du code — en UTF-8 valide ou non.
+    let mut brut_non_utf8 = texte.clone().into_bytes();
+    brut_non_utf8.extend_from_slice(b"\xff\xfe octets invalides\n");
+    for (nom, octets) in [
+        ("tune-server.log", texte.clone().into_bytes()),
+        ("journal.txt", brut_non_utf8),
+    ] {
+        let limite = "----tunecode";
+        let mut corps: Vec<u8> = format!(
+            "--{limite}\r\nContent-Disposition: form-data; name=\"description\"\r\n\r\n\
+             Journal joint\r\n--{limite}\r\nContent-Disposition: form-data; \
+             name=\"attachments[]\"; filename=\"{nom}\"\r\n\
+             Content-Type: application/octet-stream\r\n\r\n"
+        )
+        .into_bytes();
+        corps.extend_from_slice(&octets);
+        corps.extend_from_slice(format!("\r\n--{limite}--\r\n").as_bytes());
+        let pair: SocketAddr = CETTE_MACHINE.parse().unwrap();
+        let resp = tune_server::routes::router(state.clone())
+            .layer(MockConnectInfo(pair))
+            .oneshot(
+                Request::post("/api/v1/system/bug-report/submit")
+                    .header(
+                        "content-type",
+                        format!("multipart/form-data; boundary={limite}"),
+                    )
+                    .body(Body::from(corps))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{nom}");
+        let recus = recus.lock().await;
+        let dernier = recus.last().unwrap();
+        assert!(
+            dernier.contains(&format!("filename=\"{nom}\"")),
+            "la pièce {nom} doit partir"
+        );
+        assert!(
+            dernier.matches("temoin-avant").count() >= 1,
+            "le journal joint doit partir avec ses autres lignes"
+        );
+        assert!(
+            !dernier.contains(&code) && !dernier.contains(MARQUEUR_CODE_ACTIVATION),
+            "le journal joint au rapport ({nom}) porte le code"
+        );
+    }
 
     // 4. La porte commune de tout ce qui part vers le site (ticket, rapport,
     //    assistant) retire la ligne, même si le fichier entier y passe.

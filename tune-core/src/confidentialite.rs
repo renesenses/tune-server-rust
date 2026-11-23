@@ -750,6 +750,25 @@ pub fn anonymiser_champ(texte: &str) -> String {
     }
 }
 
+/// Extensions d'une pièce jointe lue comme du texte, et nettoyée comme un
+/// journal avant de quitter la machine.
+pub const PIECES_TEXTE: &[&str] = &["log", "txt", "md", "json", "csv", "xml"];
+
+/// Une pièce jointe qui part vers le site (ticket, rapport de bogue) : si son
+/// extension est celle d'un texte ([`PIECES_TEXTE`]), elle passe par
+/// [`anonymiser_champ`], même quand ses octets ne sont pas de l'UTF-8 valide ;
+/// sinon (image, archive) elle part telle quelle.
+pub fn piece_texte_nettoyee(nom: &str, octets: Vec<u8>) -> Vec<u8> {
+    let ext = nom
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !PIECES_TEXTE.contains(&ext.as_str()) {
+        return octets;
+    }
+    anonymiser_champ(&String::from_utf8_lossy(&octets)).into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
 

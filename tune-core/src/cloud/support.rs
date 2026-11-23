@@ -202,23 +202,11 @@ fn champs_de_diagnostic_nettoyes(fields: Vec<(String, String)>) -> Vec<(String, 
         .collect()
 }
 
-/// Extensions d'une pièce jointe lue comme du texte, et nettoyée comme un
-/// journal avant de partir.
-const PIECES_TEXTE: &[&str] = &["log", "txt", "md", "json", "csv", "xml"];
-
 /// Une pièce jointe texte (journal, fiche exportée) passe par le même
-/// nettoyage que le champ `logs` ; une image ou une archive part telle quelle.
+/// nettoyage que le champ `logs` ; une image ou une archive part telle quelle
+/// ([`crate::confidentialite::piece_texte_nettoyee`]).
 fn piece_nettoyee(mut file: AttachmentUpload) -> AttachmentUpload {
-    let ext = file
-        .file_name
-        .rsplit_once('.')
-        .map(|(_, e)| e.to_ascii_lowercase())
-        .unwrap_or_default();
-    if PIECES_TEXTE.contains(&ext.as_str())
-        && let Ok(texte) = std::str::from_utf8(&file.bytes)
-    {
-        file.bytes = crate::confidentialite::anonymiser_champ(texte).into_bytes();
-    }
+    file.bytes = crate::confidentialite::piece_texte_nettoyee(&file.file_name, file.bytes);
     file
 }
 

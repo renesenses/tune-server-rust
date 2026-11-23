@@ -3546,10 +3546,14 @@ async fn lire_captures(
                             ),
                         ));
                     }
+                    // Un journal joint part au site nettoyé, comme le
+                    // journal du rapport lui-même.
+                    let bytes =
+                        tune_core::confidentialite::piece_texte_nettoyee(&fname, bytes.to_vec());
                     pieces.journaux.push(CaptureJointe {
                         content_type: mime_journal(&ext).to_string(),
                         file_name: fname,
-                        bytes: bytes.to_vec(),
+                        bytes,
                     });
                 }
             }
