@@ -290,6 +290,171 @@ struct CanalDuFiltre {
     /// cadence (lue dans l'en-tete WAV), au lieu de remplacer le fichier
     /// principal. Un fichier deja present a la meme cadence est remplace.
     per_rate: Option<String>,
+    /// TESS T09a — `1`/`true` : le corps est une ARCHIVE `.zip` (de `.wav`,
+    /// ou de `.cfg` Convolver avec leurs réponses) qui remplace le jeu
+    /// entier. Un corps qui commence par la signature zip est traité de même.
+    archive: Option<String>,
+    /// Le nom du fichier déposé (affiché « Filter set: … »).
+    name: Option<String>,
+}
+
+/// Réglage : le nom du dernier dépôt d'un jeu (`.zip` ou `.wav`) de la zone.
+const CLE_NOM_DU_JEU: &str = "ir_set_name_";
+
+/// Un nom de dépôt affichable : sans chemin, sans caractère de contrôle,
+/// 128 caractères au plus.
+fn nom_de_depot(nom: Option<&str>) -> Option<String> {
+    let nom = nom?.replace('\\', "/");
+    let base = nom.rsplit('/').next()?.trim();
+    let propre: String = base.chars().filter(|c| !c.is_control()).take(128).collect();
+    (!propre.is_empty()).then_some(propre)
+}
+
+/// TESS T09a — `POST /room-correction/ir/upload/{zone}?archive=1&name=…` :
+/// importer un jeu (`.zip` de `.wav`, `.zip` de `.cfg` Convolver, ou un
+/// `.wav`) qui REMPLACE le jeu de la zone. Rien n'est écrit sous un nom venu
+/// de l'archive : chaque réponse est réécrite par Tune sous
+/// `zone_{id}.wav` (la principale) ou `zone_{id}_sr{cadence}.wav`. Tout est
+/// validé et écrit en provisoire AVANT de toucher l'ancien jeu : un refus
+/// laisse la zone telle qu'elle était.
+async fn importer_le_jeu(
+    state: &AppState,
+    zone_id: i64,
+    device_id: &str,
+    is_local: bool,
+    body: &[u8],
+    nom: Option<&str>,
+) -> axum::response::Response {
+    use tune_core::audio::import_ri;
+    let nom = nom_de_depot(nom);
+    let jeu = match import_ri::importer(body, nom.as_deref().unwrap_or("filtre.wav")) {
+        Ok(j) => j,
+        Err(refus) => {
+            tracing::warn!(zone_id, raison = refus.raison, detail = %refus.detail, "convolver_import_refuse");
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "error": refus.detail,
+                    "code": "archive_refused",
+                    "reason": refus.raison,
+                    "message_key": format!("api.roomCorrection.archive.{}", refus.raison),
+                })),
+            )
+                .into_response();
+        }
+    };
+    let Some(principal) = jeu.indice_principal() else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "aucune réponse impulsionnelle",
+                "code": "archive_refused",
+                "reason": "no_filter",
+                "message_key": "api.roomCorrection.archive.no_filter",
+            })),
+        )
+            .into_response();
+    };
+    let ir_dir = dossier_ir();
+    std::fs::create_dir_all(&ir_dir).ok();
+    // 1. Écrire chaque réponse en provisoire.
+    let mut poses: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    for (i, r) in jeu.reponses.iter().enumerate() {
+        let provisoire = chemin_provisoire(&ir_dir, zone_id);
+        let final_ = if i == principal {
+            ir_dir.join(format!("zone_{zone_id}.wav"))
+        } else {
+            ir_dir.join(format!("zone_{zone_id}_sr{}.wav", r.sample_rate))
+        };
+        if let Err(e) = tune_core::audio::convolver::ecrire_ri_wav(
+            provisoire.to_str().unwrap_or(""),
+            &r.taps,
+            r.sample_rate,
+        ) {
+            std::fs::remove_file(&provisoire).ok();
+            for (p, _) in &poses {
+                std::fs::remove_file(p).ok();
+            }
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("write IR: {e}")})),
+            )
+                .into_response();
+        }
+        poses.push((provisoire, final_));
+    }
+    // 2. Retirer l'ancien jeu (seulement les fichiers que Tune a rangés pour
+    //    CETTE zone), puis poser le nouveau.
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    for p in tune_core::audio::convolver::JeuDeZone::lire_supplementaires(&settings, zone_id) {
+        let chemin = std::path::Path::new(&p);
+        if tune_core::audio::convolver::par_cadence::chemin_du_jeu_effacable(
+            chemin, &ir_dir, zone_id,
+        ) {
+            std::fs::remove_file(chemin).ok();
+        }
+    }
+    for cote in ["L", "R"] {
+        std::fs::remove_file(ir_dir.join(format!("zone_{zone_id}_{cote}.wav"))).ok();
+    }
+    let mut supplementaires = Vec::new();
+    let mut chemin_principal = String::new();
+    for (i, (provisoire, final_)) in poses.iter().enumerate() {
+        if let Err(e) = std::fs::rename(provisoire, final_) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("write IR: {e}")})),
+            )
+                .into_response();
+        }
+        let c = final_.to_str().unwrap_or("").to_string();
+        if i == principal {
+            chemin_principal = c;
+        } else {
+            supplementaires.push(c);
+        }
+    }
+    settings
+        .set(&format!("ir_path_{zone_id}"), &chemin_principal)
+        .ok();
+    ecrire_supplementaires(&settings, zone_id, &supplementaires);
+    match &nom {
+        Some(n) => {
+            settings.set(&format!("{CLE_NOM_DU_JEU}{zone_id}"), n).ok();
+        }
+        None => {
+            settings.delete(&format!("{CLE_NOM_DU_JEU}{zone_id}")).ok();
+        }
+    }
+    let avertissement = installer_le_jeu_local(state, zone_id, device_id)
+        .await
+        .err();
+    tracing::info!(
+        zone_id,
+        set_name = nom.as_deref().unwrap_or(""),
+        reponses = jeu.reponses.len(),
+        ecartes = jeu.ecartes.len(),
+        "convolver_jeu_importe"
+    );
+    Json(json!({
+        "ok": true,
+        "zone_id": zone_id,
+        "set_name": nom,
+        "ir_path": chemin_principal,
+        "files": decrire_le_jeu(&settings, zone_id),
+        "imported": jeu.reponses.iter().map(|r| json!({
+            "name": r.nom,
+            "sample_rate": r.sample_rate,
+            "channels": r.taps.len(),
+            "taps": r.taps.first().map(Vec::len).unwrap_or(0),
+            "source": r.origine,
+        })).collect::<Vec<_>>(),
+        "ignored": jeu.ecartes.iter().map(|(n, r)| json!({"name": n, "reason": r})).collect::<Vec<_>>(),
+        "active": true,
+        "warning": avertissement,
+        "applies_to": if is_local { "local" } else { "network (transcode)" },
+    }))
+    .into_response()
 }
 
 fn vrai(v: Option<&str>) -> bool {
@@ -527,6 +692,23 @@ async fn upload_ir_handler(
     let device_id = zone.output_device_id.unwrap_or_default();
     let is_local = device_id.starts_with("local:");
 
+    // TESS T09a — une archive (demandée, ou reconnue à sa signature) remplace
+    // le jeu entier.
+    if canal.channel.as_deref().is_none_or(str::is_empty)
+        && (vrai(canal.archive.as_deref())
+            || tune_core::audio::import_ri::est_une_archive_zip(&body))
+    {
+        return importer_le_jeu(
+            &state,
+            zone_id,
+            &device_id,
+            is_local,
+            &body,
+            canal.name.as_deref(),
+        )
+        .await;
+    }
+
     if vrai(canal.per_rate.as_deref()) && canal.channel.as_deref().is_none_or(str::is_empty) {
         return ajouter_au_jeu(&state, zone_id, &device_id, is_local, &body).await;
     }
@@ -623,6 +805,11 @@ async fn upload_ir_handler(
     settings
         .set(&format!("ir_path_{zone_id}"), &ir_path_str)
         .ok();
+    // TESS T09a — un nouveau principal : le nom affiché suit le dépôt.
+    match nom_de_depot(canal.name.as_deref()) {
+        Some(n) => settings.set(&format!("{CLE_NOM_DU_JEU}{zone_id}"), &n).ok(),
+        None => settings.delete(&format!("{CLE_NOM_DU_JEU}{zone_id}")).ok(),
+    };
     // #8761 — un fichier par cadence de MEME cadence que le nouveau principal
     // l'emporterait sur lui (le dernier du jeu gagne) : il est retire.
     if let Some(cadence) = cadence_du_fichier(&ir_path_str) {
@@ -746,6 +933,7 @@ async fn clear_ir_handler(
 
     // Drop the stored path (network/transcode) + the file for any zone.
     settings.delete(&format!("ir_path_{zone_id}")).ok();
+    settings.delete(&format!("{CLE_NOM_DU_JEU}{zone_id}")).ok();
     std::fs::remove_file(&principal_par_defaut).ok();
     // Et les deux depots par canal, sinon un « effacer » suivi d'un depot d'un
     // seul cote ressusciterait l'ancien filtre de l'autre.
@@ -839,6 +1027,12 @@ async fn ir_status_handler(
     let files = decrire_le_jeu(&settings, zone_id);
     let resample = tune_core::audio::convolver::JeuDeZone::lire(&settings, zone_id)
         .is_none_or(|j| j.reechantillonner);
+    // TESS T09a — le nom du dernier dépôt (« Filter set: … »).
+    let set_name = settings
+        .get(&format!("{CLE_NOM_DU_JEU}{zone_id}"))
+        .ok()
+        .flatten()
+        .filter(|_| has_setting);
     let in_use = ir_path
         .as_deref()
         .filter(|p| !p.is_empty())
@@ -873,6 +1067,7 @@ async fn ir_status_handler(
                         "files": files,
                         "resample": resample,
                         "in_use": in_use,
+                        "set_name": set_name,
                     }))
                     .into_response();
                 }
@@ -887,6 +1082,7 @@ async fn ir_status_handler(
         "files": files,
         "resample": resample,
         "in_use": in_use,
+        "set_name": set_name,
     }))
     .into_response()
 }

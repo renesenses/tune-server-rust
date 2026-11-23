@@ -359,6 +359,13 @@ impl Convolver {
     /// rate. Walks the RIFF chunks so extra chunks before `data` don't break it.
     fn read_wav_ir(path: &str) -> Result<(Vec<Vec<f32>>, u32), String> {
         let data = std::fs::read(path).map_err(|e| format!("read IR: {e}"))?;
+        Self::lire_ri_wav(&data, path)
+    }
+
+    /// TESS T09a — la même lecture depuis des octets en mémoire (entrée
+    /// d'une archive, jamais écrite sur disque sous son nom d'origine).
+    /// `path` ne sert qu'au journal.
+    pub fn lire_ri_wav(data: &[u8], path: &str) -> Result<(Vec<Vec<f32>>, u32), String> {
         if data.len() < 12 || &data[0..4] != b"RIFF" || &data[8..12] != b"WAVE" {
             return Err("not a RIFF/WAVE file".into());
         }
@@ -986,6 +993,24 @@ pub fn log_freq_grid(n: usize, f_lo: f64, f_hi: f64) -> Vec<f64> {
 ///
 /// Magnitude is 20·log10(|H|) floored at −200 dB (a true zero would be −inf,
 /// which JSON can't carry); phase is the principal atan2 value in degrees.
+/// TESS T09a — écrire une réponse (un vecteur par canal, complétés de zéros
+/// à la même longueur) en WAV flottant 32 bits, relu sans perte par
+/// [`Convolver::read_ir_taps`].
+pub fn ecrire_ri_wav(chemin: &str, taps: &[Vec<f32>], sample_rate: u32) -> Result<(), String> {
+    let canaux = u16::try_from(taps.len()).map_err(|_| "trop de canaux".to_string())?;
+    if canaux == 0 {
+        return Err("réponse sans canal".into());
+    }
+    let n = taps.iter().map(Vec::len).max().unwrap_or(0);
+    let mut entrelace = Vec::with_capacity(n * taps.len());
+    for i in 0..n {
+        for t in taps {
+            entrelace.push(t.get(i).copied().unwrap_or(0.0));
+        }
+    }
+    ecrire_wav_float32(chemin, &entrelace, canaux, sample_rate)
+}
+
 /// Ecrire un WAV flottant 32 bits — le format que `read_wav_ir` relit sans
 /// perte (`format_tag = 3`).
 ///
