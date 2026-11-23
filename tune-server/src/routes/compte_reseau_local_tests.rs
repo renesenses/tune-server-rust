@@ -62,7 +62,12 @@ fn attente_du_serveur(state: &AppState) -> String {
         .unwrap_or_default()
 }
 
-async fn get(state: &AppState, depuis: &str, uri: &str, entetes: &[(&str, &str)]) -> (StatusCode, String) {
+async fn get(
+    state: &AppState,
+    depuis: &str,
+    uri: &str,
+    entetes: &[(&str, &str)],
+) -> (StatusCode, String) {
     let adresse: SocketAddr = depuis.parse().unwrap();
     let mut requete = Request::get(uri).extension(ConnectInfo(adresse));
     for (nom, valeur) in entetes {
@@ -108,7 +113,13 @@ async fn reseau_local_sans_authentification_la_liaison_passe() {
         "[fe80::1]:52000",
     ] {
         let b = banc();
-        let (statut, page) = get(&b.state, depuis, AUTORISER, &[("host", "192.168.1.10:8888")]).await;
+        let (statut, page) = get(
+            &b.state,
+            depuis,
+            AUTORISER,
+            &[("host", "192.168.1.10:8888")],
+        )
+        .await;
         assert_eq!(
             statut,
             StatusCode::TEMPORARY_REDIRECT,
@@ -125,7 +136,10 @@ async fn reseau_local_sans_authentification_la_liaison_passe() {
         &b.state,
         "192.168.1.50:52000",
         AUTORISER,
-        &[("host", "tune.local:8888"), ("sec-fetch-site", "same-origin")],
+        &[
+            ("host", "tune.local:8888"),
+            ("sec-fetch-site", "same-origin"),
+        ],
     )
     .await;
     assert_eq!(statut, StatusCode::TEMPORARY_REDIRECT, "mDNS — {page}");
@@ -136,11 +150,23 @@ async fn reseau_local_sans_authentification_la_liaison_passe() {
         &b.state,
         "192.168.1.50:52000",
         "/api/v1/cloud/sso/callback?code=c&state=faux",
-        &[("host", "tune.local:8888"), ("sec-fetch-site", "cross-site")],
+        &[
+            ("host", "tune.local:8888"),
+            ("sec-fetch-site", "cross-site"),
+        ],
     )
     .await;
-    assert_eq!(statut, StatusCode::BAD_REQUEST, "retour depuis le LAN — {page}");
-    assert!(reglages(&b.state).get("mozaik_access_token").unwrap().is_none());
+    assert_eq!(
+        statut,
+        StatusCode::BAD_REQUEST,
+        "retour depuis le LAN — {page}"
+    );
+    assert!(
+        reglages(&b.state)
+            .get("mozaik_access_token")
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// 1 bis. Le statut montre le compte relié au réseau local : le menu du compte
@@ -149,9 +175,16 @@ async fn reseau_local_sans_authentification_la_liaison_passe() {
 async fn reseau_local_sans_authentification_le_statut_montre_le_compte() {
     let b = banc();
     let r = reglages(&b.state);
-    r.set("mozaik_access_token", "jeton-du-proprietaire").unwrap();
+    r.set("mozaik_access_token", "jeton-du-proprietaire")
+        .unwrap();
     r.set("mozaik_user", COMPTE).unwrap();
-    let (_, texte) = get(&b.state, "192.168.1.50:52000", STATUT, &[("host", "192.168.1.10:8888")]).await;
+    let (_, texte) = get(
+        &b.state,
+        "192.168.1.50:52000",
+        STATUT,
+        &[("host", "192.168.1.10:8888")],
+    )
+    .await;
     let v = json_de(&texte);
     assert_eq!(v["connected"], true, "{texte}");
     assert_eq!(v["details_hidden"], false, "{texte}");
@@ -168,7 +201,10 @@ async fn hors_du_reseau_local_la_liaison_reste_refusee() {
             &b.state,
             depuis,
             AUTORISER,
-            &[("host", "192.168.1.10:8888"), ("accept-language", "fr-FR,fr;q=0.9")],
+            &[
+                ("host", "192.168.1.10:8888"),
+                ("accept-language", "fr-FR,fr;q=0.9"),
+            ],
         )
         .await;
         assert_eq!(statut, StatusCode::FORBIDDEN, "{depuis} — {page}");
@@ -177,7 +213,10 @@ async fn hors_du_reseau_local_la_liaison_reste_refusee() {
             page.contains("Relier le compte mozaiklabs.fr") && page.contains("réseau local"),
             "{depuis} : phrase française attendue — {page}"
         );
-        assert!(attente_du_serveur(&b.state).is_empty(), "{depuis} : rien de préparé");
+        assert!(
+            attente_du_serveur(&b.state).is_empty(),
+            "{depuis} : rien de préparé"
+        );
     }
 
     // Mandataire inverse local, qui exposerait le serveur sur Internet.
@@ -186,17 +225,26 @@ async fn hors_du_reseau_local_la_liaison_reste_refusee() {
         &b.state,
         ICI,
         AUTORISER,
-        &[("host", "127.0.0.1:8888"), ("x-forwarded-for", "203.0.113.9")],
+        &[
+            ("host", "127.0.0.1:8888"),
+            ("x-forwarded-for", "203.0.113.9"),
+        ],
     )
     .await;
     assert_eq!(statut, StatusCode::FORBIDDEN, "mandataire — {page}");
-    assert!(attente_du_serveur(&b.state).is_empty(), "mandataire : rien de préparé");
+    assert!(
+        attente_du_serveur(&b.state).is_empty(),
+        "mandataire : rien de préparé"
+    );
     // Même derrière un mandataire du réseau local.
     let (statut, page) = get(
         &b.state,
         "192.168.1.2:52000",
         AUTORISER,
-        &[("host", "tune.local:8888"), ("x-forwarded-for", "203.0.113.9")],
+        &[
+            ("host", "tune.local:8888"),
+            ("x-forwarded-for", "203.0.113.9"),
+        ],
     )
     .await;
     assert_eq!(statut, StatusCode::FORBIDDEN, "mandataire du LAN — {page}");
@@ -207,30 +255,50 @@ async fn hors_du_reseau_local_la_liaison_reste_refusee() {
             &b.state,
             depuis,
             AUTORISER,
-            &[(tune_core::cloud::ENTETE_RELAIS, "1"), ("host", "127.0.0.1:8888")],
+            &[
+                (tune_core::cloud::ENTETE_RELAIS, "1"),
+                ("host", "127.0.0.1:8888"),
+            ],
         )
         .await;
-        assert_eq!(statut, StatusCode::FORBIDDEN, "relais depuis {depuis} — {page}");
+        assert_eq!(
+            statut,
+            StatusCode::FORBIDDEN,
+            "relais depuis {depuis} — {page}"
+        );
     }
-    assert!(attente_du_serveur(&b.state).is_empty(), "relais : rien de préparé");
+    assert!(
+        attente_du_serveur(&b.state).is_empty(),
+        "relais : rien de préparé"
+    );
 
     // Le statut, lui, ne montre que « relié » au mandataire.
     let r = reglages(&b.state);
-    r.set("mozaik_access_token", "jeton-du-proprietaire").unwrap();
+    r.set("mozaik_access_token", "jeton-du-proprietaire")
+        .unwrap();
     r.set("mozaik_user", COMPTE).unwrap();
     for depuis in [ICI, "192.168.1.2:52000"] {
         let (_, texte) = get(
             &b.state,
             depuis,
             STATUT,
-            &[("host", "tune.local:8888"), ("x-forwarded-for", "203.0.113.9")],
+            &[
+                ("host", "tune.local:8888"),
+                ("x-forwarded-for", "203.0.113.9"),
+            ],
         )
         .await;
         let v = json_de(&texte);
         assert_eq!(v["details_hidden"], true, "mandataire {depuis} — {texte}");
         assert!(v["user"].is_null(), "mandataire {depuis} — {texte}");
     }
-    let (_, texte) = get(&b.state, "100.101.102.103:52000", STATUT, &[("host", "192.168.1.10:8888")]).await;
+    let (_, texte) = get(
+        &b.state,
+        "100.101.102.103:52000",
+        STATUT,
+        &[("host", "192.168.1.10:8888")],
+    )
+    .await;
     assert!(json_de(&texte)["user"].is_null(), "CGNAT — {texte}");
 }
 
@@ -243,9 +311,22 @@ async fn authentification_active_sans_jeton_la_liaison_est_refusee() {
     r.set("jwt_secret", "secret-de-banc").unwrap();
     r.set("auth_enabled", "true").unwrap();
     for depuis in ["192.168.1.50:52000", ICI] {
-        let (statut, page) = get(&b.state, depuis, AUTORISER, &[("host", "192.168.1.10:8888")]).await;
-        assert_eq!(statut, StatusCode::UNAUTHORIZED, "sans jeton depuis {depuis} — {page}");
-        assert!(attente_du_serveur(&b.state).is_empty(), "{depuis} : rien de préparé");
+        let (statut, page) = get(
+            &b.state,
+            depuis,
+            AUTORISER,
+            &[("host", "192.168.1.10:8888")],
+        )
+        .await;
+        assert_eq!(
+            statut,
+            StatusCode::UNAUTHORIZED,
+            "sans jeton depuis {depuis} — {page}"
+        );
+        assert!(
+            attente_du_serveur(&b.state).is_empty(),
+            "{depuis} : rien de préparé"
+        );
     }
 }
 
@@ -254,7 +335,12 @@ async fn authentification_active_sans_jeton_la_liaison_est_refusee() {
 async fn la_deliaison_reste_reservee_a_cette_machine() {
     let b = banc();
     assert_eq!(
-        post(&b.state, "192.168.1.50:52000", "/api/v1/cloud/sso/disconnect").await,
+        post(
+            &b.state,
+            "192.168.1.50:52000",
+            "/api/v1/cloud/sso/disconnect"
+        )
+        .await,
         StatusCode::FORBIDDEN
     );
 }
@@ -264,14 +350,23 @@ async fn la_deliaison_reste_reservee_a_cette_machine() {
 fn les_phrases_du_refus_de_liaison_existent_dans_les_seize_langues() {
     let catalogue: Value = serde_json::from_str(include_str!("../i18n_server.json")).unwrap();
     for l in [
-        "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "hu", "vi", "nb", "pl", "el", "tr",
+        "fr", "en", "de", "es", "it", "zh", "ja", "ko", "ro", "sv", "hu", "vi", "nb", "pl", "el",
+        "tr",
     ] {
         let t = catalogue["api.machine.reservedOutsideLanAccount"][l]
             .as_str()
             .unwrap_or_default();
-        assert!(t.contains("{action}"), "reservedOutsideLanAccount/{l} : {t:?}");
-        let a = catalogue["api.machine.action.account"][l].as_str().unwrap_or_default();
+        assert!(
+            t.contains("{action}"),
+            "reservedOutsideLanAccount/{l} : {t:?}"
+        );
+        let a = catalogue["api.machine.action.account"][l]
+            .as_str()
+            .unwrap_or_default();
         assert!(!a.trim().is_empty(), "action.account/{l} absente");
     }
-    assert_eq!(crate::auth::action_du_chemin("/api/v1/cloud/sso/authorize"), "account");
+    assert_eq!(
+        crate::auth::action_du_chemin("/api/v1/cloud/sso/authorize"),
+        "account"
+    );
 }

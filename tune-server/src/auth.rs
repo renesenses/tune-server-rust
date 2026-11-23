@@ -1187,7 +1187,9 @@ impl FromRequestParts<AppState> for AdminOuReseauLocalPourLeCompte {
             return Ok(Self);
         }
         if appel_depuis_le_reseau_local(parts, state).await {
-            tracing::info!("liaison_du_compte_acceptee_depuis_le_reseau_local_sans_authentification");
+            tracing::info!(
+                "liaison_du_compte_acceptee_depuis_le_reseau_local_sans_authentification"
+            );
             return Ok(Self);
         }
         Err(refus_action_reservee(parts, state, Refus::CompteHorsDuReseauLocal).await)
