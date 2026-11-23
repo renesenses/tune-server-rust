@@ -100,10 +100,7 @@ async fn faux_itunes(
 }
 
 fn source(base: &str) -> Source<'static> {
-    Source {
-        base: Box::leak(base.to_string().into_boxed_str()),
-        limiter: false,
-    }
+    Source::factice(Box::leak(base.to_string().into_boxed_str()), false)
 }
 
 fn morceau(artiste: &str, titre: &str, album: &str, image: &str, date: &str, cid: i64) -> Value {
@@ -696,10 +693,7 @@ async fn les_appels_passent_par_le_limiteur_partage() {
     let (limiteur, cle) = crate::library::images_rapides::Hote::Itunes.limiteur();
     assert!(limiteur.intervalle_courant(cle) >= Duration::from_secs(3));
     let (base, journal) = faux_itunes(|_, _| Vec::new()).await;
-    let src = Source {
-        base: Box::leak(base.into_boxed_str()),
-        limiter: true,
-    };
+    let src = Source::factice(Box::leak(base.into_boxed_str()), true);
     let debut = std::time::Instant::now();
     let _ = appeler(src, "/search", &[("term", "a")]).await;
     let _ = appeler(src, "/search", &[("term", "b")]).await;

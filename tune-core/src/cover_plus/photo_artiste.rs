@@ -48,6 +48,8 @@ use super::choix::{meme_nom, norme};
 /// L'agent du code de référence : la page d'artiste est servie à un
 /// navigateur.
 pub const AGENT_PAGE: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15";
+/// Les pages d'artiste ne se lisent que sous cette racine.
+pub const PAGES_APPLE: &str = "https://music.apple.com/";
 /// Le logo générique d'Apple Music : « pas de photo ».
 pub const GENERIQUE: &str = "/assets/meta/apple-music.png";
 /// Ce qu'on lit au plus d'une page d'artiste.
@@ -214,8 +216,10 @@ async fn lire_la_page(source: Source<'_>, adresse: &str) -> Option<String> {
 /// La page d'artiste ne se lit que sur `https://music.apple.com/`. Les
 /// épreuves, qui dressent un faux service, lisent aussi sous sa racine.
 fn page_admise(source: Source<'_>, page: &str) -> bool {
-    page.starts_with("https://music.apple.com/")
-        || (source.base != super::ITUNES_BASE && page.starts_with(&format!("{}/", source.base)))
+    page.starts_with(PAGES_APPLE)
+        || source
+            .racine_factice()
+            .is_some_and(|r| page.starts_with(&format!("{r}/")))
 }
 
 /// La photo ne vient que du CDN d'Apple, `*.mzstatic.com`, en `https://`.
