@@ -284,6 +284,9 @@ pub(crate) async fn servir_avec(
     // resservie à vie, sans une ligne de journal, et le client web l'écarte
     // (« une enveloppe toute plate ne dit rien ») : pas d'onde pour une piste
     // qui se joue très bien.
+    // Une piste réellement muette rend elle aussi une onde plate : elle est
+    // retenue (`ONDES_PLATES`) pour ne pas être redécodée à chaque demande.
+    let mut plate_en_base: Option<Value> = None;
     if en_base
         && let Ok(Some(cached)) = repo.get_waveform(id)
         && let Ok(onde) = serde_json::from_str::<Value>(&cached)
@@ -291,7 +294,7 @@ pub(crate) async fn servir_avec(
         if onde_dessinable(&onde) {
             return reponse(id, onde);
         }
-        tracing::info!(track_id = id, "onde_lecture_cache_en_base_plat_recalcule");
+        plate_en_base = Some(onde);
     }
 
     let track = match repo.get(id) {
@@ -311,6 +314,13 @@ pub(crate) async fn servir_avec(
     .flatten() else {
         return sans_onde(id, "file unreadable or unsupported format");
     };
+    let empreinte = empreinte_stable(&source.chemin, &meta);
+    if let Some(onde) = plate_en_base {
+        if deja_trouvee_plate(id, empreinte) {
+            return reponse(id, onde);
+        }
+        tracing::info!(track_id = id, "onde_lecture_cache_en_base_plat_recalcule");
+    }
     let nom = nom_en_cache(id, &source, &meta, points);
     let cible = dossier.join(&nom);
     if !en_base && let Some(onde) = lire_cache(cible.clone()).await {
@@ -361,11 +371,36 @@ pub(crate) async fn servir_avec(
     if onde.is_empty() {
         return sans_onde(id, "file unreadable or unsupported format");
     }
+    let onde = json!(onde);
     if en_base {
         let json_str = serde_json::to_string(&onde).unwrap_or_default();
         repo.set_waveform(id, &json_str).ok();
+        if !onde_dessinable(&onde) {
+            retenir_plate(id, empreinte);
+        }
     }
-    reponse(id, json!(onde))
+    reponse(id, onde)
+}
+
+/// #9248 — les pistes dont l'onde, RECALCULÉE, est restée plate (silence
+/// réel), avec l'empreinte du fichier (chemin, taille, date) à ce moment :
+/// leur onde en base est resservie telle quelle tant que le fichier ne
+/// change pas. En mémoire seulement — pas de migration ; après un
+/// redémarrage, une piste muette est recalculée une fois de plus.
+static ONDES_PLATES: LazyLock<std::sync::Mutex<std::collections::HashMap<i64, u64>>> =
+    LazyLock::new(Default::default);
+
+fn retenir_plate(id: i64, empreinte: u64) {
+    if let Ok(mut plates) = ONDES_PLATES.lock() {
+        plates.insert(id, empreinte);
+    }
+}
+
+fn deja_trouvee_plate(id: i64, empreinte: u64) -> bool {
+    ONDES_PLATES
+        .lock()
+        .map(|plates| plates.get(&id) == Some(&empreinte))
+        .unwrap_or(false)
 }
 
 /// Écriture atomique : un lecteur ne voit jamais un JSON à moitié écrit.
