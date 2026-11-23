@@ -284,9 +284,10 @@ enum Liaison {
 }
 
 /// Qui relie quoi. Authentification coupée : cette machine ou le réseau local
-/// (`AdminOuReseauLocalPourLeCompte`) relie et délie le serveur ; depuis le
-/// réseau local, la liaison suppose qu'aucun compte n'est encore relié
-/// ([`compte_du_serveur_relie`]).
+/// (`AdminOuReseauLocalPourLeCompte`) relie le serveur ; depuis le réseau
+/// local, la liaison suppose qu'aucun compte n'est encore relié
+/// ([`compte_du_serveur_relie`]). La déliaison reste à cette machine
+/// (`AdminOuCetteMachine`).
 /// Authentification active : l'administrateur relie le serveur, un compte
 /// standard ne relie que son propre profil.
 fn liaison_autorisee<G>(
@@ -1009,11 +1010,11 @@ async fn sso_status(
 /// stored tokens/profile and revoke the account premium. The license-key path is
 /// untouched (a keyed premium survives).
 ///
-/// Décision du 23/11 : même garde que la liaison
-/// (`AdminOuReseauLocalPourLeCompte`). Sans authentification, un appareil du
-/// réseau local délie le serveur ; le relais distant et un mandataire, non.
+/// Décision du 23/11 : la déliaison reste réservée à cette machine ou à
+/// l'administrateur (`AdminOuCetteMachine`), jamais au réseau local : délier
+/// puis relier un autre compte depuis un appareil du réseau n'est pas permis.
 async fn sso_disconnect(
-    garde: Result<crate::auth::AdminOuReseauLocalPourLeCompte, RefusDeGarde>,
+    garde: Result<crate::auth::AdminOuCetteMachine, RefusDeGarde>,
     appelant: Option<crate::auth::AuthUser>,
     State(state): State<AppState>,
 ) -> axum::response::Response {

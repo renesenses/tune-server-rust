@@ -17,9 +17,9 @@
 //!    - depuis le réseau local, la liaison n'est acceptée que si AUCUN compte
 //!      n'est relié ; cette machine remplace toujours le compte. Le contrôle
 //!      est refait au retour, avant et après l'échange avec mozaiklabs.fr ;
-//!    - la déliaison (`POST /cloud/sso/disconnect`) passe sous la même garde :
-//!      réseau local accepté, relais et mandataire refusés, authentification
-//!      active sans jeton refusée.
+//!    - la déliaison (`POST /cloud/sso/disconnect`) reste à cette machine ou à
+//!      l'administrateur : réseau local, relais et mandataire refusés,
+//!      authentification active sans jeton refusée.
 
 use std::net::SocketAddr;
 
@@ -460,7 +460,7 @@ async fn reseau_local_compte_deja_relie_la_liaison_est_refusee() {
     assert_eq!(statut, StatusCode::FORBIDDEN, "{page}");
     assert!(page.contains("<html"), "le refus est une page : {page}");
     assert!(
-        page.contains("déjà relié à ce serveur") && page.contains("déliez-le"),
+        page.contains("déjà relié à ce serveur") && page.contains("machine du serveur"),
         "phrase française attendue — {page}"
     );
     assert!(attente_du_serveur(&b.state).is_empty(), "rien de préparé");
@@ -621,23 +621,23 @@ async fn reseau_local_aucun_compte_la_ronde_complete_relie() {
     assert_eq!(courriel_relie(&b.state), "tiers@exemple.test");
 }
 
-// ─── Décision du 23/11 : délier depuis le réseau local ──────────────────────
+// ─── Décision du 23/11 : la déliaison reste à cette machine ─────────────────
 
-/// 11. Réseau local, sans authentification : la déliaison passe et efface le
-/// compte du serveur.
+/// 11. Réseau local, sans authentification : la déliaison est refusée
+/// (`not_local`), le compte reste relié. Seuls cette machine ou
+/// l'administrateur délient.
 #[tokio::test]
-async fn reseau_local_sans_authentification_la_deliaison_passe() {
+async fn la_deliaison_reste_reservee_a_cette_machine() {
     let b = banc();
     relier_le_proprietaire(&b.state);
     let (statut, texte) = post(&b.state, LAN, DISCONNECT, &[HOTE]).await;
+    assert_eq!(statut, StatusCode::FORBIDDEN, "{texte}");
+    assert_eq!(json_de(&texte)["reason"], "not_local", "{texte}");
+    assert_eq!(courriel_relie(&b.state), "proprio@exemple.test");
+
+    // Cette machine, elle, délie.
+    let (statut, texte) = post(&b.state, ICI, DISCONNECT, &[("host", "127.0.0.1:8888")]).await;
     assert_eq!(statut, StatusCode::OK, "{texte}");
-    assert_eq!(json_de(&texte)["connected"], false, "{texte}");
-    assert!(
-        reglages(&b.state)
-            .get("mozaik_access_token")
-            .unwrap()
-            .is_none()
-    );
     assert!(reglages(&b.state).get("mozaik_user").unwrap().is_none());
 }
 
@@ -680,10 +680,10 @@ async fn hors_du_reseau_local_la_deliaison_est_refusee() {
             "{depuis} {entetes:?} — {texte}"
         );
         // Le relais distant est arrêté plus tôt par sa propre garde
-        // (`not_available_remotely`) ; les autres par la garde du compte.
+        // (`not_available_remotely`) ; les autres par `AdminOuCetteMachine`.
         let v = json_de(&texte);
         assert!(
-            v["error"] == "not_available_remotely" || v["reason"] == "not_local_network",
+            v["error"] == "not_available_remotely" || v["reason"] == "not_local",
             "{depuis} {entetes:?} — {texte}"
         );
     }

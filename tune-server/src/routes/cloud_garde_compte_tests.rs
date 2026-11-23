@@ -3,9 +3,9 @@
 //! (`crate::routes::router`, préfixe `/api/v1`), l'adresse de l'appelant posée
 //! en extension `ConnectInfo` comme le fait le service de production.
 //!
-//! - authentification coupée, appel du réseau local → 403 `not_local`
-//!   (licence) ; la LIAISON et la DÉLIAISON du compte, elles, s'ouvrent au
-//!   réseau local en rc14 (voir `compte_reseau_local_tests.rs`) ;
+//! - authentification coupée, appel du réseau local → 403 `not_local` (licence,
+//!   déliaison) ; la LIAISON du compte, elle, s'ouvre au réseau local en rc14
+//!   (voir `compte_reseau_local_tests.rs`) ;
 //! - authentification coupée, appel de cette machine → accepté ;
 //! - authentification active, administrateur → accepté (même du réseau) ;
 //! - authentification active, compte standard → 403.
@@ -97,9 +97,8 @@ fn json_de(texte: &str) -> Value {
     serde_json::from_str(texte).unwrap_or(Value::Null)
 }
 
-/// Les routes JSON de la licence, réservées à l'administrateur ou à cette
-/// machine. La déliaison du compte (`POST /cloud/sso/disconnect`) n'y est
-/// plus : elle passe au réseau local (décision du 23/11).
+/// Les routes JSON qui engagent le compte ou la licence, réservées à
+/// l'administrateur ou à cette machine (déliaison comprise, décision du 23/11).
 fn routes_json() -> Vec<(&'static str, &'static str, Option<Value>)> {
     vec![
         (
@@ -110,6 +109,7 @@ fn routes_json() -> Vec<(&'static str, &'static str, Option<Value>)> {
         ("POST", "/api/v1/cloud/license/deactivate", None),
         ("POST", "/api/v1/system/license", Some(json!({ "key": "" }))),
         ("DELETE", "/api/v1/system/license", None),
+        ("POST", "/api/v1/cloud/sso/disconnect", None),
     ]
 }
 
@@ -514,8 +514,7 @@ async fn compte_standard_ne_relie_que_son_profil() {
 
 #[tokio::test]
 async fn sans_session_ni_machine_aucune_liaison_de_profil() {
-    // Authentification coupée : pas de mode « profil ». La déliaison du
-    // réseau local délie le SERVEUR (décision du 23/11), jamais un profil.
+    // Authentification coupée : pas de mode « profil », la machine seulement.
     let b = banc();
     let (statut, _) = appel(&b.state, LAN, None, "GET", "/api/v1/cloud/sso/status", None).await;
     assert_eq!(statut, StatusCode::OK);
@@ -528,8 +527,7 @@ async fn sans_session_ni_machine_aucune_liaison_de_profil() {
         None,
     )
     .await;
-    assert_eq!(statut, StatusCode::OK);
-    assert_eq!(json_de(&texte)["scope"], Value::Null, "{texte}");
+    assert_eq!(statut, StatusCode::FORBIDDEN, "{texte}");
 }
 
 // ─── Ronde SSO complète contre un faux mozaiklabs.fr ────────────────────────

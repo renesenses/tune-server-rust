@@ -1156,21 +1156,21 @@ impl FromRequestParts<AppState> for AdminOuReseauLocalPourLaMiseAJour {
     }
 }
 
-/// Garde du compte mozaiklabs.fr du serveur : sa LIAISON
-/// (`GET /cloud/sso/authorize` et son retour `GET /cloud/sso/callback`) et sa
-/// DÉLIAISON (`POST /cloud/sso/disconnect`), même règle que la mise à jour
-/// ([`AdminOuReseauLocalPourLaMiseAJour`]) :
+/// Garde de la LIAISON du compte mozaiklabs.fr du serveur
+/// (`GET /cloud/sso/authorize` et son retour `GET /cloud/sso/callback`), même
+/// règle que la mise à jour ([`AdminOuReseauLocalPourLaMiseAJour`]). La
+/// DÉLIAISON reste sous [`AdminOuCetteMachine`] (décision du 23/11) :
 ///
-/// - authentification active : l'administrateur (un compte standard relie ou
-///   délie son propre profil, voir `routes::cloud::liaison_autorisee`) ;
+/// - authentification active : l'administrateur (un compte standard relie son
+///   propre profil, voir `routes::cloud::liaison_autorisee`) ;
 /// - authentification coupée : cette machine, ou le RÉSEAU LOCAL
 ///   ([`appel_depuis_le_reseau_local`]) ; jamais le relais distant, un
 ///   mandataire inverse ni une adresse hors réseau local.
 ///
 /// Décision du 23/11 : depuis le réseau local, la liaison n'est acceptée que
 /// si AUCUN compte n'est encore relié au serveur. Remplacer un compte relié
-/// reste à cette machine ou à l'administrateur. Ce contrôle dépend de la route
-/// (la déliaison, elle, suppose un compte relié) : la garde dit seulement par
+/// reste à cette machine ou à l'administrateur. Ce contrôle dépend de l'état
+/// du compte et du moment de la ronde : la garde dit seulement par
 /// où l'appel est passé (`par_le_reseau_local`), et `routes::cloud` refait le
 /// contrôle à l'autorisation ET au retour, juste avant d'enregistrer la
 /// session ([`refus_compte_deja_relie`]).
