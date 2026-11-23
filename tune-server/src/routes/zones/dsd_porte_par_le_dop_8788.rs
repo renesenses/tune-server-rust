@@ -193,7 +193,10 @@ mod tests {
             assert_eq!(zone["current_track"]["format_conteneur"], "wav", "{url}");
         }
         let zone = crate::routes::playback::build_zone_json(&state, id).await;
-        assert_eq!(zone["current_track"]["format"], "dsd", "build_zone_json : {zone}");
+        assert_eq!(
+            zone["current_track"]["format"], "dsd",
+            "build_zone_json : {zone}"
+        );
         assert_eq!(zone["current_track"]["sample_rate"], 2_822_400);
 
         // L'état de lecture lui-même garde le conteneur : c'est lui que la
