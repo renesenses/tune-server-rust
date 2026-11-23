@@ -157,6 +157,23 @@ impl EqEnVol {
         })
     }
 
+    /// #9346 — le poste d'une radio qui porte AUSSI la chaîne de la zone
+    /// (convolution, crossfeed : [`super::chaine_radio_9346`]). Elle ne cuit
+    /// plus seulement l'égaliseur : une bascule PURE en vol couperait
+    /// l'égaliseur et laisserait la convolution — elle passe donc par la
+    /// relance, et un égaliseur relevé en vol n'est accepté que si le reste
+    /// de l'empreinte n'a pas bougé et qu'aucune compensation n'est cuite.
+    /// Le format, lui, ne dépend d'aucun traitement (la station est décodée
+    /// de toute façon).
+    pub(crate) fn pour_la_radio_avec_chaine(compensation_cuite: bool) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            compensation_cuite,
+            flux_sans_fin: true,
+            format_independant_du_traitement: true,
+            ..Default::default()
+        })
+    }
+
     /// Le poste d'un relais DSP progressif.
     pub(crate) fn pour_le_relais(compensation_cuite: bool) -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self {

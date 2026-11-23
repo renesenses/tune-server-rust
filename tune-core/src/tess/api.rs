@@ -131,7 +131,7 @@ impl ReponseCatalogue {
             .plugins
             .iter()
             .map(|d| {
-                let entitled = premium || !d.entitlement.demande_le_premium();
+                let entitled = premium || !d.demande_le_premium();
                 let available = disponible(&d.id);
                 let reason = if !available {
                     Some(MotifEtape::PluginUnavailable)

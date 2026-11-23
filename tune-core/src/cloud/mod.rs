@@ -1,3 +1,5 @@
+/// Diagnostic rc14 (#8963) : dernières requêtes et demandes de flux relayées.
+pub mod activite_du_relais;
 pub mod bio_sync;
 pub mod cle_serveur;
 pub mod community;

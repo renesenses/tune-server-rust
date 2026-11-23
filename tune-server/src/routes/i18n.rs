@@ -8,6 +8,7 @@ use crate::state::AppState;
 
 const SUPPORTED_LOCALES: &[&str] = &[
     "en", "fr", "de", "es", "it", "zh", "ko", "ja", "ro", "sv", "hu", "vi", "nb", "pl", "el", "tr",
+    "nl", "zh-Hant", "ru", "uk",
 ];
 
 pub fn router() -> Router<AppState> {
@@ -915,6 +916,166 @@ fn get_translations(locale: &str) -> Value {
                 "finish": "Bitir",
             },
         }),
+        "nl" => json!({
+            "common": {
+                "play": "Afspelen",
+                "pause": "Pauze",
+                "stop": "Stop",
+                "next": "Volgende",
+                "previous": "Vorige",
+                "search": "Zoeken",
+                "settings": "Instellingen",
+                "library": "Bibliotheek",
+                "artists": "Artiesten",
+                "albums": "Albums",
+                "tracks": "Nummers",
+                "genres": "Genres",
+                "playlists": "Afspeellijsten",
+                "radios": "Radiozenders",
+                "queue": "Wachtrij",
+                "favorites": "Favorieten",
+                "history": "Geschiedenis",
+                "volume": "Volume",
+            },
+            "settings": {
+                "title": "Instellingen",
+                "musicDirs": "Muziekmappen",
+                "streaming": "Streamingdiensten",
+                "zones": "Zones",
+                "system": "Systeem",
+            },
+            "onboarding": {
+                "welcome": "Welkom bij Tune!",
+                "addMusic": "Muziek toevoegen",
+                "connectStreaming": "Streamingdiensten koppelen",
+                "setupZones": "Zones instellen",
+                "createProfile": "Profiel aanmaken",
+                "complete": "Installatie voltooid!",
+                "skip": "Overslaan",
+                "next": "Volgende",
+                "finish": "Voltooien",
+            },
+        }),
+        "zh-Hant" => json!({
+            "common": {
+                "play": "播放",
+                "pause": "暫停",
+                "stop": "停止",
+                "next": "下一首",
+                "previous": "上一首",
+                "search": "搜尋",
+                "settings": "設定",
+                "library": "音樂庫",
+                "artists": "演出者",
+                "albums": "專輯",
+                "tracks": "曲目",
+                "genres": "類型",
+                "playlists": "播放列表",
+                "radios": "電台",
+                "queue": "待播清單",
+                "favorites": "喜愛項目",
+                "history": "播放記錄",
+                "volume": "音量",
+            },
+            "settings": {
+                "title": "設定",
+                "musicDirs": "音樂資料夾",
+                "streaming": "串流服務",
+                "zones": "區域",
+                "system": "系統",
+            },
+            "onboarding": {
+                "welcome": "歡迎使用 Tune！",
+                "addMusic": "加入音樂",
+                "connectStreaming": "連結串流服務",
+                "setupZones": "設定區域",
+                "createProfile": "建立個人檔案",
+                "complete": "設定完成！",
+                "skip": "略過",
+                "next": "下一步",
+                "finish": "完成",
+            },
+        }),
+        "ru" => json!({
+            "common": {
+                "play": "Воспроизвести",
+                "pause": "Пауза",
+                "stop": "Стоп",
+                "next": "Следующий",
+                "previous": "Предыдущий",
+                "search": "Поиск",
+                "settings": "Настройки",
+                "library": "Медиатека",
+                "artists": "Исполнители",
+                "albums": "Альбомы",
+                "tracks": "Треки",
+                "genres": "Жанры",
+                "playlists": "Плейлисты",
+                "radios": "Радио",
+                "queue": "Очередь",
+                "favorites": "Избранное",
+                "history": "История",
+                "volume": "Громкость",
+            },
+            "settings": {
+                "title": "Настройки",
+                "musicDirs": "Папки с музыкой",
+                "streaming": "Стриминговые сервисы",
+                "zones": "Зоны",
+                "system": "Система",
+            },
+            "onboarding": {
+                "welcome": "Добро пожаловать в Tune!",
+                "addMusic": "Добавить музыку",
+                "connectStreaming": "Подключить стриминговые сервисы",
+                "setupZones": "Настроить зоны",
+                "createProfile": "Создать профиль",
+                "complete": "Настройка завершена!",
+                "skip": "Пропустить",
+                "next": "Далее",
+                "finish": "Готово",
+            },
+        }),
+        "uk" => json!({
+            "common": {
+                "play": "Відтворити",
+                "pause": "Пауза",
+                "stop": "Стоп",
+                "next": "Наступний",
+                "previous": "Попередній",
+                "search": "Пошук",
+                "settings": "Налаштування",
+                "library": "Медіатека",
+                "artists": "Виконавці",
+                "albums": "Альбоми",
+                "tracks": "Треки",
+                "genres": "Жанри",
+                "playlists": "Плейлисти",
+                "radios": "Радіо",
+                "queue": "Черга",
+                "favorites": "Обране",
+                "history": "Історія",
+                "volume": "Гучність",
+            },
+            "settings": {
+                "title": "Налаштування",
+                "musicDirs": "Папки з музикою",
+                "streaming": "Стримінгові сервіси",
+                "zones": "Зони",
+                "system": "Система",
+            },
+            "onboarding": {
+                "welcome": "Ласкаво просимо до Tune!",
+                "addMusic": "Додати музику",
+                "connectStreaming": "Під’єднати стримінгові сервіси",
+                "setupZones": "Налаштувати зони",
+                "createProfile": "Створити профіль",
+                "complete": "Налаштування завершено!",
+                "skip": "Пропустити",
+                "next": "Далі",
+                "finish": "Готово",
+            },
+        }),
         "ro" => json!({
             "common": {
                 "play": "Redă",
@@ -1080,5 +1241,28 @@ mod tests {
     fn le_turc_est_detecte() {
         assert_eq!(parse_accept_language("tr-TR,tr;q=0.9,en;q=0.5"), "tr");
         assert_eq!(get_translations("tr")["settings"]["zones"], "Bölgeler");
+    }
+
+    /// Le néerlandais, le chinois traditionnel, le russe et l'ukrainien sont
+    /// des langues de l'interface (rc14). `zh-TW` et `zh-HK` donnent le
+    /// chinois traditionnel, `zh-CN` reste au simplifié.
+    ///
+    /// Contre-épreuve : retirer `"zh-Hant"` de `SUPPORTED_LOCALES` fait
+    /// retomber `zh-TW` sur `"en"` ; ramener `base_tag` à la seule base fait
+    /// retomber `zh-HK` sur `"zh"`.
+    #[test]
+    fn les_quatre_langues_de_la_rc14_sont_detectees() {
+        assert_eq!(parse_accept_language("nl-NL,nl;q=0.9,en;q=0.5"), "nl");
+        assert_eq!(parse_accept_language("nl-BE"), "nl");
+        assert_eq!(parse_accept_language("ru-RU,ru;q=0.9,en;q=0.5"), "ru");
+        assert_eq!(parse_accept_language("uk-UA,uk;q=0.9,ru;q=0.8"), "uk");
+        assert_eq!(parse_accept_language("zh-TW,zh;q=0.9"), "zh-Hant");
+        assert_eq!(parse_accept_language("zh-HK"), "zh-Hant");
+        assert_eq!(parse_accept_language("zh-Hant"), "zh-Hant");
+        assert_eq!(parse_accept_language("zh-CN,zh;q=0.9"), "zh");
+        assert_eq!(get_translations("nl")["settings"]["zones"], "Zones");
+        assert_eq!(get_translations("zh-Hant")["settings"]["zones"], "區域");
+        assert_eq!(get_translations("ru")["settings"]["zones"], "Зоны");
+        assert_eq!(get_translations("uk")["settings"]["zones"], "Зони");
     }
 }

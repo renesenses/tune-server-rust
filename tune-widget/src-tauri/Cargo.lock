@@ -2566,6 +2566,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "objc2-media-player"
+version = "0.3.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "85f2a98483f6e76313cb85a5a185eaa3cda86a177b13a8852d56cbd0085bf635"
+dependencies = [
+ "bitflags 2.13.0",
+ "block2",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-core-foundation",
+ "objc2-foundation",
+]
+
+[[package]]
 name = "objc2-quartz-core"
 version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4796,11 +4810,15 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 name = "tune-widget"
 version = "0.1.7"
 dependencies = [
+ "block2",
  "dirs 6.0.0",
  "futures-util",
  "mdns-sd",
  "muda 0.19.2",
  "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "objc2-media-player",
  "reqwest 0.12.28",
  "serde",
  "serde_json",

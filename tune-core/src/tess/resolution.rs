@@ -632,7 +632,7 @@ impl ChaineTess {
         }
         if !(ctx.greffon_disponible)(&m.id) {
             e.eteindre(MotifEtape::PluginUnavailable, None);
-        } else if d.entitlement.demande_le_premium()
+        } else if d.demande_le_premium()
             && !ctx.premium
             // D1 (T02) : la correction de pièce calculée sans micro (C5) est
             // Free.

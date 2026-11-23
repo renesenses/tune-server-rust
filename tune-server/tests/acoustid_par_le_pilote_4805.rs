@@ -29,6 +29,7 @@ use axum::response::IntoResponse;
 use serde_json::{Value, json};
 use tower::ServiceExt;
 use tune_core::db::backend::ToSqlValue;
+use tune_core::http::fetch::{ACOUSTID, CLE_ACOUSTID};
 
 const PROPRE: &str = include_str!("../../tune-core/tests/fixtures/acoustid/propre.json");
 const AMBIGU: &str = include_str!("../../tune-core/tests/fixtures/acoustid/ambigu.json");
@@ -40,7 +41,7 @@ static SERIE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Default)]
 struct Releve {
-    /// Instant de chaque requête AcoustID, avec sa clé `client` et son `meta`.
+    /// Créneau suivant accordé par le limiteur, clé et métadonnées de la requête.
     acoustid: Vec<(Instant, String, String)>,
     musicbrainz: Vec<String>,
 }
@@ -112,7 +113,9 @@ async fn doublure() -> Partage {
                     .unwrap_or_else(|| json!({"status": "ok", "results": []}));
                 async move {
                     r.lock().unwrap().acoustid.push((
-                        Instant::now(),
+                        ACOUSTID
+                            .prochain_creneau(CLE_ACOUSTID)
+                            .expect("autorisation AcoustID"),
                         f.get("client").cloned().unwrap_or_default(),
                         f.get("meta").cloned().unwrap_or_default(),
                     ));
@@ -345,13 +348,14 @@ async fn la_passe_ecrit_la_release_majoritaire_et_rien_d_autre() {
             .iter()
             .all(|(_, _, meta)| meta == "recordings releasegroups releases compress")
     );
-    // 3 requêtes/s au plus : sur toute fenêtre de quatre requêtes
-    // consécutives, au moins une seconde (à la tolérance d'horloge près).
-    for w in r.acoustid.windows(4) {
-        let ecart = w[3].0.duration_since(w[0].0);
+    // La passe attend chaque réponse avant la requête suivante. Les neuf
+    // réponses sont des succès : chaque prochain créneau est le départ
+    // autorisé plus le même intervalle, quel que soit le retard du serveur.
+    for w in r.acoustid.windows(2) {
+        let ecart = w[1].0.duration_since(w[0].0);
         assert!(
-            ecart >= Duration::from_millis(950),
-            "4 requêtes AcoustID en {ecart:?} : plus de 3/s"
+            ecart >= Duration::from_secs(1) / 3,
+            "autorisations AcoustID espacées de {ecart:?} : plus de 3/s"
         );
     }
     // Une lecture MusicBrainz par album retenu, aucune pour l'ambigu.
