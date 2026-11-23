@@ -1425,6 +1425,23 @@ fn session_cookie(token: &str, headers: &axum::http::HeaderMap) -> String {
     }
 }
 
+/// Le refus de connexion : `error` inchangé (les clients le comparent) et un
+/// `message` lisible dans la langue de la requête, que le web affiche.
+/// Le même, que le compte existe ou non.
+fn refus_identifiants(headers: &axum::http::HeaderMap) -> Response {
+    let lang = crate::i18n::lang_from_header(headers);
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(crate::message_api::avec_message_en(
+            json!({"error": "invalid credentials", "code": "invalid_credentials"}),
+            &lang,
+            "api.auth.invalidCredentials",
+            &[],
+        )),
+    )
+        .into_response()
+}
+
 async fn login(
     State(state): State<AppState>,
     ConnectInfo(peer): ConnectInfo<std::net::SocketAddr>,
@@ -1472,20 +1489,24 @@ async fn login(
         Some(r) => r,
         None => {
             record_login_failure(ip, operateur);
-            return (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "invalid credentials"})),
-            )
-                .into_response();
+            return refus_identifiants(&headers);
         }
     };
 
-    // A `default` profile with no password hash is claimable on first login
-    // (the provided password is persisted as the hash below — trust-on-first-use).
-    // That must never be reachable from the network once auth is enabled, or an
-    // attacker could seize the admin account before the operator sets a password.
-    // Allow it only when auth is disabled (the server is fully open anyway) or the
-    // request comes from loopback (the local operator performing first setup).
+    // Un compte n'est « sans mot de passe » que si AUCUN hachage n'est
+    // enregistré, ni l'ancien (SHA-256) ni le nouveau (argon2). Dès qu'il en a
+    // un, seul ce mot de passe ouvre la session, sur cette machine comme
+    // ailleurs.
+    let ancien_hachage = old_hash.as_deref().filter(|h| !h.is_empty());
+    let nouveau_hachage = new_hash.as_deref().filter(|h| !h.is_empty());
+    let sans_mot_de_passe = ancien_hachage.is_none() && nouveau_hachage.is_none();
+
+    // A `default` profile with no password hash at all is claimable on first
+    // login (the provided password is persisted as the hash below —
+    // trust-on-first-use). That must never be reachable from the network once
+    // auth is enabled. Allow it only when auth is disabled (the server is fully
+    // open anyway) or the request comes from loopback (the local operator
+    // performing first setup).
     let auth_enabled = settings
         .get("auth_enabled")
         .ok()
@@ -1493,53 +1514,28 @@ async fn login(
         .map(|v| v == "true")
         .unwrap_or(false);
     let passwordless_default_allowed = !auth_enabled || operateur;
+    let premiere_connexion =
+        sans_mot_de_passe && body.username == "default" && passwordless_default_allowed;
 
     // Try argon2 hash first (password_hash_v2), then fall back to SHA-256 (password_hash)
-    let valid_v2 = if let Some(ref h) = new_hash {
-        if !h.is_empty() {
-            verify_password(&body.password, h)
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    let valid_v2 = nouveau_hachage.is_some_and(|h| verify_password(&body.password, h));
+    let valid_ancien = !valid_v2
+        && ancien_hachage.is_some_and(|h| {
+            format!("{:x}", Sha256::digest(body.password.as_bytes())) == h
+        });
 
-    let valid = if valid_v2 {
-        true
-    } else if let Some(ref h) = old_hash {
-        if !h.is_empty() {
-            // Legacy SHA-256 check
-            let provided_hash = format!("{:x}", Sha256::digest(body.password.as_bytes()));
-            provided_hash == *h
-        } else {
-            // No password set — allow login for the default profile (loopback/first-run only)
-            body.username == "default" && passwordless_default_allowed
-        }
-    } else {
-        // No password set — allow login for the default profile (loopback/first-run only)
-        body.username == "default" && passwordless_default_allowed
-    };
-
-    if !valid {
+    if !(valid_v2 || valid_ancien || premiere_connexion) {
         record_login_failure(ip, operateur);
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "invalid credentials"})),
-        )
-            .into_response();
+        return refus_identifiants(&headers);
     }
     clear_login_failures(ip);
 
-    // If logged in with old SHA-256 hash, upgrade to argon2. Le profil
-    // `default` sans mot de passe n'est réclamé (mot de passe enregistré) que
-    // par l'opérateur de cette machine : depuis le réseau, authentification
-    // coupée, la session est ouverte mais le compte administrateur n'est pas
-    // pris.
-    let ancien_hachage = old_hash.as_deref().is_some_and(|h| !h.is_empty());
-    if !valid_v2
-        && valid
-        && (ancien_hachage || operateur)
+    // Ce qui s'enregistre : l'ancien hachage converti en argon2, seulement
+    // après sa vérification ; ou le premier mot de passe du compte `default`
+    // sans mot de passe, saisi par l'opérateur de cette machine (depuis le
+    // réseau, authentification coupée, la session est ouverte mais le compte
+    // n'est pas pris). Jamais rien d'autre.
+    if (valid_ancien || (premiere_connexion && operateur))
         && let Ok(upgraded) = hash_password(&body.password)
     {
         state

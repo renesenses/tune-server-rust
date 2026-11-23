@@ -7630,5 +7630,23 @@
     "vi": "Thao tác quản trị này",
     "zh": "此管理操作",
     "tr": "Bu yönetim işlemi"
+  },
+  "api.auth.invalidCredentials": {
+    "fr": "Identifiant ou mot de passe incorrect",
+    "en": "Incorrect username or password",
+    "de": "Benutzername oder Passwort falsch",
+    "es": "Usuario o contraseña incorrectos",
+    "it": "Nome utente o password non corretti",
+    "zh": "用户名或密码错误",
+    "ja": "ユーザー名またはパスワードが正しくありません",
+    "ko": "사용자 이름 또는 비밀번호가 올바르지 않습니다",
+    "ro": "Nume de utilizator sau parolă incorectă",
+    "sv": "Felaktigt användarnamn eller lösenord",
+    "hu": "Hibás felhasználónév vagy jelszó",
+    "vi": "Tên người dùng hoặc mật khẩu không đúng",
+    "nb": "Feil brukernavn eller passord",
+    "pl": "Nieprawidłowa nazwa użytkownika lub hasło",
+    "el": "Λάθος όνομα χρήστη ή κωδικός πρόσβασης",
+    "tr": "Kullanıcı adı veya parola yanlış"
   }
 }
