@@ -8882,7 +8882,7 @@
     "pl": "Czynność odrzucona: uwierzytelnianie jest wyłączone, a to urządzenie nie jest komputerem serwera. Wykonaj ją na komputerze serwera albo po zalogowaniu jako administrator.",
     "el": "Η ενέργεια απορρίφθηκε: ο έλεγχος ταυτότητας είναι απενεργοποιημένος και αυτή η συσκευή δεν είναι το μηχάνημα του διακομιστή. Κάντε την στο μηχάνημα του διακομιστή ή συνδεθείτε ως διαχειριστής.",
     "tr": "İşlem reddedildi: kimlik doğrulama kapalı ve bu cihaz sunucu makinesi değil. İşlemi sunucu makinesinde yapın ya da yönetici olarak oturum açın.",
-    "nl": "Actie geweigerd: authenticatie is uitgeschakeld en dit apparaat is niet de servercomputer. Voer haar uit op de servercomputer, of door in te loggen als beheerder.",
+    "nl": "Actie geweigerd: authenticatie is uitgeschakeld en dit apparaat is niet de servercomputer. Voer de actie uit op de servercomputer, of log in als beheerder.",
     "zh-Hant": "操作遭拒：身分驗證已停用，且此裝置不是伺服器所在的主機。請在伺服器主機上執行，或以管理者身分登入後執行。",
     "ru": "Действие отклонено: аутентификация выключена, а это устройство — не компьютер сервера. Выполните его на компьютере сервера или войдите как администратор.",
     "uk": "Дію відхилено: автентифікацію вимкнено, а цей пристрій — не комп’ютер сервера. Виконайте її на комп’ютері сервера або увійдіть як адміністратор."
