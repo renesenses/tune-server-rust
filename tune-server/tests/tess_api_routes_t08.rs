@@ -1015,10 +1015,34 @@ async fn authentification_comme_les_autres_routes_de_zone_t08() {
 async fn la_famille_upnp_publie_la_voie_de_sa_chaine_t12b() {
     for (sortie, appareil, lpcm, voie, crossfeed) in [
         ("dlna", "uuid:absent-t12b", "unknown", "untouched", false),
-        ("openhome", "uuid:oh-absent-t12b", "unknown", "untouched", false),
-        ("bluos", "bluos:absent-t12b", "accepted", "progressive_lpcm", true),
-        ("chromecast", "cast:absent-t12b", "accepted", "progressive_lpcm", true),
-        ("slimproto", "slim:absent-t12b", "refused", "untouched", false),
+        (
+            "openhome",
+            "uuid:oh-absent-t12b",
+            "unknown",
+            "untouched",
+            false,
+        ),
+        (
+            "bluos",
+            "bluos:absent-t12b",
+            "accepted",
+            "progressive_lpcm",
+            true,
+        ),
+        (
+            "chromecast",
+            "cast:absent-t12b",
+            "accepted",
+            "progressive_lpcm",
+            true,
+        ),
+        (
+            "slimproto",
+            "slim:absent-t12b",
+            "refused",
+            "untouched",
+            false,
+        ),
     ] {
         let b = Banc::avec_sortie(true, sortie, appareil).await;
         let (s, v) = b.get().await;
@@ -1041,10 +1065,22 @@ async fn la_famille_upnp_publie_la_voie_de_sa_chaine_t12b() {
         let (_, v) = b.get().await;
         conforme_au_schema("zone_response", &v).unwrap();
         assert_eq!(v["delivery"]["route"], json!(voie), "{sortie} : {v}");
-        assert_eq!(v["delivery"]["renderer_lpcm"], json!(lpcm), "{sortie} : {v}");
-        assert_eq!(etape(&v, "crossfeed")["effective"], json!(crossfeed), "{sortie} : {v}");
+        assert_eq!(
+            v["delivery"]["renderer_lpcm"],
+            json!(lpcm),
+            "{sortie} : {v}"
+        );
+        assert_eq!(
+            etape(&v, "crossfeed")["effective"],
+            json!(crossfeed),
+            "{sortie} : {v}"
+        );
         if !crossfeed {
-            assert_eq!(etape(&v, "crossfeed")["reason"], json!("renderer_without_lpcm"), "{v}");
+            assert_eq!(
+                etape(&v, "crossfeed")["reason"],
+                json!("renderer_without_lpcm"),
+                "{v}"
+            );
         }
     }
     // Contre-épreuve : une zone locale n'a pas de `delivery`.

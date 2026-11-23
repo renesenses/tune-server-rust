@@ -26,7 +26,9 @@
 //! SERVIE : l'écran ne peut pas dire autre chose que ce qui part.
 
 use super::acheminement_upnp_t12b::PisteEnCours;
-use super::crossfeed_bibliotheque_reseau::{crossfeed_cuit_dans_le_fichier, wav_progressif_consenti};
+use super::crossfeed_bibliotheque_reseau::{
+    crossfeed_cuit_dans_le_fichier, wav_progressif_consenti,
+};
 use super::regles::{
     cible_wav_pour_traitement, service_en_wav_progressif, streaming_needs_pretranscode,
     use_file_transcode_for,
@@ -41,8 +43,8 @@ use crate::tess::reseau_upnp::{
     FaitsUpnp, LpcmDuLecteur, MotifDeVoie, OrigineDuFlux, VoieUpnp, acheminer,
 };
 use crate::tess::{
-    Badge, ContexteExecution, ControleVolume, MotifEtape,
-    ReponseTessZone, SourceFlux, TransportZone, VolumeZone, catalogue_de_reference,
+    Badge, ContexteExecution, ControleVolume, MotifEtape, ReponseTessZone, SourceFlux,
+    TransportZone, VolumeZone, catalogue_de_reference,
 };
 use axum::Router;
 use axum::routing::post;
@@ -575,7 +577,11 @@ async fn un_lecteur_l16_seul_recoit_un_repli_propre_en_24_bits() {
     assert_eq!(b.faits(24).await.lpcm, LpcmDuLecteur::Unknown);
     let s = jouer(&b, id24).await;
     let f24 = b.faits(24).await;
-    assert_eq!(f24.lpcm, LpcmDuLecteur::Refused, "sonde de la lecture, pas de L24");
+    assert_eq!(
+        f24.lpcm,
+        LpcmDuLecteur::Refused,
+        "sonde de la lecture, pas de L24"
+    );
     assert_eq!(f24.lpcm_bits, 24);
     assert!(!s.progressif, "aucun WAV 24 bits vers un lecteur L16");
     assert_eq!(s.mime, "audio/flac");
@@ -723,13 +729,17 @@ async fn le_format_qui_impose_la_conversion_y_cuit_le_crossfeed_et_l_etat_le_dit
     b.crossfeed();
     let (fichier, _, _) = source(PISTE_24.0);
     let s = jouer(&b, id).await;
-    assert_ne!(s.voie, voie::FICHIER_TEL_QUEL, "plafond : la piste est convertie");
+    assert_ne!(
+        s.voie,
+        voie::FICHIER_TEL_QUEL,
+        "plafond : la piste est convertie"
+    );
     assert_ne!(sha(&s.octets), sha(&fichier));
     let sid = b.derniere_session.lock().unwrap().clone().unwrap();
     let fil = b.orch.streamer.stream_output_wire(&sid).await.unwrap();
     assert!(fil.crossfeed, "le flux servi porte le crossfeed");
     let etat = b.etat_tess(96_000, 24).await;
-    let d = etat.delivery.unwrap();
+    let d = etat.delivery.clone().unwrap();
     assert_eq!(d.route, VoieUpnp::FileTranscode, "{d:?}");
     assert!(greffon(&etat, "crossfeed").effective);
     assert_eq!(etat.badge, Badge::ProcessedByTess);
