@@ -5,4 +5,6 @@ Tune 1.0.0-rc13.2，rc13.1 的修正版本。
 - 登录：管理员账户的密码在服务器所在机器和局域网中以相同方式验证；错误提示更清晰（用户名：default）。
 - 如果无法再登录，请使用用户名 default 以及最后一次在服务器所在机器上输入的密码。
 - 在尚未关联任何账户时，现在可以从局域网内的任意浏览器（iPad、手机）关联 mozaiklabs.fr 账户。
+- 在局域网内也可以重新连接同一个账户。将其替换为其他账户或取消关联，仍然只能在服务器所在的机器上或由管理员操作。已关联账户的名称和电子邮件地址可在局域网内查看。
 - Windows：从 Tune 内部更新恢复正常。自 rc13 和 rc13.1 起，此前需要使用安装程序更新。
+- 无法再更新的 rc12 版 Tune OS：工具“Débloquer Tune”（Windows、macOS）无需任何命令即可重新启动更新。需单独下载：https://github.com/renesenses/tune-server-rust/releases/tag/debloquer-tune-v1
