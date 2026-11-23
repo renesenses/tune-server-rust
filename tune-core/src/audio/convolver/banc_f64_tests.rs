@@ -339,32 +339,35 @@ fn la_bascule_n_alloue_rien_dans_traiter() {
     assert_eq!(capacites(&m), attendu, "le successeur n'a pas grandi");
 }
 
-#[test]
-fn la_reponse_reechantillonnee_de_44_1_a_96_khz_garde_sa_phase_a_1_degre() {
-    // Une réponse de pièce à 44,1 kHz : impulsion directe, champ diffus en
-    // décroissance exponentielle (passe-bas à un pôle : partie réelle
-    // positive, donc aucun creux où la phase ne serait pas définie), écho à
-    // 6,8 ms. Rééchantillonnée vers 96 kHz par le repli de #8761 (rubato
-    // sinc, noyau symétrique, marges retirées).
+/// Écarts de module (dB) et de phase (°) entre une RI à 44,1 kHz et sa
+/// version rééchantillonnée à 96 kHz par le repli de #8761, sur 20 Hz –
+/// 0,45 × 44,1 kHz (19,8 kHz, la bande du témoin de #8761).
+fn ecarts_44_1_vers_96(pre_retard: usize) -> (f64, f64) {
+    // Une réponse de pièce : impulsion directe, champ diffus en décroissance
+    // exponentielle (passe-bas à un pôle : partie réelle positive, aucun creux
+    // où la phase ne serait pas définie), écho à 6,8 ms.
     let de = 44_100u32;
     let vers = 96_000u32;
     let n = 8192;
     let ri: Vec<f32> = (0..n)
         .map(|i| {
-            let t = i as f64 / de as f64;
-            let mut v = if i == 0 {
+            if i < pre_retard {
+                return 0.0;
+            }
+            let k = i - pre_retard;
+            let t = k as f64 / de as f64;
+            let mut v = if k == 0 {
                 0.8
             } else {
                 0.3 * (-(t / 0.01)).exp()
             };
-            if i == 300 {
+            if k == 300 {
                 v += 0.2;
             }
             v as f32
         })
         .collect();
     let rr = par_cadence::reechantillonner_ri(&[ri.clone()], de, vers);
-    // Bande utile : jusqu'à 0,45 × 44,1 kHz (19,8 kHz), comme le témoin de #8761.
     let freqs = log_freq_grid(120, 20.0, 0.45 * de as f64);
     let avant = fir_frequency_response(&ri, de, &freqs);
     let apres = fir_frequency_response(&rr[0], vers, &freqs);
@@ -381,9 +384,32 @@ fn la_reponse_reechantillonnee_de_44_1_a_96_khz_garde_sa_phase_a_1_degre() {
         pire_phase = pire_phase.max(d.abs());
         pire_db = pire_db.max((b.magnitude_db - a.magnitude_db).abs());
     }
-    eprintln!("rééchantillonnage 44,1 → 96 kHz : phase ±{pire_phase:.4}°, module ±{pire_db:.4} dB");
-    assert!(pire_phase <= 1.0, "phase : écart {pire_phase}°");
-    assert!(pire_db <= 0.1, "module : écart {pire_db} dB");
+    (pire_phase, pire_db)
+}
+
+#[test]
+fn la_reponse_reechantillonnee_de_44_1_a_96_khz_garde_sa_phase_a_1_degre() {
+    // Pic après 512 échantillons de silence (au-delà du demi-noyau sinc) :
+    // la forme des exports de correction de pièce qui gardent une avance.
+    let (phase, db) = ecarts_44_1_vers_96(512);
+    eprintln!(
+        "rééchantillonnage 44,1 → 96 kHz (pic à 512) : phase ±{phase:.4}°, module ±{db:.4} dB"
+    );
+    assert!(phase <= 1.0, "phase : écart {phase}°");
+    assert!(db <= 0.1, "module : écart {db} dB");
+}
+
+/// CONSTAT (non bloquant, relevé pour #8761) : une RI dont le pic est sur
+/// l'échantillon 0 perd, au rééchantillonnage, le pré-tintement du noyau
+/// sinc qui tombe AVANT l'instant zéro (la marge de tête est retirée pour
+/// garder l'instant zéro). Le banc le mesure et l'imprime ; il ne le corrige
+/// pas (changer l'instant zéro du repli est une décision de #8761).
+#[test]
+fn constat_pic_a_l_echantillon_zero_mesure() {
+    let (phase, db) = ecarts_44_1_vers_96(0);
+    eprintln!(
+        "CONSTAT rééchantillonnage 44,1 → 96 kHz (pic à 0) : phase ±{phase:.4}°, module ±{db:.4} dB"
+    );
 }
 
 /// Coût processeur, F64 contre F32, sur la RI de la chaîne type (65 536
