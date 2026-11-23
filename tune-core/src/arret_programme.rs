@@ -120,7 +120,7 @@ pub type Extinction = Arc<
 pub struct ArretProgramme {
     /// Actif ou non. Désactivé, l'heure et les jours sont gardés.
     pub enabled: bool,
-    /// Heure locale du serveur, `HH:MM` sur 24 h.
+    /// Heure du fuseau commun aux réveils et à l’arrêt, `HH:MM` sur 24 h.
     pub time: String,
     /// Sept caractères `0`/`1`, lundi en tête (même masque que les réveils).
     #[serde(default = "tous_les_jours")]
@@ -286,10 +286,57 @@ impl PlanificateurArretProgramme {
             let mut ticker = tokio::time::interval(std::time::Duration::from_secs(INTERVALLE_S));
             loop {
                 ticker.tick().await;
-                let maintenant = chrono::Local::now().naive_local();
-                self.passage(maintenant, &mut derniere).await;
+                self.passage_utc(chrono::Utc::now(), &mut derniere).await;
             }
         })
+    }
+
+    /// Le même fuseau explicite que les réveils, relu à chaque passage.
+    pub async fn passage_utc(
+        &self,
+        instant: chrono::DateTime<chrono::Utc>,
+        derniere: &mut Option<String>,
+    ) -> Vec<i64> {
+        let zone = match crate::alarms::read_alarm_timezone(self.db.as_ref()) {
+            Ok(zone) => zone,
+            Err(error) => {
+                warn!(error, "scheduled_stop_timezone_unreadable");
+                return Vec::new();
+            }
+        };
+        let maintenant = match crate::alarms::alarm_time_in_zone(&zone, instant) {
+            Ok(local) => local,
+            Err(error) => {
+                warn!(error, "scheduled_stop_timezone_unreadable");
+                return Vec::new();
+            }
+        };
+        let Some(reglage) = lire(&self.db) else {
+            return Vec::new();
+        };
+        // Même occurrence réelle que le réveil et que next_stop_at : une
+        // heure effacée au printemps est reportée à la première minute valide.
+        let horaire = serde_json::json!({
+            "enabled": reglage.enabled,
+            "time": reglage.time,
+            "days_of_week": reglage.days_of_week,
+        });
+        match crate::alarms::alarm_decision(&horaire, &zone, instant) {
+            Ok(crate::alarms::AlarmDecision::Ring) => {}
+            Ok(_) => return Vec::new(),
+            Err(error) => {
+                warn!(error, "scheduled_stop_timezone_unreadable");
+                return Vec::new();
+            }
+        }
+        let avant = derniere.clone();
+        let arretees = self
+            .appliquer_echeance(maintenant.naive_local(), derniere, &reglage)
+            .await;
+        if *derniere != avant {
+            info!(utc = %instant, local_time = %maintenant, "scheduled_stop_due");
+        }
+        arretees
     }
 
     /// Un passage du planificateur à l'instant `maintenant`. Rend les zones
@@ -305,12 +352,22 @@ impl PlanificateurArretProgramme {
         if !reglage.echeance(maintenant) {
             return Vec::new();
         }
+        self.appliquer_echeance(maintenant, derniere, &reglage)
+            .await
+    }
+
+    async fn appliquer_echeance(
+        &self,
+        maintenant: NaiveDateTime,
+        derniere: &mut Option<String>,
+        reglage: &ArretProgramme,
+    ) -> Vec<i64> {
         let minute = maintenant.format("%Y-%m-%d %H:%M").to_string();
         if derniere.as_deref() == Some(minute.as_str()) {
             return Vec::new();
         }
         *derniere = Some(minute);
-        let arretees = self.arreter(&reglage).await;
+        let arretees = self.arreter(reglage).await;
         if reglage.action == ActionArret::Poweroff {
             self.eteindre(maintenant, reglage.poweroff_mode.clone())
                 .await;

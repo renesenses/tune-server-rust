@@ -3004,6 +3004,11 @@ UPDATE radio_stations SET url = 'https://icecast.radiofrance.fr/fipreggae-hifi.a
 UPDATE radio_stations SET url = 'https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac?id=radiofrance' WHERE url = 'https://icecast.radiofrance.fr/fipsacrefrancais-hifi.aac';
 ",
     },
+    Migration {
+        version: 158,
+        name: "alarms_timezone",
+        up: include_str!("../../migrations/alarms_timezone.sql"),
+    },
 ];
 
 /// #8788 — le format des pistes UPnP, migration 156 et réparation idempotente.
@@ -6437,6 +6442,11 @@ pub(crate) const PG_MIGRATIONS: &[(i32, &str, &str)] = &[
         123,
         "queue_items_format_streaming",
         include_str!("../../migrations/postgres/123_queue_items_format_streaming.sql"),
+    ),
+    (
+        124,
+        "alarms_timezone",
+        include_str!("../../migrations/postgres/124_alarms_timezone.sql"),
     ),
 ];
 
@@ -10474,7 +10484,8 @@ mod tests {
         // SQLite 155. Migration de DONNÉES : annule la bascule de la 118
         // (neutralisée) là où elle a eu lieu, DEFAULT '0'.
         // 123 : format des pistes UPnP en file (#8788), SQLite 156.
-        assert_eq!(pg_latest_version(), 123, "latest PG migration must be 123");
+        // 124 : alarms_timezone (#8838), jumelle SQLite 158.
+        assert_eq!(pg_latest_version(), 124, "latest PG migration must be 124");
         assert!(
             PG_MIGRATIONS.iter().any(|&(v, name, sql)| v == 99
                 && name == "legacy_bascule_sentinel"

@@ -36,6 +36,19 @@ nohup cargo test -p tune-server --lib <filtre> > target/x.log 2>&1 &
 | `cargo clippy -p tune-core --lib --tests` | environ 6 min 40 après les tests | |
 | `cargo clippy -p tune-server --tests` | environ 8 min | |
 
+## Batterie complète et capacité du cache
+
+Constat du 21/11/2026 sur Shrek : construire tous les exécutables de tests de
+`tune-core` et `tune-server` en une commande a rempli le tmpfs de 64 Gio,
+malgré plus de 40 Gio libres au départ (cible dédiée : environ 46 Gio).
+La garde d’admission ne réserve pas l’espace consommé ensuite par les liens.
+Pour une validation complète, exécuter les bibliothèques, les binaires, puis
+les cibles d’intégration par groupes de huit avec `cargo test -j4 --test …`,
+et enfin les doctests. Conserver les mêmes features et tous les résultats.
+Retirer seulement les exécutables de chaque groupe terminé dans sa propre
+cible, en gardant les bibliothèques compilées pour les groupes suivants.
+Ne pas abaisser le seuil de stockage et ne pas purger les cibles d’autrui.
+
 ## Lancer peu de tests
 
 - Filtrer par nom : `cargo test -p tune-core --lib -- <filtre1> <filtre2>`.
@@ -169,6 +182,38 @@ fusion : lire la PR de groupe qui cite la PR unitaire
 (`gh pr view <groupe> --json state,mergeCommit`), puis
 `git diff --stat <commit unitaire> origin/<lot> -- <fichiers de la PR>` : une
 sortie vide veut dire que le contenu est fusionné.
+
+### Réveils et arrêt programmé : fuseaux (#8838, relecture #8912)
+
+Le réglage IANA `alarms_timezone` est résolu par Jiff, avec la base IANA
+embarquée (`tzdb-bundle-always`) également sous Linux : une image minimale
+sans `tzdata` conserve les fuseaux explicites. Sa valeur vide conserve
+le fuseau système. Une valeur invalide provenant d'une restauration est lue
+comme le mode système, sans réécrire la base, avec l'avertissement
+`alarm_timezone_invalid_fallback_system`, une seule fois par valeur invalide.
+Une erreur SQL reste une erreur.
+L'API refuse toujours un nouveau fuseau invalide à l'enregistrement.
+
+Une heure inexistante au printemps est reportée à la première minute valide
+du même jour : `02:30` à Paris le 29 mars 2026 donne `03:00`, et non `03:30`.
+La prochaine occurrence annoncée suit la même règle que le déclenchement.
+Les jours cochés et les jours fériés restent appliqués. Une date entièrement
+supprimée n'emprunte pas le lendemain ; une heure répétée à l'automne garde
+la déduplication par réveil et date locale. Aucun appel au périphérique n'est
+nécessaire pour les tests `8838` des bibliothèques core et serveur.
+
+Les champs `next_fired_at` et `next_stop_at` portent un instant RFC 3339 avec
+son décalage (`2026-03-29T03:00:00+02:00`), ou `null` sans occurrence.
+Vérification des remotes au 22 novembre 2026 : aucun lecteur de `next_stop_at`
+n'existe dans `tune-remote-ios` main `36998e9438fe82081d0b7e120ed9b26b666d7a67`
+ni dans `tune-remote-flutter` main `3c0a582ba4d4e0b4e72515aed43aa76adf4cd1a9`
+(`git grep` de `next_stop_at`, `nextStopAt`, `next_stop`, `nextStop`). Il n'y a
+donc pas de parseur natif existant à adapter ou à présenter comme testé.
+Le client web lit bien `next_stop_at` dans `ArretProgrammeV2.svelte` et conserve
+son heure civile avec décalage ; le cas `2026-11-11T23:00:00+01:00` est couvert
+par le test web `arretProgrammeExtinction8213.svelte.test.ts`. Le témoin API
+serveur parse les réponses avec `DateTime::parse_from_rfc3339`.
+Un futur affichage natif devra conserver l'instant et tenir compte du décalage.
 
 ### ReplayGain #7724 : isoler les états du processus
 

@@ -459,6 +459,69 @@ async fn une_extinction_refusee_ou_absente_n_empeche_pas_l_arret_de_la_lecture()
     );
 }
 
+#[tokio::test]
+async fn arret_8838_fuseau_commun_paris_hiver_ete_et_temoin_utc() {
+    for instant in ["2026-11-17T22:00:00Z", "2026-07-17T21:00:00Z"] {
+        for (fuseau, doit_arreter) in [("Europe/Paris", true), ("UTC", false)] {
+            let banc = Banc::monter().await;
+            SettingsRepo::with_backend(banc.db.clone())
+                .set("alarms_timezone", fuseau)
+                .unwrap();
+            ecrire(&banc.db, reglage("23:00", "1111111", None)).unwrap();
+            banc.jouer(banc.salon).await;
+            let mut derniere = None;
+            let arretees = banc
+                .planificateur
+                .passage_utc(instant.parse().unwrap(), &mut derniere)
+                .await;
+            assert_eq!(
+                arretees.contains(&banc.salon),
+                doit_arreter,
+                "arrêt à23h dans {fuseau} depuis {instant}"
+            );
+            assert_eq!(
+                banc.etat(banc.salon).await == PlayState::Stopped,
+                doit_arreter
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn arret_8838_jour_local_et_heure_doublee() {
+    let banc = Banc::monter().await;
+    SettingsRepo::with_backend(banc.db.clone())
+        .set("alarms_timezone", "Europe/Paris")
+        .unwrap();
+    ecrire(&banc.db, reglage("00:30", "0100000", None)).unwrap();
+    banc.jouer(banc.salon).await;
+    let mut derniere = None;
+    // Mardi à Paris, lundi en UTC.
+    assert_eq!(
+        banc.planificateur
+            .passage_utc("2026-11-16T23:30:00Z".parse().unwrap(), &mut derniere)
+            .await,
+        vec![banc.salon]
+    );
+    ecrire(&banc.db, reglage("02:30", "0000001", None)).unwrap();
+    banc.jouer(banc.salon).await;
+    derniere = None;
+    assert_eq!(
+        banc.planificateur
+            .passage_utc("2026-10-25T00:30:00Z".parse().unwrap(), &mut derniere)
+            .await,
+        vec![banc.salon]
+    );
+    banc.jouer(banc.salon).await;
+    assert!(
+        banc.planificateur
+            .passage_utc("2026-10-25T01:30:00Z".parse().unwrap(), &mut derniere)
+            .await
+            .is_empty()
+    );
+    assert_eq!(banc.etat(banc.salon).await, PlayState::Playing);
+}
+
 // ─── #8909 : l'échec d'extinction est gardé pour l'écran ─────────────
 
 #[tokio::test]
@@ -584,4 +647,53 @@ async fn le_crochet_recoit_le_mode_range_et_le_code_du_refus_est_garde() {
         .passage(mardi(23, 0), &mut derniere)
         .await;
     assert_eq!(recus.lock().unwrap().last().unwrap(), &None);
+}
+
+#[tokio::test]
+async fn relecture_8912_arret_heure_absente_a_la_premiere_minute_valide() {
+    let banc = Banc::monter().await;
+    SettingsRepo::with_backend(banc.db.clone())
+        .set("alarms_timezone", "Europe/Paris")
+        .unwrap();
+    ecrire(&banc.db, reglage("02:30", "0000001", None)).unwrap();
+    banc.jouer(banc.salon).await;
+    let mut derniere = None;
+    assert!(
+        banc.planificateur
+            .passage_utc("2026-03-29T00:59:00Z".parse().unwrap(), &mut derniere)
+            .await
+            .is_empty()
+    );
+    assert_eq!(banc.etat(banc.salon).await, PlayState::Playing);
+    assert_eq!(
+        banc.planificateur
+            .passage_utc("2026-03-29T01:00:00Z".parse().unwrap(), &mut derniere)
+            .await,
+        vec![banc.salon],
+        "#8912 : un arrêt à 02:30 doit agir à 03:00 le dimanche du saut"
+    );
+    assert_eq!(banc.etat(banc.salon).await, PlayState::Stopped);
+    banc.jouer(banc.salon).await;
+    assert!(
+        banc.planificateur
+            .passage_utc("2026-03-29T01:00:30Z".parse().unwrap(), &mut derniere)
+            .await
+            .is_empty()
+    );
+    assert!(
+        banc.planificateur
+            .passage_utc("2026-03-29T01:30:00Z".parse().unwrap(), &mut derniere)
+            .await
+            .is_empty()
+    );
+    assert_eq!(banc.etat(banc.salon).await, PlayState::Playing);
+    ecrire(&banc.db, reglage("02:30", "1000000", None)).unwrap();
+    derniere = None;
+    assert!(
+        banc.planificateur
+            .passage_utc("2026-03-29T01:00:00Z".parse().unwrap(), &mut derniere)
+            .await
+            .is_empty(),
+        "#8912 : le report ne doit pas contourner le jour coché"
+    );
 }

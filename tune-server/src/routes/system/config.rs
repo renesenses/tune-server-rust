@@ -1998,6 +1998,12 @@ pub(super) async fn update_config(
     Json(body): Json<ConfigPatch>,
 ) -> Result<impl IntoResponse, AppError> {
     let mut values = body.0;
+    if let Some(value) = values.get(tune_core::alarms::ALARM_TIMEZONE_KEY) {
+        let zone = value
+            .as_str()
+            .ok_or_else(|| AppError::bad_request("alarms_timezone : nom IANA attendu"))?;
+        tune_core::alarms::validate_alarm_timezone(zone).map_err(AppError::bad_request)?;
+    }
     // Les clés qui changent qui contrôle le serveur, ce qu'il exécute ou à
     // qui il parle (`tune_core::reglages_proteges`) ne passent par cette route
     // qu'avec une authentification admin EFFECTIVE. Authentification
@@ -3359,7 +3365,7 @@ pub(super) async fn set_default_zone(
 }
 
 /// #8213 — la réponse commune des routes de l'arrêt programmé : le réglage
-/// (ou `null`), la prochaine échéance en heure locale du serveur, et
+/// (ou `null`), la prochaine échéance dans le fuseau commun, et
 /// `poweroff_available` : l'action « éteindre la machine » est-elle permise
 /// ici ? L'écran ne propose le choix que si `true`.
 ///
@@ -3372,7 +3378,8 @@ fn reponse_arret_programme(
     reglage: Option<tune_core::arret_programme::ArretProgramme>,
     echec: Option<tune_core::arret_programme::EchecExtinction>,
     admin: bool,
-) -> Json<Value> {
+    db: &dyn tune_core::db::backend::DbBackend,
+) -> Result<Json<Value>, AppError> {
     let echec = echec.map(|e| {
         if admin {
             json!(e)
@@ -3380,28 +3387,33 @@ fn reponse_arret_programme(
             json!({ "at": e.at, "code": e.code })
         }
     });
-    let prochain = reglage.as_ref().and_then(|r| {
-        r.prochaine_echeance(chrono::Local::now().naive_local())
-            .map(|d| d.format("%Y-%m-%dT%H:%M:%S").to_string())
-    });
     let mode = crate::extinction_hote::mode();
-    Json(json!({
+    let timezone = tune_core::alarms::read_alarm_timezone(db).map_err(AppError::internal)?;
+    let prochain = reglage
+        .as_ref()
+        .map(|r| tune_core::alarms::next_alarm_at(&json!(r), &timezone, chrono::Utc::now()))
+        .transpose()
+        .map_err(AppError::internal)?
+        .flatten();
+    Ok(Json(json!({
         "scheduled_stop": reglage,
         "next_stop_at": prochain,
+        "timezone": timezone,
         "poweroff_available": mode.is_some(),
         "poweroff_mode": mode.map(crate::extinction_hote::Mode::code),
         "last_poweroff_error": echec,
-    }))
+    })))
 }
 
 pub(super) async fn get_scheduled_stop(
     admin: Result<crate::auth::RequireAdmin, (StatusCode, Json<Value>)>,
     State(state): State<AppState>,
-) -> Json<Value> {
+) -> Result<Json<Value>, AppError> {
     reponse_arret_programme(
         tune_core::arret_programme::lire(&state.backend),
         tune_core::arret_programme::lire_echec_extinction(&state.backend),
         admin.is_ok(),
+        state.backend.as_ref(),
     )
 }
 
@@ -3461,7 +3473,7 @@ pub(super) async fn set_scheduled_stop(
         // dernier échec d'extinction.
         Ok(r) => {
             tune_core::arret_programme::effacer_echec_extinction(&state.backend);
-            reponse_arret_programme(Some(r), None, true).into_response()
+            reponse_arret_programme(Some(r), None, true, state.backend.as_ref()).into_response()
         }
         Err(e) => (StatusCode::BAD_REQUEST, Json(json!({ "error": e }))).into_response(),
     }
@@ -3474,7 +3486,7 @@ pub(super) async fn delete_scheduled_stop(
     match tune_core::arret_programme::effacer(&state.backend) {
         Ok(()) => {
             tune_core::arret_programme::effacer_echec_extinction(&state.backend);
-            reponse_arret_programme(None, None, true).into_response()
+            reponse_arret_programme(None, None, true, state.backend.as_ref()).into_response()
         }
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -7691,6 +7703,10 @@ mod confinement_chemins_tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "fuseau_reveils_8838_tests.rs"]
+mod fuseau_reveils_8838_tests;
 
 #[cfg(test)]
 #[path = "cue_purge_8836_tests.rs"]
