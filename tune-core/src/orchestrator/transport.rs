@@ -209,37 +209,60 @@ pub(crate) fn message_de_refus_de_zone(
 /// - l'autre zone a un autre nom : on la nomme, c'est là qu'il faut lancer ;
 /// - l'autre zone est SUPPRIMÉE (masquée) : on ne propose pas d'y lancer la
 ///   lecture, l'auditeur ne la voit plus.
+///
+/// Forum rc14 — la sentinelle porte le motif
+/// [`crate::outputs::sortie_tenue_par_une_autre_zone::MOTIF`] et la zone qui
+/// tient la sortie : sans motif, le client web remplaçait cette phrase par son
+/// bandeau générique « l'appareil est introuvable ».
 pub(crate) fn message_de_sortie_deja_tenue(
     zone_name: &str,
     sortie: &str,
+    autre_zone_id: i64,
     autre_zone: &str,
     autre_supprimee: bool,
 ) -> String {
-    const SENTINELLE: &str = "zone_output_unavailable:";
+    use crate::outputs::sortie_tenue_par_une_autre_zone::{Forme, SortieTenue, sentinelle};
     let appareil = nom_lisible_de_l_appareil(sortie).unwrap_or_else(|| zone_name.to_string());
     let debut = format!(
-        "{SENTINELLE}La sortie de la zone « {zone_name} » a disparu. Une sortie « {appareil} » \
+        "La sortie de la zone « {zone_name} » a disparu. Une sortie « {appareil} » \
          est bien présente, mais"
     );
-    if autre_supprimee {
-        format!(
-            "{debut} elle est déjà attachée à une zone supprimée, « {autre_zone} », et deux \
-             zones ne peuvent pas partager une sortie. Choisissez une autre sortie dans les \
-             réglages de la zone « {zone_name} »."
+    let (variant, phrase) = if autre_supprimee {
+        (
+            Forme::Deleted,
+            format!(
+                "{debut} elle est déjà attachée à une zone supprimée, « {autre_zone} », et deux \
+                 zones ne peuvent pas partager une sortie. Choisissez une autre sortie dans les \
+                 réglages de la zone « {zone_name} »."
+            ),
         )
     } else if autre_zone.eq_ignore_ascii_case(zone_name) {
-        format!(
-            "{debut} une autre zone nommée elle aussi « {zone_name} » l'utilise déjà, et deux \
-             zones ne peuvent pas partager une sortie. Lancez la lecture depuis cette autre \
-             zone, ou choisissez une autre sortie dans les réglages de celle-ci."
+        (
+            Forme::SameName,
+            format!(
+                "{debut} une autre zone nommée elle aussi « {zone_name} » l'utilise déjà, et deux \
+                 zones ne peuvent pas partager une sortie. Lancez la lecture depuis cette autre \
+                 zone, ou choisissez une autre sortie dans les réglages de celle-ci."
+            ),
         )
     } else {
-        format!(
-            "{debut} la zone « {autre_zone} » l'utilise déjà, et deux zones ne peuvent pas \
-             partager une sortie. Lancez la lecture depuis « {autre_zone} », ou choisissez une \
-             autre sortie dans les réglages de la zone « {zone_name} »."
+        (
+            Forme::Other,
+            format!(
+                "{debut} la zone « {autre_zone} » l'utilise déjà, et deux zones ne peuvent pas \
+                 partager une sortie. Lancez la lecture depuis « {autre_zone} », ou choisissez une \
+                 autre sortie dans les réglages de la zone « {zone_name} »."
+            ),
         )
-    }
+    };
+    sentinelle(&SortieTenue {
+        zone_qui_tient: autre_zone_id,
+        variant,
+        zone: zone_name.to_string(),
+        device: appareil,
+        holder: autre_zone.to_string(),
+        phrase,
+    })
 }
 
 /// Le message ET le code d'un refus de zone hors ligne, en fonction pure.
@@ -811,23 +834,43 @@ impl PlaybackOrchestrator {
             .flatten()
             .filter(|z| z.id.is_some_and(|id| id != zone_id))?;
         let supprimee = repo.is_device_hidden(sortie);
-        let msg = message_de_sortie_deja_tenue(&zone.name, sortie, &occupante.name, supprimee);
+        let occupante_id = occupante.id.unwrap_or_default();
+        let msg = message_de_sortie_deja_tenue(
+            &zone.name,
+            sortie,
+            occupante_id,
+            &occupante.name,
+            supprimee,
+        );
         warn!(
             zone_id,
             zone_name = %zone.name,
             stale_device_id = dev_id,
             target_device_id = sortie,
-            holder_zone_id = occupante.id.unwrap_or_default(),
+            holder_zone_id = occupante_id,
             holder_hidden = supprimee,
             "zone_rebind_target_held_by_other_zone"
         );
-        if let Some(ref bus) = self.event_bus {
+        if let Some(ref bus) = self.event_bus
+            && let Some(refus) =
+                crate::outputs::sortie_tenue_par_une_autre_zone::depuis_sentinelle(&msg)
+        {
             bus.emit(
                 "zone.playback_error",
                 serde_json::json!({
                     "zone_id": zone_id,
-                    "error": phrase_sans_sentinelle(&msg),
+                    "error": refus.phrase,
                     "code": "zone_output_unavailable",
+                    // Forum rc14 — le motif fait afficher CE refus au client,
+                    // pas son bandeau « appareil introuvable ». La phrase est
+                    // en français : le client la compose dans la langue de
+                    // l'interface à partir du motif et de `params`
+                    // (`erreursServeur.output_held_by_other_zone…`).
+                    "message": refus.phrase,
+                    "params": refus.params_json(),
+                    "reason": crate::outputs::sortie_tenue_par_une_autre_zone::MOTIF,
+                    "holder_zone_id": occupante_id,
+                    "holder_hidden": supprimee,
                     "fatal": true,
                 }),
             );

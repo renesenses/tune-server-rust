@@ -428,6 +428,27 @@ fn play_error_response(e: String, lang: &str) -> axum::response::Response {
         )
             .into_response();
     }
+    // Forum rc14 — la sortie vivante du même nom est tenue par une AUTRE
+    // zone (#5464). Le motif fait afficher la phrase du serveur, qui nomme
+    // cette zone ; sans lui, le client web la remplaçait par son bandeau
+    // générique « l'appareil est introuvable ». Testé AVANT le refus
+    // ordinaire, dont le préfixe est aussi le sien.
+    // Rc14 — la phrase se compose dans la langue de la requête
+    // (`message_key`, `params`), jamais la phrase française de tune-core.
+    if let Some(refus) = tune_core::outputs::sortie_tenue_par_une_autre_zone::depuis_sentinelle(&e)
+    {
+        let corps = crate::message_api::avec_message_en(
+            json!({
+                "error": "zone_output_unavailable",
+                "reason": tune_core::outputs::sortie_tenue_par_une_autre_zone::MOTIF,
+                "holder_zone_id": refus.zone_qui_tient,
+            }),
+            lang,
+            refus.variant.cle_de_message(),
+            &refus.params(),
+        );
+        return (StatusCode::CONFLICT, Json(corps)).into_response();
+    }
     if let Some(msg) = e.strip_prefix("zone_output_unavailable:") {
         return (
             StatusCode::CONFLICT,
@@ -9891,6 +9912,53 @@ mod tests {
             body.get("reason").is_none(),
             "un refus ordinaire ne doit pas se voir coller un motif ASIO : {body}"
         );
+    }
+
+    /// Forum rc14 — deux zones pour un même appareil : le refus « sortie tenue
+    /// par une autre zone » rend son motif et la zone qui tient la sortie, et
+    /// la phrase traverse sans sentinelle. Sans motif, le client web affichait
+    /// son bandeau générique « appareil introuvable » à la place.
+    #[tokio::test]
+    async fn le_refus_de_sortie_tenue_par_une_autre_zone_porte_son_motif() {
+        use tune_core::outputs::sortie_tenue_par_une_autre_zone::{Forme, SortieTenue, sentinelle};
+        let refus = |variant| SortieTenue {
+            zone_qui_tient: 7,
+            variant,
+            zone: "Salon : DLNA".into(),
+            device: "NanoPlayer".into(),
+            holder: "Salon : NanoPlayer".into(),
+            phrase: "La zone « Salon : NanoPlayer » l'utilise déjà.".into(),
+        };
+        let (status, body) =
+            response_parts(play_error_response(sentinelle(&refus(Forme::Other)), "en")).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body["error"], "zone_output_unavailable");
+        assert_eq!(body["reason"], "output_held_by_other_zone", "{body}");
+        assert_eq!(body["holder_zone_id"], 7, "{body}");
+        // Rc14 — traduite, avec sa clé et ses paramètres : jamais la phrase
+        // française de tune-core.
+        assert_eq!(
+            body["message_key"], "api.zones.outputHeldByOtherZone",
+            "{body}"
+        );
+        assert_eq!(body["params"]["holder"], "Salon : NanoPlayer", "{body}");
+        assert_eq!(body["params"]["variant"], "other", "{body}");
+        let message = body["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("“Salon : NanoPlayer”") && !message.contains("déjà"),
+            "phrase anglaise attendue : {body}"
+        );
+
+        // Chaque forme a sa clé, et le français reste du français.
+        for (variant, cle) in [
+            (Forme::SameName, "api.zones.outputHeldBySameNameZone"),
+            (Forme::Deleted, "api.zones.outputHeldByDeletedZone"),
+        ] {
+            let (_, body) = parts(&sentinelle(&refus(variant))).await;
+            assert_eq!(body["message_key"], cle, "{body}");
+            let message = body["message"].as_str().unwrap_or_default();
+            assert!(message.contains("« Salon : DLNA »"), "{body}");
+        }
     }
 
     /// #4556 — le refus qui SAIT pourquoi il ne trouve rien porte un motif, et
