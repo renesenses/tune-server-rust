@@ -30,3 +30,11 @@ opt-level = 2
 # d'échantillons à 1 bit et font des FFT de 2^20 points.
 [profile.dev.package.tune-plugin-audio-support]
 opt-level = 2
+
+# TESS T06 : le banc sonore des moteurs de référence (référence hors ligne par
+# convolution directe, réponse en fréquence de 2^19 points).
+[profile.dev.package.tune-plugin-equalizer]
+opt-level = 2
+
+[profile.dev.package.tune-plugin-crossfeed]
+opt-level = 2

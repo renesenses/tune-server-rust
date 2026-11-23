@@ -2581,6 +2581,20 @@ pub trait OutputProvider: Send + Sync {
     /// when its module is not owned. The server rebuilds the context on
     /// every poll, so buying a module takes effect without a restart.
     async fn discover(&self, ctx: &ProviderContext) -> Vec<Box<dyn OutputTarget>>;
+
+    /// What this provider can say about its search, for `/system/diagnostics`
+    /// and the bug report (tune-server-rust#9380): is it searching at all
+    /// (an opt-in option may be off), and what did it hear?
+    ///
+    /// Without it, `devices: 0` reads the same for a provider whose option is
+    /// off, one that hears nothing, and one that hears devices in a form it
+    /// does not understand. Called right after [`discover`](Self::discover).
+    /// The server prints the known keys — `enabled` (bool), `listening`
+    /// (bool), `summary` (one plain sentence) — and keeps the rest in the
+    /// JSON. Default `None`: the report keeps its former line.
+    fn discovery_report(&self) -> Option<serde_json::Value> {
+        None
+    }
 }
 
 /// Runtime context handed to [`OutputProvider::discover`] on every poll.

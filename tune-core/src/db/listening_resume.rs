@@ -174,6 +174,77 @@ pub fn recent_du_profil(
     Ok(rs)
 }
 
+/// Fil 3009, point 4 (FabienM, rc13) — « Reprise d'un album ou d'une
+/// playlist : l'historique affiche les titres en 1re ligne, il manque le
+/// conteneur de la reprise ».
+///
+/// Le conteneur d'une écoute vient de la ligne de file (`queue_items.context_*`)
+/// ou, à défaut, du contexte de SESSION de la zone — tenu en MÉMOIRE seulement.
+/// Une file posée par `POST /zones/{id}/play` laisse ses lignes à NULL (« la
+/// session EST le conteneur », #6466). Après un redémarrage du serveur, la
+/// lecture reprise (`POST /zones/{id}/resume`, la reprise au démarrage #6380)
+/// n'a plus de session : chaque titre repris s'écrivait sans conteneur, au
+/// premier niveau de l'Historique.
+///
+/// La reprise ENREGISTRÉE, elle, survit : chaque contexte démarré range les
+/// lignes de file qui lui appartiennent (`queue_row_ids`). Ce repli rend le
+/// conteneur de la DERNIÈRE reprise de la zone si elle contient la ligne jouée
+/// à `position` et que cette ligne désigne bien la piste jouée. Album ou
+/// playlist seulement (ni radio, ni titre seul, ni podcast) : rien n'est
+/// inventé. L'appelant ne la consulte qu'une fois par zone après le démarrage.
+pub fn contexte_de_la_ligne_reprise(
+    db: &Arc<dyn DbBackend>,
+    zone_id: i64,
+    position: i64,
+    track_id: Option<i64>,
+    source_id: Option<&str>,
+) -> Option<super::contexte_de_file::ContexteDeFile> {
+    let ligne = db
+        .query_one(
+            "SELECT id, track_id, source_id FROM queue_items WHERE zone_id = ? AND position = ? ORDER BY id LIMIT 1",
+            &[&zone_id as &dyn ToSqlValue, &position],
+        )
+        .ok()
+        .flatten()?;
+    let id = ligne.first().and_then(|v| v.as_i64())?;
+    let meme_piste = match (track_id, ligne.get(1).and_then(|v| v.as_i64())) {
+        (Some(a), Some(b)) => a == b,
+        (None, None) => {
+            source_id.is_some() && source_id == ligne.get(2).and_then(|v| v.as_string()).as_deref()
+        }
+        _ => false,
+    };
+    if !meme_piste {
+        return None;
+    }
+    // UNE seule reprise lue : la plus récente de la zone, celle que la
+    // lecture interrompue par le redémarrage écrivait.
+    let r = db
+        .query_one(
+            "SELECT payload, resume_key FROM listening_resumes WHERE zone_id = ? ORDER BY updated_at DESC, resume_key LIMIT 1",
+            &[&zone_id as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten()
+        .and_then(|row| decode(&row).ok())?;
+    // Un album ou une playlist seulement : une radio (#6465), un titre seul,
+    // un podcast ne rangent jamais une écoute dans leur conteneur.
+    if !matches!(r.context_type.as_str(), "album" | "playlist")
+        || r.context_id.is_empty()
+        || !r.queue_row_ids.contains(&id)
+    {
+        return None;
+    }
+    let texte = |s: &str| (!s.trim().is_empty()).then(|| s.to_string());
+    Some(super::contexte_de_file::ContexteDeFile {
+        nature: r.context_type.clone(),
+        id: Some(r.context_id.clone()),
+        service: texte(&r.source),
+        titre: texte(&r.title),
+        pochette: r.cover_path.clone(),
+    })
+}
+
 pub fn recent(
     db: &Arc<dyn DbBackend>,
     zone_id: Option<i64>,

@@ -22,6 +22,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::f64::consts::PI;
+use tune_plugin_audio_support::echantillon::Echantillon;
 
 /// User-facing EQ profile combining room macro settings + perceptual sliders.
 #[cfg_attr(feature = "schemas", derive(schemars::JsonSchema))]
@@ -1366,6 +1367,22 @@ impl EqProcessor {
     /// filter states out of step and every later chunk would be filtered with
     /// the wrong channel's history.
     pub fn process_interleaved(&mut self, samples: &mut [f32]) -> EqProcessStats {
+        self.traiter_entrelace(samples)
+    }
+
+    /// TESS T06 — [`Self::process_interleaved`] sur un tampon **`f64`**
+    /// entrelacé (pleine échelle ±1,0), tel que l'exécuteur TESS le tient.
+    ///
+    /// Même cascade, même état par canal, mêmes compteurs, même limiteur :
+    /// seule la représentation change, et AUCUN arrondi vers `f32` n'a lieu
+    /// ni à l'entrée ni à la sortie. Le chemin `f32` reste celui d'avant au
+    /// bit près (il partage cette boucle, voir
+    /// [`tune_plugin_audio_support::echantillon`]).
+    pub fn process_interleaved_f64(&mut self, samples: &mut [f64]) -> EqProcessStats {
+        self.traiter_entrelace(samples)
+    }
+
+    fn traiter_entrelace<T: Echantillon>(&mut self, samples: &mut [T]) -> EqProcessStats {
         let mut stats = EqProcessStats::default();
         if !self.enabled || samples.is_empty() || self.channels == 0 {
             return stats;
@@ -1389,7 +1406,7 @@ impl EqProcessor {
             for (ch, sample) in frame.iter_mut().enumerate() {
                 let state = &mut self.states[ch];
                 let cascade = &self.filters[ch];
-                let mut s = *sample as f64 * self.preamp_gains[ch];
+                let mut s = sample.vers_f64() * self.preamp_gains[ch];
                 if !s.is_finite() {
                     stats.non_finite_samples += 1;
                     s = 0.0;
@@ -1408,7 +1425,7 @@ impl EqProcessor {
                         s.abs(),
                     );
                 }
-                *sample = s as f32;
+                *sample = T::depuis_f64(s);
             }
         }
         self.ecretage.noter_vus(samples.len() as u64);
@@ -1494,7 +1511,7 @@ impl EqProcessor {
     }
 
     /// [`Self::process_interleaved`] en mode « Réaliste ».
-    fn process_interleaved_limite(&mut self, samples: &mut [f32]) -> EqProcessStats {
+    fn process_interleaved_limite<T: Echantillon>(&mut self, samples: &mut [T]) -> EqProcessStats {
         const LSB_REFERENCE: f64 = 8_388_608.0;
         let mut stats = EqProcessStats::default();
         let ch_count = self.channels as usize;
@@ -1504,7 +1521,7 @@ impl EqProcessor {
 
         for (fi, frame) in samples.chunks_exact_mut(ch_count).enumerate() {
             for (ch, sample) in frame.iter().enumerate() {
-                let mut s = *sample as f64 * self.preamp_gains[ch];
+                let mut s = sample.vers_f64() * self.preamp_gains[ch];
                 if !s.is_finite() {
                     stats.non_finite_samples += 1;
                     s = 0.0;
@@ -1525,7 +1542,7 @@ impl EqProcessor {
                         s.abs(),
                     );
                 }
-                *sample = s as f32;
+                *sample = T::depuis_f64(s);
             }
         }
         self.ecretage.noter_vus(samples.len() as u64);
@@ -1613,6 +1630,22 @@ impl EqProcessor {
 
     pub fn preamp_db(&self, channel: u16) -> Option<f64> {
         self.preamp_db.get(channel as usize).copied()
+    }
+
+    /// TESS T06 — pour le banc sonore SEULEMENT : les coefficients préparés
+    /// `[b0, b1, b2, a1, a2]` de la cascade de chaque canal et le pré-gain
+    /// linéaire de chaque canal, tels que la boucle les applique. Le banc en
+    /// tire une référence en précision étendue (double-double), calculée à
+    /// part de la récurrence `f64` du moteur.
+    #[doc(hidden)]
+    pub fn coefficients_du_banc(&self) -> (Vec<Vec<[f64; 5]>>, Vec<f64>) {
+        (
+            self.filters
+                .iter()
+                .map(|c| c.iter().map(|b| [b.b0, b.b1, b.b2, b.a1, b.a2]).collect())
+                .collect(),
+            self.preamp_gains.clone(),
+        )
     }
 
     /// Reprendre l'historique des filtres du processeur que celui-ci remplace,

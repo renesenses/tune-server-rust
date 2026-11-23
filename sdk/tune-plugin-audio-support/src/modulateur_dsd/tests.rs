@@ -323,3 +323,93 @@ fn emballage_et_signe() {
     let part = f64::from(uns) / f64::from(total);
     assert!((part - 0.75).abs() < 0.01, "part de 1 : {part}");
 }
+
+/// Le dither casse les tons de repos d'un modulateur à 1 bit. Entrée
+/// continue faible (−60 dBFS) : sans dither, la boucle tombe dans un cycle
+/// limite qui sort des raies dans la bande audio ; avec le dither, plus de
+/// raie au-dessus de −135 dB. CONTRE-ÉPREUVE dans le même test : dither à 0,
+/// même entrée, la raie dépasse le seuil.
+#[test]
+fn le_dither_casse_les_tons_de_repos() {
+    const SEUIL_DB: f64 = -135.0;
+    let fs_dsd = 2_822_400.0;
+    let raie = |dither: f64| {
+        let mut m =
+            ModulateurDsd::avec_reglages(FS, 2, CadenceDsd::Dsd64, HINF, dither).unwrap();
+        let n = trames_pour(&m, N_FFT);
+        let octets = moduler(&mut m, &vec![1e-3; n * 2]);
+        analyser(&fin_du_canal(&octets, 2, N_FFT), fs_dsd, None).raie_max_db
+    };
+    let avec = raie(DITHER);
+    let sans = raie(0.0);
+    assert!(
+        avec < SEUIL_DB,
+        "avec dither : raie de repos à {avec:.1} dB (sans : {sans:.1} dB)"
+    );
+    assert!(
+        sans > SEUIL_DB,
+        "sans dither, aucune raie de repos au-dessus de {SEUIL_DB} dB ({sans:.1} dB) : \
+         le témoin ne discrimine pas (avec : {avec:.1} dB)"
+    );
+}
+
+/// `reinitialiser()` : pas de marche (le volume et sa rampe sont gardés), et
+/// reprise propre — la même entrée rend les MÊMES bits qu'un modulateur neuf
+/// remis à zéro au même volume (boucles, historiques ET générateurs du dither
+/// revenus à leur état de départ).
+#[test]
+fn reinitialiser_reprend_proprement_sans_marche() {
+    let amener_au_volume = |m: &mut ModulateurDsd| {
+        m.definir_volume(0.5);
+        let silence = vec![0.0; 2 * 1_000];
+        moduler(m, &silence);
+        assert_eq!(m.volume(), 0.5);
+    };
+    let b = sinus(FS, 1_000.0, 0.7, 3_000, 2);
+
+    // Un modulateur qui a déjà travaillé (autre signal), puis remis à zéro.
+    let mut use_ = ModulateurDsd::new(FS, 2, CadenceDsd::Dsd64).unwrap();
+    amener_au_volume(&mut use_);
+    moduler(&mut use_, &sinus(FS, 7_000.0, 0.9, 5_000, 2));
+    use_.reinitialiser();
+    assert_eq!(use_.volume(), 0.5, "la remise à zéro a changé le volume");
+
+    // Le même, neuf, remis à zéro au même volume.
+    let mut neuf = ModulateurDsd::new(FS, 2, CadenceDsd::Dsd64).unwrap();
+    amener_au_volume(&mut neuf);
+    neuf.reinitialiser();
+
+    assert_eq!(moduler(&mut use_, &b), moduler(&mut neuf, &b));
+    assert_eq!(use_.reinitialisations(), 0);
+}
+
+/// Le volume ne dépasse jamais 0 dB.
+#[test]
+fn le_volume_est_plafonne_a_zero_db() {
+    let mut m = ModulateurDsd::new(FS, 2, CadenceDsd::Dsd64).unwrap();
+    m.definir_volume(2.0);
+    moduler(&mut m, &vec![0.0; 2 * 1_000]);
+    assert_eq!(m.volume(), 1.0);
+}
+
+/// Les deux refus de `traiter` disent ce qui ne va pas.
+#[test]
+fn les_refus_de_traiter_sont_explicites() {
+    let mut m = ModulateurDsd::new(FS, 2, CadenceDsd::Dsd64).unwrap();
+    let mut sortie = vec![0u8; m.octets_pour(10)];
+    assert_eq!(
+        m.traiter(&[0.0; 3], &mut sortie),
+        Err(ErreurModulateur::TramesIncompletes {
+            echantillons: 3,
+            canaux: 2
+        })
+    );
+    let besoin = m.octets_pour(10);
+    assert_eq!(
+        m.traiter(&[0.0; 20], &mut sortie[..besoin - 1]),
+        Err(ErreurModulateur::TamponTropCourt {
+            besoin,
+            recu: besoin - 1
+        })
+    );
+}

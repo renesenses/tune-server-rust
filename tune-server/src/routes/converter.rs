@@ -499,8 +499,9 @@ async fn start_job(
         started_at_ms: maintenant_ms(),
     }));
 
+    // #9343 — la route et le chemin dans le message, pas « os error 30 » seul.
     crate::audio_job_journal::write("converter", &job_id, "running", total, 0)
-        .map_err(AppError::internal)?;
+        .map_err(|e| AppError::internal(format!("POST /converter/start: {e}")))?;
     let store = job_store();
     {
         let mut map = store.lock().await;

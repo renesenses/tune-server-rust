@@ -1,7 +1,7 @@
 //! TESS T11b — banc du modulateur DSD.
 //!
 //! ```text
-//! cargo run --release -p tune-plugin-audio-support --example banc_modulateur_dsd -- \
+//! cargo run --release -p tune-plugin-audio-support --features mesure-dsd --example banc_modulateur_dsd -- \
 //!     [--dsf fichier.dsf] [--secondes 10]
 //! ```
 //!

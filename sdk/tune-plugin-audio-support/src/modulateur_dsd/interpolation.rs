@@ -9,9 +9,9 @@
 //!    audio sont rejetées ;
 //! 2. **linéaire** × `l2` (le reste du rapport) : à 8 × Fs, les images
 //!    restantes sont autour de 8 × Fs, très loin de la bande audio ; la
-//!    réponse en sinus cardinal au carré les atténue encore d'environ 50 dB,
-//!    et la bande audio n'en est pas touchée de plus de 0,03 dB (20 kHz à
-//!    352,8 kHz).
+//!    réponse en sinus cardinal au carré les atténue encore d'environ 50 dB ;
+//!    elle atténue aussi le haut de la bande audio d'environ 0,09 dB à 20 kHz
+//!    (sinc²(20 / 352,8) ; mesuré : −6,11 dB au lieu de −6,02 dB au banc).
 //!
 //! Aucune allocation dans [`Interpolateur::produire`] : historiques et tampons
 //! sont réservés à la construction.

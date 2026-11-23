@@ -42,7 +42,9 @@
 
 pub mod conception;
 pub mod interpolation;
-#[doc(hidden)]
+/// Outils de mesure des témoins et du banc : hors de l'API publique du SDK,
+/// compilés pour les tests ou avec la fonctionnalité `mesure-dsd` (banc).
+#[cfg(any(test, feature = "mesure-dsd"))]
 pub mod mesure;
 
 pub use conception::Ntf;
@@ -102,6 +104,10 @@ pub enum ErreurModulateur {
     CadenceNonPrise(u32, CadenceDsd),
     CanauxInvalides(u16),
     Conception,
+    /// L'entrée n'est pas faite de trames entières (`échantillons`, `canaux`).
+    TramesIncompletes { echantillons: usize, canaux: usize },
+    /// Le tampon de sortie est trop court (`besoin`, `recu` octets).
+    TamponTropCourt { besoin: usize, recu: usize },
 }
 
 impl std::fmt::Display for ErreurModulateur {
@@ -113,6 +119,13 @@ impl std::fmt::Display for ErreurModulateur {
             ),
             Self::CanauxInvalides(n) => write!(f, "invalid channel count {n}"),
             Self::Conception => write!(f, "noise transfer function design failed"),
+            Self::TramesIncompletes {
+                echantillons,
+                canaux,
+            } => write!(f, "{echantillons} samples are not whole {canaux}-channel frames"),
+            Self::TamponTropCourt { besoin, recu } => {
+                write!(f, "output buffer holds {recu} bytes, {besoin} needed")
+            }
         }
     }
 }
@@ -159,6 +172,8 @@ pub struct Boucle {
     d: [f64; ORDRE],
     etat: [f64; ORDRE],
     alea: Alea,
+    /// État initial du générateur, rendu par [`Self::reinitialiser`].
+    graine: u64,
     dither: f64,
     pub entree_max: f64,
     pub reinitialisations: u64,
@@ -180,14 +195,18 @@ impl Boucle {
             d,
             etat: [0.0; ORDRE],
             alea: Alea(graine | 1),
+            graine: graine | 1,
             dither,
             entree_max: 0.0,
             reinitialisations: 0,
         }
     }
 
+    /// Boucle et générateur du dither remis à l'état de la construction : la
+    /// suite rend les mêmes bits qu'une boucle neuve.
     pub fn reinitialiser(&mut self) {
         self.etat = [0.0; ORDRE];
+        self.alea = Alea(self.graine);
     }
 
     /// Un échantillon à la cadence DSD : rend le bit (`true` = +1).
@@ -328,7 +347,9 @@ impl ModulateurDsd {
     /// sans marche ; un volume non fini ou négatif est ignoré.
     pub fn definir_volume(&mut self, gain: f64) {
         if gain.is_finite() && gain >= 0.0 {
-            self.cible = gain;
+            // Un volume ne dépasse jamais 0 dB : au-delà, ce serait du gain,
+            // que le limiteur de sécurité écrêterait.
+            self.cible = gain.min(1.0);
         }
     }
 
@@ -349,7 +370,10 @@ impl ModulateurDsd {
             .fold(0.0, f64::max)
     }
 
-    /// Nouvelle piste ou saut : historiques et boucles à zéro, volume gardé.
+    /// Nouvelle piste ou saut : historiques, boucles et générateurs du dither
+    /// à l'état de la construction ; le volume et sa rampe sont GARDÉS (aucune
+    /// marche de niveau). Après une remise à zéro, la même entrée rend les
+    /// mêmes bits qu'un modulateur neuf réglé au même volume.
     pub fn reinitialiser(&mut self) {
         self.interpolateur.reinitialiser();
         for b in &mut self.boucles {
@@ -367,12 +391,18 @@ impl ModulateurDsd {
     ) -> Result<usize, ErreurModulateur> {
         let c = self.canaux;
         if !entree.len().is_multiple_of(c) {
-            return Err(ErreurModulateur::CanauxInvalides(c as u16));
+            return Err(ErreurModulateur::TramesIncompletes {
+                echantillons: entree.len(),
+                canaux: c,
+            });
         }
         let trames = entree.len() / c;
         let besoin = self.octets_pour(trames);
         if sortie.len() < besoin {
-            return Err(ErreurModulateur::Conception);
+            return Err(ErreurModulateur::TamponTropCourt {
+                besoin,
+                recu: sortie.len(),
+            });
         }
         let octets_par_canal = self.rapport / 8;
         for (t, trame) in entree.chunks_exact(c).enumerate() {

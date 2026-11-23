@@ -1595,6 +1595,9 @@ impl PlaybackOrchestrator {
                 // repli historique par telechargement complet reste propre,
                 // et c'est lui que la piste aurait pris si la sonde avait
                 // echoue.
+                // #8983 — idem quand le saut demande (`seek_s`) a ete refuse
+                // par la source Range : le fichier telecharge, lui, sait
+                // partir de la position.
                 Ok(Err(e)) if crate::audio::decode::echec_avant_le_premier_octet(&e) => {
                     warn!(
                         stream_id = %session_id_for_eof,

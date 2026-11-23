@@ -246,6 +246,8 @@ async fn build_snapshot(state: &AppState, lang: &str) -> serde_json::Value {
         // est un residu de la meme famille, ferme parce qu'il est ouvert.
         if let Some(obj) = snap.as_object_mut() {
             crate::routes::zones::injecter_reglages_renderer(obj, &zone_repo, zid);
+            // #8788 — le DSD porté par du DoP, comme dans les trois autres.
+            crate::routes::zones::inject_dsd_porte(obj, "now_playing", &ps);
         }
         zone_snaps.push(snap);
     }

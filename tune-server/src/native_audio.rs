@@ -11,15 +11,71 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
+/// La racine des greffons audio natifs (et de leur journal de travaux,
+/// `jobs/`). Voir [`resoudre_la_racine`] pour les règles.
 pub fn root() -> PathBuf {
-    std::env::var_os("TUNE_AUDIO_PLUGINS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("TUNE_PLUGINS_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("plugins"))
-                .join("audio")
-        })
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let base = crate::chemins_de_donnees::base_retenue()
+        .map(str::to_owned)
+        .or_else(|| std::env::var("TUNE_DB_PATH").ok());
+    resoudre_la_racine(
+        std::env::var_os("TUNE_AUDIO_PLUGINS_DIR"),
+        std::env::var_os("TUNE_PLUGINS_DIR"),
+        std::env::var("TUNE_DATA_DIR").ok(),
+        base.as_deref(),
+        &cwd,
+        |chemin| chemin.is_dir(),
+    )
+}
+
+/// #9343 — règle pure derrière [`root`] ; l'environnement lui est passé.
+///
+/// Avant, sans `TUNE_AUDIO_PLUGINS_DIR` ni `TUNE_PLUGINS_DIR`, la racine
+/// valait `plugins/audio`, RELATIF au répertoire courant. Un serveur macOS
+/// lancé à l'ouverture de session a `/` pour répertoire courant, en lecture
+/// seule : « Convertir » échouait en « Read-only file system (os error 30) »
+/// dès l'écriture du journal des travaux, et aucun greffon audio ne pouvait
+/// s'installer. Même défaut dans l'image Docker (`/app`, propriété de root)
+/// et sur Tune OS Raspberry Pi (`ReadWritePaths=/opt/tune/data`).
+///
+/// 1. `TUNE_AUDIO_PLUGINS_DIR`, tel quel ;
+/// 2. `$TUNE_PLUGINS_DIR/audio` ;
+/// 3. **reprise** : `<cwd>/plugins/audio` s'il existe déjà — les greffons
+///    installés par un serveur lancé depuis son dossier (.deb sous
+///    `/var/lib/tune`, Tune OS NUC sous `/opt/tune`, `.command` macOS) restent
+///    là où ils sont, rien n'est déplacé ni perdu ;
+/// 4. `<dossier de données>/plugins/audio`, le dossier de données étant
+///    résolu comme partout ailleurs ([`crate::gel_executeur::dossier_de_donnees`] :
+///    `TUNE_DATA_DIR`, sinon le dossier de la base retenue au démarrage —
+///    `~/Library/Application Support/Tune` sur macOS) ;
+/// 5. sans dossier de données connu (base en mémoire), `<cwd>/plugins/audio`,
+///    mais ABSOLU.
+pub(crate) fn resoudre_la_racine(
+    audio_env: Option<std::ffi::OsString>,
+    plugins_env: Option<std::ffi::OsString>,
+    data_dir_env: Option<String>,
+    db_path: Option<&str>,
+    cwd: &std::path::Path,
+    existe: impl Fn(&std::path::Path) -> bool,
+) -> PathBuf {
+    if let Some(dossier) = audio_env.filter(|d| !d.is_empty()) {
+        return PathBuf::from(dossier);
+    }
+    if let Some(dossier) = plugins_env.filter(|d| !d.is_empty()) {
+        return PathBuf::from(dossier).join("audio");
+    }
+    let historique = cwd.join("plugins").join("audio");
+    if existe(&historique) {
+        return historique;
+    }
+    let data_dir = data_dir_env.filter(|d| !d.trim().is_empty());
+    let db_path = db_path.filter(|p| !p.trim().is_empty() && *p != ":memory:");
+    if data_dir.is_none() && db_path.is_none() {
+        return historique;
+    }
+    crate::gel_executeur::dossier_de_donnees(data_dir.as_deref(), db_path.unwrap_or(""), cwd)
+        .join("plugins")
+        .join("audio")
 }
 /// #5149 — clé publique minisign des greffons natifs de Mozaiklabs (id
 /// `24A5D1CD444CB780`). Paire DÉDIÉE aux greffons, distincte de la clé des
@@ -677,3 +733,100 @@ mod crossfeed_gratuit_9210_tests {
 #[cfg(test)]
 #[path = "native_audio_etat_9151_tests.rs"]
 mod etat_9151_tests;
+
+#[cfg(test)]
+mod racine_9343_tests {
+    use super::resoudre_la_racine;
+    use std::path::{Path, PathBuf};
+
+    const SUPPORT: &str = "/Users/manfred/Library/Application Support/Tune";
+
+    /// Le cas du fil 2996 : LaunchAgent macOS, répertoire courant `/`, base
+    /// résolue sous `Application Support`. La racine ne doit plus être
+    /// relative au répertoire courant.
+    #[test]
+    fn lance_depuis_la_racine_le_dossier_suit_la_base_et_non_le_repertoire_courant() {
+        let base = format!("{SUPPORT}/tune.db");
+        let racine = resoudre_la_racine(None, None, None, Some(&base), Path::new("/"), |_| false);
+        assert!(
+            racine.is_absolute(),
+            "racine relative : {}",
+            racine.display()
+        );
+        assert_eq!(racine, Path::new(SUPPORT).join("plugins/audio"));
+    }
+
+    #[test]
+    fn tune_data_dir_l_emporte_sur_le_dossier_de_la_base() {
+        let racine = resoudre_la_racine(
+            None,
+            None,
+            Some("/opt/tune/data".into()),
+            Some("/ailleurs/tune.db"),
+            Path::new("/opt/tune"),
+            |_| false,
+        );
+        assert_eq!(racine, PathBuf::from("/opt/tune/data/plugins/audio"));
+    }
+
+    /// Reprise : des greffons déjà installés sous `<cwd>/plugins/audio` ne
+    /// sont pas perdus.
+    #[test]
+    fn l_ancien_emplacement_existant_reste_servi() {
+        let racine = resoudre_la_racine(
+            None,
+            None,
+            Some("/opt/tune/data".into()),
+            Some("/opt/tune/data/tune.db"),
+            Path::new("/opt/tune"),
+            |p| p == Path::new("/opt/tune/plugins/audio"),
+        );
+        assert_eq!(racine, PathBuf::from("/opt/tune/plugins/audio"));
+    }
+
+    /// .deb : base relative sous `WorkingDirectory=/var/lib/tune` — rien ne
+    /// change de place.
+    #[test]
+    fn base_relative_le_dossier_est_celui_d_avant_mais_absolu() {
+        let racine = resoudre_la_racine(
+            None,
+            None,
+            None,
+            Some("tune.db"),
+            Path::new("/var/lib/tune"),
+            |_| false,
+        );
+        assert_eq!(racine, PathBuf::from("/var/lib/tune/plugins/audio"));
+        let memoire = resoudre_la_racine(
+            None,
+            None,
+            None,
+            Some(":memory:"),
+            Path::new("/srv"),
+            |_| false,
+        );
+        assert_eq!(memoire, PathBuf::from("/srv/plugins/audio"));
+    }
+
+    #[test]
+    fn les_variables_d_exploitant_restent_prioritaires() {
+        let racine = resoudre_la_racine(
+            Some("/x/audio".into()),
+            Some("/y".into()),
+            None,
+            Some("/z/tune.db"),
+            Path::new("/"),
+            |_| true,
+        );
+        assert_eq!(racine, PathBuf::from("/x/audio"));
+        let racine = resoudre_la_racine(
+            None,
+            Some("/y".into()),
+            None,
+            Some("/z/tune.db"),
+            Path::new("/"),
+            |_| true,
+        );
+        assert_eq!(racine, PathBuf::from("/y/audio"));
+    }
+}

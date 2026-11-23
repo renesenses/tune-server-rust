@@ -22,6 +22,7 @@
 //! (désinstallation, désactivation) efface la retenue ([`forget_withheld`]) :
 //! il n'est jamais annulé.
 use crate::db::settings_repo::SettingsRepo;
+use crate::license::Feature;
 /// #6044 — `channel-remap` (réaffectation des canaux) est GRATUIT et
 /// facultatif, comme l'égaliseur : décision de Bertrand du 10/10/2026.
 ///
@@ -47,6 +48,38 @@ fn facultatif(id: &str) -> bool {
 /// Les greffons gratuits. Le crossfeed conserve sa migration historique.
 pub fn gratuit(id: &str) -> bool {
     matches!(id, "equalizer" | "channel-remap" | "crossfeed")
+}
+/// TESS T19 (Q3) — un seul moteur, `equalizer`, trois sections (les
+/// greffons TESS « Graphic EQ », « Headphone EQ », « Parametric EQ »), chacune
+/// avec son droit. Le greffon `equalizer` reste GRATUIT ([`gratuit`]) : ses
+/// sections graphique et casque ne demandent que le droit gratuit `dsp_eq` ;
+/// seule la section paramétrique demande le droit Premium `parametric_eq`.
+/// Les codes de section sont les ids du catalogue TESS
+/// (`tess::catalogue_de_reference`), qui cite ce même droit.
+pub const SECTIONS_EGALISEUR: [(&str, Feature); 3] = [
+    ("equalizer-graphic", Feature::DspEq),
+    ("equalizer-headphone", Feature::DspEq),
+    ("equalizer-parametric", Feature::ParametricEq),
+];
+/// Le greffon (moteur) qui porte une section, ou `None` si `section` n'est
+/// pas une section connue.
+pub fn moteur_de_section(section: &str) -> Option<&'static str> {
+    SECTIONS_EGALISEUR
+        .iter()
+        .any(|(id, _)| *id == section)
+        .then_some("equalizer")
+}
+/// Le droit d'une section, ou `None` si `section` n'est pas une section connue.
+pub fn droit_de_section(section: &str) -> Option<Feature> {
+    SECTIONS_EGALISEUR
+        .iter()
+        .find(|(id, _)| *id == section)
+        .map(|(_, f)| *f)
+}
+/// La section demande-t-elle le Premium ? Une section inconnue : non (elle
+/// relève alors de son propre descripteur, jamais de ce tableau).
+pub fn section_requiert_premium(section: &str) -> bool {
+    droit_de_section(section).is_some_and(|f| !f.est_gratuite())
 }
 pub const MIGRATION: &str = "premium_audio_plugins_migration_v1";
 /// Préfixe de la clé de retenue d'un greffon payant (#4861). Sa valeur liste
@@ -607,5 +640,97 @@ mod tests {
         s.delete("plugin_equalizer_installed").unwrap();
         migrate(&s).unwrap();
         assert!(!enabled(&s, "equalizer"), "deleted plugin was reinstalled");
+    }
+}
+
+/// TESS T19 — les sections de l'égaliseur et leurs droits, et la migration
+/// des réglages existants : le moteur reste gratuit, aucun réglage n'est
+/// touché, seule la section paramétrique demande le Premium.
+#[cfg(test)]
+mod sections_t19_tests {
+    use super::*;
+    use crate::tess::{Droit, catalogue_de_reference};
+
+    fn settings() -> SettingsRepo {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        SettingsRepo::with_backend(std::sync::Arc::new(db))
+    }
+
+    #[test]
+    fn trois_sections_un_moteur_gratuit() {
+        for (section, _) in SECTIONS_EGALISEUR {
+            assert_eq!(moteur_de_section(section), Some("equalizer"), "{section}");
+        }
+        assert!(gratuit("equalizer"));
+        assert!(!requires_premium("equalizer"));
+        assert_eq!(droit_de_section("equalizer-graphic"), Some(Feature::DspEq));
+        assert_eq!(
+            droit_de_section("equalizer-headphone"),
+            Some(Feature::DspEq)
+        );
+        assert_eq!(
+            droit_de_section("equalizer-parametric"),
+            Some(Feature::ParametricEq)
+        );
+        assert!(!section_requiert_premium("equalizer-graphic"));
+        assert!(!section_requiert_premium("equalizer-headphone"));
+        assert!(section_requiert_premium("equalizer-parametric"));
+        assert_eq!(moteur_de_section("crossfeed"), None);
+        assert!(!section_requiert_premium("inconnue"));
+    }
+
+    /// Le tableau et le catalogue TESS disent la même chose : droit Premium et
+    /// `feature` citée pour le paramétrique, droit gratuit sans `feature` pour
+    /// les deux autres.
+    #[test]
+    fn le_catalogue_tess_cite_le_droit_de_chaque_section() {
+        let c = catalogue_de_reference();
+        for (section, droit) in SECTIONS_EGALISEUR {
+            let d = c.get(section).unwrap_or_else(|| panic!("{section} absent"));
+            assert_eq!(d.demande_le_premium(), !droit.est_gratuite(), "{section}");
+            if droit.est_gratuite() {
+                assert_eq!(d.entitlement, Droit::Free, "{section}");
+                assert_eq!(d.feature, None, "{section}");
+            } else {
+                assert_eq!(d.entitlement, Droit::Premium, "{section}");
+                assert_eq!(d.feature.as_deref(), Some(droit.code()), "{section}");
+            }
+        }
+    }
+
+    /// Migration des réglages existants, compte gratuit : l'égaliseur installé
+    /// et actif avant T19 le reste (graphique et casque continuent de jouer),
+    /// rien n'est retenu, aucune clé n'est réécrite.
+    #[test]
+    fn migration_gratuite_l_egaliseur_existant_reste_actif() {
+        let s = settings();
+        s.set("plugin_equalizer_installed", "true").unwrap();
+        s.set("plugin_equalizer_enabled", "true").unwrap();
+        s.set(
+            "zone_1_eq_profile",
+            r#"{"enabled":true,"bands":[{"freq":1200.0,"gain":-3.5,"q":1.4,"type":"peak"}]}"#,
+        )
+        .unwrap();
+        let avant: Vec<_> = {
+            let mut r = s.all().unwrap();
+            r.sort();
+            r
+        };
+        migrate_for_account(&s, false).unwrap();
+        assert!(enabled(&s, "equalizer"));
+        assert!(s.get(&withheld_key("equalizer")).unwrap().is_none());
+        let apres: Vec<_> = {
+            let mut r = s.all().unwrap();
+            r.retain(|(k, _)| !k.starts_with("plugin_") && !k.starts_with("premium_audio"));
+            r.sort();
+            r
+        };
+        let avant: Vec<_> = avant
+            .into_iter()
+            .filter(|(k, _)| !k.starts_with("plugin_") && !k.starts_with("premium_audio"))
+            .collect();
+        assert_eq!(avant, apres, "un réglage existant a été touché");
     }
 }

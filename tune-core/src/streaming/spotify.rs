@@ -477,6 +477,18 @@ fn refus(code: &'static str, message: impl Into<String>) -> TuneError {
     }
 }
 
+/// #9037 — Spotify refuse (403) le contenu d'une playlist. Constaté sur les
+/// playlists d'autres utilisateurs que le compte suit ; celles qu'il a créées
+/// s'ouvrent. Rendu en 403 (`REFUS_ACCES_DU_SERVICE`), jamais en 502.
+fn refus_contenu_de_playlist() -> TuneError {
+    refus(
+        REFUS_ACCES_DU_SERVICE,
+        "Spotify refuse de donner le contenu de cette playlist (403). Cela arrive avec les \
+         playlists d'autres utilisateurs, même suivies : Spotify ne les ouvre pas à Tune. \
+         Les playlists que vous avez créées ne sont pas concernées.",
+    )
+}
+
 const SANS_CODE: &str = "spotify: l'adresse collee ne contient pas de code";
 
 /// Fil 221 — au plus tant d'autorisations entamees gardees en memoire : deux
@@ -2292,9 +2304,22 @@ impl StreamingService for SpotifyService {
         // migration du 9 mars 2026 (applications en mode développement :
         // 403) ; la route est `/items`, et chaque entrée porte `item` au lieu
         // de `track`. Les playlists s'ouvraient vides.
+        //
+        // #9037 (fil 2828) — une playlist d'un AUTRE utilisateur, suivie par
+        // le compte, répond 403 sur `/items` alors que les playlists du
+        // compte s'ouvrent. Le refus sortait en 502, une « panne » qui n'en
+        // est pas une : c'est un refus d'accès du service, rendu en 403 avec
+        // une phrase qui dit ce qui se passe.
         let d = self
-            .api_get(&format!("/playlists/{id}/items?limit=100"))
-            .await?;
+            .api_get_detaille(&format!("/playlists/{id}/items?limit=100"))
+            .await
+            .map_err(|e| {
+                if e.statut == Some(403) {
+                    refus_contenu_de_playlist()
+                } else {
+                    TuneError::from(e.message)
+                }
+            })?;
         Ok(d["items"]
             .as_array()
             .map(|i| {
