@@ -221,10 +221,8 @@ pub fn id_pour_nom(nom: &str, liste: &PreReglages) -> String {
     if !pris(&base) {
         return base;
     }
-    (2..)
-        .map(|n| format!("{base}-{n}"))
-        .find(|id| !pris(id))
-        .unwrap_or(base)
+    let libre = (2..).map(|n| format!("{base}-{n}")).find(|id| !pris(id));
+    libre.unwrap_or(base)
 }
 
 #[cfg(test)]
@@ -441,11 +439,11 @@ mod tests {
         assert_eq!(id_pour_nom("Pure", &l), "pure-2");
         let long = "x".repeat(200);
         let id = id_pour_nom(&long, &l);
-        assert!(id_valide(&id) && id.len() <= 64, "{id}");
+        assert!(crate::tess::greffon::id_valide(&id) && id.len() <= 64, "{id}");
         // Chaque identifiant produit passe la règle des préréglages.
         for nom in ["--a--", "A b", "Ünïcödé", "9", "évier---"] {
             let id = id_pour_nom(nom, &l);
-            assert!(id_valide(&id), "{nom} → {id}");
+            assert!(crate::tess::greffon::id_valide(&id), "{nom} → {id}");
         }
     }
 
