@@ -58,6 +58,7 @@ pub use services::PisteRg;
 use crate::audio::ecretage::CompteurDEcretage;
 use crate::db::backend::{DbBackend, DbTxHandle, ToSqlValue};
 use crate::db::settings_repo::SettingsRepo;
+use crate::db::verrou_ecriture::attendre_hors_executeur;
 use crate::db::track_metadata_repo::TrackMetadataRepo;
 use crate::library::local_path::{
     LocalPath, deferral_stamp, deferral_threshold, resolve_local_path,
@@ -1503,16 +1504,23 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
     // `rg_analyzed`, que seule cette passe pose. Les élargir sans elle ne
     // sélectionnerait rien.
     let depuis = curseur_rg(backend);
-    let rows = match selectionner_les_candidats_replaygain(backend, depuis, TRACK_BATCH) {
-        // Rien après le curseur : un tour complet depuis le début, une fois,
-        // avant de conclure. Les pistes redevenues candidates DERRIÈRE lui
-        // (report expiré, rattrapage, re-scan) sont reprises ici.
-        Ok(r) if r.is_empty() && depuis > 0 => {
-            poser_curseur_rg(backend, 0);
-            selectionner_les_candidats_replaygain(backend, 0, TRACK_BATCH)
+    // Fil du forum 3013 — la sélection lit `tracks` d'un bout à l'autre
+    // quand presque tout est fait : 6 à 7 s sur une base de 156 000 pistes,
+    // posées sur un fil de l'exécuteur (« gel de l'exécuteur » de 9 à 15 s
+    // dans le rapport). Elle se fait hors de l'exécuteur.
+    let rows = attendre_hors_executeur(|| {
+        match selectionner_les_candidats_replaygain(backend, depuis, TRACK_BATCH) {
+            // Rien après le curseur : un tour complet depuis le début, une
+            // fois, avant de conclure. Les pistes redevenues candidates
+            // DERRIÈRE lui (report expiré, rattrapage, re-scan) sont reprises
+            // ici.
+            Ok(r) if r.is_empty() && depuis > 0 => {
+                poser_curseur_rg(backend, 0);
+                selectionner_les_candidats_replaygain(backend, 0, TRACK_BATCH)
+            }
+            autre => autre,
         }
-        autre => autre,
-    };
+    });
     let rows = match rows {
         Ok(r) => r,
         Err(e) => {
@@ -2059,14 +2067,18 @@ pub async fn empreinter_un_lot(backend: &Arc<dyn DbBackend>) -> usize {
     let seuil_report = deferral_threshold(now_epoch_secs() as i64);
     let motif = format!("{}:%", crate::audio::empreinte::VERSION);
     let predicat = candidats_empreinte_where(backend);
-    let rows = match backend.query_many(
-        &format!("SELECT t.id, t.file_path FROM tracks t WHERE {predicat} LIMIT ?"),
-        &[
-            &motif as &dyn ToSqlValue,
-            &seuil_report as &dyn ToSqlValue,
-            &(TRACK_BATCH as i64) as &dyn ToSqlValue,
-        ],
-    ) {
+    // Fil du forum 3013 — même lecture longue que la sélection du
+    // ReplayGain : hors de l'exécuteur.
+    let rows = match attendre_hors_executeur(|| {
+        backend.query_many(
+            &format!("SELECT t.id, t.file_path FROM tracks t WHERE {predicat} LIMIT ?"),
+            &[
+                &motif as &dyn ToSqlValue,
+                &seuil_report as &dyn ToSqlValue,
+                &(TRACK_BATCH as i64) as &dyn ToSqlValue,
+            ],
+        )
+    }) {
         Ok(r) => r,
         Err(e) => {
             // Base anterieure a la colonne : rien a rattraper, sans bruit.
@@ -7203,3 +7215,7 @@ mod tests_reportees_par_chemin_4254 {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "selections_hors_executeur_3013_tests.rs"]
+mod selections_hors_executeur_3013_tests;
