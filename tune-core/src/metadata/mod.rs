@@ -17,6 +17,7 @@ pub mod choix_de_pressage;
 pub mod coffrets;
 pub mod completude;
 pub mod credits_balises;
+pub mod discogs_master;
 /// Réglage « Balises personnelles → tags Tune » (#9158, Rob).
 pub mod tags_perso;
 // « Joue avec » de la page artiste (#7768).
@@ -4727,6 +4728,8 @@ pub fn read_extended_metadata_avec(
                 .iter()
                 .chain(balises_brutes::CLES_ANNEE_ORIGINALE.iter())
                 .chain(std::iter::once(&balises_brutes::CLE_VERSION))
+                // Fil 3012 — le master Discogs (`DISCOGS_MASTER_ID`).
+                .chain(discogs_master::CLES_DE_BALISE.iter())
                 .filter_map(|k| find_vorbis_comment(h, k).map(|v| (k.to_string(), v)))
                 // #8026 — TOUTES les trames ENSEMBLE / ORCHESTRA : un fichier
                 // qui cite deux orchestres les crédite tous les deux.
@@ -4761,6 +4764,11 @@ pub fn read_extended_metadata_avec(
         }
         if let Some(v) = balises_brutes::version_parmi(&brutes) {
             meta.insert("version".into(), v);
+        }
+        // Fil 3012 — le master Discogs, rangé en chiffres : il regroupe les
+        // Versions d'un album à côté du groupe MusicBrainz.
+        if let Some(v) = discogs_master::parmi(&brutes) {
+            meta.insert(discogs_master::CLE.into(), v);
         }
         // #9158 — les balises personnelles qui deviennent des tags Tune.
         // Présente, même vide, dès qu'une correspondance existe : une liste

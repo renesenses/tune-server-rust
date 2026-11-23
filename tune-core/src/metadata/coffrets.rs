@@ -371,6 +371,59 @@ pub fn titre_commun(titres: &[String]) -> Option<String> {
     if socle.is_empty() { None } else { Some(socle) }
 }
 
+/// Fil 3012 — les titres d'origine des disques d'un coffret composé à la
+/// main désignent-ils les disques d'UNE SEULE sortie ?
+///
+/// Vrai quand, une fois retiré leur marqueur de disque (« Physical Graffiti
+/// (Disc 1) », « …, CD2 », « 101 - Disc A »), tous les titres disent le même
+/// socle (casse, espaces doublés et année de tête ignorés, comme
+/// [`cle_de_socle`]) — ou quand ils sont tous identiques. C'est alors un
+/// album à plusieurs disques que l'utilisateur a réuni à la main, ce qu'un
+/// coffret automatique aurait fait.
+///
+/// Faux pour deux éditions réunies en un coffret (« …(Stereo) [DSD64…] » et
+/// « …(Multichannel) [DSD64…] », #8953) ou pour un coffret de plusieurs
+/// albums : leurs socles diffèrent. Faux aussi sous deux titres : on ne
+/// conclut rien d'un seul disque.
+pub fn disques_d_une_meme_sortie(titres: &[String]) -> bool {
+    if titres.len() < 2 {
+        return false;
+    }
+    let cles: Vec<String> = titres
+        .iter()
+        .map(|t| cle_de_socle(&socle_sans_disque(t)))
+        .collect();
+    !cles[0].is_empty() && cles.iter().all(|c| *c == cles[0])
+}
+
+/// Le titre sans son marqueur de disque, chiffré ([`marqueur_du_nom`]) ou
+/// lettré ([`socle_disque_lettre`]) ; le titre entier sinon.
+fn socle_sans_disque(titre: &str) -> String {
+    marqueur_du_nom(titre)
+        .map(|(socle, _)| socle)
+        .or_else(|| socle_disque_lettre(titre))
+        .unwrap_or_else(|| titre.trim().to_string())
+}
+
+/// « 101 - Disc A », « Titre (Disc B) », « Titre [CD C] » : un mot de
+/// [`MOTS_DE_DISQUE`] suivi d'UNE lettre, en fin de titre. Le socle qui
+/// précède, ou `None`.
+fn socle_disque_lettre(titre: &str) -> Option<String> {
+    let n = titre.trim_end().trim_end_matches([')', ']']).trim_end();
+    let (avant, lettre) = n.rsplit_once(char::is_whitespace)?;
+    if lettre.chars().count() != 1 || !lettre.chars().all(|c| c.is_ascii_alphabetic()) {
+        return None;
+    }
+    let (devant, mot) = avant
+        .trim_end()
+        .rsplit_once(|c: char| c.is_whitespace() || c == '(' || c == '[')?;
+    if !MOTS_DE_DISQUE.contains(&mot.to_lowercase().as_str()) {
+        return None;
+    }
+    let socle = devant.trim_end_matches(LIAISONS).trim_end();
+    (!socle.is_empty()).then(|| socle.to_string())
+}
+
 /// Les séparateurs qu'un titre traîne autour de son socle — tirets longs
 /// compris (« Le Ring — Première partie »).
 const SEPARATEURS: [char; 14] = [
@@ -525,6 +578,40 @@ pub fn coffrets(albums: &[AlbumAGrouper]) -> Vec<Coffret> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Fil 3012 : les disques d'une même sortie ─────────────────────────
+
+    #[test]
+    fn les_disques_numerotes_d_une_sortie_en_sont_une_3012() {
+        for titres in [
+            &["Physical Graffiti (Disc 1)", "Physical Graffiti (Disc 2)"][..],
+            &["Physical Graffiti, CD1", "physical graffiti  CD2"][..],
+            &[
+                "1975 - Physical Graffiti [Disc 1]",
+                "Physical Graffiti [Disc 2]",
+            ][..],
+            &["101 - Disc A", "101 - Disc B"][..],
+            &["Physical Graffiti", "Physical Graffiti"][..],
+        ] {
+            assert!(disques_d_une_meme_sortie(&t(titres)), "{titres:?}");
+        }
+    }
+
+    /// Contre-épreuve : deux éditions (#8953), deux albums, ou un seul disque.
+    #[test]
+    fn deux_editions_ou_deux_albums_ne_sont_pas_une_sortie_3012() {
+        for titres in [
+            &[
+                "The Dark Side Of The Moon (2023)(50th Anniversary)(Stereo) [DSD64 - SACD Sony Records Int'l Japan 2023]",
+                "The Dark Side Of The Moon (2023)(50th Anniversary)(Multichannel) [DSD64 - SACD Sony Records Int'l Japan 2023]",
+            ][..],
+            &["Led Zeppelin IV", "Houses of the Holy"][..],
+            &["Physical Graffiti (Disc 1)", "Presence (Disc 2)"][..],
+            &["Physical Graffiti (Disc 1)"][..],
+        ] {
+            assert!(!disques_d_une_meme_sortie(&t(titres)), "{titres:?}");
+        }
+    }
 
     fn alb(id: i64, titre: &str, dossier: &str) -> AlbumAGrouper {
         AlbumAGrouper {

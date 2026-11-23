@@ -1910,9 +1910,19 @@ pub(super) async fn track_file_tags(
 pub(super) async fn track_metadata_put(
     State(state): State<AppState>,
     Path(id): Path<i64>,
-    Json(body): Json<std::collections::HashMap<String, String>>,
+    Json(mut body): Json<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
     use tune_core::db::track_metadata_repo::TrackMetadataRepo;
+    use tune_core::metadata::discogs_master as dm;
+
+    // Fil 3012 — le master Discogs, rangé en chiffres ; vide : effacé. Vérifié
+    // AVANT toute écriture.
+    let effacer_master = match dm::preparer_ecriture(&mut body) {
+        Err(message) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({ "error": message }))).into_response();
+        }
+        Ok(e) => e == dm::Ecriture::Effacer,
+    };
 
     // Verify the track exists and get its file_path
     let track_repo = TrackRepo::with_backend(state.backend.clone());
@@ -1925,6 +1935,9 @@ pub(super) async fn track_metadata_put(
     // Save to DB (source of truth)
     let repo = TrackMetadataRepo::with_backend(state.backend.clone());
     if let Err(e) = repo.set_batch(id, &body) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    if effacer_master && let Err(e) = repo.delete(id, dm::CLE) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }
 
