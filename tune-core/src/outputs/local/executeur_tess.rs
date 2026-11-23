@@ -12,14 +12,15 @@
 //!   lit l'ordre d'une [`ChaineTess`] (la clé `zone_{id}_tess_chain` arrive
 //!   avec T02 ; le branchement par zone suit dans ce lot).
 //! - **« Bypass all »** : aucun étage n'est appelé, l'entrée ressort à l'octet.
-//! - **Adaptateurs provisoires `f32` ↔ `f64`** : l'égaliseur, le convolveur et
-//!   le crossfeed (natifs tiers compris) gardent leurs moteurs `f32` sous leurs
-//!   verrous historiques. Chaque adaptateur convertit à SA frontière, par
-//!   morceaux d'une pile fixe (aucune allocation de l'adaptateur), et rend des
-//!   `f64`. T05, T06 et T09b les remplacent par des étages `f64` natifs.
-//!   Parce que tout ce qu'un moteur `f32` rend est exactement représentable en
-//!   `f64`, la chaîne est **bit pour bit** celle d'avant tant que les étages
-//!   sont ceux d'avant (non-régression prouvée par les témoins ci-dessous).
+//! - **Moteurs de référence en `f64` natif (T06)** : l'égaliseur (graphique,
+//!   paramétrique, casque) et le crossfeed reçoivent le tampon `f64` de
+//!   l'exécuteur tel quel, sous leurs verrous historiques. Seul le convolveur
+//!   garde un adaptateur provisoire `f32` ↔ `f64` (T09b le porte), qui
+//!   convertit à SA frontière par morceaux d'une pile fixe ; un natif tiers
+//!   `F32` est converti à SA frontière par l'hôte natif (T05). Le témoin
+//!   `crate::tess::sonde_f32` compte ces frontières. Par rapport à la chaîne
+//!   `f32` d'avant, seul l'arrondi change (un à la frontière au lieu d'un par
+//!   étage) : quelques ULP `f32`, sous −126 dBFS (témoins ci-dessous).
 //! - **Repli mono** : premier étage en `f64` natif. Il reste le DERNIER des
 //!   étages (#2362 ; rattaché à `channel-remap`, place `last_plugin`).
 //! - **Points d'insertion de T07** : les étages fixes (headroom avec
@@ -137,11 +138,14 @@ impl OrdreLocal {
 }
 
 /// TESS T14 — `id` est-il un greffon natif tiers : un identifiant que l'hôte
-/// accepte pour un paquet tiers et que le catalogue de référence ne connaît
-/// pas ?
+/// accepte pour un paquet tiers, que le catalogue de référence ne connaît
+/// pas, et dont un fournisseur DSP est RÉELLEMENT chargé
+/// ([`crate::audio::natifs_tiers::fournisseur_dsp`]). Un identifiant inconnu
+/// de l'hôte natif (greffon WASM, paquet absent ou en échec) ne déplace pas
+/// l'étage casque.
 fn est_un_natif_tiers(id: &str) -> bool {
-    crate::audio::natifs_tiers::identifiant_admissible(id)
-        && crate::tess::catalogue_de_reference().get(id).is_none()
+    crate::tess::catalogue_de_reference().get(id).is_none()
+        && crate::audio::natifs_tiers::fournisseur_dsp(id).is_some()
 }
 
 /// Taille maximale, en échantillons, d'une tranche traitée d'un seul tenant
@@ -189,6 +193,8 @@ fn avec_tampon<T: Copy + Default>(
 /// Fait passer `tampon` par un moteur `f32` : un seul appel par tranche
 /// (donc un seul par bloc du producteur), converti dans le tampon du fil.
 fn par_tranches_f32(tampon: &mut [f64], canaux: usize, mut moteur: impl FnMut(&mut [f32])) {
+    #[cfg(test)]
+    crate::tess::sonde_f32::noter();
     for morceau in tampon.chunks_mut(pas_de_tranche(canaux)) {
         avec_tampon(&TAMPON_F32, morceau.len(), |f| {
             for (d, s) in f.iter_mut().zip(morceau.iter()) {
@@ -202,7 +208,9 @@ fn par_tranches_f32(tampon: &mut [f64], canaux: usize, mut moteur: impl FnMut(&m
     }
 }
 
-/// Adaptateur provisoire de l'égaliseur (`f32`) : à porter en `f64` par T06.
+/// L'égaliseur (graphique, paramétrique, casque AutoEQ et OPRA : un seul
+/// moteur), en `f64` natif depuis TESS T06 : le tampon de l'exécuteur lui est
+/// passé tel quel, sans aucun aller-retour par `f32`.
 struct AdaptateurEgaliseur<'a> {
     moteur: Option<&'a Mutex<Option<EqProcessor>>>,
     canaux: usize,
@@ -226,9 +234,7 @@ impl EtageTess for AdaptateurEgaliseur<'_> {
             && let Ok(mut e) = m.lock()
             && let Some(p) = e.as_mut()
         {
-            par_tranches_f32(&mut t[..trames * self.canaux], self.canaux, |f| {
-                p.process_interleaved(f);
-            });
+            p.process_interleaved_f64(&mut t[..trames * self.canaux]);
             // #5215 — l'égaliseur coupé a fini son fondu et ne garde aucun
             // préampli : on le retire, la chaîne redevient celle d'un EQ absent.
             if p.est_neutre_au_repos() {
@@ -283,10 +289,9 @@ impl EtageTess for AdaptateurConvolution<'_> {
     fn definir_bypass(&mut self, _: bool) {}
 }
 
-/// L'étage casque : le crossfeed et les natifs tiers, stéréo seulement.
-/// TESS T14 : les natifs tiers travaillent sur les `f64` de la chaîne, F64
-/// négocié greffon par greffon ; seul le moteur intégré du crossfeed reste
-/// en `f32`, converti à sa frontière par tranches (découpage d'avant).
+/// Le crossfeed (v1 intégré, en `f64` natif depuis TESS T06) et les natifs
+/// tiers (convertis à LEUR frontière s'ils sont des paquets `F32`, T05),
+/// stéréo seulement.
 struct AdaptateurCrossfeed<'a> {
     moteur: &'a Mutex<Option<CrossfeedProcessor>>,
     canaux: usize,
@@ -311,13 +316,7 @@ impl EtageTess for AdaptateurCrossfeed<'_> {
         if let Ok(mut cf) = self.moteur.lock()
             && let Some(c) = cf.as_mut()
         {
-            let t = &mut t[..trames * 2];
-            if c.moteur_en_f32() {
-                par_tranches_f32(t, 2, |f| c.process_moteur_f32(f));
-            } else {
-                c.process_moteur_f64(t);
-            }
-            c.process_tiers_f64(t);
+            c.process_interleaved_f64(&mut t[..trames * 2]);
         }
         Ok(())
     }

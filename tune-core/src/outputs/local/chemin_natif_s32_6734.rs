@@ -82,6 +82,7 @@ impl Zone {
             voies_pilotees: false,
             fondu_ms: 0,
             surechantillonnage_voulu: false,
+            sortie_double: false,
         }
     }
 }
@@ -513,6 +514,49 @@ fn une_source_16_ou_24_bits_servie_en_wav_32_bits_cede_au_greffon_9165() {
         );
         assert_eq!(chemin_natif_s32(&conditions(false)), Ok(()));
     }
+}
+
+/// #9187 — une source PCM entière 32 bits, au volume unité, sans DSP, sur
+/// une zone qui recopie vers des sorties suiveuses (#6132) : seul le chemin
+/// partagé les branche. Le natif doit céder, avec un motif nommé au journal,
+/// sinon les suiveuses restent muettes.
+#[test]
+fn la_sortie_double_fait_ceder_le_chemin_natif_9187() {
+    let zone = Zone::au_repos();
+    let s32 = spec(ProfondeurPcm::Entier32);
+    let base = zone.conditions(s32, UNITE_DU_GAIN_DE_RENDU);
+    assert_eq!(
+        chemin_natif_s32(&base),
+        Ok(()),
+        "sans sortie double : natif"
+    );
+    assert_eq!(
+        chemin_natif_s32(&ConditionsDuNatif {
+            sortie_double: true,
+            ..base
+        }),
+        Err(MotifDuCheminPartage::SortieDouble),
+        "sortie double : le natif ne doit pas être pris (#9187)"
+    );
+    assert_eq!(MotifDuCheminPartage::SortieDouble.code(), "sortie_double");
+}
+
+/// Garde de branchement #9187 : `play_url` passe la sortie double de la zone
+/// aux conditions du natif, avant la règle.
+#[test]
+fn play_url_passe_la_sortie_double_au_chemin_natif_9187() {
+    let local = include_str!("../local.rs");
+    let conditions = local
+        .find("let conditions = bras_alsa_natif::ConditionsDuNatif {")
+        .expect("conditions du natif");
+    let regle = local
+        .find("bras_alsa_natif::chemin_natif_s32(&conditions)")
+        .expect("règle du natif");
+    let double = conditions
+        + local[conditions..]
+            .find("sortie_double: !seconde_sortie.is_empty(),")
+            .expect("la sortie double doit entrer dans les conditions du natif");
+    assert!(double < regle);
 }
 
 /// Garde de branchement #9165 : `play_url` passe le choix de la zone aux

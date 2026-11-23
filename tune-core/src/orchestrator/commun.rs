@@ -715,6 +715,46 @@ impl PlaybackOrchestrator {
         ) {
             return (Some(c.nature), c.id, c.service, c.titre, c.pochette);
         }
+        // Fil 3009, point 4 — sans session (perdue au redémarrage), le
+        // conteneur de la reprise enregistrée qui contient cette ligne. UNE
+        // recherche par zone depuis le démarrage (`zones_reprise_cherchee`),
+        // jamais pour une radio ni un podcast ; trouvé, il redevient la
+        // session de la zone, et les titres suivants le reprennent sans relire
+        // la base.
+        if etat.session_context_type.is_none()
+            && !etat
+                .now_playing
+                .as_ref()
+                .is_some_and(|np| matches!(np.source.as_str(), "radio" | "podcast"))
+            && self
+                .zones_reprise_cherchee
+                .lock()
+                .map(|mut z| z.insert(etat.zone_id))
+                .unwrap_or(false)
+            && let Some(c) = crate::db::listening_resume::contexte_de_la_ligne_reprise(
+                &self.db,
+                etat.zone_id,
+                etat.queue_position,
+                track_id,
+                source_id,
+            )
+        {
+            let playback = self.playback.clone();
+            let (zone, contexte) = (etat.zone_id, c.clone());
+            tokio::spawn(async move {
+                playback
+                    .set_session_context(
+                        zone,
+                        Some(contexte.nature),
+                        contexte.id,
+                        contexte.service,
+                        contexte.titre,
+                        contexte.pochette,
+                    )
+                    .await;
+            });
+            return (Some(c.nature), c.id, c.service, c.titre, c.pochette);
+        }
         (
             etat.session_context_type.clone(),
             etat.session_context_id.clone(),
@@ -788,10 +828,21 @@ impl PlaybackOrchestrator {
         // par la demande quand elle la porte ; sinon, pour une piste Bandcamp,
         // celle que la file ou les favoris connaissent déjà — une avance
         // gapless ou une annonce différée n'ont pas la demande sous la main.
+        //
+        // Fil 3009, point 15 — pour toute autre piste de SERVICE, l'album que
+        // la file, les favoris ou une écoute précédente connaissent : sans
+        // lui, `/library/history` ne sert pas d'`album_id_service`, et la
+        // vignette de « Récemment écoutés » n'a ni cœur, ni « … », ni
+        // étiquettes. Une piste de la bibliothèque n'en a pas besoin.
         let album_ref = ecoute.album_ref.clone().or_else(|| {
-            source_id.filter(|_| source == "bandcamp").and_then(|sid| {
+            let sid = source_id?;
+            if source == "bandcamp" {
                 crate::db::reference_d_album::reference_d_album_bandcamp(&self.db, sid)
-            })
+            } else if ecoute.track_id.is_none() && source != "local" {
+                crate::db::reference_d_album::reference_d_album_de_service(&self.db, source, sid)
+            } else {
+                None
+            }
         });
         // The owning profile is resolved by the caller from the zone's session
         // (set by the play handler from X-Profile-Id, inherited by autoplay /

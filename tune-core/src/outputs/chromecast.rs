@@ -121,8 +121,41 @@ fn with_elapsed(error: String, started: Instant, budget: Duration) -> String {
 /// app: Cast command deadline elapsed`). Un refus franc (port fermé, liaison
 /// coupée) ne le porte pas : l'appareil a répondu, réessayer ne changerait
 /// rien.
+///
+/// #9047 (fil 2906, rc12, Windows) — la connexion TCP au port 8009 qui
+/// n'aboutit pas dans son budget sort de `TcpStream::connect_timeout` en
+/// `chromecast connect: connection timed out` : c'est la même échéance, sans
+/// le même texte, et la lecture abandonnait sans réessai. Sont donc aussi des
+/// échéances un « timed out » (texte de la bibliothèque standard, non
+/// traduit) et l'errno `ETIMEDOUT` brut, reconnu à son numéro parce que son
+/// texte suit la langue du système : 110 (Linux), 60 (macOS), 10060
+/// (Windows).
 fn est_une_echeance(error: &str) -> bool {
     error.contains("deadline elapsed")
+        || error.to_ascii_lowercase().contains("timed out")
+        || ["(os error 110)", "(os error 60)", "(os error 10060)"]
+            .iter()
+            .any(|errno| error.contains(errno))
+}
+
+/// #9047 — la phrase ajoutée à l'échec d'une lecture quand l'appareil n'a
+/// JAMAIS répondu (aucun `GET_STATUS` rendu) et que les deux tentatives ont
+/// épuisé leur budget.
+///
+/// La sortie Cast n'existe que parce que l'appareil a été vu sur le réseau
+/// (mDNS) ; s'il ne répond pas sur son port, le format n'est pas en cause et
+/// rien ne se règle dans Tune : c'est le chemin réseau entre ce serveur et
+/// l'appareil. L'erreur technique reste en tête, pour le journal. Un refus
+/// franc ou un appareil qui a répondu ne reçoivent rien.
+fn expliquer_appareil_muet(error: String, appareil_joint: bool, port: u16) -> String {
+    if appareil_joint || !est_une_echeance(&error) {
+        return error;
+    }
+    format!(
+        "{error} — l'appareil est vu sur le réseau mais ne répond pas sur le port {port} \
+         depuis ce serveur : vérifiez le pare-feu ou l'antivirus de cette machine, \
+         l'isolation des clients Wi-Fi du routeur, ou un VPN actif."
+    )
 }
 
 /// #5323 — une lecture, et au plus UN réessai si la première tentative a
@@ -792,6 +825,8 @@ impl OutputTarget for ChromecastOutput {
                 joint,
             )
         };
+        let joint_apres = Arc::clone(&appareil_joint);
+        let port_du_recepteur = self.port;
         play_with_one_retry(self.command_timeout, budget, |timeout| {
             let appareil_joint = Arc::clone(&appareil_joint);
             let cast_media = build_cast_media(media);
@@ -886,6 +921,13 @@ impl OutputTarget for ChromecastOutput {
             })
         })
         .await
+        .map_err(|error| {
+            expliquer_appareil_muet(
+                error,
+                joint_apres.load(std::sync::atomic::Ordering::SeqCst),
+                port_du_recepteur,
+            )
+        })
     }
 
     async fn pause(&self) -> Result<(), String> {
@@ -1924,6 +1966,77 @@ mod deadline_tests {
 
         assert_eq!(tentatives.load(Ordering::SeqCst), 1);
         assert!(!erreur.starts_with("retry: "), "{erreur}");
+    }
+
+    /// #9047 (fil 2906) — la connexion au port 8009 qui expire dans son
+    /// budget est une échéance comme une autre : la lecture réessaie une fois.
+    /// Avant : `chromecast connect: connection timed out` sortait sans réessai.
+    #[tokio::test]
+    async fn une_connexion_expiree_au_port_8009_est_reessayee_9047() {
+        let tentatives = AtomicUsize::new(0);
+
+        let erreur = play_with_one_retry(
+            Duration::from_millis(100),
+            || Duration::from_millis(100),
+            |_| {
+                tentatives.fetch_add(1, Ordering::SeqCst);
+                async {
+                    Err(
+                        "chromecast connect: connection timed out (after 2011ms of 2000ms budget)"
+                            .to_string(),
+                    )
+                }
+            },
+        )
+        .await
+        .expect_err("l'appareil reste muet");
+
+        assert_eq!(tentatives.load(Ordering::SeqCst), 2, "UN réessai");
+        assert!(erreur.starts_with("retry: "), "{erreur}");
+    }
+
+    /// #9047 — ce qui est une échéance, et ce qui n'en est pas une.
+    #[test]
+    fn les_echeances_reconnues_9047() {
+        for echeance in [
+            "chromecast command deadline elapsed (after 2000ms of 2000ms budget)",
+            "chromecast connect: connection timed out (after 2011ms of 2000ms budget)",
+            "chromecast connect: Connection timed out (os error 110)",
+            "chromecast connect: Une tentative de connexion a échoué (os error 10060)",
+            "chromecast connect: Operation timed out (os error 60)",
+        ] {
+            assert!(est_une_echeance(echeance), "{echeance}");
+        }
+        for refus in [
+            "chromecast connect: Connection refused (os error 111)",
+            "chromecast connect: No route to host (os error 113)",
+            "load media: LOAD_FAILED",
+        ] {
+            assert!(!est_une_echeance(refus), "{refus}");
+        }
+    }
+
+    /// #9047 — l'appareil muet sur son port reçoit une phrase qui dit où
+    /// chercher ; un appareil qui a répondu ou un refus franc, rien.
+    #[test]
+    fn un_appareil_muet_sur_8009_est_explique_9047() {
+        let muet = "retry: chromecast command deadline elapsed (after 3004ms of 3000ms budget)";
+        let message = expliquer_appareil_muet(muet.to_string(), false, 8009);
+        assert!(
+            message.starts_with(muet),
+            "l'erreur technique reste en tête : {message}"
+        );
+        assert!(message.contains("port 8009"), "{message}");
+        assert!(message.contains("pare-feu"), "{message}");
+        assert!(message.contains("Wi-Fi"), "{message}");
+        assert!(message.contains("VPN"), "{message}");
+
+        assert_eq!(expliquer_appareil_muet(muet.to_string(), true, 8009), muet);
+        let refus = "chromecast connect: Connection refused (os error 111)";
+        assert_eq!(
+            expliquer_appareil_muet(refus.to_string(), false, 8009),
+            refus
+        );
     }
 
     /// Faux pair TCP silencieux qui COMPTE les connexions reçues : c'est la

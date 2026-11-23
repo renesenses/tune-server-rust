@@ -1208,4 +1208,20 @@ mod tests {
         assert!(tune_plugin_native::provider(id).is_none());
         assert!(tune_plugin_native::failure(id).is_none());
     }
+
+    /// TESS T14 — un greffon tiers DÉSACTIVÉ n'attend rien d'un redémarrage :
+    /// l'activation à chaud ne le charge pas et ne demande pas de redémarrage.
+    #[tokio::test]
+    async fn t14_un_greffon_tiers_desactive_ne_demande_pas_de_redemarrage() {
+        let id = "catalogue-essai-desactive";
+        let (state, _app) = serveur("http://127.0.0.1:9", true, false).await;
+        let settings = SettingsRepo::with_backend(state.backend.clone());
+        settings.set(&format!("plugin_{id}_installed"), "true").unwrap();
+        settings.set(&format!("plugin_{id}_enabled"), "false").unwrap();
+        assert_eq!(
+            crate::native_audio::activer_apres_installation(&state, id).await,
+            (false, None)
+        );
+        assert!(tune_plugin_native::provider(id).is_none());
+    }
 }
