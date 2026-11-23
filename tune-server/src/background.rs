@@ -89,6 +89,8 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     configure_deezer_proxy(state, config).await;
     spawn_alarm_scheduler(state);
     spawn_desktop_notifications(state, config);
+    // #9391 — un exécuteur occupé se dit dans le journal.
+    crate::retard_de_l_executeur_9391::surveiller();
     spawn_memory_diagnostics(
         state.outputs.clone(),
         state.streamer.clone(),
