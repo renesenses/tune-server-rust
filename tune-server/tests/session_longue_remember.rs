@@ -450,3 +450,56 @@ async fn le_relais_n_ouvre_pas_les_routes_des_sessions() {
     .await;
     assert_eq!(st, StatusCode::OK);
 }
+
+/// Vingt sessions créées dans la même seconde : c'est la première créée qui
+/// part au plafond, quel que soit l'ordre des identifiants.
+#[tokio::test]
+async fn le_plafond_retire_la_plus_ancienne_meme_dans_la_meme_seconde() {
+    let state = preparer();
+    let alice: i64 = state
+        .backend
+        .query_one("SELECT id FROM profiles WHERE username = 'alice'", &[])
+        .unwrap()
+        .unwrap()[0]
+        .as_i64()
+        .unwrap();
+    let maintenant = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap();
+    let s = maintenant.as_secs();
+    let ns = maintenant.as_nanos() as u64;
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    // La plus ancienne a l'identifiant le plus GRAND : l'ordre des clés ne
+    // la désigne pas.
+    let mut ids = vec!["zz-la-plus-ancienne".to_string()];
+    ids.extend((1..20).map(|i| format!("aa-{i:02}")));
+    for (rang, id) in ids.iter().enumerate() {
+        let ligne = serde_json::json!({
+            "user_id": alice,
+            "username": "alice",
+            "role": "user",
+            "created_at": s,
+            "expires_at": s + TRENTE_JOURS,
+            "client": "",
+            "relais": false,
+            "empreinte": "",
+            "ordre": ns + rang as u64,
+        });
+        reglages
+            .set(&format!("auth_session_token:{id}"), &ligne.to_string())
+            .unwrap();
+    }
+    let _ = long_de(&state, "alice").await;
+    let restantes: Vec<String> = reglages
+        .par_prefixe("auth_session_token:")
+        .unwrap()
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(restantes.len(), 20, "{restantes:?}");
+    assert!(
+        !restantes.contains(&"auth_session_token:zz-la-plus-ancienne".to_string()),
+        "la plus ancienne doit partir : {restantes:?}"
+    );
+    assert!(restantes.contains(&"auth_session_token:aa-01".to_string()));
+}
