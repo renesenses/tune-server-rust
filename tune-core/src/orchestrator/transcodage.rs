@@ -459,7 +459,7 @@ pub(super) async fn transcode_source_to_file(
 ) -> Result<(u64, Vec<u8>, u16), String> {
     transcode_source_to_file_avec_crossfeed(
         source, out_sr, channels, target_bd, target_fmt, eq, convolver, replaygain, dest, progres,
-        abandon, tranche, None, None,
+        abandon, tranche, None, None, None,
     )
     .await
 }
@@ -501,6 +501,9 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
     // #5071 — la compensation de niveau, DERNIER étage, bornée à la crête de
     // la piste entière. `None` : strictement la chaîne d'avant.
     compensation: Option<crate::audio::compensation_reseau::CompensationReseau>,
+    // #8740 — la balance de la zone (matrice 2 → 2, sans hausse), APRÈS la
+    // compensation : le tout dernier étage. `None` : la chaîne d'avant.
+    reaffectation: Option<std::sync::Arc<crate::audio::reaffectation_canaux::Matrice>>,
 ) -> Result<(u64, Vec<u8>, u16), String> {
     // LAT-F1 (phase 2a) : le chemin fichier reste le seul où le renderer
     // attend le morceau ENTIER (cible FLAC, Content-Length exigé). Avant de
@@ -574,6 +577,7 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
     let convolution = convolver.is_some();
     let crossfeed_actif = crossfeed.is_some();
     let compensation_cible_db = compensation.as_ref().map(|c| c.cible_db());
+    let balance = reaffectation.is_some() && decoded_channels == 2;
 
     // 1a. Porter le PCM À la profondeur négociée — dans LES DEUX SENS.
     //
@@ -634,6 +638,11 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
         (comp.gain_applique_db() * 100.0).round() / 100.0
     });
 
+    // 1g. #8740 — la balance EN DERNIER : elle n'atténue que.
+    if let Some(m) = reaffectation.as_ref().filter(|_| decoded_channels == 2) {
+        crate::audio::balance_reseau::appliquer_pcm_stereo(m, &mut pcm_bytes, actual_bd);
+    }
+
     let traitement_ms = chrono.elapsed().as_millis() as u64 - decode_ms;
     // 2. Encode to the target format.
     let mut encoder = crate::audio::encoder::AudioEncoder::new(
@@ -685,6 +694,7 @@ pub(super) async fn transcode_source_to_file_avec_crossfeed(
         crossfeed = crossfeed_actif,
         compensation_cible_db = ?compensation_cible_db,
         compensation_appliquee_db = ?compensation_appliquee_db,
+        balance,
         "transcode_to_temp_file_stages"
     );
 
