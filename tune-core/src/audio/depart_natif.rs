@@ -462,7 +462,7 @@ pub fn avec_seektable(flac: &[u8]) -> Option<Vec<u8>> {
 
     let mut gardes: Vec<(u8, &[u8])> = Vec::with_capacity(blocs.len() + 1);
     gardes.push(blocs[0]);
-    gardes.push((3, &points));
+    gardes.push((3, points.as_slice()));
     gardes.extend(blocs[1..].iter().copied().filter(|(k, _)| *k != 3));
     let mut out = Vec::with_capacity(flac.len() + points.len() + 4);
     out.extend_from_slice(b"fLaC");
