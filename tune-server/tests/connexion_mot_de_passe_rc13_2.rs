@@ -264,7 +264,11 @@ async fn hachages_illisibles(state: &AppState, lan: &str) {
         let attendu = (ancien.map(str::to_string), nouveau.map(str::to_string));
         for active in [true, false] {
             poser_authentification(state, active);
-            let adresses: &[&str] = if active { &[CETTE_MACHINE, lan] } else { &[CETTE_MACHINE] };
+            let adresses: &[&str] = if active {
+                &[CETTE_MACHINE, lan]
+            } else {
+                &[CETTE_MACHINE]
+            };
             for adresse in adresses {
                 for mot in [MAUVAIS, "garbage", "   "] {
                     let (st, v) = connexion(state, adresse, "default", mot).await;
