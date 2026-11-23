@@ -1551,13 +1551,24 @@ impl PlaybackOrchestrator {
                 .await;
             // #9175 — Sendspin et Devialet AIR décodent `file_path` quand il
             // est là : ne le leur donner que si le flux servi EST ce fichier.
+            let type_de_sortie = self.output_type_of(device_id).await;
             let fichier_pour_la_sortie = self
                 .fichier_d_origine_pour_la_sortie(
-                    self.output_type_of(device_id).await.as_deref(),
+                    type_de_sortie.as_deref(),
                     resolved.stream_id.as_deref(),
                     local_file_path.as_deref(),
                 )
                 .await;
+            // TESS T12a (#9176) — OAAT lit le fichier en direct derrière ses
+            // propres gardes : seulement quand la chaîne de la zone ne
+            // toucherait à rien, sinon le flux servi (et traité) fait foi.
+            let fichier_pour_la_sortie = fichier_pour_la_sortie.filter(|fichier| {
+                type_de_sortie.as_deref() != Some("oaat")
+                    || oaat_lit_le_fichier(
+                        fichier,
+                        self.chaine_du_flux_active(req.zone_id, req.piste_rg()),
+                    )
+            });
             let media = crate::outputs::traits::PlayMedia {
                 url: &resolved.url,
                 mime_type: &resolved.mime_type,
@@ -2353,7 +2364,8 @@ impl PlaybackOrchestrator {
     /// chemin du signal annonce qui part alors vraiment.
     ///
     /// Les autres sorties gardent le fichier tel quel : OAAT le lit derrière
-    /// ses propres gardes (#9176), les autres ne le lisent pas.
+    /// ses propres gardes, et seulement sans chaîne active (TESS T12a,
+    /// [`oaat_lit_le_fichier`]) ; les autres ne le lisent pas.
     pub(super) async fn fichier_d_origine_pour_la_sortie(
         &self,
         output_type: Option<&str>,
@@ -3264,6 +3276,21 @@ impl PlaybackOrchestrator {
     /// True when the zone has an uploaded room-correction IR and is not in PURE
     /// mode. Cheap settings read (like `zone_has_active_eq`) used to force the
     /// transcode path so the FIR reaches network renderers, not just local.
+    /// TESS T12a — un étage du flux réseau toucherait-il les échantillons de
+    /// cette piste ? Les mêmes questions que la décision de lecture (PURE,
+    /// droits et greffons compris) : égaliseur, correction de pièce, étage
+    /// casque (crossfeed et greffons natifs tiers), ReplayGain.
+    pub(super) fn chaine_du_flux_active(
+        &self,
+        zone_id: i64,
+        piste: crate::audio::replaygain::PisteRg<'_>,
+    ) -> bool {
+        self.zone_has_active_eq(zone_id)
+            || self.zone_has_active_ir(zone_id)
+            || self.zone_has_active_crossfeed(zone_id)
+            || self.zone_replaygain_changes_audio(zone_id, piste)
+    }
+
     pub(super) fn zone_has_active_ir(&self, zone_id: i64) -> bool {
         if self.zone_audiophile(zone_id) {
             return false;
@@ -4835,6 +4862,23 @@ fn message_flux_non_ouvert(resolved: &ResolvedStream) -> String {
         "Le flux de « {} » n'a pas pu être ouvert auprès du service ({}).",
         resolved.title, resolved.source
     )
+}
+
+/// TESS T12a (#9176) — OAAT peut-il lire `fichier` en direct ?
+///
+/// La lecture directe d'OAAT (`outputs/oaat/output.rs`, `play_media`) décode
+/// le fichier de la bibliothèque elle-même : elle ne voit RIEN de la chaîne de
+/// la zone (égaliseur, correction de pièce, ReplayGain, crossfeed, greffons
+/// natifs tiers, compensation), que seul le flux servi porte. Elle reste donc
+/// réservée à une zone dont la chaîne ne toucherait à rien (aucun étage actif,
+/// ou mode Pure : bit-perfect, sans conversion) et au DSD natif (DSF, DFF),
+/// que la chaîne PCM ne traite pas et qu'OAAT sait seul transporter tel quel.
+pub(super) fn oaat_lit_le_fichier(fichier: &str, chaine_active: bool) -> bool {
+    let dsd = std::path::Path::new(fichier)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("dsf") || e.eq_ignore_ascii_case("dff"));
+    !chaine_active || dsd
 }
 
 /// #9175 — les sorties qui décodent elles-mêmes `PlayMedia::file_path` quand

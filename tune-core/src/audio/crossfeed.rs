@@ -757,6 +757,43 @@ pub fn avec_le_flux_traite(sortie: CrossfeedStatus, porte_le_flux_traite: bool) 
     }
 }
 
+/// TESS T12a — la sortie reçoit-elle TOUT ce qu'elle joue par le flux que
+/// Tune traite (crossfeed et greffons natifs tiers compris) ? OAAT seulement,
+/// reconnue comme dans [`sortie_porte_le_flux_traite`].
+///
+/// Mesuré sur un faux récepteur OAAT (`orchestrator::tess_t12a_oaat_tests`) :
+/// toute piste de la bibliothèque part en WAV progressif (`oaat_needs_wav`)
+/// par le relais qui porte la chaîne de la zone, et la lecture directe du
+/// fichier n'est plus permise qu'à une zone sans étage actif (#9176,
+/// `orchestrator::transport::oaat_lit_le_fichier`). Les flux des services
+/// passent par `load_streaming_dsp`, comme partout. Il ne reste hors chaîne
+/// que le DSD natif, comme sur une sortie locale.
+pub fn sortie_porte_toute_la_chaine(
+    output_type: Option<&str>,
+    output_device_id: Option<&str>,
+) -> bool {
+    output_device_id.is_some_and(|d| d.starts_with("oaat:") || d.starts_with("oaat-group:"))
+        || output_type == Some("oaat")
+}
+
+/// TESS T12a — sur une sortie qui porte toute la chaîne
+/// ([`sortie_porte_toute_la_chaine`]), le refus « non mesuré »
+/// (`NonLocalOutput`) est levé : le réglage est honoré tel quel, sans motif,
+/// comme sur une sortie locale. Tout autre statut passe inchangé (PURE garde
+/// la priorité, les droits viennent après : [`avec_les_droits`]).
+pub fn avec_toute_la_chaine(sortie: CrossfeedStatus, porte_toute_la_chaine: bool) -> CrossfeedStatus {
+    if !porte_toute_la_chaine || sortie.reason != Some(CrossfeedConstraint::NonLocalOutput) {
+        return sortie;
+    }
+    CrossfeedStatus {
+        requested: sortie.requested,
+        effective: sortie.requested,
+        unavailable: false,
+        reason: None,
+        detail: None,
+    }
+}
+
 /// Ajoute les DROITS (licence, greffon) au statut que la sortie impose — #4511.
 ///
 /// L'ordre des motifs est une promesse faite à l'utilisateur : on nomme d'abord

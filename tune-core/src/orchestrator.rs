@@ -2313,6 +2313,12 @@ mod passthrough_sans_traitement_7986_tests;
 // #9175 — Sendspin et Devialet AIR lisent le flux traité dès qu'un traitement est actif.
 #[cfg(test)]
 mod sorties_qui_decodent_le_fichier_9175_tests;
+// TESS T12 — faux serveur `/stream` des bancs de bout en bout (vraies sorties).
+#[cfg(test)]
+mod faux_serveur_de_flux_tess;
+// TESS T12a — la chaîne TESS sur OAAT, vérifiée sur un faux récepteur (#9176).
+#[cfg(all(test, feature = "oaat"))]
+mod tess_t12a_oaat_tests;
 // Suite de #9175 — saut et reprise de bout en bout avec une vraie sortie Sendspin.
 #[cfg(test)]
 mod sendspin_relance_9175_tests;
