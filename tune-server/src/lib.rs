@@ -65,8 +65,6 @@ pub mod lien_de_partage;
 pub mod memoire_a_froid;
 /// #7077 — code stable + phrase traduite pour les corps de l'API.
 pub mod message_api;
-/// rc14 — refus des actions de la machine : phrases courtes, lien d'aide.
-pub mod refus_machine;
 /// #4677 — relevé, au démarrage, des règles du pare-feu Windows pour
 /// `tune-server.exe` (lecture seule, une ligne de journal).
 pub mod pare_feu_windows;
@@ -82,6 +80,8 @@ pub mod plugins_host;
 pub mod premium_guard;
 /// Actions root d'un service qui ne tourne pas en root (Tune OS, #3206).
 pub mod privilege;
+/// rc14 — refus des actions de la machine : phrases courtes, lien d'aide.
+pub mod refus_machine;
 /// Détail du RSS (`RssAnon`, `RssFile`, `RssShmem`) pour `memory_diagnostics`.
 pub mod releve_memoire;
 pub mod reprise_des_passes;

@@ -6,9 +6,9 @@
 //!
 //! « Redémarrer le serveur », cliqué depuis un Mac du réseau, rendait un
 //! paragraphe illisible pour un utilisateur ordinaire, qui citait des
-//! commandes (`docker restart`, `journalctl -u tune`) et disait « Tune OS :
-//! SSH » — faux : le SSH par mot de passe y est fermé, on passe par Cockpit
-//! (`https://<adresse>:9443`), et le service s'appelle `tune.service`.
+//! commandes (`docker restart`, `journalctl -u tune`) et renvoyait Tune OS
+//! vers « SSH ». Pour un utilisateur de Tune OS, le chemin simple est Cockpit
+//! (`https://<adresse>:9443`), où le service s'appelle `tune.service`.
 //!
 //! ## Le contrat
 //!
@@ -28,7 +28,8 @@ use serde_json::{Value, json};
 /// refusées ? Activez l'authentification ».
 pub const AIDE_ACTIONS_MACHINE: &str = "https://mozaiklabs.fr/forum/threads/rc13-mise-a-jour-bloquee-ou-actions-refusees-activez-lauthentification-update-blocked-turn-on-authentication-3eAFTN";
 
-/// Où lire le code d'activation, par plateforme. Jamais « SSH » pour Tune OS.
+/// Où lire le code d'activation, par plateforme. Tune OS : Cockpit, plus
+/// simple pour l'utilisateur qu'une session SSH.
 pub const OU_LIRE_LE_CODE: [(&str, &str); 4] = [
     ("docker", "docker logs <container>"),
     ("deb", "journalctl -u tune-server"),
@@ -92,8 +93,8 @@ mod tests {
         "api.machine.activationCodeRequired",
     ];
 
-    /// Ce que le message ne doit JAMAIS contenir : des commandes, et « SSH »
-    /// (fermé sur Tune OS).
+    /// Ce que le message ne doit JAMAIS contenir : des commandes, ni « SSH »
+    /// (Tune OS renvoie vers Cockpit).
     const INTERDITS: [&str; 7] = [
         "SSH",
         "docker",
@@ -109,7 +110,11 @@ mod tests {
         for motif in ["not_local", "port80_relay"] {
             let corps = corps_refus_hors_machine(motif, "192.168.1.20", false);
             assert_eq!(corps["error"], json!("auth_required"));
-            assert_eq!(corps["reason"], json!(motif), "le motif machine reste lu par le client");
+            assert_eq!(
+                corps["reason"],
+                json!(motif),
+                "le motif machine reste lu par le client"
+            );
             assert_eq!(corps["help_url"], json!(AIDE_ACTIONS_MACHINE));
             assert_eq!(corps["caller"], json!("192.168.1.20"));
             assert_eq!(corps["message_key"], json!(cle_du_motif(motif)));
@@ -138,7 +143,10 @@ mod tests {
                     m.chars().count()
                 );
                 for interdit in INTERDITS {
-                    assert!(!m.contains(interdit), "{lang} {cle} : « {interdit} » dans {m}");
+                    assert!(
+                        !m.contains(interdit),
+                        "{lang} {cle} : « {interdit} » dans {m}"
+                    );
                 }
             }
         }
@@ -196,7 +204,11 @@ mod tests {
             assert_eq!(statut, StatusCode::FORBIDDEN, "{uri} : {corps}");
             assert_eq!(corps["error"], json!("auth_required"), "{uri} : {corps}");
             assert_eq!(corps["reason"], json!("not_local"), "{uri} : {corps}");
-            assert_eq!(corps["help_url"], json!(AIDE_ACTIONS_MACHINE), "{uri} : {corps}");
+            assert_eq!(
+                corps["help_url"],
+                json!(AIDE_ACTIONS_MACHINE),
+                "{uri} : {corps}"
+            );
             let m = corps["message"].as_str().unwrap_or_default();
             assert!(m.contains("machine du serveur"), "{uri} : {m}");
             assert!(m.contains("administrateur"), "{uri} : {m}");
@@ -204,11 +216,8 @@ mod tests {
                 assert!(!m.contains(interdit), "{uri} : « {interdit} » dans {m}");
             }
         }
-        let (statut, corps) = appel(
-            "/api/v1/auth/config",
-            Some(json!({ "auth_enabled": true })),
-        )
-        .await;
+        let (statut, corps) =
+            appel("/api/v1/auth/config", Some(json!({ "auth_enabled": true }))).await;
         assert_eq!(statut, StatusCode::FORBIDDEN, "{corps}");
         assert_eq!(corps["error"], json!("activation_code_required"), "{corps}");
         assert!(!corps.to_string().contains("SSH"), "{corps}");
