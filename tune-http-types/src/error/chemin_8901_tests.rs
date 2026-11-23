@@ -114,3 +114,58 @@ async fn not_found_hors_requete_reste_valide_8901() {
     .await;
     assert_eq!(journal.lignes()[0]["fields"]["message"], "not_found");
 }
+
+#[tokio::test]
+async fn internal_error_nomme_sa_route_9343() {
+    let journal = Journal::default();
+    let writer = journal.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(move || writer.clone())
+        .finish();
+    async {
+        let router = axum::Router::new()
+            .route(
+                "/converter/start",
+                axum::routing::post(|| async { AppError::internal("disque refuse") }),
+            )
+            .layer(axum::middleware::from_fn(avec_chemin_requete));
+        let response = router
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/converter/start")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+    .with_subscriber(subscriber)
+    .await;
+    let events = journal.lignes();
+    let event = events
+        .iter()
+        .find(|e| e["fields"]["error"] == "disque refuse")
+        .unwrap();
+    assert_eq!(event["fields"]["path"], "/converter/start");
+}
+
+#[test]
+fn lecture_seule_message_dedie_qui_nomme_le_chemin_9343() {
+    let chemin = std::path::Path::new("/plugins/audio/jobs");
+    let erofs = std::io::Error::from_raw_os_error(30);
+    let message = message_d_entree_sortie("write job journal", chemin, &erofs);
+    if erofs.kind() == std::io::ErrorKind::ReadOnlyFilesystem {
+        assert!(message.contains("read-only file system"), "{message}");
+    }
+    assert!(message.contains("/plugins/audio/jobs"), "{message}");
+    assert!(message.starts_with("write job journal"), "{message}");
+    let autre = std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem);
+    let message = AppError::io("write job journal", chemin, &autre).message;
+    assert!(
+        message.contains("/plugins/audio/jobs is on a read-only file system"),
+        "{message}"
+    );
+}

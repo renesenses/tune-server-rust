@@ -666,6 +666,8 @@ pub fn journaliser_l_etat(etat: &EtatDuPareFeu, exe: &str) {
             cause = ?etat.cause,
             block_rules = ?etat.regles_bloquantes,
             allowed_other_paths = ?etat.chemins_autorises_ailleurs,
+            // #9114 — le relevé est partiel : le journal le dit avec l'alerte.
+            rules_not_read = ?SOURCES_NON_LUES,
             "windows_firewall_profile_not_covered — the active network profile is not \
              covered by Tune's inbound firewall rule: DLNA discovery and remote access are \
              filtered. Set the network to Private, or allow tune-server.exe in 'Allow an app \
@@ -729,7 +731,32 @@ where
 static CACHE: std::sync::LazyLock<tokio::sync::Mutex<CacheDuReleve>> =
     std::sync::LazyLock::new(Default::default);
 
+/// #9114 — ce que le relevé ne lit PAS. [`SCRIPT_POWERSHELL`] ne lit que
+/// les règles du magasin persistant dont le programme contient
+/// `tune-server` (`Get-NetFirewallApplicationFilter`). Une règle d'une de
+/// ces familles peut autoriser ou bloquer Tune sans que le relevé la voie :
+/// l'alerte peut alors être fausse, ou manquer.
+pub const SOURCES_NON_LUES: [&str; 4] = [
+    // règles par port (8888 TCP, 1900 UDP SSDP…) sans programme
+    "regles_par_port",
+    // règles par service Windows
+    "regles_par_service",
+    // règles de stratégie de groupe (GPO, `-PolicyStore ActiveStore`)
+    "strategie_de_groupe",
+    // règles dont le programme ne porte pas `tune-server` dans son chemin
+    "programme_nomme_autrement",
+];
+
+/// #9114 — la phrase qui accompagne l'alerte : le relevé est partiel.
+pub const PERIMETRE_DU_RELEVE: &str = "Ce relevé ne lit que les règles du pare-feu Windows \
+     qui désignent le programme tune-server. Une règle par port, par service ou posée par \
+     une stratégie de groupe n'y apparaît pas : si l'une d'elles autorise déjà Tune, cette \
+     alerte peut être fausse.";
+
 /// Le corps de `GET /api/v1/system/pare-feu`. Contrat additif.
+///
+/// #9114 — sous Windows, `perimetre` dit ce que le relevé lit et ce qu'il ne
+/// lit pas ([`SOURCES_NON_LUES`]), avec la phrase à afficher sous l'alerte.
 ///
 /// `detail` : l'appelant est l'administrateur, ou cette machine. Sinon les
 /// chemins complets (`programme`, `chemins_autorises_ailleurs`), qui portent
@@ -754,11 +781,19 @@ pub fn charge_utile(
             }
         }
     });
-    serde_json::json!({
+    let mut corps = serde_json::json!({
         "windows": windows,
         "releve": vu,
         "alerte": etat.is_some_and(EtatDuPareFeu::alerte),
-    })
+    });
+    if windows {
+        corps["perimetre"] = serde_json::json!({
+            "lu": ["regles_par_programme_tune_server"],
+            "non_lu": SOURCES_NON_LUES,
+            "message": PERIMETRE_DU_RELEVE,
+        });
+    }
+    corps
 }
 
 /// Le dernier composant d'un chemin Windows (`\` ou `/`).
@@ -973,6 +1008,9 @@ mod profil_reseau_7371_tests;
 #[cfg(test)]
 #[path = "pare_feu_cause_9083_tests.rs"]
 mod cause_9083_tests;
+#[cfg(test)]
+#[path = "pare_feu_perimetre_9114_tests.rs"]
+mod perimetre_9114_tests;
 
 #[cfg(test)]
 mod tests {
