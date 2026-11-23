@@ -22,6 +22,13 @@ pub fn vers_phase_minimale(h: &[f64]) -> Vec<f64> {
     // Bourrage généreux : le cepstre d'un filtre à bande atténuée profonde
     // décroît lentement ; 16× la longueur évite le repliement du cepstre.
     let nfft = puissance_de_deux(n * 16).max(1 << 12);
+    vers_phase_minimale_avec_fft(h, nfft)
+}
+
+/// Même factorisation avec une résolution accrue pour les gabarits profonds.
+pub fn vers_phase_minimale_avec_fft(h: &[f64], nfft: usize) -> Vec<f64> {
+    let n = h.len();
+    let nfft = puissance_de_deux(nfft.max(n));
     let mut re = vec![0.0; nfft];
     let mut im = vec![0.0; nfft];
     re[..n].copy_from_slice(h);

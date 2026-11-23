@@ -84,6 +84,7 @@ fn avec_le_greffon<'a>(
     e.sortie = FormatOuvert::new(vers, 2);
     e.needs_resample = false;
     e.surechantillonneur = Some(SurechDeLEtage {
+        publication: None,
         etage: Some(EtageSurechantillonneur::nouveau(&c.reglages, 44_100, vers, 2).unwrap()),
         choix_de_la_zone: slot,
         reglages_a_l_ouverture: Some(c.reglages),
@@ -103,6 +104,7 @@ fn desactive_la_sortie_est_identique_a_l_entree() {
     let slot = Mutex::new(None);
     let mut sans = etage(&dsp, octets.clone(), 44_100, 2, 16, 44_100, 2);
     sans.surechantillonneur = Some(SurechDeLEtage {
+        publication: None,
         etage: None,
         choix_de_la_zone: &slot,
         reglages_a_l_ouverture: None,
@@ -290,4 +292,71 @@ fn jamais_sous_pure_ni_sur_un_porteur_dop() {
     assert!(!surechantillonneur_admis_a_l_ouverture(
         spec24, &dop, false, false
     ));
+}
+
+/// Un paquet installé et signé avec la clé temporaire du banc est fourni par
+/// le test du greffon. Aucun périphérique physique n'est ouvert.
+#[test]
+#[ignore = "nécessite le paquet natif et la clé publique du banc"]
+fn le_paquet_auto_passe_par_le_rendu_local_et_le_volume_entier() {
+    use crate::audio::surechantillonnage::{ID_PRO, greffon::UpsamplerMode};
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+    let root = std::env::var_os("TUNE_TEST_GREFFONS_INSTALLES").unwrap();
+    let cle = std::env::var("TUNE_TEST_CLE_DU_PAQUET").unwrap();
+    let library =
+        tune_plugin_native::package::load(std::path::Path::new(&root), ID_PRO, &[cle]).unwrap();
+    tune_plugin_native::register(library).unwrap();
+    let mut choix = choix(true);
+    choix.reglages.mode = UpsamplerMode::Auto;
+    choix.reglages.profile = std::env::var("TUNE_TEST_PROFILE_A").unwrap();
+    choix.verdict.results[0].realtime_factor = 1000.;
+    let plan = choix.plan_natif(48000, 24, 2, &[(96000, 24)]).unwrap();
+    assert_eq!(plan.rate, 96000);
+    let mut etage =
+        EtageSurechantillonneur::preparer(&choix.reglages, 48000, plan.rate, 2, Some(&plan))
+            .unwrap();
+    let avant = etage.decision_auto().unwrap();
+    let source = vec![0.25; 4096];
+    let rendu = etage.traiter(&source);
+    assert_eq!(rendu.len(), source.len() * 2);
+    assert!(rendu.iter().any(|v| *v > 0.05));
+    choix.reglages.profile = std::env::var("TUNE_TEST_PROFILE_B").unwrap();
+    etage.proposer_transition(Some(&choix));
+    let rendu = etage.traiter(&source);
+    let apres = etage.decision_apres_transition(rendu.len() / 2).unwrap();
+    assert_ne!(avant["chosen"]["design"], apres["chosen"]["design"]);
+    assert!(!apres["trace"].as_array().unwrap().is_empty());
+    let bits = avant["chosen"]["depth"].as_u64().unwrap();
+    assert!((16..=24).contains(&bits));
+    let mut q = plan
+        .library
+        .prepare_final_pcm(plan.input, plan.rate, 32, &plan.settings)
+        .unwrap();
+    let ring = super::RingBuf::new(8192);
+    let signal = 0.32123456_f32;
+    let n = 3000;
+    assert_eq!(ring.push(&vec![signal; n]), n);
+    let mut mots = vec![1i32; n + 32];
+    super::rendre_pcm_entier_quantifie(
+        &ring,
+        &AtomicU32::new(super::UNITE_DU_GAIN_DE_RENDU / 2),
+        &AtomicBool::new(false),
+        &AtomicBool::new(false),
+        &AtomicBool::new(true),
+        &mut crate::audio::soft_mute::SoftMuteRamp::new(96000, 2),
+        0,
+        0,
+        0,
+        &mut mots,
+        &mut q,
+    );
+    let pas = 1_i64 << (32 - bits);
+    let attendu = (f64::from(signal) * 0.5 * 2147483648.0).round() as i64;
+    assert!(
+        mots[..n]
+            .iter()
+            .all(|&x| i64::from(x) % pas == 0 && (i64::from(x) - attendu).abs() < 16 * pas)
+    );
+    assert!(mots[n..].iter().all(|&x| x == 0));
+    assert!(tune_plugin_native::unregister(ID_PRO));
 }

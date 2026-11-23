@@ -64,6 +64,7 @@ pub(super) struct ReserveDuSurechantillonneur {
 /// les réglages du suréchantillonneur lus à son ouverture.
 #[derive(Default)]
 struct FluxOuvert {
+    decision_auto: Option<serde_json::Value>,
     generation: u64,
     reglages: Option<crate::audio::surechantillonnage::UpsamplerSettings>,
 }
@@ -113,6 +114,7 @@ impl ReserveDuSurechantillonneur {
         *flux = FluxOuvert {
             generation,
             reglages: None,
+            decision_auto: None,
         };
         self.gain_de_l_etage.store(UNITE, Ordering::SeqCst);
         self.publier_sous_le_verrou();
@@ -142,6 +144,28 @@ impl ReserveDuSurechantillonneur {
             .store(gain_en_millioniemes(reserve_db), Ordering::SeqCst);
         self.publier_sous_le_verrou();
         true
+    }
+
+    pub(super) fn poser_decision_auto(&self, generation: u64, decision: Option<serde_json::Value>) {
+        let mut flux = self.tenir();
+        if flux.generation == generation {
+            flux.decision_auto = decision;
+        }
+    }
+    pub(super) fn terminer_transition(
+        &self,
+        generation: u64,
+        reglages: &crate::audio::surechantillonnage::UpsamplerSettings,
+        decision: serde_json::Value,
+    ) {
+        let mut flux = self.tenir();
+        if flux.generation == generation {
+            flux.reglages = Some(reglages.clone());
+            flux.decision_auto = Some(decision);
+        }
+    }
+    pub(super) fn decision_auto(&self) -> Option<serde_json::Value> {
+        self.tenir().decision_auto.clone()
     }
 
     /// Les réglages du suréchantillonneur lus à l'ouverture du flux qui joue
