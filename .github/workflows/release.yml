@@ -906,21 +906,28 @@ jobs:
             copy "$env:RUNNER_TEMP\fpcalc\fpcalc.exe" package\
           }
           xcopy web\* package\web\ /E /I /Q
-          # Bundle the Party (WASM) plugin next to tune-server.exe (see unix step).
-          mkdir package\plugins\party
-          copy tune-server\tests\fixtures\plugins\party\main.wasm package\plugins\party\
-          copy tune-server\tests\fixtures\plugins\party\manifest.json package\plugins\party\
-          # « Playlists converter » (WASM, Premium, #4715), comme Party.
-          mkdir package\plugins\playlists-converter
-          copy tune-server\tests\fixtures\plugins\playlists-converter\main.wasm package\plugins\playlists-converter\
-          copy tune-server\tests\fixtures\plugins\playlists-converter\manifest.json package\plugins\playlists-converter\
+          # Fil 3014 (décision de Bertrand, 23/11/2026) — PAS de `plugins\`
+          # dans le zip Windows. Le zip est l'archive que lit la mise à jour
+          # intégrée, et les rc13 / rc13.1 échouent toujours à y poser les
+          # greffons livrés (« stage plugin …\plugins.new\party: Accès
+          # refusé ») : sans `plugins\`, leur `a_installer` rend une liste
+          # vide et la mise à jour passe. Party et Playlists converter restent
+          # livrés par le setup.exe (étape « Create installer (windows) »).
           cd package
-          7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server.exe web\ plugins\
+          7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} tune-server.exe web\
           7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} librespot.exe LIBRESPOT-LICENSE.txt LIBRESPOT-THIRD-PARTY.txt
           if (Test-Path "airplay-daemon.exe") { 7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} airplay-daemon.exe }
           if (Test-Path "ffmpeg.exe") { 7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} ffmpeg.exe FFMPEG-LICENSE.txt }
           if (Test-Path "fpcalc.exe") { 7z a ..\${{ env.ARTIFACT }}.${{ matrix.ext }} fpcalc.exe }
           cd ..
+          # Garde du fil 3014 : le zip Windows ne doit contenir aucun `plugins\`.
+          $entrees = 7z l -slt "${{ env.ARTIFACT }}.${{ matrix.ext }}" | Select-String -Pattern '^Path = '
+          $greffons = $entrees | Where-Object { $_.Line -match '^Path = plugins([\\/]|$)' }
+          if ($greffons) {
+            Write-Error "Le zip Windows contient plugins\ : les rc13/rc13.1 ne pourraient pas s'y mettre à jour (fil 3014)."
+            $greffons | ForEach-Object { Write-Host $_.Line }
+            exit 1
+          }
 
       - name: Install NSIS
         if: runner.os == 'Windows'
