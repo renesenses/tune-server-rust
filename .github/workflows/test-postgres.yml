@@ -1380,6 +1380,13 @@ jobs:
           TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
         run: cargo test --no-fail-fast -p tune-core --lib --no-default-features --features postgres pg_9265 -- --nocapture --test-threads=1
 
+      # rc13.2 -- connexion du compte `default` (activation, base rc12) sur une
+      # VRAIE base. Sans cette étape, `postgres_memes_scenarios` saute.
+      - name: Connexion du compte default sur PostgreSQL (rc13.2)
+        env:
+          TUNE_TEST_PG_URL: postgresql://tune:tune@localhost:5432/tune_test
+        run: cargo test --no-fail-fast -p tune-server --no-default-features --features postgres,oaat --test connexion_mot_de_passe_rc13_2 postgres_ -- --nocapture --test-threads=1
+
       # QA 18/11 — la sauvegarde du cache (« Post Run Swatinem/rust-cache »)
       # écrit son archive sur le disque déjà plein : le 18/11, deux jobs aux
       # tests VERTS sont morts là en « No space left on device ». Les binaires
