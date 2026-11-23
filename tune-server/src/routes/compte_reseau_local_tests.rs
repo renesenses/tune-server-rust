@@ -1062,13 +1062,7 @@ async fn reseau_local_une_autorisation_inter_sites_est_refusee() {
         ("none", StatusCode::TEMPORARY_REDIRECT),
     ] {
         let b = banc();
-        let (statut, page) = get(
-            &b.state,
-            LAN,
-            AUTORISER,
-            &[HOTE, ("sec-fetch-site", site)],
-        )
-        .await;
+        let (statut, page) = get(&b.state, LAN, AUTORISER, &[HOTE, ("sec-fetch-site", site)]).await;
         assert_eq!(statut, attendu, "{site} — {page}");
         assert_eq!(
             attente_du_serveur(&b.state).is_empty(),

@@ -608,23 +608,23 @@ async fn sso_callback(
     let ronde = VERROU_DE_LIAISON.lock().await;
     let (pkce, lancee_du_reseau_local) =
         match prendre_l_attente_pkce(&settings, &cle_pkce, q.state.as_deref()) {
-        Ok(a) => (a.pkce, a.lancee_du_reseau_local),
-        Err(AttentePkce::Absente) => {
-            return page_echec_compte(
-                &headers,
-                StatusCode::BAD_REQUEST,
-                "no pending SSO session (restart login)",
-            );
-        }
-        Err(AttentePkce::EtatDifferent) => {
-            warn!("sso_state_mismatch");
-            return page_echec_compte(
-                &headers,
-                StatusCode::BAD_REQUEST,
-                "state mismatch (possible CSRF)",
-            );
-        }
-    };
+            Ok(a) => (a.pkce, a.lancee_du_reseau_local),
+            Err(AttentePkce::Absente) => {
+                return page_echec_compte(
+                    &headers,
+                    StatusCode::BAD_REQUEST,
+                    "no pending SSO session (restart login)",
+                );
+            }
+            Err(AttentePkce::EtatDifferent) => {
+                warn!("sso_state_mismatch");
+                return page_echec_compte(
+                    &headers,
+                    StatusCode::BAD_REQUEST,
+                    "state mismatch (possible CSRF)",
+                );
+            }
+        };
     // Relecture A : la règle du réseau local suit la RONDE, pas seulement le
     // retour. Une autorisation lancée du réseau local, rejouée sur cette
     // machine (lien, image), reste jugée comme venue du réseau local.
