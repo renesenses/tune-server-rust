@@ -142,7 +142,7 @@ jobs:
     name: macOS (app universelle)
     needs: tests
     if: github.event_name == 'workflow_dispatch'
-    runs-on: ${{ fromJSON(vars.RUNNER_MACOS || '"macos-14"') }}
+    runs-on: ${{ fromJSON(vars.RUNNER_MACOS || '"macos-latest"') }}
     timeout-minutes: 45  # ~4 min de compilation + notarisation (souvent 2-10 min)
     steps:
       - uses: actions/checkout@v4
