@@ -75,6 +75,9 @@ pub fn cle_chaine_zone(zone_id: i64) -> String {
 }
 
 #[cfg(test)]
+mod droits_t19_tests;
+
+#[cfg(test)]
 mod tests {
     #[test]
     fn la_cle_de_la_chaine_suit_le_modele_des_cles_de_zone() {
