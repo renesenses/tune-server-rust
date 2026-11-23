@@ -666,6 +666,19 @@ impl Airplay2Output {
         })
     }
 
+    /// #9379 — `autre` désigne-t-elle le même récepteur, construit à
+    /// l'identique (nom, identifiant, adresse, port, `deviceid`) ? La
+    /// découverte garde alors la sortie en place, avec son démon et sa
+    /// session, au lieu de la remplacer à chaque republication du TXT mDNS.
+    #[must_use]
+    pub fn meme_recepteur(&self, autre: &Self) -> bool {
+        self.name == autre.name
+            && self.device_id == autre.device_id
+            && self.host == autre.host
+            && self.port == autre.port
+            && self.ap_device_id == autre.ap_device_id
+    }
+
     /// Begin HomeKit PIN pairing: spawn the daemon (if needed) and ask the
     /// receiver to display its 4-digit code. Returns as soon as the command is
     /// sent; the client polls `pairing_status()` until `pin_requested`, then

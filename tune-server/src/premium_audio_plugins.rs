@@ -38,10 +38,12 @@ impl TunePlugin for PremiumAudio {
     fn description(&self) -> &str {
         match self.id {
             "equalizer" => "Égaliseur : profil, graphique, paramétrique, presets et AutoEq",
-            "crossfeed" => "Crossfeed casque : intensité, retard et ombre de la tête, à chaud",
+            "crossfeed" => {
+                "Crossfeed casque : intensité, retard et ombre de la tête, à chaud ; sortie locale, et en réseau avec un autre traitement ou un lecteur qui accepte le PCM"
+            }
             "converter" => "Convertisseur audio : codecs de l'hôte, métadonnées et exports",
             "channel-remap" => {
-                "Réaffectation des canaux : matrice en dB par zone et par album (4.0, 5.1…)"
+                "Réaffectation des canaux : matrice en dB par zone et par album (4.0, 5.1…), sortie locale uniquement"
             }
             "upsampler" => {
                 "Suréchantillonnage : filtres polyphases vers la plus haute cadence du DAC, sortie locale"
@@ -1185,5 +1187,78 @@ pub(crate) mod tests {
         // Un nom libre n'est arrêté que par la signature.
         let (_, reponse) = appel(&app, "POST", "/api/v1/audio-plugins/greffon-libre/install").await;
         assert_eq!(reponse["detail"], "missing detached signature", "{reponse}");
+    }
+}
+
+/// #9180 — le catalogue dit sur quelles sorties agissent le crossfeed et la
+/// réaffectation des canaux, comme il le disait déjà du suréchantillonneur.
+#[cfg(test)]
+mod sorties_dans_le_catalogue_9180_tests {
+    use super::*;
+
+    fn table() -> Value {
+        serde_json::from_str(include_str!("i18n_server.json")).unwrap()
+    }
+
+    /// Le terme « sortie locale » d'une langue, tel que la description du
+    /// suréchantillonneur l'écrit déjà (son dernier segment).
+    fn sortie_locale(texte: &str) -> &str {
+        texte.rsplit([',', '，', '、']).next().unwrap().trim()
+    }
+
+    #[test]
+    fn crossfeed_et_reaffectation_nomment_la_sortie_locale_dans_chaque_langue_9180() {
+        let t = table();
+        let surech = t["plugin.description.upsampler"].as_object().unwrap();
+        for id in ["crossfeed", "channel-remap"] {
+            let descriptions = t[format!("plugin.description.{id}")].as_object().unwrap();
+            assert_eq!(
+                descriptions.len(),
+                surech.len(),
+                "{id} : toutes les langues du catalogue"
+            );
+            for (langue, reference) in surech {
+                let terme = sortie_locale(reference.as_str().unwrap());
+                let texte = descriptions[langue].as_str().unwrap();
+                assert!(
+                    texte.contains(terme),
+                    "#9180 {id} ({langue}) : « {terme} » manque dans « {texte} »"
+                );
+            }
+        }
+        // Le crossfeed agit aussi en réseau, sous condition : la phrase le dit.
+        assert!(
+            t["plugin.description.crossfeed"]["fr"]
+                .as_str()
+                .unwrap()
+                .contains("en réseau")
+        );
+        assert!(
+            t["plugin.description.channel-remap"]["fr"]
+                .as_str()
+                .unwrap()
+                .contains("sortie locale uniquement")
+        );
+    }
+
+    /// Le texte par défaut (français) du greffon est celui de la table.
+    #[test]
+    fn le_texte_par_defaut_suit_la_table_9180() {
+        let t = table();
+        let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        let backend: Arc<dyn DbBackend> = Arc::new(db);
+        for id in ["crossfeed", "channel-remap", "upsampler"] {
+            let greffon = PremiumAudio {
+                id,
+                backend: backend.clone(),
+            };
+            assert_eq!(
+                greffon.description(),
+                t[format!("plugin.description.{id}")]["fr"]
+                    .as_str()
+                    .unwrap(),
+                "{id}"
+            );
+        }
     }
 }

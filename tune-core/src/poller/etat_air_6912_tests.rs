@@ -437,3 +437,31 @@ async fn air_sans_limite_n_est_pas_ramene_8920() {
     assert_eq!(s.volume, 0.5);
     assert_eq!(b.zone().volume, 50.0);
 }
+
+#[tokio::test]
+async fn air_sur_une_autre_entree_n_est_pas_ramene_8920() {
+    // Décision du 21/11 : la limite ne vaut que sur l'entrée pilotée par Tune.
+    // L'ampli est sur une autre entrée (6) et monté à −24 dB : rien ne part.
+    let mut b = Banc::nouveau().await;
+    b.poser_la_securite("0.5");
+    b.annonce.source_choisie = 6;
+    b.annoncer(-24.0, false);
+    b.observer().await;
+    b.aucune_commande();
+    let s = b.poller.playback.get_state(b.id).await;
+    assert!(
+        s.volume <= 0.5 + 1e-9,
+        "la consigne de Tune ne monte pas pour autant : {}",
+        s.volume
+    );
+
+    // Retour sur l'entrée de Tune (9) au même niveau : la limite reprend.
+    b.annonce.source_choisie = 9;
+    b.annoncer(-24.0, false);
+    b.observer().await;
+    let envoyes = b.volumes_commandes();
+    assert!(
+        !envoyes.is_empty() && envoyes.iter().all(|v| (*v - -45.0).abs() < 1e-6),
+        "revenu sur l'entrée de Tune, l'ampli doit être ramené : {envoyes:?}"
+    );
+}
