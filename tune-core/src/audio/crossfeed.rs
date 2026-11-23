@@ -726,16 +726,22 @@ pub fn crossfeed_status(
 /// son périphérique `oaat:` / `oaat-group:`, comme le fait l'orchestrateur,
 /// ou à son type) et le navigateur.
 ///
-/// Les sorties PULL (`airplay2`, `diretta`, `hqplayer`, `sendspin`,
-/// `devialet_air`, greffons) n'y sont pas : leurs pistes de la bibliothèque
-/// passent par le bras FICHIER, qui ne cuit le crossfeed que vers une zone
-/// réseau (`crossfeed_cuit_dans_le_fichier`).
+/// TESS T12c — AirPlay 1 et 2 et Devialet AIR aussi : Tune fabrique leur
+/// flux, et le crossfeed (ou un greffon natif tiers) seul y force le flux
+/// traité par le relais (`orchestrator::regles::sortie_tess_qui_tire_le_flux`).
+/// Réserve partielle : un DSD ou un ALAC servi tel quel part sans lui.
+///
+/// Les autres sorties PULL (`diretta`, `hqplayer` — hors TESS, décision Q8 —,
+/// `sendspin`, greffons) n'y sont pas.
 pub fn sortie_porte_le_flux_traite(
     output_type: Option<&str>,
     output_device_id: Option<&str>,
 ) -> bool {
     output_device_id.is_some_and(|d| d.starts_with("oaat:") || d.starts_with("oaat-group:"))
-        || matches!(output_type, Some("oaat") | Some("browser"))
+        || matches!(
+            output_type,
+            Some("oaat") | Some("browser") | Some("airplay") | Some("airplay2") | Some("devialet_air")
+        )
 }
 
 /// #9178 — sur une sortie qui porte le flux traité

@@ -3661,8 +3661,14 @@ fn decider_les_forcages(
     // octets. Constaté sur la session (`StreamInfo::relaye_tel_quel`), pas
     // déduit.
     let relaye_par_le_mandataire = wire.is_some_and(|w| w.relaye_tel_quel);
-    let flux_servi_tel_quel =
-        dsd_brut_hors_sortie_locale || alac_natif_servi || relaye_par_le_mandataire;
+    // TESS T12c (décision Q8) — HQPlayer et Diretta sont hors TESS : aucun
+    // étage de la chaîne ne leur est appliqué (`orchestrator::regles::
+    // pull_output_needs_dsp_transcode`), le panneau ne l'annonce donc pas.
+    let sortie_hors_tess = matches!(output_type, "hqplayer" | "diretta");
+    let flux_servi_tel_quel = dsd_brut_hors_sortie_locale
+        || alac_natif_servi
+        || relaye_par_le_mandataire
+        || sortie_hors_tess;
     let dsp_applique = dsp_enabled && !flux_servi_tel_quel;
     let dsp_contourne_par_le_dsd = dsp_enabled && dsd_brut_hors_sortie_locale;
     let dsp_contourne_par_l_alac = dsp_enabled && alac_natif_servi && !dsd_brut_hors_sortie_locale;

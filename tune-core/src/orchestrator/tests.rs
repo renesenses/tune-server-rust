@@ -986,11 +986,26 @@ fn pull_output_dsp_transcode_classification() {
     // The case that was silently broken: an out-of-tree pull output was in
     // none of the lists, so an active EQ never reached it.
     assert!(pull_output_needs_dsp_transcode(
-        Some("diretta"),
+        Some("un-greffon-hors-depot"),
         false,
         false,
         flac
     ));
+    // TESS T12c (décision Q8) : HQPlayer et Diretta sont HORS TESS, aucun
+    // étage de la chaîne ne leur est appliqué.
+    for hors_tess in ["diretta", "hqplayer"] {
+        assert!(
+            !pull_output_needs_dsp_transcode(Some(hors_tess), false, false, flac),
+            "{hors_tess}"
+        );
+    }
+    // AirPlay et Devialet AIR, eux, reçoivent le flux traité.
+    for tess in ["airplay", "airplay2", "devialet_air"] {
+        assert!(
+            pull_output_needs_dsp_transcode(Some(tess), false, false, flac),
+            "{tess}"
+        );
+    }
 
     // Already transcoding on their own: forcing again would be redundant.
     assert!(!pull_output_needs_dsp_transcode(
@@ -1071,8 +1086,12 @@ fn is_pull_dsp_output_type_est_la_part_type_de_pull_output_needs_dsp_transcode()
         "diretta",
         "un-greffon-hors-depot",
     ] {
+        // TESS T12c — seule exception : HQPlayer et Diretta restent des
+        // sorties PULL (transport bit-perfect, #2189), mais hors TESS (Q8) :
+        // aucun traitement ne leur est forcé.
+        let hors_tess = matches!(t, "hqplayer" | "diretta");
         assert_eq!(
-            is_pull_dsp_output_type(Some(t)),
+            is_pull_dsp_output_type(Some(t)) && !hors_tess,
             pull_output_needs_dsp_transcode(Some(t), false, false, flac),
             "{t} : le prédicat extrait doit rendre exactement ce que \
              rendait la condition d'origine"

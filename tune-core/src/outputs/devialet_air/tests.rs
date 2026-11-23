@@ -1292,6 +1292,10 @@ mod demarrage_borne_6911;
 #[path = "retours_8920_tests.rs"]
 mod retours_8920;
 
+// TESS T12c — la chaîne TESS sur Devialet AIR, garde de volume inchangée.
+#[path = "tess_t12c_tests.rs"]
+mod tess_t12c;
+
 // ─── #8536 — la session de la sortie, l'écoute à côté de Roon ───────────────
 
 /// #8536 — un Roon a ouvert la session annoncée : l'ampli lui renvoie les

@@ -49,12 +49,12 @@ fn case_decochee_sur_oaat_rien_d_effectif_9178() {
 /// Contre-épreuve : les sorties PULL et la zone sans sortie gardent le verrou.
 #[test]
 fn les_sorties_pull_et_la_zone_sans_sortie_restent_verrouillees_9178() {
+    // AirPlay et Devialet AIR en sont sortis avec TESS T12c (voir
+    // `airplay_et_devialet_air_portent_le_flux_traite_t12c`).
     for (type_, appareil) in [
-        (Some("airplay2"), Some("airplay:salon")),
         (Some("diretta"), Some("diretta:x")),
         (Some("hqplayer"), Some("hqplayer:x")),
         (Some("sendspin"), Some("sendspin:x")),
-        (Some("devialet_air"), Some("devialet:x")),
         (Some("tune_agent"), Some("agent:x")),
         (None, None),
     ] {
@@ -152,4 +152,22 @@ fn seule_oaat_porte_toute_la_chaine_t12a() {
     // Les droits viennent après : sans Premium, le motif est le droit.
     let s = avec_les_droits(avec_toute_la_chaine(non_locale(true), true), false, true);
     assert_eq!(s.reason, Some(CrossfeedConstraint::PremiumRequired));
+}
+
+/// TESS T12c — AirPlay 1 et 2 et Devialet AIR : Tune fabrique le flux, le
+/// crossfeed y est porté par le relais, réserve partielle (DSD, ALAC servis
+/// tels quels) qui ne verrouille pas le contrôle.
+#[test]
+fn airplay_et_devialet_air_portent_le_flux_traite_t12c() {
+    for (type_, appareil) in [
+        (Some("airplay"), Some("airplay-192.168.1.9-7000")),
+        (Some("airplay2"), Some("airplay2:salon")),
+        (Some("devialet_air"), Some("devialet:x")),
+    ] {
+        assert!(sortie_porte_le_flux_traite(type_, appareil), "{type_:?}");
+        assert!(!sortie_porte_toute_la_chaine(type_, appareil), "{type_:?}");
+        let s = avec_le_flux_traite(non_locale(true), true);
+        assert!(s.effective && !s.unavailable);
+        assert_eq!(s.reason, Some(CrossfeedConstraint::NonLocalPartial));
+    }
 }
