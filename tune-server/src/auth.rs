@@ -1529,7 +1529,7 @@ async fn login(
     }
     clear_login_failures(ip);
 
-    // Ce qui s'enregistre : l'ancien hachage converti en argon2, seulement
+    // Ce qui s'enregistre : l'ancien hachage converti en argon2 (puis effacé), seulement
     // après sa vérification ; ou le premier mot de passe du compte `default`
     // sans mot de passe, saisi par l'opérateur de cette machine (depuis le
     // réseau, authentification coupée, la session est ouverte mais le compte
@@ -1540,7 +1540,7 @@ async fn login(
         state
             .backend
             .execute(
-                "UPDATE profiles SET password_hash_v2 = ? WHERE id = ?",
+                "UPDATE profiles SET password_hash_v2 = ?, password_hash = NULL WHERE id = ?",
                 &[&upgraded as &dyn ToSqlValue, &profile_id as &dyn ToSqlValue],
             )
             .ok();

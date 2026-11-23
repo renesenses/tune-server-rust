@@ -203,7 +203,8 @@ async fn profil_sans_mot_de_passe_authentification_coupee(state: &AppState, lan:
 }
 
 /// Base rc12 : seul l'ancien hachage SHA-256. Un mauvais mot de passe est
-/// refusé partout sans rien convertir ; le bon est converti en argon2.
+/// refusé partout sans rien convertir ; le bon est converti en argon2 et
+/// l'ancien hachage effacé.
 async fn base_rc12_ancien_hachage(state: &AppState, lan: &str) {
     poser_hachages(state, Some(&sha256("ancien-1234")), None);
     poser_authentification(state, true);
@@ -222,6 +223,11 @@ async fn base_rc12_ancien_hachage(state: &AppState, lan: &str) {
     assert!(
         mot_de_passe_enregistre(state, "ancien-1234"),
         "converti après vérification"
+    );
+    assert_eq!(
+        hachages(state).0,
+        None,
+        "l'ancien hachage est effacé une fois converti"
     );
     let (st, _) = connexion(state, CETTE_MACHINE, "default", MAUVAIS).await;
     assert_eq!(st, StatusCode::UNAUTHORIZED);
