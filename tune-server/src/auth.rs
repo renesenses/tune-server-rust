@@ -1619,11 +1619,19 @@ async fn login(
 // POST /auth/logout
 // ---------------------------------------------------------------------------
 
-async fn logout(State(state): State<AppState>, headers: axum::http::HeaderMap) -> impl IntoResponse {
+async fn logout(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> impl IntoResponse {
     // La session longue présentée (en-tête ou cookie) est désinscrite : son
     // jeton ne vaut plus rien après la déconnexion.
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    if let Some(secret) = settings.get("jwt_secret").ok().flatten().filter(|s| !s.is_empty()) {
+    if let Some(secret) = settings
+        .get("jwt_secret")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+    {
         let mut presentes: Vec<String> = Vec::new();
         if let Some(t) = headers
             .get(axum::http::header::AUTHORIZATION)

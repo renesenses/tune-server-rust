@@ -309,7 +309,11 @@ async fn la_deconnexion_desinscrit_la_session_longue_bearer_ou_cookie() {
     .await;
     assert_eq!(st, StatusCode::OK);
     assert_eq!(moi(&state, &par_entete).await, StatusCode::UNAUTHORIZED);
-    assert_eq!(moi(&state, &par_cookie).await, StatusCode::OK, "l'autre reste");
+    assert_eq!(
+        moi(&state, &par_cookie).await,
+        StatusCode::OK,
+        "l'autre reste"
+    );
 
     let st = appel_avec(
         &state,
@@ -332,10 +336,18 @@ async fn le_nombre_de_sessions_longues_par_compte_est_plafonne() {
     for _ in 0..20 {
         derniere = long_de(&state, "alice").await;
     }
-    assert_eq!(sessions_inscrites(&state), 21, "20 pour alice + 1 pour proprio");
+    assert_eq!(
+        sessions_inscrites(&state),
+        21,
+        "20 pour alice + 1 pour proprio"
+    );
     assert_eq!(moi(&state, &premiere).await, StatusCode::UNAUTHORIZED);
     assert_eq!(moi(&state, &derniere).await, StatusCode::OK);
-    assert_eq!(moi(&state, &autre).await, StatusCode::OK, "autre compte intact");
+    assert_eq!(
+        moi(&state, &autre).await,
+        StatusCode::OK,
+        "autre compte intact"
+    );
 }
 
 #[tokio::test]
@@ -345,7 +357,10 @@ async fn retrograder_l_admin_invalide_sa_session_longue() {
     assert_eq!(moi(&state, &long).await, StatusCode::OK);
     state
         .backend
-        .execute("UPDATE profiles SET is_admin = 0 WHERE username = 'proprio'", &[])
+        .execute(
+            "UPDATE profiles SET is_admin = 0 WHERE username = 'proprio'",
+            &[],
+        )
         .unwrap();
     assert_eq!(moi(&state, &long).await, StatusCode::UNAUTHORIZED);
 }
@@ -379,7 +394,11 @@ async fn websocket_jeton_en_parametre_et_cookie_suivent_la_revocation() {
     for (cle, _) in reglages.par_prefixe("auth_session_token:").unwrap() {
         reglages.delete(&cle).unwrap();
     }
-    assert!(!tune_server::auth::ws_authorized(&state, &vide, Some(&long)));
+    assert!(!tune_server::auth::ws_authorized(
+        &state,
+        &vide,
+        Some(&long)
+    ));
     assert!(!tune_server::auth::ws_authorized(&state, &cookie, None));
 }
 
@@ -392,7 +411,9 @@ async fn le_relais_n_ouvre_pas_les_routes_des_sessions() {
         .to_string();
     let _ = long_de(&state, "alice").await;
     let reglages = SettingsRepo::with_backend(state.backend.clone());
-    let cle = reglages.par_prefixe("auth_session_token:").unwrap()[0].0.clone();
+    let cle = reglages.par_prefixe("auth_session_token:").unwrap()[0]
+        .0
+        .clone();
     let id = cle.trim_start_matches("auth_session_token:").to_string();
     let relaye = |j: &str| {
         vec![
@@ -401,7 +422,13 @@ async fn le_relais_n_ouvre_pas_les_routes_des_sessions() {
         ]
     };
 
-    let st = appel_avec(&state, Method::GET, "/api/v1/auth/sessions", &relaye(&admin)).await;
+    let st = appel_avec(
+        &state,
+        Method::GET,
+        "/api/v1/auth/sessions",
+        &relaye(&admin),
+    )
+    .await;
     assert_eq!(st, StatusCode::FORBIDDEN, "liste par le relais");
     let st = appel_avec(
         &state,
