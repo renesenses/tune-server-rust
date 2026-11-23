@@ -17,6 +17,7 @@ Votre serveur **Tune OS en rc12** refuse sa mise à jour avec le message « enab
 
 **À savoir**
 - L'app iPhone ne se connecte pas tant que l'authentification est active.
+- Si le compte administrateur de votre Tune a déjà un mot de passe (par exemple parce que sa base vient d'un autre ordinateur), l'outil vous le demande, avec son identifiant s'il ne s'appelle pas `default`. Si vous ne l'avez pas, suivez le fil épinglé du forum.
 - Si votre Tune a déjà la rc13 ou une version plus récente, l'outil ne fait rien et vous renvoie au fil épinglé du forum.
 - L'outil ne parle qu'à votre Tune, sur votre réseau local. Il n'enregistre aucun mot de passe et n'envoie rien ailleurs. Il s'arrête tout seul quand vous fermez la page.
 
@@ -37,6 +38,7 @@ Is your **Tune OS server on rc12** refusing to update with "enable authenticatio
 
 **Good to know**
 - The iPhone app does not connect while authentication is on.
+- If your Tune's administrator account already has a password (for example because its database comes from another computer), the tool asks for it, with its username if it is not `default`. If you don't have it, follow the pinned forum thread.
 - If your Tune already runs rc13 or later, the tool does nothing and points you to the pinned forum thread.
 - The tool only talks to your Tune, on your local network. It stores no password and sends nothing anywhere else. It stops by itself when you close the page.
 

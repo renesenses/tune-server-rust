@@ -98,9 +98,11 @@ footer { max-width: 640px; margin: 0 auto; padding: 0 16px 24px; color: var(--do
 
     <div id="f-existant" class="cache">
       <p id="existant-intro"></p>
+      <p id="existant-guide" class="info cache"><span data-t="existant_guide"></span> <a id="lien-guide" target="_blank" rel="noopener noreferrer" data-t="lien_guide"></a></p>
       <label for="ident" data-t="identifiant"></label>
       <input id="ident" value="default" autocomplete="username" spellcheck="false">
-      <label for="mdp0" data-t="mdp_actuel"></label>
+      <p id="ident-aide" class="doux cache" data-t="identifiant_aide"></p>
+      <label for="mdp0" id="mdp0-label"></label>
       <input id="mdp0" type="password" autocomplete="current-password">
       <button id="b-existant" data-t="mettre_a_jour"></button>
     </div>
@@ -143,7 +145,7 @@ footer { max-width: 640px; margin: 0 auto; padding: 0 16px 24px; color: var(--do
   <section id="v-fin" class="carte cache">
     <h2 data-t="fin_titre"></h2>
     <p class="ok" id="fin-texte"></p>
-    <p data-t="fin_connexion"></p>
+    <p id="fin-connexion"></p>
     <p class="info" data-t="fin_iphone"></p>
     <p id="err-fin" class="alerte cache" role="alert"></p>
     <p class="doux" data-t="fin_quitter"></p>
@@ -176,9 +178,13 @@ fr: {
   mdp_regle: "8 caractères au moins.",
   activer_et_maj: "Activer l’authentification et mettre à jour",
   existant_actif: "L’authentification de ce Tune est déjà active. Saisissez le mot de passe du compte administrateur pour lancer la mise à jour.",
-  existant_requis: "Le compte default de ce Tune a déjà un mot de passe. Saisissez-le : il sera conservé, et servira à activer l’authentification.",
+  existant_requis: "Le compte administrateur de ce serveur a déjà un mot de passe : saisissez-le pour continuer. Il sera conservé, et servira à activer l’authentification.",
+  existant_guide: "Vous ne l’avez pas, par exemple parce que la base vient d’un autre ordinateur ? Suivez ce guide :",
+  lien_guide: "le fil épinglé du forum",
   identifiant: "Identifiant",
+  identifiant_aide: "D’ordinaire default. Si l’administrateur de ce serveur porte un autre nom, saisissez-le.",
   mdp_actuel: "Mot de passe",
+  mdp_existant: "Mot de passe existant",
   mettre_a_jour: "Mettre à jour",
   recent: "Ce Tune a déjà une version récente (rc13 ou plus) : cet outil n’a rien à y faire. Si sa mise à jour est refusée, suivez le fil épinglé du forum.",
   lien_fil: "Ouvrir le fil épinglé du forum",
@@ -200,7 +206,7 @@ fr: {
   fin_titre: "C’est fait",
   fin_ok: "Votre Tune est passé en version {version}.",
   fin_deja: "Votre Tune est à jour (version {version}).",
-  fin_connexion: "Connectez-vous désormais à Tune avec l’identifiant default et votre mot de passe.",
+  fin_connexion: "Connectez-vous désormais à Tune avec l’identifiant {ident} et votre mot de passe.",
   fin_iphone: "Attention : l’app iPhone ne se connecte pas tant que l’authentification est active.",
   fin_quitter: "Vous pouvez fermer cette page : l’outil s’arrête tout seul.",
   quitter: "Quitter",
@@ -254,9 +260,13 @@ en: {
   mdp_regle: "At least 8 characters.",
   activer_et_maj: "Turn on authentication and update",
   existant_actif: "Authentication is already on for this Tune. Enter the administrator password to start the update.",
-  existant_requis: "The default account on this Tune already has a password. Enter it: it is kept as is, and used to turn on authentication.",
+  existant_requis: "The administrator account on this server already has a password: enter it to continue. It is kept as is, and used to turn on authentication.",
+  existant_guide: "Don’t have it, for example because the database comes from another computer? Follow this guide:",
+  lien_guide: "the pinned forum thread",
   identifiant: "Username",
+  identifiant_aide: "Usually default. If this server’s administrator has another name, type it.",
   mdp_actuel: "Password",
+  mdp_existant: "Existing password",
   mettre_a_jour: "Update",
   recent: "This Tune already runs a recent version (rc13 or later): this tool has nothing to do here. If its update is refused, follow the pinned forum thread.",
   lien_fil: "Open the pinned forum thread",
@@ -278,7 +288,7 @@ en: {
   fin_titre: "Done",
   fin_ok: "Your Tune now runs version {version}.",
   fin_deja: "Your Tune is up to date (version {version}).",
-  fin_connexion: "From now on, sign in to Tune with the username default and your password.",
+  fin_connexion: "From now on, sign in to Tune with the username {ident} and your password.",
   fin_iphone: "Note: the iPhone app does not connect while authentication is on.",
   fin_quitter: "You can close this page: the tool stops by itself.",
   quitter: "Quit",
@@ -320,6 +330,7 @@ const $ = (id) => document.getElementById(id);
 document.querySelectorAll("[data-t]").forEach((e) => { e.textContent = t(e.dataset.t); });
 document.title = t("titre");
 $("lien-fil").href = FIL;
+$("lien-guide").href = FIL;
 
 const BASE = location.pathname; // /s/<jeton>/
 async function api(action, corps) {
@@ -376,8 +387,13 @@ function afficherEtat(etat, existantRequis) {
   cacher("f-nouveau", "f-existant", "f-recent", "f-inconnue", "err-etat");
   if (etat === "a_debloquer" && !existantRequis) { montrer("f-nouveau"); $("mdp1").focus(); }
   else if (etat === "a_debloquer" || etat === "auth_active") {
+    // Le compte administrateur a déjà un mot de passe (ou `default` n'existe
+    // pas : base copiée d'un autre ordinateur). On demande l'EXISTANT, avec
+    // l'identifiant modifiable et le guide du forum.
     $("existant-intro").textContent = t(existantRequis ? "existant_requis" : "existant_actif");
-    $("ident").disabled = !!existantRequis; if (existantRequis) $("ident").value = "default";
+    $("mdp0-label").textContent = t(existantRequis ? "mdp_existant" : "mdp_actuel");
+    $("existant-guide").classList.toggle("cache", !existantRequis);
+    $("ident-aide").classList.toggle("cache", !existantRequis);
     montrer("f-existant"); $("mdp0").focus();
   }
   else if (etat === "recent") montrer("f-recent");
@@ -394,6 +410,8 @@ $("b-nouveau").onclick = () => {
 $("b-existant").onclick = () => {
   cacher("err-etat");
   if (!$("mdp0").value) return montrerErreur("err-etat", { code: "mot_de_passe_vide" });
+  // Authentification coupée : la longueur minimale vaut aussi pour l'existant.
+  if (tune.etat === "a_debloquer" && [...$("mdp0").value].length < 8) return montrerErreur("err-etat", { code: "mot_de_passe_trop_court" });
   mdp = $("mdp0").value; ident = $("ident").value.trim() || "default"; lancer(false, false);
 };
 
@@ -454,6 +472,7 @@ async function suivre(depart) {
 function fin(version, deja) {
   vue("v-fin");
   $("fin-texte").textContent = t(deja ? "fin_deja" : "fin_ok", { version });
+  $("fin-connexion").textContent = t("fin_connexion", { ident });
   mdp = ""; $("mdp0").value = ""; $("mdp1").value = ""; $("mdp2").value = "";
 }
 $("b-quitter").onclick = async () => { await api("quitter"); window.close(); document.body.innerHTML = ""; };

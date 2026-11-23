@@ -22,6 +22,9 @@ struct Modele {
     auth_enabled: bool,
     /// Mot de passe de `default` (`None` = aucun hash, revendicable).
     mdp_default: Option<String>,
+    /// Nom du compte administrateur : `default` d'ordinaire, autre chose
+    /// quand la base vient d'un autre ordinateur (cas de Rob, forum).
+    nom_admin: String,
     /// Rôle rendu par la connexion (le profil 1 est administrateur).
     role: String,
     lecture: bool,
@@ -53,6 +56,7 @@ impl FauxTune {
             auth_enabled,
             mdp_default: mdp_default.map(str::to_string),
             role: "admin".into(),
+            nom_admin: "default".into(),
             ..Default::default()
         }));
         let (s, mm) = (Arc::clone(&serveur), Arc::clone(&m));
@@ -124,14 +128,15 @@ fn repondre(
                 corps["username"].as_str().unwrap_or(""),
                 corps["password"].as_str().unwrap_or(""),
             );
-            if u != "default" {
+            if u != m.nom_admin {
                 return (401, json!({"error": "invalid credentials"}));
             }
             let ok = match &m.mdp_default {
                 Some(h) => h == p,
-                // rc12 : revendicable tant que l'auth est coupée ; le mot de
-                // passe fourni devient le hash.
-                None => !m.auth_enabled,
+                // rc12 : seul `default` sans hash est revendicable, et
+                // seulement tant que l'auth est coupée ; le mot de passe
+                // fourni devient le hash.
+                None => u == "default" && !m.auth_enabled,
             };
             if !ok {
                 return (401, json!({"error": "invalid credentials"}));
@@ -569,4 +574,107 @@ fn de_bout_en_bout_par_la_page_locale() {
         r["suivi"]["phase"], "downloading",
         "le suivi passe le jeton gardé en mémoire : {r}"
     );
+}
+
+fn appeler(etat: &web::Etat, action: &str, corps: Value) -> Value {
+    let chemin = format!("/s/j/api/{action}");
+    serde_json::from_str(&requete(etat, "POST", &chemin, "127.0.0.1:9", &corps.to_string()).corps)
+        .unwrap()
+}
+
+#[test]
+fn de_bout_en_bout_le_compte_administrateur_a_deja_un_mot_de_passe() {
+    // Deux cas réels de rc12, authentification coupée :
+    // - `default` a déjà un mot de passe ;
+    // - la base vient d'un autre ordinateur et `default` n'existe pas :
+    //   l'administrateur s'appelle autrement (Rob, forum).
+    // Dans les deux, revendiquer `default` rend « invalid credentials ».
+    let page = requete(
+        &web::Etat::new("j".into(), 9),
+        "GET",
+        "/s/j/",
+        "127.0.0.1:9",
+        "",
+    )
+    .corps;
+    for texte in [
+        "Le compte administrateur de ce serveur a déjà un mot de passe : saisissez-le pour continuer.",
+        "The administrator account on this server already has a password: enter it to continue.",
+        "par exemple parce que la base vient d’un autre ordinateur",
+        "for example because the database comes from another computer",
+        "Mot de passe existant",
+        "Existing password",
+    ] {
+        assert!(page.contains(texte), "la page doit dire : {texte}");
+    }
+
+    for (nom_admin, mdp_admin) in [("default", "ancien-secret"), ("rob", "secret-de-rob")] {
+        let f = FauxTune::demarrer("1.0.0-rc12", false, Some(mdp_admin));
+        f.m.lock().unwrap().nom_admin = nom_admin.into();
+        let etat = web::Etat::new("j".into(), 9);
+        let r = appeler(&etat, "diagnostiquer", json!({"adresse": f.base}));
+        assert_eq!(r["diagnostic"]["etat"], "a_debloquer", "{nom_admin} : {r}");
+
+        // 1. Nouveau mot de passe : le serveur refuse, l'outil demande
+        //    l'existant (et non « identifiant ou mot de passe incorrect »).
+        let r = appeler(
+            &etat,
+            "debloquer",
+            json!({"base": f.base, "identifiant": "default", "mot_de_passe": "nouveau-secret", "nouveau": true}),
+        );
+        assert_eq!(
+            r["erreur"]["code"], "mot_de_passe_existant_requis",
+            "{nom_admin} : {r}"
+        );
+        // Revendiquer un autre compte que `default` est impossible, même si
+        // la page l'envoie avec `nouveau`.
+        let r = appeler(
+            &etat,
+            "debloquer",
+            json!({"base": f.base, "identifiant": nom_admin, "mot_de_passe": "nouveau-secret", "nouveau": true}),
+        );
+        assert_eq!(
+            r["erreur"]["code"], "mot_de_passe_existant_requis",
+            "{nom_admin} : {r}"
+        );
+        assert!(
+            !f.m.lock().unwrap().auth_enabled,
+            "{nom_admin} : rien n'est activé"
+        );
+
+        // 2. La longueur minimale vaut aussi pour le mot de passe existant.
+        let avant = f.ecritures().len();
+        let r = appeler(
+            &etat,
+            "debloquer",
+            json!({"base": f.base, "identifiant": nom_admin, "mot_de_passe": "court", "nouveau": false}),
+        );
+        assert_eq!(
+            r["erreur"]["code"], "mot_de_passe_trop_court",
+            "{nom_admin} : {r}"
+        );
+        assert_eq!(
+            f.ecritures().len(),
+            avant,
+            "{nom_admin} : aucun appel en écriture"
+        );
+
+        // 3. Mot de passe existant, avec le nom de l'administrateur.
+        let r = appeler(
+            &etat,
+            "debloquer",
+            json!({"base": f.base, "identifiant": nom_admin, "mot_de_passe": mdp_admin, "nouveau": false}),
+        );
+        assert_eq!(
+            r["resultat"]["issue"], "mise_a_jour_lancee",
+            "{nom_admin} : {r}"
+        );
+        let m = f.m.lock().unwrap();
+        assert!(m.auth_enabled, "{nom_admin} : authentification activée");
+        assert_eq!(
+            m.mdp_default.as_deref(),
+            Some(mdp_admin),
+            "{nom_admin} : le mot de passe existant est conservé"
+        );
+    }
 }

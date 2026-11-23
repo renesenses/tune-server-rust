@@ -208,8 +208,9 @@ fn connexion(c: &ClientTune, identifiant: &str, mdp: &str, nouveau: bool) -> Res
         .map_err(|e| echec_detail("injoignable", e))?;
     match code {
         200 => {}
-        // Cas « à débloquer » : `default` a déjà un mot de passe (ou n'existe
-        // plus). On demandera le mot de passe existant.
+        // Cas « à débloquer » : `default` a déjà un mot de passe, ou n'existe
+        // pas (base copiée d'un autre ordinateur). On demandera le mot de
+        // passe existant du compte administrateur.
         401 if nouveau => return Err(echec("mot_de_passe_existant_requis")),
         401 => return Err(echec("mot_de_passe_incorrect")),
         429 => return Err(echec("trop_de_tentatives")),
@@ -264,8 +265,17 @@ pub fn debloquer(c: &ClientTune, d: &Demande) -> Result<Resultat, Echec> {
             if d.mot_de_passe.is_empty() {
                 return Err(echec("mot_de_passe_vide"));
             }
-            // Seul `default` (profil 1, administrateur) se revendique.
-            let jeton = connexion(c, "default", &d.mot_de_passe, d.nouveau)?;
+            // Seul `default` (profil 1, administrateur) se revendique : un
+            // NOUVEAU mot de passe ne part que vers lui. Un mot de passe
+            // EXISTANT part vers le compte saisi : quand la base vient d'un
+            // autre ordinateur, `default` peut manquer et l'administrateur
+            // porter un autre nom (rc12 ne laisse entrer sans mot de passe
+            // que `default` ; `connexion` exige ensuite le rôle admin).
+            let identifiant = match d.identifiant.trim() {
+                i if !d.nouveau && !i.is_empty() => i,
+                _ => "default",
+            };
+            let jeton = connexion(c, identifiant, &d.mot_de_passe, d.nouveau)?;
             etapes.push("connexion");
             activer_authentification(c, &jeton)?;
             etapes.push("authentification_activee");
