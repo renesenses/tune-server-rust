@@ -2253,6 +2253,12 @@ path = "tests/activation_authentification.rs"
 name = "code_activation_hors_des_journaux"
 path = "tests/code_activation_hors_des_journaux.rs"
 
+# Le code d'activation est aussi écrit dans le fichier journal local, et nulle
+# part ailleurs (vrai abonné `tracing`, `TUNE_LOG_FILE` posé : cible à part).
+[[test]]
+name = "code_activation_dans_le_fichier_journal"
+path = "tests/code_activation_dans_le_fichier_journal.rs"
+
 # #8135 — une radio comme élément d'une playlist (ajout, liste, lecture,
 # export/import). `autotests = false` plus haut : sans cette cible, jamais compilé.
 [[test]]

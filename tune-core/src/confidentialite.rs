@@ -573,10 +573,10 @@ pub fn anonymiser_json_garder_appareils(valeur: &mut Value) {
 /// testeur (titre, description, sujet et corps d'un ticket) y passent seuls,
 /// le diagnostic y passe par [`anonymiser`], qui commence par elle.
 /// Le marqueur de la ligne qui porte le code d'activation de
-/// l'authentification. Le serveur l'écrit sur sa CONSOLE seulement ; toute
-/// ligne qui le porte est retirée de ce qui sort (journal servi par l'API,
-/// rapport de bogue, ticket, assistant) — cas d'une sortie d'erreur
-/// redirigée dans le fichier journal, ou d'un repli sur `journalctl`.
+/// l'authentification. Le serveur l'écrit sur sa CONSOLE et dans son fichier
+/// journal local ; toute ligne qui le porte est retirée de ce qui sort
+/// (journal servi par l'API, rapport de bogue, ticket, assistant, repli sur
+/// `journalctl`).
 pub const MARQUEUR_CODE_ACTIVATION: &str = "TUNE-ACTIVATION-CODE";
 
 /// Retire les lignes qui portent [`MARQUEUR_CODE_ACTIVATION`].
