@@ -543,6 +543,8 @@ async fn pg_6179_la_ligne_survit_a_sa_piste_sur_les_deux_naissances() {
         include_str!("../../migrations/postgres/072_playlist_tracks_titres_de_service.sql"),
         include_str!("../../migrations/postgres/089_playlist_tracks_orphelines.sql"),
         include_str!("../../migrations/postgres/089_playlist_tracks_orphelines.sql"),
+        // #9362 — les écritures de `PlaylistRepo` nomment `added_at`.
+        include_str!("../../migrations/postgres/124_playlist_tracks_date_d_ajout.sql"),
         include_str!("../../migrations/postgres/playlist_tracks_orphelines.sql"),
     ] {
         sqlx::raw_sql(sql).execute(&pool).await.unwrap();

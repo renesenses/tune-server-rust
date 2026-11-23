@@ -184,6 +184,7 @@ fn une_ancienne_ligne_radio_portant_une_adresse_se_joue_telle_quelle_8135() {
         id: 9,
         position: 0,
         content: EntryContent::Service(titre("radio", FIP)),
+        added_at: None,
     };
     let jouees = lignes_a_jouer(&db, vec![e], &flux_enregistre());
     assert_eq!(jouees[0].service().unwrap().source_id, FIP);

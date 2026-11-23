@@ -591,7 +591,9 @@ CREATE TABLE IF NOT EXISTS playlist_tracks (
     audio_hash TEXT,
     audio_fingerprint TEXT,
     mbid TEXT,
-    missing_since TEXT
+    missing_since TEXT,
+    -- #9362 : date d'ajout a la playlist (SQLite 158). La PG 124 la convertit.
+    added_at TEXT
 );
 
 CREATE SEQUENCE IF NOT EXISTS zones_id_seq;

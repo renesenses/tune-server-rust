@@ -447,9 +447,35 @@ fn lignes_et_identifiants(state: &AppState, playlist_id: i64) -> Result<Vec<(i64
                 EntryContent::Service(s) => Some(s.to_json()),
                 EntryContent::Missing(m) => Some(m.to_json()),
             }
-            .map(|v| (e.id, v))
+            .map(|mut v| {
+                champs_de_tri(&mut v, e.added_at);
+                (e.id, v)
+            })
         })
         .collect())
+}
+
+/// #9362 (fil forum 3000) — ce sur quoi le client trie une playlist, présent
+/// sur CHAQUE ligne, `null` quand il est inconnu :
+///
+/// * `playlist_added_at` — la date d'ajout de la ligne À CETTE PLAYLIST, en
+///   secondes Unix (`playlist_tracks.added_at`) ; `null` pour une ligne
+///   antérieure à la migration 158. Pas `added_at` : ce nom porte déjà, chez
+///   le client, la date d'ajout d'un album à la BIBLIOTHÈQUE ;
+/// * `composer`, `sample_rate`, `bit_depth` — ceux de la piste locale
+///   (`Track::to_json`) ; une ligne de service les reçoit ensuite de sa fiche
+///   quand le service les donne (Qobuz, `metadonnees_7738::completer`) ; une
+///   ligne introuvable ou une radio ne les connaît pas.
+///
+/// Une valeur déjà posée n'est jamais remplacée.
+fn champs_de_tri(ligne: &mut Value, added_at: Option<i64>) {
+    let Some(obj) = ligne.as_object_mut() else {
+        return;
+    };
+    obj.insert("playlist_added_at".into(), json!(added_at));
+    for cle in ["composer", "sample_rate", "bit_depth"] {
+        obj.entry(cle).or_insert(Value::Null);
+    }
 }
 
 /// « # écoutes » et « Dernière écoute » vides dans la fiche d'une playlist
@@ -2771,3 +2797,7 @@ mod suppression_journal_3090_tests;
 #[cfg(test)]
 #[path = "playlists/fiche_memorisee_8892_tests.rs"]
 mod fiche_memorisee_8892_tests;
+
+#[cfg(test)]
+#[path = "playlists/champs_de_tri_9362_tests.rs"]
+mod champs_de_tri_9362_tests;

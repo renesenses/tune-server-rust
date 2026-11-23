@@ -123,12 +123,16 @@ pub mod sql {
         )
     }
 
+    /// #9362 — `added_at` (4e paramètre) : la date d'ajout de la ligne à la
+    /// playlist, en secondes Unix ; NULL quand elle est inconnue.
     pub fn insert_playlist_track<D: SqlDialect>(d: &D) -> String {
         format!(
-            "INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES ({}, {}, {})",
+            "INSERT INTO playlist_tracks (playlist_id, track_id, position, added_at) \
+             VALUES ({}, {}, {}, {})",
             d.placeholder(1),
             d.placeholder(2),
-            d.placeholder(3)
+            d.placeholder(3),
+            d.placeholder(4)
         )
     }
 
@@ -172,11 +176,12 @@ pub mod sql {
     ///
     /// #6179 — les colonnes 11 à 15 (`file_path`, `missing_since`, `mbid`,
     /// `audio_hash`, `audio_fingerprint`) ne servent qu'à la ligne INTROUVABLE.
+    /// #9362 — la colonne 16 (`added_at`) vaut pour les trois sortes.
     pub fn get_entries<D: SqlDialect>(d: &D) -> String {
         format!(
             "SELECT id, position, track_id, source, source_id, title, artist, album, \
              album_source_id, duration_ms, cover_url, file_path, missing_since, mbid, \
-             audio_hash, audio_fingerprint \
+             audio_hash, audio_fingerprint, added_at \
              FROM playlist_tracks WHERE playlist_id = {} ORDER BY position, id",
             d.placeholder(1)
         )
@@ -188,7 +193,30 @@ pub mod sql {
     pub fn insert_missing_entry<D: SqlDialect>(d: &D) -> String {
         format!(
             "INSERT INTO playlist_tracks (playlist_id, position, title, artist, album, \
-             duration_ms, file_path, audio_hash, audio_fingerprint, mbid, missing_since) \
+             duration_ms, file_path, audio_hash, audio_fingerprint, mbid, missing_since, \
+             added_at) \
+             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+            d.placeholder(1),
+            d.placeholder(2),
+            d.placeholder(3),
+            d.placeholder(4),
+            d.placeholder(5),
+            d.placeholder(6),
+            d.placeholder(7),
+            d.placeholder(8),
+            d.placeholder(9),
+            d.placeholder(10),
+            d.placeholder(11),
+            d.placeholder(12)
+        )
+    }
+
+    /// Une ligne de TITRE DE SERVICE (#4889) : `track_id` reste NUL, le CHECK
+    /// de la table l'exige.
+    pub fn insert_service_entry<D: SqlDialect>(d: &D) -> String {
+        format!(
+            "INSERT INTO playlist_tracks (playlist_id, position, source, source_id, title, \
+             artist, album, album_source_id, duration_ms, cover_url, added_at) \
              VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
             d.placeholder(1),
             d.placeholder(2),
@@ -201,26 +229,6 @@ pub mod sql {
             d.placeholder(9),
             d.placeholder(10),
             d.placeholder(11)
-        )
-    }
-
-    /// Une ligne de TITRE DE SERVICE (#4889) : `track_id` reste NUL, le CHECK
-    /// de la table l'exige.
-    pub fn insert_service_entry<D: SqlDialect>(d: &D) -> String {
-        format!(
-            "INSERT INTO playlist_tracks (playlist_id, position, source, source_id, title, \
-             artist, album, album_source_id, duration_ms, cover_url) \
-             VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
-            d.placeholder(1),
-            d.placeholder(2),
-            d.placeholder(3),
-            d.placeholder(4),
-            d.placeholder(5),
-            d.placeholder(6),
-            d.placeholder(7),
-            d.placeholder(8),
-            d.placeholder(9),
-            d.placeholder(10)
         )
     }
 
@@ -467,7 +475,7 @@ impl EntryContent {
     /// La clef de dédoublonnage : un `tracks.id`, ou la paire du service. Une
     /// ligne introuvable n'est le doublon d'aucune autre : sa clef porte son
     /// chemin et son titre, sous une source qu'aucun service ne prend.
-    fn cle(&self) -> (Option<i64>, Option<(String, String)>) {
+    fn cle(&self) -> CleDeLigne {
         match self {
             Self::Local(id) => (Some(*id), None),
             Self::Service(s) => (None, Some((s.source.clone(), s.source_id.clone()))),
@@ -493,6 +501,10 @@ pub struct PlaylistEntry {
     pub id: i64,
     pub position: i64,
     pub content: EntryContent,
+    /// #9362 — la date d'ajout de la ligne À LA PLAYLIST, en secondes Unix
+    /// (`playlist_tracks.added_at`). `None` : ligne antérieure à la migration
+    /// 158, ou recopiée d'une sauvegarde qui ne la portait pas.
+    pub added_at: Option<i64>,
 }
 
 impl PlaylistEntry {
@@ -689,9 +701,10 @@ impl PlaylistRepo {
                 .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
                 .unwrap_or(-1);
             let start_pos = position.unwrap_or(max_pos + 1);
+            let maintenant = Some(maintenant_unix());
             for (i, tid) in track_ids.iter().enumerate() {
                 let pos = start_pos + i as i64;
-                let p: [&dyn ToSqlValue; 3] = [&playlist_id, tid, &pos];
+                let p: [&dyn ToSqlValue; 4] = [&playlist_id, tid, &pos, &maintenant];
                 tx.execute(&insert_sql, &p)?;
                 inserted_ref.push(*tid);
             }
@@ -767,9 +780,10 @@ impl PlaylistRepo {
                 tx.execute(&create_sql, &cp)?;
                 let id = tx.last_insert_rowid();
                 *new_id_ref = id;
+                let maintenant = Some(maintenant_unix());
                 for (i, tid) in to_add_ref.iter().enumerate() {
                     let pos = i as i64;
-                    let p: [&dyn ToSqlValue; 3] = [&id, tid, &pos];
+                    let p: [&dyn ToSqlValue; 4] = [&id, tid, &pos, &maintenant];
                     tx.execute(&insert_sql, &p)?;
                 }
                 Ok(())
@@ -963,15 +977,25 @@ impl PlaylistRepo {
     /// atomically. This is the folder→playlist scan-sync path: the playlist
     /// mirrors its source directory on every scan, so the operation must be
     /// idempotent and never leave a half-replaced list on failure.
+    ///
+    /// #9362 — une piste qui y était déjà GARDE sa date d'ajout : la
+    /// synchronisation réécrit la liste à chaque scan, elle n'ajoute pas.
     pub fn set_tracks(&self, playlist_id: i64, track_ids: &[i64]) -> Result<(), String> {
+        let entries_sql = self.dialect_sql(sql::get_entries, sql::get_entries);
         let delete_sql = self.dialect_sql(sql::delete_all_tracks, sql::delete_all_tracks);
         let insert_sql = self.dialect_sql(sql::insert_playlist_track, sql::insert_playlist_track);
         self.db.write_tx(&mut |tx| {
             let dp: [&dyn ToSqlValue; 1] = [&playlist_id];
+            let mut dates = DatesDAjout::de(
+                tx.query_many(&entries_sql, &dp)?
+                    .iter()
+                    .filter_map(|cols| row_to_entry(cols)),
+            );
             tx.execute(&delete_sql, &dp)?;
             for (i, tid) in track_ids.iter().enumerate() {
                 let pos = i as i64;
-                let p: [&dyn ToSqlValue; 3] = [&playlist_id, tid, &pos];
+                let date = dates.reprendre(&EntryContent::Local(*tid));
+                let p: [&dyn ToSqlValue; 4] = [&playlist_id, tid, &pos, &date];
                 tx.execute(&insert_sql, &p)?;
             }
             Ok(())
@@ -1023,16 +1047,22 @@ impl PlaylistRepo {
                 }
             }
             suite.extend(locales.map(EntryContent::Local));
-            return self.rewrite_entries(playlist_id, &suite);
+            return self.rewrite_entries(playlist_id, &lignes, &suite);
         }
         let delete_sql = self.dialect_sql(sql::delete_all_tracks, sql::delete_all_tracks);
         let insert_sql = self.dialect_sql(sql::insert_playlist_track, sql::insert_playlist_track);
+        // #9362 — déplacer n'est pas ajouter : chaque piste garde sa date.
+        let mut dates = DatesDAjout::de(lignes.iter().cloned());
+        let dates: Vec<Option<i64>> = track_ids
+            .iter()
+            .map(|tid| dates.reprendre(&EntryContent::Local(*tid)))
+            .collect();
         self.db.write_tx(&mut |tx| {
             let p: [&dyn ToSqlValue; 1] = [&playlist_id];
             tx.execute(&delete_sql, &p)?;
-            for (i, tid) in track_ids.iter().enumerate() {
+            for (i, (tid, date)) in track_ids.iter().zip(&dates).enumerate() {
                 let pos = i as i64;
-                let p: [&dyn ToSqlValue; 3] = [&playlist_id, tid, &pos];
+                let p: [&dyn ToSqlValue; 4] = [&playlist_id, tid, &pos, date];
                 tx.execute(&insert_sql, &p)?;
             }
             Ok(())
@@ -1040,14 +1070,26 @@ impl PlaylistRepo {
     }
 
     /// Remplace tout le contenu par `suite`, dans l'ordre, en une transaction.
-    fn rewrite_entries(&self, playlist_id: i64, suite: &[EntryContent]) -> Result<(), String> {
+    ///
+    /// #9362 — chaque ligne de `suite` déjà présente dans `avant` (même
+    /// contenu) reprend sa date d'ajout, NULL compris ; une ligne neuve prend
+    /// l'heure.
+    fn rewrite_entries(
+        &self,
+        playlist_id: i64,
+        avant: &[PlaylistEntry],
+        suite: &[EntryContent],
+    ) -> Result<(), String> {
         let delete_sql = self.dialect_sql(sql::delete_all_tracks, sql::delete_all_tracks);
         let sqls = self.sql_d_insertion();
+        let mut dates = DatesDAjout::de(avant.iter().cloned());
+        let suite: Vec<(&EntryContent, Option<i64>)> =
+            suite.iter().map(|e| (e, dates.reprendre(e))).collect();
         self.db.write_tx(&mut |tx| {
             let p: [&dyn ToSqlValue; 1] = [&playlist_id];
             tx.execute(&delete_sql, &p)?;
-            for (i, e) in suite.iter().enumerate() {
-                Self::insert_entry(tx, &sqls, playlist_id, i as i64, e)?;
+            for (i, (e, date)) in suite.iter().enumerate() {
+                Self::insert_entry(tx, &sqls, playlist_id, i as i64, e, *date)?;
             }
             Ok(())
         })
@@ -1172,12 +1214,13 @@ impl PlaylistRepo {
         playlist_id: i64,
         pos: i64,
         contenu: &EntryContent,
+        added_at: Option<i64>,
     ) -> Result<(), String> {
         let local_sql = sqls.locale.as_str();
         let service_sql = sqls.service.as_str();
         match contenu {
             EntryContent::Missing(m) => {
-                let p: [&dyn ToSqlValue; 11] = [
+                let p: [&dyn ToSqlValue; 12] = [
                     &playlist_id,
                     &pos,
                     &m.title,
@@ -1189,15 +1232,16 @@ impl PlaylistRepo {
                     &m.audio_fingerprint,
                     &m.mbid,
                     &m.missing_since,
+                    &added_at,
                 ];
                 tx.execute(&sqls.introuvable, &p)?;
             }
             EntryContent::Local(tid) => {
-                let p: [&dyn ToSqlValue; 3] = [&playlist_id, tid, &pos];
+                let p: [&dyn ToSqlValue; 4] = [&playlist_id, tid, &pos, &added_at];
                 tx.execute(local_sql, &p)?;
             }
             EntryContent::Service(s) => {
-                let p: [&dyn ToSqlValue; 10] = [
+                let p: [&dyn ToSqlValue; 11] = [
                     &playlist_id,
                     &pos,
                     &s.source,
@@ -1208,6 +1252,7 @@ impl PlaylistRepo {
                     &s.album_source_id,
                     &s.duration_ms,
                     &s.cover_url,
+                    &added_at,
                 ];
                 tx.execute(service_sql, &p)?;
             }
@@ -1254,8 +1299,9 @@ impl PlaylistRepo {
                 .and_then(|cols| cols.first().and_then(|v| v.as_i64()))
                 .unwrap_or(-1);
             let depart = position.unwrap_or(max_pos + 1);
+            let maintenant = Some(maintenant_unix());
             for (i, e) in a_ecrire_ref.iter().enumerate() {
-                Self::insert_entry(tx, &sqls, playlist_id, depart + i as i64, e)?;
+                Self::insert_entry(tx, &sqls, playlist_id, depart + i as i64, e, maintenant)?;
             }
             Ok(())
         })?;
@@ -1290,8 +1336,11 @@ impl PlaylistRepo {
                 tx.execute(&create_sql, &cp)?;
                 let id = tx.last_insert_rowid();
                 *new_id_ref = id;
+                // #9362 — une playlist NEUVE (duplication, import) : ses
+                // lignes y entrent maintenant.
+                let maintenant = Some(maintenant_unix());
                 for (i, e) in a_ecrire_ref.iter().enumerate() {
-                    Self::insert_entry(tx, &sqls, id, i as i64, e)?;
+                    Self::insert_entry(tx, &sqls, id, i as i64, e, maintenant)?;
                 }
                 Ok(())
             })?;
@@ -1346,6 +1395,58 @@ impl PlaylistRepo {
     }
 }
 
+/// #9362 — l'heure d'un ajout, en secondes Unix (l'unité de `missing_since`).
+fn maintenant_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// #9362 — les dates d'ajout des lignes d'une playlist AVANT sa réécriture,
+/// par contenu (la clef de dédoublonnage, [`EntryContent::cle`]). Une
+/// réécriture de l'ordre efface puis réinsère : sans elle, chaque déplacement
+/// rajeunirait toute la playlist. Deux lignes de même contenu (une playlist a
+/// toujours pu porter deux fois la même piste) rendent leurs dates dans
+/// l'ordre. Un contenu inconnu d'avant est un AJOUT : l'heure.
+struct DatesDAjout {
+    par_contenu: std::collections::HashMap<CleDeLigne, std::collections::VecDeque<Option<i64>>>,
+    maintenant: i64,
+}
+
+/// La clef de dédoublonnage d'une ligne ([`EntryContent::cle`]).
+type CleDeLigne = (Option<i64>, Option<(String, String)>);
+
+impl DatesDAjout {
+    fn de(lignes: impl IntoIterator<Item = PlaylistEntry>) -> Self {
+        let mut par_contenu: std::collections::HashMap<_, std::collections::VecDeque<_>> =
+            std::collections::HashMap::new();
+        for l in lignes {
+            par_contenu
+                .entry(l.content.cle())
+                .or_default()
+                .push_back(l.added_at);
+        }
+        Self {
+            par_contenu,
+            maintenant: maintenant_unix(),
+        }
+    }
+
+    /// La date à écrire pour `contenu` : celle d'avant (NULL compris), ou
+    /// l'heure pour une ligne qui n'y était pas.
+    fn reprendre(&mut self, contenu: &EntryContent) -> Option<i64> {
+        match self
+            .par_contenu
+            .get_mut(&contenu.cle())
+            .and_then(|f| f.pop_front())
+        {
+            Some(date) => date,
+            None => Some(self.maintenant),
+        }
+    }
+}
+
 /// Les requêtes d'insertion d'une ligne de playlist, une par sorte.
 struct SqlDInsertion {
     locale: String,
@@ -1390,6 +1491,7 @@ fn row_to_entry(cols: &[SqlValue]) -> Option<PlaylistEntry> {
         id,
         position,
         content,
+        added_at: cols.get(16).and_then(|v| v.as_i64()),
     })
 }
 
@@ -2569,6 +2671,13 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
+        // #9362 — toute écriture et `get_entries` nomment `added_at` (124).
+        sqlx::raw_sql(include_str!(
+            "../../migrations/postgres/124_playlist_tracks_date_d_ajout.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
         let backend: Arc<dyn DbBackend> =
             Arc::new(crate::db::backend::PostgresBackend::new(pool.clone()));
         let locale: i64 = sqlx::query_scalar(
@@ -2615,6 +2724,23 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(copiee, (Some(1000), "bandcamp".to_string()));
+        // #9362 — la 124 convertit le TEXT de la bascule, rejouée sans effet.
+        const MIGRATION_124: &str =
+            include_str!("../../migrations/postgres/124_playlist_tracks_date_d_ajout.sql");
+        sqlx::raw_sql(MIGRATION_124).execute(&pool).await.unwrap();
+        sqlx::raw_sql(MIGRATION_124).execute(&pool).await.unwrap();
+        let type_date: String = sqlx::query_scalar(
+            "SELECT data_type::text FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = 'playlist_tracks' \
+               AND column_name = 'added_at'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            type_date, "bigint",
+            "la 124 convertit added_at de la bascule"
+        );
         assert!(
             sqlx::raw_sql(
                 "INSERT INTO playlist_tracks (id, playlist_id, track_id, position, source, source_id) \
@@ -2640,3 +2766,7 @@ mod tests {
         maintenance.close().await;
     }
 }
+
+#[cfg(test)]
+#[path = "playlist_repo_date_d_ajout_9362_tests.rs"]
+mod date_d_ajout_9362_tests;
