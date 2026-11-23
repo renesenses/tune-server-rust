@@ -145,6 +145,33 @@ struct SessionLongue {
     relais: bool,
     /// Empreinte du mot de passe au moment de la connexion.
     empreinte: String,
+    /// Ordre de création, strictement croissant (nanosecondes) : départage
+    /// les sessions créées dans la même seconde.
+    #[serde(default)]
+    ordre: u64,
+}
+
+/// Prochain ordre de création : l'horloge en nanosecondes, jamais en deçà
+/// du précédent + 1.
+fn prochain_ordre() -> u64 {
+    static DERNIER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let horloge = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut precedent = DERNIER.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let suivant = horloge.max(precedent + 1);
+        match DERNIER.compare_exchange_weak(
+            precedent,
+            suivant,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return suivant,
+            Err(v) => precedent = v,
+        }
+    }
 }
 
 /// État du compte qui conditionne une session longue : admin ou non, et
@@ -1560,6 +1587,7 @@ async fn login(
             client,
             relais: crate::garde_du_relais::requete_relayee(&headers),
             empreinte,
+            ordre: prochain_ordre(),
         };
         // Les expirées partent au passage ; au-delà du plafond par compte,
         // les plus anciennes aussi.
@@ -1567,7 +1595,7 @@ async fn login(
             .into_iter()
             .filter(|(_, s)| s.user_id == profile_id)
             .collect();
-        du_compte.sort_by_key(|(_, s)| s.created_at);
+        du_compte.sort_by_key(|(_, s)| (s.created_at, s.ordre));
         let en_trop = (du_compte.len() + 1).saturating_sub(MAX_SESSIONS_LONGUES_PAR_COMPTE);
         for (ancien, _) in du_compte.iter().take(en_trop) {
             settings
