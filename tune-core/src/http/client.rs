@@ -54,6 +54,30 @@ pub fn blocking_builder() -> reqwest::blocking::ClientBuilder {
         .http1_max_headers(MAX_ENTETES_HTTP1)
 }
 
+/// Une adresse de flux pour le journal ou un message d'erreur : le SCHÉMA et
+/// l'HÔTE seulement (`https://hôte/…`). Un jeton signé ne vit pas que dans la
+/// requête (`?token=…`) : Akamai le met dans le chemin (`/hdntl=…~hmac=…/`),
+/// googlevideo aussi (`/videoplayback/…/signature/…`), d'autres dans le
+/// fragment. L'identifiant éventuel (`user:mot-de-passe@`) part aussi.
+/// Une adresse `file://` (fichier temporaire local) reste entière.
+pub fn url_pour_journal(url: &str) -> String {
+    let Some((schema, reste)) = url.split_once("://") else {
+        return url.to_string();
+    };
+    if schema.eq_ignore_ascii_case("file") {
+        return url.to_string();
+    }
+    let fin_hote = reste.find(['/', '?', '#']).unwrap_or(reste.len());
+    let autorite = &reste[..fin_hote];
+    let hote = autorite.rsplit_once('@').map_or(autorite, |(_, h)| h);
+    let suite = &reste[fin_hote..];
+    if suite.is_empty() || suite == "/" {
+        format!("{schema}://{hote}{suite}")
+    } else {
+        format!("{schema}://{hote}/…")
+    }
+}
+
 /// Décrit une erreur `reqwest` pour un journal, **sans son URL** et avec la
 /// chaîne de ses causes (#5553, #5522).
 ///

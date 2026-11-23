@@ -4650,7 +4650,7 @@ pub fn decode_dsf_http_to_pcm_streaming(
         .map_err(|e| format!("dsf http client: {e}"))?
         .get(url)
         .send()
-        .map_err(|e| format!("dsf http fetch: {e}"))?;
+        .map_err(|e| format!("dsf http fetch: {}", e.without_url()))?;
     if !reponse.status().is_success() {
         return Err(format!("dsf http HTTP {}", reponse.status()));
     }

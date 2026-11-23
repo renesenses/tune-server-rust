@@ -296,7 +296,9 @@ pub(super) fn telecharger_amont(
     // gigaoctet (`telecharger_dans_un_fichier_temporaire`).
     let mut fichier = std::fs::File::create(vers).map_err(|e| format!("write dl: {e}"))?;
     resp.copy_to(&mut fichier)
-        .map_err(|e| format!("download: {e}"))?;
+        // `without_url` : l'adresse amont porte souvent un jeton signé, et ce
+        // message finit au journal.
+        .map_err(|e| format!("download: {}", e.without_url()))?;
     Ok(())
 }
 
@@ -310,7 +312,7 @@ fn ouvrir_amont(
         .timeout(std::time::Duration::from_secs(120))
         .build()
         .and_then(|c| rejouer_les_entetes(c.get(url), entetes).send())
-        .map_err(|e| format!("upstream fetch: {e}"))?;
+        .map_err(|e| format!("upstream fetch: {}", e.without_url()))?;
     if !resp.status().is_success() {
         // `warn!`, donc présent dans tout export de terrain : un `debug!` ici
         // rendrait la ligne inutile, c'est exactement ce qui a rendu muet le

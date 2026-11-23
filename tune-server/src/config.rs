@@ -22,6 +22,13 @@ pub struct TuneConfig {
     pub spotify_client_id: Option<String>,
     #[serde(default)]
     pub spotify_redirect_uri: Option<String>,
+    /// Identifiants client TIDAL (`TUNE_TIDAL_CLIENT_ID` /
+    /// `TUNE_TIDAL_CLIENT_SECRET` dans l'environnement l'emportent). Absents :
+    /// ceux figés dans le binaire à la compilation, s'il y en a.
+    #[serde(default)]
+    pub tidal_client_id: Option<String>,
+    #[serde(default)]
+    pub tidal_client_secret: Option<String>,
     #[serde(default)]
     pub discogs_token: Option<String>,
     #[serde(default)]
@@ -170,6 +177,8 @@ impl Default for TuneConfig {
             device_delays: HashMap::new(),
             spotify_client_id: None,
             spotify_redirect_uri: None,
+            tidal_client_id: None,
+            tidal_client_secret: None,
             discogs_token: None,
             acoustid_api_key: None,
             openai_api_key: None,
@@ -351,6 +360,16 @@ impl TuneConfig {
             && !v.is_empty()
         {
             config.spotify_redirect_uri = Some(v);
+        }
+        if let Ok(v) = std::env::var(tune_core::streaming::tidal::ENV_CLIENT_ID)
+            && !v.is_empty()
+        {
+            config.tidal_client_id = Some(v);
+        }
+        if let Ok(v) = std::env::var(tune_core::streaming::tidal::ENV_CLIENT_SECRET)
+            && !v.is_empty()
+        {
+            config.tidal_client_secret = Some(v);
         }
         if let Ok(v) = std::env::var("TUNE_DISCOGS_TOKEN")
             && !v.is_empty()

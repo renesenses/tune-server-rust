@@ -842,6 +842,14 @@ async fn relocate(
             Err(e) => return fail_job(format!("join: {e}")),
         }
 
+        // La clé maîtresse du coffre suit la base : sans elle, les jetons des
+        // services et les clés d'API scellés ne s'ouvriraient plus après le
+        // déplacement (tous les services déconnectés).
+        if let Err(e) = emporter_la_cle_du_coffre(&src_db, &target_root) {
+            let _ = std::fs::remove_dir_all(&target_root);
+            return fail_job(e);
+        }
+
         // 3) verify the copied DB before switching anything.
         set_phase("verifying");
         let target_db3 = target_db.clone();
@@ -886,6 +894,16 @@ async fn relocate(
     Ok(Json(json!({ "started": true })))
 }
 
+/// Recopie `tune-secrets.cle` du dossier de la base `src_db` vers
+/// `target_root` (0600, même propriétaire). Une source sans clé n'est pas
+/// une erreur : rien n'a encore été scellé.
+fn emporter_la_cle_du_coffre(src_db: &Path, target_root: &Path) -> Result<(), String> {
+    let dossier = tune_core::coffre::dossier_de_la_base(&src_db.to_string_lossy());
+    tune_core::coffre::copier_la_cle(&dossier, target_root)
+        .map(|_| ())
+        .map_err(|e| format!("tune-secrets.cle : {e}"))
+}
+
 /// Boot guard (docs/DATA-RELOCATION.md) : si la config pointe sous le volume
 /// de données et que celui-ci est absent, on attend — jamais de démarrage
 /// silencieux sur une base vide. Tente un `systemctl start` de l'unité à
@@ -915,6 +933,36 @@ pub async fn wait_for_data_volume(db_path: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Le déplacement emporte la clé du coffre : une valeur scellée avant
+    /// s'ouvre avec la copie. Contre-épreuve : sans la copie, elle ne s'ouvre
+    /// plus.
+    #[test]
+    fn le_deplacement_emporte_la_cle_du_coffre() {
+        let source = tempfile::tempdir().unwrap();
+        let cible = tempfile::tempdir().unwrap();
+        let db = source.path().join("tune.db");
+        let scelle = tune_core::coffre::Coffre::a_cote_de_la_base(&db.to_string_lossy())
+            .sceller(r#"{"access_token":"a"}"#)
+            .unwrap();
+        let racine = cible.path().join("TuneData");
+        assert!(
+            tune_core::coffre::Coffre::new(&racine)
+                .ouvrir(&scelle)
+                .is_err(),
+            "contre-épreuve : sans la clé, rien ne s'ouvre"
+        );
+        emporter_la_cle_du_coffre(&db, &racine).unwrap();
+        assert_eq!(
+            tune_core::coffre::Coffre::new(&racine)
+                .ouvrir(&scelle)
+                .unwrap(),
+            r#"{"access_token":"a"}"#
+        );
+        // Source sans clé : pas une erreur.
+        let vide = tempfile::tempdir().unwrap();
+        emporter_la_cle_du_coffre(&vide.path().join("tune.db"), &cible.path().join("B")).unwrap();
+    }
 
     #[test]
     fn mount_unit_name_escapes_dashes() {

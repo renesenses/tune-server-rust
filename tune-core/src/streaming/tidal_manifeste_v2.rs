@@ -1,6 +1,6 @@
 //! #6334 — la lecture TIDAL par `openapi.tidal.com/v2/trackManifests/{id}`.
 //!
-//! Avec le client de Tune (`fX2JxdmntZWK0ixT`, connexion par code appareil),
+//! Avec le client de Tune (connexion par code appareil),
 //! l'ancien `v1/tracks/{id}/playbackinfopostpaywall` rend `HIGH` (AAC 320)
 //! pour des titres que TIDAL sert en FLAC 16/44,1 (fils 2265, 2381, 2399,
 //! 2408, 2409). D'après EbbLabs/python-tidal#404, la v2 `trackManifests`,
@@ -30,6 +30,9 @@ pub(super) const OPENAPI_BASE: &str = "https://openapi.tidal.com/v2";
 
 /// La valeur de `voie` d'une réponse v2 ramenée à la forme v1.
 pub(super) const VOIE_V2: &str = "trackManifests_v2";
+/// Début de l'erreur d'une réponse v2 qui n'est qu'un extrait (`PREVIEW`).
+pub(super) const PREFIXE_EXTRAIT_V2: &str = "v2 : extrait seulement";
+
 /// La valeur de `voie` d'une réponse de l'ancien point d'accès.
 pub(super) const VOIE_V1: &str = "playbackinfopostpaywall_v1";
 
@@ -74,7 +77,7 @@ pub(super) fn interpreter_manifeste_v2(
         || attributs["previewReason"].as_str().is_some()
     {
         return Err(format!(
-            "v2 : extrait seulement ({})",
+            "{PREFIXE_EXTRAIT_V2} ({})",
             attributs["previewReason"].as_str().unwrap_or("PREVIEW")
         ));
     }

@@ -166,6 +166,7 @@ Copy `tune.toml.example` to `tune.toml` and edit, or use environment variables:
 | `TUNE_INGEST_STAGING` | *(next to artwork cache)* | Where drag-and-dropped files are staged before import |
 | `TUNE_LOG_LEVEL` | info | Log level |
 | `TUNE_SPOTIFY_CLIENT_ID` | *(none)* | Client ID of **your own** Spotify application — Spotify grants no shared one |
+| `TUNE_TIDAL_CLIENT_ID` / `TUNE_TIDAL_CLIENT_SECRET` | *(embedded in published binaries)* | TIDAL client credentials (also `tidal_client_id` / `tidal_client_secret` in `tune.toml`). Needed only for a build from source; without them TIDAL reports « not configured » |
 | `TUNE_SPOTIFY_REDIRECT_URI` | `http://127.0.0.1:<TUNE_PORT>/api/v1/streaming/spotify/callback` | Overrides the derived default; required for a remote install |
 
 ## Architecture
@@ -247,6 +248,29 @@ TUNE_LOG_LEVEL=debug cargo run --package tune-server
 # Benchmarks against a running server
 ./bench.sh localhost:8888
 ```
+
+## Secrets key (`tune-secrets.cle`) — back it up with the database
+
+Streaming-service tokens (`auth_tokens_*`) and personal API keys are sealed in
+the database with a master key, `tune-secrets.cle`, stored **next to**
+`tune.db` (mode 0600). Without it the sealed values no longer open: nothing is
+deleted, but each service shows « session unreadable, reconnect ».
+
+- Back up `tune-secrets.cle` together with the database. Local backups
+  (`backups/`), the appliance data relocation and the macOS/Windows folder
+  migration carry it; a database export or a `.enc` backup does not.
+- ⚠️ The local `backups/` folder holds a copy of the key: a copy of that
+  folder (to a NAS, an external disk, cloud storage) is enough to open the
+  saved sessions. Exclude `tune-secrets.cle*` from off-machine copies (keep
+  the key somewhere safe) or encrypt them.
+- The key must be readable by the account the service runs as (a key created
+  by `root` is unreadable for a `tune` service: `chown`/`chmod 600` it).
+- Several servers on the **same PostgreSQL database**: give them the same
+  `tune-secrets.cle`, otherwise each only reads the sessions it wrote.
+- Downgrading to a version that predates sealed tokens: reconnect the
+  streaming services.
+
+See [docs/DATA-RELOCATION.md](docs/DATA-RELOCATION.md).
 
 ## Spotify — the redirect URI you must declare yourself
 

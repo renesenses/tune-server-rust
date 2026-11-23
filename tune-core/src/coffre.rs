@@ -160,6 +160,19 @@ impl Coffre {
         creer_la_cle_de(&self.chemin)
     }
 
+    /// L'état de la clé maîtresse, sans la créer : pour dire à l'écran
+    /// POURQUOI une valeur scellée ne s'ouvre pas.
+    pub fn etat_de_la_cle(&self) -> EtatDeLaCle {
+        if self.memoire.is_some() {
+            return EtatDeLaCle::Presente;
+        }
+        match lire_la_cle_de(&self.chemin) {
+            Ok(Some(_)) => EtatDeLaCle::Presente,
+            Ok(None) => EtatDeLaCle::Absente,
+            Err(_) => EtatDeLaCle::Illisible,
+        }
+    }
+
     /// Scelle `clair`. Crée la clé maîtresse au premier usage.
     pub fn sceller(&self, clair: &str) -> Result<String, String> {
         let cle = match self.lire_la_cle()? {
@@ -288,6 +301,96 @@ fn dechiffrer(cle: &[u8; 32], scelle: &str) -> Result<String, String> {
 /// y trouvent la clé personnelle sans qu'on leur passe un chemin.
 static DOSSIER_DU_SERVEUR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
+/// L'état du fichier de la clé maîtresse ([`Coffre::etat_de_la_cle`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EtatDeLaCle {
+    /// Le fichier n'existe pas (base déplacée ou restaurée sans lui).
+    Absente,
+    /// Le fichier existe mais ne se lit pas : droits (créé par `root`, service
+    /// lancé sous un autre compte) ou contenu abîmé.
+    Illisible,
+    /// La clé se lit.
+    Presente,
+}
+
+/// Recopie la clé maîtresse de `source` (dossier) vers `cible` (dossier),
+/// droits 0600, même propriétaire que la source quand le processus peut le
+/// poser (service lancé en `root`). Sert à tout geste qui déplace ou
+/// sauvegarde la base : sans la clé, les valeurs scellées ne s'ouvrent plus.
+///
+/// - `Ok(false)` : pas de clé à la source, rien à faire ;
+/// - `Ok(true)` : la cible porte la même clé (copiée, ou déjà là) ;
+/// - `Err` : la cible porte une AUTRE clé (jamais écrasée), ou la copie a
+///   échoué. Le message ne contient jamais la clé.
+pub fn copier_la_cle(source: &Path, cible: &Path) -> Result<bool, String> {
+    let de = source.join(FICHIER_CLE);
+    let vers = cible.join(FICHIER_CLE);
+    let contenu = match std::fs::read(&de) {
+        Ok(c) => c,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(format!("clé maîtresse illisible : {}", e.kind())),
+    };
+    match std::fs::read(&vers) {
+        Ok(deja) if deja == contenu => return Ok(true),
+        Ok(_) => {
+            return Err(format!(
+                "une autre clé maîtresse existe déjà dans {}",
+                cible.display()
+            ));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "clé maîtresse de la cible illisible : {}",
+                e.kind()
+            ));
+        }
+    }
+    std::fs::create_dir_all(cible).map_err(|e| e.to_string())?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let ecrire = || -> std::io::Result<()> {
+        let mut f = options.open(&vers)?;
+        f.write_all(&contenu)?;
+        f.sync_all()
+    };
+    if let Err(e) = ecrire() {
+        let _ = std::fs::remove_file(&vers);
+        return Err(format!("copie de la clé maîtresse : {e}"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if let Ok(m) = std::fs::metadata(&de) {
+            // Seul `root` peut donner le fichier à un autre compte ; sinon il
+            // appartient déjà au compte du service, qui est celui qui copie.
+            let _ = std::os::unix::fs::chown(&vers, Some(m.uid()), Some(m.gid()));
+        }
+    }
+    Ok(true)
+}
+
+/// Vrai si `valeur` a la forme d'une valeur scellée par [`Coffre::sceller`]
+/// (`{"v":…,"nonce":…,"ct":…}`), qu'elle s'ouvre ou non avec la clé en place.
+/// Sert à distinguer une ligne déjà scellée d'une ligne écrite en clair par
+/// une version antérieure.
+pub fn est_scelle(valeur: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(valeur.trim())
+        .ok()
+        .and_then(|v| v.as_object().cloned())
+        .is_some_and(|o| {
+            o.len() == 3
+                && o.get("v").is_some_and(serde_json::Value::is_u64)
+                && o.get("nonce").is_some_and(serde_json::Value::is_string)
+                && o.get("ct").is_some_and(serde_json::Value::is_string)
+        })
+}
+
 /// Le dossier qui porte la base `db_path` (« . » pour un chemin nu).
 pub fn dossier_de_la_base(db_path: &str) -> PathBuf {
     Path::new(db_path)
@@ -317,6 +420,64 @@ pub fn fin_de_cle(cle: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copier_la_cle_emporte_la_cle_en_0600_sans_jamais_ecraser() {
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        let cible = b.path().join("sous-dossier");
+        // Rien à la source : rien à faire.
+        assert_eq!(copier_la_cle(a.path(), &cible), Ok(false));
+        let scelle = Coffre::new(a.path()).sceller("jeton").unwrap();
+        assert_eq!(copier_la_cle(a.path(), &cible), Ok(true));
+        // La valeur scellée s'ouvre avec la copie.
+        assert_eq!(Coffre::new(&cible).ouvrir(&scelle).unwrap(), "jeton");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(cible.join(FICHIER_CLE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // Même clé : rien à faire ; autre clé : refus, la cible est intacte.
+        assert_eq!(copier_la_cle(a.path(), &cible), Ok(true));
+        let c = tempfile::tempdir().unwrap();
+        Coffre::new(c.path()).sceller("x").unwrap();
+        let avant = std::fs::read(c.path().join(FICHIER_CLE)).unwrap();
+        assert!(copier_la_cle(a.path(), c.path()).is_err());
+        assert_eq!(std::fs::read(c.path().join(FICHIER_CLE)).unwrap(), avant);
+    }
+
+    #[test]
+    fn etat_de_la_cle_absente_illisible_presente() {
+        let a = tempfile::tempdir().unwrap();
+        let coffre = Coffre::new(a.path());
+        assert_eq!(coffre.etat_de_la_cle(), EtatDeLaCle::Absente);
+        coffre.sceller("x").unwrap();
+        assert_eq!(coffre.etat_de_la_cle(), EtatDeLaCle::Presente);
+        std::fs::write(a.path().join(FICHIER_CLE), "pas-de-l-hexa").unwrap();
+        assert_eq!(coffre.etat_de_la_cle(), EtatDeLaCle::Illisible);
+    }
+
+    #[test]
+    fn est_scelle_reconnait_la_forme_scellee_et_elle_seule() {
+        let dir = tempfile::tempdir().unwrap();
+        let coffre = Coffre::new(dir.path());
+        assert!(est_scelle(
+            &coffre.sceller(r#"{"access_token":"a"}"#).unwrap()
+        ));
+        for clair in [
+            r#"{"access_token":"a","refresh_token":"r"}"#,
+            r#"{"v":1,"nonce":"00"}"#,
+            r#"{"v":1,"nonce":"00","ct":"00","autre":1}"#,
+            "jeton-brut",
+            "",
+        ] {
+            assert!(!est_scelle(clair), "{clair}");
+        }
+    }
 
     #[test]
     fn sceller_puis_ouvrir_rend_la_cle_et_le_scelle_ne_la_contient_pas() {
