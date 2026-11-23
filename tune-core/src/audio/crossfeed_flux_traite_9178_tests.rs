@@ -215,5 +215,9 @@ fn le_texte_de_non_local_output_reste_neutre_t12c() {
     for interdit in ["hors TESS", "HQPlayer", "AirPlay", "DLNA", "toujours"] {
         assert!(!d.contains(interdit), "{interdit} : {d}");
     }
-    assert!(CrossfeedConstraint::OutsideTess.detail().contains("hors TESS"));
+    assert!(
+        CrossfeedConstraint::OutsideTess
+            .detail()
+            .contains("hors TESS")
+    );
 }

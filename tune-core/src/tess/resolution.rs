@@ -44,8 +44,10 @@ const GREFFONS_QUI_FORCENT_LE_FLUX: [&str; 5] = [
 /// TESS T12c — les greffons que le flux traité de Tune n'exécute pas (le
 /// relais ne porte ni le repli mono ni la réaffectation des canaux) : ils
 /// restent hors TESS sur ces sorties, même quand le flux est traité.
-const GREFFONS_HORS_DU_FLUX_TRAITE: [&str; 2] =
-    [super::migration::ID_MONO, super::migration::ID_REAFFECTATION];
+const GREFFONS_HORS_DU_FLUX_TRAITE: [&str; 2] = [
+    super::migration::ID_MONO,
+    super::migration::ID_REAFFECTATION,
+];
 
 /// Code stable d'une étape du chemin du signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -451,11 +453,11 @@ impl ChaineTess {
         if traitements_de_zone_conserves {
             let flux_force = ctx.replaygain_actif
                 || greffons.iter().any(|e| {
-                e.effective
-                    && e.plugin_id
-                        .as_deref()
-                        .is_some_and(|id| GREFFONS_QUI_FORCENT_LE_FLUX.contains(&id))
-            });
+                    e.effective
+                        && e.plugin_id
+                            .as_deref()
+                            .is_some_and(|id| GREFFONS_QUI_FORCENT_LE_FLUX.contains(&id))
+                });
             for e in greffons.iter_mut().filter(|e| e.requested) {
                 let hors_du_flux = e
                     .plugin_id
@@ -889,7 +891,10 @@ mod tests {
             let mut x = ctx(transport);
             x.replaygain_actif = true;
             let cf = greffon(&resoudre(&c, &x), "crossfeed").clone();
-            assert!(cf.effective, "{transport:?} : ReplayGain actif → crossfeed appliqué");
+            assert!(
+                cf.effective,
+                "{transport:?} : ReplayGain actif → crossfeed appliqué"
+            );
             let cf = greffon(&resoudre(&c, &ctx(transport)), "crossfeed").clone();
             assert!(!cf.effective, "{transport:?}");
             assert_eq!(cf.reason, Some(MotifEtape::OutsideTess));
