@@ -104,10 +104,10 @@
     "pl": "Crossfeed do słuchawek: siła, opóźnienie i cień głowy, stosowane na żywo; wyjście lokalne, a w sieci z innym przetwarzaniem lub odtwarzaczem przyjmującym PCM",
     "el": "Crossfeed ακουστικών: ένταση, καθυστέρηση και σκιά κεφαλιού, με άμεση εφαρμογή· τοπική έξοδος, και σε δίκτυο με άλλη επεξεργασία ή συσκευή αναπαραγωγής που δέχεται PCM",
     "tr": "Kulaklık crossfeed: yoğunluk, gecikme ve baş gölgesi, anında uygulanır; yerel çıkış, ağda ise başka bir işlemle veya PCM kabul eden bir oynatıcıyla",
-    "nl": "Crossfeed voor koptelefoon: intensiteit, vertraging en hoofdschaduw, live toegepast",
-    "zh-Hant": "耳機交叉饋送（crossfeed）：強度、延遲與頭部遮蔽效應，即時套用",
-    "ru": "Кроссфид для наушников: интенсивность, задержка и акустическая тень головы, применяется на лету",
-    "uk": "Кросфід для навушників: інтенсивність, затримка й тінь голови, застосовуються на льоту"
+    "nl": "Crossfeed voor koptelefoon: intensiteit, vertraging en hoofdschaduw, live toegepast; lokale uitvoer, en via het netwerk met een andere verwerkingsstap of een speler die PCM accepteert",
+    "zh-Hant": "耳機交叉饋送（crossfeed）：強度、延遲與頭部遮蔽效應，即時套用；本機輸出，以及在網路上搭配其他處理階段或可接受 PCM 的播放器",
+    "ru": "Кроссфид для наушников: интенсивность, задержка и акустическая тень головы, применяется на лету; локальный выход, а также сеть — с другой ступенью обработки или плеером, принимающим PCM",
+    "uk": "Кросфід для навушників: інтенсивність, затримка й тінь голови, застосовуються на льоту; локальний вихід, а також мережа — з іншим етапом обробки або програвачем, що приймає PCM"
   },
   "plugin.description.converter": {
     "fr": "Convertisseur audio : codecs de l'hôte, métadonnées et exports",
@@ -148,10 +148,10 @@
     "pl": "Przemapowanie kanałów: macierz dB dla strefy i albumu (4.0, 5.1…), tylko wyjście lokalne",
     "el": "Αναδρομολόγηση καναλιών: πίνακας dB ανά ζώνη και ανά άλμπουμ (4.0, 5.1…), μόνο τοπική έξοδος",
     "tr": "Kanal yeniden eşleme: bölge ve albüm başına dB matrisi (4.0, 5.1…), yalnızca yerel çıkış",
-    "nl": "Kanaaltoewijzing: dB-matrix per zone en per album (4.0, 5.1…)",
-    "zh-Hant": "聲道重新配置：依區域及依專輯設定的 dB 矩陣（4.0、5.1…）",
-    "ru": "Переназначение каналов: матрица в dB для зоны и для альбома (4.0, 5.1…)",
-    "uk": "Перепризначення каналів: матриця в dB для кожної зони й кожного альбому (4.0, 5.1…)"
+    "nl": "Kanaaltoewijzing: dB-matrix per zone en per album (4.0, 5.1…), alleen lokale uitvoer",
+    "zh-Hant": "聲道重新配置：依區域及依專輯設定的 dB 矩陣（4.0、5.1…），僅限本機輸出",
+    "ru": "Переназначение каналов: матрица в dB для зоны и для альбома (4.0, 5.1…), только локальный выход",
+    "uk": "Перепризначення каналів: матриця в dB для кожної зони й кожного альбому (4.0, 5.1…), лише локальний вихід"
   },
   "plugin.description.upsampler": {
     "fr": "Suréchantillonnage : filtres polyphases vers la plus haute cadence du DAC, sortie locale",
@@ -171,7 +171,7 @@
     "el": "Υπερδειγματοληψία: πολυφασικά φίλτρα έως την υψηλότερη συχνότητα του DAC, τοπική έξοδος",
     "tr": "Upsampling: DAC'ın en yüksek hızına çok fazlı filtreler, yerel çıkış",
     "nl": "Upsampling: polyfasefilters naar de hoogste samplefrequentie van de DAC, lokale uitvoer",
-    "zh-Hant": "升頻：多相濾波器，升至 DAC 支援的最高取樣率，限本機輸出",
+    "zh-Hant": "升頻：多相濾波器，升至 DAC 支援的最高取樣率，本機輸出",
     "ru": "Передискретизация: полифазные фильтры до максимальной частоты ЦАП, локальный выход",
     "uk": "Передискретизація: поліфазні фільтри до найвищої частоти ЦАП, локальний вихід"
   },
