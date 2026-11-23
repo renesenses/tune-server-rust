@@ -32,23 +32,47 @@ pub struct JwtClaims {
     pub exp: u64,
     /// Role: "admin" or "user"
     pub role: String,
+    /// Session longue (« rester connecté ») : l'identifiant de son
+    /// inscription côté serveur. Absent des jetons ordinaires.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
 // JWT helpers
 // ---------------------------------------------------------------------------
 
+/// Durée d'une session ordinaire : 24 h.
+pub const DUREE_SESSION: u64 = 86400;
+/// Durée d'une session « rester connecté » (`"remember": true`) : 30 jours.
+pub const DUREE_SESSION_LONGUE: u64 = 30 * 86400;
+
 pub fn sign_jwt(user_id: i64, role: &str, secret: &str) -> Result<String, String> {
-    let now = std::time::SystemTime::now()
+    signer_session(user_id, role, secret, DUREE_SESSION, None)
+}
+
+fn maintenant_unix() -> u64 {
+    std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
-        .as_secs();
+        .as_secs()
+}
+
+fn signer_session(
+    user_id: i64,
+    role: &str,
+    secret: &str,
+    duree: u64,
+    sid: Option<&str>,
+) -> Result<String, String> {
+    let now = maintenant_unix();
 
     let claims = JwtClaims {
         sub: user_id.to_string(),
         iat: now,
-        exp: now + 86400, // 24h
+        exp: now + duree,
         role: role.to_string(),
+        sid: sid.map(str::to_string),
     };
 
     jsonwebtoken::encode(
@@ -70,6 +94,7 @@ fn sign_jwt_long_lived(name: &str, secret: &str) -> Result<String, String> {
         iat: now,
         exp: now + 365 * 86400,
         role: "api-token".to_string(),
+        sid: None,
     };
 
     jsonwebtoken::encode(
@@ -88,6 +113,125 @@ pub fn verify_jwt(token: &str, secret: &str) -> Result<JwtClaims, String> {
     )
     .map(|data| data.claims)
     .map_err(|e| format!("jwt verify error: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// Sessions longues (« rester connecté ») — inscrites, listées, révocables
+// ---------------------------------------------------------------------------
+//
+// Une session longue est inscrite dans `settings` sous
+// `auth_session_token:{sid}`. Le jeton porte ce `sid` ; il ne vaut que tant
+// que l'inscription existe, que le compte existe encore, que son mot de passe
+// n'a pas changé et, pour un jeton admin, que le compte est toujours admin.
+// Le préfixe `auth_` range ces clés parmi les réglages protégés, et le
+// fragment `token` les tient hors des exports de configuration.
+
+/// Préfixe des inscriptions de sessions longues dans `settings`.
+pub const PREFIXE_SESSION_LONGUE: &str = "auth_session_token:";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SessionLongue {
+    user_id: i64,
+    username: String,
+    role: String,
+    created_at: u64,
+    expires_at: u64,
+    #[serde(default)]
+    client: String,
+    #[serde(default)]
+    relais: bool,
+    /// Empreinte du mot de passe au moment de la connexion.
+    empreinte: String,
+}
+
+/// État du compte qui conditionne une session longue : admin ou non, et
+/// l'empreinte de son mot de passe enregistré.
+fn etat_du_compte(
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    user_id: i64,
+) -> Option<(bool, String)> {
+    use tune_core::db::backend::ToSqlValue;
+    let r = backend
+        .query_one(
+            "SELECT is_admin, password_hash_v2, password_hash FROM profiles WHERE id = ?",
+            &[&user_id as &dyn ToSqlValue],
+        )
+        .ok()
+        .flatten()?;
+    let is_admin = r.first().and_then(|v| v.as_bool()).unwrap_or(false);
+    let v2 = r.get(1).and_then(|v| v.as_string()).unwrap_or_default();
+    let ancien = r.get(2).and_then(|v| v.as_string()).unwrap_or_default();
+    let empreinte = format!("{:x}", Sha256::digest(format!("{v2}\n{ancien}").as_bytes()));
+    Some((is_admin, empreinte[..32].to_string()))
+}
+
+fn inscrire_session_longue(
+    settings: &SettingsRepo,
+    sid: &str,
+    session: &SessionLongue,
+) -> Result<(), String> {
+    let valeur = serde_json::to_string(session).map_err(|e| e.to_string())?;
+    settings.set(&format!("{PREFIXE_SESSION_LONGUE}{sid}"), &valeur)
+}
+
+/// Les sessions longues inscrites ; les expirées sont effacées au passage.
+fn sessions_longues(settings: &SettingsRepo) -> Vec<(String, SessionLongue)> {
+    let now = maintenant_unix();
+    let mut vivantes = Vec::new();
+    for (cle, valeur) in settings
+        .par_prefixe(PREFIXE_SESSION_LONGUE)
+        .unwrap_or_default()
+    {
+        let Some(sid) = cle.strip_prefix(PREFIXE_SESSION_LONGUE) else {
+            continue;
+        };
+        match serde_json::from_str::<SessionLongue>(&valeur) {
+            Ok(s) if s.expires_at > now => vivantes.push((sid.to_string(), s)),
+            _ => {
+                settings.delete(&cle).ok();
+            }
+        }
+    }
+    vivantes
+}
+
+fn effacer_sessions_longues(settings: &SettingsRepo) {
+    for (cle, _) in settings
+        .par_prefixe(PREFIXE_SESSION_LONGUE)
+        .unwrap_or_default()
+    {
+        settings.delete(&cle).ok();
+    }
+}
+
+/// Vérifie un jeton de session : signature et échéance, puis, pour une
+/// session longue, son inscription et l'état du compte.
+pub fn verifier_jeton(
+    token: &str,
+    secret: &str,
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+) -> Result<JwtClaims, String> {
+    let claims = verify_jwt(token, secret)?;
+    let Some(sid) = claims.sid.as_deref() else {
+        return Ok(claims);
+    };
+    let settings = SettingsRepo::with_backend(backend.clone());
+    let session = settings
+        .get(&format!("{PREFIXE_SESSION_LONGUE}{sid}"))
+        .ok()
+        .flatten()
+        .and_then(|v| serde_json::from_str::<SessionLongue>(&v).ok())
+        .ok_or_else(|| "session revoked".to_string())?;
+    let user_id = claims.sub.parse::<i64>().unwrap_or(-1);
+    if session.user_id != user_id || session.role != claims.role {
+        return Err("session revoked".to_string());
+    }
+    let (is_admin, empreinte) =
+        etat_du_compte(backend, user_id).ok_or_else(|| "session revoked".to_string())?;
+    if empreinte != session.empreinte || (claims.role == "admin" && !is_admin) {
+        return Err("session revoked".to_string());
+    }
+    Ok(claims)
 }
 
 // ---------------------------------------------------------------------------
@@ -297,7 +441,7 @@ pub async fn auth_middleware(
                 Some(s) if !s.is_empty() => s,
                 _ => return (StatusCode::UNAUTHORIZED, "no jwt secret configured").into_response(),
             };
-            match verify_jwt(&tok, &secret) {
+            match verifier_jeton(&tok, &secret, &state.backend) {
                 Ok(claims) => {
                     let user_id = claims.sub.parse::<i64>().unwrap_or(0);
                     request.extensions_mut().insert(AuthUser {
@@ -502,7 +646,7 @@ pub fn ws_authorized(
                 return true;
             }
         } else if let Some(secret) = &jwt_secret
-            && verify_jwt(&tok, secret).is_ok()
+            && verifier_jeton(&tok, secret, &state.backend).is_ok()
         {
             return true;
         }
@@ -511,7 +655,7 @@ pub fn ws_authorized(
     // Query-param JWT (browser WebSocket can't set an Authorization header).
     if let (Some(tok), Some(secret)) = (query_token, &jwt_secret)
         && !tok.is_empty()
-        && verify_jwt(tok, secret).is_ok()
+        && verifier_jeton(tok, secret, &state.backend).is_ok()
     {
         return true;
     }
@@ -565,7 +709,7 @@ impl FromRequestParts<AppState> for AuthUser {
             ));
         }
 
-        let claims = verify_jwt(&token, &secret).map_err(|_| {
+        let claims = verifier_jeton(&token, &secret, &state.backend).map_err(|_| {
             (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({"error": "invalid or expired token"})),
@@ -1007,6 +1151,8 @@ pub fn router() -> Router<AppState> {
         .route("/logout", post(logout))
         .route("/me", get(me))
         .route("/token", post(create_token))
+        .route("/sessions", get(lister_sessions))
+        .route("/sessions/{id}", axum::routing::delete(revoquer_session))
         .route("/api-key", get(get_api_key).post(generate_api_key))
         .route("/config", get(auth_config).post(set_auth_config))
         .route(
@@ -1174,6 +1320,10 @@ async fn register(
 struct LoginRequest {
     username: String,
     password: String,
+    /// « Rester connecté » : session de 30 jours, inscrite et révocable.
+    /// Absent ou `false` : session ordinaire de 24 h.
+    #[serde(default)]
+    remember: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -1235,12 +1385,16 @@ fn clear_login_failures(ip: std::net::IpAddr) {
 /// the cookie still works on a plain-HTTP LAN deployment while getting the
 /// `Secure` flag wherever TLS is actually in play.
 fn session_cookie(token: &str, headers: &axum::http::HeaderMap) -> String {
+    session_cookie_pour(token, headers, DUREE_SESSION)
+}
+
+fn session_cookie_pour(token: &str, headers: &axum::http::HeaderMap, duree: u64) -> String {
     let https = headers
         .get("x-forwarded-proto")
         .and_then(|v| v.to_str().ok())
         .map(|v| v.eq_ignore_ascii_case("https"))
         .unwrap_or(false);
-    let base = format!("tune_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age=86400");
+    let base = format!("tune_session={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={duree}");
     if https {
         format!("{base}; Secure")
     } else {
@@ -1376,7 +1530,48 @@ async fn login(
 
     let role = if is_admin { "admin" } else { "user" };
     let secret = get_or_create_jwt_secret(&settings);
-    let token = match sign_jwt(profile_id, role, &secret) {
+    let duree = if body.remember {
+        DUREE_SESSION_LONGUE
+    } else {
+        DUREE_SESSION
+    };
+    let sid = if body.remember {
+        let sid = uuid::Uuid::new_v4().simple().to_string();
+        let empreinte = etat_du_compte(&state.backend, profile_id)
+            .map(|(_, e)| e)
+            .unwrap_or_default();
+        let now = maintenant_unix();
+        let client: String = headers
+            .get(axum::http::header::USER_AGENT)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .chars()
+            .take(120)
+            .collect();
+        let session = SessionLongue {
+            user_id: profile_id,
+            username: body.username.clone(),
+            role: role.to_string(),
+            created_at: now,
+            expires_at: now + DUREE_SESSION_LONGUE,
+            client,
+            relais: crate::garde_du_relais::requete_relayee(&headers),
+            empreinte,
+        };
+        // Les expirées partent au passage.
+        let _ = sessions_longues(&settings);
+        if let Err(e) = inscrire_session_longue(&settings, &sid, &session) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("session registration failed: {e}")})),
+            )
+                .into_response();
+        }
+        Some(sid)
+    } else {
+        None
+    };
+    let token = match signer_session(profile_id, role, &secret, duree, sid.as_deref()) {
         Ok(t) => t,
         Err(e) => {
             return (
@@ -1387,12 +1582,12 @@ async fn login(
         }
     };
 
-    let cookie = session_cookie(&token, &headers);
+    let cookie = session_cookie_pour(&token, &headers, duree);
 
     let mut response = Json(json!({
         "token": token,
         "token_type": "Bearer",
-        "expires_in": 86400,
+        "expires_in": duree,
         "username": body.username,
         "user_id": profile_id,
         "role": role,
@@ -1484,6 +1679,57 @@ async fn create_token(
         .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
     }
+}
+
+// ---------------------------------------------------------------------------
+// GET /auth/sessions, DELETE /auth/sessions/{id} — sessions longues (admin)
+// ---------------------------------------------------------------------------
+
+async fn lister_sessions(State(state): State<AppState>, user: Option<AuthUser>) -> Response {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    if let Err(resp) = ensure_admin_if_auth_enabled(&settings, user.as_ref()) {
+        return resp;
+    }
+    let sessions: Vec<Value> = sessions_longues(&settings)
+        .into_iter()
+        .map(|(sid, s)| {
+            json!({
+                "id": sid,
+                "user_id": s.user_id,
+                "username": s.username,
+                "role": s.role,
+                "created_at": s.created_at,
+                "expires_at": s.expires_at,
+                "client": s.client,
+                "relayed": s.relais,
+            })
+        })
+        .collect();
+    Json(json!({ "sessions": sessions })).into_response()
+}
+
+async fn revoquer_session(
+    State(state): State<AppState>,
+    user: Option<AuthUser>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+) -> Response {
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    if let Err(resp) = ensure_admin_if_auth_enabled(&settings, user.as_ref()) {
+        return resp;
+    }
+    let cle = format!("{PREFIXE_SESSION_LONGUE}{id}");
+    if id.is_empty() || settings.get(&cle).ok().flatten().is_none() {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "session not found"})),
+        )
+            .into_response();
+    }
+    if let Err(e) = settings.delete(&cle) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response();
+    }
+    tracing::info!(session = %id, "session_longue_revoquee");
+    Json(json!({ "revoked": id })).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -1834,6 +2080,7 @@ fn renouveler_les_secrets(settings: &SettingsRepo) {
         .set("jwt_secret", &uuid::Uuid::new_v4().to_string())
         .ok();
     settings.delete("api_key").ok();
+    effacer_sessions_longues(settings);
     for cle in [
         "mozaik_pkce_pending",
         "mozaik_pkce_pending_at",
