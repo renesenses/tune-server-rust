@@ -169,6 +169,52 @@ async fn reseau_local_sans_authentification_la_liaison_passe() {
     );
 }
 
+/// 1 ter. Un retour au `state` faux n'annule pas la liaison en cours :
+/// l'attente PKCE n'est consommée qu'après un `state` exact.
+#[tokio::test]
+async fn un_state_faux_n_annule_pas_la_liaison_en_cours() {
+    let b = banc();
+    let depuis = "192.168.1.50:52000";
+    let hote = [("host", "192.168.1.10:8888")];
+    let (statut, page) = get(&b.state, depuis, AUTORISER, &hote).await;
+    assert_eq!(statut, StatusCode::TEMPORARY_REDIRECT, "{page}");
+    let attente = attente_du_serveur(&b.state);
+    let etat = json_de(&attente)["state"].as_str().unwrap().to_string();
+
+    let (statut, page) = get(
+        &b.state,
+        depuis,
+        "/api/v1/cloud/sso/callback?code=c&state=faux",
+        &hote,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::BAD_REQUEST, "state faux — {page}");
+    assert_eq!(
+        attente_du_serveur(&b.state),
+        attente,
+        "un state faux ne consomme pas l'attente"
+    );
+    assert!(
+        reglages(&b.state)
+            .get("mozaik_pkce_pending_at")
+            .unwrap()
+            .is_some(),
+        "la date de l'attente reste"
+    );
+
+    // Le bon `state` passe le contrôle (l'échange échoue ensuite, aucun
+    // réseau) et consomme l'attente, à usage unique.
+    let (statut, page) = get(
+        &b.state,
+        depuis,
+        &format!("/api/v1/cloud/sso/callback?code=c&state={etat}"),
+        &hote,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::BAD_GATEWAY, "bon state — {page}");
+    assert!(attente_du_serveur(&b.state).is_empty(), "attente consommée");
+}
+
 /// 1 bis. Le statut montre le compte relié au réseau local : le menu du compte
 /// (nom, courriel, photo de profil) n'est plus « relié, sans détails ».
 #[tokio::test]

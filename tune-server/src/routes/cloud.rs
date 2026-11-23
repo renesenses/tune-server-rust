@@ -368,6 +368,53 @@ async fn sso_authorize(
 /// par mozaiklabs.fr prend quelques secondes ; au-delà, on recommence.
 const PKCE_EN_ATTENTE_MAX: u64 = 10 * 60;
 
+/// Pourquoi le retour de mozaiklabs.fr n'a pas d'attente PKCE à finir.
+enum AttentePkce {
+    /// Aucune attente valable (absente, illisible, sans date ou expirée).
+    Absente,
+    /// Une attente valable existe, mais le `state` reçu n'est pas le sien.
+    EtatDifferent,
+}
+
+/// Lit l'attente PKCE `cle_pkce` et ne la CONSOMME (usage unique) que si le
+/// `state` reçu est exactement le sien. Un `state` faux la laisse en place :
+/// un retour forgé ne doit pas annuler une liaison en cours. Une attente
+/// périmée ou illisible est effacée, elle ne servira plus.
+fn prendre_l_attente_pkce(
+    settings: &SettingsRepo,
+    cle_pkce: &str,
+    state_recu: Option<&str>,
+) -> Result<PkceSession, AttentePkce> {
+    let cle_date = format!("{cle_pkce}_at");
+    let emise = settings
+        .get(&cle_date)
+        .ok()
+        .flatten()
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    let pending: Option<PkceSession> = settings
+        .get(cle_pkce)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        // Sans date, ou plus vieille que dix minutes : plus valable.
+        .filter(|_| {
+            emise.is_some_and(|t| maintenant_unix().saturating_sub(t) <= PKCE_EN_ATTENTE_MAX)
+        });
+    let consommer = || {
+        settings.set(cle_pkce, "").ok();
+        settings.delete(&cle_date).ok();
+    };
+    let Some(pkce) = pending else {
+        consommer();
+        return Err(AttentePkce::Absente);
+    };
+    if state_recu != Some(pkce.state.as_str()) {
+        return Err(AttentePkce::EtatDifferent);
+    }
+    consommer();
+    Ok(pkce)
+}
+
 fn maintenant_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -427,39 +474,27 @@ async fn sso_callback(
     };
 
     // Load & validate the pending PKCE session (CSRF: state must match), then
-    // consume it — one-shot, cleared regardless of the exchange outcome.
-    let emise = settings
-        .get("mozaik_pkce_pending_at")
-        .ok()
-        .flatten()
-        .and_then(|s| s.trim().parse::<u64>().ok());
-    let pending: Option<PkceSession> = settings
-        .get("mozaik_pkce_pending")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        // Sans date, ou plus vieille que dix minutes : plus valable.
-        .filter(|_| {
-            emise.is_some_and(|t| maintenant_unix().saturating_sub(t) <= PKCE_EN_ATTENTE_MAX)
-        });
-    settings.set("mozaik_pkce_pending", "").ok();
-    settings.delete("mozaik_pkce_pending_at").ok();
-
-    let Some(pkce) = pending else {
-        return page_echec_compte(
-            &headers,
-            StatusCode::BAD_REQUEST,
-            "no pending SSO session (restart login)",
-        );
+    // consume it — one-shot, cleared regardless of the exchange outcome. A
+    // wrong `state` leaves it in place: it must not cancel a pending link.
+    let (cle_pkce, _) = cles_d_attente(Liaison::Serveur);
+    let pkce = match prendre_l_attente_pkce(&settings, &cle_pkce, q.state.as_deref()) {
+        Ok(pkce) => pkce,
+        Err(AttentePkce::Absente) => {
+            return page_echec_compte(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                "no pending SSO session (restart login)",
+            );
+        }
+        Err(AttentePkce::EtatDifferent) => {
+            warn!("sso_state_mismatch");
+            return page_echec_compte(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                "state mismatch (possible CSRF)",
+            );
+        }
     };
-    if q.state.as_deref() != Some(pkce.state.as_str()) {
-        warn!("sso_state_mismatch");
-        return page_echec_compte(
-            &headers,
-            StatusCode::BAD_REQUEST,
-            "state mismatch (possible CSRF)",
-        );
-    }
 
     // Reuse the exact redirect_uri minted at authorize time (must match); fall
     // back to deriving it from this request's Host if the pending value is gone.
@@ -777,38 +812,24 @@ async fn sso_callback_profil(
         );
     };
     let (cle_pkce, cle_uri) = cles_d_attente(Liaison::Profil(profil));
-    let cle_date = format!("{cle_pkce}_at");
-    let emise = settings
-        .get(&cle_date)
-        .ok()
-        .flatten()
-        .and_then(|s| s.trim().parse::<u64>().ok());
-    let pending: Option<PkceSession> = settings
-        .get(&cle_pkce)
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        // Sans date, ou plus vieille que dix minutes : plus valable.
-        .filter(|_| {
-            emise.is_some_and(|t| maintenant_unix().saturating_sub(t) <= PKCE_EN_ATTENTE_MAX)
-        });
-    settings.set(&cle_pkce, "").ok();
-    settings.delete(&cle_date).ok();
-    let Some(pkce) = pending else {
-        return page_echec_compte(
-            headers,
-            StatusCode::BAD_REQUEST,
-            "no pending SSO session (restart login)",
-        );
+    let pkce = match prendre_l_attente_pkce(&settings, &cle_pkce, q.state.as_deref()) {
+        Ok(pkce) => pkce,
+        Err(AttentePkce::Absente) => {
+            return page_echec_compte(
+                headers,
+                StatusCode::BAD_REQUEST,
+                "no pending SSO session (restart login)",
+            );
+        }
+        Err(AttentePkce::EtatDifferent) => {
+            warn!(profil, "sso_state_mismatch_profil");
+            return page_echec_compte(
+                headers,
+                StatusCode::BAD_REQUEST,
+                "state mismatch (possible CSRF)",
+            );
+        }
     };
-    if q.state.as_deref() != Some(pkce.state.as_str()) {
-        warn!(profil, "sso_state_mismatch_profil");
-        return page_echec_compte(
-            headers,
-            StatusCode::BAD_REQUEST,
-            "state mismatch (possible CSRF)",
-        );
-    }
     let uri = settings
         .get(&cle_uri)
         .ok()
