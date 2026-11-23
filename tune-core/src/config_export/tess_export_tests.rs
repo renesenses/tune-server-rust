@@ -273,8 +273,11 @@ fn les_prereglages_et_le_prereglage_actif_suivent_l_export_t17() {
     let (src, id) = depart();
     let s = SettingsRepo::with_backend(src.clone());
     crate::tess::prereglages::ecrire(&s, &liste_soiree()).unwrap();
-    s.set(&format!("zone_{id}_tess_active_preset"), "evening-listening")
-        .unwrap();
+    s.set(
+        &format!("zone_{id}_tess_active_preset"),
+        "evening-listening",
+    )
+    .unwrap();
     let fichier = exporter(&src, false).unwrap();
     assert!(fichier["settings"]["tess_presets"].is_object(), "{fichier}");
 
@@ -294,7 +297,9 @@ fn les_prereglages_et_le_prereglage_actif_suivent_l_export_t17() {
         .expect("zone créée à l'import");
     assert_ne!(arrivee, id);
     assert_eq!(
-        d.get(&format!("zone_{arrivee}_tess_active_preset")).unwrap().as_deref(),
+        d.get(&format!("zone_{arrivee}_tess_active_preset"))
+            .unwrap()
+            .as_deref(),
         Some("evening-listening")
     );
     assert!(

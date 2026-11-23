@@ -422,7 +422,10 @@ mod tests {
         };
         assert!(!l.apply_mode.immediat());
         ecrire(&s, &l).unwrap();
-        assert_eq!(lire(&s).unwrap().apply_mode, ModeApplication::AtNextPlayback);
+        assert_eq!(
+            lire(&s).unwrap().apply_mode,
+            ModeApplication::AtNextPlayback
+        );
     }
 
     #[test]
@@ -439,7 +442,10 @@ mod tests {
         assert_eq!(id_pour_nom("Pure", &l), "pure-2");
         let long = "x".repeat(200);
         let id = id_pour_nom(&long, &l);
-        assert!(crate::tess::greffon::id_valide(&id) && id.len() <= 64, "{id}");
+        assert!(
+            crate::tess::greffon::id_valide(&id) && id.len() <= 64,
+            "{id}"
+        );
         // Chaque identifiant produit passe la règle des préréglages.
         for nom in ["--a--", "A b", "Ünïcödé", "9", "évier---"] {
             let id = id_pour_nom(nom, &l);

@@ -35,12 +35,12 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+use axum::body::Bytes;
+use axum::response::Response;
 use tune_core::tess::chaine::{ChaineTess, ErreurChaine};
 use tune_core::tess::migration::{
     CHAMP_ORIGINE, ErreurMigration, MARQUE_MONO_INERTE, MARQUE_REMPLACE, lire_zone,
 };
-use axum::body::Bytes;
-use axum::response::Response;
 use tune_core::tess::prereglages::{self, ModeApplication, PreReglage};
 use tune_core::tess::resolution::MotifEtape;
 
@@ -409,7 +409,11 @@ pub async fn appliquer_prereglage(
 
 /// Après un `PUT` à la main : la zone ne marque plus « ACTIVE » un préréglage
 /// qui ne décrit plus sa chaîne (comparées sans les champs du serveur).
-pub(super) fn oublier_le_prereglage_s_il_differe(state: &AppState, zone_id: i64, chaine: &ChaineTess) {
+pub(super) fn oublier_le_prereglage_s_il_differe(
+    state: &AppState,
+    zone_id: i64,
+    chaine: &ChaineTess,
+) {
     let settings = settings_de(state);
     let cle = cle_prereglage_actif(zone_id);
     let Some(actif) = settings.get(&cle).ok().flatten().filter(|a| !a.is_empty()) else {

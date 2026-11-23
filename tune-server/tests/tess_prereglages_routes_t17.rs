@@ -50,10 +50,16 @@ impl Banc {
         state.license.set_account_premium(premium, None).await;
         let repo = ZoneRepo::with_backend(state.backend.clone());
         for i in 0..avant {
-            repo.create(&format!("Avant {i}"), Some("local"), Some(&format!("local:avant-{i}")))
-                .unwrap();
+            repo.create(
+                &format!("Avant {i}"),
+                Some("local"),
+                Some(&format!("local:avant-{i}")),
+            )
+            .unwrap();
         }
-        let zone = repo.create("Zone", Some(output_type), Some(device)).unwrap();
+        let zone = repo
+            .create("Zone", Some(output_type), Some(device))
+            .unwrap();
         repo.update_volume(zone, 100.0).unwrap();
         let app = tune_server::routes::router(state.clone());
         Self { state, app, zone }
@@ -175,8 +181,10 @@ async fn la_liste_part_de_pure_et_du_mode_immediat_t17() {
 async fn enregistrer_la_chaine_courante_la_garde_avec_son_ordre_et_ses_reglages_t17() {
     let b = Banc::nouveau(true).await;
     let (s, v) = b
-        .put_chaine(json!({"version": 1, "plugins": [crossfeed(), parametrique()],
-                           "fixed": {"headroom": {"mode": "manual", "db": -6.0}}}))
+        .put_chaine(
+            json!({"version": 1, "plugins": [crossfeed(), parametrique()],
+                           "fixed": {"headroom": {"mode": "manual", "db": -6.0}}}),
+        )
         .await;
     assert_eq!(s, StatusCode::OK, "{v}");
     let (s, p) = b.enregistrer("  Evening listening ").await;
@@ -199,7 +207,10 @@ async fn enregistrer_la_chaine_courante_la_garde_avec_son_ordre_et_ses_reglages_
     // La liste le garde, la zone le marque « ACTIVE ».
     let v = b.liste().await;
     assert_eq!(ids(&v), vec!["pure", "evening-listening"]);
-    assert_eq!(b.get_zone().await["active_preset"], json!("evening-listening"));
+    assert_eq!(
+        b.get_zone().await["active_preset"],
+        json!("evening-listening")
+    );
     // Même nom : un autre identifiant, rien n'est écrasé.
     let (s, p2) = b.enregistrer("Evening listening").await;
     assert_eq!(s, StatusCode::CREATED);
@@ -211,8 +222,16 @@ async fn enregistrer_la_chaine_courante_la_garde_avec_son_ordre_et_ses_reglages_
 async fn un_enregistrement_mal_forme_est_refuse_et_sa_contre_epreuve_passe_t17() {
     let b = Banc::nouveau(true).await;
     for (corps, statut, code) in [
-        (json!({"name": "   ", "zone_id": b.zone}), 400, "invalid_name"),
-        (json!({"name": "x".repeat(81), "zone_id": b.zone}), 400, "invalid_name"),
+        (
+            json!({"name": "   ", "zone_id": b.zone}),
+            400,
+            "invalid_name",
+        ),
+        (
+            json!({"name": "x".repeat(81), "zone_id": b.zone}),
+            400,
+            "invalid_name",
+        ),
         (json!({"name": "A"}), 400, "invalid_body"),
         (
             json!({"name": "A", "zone_id": b.zone, "chain": {"version": 1}}),
@@ -279,13 +298,27 @@ async fn renommer_garde_l_identifiant_et_supprimer_oublie_l_actif_t17() {
     assert_eq!(b.get_zone().await["active_preset"], json!("headphones"));
     // Refus : nom vide, préréglage inconnu.
     let (s, v) = b
-        .brut(Method::PATCH, "/api/v1/tess/presets/headphones", Some(json!({"name": ""})))
+        .brut(
+            Method::PATCH,
+            "/api/v1/tess/presets/headphones",
+            Some(json!({"name": ""})),
+        )
         .await;
-    assert_eq!((s, v["error"].clone()), (StatusCode::BAD_REQUEST, json!("invalid_name")));
+    assert_eq!(
+        (s, v["error"].clone()),
+        (StatusCode::BAD_REQUEST, json!("invalid_name"))
+    );
     let (s, v) = b
-        .brut(Method::PATCH, "/api/v1/tess/presets/nope", Some(json!({"name": "X"})))
+        .brut(
+            Method::PATCH,
+            "/api/v1/tess/presets/nope",
+            Some(json!({"name": "X"})),
+        )
         .await;
-    assert_eq!((s, v["error"].clone()), (StatusCode::NOT_FOUND, json!("preset_not_found")));
+    assert_eq!(
+        (s, v["error"].clone()),
+        (StatusCode::NOT_FOUND, json!("preset_not_found"))
+    );
 
     let (s, _) = b
         .brut(Method::DELETE, "/api/v1/tess/presets/headphones", None)
@@ -299,9 +332,14 @@ async fn renommer_garde_l_identifiant_et_supprimer_oublie_l_actif_t17() {
     let (s, v) = b
         .brut(Method::DELETE, "/api/v1/tess/presets/headphones", None)
         .await;
-    assert_eq!((s, v["error"].clone()), (StatusCode::NOT_FOUND, json!("preset_not_found")));
+    assert_eq!(
+        (s, v["error"].clone()),
+        (StatusCode::NOT_FOUND, json!("preset_not_found"))
+    );
     // Pure aussi se supprime (la croix de la maquette A2).
-    let (s, _) = b.brut(Method::DELETE, "/api/v1/tess/presets/pure", None).await;
+    let (s, _) = b
+        .brut(Method::DELETE, "/api/v1/tess/presets/pure", None)
+        .await;
     assert_eq!(s, StatusCode::NO_CONTENT);
     assert!(ids(&b.liste().await).is_empty());
 }
@@ -319,7 +357,11 @@ async fn charger_remplace_la_chaine_et_marque_le_prereglage_actif_t17() {
         .put_chaine(json!({"version": 1, "plugins": [parametrique()]}))
         .await;
     assert_eq!(s, StatusCode::OK);
-    assert_eq!(b.get_zone().await["active_preset"], Value::Null, "PUT à la main");
+    assert_eq!(
+        b.get_zone().await["active_preset"],
+        Value::Null,
+        "PUT à la main"
+    );
     let (s, v) = b.appliquer("headphones").await;
     assert_eq!(s, StatusCode::OK, "{v}");
     conforme_au_schema("zone_response", &v["zone"]).unwrap_or_else(|e| panic!("{e} : {v}"));
@@ -423,7 +465,11 @@ async fn un_etage_sans_effet_sur_cette_sortie_est_dit_avec_son_motif_t17() {
         .unwrap();
     let (s, v) = b.appliquer("casque").await;
     assert_eq!(s, StatusCode::OK, "{v}");
-    assert_eq!(v["not_applied"][0]["reason"], json!("plugin_unavailable"), "{v}");
+    assert_eq!(
+        v["not_applied"][0]["reason"],
+        json!("plugin_unavailable"),
+        "{v}"
+    );
 }
 
 // ── Mode d'application ──────────────────────────────────────────────
@@ -431,7 +477,11 @@ async fn un_etage_sans_effet_sur_cette_sortie_est_dit_avec_son_motif_t17() {
 #[tokio::test]
 async fn le_mode_se_regle_et_une_valeur_inconnue_est_refusee_t17() {
     let b = Banc::nouveau(true).await;
-    for faux in [json!({"apply_mode": "crossfade"}), json!({}), json!({"apply_mode": "immediately", "x": 1})] {
+    for faux in [
+        json!({"apply_mode": "crossfade"}),
+        json!({}),
+        json!({"apply_mode": "immediately", "x": 1}),
+    ] {
         let (s, v) = b
             .brut(Method::PUT, "/api/v1/tess/apply-mode", Some(faux.clone()))
             .await;
@@ -473,7 +523,9 @@ async fn au_prochain_demarrage_rien_n_interrompt_la_lecture_t17() {
     // … mais la sortie vivante n'est pas touchée : le rafraîchissement attend.
     let attente = cles_en_attente(b.zone);
     assert!(
-        attente.iter().any(|c| c == &format!("zone_{}_crossfeed", b.zone)),
+        attente
+            .iter()
+            .any(|c| c == &format!("zone_{}_crossfeed", b.zone)),
         "{attente:?}"
     );
     // Un préréglage chargé dans ce mode attend aussi, et le dit.
