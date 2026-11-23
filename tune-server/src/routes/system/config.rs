@@ -55,8 +55,9 @@ pub(super) async fn version() -> Json<Value> {
 ///   SQLite pris pendant un balayage, par exemple) → `degraded`, HTTP **200** ;
 /// - **toutes** échouent, c'est-à-dire base indisponible → `error`, HTTP 503.
 ///
-/// Les conteneurs ne rebouclent pas là-dessus : les `HEALTHCHECK` des deux
-/// `Dockerfile` visent `/system/stats`, pas cette route.
+/// Les `HEALTHCHECK` des deux `Dockerfile` visent cette route (`curl -sf`) :
+/// `degraded` reste 200 et garde le conteneur « healthy », seule la base
+/// indisponible (503) le fait passer « unhealthy ».
 ///
 /// ## Pourquoi `components` et pas un nouveau vocabulaire
 ///
