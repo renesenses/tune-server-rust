@@ -403,6 +403,11 @@ async fn labandon_dit_ce_que_le_pont_a_relaye_8963() {
         "depuis_demande_de_flux_relayee_ms=Some(",
         "octets_servis=",
         "flux=",
+        // Suite (#8963) : l'adresse remise au pont, la zone relue, le verdict.
+        "adresse_remise_au_pont_ms=",
+        "derniere_zone_relue_par_le_pont=",
+        "websockets_par_le_pont=",
+        "silence=",
     ] {
         assert!(ligne.contains(attendu), "« {attendu} » absent : {ligne}");
     }
@@ -411,5 +416,74 @@ async fn labandon_dit_ce_que_le_pont_a_relaye_8963() {
     assert!(
         !ligne.contains("feedbeef0011"),
         "l'identifiant entier du flux est recopié : {ligne}"
+    );
+}
+
+/// Suite (#8963) : l'adresse du flux abandonné est partie vers le pont (une
+/// relecture de la zone, relayée), et le téléphone ne l'a pas tirée. La
+/// ligne d'abandon le dit en un mot, `silence=adresse_remise_flux_non_demande`,
+/// avec la zone que le pont a relue : le défaut est alors côté application,
+/// et non dans le chemin du serveur.
+#[tokio::test]
+async fn labandon_dit_si_l_adresse_du_flux_est_partie_vers_le_pont_8963() {
+    #[derive(Clone, Default)]
+    struct Journal(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Journal {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Journal {
+        type Writer = Journal;
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+    crate::journal_de_test::fiabiliser_la_capture();
+    let journal = Journal::default();
+    let _garde = tracing::subscriber::set_default(
+        tracing_subscriber::fmt()
+            .with_writer(journal.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .finish(),
+    );
+
+    let banc = Banc::monter().await;
+    let zone_id = banc.zone_en_lecture("Ce téléphone", "browser", 0).await;
+    let zs = banc.instantane(zone_id, Duration::from_secs(30)).await;
+    let sid = zs
+        .now_playing
+        .as_ref()
+        .and_then(|np| np.stream_id.clone())
+        .expect("le banc pose un flux");
+    // Le téléphone relit sa zone par le pont ; la réponse porte l'adresse.
+    crate::cloud::activite_du_relais::noter_requete_relayee();
+    let corps = format!(
+        r#"{{"id":{zone_id},"stream_url":"http://10.0.0.2:8888/stream/{sid}.flac","stream_url_remote":"https://bridge.mozaiklabs.fr/stream/relay/srv/{sid}.flac"}}"#
+    );
+    crate::cloud::activite_du_relais::noter_reponse_relayee(
+        "GET",
+        &format!("/api/v1/zones/{zone_id}"),
+        corps.as_bytes(),
+    );
+    assert!(banc.poller.abandonner_lecture_sans_destination(&zs).await);
+
+    let texte = String::from_utf8_lossy(&journal.0.lock().unwrap()).into_owned();
+    let ligne = texte
+        .lines()
+        .find(|l| l.contains("lecture_sans_destination_abandonnee"))
+        .unwrap_or_else(|| panic!("aucune ligne d'abandon : {texte}"));
+    assert!(
+        ligne.contains("adresse_remise_flux_non_demande"),
+        "le verdict ne dit pas que l'adresse est partie vers le pont : {ligne}"
+    );
+    assert!(
+        ligne.contains("adresse_remise_au_pont_ms=Some("),
+        "l'âge de l'adresse remise manque : {ligne}"
     );
 }

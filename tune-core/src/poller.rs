@@ -902,6 +902,28 @@ impl PositionPoller {
             .and_then(|np| np.stream_id.as_deref())
             .map(crate::cloud::activite_du_relais::identifiant_court);
         let derniere_demande = crate::cloud::activite_du_relais::derniere_demande_de_flux_relayee();
+        // Suite (#8963) : l'adresse de CE flux est-elle partie vers le pont,
+        // quelle zone le téléphone a-t-il relue en dernier, et le verdict en
+        // un mot (`activite_du_relais::silence_du_telephone`).
+        let depuis_requete_relayee_ms =
+            crate::cloud::activite_du_relais::depuis_la_derniere_requete_relayee_ms();
+        let adresse_remise_au_pont_ms = zone_state
+            .now_playing
+            .as_ref()
+            .and_then(|np| np.stream_id.as_deref())
+            .and_then(crate::cloud::activite_du_relais::adresse_remise_au_pont_ms);
+        let zone_relue = crate::cloud::activite_du_relais::derniere_zone_relue_par_le_pont();
+        let silence = navigateur.then(|| {
+            crate::cloud::activite_du_relais::silence_du_telephone(
+                zone_state
+                    .last_play_started_at
+                    .map(|t| t.elapsed().as_millis() as u64)
+                    .unwrap_or(0),
+                depuis_requete_relayee_ms,
+                derniere_demande.as_ref().map(|(ms, id)| (*ms, id.as_str())),
+                adresse_remise_au_pont_ms,
+            )
+        });
         warn!(
             zone_id,
             navigateur,
@@ -912,10 +934,14 @@ impl PositionPoller {
                 .unwrap_or(""),
             flux = ?flux_en_cours,
             octets_servis = ?octets_servis,
-            depuis_requete_relayee_ms =
-                ?crate::cloud::activite_du_relais::depuis_la_derniere_requete_relayee_ms(),
+            depuis_requete_relayee_ms = ?depuis_requete_relayee_ms,
             depuis_demande_de_flux_relayee_ms = ?derniere_demande.as_ref().map(|(ms, _)| *ms),
-            dernier_flux_demande_par_le_pont = ?derniere_demande.map(|(_, id)| id),
+            dernier_flux_demande_par_le_pont = ?derniere_demande.as_ref().map(|(_, id)| id),
+            adresse_remise_au_pont_ms = ?adresse_remise_au_pont_ms,
+            derniere_zone_relue_par_le_pont = ?zone_relue.map(|(_, z)| z),
+            depuis_zone_relue_ms = ?zone_relue.map(|(ms, _)| ms),
+            websockets_par_le_pont = crate::cloud::activite_du_relais::clients_ws_par_le_pont(),
+            silence = silence.unwrap_or("-"),
             "lecture_sans_destination_abandonnee"
         );
         if let Some(ref bus) = self.event_bus {
