@@ -5177,7 +5177,11 @@ async fn le_refus_de_sortie_tenue_porte_son_motif_et_la_zone_qui_la_tient() {
             break ev;
         }
     };
-    assert_eq!(ev.data["reason"], "output_held_by_other_zone", "{}", ev.data);
+    assert_eq!(
+        ev.data["reason"], "output_held_by_other_zone",
+        "{}",
+        ev.data
+    );
     assert_eq!(ev.data["holder_zone_id"], zone_b, "{}", ev.data);
     let message = ev.data["message"].as_str().unwrap_or_default();
     assert!(

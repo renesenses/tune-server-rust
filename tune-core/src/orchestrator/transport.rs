@@ -290,7 +290,8 @@ pub(crate) fn phrase_sans_sentinelle(msg: &str) -> &str {
     if let Some((_, phrase)) = crate::outputs::asio_blocage_4556::depuis_sentinelle(msg) {
         return phrase;
     }
-    if let Some((_, phrase)) = crate::outputs::sortie_tenue_par_une_autre_zone::depuis_sentinelle(msg)
+    if let Some((_, phrase)) =
+        crate::outputs::sortie_tenue_par_une_autre_zone::depuis_sentinelle(msg)
     {
         return phrase;
     }
