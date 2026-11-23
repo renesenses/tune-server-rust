@@ -305,8 +305,9 @@ fn remettre_a_zero(state: &AppState) {
     poser_authentification(state, false);
 }
 
+// Le moteur PostgreSQL bloque dans `AppState` : runtime multi-thread.
 #[cfg(feature = "postgres")]
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn postgres_memes_scenarios() {
     let Ok(url) = std::env::var("TUNE_TEST_PG_URL") else {
         eprintln!("TUNE_TEST_PG_URL absente — épreuve PostgreSQL sautée");
