@@ -265,3 +265,50 @@ async fn un_episode_disponible_n_est_pas_affecte_2972() {
         "fil 2972 : un épisode servi n'est jamais marqué : {apres:?}"
     );
 }
+
+/// Suite de la relecture (#9453) : la sonde du clic part seulement si le
+/// fichier sera réellement demandé. Une zone inconnue, ou dont la sortie
+/// n'est pas encore découverte, ne coûte aucune requête à l'éditeur.
+///
+/// Contre-épreuve : remettre la sonde avant la lecture de la zone (ou
+/// rendre `le_fichier_sera_demande` toujours vrai) fait tomber ce témoin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sans_zone_ni_sortie_aucune_requete_a_l_editeur_2972() {
+    let b = banc("t4").await;
+    // Zone inconnue.
+    let req = Request::builder()
+        .uri("/api/v1/podcasts/play/987654")
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"audio_url": b.absent, "title": "Épisode"}).to_string(),
+        ))
+        .unwrap();
+    let (_, r) = appel(&b, req).await;
+    assert_ne!(r["code"], "episode_unavailable", "{r}");
+    // Zone dont la sortie n'est pas découverte : la route répond 503.
+    let sans_sortie = ZoneRepo::with_backend(b.state.backend.clone())
+        .create(
+            "Cuisine — témoin 2972",
+            Some("dlna"),
+            Some("uuid:absent-2972"),
+        )
+        .unwrap();
+    let req = Request::builder()
+        .uri(format!("/api/v1/podcasts/play/{sans_sortie}"))
+        .method("POST")
+        .header("content-type", "application/json")
+        .body(Body::from(
+            json!({"audio_url": b.absent, "title": "Épisode"}).to_string(),
+        ))
+        .unwrap();
+    let (statut, r) = appel(&b, req).await;
+    assert_eq!(statut, StatusCode::SERVICE_UNAVAILABLE, "{r}");
+    assert_eq!(r["code"], "podcast_sortie_introuvable", "{r}");
+    tune_core::taches_de_fond::priorite::oublier_la_zone(sans_sortie);
+    assert_eq!(
+        b.demandes_absent.load(Ordering::SeqCst),
+        0,
+        "fil 2972 : sans zone ni sortie, rien n'est demandé à l'éditeur"
+    );
+}
