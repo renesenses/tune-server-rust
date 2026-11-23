@@ -589,18 +589,19 @@ async fn sso_callback(
         }
     };
 
+    // Et une dernière fois après l'échange avec mozaiklabs.fr (quelques
+    // secondes) : une liaison finie entre-temps n'est pas remplacée. Avant
+    // l'adoption ci-dessous : un retour refusé n'écrit rien.
+    if remplacement_refuse(&settings, par_le_reseau_local, Liaison::Serveur) {
+        return page_refus_hors_machine(&headers, crate::auth::refus_compte_deja_relie(&headers));
+    }
+
     // 🔴 AVANT d'écraser `mozaik_user`, et pas après.
     //
     // L'adoption reprend le compte DÉJÀ lié — celui d'une installation qui en
     // portait un avant que `owner_profile_id` n'existe. La placer plus bas la
     // ferait lire le compte qui vient d'arriver, c'est-à-dire adopter le
     // nouveau venu : exactement ce qu'elle est là pour empêcher.
-    // Et une dernière fois après l'échange avec mozaiklabs.fr (quelques
-    // secondes) : une liaison finie entre-temps n'est pas remplacée.
-    if remplacement_refuse(&settings, par_le_reseau_local, Liaison::Serveur) {
-        return page_refus_hors_machine(&headers, crate::auth::refus_compte_deja_relie(&headers));
-    }
-
     tune_core::cloud::proprietaire::adopter_le_compte_lie(&settings, &state.backend);
 
     // Store cloud tokens in settings. #8238 : une session neuve lève
