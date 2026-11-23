@@ -143,8 +143,12 @@ async fn reseau_local_sans_authentification_ne_relie_pas_de_compte() {
     assert_eq!(statut, StatusCode::FORBIDDEN, "{page}");
     assert!(page.contains("<html"), "le refus est une page : {page}");
     assert!(
-        page.contains("localhost"),
+        page.contains("server machine"),
         "la page dit quoi faire : {page}"
+    );
+    assert!(
+        !page.contains("localhost"),
+        "plus de commande ni d'adresse technique dans le refus : {page}"
     );
     assert_eq!(
         reglages
