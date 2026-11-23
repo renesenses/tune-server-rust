@@ -1218,6 +1218,7 @@ pub(crate) async fn build_zone_json(state: &AppState, zone_id: i64) -> Value {
     // champs que GET /zones et GET /zones/{id}.
     if let Some(obj) = v.as_object_mut() {
         crate::routes::zones::inject_metadata_anchor(obj, &zone_state);
+        crate::routes::zones::inject_dsd_porte(obj, "current_track", &zone_state);
         crate::routes::zones::inject_session_context(obj, &zone_state);
         // #2672 — LE défaut. Cette charge utile, rendue par une vingtaine de
         // routes de lecture, ne portait aucun des neuf réglages du panneau
