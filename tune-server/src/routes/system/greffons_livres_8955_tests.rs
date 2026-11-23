@@ -314,7 +314,10 @@ fn une_bascule_de_greffon_refusee_n_empeche_pas_la_mise_a_jour_3014() {
         std::fs::read(inst.opt.join("tune-server")).unwrap(),
         elf("tune-server neuf")
     );
-    assert_eq!(lire(&inst.opt.join("plugins/party/main.wasm")), "party ancien");
+    assert_eq!(
+        lire(&inst.opt.join("plugins/party/main.wasm")),
+        "party ancien"
+    );
     assert_eq!(
         lire(&inst.opt.join("plugins/playlists-converter/main.wasm")),
         "convertisseur"
@@ -341,15 +344,19 @@ fn la_synchro_de_dossier_refusee_par_windows_est_toleree_3014() {
 #[test]
 fn la_preparation_windows_garde_le_greffon_refuse_3014() {
     let inst = Installation::nouvelle();
-    let poses = super::super::preparer_les_greffons_windows(&inst.extraction, &inst.opt, |de, vers| {
-        if vers.to_string_lossy().contains("party") {
-            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
-        }
-        installation_sure::copier_durablement(de, vers)
-    });
+    let poses =
+        super::super::preparer_les_greffons_windows(&inst.extraction, &inst.opt, |de, vers| {
+            if vers.to_string_lossy().contains("party") {
+                return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+            }
+            installation_sure::copier_durablement(de, vers)
+        });
 
     let cibles: Vec<PathBuf> = poses.into_iter().map(|g| g.cible).collect();
-    assert_eq!(cibles, [inst.opt.join("plugins").join("playlists-converter")]);
+    assert_eq!(
+        cibles,
+        [inst.opt.join("plugins").join("playlists-converter")]
+    );
     assert!(!inst.opt.join(ATTENTE).join("party").exists());
     assert!(lire(&inst.opt.join(MARQUE_GARDES)).contains("party"));
 }

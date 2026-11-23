@@ -305,8 +305,7 @@ pub(super) fn basculer(
         std::fs::create_dir_all(dossier)
             .map_err(|e| format!("create {}: {e}", dossier.display()))?;
     }
-    effacer(&g.ancien)
-        .map_err(|e| format!("clear plugin backup {}: {e}", g.ancien.display()))?;
+    effacer(&g.ancien).map_err(|e| format!("clear plugin backup {}: {e}", g.ancien.display()))?;
     let ancien_garde = std::fs::symlink_metadata(&g.cible).is_ok();
     if ancien_garde {
         renommer(&g.cible, &g.ancien)

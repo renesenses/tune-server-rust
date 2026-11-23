@@ -3970,7 +3970,11 @@ fn install_unix(
                 greffons_livres::abandonner(std::slice::from_ref(greffon));
                 greffons_gardes.push(format!(
                     "plugin {} kept at its current version ({e})",
-                    greffon.cible.file_name().unwrap_or_default().to_string_lossy()
+                    greffon
+                        .cible
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
                 ));
             }
         }
@@ -4458,7 +4462,9 @@ fn preparer_les_greffons_windows(
         for dossier in [greffons_livres::DOSSIER, greffons_livres::SAUVEGARDE] {
             if let Err(e) = std::fs::create_dir_all(exe_dir.join(dossier)) {
                 warn!(dossier, error = %e, "update_win_bundled_plugins_not_staged");
-                gardes.push(format!("bundled plugins kept at their current version (create {dossier}: {e})"));
+                gardes.push(format!(
+                    "bundled plugins kept at their current version (create {dossier}: {e})"
+                ));
                 greffons_livres::abandonner(&poses);
                 poses.clear();
                 break;
