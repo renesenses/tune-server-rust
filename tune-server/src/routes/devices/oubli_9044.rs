@@ -172,7 +172,11 @@ pub(crate) fn verdict(
 
 /// L'appareil est-il présent ? Ses zones locales répondent par `online`,
 /// le reste par le réseau.
-pub(crate) fn appareil_present(device_id: &str, zones: &[ZoneDAppareil], presents: &HashSet<String>) -> bool {
+pub(crate) fn appareil_present(
+    device_id: &str,
+    zones: &[ZoneDAppareil],
+    presents: &HashSet<String>,
+) -> bool {
     if zones.is_empty() {
         return presents.contains(device_id);
     }

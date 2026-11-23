@@ -12,9 +12,7 @@ use tune_core::outputs::mock::MockOutput;
 
 use super::*;
 use crate::routes::devices::oubli_9044;
-use crate::routes::devices::{
-    DiscoveredDlnaDevice, load_discovered_dlna, persist_discovered_dlna,
-};
+use crate::routes::devices::{DiscoveredDlnaDevice, load_discovered_dlna, persist_discovered_dlna};
 
 fn t0() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 11, 23, 12, 0, 0).unwrap()
@@ -63,17 +61,29 @@ fn le_premier_balayage_date_le_depart_et_le_retour_l_efface() {
 #[test]
 fn oublie_au_bout_de_la_duree_jamais_avant_jamais_sous_une_lecture_ni_un_manuel() {
     let appareils = [etat("a", true)];
-    assert!(planifier(&[absence("a", 29)], &[], &appareils, t0(), 30).a_oublier.is_empty());
+    assert!(
+        planifier(&[absence("a", 29)], &[], &appareils, t0(), 30)
+            .a_oublier
+            .is_empty()
+    );
     assert_eq!(
         planifier(&[absence("a", 30)], &[], &appareils, t0(), 30).a_oublier,
         vec!["a".to_string()]
     );
     let mut joue = etat("a", true);
     joue.en_lecture = true;
-    assert!(planifier(&[absence("a", 90)], &[], &[joue], t0(), 30).a_oublier.is_empty());
+    assert!(
+        planifier(&[absence("a", 90)], &[], &[joue], t0(), 30)
+            .a_oublier
+            .is_empty()
+    );
     let mut manuel = etat("a", true);
     manuel.manuel = true;
-    assert!(planifier(&[absence("a", 90)], &[], &[manuel], t0(), 30).a_oublier.is_empty());
+    assert!(
+        planifier(&[absence("a", 90)], &[], &[manuel], t0(), 30)
+            .a_oublier
+            .is_empty()
+    );
     // Déjà oublié : pas deux fois.
     let deja = Oubli {
         device_id: "a".into(),
@@ -104,12 +114,20 @@ fn banc() -> (tempfile::TempDir, AppState, ZoneRepo, SettingsRepo, i64) {
     let state = AppState::new(chemin.to_str().unwrap(), 0, Default::default()).unwrap();
     let repo = ZoneRepo::with_backend(state.backend.clone());
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    let zid = repo.create("Ampli du salon", Some("dlna"), Some(PARTI)).unwrap();
+    let zid = repo
+        .create("Ampli du salon", Some("dlna"), Some(PARTI))
+        .unwrap();
     // Un réglage de la zone, qui doit survivre à l'oubli.
     repo.update_volume(zid, 0.42).unwrap();
     persist_discovered_dlna(
         &state.backend,
-        &DiscoveredDlnaDevice::new(PARTI, "http://192.168.1.40:8019/root.xml", "Ampli", "192.168.1.40", 8019),
+        &DiscoveredDlnaDevice::new(
+            PARTI,
+            "http://192.168.1.40:8019/root.xml",
+            "Ampli",
+            "192.168.1.40",
+            8019,
+        ),
     );
     (dossier, state, repo, settings, zid)
 }
@@ -134,10 +152,17 @@ async fn zone_json(state: &AppState, zid: i64) -> Value {
         .nest("/zones", crate::routes::zones::router())
         .with_state(state.clone());
     let r = app
-        .oneshot(Request::builder().uri("/zones").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::builder()
+                .uri("/zones")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
-    let octets = axum::body::to_bytes(r.into_body(), usize::MAX).await.unwrap();
+    let octets = axum::body::to_bytes(r.into_body(), usize::MAX)
+        .await
+        .unwrap();
     let v: Value = serde_json::from_slice(&octets).unwrap();
     let zones = v
         .as_array()
@@ -163,7 +188,10 @@ async fn temoin_oubli_automatique_apres_la_duree() {
     let o = lire_oublis(&settings);
     assert_eq!(o.len(), 1);
     assert!(o[0].auto);
-    assert!(repo.get(zid).unwrap().is_some(), "la zone n'est jamais supprimée");
+    assert!(
+        repo.get(zid).unwrap().is_some(),
+        "la zone n'est jamais supprimée"
+    );
 }
 
 /// Témoin 2 — oubli manuel, sans `with_zone` : 200, l'appareil est oublié,
@@ -199,7 +227,11 @@ async fn temoin_zone_conservee_hors_ligne_avec_ses_reglages() {
     assert_eq!(z["device_forgotten"], true, "{z}");
     assert!(z["device_forgotten_at"].is_string(), "{z}");
     let zone = repo.get(zid).unwrap().unwrap();
-    assert!((zone.volume - 0.42).abs() < 1e-9, "réglage perdu : {}", zone.volume);
+    assert!(
+        (zone.volume - 0.42).abs() < 1e-9,
+        "réglage perdu : {}",
+        zone.volume
+    );
 
     // Et seule la suppression demandée l'emporte.
     let r = oubli_9044::delete_device(
@@ -211,7 +243,10 @@ async fn temoin_zone_conservee_hors_ligne_avec_ses_reglages() {
     .await;
     assert_eq!(r.status(), StatusCode::OK);
     assert!(repo.get(zid).unwrap().is_none());
-    assert!(lire_oublis(&settings).is_empty(), "plus de marque sans zone");
+    assert!(
+        lire_oublis(&settings).is_empty(),
+        "plus de marque sans zone"
+    );
 }
 
 /// Témoin 4 — l'appareil oublié revient : sa zone, pas une nouvelle, et la
@@ -237,7 +272,10 @@ async fn temoin_reapparition_sans_doublon() {
     assert_eq!(z["device_forgotten"], false, "en ligne, jamais « oublié »");
 
     balayer(&state, t0() + chrono::Duration::minutes(15)).await;
-    assert!(lire_oublis(&settings).is_empty(), "la marque reste après le retour");
+    assert!(
+        lire_oublis(&settings).is_empty(),
+        "la marque reste après le retour"
+    );
     assert!(lire_absences(&settings).is_empty());
     let zones = repo.zones_de_l_appareil(PARTI).unwrap();
     assert_eq!(zones.len(), 1, "{zones:?}");
@@ -270,7 +308,9 @@ async fn la_regle_se_lit_et_s_ecrit() {
     let r = ecrire_la_regle(
         RequireAdmin,
         State(state.clone()),
-        Json(NouvelleRegle { after_days: JOURS_MAX + 1 }),
+        Json(NouvelleRegle {
+            after_days: JOURS_MAX + 1,
+        }),
     )
     .await;
     assert_eq!(r.status(), StatusCode::BAD_REQUEST);
