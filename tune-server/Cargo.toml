@@ -175,6 +175,7 @@ quick-xml = { workspace = true }
 mdns-sd = { workspace = true }
 urlencoding = { workspace = true }
 sha2 = { workspace = true }
+subtle = "2.6"
 # Verifies minisign signatures over release checksums (self-update, audit
 # item 8). Pure-Rust, no libsodium — verify-only, the trusted key is embedded.
 minisign-verify = "0.2"
