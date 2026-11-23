@@ -7,4 +7,4 @@ Tune 1.0.0-rc13.2、rc13.1 の修正版です。
 - アカウントがまだ連携されていない場合、mozaiklabs.fr アカウントをローカルネットワーク上の任意のブラウザ（iPad、スマートフォン）から連携できるようになりました。
 - ローカルネットワークから同じアカウントを再接続することもできます。別のアカウントへの置き換えや連携の解除は、引き続きサーバーのマシンまたは管理者のみが行えます。連携中のアカウントの名前とメールアドレスは、ローカルネットワークから表示されます。
 - Windows：Tune からのアップデートが再び機能するようになりました。rc13 と rc13.1 以降は、インストーラーを使う必要がありました。
-- rc12 のまま更新できなくなった Tune OS サーバー：新しいツール「Débloquer Tune」（Windows、Mac）を使えば、コマンドなしで数回クリックするだけで解決します。ダウンロード：https://github.com/renesenses/tune-server-rust/releases/tag/debloquer-tune-v1
+- rc12 のまま更新できなくなった Tune OS サーバー：新しいツール「Débloquer Tune」（Windows、Mac）を使えば、コマンドなしで数回クリックするだけで解決します。データベースを別のコンピューターからコピーしていて default アカウントがない場合は、管理者アカウントのユーザー名とパスワードを入力するよう求められます。ダウンロード：https://github.com/renesenses/tune-server-rust/releases/tag/debloquer-tune-v1

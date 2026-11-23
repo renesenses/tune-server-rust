@@ -7,4 +7,4 @@ Tune 1.0.0-rc13.2，rc13.1 的修正版本。
 - 在尚未关联任何账户时，现在可以从局域网内的任意浏览器（iPad、手机）关联 mozaiklabs.fr 账户。
 - 在局域网内也可以重新连接同一个账户。将其替换为其他账户或取消关联，仍然只能在服务器所在的机器上或由管理员操作。已关联账户的名称和电子邮件地址可在局域网内查看。
 - Windows：从 Tune 内部更新恢复正常。自 rc13 和 rc13.1 起，此前需要使用安装程序更新。
-- 停留在 rc12、无法再更新的 Tune OS 服务器：新工具“Débloquer Tune”（Windows、Mac）只需点击几下即可解决，无需任何命令。下载：https://github.com/renesenses/tune-server-rust/releases/tag/debloquer-tune-v1
+- 停留在 rc12、无法再更新的 Tune OS 服务器：新工具“Débloquer Tune”（Windows、Mac）只需点击几下即可解决，无需任何命令。如果数据库是从另一台电脑复制过来的、没有 default 账户，它会要求输入您的管理员账户的用户名和密码。下载：https://github.com/renesenses/tune-server-rust/releases/tag/debloquer-tune-v1
