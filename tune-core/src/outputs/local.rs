@@ -5861,12 +5861,21 @@ impl EtageDeConversion<'_> {
             // #7614 — le greffon porte la cadence ; rubato ne tourne pas.
             mots = etage.traiter(&mots);
         } else if self.needs_resample {
+            let debut = std::time::Instant::now();
             mots = rubato_resample_chunk(
                 &mut self.resampler,
                 &mots,
                 self.sortie.canaux,
                 false,
                 &mut self.resample_leftover,
+            );
+            // #9391 — un rééchantillonnage qui mange le temps réel se dit.
+            crate::audio::resample::surveiller_le_cout(
+                "sortie_locale",
+                debut,
+                mots.len(),
+                self.sortie.canaux,
+                self.sortie.cadence,
             );
         }
         mots
