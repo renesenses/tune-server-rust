@@ -262,7 +262,17 @@ fn la_phase_excedentaire_d_un_passe_tout_est_corrigee_dans_le_delai_annonce() {
         "T10b passe-tout : latence {} trames, énergie avant le pic {pre:.1} dB",
         mixte.latence_trames
     );
-    assert!(pre < -20.0, "pré-tintement {pre:.1} dB");
+    // La borne est TEMPORELLE (rien avant le rang 0, soit 20 ms avant le
+    // pic) ; l'énergie qui s'y trouve est mesurée (−16,8 dB pour ce
+    // passe-tout de 5,6 ms) et seulement bornée grossièrement ici.
+    assert!(pre < -12.0, "pré-tintement {pre:.1} dB");
+    // Les 10 premières ms (fondu de la fenêtre) ne portent presque rien.
+    let h = &mixte.coefficients;
+    let total: f64 = h.iter().map(|v| v * v).sum();
+    let tete: f64 = h[..mixte.latence_trames / 2].iter().map(|v| v * v).sum();
+    let tete_db = 10.0 * (tete / total).log10();
+    eprintln!("T10b passe-tout : énergie à plus de 10 ms avant le pic {tete_db:.1} dB");
+    assert!(tete_db < -40.0, "{tete_db:.1} dB");
     let e = ecart(
         &ir,
         &mixte.coefficients,

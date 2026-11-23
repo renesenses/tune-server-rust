@@ -12,7 +12,9 @@
 //!     réserve), dans la bande `[f_lo, f_hi]` (20 Hz–15 kHz par défaut),
 //!     retour à 0 dB en dehors par un fondu en cosinus d'une demi-octave ;
 //!     normalisé par défaut pour que le gain le plus haut du filtre soit 0 dB
-//!     (aucun écrêtage ajouté par le filtre) ;
+//!     (aucun écrêtage ajouté par le filtre) ; deux passes de raffinement
+//!     ([`RAFFINEMENTS`]) reprennent l'écart entre la réponse prévue
+//!     (mesure + filtre, même lissage) et la cible ;
 //!   * **phase minimale** pour ce module (cepstre réel, ci-dessous) : aucune
 //!     énergie avant le pic, latence nulle ;
 //!   * **phase excédentaire** (facultative, [`OptionsPhase`]) : sous la
@@ -175,6 +177,12 @@ pub const PRE_TINTEMENT_MAX_MS: f64 = 50.0;
 /// Largeur (octaves) du fondu de retour à 0 dB hors de la bande corrigée, et
 /// des fondus de la correction de phase.
 pub const FONDU_OCTAVES: f64 = 0.5;
+/// Passes de raffinement : la réponse prévue (mesure + filtre, lissée comme
+/// la conception) est comparée à la cible, l'écart restant est ajouté à la
+/// correction voulue (toujours bornée), et le filtre recalculé. Le lissage
+/// d'une somme n'est pas la somme des lissages : sans ces passes, un mode
+/// étroit au milieu d'une queue diffuse laisse ±1,7 dB.
+pub const RAFFINEMENTS: usize = 2;
 
 /// Correction de la phase excédentaire (voir l'en-tête du module).
 #[derive(Debug, Clone, PartialEq)]
@@ -553,26 +561,15 @@ pub fn concevoir_fir(
     let lisse = lissage_variable(mesure, o.lissage_bas_n, o.lissage_haut_n, o.f_lissage_hz);
     let offset = cible.align_offset(&lisse, o.f_lo, o.f_hi);
     let brute = |f: f64| cible.level_db(f) + offset - lisse.at(f);
-    let voulue = |f: f64| {
+    // Correction voulue (avant normalisation), `d` = raffinement accumulé.
+    let voulue = |f: f64, d: &LogResponse| {
         let w = poids_bande(f, o.f_lo, o.f_hi);
         if w == 0.0 {
             0.0
         } else {
-            w * brute(f).clamp(-o.coupe_max_db, o.relance_max_db)
+            w * (brute(f) + d.at(f)).clamp(-o.coupe_max_db, o.relance_max_db)
         }
     };
-    let nfft = fft::next_pow2(o.prises * 4);
-    let bins = nfft / 2 + 1;
-    let df = fs / nfft as f64;
-    let mut corr: Vec<f64> = (0..bins).map(|k| voulue(k as f64 * df)).collect();
-    let crete = corr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let normalisation = if o.normaliser && crete > 0.0 {
-        -crete
-    } else {
-        0.0
-    };
-    corr.iter_mut().for_each(|c| *c += normalisation);
-
     let relances_bornees = mesure
         .freqs
         .iter()
@@ -585,40 +582,81 @@ pub fn concevoir_fir(
         ));
     }
 
+    let nfft = fft::next_pow2(o.prises * 4);
+    let bins = nfft / 2 + 1;
+    let df = fs / nfft as f64;
     let phase = match &o.phase {
         Some(p) => Some(correction_phase_excedentaire(ri.unwrap(), o.f_lo, p)?),
         None => None,
     };
     let latence = phase.as_ref().map(|e| e.len() / 2).unwrap_or(0);
-    // Module voulu ÷ module de la partie de phase fenêtrée.
-    let ln_mag: Vec<f64> = match &phase {
-        Some(e) => {
-            let ez = fft::rfft(e, nfft);
-            corr.iter()
-                .zip(&ez)
+    let ez = phase.as_ref().map(|e| fft::rfft(e, nfft));
+    let freqs = lisse.freqs.clone();
+    let mut delta = LogResponse {
+        freqs: freqs.clone(),
+        magnitude_db: vec![0.0; freqs.len()],
+    };
+    let mut h = Vec::new();
+    let mut reel = Vec::new();
+    let mut prevue = Vec::new();
+    let mut normalisation = 0.0;
+    for passe in 0..=RAFFINEMENTS {
+        let mut corr: Vec<f64> = (0..bins).map(|k| voulue(k as f64 * df, &delta)).collect();
+        let crete = corr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        normalisation = if o.normaliser && crete > 0.0 {
+            -crete
+        } else {
+            0.0
+        };
+        corr.iter_mut().for_each(|c| *c += normalisation);
+        // Module voulu ÷ module de la partie de phase fenêtrée.
+        let ln_mag: Vec<f64> = match &ez {
+            Some(ez) => corr
+                .iter()
+                .zip(ez)
                 .map(|(c, z)| (fft::from_db(*c) / z.norm().max(1e-6)).ln())
-                .collect()
+                .collect(),
+            None => corr.iter().map(|c| fft::from_db(*c).ln()).collect(),
+        };
+        let hmin = fft::irfft(&spectre_phase_minimale(&ln_mag, nfft), nfft);
+        h = match &phase {
+            Some(e) => fft::convolve(&hmin[..o.prises], e),
+            None => hmin[..o.prises].to_vec(),
+        };
+        h.truncate(o.prises);
+        // Fondu de sortie sur le dernier huitième : pas de troncature brutale.
+        let fondu = o.prises / 8;
+        for i in 0..fondu {
+            let w = 0.5 + 0.5 * (PI * i as f64 / fondu as f64).cos();
+            h[o.prises - fondu + i] *= w;
         }
-        None => corr.iter().map(|c| fft::from_db(*c).ln()).collect(),
-    };
-    let hmin = fft::irfft(&spectre_phase_minimale(&ln_mag, nfft), nfft);
-    let mut h = match &phase {
-        Some(e) => fft::convolve(&hmin[..o.prises], e),
-        None => hmin[..o.prises].to_vec(),
-    };
-    h.truncate(o.prises);
-    // Fondu de sortie sur le dernier huitième : pas de troncature brutale.
-    let fondu = o.prises / 8;
-    for i in 0..fondu {
-        let w = 0.5 + 0.5 * (PI * i as f64 / fondu as f64).cos();
-        h[o.prises - fondu + i] *= w;
-    }
-    if h.iter().any(|v| !v.is_finite()) {
-        return Err("filtre non fini (mesure dégénérée)".into());
+        if h.iter().any(|v| !v.is_finite()) {
+            return Err("filtre non fini (mesure dégénérée)".into());
+        }
+        // Ce que la vérification verra : (mesure + filtre), lissée comme la
+        // conception ; l'écart restant à la cible raffine la passe suivante.
+        reel = reponse_fir_db(&h, cadence, &freqs);
+        let somme = LogResponse {
+            freqs: freqs.clone(),
+            magnitude_db: mesure
+                .magnitude_db
+                .iter()
+                .zip(&reel)
+                .map(|(m, g)| m + g)
+                .collect(),
+        };
+        prevue = lissage_variable(&somme, o.lissage_bas_n, o.lissage_haut_n, o.f_lissage_hz)
+            .magnitude_db;
+        if passe < RAFFINEMENTS {
+            for (i, f) in freqs.iter().enumerate() {
+                if *f >= o.f_lo && *f <= o.f_hi {
+                    delta.magnitude_db[i] +=
+                        cible.level_db(*f) + offset + normalisation - prevue[i];
+                }
+            }
+        }
     }
 
-    let freqs = lisse.freqs.clone();
-    let reel = reponse_fir_db(&h, cadence, &freqs);
     let dans_bande = |i: &usize| freqs[*i] >= o.f_lo && freqs[*i] <= o.f_hi;
     let gain_max_db = (0..freqs.len())
         .filter(dans_bande)
@@ -649,13 +687,11 @@ pub fn concevoir_fir(
             .iter()
             .map(|f| cible.level_db(*f) + decalage)
             .collect(),
-        correction_db: freqs.iter().map(|f| voulue(*f) + normalisation).collect(),
-        prevue_db: lisse
-            .magnitude_db
+        correction_db: freqs
             .iter()
-            .zip(&reel)
-            .map(|(m, g)| m + g)
+            .map(|f| voulue(*f, &delta) + normalisation)
             .collect(),
+        prevue_db: prevue,
         mesure_lissee_db: lisse.magnitude_db,
         freqs,
         coefficients: h,
