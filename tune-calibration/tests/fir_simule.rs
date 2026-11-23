@@ -372,7 +372,7 @@ fn le_wav_du_fir_se_relit_comme_le_convolueur_le_lit() {
     let h = fir.coefficients.clone();
     let droite: Vec<f64> = h.iter().map(|v| v * 0.5).collect();
 
-    let octets = ecrire_wav(FS, &[h.clone()], FormatEchantillon::Flottant64).unwrap();
+    let octets = ecrire_wav(FS, std::slice::from_ref(&h), FormatEchantillon::Flottant64).unwrap();
     let (lu, sr) = lire_comme_le_convolueur(&octets).unwrap();
     assert_eq!(sr, FS);
     assert_eq!(lu.len(), 1);
