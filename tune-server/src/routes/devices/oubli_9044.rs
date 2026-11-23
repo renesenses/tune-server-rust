@@ -5,14 +5,17 @@
 //! elle empêchait même l'appareil revenu de réapparaître.
 //!
 //! * `GET /devices/absent` : les appareils connus (par leur zone) qui ne sont
-//!   plus là. **Sans durée** : `zones.last_seen_at` date le dernier RETOUR en
-//!   ligne, pas le départ — l'afficher comme « absent depuis » mentirait. Une
-//!   vraie date de départ viendra avec l'oubli groupé (rc14).
+//!   plus là, avec la date de leur départ (`absent_since`, rc14, voir
+//!   [`super::oubli_auto_9044`]) et, s'ils sont oubliés, `forgotten`.
 //! * `DELETE /devices/{id}` : oublier UN appareil — registre, appareils
-//!   ajoutés à la main, DLNA découverts (#6299) et ses zones, supprimées
-//!   DÉFINITIVEMENT pour qu'il revienne comme neuf s'il revient.
+//!   ajoutés à la main, DLNA découverts (#6299). Sa zone visible RESTE,
+//!   hors ligne, marquée « appareil oublié », avec ses réglages.
+//! * `DELETE /devices/{id}?with_zone=true` : la même chose, et ses zones
+//!   supprimées DÉFINITIVEMENT, réglages compris — le geste de l'utilisateur,
+//!   que le client n'envoie qu'après une confirmation qui a nommé la zone.
 //!
-//! Pas d'oubli groupé en rc13 (décision de Bertrand, 18/11).
+//! rc14 (décision de Bertrand, 23/11) : l'oubli automatique après une durée
+//! réglable vit dans [`super::oubli_auto_9044`], et ne supprime aucune zone.
 //!
 //! ## La zone liée — le choix le plus sûr
 //!
@@ -24,9 +27,8 @@
 //! * zone **visible** d'un appareil **présent** : `409 appareil_present`. Le
 //!   supprimer ne servirait à rien (la découverte le recrée) et casserait une
 //!   zone qui marche ; c'est « Ignorer » (#1280) qui le fait taire.
-//! * zone **visible** d'un appareil absent : `409 zone_liee`, qui nomme la
-//!   zone, tant que la requête ne porte pas `?with_zone=true` — que le client
-//!   n'envoie qu'après une confirmation qui a nommé la zone.
+//! * zone **visible** d'un appareil absent : gardée, marquée « appareil
+//!   oublié », sauf `?with_zone=true` (rc13 : `409 zone_liee`).
 //! * zone **masquée par l'utilisateur** (`suppression_utilisateur`,
 //!   `suppression_totale`, sans motif), y compris celle qui a lâché sa sortie
 //!   (#8987) : supprimée — c'est elle qui empêchait l'appareil de revenir.
@@ -55,7 +57,7 @@ use crate::state::AppState;
 
 /// Les identifiants que le réseau annonce en ce moment : scanner (identités
 /// secondaires comprises) et registre des sorties.
-async fn ids_presents(state: &AppState) -> HashSet<String> {
+pub(crate) async fn ids_presents(state: &AppState) -> HashSet<String> {
     let mut ids: HashSet<String> = state.outputs.lock().await.list().into_iter().collect();
     for d in state.scanner.devices().await {
         if let Some(alts) = d.capabilities.get("alternatives").and_then(Value::as_array) {
@@ -93,7 +95,6 @@ pub(crate) fn zone_absente(z: &ZoneDAppareil, presents: &HashSet<String>) -> boo
 pub(crate) enum Refus {
     ZoneEnLecture { zone_id: i64, zone: String },
     AppareilPresent { zone_id: i64, zone: String },
-    ZoneLiee { zone_id: i64, zone: String },
 }
 
 impl Refus {
@@ -111,9 +112,6 @@ impl Refus {
                 zone_id,
                 zone,
             ),
-            Self::ZoneLiee { zone_id, zone } => {
-                ("zone_liee", "api.devices.forgetZoneLinked", zone_id, zone)
-            }
         };
         (
             StatusCode::CONFLICT,
@@ -138,7 +136,9 @@ impl Refus {
 /// `zones` : les zones de l'appareil (masquées et libérées comprises) ;
 /// `en_lecture` : celles qui jouent ou sont en pause ; `present` : l'appareil
 /// est-il annoncé ; `avec_zone` : l'utilisateur a-t-il accepté, après une
-/// confirmation qui la nommait, de perdre la zone visible.
+/// confirmation qui la nommait, de perdre la zone visible. Sans cet accord,
+/// la zone visible reste (rc14) : seules partent les zones que l'utilisateur
+/// avait déjà supprimées (masquées).
 ///
 /// Les zones masquées par un garde-fou de la découverte ne sont ni
 /// supprimées ni bloquantes : elles restent, et c'est tout.
@@ -162,19 +162,17 @@ pub(crate) fn verdict(
                 zone: z.name.clone(),
             });
         }
-        if !avec_zone {
-            return Err(Refus::ZoneLiee {
-                zone_id: z.id,
-                zone: z.name.clone(),
-            });
-        }
     }
-    Ok(oubliables.iter().map(|z| z.id).collect())
+    Ok(oubliables
+        .iter()
+        .filter(|z| z.hidden || avec_zone)
+        .map(|z| z.id)
+        .collect())
 }
 
 /// L'appareil est-il présent ? Ses zones locales répondent par `online`,
 /// le reste par le réseau.
-fn appareil_present(device_id: &str, zones: &[ZoneDAppareil], presents: &HashSet<String>) -> bool {
+pub(crate) fn appareil_present(device_id: &str, zones: &[ZoneDAppareil], presents: &HashSet<String>) -> bool {
     if zones.is_empty() {
         return presents.contains(device_id);
     }
@@ -182,7 +180,8 @@ fn appareil_present(device_id: &str, zones: &[ZoneDAppareil], presents: &HashSet
 }
 
 /// Oublier `device_id` : vérifie, puis efface. Rend les zones supprimées,
-/// avec leur nom.
+/// avec leur nom. Une zone visible gardée fait marquer l'appareil « oublié »
+/// ; sans zone visible restante, la marque n'a plus d'objet et s'efface.
 async fn oublier(
     state: &AppState,
     device_id: &str,
@@ -245,11 +244,28 @@ async fn oublier(
             }
         }
     }
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let zone_gardee = zones
+        .iter()
+        .find(|z| z.oubliable() && !z.hidden && !supprimees.iter().any(|(id, _)| *id == z.id));
+    let marque = match zone_gardee {
+        Some(z) => {
+            state.event_bus.emit_typed(
+                tune_core::event_types::EventType::ZoneUpdated,
+                json!({ "id": z.id }),
+            );
+            super::oubli_auto_9044::marquer_oublie(&settings, device_id, chrono::Utc::now(), false)
+        }
+        None => super::oubli_auto_9044::effacer_les_traces(&settings, device_id),
+    };
+    if let Err(e) = marque {
+        warn!(device_id, error = %e, "appareil_oubli_marque_non_ecrite");
+    }
     state.event_bus.emit_typed(
         tune_core::event_types::EventType::DeviceLost,
         json!({ "device_id": device_id }),
     );
-    info!(device_id, zones = ?supprimees, "appareil_oublie");
+    info!(device_id, zones = ?supprimees, zone_gardee = zone_gardee.map(|z| z.id), "appareil_oublie");
     Ok(supprimees)
 }
 
@@ -298,7 +314,16 @@ pub(crate) async fn delete_device(
 /// emporterait (visibles, masquées par l'utilisateur, libérées #8987). Un
 /// appareil dont aucune zone n'est oubliable n'est pas listé : l'oublier ne
 /// supprimerait rien de ce que l'utilisateur voit.
-pub(crate) fn absents(zones: &[ZoneDAppareil], presents: &HashSet<String>) -> Vec<Value> {
+///
+/// rc14 : chaque ligne porte `absent_since` (le départ daté par le balayage,
+/// `null` s'il ne l'a pas encore vu) et, pour un appareil oublié dont la zone
+/// est restée, `forgotten: true`, `forgotten_at`, `forgotten_auto`.
+pub(crate) fn absents(
+    zones: &[ZoneDAppareil],
+    presents: &HashSet<String>,
+    absences: &[super::oubli_auto_9044::Absence],
+    oublis: &[super::oubli_auto_9044::Oubli],
+) -> Vec<Value> {
     let mut ordre: Vec<&str> = Vec::new();
     for z in zones.iter().filter(|z| z.oubliable()) {
         if !ordre.contains(&z.output_device_id.as_str()) {
@@ -319,11 +344,20 @@ pub(crate) fn absents(zones: &[ZoneDAppareil], presents: &HashSet<String>) -> Ve
             let siennes: Vec<&ZoneDAppareil> = toutes.iter().filter(|z| z.oubliable()).collect();
             // La zone qui le représente : une visible d'abord.
             let tete = siennes.iter().find(|z| !z.hidden).unwrap_or(&siennes[0]);
+            let depuis = absences
+                .iter()
+                .find(|a| a.device_id == device_id)
+                .map(|a| a.depuis.clone());
+            let oubli = oublis.iter().find(|o| o.device_id == device_id);
             Some(json!({
                 "device_id": device_id,
                 "name": tete.name,
                 "type": tete.output_type,
                 "zone_id": tete.id,
+                "absent_since": depuis,
+                "forgotten": oubli.is_some(),
+                "forgotten_at": oubli.map(|o| o.le.clone()),
+                "forgotten_auto": oubli.is_some_and(|o| o.auto),
                 "zones": siennes
                     .iter()
                     .map(|z| json!({
@@ -352,7 +386,13 @@ pub(crate) async fn list_absent_devices(State(state): State<AppState>) -> Respon
         }
     };
     let presents = ids_presents(&state).await;
-    let items = absents(&zones, &presents);
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let items = absents(
+        &zones,
+        &presents,
+        &super::oubli_auto_9044::lire_absences(&settings),
+        &super::oubli_auto_9044::lire_oublis(&settings),
+    );
     Json(json!({
         "total": items.len(),
         "items": items,
