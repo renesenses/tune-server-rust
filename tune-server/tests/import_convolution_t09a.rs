@@ -53,7 +53,12 @@ fn archive(fichiers: &[(&str, Vec<u8>)]) -> Vec<u8> {
     tampon.into_inner()
 }
 
-async fn appel(app: &axum::Router, methode: &str, chemin: &str, corps: Vec<u8>) -> (StatusCode, Value) {
+async fn appel(
+    app: &axum::Router,
+    methode: &str,
+    chemin: &str,
+    corps: Vec<u8>,
+) -> (StatusCode, Value) {
     let req = Request::builder()
         .method(methode)
         .uri(chemin)
@@ -65,7 +70,10 @@ async fn appel(app: &axum::Router, methode: &str, chemin: &str, corps: Vec<u8>) 
     let octets = axum::body::to_bytes(resp.into_body(), usize::MAX)
         .await
         .unwrap();
-    (status, serde_json::from_slice(&octets).unwrap_or(json!(null)))
+    (
+        status,
+        serde_json::from_slice(&octets).unwrap_or(json!(null)),
+    )
 }
 
 #[tokio::test]
@@ -135,7 +143,10 @@ async fn un_zip_remplace_le_jeu_et_un_zip_piege_est_refuse_sans_rien_toucher() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "{refus}");
     assert_eq!(refus["code"], "archive_refused");
     assert_eq!(refus["reason"], "unsafe_path");
-    assert_eq!(refus["message_key"], "api.roomCorrection.archive.unsafe_path");
+    assert_eq!(
+        refus["message_key"],
+        "api.roomCorrection.archive.unsafe_path"
+    );
     assert!(!dossier.parent().unwrap().join("evil.wav").exists());
     let (_, apres) = appel(
         &app,
@@ -144,7 +155,10 @@ async fn un_zip_remplace_le_jeu_et_un_zip_piege_est_refuse_sans_rien_toucher() {
         Vec::new(),
     )
     .await;
-    assert_eq!(apres["files"], statut["files"], "le jeu en place est intact");
+    assert_eq!(
+        apres["files"], statut["files"],
+        "le jeu en place est intact"
+    );
     assert_eq!(apres["set_name"], "living-room.zip");
 
     std::fs::remove_dir_all(&dossier).ok();
