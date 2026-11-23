@@ -262,15 +262,17 @@ pub fn acheminer(r: &Resolution, f: &FaitsUpnp) -> AcheminementUpnp {
     a
 }
 
-/// La source de la résolution est-elle un DSD ?
+/// La source de la résolution est-elle un DSD CONVERTI en PCM ? (En natif,
+/// en DoP ou quand le mode est inconnu, la résolution éteint déjà la chaîne :
+/// rien n'est converti, la source part telle quelle.)
 fn source_dsd(r: &Resolution) -> bool {
-    r.etapes
+    let params = r
+        .etapes
         .iter()
         .find(|e| e.code == CodeEtape::Source)
-        .and_then(|e| e.params.as_ref())
-        .and_then(|p| p.get("kind"))
-        .and_then(|k| k.as_str())
-        == Some("dsd")
+        .and_then(|e| e.params.as_ref());
+    let champ = |c: &str| params.and_then(|p| p.get(c)).and_then(|v| v.as_str());
+    champ("kind") == Some("dsd") && champ("played_as") == Some("converted_to_pcm")
 }
 
 /// Reporte la voie sur la résolution : un étage que la voie ne porte pas est
