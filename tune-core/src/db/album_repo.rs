@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use super::absorption::{self, table_absente};
 use super::backend::{DbBackend, SqlValue, ToSqlValue};
@@ -6,6 +6,14 @@ use super::engine::{Engine, PostgresDialect, SqlDialect, SqliteDialect};
 use super::models::{Album, SourcePochette};
 use super::sqlite::SqliteDb;
 use crate::TuneError;
+
+#[cfg(test)]
+thread_local! {
+    /// Fil du forum 3013 — combien de fois CE fil a lu et trié un ensemble
+    /// entier pour une liste alphabétique (témoin de l'ordre gardé).
+    pub(crate) static LECTURES_D_ORDRE_ALPHABETIQUE: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
 
 /// Première position de chaque initiale dans une liste triée.
 pub type ReperesAlphabetiques = std::collections::BTreeMap<String, usize>;
@@ -4470,6 +4478,47 @@ impl AlbumRepo {
     /// `desc` ne renverse que la clé principale, comme le `{dir}` du SQL
     /// qu'elle remplace : les départages restent croissants, et l'ordre reste
     /// total dans les deux sens.
+    /// Fil du forum 3013 — l'ordre alphabétique ENTIER d'une liste (sa
+    /// requête, ses valeurs liées, son sens), gardé sous le jeton des données
+    /// ([`DbBackend::jeton_des_donnees`]) : calculé une fois entre deux
+    /// écritures, et non à chaque page.
+    ///
+    /// Avant, chaque page de la grille (100 albums) relisait l'ensemble filtré
+    /// et le triait en Rust : sur une grande bibliothèque, défiler sous la
+    /// lettre « R » demandait une page tous les quatre gestes, et chacune
+    /// coûtait autant que la bibliothèque entière, en tenant une des trois
+    /// connexions de lecture. Les quelques listes gardées (tri, sens, filtres)
+    /// sont celles qu'un écran parcourt. Le jeton est lu AVANT la lecture :
+    /// une écriture entre les deux la périme. Sans jeton (PostgreSQL, base en
+    /// mémoire), rien n'est gardé, comme avant.
+    fn ordre_alphabetique_garde(
+        &self,
+        cle: &str,
+        lire: impl FnOnce() -> Result<(Vec<i64>, ReperesAlphabetiques), TuneError>,
+    ) -> Result<Arc<(Vec<i64>, ReperesAlphabetiques)>, TuneError> {
+        type Garde = Vec<((u64, i64), String, Arc<(Vec<i64>, ReperesAlphabetiques)>)>;
+        static ORDRES_GARDES: Mutex<Garde> = Mutex::new(Vec::new());
+        const ORDRES_GARDES_MAX: usize = 4;
+        let jeton = self.db.jeton_des_donnees();
+        if let Some(j) = jeton
+            && let Ok(garde) = ORDRES_GARDES.lock()
+            && let Some((_, _, ordre)) = garde.iter().find(|(jj, c, _)| *jj == j && c == cle)
+        {
+            return Ok(ordre.clone());
+        }
+        let ordre = Arc::new(lire()?);
+        if let Some(j) = jeton
+            && let Ok(mut garde) = ORDRES_GARDES.lock()
+        {
+            garde.retain(|(jj, c, _)| *jj == j && c != cle);
+            if garde.len() >= ORDRES_GARDES_MAX {
+                garde.remove(0);
+            }
+            garde.push((j, cle.to_string(), ordre.clone()));
+        }
+        Ok(ordre)
+    }
+
     fn ids_en_ordre_alphabetique(
         &self,
         sql: &str,
@@ -4478,6 +4527,8 @@ impl AlbumRepo {
         desc: bool,
     ) -> Result<(Vec<i64>, ReperesAlphabetiques), TuneError> {
         use crate::upnp_server::{CleAlphabetique, cle_alphabetique};
+        #[cfg(test)]
+        LECTURES_D_ORDRE_ALPHABETIQUE.with(|n| n.set(n.get() + 1));
         let lignes = self.db.query_many(sql, valeurs)?;
         let mut cles: Vec<(CleAlphabetique, Option<i64>, Option<CleAlphabetique>, i64)> = lignes
             .iter()
@@ -4777,13 +4828,19 @@ impl AlbumRepo {
             );
             let refs: Vec<&dyn ToSqlValue> =
                 bind_values.iter().map(|v| v as &dyn ToSqlValue).collect();
-            let (ids, reperes) =
-                self.ids_en_ordre_alphabetique(&sql, &refs, sort == "artist", dir == "DESC")?;
+            let (par_artiste, desc) = (sort == "artist", dir == "DESC");
+            // Fil du forum 3013 — l'ordre entier est gardé entre deux
+            // écritures : une page ne relit plus toute la bibliothèque.
+            let cle = format!("{sql}|{bind_values:?}|{par_artiste}|{desc}");
+            let ordre = self.ordre_alphabetique_garde(&cle, || {
+                self.ids_en_ordre_alphabetique(&sql, &refs, par_artiste, desc)
+            })?;
+            let (ids, reperes) = ordre.as_ref();
             let total = avec_total.then_some(ids.len() as i64);
             (
-                super::ordre_alphabetique::tranche(ids, limit, offset),
+                super::ordre_alphabetique::tranche_empruntee(ids, limit, offset),
                 total,
-                Some(reperes),
+                Some(reperes.clone()),
             )
         } else {
             let sql = format!(
@@ -9978,3 +10035,7 @@ pub(crate) mod tests {
         eprintln!("id offset=0: {} albums en {:?}", page.len(), t0.elapsed());
     }
 }
+
+#[cfg(test)]
+#[path = "defilement_grande_bibliotheque_3013_tests.rs"]
+mod defilement_grande_bibliotheque_3013_tests;
