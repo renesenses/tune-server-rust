@@ -347,7 +347,7 @@ async fn importer_le_jeu(
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({
-                "error": "aucune réponse impulsionnelle",
+                "error": "no impulse response in the upload",
                 "code": "archive_refused",
                 "reason": "no_filter",
                 "message_key": "api.roomCorrection.archive.no_filter",

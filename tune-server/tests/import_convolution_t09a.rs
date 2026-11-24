@@ -78,8 +78,8 @@ async fn appel(
 
 #[tokio::test]
 async fn un_zip_remplace_le_jeu_et_un_zip_piege_est_refuse_sans_rien_toucher() {
-    let dossier = std::env::temp_dir().join(format!("tune_t09a_{}", std::process::id()));
-    std::fs::create_dir_all(&dossier).unwrap();
+    let racine = tune_core::test_scratch::scratch_dir("tune-t09a-import");
+    let dossier = racine.path().to_path_buf();
     // SAFETY : seul test de ce binaire, avant toute tâche.
     unsafe { std::env::set_var("TUNE_DATA_DIR", &dossier) };
     let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
@@ -161,5 +161,5 @@ async fn un_zip_remplace_le_jeu_et_un_zip_piege_est_refuse_sans_rien_toucher() {
     );
     assert_eq!(apres["set_name"], "living-room.zip");
 
-    std::fs::remove_dir_all(&dossier).ok();
+    drop(racine);
 }

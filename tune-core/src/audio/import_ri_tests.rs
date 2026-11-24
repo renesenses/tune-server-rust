@@ -311,14 +311,12 @@ fn le_jeu_ecrit_se_relit_a_l_identique() {
         "x.zip",
     )
     .unwrap();
-    let dossier = std::env::temp_dir().join(format!("import_ri_{}", std::process::id()));
-    std::fs::create_dir_all(&dossier).unwrap();
-    let chemin = dossier.join("zone_1_sr44100.wav");
+    let dossier = crate::test_scratch::scratch_dir("import-ri-t09a");
+    let chemin = dossier.path().join("zone_1_sr44100.wav");
     let r = &j.reponses[0];
     crate::audio::convolver::ecrire_ri_wav(chemin.to_str().unwrap(), &r.taps, r.sample_rate)
         .unwrap();
     let (taps, sr) = Convolver::read_ir_taps(chemin.to_str().unwrap()).unwrap();
-    std::fs::remove_dir_all(&dossier).ok();
     assert_eq!(sr, 44_100);
     assert_eq!(taps, r.taps);
 }
