@@ -214,7 +214,7 @@ fn piece_nettoyee(mut file: AttachmentUpload) -> Result<AttachmentUpload, (u16, 
                 400u16,
                 json!({
                     "error": "attachment_unreadable",
-                    "detail": format!("« {} » n'est pas un texte lisible (UTF-8 ou UTF-16).", file.file_name),
+                    "detail": format!("\"{}\" is not readable text (UTF-8 or UTF-16).", file.file_name),
                 }),
             )
         })?;
