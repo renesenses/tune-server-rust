@@ -2127,25 +2127,102 @@ pub fn nom_annonce_du_serveur(state: &AppState) -> String {
     tune_core::discovery::nom_annonce::nom_annonce(reglage.as_deref(), udn)
 }
 
+/// Les familles de sorties réseau que ce serveur CHERCHE à découvrir (mDNS et
+/// SSDP). Par défaut : toutes, comme avant ce type — le binaire standard ne
+/// change pas.
+///
+/// Un binaire composeur dédié à une sortie (par exemple Diretta et la sortie
+/// locale) peut n'en chercher aucune ([`Self::aucune`]) : il n'a alors ni
+/// recherche multicast ni suivi d'appareils Cast, AirPlay ou DLNA qu'il
+/// n'utilisera jamais. Cela ne touche PAS à l'annonce du serveur lui-même
+/// (`register_self`, `register_sendspin_server`) : les télécommandes continuent
+/// de le trouver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecouverteDesSorties {
+    pub chromecast: bool,
+    pub airplay: bool,
+    pub bluos: bool,
+    pub oaat: bool,
+    pub squeezebox: bool,
+    pub sendspin: bool,
+    /// Les autres serveurs Tune du réseau (#1273).
+    pub pairs_tune: bool,
+    /// DLNA / OpenHome (SSDP).
+    pub dlna_openhome: bool,
+}
+
+impl Default for DecouverteDesSorties {
+    fn default() -> Self {
+        Self {
+            chromecast: true,
+            airplay: true,
+            bluos: true,
+            oaat: true,
+            squeezebox: true,
+            sendspin: true,
+            pairs_tune: true,
+            dlna_openhome: true,
+        }
+    }
+}
+
+impl DecouverteDesSorties {
+    /// Aucune famille : le serveur ne parcourt ni mDNS ni SSDP pour des sorties.
+    pub const fn aucune() -> Self {
+        Self {
+            chromecast: false,
+            airplay: false,
+            bluos: false,
+            oaat: false,
+            squeezebox: false,
+            sendspin: false,
+            pairs_tune: false,
+            dlna_openhome: false,
+        }
+    }
+}
+
 pub fn spawn_mdns_handler(
     state: &AppState,
 ) -> Option<std::sync::Arc<tune_core::discovery::mdns::MdnsScanner>> {
+    spawn_mdns_handler_avec(state, DecouverteDesSorties::default())
+}
+
+/// Comme [`spawn_mdns_handler`], en ne parcourant que les familles demandées.
+pub fn spawn_mdns_handler_avec(
+    state: &AppState,
+    decouverte: DecouverteDesSorties,
+) -> Option<std::sync::Arc<tune_core::discovery::mdns::MdnsScanner>> {
     let (mdns_tx, mut mdns_rx) = tokio::sync::mpsc::channel(64);
     let handle = if let Ok(mdns) = tune_core::discovery::mdns::MdnsScanner::new(mdns_tx) {
-        let mut mdns = mdns
-            .with_chromecast()
-            .with_airplay()
-            .with_bluos()
-            .with_oaat()
-            .with_squeezebox()
-            // Lecteurs Sendspin (#3326, phase 1). On les PARCOURT sans jamais
-            // enregistrer de sortie : voir le bras `OutputType::Sendspin` du
-            // `match` ci-dessous.
-            .with_sendspin()
-            // Browse peer Tune servers too, so this server can list the other
-            // Tune servers on the network (#1273). Each server already announces
-            // itself via `register_self`; without this it never browsed back.
-            .with_tune_peers();
+        let mut mdns = mdns;
+        if decouverte.chromecast {
+            mdns = mdns.with_chromecast();
+        }
+        if decouverte.airplay {
+            mdns = mdns.with_airplay();
+        }
+        if decouverte.bluos {
+            mdns = mdns.with_bluos();
+        }
+        if decouverte.oaat {
+            mdns = mdns.with_oaat();
+        }
+        if decouverte.squeezebox {
+            mdns = mdns.with_squeezebox();
+        }
+        // Lecteurs Sendspin (#3326, phase 1). On les PARCOURT sans jamais
+        // enregistrer de sortie : voir le bras `OutputType::Sendspin` du
+        // `match` ci-dessous.
+        if decouverte.sendspin {
+            mdns = mdns.with_sendspin();
+        }
+        // Browse peer Tune servers too, so this server can list the other
+        // Tune servers on the network (#1273). Each server already announces
+        // itself via `register_self`; without this it never browsed back.
+        if decouverte.pairs_tune {
+            mdns = mdns.with_tune_peers();
+        }
         if let Err(e) = mdns.start() {
             tracing::warn!(error = %e, "mdns_start_failed");
         }
@@ -6247,3 +6324,95 @@ mod decouverte_volume_6774_tests;
 #[cfg(test)]
 #[path = "discovery_setup/renderer_sur_cette_machine_7875_tests.rs"]
 mod renderer_sur_cette_machine_7875_tests;
+
+#[cfg(test)]
+mod decouverte_restreinte_tests {
+    use super::DecouverteDesSorties;
+
+    /// Le binaire standard ne doit rien perdre : par défaut, toutes les familles.
+    #[test]
+    fn par_defaut_toutes_les_familles_sont_cherchees() {
+        let d = DecouverteDesSorties::default();
+        assert!(
+            d.chromecast
+                && d.airplay
+                && d.bluos
+                && d.oaat
+                && d.squeezebox
+                && d.sendspin
+                && d.pairs_tune
+                && d.dlna_openhome,
+            "{d:?}"
+        );
+    }
+
+    /// `aucune()` n'en laisse passer aucune — y compris si on ajoute un champ
+    /// plus tard et qu'on oublie de le mettre à faux ici.
+    #[test]
+    fn aucune_ne_cherche_rien() {
+        let d = DecouverteDesSorties::aucune();
+        assert!(
+            !(d.chromecast
+                || d.airplay
+                || d.bluos
+                || d.oaat
+                || d.squeezebox
+                || d.sendspin
+                || d.pairs_tune
+                || d.dlna_openhome),
+            "{d:?}"
+        );
+        assert_ne!(d, DecouverteDesSorties::default());
+    }
+
+    /// Le câblage : chaque famille mDNS n'est ajoutée QUE sous son drapeau.
+    /// Sans cela, un drapeau resterait sans effet et la demande « Diretta et
+    /// sortie locale seulement » ne serait pas tenue. Le test lit la source de
+    /// la fonction, bornée à son corps.
+    #[test]
+    fn chaque_famille_mdns_est_gardee_par_son_drapeau() {
+        let source = include_str!("discovery_setup.rs");
+        let debut = source
+            .find("pub fn spawn_mdns_handler_avec(")
+            .expect("spawn_mdns_handler_avec doit exister");
+        let corps = &source[debut..debut + 2500];
+        for (drapeau, appel) in [
+            ("chromecast", "with_chromecast()"),
+            ("airplay", "with_airplay()"),
+            ("bluos", "with_bluos()"),
+            ("oaat", "with_oaat()"),
+            ("squeezebox", "with_squeezebox()"),
+            ("sendspin", "with_sendspin()"),
+            ("pairs_tune", "with_tune_peers()"),
+        ] {
+            let garde = format!("if decouverte.{drapeau} {{");
+            let g = corps
+                .find(&garde)
+                .unwrap_or_else(|| panic!("la garde `{garde}` doit exister"));
+            let a = corps
+                .find(appel)
+                .unwrap_or_else(|| panic!("l'appel `{appel}` doit exister"));
+            assert!(
+                g < a && a - g < 80,
+                "{appel} doit suivre sa garde {drapeau}"
+            );
+        }
+    }
+
+    /// Et SSDP : le bootstrap ne le lance que si la famille est demandée.
+    #[test]
+    fn le_bootstrap_garde_ssdp_par_son_drapeau() {
+        let source = include_str!("bootstrap.rs");
+        let garde = source
+            .find("if opts.decouverte.dlna_openhome {")
+            .expect("SSDP doit être gardé par `dlna_openhome`");
+        let appel = source
+            .find("spawn_ssdp_handler(&state")
+            .expect("l'appel SSDP doit exister");
+        assert!(garde < appel && appel - garde < 120);
+        assert!(
+            source.contains("spawn_mdns_handler_avec(&state, opts.decouverte)"),
+            "le bootstrap doit transmettre `opts.decouverte` au gestionnaire mDNS"
+        );
+    }
+}

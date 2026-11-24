@@ -54,6 +54,11 @@ pub struct RunOptions {
     /// que reclame une decouverte reseau dynamique doublee d'une
     /// reverification periodique d'habilitation.
     pub output_providers: Vec<std::sync::Arc<dyn tune_core::outputs::traits::OutputProvider>>,
+    /// Les familles de sorties réseau cherchées par mDNS et SSDP. Par défaut :
+    /// toutes, comme le binaire standard. Un binaire composeur dédié à une sortie
+    /// peut passer [`DecouverteDesSorties::aucune`] pour ne rien parcourir ; le
+    /// serveur reste annoncé (les télécommandes le trouvent toujours).
+    pub decouverte: crate::discovery_setup::DecouverteDesSorties,
 }
 
 /// Start the server and serve until a shutdown signal arrives.
@@ -565,10 +570,12 @@ pub async fn run_with(opts: RunOptions) {
     let oh_event_listener = crate::startup::create_oh_listener().await;
 
     // SSDP discovery (DLNA / OpenHome)
-    crate::discovery_setup::spawn_ssdp_handler(&state, &config, oh_event_listener);
+    if opts.decouverte.dlna_openhome {
+        crate::discovery_setup::spawn_ssdp_handler(&state, &config, oh_event_listener);
+    }
 
     // mDNS discovery (Chromecast, AirPlay, BluOS, OAAT, Squeezebox)
-    let _mdns_handle = crate::discovery_setup::spawn_mdns_handler(&state);
+    let _mdns_handle = crate::discovery_setup::spawn_mdns_handler_avec(&state, opts.decouverte);
 
     // Sorties hors-arbre apportees par un binaire composeur (tune-diretta).
     // Sans effet pour le binaire standard : `RunOptions::default()` n'a aucun
