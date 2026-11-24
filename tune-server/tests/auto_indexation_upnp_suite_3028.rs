@@ -570,7 +570,92 @@ async fn url_d_un_tune_tiers_aucun_rattachement() {
         Some("http://192.0.2.77:8888/api/v1/library/tracks/100/audio".into()),
         false,
     );
-    aucun_rattachement(b, "Tune tiers").await;
+    // Cet autre Tune est CONNU : il figure au registre sous son propre UDN.
+    observer(
+        &b.etat,
+        "uuid:00000000-aaaa-bbbb-cccc-0000000000a7",
+        "192.0.2.77",
+        8888,
+        "http://192.0.2.77:8888/upnp/description.xml",
+    );
+    aucun_rattachement(b, "Tune tiers connu").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn hote_inconnu_et_piste_concordante_unique_rattache() {
+    // L'URL porte un nom d'hôte que nous ne reconnaissons pas (IP DHCP
+    // changée, port redirigé, nom au lieu de l'IP) et qu'aucun serveur du
+    // registre ne porte : c'est le plus souvent nous-mêmes. L'identifiant de
+    // l'URL est ignoré, la piste locale concordante unique est retenue.
+    let b = banc(
+        "Wonderwall",
+        Some("Oasis"),
+        Some("Morning Glory"),
+        258000,
+        Some("http://mac-de-test.fritz.box:8888/api/v1/library/tracks/999/audio".into()),
+        false,
+    );
+    let apercu = apercu_du_retrait(&b).await;
+    assert_eq!(apercu["removal"]["liens_rattaches"], json!(1), "{apercu}");
+    assert_eq!(
+        apercu["removal"]["liens_sans_equivalent"],
+        json!(0),
+        "{apercu}"
+    );
+    let generation = apercu["generation"].as_str().unwrap().to_string();
+    let (statut, fait) = confirmer(&b, &generation, 1).await;
+    assert_eq!(statut, StatusCode::OK, "{fait}");
+    assert_eq!(
+        entier(
+            &b.etat,
+            "SELECT COUNT(*) FROM favorites WHERE item_type = 'track' AND CAST(item_id AS TEXT) = '100'",
+            &[]
+        ),
+        1,
+        "le favori suit la piste locale concordante"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn l_ancien_retrait_par_serveur_n_efface_pas_les_favoris_de_ce_tune() {
+    // `DELETE /media-servers/{udn}/bibliotheque` (#4624) efface les favoris
+    // sans les rattacher. Sur notre propre UDN, il est refusé (409) et renvoie
+    // vers l'action `remove` ; le favori reste.
+    let b = banc(
+        "Wonderwall",
+        Some("Oasis"),
+        Some("Morning Glory"),
+        258000,
+        None,
+        false,
+    );
+    let udn = b.etat.upnp.as_ref().unwrap().uuid.clone();
+    let (statut, corps) = appeler(
+        &b.app,
+        "DELETE",
+        &format!("/api/v1/network/media-servers/{udn}/bibliotheque?pistes=1"),
+        None,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::CONFLICT, "{corps}");
+    assert_eq!(corps["code"], json!("this_server_use_remove"), "{corps}");
+    assert_eq!(
+        entier(
+            &b.etat,
+            "SELECT COUNT(*) FROM favorites WHERE CAST(item_id AS TEXT) = '200'",
+            &[]
+        ),
+        1,
+        "le favori n'est pas effacé"
+    );
+    assert_eq!(
+        entier(
+            &b.etat,
+            "SELECT COUNT(*) FROM tracks WHERE source = 'upnp'",
+            &[]
+        ),
+        1
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

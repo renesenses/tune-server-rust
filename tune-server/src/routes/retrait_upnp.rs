@@ -320,25 +320,57 @@ fn retirer_dans(tx: &dyn DbTxHandle, udn: &str) -> Result<i64, String> {
 pub struct NotreAdresse {
     pub adresses: Vec<String>,
     pub port: u16,
+    /// Les AUTRES serveurs connus du registre (`hôte`, `port`), ceux que
+    /// `est_ce_serveur` ne reconnaît pas comme nous : un autre Tune du réseau
+    /// y figure sous son UDN.
+    pub autres: Vec<(String, u16)>,
 }
 
 impl NotreAdresse {
     pub fn de(state: &AppState) -> Self {
+        let autres =
+            tune_core::db::media_server_repo::MediaServerRepo::with_backend(state.backend.clone())
+                .lister()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|s| {
+                    let hote = s.host.clone().filter(|h| !h.is_empty())?;
+                    let port = s.port.and_then(|p| u16::try_from(p).ok())?;
+                    (!crate::discovery_setup::est_ce_serveur(
+                        state,
+                        &s.udn,
+                        &hote,
+                        port,
+                        &s.location,
+                    ))
+                    .then_some((hote, port))
+                })
+                .collect();
         Self {
             adresses: crate::discovery_setup::nos_adresses(state.config.advertised_ip.as_deref()),
             port: state.config.port,
+            autres,
         }
+    }
+
+    /// L'hôte d'une URL, sans les crochets d'une IPv6 (`Ipv6Addr::to_string`).
+    fn hote_et_port(url: &reqwest::Url) -> Option<(&str, u16)> {
+        let hote = url.host_str()?;
+        let hote = hote.trim_start_matches('[').trim_end_matches(']');
+        Some((hote, url.port_or_known_default()?))
     }
 
     /// L'URL vise-t-elle CE serveur (hôte ET port) ?
     fn designe_ce_serveur(&self, url: &reqwest::Url) -> bool {
-        // `host_str` rend une IPv6 entre crochets ; nos adresses s'écrivent
-        // sans, comme `Ipv6Addr::to_string`.
-        let Some(hote) = url.host_str() else {
-            return false;
-        };
-        let hote = hote.trim_start_matches('[').trim_end_matches(']');
-        url.port_or_known_default() == Some(self.port) && self.adresses.iter().any(|a| a == hote)
+        Self::hote_et_port(url).is_some_and(|(hote, port)| {
+            port == self.port && self.adresses.iter().any(|a| a == hote)
+        })
+    }
+
+    /// L'URL vise-t-elle un AUTRE serveur connu du registre ?
+    fn designe_un_autre_serveur(&self, url: &reqwest::Url) -> bool {
+        Self::hote_et_port(url)
+            .is_some_and(|(hote, port)| self.autres.iter().any(|(h, p)| h == hote && *p == port))
     }
 }
 
@@ -407,11 +439,14 @@ fn concorde(d: &Signature, l: &Signature) -> bool {
 ///
 /// - Signature distante incomplète (artiste, album ou durée inconnus) :
 ///   aucune. Le titre seul ne suffit pas.
-/// - URL de lecture d'un Tune (`/library/tracks/<id>/audio`) : elle doit viser
-///   CE serveur (hôte et port), et la piste qu'elle nomme doit concorder
-///   (titre, artiste, album, durée à 2 s). Une URL d'un AUTRE Tune nomme une
-///   piste d'une autre bibliothèque : aucune, même si une piste locale a les
-///   mêmes étiquettes.
+/// - URL de lecture d'un Tune (`/library/tracks/<id>/audio`) :
+///   - qui vise CE serveur (hôte et port) : la piste qu'elle nomme doit
+///     concorder (titre, artiste, album, durée à 2 s), sinon aucune ;
+///   - qui vise un AUTRE serveur connu du registre (un autre Tune, sous son
+///     UDN) : aucune, même si une piste locale a les mêmes étiquettes ;
+///   - dont l'hôte n'est pas reconnu (IP DHCP changée, port redirigé, nom
+///     d'hôte au lieu de l'IP), le plus souvent nous-mêmes : l'identifiant
+///     de l'URL est ignoré, et la règle des étiquettes ci-dessous s'applique.
 /// - Sinon, une seule piste locale concordante. Deux ou plus : aucune.
 fn equivalent(
     d: &Signature,
@@ -426,13 +461,15 @@ fn equivalent(
     if let Some(url) = url.as_ref()
         && let Some(nomme) = id_d_une_url_de_tune(url)
     {
-        if !nous.designe_ce_serveur(url) {
+        if nous.designe_ce_serveur(url) {
+            return locales
+                .iter()
+                .find(|l| l.id == nomme && concorde(d, l))
+                .map(|l| l.id);
+        }
+        if nous.designe_un_autre_serveur(url) {
             return None;
         }
-        return locales
-            .iter()
-            .find(|l| l.id == nomme && concorde(d, l))
-            .map(|l| l.id);
     }
     let mut candidates = locales.iter().filter(|l| concorde(d, l));
     match (candidates.next(), candidates.next()) {
@@ -699,6 +736,20 @@ pub async fn retrait_de_la_bibliotheque(
             )),
         )
     })?;
+    // Fil du forum 3028 — sur CE Tune, chaque piste distante est le reflet
+    // d'une piste locale : ce retrait-ci effacerait leurs favoris et leurs
+    // entrées de playlist sans les rattacher. Il est refusé, et renvoie vers
+    // l'action `remove` des sources de bibliothèque, qui rattache d'abord.
+    if super::synchronisation_upnp::source_vise_ce_serveur(&state, &udn).await {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(crate::message_api::corps_refus(
+                "this_server_use_remove",
+                "api.upnp.thisServerUseRemove",
+                &[],
+            )),
+        ));
+    }
     let vu = apercu(&state, &udn).map_err(interne)?;
     if vu.pistes == 0 && vu.albums == 0 && vu.sources == 0 {
         return Err((
