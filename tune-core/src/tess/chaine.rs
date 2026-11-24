@@ -754,6 +754,41 @@ mod tests {
     }
 
     #[test]
+    fn les_facades_de_l_egaliseur_sont_exclusives_rc14() {
+        // GO du 24/11 : deux façades cochées = 409 `mutually_exclusive`.
+        for (a, b) in [
+            ("equalizer-graphic", "equalizer-parametric"),
+            ("equalizer-headphone", "room-correction"),
+            ("room-correction", "equalizer-graphic"),
+        ] {
+            let c = chaine(vec![
+                maillon(a, true),
+                maillon("crossfeed", true),
+                maillon(b, true),
+            ]);
+            let e = valider(&c, PREMIUM).unwrap_err();
+            assert_eq!(
+                e,
+                ErreurChaine::Exclusifs {
+                    premier: a.into(),
+                    second: b.into(),
+                    groupe: "equalizer".into()
+                }
+            );
+            assert_eq!(e.statut_http(), 409);
+            assert_eq!(e.code(), "mutually_exclusive");
+            assert_eq!(e.greffon(), Some(b));
+            // Contre-épreuve : une seule cochée, l'autre décochée, passe.
+            let un_seul = chaine(vec![
+                maillon(a, true),
+                maillon("crossfeed", true),
+                maillon(b, false),
+            ]);
+            valider(&un_seul, PREMIUM).unwrap();
+        }
+    }
+
+    #[test]
     fn la_reaffectation_des_canaux_est_en_dernier() {
         let ok = chaine(vec![
             maillon("equalizer-graphic", true),

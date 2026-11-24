@@ -1070,3 +1070,105 @@ async fn un_marqueur_ni_ecrit_ni_efface_refuse_le_chargement_sans_rien_changer_s
     assert_eq!(b.chaine().plugins[0].id, "equalizer-parametric");
     assert_eq!(b.get_zone().await["active_preset"], json!("studio"));
 }
+
+// ── rc14 (recette .18) : « Pure » et le mode PURE de la zone ─────────
+
+fn pure_de_la_zone(b: &Banc) -> bool {
+    tune_core::audio::audiophile::zone_enabled(&b.state.backend, b.zone)
+}
+
+/// « Pure » chargé ⇒ mode PURE de la zone allumé, `bypass_all` relu vrai ;
+/// un préréglage avec un égaliseur chargé ensuite ⇒ PURE éteint, et la
+/// chaîne relue n'est plus contournée.
+#[tokio::test]
+async fn pure_allume_le_mode_pure_et_un_prereglage_qui_traite_l_eteint_rc14() {
+    let b = Banc::nouveau(true).await;
+    // Un préréglage avec égaliseur, enregistré depuis la chaîne courante.
+    let (s, v) = b
+        .put_chaine(json!({"version": 1, "plugins": [parametrique()]}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = b.enregistrer("Égaliseur").await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    let eq_id = v["id"].as_str().unwrap().to_owned();
+    assert!(!pure_de_la_zone(&b));
+
+    let (s, v) = b.appliquer("pure").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(pure_de_la_zone(&b), "« Pure » n'a pas allumé le mode PURE");
+    assert!(lire_zone(&b.settings(), b.zone, true).unwrap().pure);
+    assert!(b.chaine().bypass_all, "bypass_all perdu à la relecture");
+    assert_eq!(b.get_zone().await["chain"]["bypass_all"], json!(true));
+    assert_eq!(v["zone"]["chain"]["bypass_all"], json!(true));
+
+    let (s, v) = b.appliquer(&eq_id).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(
+        !pure_de_la_zone(&b),
+        "le préréglage qui traite a laissé PURE"
+    );
+    assert!(!b.chaine().bypass_all);
+    let eq = b.chaine();
+    assert!(
+        eq.plugins
+            .iter()
+            .any(|m| m.id == "equalizer-parametric" && m.enabled)
+    );
+}
+
+/// `bypass_all` posé par un `PUT` de chaîne est enregistré et relu.
+#[tokio::test]
+async fn bypass_all_d_un_put_est_relu_rc14() {
+    let b = Banc::nouveau(true).await;
+    let (s, v) = b
+        .put_chaine(json!({"version": 1, "bypass_all": true, "plugins": [crossfeed()]}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(b.chaine().bypass_all);
+    assert_eq!(b.get_zone().await["chain"]["bypass_all"], json!(true));
+    let (s, _) = b
+        .put_chaine(json!({"version": 1, "bypass_all": false, "plugins": [crossfeed()]}))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(!b.chaine().bypass_all);
+    // Un PUT de chaîne ne touche pas au mode PURE de la zone.
+    assert!(!pure_de_la_zone(&b));
+}
+
+/// Contre-épreuves : l'interrupteur PURE manuel de la zone fonctionne seul ;
+/// verrou de volume armé, « Pure » ne bascule rien et le dit
+/// (`pure_mode_needs_confirmation`).
+#[tokio::test]
+async fn l_interrupteur_pure_reste_seul_maitre_et_le_verrou_de_volume_est_respecte_rc14() {
+    let b = Banc::nouveau(true).await;
+    let uri = format!("/api/v1/zones/{}/audiophile", b.zone);
+    let (s, v) = b
+        .brut(Method::POST, &uri, Some(json!({"enabled": true})))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(pure_de_la_zone(&b));
+    let (s, v) = b
+        .brut(Method::POST, &uri, Some(json!({"enabled": false})))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(!pure_de_la_zone(&b));
+    // La chaîne n'a pas bougé.
+    assert!(!b.chaine().bypass_all);
+
+    b.settings()
+        .set(tune_core::audio::audiophile::SETTING_LOCK_VOLUME, "true")
+        .unwrap();
+    let (s, v) = b.appliquer("pure").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert!(
+        !pure_de_la_zone(&b),
+        "PURE allumé sans confirmation, verrou armé"
+    );
+    assert!(
+        v["warnings"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("pure_mode_needs_confirmation")),
+        "{v}"
+    );
+}

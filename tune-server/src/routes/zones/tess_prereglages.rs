@@ -280,6 +280,68 @@ fn effacer_le_marqueur(settings: &SettingsRepo, zone_id: i64) -> bool {
 /// L'avertissement rendu quand le marqueur « ACTIVE » n'a pas pu être écrit.
 pub const AVERTISSEMENT_MARQUEUR: &str = "active_preset_not_stored";
 
+/// rc14 — le mode PURE n'a pas été basculé par le préréglage parce que le
+/// verrou de volume de la zone est armé : la bascule ferait sauter l'appareil
+/// à 100 % (ou l'en ferait redescendre sans recomposer le trim), ce que
+/// l'interrupteur PURE ne fait qu'après une confirmation explicite.
+pub const AVERTISSEMENT_PURE_A_CONFIRMER: &str = "pure_mode_needs_confirmation";
+/// rc14 — le réglage PURE de la zone n'a pas pu être écrit.
+pub const AVERTISSEMENT_PURE_NON_ECRIT: &str = "pure_mode_not_stored";
+
+enum BasculePure {
+    Rien,
+    Ecrite { cle: String, pure: bool },
+    Avertissement(String),
+}
+
+/// La chaîne traite-t-elle quelque chose (greffon coché ou suréchantillonnage
+/// demandé, hors « Bypass all ») ?
+fn chaine_traite(c: &ChaineTess) -> bool {
+    !c.bypass_all && (c.plugins.iter().any(|m| m.enabled) || c.fixed.upsampling.demande())
+}
+
+/// rc14 (recette .18) — charger « Pure » vidait la chaîne mais laissait le
+/// mode PURE de la zone éteint (`zone_{id}_audiophile`, hors chaîne). Le
+/// préréglage intégré l'allume désormais ; un préréglage qui traite l'éteint
+/// (sinon PURE contournerait ce qu'on vient de charger). Un préréglage
+/// utilisateur sans traitement n'y touche pas. `lock_volume` est gardé, et
+/// rien ne bascule quand le verrou de volume est armé : c'est
+/// l'interrupteur PURE, avec sa confirmation, qui le fait.
+fn accorder_le_mode_pure(state: &AppState, zone_id: i64, p: &PreReglage) -> BasculePure {
+    use tune_core::audio::audiophile;
+    let voulu = if p.builtin && p.id == prereglages::ID_PREREGLAGE_PURE {
+        true
+    } else if chaine_traite(&p.chain) {
+        false
+    } else {
+        return BasculePure::Rien;
+    };
+    if audiophile::zone_enabled(&state.backend, zone_id) == voulu {
+        return BasculePure::Rien;
+    }
+    if audiophile::volume_lock_enabled(&state.backend, zone_id) {
+        warn!(zone_id, voulu, "tess_prereglage_pure_a_confirmer");
+        return BasculePure::Avertissement(AVERTISSEMENT_PURE_A_CONFIRMER.to_owned());
+    }
+    let settings = settings_de(state);
+    let cle = format!("zone_{zone_id}_audiophile");
+    let mut objet = settings
+        .get(&cle)
+        .ok()
+        .flatten()
+        .and_then(|b| serde_json::from_str::<Value>(&b).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    objet.insert("enabled".into(), Value::Bool(voulu));
+    match settings.set(&cle, &Value::Object(objet).to_string()) {
+        Ok(()) => BasculePure::Ecrite { cle, pure: voulu },
+        Err(e) => {
+            warn!(zone_id, erreur = %e, "tess_prereglage_pure_non_ecrit");
+            BasculePure::Avertissement(AVERTISSEMENT_PURE_NON_ECRIT.to_owned())
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CorpsRenommer {
@@ -507,7 +569,7 @@ pub async fn appliquer_prereglage(
         Ok(r) => r,
         Err(e) => Err(erreur_migration(&ErreurMigration::Stockage(e.to_string()))),
     };
-    let (lecture, cles) = match resultat {
+    let (mut lecture, mut cles) = match resultat {
         Ok(x) => x,
         Err(r) => {
             // Refusé : si la chaîne enregistrée n'a pas bougé, l'ancien
@@ -528,9 +590,20 @@ pub async fn appliquer_prereglage(
     };
     // La chaîne est écrite : quoi qu'il arrive au marqueur, elle atteint la
     // sortie selon le mode, et la réponse est un succès.
-    let avertissements: Vec<String> = poser_le_marqueur(&settings, id, &p.id)
+    let mut avertissements: Vec<String> = poser_le_marqueur(&settings, id, &p.id)
         .into_iter()
         .collect();
+    // rc14 (recette .18) — « Pure » allume le mode PURE de la zone ; un
+    // préréglage qui traite l'éteint. Même voie que le reste du préréglage :
+    // la clé rejoint `cles` (tout de suite, ou à la prochaine lecture).
+    match accorder_le_mode_pure(&state, id, &p) {
+        BasculePure::Rien => {}
+        BasculePure::Ecrite { cle, pure } => {
+            cles.push(cle);
+            lecture.pure = pure;
+        }
+        BasculePure::Avertissement(a) => avertissements.push(a),
+    }
     drop(_liste);
     let mode = appliquer_selon_le_mode(&state, &zone, cles.clone()).await;
     info!(zone_id = id, preset_id = %p.id, cles = ?cles, mode = ?mode, "tess_prereglage_charge");

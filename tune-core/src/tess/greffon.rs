@@ -178,6 +178,21 @@ pub const PREFIXE_FAMILLE_CROSSFEED: &str = "crossfeed-";
 /// Groupe exclusif de la famille « croisement des voies » (#7616).
 pub const GROUPE_CROSSFEED_CROSSTALK: &str = "crossfeed_crosstalk";
 
+/// rc14 (GO du 24/11) — groupe exclusif des quatre façades de l'égaliseur :
+/// elles partagent une seule clé (`zone_{id}_eq_profile`) et un seul moteur,
+/// qui n'en applique qu'une (`migration::egaliseur_principal`, la première
+/// cochée). Même priorité pour toutes : à égalité, la première de la chaîne
+/// l'emporte, comme le moteur ; les autres sont `replaced_in_group`.
+pub const GROUPE_EGALISEUR: &str = "equalizer";
+/// Les façades de l'égaliseur (même liste que `migration::FACADES_EQ`).
+pub const FACADES_EGALISEUR: [&str; 4] = [
+    "equalizer-graphic",
+    "equalizer-parametric",
+    "equalizer-headphone",
+    "room-correction",
+];
+pub const PRIORITE_FACADE_EGALISEUR: u8 = 1;
+
 /// Priorités dans le groupe, celles du code actuel : crosstalk l'emporte sur
 /// toute la famille ; un crossfeed tiers (`crossfeed-*`) remplace le crossfeed
 /// intégré.
@@ -497,12 +512,27 @@ pub fn catalogue_de_reference() -> Catalogue {
             group_priority: None,
         },
     ];
+    let mut plugins: Vec<DescripteurGreffon> = lignes.iter().map(Ligne::descripteur).collect();
+    for d in &mut plugins {
+        if FACADES_EGALISEUR.contains(&d.id.as_str()) {
+            d.placement.exclusive_group = Some(GroupeExclusif {
+                id: GROUPE_EGALISEUR.into(),
+                priority: PRIORITE_FACADE_EGALISEUR,
+            });
+        }
+    }
     Catalogue {
-        plugins: lignes.iter().map(Ligne::descripteur).collect(),
-        groups: vec![PolitiqueDeGroupe {
-            id: GROUPE_CROSSFEED_CROSSTALK.into(),
-            policy: PolitiqueGroupe::Refuse,
-        }],
+        plugins,
+        groups: vec![
+            PolitiqueDeGroupe {
+                id: GROUPE_CROSSFEED_CROSSTALK.into(),
+                policy: PolitiqueGroupe::Refuse,
+            },
+            PolitiqueDeGroupe {
+                id: GROUPE_EGALISEUR.into(),
+                policy: PolitiqueGroupe::Refuse,
+            },
+        ],
     }
 }
 
@@ -511,6 +541,38 @@ mod tests {
     use super::*;
     use crate::audio::crossfeed::{ID_CROSSTALK, est_de_la_famille_du_crossfeed};
     use crate::license::Feature;
+
+    #[test]
+    fn les_facades_de_l_egaliseur_sont_exclusives_rc14() {
+        let c = catalogue_de_reference();
+        c.verifier().unwrap();
+        for id in FACADES_EGALISEUR {
+            let g = c.get(id).unwrap().groupe_effectif().unwrap();
+            assert_eq!(g.id, GROUPE_EGALISEUR, "{id}");
+        }
+        assert_eq!(c.politique(GROUPE_EGALISEUR), PolitiqueGroupe::Refuse);
+        // Le groupe crossfeed n'est pas modifié.
+        assert_eq!(
+            c.politique(GROUPE_CROSSFEED_CROSSTALK),
+            PolitiqueGroupe::Refuse
+        );
+        for (id, p) in [
+            ("crossfeed", PRIORITE_CROSSFEED_INTEGRE),
+            ("crossfeed-pro", PRIORITE_CROSSFEED_TIERS),
+            ("crosstalk", PRIORITE_CROSSTALK),
+        ] {
+            let g = c.get(id).unwrap().groupe_effectif().unwrap();
+            assert_eq!((g.id.as_str(), g.priority), (GROUPE_CROSSFEED_CROSSTALK, p));
+        }
+        for id in [
+            "convolution",
+            "mono-downmix",
+            "channel-remap",
+            "declick-live",
+        ] {
+            assert!(c.get(id).unwrap().groupe_effectif().is_none(), "{id}");
+        }
+    }
 
     #[test]
     fn le_catalogue_de_reference_suit_les_decisions() {
@@ -565,7 +627,10 @@ mod tests {
         let c = catalogue_de_reference();
         // Mêmes appartenances que `est_de_la_famille_du_crossfeed` + crosstalk.
         for d in &c.plugins {
-            let dans_le_groupe = d.groupe_effectif().is_some();
+            // (rc14 : les façades de l'égaliseur ont leur propre groupe.)
+            let dans_le_groupe = d
+                .groupe_effectif()
+                .is_some_and(|g| g.id == GROUPE_CROSSFEED_CROSSTALK);
             let selon_le_code = d.id == "crossfeed"
                 || d.id == ID_CROSSTALK
                 || est_de_la_famille_du_crossfeed(&d.id);
@@ -573,7 +638,8 @@ mod tests {
         }
         // Un paquet tiers `crossfeed-xyz` sans groupe déclaré est reconnu par
         // le préfixe, comme aujourd'hui.
-        let mut tiers = c.get("equalizer-graphic").unwrap().clone();
+        // (Modèle sans groupe : depuis la rc14, les égaliseurs en ont un.)
+        let mut tiers = c.get("mono-downmix").unwrap().clone();
         tiers.id = "crossfeed-xyz".into();
         assert_eq!(
             tiers.groupe_effectif(),

@@ -655,6 +655,10 @@ pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
     if est(Partie::Convolution) {
         rafraichir_le_convolueur(state, zone).await;
     }
+    // rc14 — le mode PURE basculé par un préréglage (« Pure » l'allume).
+    if cles.contains(&format!("zone_{id}_audiophile")) {
+        let _ = state.orchestrator.apply_audiophile_change_portee(id).await;
+    }
 }
 
 /// La convolution d'une sortie locale : posée ou retirée à chaud, comme par
