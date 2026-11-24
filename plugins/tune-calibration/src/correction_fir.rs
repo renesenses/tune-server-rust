@@ -21,7 +21,8 @@
 //!
 //! * bande corrigée dans [`F_MIN_HZ`, `F_MAX_HZ`] (20 Hz–15 kHz par défaut) ;
 //! * relance (remontée des creux) au plus [`fir::RELANCE_MAX_DB`], +6 dB par
-//!   défaut ; coupes au plus [`fir::COUPE_MAX_DB`], 15 dB par défaut ;
+//!   défaut, et au plus [`RELANCE_SANS_NORMALISATION_DB`] si la
+//!   normalisation (crête du filtre ramenée à 0 dB) est désactivée ; coupes au plus [`fir::COUPE_MAX_DB`], 15 dB par défaut ;
 //! * longueur entre [`fir::PRISES_MIN`] et [`fir::PRISES_MAX`] prises ;
 //! * phase excédentaire : DÉSACTIVÉE par défaut (latence et pré-tintement
 //!   ajoutés, à éprouver dans deux pièces réelles avant d'être proposée
@@ -41,6 +42,9 @@ pub const F_MIN_HZ: f64 = 15.0;
 pub const F_MAX_HZ: f64 = 20_000.0;
 /// Au-delà, une mesure en un seul point décrit surtout la place du micro.
 pub const F_SCHROEDER_HZ: f64 = 500.0;
+/// Relance permise quand la normalisation est désactivée (dB) : le gain du
+/// filtre s'ajoute alors tel quel au niveau joué.
+pub const RELANCE_SANS_NORMALISATION_DB: f64 = 6.0;
 /// Cadence des mesures, donc du filtre.
 const CADENCE: u32 = crate::mesure::FREQUENCE_MESURE;
 
@@ -116,6 +120,14 @@ impl DemandeFir {
             ..defaut
         };
         o.valider(CADENCE)?;
+        // Sécurité des enceintes : sans normalisation, la relance s'ajoute
+        // au niveau de lecture ; au-delà de +6 dB, elle est refusée.
+        if !o.normaliser && o.relance_max_db > RELANCE_SANS_NORMALISATION_DB {
+            return Err(format!(
+                "relance de {} dB sans normalisation : {RELANCE_SANS_NORMALISATION_DB} dB au plus (ou garder la normalisation)",
+                o.relance_max_db
+            ));
+        }
         Ok((o, format, avertissements))
     }
 }
@@ -270,6 +282,41 @@ mod tests {
                 ..Default::default()
             })
             .contains("relance")
+        );
+        // Sécurité des enceintes : pas plus de +6 dB sans normalisation.
+        assert!(
+            refus(DemandeFir {
+                normaliser: Some(false),
+                relance_max_db: Some(12.0),
+                ..Default::default()
+            })
+            .contains("sans normalisation")
+        );
+        // Contre-épreuve : +6 dB sans normalisation, et +12 dB normalisés,
+        // sont acceptés ; le filtre non normalisé ne dépasse pas +6 dB (+1).
+        let p = proposer_fir(
+            &r,
+            None,
+            &DemandeFir {
+                normaliser: Some(false),
+                relance_max_db: Some(6.0),
+                ..Default::default()
+            },
+            1,
+        )
+        .unwrap();
+        assert!(p.gain_max_db <= 7.0, "{}", p.gain_max_db);
+        assert!(
+            proposer_fir(
+                &r,
+                None,
+                &DemandeFir {
+                    relance_max_db: Some(12.0),
+                    ..Default::default()
+                },
+                1
+            )
+            .is_ok()
         );
         assert!(
             refus(DemandeFir {

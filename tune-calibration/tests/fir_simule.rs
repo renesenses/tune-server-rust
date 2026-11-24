@@ -32,7 +32,12 @@ use tune_calibration::{analyse_capture, MeasurementSpec};
 
 const FS: u32 = 48_000;
 const BANDE: (f64, f64) = (30.0, 15_000.0);
+/// Le critère du plan (T10b).
 const TOLERANCE_DB: f64 = 1.5;
+/// Les marges tenues en simulation (mesurées 0,25 dB et 0,76 dB au plus) :
+/// phase minimale, phase mixte.
+const MARGE_MINIMALE_DB: f64 = 0.5;
+const MARGE_MIXTE_DB: f64 = 1.0;
 
 fn spec() -> MeasurementSpec {
     let mut s = MeasurementSpec::room_default(FS);
@@ -122,12 +127,18 @@ fn le_fir_mesure_ramene_la_piece_a_1_5_db_de_la_cible() {
                 fir.gain_max_db,
                 fir.normalisation_db
             );
+            let marge = if phase {
+                MARGE_MIXTE_DB
+            } else {
+                MARGE_MINIMALE_DB
+            };
+            assert!(marge < TOLERANCE_DB);
             assert!(
-                e_mesure < TOLERANCE_DB,
+                e_mesure < marge,
                 "{nom}, phase mixte {phase} : mesure⊛FIR à {e_mesure:.2} dB"
             );
             assert!(
-                e_vraie < TOLERANCE_DB,
+                e_vraie < marge,
                 "{nom}, phase mixte {phase} : pièce vraie⊛FIR à {e_vraie:.2} dB"
             );
             assert_eq!(fir.pic_trame, fir.latence_trames);
@@ -178,7 +189,9 @@ fn le_fir_mesure_tient_aussi_dans_la_piece_reverberante() {
             eprintln!("T10b réverbérante : {f:.1} Hz écart {d:+.2} dB");
         }
     }
-    assert!(e < TOLERANCE_DB, "écart {e:.2} dB");
+    // 0,88 dB mesuré : la queue diffuse ne tient pas la marge de 0,5 dB du
+    // salon sec ; elle tient 1 dB, sous le critère du plan.
+    assert!(e < 1.0 && e < TOLERANCE_DB, "écart {e:.2} dB");
     assert!(e_sans > TOLERANCE_DB);
 }
 
@@ -280,7 +293,8 @@ fn la_phase_excedentaire_d_un_passe_tout_est_corrigee_dans_le_delai_annonce() {
         &cible,
         Some(mixte.decalage_cible_db),
     );
-    assert!(e < TOLERANCE_DB, "module en phase mixte : {e:.2} dB");
+    eprintln!("T10b passe-tout : module en phase mixte, écart max {e:.3} dB");
+    assert!(e < MARGE_MIXTE_DB, "module en phase mixte : {e:.2} dB");
 }
 
 /// La latence annoncée est exacte : le pic de la réponse corrigée arrive

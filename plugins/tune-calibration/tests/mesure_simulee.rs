@@ -778,6 +778,7 @@ fn sans_premium_refus_nomme_avec_premium_les_routes_servent() {
         ("POST", "/mesures/inconnue/correction/fir", "{}"),
         ("POST", "/mesures/inconnue/correction/fir.wav", "{}"),
         ("POST", "/sessions/inconnue/correction/fir", "{}"),
+        ("POST", "/sessions/inconnue/correction/fir.wav", "{}"),
     ];
 
     let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
@@ -1714,7 +1715,8 @@ fn le_fir_de_la_mesure_simulee_ramene_la_piece_vraie_a_1_5_db() {
     eprintln!(
         "T10b greffon : pièce vraie ⊛ FIR (relu du .wav) écart max 30 Hz–15 kHz {e:.3} dB ; sans FIR {e_sans:.3} dB"
     );
-    assert!(e < 1.5, "écart {e:.2} dB");
+    // Critère du plan 1,5 dB ; marge tenue 0,5 dB (0,25 mesuré).
+    assert!(e < 0.5, "écart {e:.2} dB");
     assert!(e_sans > 4.5, "contre-épreuve : {e_sans:.2} dB");
 
     // Phase mixte : la latence est celle du pré-tintement annoncé (20 ms).
@@ -1735,7 +1737,8 @@ fn le_fir_de_la_mesure_simulee_ramene_la_piece_vraie_a_1_5_db() {
     assert_eq!(tune_calibration::fft::argmax_abs(&h), 960);
     let e = ecart(&h, 960);
     eprintln!("T10b greffon : phase mixte (f32) écart max {e:.3} dB");
-    assert!(e < 1.5, "phase mixte : {e:.2} dB");
+    // Critère du plan 1,5 dB ; marge tenue 1 dB (0,75 mesuré).
+    assert!(e < 1.0, "phase mixte : {e:.2} dB");
 
     // Bornes : refus nommé ; mesure inconnue : 404.
     let (code, e) = c.appel(

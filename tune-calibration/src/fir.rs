@@ -183,6 +183,9 @@ pub const FONDU_OCTAVES: f64 = 0.5;
 /// d'une somme n'est pas la somme des lissages : sans ces passes, un mode
 /// étroit au milieu d'une queue diffuse laisse ±1,7 dB.
 pub const RAFFINEMENTS: usize = 2;
+/// Dépassement toléré (dB) du gain réel du filtre sur le gain demandé le plus
+/// haut, au-delà duquel le filtre est REFUSÉ.
+pub const MARGE_GAIN_DB: f64 = 1.0;
 
 /// Correction de la phase excédentaire (voir l'en-tête du module).
 #[derive(Debug, Clone, PartialEq)]
@@ -525,6 +528,19 @@ pub fn concevoir_fir(
     cible: &TargetCurve,
     o: &OptionsFir,
 ) -> Result<FirCorrection, String> {
+    concevoir(cadence, mesure, ri, cible, o, None)
+}
+
+/// [`concevoir_fir`], avec la partie de phase fenêtrée imposée (essais :
+/// une partie à creux profond doit faire jouer le refus final).
+fn concevoir(
+    cadence: u32,
+    mesure: &LogResponse,
+    ri: Option<&ImpulseResponse>,
+    cible: &TargetCurve,
+    o: &OptionsFir,
+    phase_imposee: Option<Vec<f64>>,
+) -> Result<FirCorrection, String> {
     o.valider(cadence)?;
     if mesure.freqs.len() < 8
         || mesure.freqs.len() != mesure.magnitude_db.len()
@@ -585,9 +601,10 @@ pub fn concevoir_fir(
     let nfft = fft::next_pow2(o.prises * 4);
     let bins = nfft / 2 + 1;
     let df = fs / nfft as f64;
-    let phase = match &o.phase {
-        Some(p) => Some(correction_phase_excedentaire(ri.unwrap(), o.f_lo, p)?),
-        None => None,
+    let phase = match (phase_imposee, &o.phase) {
+        (Some(e), _) => Some(e),
+        (None, Some(p)) => Some(correction_phase_excedentaire(ri.unwrap(), o.f_lo, p)?),
+        (None, None) => None,
     };
     let latence = phase.as_ref().map(|e| e.len() / 2).unwrap_or(0);
     let ez = phase.as_ref().map(|e| fft::rfft(e, nfft));
@@ -600,6 +617,7 @@ pub fn concevoir_fir(
     let mut reel = Vec::new();
     let mut prevue = Vec::new();
     let mut normalisation = 0.0;
+    let mut crete_voulue = 0.0;
     for passe in 0..=RAFFINEMENTS {
         let mut corr: Vec<f64> = (0..bins).map(|k| voulue(k as f64 * df, &delta)).collect();
         let crete = corr.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
@@ -609,6 +627,7 @@ pub fn concevoir_fir(
             0.0
         };
         corr.iter_mut().for_each(|c| *c += normalisation);
+        crete_voulue = crete + normalisation;
         // Module voulu ÷ module de la partie de phase fenêtrée.
         let ln_mag: Vec<f64> = match &ez {
             Some(ez) => corr
@@ -657,6 +676,17 @@ pub fn concevoir_fir(
         }
     }
 
+    // REFUS FINAL (sécurité des enceintes) : le gain RÉEL du filtre, sur
+    // toute la grille, ne dépasse jamais de plus de 1 dB le gain le plus haut
+    // demandé (lui-même borné par la relance). En phase mixte, la partie à
+    // phase minimale divise par le module de la partie fenêtrée : un creux
+    // de celle-ci demanderait une relance que la troncature ne compense plus.
+    let gain_reel_max = reel.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    if gain_reel_max > crete_voulue + MARGE_GAIN_DB {
+        return Err(format!(
+            "filtre refusé : gain réel de {gain_reel_max:+.1} dB pour {crete_voulue:+.1} dB demandés au plus (la correction de phase demande une relance que le filtre ne tient pas ; la désactiver ou allonger le pré-tintement)"
+        ));
+    }
     let dans_bande = |i: &usize| freqs[*i] >= o.f_lo && freqs[*i] <= o.f_hi;
     let gain_max_db = (0..freqs.len())
         .filter(dans_bande)
@@ -992,5 +1022,31 @@ mod tests {
         assert!(concevoir_fir(fs, &courte, None, &TargetCurve::flat(), &d())
             .unwrap_err()
             .contains("couvre"));
+    }
+
+    /// Sécurité des enceintes : une partie de phase fenêtrée à creux profond
+    /// (peigne à −100 dB tous les 100 Hz) ferait demander +100 dB à la phase
+    /// minimale ; tronquée, elle ne les compense plus et le gain réel monte.
+    /// Le filtre est REFUSÉ. Contre-épreuve : la même conception avec une
+    /// partie de phase neutre (impulsion centrée) passe.
+    #[test]
+    fn un_creux_de_la_phase_fenetree_fait_refuser_le_filtre() {
+        let fs = 48_000;
+        let freqs = LogResponse::grid(20.0, 20_000.0, 48);
+        let m = LogResponse {
+            magnitude_db: vec![0.0; freqs.len()],
+            freqs,
+        };
+        let o = OptionsFir::default();
+        let p = 480;
+        let mut neutre = vec![0.0; 2 * p + 1];
+        neutre[p] = 1.0;
+        let ok = concevoir(fs, &m, None, &TargetCurve::flat(), &o, Some(neutre.clone())).unwrap();
+        assert_eq!(ok.latence_trames, p);
+        assert!(ok.gain_max_db.abs() < 0.1, "{}", ok.gain_max_db);
+        let mut creux = neutre;
+        creux[0] = -0.99999;
+        let e = concevoir(fs, &m, None, &TargetCurve::flat(), &o, Some(creux)).unwrap_err();
+        assert!(e.contains("filtre refusé"), "{e}");
     }
 }

@@ -8,7 +8,10 @@
 //! * `RIFF`/`WAVE`, bloc `fmt ` de 18 octets (format 3 = IEEE float, PAS le
 //!   format étendu `0xFFFE`), `cbSize` = 0 ; bloc `fact` (nombre de trames,
 //!   exigé par la norme pour un format non PCM) ; bloc `data` ;
-//! * flottant 64 bits (aucune perte depuis le calcul `f64`) ou 32 bits ;
+//! * flottant 64 bits (aucune perte depuis le calcul `f64`) ou 32 bits.
+//!   ⚠️ `read_wav_ir` relit aujourd'hui TOUT en `f32` (le 64 bits y est
+//!   arrondi au chargement) : le fichier 64 bits ne garde sa précision que
+//!   pour un lecteur `f64` (portage du convolueur en `f64`, T09b) ;
 //! * un canal par enceinte, entrelacés ; mêmes bornes que le convolueur
 //!   (`convolver/par_cadence.rs`) : 8 à 768 kHz, 2^20 trames, 32 canaux.
 //!
