@@ -902,3 +902,9 @@ path = "tests/journal_apres_scan_pg_8239.rs"
 [[test]]
 name = "ytdlp_sans_oauth_8904"
 path = "tests/ytdlp_sans_oauth_8904.rs"
+
+# #9472 : une musique grave et calme n'est pas « coupée net vers 1 kHz ».
+# autotests=false : sans cette entrée, le témoin ne serait jamais compilé.
+[[test]]
+name = "faux_hires_coupure_basse_9472"
+path = "tests/faux_hires_coupure_basse_9472.rs"

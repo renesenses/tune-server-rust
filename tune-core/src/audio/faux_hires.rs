@@ -85,6 +85,17 @@ const PAS_BORD_HZ: f64 = 200.0;
 /// falaise (30 dB par kHz) et plus dans la pente naturelle du spectre.
 const PENTE_BORD_DB: f64 = 6.0;
 
+/// #9472 — aucune falaise n'est retenue sous cette fréquence. La falaise se
+/// mesure par un écart RELATIF, raie par raie : une musique calme dont
+/// l'énergie tient dans le grave (notes concentrées sur quelques raies) domine
+/// de plus de [`FALAISE_DB`] un aigu large bande pourtant bien audible, étalé
+/// sur des milliers de raies (fils du forum 3041 et 3032 : « coupé net vers
+/// 1,4 kHz »). Aucun codec ni mastering ne coupe une musique si bas : les
+/// passe-bas d'encodeurs avec perte vont de 11 kHz (MP3 à 64 kbit/s) à
+/// 20,5 kHz, et la signature de codec ([`trous_de_codec`]) ne se cherche
+/// qu'au-dessus de 9 kHz.
+pub const COUPURE_FALAISE_MIN_HZ: f64 = 10_000.0;
+
 /// Largeur du lissage du spectre, en Hz.
 const LISSAGE_HZ: f64 = 200.0;
 
@@ -256,12 +267,31 @@ fn cd_sql(a: &str) -> String {
 /// jamais montré altéré.
 pub fn verdict_effectif_sql(alias: &str) -> String {
     format!(
-        "(CASE WHEN {a}.verdict = 'douteux' AND {cd} \
+        "(CASE WHEN {basse} THEN 'non_concluant' \
+         WHEN {a}.verdict = 'douteux' AND {cd} \
          AND {plus_altere} \
          THEN 'conforme' ELSE {a}.verdict END)",
         a = alias,
+        basse = coupure_basse_rangee_sql(alias),
         cd = cd_sql(alias),
         plus_altere = cd_douteux_plus_altere_sql(alias),
+    )
+}
+
+/// #9472 — une ligne d'un fichier qui se dit hi-res, rangée `douteux` sur une
+/// coupure sous [`COUPURE_FALAISE_MIN_HZ`] (mesurée avant #9472) : la mesure
+/// actuelle n'en retient plus aucune. Elle se lit `non_concluant` (rien
+/// d'affiché) jusqu'à sa remesure, et elle est à remesurer
+/// (`faux_hires_passe`). En SQL sur l'alias `a`. Les CD gardent la règle de
+/// #9067 (`conforme` sans mur de codec).
+pub fn coupure_basse_rangee_sql(a: &str) -> String {
+    format!(
+        "({a}.verdict = 'douteux' AND NOT ({cd}) \
+         AND COALESCE({a}.raison, '') IN ('coupure_spectrale', 'signature_de_codec', '{herite}') \
+         AND {a}.coupure_hz IS NOT NULL AND {a}.coupure_hz < {min})",
+        cd = cd_sql(a),
+        herite = RAISON_HERITEE_CODEC,
+        min = COUPURE_FALAISE_MIN_HZ,
     )
 }
 
@@ -480,7 +510,8 @@ fn lisser(db: &[f64], demi: usize) -> Vec<f64> {
 
 /// La falaise la plus HAUTE du spectre : la fréquence où le niveau, mesuré
 /// juste en dessous, dépasse d'au moins [`FALAISE_DB`] TOUT ce qui suit
-/// jusqu'à Nyquist. `None` sans falaise (pente naturelle, bande pleine).
+/// jusqu'à Nyquist. `None` sans falaise (pente naturelle, bande pleine), ou
+/// quand la falaise ou son bord tombe sous [`COUPURE_FALAISE_MIN_HZ`] (#9472).
 fn falaise(db_lisse: &[f64], sample_rate: u32) -> Option<f64> {
     let n = db_lisse.len();
     let hz_par_raie = sample_rate as f64 / TAILLE_FFT as f64;
@@ -490,11 +521,16 @@ fn falaise(db_lisse: &[f64], sample_rate: u32) -> Option<f64> {
     for i in (0..n).rev() {
         max_apres[i] = max_apres[i + 1].max(db_lisse[i]);
     }
-    // On ignore le très grave (sous 1 kHz) : une falaise y serait un signal
-    // pathologique, pas une coupure de bande.
+    // `debut` (1 kHz) borne la bande PASSANTE qui sert de référence au bord,
+    // plus bas. Il n'écarte PAS le grave de la comparaison : à la raie `i`, le
+    // niveau « dessous » se lit sur [i - 1000, i - 500 Hz], jusqu'à 0 Hz près
+    // de `debut`. #9472 — les falaises candidates ne se cherchent donc qu'à
+    // partir de [`COUPURE_FALAISE_MIN_HZ`] : plus bas, le grave d'une musique
+    // calme passait pour une bande coupée.
     let debut = ((1000.0 / hz_par_raie) as usize).max(2 * marche);
+    let debut_recherche = ((COUPURE_FALAISE_MIN_HZ / hz_par_raie).ceil() as usize).max(debut);
     let mut trouvee = None;
-    for i in debut..n.saturating_sub(marche) {
+    for i in debut_recherche..n.saturating_sub(marche) {
         let dessous = db_lisse[i - 2 * marche..i - marche]
             .iter()
             .copied()
@@ -535,7 +571,10 @@ fn falaise(db_lisse: &[f64], sample_rate: u32) -> Option<f64> {
         }
         k += 1;
     }
-    Some(k as f64 * hz_par_raie)
+    // #9472 — un bord redescendu sous la borne (pente du grave d'un master
+    // calme sous une falaise haute) n'est pas une coupure de bande non plus.
+    let f = k as f64 * hz_par_raie;
+    (f >= COUPURE_FALAISE_MIN_HZ).then_some(f)
 }
 
 /// #9067 — la coupure à `bord_hz` d'un spectre lissé est-elle un MUR ? Le
