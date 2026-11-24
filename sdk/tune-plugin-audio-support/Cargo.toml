@@ -9,3 +9,12 @@ publish.workspace = true
 [dependencies]
 serde.workspace = true
 tracing = "0.1"
+
+[features]
+# TESS T11b : outils de mesure du modulateur DSD (FFT, analyse), pour le banc.
+# Hors de l'API publique du SDK par défaut.
+mesure-dsd = []
+
+[[example]]
+name = "banc_modulateur_dsd"
+required-features = ["mesure-dsd"]

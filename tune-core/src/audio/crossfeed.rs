@@ -542,6 +542,12 @@ pub enum CrossfeedConstraint {
     /// qui ne VERROUILLE pas le contrôle ([`Self::verrouille`]). Mesuré par
     /// `orchestrator::tests::*_9178` sur la décision réelle.
     NonLocalPartial,
+    /// TESS T12c (décision du 23/11) — zone HORS TESS (HQPlayer et l'autre
+    /// transport) dont aucun traitement de zone conservé (égaliseur,
+    /// correction de pièce, ReplayGain) ne fait passer les pistes par le flux
+    /// traité : le crossfeed seul n'y est pas appliqué. Avec l'un d'eux, le
+    /// statut devient [`Self::NonLocalPartial`] ([`avec_la_sortie_hors_tess`]).
+    OutsideTess,
 }
 
 impl CrossfeedConstraint {
@@ -555,6 +561,7 @@ impl CrossfeedConstraint {
             Self::NetworkProgressiveOff => "network_progressive_off",
             Self::NetworkRendererNoLpcm => "network_renderer_no_lpcm",
             Self::NonLocalPartial => "non_local_partial",
+            Self::OutsideTess => "outside_tess",
         }
     }
 
@@ -569,11 +576,16 @@ impl CrossfeedConstraint {
                 "Le greffon crossfeed est indisponible. Réactivez-le dans les greffons ; vos réglages sont conservés."
             }
             Self::NonLocalOutput => {
-                "Le crossfeed est un effet de casque : il n'est appliqué que par \
-                 une sortie LOCALE (DAC USB ou carte son de la machine). Cette \
-                 zone ne joue pas par une sortie locale, le réglage est \
-                 enregistré mais n'atteint pas le son. Pour l'entendre, écoutez \
-                 sur une zone à sortie locale."
+                "Cette sortie ne reçoit pas le flux que Tune traite au fil de \
+                 l'eau : le crossfeed n'y est pas appliqué. Le réglage est \
+                 enregistré mais n'atteint pas le son."
+            }
+            Self::OutsideTess => {
+                "Cette zone est hors TESS : sa sortie applique son propre \
+                 traitement ou reçoit le fichier tel quel. Le crossfeed seul n'y \
+                 est pas appliqué ; il ne l'est qu'avec un égaliseur, une \
+                 correction de pièce ou un ReplayGain actif, qui font passer la \
+                 piste par le flux traité de Tune. Le réglage est enregistré."
             }
             Self::PureMode => {
                 "Le mode PURE garde le chemin bit-perfect : aucun traitement ne \
@@ -625,7 +637,7 @@ impl CrossfeedConstraint {
 
     /// Toutes les variantes. Sert la contre-épreuve permanente : une contrainte
     /// ajoutée sans code ni libellé fait tomber le test qui parcourt cette liste.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::PremiumRequired,
         Self::PluginUnavailable,
         Self::NonLocalOutput,
@@ -633,6 +645,7 @@ impl CrossfeedConstraint {
         Self::NetworkProgressiveOff,
         Self::NetworkRendererNoLpcm,
         Self::NonLocalPartial,
+        Self::OutsideTess,
     ];
 }
 
@@ -758,16 +771,26 @@ pub fn crossfeed_status(
 /// son périphérique `oaat:` / `oaat-group:`, comme le fait l'orchestrateur,
 /// ou à son type) et le navigateur.
 ///
-/// Les sorties PULL (`airplay2`, `diretta`, `hqplayer`, `sendspin`,
-/// `devialet_air`, greffons) n'y sont pas : leurs pistes de la bibliothèque
-/// passent par le bras FICHIER, qui ne cuit le crossfeed que vers une zone
-/// réseau (`crossfeed_cuit_dans_le_fichier`).
+/// TESS T12c — AirPlay 1 et 2 et Devialet AIR aussi : Tune fabrique leur
+/// flux, et le crossfeed (ou un greffon natif tiers) seul y force le flux
+/// traité par le relais (`orchestrator::regles::sortie_tess_qui_tire_le_flux`).
+/// Réserve partielle : un DSD ou un ALAC servi tel quel part sans lui.
+///
+/// Les autres sorties PULL (`diretta`, `hqplayer` — hors TESS, décision Q8 —,
+/// `sendspin`, greffons) n'y sont pas.
 pub fn sortie_porte_le_flux_traite(
     output_type: Option<&str>,
     output_device_id: Option<&str>,
 ) -> bool {
     output_device_id.is_some_and(|d| d.starts_with("oaat:") || d.starts_with("oaat-group:"))
-        || matches!(output_type, Some("oaat") | Some("browser"))
+        || matches!(
+            output_type,
+            Some("oaat")
+                | Some("browser")
+                | Some("airplay")
+                | Some("airplay2")
+                | Some("devialet_air")
+        )
 }
 
 /// #9178 — sur une sortie qui porte le flux traité
@@ -829,6 +852,40 @@ pub fn avec_toute_la_chaine(
     }
 }
 
+/// TESS T12c (décision du 23/11) — sur une sortie hors TESS (HQPlayer et
+/// l'autre transport, `hors_tess` fourni par l'appelant), `NonLocalOutput`
+/// devient :
+///
+/// - [`CrossfeedConstraint::NonLocalPartial`] (contrôle actif) quand un
+///   traitement de zone conservé fait passer les pistes par le flux traité
+///   (`flux_traite`), qui porte aussi le crossfeed ;
+/// - [`CrossfeedConstraint::OutsideTess`] (verrouillé) sinon : le crossfeed
+///   seul n'y est pas appliqué.
+///
+/// Tout autre statut passe inchangé (PURE garde la priorité).
+pub fn avec_la_sortie_hors_tess(
+    sortie: CrossfeedStatus,
+    hors_tess: bool,
+    flux_traite: bool,
+) -> CrossfeedStatus {
+    if !hors_tess || sortie.reason != Some(CrossfeedConstraint::NonLocalOutput) {
+        return sortie;
+    }
+    let reason = if flux_traite {
+        CrossfeedConstraint::NonLocalPartial
+    } else {
+        CrossfeedConstraint::OutsideTess
+    };
+    let unavailable = reason.verrouille();
+    CrossfeedStatus {
+        requested: sortie.requested,
+        effective: sortie.requested && !unavailable,
+        unavailable,
+        reason: Some(reason),
+        detail: Some(reason.detail()),
+    }
+}
+
 /// Ajoute les DROITS (licence, greffon) au statut que la sortie impose — #4511.
 ///
 /// L'ordre des motifs est une promesse faite à l'utilisateur : on nomme d'abord
@@ -849,7 +906,10 @@ pub fn avec_les_droits(
     premium: bool,
     greffon_actif: bool,
 ) -> CrossfeedStatus {
-    if matches!(sortie.reason, Some(CrossfeedConstraint::NonLocalOutput)) {
+    if matches!(
+        sortie.reason,
+        Some(CrossfeedConstraint::NonLocalOutput | CrossfeedConstraint::OutsideTess)
+    ) {
         return sortie;
     }
     let droit = if !premium {

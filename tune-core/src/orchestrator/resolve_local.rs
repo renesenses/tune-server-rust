@@ -283,11 +283,16 @@ struct TraitementsDeZone {
     egaliseur: bool,
     correction_de_piece: bool,
     replaygain: bool,
+    /// TESS T12c — l'étage casque (crossfeed, greffons natifs tiers) d'une
+    /// zone AirPlay ou Devialet AIR ([`super::regles::sortie_tess_qui_tire_le_flux`]).
+    /// Faux partout ailleurs : sur une zone réseau, le crossfeed a ses
+    /// propres règles (#2742, `crossfeed_bibliotheque_reseau`).
+    etage_casque: bool,
 }
 
 impl TraitementsDeZone {
     fn un_au_moins(self) -> bool {
-        self.egaliseur || self.correction_de_piece || self.replaygain
+        self.egaliseur || self.correction_de_piece || self.replaygain || self.etage_casque
     }
 
     fn noms(self) -> Vec<&'static str> {
@@ -295,6 +300,7 @@ impl TraitementsDeZone {
             (self.egaliseur, "egaliseur"),
             (self.correction_de_piece, "correction_de_piece"),
             (self.replaygain, "replaygain"),
+            (self.etage_casque, "etage_casque"),
         ]
         .into_iter()
         .filter_map(|(vrai, nom)| vrai.then_some(nom))
@@ -2180,6 +2186,13 @@ impl PlaybackOrchestrator {
                 // passthrough. Enabling it is an explicit choice of processing;
                 // PURE zones are excluded upstream.
                 replaygain: self.zone_replaygain_changes_audio(req.zone_id, req.piste_rg()),
+                // TESS T12c — AirPlay et Devialet AIR : Tune fabrique le flux,
+                // la chaîne entière s'y applique. Le crossfeed et les greffons
+                // natifs tiers y forcent donc le flux traité comme l'égaliseur ;
+                // le relais progressif (`load_streaming_dsp`) les porte déjà.
+                etage_casque: super::regles::sortie_tess_qui_tire_le_flux(
+                    zone_output_type.as_deref(),
+                ) && self.zone_has_active_crossfeed(req.zone_id),
             }
         } else {
             TraitementsDeZone::default()

@@ -503,6 +503,18 @@ pub(super) async fn crossfeed_status_de_zone(
             device.as_deref(),
         ),
     );
+    // TESS T12c (décision du 23/11) — HQPlayer et l'autre transport hors TESS :
+    // le crossfeed n'y passe qu'avec un traitement de zone conservé.
+    let sortie = tune_core::audio::crossfeed::avec_la_sortie_hors_tess(
+        sortie,
+        matches!(
+            tune_core::tess::TransportZone::depuis_type_de_sortie(
+                zone.as_ref().and_then(|z| z.output_type.as_deref()),
+            ),
+            tune_core::tess::TransportZone::HqPlayer | tune_core::tess::TransportZone::Diretta
+        ),
+        state.orchestrator.zone_traite_le_flux_hors_tess(zone_id),
+    );
     // #9178 — le navigateur reçoit le flux traité au fil de l'eau : réserve
     // partielle, et non plus « sortie non locale » verrouillée.
     let sortie = tune_core::audio::crossfeed::avec_le_flux_traite(
