@@ -92,6 +92,10 @@ fn un_filtre_pose_en_lecture_sans_moteur_attend_le_flux_suivant_t09b() {
         s.convolver.lock().unwrap().is_none(),
         "aucun moteur posé dans le flux en cours"
     );
+    assert!(
+        s.convolveur_en_attente.load(Ordering::Relaxed),
+        "le jeu attend la prochaine jonction de pistes"
+    );
     let entree = sinus(2_400);
     let mut pcm = entree.clone();
     passer(&s, &mut pcm);

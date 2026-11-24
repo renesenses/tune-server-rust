@@ -455,19 +455,28 @@ impl<T: Flottant> Convolver<T> {
     /// T09b — une bascule en cours est abandonnée : c'est le moteur EN
     /// SERVICE qui s'éteint, et le successeur n'aura jamais été entendu.
     pub fn eteindre_en_fondu(&mut self, trames: usize) {
+        drop(self.eteindre_en_fondu_en_rendant(trames));
+    }
+
+    /// [`Self::eteindre_en_fondu`], qui REND les moteurs qu'il retire (un
+    /// successeur abandonné, le retraité d'une bascule précédente) au lieu de
+    /// les libérer : l'appelant les libère hors de son verrou.
+    pub fn eteindre_en_fondu_en_rendant(
+        &mut self,
+        trames: usize,
+    ) -> [Option<Box<Convolver<T>>>; 2] {
         if self.eteint || self.fondu.is_some() {
-            return;
+            return [None, None];
         }
-        if let Some(s) = self.successeur.take() {
-            self.retraite = Some(s);
-            self.bascule = None;
-            self.rechauffe = 0;
-        }
+        let rendus = [self.successeur.take(), self.retraite.take()];
+        self.bascule = None;
+        self.rechauffe = 0;
         if trames == 0 {
             self.eteint = true;
         } else {
             self.fondu = Some((trames, trames));
         }
+        rendus
     }
 
     /// La convolution est-elle éteinte (fondu terminé) ?
@@ -487,9 +496,10 @@ impl<T: Flottant> Convolver<T> {
     /// ont la même latence, donc aucun saut de temps.
     ///
     /// Hors temps réel (sous le verrou de l'hôte). Refuse — et rend
-    /// `nouveau` — si les canaux ou le bloc diffèrent, ou si ce moteur est
-    /// éteint : l'appelant décide alors (remplacement à la frontière de
-    /// piste). Une bascule déjà en cours est remplacée par la nouvelle.
+    /// `nouveau` — si les canaux ou le bloc diffèrent : l'appelant décide
+    /// alors (remplacement à la frontière de piste). Une bascule déjà en
+    /// cours est remplacée par la nouvelle ; un moteur éteint bascule depuis
+    /// sa sortie retardée.
     pub fn remplacer_en_fondu(
         &mut self,
         nouveau: Convolver<T>,
@@ -507,11 +517,11 @@ impl<T: Flottant> Convolver<T> {
         nouveau: Convolver<T>,
         trames_fondu: usize,
     ) -> Result<[Option<Box<Convolver<T>>>; 2], Convolver<T>> {
-        if nouveau.channels != self.channels
-            || nouveau.block_size != self.block_size
-            || self.eteint
-            || self.fondu.is_some()
-        {
+        // T09b — un moteur ÉTEINT (simple retard de sa latence) ou en fondu
+        // d'extinction bascule lui aussi : le nouveau filtre part de cette
+        // sortie retardée, par réchauffe puis fondu, sans trou ni saut de
+        // temps (« Effacer » puis « Importer » pendant la lecture).
+        if nouveau.channels != self.channels || nouveau.block_size != self.block_size {
             return Err(nouveau);
         }
         self.rechauffe = (nouveau.prises + nouveau.block_size).min(RECHAUFFE_MAX);

@@ -301,8 +301,8 @@ fn une_bascule_incompatible_est_rendue_a_l_appelant() {
     m.eteindre_en_fondu(0);
     assert!(
         m.remplacer_en_fondu(Convolver::depuis_f64(&[vec![1.0]], 256), 960)
-            .is_err(),
-        "un moteur éteint ne se rallume pas en cours de flux"
+            .is_ok(),
+        "un moteur éteint bascule depuis sa sortie retardée (relecture de #9452)"
     );
 }
 
@@ -525,4 +525,56 @@ fn la_bascule_par_le_chemin_f32_ne_libere_rien() {
         .ok()
         .expect("bascule acceptée");
     assert!(a_liberer[0].is_some(), "le retraité est rendu, pas libéré");
+}
+
+/// Relecture de #9452 — « Effacer » puis « Importer » pendant la lecture : le
+/// moteur s'éteint en fondu (simple retard), puis le nouveau filtre part de
+/// cette sortie retardée par réchauffe et fondu. Aucun trou, aucun saut ; à
+/// la fin, la sortie est exactement celle du nouveau filtre.
+#[test]
+fn effacer_puis_importer_en_lecture_est_continu() {
+    let bloc = 256;
+    let x = sinus_de_bascule(48_000);
+    let mut m = Convolver::<f64>::depuis_f64(&[vec![0.8]], bloc);
+    let mut y = x.clone();
+    let (a, reste) = y.split_at_mut(8_000);
+    m.traiter(a);
+    // Effacer : extinction en fondu de 20 ms.
+    let rendus = m.eteindre_en_fondu_en_rendant(960);
+    assert!(rendus.iter().all(Option::is_none));
+    let (b, c) = reste.split_at_mut(4_000);
+    m.traiter(b);
+    assert!(m.est_eteint());
+    // Importer : un nouveau filtre, gain 0,5 retardé de 10 trames.
+    let mut h = vec![0.0f64; 11];
+    h[10] = 0.5;
+    m.remplacer_en_fondu(Convolver::depuis_f64(&[h.clone()], bloc), 960)
+        .ok()
+        .expect("bascule depuis l'état éteint");
+    m.traiter(c);
+    assert!(!m.bascule_en_cours());
+    let saut = plus_grand_saut(&y[bloc..]);
+    assert!(
+        saut <= 1.05 * pente_du_sinus(),
+        "saut {saut} : trou ou clic"
+    );
+    let r = reference(&x, &h);
+    let apres = 12_000 + 11 + bloc + 960 + 1;
+    let ecart = (apres..x.len())
+        .map(|n| (y[n] - r[n - bloc]).abs())
+        .fold(0.0, f64::max);
+    assert!(ecart < SEUIL_64_BITS, "après bascule : écart {ecart:e}");
+}
+
+/// Relecture de #9452 — l'extinction REND les moteurs qu'elle retire (un
+/// successeur abandonné) au lieu de les libérer sous le verrou de l'hôte.
+#[test]
+fn l_extinction_rend_le_successeur_abandonne() {
+    let mut m = Convolver::<f64>::depuis_f64(&[vec![1.0]], 128);
+    m.remplacer_en_fondu(Convolver::depuis_f64(&[vec![0.5]], 128), 480)
+        .ok()
+        .unwrap();
+    let rendus = m.eteindre_en_fondu_en_rendant(480);
+    assert!(rendus[0].is_some(), "le successeur est rendu");
+    assert!(!m.bascule_en_cours());
 }
