@@ -1102,6 +1102,9 @@ pub(crate) mod fabrique {
         pub stereo_dst: bool,
         /// Ajoute une zone multicanal DST, vide de trames.
         pub multicanal_dst: bool,
+        /// #9184 — la zone multicanal (6 voies) porte du DSD BRUT, et la
+        /// stéréo est DST : la zone lue est alors la multicanal.
+        pub multicanal_dsd: bool,
         /// Gonfle `track_length_lsn` pour fausser l'estimation de position.
         pub longueurs_faussees: bool,
         /// Code temporel de la première trame de la zone.
@@ -1131,6 +1134,7 @@ pub(crate) mod fabrique {
                 ],
                 stereo_dst: false,
                 multicanal_dst: false,
+                multicanal_dsd: false,
                 longueurs_faussees: false,
                 premiere_trame: 0,
             }
@@ -1173,8 +1177,12 @@ pub(crate) mod fabrique {
     /// Place les trames `[premiere, premiere + n)` dans des secteurs audio à
     /// partir de `LSN_AUDIO`. Rend les secteurs et, par trame, le secteur où
     /// elle commence et celui où elle finit.
-    fn secteurs_audio(premiere: u32, n: u32) -> (Vec<[u8; TAILLE_SECTEUR]>, Vec<(u32, u32)>) {
-        let taille_trame = 2 * OCTETS_PAR_TRAME_ET_CANAL;
+    fn secteurs_audio(
+        premiere: u32,
+        n: u32,
+        canaux: usize,
+    ) -> (Vec<[u8; TAILLE_SECTEUR]>, Vec<(u32, u32)>) {
+        let taille_trame = canaux * OCTETS_PAR_TRAME_ET_CANAL;
         let mut secteurs = Vec::new();
         let mut places = Vec::new();
         let (mut trame, mut dans) = (0u32, 0usize);
@@ -1305,10 +1313,12 @@ pub(crate) mod fabrique {
     /// sur l'horloge de la zone.
     pub(crate) fn ecrire(chemin: &Path, image: &ImageFabriquee) -> Vec<(u32, u32)> {
         let total: u32 = image.pistes.iter().map(|p| p.trames).sum();
-        let (secteurs, places) = if image.stereo_dst {
+        let (secteurs, places) = if image.multicanal_dsd {
+            secteurs_audio(image.premiere_trame, total, 6)
+        } else if image.stereo_dst {
             (Vec::new(), Vec::new())
         } else {
-            secteurs_audio(image.premiere_trame, total)
+            secteurs_audio(image.premiere_trame, total, 2)
         };
         let mut bornes = Vec::new();
         let mut pistes = Vec::new();
@@ -1333,7 +1343,7 @@ pub(crate) mod fabrique {
         poser16(&mut mtoc, 18, 1);
         poser32(&mut mtoc, 64, LSN_ZONE_STEREO);
         poser16(&mut mtoc, 84, TAILLE_ZONE);
-        if image.multicanal_dst {
+        if image.multicanal_dst || image.multicanal_dsd {
             poser32(&mut mtoc, 72, LSN_ZONE_MULTI);
             poser16(&mut mtoc, 86, TAILLE_ZONE);
         }
@@ -1354,8 +1364,15 @@ pub(crate) mod fabrique {
         poser16(&mut texte, 32, apres as u16);
         texte_c(&mut texte, apres, "Disque 1");
 
-        let stereo = area_toc(image, b"TWOCHTOC", 2, image.stereo_dst, &pistes, audio);
-        let multi = area_toc(image, b"MULCHTOC", 6, true, &pistes, audio);
+        let stereo = area_toc(
+            image,
+            b"TWOCHTOC",
+            2,
+            image.stereo_dst || image.multicanal_dsd,
+            &pistes,
+            audio,
+        );
+        let multi = area_toc(image, b"MULCHTOC", 6, !image.multicanal_dsd, &pistes, audio);
 
         let mut f = File::create(chemin).unwrap();
         let mut ecrire_a = |lsn: u32, octets: &[u8]| {
@@ -1366,7 +1383,7 @@ pub(crate) mod fabrique {
         ecrire_a(LSN_MASTER_TOC, &mtoc);
         ecrire_a(LSN_MASTER_TOC + 1, &texte);
         ecrire_a(LSN_ZONE_STEREO, &stereo);
-        if image.multicanal_dst {
+        if image.multicanal_dst || image.multicanal_dsd {
             ecrire_a(LSN_ZONE_MULTI, &multi);
         }
         for (i, s) in secteurs.iter().enumerate() {

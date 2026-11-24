@@ -892,6 +892,102 @@ pub(in crate::outputs::local) fn comparer_un_etage_casque_a_l_ancien(
 }
 
 // ---------------------------------------------------------------------------
+// TESS T14 — natifs tiers dans l'hôte.
+// ---------------------------------------------------------------------------
+
+/// Un signal stéréo dont les valeurs occupent toute la mantisse d'un `f64` :
+/// aucune n'est représentable en `f32`.
+fn signal_double_precision(trames: usize) -> Vec<f64> {
+    (0..trames * 2)
+        .map(|i| (((i as f64) * 0.618_033_988_749_894_9).fract() - 0.5) * 0.9)
+        .collect()
+}
+
+/// L'étage casque d'un seul natif tiers `id`, gain 0,5 (exact en binaire),
+/// passé par la chaîne locale réelle ; rend l'écart maximal à `x × 0,5`.
+fn ecart_d_un_natif_tiers(id: &str) -> (f64, Vec<(String, bool)>) {
+    let cf = CrossfeedProcessor::composer(
+        44_100,
+        None,
+        &[(
+            id.to_string(),
+            serde_json::json!({"enabled": true, "gain": 0.5}),
+        )],
+    );
+    assert_eq!(cf.etages_tiers(), 1, "{id} : étage tiers non préparé");
+    let diagnostic = cf.etages_tiers_en_f64();
+    let chaine = Chaine::avec(None, None, Some(cf), false);
+    let source = signal_double_precision(4_096);
+    let mut x = source.clone();
+    executer_chaine_locale(&mut x, &chaine.moteurs(), OrdreLocal::HISTORIQUE, 2, false);
+    let ecart = x
+        .iter()
+        .zip(&source)
+        .map(|(y, s)| (y - s * 0.5).abs())
+        .fold(0.0, f64::max);
+    (ecart, diagnostic)
+}
+
+/// F64 NÉGOCIÉ : un natif tiers qui a demandé `audio-f64` reçoit les `f64`
+/// de la chaîne locale tels quels (écart nul au gain exact).
+/// CONTRE-ÉPREUVE : un natif tiers `f32`, même gain, même banc, porte
+/// l'arrondi du `f32` (≈ 1e-8) : le banc discrimine, et le greffon `f32`
+/// tourne inchangé par la conversion à sa frontière.
+#[test]
+fn t14_un_natif_tiers_f64_recoit_les_f64_de_la_chaine() {
+    let (_ids, _dossier) = crate::greffon_natif_de_test::enregistrer_les_bibliotheques_de_test(&[
+        "essai-t14-f64",
+        "essai-t14-f32",
+    ]);
+    let (e64, d64) = ecart_d_un_natif_tiers("essai-t14-f64");
+    assert_eq!(d64, [("essai-t14-f64".to_string(), true)]);
+    assert!(
+        e64 < 1e-15,
+        "F64 négocié : écart {e64:e}, le greffon a reçu du f32"
+    );
+
+    let (e32, d32) = ecart_d_un_natif_tiers("essai-t14-f32");
+    assert_eq!(d32, [("essai-t14-f32".to_string(), false)]);
+    assert!(
+        e32 > 1e-12 && e32 < 1e-6,
+        "le banc ne discrimine pas : greffon f32 à {e32:e}"
+    );
+}
+
+/// ORDRE LIBRE : un natif tiers CHARGÉ, nommé par la chaîne, place l'étage
+/// casque qui le porte, comme un membre de la famille du crossfeed.
+/// CONTRE-ÉPREUVES : un identifiant valide mais sans fournisseur natif chargé
+/// (greffon WASM, paquet absent), un greffon du catalogue de référence qui
+/// n'est pas un étage local et un identifiant invalide ne placent rien.
+#[test]
+fn t14_un_natif_tiers_place_l_etage_casque() {
+    use EtageLocal::*;
+    let (_ids, _dossier) =
+        crate::greffon_natif_de_test::enregistrer_les_bibliotheques_de_test(&["essai-t14-ordre"]);
+    assert_eq!(
+        OrdreLocal::depuis_ids(["essai-t14-ordre", "equalizer-graphic"], false).etages(),
+        [Crossfeed, Egaliseur, Convolution, RepliMono]
+    );
+    assert_eq!(
+        OrdreLocal::depuis_ids(
+            ["convolution", "essai-t14-ordre", "equalizer-graphic"],
+            false
+        )
+        .etages(),
+        [Convolution, Crossfeed, Egaliseur, RepliMono]
+    );
+    assert_eq!(
+        OrdreLocal::depuis_ids(["essai-t14-non-charge", "equalizer-graphic"], false).etages(),
+        [Egaliseur, Convolution, Crossfeed, RepliMono],
+        "un identifiant sans fournisseur chargé a déplacé l'étage casque"
+    );
+    assert_eq!(
+        OrdreLocal::depuis_ids(["declick-live", "Pas_Valide", "equalizer-graphic"], false).etages(),
+        [Egaliseur, Convolution, Crossfeed, RepliMono]
+    );
+}
+
+// ---------------------------------------------------------------------------
 // TESS T06 — moteurs de référence en `f64` dans la chaîne locale.
 // ---------------------------------------------------------------------------
 

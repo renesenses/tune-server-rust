@@ -77,9 +77,9 @@ impl OrdreLocal {
     /// L'ordre d'une suite d'identifiants de greffons TESS.
     ///
     /// - Les trois façades d'égaliseur visent le même moteur ; la famille
-    ///   crossfeed (`crossfeed`, `crossfeed-*`, `crosstalk`) vise le
-    ///   `CrossfeedProcessor`, qui porte aussi les natifs tiers ; la première
-    ///   occurrence fixe la place.
+    ///   crossfeed (`crossfeed`, `crossfeed-*`, `crosstalk`) et tout natif
+    ///   tiers (T14) visent le `CrossfeedProcessor`, qui les porte ; la
+    ///   première occurrence fixe la place.
     /// - Un étage que la liste ne nomme pas garde sa place historique
     ///   relative, après ceux qu'elle nomme : un moteur posé par les anciennes
     ///   clés n'est jamais retiré en silence.
@@ -103,6 +103,10 @@ impl OrdreLocal {
                 "convolution" | "room-correction" => EtageLocal::Convolution,
                 "crossfeed" | "crosstalk" => EtageLocal::Crossfeed,
                 _ if id.starts_with("crossfeed-") => EtageLocal::Crossfeed,
+                // TESS T14 — un natif tiers (absent du catalogue de
+                // référence) vit dans l'étage casque : il le place, comme
+                // les membres de la famille du crossfeed.
+                _ if est_un_natif_tiers(id) => EtageLocal::Crossfeed,
                 _ => continue,
             };
             placer(e, &mut etages);
@@ -129,6 +133,17 @@ impl OrdreLocal {
     pub(crate) fn bypass_all(&self) -> bool {
         self.bypass_all
     }
+}
+
+/// TESS T14 — `id` est-il un greffon natif tiers : un identifiant que l'hôte
+/// accepte pour un paquet tiers, que le catalogue de référence ne connaît
+/// pas, et dont un fournisseur DSP est RÉELLEMENT chargé
+/// ([`crate::audio::natifs_tiers::fournisseur_dsp`]). Un identifiant inconnu
+/// de l'hôte natif (greffon WASM, paquet absent ou en échec) ne déplace pas
+/// l'étage casque.
+fn est_un_natif_tiers(id: &str) -> bool {
+    crate::tess::catalogue_de_reference().get(id).is_none()
+        && crate::audio::natifs_tiers::fournisseur_dsp(id).is_some()
 }
 
 /// Taille maximale, en échantillons, d'une tranche traitée d'un seul tenant

@@ -156,62 +156,90 @@ fn get_or_create_jwt_secret(settings: &SettingsRepo) -> String {
 // Middleware — auth layer applied to the API router
 // ---------------------------------------------------------------------------
 
-/// Les routes que la couche d'authentification laisse passer SANS jeton
-/// quand `auth_enabled = true` (hors exemption DIDL, qui dépend aussi de
-/// l'adresse de l'appelant et reste dans le middleware).
+/// Méthodes de lecture : `get(...)` d'axum sert aussi HEAD.
+const LECTURE: &[&str] = &["GET", "HEAD"];
+
+/// La liste publique : les routes que la couche d'authentification laisse
+/// passer SANS jeton quand `auth_enabled = true` (hors exemption DIDL, qui
+/// dépend aussi de l'adresse de l'appelant et reste dans le middleware, et
+/// hors passerelle des sources réseau, plus bas).
+///
+/// **Correspondance exacte** : chemin tel que la couche le voit sans le
+/// préfixe `/api/v1`, et méthodes admises. Une route voisine (même préfixe,
+/// segment de plus) n'hérite JAMAIS de l'ouverture : `/system/health` est
+/// publique, `/system/health/monitor` demande un jeton. Ouvrir une route,
+/// c'est l'écrire ici en entier — et l'épreuve
+/// `auth_liste_publique_tests::tableau_des_routes_publiques_du_routeur` le
+/// montre.
+///
+/// Chaque entrée est une poignée de main documentée :
+///
+/// * `/system/health`, `/system/version` : sondes de vie (le `HEALTHCHECK`
+///   des images Docker vise `/system/health`) et découverte du serveur ;
+/// * `/system/peer-info` (GET) : la poignée de main entre deux serveurs Tune.
+///   L'autre bout l'appelle sans jeton (`fetch_peer_info`, admin.rs) et n'a
+///   aucun moyen d'en obtenir un. Surface étroite et délibérée : nom choisi
+///   par l'utilisateur, version, nombre de pistes, nombre de zones — ni
+///   music_dirs, ni IP, ni chemin, ni réglage. Un POST homonyme futur n'en
+///   hérite pas ;
+/// * `/cloud/sso/callback` (GET) : seul le retour du SSO est public (A5), le
+///   navigateur y revient de mozaiklabs.fr ; `authorize`, `status` et
+///   `disconnect` demandent une session ;
+/// * `/auth/login`, `/auth/logout` (POST), `/auth/config` et
+///   `/auth/activation` (GET, lecture de l'état seulement). Le reste de
+///   `/auth/` — inscription (seul un administrateur crée des comptes une fois
+///   l'authentification active), émission de jeton, clé d'API, écriture de la
+///   configuration, code d'activation — porte un jeton valide pour que le
+///   gestionnaire exige le rôle administrateur.
+///
+/// Ce qui n'y est volontairement PAS :
+///
+/// * `/system/profile` (fiche support) : elle expose music_dirs et l'IP LAN,
+///   trop large pour un appel anonyme. N'importe quel rôle authentifié la lit ;
+/// * `/system/stats`, `/system/health/monitor`, `/system/health/alerts` :
+///   mémoire, disque, alertes — l'écran qui les lit a une session ;
+/// * `/ws` : monté à la racine, hors de `/api/v1`, il ne passe pas par cette
+///   couche (`WsAuthorized` y fait le contrôle).
+pub(crate) const LISTE_PUBLIQUE: &[(&str, &[&str])] = &[
+    ("/system/health", LECTURE),
+    ("/system/version", LECTURE),
+    ("/system/peer-info", &["GET"]),
+    ("/cloud/sso/callback", &["GET"]),
+    ("/auth/login", &["POST"]),
+    ("/auth/logout", &["POST"]),
+    ("/auth/config", &["GET"]),
+    ("/auth/activation", &["GET"]),
+];
+
+/// Le chemin tel que la liste publique l'écrit : sans le préfixe `/api/v1`.
+///
+/// Les deux graphies arrivent ici, parce que cette couche enveloppe le
+/// routeur `api`, lui-même imbriqué sous `/api/v1` : que le préfixe soit
+/// encore sur l'URI dépend des rouages d'imbrication d'axum, et le contrôle
+/// ne doit pas cesser de mordre en silence si cela change.
+fn chemin_sans_prefixe_api(path: &str) -> &str {
+    match path.strip_prefix("/api/v1") {
+        Some(reste) if reste.starts_with('/') => reste,
+        _ => path,
+    }
+}
+
+/// La route `(method, path)` passe-t-elle la couche d'authentification sans
+/// jeton ? Voir [`LISTE_PUBLIQUE`].
 ///
 /// Sortie du middleware pour qu'une épreuve puisse la confronter aux sondes
-/// qui vivent hors du code Rust — le `HEALTHCHECK` des images Docker en tête,
-/// qui appelait `/system/stats`, absente de cette liste : sous
-/// authentification, la sonde prenait un 401 et Docker déclarait « unhealthy »
-/// un conteneur qui servait parfaitement.
-///
-/// Public allowlist. Health/version/ws/sso stay open. For /auth/ we no
-/// longer blanket-public the whole namespace (the old `contains("/auth/")`):
-/// the privileged endpoints — /auth/token, /auth/api-key, POST /auth/config —
-/// MUST require a valid admin token even when auth is enabled, otherwise
-/// enabling auth is defeated (an anonymous caller could mint a year-long JWT,
-/// rotate the API key, or turn auth back off). Only the genuinely-public
-/// handshakes are listed; everything else falls through to the token check.
+/// qui vivent hors du code Rust — le `HEALTHCHECK` des images Docker en tête.
 pub(crate) fn est_route_publique(method: &axum::http::Method, path: &str) -> bool {
-    let is_extension_route = path.starts_with("/ext/") || path.starts_with("/api/v1/ext/");
-    !is_extension_route
-        && (path.contains("/system/health")
-        || path.contains("/system/version")
-        // NB : /system/profile (fiche support) n'est volontairement PAS
-        // dans cette allowlist : la fiche expose music_dirs et l'IP LAN,
-        // trop large pour un appel anonyme quand l'auth est activée. Elle
-        // requiert donc un token — n'importe quel rôle, pas de RequireAdmin :
-        // l'écran Support est consulté par un utilisateur authentifié,
-        // jamais de façon anonyme.
-        // /system/peer-info EST public, et il doit l'etre : c'est la
-        // poignee de main entre deux serveurs Tune. Un serveur protege
-        // etait jusqu'ici IMPOSSIBLE a ajouter comme pair — l'autre bout
-        // appelle cette route sans jeton (fetch_peer_info, admin.rs), et
-        // il n'a aucun moyen d'en obtenir un.
-        //
-        // Contrairement a /system/profile juste au-dessus, la surface est
-        // etroite et delibere : nom choisi par l'utilisateur, version,
-        // nombre de pistes, nombre de zones. Ni music_dirs, ni IP, ni
-        // chemin de fichier, ni reglage. C'est ce qu'un serveur affiche
-        // deja de lui-meme dans la liste « serveurs du reseau » d'en face.
-        //
-        // GET seulement : la route est en lecture, et un POST homonyme
-        // futur ne doit pas heriter de cette ouverture.
-        || (method == axum::http::Method::GET
-            && (path == "/system/peer-info" || path == "/api/v1/system/peer-info"))
-        // Seul le retour du SSO est public (A5) : chemin exact, GET. Le
-        // navigateur y revient de mozaiklabs.fr ; `authorize`, `status`
-        // et `disconnect` demandent une session (le cookie la porte).
-        || (method == axum::http::Method::GET
-            && (path == "/cloud/sso/callback" || path == "/api/v1/cloud/sso/callback"))
-        || path == "/ws"
+    let chemin = chemin_sans_prefixe_api(path);
+    let lecture = method == axum::http::Method::GET || method == axum::http::Method::HEAD;
+    LISTE_PUBLIQUE
+        .iter()
+        .any(|(public, methodes)| *public == chemin && methodes.contains(&method.as_str()))
         // #8189 — la passerelle des sources réseau : un renderer n'a pas
         // de session. Le gestionnaire exige le jeton signé, propre au
-        // fichier et de courte durée ; GET et HEAD seulement.
-        || ((method == axum::http::Method::GET || method == axum::http::Method::HEAD)
-            && crate::routes::sources_reseau::est_route_passerelle(path))
-        || is_public_auth_route(&method, path))
+        // fichier et de courte durée ; GET et HEAD seulement. Forme exacte
+        // `/sources-reseau/{id}/fichier`, rendue par le module lui-même.
+        || (lecture && crate::routes::sources_reseau::est_route_passerelle(path))
 }
 
 pub async fn auth_middleware(
@@ -231,18 +259,9 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
-    // Allow unauthenticated access to health, version, auth, and ws endpoints.
-    //
-    // These are *substring* matches, so any path segment an extension controls
-    // could otherwise smuggle itself into the allowlist: a plugin named `auth`
-    // (mounted at /ext/auth/…) or any plugin route containing `/auth/` would
-    // read as public and skip the token check entirely. Plugin namespaces are
-    // never public — settle that before the allowlist gets a chance to match.
-    //
-    // Both spellings are tested because this middleware layers the `api`
-    // router, which is itself nested under /api/v1: whether the prefix is
-    // still on the URI here depends on axum's nesting internals, and this
-    // check must not silently stop working if that changes.
+    // La liste publique (correspondance exacte, voir `LISTE_PUBLIQUE`).
+    // Les espaces des greffons (`/ext/…`) n'y figurent jamais : l'exemption
+    // DIDL plus bas les écarte aussi explicitement.
     let path = request.uri().path();
     let method = request.method().clone();
     let is_extension_route = path.starts_with("/ext/") || path.starts_with("/api/v1/ext/");
@@ -389,22 +408,6 @@ fn adresse_locale(ip: std::net::IpAddr) -> bool {
             v6.is_loopback() || (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80
         }
     }
-}
-
-/// The only /auth/ endpoints reachable without a token when auth is enabled:
-/// login, logout, and the read-only config *status* (GET /auth/config).
-/// Everything else in the auth router — registration (only an
-/// administrator creates accounts once auth is on), token minting, API-key
-/// generation/read, and mutating the auth config — must carry a valid token so
-/// the handler can enforce the admin role.
-fn is_public_auth_route(method: &axum::http::Method, path: &str) -> bool {
-    use axum::http::Method;
-    path.ends_with("/auth/login")
-        || path.ends_with("/auth/logout")
-        || (method == Method::GET && path.ends_with("/auth/config"))
-        // L'écran d'activation lit seulement l'état (activée ou non, appel de
-        // cette machine ou non).
-        || (method == Method::GET && path.ends_with("/auth/activation"))
 }
 
 /// When auth is enabled, require the caller to present a valid admin token.
@@ -966,46 +969,308 @@ impl FromRequestParts<AppState> for AdminOuCetteMachine {
         if appel_depuis_cette_machine(parts, state).await {
             return Ok(AdminOuCetteMachine);
         }
-        let appelant = adresse_de_l_appelant(parts, state)
-            .await
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        let relaye = crate::garde_du_relais::requete_relayee(&parts.headers);
-        let relais_port_80 = !crate::routes::appliance::bouclage_fiable();
-        let mandataire = derriere_un_mandataire(&parts.headers);
-        tracing::warn!(
-            chemin = %parts.uri.path(),
-            %appelant,
-            relaye,
-            relais_port_80,
-            mandataire,
-            "action_machine_refusee_hors_de_cette_machine_sans_authentification"
-        );
-        // Le refus dit ce que le serveur a vu : l'exploitant comprend tout de
-        // suite pourquoi « depuis cette machine » n'a pas été reconnu.
-        let (motif, message) = if relais_port_80 {
-            (
-                "port80_relay",
-                "This appliance relays port 80 to the server from 127.0.0.1, so a local \
-                 call cannot be told apart from the network: enable authentication and \
-                 sign in as an administrator (or rebuild the Tune OS image).",
-            )
-        } else {
-            (
-                "not_local",
-                "This action requires authentication to be enabled, or a call from this \
-                 machine (localhost).",
-            )
-        };
-        Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({
+        Err(refus_action_reservee(parts, state, Refus::HorsDeCetteMachine).await)
+    }
+}
+
+/// Pourquoi une action réservée a été refusée : choisit la phrase rendue.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Refus {
+    /// Ni administrateur, ni appel de cette machine.
+    HorsDeCetteMachine,
+    /// Installation d'une mise à jour sans authentification, appel venu
+    /// d'ailleurs que du réseau local (accès à distance, mandataire, VPN).
+    HorsDuReseauLocal,
+    /// Liaison du compte mozaiklabs.fr sans authentification, appel venu
+    /// d'ailleurs que du réseau local.
+    CompteHorsDuReseauLocal,
+}
+
+/// L'action que nomme le refus, d'après le chemin appelé : la clé de son
+/// libellé dans `i18n_server.json` (`api.machine.action.<clé>`).
+pub fn action_du_chemin(chemin: &str) -> &'static str {
+    let c = chemin.to_ascii_lowercase();
+    if c.contains("/cloud/sso") {
+        "account"
+    } else if c.contains("/update/channel") {
+        "updateChannel"
+    } else if c.contains("/update") {
+        "update"
+    } else if c.contains("/reboot") || c.contains("/restart") {
+        "restart"
+    } else if c.contains("/shutdown") {
+        "shutdown"
+    } else if c.contains("backup") || c.contains("restore") {
+        "backup"
+    } else if c.contains("/support") {
+        "support"
+    } else if c.contains("/cloud") {
+        "remote"
+    } else if c.contains("plugin") {
+        "extensions"
+    } else {
+        "other"
+    }
+}
+
+/// Le refus d'une action réservée : une phrase lisible, dans la langue de
+/// l'interface (`Accept-Language`, repli anglais), qui dit QUELLE action,
+/// POURQUOI, et COMMENT faire. Le client web affiche `message` tel quel.
+async fn refus_action_reservee(
+    parts: &mut Parts,
+    state: &AppState,
+    refus: Refus,
+) -> (StatusCode, Json<Value>) {
+    let appelant = adresse_de_l_appelant(parts, state)
+        .await
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let relaye = crate::garde_du_relais::requete_relayee(&parts.headers);
+    let relais_port_80 = !crate::routes::appliance::bouclage_fiable();
+    let mandataire = derriere_un_mandataire(&parts.headers);
+    let chemin = parts
+        .extensions
+        .get::<axum::extract::OriginalUri>()
+        .map(|o| o.0.path().to_string())
+        .unwrap_or_else(|| parts.uri.path().to_string());
+    tracing::warn!(
+        chemin = %chemin,
+        %appelant,
+        relaye,
+        relais_port_80,
+        mandataire,
+        hors_du_reseau_local = refus != Refus::HorsDeCetteMachine,
+        "action_machine_refusee_hors_de_cette_machine_sans_authentification"
+    );
+    // Le refus dit ce que le serveur a vu : l'exploitant comprend tout de
+    // suite pourquoi « depuis cette machine » n'a pas été reconnu.
+    let (motif, cle) = match refus {
+        Refus::HorsDuReseauLocal => ("not_local_network", "api.machine.reservedOutsideLan"),
+        Refus::CompteHorsDuReseauLocal => {
+            ("not_local_network", "api.machine.reservedOutsideLanAccount")
+        }
+        Refus::HorsDeCetteMachine if relais_port_80 => {
+            ("port80_relay", "api.machine.reservedPort80Relay")
+        }
+        Refus::HorsDeCetteMachine => ("not_local", "api.machine.reservedNotLocal"),
+    };
+    let lang = crate::i18n::lang_from_header(&parts.headers);
+    let action_cle = action_du_chemin(&chemin);
+    let action = crate::i18n::t(&lang, &format!("api.machine.action.{action_cle}"));
+    (
+        StatusCode::FORBIDDEN,
+        Json(crate::message_api::avec_message_en(
+            json!({
                 "error": "auth_required",
+                "code": "auth_required",
                 "reason": motif,
-                "message": message,
+                "action": action_cle,
                 "caller": appelant,
                 "relayed": relaye,
-            })),
+            }),
+            &lang,
+            cle,
+            &[("action", action)],
+        )),
+    )
+}
+
+/// Adresse du RÉSEAU LOCAL : privée IPv4 (RFC 1918), lien local IPv4
+/// (169.254/16), unique locale IPv6 (fc00::/7), lien local IPv6 (fe80::/10),
+/// et leurs formes IPv4 d'une socket à double pile. PAS le partage
+/// d'adresses 100.64/10 (CGNAT, Tailscale) : c'est un accès à distance.
+pub fn adresse_du_reseau_local(ip: std::net::IpAddr) -> bool {
+    let v4_local = |v4: std::net::Ipv4Addr| v4.is_private() || v4.is_link_local();
+    match ip {
+        std::net::IpAddr::V4(v4) => v4_local(v4),
+        std::net::IpAddr::V6(v6) => {
+            let premier = v6.segments()[0];
+            (premier & 0xfe00) == 0xfc00
+                || (premier & 0xffc0) == 0xfe80
+                || v6.to_ipv4_mapped().is_some_and(v4_local)
+        }
+    }
+}
+
+/// L'appel vient-il du RÉSEAU LOCAL ? Mêmes critères que la garde d'hôte et
+/// d'origine (`garde_origine`), et jamais :
+///
+/// - une requête rejouée par le relais cloud ou l'écoute directe ;
+/// - une requête passée par un mandataire inverse (en-têtes, HTTP/1.0, ou
+///   mandataire déclaré par `TUNE_ALLOWED_ORIGINS` / `TUNE_ALLOWED_HOSTS`) ;
+/// - une adresse hors réseau local (Internet, CGNAT/Tailscale).
+///
+/// Le bouclage n'est accepté ici que sur une appliance Tune OS dont le relais
+/// du port 80 rouvre depuis 127.0.0.1 les connexions du réseau local
+/// (`appliance::bouclage_fiable` faux) : c'est exactement ce qu'il relaie.
+/// Ailleurs, le bouclage relève de [`appel_depuis_cette_machine`].
+async fn appel_depuis_le_reseau_local(parts: &mut Parts, state: &AppState) -> bool {
+    if crate::garde_du_relais::requete_relayee(&parts.headers) {
+        return false;
+    }
+    if parts.version == axum::http::Version::HTTP_10 {
+        return false;
+    }
+    if derriere_un_mandataire(&parts.headers) {
+        return false;
+    }
+    if !crate::garde_origine::hote_de_la_requete_accepte(&parts.headers) {
+        return false;
+    }
+    if !matches!(
+        crate::garde_origine::juger(&parts.method, &parts.headers),
+        crate::garde_origine::Verdict::Acceptee
+    ) {
+        return false;
+    }
+    let Some(ip) = adresse_de_l_appelant(parts, state).await else {
+        return false;
+    };
+    if adresse_de_cette_machine(ip) {
+        return !crate::routes::appliance::bouclage_fiable();
+    }
+    adresse_du_reseau_local(ip)
+}
+
+/// Garde de la SEULE installation d'une mise à jour officielle
+/// (`POST /system/update/install`).
+///
+/// - Authentification active : l'administrateur, comme [`AdminOuCetteMachine`].
+/// - Authentification coupée : un appel de cette machine, ou du RÉSEAU LOCAL
+///   ([`appel_depuis_le_reseau_local`]), à condition que la vérification de
+///   signature des mises à jour soit armée (clé minisign embarquée). La route
+///   ne prend aucune URL ni aucune version de l'appelant : elle installe la
+///   release officielle choisie par le vérificateur, après contrôle de la
+///   signature de `SHA256SUMS`.
+///
+/// Les autres actions de machine (redémarrer, éteindre, extensions, accès à
+/// distance, sauvegardes, canal de mise à jour) restent sous
+/// [`AdminOuCetteMachine`].
+pub struct AdminOuReseauLocalPourLaMiseAJour;
+
+impl FromRequestParts<AppState> for AdminOuReseauLocalPourLaMiseAJour {
+    type Rejection = (StatusCode, Json<Value>);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if authentification_active(state) {
+            return <RequireAdmin as FromRequestParts<AppState>>::from_request_parts(parts, state)
+                .await
+                .map(|_| Self);
+        }
+        if appel_depuis_cette_machine(parts, state).await {
+            return Ok(Self);
+        }
+        if crate::routes::system::update::mise_a_jour_signee_exigee()
+            && appel_depuis_le_reseau_local(parts, state).await
+        {
+            tracing::info!("mise_a_jour_acceptee_depuis_le_reseau_local_sans_authentification");
+            return Ok(Self);
+        }
+        Err(refus_action_reservee(parts, state, Refus::HorsDuReseauLocal).await)
+    }
+}
+
+/// Garde de la LIAISON du compte mozaiklabs.fr du serveur
+/// (`GET /cloud/sso/authorize` et son retour `GET /cloud/sso/callback`), même
+/// règle que la mise à jour ([`AdminOuReseauLocalPourLaMiseAJour`]). La
+/// DÉLIAISON reste sous [`AdminOuCetteMachine`] (décision du 23/11) :
+///
+/// - authentification active : l'administrateur (un compte standard relie son
+///   propre profil, voir `routes::cloud::liaison_autorisee`) ;
+/// - authentification coupée : cette machine, ou le RÉSEAU LOCAL
+///   ([`appel_depuis_le_reseau_local`]) ; jamais le relais distant, un
+///   mandataire inverse ni une adresse hors réseau local.
+///
+/// Décision du 23/11 (option C) : depuis le réseau local, la liaison relie un
+/// serveur sans compte, ou reconnecte le MÊME compte ; remplacer le compte
+/// relié par un autre reste à cette machine ou à l'administrateur. Le compte
+/// n'est connu qu'après l'échange du code : la garde dit seulement par où
+/// l'appel est passé (`par_le_reseau_local`), et `routes::cloud` juge au
+/// retour, juste avant d'enregistrer la session ([`refus_compte_deja_relie`]).
+///
+/// La ronde OAuth garde ses propres verrous (PKCE, `state` à usage unique,
+/// `redirect_uri` mémorisée).
+pub struct AdminOuReseauLocalPourLeCompte {
+    /// Vrai quand seul le réseau local a ouvert la garde (ni administrateur,
+    /// ni cette machine).
+    pub par_le_reseau_local: bool,
+}
+
+impl FromRequestParts<AppState> for AdminOuReseauLocalPourLeCompte {
+    type Rejection = (StatusCode, Json<Value>);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let admin_ou_machine = Self {
+            par_le_reseau_local: false,
+        };
+        if authentification_active(state) {
+            return <RequireAdmin as FromRequestParts<AppState>>::from_request_parts(parts, state)
+                .await
+                .map(|_| admin_ou_machine);
+        }
+        if appel_depuis_cette_machine(parts, state).await {
+            return Ok(admin_ou_machine);
+        }
+        if appel_depuis_le_reseau_local(parts, state).await {
+            tracing::info!("compte_accepte_depuis_le_reseau_local_sans_authentification");
+            return Ok(Self {
+                par_le_reseau_local: true,
+            });
+        }
+        Err(refus_action_reservee(parts, state, Refus::CompteHorsDuReseauLocal).await)
+    }
+}
+
+/// Refus de LIER depuis le réseau local, sans authentification, un AUTRE
+/// compte mozaiklabs.fr que celui déjà relié au serveur (décision du 23/11) :
+/// le remplacer reste à cette machine ou à l'administrateur. Motif `account_already_linked`,
+/// phrase `api.machine.accountAlreadyLinked` dans la langue de l'interface.
+pub fn refus_compte_deja_relie(entetes: &axum::http::HeaderMap) -> (StatusCode, Json<Value>) {
+    tracing::warn!("liaison_du_compte_refusee_depuis_le_reseau_local_compte_deja_relie");
+    let lang = crate::i18n::lang_from_header(entetes);
+    (
+        StatusCode::FORBIDDEN,
+        Json(crate::message_api::avec_message_en(
+            json!({
+                "error": "auth_required",
+                "code": "auth_required",
+                "reason": "account_already_linked",
+                "action": "account",
+            }),
+            &lang,
+            "api.machine.accountAlreadyLinked",
+            &[],
+        )),
+    )
+}
+
+/// Extracteur infaillible, même règle que [`AdminOuReseauLocalPourLeCompte`]
+/// sans rejet ni trace : `GET /cloud/sso/status` montre le compte relié
+/// (nom, courriel, photo) à qui peut le relier. Sans authentification, un
+/// appareil du réseau local voit donc le compte du serveur, et le menu du
+/// compte (photo de profil comprise) fonctionne ; le relais distant et les
+/// mandataires n'en voient toujours que « relié ».
+#[derive(Debug, Clone, Copy)]
+pub struct ReliePourLeCompteDuReseauLocal(pub bool);
+
+impl FromRequestParts<AppState> for ReliePourLeCompteDuReseauLocal {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if admin_ou_cette_machine(parts, state).await {
+            return Ok(Self(true));
+        }
+        Ok(Self(
+            !authentification_active(state) && appel_depuis_le_reseau_local(parts, state).await,
         ))
     }
 }
@@ -2213,35 +2478,32 @@ mod cette_machine_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::is_public_auth_route;
+    use super::est_route_publique;
     use axum::http::Method;
 
     #[test]
     fn only_handshake_auth_routes_are_public() {
-        // Public: login, logout, register, and the read-only config status (GET).
-        assert!(is_public_auth_route(&Method::POST, "/api/v1/auth/login"));
-        assert!(is_public_auth_route(&Method::POST, "/api/v1/auth/logout"));
-        assert!(is_public_auth_route(&Method::GET, "/api/v1/auth/config"));
+        // Public: login, logout, and the read-only config status (GET).
+        assert!(est_route_publique(&Method::POST, "/api/v1/auth/login"));
+        assert!(est_route_publique(&Method::POST, "/api/v1/auth/logout"));
+        assert!(est_route_publique(&Method::GET, "/api/v1/auth/config"));
         // Nesting may strip the /api/v1 prefix — both spellings must hold.
-        assert!(is_public_auth_route(&Method::POST, "/auth/login"));
+        assert!(est_route_publique(&Method::POST, "/auth/login"));
     }
 
     #[test]
     fn privileged_auth_routes_are_never_public() {
         // The P0: these must never be reachable without a token.
-        assert!(!is_public_auth_route(&Method::POST, "/api/v1/auth/config"));
+        assert!(!est_route_publique(&Method::POST, "/api/v1/auth/config"));
         // Sécurité : l'inscription n'est plus publique sous authentification.
-        assert!(!is_public_auth_route(
-            &Method::POST,
-            "/api/v1/auth/register"
-        ));
-        assert!(!is_public_auth_route(&Method::POST, "/auth/register"));
-        assert!(!is_public_auth_route(&Method::POST, "/api/v1/auth/token"));
-        assert!(!is_public_auth_route(&Method::GET, "/api/v1/auth/token"));
-        assert!(!is_public_auth_route(&Method::POST, "/api/v1/auth/api-key"));
-        assert!(!is_public_auth_route(&Method::GET, "/api/v1/auth/api-key"));
-        assert!(!is_public_auth_route(&Method::GET, "/api/v1/auth/me"));
-        assert!(!is_public_auth_route(
+        assert!(!est_route_publique(&Method::POST, "/api/v1/auth/register"));
+        assert!(!est_route_publique(&Method::POST, "/auth/register"));
+        assert!(!est_route_publique(&Method::POST, "/api/v1/auth/token"));
+        assert!(!est_route_publique(&Method::GET, "/api/v1/auth/token"));
+        assert!(!est_route_publique(&Method::POST, "/api/v1/auth/api-key"));
+        assert!(!est_route_publique(&Method::GET, "/api/v1/auth/api-key"));
+        assert!(!est_route_publique(&Method::GET, "/api/v1/auth/me"));
+        assert!(!est_route_publique(
             &Method::POST,
             "/api/v1/system/audio/asio-warm-scan/rearm"
         ));
@@ -2249,17 +2511,15 @@ mod tests {
 
     #[test]
     fn unrelated_paths_are_not_matched() {
-        assert!(!is_public_auth_route(
-            &Method::GET,
-            "/api/v1/library/albums"
-        ));
-        assert!(!is_public_auth_route(
-            &Method::POST,
-            "/api/v1/system/restart"
-        ));
+        assert!(!est_route_publique(&Method::GET, "/api/v1/library/albums"));
+        assert!(!est_route_publique(&Method::POST, "/api/v1/system/restart"));
     }
 }
 
 #[cfg(test)]
 #[path = "auth_sondes_docker_tests.rs"]
 mod sondes_docker_tests;
+
+#[cfg(test)]
+#[path = "auth_liste_publique_tests.rs"]
+mod auth_liste_publique_tests;

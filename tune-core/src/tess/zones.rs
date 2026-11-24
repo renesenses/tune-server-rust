@@ -68,10 +68,14 @@ impl MotifHorsTess {
     pub fn detail(self) -> &'static str {
         match self {
             Self::HqplayerOwnProcessing => {
-                "HQPlayer applies its own processing: TESS is not applied to this zone."
+                "HQPlayer applies its own processing: TESS is not applied to this zone, \
+                 except the zone's equalizer, room correction and ReplayGain, which \
+                 Tune still applies to the stream it serves."
             }
             Self::DirettaOutsideTess => {
-                "Diretta carries the stream unchanged: TESS is not applied to this zone."
+                "This transport carries the stream to its host: TESS is not applied to \
+                 this zone, except the zone's equalizer, room correction and ReplayGain, \
+                 which Tune still applies to the stream it serves."
             }
             Self::UnclassifiedTransport | Self::Unknown => {
                 "This output is not covered by TESS yet: no processing is applied."
