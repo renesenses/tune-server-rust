@@ -77,7 +77,8 @@ impl PlaybackOrchestrator {
     }
 
     /// La session servie pour la piste en cours est-elle une CONVERSION
-    /// (fichier ré-encodé, flux décodé) ? Vrai aussi quand le format seul l'a
+    /// (fichier ré-encodé, flux décodé) ? Pas le flux continu de #8082
+    /// (`FLUX_CONTINU`) : il enchaîne les pistes en passthrough. Vrai aussi quand le format seul l'a
     /// imposée (format illisible par le lecteur, plafond de cadence, DSD
     /// converti) : la lecture y cuit alors l'étage casque
     /// (`crossfeed_du_fichier`, #2742 cas 1).
@@ -87,7 +88,7 @@ impl PlaybackOrchestrator {
         };
         matches!(
             self.streamer.voie_servie(sid).await,
-            voie::FICHIER_CONVERTI | voie::FLUX_CONVERTI | voie::FLUX_CONTINU
+            voie::FICHIER_CONVERTI | voie::FLUX_CONVERTI
         )
     }
 

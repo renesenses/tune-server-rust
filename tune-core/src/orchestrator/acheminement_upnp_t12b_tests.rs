@@ -367,12 +367,14 @@ fn greffon<'a>(r: &'a ReponseTessZone, id: &str) -> &'a crate::tess::EtapeResolu
 /// `reencodage` est `TraitementsDeZone::un_au_moins` (égaliseur, correction de
 /// pièce, ReplayGain : `eq_forces_transcode`), `casque` est
 /// `zone_has_active_crossfeed` (le `crossfeed_reseau` de `dsp_progressif_wav`),
-/// `conversion` dit que le format impose de convertir la piste.
+/// `conversion` dit que le format impose de convertir la piste, `dsd` que la
+/// source est un DSD converti en PCM (`src_est_dsd` de la lecture).
 #[allow(clippy::too_many_arguments)]
 fn voie_de_la_lecture(
     reencodage: bool,
     casque: bool,
     conversion: bool,
+    dsd: bool,
     lpcm: bool,
     opt_in: bool,
     service: bool,
@@ -390,9 +392,9 @@ fn voie_de_la_lecture(
         }
     } else {
         let traitement = reencodage || casque;
-        if cible_wav_pour_traitement(traitement, true, false, consenti, lpcm) {
+        if cible_wav_pour_traitement(traitement, true, dsd, consenti, lpcm) {
             VoieUpnp::ProgressiveLpcm
-        } else if (reencodage || conversion)
+        } else if (reencodage || conversion || dsd)
             // La cible FLAC part par le fichier ; l'étage casque y est cuit
             // (`crossfeed_cuit_dans_le_fichier`).
             && use_file_transcode_for(true, false, false, false, false, reencodage)
@@ -433,66 +435,83 @@ async fn la_voie_publiee_est_celle_de_la_lecture_case_par_case() {
         let settings = SettingsRepo::with_backend(b.orch.db.clone());
         let lecture = crate::tess::migration::lire_zone(&settings, z, true).unwrap();
         let tout = |_: &str| true;
-        let ctx = ContexteExecution {
-            transport: TransportZone::Dlna,
-            source: Some(SourceFlux::Pcm {
-                sample_rate_hz: 44_100,
-                bits: 16,
-                channels: 2,
-            }),
-            premium: true,
-            greffon_disponible: &tout,
-            pure: lecture.pure,
-            volume: VolumeZone {
-                control: ControleVolume::Device,
-                db: 0.0,
-            },
+        let pcm = SourceFlux::Pcm {
+            sample_rate_hz: 44_100,
+            bits: 16,
+            channels: 2,
         };
-        let r = lecture.chaine.resoudre(&catalogue_de_reference(), &ctx);
-        for conversion in [false, true] {
-            for lpcm in [
-                LpcmDuLecteur::Accepted,
-                LpcmDuLecteur::Refused,
-                LpcmDuLecteur::Unknown,
-            ] {
-                for opt_in in [false, true] {
-                    for (origine, decodable) in [
-                        (OrigineDuFlux::Library, true),
-                        (OrigineDuFlux::Unknown, true),
-                        (OrigineDuFlux::Service, true),
-                        (OrigineDuFlux::Service, false),
+        let dsd = SourceFlux::Dsd {
+            rate: crate::tess::TauxDsd::Dsd64,
+            channels: 2,
+            played_as: crate::tess::LectureDsd::ConvertedToPcm,
+        };
+        for (source, est_dsd) in [(pcm, false), (dsd, true)] {
+            let ctx = ContexteExecution {
+                transport: TransportZone::Dlna,
+                source: Some(source),
+                premium: true,
+                greffon_disponible: &tout,
+                pure: lecture.pure,
+                volume: VolumeZone {
+                    control: ControleVolume::Device,
+                    db: 0.0,
+                },
+            };
+            let r = lecture.chaine.resoudre(&catalogue_de_reference(), &ctx);
+            for rg in [false, true] {
+                for conversion in [false, true] {
+                    for lpcm in [
+                        LpcmDuLecteur::Accepted,
+                        LpcmDuLecteur::Refused,
+                        LpcmDuLecteur::Unknown,
                     ] {
-                        let f = FaitsUpnp {
-                            lpcm,
-                            lpcm_bits: 16,
-                            progressif_arme: opt_in,
-                            origine,
-                            replaygain_actif: false,
-                            service_decodable_au_fil: decodable,
-                            format_impose_le_transcodage: conversion,
-                        };
-                        let attendu = voie_de_la_lecture(
-                            reencodage,
-                            casque,
-                            conversion,
-                            lpcm == LpcmDuLecteur::Accepted,
-                            opt_in,
-                            origine == OrigineDuFlux::Service,
-                            decodable,
-                        );
-                        assert_eq!(
-                            acheminer(&r, &f).route,
-                            attendu,
-                            "eq={eq} cf={cf} conversion={conversion} {lpcm:?} \
-                             opt_in={opt_in} {origine:?} decodable={decodable}"
-                        );
-                        cases += 1;
+                        for opt_in in [false, true] {
+                            for (origine, decodable) in [
+                                (OrigineDuFlux::Library, true),
+                                (OrigineDuFlux::Unknown, true),
+                                (OrigineDuFlux::Service, true),
+                                (OrigineDuFlux::Service, false),
+                            ] {
+                                // Un DSD converti vient de la bibliothèque.
+                                if est_dsd && origine == OrigineDuFlux::Service {
+                                    continue;
+                                }
+                                let f = FaitsUpnp {
+                                    lpcm,
+                                    lpcm_bits: 16,
+                                    progressif_arme: opt_in,
+                                    origine,
+                                    replaygain_actif: rg,
+                                    service_decodable_au_fil: decodable,
+                                    format_impose_le_transcodage: conversion,
+                                };
+                                let attendu = voie_de_la_lecture(
+                                    reencodage || rg,
+                                    casque,
+                                    conversion,
+                                    est_dsd,
+                                    lpcm == LpcmDuLecteur::Accepted,
+                                    opt_in,
+                                    origine == OrigineDuFlux::Service,
+                                    decodable,
+                                );
+                                assert_eq!(
+                                    acheminer(&r, &f).route,
+                                    attendu,
+                                    "eq={eq} cf={cf} dsd={est_dsd} rg={rg} \
+                                     conversion={conversion} {lpcm:?} opt_in={opt_in} \
+                                     {origine:?} decodable={decodable}"
+                                );
+                                cases += 1;
+                            }
+                        }
                     }
                 }
             }
         }
     }
-    assert_eq!(cases, 4 * 2 * 3 * 2 * 4);
+    // PCM : 2 (RG) × 2 × 3 × 2 × 4 ; DSD converti : 2 × 2 × 3 × 2 × 2.
+    assert_eq!(cases, 4 * (96 + 48));
 }
 
 // ─── 2. Bit-perfect à l'octet ───────────────────────────────────────────────
@@ -743,4 +762,34 @@ async fn le_format_qui_impose_la_conversion_y_cuit_le_crossfeed_et_l_etat_le_dit
     assert_eq!(d.route, VoieUpnp::FileTranscode, "{d:?}");
     assert!(greffon(&etat, "crossfeed").effective);
     assert_eq!(etat.badge, Badge::ProcessedByTess);
+}
+
+/// Relecture de suivi : Pure, mais zone plafonnée à 48 kHz. La piste 96 kHz
+/// est convertie sans aucun étage TESS : `delivery: file_transcode`, et le
+/// badge n'est PAS « Bit-perfect » (`altered_outside_tess`). Contre-épreuve :
+/// sans plafond, la source part à l'octet et le badge redit « Bit-perfect ».
+#[tokio::test]
+async fn en_pure_une_conversion_imposee_n_est_pas_dite_bit_perfect() {
+    let b = banc(SINK_FLAC_SEUL).await;
+    let id = piste(&b.orch, PISTE_24.0, PISTE_24.1, PISTE_24.2);
+    b.egaliseur();
+    b.pure(true);
+    ZoneRepo::with_backend(b.orch.db.clone())
+        .update_max_sample_rate(b.zone_id, Some(48_000))
+        .unwrap();
+    let s = jouer(&b, id).await;
+    assert_ne!(s.voie, voie::FICHIER_TEL_QUEL, "plafond : convertie");
+    let etat = b.etat_tess(96_000, 24).await;
+    assert_eq!(etat.delivery.as_ref().unwrap().route, VoieUpnp::FileTranscode);
+    assert_eq!(etat.badge, Badge::AlteredOutsideTess);
+
+    ZoneRepo::with_backend(b.orch.db.clone())
+        .update_max_sample_rate(b.zone_id, None)
+        .unwrap();
+    let s = jouer(&b, id).await;
+    assert_eq!(s.voie, voie::FICHIER_TEL_QUEL);
+    assert_eq!(sha(&s.octets), sha(&source(PISTE_24.0).0));
+    let etat = b.etat_tess(96_000, 24).await;
+    assert_eq!(etat.delivery.as_ref().unwrap().route, VoieUpnp::Untouched);
+    assert_eq!(etat.badge, Badge::BitPerfect);
 }

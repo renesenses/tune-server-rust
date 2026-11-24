@@ -1088,3 +1088,47 @@ async fn la_famille_upnp_publie_la_voie_de_sa_chaine_t12b() {
     let (_, v) = b.get().await;
     assert!(v.get("delivery").is_none(), "{v}");
 }
+
+/// T12b (relecture de suivi) — un `GET` d'état pendant qu'une LECTURE sonde
+/// un lecteur muet (elle garde le verrou de la sortie pendant la sonde SOAP) :
+/// la route n'attend ni la sonde ni le verrou, et répond en moins d'une
+/// seconde.
+#[tokio::test]
+async fn le_get_d_etat_n_attend_pas_la_sonde_d_une_lecture_t12b() {
+    let muet = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = muet.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut tenues = Vec::new();
+        while let Ok((sock, _)) = muet.accept().await {
+            tenues.push(sock);
+        }
+    });
+    let appareil = "uuid:muet-t12b-route";
+    let b = Banc::avec_sortie(true, "dlna", appareil).await;
+    b.state
+        .outputs
+        .lock()
+        .await
+        .register(Box::new(tune_core::outputs::dlna::DlnaOutput::new(
+            "Lecteur muet".into(),
+            appareil.into(),
+            "127.0.0.1".into(),
+            format!("http://127.0.0.1:{port}/av"),
+            format!("http://127.0.0.1:{port}/rc"),
+            Some(format!("http://127.0.0.1:{port}/cm")),
+        )));
+    // La lecture en parallèle : sa sonde tient le verrou de la sortie.
+    let orch = b.state.orchestrator.clone();
+    let sonde = tokio::spawn(async move { orch.dlna_accepte_lpcm(appareil, false).await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!sonde.is_finished(), "la sonde de lecture doit être en cours");
+    let t0 = std::time::Instant::now();
+    let (s, v) = tokio::time::timeout(std::time::Duration::from_secs(1), b.get())
+        .await
+        .expect("le GET d'état répond en moins d'une seconde");
+    assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(s, StatusCode::OK, "{v}");
+    conforme_au_schema("zone_response", &v).unwrap();
+    assert_eq!(v["delivery"]["renderer_lpcm"], json!("unknown"), "{v}");
+    sonde.abort();
+}

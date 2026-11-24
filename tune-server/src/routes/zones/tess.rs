@@ -300,8 +300,7 @@ fn source_de(etat: &tune_core::playback::ZoneState, dsd_mode: &str) -> Option<So
 /// `zones.volume` est sur 0 à 100 ; le verrou Pure (`audiophile_lock_volume`)
 /// le tient à 100 % (`effective_volume`), donc 0 dB.
 async fn volume_de(state: &AppState, zone: &Zone) -> VolumeZone {
-    let capacites = super::output_capabilities(state, zone.output_device_id.as_deref()).await;
-    if zone.fixed_volume || capacites.is_some_and(|c| !c.can_set_volume) {
+    if zone.fixed_volume || sait_regler_le_volume(state, zone).await == Some(false) {
         return VolumeZone {
             control: ControleVolume::Fixed,
             db: 0.0,
@@ -329,6 +328,18 @@ async fn volume_de(state: &AppState, zone: &Zone) -> VolumeZone {
         control: ControleVolume::Software,
         db,
     }
+}
+
+/// T12b (relecture de suivi) — la sortie sait-elle régler son volume ? Lu
+/// SANS attendre le verrou de la sortie : la lecture le garde pendant une
+/// sonde SOAP (`dlna_accepte_lpcm`), et un lecteur muet le tiendrait des
+/// dizaines de secondes. Sortie occupée ou absente : `None`, le volume est
+/// alors celui du type de la zone (appareil hors sortie locale).
+async fn sait_regler_le_volume(state: &AppState, zone: &Zone) -> Option<bool> {
+    let device = zone.output_device_id.as_deref()?;
+    let sortie = { state.outputs.lock().await.get(device) }?;
+    let s = sortie.try_lock().ok()?;
+    Some(s.capabilities().can_set_volume)
 }
 
 /// La réponse de la zone, à partir de sa chaîne lue (T02).

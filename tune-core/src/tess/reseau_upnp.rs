@@ -34,7 +34,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::resolution::{CodeEtape, EtapeResolue, MotifEtape, Resolution};
+use super::resolution::{Badge, CodeEtape, EtapeResolue, MotifEtape, Resolution};
 use super::zones::TransportZone;
 
 /// La zone joue-t-elle sur la famille UPnP (au sens de T12b) ?
@@ -187,7 +187,14 @@ fn greffons_effectifs(r: &Resolution) -> impl Iterator<Item = &EtapeResolue> {
 /// La voie de la chaîne résolue vers ce lecteur. Pure : la matrice se teste
 /// sans orchestrateur.
 pub fn acheminer(r: &Resolution, f: &FaitsUpnp) -> AcheminementUpnp {
+    // L'upsampling effectif et un headroom effectif (manuel, ou automatique
+    // devant un traitement) modifient aussi les échantillons : comptés avec
+    // les étages qui imposent le ré-encodage, pour que `delivery` et le badge
+    // ne se contredisent jamais.
+    let etape_fixe = |c: CodeEtape| r.etapes.iter().any(|e| e.code == c && e.effective);
     let reencodage = f.replaygain_actif
+        || etape_fixe(CodeEtape::Upsampling)
+        || etape_fixe(CodeEtape::Headroom)
         || greffons_effectifs(r)
             .any(|e| famille(e.plugin_id.as_deref().unwrap_or("")) == Famille::Reencodage);
     let casque = greffons_effectifs(r)
@@ -275,26 +282,33 @@ fn source_dsd(r: &Resolution) -> bool {
     champ("kind") == Some("dsd") && champ("played_as") == Some("converted_to_pcm")
 }
 
-/// Reporte la voie sur la résolution : un étage que la voie ne porte pas est
-/// éteint, avec le motif `renderer_without_lpcm`, et les étapes finales
-/// (headroom automatique, quantification, badge) sont recalculées.
+/// Reporte la voie sur la résolution :
+/// - un étage que la voie ne porte pas est éteint, avec le motif
+///   `renderer_without_lpcm`, et les étapes finales (headroom automatique,
+///   quantification, badge) sont recalculées ;
+/// - une piste CONVERTIE (relais ou transcodage) sans aucun étage TESS
+///   effectif — chaîne vide ou Pure avec plafond de cadence, DSD converti,
+///   ReplayGain seul — n'est jamais « Bit-perfect » : le badge descend à
+///   `altered_outside_tess`.
 pub fn appliquer(r: &mut Resolution, a: &AcheminementUpnp) {
-    if a.route != VoieUpnp::Untouched || a.reason != Some(MotifDeVoie::RendererWithoutLpcm) {
-        return;
+    if a.route == VoieUpnp::Untouched && a.reason == Some(MotifDeVoie::RendererWithoutLpcm) {
+        let mut change = false;
+        for e in r.etapes.iter_mut().filter(|e| {
+            e.code == CodeEtape::Plugin
+                && e.effective
+                && famille(e.plugin_id.as_deref().unwrap_or("")) == Famille::Casque
+        }) {
+            e.effective = false;
+            e.reason = Some(MotifEtape::RendererWithoutLpcm);
+            e.detail = Some(DETAIL_SANS_LPCM.into());
+            change = true;
+        }
+        if change {
+            r.recalculer_les_etapes_finales();
+        }
     }
-    let mut change = false;
-    for e in r.etapes.iter_mut().filter(|e| {
-        e.code == CodeEtape::Plugin
-            && e.effective
-            && famille(e.plugin_id.as_deref().unwrap_or("")) == Famille::Casque
-    }) {
-        e.effective = false;
-        e.reason = Some(MotifEtape::RendererWithoutLpcm);
-        e.detail = Some(DETAIL_SANS_LPCM.into());
-        change = true;
-    }
-    if change {
-        r.recalculer_les_etapes_finales();
+    if a.route != VoieUpnp::Untouched && r.badge == Badge::BitPerfect {
+        r.badge = Badge::AlteredOutsideTess;
     }
 }
 
@@ -462,6 +476,75 @@ mod tests {
             acheminer(&r, &faits(Accepted, true, Library)).route,
             VoieUpnp::ProgressiveLpcm
         );
+    }
+
+    /// Relecture de suivi : une piste CONVERTIE sans étage TESS effectif
+    /// n'est jamais « Bit-perfect ».
+    #[test]
+    fn une_piste_convertie_sans_etage_tess_n_est_jamais_bit_perfect() {
+        let dsd = SourceFlux::Dsd {
+            rate: TauxDsd::Dsd64,
+            channels: 2,
+            played_as: LectureDsd::ConvertedToPcm,
+        };
+        let mut plafond = faits(Refused, false, Library);
+        plafond.format_impose_le_transcodage = true;
+        let mut rg = faits(Refused, false, Library);
+        rg.replaygain_actif = true;
+        for (cas, ids, pure, source, f) in [
+            ("chaîne vide + plafond", &[][..], false, PCM24, plafond),
+            ("Pure + plafond", &["equalizer-graphic"][..], true, PCM24, plafond),
+            ("chaîne vide + DSD converti", &[][..], false, dsd, faits(Refused, false, Library)),
+            ("ReplayGain seul", &[][..], false, PCM24, rg),
+        ] {
+            let mut r = resoudre(ids, pure, source);
+            assert_eq!(r.badge, Badge::BitPerfect, "{cas} : avant");
+            let a = acheminer(&r, &f);
+            assert_eq!(a.route, VoieUpnp::FileTranscode, "{cas}");
+            appliquer(&mut r, &a);
+            assert_eq!(r.badge, Badge::AlteredOutsideTess, "{cas}");
+        }
+        // Contre-épreuve : rien de converti, le badge reste « Bit-perfect ».
+        let mut r = resoudre(&[], false, PCM24);
+        let a = acheminer(&r, &faits(Refused, false, Library));
+        appliquer(&mut r, &a);
+        assert_eq!(r.badge, Badge::BitPerfect);
+    }
+
+    /// Upsampling effectif ou headroom manuel : `delivery` compte ce
+    /// traitement, comme le badge.
+    #[test]
+    fn upsampling_et_headroom_manuel_comptent_comme_traitement() {
+        use crate::tess::chaine::{Headroom, Upsampling};
+        let tout = |_: &str| true;
+        let x = ContexteExecution {
+            transport: TransportZone::Dlna,
+            source: Some(PCM24),
+            premium: true,
+            greffon_disponible: &tout,
+            pure: false,
+            volume: VolumeZone {
+                control: ControleVolume::Device,
+                db: 0.0,
+            },
+        };
+        let mut up = chaine(&[]);
+        up.fixed.upsampling = Upsampling::Pcm {
+            filter: "polyvalent".into(),
+            max_ratio: Some(2),
+            max_rate_hz: None,
+        };
+        let mut hm = chaine(&[]);
+        hm.fixed.headroom = Headroom::Manual { db: -3.0 };
+        for (cas, c) in [("upsampling", up), ("headroom manuel", hm)] {
+            let r = c.resoudre(&catalogue_de_reference(), &x);
+            assert_eq!(r.badge, Badge::ProcessedByTess, "{cas}");
+            let a = acheminer(&r, &faits(Refused, false, Library));
+            assert_eq!(a.route, VoieUpnp::FileTranscode, "{cas}");
+            assert_ne!(a.reason, Some(MotifDeVoie::NothingToProcess), "{cas}");
+            let a = acheminer(&r, &faits(Accepted, true, Library));
+            assert_eq!(a.route, VoieUpnp::ProgressiveLpcm, "{cas}");
+        }
     }
 
     #[test]
