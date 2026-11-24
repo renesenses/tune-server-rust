@@ -371,6 +371,16 @@ impl DevialetAirOutput {
         })
     }
 
+    /// #8920 (décision de Bertrand du 21/11) — l'ampli annonce-t-il l'entrée
+    /// AIR de Tune comme source choisie ? La limite de sécurité de la zone ne
+    /// vaut que là : sur une autre entrée (optique, phono…), le volume monté à
+    /// la télécommande n'est pas le signal de Tune et n'est pas rappelé.
+    /// `false` sans annonce.
+    pub(crate) fn sur_l_entree_de_tune(&self) -> bool {
+        self.ampli()
+            .is_some_and(|a| a.annonce.source_choisie == (self.contexte.indice_source)())
+    }
+
     /// #8920 — l'adresse IP sous laquelle l'ampli s'annonce, s'il est
     /// entendu : le chemin du signal la montre à côté du nom de la zone.
     #[must_use]

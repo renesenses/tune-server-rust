@@ -1285,9 +1285,18 @@ impl PositionPoller {
                 && self.orchestrator.streamer.stream_bytes_sent(sid).await == Some(0)
             {
                 let titre = np.title.clone();
+                // Fil 2972 — l'adresse de l'épisode, pour le marquer
+                // indisponible si l'éditeur a répondu 404/410.
+                let adresse = np.source_id.clone();
                 poll_states.remove(&zone_id);
-                Box::pin(self.arreter_sur_source_en_erreur(zone_id, &device_id, &titre, statut))
-                    .await;
+                Box::pin(self.arreter_sur_source_en_erreur(
+                    zone_id,
+                    &device_id,
+                    &titre,
+                    adresse.as_deref(),
+                    statut,
+                ))
+                .await;
                 continue;
             }
 
@@ -1885,6 +1894,41 @@ impl PositionPoller {
                 // diverger l'évènement `position` de l'état servi par
                 // `GET /zones`, et l'écran reculerait quand même (#3229).
                 let publiee = self.playback.update_position(zone_id, reported).await;
+                // #9043 — la barre « collée à la fin » dès le départ d'une
+                // piste : dit une fois par piste, avec les relevés qui
+                // départagent un `RelTime` faux d'un plancher resté au bout.
+                let ecoule_depuis_le_depart_s = ps
+                    .track_started_at
+                    .map(|t| t.elapsed().as_secs())
+                    .unwrap_or(0);
+                if super::barre_au_bout_9043::barre_au_bout_des_le_depart(
+                    ecoule_depuis_le_depart_s,
+                    publiee,
+                    dur,
+                ) && let Some(np) = zone_state.now_playing.as_ref()
+                    && super::barre_au_bout_9043::a_signaler(
+                        zone_id,
+                        &format!(
+                            "{}:{:?}:{:?}:{:?}",
+                            np.source, np.track_id, np.source_id, np.stream_id
+                        ),
+                    )
+                {
+                    warn!(
+                        zone_id,
+                        device_id = %device_id,
+                        source = %np.source,
+                        stream_id = np.stream_id.as_deref().unwrap_or("absent"),
+                        etat = ?status.state,
+                        position_brute_ms = status.position_ms,
+                        position_publiee_ms = publiee,
+                        duree_ms = dur,
+                        duree_rapportee_ms = status.duration_ms,
+                        ecoule_depuis_le_depart_s,
+                        uri_du_renderer = status.current_uri.as_deref().unwrap_or("absente"),
+                        "barre_de_progression_au_bout_des_le_depart"
+                    );
+                }
                 self.playback.emit_position(zone_id, publiee);
             }
 

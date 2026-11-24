@@ -3,8 +3,10 @@
 //! `tune-stream-http` a noté l'erreur de la source.
 //!
 //! Témoins :
-//!  1. source en 404 notée sur la session : au premier tour, la zone
+//!  1. source en 503 notée sur la session : au premier tour, la zone
 //!     s'arrête avec UN bandeau fatal `source_http_error` (statut, titre) ;
+//!     le 404/410 a son propre code, `episode_unavailable` (fil 2972,
+//!     témoins en fin de fichier) ;
 //!  2. CONTRE-TÉMOIN : la même zone, sans erreur notée, continue de jouer
 //!     sans bandeau ;
 //!  3. erreur notée PUIS audio servi (le renderer a réessayé après le 502) :
@@ -169,10 +171,10 @@ impl Banc {
 }
 
 #[tokio::test]
-async fn une_source_en_404_arrete_la_zone_avec_un_bandeau_9315() {
+async fn une_source_en_503_arrete_la_zone_avec_un_bandeau_9315() {
     let mut banc = Banc::monter().await;
     banc.sortie_en_lecture().await;
-    banc.noter_l_erreur_de_la_source(404).await;
+    banc.noter_l_erreur_de_la_source(503).await;
     banc.tic().await;
 
     let bandeaux = banc.bandeaux();
@@ -187,10 +189,10 @@ async fn une_source_en_404_arrete_la_zone_avec_un_bandeau_9315() {
         source_en_erreur_9315::CODE_SOURCE_EN_ERREUR,
         "{b}"
     );
-    assert_eq!(b["params"]["status"], 404, "{b}");
+    assert_eq!(b["params"]["status"], 503, "{b}");
     assert_eq!(b["params"]["title"], TITRE, "{b}");
     assert_eq!(b["fatal"], true, "{b}");
-    assert!(b["error"].as_str().unwrap().contains("HTTP 404"), "{b}");
+    assert!(b["error"].as_str().unwrap().contains("HTTP 503"), "{b}");
     assert_ne!(
         banc.playback.get_state(banc.zone_id).await.state,
         PlayState::Playing,
@@ -244,5 +246,113 @@ async fn une_erreur_effacee_par_un_succes_laisse_jouer_9315() {
     assert_eq!(
         banc.playback.get_state(banc.zone_id).await.state,
         PlayState::Playing
+    );
+}
+
+// ── Fil 2972 — l'éditeur ne sert plus le fichier de l'épisode (404/410) ──
+//
+// Contre-épreuves : retirer l'appel à `episodes_indisponibles::marquer` de
+// `arreter_sur_source_en_erreur` fait tomber la marque du témoin 404 ;
+// retirer la branche 404/410 de `charge_source_en_erreur` fait retomber le
+// code sur `source_http_error`.
+
+const ADRESSE: &str = "http://127.0.0.1:9/episode-9315.m4a";
+
+#[tokio::test]
+async fn un_episode_en_404_chez_l_editeur_est_indisponible_sans_boucle_2972() {
+    use crate::streaming::episodes_indisponibles as indispo;
+    indispo::oublier(ADRESSE);
+    let mut banc = Banc::monter().await;
+    banc.sortie_en_lecture().await;
+    banc.noter_l_erreur_de_la_source(404).await;
+    banc.tic().await;
+
+    let bandeaux = banc.bandeaux();
+    assert_eq!(bandeaux.len(), 1, "fil 2972 : UN bandeau : {bandeaux:?}");
+    let b = &bandeaux[0];
+    assert_eq!(b["code"], indispo::CODE_EPISODE_INDISPONIBLE, "{b}");
+    assert_eq!(b["params"]["status"], 404, "{b}");
+    assert_eq!(b["fatal"], true, "{b}");
+    assert_ne!(
+        banc.playback.get_state(banc.zone_id).await.state,
+        PlayState::Playing,
+        "fil 2972 : la zone s'arrête au lieu de faire semblant de jouer"
+    );
+    assert_eq!(
+        indispo::statut_note(ADRESSE),
+        Some(404),
+        "fil 2972 : l'épisode est marqué indisponible pour les listes"
+    );
+    // Aucune relance : les tours suivants ne rejouent rien et ne disent rien.
+    let lancements = {
+        let reg = banc.outputs.lock().await;
+        let arc = reg.get(APPAREIL).unwrap();
+        let sortie = arc.lock().await;
+        sortie
+            .as_any()
+            .downcast_ref::<MockOutput>()
+            .unwrap()
+            .play_titles()
+            .await
+            .len()
+    };
+    for _ in 0..3 {
+        banc.tic().await;
+    }
+    assert!(
+        banc.bandeaux().is_empty(),
+        "fil 2972 : pas de boucle de bandeaux"
+    );
+    let reg = banc.outputs.lock().await;
+    let arc = reg.get(APPAREIL).unwrap();
+    let sortie = arc.lock().await;
+    assert_eq!(
+        sortie
+            .as_any()
+            .downcast_ref::<MockOutput>()
+            .unwrap()
+            .play_titles()
+            .await
+            .len(),
+        lancements,
+        "fil 2972 : aucune relance de l'épisode"
+    );
+    drop(sortie);
+    drop(reg);
+    indispo::oublier(ADRESSE);
+}
+
+#[tokio::test]
+async fn une_source_en_503_ne_marque_pas_l_episode_2972() {
+    use crate::streaming::episodes_indisponibles as indispo;
+    let mut banc = Banc::monter().await;
+    // Adresse propre à ce témoin : le registre est partagé entre tests.
+    let adresse = "http://127.0.0.1:9/episode-2972-503.m4a";
+    banc.playback
+        .play(
+            banc.zone_id,
+            NowPlaying {
+                title: TITRE.into(),
+                source: "podcast".into(),
+                source_id: Some(adresse.into()),
+                stream_id: Some(banc.session.clone()),
+                duration_ms: 3_600_000,
+                ..Default::default()
+            },
+        )
+        .await;
+    banc.sortie_en_lecture().await;
+    banc.noter_l_erreur_de_la_source(503).await;
+    banc.tic().await;
+    let bandeaux = banc.bandeaux();
+    assert_eq!(bandeaux.len(), 1, "{bandeaux:?}");
+    assert_eq!(
+        bandeaux[0]["code"],
+        source_en_erreur_9315::CODE_SOURCE_EN_ERREUR
+    );
+    assert_eq!(
+        indispo::statut_note(adresse),
+        None,
+        "fil 2972 : une panne passagère (503) ne rend pas l'épisode indisponible"
     );
 }

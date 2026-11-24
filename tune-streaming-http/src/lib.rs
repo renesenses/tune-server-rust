@@ -610,6 +610,11 @@ where
             "/{service}/artists/{artist_id}/top-tracks",
             get(service_artist_top_tracks),
         )
+        // Fil 3009 (FabienM), point 7 — les artistes similaires de la fiche.
+        .route(
+            "/{service}/artists/{artist_id}/similar",
+            get(service_artist_similar),
+        )
         .route(
             "/{service}/playlists",
             get(service_playlists).post(service_create_playlist),
@@ -2105,6 +2110,77 @@ const PLUS_COMME_CA_PLAFOND: usize = 50;
 #[derive(Deserialize)]
 struct SimilairesQuery {
     limit: Option<usize>,
+}
+
+/// Fil 3009 (FabienM), point 7 — combien de voisins rend la fiche artiste
+/// d'un service : la grille de l'onglet « Artistes similaires » en montre
+/// une vingtaine (comme la fiche de bibliothèque), le plafond protège le
+/// service d'une demande démesurée.
+const SIMILAIRES_ARTISTE_PAR_DEFAUT: usize = 24;
+const SIMILAIRES_ARTISTE_PLAFOND: usize = 60;
+
+fn borne_similaires_artiste(limit: Option<usize>) -> usize {
+    limit
+        .unwrap_or(SIMILAIRES_ARTISTE_PAR_DEFAUT)
+        .clamp(1, SIMILAIRES_ARTISTE_PLAFOND)
+}
+
+/// Les voisins tels que la fiche les montre : sans l'artiste lui-même, sans
+/// doublon d'identifiant, sans nom vide, dans l'ordre du service, bornés.
+fn voisins_de_la_fiche(
+    artist_id: &str,
+    voisins: Vec<tune_core::streaming::traits::StreamArtist>,
+    borne: usize,
+) -> Vec<tune_core::streaming::traits::StreamArtist> {
+    let mut vus = std::collections::HashSet::new();
+    voisins
+        .into_iter()
+        .filter(|a| a.id != artist_id && !a.name.trim().is_empty())
+        .filter(|a| vus.insert(a.id.clone()))
+        .take(borne)
+        .collect()
+}
+
+/// `GET /{service}/artists/{artist_id}/similar` — les artistes que le SERVICE
+/// rapproche de celui-ci (Qobuz `artist/getSimilarArtists`, TIDAL, Deezer).
+///
+/// Fil 3009 (FabienM), point 7 : la page artiste Qobuz doit reprendre la
+/// présentation de la page artiste de la bibliothèque, dont l'encart et
+/// l'onglet « Artistes similaires ». Ceux de la bibliothèque viennent des
+/// métadonnées de l'artiste local (MBID) ; un artiste de service n'en a pas,
+/// mais le service connaît son propre catalogue — c'est déjà lui qu'écoute la
+/// radio d'artiste (`radio_artiste`). La réponse porte l'identifiant et le
+/// portrait de chaque voisin : la fiche ouvre sa page chez le même service.
+///
+/// Réponses :
+///  - 404 : service inconnu (comme toutes les routes `/{service}/…`) ;
+///  - 501 : le service ne connaît pas ses artistes similaires — un refus
+///    DIT, pas une liste vide qui laisserait croire à un artiste isolé ;
+///  - 502 : le service n'a pas répondu ;
+///  - 200 `[]` : aucun voisin — une réponse, pas une panne.
+async fn service_artist_similar(
+    State(state): State<StreamingHttpState>,
+    Path((service, artist_id)): Path<(String, String)>,
+    Query(q): Query<SimilairesQuery>,
+) -> Response {
+    let arc = match get_svc_actif(&state, &service).await {
+        Ok(s) => s,
+        Err(e) => return e.into_response(),
+    };
+    let svc = arc.read().await;
+    if !svc.propose_des_artistes_similaires() {
+        return svc_response::<Vec<tune_core::streaming::traits::StreamArtist>>(Err(
+            tune_core::TuneError::Unsupported(format!(
+                "{service} ne fournit pas d'artistes similaires"
+            )),
+        ));
+    }
+    let borne = borne_similaires_artiste(q.limit);
+    // Le service peut rendre l'artiste lui-même ou un doublon : on lui en
+    // demande un de plus que la borne pour ne pas rester court.
+    let voisins = svc.get_similar_artists(&artist_id, borne + 1).await;
+    drop(svc);
+    svc_response(voisins.map(|v| voisins_de_la_fiche(&artist_id, v, borne)))
 }
 
 /// Le nombre de titres réellement demandé : absent → le défaut, `0` → au
@@ -4848,6 +4924,9 @@ mod etat_sans_verrou_exclusif_7760_tests;
 
 #[cfg(test)]
 mod ecoutes_pistes_de_service_8062_tests;
+
+#[cfg(test)]
+mod artistes_similaires_fiche_fil3009_tests;
 
 /// #6480 — `GET /streaming/{service}/albums/{id}/description` : le texte de
 /// présentation d'un album de service (cpadiou77, fil forum 2327).

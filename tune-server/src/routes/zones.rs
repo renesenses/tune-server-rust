@@ -817,6 +817,10 @@ mod zone_sans_appareil_guard;
 #[cfg(test)]
 mod zone_supprimee_en_pause_disparait_5322;
 
+// #8788 — un DSD porté par du DoP s'annonce en DSD dans la piste en cours.
+mod dsd_porte_par_le_dop_8788;
+pub(crate) use dsd_porte_par_le_dop_8788::inject_dsd_porte;
+
 // #7133 — une zone qui change d'appareil coupe celui qu'elle quitte.
 mod ancienne_sortie_coupee_7133;
 pub(crate) use ancienne_sortie_coupee_7133::couper_l_ancienne_sortie;
