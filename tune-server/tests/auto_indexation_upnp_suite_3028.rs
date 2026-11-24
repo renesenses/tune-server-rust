@@ -879,26 +879,35 @@ async fn ancien_udn_au_registre_a_notre_adresse_rend_409() {
 async fn autre_udn_absent_du_registre_en_boucle_locale_ni_409_ni_desactivation() {
     // Un AUTRE serveur, absent du registre, dont les pistes portent une URL
     // `127.0.0.1:<notre port>` (un autre Tune qui publie sa boucle locale) :
-    // ce n'est pas une preuve que c'est nous. Ni 409, ni désactivation.
+    // ce n'est pas une preuve que c'est nous. Ni 409, ni désactivation, ni
+    // rattachement à NOTRE piste de même identifiant.
     let port = AppState::new(":memory:", 0, Default::default())
         .unwrap()
         .config
         .port;
-    let b = banc_de(
-        Some(AUTRE_TUNE),
-        "Wonderwall",
-        Some("Oasis"),
-        Some("Morning Glory"),
-        258000,
-        Some(notre_url(port, 100)),
-        false,
-    );
-    // `run_one`, par « Synchroniser » : la source n'est pas refusée.
+    let nouveau_banc = || {
+        banc_de(
+            Some(AUTRE_TUNE),
+            "Wonderwall",
+            Some("Oasis"),
+            Some("Morning Glory"),
+            258000,
+            Some(notre_url(port, 100)),
+            false,
+        )
+    };
+    let b = nouveau_banc();
     exec(
         &b.etat,
-        "UPDATE upnp_library_sources SET state_json = REPLACE(state_json, '\"this_server\"', '\"ready\"')",
+        "INSERT INTO playlists (id, name, profile_id) VALUES (7, 'Soir', 1)",
         &[],
     );
+    exec(
+        &b.etat,
+        "INSERT INTO playlist_tracks (playlist_id, track_id, position) VALUES (7, 200, 0)",
+        &[],
+    );
+    // `run_one`, par « Synchroniser » : la source n'est pas refusée.
     let (statut, corps) = appeler(
         &b.app,
         "POST",
@@ -917,7 +926,50 @@ async fn autre_udn_absent_du_registre_en_boucle_locale_ni_409_ni_desactivation()
     }
     assert_ne!(vue["status"], json!("this_server"), "{vue}");
     assert_eq!(vue["enabled"], json!(true), "pas de désactivation : {vue}");
-    // L'ancien retrait par serveur n'est pas refusé en 409.
+
+    // Le retrait : AUCUN favori ni aucune entrée de playlist n'est rattaché
+    // à notre piste 100.
+    let apercu = apercu_du_retrait(&b).await;
+    assert_eq!(apercu["removal"]["liens_rattaches"], json!(0), "{apercu}");
+    assert_eq!(
+        apercu["removal"]["liens_sans_equivalent"],
+        json!(1),
+        "{apercu}"
+    );
+    let generation = apercu["generation"].as_str().unwrap().to_string();
+    let (statut, fait) = confirmer(&b, &generation, 1).await;
+    assert_eq!(statut, StatusCode::OK, "{fait}");
+    assert_eq!(favoris_sur_le_local(&b), 0, "aucun favori rattaché");
+    assert_eq!(
+        entier(
+            &b.etat,
+            "SELECT COUNT(*) FROM playlist_tracks WHERE track_id IN (100, 101)",
+            &[]
+        ),
+        0,
+        "aucune entrée de playlist rattachée"
+    );
+
+    // L'ancien retrait par serveur, sur un banc neuf : accepté (200), pas le
+    // refus réservé à ce Tune.
+    let b = nouveau_banc();
     let (statut, corps) = supprimer_par_serveur(&b, AUTRE_TUNE).await;
-    assert_ne!(statut, StatusCode::CONFLICT, "{corps}");
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    assert_ne!(corps["code"], json!("this_server_use_remove"), "{corps}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn piste_d_un_autre_tune_sans_url_aucun_rattachement() {
+    // Une piste d'un AUTRE Tune, sans URL de lecture, aux étiquettes
+    // identiques à une piste locale : rien ne dit que c'est la même. Aucune.
+    let b = banc_de(
+        Some(AUTRE_TUNE),
+        "Wonderwall",
+        Some("Oasis"),
+        Some("Morning Glory"),
+        258000,
+        None,
+        false,
+    );
+    aucun_rattachement(b, "autre Tune sans URL").await;
 }

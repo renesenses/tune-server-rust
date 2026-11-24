@@ -478,7 +478,12 @@ fn equivalent(
             ))
         });
     if url_de_tune {
-        if let (Some(url), Some(nomme)) = (url.as_ref(), nomme)
+        // L'identifiant d'une URL qui nous vise n'est suivi que pour une
+        // source qui est CE Tune : un autre Tune peut publier
+        // `127.0.0.1:<notre port>`, et son identifiant nomme une piste de SA
+        // bibliothèque.
+        if nous.source_est_ce_tune
+            && let (Some(url), Some(nomme)) = (url.as_ref(), nomme)
             && nous.designe_ce_serveur(url)
         {
             return locales
@@ -496,6 +501,10 @@ fn equivalent(
         {
             return None;
         }
+    } else if brute.is_none() && !nous.source_est_ce_tune {
+        // Sans URL de lecture, rien ne dit d'où vient la piste : la règle des
+        // étiquettes ne vaut que pour CE Tune.
+        return None;
     }
     let mut candidates = locales.iter().filter(|l| concorde(d, l));
     match (candidates.next(), candidates.next()) {

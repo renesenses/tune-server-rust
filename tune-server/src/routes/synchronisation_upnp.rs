@@ -685,7 +685,8 @@ pub(crate) fn enregistrer_les_membres(
 /// Même calcul que le champ `this_server` de `GET /network/media-servers`
 /// (`discovery_setup::est_ce_serveur`), sur l'annonce la plus fraîche : le
 /// registre en mémoire, sinon le registre durable, sinon l'UDN seul. Un
-/// ancien UDN (base remise à zéro) est donc reconnu par son adresse.
+/// ancien UDN (base remise à zéro) est donc reconnu par son adresse, si
+/// l'UDN est encore au registre.
 pub(crate) async fn source_vise_ce_serveur(state: &AppState, udn: &str) -> bool {
     let en_memoire = state.media_servers.lock().await.get(udn).cloned();
     if let Some(ms) = en_memoire
