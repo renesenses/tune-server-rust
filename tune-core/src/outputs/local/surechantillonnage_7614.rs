@@ -314,7 +314,7 @@ fn le_paquet_auto_passe_par_le_rendu_local_et_le_volume_entier() {
     let chemins = crate::greffon_natif_de_test::construire_cdylibs(
         &dossier,
         &["cadence-du-banc"],
-        include_str!("../../../tests/fixtures/pcm-auto/greffon.rs"),
+        include_str!("../../../test-support/pcm-auto/greffon.rs"),
         "audio-rate-change",
     );
     // SAFETY : la bibliothèque vient des sources du banc compilées ci-dessus.
