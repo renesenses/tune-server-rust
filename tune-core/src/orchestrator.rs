@@ -1455,7 +1455,7 @@ pub struct PlaybackOrchestrator {
     pub(crate) radios_refusees: Arc<std::sync::Mutex<HashMap<i64, String>>>,
     /// #9174 — les zones navigateur dont le lecteur écoute à distance (relais,
     /// écoute directe) : voir `flux_a_distance_9174`.
-    zones_tirees_a_distance: std::sync::Mutex<std::collections::HashSet<i64>>,
+    zones_tirees_a_distance: flux_a_distance_9174::ZonesADistance,
     /// #4598 — l'énumération du parc local menée à la demande, sur le seul
     /// chemin du refus d'une zone locale (`gate_or_rebind_offline_zone`).
     /// Un champ et non un appel direct : les témoins y substituent un parc

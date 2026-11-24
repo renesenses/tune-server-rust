@@ -14,62 +14,111 @@
 //! 5 s, `browser-next` avant chaque suivante) : la provenance de ses requêtes
 //! dit d'où il écoute.
 //!
-//! Règle :
-//! - une requête RELAYÉE sur `/api/v1/zones/{id}/…` : la zone est tirée à
-//!   distance ;
-//! - une requête LOCALE du lecteur lui-même (`POST …/browser-…`) : il est
-//!   revenu sur le réseau de la maison. Les autres requêtes locales (une
-//!   télécommande du salon qui lit l'état de la zone) ne disent rien du
-//!   lecteur, et ne changent rien.
+//! Règle : seul le LECTEUR de la zone compte, c'est-à-dire ses `POST
+//! …/browser-*` (signal de lecture, suivante préparée, erreur média), après
+//! authentification, réussis (2xx), sur une zone qui existe et qui est une
+//! zone navigateur (`garde` côté serveur, `provenance_navigateur_9174`) :
+//! - relayé : la zone est tirée à distance, pour [`DELAI_A_DISTANCE`] ;
+//! - local : le lecteur est revenu sur le réseau de la maison.
+//!
+//! Une télécommande (même en 5G) qui lit l'état d'une zone ne dit rien du
+//! lecteur et ne change rien. Sans signal relayé depuis
+//! [`DELAI_A_DISTANCE`], la zone revient en local : un lecteur qui s'est tu
+//! n'emporte pas la zone avec lui.
 //!
 //! Une zone tirée à distance reçoit du FLAC pré-transcodé, borné
 //! (`Content-Length`, ce qu'exige CoreMedia) et indexé (SEEKTABLE, ce
 //! qu'exigent les `Range` du `<audio>`). La même zone, lue chez soi, garde son
 //! WAV. Aucun réglage : c'est le chemin qui décide.
 
+use std::time::{Duration, Instant};
+
 use super::PlaybackOrchestrator;
+
+/// Sans `browser-*` relayé depuis ce délai, la zone revient en local. Le
+/// lecteur signale sa lecture toutes les 5 s.
+pub const DELAI_A_DISTANCE: Duration = Duration::from_secs(30);
+
+/// Zones retenues au plus : au-delà, la plus ancienne est oubliée.
+pub const ZONES_RETENUES_MAX: usize = 64;
 
 /// Ce qu'une requête HTTP dit de la provenance du lecteur d'une zone :
 /// `Some((zone, true))` tirée à distance, `Some((zone, false))` revenue en
-/// local, `None` rien.
+/// local, `None` rien. `chemin` : celui de l'API (`/api/v1/zones/{id}/…`) ou
+/// celui vu sous `/zones` (`/{id}/…`).
 pub fn provenance_d_une_requete_de_zone(
     methode: &str,
     chemin: &str,
     relayee: bool,
 ) -> Option<(i64, bool)> {
-    let reste = chemin.strip_prefix("/api/v1/zones/")?;
+    if !methode.eq_ignore_ascii_case("POST") {
+        return None;
+    }
+    let reste = chemin
+        .strip_prefix("/api/v1/zones")
+        .unwrap_or(chemin)
+        .strip_prefix('/')?;
     let (id, suite) = reste.split_once('/')?;
     let zone: i64 = id.parse().ok()?;
-    if relayee {
-        return Some((zone, true));
+    suite.starts_with("browser-").then_some((zone, relayee))
+}
+
+/// Les zones tirées à distance et l'instant de leur dernier signal relayé.
+#[derive(Default)]
+pub(crate) struct ZonesADistance(std::sync::Mutex<std::collections::HashMap<i64, Instant>>);
+
+impl ZonesADistance {
+    pub(crate) fn noter(&self, zone_id: i64, a_distance: bool, maintenant: Instant) -> bool {
+        let Ok(mut zones) = self.0.lock() else {
+            return false;
+        };
+        zones.retain(|_, t| maintenant.saturating_duration_since(*t) < DELAI_A_DISTANCE);
+        if !a_distance {
+            return zones.remove(&zone_id).is_some();
+        }
+        let nouvelle = zones.insert(zone_id, maintenant).is_none();
+        if zones.len() > ZONES_RETENUES_MAX
+            && let Some((&plus_ancienne, _)) = zones.iter().min_by_key(|(_, t)| **t)
+        {
+            zones.remove(&plus_ancienne);
+        }
+        nouvelle
     }
-    if methode.eq_ignore_ascii_case("POST") && suite.starts_with("browser-") {
-        return Some((zone, false));
+
+    pub(crate) fn a_distance(&self, zone_id: i64, maintenant: Instant) -> bool {
+        self.0.lock().is_ok_and(|zones| {
+            zones
+                .get(&zone_id)
+                .is_some_and(|t| maintenant.saturating_duration_since(*t) < DELAI_A_DISTANCE)
+        })
     }
-    None
+
+    #[cfg(test)]
+    pub(crate) fn nombre(&self) -> usize {
+        self.0.lock().map(|z| z.len()).unwrap_or(0)
+    }
 }
 
 impl PlaybackOrchestrator {
     /// Retient d'où écoute le lecteur de cette zone (voir le module).
     pub fn noter_provenance_de_zone(&self, zone_id: i64, a_distance: bool) {
-        let Ok(mut zones) = self.zones_tirees_a_distance.lock() else {
-            return;
-        };
-        let changee = if a_distance {
-            zones.insert(zone_id)
-        } else {
-            zones.remove(&zone_id)
-        };
-        if changee {
+        if self
+            .zones_tirees_a_distance
+            .noter(zone_id, a_distance, Instant::now())
+        {
             tracing::info!(zone_id, a_distance, "zone_navigateur_provenance");
         }
     }
 
     /// Le lecteur de cette zone écoute-t-il à distance (relais, écoute
-    /// directe) ?
+    /// directe), avec un signal relayé depuis moins de [`DELAI_A_DISTANCE`] ?
     pub fn zone_tiree_a_distance(&self, zone_id: i64) -> bool {
         self.zones_tirees_a_distance
-            .lock()
-            .is_ok_and(|zones| zones.contains(&zone_id))
+            .a_distance(zone_id, Instant::now())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn zones_a_distance(&self) -> &ZonesADistance {
+        &self.zones_tirees_a_distance
     }
 }

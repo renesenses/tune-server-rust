@@ -2407,16 +2407,15 @@ impl PlaybackOrchestrator {
                         dash_plafond_16,
                         plafonnee,
                     ) {
-                        match crate::audio::decode::remux_flac_dash(
+                        // #9174 — indexé pendant le remux pour un navigateur
+                        // tiré à distance ; un index illisible est abandonné,
+                        // la piste part sans.
+                        match crate::audio::decode::remux_flac_dash_indexe(
                             &unique_path_clone,
                             &tmp_path_clone,
+                            indexer,
                         ) {
-                            Ok(mut remuxe) => {
-                                if indexer {
-                                    remuxe.0 = crate::audio::depart_natif::indexer_un_flac(
-                                        &tmp_path_clone,
-                                    )?;
-                                }
+                            Ok(remuxe) => {
                                 // Les VU-mètres décrivaient le PCM du transcodage.
                                 // Le remux n'en produit pas : un décodage À CÔTÉ,
                                 // après coup, les nourrit sans retarder le Play (le
@@ -2482,16 +2481,19 @@ impl PlaybackOrchestrator {
                         encoder.finish().await
                     })?;
 
-                    let encoded_data = if indexer {
-                        crate::audio::depart_natif::avec_seektable(&encoded_data)
-                            .unwrap_or(encoded_data)
+                    // #9174 — indexé à l'écriture pour un navigateur tiré à
+                    // distance (en-tête neuf, trames recopiées en flux) ; un
+                    // FLAC que l'index ne lit pas est écrit tel quel.
+                    let file_size = if indexer {
+                        crate::audio::seektable_flac_9174::ecrire_flac_indexe(
+                            &tmp_path_clone,
+                            &encoded_data,
+                        )?
                     } else {
-                        encoded_data
+                        std::fs::write(&tmp_path_clone, &encoded_data)
+                            .map_err(|e| format!("write temp file: {e}"))?;
+                        encoded_data.len() as u64
                     };
-                    std::fs::write(&tmp_path_clone, &encoded_data)
-                        .map_err(|e| format!("write temp file: {e}"))?;
-
-                    let file_size = encoded_data.len() as u64;
                     Ok::<(u64, u16, u32), String>((file_size, actual_bd, decoded.sample_rate))
                 }),
                 fichiers_de_la_tache,

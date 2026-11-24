@@ -1,12 +1,18 @@
 //! #9174 — la même zone navigateur : WAV chez soi, FLAC indexé par le relais.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex;
 
 use super::PlaybackOrchestrator;
-use super::flux_a_distance_9174::provenance_d_une_requete_de_zone;
+use super::flux_a_distance_9174::{
+    DELAI_A_DISTANCE, ZONES_RETENUES_MAX, provenance_d_une_requete_de_zone,
+};
 use super::resolve_stream::{format_dash_impose, reglages_dash};
+use crate::audio::seektable_flac_9174::{
+    Indexeur, blocs_de_metadonnees, ecrire_flac_indexe, indexer_les_trames,
+};
 use crate::db::migrations::run_migrations;
 use crate::db::sqlite::SqliteDb;
 use crate::db::zone_repo::ZoneRepo;
@@ -51,19 +57,23 @@ fn format_servi(orch: &PlaybackOrchestrator, zone: i64) -> &'static str {
     .expect("sans appareil, le format est imposé")
 }
 
-/// Ce que fait `garde_du_relais` pour chaque requête.
+/// Ce que fait la couche `provenance_navigateur_9174` d'une requête réussie.
 fn requete(orch: &PlaybackOrchestrator, methode: &str, chemin: &str, relayee: bool) {
     if let Some((zone, a_distance)) = provenance_d_une_requete_de_zone(methode, chemin, relayee) {
         orch.noter_provenance_de_zone(zone, a_distance);
     }
 }
 
+fn zone_navigateur(orch: &PlaybackOrchestrator) -> i64 {
+    ZoneRepo::with_backend(orch.db.clone())
+        .create("Ce téléphone", Some("browser"), None)
+        .unwrap()
+}
+
 #[test]
 fn la_meme_zone_navigateur_recoit_du_wav_chez_soi_et_du_flac_par_le_relais() {
     let orch = orchestrateur();
-    let zone = ZoneRepo::with_backend(orch.db.clone())
-        .create("Ce téléphone", Some("browser"), None)
-        .unwrap();
+    let zone = zone_navigateur(&orch);
     let signal = format!("/api/v1/zones/{zone}/browser-playing");
 
     // Chez soi : le lecteur parle au serveur directement.
@@ -82,11 +92,6 @@ fn la_meme_zone_navigateur_recoit_du_wav_chez_soi_et_du_flac_par_le_relais() {
         "tirée par le relais, la zone doit recevoir un format compressé"
     );
 
-    // Une télécommande du salon qui lit l'état de la zone ne dit rien du
-    // lecteur : la zone reste servie à distance.
-    requete(&orch, "GET", &format!("/api/v1/zones/{zone}/status"), false);
-    assert_eq!(format_servi(&orch, zone), "flac");
-
     // Le téléphone revient sur le Wi-Fi de la maison.
     requete(
         &orch,
@@ -97,18 +102,76 @@ fn la_meme_zone_navigateur_recoit_du_wav_chez_soi_et_du_flac_par_le_relais() {
     assert_eq!(format_servi(&orch, zone), "wav");
 }
 
+/// Une télécommande en 5G qui lit l'état de la zone (ou la commande) ne dit
+/// rien de l'endroit où joue son lecteur.
+#[test]
+fn une_telecommande_relayee_ne_met_pas_la_zone_a_distance() {
+    let orch = orchestrateur();
+    let zone = zone_navigateur(&orch);
+    for (m, c) in [
+        ("GET", format!("/api/v1/zones/{zone}/status")),
+        ("POST", format!("/api/v1/zones/{zone}/play")),
+        ("POST", format!("/api/v1/zones/{zone}/volume")),
+        ("GET", format!("/api/v1/zones/{zone}/browser-playing")),
+    ] {
+        requete(&orch, m, &c, true);
+        assert_eq!(format_servi(&orch, zone), "wav", "{m} {c}");
+    }
+    // Et la même télécommande, locale, ne ramène pas un lecteur distant.
+    requete(
+        &orch,
+        "POST",
+        &format!("/api/v1/zones/{zone}/browser-playing"),
+        true,
+    );
+    requete(&orch, "GET", &format!("/api/v1/zones/{zone}/status"), false);
+    assert_eq!(format_servi(&orch, zone), "flac");
+}
+
+/// Un lecteur qui s'est tu depuis plus de 30 s n'emporte plus la zone.
+#[test]
+fn sans_signal_relaye_la_zone_revient_en_local() {
+    let orch = orchestrateur();
+    let zones = orch.zones_a_distance();
+    let t0 = Instant::now();
+    zones.noter(7, true, t0);
+    assert!(zones.a_distance(7, t0 + DELAI_A_DISTANCE - Duration::from_secs(1)));
+    assert!(
+        !zones.a_distance(7, t0 + DELAI_A_DISTANCE + Duration::from_secs(1)),
+        "après le délai, la zone doit revenir en local"
+    );
+    // Un signal relayé la remet à distance, pour un nouveau délai.
+    let t1 = t0 + DELAI_A_DISTANCE + Duration::from_secs(5);
+    zones.noter(7, true, t1);
+    assert!(zones.a_distance(7, t1 + Duration::from_secs(20)));
+}
+
+#[test]
+fn les_zones_retenues_sont_bornees() {
+    let orch = orchestrateur();
+    let zones = orch.zones_a_distance();
+    let t0 = Instant::now();
+    for z in 0..(ZONES_RETENUES_MAX as i64 + 20) {
+        zones.noter(z, true, t0 + Duration::from_millis(z as u64));
+    }
+    assert_eq!(zones.nombre(), ZONES_RETENUES_MAX);
+    // La plus récente est gardée, la plus ancienne oubliée.
+    let fin = t0 + Duration::from_secs(1);
+    assert!(zones.a_distance(ZONES_RETENUES_MAX as i64 + 19, fin));
+    assert!(!zones.a_distance(0, fin));
+}
+
 #[test]
 fn une_zone_reseau_n_est_pas_concernee() {
     let orch = orchestrateur();
     let zone = ZoneRepo::with_backend(orch.db.clone())
         .create("Salon", Some("dlna"), Some("uuid:salon"))
         .unwrap();
-    let navigateur = false;
     orch.noter_provenance_de_zone(zone, true);
     // Hors navigateur, le relais ne change rien : la sonde du renderer décide.
     assert_eq!(
         format_dash_impose(
-            navigateur,
+            false,
             reglages_dash(&orch.db, zone, 24),
             false,
             false,
@@ -121,102 +184,59 @@ fn une_zone_reseau_n_est_pas_concernee() {
 #[test]
 fn provenance_des_requetes() {
     assert_eq!(
-        provenance_d_une_requete_de_zone("GET", "/api/v1/zones/7/status", true),
+        provenance_d_une_requete_de_zone("POST", "/api/v1/zones/7/browser-playing", true),
         Some((7, true))
     );
     assert_eq!(
         provenance_d_une_requete_de_zone("POST", "/api/v1/zones/7/browser-playing", false),
         Some((7, false))
     );
+    // Le chemin vu sous `/zones`, par la couche du routeur des zones.
     assert_eq!(
-        provenance_d_une_requete_de_zone("POST", "/api/v1/zones/7/play", false),
+        provenance_d_une_requete_de_zone("POST", "/7/browser-next", true),
+        Some((7, true))
+    );
+    assert_eq!(
+        provenance_d_une_requete_de_zone("GET", "/api/v1/zones/7/status", true),
         None
     );
     assert_eq!(
-        provenance_d_une_requete_de_zone("GET", "/api/v1/zones/7/browser-playing", false),
+        provenance_d_une_requete_de_zone("POST", "/api/v1/zones/7/play", true),
         None
     );
     assert_eq!(
         provenance_d_une_requete_de_zone("POST", "/api/v1/zones/now-listening", true),
         None
     );
-    assert_eq!(
-        provenance_d_une_requete_de_zone("GET", "/stream/abc.wav", true),
-        None
-    );
-}
-
-/// Le bras DASH décide bien avec la provenance de la zone, au cache chaud
-/// comme à la lecture, et indexe le FLAC qu'il sert à distance.
-#[test]
-fn le_bras_dash_consulte_la_provenance_de_la_zone() {
-    let site = include_str!("resolve_stream.rs");
-    assert!(
-        site.contains(
-            "let a_distance = is_browser_output && self.zone_tiree_a_distance(req.zone_id);"
-        ),
-        "le bras DASH doit savoir si la zone navigateur est tirée à distance"
-    );
-    assert!(site.contains("let indexer = a_distance && dash_enc_format == \"flac\";"));
-    assert_eq!(
-        site.matches("depart_natif::indexer_un_flac(").count()
-            + site.matches("depart_natif::avec_seektable(").count(),
-        2,
-        "remux ET ré-encodage doivent indexer le FLAC servi à distance"
-    );
 }
 
 // ─────────────────────────── SEEKTABLE ───────────────────────────
+//
+// Les fixtures sont de VRAIS FLAC libFLAC stéréo : leur affectation des
+// canaux change d'une trame à l'autre (16/44,1 : 1, puis 10 ; 24/96 : 9,
+// puis 10). Comparer l'affectation entière, et non le nombre de canaux,
+// abandonnait l'index dès la deuxième trame.
 
-const HZ: u32 = 44_100;
+const FIXTURES: [&str; 2] = ["ref_16_44100_stereo.flac", "ref_24_96000_stereo.flac"];
 
-fn flac_sans_index(secondes: u32) -> Vec<u8> {
-    let n = (HZ * secondes) as usize;
-    let mut pcm = Vec::with_capacity(n * 4);
-    let mut x: u32 = 1;
-    for i in 0..n {
-        x = x.wrapping_mul(1_103_515_245).wrapping_add(12_345);
-        let g = ((i as f32 * 0.05).sin() * 8_000.0) as i16 ^ ((x >> 20) as i16 & 0x3F);
-        pcm.extend_from_slice(&g.to_le_bytes());
-        pcm.extend_from_slice(&g.wrapping_neg().to_le_bytes());
-    }
-    let mut enc = crate::audio::encoder::AudioEncoder::new("flac", HZ, 16, 2);
-    enc.start_sync().unwrap();
-    enc.write_sync(&pcm).unwrap();
-    enc.finish_sync().unwrap()
+fn fixture(nom: &str) -> Vec<u8> {
+    std::fs::read(format!(
+        "{}/tests/fixtures/flac/{nom}",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .unwrap()
 }
 
-/// Les blocs de métadonnées : (type, corps), et l'octet de la première trame.
+/// Les blocs (type, corps) et l'octet de la première trame.
 fn blocs(flac: &[u8]) -> (Vec<(u8, Vec<u8>)>, usize) {
-    let mut out = Vec::new();
-    let mut pos = 4;
-    loop {
-        let h = &flac[pos..pos + 4];
-        let len = u32::from_be_bytes([0, h[1], h[2], h[3]]) as usize;
-        out.push((h[0] & 0x7F, flac[pos + 4..pos + 4 + len].to_vec()));
-        pos += 4 + len;
-        if h[0] & 0x80 != 0 {
-            return (out, pos);
-        }
-    }
+    let (b, debut) = blocs_de_metadonnees(flac).expect("FLAC");
+    (b.into_iter().map(|(k, c)| (k, c.to_vec())).collect(), debut)
 }
 
-#[test]
-fn le_flac_servi_a_distance_porte_une_seektable_juste() {
-    let brut = flac_sans_index(35);
-    let (avant, _) = blocs(&brut);
-    assert!(
-        avant.iter().all(|(k, _)| *k != 3),
-        "l'encodeur natif n'écrit pas de SEEKTABLE"
-    );
-
-    let indexe = crate::audio::depart_natif::avec_seektable(&brut).expect("FLAC lisible");
-    let (apres, debut) = blocs(&indexe);
-    assert_eq!(apres[0].0, 0, "STREAMINFO d'abord");
-    assert_eq!(apres[1].0, 3, "SEEKTABLE juste après");
-    let table = &apres[1].1;
+/// Les points de la SEEKTABLE : (échantillon, décalage, échantillons).
+fn points(table: &[u8]) -> Vec<(u64, u64, u16)> {
     assert_eq!(table.len() % 18, 0);
-    let points: Vec<(u64, u64, u16)> = table
+    table
         .chunks(18)
         .map(|p| {
             (
@@ -225,48 +245,111 @@ fn le_flac_servi_a_distance_porte_une_seektable_juste() {
                 u16::from_be_bytes([p[16], p[17]]),
             )
         })
-        .collect();
-    // 0, 10, 20 et 30 s : un point par tranche de 10 s, sur la première trame
-    // qui la commence.
-    assert_eq!(points.len(), 4, "{points:?}");
-    for (k, &(echantillon, decalage, dans_la_trame)) in points.iter().enumerate() {
-        let cible = k as u64 * 10 * HZ as u64;
-        assert!(
-            echantillon >= cible && echantillon < cible + 4096,
-            "point {k} : {echantillon}"
-        );
-        assert_eq!(dans_la_trame, 4096);
-        // Le décalage désigne un en-tête de trame réel, de ce numéro-là.
-        let t = &indexe[debut + decalage as usize..];
-        assert_eq!((t[0], t[1] & 0xFE), (0xFF, 0xF8), "point {k} hors trame");
-        assert_eq!(echantillon % 4096, 0);
-    }
-    // Les trames sont celles de l'original, octet pour octet.
-    let (_, debut_brut) = blocs(&brut);
-    assert_eq!(&indexe[debut..], &brut[debut_brut..]);
-
-    // Et le fichier se décode toujours, au même PCM.
-    let dir = tempfile::tempdir().unwrap();
-    let a = dir.path().join("brut.flac");
-    let b = dir.path().join("indexe.flac");
-    std::fs::write(&a, &brut).unwrap();
-    std::fs::write(&b, &indexe).unwrap();
-    let pa =
-        crate::audio::decode::decode_to_pcm(a.to_str().unwrap(), None, None, 0.0, 0.0).unwrap();
-    let pb =
-        crate::audio::decode::decode_to_pcm(b.to_str().unwrap(), None, None, 0.0, 0.0).unwrap();
-    assert_eq!(pa.samples_i32, pb.samples_i32);
-
-    // Indexer un fichier déjà indexé ne double pas la table.
-    let taille = crate::audio::depart_natif::indexer_un_flac(b.to_str().unwrap()).unwrap();
-    let relu = std::fs::read(&b).unwrap();
-    assert_eq!(taille, relu.len() as u64);
-    let (encore, _) = blocs(&relu);
-    assert_eq!(encore.iter().filter(|(k, _)| *k == 3).count(), 1);
+        .collect()
 }
 
+fn pcm(chemin: &std::path::Path) -> Vec<i32> {
+    crate::audio::decode::decode_to_pcm(chemin.to_str().unwrap(), None, None, 0.0, 0.0)
+        .unwrap()
+        .samples_i32
+}
+
+/// Le FLAC libFLAC passé par `remux_flac_dash` (en fMP4, comme TIDAL le
+/// livre) sort avec une SEEKTABLE, des trames intactes et le même PCM.
 #[test]
-fn ce_qui_n_est_pas_un_flac_reste_tel_quel() {
-    assert!(crate::audio::depart_natif::avec_seektable(b"RIFF\0\0\0\0WAVE").is_none());
-    assert!(crate::audio::depart_natif::avec_seektable(b"fLaC").is_none());
+fn un_flac_libflac_remuxe_pour_le_relais_porte_sa_seektable() {
+    use super::tidal_cd_dash_jusqu_au_play_7266::{segment_init, segment_media, trames_flac};
+    for nom in FIXTURES {
+        let flac = fixture(nom);
+        let (info, trames) = trames_flac(&flac);
+        let fmp4 = [segment_init(&info), segment_media(1, 0, &trames)].concat();
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("piste.mp4");
+        std::fs::write(&source, &fmp4).unwrap();
+        let sans = dir.path().join("sans.flac");
+        let avec = dir.path().join("avec.flac");
+        let s = source.to_str().unwrap();
+        crate::audio::decode::remux_flac_dash_indexe(s, sans.to_str().unwrap(), false).unwrap();
+        let (taille, _, _) =
+            crate::audio::decode::remux_flac_dash_indexe(s, avec.to_str().unwrap(), true)
+                .unwrap();
+
+        let brut = std::fs::read(&sans).unwrap();
+        let indexe = std::fs::read(&avec).unwrap();
+        assert_eq!(taille, indexe.len() as u64);
+        let (b_sans, d_sans) = blocs(&brut);
+        assert!(b_sans.iter().all(|(k, _)| *k != 3), "{nom} : sans index demandé");
+        let (b_avec, d_avec) = blocs(&indexe);
+        assert_eq!(b_avec[0].0, 0, "{nom} : STREAMINFO d'abord");
+        assert_eq!(
+            b_avec.get(1).map(|b| b.0),
+            Some(3),
+            "{nom} : la SEEKTABLE doit suivre STREAMINFO (index abandonné ?)"
+        );
+        assert_eq!(points(&b_avec[1].1), vec![(0, 0, 4096)], "{nom}");
+        assert_eq!(&indexe[d_avec..], &brut[d_sans..], "{nom} : trames intactes");
+        assert_eq!(pcm(&avec), pcm(&sans), "{nom} : même PCM");
+    }
+}
+
+/// Le ré-encodage : les trames retrouvées dans le tampon (CRC-16), un point
+/// par trame avec un intervalle d'une trame — TOUTES les trames du flux.
+#[test]
+fn chaque_trame_libflac_est_retrouvee_malgre_l_affectation_variable() {
+    for nom in FIXTURES {
+        let flac = fixture(nom);
+        let (b, debut) = blocs(&flac);
+        let info = &b[0].1;
+        let total = (((info[13] & 0x0F) as u64) << 32)
+            | u32::from_be_bytes([info[14], info[15], info[16], info[17]]) as u64;
+        let attendues = total.div_ceil(4096);
+        let mut ix = Indexeur::depuis_streaminfo(info).unwrap().avec_intervalle(4096);
+        assert!(
+            indexer_les_trames(&flac, debut, &mut ix),
+            "{nom} : une trame décorrélée autrement que la première a été refusée"
+        );
+        let p = points(ix.table());
+        assert_eq!(p.len() as u64, attendues, "{nom} : {p:?}");
+        for (k, &(echantillon, decalage, _)) in p.iter().enumerate() {
+            assert_eq!(echantillon, k as u64 * 4096, "{nom}");
+            let t = &flac[debut + decalage as usize..];
+            assert_eq!((t[0], t[1] & 0xFE), (0xFF, 0xF8), "{nom} : point {k} hors trame");
+        }
+    }
+}
+
+/// Le chemin du ré-encodage écrit le fichier indexé en flux ; un tampon que
+/// l'index ne sait pas lire est écrit tel quel, sans faire échouer la piste.
+#[test]
+fn le_flac_reencode_est_ecrit_indexe_ou_tel_quel() {
+    let dir = tempfile::tempdir().unwrap();
+    for nom in FIXTURES {
+        let flac = fixture(nom);
+        let sortie = dir.path().join(nom);
+        let taille = ecrire_flac_indexe(sortie.to_str().unwrap(), &flac).unwrap();
+        let ecrit = std::fs::read(&sortie).unwrap();
+        assert_eq!(taille, ecrit.len() as u64);
+        let (b, _) = blocs(&ecrit);
+        assert_eq!(b[1].0, 3, "{nom}");
+        assert_eq!(b.iter().filter(|(k, _)| *k == 3).count(), 1, "{nom}");
+        let source = dir.path().join(format!("source-{nom}"));
+        std::fs::write(&source, &flac).unwrap();
+        assert_eq!(pcm(&sortie), pcm(&source), "{nom}");
+    }
+    // Un faux FLAC : écrit tel quel.
+    let faux = dir.path().join("faux.flac");
+    let octets = b"fLaC\x80\x00\x00\x02xx".to_vec();
+    assert_eq!(
+        ecrire_flac_indexe(faux.to_str().unwrap(), &octets).unwrap(),
+        octets.len() as u64
+    );
+    assert_eq!(std::fs::read(&faux).unwrap(), octets);
+    // Une trame corrompue (CRC-16 faux) : l'index renonce, le fichier part.
+    let mut abime = fixture(FIXTURES[0]);
+    let n = abime.len();
+    abime[n - 1] ^= 0xFF;
+    let sortie = dir.path().join("abime.flac");
+    let taille = ecrire_flac_indexe(sortie.to_str().unwrap(), &abime).unwrap();
+    assert_eq!(std::fs::read(&sortie).unwrap(), abime);
+    assert_eq!(taille, n as u64);
 }

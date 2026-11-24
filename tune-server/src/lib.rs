@@ -43,6 +43,8 @@ pub mod fils_de_travail;
 pub mod garde_du_cercle;
 /// Ce qu'une requête rejouée par le relais ou l'écoute directe peut atteindre.
 pub mod garde_du_relais;
+/// #9174 — d'où écoute le lecteur d'une zone navigateur (relais ou local).
+pub mod provenance_navigateur_9174;
 /// #7077 — garde : aucune phrase française dans les champs exposés de l'API.
 #[cfg(test)]
 mod garde_francais_api;

@@ -39,6 +39,8 @@ pub mod decode;
 pub mod decode_progress;
 /// #6059 — servir un FLAC, AIFF ou DSF natif à partir d'une position.
 pub mod depart_natif;
+/// #9174 — une SEEKTABLE pour le FLAC servi à un navigateur tiré à distance.
+pub mod seektable_flac_9174;
 pub mod dff;
 /// #6057 — la disposition des canaux déclarée par le fichier (WAV, FLAC, DSF,
 /// DFF) et le routage par position vers la sortie.
