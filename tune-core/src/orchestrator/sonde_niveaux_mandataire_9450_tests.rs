@@ -436,18 +436,19 @@ async fn le_decodeur_freine_reagit_a_un_saut() {
             .get(&sid)
             .cloned()
             .unwrap();
-        // 35 s relayées d'un coup : le décodeur s'arrête à ~30 s d'avance.
+        // 55 s relayées d'un coup : le décodeur s'arrête à ~30 s d'avance et
+        // ne se libérerait seul qu'après ~25 s.
         let wav = wav_silencieux(60);
         let total = wav.len() as u64;
         let seconde = 176_400usize;
-        for (i, bloc) in wav[..44 + 35 * seconde].chunks(256 * 1024).enumerate() {
+        for (i, bloc) in wav[..44 + 55 * seconde].chunks(256 * 1024).enumerate() {
             session
                 .prise_des_niveaux
                 .nourrir(1, (i * 256 * 1024) as u64, bloc, Some(total));
         }
         tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
-        // Le renderer saute en avant, à 50 s (nouvelle connexion).
-        let saut = 44 + 50 * seconde;
+        // Le renderer saute en avant, à 58 s (nouvelle connexion).
+        let saut = 44 + 58 * seconde;
         session
             .prise_des_niveaux
             .nourrir(2, saut as u64, &wav[saut..saut + seconde], Some(total));
@@ -455,7 +456,7 @@ async fn le_decodeur_freine_reagit_a_un_saut() {
             session.prise_des_niveaux.saut_en_attente(),
             "mise en scène : saut envoyé"
         );
-        let fin = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let fin = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
         while session.prise_des_niveaux.saut_en_attente() && tokio::time::Instant::now() < fin {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
