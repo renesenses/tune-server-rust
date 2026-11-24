@@ -499,7 +499,6 @@ impl<T: Flottant> Convolver<T> {
         m.eteint = true;
         m
     }
-    }
 
     /// T09b — changer de filtre FLUX EN COURS, sans discontinuité.
     ///

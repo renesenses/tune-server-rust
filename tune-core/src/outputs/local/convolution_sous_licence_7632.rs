@@ -90,7 +90,10 @@ fn un_filtre_pose_en_lecture_sans_moteur_ne_rejoue_aucun_echantillon_t09b() {
     {
         let garde = s.convolver.lock().unwrap();
         let moteur = garde.as_ref().expect("un moteur est posé tout de suite");
-        assert!(moteur.bascule_en_cours(), "le filtre arrive par réchauffe et fondu");
+        assert!(
+            moteur.bascule_en_cours(),
+            "le filtre arrive par réchauffe et fondu"
+        );
     }
     let lat = 1024;
     let entree = sinus(2_000);
@@ -99,11 +102,18 @@ fn un_filtre_pose_en_lecture_sans_moteur_ne_rejoue_aucun_echantillon_t09b() {
         passer(&s, bloc);
     }
     // Le bloc de la pose : du silence (le retard s'amorce), jamais l'entrée.
-    assert!(pcm[..lat * 2].iter().all(|v| *v == 0.0), "trou de pose attendu");
+    assert!(
+        pcm[..lat * 2].iter().all(|v| *v == 0.0),
+        "trou de pose attendu"
+    );
     // Pendant la réchauffe (64 prises + un bloc) : l'entrée exactement
     // retardée d'un bloc.
     for n in lat..(64 + lat) {
-        assert_eq!(pcm[2 * n], entree[2 * (n - lat)], "trame {n} rejouée ou altérée");
+        assert_eq!(
+            pcm[2 * n],
+            entree[2 * (n - lat)],
+            "trame {n} rejouée ou altérée"
+        );
     }
 }
 

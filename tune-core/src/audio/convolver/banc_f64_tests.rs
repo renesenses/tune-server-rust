@@ -633,7 +633,10 @@ fn la_pose_en_lecture_ne_rejoue_aucun_echantillon() {
         .ok()
         .unwrap();
     m.traiter(apres);
-    assert!(y[..bloc].iter().all(|v| *v == 0.0), "bloc de pose : silence");
+    assert!(
+        y[..bloc].iter().all(|v| *v == 0.0),
+        "bloc de pose : silence"
+    );
     // Jusqu'à la fin de la réchauffe (prises + bloc), l'entrée exactement
     // retardée : chaque trame sort une seule fois.
     let rechauffe = 1 + bloc;
@@ -644,6 +647,9 @@ fn la_pose_en_lecture_ne_rejoue_aucun_echantillon() {
     assert!(saut <= 1.05 * pente_du_sinus(), "saut {saut}");
     let fin = pose + rechauffe + 960 + 1;
     for n in fin..x.len() {
-        assert!((y[n] - 0.6 * x[n - bloc]).abs() < SEUIL_64_BITS, "trame {n}");
+        assert!(
+            (y[n] - 0.6 * x[n - bloc]).abs() < SEUIL_64_BITS,
+            "trame {n}"
+        );
     }
 }
