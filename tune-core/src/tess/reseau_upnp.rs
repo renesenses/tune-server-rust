@@ -399,7 +399,12 @@ mod tests {
                 .map(|id| MaillonGreffon {
                     id: (*id).into(),
                     enabled: true,
-                    settings: Value::Null,
+                    // rc14 : une convolution sans fichier ne traite rien.
+                    settings: if *id == "convolution" {
+                        serde_json::json!({ "ir_path": "/ir/salon.wav" })
+                    } else {
+                        Value::Null
+                    },
                 })
                 .collect(),
             ..ChaineTess::default()

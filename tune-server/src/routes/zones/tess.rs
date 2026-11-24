@@ -184,15 +184,33 @@ pub fn greffon_disponible(settings: &SettingsRepo, id: &str) -> bool {
     }
 }
 
+/// Le paquet facultatif qui manque à ce greffon et que l'utilisateur peut
+/// installer (`POST /plugins/{paquet}/install`), ou `None`. Depuis la
+/// v0.9.156, l'égaliseur et la réaffectation des canaux ne sont plus installés
+/// par la migration : sur une base neuve, ils sont « à installer », pas
+/// « indisponibles ». Un paquet installé mais désactivé, ou en échec de
+/// chargement, reste `plugin_unavailable`.
+pub fn paquet_a_installer(settings: &SettingsRepo, id: &str) -> Option<&'static str> {
+    use tune_core::audio::premium_plugins::installed;
+    let paquet = match id {
+        ID_EQ_GRAPHIQUE | ID_EQ_PARAMETRIQUE | ID_EQ_CASQUE | ID_CORRECTION_PIECE => "equalizer",
+        ID_REAFFECTATION => "channel-remap",
+        _ => return None,
+    };
+    (!installed(settings, paquet)).then_some(paquet)
+}
+
 /// `GET /tess/catalog`
 pub async fn catalogue_tess_route(State(state): State<AppState>) -> impl IntoResponse {
     let premium = state.license.is_premium().await;
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let disponible = |id: &str| greffon_disponible(&settings, id);
-    Json(ReponseCatalogue::depuis(
+    let a_installer = |id: &str| paquet_a_installer(&settings, id).map(str::to_owned);
+    Json(ReponseCatalogue::depuis_avec_installation(
         catalogue_du_serveur(),
         premium,
         &disponible,
+        &a_installer,
     ))
 }
 
@@ -717,7 +735,13 @@ pub async fn put_zone_tess(
             .await;
     let (lecture, cles) = match resultat {
         Ok(Ok(x)) => x,
-        Ok(Err(r)) => return r,
+        Ok(Err(r)) => {
+            // rc14 (recette .18) : un refus laisse sa trace au journal ; sans
+            // elle, « rien ne se passe » ne se distinguait pas d'un PUT jamais
+            // parti.
+            info!(zone_id = id, status = %r.status(), "tess_put_refuse");
+            return r;
+        }
         Err(e) => return erreur_migration(&ErreurMigration::Stockage(e.to_string())),
     };
     // T17 : la chaîne a changé à la main ; le préréglage chargé n'est plus
