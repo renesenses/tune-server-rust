@@ -300,6 +300,13 @@ path = "tests/pont_administration.rs"
 name = "relais_routes_relayables"
 path = "tests/relais_routes_relayables.rs"
 
+# Garde de la couche d'authentification (routes privilégiées, profil
+# `default`, premier lancement). `autotests = false` plus haut : sans cette
+# cible, jamais compilé.
+[[test]]
+name = "auth_security"
+path = "tests/auth_security.rs"
+
 # #3326 — le mode de transition (un `client/hello` en clair). `autotests =
 # false` plus haut : sans cette cible, le fichier ne serait JAMAIS compilé, et
 # la contre-épreuve qui garde le chemin chiffré ne serait exécutée par personne.
