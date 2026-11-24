@@ -5890,10 +5890,12 @@ mod scan_de_demarrage_tests {
 
         let bus = Arc::new(tune_core::event_bus::EventBus::new());
         let fini = crate::auto_scan::spawn_auto_scan(backend.clone(), bus);
-        for _ in 0..600 {
-            if fini.load(Ordering::Acquire) {
-                break;
-            }
+        // #9057 — attendre le DRAPEAU de fin, pas 12 s fixes : sous charge, le
+        // scan de démarrage peut dépasser ce délai sans être en faute. Le
+        // plafond (300 s) est celui des autres épreuves de scan de démarrage.
+        let debut = std::time::Instant::now();
+        while !fini.load(Ordering::Acquire) && debut.elapsed() < std::time::Duration::from_secs(300)
+        {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
         assert!(
