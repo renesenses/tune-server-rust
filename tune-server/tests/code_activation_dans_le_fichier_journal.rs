@@ -53,32 +53,97 @@ async fn appeler(
     (st, String::from_utf8_lossy(&octets).to_string())
 }
 
-/// Un faux service communautaire local : il garde ce que le rapport de bogue
-/// lui envoie réellement.
-async fn faux_site() -> (String, Arc<Mutex<Vec<String>>>) {
-    let recus = Arc::new(Mutex::new(Vec::new()));
-    let r = recus.clone();
-    let app = axum::Router::new().route(
-        "/api/v1/community/bug-report",
-        axum::routing::post(move |corps: axum::body::Bytes| {
-            let r = r.clone();
-            async move {
-                r.lock()
-                    .await
-                    .push(String::from_utf8_lossy(&corps).to_string());
-                axum::Json(serde_json::json!({
-                    "status": "submitted",
-                    "thread": { "id": 1, "slug": "essai", "url": "https://exemple/forum/threads/essai" },
-                }))
-            }
-        }),
-    );
+type Recus = Arc<Mutex<Vec<String>>>;
+
+/// Ce qu'un faux service a reçu, lu en texte, octets nuls retirés : une pièce
+/// UTF-16 qui partirait brute montrerait alors le code en clair.
+fn en_texte(corps: &[u8]) -> String {
+    String::from_utf8_lossy(corps).replace('\0', "")
+}
+
+/// Un faux site local : il garde ce que le rapport de bogue et le ticket de
+/// support lui envoient réellement.
+async fn faux_site() -> (String, Recus, Recus) {
+    let rapports: Recus = Arc::default();
+    let tickets: Recus = Arc::default();
+    let r = rapports.clone();
+    let t = tickets.clone();
+    let app = axum::Router::new()
+        .route(
+            "/api/v1/community/bug-report",
+            axum::routing::post(move |corps: axum::body::Bytes| {
+                let r = r.clone();
+                async move {
+                    r.lock().await.push(en_texte(&corps));
+                    axum::Json(serde_json::json!({
+                        "status": "submitted",
+                        "thread": { "id": 1, "slug": "essai", "url": "https://exemple/forum/threads/essai" },
+                    }))
+                }
+            }),
+        )
+        .route(
+            "/api/v1/support/tickets",
+            axum::routing::post(move |corps: axum::body::Bytes| {
+                let t = t.clone();
+                async move {
+                    t.lock().await.push(en_texte(&corps));
+                    (StatusCode::CREATED, axum::Json(serde_json::json!({ "id": 1 })))
+                }
+            }),
+        );
     let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = ecoute.local_addr().unwrap().port();
     tokio::spawn(async move {
         let _ = axum::serve(ecoute, app).await;
     });
-    (format!("http://127.0.0.1:{port}"), recus)
+    (format!("http://127.0.0.1:{port}"), rapports, tickets)
+}
+
+/// Un `multipart/form-data` : des champs texte, puis une pièce `attachments[]`.
+fn multipart(champs: &[(&str, &str)], nom: &str, octets: &[u8]) -> (String, Vec<u8>) {
+    let limite = "----tunecode";
+    let mut corps = Vec::new();
+    for (k, v) in champs {
+        corps.extend_from_slice(
+            format!("--{limite}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n")
+                .as_bytes(),
+        );
+    }
+    corps.extend_from_slice(
+        format!(
+            "--{limite}\r\nContent-Disposition: form-data; name=\"attachments[]\"; \
+             filename=\"{nom}\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    corps.extend_from_slice(octets);
+    corps.extend_from_slice(format!("\r\n--{limite}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={limite}"), corps)
+}
+
+async fn poster_multipart(state: &AppState, chemin: &str, ct: String, corps: Vec<u8>) -> StatusCode {
+    let pair: SocketAddr = CETTE_MACHINE.parse().unwrap();
+    tune_server::routes::router(state.clone())
+        .layer(MockConnectInfo(pair))
+        .oneshot(
+            Request::post(chemin)
+                .header("content-type", ct)
+                .body(Body::from(corps))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+}
+
+/// UTF-16LE avec marque d'ordre : ce que PowerShell 5.1 écrit avec `>`.
+fn utf16le(texte: &str) -> Vec<u8> {
+    let mut octets = vec![0xFF, 0xFE];
+    for u in texte.encode_utf16() {
+        octets.extend_from_slice(&u.to_le_bytes());
+    }
+    octets
 }
 
 #[tokio::test]
@@ -97,10 +162,11 @@ async fn le_code_est_dans_le_fichier_journal_et_nulle_part_ailleurs() {
     assert_eq!(chemin.as_deref(), Some(journal.as_path()));
 
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
-    let (base, recus) = faux_site().await;
-    SettingsRepo::with_backend(state.backend.clone())
-        .set("mozaik_base_url", &base)
-        .unwrap();
+    let (base, recus, tickets) = faux_site().await;
+    let reglages = SettingsRepo::with_backend(state.backend.clone());
+    reglages.set("mozaik_base_url", &base).unwrap();
+    // Le ticket de support exige une licence.
+    reglages.set("license_key", "TUNE-ESSAI-CODE").unwrap();
 
     // Une ligne ordinaire avant, pour prouver que les lecteurs lisent bien ce
     // fichier-là.
@@ -189,53 +255,57 @@ async fn le_code_est_dans_le_fichier_journal_et_nulle_part_ailleurs() {
         );
     }
 
-    // 3 bis. Le fichier journal brut joint au rapport (`attachments[]`) :
-    //        il part, sans la ligne du code — en UTF-8 valide ou non.
+    // 3 bis. Le fichier journal brut joint au rapport de bogue et au ticket
+    //        de support (`attachments[]`) : il part, sans la ligne du code —
+    //        UTF-8 valide ou non, UTF-16LE.
     let mut brut_non_utf8 = texte.clone().into_bytes();
     brut_non_utf8.extend_from_slice(b"\xff\xfe octets invalides\n");
-    for (nom, octets) in [
+    let pieces = [
         ("tune-server.log", texte.clone().into_bytes()),
         ("journal.txt", brut_non_utf8),
+        ("powershell.log", utf16le(&texte)),
+    ];
+    for (route, champs, recu) in [
+        (
+            "/api/v1/system/bug-report/submit",
+            &[("description", "Journal joint")][..],
+            &recus,
+        ),
+        (
+            "/api/v1/support/tickets",
+            &[("subject", "Essai"), ("body", "Journal joint")][..],
+            &tickets,
+        ),
     ] {
-        let limite = "----tunecode";
-        let mut corps: Vec<u8> = format!(
-            "--{limite}\r\nContent-Disposition: form-data; name=\"description\"\r\n\r\n\
-             Journal joint\r\n--{limite}\r\nContent-Disposition: form-data; \
-             name=\"attachments[]\"; filename=\"{nom}\"\r\n\
-             Content-Type: application/octet-stream\r\n\r\n"
-        )
-        .into_bytes();
-        corps.extend_from_slice(&octets);
-        corps.extend_from_slice(format!("\r\n--{limite}--\r\n").as_bytes());
-        let pair: SocketAddr = CETTE_MACHINE.parse().unwrap();
-        let resp = tune_server::routes::router(state.clone())
-            .layer(MockConnectInfo(pair))
-            .oneshot(
-                Request::post("/api/v1/system/bug-report/submit")
-                    .header(
-                        "content-type",
-                        format!("multipart/form-data; boundary={limite}"),
-                    )
-                    .body(Body::from(corps))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "{nom}");
-        let recus = recus.lock().await;
-        let dernier = recus.last().unwrap();
-        assert!(
-            dernier.contains(&format!("filename=\"{nom}\"")),
-            "la pièce {nom} doit partir"
-        );
-        assert!(
-            dernier.matches("temoin-avant").count() >= 1,
-            "le journal joint doit partir avec ses autres lignes"
-        );
-        assert!(
-            !dernier.contains(&code) && !dernier.contains(MARQUEUR_CODE_ACTIVATION),
-            "le journal joint au rapport ({nom}) porte le code"
-        );
+        for (nom, octets) in &pieces {
+            let (ct, corps) = multipart(champs, nom, octets);
+            let st = poster_multipart(&state, route, ct, corps).await;
+            assert!(st.is_success(), "{route} {nom} : {st}");
+            let recu = recu.lock().await;
+            let dernier = recu.last().unwrap_or_else(|| panic!("{route} {nom} : rien reçu"));
+            assert!(
+                dernier.contains(&format!("filename=\"{nom}\"")),
+                "{route} : la pièce {nom} doit partir"
+            );
+            assert!(
+                dernier.contains("temoin-avant"),
+                "{route} : le journal joint ({nom}) doit partir avec ses autres lignes"
+            );
+            assert!(
+                !dernier.contains(&code) && !dernier.contains(MARQUEUR_CODE_ACTIVATION),
+                "{route} : le journal joint ({nom}) porte le code"
+            );
+        }
+        // Une pièce texte illisible (UTF-16 mal formé) est refusée, et rien
+        // ne part.
+        let avant = recu.lock().await.len();
+        let mut illisible = vec![0xFF, 0xFE];
+        illisible.extend_from_slice(&0xD800u16.to_le_bytes());
+        illisible.extend_from_slice(&utf16le(&texte)[2..]);
+        let (ct, corps) = multipart(champs, "illisible.log", &illisible);
+        let st = poster_multipart(&state, route, ct, corps).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{route} : pièce illisible");
+        assert_eq!(recu.lock().await.len(), avant, "{route} : rien ne doit partir");
     }
 
     // 4. La porte commune de tout ce qui part vers le site (ticket, rapport,

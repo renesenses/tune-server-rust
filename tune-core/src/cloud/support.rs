@@ -205,9 +205,20 @@ fn champs_de_diagnostic_nettoyes(fields: Vec<(String, String)>) -> Vec<(String, 
 /// Une pièce jointe texte (journal, fiche exportée) passe par le même
 /// nettoyage que le champ `logs` ; une image ou une archive part telle quelle
 /// ([`crate::confidentialite::piece_texte_nettoyee`]).
-fn piece_nettoyee(mut file: AttachmentUpload) -> AttachmentUpload {
-    file.bytes = crate::confidentialite::piece_texte_nettoyee(&file.file_name, file.bytes);
-    file
+/// Une pièce texte illisible (UTF-16 mal formé…) est refusée : on ne sait pas
+/// la nettoyer.
+fn piece_nettoyee(mut file: AttachmentUpload) -> Result<AttachmentUpload, (u16, Value)> {
+    file.bytes = crate::confidentialite::piece_texte_nettoyee(&file.file_name, file.bytes)
+        .map_err(|_| {
+            (
+                400u16,
+                json!({
+                    "error": "attachment_unreadable",
+                    "detail": format!("« {} » n'est pas un texte lisible (UTF-8 ou UTF-16).", file.file_name),
+                }),
+            )
+        })?;
+    Ok(file)
 }
 
 /// Complète un formulaire sortant : les champs texte tels quels, puis chaque
@@ -226,7 +237,8 @@ fn multipart_form(
         form = form.text(name, value);
     }
 
-    for file in files.into_iter().map(piece_nettoyee) {
+    for file in files {
+        let file = piece_nettoyee(file)?;
         let part = reqwest::multipart::Part::bytes(file.bytes)
             .file_name(file.file_name)
             .mime_str(&file.content_type)
@@ -823,14 +835,16 @@ mod tests {
             file_name: "tune.LOG".into(),
             content_type: "text/plain".into(),
             bytes: format!("WARN relay server_id={sid} {lien}").into_bytes(),
-        });
+        })
+        .unwrap();
         let texte = String::from_utf8(piece.bytes).unwrap();
         assert!(!texte.contains(sid) && !texte.contains(jeton), "{texte}");
         let image = piece_nettoyee(AttachmentUpload {
             file_name: "capture.png".into(),
             content_type: "image/png".into(),
             bytes: sid.as_bytes().to_vec(),
-        });
+        })
+        .unwrap();
         assert_eq!(image.bytes, sid.as_bytes(), "une image ne se réécrit pas");
     }
 }

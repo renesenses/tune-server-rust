@@ -292,13 +292,13 @@ pub fn la_console_ecrit_deja_dans(_chemin: &std::path::Path) -> bool {
     false
 }
 
-/// #8946 — le fichier de journal, ouvert en ajout ; en 0600 sous Unix.
+/// #8946 — le fichier de journal, ouvert en ajout ; CRÉÉ en 0600 sous Unix.
 ///
 /// Le journal porte des chemins de la bibliothèque, des noms d'appareils, des
-/// adresses : il n'a pas à être lisible par les autres comptes. Créé en 0600 ;
-/// un fichier existant plus ouvert (laissé par une version antérieure, ou créé
-/// par une redirection du lanceur) est ramené à 0600 à l'ouverture, quand ce
-/// compte en est le propriétaire.
+/// adresses : il n'a pas à être lisible par les autres comptes. Un fichier
+/// existant lisible par les AUTRES (laissé par une version antérieure, ou créé
+/// par une redirection du lanceur) perd ces droits-là à l'ouverture — voir
+/// [`mode_resserre`].
 fn ouvrir_en_ajout(chemin: &std::path::Path) -> io::Result<File> {
     let mut options = std::fs::OpenOptions::new();
     options.create(true).append(true);
@@ -306,15 +306,34 @@ fn ouvrir_en_ajout(chemin: &std::path::Path) -> io::Result<File> {
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let fichier = options.open(chemin)?;
     #[cfg(unix)]
-    {
+    if let Some(mode) = fichier.metadata().ok().as_ref().and_then(mode_resserre) {
         use std::os::unix::fs::PermissionsExt;
-        if let Ok(meta) = fichier.metadata()
-            && meta.permissions().mode() & 0o077 != 0
-        {
-            let _ = fichier.set_permissions(std::fs::Permissions::from_mode(0o600));
+        // Avant l'abonné `tracing` : le flux d'erreur, comme les refus.
+        match fichier.set_permissions(std::fs::Permissions::from_mode(mode)) {
+            Ok(()) => eprintln!(
+                "tune-server: journal {} ramené au mode {mode:o} (plus lisible par les autres comptes)",
+                chemin.display()
+            ),
+            Err(e) => eprintln!(
+                "tune-server: journal {} lisible par les autres comptes, mode inchangé : {e}",
+                chemin.display()
+            ),
         }
     }
     Ok(fichier)
+}
+
+/// Le mode à poser sur un journal existant, ou `None` pour n'y rien changer.
+///
+/// Seuls les droits des AUTRES sont retirés : un 0640 posé exprès (groupe
+/// `adm`, logrotate, un collecteur de journaux) reste tel quel. Et seulement
+/// sur un fichier ORDINAIRE : `TUNE_LOG_FILE=/dev/null` ou `/dev/stdout` ne
+/// doivent pas changer les droits d'un périphérique ou d'un terminal.
+#[cfg(unix)]
+fn mode_resserre(meta: &std::fs::Metadata) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = meta.permissions().mode() & 0o7777;
+    (meta.is_file() && mode & 0o007 != 0).then_some(mode & !0o007)
 }
 
 /// Le dossier du journal, créé en 0700 sous Unix (seuls les dossiers CRÉÉS
@@ -421,21 +440,37 @@ mod tests {
     /// dans #3030 : 1 657 des 3 204 résidus de `/tmp` étaient des
     /// `tune-journal-*`.
     /// Un journal existant en 0644 (version antérieure, redirection du
-    /// lanceur) est ramené à 0600 à l'ouverture.
+    /// lanceur) perd les droits des autres à l'ouverture ; un 0640 posé exprès
+    /// reste tel quel.
     #[cfg(unix)]
     #[test]
-    fn un_journal_existant_trop_ouvert_est_ramene_a_0600() {
+    fn un_journal_existant_perd_les_droits_des_autres_seulement() {
         use std::os::unix::fs::PermissionsExt;
-        let d = dossier("journal-0600");
-        let chemin = d.path().join("tune-server.log");
-        std::fs::write(&chemin, b"ancienne ligne\n").expect("fichier existant");
-        std::fs::set_permissions(&chemin, std::fs::Permissions::from_mode(0o644)).expect("0644");
+        let d = dossier("journal-0640");
+        for (avant, apres) in [(0o644, 0o640), (0o666, 0o660), (0o640, 0o640), (0o600, 0o600)] {
+            let chemin = d.path().join(format!("tune-server-{avant:o}.log"));
+            std::fs::write(&chemin, b"ancienne ligne\n").expect("fichier existant");
+            std::fs::set_permissions(&chemin, std::fs::Permissions::from_mode(avant))
+                .expect("mode");
+            let (ouvert, refus) = ouvrir_le_premier_journal([chemin.clone()], 1024 * 1024);
+            assert!(refus.is_empty(), "{refus:?}");
+            assert!(ouvert.is_some());
+            let mode = std::fs::metadata(&chemin).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, apres, "{avant:o}");
+        }
+    }
 
-        let (ouvert, refus) = ouvrir_le_premier_journal([chemin.clone()], 1024 * 1024);
-        assert!(refus.is_empty(), "{refus:?}");
-        assert!(ouvert.is_some());
-        let mode = std::fs::metadata(&chemin).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+    /// Un journal qui n'est pas un fichier ordinaire (`/dev/null`, un
+    /// terminal) ne voit jamais ses droits changer.
+    #[cfg(unix)]
+    #[test]
+    fn un_journal_qui_n_est_pas_un_fichier_ordinaire_garde_ses_droits() {
+        let null = std::fs::metadata("/dev/null").expect("/dev/null");
+        assert!(!null.is_file());
+        assert_eq!(super::mode_resserre(&null), None);
+        let d = dossier("journal-dossier");
+        let meta = std::fs::metadata(d.path()).unwrap();
+        assert_eq!(super::mode_resserre(&meta), None, "un dossier");
     }
 
     fn dossier(nom: &str) -> tune_core::test_scratch::ScratchDir {
