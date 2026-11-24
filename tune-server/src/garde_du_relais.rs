@@ -248,7 +248,9 @@ pub async fn garde_du_relais(
             requete_relayee(request.headers()),
         )
     {
-        state.orchestrator.noter_provenance_de_zone(zone, a_distance);
+        state
+            .orchestrator
+            .noter_provenance_de_zone(zone, a_distance);
     }
     if !requete_relayee(request.headers()) {
         return next.run(request).await;

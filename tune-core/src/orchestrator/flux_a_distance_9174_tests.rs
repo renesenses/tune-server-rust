@@ -68,7 +68,11 @@ fn la_meme_zone_navigateur_recoit_du_wav_chez_soi_et_du_flac_par_le_relais() {
 
     // Chez soi : le lecteur parle au serveur directement.
     requete(&orch, "POST", &signal, false);
-    assert_eq!(format_servi(&orch, zone), "wav", "en local, la zone garde son WAV");
+    assert_eq!(
+        format_servi(&orch, zone),
+        "wav",
+        "en local, la zone garde son WAV"
+    );
 
     // En 5G : le même lecteur, par le relais.
     requete(&orch, "POST", &signal, true);
@@ -247,10 +251,10 @@ fn le_flac_servi_a_distance_porte_une_seektable_juste() {
     let b = dir.path().join("indexe.flac");
     std::fs::write(&a, &brut).unwrap();
     std::fs::write(&b, &indexe).unwrap();
-    let pa = crate::audio::decode::decode_to_pcm(a.to_str().unwrap(), None, None, 0.0, 0.0)
-        .unwrap();
-    let pb = crate::audio::decode::decode_to_pcm(b.to_str().unwrap(), None, None, 0.0, 0.0)
-        .unwrap();
+    let pa =
+        crate::audio::decode::decode_to_pcm(a.to_str().unwrap(), None, None, 0.0, 0.0).unwrap();
+    let pb =
+        crate::audio::decode::decode_to_pcm(b.to_str().unwrap(), None, None, 0.0, 0.0).unwrap();
     assert_eq!(pa.samples_i32, pb.samples_i32);
 
     // Indexer un fichier déjà indexé ne double pas la table.

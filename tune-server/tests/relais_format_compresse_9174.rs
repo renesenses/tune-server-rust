@@ -50,7 +50,13 @@ async fn le_lecteur_tire_par_le_relais_met_sa_zone_a_distance() {
     );
 
     // Une télécommande locale qui lit l'état ne ramène pas le lecteur.
-    appel(&app, Method::GET, &format!("/api/v1/zones/{zone}/status"), false).await;
+    appel(
+        &app,
+        Method::GET,
+        &format!("/api/v1/zones/{zone}/status"),
+        false,
+    )
+    .await;
     assert!(state.orchestrator.zone_tiree_a_distance(zone));
 
     appel(&app, Method::POST, &signal, false).await;
