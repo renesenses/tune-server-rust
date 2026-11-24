@@ -496,69 +496,69 @@ async fn la_voie_publiee_est_celle_de_la_lecture_case_par_case() {
             // (`TraitementsDeZone`) ; ils varient ici, et la voie attendue de
             // la lecture ne change pas.
             for (upsampling, headroom) in [(false, false), (true, false), (false, true)] {
-            let mut chaine = lecture.chaine.clone();
-            if upsampling {
-                chaine.fixed.upsampling = crate::tess::Upsampling::Pcm {
-                    filter: "polyvalent".into(),
-                    max_ratio: Some(2),
-                    max_rate_hz: None,
-                };
-            }
-            if headroom {
-                chaine.fixed.headroom = crate::tess::Headroom::Manual { db: -3.0 };
-            }
-            let r = chaine.resoudre(&catalogue_de_reference(), &ctx);
-            for &(rg, reencodage, rg_lu) in &par_rg {
-                for conversion in [false, true] {
-                    for lpcm in [
-                        LpcmDuLecteur::Accepted,
-                        LpcmDuLecteur::Refused,
-                        LpcmDuLecteur::Unknown,
-                    ] {
-                        for opt_in in [false, true] {
-                            for (origine, decodable) in [
-                                (OrigineDuFlux::Library, true),
-                                (OrigineDuFlux::Unknown, true),
-                                (OrigineDuFlux::Service, true),
-                                (OrigineDuFlux::Service, false),
-                            ] {
-                                // Un DSD converti vient de la bibliothèque.
-                                if est_dsd && origine == OrigineDuFlux::Service {
-                                    continue;
-                                }
-                                let f = FaitsUpnp {
-                                    lpcm,
-                                    lpcm_bits: 16,
-                                    progressif_arme: opt_in,
-                                    origine,
-                                    replaygain_actif: rg_lu,
-                                    service_decodable_au_fil: decodable,
-                                    format_impose_le_transcodage: conversion,
-                                };
-                                let attendu = voie_de_la_lecture(
-                                    reencodage,
-                                    casque,
-                                    conversion,
-                                    est_dsd,
-                                    lpcm == LpcmDuLecteur::Accepted,
-                                    opt_in,
-                                    origine == OrigineDuFlux::Service,
-                                    decodable,
-                                );
-                                assert_eq!(
-                                    acheminer(&r, &f).route,
-                                    attendu,
-                                    "eq={eq} cf={cf} dsd={est_dsd} rg={rg} \
+                let mut chaine = lecture.chaine.clone();
+                if upsampling {
+                    chaine.fixed.upsampling = crate::tess::Upsampling::Pcm {
+                        filter: "polyvalent".into(),
+                        max_ratio: Some(2),
+                        max_rate_hz: None,
+                    };
+                }
+                if headroom {
+                    chaine.fixed.headroom = crate::tess::Headroom::Manual { db: -3.0 };
+                }
+                let r = chaine.resoudre(&catalogue_de_reference(), &ctx);
+                for &(rg, reencodage, rg_lu) in &par_rg {
+                    for conversion in [false, true] {
+                        for lpcm in [
+                            LpcmDuLecteur::Accepted,
+                            LpcmDuLecteur::Refused,
+                            LpcmDuLecteur::Unknown,
+                        ] {
+                            for opt_in in [false, true] {
+                                for (origine, decodable) in [
+                                    (OrigineDuFlux::Library, true),
+                                    (OrigineDuFlux::Unknown, true),
+                                    (OrigineDuFlux::Service, true),
+                                    (OrigineDuFlux::Service, false),
+                                ] {
+                                    // Un DSD converti vient de la bibliothèque.
+                                    if est_dsd && origine == OrigineDuFlux::Service {
+                                        continue;
+                                    }
+                                    let f = FaitsUpnp {
+                                        lpcm,
+                                        lpcm_bits: 16,
+                                        progressif_arme: opt_in,
+                                        origine,
+                                        replaygain_actif: rg_lu,
+                                        service_decodable_au_fil: decodable,
+                                        format_impose_le_transcodage: conversion,
+                                    };
+                                    let attendu = voie_de_la_lecture(
+                                        reencodage,
+                                        casque,
+                                        conversion,
+                                        est_dsd,
+                                        lpcm == LpcmDuLecteur::Accepted,
+                                        opt_in,
+                                        origine == OrigineDuFlux::Service,
+                                        decodable,
+                                    );
+                                    assert_eq!(
+                                        acheminer(&r, &f).route,
+                                        attendu,
+                                        "eq={eq} cf={cf} dsd={est_dsd} rg={rg} \
                                      up={upsampling} hm={headroom} \
                                      conversion={conversion} {lpcm:?} opt_in={opt_in} \
                                      {origine:?} decodable={decodable}"
-                                );
-                                cases += 1;
+                                    );
+                                    cases += 1;
+                                }
                             }
                         }
                     }
                 }
-            }
             }
         }
     }
@@ -879,7 +879,11 @@ fn la_capacite_de_volume_retenue_survit_a_une_sortie_occupee() {
     let id = "uuid:volume-retenu-t12b";
     assert_eq!(volume_reglable_retenu(id, None), None, "jamais lue");
     assert_eq!(volume_reglable_retenu(id, Some(false)), Some(false));
-    assert_eq!(volume_reglable_retenu(id, None), Some(false), "sortie occupée");
+    assert_eq!(
+        volume_reglable_retenu(id, None),
+        Some(false),
+        "sortie occupée"
+    );
     assert_eq!(volume_reglable_retenu(id, Some(true)), Some(true));
     assert_eq!(volume_reglable_retenu(id, None), Some(true));
     assert_eq!(volume_reglable_retenu("uuid:autre-t12b", None), None);
@@ -897,7 +901,11 @@ async fn upsampling_et_headroom_ne_sont_pas_annonces_quand_la_lecture_sert_la_so
     b.opt_in();
     // La lecture : rien dans ses réglages ne l'invite à traiter.
     let s = jouer(&b, id).await;
-    assert_eq!(s.voie, voie::FICHIER_TEL_QUEL, "la lecture ne lit ni l'un ni l'autre");
+    assert_eq!(
+        s.voie,
+        voie::FICHIER_TEL_QUEL,
+        "la lecture ne lit ni l'un ni l'autre"
+    );
     assert_eq!(sha(&s.octets), sha(&source(PISTE_24.0).0));
     // L'état : la chaîne de la zone, avec upsampling et headroom manuel.
     let settings = SettingsRepo::with_backend(b.orch.db.clone());
@@ -936,10 +944,21 @@ async fn upsampling_et_headroom_ne_sont_pas_annonces_quand_la_lecture_sert_la_so
         Some(&faits),
     );
     assert_eq!(etat.delivery.as_ref().unwrap().route, VoieUpnp::Untouched);
-    assert_eq!(etat.badge, Badge::BitPerfect, "badge = delivery = octets servis");
-    for code in [crate::tess::CodeEtape::Upsampling, crate::tess::CodeEtape::Headroom] {
+    assert_eq!(
+        etat.badge,
+        Badge::BitPerfect,
+        "badge = delivery = octets servis"
+    );
+    for code in [
+        crate::tess::CodeEtape::Upsampling,
+        crate::tess::CodeEtape::Headroom,
+    ] {
         let e = etat.signal_path.iter().find(|e| e.code == code).unwrap();
         assert!(e.requested && !e.effective, "{code:?}");
-        assert_eq!(e.reason, Some(MotifEtape::NotAppliedOnTransport), "{code:?}");
+        assert_eq!(
+            e.reason,
+            Some(MotifEtape::NotAppliedOnTransport),
+            "{code:?}"
+        );
     }
 }

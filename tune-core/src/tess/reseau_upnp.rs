@@ -596,14 +596,15 @@ mod tests {
                 "{cas} : motif publié"
             );
             assert!(
-                r.etapes.iter().all(|e| !e.effective
-                    || matches!(e.code, CodeEtape::Source | CodeEtape::Output)),
+                r.etapes.iter().all(
+                    |e| !e.effective || matches!(e.code, CodeEtape::Source | CodeEtape::Output)
+                ),
                 "{cas} : plus rien d'effectif"
             );
         }
         // Avec un égaliseur, le repli mono reste éteint et l'égaliseur porté.
-        let mut r = chaine(&["equalizer-graphic", "mono-downmix"])
-            .resoudre(&catalogue_de_reference(), &x);
+        let mut r =
+            chaine(&["equalizer-graphic", "mono-downmix"]).resoudre(&catalogue_de_reference(), &x);
         let a = acheminer(&r, &faits(Refused, false, Library));
         appliquer(&mut r, &a);
         assert_eq!(a.route, VoieUpnp::FileTranscode);
