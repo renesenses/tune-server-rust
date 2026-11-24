@@ -350,6 +350,7 @@ mod tests {
                 control: ControleVolume::Software,
                 db: 0.0,
             },
+            replaygain_actif: false,
         };
         let r = p.chain.resoudre(&catalogue_de_reference(), &ctx);
         assert_eq!(r.badge, Badge::BitPerfect);

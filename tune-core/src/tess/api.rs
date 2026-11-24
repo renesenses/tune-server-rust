@@ -585,6 +585,7 @@ mod tests {
                 control: ControleVolume::Software,
                 db: -18.0,
             },
+            replaygain_actif: false,
         }
     }
 
