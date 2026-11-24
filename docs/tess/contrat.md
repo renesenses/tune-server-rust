@@ -382,13 +382,17 @@ ordre et tous leurs réglages.
   Chaîne vide et `bypass_all`. Il peut être supprimé, pas modifié.
 - **Charger un préréglage remplace la chaîne de la zone.** W4 propose
   d'enregistrer la chaîne courante avant.
-- **`verifier` refuse** : plus de 200 préréglages, un id invalide ou en
-  double, un nom vide, un nom de plus de 80 caractères ou avec un caractère
-  de contrôle ou de format invisible (catégorie Unicode Cf : U+200B,
-  U+200E/F, U+202A-202E, U+2066-2069, U+FEFF…), un Pure modifié. Même règle
-  que la route, donc aussi à l'import (liste refusée en entier).
+- **Règles d'entrée** (`verifier`, appliquées par l'enregistrement et le
+  renommage) : 200 préréglages au plus, id valide et unique, nom de 1 à 80
+  caractères sans caractère de contrôle ni de format invisible (catégorie
+  Unicode Cf : U+200B, U+200E/F, U+202A-202E, U+2066-2069, U+FEFF…), Pure
+  non modifié.
+- **Import** : tolérant comme la base (noms, doublons, plus de 200 gardés),
+  mais borné : un fichier de plus de 1000 préréglages est refusé en entier
+  (avertissement, la liste de la machine reste) ; un « pure » modifié est
+  remplacé par le Pure standard (avertissement).
 - **Validation à l'entrée seulement** (enregistrement et renommage ; l'import
-  relit la liste avec la tolérance de la base).
+  relit la liste avec la tolérance de la base, dans les bornes ci-dessus).
   La lecture de la base est tolérante et ne perd JAMAIS une entrée : une
   liste écrite par une version plus lâche (nom trop long, doublon, plus de
   200…) est rendue telle quelle et réécrite telle quelle par les routes.
@@ -469,12 +473,15 @@ ordre et tous leurs réglages.
     avec les nouvelles clés.
 - **Export / import** : `tess_presets` part avec les réglages globaux et se
   réimporte avec la MÊME tolérance que la lecture de la base : toutes les
-  entrées, même celles que les règles d'entrée refuseraient aujourd'hui. Seul
-  un JSON illisible est écarté (avec un avertissement ; celle de la machine
-  reste). `zone_{id}_tess_active_preset` voyage dans sa zone ; s'il désigne un
+  entrées, même celles que les règles d'entrée refuseraient aujourd'hui. Sont
+  écartés, avec un avertissement (la liste de la machine reste) : un JSON
+  illisible, un fichier de plus de 1000 préréglages ; un « pure » modifié est
+  remplacé par le Pure standard. `zone_{id}_tess_active_preset` voyage dans sa zone ; s'il désigne un
   préréglage absent après l'import, il est écarté avec un avertissement.
 - **Chargement** : le marqueur est effacé AVANT d'écrire la chaîne ; s'il ne
-  peut pas l'être, 503 `storage_error` et rien n'est modifié. `active_preset`
+  peut pas l'être, 503 `storage_error` et rien n'est modifié. Si le `PUT`
+  refuse ensuite (402, 409, 400) sans toucher à la chaîne, l'ancien marqueur
+  est remis. `active_preset`
   n'est publié que si le préréglage existe encore.
 
 ## 6. Zones (`tess::zones`, Q8)

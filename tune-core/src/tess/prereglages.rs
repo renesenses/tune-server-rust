@@ -124,7 +124,7 @@ impl PreReglages {
             if p.name.trim().is_empty() {
                 return Err(ErreurPreReglage::NomVide(p.id.clone()));
             }
-            // Même règle que la route (un fichier importé ne la contourne pas).
+            // Même règle que les routes d'enregistrement et de renommage.
             if nom_valide(&p.name).is_none() {
                 return Err(ErreurPreReglage::NomInvalide(p.id.clone()));
             }
@@ -149,20 +149,28 @@ impl ModeApplication {
 /// La clé de réglage GLOBALE qui porte la liste des préréglages et le mode
 /// d'application. Absente : [`PreReglages::default`] (Pure seul, Immédiat).
 /// Elle part dans l'export de configuration comme les autres réglages
-/// globaux ; l'import la relit par [`lire_texte`] et l'écarte si elle ne
-/// passe pas [`PreReglages::verifier`].
+/// globaux ; l'import la relit par [`lire_texte_tolerant`] (toutes les
+/// entrées, comme la base), écarte un fichier illisible ou de plus de
+/// [`PREREGLAGES_IMPORT_MAX`] entrées, et remplace un Pure modifié par le
+/// Pure standard.
 pub const CLE_PREREGLAGES: &str = "tess_presets";
 
 /// Longueur maximale d'un nom de préréglage, en caractères.
 pub const NOM_MAX: usize = 80;
 
-/// Nombre maximal de préréglages (Pure compris), à l'enregistrement comme à
-/// l'import.
+/// Nombre maximal de préréglages (Pure compris) qu'on peut CRÉER par la route
+/// d'enregistrement. Une liste plus longue venue d'une version plus lâche ou
+/// d'un import est gardée telle quelle.
 pub const PREREGLAGES_MAX: usize = 200;
 
-/// Lit une liste de préréglages écrite (base ou fichier d'export) :
-/// tolérante aux champs et valeurs inconnus (comme toute réponse du
-/// contrat), mais cohérente ([`PreReglages::verifier`]).
+/// Au-delà, un fichier d'import est refusé en entier (avertissement), la
+/// liste de la machine reste.
+pub const PREREGLAGES_IMPORT_MAX: usize = 1000;
+
+/// Lit une liste et la soumet aux règles d'ENTRÉE ([`PreReglages::verifier`]) :
+/// tolérante aux champs et valeurs inconnus, mais cohérente. Ni la base ni
+/// l'import ne s'en servent (ils lisent avec [`lire_texte_tolerant`]) ; elle
+/// sert aux vérifications et aux tests.
 pub fn lire_texte(texte: &str) -> Result<PreReglages, String> {
     let l: PreReglages = serde_json::from_str(texte).map_err(|e| e.to_string())?;
     l.verifier().map_err(|e| e.to_string())?;

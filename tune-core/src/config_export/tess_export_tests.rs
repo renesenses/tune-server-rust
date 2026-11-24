@@ -420,3 +420,66 @@ fn un_marqueur_vers_un_prereglage_absent_est_ecarte_a_l_import_suite_t17() {
         Some("evening-listening")
     );
 }
+
+#[test]
+fn un_import_de_plus_de_mille_prereglages_est_refuse_suite_t17() {
+    let dst = base();
+    let d = SettingsRepo::with_backend(dst.clone());
+    crate::tess::prereglages::ecrire(&d, &liste_soiree()).unwrap();
+    let fichier_de = |n: usize| {
+        let mut l = crate::tess::PreReglages::default();
+        for i in 1..n {
+            let mut p = liste_soiree().presets[1].clone();
+            p.id = format!("p{i}");
+            l.presets.push(p);
+        }
+        json!({
+            "format": "tune-config", "format_version": 2,
+            "settings": { "tess_presets": serde_json::to_value(&l).unwrap() },
+            "zones": [],
+        })
+    };
+    let max = crate::tess::prereglages::PREREGLAGES_IMPORT_MAX;
+    let (_plan, bilan) = importer(&dst, &fichier_de(max + 1));
+    assert_eq!(crate::tess::prereglages::lire(&d).unwrap(), liste_soiree());
+    let dit = bilan.avertissements.join(" | ");
+    assert!(dit.contains("more than 1000"), "{dit}");
+    // Contre-épreuve : 1000 tout juste, importés (au-delà des 200 de la route).
+    let (_plan, bilan) = importer(&dst, &fichier_de(max));
+    assert_eq!(
+        crate::tess::prereglages::lire(&d).unwrap().presets.len(),
+        max
+    );
+    assert!(!bilan.avertissements.join(" | ").contains("TESS"));
+}
+
+#[test]
+fn un_pure_modifie_a_l_import_est_remplace_par_le_pure_standard_suite_t17() {
+    let dst = base();
+    let d = SettingsRepo::with_backend(dst.clone());
+    let mut l = liste_soiree();
+    l.presets[0].chain = l.presets[1].chain.clone();
+    l.presets[0].name = "Pure (mien)".into();
+    let fichier = json!({
+        "format": "tune-config", "format_version": 2,
+        "settings": { "tess_presets": serde_json::to_value(&l).unwrap() },
+        "zones": [],
+    });
+    let (_plan, bilan) = importer(&dst, &fichier);
+    let lue = crate::tess::prereglages::lire(&d).unwrap();
+    assert_eq!(lue.presets[0], crate::tess::PreReglage::pure());
+    assert_eq!(lue.presets[1], l.presets[1], "le reste est importé");
+    let dit = bilan.avertissements.join(" | ");
+    assert!(dit.contains("standard Pure preset is kept"), "{dit}");
+    // Contre-épreuve : un Pure intact passe sans avertissement.
+    let (_plan, bilan) = importer(
+        &dst,
+        &json!({
+            "format": "tune-config", "format_version": 2,
+            "settings": { "tess_presets": serde_json::to_value(liste_soiree()).unwrap() },
+            "zones": [],
+        }),
+    );
+    assert!(!bilan.avertissements.join(" | ").contains("TESS"));
+    assert_eq!(crate::tess::prereglages::lire(&d).unwrap(), liste_soiree());
+}

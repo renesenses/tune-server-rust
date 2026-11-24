@@ -478,7 +478,19 @@ pub async fn appliquer_prereglage(
     let _garde = verrou.lock().await;
     // Le marqueur est effacé AVANT d'écrire la chaîne : si l'écriture du
     // nouveau échoue ensuite, il n'en reste aucun (jamais un faux). S'il ne
-    // peut même pas être effacé, rien n'est modifié : refus propre.
+    // peut même pas être effacé, rien n'est modifié : refus propre. L'ancien
+    // marqueur et la chaîne enregistrée sont notés pour le remettre si le
+    // `PUT` refuse (402, 409, 400…) sans toucher à la chaîne.
+    let cle_actif = cle_prereglage_actif(id);
+    let ancien_marqueur = settings
+        .get(&cle_actif)
+        .ok()
+        .flatten()
+        .filter(|m| !m.is_empty());
+    let chaine_avant = settings
+        .get(&tune_core::tess::cle_chaine_zone(id))
+        .ok()
+        .flatten();
     if !effacer_le_marqueur(&settings, id) {
         return erreur(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -491,10 +503,28 @@ pub async fn appliquer_prereglage(
     let s = settings_de(&state);
     let resultat =
         tokio::task::spawn_blocking(move || appliquer_le_put(&s, id, &corps, premium, &cat)).await;
+    let resultat = match resultat {
+        Ok(r) => r,
+        Err(e) => Err(erreur_migration(&ErreurMigration::Stockage(e.to_string()))),
+    };
     let (lecture, cles) = match resultat {
-        Ok(Ok(x)) => x,
-        Ok(Err(r)) => return r,
-        Err(e) => return erreur_migration(&ErreurMigration::Stockage(e.to_string())),
+        Ok(x) => x,
+        Err(r) => {
+            // Refusé : si la chaîne enregistrée n'a pas bougé, l'ancien
+            // marqueur la décrit toujours et revient. (Si elle a bougé, aucun
+            // marqueur plutôt qu'un faux.)
+            let chaine_apres = settings
+                .get(&tune_core::tess::cle_chaine_zone(id))
+                .ok()
+                .flatten();
+            if chaine_apres == chaine_avant
+                && let Some(m) = &ancien_marqueur
+                && let Err(e) = settings.set(&cle_actif, m)
+            {
+                warn!(zone_id = id, erreur = %e, "tess_marqueur_actif_non_remis");
+            }
+            return r;
+        }
     };
     // La chaîne est écrite : quoi qu'il arrive au marqueur, elle atteint la
     // sortie selon le mode, et la réponse est un succès.

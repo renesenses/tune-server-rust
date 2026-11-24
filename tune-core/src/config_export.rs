@@ -928,14 +928,48 @@ pub fn planifier(backend: &Arc<dyn DbBackend>, fichier: &Fichier) -> Result<Plan
         // seule une liste qui ne se relit pas du tout (JSON) n'écrase pas
         // celle de la machine. Les droits se vérifient au chargement : un
         // préréglage Premium importé n'ouvre rien.
-        if cle == crate::tess::prereglages::CLE_PREREGLAGES
-            && let Err(e) = crate::tess::prereglages::lire_texte_tolerant(&texte_json(brute))
-        {
-            avertissements.push(format!(
-                "TESS presets are not readable ({e}); the presets of this server are kept"
-            ));
-            continue;
+        let mut corrigee: Option<Value> = None;
+        if cle == crate::tess::prereglages::CLE_PREREGLAGES {
+            use crate::tess::prereglages::{
+                ID_PREREGLAGE_PURE, PREREGLAGES_IMPORT_MAX, PreReglage, lire_texte_tolerant,
+            };
+            let mut l = match lire_texte_tolerant(&texte_json(brute)) {
+                Ok(l) => l,
+                Err(e) => {
+                    avertissements.push(format!(
+                        "TESS presets are not readable ({e}); the presets of this server are kept"
+                    ));
+                    continue;
+                }
+            };
+            // Tolérant sur les noms, mais borné : un fichier démesuré n'entre pas.
+            if l.presets.len() > PREREGLAGES_IMPORT_MAX {
+                avertissements.push(format!(
+                    "TESS presets: the file holds {} presets, more than {PREREGLAGES_IMPORT_MAX}; not imported, the presets of this server are kept",
+                    l.presets.len()
+                ));
+                continue;
+            }
+            // « Pure » reste sans traitement : une entrée modifiée est remplacée
+            // par le Pure standard.
+            let pure = PreReglage::pure();
+            let mut modifie = false;
+            for p in l
+                .presets
+                .iter_mut()
+                .filter(|p| p.id == ID_PREREGLAGE_PURE && p.chain != pure.chain)
+            {
+                *p = pure.clone();
+                modifie = true;
+            }
+            if modifie {
+                avertissements.push(
+                    "TESS presets: the \"pure\" preset of the file was modified; the standard Pure preset is kept".into(),
+                );
+                corrigee = Some(serde_json::to_value(&l).map_err(|e| e.to_string())?);
+            }
         }
+        let brute = corrigee.as_ref().unwrap_or(brute);
         // TESS D1 : mêmes clés que celles que `PATCH /system/config` refuse.
         if crate::tess::migration::cle_tenue_par_le_serveur(cle) {
             tenus_par_le_serveur.push(cle);

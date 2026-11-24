@@ -429,7 +429,11 @@ async fn un_prereglage_premium_ne_donne_jamais_le_droit_a_un_compte_gratuit_t17(
     b.put_chaine(json!({"version": 1, "plugins": [parametrique(), crossfeed()]}))
         .await;
     b.enregistrer("Studio").await;
-    b.put_chaine(json!({"version": 1, "plugins": []})).await;
+    // Un marqueur VALIDE sur la zone : « Casque » décrit sa chaîne.
+    b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
+        .await;
+    b.enregistrer("Casque").await;
+    assert_eq!(b.get_zone().await["active_preset"], json!("casque"));
     b.premium(false).await;
     let avant = b.settings().get(&cle_chaine_zone(b.zone)).unwrap();
     let (s, v) = b.appliquer("studio").await;
@@ -439,9 +443,20 @@ async fn un_prereglage_premium_ne_donne_jamais_le_droit_a_un_compte_gratuit_t17(
     assert_eq!(v["plugin_id"], json!("equalizer-parametric"));
     assert!(v["upgrade_url"].is_string());
     assert!(!v["message"].as_str().unwrap().is_empty());
-    // Rien n'a bougé : ni la chaîne, ni l'actif.
+    // Rien n'a bougé : ni la chaîne, ni le marqueur d'origine (toujours valide).
     assert_eq!(b.settings().get(&cle_chaine_zone(b.zone)).unwrap(), avant);
-    assert_eq!(b.get_zone().await["active_preset"], Value::Null);
+    assert_eq!(b.get_zone().await["active_preset"], json!("casque"));
+    // Idem sur un refus 409 (version de chaîne trop récente dans le préréglage).
+    let mut l = tune_core::tess::prereglages::lire(&b.settings()).unwrap();
+    let mut futur = l.get("casque").unwrap().clone();
+    futur.id = "futur".into();
+    futur.chain.version = 99;
+    l.presets.push(futur);
+    tune_core::tess::prereglages::ecrire(&b.settings(), &l).unwrap();
+    let (s, v) = b.appliquer("futur").await;
+    assert!(s.is_client_error(), "{s} {v}");
+    assert_eq!(b.settings().get(&cle_chaine_zone(b.zone)).unwrap(), avant);
+    assert_eq!(b.get_zone().await["active_preset"], json!("casque"));
     // Le préréglage reste enregistré (le droit se vérifie au chargement).
     assert!(ids(&b.liste().await).contains(&"studio".to_owned()));
     // Contre-épreuve : avec le Premium, le même chargement passe.
