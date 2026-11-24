@@ -70,6 +70,10 @@ pub mod dsf;
 pub mod dsf_depuis_dst;
 #[cfg(test)]
 mod dsf_depuis_dst_tests_6221;
+/// #9184 — une tranche d'ISO SACD servie en DSF virtuel (DSD natif réseau).
+pub mod dsf_depuis_iso;
+#[cfg(test)]
+mod dsf_depuis_iso_tests_9184;
 /// #4833 — le DSF décodé au fil de l'eau depuis HTTP produit le même PCM que
 /// le fichier (mesuré : comptes, cadence, RMS, corrélation, vitesse).
 #[cfg(test)]
@@ -120,6 +124,8 @@ pub mod m4a;
 /// Matroska (`.mkv`/`.mka`/`.webm`) : la sonde de la piste audio — admis si
 /// un décodeur livré la lit, compté-nommé sinon (#3633).
 pub mod matroska;
+/// #9174 — une SEEKTABLE pour le FLAC servi à un navigateur tiré à distance.
+pub mod seektable_flac_9174;
 // #8513 — traitements de zone contournés pendant une mesure de pièce.
 /// La forme d'onde d'une piste (crêtes, RMS, écrêtage) pour sa fiche
 /// technique (fil du forum 2793).

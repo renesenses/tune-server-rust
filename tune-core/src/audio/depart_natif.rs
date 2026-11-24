@@ -108,14 +108,14 @@ fn echantillons_vers_ms(n: u64, cadence: u64) -> u64 {
 
 /// Ce que dit STREAMINFO.
 #[derive(Debug, Clone, Copy)]
-struct StreamInfoFlac {
-    bloc_min: u16,
-    bloc_max: u16,
-    cadence: u32,
-    total: u64,
+pub(super) struct StreamInfoFlac {
+    pub(super) bloc_min: u16,
+    pub(super) bloc_max: u16,
+    pub(super) cadence: u32,
+    pub(super) total: u64,
 }
 
-fn lire_streaminfo(corps: &[u8]) -> Option<StreamInfoFlac> {
+pub(super) fn lire_streaminfo(corps: &[u8]) -> Option<StreamInfoFlac> {
     if corps.len() < 34 {
         return None;
     }
@@ -166,14 +166,40 @@ fn crc8_flac(octets: &[u8]) -> u8 {
 }
 
 /// Ce qui ne change pas d'une trame à l'autre d'un même flux : code de
-/// cadence, affectation des canaux et taille d'échantillon. Exigé identique à
+/// cadence, NOMBRE de canaux et taille d'échantillon. Exigé identique à
 /// celui de la première trame, pour qu'un faux code de synchro DANS l'audio
 /// (CRC-8 : une chance sur 256) ne passe pas pour une trame.
-type SignatureTrame = (u8, u8);
+///
+/// #9174 — le nombre de canaux, pas leur AFFECTATION : libFLAC choisit
+/// trame par trame entre gauche/droite indépendants, gauche/côté, côté/droite
+/// et milieu/côté (codes 1, 8, 9, 10 d'un même flux stéréo). Comparer le code
+/// entier écartait toutes les trames décorrélées autrement que la première.
+pub(super) type SignatureTrame = (u8, u8, u8);
+
+/// Le nombre de canaux que dit le code d'affectation (0-7 : indépendants ;
+/// 8, 9, 10 : stéréo décorrélée).
+fn nombre_de_canaux(code: u8) -> u8 {
+    if code < 8 { code + 1 } else { 2 }
+}
+
+/// Un en-tête de trame FLAC valide (synchro, champs, CRC-8).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct EnTeteTrame {
+    /// Numéro du premier échantillon de la trame.
+    pub(super) echantillon: u64,
+    /// Échantillons (par canal) dans la trame.
+    pub(super) bloc: u64,
+    pub(super) signature: SignatureTrame,
+}
 
 /// L'en-tête de trame FLAC qui commence à `t[0]` est-il valide ? Rend le
 /// numéro du premier échantillon de la trame et sa signature.
 fn premier_echantillon_de_trame(t: &[u8], info: &StreamInfoFlac) -> Option<(u64, SignatureTrame)> {
+    en_tete_de_trame(t, info).map(|e| (e.echantillon, e.signature))
+}
+
+/// L'en-tête de trame FLAC qui commence à `t[0]`, s'il est valide.
+pub(super) fn en_tete_de_trame(t: &[u8], info: &StreamInfoFlac) -> Option<EnTeteTrame> {
     if t.len() < 6 || t[0] != 0xFF || (t[1] & 0xFE) != 0xF8 {
         return None;
     }
@@ -227,9 +253,9 @@ fn premier_echantillon_de_trame(t: &[u8], info: &StreamInfoFlac) -> Option<(u64,
     if crc8_flac(t.get(..i)?) != *t.get(i)? {
         return None;
     }
-    let signature = (t[2] & 0x0F, t[3]);
-    if variable {
-        Some((valeur, signature))
+    let signature = (code_cadence, nombre_de_canaux(canaux), code_taille);
+    let echantillon = if variable {
+        valeur
     } else {
         // Blocs fixes : le numéro est celui de la TRAME. Toutes les trames
         // sauf la dernière ont la taille de STREAMINFO.
@@ -238,8 +264,13 @@ fn premier_echantillon_de_trame(t: &[u8], info: &StreamInfoFlac) -> Option<(u64,
         } else {
             taille_bloc
         };
-        Some((valeur * fixe, signature))
-    }
+        valeur * fixe
+    };
+    Some(EnTeteTrame {
+        echantillon,
+        bloc: taille_bloc,
+        signature,
+    })
 }
 
 /// La première trame valide à partir de l'octet `depuis` (au plus `fin`) :

@@ -794,6 +794,44 @@ fn sorti_et_ecoutable(item: &serde_json::Value, maintenant: u64) -> bool {
     streamable && released
 }
 
+/// Fil 3009, point 1 (FabienM, rc13) — une PISTE du catalogue d'un artiste
+/// qu'on peut proposer en « titre phare » : écoutable et déjà sortie.
+///
+/// Page artiste d'Alela Diane : les titres phares étaient ceux de son
+/// prochain album, annoncé mais pas encore sorti, donc injouables. `artist/get`
+/// `extra=tracks` rend le catalogue dans l'ordre d'un album, le plus récent
+/// d'abord — précommandes comprises. Même règle que [`sorti_et_ecoutable`]
+/// pour un album : `streamable` faux, ou une date de sortie (de la piste ou de
+/// son album) dans le futur, écarte la piste. Une date absente ou illisible ne
+/// conclut rien.
+fn piste_sortie_et_ecoutable(item: &serde_json::Value, maintenant: u64) -> bool {
+    if item["streamable"].as_bool() == Some(false) {
+        return false;
+    }
+    let aujourd_hui =
+        chrono::DateTime::from_timestamp(maintenant as i64, 0).map(|d| d.date_naive());
+    let pas_encore = |v: &serde_json::Value| {
+        if let Some(ts) = v.as_u64() {
+            return ts > maintenant;
+        }
+        v.as_str()
+            .and_then(|d| chrono::NaiveDate::parse_from_str(d.get(..10)?, "%Y-%m-%d").ok())
+            .zip(aujourd_hui)
+            .is_some_and(|(date, jour)| date > jour)
+    };
+    let album = &item["album"];
+    ![
+        &item["streamable_at"],
+        &item["released_at"],
+        &item["release_date_stream"],
+        &album["streamable_at"],
+        &album["released_at"],
+        &album["release_date_stream"],
+    ]
+    .into_iter()
+    .any(pas_encore)
+}
+
 fn secondes_d_epoque() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -1871,9 +1909,18 @@ impl QobuzService {
                 &[("artist_id", artist_id), ("extra", extra), ("limit", "20")],
             )
             .await?;
+        // Fil 3009, point 1 — ni précommande, ni piste que le service ne
+        // laisse pas écouter : un titre phare se joue.
+        let maintenant = secondes_d_epoque();
         Ok(data[extra]["items"]
             .as_array()
-            .map(|items| items.iter().map(Self::map_track).collect())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter(|it| piste_sortie_et_ecoutable(it, maintenant))
+                    .map(Self::map_track)
+                    .collect()
+            })
             .unwrap_or_default())
     }
 
@@ -7080,6 +7127,70 @@ mod tests {
             pistes[0].album.as_deref(),
             Some("The Dark Side of the Moon")
         );
+    }
+
+    /// Fil 3009, point 1 (FabienM, rc13) — page artiste d'Alela Diane : les
+    /// titres phares étaient ceux de son PROCHAIN album, annoncé mais pas
+    /// encore sorti, donc injouables. Qobuz rend le catalogue le plus récent
+    /// d'abord, précommandes comprises : seules les pistes sorties et
+    /// écoutables restent.
+    ///
+    /// Contre-épreuve (mesurée) : sans le filtre de `pistes_extra_artiste`,
+    /// les trois pistes reviennent et le témoin rougit.
+    #[tokio::test]
+    async fn les_titres_phares_ecartent_l_album_pas_encore_sorti_3009() {
+        let futur = secondes_d_epoque() + 30 * 24 * 3600;
+        let passe = 1_262_304_000u64; // 2010
+        let mut a_paraitre = piste_qobuz(1, "Prochain single", "Alela Diane", "Album à paraître");
+        a_paraitre["album"]["released_at"] = json!(futur);
+        let mut injouable = piste_qobuz(2, "Retirée", "Alela Diane", "To Be Still");
+        injouable["streamable"] = json!(false);
+        let mut sortie = piste_qobuz(
+            3,
+            "The Pirate's Gospel",
+            "Alela Diane",
+            "The Pirate's Gospel",
+        );
+        sortie["album"]["released_at"] = json!(passe);
+        sortie["streamable"] = json!(true);
+        let svc = service_avec_extras_artiste(
+            "30090",
+            &[(
+                "tracks",
+                json!({"tracks": {"items": [a_paraitre, injouable, sortie]}}),
+            )],
+        );
+
+        let pistes = svc
+            .get_artist_top_tracks("30090")
+            .await
+            .expect("cache servi");
+
+        assert_eq!(
+            pistes.iter().map(|p| p.title.as_str()).collect::<Vec<_>>(),
+            vec!["The Pirate's Gospel"],
+            "un titre pas encore sorti ou injouable n'est pas un titre phare"
+        );
+    }
+
+    #[test]
+    fn piste_sortie_et_ecoutable_lit_les_dates_de_la_piste_et_de_l_album_3009() {
+        let maintenant = 1_795_000_000u64; // novembre 2026
+        let ok = |v: serde_json::Value| piste_sortie_et_ecoutable(&v, maintenant);
+        assert!(
+            ok(json!({"id": 1})),
+            "sans date ni drapeau, on ne conclut rien"
+        );
+        assert!(ok(
+            json!({"streamable": true, "album": {"released_at": 1_262_304_000u64}})
+        ));
+        assert!(!ok(json!({"streamable": false})));
+        assert!(!ok(json!({"album": {"released_at": maintenant + 1}})));
+        assert!(!ok(json!({"release_date_stream": "2027-01-15"})));
+        assert!(!ok(json!({"album": {"release_date_stream": "2027-01-15"}})));
+        assert!(ok(json!({"album": {"release_date_stream": "2020-01-15"}})));
+        assert!(!ok(json!({"streamable_at": maintenant + 3600})));
+        assert!(ok(json!({"release_date_stream": "pas une date"})));
     }
 
     /// Le pendant : sans titres à son nom, les participations restent servies.

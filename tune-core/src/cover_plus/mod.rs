@@ -424,13 +424,16 @@ pub fn artiste_pour_la_photo(station: &str, prep: &Preparation) -> Option<String
 // Appels
 // ---------------------------------------------------------------------------
 
-/// Où et comment parler à iTunes. La racine est un paramètre pour que les
-/// épreuves dressent un faux service : **aucun test n'appelle iTunes**.
+/// Où et comment parler à iTunes. En production, la seule source est
+/// [`Source::ITUNES`] : les champs sont privés, et l'autre racine
+/// ([`Source::factice`]) n'existe que dans les épreuves (`cfg(test)` ou
+/// `services-factices`) — **aucun test n'appelle iTunes**, et aucun binaire
+/// publié ne peut viser un autre service ni lever le passe-droit des pages.
 #[derive(Clone, Copy)]
 pub struct Source<'a> {
-    pub base: &'a str,
+    base: &'a str,
     /// Passer par le limiteur iTunes partagé. Toujours vrai hors épreuves.
-    pub limiter: bool,
+    limiter: bool,
 }
 
 impl Source<'static> {
@@ -438,6 +441,23 @@ impl Source<'static> {
         base: ITUNES_BASE,
         limiter: true,
     };
+}
+
+impl<'a> Source<'a> {
+    /// Un faux service à la racine `base`, pour les épreuves seulement.
+    #[cfg(any(test, feature = "services-factices"))]
+    pub fn factice(base: &'a str, limiter: bool) -> Self {
+        Self { base, limiter }
+    }
+
+    /// La racine d'un faux service, s'il en est un : jamais en production.
+    pub(crate) fn racine_factice(&self) -> Option<&'a str> {
+        #[cfg(any(test, feature = "services-factices"))]
+        if self.base != ITUNES_BASE {
+            return Some(self.base);
+        }
+        None
+    }
 }
 
 /// Le compte des appels d'une phase de recherche : ce qui reste du budget,
@@ -550,6 +570,7 @@ static FENETRE: Fenetre = Fenetre::new(PLAFOND_PAR_MINUTE, Duration::from_secs(6
 /// La réponse si elle est un succès, `None` sinon — en silence (`debug`).
 async fn obtenir(
     source: Source<'_>,
+    client: &reqwest::Client,
     url: reqwest::Url,
     agent: Option<&str>,
 ) -> Option<reqwest::Response> {
@@ -562,7 +583,7 @@ async fn obtenir(
         FENETRE.passer().await;
         limiteur.acquire(cle).await;
     }
-    let requete = crate::http::client::shared()
+    let requete = client
         .get(url)
         .timeout(DELAI_APPEL)
         .header(reqwest::header::USER_AGENT, agent.unwrap_or(AGENT_API));
@@ -578,8 +599,10 @@ async fn obtenir(
         limiteur.constater_reponse(cle, &reponse);
     }
     if !reponse.status().is_success() {
-        // Un 404 est une réponse (pas de page) ; le reste est un incident.
-        if reponse.status() != reqwest::StatusCode::NOT_FOUND {
+        // Un 404 est une réponse (pas de page), une redirection refusée par
+        // la politique du client aussi ; le reste est un incident.
+        if reponse.status() != reqwest::StatusCode::NOT_FOUND && !reponse.status().is_redirection()
+        {
             noter_incident();
         }
         debug!(statut = reponse.status().as_u16(), "cover_plus_refus");
@@ -595,7 +618,7 @@ pub(crate) async fn appeler(
     params: &[(&str, &str)],
 ) -> Option<Vec<Value>> {
     let url = reqwest::Url::parse_with_params(&format!("{}{chemin}", source.base), params).ok()?;
-    let reponse = obtenir(source, url, None).await?;
+    let reponse = obtenir(source, crate::http::client::shared(), url, None).await?;
     let corps: Value = match reponse.json().await {
         Ok(v) => v,
         Err(_) => {
@@ -923,10 +946,7 @@ pub fn pochette_du_titre(db: &Arc<dyn DbBackend>, t: &TitreEnCours<'_>) -> Decis
     // `services-factices`), passent par ici sans le savoir (le sondeur
     // radio) : elles parlent à une adresse morte, jamais à iTunes.
     #[cfg(any(test, feature = "services-factices"))]
-    let source = Source {
-        base: "http://127.0.0.1:9",
-        limiter: false,
-    };
+    let source = Source::factice("http://127.0.0.1:9", false);
     #[cfg(not(any(test, feature = "services-factices")))]
     let source = Source::ITUNES;
     pochette_du_titre_par(db, t, source)

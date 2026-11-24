@@ -214,6 +214,56 @@ fn page_refus_hors_machine(
 
 type RefusDeGarde = (StatusCode, Json<Value>);
 
+/// Un compte mozaiklabs.fr est-il relié au serveur ? Sa session (jeton) ou son
+/// identité est en base, même périmée (« reconnexion requise ») : c'est encore
+/// le compte du serveur, que seule la déliaison efface.
+fn compte_du_serveur_relie(settings: &SettingsRepo) -> bool {
+    ["mozaik_access_token", "mozaik_user"].iter().any(|cle| {
+        settings
+            .get(cle)
+            .ok()
+            .flatten()
+            .is_some_and(|v| !v.trim().is_empty())
+    })
+}
+
+/// Deux comptes mozaiklabs.fr sont-ils le même ? L'identifiant stable du site
+/// d'abord ; à défaut (identifiant absent ou nul), le courriel normalisé
+/// (espaces retirés, minuscules).
+fn meme_compte(
+    en_base: &tune_core::cloud::sso::CloudUser,
+    obtenu: &tune_core::cloud::sso::CloudUser,
+) -> bool {
+    if en_base.id > 0 && obtenu.id > 0 {
+        return en_base.id == obtenu.id;
+    }
+    let normal = |e: &str| e.trim().to_lowercase();
+    let courriel = normal(&en_base.email);
+    !courriel.is_empty() && courriel == normal(&obtenu.email)
+}
+
+/// Décisions du 23/11 (option C) : sans authentification, le réseau local
+/// relie le serveur s'il n'a aucun compte, ou RECONNECTE le compte déjà relié
+/// (même compte, session renouvelée, « reconnexion requise » comprise). Il ne
+/// le remplace jamais par un autre compte : c'est à cette machine ou à
+/// l'administrateur. Jugé APRÈS l'échange du code, sur le compte obtenu ; un
+/// compte relié dont l'identité est illisible n'est pas « le même ».
+fn autre_compte_refuse(
+    settings: &SettingsRepo,
+    par_le_reseau_local: bool,
+    obtenu: &tune_core::cloud::sso::CloudUser,
+) -> bool {
+    if !par_le_reseau_local || !compte_du_serveur_relie(settings) {
+        return false;
+    }
+    let en_base: Option<tune_core::cloud::sso::CloudUser> = settings
+        .get("mozaik_user")
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    !en_base.is_some_and(|u| meme_compte(&u, obtenu))
+}
+
 /// Réglages dont l'écriture fait envoyer au nom du compte par une tâche de
 /// fond (résumé hebdomadaire, écoutes envoyées au compte, partage
 /// communautaire, consentements de télémétrie et de contribution, que
@@ -259,12 +309,16 @@ enum Liaison {
     Profil(i64),
 }
 
-/// Qui relie quoi. Authentification coupée : cette machine seulement.
+/// Qui relie quoi. Authentification coupée : cette machine ou le réseau local
+/// (`AdminOuReseauLocalPourLeCompte`) relie le serveur ; depuis le réseau
+/// local, seulement s'il n'a pas de compte ou pour reconnecter le même
+/// ([`autre_compte_refuse`]). La déliaison reste à cette machine
+/// (`AdminOuCetteMachine`).
 /// Authentification active : l'administrateur relie le serveur, un compte
 /// standard ne relie que son propre profil.
-fn liaison_autorisee(
+fn liaison_autorisee<G>(
     state: &AppState,
-    garde: Result<crate::auth::AdminOuCetteMachine, RefusDeGarde>,
+    garde: Result<G, RefusDeGarde>,
     appelant: Option<crate::auth::AuthUser>,
 ) -> Result<Liaison, RefusDeGarde> {
     match garde {
@@ -302,16 +356,34 @@ fn cles_d_attente(liaison: Liaison) -> (String, String) {
 /// Mozaiklabs — voir [`liaison_autorisee`]. Le retour (`sso_callback`) passe
 /// la même règle.
 async fn sso_authorize(
-    garde: Result<crate::auth::AdminOuCetteMachine, RefusDeGarde>,
+    garde: Result<crate::auth::AdminOuReseauLocalPourLeCompte, RefusDeGarde>,
     appelant: Option<crate::auth::AuthUser>,
     State(state): State<AppState>,
     headers: HeaderMap,
     Query(requete): Query<Vec<(String, String)>>,
 ) -> impl IntoResponse {
+    let par_le_reseau_local = garde.as_ref().is_ok_and(|g| g.par_le_reseau_local);
     let liaison = match liaison_autorisee(&state, garde, appelant) {
         Ok(l) => l,
         Err(refus) => return page_refus_hors_machine(&headers, refus),
     };
+    // Relecture B : du réseau local, la liaison ne part que d'une navigation
+    // de Tune lui-même (`same-origin`), saisie à la main (`none`) ou d'un
+    // client sans l'en-tête ; jamais d'une page d'un autre site. Le retour,
+    // lui, est légitimement inter-sites (il revient de mozaiklabs.fr).
+    if par_le_reseau_local && autorisation_inter_sites(&headers) {
+        warn!("sso_authorize_inter_sites_refuse_depuis_le_reseau_local");
+        return page_refus_hors_machine(
+            &headers,
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "error": "cross_site_request",
+                    "message": "Cross-site request refused.",
+                })),
+            ),
+        );
+    }
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let Some(auth) = get_mozaik_auth(&settings) else {
         // sso_authorize is a full browser navigation, so degrade to a friendly
@@ -345,8 +417,11 @@ async fn sso_authorize(
     // verifier + state for the browser round-trip (consumed in sso_callback).
     let pkce = PkceSession::generate();
     let (cle_pkce, cle_uri) = cles_d_attente(liaison);
+    // D'où la ronde est lancée (relecture A), DANS l'attente même : une seule
+    // écriture, la marque ne peut pas se séparer de son PKCE, même avec deux
+    // autorisations simultanées (machine et réseau local).
     settings
-        .set(&cle_pkce, &serde_json::to_string(&pkce).unwrap_or_default())
+        .set(&cle_pkce, &attente_a_stocker(&pkce, par_le_reseau_local))
         .ok();
 
     let uri = redirect_uri(&state, Some(&headers));
@@ -366,6 +441,117 @@ async fn sso_authorize(
 /// par mozaiklabs.fr prend quelques secondes ; au-delà, on recommence.
 const PKCE_EN_ATTENTE_MAX: u64 = 10 * 60;
 
+/// Pourquoi le retour de mozaiklabs.fr n'a pas d'attente PKCE à finir.
+enum AttentePkce {
+    /// Aucune attente valable (absente, illisible, sans date ou expirée).
+    Absente,
+    /// Une attente valable existe, mais le `state` reçu n'est pas le sien.
+    EtatDifferent,
+}
+
+/// Une seule ronde de liaison à la fois dans le processus (relecture D2/D3) :
+/// tenu par chaque retour (`sso_callback`, `sso_callback_profil`) depuis la
+/// consommation de l'attente PKCE jusqu'à l'écriture de l'identité du compte.
+/// Lire puis effacer l'attente devient ainsi atomique (un `state` ne sert
+/// qu'une fois, même à deux retours simultanés), et le contrôle du compte
+/// obtenu, la session et `mozaik_user` s'écrivent d'un seul tenant : jamais le
+/// jeton d'un compte avec l'identité d'un autre.
+///
+/// #9475 : le retour du SERVEUR le garde aussi pendant le propriétaire et la
+/// licence, et la déliaison (`sso_disconnect_serveur`) le prend pour effacer
+/// compte et licence, après son appel au cloud. Ordre unique : ce verrou,
+/// puis l'état de licence, puis les services.
+static VERROU_DE_LIAISON: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// Lit l'attente PKCE `cle_pkce` et ne la CONSOMME (usage unique) que si le
+/// `state` reçu est exactement le sien. Un `state` faux la laisse en place :
+/// un retour forgé ne doit pas annuler une liaison en cours. Une attente
+/// périmée ou illisible est effacée, elle ne servira plus.
+fn prendre_l_attente_pkce(
+    settings: &SettingsRepo,
+    cle_pkce: &str,
+    state_recu: Option<&str>,
+) -> Result<AttenteConsommee, AttentePkce> {
+    let cle_date = format!("{cle_pkce}_at");
+    let emise = settings
+        .get(&cle_date)
+        .ok()
+        .flatten()
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    let pending: Option<AttenteStockee> = settings
+        .get(cle_pkce)
+        .ok()
+        .flatten()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        // Sans date, ou plus vieille que dix minutes : plus valable.
+        .filter(|_| {
+            emise.is_some_and(|t| maintenant_unix().saturating_sub(t) <= PKCE_EN_ATTENTE_MAX)
+        });
+    #[cfg(test)]
+    if let Some(p) = &pending {
+        rendez_vous_de_test::apres_lecture(&p.pkce.state);
+    }
+    let consommer = || {
+        settings.set(cle_pkce, "").ok();
+        settings.delete(&cle_date).ok();
+    };
+    let Some(AttenteStockee {
+        pkce,
+        lancee_du_reseau_local,
+    }) = pending
+    else {
+        consommer();
+        return Err(AttentePkce::Absente);
+    };
+    if state_recu != Some(pkce.state.as_str()) {
+        return Err(AttentePkce::EtatDifferent);
+    }
+    consommer();
+    Ok(AttenteConsommee {
+        pkce,
+        lancee_du_reseau_local,
+    })
+}
+
+/// `Sec-Fetch-Site: cross-site` ou `same-site` : la navigation vient d'une
+/// page d'un autre site (ou d'un autre port, sous-domaine du même site).
+fn autorisation_inter_sites(entetes: &HeaderMap) -> bool {
+    entetes
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .is_some_and(|v| v == "cross-site" || v == "same-site")
+}
+
+/// Une attente PKCE consommée, et d'où sa ronde a été LANCÉE.
+struct AttenteConsommee {
+    pkce: PkceSession,
+    /// L'autorisation a été ouverte par le réseau local (relecture A) : le
+    /// retour garde la règle du réseau local même s'il arrive de cette
+    /// machine (un lien ou une image qui y rejoue le `code` et le `state`).
+    lancee_du_reseau_local: bool,
+}
+
+/// L'attente PKCE telle qu'elle est rangée : le PKCE et, dans le même JSON,
+/// la marque « ronde lancée du réseau local » (`lan`, absente = faux pour
+/// une attente écrite avant elle).
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AttenteStockee {
+    #[serde(flatten)]
+    pkce: PkceSession,
+    #[serde(rename = "lan", default)]
+    lancee_du_reseau_local: bool,
+}
+
+fn attente_a_stocker(pkce: &PkceSession, lancee_du_reseau_local: bool) -> String {
+    serde_json::to_string(&AttenteStockee {
+        pkce: pkce.clone(),
+        lancee_du_reseau_local,
+    })
+    .unwrap_or_default()
+}
+
 fn maintenant_unix() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -381,7 +567,7 @@ struct CallbackQuery {
 }
 
 async fn sso_callback(
-    garde: Result<crate::auth::AdminOuCetteMachine, RefusDeGarde>,
+    garde: Result<crate::auth::AdminOuReseauLocalPourLeCompte, RefusDeGarde>,
     appelant: Option<crate::auth::AuthUser>,
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -390,6 +576,14 @@ async fn sso_callback(
     // Même règle qu'à l'autorisation, AVANT de lire ou consommer une attente
     // PKCE : le navigateur qui revient de mozaiklabs.fr est celui qui a lancé
     // la liaison (cette machine, ou une session et son cookie).
+    let par_le_reseau_local = garde.as_ref().is_ok_and(|g| g.par_le_reseau_local);
+    // Le profil de la session, s'il est AUTHENTIFIÉ : sans authentification,
+    // le profil `default` s'ouvre sans mot de passe, la session ne prouve rien
+    // pour la règle du propriétaire (voir `proprietaire::Relieur`).
+    let session_authentifiee = appelant
+        .as_ref()
+        .filter(|u| u.user_id > 0 && crate::auth::authentification_active(&state))
+        .map(|u| u.user_id);
     match liaison_autorisee(&state, garde, appelant) {
         Ok(Liaison::Serveur) => {}
         Ok(Liaison::Profil(profil)) => {
@@ -425,39 +619,34 @@ async fn sso_callback(
     };
 
     // Load & validate the pending PKCE session (CSRF: state must match), then
-    // consume it — one-shot, cleared regardless of the exchange outcome.
-    let emise = settings
-        .get("mozaik_pkce_pending_at")
-        .ok()
-        .flatten()
-        .and_then(|s| s.trim().parse::<u64>().ok());
-    let pending: Option<PkceSession> = settings
-        .get("mozaik_pkce_pending")
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        // Sans date, ou plus vieille que dix minutes : plus valable.
-        .filter(|_| {
-            emise.is_some_and(|t| maintenant_unix().saturating_sub(t) <= PKCE_EN_ATTENTE_MAX)
-        });
-    settings.set("mozaik_pkce_pending", "").ok();
-    settings.delete("mozaik_pkce_pending_at").ok();
-
-    let Some(pkce) = pending else {
-        return page_echec_compte(
-            &headers,
-            StatusCode::BAD_REQUEST,
-            "no pending SSO session (restart login)",
-        );
-    };
-    if q.state.as_deref() != Some(pkce.state.as_str()) {
-        warn!("sso_state_mismatch");
-        return page_echec_compte(
-            &headers,
-            StatusCode::BAD_REQUEST,
-            "state mismatch (possible CSRF)",
-        );
-    }
+    // consume it — one-shot, cleared regardless of the exchange outcome. A
+    // wrong `state` leaves it in place: it must not cancel a pending link.
+    let (cle_pkce, _) = cles_d_attente(Liaison::Serveur);
+    // Tenu jusqu'après les écritures de licence (voir `VERROU_DE_LIAISON`).
+    let ronde = VERROU_DE_LIAISON.lock().await;
+    let (pkce, lancee_du_reseau_local) =
+        match prendre_l_attente_pkce(&settings, &cle_pkce, q.state.as_deref()) {
+            Ok(a) => (a.pkce, a.lancee_du_reseau_local),
+            Err(AttentePkce::Absente) => {
+                return page_echec_compte(
+                    &headers,
+                    StatusCode::BAD_REQUEST,
+                    "no pending SSO session (restart login)",
+                );
+            }
+            Err(AttentePkce::EtatDifferent) => {
+                warn!("sso_state_mismatch");
+                return page_echec_compte(
+                    &headers,
+                    StatusCode::BAD_REQUEST,
+                    "state mismatch (possible CSRF)",
+                );
+            }
+        };
+    // Relecture A : la règle du réseau local suit la RONDE, pas seulement le
+    // retour. Une autorisation lancée du réseau local, rejouée sur cette
+    // machine (lien, image), reste jugée comme venue du réseau local.
+    let par_le_reseau_local = par_le_reseau_local || lancee_du_reseau_local;
 
     // Reuse the exact redirect_uri minted at authorize time (must match); fall
     // back to deriving it from this request's Host if the pending value is gone.
@@ -514,6 +703,24 @@ async fn sso_callback(
         }
     };
 
+    // Décision du 23/11 (option C) : depuis le réseau local, le compte obtenu
+    // doit être celui déjà relié, s'il y en a un. Jugé ici, après l'échange et
+    // la relecture du profil (on connaît enfin le compte), et avant
+    // l'adoption ci-dessous : un retour refusé n'écrit rien.
+    if autre_compte_refuse(&settings, par_le_reseau_local, &user) {
+        return page_refus_hors_machine(&headers, crate::auth::refus_compte_deja_relie(&headers));
+    }
+
+    // Qui relie, pour la règle du propriétaire — lu AVANT d'écrire la session :
+    // « un compte est-il relié » parle du compte précédent. La garde de cette
+    // route n'a laissé passer que l'administrateur, cette machine ou le réseau
+    // local ; seuls les deux premiers délient.
+    let relieur = tune_core::cloud::proprietaire::Relieur {
+        session_authentifiee,
+        peut_delier: !par_le_reseau_local,
+        compte_relie: compte_du_serveur_relie(&settings),
+    };
+
     // 🔴 AVANT d'écraser `mozaik_user`, et pas après.
     //
     // L'adoption reprend le compte DÉJÀ lié — celui d'une installation qui en
@@ -537,6 +744,11 @@ async fn sso_callback(
             &serde_json::to_string(&user).unwrap_or_default(),
         )
         .ok();
+    // `ronde` reste tenue jusqu'après les écritures de LICENCE plus bas : une
+    // déliaison (`sso_disconnect_serveur`, même verrou) ne peut plus
+    // s'intercaler entre l'identité et la licence, ce qui laisserait un
+    // propriétaire et ses modules sans aucun compte relié. Rien d'ici à la
+    // fin du bloc de licence n'appelle le réseau.
 
     // Liaison du serveur au compte (#5325), à chaque connexion : le cloud
     // délivre un jeton que `library_sync` présente sur chaque `sync`. En tâche
@@ -645,6 +857,13 @@ async fn sso_callback(
     // établit d'abord qui se connecte, on décide ensuite de ce qu'il a le
     // droit de changer. Le premier compte lié devient propriétaire — d'où
     // l'invariance sur une installation à un seul compte.
+    //
+    // Changer de compte relié (après une déliaison, ou par le propriétaire
+    // authentifié) fait suivre la propriété, AVANT de demander qui pilote :
+    // sans cela, le compte suivant n'écrivait jamais ses modules payants
+    // (`module_not_owned`) alors que les Réglages les montraient. Un autre
+    // profil ne s'empare jamais du serveur : voir `le_proprietaire_suit`.
+    tune_core::cloud::proprietaire::suivre_le_compte_relie(&settings, profile_id, relieur);
     let pilote = tune_core::cloud::proprietaire::revendiquer(&settings, profile_id);
 
     if pilote {
@@ -680,6 +899,8 @@ async fn sso_callback(
             "sso_licence_non_pilotee_par_ce_profil"
         );
     }
+    // Identité, propriétaire et licence sont écrits : la ronde est finie.
+    drop(ronde);
 
     // Le rôle de la session est celui du profil LOCAL, jamais celui du compte
     // mozaiklabs.fr : un administrateur local le reste, un profil créé ou
@@ -775,38 +996,26 @@ async fn sso_callback_profil(
         );
     };
     let (cle_pkce, cle_uri) = cles_d_attente(Liaison::Profil(profil));
-    let cle_date = format!("{cle_pkce}_at");
-    let emise = settings
-        .get(&cle_date)
-        .ok()
-        .flatten()
-        .and_then(|s| s.trim().parse::<u64>().ok());
-    let pending: Option<PkceSession> = settings
-        .get(&cle_pkce)
-        .ok()
-        .flatten()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        // Sans date, ou plus vieille que dix minutes : plus valable.
-        .filter(|_| {
-            emise.is_some_and(|t| maintenant_unix().saturating_sub(t) <= PKCE_EN_ATTENTE_MAX)
-        });
-    settings.set(&cle_pkce, "").ok();
-    settings.delete(&cle_date).ok();
-    let Some(pkce) = pending else {
-        return page_echec_compte(
-            headers,
-            StatusCode::BAD_REQUEST,
-            "no pending SSO session (restart login)",
-        );
+    // Tenu jusqu'à l'écriture du compte du profil (voir `VERROU_DE_LIAISON`).
+    let ronde = VERROU_DE_LIAISON.lock().await;
+    let pkce = match prendre_l_attente_pkce(&settings, &cle_pkce, q.state.as_deref()) {
+        Ok(a) => a.pkce,
+        Err(AttentePkce::Absente) => {
+            return page_echec_compte(
+                headers,
+                StatusCode::BAD_REQUEST,
+                "no pending SSO session (restart login)",
+            );
+        }
+        Err(AttentePkce::EtatDifferent) => {
+            warn!(profil, "sso_state_mismatch_profil");
+            return page_echec_compte(
+                headers,
+                StatusCode::BAD_REQUEST,
+                "state mismatch (possible CSRF)",
+            );
+        }
     };
-    if q.state.as_deref() != Some(pkce.state.as_str()) {
-        warn!(profil, "sso_state_mismatch_profil");
-        return page_echec_compte(
-            headers,
-            StatusCode::BAD_REQUEST,
-            "state mismatch (possible CSRF)",
-        );
-    }
     let uri = settings
         .get(&cle_uri)
         .ok()
@@ -837,6 +1046,7 @@ async fn sso_callback_profil(
     // Le jeton n'est PAS conservé : il ne sert qu'à établir l'identité.
     drop(token);
     enregistrer_compte_du_profil(state, profil, &user);
+    drop(ronde);
     info!(profil, "sso_liaison_du_profil");
     Redirect::temporary("/").into_response()
 }
@@ -871,13 +1081,13 @@ fn enregistrer_compte_du_profil(
 async fn sso_status(
     // Lecture appelée par tous les appareils : la garde silencieuse (pas
     // d'avertissement à chaque appel d'un autre appareil).
-    relie: crate::auth::ReliePourLesComptes,
+    relie: crate::auth::ReliePourLeCompteDuReseauLocal,
     appelant: Option<crate::auth::AuthUser>,
     State(state): State<AppState>,
 ) -> Json<Value> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let garde = if relie.0 {
-        Ok(crate::auth::AdminOuCetteMachine)
+        Ok(())
     } else {
         Err((StatusCode::FORBIDDEN, Json(json!({}))))
     };
@@ -907,9 +1117,9 @@ async fn sso_status(
         .filter(|s| !s.is_empty())
         .is_some();
     // Le compte du serveur (courriel, offre, modules) ne se montre qu'à qui
-    // relie le serveur : l'administrateur, ou cette machine sans
-    // authentification. Un autre appareil du réseau sait seulement si le
-    // serveur est relié.
+    // relie le serveur : l'administrateur, ou, sans authentification, cette
+    // machine et le réseau local. Le relais distant et un mandataire savent
+    // seulement si le serveur est relié.
     let user: Option<tune_core::cloud::sso::CloudUser> = if liaison.is_ok() {
         settings
             .get("mozaik_user")
@@ -942,6 +1152,10 @@ async fn sso_status(
 /// POST /cloud/sso/disconnect — log out of the mozaiklabs.fr account: drop the
 /// stored tokens/profile and revoke the account premium. The license-key path is
 /// untouched (a keyed premium survives).
+///
+/// Décision du 23/11 : la déliaison reste réservée à cette machine ou à
+/// l'administrateur (`AdminOuCetteMachine`), jamais au réseau local : délier
+/// puis relier un autre compte depuis un appareil du réseau n'est pas permis.
 async fn sso_disconnect(
     garde: Result<crate::auth::AdminOuCetteMachine, RefusDeGarde>,
     appelant: Option<crate::auth::AuthUser>,
@@ -981,6 +1195,11 @@ async fn sso_disconnect_serveur(state: &AppState) -> Json<Value> {
         Ok(false) => {}
         Err(e) => warn!(error = %e, "cloud_server_unlink_failed"),
     }
+    // Même verrou que les retours de liaison, pris APRÈS l'appel au cloud
+    // (aucun verrou tenu pendant le réseau) et dans le même ordre qu'eux
+    // (liaison, puis licence, puis services) : l'effacement du compte et de la
+    // licence ne s'intercale plus au milieu d'une liaison en cours.
+    let ronde = VERROU_DE_LIAISON.lock().await;
     for key in [
         "mozaik_access_token",
         "mozaik_refresh_token",
@@ -1002,6 +1221,7 @@ async fn sso_disconnect_serveur(state: &AppState) -> Json<Value> {
     // Founder endpoint order came from this account — revert to direct-first.
     state.license.set_qobuz_proxy_first(false).await;
     crate::background::apply_qobuz_proxy_first(&state.services, false).await;
+    drop(ronde);
     info!("sso_disconnected");
     Json(json!({ "connected": false }))
 }
@@ -3186,3 +3406,38 @@ mod confinement_chemins_tests {
 #[cfg(test)]
 #[path = "cloud_garde_compte_tests.rs"]
 mod cloud_garde_compte_tests;
+
+#[cfg(test)]
+#[path = "compte_reseau_local_tests.rs"]
+mod compte_reseau_local_tests;
+
+#[cfg(test)]
+#[path = "proprietaire_change_de_compte_tests.rs"]
+mod proprietaire_change_de_compte_tests;
+
+/// Rendez-vous de test : fait se croiser deux retours entre la LECTURE et
+/// l'EFFACEMENT d'une attente PKCE, pour prouver que `VERROU_DE_LIAISON` les
+/// sépare. Armé pour un seul `state` : les autres tests n'y passent pas. Sans
+/// partenaire, il rend la main au bout de 500 ms.
+#[cfg(test)]
+pub(super) mod rendez_vous_de_test {
+    use std::sync::{Condvar, Mutex};
+    use std::time::Duration;
+
+    static ETAT: Mutex<(Option<String>, usize)> = Mutex::new((None, 0));
+    static SIGNAL: Condvar = Condvar::new();
+
+    pub fn armer(state: &str) {
+        *ETAT.lock().unwrap() = (Some(state.to_string()), 0);
+    }
+
+    pub fn apres_lecture(state: &str) {
+        let mut etat = ETAT.lock().unwrap();
+        if etat.0.as_deref() != Some(state) {
+            return;
+        }
+        etat.1 += 1;
+        SIGNAL.notify_all();
+        let _ = SIGNAL.wait_timeout_while(etat, Duration::from_millis(500), |e| e.1 < 2);
+    }
+}
