@@ -181,6 +181,105 @@ pub fn verifier(demande: &str, emplacements: &[String]) -> Result<PathBuf, Refus
     Ok(chemin)
 }
 
+/// Un sous-dossier proposé au choix de la destination (fil forum 3036).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SousDossier {
+    pub nom: String,
+    pub chemin: String,
+}
+
+/// Ce que montre le choix du dossier : le dossier `courant` (`None` : la
+/// liste des emplacements eux-mêmes), son `parent` (`None` en haut d'un
+/// emplacement : on n'en remonte pas) et ses sous-dossiers.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ListeDossiers {
+    pub courant: Option<String>,
+    pub parent: Option<String>,
+    pub dossiers: Vec<SousDossier>,
+}
+
+/// Fil forum 3036 — les sous-dossiers de `demande` où ranger une
+/// extraction, pour descendre aussi bas qu'on veut SOUS un emplacement de
+/// la bibliothèque, et jamais au-dessus ni à côté.
+///
+/// `demande` passe d'abord par [`verifier`] (absolue, sans `.` ni `..`,
+/// dans un emplacement une fois les liens résolus) : les refus sont les
+/// mêmes que ceux du réglage, rendus AVANT toute lecture du dossier. Un
+/// dossier qui n'existe pas encore se choisit (l'extraction le crée) mais
+/// ne se liste pas. Les dossiers cachés et les dossiers système (corbeilles
+/// de NAS…) ne sont pas proposés, ni un lien symbolique qui mène hors de
+/// l'emplacement. Pas de sondage des petits-enfants : sur un partage
+/// réseau, un dossier d'artistes en compte des milliers.
+pub fn sous_dossiers(
+    demande: Option<&str>,
+    emplacements: &[String],
+) -> Result<ListeDossiers, Refus> {
+    let Some(demande) = demande.filter(|d| !d.trim().is_empty()) else {
+        return Ok(ListeDossiers {
+            courant: None,
+            parent: None,
+            dossiers: emplacements
+                .iter()
+                .map(|e| SousDossier {
+                    nom: e.clone(),
+                    chemin: e.clone(),
+                })
+                .collect(),
+        });
+    };
+    let chemin = verifier(demande, emplacements)?;
+    if !chemin.is_dir() {
+        return Err(refus(
+            "dossier_introuvable",
+            "Ce dossier n'existe pas (encore) : il sera créé par l'extraction.",
+        ));
+    }
+    let en_haut = emplacements
+        .iter()
+        .any(|e| Path::new(&tune_core::scanner::walker::normalize_path(e)) == chemin.as_path());
+    let parent = if en_haut {
+        None
+    } else {
+        chemin.parent().map(|p| p.to_string_lossy().to_string())
+    };
+    let entrees = std::fs::read_dir(&chemin).map_err(|e| {
+        refus(
+            "destination_invalide",
+            format!("Le dossier est illisible : {e}"),
+        )
+    })?;
+    let mut dossiers: Vec<SousDossier> = Vec::new();
+    for entree in entrees.flatten() {
+        let nom = entree.file_name().to_string_lossy().to_string();
+        if nom.starts_with('.') || tune_core::scanner::dossier_systeme_ignore(&nom) {
+            continue;
+        }
+        let p = entree.path();
+        let lien = entree.file_type().is_ok_and(|t| t.is_symlink());
+        if !p.is_dir() {
+            continue;
+        }
+        let texte = p.to_string_lossy().to_string();
+        // Un lien est suivi seulement s'il reste dans l'emplacement : la
+        // même vérification que la destination elle-même.
+        if lien && verifier(&texte, emplacements).is_err() {
+            continue;
+        }
+        dossiers.push(SousDossier { nom, chemin: texte });
+    }
+    dossiers.sort_by(|a, b| {
+        a.nom
+            .to_lowercase()
+            .cmp(&b.nom.to_lowercase())
+            .then_with(|| a.nom.cmp(&b.nom))
+    });
+    Ok(ListeDossiers {
+        courant: Some(chemin.to_string_lossy().to_string()),
+        parent,
+        dossiers,
+    })
+}
+
 /// #7105 — la cause d'une écriture refusée, en un motif stable.
 pub fn cause_d_ecriture(e: &std::io::Error) -> &'static str {
     use std::io::ErrorKind;
