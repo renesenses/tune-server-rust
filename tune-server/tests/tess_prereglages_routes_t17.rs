@@ -24,6 +24,14 @@ use tune_server::routes::zones::tess_prereglages::{
     verrou_de_la_liste,
 };
 
+/// La file d'attente du mode `at_next_playback` est commune au processus,
+/// et passer en `immediately` la sert pour TOUTES les zones : les tests qui
+/// changent de mode ou observent la file passent l'un après l'autre.
+fn file_partagee() -> &'static tokio::sync::Mutex<()> {
+    static F: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    F.get_or_init(Default::default)
+}
+
 struct Banc {
     state: tune_server::state::AppState,
     app: axum::Router,
@@ -480,6 +488,7 @@ async fn un_etage_sans_effet_sur_cette_sortie_est_dit_avec_son_motif_t17() {
 
 #[tokio::test]
 async fn le_mode_se_regle_et_une_valeur_inconnue_est_refusee_t17() {
+    let _serie = file_partagee().lock().await;
     let b = Banc::nouveau(true).await;
     for faux in [
         json!({"apply_mode": "crossfade"}),
@@ -507,6 +516,7 @@ async fn le_mode_se_regle_et_une_valeur_inconnue_est_refusee_t17() {
 
 #[tokio::test]
 async fn au_prochain_demarrage_rien_n_interrompt_la_lecture_t17() {
+    let _serie = file_partagee().lock().await;
     // Numéro de zone propre au test : l'attente est tenue par zone.
     let b = Banc::avec_sortie(true, "local", "local:Realtek HD", 40).await;
     b.brut(
@@ -571,6 +581,7 @@ async fn mode(b: &Banc, m: &str) {
 
 #[tokio::test]
 async fn la_lecture_attend_le_put_en_cours_de_la_zone_suite_t17() {
+    let _serie = file_partagee().lock().await;
     let b = Banc::avec_sortie(true, "local", "local:Realtek HD", 50).await;
     mode(&b, "at_next_playback").await;
     b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
@@ -606,6 +617,7 @@ async fn une_zone_reseau_sans_appareil_n_est_pas_locale_suite_t17() {
 
 #[tokio::test]
 async fn repasser_en_immediat_vide_la_file_suite_t17() {
+    let _serie = file_partagee().lock().await;
     let b = Banc::avec_sortie(true, "local", "local:Realtek HD", 60).await;
     mode(&b, "at_next_playback").await;
     b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
@@ -726,6 +738,7 @@ async fn une_suppression_pendant_un_chargement_ne_laisse_pas_de_marqueur_orpheli
 
 #[tokio::test]
 async fn passer_en_immediat_rafraichit_aussi_une_zone_reseau_suite_t17() {
+    let _serie = file_partagee().lock().await;
     let b = Banc::avec_sortie(true, "dlna", "dlna:salon", 70).await;
     mode(&b, "at_next_playback").await;
     b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
