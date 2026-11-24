@@ -1095,7 +1095,6 @@ impl OutputTarget for OaatOutput {
             let mut fin_jouee = super::fin_jouee_7330::FinJouee::default();
 
             let http_client = crate::http::client::builder()
-                .user_agent(crate::http::client::agent_interne("oaat"))
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .build()
                 .unwrap_or_default();
@@ -2462,7 +2461,14 @@ impl OutputTarget for OaatOutput {
             }
 
             debug!(device = %device_name, url = %crate::confidentialite::masquer_url(&url), "oaat: fetching audio stream");
-            let resp = match http_client.get(&url).send().await {
+            let resp = match crate::http::client::marquer_si_flux_de_tune(
+                http_client.get(&url),
+                &url,
+                "oaat",
+            )
+            .send()
+            .await
+            {
                 Ok(r) if r.status().is_success() => r,
                 Ok(r) => {
                     error!(device = %device_name, status = %r.status(), url = %crate::confidentialite::masquer_url(&url), "oaat: HTTP error");
@@ -2914,7 +2920,7 @@ impl OutputTarget for OaatOutput {
                                     let file_offset = aligned + source_data_offset as u64;
 
                                     let range = format!("bytes={file_offset}-");
-                                    match http_client.get(&url).header("Range", &range).send().await {
+                                    match crate::http::client::marquer_si_flux_de_tune(http_client.get(&url), &url, "oaat").header("Range", &range).send().await {
                                         Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 206 => {
                                             let source = ContratPropose {
                                                 stream_id: stream_id.clone(),
@@ -3082,7 +3088,7 @@ impl OutputTarget for OaatOutput {
                                 warn!(device = %device_name, error = %e, attempt = stream_retry_attempts, file_offset, "oaat: stream error, resuming via Range");
                                 // Brief backoff to let a transient upstream hiccup clear.
                                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                                match http_client.get(&url).header("Range", &range).send().await {
+                                match crate::http::client::marquer_si_flux_de_tune(http_client.get(&url), &url, "oaat").header("Range", &range).send().await {
                                     Ok(resp) if resp.status().is_success() || resp.status().as_u16() == 206 => {
                                         let source = ContratPropose {
                                             stream_id: stream_id.clone(),

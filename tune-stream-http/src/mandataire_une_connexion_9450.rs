@@ -23,7 +23,17 @@ fn cdn_qui_compte(corps: Vec<u8>) -> (String, Arc<AtomicUsize>) {
             let corps = corps.clone();
             std::thread::spawn(move || {
                 let mut buf = [0u8; 4096];
-                let _ = s.read(&mut buf);
+                let n = s.read(&mut buf).unwrap_or(0);
+                let requete = String::from_utf8_lossy(&buf[..n]).to_ascii_lowercase();
+                if requete.contains("range: bytes=0-0") {
+                    let _ = write!(
+                        s,
+                        "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/flac\r\nContent-Range: bytes 0-0/{}\r\nContent-Length: 1\r\nConnection: close\r\n\r\n",
+                        corps.len()
+                    );
+                    let _ = s.write_all(&corps[..1]);
+                    return;
+                }
                 let _ = write!(
                     s,
                     "HTTP/1.1 200 OK\r\nContent-Type: audio/flac\r\nAccept-Ranges: bytes\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -87,4 +97,46 @@ async fn une_seule_connexion_amont_par_piste_sur_la_voie_mandataire_9450() {
         1,
         "une seule connexion amont pour la piste (#9450)"
     );
+}
+
+/// #9450, revue — un renderer qui fait un HEAD AVANT tout GET : la longueur
+/// n'est plus apprise du GET de la sonde (qui n'existe plus). Le HEAD la
+/// demande à l'amont (`bytes=0-0`) et annonce un fichier recherchable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn un_head_d_abord_annonce_la_longueur_9450() {
+    let fichier = vec![5u8; 123_456];
+    let (amont, _connexions) = cdn_qui_compte(fichier.clone());
+    let sid = "s9450-head-d-abord";
+    let info = StreamInfo {
+        format: "flac".into(),
+        mime_type: "audio/flac".into(),
+        sample_rate: 44_100,
+        bit_depth: 16,
+        channels: 2,
+        ..StreamInfo::default()
+    };
+    let session = StreamSession::new(sid.to_string(), info, false, 128);
+    *session.proxy_url.lock().await = Some(amont);
+    let session = Arc::new(session);
+    let sessions: SharedSessions = Arc::new(tokio::sync::Mutex::new(
+        [(sid.to_string(), session.clone())].into_iter().collect(),
+    ));
+    let mut h = HeaderMap::new();
+    h.insert("User-Agent", "Renderer/1.0".parse().unwrap());
+    let rep = handle_head(Path(format!("{sid}.flac")), State(sessions), h).await;
+    assert_eq!(
+        rep.headers()
+            .get("Content-Length")
+            .and_then(|v| v.to_str().ok()),
+        Some("123456"),
+        "le HEAD d'abord doit annoncer la longueur de l'amont"
+    );
+    assert!(
+        rep.headers()
+            .get("contentFeatures.dlna.org")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|v| v.contains("DLNA.ORG_OP=01")),
+        "recherche par octets annoncée"
+    );
+    assert_eq!(session.longueur_amont(), Some(123_456));
 }

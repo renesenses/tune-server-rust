@@ -188,7 +188,7 @@ async fn la_sonde_decode_les_octets_relayes_au_renderer() {
     for (i, bloc) in wav.chunks(64 * 1024).enumerate() {
         session
             .prise_des_niveaux
-            .nourrir((i * 64 * 1024) as u64, bloc, Some(total));
+            .nourrir(1, (i * 64 * 1024) as u64, bloc, Some(total));
     }
     let n = trames_recues(&mut b.rx, 5).await;
     assert!(
@@ -213,4 +213,134 @@ async fn une_adresse_exterieure_garde_sa_connexion() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert_eq!(connexions.load(Ordering::SeqCst), 1);
+}
+
+/// #9450, revue — le renderer saute dans le fichier (nouvelle connexion
+/// `bytes=N-` loin de la position suivie) : la sonde se RECALE, en-tête gardé
+/// puis la suite, au lieu de rester muette jusqu'à la fin de la piste.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn un_saut_du_renderer_recale_la_sonde() {
+    let mut b = banc().await;
+    let sid = session_mandataire(&b.streamer).await;
+    let url = format!("http://127.0.0.1:9/stream/{sid}.wav");
+    b.orch
+        .spawn_proxy_levels_probe(b.zone_id, url, "wav".into())
+        .await;
+    let session = b
+        .streamer
+        .sessions_state()
+        .lock()
+        .await
+        .get(&sid)
+        .cloned()
+        .unwrap();
+    // 6 s de WAV 44,1/16 stéréo : 176 400 octets par seconde après 44.
+    let wav = wav_silencieux(6);
+    let total = wav.len() as u64;
+    let seconde = 176_400usize;
+    // Connexion 1 : la première seconde.
+    session
+        .prise_des_niveaux
+        .nourrir(1, 0, &wav[..44 + seconde], Some(total));
+    // Le renderer joue la première seconde, puis saute à 4 s : sa position
+    // rapportée suit, comme le sondeur la relèverait.
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    let playback = b.orch.playback.clone();
+    let zone_id = b.zone_id;
+    let horloge = tokio::spawn(async move {
+        let t0 = tokio::time::Instant::now();
+        loop {
+            let ms = 4_000 + t0.elapsed().as_millis() as i64;
+            playback.update_position(zone_id, ms).await;
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    });
+    // Connexion 2 : saut à 4 s, jusqu'à la fin.
+    let saut = 44 + 4 * seconde;
+    for (i, bloc) in wav[saut..].chunks(64 * 1024).enumerate() {
+        session
+            .prise_des_niveaux
+            .nourrir(2, (saut + i * 64 * 1024) as u64, bloc, Some(total));
+    }
+    // 1 s + 2 s décodées ≈ 75 fenêtres ; sans recalage, ~25 seulement.
+    let n = trames_recues(&mut b.rx, 6).await;
+    horloge.abort();
+    assert!(
+        n >= 60,
+        "la sonde doit se recaler après le saut et décoder la suite ; reçu {n} fenêtres"
+    );
+    b.streamer.remove_session(&sid).await;
+}
+
+/// #9450, revue — le balayage d'inactivité coupe la prise et oublie la prise
+/// garée, comme `remove_session`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn le_balayage_d_inactivite_coupe_et_oublie_la_prise() {
+    let b = banc().await;
+    let sid = session_mandataire(&b.streamer).await;
+    let lecteur = b
+        .streamer
+        .brancher_la_prise_des_niveaux(&sid, Box::new(|| false))
+        .await
+        .unwrap();
+    crate::http::prise_des_niveaux_9450::garer(&sid, lecteur);
+    let session = b
+        .streamer
+        .sessions_state()
+        .lock()
+        .await
+        .get(&sid)
+        .cloned()
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let retirees = b
+        .streamer
+        .cleanup_stale_sessions_with(
+            std::time::Duration::from_millis(1),
+            std::time::Duration::from_secs(3600),
+        )
+        .await;
+    assert_eq!(retirees, 1);
+    assert!(!session.prise_des_niveaux.branchee(), "prise coupée");
+    assert!(
+        !crate::http::prise_des_niveaux_9450::est_garee(&sid),
+        "prise garée oubliée"
+    );
+}
+
+/// #9450, revue — la piste remplacée arrête le lecteur d'une prise muette :
+/// pas de sonde garée jusqu'au balayage.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn la_piste_remplacee_arrete_la_sonde_d_une_prise_muette() {
+    let b = banc().await;
+    let sid = session_mandataire(&b.streamer).await;
+    let url = format!("http://127.0.0.1:9/stream/{sid}.wav");
+    b.orch
+        .spawn_proxy_levels_probe(b.zone_id, url, "wav".into())
+        .await;
+    let session = b
+        .streamer
+        .sessions_state()
+        .lock()
+        .await
+        .get(&sid)
+        .cloned()
+        .unwrap();
+    assert!(session.prise_des_niveaux.branchee());
+    // La zone passe à une autre piste ; rien n'a jamais coulé.
+    b.orch.playback.bump_generation(b.zone_id).await;
+    let fin = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut pos = 0u64;
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    while session.prise_des_niveaux.branchee() && tokio::time::Instant::now() < fin {
+        // Un bloc relayé fait voir à la prise que le lecteur est parti.
+        session.prise_des_niveaux.nourrir(1, pos, &[0u8; 4], None);
+        pos += 4;
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        !session.prise_des_niveaux.branchee(),
+        "le lecteur doit voir la piste remplacée et lâcher la prise"
+    );
+    b.streamer.remove_session(&sid).await;
 }

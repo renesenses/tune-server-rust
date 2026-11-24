@@ -1078,8 +1078,7 @@ fn decode_http_stream_for_levels(
     // Pas de timeout total : la connexion vit toute la piste (le débit est
     // volontairement bridé au rythme de lecture, jamais idle assez longtemps
     // pour un drop keep-alive CDN).
-    let response = crate::http::client::blocking_builder()
-        .user_agent(crate::http::client::agent_interne("niveaux"))
+    let response = crate::http::client::blocking_builder_pour(&url, "niveaux")
         .timeout(None)
         .connect_timeout(std::time::Duration::from_secs(10))
         .build()
@@ -1099,6 +1098,27 @@ fn decode_source_for_levels<R: std::io::Read + Send + Sync + 'static>(
     codec_hint: String,
     levels_tx: tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
     reported_position_ms: std::sync::Arc<std::sync::atomic::AtomicI64>,
+) -> Result<(), String> {
+    decoder_les_niveaux(
+        lecture,
+        codec_hint,
+        levels_tx,
+        reported_position_ms,
+        0,
+        None,
+    )
+}
+
+/// Le décodage-pour-niveaux, à partir de `depart_ms` dans la piste (un
+/// recalage de la prise, #9450) ; `duree_ms` reçoit la durée que l'en-tête
+/// annonce, quand il la dit.
+fn decoder_les_niveaux<R: std::io::Read + Send + Sync + 'static>(
+    lecture: R,
+    codec_hint: String,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+    reported_position_ms: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    depart_ms: i64,
+    duree_ms: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
 ) -> Result<(), String> {
     use symphonia::core::audio::conv::IntoSample;
     use symphonia::core::codecs::CodecParameters;
@@ -1142,13 +1162,24 @@ fn decode_source_for_levels<R: std::io::Read + Send + Sync + 'static>(
         .map(|c| c.count() as u16)
         .unwrap_or(2);
     let sample_rate = audio_params.sample_rate.unwrap_or(44100);
+    if let Some(d) = duree_ms.as_ref() {
+        let trames = format
+            .default_track(TrackType::Audio)
+            .and_then(|t| t.num_frames);
+        if let Some(n) = trames.filter(|_| sample_rate > 0) {
+            d.store(
+                (n as i64).saturating_mul(1000) / i64::from(sample_rate),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+    }
 
     let mut decoder = symphonia::default::get_codecs()
         .make_audio_decoder(&audio_params, &AudioDecoderOptions::default())
         .map_err(|e| format!("levels probe decoder init failed: {e}"))?;
 
     // Position décodée (référentiel piste) pour le bridage.
-    let mut decoded_ms: i64 = 0;
+    let mut decoded_ms: i64 = depart_ms;
     loop {
         let packet = match format.next_packet() {
             Ok(Some(p)) => p,
@@ -1241,57 +1272,231 @@ async fn spawn_proxy_levels_probe_task(
     codec_hint: String,
     play_seq: u64,
 ) {
-    let (levels_tx, consomme_ms) =
-        spawn_paced_levels_forwarder_mesure(bus, playback.clone(), zone_id, play_seq, 0);
     // #9450 — branchée ICI, avant le retour : l'appelant n'a pas encore rendu
     // l'URL au renderer, ses premiers octets passent donc par la prise.
-    let prise = match source {
-        SourceDesNiveaux::Url(url) => Err(url),
-        SourceDesNiveaux::Garee(mut lecteur) => {
-            let tx = levels_tx.clone();
-            lecteur.poser_l_arret(Box::new(move || tx.is_closed()));
-            Ok(lecteur)
+    let lecteur = match source {
+        SourceDesNiveaux::Url(url) => {
+            sonder_une_adresse(playback, bus, zone_id, url, codec_hint, play_seq);
+            return;
         }
+        SourceDesNiveaux::Garee(lecteur) => lecteur,
         SourceDesNiveaux::Prise(streamer, stream_id) => {
-            let tx = levels_tx.clone();
-            match streamer
-                .brancher_la_prise_des_niveaux(&stream_id, Box::new(move || tx.is_closed()))
-                .await
-            {
-                Some(lecteur) => Ok(lecteur),
-                None => {
-                    debug!(zone_id, stream_id = %stream_id, "proxy_levels_probe_sans_session");
-                    return;
+            // Une prise garée (avance sans blanc) se reprend : un nouveau
+            // branchement la remplacerait.
+            if let Some(l) = crate::http::prise_des_niveaux_9450::reprendre(&stream_id) {
+                l
+            } else {
+                match streamer
+                    .brancher_la_prise_des_niveaux(&stream_id, Box::new(|| false))
+                    .await
+                {
+                    Some(l) => l,
+                    None => {
+                        debug!(zone_id, stream_id = %stream_id, "proxy_levels_probe_sans_session");
+                        return;
+                    }
                 }
             }
         }
     };
-    tokio::spawn(async move {
-        let reported = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    tokio::spawn(sonder_la_prise(
+        playback, bus, zone_id, lecteur, codec_hint, play_seq,
+    ));
+}
 
-        let sampler_pos = reported.clone();
-        let sampler_probe_tx = levels_tx.clone();
-        let sampler_playback = playback.clone();
-        tokio::spawn(async move {
-            while !sampler_probe_tx.is_closed() {
-                let state = sampler_playback.get_state(zone_id).await;
-                // #3818 — même référence que le puits freiné des fichiers
-                // locaux : une position rapportée figée n'affame plus la
-                // sonde à 30 s d'avance.
-                sampler_pos.store(
-                    reference_du_frein(
-                        state.position_ms,
-                        consomme_ms.load(std::sync::atomic::Ordering::Relaxed),
-                    ),
-                    std::sync::atomic::Ordering::Relaxed,
+/// Le lecteur d'une prise, partagé entre les décodages successifs d'une même
+/// piste (un par recalage).
+struct PartDeLecteur(Arc<std::sync::Mutex<crate::http::prise_des_niveaux_9450::LecteurDePrise>>);
+
+impl std::io::Read for PartDeLecteur {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).read(buf)
+    }
+}
+
+/// #9450 — la sonde d'une prise. Chaque saut du renderer termine le
+/// décodage en cours ; la sonde se RECALE : nouveau décodeur sur « en-tête +
+/// nouvelle position », nouveau forwarder daté de la position estimée
+/// (octet / longueur × durée). Le lecteur voit lui-même la piste remplacée
+/// (`play_seq`, génération des niveaux) : il ne reste jamais garé sur une
+/// prise muette, et le forwarder s'arrête avec lui (canal fermé).
+async fn sonder_la_prise(
+    playback: Arc<PlaybackManager>,
+    bus: Arc<EventBus>,
+    zone_id: i64,
+    lecteur: crate::http::prise_des_niveaux_9450::LecteurDePrise,
+    codec_hint: String,
+    play_seq: u64,
+) {
+    let generation = playback.levels_gen(zone_id);
+    let gen_au_depart = generation.load(std::sync::atomic::Ordering::Relaxed);
+    let piste_remplacee: Arc<dyn Fn() -> bool + Send + Sync> = {
+        let playback = playback.clone();
+        let handle = tokio::runtime::Handle::current();
+        let generation = generation.clone();
+        Arc::new(move || {
+            generation.load(std::sync::atomic::Ordering::Relaxed) != gen_au_depart
+                || handle.block_on(playback.current_play_seq(zone_id)) != play_seq
+        })
+    };
+    let lecteur = Arc::new(std::sync::Mutex::new(lecteur));
+    let duree_ms = Arc::new(std::sync::atomic::AtomicI64::new(0));
+    let mut recalages: u32 = 0;
+    loop {
+        let saut = lecteur
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .prendre_le_saut();
+        let depart_ms = match saut {
+            None => 0,
+            Some(octet) => {
+                recalages += 1;
+                let total = lecteur.lock().unwrap_or_else(|e| e.into_inner()).total();
+                let mut duree = duree_ms.load(std::sync::atomic::Ordering::Relaxed);
+                if duree <= 0 {
+                    duree = playback
+                        .get_state(zone_id)
+                        .await
+                        .now_playing
+                        .map(|np| np.duration_ms)
+                        .unwrap_or(0);
+                }
+                let entete = lecteur
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .longueur_d_en_tete()
+                    .unwrap_or(0);
+                let depart = position_estimee_ms(
+                    octet.saturating_sub(entete),
+                    total.map(|t| t.saturating_sub(entete)),
+                    duree,
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                info!(
+                    zone_id,
+                    octet,
+                    depart_ms = depart,
+                    recalages,
+                    "proxy_levels_probe_recalee"
+                );
+                depart
             }
-        });
+        };
+        let (levels_tx, consomme_ms) = spawn_paced_levels_forwarder_mesure(
+            bus.clone(),
+            playback.clone(),
+            zone_id,
+            play_seq,
+            depart_ms,
+        );
+        {
+            let tx = levels_tx.clone();
+            let remplacee = piste_remplacee.clone();
+            lecteur
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .poser_l_arret(Box::new(move || tx.is_closed() || remplacee()));
+        }
+        let reported = Arc::new(std::sync::atomic::AtomicI64::new(depart_ms));
+        lancer_l_echantillonneur(
+            playback.clone(),
+            zone_id,
+            levels_tx.clone(),
+            reported.clone(),
+            consomme_ms,
+            depart_ms,
+        );
+        let part = PartDeLecteur(lecteur.clone());
+        let hint = codec_hint.clone();
+        let duree = duree_ms.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            decoder_les_niveaux(part, hint, levels_tx, reported, depart_ms, Some(duree))
+        })
+        .await;
+        match result {
+            Ok(Ok(())) => debug!(zone_id, "proxy_levels_probe_ended"),
+            Ok(Err(e)) => debug!(zone_id, error = %e, "proxy_levels_probe_failed"),
+            Err(e) => debug!(zone_id, error = %e, "proxy_levels_probe_panic"),
+        }
+        let saut_en_attente = lecteur
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .commence_par_un_saut()
+            .is_some();
+        if !saut_en_attente || recalages >= 64 {
+            break;
+        }
+        let remplacee = piste_remplacee.clone();
+        if tokio::task::spawn_blocking(move || remplacee())
+            .await
+            .unwrap_or(true)
+        {
+            break;
+        }
+    }
+}
 
-        let result = tokio::task::spawn_blocking(move || match prise {
-            Ok(lecteur) => decode_source_for_levels(lecteur, codec_hint, levels_tx, reported),
-            Err(url) => decode_http_stream_for_levels(url, codec_hint, levels_tx, reported),
+/// La position, dans la piste, de l'octet `octet` : proportion de la longueur
+/// × durée. 0 quand l'une des deux manque.
+fn position_estimee_ms(octet: u64, total: Option<u64>, duree_ms: i64) -> i64 {
+    match total.filter(|&t| t > 0) {
+        Some(t) if duree_ms > 0 => {
+            ((u128::from(octet.min(t)) * duree_ms as u128) / u128::from(t)) as i64
+        }
+        _ => 0,
+    }
+}
+
+/// L'échantillonneur de position du frein (#3818), commun aux deux sondes.
+fn lancer_l_echantillonneur(
+    playback: Arc<PlaybackManager>,
+    zone_id: i64,
+    probe_tx: tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+    reported: Arc<std::sync::atomic::AtomicI64>,
+    consomme_ms: Arc<std::sync::atomic::AtomicI64>,
+    depart_ms: i64,
+) {
+    tokio::spawn(async move {
+        while !probe_tx.is_closed() {
+            let state = playback.get_state(zone_id).await;
+            // #3818 — même référence que le puits freiné des fichiers
+            // locaux : une position rapportée figée n'affame plus la
+            // sonde à 30 s d'avance.
+            reported.store(
+                reference_du_frein(
+                    state.position_ms,
+                    depart_ms + consomme_ms.load(std::sync::atomic::Ordering::Relaxed),
+                ),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        }
+    });
+}
+
+/// La sonde d'une adresse extérieure (épisode, Bandcamp, avance gapless sans
+/// prise) : sa propre connexion, comme avant #9450.
+fn sonder_une_adresse(
+    playback: Arc<PlaybackManager>,
+    bus: Arc<EventBus>,
+    zone_id: i64,
+    url: String,
+    codec_hint: String,
+    play_seq: u64,
+) {
+    tokio::spawn(async move {
+        let (levels_tx, consomme_ms) =
+            spawn_paced_levels_forwarder_mesure(bus, playback.clone(), zone_id, play_seq, 0);
+        let reported = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        lancer_l_echantillonneur(
+            playback,
+            zone_id,
+            levels_tx.clone(),
+            reported.clone(),
+            consomme_ms,
+            0,
+        );
+        let result = tokio::task::spawn_blocking(move || {
+            decode_http_stream_for_levels(url, codec_hint, levels_tx, reported)
         })
         .await;
         match result {

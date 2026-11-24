@@ -60,7 +60,35 @@ pub fn agent_interne(role: &str) -> String {
 /// Les flux de Tune sont en HTTP clair ; une adresse de CDN (HTTPS) garde ses
 /// en-têtes d'origine, rien n'y est ajouté.
 pub fn vise_un_flux_de_tune(url: &str) -> bool {
-    url.starts_with("http://") && crate::http::streamer::stream_id_de_l_url(url).is_some()
+    let port = PORT_DU_FLUX.load(std::sync::atomic::Ordering::Relaxed);
+    port != 0 && est_un_flux_de_tune_sur(url, port)
+}
+
+/// Le port du serveur de flux de Tune (`AudioStreamer::new`) ; 0 = inconnu.
+static PORT_DU_FLUX: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+/// Retient le port du serveur de flux de Tune.
+pub fn noter_le_port_du_flux(port: u16) {
+    PORT_DU_FLUX.store(port, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// L'ORIGINE de Tune seulement : HTTP clair, sur le port de son serveur de
+/// flux, chemin `/stream/<identifiant de session>` (un UUID). Un Icecast tiers
+/// qui publie `/stream/live` ou un CDN n'en est pas.
+pub fn est_un_flux_de_tune_sur(url: &str, port: u16) -> bool {
+    let Some(reste) = url.strip_prefix("http://") else {
+        return false;
+    };
+    let hote = reste.split('/').next().unwrap_or("");
+    let port_de_l_url = hote
+        .rsplit_once(':')
+        .and_then(|(_, p)| p.parse::<u16>().ok())
+        .unwrap_or(80);
+    let chemin = &reste[hote.len()..];
+    port_de_l_url == port
+        && chemin.starts_with("/stream/")
+        && crate::http::streamer::stream_id_de_l_url(url)
+            .is_some_and(|id| uuid::Uuid::parse_str(id).is_ok())
 }
 
 /// Le constructeur bloquant, avec l'agent interne `role` quand `url` est un
@@ -173,6 +201,51 @@ pub fn long_timeout() -> &'static reqwest::Client {
 /// Client for infinite streams (radio). No total timeout, only connect timeout.
 pub fn infinite_stream() -> &'static reqwest::Client {
     &INFINITE_CLIENT
+}
+
+#[cfg(test)]
+mod tests_9450 {
+    use super::*;
+
+    #[test]
+    fn seule_l_origine_de_tune_recoit_l_agent_interne() {
+        let id = "0b7d8c1e-4f5a-4b6c-9d7e-8f9a0b1c2d3e";
+        assert!(est_un_flux_de_tune_sur(
+            &format!("http://192.168.3.78:8888/stream/{id}.flac"),
+            8888
+        ));
+        assert!(est_un_flux_de_tune_sur(
+            &format!("http://127.0.0.1:8888/stream/{id}.wav?depart_ms=5"),
+            8888
+        ));
+        // Icecast tiers, autre port, CDN, identifiant qui n'est pas une session.
+        assert!(!est_un_flux_de_tune_sur(
+            "http://radio.exemple:8000/stream/live.mp3",
+            8888
+        ));
+        assert!(!est_un_flux_de_tune_sur(
+            "http://radio.exemple:8888/stream/live.mp3",
+            8888
+        ));
+        assert!(!est_un_flux_de_tune_sur(
+            &format!("http://192.168.3.78:8000/stream/{id}.flac"),
+            8888
+        ));
+        assert!(!est_un_flux_de_tune_sur(
+            &format!("https://cdn.exemple/stream/{id}.flac"),
+            8888
+        ));
+        assert!(!est_un_flux_de_tune_sur(
+            &format!("http://t4.bcbits.com/stream/{id}/mp3-128/x"),
+            80
+        ));
+    }
+
+    #[test]
+    fn un_agent_interne_se_reconnait() {
+        assert!(est_un_agent_interne(&agent_interne("oaat")));
+        assert!(!est_un_agent_interne("Lavf/58.45.100"));
+    }
 }
 
 #[cfg(test)]

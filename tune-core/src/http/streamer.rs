@@ -1930,6 +1930,10 @@ const SESSIONS_ABANDONNEES_RETENUES: usize = 64;
 
 impl AudioStreamer {
     pub fn new(port: u16) -> Self {
+        // #9450 — l'origine de Tune, pour reconnaître ses propres flux.
+        if port != 0 {
+            crate::http::client::noter_le_port_du_flux(port);
+        }
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             port,
@@ -2647,6 +2651,10 @@ impl AudioStreamer {
             if s.is_radio {
                 radios_reprises.push(s.clone());
             }
+            // #9450 — comme `remove_session` : la sonde de niveaux lit la fin
+            // du flux, et une prise garée ne survit pas à sa session.
+            s.prise_des_niveaux.couper();
+            super::prise_des_niveaux_9450::oublier(id);
             false
         });
         let after = sessions.len();

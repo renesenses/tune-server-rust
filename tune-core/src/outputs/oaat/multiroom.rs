@@ -397,14 +397,20 @@ impl OutputTarget for OaatMultiroomOutput {
 
             // Fetch audio stream
             let http_client = crate::http::client::builder()
-                .user_agent(crate::http::client::agent_interne("oaat-multiroom"))
                 .timeout(std::time::Duration::from_secs(30))
                 .build()
                 .unwrap_or_default();
 
             let stream_id = format!("tune-{stream_num}");
 
-            let resp = match http_client.get(&url).send().await {
+            let resp = match crate::http::client::marquer_si_flux_de_tune(
+                http_client.get(&url),
+                &url,
+                "oaat-multiroom",
+            )
+            .send()
+            .await
+            {
                 Ok(r) if r.status().is_success() => r,
                 Ok(r) => {
                     error!(device = %device_name, status = %r.status(), "oaat-multiroom: HTTP error");
