@@ -91,7 +91,8 @@ pub(crate) fn reglages_dash(
 }
 
 /// Le format du pré-transcodage DASH, quand la décision ne dépend pas de la
-/// sonde `audio/flac` du renderer : navigateur ou zone forcée en WAV → WAV ;
+/// sonde `audio/flac` du renderer : navigateur tiré à distance → FLAC (#9174,
+/// indexé au pré-transcodage) ; navigateur ou zone forcée en WAV → WAV ;
 /// pas d'appareil ou zone forcée en FLAC natif → FLAC. `None` : demander au
 /// renderer. Le forçage WAV l'emporte sur le FLAC natif, comme sur le chemin
 /// local (le WAV/LPCM prime sur les passthroughs).
@@ -100,8 +101,11 @@ pub(crate) fn format_dash_impose(
     reglages: ReglagesDash,
     sans_appareil: bool,
     forcer_flac: bool,
+    a_distance: bool,
 ) -> Option<&'static str> {
-    if navigateur || reglages.forcer_wav {
+    if navigateur && a_distance {
+        Some("flac")
+    } else if navigateur || reglages.forcer_wav {
         Some("wav")
     } else if sans_appareil || forcer_flac {
         Some("flac")
@@ -186,6 +190,8 @@ struct DashPret<'a> {
     dash_dsp: StreamingDsp,
     dash_dsp_active: bool,
     is_browser_output: bool,
+    /// #9174 — le lecteur de cette zone navigateur écoute à distance.
+    a_distance: bool,
     warm: Option<DashWarm>,
     unique_path: String,
     sr: u32,
@@ -1916,6 +1922,8 @@ impl PlaybackOrchestrator {
             .and_then(|z| z.output_type)
             .as_deref()
             == Some("browser");
+        // #9174 — tiré par le relais : FLAC indexé plutôt que WAV.
+        let a_distance = is_browser_output && self.zone_tiree_a_distance(req.zone_id);
         let reglages = reglages_dash(&self.db, req.zone_id, stream_data.quality.bit_depth);
 
         // Warm-cache (opt-in, TUNE_DASH_WARM_CACHE): a prior play/warm of this
@@ -1930,8 +1938,13 @@ impl PlaybackOrchestrator {
             let wsr = sr_servie;
             let wdid = req.output_device_id.as_deref().unwrap_or("");
             let wflac = ZoneRepo::with_backend(self.db.clone()).get_dlna_native_flac(req.zone_id);
-            let wfmt = match format_dash_impose(is_browser_output, reglages, wdid.is_empty(), wflac)
-            {
+            let wfmt = match format_dash_impose(
+                is_browser_output,
+                reglages,
+                wdid.is_empty(),
+                wflac,
+                a_distance,
+            ) {
                 Some(f) => f,
                 None if self.dlna_supports_mime(wdid, "audio/flac").await => "flac",
                 None => "wav",
@@ -1943,7 +1956,9 @@ impl PlaybackOrchestrator {
             // le ReplayGain la traversaient (#2863).
             // Sans racine de cache utilisable pour ce compte (#5133), même
             // chemin que sans cache : pas de `DashWarm`.
-            if !dash_dsp_active {
+            // #9174 — un FLAC rangé pour un renderer n'a pas de SEEKTABLE :
+            // le navigateur tiré à distance ne le reprend pas.
+            if !dash_dsp_active && !a_distance {
                 crate::transcode_cache::cache_path_streaming(
                     service_name,
                     source_id,
@@ -2106,6 +2121,7 @@ impl PlaybackOrchestrator {
             dash_dsp,
             dash_dsp_active,
             is_browser_output,
+            a_distance,
             warm,
             unique_path,
             sr,
@@ -2124,6 +2140,7 @@ impl PlaybackOrchestrator {
     async fn choisir_l_encodage_dash(&self, req: &PlayRequest, p: &DashPret<'_>) -> &'static str {
         let DashPret {
             is_browser_output,
+            a_distance,
             ref warm,
             dash_did,
             reglages,
@@ -2143,6 +2160,7 @@ impl PlaybackOrchestrator {
                     reglages,
                     dash_did.is_empty(),
                     force,
+                    a_distance,
                 ) {
                     Some(f) => f,
                     None if self.dlna_supports_mime(dash_did, "audio/flac").await => "flac",
@@ -2158,6 +2176,7 @@ impl PlaybackOrchestrator {
             zone_id = req.zone_id,
             device_id = %dash_did,
             native_flac_override = dash_force_flac,
+            a_distance,
             lpcm_override = reglages.forcer_wav,
             cap_16bit = reglages.plafond_16,
             chosen_format = dash_enc_format,
@@ -2186,6 +2205,7 @@ impl PlaybackOrchestrator {
             bd,
             plafonnee,
             reglages,
+            a_distance,
             ..
         } = *p;
         // Streaming remux (#1146, opt-in TUNE_DASH_STREAM_REMUX): chunked-stream
@@ -2197,7 +2217,10 @@ impl PlaybackOrchestrator {
         // background download, so playback begins on the first fragments.
         // #6909 — le remux recopie les trames FLAC telles quelles : il ne
         // peut pas servir le plafond 16 bits de la zone.
+        // #9174 — pas pour un navigateur tiré à distance : CoreMedia refuse un
+        // flux sans `Content-Length`, et ce FLAC-là n'a pas de SEEKTABLE.
         if dash_enc_format == "flac"
+            && !a_distance
             && !dash_dsp_active
             && !plafonnee
             && !reglages.plafond_16
@@ -2319,8 +2342,12 @@ impl PlaybackOrchestrator {
             reglages,
             plafonnee,
             source_flac,
+            a_distance,
             ..
         } = p;
+        // #9174 — le FLAC d'un navigateur tiré à distance porte une SEEKTABLE :
+        // ses `Range` tombent alors sur une trame.
+        let indexer = a_distance && dash_enc_format == "flac";
         // #5114 — lu avant que le porteur parte dans la tâche de décodage :
         // la session de fichier dira si ses octets portent le crossfeed.
         // Le remux (sans traitement) ne l'appelle jamais, d'où `dash_dsp_active`.
@@ -2380,9 +2407,13 @@ impl PlaybackOrchestrator {
                         dash_plafond_16,
                         plafonnee,
                     ) {
-                        match crate::audio::decode::remux_flac_dash(
+                        // #9174 — indexé pendant le remux pour un navigateur
+                        // tiré à distance ; un index illisible est abandonné,
+                        // la piste part sans.
+                        match crate::audio::decode::remux_flac_dash_indexe(
                             &unique_path_clone,
                             &tmp_path_clone,
+                            indexer,
                         ) {
                             Ok(remuxe) => {
                                 // Les VU-mètres décrivaient le PCM du transcodage.
@@ -2450,10 +2481,19 @@ impl PlaybackOrchestrator {
                         encoder.finish().await
                     })?;
 
-                    std::fs::write(&tmp_path_clone, &encoded_data)
-                        .map_err(|e| format!("write temp file: {e}"))?;
-
-                    let file_size = encoded_data.len() as u64;
+                    // #9174 — indexé à l'écriture pour un navigateur tiré à
+                    // distance (en-tête neuf, trames recopiées en flux) ; un
+                    // FLAC que l'index ne lit pas est écrit tel quel.
+                    let file_size = if indexer {
+                        crate::audio::seektable_flac_9174::ecrire_flac_indexe(
+                            &tmp_path_clone,
+                            &encoded_data,
+                        )?
+                    } else {
+                        std::fs::write(&tmp_path_clone, &encoded_data)
+                            .map_err(|e| format!("write temp file: {e}"))?;
+                        encoded_data.len() as u64
+                    };
                     Ok::<(u64, u16, u32), String>((file_size, actual_bd, decoded.sample_rate))
                 }),
                 fichiers_de_la_tache,
