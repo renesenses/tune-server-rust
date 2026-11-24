@@ -1176,7 +1176,11 @@ async fn dash_tidal(egaliseur: bool) -> (&'static str, ReponseTessZone) {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn un_flac_tidal_dash_remuxe_reste_bit_perfect() {
     let (voie_servie, etat) = dash_tidal(false).await;
-    assert_eq!(voie_servie, voie::ENTETE_FLAC_NEUF, "remux : trames intactes");
+    assert_eq!(
+        voie_servie,
+        voie::ENTETE_FLAC_NEUF,
+        "remux : trames intactes"
+    );
     assert_eq!(etat.delivery.as_ref().unwrap().route, VoieUpnp::Untouched);
     assert_eq!(etat.badge, Badge::BitPerfect);
 }
@@ -1189,7 +1193,10 @@ async fn un_flac_tidal_dash_remuxe_reste_bit_perfect() {
 async fn un_flac_tidal_dash_decode_est_une_conversion() {
     let (voie_servie, etat) = dash_tidal(true).await;
     assert_eq!(voie_servie, voie::FICHIER_CONVERTI, "égaliseur : décodage");
-    assert_eq!(etat.delivery.as_ref().unwrap().route, VoieUpnp::FileTranscode);
+    assert_eq!(
+        etat.delivery.as_ref().unwrap().route,
+        VoieUpnp::FileTranscode
+    );
     assert_ne!(etat.badge, Badge::BitPerfect);
 }
 
