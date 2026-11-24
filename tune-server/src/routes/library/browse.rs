@@ -1502,6 +1502,8 @@ mod comptes_9116_tests {
     fn une_racine_d_images_iso_ou_cue_compte_ses_tranches_9480() {
         let b = banc();
         let (s, r) = (&b.state, &b.racine);
+        // Le dossier des images existe sur le disque, comme chez le testeur.
+        std::fs::create_dir_all(r.join("SACD")).unwrap();
         let image = |nom: &str| -> String { r.join("SACD").join(nom).to_str().unwrap().nfc().collect() };
         for (debut, media) in [
             (0, image("disque.iso")),
