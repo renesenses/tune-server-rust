@@ -195,7 +195,10 @@ pub fn acheminer(r: &Resolution, f: &FaitsUpnp) -> AcheminementUpnp {
     let headroom_manuel = r.etapes.iter().any(|e| {
         e.code == CodeEtape::Headroom
             && e.effective
-            && e.params.as_ref().and_then(|p| p.get("mode")).and_then(|m| m.as_str())
+            && e.params
+                .as_ref()
+                .and_then(|p| p.get("mode"))
+                .and_then(|m| m.as_str())
                 == Some("manual")
     });
     let reencodage = f.replaygain_actif
@@ -499,8 +502,20 @@ mod tests {
         rg.replaygain_actif = true;
         for (cas, ids, pure, source, f) in [
             ("chaîne vide + plafond", &[][..], false, PCM24, plafond),
-            ("Pure + plafond", &["equalizer-graphic"][..], true, PCM24, plafond),
-            ("chaîne vide + DSD converti", &[][..], false, dsd, faits(Refused, false, Library)),
+            (
+                "Pure + plafond",
+                &["equalizer-graphic"][..],
+                true,
+                PCM24,
+                plafond,
+            ),
+            (
+                "chaîne vide + DSD converti",
+                &[][..],
+                false,
+                dsd,
+                faits(Refused, false, Library),
+            ),
             ("ReplayGain seul", &[][..], false, PCM24, rg),
         ] {
             let mut r = resoudre(ids, pure, source);

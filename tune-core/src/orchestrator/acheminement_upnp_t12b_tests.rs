@@ -780,7 +780,10 @@ async fn en_pure_une_conversion_imposee_n_est_pas_dite_bit_perfect() {
     let s = jouer(&b, id).await;
     assert_ne!(s.voie, voie::FICHIER_TEL_QUEL, "plafond : convertie");
     let etat = b.etat_tess(96_000, 24).await;
-    assert_eq!(etat.delivery.as_ref().unwrap().route, VoieUpnp::FileTranscode);
+    assert_eq!(
+        etat.delivery.as_ref().unwrap().route,
+        VoieUpnp::FileTranscode
+    );
     assert_eq!(etat.badge, Badge::AlteredOutsideTess);
 
     ZoneRepo::with_backend(b.orch.db.clone())

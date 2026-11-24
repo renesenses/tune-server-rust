@@ -1121,7 +1121,10 @@ async fn le_get_d_etat_n_attend_pas_la_sonde_d_une_lecture_t12b() {
     let orch = b.state.orchestrator.clone();
     let sonde = tokio::spawn(async move { orch.dlna_accepte_lpcm(appareil, false).await });
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    assert!(!sonde.is_finished(), "la sonde de lecture doit être en cours");
+    assert!(
+        !sonde.is_finished(),
+        "la sonde de lecture doit être en cours"
+    );
     let t0 = std::time::Instant::now();
     let (s, v) = tokio::time::timeout(std::time::Duration::from_secs(1), b.get())
         .await
