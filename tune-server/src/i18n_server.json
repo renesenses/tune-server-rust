@@ -9519,7 +9519,11 @@
     "vi": "Bản nhạc này không còn trong thư viện. Hãy làm mới chế độ xem.",
     "nb": "Dette sporet finnes ikke lenger i biblioteket. Oppdater visningen.",
     "pl": "Tego utworu nie ma już w bibliotece. Odśwież widok.",
-    "el": "Αυτό το κομμάτι δεν υπάρχει πλέον στη βιβλιοθήκη. Ανανεώστε την προβολή."
+    "el": "Αυτό το κομμάτι δεν υπάρχει πλέον στη βιβλιοθήκη. Ανανεώστε την προβολή.",
+    "nl": "Dit nummer staat niet meer in de bibliotheek. Vernieuw de weergave.",
+    "zh-Hant": "此曲目已不在音樂庫中。請重新整理檢視。",
+    "ru": "Этого трека больше нет в библиотеке. Обновите представление.",
+    "uk": "Цього треку більше немає в бібліотеці. Оновіть подання."
   },
   "api.auth.invalidCredentials": {
     "fr": "Identifiant ou mot de passe incorrect",
@@ -9537,6 +9541,10 @@
     "nb": "Feil brukernavn eller passord",
     "pl": "Nieprawidłowa nazwa użytkownika lub hasło",
     "el": "Λάθος όνομα χρήστη ή κωδικός πρόσβασης",
-    "tr": "Kullanıcı adı veya parola yanlış"
+    "tr": "Kullanıcı adı veya parola yanlış",
+    "nl": "Onjuiste gebruikersnaam of wachtwoord",
+    "zh-Hant": "使用者名稱或密碼錯誤",
+    "ru": "Неверное имя пользователя или пароль",
+    "uk": "Неправильне ім’я користувача або пароль"
   }
 }
