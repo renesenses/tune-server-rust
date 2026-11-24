@@ -18,13 +18,6 @@ use crate::trafic::{Categorie, Erreur};
 /// pour ce qu'il est — le contrat de fil deja deploye chez les utilisateurs.
 const PREFIXE_MORCEAU: &str = "BINARY:";
 
-/// Morceaux en attente avant que le relais ne freine le serveur.
-///
-/// Le canal borne fait le contre-pression : si le navigateur lit moins vite
-/// que le disque ne debite, l'envoi cote serveur attend au lieu de remplir la
-/// memoire du relais avec un album entier.
-const MORCEAUX_EN_ATTENTE: usize = 64;
-
 pub async fn handle_server_ws(socket: WebSocket, state: Arc<RelayState>) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
@@ -366,24 +359,23 @@ pub(crate) async fn handle_server_binary(
         return;
     };
 
-    // Le `Sender` est clone hors du verrou, comme pour le texte.
-    let puits = {
-        let puits = flux.lock().await;
-        if morceau.seq == 0 {
-            // Un flux commence : on oublie les rangs des flux deja fermes.
-            rangs.ne_garder_que(|id| puits.contains_key(id));
-        }
-        puits
-            .get(morceau.id)
-            .map(|p| (p.envoi.clone(), p.categorie))
-    };
-    let categorie = puits.as_ref().map_or(Categorie::Audio, |(_, c)| *c);
+    // Le depot ne s'attend jamais (diagnostic CarPlay 5G, 24/11) : il se
+    // fait sous le verrou, d'un coup, sans `await` entre la lecture et
+    // l'eventuel retrait du puits.
+    let mut puits = flux.lock().await;
+    if morceau.seq == 0 {
+        // Un flux commence : on oublie les rangs des flux deja fermes.
+        rangs.ne_garder_que(|id| puits.contains_key(id));
+    }
+    let categorie = puits
+        .get(morceau.id)
+        .map_or(Categorie::Audio, |p| p.categorie);
     state.trafic.entree(&compteurs, categorie, data.len());
-    let Some((envoi, _)) = puits else {
+    if !puits.contains_key(morceau.id) {
         // Requete abandonnee : le flux n'a plus de puits.
         rangs.oublier(morceau.id);
         return;
-    };
+    }
 
     if !rangs.accepter(morceau.id, morceau.seq) {
         warn!(
@@ -392,13 +384,28 @@ pub(crate) async fn handle_server_binary(
             seq = morceau.seq,
             "morceau perdu ou hors d'ordre : flux coupe"
         );
-        flux.lock().await.remove(morceau.id);
+        puits.remove(morceau.id);
         return;
     }
 
-    if envoi.send(morceau.octets.to_vec()).await.is_err() {
-        // Le navigateur a ferme l'onglet : le puits ne sert plus a rien.
-        flux.lock().await.remove(morceau.id);
+    let refus = puits
+        .get(morceau.id)
+        .and_then(|p| p.envoi.deposer(morceau.octets.to_vec()).err());
+    if let Some(refus) = refus {
+        signaler_refus(server_id, morceau.id, &refus);
+        puits.remove(morceau.id);
+    }
+}
+
+/// Un depot refuse retire le puits : le corps HTTP de CE flux se ferme, les
+/// autres flux et l'API continuent.
+fn signaler_refus(server_id: &str, id: &str, refus: &crate::state::RefusDeFlux) {
+    if *refus == crate::state::RefusDeFlux::Plein {
+        warn!(
+            server_id = %server_id,
+            id,
+            "le lecteur ne lit plus : flux coupe, lui seul"
+        );
     }
 }
 
@@ -463,7 +470,7 @@ async fn ouvrir_flux(
         return;
     }
 
-    let (envoi, reception) = mpsc::channel::<Vec<u8>>(MORCEAUX_EN_ATTENTE);
+    let (envoi, reception) = crate::state::file_de_flux(state.plafond_par_flux);
     let fin_propre = Arc::new(std::sync::atomic::AtomicBool::new(false));
     flux.lock().await.insert(
         debut.id.clone(),
@@ -499,20 +506,16 @@ async fn transmettre_morceau(state: &RelayState, server_id: &str, reste: &str, t
         return;
     };
 
-    // Le `Sender` est clone hors du verrou : `send` attend quand le canal est
-    // plein (contre-pression voulue), et attendre le verrou en main bloquerait
-    // tous les autres flux du meme serveur.
-    let puits = flux
-        .lock()
-        .await
-        .get(id)
-        .map(|p| (p.envoi.clone(), p.categorie));
+    // Le depot ne s'attend jamais (diagnostic CarPlay 5G, 24/11) : un
+    // lecteur qui ne lit plus ne bloque ni l'API, ni les autres flux, ni
+    // `relay.pong`.
+    let mut puits = flux.lock().await;
     // La trame est entree sur le VPS, qu'elle serve ou non : elle compte.
-    let categorie = puits.as_ref().map_or(Categorie::Audio, |(_, c)| *c);
+    let categorie = puits.get(id).map_or(Categorie::Audio, |p| p.categorie);
     state.trafic.entree(&compteurs, categorie, taille);
-    let Some((envoi, _)) = puits else {
+    if !puits.contains_key(id) {
         return;
-    };
+    }
 
     let Some(octets) = decoder_base64(encode) else {
         // Un morceau illisible n'est pas transmis : mieux vaut un trou franc
@@ -521,9 +524,10 @@ async fn transmettre_morceau(state: &RelayState, server_id: &str, reste: &str, t
         return;
     };
 
-    if envoi.send(octets).await.is_err() {
-        // Le navigateur a ferme l'onglet : le puits ne sert plus a rien.
-        flux.lock().await.remove(id);
+    let refus = puits.get(id).and_then(|p| p.envoi.deposer(octets).err());
+    if let Some(refus) = refus {
+        signaler_refus(server_id, id, &refus);
+        puits.remove(id);
     }
 }
 
@@ -680,7 +684,7 @@ mod relais_de_flux_tests {
             .expect("l'attente a ete abandonnee sans reponse")
     }
 
-    async fn morceau_attendu(morceaux: &mut mpsc::Receiver<Vec<u8>>) -> Option<Vec<u8>> {
+    async fn morceau_attendu(morceaux: &mut crate::state::ReceptionDeFlux) -> Option<Vec<u8>> {
         tokio::time::timeout(PATIENCE, morceaux.recv())
             .await
             .expect("aucun morceau n'est arrive : le corps HTTP reste muet")
@@ -807,6 +811,77 @@ mod relais_de_flux_tests {
         assert_eq!(morceau_attendu(&mut morceaux).await, None);
     }
 
+    /// Diagnostic CarPlay 5G (24/11) : un flux que son lecteur ne lit plus
+    /// depasse son plafond et est coupe, LUI SEUL — sans que le depot ait
+    /// jamais attendu. L'autre flux du meme serveur continue.
+    #[tokio::test]
+    async fn un_flux_en_depassement_est_coupe_seul_sans_attendre() {
+        let mut state = relais();
+        state.plafond_par_flux = 8;
+        let _serveur = serveur_enregistre(&state).await;
+        let attente_a = attente_deposee(&state, "req-a").await;
+        let attente_b = attente_deposee(&state, "req-b").await;
+        handle_server_message(&state, "srv", &debut("req-a", 200, None)).await;
+        handle_server_message(&state, "srv", &debut("req-b", 200, None)).await;
+        let corps = |r: PendingResponse| match r.body {
+            CorpsRelaye::Morceaux(rx, _) => rx,
+            CorpsRelaye::Entier(_) => panic!("un flux audio n'est pas un corps entier"),
+        };
+        let mut a = corps(reponse_attendue(attente_a).await);
+        let mut b = corps(reponse_attendue(attente_b).await);
+
+        // Personne ne lit `a` : 4, 8, puis 12 octets en attente > 8.
+        for _ in 0..3 {
+            tokio::time::timeout(
+                PATIENCE,
+                handle_server_message(&state, "srv", "BINARY:req-a:ZkxhQw=="),
+            )
+            .await
+            .expect("le depot d'un morceau ne doit jamais attendre le lecteur");
+        }
+        let puits = state.servers.get("srv").unwrap().flux.clone();
+        assert!(
+            !puits.lock().await.contains_key("req-a"),
+            "flux en depassement coupe"
+        );
+        assert!(
+            puits.lock().await.contains_key("req-b"),
+            "l'autre flux reste ouvert"
+        );
+        assert_eq!(
+            morceau_attendu(&mut a).await,
+            None,
+            "le corps coupe se termine tout de suite et libere sa file"
+        );
+
+        handle_server_message(&state, "srv", "BINARY:req-b:ZkxhQw==").await;
+        assert_eq!(morceau_attendu(&mut b).await.unwrap(), b"fLaC".to_vec());
+    }
+
+    #[test]
+    fn la_file_dun_flux_compte_ses_octets() {
+        let (envoi, reception) = crate::state::file_de_flux(8);
+        assert_eq!(
+            envoi.deposer(vec![0; 20]),
+            Ok(()),
+            "file vide : un gros morceau passe"
+        );
+        assert_eq!(envoi.en_attente(), 20);
+        assert_eq!(
+            envoi.deposer(vec![0; 1]),
+            Err(crate::state::RefusDeFlux::Plein)
+        );
+        assert_eq!(envoi.en_attente(), 20);
+        drop(reception);
+        let (envoi, reception) = crate::state::file_de_flux(8);
+        drop(reception);
+        assert_eq!(
+            envoi.deposer(vec![0; 1]),
+            Err(crate::state::RefusDeFlux::Ferme)
+        );
+        assert_eq!(envoi.en_attente(), 0);
+    }
+
     /// Une reponse d'API reste ce qu'elle etait : un corps entier.
     #[tokio::test]
     async fn une_reponse_dapi_reste_un_corps_entier() {
@@ -838,9 +913,9 @@ mod relais_de_flux_tests {
     /// Le corps HTTP rend les morceaux dans l'ordre, et se termine avec eux.
     #[tokio::test]
     async fn le_corps_http_rend_les_morceaux_dans_lordre() {
-        let (envoi, reception) = mpsc::channel::<Vec<u8>>(4);
-        envoi.send(b"fLaC".to_vec()).await.unwrap();
-        envoi.send(vec![0, 0, 0, 0x22]).await.unwrap();
+        let (envoi, reception) = crate::state::file_de_flux(1024);
+        envoi.deposer(b"fLaC".to_vec()).unwrap();
+        envoi.deposer(vec![0, 0, 0, 0x22]).unwrap();
         drop(envoi);
 
         let reponse = crate::stream_proxy::reponse_relayee(PendingResponse {

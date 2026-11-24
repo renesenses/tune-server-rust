@@ -2,6 +2,8 @@ mod api_proxy;
 mod circle;
 #[cfg(test)]
 mod ecoute_distance_bout_en_bout_tests;
+#[cfg(test)]
+mod flux_bloque_tests;
 mod licence;
 mod morceau_binaire;
 mod protocol;

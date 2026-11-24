@@ -31,7 +31,15 @@ pub struct RelayState {
     pub max_servers: usize,
     pub max_clients_per_server: usize,
     pub max_streams_per_server: usize,
+    /// Octets qu'un flux peut garder en attente sur le pont avant d'etre
+    /// coupe (diagnostic CarPlay 5G du 24/11). Voir [`file_de_flux`].
+    pub plafond_par_flux: usize,
 }
+
+/// Plafond par defaut d'un flux en attente : 64 Mio, de quoi tenir une piste
+/// FLAC 16/44,1 entiere quand le lecteur cesse de lire (AVPlayer remplit son
+/// tampon puis se tait), alors que le serveur pousse a son debit montant.
+pub const PLAFOND_PAR_FLUX: usize = 64 * 1024 * 1024;
 
 impl RelayState {
     pub fn new() -> Self {
@@ -45,6 +53,7 @@ impl RelayState {
             max_servers: 100,
             max_clients_per_server: 10,
             max_streams_per_server: 5,
+            plafond_par_flux: PLAFOND_PAR_FLUX,
         }
     }
 
@@ -242,7 +251,7 @@ impl Attente {
 
 /// Le puits d'un flux audio en vol.
 pub struct Puits {
-    pub envoi: mpsc::Sender<Vec<u8>>,
+    pub envoi: EnvoiDeFlux,
     pub categorie: crate::trafic::Categorie,
     /// Pose par `relay.stream_end` : la session s'est finie proprement.
     pub fin_propre: Arc<std::sync::atomic::AtomicBool>,
@@ -260,7 +269,101 @@ pub enum CorpsRelaye {
     Entier(Option<Vec<u8>>),
     /// Morceaux a venir, jusqu'a la fermeture du canal. `fin_propre` passe a
     /// vrai quand le serveur a annonce la fin (`relay.stream_end`).
-    Morceaux(mpsc::Receiver<Vec<u8>>, Arc<std::sync::atomic::AtomicBool>),
+    Morceaux(ReceptionDeFlux, Arc<std::sync::atomic::AtomicBool>),
+}
+
+/// La file d'un flux audio, entre la boucle de lecture de la WebSocket du
+/// serveur et le corps HTTP du lecteur.
+///
+/// Diagnostic CarPlay en 5G (24/11) : cette file etait un canal borne a 64
+/// morceaux, et la boucle de lecture ATTENDAIT d'y avoir de la place. Quand
+/// AVPlayer cessait de lire, toute la connexion du serveur s'arretait : l'API,
+/// les autres flux, et `relay.pong` — au bout de 90 s le pont coupait la
+/// session, les corps se fermaient avant leur `Content-Length`, et iOS
+/// affichait une « erreur TLS ».
+///
+/// Desormais le depot ne s'attend jamais : il est compte en octets, et un flux
+/// qui depasse son plafond est coupe, LUI SEUL ([`RefusDeFlux::Plein`]). Le
+/// protocole n'a pas (encore) de pause par flux a demander au serveur.
+pub fn file_de_flux(plafond: usize) -> (EnvoiDeFlux, ReceptionDeFlux) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    let partage = Arc::new(EtatDeFile::default());
+    (
+        EnvoiDeFlux {
+            tx,
+            partage: partage.clone(),
+            plafond,
+        },
+        ReceptionDeFlux { rx, partage },
+    )
+}
+
+#[derive(Default)]
+struct EtatDeFile {
+    /// Octets deposes, pas encore rendus au corps HTTP.
+    en_attente: std::sync::atomic::AtomicUsize,
+    /// Flux coupe pour depassement : le corps se termine tout de suite et
+    /// libere ce qu'il retenait.
+    coupe: std::sync::atomic::AtomicBool,
+}
+
+/// Le cote du pont qui depose les morceaux : jamais d'attente.
+pub struct EnvoiDeFlux {
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+    partage: Arc<EtatDeFile>,
+    plafond: usize,
+}
+
+/// Pourquoi un morceau n'a pas ete depose.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RefusDeFlux {
+    /// Le lecteur est parti.
+    Ferme,
+    /// Le lecteur ne lit plus : le flux est coupe.
+    Plein,
+}
+
+impl EnvoiDeFlux {
+    /// Depose un morceau sans attendre. Un morceau plus gros que le plafond
+    /// passe encore si la file est vide.
+    pub fn deposer(&self, morceau: Vec<u8>) -> Result<(), RefusDeFlux> {
+        let n = morceau.len();
+        let avant = self.partage.en_attente.fetch_add(n, Ordering::AcqRel);
+        if avant > 0 && avant + n > self.plafond {
+            self.partage.en_attente.fetch_sub(n, Ordering::AcqRel);
+            self.partage.coupe.store(true, Ordering::Release);
+            return Err(RefusDeFlux::Plein);
+        }
+        self.tx.send(morceau).map_err(|_| {
+            self.partage.en_attente.fetch_sub(n, Ordering::AcqRel);
+            RefusDeFlux::Ferme
+        })
+    }
+
+    /// Octets en attente (journal, tests).
+    pub fn en_attente(&self) -> usize {
+        self.partage.en_attente.load(Ordering::Acquire)
+    }
+}
+
+/// Le cote du corps HTTP.
+pub struct ReceptionDeFlux {
+    rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    partage: Arc<EtatDeFile>,
+}
+
+impl ReceptionDeFlux {
+    /// Le morceau suivant ; `None` a la fin du flux, ou des qu'il est coupe.
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        if self.partage.coupe.load(Ordering::Acquire) {
+            return None;
+        }
+        let morceau = self.rx.recv().await?;
+        self.partage
+            .en_attente
+            .fetch_sub(morceau.len(), Ordering::AcqRel);
+        Some(morceau)
+    }
 }
 
 pub struct PendingResponse {
@@ -293,6 +396,7 @@ mod tests {
             max_servers,
             max_clients_per_server: 10,
             max_streams_per_server: 5,
+            plafond_par_flux: PLAFOND_PAR_FLUX,
         }
     }
 
