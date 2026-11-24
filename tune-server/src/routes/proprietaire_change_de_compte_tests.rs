@@ -333,3 +333,47 @@ async fn authentification_active_seul_le_proprietaire_fait_suivre() {
     );
     assert!(b.state.license.has_module(MODULE).await);
 }
+
+/// Authentification active, cas 2 : un administrateur qui n'est PAS le
+/// propriétaire délie le compte, puis en relie un autre. Aucun compte n'est
+/// relié et il peut délier : la propriété suit, le module est accordé.
+#[tokio::test]
+async fn authentification_active_un_administrateur_relie_apres_deliaison() {
+    let b = banc(&[MODULE]).await;
+    let s = reglages(&b.state);
+    s.set("jwt_secret", "secret-de-banc").unwrap();
+    s.set("auth_enabled", "true").unwrap();
+    let profils = ProfileRepo::with_backend(b.state.backend.clone());
+    let admin = profils.create("admin", Some("Admin"), None).unwrap();
+    let autre_admin = profils.create("admin2", Some("Admin 2"), None).unwrap();
+    let jeton_admin = crate::auth::sign_jwt(admin, "admin", "secret-de-banc").unwrap();
+    let jeton_autre = crate::auth::sign_jwt(autre_admin, "admin", "secret-de-banc").unwrap();
+
+    use tune_core::db::backend::ToSqlValue;
+    b.state
+        .backend
+        .execute(
+            "UPDATE profiles SET email = ? WHERE id = ?",
+            &[
+                &"a@exemple.test" as &dyn ToSqlValue,
+                &admin as &dyn ToSqlValue,
+            ],
+        )
+        .unwrap();
+    relier(&b.state, ICI, HOTE_ICI, Some(&jeton_admin), "a").await;
+    assert_eq!(proprietaire(&s), Some(admin));
+
+    delier(&b.state, Some(&jeton_autre)).await;
+    assert!(s.get("mozaik_user").unwrap().is_none());
+    assert!(!b.state.license.has_module(MODULE).await);
+
+    relier(&b.state, LAN, HOTE_LAN, Some(&jeton_autre), "b").await;
+    let profil_b = profil_de(&b.state, "b@exemple.test");
+    assert_ne!(profil_b, autre_admin);
+    assert_eq!(
+        proprietaire(&s),
+        Some(profil_b),
+        "après une déliaison, la propriété doit suivre le compte relié"
+    );
+    assert!(b.state.license.has_module(MODULE).await);
+}
