@@ -1004,3 +1004,134 @@ async fn authentification_comme_les_autres_routes_de_zone_t08() {
         assert_eq!(st, StatusCode::OK, "{m} {uri} {v}");
     }
 }
+
+/// T12b — une zone de la famille UPnP publie la voie de sa chaîne
+/// (`delivery`), conforme au schéma ; une zone locale ne la publie pas.
+/// Rien n'a joué : l'état ne SONDE pas (relecture du 23/11). DLNA et OpenHome
+/// restent `unknown` (aucune réponse mémorisée), donc un crossfeed seul n'y
+/// est pas promis ; BluOS et Chromecast acceptent le LPCM 16 bits par type,
+/// SlimProto le refuse.
+#[tokio::test]
+async fn la_famille_upnp_publie_la_voie_de_sa_chaine_t12b() {
+    for (sortie, appareil, lpcm, voie, crossfeed) in [
+        ("dlna", "uuid:absent-t12b", "unknown", "untouched", false),
+        (
+            "openhome",
+            "uuid:oh-absent-t12b",
+            "unknown",
+            "untouched",
+            false,
+        ),
+        (
+            "bluos",
+            "bluos:absent-t12b",
+            "accepted",
+            "progressive_lpcm",
+            true,
+        ),
+        (
+            "chromecast",
+            "cast:absent-t12b",
+            "accepted",
+            "progressive_lpcm",
+            true,
+        ),
+        (
+            "slimproto",
+            "slim:absent-t12b",
+            "refused",
+            "untouched",
+            false,
+        ),
+    ] {
+        let b = Banc::avec_sortie(true, sortie, appareil).await;
+        let (s, v) = b.get().await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        conforme_au_schema("zone_response", &v).unwrap_or_else(|e| panic!("{sortie} {e} : {v}"));
+        assert_eq!(v["delivery"]["route"], json!("untouched"), "{sortie} : {v}");
+        assert_eq!(v["delivery"]["reason"], json!("nothing_to_process"), "{v}");
+        let (s, v) = b
+            .brut(
+                Method::PUT,
+                &format!("/api/v1/zones/{}/dsp", b.zone),
+                Some(
+                    json!({"crossfeed": {"enabled": true, "amount": 0.35, "delay_ms": 0.3}})
+                        .to_string(),
+                ),
+                None,
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let (_, v) = b.get().await;
+        conforme_au_schema("zone_response", &v).unwrap();
+        assert_eq!(v["delivery"]["route"], json!(voie), "{sortie} : {v}");
+        assert_eq!(
+            v["delivery"]["renderer_lpcm"],
+            json!(lpcm),
+            "{sortie} : {v}"
+        );
+        assert_eq!(
+            etape(&v, "crossfeed")["effective"],
+            json!(crossfeed),
+            "{sortie} : {v}"
+        );
+        if !crossfeed {
+            assert_eq!(
+                etape(&v, "crossfeed")["reason"],
+                json!("renderer_without_lpcm"),
+                "{v}"
+            );
+        }
+    }
+    // Contre-épreuve : une zone locale n'a pas de `delivery`.
+    let b = Banc::nouveau(true).await;
+    let (_, v) = b.get().await;
+    assert!(v.get("delivery").is_none(), "{v}");
+}
+
+/// T12b (relecture de suivi) — un `GET` d'état pendant qu'une LECTURE sonde
+/// un lecteur muet (elle garde le verrou de la sortie pendant la sonde SOAP) :
+/// la route n'attend ni la sonde ni le verrou, et répond en moins d'une
+/// seconde.
+#[tokio::test]
+async fn le_get_d_etat_n_attend_pas_la_sonde_d_une_lecture_t12b() {
+    let muet = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = muet.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        let mut tenues = Vec::new();
+        while let Ok((sock, _)) = muet.accept().await {
+            tenues.push(sock);
+        }
+    });
+    let appareil = "uuid:muet-t12b-route";
+    let b = Banc::avec_sortie(true, "dlna", appareil).await;
+    b.state
+        .outputs
+        .lock()
+        .await
+        .register(Box::new(tune_core::outputs::dlna::DlnaOutput::new(
+            "Lecteur muet".into(),
+            appareil.into(),
+            "127.0.0.1".into(),
+            format!("http://127.0.0.1:{port}/av"),
+            format!("http://127.0.0.1:{port}/rc"),
+            Some(format!("http://127.0.0.1:{port}/cm")),
+        )));
+    // La lecture en parallèle : sa sonde tient le verrou de la sortie.
+    let orch = b.state.orchestrator.clone();
+    let sonde = tokio::spawn(async move { orch.dlna_accepte_lpcm(appareil, false).await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !sonde.is_finished(),
+        "la sonde de lecture doit être en cours"
+    );
+    let t0 = std::time::Instant::now();
+    let (s, v) = tokio::time::timeout(std::time::Duration::from_secs(1), b.get())
+        .await
+        .expect("le GET d'état répond en moins d'une seconde");
+    assert!(t0.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(s, StatusCode::OK, "{v}");
+    conforme_au_schema("zone_response", &v).unwrap();
+    assert_eq!(v["delivery"]["renderer_lpcm"], json!("unknown"), "{v}");
+    sonde.abort();
+}

@@ -530,16 +530,26 @@ async fn serveur_de_flux(
 
 // ── Le banc ───────────────────────────────────────────────────────────────
 
-struct Mesure {
+pub(super) struct Mesure {
     debut: Instant,
     tidal: Arc<Mutex<JournalTidal>>,
     renderer: Arc<Mutex<JournalRenderer>>,
     /// Durée de `play()` jusqu'à son retour.
     play_rendu: Duration,
-    resultat: Result<super::PlayResult, String>,
+    pub(super) resultat: Result<super::PlayResult, String>,
 }
 
 async fn jouer(piste: Arc<PisteDash>, codec: &'static str) -> Mesure {
+    jouer_avec(piste, codec, |_, _| {}).await.0
+}
+
+/// TESS T12b — le même banc, la zone réglée par `regler` avant le `play()` ;
+/// rend aussi l'orchestrateur et la zone pour lire l'état servi.
+pub(super) async fn jouer_avec(
+    piste: Arc<PisteDash>,
+    codec: &'static str,
+    regler: impl FnOnce(&PlaybackOrchestrator, i64),
+) -> (Mesure, PlaybackOrchestrator, i64) {
     let ecoute_flux = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = ecoute_flux.local_addr().unwrap().port();
     let streamer = Arc::new(crate::http::streamer::AudioStreamer::new(port));
@@ -585,6 +595,7 @@ async fn jouer(piste: Arc<PisteDash>, codec: &'static str) -> Mesure {
     let zone_id = ZoneRepo::with_backend(orch.db.clone())
         .create("Salon 7266", Some("dlna"), Some(&appareil))
         .unwrap();
+    regler(&orch, zone_id);
 
     let req = PlayRequest {
         zone_id,
@@ -607,13 +618,17 @@ async fn jouer(piste: Arc<PisteDash>, codec: &'static str) -> Mesure {
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    Mesure {
-        debut,
-        tidal,
-        renderer,
-        play_rendu,
-        resultat,
-    }
+    (
+        Mesure {
+            debut,
+            tidal,
+            renderer,
+            play_rendu,
+            resultat,
+        },
+        orch,
+        zone_id,
+    )
 }
 
 fn depuis(debut: Instant, t: Option<Instant>) -> String {
