@@ -305,7 +305,9 @@ mod tests {
             1,
         )
         .unwrap();
-        assert!(p.gain_max_db <= 7.0, "{}", p.gain_max_db);
+        // Sur TOUTE la bande (0 Hz à Nyquist), pas seulement la grille.
+        let crete = fir::gain_crete_db(&p.coefficients);
+        assert!(crete <= 7.0, "{crete}");
         assert!(
             proposer_fir(
                 &r,

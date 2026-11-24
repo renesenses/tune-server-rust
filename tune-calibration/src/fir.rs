@@ -407,6 +407,17 @@ pub fn lissage_variable(
     }
 }
 
+/// Gain le plus haut (dB) d'un FIR `f64` sur TOUTE la bande, de 0 Hz à
+/// Nyquist : maximum du module sur une FFT à 4 fois la longueur au moins
+/// (puissance de deux).
+pub fn gain_crete_db(h: &[f64]) -> f64 {
+    let nfft = fft::next_pow2(h.len() * 4);
+    let crete = fft::rfft(h, nfft)
+        .iter()
+        .fold(0.0f64, |m, z| m.max(z.norm()));
+    fft::to_db(crete)
+}
+
 /// Module (dB) d'un FIR `f64` aux fréquences `freqs` : FFT fine (8 fois la
 /// longueur au moins), interpolation linéaire du module entre deux bins.
 pub fn reponse_fir_db(h: &[f64], cadence: u32, freqs: &[f64]) -> Vec<f64> {
@@ -676,12 +687,15 @@ fn concevoir(
         }
     }
 
-    // REFUS FINAL (sécurité des enceintes) : le gain RÉEL du filtre, sur
-    // toute la grille, ne dépasse jamais de plus de 1 dB le gain le plus haut
-    // demandé (lui-même borné par la relance). En phase mixte, la partie à
-    // phase minimale divise par le module de la partie fenêtrée : un creux
-    // de celle-ci demanderait une relance que la troncature ne compense plus.
-    let gain_reel_max = reel.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    // REFUS FINAL (sécurité des enceintes) : le gain RÉEL du filtre, de 0 Hz
+    // à Nyquist (FFT fine, pas la seule grille de mesure : le sous-grave
+    // fait travailler l'élongation du haut-parleur, une pointe étroite peut
+    // tomber entre deux points), ne dépasse jamais de plus de 1 dB le gain
+    // le plus haut demandé (lui-même borné par la relance). En phase mixte,
+    // la partie à phase minimale divise par le module de la partie
+    // fenêtrée : un creux de celle-ci demanderait une relance que la
+    // troncature ne compense plus.
+    let gain_reel_max = gain_crete_db(&h);
     if gain_reel_max > crete_voulue + MARGE_GAIN_DB {
         return Err(format!(
             "filtre refusé : gain réel de {gain_reel_max:+.1} dB pour {crete_voulue:+.1} dB demandés au plus (la correction de phase demande une relance que le filtre ne tient pas ; la désactiver ou allonger le pré-tintement)"
@@ -1048,5 +1062,68 @@ mod tests {
         creux[0] = -0.99999;
         let e = concevoir(fs, &m, None, &TargetCurve::flat(), &o, Some(creux)).unwrap_err();
         assert!(e.contains("filtre refusé"), "{e}");
+    }
+
+    /// Partie de phase neutre (impulsion centrée au rang `p`) moins une
+    /// fenêtre de Hann de même longueur, de somme 0,99999, modulée à `nyquist`
+    /// ou non : un creux de −100 dB À 0 Hz (sous le premier point de mesure,
+    /// 20 Hz) ou À Nyquist (au-dessus de 20 kHz), large d'environ 20 Hz.
+    fn phase_a_creux(p: usize, nyquist: bool) -> Vec<f64> {
+        let n = 2 * p + 1;
+        let hann: Vec<f64> = (0..n)
+            .map(|i| 0.5 - 0.5 * (2.0 * PI * (i as f64 + 1.0) / (n as f64 + 1.0)).cos())
+            .collect();
+        let somme: f64 = hann.iter().sum();
+        let mut e: Vec<f64> = hann
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                let signe = if nyquist && (i + p) % 2 == 1 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                -0.99999 * w / somme * signe
+            })
+            .collect();
+        e[p] += 1.0;
+        e
+    }
+
+    /// Le refus final regarde TOUTE la bande, pas la seule grille de mesure
+    /// (20 Hz–20 kHz) : un creux de la partie de phase placé sous 20 Hz, puis
+    /// au-dessus de 20 kHz, fait refuser le filtre. Contre-épreuve : la même
+    /// conception, avec une partie de phase sans creux, passe ; son gain sur
+    /// toute la bande reste à 1 dB de la crête demandée.
+    #[test]
+    fn un_creux_hors_de_la_grille_fait_aussi_refuser_le_filtre() {
+        let fs = 48_000;
+        let freqs = LogResponse::grid(20.0, 20_000.0, 48);
+        let m = LogResponse {
+            magnitude_db: vec![0.0; freqs.len()],
+            freqs,
+        };
+        let o = OptionsFir::default();
+        let p = 2_400;
+        let mut neutre = vec![0.0; 2 * p + 1];
+        neutre[p] = 1.0;
+        let ok = concevoir(fs, &m, None, &TargetCurve::flat(), &o, Some(neutre)).unwrap();
+        assert!(
+            gain_crete_db(&ok.coefficients) <= 1.0,
+            "{}",
+            gain_crete_db(&ok.coefficients)
+        );
+        for (nom, nyquist) in [("sous 20 Hz", false), ("au-dessus de 20 kHz", true)] {
+            let e = phase_a_creux(p, nyquist);
+            let r = concevoir(fs, &m, None, &TargetCurve::flat(), &o, Some(e));
+            match r {
+                Err(e) => assert!(e.contains("filtre refusé"), "{nom} : {e}"),
+                Ok(f) => panic!(
+                    "{nom} : filtre accepté, gain sur la grille {:.1} dB, sur toute la bande {:.1} dB",
+                    f.gain_max_db,
+                    gain_crete_db(&f.coefficients)
+                ),
+            }
+        }
     }
 }
