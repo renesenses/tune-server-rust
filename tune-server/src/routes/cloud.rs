@@ -456,6 +456,11 @@ enum AttentePkce {
 /// qu'une fois, même à deux retours simultanés), et le contrôle du compte
 /// obtenu, la session et `mozaik_user` s'écrivent d'un seul tenant : jamais le
 /// jeton d'un compte avec l'identité d'un autre.
+///
+/// #9475 : le retour du SERVEUR le garde aussi pendant le propriétaire et la
+/// licence, et la déliaison (`sso_disconnect_serveur`) le prend pour effacer
+/// compte et licence, après son appel au cloud. Ordre unique : ce verrou,
+/// puis l'état de licence, puis les services.
 static VERROU_DE_LIAISON: std::sync::LazyLock<tokio::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
 
@@ -572,6 +577,13 @@ async fn sso_callback(
     // PKCE : le navigateur qui revient de mozaiklabs.fr est celui qui a lancé
     // la liaison (cette machine, ou une session et son cookie).
     let par_le_reseau_local = garde.as_ref().is_ok_and(|g| g.par_le_reseau_local);
+    // Le profil de la session, s'il est AUTHENTIFIÉ : sans authentification,
+    // le profil `default` s'ouvre sans mot de passe, la session ne prouve rien
+    // pour la règle du propriétaire (voir `proprietaire::Relieur`).
+    let session_authentifiee = appelant
+        .as_ref()
+        .filter(|u| u.user_id > 0 && crate::auth::authentification_active(&state))
+        .map(|u| u.user_id);
     match liaison_autorisee(&state, garde, appelant) {
         Ok(Liaison::Serveur) => {}
         Ok(Liaison::Profil(profil)) => {
@@ -610,7 +622,7 @@ async fn sso_callback(
     // consume it — one-shot, cleared regardless of the exchange outcome. A
     // wrong `state` leaves it in place: it must not cancel a pending link.
     let (cle_pkce, _) = cles_d_attente(Liaison::Serveur);
-    // Tenu jusqu'à l'écriture de `mozaik_user` (voir `VERROU_DE_LIAISON`).
+    // Tenu jusqu'après les écritures de licence (voir `VERROU_DE_LIAISON`).
     let ronde = VERROU_DE_LIAISON.lock().await;
     let (pkce, lancee_du_reseau_local) =
         match prendre_l_attente_pkce(&settings, &cle_pkce, q.state.as_deref()) {
@@ -699,6 +711,16 @@ async fn sso_callback(
         return page_refus_hors_machine(&headers, crate::auth::refus_compte_deja_relie(&headers));
     }
 
+    // Qui relie, pour la règle du propriétaire — lu AVANT d'écrire la session :
+    // « un compte est-il relié » parle du compte précédent. La garde de cette
+    // route n'a laissé passer que l'administrateur, cette machine ou le réseau
+    // local ; seuls les deux premiers délient.
+    let relieur = tune_core::cloud::proprietaire::Relieur {
+        session_authentifiee,
+        peut_delier: !par_le_reseau_local,
+        compte_relie: compte_du_serveur_relie(&settings),
+    };
+
     // 🔴 AVANT d'écraser `mozaik_user`, et pas après.
     //
     // L'adoption reprend le compte DÉJÀ lié — celui d'une installation qui en
@@ -722,7 +744,11 @@ async fn sso_callback(
             &serde_json::to_string(&user).unwrap_or_default(),
         )
         .ok();
-    drop(ronde);
+    // `ronde` reste tenue jusqu'après les écritures de LICENCE plus bas : une
+    // déliaison (`sso_disconnect_serveur`, même verrou) ne peut plus
+    // s'intercaler entre l'identité et la licence, ce qui laisserait un
+    // propriétaire et ses modules sans aucun compte relié. Rien d'ici à la
+    // fin du bloc de licence n'appelle le réseau.
 
     // Liaison du serveur au compte (#5325), à chaque connexion : le cloud
     // délivre un jeton que `library_sync` présente sur chaque `sync`. En tâche
@@ -831,6 +857,13 @@ async fn sso_callback(
     // établit d'abord qui se connecte, on décide ensuite de ce qu'il a le
     // droit de changer. Le premier compte lié devient propriétaire — d'où
     // l'invariance sur une installation à un seul compte.
+    //
+    // Changer de compte relié (après une déliaison, ou par le propriétaire
+    // authentifié) fait suivre la propriété, AVANT de demander qui pilote :
+    // sans cela, le compte suivant n'écrivait jamais ses modules payants
+    // (`module_not_owned`) alors que les Réglages les montraient. Un autre
+    // profil ne s'empare jamais du serveur : voir `le_proprietaire_suit`.
+    tune_core::cloud::proprietaire::suivre_le_compte_relie(&settings, profile_id, relieur);
     let pilote = tune_core::cloud::proprietaire::revendiquer(&settings, profile_id);
 
     if pilote {
@@ -866,6 +899,8 @@ async fn sso_callback(
             "sso_licence_non_pilotee_par_ce_profil"
         );
     }
+    // Identité, propriétaire et licence sont écrits : la ronde est finie.
+    drop(ronde);
 
     // Le rôle de la session est celui du profil LOCAL, jamais celui du compte
     // mozaiklabs.fr : un administrateur local le reste, un profil créé ou
@@ -1160,6 +1195,11 @@ async fn sso_disconnect_serveur(state: &AppState) -> Json<Value> {
         Ok(false) => {}
         Err(e) => warn!(error = %e, "cloud_server_unlink_failed"),
     }
+    // Même verrou que les retours de liaison, pris APRÈS l'appel au cloud
+    // (aucun verrou tenu pendant le réseau) et dans le même ordre qu'eux
+    // (liaison, puis licence, puis services) : l'effacement du compte et de la
+    // licence ne s'intercale plus au milieu d'une liaison en cours.
+    let ronde = VERROU_DE_LIAISON.lock().await;
     for key in [
         "mozaik_access_token",
         "mozaik_refresh_token",
@@ -1181,6 +1221,7 @@ async fn sso_disconnect_serveur(state: &AppState) -> Json<Value> {
     // Founder endpoint order came from this account — revert to direct-first.
     state.license.set_qobuz_proxy_first(false).await;
     crate::background::apply_qobuz_proxy_first(&state.services, false).await;
+    drop(ronde);
     info!("sso_disconnected");
     Json(json!({ "connected": false }))
 }
@@ -3369,6 +3410,10 @@ mod cloud_garde_compte_tests;
 #[cfg(test)]
 #[path = "compte_reseau_local_tests.rs"]
 mod compte_reseau_local_tests;
+
+#[cfg(test)]
+#[path = "proprietaire_change_de_compte_tests.rs"]
+mod proprietaire_change_de_compte_tests;
 
 /// Rendez-vous de test : fait se croiser deux retours entre la LECTURE et
 /// l'EFFACEMENT d'une attente PKCE, pour prouver que `VERROU_DE_LIAISON` les
