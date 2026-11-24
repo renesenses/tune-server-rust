@@ -18,6 +18,9 @@ use crate::error::AppError;
 use crate::state::AppState;
 
 pub fn router() -> Router<AppState> {
+    // Au démarrage : les dépôts provisoires d'un import interrompu (arrêt
+    // brutal) ne restent pas dans `ir/`.
+    balayer_les_depots_provisoires(&dossier_ir());
     Router::new()
         .route("/profiles", get(list_profiles_handler))
         .route(
@@ -311,12 +314,14 @@ fn nom_de_depot(nom: Option<&str>) -> Option<String> {
 }
 
 /// Un seul import d'archive à la fois sur le serveur : la mémoire d'un import
-/// reste bornée par les plafonds de `import_ri`, pas multipliée.
-static IMPORTS: std::sync::LazyLock<tokio::sync::Semaphore> =
-    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(1));
+/// reste bornée par les plafonds de `import_ri`, pas multipliée. Pris DANS la
+/// tâche bloquante : un client qui abandonne sa requête ne libère rien avant
+/// la fin de l'import.
+static IMPORT_UNIQUE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Un verrou par zone pour toute écriture de son jeu de réponses (dépôt,
-/// import, retrait) : deux requêtes sur la même zone ne s'entrelacent pas.
+/// import, retrait, options) : deux requêtes sur la même zone ne
+/// s'entrelacent pas.
 fn verrou_de_zone(zone_id: i64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
     static VERROUS: std::sync::LazyLock<
         std::sync::Mutex<std::collections::HashMap<i64, std::sync::Arc<tokio::sync::Mutex<()>>>>,
@@ -327,11 +332,24 @@ fn verrou_de_zone(zone_id: i64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
         .unwrap_or_default()
 }
 
-/// Ce que la partie bloquante d'un import rend.
+/// Retire les dépôts provisoires (`depot_zone_*.tmp`) laissés dans `ir/`.
+fn balayer_les_depots_provisoires(ir_dir: &std::path::Path) {
+    let Ok(entrees) = std::fs::read_dir(ir_dir) else {
+        return;
+    };
+    for e in entrees.flatten() {
+        let nom = e.file_name();
+        let nom = nom.to_string_lossy();
+        if nom.starts_with("depot_zone_") && nom.ends_with(".tmp") {
+            std::fs::remove_file(e.path()).ok();
+        }
+    }
+}
+
+/// Ce qu'un import réussi rend.
 struct JeuPose {
     jeu: tune_core::audio::import_ri::JeuImporte,
     chemin_principal: String,
-    supplementaires: Vec<String>,
 }
 
 /// Refus d'un import, au format de l'API.
@@ -348,22 +366,33 @@ fn refus_d_import(raison: &str, detail: &str) -> axum::response::Response {
         .into_response()
 }
 
-/// La partie BLOQUANTE d'un import (décompression, décodage, écritures),
-/// hors du fil asynchrone. Ordre atomique : les nouveaux fichiers sont
-/// écrits sous des noms provisoires, puis renommés à leur place (un renommage
-/// remplace l'ancien fichier de même nom d'un coup), et SEULEMENT ensuite
-/// les fichiers de l'ancien jeu qui ne servent plus sont retirés. Un échec
-/// avant les renommages ne laisse que l'ancien jeu ; les provisoires sont
-/// nettoyés.
-fn poser_le_jeu(
+fn erreur_d_ecriture(e: impl std::fmt::Display) -> axum::response::Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        Json(json!({"error": format!("write IR: {e}")})),
+    )
+        .into_response()
+}
+
+/// L'import entier, BLOQUANT (décompression, décodage, fichiers, réglages),
+/// sous le verrou global d'import et celui de la zone.
+///
+/// Ordre : (1) nouveaux fichiers écrits en provisoire ; (2) les fichiers en
+/// place de même nom mis de côté, puis les nouveaux renommés à leur place —
+/// au moindre échec, tout est remis comme avant ; (3) les RÉGLAGES écrits ;
+/// (4) seulement alors, l'ancien jeu qui ne sert plus et les copies de côté
+/// retirés. Un arrêt brutal ne laisse que des `depot_zone_*.tmp`, balayés au
+/// démarrage.
+fn importer_bloquant(
     corps: &[u8],
-    nom: &str,
+    nom: Option<String>,
     ir_dir: &std::path::Path,
     zone_id: i64,
-    anciens: Vec<String>,
+    settings: &SettingsRepo,
 ) -> Result<JeuPose, axum::response::Response> {
     use tune_core::audio::import_ri;
-    let jeu = import_ri::importer(corps, nom).map_err(|refus| {
+    let nom_lu = nom.clone().unwrap_or_else(|| "filtre.wav".into());
+    let jeu = import_ri::importer(corps, &nom_lu).map_err(|refus| {
         tracing::warn!(zone_id, raison = refus.raison, detail = %refus.detail, "convolver_import_refuse");
         refus_d_import(refus.raison, &refus.detail)
     })?;
@@ -371,15 +400,23 @@ fn poser_le_jeu(
         .indice_principal()
         .ok_or_else(|| refus_d_import("no_filter", "no impulse response in the upload"))?;
     std::fs::create_dir_all(ir_dir).ok();
-    let erreur_ecriture = |e: String| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error": format!("write IR: {e}")})),
-        )
-            .into_response()
-    };
-    // 1. Écrire en provisoire.
+    let mut anciens =
+        tune_core::audio::convolver::JeuDeZone::lire_supplementaires(settings, zone_id);
+    if let Some(p) = settings
+        .get(&format!("ir_path_{zone_id}"))
+        .ok()
+        .flatten()
+        .filter(|p| !p.is_empty())
+    {
+        anciens.push(p);
+    }
+    // (1) Provisoires.
     let mut poses: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    let nettoyer = |poses: &[(std::path::PathBuf, std::path::PathBuf)]| {
+        for (p, _) in poses {
+            std::fs::remove_file(p).ok();
+        }
+    };
     for (i, r) in jeu.reponses.iter().enumerate() {
         let provisoire = chemin_provisoire(ir_dir, zone_id);
         let final_ = if i == principal {
@@ -393,36 +430,70 @@ fn poser_le_jeu(
             r.sample_rate,
         ) {
             std::fs::remove_file(&provisoire).ok();
-            for (p, _) in &poses {
-                std::fs::remove_file(p).ok();
-            }
-            return Err(erreur_ecriture(e));
+            nettoyer(&poses);
+            return Err(erreur_d_ecriture(e));
         }
         poses.push((provisoire, final_));
     }
-    // 2. Renommer à leur place.
-    for (n, (provisoire, final_)) in poses.iter().enumerate() {
-        if let Err(e) = std::fs::rename(provisoire, final_) {
-            for (p, _) in &poses[n..] {
-                std::fs::remove_file(p).ok();
+    // (2) Mise de côté puis mise en place, avec retour arrière.
+    let mut de_cote: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
+    let mut en_place: Vec<std::path::PathBuf> = Vec::new();
+    let mut echec = None;
+    for (provisoire, final_) in &poses {
+        if final_.exists() {
+            let cote = chemin_provisoire(ir_dir, zone_id);
+            if let Err(e) = std::fs::rename(final_, &cote) {
+                echec = Some(e);
+                break;
             }
-            return Err(erreur_ecriture(e.to_string()));
+            de_cote.push((cote, final_.clone()));
+        }
+        if let Err(e) = std::fs::rename(provisoire, final_) {
+            echec = Some(e);
+            break;
+        }
+        en_place.push(final_.clone());
+    }
+    if let Some(e) = echec {
+        for f in &en_place {
+            std::fs::remove_file(f).ok();
+        }
+        for (cote, final_) in &de_cote {
+            std::fs::rename(cote, final_).ok();
+        }
+        nettoyer(&poses);
+        return Err(erreur_d_ecriture(e));
+    }
+    let chemins: Vec<String> = poses
+        .iter()
+        .map(|(_, f)| f.to_str().unwrap_or("").to_string())
+        .collect();
+    let chemin_principal = chemins[principal].clone();
+    let supplementaires: Vec<String> = chemins
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != principal)
+        .map(|(_, c)| c.clone())
+        .collect();
+    // (3) Réglages.
+    settings
+        .set(&format!("ir_path_{zone_id}"), &chemin_principal)
+        .ok();
+    ecrire_supplementaires(settings, zone_id, &supplementaires);
+    match &nom {
+        Some(n) => {
+            settings.set(&format!("{CLE_NOM_DU_JEU}{zone_id}"), n).ok();
+        }
+        None => {
+            settings.delete(&format!("{CLE_NOM_DU_JEU}{zone_id}")).ok();
         }
     }
-    let mut supplementaires = Vec::new();
-    let mut chemin_principal = String::new();
-    for (i, (_, final_)) in poses.iter().enumerate() {
-        let c = final_.to_str().unwrap_or("").to_string();
-        if i == principal {
-            chemin_principal = c;
-        } else {
-            supplementaires.push(c);
-        }
+    // (4) L'ancien jeu qui ne sert plus, et les copies de côté.
+    for (cote, _) in &de_cote {
+        std::fs::remove_file(cote).ok();
     }
-    // 3. Retirer ce qui reste de l'ancien jeu (seulement les fichiers que
-    //    Tune a rangés pour CETTE zone, et qui ne sont pas dans le nouveau).
     for p in anciens {
-        if p == chemin_principal || supplementaires.contains(&p) {
+        if chemins.contains(&p) {
             continue;
         }
         let chemin = std::path::Path::new(&p);
@@ -438,7 +509,6 @@ fn poser_le_jeu(
     Ok(JeuPose {
         jeu,
         chemin_principal,
-        supplementaires,
     })
 }
 
@@ -455,35 +525,23 @@ async fn importer_le_jeu(
     body: axum::body::Bytes,
     nom: Option<&str>,
 ) -> axum::response::Response {
-    let Ok(_jeton) = IMPORTS.acquire().await else {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(json!({"error": "import unavailable"})),
-        )
-            .into_response();
-    };
     let nom = nom_de_depot(nom);
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    let mut anciens =
-        tune_core::audio::convolver::JeuDeZone::lire_supplementaires(&settings, zone_id);
-    if let Some(p) = settings
-        .get(&format!("ir_path_{zone_id}"))
-        .ok()
-        .flatten()
-        .filter(|p| !p.is_empty())
-    {
-        anciens.push(p);
-    }
     let ir_dir = dossier_ir();
-    let nom_lu = nom.clone().unwrap_or_else(|| "filtre.wav".into());
+    let backend = state.backend.clone();
+    let verrou = verrou_de_zone(zone_id);
+    let nom_tache = nom.clone();
+    // Tout l'import, verrous compris, dans la tâche bloquante : abandonner la
+    // requête n'interrompt ni ne déverrouille rien en cours de route.
     let pose = tokio::task::spawn_blocking(move || {
-        poser_le_jeu(&body, &nom_lu, &ir_dir, zone_id, anciens)
+        let _import = IMPORT_UNIQUE.lock().unwrap_or_else(|e| e.into_inner());
+        let _zone = verrou.blocking_lock_owned();
+        let settings = SettingsRepo::with_backend(backend);
+        importer_bloquant(&body, nom_tache, &ir_dir, zone_id, &settings)
     })
     .await;
     let JeuPose {
         jeu,
         chemin_principal,
-        supplementaires,
     } = match pose {
         Ok(Ok(p)) => p,
         Ok(Err(reponse)) => return reponse,
@@ -495,18 +553,7 @@ async fn importer_le_jeu(
                 .into_response();
         }
     };
-    settings
-        .set(&format!("ir_path_{zone_id}"), &chemin_principal)
-        .ok();
-    ecrire_supplementaires(&settings, zone_id, &supplementaires);
-    match &nom {
-        Some(n) => {
-            settings.set(&format!("{CLE_NOM_DU_JEU}{zone_id}"), n).ok();
-        }
-        None => {
-            settings.delete(&format!("{CLE_NOM_DU_JEU}{zone_id}")).ok();
-        }
-    }
+    let settings = SettingsRepo::with_backend(state.backend.clone());
     let avertissement = installer_le_jeu_local(state, zone_id, device_id)
         .await
         .err();
@@ -766,8 +813,6 @@ async fn upload_ir_handler(
     {
         return resp;
     }
-    let verrou = verrou_de_zone(zone_id);
-    let _zone_verrouillee = verrou.lock().await;
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     let zone = match zone_repo.get(zone_id) {
         Ok(Some(z)) => z,
@@ -799,6 +844,10 @@ async fn upload_ir_handler(
         )
         .await;
     }
+    // Les autres dépôts : verrou de la zone (l'import le prend lui-même, dans
+    // sa tâche bloquante).
+    let verrou = verrou_de_zone(zone_id);
+    let _zone_verrouillee = verrou.lock().await;
 
     if vrai(canal.per_rate.as_deref()) && canal.channel.as_deref().is_none_or(str::is_empty) {
         return ajouter_au_jeu(&state, zone_id, &device_id, is_local, &body).await;
@@ -945,9 +994,15 @@ struct CadenceARetirer {
 /// devient le principal.
 async fn clear_ir_handler(
     State(state): State<AppState>,
+    _admin: crate::auth::RequireAdmin,
     Path(zone_id): Path<i64>,
     Query(cible): Query<CadenceARetirer>,
 ) -> impl IntoResponse {
+    if let Err(resp) =
+        crate::premium_guard::require_premium(&state.license, Feature::RoomCorrection).await
+    {
+        return resp;
+    }
     let verrou = verrou_de_zone(zone_id);
     let _zone_verrouillee = verrou.lock().await;
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
@@ -1037,8 +1092,17 @@ async fn clear_ir_handler(
     for p in &supplementaires {
         effacer(p);
     }
-    for sr in tune_core::audio::convolver::par_cadence::CADENCES_USUELLES {
-        std::fs::remove_file(ir_dir.join(format!("zone_{zone_id}_sr{sr}.wav"))).ok();
+    // Tous les fichiers par cadence de la zone, quelle que soit leur cadence.
+    if let Ok(entrees) = std::fs::read_dir(&ir_dir) {
+        for e in entrees.flatten() {
+            let nom = e.file_name();
+            let nom = nom.to_string_lossy();
+            if nom.contains("_sr")
+                && tune_core::audio::convolver::par_cadence::nom_du_jeu_valide(&nom, Some(zone_id))
+            {
+                std::fs::remove_file(e.path()).ok();
+            }
+        }
     }
     ecrire_supplementaires(&settings, zone_id, &[]);
 
@@ -1060,9 +1124,17 @@ struct OptionsDeConvolution {
 /// correction, comme avant #8761) ; `true` le retablit.
 async fn ir_options_handler(
     State(state): State<AppState>,
+    _admin: crate::auth::RequireAdmin,
     Path(zone_id): Path<i64>,
     Json(options): Json<OptionsDeConvolution>,
 ) -> impl IntoResponse {
+    if let Err(resp) =
+        crate::premium_guard::require_premium(&state.license, Feature::RoomCorrection).await
+    {
+        return resp;
+    }
+    let verrou = verrou_de_zone(zone_id);
+    let _zone_verrouillee = verrou.lock().await;
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     let Ok(Some(zone)) = zone_repo.get(zone_id) else {
         return (

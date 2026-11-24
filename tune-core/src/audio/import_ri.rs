@@ -67,6 +67,13 @@ pub const TOTAL_MAX_OCTETS: u64 = 48 << 20;
 /// refusée (au-dessus de 1 Mio décompressé). Mesuré sur les octets lus et sur
 /// la longueur du dépôt, jamais sur les tailles que l'archive annonce.
 pub const RAPPORT_MAX: u64 = 100;
+/// Réponses au plus dans un jeu (une par cadence).
+pub const REPONSES_MAX: usize = par_cadence::CADENCES_USUELLES.len() + 2;
+/// Somme canaux × prises au plus pour TOUT le jeu (16 Mi échantillons, 64 Mio
+/// en `f32`) : borne la mémoire décodée, quel que soit le nombre de chemins
+/// d'un `.cfg`.
+pub const ECHANTILLONS_MAX: usize = 1 << 24;
+
 /// Taille maximale d'un `.cfg`.
 const CFG_MAX_OCTETS: u64 = 64 << 10;
 
@@ -321,6 +328,12 @@ pub fn importer_archive(octets: &[u8]) -> Result<JeuImporte, RefusImport> {
             "l'archive ne contient aucune réponse impulsionnelle utilisable",
         ));
     }
+    if jeu.reponses.len() > REPONSES_MAX {
+        return Err(RefusImport::new(
+            "too_many_entries",
+            format!("{} réponses (au plus {REPONSES_MAX})", jeu.reponses.len()),
+        ));
+    }
     jeu.reponses.sort_by_key(|r| r.sample_rate);
     Ok(jeu)
 }
@@ -352,16 +365,37 @@ fn cote_du_nom(chemin: &str) -> Option<usize> {
     cote
 }
 
+/// Retire `n` échantillons du budget du jeu ([`ECHANTILLONS_MAX`]), ou refuse.
+fn consommer(budget: &mut usize, n: usize, nom: &str) -> Result<(), RefusImport> {
+    if n > *budget {
+        return Err(RefusImport::new(
+            "too_large",
+            format!("{nom} : le jeu dépasse {ECHANTILLONS_MAX} échantillons"),
+        ));
+    }
+    *budget -= n;
+    Ok(())
+}
+
+/// Le nombre d'échantillons (canaux × prises) d'une réponse.
+fn echantillons(taps: &[Vec<f32>]) -> usize {
+    taps.len() * taps.iter().map(Vec::len).max().unwrap_or(0)
+}
+
 fn importer_wav(entrees: &BTreeMap<String, Vec<u8>>) -> Result<JeuImporte, RefusImport> {
     let mut jeu = JeuImporte::default();
     // Par cadence : les fichiers lus.
     let mut par_cadence: BTreeMap<u32, Vec<(String, Vec<Vec<f32>>)>> = BTreeMap::new();
+    let mut budget = ECHANTILLONS_MAX;
     for (chemin, octets) in entrees {
         match lire_wav(octets, chemin) {
-            Ok((taps, sr)) => par_cadence
-                .entry(sr)
-                .or_default()
-                .push((chemin.clone(), taps)),
+            Ok((taps, sr)) => {
+                consommer(&mut budget, echantillons(&taps), chemin)?;
+                par_cadence
+                    .entry(sr)
+                    .or_default()
+                    .push((chemin.clone(), taps));
+            }
             Err(e) => jeu.ecartes.push((chemin.clone(), e.detail)),
         }
     }
@@ -386,8 +420,8 @@ fn importer_wav(entrees: &BTreeMap<String, Vec<u8>>) -> Result<JeuImporte, Refus
                     fichiers.swap(0, 1);
                 }
                 let nom = format!("{} + {}", fichiers[0].0, fichiers[1].0);
-                let mut g = fichiers[0].1[0].clone();
-                let mut d = fichiers[1].1[0].clone();
+                let mut d = std::mem::take(&mut fichiers[1].1[0]);
+                let mut g = std::mem::take(&mut fichiers[0].1[0]);
                 let n = g.len().max(d.len());
                 g.resize(n, 0.0);
                 d.resize(n, 0.0);
@@ -460,11 +494,17 @@ fn retards_cfg(ligne: &str, n: usize, nom: &str) -> Result<Vec<f64>, RefusImport
 }
 
 /// Lire un `.cfg` Convolver et bâtir sa réponse multicanal.
+/// Les `.wav` d'une archive `.cfg`, décodés UNE fois chacun (plusieurs
+/// chemins citent souvent le même fichier), sous le budget du jeu.
+type Decodes = BTreeMap<String, (Vec<Vec<f32>>, u32)>;
+
 fn lire_cfg(
     nom: &str,
     texte: &str,
     entrees: &BTreeMap<String, Vec<u8>>,
     utilises: &mut Vec<String>,
+    decodes: &mut Decodes,
+    budget: &mut usize,
 ) -> Result<RiImportee, RefusImport> {
     let lignes: Vec<&str> = texte
         .lines()
@@ -490,8 +530,12 @@ fn lire_cfg(
     };
     let sr = u32::try_from(lire(0)?).unwrap_or(0);
     let (n_in, n_out) = (lire(1)? as usize, lire(2)? as usize);
-    par_cadence::cadence_admise(sr)
-        .map_err(|e| RefusImport::new("invalid_cfg", format!("{nom} : {e}")))?;
+    if !par_cadence::CADENCES_USUELLES.contains(&sr) {
+        return Err(RefusImport::new(
+            "invalid_cfg",
+            format!("{nom} : cadence de {sr} Hz (cadences admises : 44,1 à 192 kHz)"),
+        ));
+    }
     if n_in == 0 || n_out == 0 || n_in > par_cadence::CANAUX_MAX || n_out > par_cadence::CANAUX_MAX
     {
         return Err(RefusImport::new(
@@ -570,7 +614,13 @@ fn lire_cfg(
                 format!("{nom} : fichier « {} » absent de l'archive", c.fichier),
             )
         })?;
-        let (taps, sr_fichier) = lire_wav(octets, &c.fichier)?;
+        if !decodes.contains_key(&cle) {
+            let (taps, sr_fichier) = lire_wav(octets, &c.fichier)?;
+            consommer(budget, echantillons(&taps), nom)?;
+            decodes.insert(cle.clone(), (taps, sr_fichier));
+        }
+        let (taps, sr_fichier) = &decodes[&cle];
+        let sr_fichier = *sr_fichier;
         if sr_fichier != sr {
             return Err(RefusImport::new(
                 "invalid_cfg",
@@ -591,7 +641,21 @@ fn lire_cfg(
         })?;
         let ms = retard_entree[sortie] + retard_sortie[sortie];
         let decalage = (ms * f64::from(sr) / 1000.0).round() as usize;
-        let mut r = vec![0.0f32; decalage];
+        // Retard et longueur contrôlés AVANT l'allocation.
+        let longueur = decalage.saturating_add(canal.len());
+        if longueur > par_cadence::PRISES_MAX {
+            return Err(RefusImport::new(
+                "invalid_cfg",
+                format!(
+                    "{nom} : retard de {ms} ms et {} prises : au-delà de {} prises",
+                    canal.len(),
+                    par_cadence::PRISES_MAX
+                ),
+            ));
+        }
+        consommer(budget, longueur, nom)?;
+        let mut r = Vec::with_capacity(longueur);
+        r.resize(decalage, 0.0f32);
         r.extend_from_slice(canal);
         par_sortie[sortie] = Some(r);
         if !utilises.contains(&cle) {
@@ -608,6 +672,8 @@ fn lire_cfg(
         })?);
     }
     let n = taps.iter().map(Vec::len).max().unwrap_or(0);
+    let complement: usize = taps.iter().map(|t| n - t.len()).sum();
+    consommer(budget, complement, nom)?;
     for t in &mut taps {
         t.resize(n, 0.0);
     }
@@ -624,9 +690,25 @@ fn lire_cfg(
 fn importer_cfg(entrees: &BTreeMap<String, Vec<u8>>) -> Result<JeuImporte, RefusImport> {
     let mut jeu = JeuImporte::default();
     let mut utilises = Vec::new();
+    let cfgs = entrees.keys().filter(|k| extension(k) == "cfg").count();
+    if cfgs > REPONSES_MAX {
+        return Err(RefusImport::new(
+            "too_many_entries",
+            format!("{cfgs} fichiers .cfg (au plus {REPONSES_MAX})"),
+        ));
+    }
+    let mut decodes = Decodes::new();
+    let mut budget = ECHANTILLONS_MAX;
     for (nom, octets) in entrees.iter().filter(|(k, _)| extension(k) == "cfg") {
         let texte = String::from_utf8_lossy(octets);
-        let ri = lire_cfg(nom, &texte, entrees, &mut utilises)?;
+        let ri = lire_cfg(
+            nom,
+            &texte,
+            entrees,
+            &mut utilises,
+            &mut decodes,
+            &mut budget,
+        )?;
         if let Some(autre) = jeu
             .reponses
             .iter()

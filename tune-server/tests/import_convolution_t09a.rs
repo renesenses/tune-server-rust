@@ -80,6 +80,30 @@ async fn appel(
     )
 }
 
+async fn appel_json(
+    app: &axum::Router,
+    jeton: &str,
+    chemin: &str,
+    corps: Vec<u8>,
+) -> (StatusCode, Value) {
+    let req = Request::builder()
+        .method("POST")
+        .uri(chemin)
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {jeton}"))
+        .body(Body::from(corps))
+        .unwrap();
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    let octets = axum::body::to_bytes(resp.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&octets).unwrap_or(json!(null)),
+    )
+}
+
 #[tokio::test]
 async fn un_zip_remplace_le_jeu_et_un_zip_piege_est_refuse_sans_rien_toucher() {
     let racine = tune_core::test_scratch::scratch_dir("tune-t09a-import");
@@ -115,6 +139,30 @@ async fn un_zip_remplace_le_jeu_et_un_zip_piege_est_refuse_sans_rien_toucher() {
         !dossier.join("ir").exists(),
         "rien n'est écrit sans les droits"
     );
+    // Les routes de retrait et d'options ont les mêmes gardes.
+    for (route, corps) in [
+        (
+            format!("/api/v1/room-correction/ir/clear/{zone}"),
+            Vec::new(),
+        ),
+        (
+            format!("/api/v1/room-correction/ir/options/{zone}"),
+            br#"{"resample":false}"#.to_vec(),
+        ),
+    ] {
+        let (status, _) = appel_json(&app, &utilisateur, &route, corps.clone()).await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "{route} : profil non administrateur"
+        );
+        let (status, _) = appel_json(&app, &admin, &route, corps).await;
+        assert_eq!(
+            status,
+            StatusCode::PAYMENT_REQUIRED,
+            "{route} : compte sans Premium"
+        );
+    }
     state.license.set_account_premium(true, None).await;
     let (status, corps) = appel(&app, &admin, "POST", &route, z).await;
     assert_eq!(status, StatusCode::OK, "{corps}");
@@ -177,6 +225,26 @@ async fn un_zip_remplace_le_jeu_et_un_zip_piege_est_refuse_sans_rien_toucher() {
         "le jeu en place est intact"
     );
     assert_eq!(apres["set_name"], "living-room.zip");
+
+    // « Effacer » retire TOUS les fichiers par cadence de la zone, même à une
+    // cadence inusuelle déposée hors du jeu.
+    let ir = dossier.join("ir");
+    std::fs::write(ir.join(format!("zone_{zone}_sr32000.wav")), b"x").unwrap();
+    let (status, _) = appel_json(
+        &app,
+        &admin,
+        &format!("/api/v1/room-correction/ir/clear/{zone}"),
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let restants: Vec<String> = std::fs::read_dir(&ir)
+        .unwrap()
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(&format!("zone_{zone}")))
+        .collect();
+    assert!(restants.is_empty(), "restent : {restants:?}");
 
     drop(racine);
 }

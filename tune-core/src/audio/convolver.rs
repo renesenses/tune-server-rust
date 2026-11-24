@@ -443,6 +443,17 @@ impl Convolver {
             ));
         }
 
+        // Format refusé AVANT de réserver les canaux décodés.
+        if !matches!(
+            (bits, is_float),
+            (16, false) | (24, false) | (32, false) | (32, true) | (64, true)
+        ) {
+            return Err(format!(
+                "unsupported WAV sample format: {bits}-bit {}",
+                if is_float { "float" } else { "int" }
+            ));
+        }
+
         tracing::info!(
             path,
             channels,

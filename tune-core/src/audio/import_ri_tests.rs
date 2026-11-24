@@ -428,3 +428,94 @@ fn un_wav_dont_l_en_tete_ment() {
     let e = importer(&wav(&[longues], 48_000, 32), "c.wav").unwrap_err();
     assert_eq!(e.raison, "bad_wav", "{e}");
 }
+
+// ---------------------------------------------------------------------------
+// Relecture de suivi de #9451 : mémoire du mode `.cfg`
+// ---------------------------------------------------------------------------
+
+/// Un bruit déterministe (peu compressible), `n` prises.
+fn bruit(n: usize) -> Vec<f32> {
+    let mut x = 0x2545_f491_u32;
+    (0..n)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            (x as f32 / u32::MAX as f32 - 0.5) * 0.01
+        })
+        .collect()
+}
+
+/// Un `.cfg` à `canaux` entrées et sorties, chaque chemin citant le même
+/// fichier `ri.wav` (canal 0).
+fn cfg_diagonal(sr: u32, canaux: usize, retard_ms: &str) -> String {
+    let zeros = vec!["0"; canaux].join(" ");
+    let retards = vec![retard_ms; canaux].join(" ");
+    let mut t = format!("{sr} {canaux} {canaux} 0\n{retards}\n{zeros}\n");
+    for c in 0..canaux {
+        t.push_str(&format!("ri.wav\n0\n{c}.0\n{c}.0\n"));
+    }
+    t
+}
+
+#[test]
+fn un_cfg_qui_multiplie_un_meme_fichier_depasse_le_budget_du_jeu() {
+    // 32 sorties × 600 000 prises = 19,2 M échantillons, au-delà du budget
+    // du jeu, depuis UN seul fichier de 2,4 Mo.
+    let z = archive(&[
+        ("a.cfg", cfg_diagonal(48_000, 32, "0").into_bytes()),
+        ("ri.wav", wav(&[bruit(600_000)], 48_000, 32)),
+    ]);
+    let e = importer(&z, "x.zip").unwrap_err();
+    assert_eq!(e.raison, "too_large", "{e}");
+    // Contre-épreuve : 8 sorties tiennent dans le budget.
+    let z = archive(&[
+        ("a.cfg", cfg_diagonal(48_000, 8, "0").into_bytes()),
+        ("ri.wav", wav(&[bruit(600_000)], 48_000, 32)),
+    ]);
+    let j = importer(&z, "x.zip").unwrap();
+    assert_eq!(j.reponses[0].taps.len(), 8);
+}
+
+#[test]
+fn un_retard_qui_depasse_les_prises_admises_est_refuse_avant_allocation() {
+    let n = par_cadence::PRISES_MAX - 1_000;
+    let z = archive(&[
+        ("a.cfg", cfg_diagonal(48_000, 1, "1000").into_bytes()),
+        ("ri.wav", wav(&[bruit(n)], 48_000, 32)),
+    ]);
+    assert_eq!(importer(&z, "x.zip").unwrap_err().raison, "invalid_cfg");
+}
+
+#[test]
+fn un_cfg_a_une_cadence_inusuelle_est_refuse() {
+    let z = archive(&[
+        ("a.cfg", cfg_diagonal(32_000, 1, "0").into_bytes()),
+        ("ri.wav", wav(&[ri(8, 0.5)], 32_000, 32)),
+    ]);
+    assert_eq!(importer(&z, "x.zip").unwrap_err().raison, "invalid_cfg");
+}
+
+#[test]
+fn trop_de_cfg_sont_refuses() {
+    let fichiers: Vec<(String, Vec<u8>)> = (0..REPONSES_MAX + 1)
+        .map(|i| {
+            (
+                format!("f{i}.cfg"),
+                cfg_diagonal(48_000, 1, "0").into_bytes(),
+            )
+        })
+        .chain(std::iter::once((
+            "ri.wav".to_string(),
+            wav(&[ri(8, 0.5)], 48_000, 32),
+        )))
+        .collect();
+    let refs: Vec<(&str, Vec<u8>)> = fichiers
+        .iter()
+        .map(|(n, c)| (n.as_str(), c.clone()))
+        .collect();
+    assert_eq!(
+        importer(&archive(&refs), "x.zip").unwrap_err().raison,
+        "too_many_entries"
+    );
+}
