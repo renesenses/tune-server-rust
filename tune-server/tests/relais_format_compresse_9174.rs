@@ -163,3 +163,94 @@ async fn sans_authentification_rien_n_est_note() {
     assert!(!s.is_success(), "sans jeton, refusé : {s}");
     assert!(!state.orchestrator.zone_tiree_a_distance(zone));
 }
+
+/// #9174 (suite) — la première piste : une commande relayée qui prépare une
+/// piste met la zone à distance AVANT son gestionnaire, celui qui choisit le
+/// format. Un gestionnaire témoin, derrière la vraie couche, relève ce que
+/// l'orchestrateur sait au moment où il est appelé.
+#[tokio::test]
+async fn une_commande_relayee_note_la_zone_avant_de_preparer_la_piste() {
+    use std::sync::{Arc, Mutex};
+
+    use axum::extract::State;
+    use axum::routing::post;
+
+    let (state, zone) = etat();
+    let vu: Arc<Mutex<Vec<bool>>> = Arc::default();
+    let releve = vu.clone();
+    let preparer = move |State(s): State<AppState>| {
+        let releve = releve.clone();
+        async move {
+            releve
+                .lock()
+                .unwrap()
+                .push(s.orchestrator.zone_tiree_a_distance(zone));
+            StatusCode::OK
+        }
+    };
+    let app: Router = Router::new()
+        .route("/{id}/play", post(preparer.clone()))
+        .route("/{id}/browser-next", post(preparer))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            tune_server::provenance_navigateur_9174::noter_la_provenance,
+        ))
+        .with_state(state.clone());
+
+    // Locale (télécommande du salon) : rien n'est noté.
+    appel(&app, Method::POST, &format!("/{zone}/play"), false, "{}").await;
+    // Relayée : notée AVANT le gestionnaire.
+    appel(&app, Method::POST, &format!("/{zone}/play"), true, "{}").await;
+    assert_eq!(*vu.lock().unwrap(), vec![false, true]);
+
+    // `browser-next` relayé après plus de 30 s de silence : même règle.
+    state.orchestrator.noter_provenance_de_zone(zone, false);
+    appel(
+        &app,
+        Method::POST,
+        &format!("/{zone}/browser-next"),
+        true,
+        SIGNAL,
+    )
+    .await;
+    assert_eq!(*vu.lock().unwrap(), vec![false, true, true]);
+}
+
+/// Par le vrai routeur : un `play` relayé sur une zone navigateur la met à
+/// distance (même si la file vide le fait échouer) ; sur une zone réseau,
+/// rien.
+#[tokio::test]
+async fn un_play_relaye_met_la_zone_navigateur_a_distance() {
+    let (state, zone) = etat();
+    let dlna = ZoneRepo::with_backend(state.backend.clone())
+        .create("Salon", Some("dlna"), Some("uuid:salon"))
+        .unwrap();
+    let app = tune_server::routes::router(state.clone());
+    appel(
+        &app,
+        Method::POST,
+        &format!("/api/v1/zones/{zone}/play"),
+        false,
+        "{}",
+    )
+    .await;
+    assert!(!state.orchestrator.zone_tiree_a_distance(zone));
+    appel(
+        &app,
+        Method::POST,
+        &format!("/api/v1/zones/{zone}/play"),
+        true,
+        "{}",
+    )
+    .await;
+    assert!(state.orchestrator.zone_tiree_a_distance(zone));
+    appel(
+        &app,
+        Method::POST,
+        &format!("/api/v1/zones/{dlna}/play"),
+        true,
+        "{}",
+    )
+    .await;
+    assert!(!state.orchestrator.zone_tiree_a_distance(dlna));
+}

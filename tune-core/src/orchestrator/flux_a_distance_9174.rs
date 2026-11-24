@@ -15,7 +15,9 @@
 //! dit d'où il écoute.
 //!
 //! Règle : seul le LECTEUR de la zone compte, c'est-à-dire ses `POST
-//! …/browser-*` (signal de lecture, suivante préparée, erreur média), après
+//! …/browser-*` (signal de lecture, suivante préparée, erreur média), plus
+//! une commande RELAYÉE qui prépare une piste ([`commande_relayee_qui_prepare`],
+//! notée AVANT la préparation), après
 //! authentification, réussis (2xx), sur une zone qui existe et qui est une
 //! zone navigateur (`garde` côté serveur, `provenance_navigateur_9174`) :
 //! - relayé : la zone est tirée à distance, pour [`DELAI_A_DISTANCE`] ;
@@ -61,6 +63,30 @@ pub fn provenance_d_une_requete_de_zone(
     let (id, suite) = reste.split_once('/')?;
     let zone: i64 = id.parse().ok()?;
     suite.starts_with("browser-").then_some((zone, relayee))
+}
+
+/// #9174 (suite) — une commande RELAYÉE qui prépare une piste sur cette zone
+/// (`play`, `next`, `previous`, `queue/jump`, `browser-next`) : la zone est
+/// notée à distance AVANT que la piste ne soit préparée. Sans cela, la
+/// première piste en 5G partait en WAV : le lecteur ne signale sa lecture
+/// (`browser-playing`) qu'une fois cette piste lancée, et `browser-next`
+/// n'était noté qu'après sa réponse, donc après la préparation. Locale, une
+/// telle commande ne dit rien (une télécommande du salon) : `None`.
+pub fn commande_relayee_qui_prepare(methode: &str, chemin: &str, relayee: bool) -> Option<i64> {
+    if !relayee || !methode.eq_ignore_ascii_case("POST") {
+        return None;
+    }
+    let reste = chemin
+        .strip_prefix("/api/v1/zones")
+        .unwrap_or(chemin)
+        .strip_prefix('/')?;
+    let (id, suite) = reste.split_once('/')?;
+    let zone: i64 = id.parse().ok()?;
+    matches!(
+        suite,
+        "play" | "next" | "previous" | "queue/jump" | "browser-next"
+    )
+    .then_some(zone)
 }
 
 /// Les zones tirées à distance et l'instant de leur dernier signal relayé.
