@@ -958,10 +958,39 @@ pub(super) async fn play_episode(
     }
     let title = body.title.as_deref().unwrap_or("Podcast Episode");
     let podcast_name = body.podcast_name.as_deref().unwrap_or("Podcast");
+    let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
+        .get(zone_id)
+        .ok()
+        .flatten();
+    let navigateur = zone
+        .as_ref()
+        .is_some_and(|z| z.output_type.as_deref() == Some("browser"));
+    let zone_existe = zone.is_some();
+    let device_id = zone.and_then(|z| z.output_device_id);
+    let output_arc = match device_id.as_deref() {
+        Some(did) => {
+            let outputs = state.outputs.lock().await;
+            outputs.get(did)
+        }
+        None => None,
+    };
+    let reseau = match output_arc.as_ref() {
+        Some(arc) => {
+            tune_core::orchestrator::is_network_output_type(Some(arc.lock().await.output_type()))
+        }
+        None => false,
+    };
     // Fil 2972 — le fichier existe-t-il encore chez l'éditeur ? Une seule
-    // question, au clic, bornée : un 404/410 arrête tout ici, sans rien
-    // envoyer à la sortie ni relancer, et marque l'épisode pour les listes.
-    let sonde = sonder_l_episode(&state.http_client, &body.audio_url).await;
+    // question, au clic, bornée, et seulement si quelqu'un va réellement le
+    // chercher (voir `le_fichier_sera_demande`) : une zone inconnue ou sans
+    // sortie découverte ne coûte aucune requête à l'éditeur. Un 404/410
+    // arrête tout ici, sans rien envoyer à la sortie ni relancer, et marque
+    // l'épisode pour les listes.
+    let sonde = if le_fichier_sera_demande(zone_existe, navigateur, output_arc.is_some()) {
+        sonder_l_episode(&state.http_client, &body.audio_url).await
+    } else {
+        SondeDeLEpisode::default()
+    };
     if let Some(statut) = sonde.introuvable {
         episodes_indisponibles::marquer(&body.audio_url, statut);
         warn!(
@@ -990,23 +1019,6 @@ pub(super) async fn play_episode(
         // L'éditeur sert de nouveau le fichier : la marque ne vaut plus.
         episodes_indisponibles::oublier(&body.audio_url);
     }
-    let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
-        .get(zone_id)
-        .ok()
-        .flatten();
-    let navigateur = zone
-        .as_ref()
-        .is_some_and(|z| z.output_type.as_deref() == Some("browser"));
-    let device_id = zone.and_then(|z| z.output_device_id);
-    let reseau = match device_id.as_deref() {
-        Some(did) => match { state.outputs.lock().await.get(did) } {
-            Some(arc) => tune_core::orchestrator::is_network_output_type(Some(
-                arc.lock().await.output_type(),
-            )),
-            None => false,
-        },
-        None => false,
-    };
     let (mime_type, origine_du_type) = type_de_l_episode(
         body.mime_type.as_deref(),
         &body.audio_url,
@@ -1029,13 +1041,6 @@ pub(super) async fn play_episode(
         body.cover_url.as_deref(),
         body.podcast_name.as_deref(),
     );
-    let output_arc = match device_id.as_deref() {
-        Some(did) => {
-            let outputs = state.outputs.lock().await;
-            outputs.get(did)
-        }
-        None => None,
-    };
     // #6468 — un renderer réseau (DLNA, OpenHome…) reçoit l'épisode par le
     // mandataire de Tune, en `http://`, comme les radios et les services :
     // beaucoup de renderers DLNA n'ouvrent pas le HTTPS d'un hébergeur de
@@ -1631,6 +1636,21 @@ fn type_de_l_episode(
     }
     // Ni le flux, ni l'adresse, ni l'hébergeur : le repli d'avant.
     (guess_audio_mime(url).to_string(), "defaut")
+}
+
+/// Fil 2972 — le fichier de l'épisode sera-t-il demandé à l'éditeur si le
+/// lancement continue ? C'est la condition de la sonde du clic : sans elle,
+/// une zone inconnue ou sans sortie déclenchait une requête pour rien.
+///
+/// - zone inconnue : non, rien ne jouera ;
+/// - zone navigateur : oui, le serveur relaie toujours l'épisode au
+///   navigateur par une session Tune (`/stream/…`, `resolve_direct_url`,
+///   témoin `reprise_navigateur_7354_tests`) ;
+/// - sinon, seulement si la sortie de la zone est découverte : un renderer
+///   réseau le reçoit par le mandataire, une sortie locale l'ouvre
+///   elle-même ; sans sortie, la route répond 503 sans rien jouer.
+fn le_fichier_sera_demande(zone_existe: bool, navigateur: bool, sortie_presente: bool) -> bool {
+    zone_existe && (navigateur || sortie_presente)
 }
 
 /// Ce que la sonde du clic a appris de l'hébergeur.
