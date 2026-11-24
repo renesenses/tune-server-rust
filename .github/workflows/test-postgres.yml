@@ -221,6 +221,7 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
+          cache-bin: ${{ runner.environment == 'github-hosted' }}  # sinon rust-cache vide ~/.cargo/bin (rustup) du runner auto-hébergé
           shared-key: tune-core-postgres
 
       # Suite unique et superset des anciens jobs : elle couvre engine,
