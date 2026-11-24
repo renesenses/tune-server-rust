@@ -2,8 +2,9 @@
 //! (tri Titre, lettre « R ») sur une GRANDE bibliothèque.
 //!
 //! Base SQLite synthétique sur disque (WAL, comme en production), écrite par
-//! requêtes préparées dans une transaction. `TUNE_BANC_ALBUMS` (défaut 100 000) fixe le
-//! nombre d'albums ; `TUNE_BANC_DIR` le dossier de la base. Lancé à la main :
+//! requêtes préparées dans une transaction, dans un dossier de
+//! [`crate::test_scratch`]. Deux tailles : 10 500 albums (la bibliothèque du
+//! rapport) et 100 000. Lancé à la main :
 //! `cargo test -p tune-core --release banc_3013 -- --ignored --nocapture`.
 
 use super::*;
@@ -78,18 +79,21 @@ fn mediane(mut v: Vec<Duration>) -> Duration {
     v[v.len() / 2]
 }
 
+/// Les tailles du banc : la bibliothèque du rapport, puis une grande.
+const TAILLES_DU_BANC: [usize; 2] = [10_500, 100_000];
+
 #[test]
 #[ignore = "banc de mesure, lancé à la main (fil 3013)"]
 fn banc_3013_pages_par_titre_sur_grande_bibliotheque() {
-    let nb: usize = std::env::var("TUNE_BANC_ALBUMS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(100_000);
-    let dossier = std::env::var("TUNE_BANC_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::env::temp_dir());
+    for nb in TAILLES_DU_BANC {
+        let dossier = crate::test_scratch::scratch_dir("banc-3013");
+        mesurer(dossier.path(), nb);
+    }
+}
+
+fn mesurer(dossier: &std::path::Path, nb: usize) {
     let t0 = Instant::now();
-    let db = base_synthetique(&dossier, nb);
+    let db = base_synthetique(dossier, nb);
     println!(
         "[banc 3013] base de {nb} albums écrite en {:?}",
         t0.elapsed()
@@ -239,7 +243,7 @@ fn banc_3013_pages_par_titre_sur_grande_bibliotheque() {
 /// pages sont celles de l'ordre complet, et une écriture le fait relire.
 #[test]
 fn les_pages_par_titre_ne_relisent_pas_toute_la_bibliotheque_3013() {
-    let dossier = tempfile::tempdir().unwrap();
+    let dossier = crate::test_scratch::scratch_dir("pages-3013");
     let db = base_synthetique(dossier.path(), 2_000);
     let repo = AlbumRepo::new(db.clone());
     let lectures = || LECTURES_D_ORDRE_ALPHABETIQUE.with(|n| n.get());

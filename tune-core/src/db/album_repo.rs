@@ -4467,17 +4467,6 @@ impl AlbumRepo {
         ))
     }
 
-    /// Les identifiants que rend `sql` (colonnes `a.id, a.title, ar.name,
-    /// a.year`), dans l'ordre alphabétique du serveur média (#4956) :
-    ///
-    /// - par titre : la clé du titre, puis l'identifiant ;
-    /// - par artiste : la clé du nom de l'artiste, puis l'année (sans année
-    ///   d'abord, comme `ORDER BY a.year ASC` sur SQLite), la clé du titre,
-    ///   l'identifiant.
-    ///
-    /// `desc` ne renverse que la clé principale, comme le `{dir}` du SQL
-    /// qu'elle remplace : les départages restent croissants, et l'ordre reste
-    /// total dans les deux sens.
     /// Fil du forum 3013 — l'ordre alphabétique ENTIER d'une liste (sa
     /// requête, ses valeurs liées, son sens), gardé sous le jeton des données
     /// ([`DbBackend::jeton_des_donnees`]) : calculé une fois entre deux
@@ -4519,6 +4508,17 @@ impl AlbumRepo {
         Ok(ordre)
     }
 
+    /// Les identifiants que rend `sql` (colonnes `a.id, a.title, ar.name,
+    /// a.year`), dans l'ordre alphabétique du serveur média (#4956) :
+    ///
+    /// - par titre : la clé du titre, puis l'identifiant ;
+    /// - par artiste : la clé du nom de l'artiste, puis l'année (sans année
+    ///   d'abord, comme `ORDER BY a.year ASC` sur SQLite), la clé du titre,
+    ///   l'identifiant.
+    ///
+    /// `desc` ne renverse que la clé principale, comme le `{dir}` du SQL
+    /// qu'elle remplace : les départages restent croissants, et l'ordre reste
+    /// total dans les deux sens.
     fn ids_en_ordre_alphabetique(
         &self,
         sql: &str,

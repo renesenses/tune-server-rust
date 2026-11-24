@@ -58,7 +58,6 @@ pub use services::PisteRg;
 use crate::audio::ecretage::CompteurDEcretage;
 use crate::db::backend::{DbBackend, DbTxHandle, ToSqlValue};
 use crate::db::settings_repo::SettingsRepo;
-use crate::db::verrou_ecriture::attendre_hors_executeur;
 use crate::db::track_metadata_repo::TrackMetadataRepo;
 use crate::library::local_path::{
     LocalPath, deferral_stamp, deferral_threshold, resolve_local_path,
@@ -1507,20 +1506,26 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
     // Fil du forum 3013 — la sélection lit `tracks` d'un bout à l'autre
     // quand presque tout est fait : 6 à 7 s sur une base de 156 000 pistes,
     // posées sur un fil de l'exécuteur (« gel de l'exécuteur » de 9 à 15 s
-    // dans le rapport). Elle se fait hors de l'exécuteur.
-    let rows = attendre_hors_executeur(|| {
-        match selectionner_les_candidats_replaygain(backend, depuis, TRACK_BATCH) {
-            // Rien après le curseur : un tour complet depuis le début, une
-            // fois, avant de conclure. Les pistes redevenues candidates
-            // DERRIÈRE lui (report expiré, rattrapage, re-scan) sont reprises
-            // ici.
-            Ok(r) if r.is_empty() && depuis > 0 => {
-                poser_curseur_rg(backend, 0);
-                selectionner_les_candidats_replaygain(backend, 0, TRACK_BATCH)
+    // dans le rapport). Elle se fait sur un fil de fond (#4681).
+    let b = backend.clone();
+    let rows = crate::taches_de_fond::priorite::hors_du_fil_async(
+        crate::taches_de_fond::Tache::ReplayGain.id(),
+        move || {
+            match selectionner_les_candidats_replaygain(&b, depuis, TRACK_BATCH) {
+                // Rien après le curseur : un tour complet depuis le début,
+                // une fois, avant de conclure. Les pistes redevenues
+                // candidates DERRIÈRE lui (report expiré, rattrapage,
+                // re-scan) sont reprises ici.
+                Ok(r) if r.is_empty() && depuis > 0 => {
+                    poser_curseur_rg(&b, 0);
+                    selectionner_les_candidats_replaygain(&b, 0, TRACK_BATCH)
+                }
+                autre => autre,
             }
-            autre => autre,
-        }
-    });
+        },
+    )
+    .await
+    .unwrap_or_else(|| Err("selection_interrompue".to_string()));
     let rows = match rows {
         Ok(r) => r,
         Err(e) => {
@@ -1537,7 +1542,14 @@ pub async fn analyze_track_batch(backend: &Arc<dyn DbBackend>) -> usize {
     }
     // #4144 — l'ouverture de la campagne, et avec elle le DÉNOMINATEUR. Compté
     // une seule fois : voir `progression::ouvrir_si_besoin`.
-    progression::ouvrir_si_besoin(|| compter_les_candidats_replaygain(backend));
+    // Fil du forum 3013 — le `COUNT(*)` de l'ouverture (à chaque
+    // redémarrage) se fait lui aussi sur un fil de fond.
+    let b = backend.clone();
+    crate::taches_de_fond::priorite::hors_du_fil_async(
+        crate::taches_de_fond::Tache::ReplayGain.id(),
+        move || progression::ouvrir_si_besoin(|| compter_les_candidats_replaygain(&b)),
+    )
+    .await;
 
     let mut done = 0usize;
     let mut deferred = 0usize;
@@ -2068,17 +2080,24 @@ pub async fn empreinter_un_lot(backend: &Arc<dyn DbBackend>) -> usize {
     let motif = format!("{}:%", crate::audio::empreinte::VERSION);
     let predicat = candidats_empreinte_where(backend);
     // Fil du forum 3013 — même lecture longue que la sélection du
-    // ReplayGain : hors de l'exécuteur.
-    let rows = match attendre_hors_executeur(|| {
-        backend.query_many(
-            &format!("SELECT t.id, t.file_path FROM tracks t WHERE {predicat} LIMIT ?"),
-            &[
-                &motif as &dyn ToSqlValue,
-                &seuil_report as &dyn ToSqlValue,
-                &(TRACK_BATCH as i64) as &dyn ToSqlValue,
-            ],
-        )
-    }) {
+    // ReplayGain : sur un fil de fond (#4681).
+    let b = backend.clone();
+    let rows = match crate::taches_de_fond::priorite::hors_du_fil_async(
+        crate::taches_de_fond::Tache::Empreintes.id(),
+        move || {
+            b.query_many(
+                &format!("SELECT t.id, t.file_path FROM tracks t WHERE {predicat} LIMIT ?"),
+                &[
+                    &motif as &dyn ToSqlValue,
+                    &seuil_report as &dyn ToSqlValue,
+                    &(TRACK_BATCH as i64) as &dyn ToSqlValue,
+                ],
+            )
+        },
+    )
+    .await
+    .unwrap_or_else(|| Err("selection_interrompue".to_string()))
+    {
         Ok(r) => r,
         Err(e) => {
             // Base anterieure a la colonne : rien a rattraper, sans bruit.
@@ -2093,10 +2112,18 @@ pub async fn empreinter_un_lot(backend: &Arc<dyn DbBackend>) -> usize {
     }
     // #7915 — ReplayGain coupé (le défaut), cette passe décode toute la
     // bibliothèque : elle publie son propre avancement.
-    crate::taches_de_fond::avancement::ouvrir_si_besoin(
-        crate::taches_de_fond::Tache::Empreintes,
-        || compter_les_candidats_a_empreinter(backend).unwrap_or(0),
-    );
+    // Fil du forum 3013 — et son `COUNT(*)` d'ouverture, sur un fil de fond.
+    let b = backend.clone();
+    crate::taches_de_fond::priorite::hors_du_fil_async(
+        crate::taches_de_fond::Tache::Empreintes.id(),
+        move || {
+            crate::taches_de_fond::avancement::ouvrir_si_besoin(
+                crate::taches_de_fond::Tache::Empreintes,
+                || compter_les_candidats_a_empreinter(&b).unwrap_or(0),
+            )
+        },
+    )
+    .await;
     let repo = TrackMetadataRepo::with_backend(backend.clone());
     let mut done = 0usize;
     // #5519 — la même largeur que la passe nominale, les mêmes gardes avant

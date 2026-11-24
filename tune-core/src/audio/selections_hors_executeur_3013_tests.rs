@@ -4,9 +4,12 @@
 //! Le rapport du testeur (Windows, 156 000 pistes) relève des « gels de
 //! l'exécuteur » de 9 à 15 s. À chaque relevé, la seule lecture SQLite en
 //! cours est l'une de ces deux sélections, 6 à 7 s, posée sur un fil
-//! `tokio-rt-worker`. Ici, une base qui met 600 ms à répondre à ces
-//! sélections, et un exécuteur à UN fil : un battement toutes les 5 ms ne
-//! doit pas se taire pendant la lecture.
+//! `tokio-rt-worker`. Elles passent désormais par
+//! `taches_de_fond::priorite::hors_du_fil_async`.
+//!
+//! Ici, une base qui met 600 ms à répondre à ces sélections, et un exécuteur
+//! à UN fil : un battement toutes les 5 ms ne doit pas se taire pendant la
+//! lecture. Un témoin par passe.
 
 use super::*;
 use crate::db::backend::SqlValue;
@@ -91,14 +94,22 @@ async fn silence_pendant(passe: &'static str) -> (Duration, Duration) {
     (duree, silence)
 }
 
+fn exiger_un_executeur_vivant(passe: &str, duree: Duration, silence: Duration) {
+    assert!(duree >= LENTEUR, "{passe} : la sélection n'a pas été lue");
+    assert!(
+        silence < LENTEUR / 3,
+        "{passe} : l'exécuteur s'est tu {silence:?} pendant une lecture de {LENTEUR:?}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn les_selections_des_passes_de_fond_ne_figent_pas_l_executeur_3013() {
-    for passe in ["replaygain", "empreintes"] {
-        let (duree, silence) = silence_pendant(passe).await;
-        assert!(duree >= LENTEUR, "{passe} : la sélection n'a pas été lue");
-        assert!(
-            silence < LENTEUR / 3,
-            "{passe} : l'exécuteur s'est tu {silence:?} pendant une lecture de {LENTEUR:?}"
-        );
-    }
+async fn la_selection_du_replaygain_ne_fige_pas_l_executeur_3013() {
+    let (duree, silence) = silence_pendant("replaygain").await;
+    exiger_un_executeur_vivant("replaygain", duree, silence);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn la_selection_des_empreintes_ne_fige_pas_l_executeur_3013() {
+    let (duree, silence) = silence_pendant("empreintes").await;
+    exiger_un_executeur_vivant("empreintes", duree, silence);
 }
