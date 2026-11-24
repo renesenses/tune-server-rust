@@ -607,7 +607,10 @@ fn refus_premium(resultat: &support::SupportResult) -> bool {
 /// serveur est Premium. Même règle que l'installation depuis le catalogue de
 /// greffons. Tout autre résultat (succès, autre refus, panne) est rendu tel
 /// quel, et le dernier refus Premium aussi quand plus rien ne reste à essayer.
-async fn avec_repli<F, Fut>(identifiants: &[support::SupportAuth], mut appel: F) -> support::SupportResult
+async fn avec_repli<F, Fut>(
+    identifiants: &[support::SupportAuth],
+    mut appel: F,
+) -> support::SupportResult
 where
     F: FnMut(support::SupportAuth) -> Fut,
     Fut: std::future::Future<Output = support::SupportResult>,
@@ -616,10 +619,7 @@ where
     loop {
         let Some(identifiant) = restants.next() else {
             // `auth()` ne rend jamais une liste vide.
-            return Err((
-                412,
-                json!({"error": "not_connected"}),
-            ));
+            return Err((412, json!({"error": "not_connected"})));
         };
         let resultat = appel(identifiant).await;
         if restants.peek().is_some() && refus_premium(&resultat) {

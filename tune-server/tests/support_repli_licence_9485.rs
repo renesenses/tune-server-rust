@@ -85,7 +85,9 @@ fn app_vers(base: &str, licence: bool) -> Router {
     let state = AppState::new(":memory:", 0, Default::default()).unwrap();
     let reglages = SettingsRepo::with_backend(state.backend.clone());
     reglages.set("mozaik_base_url", base).unwrap();
-    reglages.set("mozaik_access_token", "jeton-sso-9485").unwrap();
+    reglages
+        .set("mozaik_access_token", "jeton-sso-9485")
+        .unwrap();
     if licence {
         reglages.set("license_key", "TUNE-TEST-9485").unwrap();
         reglages
