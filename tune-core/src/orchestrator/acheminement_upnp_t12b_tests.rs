@@ -253,6 +253,7 @@ impl Banc {
                 control: ControleVolume::Device,
                 db: 0.0,
             },
+            replaygain_actif: false,
         };
         ReponseTessZone::depuis_avec_le_lecteur(
             self.zone_id,
@@ -491,6 +492,7 @@ async fn la_voie_publiee_est_celle_de_la_lecture_case_par_case() {
                     control: ControleVolume::Device,
                     db: 0.0,
                 },
+                replaygain_actif: false,
             };
             // Upsampling et headroom manuel : la lecture réseau ne les lit pas
             // (`TraitementsDeZone`) ; ils varient ici, et la voie attendue de
@@ -934,6 +936,7 @@ async fn upsampling_et_headroom_ne_sont_pas_annonces_quand_la_lecture_sert_la_so
             control: ControleVolume::Device,
             db: 0.0,
         },
+        replaygain_actif: false,
     };
     let etat = ReponseTessZone::depuis_avec_le_lecteur(
         b.zone_id,

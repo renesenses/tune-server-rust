@@ -361,6 +361,7 @@ mod tests {
                 control: ControleVolume::Device,
                 db: 0.0,
             },
+            replaygain_actif: false,
         }
     }
 
@@ -564,6 +565,7 @@ mod tests {
                 control: ControleVolume::Device,
                 db: 0.0,
             },
+            replaygain_actif: false,
         };
         let mut up = chaine(&[]);
         up.fixed.upsampling = Upsampling::Pcm {
