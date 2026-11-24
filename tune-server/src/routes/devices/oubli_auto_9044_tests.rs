@@ -93,7 +93,14 @@ fn oublie_au_bout_de_la_duree_jamais_avant_jamais_sous_une_lecture_ni_un_manuel(
         le: horodatage(t0()),
         auto: true,
     };
-    let p = planifier(&[absence("a", 90)], &[deja.clone()], &appareils, t0(), 30, Z);
+    let p = planifier(
+        &[absence("a", 90)],
+        &[deja.clone()],
+        &appareils,
+        t0(),
+        30,
+        Z,
+    );
     assert!(p.a_oublier.is_empty());
     // Revenu : la marque s'efface.
     let p = planifier(&[], &[deja], &[etat("a", false)], t0(), 30, Z);
@@ -189,7 +196,10 @@ async fn temoin_oubli_automatique_apres_la_duree() {
     assert_eq!(oublies, vec![PARTI.to_string()]);
     // Relecture #9044 : l'oubli AUTOMATIQUE laisse le magasin DLNA (#6299) —
     // sans lui, un appareil qui s'annonce mal en SSDP ne revenait plus.
-    assert!(dlna_connu(&state), "magasin DLNA vidé par l'oubli automatique");
+    assert!(
+        dlna_connu(&state),
+        "magasin DLNA vidé par l'oubli automatique"
+    );
     let o = lire_oublis(&settings);
     assert_eq!(o.len(), 1);
     assert!(o[0].auto);
@@ -219,7 +229,10 @@ async fn temoin_redemarrage_l_arret_ne_compte_pas() {
         .set(CLE_DERNIER_BALAYAGE, &horodatage(arret_debut))
         .unwrap();
 
-    assert!(balayer(&state, t0()).await.is_empty(), "oublié à cause de l'arrêt");
+    assert!(
+        balayer(&state, t0()).await.is_empty(),
+        "oublié à cause de l'arrêt"
+    );
     assert!(lire_oublis(&settings).is_empty());
     let a = lire_absences(&settings);
     assert_eq!(
@@ -235,7 +248,10 @@ async fn temoin_redemarrage_l_arret_ne_compte_pas() {
     settings.set(CLE_DERNIER_BALAYAGE, &horodatage(t)).unwrap();
     t = t + chrono::Duration::days(20);
     settings
-        .set(CLE_DERNIER_BALAYAGE, &horodatage(t - chrono::Duration::minutes(15)))
+        .set(
+            CLE_DERNIER_BALAYAGE,
+            &horodatage(t - chrono::Duration::minutes(15)),
+        )
         .unwrap();
     assert_eq!(balayer(&state, t).await, vec![PARTI.to_string()]);
 }
@@ -243,12 +259,19 @@ async fn temoin_redemarrage_l_arret_ne_compte_pas() {
 #[test]
 fn le_temps_d_arret_ne_compte_qu_au_dela_de_deux_intervalles() {
     assert_eq!(temps_d_arret(None, t0()), Z);
-    assert_eq!(temps_d_arret(Some(t0() - chrono::Duration::minutes(29)), t0()), Z);
+    assert_eq!(
+        temps_d_arret(Some(t0() - chrono::Duration::minutes(29)), t0()),
+        Z
+    );
     assert_eq!(
         temps_d_arret(Some(t0() - chrono::Duration::hours(5)), t0()),
         chrono::Duration::hours(5)
     );
-    assert_eq!(temps_d_arret(Some(t0() + chrono::Duration::hours(1)), t0()), Z, "horloge reculée");
+    assert_eq!(
+        temps_d_arret(Some(t0() + chrono::Duration::hours(1)), t0()),
+        Z,
+        "horloge reculée"
+    );
 }
 
 /// Relecture — l'oubli automatique n'écrase pas un oubli manuel posé entre

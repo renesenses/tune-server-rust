@@ -154,13 +154,20 @@ pub struct Plan {
 /// Le temps à NE PAS compter depuis le balayage précédent : tout l'écart
 /// s'il dépasse deux intervalles (le serveur ne tournait pas), zéro sinon.
 /// Une horloge reculée (`maintenant` avant le précédent) ne décale rien.
-pub fn temps_d_arret(precedent: Option<DateTime<Utc>>, maintenant: DateTime<Utc>) -> chrono::Duration {
+pub fn temps_d_arret(
+    precedent: Option<DateTime<Utc>>,
+    maintenant: DateTime<Utc>,
+) -> chrono::Duration {
     let Some(p) = precedent else {
         return chrono::Duration::zero();
     };
     let ecart = maintenant - p;
     let seuil = chrono::Duration::from_std(ENTRE_DEUX_BALAYAGES * 2).unwrap_or_default();
-    if ecart > seuil { ecart } else { chrono::Duration::zero() }
+    if ecart > seuil {
+        ecart
+    } else {
+        chrono::Duration::zero()
+    }
 }
 
 /// Le balayage, sans effet : pure fonction du passé, du présent et du
@@ -325,13 +332,23 @@ pub async fn balayer(state: &AppState, maintenant: DateTime<Utc>) -> Vec<String>
         .and_then(|v| lire_date(&v));
     let arret = temps_d_arret(precedent, maintenant);
     if arret > chrono::Duration::zero() {
-        info!(heures = arret.num_hours(), "appareils_balayage_temps_d_arret_non_compte");
+        info!(
+            heures = arret.num_hours(),
+            "appareils_balayage_temps_d_arret_non_compte"
+        );
     }
     // Le plan se calcule DANS la transaction des départs : un oubli ou une
     // suppression manuelle qui passe entre-temps n'est pas écrasé (même
     // verrou de clé), et la liste des oubliés est relue au dernier moment.
     let plan = match settings.update_json_list::<Absence, _, _>(CLE_ABSENCES, |l| {
-        let plan = planifier(l, &lire_oublis(&settings), &appareils, maintenant, jours, arret);
+        let plan = planifier(
+            l,
+            &lire_oublis(&settings),
+            &appareils,
+            maintenant,
+            jours,
+            arret,
+        );
         *l = plan.absences.clone();
         Ok(plan)
     }) {
