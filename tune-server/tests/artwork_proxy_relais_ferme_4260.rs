@@ -1150,3 +1150,129 @@ async fn les_cas_hors_regle_restent_refuses_4895() {
     assert_ne!(statut, StatusCode::OK);
     assert_eq!(amont.requetes.load(Ordering::SeqCst), 0);
 }
+
+// ---------------------------------------------------------------------------
+// rc13.1 — le client web du LAN, authentifié par son cookie de session.
+// ---------------------------------------------------------------------------
+
+/// Appel tel qu'une balise `<img>` le fait : pas d'en-tête `Authorization`,
+/// seulement le cookie de session posé à la connexion.
+async fn appel_cookie(app: &Router, chemin: &str, cookie: &str) -> (StatusCode, Vec<u8>) {
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::get(chemin)
+                .header(header::COOKIE, format!("tune_session={cookie}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let statut = resp.status();
+    let corps = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+        .await
+        .unwrap()
+        .to_vec();
+    (statut, corps)
+}
+
+/// Authentification active, navigateur sur le LAN : le logo de radio de
+/// mozaiklabs.fr et la pochette Qobuz, non signés, se chargent avec le cookie
+/// de session. Avant le correctif, l'exemption DIDL passait AVANT le cookie
+/// et le relais rendait 400 « signature requise ».
+#[tokio::test]
+async fn client_web_du_lan_avec_cookie_charge_les_pochettes_publiques() {
+    let amont = amont().await;
+    let state = etat_du_banc();
+    enable_auth(&state);
+    let jeton = tune_server::auth::sign_jwt(1, "admin", "test-jwt-secret").unwrap();
+    let app_lan = app(&state, RENDERER_LAN);
+
+    for url in [
+        format!("http://mozaiklabs.fr:{}/logo.png", amont.port),
+        format!("http://static.qobuz.com:{}/logo.png", amont.port),
+    ] {
+        let (statut, corps) = appel_cookie(&app_lan, &chemin_relais(&url), &jeton).await;
+        assert_eq!(
+            statut,
+            StatusCode::OK,
+            "{url} : navigateur authentifié du LAN, attendu 200 — obtenu {statut} : {}",
+            texte(&corps)
+        );
+        assert_eq!(corps, POCHETTE);
+    }
+}
+
+/// Le cookie ne rouvre rien : hors liste, refusé ; adresse interne, refusée
+/// (relais de production) ; l'amont ne voit aucune requête.
+#[tokio::test]
+async fn client_web_du_lan_avec_cookie_reste_borne_par_la_garde() {
+    let amont = amont().await;
+    let state = etat_du_banc();
+    enable_auth(&state);
+    let jeton = tune_server::auth::sign_jwt(1, "admin", "test-jwt-secret").unwrap();
+    let app_lan = app(&state, RENDERER_LAN);
+    let url = format!("http://interne.exemple:{}/logo.png", amont.port);
+    let (statut, corps) = appel_cookie(&app_lan, &chemin_relais(&url), &jeton).await;
+    assert_eq!(
+        statut,
+        StatusCode::FORBIDDEN,
+        "hors liste : {}",
+        texte(&corps)
+    );
+    assert_eq!(amont.requetes.load(Ordering::SeqCst), 0);
+
+    let prod = etat_de_production();
+    enable_auth(&prod);
+    let app_prod = app(&prod, RENDERER_LAN);
+    for url in [
+        format!("http://127.0.0.1:{}/logo.png", amont.port),
+        "http://192.168.1.1/cover.jpg".to_string(),
+    ] {
+        let (statut, corps) = appel_cookie(&app_prod, &chemin_relais(&url), &jeton).await;
+        assert_eq!(
+            statut,
+            StatusCode::FORBIDDEN,
+            "{url} : adresse interne, attendu 403 — obtenu {statut} : {}",
+            texte(&corps)
+        );
+    }
+    assert_eq!(amont.requetes.load(Ordering::SeqCst), 0);
+}
+
+/// Sans jeton, ou avec un jeton invalide, l'exemption DIDL est inchangée :
+/// toute URL non signée est refusée — adresse interne, hôte hors liste ou
+/// hôte de la liste.
+#[tokio::test]
+async fn sans_jeton_valide_l_exemption_exige_toujours_la_signature() {
+    let amont = amont().await;
+    let state = etat_de_production();
+    enable_auth(&state);
+    let app_lan = app(&state, RENDERER_LAN);
+
+    for url in [
+        format!("http://127.0.0.1:{}/logo.png", amont.port),
+        "http://192.168.1.1/cover.jpg".to_string(),
+        "http://cdn.inconnu.example/x.png".to_string(),
+        "https://mozaiklabs.fr/storage/radio-logos/x.webp".to_string(),
+    ] {
+        let (statut, corps) = appel(&app_lan, &chemin_relais(&url), None).await;
+        assert_eq!(
+            statut,
+            StatusCode::BAD_REQUEST,
+            "{url} sans jeton : {}",
+            texte(&corps)
+        );
+        assert!(texte(&corps).contains("artwork_proxy_signature_requise"));
+
+        let (statut, corps) = appel_cookie(&app_lan, &chemin_relais(&url), "jeton-invalide").await;
+        assert_eq!(
+            statut,
+            StatusCode::BAD_REQUEST,
+            "{url} jeton invalide : {}",
+            texte(&corps)
+        );
+        assert!(texte(&corps).contains("artwork_proxy_signature_requise"));
+    }
+    assert_eq!(amont.requetes.load(Ordering::SeqCst), 0);
+}

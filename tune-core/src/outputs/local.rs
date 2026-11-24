@@ -1660,7 +1660,7 @@ impl LocalOutput {
         }
     }
 
-    /// #4176 — « Remettre à plat » : le gain gardé d'un égaliseur coupé
+    /// #6524 — « Rendre le niveau » : le gain gardé d'un égaliseur coupé
     /// remonte, progressivement, jusqu'au niveau sans égaliseur, sans la borne
     /// de volume de #6741 (voir `EqProcessor::liberer_le_gain_garde`). Sans
     /// effet si la chaîne ne porte pas d'égaliseur coupé.
@@ -2355,6 +2355,18 @@ impl LocalOutput {
         {
             None
         }
+    }
+
+    /// #8616 — endpoint exclusif à sonder hors des verrous de sortie.
+    #[cfg(target_os = "windows")]
+    pub(crate) fn endpoint_pcm_exclusif(&self) -> Option<String> {
+        (enchainement_exclusif::bras_de_cette_plateforme(self.mode_exclusif(), &self.audio_backend)
+            == enchainement_exclusif::BrasDeLecture::WasapiExclusif)
+            .then(|| {
+                self.endpoint_id
+                    .clone()
+                    .unwrap_or_else(|| self.device_name.clone())
+            })
     }
 
     /// #8248 — de quoi sonder le DSD natif ALSA de cette sortie. `None` hors

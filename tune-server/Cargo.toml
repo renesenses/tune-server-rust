@@ -2286,6 +2286,13 @@ path = "tests/durcissement_routes_admin.rs"
 name = "activation_authentification"
 path = "tests/activation_authentification.rs"
 
+# rc13.2 : connexion de `default` sur cette machine et depuis le réseau local,
+# après l'activation et sur une base rc12 (ancien hachage). SQLite, et
+# PostgreSQL quand `TUNE_TEST_PG_URL` est posée (feature `postgres`).
+[[test]]
+name = "connexion_mot_de_passe_rc13_2"
+path = "tests/connexion_mot_de_passe_rc13_2.rs"
+
 # Le code d'activation ne sort par aucun lecteur de journal (TUNE_LOG_FILE
 # posé pour tout le processus : cible à part).
 [[test]]

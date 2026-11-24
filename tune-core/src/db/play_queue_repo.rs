@@ -803,6 +803,17 @@ impl PlayQueueRepo {
     /// Une file qui perd des lignes le dit (#2394 : un compteur qui ment est pire
     /// qu'un compteur absent).
     pub fn set_queue(&self, zone_id: i64, track_ids: &[i64]) -> Result<SetQueueOutcome, String> {
+        self.set_queue_avec_cible(zone_id, track_ids, None)
+    }
+
+    /// #8832 — revalider la piste de départ dans la transaction de remplacement.
+    /// Son absence conserve la file précédente, même après une attente d'écriture.
+    pub fn set_queue_avec_cible(
+        &self,
+        zone_id: i64,
+        track_ids: &[i64],
+        cible: Option<i64>,
+    ) -> Result<SetQueueOutcome, String> {
         let delete_sql = self.dialect_sql(sql::delete_for_zone, sql::delete_for_zone);
         // set_queue is a FULL replacement of the zone's queue: the streaming
         // subset must go too. It only deleted the local subset, so streaming
@@ -855,6 +866,17 @@ impl PlayQueueRepo {
             // fermeture rejouée ne compte pas deux fois la même perte.
             outcome.inserted = 0;
             outcome.skipped.clear();
+            if let Some(cible) = cible {
+                // SQLite tient déjà sa transaction d'écriture. Sur PostgreSQL,
+                // empêcher aussi un DELETE entre la vérification et l'INSERT.
+                let sql = match self.db.engine() {
+                    Engine::Sqlite => "SELECT id FROM tracks WHERE id = ?",
+                    Engine::Postgres => "SELECT id FROM tracks WHERE id = $1 FOR KEY SHARE",
+                };
+                if tx.query_one(sql, &[&cible])?.is_none() {
+                    return Err("track not found".into());
+                }
+            }
             let p: [&dyn ToSqlValue; 1] = [&zone_id];
             tx.execute(&delete_sql, &p)?;
             tx.execute(&delete_streaming_sql, &p)?;
