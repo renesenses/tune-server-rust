@@ -34,7 +34,9 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::resolution::{Badge, CodeEtape, EtapeResolue, MotifEtape, Resolution};
+use super::resolution::{
+    Badge, CodeEtape, EtapeResolue, MotifEtape, PlacementVolume, Resolution,
+};
 use super::zones::TransportZone;
 
 /// La zone joue-t-elle sur la famille UPnP (au sens de T12b) ?
@@ -70,6 +72,9 @@ pub enum OrigineDuFlux {
     Library,
     /// Un service (Qobuz, TIDAL…) relayé par Tune.
     Service,
+    /// Une radio : vers un lecteur DLNA, TOUJOURS décodée et servie en WAV
+    /// LPCM au fil de l'eau (`resolve_direct`, flux radio lié au lecteur).
+    Radio,
     /// Rien ne joue : la règle de la bibliothèque, la plus prudente, s'applique.
     #[serde(other)]
     Unknown,
@@ -206,6 +211,17 @@ pub fn acheminer(r: &Resolution, f: &FaitsUpnp) -> AcheminementUpnp {
         renderer_lpcm: f.lpcm,
         lpcm_bits: f.lpcm_bits,
     };
+    // Une radio est toujours décodée et servie en LPCM au fil de l'eau : le
+    // relais progressif, chaîne vide comprise. Jamais « Bit-perfect », jamais
+    // « converted before the first note ».
+    if f.origine == OrigineDuFlux::Radio {
+        a.route = VoieUpnp::ProgressiveLpcm;
+        if !reencodage && !casque {
+            a.reason = Some(MotifDeVoie::NothingToProcess);
+        }
+        a.detail = Some(DETAIL_RADIO.into());
+        return a;
+    }
     if !reencodage && !casque {
         a.reason = Some(MotifDeVoie::NothingToProcess);
         if conversion_imposee {
@@ -276,14 +292,17 @@ fn source_dsd(r: &Resolution) -> bool {
     champ("kind") == Some("dsd") && champ("played_as") == Some("converted_to_pcm")
 }
 
+/// Détail de la voie d'une radio.
+pub const DETAIL_RADIO: &str = "Radio streams are decoded and served to this renderer as LPCM";
+
 /// Détail d'un étage que la lecture n'applique sur AUCUNE voie de la famille
 /// UPnP.
 pub const DETAIL_NON_APPLIQUE: &str =
     "Not applied on this network output: Tune serves this renderer without it";
 
 /// Reporte la voie sur la résolution :
-/// - les étages que la lecture réseau n'applique sur aucune voie — upsampling,
-///   headroom (`TraitementsDeZone` ne lit ni `Upsampling` ni `Headroom`),
+/// - les étages que la lecture réseau n'applique sur aucune voie — upsampling
+///   (et son modulateur DSD), headroom (`TraitementsDeZone` ne lit ni `Upsampling` ni `Headroom`),
 ///   repli mono et réaffectation (hors de `StreamingDsp`) — sont éteints avec
 ///   le motif `not_applied_on_transport` ;
 /// - un étage que la voie ne porte pas est éteint, avec le motif
@@ -298,7 +317,7 @@ pub fn appliquer(r: &mut Resolution, a: &AcheminementUpnp) {
     for e in r.etapes.iter_mut().filter(|e| {
         e.effective
             && match e.code {
-                CodeEtape::Upsampling | CodeEtape::Headroom => true,
+                CodeEtape::Upsampling | CodeEtape::Headroom | CodeEtape::DsdModulator => true,
                 CodeEtape::Plugin => {
                     famille(e.plugin_id.as_deref().unwrap_or("")) == Famille::HorsRelais
                 }
@@ -312,6 +331,10 @@ pub fn appliquer(r: &mut Resolution, a: &AcheminementUpnp) {
     }
     if non_appliques {
         r.headroom_db = 0.0;
+        // Sans modulateur DSD, le volume (s'il est appliqué) reste au rendu.
+        if r.volume.placement == Some(PlacementVolume::BeforeDsdModulator) {
+            r.volume.placement = Some(PlacementVolume::AtRender);
+        }
         r.recalculer_les_etapes_finales();
     }
     if a.route == VoieUpnp::Untouched && a.reason == Some(MotifDeVoie::RendererWithoutLpcm) {
@@ -611,6 +634,94 @@ mod tests {
         appliquer(&mut r, &a);
         assert_eq!(a.route, VoieUpnp::FileTranscode);
         assert_eq!(r.badge, Badge::ProcessedByTess);
+    }
+
+    /// 4e relecture : un upsampling vers DSD n'est pas appliqué sur UPnP ;
+    /// aucune étape DSD n'est effective quand le badge dit « Bit-perfect », et
+    /// le volume revient au rendu.
+    #[test]
+    fn le_modulateur_dsd_n_est_pas_annonce_sur_upnp() {
+        use crate::tess::chaine::Upsampling;
+        use crate::tess::resolution::PlacementVolume;
+        let tout = |_: &str| true;
+        for (volume, attendu) in [
+            (
+                VolumeZone {
+                    control: ControleVolume::Device,
+                    db: 0.0,
+                },
+                None,
+            ),
+            (
+                VolumeZone {
+                    control: ControleVolume::Software,
+                    db: -6.0,
+                },
+                Some(PlacementVolume::AtRender),
+            ),
+        ] {
+            let x = ContexteExecution {
+                transport: TransportZone::Dlna,
+                source: Some(PCM24),
+                premium: true,
+                greffon_disponible: &tout,
+                pure: false,
+                volume,
+                replaygain_actif: false,
+            };
+            let mut c = chaine(&[]);
+            c.fixed.upsampling = Upsampling::Dsd {
+                rate: TauxDsd::Dsd128,
+                filter: "polyvalent".into(),
+            };
+            let mut r = c.resoudre(&catalogue_de_reference(), &x);
+            assert!(
+                r.etapes
+                    .iter()
+                    .any(|e| e.code == CodeEtape::DsdModulator && e.effective),
+                "avant : modulateur annoncé"
+            );
+            let a = acheminer(&r, &faits(Refused, false, Library));
+            appliquer(&mut r, &a);
+            let dsd = r
+                .etapes
+                .iter()
+                .find(|e| e.code == CodeEtape::DsdModulator)
+                .unwrap();
+            assert!(!dsd.effective);
+            assert_eq!(dsd.reason, Some(MotifEtape::NotAppliedOnTransport));
+            assert!(
+                !r.etapes.iter().any(|e| e.effective
+                    && matches!(e.code, CodeEtape::Upsampling | CodeEtape::DsdModulator)),
+                "plus aucune étape DSD effective"
+            );
+            assert_eq!(r.volume.placement, attendu);
+            if volume.control == ControleVolume::Device {
+                assert_eq!(r.badge, Badge::BitPerfect);
+            }
+        }
+    }
+
+    /// 4e relecture : une radio vers un lecteur DLNA est toujours décodée et
+    /// servie en LPCM : relais progressif, jamais « Bit-perfect », jamais
+    /// « converted before the first note ». Chaîne vide, puis égaliseur.
+    #[test]
+    fn une_radio_part_au_relais_progressif_jamais_bit_perfect() {
+        for (ids, badge) in [
+            (&[][..], Badge::AlteredOutsideTess),
+            (&["equalizer-graphic"][..], Badge::ProcessedByTess),
+        ] {
+            let mut r = resoudre(ids, false, PCM24);
+            for l in [Accepted, Refused, Unknown] {
+                let a = acheminer(&r, &faits(l, false, OrigineDuFlux::Radio));
+                assert_eq!(a.route, VoieUpnp::ProgressiveLpcm, "{ids:?} {l:?}");
+                let d = a.detail.as_deref().unwrap_or_default();
+                assert!(!d.contains("Bit-perfect") && !d.contains("before the first note"));
+            }
+            let a = acheminer(&r, &faits(Refused, false, OrigineDuFlux::Radio));
+            appliquer(&mut r, &a);
+            assert_eq!(r.badge, badge, "{ids:?}");
+        }
     }
 
     #[test]

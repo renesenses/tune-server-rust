@@ -2009,6 +2009,11 @@ impl PlaybackOrchestrator {
                     .streamer
                     .create_file_session(file_info, w.cache_path.clone(), false)
                     .await;
+                // TESS T12b — la session SERT une conversion : la voie le dit, comme
+                // `resolve_local` (`faits_upnp_de_zone` la lit pour l'état effectif).
+                self.streamer
+                    .noter_la_voie(&session_id, crate::http::streamer::voie::FICHIER_CONVERTI)
+                    .await;
                 let server_ip = self.server_ip();
                 let stream_url =
                     self.streamer
@@ -2572,6 +2577,11 @@ impl PlaybackOrchestrator {
                     let session_id = self
                         .streamer
                         .create_file_session(file_info, serve_path, false)
+                        .await;
+                    // TESS T12b — la session SERT une conversion : la voie le dit, comme
+                    // `resolve_local` (`faits_upnp_de_zone` la lit pour l'état effectif).
+                    self.streamer
+                        .noter_la_voie(&session_id, crate::http::streamer::voie::FICHIER_CONVERTI)
                         .await;
 
                     let server_ip = self.server_ip();
@@ -3223,6 +3233,11 @@ impl PlaybackOrchestrator {
                         let session_id = self
                             .streamer
                             .create_file_session(file_info, tmp_wav, false)
+                            .await;
+                        // TESS T12b — la session SERT une conversion : la voie le dit, comme
+                        // `resolve_local` (`faits_upnp_de_zone` la lit pour l'état effectif).
+                        self.streamer
+                            .noter_la_voie(&session_id, crate::http::streamer::voie::FICHIER_CONVERTI)
                             .await;
 
                         let server_ip = self.server_ip();

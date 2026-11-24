@@ -43,6 +43,7 @@ impl PisteEnCours {
             Some(s) if s.eq_ignore_ascii_case("local") || s.eq_ignore_ascii_case("upnp") => {
                 OrigineDuFlux::Library
             }
+            Some(s) if s.eq_ignore_ascii_case("radio") => OrigineDuFlux::Radio,
             Some(_) => OrigineDuFlux::Service,
         }
     }

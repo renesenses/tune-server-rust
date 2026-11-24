@@ -857,7 +857,17 @@ async fn en_pure_une_conversion_imposee_n_est_pas_dite_bit_perfect() {
 /// converti (décodé) l'est.
 #[tokio::test]
 async fn le_flux_continu_n_est_pas_une_conversion() {
-    let b = banc(SINK_COMPLET).await;
+    // Sans faux lecteur : ce témoin ne lit que la voie de la session (le
+    // `bind` du faux serveur était sa seule source d'instabilité).
+    let orch = orchestrateur();
+    let zone_id = ZoneRepo::with_backend(orch.db.clone())
+        .create("Flux continu", Some("dlna"), Some(LECTEUR))
+        .unwrap();
+    let b = Banc {
+        orch,
+        zone_id,
+        derniere_session: Default::default(),
+    };
     let mut faits_de = Vec::new();
     for v in [voie::FLUX_CONTINU, voie::FLUX_CONVERTI] {
         let (sid, _tx, _n) = b
@@ -963,5 +973,107 @@ async fn upsampling_et_headroom_ne_sont_pas_annonces_quand_la_lecture_sert_la_so
             Some(MotifEtape::NotAppliedOnTransport),
             "{code:?}"
         );
+    }
+}
+
+/// 4e relecture — un SERVICE converti pour le lecteur, en Pure : la zone
+/// plafonne à 16 bits, le FLAC Qobuz 24/96 est pré-transcodé (bras HTTPS,
+/// `streaming_needs_pretranscode`). La session le note `fichier_converti`,
+/// et l'état n'est jamais `untouched` ni « Bit-perfect ». Contre-épreuve :
+/// sans plafond, le flux part en mandataire, `untouched` et « Bit-perfect ».
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn un_service_converti_pour_le_lecteur_n_est_jamais_dit_bit_perfect() {
+    let flac = std::fs::read(format!("{FIXTURES}/{}", PISTE_24.0)).unwrap();
+    let app = Router::new().route(
+        "/piste.flac",
+        axum::routing::get(move || {
+            let flac = flac.clone();
+            async move { ([("Content-Type", "audio/flac")], flac) }
+        }),
+    );
+    let ecoute = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cdn = format!("http://{}/piste.flac", ecoute.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(ecoute, app).await.ok() });
+
+    for (plafond, attendu, badge) in [
+        (true, VoieUpnp::FileTranscode, Badge::AlteredOutsideTess),
+        (false, VoieUpnp::Untouched, Badge::BitPerfect),
+    ] {
+        let orch = orchestrateur();
+        let zones = ZoneRepo::with_backend(orch.db.clone());
+        let zone = zones
+            .create("Lecteur 16 bits", Some("dlna"), Some("uuid:t12b-service-16"))
+            .unwrap();
+        zones.update_dlna_cap_16bit(zone, plafond).unwrap();
+        SettingsRepo::with_backend(orch.db.clone())
+            .set(&format!("zone_{zone}_audiophile"), r#"{"enabled":true}"#)
+            .unwrap();
+        let req = super::service_wav_progressif_5080::requete_qobuz(zone);
+        let flux = super::service_wav_progressif_5080::flux_qobuz(cdn.clone(), 96_000, 24);
+        let (_, sid, _, _) = orch
+            .relayer_le_flux(
+                &req,
+                "t12b",
+                "qobuz",
+                &flux,
+                super::service_wav_progressif_5080::info_amont(&flux),
+                true,
+                "flac".into(),
+                None,
+                None,
+            )
+            .await
+            .expect("la piste se résout");
+        let sid = sid.expect("une session");
+        let voie_servie = orch.streamer.voie_servie(&sid).await;
+        assert_eq!(
+            voie_servie == voie::FICHIER_CONVERTI,
+            plafond,
+            "plafond={plafond} : voie {voie_servie}"
+        );
+        let faits = orch
+            .faits_upnp_de_zone(
+                zone,
+                &PisteEnCours {
+                    source: Some("qobuz".into()),
+                    source_id: Some("t12b".into()),
+                    format: Some("flac".into()),
+                    bit_depth: Some(24),
+                    stream_id: Some(sid),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let settings = SettingsRepo::with_backend(orch.db.clone());
+        let lecture = crate::tess::migration::lire_zone(&settings, zone, true).unwrap();
+        assert!(lecture.pure);
+        let tout = |_: &str| true;
+        let ctx = ContexteExecution {
+            transport: TransportZone::Dlna,
+            source: Some(SourceFlux::Pcm {
+                sample_rate_hz: 96_000,
+                bits: 24,
+                channels: 2,
+            }),
+            premium: true,
+            greffon_disponible: &tout,
+            pure: true,
+            volume: VolumeZone {
+                control: ControleVolume::Device,
+                db: 0.0,
+            },
+            replaygain_actif: false,
+        };
+        let etat = ReponseTessZone::depuis_avec_le_lecteur(
+            zone,
+            lecture.chaine,
+            None,
+            catalogue_de_reference(),
+            &ctx,
+            Some(&faits),
+        );
+        assert_eq!(etat.delivery.as_ref().unwrap().route, attendu, "plafond={plafond}");
+        assert_eq!(etat.badge, badge, "plafond={plafond}");
     }
 }
