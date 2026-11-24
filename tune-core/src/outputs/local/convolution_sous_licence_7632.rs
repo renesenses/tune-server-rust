@@ -100,8 +100,9 @@ fn un_filtre_pose_en_lecture_sans_moteur_ne_rejoue_aucun_echantillon_t09b() {
     }
     // Le bloc de la pose : du silence (le retard s'amorce), jamais l'entrée.
     assert!(pcm[..lat * 2].iter().all(|v| *v == 0.0), "trou de pose attendu");
-    // Pendant la réchauffe : l'entrée exactement retardée d'un bloc.
-    for n in lat..2_000 {
+    // Pendant la réchauffe (64 prises + un bloc) : l'entrée exactement
+    // retardée d'un bloc.
+    for n in lat..(64 + lat) {
         assert_eq!(pcm[2 * n], entree[2 * (n - lat)], "trame {n} rejouée ou altérée");
     }
 }

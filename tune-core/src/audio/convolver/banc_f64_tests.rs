@@ -625,19 +625,24 @@ fn la_pose_en_lecture_ne_rejoue_aucun_echantillon() {
     let x = sinus_de_bascule(24_000);
     let mut m = Convolver::<f64>::retard_seul(1, bloc);
     assert!(m.est_eteint());
+    let mut y = x.clone();
+    let pose = 2_000;
+    let (avant, apres) = y.split_at_mut(pose);
+    m.traiter(avant);
     m.remplacer_en_fondu(Convolver::depuis_f64(&[vec![0.6]], bloc), 960)
         .ok()
         .unwrap();
-    let mut y = x.clone();
-    m.traiter(&mut y);
+    m.traiter(apres);
     assert!(y[..bloc].iter().all(|v| *v == 0.0), "bloc de pose : silence");
+    // Jusqu'à la fin de la réchauffe (prises + bloc), l'entrée exactement
+    // retardée : chaque trame sort une seule fois.
     let rechauffe = 1 + bloc;
-    for n in bloc..bloc + rechauffe {
+    for n in bloc..pose + rechauffe {
         assert_eq!(y[n], x[n - bloc], "trame {n} rejouée");
     }
     let saut = plus_grand_saut(&y[bloc..]);
     assert!(saut <= 1.05 * pente_du_sinus(), "saut {saut}");
-    let fin = bloc + rechauffe + 960 + 1;
+    let fin = pose + rechauffe + 960 + 1;
     for n in fin..x.len() {
         assert!((y[n] - 0.6 * x[n - bloc]).abs() < SEUIL_64_BITS, "trame {n}");
     }
