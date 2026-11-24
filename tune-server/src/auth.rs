@@ -308,17 +308,24 @@ pub async fn auth_middleware(
     next.run(request).await
 }
 
+pub(crate) fn cle_api_valide(cle: &str, settings: &SettingsRepo) -> bool {
+    let Some(attendue) = settings
+        .get("api_key")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    // Comparer des empreintes de longueur fixe, même si les clés ont des tailles différentes.
+    let recue = Sha256::digest(cle.as_bytes());
+    let configuree = Sha256::digest(attendue.as_bytes());
+    bool::from(recue.ct_eq(&configuree))
+}
+
 fn valider_jeton(tok: &str, settings: &SettingsRepo) -> Option<AuthUser> {
     if let Some(cle) = tok.strip_prefix("ApiKey:") {
-        let attendue = settings
-            .get("api_key")
-            .ok()
-            .flatten()
-            .filter(|s| !s.is_empty())?;
-        // Deux empreintes de taille fixe, y compris si les clés ont des longueurs différentes.
-        let recue = Sha256::digest(cle.as_bytes());
-        let configuree = Sha256::digest(attendue.as_bytes());
-        return bool::from(recue.ct_eq(&configuree)).then(|| AuthUser {
+        return cle_api_valide(cle, settings).then(|| AuthUser {
             user_id: 0,
             role: "api-key".into(),
         });

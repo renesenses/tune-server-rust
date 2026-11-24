@@ -63,10 +63,7 @@ async fn ws_handler(
 ) -> impl IntoResponse {
     // Authenticate via API key
     let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
-    let stored_key = settings.get("api_key").ok().flatten().unwrap_or_default();
-
-    let provided_key = query.api_key.unwrap_or_default();
-    if stored_key.is_empty() || provided_key != stored_key {
+    if !crate::auth::cle_api_valide(query.api_key.as_deref().unwrap_or_default(), &settings) {
         return axum::http::StatusCode::UNAUTHORIZED.into_response();
     }
 
