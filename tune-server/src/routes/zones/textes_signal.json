@@ -1781,7 +1781,8 @@
     "oaat_dsd_cadence": "DSD-samplefrequentie niet herkend door het native OAAT-pad: omgezet naar PCM.",
     "upsampling_level_matched": "niveau gelijk aan afspelen zonder upsampling (headroom gecompenseerd met het volume)",
     "upsampling_level_partial": "headroom deels gecompenseerd: {0} dB onder afspelen zonder upsampling, volume te hoog om volledig te compenseren",
-    "upsampling_level_full_volume": "headroom niet gecompenseerd: volume op 100%, {0} dB onder afspelen zonder upsampling; zet voor een vergelijking op gelijk niveau het volume van Tune minstens {1} dB lager en stel het niveau in op de DAC of voorversterker"
+    "upsampling_level_full_volume": "headroom niet gecompenseerd: volume op 100%, {0} dB onder afspelen zonder upsampling; zet voor een vergelijking op gelijk niveau het volume van Tune minstens {1} dB lager en stel het niveau in op de DAC of voorversterker",
+    "wasapi_rate_fallback": "Conversie {0} → {1} kHz: het apparaat ondersteunt geen {0} kHz in exclusieve WASAPI-modus"
   },
   "zh-Hant": {
     "pregain": "自動前置增益 {0} dB",
@@ -1885,7 +1886,8 @@
     "oaat_dsd_cadence": "OAAT 原生路徑無法辨識此 DSD 取樣率：已轉換為 PCM。",
     "upsampling_level_matched": "電平與未升頻播放時相同（餘裕已由音量補償）",
     "upsampling_level_partial": "餘裕僅部分補償：比未升頻播放低 {0} dB，音量過高而無法完全補償",
-    "upsampling_level_full_volume": "餘裕未補償：音量為 100%，比未升頻播放低 {0} dB；若要在相同電平下比較，請將 Tune 的音量至少調低 {1} dB，並在 DAC 或前級上調整電平"
+    "upsampling_level_full_volume": "餘裕未補償：音量為 100%，比未升頻播放低 {0} dB；若要在相同電平下比較，請將 Tune 的音量至少調低 {1} dB，並在 DAC 或前級上調整電平",
+    "wasapi_rate_fallback": "轉換 {0} → {1} kHz：此裝置在 WASAPI 獨佔模式下不支援 {0} kHz"
   },
   "ru": {
     "pregain": "автоматическое предусиление {0} dB",
@@ -1989,7 +1991,8 @@
     "oaat_dsd_cadence": "Частота DSD не распознана нативным трактом OAAT: выполнено преобразование в PCM.",
     "upsampling_level_matched": "уровень выровнен с воспроизведением без передискретизации (запас компенсирован громкостью)",
     "upsampling_level_partial": "запас компенсирован частично: на {0} dB ниже воспроизведения без передискретизации, громкость слишком высока для полной компенсации",
-    "upsampling_level_full_volume": "запас не компенсирован: громкость 100%, на {0} dB ниже воспроизведения без передискретизации; для сравнения на равном уровне уменьшите громкость Tune хотя бы на {1} dB и выставьте уровень на ЦАП или предусилителе"
+    "upsampling_level_full_volume": "запас не компенсирован: громкость 100%, на {0} dB ниже воспроизведения без передискретизации; для сравнения на равном уровне уменьшите громкость Tune хотя бы на {1} dB и выставьте уровень на ЦАП или предусилителе",
+    "wasapi_rate_fallback": "Преобразование {0} → {1} кГц: устройство не поддерживает {0} кГц в монопольном режиме WASAPI"
   },
   "uk": {
     "pregain": "автоматичне попереднє підсилення {0} dB",
@@ -2093,6 +2096,7 @@
     "oaat_dsd_cadence": "Частоту DSD не розпізнано нативним шляхом OAAT: перетворено на PCM.",
     "upsampling_level_matched": "рівень вирівняно з відтворенням без передискретизації (запас компенсовано гучністю)",
     "upsampling_level_partial": "запас компенсовано частково: на {0} dB нижче, ніж відтворення без передискретизації, гучність зависока для повної компенсації",
-    "upsampling_level_full_volume": "запас не компенсовано: гучність 100 %, на {0} dB нижче, ніж відтворення без передискретизації; для порівняння на однаковому рівні знизьте гучність Tune щонайменше на {1} dB і налаштуйте рівень на ЦАП або попередньому підсилювачі"
+    "upsampling_level_full_volume": "запас не компенсовано: гучність 100 %, на {0} dB нижче, ніж відтворення без передискретизації; для порівняння на однаковому рівні знизьте гучність Tune щонайменше на {1} dB і налаштуйте рівень на ЦАП або попередньому підсилювачі",
+    "wasapi_rate_fallback": "Перетворення {0} → {1} кГц: пристрій не підтримує {0} кГц в монопольному режимі WASAPI"
   }
 }
