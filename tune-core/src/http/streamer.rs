@@ -363,6 +363,10 @@ pub struct StreamSession {
     /// qu'il relaie, la sonde de niveaux le décode sans ouvrir de seconde
     /// connexion amont.
     pub prise_des_niveaux: super::prise_des_niveaux_9450::PriseDesNiveaux,
+    /// #9450 — la sonde de longueur du HEAD a-t-elle déjà été tentée ? Une
+    /// seule fois par session : un amont lent ou en panne ne doit pas coûter
+    /// 3 s à chaque HEAD.
+    pub sonde_de_longueur_tentee: std::sync::atomic::AtomicBool,
     pub info: StreamInfo,
     detected_radio_source: std::sync::Mutex<Option<RadioSourceInfo>>,
     /// #5716 — appelé UNE fois, au premier codec de station que la sonde
@@ -847,6 +851,7 @@ impl StreamSession {
         Self {
             id,
             prise_des_niveaux: Default::default(),
+            sonde_de_longueur_tentee: std::sync::atomic::AtomicBool::new(false),
             info,
             detected_radio_source: std::sync::Mutex::new(None),
             au_premier_codec: std::sync::Mutex::new(None),
@@ -2393,6 +2398,15 @@ impl AudioStreamer {
             }
         }
         info!(stream_id, "stream_session_removed");
+    }
+
+    /// #9450 — la session existe-t-elle, et relaie-t-elle un amont ?
+    pub async fn est_mandataire(&self, stream_id: &str) -> bool {
+        let session = self.sessions.lock().await.get(stream_id).cloned();
+        match session {
+            Some(s) => s.proxy_url.lock().await.is_some(),
+            None => false,
+        }
     }
 
     /// #9450 — branche la sonde de niveaux sur la prise d'une session
