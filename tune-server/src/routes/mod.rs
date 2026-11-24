@@ -132,6 +132,7 @@ pub mod system;
 pub mod tagger;
 pub mod tags;
 pub mod upnp;
+pub mod upnp_icones;
 pub mod upnp_media_renderer;
 pub mod upnp_media_server;
 pub mod versions;
