@@ -636,6 +636,12 @@ pub(super) fn appliquer_le_put(
     Ok((lecture, bilan.cles_modifiees))
 }
 
+/// rc14 — la clé du mode PURE de la zone (hors chaîne), que le chargement
+/// d'un préréglage bascule ; [`rafraichir`] l'applique à la sortie vivante.
+pub(super) fn cle_mode_pure(zone_id: i64) -> String {
+    format!("zone_{zone_id}_audiophile")
+}
+
 /// Chaque ancienne clé réécrite atteint la sortie vivante, comme par son
 /// ancienne route (`REGLAGES_A_RAFRAICHIR`).
 pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
@@ -663,7 +669,7 @@ pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
         rafraichir_le_convolueur(state, zone).await;
     }
     // rc14 — le mode PURE basculé par un préréglage (« Pure » l'allume).
-    if cles.contains(&format!("zone_{id}_audiophile")) {
+    if cles.contains(&cle_mode_pure(id)) {
         let _ = state.orchestrator.apply_audiophile_change_portee(id).await;
     }
 }

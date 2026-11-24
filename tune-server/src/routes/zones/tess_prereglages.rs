@@ -49,8 +49,8 @@ use tune_core::tess::prereglages::{self, ModeApplication, PreReglage};
 use tune_core::tess::resolution::MotifEtape;
 
 use super::tess::{
-    appliquer_le_put, catalogue_du_serveur, cle_prereglage_actif, erreur_migration, rafraichir,
-    refus, reponse_de_zone, verrou_des_put, zone_de,
+    appliquer_le_put, catalogue_du_serveur, cle_mode_pure, cle_prereglage_actif, erreur_migration,
+    rafraichir, refus, reponse_de_zone, verrou_des_put, zone_de,
 };
 use super::*;
 
@@ -305,7 +305,7 @@ fn chaine_traite(c: &ChaineTess) -> bool {
 }
 
 /// rc14 (recette .18) — charger « Pure » vidait la chaîne mais laissait le
-/// mode PURE de la zone éteint (`zone_{id}_audiophile`, hors chaîne). Le
+/// mode PURE de la zone éteint ([`cle_mode_pure`], hors chaîne). Le
 /// préréglage intégré l'allume désormais ; un préréglage qui traite l'éteint
 /// (sinon PURE contournerait ce qu'on vient de charger). Un préréglage
 /// utilisateur sans traitement n'y touche pas. `lock_volume` est gardé, et
@@ -323,7 +323,7 @@ async fn accorder_le_mode_pure(state: &AppState, zone_id: i64, p: &PreReglage) -
     if audiophile::zone_enabled(&state.backend, zone_id) == voulu {
         return BasculePure::Rien;
     }
-    // Comme l'interrupteur PURE (`set_audiophile`) : seule l'ENTRÉE en PURE
+    // Comme l'interrupteur PURE de la zone : seule l'ENTRÉE en PURE
     // avec le verrou de volume armé (saut à 100 %) demande une confirmation.
     // La sortie est libre ; elle recompose la consigne (`set_volume_sortie_de_pure`).
     let verrou = audiophile::volume_lock_enabled(&state.backend, zone_id);
@@ -333,7 +333,9 @@ async fn accorder_le_mode_pure(state: &AppState, zone_id: i64, p: &PreReglage) -
     }
     let sortie_du_plein_volume = !voulu && verrou;
     let settings = settings_de(state);
-    let cle = format!("zone_{zone_id}_audiophile");
+    // La clé est tenue par `tess.rs`, dont `rafraichir` l'applique
+    // à la sortie vivante selon le mode, comme le reste du préréglage.
+    let cle = cle_mode_pure(zone_id);
     let mut objet = settings
         .get(&cle)
         .ok()
