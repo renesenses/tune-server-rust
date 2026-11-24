@@ -1416,7 +1416,7 @@ pub(crate) fn fichier_a_mesurer_apres_avance(
 /// end (Patricia Barber / Qobuz on an Eversolo DMP-A8: `bytes_sent=0`,
 /// `peak_pos=30000`, zone force-stopped). Callers only consult this for network
 /// outputs, so local gapless (which serves the buffer) is unaffected.
-pub(super) fn prefetch_buffer_truncated(buffered_ms: u64, duration_ms: u64) -> bool {
+pub(crate) fn prefetch_buffer_truncated(buffered_ms: u64, duration_ms: u64) -> bool {
     duration_ms == 0 || buffered_ms + 2000 < duration_ms
 }
 
