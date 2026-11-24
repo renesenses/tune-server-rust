@@ -831,6 +831,9 @@ fn annonce_de_notre_serveur_multimedia(
     if !location.ends_with(&notre_mount) {
         return false;
     }
+    // Une IPv6 de lien local peut porter sa zone (`fe80::1%en0`) : elle ne
+    // change pas l'adresse.
+    let hote = hote.split('%').next().unwrap_or(hote);
     !hote.is_empty() && nos_adresses.iter().any(|a| a == hote)
 }
 
@@ -879,11 +882,27 @@ pub(crate) fn est_ce_serveur(
 /// les formes locales, qu'un M-SEARCH émis depuis la machine elle-même peut
 /// nous renvoyer.
 pub(crate) fn nos_adresses(annoncee: Option<&str>) -> Vec<String> {
-    nos_adresses_depuis(
-        &tune_core::discovery::ssdp::local_ipv4_addresses(),
-        tune_core::discovery::ssdp::get_local_ip(),
-        annoncee,
+    avec_nos_ipv6(
+        nos_adresses_depuis(
+            &tune_core::discovery::ssdp::local_ipv4_addresses(),
+            tune_core::discovery::ssdp::get_local_ip(),
+            annoncee,
+        ),
+        &tune_core::discovery::ssdp::local_ipv6_addresses(),
     )
+}
+
+/// Fil du forum 3028 — nos adresses IPv6 : la boucle locale `::1` et celles
+/// de nos interfaces, sous la forme de `Ipv6Addr::to_string` (sans crochets),
+/// celle que rendent `host_from_location` et une URL relue.
+fn avec_nos_ipv6(mut v: Vec<String>, interfaces: &[std::net::Ipv6Addr]) -> Vec<String> {
+    for ip in std::iter::once(std::net::Ipv6Addr::LOCALHOST).chain(interfaces.iter().copied()) {
+        let s = ip.to_string();
+        if !v.contains(&s) {
+            v.push(s);
+        }
+    }
+    v
 }
 
 /// L'assemblage seul, sans I/O — c'est lui que le test couvre.
@@ -6255,3 +6274,16 @@ mod decouverte_volume_6774_tests;
 #[cfg(test)]
 #[path = "discovery_setup/renderer_sur_cette_machine_7875_tests.rs"]
 mod renderer_sur_cette_machine_7875_tests;
+
+/// Fil du forum 3028 — nos adresses comptent l'IPv6.
+#[cfg(test)]
+mod nos_adresses_ipv6_3028 {
+    #[test]
+    fn nos_adresses_comptent_l_ipv6_de_nos_interfaces_et_la_boucle() {
+        let lien_local: std::net::Ipv6Addr = "fe80::1c2b:3aff:fe4d:5e6f".parse().unwrap();
+        let v = super::avec_nos_ipv6(vec!["127.0.0.1".into()], &[lien_local]);
+        assert!(v.iter().any(|a| a == "::1"), "{v:?}");
+        assert!(v.iter().any(|a| a == "fe80::1c2b:3aff:fe4d:5e6f"), "{v:?}");
+        assert!(v.iter().any(|a| a == "127.0.0.1"), "l'IPv4 reste : {v:?}");
+    }
+}

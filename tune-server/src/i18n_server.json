@@ -7281,6 +7281,28 @@
     "ru": "«{id}» — медиасервер, который публикует этот Tune: его индексирование продублирует локальную библиотеку. Просматривать его по-прежнему можно.",
     "uk": "«{id}» — медіасервер, який публікує цей Tune: його індексування продублює локальну бібліотеку. Переглядати його досі можна."
   },
+  "api.upnp.thisServerUseRemove": {
+    "fr": "Ce serveur est ce Tune : retirez ses doublons par l'action « remove » des sources de bibliothèque, qui rattache d'abord favoris et playlists aux pistes locales.",
+    "en": "This server is this Tune: remove its duplicates with the \"remove\" action of library sources, which first moves favorites and playlists to the local tracks.",
+    "de": "Dieser Server ist dieses Tune: Entfernen Sie seine Duplikate mit der Aktion „remove“ der Bibliotheksquellen, die Favoriten und Playlists zuerst den lokalen Titeln zuordnet.",
+    "es": "Este servidor es este Tune: elimine sus duplicados con la acción «remove» de las fuentes de biblioteca, que primero pasa favoritos y listas a las pistas locales.",
+    "it": "Questo server è questo Tune: rimuova i suoi doppioni con l'azione «remove» delle sorgenti di libreria, che prima sposta preferiti e playlist sui brani locali.",
+    "zh": "此服务器就是本 Tune：请使用音乐库来源的“remove”操作删除其重复项，该操作会先将收藏和播放列表转到本地曲目。",
+    "ja": "このサーバーはこの Tune です。ライブラリソースの「remove」操作で重複を削除してください。お気に入りとプレイリストは先にローカルのトラックへ移されます。",
+    "ko": "이 서버는 바로 이 Tune입니다. 라이브러리 소스의 \"remove\" 작업으로 중복을 제거하세요. 즐겨찾기와 재생목록은 먼저 로컬 트랙으로 옮겨집니다.",
+    "ro": "Acest server este chiar acest Tune: eliminați dublurile cu acțiunea „remove” a surselor de bibliotecă, care mută mai întâi favoritele și listele pe piesele locale.",
+    "sv": "Den här servern är denna Tune: ta bort dubbletterna med åtgärden ”remove” för bibliotekskällor, som först flyttar favoriter och spellistor till de lokala spåren.",
+    "hu": "Ez a kiszolgáló maga ez a Tune: a másolatokat a könyvtárforrások „remove” műveletével törölje, amely előbb a helyi számokra helyezi át a kedvenceket és a lejátszási listákat.",
+    "vi": "Máy chủ này chính là Tune này: hãy xóa bản trùng bằng thao tác \"remove\" của nguồn thư viện, thao tác này chuyển mục yêu thích và danh sách phát sang bản nhạc cục bộ trước.",
+    "nb": "Denne serveren er denne Tune: fjern duplikatene med handlingen «remove» for bibliotekskilder, som først flytter favoritter og spillelister til de lokale sporene.",
+    "pl": "Ten serwer to ten Tune: usuń duplikaty akcją „remove” źródeł biblioteki, która najpierw przenosi ulubione i playlisty na lokalne utwory.",
+    "el": "Αυτός ο διακομιστής είναι αυτό το Tune: αφαιρέστε τα διπλότυπα με την ενέργεια «remove» των πηγών βιβλιοθήκης, που πρώτα μεταφέρει αγαπημένα και λίστες στα τοπικά κομμάτια.",
+    "tr": "Bu sunucu bu Tune'un kendisi: kopyalarını kitaplık kaynaklarının \"remove\" eylemiyle kaldırın; bu eylem önce favorileri ve çalma listelerini yerel parçalara taşır.",
+    "nl": "Deze server is deze Tune: verwijder de duplicaten met de actie “remove” van bibliotheekbronnen, die favorieten en afspeellijsten eerst naar de lokale nummers verplaatst.",
+    "zh-Hant": "此伺服器就是本 Tune：請使用音樂庫來源的「remove」操作刪除其重複項，該操作會先將收藏與播放清單轉到本機曲目。",
+    "ru": "Этот сервер — сам этот Tune: удалите дубликаты действием «remove» источников библиотеки, которое сначала переносит избранное и плейлисты на локальные треки.",
+    "uk": "Цей сервер — сам цей Tune: видаліть дублікати дією «remove» джерел бібліотеки, яка спершу переносить обране й плейлисти на локальні треки."
+  },
   "api.metadata.trackUnknownOrNotMp3": {
     "fr": "Piste inconnue ou non MP3.",
     "en": "Unknown track or not an MP3.",
