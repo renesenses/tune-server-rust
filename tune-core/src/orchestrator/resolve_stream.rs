@@ -3237,7 +3237,10 @@ impl PlaybackOrchestrator {
                         // TESS T12b — la session SERT une conversion : la voie le dit, comme
                         // `resolve_local` (`faits_upnp_de_zone` la lit pour l'état effectif).
                         self.streamer
-                            .noter_la_voie(&session_id, crate::http::streamer::voie::FICHIER_CONVERTI)
+                            .noter_la_voie(
+                                &session_id,
+                                crate::http::streamer::voie::FICHIER_CONVERTI,
+                            )
                             .await;
 
                         let server_ip = self.server_ip();

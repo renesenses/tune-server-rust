@@ -1002,7 +1002,11 @@ async fn un_service_converti_pour_le_lecteur_n_est_jamais_dit_bit_perfect() {
         let orch = orchestrateur();
         let zones = ZoneRepo::with_backend(orch.db.clone());
         let zone = zones
-            .create("Lecteur 16 bits", Some("dlna"), Some("uuid:t12b-service-16"))
+            .create(
+                "Lecteur 16 bits",
+                Some("dlna"),
+                Some("uuid:t12b-service-16"),
+            )
             .unwrap();
         zones.update_dlna_cap_16bit(zone, plafond).unwrap();
         SettingsRepo::with_backend(orch.db.clone())
@@ -1073,7 +1077,11 @@ async fn un_service_converti_pour_le_lecteur_n_est_jamais_dit_bit_perfect() {
             &ctx,
             Some(&faits),
         );
-        assert_eq!(etat.delivery.as_ref().unwrap().route, attendu, "plafond={plafond}");
+        assert_eq!(
+            etat.delivery.as_ref().unwrap().route,
+            attendu,
+            "plafond={plafond}"
+        );
         assert_eq!(etat.badge, badge, "plafond={plafond}");
     }
 }

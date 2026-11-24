@@ -34,9 +34,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::resolution::{
-    Badge, CodeEtape, EtapeResolue, MotifEtape, PlacementVolume, Resolution,
-};
+use super::resolution::{Badge, CodeEtape, EtapeResolue, MotifEtape, PlacementVolume, Resolution};
 use super::zones::TransportZone;
 
 /// La zone joue-t-elle sur la famille UPnP (au sens de T12b) ?
