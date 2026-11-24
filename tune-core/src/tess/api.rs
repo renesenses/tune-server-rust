@@ -42,6 +42,10 @@ pub struct ReponseTessZone {
     pub signal_path: Vec<EtapeResolue>,
     /// Les greffons qu'on peut ajouter (« + Add plugin »), avec leurs droits.
     pub catalog: Catalogue,
+    /// Avertissements d'un `PUT` accepté (T17 : `active_preset_not_stored`
+    /// quand le marqueur « ACTIVE » n'a pas pu être tenu). Absent si vide.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl ReponseTessZone {
@@ -65,6 +69,7 @@ impl ReponseTessZone {
             badge: r.badge,
             signal_path: r.etapes,
             catalog,
+            warnings: Vec::new(),
         }
     }
 }
@@ -346,7 +351,9 @@ pub fn schema_json() -> Value {
                     "badge": enumere(&["bit_perfect", "processed_by_tess", "outside_tess",
                                        "altered_outside_tess"]),
                     "signal_path": { "type": "array", "items": { "$ref": "#/$defs/step" } },
-                    "catalog": { "$ref": "#/$defs/catalog" }
+                    "catalog": { "$ref": "#/$defs/catalog" },
+                    // Facultatif (T17) : avertissements d'un `PUT` accepté.
+                    "warnings": { "type": "array", "items": { "type": "string" } }
                 },
                 "additionalProperties": false
             },
@@ -356,7 +363,11 @@ pub fn schema_json() -> Value {
                     "id": { "$ref": "#/$defs/id" },
                     "name": { "type": "string" },
                     "builtin": { "type": "boolean" },
-                    "chain": { "$ref": "#/$defs/chain" }
+                    "chain": { "$ref": "#/$defs/chain" },
+                    // Facultatif (T17) : seulement dans la réponse d'un
+                    // `POST /tess/presets` dont le marqueur « ACTIVE » n'a
+                    // pas pu être posé (`active_preset_not_stored`).
+                    "warnings": { "type": "array", "items": { "type": "string" } }
                 },
                 "additionalProperties": false
             },

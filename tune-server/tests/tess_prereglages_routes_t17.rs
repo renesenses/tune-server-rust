@@ -18,12 +18,27 @@ use tune_core::db::zone_repo::ZoneRepo;
 use tune_core::tess::api::conforme_au_schema;
 use tune_core::tess::migration::lire_zone;
 use tune_core::tess::{ChaineTess, cle_chaine_zone};
-use tune_server::routes::zones::tess_prereglages::{appliquer_a_la_lecture, cles_en_attente};
+use tune_server::routes::zones::tess::verrou_des_put;
+use tune_server::routes::zones::tess_prereglages::{
+    appliquer_a_la_lecture, cles_en_attente, rafraichissements_demandes, sortie_locale,
+    verrou_de_la_liste,
+};
+
+/// La file d'attente du mode `at_next_playback` est commune au processus,
+/// et passer en `immediately` la sert pour TOUTES les zones ; un `PUT` ou un
+/// chargement en mode immédiat vide celle de sa zone. Chaque banc tient donc
+/// la série : les tests de ce fichier passent l'un après l'autre.
+fn file_partagee() -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static F: std::sync::OnceLock<std::sync::Arc<tokio::sync::Mutex<()>>> =
+        std::sync::OnceLock::new();
+    F.get_or_init(Default::default).clone()
+}
 
 struct Banc {
     state: tune_server::state::AppState,
     app: axum::Router,
     zone: i64,
+    _serie: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl Banc {
@@ -34,6 +49,7 @@ impl Banc {
     /// `avant` zones créées d'abord : la zone du banc a un numéro propre
     /// (l'attente du mode `at_next_playback` est tenue par numéro de zone).
     async fn avec_sortie(premium: bool, output_type: &str, device: &str, avant: usize) -> Self {
+        let _serie = file_partagee().lock_owned().await;
         let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
         let settings = SettingsRepo::with_backend(state.backend.clone());
         settings
@@ -62,7 +78,12 @@ impl Banc {
             .unwrap();
         repo.update_volume(zone, 100.0).unwrap();
         let app = tune_server::routes::router(state.clone());
-        Self { state, app, zone }
+        Self {
+            state,
+            app,
+            zone,
+            _serie,
+        }
     }
 
     fn settings(&self) -> SettingsRepo {
@@ -408,7 +429,11 @@ async fn un_prereglage_premium_ne_donne_jamais_le_droit_a_un_compte_gratuit_t17(
     b.put_chaine(json!({"version": 1, "plugins": [parametrique(), crossfeed()]}))
         .await;
     b.enregistrer("Studio").await;
-    b.put_chaine(json!({"version": 1, "plugins": []})).await;
+    // Un marqueur VALIDE sur la zone : « Casque » décrit sa chaîne.
+    b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
+        .await;
+    b.enregistrer("Casque").await;
+    assert_eq!(b.get_zone().await["active_preset"], json!("casque"));
     b.premium(false).await;
     let avant = b.settings().get(&cle_chaine_zone(b.zone)).unwrap();
     let (s, v) = b.appliquer("studio").await;
@@ -418,9 +443,24 @@ async fn un_prereglage_premium_ne_donne_jamais_le_droit_a_un_compte_gratuit_t17(
     assert_eq!(v["plugin_id"], json!("equalizer-parametric"));
     assert!(v["upgrade_url"].is_string());
     assert!(!v["message"].as_str().unwrap().is_empty());
-    // Rien n'a bougé : ni la chaîne, ni l'actif.
+    // Rien n'a bougé : ni la chaîne, ni le marqueur d'origine (toujours valide).
     assert_eq!(b.settings().get(&cle_chaine_zone(b.zone)).unwrap(), avant);
-    assert_eq!(b.get_zone().await["active_preset"], Value::Null);
+    assert_eq!(b.get_zone().await["active_preset"], json!("casque"));
+    // Idem sur un refus 409 (version de chaîne trop récente dans le préréglage).
+    let mut l = tune_core::tess::prereglages::lire(&b.settings()).unwrap();
+    let mut futur = l.get("casque").unwrap().clone();
+    futur.id = "futur".into();
+    futur.chain.version = 99;
+    l.presets.push(futur);
+    tune_core::tess::prereglages::ecrire(&b.settings(), &l).unwrap();
+    let (s, v) = b.appliquer("futur").await;
+    assert!(s.is_client_error(), "{s} {v}");
+    assert_eq!(b.settings().get(&cle_chaine_zone(b.zone)).unwrap(), avant);
+    assert_eq!(b.get_zone().await["active_preset"], json!("casque"));
+    // (Retiré ensuite : sa version hors bornes ne passe pas le schéma
+    // strict que `liste()` applique.)
+    l.presets.retain(|p| p.id != "futur");
+    tune_core::tess::prereglages::ecrire(&b.settings(), &l).unwrap();
     // Le préréglage reste enregistré (le droit se vérifie au chargement).
     assert!(ids(&b.liste().await).contains(&"studio".to_owned()));
     // Contre-épreuve : avec le Premium, le même chargement passe.
@@ -451,6 +491,7 @@ async fn un_etage_sans_effet_sur_cette_sortie_est_dit_avec_son_motif_t17() {
         "{v}"
     );
     // Greffon désinstallé sur une zone locale : motif propre.
+    drop(b);
     let b = Banc::nouveau(true).await;
     b.brut(
         Method::POST,
@@ -550,4 +591,482 @@ async fn au_prochain_demarrage_rien_n_interrompt_la_lecture_t17() {
     b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
         .await;
     assert!(cles_en_attente(b.zone).is_empty());
+}
+
+// ── Suites de relecture (T17) ───────────────────────────────────────
+
+async fn mode(b: &Banc, m: &str) {
+    let (s, v) = b
+        .brut(
+            Method::PUT,
+            "/api/v1/tess/apply-mode",
+            Some(json!({"apply_mode": m})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+}
+
+#[tokio::test]
+async fn la_lecture_attend_le_put_en_cours_de_la_zone_suite_t17() {
+    let b = Banc::avec_sortie(true, "local", "local:Realtek HD", 50).await;
+    mode(&b, "at_next_playback").await;
+    b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
+        .await;
+    assert!(!cles_en_attente(b.zone).is_empty());
+    // Un PUT tient la zone : le démarrage de lecture attend, la file reste.
+    let verrou = verrou_des_put(b.zone);
+    let garde = verrou.lock().await;
+    let state = b.state.clone();
+    let zone = b.zone;
+    let tache = tokio::spawn(async move { appliquer_a_la_lecture(&state, zone).await });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !cles_en_attente(b.zone).is_empty(),
+        "la file a été lue pendant le PUT"
+    );
+    drop(garde);
+    tache.await.unwrap();
+    assert!(cles_en_attente(b.zone).is_empty());
+}
+
+#[tokio::test]
+async fn une_zone_reseau_sans_appareil_n_est_pas_locale_suite_t17() {
+    let b = Banc::nouveau(true).await;
+    let repo = ZoneRepo::with_backend(b.state.backend.clone());
+    let reseau = repo.create("Salon DLNA", Some("dlna"), None).unwrap();
+    assert!(!sortie_locale(&repo.get(reseau).unwrap().unwrap()));
+    // Contre-épreuves : locale déclarée, ou type absent (locale par défaut).
+    assert!(sortie_locale(&repo.get(b.zone).unwrap().unwrap()));
+    let sans_type = repo.create("Sans type", None, None).unwrap();
+    assert!(sortie_locale(&repo.get(sans_type).unwrap().unwrap()));
+}
+
+#[tokio::test]
+async fn repasser_en_immediat_vide_la_file_suite_t17() {
+    let b = Banc::avec_sortie(true, "local", "local:Realtek HD", 60).await;
+    mode(&b, "at_next_playback").await;
+    b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
+        .await;
+    assert!(!cles_en_attente(b.zone).is_empty());
+    // Contre-épreuve : reposer le même mode ne sert rien.
+    mode(&b, "at_next_playback").await;
+    assert!(!cles_en_attente(b.zone).is_empty());
+    mode(&b, "immediately").await;
+    assert!(cles_en_attente(b.zone).is_empty());
+}
+
+#[tokio::test]
+async fn charger_lit_la_liste_sous_son_verrou_suite_t17() {
+    let b = Banc::nouveau(true).await;
+    b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
+        .await;
+    b.enregistrer("Headphones").await;
+    let app = b.app.clone();
+    let uri = format!("/api/v1/zones/{}/tess/presets/headphones/apply", b.zone);
+    let garde = verrou_de_la_liste().lock().await;
+    let tache = tokio::spawn(async move {
+        app.oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(
+        !tache.is_finished(),
+        "chargé pendant qu'on modifiait la liste"
+    );
+    drop(garde);
+    assert_eq!(tache.await.unwrap(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn un_put_identique_sur_un_compte_gratuit_garde_l_actif_suite_t17() {
+    let b = Banc::nouveau(true).await;
+    b.put_chaine(json!({"version": 1, "plugins": [parametrique()]}))
+        .await;
+    b.enregistrer("Studio").await;
+    b.premium(false).await;
+    // Le GET gratuit montre le paramétrique converti en graphique (P2).
+    let vue = b.get_zone().await;
+    assert_eq!(
+        vue["chain"]["plugins"][0]["id"],
+        json!("equalizer-graphic"),
+        "{vue}"
+    );
+    assert_eq!(vue["active_preset"], json!("studio"));
+    // Renvoyée telle quelle, la chaîne ne change pas : l'actif reste.
+    let (s, v) = b.put_chaine(vue["chain"].clone()).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(b.chaine().plugins[0].id, "equalizer-parametric");
+    assert_eq!(b.get_zone().await["active_preset"], json!("studio"));
+    // Contre-épreuve : décocher l'oublie.
+    let mut autre = vue["chain"].clone();
+    autre["plugins"][0]["enabled"] = json!(false);
+    b.put_chaine(autre).await;
+    assert_eq!(b.get_zone().await["active_preset"], Value::Null);
+}
+
+// ── Retouches de relecture (T17) ────────────────────────────────────
+
+#[tokio::test]
+async fn une_suppression_pendant_un_chargement_ne_laisse_pas_de_marqueur_orphelin_suite_t17() {
+    let b = Banc::nouveau(true).await;
+    b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
+        .await;
+    b.enregistrer("Headphones").await;
+    b.put_chaine(json!({"version": 1, "plugins": []})).await;
+    assert_eq!(b.get_zone().await["active_preset"], Value::Null);
+    // Un PUT tient la zone : le chargement attend après avoir lu la liste.
+    let verrou = verrou_des_put(b.zone);
+    let garde = verrou.lock().await;
+    let (app1, app2) = (b.app.clone(), b.app.clone());
+    let uri = format!("/api/v1/zones/{}/tess/presets/headphones/apply", b.zone);
+    let charger = tokio::spawn(async move {
+        app1.oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    });
+    // Le chargement tient la liste (et attend la zone).
+    attendre_que_la_liste_soit_tenue().await;
+    let supprimer = tokio::spawn(async move {
+        app2.oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/api/v1/tess/presets/headphones")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    });
+    // La suppression attend la liste : rien d'observable, on lui laisse le
+    // temps de se mettre en file.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    drop(garde);
+    assert_eq!(charger.await.unwrap(), StatusCode::OK);
+    assert_eq!(supprimer.await.unwrap(), StatusCode::NO_CONTENT);
+    // Le préréglage n'existe plus : aucune zone ne doit le marquer.
+    assert!(!ids(&b.liste().await).contains(&"headphones".to_owned()));
+    assert_eq!(b.get_zone().await["active_preset"], Value::Null);
+}
+
+#[tokio::test]
+async fn passer_en_immediat_rafraichit_aussi_une_zone_reseau_suite_t17() {
+    let b = Banc::avec_sortie(true, "dlna", "dlna:salon", 70).await;
+    mode(&b, "at_next_playback").await;
+    b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
+        .await;
+    assert!(!cles_en_attente(b.zone).is_empty());
+    // Contre-épreuve : au démarrage d'une lecture, une zone réseau n'est pas
+    // rafraîchie (le flux vient d'être fabriqué avec les clés).
+    let avant = rafraichissements_demandes(b.zone);
+    appliquer_a_la_lecture(&b.state, b.zone).await;
+    assert_eq!(rafraichissements_demandes(b.zone), avant);
+    // Le passage en immédiat, lui, DEMANDE le rafraîchissement de la sortie
+    // réseau (ce témoin compte les demandes ; ce qu'elles produisent sur un
+    // flux réseau, relance par l'égaliseur, relève des tests de l'orchestrateur).
+    b.put_chaine(json!({"version": 1, "plugins": []})).await;
+    assert!(!cles_en_attente(b.zone).is_empty());
+    mode(&b, "immediately").await;
+    assert!(cles_en_attente(b.zone).is_empty());
+    assert_eq!(rafraichissements_demandes(b.zone), avant + 1);
+}
+
+#[tokio::test]
+async fn au_dela_de_deux_cents_l_enregistrement_est_refuse_suite_t17() {
+    let b = Banc::nouveau(true).await;
+    let mut l = tune_core::tess::PreReglages::default();
+    for i in 1..tune_core::tess::prereglages::PREREGLAGES_MAX {
+        l.presets.push(tune_core::tess::PreReglage {
+            id: format!("p{i}"),
+            name: format!("P{i}"),
+            builtin: false,
+            chain: ChaineTess::default(),
+        });
+    }
+    tune_core::tess::prereglages::ecrire(&b.settings(), &l).unwrap();
+    let (s, v) = b.enregistrer("Un de trop").await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["error"], json!("too_many_presets"));
+    // Contre-épreuve : une place libérée, l'enregistrement passe.
+    b.brut(Method::DELETE, "/api/v1/tess/presets/p1", None)
+        .await;
+    let (s, v) = b.enregistrer("Un de trop").await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+}
+
+#[tokio::test]
+async fn une_entree_stockee_trop_longue_ne_fait_pas_tomber_les_routes_suite_t17() {
+    let b = Banc::nouveau(true).await;
+    let corps = json!({"apply_mode": "immediately", "presets": [
+        {"id": "pure", "name": "Pure — no processing", "builtin": true,
+         "chain": {"version": 1, "bypass_all": true}},
+        {"id": "long", "name": "x".repeat(81), "chain": {"version": 1}},
+        {"id": "casque", "name": "Casque", "chain": {"version": 1}}
+    ]});
+    b.settings()
+        .set("tess_presets", &corps.to_string())
+        .unwrap();
+    // Rendue telle quelle (rien n'est perdu) ; les routes servent le reste.
+    assert_eq!(ids(&b.liste().await), vec!["pure", "long", "casque"]);
+    let (s, _) = b.appliquer("casque").await;
+    assert_eq!(s, StatusCode::OK);
+}
+
+/// L'entrée « long » de la base, brute.
+fn entree_brute(b: &Banc, id: &str) -> Option<Value> {
+    let brut: Value =
+        serde_json::from_str(&b.settings().get("tess_presets").unwrap().unwrap()).unwrap();
+    brut["presets"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["id"] == json!(id))
+        .cloned()
+}
+
+#[tokio::test]
+async fn une_entree_invalide_en_base_survit_aux_ecritures_des_routes_suite_t17() {
+    let b = Banc::nouveau(true).await;
+    let long = "x".repeat(81);
+    let corps = json!({"apply_mode": "immediately", "presets": [
+        {"id": "long", "name": long, "chain": {"version": 1}},
+        {"id": "casque", "name": "Casque", "chain": {"version": 1}}
+    ]});
+    b.settings()
+        .set("tess_presets", &corps.to_string())
+        .unwrap();
+    // Enregistrer un AUTRE préréglage, en renommer un, changer de mode…
+    let (s, v) = b.enregistrer("Soirée").await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    let (s, _) = b
+        .brut(
+            Method::PATCH,
+            "/api/v1/tess/presets/casque",
+            Some(json!({"name": "Casque du soir"})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    mode(&b, "at_next_playback").await;
+    let (s, _) = b
+        .brut(Method::DELETE, "/api/v1/tess/presets/soiree", None)
+        .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    // … et l'entrée invalide est toujours en base, intacte.
+    let e = entree_brute(&b, "long").expect("entrée invalide perdue");
+    assert_eq!(e["name"], json!(long));
+    // Contre-épreuve : on ne peut pas en CRÉER une pareille.
+    let (s, v) = b.enregistrer(&"y".repeat(81)).await;
+    assert_eq!(
+        (s, v["error"].clone()),
+        (StatusCode::BAD_REQUEST, json!("invalid_name"))
+    );
+}
+
+/// Fait échouer, en base, l'écriture (`INSERT`/`UPDATE`) et/ou l'effacement
+/// (`DELETE`) des marqueurs « ACTIVE » dont la clé correspond à `motif`.
+fn bloquer_le_marqueur(b: &Banc, motif: &str, ecriture: bool, effacement: bool) {
+    use tune_core::db::backend::DbBackend;
+    let mut sql = String::new();
+    if ecriture {
+        sql += &format!(
+            "CREATE TRIGGER t17_ins BEFORE INSERT ON settings WHEN NEW.key LIKE '{motif}' \
+             BEGIN SELECT RAISE(ABORT, 'refus de test'); END; \
+             CREATE TRIGGER t17_upd BEFORE UPDATE ON settings WHEN NEW.key LIKE '{motif}' \
+             BEGIN SELECT RAISE(ABORT, 'refus de test'); END;"
+        );
+    }
+    if effacement {
+        sql += &format!(
+            "CREATE TRIGGER t17_del BEFORE DELETE ON settings WHEN OLD.key LIKE '{motif}' \
+             BEGIN SELECT RAISE(ABORT, 'refus de test'); END;"
+        );
+    }
+    b.state.backend.execute_batch(&sql).unwrap();
+}
+
+const MARQUEURS: &str = "zone_%_tess_active_preset";
+
+#[tokio::test]
+async fn un_marqueur_non_ecrit_au_chargement_n_empeche_pas_la_chaine_suite_t17() {
+    let b = Banc::nouveau(true).await;
+    b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
+        .await;
+    b.enregistrer("Headphones").await;
+    b.put_chaine(json!({"version": 1, "plugins": [parametrique()]}))
+        .await;
+    b.enregistrer("Studio").await;
+    assert_eq!(b.get_zone().await["active_preset"], json!("studio"));
+    bloquer_le_marqueur(&b, MARQUEURS, true, false);
+    let (s, v) = b.appliquer("headphones").await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["warnings"], json!(["active_preset_not_stored"]), "{v}");
+    // La chaîne est appliquée et servie…
+    assert_eq!(
+        b.chaine()
+            .plugins
+            .iter()
+            .map(|m| m.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["crossfeed"]
+    );
+    assert_eq!(
+        b.get_zone().await["chain"]["plugins"][0]["id"],
+        json!("crossfeed")
+    );
+    // … et aucun marqueur périmé (« studio » ne décrit plus la zone).
+    assert_eq!(b.get_zone().await["active_preset"], Value::Null);
+}
+
+#[tokio::test]
+async fn un_marqueur_non_efface_au_put_n_empeche_pas_la_chaine_suite_t17() {
+    let b = Banc::nouveau(true).await;
+    b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
+        .await;
+    b.enregistrer("Headphones").await;
+    bloquer_le_marqueur(&b, MARQUEURS, false, true);
+    let (s, v) = b
+        .put_chaine(json!({"version": 1, "plugins": [parametrique()]}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    conforme_au_schema("zone_response", &v).unwrap_or_else(|e| panic!("{e} : {v}"));
+    assert_eq!(
+        v["chain"]["plugins"][0]["id"],
+        json!("equalizer-parametric")
+    );
+    // Effacé au mieux (valeur vide) : aucun marqueur périmé.
+    assert_eq!(v["active_preset"], Value::Null, "{v}");
+    assert_eq!(b.get_zone().await["active_preset"], Value::Null);
+}
+
+#[tokio::test]
+async fn un_marqueur_non_ecrit_a_l_enregistrement_ne_cree_pas_de_doublon_suite_t17() {
+    let b = Banc::nouveau(true).await;
+    b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
+        .await;
+    bloquer_le_marqueur(&b, MARQUEURS, true, false);
+    let (s, v) = b.enregistrer("Headphones").await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    assert_eq!(v["id"], json!("headphones"));
+    assert_eq!(v["warnings"], json!(["active_preset_not_stored"]));
+    assert_eq!(ids(&b.liste().await), vec!["pure", "headphones"]);
+    assert_eq!(b.get_zone().await["active_preset"], Value::Null);
+}
+
+#[tokio::test]
+async fn une_suppression_continue_si_un_marqueur_resiste_suite_t17() {
+    let b = Banc::nouveau(true).await;
+    let autre = ZoneRepo::with_backend(b.state.backend.clone())
+        .create("Autre", Some("local"), Some("local:autre"))
+        .unwrap();
+    b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
+        .await;
+    b.enregistrer("Headphones").await;
+    b.settings()
+        .set(&format!("zone_{autre}_tess_active_preset"), "headphones")
+        .unwrap();
+    // Le marqueur de la PREMIÈRE zone ne se laisse ni effacer ni vider.
+    bloquer_le_marqueur(
+        &b,
+        &format!("zone_{}_tess_active_preset", b.zone),
+        true,
+        true,
+    );
+    let (s, v) = b
+        .brut(Method::DELETE, "/api/v1/tess/presets/headphones", None)
+        .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "{v}");
+    assert!(!ids(&b.liste().await).contains(&"headphones".to_owned()));
+    // L'autre zone est quand même nettoyée.
+    assert_eq!(
+        b.settings()
+            .get(&format!("zone_{autre}_tess_active_preset"))
+            .unwrap(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn enregistrer_lit_la_chaine_sous_le_verrou_de_la_zone_suite_t17() {
+    let b = Banc::nouveau(true).await;
+    b.put_chaine(json!({"version": 1, "plugins": []})).await;
+    // Un PUT tient la zone…
+    let verrou = verrou_des_put(b.zone);
+    let garde = verrou.lock().await;
+    let app = b.app.clone();
+    let zone = b.zone;
+    let enregistrer = tokio::spawn(async move {
+        let r = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/v1/tess/presets")
+                    .header("Content-Type", "application/json")
+                    .body(Body::from(
+                        json!({"name": "Casque", "zone_id": zone}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice::<Value>(&bytes).unwrap()
+    });
+    attendre_que_la_liste_soit_tenue().await;
+    // … et écrit sa chaîne pendant que l'enregistrement attend.
+    let nouvelle: ChaineTess =
+        serde_json::from_value(json!({"version": 1, "plugins": [crossfeed()]})).unwrap();
+    tune_core::tess::migration::ecrire_chaine(&b.settings(), b.zone, &nouvelle).unwrap();
+    drop(garde);
+    let p = enregistrer.await.unwrap();
+    // Le préréglage garde la chaîne ÉCRITE par le PUT, et la marque active.
+    assert_eq!(p["chain"]["plugins"][0]["id"], json!("crossfeed"), "{p}");
+    assert_eq!(b.get_zone().await["active_preset"], json!("casque"));
+}
+
+/// Attend qu'une requête tienne le verrou de la liste.
+async fn attendre_que_la_liste_soit_tenue() {
+    for _ in 0..500 {
+        if verrou_de_la_liste().try_lock().is_err() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("la liste n'a jamais été tenue");
+}
+
+#[tokio::test]
+async fn un_marqueur_ni_ecrit_ni_efface_refuse_le_chargement_sans_rien_changer_suite_t17() {
+    let b = Banc::nouveau(true).await;
+    b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
+        .await;
+    b.enregistrer("Headphones").await;
+    b.put_chaine(json!({"version": 1, "plugins": [parametrique()]}))
+        .await;
+    b.enregistrer("Studio").await;
+    let avant = b.settings().get(&cle_chaine_zone(b.zone)).unwrap();
+    bloquer_le_marqueur(&b, MARQUEURS, true, true);
+    let (s, v) = b.appliquer("headphones").await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+    assert_eq!(v["error"], json!("storage_error"));
+    // Rien n'a bougé : la chaîne, et le marqueur qui la décrit toujours.
+    assert_eq!(b.settings().get(&cle_chaine_zone(b.zone)).unwrap(), avant);
+    assert_eq!(b.chaine().plugins[0].id, "equalizer-parametric");
+    assert_eq!(b.get_zone().await["active_preset"], json!("studio"));
 }

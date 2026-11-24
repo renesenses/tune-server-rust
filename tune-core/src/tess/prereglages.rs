@@ -93,8 +93,12 @@ pub enum ErreurPreReglage {
     IdEnDouble(String),
     #[error("le préréglage {0} n'a pas de nom")]
     NomVide(String),
+    #[error("le nom du préréglage {0} dépasse 80 caractères ou contient un caractère de contrôle")]
+    NomInvalide(String),
     #[error("le préréglage Pure doit rester sans traitement")]
     PureModifie,
+    #[error("plus de {max} préréglages ({0})", max = PREREGLAGES_MAX)]
+    TropNombreux(usize),
 }
 
 impl PreReglages {
@@ -107,6 +111,9 @@ impl PreReglages {
     /// ([`ChaineTess::valider`]) : un préréglage Premium reste enregistré sur
     /// un compte redevenu gratuit.
     pub fn verifier(&self) -> Result<(), ErreurPreReglage> {
+        if self.presets.len() > PREREGLAGES_MAX {
+            return Err(ErreurPreReglage::TropNombreux(self.presets.len()));
+        }
         for (i, p) in self.presets.iter().enumerate() {
             if !id_valide(&p.id) {
                 return Err(ErreurPreReglage::IdInvalide(p.id.clone()));
@@ -116,6 +123,10 @@ impl PreReglages {
             }
             if p.name.trim().is_empty() {
                 return Err(ErreurPreReglage::NomVide(p.id.clone()));
+            }
+            // Même règle que les routes d'enregistrement et de renommage.
+            if nom_valide(&p.name).is_none() {
+                return Err(ErreurPreReglage::NomInvalide(p.id.clone()));
             }
             if p.id == ID_PREREGLAGE_PURE && p.chain != PreReglage::pure().chain {
                 return Err(ErreurPreReglage::PureModifie);
@@ -138,39 +149,65 @@ impl ModeApplication {
 /// La clé de réglage GLOBALE qui porte la liste des préréglages et le mode
 /// d'application. Absente : [`PreReglages::default`] (Pure seul, Immédiat).
 /// Elle part dans l'export de configuration comme les autres réglages
-/// globaux ; l'import la relit par [`lire_texte`] et l'écarte si elle ne
-/// passe pas [`PreReglages::verifier`].
+/// globaux ; l'import la relit par [`lire_texte_tolerant`] (toutes les
+/// entrées, comme la base), écarte un fichier illisible ou de plus de
+/// [`PREREGLAGES_IMPORT_MAX`] entrées, et remplace un Pure modifié par le
+/// Pure standard.
 pub const CLE_PREREGLAGES: &str = "tess_presets";
 
 /// Longueur maximale d'un nom de préréglage, en caractères.
 pub const NOM_MAX: usize = 80;
 
-/// Lit une liste de préréglages écrite (base ou fichier d'export) :
-/// tolérante aux champs et valeurs inconnus (comme toute réponse du
-/// contrat), mais cohérente ([`PreReglages::verifier`]).
+/// Nombre maximal de préréglages (Pure compris) qu'on peut CRÉER par la route
+/// d'enregistrement. Une liste plus longue venue d'une version plus lâche ou
+/// d'un import est gardée telle quelle.
+pub const PREREGLAGES_MAX: usize = 200;
+
+/// Au-delà, un fichier d'import est refusé en entier (avertissement), la
+/// liste de la machine reste.
+pub const PREREGLAGES_IMPORT_MAX: usize = 1000;
+
+/// Lit une liste et la soumet aux règles d'ENTRÉE ([`PreReglages::verifier`]) :
+/// tolérante aux champs et valeurs inconnus, mais cohérente. Ni la base ni
+/// l'import ne s'en servent (ils lisent avec [`lire_texte_tolerant`]) ; elle
+/// sert aux vérifications et aux tests.
 pub fn lire_texte(texte: &str) -> Result<PreReglages, String> {
     let l: PreReglages = serde_json::from_str(texte).map_err(|e| e.to_string())?;
     l.verifier().map_err(|e| e.to_string())?;
     Ok(l)
 }
 
+/// Lit une liste avec la tolérance de [`lire`] : toutes les entrées, sans
+/// règle d'entrée. Sert à l'import (un export rendu par ce serveur doit se
+/// réimporter tel quel, même s'il porte une entrée ancienne que les règles
+/// d'aujourd'hui refuseraient). Seul un JSON illisible est une erreur.
+pub fn lire_texte_tolerant(texte: &str) -> Result<PreReglages, String> {
+    serde_json::from_str(texte).map_err(|e| e.to_string())
+}
+
 /// La liste enregistrée sur ce serveur. Absente : la liste par défaut.
-/// Illisible : une erreur (jamais une liste vide qui écraserait l'ancienne).
+/// Illisible (JSON) : une erreur (jamais une liste vide qui écraserait
+/// l'ancienne). Lisible : TOUTES les entrées sont rendues, même celles que
+/// les règles d'entrée refuseraient aujourd'hui (nom trop long, doublon,
+/// au-delà du plafond…). La validation se fait à l'ENTRÉE (enregistrement,
+/// renommage, import), jamais à la lecture : aucune écriture ultérieure ne
+/// supprime en silence le préréglage d'un utilisateur.
 pub fn lire(settings: &crate::db::settings_repo::SettingsRepo) -> Result<PreReglages, String> {
     match settings.get(CLE_PREREGLAGES)? {
         None => Ok(PreReglages::default()),
         Some(t) if t.trim().is_empty() => Ok(PreReglages::default()),
-        Some(t) => lire_texte(&t),
+        Some(t) => serde_json::from_str(&t).map_err(|e| e.to_string()),
     }
 }
 
-/// Écrit la liste, après [`PreReglages::verifier`]. Une valeur de mode
-/// inconnue est enregistrée comme `at_next_playback` (ce qu'elle vaut).
+/// Écrit la liste TELLE QUELLE, sans la revalider : la liste lue est
+/// réécrite avec ses entrées anciennes, et chaque route valide ce qu'elle
+/// AJOUTE ou change. Une valeur de mode inconnue est enregistrée comme
+/// `at_next_playback` (ce qu'elle vaut).
 pub fn ecrire(
     settings: &crate::db::settings_repo::SettingsRepo,
     liste: &PreReglages,
 ) -> Result<(), String> {
-    liste.verifier().map_err(|e| e.to_string())?;
     let mut liste = liste.clone();
     if liste.apply_mode == ModeApplication::Unknown {
         liste.apply_mode = ModeApplication::AtNextPlayback;
@@ -182,8 +219,24 @@ pub fn ecrire(
 /// Le nom choisi, nettoyé : espaces de bord retirés, ni vide ni trop long.
 pub fn nom_valide(nom: &str) -> Option<String> {
     let n = nom.trim();
-    (!n.is_empty() && n.chars().count() <= NOM_MAX && !n.chars().any(char::is_control))
-        .then(|| n.to_owned())
+    (!n.is_empty()
+        && n.chars().count() <= NOM_MAX
+        && !n.chars().any(|c| c.is_control() || caractere_de_format(c)))
+    .then(|| n.to_owned())
+}
+
+/// Caractère invisible de la catégorie Unicode Cf (format) : espaces de
+/// largeur nulle, marques et contrôles de direction (qui retournent un nom à
+/// l'affichage), BOM, tirets conditionnels, étiquettes.
+pub fn caractere_de_format(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}'
+        | '\u{0890}'..='\u{0891}' | '\u{08E2}' | '\u{180E}'
+        | '\u{200B}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}'
+        | '\u{FFF9}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}'
+        | '\u{13430}'..='\u{1343F}' | '\u{1BCA0}'..='\u{1BCA3}'
+        | '\u{1D173}'..='\u{1D17A}' | '\u{E0001}' | '\u{E0020}'..='\u{E007F}')
 }
 
 /// Un identifiant stable tiré du nom (« Evening listening » →
@@ -392,26 +445,28 @@ mod tests {
     }
 
     #[test]
-    fn une_liste_incoherente_n_est_ni_ecrite_ni_lue_t17() {
+    fn une_liste_incoherente_est_lue_sans_perte_et_refusee_a_l_import_t17() {
         let s = reglages();
         let mut l = PreReglages::default();
         l.presets.push(soiree());
         l.presets.push(soiree());
-        assert!(ecrire(&s, &l).is_err());
-        // Rien n'a été écrit : la liste par défaut reste.
-        assert_eq!(lire(&s).unwrap(), PreReglages::default());
         // Une base (ou un fichier) illisible est une erreur, jamais une
         // liste vide qui écraserait l'ancienne.
         s.set(CLE_PREREGLAGES, "{pas du json").unwrap();
         assert!(lire(&s).is_err());
-        s.set(CLE_PREREGLAGES, &serde_json::to_string(&l).unwrap())
-            .unwrap();
-        assert!(lire(&s).unwrap_err().contains("deux fois"));
-        // Contre-épreuve : la même liste sans le doublon se lit.
-        l.presets.pop();
+        // Lisible mais incohérente (écrite par une version plus lâche) : rien
+        // n'est perdu, ni à la lecture ni à la réécriture.
         s.set(CLE_PREREGLAGES, &serde_json::to_string(&l).unwrap())
             .unwrap();
         assert_eq!(lire(&s).unwrap(), l);
+        ecrire(&s, &lire(&s).unwrap()).unwrap();
+        assert_eq!(lire(&s).unwrap(), l);
+        // Contre-épreuve : l'import (lecture stricte) refuse le doublon.
+        assert!(
+            lire_texte(&serde_json::to_string(&l).unwrap())
+                .unwrap_err()
+                .contains("deux fois")
+        );
     }
 
     #[test]
@@ -461,5 +516,104 @@ mod tests {
         assert_eq!(nom_valide("a\nb"), None);
         assert!(nom_valide(&"é".repeat(NOM_MAX)).is_some());
         assert_eq!(nom_valide(&"é".repeat(NOM_MAX + 1)), None);
+    }
+
+    #[test]
+    fn verifier_borne_le_nom_comme_la_route_suite_t17() {
+        let base = || {
+            let mut l = PreReglages::default();
+            l.presets.push(soiree());
+            l
+        };
+        for mauvais in [
+            "é".repeat(NOM_MAX + 1),
+            "a\u{7}b".into(),
+            "Soir\nMatin".into(),
+        ] {
+            let mut l = base();
+            l.presets[1].name = mauvais.clone();
+            assert_eq!(
+                l.verifier(),
+                Err(ErreurPreReglage::NomInvalide("evening-listening".into())),
+                "{mauvais:?}"
+            );
+            // L'import (même lecture) l'écarte aussi.
+            assert!(lire_texte(&serde_json::to_string(&l).unwrap()).is_err());
+        }
+        // Contre-épreuve : 80 caractères, espaces de bord compris, passent.
+        let mut l = base();
+        l.presets[1].name = format!(" {} ", "é".repeat(NOM_MAX));
+        l.verifier().unwrap();
+        lire_texte(&serde_json::to_string(&l).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn les_caracteres_invisibles_de_format_sont_refuses_suite_t17() {
+        for c in [
+            '\u{200B}', '\u{200E}', '\u{200F}', '\u{202A}', '\u{202E}', '\u{2066}', '\u{2069}',
+            '\u{FEFF}', '\u{00AD}',
+        ] {
+            let nom = format!("Soi{c}rée");
+            assert_eq!(nom_valide(&nom), None, "U+{:04X}", c as u32);
+        }
+        // Contre-épreuves : accents, idéogrammes, emoji passent, ainsi que
+        // ZWNJ (U+200C, persan) et ZWJ (U+200D, emoji composés).
+        for nom in [
+            "Café crème",
+            "耳机",
+            "Écoute 🎧",
+            "می\u{200C}خواهم",
+            "👨\u{200D}👩\u{200D}👧",
+        ] {
+            assert!(nom_valide(nom).is_some(), "{nom}");
+        }
+    }
+
+    #[test]
+    fn une_entree_stockee_invalide_survit_a_la_lecture_et_a_la_reecriture_suite_t17() {
+        let s = reglages();
+        let mut l = PreReglages::default();
+        l.presets.push(soiree());
+        let mut long = soiree();
+        long.id = "trop-long".into();
+        long.name = "x".repeat(NOM_MAX + 1);
+        l.presets.push(long.clone());
+        s.set(CLE_PREREGLAGES, &serde_json::to_string(&l).unwrap())
+            .unwrap();
+        let mut lue = lire(&s).unwrap();
+        assert_eq!(lue, l);
+        // Une écriture ultérieure (ajout d'un autre préréglage) la garde.
+        let mut autre = soiree();
+        autre.id = "autre".into();
+        lue.presets.push(autre);
+        ecrire(&s, &lue).unwrap();
+        assert!(lire(&s).unwrap().presets.contains(&long));
+        // L'import, lui, refuse la liste (règle d'entrée).
+        assert!(lire_texte(&serde_json::to_string(&l).unwrap()).is_err());
+    }
+
+    #[test]
+    fn deux_cents_preregages_au_plus_a_l_import_suite_t17() {
+        let mut l = PreReglages::default();
+        for i in 1..PREREGLAGES_MAX {
+            let mut p = soiree();
+            p.id = format!("p{i}");
+            l.presets.push(p);
+        }
+        assert_eq!(l.presets.len(), PREREGLAGES_MAX);
+        l.verifier().unwrap();
+        let mut p = soiree();
+        p.id = "un-de-trop".into();
+        l.presets.push(p);
+        assert_eq!(
+            l.verifier(),
+            Err(ErreurPreReglage::TropNombreux(PREREGLAGES_MAX + 1))
+        );
+        // L'import refuse ; une base qui en a déjà plus les garde tous.
+        assert!(lire_texte(&serde_json::to_string(&l).unwrap()).is_err());
+        let s = reglages();
+        s.set(CLE_PREREGLAGES, &serde_json::to_string(&l).unwrap())
+            .unwrap();
+        assert_eq!(lire(&s).unwrap().presets.len(), PREREGLAGES_MAX + 1);
     }
 }

@@ -24,9 +24,13 @@
 //!
 //! **Mode d'application** (`apply_mode`, global, suivi par le `PUT` comme par
 //! le chargement d'un préréglage) :
-//! - `immediately` : la sortie vivante est rafraîchie tout de suite (à chaud
-//!   en local ; relance du flux réseau à la position, #8422, une seule par
-//!   rafale grâce à l'anti-rebond et au plancher des relances) ;
+//! - `immediately` : la sortie vivante est rafraîchie tout de suite, par les
+//!   chemins des anciennes routes : à chaud en local ; sur une zone réseau
+//!   qui joue, SEUL l'égaliseur relance le flux à la position (#8422, une
+//!   relance par rafale grâce à l'anti-rebond et au plancher) ; le crossfeed
+//!   réseau prend effet à la piste suivante ; mono, réaffectation,
+//!   suréchantillonnage et convolution n'agissent qu'en local (le prochain
+//!   flux réseau les porte) ;
 //! - `at_next_playback` (et toute valeur inconnue) : rien n'interrompt la
 //!   lecture. Les anciennes clés sont écrites, donc le prochain flux réseau
 //!   part avec ; sur une sortie locale, ce qui reste à rafraîchir l'est au
@@ -93,7 +97,7 @@ fn nom_invalide() -> Response {
 }
 
 /// Une modification de la liste à la fois (lecture, changement, écriture).
-fn verrou_de_la_liste() -> &'static tokio::sync::Mutex<()> {
+pub fn verrou_de_la_liste() -> &'static tokio::sync::Mutex<()> {
     static VERROU: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     VERROU.get_or_init(Default::default)
 }
@@ -153,6 +157,16 @@ pub async fn enregistrer_prereglage(State(state): State<AppState>, corps: Bytes)
         return nom_invalide();
     };
     let settings = settings_de(&state);
+    // Ordre des verrous : liste, puis zone. Le verrou de la zone est pris
+    // AVANT de lire sa chaîne et tenu jusqu'à la pose du marqueur : un `PUT`
+    // intercalé passe avant (sa chaîne est enregistrée) ou après (il
+    // décide alors du marqueur), jamais entre les deux.
+    let _liste = verrou_de_la_liste().lock().await;
+    let verrou_zone = corps.zone_id.map(verrou_des_put);
+    let _zone = match &verrou_zone {
+        Some(v) => Some(v.lock().await),
+        None => None,
+    };
     let chaine = match (corps.zone_id, corps.chain) {
         (Some(zone_id), None) => {
             if let Err(r) = zone_de(&state, zone_id) {
@@ -196,11 +210,21 @@ pub async fn enregistrer_prereglage(State(state): State<AppState>, corps: Bytes)
             attendue: tune_core::tess::VERSION_CHAINE,
         });
     }
-    let _garde = verrou_de_la_liste().lock().await;
     let mut liste = match prereglages::lire(&settings) {
         Ok(l) => l,
         Err(e) => return stockage(e),
     };
+    if liste.presets.len() >= prereglages::PREREGLAGES_MAX {
+        return erreur(
+            StatusCode::CONFLICT,
+            "too_many_presets",
+            &format!(
+                "This server keeps at most {} presets. Delete one first.",
+                prereglages::PREREGLAGES_MAX
+            ),
+            None,
+        );
+    }
     let p = PreReglage {
         id: prereglages::id_pour_nom(&nom, &liste),
         name: nom,
@@ -211,12 +235,50 @@ pub async fn enregistrer_prereglage(State(state): State<AppState>, corps: Bytes)
     if let Err(e) = prereglages::ecrire(&settings, &liste) {
         return stockage(e);
     }
-    if let Some(zone_id) = corps.zone_id {
-        let _ = settings.set(&cle_prereglage_actif(zone_id), &p.id);
+    // Le préréglage est créé : un échec du marqueur ne le défait pas (un 500
+    // pousserait à recréer un doublon `…-2`) ; il est dit en avertissement.
+    let mut avertissements = Vec::new();
+    if let Some(zone_id) = corps.zone_id
+        && let Some(a) = poser_le_marqueur(&settings, zone_id, &p.id)
+    {
+        avertissements.push(a);
     }
     info!(preset_id = %p.id, zone_id = ?corps.zone_id, "tess_prereglage_enregistre");
-    (StatusCode::CREATED, Json(p)).into_response()
+    let mut v = serde_json::to_value(&p).unwrap_or_else(|_| json!({}));
+    if !avertissements.is_empty()
+        && let Some(o) = v.as_object_mut()
+    {
+        o.insert("warnings".into(), json!(avertissements));
+    }
+    (StatusCode::CREATED, Json(v)).into_response()
 }
+
+/// Pose le marqueur « ACTIVE » de la zone. En cas d'échec : journalisé,
+/// l'ancien marqueur est effacé au mieux (aucun marqueur plutôt qu'un
+/// marqueur faux) et un avertissement est rendu, jamais une erreur.
+fn poser_le_marqueur(settings: &SettingsRepo, zone_id: i64, preset_id: &str) -> Option<String> {
+    let cle = cle_prereglage_actif(zone_id);
+    let e = settings.set(&cle, preset_id).err()?;
+    warn!(zone_id, preset_id, erreur = %e, "tess_marqueur_actif_non_pose");
+    effacer_le_marqueur(settings, zone_id);
+    Some(AVERTISSEMENT_MARQUEUR.to_owned())
+}
+
+/// Efface le marqueur au mieux : suppression, ou à défaut valeur vide (lue
+/// comme « aucun préréglage actif »). Rend `false` si les deux échouent.
+fn effacer_le_marqueur(settings: &SettingsRepo, zone_id: i64) -> bool {
+    let cle = cle_prereglage_actif(zone_id);
+    match settings.delete(&cle) {
+        Ok(_) => true,
+        Err(e) => {
+            warn!(zone_id, erreur = %e, "tess_marqueur_actif_non_efface");
+            settings.set(&cle, "").is_ok()
+        }
+    }
+}
+
+/// L'avertissement rendu quand le marqueur « ACTIVE » n'a pas pu être écrit.
+pub const AVERTISSEMENT_MARQUEUR: &str = "active_preset_not_stored";
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -282,8 +344,9 @@ pub async fn supprimer_prereglage(
     {
         let Some(id) = zone.id else { continue };
         let cle = cle_prereglage_actif(id);
+        // Une zone dont le marqueur ne s'efface pas n'arrête pas les autres.
         if settings.get(&cle).ok().flatten().as_deref() == Some(preset_id.as_str()) {
-            let _ = settings.delete(&cle);
+            effacer_le_marqueur(&settings, id);
         }
     }
     info!(preset_id = %preset_id, "tess_prereglage_supprime");
@@ -324,7 +387,31 @@ pub async fn regler_le_mode(State(state): State<AppState>, corps: Bytes) -> Resp
     if let Err(e) = prereglages::ecrire(&settings, &liste) {
         return stockage(e);
     }
+    drop(_garde);
+    // Passer en « Immediately » : ce qui attendait la prochaine lecture
+    // atteint la sortie vivante maintenant, et la file se vide.
+    if mode.immediat() {
+        appliquer_toute_l_attente(&state).await;
+    }
     Json(liste).into_response()
+}
+
+/// Sert tout ce qui attend une prochaine lecture, zone par zone (sous le
+/// verrou des `PUT` de chaque zone), et vide la file.
+async fn appliquer_toute_l_attente(state: &AppState) {
+    let zones: Vec<i64> = en_attente()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .keys()
+        .copied()
+        .collect();
+    for zone_id in zones {
+        // Toutes les sorties, réseau compris, par le même `rafraichir` que le
+        // `PUT` en mode immédiat : sur une zone réseau qui joue, l'égaliseur
+        // relance le flux à la position ; le crossfeed réseau attend la piste
+        // suivante ; le reste n'agit qu'en local.
+        servir_l_attente(state, zone_id, true).await;
+    }
 }
 
 // ── Chargement sur une zone ─────────────────────────────────────────
@@ -369,6 +456,11 @@ pub async fn appliquer_prereglage(
         Err(r) => return r,
     };
     let settings = settings_de(&state);
+    // Le verrou de la liste est tenu jusqu'à la pose du marqueur : une
+    // suppression concurrente passe avant (404) ou après (elle efface alors
+    // le marqueur), jamais entre les deux. Ordre des verrous : liste, puis
+    // zone (comme à l'enregistrement).
+    let _liste = verrou_de_la_liste().lock().await;
     let liste = match prereglages::lire(&settings) {
         Ok(l) => l,
         Err(e) => return stockage(e),
@@ -384,16 +476,62 @@ pub async fn appliquer_prereglage(
     let catalogue = catalogue_du_serveur();
     let verrou = verrou_des_put(id);
     let _garde = verrou.lock().await;
+    // Le marqueur est effacé AVANT d'écrire la chaîne : si l'écriture du
+    // nouveau échoue ensuite, il n'en reste aucun (jamais un faux). S'il ne
+    // peut même pas être effacé, rien n'est modifié : refus propre. L'ancien
+    // marqueur et la chaîne enregistrée sont notés pour le remettre si le
+    // `PUT` refuse (402, 409, 400…) sans toucher à la chaîne.
+    let cle_actif = cle_prereglage_actif(id);
+    let ancien_marqueur = settings
+        .get(&cle_actif)
+        .ok()
+        .flatten()
+        .filter(|m| !m.is_empty());
+    let chaine_avant = settings
+        .get(&tune_core::tess::cle_chaine_zone(id))
+        .ok()
+        .flatten();
+    if !effacer_le_marqueur(&settings, id) {
+        return erreur(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage_error",
+            "The active preset of the zone could not be cleared; nothing was changed. Try again.",
+            Some(&p.id),
+        );
+    }
     let cat = catalogue.clone();
     let s = settings_de(&state);
     let resultat =
         tokio::task::spawn_blocking(move || appliquer_le_put(&s, id, &corps, premium, &cat)).await;
-    let (lecture, cles) = match resultat {
-        Ok(Ok(x)) => x,
-        Ok(Err(r)) => return r,
-        Err(e) => return erreur_migration(&ErreurMigration::Stockage(e.to_string())),
+    let resultat = match resultat {
+        Ok(r) => r,
+        Err(e) => Err(erreur_migration(&ErreurMigration::Stockage(e.to_string()))),
     };
-    let _ = settings.set(&cle_prereglage_actif(id), &p.id);
+    let (lecture, cles) = match resultat {
+        Ok(x) => x,
+        Err(r) => {
+            // Refusé : si la chaîne enregistrée n'a pas bougé, l'ancien
+            // marqueur la décrit toujours et revient. (Si elle a bougé, aucun
+            // marqueur plutôt qu'un faux.)
+            let chaine_apres = settings
+                .get(&tune_core::tess::cle_chaine_zone(id))
+                .ok()
+                .flatten();
+            if chaine_apres == chaine_avant
+                && let Some(m) = &ancien_marqueur
+                && let Err(e) = settings.set(&cle_actif, m)
+            {
+                warn!(zone_id = id, erreur = %e, "tess_marqueur_actif_non_remis");
+            }
+            return r;
+        }
+    };
+    // La chaîne est écrite : quoi qu'il arrive au marqueur, elle atteint la
+    // sortie selon le mode, et la réponse est un succès.
+    let avertissements: Vec<String> = poser_le_marqueur(&settings, id, &p.id)
+        .into_iter()
+        .collect();
+    drop(_liste);
     let mode = appliquer_selon_le_mode(&state, &zone, cles.clone()).await;
     info!(zone_id = id, preset_id = %p.id, cles = ?cles, mode = ?mode, "tess_prereglage_charge");
     let reponse = reponse_de_zone(&state, &zone, lecture, premium, catalogue).await;
@@ -402,6 +540,7 @@ pub async fn appliquer_prereglage(
         "preset_id": p.id,
         "apply_mode": if mode.immediat() { "immediately" } else { "at_next_playback" },
         "not_applied": non_appliques,
+        "warnings": avertissements,
         "zone": reponse,
     }))
     .into_response()
@@ -413,19 +552,27 @@ pub(super) fn oublier_le_prereglage_s_il_differe(
     state: &AppState,
     zone_id: i64,
     chaine: &ChaineTess,
-) {
+) -> Option<String> {
     let settings = settings_de(state);
     let cle = cle_prereglage_actif(zone_id);
-    let Some(actif) = settings.get(&cle).ok().flatten().filter(|a| !a.is_empty()) else {
-        return;
-    };
+    let actif = settings
+        .get(&cle)
+        .ok()
+        .flatten()
+        .filter(|a| !a.is_empty())?;
+    // La chaîne ENREGISTRÉE (sans les droits) : sur un compte gratuit, la vue
+    // convertie (P2) ne doit pas faire croire que la chaîne a changé.
+    let enregistree = lire_zone(&settings, zone_id, true)
+        .map(|l| l.chaine)
+        .unwrap_or_else(|_| chaine.clone());
     let decrit = prereglages::lire(&settings)
         .ok()
         .and_then(|l| l.get(&actif).cloned())
-        .is_some_and(|p| sans_champs_du_serveur(&p.chain) == sans_champs_du_serveur(chaine));
-    if !decrit {
-        let _ = settings.delete(&cle);
+        .is_some_and(|p| sans_champs_du_serveur(&p.chain) == sans_champs_du_serveur(&enregistree));
+    if !decrit && !effacer_le_marqueur(&settings, zone_id) {
+        return Some(AVERTISSEMENT_MARQUEUR.to_owned());
     }
+    None
 }
 
 // ── Mode d'application ──────────────────────────────────────────────
@@ -504,6 +651,35 @@ pub(super) async fn appliquer_selon_le_mode(
 /// réseau, lui, vient d'être fabriqué avec les clés déjà écrites : rien à
 /// relancer (jamais de relance juste après un démarrage).
 pub async fn appliquer_a_la_lecture(state: &AppState, zone_id: i64) {
+    servir_l_attente(state, zone_id, false).await;
+}
+
+/// Combien de rafraîchissements de la sortie vivante la file d'attente a
+/// DEMANDÉS pour la zone (banc et diagnostic). Compte des demandes, pas des
+/// relances : ce qu'une demande produit sur la sortie dépend de l'étage
+/// (voir l'en-tête du module).
+pub fn rafraichissements_demandes(zone_id: i64) -> usize {
+    rafraichis()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(&zone_id)
+        .copied()
+        .unwrap_or(0)
+}
+
+fn rafraichis() -> &'static Mutex<HashMap<i64, usize>> {
+    static R: OnceLock<Mutex<HashMap<i64, usize>>> = OnceLock::new();
+    R.get_or_init(Default::default)
+}
+
+/// Sert la file d'une zone. `toutes_sorties` : rafraîchit aussi une sortie
+/// réseau (passage en immédiat) ; sinon, au démarrage d'une lecture, seule
+/// une sortie locale l'est (le flux réseau vient d'être fabriqué).
+async fn servir_l_attente(state: &AppState, zone_id: i64, toutes_sorties: bool) {
+    // Sous le verrou des `PUT` de la zone : un `PUT` (ou un chargement) en
+    // cours écrit ses clés et décide de leur sort avant que la file soit lue.
+    let verrou = verrou_des_put(zone_id);
+    let _garde = verrou.lock().await;
     let cles = prendre_en_attente(zone_id);
     if cles.is_empty() {
         return;
@@ -511,14 +687,23 @@ pub async fn appliquer_a_la_lecture(state: &AppState, zone_id: i64) {
     let Ok(zone) = zone_de(state, zone_id) else {
         return;
     };
-    let locale = zone
-        .output_device_id
-        .as_deref()
-        .is_none_or(|d| d.starts_with("local:"));
-    if locale {
+    let locale = sortie_locale(&zone);
+    if locale || toutes_sorties {
+        *rafraichis()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(zone_id)
+            .or_default() += 1;
         rafraichir(state, &zone, &cles).await;
     }
     info!(zone_id, cles = ?cles, locale, "tess_applique_au_demarrage");
+}
+
+/// La zone sort-elle sur une sortie locale ? Lu dans `output_type` (absent =
+/// locale), comme le volume de TESS : une zone réseau sans appareil connu
+/// n'est pas locale.
+pub fn sortie_locale(zone: &Zone) -> bool {
+    zone.output_type.as_deref().unwrap_or("local") == "local"
 }
 
 /// Écoute les démarrages de lecture (`started`) pour le mode
