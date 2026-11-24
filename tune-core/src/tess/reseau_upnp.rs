@@ -733,10 +733,19 @@ mod tests {
             (&["equalizer-graphic", "crossfeed"][..], Refused),
         ] {
             let mut r = resoudre(ids, false, PCM24);
-            let avant = r.clone();
+            let greffons = |r: &Resolution| -> Vec<EtapeResolue> {
+                r.etapes
+                    .iter()
+                    .filter(|e| e.code == CodeEtape::Plugin)
+                    .cloned()
+                    .collect()
+            };
+            let avant = greffons(&r);
             let a = acheminer(&r, &faits(l, false, Library));
             appliquer(&mut r, &a);
-            assert_eq!(r, avant, "{ids:?} {l:?}");
+            // Aucun greffon n'est éteint ; seul le headroom (appliqué sur
+            // aucune voie UPnP) l'est.
+            assert_eq!(greffons(&r), avant, "{ids:?} {l:?}");
             assert_eq!(r.badge, Badge::ProcessedByTess);
         }
     }

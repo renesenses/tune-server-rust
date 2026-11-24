@@ -885,33 +885,58 @@ fn la_capacite_de_volume_retenue_survit_a_une_sortie_occupee() {
     assert_eq!(volume_reglable_retenu("uuid:autre-t12b", None), None);
 }
 
-/// Relecture du 24/11 (3e), contre la LECTURE réelle : une chaîne avec
-/// upsampling et headroom manuel, opt-in armé, lecteur L24 : la lecture n'en
-/// lit rien et sert la source à l'octet ; l'état dit `untouched`, les deux
-/// étages `not_applied_on_transport`, et le badge « Bit-perfect », comme
-/// `delivery`.
+/// Relecture du 24/11 (3e), contre la LECTURE réelle : opt-in armé, lecteur
+/// L24, la lecture sert la source à l'octet (elle ne lit ni `Upsampling` ni
+/// `Headroom`) ; l'état de la même zone, chaîne avec upsampling et headroom
+/// manuel, dit `untouched`, les deux étages `not_applied_on_transport`, et le
+/// badge « Bit-perfect », comme `delivery` et comme les octets.
 #[tokio::test]
 async fn upsampling_et_headroom_ne_sont_pas_annonces_quand_la_lecture_sert_la_source() {
     let b = banc(SINK_COMPLET).await;
     let id = piste(&b.orch, PISTE_24.0, PISTE_24.1, PISTE_24.2);
     b.opt_in();
-    let mut chaine = crate::tess::ChaineTess::default();
+    // La lecture : rien dans ses réglages ne l'invite à traiter.
+    let s = jouer(&b, id).await;
+    assert_eq!(s.voie, voie::FICHIER_TEL_QUEL, "la lecture ne lit ni l'un ni l'autre");
+    assert_eq!(sha(&s.octets), sha(&source(PISTE_24.0).0));
+    // L'état : la chaîne de la zone, avec upsampling et headroom manuel.
+    let settings = SettingsRepo::with_backend(b.orch.db.clone());
+    let mut chaine = crate::tess::migration::lire_zone(&settings, b.zone_id, true)
+        .unwrap()
+        .chaine;
     chaine.fixed.upsampling = crate::tess::Upsampling::Pcm {
         filter: "polyvalent".into(),
         max_ratio: Some(2),
         max_rate_hz: None,
     };
     chaine.fixed.headroom = crate::tess::Headroom::Manual { db: -3.0 };
-    b.reglage(
-        &crate::tess::cle_chaine_zone(b.zone_id),
-        &serde_json::to_string(&chaine).unwrap(),
+    let faits = b.faits(24).await;
+    let tout = |_: &str| true;
+    let ctx = ContexteExecution {
+        transport: TransportZone::Dlna,
+        source: Some(SourceFlux::Pcm {
+            sample_rate_hz: 96_000,
+            bits: 24,
+            channels: 2,
+        }),
+        premium: true,
+        greffon_disponible: &tout,
+        pure: false,
+        volume: VolumeZone {
+            control: ControleVolume::Device,
+            db: 0.0,
+        },
+    };
+    let etat = ReponseTessZone::depuis_avec_le_lecteur(
+        b.zone_id,
+        chaine,
+        None,
+        catalogue_de_reference(),
+        &ctx,
+        Some(&faits),
     );
-    let s = jouer(&b, id).await;
-    assert_eq!(s.voie, voie::FICHIER_TEL_QUEL, "la lecture ne lit ni l'un ni l'autre");
-    assert_eq!(sha(&s.octets), sha(&source(PISTE_24.0).0));
-    let etat = b.etat_tess(96_000, 24).await;
     assert_eq!(etat.delivery.as_ref().unwrap().route, VoieUpnp::Untouched);
-    assert_eq!(etat.badge, Badge::BitPerfect);
+    assert_eq!(etat.badge, Badge::BitPerfect, "badge = delivery = octets servis");
     for code in [crate::tess::CodeEtape::Upsampling, crate::tess::CodeEtape::Headroom] {
         let e = etat.signal_path.iter().find(|e| e.code == code).unwrap();
         assert!(e.requested && !e.effective, "{code:?}");
