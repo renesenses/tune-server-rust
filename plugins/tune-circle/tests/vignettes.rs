@@ -42,6 +42,8 @@ struct Faux {
     quota: Option<usize>,
     /// Jetons vus sur chaque appel du serveur : (Bearer, X-Tune-Server-Token).
     jetons: Vec<(String, String)>,
+    /// #9337 — lectures de vignette de contact reçues par le cloud.
+    lectures_de_vignette: usize,
 }
 
 type Partage = Arc<Mutex<Faux>>;
@@ -128,7 +130,12 @@ const SHA_DU_CONTACT: &str = "7dd7622944e688de7d6cde44858de18dd49d835d1c4146427c
 const ETAG_DU_CONTACT: &str =
     "\"7dd7622944e688de7d6cde44858de18dd49d835d1c4146427c36153bd2610d7b\"";
 
-async fn vignette_du_contact(Path((uid, album)): Path<(String, String)>, h: HeaderMap) -> Response {
+async fn vignette_du_contact(
+    State(e): State<Partage>,
+    Path((uid, album)): Path<(String, String)>,
+    h: HeaderMap,
+) -> Response {
+    e.lock().unwrap().lectures_de_vignette += 1;
     if uid != CONTACT || album != "10" {
         return (
             StatusCode::NOT_FOUND,
@@ -615,6 +622,79 @@ async fn la_vignette_versionnee_se_garde_une_semaine_2985() {
         assert_eq!(r.statut, StatusCode::OK, "{autre}");
         assert_eq!(cache(&r), "private, max-age=3600", "{autre}");
     }
+}
+
+/// #9337 — une grille de contact rouverte ne repasse plus par le cloud pour
+/// une vignette déjà vue : l'adresse versionnée (`?v=` = début du sha256 que
+/// le cloud rend en ETag) désigne des octets immuables, que CE serveur garde
+/// en mémoire. Un autre navigateur, un autre appareil ou une adresse de pont
+/// dont le jeton change en profitent aussi (le cache du navigateur, lui, ne
+/// sert que la même adresse dans le même navigateur).
+///
+/// Contre-épreuves : sans `v`, ou avec un `v` qui ne correspond pas, chaque
+/// lecture repart au cloud ; un 304 se rend depuis la copie gardée ; sans
+/// session, rien n'est servi, pas même la copie.
+#[tokio::test]
+async fn une_vignette_versionnee_deja_vue_ne_repasse_plus_par_le_cloud_9337() {
+    let banc = demarrer().await;
+    let dossier = dossier_de_pochettes();
+    let backend = bibliotheque(&banc, &dossier, 0);
+    let relais = Arc::new(tune_circle::relais::Relais::new(backend.clone()));
+    let app = tune_circle::routes::router_des_vignettes(
+        relais,
+        Arc::new(vignettes_de(&banc, &backend, &dossier)),
+    );
+    let lectures = || banc.etat.lock().unwrap().lectures_de_vignette;
+    let v = &SHA_DU_CONTACT[..16];
+    let chemin = format!("/contacts/7/library/albums/10/thumbnail?v={v}");
+    let r = appel(&app, "GET", &chemin, None).await;
+    assert_eq!(r.statut, StatusCode::OK);
+    assert_eq!(lectures(), 1, "première lecture : par le cloud");
+    for _ in 0..3 {
+        let r = appel(&app, "GET", &chemin, None).await;
+        assert_eq!(r.statut, StatusCode::OK);
+        assert_eq!(r.octets, IMAGE_DU_CONTACT);
+        assert_eq!(r.entetes[header::CONTENT_TYPE], "image/jpeg");
+        assert_eq!(r.entetes[header::ETAG], ETAG_DU_CONTACT);
+        assert_eq!(
+            r.entetes[header::CACHE_CONTROL],
+            "private, max-age=604800, immutable"
+        );
+    }
+    assert_eq!(
+        lectures(),
+        1,
+        "#9337 : une vignette déjà vue repart au cloud"
+    );
+    // Le 304 se rend aussi depuis la copie gardée.
+    let r = appel_avec_entetes(
+        &app,
+        "GET",
+        &chemin,
+        None,
+        &[("if-none-match", ETAG_DU_CONTACT)],
+    )
+    .await;
+    assert_eq!(r.statut, StatusCode::NOT_MODIFIED);
+    assert!(r.octets.is_empty());
+    assert_eq!(lectures(), 1);
+    // Contre-épreuve : sans `v`, ou un `v` qui ne désigne pas ces octets,
+    // la lecture repart au cloud à chaque fois.
+    for autre in [
+        "/contacts/7/library/albums/10/thumbnail",
+        "/contacts/7/library/albums/10/thumbnail?v=0000000000000000",
+    ] {
+        let avant = lectures();
+        assert_eq!(appel(&app, "GET", autre, None).await.statut, StatusCode::OK);
+        assert_eq!(appel(&app, "GET", autre, None).await.statut, StatusCode::OK);
+        assert_eq!(lectures(), avant + 2, "{autre}");
+    }
+    // Sans session : 412, la copie gardée ne sort pas.
+    SettingsRepo::with_backend(backend.clone())
+        .delete("mozaik_access_token")
+        .unwrap();
+    let r = appel(&app, "GET", &chemin, None).await;
+    assert_eq!(r.statut, StatusCode::PRECONDITION_FAILED);
 }
 
 // 5. #6733 — le débit et l'ordre ---------------------------------------------

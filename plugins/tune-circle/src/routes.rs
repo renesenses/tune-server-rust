@@ -247,6 +247,8 @@ pub fn router(relais: Arc<Relais>, license: Arc<LicenseManager>) -> Router<()> {
 pub struct EtatDesVignettes {
     pub relais: Arc<Relais>,
     pub vignettes: Arc<crate::vignettes::Vignettes>,
+    /// #9337 — les vignettes versionnées déjà relayées.
+    gardees: crate::vignettes_gardees::VignettesGardees,
 }
 
 /// | Tune (`/api/v1/ext/circle`)                                   | mozaiklabs (`/api/v1/circle`) |
@@ -267,7 +269,11 @@ pub fn router_des_vignettes(
             "/contacts/{user_id}/library/albums/{album_id}/thumbnail",
             get(vignette_d_un_contact),
         )
-        .with_state(Arc::new(EtatDesVignettes { relais, vignettes }))
+        .with_state(Arc::new(EtatDesVignettes {
+            relais,
+            vignettes,
+            gardees: crate::vignettes_gardees::VignettesGardees::new(),
+        }))
 }
 
 async fn etat_du_partage_des_pochettes(State(e): State<Arc<EtatDesVignettes>>) -> Response {
@@ -312,6 +318,39 @@ async fn vignette_d_un_contact(
     let version = requete
         .as_deref()
         .and_then(|q| q.split('&').find_map(|p| p.strip_prefix("v=")));
+    // #9337 — une adresse versionnée déjà relayée se sert d'ici, sans
+    // repasser par le cloud ; jamais sans session.
+    if let Some(v) = version.filter(|v| version_lisible(v))
+        && let Some(gardee) = e.gardees.lire(&user_id, &album_id, v)
+        && e.relais.session_ouverte()
+    {
+        let deja_a_jour = entetes
+            .get(header::IF_NONE_MATCH)
+            .and_then(|h| h.to_str().ok())
+            .is_some_and(|h| {
+                h.split(',')
+                    .any(|x| x.trim().as_bytes() == gardee.etag.as_bytes())
+            });
+        let mut r = if deja_a_jour {
+            StatusCode::NOT_MODIFIED.into_response()
+        } else {
+            let mut r = (StatusCode::OK, Body::from(gardee.corps)).into_response();
+            r.headers_mut()
+                .insert(header::CONTENT_TYPE, gardee.type_mime);
+            r.headers_mut().insert(
+                header::X_CONTENT_TYPE_OPTIONS,
+                axum::http::HeaderValue::from_static("nosniff"),
+            );
+            r
+        };
+        let h = r.headers_mut();
+        h.insert(
+            header::CACHE_CONTROL,
+            cache_de_vignette(Some(v), Some(&gardee.etag)),
+        );
+        h.insert(header::ETAG, gardee.etag);
+        return r;
+    }
     match e
         .relais
         .lire_image(
@@ -335,6 +374,20 @@ async fn vignette_d_un_contact(
             type_mime,
             etag,
         } => {
+            if let (Some(v), Some(etag)) = (version, etag.as_ref())
+                && version_figee(Some(v), Some(etag))
+            {
+                e.gardees.garder(
+                    &user_id,
+                    &album_id,
+                    v,
+                    crate::vignettes_gardees::Vignette {
+                        corps: corps.clone(),
+                        type_mime: type_mime.clone(),
+                        etag: etag.clone(),
+                    },
+                );
+            }
             let mut r = (StatusCode::OK, Body::from(corps)).into_response();
             let h = r.headers_mut();
             h.insert(header::CONTENT_TYPE, type_mime);
@@ -390,33 +443,44 @@ async fn vignette_d_un_contact(
 /// par pochette, vers le cloud (≈ 0,2 à 0,4 s chacune, et 600 par minute au
 /// plus chez mozaiklabs).
 ///
-/// Rien n'est gardé par CE serveur : la règle du greffon (« une révocation
-/// vue par le cloud est vraie au prochain appel ») tient, puisque ces
-/// adresses ne s'obtiennent qu'en relisant la liste des albums, qui, elle,
-/// passe toujours par le cloud et répond 404 au partage coupé.
+/// La règle du greffon (« une révocation vue par le cloud est vraie au
+/// prochain appel ») tient, puisque ces adresses ne s'obtiennent qu'en
+/// relisant la liste des albums, qui, elle, passe toujours par le cloud et
+/// répond 404 au partage coupé. #9337 : pour la même raison, CE serveur garde
+/// en mémoire les vignettes versionnées déjà relayées
+/// ([`crate::vignettes_gardees`]), pour un autre navigateur ou appareil.
 ///
 /// Sans `v`, ou avec un `v` qui ne correspond pas : une heure, comme avant.
 fn cache_de_vignette(
     version: Option<&str>,
     etag: Option<&axum::http::HeaderValue>,
 ) -> axum::http::HeaderValue {
-    let condensat = etag
-        .and_then(|v| v.to_str().ok())
-        .map(|e| e.trim().trim_start_matches("W/").trim_matches('"'));
-    let figee = match (version, condensat) {
-        (Some(v), Some(c)) => {
-            (8..=64).contains(&v.len())
-                && v.bytes().all(|b| b.is_ascii_hexdigit())
-                && c.len() >= v.len()
-                && c.as_bytes()[..v.len()].eq_ignore_ascii_case(v.as_bytes())
-        }
-        _ => false,
-    };
-    axum::http::HeaderValue::from_static(if figee {
+    axum::http::HeaderValue::from_static(if version_figee(version, etag) {
         "private, max-age=604800, immutable"
     } else {
         "private, max-age=3600"
     })
+}
+
+/// Un `v=` qui peut désigner des octets : 8 à 64 chiffres hexadécimaux.
+fn version_lisible(v: &str) -> bool {
+    (8..=64).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// `v` est-il bien le début de l'ETag rendu (le sha256 de la vignette) ?
+/// Alors l'adresse désigne CES octets-là et aucun autre (web#2985, #9337).
+fn version_figee(version: Option<&str>, etag: Option<&axum::http::HeaderValue>) -> bool {
+    let condensat = etag
+        .and_then(|v| v.to_str().ok())
+        .map(|e| e.trim().trim_start_matches("W/").trim_matches('"'));
+    match (version, condensat) {
+        (Some(v), Some(c)) => {
+            version_lisible(v)
+                && c.len() >= v.len()
+                && c.as_bytes()[..v.len()].eq_ignore_ascii_case(v.as_bytes())
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn refus(statut: StatusCode, corps: Value) -> Response {
