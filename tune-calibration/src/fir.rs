@@ -418,6 +418,31 @@ pub fn gain_crete_db(h: &[f64]) -> f64 {
     fft::to_db(crete)
 }
 
+/// REFUS FINAL (sécurité des enceintes) : le gain RÉEL du filtre `h`, pris
+/// de 0 Hz à Nyquist ([`gain_crete_db`], FFT fine) et PAS sur la seule
+/// grille de mesure (le sous-grave fait travailler l'élongation du
+/// haut-parleur, la bande au-dessus de 20 kHz et une pointe étroite entre
+/// deux points échappent à la grille), ne dépasse jamais de plus de
+/// [`MARGE_GAIN_DB`] le gain le plus haut demandé, `crete_voulue_db`.
+/// `grille` ne sert qu'au message (gain vu sur la grille).
+pub fn refus_gain_reel(
+    h: &[f64],
+    cadence: u32,
+    grille: &[f64],
+    crete_voulue_db: f64,
+) -> Result<(), String> {
+    let g = gain_crete_db(h);
+    if g > crete_voulue_db + MARGE_GAIN_DB {
+        let sur_grille = reponse_fir_db(h, cadence, grille)
+            .into_iter()
+            .fold(f64::NEG_INFINITY, f64::max);
+        return Err(format!(
+            "filtre refusé : gain réel de {g:+.1} dB (dont {sur_grille:+.1} dB sur la grille de mesure) pour {crete_voulue_db:+.1} dB demandés au plus (la correction de phase demande une relance que le filtre ne tient pas ; la désactiver ou allonger le pré-tintement)"
+        ));
+    }
+    Ok(())
+}
+
 /// Module (dB) d'un FIR `f64` aux fréquences `freqs` : FFT fine (8 fois la
 /// longueur au moins), interpolation linéaire du module entre deux bins.
 pub fn reponse_fir_db(h: &[f64], cadence: u32, freqs: &[f64]) -> Vec<f64> {
@@ -687,20 +712,11 @@ fn concevoir(
         }
     }
 
-    // REFUS FINAL (sécurité des enceintes) : le gain RÉEL du filtre, de 0 Hz
-    // à Nyquist (FFT fine, pas la seule grille de mesure : le sous-grave
-    // fait travailler l'élongation du haut-parleur, une pointe étroite peut
-    // tomber entre deux points), ne dépasse jamais de plus de 1 dB le gain
-    // le plus haut demandé (lui-même borné par la relance). En phase mixte,
-    // la partie à phase minimale divise par le module de la partie
-    // fenêtrée : un creux de celle-ci demanderait une relance que la
+    // REFUS FINAL (sécurité des enceintes), voir [`refus_gain_reel`]. En
+    // phase mixte, la partie à phase minimale divise par le module de la
+    // partie fenêtrée : un creux de celle-ci demanderait une relance que la
     // troncature ne compense plus.
-    let gain_reel_max = gain_crete_db(&h);
-    if gain_reel_max > crete_voulue + MARGE_GAIN_DB {
-        return Err(format!(
-            "filtre refusé : gain réel de {gain_reel_max:+.1} dB pour {crete_voulue:+.1} dB demandés au plus (la correction de phase demande une relance que le filtre ne tient pas ; la désactiver ou allonger le pré-tintement)"
-        ));
-    }
+    refus_gain_reel(&h, cadence, &freqs, crete_voulue)?;
     let dans_bande = |i: &usize| freqs[*i] >= o.f_lo && freqs[*i] <= o.f_hi;
     let gain_max_db = (0..freqs.len())
         .filter(dans_bande)
@@ -1090,11 +1106,13 @@ mod tests {
         e
     }
 
-    /// Le refus final regarde TOUTE la bande, pas la seule grille de mesure
-    /// (20 Hz–20 kHz) : un creux de la partie de phase placé sous 20 Hz, puis
-    /// au-dessus de 20 kHz, fait refuser le filtre. Contre-épreuve : la même
-    /// conception, avec une partie de phase sans creux, passe ; son gain sur
-    /// toute la bande reste à 1 dB de la crête demandée.
+    /// Par la conception : un creux de la partie de phase placé à 0 Hz (sous
+    /// le premier point de mesure), puis à Nyquist (au-dessus de 20 kHz),
+    /// fait refuser le filtre. Contre-épreuve : la même conception, avec une
+    /// partie de phase sans creux, passe ; son gain sur toute la bande reste
+    /// à 1 dB de la crête demandée. NB : l'erreur de troncature de ces creux
+    /// déborde aussi sur la grille ; le témoin qui distingue la bande entière
+    /// de la grille est `le_refus_final_voit_ce_qui_echappe_a_la_grille`.
     #[test]
     fn un_creux_hors_de_la_grille_fait_aussi_refuser_le_filtre() {
         let fs = 48_000;
@@ -1124,6 +1142,44 @@ mod tests {
                     gain_crete_db(&f.coefficients)
                 ),
             }
+        }
+    }
+
+    /// Le refus final porte sur TOUTE la bande : un filtre dont la seule
+    /// bosse (+3,5 dB, Hann de ±20 Hz) est à 0 Hz, puis à Nyquist, est
+    /// REFUSÉ, alors que la grille de mesure (20 Hz–20 kHz) n'en voit
+    /// presque rien (moins de 1 dB, vérifié ici). Contre-épreuve : le même
+    /// filtre sans bosse (impulsion seule) passe.
+    #[test]
+    fn le_refus_final_voit_ce_qui_echappe_a_la_grille() {
+        let fs = 48_000;
+        let grille = LogResponse::grid(20.0, 20_000.0, 48);
+        let (n, c) = (4_801usize, 2_400usize);
+        let hann: Vec<f64> = (0..n)
+            .map(|i| 0.5 - 0.5 * (2.0 * PI * (i as f64 + 1.0) / (n as f64 + 1.0)).cos())
+            .collect();
+        let somme: f64 = hann.iter().sum();
+        let mut impulsion = vec![0.0; n];
+        impulsion[c] = 1.0;
+        assert!(refus_gain_reel(&impulsion, fs, &grille, 0.0).is_ok());
+        for (nom, nyquist) in [("à 0 Hz", false), ("à Nyquist", true)] {
+            let h: Vec<f64> = (0..n)
+                .map(|i| {
+                    let signe = if nyquist && (i + c) % 2 == 1 {
+                        -1.0
+                    } else {
+                        1.0
+                    };
+                    impulsion[i] + 0.5 * hann[i] / somme * signe
+                })
+                .collect();
+            let sur_grille = reponse_fir_db(&h, fs, &grille)
+                .into_iter()
+                .fold(f64::NEG_INFINITY, f64::max);
+            assert!(sur_grille < 1.0, "{nom} : {sur_grille:.2} dB sur la grille");
+            assert!(gain_crete_db(&h) > 3.0, "{nom} : {}", gain_crete_db(&h));
+            let e = refus_gain_reel(&h, fs, &grille, 0.0).unwrap_err();
+            assert!(e.contains("filtre refusé"), "{nom} : {e}");
         }
     }
 }
