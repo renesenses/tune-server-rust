@@ -1085,3 +1085,119 @@ async fn un_service_converti_pour_le_lecteur_n_est_jamais_dit_bit_perfect() {
         assert_eq!(etat.badge, badge, "plafond={plafond}");
     }
 }
+
+/// 5e relecture — le bras DASH de TIDAL (banc #7266 : faux TIDAL, faux CDN en
+/// fMP4, vraie `DlnaOutput`). Rend la voie servie et l'état publié, chaîne
+/// vide.
+async fn dash_tidal(plafond_16: bool) -> (&'static str, ReponseTessZone) {
+    use super::tidal_cd_dash_jusqu_au_play_7266 as banc_7266;
+    let flac = banc_7266::flac_cd(&banc_7266::pcm_cd()).await;
+    let piste = std::sync::Arc::new(banc_7266::decouper(&flac));
+    let (mesure, orch, zone) = banc_7266::jouer_avec(piste, "flac", |orch, zone| {
+        ZoneRepo::with_backend(orch.db.clone())
+            .update_dlna_cap_16bit(zone, plafond_16)
+            .unwrap();
+    })
+    .await;
+    let url = mesure
+        .resultat
+        .expect("play")
+        .stream_url
+        .expect("une adresse servie");
+    let sid = crate::http::streamer::stream_id_de_l_url(&url)
+        .expect("une session")
+        .to_owned();
+    let voie_servie = orch.streamer.voie_servie(&sid).await;
+    let faits = orch
+        .faits_upnp_de_zone(
+            zone,
+            &PisteEnCours {
+                source: Some("tidal".into()),
+                source_id: Some(banc_7266::PISTE.into()),
+                format: Some("flac".into()),
+                bit_depth: Some(16),
+                stream_id: Some(sid),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let settings = SettingsRepo::with_backend(orch.db.clone());
+    let lecture = crate::tess::migration::lire_zone(&settings, zone, true).unwrap();
+    let tout = |_: &str| true;
+    let ctx = ContexteExecution {
+        transport: TransportZone::Dlna,
+        source: Some(SourceFlux::Pcm {
+            sample_rate_hz: banc_7266::SR,
+            bits: 16,
+            channels: 2,
+        }),
+        premium: true,
+        greffon_disponible: &tout,
+        pure: lecture.pure,
+        volume: VolumeZone {
+            control: ControleVolume::Device,
+            db: 0.0,
+        },
+        replaygain_actif: false,
+    };
+    let etat = ReponseTessZone::depuis_avec_le_lecteur(
+        zone,
+        lecture.chaine,
+        None,
+        catalogue_de_reference(),
+        &ctx,
+        Some(&faits),
+    );
+    (voie_servie, etat)
+}
+
+/// 5e relecture — un FLAC TIDAL en DASH vers un lecteur FLAC, sans
+/// traitement ni plafond, est REMUXÉ (trames recopiées, #7266) : `untouched`
+/// et « Bit-perfect ». Rouge sur `f08457f99`, qui notait toute session DASH
+/// `fichier_converti`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn un_flac_tidal_dash_remuxe_reste_bit_perfect() {
+    let (voie_servie, etat) = dash_tidal(false).await;
+    assert_eq!(voie_servie, voie::ENTETE_FLAC_NEUF, "remux : trames intactes");
+    assert_eq!(etat.delivery.as_ref().unwrap().route, VoieUpnp::Untouched);
+    assert_eq!(etat.badge, Badge::BitPerfect);
+}
+
+/// 5e relecture — le même FLAC DASH vers une zone plafonnée à 16 bits : le
+/// remux est exclu (`remux_dash_sans_perte`), la tâche DÉCODE ; la session
+/// est une conversion, jamais « Bit-perfect ».
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn un_flac_tidal_dash_decode_est_une_conversion() {
+    let (voie_servie, etat) = dash_tidal(true).await;
+    assert_eq!(voie_servie, voie::FICHIER_CONVERTI, "plafond : décodage");
+    assert_eq!(etat.delivery.as_ref().unwrap().route, VoieUpnp::FileTranscode);
+    assert_eq!(etat.badge, Badge::AlteredOutsideTess);
+}
+
+/// 5e relecture — le cache chaud du bras DASH note la voie par le MÊME
+/// prédicat que le bras qui a rangé le fichier.
+#[test]
+fn le_cache_chaud_du_dash_suit_le_predicat_du_remux() {
+    use super::resolve_stream::{remux_dash_sans_perte, voie_du_dash};
+    assert_eq!(
+        voie_du_dash(remux_dash_sans_perte(true, false, false, false, false)),
+        voie::ENTETE_FLAC_NEUF
+    );
+    for (wav, dsp, p16, cadence) in [
+        (true, false, false, false),
+        (false, true, false, false),
+        (false, false, true, false),
+        (false, false, false, true),
+    ] {
+        assert_eq!(
+            voie_du_dash(remux_dash_sans_perte(true, wav, dsp, p16, cadence)),
+            voie::FICHIER_CONVERTI
+        );
+    }
+    assert_eq!(
+        voie_du_dash(remux_dash_sans_perte(false, false, false, false, false)),
+        voie::FICHIER_CONVERTI,
+        "un AAC DASH se décode"
+    );
+}

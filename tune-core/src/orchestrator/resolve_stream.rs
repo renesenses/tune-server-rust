@@ -122,6 +122,16 @@ pub(crate) fn format_dash_impose(
 /// décodage. Un AAC DASH (qualité « Haute ») n'a pas de trames FLAC à
 /// recopier : il garde le décodage. Par défaut depuis #7266 ;
 /// `TUNE_DASH_REMUX=0` (ou `false`) le coupe.
+/// TESS T12b — la voie d'une session DASH en fichier : trames FLAC recopiées
+/// sous un en-tête neuf après un remux, conversion après un décodage.
+pub(crate) fn voie_du_dash(remuxe: bool) -> &'static str {
+    if remuxe {
+        crate::http::streamer::voie::ENTETE_FLAC_NEUF
+    } else {
+        crate::http::streamer::voie::FICHIER_CONVERTI
+    }
+}
+
 pub(crate) fn remux_dash_sans_perte(
     source_flac: bool,
     servi_en_wav: bool,
@@ -2009,10 +2019,21 @@ impl PlaybackOrchestrator {
                     .streamer
                     .create_file_session(file_info, w.cache_path.clone(), false)
                     .await;
-                // TESS T12b — la session SERT une conversion : la voie le dit, comme
-                // `resolve_local` (`faits_upnp_de_zone` la lit pour l'état effectif).
+                // TESS T12b — ce que la session sert, pour l'état effectif
+                // (`faits_upnp_de_zone`) : le fichier en cache a été REMUXÉ
+                // (trames FLAC intactes) ou transcodé, selon le même prédicat
+                // que le bras qui l'a rangé (`remux_dash_sans_perte`).
                 self.streamer
-                    .noter_la_voie(&session_id, crate::http::streamer::voie::FICHIER_CONVERTI)
+                    .noter_la_voie(
+                        &session_id,
+                        voie_du_dash(remux_dash_sans_perte(
+                            source_dash_en_flac(&stream_data.quality.codec),
+                            w.enc_format == "wav",
+                            dash_dsp_active,
+                            reglages.plafond_16,
+                            cadence_plafonnee.is_some(),
+                        )),
+                    )
                     .await;
                 let server_ip = self.server_ip();
                 let stream_url =
@@ -2392,6 +2413,10 @@ impl PlaybackOrchestrator {
             // #6718 — même garde que le bras HTTPS : un pré-transcodage DASH
             // abandonné ne laisse ni sa source ni son fichier.
             let fichiers_de_la_tache = vec![unique_path.clone(), tmp_path.clone()];
+            // TESS T12b — la tâche dit si elle a remuxé (trames intactes) ou
+            // décodé : la voie notée sur la session en dépend.
+            let a_remuxe = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let a_remuxe_tache = a_remuxe.clone();
             let transcode_result = super::pretranscode_abandonne_6718::attendre_ou_nettoyer(
                 tokio::task::spawn_blocking(move || {
                     // Fast path: Tidal HI-RES DASH is ALREADY FLAC (frames inside an
@@ -2421,6 +2446,7 @@ impl PlaybackOrchestrator {
                             indexer,
                         ) {
                             Ok(remuxe) => {
+                                a_remuxe_tache.store(true, std::sync::atomic::Ordering::Release);
                                 // Les VU-mètres décrivaient le PCM du transcodage.
                                 // Le remux n'en produit pas : un décodage À CÔTÉ,
                                 // après coup, les nourrit sans retarder le Play (le
@@ -2578,10 +2604,14 @@ impl PlaybackOrchestrator {
                         .streamer
                         .create_file_session(file_info, serve_path, false)
                         .await;
-                    // TESS T12b — la session SERT une conversion : la voie le dit, comme
-                    // `resolve_local` (`faits_upnp_de_zone` la lit pour l'état effectif).
+                    // TESS T12b — ce que la session sert, pour l'état effectif
+                    // (`faits_upnp_de_zone`) : trames FLAC recopiées si la tâche
+                    // a REMUXÉ, conversion si elle a décodé.
                     self.streamer
-                        .noter_la_voie(&session_id, crate::http::streamer::voie::FICHIER_CONVERTI)
+                        .noter_la_voie(
+                            &session_id,
+                            voie_du_dash(a_remuxe.load(std::sync::atomic::Ordering::Acquire)),
+                        )
                         .await;
 
                     let server_ip = self.server_ip();
