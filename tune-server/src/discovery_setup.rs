@@ -2270,6 +2270,14 @@ pub fn spawn_mdns_handler(
                                     dev.port,
                                     dev.id.clone(),
                                     ap_dev_id,
+                                )
+                                // #9379 — Apple TV : appairage unique par le
+                                // code affiché (TXT `flags` bit 9).
+                                .avec_code_a_l_ecran(
+                                    dev.capabilities
+                                        .get(tune_core::discovery::mdns::CAP_AIRPLAY_CODE_A_L_ECRAN)
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false),
                                 );
                                 // #8402 — elle part du volume mémorisé de sa
                                 // zone, jamais de la pleine échelle.
