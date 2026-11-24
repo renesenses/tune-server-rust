@@ -19,6 +19,9 @@ mod reprise_service_titre_seul_6380_tests;
 #[path = "playback/seek_en_double_193_tests.rs"]
 mod seek_en_double_193_tests;
 #[cfg(test)]
+#[path = "playback/saut_relatif_tests.rs"]
+mod saut_relatif_tests;
+#[cfg(test)]
 #[path = "playback/session_locale_tests.rs"]
 mod session_locale_tests;
 #[path = "playback/session_message.rs"]
