@@ -1971,6 +1971,26 @@ pub fn local_ipv4_addresses() -> Vec<Ipv4Addr> {
     v
 }
 
+/// Fil du forum 3028 — les adresses IPv6 de nos interfaces (boucle locale
+/// exclue, comme [`local_ipv4_addresses`]). Elles servent à SE RECONNAÎTRE
+/// dans une annonce ou une URL, jamais à s'annoncer.
+pub fn local_ipv6_addresses() -> Vec<std::net::Ipv6Addr> {
+    let mut v = Vec::new();
+    if let Ok(ifaces) = if_addrs::get_if_addrs() {
+        for iface in &ifaces {
+            if iface.is_loopback() {
+                continue;
+            }
+            if let std::net::IpAddr::V6(ip) = iface.ip()
+                && !v.contains(&ip)
+            {
+                v.push(ip);
+            }
+        }
+    }
+    v
+}
+
 pub fn get_local_ip() -> Option<Ipv4Addr> {
     // --- Step 1: UDP connect probe (follows the OS default route → real LAN) ---
     let probe_ip = udp_probe_ip();

@@ -227,7 +227,10 @@ async fn le_retrait_rattache_les_liens_et_epargne_le_local() {
     exec(
         &etat,
         "INSERT INTO track_metadata (track_id, key, value) VALUES (200, 'upnp_res_url', ?)",
-        &[&"http://192.0.2.10:8888/api/v1/library/tracks/100/audio"],
+        &[&format!(
+            "http://127.0.0.1:{}/api/v1/library/tracks/100/audio",
+            etat.config.port
+        )],
     );
     // Les liens de l'utilisateur, posés sur le reflet.
     exec(
@@ -360,4 +363,343 @@ async fn le_retrait_rattache_les_liens_et_epargne_le_local() {
         ),
         2
     );
+}
+
+// ---------------------------------------------------------------------------
+// Revue de #9467 : les gardes du rattachement et de la confirmation.
+// ---------------------------------------------------------------------------
+
+/// Un banc minimal : une piste locale « Wonderwall » (id 100, album 10), et
+/// une piste distante (id 200, album 20) de ce Tune, mise en favori. Le
+/// témoin règle ce qui diffère.
+struct Banc {
+    etat: AppState,
+    app: Router,
+}
+
+fn banc(
+    distante_titre: &str,
+    distante_artiste: Option<&str>,
+    distante_album: Option<&str>,
+    distante_duree: i64,
+    url: Option<String>,
+    homonyme: bool,
+) -> Banc {
+    let etat = AppState::new(":memory:", 0, Default::default()).expect("état isolé");
+    let udn = etat.upnp.as_ref().expect("état UPnP").uuid.clone();
+    exec(
+        &etat,
+        "INSERT INTO artists (id, name) VALUES (1, 'Oasis'), (2, 'Inconnu')",
+        &[],
+    );
+    exec(
+        &etat,
+        "INSERT INTO albums (id, title, artist_id, source) VALUES (10, 'Morning Glory', 1, 'local')",
+        &[],
+    );
+    exec(
+        &etat,
+        "INSERT INTO tracks (id, title, album_id, artist_id, duration_ms, file_path, source) VALUES \
+         (100, 'Wonderwall', 10, 1, 258000, '/m/mg/03.flac', 'local'), \
+         (101, 'Champagne Supernova', 10, 1, 451000, '/m/mg/12.flac', 'local')",
+        &[],
+    );
+    if homonyme {
+        exec(
+            &etat,
+            "INSERT INTO tracks (id, title, album_id, artist_id, duration_ms, file_path, source) VALUES \
+             (103, 'Wonderwall', 10, 1, 258000, '/m/copie/03.flac', 'local')",
+            &[],
+        );
+    }
+    let artiste = distante_artiste.map(|_| 1i64);
+    let album_source = format!("{udn}|album");
+    if let Some(titre) = distante_album {
+        exec(
+            &etat,
+            "INSERT INTO albums (id, title, artist_id, source, source_id) VALUES (20, ?, 1, 'upnp', ?)",
+            &[&titre, &album_source],
+        );
+    }
+    let album = distante_album.map(|_| 20i64);
+    let source_id = format!("{udn}|a");
+    exec(
+        &etat,
+        "INSERT INTO tracks (id, title, album_id, artist_id, duration_ms, source, source_id) \
+         VALUES (200, ?, ?, ?, ?, 'upnp', ?)",
+        &[
+            &distante_titre,
+            &album,
+            &artiste,
+            &distante_duree,
+            &source_id,
+        ],
+    );
+    if let Some(url) = url {
+        exec(
+            &etat,
+            "INSERT INTO track_metadata (track_id, key, value) VALUES (200, 'upnp_res_url', ?)",
+            &[&url],
+        );
+    }
+    exec(
+        &etat,
+        "INSERT INTO favorites (profile_id, item_type, item_id) VALUES (1, 'track', '200')",
+        &[],
+    );
+    abonner(&etat, "soi", &udn, "this_server");
+    let app = tune_server::routes::router(etat.clone());
+    Banc { etat, app }
+}
+
+async fn apercu_du_retrait(b: &Banc) -> Value {
+    let (statut, corps) = appeler(
+        &b.app,
+        "POST",
+        "/api/v1/network/library-sources",
+        Some(json!({ "key": "soi", "action": "remove" })),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    corps
+}
+
+async fn confirmer(b: &Banc, generation: &str, compte: u64) -> (StatusCode, Value) {
+    appeler(
+        &b.app,
+        "POST",
+        "/api/v1/network/library-sources",
+        Some(
+            json!({ "key": "soi", "action": "remove", "generation": generation, "count": compte }),
+        ),
+    )
+    .await
+}
+
+fn favoris_sur_le_local(b: &Banc) -> i64 {
+    entier(
+        &b.etat,
+        "SELECT COUNT(*) FROM favorites WHERE item_type = 'track' \
+         AND CAST(item_id AS TEXT) IN ('100', '101', '103', '104')",
+        &[],
+    )
+}
+
+/// Aperçu puis confirmation : la piste distante n'est rattachée à RIEN, le cas
+/// est annoncé, et aucun favori n'arrive sur une piste locale.
+async fn aucun_rattachement(b: Banc, cas: &str) {
+    let apercu = apercu_du_retrait(&b).await;
+    assert_eq!(
+        apercu["removal"]["liens_rattaches"],
+        json!(0),
+        "{cas} : {apercu}"
+    );
+    assert_eq!(
+        apercu["removal"]["liens_sans_equivalent"],
+        json!(1),
+        "{cas} : le cas doit être annoncé — {apercu}"
+    );
+    let generation = apercu["generation"].as_str().unwrap().to_string();
+    let (statut, fait) = confirmer(&b, &generation, 1).await;
+    assert_eq!(statut, StatusCode::OK, "{cas} : {fait}");
+    assert_eq!(favoris_sur_le_local(&b), 0, "{cas} : aucun rattachement");
+    assert_eq!(
+        entier(
+            &b.etat,
+            "SELECT COUNT(*) FROM tracks WHERE source = 'local'",
+            &[]
+        ),
+        entier(&b.etat, "SELECT COUNT(*) FROM tracks", &[]),
+        "{cas} : le local reste"
+    );
+}
+
+fn notre_url(etat_port: u16, id: i64) -> String {
+    format!("http://127.0.0.1:{etat_port}/api/v1/library/tracks/{id}/audio")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn homonymes_aucun_rattachement() {
+    let b = banc(
+        "Wonderwall",
+        Some("Oasis"),
+        Some("Morning Glory"),
+        258000,
+        None,
+        true,
+    );
+    aucun_rattachement(b, "homonymes").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn duree_au_dela_de_deux_secondes_aucun_rattachement() {
+    let b = banc(
+        "Wonderwall",
+        Some("Oasis"),
+        Some("Morning Glory"),
+        261000,
+        None,
+        false,
+    );
+    aucun_rattachement(b, "durée +3 s").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn titre_seul_aucun_rattachement() {
+    // Ni artiste, ni album, ni durée connus, côté distant comme sur une piste
+    // locale de même titre : le titre seul ne prouve rien.
+    let b = banc("Wonderwall", None, None, 0, None, false);
+    exec(
+        &b.etat,
+        "INSERT INTO tracks (id, title, duration_ms, file_path, source) VALUES \
+         (104, 'Wonderwall', 0, '/m/vrac/wonderwall.flac', 'local')",
+        &[],
+    );
+    aucun_rattachement(b, "titre seul").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn url_d_un_tune_tiers_aucun_rattachement() {
+    // Mêmes étiquettes que la piste locale 100, mais l'URL nomme la piste 100
+    // d'un AUTRE Tune : c'est une autre bibliothèque.
+    let b = banc(
+        "Wonderwall",
+        Some("Oasis"),
+        Some("Morning Glory"),
+        258000,
+        Some("http://192.0.2.77:8888/api/v1/library/tracks/100/audio".into()),
+        false,
+    );
+    aucun_rattachement(b, "Tune tiers").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn notre_url_mais_autres_metadonnees_aucun_rattachement() {
+    // L'URL est bien la nôtre, mais elle nomme la piste 101 (« Champagne
+    // Supernova ») alors que la distante dit « Wonderwall » : on ne suit ni
+    // l'URL ni les étiquettes.
+    let etat_port = AppState::new(":memory:", 0, Default::default())
+        .unwrap()
+        .config
+        .port;
+    let b = banc(
+        "Wonderwall",
+        Some("Oasis"),
+        Some("Morning Glory"),
+        258000,
+        Some(notre_url(etat_port, 101)),
+        false,
+    );
+    aucun_rattachement(b, "notre URL, autres métadonnées").await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn la_confirmation_refuse_un_compte_change_un_apercu_expire_et_un_rejeu() {
+    // Compte différent : 409, rien n'est retiré.
+    let b = banc(
+        "Wonderwall",
+        Some("Oasis"),
+        Some("Morning Glory"),
+        258000,
+        None,
+        false,
+    );
+    let apercu = apercu_du_retrait(&b).await;
+    let generation = apercu["generation"].as_str().unwrap().to_string();
+    let (statut, corps) = confirmer(&b, &generation, 7).await;
+    assert_eq!(statut, StatusCode::CONFLICT, "compte changé : {corps}");
+    assert_eq!(
+        entier(
+            &b.etat,
+            "SELECT COUNT(*) FROM tracks WHERE source = 'upnp'",
+            &[]
+        ),
+        1
+    );
+
+    // Favori ajouté entre l'aperçu et la confirmation : le plan a changé, 409,
+    // et AUCUN lien n'est déplacé ni effacé.
+    exec(
+        &b.etat,
+        "INSERT INTO favorites (profile_id, item_type, item_id) VALUES (1, 'album', '20')",
+        &[],
+    );
+    let (statut, corps) = confirmer(&b, &generation, 1).await;
+    assert_eq!(statut, StatusCode::CONFLICT, "favori ajouté : {corps}");
+    assert_eq!(favoris_sur_le_local(&b), 0, "rien n'a bougé");
+    assert_eq!(
+        entier(
+            &b.etat,
+            "SELECT COUNT(*) FROM favorites WHERE CAST(item_id AS TEXT) IN ('200', '20')",
+            &[]
+        ),
+        2,
+        "rien n'est effacé"
+    );
+
+    // Aperçu expiré : 409.
+    let apercu = apercu_du_retrait(&b).await;
+    let generation = apercu["generation"].as_str().unwrap().to_string();
+    let vieux = entier(&b.etat, "SELECT COUNT(*) FROM upnp_library_sources", &[]);
+    assert_eq!(vieux, 1);
+    let etat_json = b
+        .etat
+        .backend
+        .query_one("SELECT state_json FROM upnp_library_sources", &[])
+        .unwrap()
+        .unwrap()[0]
+        .as_string()
+        .unwrap();
+    let mut v: Value = serde_json::from_str(&etat_json).unwrap();
+    v["last_attempt"] = json!(v["last_attempt"].as_i64().unwrap() - 7200);
+    let texte = v.to_string();
+    exec(
+        &b.etat,
+        "UPDATE upnp_library_sources SET state_json = ?",
+        &[&texte],
+    );
+    let (statut, corps) = confirmer(&b, &generation, 1).await;
+    assert_eq!(statut, StatusCode::CONFLICT, "aperçu expiré : {corps}");
+
+    // Rejeu : une confirmation valide, puis la même une seconde fois.
+    let apercu = apercu_du_retrait(&b).await;
+    let generation = apercu["generation"].as_str().unwrap().to_string();
+    let (statut, corps) = confirmer(&b, &generation, 1).await;
+    assert_eq!(statut, StatusCode::OK, "confirmation : {corps}");
+    let (statut, corps) = confirmer(&b, &generation, 1).await;
+    assert_eq!(statut, StatusCode::CONFLICT, "rejeu : {corps}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn notre_serveur_annonce_en_ipv6_est_reconnu() {
+    // Une annonce de CE Tune sur la boucle IPv6, sous un autre UDN (base
+    // remise à zéro) : l'adresse seule doit le reconnaître.
+    let etat = AppState::new(":memory:", 0, Default::default()).expect("état isolé");
+    let port = etat.config.port;
+    let id = "uuid:5e1f0000-0000-4000-8000-0000000036a6";
+    etat.media_servers.lock().await.insert(
+        id.into(),
+        tune_core::discovery::ssdp::MediaServerInfo {
+            id: id.into(),
+            name: "Mac-de-test.fritz.box".into(),
+            manufacturer: "Tune".into(),
+            model: "Tune Server".into(),
+            location: format!("http://[::1]:{port}/upnp/description.xml"),
+            content_directory_url: "http://127.0.0.1:9/control".into(),
+            host: "::1".into(),
+            port,
+            last_seen: std::time::Instant::now(),
+            max_age: std::time::Duration::from_secs(1800),
+        },
+    );
+    let app = tune_server::routes::router(etat.clone());
+    let (statut, corps) = appeler(
+        &app,
+        "POST",
+        &format!("/api/v1/network/media-servers/{id}/indexer"),
+        None,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    assert_eq!(corps["code"], json!("this_server"), "{corps}");
 }

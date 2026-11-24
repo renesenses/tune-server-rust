@@ -57,7 +57,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tune_core::db::backend::{DbTxHandle, ToSqlValue};
+use tune_core::db::backend::{DbBackend, DbTxHandle, SqlValue, ToSqlValue};
 
 type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
@@ -109,55 +109,79 @@ pub struct Apercu {
     pub sources: i64,
 }
 
-fn compte(state: &AppState, sql: &str, prefixe: &str) -> Result<i64, String> {
-    let params: [&dyn ToSqlValue; 1] = [&prefixe];
-    Ok(state
-        .backend
-        .query_one(sql, &params)?
+/// Une lecture, par la base ou dans une transaction : l'aperçu et le plan de
+/// rattachement se calculent de la même façon des deux côtés.
+pub(crate) trait Lire {
+    fn un(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<Option<Vec<SqlValue>>, String>;
+    fn tous(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<Vec<Vec<SqlValue>>, String>;
+}
+pub(crate) struct ParLaBase<'a>(pub &'a dyn DbBackend);
+struct DansLaTx<'a>(&'a dyn DbTxHandle);
+impl Lire for ParLaBase<'_> {
+    fn un(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<Option<Vec<SqlValue>>, String> {
+        self.0.query_one(sql, p)
+    }
+    fn tous(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<Vec<Vec<SqlValue>>, String> {
+        self.0.query_many(sql, p)
+    }
+}
+impl Lire for DansLaTx<'_> {
+    fn un(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<Option<Vec<SqlValue>>, String> {
+        self.0.query_one(sql, p)
+    }
+    fn tous(&self, sql: &str, p: &[&dyn ToSqlValue]) -> Result<Vec<Vec<SqlValue>>, String> {
+        self.0.query_many(sql, p)
+    }
+}
+
+fn compte(l: &dyn Lire, sql: &str, params: &[&dyn ToSqlValue]) -> Result<i64, String> {
+    Ok(l.un(sql, params)?
         .and_then(|r| r.first().and_then(|v| v.as_i64()))
         .unwrap_or(0))
 }
 
 /// Compte, sans rien écrire, ce qu'un retrait emporterait.
 pub fn apercu(state: &AppState, udn: &str) -> Result<Apercu, String> {
+    apercu_par(&ParLaBase(state.backend.as_ref()), udn)
+}
+
+fn apercu_par(l: &dyn Lire, udn: &str) -> Result<Apercu, String> {
     let p = prefixe(udn);
+    let pp: [&dyn ToSqlValue; 1] = [&p];
     let piste = borne("t", &p);
     let album = borne("a", &p);
     let pistes = compte(
-        state,
+        l,
         &format!("SELECT COUNT(*) FROM tracks t WHERE {piste}"),
-        &p,
+        &pp,
     )?;
     let favoris = compte(
-        state,
+        l,
         &format!(
             "SELECT COUNT(*) FROM tracks t WHERE {piste} AND {}",
             lien_favori("t")
         ),
-        &p,
+        &pp,
     )?;
     let playlists = compte(
-        state,
+        l,
         &format!(
             "SELECT COUNT(*) FROM tracks t WHERE {piste} AND {}",
             lien_playlist("t")
         ),
-        &p,
+        &pp,
     )?;
     let albums = compte(
-        state,
+        l,
         &format!("SELECT COUNT(*) FROM albums a WHERE {album}"),
-        &p,
+        &pp,
     )?;
-    let params: [&dyn ToSqlValue; 1] = [&udn];
-    let sources = state
-        .backend
-        .query_one(
-            "SELECT COUNT(*) FROM upnp_library_sources WHERE udn = ?",
-            &params,
-        )?
-        .and_then(|r| r.first().and_then(|v| v.as_i64()))
-        .unwrap_or(0);
+    let pu: [&dyn ToSqlValue; 1] = [&udn];
+    let sources = compte(
+        l,
+        "SELECT COUNT(*) FROM upnp_library_sources WHERE udn = ?",
+        &pu,
+    )?;
     Ok(Apercu {
         pistes,
         albums,
@@ -179,7 +203,6 @@ fn public(a: &Apercu) -> Value {
 /// autre chose que ce qui a été confirmé. C'est la garde de `confirm`, reprise
 /// telle quelle.
 pub fn retirer(state: &AppState, udn: &str, attendu: Option<i64>) -> Result<Apercu, String> {
-    let p = prefixe(udn);
     let vu = apercu(state, udn)?;
     if let Some(attendu) = attendu
         && attendu != vu.pistes
@@ -190,92 +213,8 @@ pub fn retirer(state: &AppState, udn: &str, attendu: Option<i64>) -> Result<Aper
         ));
     }
     let mut retirees = 0i64;
-    let retirees_ref = &mut retirees;
-    let udn_owned = udn.to_string();
     state.backend.write_tx(&mut |tx| {
-        let params: [&dyn ToSqlValue; 1] = [&p];
-        let ids: Vec<i64> = tx
-            .query_many(
-                &format!("SELECT t.id FROM tracks t WHERE {}", borne("t", &p)),
-                &params,
-            )?
-            .iter()
-            .filter_map(|r| r.first().and_then(|v| v.as_i64()))
-            .collect();
-        for lot in ids.chunks(500) {
-            // Construit exclusivement depuis des i64 : jamais une entrée
-            // utilisateur. Même précaution que `liens_utilisateur_sql`.
-            let liste = lot.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
-            let textes = lot
-                .iter()
-                .map(|id| format!("'{id}'"))
-                .collect::<Vec<_>>()
-                .join(",");
-            tx.execute(
-                &format!("DELETE FROM upnp_library_members WHERE track_id IN ({liste})"),
-                &[],
-            )?;
-            tx.execute(
-                &format!("DELETE FROM playlist_tracks WHERE track_id IN ({liste})"),
-                &[],
-            )?;
-            // `favorites` ne porte AUCUNE clé étrangère (ni SQLite ni PG) :
-            // sans ce ménage, un favori survivrait à sa piste.
-            tx.execute(
-                &format!(
-                    "DELETE FROM favorites WHERE item_type = 'track' AND CAST(item_id AS TEXT) IN ({textes})"
-                ),
-                &[],
-            )?;
-            // La cascade existe sur un schéma neuf mais manque sur les bases
-            // migrées (cf. `TrackRepo::delete`).
-            let _ = tx.execute(
-                &format!("DELETE FROM queue_items WHERE track_id IN ({liste})"),
-                &[],
-            );
-            *retirees_ref +=
-                tx.execute(&format!("DELETE FROM tracks WHERE id IN ({liste})"), &[])? as i64;
-        }
-        // Seuls les albums DISTANTS de CE serveur, et seulement une fois vides.
-        // Un album local n'est jamais touché.
-        let albums: Vec<i64> = tx
-            .query_many(
-                &format!(
-                    "SELECT a.id FROM albums a WHERE {} AND NOT EXISTS (SELECT 1 FROM tracks WHERE tracks.album_id = a.id)",
-                    borne("a", &p)
-                ),
-                &params,
-            )?
-            .iter()
-            .filter_map(|r| r.first().and_then(|v| v.as_i64()))
-            .collect();
-        for lot in albums.chunks(500) {
-            let liste = lot.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
-            let textes = lot
-                .iter()
-                .map(|id| format!("'{id}'"))
-                .collect::<Vec<_>>()
-                .join(",");
-            tx.execute(
-                &format!(
-                    "DELETE FROM favorites WHERE item_type = 'album' AND CAST(item_id AS TEXT) IN ({textes})"
-                ),
-                &[],
-            )?;
-            tx.execute(
-                &format!("DELETE FROM albums WHERE id IN ({liste}) AND source = 'upnp'"),
-                &[],
-            )?;
-        }
-        // Sans ce dernier retrait, la boucle de `synchronisation_upnp::start`
-        // ramène tout au plus tard une heure après : l'abonnement survivrait au
-        // retrait. La cascade emporte `upnp_library_members`.
-        let params: [&dyn ToSqlValue; 1] = [&udn_owned];
-        tx.execute(
-            "DELETE FROM upnp_library_members WHERE source_key IN (SELECT source_key FROM upnp_library_sources WHERE udn = ?)",
-            &params,
-        )?;
-        tx.execute("DELETE FROM upnp_library_sources WHERE udn = ?", &params)?;
+        retirees = retirer_dans(tx, udn)?;
         Ok(())
     })?;
     Ok(Apercu {
@@ -284,31 +223,131 @@ pub fn retirer(state: &AppState, udn: &str, attendu: Option<i64>) -> Result<Aper
     })
 }
 
-/// Fil du forum 3028 — ce que le rattachement ferait, ou a fait.
-///
-/// Un lien utilisateur (favori de piste ou d'album, entrée de playlist) porté
-/// par une piste distante est d'abord REPORTÉ sur la piste locale
-/// équivalente, quand elle existe et qu'elle est unique. C'est le cas d'un
-/// Tune qui s'est indexé lui-même : chaque piste `upnp` y est le reflet d'une
-/// piste locale. Ce qui n'a pas d'équivalent est compté, annoncé par
-/// l'aperçu, et ne part qu'après confirmation.
-#[derive(Debug, Default, PartialEq, Eq)]
-pub struct Rattachement {
-    /// Pistes et albums liés dont les liens ont trouvé leur équivalent local.
-    pub rattaches: i64,
-    /// Pistes et albums liés SANS équivalent local unique.
-    pub sans_equivalent: i64,
+/// Le retrait lui-même, dans la transaction de l'appelant. Rend le nombre de
+/// pistes retirées.
+fn retirer_dans(tx: &dyn DbTxHandle, udn: &str) -> Result<i64, String> {
+    let p = prefixe(udn);
+    let mut retirees = 0i64;
+    let params: [&dyn ToSqlValue; 1] = [&p];
+    let ids: Vec<i64> = tx
+        .query_many(
+            &format!("SELECT t.id FROM tracks t WHERE {}", borne("t", &p)),
+            &params,
+        )?
+        .iter()
+        .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+        .collect();
+    for lot in ids.chunks(500) {
+        // Construit exclusivement depuis des i64 : jamais une entrée
+        // utilisateur. Même précaution que `liens_utilisateur_sql`.
+        let liste = lot.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        let textes = lot
+            .iter()
+            .map(|id| format!("'{id}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        tx.execute(
+            &format!("DELETE FROM upnp_library_members WHERE track_id IN ({liste})"),
+            &[],
+        )?;
+        tx.execute(
+            &format!("DELETE FROM playlist_tracks WHERE track_id IN ({liste})"),
+            &[],
+        )?;
+        // `favorites` ne porte AUCUNE clé étrangère (ni SQLite ni PG) :
+        // sans ce ménage, un favori survivrait à sa piste.
+        tx.execute(
+            &format!(
+                "DELETE FROM favorites WHERE item_type = 'track' AND CAST(item_id AS TEXT) IN ({textes})"
+            ),
+            &[],
+        )?;
+        // La cascade existe sur un schéma neuf mais manque sur les bases
+        // migrées (cf. `TrackRepo::delete`).
+        let _ = tx.execute(
+            &format!("DELETE FROM queue_items WHERE track_id IN ({liste})"),
+            &[],
+        );
+        retirees += tx.execute(&format!("DELETE FROM tracks WHERE id IN ({liste})"), &[])? as i64;
+    }
+    // Seuls les albums DISTANTS de CE serveur, et seulement une fois vides.
+    // Un album local n'est jamais touché.
+    let albums: Vec<i64> = tx
+        .query_many(
+            &format!(
+                "SELECT a.id FROM albums a WHERE {} AND NOT EXISTS (SELECT 1 FROM tracks WHERE tracks.album_id = a.id)",
+                borne("a", &p)
+            ),
+            &params,
+        )?
+        .iter()
+        .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+        .collect();
+    for lot in albums.chunks(500) {
+        let liste = lot.iter().map(i64::to_string).collect::<Vec<_>>().join(",");
+        let textes = lot
+            .iter()
+            .map(|id| format!("'{id}'"))
+            .collect::<Vec<_>>()
+            .join(",");
+        tx.execute(
+            &format!(
+                "DELETE FROM favorites WHERE item_type = 'album' AND CAST(item_id AS TEXT) IN ({textes})"
+            ),
+            &[],
+        )?;
+        tx.execute(
+            &format!("DELETE FROM albums WHERE id IN ({liste}) AND source = 'upnp'"),
+            &[],
+        )?;
+    }
+    // Sans ce dernier retrait, la boucle de `synchronisation_upnp::start`
+    // ramène tout au plus tard une heure après : l'abonnement survivrait au
+    // retrait. La cascade emporte `upnp_library_members`.
+    let params: [&dyn ToSqlValue; 1] = [&udn];
+    tx.execute(
+        "DELETE FROM upnp_library_members WHERE source_key IN (SELECT source_key FROM upnp_library_sources WHERE udn = ?)",
+        &params,
+    )?;
+    tx.execute("DELETE FROM upnp_library_sources WHERE udn = ?", &params)?;
+    Ok(retirees)
 }
 
-/// L'identifiant de piste que porte une URL de lecture de NOTRE bibliothèque
-/// (`…/api/v1/library/tracks/<id>/audio`), ce que publie notre MediaServer.
-fn id_dans_l_url_de_lecture(url: &str) -> Option<i64> {
-    let chemin = url.split(['?', '#']).next()?;
-    let (_, reste) = chemin.split_once(&format!(
-        "{}/library/tracks/",
-        tune_core::upnp_server::API_PATH
-    ))?;
-    reste
+/// Fil du forum 3028 — d'où l'on reconnaît une URL de NOTRE bibliothèque :
+/// nos adresses (IPv4 et IPv6, `discovery_setup::nos_adresses`) et notre
+/// port d'API. Calculé une fois, hors de la transaction.
+#[derive(Clone, Debug)]
+pub struct NotreAdresse {
+    pub adresses: Vec<String>,
+    pub port: u16,
+}
+
+impl NotreAdresse {
+    pub fn de(state: &AppState) -> Self {
+        Self {
+            adresses: crate::discovery_setup::nos_adresses(state.config.advertised_ip.as_deref()),
+            port: state.config.port,
+        }
+    }
+
+    /// L'URL vise-t-elle CE serveur (hôte ET port) ?
+    fn designe_ce_serveur(&self, url: &reqwest::Url) -> bool {
+        // `host_str` rend une IPv6 entre crochets ; nos adresses s'écrivent
+        // sans, comme `Ipv6Addr::to_string`.
+        let Some(hote) = url.host_str() else {
+            return false;
+        };
+        let hote = hote.trim_start_matches('[').trim_end_matches(']');
+        url.port_or_known_default() == Some(self.port) && self.adresses.iter().any(|a| a == hote)
+    }
+}
+
+/// L'identifiant de piste que porte une URL de lecture d'un Tune
+/// (`…/api/v1/library/tracks/<id>/audio`), quel que soit l'hôte.
+fn id_d_une_url_de_tune(url: &reqwest::Url) -> Option<i64> {
+    url.path()
+        .strip_prefix(tune_core::upnp_server::API_PATH)?
+        .strip_prefix("/library/tracks/")?
         .strip_suffix("/audio")?
         .parse()
         .ok()
@@ -317,57 +356,209 @@ fn id_dans_l_url_de_lecture(url: &str) -> Option<i64> {
 
 const PISTE_LOCALE: &str = "(l.source IS NULL OR l.source = 'local') AND l.file_path IS NOT NULL";
 
-/// La piste LOCALE équivalente d'une piste distante, si elle est unique.
+/// Ce qu'une piste porte pour être comparée : titre, artiste, album (sans
+/// casse ni blancs de bord), durée, album en base.
+#[derive(Clone, Debug)]
+struct Signature {
+    id: i64,
+    titre: String,
+    artiste: String,
+    album: String,
+    duree: i64,
+    album_id: Option<i64>,
+}
+
+fn signatures(l: &dyn Lire, sql: &str, p: &[&dyn ToSqlValue]) -> Result<Vec<Signature>, String> {
+    let texte = |v: Option<&SqlValue>| {
+        v.and_then(|v| v.as_str())
+            .map(|s| s.trim().to_lowercase())
+            .unwrap_or_default()
+    };
+    Ok(l.tous(sql, p)?
+        .iter()
+        .filter_map(|r| {
+            Some(Signature {
+                id: r.first()?.as_i64()?,
+                titre: texte(r.get(1)),
+                artiste: texte(r.get(2)),
+                album: texte(r.get(3)),
+                duree: r.get(4).and_then(|v| v.as_i64()).unwrap_or(0),
+                album_id: r.get(5).and_then(|v| v.as_i64()),
+            })
+        })
+        .collect())
+}
+
+/// La signature est-elle assez complète pour fonder une équivalence ? Un titre
+/// seul ne prouve rien : artiste, album et durée doivent être connus.
+fn complete(s: &Signature) -> bool {
+    !s.titre.is_empty() && !s.artiste.is_empty() && !s.album.is_empty() && s.duree > 0
+}
+
+fn concorde(d: &Signature, l: &Signature) -> bool {
+    complete(l)
+        && d.titre == l.titre
+        && d.artiste == l.artiste
+        && d.album == l.album
+        && (d.duree - l.duree).abs() <= 2000
+}
+
+/// La piste LOCALE équivalente d'une piste distante, ou aucune.
 ///
-/// 1. L'URL de lecture désigne une piste de notre bibliothèque, et c'est bien
-///    une piste locale du même titre : c'est elle.
-/// 2. Sinon, une seule piste locale porte le même titre, le même artiste, le
-///    même album (sans casse) et une durée à deux secondes près.
+/// - Signature distante incomplète (artiste, album ou durée inconnus) :
+///   aucune. Le titre seul ne suffit pas.
+/// - URL de lecture d'un Tune (`/library/tracks/<id>/audio`) : elle doit viser
+///   CE serveur (hôte et port), et la piste qu'elle nomme doit concorder
+///   (titre, artiste, album, durée à 2 s). Une URL d'un AUTRE Tune nomme une
+///   piste d'une autre bibliothèque : aucune, même si une piste locale a les
+///   mêmes étiquettes.
+/// - Sinon, une seule piste locale concordante. Deux ou plus : aucune.
+fn equivalent(
+    d: &Signature,
+    url: Option<&str>,
+    locales: &[Signature],
+    nous: &NotreAdresse,
+) -> Option<i64> {
+    if !complete(d) {
+        return None;
+    }
+    let url = url.and_then(|u| reqwest::Url::parse(u.trim()).ok());
+    if let Some(url) = url.as_ref()
+        && let Some(nomme) = id_d_une_url_de_tune(url)
+    {
+        if !nous.designe_ce_serveur(url) {
+            return None;
+        }
+        return locales
+            .iter()
+            .find(|l| l.id == nomme && concorde(d, l))
+            .map(|l| l.id);
+    }
+    let mut candidates = locales.iter().filter(|l| concorde(d, l));
+    match (candidates.next(), candidates.next()) {
+        (Some(une), None) => Some(une.id),
+        _ => None,
+    }
+}
+
+/// Fil du forum 3028 — le plan d'un retrait : ce qui part, ce qui est
+/// rattaché, ce qui n'a pas d'équivalent.
 ///
-/// Deux candidates ou plus : aucune. On ne devine pas.
-fn equivalent_local(tx: &dyn DbTxHandle, piste: i64) -> Result<Option<i64>, String> {
-    let texte = piste.to_string();
-    let p: [&dyn ToSqlValue; 1] = [&texte];
-    let url = tx
-        .query_one(
-            "SELECT value FROM track_metadata WHERE CAST(track_id AS TEXT) = ? AND key = 'upnp_res_url'",
-            &p,
-        )?
-        .and_then(|r| r.first().and_then(|v| v.as_str().map(str::to_string)));
-    if let Some(local) = url.as_deref().and_then(id_dans_l_url_de_lecture) {
-        let params: [&dyn ToSqlValue; 2] = [&local, &piste];
-        let meme = tx.query_one(
+/// Un lien utilisateur (favori de piste ou d'album, entrée de playlist) porté
+/// par une piste distante est REPORTÉ sur la piste locale équivalente avant le
+/// retrait. Ce qui n'a pas d'équivalent est compté et annoncé. Le calcul tient
+/// en un nombre FIXE de requêtes, quel que soit le nombre de pistes.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Plan {
+    /// `(nature, distant, local)` : `track` ou `album`.
+    pub rattachements: Vec<(&'static str, i64, i64)>,
+    /// Pistes et albums liés SANS équivalent local sûr.
+    pub sans_equivalent: i64,
+    /// Les pistes que le retrait emportera.
+    pub pistes: Vec<i64>,
+}
+
+fn plan_par(l: &dyn Lire, udn: &str, nous: &NotreAdresse) -> Result<Plan, String> {
+    let p = prefixe(udn);
+    let pp: [&dyn ToSqlValue; 1] = [&p];
+    let colonnes = |t: &str| {
+        format!(
+            "SELECT {t}.id, {t}.title, ar.name, al.title, {t}.duration_ms, {t}.album_id \
+             FROM tracks {t} LEFT JOIN artists ar ON ar.id = {t}.artist_id \
+             LEFT JOIN albums al ON al.id = {t}.album_id"
+        )
+    };
+    let distantes = signatures(
+        l,
+        &format!("{} WHERE {} ORDER BY t.id", colonnes("t"), borne("t", &p)),
+        &pp,
+    )?;
+    let locales = signatures(
+        l,
+        &format!(
+            "{} WHERE {PISTE_LOCALE} AND lower(trim(l.title)) IN \
+             (SELECT lower(trim(t.title)) FROM tracks t WHERE {})",
+            colonnes("l"),
+            borne("t", &p)
+        ),
+        &pp,
+    )?;
+    let urls: std::collections::HashMap<String, String> = l
+        .tous(
             &format!(
-                "SELECT l.id FROM tracks l, tracks d WHERE l.id = ? AND d.id = ? AND {PISTE_LOCALE} \
-                 AND lower(trim(l.title)) = lower(trim(d.title))"
+                "SELECT CAST(m.track_id AS TEXT), m.value FROM track_metadata m \
+                 WHERE m.key = 'upnp_res_url' AND CAST(m.track_id AS TEXT) IN \
+                 (SELECT CAST(t.id AS TEXT) FROM tracks t WHERE {})",
+                borne("t", &p)
             ),
-            &params,
-        )?;
-        if meme.is_some() {
-            return Ok(Some(local));
+            &pp,
+        )?
+        .iter()
+        .filter_map(|r| Some((r.first()?.as_string()?, r.get(1)?.as_string()?)))
+        .collect();
+    let equivalents: std::collections::HashMap<i64, Option<i64>> = distantes
+        .iter()
+        .map(|d| {
+            let url = urls.get(&d.id.to_string()).map(String::as_str);
+            (d.id, equivalent(d, url, &locales, nous))
+        })
+        .collect();
+    let album_local: std::collections::HashMap<i64, Option<i64>> =
+        locales.iter().map(|s| (s.id, s.album_id)).collect();
+
+    let mut plan = Plan {
+        pistes: distantes.iter().map(|d| d.id).collect(),
+        ..Plan::default()
+    };
+    let pistes_liees = ids(l.tous(
+        &format!(
+            "SELECT t.id FROM tracks t WHERE {} AND (EXISTS (SELECT 1 FROM favorites f \
+             WHERE f.item_type = 'track' AND {}) OR {}) ORDER BY t.id",
+            borne("t", &p),
+            super::synchronisation_upnp::favori_designe("t.id"),
+            lien_playlist("t"),
+        ),
+        &pp,
+    )?);
+    for piste in pistes_liees {
+        match equivalents.get(&piste).copied().flatten() {
+            Some(locale) => plan.rattachements.push(("track", piste, locale)),
+            None => plan.sans_equivalent += 1,
         }
     }
-    let params: [&dyn ToSqlValue; 1] = [&piste];
-    let candidates = tx.query_many(
+    let albums_lies = ids(l.tous(
         &format!(
-            "SELECT l.id FROM tracks d \
-             JOIN tracks l ON lower(trim(l.title)) = lower(trim(d.title)) \
-               AND abs(coalesce(l.duration_ms, 0) - coalesce(d.duration_ms, 0)) <= 2000 \
-             LEFT JOIN artists ad ON ad.id = d.artist_id \
-             LEFT JOIN artists al ON al.id = l.artist_id \
-             LEFT JOIN albums bd ON bd.id = d.album_id \
-             LEFT JOIN albums bl ON bl.id = l.album_id \
-             WHERE d.id = ? AND {PISTE_LOCALE} \
-               AND lower(coalesce(ad.name, '')) = lower(coalesce(al.name, '')) \
-               AND lower(coalesce(bd.title, '')) = lower(coalesce(bl.title, '')) \
-             LIMIT 2"
+            "SELECT a.id FROM albums a WHERE {} AND EXISTS (SELECT 1 FROM favorites f \
+             WHERE f.item_type = 'album' AND {}) ORDER BY a.id",
+            borne("a", &p),
+            super::synchronisation_upnp::favori_designe("a.id"),
         ),
-        &params,
-    )?;
-    Ok(match candidates.as_slice() {
-        [une] => une.first().and_then(|v| v.as_i64()),
-        _ => None,
-    })
+        &pp,
+    )?);
+    for album in albums_lies {
+        let pistes: Vec<&Signature> = distantes
+            .iter()
+            .filter(|d| d.album_id == Some(album))
+            .collect();
+        let cibles: Option<std::collections::BTreeSet<i64>> = pistes
+            .iter()
+            .map(|d| {
+                equivalents
+                    .get(&d.id)
+                    .copied()
+                    .flatten()
+                    .and_then(|l| album_local.get(&l).copied().flatten())
+            })
+            .collect();
+        match cibles {
+            Some(c) if !pistes.is_empty() && c.len() == 1 => {
+                let locale = *c.iter().next().expect("un élément");
+                plan.rattachements.push(("album", album, locale));
+            }
+            _ => plan.sans_equivalent += 1,
+        }
+    }
+    Ok(plan)
 }
 
 /// Reporte un favori `nature` de `ancien` sur `nouveau`, profil par profil,
@@ -391,130 +582,89 @@ fn reporter_le_favori(
     Ok(())
 }
 
-fn ids(lignes: Vec<Vec<tune_core::db::backend::SqlValue>>) -> Vec<i64> {
+fn ids(lignes: Vec<Vec<SqlValue>>) -> Vec<i64> {
     lignes
         .iter()
         .filter_map(|r| r.first().and_then(|v| v.as_i64()))
         .collect()
 }
 
-/// Le rattachement, calculé (`ecrire = false`) ou appliqué.
-///
-/// Borné comme le retrait : pistes et albums `upnp` dont le `source_id`
-/// commence par `<udn>|`. Seuls `favorites.item_id` et
-/// `playlist_tracks.track_id` changent ; aucune piste et aucun album LOCAL
-/// n'est écrit.
-fn rattacher(tx: &dyn DbTxHandle, udn: &str, ecrire: bool) -> Result<Rattachement, String> {
-    let p = prefixe(udn);
-    let params: [&dyn ToSqlValue; 1] = [&p];
-    let mut bilan = Rattachement::default();
-    let pistes_liees = ids(tx.query_many(
-        &format!(
-            "SELECT t.id FROM tracks t WHERE {} AND (EXISTS (SELECT 1 FROM favorites f \
-             WHERE f.item_type = 'track' AND {}) OR {})",
-            borne("t", &p),
-            super::synchronisation_upnp::favori_designe("t.id"),
-            lien_playlist("t"),
-        ),
-        &params,
-    )?);
-    for piste in pistes_liees {
-        match equivalent_local(tx, piste)? {
-            Some(locale) => {
-                if ecrire {
-                    reporter_le_favori(tx, "track", piste, locale)?;
-                    let p: [&dyn ToSqlValue; 2] = [&locale, &piste];
-                    tx.execute(
-                        "UPDATE playlist_tracks SET track_id = ? WHERE track_id = ?",
-                        &p,
-                    )?;
-                }
-                bilan.rattaches += 1;
-            }
-            None => bilan.sans_equivalent += 1,
-        }
-    }
-    let albums_lies = ids(tx.query_many(
-        &format!(
-            "SELECT a.id FROM albums a WHERE {} AND EXISTS (SELECT 1 FROM favorites f \
-             WHERE f.item_type = 'album' AND {})",
-            borne("a", &p),
-            super::synchronisation_upnp::favori_designe("a.id"),
-        ),
-        &params,
-    )?);
-    for album in albums_lies {
-        let pa: [&dyn ToSqlValue; 1] = [&album];
-        let mut cibles = std::collections::BTreeSet::new();
-        let mut complet = true;
-        for piste in ids(tx.query_many("SELECT id FROM tracks WHERE album_id = ?", &pa)?) {
-            let cible = match equivalent_local(tx, piste)? {
-                Some(locale) => {
-                    let pl: [&dyn ToSqlValue; 1] = [&locale];
-                    tx.query_one("SELECT album_id FROM tracks WHERE id = ?", &pl)?
-                        .and_then(|r| r.first().and_then(|v| v.as_i64()))
-                }
-                None => None,
-            };
-            match cible {
-                Some(c) => {
-                    cibles.insert(c);
-                }
-                None => complet = false,
-            }
-        }
-        match (complet, cibles.len(), cibles.iter().next()) {
-            (true, 1, Some(&locale)) => {
-                if ecrire {
-                    reporter_le_favori(tx, "album", album, locale)?;
-                }
-                bilan.rattaches += 1;
-            }
-            _ => bilan.sans_equivalent += 1,
-        }
-    }
-    Ok(bilan)
+/// L'empreinte du plan : ce que la confirmation doit retrouver À L'IDENTIQUE
+/// (pistes à retirer, rattachements, liens sans équivalent).
+fn empreinte(plan: &Plan) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    plan.pistes.hash(&mut h);
+    plan.rattachements.hash(&mut h);
+    plan.sans_equivalent.hash(&mut h);
+    format!("{:016x}", h.finish())
 }
 
-/// Le rattachement que ferait un retrait, sans rien écrire.
-pub fn plan_de_rattachement(state: &AppState, udn: &str) -> Result<Rattachement, String> {
-    let mut bilan = Rattachement::default();
-    state.backend.write_tx(&mut |tx| {
-        bilan = rattacher(tx, udn, false)?;
-        Ok(())
-    })?;
-    Ok(bilan)
-}
-
-/// Fil du forum 3028 — rattacher les liens, PUIS retirer ce qui vient de
-/// `udn` (pistes, albums distants vidés, sources). `attendu` est le nombre de
-/// pistes annoncé et confirmé : s'il a bougé, rien n'est retiré.
-pub fn retirer_en_rattachant(
-    state: &AppState,
-    udn: &str,
-    attendu: i64,
-) -> Result<(Apercu, Rattachement), String> {
-    let vu = apercu(state, udn)?;
-    if vu.pistes != attendu {
-        return Err(format!(
-            "Le nombre a changé : {} pistes à retirer, {attendu} annoncées. Relisez le compte avant de confirmer.",
-            vu.pistes
-        ));
-    }
-    let mut bilan = Rattachement::default();
-    state.backend.write_tx(&mut |tx| {
-        bilan = rattacher(tx, udn, true)?;
-        Ok(())
-    })?;
-    Ok((retirer(state, udn, Some(attendu))?, bilan))
-}
-
-/// L'aperçu et le rattachement, dans la forme que l'écran lit.
-pub fn apercu_public(a: &Apercu, r: &Rattachement) -> Value {
+fn plan_public(a: &Apercu, plan: &Plan) -> Value {
     let mut v = public(a);
-    v["liens_rattaches"] = json!(r.rattaches);
-    v["liens_sans_equivalent"] = json!(r.sans_equivalent);
+    v["liens_rattaches"] = json!(plan.rattachements.len());
+    v["liens_sans_equivalent"] = json!(plan.sans_equivalent);
+    v["empreinte"] = json!(empreinte(plan));
     v
+}
+
+/// L'aperçu d'un retrait : une LECTURE simple, rien n'est écrit. Ce qu'elle
+/// rend est ce que la confirmation devra retrouver.
+pub fn preparer_le_retrait(
+    db: &dyn DbBackend,
+    udn: &str,
+    nous: &NotreAdresse,
+) -> Result<Value, String> {
+    let l = ParLaBase(db);
+    let apercu = apercu_par(&l, udn)?;
+    Ok(plan_public(&apercu, &plan_par(&l, udn, nous)?))
+}
+
+/// Préfixe des refus de [`retirer_selon_le_plan`] qui sont des CONFLITS.
+pub const PLAN_CHANGE: &str = "Le plan a changé";
+
+/// Fil du forum 3028 — le retrait confirmé, en UNE transaction : relire le
+/// plan, le comparer à l'aperçu annoncé (`annonce`) et au compte confirmé,
+/// rattacher, puis retirer. Un écart (favori ajouté, piste apparue, compte
+/// différent) annule tout : aucun lien n'est déplacé ni effacé sans avoir été
+/// annoncé.
+pub fn retirer_selon_le_plan(
+    db: &dyn DbBackend,
+    udn: &str,
+    nous: &NotreAdresse,
+    annonce: &Value,
+    compte_confirme: i64,
+) -> Result<Value, String> {
+    let mut resultat = Value::Null;
+    db.write_tx(&mut |tx| {
+        let l = DansLaTx(tx);
+        let apercu = apercu_par(&l, udn)?;
+        let plan = plan_par(&l, udn, nous)?;
+        let relu = plan_public(&apercu, &plan);
+        if relu != *annonce || apercu.pistes != compte_confirme {
+            return Err(format!(
+                "{PLAN_CHANGE} : {} pistes à retirer, {compte_confirme} confirmées. Relisez l'aperçu avant de confirmer.",
+                apercu.pistes
+            ));
+        }
+        for &(nature, distant, local) in &plan.rattachements {
+            reporter_le_favori(tx, nature, distant, local)?;
+            if nature == "track" {
+                let p: [&dyn ToSqlValue; 2] = [&local, &distant];
+                tx.execute("UPDATE playlist_tracks SET track_id = ? WHERE track_id = ?", &p)?;
+            }
+        }
+        let retirees = retirer_dans(tx, udn)?;
+        resultat = plan_public(
+            &Apercu {
+                pistes: retirees,
+                ..apercu
+            },
+            &plan,
+        );
+        Ok(())
+    })?;
+    Ok(resultat)
 }
 
 /// `GET /network/media-servers/{id}/bibliotheque` — ne modifie rien.

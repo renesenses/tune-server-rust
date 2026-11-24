@@ -300,36 +300,54 @@ pub async fn act(State(state): State<AppState>, Json(request): Json<Action>) -> 
             )),
         )
     })?;
-    let mut source = sources(state.backend.as_ref())
+    let trouvee = sources(state.backend.as_ref())
         .map_err(error)?
         .into_iter()
-        .find(|s| s.key == request.key)
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(json!({"error": "source inconnue"})),
-            )
-        })?;
+        .find(|s| s.key == request.key);
+    let Some(mut source) = trouvee else {
+        // Fil du forum 3028 — une confirmation de retrait REJOUÉE vise une
+        // source déjà retirée : c'est un conflit, pas une source inconnue.
+        if request.action == "remove" && request.generation.is_some() {
+            return Err(revue_changee());
+        }
+        return Err((
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": "source inconnue"})),
+        ));
+    };
     match request.action.as_str() {
         // Fil du forum 3028 — retirer la source ET ses pistes, en deux temps.
-        // Sans `generation` (ou avec une autre) : l'aperçu, la source passe
-        // en `removal`. Avec la `generation` de l'aperçu et son `count` de
-        // pistes, dans l'heure : les liens sont rattachés aux pistes locales,
-        // puis tout ce qui vient de ce serveur est retiré (`retrait_upnp`).
+        //
+        // 1. Sans la `generation` de l'aperçu en cours : l'APERÇU, une lecture
+        //    simple. Il est rangé dans la source (`report.removal`), lié à une
+        //    `generation` neuve, et la source passe en `removal`.
+        // 2. Avec cette `generation`, son `count` de pistes, dans l'heure :
+        //    le retrait, en UNE transaction qui relit le plan et refuse (409)
+        //    s'il ne correspond plus exactement à l'aperçu annoncé.
+        //
+        // Les deux temps passent hors de l'exécuteur (#4924).
         "remove" => {
-            let confirme = source.status == "removal"
+            let nous = super::retrait_upnp::NotreAdresse::de(&state);
+            let en_revue = source.status == "removal"
                 && request.generation.as_deref() == Some(source.generation.as_str());
-            if !confirme {
-                let apercu = super::retrait_upnp::apercu(&state, &source.udn).map_err(error)?;
-                let plan = super::retrait_upnp::plan_de_rattachement(&state, &source.udn)
-                    .map_err(error)?;
+            if !en_revue {
+                if request.generation.is_some() {
+                    // Une génération qui n'est pas celle de l'aperçu en cours.
+                    return Err(revue_changee());
+                }
+                let annonce = hors_executeur(&state, &source, move |db, s| {
+                    super::retrait_upnp::preparer_le_retrait(db, &s.udn, &nous)
+                })
+                .await
+                .map_err(error)?;
                 source.status = "removal".into();
                 source.generation = uuid::Uuid::new_v4().to_string();
                 source.last_attempt = now_seconds();
                 source.pending.clear();
+                source.report = json!({ "removal": annonce });
                 save(state.backend.as_ref(), &source).map_err(error)?;
                 let mut corps = public(&source);
-                corps["removal"] = super::retrait_upnp::apercu_public(&apercu, &plan);
+                corps["removal"] = source.report["removal"].clone();
                 return Ok(Json(corps));
             }
             if now_seconds() - source.last_attempt > 3600 {
@@ -342,34 +360,23 @@ pub async fn act(State(state): State<AppState>, Json(request): Json<Action>) -> 
                     )),
                 ));
             }
-            let attendu = request
+            let compte = request
                 .count
                 .and_then(|n| i64::try_from(n).ok())
-                .ok_or_else(|| {
-                    (
-                        StatusCode::CONFLICT,
-                        Json(crate::message_api::corps_refus(
-                            "upnp_review_changed",
-                            "api.upnp.reviewChanged",
-                            &[],
-                        )),
-                    )
-                })?;
-            return match super::retrait_upnp::retirer_en_rattachant(&state, &source.udn, attendu) {
-                Ok((fait, plan)) => Ok(Json(json!({
+                .ok_or_else(revue_changee)?;
+            let annonce = source.report["removal"].clone();
+            return match hors_executeur(&state, &source, move |db, s| {
+                super::retrait_upnp::retirer_selon_le_plan(db, &s.udn, &nous, &annonce, compte)
+            })
+            .await
+            {
+                Ok(fait) => Ok(Json(json!({
                     "key": source.key,
                     "udn": source.udn,
                     "status": "removed",
-                    "removal": super::retrait_upnp::apercu_public(&fait, &plan),
+                    "removal": fait,
                 }))),
-                Err(e) if e.starts_with("Le nombre a changé") => Err((
-                    StatusCode::CONFLICT,
-                    Json(crate::message_api::corps_refus(
-                        "upnp_review_changed",
-                        "api.upnp.reviewChanged",
-                        &[],
-                    )),
-                )),
+                Err(e) if e.starts_with(super::retrait_upnp::PLAN_CHANGE) => Err(revue_changee()),
                 Err(e) => Err(error(e)),
             };
         }
@@ -431,6 +438,18 @@ pub async fn act(State(state): State<AppState>, Json(request): Json<Action>) -> 
         });
     }
     Ok(Json(result))
+}
+
+/// Fil du forum 3028 — le refus d'une revue qui ne correspond plus.
+fn revue_changee() -> (StatusCode, Json<Value>) {
+    (
+        StatusCode::CONFLICT,
+        Json(crate::message_api::corps_refus(
+            "upnp_review_changed",
+            "api.upnp.reviewChanged",
+            &[],
+        )),
+    )
 }
 
 /// Le travail SQL d'une source sur le pool de fils bloquants de Tokio (#4924) :
