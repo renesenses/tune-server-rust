@@ -328,6 +328,9 @@ fn membres_remplacants(
         .iter()
         .enumerate()
         .filter(|(_, m)| !m.enabled)
+        // rc14 — une façade de l'égaliseur écartée ne reprend jamais la place :
+        // le moteur n'applique que la première façade COCHÉE.
+        .filter(|(_, m)| !super::migration::FACADES_EQ.contains(&m.id.as_str()))
         .filter_map(|(i, m)| {
             let gagnant = m
                 .settings
