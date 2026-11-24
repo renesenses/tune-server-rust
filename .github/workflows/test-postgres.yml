@@ -31,6 +31,15 @@ on:
   pull_request:
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
+    inputs:
+      # Essai d'un runner sans toucher aux variables du dépôt (rc15, Hulk) :
+      # JSON d'étiquettes, par exemple ["self-hosted","hulk-pg"]. Vide
+      # (défaut) : vars.RUNNER_LINUX_PG, sinon ubuntu-latest, comme avant.
+      runner:
+        description: 'Runner PostgreSQL (JSON), ex. ["self-hosted","hulk-pg"] ; vide = vars.RUNNER_LINUX_PG'
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   group: postgres-${{ github.event.pull_request.number || github.ref }}
@@ -44,7 +53,7 @@ jobs:
   # Il ne calcule PAS `full` : ce job ne se decide plus sur le profil.
   impact:
     name: Impact (PostgreSQL)
-    runs-on: ${{ fromJSON(vars.RUNNER_LINUX_PG || vars.RUNNER_LINUX || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(inputs.runner || vars.RUNNER_LINUX_PG || vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.classer.outputs.rust }}
@@ -108,7 +117,7 @@ jobs:
       || contains(github.event.pull_request.labels.*.name, 'ci:full')
       || needs.impact.outputs.rust == 'true'
       )
-    runs-on: ${{ fromJSON(vars.RUNNER_LINUX_PG || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(inputs.runner || vars.RUNNER_LINUX_PG || '"ubuntu-latest"') }}
     # 45 et non 30 : le job compile et execute un paquet de plus (#3123). Mesure
     # du 01/09/2026 — le job tenait en 6 min 21 et 6 min 31 sur les deux
     # dernieres executions reelles, et `tune-server` ajoute une compilation
@@ -161,7 +170,11 @@ jobs:
 
       # Libère ~25 Gio sur la machine GitHub (outils préinstallés dont ce job
       # n'a pas besoin), avant que la compilation ne remplisse le disque.
+      # Runner auto-hébergé (Hulk) : rien de tout cela n'y est installé, le
+      # compte du runner n'a pas root (sudo refusé) et `docker image prune`
+      # viderait le cache d'images partagé des autres runners : sauté.
       - name: Libérer de la place sur le disque
+        if: runner.environment == 'github-hosted'
         run: |
           df -h /
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/share/boost
@@ -184,7 +197,11 @@ jobs:
       # gratuite. Une mémoire d'échange de 16 Gio absorbe la pointe sans
       # ralentir le reste du job ni réduire le parallélisme (CARGO_BUILD_JOBS
       # reste à 3) ; le disque a ~100 Gio libres après l'étape précédente.
+      # Runner auto-hébergé : pas de root pour swapon, et la machine a la
+      # mémoire qu'il faut (la mémoire d'échange est l'affaire de l'hôte) :
+      # sauté.
       - name: Ajouter de la mémoire d'échange (#8190)
+        if: runner.environment == 'github-hosted'
         run: |
           free -h; swapon --show || true; nproc
           # QA 18/11 — la mémoire d'échange va sur le disque temporaire de la

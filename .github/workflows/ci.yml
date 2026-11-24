@@ -13,6 +13,16 @@ on:
     # Poser `ci:full` sur une PR de lot doit relancer immediatement le routage.
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
+    inputs:
+      # Essai d'un runner sans toucher aux variables du dépôt (rc15, Hulk) :
+      # JSON d'étiquettes, par exemple ["self-hosted","hulk"]. Vide (défaut) :
+      # vars.RUNNER_LINUX, sinon ubuntu-latest, comme avant. Ne vaut que pour
+      # les jobs Linux.
+      runner:
+        description: 'Runner Linux (JSON), ex. ["self-hosted","hulk"] ; vide = vars.RUNNER_LINUX'
+        required: false
+        default: ''
+        type: string
 
 concurrency:
   # Un nouveau SHA rend tous les resultats de l'ancien SHA inutiles. Sans
@@ -35,7 +45,7 @@ jobs:
   # manuel reste toujours complet.
   impact:
     name: Impact et garde-fous légers
-    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(inputs.runner || vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 5
     outputs:
       rust: ${{ steps.classer.outputs.rust }}
@@ -308,7 +318,7 @@ jobs:
     name: Format
     needs: impact
     if: needs.impact.outputs.rust == 'true'
-    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(inputs.runner || vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 15  # fmt — 27 s observe
     steps:
       - uses: actions/checkout@v4
@@ -322,8 +332,8 @@ jobs:
     name: Test
     needs: impact
     if: needs.impact.outputs.rust == 'true'
-    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
-    timeout-minutes: ${{ vars.RUNNER_LINUX && 180 || 120 }}  # test — 75 min dépassées sur les runners GitHub depuis la disparition de RUNNER_LINUX (24/11), d où 120 ; 37 à 45 min observées début novembre (45 dépassé, PR #7711 et #7727) ; > 75 min sur Shrek à 4 cœurs (run 44792749729) : 180 sur runner auto-hébergé
+    runs-on: ${{ fromJSON(inputs.runner || vars.RUNNER_LINUX || '"ubuntu-latest"') }}
+    timeout-minutes: ${{ (inputs.runner || vars.RUNNER_LINUX) && 180 || 120 }}  # test — 75 min dépassées sur les runners GitHub depuis la disparition de RUNNER_LINUX (24/11), d où 120 ; 37 à 45 min observées début novembre (45 dépassé, PR #7711 et #7727) ; > 75 min sur Shrek à 4 cœurs (run 44792749729) : 180 sur runner auto-hébergé
     # 02/11 (train rc10) : le runner tuait le job en pleine compilation (143)
     # ou le coupait a 45 min. Sans info de debogage et a 2 compilations en
     # parallele, memoire et disque restent sous les limites du runner.
@@ -439,8 +449,8 @@ jobs:
     name: Test (jeu de fonctionnalites livre)
     needs: impact
     if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.full == 'true' && needs.impact.outputs.livre == 'true'
-    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
-    timeout-minutes: ${{ vars.RUNNER_LINUX && 180 || 120 }}  # compilation + suite complete : coupures observees a 45 min ; même calcul que `test` (#9476) : 120 sur runners GitHub, 180 sur runner auto-hébergé
+    runs-on: ${{ fromJSON(inputs.runner || vars.RUNNER_LINUX || '"ubuntu-latest"') }}
+    timeout-minutes: ${{ (inputs.runner || vars.RUNNER_LINUX) && 180 || 120 }}  # compilation + suite complete : coupures observees a 45 min ; même calcul que `test` (#9476) : 120 sur runners GitHub, 180 sur runner auto-hébergé
     steps:
       - uses: actions/checkout@v4
       - uses: actions-rust-lang/setup-rust-toolchain@v1
@@ -502,7 +512,7 @@ jobs:
     # touchait que lui. Le classifieur n'allume `embedding` que si le diff
     # touche `*embedding*` / `*onnx*` : le profil rapide reste rapide ailleurs.
     if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.embedding == 'true'
-    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(inputs.runner || vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 45  # audio-embedding — ~5 min observe
     steps:
       - uses: actions/checkout@v4
@@ -660,7 +670,7 @@ jobs:
             os: windows-latest
             artifact: tune-server-windows-x86_64
 
-    runs-on: ${{ (startsWith(matrix.os, 'ubuntu-') && fromJSON(vars.RUNNER_LINUX || toJSON(matrix.os))) || (matrix.os == 'macos-latest' && fromJSON(vars.RUNNER_MACOS || '"macos-latest"')) || matrix.os }}
+    runs-on: ${{ (startsWith(matrix.os, 'ubuntu-') && fromJSON(inputs.runner || vars.RUNNER_LINUX || toJSON(matrix.os))) || (matrix.os == 'macos-latest' && fromJSON(vars.RUNNER_MACOS || '"macos-latest"')) || matrix.os }}
     timeout-minutes: 60  # build — 18 min au pire observe
     steps:
       - uses: actions/checkout@v4
@@ -677,6 +687,22 @@ jobs:
       - name: Install cross
         if: matrix.cross
         uses: taiki-e/install-action@cross
+
+      # Docker rootless (runner auto-hébergé sans root, Hulk) : cross lance
+      # ses conteneurs en `--user <uid du runner>`, qui, dans l'espace de
+      # noms rootless, n'est PAS le propriétaire du dossier monté (c'est le
+      # root du conteneur) : écriture refusée dans target/. Avec
+      # CROSS_ROOTLESS_CONTAINER_ENGINE=1, cross reste root du conteneur,
+      # c'est-à-dire le compte du runner sur l'hôte. Docker classique (GitHub,
+      # Shrek) : rien ne change.
+      - name: cross sous Docker rootless
+        if: matrix.cross && runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          if docker info -f '{{.SecurityOptions}}' 2>/dev/null | grep -q 'name=rootless'; then
+            echo "CROSS_ROOTLESS_CONTAINER_ENGINE=1" >> "$GITHUB_ENV"
+            echo "Docker rootless : CROSS_ROOTLESS_CONTAINER_ENGINE=1"
+          fi
 
       - name: Build (cross)
         if: matrix.cross
@@ -861,7 +887,7 @@ jobs:
     name: Clippy
     needs: impact
     if: needs.impact.outputs.rust == 'true'
-    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(inputs.runner || vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 45  # clippy — 4 min observe (2 min avant #2865)
     steps:
       - uses: actions/checkout@v4
@@ -964,7 +990,7 @@ jobs:
     name: Security Audit
     needs: impact
     if: needs.impact.outputs.rust == 'true' && needs.impact.outputs.audit == 'true'
-    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(inputs.runner || vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 15  # audit — 10 s observe
     # Blocking: a security advisory must fail CI, not be swallowed. The wasmtime
     # advisories that forced continue-on-error are fixed (bump to 47.0.3).
@@ -1059,7 +1085,7 @@ jobs:
     # garde-fou (#1751) a refuse le tag, correctement, mais le signal n'est
     # jamais remonte jusqu'ici.
     #
-    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(inputs.runner || vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -1146,7 +1172,7 @@ jobs:
           - {target: x86_64-apple-darwin, os: macos-15-intel, cross: false}
           - {target: aarch64-apple-darwin, os: macos-latest, cross: false}
           - {target: x86_64-pc-windows-msvc, os: windows-latest, cross: false}
-    runs-on: ${{ (startsWith(matrix.os, 'ubuntu-') && fromJSON(vars.RUNNER_LINUX || toJSON(matrix.os))) || (matrix.os == 'macos-latest' && fromJSON(vars.RUNNER_MACOS || '"macos-latest"')) || matrix.os }}
+    runs-on: ${{ (startsWith(matrix.os, 'ubuntu-') && fromJSON(inputs.runner || vars.RUNNER_LINUX || toJSON(matrix.os))) || (matrix.os == 'macos-latest' && fromJSON(vars.RUNNER_MACOS || '"macos-latest"')) || matrix.os }}
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
@@ -1172,6 +1198,21 @@ jobs:
           cargo about --version
       - uses: taiki-e/install-action@cross
         if: matrix.cross
+      # Docker rootless (runner auto-hébergé sans root, Hulk) : cross lance
+      # ses conteneurs en `--user <uid du runner>`, qui, dans l'espace de
+      # noms rootless, n'est PAS le propriétaire du dossier monté (c'est le
+      # root du conteneur) : écriture refusée dans target/. Avec
+      # CROSS_ROOTLESS_CONTAINER_ENGINE=1, cross reste root du conteneur,
+      # c'est-à-dire le compte du runner sur l'hôte. Docker classique (GitHub,
+      # Shrek) : rien ne change.
+      - name: cross sous Docker rootless
+        if: matrix.cross && runner.environment == 'self-hosted'
+        shell: bash
+        run: |
+          if docker info -f '{{.SecurityOptions}}' 2>/dev/null | grep -q 'name=rootless'; then
+            echo "CROSS_ROOTLESS_CONTAINER_ENGINE=1" >> "$GITHUB_ENV"
+            echo "Docker rootless : CROSS_ROOTLESS_CONTAINER_ENGINE=1"
+          fi
       - name: Build the helper and dependency notices
         shell: bash
         run: |
@@ -1231,7 +1272,7 @@ jobs:
       - audit
       - ffi
       - librespot
-    runs-on: ${{ fromJSON(vars.RUNNER_LINUX || '"ubuntu-latest"') }}
+    runs-on: ${{ fromJSON(inputs.runner || vars.RUNNER_LINUX || '"ubuntu-latest"') }}
     timeout-minutes: 2
     steps:
       - name: Refuser une branche autre qu'une RC
