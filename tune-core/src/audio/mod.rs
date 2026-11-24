@@ -124,6 +124,8 @@ pub mod m4a;
 /// Matroska (`.mkv`/`.mka`/`.webm`) : la sonde de la piste audio — admis si
 /// un décodeur livré la lit, compté-nommé sinon (#3633).
 pub mod matroska;
+/// #9174 — une SEEKTABLE pour le FLAC servi à un navigateur tiré à distance.
+pub mod seektable_flac_9174;
 // #8513 — traitements de zone contournés pendant une mesure de pièce.
 /// La forme d'onde d'une piste (crêtes, RMS, écrêtage) pour sa fiche
 /// technique (fil du forum 2793).

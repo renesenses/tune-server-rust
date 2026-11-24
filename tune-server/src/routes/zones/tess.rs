@@ -125,11 +125,13 @@ fn descripteur_tiers(id: &str) -> DescripteurGreffon {
         origin: Origine::Package,
         settings_schema: json!({ "type": "object" }),
         placement: ContraintesPlace {
-            channels: if famille {
-                Canaux::StereoOnly
-            } else {
-                Canaux::Any
-            },
+            // TESS T14 — l'hôte exécute TOUT natif tiers dans l'étage casque,
+            // stéréo seulement (`CrossfeedProcessor`, préparé en 2 canaux).
+            // Annoncer `any` laissait cocher le greffon sur une zone
+            // multicanal où il ne tournait pas, sans motif : le descripteur
+            // dit ce que l'hôte fait vraiment, et la résolution l'éteint
+            // avec son motif hors stéréo.
+            channels: Canaux::StereoOnly,
             position: Position::Free,
             // Le groupe vient du préfixe (`groupe_effectif`).
             exclusive_group: None,
@@ -162,7 +164,7 @@ pub fn catalogue_tess(paquets_charges: &[String]) -> Catalogue {
     c
 }
 
-fn catalogue_du_serveur() -> Catalogue {
+pub(super) fn catalogue_du_serveur() -> Catalogue {
     catalogue_tess(&tune_core::audio::natifs_tiers::identifiants_charges())
 }
 
@@ -196,7 +198,7 @@ pub async fn catalogue_tess_route(State(state): State<AppState>) -> impl IntoRes
 
 // ── Contexte de la zone ─────────────────────────────────────────────
 
-fn zone_introuvable(zone_id: i64) -> Response {
+pub(super) fn zone_introuvable(zone_id: i64) -> Response {
     (
         StatusCode::NOT_FOUND,
         Json(json!({ "error": "zone_not_found", "zone_id": zone_id })),
@@ -223,7 +225,7 @@ pub fn corps_du_refus(r: &RefusTess) -> Value {
     v
 }
 
-fn refus(e: &ErreurChaine) -> Response {
+pub(super) fn refus(e: &ErreurChaine) -> Response {
     let r = RefusTess::from(e);
     let statut = StatusCode::from_u16(r.status).unwrap_or(StatusCode::CONFLICT);
     (statut, Json(corps_du_refus(&r))).into_response()
@@ -231,7 +233,7 @@ fn refus(e: &ErreurChaine) -> Response {
 
 /// Une clé de la zone ne se relit pas (T02 : refus explicite, jamais une
 /// chaîne vide) : l'écran le dit, la lecture garde son chemin actuel.
-fn erreur_migration(e: &ErreurMigration) -> Response {
+pub(super) fn erreur_migration(e: &ErreurMigration) -> Response {
     match e {
         ErreurMigration::ReglagesInvalides { id, raison } => {
             refus(&ErreurChaine::ReglagesInvalides {
@@ -332,7 +334,7 @@ async fn volume_de(state: &AppState, zone: &Zone) -> VolumeZone {
 }
 
 /// La réponse de la zone, à partir de sa chaîne lue (T02).
-async fn reponse_de_zone(
+pub(super) async fn reponse_de_zone(
     state: &AppState,
     zone: &Zone,
     lecture: LectureZone,
@@ -360,7 +362,7 @@ async fn reponse_de_zone(
     ReponseTessZone::depuis(zone_id, lecture.chaine, actif, catalogue, &ctx)
 }
 
-fn zone_de(state: &AppState, zone_id: i64) -> Result<Zone, Response> {
+pub(super) fn zone_de(state: &AppState, zone_id: i64) -> Result<Zone, Response> {
     match ZoneRepo::with_backend(state.backend.clone()).get(zone_id) {
         Ok(Some(z)) => Ok(z),
         Ok(None) => Err(zone_introuvable(zone_id)),
@@ -392,7 +394,7 @@ pub async fn get_zone_tess(State(state): State<AppState>, Path(id): Path<i64>) -
 /// écriture (comparaison des marques et des maillons inchangés). L'écriture
 /// elle-même prend en plus [`verrou_de_zone`] (dans [`ecrire_chaine`]), qui
 /// l'ordonne avec la migration de T03.
-fn verrou_des_put(zone_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+pub(super) fn verrou_des_put(zone_id: i64) -> Arc<tokio::sync::Mutex<()>> {
     static VERROUS: OnceLock<std::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>> =
         OnceLock::new();
     let mut table = VERROUS
@@ -516,7 +518,7 @@ pub fn defaire_p2(
 
 /// La partie synchrone d'un `PUT` : lecture, fusion, droits, validation,
 /// écriture. Rend la lecture après écriture et les anciennes clés modifiées.
-fn appliquer_le_put(
+pub(super) fn appliquer_le_put(
     settings: &SettingsRepo,
     zone_id: i64,
     corps: &[u8],
@@ -566,7 +568,7 @@ fn appliquer_le_put(
 
 /// Chaque ancienne clé réécrite atteint la sortie vivante, comme par son
 /// ancienne route (`REGLAGES_A_RAFRAICHIR`).
-async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
+pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
     let id = zone.id.unwrap_or_default();
     let est = |p: Partie| cles.contains(&p.cle(id));
     let natif = cles
@@ -655,7 +657,33 @@ pub async fn put_zone_tess(
         Ok(Err(r)) => return r,
         Err(e) => return erreur_migration(&ErreurMigration::Stockage(e.to_string())),
     };
-    rafraichir(&state, &zone, &cles).await;
-    info!(zone_id = id, cles = ?cles, "tess_chaine_ecrite");
+    // T17 : la chaîne a changé à la main ; le préréglage chargé n'est plus
+    // « ACTIVE » s'il ne la décrit plus.
+    super::tess_prereglages::oublier_le_prereglage_s_il_differe(&state, id, &lecture.chaine);
+    let mode = super::tess_prereglages::appliquer_selon_le_mode(&state, &zone, cles.clone()).await;
+    info!(zone_id = id, cles = ?cles, mode = ?mode, "tess_chaine_ecrite");
     Json(reponse_de_zone(&state, &zone, lecture, premium, catalogue).await).into_response()
+}
+
+#[cfg(test)]
+mod tests_t14 {
+    use super::*;
+
+    /// TESS T14 — le descripteur d'un natif tiers dit ce que l'hôte exécute :
+    /// stéréo seulement (étage casque), famille du crossfeed ou non. La
+    /// contre-épreuve est un greffon de référence qui travaille sur tout
+    /// nombre de canaux et le dit (`convolution`).
+    #[test]
+    fn t14_un_natif_tiers_est_annonce_stereo_seulement() {
+        let c = catalogue_tess(&["mon-greffon".to_string(), "crossfeed-essai".to_string()]);
+        for id in ["mon-greffon", "crossfeed-essai"] {
+            let d = c.get(id).expect("descripteur tiers");
+            assert_eq!(d.origin, Origine::Package, "{id}");
+            assert_eq!(d.placement.channels, Canaux::StereoOnly, "{id}");
+        }
+        assert_eq!(
+            c.get("convolution").unwrap().placement.channels,
+            Canaux::Any
+        );
+    }
 }
