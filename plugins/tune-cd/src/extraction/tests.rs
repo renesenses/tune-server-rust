@@ -1731,3 +1731,38 @@ fn encode(s: &str) -> String {
         })
         .collect()
 }
+
+/// Fil forum 3036 (relecture) — un réglage ou un lancement forgé ne range
+/// pas un CD dans un dossier masqué : `.tune`, `duplicates`.
+#[tokio::test]
+async fn reglage_et_lancement_refusent_un_dossier_masque_3036() {
+    let banc = Banc::new(simule(), Arc::new(SansReseau));
+    let racine = banc.racine().to_string_lossy().to_string();
+    std::fs::create_dir_all(banc.racine().join(".tune")).unwrap();
+    let (code, v) = banc
+        .appel(
+            "PUT",
+            "/extraction/reglages",
+            Some(json!({ "destination": format!("{racine}/.tune") })),
+        )
+        .await;
+    assert_eq!(
+        (code, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("dossier_masque"))
+    );
+    let (code, v) = banc
+        .appel(
+            "POST",
+            "/extractions",
+            Some(json!({ "destination": format!("{racine}/duplicates") })),
+        )
+        .await;
+    assert_eq!(
+        (code, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("dossier_masque"))
+    );
+    assert!(
+        !banc.racine().join("duplicates").exists(),
+        "rien n'est créé"
+    );
+}
