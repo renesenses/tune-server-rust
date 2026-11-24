@@ -101,7 +101,18 @@ fn desactive_la_sortie_est_identique_a_l_entree() {
     let mut puits_ref = CaptureOutput::avec_retenue(FormatOuvert::new(44_100, 2), 1 << 20);
     pousser_tout(&mut reference, &mut puits_ref);
 
-    let slot = Mutex::new(None);
+    let mut auto = choix(true);
+    auto.reglages.mode = crate::audio::surechantillonnage::greffon::UpsamplerMode::Auto;
+    let verifier = super::backend::surechantillonneur_possible_sans_peripherique;
+    assert_eq!(
+        verifier(&auto, true, 44_100).unwrap_err().code(),
+        "strict_bitperfect"
+    );
+    assert_eq!(
+        verifier(&auto, false, 44_100).unwrap_err().code(),
+        "auto_plugin_unavailable"
+    );
+    let slot = Mutex::new(Some(auto));
     let mut sans = etage(&dsp, octets.clone(), 44_100, 2, 16, 44_100, 2);
     sans.surechantillonneur = Some(SurechDeLEtage {
         publication: None,
@@ -294,23 +305,27 @@ fn jamais_sous_pure_ni_sur_un_porteur_dop() {
     ));
 }
 
-/// Un paquet installé et signé avec la clé temporaire du banc est fourni par
-/// le test du greffon. Aucun périphérique physique n'est ouvert.
+/// La bibliothèque synthétique utilise le même ABI que le greffon installé.
 #[test]
-#[ignore = "nécessite le paquet natif et la clé publique du banc"]
 fn le_paquet_auto_passe_par_le_rendu_local_et_le_volume_entier() {
-    use crate::audio::surechantillonnage::{ID_PRO, greffon::UpsamplerMode};
+    use crate::audio::surechantillonnage::greffon::UpsamplerMode;
     use std::sync::atomic::{AtomicBool, AtomicU32};
-    let root = std::env::var_os("TUNE_TEST_GREFFONS_INSTALLES").unwrap();
-    let cle = std::env::var("TUNE_TEST_CLE_DU_PAQUET").unwrap();
-    let library =
-        tune_plugin_native::package::load(std::path::Path::new(&root), ID_PRO, &[cle]).unwrap();
-    tune_plugin_native::register(library).unwrap();
+    let dossier = crate::test_scratch::scratch_dir("pcm-auto-9442");
+    let chemins = crate::greffon_natif_de_test::construire_cdylibs(
+        &dossier,
+        &["cadence-du-banc"],
+        include_str!("../../../tests/fixtures/pcm-auto/greffon.rs"),
+        "audio-rate-change",
+    );
+    // SAFETY : la bibliothèque vient des sources du banc compilées ci-dessus.
+    let library = unsafe { tune_plugin_native::Library::load_trusted(&chemins[0]) }.unwrap();
     let mut choix = choix(true);
     choix.reglages.mode = UpsamplerMode::Auto;
-    choix.reglages.profile = std::env::var("TUNE_TEST_PROFILE_A").unwrap();
+    choix.reglages.profile = "banc-a".into();
     choix.verdict.results[0].realtime_factor = 1000.;
-    let plan = choix.plan_natif(48000, 24, 2, &[(96000, 24)]).unwrap();
+    let plan = choix
+        .plan_avec_bibliotheque(library, 48000, 24, 2, &[(96000, 24)])
+        .unwrap();
     assert_eq!(plan.rate, 96000);
     let mut etage =
         EtageSurechantillonneur::preparer(&choix.reglages, 48000, plan.rate, 2, Some(&plan))
@@ -320,12 +335,17 @@ fn le_paquet_auto_passe_par_le_rendu_local_et_le_volume_entier() {
     let rendu = etage.traiter(&source);
     assert_eq!(rendu.len(), source.len() * 2);
     assert!(rendu.iter().any(|v| *v > 0.05));
-    choix.reglages.profile = std::env::var("TUNE_TEST_PROFILE_B").unwrap();
-    etage.proposer_transition(Some(&choix));
+    choix.reglages.profile = "banc-b".into();
+    assert!(etage.proposer_transition(Some(&choix)).is_none());
     let rendu = etage.traiter(&source);
     let apres = etage.decision_apres_transition(rendu.len() / 2).unwrap();
     assert_ne!(avant["chosen"]["design"], apres["chosen"]["design"]);
     assert!(!apres["trace"].as_array().unwrap().is_empty());
+    choix.reglages.profile = "refus-banc".into();
+    let refus = etage.proposer_transition(Some(&choix)).unwrap();
+    assert_eq!(refus["transition"]["status"], "refused");
+    assert_eq!(refus["chosen"], apres["chosen"]);
+    assert!(!etage.doit_proposer(&choix.reglages));
     let bits = avant["chosen"]["depth"].as_u64().unwrap();
     assert!((16..=24).contains(&bits));
     let mut q = plan
@@ -358,5 +378,9 @@ fn le_paquet_auto_passe_par_le_rendu_local_et_le_volume_entier() {
             .all(|&x| i64::from(x) % pas == 0 && (i64::from(x) - attendu).abs() < 16 * pas)
     );
     assert!(mots[n..].iter().all(|&x| x == 0));
-    assert!(tune_plugin_native::unregister(ID_PRO));
+    assert!(
+        plan.library
+            .prepare_final_pcm(plan.input, plan.rate, 16, &plan.settings)
+            .is_err()
+    );
 }

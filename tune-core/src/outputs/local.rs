@@ -5949,8 +5949,11 @@ impl EtageDeConversion<'_> {
                         .filter(|c| etage.doit_proposer(&c.reglages))
                         .cloned()
                 });
-                if let Some(choix) = choix {
-                    etage.proposer_transition(Some(&choix));
+                if let Some(choix) = choix
+                    && let Some(refus) = etage.proposer_transition(Some(&choix))
+                    && let Some((reserve, generation)) = surech.publication
+                {
+                    reserve.poser_decision_auto(generation, Some(refus));
                 }
             }
             // #7614 — le greffon porte la cadence ; rubato ne tourne pas.

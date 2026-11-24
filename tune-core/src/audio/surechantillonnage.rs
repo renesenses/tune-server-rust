@@ -258,6 +258,17 @@ impl ChoixSurechantillonnage {
         formats: &[(u32, u16)],
     ) -> Result<PlanNatif, &'static str> {
         let library = tune_plugin_native::provider(ID_PRO).ok_or("auto_plugin_unavailable")?;
+        self.plan_avec_bibliotheque(library, source, bits, canaux, formats)
+    }
+
+    pub(crate) fn plan_avec_bibliotheque(
+        &self,
+        library: std::sync::Arc<tune_plugin_native::Library>,
+        source: u32,
+        bits: u16,
+        canaux: u16,
+        formats: &[(u32, u16)],
+    ) -> Result<PlanNatif, &'static str> {
         let layout = match canaux {
             1 => ChannelLayout::Mono,
             2 => ChannelLayout::Stereo,
@@ -309,6 +320,7 @@ const BLOC_MAX: usize = 4096;
 pub struct EtageSurechantillonneur {
     instance: Rendu,
     publication_apres: Option<usize>,
+    refus_transition: bool,
     canaux: usize,
     rapport: usize,
     entree: Vec<f32>,
@@ -381,6 +393,7 @@ impl EtageSurechantillonneur {
         let n = usize::from(canaux);
         Ok(Self {
             publication_apres: None,
+            refus_transition: false,
             format_sortie: requete.output_format(),
             instance,
             canaux: n,
@@ -392,15 +405,18 @@ impl EtageSurechantillonneur {
         })
     }
 
-    pub fn proposer_transition(&mut self, choix: Option<&ChoixSurechantillonnage>) {
+    pub fn proposer_transition(
+        &mut self,
+        choix: Option<&ChoixSurechantillonnage>,
+    ) -> Option<serde_json::Value> {
         let Rendu::Natif(instance, _, sonde, derniere) = &mut self.instance else {
-            return;
+            return None;
         };
         let Some(r) = choix.map(|c| &c.reglages) else {
-            return;
+            return None;
         };
         if r.mode != greffon::UpsamplerMode::Auto || r == derniere {
-            return;
+            return None;
         }
         let mut settings = sonde.clone();
         settings["profile"] = serde_json::json!(r.profile);
@@ -409,6 +425,7 @@ impl EtageSurechantillonneur {
         settings["max_rate_hz"] = serde_json::json!(r.max_rate_hz);
         match instance.update(&settings) {
             Ok(()) => {
+                self.refus_transition = false;
                 self.publication_apres =
                     Some((self.format_sortie.sample_rate() as usize).div_ceil(50));
                 *derniere = r.clone();
@@ -418,8 +435,11 @@ impl EtageSurechantillonneur {
             Err(tune_plugin_sdk::Error::InvalidState) => {} // Le fondu précédent doit finir.
             Err(_) => {
                 *derniere = r.clone();
+                self.refus_transition = true;
+                return self.decision_auto();
             } // Cadence, réserve ou charge incompatibles.
         }
+        None
     }
     pub fn decision_apres_transition(&mut self, trames: usize) -> Option<serde_json::Value> {
         let n = self.publication_apres?;
@@ -436,7 +456,20 @@ impl EtageSurechantillonneur {
     }
     pub fn decision_auto(&self) -> Option<serde_json::Value> {
         if let Rendu::Natif(instance, ..) = &self.instance {
-            instance.diagnostics().ok()?.get("decision").cloned()
+            let decision = instance
+                .diagnostics()
+                .ok()
+                .and_then(|d| d.get("decision").cloned());
+            if self.refus_transition {
+                let mut decision = decision
+                    .filter(|v| v.is_object())
+                    .unwrap_or_else(|| serde_json::json!({"chosen": null, "trace": []}));
+                decision["transition"] =
+                    serde_json::json!({"status": "refused", "code": "auto_update_refused"});
+                Some(decision)
+            } else {
+                decision
+            }
         } else {
             None
         }

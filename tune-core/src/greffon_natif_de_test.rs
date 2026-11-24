@@ -108,6 +108,15 @@ pub fn construire_les_bibliotheques_de_test(
     dossier: &std::path::Path,
     ids: &[&str],
 ) -> Vec<std::path::PathBuf> {
+    construire_cdylibs(dossier, ids, SOURCE_DU_GREFFON_DE_TEST, "audio-process")
+}
+
+pub(crate) fn construire_cdylibs(
+    dossier: &std::path::Path,
+    ids: &[&str],
+    source: &str,
+    capacite: &str,
+) -> Vec<std::path::PathBuf> {
     let racine = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("racine du dépôt")
@@ -145,13 +154,13 @@ pub fn construire_les_bibliotheques_de_test(
                     "entitlement": format!("plugin.{id}"),
                     "distribution": "source",
                     "capabilities": [
-                        {"id": "audio-process", "version": {"major": 0, "minor": 1}, "required": true}
+                        {"id": capacite, "version": {"major": 0, "minor": 1}, "required": true}
                     ]
                 })
                 .to_string(),
             )
             .unwrap();
-            std::fs::write(caisse.join("src/lib.rs"), SOURCE_DU_GREFFON_DE_TEST).unwrap();
+            std::fs::write(caisse.join("src/lib.rs"), source).unwrap();
             std::fs::copy(racine.join("Cargo.lock"), caisse.join("Cargo.lock")).unwrap();
 
             let sortie = std::process::Command::new(env!("CARGO"))

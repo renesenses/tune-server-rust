@@ -1078,6 +1078,7 @@ impl<'a> BackendCpal<'a> {
         let data_started_shared = Arc::new(AtomicBool::new(false));
         let recopie = super::sortie_double_locale::emplacement_vide();
         let quantification_active = Arc::new(AtomicBool::new(false));
+        let finaliseur_refuse = std::cell::Cell::new(false);
         let quantification_auto = |cfg: &cpal::StreamConfig, bits: u16| {
             let Some(plan) = plan_natif.as_ref().filter(|p| p.rate == cfg.sample_rate) else {
                 return Ok(None);
@@ -1088,7 +1089,10 @@ impl<'a> BackendCpal<'a> {
             plan.library
                 .prepare_final_pcm(plan.input, plan.rate, bits, &plan.settings)
                 .map(|q| Some((quantification_active.clone(), q)))
-                .map_err(|_| cpal::BuildStreamError::StreamConfigNotSupported)
+                .map_err(|_| {
+                    finaliseur_refuse.set(true);
+                    cpal::BuildStreamError::StreamConfigNotSupported
+                })
         };
         let build_stream =
             |cfg: &cpal::StreamConfig,
@@ -1404,6 +1408,15 @@ impl<'a> BackendCpal<'a> {
                                 t
                             }
                             None => return Err(RefusDOuverture::Cancelled),
+                            Some(Err(_)) if finaliseur_refuse.get() => {
+                                // Tous les formats du plan ont été essayés. Reprendre la
+                                // négociation ordinaire, y compris sa propre cadence.
+                                let mut sortie =
+                                    Self::ouvrir_pour_le_surechantillonneur(demande, None)?;
+                                sortie.refus_du_surechantillonneur =
+                                    Some("auto_finalizer_unavailable");
+                                return Ok(sortie);
+                            }
                             Some(Err(last_error)) => {
                                 // Every format was refused, so the fault is
                                 // the device itself, not the encoding. Name
