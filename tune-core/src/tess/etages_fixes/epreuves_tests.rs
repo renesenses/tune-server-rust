@@ -50,6 +50,7 @@ fn ctx(volume_db: f64, pure: bool) -> ContexteExecution<'static> {
             control: ControleVolume::Software,
             db: volume_db,
         },
+        replaygain_actif: false,
     }
 }
 
