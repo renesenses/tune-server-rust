@@ -1330,6 +1330,11 @@ path = "tests/indexation_upnp_2219.rs"
 name = "auto_indexation_upnp_3028"
 path = "tests/auto_indexation_upnp_3028.rs"
 
+# Fil du forum 3028, suite : source refusée, retrait qui rattache, this_server.
+[[test]]
+name = "auto_indexation_upnp_suite_3028"
+path = "tests/auto_indexation_upnp_suite_3028.rs"
+
 [[test]]
 name = "refus_oaat_upnp_2219"
 path = "tests/refus_oaat_upnp_2219.rs"

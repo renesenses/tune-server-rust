@@ -57,7 +57,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tune_core::db::backend::ToSqlValue;
+use tune_core::db::backend::{DbTxHandle, ToSqlValue};
 
 type ApiResult = Result<Json<Value>, (StatusCode, Json<Value>)>;
 
@@ -282,6 +282,239 @@ pub fn retirer(state: &AppState, udn: &str, attendu: Option<i64>) -> Result<Aper
         pistes: retirees,
         ..vu
     })
+}
+
+/// Fil du forum 3028 — ce que le rattachement ferait, ou a fait.
+///
+/// Un lien utilisateur (favori de piste ou d'album, entrée de playlist) porté
+/// par une piste distante est d'abord REPORTÉ sur la piste locale
+/// équivalente, quand elle existe et qu'elle est unique. C'est le cas d'un
+/// Tune qui s'est indexé lui-même : chaque piste `upnp` y est le reflet d'une
+/// piste locale. Ce qui n'a pas d'équivalent est compté, annoncé par
+/// l'aperçu, et ne part qu'après confirmation.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Rattachement {
+    /// Pistes et albums liés dont les liens ont trouvé leur équivalent local.
+    pub rattaches: i64,
+    /// Pistes et albums liés SANS équivalent local unique.
+    pub sans_equivalent: i64,
+}
+
+/// L'identifiant de piste que porte une URL de lecture de NOTRE bibliothèque
+/// (`…/api/v1/library/tracks/<id>/audio`), ce que publie notre MediaServer.
+fn id_dans_l_url_de_lecture(url: &str) -> Option<i64> {
+    let chemin = url.split(['?', '#']).next()?;
+    let (_, reste) = chemin.split_once(&format!(
+        "{}/library/tracks/",
+        tune_core::upnp_server::API_PATH
+    ))?;
+    reste
+        .strip_suffix("/audio")?
+        .parse()
+        .ok()
+        .filter(|id| *id > 0)
+}
+
+const PISTE_LOCALE: &str = "(l.source IS NULL OR l.source = 'local') AND l.file_path IS NOT NULL";
+
+/// La piste LOCALE équivalente d'une piste distante, si elle est unique.
+///
+/// 1. L'URL de lecture désigne une piste de notre bibliothèque, et c'est bien
+///    une piste locale du même titre : c'est elle.
+/// 2. Sinon, une seule piste locale porte le même titre, le même artiste, le
+///    même album (sans casse) et une durée à deux secondes près.
+///
+/// Deux candidates ou plus : aucune. On ne devine pas.
+fn equivalent_local(tx: &dyn DbTxHandle, piste: i64) -> Result<Option<i64>, String> {
+    let texte = piste.to_string();
+    let p: [&dyn ToSqlValue; 1] = [&texte];
+    let url = tx
+        .query_one(
+            "SELECT value FROM track_metadata WHERE CAST(track_id AS TEXT) = ? AND key = 'upnp_res_url'",
+            &p,
+        )?
+        .and_then(|r| r.first().and_then(|v| v.as_str().map(str::to_string)));
+    if let Some(local) = url.as_deref().and_then(id_dans_l_url_de_lecture) {
+        let params: [&dyn ToSqlValue; 2] = [&local, &piste];
+        let meme = tx.query_one(
+            &format!(
+                "SELECT l.id FROM tracks l, tracks d WHERE l.id = ? AND d.id = ? AND {PISTE_LOCALE} \
+                 AND lower(trim(l.title)) = lower(trim(d.title))"
+            ),
+            &params,
+        )?;
+        if meme.is_some() {
+            return Ok(Some(local));
+        }
+    }
+    let params: [&dyn ToSqlValue; 1] = [&piste];
+    let candidates = tx.query_many(
+        &format!(
+            "SELECT l.id FROM tracks d \
+             JOIN tracks l ON lower(trim(l.title)) = lower(trim(d.title)) \
+               AND abs(coalesce(l.duration_ms, 0) - coalesce(d.duration_ms, 0)) <= 2000 \
+             LEFT JOIN artists ad ON ad.id = d.artist_id \
+             LEFT JOIN artists al ON al.id = l.artist_id \
+             LEFT JOIN albums bd ON bd.id = d.album_id \
+             LEFT JOIN albums bl ON bl.id = l.album_id \
+             WHERE d.id = ? AND {PISTE_LOCALE} \
+               AND lower(coalesce(ad.name, '')) = lower(coalesce(al.name, '')) \
+               AND lower(coalesce(bd.title, '')) = lower(coalesce(bl.title, '')) \
+             LIMIT 2"
+        ),
+        &params,
+    )?;
+    Ok(match candidates.as_slice() {
+        [une] => une.first().and_then(|v| v.as_i64()),
+        _ => None,
+    })
+}
+
+/// Reporte un favori `nature` de `ancien` sur `nouveau`, profil par profil,
+/// sans créer de doublon : un profil qui a déjà `nouveau` en favori garde le
+/// sien, et l'ancien part avec le retrait.
+fn reporter_le_favori(
+    tx: &dyn DbTxHandle,
+    nature: &str,
+    ancien: i64,
+    nouveau: i64,
+) -> Result<(), String> {
+    let (ancien, nouveau_texte) = (ancien.to_string(), nouveau.to_string());
+    let params: [&dyn ToSqlValue; 5] = [&nouveau, &nature, &ancien, &nature, &nouveau_texte];
+    tx.execute(
+        "UPDATE favorites SET item_id = ? WHERE item_type = ? AND CAST(item_id AS TEXT) = ? \
+         AND NOT EXISTS (SELECT 1 FROM favorites g WHERE g.item_type = ? \
+           AND CAST(g.item_id AS TEXT) = ? \
+           AND CAST(g.profile_id AS TEXT) = CAST(favorites.profile_id AS TEXT))",
+        &params,
+    )?;
+    Ok(())
+}
+
+fn ids(lignes: Vec<Vec<tune_core::db::backend::SqlValue>>) -> Vec<i64> {
+    lignes
+        .iter()
+        .filter_map(|r| r.first().and_then(|v| v.as_i64()))
+        .collect()
+}
+
+/// Le rattachement, calculé (`ecrire = false`) ou appliqué.
+///
+/// Borné comme le retrait : pistes et albums `upnp` dont le `source_id`
+/// commence par `<udn>|`. Seuls `favorites.item_id` et
+/// `playlist_tracks.track_id` changent ; aucune piste et aucun album LOCAL
+/// n'est écrit.
+fn rattacher(tx: &dyn DbTxHandle, udn: &str, ecrire: bool) -> Result<Rattachement, String> {
+    let p = prefixe(udn);
+    let params: [&dyn ToSqlValue; 1] = [&p];
+    let mut bilan = Rattachement::default();
+    let pistes_liees = ids(tx.query_many(
+        &format!(
+            "SELECT t.id FROM tracks t WHERE {} AND (EXISTS (SELECT 1 FROM favorites f \
+             WHERE f.item_type = 'track' AND {}) OR {})",
+            borne("t", &p),
+            super::synchronisation_upnp::favori_designe("t.id"),
+            lien_playlist("t"),
+        ),
+        &params,
+    )?);
+    for piste in pistes_liees {
+        match equivalent_local(tx, piste)? {
+            Some(locale) => {
+                if ecrire {
+                    reporter_le_favori(tx, "track", piste, locale)?;
+                    let p: [&dyn ToSqlValue; 2] = [&locale, &piste];
+                    tx.execute(
+                        "UPDATE playlist_tracks SET track_id = ? WHERE track_id = ?",
+                        &p,
+                    )?;
+                }
+                bilan.rattaches += 1;
+            }
+            None => bilan.sans_equivalent += 1,
+        }
+    }
+    let albums_lies = ids(tx.query_many(
+        &format!(
+            "SELECT a.id FROM albums a WHERE {} AND EXISTS (SELECT 1 FROM favorites f \
+             WHERE f.item_type = 'album' AND {})",
+            borne("a", &p),
+            super::synchronisation_upnp::favori_designe("a.id"),
+        ),
+        &params,
+    )?);
+    for album in albums_lies {
+        let pa: [&dyn ToSqlValue; 1] = [&album];
+        let mut cibles = std::collections::BTreeSet::new();
+        let mut complet = true;
+        for piste in ids(tx.query_many("SELECT id FROM tracks WHERE album_id = ?", &pa)?) {
+            let cible = match equivalent_local(tx, piste)? {
+                Some(locale) => {
+                    let pl: [&dyn ToSqlValue; 1] = [&locale];
+                    tx.query_one("SELECT album_id FROM tracks WHERE id = ?", &pl)?
+                        .and_then(|r| r.first().and_then(|v| v.as_i64()))
+                }
+                None => None,
+            };
+            match cible {
+                Some(c) => {
+                    cibles.insert(c);
+                }
+                None => complet = false,
+            }
+        }
+        match (complet, cibles.len(), cibles.iter().next()) {
+            (true, 1, Some(&locale)) => {
+                if ecrire {
+                    reporter_le_favori(tx, "album", album, locale)?;
+                }
+                bilan.rattaches += 1;
+            }
+            _ => bilan.sans_equivalent += 1,
+        }
+    }
+    Ok(bilan)
+}
+
+/// Le rattachement que ferait un retrait, sans rien écrire.
+pub fn plan_de_rattachement(state: &AppState, udn: &str) -> Result<Rattachement, String> {
+    let mut bilan = Rattachement::default();
+    state.backend.write_tx(&mut |tx| {
+        bilan = rattacher(tx, udn, false)?;
+        Ok(())
+    })?;
+    Ok(bilan)
+}
+
+/// Fil du forum 3028 — rattacher les liens, PUIS retirer ce qui vient de
+/// `udn` (pistes, albums distants vidés, sources). `attendu` est le nombre de
+/// pistes annoncé et confirmé : s'il a bougé, rien n'est retiré.
+pub fn retirer_en_rattachant(
+    state: &AppState,
+    udn: &str,
+    attendu: i64,
+) -> Result<(Apercu, Rattachement), String> {
+    let vu = apercu(state, udn)?;
+    if vu.pistes != attendu {
+        return Err(format!(
+            "Le nombre a changé : {} pistes à retirer, {attendu} annoncées. Relisez le compte avant de confirmer.",
+            vu.pistes
+        ));
+    }
+    let mut bilan = Rattachement::default();
+    state.backend.write_tx(&mut |tx| {
+        bilan = rattacher(tx, udn, true)?;
+        Ok(())
+    })?;
+    Ok((retirer(state, udn, Some(attendu))?, bilan))
+}
+
+/// L'aperçu et le rattachement, dans la forme que l'écran lit.
+pub fn apercu_public(a: &Apercu, r: &Rattachement) -> Value {
+    let mut v = public(a);
+    v["liens_rattaches"] = json!(r.rattaches);
+    v["liens_sans_equivalent"] = json!(r.sans_equivalent);
+    v
 }
 
 /// `GET /network/media-servers/{id}/bibliotheque` — ne modifie rien.
