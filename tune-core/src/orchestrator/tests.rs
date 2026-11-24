@@ -986,11 +986,26 @@ fn pull_output_dsp_transcode_classification() {
     // The case that was silently broken: an out-of-tree pull output was in
     // none of the lists, so an active EQ never reached it.
     assert!(pull_output_needs_dsp_transcode(
-        Some("diretta"),
+        Some("un-greffon-hors-depot"),
         false,
         false,
         flac
     ));
+    // TESS T12c (décision du 23/11) : HQPlayer et l'autre transport hors
+    // TESS gardent l'égaliseur et le ReplayGain (#1216).
+    for hors_tess in ["diretta", "hqplayer"] {
+        assert!(
+            pull_output_needs_dsp_transcode(Some(hors_tess), false, false, flac),
+            "{hors_tess}"
+        );
+    }
+    // AirPlay et Devialet AIR, eux, reçoivent le flux traité.
+    for tess in ["airplay", "airplay2", "devialet_air"] {
+        assert!(
+            pull_output_needs_dsp_transcode(Some(tess), false, false, flac),
+            "{tess}"
+        );
+    }
 
     // Already transcoding on their own: forcing again would be redundant.
     assert!(!pull_output_needs_dsp_transcode(

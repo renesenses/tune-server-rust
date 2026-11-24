@@ -33,6 +33,32 @@ mdns-sd = "0.20"
 # NSWindow, que Tauri n'expose pas. Déjà dans l'arbre par Tauri.
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
+# Touches multimédia et Centre de contrôle sous macOS, SANS autorisation
+# (rc14) : le Widget se déclare comme lecteur auprès du système
+# (`MPRemoteCommandCenter`, `MPNowPlayingInfoCenter`, voir
+# `centre_multimedia.rs`). Liaisons de la famille `objc2` (déjà dans l'arbre
+# par Tauri) ; seules les classes utilisées sont compilées.
+objc2-media-player = { version = "0.3", default-features = false, features = [
+    "std",
+    "block2",
+    "objc2-app-kit",
+    "objc2-core-foundation",
+    "MPMediaItem",
+    "MPNowPlayingInfoCenter",
+    "MPRemoteCommand",
+    "MPRemoteCommandCenter",
+    "MPRemoteCommandEvent",
+] }
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSData",
+    "NSDictionary",
+    "NSObject",
+    "NSString",
+    "NSValue",
+] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSImage", "objc2-core-foundation"] }
+block2 = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.55"

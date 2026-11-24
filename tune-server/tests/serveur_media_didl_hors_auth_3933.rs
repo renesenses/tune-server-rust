@@ -277,6 +277,41 @@ fn jeton_expire() -> String {
 }
 
 #[tokio::test]
+async fn les_refus_http_9413_conservent_le_message_de_la_couche_auth() {
+    let state = new_state();
+    enable_auth(&state);
+    let app = app(&state, DISTANT);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+
+    for (secret, entete, attendu) in [
+        ("test-jwt-secret", None, "authentication required"),
+        (
+            "test-jwt-secret",
+            Some("ApiKey incorrecte"),
+            "invalid api key",
+        ),
+        ("test-jwt-secret", Some("Bearer invalide"), "invalid token"),
+        ("", Some("Bearer invalide"), "no jwt secret configured"),
+    ] {
+        settings.set("jwt_secret", secret).unwrap();
+        let mut requete = Request::get("/api/v1/library/albums");
+        if let Some(valeur) = entete {
+            requete = requete.header(header::AUTHORIZATION, valeur);
+        }
+        let reponse = app
+            .clone()
+            .oneshot(requete.body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(reponse.status(), StatusCode::UNAUTHORIZED);
+        let corps = axum::body::to_bytes(reponse.into_body(), 128)
+            .await
+            .unwrap();
+        assert_eq!(corps.as_ref(), attendu.as_bytes());
+    }
+}
+
+#[tokio::test]
 async fn les_justificatifs_de_session_9407_sont_coherents_sur_http_et_ws() {
     let state = new_state();
     enable_auth(&state);

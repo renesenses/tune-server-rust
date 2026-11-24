@@ -120,6 +120,61 @@ pub fn reference_d_album_bandcamp(db: &Arc<dyn DbBackend>, source_id: &str) -> O
     None
 }
 
+/// Fil 3009, point 15 (FabienM, rc13) — l'album CHEZ SON SERVICE d'une piste
+/// de service (Qobuz, Tidal…), quand Tune l'a déjà rangé : dans la file (la
+/// ligne enfilée avec la piste, #6079), dans les favoris (piste favorite,
+/// web#2759) ou dans une écoute précédente. `None` sinon, ou si la base ne
+/// répond pas : rien n'est deviné.
+///
+/// L'écoute d'une piste de service n'écrivait cette référence que lorsque la
+/// DEMANDE de lecture la portait. Or `POST /zones/{id}/play` ne la passe à
+/// l'orchestrateur que pour Bandcamp (`reference_d_album_de_la_demande`),
+/// l'avance sans blanc et la confirmation d'une zone navigateur n'en passent
+/// aucune — alors que la ligne de file, elle, l'a. Sans elle, `GET
+/// /library/history` ne sert pas d'`album_id_service`, et la vignette de
+/// « Récemment écoutés » n'a ni cœur, ni « … », ni étiquettes.
+///
+/// Contrairement à Bandcamp, l'identifiant d'une piste de service est STABLE :
+/// on compare la paire `source` + identifiant exactement, sans `LIKE`.
+pub fn reference_d_album_de_service(
+    db: &Arc<dyn DbBackend>,
+    source: &str,
+    source_id: &str,
+) -> Option<String> {
+    let (source, source_id) = (source.trim(), source_id.trim());
+    if source.is_empty() || source_id.is_empty() || source == "bandcamp" {
+        return None;
+    }
+    let (p1, p2) = match db.engine() {
+        super::engine::Engine::Sqlite => ("?", "?"),
+        super::engine::Engine::Postgres => ("$1", "$2"),
+    };
+    let requetes = [
+        format!(
+            "SELECT album_ref FROM queue_items WHERE source = {p1} AND source_id = {p2} \
+             AND album_ref IS NOT NULL AND album_ref != '' ORDER BY id DESC LIMIT 1"
+        ),
+        format!(
+            "SELECT album_ref FROM streaming_favorites WHERE service = {p1} AND service_id = {p2} \
+             AND item_type = 'track' AND album_ref IS NOT NULL AND album_ref != '' \
+             ORDER BY id DESC LIMIT 1"
+        ),
+        format!(
+            "SELECT album_ref FROM listen_history WHERE source = {p1} AND source_id = {p2} \
+             AND album_ref IS NOT NULL AND album_ref != '' ORDER BY id DESC LIMIT 1"
+        ),
+    ];
+    let params: [&dyn ToSqlValue; 2] = [&source, &source_id];
+    requetes.iter().find_map(|sql| {
+        db.query_one(sql, &params)
+            .ok()
+            .flatten()
+            .and_then(|cols| cols.first().and_then(|v| v.as_string()))
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

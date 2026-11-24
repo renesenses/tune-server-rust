@@ -36,7 +36,12 @@ fn language_directive(lang: &str) -> &'static str {
         "de" => "Reply to the user in German unless they clearly write in another language.",
         "es" => "Reply to the user in Spanish unless they clearly write in another language.",
         "it" => "Reply to the user in Italian unless they clearly write in another language.",
-        "zh" => "Reply to the user in Chinese unless they clearly write in another language.",
+        "zh" => {
+            "Reply to the user in Simplified Chinese unless they clearly write in another language."
+        }
+        "zh-Hant" => {
+            "Reply to the user in Traditional Chinese (as used in Taiwan and Hong Kong) unless they clearly write in another language."
+        }
         "ja" => "Reply to the user in Japanese unless they clearly write in another language.",
         "ko" => "Reply to the user in Korean unless they clearly write in another language.",
         "ro" => "Reply to the user in Romanian unless they clearly write in another language.",
@@ -49,6 +54,9 @@ fn language_directive(lang: &str) -> &'static str {
         "pl" => "Reply to the user in Polish unless they clearly write in another language.",
         "el" => "Reply to the user in Greek unless they clearly write in another language.",
         "tr" => "Reply to the user in Turkish unless they clearly write in another language.",
+        "nl" => "Reply to the user in Dutch unless they clearly write in another language.",
+        "ru" => "Reply to the user in Russian unless they clearly write in another language.",
+        "uk" => "Reply to the user in Ukrainian unless they clearly write in another language.",
         _ => "Reply to the user in French unless they clearly write in another language.",
     }
 }
@@ -1160,6 +1168,11 @@ mod language_directive_tests {
         assert!(language_directive("pl").contains("Polish"));
         assert!(language_directive("el").contains("Greek"));
         assert!(language_directive("tr").contains("Turkish"));
+        assert!(language_directive("nl").contains("Dutch"));
+        assert!(language_directive("zh").contains("Simplified Chinese"));
+        assert!(language_directive("zh-Hant").contains("Traditional Chinese"));
+        assert!(language_directive("ru").contains("Russian"));
+        assert!(language_directive("uk").contains("Ukrainian"));
     }
 }
 

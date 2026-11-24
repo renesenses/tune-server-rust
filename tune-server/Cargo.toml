@@ -301,6 +301,19 @@ path = "tests/pont_administration.rs"
 name = "relais_routes_relayables"
 path = "tests/relais_routes_relayables.rs"
 
+# #9174 — la provenance du lecteur d'une zone navigateur (relais ou local).
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "relais_format_compresse_9174"
+path = "tests/relais_format_compresse_9174.rs"
+
+# Garde de la couche d'authentification (routes privilégiées, profil
+# `default`, premier lancement). `autotests = false` plus haut : sans cette
+# cible, jamais compilé.
+[[test]]
+name = "auth_security"
+path = "tests/auth_security.rs"
+
 # #3326 — le mode de transition (un `client/hello` en clair). `autotests =
 # false` plus haut : sans cette cible, le fichier ne serait JAMAIS compilé, et
 # la contre-épreuve qui garde le chemin chiffré ne serait exécutée par personne.
@@ -1265,16 +1278,16 @@ path = "tests/bibliotheque_rest_ordre_alphabetique_4956.rs"
 name = "repertoires_ordre_alphabetique_5582"
 path = "tests/repertoires_ordre_alphabetique_5582.rs"
 
+[[test]]
+name = "bridge_cle_api_9413"
+path = "tests/bridge_cle_api_9413.rs"
+
 # #4260 — `/library/artwork/proxy` n'est plus un relais ouvert (SSRF) : URL
 # signées pour ce que la DIDL publie (#4061), liste d'hôtes pour le reste,
 # refus des adresses internes APRÈS résolution DNS, redirections à la main.
 # Passe par le routeur monté (donc l'exemption DIDL de #3933), avec un amont
 # local et un résolveur factice — rien ne sort sur Internet. `autotests =
 # false` plus haut : sans cette entrée, le fichier ne serait JAMAIS compilé.
-[[test]]
-name = "bridge_cle_api_9413"
-path = "tests/bridge_cle_api_9413.rs"
-
 [[test]]
 name = "artwork_proxy_relais_ferme_4260"
 path = "tests/artwork_proxy_relais_ferme_4260.rs"
@@ -1329,6 +1342,11 @@ path = "tests/web_response_contracts.rs"
 [[test]]
 name = "indexation_upnp_2219"
 path = "tests/indexation_upnp_2219.rs"
+
+# Fil du forum 3028 : Tune ne s'indexe pas lui-même (UDN et adresses locales).
+[[test]]
+name = "auto_indexation_upnp_3028"
+path = "tests/auto_indexation_upnp_3028.rs"
 
 [[test]]
 name = "refus_oaat_upnp_2219"
@@ -1542,6 +1560,11 @@ path = "tests/tess_migration_routes_t02.rs"
 [[test]]
 name = "tess_api_routes_t08"
 path = "tests/tess_api_routes_t08.rs"
+
+# TESS T17 — préréglages de chaîne globaux et mode d'application.
+[[test]]
+name = "tess_prereglages_routes_t17"
+path = "tests/tess_prereglages_routes_t17.rs"
 
 # #4602 — le scan complet rend les mêmes comptes à chaque passe, sur SQLite
 # et sur PostgreSQL (`TUNE_TEST_PG_URL`). `autotests = false` plus haut : sans

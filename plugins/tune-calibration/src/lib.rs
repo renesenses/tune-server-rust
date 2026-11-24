@@ -12,6 +12,8 @@
 //!        │       capture par tune-entree-audio::tampon (cpal, vers tampon)
 //! correction.rs  C2 : cible, zone bornée, égaliseur qui ne fait que couper,
 //!        │       profil de pièce de la zone (appliqué par la route existante)
+//! correction_fir.rs C3 : FIR de correction (phase minimale, phase
+//!        │       excédentaire facultative) et sa RI `.wav`, déposée par le web
 //! modes.rs       C5 : modes de basse d'une pièce rectangulaire sans micro,
 //!        │       réponse estimée, correction C2 plus prudente
 //! session.rs     C4 : session à plusieurs positions (3 à 9), moyenne
@@ -27,9 +29,11 @@
 //! l'orchestrateur (volume, file, lecture, arrêt), rien de parallèle.
 //!
 //! Hors de ce greffon : l'étape « Correction de pièce » du chemin du signal
-//! (tune-server), l'écran web, le micro du téléphone (C1-bis), le FIR (C3).
+//! (tune-server), l'écran web, le micro du téléphone (C1-bis), l'installation
+//! du FIR dans la zone (route `room-correction/ir/upload` du serveur).
 
 pub mod correction;
+pub mod correction_fir;
 pub mod fournisseur;
 pub mod generateur;
 pub mod hote;
