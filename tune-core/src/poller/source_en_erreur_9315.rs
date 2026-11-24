@@ -13,6 +13,8 @@
 //! relance : la source a refusé, rejouer la même adresse rendrait la même
 //! erreur.
 
+use crate::streaming::episodes_indisponibles;
+
 /// Code stable du bandeau, que le client traduit (`erreursServeur.<code>`).
 pub(super) const CODE_SOURCE_EN_ERREUR: &str = "source_http_error";
 
@@ -21,14 +23,23 @@ pub(super) const CODE_SOURCE_EN_ERREUR: &str = "source_http_error";
 /// #7077 — `error` n'est que le repli des anciens clients, en anglais : la
 /// phrase de l'écran vient du code.
 pub(super) fn charge_source_en_erreur(zone_id: i64, titre: &str, statut: u16) -> serde_json::Value {
-    let precision = match statut {
-        404 | 410 => " (not found at the publisher)",
-        _ => "",
-    };
+    // Fil 2972 — 404/410 : le fichier de l'épisode n'existe plus chez
+    // l'éditeur. Le code dit « épisode indisponible », que le client traduit.
+    if episodes_indisponibles::statut_introuvable(statut) {
+        return serde_json::json!({
+            "zone_id": zone_id,
+            "error": format!(
+                "Episode unavailable at the publisher: \u{201c}{titre}\u{201d} (HTTP {statut}). The zone was stopped."
+            ),
+            "code": episodes_indisponibles::CODE_EPISODE_INDISPONIBLE,
+            "params": { "status": statut, "title": titre },
+            "fatal": true,
+        });
+    }
     serde_json::json!({
         "zone_id": zone_id,
         "error": format!(
-            "The source refused \u{201c}{titre}\u{201d}: HTTP {statut}{precision}. The zone was stopped."
+            "The source refused \u{201c}{titre}\u{201d}: HTTP {statut}. The zone was stopped."
         ),
         "code": CODE_SOURCE_EN_ERREUR,
         "params": { "status": statut, "title": titre },
@@ -44,8 +55,16 @@ impl super::PositionPoller {
         zone_id: i64,
         appareil: &str,
         titre: &str,
+        adresse: Option<&str>,
         statut: u16,
     ) {
+        // Fil 2972 — l'éditeur ne sert plus ce fichier : l'épisode est marqué
+        // indisponible, les listes le diront (`unavailable: true`).
+        if episodes_indisponibles::statut_introuvable(statut)
+            && let Some(adresse) = adresse
+        {
+            episodes_indisponibles::marquer(adresse, statut);
+        }
         tracing::warn!(
             zone_id,
             device = %appareil,

@@ -181,6 +181,220 @@ pub fn verifier(demande: &str, emplacements: &[String]) -> Result<PathBuf, Refus
     Ok(chemin)
 }
 
+/// Un sous-dossier proposé au choix de la destination (fil forum 3036).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct SousDossier {
+    pub nom: String,
+    pub chemin: String,
+}
+
+/// Ce que montre le choix du dossier : le dossier `courant` (`None` : la
+/// liste des emplacements eux-mêmes), son `parent` (`None` en haut d'un
+/// emplacement : on n'en remonte pas) et ses sous-dossiers.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ListeDossiers {
+    pub courant: Option<String>,
+    pub parent: Option<String>,
+    pub dossiers: Vec<SousDossier>,
+}
+
+/// Fil forum 3036 — les sous-dossiers de `demande` où ranger une
+/// extraction, pour descendre aussi bas qu'on veut SOUS un emplacement de
+/// la bibliothèque, et jamais au-dessus ni à côté.
+///
+/// `demande` passe d'abord par [`verifier`] (absolue, sans `.` ni `..`,
+/// dans un emplacement une fois les liens résolus) : les refus sont les
+/// mêmes que ceux du réglage, rendus AVANT toute lecture du dossier. Un
+/// dossier qui n'existe pas encore se choisit (l'extraction le crée) mais
+/// ne se liste pas. Les dossiers cachés et les dossiers système (corbeilles
+/// de NAS…) ne sont pas proposés, ni un lien symbolique qui mène hors de
+/// l'emplacement. Pas de sondage des petits-enfants : sur un partage
+/// réseau, un dossier d'artistes en compte des milliers.
+pub fn sous_dossiers(
+    demande: Option<&str>,
+    emplacements: &[String],
+) -> Result<ListeDossiers, Refus> {
+    let Some(demande) = demande.filter(|d| !d.trim().is_empty()) else {
+        return Ok(ListeDossiers {
+            courant: None,
+            parent: None,
+            dossiers: emplacements
+                .iter()
+                .map(|e| SousDossier {
+                    nom: e.clone(),
+                    chemin: e.clone(),
+                })
+                .collect(),
+        });
+    };
+    let chemin = verifier(demande, emplacements)?;
+    // Un dossier masqué (caché, système, propre à Tune) ne s'ouvre pas non
+    // plus quand on le demande directement.
+    if let Some(racine) = emplacements
+        .iter()
+        .map(|e| PathBuf::from(tune_core::scanner::walker::normalize_path(e)))
+        .filter(|r| chemin.starts_with(r))
+        .max_by_key(|r| r.components().count())
+        && let Ok(reste) = chemin.strip_prefix(&racine)
+        && reste
+            .components()
+            .any(|c| nom_masque(&c.as_os_str().to_string_lossy(), None))
+    {
+        return Err(refus(
+            "dossier_masque",
+            "Ce dossier est caché ou réservé : choisissez-en un autre.",
+        ));
+    }
+    if !chemin.is_dir() {
+        return Err(refus(
+            "dossier_introuvable",
+            "Ce dossier n'existe pas (encore) : il sera créé par l'extraction.",
+        ));
+    }
+    let en_haut = emplacements
+        .iter()
+        .any(|e| Path::new(&tune_core::scanner::walker::normalize_path(e)) == chemin.as_path());
+    let parent = if en_haut {
+        None
+    } else {
+        chemin.parent().map(|p| p.to_string_lossy().to_string())
+    };
+    // Lecture sur le chemin CANONIQUE, vérifié dans l'emplacement : un lien
+    // du chemin demandé, re-pointé entre la vérification et la lecture, ne
+    // mène plus ailleurs (TOCTOU). Les chemins rendus restent exprimés sous
+    // le chemin demandé, celui que `verifier` reconnaît.
+    let reel = canonique_dans(&chemin, emplacements)?;
+    #[cfg(test)]
+    tests_course::apres_verification(&chemin);
+    let entrees = std::fs::read_dir(&reel).map_err(|e| {
+        refus(
+            "destination_invalide",
+            format!("Le dossier est illisible : {e}"),
+        )
+    })?;
+    let mut dossiers: Vec<SousDossier> = Vec::new();
+    for entree in entrees.flatten() {
+        // Un nom hors UTF-8 n'est pas proposé : sa forme avec pertes (`�`)
+        // désignerait un autre dossier, inexistant ou voisin.
+        let Some(nom) = entree.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if nom_masque(&nom, attributs_windows(&entree)) {
+            continue;
+        }
+        let lien = traite_comme_lien(&entree.file_type());
+        if !entree.path().is_dir() {
+            continue;
+        }
+        let Some(texte) = chemin.join(&nom).to_str().map(str::to_string) else {
+            continue;
+        };
+        // Un lien est suivi seulement s'il reste dans l'emplacement : la
+        // même vérification que la destination elle-même.
+        if lien && verifier(&texte, emplacements).is_err() {
+            continue;
+        }
+        dossiers.push(SousDossier { nom, chemin: texte });
+    }
+    dossiers.sort_by(|a, b| {
+        a.nom
+            .to_lowercase()
+            .cmp(&b.nom.to_lowercase())
+            .then_with(|| a.nom.cmp(&b.nom))
+    });
+    Ok(ListeDossiers {
+        courant: Some(chemin.to_string_lossy().to_string()),
+        parent,
+        dossiers,
+    })
+}
+
+/// Une entrée dont le type n'a pas pu être lu est-elle traitée comme un
+/// lien symbolique (donc vérifiée avant d'être proposée) ?
+fn traite_comme_lien(t: &std::io::Result<std::fs::FileType>) -> bool {
+    t.as_ref().map_or(true, |t| t.is_symlink())
+}
+
+/// La forme canonique de `chemin`, refusée si elle sort de l'emplacement
+/// qui le contient (même règle que [`verifier`], rejouée au moment de lire).
+fn canonique_dans(chemin: &Path, emplacements: &[String]) -> Result<PathBuf, Refus> {
+    let reel = std::fs::canonicalize(chemin).map_err(|e| {
+        refus(
+            "destination_invalide",
+            format!("La destination est inaccessible : {e}"),
+        )
+    })?;
+    let dedans = emplacements
+        .iter()
+        .map(|e| PathBuf::from(tune_core::scanner::walker::normalize_path(e)))
+        .filter(|r| chemin.starts_with(r))
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .any(|r| reel.starts_with(r));
+    if !dedans {
+        return Err(refus(
+            "hors_bibliotheque",
+            "La destination sort de la bibliothèque par un lien symbolique.",
+        ));
+    }
+    Ok(reel)
+}
+
+/// Les attributs de fichier Windows d'une entrée (`None` ailleurs).
+fn attributs_windows(entree: &std::fs::DirEntry) -> Option<u32> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        entree.metadata().ok().map(|m| m.file_attributes())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = entree;
+        None
+    }
+}
+
+/// `lost+found` : le dossier de récupération d'ext2/3/4, jamais de la musique.
+const DOSSIERS_DE_RECUPERATION: &[&str] = &["lost+found"];
+/// `FILE_ATTRIBUTE_HIDDEN`.
+const ATTRIBUT_CACHE: u32 = 0x2;
+
+/// Un nom de dossier à ne pas proposer. `attributs` : les attributs de
+/// fichier Windows, s'ils sont connus.
+fn nom_masque(nom: &str, attributs: Option<u32>) -> bool {
+    nom.starts_with('.')
+        || tune_core::scanner::dossier_systeme_ignore(nom)
+        || tune_core::scanner::walker::SKIP_DIRS.contains(&nom)
+        || DOSSIERS_DE_RECUPERATION.contains(&nom)
+        || attributs.is_some_and(|a| a & ATTRIBUT_CACHE != 0)
+}
+
+/// Le point d'injection des témoins de course : une action jouée entre la
+/// vérification du chemin et la lecture du dossier.
+#[cfg(test)]
+pub(crate) mod tests_course {
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    type Action = Box<dyn FnOnce() + Send>;
+    static ACTIONS: Mutex<Vec<(PathBuf, Action)>> = Mutex::new(Vec::new());
+
+    pub fn programmer(chemin: PathBuf, action: Action) {
+        ACTIONS.lock().unwrap().push((chemin, action));
+    }
+
+    pub fn apres_verification(chemin: &Path) {
+        let action = {
+            let mut a = ACTIONS.lock().unwrap();
+            a.iter()
+                .position(|(c, _)| c == chemin)
+                .map(|i| a.remove(i).1)
+        };
+        if let Some(action) = action {
+            action();
+        }
+    }
+}
+
 /// #7105 — la cause d'une écriture refusée, en un motif stable.
 pub fn cause_d_ecriture(e: &std::io::Error) -> &'static str {
     use std::io::ErrorKind;
@@ -399,6 +613,95 @@ mod tests {
         // Un fichier n'est pas un dossier.
         std::fs::write(bib.path().join("f"), b"x").unwrap();
         assert_eq!(motif(&format!("{racine}/f")), "destination_invalide");
+    }
+
+    // ─── Durcissement du choix de dossier (fil 3036, relecture) ──────────
+
+    fn noms(l: &ListeDossiers) -> Vec<String> {
+        l.dossiers.iter().map(|d| d.nom.clone()).collect()
+    }
+
+    /// Point 1 — un type d'entrée illisible est traité comme un lien : il
+    /// passe par la vérification avant d'être proposé.
+    #[test]
+    fn un_type_d_entree_illisible_est_traite_comme_un_lien() {
+        assert!(traite_comme_lien(&Err(std::io::Error::other("illisible"))));
+        let ici = std::fs::symlink_metadata(".").unwrap().file_type();
+        assert!(!traite_comme_lien(&Ok(ici)));
+    }
+
+    /// Point 2 — la lecture suit le chemin CANONIQUE vérifié : un lien du
+    /// chemin demandé, re-pointé vers l'extérieur juste après la
+    /// vérification, ne fait rien lister d'extérieur.
+    #[cfg(unix)]
+    #[test]
+    fn un_lien_re_pointe_apres_la_verification_ne_fait_rien_lister_d_exterieur() {
+        let bib = tempfile::tempdir().unwrap();
+        let ailleurs = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(bib.path().join("A/sous/Bon")).unwrap();
+        std::fs::create_dir_all(ailleurs.path().join("sous/Secret")).unwrap();
+        let places = vec![bib.path().to_string_lossy().to_string()];
+        let lien = bib.path().join("lien");
+        std::os::unix::fs::symlink(bib.path().join("A"), &lien).unwrap();
+        let demande = lien.join("sous");
+        let (l2, cible) = (lien.clone(), ailleurs.path().to_path_buf());
+        tests_course::programmer(
+            demande.clone(),
+            Box::new(move || {
+                std::fs::remove_file(&l2).unwrap();
+                std::os::unix::fs::symlink(&cible, &l2).unwrap();
+            }),
+        );
+        let r = sous_dossiers(Some(&demande.to_string_lossy()), &places);
+        match r {
+            Ok(l) => assert_eq!(noms(&l), ["Bon"], "rien d'extérieur"),
+            Err(r) => assert_eq!(r.motif, "hors_bibliotheque"),
+        }
+    }
+
+    /// Point 3 — un nom qui n'est pas en UTF-8 n'est pas proposé : sa
+    /// conversion avec pertes désignerait un autre dossier.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn un_nom_qui_n_est_pas_en_utf8_n_est_pas_propose() {
+        use std::os::unix::ffi::OsStrExt;
+        let bib = tempfile::tempdir().unwrap();
+        std::fs::create_dir(bib.path().join("Bon")).unwrap();
+        std::fs::create_dir(bib.path().join(std::ffi::OsStr::from_bytes(b"caf\xe9"))).unwrap();
+        let racine = bib.path().to_string_lossy().to_string();
+        let l = sous_dossiers(Some(&racine), std::slice::from_ref(&racine)).unwrap();
+        assert_eq!(noms(&l), ["Bon"]);
+    }
+
+    /// Point 4 — ni `lost+found`, ni les dossiers propres à Tune, ni un
+    /// dossier caché (nom en `.` ou attribut caché de Windows) ; et un
+    /// dossier caché demandé directement est refusé.
+    #[cfg(unix)]
+    #[test]
+    fn les_dossiers_masques_ne_sont_ni_proposes_ni_ouverts() {
+        let bib = tempfile::tempdir().unwrap();
+        for d in [
+            "Bon",
+            "lost+found",
+            "duplicates",
+            ".tune",
+            ".cache/dedans",
+            "@eaDir",
+        ] {
+            std::fs::create_dir_all(bib.path().join(d)).unwrap();
+        }
+        let racine = bib.path().to_string_lossy().to_string();
+        let places = [racine.clone()];
+        let l = sous_dossiers(Some(&racine), &places).unwrap();
+        assert_eq!(noms(&l), ["Bon"]);
+        for d in [".cache", ".cache/dedans", "lost+found", "duplicates"] {
+            let r = sous_dossiers(Some(&format!("{racine}/{d}")), &places).unwrap_err();
+            assert_eq!(r.motif, "dossier_masque", "{d}");
+        }
+        // L'attribut caché de Windows (FILE_ATTRIBUTE_HIDDEN = 0x2).
+        assert!(nom_masque("Musique", Some(0x2)));
+        assert!(!nom_masque("Musique", Some(0x10)));
+        assert!(!nom_masque("Musique", None));
     }
 
     #[cfg(unix)]

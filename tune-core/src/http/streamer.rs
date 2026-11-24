@@ -146,8 +146,9 @@ pub struct StreamInfo {
 /// #6221 — un fichier VIRTUEL servi par la branche fichier (`serve_file`) :
 /// taille connue d'avance, octets calculés à la demande pour une tranche
 /// quelconque — donc `Content-Length` exact et requêtes `Range` honorées.
-/// Producteurs : L16 depuis WAV (#8722) et DSF fabriqué depuis un DST
-/// (`audio::dsf_depuis_dst::DsfDepuisDst`).
+/// Producteurs : L16 depuis WAV (#8722), DSF fabriqué depuis un DST
+/// (`audio::dsf_depuis_dst::DsfDepuisDst`) et depuis une tranche d'ISO SACD
+/// (`audio::dsf_depuis_iso::DsfDepuisIso`, #9184).
 pub trait SourceVirtuelle: Send + Sync + std::fmt::Debug {
     /// Taille totale du fichier virtuel.
     fn total(&self) -> u64;
@@ -320,6 +321,8 @@ pub mod voie {
     pub const DEPART_NATIF: &str = "depart_natif_trames_intactes";
     /// #6221 — DSF fabriqué depuis un DST.
     pub const DSF_RECONSTRUIT: &str = "dsf_reconstruit";
+    /// #9184 — DSF fabriqué depuis une tranche d'ISO SACD.
+    pub const DSF_DEPUIS_ISO: &str = "dsf_depuis_iso";
     /// Fichier issu d'un décodage puis d'un ré-encodage (temporaire ou cache).
     pub const FICHIER_CONVERTI: &str = "fichier_converti";
     /// Session de fichier dont la résolution n'a rien noté.
