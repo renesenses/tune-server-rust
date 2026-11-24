@@ -185,12 +185,13 @@ fn verifier_avec(
             "La destination sort de la bibliothèque par un lien symbolique.",
         ));
     }
-    // Fil 3036 — pas de « : » sous l'emplacement : un flux NTFS
+    // Fil 3036 — sous Windows, pas de « : » sous l'emplacement : un flux NTFS
     // (`duplicates::$INDEX_ALLOCATION`) crée le vrai dossier `duplicates`.
+    // Ailleurs, « : » est un caractère de nom valide.
     // Les noms que Tune crée (`nom_sur`) le remplacent déjà par « _ ».
     if chemin
         .strip_prefix(racine)
-        .is_ok_and(|r| r.to_string_lossy().contains(':'))
+        .is_ok_and(|r| deux_points_interdit(&r.to_string_lossy(), cfg!(windows)))
     {
         return Err(refus(
             "destination_invalide",
@@ -440,6 +441,14 @@ const DOSSIERS_DE_RECUPERATION: &[&str] = &["lost+found"];
 /// Le dossier de travail de Tune, nommé même s'il quittait `SKIP_DIRS`.
 const DOSSIER_DE_TUNE: &str = ".tune";
 
+/// Un « : » est-il interdit dans `texte` ? Sous Windows seulement : il y
+/// ouvre un flux NTFS (`duplicates::$INDEX_ALLOCATION` crée le vrai dossier
+/// `duplicates`). Sous Linux et macOS, c'est un caractère de nom valide
+/// (`Live: 1991`).
+fn deux_points_interdit(texte: &str, windows: bool) -> bool {
+    windows && texte.contains(':')
+}
+
 /// Un segment que Windows réduit à rien (`.. `, `...`, `. `) : il y vaut
 /// « . » ou « .. ».
 fn segment_vide_sous_windows(seg: &str) -> bool {
@@ -449,8 +458,8 @@ fn segment_vide_sous_windows(seg: &str) -> bool {
 const ATTRIBUT_CACHE: u32 = 0x2;
 
 /// Un nom de dossier à ne pas proposer ni accepter : AU MOINS ce que le scan
-/// ignore (`SKIP_DIRS`, dossiers système), plus `lost+found`, `.tune`, un
-/// nom à deux-points (flux NTFS) et l'attribut caché de Windows. Un dossier qui commence simplement par un
+/// ignore (`SKIP_DIRS`, dossiers système), plus `lost+found`, `.tune` et,
+/// sous Windows, un nom à deux-points (flux NTFS) ou l'attribut caché. Un dossier qui commence simplement par un
 /// point (`.38 Special`) est parcouru par le scan : il reste choisissable.
 ///
 /// Le point et l'espace finals sont retirés d'abord (Windows les retire en
@@ -459,7 +468,7 @@ const ATTRIBUT_CACHE: u32 = 0x2;
 /// insensibles à la casse). `attributs` : les attributs de fichier Windows,
 /// s'ils sont connus.
 fn nom_masque(nom: &str, attributs: Option<u32>) -> bool {
-    if nom.contains(':') {
+    if deux_points_interdit(nom, cfg!(windows)) {
         return true;
     }
     let nom = nom.trim_end_matches(['.', ' ']);
@@ -914,29 +923,38 @@ mod tests {
 
     // ─── Au moins ce que le scan ignore (fil 3036, relecture) ────────────
 
-    /// Deux-points (flux NTFS : `duplicates::$INDEX_ALLOCATION` crée le
-    /// vrai dossier `duplicates`) et segments que Windows réduit à « . » ou
-    /// « .. » : refusés sous l'emplacement.
+    /// Deux-points : refusé sous Windows (flux NTFS :
+    /// `duplicates::$INDEX_ALLOCATION` crée le vrai dossier `duplicates`),
+    /// accepté ailleurs, où c'est un caractère de nom (`Live: 1991` reste
+    /// proposé, ouvert et choisi). Segments que Windows réduit à « . » ou
+    /// « .. » : refusés sous Windows.
     #[cfg(unix)]
     #[test]
     fn un_deux_points_ou_un_segment_vide_sous_windows_est_refuse() {
+        // Sous Windows : la règle, injectée.
+        for d in ["duplicates::$INDEX_ALLOCATION", "A:b/x", "Live: 1991"] {
+            assert!(deux_points_interdit(d, true), "Windows : « {d} »");
+        }
+        assert!(!deux_points_interdit("Live 1991", true));
+        // Ailleurs (ce système) : accepté.
+        for d in ["duplicates::$INDEX_ALLOCATION", "Live: 1991"] {
+            assert!(!deux_points_interdit(d, false), "Unix : « {d} »");
+        }
         let bib = tempfile::tempdir().unwrap();
-        std::fs::create_dir(bib.path().join("Live: 1991")).unwrap();
+        std::fs::create_dir_all(bib.path().join("Live: 1991/Face A")).unwrap();
         std::fs::create_dir(bib.path().join("Bon")).unwrap();
         let racine = bib.path().to_string_lossy().to_string();
         let places = [racine.clone()];
-        for d in [
-            "duplicates::$INDEX_ALLOCATION",
-            "A:b/x",
-            "Bon/c:d",
-            "Live: 1991",
-        ] {
-            let r = verifier(&format!("{racine}/{d}"), &places).unwrap_err();
-            assert_eq!(r.motif, "destination_invalide", "« {d} »");
-        }
-        assert!(nom_masque("Live: 1991", None));
+        let live = format!("{racine}/Live: 1991");
+        assert!(!nom_masque("Live: 1991", None));
+        assert!(verifier(&live, &places).is_ok());
+        assert!(verifier(&format!("{live}/Neuf"), &places).is_ok());
         let l = sous_dossiers(Some(&racine), &places).unwrap();
-        assert_eq!(noms(&l), ["Bon"], "un nom à deux-points n'est pas proposé");
+        assert_eq!(noms(&l), ["Bon", "Live: 1991"]);
+        assert_eq!(
+            noms(&sous_dossiers(Some(&live), &places).unwrap()),
+            ["Face A"]
+        );
 
         for seg in [".. ", "...", ". ", "..  .", " . "] {
             assert!(segment_vide_sous_windows(seg), "« {seg} »");
