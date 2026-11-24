@@ -303,6 +303,23 @@ async fn le_code_est_dans_le_fichier_journal_et_nulle_part_ailleurs() {
                 "{route} : le journal joint ({nom}) porte le code"
             );
         }
+        // Un fichier mixte (UTF-8 puis UTF-16LE, chacun avec le code) est
+        // refusé, et rien ne part.
+        let avant = recu.lock().await.len();
+        let mut mixte = texte.clone().into_bytes();
+        if mixte.len() % 2 != 0 {
+            mixte.push(b' ');
+        }
+        mixte.extend_from_slice(&utf16le(&texte)[2..]);
+        let (ct, corps) = multipart(champs, "mixte.log", &mixte);
+        let st = poster_multipart(&state, route, ct, corps).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{route} : pièce mixte");
+        assert_eq!(
+            recu.lock().await.len(),
+            avant,
+            "{route} : rien ne doit partir (pièce mixte)"
+        );
+
         // Une pièce texte illisible (UTF-16 mal formé) est refusée, et rien
         // ne part.
         let avant = recu.lock().await.len();

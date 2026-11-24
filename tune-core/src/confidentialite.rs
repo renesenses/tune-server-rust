@@ -586,6 +586,15 @@ const PHRASES_CODE_ACTIVATION: &[&str] = &[
     "One-time code to enable authentication",
 ];
 
+/// Combien de fois le marqueur et les phrases fixes apparaissent.
+fn occurrences_du_code_d_activation(texte: &str) -> usize {
+    texte.matches(MARQUEUR_CODE_ACTIVATION).count()
+        + PHRASES_CODE_ACTIVATION
+            .iter()
+            .map(|p| texte.matches(p).count())
+            .sum::<usize>()
+}
+
 fn porte_un_code_d_activation(ligne: &str) -> bool {
     ligne.contains(MARQUEUR_CODE_ACTIVATION)
         || PHRASES_CODE_ACTIVATION.iter().any(|p| ligne.contains(p))
@@ -821,9 +830,14 @@ fn texte_de_la_piece(octets: &[u8]) -> Result<String, PieceIllisible> {
             }
         }
     };
-    if lu_en_utf16 && !porte_un_code_d_activation(&texte) {
+    // Lu en UTF-16 : le marqueur et les phrases (ASCII) se comptent pareil
+    // dans les octets bruts sans leurs nuls et dans le texte décodé. Plus
+    // d'occurrences dans les octets bruts : une partie du fichier n'était pas
+    // de l'UTF-16 (UTF-8 avant ou après), et son code serait illisible pour le
+    // nettoyage.
+    if lu_en_utf16 {
         let brut = String::from_utf8_lossy(octets).replace('\0', "");
-        if porte_un_code_d_activation(&brut) {
+        if occurrences_du_code_d_activation(&brut) > occurrences_du_code_d_activation(&texte) {
             return Err(PieceIllisible);
         }
     }
@@ -951,18 +965,56 @@ mod tests {
     /// nettoyage. Refusé.
     #[test]
     fn un_fichier_mixte_utf8_puis_utf16_est_refuse() {
-        let mut debut = journal_avec_code().into_bytes();
-        if debut.len() % 2 != 0 {
-            debut.push(b' ');
+        let utf8_pair = |t: &str| {
+            let mut o = t.as_bytes().to_vec();
+            if o.len() % 2 != 0 {
+                o.push(b' ');
+            }
+            o
+        };
+        let avec_code = journal_avec_code();
+        let sans_code = "INFO suite en UTF-16 ".repeat(4);
+        let long_avec_code = format!("{avec_code}{}", "INFO suite\r\n".repeat(8));
+        let cas: [(&str, Vec<u8>); 4] = [
+            // UTF-8 avec le code, puis UTF-16LE sans code.
+            ("utf8+utf16le sans code", {
+                let mut o = utf8_pair(&avec_code);
+                o.extend_from_slice(&utf16(&sans_code, true, false));
+                o
+            }),
+            // UTF-8 avec le code, puis UTF-16LE avec le code.
+            ("utf8+utf16le", {
+                let mut o = utf8_pair(&avec_code);
+                o.extend_from_slice(&utf16(&long_avec_code, true, false));
+                o
+            }),
+            // UTF-8 avec le code, puis UTF-16BE avec le code.
+            ("utf8+utf16be", {
+                let mut o = utf8_pair(&avec_code);
+                o.extend_from_slice(&utf16(&long_avec_code, false, false));
+                o
+            }),
+            // `FF FE` + UTF-16LE avec le code, puis une queue UTF-8 avec le
+            // code (`>` puis `Add-Content`).
+            ("bom utf16le+utf8", {
+                let mut o = utf16(&avec_code, true, true);
+                o.extend_from_slice(&utf8_pair(&avec_code));
+                o
+            }),
+        ];
+        for (nom, octets) in cas {
+            assert_eq!(
+                piece_texte_nettoyee("mixte.log", octets),
+                Err(PieceIllisible),
+                "{nom}"
+            );
         }
-        let suite = "INFO suite en UTF-16 ".repeat(4);
-        let mut octets = debut.clone();
-        octets.extend_from_slice(&utf16(&suite, true, false));
-        assert!(octets.len() >= 2 * debut.len());
-        assert_eq!(
-            piece_texte_nettoyee("mixte.log", octets),
-            Err(PieceIllisible)
-        );
+        // Contre-épreuve : un UTF-16 ordinaire qui porte le code n'est pas
+        // refusé, il est nettoyé.
+        for (le, marque) in [(true, true), (false, false)] {
+            let piece = piece_texte_nettoyee("a.log", utf16(&long_avec_code, le, marque)).unwrap();
+            assert!(!String::from_utf8(piece).unwrap().contains("K7QXR2MZPA"));
+        }
     }
 
     /// Un journal tronqué par une coupure de courant finit par des octets
