@@ -444,13 +444,7 @@ pub fn build_device_description(state: &UpnpState) -> String {
     <modelURL>https://mozaiklabs.fr/tune</modelURL>
     <serialNumber>{version}</serialNumber>
     <UDN>{uuid}</UDN>
-    <iconList>
-      <icon>
-        <mimetype>image/png</mimetype>
-        <width>120</width><height>120</height><depth>24</depth>
-        <url>/icon.png</url>
-      </icon>
-    </iconList>
+    {icones}
     <serviceList>
       <service>
         <serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType>
@@ -478,6 +472,8 @@ pub fn build_device_description(state: &UpnpState) -> String {
         friendly = crate::outputs::didl::escape_sain(&state.friendly_name),
         version = crate::version(),
         uuid = state.uuid,
+        // #9483 — `/icon.png` était annoncé sans qu'aucune route le serve.
+        icones = crate::upnp_icones::icon_list_xml(&base),
         base = base,
         mount = MOUNT_PATH,
     )

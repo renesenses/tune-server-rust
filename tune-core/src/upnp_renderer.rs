@@ -48,6 +48,7 @@ pub fn renderer_description_xml(
     <modelURL>https://mozaiklabs.fr/tune</modelURL>
     <serialNumber>{version}</serialNumber>
     <UDN>{uuid}</UDN>
+    {icones}
     <serviceList>
       <service>
         <serviceType>{av}</serviceType>
@@ -76,6 +77,8 @@ pub fn renderer_description_xml(
         friendly = quick_xml::escape::escape(friendly_name),
         version = crate::version(),
         uuid = uuid,
+        // #9483 — le lecteur n'annonçait aucune icône.
+        icones = crate::upnp_icones::icon_list_xml(base_url),
         base = base,
         av = AVTRANSPORT_URN,
         rc = RENDERINGCONTROL_URN,
