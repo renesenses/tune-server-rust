@@ -288,6 +288,8 @@ struct Interne {
     resultat: Option<Arc<Resultat>>,
     /// La RI brute (f32) pour `ri.wav`.
     ri_wav: Option<Arc<Vec<u8>>>,
+    /// La RI en `f64`, pour la phase du FIR de correction (C3, T10b).
+    ri: Option<Arc<tune_calibration::deconv::ImpulseResponse>>,
 }
 
 pub struct Mesure {
@@ -325,6 +327,11 @@ impl Mesure {
 
     pub fn ri_wav(&self) -> Option<Arc<Vec<u8>>> {
         self.verrou().ri_wav.clone()
+    }
+
+    /// La réponse impulsionnelle `f64` d'une mesure terminée (C3, T10b).
+    pub fn reponse_impulsionnelle(&self) -> Option<Arc<tune_calibration::deconv::ImpulseResponse>> {
+        self.verrou().ri.clone()
     }
 
     pub fn avancement(&self) -> Avancement {
@@ -530,6 +537,7 @@ impl Controleur {
                 avertissements: Vec::new(),
                 resultat: None,
                 ri_wav: None,
+                ri: None,
             }),
         });
         // #8513 — les traitements ne colorent plus la mesure : ils sont
@@ -803,6 +811,7 @@ impl Controleur {
         i.avertissements = avertissements;
         i.resultat = Some(Arc::new(resultat));
         i.ri_wav = Some(Arc::new(ri_wav));
+        i.ri = Some(Arc::new(m.ir));
         Ok(())
     }
 

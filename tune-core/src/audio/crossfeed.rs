@@ -378,6 +378,15 @@ impl CrossfeedProcessor {
             }
         }
     }
+
+    /// TESS T14 — diagnostic : `(identifiant, traite le F64 lui-même)` par
+    /// étage tiers (F64 négocié avec le greffon, T05).
+    pub fn etages_tiers_en_f64(&self) -> Vec<(String, bool)> {
+        self.tiers
+            .iter()
+            .map(|t| (t.id.clone(), t.stage.processes_f64_natively()))
+            .collect()
+    }
     pub fn process_pcm(&mut self, pcm: &mut [u8], bit_depth: u16, channels: u16) {
         if channels != 2 {
             return;

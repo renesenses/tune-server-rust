@@ -1285,9 +1285,18 @@ impl PositionPoller {
                 && self.orchestrator.streamer.stream_bytes_sent(sid).await == Some(0)
             {
                 let titre = np.title.clone();
+                // Fil 2972 — l'adresse de l'épisode, pour le marquer
+                // indisponible si l'éditeur a répondu 404/410.
+                let adresse = np.source_id.clone();
                 poll_states.remove(&zone_id);
-                Box::pin(self.arreter_sur_source_en_erreur(zone_id, &device_id, &titre, statut))
-                    .await;
+                Box::pin(self.arreter_sur_source_en_erreur(
+                    zone_id,
+                    &device_id,
+                    &titre,
+                    adresse.as_deref(),
+                    statut,
+                ))
+                .await;
                 continue;
             }
 

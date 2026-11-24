@@ -505,7 +505,15 @@ pub fn router_with_plugins(
         .to_string_lossy()
         .into_owned();
 
-    let zones_and_playback = zones::router().merge(playback::router());
+    // #9174 — sous l'authentification (posée sur `api`) : la provenance du
+    // lecteur d'une zone navigateur, relais ou local.
+    let zones_and_playback =
+        zones::router()
+            .merge(playback::router())
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::provenance_navigateur_9174::noter_la_provenance,
+            ));
     let api = Router::new()
         .route(
             "/playback/shuffle-all",

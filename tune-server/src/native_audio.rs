@@ -1,5 +1,7 @@
 //! Operator-controlled native audio packages. No default trust key and no
-//! unsigned installation switch. Libraries activate only during startup.
+//! unsigned installation switch. Built-in slots activate during startup;
+//! a third-party DSP package also activates right after its installation
+//! (TESS T14, [`activer_tiers_sans_redemarrage`]).
 use crate::{auth::RequireAdmin, state::AppState};
 use axum::{
     Json, Router,
@@ -144,15 +146,7 @@ pub fn load_installed(settings: &tune_core::db::settings_repo::SettingsRepo) {
         let loaded = keys
             .as_ref()
             .map_err(Clone::clone)
-            .and_then(|keys| tune_plugin_native::package::load(&directory, &id, keys))
-            .and_then(|library| {
-                // Un greffon natif tiers n'a de place que sur la chaîne DSP.
-                if tiers && library.manifest.kind != tune_plugin_sdk::manifest::PluginKind::Dsp {
-                    Err("third-party native plugins must be DSP plugins".to_string())
-                } else {
-                    Ok(library)
-                }
-            });
+            .and_then(|keys| charger(&directory, keys, &id, tiers));
         match loaded {
             Ok(library) => {
                 if let Err(error) = tune_plugin_native::register(library) {
@@ -164,6 +158,81 @@ pub fn load_installed(settings: &tune_core::db::settings_repo::SettingsRepo) {
                 tune_plugin_native::record_failure(&id, error);
             }
         }
+    }
+}
+
+/// Vérifie (signature, manifeste) et charge la bibliothèque du greffon `id`
+/// installé sous `directory`. Un greffon natif tiers n'a de place que sur la
+/// chaîne DSP : un autre type est refusé.
+fn charger(
+    directory: &std::path::Path,
+    keys: &[String],
+    id: &str,
+    tiers: bool,
+) -> Result<std::sync::Arc<tune_plugin_native::Library>, String> {
+    let library = tune_plugin_native::package::load(directory, id, keys)?;
+    if tiers && library.manifest.kind != tune_plugin_sdk::manifest::PluginKind::Dsp {
+        return Err("third-party native plugins must be DSP plugins".to_string());
+    }
+    Ok(library)
+}
+
+/// TESS T14 — active un greffon natif TIERS sans redémarrer le serveur :
+/// juste après son installation (envoi direct ou catalogue) ou un retour à
+/// la version précédente. Le paquet est vérifié et chargé comme au
+/// démarrage ([`charger`]), puis inscrit au registre : la prochaine chaîne
+/// composée (piste suivante, réglage de zone) le prend ; les étages déjà
+/// construits gardent l'ancienne bibliothèque jusqu'à leur destruction.
+///
+/// Rend `Ok(true)` si le greffon est en service, `Ok(false)` s'il n'est pas
+/// demandé (désactivé). Deux activations du même processus ne se croisent
+/// pas (verrou [`ACTIVATION`]) : le paquet lu est toujours la version active
+/// au moment de l'inscription, jamais une version plus ancienne inscrite en
+/// dernier. Un échec de chargement n'est PAS inscrit comme échec
+/// du greffon : une version précédente déjà en service le reste, et le
+/// démarrage suivant rejouera le chargement.
+/// Sérialise les activations à chaud (installation, retour arrière).
+static ACTIVATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) fn activer_tiers_sans_redemarrage(
+    settings: &tune_core::db::settings_repo::SettingsRepo,
+    id: &str,
+) -> Result<bool, String> {
+    if !tune_core::audio::natifs_tiers::identifiant_admissible(id) {
+        return Err("invalid plugin id".into());
+    }
+    let _verrou = ACTIVATION.lock().unwrap_or_else(|e| e.into_inner());
+    if !tune_core::audio::natifs_tiers::demande(settings, id) {
+        return Ok(false);
+    }
+    let keys = trusted_keys()?;
+    let library = charger(&root(), &keys, id, true)?;
+    tune_plugin_native::register(library).map_err(|e| e.to_string())?;
+    tune_plugin_native::forget_failure(id);
+    tracing::info!(%id, "native_audio_third_party_activated_without_restart");
+    Ok(true)
+}
+
+/// [`activer_tiers_sans_redemarrage`] hors du fil asynchrone (le chargement
+/// lit et vérifie le paquet, puis ouvre la bibliothèque). Rend
+/// `(restart_required, activation_error)` pour la réponse de la route. Un
+/// greffon désactivé n'attend rien d'un redémarrage : `false`, sans erreur
+/// (c'est `active: false` de l'état des greffons qui le dit).
+pub(crate) async fn activer_apres_installation(
+    state: &AppState,
+    id: &str,
+) -> (bool, Option<String>) {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let id = id.to_owned();
+    match tokio::task::spawn_blocking(move || activer_tiers_sans_redemarrage(&settings, &id)).await
+    {
+        // En service, ou désactivé : aucun redémarrage n'y changerait rien.
+        Ok(Ok(_)) => (false, None),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "native_audio_hot_activation_failed");
+            (true, Some(error))
+        }
+        Err(error) => (true, Some(error.to_string())),
     }
 }
 pub fn router() -> Router<AppState> {
@@ -254,7 +323,9 @@ async fn status(_admin: RequireAdmin, State(state): State<AppState>) -> Response
 /// - `engine` : `"native"` (paquet chargé), `"bundled"` (intégré, moteur
 ///   embarqué) ou `null` (greffon tiers sans bibliothèque chargée) ;
 /// - `restart_required` : voulu actif mais pas encore en service. Seul un
-///   tiers est dans ce cas : il ne charge sa bibliothèque qu'au démarrage.
+///   tiers peut être dans ce cas : il est chargé à son installation (TESS
+///   T14, [`activer_tiers_sans_redemarrage`]) ou au démarrage, et ne reste en
+///   attente que si ce chargement à chaud a échoué.
 ///   Un intégré agit dès l'installation, ses portes lisant ses réglages à
 ///   chaque appel ([`crate::premium_audio_plugins::agit_sans_redemarrage`]) :
 ///   l'upsampler installé en cours de session marche aussitôt, et n'attend
@@ -336,8 +407,21 @@ async fn install(
     };
     match install_package(&state, &id, tiers, body.to_vec(), signature, None).await {
         Ok(package) => {
-            Json(json!({"id":id,"installed":true,"restart_required":true,"target":package.target}))
-                .into_response()
+            // TESS T14 — un greffon tiers agit sans redémarrage ; un
+            // emplacement intégré garde son cycle (démarrage).
+            let (restart_required, activation_error) = if tiers {
+                activer_apres_installation(&state, &id).await
+            } else {
+                (true, None)
+            };
+            Json(json!({
+                "id": id,
+                "installed": true,
+                "restart_required": restart_required,
+                "activation_error": activation_error,
+                "target": package.target,
+            }))
+            .into_response()
         }
         Err(e) => refusal(e),
     }
@@ -364,7 +448,9 @@ pub(crate) async fn check_slot(state: &AppState, id: &str) -> Result<bool, Respo
     Ok(tiers)
 }
 
-/// Vérifie puis installe un paquet signé pour le PROCHAIN démarrage, et pose
+/// Vérifie puis installe un paquet signé (actif au démarrage suivant ; un
+/// greffon tiers est en plus activé aussitôt par l'appelant,
+/// [`activer_apres_installation`]), et pose
 /// les drapeaux `plugin_{id}_installed|enabled`. `version` est la version
 /// annoncée par le catalogue (le manifeste du SDK n'en porte pas) : elle est
 /// retenue sous `plugin_{id}_version` pour l'écran Extensions.
@@ -454,7 +540,21 @@ async fn rollback(
     };
     match tune_plugin_native::package::rollback(&root(), &id, &keys) {
         Ok(active) => {
-            Json(json!({"id":id,"active":active,"restart_required":true})).into_response()
+            // TESS T14 — la version précédente d'un greffon tiers reprend la
+            // main sans redémarrage, comme une installation.
+            let (restart_required, activation_error) =
+                if !tune_core::audio::premium_plugins::contains(&id) {
+                    activer_apres_installation(&state, &id).await
+                } else {
+                    (true, None)
+                };
+            Json(json!({
+                "id": id,
+                "active": active,
+                "restart_required": restart_required,
+                "activation_error": activation_error,
+            }))
+            .into_response()
         }
         Err(e) => refusal(e),
     }

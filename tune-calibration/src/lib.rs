@@ -5,8 +5,9 @@
 //! [`analysis`] (fenêtrage, réponse en fréquence, lissage, RT60, cascade,
 //! moyenne spatiale) → [`mic_cal`] (étalonnage du micro) → [`target`] et
 //! [`eq`] (cible, égaliseur paramétrique automatique au format natif) →
-//! [`fir`] (esquisse C3 : FIR phase mixte et coût du convolueur) →
-//! [`rew`] (import/export REW). [`level`] porte les garde-fous de niveau et
+//! [`fir`] (C3 : FIR de correction à phase mixte depuis la mesure, coût du
+//! convolueur) et [`wav`] (son fichier de RI) → [`rew`] (import/export REW).
+//! [`level`] porte les garde-fous de niveau et
 //! [`sim`] les pièces simulées des essais.
 //!
 //! Aucun son n'est joué ni capté : tout est hors serveur, hors temps réel.
@@ -23,6 +24,7 @@ pub mod rew;
 pub mod sim;
 pub mod sweep;
 pub mod target;
+pub mod wav;
 
 use analysis::{BandRt60, LogResponse};
 use deconv::ImpulseResponse;

@@ -7,6 +7,8 @@ pub mod cadence_du_flux;
 pub mod deezer;
 pub mod deezer_decrypt;
 pub mod editorial_bibliotheque;
+/// Fil 2972 — épisodes de podcast que l'éditeur ne sert plus (404/410).
+pub mod episodes_indisponibles;
 pub mod favorites_date;
 pub mod favorites_identity;
 pub mod favorites_import;
