@@ -130,6 +130,97 @@ pub struct FileWatcher {
     /// `ensure_watches` retries them so a NAS mounted after boot — or
     /// remounted after a drop — gets picked up without a restart.
     pending: Vec<PathBuf>,
+    /// #9360 — racines suivies « en descendant » : leur suivi récursif a été
+    /// refusé parce qu'un SOUS-dossier est illisible (inotify refuse alors
+    /// toute la racine). Voir [`Descente`].
+    descentes: HashMap<PathBuf, Descente>,
+}
+
+/// #9360 — le suivi d'une racine dont un sous-dossier est illisible.
+///
+/// Sous Linux, `notify` pose le suivi récursif dossier par dossier, et le
+/// premier dossier illisible (un `lost+found`, une partition système montée
+/// sous `/media`) fait échouer TOUTE la racine : la bibliothèque entière
+/// n'était plus surveillée. La racine est alors suivie en descendant : chaque
+/// dossier dont le suivi récursif échoue est suivi seul (non récursif), puis
+/// ses sous-dossiers sont repris un par un ; seul le dossier illisible est
+/// sauté, et le journal le nomme.
+#[derive(Debug, Default)]
+struct Descente {
+    /// Dossiers suivis seuls : la racine et les ancêtres d'un dossier
+    /// illisible. Leurs sous-dossiers sont relus à chaque `ensure_watches`
+    /// (un dossier créé depuis, ou devenu lisible, y est repris).
+    non_recursifs: Vec<PathBuf>,
+    /// Sous-dossiers suivis récursivement.
+    recursifs: Vec<PathBuf>,
+    /// Dossiers illisibles, déjà nommés au journal (une seule fois).
+    refuses: HashSet<PathBuf>,
+}
+
+/// Profondeur au-delà de laquelle la descente s'arrête (boucle de liens).
+const PROFONDEUR_MAX_DESCENTE: usize = 32;
+
+/// #9360 — suit `dossier` récursivement si possible ; sinon le suit seul et
+/// descend dans ses sous-dossiers. Rend `false` si `dossier` lui-même ne peut
+/// pas être suivi.
+fn descendre(
+    w: &mut RecommendedWatcher,
+    dossier: &Path,
+    d: &mut Descente,
+    profondeur: usize,
+) -> bool {
+    if d.recursifs.iter().any(|r| r == dossier) {
+        return true;
+    }
+    let deja_seul = d.non_recursifs.iter().any(|r| r == dossier);
+    if !deja_seul {
+        if profondeur > 0 {
+            match w.watch(dossier, RecursiveMode::Recursive) {
+                Ok(()) => {
+                    if d.refuses.remove(dossier) {
+                        info!(dir = %dossier.display(), "watch_subdir_readable_again — dossier de nouveau suivi");
+                    }
+                    d.recursifs.push(dossier.to_path_buf());
+                    return true;
+                }
+                Err(_) => {
+                    // Un suivi récursif refusé a pu poser une partie de
+                    // l'arbre : tout retirer avant de suivre ce dossier seul.
+                    let _ = w.unwatch(dossier);
+                }
+            }
+        }
+        if let Err(e) = w.watch(dossier, RecursiveMode::NonRecursive) {
+            if d.refuses.insert(dossier.to_path_buf()) {
+                warn!(
+                    dir = %dossier.display(),
+                    error = %e,
+                    "watch_subdir_refused — dossier illisible sauté, le reste de la racine reste suivi"
+                );
+            }
+            return false;
+        }
+        if d.refuses.remove(dossier) {
+            info!(dir = %dossier.display(), "watch_subdir_readable_again — dossier de nouveau suivi");
+        }
+        d.non_recursifs.push(dossier.to_path_buf());
+    }
+    if profondeur >= PROFONDEUR_MAX_DESCENTE {
+        return true;
+    }
+    let Ok(entrees) = std::fs::read_dir(dossier) else {
+        return true;
+    };
+    let mut sous: Vec<PathBuf> = entrees
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|e| e.path())
+        .collect();
+    sous.sort();
+    for s in sous {
+        descendre(w, &s, d, profondeur + 1);
+    }
+    true
 }
 
 /// Les sondes des racines réseau, partagées avec les fils qui les amorcent.
@@ -1002,6 +1093,7 @@ impl FileWatcher {
             event_rx: std::sync::Mutex::new(rx),
             dirs: Vec::new(),
             pending: requested.clone(),
+            descentes: HashMap::new(),
         };
         this.ensure_watches();
 
@@ -1077,11 +1169,23 @@ impl FileWatcher {
                 warn!(dir = %dir.display(), "watch_dir_lost — unmounted or unreadable, will re-watch when it returns");
                 if let Some(w) = self.watcher.as_mut() {
                     let _ = w.unwatch(&dir);
+                    if let Some(d) = self.descentes.remove(&dir) {
+                        for s in d.recursifs.iter().chain(d.non_recursifs.iter()) {
+                            let _ = w.unwatch(s);
+                        }
+                    }
                 }
                 self.pending.push(dir);
             }
         }
         self.dirs = still_watched;
+        // #9360 — une racine suivie en descendant : reprendre les dossiers
+        // créés depuis, ou redevenus lisibles.
+        if let Some(w) = self.watcher.as_mut() {
+            for (racine, d) in self.descentes.iter_mut() {
+                descendre(w, racine, d, 0);
+            }
+        }
         {
             let mut pretes = verrou(&self.sondage.pretes);
             let mut still_polled = Vec::new();
@@ -1163,8 +1267,24 @@ impl FileWatcher {
                         self.dirs.push(dir);
                     }
                     Err(e) => {
-                        warn!(dir = %dir.display(), error = %e, "watch_dir_failed — skipping, other dirs still watched");
-                        self.pending.push(dir);
+                        // #9360 — sous Linux, un seul sous-dossier illisible
+                        // fait échouer le suivi récursif de toute la racine :
+                        // la suivre en descendant, en sautant ce dossier.
+                        let _ = w.unwatch(&dir);
+                        let mut d = Descente::default();
+                        if descendre(w, &dir, &mut d, 0) {
+                            warn!(
+                                dir = %dir.display(),
+                                error = %e,
+                                refuses = ?d.refuses,
+                                "watch_dir_partial — racine suivie sans ses dossiers illisibles"
+                            );
+                            self.descentes.insert(dir.clone(), d);
+                            self.dirs.push(dir);
+                        } else {
+                            warn!(dir = %dir.display(), error = %e, "watch_dir_failed — skipping, other dirs still watched");
+                            self.pending.push(dir);
+                        }
                     }
                 }
             }
@@ -1218,6 +1338,11 @@ impl FileWatcher {
         if let Some(mut w) = self.watcher.take() {
             for dir in &self.dirs {
                 let _ = w.unwatch(dir);
+            }
+            for d in self.descentes.values() {
+                for s in d.recursifs.iter().chain(d.non_recursifs.iter()) {
+                    let _ = w.unwatch(s);
+                }
             }
         }
         self.sondage.arrete.store(true, Ordering::Release);
@@ -1762,6 +1887,90 @@ mod tests {
             vus.is_empty(),
             "🔴 fil 2207 — la sonde réseau remonte le contenu des corbeilles : {vus:?}"
         );
+    }
+
+    /// #9360 — un seul sous-dossier illisible ne désactive plus la
+    /// surveillance de toute la racine : les autres sous-dossiers restent
+    /// suivis, le dossier illisible est sauté et nommé.
+    #[cfg(unix)]
+    #[test]
+    fn un_sous_dossier_illisible_ne_coupe_pas_la_racine_9360() {
+        use std::os::unix::fs::PermissionsExt;
+        let garde = crate::test_scratch::scratch_dir("watcher-sous-dossier-illisible-9360");
+        let racine = garde.path().to_path_buf();
+        let lisible = racine.join("Artiste").join("Album");
+        let ferme = racine.join("ferme");
+        fs::create_dir_all(&lisible).unwrap();
+        fs::create_dir_all(ferme.join("dedans")).unwrap();
+        fs::set_permissions(&ferme, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&ferme).is_ok() {
+            // root : aucun dossier n'est illisible, rien à prouver ici.
+            fs::set_permissions(&ferme, fs::Permissions::from_mode(0o755)).unwrap();
+            eprintln!("#9360 : exécuté en root, preuve sautée");
+            return;
+        }
+        let cree = FileWatcher::new(vec![racine.to_string_lossy().to_string()]);
+        let mut watcher = match cree {
+            Ok(w) => w,
+            Err(e) => {
+                fs::set_permissions(&ferme, fs::Permissions::from_mode(0o755)).unwrap();
+                panic!("🔴 #9360 — un sous-dossier illisible coupe toute la racine : {e}");
+            }
+        };
+        assert!(
+            watcher.dirs.contains(&racine),
+            "🔴 #9360 — la racine n'est pas suivie : {:?} (en attente : {:?})",
+            watcher.dirs,
+            watcher.pending
+        );
+        // Sous macOS (FSEvents), le suivi récursif ne bute pas sur un dossier
+        // illisible : pas de descente, et rien de plus à vérifier.
+        if let Some(d) = watcher.descentes.get(&racine) {
+            assert!(
+                d.refuses.contains(&ferme),
+                "#9360 : le dossier illisible doit être nommé : {d:?}"
+            );
+            assert!(
+                d.recursifs.contains(&racine.join("Artiste")),
+                "#9360 : le sous-dossier lisible doit être suivi : {d:?}"
+            );
+            // Un second passage ne pose rien deux fois.
+            watcher.ensure_watches();
+            let d = &watcher.descentes[&racine];
+            assert_eq!(d.recursifs.len(), 1, "{d:?}");
+            assert_eq!(d.non_recursifs, vec![racine.clone()], "{d:?}");
+            // Un dossier créé APRÈS sous la racine est repris au passage suivant.
+            let nouveau = racine.join("Nouveau");
+            fs::create_dir_all(&nouveau).unwrap();
+            watcher.ensure_watches();
+            assert!(
+                watcher.descentes[&racine].recursifs.contains(&nouveau),
+                "#9360 : un dossier créé depuis doit être suivi"
+            );
+            // Le dossier redevenu lisible est repris.
+            fs::set_permissions(&ferme, fs::Permissions::from_mode(0o755)).unwrap();
+            watcher.ensure_watches();
+            let d = &watcher.descentes[&racine];
+            assert!(
+                d.recursifs.contains(&ferme) && d.refuses.is_empty(),
+                "{d:?}"
+            );
+        }
+        let _ = watcher.poll_changes(Duration::from_millis(200));
+        // L'événement d'un fichier posé dans le dossier lisible arrive (si le
+        // moteur natif de la machine n'est pas sourd).
+        fs::write(lisible.join("piste.flac"), b"fLaC").unwrap();
+        let recu = watcher.poll_changes(Duration::from_secs(3));
+        if recu.is_empty() {
+            eprintln!("#9360 : moteur natif sourd sur cette machine, preuve par événement sautée");
+        } else {
+            assert!(
+                recu.iter().any(|c| c.path.ends_with("piste.flac")),
+                "#9360 : {recu:?}"
+            );
+        }
+        watcher.stop();
+        let _ = fs::set_permissions(&ferme, fs::Permissions::from_mode(0o755));
     }
 
     /// #8083 — une racine ajoutée après la création du surveillant est
