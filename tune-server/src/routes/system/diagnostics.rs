@@ -3546,10 +3546,20 @@ async fn lire_captures(
                             ),
                         ));
                     }
+                    // Un journal joint part au site nettoyé, comme le
+                    // journal du rapport lui-même.
+                    let Ok(bytes) =
+                        tune_core::confidentialite::piece_texte_nettoyee(&fname, bytes.to_vec())
+                    else {
+                        return Err(refus_de_capture(
+                            "attachment_unreadable",
+                            &format!("« {fname} » n'est pas un texte lisible (UTF-8 ou UTF-16)."),
+                        ));
+                    };
                     pieces.journaux.push(CaptureJointe {
                         content_type: mime_journal(&ext).to_string(),
                         file_name: fname,
-                        bytes: bytes.to_vec(),
+                        bytes,
                     });
                 }
             }

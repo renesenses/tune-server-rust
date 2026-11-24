@@ -1900,8 +1900,8 @@ impl FromRequestParts<AppState> for DepuisCetteMachine {
     }
 }
 
-/// Code d'activation à usage unique, écrit sur la CONSOLE du serveur
-/// seulement (voir [`emettre_code_activation`]).
+/// Code d'activation à usage unique, écrit sur la CONSOLE du serveur et dans
+/// son fichier journal local (voir [`emettre_code_activation`]).
 pub struct CodeActivation {
     code: String,
     emis: std::time::Instant,
@@ -1966,7 +1966,7 @@ fn normaliser_code(saisi: &str) -> String {
 /// Ce que donne une demande de code.
 #[derive(Debug, PartialEq, Eq)]
 pub enum EmissionCode {
-    /// Un nouveau code est sur la console.
+    /// Un nouveau code est sur la console et dans le fichier journal.
     Emis,
     /// Un code encore valable est déjà en cours : il n'est pas remplacé et
     /// ses essais ne sont pas remis à zéro.
@@ -1979,13 +1979,18 @@ fn code_valable(c: &CodeActivation) -> bool {
     c.emis.elapsed() <= DUREE_CODE_ACTIVATION && c.essais_rates < ESSAIS_CODE_ACTIVATION
 }
 
+/// Cible `tracing` de la ligne qui porte le code d'activation. Seule la couche
+/// FICHIER du journal la reçoit (`bootstrap::installer_le_journal`) : la
+/// console a déjà la ligne par `eprintln!`.
+pub const CIBLE_CODE_ACTIVATION: &str = "tune_server::code_activation";
+
 /// Émet un code, s'il n'y en a pas déjà un de valable, et l'écrit sur la
 /// CONSOLE du serveur (sortie d'erreur : `docker logs`, `journalctl -u tune`,
-/// en SSH sur Tune OS ; sous Windows sans console, le fichier journal) — jamais dans le journal de `tracing`, que l'API sert
-/// (`/system/logs`, rapports de bogue). La ligne porte
+/// en SSH sur Tune OS) et dans le FICHIER JOURNAL local (`tune-server.log`),
+/// pour les installations sans console visible. La ligne porte
 /// [`tune_core::confidentialite::MARQUEUR_CODE_ACTIVATION`], que tous les
-/// lecteurs de journaux retirent (cas d'une sortie d'erreur redirigée dans le
-/// fichier journal).
+/// lecteurs de journaux retirent : elle ne sort ni par l'API
+/// (`/system/logs`, rapports de bogue), ni vers le site.
 pub fn emettre_code_activation(state: &AppState) -> EmissionCode {
     let mut etat = state.code_activation_auth.lock().unwrap();
     if etat.en_cours.as_ref().is_some_and(code_valable) {
@@ -2005,24 +2010,18 @@ pub fn emettre_code_activation(state: &AppState) -> EmissionCode {
     });
     etat.derniere_emission = Some(std::time::Instant::now());
     drop(etat);
-    eprintln!(
+    let ligne = format!(
         "{} {code} — Tune : code d'activation de l'authentification, usage unique, {} min. \
          Saisissez-le dans Réglages > Système > Authentification. / One-time code to enable \
          authentication in Settings > System > Authentication.",
         tune_core::confidentialite::MARQUEUR_CODE_ACTIVATION,
         DUREE_CODE_ACTIVATION.as_secs() / 60,
     );
+    eprintln!("{ligne}");
+    // La même ligne dans le fichier journal local : Daphile, `nohup`, un
+    // service ou Windows sans console n'ont pas de console visible.
+    tracing::warn!(target: CIBLE_CODE_ACTIVATION, "{ligne}");
     tracing::warn!("auth_activation_code_ecrit_sur_la_console");
-    // Windows sans console (`lancement_sans_console`) : la sortie d'erreur
-    // ne va nulle part. Le code part aussi dans le fichier journal, que seul
-    // l'exploitant de la machine lit ; tous les lecteurs de l'API retirent
-    // la ligne (marqueur).
-    #[cfg(windows)]
-    tracing::warn!(
-        "{} {} (Windows : fichier journal tune-server.log)",
-        tune_core::confidentialite::MARQUEUR_CODE_ACTIVATION,
-        code,
-    );
     EmissionCode::Emis
 }
 
@@ -2133,7 +2132,7 @@ fn refus_activation_hors_machine() -> Response {
         Json(json!({
             "error": "activation_code_required",
             "reason": "not_local",
-            "message": "Enabling authentication from another device requires the one-time code written to the server console (POST /auth/activation/code; docker logs, journalctl -u tune — on Tune OS over SSH —, or the log file on Windows), or a call from this machine.",
+            "message": "Enabling authentication from another device requires the one-time code written to the server console and to the log file tune-server.log (POST /auth/activation/code; docker logs, journalctl -u tune — on Tune OS over SSH —, or the log file), or a call from this machine.",
         })),
     )
         .into_response()
