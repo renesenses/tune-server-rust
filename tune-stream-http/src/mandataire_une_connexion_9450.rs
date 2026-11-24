@@ -48,55 +48,63 @@ fn cdn_qui_compte(corps: Vec<u8>) -> (String, Arc<AtomicUsize>) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn une_seule_connexion_amont_par_piste_sur_la_voie_mandataire_9450() {
-    let fichier: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
-    let (amont, connexions) = cdn_qui_compte(fichier.clone());
-    let sid = "s9450-une-connexion";
-    let info = StreamInfo {
-        format: "flac".into(),
-        mime_type: "audio/flac".into(),
-        sample_rate: 96_000,
-        bit_depth: 24,
-        channels: 2,
-        ..StreamInfo::default()
-    };
-    let session = StreamSession::new(sid.to_string(), info, false, 128);
-    *session.proxy_url.lock().await = Some(amont);
-    let session = Arc::new(session);
-    let sessions: SharedSessions = Arc::new(tokio::sync::Mutex::new(
-        [(sid.to_string(), session.clone())].into_iter().collect(),
-    ));
+    tokio::time::timeout(std::time::Duration::from_secs(30), async move {
+        let fichier: Vec<u8> = (0..3_000_000u32).map(|i| (i % 251) as u8).collect();
+        let (amont, connexions) = cdn_qui_compte(fichier.clone());
+        let sid = "s9450-une-connexion";
+        let info = StreamInfo {
+            format: "flac".into(),
+            mime_type: "audio/flac".into(),
+            sample_rate: 96_000,
+            bit_depth: 24,
+            channels: 2,
+            ..StreamInfo::default()
+        };
+        let session = StreamSession::new(sid.to_string(), info, false, 128);
+        *session.proxy_url.lock().await = Some(amont);
+        let session = Arc::new(session);
+        let sessions: SharedSessions = Arc::new(tokio::sync::Mutex::new(
+            [(sid.to_string(), session.clone())].into_iter().collect(),
+        ));
 
-    // La sonde se branche à la création de la session, avant le renderer.
-    let lecteur = session.prise_des_niveaux.brancher(Box::new(|| false));
-    let sonde = std::thread::spawn(move || {
-        let mut lecteur = lecteur;
-        let mut v = Vec::new();
-        lecteur.read_to_end(&mut v).unwrap();
-        v
-    });
+        // La sonde se branche à la création de la session, avant le renderer.
+        // Arrêt borné : un blocage fait échouer le test au lieu de le pendre.
+        let fin = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let lecteur = session
+            .prise_des_niveaux
+            .brancher(Box::new(move || std::time::Instant::now() >= fin));
+        let sonde = std::thread::spawn(move || {
+            let mut lecteur = lecteur;
+            let mut v = Vec::new();
+            lecteur.read_to_end(&mut v).unwrap();
+            v
+        });
 
-    // Le renderer.
-    let mut h = HeaderMap::new();
-    h.insert("User-Agent", "Renderer/1.0".parse().unwrap());
-    h.insert("Range", "bytes=0-".parse().unwrap());
-    let rep = handle_stream(Path(format!("{sid}.flac")), State(sessions.clone()), h).await;
-    assert_eq!(rep.status(), StatusCode::PARTIAL_CONTENT);
-    let mut flux = rep.into_body().into_data_stream();
-    let mut servi = Vec::new();
-    while let Some(m) = flux.next().await {
-        servi.extend_from_slice(&m.unwrap());
-    }
-    assert_eq!(servi, fichier, "le renderer reçoit le fichier verbatim");
+        // Le renderer.
+        let mut h = HeaderMap::new();
+        h.insert("User-Agent", "Renderer/1.0".parse().unwrap());
+        h.insert("Range", "bytes=0-".parse().unwrap());
+        let rep = handle_stream(Path(format!("{sid}.flac")), State(sessions.clone()), h).await;
+        assert_eq!(rep.status(), StatusCode::PARTIAL_CONTENT);
+        let mut flux = rep.into_body().into_data_stream();
+        let mut servi = Vec::new();
+        while let Some(m) = flux.next().await {
+            servi.extend_from_slice(&m.unwrap());
+        }
+        assert_eq!(servi, fichier, "le renderer reçoit le fichier verbatim");
 
-    let lu = tokio::task::spawn_blocking(move || sonde.join().unwrap())
-        .await
-        .unwrap();
-    assert_eq!(lu, fichier, "la sonde lit les mêmes octets, dans l'ordre");
-    assert_eq!(
-        connexions.load(Ordering::SeqCst),
-        1,
-        "une seule connexion amont pour la piste (#9450)"
-    );
+        let lu = tokio::task::spawn_blocking(move || sonde.join().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(lu, fichier, "la sonde lit les mêmes octets, dans l'ordre");
+        assert_eq!(
+            connexions.load(Ordering::SeqCst),
+            1,
+            "une seule connexion amont pour la piste (#9450)"
+        );
+    })
+    .await
+    .expect("témoin #9450 bloqué : 30 s dépassées");
 }
 
 /// #9450, revue — un renderer qui fait un HEAD AVANT tout GET : la longueur
@@ -104,39 +112,43 @@ async fn une_seule_connexion_amont_par_piste_sur_la_voie_mandataire_9450() {
 /// demande à l'amont (`bytes=0-0`) et annonce un fichier recherchable.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn un_head_d_abord_annonce_la_longueur_9450() {
-    let fichier = vec![5u8; 123_456];
-    let (amont, _connexions) = cdn_qui_compte(fichier.clone());
-    let sid = "s9450-head-d-abord";
-    let info = StreamInfo {
-        format: "flac".into(),
-        mime_type: "audio/flac".into(),
-        sample_rate: 44_100,
-        bit_depth: 16,
-        channels: 2,
-        ..StreamInfo::default()
-    };
-    let session = StreamSession::new(sid.to_string(), info, false, 128);
-    *session.proxy_url.lock().await = Some(amont);
-    let session = Arc::new(session);
-    let sessions: SharedSessions = Arc::new(tokio::sync::Mutex::new(
-        [(sid.to_string(), session.clone())].into_iter().collect(),
-    ));
-    let mut h = HeaderMap::new();
-    h.insert("User-Agent", "Renderer/1.0".parse().unwrap());
-    let rep = handle_head(Path(format!("{sid}.flac")), State(sessions), h).await;
-    assert_eq!(
-        rep.headers()
-            .get("Content-Length")
-            .and_then(|v| v.to_str().ok()),
-        Some("123456"),
-        "le HEAD d'abord doit annoncer la longueur de l'amont"
-    );
-    assert!(
-        rep.headers()
-            .get("contentFeatures.dlna.org")
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.contains("DLNA.ORG_OP=01")),
-        "recherche par octets annoncée"
-    );
-    assert_eq!(session.longueur_amont(), Some(123_456));
+    tokio::time::timeout(std::time::Duration::from_secs(30), async move {
+        let fichier = vec![5u8; 123_456];
+        let (amont, _connexions) = cdn_qui_compte(fichier.clone());
+        let sid = "s9450-head-d-abord";
+        let info = StreamInfo {
+            format: "flac".into(),
+            mime_type: "audio/flac".into(),
+            sample_rate: 44_100,
+            bit_depth: 16,
+            channels: 2,
+            ..StreamInfo::default()
+        };
+        let session = StreamSession::new(sid.to_string(), info, false, 128);
+        *session.proxy_url.lock().await = Some(amont);
+        let session = Arc::new(session);
+        let sessions: SharedSessions = Arc::new(tokio::sync::Mutex::new(
+            [(sid.to_string(), session.clone())].into_iter().collect(),
+        ));
+        let mut h = HeaderMap::new();
+        h.insert("User-Agent", "Renderer/1.0".parse().unwrap());
+        let rep = handle_head(Path(format!("{sid}.flac")), State(sessions), h).await;
+        assert_eq!(
+            rep.headers()
+                .get("Content-Length")
+                .and_then(|v| v.to_str().ok()),
+            Some("123456"),
+            "le HEAD d'abord doit annoncer la longueur de l'amont"
+        );
+        assert!(
+            rep.headers()
+                .get("contentFeatures.dlna.org")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("DLNA.ORG_OP=01")),
+            "recherche par octets annoncée"
+        );
+        assert_eq!(session.longueur_amont(), Some(123_456));
+    })
+    .await
+    .expect("témoin #9450 bloqué : 30 s dépassées");
 }

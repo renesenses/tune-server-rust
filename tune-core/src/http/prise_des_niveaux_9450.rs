@@ -471,6 +471,13 @@ pub fn oublier(stream_id: &str) {
 mod tests {
     use super::*;
 
+    /// Un arrêt qui tombe au bout de 10 s : un test qui se bloque échoue au
+    /// lieu de pendre (relecture de #9458).
+    fn borne() -> Box<dyn Fn() -> bool + Send + Sync> {
+        let fin = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        Box::new(move || std::time::Instant::now() >= fin)
+    }
+
     fn tout_lire(l: &mut LecteurDePrise) -> Vec<u8> {
         let mut v = Vec::new();
         l.read_to_end(&mut v).unwrap();
@@ -480,7 +487,7 @@ mod tests {
     #[test]
     fn les_octets_contigus_passent_une_fois_dans_l_ordre() {
         let prise = PriseDesNiveaux::default();
-        let mut l = prise.brancher(Box::new(|| false));
+        let mut l = prise.brancher(borne());
         let fichier: Vec<u8> = (0..100u8).collect();
         let total = Some(100);
         prise.nourrir(1, 0, &fichier[..40], total);
@@ -495,7 +502,7 @@ mod tests {
     #[test]
     fn la_lecture_des_etiquettes_de_fin_est_ignoree() {
         let prise = PriseDesNiveaux::default();
-        let mut l = prise.brancher(Box::new(|| false));
+        let mut l = prise.brancher(borne());
         let total = 4 * 1024 * 1024u64;
         let bloc = vec![7u8; 1000];
         prise.nourrir(1, 0, &bloc, Some(total));
@@ -512,7 +519,7 @@ mod tests {
     #[test]
     fn un_saut_recale_la_sonde_depuis_l_en_tete() {
         let prise = PriseDesNiveaux::default();
-        let mut l = prise.brancher(Box::new(|| false));
+        let mut l = prise.brancher(borne());
         let total = Some(10 * 1024 * 1024u64);
         prise.nourrir(1, 0, &[1, 2, 3, 4], total);
         let loin = 5 * 1024 * 1024u64;
@@ -527,7 +534,7 @@ mod tests {
     fn une_sonde_trop_en_retard_est_debranchee_sans_rien_bloquer() {
         let prise = PriseDesNiveaux::default();
         prise.poser_le_debit(100_000); // 45 s = 4,5 Mo → plancher 8 Mio
-        let _l = prise.brancher(Box::new(|| false));
+        let _l = prise.brancher(borne());
         let bloc = vec![0u8; 1024 * 1024];
         let mut pos = 0u64;
         for _ in 0..(PLAFOND_MIN / bloc.len() as u64 + 2) {
@@ -548,7 +555,7 @@ mod tests {
     #[test]
     fn une_prise_garee_rend_le_debut_tire_avant_l_avance() {
         let prise = PriseDesNiveaux::default();
-        garer("s-garee-9450", prise.brancher(Box::new(|| false)));
+        garer("s-garee-9450", prise.brancher(borne()));
         prise.nourrir(1, 0, &[1, 2, 3], Some(6));
         assert!(est_garee("s-garee-9450"));
         let mut l = reprendre("s-garee-9450").expect("garée");
@@ -566,7 +573,7 @@ mod tests {
     fn un_branchement_tardif_se_recale_sans_repartir_de_zero() {
         let prise = PriseDesNiveaux::default();
         prise.nourrir(1, 0, &[1, 2, 3], None);
-        let mut l = prise.brancher(Box::new(|| false));
+        let mut l = prise.brancher(borne());
         assert_eq!(l.commence_par_un_saut(), Some(3));
         assert_eq!(l.prendre_le_saut(), Some(3));
         prise.nourrir(1, 3, &[4, 5], None);
