@@ -62,7 +62,59 @@ fn sortie(autorisee: bool, ri: &crate::test_scratch::ScratchFile) -> LocalOutput
     s.declare_current_format_for_test(TAUX, 2);
     s.set_convolution_autorisee(autorisee);
     s.set_convolver_ir(&ri.as_str()).unwrap();
+    // T09b — un filtre posé flux en cours SANS moteur attend le départ du
+    // flux suivant (sinon, saut de temps de la latence) : le témoin simule ce
+    // départ, comme la boucle de lecture.
+    rebuild_local_convolver(
+        &s.convolver_config,
+        &s.convolver,
+        &s.convolution_autorisee,
+        TAUX,
+        2,
+    )
+    .unwrap();
     s
+}
+
+/// T09b — un filtre posé PENDANT la lecture, sans moteur en service : rien
+/// ne bouge dans le flux en cours (ni saut de temps ni latence qui change) ;
+/// le jeu est mémorisé et le moteur bâti au départ du flux suivant.
+/// CONTRE-ÉPREUVE : un moteur déjà en service, lui, bascule en fondu.
+#[test]
+fn un_filtre_pose_en_lecture_sans_moteur_attend_le_flux_suivant_t09b() {
+    let ri = ri_quart();
+    let s = LocalOutput::new("DAC test".to_string());
+    s.declare_current_format_for_test(TAUX, 2);
+    s.set_convolution_autorisee(true);
+    s.set_convolver_ir(&ri.as_str()).unwrap();
+    assert!(s.has_convolver(), "le jeu est mémorisé");
+    assert!(
+        s.convolver.lock().unwrap().is_none(),
+        "aucun moteur posé dans le flux en cours"
+    );
+    let entree = sinus(2_400);
+    let mut pcm = entree.clone();
+    passer(&s, &mut pcm);
+    assert_eq!(pcm, entree, "le flux en cours n'a pas été retardé");
+    assert!(
+        rebuild_local_convolver(
+            &s.convolver_config,
+            &s.convolver,
+            &s.convolution_autorisee,
+            TAUX,
+            2,
+        )
+        .unwrap(),
+        "le moteur est bâti au départ du flux"
+    );
+    // Moteur en service : un nouveau filtre bascule en fondu, sans retrait.
+    s.set_convolver_ir(&ri.as_str()).unwrap();
+    let garde = s.convolver.lock().unwrap();
+    let moteur = garde.as_ref().expect("le moteur reste en service");
+    assert!(
+        moteur.bascule_en_cours(),
+        "le nouveau filtre arrive en fondu"
+    );
 }
 
 #[test]

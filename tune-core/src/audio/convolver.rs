@@ -495,6 +495,18 @@ impl<T: Flottant> Convolver<T> {
         nouveau: Convolver<T>,
         trames_fondu: usize,
     ) -> Result<(), Convolver<T>> {
+        self.remplacer_en_fondu_en_rendant(nouveau, trames_fondu)
+            .map(drop)
+    }
+
+    /// [`Self::remplacer_en_fondu`], qui REND les moteurs qu'il retire (le
+    /// retraité d'une bascule précédente, un successeur remplacé) au lieu de
+    /// les libérer : l'appelant les libère hors de son verrou.
+    pub fn remplacer_en_fondu_en_rendant(
+        &mut self,
+        nouveau: Convolver<T>,
+        trames_fondu: usize,
+    ) -> Result<[Option<Box<Convolver<T>>>; 2], Convolver<T>> {
         if nouveau.channels != self.channels
             || nouveau.block_size != self.block_size
             || self.eteint
@@ -502,13 +514,10 @@ impl<T: Flottant> Convolver<T> {
         {
             return Err(nouveau);
         }
-        // Libérer ici, hors du fil audio, ce que la bascule précédente a
-        // laissé.
-        self.retraite = None;
         self.rechauffe = (nouveau.prises + nouveau.block_size).min(RECHAUFFE_MAX);
         self.bascule = Some((trames_fondu.max(1), trames_fondu.max(1)));
-        self.successeur = Some(Box::new(nouveau));
-        Ok(())
+        let precedent = self.successeur.replace(Box::new(nouveau));
+        Ok([self.retraite.take(), precedent])
     }
 
     /// Une bascule de filtre est-elle en cours (réchauffe ou fondu) ?
@@ -1004,9 +1013,16 @@ impl Convolver<f64> {
                 *d = *s as f32;
             }
         }
-        // La bascule a pu échanger le moteur : le tampon rendu est celui du
-        // moteur en service (même taille, mêmes canaux et bloc).
-        self.tampon_es = tampon;
+        // La bascule a pu échanger le moteur : le moteur en service a alors
+        // son propre tampon. Rien n'est libéré ici (fil audio) : le tampon
+        // emprunté retourne au moteur qui n'en a plus, le retraité.
+        if self.tampon_es.is_empty() {
+            self.tampon_es = tampon;
+        } else if let Some(r) = self.retraite.as_mut()
+            && r.tampon_es.is_empty()
+        {
+            r.tampon_es = tampon;
+        }
     }
 
     /// Rendre ce que le moteur retient encore, en fin de piste.

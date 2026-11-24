@@ -2041,21 +2041,45 @@ impl LocalOutput {
         nouveau: Option<super::super::audio::convolver::Convolver>,
         fondu: usize,
     ) {
-        let mut actif = self.convolver.lock().unwrap();
-        if fondu > 0
-            && let Some(ancien) = actif.as_mut()
+        // Ce qui est retiré sort du verrou et n'est libéré qu'après : le fil
+        // audio, qui prend ce verrou à chaque bloc, n'attend jamais une
+        // libération.
+        let mut a_liberer: [Option<Box<super::super::audio::convolver::Convolver>>; 2] =
+            [None, None];
+        let mut remplace = None;
         {
+            let mut actif = self.convolver.lock().unwrap();
+            let joue = fondu > 0;
             match nouveau {
-                Some(n) => {
-                    if let Err(n) = ancien.remplacer_en_fondu(n, fondu) {
-                        *actif = Some(n);
+                Some(n) if joue && actif.is_some() => {
+                    let resultat = match actif.as_mut() {
+                        Some(ancien) => ancien.remplacer_en_fondu_en_rendant(n, fondu),
+                        None => Err(n),
+                    };
+                    match resultat {
+                        Ok(r) => a_liberer = r,
+                        Err(n) => remplace = actif.replace(n),
                     }
                 }
-                None => ancien.eteindre_en_fondu(fondu),
+                None if joue && actif.is_some() => {
+                    if let Some(ancien) = actif.as_mut() {
+                        ancien.eteindre_en_fondu(fondu);
+                    }
+                }
+                // Flux en cours SANS moteur : poser un convolveur maintenant
+                // retarderait le flux de sa latence d'un coup (saut de temps,
+                // latence de la chaîne qui passe de 0 à un bloc). Le jeu est
+                // mémorisé ; la sortie le bâtit au prochain départ de flux,
+                // comme pour un droit accordé en cours de lecture (#7632).
+                Some(n) if joue => {
+                    remplace = Some(n);
+                    tracing::info!(device = %self.device_name, "convolver_pose_au_prochain_flux");
+                }
+                n => remplace = std::mem::replace(&mut *actif, n),
             }
-            return;
         }
-        *actif = nouveau;
+        drop(remplace);
+        drop(a_liberer);
     }
 
     /// #7632 — accorder ou retirer le droit de convoluer (Premium

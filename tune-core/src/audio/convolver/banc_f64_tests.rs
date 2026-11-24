@@ -485,3 +485,44 @@ fn banc_cpu_convolution_65536_prises() {
         }
     }
 }
+
+/// Relecture de #9452 — par le chemin `f32` hérité, une bascule ne libère
+/// rien dans le fil audio : le tampon de conversion emprunté retourne au
+/// moteur retraité (libéré plus tard, hors du fil audio), et le moteur en
+/// service garde le sien.
+#[test]
+fn la_bascule_par_le_chemin_f32_ne_libere_rien() {
+    let bloc = 128;
+    let mut m = Convolver::new(&[vec![1.0f32]], bloc);
+    let mut x: Vec<f32> = (0..20_000).map(|n| (n as f32 * 0.01).sin() * 0.5).collect();
+    let (a, b) = x.split_at_mut(4_000);
+    m.process_interleaved(a);
+    let a_liberer = m
+        .remplacer_en_fondu_en_rendant(Convolver::new(&[vec![0.5f32]], bloc), 480)
+        .ok()
+        .expect("bascule acceptée");
+    assert!(
+        a_liberer.iter().all(Option::is_none),
+        "rien à libérer encore"
+    );
+    m.process_interleaved(b);
+    assert!(!m.bascule_en_cours(), "bascule terminée");
+    assert_eq!(
+        m.tampon_es.len(),
+        bloc,
+        "le moteur en service garde son tampon"
+    );
+    let retraite = m.retraite.as_ref().expect("l'ancien moteur est retraité");
+    assert_eq!(
+        retraite.tampon_es.len(),
+        bloc,
+        "le tampon emprunté lui revient"
+    );
+    // La bascule suivante REND le retraité à l'appelant, qui le libère hors
+    // de son verrou.
+    let a_liberer = m
+        .remplacer_en_fondu_en_rendant(Convolver::new(&[vec![1.0f32]], bloc), 480)
+        .ok()
+        .expect("bascule acceptée");
+    assert!(a_liberer[0].is_some(), "le retraité est rendu, pas libéré");
+}
