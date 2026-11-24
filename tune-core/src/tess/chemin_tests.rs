@@ -28,6 +28,7 @@ fn ctx(transport: TransportZone, pure: bool, volume_db: f64) -> ContexteExecutio
             control: ControleVolume::Software,
             db: volume_db,
         },
+        replaygain_actif: false,
     }
 }
 
