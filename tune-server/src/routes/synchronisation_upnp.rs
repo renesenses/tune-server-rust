@@ -236,6 +236,18 @@ pub async fn subscribe(
                 )),
             )
         })?;
+    // Fil du forum 3028 — s'abonner à soi-même recopierait toute la
+    // bibliothèque locale en albums `upnp` : refusé avant d'écrire la source.
+    if super::indexation_upnp::est_ce_serveur(&state, &server) {
+        return Err((
+            StatusCode::CONFLICT,
+            Json(crate::message_api::corps_refus(
+                "this_server",
+                "api.upnp.thisServer",
+                &[],
+            )),
+        ));
+    }
     let key = serde_json::to_string(&(&udn, &request.container)).map_err(error)?;
     let mut source = sources(state.backend.as_ref())
         .map_err(error)?

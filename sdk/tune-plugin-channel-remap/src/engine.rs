@@ -222,6 +222,44 @@ impl Matrice {
         sortie
     }
 
+    /// TESS T06 — appliquer à un tampon **`f64`** entrelacé de `entrees()`
+    /// canaux, en écrivant `sorties()` canaux dans `sortie`, SANS allocation
+    /// (le fil audio de l'exécuteur TESS) et sans aucun arrondi : la somme
+    /// pondérée est faite et rendue en `f64`, une recopie (permutation) rend
+    /// les échantillons à l'identique.
+    ///
+    /// Rend le nombre de trames écrites : celles de `entree` (une trame
+    /// incomplète en fin est ignorée), bornées par la place de `sortie`.
+    /// `entree` et `sortie` ne se recouvrent pas : pour le même nombre de
+    /// canaux, voir [`Self::appliquer_f64_sur_place`].
+    pub fn appliquer_f64_dans(&self, entree: &[f64], sortie: &mut [f64]) -> usize {
+        let trames = (entree.len() / self.entrees).min(sortie.len() / self.sorties.max(1));
+        for (e, s) in entree
+            .chunks_exact(self.entrees)
+            .zip(sortie.chunks_exact_mut(self.sorties))
+            .take(trames)
+        {
+            self.appliquer_trame(e, s, 0.0, |v| v, |v| v);
+        }
+        trames
+    }
+
+    /// TESS T06 — [`Self::appliquer_f64_dans`] sur place, quand
+    /// `entrees() == sorties()` ; `trame` est un tampon de travail d'au moins
+    /// `entrees()` échantillons, préparé hors temps réel. Rend `false` (rien
+    /// touché) si les tailles ne le permettent pas.
+    pub fn appliquer_f64_sur_place(&self, tampon: &mut [f64], trame: &mut [f64]) -> bool {
+        if self.entrees != self.sorties || trame.len() < self.entrees {
+            return false;
+        }
+        let trame = &mut trame[..self.entrees];
+        for t in tampon.chunks_exact_mut(self.entrees) {
+            trame.copy_from_slice(t);
+            self.appliquer_trame(trame, t, 0.0, |v| v, |v| v);
+        }
+        true
+    }
+
     /// Appliquer à un tampon d'entiers justifiés à droite de `profondeur` bits ;
     /// un mélange est arrondi au plus proche puis borné à la pleine échelle.
     pub fn appliquer_i32(&self, entree: &[i32], profondeur: u16) -> Vec<i32> {

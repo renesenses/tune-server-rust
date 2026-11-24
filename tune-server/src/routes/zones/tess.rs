@@ -125,11 +125,13 @@ fn descripteur_tiers(id: &str) -> DescripteurGreffon {
         origin: Origine::Package,
         settings_schema: json!({ "type": "object" }),
         placement: ContraintesPlace {
-            channels: if famille {
-                Canaux::StereoOnly
-            } else {
-                Canaux::Any
-            },
+            // TESS T14 — l'hôte exécute TOUT natif tiers dans l'étage casque,
+            // stéréo seulement (`CrossfeedProcessor`, préparé en 2 canaux).
+            // Annoncer `any` laissait cocher le greffon sur une zone
+            // multicanal où il ne tournait pas, sans motif : le descripteur
+            // dit ce que l'hôte fait vraiment, et la résolution l'éteint
+            // avec son motif hors stéréo.
+            channels: Canaux::StereoOnly,
             position: Position::Free,
             // Le groupe vient du préfixe (`groupe_effectif`).
             exclusive_group: None,
@@ -162,7 +164,7 @@ pub fn catalogue_tess(paquets_charges: &[String]) -> Catalogue {
     c
 }
 
-fn catalogue_du_serveur() -> Catalogue {
+pub(super) fn catalogue_du_serveur() -> Catalogue {
     catalogue_tess(&tune_core::audio::natifs_tiers::identifiants_charges())
 }
 
@@ -196,7 +198,7 @@ pub async fn catalogue_tess_route(State(state): State<AppState>) -> impl IntoRes
 
 // ── Contexte de la zone ─────────────────────────────────────────────
 
-fn zone_introuvable(zone_id: i64) -> Response {
+pub(super) fn zone_introuvable(zone_id: i64) -> Response {
     (
         StatusCode::NOT_FOUND,
         Json(json!({ "error": "zone_not_found", "zone_id": zone_id })),
@@ -223,7 +225,7 @@ pub fn corps_du_refus(r: &RefusTess) -> Value {
     v
 }
 
-fn refus(e: &ErreurChaine) -> Response {
+pub(super) fn refus(e: &ErreurChaine) -> Response {
     let r = RefusTess::from(e);
     let statut = StatusCode::from_u16(r.status).unwrap_or(StatusCode::CONFLICT);
     (statut, Json(corps_du_refus(&r))).into_response()
@@ -231,7 +233,7 @@ fn refus(e: &ErreurChaine) -> Response {
 
 /// Une clé de la zone ne se relit pas (T02 : refus explicite, jamais une
 /// chaîne vide) : l'écran le dit, la lecture garde son chemin actuel.
-fn erreur_migration(e: &ErreurMigration) -> Response {
+pub(super) fn erreur_migration(e: &ErreurMigration) -> Response {
     match e {
         ErreurMigration::ReglagesInvalides { id, raison } => {
             refus(&ErreurChaine::ReglagesInvalides {
@@ -300,8 +302,7 @@ fn source_de(etat: &tune_core::playback::ZoneState, dsd_mode: &str) -> Option<So
 /// `zones.volume` est sur 0 à 100 ; le verrou Pure (`audiophile_lock_volume`)
 /// le tient à 100 % (`effective_volume`), donc 0 dB.
 async fn volume_de(state: &AppState, zone: &Zone) -> VolumeZone {
-    let capacites = super::output_capabilities(state, zone.output_device_id.as_deref()).await;
-    if zone.fixed_volume || capacites.is_some_and(|c| !c.can_set_volume) {
+    if zone.fixed_volume || sait_regler_le_volume(state, zone).await == Some(false) {
         return VolumeZone {
             control: ControleVolume::Fixed,
             db: 0.0,
@@ -331,8 +332,24 @@ async fn volume_de(state: &AppState, zone: &Zone) -> VolumeZone {
     }
 }
 
+/// T12b (relecture de suivi) — la sortie sait-elle régler son volume ? Lu
+/// SANS attendre le verrou de la sortie : la lecture le garde pendant une
+/// sonde SOAP (`dlna_accepte_lpcm`), et un lecteur muet le tiendrait des
+/// dizaines de secondes. Sortie occupée : la dernière capacité connue
+/// (`volume_reglable_retenu`) ; jamais lue, ou sortie absente : `None`, le
+/// volume est alors celui du type de la zone.
+async fn sait_regler_le_volume(state: &AppState, zone: &Zone) -> Option<bool> {
+    let device = zone.output_device_id.as_deref()?;
+    let sortie = { state.outputs.lock().await.get(device) }?;
+    let lu = sortie
+        .try_lock()
+        .ok()
+        .map(|s| s.capabilities().can_set_volume);
+    tune_core::orchestrator::volume_reglable_retenu(device, lu)
+}
+
 /// La réponse de la zone, à partir de sa chaîne lue (T02).
-async fn reponse_de_zone(
+pub(super) async fn reponse_de_zone(
     state: &AppState,
     zone: &Zone,
     lecture: LectureZone,
@@ -343,6 +360,12 @@ async fn reponse_de_zone(
     let settings = SettingsRepo::with_backend(state.backend.clone());
     let etat = state.playback.get_state(zone_id).await;
     let volume = volume_de(state, zone).await;
+    // T12b — famille UPnP : la voie de la chaîne vers ce lecteur (relais
+    // progressif LPCM, transcodage, ou aucune), établie par la même sonde et
+    // les mêmes réglages que la lecture. `None` hors famille UPnP. Avant le
+    // contexte : il emprunte une fermeture qui ne traverse pas un `await`.
+    let piste = piste_en_cours(&etat);
+    let lecteur = state.orchestrator.faits_upnp_de_zone(zone_id, &piste).await;
     let disponible = |id: &str| greffon_disponible(&settings, id);
     let ctx = ContexteExecution {
         transport: TransportZone::depuis_type_de_sortie(zone.output_type.as_deref()),
@@ -351,16 +374,58 @@ async fn reponse_de_zone(
         greffon_disponible: &disponible,
         pure: lecture.pure,
         volume,
+        // TESS T12c — le ReplayGain de la piste en cours change-t-il ses
+        // échantillons ? (le même facteur que la lecture, `facteur_de_zone`).
+        replaygain_actif: etat.now_playing.as_ref().is_some_and(|np| {
+            (tune_core::audio::replaygain::facteur_de_zone(&state.backend, zone_id, np.piste_rg())
+                - 1.0)
+                .abs()
+                > 1e-6
+        }),
     };
+    // « ACTIVE » seulement si le préréglage existe encore (un marqueur resté
+    // après une suppression ou un import ne s'affiche pas).
     let actif = settings
         .get(&cle_prereglage_actif(zone_id))
         .ok()
         .flatten()
-        .filter(|p| !p.is_empty());
-    ReponseTessZone::depuis(zone_id, lecture.chaine, actif, catalogue, &ctx)
+        .filter(|p| !p.is_empty())
+        .filter(|p| {
+            tune_core::tess::prereglages::lire(&settings)
+                .map(|l| l.get(p).is_some())
+                .unwrap_or(true)
+        });
+    ReponseTessZone::depuis_avec_le_lecteur(
+        zone_id,
+        lecture.chaine,
+        actif,
+        catalogue,
+        &ctx,
+        lecteur.as_ref(),
+    )
 }
 
-fn zone_de(state: &AppState, zone_id: i64) -> Result<Zone, Response> {
+/// T12b — ce qui joue, pour les faits du lecteur ; rien quand la zone est
+/// arrêtée (la règle de la bibliothèque, la plus prudente, s'applique alors).
+fn piste_en_cours(etat: &tune_core::playback::ZoneState) -> tune_core::orchestrator::PisteEnCours {
+    let np = etat
+        .now_playing
+        .as_ref()
+        .filter(|_| etat.state != tune_core::playback::PlayState::Stopped);
+    match np {
+        None => Default::default(),
+        Some(np) => tune_core::orchestrator::PisteEnCours {
+            track_id: np.track_id,
+            source: Some(np.source.clone()),
+            source_id: np.source_id.clone(),
+            format: np.format.clone(),
+            bit_depth: np.bit_depth,
+            stream_id: np.stream_id.clone(),
+        },
+    }
+}
+
+pub(super) fn zone_de(state: &AppState, zone_id: i64) -> Result<Zone, Response> {
     match ZoneRepo::with_backend(state.backend.clone()).get(zone_id) {
         Ok(Some(z)) => Ok(z),
         Ok(None) => Err(zone_introuvable(zone_id)),
@@ -392,7 +457,7 @@ pub async fn get_zone_tess(State(state): State<AppState>, Path(id): Path<i64>) -
 /// écriture (comparaison des marques et des maillons inchangés). L'écriture
 /// elle-même prend en plus [`verrou_de_zone`] (dans [`ecrire_chaine`]), qui
 /// l'ordonne avec la migration de T03.
-fn verrou_des_put(zone_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+pub fn verrou_des_put(zone_id: i64) -> Arc<tokio::sync::Mutex<()>> {
     static VERROUS: OnceLock<std::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>> =
         OnceLock::new();
     let mut table = VERROUS
@@ -516,7 +581,7 @@ pub fn defaire_p2(
 
 /// La partie synchrone d'un `PUT` : lecture, fusion, droits, validation,
 /// écriture. Rend la lecture après écriture et les anciennes clés modifiées.
-fn appliquer_le_put(
+pub(super) fn appliquer_le_put(
     settings: &SettingsRepo,
     zone_id: i64,
     corps: &[u8],
@@ -566,7 +631,7 @@ fn appliquer_le_put(
 
 /// Chaque ancienne clé réécrite atteint la sortie vivante, comme par son
 /// ancienne route (`REGLAGES_A_RAFRAICHIR`).
-async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
+pub(super) async fn rafraichir(state: &AppState, zone: &Zone, cles: &[String]) {
     let id = zone.id.unwrap_or_default();
     let est = |p: Partie| cles.contains(&p.cle(id));
     let natif = cles
@@ -655,7 +720,38 @@ pub async fn put_zone_tess(
         Ok(Err(r)) => return r,
         Err(e) => return erreur_migration(&ErreurMigration::Stockage(e.to_string())),
     };
-    rafraichir(&state, &zone, &cles).await;
-    info!(zone_id = id, cles = ?cles, "tess_chaine_ecrite");
-    Json(reponse_de_zone(&state, &zone, lecture, premium, catalogue).await).into_response()
+    // T17 : la chaîne a changé à la main ; le préréglage chargé n'est plus
+    // « ACTIVE » s'il ne la décrit plus.
+    // Un marqueur qui ne s'efface pas n'empêche jamais la chaîne écrite
+    // d'atteindre la sortie : avertissement, pas d'erreur.
+    let avertissement =
+        super::tess_prereglages::oublier_le_prereglage_s_il_differe(&state, id, &lecture.chaine);
+    let mode = super::tess_prereglages::appliquer_selon_le_mode(&state, &zone, cles.clone()).await;
+    info!(zone_id = id, cles = ?cles, mode = ?mode, "tess_chaine_ecrite");
+    let mut reponse = reponse_de_zone(&state, &zone, lecture, premium, catalogue).await;
+    reponse.warnings.extend(avertissement);
+    Json(reponse).into_response()
+}
+
+#[cfg(test)]
+mod tests_t14 {
+    use super::*;
+
+    /// TESS T14 — le descripteur d'un natif tiers dit ce que l'hôte exécute :
+    /// stéréo seulement (étage casque), famille du crossfeed ou non. La
+    /// contre-épreuve est un greffon de référence qui travaille sur tout
+    /// nombre de canaux et le dit (`convolution`).
+    #[test]
+    fn t14_un_natif_tiers_est_annonce_stereo_seulement() {
+        let c = catalogue_tess(&["mon-greffon".to_string(), "crossfeed-essai".to_string()]);
+        for id in ["mon-greffon", "crossfeed-essai"] {
+            let d = c.get(id).expect("descripteur tiers");
+            assert_eq!(d.origin, Origine::Package, "{id}");
+            assert_eq!(d.placement.channels, Canaux::StereoOnly, "{id}");
+        }
+        assert_eq!(
+            c.get("convolution").unwrap().placement.channels,
+            Canaux::Any
+        );
+    }
 }

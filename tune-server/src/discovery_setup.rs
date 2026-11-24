@@ -795,20 +795,84 @@ fn est_notre_propre_serveur_multimedia(
     nos_adresses: &[String],
     notre_udn: Option<&str>,
 ) -> bool {
+    annonce_de_notre_serveur_multimedia(
+        &ms.id,
+        &ms.host,
+        ms.port,
+        &ms.location,
+        port_api,
+        nos_adresses,
+        notre_udn,
+    )
+}
+
+/// La règle de [`est_notre_propre_serveur_multimedia`] sur les seuls champs
+/// d'une annonce : le registre durable (`media_servers` en base) les porte
+/// sans `MediaServerInfo`.
+fn annonce_de_notre_serveur_multimedia(
+    udn_annonce: &str,
+    hote: &str,
+    port: u16,
+    location: &str,
+    port_api: u16,
+    nos_adresses: &[String],
+    notre_udn: Option<&str>,
+) -> bool {
     if let Some(udn) = notre_udn
         && !udn.is_empty()
-        && ms.id == udn
+        && udn_annonce == udn
     {
         return true;
     }
-    if ms.port != port_api {
+    if port != port_api {
         return false;
     }
     let notre_mount = format!("{}/description.xml", tune_core::upnp_server::MOUNT_PATH);
-    if !ms.location.ends_with(&notre_mount) {
+    if !location.ends_with(&notre_mount) {
         return false;
     }
-    !ms.host.is_empty() && nos_adresses.iter().any(|a| a == &ms.host)
+    !hote.is_empty() && nos_adresses.iter().any(|a| a == hote)
+}
+
+/// Fil du forum 3028 — ce serveur multimédia est-il CE Tune ?
+///
+/// Tune reste dans sa propre liste de serveurs (#3786 : on y parcourt ses
+/// dossiers), mais l'indexer dans sa propre bibliothèque recopie chaque album
+/// local en album `upnp` : la bibliothèque montre alors deux fois les mêmes
+/// albums, une fois en « Local », une fois sous le nom que Tune s'annonce
+/// (le nom de la machine — `…fritz.box` derrière une Fritz!Box).
+///
+/// Deux identités, prises toutes deux :
+/// - l'UDN, celui de l'état UPnP (persisté en `upnp_udn`, donc stable d'un
+///   démarrage à l'autre) ET celui de l'annonce en cours ;
+/// - à défaut d'UDN reconnu, l'adresse : une adresse de l'une de NOS
+///   interfaces (toutes, pas seulement l'élue — Wi-Fi et Ethernet d'un Mac),
+///   ou l'adresse annoncée, avec notre port d'API et notre chemin de montage.
+///   C'est ce qui couvre un UDN régénéré (base remise à zéro) dont l'ancienne
+///   annonce traîne encore.
+pub(crate) fn est_ce_serveur(
+    state: &AppState,
+    udn_annonce: &str,
+    hote: &str,
+    port: u16,
+    location: &str,
+) -> bool {
+    let adresses = nos_adresses(state.config.advertised_ip.as_deref());
+    let udn_de_l_etat = state.upnp.as_ref().map(|u| u.uuid.clone());
+    let udn_annonce_en_cours = tune_core::upnp_server::media_server_advert().map(|a| a.uuid);
+    [udn_de_l_etat, udn_annonce_en_cours, None]
+        .iter()
+        .any(|notre_udn| {
+            annonce_de_notre_serveur_multimedia(
+                udn_annonce,
+                hote,
+                port,
+                location,
+                state.config.port,
+                &adresses,
+                notre_udn.as_deref(),
+            )
+        })
 }
 
 /// Nos adresses, du point de vue d'une annonce reçue : l'IP du réseau local et
@@ -2206,6 +2270,14 @@ pub fn spawn_mdns_handler(
                                     dev.port,
                                     dev.id.clone(),
                                     ap_dev_id,
+                                )
+                                // #9379 — Apple TV : appairage unique par le
+                                // code affiché (TXT `flags` bit 9).
+                                .avec_code_a_l_ecran(
+                                    dev.capabilities
+                                        .get(tune_core::discovery::mdns::CAP_AIRPLAY_CODE_A_L_ECRAN)
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false),
                                 );
                                 // #8402 — elle part du volume mémorisé de sa
                                 // zone, jamais de la pleine échelle.
@@ -2434,6 +2506,39 @@ async fn retirer_la_sortie_mdns_perdue(
     );
     info!(id = %id, "mdns_output_removed_zone_offline");
 }
+/// #9379 — la sortie AirPlay 2 déjà enregistrée pour ce récepteur, quand la
+/// nouvelle annonce la reconstruirait à l'identique (même nom, même adresse,
+/// même `deviceid`).
+///
+/// Un HomePod republie son TXT mDNS au moment où un émetteur s'y connecte
+/// (fil Sheev, 22/11 : `connected` à 13:26:10.094, puis
+/// `airplay2_output_registered name=Zone 15` à 10.171, `play_media` à 10.550).
+/// La sortie était alors REMPLACÉE dans le registre par une neuve, sans démon :
+/// l'ancienne, lâchée dès la fin de `play_media`, emportait son démon
+/// (`kill_on_drop`) et la session avec lui, quelques instants après le début
+/// du flux. Le HomePod rejouait en boucle les deux secondes reçues, et Tune
+/// parlait à la sortie neuve : volume « kept for the next session », pause
+/// sans effet, position figée à 0 jusqu'à l'arrêt de la zone après 120 s.
+/// Rien dans une `Airplay2Output` ne dépend du reste du TXT : la garder ne
+/// perd rien, la remplacer perd la session.
+async fn sortie_airplay2_a_conserver_9379(
+    outputs: &Arc<tokio::sync::Mutex<OutputRegistry>>,
+    neuve: &dyn tune_core::outputs::OutputTarget,
+) -> Option<Arc<tokio::sync::Mutex<Box<dyn tune_core::outputs::OutputTarget>>>> {
+    use tune_core::outputs::OutputTarget as _;
+    use tune_core::outputs::airplay2::Airplay2Output;
+    let neuve = neuve.as_any().downcast_ref::<Airplay2Output>()?;
+    let existante = { outputs.lock().await.get(neuve.device_id())? };
+    let meme = {
+        let sortie = existante.lock().await;
+        sortie
+            .as_any()
+            .downcast_ref::<Airplay2Output>()
+            .is_some_and(|ancienne| ancienne.meme_recepteur(neuve))
+    };
+    meme.then_some(existante)
+}
+
 /// Enregistre la sortie d'un appareil annoncé par mDNS, puis rattache ou crée
 /// sa zone : reconnexion, montée de priorité, ré-ancrages, dédoublonnage entre
 /// protocoles et création automatique.
@@ -2484,14 +2589,18 @@ async fn enregistrer_la_sortie_mdns_et_sa_zone(
     } else {
         None
     };
-    let mut reg = outputs.lock().await;
+    // #9379 — de même pour une sortie AirPlay 2 : voir
+    // `sortie_airplay2_a_conserver_9379`.
+    let conservee_airplay2 = sortie_airplay2_a_conserver_9379(outputs, output.as_ref()).await;
     #[cfg(feature = "oaat")]
+    let conservee = conservee.or(conservee_airplay2);
+    #[cfg(not(feature = "oaat"))]
+    let conservee = conservee_airplay2;
+    let mut reg = outputs.lock().await;
     let conserver = conservee.as_ref().is_some_and(|ancienne| {
         reg.get(&dev.id)
             .is_some_and(|actuelle| Arc::ptr_eq(ancienne, &actuelle))
     });
-    #[cfg(not(feature = "oaat"))]
-    let conserver = false;
     if conserver {
         annoncer_sortie_mdns(event_bus, dev, output_type_str, annonce);
     } else {
@@ -3394,13 +3503,19 @@ pub fn spawn_output_providers(
             let mut statuts = Vec::with_capacity(providers.len());
             for provider in &providers {
                 let trouves = provider.discover(&ctx).await;
-                statuts.push(statut_du_fournisseur(
+                let mut statut = statut_du_fournisseur(
                     provider.provider_name(),
                     provider.required_module(),
                     trouves.len(),
                     &ctx.licensed_modules,
                     compte_lie,
-                ));
+                );
+                // #9380 — ce que le fournisseur dit de sa recherche (option
+                // coupée, rien reçu, formes inconnues), lu par le rapport.
+                if let Some(recherche) = provider.discovery_report() {
+                    statut["discovery"] = recherche;
+                }
+                statuts.push(statut);
                 for output in trouves {
                     let dev_id = output.device_id().to_string();
                     let name = output.name().to_string();
@@ -5992,6 +6107,83 @@ mod reancrage_par_mac {
              zone neuve est deja la, et la re-association n'a plus qu'un \
              doublon a contempler (#3919)"
         );
+    }
+}
+
+#[cfg(test)]
+mod sortie_airplay2_conservee_9379_tests {
+    use super::*;
+    use tune_core::discovery::device::{DiscoveredDevice, OutputType};
+    use tune_core::outputs::airplay2::Airplay2Output;
+
+    fn homepod(hote: &str) -> DiscoveredDevice {
+        let mut d = DiscoveredDevice::new(
+            "airplay-d2:7c:ce:93:79:01".into(),
+            "Zone 15".into(),
+            OutputType::Airplay,
+            hote.into(),
+            7000,
+        );
+        d.airplay_version = Some("2".into());
+        d.mac_address = Some("D2:7C:CE:93:79:01".into());
+        d
+    }
+
+    fn sortie(dev: &DiscoveredDevice) -> Airplay2Output {
+        Airplay2Output::new(
+            dev.name.clone(),
+            dev.host.clone(),
+            dev.port,
+            dev.id.clone(),
+            dev.mac_address.clone().unwrap(),
+        )
+    }
+
+    async fn republier(state: &crate::state::AppState, dev: &DiscoveredDevice) {
+        enregistrer_la_sortie_mdns_et_sa_zone(
+            &state.outputs,
+            &state.backend,
+            &state.event_bus,
+            &state.playback,
+            dev,
+            Box::new(sortie(dev)),
+            "airplay2",
+            false,
+            AnnonceAppareil::MiseAJour,
+        )
+        .await;
+    }
+
+    /// #9379 (Sheev, HomePod mini) : le TXT republié à la connexion ne doit
+    /// plus remplacer la sortie qui tient le démon et la session en cours.
+    #[tokio::test]
+    async fn une_republication_mdns_garde_la_sortie_airplay2_en_place_9379() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let dev = homepod("192.168.1.45");
+        state.outputs.lock().await.register(Box::new(sortie(&dev)));
+        let avant = state.outputs.lock().await.get(&dev.id).unwrap();
+        republier(&state, &dev).await;
+        let apres = state.outputs.lock().await.get(&dev.id).unwrap();
+        assert!(
+            Arc::ptr_eq(&avant, &apres),
+            "#9379 : la republication du TXT remplace la sortie AirPlay 2 et tue son démon"
+        );
+    }
+
+    /// Le récepteur a changé d'adresse : la sortie est bien reconstruite.
+    #[tokio::test]
+    async fn un_recepteur_qui_change_d_adresse_recoit_une_sortie_neuve_9379() {
+        let state = crate::state::AppState::new(":memory:", 0, Default::default()).unwrap();
+        let dev = homepod("192.168.1.45");
+        state.outputs.lock().await.register(Box::new(sortie(&dev)));
+        let avant = state.outputs.lock().await.get(&dev.id).unwrap();
+        republier(&state, &homepod("192.168.1.46")).await;
+        let apres = state.outputs.lock().await.get(&dev.id).unwrap();
+        assert!(!Arc::ptr_eq(&avant, &apres));
+        let neuve = sortie(&homepod("192.168.1.46"));
+        let garde = apres.lock().await;
+        let enregistree = garde.as_any().downcast_ref::<Airplay2Output>().unwrap();
+        assert!(enregistree.meme_recepteur(&neuve));
     }
 }
 

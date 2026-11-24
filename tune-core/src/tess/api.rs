@@ -21,6 +21,7 @@ use serde_json::{Map, Value, json};
 use super::VERSION_CONTRAT;
 use super::chaine::{ChaineTess, ErreurChaine};
 use super::greffon::Catalogue;
+use super::reseau_upnp::{AcheminementUpnp, FaitsUpnp, acheminer, appliquer, famille_upnp};
 use super::resolution::{Badge, ContexteExecution, EtapeResolue, EtatVolume, MotifEtape};
 use super::zones::{Applicabilite, TransportZone};
 
@@ -42,6 +43,15 @@ pub struct ReponseTessZone {
     pub signal_path: Vec<EtapeResolue>,
     /// Les greffons qu'on peut ajouter (« + Add plugin »), avec leurs droits.
     pub catalog: Catalogue,
+    /// T12b — famille UPnP seulement : la voie par laquelle la chaîne atteint
+    /// le lecteur (relais progressif LPCM, transcodage, ou aucune) et son
+    /// motif. Absent ailleurs ; un client qui ne le connaît pas l'ignore.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delivery: Option<AcheminementUpnp>,
+    /// Avertissements d'un `PUT` accepté (T17 : `active_preset_not_stored`
+    /// quand le marqueur « ACTIVE » n'a pas pu être tenu). Absent si vide.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 impl ReponseTessZone {
@@ -52,7 +62,28 @@ impl ReponseTessZone {
         catalog: Catalogue,
         ctx: &ContexteExecution<'_>,
     ) -> Self {
-        let r = chain.resoudre(&catalog, ctx);
+        Self::depuis_avec_le_lecteur(zone_id, chain, active_preset, catalog, ctx, None)
+    }
+
+    /// T12b — comme [`Self::depuis`], et, sur une zone de la famille UPnP
+    /// dont la lecture a établi les faits du lecteur, la voie de la chaîne :
+    /// un étage que la voie ne porte pas est publié éteint, avec son motif.
+    pub fn depuis_avec_le_lecteur(
+        zone_id: i64,
+        chain: ChaineTess,
+        active_preset: Option<String>,
+        catalog: Catalogue,
+        ctx: &ContexteExecution<'_>,
+        lecteur: Option<&FaitsUpnp>,
+    ) -> Self {
+        let mut r = chain.resoudre(&catalog, ctx);
+        let delivery = lecteur
+            .filter(|_| famille_upnp(ctx.transport) && ctx.transport.applicabilite().appliquee())
+            .map(|f| {
+                let a = acheminer(&r, f);
+                appliquer(&mut r, &a);
+                a
+            });
         Self {
             contract_version: VERSION_CONTRAT,
             zone_id,
@@ -65,6 +96,8 @@ impl ReponseTessZone {
             badge: r.badge,
             signal_path: r.etapes,
             catalog,
+            delivery,
+            warnings: Vec::new(),
         }
     }
 }
@@ -103,7 +136,7 @@ impl ReponseCatalogue {
             .plugins
             .iter()
             .map(|d| {
-                let entitled = premium || !d.entitlement.demande_le_premium();
+                let entitled = premium || !d.demande_le_premium();
                 let available = disponible(&d.id);
                 let reason = if !available {
                     Some(MotifEtape::PluginUnavailable)
@@ -166,7 +199,28 @@ pub fn schema_json() -> Value {
         .iter()
         .map(ErreurChaine::code)
         .collect();
-    json!({
+    // T12b — `delivery` est défini hors du grand littéral : `json!` y atteint
+    // sa limite de récursion.
+    let delivery = json!({
+        "type": "object",
+        "required": ["route", "reason", "detail", "renderer_lpcm", "lpcm_bits"],
+        "properties": {
+            "route": enumere(&["untouched", "progressive_lpcm", "file_transcode"]),
+            "reason": { "enum": ["nothing_to_process", "renderer_without_lpcm",
+                                 "progressive_off", "service_not_streamable",
+                                 "dsd_converted_to_pcm", null] },
+            "detail": texte_ou_null.clone(),
+            "renderer_lpcm": enumere(&["accepted", "refused", "unknown"]),
+            "lpcm_bits": { "type": "integer" }
+        },
+        "additionalProperties": false
+    });
+    let motifs_etape = json!({ "enum": ["outside_tess", "pure_mode", "bypass_all",
+        "dsd_source_native", "chain_version_unsupported", "unknown_value", "unknown_plugin",
+        "plugin_unavailable", "premium_required", "stereo_only", "replaced_in_group",
+        "nothing_to_protect", "volume_not_software", "nothing_to_quantize", "not_in_service",
+        "renderer_without_lpcm", "not_applied_on_transport", null] });
+    let mut schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": "https://mozaiklabs.fr/schemas/tess/contract-1.json",
         "title": "TESS API contract",
@@ -310,11 +364,7 @@ pub fn schema_json() -> Value {
                     "fixed": { "type": "boolean" },
                     "requested": { "type": "boolean" },
                     "effective": { "type": "boolean" },
-                    "reason": { "enum": ["outside_tess", "pure_mode", "bypass_all", "dsd_source_native",
-                                         "chain_version_unsupported", "unknown_value", "unknown_plugin",
-                                         "plugin_unavailable", "premium_required", "stereo_only",
-                                         "replaced_in_group", "nothing_to_protect", "volume_not_software",
-                                         "nothing_to_quantize", "not_in_service", null] },
+                    "reason": motifs_etape,
                     "detail": texte_ou_null,
                     "params": objet_ou_null,
                     "latency_frames": entier_ou_null
@@ -346,7 +396,9 @@ pub fn schema_json() -> Value {
                     "badge": enumere(&["bit_perfect", "processed_by_tess", "outside_tess",
                                        "altered_outside_tess"]),
                     "signal_path": { "type": "array", "items": { "$ref": "#/$defs/step" } },
-                    "catalog": { "$ref": "#/$defs/catalog" }
+                    "catalog": { "$ref": "#/$defs/catalog" },
+                    // Facultatif (T17) : avertissements d'un `PUT` accepté.
+                    "warnings": { "type": "array", "items": { "type": "string" } }
                 },
                 "additionalProperties": false
             },
@@ -356,7 +408,11 @@ pub fn schema_json() -> Value {
                     "id": { "$ref": "#/$defs/id" },
                     "name": { "type": "string" },
                     "builtin": { "type": "boolean" },
-                    "chain": { "$ref": "#/$defs/chain" }
+                    "chain": { "$ref": "#/$defs/chain" },
+                    // Facultatif (T17) : seulement dans la réponse d'un
+                    // `POST /tess/presets` dont le marqueur « ACTIVE » n'a
+                    // pas pu être posé (`active_preset_not_stored`).
+                    "warnings": { "type": "array", "items": { "type": "string" } }
                 },
                 "additionalProperties": false
             },
@@ -386,7 +442,11 @@ pub fn schema_json() -> Value {
                 "additionalProperties": false
             }
         }
-    })
+    });
+    schema["$defs"]["delivery"] = delivery;
+    schema["$defs"]["zone_response"]["properties"]["delivery"] =
+        json!({ "$ref": "#/$defs/delivery" });
+    schema
 }
 
 /// Ouvre un schéma pour la LECTURE par un client : champs inconnus permis,
@@ -574,6 +634,7 @@ mod tests {
                 control: ControleVolume::Software,
                 db: -18.0,
             },
+            replaygain_actif: false,
         }
     }
 
@@ -628,6 +689,71 @@ mod tests {
                 assert_eq!(serde_json::from_value::<ReponseTessZone>(v).unwrap(), r);
             }
         }
+    }
+
+    /// T12b — `delivery` n'apparaît que sur la famille UPnP, suit le schéma
+    /// strict et celui de lecture, et fait l'aller-retour ; l'étage casque
+    /// éteint faute de LPCM porte `renderer_without_lpcm`.
+    #[test]
+    fn la_voie_upnp_est_publiee_sur_la_seule_famille_upnp() {
+        use crate::tess::reseau_upnp::{FaitsUpnp, LpcmDuLecteur, OrigineDuFlux, VoieUpnp};
+        let casque_seul = ChaineTess {
+            plugins: vec![MaillonGreffon {
+                id: "crossfeed".into(),
+                enabled: true,
+                settings: Value::Null,
+            }],
+            ..ChaineTess::default()
+        };
+        let faits = FaitsUpnp {
+            lpcm: LpcmDuLecteur::Refused,
+            lpcm_bits: 16,
+            progressif_arme: false,
+            origine: OrigineDuFlux::Library,
+            replaygain_actif: false,
+            service_decodable_au_fil: true,
+            format_impose_le_transcodage: false,
+        };
+        for t in TransportZone::ALL {
+            for c in [
+                ChaineTess::default(),
+                chaine_complete(),
+                casque_seul.clone(),
+            ] {
+                let r = ReponseTessZone::depuis_avec_le_lecteur(
+                    12,
+                    c.clone(),
+                    None,
+                    catalogue_de_reference(),
+                    &ctx(t),
+                    Some(&faits),
+                );
+                assert_eq!(r.delivery.is_some(), super::famille_upnp(t), "{t:?}");
+                let v = serde_json::to_value(&r).unwrap();
+                strict("zone_response", &v).unwrap_or_else(|e| panic!("{t:?} : {e}"));
+                lecture("zone_response", &v).unwrap_or_else(|e| panic!("{t:?} : {e}"));
+                assert_eq!(serde_json::from_value::<ReponseTessZone>(v).unwrap(), r);
+            }
+        }
+        let r = ReponseTessZone::depuis_avec_le_lecteur(
+            12,
+            casque_seul.clone(),
+            None,
+            catalogue_de_reference(),
+            &ctx(TransportZone::Dlna),
+            Some(&faits),
+        );
+        assert_eq!(r.delivery.as_ref().unwrap().route, VoieUpnp::Untouched);
+        let cf = r
+            .signal_path
+            .iter()
+            .find(|e| e.plugin_id.as_deref() == Some("crossfeed"))
+            .unwrap();
+        assert_eq!(cf.reason, Some(MotifEtape::RendererWithoutLpcm));
+        // Contre-épreuve : sans faits du lecteur, rien ne change (`depuis`).
+        let sans = reponse(TransportZone::Dlna, casque_seul);
+        assert!(sans.delivery.is_none());
+        assert_eq!(sans.badge, Badge::ProcessedByTess);
     }
 
     #[test]

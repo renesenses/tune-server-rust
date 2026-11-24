@@ -172,13 +172,19 @@ fn signed_native_activation_keeps_old_instance_alive_during_update_and_rollback(
     // Drop the processor before TempDir: Windows intentionally keeps its DLL mapped.
     drop(processor);
 }
-/// TESS T05 — the reference equalizer and crossfeed do not request
-/// `audio-f64` and refuse F64. Through `Stage::process_f64` they still run,
-/// converted at their boundary, bit for bit like the historical F32 path.
-/// Pointed at libraries built from a pre-T05 tree (`TUNE_NATIVE_TEST_DIR`),
-/// this proves an existing F32 binary runs unchanged under the new host.
+/// TESS T05 then T06 — the reference equalizer and crossfeed behind
+/// `Stage::process_f64`.
+///
+/// - Built from this tree (T06), they request `audio-f64`: the host hands them
+///   its `f64` samples as they are, and their engines compute in `f64` end to
+///   end. The result is NOT the F32 path any more (no rounding to `f32` on the
+///   way) but stays within 2^-21 (−126 dBFS) of it: inaudible.
+/// - Pointed at libraries built from a pre-T06 tree (`TUNE_NATIVE_TEST_DIR`),
+///   they do not request it, and still run converted at their boundary, bit
+///   for bit like the historical F32 path: an existing F32 binary runs
+///   unchanged under the new host.
 #[test]
-fn reference_f32_plugins_run_unchanged_behind_the_f64_boundary() {
+fn reference_plugins_run_behind_the_f64_boundary() {
     for (id, settings) in [
         (
             "equalizer",
@@ -190,10 +196,10 @@ fn reference_f32_plugins_run_unchanged_behind_the_f64_boundary() {
         ),
     ] {
         let library = library(id);
-        assert!(!library.manifest.declares_f64(), "{id} now requests F64");
+        let f64_natif = library.manifest.declares_f64();
         let mut wide = Stage::prepare(library.clone(), 48000, 2, &settings).unwrap();
         let mut narrow = Stage::prepare(library, 48000, 2, &settings).unwrap();
-        assert!(!wide.processes_f64_natively());
+        assert_eq!(wide.processes_f64_natively(), f64_natif, "{id}");
         let input: Vec<f64> = (0..32768)
             .map(|i| (f64::from(i) * 0.07).sin() * 0.8 + 1e-11)
             .collect();
@@ -204,7 +210,20 @@ fn reference_f32_plugins_run_unchanged_behind_the_f64_boundary() {
         let mut y: Vec<f32> = input.iter().map(|v| *v as f32).collect();
         narrow.process_f32(&mut y).unwrap();
         let expected: Vec<f64> = y.iter().map(|v| f64::from(*v)).collect();
-        assert_eq!(x, expected, "{id}: F64 boundary differs from the F32 path");
+        if f64_natif {
+            let ecart = x
+                .iter()
+                .zip(&expected)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f64, f64::max);
+            assert!(
+                ecart <= 1.0 / f64::from(1u32 << 21),
+                "{id}: F64 path {ecart:e} away from the F32 path"
+            );
+            assert_ne!(x, expected, "{id}: requests F64 but rounds to f32");
+        } else {
+            assert_eq!(x, expected, "{id}: F64 boundary differs from the F32 path");
+        }
         assert_ne!(x, input, "{id}: native DSP must actually run");
     }
 }

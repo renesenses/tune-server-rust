@@ -35,3 +35,7 @@ path = "tests/pieces_simulees.rs"
 [[test]]
 name = "positions_simulees"
 path = "tests/positions_simulees.rs"
+
+[[test]]
+name = "fir_simule"
+path = "tests/fir_simule.rs"

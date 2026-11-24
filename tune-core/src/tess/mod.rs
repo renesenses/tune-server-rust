@@ -36,7 +36,11 @@ pub mod greffon;
 pub mod migration;
 pub mod prereglages;
 pub mod quantification;
+/// TESS sur la famille UPnP : voie, réserves par lecteur, motifs (lot T12b).
+pub mod reseau_upnp;
 pub mod resolution;
+#[cfg(test)]
+pub(crate) mod sonde_f32;
 pub mod zones;
 
 pub use api::{RefusTess, ReponseTessZone, schema_json, schema_json_lecture};
@@ -73,6 +77,9 @@ pub const VERSION_CONTRAT: u32 = 1;
 pub fn cle_chaine_zone(zone_id: i64) -> String {
     format!("zone_{zone_id}_tess_chain")
 }
+
+#[cfg(test)]
+mod droits_t19_tests;
 
 #[cfg(test)]
 mod tests {

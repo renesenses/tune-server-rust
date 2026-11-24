@@ -131,6 +131,15 @@ impl Default for PrefetchEngine {
     }
 }
 
+/// #9449 — le tampon que ce mode préparerait pour une piste de `duree_ms`
+/// sera-t-il servi ? En mode « 30 s », seulement si la piste tient dans le
+/// tampon : la règle de [`crate::orchestrator::prefetch_buffer_truncated`],
+/// celle-là même qui l'écarte à la lecture (durée inconnue comprise).
+pub(crate) fn tampon_30s_servable(mode: PrefetchMode, duree_ms: u64) -> bool {
+    mode != PrefetchMode::Buffer30s
+        || !crate::orchestrator::prefetch_buffer_truncated(30_000, duree_ms)
+}
+
 impl PrefetchEngine {
     pub fn new() -> Self {
         Self {
@@ -603,6 +612,25 @@ impl PrefetchEngine {
             PrefetchMode::Off => return,
         };
 
+        // #9449 — en mode « 30 s », le tampon d'une piste plus longue n'est
+        // JAMAIS servi : `resolve_streaming_url` l'écarte pour toutes les
+        // sorties (`prefetch_skip_truncated_serving_full_stream`) et sert le
+        // flux complet. Le préparer quand même coûtait, au début de chaque
+        // morceau, le téléchargement de la piste suivante ENTIÈRE à pleine
+        // vitesse et son décodage complet (le tampon n'est tronqué qu'après),
+        // pendant que la piste courante démarre — sur un Raspberry Pi qui
+        // héberge aussi le renderer (fil 3033). La résolution ci-dessus est
+        // gardée : c'est elle qui prépare le fMP4 DASH de TIDAL (#7247).
+        if !tampon_30s_servable(mode, actual_duration) {
+            info!(
+                source = %source,
+                source_id = %source_id,
+                duration_ms = actual_duration,
+                "prefetch_skip_30s_piste_trop_longue"
+            );
+            return;
+        }
+
         let source_clone = source.clone();
         let source_id_clone = source_id.clone();
 
@@ -948,6 +976,9 @@ pub(crate) async fn resoudre_le_flux_a_precharger(
     Some(flux)
 }
 
+#[cfg(test)]
+#[path = "prefetch_30s_piste_longue_9449_tests.rs"]
+mod prefetch_30s_piste_longue_9449_tests;
 #[cfg(test)]
 #[path = "prefetch_tidal_8215_7266_tests.rs"]
 mod prefetch_tidal_8215_7266_tests;

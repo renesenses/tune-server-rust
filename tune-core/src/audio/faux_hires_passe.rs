@@ -89,13 +89,19 @@ pub fn activer(db: &Arc<dyn DbBackend>, actif: bool) -> Result<(), String> {
 /// changer : voir [`super::faux_hires::cd_a_remesurer_sql`]. Les lignes
 /// `coupure_de_codec` des fichiers hi-res le restent comme avant (#9035).
 /// Une ligne remesurée n'est plus candidate : la boucle ne tourne pas.
+///
+/// #9472 — un hi-res rangé `douteux` sur une coupure sous
+/// [`super::faux_hires::COUPURE_FALAISE_MIN_HZ`] est remesuré aussi : la
+/// mesure actuelle ne range plus de coupure si basse, et une remesure
+/// illisible le range `non_concluant` (voir [`enregistrer`]).
 fn a_remesurer() -> String {
     format!(
         "EXISTS (SELECT 1 FROM hires_verifications h WHERE h.track_id = t.id AND \
          ((h.raison = '{codec}' AND (h.sample_rate > 48000 OR h.bits_declares > 16)) \
-          OR {cd}))",
+          OR {cd} OR {basse}))",
         codec = super::faux_hires::RAISON_HERITEE_CODEC,
         cd = super::faux_hires::cd_a_remesurer_sql("h"),
+        basse = super::faux_hires::coupure_basse_rangee_sql("h"),
     )
 }
 
@@ -273,13 +279,16 @@ pub fn enregistrer(
     // `non_concluant` : l'album ne doit pas basculer de « douteux » à
     // « vérifié » faute d'avoir pu relire un fichier. La ligne n'est plus
     // candidate (pas de boucle de remesure sur un fichier absent).
+    // #9472 — sauf une coupure sous la borne, que la mesure actuelle ne
+    // retient plus : elle suit le cas général (`non_concluant`).
     if resultat.is_err() {
         let gardee = db.execute(
             &format!(
                 "UPDATE hires_verifications SET raison = 'coupure_spectrale' \
-                 WHERE track_id = {} AND raison = '{}'",
+                 WHERE track_id = {} AND raison = '{}' AND NOT {}",
                 ph(e, 1),
-                super::faux_hires::RAISON_HERITEE_CODEC
+                super::faux_hires::RAISON_HERITEE_CODEC,
+                super::faux_hires::coupure_basse_rangee_sql("hires_verifications")
             ),
             &[&track_id as &dyn ToSqlValue],
         )?;

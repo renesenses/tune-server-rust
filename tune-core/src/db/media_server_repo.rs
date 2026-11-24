@@ -127,6 +127,31 @@ pub mod sql {
     }
 }
 
+/// #9336 — la clé de l'instantané (`track_metadata`) où l'indexation UPnP
+/// range l'hôte d'ANNONCE du serveur (celui de sa `LOCATION` SSDP) au moment
+/// de l'indexation. La lecture ne reporte une URL indexée sur l'adresse
+/// actuelle du serveur que si elle pointait sur cet hôte-là : une URL servie
+/// depuis un autre hôte que la description n'est jamais réécrite.
+pub const CLE_HOTE_D_ANNONCE_UPNP: &str = "upnp_hote_d_annonce";
+
+impl ServeurEnregistre {
+    /// L'hôte d'annonce du serveur : la colonne `host`, sinon l'hôte de sa
+    /// `LOCATION`. `None` quand ni l'un ni l'autre ne se lit.
+    pub fn hote_d_annonce(&self) -> Option<String> {
+        self.host
+            .as_deref()
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                reqwest::Url::parse(self.location.trim())
+                    .ok()?
+                    .host_str()
+                    .map(str::to_string)
+            })
+    }
+}
+
 /// Une ligne du registre, telle qu'elle est relue.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServeurEnregistre {
@@ -294,6 +319,15 @@ impl MediaServerRepo {
             .iter()
             .filter_map(|cols| ligne_vers_serveur(cols))
             .collect())
+    }
+
+    /// #9336 — l'hôte d'annonce que le registre connaît pour `udn`.
+    pub fn hote_d_annonce(&self, udn: &str) -> Option<String> {
+        self.lister()
+            .ok()?
+            .into_iter()
+            .find(|s| s.udn == udn)
+            .and_then(|s| s.hote_d_annonce())
     }
 
     pub fn compter(&self) -> Result<i64, String> {

@@ -228,63 +228,102 @@ impl DsfDepuisDst {
         rendre: &mut dyn FnMut(Vec<u8>) -> Result<(), String>,
     ) -> Result<(), String> {
         let c = usize::from(self.canaux);
-        let super_bloc = (BLOC_DSF * c) as u64;
-        let premier_bloc = d0 / super_bloc;
-        let mut source = SourceDsdMsb::ouvrir(&self.chemin, c, premier_bloc * BLOC_DSF as u64)?;
-        // Position (dans les données) du super-bloc courant, et position PAR
-        // CANAL de son premier octet.
-        let mut pos = premier_bloc * super_bloc;
-        let mut par_canal = premier_bloc * BLOC_DSF as u64;
-        let mut en_attente: Vec<u8> = Vec::new();
-        let mut silence_rendu = false;
-        while pos < d1 {
-            // Octets utiles de ce bloc, par canal (le dernier est partiel).
-            let utiles = self
-                .octets_par_canal
-                .saturating_sub(par_canal)
-                .min(BLOC_DSF as u64) as usize;
-            while en_attente.len() < utiles * c {
-                match source.suivant()? {
-                    Some(m) => en_attente.extend_from_slice(&m),
-                    None => break,
-                }
-            }
-            let disponibles = (en_attente.len() / c).min(utiles);
-            if disponibles < utiles && !silence_rendu {
+        rendre_les_blocs_dsf(
+            c,
+            self.octets_par_canal,
+            d0,
+            d1,
+            |depart| {
+                let mut source = SourceDsdMsb::ouvrir(&self.chemin, c, depart)?;
+                Ok(move || source.suivant())
+            },
+            |atteint| {
                 // Le fichier porte moins de trames que FRTE n'en annonce :
                 // la taille promise au renderer est tenue par du silence.
-                silence_rendu = true;
                 tracing::warn!(
                     fichier = %self.chemin,
-                    octet_par_canal = par_canal + disponibles as u64,
+                    octet_par_canal = atteint,
                     attendus = self.octets_par_canal,
                     "dsf_depuis_dst_trames_manquantes_completees_en_silence"
                 );
-            }
-            let mut bloc = vec![0u8; BLOC_DSF * c];
-            for i in 0..utiles {
-                for canal in 0..c {
-                    let msb = if i < disponibles {
-                        en_attente[i * c + canal]
-                    } else {
-                        dff::SILENCE_DSD
-                    };
-                    bloc[canal * BLOC_DSF + i] = msb.reverse_bits();
-                }
-            }
-            en_attente.drain(..disponibles * c);
-            let a = d0.saturating_sub(pos) as usize;
-            let b = (d1 - pos).min(super_bloc) as usize;
-            bloc.truncate(b);
-            if a > 0 {
-                bloc.drain(..a);
-            }
-            rendre(bloc)?;
-            pos += super_bloc;
-            par_canal += BLOC_DSF as u64;
-        }
-        Ok(())
+            },
+            rendre,
+        )
     }
+}
+
+/// Les octets `[d0, d1)` du bloc de données d'un DSF virtuel de `canaux`
+/// voies et `octets_par_canal` octets DSD par voie, tirés d'une source de DSD
+/// MSB-first entrelacé octet par octet (forme DSDIFF).
+///
+/// `ouvrir(depart)` rend la source calée sur l'octet `depart` PAR CANAL
+/// (toujours un début de bloc DSF) ; elle rend ses morceaux jusqu'à `None`.
+/// Chaque octet est inversé bit à bit (DSF : LSB-first) et rangé dans son
+/// bloc de 4 096 octets par canal. Une source plus courte que promis est
+/// complétée de silence DSD, et `manque` reçoit, une seule fois, la position
+/// par canal où elle s'est tarie. Partagé par le DST (#6221) et la tranche
+/// d'ISO SACD (#9184).
+pub(crate) fn rendre_les_blocs_dsf<S>(
+    c: usize,
+    octets_par_canal: u64,
+    d0: u64,
+    d1: u64,
+    ouvrir: impl FnOnce(u64) -> Result<S, String>,
+    manque: impl FnOnce(u64),
+    rendre: &mut dyn FnMut(Vec<u8>) -> Result<(), String>,
+) -> Result<(), String>
+where
+    S: FnMut() -> Result<Option<Vec<u8>>, String>,
+{
+    let super_bloc = (BLOC_DSF * c) as u64;
+    let premier_bloc = d0 / super_bloc;
+    let mut suivant = ouvrir(premier_bloc * BLOC_DSF as u64)?;
+    let mut manque = Some(manque);
+    // Position (dans les données) du super-bloc courant, et position PAR
+    // CANAL de son premier octet.
+    let mut pos = premier_bloc * super_bloc;
+    let mut par_canal = premier_bloc * BLOC_DSF as u64;
+    let mut en_attente: Vec<u8> = Vec::new();
+    while pos < d1 {
+        // Octets utiles de ce bloc, par canal (le dernier est partiel).
+        let utiles = octets_par_canal
+            .saturating_sub(par_canal)
+            .min(BLOC_DSF as u64) as usize;
+        while en_attente.len() < utiles * c {
+            match suivant()? {
+                Some(m) => en_attente.extend_from_slice(&m),
+                None => break,
+            }
+        }
+        let disponibles = (en_attente.len() / c).min(utiles);
+        if disponibles < utiles
+            && let Some(signaler) = manque.take()
+        {
+            signaler(par_canal + disponibles as u64);
+        }
+        let mut bloc = vec![0u8; BLOC_DSF * c];
+        for i in 0..utiles {
+            for canal in 0..c {
+                let msb = if i < disponibles {
+                    en_attente[i * c + canal]
+                } else {
+                    dff::SILENCE_DSD
+                };
+                bloc[canal * BLOC_DSF + i] = msb.reverse_bits();
+            }
+        }
+        en_attente.drain(..disponibles * c);
+        let a = d0.saturating_sub(pos) as usize;
+        let b = (d1 - pos).min(super_bloc) as usize;
+        bloc.truncate(b);
+        if a > 0 {
+            bloc.drain(..a);
+        }
+        rendre(bloc)?;
+        pos += super_bloc;
+        par_canal += BLOC_DSF as u64;
+    }
+    Ok(())
 }
 
 impl crate::http::streamer::SourceVirtuelle for DsfDepuisDst {

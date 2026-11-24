@@ -175,6 +175,7 @@ quick-xml = { workspace = true }
 mdns-sd = { workspace = true }
 urlencoding = { workspace = true }
 sha2 = { workspace = true }
+subtle = { workspace = true }
 # Verifies minisign signatures over release checksums (self-update, audit
 # item 8). Pure-Rust, no libsodium — verify-only, the trusted key is embedded.
 minisign-verify = "0.2"
@@ -299,6 +300,19 @@ path = "tests/pont_administration.rs"
 [[test]]
 name = "relais_routes_relayables"
 path = "tests/relais_routes_relayables.rs"
+
+# #9174 — la provenance du lecteur d'une zone navigateur (relais ou local).
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "relais_format_compresse_9174"
+path = "tests/relais_format_compresse_9174.rs"
+
+# Garde de la couche d'authentification (routes privilégiées, profil
+# `default`, premier lancement). `autotests = false` plus haut : sans cette
+# cible, jamais compilé.
+[[test]]
+name = "auth_security"
+path = "tests/auth_security.rs"
 
 # #3326 — le mode de transition (un `client/hello` en clair). `autotests =
 # false` plus haut : sans cette cible, le fichier ne serait JAMAIS compilé, et
@@ -1264,6 +1278,10 @@ path = "tests/bibliotheque_rest_ordre_alphabetique_4956.rs"
 name = "repertoires_ordre_alphabetique_5582"
 path = "tests/repertoires_ordre_alphabetique_5582.rs"
 
+[[test]]
+name = "bridge_cle_api_9413"
+path = "tests/bridge_cle_api_9413.rs"
+
 # #4260 — `/library/artwork/proxy` n'est plus un relais ouvert (SSRF) : URL
 # signées pour ce que la DIDL publie (#4061), liste d'hôtes pour le reste,
 # refus des adresses internes APRÈS résolution DNS, redirections à la main.
@@ -1324,6 +1342,11 @@ path = "tests/web_response_contracts.rs"
 [[test]]
 name = "indexation_upnp_2219"
 path = "tests/indexation_upnp_2219.rs"
+
+# Fil du forum 3028 : Tune ne s'indexe pas lui-même (UDN et adresses locales).
+[[test]]
+name = "auto_indexation_upnp_3028"
+path = "tests/auto_indexation_upnp_3028.rs"
 
 [[test]]
 name = "refus_oaat_upnp_2219"
@@ -1537,6 +1560,17 @@ path = "tests/tess_migration_routes_t02.rs"
 [[test]]
 name = "tess_api_routes_t08"
 path = "tests/tess_api_routes_t08.rs"
+
+# TESS T09a — import d'un jeu de convolution (.zip de RI, .cfg Convolver),
+# archive piégée refusée sans toucher au jeu en place.
+[[test]]
+name = "import_convolution_t09a"
+path = "tests/import_convolution_t09a.rs"
+
+# TESS T17 — préréglages de chaîne globaux et mode d'application.
+[[test]]
+name = "tess_prereglages_routes_t17"
+path = "tests/tess_prereglages_routes_t17.rs"
 
 # #4602 — le scan complet rend les mêmes comptes à chaque passe, sur SQLite
 # et sur PostgreSQL (`TUNE_TEST_PG_URL`). `autotests = false` plus haut : sans

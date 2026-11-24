@@ -674,3 +674,65 @@ fn un_mur_de_codec_range_entre_20_et_20_5_khz_est_remesure_9067() {
     assert_eq!(r[0].as_string().as_deref(), Some("conforme"));
     assert_eq!(r[1].as_string().as_deref(), Some("coupure_sans_mur"));
 }
+
+/// #9472 — une ligne hi-res rangée `douteux` sur une coupure sous la borne
+/// (mesurée avant #9472, « coupé net vers 1,4 kHz ») se lit `non_concluant`
+/// (rien d'affiché) et redevient candidate ; une coupure à 16 kHz n'est pas
+/// touchée. Remesurée, lisible ou non, elle n'est plus candidate.
+#[test]
+fn une_coupure_basse_rangee_est_remesuree_9472() {
+    let db = base();
+    for id in 1..=3 {
+        piste(&db, id, &format!("/m/a/{id}.flac"), "flac", "local");
+    }
+    for (id, raison, coupure) in [
+        (1i64, "coupure_spectrale", 1_400.0f64),
+        (2, "coupure_spectrale", 16_000.0),
+        (3, "coupure_de_codec", 1_043.0),
+    ] {
+        let raison = raison.to_string();
+        db.execute(
+            "INSERT INTO hires_verifications (track_id, verdict, raison, coupure_hz, bits_effectifs, sample_rate, bits_declares) \
+             VALUES (?1, 'douteux', ?2, ?3, 24, 96000, 24)",
+            &[&id as &dyn ToSqlValue, &raison, &coupure],
+        )
+        .unwrap();
+    }
+    let effectif = |id: i64| {
+        db.query_one(
+            &format!(
+                "SELECT {} FROM hires_verifications hv WHERE hv.track_id = {id}",
+                crate::audio::faux_hires::verdict_effectif_sql("hv")
+            ),
+            &[],
+        )
+        .unwrap()
+        .unwrap()[0]
+            .as_string()
+    };
+    assert_eq!(effectif(1).as_deref(), Some("non_concluant"));
+    assert_eq!(effectif(2).as_deref(), Some("douteux"));
+    assert_eq!(effectif(3).as_deref(), Some("non_concluant"));
+    let ids: Vec<i64> = prochains_candidats(&db, 10)
+        .iter()
+        .map(|c| c.track_id)
+        .collect();
+    assert_eq!(
+        ids,
+        vec![1, 3],
+        "les deux coupures basses, pas celle à 16 kHz"
+    );
+    let verifie = Mesure {
+        sample_rate: 96_000,
+        bits_declares: 24,
+        bits_effectifs: Some(24),
+        fenetres_jugees: 10,
+        ..Default::default()
+    };
+    enregistrer(&db, 1, &Ok(verifie)).unwrap();
+    // Illisible : pas de `coupure_spectrale` gardée, le cas général.
+    enregistrer(&db, 3, &Err("fichier injoignable".into())).unwrap();
+    assert_eq!(compter_les_candidats(&db), 0);
+    assert_eq!(effectif(1).as_deref(), Some("verifie"));
+    assert_eq!(effectif(3).as_deref(), Some("non_concluant"));
+}

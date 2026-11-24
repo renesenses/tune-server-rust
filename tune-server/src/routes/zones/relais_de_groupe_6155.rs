@@ -828,6 +828,18 @@ pub async fn deplacer_les_suiveuses(
     }
 }
 
+/// Fil 2757 — [`deplacer_les_suiveuses`] détaché, pour un déplacement de la
+/// meneuse qui ne passe pas par la route `seek` : la relance de la piste par
+/// « Précédent ». La demande est numérotée ICI, à l'appel, comme dans la
+/// route `seek` (relecture de #8254) ; la réponse n'attend pas les suiveuses.
+pub(crate) fn deplacer_les_suiveuses_en_fond(state: &AppState, meneuse: i64, position_ms: u64) {
+    let demande = state.deplacements_de_groupe.nouvelle_demande(meneuse);
+    let state = state.clone();
+    tokio::spawn(async move {
+        deplacer_les_suiveuses(&state, meneuse, position_ms, demande).await;
+    });
+}
+
 /// Lance le relais : une tâche qui écoute le canal de lecture et aligne les
 /// suiveuses après chaque geste d'une meneuse. Appelé une fois au démarrage
 /// (`background.rs`).

@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::{info, warn};
 use tune_core::playback::NowPlaying;
+use tune_core::streaming::episodes_indisponibles;
 use tune_core::streaming::podcast_annuaires::RelaisPodcastIndex;
 use tune_core::streaming::podcast_par_adresse::{self, EchecAjoutParAdresse};
 use tune_core::streaming::podcasts::{EchecResolution, PodcastService};
@@ -106,8 +107,15 @@ fn pays_d_une_etiquette(etiquette: &str) -> Option<String> {
     if langue.is_empty() || langue == "c" || langue == "posix" {
         return None;
     }
-    if let Some(region) = morceaux.find_map(code_pays) {
+    let suite: Vec<&str> = morceaux.collect();
+    if let Some(region) = suite.iter().copied().find_map(code_pays) {
         return Some(region);
+    }
+    // `zh-Hant` sans région (la langue de l'interface, rc14) : le chinois
+    // traditionnel, Taïwan par défaut (sous-étiquette probable du CLDR), et
+    // non la Chine continentale du simple `zh`.
+    if langue == "zh" && suite.iter().any(|m| m.eq_ignore_ascii_case("hant")) {
+        return Some("tw".to_string());
     }
     pays_de_la_langue(&langue).map(str::to_string)
 }
@@ -802,9 +810,10 @@ async fn episodes_by_feed_url(
     match svc.get_feed(&feed_url, q.limit).await {
         Ok(flux) => {
             suivre_image_du_flux(&state, &feed_url, &flux.image_url);
-            let episodes = flux.episodes;
+            let count = flux.episodes.len();
+            let episodes = episodes_annotes(&flux.episodes);
             Ok(Json(
-                json!({"feed_url": feed_url, "count": episodes.len(), "episodes": episodes}),
+                json!({"feed_url": feed_url, "count": count, "episodes": episodes}),
             ))
         }
         Err(e) => {
@@ -823,10 +832,11 @@ async fn podcast_episodes(
         return match svc.get_feed(feed_url, q.limit).await {
             Ok(flux) => {
                 suivre_image_du_flux(&state, feed_url, &flux.image_url);
-                let episodes = flux.episodes;
-                Ok(Json(json!({"podcast_id": podcast_id, "feed_url": feed_url, "count": episodes.len(), "episodes": episodes})).into_response())
+                let count = flux.episodes.len();
+                let episodes = episodes_annotes(&flux.episodes);
+                Ok(Json(json!({"podcast_id": podcast_id, "feed_url": feed_url, "count": count, "episodes": episodes})).into_response())
             }
-            Err(e) => Ok(Json(json!({"podcast_id": podcast_id, "error": e})).into_response()),
+            Err(e) => Err(flux_en_echec(feed_url, e)),
         };
     }
     let feed_url = {
@@ -861,14 +871,40 @@ async fn podcast_episodes(
     match svc.get_feed(&feed_url, q.limit).await {
         Ok(flux) => {
             suivre_image_du_flux(&state, &feed_url, &flux.image_url);
-            let episodes = flux.episodes;
-            let count = episodes.len();
+            let count = flux.episodes.len();
+            let episodes = episodes_annotes(&flux.episodes);
             Ok(Json(json!({"podcast_id": podcast_id, "feed_url": feed_url, "count": count, "episodes": episodes})).into_response())
         }
-        Err(e) => Ok(
-            Json(json!({"podcast_id": podcast_id, "feed_url": feed_url, "error": e}))
-                .into_response(),
-        ),
+        Err(e) => Err(flux_en_echec(&feed_url, e)),
+    }
+}
+
+/// Fil 2972 — la liste d'épisodes, chacun avec `unavailable` : `true` si
+/// l'éditeur a refusé son fichier (404/410) lors d'un clic récent. Aucune
+/// requête n'est faite ici : seul le registre en mémoire est lu.
+fn episodes_annotes<T: serde::Serialize>(episodes: &[T]) -> Value {
+    let mut v = serde_json::to_value(episodes).unwrap_or_else(|_| json!([]));
+    episodes_indisponibles::annoter(&mut v);
+    v
+}
+
+/// #9317 — code stable d'un flux d'épisodes que l'éditeur n'a pas rendu.
+pub(super) const CODE_FLUX_EN_ECHEC: &str = "podcast_episodes_indisponibles";
+
+/// #9317 — le flux RSS de l'éditeur n'a pas répondu (404, 5xx, réseau) :
+/// c'est l'amont qui échoue, la route le dit par un 502 et le corps habituel
+/// `{error, code}`. Elle répondait 200 `{error}` : le client web, qui lit
+/// `data.episodes || data`, avalait l'erreur et affichait « Aucun épisode ».
+fn flux_en_echec(feed_url: &str, e: String) -> AppError {
+    warn!(
+        feed_url = %tune_core::confidentialite::masquer_url(feed_url),
+        error = %e,
+        "podcast_episodes_fetch_failed"
+    );
+    AppError {
+        status: StatusCode::BAD_GATEWAY,
+        message: e,
+        code: Some(CODE_FLUX_EN_ECHEC.into()),
     }
 }
 /// #7717 — un épisode lancé sur une zone est un lancement.
@@ -929,18 +965,66 @@ pub(super) async fn play_episode(
     let navigateur = zone
         .as_ref()
         .is_some_and(|z| z.output_type.as_deref() == Some("browser"));
+    let zone_existe = zone.is_some();
     let device_id = zone.and_then(|z| z.output_device_id);
-    let reseau = match device_id.as_deref() {
-        Some(did) => match { state.outputs.lock().await.get(did) } {
-            Some(arc) => tune_core::orchestrator::is_network_output_type(Some(
-                arc.lock().await.output_type(),
-            )),
-            None => false,
-        },
+    let output_arc = match device_id.as_deref() {
+        Some(did) => {
+            let outputs = state.outputs.lock().await;
+            outputs.get(did)
+        }
+        None => None,
+    };
+    let reseau = match output_arc.as_ref() {
+        Some(arc) => {
+            tune_core::orchestrator::is_network_output_type(Some(arc.lock().await.output_type()))
+        }
         None => false,
     };
-    let (mime_type, origine_du_type) =
-        type_de_l_episode(&state, body.mime_type.as_deref(), &body.audio_url, reseau).await;
+    // Fil 2972 — le fichier existe-t-il encore chez l'éditeur ? Une seule
+    // question, au clic, bornée, et seulement si quelqu'un va réellement le
+    // chercher (voir `le_fichier_sera_demande`) : une zone inconnue ou sans
+    // sortie découverte ne coûte aucune requête à l'éditeur. Un 404/410
+    // arrête tout ici, sans rien envoyer à la sortie ni relancer, et marque
+    // l'épisode pour les listes.
+    let sonde = if le_fichier_sera_demande(zone_existe, navigateur, output_arc.is_some()) {
+        sonder_l_episode(&state.http_client, &body.audio_url).await
+    } else {
+        SondeDeLEpisode::default()
+    };
+    if let Some(statut) = sonde.introuvable {
+        episodes_indisponibles::marquer(&body.audio_url, statut);
+        warn!(
+            zone_id,
+            title,
+            podcast = podcast_name,
+            statut,
+            "podcast_episode_indisponible"
+        );
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "zone_id": zone_id,
+                "title": title,
+                "podcast": podcast_name,
+                "audio_url": body.audio_url,
+                "output_sent": false,
+                "error": format!("Episode unavailable at the publisher (HTTP {statut})"),
+                "code": episodes_indisponibles::CODE_EPISODE_INDISPONIBLE,
+                "params": {"status": statut, "title": title},
+                "unavailable": true,
+            })),
+        );
+    }
+    if sonde.trouve {
+        // L'éditeur sert de nouveau le fichier : la marque ne vaut plus.
+        episodes_indisponibles::oublier(&body.audio_url);
+    }
+    let (mime_type, origine_du_type) = type_de_l_episode(
+        body.mime_type.as_deref(),
+        &body.audio_url,
+        reseau,
+        sonde.type_audio,
+    );
     info!(
         zone_id,
         mime_type = %mime_type,
@@ -957,13 +1041,6 @@ pub(super) async fn play_episode(
         body.cover_url.as_deref(),
         body.podcast_name.as_deref(),
     );
-    let output_arc = match device_id.as_deref() {
-        Some(did) => {
-            let outputs = state.outputs.lock().await;
-            outputs.get(did)
-        }
-        None => None,
-    };
     // #6468 — un renderer réseau (DLNA, OpenHome…) reçoit l'épisode par le
     // mandataire de Tune, en `http://`, comme les radios et les services :
     // beaucoup de renderers DLNA n'ouvrent pas le HTTPS d'un hébergeur de
@@ -1472,7 +1549,7 @@ async fn rf_episodes(
     let api = RadioFranceApi::with_client(state.http_client.clone(), api_key);
     match api.get_episodes(&q.show_url, q.limit as u32).await {
         Ok(episodes) => Ok(Json(
-            json!({"show_url": q.show_url, "count": episodes.len(), "episodes": episodes}),
+            json!({"show_url": q.show_url, "count": episodes.len(), "episodes": episodes_annotes(&episodes)}),
         )
         .into_response()),
         Err(e) => {
@@ -1528,7 +1605,7 @@ fn normaliser_type_audio(declare: &str) -> Option<String> {
 }
 
 /// Délai borné de la question posée à l'hébergeur : elle retarde le départ.
-const DELAI_TYPE_DE_L_HEBERGEUR: std::time::Duration = std::time::Duration::from_secs(3);
+const DELAI_DE_LA_SONDE: std::time::Duration = std::time::Duration::from_secs(3);
 
 /// #7894 — le type de l'épisode à annoncer à la sortie, et d'où il vient.
 ///
@@ -1539,14 +1616,14 @@ const DELAI_TYPE_DE_L_HEBERGEUR: std::time::Duration = std::time::Duration::from
 /// lâche une URI dont le type annoncé ne correspond pas. Ordre retenu :
 /// 1. le type que le flux déclare (`enclosure@type`), passé par le client ;
 /// 2. l'extension de l'adresse ;
-/// 3. pour un appareil réseau, le `Content-Type` que l'hébergeur rend, demandé
-///    une fois avec un délai borné ;
+/// 3. pour un appareil réseau, le `Content-Type` que l'hébergeur a rendu à
+///    la sonde du clic ([`sonder_l_episode`]) ;
 /// 4. `audio/mpeg`, comme avant.
-async fn type_de_l_episode(
-    state: &AppState,
+fn type_de_l_episode(
     declare: Option<&str>,
     url: &str,
     reseau: bool,
+    type_de_l_hebergeur: Option<String>,
 ) -> (String, &'static str) {
     if let Some(t) = declare.and_then(normaliser_type_audio) {
         return (t, "flux");
@@ -1554,55 +1631,78 @@ async fn type_de_l_episode(
     if let Some(t) = mime_par_extension(url) {
         return (t.to_string(), "extension");
     }
-    if reseau && let Some(t) = type_de_l_hebergeur(&state.http_client, url).await {
+    if reseau && let Some(t) = type_de_l_hebergeur {
         return (t, "hebergeur");
     }
     // Ni le flux, ni l'adresse, ni l'hébergeur : le repli d'avant.
     (guess_audio_mime(url).to_string(), "defaut")
 }
 
-/// Le `Content-Type` audio que l'hébergeur rend pour `url` : un `HEAD`, puis
-/// un `GET` du premier octet si le `HEAD` est refusé. `None` sur échec, délai
-/// dépassé ou type qui n'est pas de l'audio.
-async fn type_de_l_hebergeur(client: &reqwest::Client, url: &str) -> Option<String> {
-    // Un seul budget pour les deux questions : un hébergeur qui ne répond pas
-    // retarde le départ de 3 s, pas de 3 s par requête.
-    match tokio::time::timeout(DELAI_TYPE_DE_L_HEBERGEUR, demander_le_type(client, url)).await {
-        Ok(t) => t,
-        Err(_) => {
-            warn!(url = %tune_core::confidentialite::masquer_url(&url), "podcast_type_hebergeur_delai_depasse");
-            None
-        }
-    }
+/// Fil 2972 — le fichier de l'épisode sera-t-il demandé à l'éditeur si le
+/// lancement continue ? C'est la condition de la sonde du clic : sans elle,
+/// une zone inconnue ou sans sortie déclenchait une requête pour rien.
+///
+/// - zone inconnue : non, rien ne jouera ;
+/// - zone navigateur : oui, le serveur relaie toujours l'épisode au
+///   navigateur par une session Tune (`/stream/…`, `resolve_direct_url`,
+///   témoin `reprise_navigateur_7354_tests`) ;
+/// - sinon, seulement si la sortie de la zone est découverte : un renderer
+///   réseau le reçoit par le mandataire, une sortie locale l'ouvre
+///   elle-même ; sans sortie, la route répond 503 sans rien jouer.
+fn le_fichier_sera_demande(zone_existe: bool, navigateur: bool, sortie_presente: bool) -> bool {
+    zone_existe && (navigateur || sortie_presente)
 }
 
-async fn demander_le_type(client: &reqwest::Client, url: &str) -> Option<String> {
-    let lire = |r: reqwest::Response| {
-        r.status()
-            .is_success()
-            .then(|| {
-                r.headers()
-                    .get(reqwest::header::CONTENT_TYPE)
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(normaliser_type_audio)
-            })
-            .flatten()
-    };
-    if let Ok(r) = client.head(url).send().await
-        && let Some(t) = lire(r)
-    {
-        return Some(t);
-    }
-    match client
+/// Ce que la sonde du clic a appris de l'hébergeur.
+#[derive(Debug, Default)]
+struct SondeDeLEpisode {
+    /// Fil 2972 — 404/410 : le fichier n'existe plus chez l'éditeur.
+    introuvable: Option<u16>,
+    /// L'hébergeur a servi le fichier (2xx).
+    trouve: bool,
+    /// #7894 — le `Content-Type` audio servi, s'il en est un.
+    type_audio: Option<String>,
+}
+
+/// Une seule question à l'hébergeur, au clic : `GET` du premier octet, avec
+/// un délai borné (une `HEAD` est trop souvent refusée ou mal servie pour
+/// conclure « introuvable »). Un délai dépassé ou une panne réseau ne
+/// concluent rien : la lecture part comme avant, et le mandataire (#9315)
+/// rattrape un refus tardif.
+async fn sonder_l_episode(client: &reqwest::Client, url: &str) -> SondeDeLEpisode {
+    let question = client
         .get(url)
         .header(reqwest::header::RANGE, "bytes=0-0")
-        .send()
-        .await
-    {
-        Ok(r) => lire(r),
-        Err(e) => {
-            warn!(error = %e, "podcast_type_hebergeur_illisible");
-            None
+        .send();
+    match tokio::time::timeout(DELAI_DE_LA_SONDE, question).await {
+        Ok(Ok(r)) => {
+            let statut = r.status();
+            if episodes_indisponibles::statut_introuvable(statut.as_u16()) {
+                return SondeDeLEpisode {
+                    introuvable: Some(statut.as_u16()),
+                    ..Default::default()
+                };
+            }
+            if !statut.is_success() {
+                return SondeDeLEpisode::default();
+            }
+            SondeDeLEpisode {
+                introuvable: None,
+                trouve: true,
+                type_audio: r
+                    .headers()
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(normaliser_type_audio),
+            }
+        }
+        Ok(Err(e)) => {
+            warn!(error = %e, "podcast_sonde_hebergeur_illisible");
+            SondeDeLEpisode::default()
+        }
+        Err(_) => {
+            warn!(url = %tune_core::confidentialite::masquer_url(url), "podcast_sonde_hebergeur_delai_depasse");
+            SondeDeLEpisode::default()
         }
     }
 }
@@ -1667,6 +1767,10 @@ mod tests {
         // Une langue sans région : son pays par défaut ; le poids q compte.
         assert_eq!(p(None, None, Some("en;q=0.2, sv;q=0.9"), None).0, "se");
         assert_eq!(p(None, None, Some("zh-Hant-TW"), None).0, "tw");
+        // `zh-Hant` seul (la langue de l'interface, rc14) : Taïwan, pas la Chine.
+        assert_eq!(p(None, None, Some("zh-Hant"), None).0, "tw");
+        assert_eq!(p(None, None, Some("zh-Hant-HK"), None).0, "hk");
+        assert_eq!(p(None, None, Some("zh"), None).0, "cn");
         assert_eq!(
             p(None, None, None, Some("fr_FR.UTF-8")),
             ("fr".into(), OriginePaysPodcasts::Systeme)
@@ -1725,6 +1829,12 @@ mod historique_7965_tests;
 #[cfg(test)]
 #[path = "podcasts/adresses_de_la_selection_6925_tests.rs"]
 mod adresses_de_la_selection_6925_tests;
+#[cfg(test)]
+#[path = "podcasts/episode_indisponible_2972_tests.rs"]
+mod episode_indisponible_2972_tests;
+#[cfg(test)]
+#[path = "podcasts/episodes_en_echec_9317_tests.rs"]
+mod episodes_en_echec_9317_tests;
 #[cfg(test)]
 #[path = "podcasts/positions_des_episodes_8170_tests.rs"]
 mod positions_des_episodes_8170_tests;
