@@ -25,6 +25,39 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  catalogue:
+    name: Garde du catalogue
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Vérifier les occurrences publiques relues
+        env:
+          CATALOGUE_HMAC_KEY: ${{ secrets.CATALOGUE_HMAC_KEY }}
+        run: |
+          dossier="$(mktemp -d "$RUNNER_TEMP/catalogue.XXXXXX")"
+          mkdir "$dossier/catalogue"
+          cp scripts/verifier-catalogue.py "$dossier/"
+          cp scripts/catalogue/{confusables.json,occurrences-relues.json,canari.sha256} "$dossier/catalogue/"
+          (
+            cd "$dossier"
+            sha256sum --check --strict --status <<'EMPREINTES'
+          90f924445eccaf638af56c2d37cf7006e1d8650abdc82cae1e7f41bf0781579d  verifier-catalogue.py
+          75c83cc88101b4b96c482459b6373ddcfad1d2f743e082ce95100e25faf210fc  catalogue/confusables.json
+          cdb4e32ce2ef86d3da1c1a66c47f8f5dd5a4934df07b4f734e716ec81b19355c  catalogue/occurrences-relues.json
+          e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  catalogue/canari.sha256
+          EMPREINTES
+          )
+          python3 -I "$dossier/verifier-catalogue.py"
+      - name: Éprouver les règles sur un catalogue fictif
+        if: always()
+        run: python3 -I scripts/test-verifier-catalogue.py
+
   # Une PR qui ne touche que la documentation ou les garde-fous GitHub ne
   # gagne rien a compiler Rust sur Linux, macOS et Windows. #2428 l'a mesure :
   # 29 min 44 de runners et 9 min 38 de mur pour deux fichiers shell/YAML.
@@ -54,18 +87,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Vérifier le catalogue avec la garde relue
-        env:
-          CATALOGUE_HMAC_KEY: ${{ secrets.CATALOGUE_HMAC_KEY }}
-        run: |
-          garde="$RUNNER_TEMP/verifier-catalogue.py"
-          cp scripts/verifier-catalogue.py "$garde"
-          echo "5a41b9523c429252ebc6f5c57c37b2e4e9f3e2bcbd66c1be825ad1b7d10eda11  $garde" | sha256sum --check --status
-          python3 -I -c 'import hmac, os; key = os.environ["CATALOGUE_HMAC_KEY"].encode(); print("Canari catalogue", hmac.digest(key, b"tune-canari", "sha256").hex()) if key else None'
-          python3 -I "$garde"
-      - name: Éprouver les règles sur un catalogue fictif
-        run: python3 scripts/test-verifier-catalogue.py
-
       - name: Vérifier les payloads de promotion (200 Kio, aucun réseau)
         run: python3 scripts/test-promotion-payloads-8902.py
 
