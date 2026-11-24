@@ -52,7 +52,7 @@ RUN cargo install cargo-about --version 0.9.3 --locked && \
 # touch a placeholder so a local build still succeeds (AirPlay 2 then falls back
 # to legacy AirPlay 1). The release path (Dockerfile.dist) requires it.
 RUN cargo install --git https://github.com/renesenses/airplay2-rs \
-      --rev 2ae92906c2110977905726caf66c32411f3bc3d9 airplay-daemon --locked \
+      --rev 6961b4fc28cf43749aa9796b396fde9192d76801 airplay-daemon --locked \
     || touch /usr/local/cargo/bin/airplay-daemon
 
 # Build real source — clean dummy artifacts to force recompilation
@@ -173,8 +173,11 @@ EXPOSE 8888
 
 VOLUME ["/data", "/music"]
 
+# /system/health, pas /system/stats : la sonde ne porte pas de jeton, et seule
+# une route de la liste publique de tune-server/src/auth.rs (est_route_publique)
+# répond quand l'authentification est active. Épreuve : auth_sondes_docker_tests.rs.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -sf http://localhost:8888/api/v1/system/stats || exit 1
+    CMD curl -sf http://localhost:8888/api/v1/system/health || exit 1
 
 # No `USER tune`: the entrypoint starts as root only to drop to `tune`
 # (uid/gid 1000) at once — or, when PUID/PGID are given, to re-number `tune`

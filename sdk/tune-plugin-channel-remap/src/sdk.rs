@@ -37,10 +37,8 @@ impl DspFactory for ChannelRemap {
         // Un `AudioBlock` garde son format : le processeur ne peut pas changer
         // le nombre de canaux. N → M est fait par l'hôte, avec la même
         // `Matrice`, à l'adaptation source → périphérique.
-        if m.entrees() != m.sorties()
-            || format.channels() != m.entrees()
-            || format.encoding() == SampleEncoding::F64
-        {
+        // TESS T06 — `F64` accepté (le manifeste demande `audio-f64`).
+        if m.entrees() != m.sorties() || format.channels() != m.entrees() {
             return Err(Error::UnsupportedFormat);
         }
         if max_frames == 0 || max_frames > 4 * 1024 * 1024 {
@@ -52,6 +50,7 @@ impl DspFactory for ChannelRemap {
             format,
             max_frames,
             trame_f32: vec![0.0; n],
+            trame_f64: vec![0.0; n],
             trame_i32: vec![0; n],
             trame_i16: vec![0; n],
             trame_s24: vec![[0; 3]; n],
@@ -64,6 +63,7 @@ struct Instance {
     format: AudioFormat,
     max_frames: usize,
     trame_f32: Vec<f32>,
+    trame_f64: Vec<f64>,
     trame_i32: Vec<i32>,
     trame_i16: Vec<i16>,
     trame_s24: Vec<[u8; 3]>,
@@ -128,7 +128,15 @@ impl Processor for Instance {
                     m.appliquer_trame(&self.trame_s24, echantillons, [0; 3], s24, vers_s24);
                 }
             }
-            SamplesMut::F64(_) => return Err(Error::UnsupportedFormat),
+            SamplesMut::F64(s) => {
+                if s.iter().any(|x| !x.is_finite()) {
+                    return Err(Error::NonFinite);
+                }
+                for trame in s.chunks_exact_mut(n) {
+                    self.trame_f64.copy_from_slice(trame);
+                    m.appliquer_trame(&self.trame_f64, trame, 0.0, |v| v, |v| v);
+                }
+            }
         }
         Ok(ProcessReport {
             changed: true,

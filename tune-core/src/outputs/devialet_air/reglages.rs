@@ -282,9 +282,13 @@ pub const FREQUENCE_MAX_AIR: u32 = 192_000;
 /// 19/10, inchangée).
 pub const FREQUENCE_MAX_SANS_PERTE: u32 = 96_000;
 
-/// #8920 — les seuls modes DSD d'une zone Devialet AIR : DSD64 en DoP, ou
-/// conversion en PCM.
-pub const MODES_DSD_AIR: [&str; 2] = ["dop", "pcm"];
+/// #8920 — les seuls modes DSD d'une zone Devialet AIR : la conversion en PCM.
+///
+/// TESS T12c (décision du 17/11) : le DoP est DÉBRANCHÉ jusqu'à un essai sur un
+/// ampli réel. La sortie n'émet jamais de DoP (`dop_active: false`) ; le
+/// réglage ne l'accepte donc plus, plutôt que d'enregistrer une promesse que le
+/// son ne tient pas.
+pub const MODES_DSD_AIR: [&str; 1] = ["pcm"];
 
 /// #8920 — la cadence envoyée pour une source à `source` Hz sous le plafond
 /// de la zone (`max_sample_rate`).

@@ -49,12 +49,12 @@ fn case_decochee_sur_oaat_rien_d_effectif_9178() {
 /// Contre-épreuve : les sorties PULL et la zone sans sortie gardent le verrou.
 #[test]
 fn les_sorties_pull_et_la_zone_sans_sortie_restent_verrouillees_9178() {
+    // AirPlay et Devialet AIR en sont sortis avec TESS T12c (voir
+    // `airplay_et_devialet_air_portent_le_flux_traite_t12c`).
     for (type_, appareil) in [
-        (Some("airplay2"), Some("airplay:salon")),
         (Some("diretta"), Some("diretta:x")),
         (Some("hqplayer"), Some("hqplayer:x")),
         (Some("sendspin"), Some("sendspin:x")),
-        (Some("devialet_air"), Some("devialet:x")),
         (Some("tune_agent"), Some("agent:x")),
         (None, None),
     ] {
@@ -111,4 +111,113 @@ fn la_route_applique_le_flux_traite_avant_les_droits_9178() {
         .expect("#9178 : la route doit appliquer avec_le_flux_traite");
     let droits = corps.find("avec_les_droits(").expect("droits");
     assert!(sortie < flux && flux < droits);
+}
+
+/// TESS T12a — OAAT porte TOUTE la chaîne : le refus « non mesuré » est
+/// levé, le réglage est honoré tel quel, sans motif (comme une sortie locale).
+#[test]
+fn oaat_porte_toute_la_chaine_sans_motif_t12a() {
+    for (type_, appareil) in [
+        (Some("oaat"), Some("oaat:salon")),
+        (None, Some("oaat-group:maison")),
+    ] {
+        assert!(sortie_porte_toute_la_chaine(type_, appareil), "{type_:?}");
+        let s = avec_toute_la_chaine(non_locale(true), true);
+        assert_eq!(s.reason, None, "T12a : plus de motif sur OAAT");
+        assert!(s.effective && !s.unavailable);
+        let s = avec_toute_la_chaine(non_locale(false), true);
+        assert!(!s.effective && !s.unavailable && s.reason.is_none());
+    }
+}
+
+/// Contre-épreuve T12a : le navigateur garde sa réserve partielle, les
+/// sorties PULL leur verrou, et PURE la priorité.
+#[test]
+fn seule_oaat_porte_toute_la_chaine_t12a() {
+    for (type_, appareil) in [
+        (Some("browser"), Some("browser:onglet")),
+        (Some("airplay2"), Some("airplay:salon")),
+        (Some("devialet_air"), Some("devialet:x")),
+        (Some("hqplayer"), Some("hqplayer:x")),
+        (Some("diretta"), Some("diretta:x")),
+        (None, None),
+    ] {
+        assert!(!sortie_porte_toute_la_chaine(type_, appareil), "{type_:?}");
+    }
+    let pure = crossfeed_status(true, false, false, true, false, false);
+    assert_eq!(
+        avec_toute_la_chaine(pure, true).reason,
+        Some(CrossfeedConstraint::PureMode)
+    );
+    // Les droits viennent après : sans Premium, le motif est le droit.
+    let s = avec_les_droits(avec_toute_la_chaine(non_locale(true), true), false, true);
+    assert_eq!(s.reason, Some(CrossfeedConstraint::PremiumRequired));
+}
+
+/// TESS T12c — AirPlay 1 et 2 et Devialet AIR : Tune fabrique le flux, le
+/// crossfeed y est porté par le relais, réserve partielle (DSD, ALAC servis
+/// tels quels) qui ne verrouille pas le contrôle.
+#[test]
+fn airplay_et_devialet_air_portent_le_flux_traite_t12c() {
+    for (type_, appareil) in [
+        (Some("airplay"), Some("airplay-192.168.1.9-7000")),
+        (Some("airplay2"), Some("airplay2:salon")),
+        (Some("devialet_air"), Some("devialet:x")),
+    ] {
+        assert!(sortie_porte_le_flux_traite(type_, appareil), "{type_:?}");
+        assert!(!sortie_porte_toute_la_chaine(type_, appareil), "{type_:?}");
+        let s = avec_le_flux_traite(non_locale(true), true);
+        assert!(s.effective && !s.unavailable);
+        assert_eq!(s.reason, Some(CrossfeedConstraint::NonLocalPartial));
+    }
+}
+
+/// TESS T12c (décision du 23/11) — HQPlayer et l'autre transport hors TESS :
+/// le crossfeed seul n'y est pas appliqué (motif propre `outside_tess`,
+/// verrouillé, sans nag de licence) ; avec un traitement de zone conservé
+/// (égaliseur, correction de pièce, ReplayGain), il passe par le flux traité :
+/// réserve partielle, contrôle actif, `effective` vrai.
+#[test]
+fn sortie_hors_tess_crossfeed_seul_ou_avec_un_traitement_t12c() {
+    let seul = avec_la_sortie_hors_tess(non_locale(true), true, false);
+    assert_eq!(seul.reason, Some(CrossfeedConstraint::OutsideTess));
+    assert!(seul.unavailable && !seul.effective);
+    assert_eq!(CrossfeedConstraint::OutsideTess.code(), "outside_tess");
+    assert_eq!(
+        avec_les_droits(seul.clone(), false, false).reason,
+        Some(CrossfeedConstraint::OutsideTess),
+        "pas d'invitation au Premium pour un effet qui ne s'entend pas"
+    );
+
+    let avec = avec_la_sortie_hors_tess(non_locale(true), true, true);
+    assert_eq!(avec.reason, Some(CrossfeedConstraint::NonLocalPartial));
+    assert!(avec.effective && !avec.unavailable);
+
+    // Contre-épreuves : une autre sortie non locale garde son motif, PURE garde
+    // la priorité.
+    assert_eq!(
+        avec_la_sortie_hors_tess(non_locale(true), false, true).reason,
+        Some(CrossfeedConstraint::NonLocalOutput)
+    );
+    let pure = crossfeed_status(true, false, false, true, false, false);
+    assert_eq!(
+        avec_la_sortie_hors_tess(pure, true, true).reason,
+        Some(CrossfeedConstraint::PureMode)
+    );
+}
+
+/// Le motif `non_local_output` sert à toutes les sorties qui ne reçoivent pas
+/// le flux traité (Sendspin, AES67, greffons, zone sans périphérique) : son
+/// texte ne dit ni « hors TESS » ni ne promet un transport précis.
+#[test]
+fn le_texte_de_non_local_output_reste_neutre_t12c() {
+    let d = CrossfeedConstraint::NonLocalOutput.detail();
+    for interdit in ["hors TESS", "HQPlayer", "AirPlay", "DLNA", "toujours"] {
+        assert!(!d.contains(interdit), "{interdit} : {d}");
+    }
+    assert!(
+        CrossfeedConstraint::OutsideTess
+            .detail()
+            .contains("hors TESS")
+    );
 }

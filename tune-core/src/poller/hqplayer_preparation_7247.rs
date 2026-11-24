@@ -351,12 +351,17 @@ async fn un_dash_deja_precharge_n_est_pas_telecharge_apres_rejet_du_pcm_7247() {
         .await
         .unwrap()
         .unwrap();
+    // #9449 — piste de 200 s en mode « 30 s » : aucun tampon PCM n'est plus
+    // préparé (il serait jeté à la lecture) ; le fMP4 DASH, lui, est gardé
+    // par la résolution, et c'est sa réutilisation que vérifie la suite.
     assert!(
-        banc.poller
+        !banc
+            .poller
             .orchestrator
             .prefetch
             .has_prefetched("tidal", "suivante")
-            .await
+            .await,
+        "un tampon PCM tronqué ne se prépare plus (#9449)"
     );
     depot.update_gapless_enabled(banc.zone_id, true).unwrap();
     let resolu = tokio::time::timeout(

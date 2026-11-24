@@ -177,6 +177,19 @@ pub(crate) fn empreinte_stable(chemin: &str, meta: &std::fs::Metadata) -> u64 {
     h
 }
 
+/// Une onde que le client peut dessiner : au moins deux nombres finis, dont
+/// un au-dessus de zéro — la règle de `normaliserOnde` côté web.
+pub(crate) fn onde_dessinable(onde: &Value) -> bool {
+    let Some(points) = onde.as_array() else {
+        return false;
+    };
+    points.len() >= 2
+        && points
+            .iter()
+            .all(|v| v.as_f64().is_some_and(f64::is_finite))
+        && points.iter().any(|v| v.as_f64().is_some_and(|x| x > 0.0))
+}
+
 fn reponse(id: i64, onde: Value) -> Response {
     let points = onde.as_array().map_or(0, Vec::len);
     Json(json!({ "track_id": id, "waveform": onde, "points": points })).into_response()
@@ -264,11 +277,24 @@ pub(crate) async fn servir_avec(
     let en_base = points == ONDE_POINTS_ANCIEN;
     let repo = TrackRepo::with_backend(state.backend.clone());
 
-    if en_base && let Ok(Some(cached)) = repo.get_waveform(id) {
-        return reponse(
-            id,
-            serde_json::from_str::<Value>(&cached).unwrap_or(Value::Null),
-        );
+    // #9248 — une onde en base qui ne se dessine pas (toute plate, vide,
+    // illisible) n'est pas resservie : elle est recalculée et remplacée.
+    // Le décodeur APE maison de juin-juillet 2026 rendait du SILENCE
+    // (23ad9561b) ; une onde de 200 zéros mise en base à cette époque était
+    // resservie à vie, sans une ligne de journal, et le client web l'écarte
+    // (« une enveloppe toute plate ne dit rien ») : pas d'onde pour une piste
+    // qui se joue très bien.
+    // Une piste réellement muette rend elle aussi une onde plate : elle est
+    // retenue (`ONDES_PLATES`) pour ne pas être redécodée à chaque demande.
+    let mut plate_en_base: Option<Value> = None;
+    if en_base
+        && let Ok(Some(cached)) = repo.get_waveform(id)
+        && let Ok(onde) = serde_json::from_str::<Value>(&cached)
+    {
+        if onde_dessinable(&onde) {
+            return reponse(id, onde);
+        }
+        plate_en_base = Some(onde);
     }
 
     let track = match repo.get(id) {
@@ -288,6 +314,13 @@ pub(crate) async fn servir_avec(
     .flatten() else {
         return sans_onde(id, "file unreadable or unsupported format");
     };
+    let empreinte = empreinte_stable(&source.chemin, &meta);
+    if let Some(onde) = plate_en_base {
+        if deja_trouvee_plate(id, empreinte) {
+            return reponse(id, onde);
+        }
+        tracing::info!(track_id = id, "onde_lecture_cache_en_base_plat_recalcule");
+    }
     let nom = nom_en_cache(id, &source, &meta, points);
     let cible = dossier.join(&nom);
     if !en_base && let Some(onde) = lire_cache(cible.clone()).await {
@@ -338,11 +371,36 @@ pub(crate) async fn servir_avec(
     if onde.is_empty() {
         return sans_onde(id, "file unreadable or unsupported format");
     }
+    let onde = json!(onde);
     if en_base {
         let json_str = serde_json::to_string(&onde).unwrap_or_default();
         repo.set_waveform(id, &json_str).ok();
+        if !onde_dessinable(&onde) {
+            retenir_plate(id, empreinte);
+        }
     }
-    reponse(id, json!(onde))
+    reponse(id, onde)
+}
+
+/// #9248 — les pistes dont l'onde, RECALCULÉE, est restée plate (silence
+/// réel), avec l'empreinte du fichier (chemin, taille, date) à ce moment :
+/// leur onde en base est resservie telle quelle tant que le fichier ne
+/// change pas. En mémoire seulement — pas de migration ; après un
+/// redémarrage, une piste muette est recalculée une fois de plus.
+static ONDES_PLATES: LazyLock<std::sync::Mutex<std::collections::HashMap<i64, u64>>> =
+    LazyLock::new(Default::default);
+
+fn retenir_plate(id: i64, empreinte: u64) {
+    if let Ok(mut plates) = ONDES_PLATES.lock() {
+        plates.insert(id, empreinte);
+    }
+}
+
+fn deja_trouvee_plate(id: i64, empreinte: u64) -> bool {
+    ONDES_PLATES
+        .lock()
+        .map(|plates| plates.get(&id) == Some(&empreinte))
+        .unwrap_or(false)
 }
 
 /// Écriture atomique : un lecteur ne voit jamais un JSON à moitié écrit.
