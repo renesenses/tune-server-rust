@@ -82,7 +82,10 @@ impl HorlogeDuMaitre {
     }
 
     pub fn maintenant_ns(&self) -> u64 {
-        let m = self.monotone.ns();
+        self.temps_a(self.monotone.ns())
+    }
+
+    fn temps_a(&self, m: u64) -> u64 {
         let ecoule = (m - self.origine) as f64;
         let v = i128::from(m)
             + i128::from(self.decalage_ns)
@@ -420,12 +423,16 @@ mod tests {
     #[test]
     fn l_horloge_du_maitre_derive_comme_annonce() {
         let h = HorlogeDuMaitre::new(5_000_000_000, 1000.0);
-        let m = HorlogeMonotone::new();
-        let (a, ma) = (h.maintenant_ns(), m.ns());
-        std::thread::sleep(Duration::from_millis(200));
-        let (b, mb) = (h.maintenant_ns(), m.ns());
-        let ppm = ((b - a) as f64 / (mb - ma) as f64 - 1.0) * 1e6;
-        assert!((ppm - 1000.0).abs() < 50.0, "{ppm}");
-        assert!(a.abs_diff(ma + 5_000_000_000) < 10_000_000);
+        let depart = h.origine + 5_000_000_000;
+        assert_eq!(h.temps_a(h.origine), depart);
+        // En 200 ms monotones, 1 000 ppm ajoutent exactement 200 000 ns.
+        assert_eq!(h.temps_a(h.origine + 200_000_000), depart + 200_200_000);
+
+        // Vérifier aussi le raccordement à l'horloge réelle : la lecture du
+        // maître a nécessairement lieu entre ces deux lectures monotones.
+        let avant = h.monotone.ns();
+        let mesure = h.maintenant_ns();
+        let apres = h.monotone.ns();
+        assert!((h.temps_a(avant)..=h.temps_a(apres)).contains(&mesure));
     }
 }

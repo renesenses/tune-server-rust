@@ -156,6 +156,92 @@ fn get_or_create_jwt_secret(settings: &SettingsRepo) -> String {
 // Middleware — auth layer applied to the API router
 // ---------------------------------------------------------------------------
 
+/// Méthodes de lecture : `get(...)` d'axum sert aussi HEAD.
+const LECTURE: &[&str] = &["GET", "HEAD"];
+
+/// La liste publique : les routes que la couche d'authentification laisse
+/// passer SANS jeton quand `auth_enabled = true` (hors exemption DIDL, qui
+/// dépend aussi de l'adresse de l'appelant et reste dans le middleware, et
+/// hors passerelle des sources réseau, plus bas).
+///
+/// **Correspondance exacte** : chemin tel que la couche le voit sans le
+/// préfixe `/api/v1`, et méthodes admises. Une route voisine (même préfixe,
+/// segment de plus) n'hérite JAMAIS de l'ouverture : `/system/health` est
+/// publique, `/system/health/monitor` demande un jeton. Ouvrir une route,
+/// c'est l'écrire ici en entier — et l'épreuve
+/// `auth_liste_publique_tests::tableau_des_routes_publiques_du_routeur` le
+/// montre.
+///
+/// Chaque entrée est une poignée de main documentée :
+///
+/// * `/system/health`, `/system/version` : sondes de vie (le `HEALTHCHECK`
+///   des images Docker vise `/system/health`) et découverte du serveur ;
+/// * `/system/peer-info` (GET) : la poignée de main entre deux serveurs Tune.
+///   L'autre bout l'appelle sans jeton (`fetch_peer_info`, admin.rs) et n'a
+///   aucun moyen d'en obtenir un. Surface étroite et délibérée : nom choisi
+///   par l'utilisateur, version, nombre de pistes, nombre de zones — ni
+///   music_dirs, ni IP, ni chemin, ni réglage. Un POST homonyme futur n'en
+///   hérite pas ;
+/// * `/cloud/sso/callback` (GET) : seul le retour du SSO est public (A5), le
+///   navigateur y revient de mozaiklabs.fr ; `authorize`, `status` et
+///   `disconnect` demandent une session ;
+/// * `/auth/login`, `/auth/logout` (POST), `/auth/config` et
+///   `/auth/activation` (GET, lecture de l'état seulement). Le reste de
+///   `/auth/` — inscription (seul un administrateur crée des comptes une fois
+///   l'authentification active), émission de jeton, clé d'API, écriture de la
+///   configuration, code d'activation — porte un jeton valide pour que le
+///   gestionnaire exige le rôle administrateur.
+///
+/// Ce qui n'y est volontairement PAS :
+///
+/// * `/system/profile` (fiche support) : elle expose music_dirs et l'IP LAN,
+///   trop large pour un appel anonyme. N'importe quel rôle authentifié la lit ;
+/// * `/system/stats`, `/system/health/monitor`, `/system/health/alerts` :
+///   mémoire, disque, alertes — l'écran qui les lit a une session ;
+/// * `/ws` : monté à la racine, hors de `/api/v1`, il ne passe pas par cette
+///   couche (`WsAuthorized` y fait le contrôle).
+pub(crate) const LISTE_PUBLIQUE: &[(&str, &[&str])] = &[
+    ("/system/health", LECTURE),
+    ("/system/version", LECTURE),
+    ("/system/peer-info", &["GET"]),
+    ("/cloud/sso/callback", &["GET"]),
+    ("/auth/login", &["POST"]),
+    ("/auth/logout", &["POST"]),
+    ("/auth/config", &["GET"]),
+    ("/auth/activation", &["GET"]),
+];
+
+/// Le chemin tel que la liste publique l'écrit : sans le préfixe `/api/v1`.
+///
+/// Les deux graphies arrivent ici, parce que cette couche enveloppe le
+/// routeur `api`, lui-même imbriqué sous `/api/v1` : que le préfixe soit
+/// encore sur l'URI dépend des rouages d'imbrication d'axum, et le contrôle
+/// ne doit pas cesser de mordre en silence si cela change.
+fn chemin_sans_prefixe_api(path: &str) -> &str {
+    match path.strip_prefix("/api/v1") {
+        Some(reste) if reste.starts_with('/') => reste,
+        _ => path,
+    }
+}
+
+/// La route `(method, path)` passe-t-elle la couche d'authentification sans
+/// jeton ? Voir [`LISTE_PUBLIQUE`].
+///
+/// Sortie du middleware pour qu'une épreuve puisse la confronter aux sondes
+/// qui vivent hors du code Rust — le `HEALTHCHECK` des images Docker en tête.
+pub(crate) fn est_route_publique(method: &axum::http::Method, path: &str) -> bool {
+    let chemin = chemin_sans_prefixe_api(path);
+    let lecture = method == axum::http::Method::GET || method == axum::http::Method::HEAD;
+    LISTE_PUBLIQUE
+        .iter()
+        .any(|(public, methodes)| *public == chemin && methodes.contains(&method.as_str()))
+        // #8189 — la passerelle des sources réseau : un renderer n'a pas
+        // de session. Le gestionnaire exige le jeton signé, propre au
+        // fichier et de courte durée ; GET et HEAD seulement. Forme exacte
+        // `/sources-reseau/{id}/fichier`, rendue par le module lui-même.
+        || (lecture && crate::routes::sources_reseau::est_route_passerelle(path))
+}
+
 pub async fn auth_middleware(
     State(state): State<AppState>,
     mut request: Request,
@@ -173,67 +259,14 @@ pub async fn auth_middleware(
         return next.run(request).await;
     }
 
-    // Allow unauthenticated access to health, version, auth, and ws endpoints.
-    //
-    // These are *substring* matches, so any path segment an extension controls
-    // could otherwise smuggle itself into the allowlist: a plugin named `auth`
-    // (mounted at /ext/auth/…) or any plugin route containing `/auth/` would
-    // read as public and skip the token check entirely. Plugin namespaces are
-    // never public — settle that before the allowlist gets a chance to match.
-    //
-    // Both spellings are tested because this middleware layers the `api`
-    // router, which is itself nested under /api/v1: whether the prefix is
-    // still on the URI here depends on axum's nesting internals, and this
-    // check must not silently stop working if that changes.
+    // La liste publique (correspondance exacte, voir `LISTE_PUBLIQUE`).
+    // Les espaces des greffons (`/ext/…`) n'y figurent jamais : l'exemption
+    // DIDL plus bas les écarte aussi explicitement.
     let path = request.uri().path();
     let method = request.method().clone();
     let is_extension_route = path.starts_with("/ext/") || path.starts_with("/api/v1/ext/");
 
-    // Public allowlist. Health/version/ws/sso stay open. For /auth/ we no
-    // longer blanket-public the whole namespace (the old `contains("/auth/")`):
-    // the privileged endpoints — /auth/token, /auth/api-key, POST /auth/config —
-    // MUST require a valid admin token even when auth is enabled, otherwise
-    // enabling auth is defeated (an anonymous caller could mint a year-long JWT,
-    // rotate the API key, or turn auth back off). Only the genuinely-public
-    // handshakes are listed; everything else falls through to the token check.
-    if !is_extension_route
-        && (path.contains("/system/health")
-            || path.contains("/system/version")
-            // NB : /system/profile (fiche support) n'est volontairement PAS
-            // dans cette allowlist : la fiche expose music_dirs et l'IP LAN,
-            // trop large pour un appel anonyme quand l'auth est activée. Elle
-            // requiert donc un token — n'importe quel rôle, pas de RequireAdmin :
-            // l'écran Support est consulté par un utilisateur authentifié,
-            // jamais de façon anonyme.
-            // /system/peer-info EST public, et il doit l'etre : c'est la
-            // poignee de main entre deux serveurs Tune. Un serveur protege
-            // etait jusqu'ici IMPOSSIBLE a ajouter comme pair — l'autre bout
-            // appelle cette route sans jeton (fetch_peer_info, admin.rs), et
-            // il n'a aucun moyen d'en obtenir un.
-            //
-            // Contrairement a /system/profile juste au-dessus, la surface est
-            // etroite et delibere : nom choisi par l'utilisateur, version,
-            // nombre de pistes, nombre de zones. Ni music_dirs, ni IP, ni
-            // chemin de fichier, ni reglage. C'est ce qu'un serveur affiche
-            // deja de lui-meme dans la liste « serveurs du reseau » d'en face.
-            //
-            // GET seulement : la route est en lecture, et un POST homonyme
-            // futur ne doit pas heriter de cette ouverture.
-            || (method == axum::http::Method::GET
-                && (path == "/system/peer-info" || path == "/api/v1/system/peer-info"))
-            // Seul le retour du SSO est public (A5) : chemin exact, GET. Le
-            // navigateur y revient de mozaiklabs.fr ; `authorize`, `status`
-            // et `disconnect` demandent une session (le cookie la porte).
-            || (method == axum::http::Method::GET
-                && (path == "/cloud/sso/callback" || path == "/api/v1/cloud/sso/callback"))
-            || path == "/ws"
-            // #8189 — la passerelle des sources réseau : un renderer n'a pas
-            // de session. Le gestionnaire exige le jeton signé, propre au
-            // fichier et de courte durée ; GET et HEAD seulement.
-            || ((method == axum::http::Method::GET || method == axum::http::Method::HEAD)
-                && crate::routes::sources_reseau::est_route_passerelle(path))
-            || is_public_auth_route(&method, path))
-    {
+    if est_route_publique(&method, path) {
         return next.run(request).await;
     }
 
@@ -375,22 +408,6 @@ fn adresse_locale(ip: std::net::IpAddr) -> bool {
             v6.is_loopback() || (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80
         }
     }
-}
-
-/// The only /auth/ endpoints reachable without a token when auth is enabled:
-/// login, logout, and the read-only config *status* (GET /auth/config).
-/// Everything else in the auth router — registration (only an
-/// administrator creates accounts once auth is on), token minting, API-key
-/// generation/read, and mutating the auth config — must carry a valid token so
-/// the handler can enforce the admin role.
-fn is_public_auth_route(method: &axum::http::Method, path: &str) -> bool {
-    use axum::http::Method;
-    path.ends_with("/auth/login")
-        || path.ends_with("/auth/logout")
-        || (method == Method::GET && path.ends_with("/auth/config"))
-        // L'écran d'activation lit seulement l'état (activée ou non, appel de
-        // cette machine ou non).
-        || (method == Method::GET && path.ends_with("/auth/activation"))
 }
 
 /// When auth is enabled, require the caller to present a valid admin token.
@@ -2199,35 +2216,32 @@ mod cette_machine_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::is_public_auth_route;
+    use super::est_route_publique;
     use axum::http::Method;
 
     #[test]
     fn only_handshake_auth_routes_are_public() {
-        // Public: login, logout, register, and the read-only config status (GET).
-        assert!(is_public_auth_route(&Method::POST, "/api/v1/auth/login"));
-        assert!(is_public_auth_route(&Method::POST, "/api/v1/auth/logout"));
-        assert!(is_public_auth_route(&Method::GET, "/api/v1/auth/config"));
+        // Public: login, logout, and the read-only config status (GET).
+        assert!(est_route_publique(&Method::POST, "/api/v1/auth/login"));
+        assert!(est_route_publique(&Method::POST, "/api/v1/auth/logout"));
+        assert!(est_route_publique(&Method::GET, "/api/v1/auth/config"));
         // Nesting may strip the /api/v1 prefix — both spellings must hold.
-        assert!(is_public_auth_route(&Method::POST, "/auth/login"));
+        assert!(est_route_publique(&Method::POST, "/auth/login"));
     }
 
     #[test]
     fn privileged_auth_routes_are_never_public() {
         // The P0: these must never be reachable without a token.
-        assert!(!is_public_auth_route(&Method::POST, "/api/v1/auth/config"));
+        assert!(!est_route_publique(&Method::POST, "/api/v1/auth/config"));
         // Sécurité : l'inscription n'est plus publique sous authentification.
-        assert!(!is_public_auth_route(
-            &Method::POST,
-            "/api/v1/auth/register"
-        ));
-        assert!(!is_public_auth_route(&Method::POST, "/auth/register"));
-        assert!(!is_public_auth_route(&Method::POST, "/api/v1/auth/token"));
-        assert!(!is_public_auth_route(&Method::GET, "/api/v1/auth/token"));
-        assert!(!is_public_auth_route(&Method::POST, "/api/v1/auth/api-key"));
-        assert!(!is_public_auth_route(&Method::GET, "/api/v1/auth/api-key"));
-        assert!(!is_public_auth_route(&Method::GET, "/api/v1/auth/me"));
-        assert!(!is_public_auth_route(
+        assert!(!est_route_publique(&Method::POST, "/api/v1/auth/register"));
+        assert!(!est_route_publique(&Method::POST, "/auth/register"));
+        assert!(!est_route_publique(&Method::POST, "/api/v1/auth/token"));
+        assert!(!est_route_publique(&Method::GET, "/api/v1/auth/token"));
+        assert!(!est_route_publique(&Method::POST, "/api/v1/auth/api-key"));
+        assert!(!est_route_publique(&Method::GET, "/api/v1/auth/api-key"));
+        assert!(!est_route_publique(&Method::GET, "/api/v1/auth/me"));
+        assert!(!est_route_publique(
             &Method::POST,
             "/api/v1/system/audio/asio-warm-scan/rearm"
         ));
@@ -2235,13 +2249,15 @@ mod tests {
 
     #[test]
     fn unrelated_paths_are_not_matched() {
-        assert!(!is_public_auth_route(
-            &Method::GET,
-            "/api/v1/library/albums"
-        ));
-        assert!(!is_public_auth_route(
-            &Method::POST,
-            "/api/v1/system/restart"
-        ));
+        assert!(!est_route_publique(&Method::GET, "/api/v1/library/albums"));
+        assert!(!est_route_publique(&Method::POST, "/api/v1/system/restart"));
     }
 }
+
+#[cfg(test)]
+#[path = "auth_sondes_docker_tests.rs"]
+mod sondes_docker_tests;
+
+#[cfg(test)]
+#[path = "auth_liste_publique_tests.rs"]
+mod auth_liste_publique_tests;
