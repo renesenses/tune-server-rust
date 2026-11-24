@@ -572,6 +572,13 @@ async fn sso_callback(
     // PKCE : le navigateur qui revient de mozaiklabs.fr est celui qui a lancé
     // la liaison (cette machine, ou une session et son cookie).
     let par_le_reseau_local = garde.as_ref().is_ok_and(|g| g.par_le_reseau_local);
+    // Le profil de la session, s'il est AUTHENTIFIÉ : sans authentification,
+    // le profil `default` s'ouvre sans mot de passe, la session ne prouve rien
+    // pour la règle du propriétaire (voir `proprietaire::Relieur`).
+    let session_authentifiee = appelant
+        .as_ref()
+        .filter(|u| u.user_id > 0 && crate::auth::authentification_active(&state))
+        .map(|u| u.user_id);
     match liaison_autorisee(&state, garde, appelant) {
         Ok(Liaison::Serveur) => {}
         Ok(Liaison::Profil(profil)) => {
@@ -698,6 +705,16 @@ async fn sso_callback(
     if autre_compte_refuse(&settings, par_le_reseau_local, &user) {
         return page_refus_hors_machine(&headers, crate::auth::refus_compte_deja_relie(&headers));
     }
+
+    // Qui relie, pour la règle du propriétaire — lu AVANT d'écrire la session :
+    // « un compte est-il relié » parle du compte précédent. La garde de cette
+    // route n'a laissé passer que l'administrateur, cette machine ou le réseau
+    // local ; seuls les deux premiers délient.
+    let relieur = tune_core::cloud::proprietaire::Relieur {
+        session_authentifiee,
+        peut_delier: !par_le_reseau_local,
+        compte_relie: compte_du_serveur_relie(&settings),
+    };
 
     // 🔴 AVANT d'écraser `mozaik_user`, et pas après.
     //
@@ -831,6 +848,13 @@ async fn sso_callback(
     // établit d'abord qui se connecte, on décide ensuite de ce qu'il a le
     // droit de changer. Le premier compte lié devient propriétaire — d'où
     // l'invariance sur une installation à un seul compte.
+    //
+    // Changer de compte relié (après une déliaison, ou par le propriétaire
+    // authentifié) fait suivre la propriété, AVANT de demander qui pilote :
+    // sans cela, le compte suivant n'écrivait jamais ses modules payants
+    // (`module_not_owned`) alors que les Réglages les montraient. Un autre
+    // profil ne s'empare jamais du serveur : voir `le_proprietaire_suit`.
+    tune_core::cloud::proprietaire::suivre_le_compte_relie(&settings, profile_id, relieur);
     let pilote = tune_core::cloud::proprietaire::revendiquer(&settings, profile_id);
 
     if pilote {
