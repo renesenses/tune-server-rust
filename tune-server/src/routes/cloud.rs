@@ -3370,6 +3370,10 @@ mod cloud_garde_compte_tests;
 #[path = "compte_reseau_local_tests.rs"]
 mod compte_reseau_local_tests;
 
+#[cfg(test)]
+#[path = "proprietaire_change_de_compte_tests.rs"]
+mod proprietaire_change_de_compte_tests;
+
 /// Rendez-vous de test : fait se croiser deux retours entre la LECTURE et
 /// l'EFFACEMENT d'une attente PKCE, pour prouver que `VERROU_DE_LIAISON` les
 /// sépare. Armé pour un seul `state` : les autres tests n'y passent pas. Sans
