@@ -127,38 +127,7 @@ fn decider_8565_recepteur_desactive_ou_zone_changee_ferme_la_session() {
 #[cfg(unix)]
 mod avec_un_faux_librespot {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::sync::Mutex as StdMutex;
-
-    /// Un faux librespot : exécute, ligne à ligne, les ordres posés dans le
-    /// fichier `ordres` — `ev <EVENEMENT> <PISTE> <VOLUME>` publie un
-    /// évènement par `--onevent`, `pcm <N>` écrit N octets 0x55, `dors <s>`
-    /// se tait (le chargement du titre suivant).
-    const FAUX: &str = r#"#!/bin/sh
-D=$(dirname "$0")
-printf '%s\n' "$*" > "$D/args"
-EV=""
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --onevent) EV="$2"; shift ;;
-  esac
-  shift
-done
-while :; do
-  if [ -f "$D/ordres" ]; then
-    mv "$D/ordres" "$D/encours"
-    while read A B C E; do
-      case "$A" in
-        ev) PLAYER_EVENT="$B" TRACK_ID="$C" VOLUME="$E" NAME="Titre $C" DURATION_MS=1000 $EV ;;
-        pcm) head -c "$B" /dev/zero | tr '\000' '\125' ;;
-        dors) sleep "$B" ;;
-      esac
-    done < "$D/encours"
-    rm -f "$D/encours"
-  fi
-  sleep 0.05
-done
-"#;
 
     #[derive(Default)]
     struct FaussesZones {
@@ -221,8 +190,10 @@ done
 
     fn recepteur(dossier: &std::path::Path) -> Arc<SpotifyConnectManager> {
         let bin = dossier.join("librespot");
-        std::fs::write(&bin, FAUX).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // Chaque session a ses propres ordres. Le script exécuté reste en lecture seule.
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/spotify-connect/faux-librespot.sh");
+        std::os::unix::fs::symlink(script, &bin).unwrap();
         Arc::new(SpotifyConnectManager::avec_binaire(
             "Tune".into(),
             0,

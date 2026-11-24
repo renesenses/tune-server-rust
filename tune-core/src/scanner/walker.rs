@@ -510,7 +510,10 @@ pub use crate::audio::support::KNOWN_UNREAD_AUDIO_EXTENSIONS as KNOWN_UNREAD_AUD
 /// dossiers système (NAS, Windows, macOS) relèvent de
 /// [`crate::scanner::dossier_systeme_ignore`], seule liste partagée avec le
 /// surveillant et l'estimation (fil forum 2207).
-const SKIP_DIRS: &[&str] = &["duplicates", ".tune"];
+///
+/// Public : le choix du dossier d'extraction de CD ne les propose pas non
+/// plus (fil forum 3036) — y ranger un CD, c'est le soustraire au scan.
+pub const SKIP_DIRS: &[&str] = &["duplicates", ".tune"];
 
 /// Normalize a directory path for cross-platform compatibility.
 ///

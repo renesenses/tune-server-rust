@@ -1,0 +1,24 @@
+[package]
+name = "banc-cpu-tess"
+version = "0.1.0"
+edition = "2024"
+description = "TESS T18 : banc CPU de la chaîne type (F32 contre F64), pour le Raspberry Pi. Hors produit."
+license = "BUSL-1.1"
+publish = false
+
+# Hors workspace (`exclude` du Cargo.toml racine), comme tools/p2p-mesure : une
+# seule dépendance en Rust pur (realfft), pour se construire en croisé vers
+# aarch64 (musl, édition de liens par rust-lld) sans chaîne C.
+
+[[bin]]
+name = "banc-cpu-tess"
+path = "src/main.rs"
+
+[dependencies]
+realfft = "3"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "fat"
+debug = false
