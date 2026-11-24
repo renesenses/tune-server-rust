@@ -215,6 +215,11 @@ pub fn schema_json() -> Value {
         },
         "additionalProperties": false
     });
+    let motifs_etape = json!({ "enum": ["outside_tess", "pure_mode", "bypass_all",
+        "dsd_source_native", "chain_version_unsupported", "unknown_value", "unknown_plugin",
+        "plugin_unavailable", "premium_required", "stereo_only", "replaced_in_group",
+        "nothing_to_protect", "volume_not_software", "nothing_to_quantize", "not_in_service",
+        "renderer_without_lpcm", "not_applied_on_transport", null] });
     let mut schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": "https://mozaiklabs.fr/schemas/tess/contract-1.json",
@@ -359,13 +364,7 @@ pub fn schema_json() -> Value {
                     "fixed": { "type": "boolean" },
                     "requested": { "type": "boolean" },
                     "effective": { "type": "boolean" },
-                    "reason": { "enum": ["outside_tess", "pure_mode", "bypass_all", "dsd_source_native",
-                                         "chain_version_unsupported", "unknown_value", "unknown_plugin",
-                                         "plugin_unavailable", "premium_required", "stereo_only",
-                                         "replaced_in_group", "nothing_to_protect", "volume_not_software",
-                                         "nothing_to_quantize", "not_in_service",
-                                         "renderer_without_lpcm", "not_applied_on_transport",
-                                         null] },
+                    "reason": motifs_etape,
                     "detail": texte_ou_null,
                     "params": objet_ou_null,
                     "latency_frames": entier_ou_null
@@ -398,7 +397,6 @@ pub fn schema_json() -> Value {
                                        "altered_outside_tess"]),
                     "signal_path": { "type": "array", "items": { "$ref": "#/$defs/step" } },
                     "catalog": { "$ref": "#/$defs/catalog" },
-                    "delivery": { "$ref": "#/$defs/delivery" },
                     // Facultatif (T17) : avertissements d'un `PUT` accepté.
                     "warnings": { "type": "array", "items": { "type": "string" } }
                 },
@@ -446,6 +444,7 @@ pub fn schema_json() -> Value {
         }
     });
     schema["$defs"]["delivery"] = delivery;
+    schema["$defs"]["zone_response"]["properties"]["delivery"] = json!({ "$ref": "#/$defs/delivery" });
     schema
 }
 
