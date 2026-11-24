@@ -327,6 +327,15 @@ fn traite_comme_lien(t: &std::io::Result<std::fs::FileType>) -> bool {
 /// La forme canonique de `chemin`, refusée si elle sort de l'emplacement
 /// qui le contient (même règle que [`verifier`], rejouée au moment de lire).
 fn canonique_dans(chemin: &Path, emplacements: &[String]) -> Result<PathBuf, Refus> {
+    canonique_dans_avec(chemin, emplacements, attributs_de)
+}
+
+/// [`canonique_dans`], les attributs Windows lus par `attributs` (témoins).
+fn canonique_dans_avec(
+    chemin: &Path,
+    emplacements: &[String],
+    attributs: impl Fn(&Path) -> Option<u32>,
+) -> Result<PathBuf, Refus> {
     let reel = std::fs::canonicalize(chemin).map_err(|e| {
         refus(
             "destination_invalide",
@@ -350,7 +359,7 @@ fn canonique_dans(chemin: &Path, emplacements: &[String]) -> Result<PathBuf, Ref
     if reel
         .strip_prefix(&racine_reelle)
         .is_ok_and(composants_masques)
-        || cache_par_attribut(&reel, &racine_reelle, attributs_de)
+        || cache_par_attribut(&reel, &racine_reelle, &attributs)
     {
         return Err(refus_masque());
     }
@@ -413,16 +422,28 @@ fn attributs_windows(entree: &std::fs::DirEntry) -> Option<u32> {
 
 /// `lost+found` : le dossier de récupération d'ext2/3/4, jamais de la musique.
 const DOSSIERS_DE_RECUPERATION: &[&str] = &["lost+found"];
+/// Le dossier de travail de Tune, nommé même s'il quittait `SKIP_DIRS`.
+const DOSSIER_DE_TUNE: &str = ".tune";
 /// `FILE_ATTRIBUTE_HIDDEN`.
 const ATTRIBUT_CACHE: u32 = 0x2;
 
-/// Un nom de dossier à ne pas proposer. `attributs` : les attributs de
-/// fichier Windows, s'ils sont connus.
+/// Un nom de dossier à ne pas proposer ni accepter : ce que le SCAN ignore
+/// (`SKIP_DIRS`, dossiers système), plus `lost+found`, `.tune` et
+/// l'attribut caché de Windows. Un dossier qui commence simplement par un
+/// point (`.38 Special`) est parcouru par le scan : il reste choisissable.
+///
+/// Le point et l'espace finals sont retirés d'abord (Windows les retire en
+/// créant le dossier : `duplicates.` deviendrait `duplicates`) ; les noms
+/// propres à Tune se comparent sans la casse (montages CIFS, systèmes
+/// insensibles à la casse). `attributs` : les attributs de fichier Windows,
+/// s'ils sont connus.
 fn nom_masque(nom: &str, attributs: Option<u32>) -> bool {
-    nom.starts_with('.')
-        || tune_core::scanner::dossier_systeme_ignore(nom)
-        || tune_core::scanner::walker::SKIP_DIRS.contains(&nom)
-        || DOSSIERS_DE_RECUPERATION.contains(&nom)
+    let nom = nom.trim_end_matches(['.', ' ']);
+    let meme = |n: &&str| n.eq_ignore_ascii_case(nom);
+    tune_core::scanner::dossier_systeme_ignore(nom)
+        || tune_core::scanner::walker::SKIP_DIRS.iter().any(meme)
+        || DOSSIERS_DE_RECUPERATION.iter().any(meme)
+        || DOSSIER_DE_TUNE.eq_ignore_ascii_case(nom)
         || attributs.is_some_and(|a| a & ATTRIBUT_CACHE != 0)
 }
 
@@ -766,8 +787,10 @@ mod tests {
         let racine = bib.path().to_string_lossy().to_string();
         let places = [racine.clone()];
         let l = sous_dossiers(Some(&racine), &places).unwrap();
-        assert_eq!(noms(&l), ["Bon"]);
-        for d in [".cache", ".cache/dedans", "lost+found", "duplicates"] {
+        // `.cache` : le scan le parcourt, il reste proposé (voir
+        // `un_dossier_qui_commence_par_un_point_est_accepte`).
+        assert_eq!(noms(&l), [".cache", "Bon"]);
+        for d in [".tune", ".tune/dedans", "lost+found", "duplicates"] {
             let r = sous_dossiers(Some(&format!("{racine}/{d}")), &places).unwrap_err();
             assert_eq!(r.motif, "dossier_masque", "{d}");
         }
@@ -834,7 +857,7 @@ mod tests {
             ".tune",
             "duplicates",
             "duplicates/x",
-            ".cache/neuf",
+            ".tune/neuf",
             "lost+found",
             "lien",
             "lien/x",
@@ -863,6 +886,78 @@ mod tests {
             assert_eq!(r.motif, "dossier_masque", "{d}");
         }
         assert!(verifier_avec(&format!("{racine}/Visible"), &places, attributs).is_ok());
+    }
+
+    // ─── Ce que le scan ignore, et rien d'autre (fil 3036, relecture) ────
+
+    /// Point 1 — un point ou une espace final (que Windows retire en créant
+    /// le dossier) ne contourne pas le masque ; la casse non plus (montages
+    /// CIFS, systèmes insensibles à la casse).
+    #[cfg(unix)]
+    #[test]
+    fn un_point_ou_une_espace_final_ne_contourne_pas_le_masque() {
+        let bib = tempfile::tempdir().unwrap();
+        let racine = bib.path().to_string_lossy().to_string();
+        let places = [racine.clone()];
+        for d in [
+            "duplicates.",
+            "duplicates ",
+            "duplicates. .",
+            ".tune.",
+            "$Recycle.Bin.",
+            "lost+found ",
+            "Duplicates",
+            ".TUNE",
+            "Lost+Found",
+        ] {
+            let r = verifier(&format!("{racine}/{d}/x"), &places).unwrap_err();
+            assert_eq!(r.motif, "dossier_masque", "« {d} »");
+        }
+        std::fs::create_dir(bib.path().join("duplicates.")).unwrap();
+        std::fs::create_dir(bib.path().join("Bon")).unwrap();
+        let l = sous_dossiers(Some(&racine), &places).unwrap();
+        assert_eq!(noms(&l), ["Bon"]);
+    }
+
+    /// Point 2 — un dossier qui commence par un point, que le scan parcourt,
+    /// reste choisissable : `.38 Special` est accepté, listé et ouvert.
+    #[cfg(unix)]
+    #[test]
+    fn un_dossier_qui_commence_par_un_point_est_accepte() {
+        let bib = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(bib.path().join(".38 Special/Live")).unwrap();
+        let racine = bib.path().to_string_lossy().to_string();
+        let places = [racine.clone()];
+        let special = format!("{racine}/.38 Special");
+        assert!(verifier(&special, &places).is_ok());
+        assert!(verifier(&format!("{special}/Neuf"), &places).is_ok());
+        assert_eq!(
+            noms(&sous_dossiers(Some(&racine), &places).unwrap()),
+            [".38 Special"]
+        );
+        assert_eq!(
+            noms(&sous_dossiers(Some(&special), &places).unwrap()),
+            ["Live"]
+        );
+    }
+
+    /// Point 3 — `canonique_dans` refuse l'attribut caché de Windows de la
+    /// cible résolue (attributs injectés).
+    #[cfg(unix)]
+    #[test]
+    fn canonique_dans_refuse_l_attribut_cache_injecte() {
+        let bib = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(bib.path().join("Cache/dedans")).unwrap();
+        std::fs::create_dir_all(bib.path().join("Visible")).unwrap();
+        let racine = bib.path().to_string_lossy().to_string();
+        let places = [racine.clone()];
+        let cache = std::fs::canonicalize(bib.path().join("Cache")).unwrap();
+        let attributs = |p: &Path| (p == cache).then_some(ATTRIBUT_CACHE);
+        for d in ["Cache", "Cache/dedans"] {
+            let r = canonique_dans_avec(&bib.path().join(d), &places, attributs).unwrap_err();
+            assert_eq!(r.motif, "dossier_masque", "{d}");
+        }
+        assert!(canonique_dans_avec(&bib.path().join("Visible"), &places, attributs).is_ok());
     }
 
     #[cfg(unix)]
