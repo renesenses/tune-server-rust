@@ -129,10 +129,10 @@ pub(super) fn select_stream(
 }
 
 /// #8110 — les flux de la fiche que la lecture peut essayer après `url`,
-/// quand le diffuseur refuse celui-ci : les autres flux autorisés pour le pays
-/// d'écoute, du meilleur au moins bon ([`rang`]), sans `url` lui-même. Vide
-/// quand `url` n'est le flux d'aucune fiche, ou que la fiche n'a pas d'autre
-/// flux autorisé.
+/// quand celui-ci ne démarre pas : les autres flux autorisés pour le pays
+/// d'écoute, sans `url` lui-même, dans l'ordre de [`ordonner_les_replis`].
+/// Vide quand `url` n'est le flux d'aucune fiche, ou que la fiche n'a pas
+/// d'autre flux autorisé.
 pub(crate) fn replis_autorises(state: &AppState, url: &str) -> Vec<String> {
     let Ok(fiches) = state.annuaire_radios.read() else {
         return Vec::new();
@@ -145,14 +145,68 @@ pub(crate) fn replis_autorises(state: &AppState, url: &str) -> Vec<String> {
     };
     let country = listener_country(state);
     let joue = super::flux_normalise(url);
-    let mut flux: Vec<FluxAnnuaire> = flux_autorises(fiche, country.as_deref(), Some(url))
+    let tous = flux_autorises(fiche, country.as_deref(), Some(url));
+    let flux_joue = tous
+        .iter()
+        .find(|f| super::flux_normalise(&f.url) == joue)
+        .cloned();
+    let mut flux: Vec<FluxAnnuaire> = tous
         .into_iter()
         .filter(|f| super::flux_normalise(&f.url) != joue)
         .collect();
-    // Tri stable : l'ordre de la fiche départage les ex æquo, comme
-    // `flux_proposes`.
-    flux.sort_by_key(|f| std::cmp::Reverse(rang(f)));
+    ordonner_les_replis(flux_joue.as_ref(), &mut flux);
     flux.into_iter().map(|f| f.url).collect()
+}
+
+/// #9488 — l'ordre d'essai des autres flux quand `joue` ne démarre pas. Le
+/// flux lancé est déjà le préféré de l'auditeur s'il en a choisi un
+/// ([`select_stream`]) ; après lui : le même codec, à la qualité la plus
+/// proche (un 256 kbit/s en panne cède la place au 192 avant le 64) ; puis
+/// le reste, du meilleur au moins bon ([`rang`]). Sans flux joué connu, ou
+/// sans codec ni débit publiés, l'ordre est celui de [`rang`], comme #8110.
+/// Tri stable : l'ordre de la fiche départage les ex æquo.
+pub(crate) fn ordonner_les_replis(joue: Option<&FluxAnnuaire>, flux: &mut [FluxAnnuaire]) {
+    let codec_joue = joue.and_then(|j| j.codec.as_deref());
+    let debit_joue = joue.and_then(|j| j.bitrate);
+    flux.sort_by_key(|f| {
+        let meme_codec = codec_joue
+            .zip(f.codec.as_deref())
+            .is_some_and(|(a, b)| a.eq_ignore_ascii_case(b));
+        let ecart = match (meme_codec, debit_joue, f.bitrate) {
+            (true, Some(a), Some(b)) => (a - b).abs(),
+            (true, _, _) => i32::MAX,
+            _ => 0,
+        };
+        (!meme_codec, ecart, std::cmp::Reverse(rang(f)))
+    });
+}
+
+/// #8110 / #9488 — retient, au lancement du flux `url`, les autres flux que
+/// la lecture essaiera s'il ne démarre pas, et le débit de chacun (pour
+/// l'avis « flux 256 kbps indisponible, lecture du flux 128 kbps »).
+pub(crate) fn retenir_les_replis_de_la_fiche(state: &AppState, url: &str) {
+    tune_core::orchestrator::retenir_les_replis_radio(url, replis_autorises(state, url));
+    let Ok(fiches) = state.annuaire_radios.read() else {
+        return;
+    };
+    if let Some(fiche) = fiches
+        .iter()
+        .find(|f| super::super::radios_annuaire::flux_de_la_fiche(f, url))
+    {
+        let streams = if fiche.flux.is_empty() {
+            fiche.flux_proposes()
+        } else {
+            fiche.flux.clone()
+        };
+        let debits = streams
+            .iter()
+            .filter_map(|f| {
+                let kbps = u32::try_from(f.bitrate?).ok()?;
+                Some((f.url.clone(), kbps))
+            })
+            .collect();
+        tune_core::orchestrator::retenir_les_debits_radio(debits);
+    }
 }
 
 /// Les flux de la fiche que le pays d'écoute permet, dans l'ordre de la fiche
@@ -461,3 +515,7 @@ mod debit_ecoute_tests;
 #[cfg(test)]
 #[path = "radios_repli_8110_tests.rs"]
 mod repli_8110_tests;
+
+#[cfg(test)]
+#[path = "radios_ordre_des_replis_9488_tests.rs"]
+mod ordre_des_replis_9488_tests;

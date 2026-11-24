@@ -35,6 +35,8 @@ pub(crate) use radio::*;
 /// lancement : la lecture y passe quand le diffuseur refuse le flux joué.
 mod radio_replis_8110;
 pub use radio_replis_8110::retenir_les_replis_radio;
+mod radio_autres_flux_9488;
+pub use radio_autres_flux_9488::retenir_les_debits_radio;
 
 /// re-resolve or re-send. The `superseded` play_seq guard in `play_inner` only
 /// catches an OVERLAPPING second play; when the second play arrives just AFTER
