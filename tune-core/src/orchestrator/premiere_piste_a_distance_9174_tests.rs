@@ -65,7 +65,8 @@ async fn premiere_piste(a_distance: bool) -> String {
         })
         .await
         .expect("la lecture part");
-    r.stream_url.expect("une zone navigateur reçoit l'URL du flux")
+    r.stream_url
+        .expect("une zone navigateur reçoit l'URL du flux")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

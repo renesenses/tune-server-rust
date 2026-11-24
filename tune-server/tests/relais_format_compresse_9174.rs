@@ -205,7 +205,14 @@ async fn une_commande_relayee_note_la_zone_avant_de_preparer_la_piste() {
 
     // `browser-next` relayé après plus de 30 s de silence : même règle.
     state.orchestrator.noter_provenance_de_zone(zone, false);
-    appel(&app, Method::POST, &format!("/{zone}/browser-next"), true, SIGNAL).await;
+    appel(
+        &app,
+        Method::POST,
+        &format!("/{zone}/browser-next"),
+        true,
+        SIGNAL,
+    )
+    .await;
     assert_eq!(*vu.lock().unwrap(), vec![false, true, true]);
 }
 
@@ -219,10 +226,31 @@ async fn un_play_relaye_met_la_zone_navigateur_a_distance() {
         .create("Salon", Some("dlna"), Some("uuid:salon"))
         .unwrap();
     let app = tune_server::routes::router(state.clone());
-    appel(&app, Method::POST, &format!("/api/v1/zones/{zone}/play"), false, "{}").await;
+    appel(
+        &app,
+        Method::POST,
+        &format!("/api/v1/zones/{zone}/play"),
+        false,
+        "{}",
+    )
+    .await;
     assert!(!state.orchestrator.zone_tiree_a_distance(zone));
-    appel(&app, Method::POST, &format!("/api/v1/zones/{zone}/play"), true, "{}").await;
+    appel(
+        &app,
+        Method::POST,
+        &format!("/api/v1/zones/{zone}/play"),
+        true,
+        "{}",
+    )
+    .await;
     assert!(state.orchestrator.zone_tiree_a_distance(zone));
-    appel(&app, Method::POST, &format!("/api/v1/zones/{dlna}/play"), true, "{}").await;
+    appel(
+        &app,
+        Method::POST,
+        &format!("/api/v1/zones/{dlna}/play"),
+        true,
+        "{}",
+    )
+    .await;
     assert!(!state.orchestrator.zone_tiree_a_distance(dlna));
 }
