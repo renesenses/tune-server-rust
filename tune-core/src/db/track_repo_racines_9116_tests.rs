@@ -135,7 +135,8 @@ fn sqlite_le_compte_d_une_racine_ne_lit_que_l_index_9116() {
     // NULL) par un index — jamais la table entière.
     let lectures: Vec<&String> = plan
         .iter()
-        .filter(|l| l.starts_with("SCAN") || l.starts_with("SEARCH"))
+        // `SCAN CONSTANT ROW` (la somme des deux sous-requêtes) ne lit rien.
+        .filter(|l| l.starts_with("SCAN tracks") || l.starts_with("SEARCH tracks"))
         .collect();
     assert!(
         lectures.len() == 2
