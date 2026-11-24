@@ -6104,6 +6104,10 @@ mod mixes_7822_tests;
 #[cfg(test)]
 #[path = "tidal_genres_du_pays_9119_tests.rs"]
 mod genres_du_pays_9119_tests;
+// #9486 — une catégorie que TIDAL ne propose pas (404/2001) est masquée.
+#[cfg(test)]
+#[path = "tidal_categorie_absente_9486_tests.rs"]
+mod categorie_absente_9486_tests;
 
 // #8481 — le pays du catalogue choisi dans les Réglages.
 #[cfg(test)]
