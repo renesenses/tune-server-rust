@@ -51,10 +51,11 @@ async fn journaliser_le_refus(
         .ok()
         .flatten();
     let ligne_courante = ligne.as_ref().map(|l| l.is_current);
-    let meme_piste = ligne.as_ref().zip(np).map(|(l, np)| {
-        // Même règle que l'orchestrateur (`suivante_navigateur`).
-        l.track_id == np.track_id && (l.track_id.is_some() || l.source_id == np.source_id)
-    });
+    // Même règle que l'orchestrateur (`suivante_navigateur`, #9273).
+    let meme_piste = ligne
+        .as_ref()
+        .zip(np)
+        .map(|(l, np)| np.lancee_par_la_ligne(l.track_id, l.source_id.as_deref()));
     let version = np
         .and_then(|np| np.version.as_ref())
         .map(|v| format!("{}:{}", v.origin, v.rule));

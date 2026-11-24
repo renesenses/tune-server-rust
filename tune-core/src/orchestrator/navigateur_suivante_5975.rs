@@ -58,9 +58,10 @@ impl PlaybackOrchestrator {
             .get_at(zone_id, etat.queue_position)?
             .ok_or("browser_queue_changed")?;
         let np = etat.now_playing.as_ref().ok_or("browser_current_changed")?;
+        // #9273 — la ligne porte la piste LANCÉE, pas forcément celle qui
+        // joue : la règle de version (#2264) a pu en faire jouer une autre.
         if !courante.is_current
-            || courante.track_id != np.track_id
-            || (courante.track_id.is_none() && courante.source_id != np.source_id)
+            || !np.lancee_par_la_ligne(courante.track_id, courante.source_id.as_deref())
         {
             return Err("browser_queue_changed".into());
         }
@@ -168,3 +169,7 @@ impl PlaybackOrchestrator {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "navigateur_suivante_version_9273_tests.rs"]
+mod version_9273_tests;

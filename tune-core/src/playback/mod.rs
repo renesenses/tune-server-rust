@@ -190,6 +190,20 @@ pub struct VersionJouee {
 }
 
 impl NowPlaying {
+    /// #9273 — la ligne de file (`track_id`, `source_id`) est-elle celle qui
+    /// a LANCÉ la piste en cours ? Quand la règle de version (#2264) fait
+    /// jouer un autre exemplaire, la ligne garde la piste DEMANDÉE
+    /// (`version.requested`), et `track_id`/`source_id` disent la piste
+    /// JOUÉE : comparer la ligne à ces derniers y voyait une file changée à
+    /// chaque piste substituée.
+    pub fn lancee_par_la_ligne(&self, track_id: Option<i64>, source_id: Option<&str>) -> bool {
+        let (lancee, source_lancee) = match self.version.as_ref().and_then(|v| v.requested.as_ref())
+        {
+            Some(demandee) => (demandee.track_id, demandee.source_id.as_deref()),
+            None => (self.track_id, self.source_id.as_deref()),
+        };
+        lancee == track_id && (track_id.is_some() || source_lancee == source_id)
+    }
     /// #8689 — la piste dont le ReplayGain s'applique : bibliothèque, ou
     /// titre Qobuz / TIDAL par son identifiant de service.
     pub fn piste_rg(&self) -> crate::audio::replaygain::PisteRg<'_> {
