@@ -125,6 +125,106 @@ impl PreReglages {
     }
 }
 
+impl ModeApplication {
+    /// Le changement interrompt-il la lecture en cours (pause, puis reprise
+    /// à la position, #8422) ? Une valeur inconnue ne l'interrompt jamais.
+    pub fn immediat(self) -> bool {
+        self == Self::Immediately
+    }
+}
+
+// ── Stockage (lot T17) ──────────────────────────────────────────────
+
+/// La clé de réglage GLOBALE qui porte la liste des préréglages et le mode
+/// d'application. Absente : [`PreReglages::default`] (Pure seul, Immédiat).
+/// Elle part dans l'export de configuration comme les autres réglages
+/// globaux ; l'import la relit par [`lire_texte`] et l'écarte si elle ne
+/// passe pas [`PreReglages::verifier`].
+pub const CLE_PREREGLAGES: &str = "tess_presets";
+
+/// Longueur maximale d'un nom de préréglage, en caractères.
+pub const NOM_MAX: usize = 80;
+
+/// Lit une liste de préréglages écrite (base ou fichier d'export) :
+/// tolérante aux champs et valeurs inconnus (comme toute réponse du
+/// contrat), mais cohérente ([`PreReglages::verifier`]).
+pub fn lire_texte(texte: &str) -> Result<PreReglages, String> {
+    let l: PreReglages = serde_json::from_str(texte).map_err(|e| e.to_string())?;
+    l.verifier().map_err(|e| e.to_string())?;
+    Ok(l)
+}
+
+/// La liste enregistrée sur ce serveur. Absente : la liste par défaut.
+/// Illisible : une erreur (jamais une liste vide qui écraserait l'ancienne).
+pub fn lire(settings: &crate::db::settings_repo::SettingsRepo) -> Result<PreReglages, String> {
+    match settings.get(CLE_PREREGLAGES)? {
+        None => Ok(PreReglages::default()),
+        Some(t) if t.trim().is_empty() => Ok(PreReglages::default()),
+        Some(t) => lire_texte(&t),
+    }
+}
+
+/// Écrit la liste, après [`PreReglages::verifier`]. Une valeur de mode
+/// inconnue est enregistrée comme `at_next_playback` (ce qu'elle vaut).
+pub fn ecrire(
+    settings: &crate::db::settings_repo::SettingsRepo,
+    liste: &PreReglages,
+) -> Result<(), String> {
+    liste.verifier().map_err(|e| e.to_string())?;
+    let mut liste = liste.clone();
+    if liste.apply_mode == ModeApplication::Unknown {
+        liste.apply_mode = ModeApplication::AtNextPlayback;
+    }
+    let texte = serde_json::to_string(&liste).map_err(|e| e.to_string())?;
+    settings.set(CLE_PREREGLAGES, &texte)
+}
+
+/// Le nom choisi, nettoyé : espaces de bord retirés, ni vide ni trop long.
+pub fn nom_valide(nom: &str) -> Option<String> {
+    let n = nom.trim();
+    (!n.is_empty() && n.chars().count() <= NOM_MAX && !n.chars().any(char::is_control))
+        .then(|| n.to_owned())
+}
+
+/// Un identifiant stable tiré du nom (« Evening listening » →
+/// `evening-listening`), unique dans la liste. `pure` reste réservé au
+/// préréglage fourni, même supprimé : un préréglage d'utilisateur ne peut
+/// pas le reprendre (il devrait rester sans traitement).
+pub fn id_pour_nom(nom: &str, liste: &PreReglages) -> String {
+    let mut base = String::new();
+    for c in nom.chars().flat_map(char::to_lowercase) {
+        let c = match c {
+            'à' | 'â' | 'ä' | 'á' | 'ã' | 'å' => 'a',
+            'ç' => 'c',
+            'é' | 'è' | 'ê' | 'ë' => 'e',
+            'î' | 'ï' | 'í' | 'ì' => 'i',
+            'ô' | 'ö' | 'ó' | 'ò' | 'õ' | 'ø' => 'o',
+            'ù' | 'û' | 'ü' | 'ú' => 'u',
+            'ñ' => 'n',
+            'ÿ' | 'ý' => 'y',
+            c => c,
+        };
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            base.push(c);
+        } else if !base.is_empty() && !base.ends_with('-') {
+            base.push('-');
+        }
+    }
+    base.truncate(56);
+    let base = base.trim_matches('-').to_owned();
+    let base = if base.is_empty() {
+        "preset".to_owned()
+    } else {
+        base
+    };
+    let pris = |id: &str| id == ID_PREREGLAGE_PURE || liste.get(id).is_some();
+    if !pris(&base) {
+        return base;
+    }
+    let libre = (2..).map(|n| format!("{base}-{n}")).find(|id| !pris(id));
+    libre.unwrap_or(base)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +360,105 @@ mod tests {
         assert!(!l.presets[0].builtin);
         let l: PreReglages = serde_json::from_str(r#"{"presets":[]}"#).unwrap();
         assert_eq!(l.apply_mode, ModeApplication::Immediately);
+    }
+
+    // ── Stockage (T17) ──────────────────────────────────────────────
+
+    fn reglages() -> crate::db::settings_repo::SettingsRepo {
+        use crate::db::backend::DbBackend;
+        use crate::db::sqlite::SqliteDb;
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        let backend: std::sync::Arc<dyn DbBackend> = std::sync::Arc::new(db);
+        crate::db::settings_repo::SettingsRepo::with_backend(backend)
+    }
+
+    #[test]
+    fn la_liste_absente_vaut_pure_seul_et_s_enregistre_t17() {
+        let s = reglages();
+        let l = lire(&s).unwrap();
+        assert_eq!(l, PreReglages::default());
+        assert_eq!(l.presets[0].id, ID_PREREGLAGE_PURE);
+        assert!(l.apply_mode.immediat());
+
+        let mut l = l;
+        l.presets.push(soiree());
+        l.apply_mode = ModeApplication::AtNextPlayback;
+        ecrire(&s, &l).unwrap();
+        assert_eq!(lire(&s).unwrap(), l);
+        assert!(!lire(&s).unwrap().apply_mode.immediat());
+    }
+
+    #[test]
+    fn une_liste_incoherente_n_est_ni_ecrite_ni_lue_t17() {
+        let s = reglages();
+        let mut l = PreReglages::default();
+        l.presets.push(soiree());
+        l.presets.push(soiree());
+        assert!(ecrire(&s, &l).is_err());
+        // Rien n'a été écrit : la liste par défaut reste.
+        assert_eq!(lire(&s).unwrap(), PreReglages::default());
+        // Une base (ou un fichier) illisible est une erreur, jamais une
+        // liste vide qui écraserait l'ancienne.
+        s.set(CLE_PREREGLAGES, "{pas du json").unwrap();
+        assert!(lire(&s).is_err());
+        s.set(CLE_PREREGLAGES, &serde_json::to_string(&l).unwrap())
+            .unwrap();
+        assert!(lire(&s).unwrap_err().contains("deux fois"));
+        // Contre-épreuve : la même liste sans le doublon se lit.
+        l.presets.pop();
+        s.set(CLE_PREREGLAGES, &serde_json::to_string(&l).unwrap())
+            .unwrap();
+        assert_eq!(lire(&s).unwrap(), l);
+    }
+
+    #[test]
+    fn un_mode_inconnu_est_enregistre_comme_au_prochain_demarrage_t17() {
+        let s = reglages();
+        let l = PreReglages {
+            apply_mode: ModeApplication::Unknown,
+            ..PreReglages::default()
+        };
+        assert!(!l.apply_mode.immediat());
+        ecrire(&s, &l).unwrap();
+        assert_eq!(
+            lire(&s).unwrap().apply_mode,
+            ModeApplication::AtNextPlayback
+        );
+    }
+
+    #[test]
+    fn l_identifiant_vient_du_nom_et_reste_unique_t17() {
+        let mut l = PreReglages::default();
+        assert_eq!(id_pour_nom("Evening listening", &l), "evening-listening");
+        assert_eq!(id_pour_nom("  Écoute du soir !  ", &l), "ecoute-du-soir");
+        assert_eq!(id_pour_nom("耳机", &l), "preset");
+        l.presets.push(soiree());
+        assert_eq!(id_pour_nom("Evening listening", &l), "evening-listening-2");
+        // `pure` reste réservé, même une fois le préréglage fourni supprimé.
+        assert_eq!(id_pour_nom("Pure", &l), "pure-2");
+        l.presets.remove(0);
+        assert_eq!(id_pour_nom("Pure", &l), "pure-2");
+        let long = "x".repeat(200);
+        let id = id_pour_nom(&long, &l);
+        assert!(
+            crate::tess::greffon::id_valide(&id) && id.len() <= 64,
+            "{id}"
+        );
+        // Chaque identifiant produit passe la règle des préréglages.
+        for nom in ["--a--", "A b", "Ünïcödé", "9", "évier---"] {
+            let id = id_pour_nom(nom, &l);
+            assert!(crate::tess::greffon::id_valide(&id), "{nom} → {id}");
+        }
+    }
+
+    #[test]
+    fn le_nom_est_nettoye_et_borne_t17() {
+        assert_eq!(nom_valide("  Casque  ").as_deref(), Some("Casque"));
+        assert_eq!(nom_valide("   "), None);
+        assert_eq!(nom_valide("a\nb"), None);
+        assert!(nom_valide(&"é".repeat(NOM_MAX)).is_some());
+        assert_eq!(nom_valide(&"é".repeat(NOM_MAX + 1)), None);
     }
 }

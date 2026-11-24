@@ -209,6 +209,9 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     spawn_ssdp_startup_scan(state);
     spawn_slimproto_server(state, config);
     spawn_social_sharing_listener(state);
+    // TESS T17 — mode « At next playback » : ce qui attend la prochaine
+    // lecture d'une zone locale l'atteint à son démarrage.
+    crate::routes::zones::tess_prereglages::spawn_application_au_demarrage(state);
     crate::routes::developer_api::spawn_webhook_dispatcher(state);
     #[cfg(feature = "oaat")]
     spawn_oaat_stall_supervisor(state);
