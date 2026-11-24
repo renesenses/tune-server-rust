@@ -12,15 +12,13 @@
 //!   lit l'ordre d'une [`ChaineTess`] (la clé `zone_{id}_tess_chain` arrive
 //!   avec T02 ; le branchement par zone suit dans ce lot).
 //! - **« Bypass all »** : aucun étage n'est appelé, l'entrée ressort à l'octet.
-//! - **Moteurs de référence en `f64` natif (T06)** : l'égaliseur (graphique,
-//!   paramétrique, casque) et le crossfeed reçoivent le tampon `f64` de
-//!   l'exécuteur tel quel, sous leurs verrous historiques. Seul le convolveur
-//!   garde un adaptateur provisoire `f32` ↔ `f64` (T09b le porte), qui
-//!   convertit à SA frontière par morceaux d'une pile fixe ; un natif tiers
-//!   `F32` est converti à SA frontière par l'hôte natif (T05). Le témoin
-//!   `crate::tess::sonde_f32` compte ces frontières. Par rapport à la chaîne
-//!   `f32` d'avant, seul l'arrondi change (un à la frontière au lieu d'un par
-//!   étage) : quelques ULP `f32`, sous −126 dBFS (témoins ci-dessous).
+//! - **Moteurs de référence en `f64` natif (T06, T09b)** : l'égaliseur
+//!   (graphique, paramétrique, casque), le crossfeed et le convolveur reçoivent
+//!   le tampon `f64` de l'exécuteur tel quel, sous leurs verrous historiques ;
+//!   un natif tiers `F32` est converti à SA frontière par l'hôte natif (T05).
+//!   Le témoin `crate::tess::sonde_f32` compte ces frontières. Par rapport à
+//!   la chaîne `f32` d'avant, seul l'arrondi change (un à la frontière au lieu
+//!   d'un par étage) : quelques ULP `f32`, sous −126 dBFS (témoins ci-dessous).
 //! - **Repli mono** : premier étage en `f64` natif. Il reste le DERNIER des
 //!   étages (#2362 ; rattaché à `channel-remap`, place `last_plugin`).
 //! - **Points d'insertion de T07** : les étages fixes (headroom avec
@@ -157,9 +155,6 @@ fn est_un_natif_tiers(id: &str) -> bool {
 pub(super) const TRANCHE: usize = 1 << 16;
 
 thread_local! {
-    /// Tampon de conversion des adaptateurs `f32` : grandit jusqu'au plus grand
-    /// bloc vu (au plus [`TRANCHE`]), puis n'alloue plus.
-    static TAMPON_F32: RefCell<Vec<f32>> = const { RefCell::new(Vec::new()) };
     /// Tampon `f64` du décodage et de l'entrée `f32` : même règle.
     static TAMPON_F64: RefCell<Vec<f64>> = const { RefCell::new(Vec::new()) };
 }
@@ -188,24 +183,6 @@ fn avec_tampon<T: Copy + Default>(
         }
         Err(_) => f(&mut vec![T::default(); n]),
     });
-}
-
-/// Fait passer `tampon` par un moteur `f32` : un seul appel par tranche
-/// (donc un seul par bloc du producteur), converti dans le tampon du fil.
-fn par_tranches_f32(tampon: &mut [f64], canaux: usize, mut moteur: impl FnMut(&mut [f32])) {
-    #[cfg(test)]
-    crate::tess::sonde_f32::noter();
-    for morceau in tampon.chunks_mut(pas_de_tranche(canaux)) {
-        avec_tampon(&TAMPON_F32, morceau.len(), |f| {
-            for (d, s) in f.iter_mut().zip(morceau.iter()) {
-                *d = *s as f32;
-            }
-            moteur(f);
-            for (d, s) in morceau.iter_mut().zip(f.iter()) {
-                *d = f64::from(*s);
-            }
-        });
-    }
 }
 
 /// L'égaliseur (graphique, paramétrique, casque AutoEQ et OPRA : un seul
@@ -251,11 +228,13 @@ impl EtageTess for AdaptateurEgaliseur<'_> {
     }
 }
 
-/// Adaptateur provisoire du convolveur (`f32`) : à porter en `f64` par T09b.
-/// Sa queue de fin de piste passe par `Convolver::flush`
-/// ([`vidanger_chaine_locale`]), pas par la vidange de l'exécuteur.
-/// Le contournement avec retard conservé viendra avec le moteur `f64` (ligne
-/// de retard préparée) ; d'ici là, cet adaptateur n'est jamais contourné.
+/// TESS T09b — l'étage de convolution, en `f64` natif : le moteur
+/// ([`Convolver`]) calcule en double précision et reçoit le tampon de la
+/// chaîne tel quel, sans conversion. Sa latence (`latency_frames()`, un bloc)
+/// est ANNONCÉE à l'exécuteur. Sa queue de fin de piste passe par
+/// `Convolver::flush_f64` ([`vidanger_chaine_locale`]), pas par la vidange de
+/// l'exécuteur. Le changement de filtre flux en cours est un fondu du moteur
+/// lui-même (`Convolver::remplacer_en_fondu`, posé par la sortie locale).
 struct AdaptateurConvolution<'a> {
     moteur: &'a Mutex<Option<Convolver>>,
     canaux: usize,
@@ -267,19 +246,24 @@ impl EtageTess for AdaptateurConvolution<'_> {
     }
     fn preparer(&mut self, e: FormatFlux, max: usize) -> Result<Disposition, ErreurEtage> {
         self.canaux = usize::from(e.channels);
-        // La latence du moteur `f32` n'est pas annoncée ici : la sortie locale
-        // ne l'utilise pas, et la lire prendrait le verrou une fois de plus
-        // par bloc. Le moteur `f64` de T09b l'annoncera (T16).
-        Ok(Disposition::sur_place(e, max, 0))
+        let latence = self
+            .moteur
+            .lock()
+            .ok()
+            .and_then(|c| c.as_ref().map(Convolver::latency_frames))
+            .unwrap_or(0);
+        Ok(Disposition::sur_place(
+            e,
+            max,
+            u32::try_from(latence).unwrap_or(u32::MAX),
+        ))
     }
     fn traiter_sur_place(&mut self, t: &mut [f64], trames: usize) -> Result<(), ErreurEtage> {
         verifier_tampon(t.len(), trames, self.canaux as u16)?;
         if let Ok(mut conv) = self.moteur.lock()
             && let Some(c) = conv.as_mut()
         {
-            par_tranches_f32(&mut t[..trames * self.canaux], self.canaux, |f| {
-                c.process_interleaved(f);
-            });
+            c.process_interleaved_f64(&mut t[..trames * self.canaux]);
         }
         Ok(())
     }
@@ -548,28 +532,42 @@ pub(super) fn vidanger_chaine_locale(
     channels: u16,
     dop: bool,
 ) -> Vec<f32> {
+    vidanger_chaine_locale_f64(moteurs, ordre, channels, dop)
+        .into_iter()
+        .map(|x| x as f32)
+        .collect()
+}
+
+/// [`vidanger_chaine_locale`] avant la frontière `f32` du producteur (T09b :
+/// la queue de la convolution reste en `f64` jusqu'au bout de la chaîne).
+pub(super) fn vidanger_chaine_locale_f64(
+    moteurs: &MoteursLocaux<'_>,
+    ordre: OrdreLocal,
+    channels: u16,
+    dop: bool,
+) -> Vec<f64> {
     if moteurs.exemptee(ordre, dop) {
         return Vec::new();
     }
-    let queue = match moteurs.convolver.lock() {
+    // T09b — la queue sort du moteur en `f64` et suit la chaîne sans repasser
+    // par le `f32`.
+    let mut queue = match moteurs.convolver.lock() {
         Ok(mut c) => match c.as_mut() {
-            Some(conv) => conv.flush(),
+            Some(conv) => conv.flush_f64(),
             None => return Vec::new(),
         },
         Err(_) => return Vec::new(),
     };
     if queue.is_empty() {
-        return queue;
+        return Vec::new();
     }
-    // La queue fait `latency_frames()` trames : petite, convertie d'un tenant.
-    let mut queue: Vec<f64> = queue.into_iter().map(f64::from).collect();
     let apres = ordre
         .etages
         .iter()
         .position(|e| *e == EtageLocal::Convolution)
         .map_or(NB_ETAGES, |i| i + 1);
     moteurs.executer(ordre, apres, &mut queue, channels);
-    queue.into_iter().map(|x| x as f32).collect()
+    queue
 }
 
 /// La frontière PROVISOIRE `f64` → `f32` du producteur local (dans la

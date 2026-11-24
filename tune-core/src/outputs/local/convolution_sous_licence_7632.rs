@@ -62,7 +62,59 @@ fn sortie(autorisee: bool, ri: &crate::test_scratch::ScratchFile) -> LocalOutput
     s.declare_current_format_for_test(TAUX, 2);
     s.set_convolution_autorisee(autorisee);
     s.set_convolver_ir(&ri.as_str()).unwrap();
+    // Départ du flux : la boucle de lecture rebâtit le moteur pour le format
+    // (un moteur neuf, sans le retard et la bascule d'une pose en lecture).
+    rebuild_local_convolver(
+        &s.convolver_config,
+        &s.convolver,
+        &s.convolution_autorisee,
+        TAUX,
+        2,
+    )
+    .unwrap();
     s
+}
+
+/// T09b — un filtre posé PENDANT la lecture, sans moteur en service : un
+/// moteur ÉTEINT (simple retard d'un bloc) est posé d'abord, puis le filtre
+/// lui succède par réchauffe et fondu. Le seul saut de temps est le bloc de
+/// silence de la pose : AUCUN échantillon n'est rejoué (chaque trame d'entrée
+/// sort au plus une fois, exactement retardée d'un bloc).
+#[test]
+fn un_filtre_pose_en_lecture_sans_moteur_ne_rejoue_aucun_echantillon_t09b() {
+    let ri = ri_quart();
+    let s = LocalOutput::new("DAC test".to_string());
+    s.declare_current_format_for_test(TAUX, 2);
+    s.set_convolution_autorisee(true);
+    s.set_convolver_ir(&ri.as_str()).unwrap();
+    {
+        let garde = s.convolver.lock().unwrap();
+        let moteur = garde.as_ref().expect("un moteur est posé tout de suite");
+        assert!(
+            moteur.bascule_en_cours(),
+            "le filtre arrive par réchauffe et fondu"
+        );
+    }
+    let lat = 1024;
+    let entree = sinus(2_000);
+    let mut pcm = entree.clone();
+    for bloc in pcm.chunks_mut(480 * 2) {
+        passer(&s, bloc);
+    }
+    // Le bloc de la pose : du silence (le retard s'amorce), jamais l'entrée.
+    assert!(
+        pcm[..lat * 2].iter().all(|v| *v == 0.0),
+        "trou de pose attendu"
+    );
+    // Pendant la réchauffe (64 prises + un bloc) : l'entrée exactement
+    // retardée d'un bloc.
+    for n in lat..(64 + lat) {
+        assert_eq!(
+            pcm[2 * n],
+            entree[2 * (n - lat)],
+            "trame {n} rejouée ou altérée"
+        );
+    }
 }
 
 #[test]
@@ -155,4 +207,30 @@ fn le_droit_retire_en_lecture_eteint_la_convolution_sans_clic_7632() {
     )
     .unwrap();
     assert!(!bati);
+}
+
+/// Relecture de #9452 — le droit est relu SOUS le verrou au moment de poser
+/// le moteur : un jeu posé alors que le droit vient d'être retiré ne
+/// convolue pas, et le jeu reste mémorisé.
+#[test]
+fn un_jeu_pose_sans_le_droit_ne_pose_aucun_moteur_t09b() {
+    let ri = ri_quart();
+    let s = LocalOutput::new("DAC test".to_string());
+    s.declare_current_format_for_test(TAUX, 2);
+    s.set_convolution_autorisee(true);
+    s.set_convolver_ir(&ri.as_str()).unwrap();
+    assert!(
+        s.convolver.lock().unwrap().is_some(),
+        "avec le droit, un moteur"
+    );
+    s.set_convolution_autorisee(false);
+    s.set_convolver_ir(&ri.as_str()).unwrap();
+    assert!(s.has_convolver(), "le jeu reste mémorisé");
+    let garde = s.convolver.lock().unwrap();
+    if let Some(m) = garde.as_ref() {
+        assert!(
+            !m.bascule_en_cours(),
+            "aucun nouveau filtre ne prend la main sans le droit"
+        );
+    }
 }

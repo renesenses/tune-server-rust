@@ -1981,6 +1981,7 @@ impl LocalOutput {
         let current_format = self
             .current_format()
             .filter(|_| self.convolution_autorisee.load(Ordering::Relaxed));
+        let fondu = Self::trames_de_fondu(current_format);
         let active = match current_format {
             Some((sample_rate, channels)) => {
                 match config.build_for(1024, sample_rate, channels as usize) {
@@ -1988,15 +1989,16 @@ impl LocalOutput {
                     Err(error) => {
                         // La configuration reste mémorisée pour une prochaine
                         // piste compatible, mais l'ancien moteur ne doit jamais
-                        // continuer à corriger le format courant.
-                        *self.convolver.lock().unwrap() = None;
+                        // continuer à corriger le format courant : il s'éteint
+                        // (en fondu s'il joue, T09b).
+                        self.installer_moteur(None, fondu);
                         return Err(error);
                     }
                 }
             }
             None => None,
         };
-        *self.convolver.lock().unwrap() = active;
+        self.installer_moteur(active, fondu);
         tracing::info!(
             path,
             device = %self.device_name,
@@ -2012,8 +2014,103 @@ impl LocalOutput {
 
     pub fn clear_convolver(&self) {
         *self.convolver_config.lock().unwrap() = None;
-        *self.convolver.lock().unwrap() = None;
+        // T09b — flux en cours, le filtre retiré s'éteint en fondu (le moteur
+        // reste un simple retard jusqu'à la piste suivante, qui ne le
+        // reconstruit pas) : ni clic ni saut de temps.
+        self.installer_moteur(None, Self::trames_de_fondu(self.current_format()));
         tracing::info!(device = %self.device_name, "convolver_cleared");
+    }
+
+    /// T09b — durée des fondus de changement de filtre : 20 ms à la cadence du
+    /// flux en cours ; 0 sans flux (remplacement immédiat, rien ne joue).
+    fn trames_de_fondu(format: Option<(u32, u16)>) -> usize {
+        format
+            .map(|(taux, _)| (taux as usize / 50).max(1))
+            .unwrap_or(0)
+    }
+
+    /// T09b — poser le moteur de convolution SANS discontinuité.
+    ///
+    /// Flux en cours (`fondu > 0`) et moteur en service : un nouveau filtre
+    /// le remplace par [`Convolver::remplacer_en_fondu`] (réchauffe muette,
+    /// puis fondu de 20 ms à latence égale) ; un retrait l'éteint en fondu
+    /// ([`Convolver::eteindre_en_fondu`]). Sinon (rien ne joue, ou moteur
+    /// incompatible : canaux ou bloc), remplacement direct, comme avant.
+    fn installer_moteur(
+        &self,
+        nouveau: Option<super::super::audio::convolver::Convolver>,
+        fondu: usize,
+    ) {
+        // Ce qui est retiré sort du verrou et n'est libéré qu'après : le fil
+        // audio, qui prend ce verrou à chaque bloc, n'attend jamais une
+        // libération.
+        let mut a_liberer: [Option<Box<super::super::audio::convolver::Convolver>>; 2] =
+            [None, None];
+        let mut remplace = None;
+        let mut refuse = None;
+        let joue = fondu > 0;
+        // Le moteur de retard d'une pose en lecture est bâti AVANT le verrou
+        // (allocation et FFT hors du verrou de la boucle de lecture) ; libéré
+        // après s'il ne sert pas.
+        let mut retard = match (&nouveau, joue) {
+            (Some(n), true) => Some(super::super::audio::convolver::Convolver::retard_seul(
+                n.channels(),
+                n.block_size(),
+            )),
+            _ => None,
+        };
+        {
+            let mut actif = self.convolver.lock().unwrap();
+            // Le droit est relu SOUS le verrou : un retrait du Premium
+            // concurrent (`set_convolution_autorisee`) n'est jamais ignoré.
+            let nouveau = match nouveau {
+                Some(n) if !self.convolution_autorisee.load(Ordering::Relaxed) => {
+                    refuse = Some(n);
+                    None
+                }
+                n => n,
+            };
+            match nouveau {
+                Some(n) if joue && actif.is_some() => {
+                    let resultat = match actif.as_mut() {
+                        Some(ancien) => ancien.remplacer_en_fondu_en_rendant(n, fondu),
+                        None => Err(n),
+                    };
+                    match resultat {
+                        Ok(r) => a_liberer = r,
+                        Err(n) => remplace = actif.replace(n),
+                    }
+                }
+                None if joue && actif.is_some() => {
+                    if let Some(ancien) = actif.as_mut() {
+                        a_liberer = ancien.eteindre_en_fondu_en_rendant(fondu);
+                    }
+                }
+                // Flux en cours SANS moteur : d'abord un moteur ÉTEINT, qui
+                // retarde seulement l'entrée de sa latence — le SEUL saut de
+                // temps, un bloc de silence à la pose, sans aucun échantillon
+                // rejoué —, puis le vrai filtre lui succède par réchauffe et
+                // fondu. Radio comprise : rien n'attend une jonction.
+                Some(n) if joue => {
+                    let pose = match retard.take() {
+                        Some(mut r) => match r.remplacer_en_fondu_en_rendant(n, fondu) {
+                            Ok(rendus) => {
+                                a_liberer = rendus;
+                                r
+                            }
+                            Err(n) => n,
+                        },
+                        None => n,
+                    };
+                    remplace = actif.replace(pose);
+                }
+                n => remplace = std::mem::replace(&mut *actif, n),
+            }
+        }
+        drop(retard);
+        drop(refuse);
+        drop(remplace);
+        drop(a_liberer);
     }
 
     /// #7632 — accorder ou retirer le droit de convoluer (Premium
@@ -2032,12 +2129,15 @@ impl LocalOutput {
                 .current_format()
                 .map(|(taux, _)| (taux as usize / 50).max(1))
                 .unwrap_or(0);
+            // Les moteurs retirés sortent du verrou avant d'être libérés.
+            let mut a_liberer = [None, None];
             if let Ok(mut c) = self.convolver.lock()
                 && let Some(conv) = c.as_mut()
             {
-                conv.eteindre_en_fondu(trames);
+                a_liberer = conv.eteindre_en_fondu_en_rendant(trames);
                 tracing::info!(device = %self.device_name, trames, "convolution_eteinte_sans_licence");
             }
+            drop(a_liberer);
         }
         avant != autorisee
     }
@@ -4735,18 +4835,24 @@ fn rebuild_local_convolver(
         Some(config) => match config.build_for(1024, sample_rate, channels as usize) {
             Ok(convolver) => Some(convolver),
             Err(error) => {
-                if let Ok(mut current) = active.lock() {
-                    *current = None;
-                }
+                // L'ancien moteur sort du verrou avant d'être libéré.
+                let ancien = active.lock().ok().and_then(|mut c| c.take());
+                drop(ancien);
                 return Err(error);
             }
         },
         None => None,
     };
     let enabled = next.is_some();
-    *active
-        .lock()
-        .map_err(|_| "verrou du convolveur actif empoisonné".to_string())? = next;
+    // Le moteur est bâti AVANT le verrou (ci-dessus) ; sous le verrou, un
+    // simple échange, et l'ancien moteur est libéré après.
+    let ancien = std::mem::replace(
+        &mut *active
+            .lock()
+            .map_err(|_| "verrou du convolveur actif empoisonné".to_string())?,
+        next,
+    );
+    drop(ancien);
     Ok(enabled)
 }
 
@@ -9071,6 +9177,11 @@ impl OutputTarget for LocalOutput {
                     LocalOutput::pack_format(sample_rate, channels),
                     Ordering::Relaxed,
                 );
+                // Un format qui change à la jonction : le moteur est rebâti
+                // pour le nouveau format (le rééchantillonnage du filtre est
+                // en cache, préparé en tâche de fond dès la pose du jeu).
+                // S'il n'y avait pas de moteur, le flux prend ici sa latence
+                // (un bloc, 21 ms à 48 kHz), à cette jonction précise.
                 if convolver_format_changed {
                     match rebuild_local_convolver(
                         &convolver_config,

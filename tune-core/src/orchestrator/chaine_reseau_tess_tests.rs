@@ -535,7 +535,8 @@ fn t06_egaliseur_et_crossfeed_en_f64_sur_la_chaine_reseau() {
     // … et il reste inaudible (−120 dBFS).
     assert!(e_ancien < 1e-6, "écart f32↔f64 {e_ancien:e}");
 
-    // Contre-épreuve 2 : la sonde voit la frontière du convolveur f32.
+    // T09b : avec le convolveur aussi, AUCUNE frontière f32 (il est en f64
+    // natif depuis T09b ; avant, la sonde y voyait son adaptateur).
     let mut avec_conv = neuf();
     avec_conv.convolver = Some(Convolver::new(
         &[vec![0.5f32, 0.25, 0.125], vec![0.5f32, 0.25, 0.125]],
@@ -543,10 +544,16 @@ fn t06_egaliseur_et_crossfeed_en_f64_sur_la_chaine_reseau() {
     ));
     let mut pcm = src.clone();
     let frontieres = crate::tess::sonde_f32::compter(|| avec_conv.process(&mut pcm, bits));
-    assert!(
-        frontieres > 0,
-        "la sonde ne voit pas l'adaptateur f32 du convolveur"
+    assert_eq!(
+        frontieres, 0,
+        "{frontieres} frontières f32 avec le convolveur"
     );
+    // Contre-épreuve 2 : la sonde voit bien une frontière quand il y en a une.
+    let vue = crate::tess::sonde_f32::compter(|| {
+        crate::tess::sonde_f32::noter();
+        avec_conv.process(&mut pcm, bits);
+    });
+    assert_eq!(vue, 1, "la sonde ne compte pas les frontières");
 }
 
 /// Garde-fou mémoire (relecture de #9414) : une piste compensée plus longue
