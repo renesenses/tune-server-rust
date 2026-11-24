@@ -1,5 +1,7 @@
 //! Operator-controlled native audio packages. No default trust key and no
-//! unsigned installation switch. Libraries activate only during startup.
+//! unsigned installation switch. Built-in slots activate during startup;
+//! a third-party DSP package also activates right after its installation
+//! (TESS T14, [`activer_tiers_sans_redemarrage`]).
 use crate::{auth::RequireAdmin, state::AppState};
 use axum::{
     Json, Router,
@@ -11,15 +13,71 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 use std::path::PathBuf;
+/// La racine des greffons audio natifs (et de leur journal de travaux,
+/// `jobs/`). Voir [`resoudre_la_racine`] pour les règles.
 pub fn root() -> PathBuf {
-    std::env::var_os("TUNE_AUDIO_PLUGINS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            std::env::var_os("TUNE_PLUGINS_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| PathBuf::from("plugins"))
-                .join("audio")
-        })
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let base = crate::chemins_de_donnees::base_retenue()
+        .map(str::to_owned)
+        .or_else(|| std::env::var("TUNE_DB_PATH").ok());
+    resoudre_la_racine(
+        std::env::var_os("TUNE_AUDIO_PLUGINS_DIR"),
+        std::env::var_os("TUNE_PLUGINS_DIR"),
+        std::env::var("TUNE_DATA_DIR").ok(),
+        base.as_deref(),
+        &cwd,
+        |chemin| chemin.is_dir(),
+    )
+}
+
+/// #9343 — règle pure derrière [`root`] ; l'environnement lui est passé.
+///
+/// Avant, sans `TUNE_AUDIO_PLUGINS_DIR` ni `TUNE_PLUGINS_DIR`, la racine
+/// valait `plugins/audio`, RELATIF au répertoire courant. Un serveur macOS
+/// lancé à l'ouverture de session a `/` pour répertoire courant, en lecture
+/// seule : « Convertir » échouait en « Read-only file system (os error 30) »
+/// dès l'écriture du journal des travaux, et aucun greffon audio ne pouvait
+/// s'installer. Même défaut dans l'image Docker (`/app`, propriété de root)
+/// et sur Tune OS Raspberry Pi (`ReadWritePaths=/opt/tune/data`).
+///
+/// 1. `TUNE_AUDIO_PLUGINS_DIR`, tel quel ;
+/// 2. `$TUNE_PLUGINS_DIR/audio` ;
+/// 3. **reprise** : `<cwd>/plugins/audio` s'il existe déjà — les greffons
+///    installés par un serveur lancé depuis son dossier (.deb sous
+///    `/var/lib/tune`, Tune OS NUC sous `/opt/tune`, `.command` macOS) restent
+///    là où ils sont, rien n'est déplacé ni perdu ;
+/// 4. `<dossier de données>/plugins/audio`, le dossier de données étant
+///    résolu comme partout ailleurs ([`crate::gel_executeur::dossier_de_donnees`] :
+///    `TUNE_DATA_DIR`, sinon le dossier de la base retenue au démarrage —
+///    `~/Library/Application Support/Tune` sur macOS) ;
+/// 5. sans dossier de données connu (base en mémoire), `<cwd>/plugins/audio`,
+///    mais ABSOLU.
+pub(crate) fn resoudre_la_racine(
+    audio_env: Option<std::ffi::OsString>,
+    plugins_env: Option<std::ffi::OsString>,
+    data_dir_env: Option<String>,
+    db_path: Option<&str>,
+    cwd: &std::path::Path,
+    existe: impl Fn(&std::path::Path) -> bool,
+) -> PathBuf {
+    if let Some(dossier) = audio_env.filter(|d| !d.is_empty()) {
+        return PathBuf::from(dossier);
+    }
+    if let Some(dossier) = plugins_env.filter(|d| !d.is_empty()) {
+        return PathBuf::from(dossier).join("audio");
+    }
+    let historique = cwd.join("plugins").join("audio");
+    if existe(&historique) {
+        return historique;
+    }
+    let data_dir = data_dir_env.filter(|d| !d.trim().is_empty());
+    let db_path = db_path.filter(|p| !p.trim().is_empty() && *p != ":memory:");
+    if data_dir.is_none() && db_path.is_none() {
+        return historique;
+    }
+    crate::gel_executeur::dossier_de_donnees(data_dir.as_deref(), db_path.unwrap_or(""), cwd)
+        .join("plugins")
+        .join("audio")
 }
 /// #5149 — clé publique minisign des greffons natifs de Mozaiklabs (id
 /// `24A5D1CD444CB780`). Paire DÉDIÉE aux greffons, distincte de la clé des
@@ -88,15 +146,7 @@ pub fn load_installed(settings: &tune_core::db::settings_repo::SettingsRepo) {
         let loaded = keys
             .as_ref()
             .map_err(Clone::clone)
-            .and_then(|keys| tune_plugin_native::package::load(&directory, &id, keys))
-            .and_then(|library| {
-                // Un greffon natif tiers n'a de place que sur la chaîne DSP.
-                if tiers && library.manifest.kind != tune_plugin_sdk::manifest::PluginKind::Dsp {
-                    Err("third-party native plugins must be DSP plugins".to_string())
-                } else {
-                    Ok(library)
-                }
-            });
+            .and_then(|keys| charger(&directory, keys, &id, tiers));
         match loaded {
             Ok(library) => {
                 if let Err(error) = tune_plugin_native::register(library) {
@@ -108,6 +158,81 @@ pub fn load_installed(settings: &tune_core::db::settings_repo::SettingsRepo) {
                 tune_plugin_native::record_failure(&id, error);
             }
         }
+    }
+}
+
+/// Vérifie (signature, manifeste) et charge la bibliothèque du greffon `id`
+/// installé sous `directory`. Un greffon natif tiers n'a de place que sur la
+/// chaîne DSP : un autre type est refusé.
+fn charger(
+    directory: &std::path::Path,
+    keys: &[String],
+    id: &str,
+    tiers: bool,
+) -> Result<std::sync::Arc<tune_plugin_native::Library>, String> {
+    let library = tune_plugin_native::package::load(directory, id, keys)?;
+    if tiers && library.manifest.kind != tune_plugin_sdk::manifest::PluginKind::Dsp {
+        return Err("third-party native plugins must be DSP plugins".to_string());
+    }
+    Ok(library)
+}
+
+/// TESS T14 — active un greffon natif TIERS sans redémarrer le serveur :
+/// juste après son installation (envoi direct ou catalogue) ou un retour à
+/// la version précédente. Le paquet est vérifié et chargé comme au
+/// démarrage ([`charger`]), puis inscrit au registre : la prochaine chaîne
+/// composée (piste suivante, réglage de zone) le prend ; les étages déjà
+/// construits gardent l'ancienne bibliothèque jusqu'à leur destruction.
+///
+/// Rend `Ok(true)` si le greffon est en service, `Ok(false)` s'il n'est pas
+/// demandé (désactivé). Deux activations du même processus ne se croisent
+/// pas (verrou [`ACTIVATION`]) : le paquet lu est toujours la version active
+/// au moment de l'inscription, jamais une version plus ancienne inscrite en
+/// dernier. Un échec de chargement n'est PAS inscrit comme échec
+/// du greffon : une version précédente déjà en service le reste, et le
+/// démarrage suivant rejouera le chargement.
+/// Sérialise les activations à chaud (installation, retour arrière).
+static ACTIVATION: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+pub(crate) fn activer_tiers_sans_redemarrage(
+    settings: &tune_core::db::settings_repo::SettingsRepo,
+    id: &str,
+) -> Result<bool, String> {
+    if !tune_core::audio::natifs_tiers::identifiant_admissible(id) {
+        return Err("invalid plugin id".into());
+    }
+    let _verrou = ACTIVATION.lock().unwrap_or_else(|e| e.into_inner());
+    if !tune_core::audio::natifs_tiers::demande(settings, id) {
+        return Ok(false);
+    }
+    let keys = trusted_keys()?;
+    let library = charger(&root(), &keys, id, true)?;
+    tune_plugin_native::register(library).map_err(|e| e.to_string())?;
+    tune_plugin_native::forget_failure(id);
+    tracing::info!(%id, "native_audio_third_party_activated_without_restart");
+    Ok(true)
+}
+
+/// [`activer_tiers_sans_redemarrage`] hors du fil asynchrone (le chargement
+/// lit et vérifie le paquet, puis ouvre la bibliothèque). Rend
+/// `(restart_required, activation_error)` pour la réponse de la route. Un
+/// greffon désactivé n'attend rien d'un redémarrage : `false`, sans erreur
+/// (c'est `active: false` de l'état des greffons qui le dit).
+pub(crate) async fn activer_apres_installation(
+    state: &AppState,
+    id: &str,
+) -> (bool, Option<String>) {
+    let settings = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    let id = id.to_owned();
+    match tokio::task::spawn_blocking(move || activer_tiers_sans_redemarrage(&settings, &id)).await
+    {
+        // En service, ou désactivé : aucun redémarrage n'y changerait rien.
+        Ok(Ok(_)) => (false, None),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "native_audio_hot_activation_failed");
+            (true, Some(error))
+        }
+        Err(error) => (true, Some(error.to_string())),
     }
 }
 pub fn router() -> Router<AppState> {
@@ -198,7 +323,9 @@ async fn status(_admin: RequireAdmin, State(state): State<AppState>) -> Response
 /// - `engine` : `"native"` (paquet chargé), `"bundled"` (intégré, moteur
 ///   embarqué) ou `null` (greffon tiers sans bibliothèque chargée) ;
 /// - `restart_required` : voulu actif mais pas encore en service. Seul un
-///   tiers est dans ce cas : il ne charge sa bibliothèque qu'au démarrage.
+///   tiers peut être dans ce cas : il est chargé à son installation (TESS
+///   T14, [`activer_tiers_sans_redemarrage`]) ou au démarrage, et ne reste en
+///   attente que si ce chargement à chaud a échoué.
 ///   Un intégré agit dès l'installation, ses portes lisant ses réglages à
 ///   chaque appel ([`crate::premium_audio_plugins::agit_sans_redemarrage`]) :
 ///   l'upsampler installé en cours de session marche aussitôt, et n'attend
@@ -280,8 +407,21 @@ async fn install(
     };
     match install_package(&state, &id, tiers, body.to_vec(), signature, None).await {
         Ok(package) => {
-            Json(json!({"id":id,"installed":true,"restart_required":true,"target":package.target}))
-                .into_response()
+            // TESS T14 — un greffon tiers agit sans redémarrage ; un
+            // emplacement intégré garde son cycle (démarrage).
+            let (restart_required, activation_error) = if tiers {
+                activer_apres_installation(&state, &id).await
+            } else {
+                (true, None)
+            };
+            Json(json!({
+                "id": id,
+                "installed": true,
+                "restart_required": restart_required,
+                "activation_error": activation_error,
+                "target": package.target,
+            }))
+            .into_response()
         }
         Err(e) => refusal(e),
     }
@@ -308,7 +448,9 @@ pub(crate) async fn check_slot(state: &AppState, id: &str) -> Result<bool, Respo
     Ok(tiers)
 }
 
-/// Vérifie puis installe un paquet signé pour le PROCHAIN démarrage, et pose
+/// Vérifie puis installe un paquet signé (actif au démarrage suivant ; un
+/// greffon tiers est en plus activé aussitôt par l'appelant,
+/// [`activer_apres_installation`]), et pose
 /// les drapeaux `plugin_{id}_installed|enabled`. `version` est la version
 /// annoncée par le catalogue (le manifeste du SDK n'en porte pas) : elle est
 /// retenue sous `plugin_{id}_version` pour l'écran Extensions.
@@ -398,7 +540,21 @@ async fn rollback(
     };
     match tune_plugin_native::package::rollback(&root(), &id, &keys) {
         Ok(active) => {
-            Json(json!({"id":id,"active":active,"restart_required":true})).into_response()
+            // TESS T14 — la version précédente d'un greffon tiers reprend la
+            // main sans redémarrage, comme une installation.
+            let (restart_required, activation_error) =
+                if !tune_core::audio::premium_plugins::contains(&id) {
+                    activer_apres_installation(&state, &id).await
+                } else {
+                    (true, None)
+                };
+            Json(json!({
+                "id": id,
+                "active": active,
+                "restart_required": restart_required,
+                "activation_error": activation_error,
+            }))
+            .into_response()
         }
         Err(e) => refusal(e),
     }
@@ -677,3 +833,100 @@ mod crossfeed_gratuit_9210_tests {
 #[cfg(test)]
 #[path = "native_audio_etat_9151_tests.rs"]
 mod etat_9151_tests;
+
+#[cfg(test)]
+mod racine_9343_tests {
+    use super::resoudre_la_racine;
+    use std::path::{Path, PathBuf};
+
+    const SUPPORT: &str = "/Users/manfred/Library/Application Support/Tune";
+
+    /// Le cas du fil 2996 : LaunchAgent macOS, répertoire courant `/`, base
+    /// résolue sous `Application Support`. La racine ne doit plus être
+    /// relative au répertoire courant.
+    #[test]
+    fn lance_depuis_la_racine_le_dossier_suit_la_base_et_non_le_repertoire_courant() {
+        let base = format!("{SUPPORT}/tune.db");
+        let racine = resoudre_la_racine(None, None, None, Some(&base), Path::new("/"), |_| false);
+        assert!(
+            racine.is_absolute(),
+            "racine relative : {}",
+            racine.display()
+        );
+        assert_eq!(racine, Path::new(SUPPORT).join("plugins/audio"));
+    }
+
+    #[test]
+    fn tune_data_dir_l_emporte_sur_le_dossier_de_la_base() {
+        let racine = resoudre_la_racine(
+            None,
+            None,
+            Some("/opt/tune/data".into()),
+            Some("/ailleurs/tune.db"),
+            Path::new("/opt/tune"),
+            |_| false,
+        );
+        assert_eq!(racine, PathBuf::from("/opt/tune/data/plugins/audio"));
+    }
+
+    /// Reprise : des greffons déjà installés sous `<cwd>/plugins/audio` ne
+    /// sont pas perdus.
+    #[test]
+    fn l_ancien_emplacement_existant_reste_servi() {
+        let racine = resoudre_la_racine(
+            None,
+            None,
+            Some("/opt/tune/data".into()),
+            Some("/opt/tune/data/tune.db"),
+            Path::new("/opt/tune"),
+            |p| p == Path::new("/opt/tune/plugins/audio"),
+        );
+        assert_eq!(racine, PathBuf::from("/opt/tune/plugins/audio"));
+    }
+
+    /// .deb : base relative sous `WorkingDirectory=/var/lib/tune` — rien ne
+    /// change de place.
+    #[test]
+    fn base_relative_le_dossier_est_celui_d_avant_mais_absolu() {
+        let racine = resoudre_la_racine(
+            None,
+            None,
+            None,
+            Some("tune.db"),
+            Path::new("/var/lib/tune"),
+            |_| false,
+        );
+        assert_eq!(racine, PathBuf::from("/var/lib/tune/plugins/audio"));
+        let memoire = resoudre_la_racine(
+            None,
+            None,
+            None,
+            Some(":memory:"),
+            Path::new("/srv"),
+            |_| false,
+        );
+        assert_eq!(memoire, PathBuf::from("/srv/plugins/audio"));
+    }
+
+    #[test]
+    fn les_variables_d_exploitant_restent_prioritaires() {
+        let racine = resoudre_la_racine(
+            Some("/x/audio".into()),
+            Some("/y".into()),
+            None,
+            Some("/z/tune.db"),
+            Path::new("/"),
+            |_| true,
+        );
+        assert_eq!(racine, PathBuf::from("/x/audio"));
+        let racine = resoudre_la_racine(
+            None,
+            Some("/y".into()),
+            None,
+            Some("/z/tune.db"),
+            Path::new("/"),
+            |_| true,
+        );
+        assert_eq!(racine, PathBuf::from("/y/audio"));
+    }
+}

@@ -7,22 +7,24 @@ impl PositionPoller {
     pub(super) async fn relever_controles_air(&self, zone: &Zone, startup_at: &Instant) {
         let zone_id = zone.id.unwrap_or(0);
         let did = zone.output_device_id.as_deref();
-        let observation = if zone.output_type.as_deref() == Some(TYPE_DE_SORTIE) {
-            let arc = { self.outputs.lock().await.get(did.unwrap_or("")) };
-            if let Some(arc) = arc {
-                let Ok(sortie) = arc.try_lock() else {
-                    return;
-                };
-                sortie
-                    .as_any()
-                    .downcast_ref::<DevialetAirOutput>()
-                    .and_then(DevialetAirOutput::observation_volume)
+        let (observation, sur_l_entree_de_tune) =
+            if zone.output_type.as_deref() == Some(TYPE_DE_SORTIE) {
+                let arc = { self.outputs.lock().await.get(did.unwrap_or("")) };
+                if let Some(arc) = arc {
+                    let Ok(sortie) = arc.try_lock() else {
+                        return;
+                    };
+                    let air = sortie.as_any().downcast_ref::<DevialetAirOutput>();
+                    (
+                        air.and_then(DevialetAirOutput::observation_volume),
+                        air.is_some_and(DevialetAirOutput::sur_l_entree_de_tune),
+                    )
+                } else {
+                    (None, false)
+                }
             } else {
-                None
-            }
-        } else {
-            None
-        };
+                (None, false)
+            };
         self.playback
             .noter_observation_volume_appareil(
                 zone_id,
@@ -59,9 +61,13 @@ impl PositionPoller {
         }) else {
             return;
         };
-        // #8920 — au-dessus de la limite de sécurité, l'ampli y est ramené.
+        // #8920 — au-dessus de la limite de sécurité, l'ampli y est ramené,
+        // seulement s'il est sur l'entrée de Tune (décision du 21/11).
         // Le verrou de la file est rendu AVANT : `set_volume` le reprend.
-        if !zone.fixed_volume && self.depassement_air_a_rappeler(zone_id, &observation) {
+        if !zone.fixed_volume
+            && sur_l_entree_de_tune
+            && self.depassement_air_a_rappeler(zone_id, &observation)
+        {
             drop(attente);
             self.rappeler_air_a_la_securite(zone_id, did, &observation)
                 .await;

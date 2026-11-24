@@ -90,6 +90,8 @@ pub mod profil_par_appareil;
 pub mod profiles;
 pub mod radios;
 pub mod radios_annuaire;
+/// #8452 — Cover+ par station.
+pub mod radios_cover_plus_8452;
 pub mod radios_criteres_7466;
 pub mod radios_libelles;
 pub mod room_calibration;
@@ -503,7 +505,15 @@ pub fn router_with_plugins(
         .to_string_lossy()
         .into_owned();
 
-    let zones_and_playback = zones::router().merge(playback::router());
+    // #9174 — sous l'authentification (posée sur `api`) : la provenance du
+    // lecteur d'une zone navigateur, relais ou local.
+    let zones_and_playback =
+        zones::router()
+            .merge(playback::router())
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                crate::provenance_navigateur_9174::noter_la_provenance,
+            ));
     let api = Router::new()
         .route(
             "/playback/shuffle-all",
@@ -521,6 +531,21 @@ pub fn router_with_plugins(
         .nest("/zones", zones_and_playback)
         // TESS T08 — le catalogue ; 404 = serveur sans TESS (écran caché).
         .route("/tess/catalog", get(zones::tess::catalogue_tess_route))
+        // TESS T17 — préréglages de chaîne (globaux) et mode d'application.
+        .route(
+            "/tess/presets",
+            get(zones::tess_prereglages::lister_prereglages)
+                .post(zones::tess_prereglages::enregistrer_prereglage),
+        )
+        .route(
+            "/tess/presets/{preset_id}",
+            axum::routing::patch(zones::tess_prereglages::renommer_prereglage)
+                .delete(zones::tess_prereglages::supprimer_prereglage),
+        )
+        .route(
+            "/tess/apply-mode",
+            axum::routing::put(zones::tess_prereglages::regler_le_mode),
+        )
         .nest("/playlists", playlists::router())
         .nest("/radios", radios::router())
         .nest("/radio-favorites", radios::radio_favorites_router())

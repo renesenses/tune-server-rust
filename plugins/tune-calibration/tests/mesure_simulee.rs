@@ -775,6 +775,10 @@ fn sans_premium_refus_nomme_avec_premium_les_routes_servent() {
         ("GET", "/mesures/inconnue/resultat", ""),
         ("GET", "/mesures/inconnue/ri.wav", ""),
         ("DELETE", "/mesures/inconnue", ""),
+        ("POST", "/mesures/inconnue/correction/fir", "{}"),
+        ("POST", "/mesures/inconnue/correction/fir.wav", "{}"),
+        ("POST", "/sessions/inconnue/correction/fir", "{}"),
+        ("POST", "/sessions/inconnue/correction/fir.wav", "{}"),
     ];
 
     let db = tune_core::db::sqlite::SqliteDb::open_in_memory().unwrap();
@@ -1348,24 +1352,18 @@ fn anciennes_mesures_relues_sans_perte_et_positions_identiques() {
         &format!("/sessions/{sid}/correction"),
         Some(serde_json::json!({})),
     );
-    // La relecture est exacte au niveau du document (ci-dessus). Entre la
-    // mesure EN MÉMOIRE et sa relecture depuis du texte, serde_json (sans
-    // `float_roundtrip`) peut décaler un flottant d'un ULP : l'ajustement de
-    // l'égaliseur, itératif, peut alors bouger d'un cheveu. Même nombre de
-    // bandes, mêmes fréquences à 1 % près, gains à 0,1 dB près.
+    // La courbe passée par le client JSON doit conserver exactement les
+    // entrées du calcul itératif de l'égaliseur.
     let r_memoire = b.controleur.mesure(&id).unwrap().resultat().unwrap();
     let relu: Vec<f64> = serde_json::from_value(v1["reponse"]["db"].clone()).unwrap();
-    let ulp = r_memoire
-        .reponse
-        .db
-        .iter()
-        .zip(&relu)
-        .filter(|(a, b)| a != b)
-        .count();
-    println!(
-        "T10a relecture v1 : {ulp} valeur(s) sur {} décalée(s) d'un ULP par le texte",
-        relu.len()
-    );
+    assert_eq!(r_memoire.reponse.db.len(), relu.len());
+    for (i, (avant, apres)) in r_memoire.reponse.db.iter().zip(&relu).enumerate() {
+        assert_eq!(
+            avant.to_bits(),
+            apres.to_bits(),
+            "relecture JSON de la fréquence d’indice {i} : {avant:?} / {apres:?}"
+        );
+    }
     let bm = p_mesure["bandes"].as_array().unwrap();
     let bs = p_session["bandes"].as_array().unwrap();
     assert_eq!(bm.len(), bs.len(), "{bm:?} / {bs:?}");
@@ -1615,4 +1613,170 @@ fn un_micro_qui_ne_renvoie_rien_arrete_la_mesure_en_quatre_secondes_9070() {
         "une salve a été jouée vers un micro muet"
     );
     assert!(j.volumes.is_empty(), "le volume de la zone a été touché");
+}
+
+/// C3 (TESS T10b), de bout en bout par les routes : le salon sec est mesuré
+/// (balayage, capture simulée, déconvolution), le FIR est demandé en JSON
+/// puis en `.wav` ; le fichier, relu, est convolué à la pièce VRAIE (pas à
+/// la mesure qui l'a produit) : la réponse corrigée est dans ±1,5 dB de la
+/// cible sur 30 Hz–15 kHz (lissage 1/6 d'octave sous 300 Hz, 1/3 au-dessus,
+/// cible réalignée par la médiane, la pièce vraie n'ayant pas le niveau de
+/// la mesure). Contre-épreuve : la pièce sans filtre échoue au même contrôle.
+/// Puis la phase mixte (latence annoncée = 20 ms) et une session importée
+/// (phase refusée, module seul).
+#[test]
+fn le_fir_de_la_mesure_simulee_ramene_la_piece_vraie_a_1_5_db() {
+    use axum::http::StatusCode;
+    use tower::ServiceExt;
+    use tune_calibration::analysis::LogResponse;
+    use tune_calibration::deconv::ImpulseResponse;
+    use tune_calibration::fir::{ecart_max_a_la_cible_db, lissage_variable, reponse_corrigee};
+    use tune_calibration::target::TargetCurve;
+
+    let sim = RoomSim::dry_living_room(FREQUENCE_MESURE);
+    let b = banc(&sim, 1.0, Some(63.0), "fir");
+    let c = Client::new(&b);
+    let id = b.controleur.lancer(demande(7)).expect("lancée");
+    assert_eq!(
+        attendre_fin(&b.controleur, &id, Duration::from_secs(60)),
+        Etat::Terminee
+    );
+
+    let (code, p) = c.appel(
+        "POST",
+        &format!("/mesures/{id}/correction/fir"),
+        Some(serde_json::json!({})),
+    );
+    assert_eq!(code, StatusCode::OK, "{p}");
+    assert_eq!(p["cadence"], 48_000);
+    assert_eq!(p["prises"], 32_768);
+    assert_eq!(p["latence_trames"], 0);
+    assert_eq!(p["phase_excedentaire"], false);
+    assert_eq!(
+        p["deposer"],
+        "/api/v1/room-correction/ir/upload/7?per_rate=1"
+    );
+    assert!(
+        p["gain_max_db"].as_f64().unwrap() <= 0.05,
+        "{}",
+        p["gain_max_db"]
+    );
+
+    // Le fichier, par la route `.wav`.
+    let wav = |chemin: String, corps: serde_json::Value| {
+        let req = axum::http::Request::post(chemin)
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(corps.to_string()))
+            .unwrap();
+        let app = c.app.clone();
+        c.rt.block_on(async move {
+            let r = app.oneshot(req).await.unwrap();
+            let code = r.status();
+            let lat = r
+                .headers()
+                .get("x-tune-latence-trames")
+                .map(|v| v.to_str().unwrap().to_string());
+            let octets = axum::body::to_bytes(r.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            (code, lat, octets.to_vec())
+        })
+    };
+    let (code, lat, octets) = wav(
+        format!("/mesures/{id}/correction/fir.wav"),
+        serde_json::json!({}),
+    );
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(lat.as_deref(), Some("0"));
+    let (sr, nc, h) = tune_calibration::rew::wav_read(&octets).unwrap();
+    assert_eq!((sr, nc, h.len()), (48_000, 1, 32_768));
+
+    let cible = TargetCurve::flat();
+    let vraie = ImpulseResponse {
+        sample_rate: FREQUENCE_MESURE,
+        samples: sim.impulse_response(),
+        peak_index: 0,
+        delay_samples: 0,
+    };
+    let grille = LogResponse::grid(20.0, 20_000.0, 48);
+    let ecart = |h: &[f64], latence: usize| {
+        let r = lissage_variable(&reponse_corrigee(&vraie, h, latence, &grille), 6, 3, 300.0);
+        let d = cible.align_offset(&r, 30.0, 15_000.0);
+        ecart_max_a_la_cible_db(&r, &cible, d, 30.0, 15_000.0)
+    };
+    let e = ecart(&h, 0);
+    let e_sans = ecart(&[1.0], 0);
+    eprintln!(
+        "T10b greffon : pièce vraie ⊛ FIR (relu du .wav) écart max 30 Hz–15 kHz {e:.3} dB ; sans FIR {e_sans:.3} dB"
+    );
+    // Critère du plan 1,5 dB ; marge tenue 0,5 dB (0,25 mesuré).
+    assert!(e < 0.5, "écart {e:.2} dB");
+    assert!(e_sans > 4.5, "contre-épreuve : {e_sans:.2} dB");
+
+    // Phase mixte : la latence est celle du pré-tintement annoncé (20 ms).
+    let corps = serde_json::json!({ "phase_excedentaire": true, "format": "f32" });
+    let (code, p) = c.appel(
+        "POST",
+        &format!("/mesures/{id}/correction/fir"),
+        Some(corps.clone()),
+    );
+    assert_eq!(code, StatusCode::OK, "{p}");
+    assert_eq!(p["latence_trames"], 960);
+    assert_eq!(p["latence_ms"], 20.0);
+    assert!(p["energie_pre_tintement_db"].as_f64().is_some());
+    let (code, lat, octets) = wav(format!("/mesures/{id}/correction/fir.wav"), corps);
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(lat.as_deref(), Some("960"));
+    let (_, _, h) = tune_calibration::rew::wav_read(&octets).unwrap();
+    assert_eq!(tune_calibration::fft::argmax_abs(&h), 960);
+    let e = ecart(&h, 960);
+    eprintln!("T10b greffon : phase mixte (f32) écart max {e:.3} dB");
+    // Critère du plan 1,5 dB ; marge tenue 1 dB (0,75 mesuré).
+    assert!(e < 1.0, "phase mixte : {e:.2} dB");
+
+    // Bornes : refus nommé ; mesure inconnue : 404.
+    let (code, e) = c.appel(
+        "POST",
+        &format!("/mesures/{id}/correction/fir"),
+        Some(serde_json::json!({ "relance_max_db": 20.0 })),
+    );
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{e}");
+    assert_eq!(e["error"], "correction_refusee");
+    let (code, _) = c.appel(
+        "POST",
+        "/mesures/inconnue/correction/fir",
+        Some(serde_json::json!({})),
+    );
+    assert_eq!(code, StatusCode::NOT_FOUND);
+
+    // Session importée (une mesure v1, sans RI) : module seul ; phase refusée.
+    let (code, v) = c.appel("POST", "/sessions/import", Some(resultat_fabrique()));
+    assert_eq!(code, StatusCode::CREATED, "{v}");
+    let s = v["id"].as_str().unwrap().to_string();
+    let (code, p) = c.appel(
+        "POST",
+        &format!("/sessions/{s}/correction/fir"),
+        Some(serde_json::json!({})),
+    );
+    assert_eq!(code, StatusCode::OK, "{p}");
+    assert_eq!(p["latence_trames"], 0);
+    let (code, _, octets) = wav(
+        format!("/sessions/{s}/correction/fir.wav"),
+        serde_json::json!({}),
+    );
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(&octets[0..4], b"RIFF");
+    let (code, e) = c.appel(
+        "POST",
+        &format!("/sessions/{s}/correction/fir"),
+        Some(serde_json::json!({ "phase_excedentaire": true })),
+    );
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{e}");
+    let (code, _) = c.appel(
+        "POST",
+        "/sessions/inconnue/correction/fir",
+        Some(serde_json::json!({})),
+    );
+    assert_eq!(code, StatusCode::NOT_FOUND);
+    assert!(b.hote.journal().profils.is_empty(), "un FIR n'écrit rien");
 }

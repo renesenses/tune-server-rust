@@ -307,9 +307,24 @@ impl RadioRepo {
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
         let sql = self.dialect_sql(sql::delete, sql::delete);
-        let params: [&dyn ToSqlValue; 1] = [&id];
-        self.db.execute(&sql, &params)?;
-        Ok(())
+        // #8452 — le réglage Cover+ de la station part avec elle, dans la
+        // MÊME transaction : une station recréée sous le même identifiant
+        // n'hérite pas d'un « off », et un effacement qui échoue annule la
+        // suppression au lieu de laisser un réglage orphelin.
+        let efface_reglage = self.dialect_sql(
+            crate::db::settings_repo::sql::delete_by_key,
+            crate::db::settings_repo::sql::delete_by_key,
+        );
+        let cle = crate::cover_plus::cle_reglage_station(id);
+        self.db
+            .write_tx(&mut |tx| {
+                tx.execute(&sql, &[&id])?;
+                tx.execute(&efface_reglage, &[&cle])?;
+                Ok(())
+            })
+            .inspect_err(|e| {
+                tracing::warn!(station = id, erreur = %e, "radio_suppression_annulee");
+            })
     }
 
     pub fn set_favorite(&self, id: i64, favorite: bool) -> Result<(), String> {
@@ -868,5 +883,51 @@ mod tests {
         assert_eq!(codec(chaine_vide).as_deref(), Some("FLAC"));
         assert_eq!(codec(connue).as_deref(), Some("MP3"));
         assert_eq!(codec(autre), None, "une autre station n'est pas touchée");
+    }
+
+    /// #8452 — la station et son réglage Cover+ partent ensemble ou pas du
+    /// tout : si l'effacement du réglage échoue, la suppression est annulée
+    /// et l'erreur remonte (au lieu d'un réglage orphelin, avalé en debug).
+    #[test]
+    fn suppression_et_reglage_cover_plus_dans_une_transaction() {
+        let db = SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        migrations::run_migrations(&db).unwrap();
+        let db: Arc<dyn DbBackend> = Arc::new(db);
+        let repo = RadioRepo::with_backend(db.clone());
+        let station = RadioStation {
+            id: None,
+            name: "Radio 8452 transaction".into(),
+            url: "https://flux.exemple.net/8452.mp3".into(),
+            homepage: None,
+            logo_url: None,
+            country: None,
+            language: None,
+            genre: None,
+            codec: None,
+            bitrate: None,
+            is_favorite: false,
+            last_played: None,
+            play_count: 0,
+        };
+        let id = repo.create(&station).unwrap();
+        crate::cover_plus::regler_la_station(&db, id, false).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER refus_8452 BEFORE DELETE ON settings \
+             BEGIN SELECT RAISE(ABORT, 'effacement refusé'); END;",
+        )
+        .unwrap();
+        assert!(repo.delete(id).is_err(), "l'échec doit remonter");
+        assert!(
+            repo.get(id).unwrap().is_some(),
+            "la suppression est annulée"
+        );
+        assert!(!crate::cover_plus::actif_pour_la_station(&db, Some(id)));
+
+        // Contre-épreuve : sans le refus, les deux partent.
+        db.execute_batch("DROP TRIGGER refus_8452;").unwrap();
+        repo.delete(id).unwrap();
+        assert!(repo.get(id).unwrap().is_none());
+        assert!(crate::cover_plus::actif_pour_la_station(&db, Some(id)));
     }
 }

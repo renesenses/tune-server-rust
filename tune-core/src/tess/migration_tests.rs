@@ -1295,6 +1295,7 @@ fn contexte_gratuit(dispo: &dyn Fn(&str) -> bool) -> ContexteExecution<'_> {
             control: ControleVolume::Software,
             db: 0.0,
         },
+        replaygain_actif: false,
     }
 }
 

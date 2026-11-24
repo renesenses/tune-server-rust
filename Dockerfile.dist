@@ -120,8 +120,11 @@ EXPOSE 8888
 
 VOLUME ["/data", "/music"]
 
+# /system/health, pas /system/stats : la sonde ne porte pas de jeton, et seule
+# une route de la liste publique de tune-server/src/auth.rs (est_route_publique)
+# répond quand l'authentification est active. Épreuve : auth_sondes_docker_tests.rs.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -sf http://localhost:8888/api/v1/system/stats || exit 1
+    CMD curl -sf http://localhost:8888/api/v1/system/health || exit 1
 
 # No `USER tune`: the entrypoint starts as root only to drop to `tune`
 # (uid/gid 1000) at once — or, when PUID/PGID are given, to re-number `tune`

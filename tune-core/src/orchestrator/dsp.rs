@@ -2186,6 +2186,27 @@ impl PlaybackOrchestrator {
     /// sonde — `load_crossfeed_processor` ne rend `None` que sur le mode PURE,
     /// la case décochée ou un `amount` nul, et aucun des trois ne dépend du
     /// taux ; seule la longueur de la ligne à retard en dépend.
+    /// TESS T12c (décision du 23/11) — sur une sortie hors TESS (HQPlayer et
+    /// l'autre transport), un traitement de zone conservé (égaliseur,
+    /// correction de pièce, ReplayGain) fait-il passer les pistes par le flux
+    /// traité de Tune ? Le crossfeed y est alors porté par le même relais.
+    /// Faux en PURE. Le ReplayGain est jugé à son réglage (il dépend aussi de
+    /// la piste) : la réponse reste un « peut s'appliquer ».
+    pub fn zone_traite_le_flux_hors_tess(&self, zone_id: i64) -> bool {
+        if self.zone_audiophile(zone_id) {
+            return false;
+        }
+        let replaygain = crate::db::settings_repo::SettingsRepo::with_backend(self.db.clone())
+            .get(crate::audio::replaygain::MODE_KEY)
+            .ok()
+            .flatten()
+            .is_some_and(|m| {
+                crate::audio::replaygain::ReplayGainMode::from_setting(&m)
+                    != crate::audio::replaygain::ReplayGainMode::Off
+            });
+        self.zone_has_active_eq(zone_id) || self.zone_has_active_ir(zone_id) || replaygain
+    }
+
     pub(super) fn zone_has_active_crossfeed(&self, zone_id: i64) -> bool {
         self.load_crossfeed_processor(zone_id, 44100).is_some()
     }

@@ -103,7 +103,7 @@ impl ReponseCatalogue {
             .plugins
             .iter()
             .map(|d| {
-                let entitled = premium || !d.entitlement.demande_le_premium();
+                let entitled = premium || !d.demande_le_premium();
                 let available = disponible(&d.id);
                 let reason = if !available {
                     Some(MotifEtape::PluginUnavailable)
@@ -574,6 +574,7 @@ mod tests {
                 control: ControleVolume::Software,
                 db: -18.0,
             },
+            replaygain_actif: false,
         }
     }
 

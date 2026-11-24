@@ -66,6 +66,8 @@ async fn faux_spotify_2026() -> (SpotifyService, Recu) {
     let app = axum::Router::new()
         .route("/v1/playlists/{id}", get(playlist))
         .route("/v1/playlists/{id}/items", get(elements).post(ajouter))
+        // #9037 — la playlist suivie d'un autre utilisateur : 403 sur `/items`.
+        .route("/v1/playlists/autrui/items", get(refus))
         .route("/v1/playlists/{id}/tracks", get(refus).post(refus))
         .route("/v1/me/playlists", get(mes_playlists).post(creer))
         .route("/v1/users/{id}/playlists", post(refus))
@@ -131,4 +133,26 @@ async fn creer_et_remplir_une_playlist_passent_par_les_nouvelles_routes_8193() {
         *recu.0.lock().unwrap(),
         ["creer".to_string(), "ajouter:nouvelle".to_string()]
     );
+}
+
+/// #9037 (fil 2828) — une playlist suivie d'un autre utilisateur répond 403
+/// sur `/items` : un refus d'accès qualifié (rendu en 403 avec sa phrase),
+/// plus une erreur générique que la route sortait en 502.
+#[tokio::test]
+async fn une_playlist_d_autrui_refusee_est_un_refus_d_acces_9037() {
+    let (svc, _) = faux_spotify_2026().await;
+    let erreur = svc
+        .get_playlist_tracks("autrui")
+        .await
+        .expect_err("Spotify refuse le contenu");
+    let TuneError::Refused { code, message } = erreur else {
+        panic!("#9037 : un 403 de Spotify doit être un refus qualifié, pas {erreur:?}");
+    };
+    assert_eq!(code, REFUS_ACCES_DU_SERVICE);
+    assert!(
+        message.contains("playlists d'autres utilisateurs"),
+        "{message}"
+    );
+    // Les playlists du compte, elles, s'ouvrent toujours.
+    assert_eq!(svc.get_playlist_tracks("p1").await.expect("p1").len(), 3);
 }
