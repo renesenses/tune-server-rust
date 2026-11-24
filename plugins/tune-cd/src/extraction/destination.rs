@@ -115,15 +115,17 @@ fn refus(motif: &'static str, message: impl Into<String>) -> Refus {
 /// pas exister encore : c'est son plus proche parent existant qui est
 /// vérifié.
 pub fn verifier(demande: &str, emplacements: &[String]) -> Result<PathBuf, Refus> {
-    verifier_avec(demande, emplacements, attributs_de)
+    verifier_avec(demande, emplacements, attributs_de, cfg!(windows))
 }
 
-/// [`verifier`], les attributs de fichier Windows lus par `attributs`
-/// (injectable : l'attribut caché ne se pose pas hors de Windows).
+/// [`verifier`], les attributs de fichier Windows lus par `attributs` et les
+/// règles propres à Windows appliquées si `windows` (injectables : ni
+/// l'attribut caché ni ces règles ne s'exercent hors de Windows).
 fn verifier_avec(
     demande: &str,
     emplacements: &[String],
     attributs: impl Fn(&Path) -> Option<u32>,
+    windows: bool,
 ) -> Result<PathBuf, Refus> {
     let brut = demande.trim();
     if brut.is_empty() {
@@ -146,11 +148,17 @@ fn verifier_avec(
     // intermédiaires sans le dire.
     if brut
         .split(['/', '\\'])
-        .any(|seg| seg == "." || seg == ".." || (cfg!(windows) && segment_vide_sous_windows(seg)))
+        .any(|seg| seg == "." || seg == ".." || (windows && segment_vide_sous_windows(seg)))
     {
         return Err(refus(
             "destination_invalide",
             "La destination ne peut pas contenir « . » ni « .. ».",
+        ));
+    }
+    if windows && brut.split(['/', '\\']).any(nom_reserve_windows) {
+        return Err(refus(
+            "destination_invalide",
+            "La destination contient un nom réservé par Windows (CON, NUL, COM1…).",
         ));
     }
     let Some(racine) = emplacements
@@ -191,7 +199,7 @@ fn verifier_avec(
     // Les noms que Tune crée (`nom_sur`) le remplacent déjà par « _ ».
     if chemin
         .strip_prefix(racine)
-        .is_ok_and(|r| deux_points_interdit(&r.to_string_lossy(), cfg!(windows)))
+        .is_ok_and(|r| deux_points_interdit(&r.to_string_lossy(), windows))
     {
         return Err(refus(
             "destination_invalide",
@@ -202,10 +210,12 @@ fn verifier_avec(
     // qu'il contient : sur le chemin DEMANDÉ (y compris la partie à créer),
     // sur le chemin RÉSOLU (un lien vers `.tune` n'y mène pas), et par
     // l'attribut caché de Windows des dossiers existants.
-    if chemin.strip_prefix(racine).is_ok_and(composants_masques)
+    if chemin
+        .strip_prefix(racine)
+        .is_ok_and(|r| composants_masques(r, windows))
         || existant_reel
             .strip_prefix(&racine_reelle)
-            .is_ok_and(composants_masques)
+            .is_ok_and(|r| composants_masques(r, windows))
         || cache_par_attribut(&existant_reel, &racine_reelle, &attributs)
     {
         return Err(refus_masque());
@@ -304,7 +314,7 @@ pub fn sous_dossiers(
         let Some(nom) = entree.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        if nom_masque(&nom, attributs_windows(&entree)) {
+        if nom_masque(&nom, attributs_windows(&entree), cfg!(windows)) {
             continue;
         }
         let lien = traite_comme_lien(&entree.file_type());
@@ -374,7 +384,7 @@ fn canonique_dans_avec(
     // après `verifier` est refusé ici.
     if reel
         .strip_prefix(&racine_reelle)
-        .is_ok_and(composants_masques)
+        .is_ok_and(|r| composants_masques(r, cfg!(windows)))
         || cache_par_attribut(&reel, &racine_reelle, &attributs)
     {
         return Err(refus_masque());
@@ -390,10 +400,10 @@ fn refus_masque() -> Refus {
 }
 
 /// Un des composants de `reste` (relatif à un emplacement) est-il masqué ?
-fn composants_masques(reste: &Path) -> bool {
+fn composants_masques(reste: &Path, windows: bool) -> bool {
     reste
         .components()
-        .any(|c| nom_masque(&c.as_os_str().to_string_lossy(), None))
+        .any(|c| nom_masque(&c.as_os_str().to_string_lossy(), None, windows))
 }
 
 /// `reel`, ou l'un de ses parents sous `racine_reelle` (exclue), porte-t-il
@@ -449,26 +459,39 @@ fn deux_points_interdit(texte: &str, windows: bool) -> bool {
     windows && texte.contains(':')
 }
 
-/// Un segment que Windows réduit à rien (`.. `, `...`, `. `) : il y vaut
-/// « . » ou « .. ».
+/// Un segment que Windows réduit à « . » ou à « .. » en retirant ses points
+/// et espaces finals (`.. `, `...`, `. `).
 fn segment_vide_sous_windows(seg: &str) -> bool {
     !seg.is_empty() && seg.trim_end_matches(['.', ' ']).is_empty()
+}
+
+/// Un nom réservé par Windows (`NUL`, `CON`, `COM1`…), extension comprise
+/// (`nul.txt`) : même règle que [`nom_sur`].
+fn nom_reserve_windows(seg: &str) -> bool {
+    let racine = seg
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_uppercase();
+    RESERVES.contains(&racine.as_str())
 }
 /// `FILE_ATTRIBUTE_HIDDEN`.
 const ATTRIBUT_CACHE: u32 = 0x2;
 
 /// Un nom de dossier à ne pas proposer ni accepter : AU MOINS ce que le scan
 /// ignore (`SKIP_DIRS`, dossiers système), plus `lost+found`, `.tune` et,
-/// sous Windows, un nom à deux-points (flux NTFS) ou l'attribut caché. Un dossier qui commence simplement par un
-/// point (`.38 Special`) est parcouru par le scan : il reste choisissable.
+/// sous Windows, un nom à deux-points (flux NTFS) ou l'attribut caché. Un
+/// dossier qui commence simplement par un point (`.38 Special`) est parcouru
+/// par le scan : il reste choisissable.
 ///
 /// Le point et l'espace finals sont retirés d'abord (Windows les retire en
 /// créant le dossier : `duplicates.` deviendrait `duplicates`) ; les noms
 /// propres à Tune se comparent sans la casse (montages CIFS, systèmes
 /// insensibles à la casse). `attributs` : les attributs de fichier Windows,
 /// s'ils sont connus.
-fn nom_masque(nom: &str, attributs: Option<u32>) -> bool {
-    if deux_points_interdit(nom, cfg!(windows)) {
+fn nom_masque(nom: &str, attributs: Option<u32>, windows: bool) -> bool {
+    if deux_points_interdit(nom, windows) {
         return true;
     }
     let nom = nom.trim_end_matches(['.', ' ']);
@@ -828,9 +851,9 @@ mod tests {
             assert_eq!(r.motif, "dossier_masque", "{d}");
         }
         // L'attribut caché de Windows (FILE_ATTRIBUTE_HIDDEN = 0x2).
-        assert!(nom_masque("Musique", Some(0x2)));
-        assert!(!nom_masque("Musique", Some(0x10)));
-        assert!(!nom_masque("Musique", None));
+        assert!(nom_masque("Musique", Some(0x2), false));
+        assert!(!nom_masque("Musique", Some(0x10), false));
+        assert!(!nom_masque("Musique", None, false));
     }
 
     // ─── Dossiers masqués par lien, par réglage, par attribut (fil 3036) ──
@@ -915,10 +938,10 @@ mod tests {
         let cache = std::fs::canonicalize(bib.path().join("Cache")).unwrap();
         let attributs = |p: &Path| (p == cache).then_some(ATTRIBUT_CACHE);
         for d in ["Cache", "Cache/dedans", "Cache/neuf"] {
-            let r = verifier_avec(&format!("{racine}/{d}"), &places, attributs).unwrap_err();
+            let r = verifier_avec(&format!("{racine}/{d}"), &places, attributs, false).unwrap_err();
             assert_eq!(r.motif, "dossier_masque", "{d}");
         }
-        assert!(verifier_avec(&format!("{racine}/Visible"), &places, attributs).is_ok());
+        assert!(verifier_avec(&format!("{racine}/Visible"), &places, attributs, false).is_ok());
     }
 
     // ─── Au moins ce que le scan ignore (fil 3036, relecture) ────────────
@@ -946,7 +969,7 @@ mod tests {
         let racine = bib.path().to_string_lossy().to_string();
         let places = [racine.clone()];
         let live = format!("{racine}/Live: 1991");
-        assert!(!nom_masque("Live: 1991", None));
+        assert!(!nom_masque("Live: 1991", None, false));
         assert!(verifier(&live, &places).is_ok());
         assert!(verifier(&format!("{live}/Neuf"), &places).is_ok());
         let l = sous_dossiers(Some(&racine), &places).unwrap();
@@ -1032,6 +1055,39 @@ mod tests {
             assert_eq!(r.motif, "dossier_masque", "{d}");
         }
         assert!(canonique_dans_avec(&bib.path().join("Visible"), &places, attributs).is_ok());
+    }
+
+    /// Le branchement Windows de `verifier`, exercé par injection : retirer
+    /// le refus des segments réduits, des noms réservés ou du « : » (dans
+    /// `verifier` ou dans `nom_masque`) fait rougir ce témoin.
+    #[cfg(unix)]
+    #[test]
+    fn le_branchement_windows_de_verifier_est_exerce() {
+        let bib = tempfile::tempdir().unwrap();
+        std::fs::create_dir(bib.path().join("A")).unwrap();
+        let racine = bib.path().to_string_lossy().to_string();
+        let places = [racine.clone()];
+        let sans = |_: &Path| None;
+        let cas = [
+            "duplicates::$INDEX_ALLOCATION",
+            "A/.. /x",
+            "A/.../x",
+            "A/. /x",
+            "NUL/x",
+            "A/nul.txt",
+            "A/COM1",
+        ];
+        for d in cas {
+            let r = verifier_avec(&format!("{racine}/{d}"), &places, sans, true).unwrap_err();
+            assert_eq!(r.motif, "destination_invalide", "Windows : « {d} »");
+            assert!(
+                verifier_avec(&format!("{racine}/{d}"), &places, sans, false).is_ok(),
+                "ailleurs : « {d} »"
+            );
+        }
+        assert!(verifier_avec(&format!("{racine}/A/Console"), &places, sans, true).is_ok());
+        assert!(nom_masque("a:b", None, true));
+        assert!(!nom_masque("a:b", None, false));
     }
 
     #[cfg(unix)]
