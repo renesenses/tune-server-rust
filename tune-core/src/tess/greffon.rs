@@ -130,7 +130,8 @@ pub struct DescripteurGreffon {
     pub entitlement: Droit,
     /// Le code stable de la `Feature` de `license.rs` qui ouvre ce greffon
     /// (`Feature::code`), quand il y en a une. `None` : le droit Premium
-    /// général. Le lien fin droit ↔ Feature est le travail de T19.
+    /// général. Lien fin droit ↔ Feature (T19) : voir
+    /// [`DescripteurGreffon::demande_le_premium`].
     #[serde(default)]
     pub feature: Option<String>,
     pub origin: Origine,
@@ -185,6 +186,22 @@ pub const PRIORITE_CROSSFEED_TIERS: u8 = 2;
 pub const PRIORITE_CROSSFEED_INTEGRE: u8 = 1;
 
 impl DescripteurGreffon {
+    /// T19 — ce greffon, coché, demande-t-il le Premium ?
+    ///
+    /// Oui si son droit le dit (`entitlement`), OU si sa `feature` nomme un
+    /// droit Premium de `license.rs`. Les deux ne font que S'AJOUTER : une
+    /// `feature` gratuite (`dsp_eq`) ou inconnue de cette version ne rend
+    /// jamais gratuit un greffon déclaré Premium, et un paquet qui se dirait
+    /// `free` tout en citant un droit Premium reste Premium.
+    pub fn demande_le_premium(&self) -> bool {
+        self.entitlement.demande_le_premium()
+            || self
+                .feature
+                .as_deref()
+                .and_then(crate::license::Feature::from_code)
+                .is_some_and(|f| !f.est_gratuite())
+    }
+
     /// Cohérence interne du descripteur (côté serveur, à l'enregistrement).
     pub fn verifier(&self) -> Result<(), ErreurCatalogue> {
         if !id_valide(&self.id) {
@@ -372,7 +389,9 @@ pub fn catalogue_de_reference() -> Catalogue {
             name: "Parametric EQ",
             category: Equalisation,
             entitlement: payant,
-            feature: None,
+            // T19 (Q3) : droit propre, même moteur que le graphique et le
+            // casque (`premium_plugins::SECTIONS_EGALISEUR`).
+            feature: Some("parametric_eq"),
             origin: Reference,
             channels: Any,
             position: libre,

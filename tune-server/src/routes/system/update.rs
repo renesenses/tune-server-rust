@@ -1462,6 +1462,14 @@ mod update_availability_tests {
 /// once the CI signing step is live; verification then becomes mandatory.
 const UPDATE_PUBLIC_KEY: &str = "RWRjeNGnrhiQYHaMp7e0Cmr6PCC4tEY7UwenBFrbDBoIPDB7T9aBRwUM";
 
+/// La vérification de signature des mises à jour est-elle armée ? Tant que
+/// oui, une installation n'aboutit qu'à une release officielle signée : c'est
+/// la condition pour l'ouvrir au réseau local sans authentification
+/// (`auth::AdminOuReseauLocalPourLaMiseAJour`).
+pub(crate) fn mise_a_jour_signee_exigee() -> bool {
+    !UPDATE_PUBLIC_KEY.is_empty()
+}
+
 /// À qui la faute quand une mise à jour ne peut pas être vérifiée.
 ///
 /// La question n'est pas cosmétique. En v0.9.71 la release est restée douze
@@ -2537,7 +2545,10 @@ pub(super) async fn update_check(State(state): State<AppState>) -> Json<Value> {
 /// directly under the warning that playback will stop. It does NOT override
 /// the restart deferral — see [`defer_restart_until_quiet`].
 pub(super) async fn update_install(
-    _garde: crate::auth::AdminOuCetteMachine,
+    // rc13.1 — sans authentification, le réseau local peut installer la
+    // release OFFICIELLE (aucune URL ni version reçue de l'appelant, signature
+    // minisign vérifiée avant toute installation). Voir la garde.
+    _garde: crate::auth::AdminOuReseauLocalPourLaMiseAJour,
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     axum::extract::Query(params): axum::extract::Query<UpdateInstallParams>,
@@ -5042,7 +5053,8 @@ fn marqueur_de_langue(line: &str) -> Option<String> {
         .trim()
         .strip_prefix("lang:")?;
     let tag = crate::i18n::base_tag(inner);
-    (!tag.is_empty() && tag.chars().all(|c| c.is_ascii_alphabetic())).then_some(tag)
+    // `zh-Hant` (rc14) : la seule langue servie qui porte un tiret.
+    (!tag.is_empty() && tag.chars().all(|c| c.is_ascii_alphabetic() || c == '-')).then_some(tag)
 }
 
 /// Découpe un corps de release en blocs `(langue, texte)`, dans l'ordre.

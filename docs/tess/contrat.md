@@ -117,7 +117,7 @@ Un greffon TESS est un traitement du SDK natif : référence compilée
 | `name` | nom d'affichage anglais, traduit par les clients |
 | `category` | groupe de la fenêtre « Add plugin » (A3) : `equalisation`, `spatial`, `room_and_filters`, `restoration_and_routing` |
 | `entitlement` | `free` ou `premium` (inconnu = traité comme Premium) |
-| `feature` | code de la `Feature` de `license.rs` qui ouvre le greffon, ou `null` (droit Premium général) |
+| `feature` | code de la `Feature` de `license.rs` qui ouvre le greffon, ou `null` (droit Premium général). Il ne fait que s'ajouter à `entitlement` (T19) : un greffon est Premium si `entitlement` le dit OU si `feature` nomme un droit Premium ; un code gratuit ou inconnu ne rend jamais gratuit un greffon Premium |
 | `origin` | `reference` ou `package` |
 | `settings_schema` | schéma JSON des réglages (caisse du SDK ou manifeste du paquet) |
 | `placement.channels` | `any`, `stereo_only` (seulement s'il le déclare), `remaps` (change le nombre de canaux) |
@@ -163,7 +163,7 @@ enceintes) agit en sens contraire du crossfeed (pour casque).
 | id | Nom | Catégorie | Droit | `feature` | Origine | Canaux | Place | Groupe (priorité) |
 |---|---|---|---|---|---|---|---|---|
 | `equalizer-graphic` | Graphic EQ | equalisation | Free | — | référence | any | libre | — |
-| `equalizer-parametric` | Parametric EQ | equalisation | **Premium** (Q3) | à fixer (T19) | référence | any | libre | — |
+| `equalizer-parametric` | Parametric EQ | equalisation | **Premium** (Q3) | `parametric_eq` (T19) | référence | any | libre | — |
 | `equalizer-headphone` | Headphone EQ | equalisation | Free | — | référence | any | libre | — |
 | `crossfeed` | Crossfeed | spatial | **Free** (Q2 révisée) | — | référence | stereo_only | libre | crossfeed_crosstalk (1) |
 | `crossfeed-pro` | Crossfeed Pro | spatial | Premium | — | paquet | stereo_only | libre | crossfeed_crosstalk (2) |
@@ -795,10 +795,16 @@ producteur et le rendu transporte des `f64`**, et que la quantification
 
 ### T19 : droits
 
-- Lien droit ↔ `Feature` de `license.rs` par le champ `feature` : Parametric EQ
-  et Declick à fixer, et passage du crossfeed en Free.
-- `ContexteValidation.premium` et `ContexteExecution.premium` deviendront un
-  test par `Feature`.
+- Fait (T19) : `Feature::ParametricEq` (`parametric_eq`, Premium), cité par
+  `equalizer-parametric` ; graphique et casque restent sous `dsp_eq`
+  (gratuit), même moteur (`premium_plugins::SECTIONS_EGALISEUR`).
+  `DescripteurGreffon::demande_le_premium` relie `entitlement` et `feature`
+  pour la validation (402), la résolution et le catalogue. Crossfeed simple
+  déjà Free (#9210) ; Declick (outil de Studio, `declick`) et `declick-live`
+  restent Premium (P1), sans droit propre pour le second.
+- `ContexteValidation.premium` reste un booléen : tous les droits Premium
+  suivent le même palier (`LicenseManager::check_feature`), un test par
+  `Feature` n'apporterait rien tant qu'aucune licence ne vend un droit seul.
 
 ### W1 à W5 : écran
 

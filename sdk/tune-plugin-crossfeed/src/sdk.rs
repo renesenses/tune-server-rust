@@ -75,7 +75,8 @@ impl DspFactory for Crossfeed {
         max_frames: usize,
         s: &Settings,
     ) -> Result<Box<dyn Processor>, Error> {
-        if format.layout() != ChannelLayout::Stereo || format.encoding() == SampleEncoding::F64 {
+        // TESS T06 — `F64` accepté (le manifeste demande `audio-f64`).
+        if format.layout() != ChannelLayout::Stereo {
             return Err(Error::UnsupportedFormat);
         }
         let count = max_frames
@@ -155,7 +156,12 @@ impl Processor for Instance {
                     *x = crate::engine::quantifier_i32(*v);
                 }
             }
-            SamplesMut::F64(_) => return Err(Error::UnsupportedFormat),
+            SamplesMut::F64(s) => {
+                if s.iter().any(|x| !x.is_finite()) {
+                    return Err(Error::NonFinite);
+                }
+                self.engine.process_interleaved_f64(s);
+            }
         }
         Ok(ProcessReport {
             changed: true,

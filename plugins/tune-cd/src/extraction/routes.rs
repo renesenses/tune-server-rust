@@ -5,6 +5,8 @@
 //! * `GET    /lecteurs`             — les lecteurs et leur état ;
 //! * `GET    /extraction/reglages`  — formats, destination, emplacements ;
 //! * `PUT    /extraction/reglages`  — `{ "format", "destination" }` ;
+//! * `GET    /extraction/dossiers?chemin=` — les sous-dossiers où ranger
+//!   l'extraction, sous les emplacements seulement (fil forum 3036) ;
 //! * `POST   /extractions`          — lancer (voir [`DemandeExtraction`]) ;
 //! * `GET    /extractions`          — les extractions connues ;
 //! * `GET    /extractions/{id}`     — suivre une extraction ;
@@ -96,6 +98,7 @@ pub fn router(routes: EtatRoutes, ex: Arc<Extractions>) -> Router<()> {
     Router::new()
         .route("/lecteurs", get(lecteurs))
         .route("/extraction/reglages", get(reglages).put(regler))
+        .route("/extraction/dossiers", get(dossiers))
         .route("/extractions", get(liste).post(lancer))
         .route("/extractions/{id}", get(une).delete(annuler))
         .layer(axum::middleware::from_fn_with_state(
@@ -253,6 +256,47 @@ async fn regler(State(e): State<EtatExtraction>, corps: Bytes) -> Response {
         }
     }
     Json(etat_des_reglages(&e.ex)).into_response()
+}
+
+#[derive(Deserialize)]
+struct DemandeDossiers {
+    chemin: Option<String>,
+}
+
+/// Fil forum 3036 — `GET /extraction/dossiers?chemin=` : sans chemin, les
+/// emplacements ; avec, ses sous-dossiers (voir
+/// [`destination::sous_dossiers`]). Mêmes refus que le réglage de la
+/// destination (`400` + motif), `404 dossier_introuvable` pour un dossier
+/// pas encore créé. Lu hors de l'exécuteur : un partage réseau lent ne
+/// l'immobilise pas.
+async fn dossiers(
+    State(e): State<EtatExtraction>,
+    axum::extract::Query(q): axum::extract::Query<DemandeDossiers>,
+) -> Response {
+    let backend = e.ex.backend.clone();
+    let r = tokio::task::spawn_blocking(move || {
+        destination::sous_dossiers(
+            q.chemin.as_deref(),
+            &destination::emplacements(backend.as_ref()),
+        )
+    })
+    .await;
+    match r {
+        Ok(Ok(liste)) => Json(liste).into_response(),
+        Ok(Err(r)) => {
+            let code = if r.motif == "dossier_introuvable" {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            reponse((code, r.motif, r.message))
+        }
+        Err(err) => reponse((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "lecture_dossier",
+            err.to_string(),
+        )),
+    }
 }
 
 fn format_refuse(f: &str) -> Refus {

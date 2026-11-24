@@ -69,6 +69,9 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     crate::routes::library::renvoi_images_artistes::armer(state);
     spawn_hqplayer_poller(state);
     spawn_session_gc(state);
+    // #9044 (rc14) — dater le départ des appareils, et oublier ceux partis
+    // depuis la durée réglée (30 j par défaut, 0 : jamais).
+    crate::routes::devices::oubli_auto_9044::armer(state);
     spawn_dash_temp_gc();
     spawn_position_poller(state);
     // #6155 — les zones d'un groupe suivent sa meneuse (lecture, pause,
@@ -89,6 +92,8 @@ pub async fn spawn_background_tasks(state: &AppState, config: &TuneConfig) {
     configure_deezer_proxy(state, config).await;
     spawn_alarm_scheduler(state);
     spawn_desktop_notifications(state, config);
+    // #9391 — un exécuteur occupé se dit dans le journal.
+    crate::retard_de_l_executeur_9391::surveiller();
     spawn_memory_diagnostics(
         state.outputs.clone(),
         state.streamer.clone(),

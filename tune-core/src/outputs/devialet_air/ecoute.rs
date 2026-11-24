@@ -35,11 +35,55 @@ impl AmpliVu {
     }
 }
 
+/// #9380 — combien de formes inconnues sont journalisées, au plus.
+pub const FORMES_JOURNALISEES_AU_PLUS: usize = 8;
+
+/// #9380 — un datagramme reçu sur le port des annonces mais écarté.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DatagrammeEcarte {
+    pub ip: IpAddr,
+    pub taille: usize,
+    /// Les deux premiers octets, en texte quand ils sont imprimables
+    /// (`Da`), en hexadécimal sinon.
+    pub entete: String,
+    pub raison: String,
+}
+
+/// #9380 — ce que l'écoute a reçu depuis son ouverture.
+///
+/// Sans ce bilan, « aucun ampli » ne disait rien : rien reçu du tout (le
+/// réseau ou le système ne laisse rien passer) et des annonces reçues mais
+/// d'une forme que Tune ne connaît pas (un autre modèle, un autre
+/// micrologiciel) donnaient le même `0 device(s)`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BilanEcoute {
+    pub datagrammes: u64,
+    pub annonces: u64,
+    pub ecartes: u64,
+    pub dernier_ecarte: Option<DatagrammeEcarte>,
+    /// L'erreur de la dernière ouverture refusée, effacée par une ouverture
+    /// réussie.
+    pub ouverture_refusee: Option<String>,
+}
+
 /// L'état des amplis entendus, par MAC.
 #[derive(Default)]
 pub struct Ecoute {
     amplis: Mutex<HashMap<String, AmpliVu>>,
     tache: Mutex<Option<JoinHandle<()>>>,
+    bilan: Mutex<BilanEcoute>,
+    /// (ip, taille, en-tête) déjà journalisés, pour ne le dire qu'une fois.
+    formes_dites: Mutex<Vec<(IpAddr, usize, String)>>,
+}
+
+/// Les deux premiers octets d'un datagramme, lisibles dans un journal.
+fn entete_lisible(octets: &[u8]) -> String {
+    let tete = &octets[..octets.len().min(2)];
+    if !tete.is_empty() && tete.iter().all(|b| b.is_ascii_graphic()) {
+        String::from_utf8_lossy(tete).into_owned()
+    } else {
+        tete.iter().map(|b| format!("{b:02x}")).collect()
+    }
 }
 
 impl Ecoute {
@@ -57,15 +101,15 @@ impl Ecoute {
     /// Range un datagramme reçu de `ip`. Rend la MAC si c'était une annonce
     /// valide ; tout le reste (autre protocole, CRC faux) est ignoré.
     pub fn noter(&self, ip: IpAddr, octets: &[u8]) -> Option<String> {
+        self.bilan_mut().datagrammes += 1;
         let annonce = match analyser_annonce(octets) {
             Ok(a) => a,
             Err(e) => {
-                if octets.len() == TAILLE_ANNONCE {
-                    debug!(%ip, erreur = %e, "devialet_air_annonce_refusee");
-                }
+                self.ecarter(ip, octets, &e.to_string());
                 return None;
             }
         };
+        self.bilan_mut().annonces += 1;
         let mac = annonce.mac_texte();
         let nouveau = {
             let mut amplis = self.amplis();
@@ -84,6 +128,62 @@ impl Ecoute {
             info!(%ip, %mac, "devialet_air_ampli_entendu");
         }
         Some(mac)
+    }
+
+    fn bilan_mut(&self) -> std::sync::MutexGuard<'_, BilanEcoute> {
+        self.bilan
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// #9380 — un datagramme écarté est compté, et chaque forme nouvelle
+    /// (source, taille, en-tête) est dite UNE fois au-dessus de `debug` : une
+    /// annonce de 345 octets au CRC faux ne laissait qu'un `debug`, et toute
+    /// autre taille rien du tout. Un ampli qui s'annonce dans une forme
+    /// inconnue de Tune restait donc invisible, sans une trace.
+    fn ecarter(&self, ip: IpAddr, octets: &[u8], raison: &str) {
+        let ecarte = DatagrammeEcarte {
+            ip,
+            taille: octets.len(),
+            entete: entete_lisible(octets),
+            raison: raison.to_string(),
+        };
+        {
+            let mut bilan = self.bilan_mut();
+            bilan.ecartes += 1;
+            bilan.dernier_ecarte = Some(ecarte.clone());
+        }
+        let forme = (ip, ecarte.taille, ecarte.entete.clone());
+        let nouvelle = {
+            let mut dites = self
+                .formes_dites
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if dites.contains(&forme) || dites.len() >= FORMES_JOURNALISEES_AU_PLUS {
+                false
+            } else {
+                dites.push(forme);
+                true
+            }
+        };
+        if nouvelle {
+            info!(
+                %ip,
+                taille = ecarte.taille,
+                attendue = TAILLE_ANNONCE,
+                entete = %ecarte.entete,
+                raison = %ecarte.raison,
+                "devialet_air_datagramme_ecarte"
+            );
+        } else {
+            debug!(%ip, taille = ecarte.taille, raison = %ecarte.raison, "devialet_air_datagramme_ecarte");
+        }
+    }
+
+    /// #9380 — ce que l'écoute a reçu depuis son ouverture.
+    #[must_use]
+    pub fn bilan(&self) -> BilanEcoute {
+        self.bilan_mut().clone()
     }
 
     /// Les amplis entendus il y a moins de 2 s.
@@ -129,8 +229,10 @@ impl Ecoute {
         // n'apparaîtrait pas, sans rien dans les journaux pour dire pourquoi.
         let socket = ouvrir_socket_d_ecoute(port).inspect_err(|e| {
             error!(port, erreur = %e, "devialet_air_ecoute_ouverture_refusee");
+            self.bilan_mut().ouverture_refusee = Some(e.clone());
         })?;
         info!(port, "devialet_air_ecoute_ouverte");
+        self.bilan_mut().ouverture_refusee = None;
         let moi = Arc::clone(self);
         *tache = Some(tokio::spawn(async move {
             let mut tampon = vec![0u8; 2048];
@@ -161,6 +263,13 @@ impl Ecoute {
             info!("devialet_air_ecoute_fermee");
         }
         self.amplis().clear();
+        // #9380 — le bilan vaut pour UNE ouverture : celui d'une écoute
+        // fermée ne décrirait plus rien.
+        *self.bilan_mut() = BilanEcoute::default();
+        self.formes_dites
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
     }
 }
 

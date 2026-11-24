@@ -24,6 +24,8 @@ mod bascule_progressive_8558;
 const DUPLICATE_NET_PLAY_WINDOW: std::time::Duration = std::time::Duration::from_secs(12);
 
 mod radio;
+// #9346 — la chaîne de la zone (convolution, crossfeed) sur une radio servie.
+mod chaine_radio_9346;
 /// Réexport PUBLIC, et un seul : `tune-server` refuse désormais à
 /// l'ENREGISTREMENT une adresse de station qui rend une page web, avec le même
 /// verdict que la lecture (#3578). Le reste de ce module reste interne.
@@ -991,6 +993,32 @@ fn spawn_local_file_levels_decode_depuis(
     debut_fichier_ms: u64,
     depart_ms: u64,
 ) {
+    spawn_local_file_levels_decode_tranche(
+        bus,
+        playback,
+        zone_id,
+        play_seq,
+        path,
+        debut_fichier_ms,
+        None,
+        depart_ms,
+    );
+}
+
+/// #9184 — [`spawn_local_file_levels_decode_depuis`], borné à la FIN d'une
+/// tranche d'image SACD (`fin_iso_ms`, horloge de la zone) : la mesure
+/// s'arrête avec la piste au lieu de courir sur le reste du disque.
+#[allow(clippy::too_many_arguments)]
+fn spawn_local_file_levels_decode_tranche(
+    bus: Arc<EventBus>,
+    playback: Arc<PlaybackManager>,
+    zone_id: i64,
+    play_seq: u64,
+    path: String,
+    debut_fichier_ms: u64,
+    fin_iso_ms: Option<u64>,
+    depart_ms: u64,
+) {
     let depart_ms = i64::try_from(depart_ms).unwrap_or(i64::MAX);
     tokio::spawn(async move {
         let cadence = playback.clone();
@@ -1000,16 +1028,13 @@ fn spawn_local_file_levels_decode_depuis(
             spawn_braked_levels_sink_depuis(cadence, zone_id, levels_tx, consomme_ms, depart_ms);
         let ready = std::sync::Arc::new(tokio::sync::Notify::new());
         let result = tokio::task::spawn_blocking(move || {
-            crate::audio::decode::decode_to_pcm_streaming_seeked(
+            decoder_pour_les_niveaux(
                 &path,
-                None,
-                None,
-                None,
+                debut_fichier_ms,
+                fin_iso_ms,
                 sink_tx,
-                LEVELS_DECODE_CHUNK,
                 ready,
                 relais_tx,
-                debut_fichier_ms as f64 / 1000.0,
             )
         })
         .await;
@@ -1021,6 +1046,45 @@ fn spawn_local_file_levels_decode_depuis(
             Ok(Ok(_)) => {}
         }
     });
+}
+
+/// Le décodage (bloquant) du décodage-pour-niveaux d'un fichier : depuis
+/// `debut_fichier_ms`, et jusqu'à `fin_iso_ms` pour une image SACD (#9184 :
+/// le lecteur de l'image s'arrête à la trame de fin de la piste). Sans fin,
+/// ou pour un autre fichier, jusqu'au bout du fichier, comme avant.
+pub(crate) fn decoder_pour_les_niveaux(
+    path: &str,
+    debut_fichier_ms: u64,
+    fin_iso_ms: Option<u64>,
+    sink_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    ready: std::sync::Arc<tokio::sync::Notify>,
+    relais_tx: tokio::sync::mpsc::UnboundedSender<crate::audio::tap::RawWindow>,
+) -> Result<(u16, u32), String> {
+    let debut_s = debut_fichier_ms as f64 / 1000.0;
+    match fin_iso_ms {
+        Some(fin) if crate::audio::sacd::est_extension_iso(std::path::Path::new(path)) => {
+            crate::audio::decode::decode_iso_sacd_tranche_streaming(
+                path,
+                sink_tx,
+                LEVELS_DECODE_CHUNK,
+                ready,
+                relais_tx,
+                debut_s,
+                fin as f64 / 1000.0,
+            )
+        }
+        _ => crate::audio::decode::decode_to_pcm_streaming_seeked(
+            path,
+            None,
+            None,
+            None,
+            sink_tx,
+            LEVELS_DECODE_CHUNK,
+            ready,
+            relais_tx,
+            debut_s,
+        ),
+    }
 }
 
 /// Avance maximale du décodage-pour-niveaux d'une session proxy sur la
@@ -1387,6 +1451,12 @@ pub struct PlaybackOrchestrator {
     ///
     /// Verrou std : accès très courts, jamais tenus à travers un await.
     ecoutes_en_attente: std::sync::Mutex<HashMap<i64, ecoute_validee_7852::EcouteEnAttente>>,
+    /// Fil 3009, point 4 — les zones dont la reprise enregistrée a déjà été
+    /// cherchée depuis le démarrage (`contexte_de_l_ecoute`) : une fois par
+    /// zone, jamais à chaque écoute sans session.
+    ///
+    /// Verrou std : accès très courts, jamais tenus à travers un await.
+    pub(crate) zones_reprise_cherchee: std::sync::Mutex<std::collections::HashSet<i64>>,
     /// #8107 — la dernière écoute écrite par chaque zone, pour qu'un groupe
     /// de zones (`zone_groups`) ne compte qu'une écoute par titre. Voir
     /// `ecoute_validee_7852`.
@@ -1445,6 +1515,9 @@ pub struct PlaybackOrchestrator {
     ///
     /// Verrou std : accès très courts, jamais tenus à travers un await.
     pub(crate) radios_refusees: Arc<std::sync::Mutex<HashMap<i64, String>>>,
+    /// #9174 — les zones navigateur dont le lecteur écoute à distance (relais,
+    /// écoute directe) : voir `flux_a_distance_9174`.
+    zones_tirees_a_distance: flux_a_distance_9174::ZonesADistance,
     /// #4598 — l'énumération du parc local menée à la demande, sur le seul
     /// chemin du refus d'une zone locale (`gate_or_rebind_offline_zone`).
     /// Un champ et non un appel direct : les témoins y substituent un parc
@@ -2006,6 +2079,7 @@ impl PlaybackOrchestrator {
             last_net_play: Mutex::new(HashMap::new()),
             annonces_navigateur: std::sync::Mutex::new(HashMap::new()),
             ecoutes_en_attente: std::sync::Mutex::new(HashMap::new()),
+            zones_reprise_cherchee: std::sync::Mutex::new(std::collections::HashSet::new()),
             ecoutes_ecrites: std::sync::Mutex::new(HashMap::new()),
             sas_retrait: Arc::new(crate::db::ecouter_plus_tard_retrait::SasRetrait::new()),
             suivis_de_bail: std::sync::Mutex::new(HashMap::new()),
@@ -2013,6 +2087,7 @@ impl PlaybackOrchestrator {
             #[cfg(feature = "local-audio")]
             replis_de_peripherique_dits: std::sync::Mutex::new(HashMap::new()),
             radios_refusees: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            zones_tirees_a_distance: Default::default(),
             enumerer_parc_local: reenumeration_avant_refus::enumerateur_de_production(),
             systeme_du_parc_local: std::env::consts::OS,
             sources_pcm: crate::source_pcm::SourcesPcm::default(),
@@ -2092,6 +2167,9 @@ impl PlaybackOrchestrator {
     pub(crate) const UPSAMPLER_REPLAY_FLOOR_MS: u64 = 1_500;
 }
 
+// Fil 3009, point 15 — l'album de service d'une écoute, repris de la file.
+#[cfg(test)]
+mod album_de_l_ecoute_de_service_3009_tests;
 // #8611 — contrôle parental : refus de lecture des artistes bloqués.
 pub mod artiste_bloque_8611;
 #[cfg(test)]
@@ -2130,6 +2208,14 @@ mod pause_sans_media_7894_tests;
 mod repli_de_peripherique;
 
 mod resolve_stream;
+// #9174 — une zone navigateur tirée à distance reçoit du FLAC indexé.
+pub mod flux_a_distance_9174;
+#[cfg(test)]
+mod flux_a_distance_9174_tests;
+/// #9174 — la première piste d'une zone tirée à distance part en FLAC ;
+/// index du remux et du ré-encodage sur une piste longue.
+#[cfg(test)]
+mod premiere_piste_a_distance_9174_tests;
 // #7148 — la sentinelle de streaming : résolution et décodage réels, sans son.
 pub mod sentinelle_streaming;
 // #6130 — quitter une radio sur une sortie DLNA : Stop, puis attendre le renderer.
@@ -2313,6 +2399,15 @@ mod passthrough_sans_traitement_7986_tests;
 // #9175 — Sendspin et Devialet AIR lisent le flux traité dès qu'un traitement est actif.
 #[cfg(test)]
 mod sorties_qui_decodent_le_fichier_9175_tests;
+// #9176 — OAAT ne lit plus le WAV en direct quand la zone traite le flux.
+#[cfg(test)]
+mod oaat_lecture_directe_9176_tests;
+// TESS T12 — faux serveur `/stream` des bancs de bout en bout (vraies sorties).
+#[cfg(test)]
+mod faux_serveur_de_flux_tess;
+// TESS T12a — la chaîne TESS sur OAAT, vérifiée sur un faux récepteur (#9176).
+#[cfg(all(test, feature = "oaat"))]
+mod tess_t12a_oaat_tests;
 // Suite de #9175 — saut et reprise de bout en bout avec une vraie sortie Sendspin.
 #[cfg(test)]
 mod sendspin_relance_9175_tests;
@@ -2329,6 +2424,8 @@ mod prefetch_fiche_qobuz_m3u_8229_tests;
 #[cfg(test)]
 mod prefetch_wav_annonce_6990_tests;
 mod resolve_direct;
+// #9336 — une piste indexée se joue à l'adresse actuelle de son serveur.
+mod adresse_actuelle_du_serveur_9336;
 // #9207 — une URI de notre bibliothèque reçue par le renderer se joue en local.
 mod uri_de_notre_bibliotheque_9207;
 /// #2264 — la règle de version appliquée à la lecture.
@@ -2526,6 +2623,10 @@ mod dst_en_dsf_6221_tests;
 /// réseau, même en DSD « natif » : il passe par le décodeur.
 #[cfg(test)]
 mod dst_jamais_brut_au_renderer_4378_tests;
+/// #9184 — une piste d'ISO SACD vers un renderer qui annonce le DSD part en
+/// DSF virtuel bâti sur la tranche ; mode « pcm » ou sans DSD, en PCM.
+#[cfg(test)]
+mod iso_sacd_dsf_9184_tests;
 
 #[cfg(test)]
 mod mesure_saut_cd_5079;
@@ -2704,6 +2805,10 @@ mod reprise_au_redemarrage_6380;
 /// réseau à la position de la pause.
 #[cfg(test)]
 mod reprise_dlna_position_2095;
+/// #8967 — Lecture sur une zone navigateur dont la session a expiré
+/// pendant la pause : la piste repart au lieu d'une erreur.
+#[cfg(test)]
+mod reprise_navigateur_8967_tests;
 /// Fil 2125 — le saut de la reprise après décrochage attend que le renderer
 /// ait ouvert le flux.
 #[cfg(test)]

@@ -125,11 +125,13 @@ fn descripteur_tiers(id: &str) -> DescripteurGreffon {
         origin: Origine::Package,
         settings_schema: json!({ "type": "object" }),
         placement: ContraintesPlace {
-            channels: if famille {
-                Canaux::StereoOnly
-            } else {
-                Canaux::Any
-            },
+            // TESS T14 — l'hôte exécute TOUT natif tiers dans l'étage casque,
+            // stéréo seulement (`CrossfeedProcessor`, préparé en 2 canaux).
+            // Annoncer `any` laissait cocher le greffon sur une zone
+            // multicanal où il ne tournait pas, sans motif : le descripteur
+            // dit ce que l'hôte fait vraiment, et la résolution l'éteint
+            // avec son motif hors stéréo.
+            channels: Canaux::StereoOnly,
             position: Position::Free,
             // Le groupe vient du préfixe (`groupe_effectif`).
             exclusive_group: None,
@@ -661,4 +663,27 @@ pub async fn put_zone_tess(
     let mode = super::tess_prereglages::appliquer_selon_le_mode(&state, &zone, cles.clone()).await;
     info!(zone_id = id, cles = ?cles, mode = ?mode, "tess_chaine_ecrite");
     Json(reponse_de_zone(&state, &zone, lecture, premium, catalogue).await).into_response()
+}
+
+#[cfg(test)]
+mod tests_t14 {
+    use super::*;
+
+    /// TESS T14 — le descripteur d'un natif tiers dit ce que l'hôte exécute :
+    /// stéréo seulement (étage casque), famille du crossfeed ou non. La
+    /// contre-épreuve est un greffon de référence qui travaille sur tout
+    /// nombre de canaux et le dit (`convolution`).
+    #[test]
+    fn t14_un_natif_tiers_est_annonce_stereo_seulement() {
+        let c = catalogue_tess(&["mon-greffon".to_string(), "crossfeed-essai".to_string()]);
+        for id in ["mon-greffon", "crossfeed-essai"] {
+            let d = c.get(id).expect("descripteur tiers");
+            assert_eq!(d.origin, Origine::Package, "{id}");
+            assert_eq!(d.placement.channels, Canaux::StereoOnly, "{id}");
+        }
+        assert_eq!(
+            c.get("convolution").unwrap().placement.channels,
+            Canaux::Any
+        );
+    }
 }

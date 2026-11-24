@@ -1037,7 +1037,7 @@ pub(super) fn zone_reaffectation_ignoree_lang(
 ) -> Option<String> {
     use tune_core::audio::reaffectation_canaux as rc;
     if output_type != "local" {
-        return None;
+        return reaffectation_hors_sortie_locale_lang(lang, backend, zone_id, track_id, reel);
     }
     let reel = reel?;
     let (album_id, _) = track_id
@@ -1072,6 +1072,56 @@ pub(super) fn zone_reaffectation_ignoree_lang(
                 },
             ),
             &compte.to_string(),
+        ],
+    ))
+}
+
+/// #9179 — une règle armée sur une zone dont la sortie n'est pas locale.
+///
+/// Seul l'étage de conversion de la sortie locale applique la matrice
+/// (`applies_to_output: false` dans `routes/reaffectation_canaux.rs`) : un
+/// lecteur réseau (DLNA, AirPlay, OAAT, Squeezebox…) reçoit les canaux de la
+/// piste tels quels. Le chemin du signal le dit, avec les mêmes règles de
+/// silence que la sortie locale : une règle de zone multicanale ne s'annonce
+/// pas sur chaque piste stéréo. Les canaux de la piste se lisent en base, à
+/// défaut dans ce que la sortie a mesuré, à défaut deux.
+fn reaffectation_hors_sortie_locale_lang(
+    lang: &str,
+    backend: &std::sync::Arc<dyn tune_core::db::backend::DbBackend>,
+    zone_id: i64,
+    track_id: Option<i64>,
+    reel: Option<&TransformationsReelles>,
+) -> Option<String> {
+    use tune_core::audio::reaffectation_canaux as rc;
+    let (album_id, canaux_piste) = track_id
+        .map(|tid| rc::album_et_canaux_de_la_piste(backend, tid))
+        .unwrap_or((None, None));
+    let canaux = canaux_piste
+        .or_else(|| reel.map(|r| r.entree().canaux()))
+        .unwrap_or(2);
+    let regle = match rc::regle_effective_with(backend, zone_id, album_id, Some(canaux)) {
+        Some(regle) => regle,
+        None => {
+            let regle = rc::regle_effective_with(backend, zone_id, album_id, None)?;
+            if regle.origine != rc::Origine::Album && canaux <= 2 {
+                return None;
+            }
+            regle
+        }
+    };
+    Some(fs(
+        lang,
+        "matrix_not_applied_network",
+        &[
+            &regle.reglage.inputs.to_string(),
+            &regle.reglage.outputs.to_string(),
+            ts(
+                lang,
+                match regle.origine {
+                    rc::Origine::Album => "rule_album",
+                    rc::Origine::Zone => "rule_zone",
+                },
+            ),
         ],
     ))
 }

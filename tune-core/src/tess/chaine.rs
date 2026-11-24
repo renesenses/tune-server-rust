@@ -184,8 +184,9 @@ impl Default for ChaineTess {
 /// Ce que la validation d'un `PUT` doit savoir du compte.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContexteValidation {
-    /// Le compte a-t-il le Premium ? (Le lien fin avec les `Feature` de
-    /// `license.rs`, via `DescripteurGreffon::feature`, est le travail de T19.)
+    /// Le compte a-t-il le Premium ? Le lien avec les `Feature` de
+    /// `license.rs` passe par [`crate::tess::greffon::DescripteurGreffon::demande_le_premium`]
+    /// (T19) : tous les droits Premium suivent le même palier.
     pub premium: bool,
 }
 
@@ -477,7 +478,7 @@ impl ChaineTess {
             if !m.enabled {
                 continue;
             }
-            if d.entitlement.demande_le_premium() && !contexte.premium {
+            if d.demande_le_premium() && !contexte.premium {
                 return Err(ErreurChaine::PremiumRequis(m.id.clone()));
             }
             if let Some(g) = d.groupe_effectif()
