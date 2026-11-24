@@ -87,9 +87,9 @@ pub enum MotifEtape {
     /// Paquet désinstallé ou désactivé.
     PluginUnavailable,
     /// Paquet facultatif pas encore installé, que l'utilisateur peut
-    /// installer depuis le catalogue (`install_package` dans `GET
-    /// /tess/catalog`). Émis par le catalogue seulement ; la résolution garde
-    /// `plugin_unavailable`.
+    /// installer (`POST /plugins/{paquet}/install`) : `install_package` dans
+    /// `GET /tess/catalog`, et `params.install_package` dans une étape du
+    /// chemin du signal (le serveur précise ainsi `plugin_unavailable`).
     PluginNotInstalled,
     /// Droit Premium absent (ou perdu en cours de route).
     PremiumRequired,
@@ -563,6 +563,12 @@ impl ChaineTess {
                 )
             {
                 upsampling.eteindre(MotifEtape::UnknownValue, None);
+            } else if !(ctx.greffon_disponible)(super::chaine::ID_UPSAMPLING) {
+                // rc14 — le moteur `upsampler` n'est ni installé ni activé
+                // (facultatif : jamais posé par la migration) : rien ne
+                // suréchantillonne, comme pour un greffon (le serveur précise
+                // `plugin_not_installed` quand il suffit de l'installer).
+                upsampling.eteindre(MotifEtape::PluginUnavailable, None);
             } else if !ctx.premium {
                 upsampling.eteindre(MotifEtape::PremiumRequired, None);
             }

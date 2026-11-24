@@ -1290,3 +1290,56 @@ async fn convolution_cochee_sans_fichier_efface_l_ancien_ir_rc14() {
         );
     }
 }
+
+/// rc14 (Rémi, base neuve) — le moteur `upsampler`, facultatif, n'est pas
+/// installé : l'étage fixe de suréchantillonnage demandé ne traite pas, et
+/// le chemin du signal le dit `plugin_not_installed` avec
+/// `params.install_package = "upsampler"` (avant : annoncé effectif alors
+/// que rien ne suréchantillonnait). Installé, il traite. Désactivé :
+/// `plugin_unavailable`, sans paquet.
+#[tokio::test]
+async fn surechantillonnage_non_installe_propose_l_installation_rc14() {
+    let b = Banc::nouveau(true).await;
+    b.settings()
+        .set("plugin_upsampler_installed", "false")
+        .unwrap();
+    let etape = |v: &Value| {
+        v["signal_path"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["code"] == json!("upsampling"))
+            .unwrap()
+            .clone()
+    };
+    let corps =
+        json!({"version": 1, "fixed": {"upsampling": {"mode": "pcm", "filter": "polyvalent"}}});
+    let (s, v) = b.put(corps.clone()).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    conforme_au_schema("zone_response", &v).unwrap_or_else(|e| panic!("{e} : {v}"));
+    let e = etape(&v);
+    assert_eq!(e["requested"], json!(true), "{e}");
+    assert_eq!(e["effective"], json!(false), "{e}");
+    assert_eq!(e["reason"], json!("plugin_not_installed"), "{e}");
+    assert_eq!(e["params"]["install_package"], json!("upsampler"), "{e}");
+    let (_, v) = b.get().await;
+    assert_eq!(etape(&v)["reason"], json!("plugin_not_installed"));
+
+    // Installé (ce que fait `POST /plugins/upsampler/install`) : il traite.
+    b.settings()
+        .set("plugin_upsampler_installed", "true")
+        .unwrap();
+    let (_, v) = b.get().await;
+    let e = etape(&v);
+    assert_eq!(e["effective"], json!(true), "{e}");
+    assert!(e["reason"].is_null(), "{e}");
+
+    // Installé mais désactivé : indisponible, rien à installer.
+    b.settings()
+        .set("plugin_upsampler_enabled", "false")
+        .unwrap();
+    let (_, v) = b.get().await;
+    let e = etape(&v);
+    assert_eq!(e["reason"], json!("plugin_unavailable"), "{e}");
+    assert!(e["params"].get("install_package").is_none(), "{e}");
+}
