@@ -2119,6 +2119,43 @@ pub fn decode_to_pcm_streaming_tranche(
     )
 }
 
+/// #9184 — le décodage progressif d'une TRANCHE d'image SACD, `debut_s` à
+/// `fin_s` sur l'horloge de la zone, au format natif du convertisseur DSD.
+///
+/// La fin est tenue par le lecteur de l'image lui-même, à la trame près
+/// (`sacd::ouvrir_lecture`) : aucune borne en octets, qui exigerait de
+/// connaître d'avance cadence, canaux et profondeur. `Err` pour tout autre
+/// fichier qu'un `.iso`.
+pub fn decode_iso_sacd_tranche_streaming(
+    file_path: &str,
+    tx: mpsc::Sender<Vec<u8>>,
+    chunk_size: usize,
+    data_ready: std::sync::Arc<tokio::sync::Notify>,
+    levels_tx: tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>,
+    debut_s: f64,
+    fin_s: f64,
+) -> Result<(u16, u32), String> {
+    if !super::sacd::est_extension_iso(Path::new(file_path)) {
+        return Err(format!(
+            "tranche SACD demandée sur autre chose qu'un .iso : {file_path}"
+        ));
+    }
+    decode_to_pcm_streaming_inner_avec(
+        file_path,
+        None,
+        None,
+        None,
+        tx,
+        chunk_size,
+        Some(data_ready),
+        Some(levels_tx),
+        debut_s,
+        None,
+        SautDemande::AuMieux,
+        Some(fin_s),
+    )
+}
+
 /// Combien d'octets de PCM valent `duree_s` dans le format de sortie annoncé.
 ///
 /// `None` dès qu'une des trois dimensions manque : sans cadence, sans nombre de
@@ -2279,6 +2316,7 @@ pub fn decode_http_range_to_pcm_streaming_seeked(
         seek_s,
         Some(Box::new(source)),
         SautDemande::Exige,
+        None,
     )
 }
 
@@ -2440,6 +2478,7 @@ fn decode_to_pcm_streaming_inner(
         seek_s,
         source_override,
         SautDemande::AuMieux,
+        None,
     )
 }
 
@@ -2456,6 +2495,9 @@ fn decode_to_pcm_streaming_inner_avec(
     seek_s: f64,
     source_override: Option<Box<dyn MediaSource>>,
     saut: SautDemande,
+    // #9184 — fin de la tranche d'une image SACD, sur l'horloge de la zone :
+    // le lecteur de l'image s'arrête à cette trame. Seul le `.iso` la lit.
+    fin_iso_s: Option<f64>,
 ) -> Result<(u16, u32), String> {
     if target_sample_rate == Some(0) {
         return Err("stream target sample rate must be greater than zero".into());
@@ -2550,6 +2592,7 @@ fn decode_to_pcm_streaming_inner_avec(
             &levels_tx,
             &rt,
             seek_s,
+            fin_iso_s,
         );
     }
 
@@ -4602,6 +4645,7 @@ fn decode_dsd_streaming(
     levels_tx: &Option<tokio::sync::mpsc::UnboundedSender<super::tap::RawWindow>>,
     rt: &tokio::runtime::Handle,
     seek_s: f64,
+    fin_iso_s: Option<f64>,
 ) -> Result<(u16, u32), String> {
     let lsb_first = ext == "dsf";
     if ext == "dsf" {
@@ -4655,7 +4699,8 @@ fn decode_dsd_streaming(
         let chemin = Path::new(file_path);
         let (dsd_rate, channels) = super::sacd::parametres_de_lecture(chemin)?;
         let debut_ms = (seek_s.max(0.0) * 1000.0).round() as u64;
-        let mut reader = super::sacd::ouvrir_lecture(chemin, debut_ms, None)?;
+        let fin_ms = fin_iso_s.map(|f| (f.max(0.0) * 1000.0).round() as u64);
+        let mut reader = super::sacd::ouvrir_lecture(chemin, debut_ms, fin_ms)?;
         tracing::info!(
             seek_s,
             trame = reader.trame_atteinte(),
