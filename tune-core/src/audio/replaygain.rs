@@ -2429,16 +2429,27 @@ pub fn compter_les_pistes_traitees_dr(backend: &Arc<dyn DbBackend>) -> Option<Pi
 pub async fn rattraper_un_lot_de_dr(backend: &Arc<dyn DbBackend>) -> usize {
     let seuil_report = deferral_threshold(now_epoch_secs() as i64);
     let predicat = candidats_dr_where(backend);
-    let rows = match backend.query_many(
-        &format!(
-            "SELECT t.id, t.file_path, t.duration_ms, t.sample_rate, t.channels \
-             FROM tracks t WHERE {predicat} LIMIT ?"
-        ),
-        &[
-            &seuil_report as &dyn ToSqlValue,
-            &(TRACK_BATCH as i64) as &dyn ToSqlValue,
-        ],
-    ) {
+    // Fil du forum 3013 — même lecture longue que les sélections du
+    // ReplayGain et des empreintes : sur un fil de fond (#4681).
+    let b = backend.clone();
+    let rows = match crate::taches_de_fond::priorite::hors_du_fil_async(
+        crate::taches_de_fond::Tache::PlageDynamique.id(),
+        move || {
+            b.query_many(
+                &format!(
+                    "SELECT t.id, t.file_path, t.duration_ms, t.sample_rate, t.channels \
+                     FROM tracks t WHERE {predicat} LIMIT ?"
+                ),
+                &[
+                    &seuil_report as &dyn ToSqlValue,
+                    &(TRACK_BATCH as i64) as &dyn ToSqlValue,
+                ],
+            )
+        },
+    )
+    .await
+    .unwrap_or_else(|| Err("selection_interrompue".to_string()))
+    {
         Ok(r) => r,
         Err(e) => {
             warn!(error = %e, "dr_candidate_query_failed");
@@ -2450,10 +2461,18 @@ pub async fn rattraper_un_lot_de_dr(backend: &Arc<dyn DbBackend>) -> usize {
         return 0;
     }
     // #7915 — même raison que les empreintes : publier l'avancement.
-    crate::taches_de_fond::avancement::ouvrir_si_besoin(
-        crate::taches_de_fond::Tache::PlageDynamique,
-        || compter_les_candidats_dr(backend),
-    );
+    // Fil du forum 3013 — et son `COUNT(*)` d'ouverture, sur un fil de fond.
+    let b = backend.clone();
+    crate::taches_de_fond::priorite::hors_du_fil_async(
+        crate::taches_de_fond::Tache::PlageDynamique.id(),
+        move || {
+            crate::taches_de_fond::avancement::ouvrir_si_besoin(
+                crate::taches_de_fond::Tache::PlageDynamique,
+                || compter_les_candidats_dr(&b),
+            )
+        },
+    )
+    .await;
 
     let repo = TrackMetadataRepo::with_backend(backend.clone());
     let mut done = 0usize;
