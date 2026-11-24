@@ -1089,14 +1089,31 @@ async fn un_service_converti_pour_le_lecteur_n_est_jamais_dit_bit_perfect() {
 /// 5e relecture — le bras DASH de TIDAL (banc #7266 : faux TIDAL, faux CDN en
 /// fMP4, vraie `DlnaOutput`). Rend la voie servie et l'état publié, chaîne
 /// vide.
-async fn dash_tidal(plafond_16: bool) -> (&'static str, ReponseTessZone) {
+async fn dash_tidal(egaliseur: bool) -> (&'static str, ReponseTessZone) {
     use super::tidal_cd_dash_jusqu_au_play_7266 as banc_7266;
     let flac = banc_7266::flac_cd(&banc_7266::pcm_cd()).await;
     let piste = std::sync::Arc::new(banc_7266::decouper(&flac));
     let (mesure, orch, zone) = banc_7266::jouer_avec(piste, "flac", |orch, zone| {
-        ZoneRepo::with_backend(orch.db.clone())
-            .update_dlna_cap_16bit(zone, plafond_16)
+        if egaliseur {
+            let s = SettingsRepo::with_backend(orch.db.clone());
+            s.set("plugin_equalizer_installed", "true").unwrap();
+            let p = crate::audio::eq::EqProfile {
+                enabled: true,
+                bands: vec![crate::audio::eq::EqBandSpec {
+                    freq: 1000.0,
+                    gain: -4.0,
+                    q: 0.71,
+                    band_type: "peak".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            s.set(
+                &format!("zone_{zone}_eq_profile"),
+                &serde_json::to_string(&p).unwrap(),
+            )
             .unwrap();
+        }
     })
     .await;
     let url = mesure
@@ -1164,15 +1181,16 @@ async fn un_flac_tidal_dash_remuxe_reste_bit_perfect() {
     assert_eq!(etat.badge, Badge::BitPerfect);
 }
 
-/// 5e relecture — le même FLAC DASH vers une zone plafonnée à 16 bits : le
-/// remux est exclu (`remux_dash_sans_perte`), la tâche DÉCODE ; la session
-/// est une conversion, jamais « Bit-perfect ».
+/// 5e relecture — le même FLAC DASH vers une zone à égaliseur : le remux est
+/// exclu (`remux_dash_sans_perte`, traitement de zone), la tâche DÉCODE ; la
+/// session est une conversion, et l'état le dit (`file_transcode`).
+/// (Un plafond 16 bits ne s'applique pas à ce FLAC CD déjà en 16 bits.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn un_flac_tidal_dash_decode_est_une_conversion() {
     let (voie_servie, etat) = dash_tidal(true).await;
-    assert_eq!(voie_servie, voie::FICHIER_CONVERTI, "plafond : décodage");
+    assert_eq!(voie_servie, voie::FICHIER_CONVERTI, "égaliseur : décodage");
     assert_eq!(etat.delivery.as_ref().unwrap().route, VoieUpnp::FileTranscode);
-    assert_eq!(etat.badge, Badge::AlteredOutsideTess);
+    assert_ne!(etat.badge, Badge::BitPerfect);
 }
 
 /// 5e relecture — le cache chaud du bras DASH note la voie par le MÊME
