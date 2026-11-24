@@ -81,7 +81,7 @@ pub(super) async fn flac_cd(pcm: &[u8]) -> Vec<u8> {
 
 /// Le STREAMINFO (34 octets) et les trames du FLAC, chacune avec son nombre
 /// d'échantillons, lues par le démultiplexeur FLAC de symphonia.
-fn trames_flac(flac: &[u8]) -> ([u8; 34], Vec<(Vec<u8>, u32)>) {
+pub(super) fn trames_flac(flac: &[u8]) -> ([u8; 34], Vec<(Vec<u8>, u32)>) {
     use symphonia::core::formats::probe::Hint;
     use symphonia::core::formats::{FormatOptions, TrackType};
     use symphonia::core::io::MediaSourceStream;
@@ -137,7 +137,7 @@ fn matrice() -> Vec<u8> {
 
 /// Le segment d'initialisation : `ftyp` + `moov` d'une piste audio `fLaC`
 /// dont le `dfLa` porte le STREAMINFO, `mvex` pour les fragments.
-fn segment_init(info: &[u8; 34]) -> Vec<u8> {
+pub(super) fn segment_init(info: &[u8; 34]) -> Vec<u8> {
     let ftyp = boite(b"ftyp", b"iso6\0\0\0\0iso6mp41");
     let mut mvhd = vec![0u8; 8]; // création, modification
     mvhd.extend_from_slice(&SR.to_be_bytes());
@@ -219,7 +219,7 @@ fn segment_init(info: &[u8; 34]) -> Vec<u8> {
 
 /// Un segment média : `moof` (`trun` avec durée et taille de chaque trame)
 /// puis `mdat` des trames FLAC, recopiées telles quelles.
-fn segment_media(numero: u32, debut: u64, trames: &[(Vec<u8>, u32)]) -> Vec<u8> {
+pub(super) fn segment_media(numero: u32, debut: u64, trames: &[(Vec<u8>, u32)]) -> Vec<u8> {
     let mfhd = boite_pleine(b"mfhd", 0, 0, &numero.to_be_bytes());
     // default-base-is-moof : les décalages partent du début du moof.
     let tfhd = boite_pleine(b"tfhd", 0, 0x02_0000, &1u32.to_be_bytes());

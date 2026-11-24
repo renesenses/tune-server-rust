@@ -1453,6 +1453,9 @@ pub struct PlaybackOrchestrator {
     ///
     /// Verrou std : accès très courts, jamais tenus à travers un await.
     pub(crate) radios_refusees: Arc<std::sync::Mutex<HashMap<i64, String>>>,
+    /// #9174 — les zones navigateur dont le lecteur écoute à distance (relais,
+    /// écoute directe) : voir `flux_a_distance_9174`.
+    zones_tirees_a_distance: flux_a_distance_9174::ZonesADistance,
     /// #4598 — l'énumération du parc local menée à la demande, sur le seul
     /// chemin du refus d'une zone locale (`gate_or_rebind_offline_zone`).
     /// Un champ et non un appel direct : les témoins y substituent un parc
@@ -2022,6 +2025,7 @@ impl PlaybackOrchestrator {
             #[cfg(feature = "local-audio")]
             replis_de_peripherique_dits: std::sync::Mutex::new(HashMap::new()),
             radios_refusees: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            zones_tirees_a_distance: Default::default(),
             enumerer_parc_local: reenumeration_avant_refus::enumerateur_de_production(),
             systeme_du_parc_local: std::env::consts::OS,
             sources_pcm: crate::source_pcm::SourcesPcm::default(),
@@ -2142,6 +2146,10 @@ mod pause_sans_media_7894_tests;
 mod repli_de_peripherique;
 
 mod resolve_stream;
+// #9174 — une zone navigateur tirée à distance reçoit du FLAC indexé.
+pub mod flux_a_distance_9174;
+#[cfg(test)]
+mod flux_a_distance_9174_tests;
 // #7148 — la sentinelle de streaming : résolution et décodage réels, sans son.
 pub mod sentinelle_streaming;
 // #6130 — quitter une radio sur une sortie DLNA : Stop, puis attendre le renderer.

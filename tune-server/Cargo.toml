@@ -300,6 +300,12 @@ path = "tests/pont_administration.rs"
 name = "relais_routes_relayables"
 path = "tests/relais_routes_relayables.rs"
 
+# #9174 — la provenance du lecteur d'une zone navigateur (relais ou local).
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "relais_format_compresse_9174"
+path = "tests/relais_format_compresse_9174.rs"
+
 # Garde de la couche d'authentification (routes privilégiées, profil
 # `default`, premier lancement). `autotests = false` plus haut : sans cette
 # cible, jamais compilé.

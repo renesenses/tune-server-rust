@@ -3926,6 +3926,19 @@ fn decode_wavpack_streaming(
 /// mutate samples, which a remux cannot). Returns `(file_size, bit_depth,
 /// sample_rate)`, matching the decode+encode path's tuple.
 pub fn remux_flac_dash(input_path: &str, output_path: &str) -> Result<(u64, u16, u32), String> {
+    remux_flac_dash_indexe(input_path, output_path, false)
+}
+
+/// [`remux_flac_dash`], avec une SEEKTABLE quand `indexer` (#9174 : navigateur
+/// tiré à distance). La table se construit trame après trame pendant le
+/// remux ; l'en-tête puis les trames sont écrits dans le fichier sans être
+/// recollés en mémoire. Une trame que l'index ne sait pas lire abandonne
+/// l'index, jamais le remux.
+pub fn remux_flac_dash_indexe(
+    input_path: &str,
+    output_path: &str,
+    indexer: bool,
+) -> Result<(u64, u16, u32), String> {
     let file = File::open(input_path).map_err(|e| format!("remux open: {e}"))?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
 
@@ -3964,19 +3977,13 @@ pub fn remux_flac_dash(input_path: &str, output_path: &str) -> Result<(u64, u16,
     let sample_rate = audio_params.sample_rate.unwrap_or(44100);
     let bit_depth = resolve_bit_depth(&audio_params);
 
+    // Les trames seules : l'en-tête, qui porte la SEEKTABLE, s'écrit après.
     let mut out: Vec<u8> = Vec::with_capacity(1 << 20);
-    // "fLaC" stream marker.
-    out.extend_from_slice(b"fLaC");
-    // METADATA_BLOCK_HEADER: is_last=0, type=0 (STREAMINFO), 24-bit length = 34.
-    out.push(0x00);
-    out.extend_from_slice(&[0x00, 0x00, 0x22]);
-    out.extend_from_slice(&stream_info);
-    // Empty VORBIS_COMMENT (is_last=1, type=4, len=8): vendor_len=0 + count=0.
-    // Some DLNA renderers reject a FLAC stream without a VORBIS_COMMENT block, so
-    // append the same empty one the native encoder emits.
-    out.push(0x84);
-    out.extend_from_slice(&[0x00, 0x00, 0x08]);
-    out.extend_from_slice(&[0u8; 8]);
+    let mut indexeur = if indexer {
+        crate::audio::seektable_flac_9174::Indexeur::depuis_streaminfo(&stream_info)
+    } else {
+        None
+    };
 
     // Concatenate the raw FLAC frames in order — one mp4 sample = one FLAC frame.
     let mut frame_count: u64 = 0;
@@ -3984,6 +3991,12 @@ pub fn remux_flac_dash(input_path: &str, output_path: &str) -> Result<(u64, u16,
         match format.next_packet() {
             Ok(Some(packet)) => {
                 if packet.track_id == track_id {
+                    if let Some(ix) = indexeur.as_mut()
+                        && !ix.trame_brute(&packet.data)
+                    {
+                        tracing::warn!(frame_count, "remux_seektable_abandonnee");
+                        indexeur = None;
+                    }
                     out.extend_from_slice(&packet.data);
                     frame_count += 1;
                 }
@@ -4001,8 +4014,30 @@ pub fn remux_flac_dash(input_path: &str, output_path: &str) -> Result<(u64, u16,
         return Err("remux: no FLAC frames extracted".into());
     }
 
-    std::fs::write(output_path, &out).map_err(|e| format!("remux write: {e}"))?;
-    Ok((out.len() as u64, bit_depth, sample_rate))
+    // Empty VORBIS_COMMENT (vendor_len=0 + count=0): some DLNA renderers reject
+    // a FLAC stream without one, so append the same empty one the native
+    // encoder emits.
+    let commentaire = [0u8; 8];
+    let blocs: [(u8, &[u8]); 2] = [(0, &stream_info), (4, &commentaire)];
+    let en_tete = match indexeur.as_ref() {
+        Some(ix) => crate::audio::seektable_flac_9174::en_tete_avec_seektable(&blocs, ix.table()),
+        None => {
+            // "fLaC", STREAMINFO (is_last=0, len=34), VORBIS_COMMENT (is_last=1).
+            let mut h = b"fLaC".to_vec();
+            h.push(0x00);
+            h.extend_from_slice(&[0x00, 0x00, 0x22]);
+            h.extend_from_slice(&stream_info);
+            h.push(0x84);
+            h.extend_from_slice(&[0x00, 0x00, 0x08]);
+            h.extend_from_slice(&commentaire);
+            h
+        }
+    };
+    let mut fichier = File::create(output_path).map_err(|e| format!("remux write: {e}"))?;
+    std::io::Write::write_all(&mut fichier, &en_tete)
+        .and_then(|_| std::io::Write::write_all(&mut fichier, &out))
+        .map_err(|e| format!("remux write: {e}"))?;
+    Ok(((en_tete.len() + out.len()) as u64, bit_depth, sample_rate))
 }
 
 /// Streaming variant of [`remux_flac_dash`] (#1146): remux a STILL-DOWNLOADING
