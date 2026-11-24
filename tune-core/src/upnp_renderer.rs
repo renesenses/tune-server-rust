@@ -229,6 +229,8 @@ pub enum RendererCommand {
         title: Option<String>,
         artist: Option<String>,
         duration_ms: Option<i64>,
+        /// #9502 — le DIDL classe l'item en `audioBroadcast` : un direct.
+        diffusion: bool,
     },
     /// SetNextAVTransportURI : la piste à enchaîner quand la courante finit.
     SetNextUri {
@@ -436,11 +438,14 @@ pub fn parse_renderer_command(soap_body: &str) -> RendererCommand {
             let uri = text_of(soap_body, "CurrentURI").unwrap_or_default();
             let meta = text_of(soap_body, "CurrentURIMetaData").unwrap_or_default();
             let (title, artist, duration_ms) = parse_didl_metadata(&meta);
+            let diffusion = text_of(&meta, "class")
+                .is_some_and(|c| crate::orchestrator::classe_de_diffusion(&c));
             RendererCommand::SetUri {
                 uri,
                 title,
                 artist,
                 duration_ms,
+                diffusion,
             }
         }
         "SetNextAVTransportURI" => {
@@ -753,11 +758,44 @@ mod tests {
                 title,
                 artist,
                 duration_ms,
+                diffusion,
             } => {
                 assert_eq!(uri, "http://srv/track.flac");
                 assert_eq!(title.as_deref(), Some("So What"));
                 assert_eq!(artist.as_deref(), Some("Miles Davis"));
                 assert_eq!(duration_ms, Some(562_000));
+                assert!(!diffusion, "sans `upnp:class`, pas un direct");
+            }
+            other => panic!("attendu SetUri, obtenu {other:?}"),
+        }
+    }
+    /// #9502 — une radio poussée par JPlay : `upnp:class` en
+    /// `audioBroadcast`, sans durée.
+    #[test]
+    fn parse_set_uri_classe_audio_broadcast_9502() {
+        let didl = "&lt;DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" \
+                    xmlns:dc=\"http://purl.org/dc/elements/1.1/\" \
+                    xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\"&gt;\
+                    &lt;item&gt;&lt;dc:title&gt;Radio Paradise&lt;/dc:title&gt;\
+                    &lt;upnp:class&gt;object.item.audioItem.audioBroadcast&lt;/upnp:class&gt;\
+                    &lt;res&gt;http://stream.radioparadise.com/flac&lt;/res&gt;\
+                    &lt;/item&gt;&lt;/DIDL-Lite&gt;";
+        let body = soap(
+            "SetAVTransportURI",
+            &format!(
+                "<InstanceID>0</InstanceID>\
+                 <CurrentURI>http://stream.radioparadise.com/flac</CurrentURI>\
+                 <CurrentURIMetaData>{didl}</CurrentURIMetaData>"
+            ),
+        );
+        match parse_renderer_command(&body) {
+            RendererCommand::SetUri {
+                diffusion,
+                duration_ms,
+                ..
+            } => {
+                assert!(diffusion, "audioBroadcast désigne un direct");
+                assert_eq!(duration_ms, None);
             }
             other => panic!("attendu SetUri, obtenu {other:?}"),
         }

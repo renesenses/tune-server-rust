@@ -30,6 +30,9 @@ struct RendererSession {
     title: Option<String>,
     artist: Option<String>,
     duration_ms: Option<i64>,
+    /// #9502 — le DIDL du point de contrôle classe l'item en
+    /// `audioBroadcast` : un direct, joué par le chemin radio.
+    diffusion: bool,
     /// Piste suivante (SetNextAVTransportURI) — enchaînée par le watcher
     /// quand la courante se termine. Un Stop commandé ou un nouveau
     /// SetAVTransportURI l'efface : enchaîner après un arrêt voulu serait
@@ -381,6 +384,7 @@ async fn avtransport_control(
             title,
             artist,
             duration_ms,
+            diffusion,
         } => {
             let ancienne_file = sessions().lock().ok().and_then(|mut s| {
                 // Nouveau contexte de lecture : la suivante en attente est
@@ -392,6 +396,7 @@ async fn avtransport_control(
                         title,
                         artist,
                         duration_ms,
+                        diffusion,
                         next: None,
                         revision: nouvelle_revision(),
                         play_seq: None,
@@ -505,6 +510,11 @@ async fn avtransport_control(
                         crate::routes::zones::relais_de_groupe_6155::prendre_la_tete_du_groupe(
                             &state, zone_id,
                         );
+                    // #9502 — un direct classé `audioBroadcast` par le point
+                    // de contrôle : la résolution le joue par le chemin radio.
+                    if session.diffusion {
+                        tune_core::orchestrator::annoncer_une_diffusion(&session.uri);
+                    }
                     let lancement = state.orchestrator.play(req).await;
                     if !lancement
                         .as_ref()
