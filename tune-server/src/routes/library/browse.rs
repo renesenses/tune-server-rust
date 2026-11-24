@@ -218,7 +218,8 @@ impl ModeDesComptes {
     /// Le compte d'une racine (`file_path` seul), ou `None` en attente.
     fn racine(&self, state: &AppState, racine: &str) -> Option<i64> {
         match self {
-            Self::Arbre { arbre, .. } => Some(arbre.fichiers_sous(racine)),
+            // #9480 — tranches d'images (ISO SACD, CUE) comprises.
+            Self::Arbre { arbre, .. } => Some(arbre.pistes_sous(racine)),
             Self::EnAttente => None,
             Self::Sql => Some(
                 tune_core::db::track_repo::compter_pistes_sous_dossier(
