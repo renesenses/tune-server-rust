@@ -465,12 +465,16 @@ impl<T: Flottant> Convolver<T> {
         &mut self,
         trames: usize,
     ) -> [Option<Box<Convolver<T>>>; 2] {
-        if self.eteint || self.fondu.is_some() {
-            return [None, None];
-        }
+        // Une bascule en cours (réchauffe ou fondu) est abandonnée dans TOUS
+        // les cas, même si ce moteur est déjà éteint ou en train de s'éteindre :
+        // sinon le successeur reprendrait la main, et la convolution
+        // reviendrait après un « Effacer » ou un retrait du droit.
         let rendus = [self.successeur.take(), self.retraite.take()];
         self.bascule = None;
         self.rechauffe = 0;
+        if self.eteint || self.fondu.is_some() {
+            return rendus;
+        }
         if trames == 0 {
             self.eteint = true;
         } else {
@@ -482,6 +486,19 @@ impl<T: Flottant> Convolver<T> {
     /// La convolution est-elle éteinte (fondu terminé) ?
     pub fn est_eteint(&self) -> bool {
         self.eteint
+    }
+
+    /// T09b — un moteur ÉTEINT d'emblée : il ne convolue pas, il retarde
+    /// seulement l'entrée de sa latence. Posé flux en cours là où aucun moteur
+    /// ne tournait, il porte le SEUL saut de temps (un bloc de silence, au
+    /// moment de la pose : aucun échantillon n'est rejoué) ; le vrai filtre
+    /// lui succède ensuite par [`Self::remplacer_en_fondu`] (réchauffe, puis
+    /// fondu), sans autre saut.
+    pub fn retard_seul(canaux: usize, block_size: usize) -> Self {
+        let mut m = Self::depuis_f64(&vec![vec![1.0]; canaux.max(1)], block_size);
+        m.eteint = true;
+        m
+    }
     }
 
     /// T09b — changer de filtre FLUX EN COURS, sans discontinuité.

@@ -578,3 +578,67 @@ fn l_extinction_rend_le_successeur_abandonne() {
     assert!(rendus[0].is_some(), "le successeur est rendu");
     assert!(!m.bascule_en_cours());
 }
+
+/// Relecture de #9452 (témoin du relecteur) — Effacer, Importer, puis Effacer
+/// de nouveau PENDANT la réchauffe de la bascule : la seconde extinction
+/// abandonne le successeur, qui est rendu ; la convolution ne revient pas.
+/// Même chemin que le retrait du droit Premium.
+#[test]
+fn relecture_effacer_importer_effacer_abandonne_le_successeur() {
+    let bloc = 128;
+    let x = sinus_de_bascule(30_000);
+    let mut m = Convolver::<f64>::depuis_f64(&[vec![0.5]], bloc);
+    let mut y = x.clone();
+    let (a, reste) = y.split_at_mut(4_000);
+    m.traiter(a);
+    drop(m.eteindre_en_fondu_en_rendant(480));
+    let (b, reste) = reste.split_at_mut(2_000);
+    m.traiter(b);
+    assert!(m.est_eteint());
+    let mut h = vec![0.0f64; 4_000];
+    h[0] = 0.9;
+    h[3_999] = 0.1;
+    m.remplacer_en_fondu(Convolver::depuis_f64(&[h], bloc), 480)
+        .ok()
+        .unwrap();
+    let (c, d) = reste.split_at_mut(1_000);
+    m.traiter(c);
+    assert!(m.bascule_en_cours(), "encore en réchauffe");
+    let rendus = m.eteindre_en_fondu_en_rendant(480);
+    assert!(rendus[0].is_some(), "le successeur abandonné est rendu");
+    assert!(!m.bascule_en_cours());
+    assert!(m.est_eteint(), "le moteur reste éteint");
+    m.traiter(d);
+    // Après coup : l'entrée seulement retardée, jamais convoluée.
+    for n in 7_000..30_000 {
+        assert_eq!(y[n], x[n - bloc], "trame {n} : la convolution est revenue");
+    }
+}
+
+/// Relecture de #9452 — pose flux en cours sans moteur : un moteur qui ne
+/// fait que retarder, puis le filtre en fondu. Aucun échantillon n'est rejoué :
+/// silence pendant le bloc de pose, puis l'entrée exactement retardée, puis
+/// le fondu continu vers le filtre.
+#[test]
+fn la_pose_en_lecture_ne_rejoue_aucun_echantillon() {
+    let bloc = 256;
+    let x = sinus_de_bascule(24_000);
+    let mut m = Convolver::<f64>::retard_seul(1, bloc);
+    assert!(m.est_eteint());
+    m.remplacer_en_fondu(Convolver::depuis_f64(&[vec![0.6]], bloc), 960)
+        .ok()
+        .unwrap();
+    let mut y = x.clone();
+    m.traiter(&mut y);
+    assert!(y[..bloc].iter().all(|v| *v == 0.0), "bloc de pose : silence");
+    let rechauffe = 1 + bloc;
+    for n in bloc..bloc + rechauffe {
+        assert_eq!(y[n], x[n - bloc], "trame {n} rejouée");
+    }
+    let saut = plus_grand_saut(&y[bloc..]);
+    assert!(saut <= 1.05 * pente_du_sinus(), "saut {saut}");
+    let fin = bloc + rechauffe + 960 + 1;
+    for n in fin..x.len() {
+        assert!((y[n] - 0.6 * x[n - bloc]).abs() < SEUIL_64_BITS, "trame {n}");
+    }
+}

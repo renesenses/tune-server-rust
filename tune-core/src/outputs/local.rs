@@ -849,10 +849,6 @@ pub struct LocalOutput {
     /// ([`Self::set_convolution_autorisee`]). Faux, la configuration reste
     /// mémorisée mais aucun moteur n'est construit.
     convolution_autorisee: Arc<AtomicBool>,
-    /// T09b — un jeu posé pendant la lecture sans moteur en service attend :
-    /// la boucle de lecture le bâtit à la prochaine jonction de pistes
-    /// (gapless compris), ou au départ du flux suivant.
-    convolveur_en_attente: Arc<AtomicBool>,
     /// #6522, #6524 — un traitement est-il ARMÉ dans les réglages enregistrés
     /// de la zone qui joue (égaliseur, correction de pièce, crossfeed, greffon
     /// natif, repli mono) ? Posé par l'orchestrateur à côté de `pure_bypass`.
@@ -1532,7 +1528,6 @@ impl LocalOutput {
             convolver_config: Arc::new(std::sync::Mutex::new(None)),
             convolver: Arc::new(std::sync::Mutex::new(None)),
             convolution_autorisee: Arc::new(AtomicBool::new(false)),
-            convolveur_en_attente: Arc::new(AtomicBool::new(false)),
             pure_bypass: Arc::new(AtomicBool::new(false)),
             volume_pose: AtomicBool::new(false),
             flux_sans_fin: AtomicBool::new(false),
@@ -2057,7 +2052,6 @@ impl LocalOutput {
             let joue = fondu > 0;
             match nouveau {
                 Some(n) if joue && actif.is_some() => {
-                    self.convolveur_en_attente.store(false, Ordering::Relaxed);
                     let resultat = match actif.as_mut() {
                         Some(ancien) => ancien.remplacer_en_fondu_en_rendant(n, fondu),
                         None => Err(n),
@@ -2071,22 +2065,24 @@ impl LocalOutput {
                     if let Some(ancien) = actif.as_mut() {
                         a_liberer = ancien.eteindre_en_fondu_en_rendant(fondu);
                     }
-                    self.convolveur_en_attente.store(false, Ordering::Relaxed);
                 }
-                // Flux en cours SANS moteur : poser un convolveur maintenant
-                // retarderait le flux de sa latence d'un coup (saut de temps,
-                // latence de la chaîne qui passe de 0 à un bloc). Le jeu est
-                // mémorisé ; la sortie le bâtit au prochain départ de flux,
-                // comme pour un droit accordé en cours de lecture (#7632).
+                // Flux en cours SANS moteur : d'abord un moteur ÉTEINT, qui
+                // retarde seulement l'entrée de sa latence — le SEUL saut de
+                // temps, un bloc de silence à la pose, sans aucun échantillon
+                // rejoué —, puis le vrai filtre lui succède par réchauffe et
+                // fondu. Radio comprise : rien n'attend une jonction.
                 Some(n) if joue => {
-                    remplace = Some(n);
-                    self.convolveur_en_attente.store(true, Ordering::Relaxed);
-                    tracing::info!(device = %self.device_name, "convolver_pose_a_la_prochaine_jonction");
+                    let mut retard = super::super::audio::convolver::Convolver::retard_seul(
+                        n.channels(),
+                        n.block_size(),
+                    );
+                    match retard.remplacer_en_fondu_en_rendant(n, fondu) {
+                        Ok(r) => a_liberer = r,
+                        Err(n) => retard = n,
+                    }
+                    remplace = actif.replace(retard);
                 }
-                n => {
-                    self.convolveur_en_attente.store(false, Ordering::Relaxed);
-                    remplace = std::mem::replace(&mut *actif, n);
-                }
+                n => remplace = std::mem::replace(&mut *actif, n),
             }
         }
         drop(remplace);
@@ -4815,18 +4811,24 @@ fn rebuild_local_convolver(
         Some(config) => match config.build_for(1024, sample_rate, channels as usize) {
             Ok(convolver) => Some(convolver),
             Err(error) => {
-                if let Ok(mut current) = active.lock() {
-                    *current = None;
-                }
+                // L'ancien moteur sort du verrou avant d'être libéré.
+                let ancien = active.lock().ok().and_then(|mut c| c.take());
+                drop(ancien);
                 return Err(error);
             }
         },
         None => None,
     };
     let enabled = next.is_some();
-    *active
-        .lock()
-        .map_err(|_| "verrou du convolveur actif empoisonné".to_string())? = next;
+    // Le moteur est bâti AVANT le verrou (ci-dessus) ; sous le verrou, un
+    // simple échange, et l'ancien moteur est libéré après.
+    let ancien = std::mem::replace(
+        &mut *active
+            .lock()
+            .map_err(|_| "verrou du convolveur actif empoisonné".to_string())?,
+        next,
+    );
+    drop(ancien);
     Ok(enabled)
 }
 
@@ -7057,7 +7059,6 @@ impl OutputTarget for LocalOutput {
         let convolver_config = self.convolver_config.clone();
         let convolver = self.convolver.clone();
         let convolution_autorisee = self.convolution_autorisee.clone();
-        let convolveur_en_attente = self.convolveur_en_attente.clone();
         let pure_bypass = self.pure_bypass.clone();
         // #3973 — lu UNE fois par piste, comme le reste de ce que
         // l'orchestrateur pose avant `play_url`.
@@ -7820,7 +7821,6 @@ impl OutputTarget for LocalOutput {
                 // forme de f32 — `is_dop_pcm`, qui inspecte des octets PCM
                 // bruts, n'a rien a y examiner.
                 current_format.store(LocalOutput::pack_format(dec_sr, dec_ch), Ordering::Relaxed);
-                convolveur_en_attente.store(false, Ordering::Relaxed);
                 match rebuild_local_convolver(
                     &convolver_config,
                     &convolver,
@@ -8037,7 +8037,6 @@ impl OutputTarget for LocalOutput {
                 LocalOutput::pack_format(sample_rate, channels),
                 Ordering::Relaxed,
             );
-            convolveur_en_attente.store(false, Ordering::Relaxed);
             match rebuild_local_convolver(
                 &convolver_config,
                 &convolver,
@@ -9154,13 +9153,12 @@ impl OutputTarget for LocalOutput {
                     LocalOutput::pack_format(sample_rate, channels),
                     Ordering::Relaxed,
                 );
-                // T09b — à la jonction : un format qui change, ou un jeu posé
-                // pendant la piste précédente sans moteur en service. Poser
-                // un moteur ici retarde le flux de sa latence (un bloc, 21 ms
-                // à 48 kHz) à cette jonction précise : c'est le seul endroit
-                // où ce saut est admis.
-                let en_attente = convolveur_en_attente.swap(false, Ordering::Relaxed);
-                if convolver_format_changed || en_attente {
+                // Un format qui change à la jonction : le moteur est rebâti
+                // pour le nouveau format (le rééchantillonnage du filtre est
+                // en cache, préparé en tâche de fond dès la pose du jeu).
+                // S'il n'y avait pas de moteur, le flux prend ici sa latence
+                // (un bloc, 21 ms à 48 kHz), à cette jonction précise.
+                if convolver_format_changed {
                     match rebuild_local_convolver(
                         &convolver_config,
                         &convolver,
