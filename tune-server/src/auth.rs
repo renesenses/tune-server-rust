@@ -8,6 +8,7 @@ use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
@@ -303,6 +304,7 @@ pub async fn auth_middleware(
         && (method == axum::http::Method::GET || method == axum::http::Method::HEAD)
         && tune_core::upnp_server::est_ressource_didl(path)
         && appelant_sur_le_reseau_local(&request)
+        && !porte_un_jeton_valide(&request, &settings)
     {
         // #4260 : le gestionnaire du relais de pochettes doit savoir que
         // l'appel est entré SANS jeton, par cette exemption — il exige alors
@@ -314,36 +316,67 @@ pub async fn auth_middleware(
     // Extract token from Authorization header or tune_session cookie
     let token = extract_token_from_request(&request);
 
-    match token {
-        Some(tok) if tok.starts_with("ApiKey:") => {
-            // API key auth
-            let key = &tok[7..];
-            let stored = settings.get("api_key").ok().flatten().unwrap_or_default();
-            if !stored.is_empty() && key == stored {
-                next.run(request).await
-            } else {
-                (StatusCode::UNAUTHORIZED, "invalid api key").into_response()
-            }
-        }
-        Some(tok) => {
-            let secret = match settings.get("jwt_secret").ok().flatten() {
-                Some(s) if !s.is_empty() => s,
-                _ => return (StatusCode::UNAUTHORIZED, "no jwt secret configured").into_response(),
-            };
-            match verify_jwt(&tok, &secret) {
-                Ok(claims) => {
-                    let user_id = claims.sub.parse::<i64>().unwrap_or(0);
-                    request.extensions_mut().insert(AuthUser {
-                        user_id,
-                        role: claims.role,
-                    });
-                    next.run(request).await
-                }
-                Err(_) => (StatusCode::UNAUTHORIZED, "invalid token").into_response(),
-            }
-        }
-        None => (StatusCode::UNAUTHORIZED, "authentication required").into_response(),
+    let Some(tok) = token else {
+        return (StatusCode::UNAUTHORIZED, "authentication required").into_response();
+    };
+    let Some(user) = valider_jeton(&tok, &settings) else {
+        let message = if tok.starts_with("ApiKey:") {
+            "invalid api key"
+        } else if settings
+            .get("jwt_secret")
+            .ok()
+            .flatten()
+            .is_none_or(|s| s.is_empty())
+        {
+            "no jwt secret configured"
+        } else {
+            "invalid token"
+        };
+        return (StatusCode::UNAUTHORIZED, message).into_response();
+    };
+    // Seul le JWT porte l’identité d’un profil utilisable par les extracteurs.
+    if !tok.starts_with("ApiKey:") {
+        request.extensions_mut().insert(user);
     }
+    next.run(request).await
+}
+
+pub(crate) fn cle_api_valide(cle: &str, settings: &SettingsRepo) -> bool {
+    let Some(attendue) = settings
+        .get("api_key")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())
+    else {
+        return false;
+    };
+    // Comparer des empreintes de longueur fixe, même si les clés ont des tailles différentes.
+    let recue = Sha256::digest(cle.as_bytes());
+    let configuree = Sha256::digest(attendue.as_bytes());
+    bool::from(recue.ct_eq(&configuree))
+}
+
+fn valider_jeton(tok: &str, settings: &SettingsRepo) -> Option<AuthUser> {
+    if let Some(cle) = tok.strip_prefix("ApiKey:") {
+        return cle_api_valide(cle, settings).then(|| AuthUser {
+            user_id: 0,
+            role: "api-key".into(),
+        });
+    }
+    let secret = settings
+        .get("jwt_secret")
+        .ok()
+        .flatten()
+        .filter(|s| !s.is_empty())?;
+    let claims = verify_jwt(tok, &secret).ok()?;
+    Some(AuthUser {
+        user_id: claims.sub.parse().unwrap_or(0),
+        role: claims.role,
+    })
+}
+
+fn porte_un_jeton_valide(request: &Request, settings: &SettingsRepo) -> bool {
+    extract_token_from_request(request).is_some_and(|tok| valider_jeton(&tok, settings).is_some())
 }
 
 /// Marqueur posé sur la requête quand elle est entrée par l'exemption DIDL
@@ -505,35 +538,15 @@ pub fn ws_authorized(
         return true;
     }
 
-    let jwt_secret = settings
-        .get("jwt_secret")
-        .ok()
-        .flatten()
-        .filter(|s| !s.is_empty());
-
-    // Header- or cookie-borne credential (Bearer JWT or ApiKey).
-    if let Some(tok) = extract_token_from_headers(headers) {
-        if let Some(key) = tok.strip_prefix("ApiKey:") {
-            let stored = settings.get("api_key").ok().flatten().unwrap_or_default();
-            if !stored.is_empty() && key == stored {
-                return true;
-            }
-        } else if let Some(secret) = &jwt_secret
-            && verify_jwt(&tok, secret).is_ok()
-        {
-            return true;
-        }
-    }
-
-    // Query-param JWT (browser WebSocket can't set an Authorization header).
-    if let (Some(tok), Some(secret)) = (query_token, &jwt_secret)
-        && !tok.is_empty()
-        && verify_jwt(tok, secret).is_ok()
+    if extract_token_from_headers(headers)
+        .is_some_and(|tok| valider_jeton(&tok, &settings).is_some())
     {
         return true;
     }
-
-    false
+    // Le paramètre du handshake accepte uniquement un JWT.
+    query_token
+        .filter(|tok| !tok.is_empty() && !tok.starts_with("ApiKey:"))
+        .is_some_and(|tok| valider_jeton(tok, &settings).is_some())
 }
 
 // ---------------------------------------------------------------------------
@@ -555,45 +568,30 @@ impl FromRequestParts<AppState> for AuthUser {
         // Otherwise, try to extract directly (for routes outside the middleware layer)
         let settings = SettingsRepo::with_backend(state.backend.clone());
 
-        let secret = settings
+        let token = extract_token_from_headers(&parts.headers);
+        if let Some(tok) = token.as_deref()
+            && !tok.starts_with("ApiKey:")
+            && let Some(user) = valider_jeton(tok, &settings)
+        {
+            return Ok(user);
+        }
+        let message = if settings
             .get("jwt_secret")
             .ok()
             .flatten()
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| {
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(json!({"error": "authentication not configured"})),
-                )
-            })?;
-
-        let token = extract_token_from_headers(&parts.headers).ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "authentication required"})),
-            )
-        })?;
-
-        // Skip ApiKey tokens for the extractor
-        if token.starts_with("ApiKey:") {
-            return Err((
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "API key auth not supported for this endpoint, use JWT"})),
-            ));
-        }
-
-        let claims = verify_jwt(&token, &secret).map_err(|_| {
-            (
-                StatusCode::UNAUTHORIZED,
-                Json(json!({"error": "invalid or expired token"})),
-            )
-        })?;
-
-        let user_id = claims.sub.parse::<i64>().unwrap_or(0);
-        Ok(AuthUser {
-            user_id,
-            role: claims.role,
-        })
+            .is_none_or(|s| s.is_empty())
+        {
+            "authentication not configured"
+        } else {
+            match token.as_deref() {
+                None => "authentication required",
+                Some(tok) if tok.starts_with("ApiKey:") => {
+                    "API key auth not supported for this endpoint, use JWT"
+                }
+                Some(_) => "invalid or expired token",
+            }
+        };
+        Err((StatusCode::UNAUTHORIZED, Json(json!({"error": message}))))
     }
 }
 

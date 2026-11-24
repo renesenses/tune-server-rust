@@ -5267,6 +5267,14 @@ async fn previous(
             .lock()
             .unwrap()
             .insert(zone_id, std::time::Instant::now());
+        // Fil 2757 — « revenir au début » donné sur la meneuse vaut pour ses
+        // suiveuses, comme un `seek` (#7759) : c'en est un, à 0. Le relais
+        // n'écoute pas l'événement `seek`, et la suiveuse, déjà sur la même
+        // piste, n'a aucune raison de bouger seule. Ce relais ne démarre
+        // aucune piste : il ne déplace que des suiveuses déjà sur la même.
+        crate::routes::zones::relais_de_groupe_6155::deplacer_les_suiveuses_en_fond(
+            &state, zone_id, 0,
+        );
         return Json(json!({ "status": "restarted" })).into_response();
     }
 

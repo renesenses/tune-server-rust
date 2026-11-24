@@ -1632,7 +1632,7 @@ async fn le_choix_du_dossier_descend_sans_sortir_de_la_bibliotheque_3036() {
     let banc = Banc::new(simule(), Arc::new(SansReseau));
     let racine = banc.racine().to_string_lossy().to_string();
     std::fs::create_dir_all(banc.racine().join("Classique/Bach/Cantates")).unwrap();
-    std::fs::create_dir_all(banc.racine().join(".cache")).unwrap();
+    std::fs::create_dir_all(banc.racine().join(".tune")).unwrap();
     std::fs::write(banc.racine().join("Classique/notes.txt"), b"x").unwrap();
     let q = |c: &str| format!("/extraction/dossiers?chemin={}", encode(c));
     let noms = |v: &Value| -> Vec<String> {
@@ -1730,4 +1730,63 @@ fn encode(s: &str) -> String {
             _ => format!("%{b:02X}"),
         })
         .collect()
+}
+
+/// Fil forum 3036 (relecture) — un réglage ou un lancement forgé ne range
+/// pas un CD dans un dossier masqué : `.tune`, `duplicates`.
+#[tokio::test]
+async fn reglage_et_lancement_refusent_un_dossier_masque_3036() {
+    let banc = Banc::new(simule(), Arc::new(SansReseau));
+    let racine = banc.racine().to_string_lossy().to_string();
+    std::fs::create_dir_all(banc.racine().join(".tune")).unwrap();
+    let (code, v) = banc
+        .appel(
+            "PUT",
+            "/extraction/reglages",
+            Some(json!({ "destination": format!("{racine}/.tune") })),
+        )
+        .await;
+    assert_eq!(
+        (code, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("dossier_masque"))
+    );
+    let (code, v) = banc
+        .appel(
+            "POST",
+            "/extractions",
+            Some(json!({ "destination": format!("{racine}/duplicates") })),
+        )
+        .await;
+    assert_eq!(
+        (code, v["error"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("dossier_masque"))
+    );
+    assert!(
+        !banc.racine().join("duplicates").exists(),
+        "rien n'est créé"
+    );
+}
+
+/// Fil forum 3036 (relecture) — un dossier en « . » que le scan parcourt
+/// se règle, et le réglage tient : pas de retour silencieux au premier
+/// emplacement.
+#[tokio::test]
+async fn un_reglage_dans_un_dossier_en_point_tient_3036() {
+    let banc = Banc::new(simule(), Arc::new(SansReseau));
+    let racine = banc.racine().to_string_lossy().to_string();
+    let special = format!("{racine}/.38 Special");
+    std::fs::create_dir_all(&special).unwrap();
+    let (code, v) = banc
+        .appel(
+            "PUT",
+            "/extraction/reglages",
+            Some(json!({ "destination": special })),
+        )
+        .await;
+    assert_eq!(code, StatusCode::OK, "{v}");
+    let (_, v) = banc.appel("GET", "/extraction/reglages", None).await;
+    assert_eq!(
+        (v["destination"].as_str(), v["destination_source"].as_str()),
+        (Some(special.as_str()), Some("reglage"))
+    );
 }

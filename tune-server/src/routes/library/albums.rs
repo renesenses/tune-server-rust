@@ -2740,6 +2740,22 @@ pub(super) async fn album_metadata_put(
     body.remove(tune_core::db::album_metadata_repo::CLE_EDITION_MANUELLE);
     // #5314 — pas plus que le marqueur de recopie du genre sur les pistes.
     body.remove(tune_core::db::genre_album_pistes::CLE_GENRE_PISTES);
+    // Fil 3012 — le master Discogs, rangé en chiffres ; vide : effacé.
+    {
+        use tune_core::metadata::discogs_master as dm;
+        match dm::preparer_ecriture(&mut body) {
+            Err(message) => {
+                return (StatusCode::BAD_REQUEST, Json(json!({ "error": message })))
+                    .into_response();
+            }
+            Ok(dm::Ecriture::Effacer) => {
+                if let Err(e) = repo.delete(id, dm::CLE) {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+                }
+            }
+            Ok(_) => {}
+        }
+    }
     if let Err(e) = repo.set_batch(id, &body) {
         return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
     }

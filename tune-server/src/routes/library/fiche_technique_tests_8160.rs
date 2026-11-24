@@ -347,3 +347,34 @@ async fn douteux_masque_se_dit_non_analyse_8160() {
     assert_eq!(f["faux_hires"]["verdict"], "non_analyse");
     assert!(f["faux_hires"]["raison"].is_null());
 }
+
+/// #9472 — une ligne hi-res rangée « douteuse » sur une coupure basse (avant
+/// #9472, « coupé net vers 1,4 kHz ») se lit non concluante jusqu'à sa
+/// remesure : la fiche ne publie alors ni sa raison ni sa coupure.
+#[tokio::test]
+async fn une_coupure_basse_rangee_ne_se_publie_pas_sur_la_fiche_9472() {
+    let state = AppState::new(":memory:", 0, Default::default()).unwrap();
+    executer(
+        &state,
+        "INSERT INTO tracks (id, title, duration_ms, source, file_path, format, sample_rate, bit_depth, channels) \
+         VALUES (3, 'grave', 180000, 'local', '/m/absent.flac', 'flac', 96000, 24, 2)",
+    );
+    executer(
+        &state,
+        "INSERT INTO hires_verifications (track_id, verdict, raison, coupure_hz, bits_effectifs, \
+         sample_rate, bits_declares) VALUES (3, 'douteux', 'coupure_spectrale', 1400.0, 24, 96000, 24)",
+    );
+    let app = crate::routes::router(state.clone());
+    let (statut, f) = appel(
+        &app,
+        "GET",
+        "/api/v1/library/tracks/3/fiche-technique",
+        None,
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{f}");
+    let h = &f["faux_hires"];
+    assert_eq!(h["verdict"], "non_concluant", "{h}");
+    assert!(h["raison"].is_null(), "aucune raison publiée : {h}");
+    assert!(h["coupure_hz"].is_null(), "aucune coupure publiée : {h}");
+}

@@ -107,9 +107,12 @@ fn statut_note_a(adresse: &str, publie: Option<&str>, maintenant: SystemTime) ->
     let mut r = registre().lock().ok()?;
     let k = cle(adresse);
     let m = *r.get(&k)?;
+    // Une date dans le futur (flux mal daté, horloge de l'éditeur en avance)
+    // ne prouve aucune republication : elle laisserait tomber la marque à
+    // chaque lecture de la liste.
     let republie = publie
         .and_then(date_de_publication)
-        .is_some_and(|d| d > m.depuis);
+        .is_some_and(|d| d > m.depuis && d <= maintenant);
     if expiree(&m, maintenant) || republie {
         r.remove(&k);
         return None;
@@ -172,18 +175,37 @@ mod tests {
     fn un_episode_republie_apres_la_marque_n_est_plus_indisponible() {
         let url = "https://media.test/republie.mp3";
         let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_763_000_000);
+        let plus_tard = t0 + Duration::from_secs(7200);
         marquer_a(url, 410, t0);
         // Publié avant la marque : toujours indisponible.
         assert_eq!(
-            statut_note_a(url, Some("Thu, 01 Jan 2015 10:00:00 +0000"), t0),
+            statut_note_a(url, Some("Thu, 01 Jan 2015 10:00:00 +0000"), plus_tard),
             Some(410)
         );
-        // Republié après : la marque tombe.
+        // Republié une heure après la marque, lu deux heures après : elle tombe.
+        let republie = chrono::DateTime::<chrono::Utc>::from(t0 + Duration::from_secs(3600));
         assert_eq!(
-            statut_note_a(url, Some("2099-01-01T10:00:00+01:00"), t0),
+            statut_note_a(url, Some(&republie.to_rfc3339()), plus_tard),
             None
         );
-        assert_eq!(statut_note_a(url, None, t0), None);
+        assert_eq!(statut_note_a(url, None, plus_tard), None);
+    }
+
+    #[test]
+    fn une_date_de_publication_dans_le_futur_ne_leve_pas_la_marque() {
+        let url = "https://media.test/date-future.mp3";
+        let t0 = SystemTime::UNIX_EPOCH + Duration::from_secs(1_763_000_000);
+        marquer_a(url, 404, t0);
+        assert_eq!(
+            statut_note_a(
+                url,
+                Some("2099-01-01T10:00:00+01:00"),
+                t0 + Duration::from_secs(60)
+            ),
+            Some(404),
+            "une date future ne prouve pas que l'éditeur a republié"
+        );
+        oublier(url);
     }
 
     #[test]

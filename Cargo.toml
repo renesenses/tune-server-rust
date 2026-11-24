@@ -97,6 +97,7 @@ cpal = "0.17"
 # ne le réclame donc pas.
 rust_cast = { path = "vendor/rust_cast" }
 sha2 = "0.10"
+subtle = "2.6"
 jsonwebtoken = "9"
 argon2 = { version = "0.5", features = ["std"] }
 blowfish = "0.9"

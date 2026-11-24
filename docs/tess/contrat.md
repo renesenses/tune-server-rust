@@ -382,8 +382,21 @@ ordre et tous leurs réglages.
   Chaîne vide et `bypass_all`. Il peut être supprimé, pas modifié.
 - **Charger un préréglage remplace la chaîne de la zone.** W4 propose
   d'enregistrer la chaîne courante avant.
-- **`verifier` refuse** : un id invalide ou en double, un nom vide, un Pure
-  modifié.
+- **Règles d'entrée** (`verifier`, appliquées par l'enregistrement et le
+  renommage) : 200 préréglages au plus, id valide et unique, nom de 1 à 80
+  caractères sans caractère de contrôle ni de format invisible (catégorie
+  Unicode Cf : U+200B, U+200E/F, U+202A-202E, U+2066-2069, U+FEFF…), Pure
+  non modifié.
+- **Import** : tolérant comme la base (noms, doublons, plus de 200 gardés),
+  mais borné : un fichier de plus de 1000 préréglages est refusé en entier
+  (avertissement, la liste de la machine reste) ; un « pure » modifié est
+  remplacé par le Pure standard (avertissement).
+- **Validation à l'entrée seulement** (enregistrement et renommage ; l'import
+  relit la liste avec la tolérance de la base, dans les bornes ci-dessus).
+  La lecture de la base est tolérante et ne perd JAMAIS une entrée : une
+  liste écrite par une version plus lâche (nom trop long, doublon, plus de
+  200…) est rendue telle quelle et réécrite telle quelle par les routes.
+  ZWNJ (U+200C) et ZWJ (U+200D) sont permis (persan, emoji composés).
 - **Droits** : ils sont vérifiés au **chargement**. Un préréglage Premium reste
   enregistré sur un compte redevenu gratuit.
 
@@ -392,11 +405,18 @@ ordre et tous leurs réglages.
 - **Stockage** : un seul réglage global, `tess_presets` (la liste et
   `apply_mode`), écrit après `verifier`. Absent : Pure seul, `immediately`.
   Le préréglage actif d'une zone : `zone_{id}_tess_active_preset`.
-- **`GET /tess/presets`** → `presets`.
+- **`GET /tess/presets`** → `presets`. La liste est rendue telle qu'en base :
+  une entrée écrite par une version plus lâche peut avoir un `id` hors du
+  motif (`^[a-z0-9]([a-z0-9-]*[a-z0-9])?$`), un nom hors des règles d'entrée,
+  un doublon, ou dépasser 200 entrées. Un client l'affiche et peut la
+  renommer ou la supprimer, sans rien supposer de son `id` (l'encoder dans
+  les URL).
 - **`POST /tess/presets`** ← `{ "name", "zone_id" }` (chaîne ENREGISTRÉE de
   la zone, neutre vis-à-vis du droit) ou `{ "name", "chain" }` (lue
   strictement, forme vérifiée en 409, droits au chargement) → **201**, le
-  préréglage. Identifiant tiré du nom, rendu unique (`-2`, `-3`…) ; `pure`
+  préréglage (avec, seulement si le marqueur « ACTIVE » n'a pas pu être posé,
+  `warnings: ["active_preset_not_stored"]`, champ facultatif du schéma
+  `preset`). Identifiant tiré du nom, rendu unique (`-2`, `-3`…) ; `pure`
   reste réservé. Nom : 1 à 80 caractères, une ligne, sinon 400
   `invalid_name`. Enregistré depuis une zone, il y devient « ACTIVE ». Les
   champs tenus par le serveur (`origin`, `inert_on_network`,
@@ -418,24 +438,51 @@ ordre et tous leurs réglages.
   `plugin_unavailable`…). Un refus garde la forme `refusal`.
 - Erreurs propres aux préréglages : `{ "error", "message", "preset_id" }`
   (`preset_not_found` en 404, `invalid_name`, `invalid_body`,
-  `invalid_apply_mode` en 400).
+  `invalid_apply_mode` en 400, `too_many_presets` en 409 au-delà de 200).
+- **Marqueur « ACTIVE »** : posé sous le verrou des `PUT` de la zone ; au
+  chargement, le verrou de la liste est tenu jusqu'à sa pose (une suppression
+  concurrente ne laisse jamais de marqueur orphelin). À l'enregistrement, la
+  chaîne de la zone est lue sous ce même verrou. Un échec d'écriture du
+  marqueur n'annule rien : la chaîne écrite atteint la sortie selon le mode,
+  le préréglage enregistré reste créé, l'ancien marqueur est effacé au mieux
+  (aucun marqueur plutôt qu'un faux), et la réponse est un succès avec
+  `warnings: ["active_preset_not_stored"]` (aussi dans `zone_response` d'un
+  `PUT`, champ facultatif).
 - **Préréglage actif et `PUT`** : un `PUT /zones/{id}/tess` dont la chaîne
-  écrite ne correspond plus au préréglage actif (comparée sans les champs du
-  serveur) efface `active_preset` ; renvoyée telle quelle, il reste.
+  ENREGISTRÉE (lue sans les droits, donc jamais la vue convertie P2 d'un
+  compte gratuit) ne correspond plus au préréglage actif (comparée sans les
+  champs du serveur) efface `active_preset` ; renvoyée telle quelle, il reste.
+- Passer en `immediately` sert aussitôt ce qui attendait la prochaine lecture
+  et vide la file, sur TOUTES les sorties, par le même rafraîchissement que
+  le `PUT` (voir ci-dessous ce qu'il produit sur une zone réseau). Le
+  démarrage de lecture lit la file sous le verrou des
+  `PUT` de la zone ; « locale » se lit dans `output_type` (absent = locale).
 - **Mode d'application**, suivi par le `PUT` comme par le chargement :
-  - `immediately` : la sortie vivante est rafraîchie tout de suite (à chaud en
-    local ; relance du flux réseau à la position, #8422 : anti-rebond,
-    plancher et verrou de relance, donc une seule relance par rafale) ;
+  - `immediately` : la sortie vivante est rafraîchie tout de suite par les
+    chemins des anciennes routes. En local : à chaud. Sur une zone réseau qui
+    joue : SEUL l'égaliseur relance le flux à la position (#8422 :
+    anti-rebond, plancher et verrou de relance, donc une seule relance par
+    rafale) ; le crossfeed réseau prend effet à la piste suivante ; mono,
+    réaffectation, suréchantillonnage et convolution n'agissent qu'en local
+    (le prochain flux réseau les porte) ;
   - `at_next_playback` (ou valeur inconnue) : les anciennes clés sont écrites
     (le prochain flux réseau part avec), la sortie vivante n'est pas touchée ;
     ce qui reste à rafraîchir sur une sortie locale l'est au prochain
     démarrage de lecture de la zone (événement `started`). Sur une sortie
     réseau, rien n'est relancé au démarrage : le flux vient d'être fabriqué
     avec les nouvelles clés.
-- **Export / import** : `tess_presets` part avec les réglages globaux ; à
-  l'import, une liste illisible ou incohérente est écartée avec un
-  avertissement (celle de la machine reste). `zone_{id}_tess_active_preset`
-  voyage dans sa zone.
+- **Export / import** : `tess_presets` part avec les réglages globaux et se
+  réimporte avec la MÊME tolérance que la lecture de la base : toutes les
+  entrées, même celles que les règles d'entrée refuseraient aujourd'hui. Sont
+  écartés, avec un avertissement (la liste de la machine reste) : un JSON
+  illisible, un fichier de plus de 1000 préréglages ; un « pure » modifié est
+  remplacé par le Pure standard. `zone_{id}_tess_active_preset` voyage dans sa zone ; s'il désigne un
+  préréglage absent après l'import, il est écarté avec un avertissement.
+- **Chargement** : le marqueur est effacé AVANT d'écrire la chaîne ; s'il ne
+  peut pas l'être, 503 `storage_error` et rien n'est modifié. Si le `PUT`
+  refuse ensuite (402, 409, 400) sans toucher à la chaîne, l'ancien marqueur
+  est remis. `active_preset`
+  n'est publié que si le préréglage existe encore.
 
 ## 6. Zones (`tess::zones`, Q8)
 

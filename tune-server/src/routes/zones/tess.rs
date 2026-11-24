@@ -383,11 +383,18 @@ pub(super) async fn reponse_de_zone(
                 > 1e-6
         }),
     };
+    // « ACTIVE » seulement si le préréglage existe encore (un marqueur resté
+    // après une suppression ou un import ne s'affiche pas).
     let actif = settings
         .get(&cle_prereglage_actif(zone_id))
         .ok()
         .flatten()
-        .filter(|p| !p.is_empty());
+        .filter(|p| !p.is_empty())
+        .filter(|p| {
+            tune_core::tess::prereglages::lire(&settings)
+                .map(|l| l.get(p).is_some())
+                .unwrap_or(true)
+        });
     ReponseTessZone::depuis_avec_le_lecteur(
         zone_id,
         lecture.chaine,
@@ -450,7 +457,7 @@ pub async fn get_zone_tess(State(state): State<AppState>, Path(id): Path<i64>) -
 /// écriture (comparaison des marques et des maillons inchangés). L'écriture
 /// elle-même prend en plus [`verrou_de_zone`] (dans [`ecrire_chaine`]), qui
 /// l'ordonne avec la migration de T03.
-pub(super) fn verrou_des_put(zone_id: i64) -> Arc<tokio::sync::Mutex<()>> {
+pub fn verrou_des_put(zone_id: i64) -> Arc<tokio::sync::Mutex<()>> {
     static VERROUS: OnceLock<std::sync::Mutex<HashMap<i64, Arc<tokio::sync::Mutex<()>>>>> =
         OnceLock::new();
     let mut table = VERROUS
@@ -715,10 +722,15 @@ pub async fn put_zone_tess(
     };
     // T17 : la chaîne a changé à la main ; le préréglage chargé n'est plus
     // « ACTIVE » s'il ne la décrit plus.
-    super::tess_prereglages::oublier_le_prereglage_s_il_differe(&state, id, &lecture.chaine);
+    // Un marqueur qui ne s'efface pas n'empêche jamais la chaîne écrite
+    // d'atteindre la sortie : avertissement, pas d'erreur.
+    let avertissement =
+        super::tess_prereglages::oublier_le_prereglage_s_il_differe(&state, id, &lecture.chaine);
     let mode = super::tess_prereglages::appliquer_selon_le_mode(&state, &zone, cles.clone()).await;
     info!(zone_id = id, cles = ?cles, mode = ?mode, "tess_chaine_ecrite");
-    Json(reponse_de_zone(&state, &zone, lecture, premium, catalogue).await).into_response()
+    let mut reponse = reponse_de_zone(&state, &zone, lecture, premium, catalogue).await;
+    reponse.warnings.extend(avertissement);
+    Json(reponse).into_response()
 }
 
 #[cfg(test)]
