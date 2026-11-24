@@ -161,8 +161,9 @@ enum Famille {
     /// L'étage casque de `StreamingDsp` : crossfeed et greffons natifs tiers
     /// (`load_crossfeed_processor`). Il n'impose PAS le ré-encodage (#2742).
     Casque,
-    /// Repli mono, réaffectation : hors de `StreamingDsp`, leur état réseau
-    /// est déjà dit par T02 et T16 ; T12b n'y touche pas.
+    /// Repli mono, réaffectation : hors de `StreamingDsp`, la lecture réseau
+    /// ne les applique sur aucune voie ; [`appliquer`] les publie éteints
+    /// (`not_applied_on_transport`).
     HorsRelais,
 }
 
@@ -187,23 +188,7 @@ fn greffons_effectifs(r: &Resolution) -> impl Iterator<Item = &EtapeResolue> {
 /// La voie de la chaîne résolue vers ce lecteur. Pure : la matrice se teste
 /// sans orchestrateur.
 pub fn acheminer(r: &Resolution, f: &FaitsUpnp) -> AcheminementUpnp {
-    // L'upsampling effectif et un headroom MANUEL effectif modifient aussi
-    // les échantillons : comptés avec les étages qui imposent le ré-encodage,
-    // pour que `delivery` et le badge ne se contredisent jamais. (Le headroom
-    // automatique n'est effectif que devant un traitement déjà compté.)
-    let etape_fixe = |c: CodeEtape| r.etapes.iter().any(|e| e.code == c && e.effective);
-    let headroom_manuel = r.etapes.iter().any(|e| {
-        e.code == CodeEtape::Headroom
-            && e.effective
-            && e.params
-                .as_ref()
-                .and_then(|p| p.get("mode"))
-                .and_then(|m| m.as_str())
-                == Some("manual")
-    });
     let reencodage = f.replaygain_actif
-        || etape_fixe(CodeEtape::Upsampling)
-        || headroom_manuel
         || greffons_effectifs(r)
             .any(|e| famille(e.plugin_id.as_deref().unwrap_or("")) == Famille::Reencodage);
     let casque = greffons_effectifs(r)
@@ -291,7 +276,16 @@ fn source_dsd(r: &Resolution) -> bool {
     champ("kind") == Some("dsd") && champ("played_as") == Some("converted_to_pcm")
 }
 
+/// Détail d'un étage que la lecture n'applique sur AUCUNE voie de la famille
+/// UPnP.
+pub const DETAIL_NON_APPLIQUE: &str =
+    "Not applied on this network output: Tune serves this renderer without it";
+
 /// Reporte la voie sur la résolution :
+/// - les étages que la lecture réseau n'applique sur aucune voie — upsampling,
+///   headroom (`TraitementsDeZone` ne lit ni `Upsampling` ni `Headroom`),
+///   repli mono et réaffectation (hors de `StreamingDsp`) — sont éteints avec
+///   le motif `not_applied_on_transport` ;
 /// - un étage que la voie ne porte pas est éteint, avec le motif
 ///   `renderer_without_lpcm`, et les étapes finales (headroom automatique,
 ///   quantification, badge) sont recalculées ;
@@ -300,6 +294,26 @@ fn source_dsd(r: &Resolution) -> bool {
 ///   ReplayGain seul — n'est jamais « Bit-perfect » : le badge descend à
 ///   `altered_outside_tess`.
 pub fn appliquer(r: &mut Resolution, a: &AcheminementUpnp) {
+    let mut non_appliques = false;
+    for e in r.etapes.iter_mut().filter(|e| {
+        e.effective
+            && match e.code {
+                CodeEtape::Upsampling | CodeEtape::Headroom => true,
+                CodeEtape::Plugin => {
+                    famille(e.plugin_id.as_deref().unwrap_or("")) == Famille::HorsRelais
+                }
+                _ => false,
+            }
+    }) {
+        e.effective = false;
+        e.reason = Some(MotifEtape::NotAppliedOnTransport);
+        e.detail = Some(DETAIL_NON_APPLIQUE.into());
+        non_appliques = true;
+    }
+    if non_appliques {
+        r.headroom_db = 0.0;
+        r.recalculer_les_etapes_finales();
+    }
     if a.route == VoieUpnp::Untouched && a.reason == Some(MotifDeVoie::RendererWithoutLpcm) {
         let mut change = false;
         for e in r.etapes.iter_mut().filter(|e| {
@@ -532,10 +546,12 @@ mod tests {
         assert_eq!(r.badge, Badge::BitPerfect);
     }
 
-    /// Upsampling effectif ou headroom manuel : `delivery` compte ce
-    /// traitement, comme le badge.
+    /// Relecture du 24/11 (3e) : la lecture réseau n'applique ni l'upsampling
+    /// ni le headroom, ni le repli mono ni la réaffectation. La voie n'en tient
+    /// pas compte, l'état les dit non appliqués, et badge et `delivery` disent
+    /// la même chose : rien n'est traité, « Bit-perfect ».
     #[test]
-    fn upsampling_et_headroom_manuel_comptent_comme_traitement() {
+    fn upsampling_headroom_mono_et_reaffectation_ne_sont_pas_appliques() {
         use crate::tess::chaine::{Headroom, Upsampling};
         let tout = |_: &str| true;
         let x = ContexteExecution {
@@ -557,15 +573,41 @@ mod tests {
         };
         let mut hm = chaine(&[]);
         hm.fixed.headroom = Headroom::Manual { db: -3.0 };
-        for (cas, c) in [("upsampling", up), ("headroom manuel", hm)] {
-            let r = c.resoudre(&catalogue_de_reference(), &x);
-            assert_eq!(r.badge, Badge::ProcessedByTess, "{cas}");
+        for (cas, c) in [
+            ("upsampling", up),
+            ("headroom manuel", hm),
+            ("repli mono", chaine(&["mono-downmix"])),
+            ("réaffectation", chaine(&["channel-remap"])),
+        ] {
+            let mut r = c.resoudre(&catalogue_de_reference(), &x);
+            assert_eq!(r.badge, Badge::ProcessedByTess, "{cas} : avant");
+            for (l, arme) in [(Refused, false), (Accepted, true)] {
+                let a = acheminer(&r, &faits(l, arme, Library));
+                assert_eq!(a.route, VoieUpnp::Untouched, "{cas} {l:?}");
+                assert_eq!(a.reason, Some(MotifDeVoie::NothingToProcess), "{cas}");
+            }
             let a = acheminer(&r, &faits(Refused, false, Library));
-            assert_eq!(a.route, VoieUpnp::FileTranscode, "{cas}");
-            assert_ne!(a.reason, Some(MotifDeVoie::NothingToProcess), "{cas}");
-            let a = acheminer(&r, &faits(Accepted, true, Library));
-            assert_eq!(a.route, VoieUpnp::ProgressiveLpcm, "{cas}");
+            appliquer(&mut r, &a);
+            assert_eq!(r.badge, Badge::BitPerfect, "{cas} : badge = delivery");
+            assert!(
+                r.etapes.iter().any(|e| !e.effective
+                    && e.reason == Some(MotifEtape::NotAppliedOnTransport)
+                    && e.detail.as_deref() == Some(DETAIL_NON_APPLIQUE)),
+                "{cas} : motif publié"
+            );
+            assert!(
+                r.etapes.iter().all(|e| !e.effective
+                    || matches!(e.code, CodeEtape::Source | CodeEtape::Output)),
+                "{cas} : plus rien d'effectif"
+            );
         }
+        // Avec un égaliseur, le repli mono reste éteint et l'égaliseur porté.
+        let mut r = chaine(&["equalizer-graphic", "mono-downmix"])
+            .resoudre(&catalogue_de_reference(), &x);
+        let a = acheminer(&r, &faits(Refused, false, Library));
+        appliquer(&mut r, &a);
+        assert_eq!(a.route, VoieUpnp::FileTranscode);
+        assert_eq!(r.badge, Badge::ProcessedByTess);
     }
 
     #[test]
@@ -672,7 +714,8 @@ mod tests {
                 .iter()
                 .find(|e| e.code == CodeEtape::Headroom)
                 .unwrap();
-            assert_eq!(h.reason, Some(MotifEtape::NothingToProtect), "{id}");
+            // Le headroom n'est appliqué sur aucune voie UPnP.
+            assert_eq!(h.reason, Some(MotifEtape::NotAppliedOnTransport), "{id}");
             let q = r
                 .etapes
                 .iter()

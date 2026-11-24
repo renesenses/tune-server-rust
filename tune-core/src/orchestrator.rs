@@ -2127,7 +2127,7 @@ mod gapless_dlna_pure_8076_tests;
 mod acheminement_upnp_t12b;
 #[cfg(test)]
 mod acheminement_upnp_t12b_tests;
-pub use acheminement_upnp_t12b::PisteEnCours;
+pub use acheminement_upnp_t12b::{PisteEnCours, volume_reglable_retenu};
 // #7965 — radios (au nom de la station) et podcasts dans l'historique.
 mod historique_radio_podcast_7965;
 #[cfg(test)]

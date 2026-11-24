@@ -333,13 +333,17 @@ async fn volume_de(state: &AppState, zone: &Zone) -> VolumeZone {
 /// T12b (relecture de suivi) — la sortie sait-elle régler son volume ? Lu
 /// SANS attendre le verrou de la sortie : la lecture le garde pendant une
 /// sonde SOAP (`dlna_accepte_lpcm`), et un lecteur muet le tiendrait des
-/// dizaines de secondes. Sortie occupée ou absente : `None`, le volume est
-/// alors celui du type de la zone (appareil hors sortie locale).
+/// dizaines de secondes. Sortie occupée : la dernière capacité connue
+/// (`volume_reglable_retenu`) ; jamais lue, ou sortie absente : `None`, le
+/// volume est alors celui du type de la zone.
 async fn sait_regler_le_volume(state: &AppState, zone: &Zone) -> Option<bool> {
     let device = zone.output_device_id.as_deref()?;
     let sortie = { state.outputs.lock().await.get(device) }?;
-    let s = sortie.try_lock().ok()?;
-    Some(s.capabilities().can_set_volume)
+    let lu = sortie
+        .try_lock()
+        .ok()
+        .map(|s| s.capabilities().can_set_volume);
+    tune_core::orchestrator::volume_reglable_retenu(device, lu)
 }
 
 /// La réponse de la zone, à partir de sa chaîne lue (T02).

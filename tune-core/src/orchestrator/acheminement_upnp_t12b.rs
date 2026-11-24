@@ -148,3 +148,25 @@ impl PlaybackOrchestrator {
         })
     }
 }
+
+/// Relecture du 24/11 (3e) — la dernière capacité de volume CONNUE de chaque
+/// sortie, pour la route d'état : elle lit la capacité sans attendre le verrou
+/// de la sortie (`try_lock`), et une sortie occupée (sonde SOAP d'une lecture)
+/// rend la dernière réponse lue plutôt que de retomber sur le type de zone.
+/// `lu` : la capacité lue à l'instant, ou `None` si la sortie était occupée.
+pub fn volume_reglable_retenu(device_id: &str, lu: Option<bool>) -> Option<bool> {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static MEMOIRE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
+    let mut m = MEMOIRE
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match lu {
+        Some(v) => {
+            m.insert(device_id.to_owned(), v);
+            Some(v)
+        }
+        None => m.get(device_id).copied(),
+    }
+}

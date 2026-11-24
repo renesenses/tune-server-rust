@@ -87,6 +87,9 @@ pub enum MotifEtape {
     /// n'impose de convertir la piste ; l'étage casque (crossfeed, greffons
     /// natifs tiers) ne l'atteint pas (`tess::reseau_upnp`).
     RendererWithoutLpcm,
+    /// T12b — famille UPnP : la lecture réseau n'applique cet étage sur
+    /// aucune voie (upsampling, headroom, repli mono, réaffectation).
+    NotAppliedOnTransport,
     #[serde(other)]
     Unknown,
 }

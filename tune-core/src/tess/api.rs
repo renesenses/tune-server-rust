@@ -343,7 +343,8 @@ pub fn schema_json() -> Value {
                                          "plugin_unavailable", "premium_required", "stereo_only",
                                          "replaced_in_group", "nothing_to_protect", "volume_not_software",
                                          "nothing_to_quantize", "not_in_service",
-                                         "renderer_without_lpcm", null] },
+                                         "renderer_without_lpcm", "not_applied_on_transport",
+                                         null] },
                     "detail": texte_ou_null,
                     "params": objet_ou_null,
                     "latency_frames": entier_ou_null

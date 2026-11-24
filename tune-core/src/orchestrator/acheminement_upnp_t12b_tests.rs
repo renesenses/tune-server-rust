@@ -426,12 +426,47 @@ async fn la_voie_publiee_est_celle_de_la_lecture_case_par_case() {
             b.crossfeed();
         }
         let z = b.zone_id;
-        let piste = crate::audio::replaygain::PisteRg::AUCUNE;
-        let reencodage = b.orch.zone_has_active_eq(z)
-            || b.orch.zone_ir_s_appliquerait(z, None, 2)
-            || b.orch.zone_replaygain_changes_audio(z, piste);
+        // ReplayGain RÉEL : un titre de service dont les gains sont notés
+        // (#8689), mode « track » ; l'autre titre n'en a pas. Le fait
+        // `replaygain_actif` vient de `faits_upnp_de_zone`, la lecture le juge
+        // par `zone_replaygain_changes_audio` : deux chemins, même prédicat.
+        {
+            use crate::audio::replaygain::services::{GainsDuService, noter};
+            noter(
+                "qobuz",
+                "t12b-avec-gain",
+                GainsDuService::depuis_qobuz(&serde_json::json!({"audio_info": {
+                    "replaygain_track_gain": -8.0, "replaygain_track_peak": 0.5
+                }}))
+                .unwrap(),
+            );
+            b.reglage(crate::audio::replaygain::SERVICES_ENABLED_KEY, "true");
+            b.reglage(crate::audio::replaygain::MODE_KEY, "track");
+        }
         let casque = b.orch.zone_has_active_crossfeed(z);
-        assert_eq!((reencodage, casque), (eq, cf), "banc");
+        let mut par_rg = Vec::new();
+        for (rg, id) in [(false, "t12b-sans-gain"), (true, "t12b-avec-gain")] {
+            let piste = crate::audio::replaygain::PisteRg::new(None, Some("qobuz"), Some(id));
+            let reencodage = b.orch.zone_has_active_eq(z)
+                || b.orch.zone_ir_s_appliquerait(z, None, 2)
+                || b.orch.zone_replaygain_changes_audio(z, piste);
+            assert_eq!((reencodage, casque), (eq || rg, cf), "banc rg={rg}");
+            let faits = b
+                .orch
+                .faits_upnp_de_zone(
+                    z,
+                    &PisteEnCours {
+                        source: Some("qobuz".into()),
+                        source_id: Some(id.into()),
+                        format: Some("flac".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(faits.replaygain_actif, rg, "fait lu rg={rg}");
+            par_rg.push((rg, reencodage, faits.replaygain_actif));
+        }
         let settings = SettingsRepo::with_backend(b.orch.db.clone());
         let lecture = crate::tess::migration::lire_zone(&settings, z, true).unwrap();
         let tout = |_: &str| true;
@@ -457,8 +492,23 @@ async fn la_voie_publiee_est_celle_de_la_lecture_case_par_case() {
                     db: 0.0,
                 },
             };
-            let r = lecture.chaine.resoudre(&catalogue_de_reference(), &ctx);
-            for rg in [false, true] {
+            // Upsampling et headroom manuel : la lecture réseau ne les lit pas
+            // (`TraitementsDeZone`) ; ils varient ici, et la voie attendue de
+            // la lecture ne change pas.
+            for (upsampling, headroom) in [(false, false), (true, false), (false, true)] {
+            let mut chaine = lecture.chaine.clone();
+            if upsampling {
+                chaine.fixed.upsampling = crate::tess::Upsampling::Pcm {
+                    filter: "polyvalent".into(),
+                    max_ratio: Some(2),
+                    max_rate_hz: None,
+                };
+            }
+            if headroom {
+                chaine.fixed.headroom = crate::tess::Headroom::Manual { db: -3.0 };
+            }
+            let r = chaine.resoudre(&catalogue_de_reference(), &ctx);
+            for &(rg, reencodage, rg_lu) in &par_rg {
                 for conversion in [false, true] {
                     for lpcm in [
                         LpcmDuLecteur::Accepted,
@@ -481,12 +531,12 @@ async fn la_voie_publiee_est_celle_de_la_lecture_case_par_case() {
                                     lpcm_bits: 16,
                                     progressif_arme: opt_in,
                                     origine,
-                                    replaygain_actif: rg,
+                                    replaygain_actif: rg_lu,
                                     service_decodable_au_fil: decodable,
                                     format_impose_le_transcodage: conversion,
                                 };
                                 let attendu = voie_de_la_lecture(
-                                    reencodage || rg,
+                                    reencodage,
                                     casque,
                                     conversion,
                                     est_dsd,
@@ -499,6 +549,7 @@ async fn la_voie_publiee_est_celle_de_la_lecture_case_par_case() {
                                     acheminer(&r, &f).route,
                                     attendu,
                                     "eq={eq} cf={cf} dsd={est_dsd} rg={rg} \
+                                     up={upsampling} hm={headroom} \
                                      conversion={conversion} {lpcm:?} opt_in={opt_in} \
                                      {origine:?} decodable={decodable}"
                                 );
@@ -508,10 +559,12 @@ async fn la_voie_publiee_est_celle_de_la_lecture_case_par_case() {
                     }
                 }
             }
+            }
         }
     }
-    // PCM : 2 (RG) × 2 × 3 × 2 × 4 ; DSD converti : 2 × 2 × 3 × 2 × 2.
-    assert_eq!(cases, 4 * (96 + 48));
+    // × 3 (upsampling, headroom) ; PCM : 2 (RG) × 2 × 3 × 2 × 4 ;
+    // DSD converti : 2 × 2 × 3 × 2 × 2.
+    assert_eq!(cases, 4 * 3 * (96 + 48));
 }
 
 // ─── 2. Bit-perfect à l'octet ───────────────────────────────────────────────
@@ -795,4 +848,73 @@ async fn en_pure_une_conversion_imposee_n_est_pas_dite_bit_perfect() {
     let etat = b.etat_tess(96_000, 24).await;
     assert_eq!(etat.delivery.as_ref().unwrap().route, VoieUpnp::Untouched);
     assert_eq!(etat.badge, Badge::BitPerfect);
+}
+
+/// Relecture du 24/11 (3e) — le flux continu de #8082 enchaîne les pistes en
+/// passthrough : ce n'est PAS une conversion. Contre-épreuve : un flux
+/// converti (décodé) l'est.
+#[tokio::test]
+async fn le_flux_continu_n_est_pas_une_conversion() {
+    let b = banc(SINK_COMPLET).await;
+    let mut faits_de = Vec::new();
+    for v in [voie::FLUX_CONTINU, voie::FLUX_CONVERTI] {
+        let (sid, _tx, _n) = b
+            .orch
+            .streamer
+            .create_session(crate::http::streamer::StreamInfo::default(), false, 4)
+            .await;
+        b.orch.streamer.noter_la_voie(&sid, v).await;
+        assert_eq!(b.orch.streamer.voie_servie(&sid).await, v);
+        *b.derniere_session.lock().unwrap() = Some(sid);
+        faits_de.push(b.faits(16).await.format_impose_le_transcodage);
+    }
+    assert_eq!(faits_de, [false, true]);
+}
+
+/// Relecture du 24/11 (3e) — la capacité de volume d'une sortie occupée est
+/// la DERNIÈRE connue, pas le type de la zone ; jamais lue, rien.
+#[test]
+fn la_capacite_de_volume_retenue_survit_a_une_sortie_occupee() {
+    use super::acheminement_upnp_t12b::volume_reglable_retenu;
+    let id = "uuid:volume-retenu-t12b";
+    assert_eq!(volume_reglable_retenu(id, None), None, "jamais lue");
+    assert_eq!(volume_reglable_retenu(id, Some(false)), Some(false));
+    assert_eq!(volume_reglable_retenu(id, None), Some(false), "sortie occupée");
+    assert_eq!(volume_reglable_retenu(id, Some(true)), Some(true));
+    assert_eq!(volume_reglable_retenu(id, None), Some(true));
+    assert_eq!(volume_reglable_retenu("uuid:autre-t12b", None), None);
+}
+
+/// Relecture du 24/11 (3e), contre la LECTURE réelle : une chaîne avec
+/// upsampling et headroom manuel, opt-in armé, lecteur L24 : la lecture n'en
+/// lit rien et sert la source à l'octet ; l'état dit `untouched`, les deux
+/// étages `not_applied_on_transport`, et le badge « Bit-perfect », comme
+/// `delivery`.
+#[tokio::test]
+async fn upsampling_et_headroom_ne_sont_pas_annonces_quand_la_lecture_sert_la_source() {
+    let b = banc(SINK_COMPLET).await;
+    let id = piste(&b.orch, PISTE_24.0, PISTE_24.1, PISTE_24.2);
+    b.opt_in();
+    let mut chaine = crate::tess::ChaineTess::default();
+    chaine.fixed.upsampling = crate::tess::Upsampling::Pcm {
+        filter: "polyvalent".into(),
+        max_ratio: Some(2),
+        max_rate_hz: None,
+    };
+    chaine.fixed.headroom = crate::tess::Headroom::Manual { db: -3.0 };
+    b.reglage(
+        &crate::tess::cle_chaine_zone(b.zone_id),
+        &serde_json::to_string(&chaine).unwrap(),
+    );
+    let s = jouer(&b, id).await;
+    assert_eq!(s.voie, voie::FICHIER_TEL_QUEL, "la lecture ne lit ni l'un ni l'autre");
+    assert_eq!(sha(&s.octets), sha(&source(PISTE_24.0).0));
+    let etat = b.etat_tess(96_000, 24).await;
+    assert_eq!(etat.delivery.as_ref().unwrap().route, VoieUpnp::Untouched);
+    assert_eq!(etat.badge, Badge::BitPerfect);
+    for code in [crate::tess::CodeEtape::Upsampling, crate::tess::CodeEtape::Headroom] {
+        let e = etat.signal_path.iter().find(|e| e.code == code).unwrap();
+        assert!(e.requested && !e.effective, "{code:?}");
+        assert_eq!(e.reason, Some(MotifEtape::NotAppliedOnTransport), "{code:?}");
+    }
 }
