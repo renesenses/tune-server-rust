@@ -457,6 +457,10 @@ async fn un_prereglage_premium_ne_donne_jamais_le_droit_a_un_compte_gratuit_t17(
     assert!(s.is_client_error(), "{s} {v}");
     assert_eq!(b.settings().get(&cle_chaine_zone(b.zone)).unwrap(), avant);
     assert_eq!(b.get_zone().await["active_preset"], json!("casque"));
+    // (Retiré ensuite : sa version hors bornes ne passe pas le schéma
+    // strict que `liste()` applique.)
+    l.presets.retain(|p| p.id != "futur");
+    tune_core::tess::prereglages::ecrire(&b.settings(), &l).unwrap();
     // Le préréglage reste enregistré (le droit se vérifie au chargement).
     assert!(ids(&b.liste().await).contains(&"studio".to_owned()));
     // Contre-épreuve : avec le Premium, le même chargement passe.
