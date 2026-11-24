@@ -22,7 +22,13 @@ use tune_server::state::AppState;
 
 const SIGNAL: &str = r#"{"stream_id":"abc","position_ms":0}"#;
 
-async fn appel(app: &Router, methode: Method, chemin: &str, relaye: bool, corps: &str) -> StatusCode {
+async fn appel(
+    app: &Router,
+    methode: Method,
+    chemin: &str,
+    relaye: bool,
+    corps: &str,
+) -> StatusCode {
     let mut req = Request::builder()
         .method(methode)
         .uri(chemin)
@@ -62,7 +68,14 @@ async fn le_lecteur_tire_par_le_relais_met_sa_zone_a_distance() {
     );
 
     // Une télécommande locale qui lit l'état ne ramène pas le lecteur.
-    appel(&app, Method::GET, &format!("/api/v1/zones/{zone}/status"), false, "").await;
+    appel(
+        &app,
+        Method::GET,
+        &format!("/api/v1/zones/{zone}/status"),
+        false,
+        "",
+    )
+    .await;
     assert!(state.orchestrator.zone_tiree_a_distance(zone));
 
     let s = appel(&app, Method::POST, &signal, false, SIGNAL).await;
@@ -77,8 +90,22 @@ async fn le_lecteur_tire_par_le_relais_met_sa_zone_a_distance() {
 async fn une_telecommande_relayee_ne_met_pas_la_zone_a_distance() {
     let (state, zone) = etat();
     let app = tune_server::routes::router(state.clone());
-    appel(&app, Method::GET, &format!("/api/v1/zones/{zone}/status"), true, "").await;
-    appel(&app, Method::GET, &format!("/api/v1/zones/{zone}/queue"), true, "").await;
+    appel(
+        &app,
+        Method::GET,
+        &format!("/api/v1/zones/{zone}/status"),
+        true,
+        "",
+    )
+    .await;
+    appel(
+        &app,
+        Method::GET,
+        &format!("/api/v1/zones/{zone}/queue"),
+        true,
+        "",
+    )
+    .await;
     assert!(!state.orchestrator.zone_tiree_a_distance(zone));
 }
 
@@ -107,7 +134,14 @@ async fn une_requete_refusee_ne_compte_pas() {
     assert!(!state.orchestrator.zone_tiree_a_distance(dlna));
 
     // Une zone qui n'existe pas.
-    appel(&app, Method::POST, "/api/v1/zones/987654/browser-playing", true, SIGNAL).await;
+    appel(
+        &app,
+        Method::POST,
+        "/api/v1/zones/987654/browser-playing",
+        true,
+        SIGNAL,
+    )
+    .await;
     assert!(!state.orchestrator.zone_tiree_a_distance(987654));
 }
 

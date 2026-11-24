@@ -43,8 +43,6 @@ pub mod fils_de_travail;
 pub mod garde_du_cercle;
 /// Ce qu'une requête rejouée par le relais ou l'écoute directe peut atteindre.
 pub mod garde_du_relais;
-/// #9174 — d'où écoute le lecteur d'une zone navigateur (relais ou local).
-pub mod provenance_navigateur_9174;
 /// #7077 — garde : aucune phrase française dans les champs exposés de l'API.
 #[cfg(test)]
 mod garde_francais_api;
@@ -56,6 +54,8 @@ mod instance_existante;
 pub(crate) mod lancement_sans_console;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod navigateur_windows;
+/// #9174 — d'où écoute le lecteur d'une zone navigateur (relais ou local).
+pub mod provenance_navigateur_9174;
 pub mod retard_de_l_executeur_9391;
 pub use tune_http_types::error;
 #[cfg(feature = "local-audio")]

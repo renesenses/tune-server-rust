@@ -271,14 +271,16 @@ fn un_flac_libflac_remuxe_pour_le_relais_porte_sa_seektable() {
         let s = source.to_str().unwrap();
         crate::audio::decode::remux_flac_dash_indexe(s, sans.to_str().unwrap(), false).unwrap();
         let (taille, _, _) =
-            crate::audio::decode::remux_flac_dash_indexe(s, avec.to_str().unwrap(), true)
-                .unwrap();
+            crate::audio::decode::remux_flac_dash_indexe(s, avec.to_str().unwrap(), true).unwrap();
 
         let brut = std::fs::read(&sans).unwrap();
         let indexe = std::fs::read(&avec).unwrap();
         assert_eq!(taille, indexe.len() as u64);
         let (b_sans, d_sans) = blocs(&brut);
-        assert!(b_sans.iter().all(|(k, _)| *k != 3), "{nom} : sans index demandé");
+        assert!(
+            b_sans.iter().all(|(k, _)| *k != 3),
+            "{nom} : sans index demandé"
+        );
         let (b_avec, d_avec) = blocs(&indexe);
         assert_eq!(b_avec[0].0, 0, "{nom} : STREAMINFO d'abord");
         assert_eq!(
@@ -287,7 +289,11 @@ fn un_flac_libflac_remuxe_pour_le_relais_porte_sa_seektable() {
             "{nom} : la SEEKTABLE doit suivre STREAMINFO (index abandonné ?)"
         );
         assert_eq!(points(&b_avec[1].1), vec![(0, 0, 4096)], "{nom}");
-        assert_eq!(&indexe[d_avec..], &brut[d_sans..], "{nom} : trames intactes");
+        assert_eq!(
+            &indexe[d_avec..],
+            &brut[d_sans..],
+            "{nom} : trames intactes"
+        );
         assert_eq!(pcm(&avec), pcm(&sans), "{nom} : même PCM");
     }
 }
@@ -303,7 +309,9 @@ fn chaque_trame_libflac_est_retrouvee_malgre_l_affectation_variable() {
         let total = (((info[13] & 0x0F) as u64) << 32)
             | u32::from_be_bytes([info[14], info[15], info[16], info[17]]) as u64;
         let attendues = total.div_ceil(4096);
-        let mut ix = Indexeur::depuis_streaminfo(info).unwrap().avec_intervalle(4096);
+        let mut ix = Indexeur::depuis_streaminfo(info)
+            .unwrap()
+            .avec_intervalle(4096);
         assert!(
             indexer_les_trames(&flac, debut, &mut ix),
             "{nom} : une trame décorrélée autrement que la première a été refusée"
@@ -313,7 +321,11 @@ fn chaque_trame_libflac_est_retrouvee_malgre_l_affectation_variable() {
         for (k, &(echantillon, decalage, _)) in p.iter().enumerate() {
             assert_eq!(echantillon, k as u64 * 4096, "{nom}");
             let t = &flac[debut + decalage as usize..];
-            assert_eq!((t[0], t[1] & 0xFE), (0xFF, 0xF8), "{nom} : point {k} hors trame");
+            assert_eq!(
+                (t[0], t[1] & 0xFE),
+                (0xFF, 0xF8),
+                "{nom} : point {k} hors trame"
+            );
         }
     }
 }
