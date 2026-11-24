@@ -144,7 +144,10 @@ fn verifier_avec(
     }
     // Sur le texte, pas sur `components()` : celui-ci efface les « . »
     // intermédiaires sans le dire.
-    if brut.split(['/', '\\']).any(|seg| seg == "." || seg == "..") {
+    if brut
+        .split(['/', '\\'])
+        .any(|seg| seg == "." || seg == ".." || (cfg!(windows) && segment_vide_sous_windows(seg)))
+    {
         return Err(refus(
             "destination_invalide",
             "La destination ne peut pas contenir « . » ni « .. ».",
@@ -180,6 +183,18 @@ fn verifier_avec(
         return Err(refus(
             "hors_bibliotheque",
             "La destination sort de la bibliothèque par un lien symbolique.",
+        ));
+    }
+    // Fil 3036 — pas de « : » sous l'emplacement : un flux NTFS
+    // (`duplicates::$INDEX_ALLOCATION`) crée le vrai dossier `duplicates`.
+    // Les noms que Tune crée (`nom_sur`) le remplacent déjà par « _ ».
+    if chemin
+        .strip_prefix(racine)
+        .is_ok_and(|r| r.to_string_lossy().contains(':'))
+    {
+        return Err(refus(
+            "destination_invalide",
+            "La destination ne peut pas contenir « : » sous l'emplacement.",
         ));
     }
     // Fil 3036 — ni un dossier masqué (caché, système, propre à Tune), ni ce
@@ -424,12 +439,18 @@ fn attributs_windows(entree: &std::fs::DirEntry) -> Option<u32> {
 const DOSSIERS_DE_RECUPERATION: &[&str] = &["lost+found"];
 /// Le dossier de travail de Tune, nommé même s'il quittait `SKIP_DIRS`.
 const DOSSIER_DE_TUNE: &str = ".tune";
+
+/// Un segment que Windows réduit à rien (`.. `, `...`, `. `) : il y vaut
+/// « . » ou « .. ».
+fn segment_vide_sous_windows(seg: &str) -> bool {
+    !seg.is_empty() && seg.trim_end_matches(['.', ' ']).is_empty()
+}
 /// `FILE_ATTRIBUTE_HIDDEN`.
 const ATTRIBUT_CACHE: u32 = 0x2;
 
-/// Un nom de dossier à ne pas proposer ni accepter : ce que le SCAN ignore
-/// (`SKIP_DIRS`, dossiers système), plus `lost+found`, `.tune` et
-/// l'attribut caché de Windows. Un dossier qui commence simplement par un
+/// Un nom de dossier à ne pas proposer ni accepter : AU MOINS ce que le scan
+/// ignore (`SKIP_DIRS`, dossiers système), plus `lost+found`, `.tune`, un
+/// nom à deux-points (flux NTFS) et l'attribut caché de Windows. Un dossier qui commence simplement par un
 /// point (`.38 Special`) est parcouru par le scan : il reste choisissable.
 ///
 /// Le point et l'espace finals sont retirés d'abord (Windows les retire en
@@ -438,6 +459,9 @@ const ATTRIBUT_CACHE: u32 = 0x2;
 /// insensibles à la casse). `attributs` : les attributs de fichier Windows,
 /// s'ils sont connus.
 fn nom_masque(nom: &str, attributs: Option<u32>) -> bool {
+    if nom.contains(':') {
+        return true;
+    }
     let nom = nom.trim_end_matches(['.', ' ']);
     let meme = |n: &&str| n.eq_ignore_ascii_case(nom);
     tune_core::scanner::dossier_systeme_ignore(nom)
@@ -888,7 +912,39 @@ mod tests {
         assert!(verifier_avec(&format!("{racine}/Visible"), &places, attributs).is_ok());
     }
 
-    // ─── Ce que le scan ignore, et rien d'autre (fil 3036, relecture) ────
+    // ─── Au moins ce que le scan ignore (fil 3036, relecture) ────────────
+
+    /// Deux-points (flux NTFS : `duplicates::$INDEX_ALLOCATION` crée le
+    /// vrai dossier `duplicates`) et segments que Windows réduit à « . » ou
+    /// « .. » : refusés sous l'emplacement.
+    #[cfg(unix)]
+    #[test]
+    fn un_deux_points_ou_un_segment_vide_sous_windows_est_refuse() {
+        let bib = tempfile::tempdir().unwrap();
+        std::fs::create_dir(bib.path().join("Live: 1991")).unwrap();
+        std::fs::create_dir(bib.path().join("Bon")).unwrap();
+        let racine = bib.path().to_string_lossy().to_string();
+        let places = [racine.clone()];
+        for d in [
+            "duplicates::$INDEX_ALLOCATION",
+            "A:b/x",
+            "Bon/c:d",
+            "Live: 1991",
+        ] {
+            let r = verifier(&format!("{racine}/{d}"), &places).unwrap_err();
+            assert_eq!(r.motif, "destination_invalide", "« {d} »");
+        }
+        assert!(nom_masque("Live: 1991", None));
+        let l = sous_dossiers(Some(&racine), &places).unwrap();
+        assert_eq!(noms(&l), ["Bon"], "un nom à deux-points n'est pas proposé");
+
+        for seg in [".. ", "...", ". ", "..  .", " . "] {
+            assert!(segment_vide_sous_windows(seg), "« {seg} »");
+        }
+        for seg in ["", "..x", ".38 Special", "a.", "Vol. 2"] {
+            assert!(!segment_vide_sous_windows(seg), "« {seg} »");
+        }
+    }
 
     /// Point 1 — un point ou une espace final (que Windows retire en créant
     /// le dossier) ne contourne pas le masque ; la casse non plus (montages
