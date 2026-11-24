@@ -53,8 +53,11 @@ fn archive(fichiers: &[(&str, Vec<u8>)]) -> Vec<u8> {
     tampon.into_inner()
 }
 
+const SECRET: &str = "secret-t09a";
+
 async fn appel(
     app: &axum::Router,
+    jeton: &str,
     methode: &str,
     chemin: &str,
     corps: Vec<u8>,
@@ -63,6 +66,7 @@ async fn appel(
         .method(methode)
         .uri(chemin)
         .header("Content-Type", "application/octet-stream")
+        .header("Authorization", format!("Bearer {jeton}"))
         .body(Body::from(corps))
         .unwrap();
     let resp = app.clone().oneshot(req).await.unwrap();
@@ -83,7 +87,11 @@ async fn un_zip_remplace_le_jeu_et_un_zip_piege_est_refuse_sans_rien_toucher() {
     // SAFETY : seul test de ce binaire, avant toute tâche.
     unsafe { std::env::set_var("TUNE_DATA_DIR", &dossier) };
     let state = tune_server::state::AppState::new(":memory:", 0, Default::default()).unwrap();
-    state.license.set_account_premium(true, None).await;
+    let reglages = tune_core::db::settings_repo::SettingsRepo::with_backend(state.backend.clone());
+    reglages.set("auth_enabled", "true").unwrap();
+    reglages.set("jwt_secret", SECRET).unwrap();
+    let admin = tune_server::auth::sign_jwt(1, "admin", SECRET).unwrap();
+    let utilisateur = tune_server::auth::sign_jwt(2, "user", SECRET).unwrap();
     // Une zone réseau : l'import n'a pas de sortie locale à rafraîchir.
     let zone = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone())
         .create("Salon", Some("dlna"), Some("dlna:essai"))
@@ -96,19 +104,26 @@ async fn un_zip_remplace_le_jeu_et_un_zip_piege_est_refuse_sans_rien_toucher() {
         ("living-room/room_48k.wav", wav(&[ri(0.6), ri(0.4)], 48_000)),
         ("living-room/room_96k.wav", wav(&[ri(0.7), ri(0.4)], 96_000)),
     ]);
-    let (status, corps) = appel(
-        &app,
-        "POST",
-        &format!("/api/v1/room-correction/ir/upload/{zone}?archive=1&name=living-room.zip"),
-        z,
-    )
-    .await;
+    let route = format!("/api/v1/room-correction/ir/upload/{zone}?archive=1&name=living-room.zip");
+    // Gardes : un profil non administrateur, puis un compte sans Premium,
+    // sont refusés, et rien n'est posé.
+    let (status, _) = appel(&app, &utilisateur, "POST", &route, z.clone()).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "profil non administrateur");
+    let (status, _) = appel(&app, &admin, "POST", &route, z.clone()).await;
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "compte sans Premium");
+    assert!(
+        !dossier.join("ir").exists(),
+        "rien n'est écrit sans les droits"
+    );
+    state.license.set_account_premium(true, None).await;
+    let (status, corps) = appel(&app, &admin, "POST", &route, z).await;
     assert_eq!(status, StatusCode::OK, "{corps}");
     assert_eq!(corps["set_name"], "living-room.zip");
     assert_eq!(corps["imported"].as_array().unwrap().len(), 3);
 
     let (status, statut) = appel(
         &app,
+        &admin,
         "GET",
         &format!("/api/v1/room-correction/ir/status/{zone}"),
         Vec::new(),
@@ -135,6 +150,7 @@ async fn un_zip_remplace_le_jeu_et_un_zip_piege_est_refuse_sans_rien_toucher() {
     let piege = archive(&[("../../evil.wav", wav(&[ri(0.9)], 48_000))]);
     let (status, refus) = appel(
         &app,
+        &admin,
         "POST",
         &format!("/api/v1/room-correction/ir/upload/{zone}?name=piege.zip"),
         piege,
@@ -150,6 +166,7 @@ async fn un_zip_remplace_le_jeu_et_un_zip_piege_est_refuse_sans_rien_toucher() {
     assert!(!dossier.parent().unwrap().join("evil.wav").exists());
     let (_, apres) = appel(
         &app,
+        &admin,
         "GET",
         &format!("/api/v1/room-correction/ir/status/{zone}"),
         Vec::new(),

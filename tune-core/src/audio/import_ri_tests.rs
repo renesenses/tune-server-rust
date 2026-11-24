@@ -320,3 +320,111 @@ fn le_jeu_ecrit_se_relit_a_l_identique() {
     assert_eq!(sr, 44_100);
     assert_eq!(taps, r.taps);
 }
+
+// ---------------------------------------------------------------------------
+// Relecture de #9451 : cas supplémentaires
+// ---------------------------------------------------------------------------
+
+/// Marque la première entrée comme chiffrée (bit 0 des drapeaux, en-tête
+/// local et répertoire central) : la forme d'une entrée ZipCrypto.
+fn marquer_chiffree(mut z: Vec<u8>) -> Vec<u8> {
+    assert_eq!(&z[..4], b"PK\x03\x04");
+    z[6] |= 1;
+    let central = z
+        .windows(4)
+        .position(|w| w == b"PK\x01\x02")
+        .expect("répertoire central");
+    z[central + 8] |= 1;
+    z
+}
+
+#[test]
+fn piege_entree_chiffree() {
+    let z = marquer_chiffree(archive(&[("room_48k.wav", wav(&[ri(8, 0.5)], 48_000, 32))]));
+    assert_eq!(importer(&z, "x.zip").unwrap_err().raison, "encrypted");
+}
+
+#[test]
+fn piege_chemins_windows() {
+    for nom in [
+        "C:\\evil.wav",
+        "C:/evil.wav",
+        "\\evil.wav",
+        "..\\..\\evil.wav",
+        "a\\..\\..\\evil.wav",
+    ] {
+        let z = archive(&[(nom, wav(&[ri(8, 0.5)], 48_000, 32))]);
+        assert_eq!(
+            importer(&z, "x.zip").unwrap_err().raison,
+            "unsafe_path",
+            "{nom}"
+        );
+    }
+}
+
+#[test]
+fn un_cfg_en_chemin_absolu_est_refuse() {
+    for cible in ["/etc/room_96k.wav", "C:\\room_96k.wav", "\\room_96k.wav"] {
+        let cfg = CFG_96.replace("room_96k.wav", cible);
+        let z = archive(&[
+            ("a.cfg", cfg.into_bytes()),
+            ("room_96k.wav", wav(&[ri(16, 0.7), ri(16, 0.6)], 96_000, 32)),
+        ]);
+        assert_eq!(
+            importer(&z, "x.zip").unwrap_err().raison,
+            "unsafe_path",
+            "{cible}"
+        );
+    }
+}
+
+#[test]
+fn les_noms_unicode_sont_acceptes() {
+    let z = archive(&[
+        (
+            "salon-é/réponse_48k_gauche.wav",
+            wav(&[ri(8, 0.9)], 48_000, 32),
+        ),
+        (
+            "salon-é/réponse_48k_droite.wav",
+            wav(&[ri(8, 0.4)], 48_000, 32),
+        ),
+        (
+            "salon-é/房间_96k.wav",
+            wav(&[ri(8, 0.5), ri(8, 0.5)], 96_000, 32),
+        ),
+    ]);
+    let j = importer(&z, "salon.zip").unwrap();
+    assert_eq!(j.reponses.len(), 2);
+    assert_eq!(j.reponses[0].taps[0][0], 0.9, "gauche à gauche");
+}
+
+#[test]
+fn un_zip_imbrique_n_est_pas_ouvert() {
+    let interieur = archive(&[("room_48k.wav", wav(&[ri(8, 0.5)], 48_000, 32))]);
+    let z = archive(&[("filtres.zip", interieur)]);
+    assert_eq!(importer(&z, "x.zip").unwrap_err().raison, "no_filter");
+}
+
+/// Un WAV dont l'en-tête annonce plus de prises qu'une réponse admise est
+/// refusé AVANT décodage ; un en-tête qui annonce plus de données que le
+/// fichier n'en porte est ramené à ce qui est présent.
+#[test]
+fn un_wav_dont_l_en_tete_ment() {
+    // 33 canaux annoncés : au-delà du plafond.
+    let mut trop_de_canaux = wav(&[ri(8, 0.5)], 48_000, 32);
+    trop_de_canaux[22..24].copy_from_slice(&33u16.to_le_bytes());
+    let e = importer(&trop_de_canaux, "a.wav").unwrap_err();
+    assert_eq!(e.raison, "bad_wav", "{e}");
+    // Taille de données annoncée à 4 Gio, 8 prises présentes : lu tel quel.
+    let mut taille_fausse = wav(&[ri(8, 0.5)], 48_000, 32);
+    let n = taille_fausse.len();
+    taille_fausse[40..44].copy_from_slice(&u32::MAX.to_le_bytes());
+    let j = importer(&taille_fausse, "b.wav").unwrap();
+    assert_eq!(j.reponses[0].taps[0].len(), (n - 44) / 4);
+    // Plus de prises que le plafond, réellement présentes : refusé avant
+    // l'allocation des canaux décodés.
+    let longues = vec![0.0f32; par_cadence::PRISES_MAX + 1];
+    let e = importer(&wav(&[longues], 48_000, 32), "c.wav").unwrap_err();
+    assert_eq!(e.raison, "bad_wav", "{e}");
+}

@@ -53,16 +53,19 @@ use std::io::{Cursor, Read};
 use super::convolver::Convolver;
 use super::convolver::par_cadence;
 
-/// Taille maximale d'une archive déposée.
-pub const ARCHIVE_MAX_OCTETS: usize = 256 << 20;
+/// Taille maximale d'une archive déposée : la limite du corps des requêtes
+/// du serveur (`DefaultBodyLimit`, 50 Mio).
+pub const ARCHIVE_MAX_OCTETS: usize = 50 << 20;
 /// Nombre maximal d'entrées d'une archive (dossiers compris).
 pub const ENTREES_MAX: usize = 512;
 /// Octets décompressés au plus par fichier lu.
-pub const ENTREE_MAX_OCTETS: u64 = 96 << 20;
-/// Octets décompressés au plus pour toute l'archive.
-pub const TOTAL_MAX_OCTETS: u64 = 384 << 20;
-/// Rapport décompressé / compressé au-delà duquel un fichier est une bombe
-/// (au-dessus de 1 Mio décompressé : un petit `.cfg` se comprime très bien).
+pub const ENTREE_MAX_OCTETS: u64 = 48 << 20;
+/// Octets décompressés au plus pour toute l'archive : sous la limite du
+/// corps, la mémoire d'un import reste du même ordre que celle de la requête.
+pub const TOTAL_MAX_OCTETS: u64 = 48 << 20;
+/// Rapport décompressé / taille RÉELLE de l'archive au-delà duquel elle est
+/// refusée (au-dessus de 1 Mio décompressé). Mesuré sur les octets lus et sur
+/// la longueur du dépôt, jamais sur les tailles que l'archive annonce.
 pub const RAPPORT_MAX: u64 = 100;
 /// Taille maximale d'un `.cfg`.
 const CFG_MAX_OCTETS: u64 = 64 << 10;
@@ -247,24 +250,26 @@ fn lire_les_entrees(octets: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, RefusImp
             continue;
         }
         if matches!(extension(&chemin).as_str(), "wav" | "cfg") {
-            a_lire.push((i, chemin, entree.compressed_size()));
+            a_lire.push((i, chemin));
         }
     }
     // Second passage : décompresser sous plafond RÉEL.
+    let longueur = octets.len().max(1) as u64;
     let mut total = 0u64;
     let mut lus = BTreeMap::new();
-    for (i, chemin, compresse) in a_lire {
+    for (i, chemin) in a_lire {
         let plafond = if extension(&chemin) == "cfg" {
             CFG_MAX_OCTETS
         } else {
             ENTREE_MAX_OCTETS
         };
+        let restant = TOTAL_MAX_OCTETS.saturating_sub(total);
         let entree = zip
             .by_index(i)
             .map_err(|e| RefusImport::new("not_a_zip", format!("{chemin} : {e}")))?;
         let mut contenu = Vec::new();
         entree
-            .take(plafond + 1)
+            .take(plafond.min(restant) + 1)
             .read_to_end(&mut contenu)
             .map_err(|e| RefusImport::new("not_a_zip", format!("{chemin} : {e}")))?;
         let n = contenu.len() as u64;
@@ -274,20 +279,20 @@ fn lire_les_entrees(octets: &[u8]) -> Result<BTreeMap<String, Vec<u8>>, RefusImp
                 format!("{chemin} : plus de {plafond} octets décompressés"),
             ));
         }
-        if n > (1 << 20) && n > compresse.max(1).saturating_mul(RAPPORT_MAX) {
-            return Err(RefusImport::new(
-                "compression_ratio",
-                format!(
-                    "{chemin} : rapport de compression de {} (au plus {RAPPORT_MAX})",
-                    n / compresse.max(1)
-                ),
-            ));
-        }
         total += n;
         if total > TOTAL_MAX_OCTETS {
             return Err(RefusImport::new(
                 "too_large",
                 format!("plus de {TOTAL_MAX_OCTETS} octets décompressés au total"),
+            ));
+        }
+        if total > (1 << 20) && total > longueur.saturating_mul(RAPPORT_MAX) {
+            return Err(RefusImport::new(
+                "compression_ratio",
+                format!(
+                    "rapport de compression de {} (au plus {RAPPORT_MAX})",
+                    total / longueur
+                ),
             ));
         }
         if lus.insert(chemin.to_ascii_lowercase(), contenu).is_some() {
@@ -327,9 +332,11 @@ fn cote_du_nom(chemin: &str) -> Option<usize> {
     let tige = base
         .rsplit_once('.')
         .map_or(base, |(t, _)| t)
-        .to_ascii_lowercase();
+        .to_lowercase();
     let mut cote = None;
-    for jeton in tige.split(|c: char| !c.is_ascii_alphanumeric()) {
+    // Jetons Unicode : « réponse » reste un seul mot (un découpage ASCII en
+    // ferait « r » + « ponse », lu comme « droite »).
+    for jeton in tige.split(|c: char| !c.is_alphanumeric()) {
         let c = match jeton {
             "l" | "left" | "gauche" | "g" => Some(0),
             "r" | "right" | "droite" | "d" => Some(1),

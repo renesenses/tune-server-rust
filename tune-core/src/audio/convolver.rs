@@ -428,6 +428,20 @@ impl Convolver {
         if samples_per_channel == 0 {
             return Err("IR has no samples".into());
         }
+        // TESS T09a — bornes lues dans l'EN-TÊTE, avant tout décodage : un
+        // fichier ne réserve jamais plus que ce qu'une réponse admise occupe.
+        if channels > par_cadence::CANAUX_MAX {
+            return Err(format!(
+                "réponse impulsionnelle à {channels} canaux (au plus {})",
+                par_cadence::CANAUX_MAX
+            ));
+        }
+        if samples_per_channel > par_cadence::PRISES_MAX {
+            return Err(format!(
+                "réponse impulsionnelle de {samples_per_channel} prises (au plus {})",
+                par_cadence::PRISES_MAX
+            ));
+        }
 
         tracing::info!(
             path,
@@ -439,7 +453,9 @@ impl Convolver {
             "convolver_ir_loaded"
         );
 
-        let mut ir = vec![Vec::with_capacity(samples_per_channel); channels];
+        let mut ir: Vec<Vec<f32>> = (0..channels)
+            .map(|_| Vec::with_capacity(samples_per_channel))
+            .collect();
         for i in 0..samples_per_channel {
             for ch in 0..channels {
                 let o = dstart + (i * channels + ch) * bytes_per_sample;
@@ -984,15 +1000,6 @@ pub fn log_freq_grid(n: usize, f_lo: f64, f_hi: f64) -> Vec<f64> {
         .collect()
 }
 
-/// Evaluate the frequency response of a FIR filter at arbitrary frequencies by
-/// DIRECT summation: H(f) = Σ h[n]·e^(−j2πfn/fs), accumulated in f64. No FFT —
-/// the target grid is log-spaced, which an FFT bin grid can't serve without
-/// interpolation, and ~200 freqs × 128k taps stays a few tens of millions of
-/// f64 ops. The unit phasor is advanced by complex rotation (one sin/cos pair
-/// per frequency); f64 rotation drift over 128k steps is ~1e-11, negligible.
-///
-/// Magnitude is 20·log10(|H|) floored at −200 dB (a true zero would be −inf,
-/// which JSON can't carry); phase is the principal atan2 value in degrees.
 /// TESS T09a — écrire une réponse (un vecteur par canal, complétés de zéros
 /// à la même longueur) en WAV flottant 32 bits, relu sans perte par
 /// [`Convolver::read_ir_taps`].
@@ -1048,6 +1055,15 @@ fn ecrire_wav_float32(
     std::fs::write(chemin, &w).map_err(|e| format!("ecriture du filtre combine : {e}"))
 }
 
+/// Evaluate the frequency response of a FIR filter at arbitrary frequencies by
+/// DIRECT summation: H(f) = Σ h[n]·e^(−j2πfn/fs), accumulated in f64. No FFT —
+/// the target grid is log-spaced, which an FFT bin grid can't serve without
+/// interpolation, and ~200 freqs × 128k taps stays a few tens of millions of
+/// f64 ops. The unit phasor is advanced by complex rotation (one sin/cos pair
+/// per frequency); f64 rotation drift over 128k steps is ~1e-11, negligible.
+///
+/// Magnitude is 20·log10(|H|) floored at −200 dB (a true zero would be −inf,
+/// which JSON can't carry); phase is the principal atan2 value in degrees.
 pub fn fir_frequency_response(
     taps: &[f32],
     sample_rate: u32,

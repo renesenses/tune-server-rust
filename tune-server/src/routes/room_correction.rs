@@ -310,57 +310,78 @@ fn nom_de_depot(nom: Option<&str>) -> Option<String> {
     (!propre.is_empty()).then_some(propre)
 }
 
-/// TESS T09a — `POST /room-correction/ir/upload/{zone}?archive=1&name=…` :
-/// importer un jeu (`.zip` de `.wav`, `.zip` de `.cfg` Convolver, ou un
-/// `.wav`) qui REMPLACE le jeu de la zone. Rien n'est écrit sous un nom venu
-/// de l'archive : chaque réponse est réécrite par Tune sous
-/// `zone_{id}.wav` (la principale) ou `zone_{id}_sr{cadence}.wav`. Tout est
-/// validé et écrit en provisoire AVANT de toucher l'ancien jeu : un refus
-/// laisse la zone telle qu'elle était.
-async fn importer_le_jeu(
-    state: &AppState,
+/// Un seul import d'archive à la fois sur le serveur : la mémoire d'un import
+/// reste bornée par les plafonds de `import_ri`, pas multipliée.
+static IMPORTS: std::sync::LazyLock<tokio::sync::Semaphore> =
+    std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(1));
+
+/// Un verrou par zone pour toute écriture de son jeu de réponses (dépôt,
+/// import, retrait) : deux requêtes sur la même zone ne s'entrelacent pas.
+fn verrou_de_zone(zone_id: i64) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static VERROUS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<i64, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::LazyLock::new(Default::default);
+    VERROUS
+        .lock()
+        .map(|mut m| m.entry(zone_id).or_default().clone())
+        .unwrap_or_default()
+}
+
+/// Ce que la partie bloquante d'un import rend.
+struct JeuPose {
+    jeu: tune_core::audio::import_ri::JeuImporte,
+    chemin_principal: String,
+    supplementaires: Vec<String>,
+}
+
+/// Refus d'un import, au format de l'API.
+fn refus_d_import(raison: &str, detail: &str) -> axum::response::Response {
+    (
+        StatusCode::BAD_REQUEST,
+        Json(json!({
+            "error": detail,
+            "code": "archive_refused",
+            "reason": raison,
+            "message_key": format!("api.roomCorrection.archive.{raison}"),
+        })),
+    )
+        .into_response()
+}
+
+/// La partie BLOQUANTE d'un import (décompression, décodage, écritures),
+/// hors du fil asynchrone. Ordre atomique : les nouveaux fichiers sont
+/// écrits sous des noms provisoires, puis renommés à leur place (un renommage
+/// remplace l'ancien fichier de même nom d'un coup), et SEULEMENT ensuite
+/// les fichiers de l'ancien jeu qui ne servent plus sont retirés. Un échec
+/// avant les renommages ne laisse que l'ancien jeu ; les provisoires sont
+/// nettoyés.
+fn poser_le_jeu(
+    corps: &[u8],
+    nom: &str,
+    ir_dir: &std::path::Path,
     zone_id: i64,
-    device_id: &str,
-    is_local: bool,
-    body: &[u8],
-    nom: Option<&str>,
-) -> axum::response::Response {
+    anciens: Vec<String>,
+) -> Result<JeuPose, axum::response::Response> {
     use tune_core::audio::import_ri;
-    let nom = nom_de_depot(nom);
-    let jeu = match import_ri::importer(body, nom.as_deref().unwrap_or("filtre.wav")) {
-        Ok(j) => j,
-        Err(refus) => {
-            tracing::warn!(zone_id, raison = refus.raison, detail = %refus.detail, "convolver_import_refuse");
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": refus.detail,
-                    "code": "archive_refused",
-                    "reason": refus.raison,
-                    "message_key": format!("api.roomCorrection.archive.{}", refus.raison),
-                })),
-            )
-                .into_response();
-        }
-    };
-    let Some(principal) = jeu.indice_principal() else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "error": "no impulse response in the upload",
-                "code": "archive_refused",
-                "reason": "no_filter",
-                "message_key": "api.roomCorrection.archive.no_filter",
-            })),
+    let jeu = import_ri::importer(corps, nom).map_err(|refus| {
+        tracing::warn!(zone_id, raison = refus.raison, detail = %refus.detail, "convolver_import_refuse");
+        refus_d_import(refus.raison, &refus.detail)
+    })?;
+    let principal = jeu
+        .indice_principal()
+        .ok_or_else(|| refus_d_import("no_filter", "no impulse response in the upload"))?;
+    std::fs::create_dir_all(ir_dir).ok();
+    let erreur_ecriture = |e: String| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("write IR: {e}")})),
         )
-            .into_response();
+            .into_response()
     };
-    let ir_dir = dossier_ir();
-    std::fs::create_dir_all(&ir_dir).ok();
-    // 1. Écrire chaque réponse en provisoire.
+    // 1. Écrire en provisoire.
     let mut poses: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
     for (i, r) in jeu.reponses.iter().enumerate() {
-        let provisoire = chemin_provisoire(&ir_dir, zone_id);
+        let provisoire = chemin_provisoire(ir_dir, zone_id);
         let final_ = if i == principal {
             ir_dir.join(format!("zone_{zone_id}.wav"))
         } else {
@@ -375,38 +396,22 @@ async fn importer_le_jeu(
             for (p, _) in &poses {
                 std::fs::remove_file(p).ok();
             }
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("write IR: {e}")})),
-            )
-                .into_response();
+            return Err(erreur_ecriture(e));
         }
         poses.push((provisoire, final_));
     }
-    // 2. Retirer l'ancien jeu (seulement les fichiers que Tune a rangés pour
-    //    CETTE zone), puis poser le nouveau.
-    let settings = SettingsRepo::with_backend(state.backend.clone());
-    for p in tune_core::audio::convolver::JeuDeZone::lire_supplementaires(&settings, zone_id) {
-        let chemin = std::path::Path::new(&p);
-        if tune_core::audio::convolver::par_cadence::chemin_du_jeu_effacable(
-            chemin, &ir_dir, zone_id,
-        ) {
-            std::fs::remove_file(chemin).ok();
+    // 2. Renommer à leur place.
+    for (n, (provisoire, final_)) in poses.iter().enumerate() {
+        if let Err(e) = std::fs::rename(provisoire, final_) {
+            for (p, _) in &poses[n..] {
+                std::fs::remove_file(p).ok();
+            }
+            return Err(erreur_ecriture(e.to_string()));
         }
-    }
-    for cote in ["L", "R"] {
-        std::fs::remove_file(ir_dir.join(format!("zone_{zone_id}_{cote}.wav"))).ok();
     }
     let mut supplementaires = Vec::new();
     let mut chemin_principal = String::new();
-    for (i, (provisoire, final_)) in poses.iter().enumerate() {
-        if let Err(e) = std::fs::rename(provisoire, final_) {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": format!("write IR: {e}")})),
-            )
-                .into_response();
-        }
+    for (i, (_, final_)) in poses.iter().enumerate() {
         let c = final_.to_str().unwrap_or("").to_string();
         if i == principal {
             chemin_principal = c;
@@ -414,6 +419,82 @@ async fn importer_le_jeu(
             supplementaires.push(c);
         }
     }
+    // 3. Retirer ce qui reste de l'ancien jeu (seulement les fichiers que
+    //    Tune a rangés pour CETTE zone, et qui ne sont pas dans le nouveau).
+    for p in anciens {
+        if p == chemin_principal || supplementaires.contains(&p) {
+            continue;
+        }
+        let chemin = std::path::Path::new(&p);
+        if tune_core::audio::convolver::par_cadence::chemin_du_jeu_effacable(
+            chemin, ir_dir, zone_id,
+        ) {
+            std::fs::remove_file(chemin).ok();
+        }
+    }
+    for cote in ["L", "R"] {
+        std::fs::remove_file(ir_dir.join(format!("zone_{zone_id}_{cote}.wav"))).ok();
+    }
+    Ok(JeuPose {
+        jeu,
+        chemin_principal,
+        supplementaires,
+    })
+}
+
+/// TESS T09a — `POST /room-correction/ir/upload/{zone}?archive=1&name=…` :
+/// importer un jeu (`.zip` de `.wav`, `.zip` de `.cfg` Convolver, ou un
+/// `.wav`) qui REMPLACE le jeu de la zone. Chaque réponse est réécrite par
+/// Tune sous `zone_{id}.wav` (la principale) ou `zone_{id}_sr{cadence}.wav`.
+/// Un refus laisse la zone telle qu'elle était.
+async fn importer_le_jeu(
+    state: &AppState,
+    zone_id: i64,
+    device_id: &str,
+    is_local: bool,
+    body: axum::body::Bytes,
+    nom: Option<&str>,
+) -> axum::response::Response {
+    let Ok(_jeton) = IMPORTS.acquire().await else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "import unavailable"})),
+        )
+            .into_response();
+    };
+    let nom = nom_de_depot(nom);
+    let settings = SettingsRepo::with_backend(state.backend.clone());
+    let mut anciens =
+        tune_core::audio::convolver::JeuDeZone::lire_supplementaires(&settings, zone_id);
+    if let Some(p) = settings
+        .get(&format!("ir_path_{zone_id}"))
+        .ok()
+        .flatten()
+        .filter(|p| !p.is_empty())
+    {
+        anciens.push(p);
+    }
+    let ir_dir = dossier_ir();
+    let nom_lu = nom.clone().unwrap_or_else(|| "filtre.wav".into());
+    let pose = tokio::task::spawn_blocking(move || {
+        poser_le_jeu(&body, &nom_lu, &ir_dir, zone_id, anciens)
+    })
+    .await;
+    let JeuPose {
+        jeu,
+        chemin_principal,
+        supplementaires,
+    } = match pose {
+        Ok(Ok(p)) => p,
+        Ok(Err(reponse)) => return reponse,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("import: {e}")})),
+            )
+                .into_response();
+        }
+    };
     settings
         .set(&format!("ir_path_{zone_id}"), &chemin_principal)
         .ok();
@@ -673,10 +754,20 @@ async fn ajouter_au_jeu(
 /// manque.
 async fn upload_ir_handler(
     State(state): State<AppState>,
+    _admin: crate::auth::RequireAdmin,
     Path(zone_id): Path<i64>,
     Query(canal): Query<CanalDuFiltre>,
     body: axum::body::Bytes,
 ) -> impl IntoResponse {
+    // Mêmes gardes que les profils de correction : administrateur, puis
+    // Premium (`RoomCorrection`).
+    if let Err(resp) =
+        crate::premium_guard::require_premium(&state.license, Feature::RoomCorrection).await
+    {
+        return resp;
+    }
+    let verrou = verrou_de_zone(zone_id);
+    let _zone_verrouillee = verrou.lock().await;
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     let zone = match zone_repo.get(zone_id) {
         Ok(Some(z)) => z,
@@ -703,7 +794,7 @@ async fn upload_ir_handler(
             zone_id,
             &device_id,
             is_local,
-            &body,
+            body,
             canal.name.as_deref(),
         )
         .await;
@@ -857,6 +948,8 @@ async fn clear_ir_handler(
     Path(zone_id): Path<i64>,
     Query(cible): Query<CadenceARetirer>,
 ) -> impl IntoResponse {
+    let verrou = verrou_de_zone(zone_id);
+    let _zone_verrouillee = verrou.lock().await;
     let zone_repo = tune_core::db::zone_repo::ZoneRepo::with_backend(state.backend.clone());
     let zone = match zone_repo.get(zone_id) {
         Ok(Some(z)) => z,
