@@ -187,14 +187,20 @@ fn greffons_effectifs(r: &Resolution) -> impl Iterator<Item = &EtapeResolue> {
 /// La voie de la chaîne résolue vers ce lecteur. Pure : la matrice se teste
 /// sans orchestrateur.
 pub fn acheminer(r: &Resolution, f: &FaitsUpnp) -> AcheminementUpnp {
-    // L'upsampling effectif et un headroom effectif (manuel, ou automatique
-    // devant un traitement) modifient aussi les échantillons : comptés avec
-    // les étages qui imposent le ré-encodage, pour que `delivery` et le badge
-    // ne se contredisent jamais.
+    // L'upsampling effectif et un headroom MANUEL effectif modifient aussi
+    // les échantillons : comptés avec les étages qui imposent le ré-encodage,
+    // pour que `delivery` et le badge ne se contredisent jamais. (Le headroom
+    // automatique n'est effectif que devant un traitement déjà compté.)
     let etape_fixe = |c: CodeEtape| r.etapes.iter().any(|e| e.code == c && e.effective);
+    let headroom_manuel = r.etapes.iter().any(|e| {
+        e.code == CodeEtape::Headroom
+            && e.effective
+            && e.params.as_ref().and_then(|p| p.get("mode")).and_then(|m| m.as_str())
+                == Some("manual")
+    });
     let reencodage = f.replaygain_actif
         || etape_fixe(CodeEtape::Upsampling)
-        || etape_fixe(CodeEtape::Headroom)
+        || headroom_manuel
         || greffons_effectifs(r)
             .any(|e| famille(e.plugin_id.as_deref().unwrap_or("")) == Famille::Reencodage);
     let casque = greffons_effectifs(r)
