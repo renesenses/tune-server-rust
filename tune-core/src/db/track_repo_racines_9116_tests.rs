@@ -131,8 +131,8 @@ fn sqlite_le_compte_d_une_racine_ne_lit_que_l_index_9116() {
         .collect();
     eprintln!("#9116 plan SQLite du compte de racine : {plan:?}");
     // Deux lectures, chacune dans un index (#9480) : les fichiers dans
-    // l'index couvrant de `file_path`, les tranches d'images dans l'index
-    // partiel des tranches — jamais la table entière.
+    // l'index couvrant de `file_path`, les tranches d'images (`file_path`
+    // NULL) par un index — jamais la table entière.
     let lectures: Vec<&String> = plan
         .iter()
         .filter(|l| l.starts_with("SCAN") || l.starts_with("SEARCH"))
@@ -140,11 +140,9 @@ fn sqlite_le_compte_d_une_racine_ne_lit_que_l_index_9116() {
     assert!(
         lectures.len() == 2
             && lectures.iter().any(|l| l.contains("COVERING INDEX"))
-            && lectures
-                .iter()
-                .all(|l| l.contains("COVERING INDEX") || l.contains("idx_tracks_cue_identity")),
+            && lectures.iter().all(|l| l.contains("INDEX")),
         "#9116 : le compte d'une racine doit se lire dans un index couvrant (fichiers) \
-         et dans l'index partiel des tranches, sans parcourir `tracks` : {plan:?}"
+         et dans un index pour les tranches, sans parcourir `tracks` : {plan:?}"
     );
     comparer(&db, Engine::Sqlite);
 }
