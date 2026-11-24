@@ -1168,6 +1168,7 @@ fn decode_source_for_levels<R: std::io::Read + Send + Sync + 'static>(
         reported_position_ms,
         0,
         None,
+        None,
     )
 }
 
@@ -1181,6 +1182,9 @@ fn decoder_les_niveaux<R: std::io::Read + Send + Sync + 'static>(
     reported_position_ms: std::sync::Arc<std::sync::atomic::AtomicI64>,
     depart_ms: i64,
     duree_ms: Option<std::sync::Arc<std::sync::atomic::AtomicI64>>,
+    // #9450 — un saut signalé par la prise : le décodeur freiné ne lit pas,
+    // il ne verrait jamais le message ; il s'interrompt pour se recaler.
+    interrompre: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
 ) -> Result<(), String> {
     use symphonia::core::audio::conv::IntoSample;
     use symphonia::core::codecs::CodecParameters;
@@ -1293,6 +1297,12 @@ fn decoder_les_niveaux<R: std::io::Read + Send + Sync + 'static>(
             reported_position_ms.load(std::sync::atomic::Ordering::Relaxed),
         ) {
             if levels_tx.is_closed() {
+                return Ok(());
+            }
+            if interrompre
+                .as_ref()
+                .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+            {
                 return Ok(());
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
@@ -1470,8 +1480,27 @@ async fn sonder_la_prise(
         let part = PartDeLecteur(lecteur.clone());
         let hint = codec_hint.clone();
         let duree = duree_ms.clone();
+        let signal = lecteur
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .signal_de_saut();
+        let pour_l_avance = lecteur.clone();
         let result = tokio::task::spawn_blocking(move || {
-            decoder_les_niveaux(part, hint, levels_tx, reported, depart_ms, Some(duree))
+            let r = decoder_les_niveaux(
+                part,
+                hint,
+                levels_tx,
+                reported,
+                depart_ms,
+                Some(duree),
+                Some(signal),
+            );
+            // Interrompu au frein sur un saut signalé : rejoindre ce saut.
+            pour_l_avance
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .avancer_jusqu_au_saut();
+            r
         })
         .await;
         match result {

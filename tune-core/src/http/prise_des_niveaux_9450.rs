@@ -55,6 +55,20 @@ const QUEUE_DE_FICHIER: u64 = 128 * 1024;
 
 static UTILISE: AtomicU64 = AtomicU64::new(0);
 
+/// Le bloc commence-t-il dans la fin du fichier, celle des étiquettes ?
+fn est_en_queue(debut: u64, total: Option<u64>) -> bool {
+    debut > 0 && total.is_some_and(|t| debut + QUEUE_DE_FICHIER >= t)
+}
+
+/// Retire `n` de `compteur` sans jamais passer sous 0, en une seule
+/// opération atomique (une lecture puis une soustraction séparées pouvaient
+/// faire boucler le compteur sous une course).
+pub(crate) fn soustraire_sature(compteur: &AtomicU64, n: u64) {
+    let _ = compteur.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        Some(v.saturating_sub(n))
+    });
+}
+
 /// Octets tenus par toutes les prises (attente + en-têtes).
 pub fn budget_utilise() -> u64 {
     UTILISE.load(Ordering::Relaxed)
@@ -80,6 +94,12 @@ struct Branchement {
     /// La connexion du renderer que la sonde suit.
     connexion: Option<u64>,
     en_attente: Arc<AtomicU64>,
+    /// Faux dès que la prise lâche CE lecteur en perdant des octets (plafond,
+    /// budget) : un lecteur garé mort ne se reprend pas.
+    vivant: Arc<std::sync::atomic::AtomicBool>,
+    /// Vrai dès qu'un saut est envoyé et pas encore pris : le décodeur freiné
+    /// le voit sans attendre de relire.
+    saut_signale: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Default)]
@@ -113,7 +133,7 @@ impl Drop for PriseDesNiveaux {
         let e = self.etat.get_mut().unwrap_or_else(|e| e.into_inner());
         let n = e.entete.lock().map(|v| v.len() as u64).unwrap_or(0);
         // L'attente, elle, est rendue par le lecteur (lecture ou `Drop`).
-        UTILISE.fetch_sub(n.min(UTILISE.load(Ordering::Relaxed)), Ordering::Relaxed);
+        soustraire_sature(&UTILISE, n);
     }
 }
 
@@ -132,11 +152,15 @@ impl PriseDesNiveaux {
         let en_attente = Arc::new(AtomicU64::new(0));
         let mut e = self.etat.lock().unwrap_or_else(|e| e.into_inner());
         let depart = e.derniere_fin;
+        let vivant = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let saut_signale = Arc::new(std::sync::atomic::AtomicBool::new(false));
         e.branchement = Some(Branchement {
             tx,
             prochain: depart,
             connexion: None,
             en_attente: en_attente.clone(),
+            vivant: vivant.clone(),
+            saut_signale: saut_signale.clone(),
         });
         LecteurDePrise {
             rx: Mutex::new(rx),
@@ -148,8 +172,20 @@ impl PriseDesNiveaux {
             saut: (depart > 0).then_some(depart),
             a_ignorer: 0,
             fini: false,
+            vivant,
+            saut_signale,
             arret,
         }
+    }
+
+    /// Un saut envoyé au lecteur attend-il encore d'être pris ?
+    pub fn saut_en_attente(&self) -> bool {
+        self.etat
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .branchement
+            .as_ref()
+            .is_some_and(|b| b.saut_signale.load(Ordering::Relaxed))
     }
 
     /// Une sonde est-elle branchée ?
@@ -190,16 +226,19 @@ impl PriseDesNiveaux {
                 UTILISE.fetch_add(n as u64, Ordering::Relaxed);
             }
         }
-        e.derniere_fin = fin;
         let total = e.total;
+        // Une lecture des étiquettes de fin ne dit pas où le renderer en est :
+        // un branchement tardif ne doit pas s'y recaler.
+        if !(est_en_queue(debut, total) && debut > e.derniere_fin) {
+            e.derniere_fin = fin;
+        }
         let plafond = self.plafond.load(Ordering::Relaxed);
         let Some(b) = e.branchement.as_mut() else {
             return;
         };
         let nouvelle = b.connexion != Some(connexion);
         if nouvelle {
-            let en_queue = total.is_some_and(|t| debut + QUEUE_DE_FICHIER >= t && debut > 0);
-            if en_queue && debut > b.prochain {
+            if est_en_queue(debut, total) && debut > b.prochain {
                 // Lecture des étiquettes de fin : rien à décoder.
                 return;
             }
@@ -212,6 +251,7 @@ impl PriseDesNiveaux {
                     e.branchement.take();
                     return;
                 }
+                b.saut_signale.store(true, Ordering::Relaxed);
                 b.prochain = debut;
             }
             if debut <= b.prochain {
@@ -232,14 +272,15 @@ impl PriseDesNiveaux {
                 budget_commun = commun,
                 "prise_des_niveaux_debranchee — sonde trop en retard, le renderer n'est pas freiné"
             );
-            UTILISE.fetch_sub(n, Ordering::Relaxed);
-            b.en_attente.fetch_sub(n, Ordering::Relaxed);
+            soustraire_sature(&UTILISE, n);
+            soustraire_sature(&b.en_attente, n);
+            b.vivant.store(false, Ordering::Relaxed);
             e.branchement.take();
             return;
         }
         if b.tx.send(Message::Octets(neuf.to_vec())).is_err() {
-            UTILISE.fetch_sub(n, Ordering::Relaxed);
-            b.en_attente.fetch_sub(n, Ordering::Relaxed);
+            soustraire_sature(&UTILISE, n);
+            soustraire_sature(&b.en_attente, n);
             e.branchement.take();
             return;
         }
@@ -266,6 +307,8 @@ pub struct LecteurDePrise {
     /// (alignement sur une trame WAV).
     a_ignorer: usize,
     fini: bool,
+    vivant: Arc<std::sync::atomic::AtomicBool>,
+    saut_signale: Arc<std::sync::atomic::AtomicBool>,
     /// Vrai quand la sonde n'a plus de raison de lire (piste remplacée).
     arret: Box<dyn Fn() -> bool + Send + Sync>,
 }
@@ -285,9 +328,23 @@ impl LecteurDePrise {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        self.saut_signale.store(false, Ordering::Relaxed);
         // L'en-tête SEUL (métadonnées), jamais l'audio qui le suit : rejouer
-        // la première seconde daterait faux tout ce qui vient après.
-        let forme = forme_de_l_en_tete(&entete);
+        // la première seconde daterait faux tout ce qui vient après. Un
+        // en-tête de forme inconnue, ou tronqué (métadonnées FLAC au-delà de
+        // ENTETE_MAX), ne permet pas de se recaler : la sonde se tait.
+        let Some(forme) = forme_de_l_en_tete(&entete) else {
+            tracing::info!(
+                octet,
+                entete = entete.len(),
+                "prise_des_niveaux_recalage_impossible — en-tête inconnu ou tronqué, VU-mètres muets"
+            );
+            self.fini = true;
+            self.reste.clear();
+            self.lu = 0;
+            return None;
+        };
+        let forme = Some(forme);
         let n = forme.map_or(entete.len(), |f| f.longueur).min(entete.len());
         self.reste = entete[..n].to_vec();
         // Un WAV reprend sur une trame entière.
@@ -307,6 +364,46 @@ impl LecteurDePrise {
         forme_de_l_en_tete(&entete).map(|f| f.longueur as u64)
     }
 
+    /// Un saut a-t-il été envoyé et pas encore pris ? (frein du décodeur)
+    pub fn signal_de_saut(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        self.saut_signale.clone()
+    }
+
+    /// Le décodeur s'est interrompu sur un saut SIGNALÉ qu'il n'a pas encore
+    /// lu : avance jusqu'au message de saut (les octets d'avant, que plus
+    /// personne ne jouera, sont rendus au budget).
+    pub fn avancer_jusqu_au_saut(&mut self) {
+        if self.saut.is_some() || !self.saut_signale.load(Ordering::Relaxed) {
+            return;
+        }
+        self.reste.clear();
+        self.lu = 0;
+        loop {
+            let recu = self
+                .rx
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .recv_timeout(Duration::from_millis(250));
+            match recu {
+                Ok(Message::Octets(bloc)) => self.rendre(bloc.len() as u64),
+                Ok(Message::Saut(octet)) => {
+                    self.saut = Some(octet);
+                    return;
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) if !(self.arret)() => {}
+                Err(_) => {
+                    self.fini = true;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// La prise tient-elle encore ce lecteur ?
+    pub fn est_vivant(&self) -> bool {
+        self.vivant.load(Ordering::Relaxed)
+    }
+
     /// La longueur du fichier, si l'amont l'a dite.
     pub fn total(&self) -> Option<u64> {
         Some(self.total.load(Ordering::Relaxed)).filter(|&t| t > 0)
@@ -318,18 +415,15 @@ impl LecteurDePrise {
     }
 
     fn rendre(&self, n: u64) {
-        self.en_attente.fetch_sub(n, Ordering::Relaxed);
-        UTILISE.fetch_sub(n.min(UTILISE.load(Ordering::Relaxed)), Ordering::Relaxed);
+        soustraire_sature(&self.en_attente, n);
+        soustraire_sature(&UTILISE, n);
     }
 }
 
 impl Drop for LecteurDePrise {
     fn drop(&mut self) {
         let reste = self.en_attente.swap(0, Ordering::Relaxed);
-        UTILISE.fetch_sub(
-            reste.min(UTILISE.load(Ordering::Relaxed)),
-            Ordering::Relaxed,
-        );
+        soustraire_sature(&UTILISE, reste);
     }
 }
 
@@ -447,7 +541,11 @@ pub fn garer(stream_id: &str, lecteur: LecteurDePrise) {
 pub fn reprendre(stream_id: &str) -> Option<LecteurDePrise> {
     let mut g = GAREES.lock().unwrap_or_else(|e| e.into_inner());
     let i = g.iter().position(|(s, _)| s == stream_id)?;
-    Some(g.remove(i).1)
+    let lecteur = g.remove(i).1;
+    // Débranchée pour avoir dépassé son plafond, la prise garée a perdu des
+    // octets : l'appelant branche un lecteur neuf (recalé à la position
+    // courante) au lieu de reprendre un lecteur mort.
+    lecteur.est_vivant().then_some(lecteur)
 }
 
 /// La session a-t-elle une prise garée ?
@@ -470,6 +568,14 @@ pub fn oublier(stream_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `fLaC` + STREAMINFO (34 octets), dernier bloc : 42 octets.
+    fn entete_flac() -> Vec<u8> {
+        let mut f = b"fLaC".to_vec();
+        f.extend_from_slice(&[0x80, 0, 0, 34]);
+        f.extend_from_slice(&[0u8; 34]);
+        f
+    }
 
     /// Un arrêt qui tombe au bout de 10 s : un test qui se bloque échoue au
     /// lieu de pendre (relecture de #9458).
@@ -521,13 +627,17 @@ mod tests {
         let prise = PriseDesNiveaux::default();
         let mut l = prise.brancher(borne());
         let total = Some(10 * 1024 * 1024u64);
-        prise.nourrir(1, 0, &[1, 2, 3, 4], total);
+        let mut debut = entete_flac();
+        debut.extend_from_slice(&[1, 2]);
+        prise.nourrir(1, 0, &debut, total);
         let loin = 5 * 1024 * 1024u64;
         prise.nourrir(2, loin, &[9, 9], total);
-        assert_eq!(tout_lire(&mut l), vec![1, 2, 3, 4], "fin de flux au saut");
+        assert_eq!(tout_lire(&mut l), debut, "fin de flux au saut");
         assert_eq!(l.prendre_le_saut(), Some(loin));
         prise.couper();
-        assert_eq!(tout_lire(&mut l), vec![1, 2, 3, 4, 9, 9]);
+        let mut attendu = entete_flac();
+        attendu.extend_from_slice(&[9, 9]);
+        assert_eq!(tout_lire(&mut l), attendu, "en-tête seul, puis la suite");
     }
 
     #[test]
@@ -572,13 +682,113 @@ mod tests {
     #[test]
     fn un_branchement_tardif_se_recale_sans_repartir_de_zero() {
         let prise = PriseDesNiveaux::default();
-        prise.nourrir(1, 0, &[1, 2, 3], None);
+        let mut debut = entete_flac();
+        debut.extend_from_slice(&[1, 2, 3]);
+        let n = debut.len() as u64;
+        prise.nourrir(1, 0, &debut, None);
         let mut l = prise.brancher(borne());
-        assert_eq!(l.commence_par_un_saut(), Some(3));
-        assert_eq!(l.prendre_le_saut(), Some(3));
-        prise.nourrir(1, 3, &[4, 5], None);
+        assert_eq!(l.commence_par_un_saut(), Some(n));
+        assert_eq!(l.prendre_le_saut(), Some(n));
+        prise.nourrir(1, n, &[4, 5], None);
         prise.couper();
-        assert_eq!(tout_lire(&mut l), vec![1, 2, 3, 4, 5]);
+        let mut attendu = entete_flac();
+        attendu.extend_from_slice(&[4, 5]);
+        assert_eq!(tout_lire(&mut l), attendu);
+    }
+
+    // ── Suite de la relecture de #9458 ──────────────────────────────────
+
+    /// Point 1 — une prise garée débranchée pour avoir dépassé son plafond ne
+    /// se reprend pas : l'appelant en branchera une neuve.
+    #[test]
+    fn une_prise_garee_debranchee_ne_se_reprend_pas() {
+        let prise = PriseDesNiveaux::default();
+        prise.poser_le_debit(1); // plafond au plancher : 8 Mio
+        garer("s-garee-morte-9450", prise.brancher(borne()));
+        let bloc = vec![0u8; 1024 * 1024];
+        for i in 0..(PLAFOND_MIN / bloc.len() as u64 + 2) {
+            prise.nourrir(1, i * bloc.len() as u64, &bloc, None);
+        }
+        assert!(!prise.branchee(), "débranchée au plafond");
+        assert!(
+            reprendre("s-garee-morte-9450").is_none(),
+            "un lecteur garé mort ne doit pas être rendu"
+        );
+    }
+
+    /// Point 2 — le saut envoyé à un lecteur qui ne lit pas (décodeur freiné)
+    /// se voit sans relire, et `avancer_jusqu_au_saut` le rejoint.
+    #[test]
+    fn un_saut_se_signale_au_decodeur_freine() {
+        let prise = PriseDesNiveaux::default();
+        let mut l = prise.brancher(borne());
+        let signal = l.signal_de_saut();
+        let total = Some(10 * 1024 * 1024u64);
+        prise.nourrir(1, 0, &entete_flac(), total);
+        assert!(!signal.load(Ordering::Relaxed));
+        prise.nourrir(2, 6 * 1024 * 1024, &[9], total);
+        assert!(signal.load(Ordering::Relaxed), "saut signalé sans lecture");
+        l.avancer_jusqu_au_saut();
+        assert_eq!(l.prendre_le_saut(), Some(6 * 1024 * 1024));
+        assert!(!signal.load(Ordering::Relaxed), "signal levé une fois pris");
+    }
+
+    /// Point 3 — une lecture des étiquettes de fin ne déplace pas la position
+    /// où un branchement tardif se recale.
+    #[test]
+    fn les_etiquettes_de_fin_ne_deplacent_pas_la_position_courante() {
+        let prise = PriseDesNiveaux::default();
+        let total = 4 * 1024 * 1024u64;
+        prise.nourrir(1, 0, &[0u8; 1000], Some(total));
+        prise.nourrir(2, total - 187, &[0u8; 187], Some(total));
+        let l = prise.brancher(borne());
+        assert_eq!(l.commence_par_un_saut(), Some(1000));
+    }
+
+    /// Point 4 — un en-tête inconnu, ou un en-tête FLAC tronqué (métadonnées
+    /// au-delà de ENTETE_MAX), ne permet pas de se recaler : la sonde se tait
+    /// au lieu de rejouer un faux en-tête.
+    #[test]
+    fn un_en_tete_tronque_ou_inconnu_ne_recale_pas() {
+        for debut in [vec![1u8, 2, 3, 4], {
+            // Bloc PICTURE de 2 Mio annoncé, jamais tenu en entier.
+            let mut f = b"fLaC".to_vec();
+            f.extend_from_slice(&[0x86, 0x20, 0x00, 0x00]);
+            f.extend_from_slice(&[0u8; 64]);
+            f
+        }] {
+            let prise = PriseDesNiveaux::default();
+            let mut l = prise.brancher(borne());
+            let total = Some(10 * 1024 * 1024u64);
+            prise.nourrir(1, 0, &debut, total);
+            prise.nourrir(2, 5 * 1024 * 1024, &[9, 9], total);
+            assert_eq!(tout_lire(&mut l), debut);
+            assert_eq!(l.prendre_le_saut(), None, "pas de recalage");
+            assert!(tout_lire(&mut l).is_empty(), "la sonde se tait");
+        }
+    }
+
+    /// Point 5 — la soustraction du budget est atomique et saturée : sous une
+    /// course, le compteur ne boucle jamais sous 0.
+    #[test]
+    fn la_soustraction_du_budget_ne_boucle_jamais() {
+        let compteur = Arc::new(AtomicU64::new(0));
+        let fils: Vec<_> = (0..8)
+            .map(|_| {
+                let c = compteur.clone();
+                std::thread::spawn(move || {
+                    for _ in 0..20_000 {
+                        c.fetch_add(1, Ordering::Relaxed);
+                        soustraire_sature(&c, 2);
+                        assert!(c.load(Ordering::Relaxed) < 1_000_000, "bouclé sous 0");
+                    }
+                })
+            })
+            .collect();
+        for f in fils {
+            f.join().unwrap();
+        }
+        assert_eq!(compteur.load(Ordering::Relaxed), 0);
     }
 
     #[test]

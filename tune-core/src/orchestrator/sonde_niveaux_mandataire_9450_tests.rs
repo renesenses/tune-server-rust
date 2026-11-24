@@ -368,3 +368,104 @@ async fn la_piste_remplacee_arrete_la_sonde_d_une_prise_muette() {
     .await
     .expect("témoin #9450 bloqué : 30 s dépassées");
 }
+
+// ── Suite de la relecture de #9458 ──────────────────────────────────────
+
+/// Point 1 — la prise garée d'une session a été débranchée (plafond
+/// dépassé) : la sonde ne la reprend pas, elle branche un lecteur neuf.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn une_prise_garee_morte_est_remplacee_par_un_lecteur_neuf() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async move {
+        let b = banc().await;
+        let sid = session_mandataire(&b.streamer).await;
+        let session = b
+            .streamer
+            .sessions_state()
+            .lock()
+            .await
+            .get(&sid)
+            .cloned()
+            .unwrap();
+        session.prise_des_niveaux.poser_le_debit(1);
+        let fin = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let garee = session
+            .prise_des_niveaux
+            .brancher(Box::new(move || std::time::Instant::now() >= fin));
+        crate::http::prise_des_niveaux_9450::garer(&sid, garee);
+        let bloc = vec![0u8; 1024 * 1024];
+        for i in 0..10u64 {
+            session
+                .prise_des_niveaux
+                .nourrir(1, i * bloc.len() as u64, &bloc, None);
+        }
+        assert!(
+            !session.prise_des_niveaux.branchee(),
+            "mise en scène : débranchée"
+        );
+        let url = format!("http://127.0.0.1:9/stream/{sid}.wav");
+        b.orch
+            .spawn_proxy_levels_probe(b.zone_id, url, "wav".into())
+            .await;
+        assert!(
+            session.prise_des_niveaux.branchee(),
+            "un lecteur neuf doit être branché à la place de la prise garée morte"
+        );
+        b.streamer.remove_session(&sid).await;
+    })
+    .await
+    .expect("témoin #9450 bloqué : 30 s dépassées");
+}
+
+/// Point 2 — le décodeur freiné (30 s d'avance, position immobile) voit le
+/// saut du renderer et se recale, au lieu de rester freiné sur l'ancienne
+/// position.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn le_decodeur_freine_reagit_a_un_saut() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async move {
+        let b = banc().await;
+        let sid = session_mandataire(&b.streamer).await;
+        let url = format!("http://127.0.0.1:9/stream/{sid}.wav");
+        b.orch
+            .spawn_proxy_levels_probe(b.zone_id, url, "wav".into())
+            .await;
+        let session = b
+            .streamer
+            .sessions_state()
+            .lock()
+            .await
+            .get(&sid)
+            .cloned()
+            .unwrap();
+        // 55 s relayées d'un coup : le décodeur s'arrête à ~30 s d'avance et
+        // ne se libérerait seul qu'après ~25 s.
+        let wav = wav_silencieux(60);
+        let total = wav.len() as u64;
+        let seconde = 176_400usize;
+        for (i, bloc) in wav[..44 + 55 * seconde].chunks(256 * 1024).enumerate() {
+            session
+                .prise_des_niveaux
+                .nourrir(1, (i * 256 * 1024) as u64, bloc, Some(total));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        // Le renderer saute en avant, à 58 s (nouvelle connexion).
+        let saut = 44 + 58 * seconde;
+        session
+            .prise_des_niveaux
+            .nourrir(2, saut as u64, &wav[saut..saut + seconde], Some(total));
+        assert!(
+            session.prise_des_niveaux.saut_en_attente(),
+            "mise en scène : saut envoyé"
+        );
+        let fin = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while session.prise_des_niveaux.saut_en_attente() && tokio::time::Instant::now() < fin {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(
+            !session.prise_des_niveaux.saut_en_attente(),
+            "le décodeur freiné doit prendre le saut et se recaler"
+        );
+        b.streamer.remove_session(&sid).await;
+    })
+    .await
+    .expect("témoin #9450 bloqué : 30 s dépassées");
+}

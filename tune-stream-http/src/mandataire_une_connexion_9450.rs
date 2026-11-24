@@ -152,3 +152,88 @@ async fn un_head_d_abord_annonce_la_longueur_9450() {
     .await
     .expect("témoin #9450 bloqué : 30 s dépassées");
 }
+
+/// Un amont qui accepte la connexion et ne répond jamais (`muet`), ou qui
+/// répond 500 : rend l'URL et le compte des connexions.
+fn amont_en_panne(muet: bool) -> (String, Arc<AtomicUsize>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let n = Arc::new(AtomicUsize::new(0));
+    let compte = n.clone();
+    std::thread::spawn(move || {
+        use std::io::Write;
+        let mut gardees = Vec::new();
+        for flux in listener.incoming() {
+            let Ok(mut s) = flux else { break };
+            compte.fetch_add(1, Ordering::SeqCst);
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf);
+            if muet {
+                gardees.push(s);
+            } else {
+                let _ = s.write_all(
+                    b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                );
+            }
+        }
+    });
+    (format!("http://127.0.0.1:{port}/piste.flac"), n)
+}
+
+async fn session_vers(amont: String, sid: &str) -> (SharedSessions, Arc<StreamSession>) {
+    let info = StreamInfo {
+        format: "flac".into(),
+        mime_type: "audio/flac".into(),
+        sample_rate: 44_100,
+        bit_depth: 16,
+        channels: 2,
+        ..StreamInfo::default()
+    };
+    let session = StreamSession::new(sid.to_string(), info, false, 128);
+    *session.proxy_url.lock().await = Some(amont);
+    let session = Arc::new(session);
+    let sessions: SharedSessions = Arc::new(tokio::sync::Mutex::new(
+        [(sid.to_string(), session.clone())].into_iter().collect(),
+    ));
+    (sessions, session)
+}
+
+/// Point 6 de la relecture — un amont qui expire ou échoue : le HEAD répond
+/// sans longueur, et l'échec est retenu. Le HEAD suivant ne retente pas :
+/// réponse immédiate, aucune connexion de plus à l'amont.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn un_amont_en_panne_n_est_sonde_qu_une_fois_par_session_9450() {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async move {
+        for (muet, sid) in [(true, "s9450-head-muet"), (false, "s9450-head-500")] {
+            let (amont, connexions) = amont_en_panne(muet);
+            let (sessions, session) = session_vers(amont, sid).await;
+            let head = || {
+                let mut h = HeaderMap::new();
+                h.insert("User-Agent", "Renderer/1.0".parse().unwrap());
+                handle_head(Path(format!("{sid}.flac")), State(sessions.clone()), h)
+            };
+            let t0 = std::time::Instant::now();
+            let rep = head().await;
+            assert!(
+                t0.elapsed() < std::time::Duration::from_secs(5),
+                "borné à 3 s"
+            );
+            assert!(rep.headers().get("Content-Length").is_none());
+            assert!(session.longueur_amont().is_none());
+            let t1 = std::time::Instant::now();
+            let rep = head().await;
+            assert!(
+                t1.elapsed() < std::time::Duration::from_millis(500),
+                "le second HEAD ne doit pas retenter l'amont ({muet})"
+            );
+            assert!(rep.headers().get("Content-Length").is_none());
+            assert_eq!(
+                connexions.load(Ordering::SeqCst),
+                1,
+                "une seule tentative par session ({muet})"
+            );
+        }
+    })
+    .await
+    .expect("témoin #9450 bloqué : 30 s dépassées");
+}

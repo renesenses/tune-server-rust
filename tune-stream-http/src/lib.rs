@@ -3213,7 +3213,14 @@ async fn send_with_reresolve(
 /// `GET bytes=0-0` (un octet), bornée à 3 s, puis retenue par la session.
 async fn longueur_par_sonde_amont(session: &StreamSession) -> Option<u64> {
     let url = session.proxy_url.lock().await.clone()?;
-    let rep = tokio::time::timeout(
+    // Une seule tentative par session, réussie ou non.
+    if session
+        .sonde_de_longueur_tentee
+        .swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        return None;
+    }
+    let reponse = tokio::time::timeout(
         std::time::Duration::from_secs(3),
         tune_core::http::client::long_timeout()
             .get(&url)
@@ -3221,9 +3228,18 @@ async fn longueur_par_sonde_amont(session: &StreamSession) -> Option<u64> {
             .header("Range", "bytes=0-0")
             .send(),
     )
-    .await
-    .ok()?
-    .ok()?;
+    .await;
+    let rep = match reponse {
+        Ok(Ok(rep)) => rep,
+        Ok(Err(e)) => {
+            info!(stream_id = %session.id, erreur = %tune_core::http::client::decrire_erreur_http(&e), "proxy_longueur_par_sonde_amont_echec");
+            return None;
+        }
+        Err(_) => {
+            info!(stream_id = %session.id, "proxy_longueur_par_sonde_amont_delai_depasse");
+            return None;
+        }
+    };
     let content_length = rep
         .headers()
         .get("Content-Length")
@@ -3234,12 +3250,13 @@ async fn longueur_par_sonde_amont(session: &StreamSession) -> Option<u64> {
         .get("Content-Range")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
-    let total = longueur_totale_amont(
-        rep.status().as_u16(),
-        content_length,
-        content_range.as_deref(),
-    )?;
+    let statut = rep.status().as_u16();
     drop(rep);
+    let Some(total) = longueur_totale_amont(statut, content_length, content_range.as_deref())
+    else {
+        info!(stream_id = %session.id, statut, "proxy_longueur_par_sonde_amont_sans_longueur");
+        return None;
+    };
     session.noter_longueur_amont(total);
     info!(stream_id = %session.id, total, "proxy_longueur_par_sonde_amont");
     Some(total)
