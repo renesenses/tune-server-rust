@@ -77,13 +77,16 @@ pub(super) async fn verdict_album(
         .iter()
         .map(|r| {
             let verdict = r.get(1).and_then(|v| v.as_string()).unwrap_or_default();
+            // #9472 — une ligne lue « non concluante » (dont une coupure basse
+            // rangée avant #9472) ne publie ni raison ni coupure.
+            let non_concluant = verdict == "non_concluant";
             // #9035 — l'ancien `coupure_de_codec` se publie `coupure_spectrale`.
             let raison = r
                 .get(2)
                 .and_then(|v| v.as_string())
                 .map(|c| raison_publiee(&c).to_string())
                 // #9067 — un CD lu « conforme » n'a pas de raison de doute.
-                .filter(|_| verdict != "conforme");
+                .filter(|_| verdict != "conforme" && !non_concluant);
             verdicts.push((verdict.clone(), raison.clone()));
             if let (true, Some(f)) = (verdict == "douteux", r.get(3).and_then(|v| v.as_f64())) {
                 coupures.push((raison.clone(), f));
@@ -98,7 +101,7 @@ pub(super) async fn verdict_album(
                 "track_id": r.first().and_then(|v| v.as_i64()),
                 "verdict": verdict,
                 "raison": raison,
-                "coupure_hz": r.get(3).and_then(|v| v.as_f64()),
+                "coupure_hz": r.get(3).and_then(|v| v.as_f64()).filter(|_| !non_concluant),
                 "bits_effectifs": r.get(4).and_then(|v| v.as_i64()),
                 "sample_rate": r.get(5).and_then(|v| v.as_i64()),
                 "bits_declares": r.get(6).and_then(|v| v.as_i64()),
