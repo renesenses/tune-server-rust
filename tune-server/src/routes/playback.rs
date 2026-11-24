@@ -15,14 +15,14 @@ mod reprise_apres_redemarrage_dlna_6380_tests;
 #[cfg(test)]
 #[path = "playback/reprise_service_titre_seul_6380_tests.rs"]
 mod reprise_service_titre_seul_6380_tests;
-#[cfg(test)]
-#[path = "playback/seek_en_double_193_tests.rs"]
-mod seek_en_double_193_tests;
 #[path = "playback/saut_relatif.rs"]
 mod saut_relatif;
 #[cfg(test)]
 #[path = "playback/saut_relatif_tests.rs"]
 mod saut_relatif_tests;
+#[cfg(test)]
+#[path = "playback/seek_en_double_193_tests.rs"]
+mod seek_en_double_193_tests;
 #[cfg(test)]
 #[path = "playback/session_locale_tests.rs"]
 mod session_locale_tests;
