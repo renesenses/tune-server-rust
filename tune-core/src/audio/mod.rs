@@ -70,6 +70,10 @@ pub mod dsf;
 pub mod dsf_depuis_dst;
 #[cfg(test)]
 mod dsf_depuis_dst_tests_6221;
+/// #9184 — une tranche d'ISO SACD servie en DSF virtuel (DSD natif réseau).
+pub mod dsf_depuis_iso;
+#[cfg(test)]
+mod dsf_depuis_iso_tests_9184;
 /// #4833 — le DSF décodé au fil de l'eau depuis HTTP produit le même PCM que
 /// le fichier (mesuré : comptes, cadence, RMS, corrélation, vitesse).
 #[cfg(test)]
