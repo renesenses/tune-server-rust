@@ -192,6 +192,33 @@ impl Marqueur {
     pub(crate) fn est_auto(&self) -> bool {
         self.origine == ORIGINE_AUTO
     }
+
+    /// Fil 3012 — le coffret ne réunit-il que les disques d'UNE sortie ?
+    ///
+    /// Vrai quand les titres d'origine retenus ([`DisqueRetenu::titre`], un
+    /// par album réuni) ne diffèrent que par leur marqueur de disque
+    /// ([`crate::metadata::coffrets::disques_d_une_meme_sortie`]) et que les
+    /// artistes connus sont le même. Un marqueur sans disques retenus
+    /// (coffret d'avant #5319, « attacher ») ne prouve rien : faux.
+    pub fn reunit_une_seule_sortie(&self) -> bool {
+        // Un album de plusieurs disques en donne plusieurs : un titre par
+        // album réuni (`membre`), sinon par disque.
+        let mut vus: Vec<Option<u32>> = Vec::new();
+        let mut titres: Vec<String> = Vec::new();
+        for d in &self.disques {
+            if d.membre.is_some() && vus.contains(&d.membre) {
+                continue;
+            }
+            vus.push(d.membre);
+            titres.push(d.titre.clone());
+        }
+        let mut artistes = self.disques.iter().filter_map(|d| d.artiste_id);
+        let un_artiste = match artistes.next() {
+            Some(premier) => artistes.all(|a| a == premier),
+            None => true,
+        };
+        un_artiste && crate::metadata::coffrets::disques_d_une_meme_sortie(&titres)
+    }
 }
 
 /// Ce que la passe lit de la base, en trois requêtes.
