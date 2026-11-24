@@ -198,6 +198,121 @@ pub fn adapter_f32(
         .then(|| m.appliquer_f32(samples))
 }
 
+/// TESS T06 — la réaffectation des canaux comme étage TESS, en `f64` de
+/// bout en bout.
+///
+/// - Même [`Matrice`] que la sortie locale (somme pondérée en `f64`,
+///   normalisation, recopie au bit près des permutations) : seul le type
+///   change, aucun arrondi n'a lieu dans l'étage.
+/// - `N → N` : sur place (une trame de travail préparée) ; `N → M` : vers le
+///   tampon de sortie que l'exécuteur préalloue d'après la disposition
+///   (`max_trames × M`). Rien n'est alloué dans `traiter_*`.
+/// - Place `last_plugin` (contrat T01) : c'est le dernier greffon de la
+///   chaîne, juste avant les étages fixes de rendu.
+/// - Contournement : possible en `N → N` (l'étage n'a pas de latence, il rend
+///   son entrée) ; en `N → M`, le nombre de canaux ne peut pas changer en
+///   cours de lecture, le contournement passe par une reconstruction de la
+///   chaîne (comme « Bypass all »).
+pub struct EtageReaffectation {
+    matrice: Arc<Matrice>,
+    trame: Vec<f64>,
+    contourne: bool,
+}
+
+impl EtageReaffectation {
+    pub fn new(matrice: Arc<Matrice>) -> Self {
+        Self {
+            matrice,
+            trame: Vec::new(),
+            contourne: false,
+        }
+    }
+
+    fn garde_ses_canaux(&self) -> bool {
+        self.matrice.entrees() == self.matrice.sorties()
+    }
+}
+
+impl crate::tess::EtageTess for EtageReaffectation {
+    fn id(&self) -> &str {
+        ID_GREFFON
+    }
+
+    fn preparer(
+        &mut self,
+        entree: crate::tess::FormatFlux,
+        max_trames: usize,
+    ) -> Result<crate::tess::Disposition, crate::tess::ErreurEtage> {
+        if entree.channels != self.matrice.entrees() {
+            return Err(crate::tess::ErreurEtage::FormatNonPrisEnCharge {
+                channels: entree.channels,
+                sample_rate_hz: entree.sample_rate_hz,
+            });
+        }
+        self.trame = vec![0.0; usize::from(self.matrice.entrees())];
+        if self.garde_ses_canaux() {
+            return Ok(crate::tess::Disposition::sur_place(entree, max_trames, 0));
+        }
+        Ok(crate::tess::Disposition {
+            sortie: crate::tess::FormatFlux {
+                channels: self.matrice.sorties(),
+                sample_rate_hz: entree.sample_rate_hz,
+            },
+            max_trames_sortie: max_trames,
+            latence_trames: 0,
+            sur_place: false,
+        })
+    }
+
+    fn traiter_sur_place(
+        &mut self,
+        tampon: &mut [f64],
+        trames: usize,
+    ) -> Result<(), crate::tess::ErreurEtage> {
+        let n = self.matrice.entrees();
+        crate::tess::etage::verifier_tampon(tampon.len(), trames, n)?;
+        if self.contourne || self.matrice.est_identite() {
+            return Ok(());
+        }
+        if !self
+            .matrice
+            .appliquer_f64_sur_place(&mut tampon[..trames * usize::from(n)], &mut self.trame)
+        {
+            return Err(crate::tess::ErreurEtage::ModeNonPrisEnCharge);
+        }
+        Ok(())
+    }
+
+    fn traiter_vers(
+        &mut self,
+        entree: &[f64],
+        trames: usize,
+        sortie: &mut [f64],
+    ) -> Result<usize, crate::tess::ErreurEtage> {
+        let (n, m) = (self.matrice.entrees(), self.matrice.sorties());
+        crate::tess::etage::verifier_tampon(entree.len(), trames, n)?;
+        crate::tess::etage::verifier_tampon(sortie.len(), trames, m)?;
+        Ok(self.matrice.appliquer_f64_dans(
+            &entree[..trames * usize::from(n)],
+            &mut sortie[..trames * usize::from(m)],
+        ))
+    }
+
+    fn bypass(&self) -> bool {
+        self.contourne
+    }
+
+    fn definir_bypass(&mut self, bypass: bool) {
+        // En N → M, un contournement changerait le nombre de canaux en vol :
+        // il passe par la reconstruction de la chaîne (voir le type).
+        self.contourne = bypass && self.garde_ses_canaux();
+    }
+}
+
+#[cfg(test)]
+#[path = "reaffectation_canaux_f64_tests.rs"]
+mod tests_f64;
+
 #[cfg(test)]
 mod tests {
     use super::*;

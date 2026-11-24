@@ -42,7 +42,20 @@ pub enum Feature {
     /// AirPlay, locaux. Les paires stéréo restent gratuites.
     MultiroomSync,
     /// Equalizer is free; retain the historical wire name `dsp_eq`.
+    ///
+    /// Depuis T19 (TESS, décision Q3 de Bertrand du 17/11/2026), ce droit
+    /// gratuit couvre l'égaliseur graphique et l'égaliseur casque (AutoEQ,
+    /// OPRA). L'égaliseur paramétrique, même moteur, a son propre droit
+    /// Premium : [`Feature::ParametricEq`].
     DspEq,
+    /// TESS T19 — « Parametric EQ » : la section paramétrique de l'égaliseur
+    /// (même moteur que le graphique et le casque, greffon TESS
+    /// `equalizer-parametric`). Premium (décision Q3 de Bertrand du
+    /// 17/11/2026, confirmée avec Rémi le 18/11). Un compte gratuit qui avait
+    /// un égaliseur paramétrique le voit converti en graphique au plus près à
+    /// la lecture (décision P2, `tess::migration::lire_zone`), sans que rien
+    /// d'enregistré ne soit perdu : le Premium retrouvé le rend tel quel.
+    ParametricEq,
     /// Crossfeed simple gratuit ; code historique conservé (#9210).
     Crossfeed,
     CloudRelay,
@@ -135,7 +148,27 @@ impl Feature {
             Feature::Aes67,
             Feature::Subsonic,
             Feature::Upsampling,
+            // T19 (Q3) : la section paramétrique de l'égaliseur.
+            Feature::ParametricEq,
         ]
+    }
+
+    /// Toutes les variantes, gratuites comprises, dans un ordre stable. Sert à
+    /// relire un code stable ([`Feature::from_code`]).
+    pub fn all() -> impl Iterator<Item = Feature> {
+        Self::all_advertised().chain([Self::OaatProtocol, Self::Concerts])
+    }
+
+    /// La `Feature` dont [`Feature::code`] vaut `code`, ou `None` pour un code
+    /// inconnu de cette version (un paquet tiers peut en citer un).
+    pub fn from_code(code: &str) -> Option<Feature> {
+        Self::all().find(|f| f.code() == code)
+    }
+
+    /// Le droit est-il ouvert sans Premium ? La seule liste des droits
+    /// gratuits, lue par [`LicenseManager::check_feature`].
+    pub fn est_gratuite(self) -> bool {
+        matches!(self, Feature::DspEq | Feature::Crossfeed)
     }
 
     /// Features exposed to clients, including the free historical EQ and crossfeed keys.
@@ -152,6 +185,7 @@ impl Feature {
             Feature::UnlimitedZones => "Unlimited Zones",
             Feature::MultiroomSync => "Multiroom Sync",
             Feature::DspEq => "Equalizer",
+            Feature::ParametricEq => "Parametric EQ",
             Feature::Crossfeed => "Crossfeed",
             Feature::CloudRelay => "Cloud Relay",
             Feature::OaatProtocol => "OAAT Protocol",
@@ -197,6 +231,7 @@ impl Feature {
             Feature::UnlimitedZones => "unlimited_zones",
             Feature::MultiroomSync => "multiroom_sync",
             Feature::DspEq => "dsp_eq",
+            Feature::ParametricEq => "parametric_eq",
             Feature::Crossfeed => "crossfeed",
             Feature::CloudRelay => "cloud_relay",
             Feature::OaatProtocol => "oaat_protocol",
@@ -497,8 +532,7 @@ impl LicenseManager {
     /// Check whether a specific feature is enabled. All premium features require
     /// the effective Premium tier (license key or account premium).
     pub async fn check_feature(&self, feature: Feature) -> bool {
-        matches!(feature, Feature::DspEq | Feature::Crossfeed)
-            || effective_tier(&*self.state.read().await) == Tier::Premium
+        feature.est_gratuite() || effective_tier(&*self.state.read().await) == Tier::Premium
     }
 
     /// Le plafond de zones **en vigueur** : `None` = illimité (Premium),
@@ -1495,8 +1529,9 @@ mod tests {
         // 04/11/2026) ; puis revenu à 28 sans `Concerts` (#7865, Bertrand,
         // 04/11/2026 : le module n'est plus Premium) ; puis à 29 avec
         // `Upsampling` (#7614, Bertrand, 07/11/2026), puis à 28 sans
-        // le crossfeed simple (#9210, décision Bertrand du 17/11/2026).
-        assert_eq!(Feature::all_premium().len(), 28);
+        // le crossfeed simple (#9210, décision Bertrand du 17/11/2026), puis
+        // à 29 avec `ParametricEq` (TESS T19, décision Q3 du 17/11/2026).
+        assert_eq!(Feature::all_premium().len(), 29);
     }
 
     #[test]
@@ -2538,5 +2573,201 @@ mod declick_nom_9213_tests {
         assert!(!licence.check_feature(Feature::Declick).await);
         licence.set_account_premium(true, None).await;
         assert!(licence.check_feature(Feature::Declick).await);
+    }
+}
+
+/// TESS T19 — droits et noms : la section paramétrique de l'égaliseur devient
+/// un droit Premium propre (Q3), sans qu'aucune licence ne perde un droit
+/// qu'elle avait, et sans qu'aucun droit Premium ne devienne gratuit.
+#[cfg(test)]
+mod droits_t19_tests {
+    use super::*;
+
+    /// Les 28 codes Premium d'avant T19, recopiés à la main : un garde-fou
+    /// contre un retrait silencieux.
+    const PREMIUM_AVANT_T19: [&str; 28] = [
+        "unlimited_zones",
+        "multiroom_sync",
+        "cloud_relay",
+        "cloud_backup",
+        "synced_lyrics",
+        "listening_stats",
+        "multi_scrobbling",
+        "ai_recommendations",
+        "playlist_transfer",
+        "advanced_alarms",
+        "multi_profiles",
+        "weekly_digest",
+        "auto_enrichment",
+        "room_correction",
+        "cloud_config_backup",
+        "social_sharing",
+        "developer_api",
+        "plugin_marketplace",
+        "multi_server",
+        "dac_calibration",
+        "batch_converter",
+        "playlists_hub",
+        "declick",
+        "acoustic_analysis",
+        "pont_roon",
+        "aes67_output",
+        "subsonic",
+        "upsampling",
+    ];
+
+    fn gestionnaire() -> LicenseManager {
+        let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+        db.init_schema().unwrap();
+        crate::db::migrations::run_migrations(&db).unwrap();
+        LicenseManager::new(Arc::new(db))
+    }
+
+    async fn ouverts(mgr: &LicenseManager) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        for f in Feature::all() {
+            if mgr.check_feature(f).await {
+                v.push(f.code());
+            }
+        }
+        v
+    }
+
+    #[test]
+    fn le_parametrique_a_son_propre_droit_premium() {
+        assert_eq!(Feature::ParametricEq.code(), "parametric_eq");
+        assert_eq!(Feature::ParametricEq.display_name(), "Parametric EQ");
+        assert!(Feature::all_premium().contains(&Feature::ParametricEq));
+        assert!(!Feature::ParametricEq.est_gratuite());
+        assert!(Feature::ParametricEq.available());
+        // Le code voyage tel quel en JSON (refus 402, `premium_features`).
+        assert_eq!(
+            serde_json::to_string(&Feature::ParametricEq).unwrap(),
+            r#""parametric_eq""#
+        );
+        assert!(Feature::all_advertised().any(|f| f == Feature::ParametricEq));
+    }
+
+    #[test]
+    fn aucun_droit_premium_ne_disparait_ni_ne_devient_gratuit() {
+        let premium: Vec<&str> = Feature::all_premium().iter().map(|f| f.code()).collect();
+        for code in PREMIUM_AVANT_T19 {
+            assert!(premium.contains(&code), "{code} n'est plus Premium");
+            let f = Feature::from_code(code).unwrap();
+            assert!(!f.est_gratuite(), "{code} est devenu gratuit");
+        }
+        // Les seuls droits gratuits restent ceux d'avant T19.
+        let gratuits: Vec<&str> = Feature::all()
+            .filter(|f| f.est_gratuite())
+            .map(|f| f.code())
+            .collect();
+        assert_eq!(gratuits, vec!["dsp_eq", "crossfeed"]);
+    }
+
+    #[test]
+    fn chaque_code_se_relit() {
+        // Exhaustif : une variante ajoutée sans être relisible fait échouer
+        // la compilation de ce `match`, puis le décompte.
+        fn temoin(f: Feature) -> u8 {
+            match f {
+                Feature::UnlimitedZones
+                | Feature::MultiroomSync
+                | Feature::DspEq
+                | Feature::ParametricEq
+                | Feature::Crossfeed
+                | Feature::CloudRelay
+                | Feature::OaatProtocol
+                | Feature::CloudBackup
+                | Feature::SyncedLyrics
+                | Feature::ListeningStats
+                | Feature::MultiScrobbling
+                | Feature::AiRecommendations
+                | Feature::PlaylistTransfer
+                | Feature::AdvancedAlarms
+                | Feature::MultiProfiles
+                | Feature::WeeklyDigest
+                | Feature::AutoEnrichment
+                | Feature::RoomCorrection
+                | Feature::CloudConfigBackup
+                | Feature::SocialSharing
+                | Feature::DeveloperApi
+                | Feature::PluginMarketplace
+                | Feature::MultiServer
+                | Feature::DacCalibration
+                | Feature::BatchConverter
+                | Feature::PlaylistsHub
+                | Feature::Declick
+                | Feature::AcousticAnalysis
+                | Feature::PontRoon
+                | Feature::Concerts
+                | Feature::Aes67
+                | Feature::Subsonic
+                | Feature::Upsampling => 1,
+            }
+        }
+        let toutes: Vec<Feature> = Feature::all().collect();
+        assert_eq!(
+            toutes.iter().map(|f| temoin(*f) as usize).sum::<usize>(),
+            33
+        );
+        for f in toutes {
+            assert_eq!(Feature::from_code(f.code()), Some(f), "{f:?}");
+        }
+        assert_eq!(Feature::from_code("no_such_feature"), None);
+    }
+
+    #[tokio::test]
+    async fn utilisateur_gratuit_graphique_et_casque_oui_parametrique_non() {
+        let mgr = gestionnaire();
+        assert!(mgr.check_feature(Feature::DspEq).await);
+        assert!(mgr.check_feature(Feature::Crossfeed).await);
+        assert!(!mgr.check_feature(Feature::ParametricEq).await);
+        assert_eq!(ouverts(&mgr).await, vec!["dsp_eq", "crossfeed"]);
+    }
+
+    #[tokio::test]
+    async fn premium_par_le_compte_tout_est_ouvert() {
+        let mgr = gestionnaire();
+        mgr.set_account_premium(true, None).await;
+        for f in Feature::all() {
+            assert!(mgr.check_feature(f).await, "{f:?} refusé en Premium");
+        }
+    }
+
+    #[tokio::test]
+    async fn licence_a_vie_garde_tout_et_gagne_le_parametrique() {
+        // Une licence à vie : clé Premium validée, sans date de fin.
+        let mgr = gestionnaire();
+        mgr.update_from_server(Tier::Premium, None).await;
+        assert_eq!(mgr.license_state().await.expires_at, None);
+        for code in PREMIUM_AVANT_T19 {
+            let f = Feature::from_code(code).unwrap();
+            assert!(
+                mgr.check_feature(f).await,
+                "{code} perdu par la licence à vie"
+            );
+        }
+        assert!(mgr.check_feature(Feature::ParametricEq).await);
+        assert!(mgr.check_feature(Feature::DspEq).await);
+    }
+
+    #[tokio::test]
+    async fn essai_expire_retombe_au_gratuit_sans_perdre_le_gratuit() {
+        // Essai par la clé, échu.
+        let cle = gestionnaire();
+        cle.update_from_server(Tier::Premium, Some("2020-01-01T00:00:00Z".into()))
+            .await;
+        assert_eq!(cle.tier().await, Tier::Free);
+        // Essai par le compte, échu.
+        let compte = gestionnaire();
+        compte
+            .set_account_premium(true, Some("2020-01-01T00:00:00Z".into()))
+            .await;
+        assert_eq!(compte.tier().await, Tier::Free);
+        for mgr in [&cle, &compte] {
+            assert!(!mgr.check_feature(Feature::ParametricEq).await);
+            assert!(mgr.check_feature(Feature::DspEq).await);
+            assert_eq!(ouverts(mgr).await, vec!["dsp_eq", "crossfeed"]);
+        }
     }
 }

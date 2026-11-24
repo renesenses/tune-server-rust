@@ -114,3 +114,37 @@ fn la_photo_vient_du_cdn_d_apple_seulement() {
         assert!(!image_admise(mauvaise), "{mauvaise}");
     }
 }
+
+/// Le passe-droit des épreuves (une autre racine que celle d'iTunes, des
+/// pages lues hors de music.apple.com) ne doit pas exister en production :
+/// les champs de `Source` sont privés, et seul un constructeur réservé aux
+/// épreuves (`cfg(test)` ou `services-factices`) vise une autre racine. Garde
+/// de texte : une visibilité ne se constate pas à l'exécution d'une épreuve,
+/// qui compile justement avec `cfg(test)`.
+#[test]
+fn le_passe_droit_des_epreuves_n_existe_pas_en_production() {
+    let code = include_str!("mod.rs");
+    let debut = code.find("pub struct Source<'a> {").expect("struct Source");
+    let corps = &code[debut..debut + code[debut..].find('}').unwrap()];
+    assert!(!corps.contains("pub base"), "champ `base` public : {corps}");
+    assert!(
+        !corps.contains("pub limiter"),
+        "champ `limiter` public : {corps}"
+    );
+    let factice = code.find("pub fn factice(").expect("constructeur factice");
+    let avant = &code[..factice];
+    let attribut = avant.rfind("#[cfg(any(test, feature = \"services-factices\"))]");
+    assert!(
+        attribut.is_some_and(|a| !avant[a..].contains("\n\n")),
+        "le constructeur factice doit être sous cfg(test | services-factices)"
+    );
+    // Et l'autre racine n'est jamais rendue hors épreuves.
+    let racine = code.find("fn racine_factice(").expect("racine_factice");
+    assert!(
+        code[racine..]
+            .split("\n}")
+            .next()
+            .unwrap()
+            .contains("#[cfg(any(test, feature = \"services-factices\"))]")
+    );
+}
