@@ -404,6 +404,31 @@ async fn un_hote_de_la_liste_non_signe_est_accepte() {
     assert_eq!(amont.requetes.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn la_session_lan_9413_peut_lire_une_pochette_autorisee() {
+    let amont = amont().await;
+    let state = etat_du_banc();
+    enable_auth(&state);
+    let router = app(&state, RENDERER_LAN);
+    let url = chemin_relais(&format!("http://static.qobuz.com:{}/logo.png", amont.port));
+    let (statut, _) = appel(&router, &url, None).await;
+    assert_eq!(statut, StatusCode::BAD_REQUEST);
+    assert_eq!(amont.requetes.load(Ordering::SeqCst), 0);
+
+    let jeton = tune_server::auth::sign_jwt(1, "user", "test-jwt-secret").unwrap();
+    let requete = Request::get(&url)
+        .header(header::COOKIE, format!("tune_session={jeton}"))
+        .body(Body::empty())
+        .unwrap();
+    let reponse = router.oneshot(requete).await.unwrap();
+    assert_eq!(reponse.status(), StatusCode::OK);
+    let image = axum::body::to_bytes(reponse.into_body(), 1024 * 1024)
+        .await
+        .unwrap();
+    assert_eq!(image.as_ref(), POCHETTE);
+    assert_eq!(amont.requetes.load(Ordering::SeqCst), 1);
+}
+
 /// Le réglage `artwork_proxy_hosts` étend la liste — pour une radio dont le
 /// logo vit chez un diffuseur que la liste bâtie ne connaît pas.
 #[tokio::test]
