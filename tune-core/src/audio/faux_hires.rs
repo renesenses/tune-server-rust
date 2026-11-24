@@ -511,7 +511,7 @@ fn lisser(db: &[f64], demi: usize) -> Vec<f64> {
 /// La falaise la plus HAUTE du spectre : la fréquence où le niveau, mesuré
 /// juste en dessous, dépasse d'au moins [`FALAISE_DB`] TOUT ce qui suit
 /// jusqu'à Nyquist. `None` sans falaise (pente naturelle, bande pleine), ou
-/// quand la falaise ou son bord tombe sous [`COUPURE_FALAISE_MIN_HZ`] (#9472).
+/// sans falaise à partir de [`COUPURE_FALAISE_MIN_HZ`] (#9472).
 fn falaise(db_lisse: &[f64], sample_rate: u32) -> Option<f64> {
     let n = db_lisse.len();
     let hz_par_raie = sample_rate as f64 / TAILLE_FFT as f64;
@@ -571,10 +571,18 @@ fn falaise(db_lisse: &[f64], sample_rate: u32) -> Option<f64> {
         }
         k += 1;
     }
-    // #9472 — un bord redescendu sous la borne (pente du grave d'un master
-    // calme sous une falaise haute) n'est pas une coupure de bande non plus.
+    // #9472 — un bord redescendu sous la borne n'est pas le bord de CETTE
+    // falaise : c'est le grave d'un master sombre (une bande passante forte
+    // qui s'arrête tôt, un aigu faible au-dessus) qui a tiré la référence. La
+    // falaise `i`, elle, est réelle et au-dessus de la borne : c'est elle qui
+    // est rendue. Rendre `None` effacerait une VRAIE coupure haute (un MP3
+    // d'un master sombre passerait « vérifié »).
     let f = k as f64 * hz_par_raie;
-    (f >= COUPURE_FALAISE_MIN_HZ).then_some(f)
+    Some(if f >= COUPURE_FALAISE_MIN_HZ {
+        f
+    } else {
+        i as f64 * hz_par_raie
+    })
 }
 
 /// #9067 — la coupure à `bord_hz` d'un spectre lissé est-elle un MUR ? Le

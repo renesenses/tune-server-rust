@@ -62,6 +62,18 @@ fn grave_et_calme(sample_rate: u32, secondes: f64, tapis_db: f64, graine: u64) -
 /// Un bruit ROSE de 20 Hz à `bande_hz`, rien au-dessus (une vraie coupure),
 /// normalisé à -6 dBFS de crête.
 fn rose_coupe(sample_rate: u32, bande_hz: f64, graine: u64) -> Vec<f32> {
+    par_spectre(sample_rate, graine, |f| {
+        if (20.0..bande_hz).contains(&f) {
+            1.0 / f.sqrt()
+        } else {
+            0.0
+        }
+    })
+}
+
+/// Un bruit d'amplitude `amplitude(f)`, phases aléatoires, normalisé à
+/// -6 dBFS de crête.
+fn par_spectre(sample_rate: u32, graine: u64, amplitude: impl Fn(f64) -> f64) -> Vec<f32> {
     let n = 1usize << 17;
     let inverse = RealFftPlanner::<f32>::new().plan_fft_inverse(n);
     let mut spectre = inverse.make_input_vec();
@@ -70,12 +82,8 @@ fn rose_coupe(sample_rate: u32, bande_hz: f64, graine: u64) -> Vec<f32> {
     for (k, c) in spectre.iter_mut().enumerate() {
         let f = k as f64 * hz_par_raie;
         let phase = (alea.suivant() * std::f64::consts::PI) as f32;
-        *c = if (20.0..bande_hz).contains(&f) {
-            let a = (1.0 / f.sqrt()) as f32;
-            Complex::new(a * phase.cos(), a * phase.sin())
-        } else {
-            Complex::new(0.0, 0.0)
-        };
+        let a = amplitude(f) as f32;
+        *c = Complex::new(a * phase.cos(), a * phase.sin());
     }
     let dernier = spectre.len() - 1;
     spectre[dernier].im = 0.0;
@@ -143,4 +151,53 @@ fn une_falaise_sous_la_borne_n_est_pas_une_coupure_9472() {
     let m = mesurer(&pcm, 1, 96_000, 24);
     assert!(m.fenetres_coupees.is_empty(), "{m:?}");
     assert_eq!(juger(&m), Verdict::Verifie, "{m:?}");
+}
+
+/// 🔴 TÉMOIN #9472 (relecture de #9474) — un MP3 à bas débit d'un master
+/// SOMBRE, en 24/96 : bande passante forte jusqu'à 8,5 kHz, aigu 40 dB plus
+/// bas au-dessus, la VRAIE coupure de l'encodeur à 12 kHz, puis le bruit de
+/// fond de la chaîne (50 dB sous l'aigu) jusqu'à Nyquist. La bande forte,
+/// majoritaire sous la falaise, tire la référence du bord : la remontée du
+/// bord s'arrête vers 8,5 kHz, sous la borne. La falaise à 12 kHz, elle, est
+/// réelle et doit rester vue : rendre `None` à cause du bord (e0f7e1999)
+/// faisait passer ce fichier « vérifié ». Paramètres trouvés par une sonde :
+/// avec une coupure à 14 kHz ou plus haut, la bande forte n'est plus
+/// majoritaire et le bord reste au-dessus de la borne.
+#[test]
+fn un_master_sombre_coupe_haut_reste_douteux_9472() {
+    let aigu = 10f64.powf(-40.0 / 20.0);
+    let fond = aigu / 12_000f64.sqrt() * 10f64.powf(-50.0 / 20.0);
+    let pcm = quantifier(
+        &par_spectre(96_000, 9474, |f| {
+            if f < 20.0 {
+                0.0
+            } else if f < 8_500.0 {
+                1.0 / f.sqrt()
+            } else if f < 12_000.0 {
+                aigu / f.sqrt()
+            } else {
+                fond
+            }
+        }),
+        24,
+    );
+    let m = mesurer(&pcm, 1, 96_000, 24);
+    assert!(
+        !m.fenetres_coupees.is_empty(),
+        "la coupure à 12 kHz doit être vue — {m:?}"
+    );
+    let f = m
+        .coupure_hz
+        .unwrap_or_else(|| panic!("coupure attendue : {m:?}"));
+    assert!(
+        (COUPURE_FALAISE_MIN_HZ..20_000.0).contains(&f),
+        "coupure {f:.0} Hz : {m:?}"
+    );
+    assert!(
+        matches!(
+            juger(&m),
+            Verdict::Douteux(Raison::CoupureSpectrale { .. } | Raison::SignatureDeCodec { .. })
+        ),
+        "{m:?}"
+    );
 }
