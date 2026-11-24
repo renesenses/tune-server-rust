@@ -1249,3 +1249,44 @@ async fn convolution_cochee_sans_fichier_acceptee_et_inactive_rc14() {
         Some("/x.wav")
     );
 }
+
+/// rc14 (relecture) — une zone a déjà `ir_path_{zone}` ; un client envoie la
+/// convolution cochée SANS fichier : la clé est effacée (comme décochée),
+/// sinon le DSP convoluerait encore `/a.wav` pendant que la réponse dit
+/// `no_filter_selected`.
+#[tokio::test]
+async fn convolution_cochee_sans_fichier_efface_l_ancien_ir_rc14() {
+    let cle_ir = |b: &Banc| format!("ir_path_{}", b.zone);
+    for reglages in [Value::Null, json!({}), json!({"ir_path": "  "})] {
+        let b = Banc::nouveau(true).await;
+        let (s, v) = b
+            .put(json!({"version": 1, "plugins": [
+                {"id": "convolution", "enabled": true, "settings": {"ir_path": "/a.wav"}}
+            ]}))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(
+            b.settings().get(&cle_ir(&b)).unwrap().as_deref(),
+            Some("/a.wav")
+        );
+        let (s, v) = b
+            .put(json!({"version": 1, "plugins": [
+                {"id": "convolution", "enabled": true, "settings": reglages}
+            ]}))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{reglages} → {v}");
+        let e = v["signal_path"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["plugin_id"] == json!("convolution"))
+            .unwrap()
+            .clone();
+        assert_eq!(e["effective"], json!(false), "{e}");
+        assert_eq!(e["reason"], json!("no_filter_selected"), "{e}");
+        assert!(
+            b.settings().get(&cle_ir(&b)).unwrap().is_none(),
+            "{reglages} : ir_path_{{zone}} encore posé"
+        );
+    }
+}

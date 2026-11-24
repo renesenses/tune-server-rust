@@ -1524,9 +1524,10 @@ fn projeter_convolution(
         Some(m) if m.enabled => match m.settings.get("ir_path").and_then(Value::as_str) {
             Some(p) if !p.trim().is_empty() => Some(p.to_owned()),
             // Cochée sans fichier choisi (ajoutée depuis « + Ajouter ») :
-            // acceptée, inactive à la résolution (`no_filter_selected`), et
-            // rien n'est posé ni effacé dans les anciennes clés.
-            _ => return Ok(Ecriture::Rien),
+            // acceptée, inactive à la résolution (`no_filter_selected`). Comme
+            // décochée : un `ir_path_{zone}` déjà posé est effacé, sinon le
+            // DSP convoluerait encore un fichier que l'écran dit absent.
+            _ => None,
         },
         // Décochée ou retirée : la convolution n'a pas d'état « décoché »
         // dans les anciennes clés ; le chemin reste dans la chaîne.

@@ -457,7 +457,7 @@ impl JeuDeZone {
             .get(&format!("ir_path_{zone_id}"))
             .ok()
             .flatten()
-            .filter(|p| !p.is_empty())?;
+            .filter(|p| !p.trim().is_empty())?;
         Some(Self::avec_principal(settings, zone_id, principal))
     }
 
