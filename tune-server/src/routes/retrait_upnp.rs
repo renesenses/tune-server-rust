@@ -324,10 +324,16 @@ pub struct NotreAdresse {
     /// `est_ce_serveur` ne reconnaît pas comme nous : un autre Tune du réseau
     /// y figure sous son UDN.
     pub autres: Vec<(String, u16)>,
+    /// La source retirée est-elle CE Tune (`source_vise_ce_serveur`) ? Seul
+    /// ce cas autorise à suivre les étiquettes quand l'hôte d'une URL de
+    /// Tune n'est pas reconnu.
+    pub source_est_ce_tune: bool,
 }
 
 impl NotreAdresse {
-    pub fn de(state: &AppState) -> Self {
+    /// `source_est_ce_tune` : calculé UNE fois par l'appelant, par
+    /// `synchronisation_upnp::source_vise_ce_serveur`.
+    pub fn de(state: &AppState, source_est_ce_tune: bool) -> Self {
         let autres =
             tune_core::db::media_server_repo::MediaServerRepo::with_backend(state.backend.clone())
                 .lister()
@@ -350,6 +356,7 @@ impl NotreAdresse {
             adresses: crate::discovery_setup::nos_adresses(state.config.advertised_ip.as_deref()),
             port: state.config.port,
             autres,
+            source_est_ce_tune,
         }
     }
 
@@ -372,6 +379,37 @@ impl NotreAdresse {
         Self::hote_et_port(url)
             .is_some_and(|(hote, port)| self.autres.iter().any(|(h, p)| h == hote && *p == port))
     }
+}
+
+/// Fil du forum 3028 — les pistes `upnp` de `udn` ont-elles été servies par
+/// CE Tune ? C'est le dernier recours quand l'UDN a disparu du registre
+/// (ancien UDN, base du registre purgée) : leur URL de lecture vise notre
+/// hôte, notre port et notre route `/library/tracks/<id>/audio`. Quelques
+/// lignes suffisent ; une requête, bornée.
+pub fn pistes_servies_par_ce_tune(state: &AppState, udn: &str) -> bool {
+    let nous = NotreAdresse {
+        adresses: crate::discovery_setup::nos_adresses(state.config.advertised_ip.as_deref()),
+        port: state.config.port,
+        autres: Vec::new(),
+        source_est_ce_tune: false,
+    };
+    let p = prefixe(udn);
+    let pp: [&dyn ToSqlValue; 1] = [&p];
+    let urls = state.backend.query_many(
+        &format!(
+            "SELECT m.value FROM track_metadata m WHERE m.key = 'upnp_res_url' \
+             AND CAST(m.track_id AS TEXT) IN (SELECT CAST(t.id AS TEXT) FROM tracks t WHERE {}) \
+             LIMIT 20",
+            borne("t", &p)
+        ),
+        &pp,
+    );
+    urls.unwrap_or_default().iter().any(|r| {
+        r.first()
+            .and_then(|v| v.as_str())
+            .and_then(|u| reqwest::Url::parse(u.trim()).ok())
+            .is_some_and(|u| id_d_une_url_de_tune(&u).is_some() && nous.designe_ce_serveur(&u))
+    })
 }
 
 /// L'identifiant de piste que porte une URL de lecture d'un Tune
@@ -445,8 +483,9 @@ fn concorde(d: &Signature, l: &Signature) -> bool {
 ///   - qui vise un AUTRE serveur connu du registre (un autre Tune, sous son
 ///     UDN) : aucune, même si une piste locale a les mêmes étiquettes ;
 ///   - dont l'hôte n'est pas reconnu (IP DHCP changée, port redirigé, nom
-///     d'hôte au lieu de l'IP), le plus souvent nous-mêmes : l'identifiant
-///     de l'URL est ignoré, et la règle des étiquettes ci-dessous s'applique.
+///     d'hôte au lieu de l'IP) : SEULEMENT si la source retirée est CE Tune,
+///     l'identifiant de l'URL est ignoré et la règle des étiquettes
+///     ci-dessous s'applique ; pour toute autre source, aucune.
 /// - Sinon, une seule piste locale concordante. Deux ou plus : aucune.
 fn equivalent(
     d: &Signature,
@@ -457,17 +496,35 @@ fn equivalent(
     if !complete(d) {
         return None;
     }
-    let url = url.and_then(|u| reqwest::Url::parse(u.trim()).ok());
-    if let Some(url) = url.as_ref()
-        && let Some(nomme) = id_d_une_url_de_tune(url)
-    {
-        if nous.designe_ce_serveur(url) {
+    let brute = url.map(str::trim);
+    let url = brute.and_then(|u| reqwest::Url::parse(u).ok());
+    let nomme = url.as_ref().and_then(id_d_une_url_de_tune);
+    // Une URL de Tune que l'on ne sait pas relire (sans hôte ni port, chemin
+    // seul) reste une URL de Tune.
+    let url_de_tune = nomme.is_some()
+        || brute.is_some_and(|u| {
+            u.contains(&format!(
+                "{}/library/tracks/",
+                tune_core::upnp_server::API_PATH
+            ))
+        });
+    if url_de_tune {
+        if let (Some(url), Some(nomme)) = (url.as_ref(), nomme)
+            && nous.designe_ce_serveur(url)
+        {
             return locales
                 .iter()
                 .find(|l| l.id == nomme && concorde(d, l))
                 .map(|l| l.id);
         }
-        if nous.designe_un_autre_serveur(url) {
+        // Pour toute AUTRE source, une URL de Tune qui ne nous vise pas nomme
+        // une autre bibliothèque, quoi qu'il en soit de son hôte (IP changée
+        // par DHCP, nom d'hôte, ni hôte ni port) : aucune.
+        if !nous.source_est_ce_tune
+            || url
+                .as_ref()
+                .is_some_and(|u| nous.designe_un_autre_serveur(u))
+        {
             return None;
         }
     }

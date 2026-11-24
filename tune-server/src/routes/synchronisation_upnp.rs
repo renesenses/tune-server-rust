@@ -327,7 +327,10 @@ pub async fn act(State(state): State<AppState>, Json(request): Json<Action>) -> 
         //
         // Les deux temps passent hors de l'exécuteur (#4924).
         "remove" => {
-            let nous = super::retrait_upnp::NotreAdresse::de(&state);
+            let nous = super::retrait_upnp::NotreAdresse::de(
+                &state,
+                source_vise_ce_serveur(&state, &source.udn).await,
+            );
             let en_revue = source.status == "removal"
                 && request.generation.as_deref() == Some(source.generation.as_str());
             if !en_revue {
@@ -702,7 +705,12 @@ pub(crate) async fn source_vise_ce_serveur(state: &AppState, udn: &str) -> bool 
             s.port.and_then(|p| u16::try_from(p).ok()).unwrap_or(0),
             &s.location,
         ),
-        None => crate::discovery_setup::est_ce_serveur(state, udn, "", 0, ""),
+        // L'UDN a disparu du registre (ancien UDN) : l'UDN seul, puis les URL
+        // de lecture des pistes déjà indexées sous lui.
+        None => {
+            crate::discovery_setup::est_ce_serveur(state, udn, "", 0, "")
+                || super::retrait_upnp::pistes_servies_par_ce_tune(state, udn)
+        }
     }
 }
 

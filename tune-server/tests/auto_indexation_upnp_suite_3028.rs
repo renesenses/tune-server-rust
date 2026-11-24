@@ -385,8 +385,32 @@ fn banc(
     url: Option<String>,
     homonyme: bool,
 ) -> Banc {
+    banc_de(
+        None,
+        distante_titre,
+        distante_artiste,
+        distante_album,
+        distante_duree,
+        url,
+        homonyme,
+    )
+}
+
+/// Le même banc, la piste distante venant de `source_udn` (notre UDN si
+/// `None`).
+fn banc_de(
+    source_udn: Option<&str>,
+    distante_titre: &str,
+    distante_artiste: Option<&str>,
+    distante_album: Option<&str>,
+    distante_duree: i64,
+    url: Option<String>,
+    homonyme: bool,
+) -> Banc {
     let etat = AppState::new(":memory:", 0, Default::default()).expect("état isolé");
-    let udn = etat.upnp.as_ref().expect("état UPnP").uuid.clone();
+    let udn = source_udn
+        .map(str::to_string)
+        .unwrap_or_else(|| etat.upnp.as_ref().expect("état UPnP").uuid.clone());
     exec(
         &etat,
         "INSERT INTO artists (id, name) VALUES (1, 'Oasis'), (2, 'Inconnu')",
@@ -787,4 +811,88 @@ async fn notre_serveur_annonce_en_ipv6_est_reconnu() {
     .await;
     assert_eq!(statut, StatusCode::OK, "{corps}");
     assert_eq!(corps["code"], json!("this_server"), "{corps}");
+}
+
+const AUTRE_TUNE: &str = "uuid:00000000-aaaa-bbbb-cccc-0000000000b9";
+const ANCIEN_UDN: &str = "uuid:5e1f0000-0000-4000-8000-0000000a1d00";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn autre_tune_a_l_hote_perime_aucun_rattachement() {
+    // La source est un AUTRE Tune ; son URL porte un hôte périmé (IP changée
+    // par DHCP) qu'aucun serveur du registre ne porte, et une piste locale
+    // a exactement les mêmes étiquettes. Ce n'est pas nous : aucune.
+    let b = banc_de(
+        Some(AUTRE_TUNE),
+        "Wonderwall",
+        Some("Oasis"),
+        Some("Morning Glory"),
+        258000,
+        Some("http://192.0.2.99:8888/api/v1/library/tracks/100/audio".into()),
+        false,
+    );
+    aucun_rattachement(b, "autre Tune, hôte périmé").await;
+}
+
+async fn supprimer_par_serveur(b: &Banc, udn: &str) -> (StatusCode, Value) {
+    appeler(
+        &b.app,
+        "DELETE",
+        &format!("/api/v1/network/media-servers/{udn}/bibliotheque?pistes=1"),
+        None,
+    )
+    .await
+}
+
+fn favori_200(b: &Banc) -> i64 {
+    entier(
+        &b.etat,
+        "SELECT COUNT(*) FROM favorites WHERE CAST(item_id AS TEXT) = '200'",
+        &[],
+    )
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ancien_udn_au_registre_a_notre_adresse_rend_409() {
+    let b = banc_de(
+        Some(ANCIEN_UDN),
+        "Wonderwall",
+        Some("Oasis"),
+        Some("Morning Glory"),
+        258000,
+        None,
+        false,
+    );
+    let port = b.etat.config.port;
+    observer(
+        &b.etat,
+        ANCIEN_UDN,
+        "127.0.0.1",
+        port,
+        &tune_core::upnp_server::advert_location("127.0.0.1", port),
+    );
+    let (statut, corps) = supprimer_par_serveur(&b, ANCIEN_UDN).await;
+    assert_eq!(statut, StatusCode::CONFLICT, "{corps}");
+    assert_eq!(favori_200(&b), 1, "le favori reste");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn ancien_udn_disparu_du_registre_reconnu_par_ses_url_rend_409() {
+    // L'ancien UDN n'est plus au registre ; ses pistes ont été servies par
+    // NOTRE route de lecture : c'est nous, le retrait par serveur est refusé.
+    let port = AppState::new(":memory:", 0, Default::default())
+        .unwrap()
+        .config
+        .port;
+    let b = banc_de(
+        Some(ANCIEN_UDN),
+        "Wonderwall",
+        Some("Oasis"),
+        Some("Morning Glory"),
+        258000,
+        Some(notre_url(port, 100)),
+        false,
+    );
+    let (statut, corps) = supprimer_par_serveur(&b, ANCIEN_UDN).await;
+    assert_eq!(statut, StatusCode::CONFLICT, "{corps}");
+    assert_eq!(favori_200(&b), 1, "le favori reste");
 }
