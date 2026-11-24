@@ -374,6 +374,46 @@ fn erreur_d_ecriture(e: impl std::fmt::Display) -> axum::response::Response {
         .into_response()
 }
 
+/// Retour arrière d'un import qui échoue après la mise en place : les
+/// nouveaux fichiers sont retirés, les fichiers mis de côté remis. Une remise
+/// qui échoue est SIGNALÉE (journal et réponse) et sa copie de côté n'est pas
+/// effacée : elle reste dans `ir/` pour une reprise à la main.
+fn remettre_en_place(
+    zone_id: i64,
+    en_place: &[std::path::PathBuf],
+    de_cote: &[(std::path::PathBuf, std::path::PathBuf)],
+    poses: &[(std::path::PathBuf, std::path::PathBuf)],
+    cause: impl std::fmt::Display,
+) -> axum::response::Response {
+    for f in en_place {
+        std::fs::remove_file(f).ok();
+    }
+    let mut non_remis = Vec::new();
+    for (cote, final_) in de_cote {
+        if let Err(e) = std::fs::rename(cote, final_) {
+            tracing::error!(
+                zone_id,
+                copie = %cote.display(),
+                fichier = %final_.display(),
+                error = %e,
+                "convolver_import_remise_en_place_echouee"
+            );
+            non_remis.push(cote.display().to_string());
+        }
+    }
+    for (p, _) in poses {
+        // Une copie de côté qui n'a pas pu être remise n'est jamais effacée.
+        if !de_cote.iter().any(|(c, _)| c == p) {
+            std::fs::remove_file(p).ok();
+        }
+    }
+    let mut corps = json!({"error": format!("write IR: {cause}")});
+    if !non_remis.is_empty() {
+        corps["restore_incomplete"] = json!(non_remis);
+    }
+    (StatusCode::INTERNAL_SERVER_ERROR, Json(corps)).into_response()
+}
+
 /// L'import entier, BLOQUANT (décompression, décodage, fichiers, réglages),
 /// sous le verrou global d'import et celui de la zone.
 ///
@@ -410,6 +450,21 @@ fn importer_bloquant(
     {
         anciens.push(p);
     }
+    // Les réglages d'avant, pour les rétablir si l'écriture échoue.
+    let reglages_avant: Vec<(String, Option<String>)> = [
+        format!("ir_path_{zone_id}"),
+        format!(
+            "{}{zone_id}",
+            tune_core::audio::convolver::par_cadence::CLE_JEU
+        ),
+        format!("{CLE_NOM_DU_JEU}{zone_id}"),
+    ]
+    .into_iter()
+    .map(|c| {
+        let v = settings.get(&c).ok().flatten();
+        (c, v)
+    })
+    .collect();
     // (1) Provisoires.
     let mut poses: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
     let nettoyer = |poses: &[(std::path::PathBuf, std::path::PathBuf)]| {
@@ -455,14 +510,7 @@ fn importer_bloquant(
         en_place.push(final_.clone());
     }
     if let Some(e) = echec {
-        for f in &en_place {
-            std::fs::remove_file(f).ok();
-        }
-        for (cote, final_) in &de_cote {
-            std::fs::rename(cote, final_).ok();
-        }
-        nettoyer(&poses);
-        return Err(erreur_d_ecriture(e));
+        return Err(remettre_en_place(zone_id, &en_place, &de_cote, &poses, e));
     }
     let chemins: Vec<String> = poses
         .iter()
@@ -475,18 +523,55 @@ fn importer_bloquant(
         .filter(|(i, _)| *i != principal)
         .map(|(_, c)| c.clone())
         .collect();
-    // (3) Réglages.
-    settings
+    // (3) Réglages : un échec fait échouer l'import et remet l'ancien jeu.
+    let cle_jeu = format!(
+        "{}{zone_id}",
+        tune_core::audio::convolver::par_cadence::CLE_JEU
+    );
+    let ecrits = settings
         .set(&format!("ir_path_{zone_id}"), &chemin_principal)
-        .ok();
-    ecrire_supplementaires(settings, zone_id, &supplementaires);
-    match &nom {
-        Some(n) => {
-            settings.set(&format!("{CLE_NOM_DU_JEU}{zone_id}"), n).ok();
+        .map_err(|e| e.to_string())
+        .and_then(|_| {
+            if supplementaires.is_empty() {
+                settings
+                    .delete(&cle_jeu)
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            } else {
+                settings
+                    .set(
+                        &cle_jeu,
+                        &serde_json::to_string(&supplementaires).unwrap_or_default(),
+                    )
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }
+        })
+        .and_then(|_| match &nom {
+            Some(n) => settings
+                .set(&format!("{CLE_NOM_DU_JEU}{zone_id}"), n)
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+            None => settings
+                .delete(&format!("{CLE_NOM_DU_JEU}{zone_id}"))
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+        });
+    if let Err(e) = ecrits {
+        // Les réglages d'avant sont rétablis autant que possible.
+        for (cle, valeur) in &reglages_avant {
+            match valeur {
+                Some(v) => settings.set(cle, v).ok(),
+                None => settings.delete(cle).ok(),
+            };
         }
-        None => {
-            settings.delete(&format!("{CLE_NOM_DU_JEU}{zone_id}")).ok();
-        }
+        return Err(remettre_en_place(
+            zone_id,
+            &en_place,
+            &de_cote,
+            &poses,
+            format!("settings: {e}"),
+        ));
     }
     // (4) L'ancien jeu qui ne sert plus, et les copies de côté.
     for (cote, _) in &de_cote {
