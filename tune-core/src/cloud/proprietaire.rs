@@ -479,11 +479,7 @@ mod tests {
     /// autre compte. Sans transfert, ce compte n'écrit jamais les modules.
     #[test]
     fn apres_deliaison_cette_machine_fait_suivre_la_propriete() {
-        assert!(le_proprietaire_suit(
-            Some(1),
-            2,
-            relieur(None, true, false)
-        ));
+        assert!(le_proprietaire_suit(Some(1), 2, relieur(None, true, false)));
     }
 
     /// Le propriétaire authentifié change lui-même de compte.

@@ -278,7 +278,11 @@ async fn le_reseau_local_ne_prend_jamais_la_propriete() {
 
     relier(&b.state, LAN, HOTE_LAN, None, "b").await;
     assert_eq!(courriel_relie(&b.state), "b@exemple.test");
-    assert_eq!(proprietaire(&s), Some(profil_a), "le réseau local a pris la propriété");
+    assert_eq!(
+        proprietaire(&s),
+        Some(profil_a),
+        "le réseau local a pris la propriété"
+    );
     assert!(!b.state.license.has_module(MODULE).await);
 }
 
@@ -303,7 +307,10 @@ async fn authentification_active_seul_le_proprietaire_fait_suivre() {
         .backend
         .execute(
             "UPDATE profiles SET email = ? WHERE id = ?",
-            &[&"a@exemple.test" as &dyn ToSqlValue, &admin as &dyn ToSqlValue],
+            &[
+                &"a@exemple.test" as &dyn ToSqlValue,
+                &admin as &dyn ToSqlValue,
+            ],
         )
         .unwrap();
     relier(&b.state, ICI, HOTE_ICI, Some(&jeton_admin), "a").await;
@@ -320,6 +327,9 @@ async fn authentification_active_seul_le_proprietaire_fait_suivre() {
 
     // Le propriétaire authentifié relie B à son tour : la propriété suit.
     relier(&b.state, LAN, HOTE_LAN, Some(&jeton_admin), "b").await;
-    assert_eq!(proprietaire(&s), Some(profil_de(&b.state, "b@exemple.test")));
+    assert_eq!(
+        proprietaire(&s),
+        Some(profil_de(&b.state, "b@exemple.test"))
+    );
     assert!(b.state.license.has_module(MODULE).await);
 }
