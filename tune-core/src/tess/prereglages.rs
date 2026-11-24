@@ -169,6 +169,14 @@ pub fn lire_texte(texte: &str) -> Result<PreReglages, String> {
     Ok(l)
 }
 
+/// Lit une liste avec la tolérance de [`lire`] : toutes les entrées, sans
+/// règle d'entrée. Sert à l'import (un export rendu par ce serveur doit se
+/// réimporter tel quel, même s'il porte une entrée ancienne que les règles
+/// d'aujourd'hui refuseraient). Seul un JSON illisible est une erreur.
+pub fn lire_texte_tolerant(texte: &str) -> Result<PreReglages, String> {
+    serde_json::from_str(texte).map_err(|e| e.to_string())
+}
+
 /// La liste enregistrée sur ce serveur. Absente : la liste par défaut.
 /// Illisible (JSON) : une erreur (jamais une liste vide qui écraserait
 /// l'ancienne). Lisible : TOUTES les entrées sont rendues, même celles que

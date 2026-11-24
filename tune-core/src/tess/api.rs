@@ -363,7 +363,11 @@ pub fn schema_json() -> Value {
                     "id": { "$ref": "#/$defs/id" },
                     "name": { "type": "string" },
                     "builtin": { "type": "boolean" },
-                    "chain": { "$ref": "#/$defs/chain" }
+                    "chain": { "$ref": "#/$defs/chain" },
+                    // Facultatif (T17) : seulement dans la réponse d'un
+                    // `POST /tess/presets` dont le marqueur « ACTIVE » n'a
+                    // pas pu être posé (`active_preset_not_stored`).
+                    "warnings": { "type": "array", "items": { "type": "string" } }
                 },
                 "additionalProperties": false
             },

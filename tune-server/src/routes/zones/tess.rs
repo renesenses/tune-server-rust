@@ -354,11 +354,18 @@ pub(super) async fn reponse_de_zone(
         pure: lecture.pure,
         volume,
     };
+    // « ACTIVE » seulement si le préréglage existe encore (un marqueur resté
+    // après une suppression ou un import ne s'affiche pas).
     let actif = settings
         .get(&cle_prereglage_actif(zone_id))
         .ok()
         .flatten()
-        .filter(|p| !p.is_empty());
+        .filter(|p| !p.is_empty())
+        .filter(|p| {
+            tune_core::tess::prereglages::lire(&settings)
+                .map(|l| l.get(p).is_some())
+                .unwrap_or(true)
+        });
     ReponseTessZone::depuis(zone_id, lecture.chaine, actif, catalogue, &ctx)
 }
 

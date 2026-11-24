@@ -476,6 +476,17 @@ pub async fn appliquer_prereglage(
     let catalogue = catalogue_du_serveur();
     let verrou = verrou_des_put(id);
     let _garde = verrou.lock().await;
+    // Le marqueur est effacé AVANT d'écrire la chaîne : si l'écriture du
+    // nouveau échoue ensuite, il n'en reste aucun (jamais un faux). S'il ne
+    // peut même pas être effacé, rien n'est modifié : refus propre.
+    if !effacer_le_marqueur(&settings, id) {
+        return erreur(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "storage_error",
+            "The active preset of the zone could not be cleared; nothing was changed. Try again.",
+            Some(&p.id),
+        );
+    }
     let cat = catalogue.clone();
     let s = settings_de(&state);
     let resultat =

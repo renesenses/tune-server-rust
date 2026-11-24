@@ -314,12 +314,11 @@ fn une_liste_de_prereglages_incoherente_n_ecrase_pas_celle_de_la_machine_t17() {
     let dst = base();
     let d = SettingsRepo::with_backend(dst.clone());
     crate::tess::prereglages::ecrire(&d, &liste_soiree()).unwrap();
-    let mut doublon = serde_json::to_value(liste_soiree()).unwrap();
-    let p = doublon["presets"][1].clone();
-    doublon["presets"].as_array_mut().unwrap().push(p);
+    // Une liste qui ne se relit pas du tout (`presets` n'est pas une liste).
+    let illisible = json!({"apply_mode": "immediately", "presets": "pas une liste"});
     let fichier = json!({
         "format": "tune-config", "format_version": 2,
-        "settings": { "tess_presets": doublon },
+        "settings": { "tess_presets": illisible },
         "zones": [],
     });
     let (_plan, bilan) = importer(&dst, &fichier);
@@ -338,4 +337,86 @@ fn une_liste_de_prereglages_incoherente_n_ecrase_pas_celle_de_la_machine_t17() {
     let (_plan, bilan) = importer(&dst, &fichier);
     assert_eq!(crate::tess::prereglages::lire(&d).unwrap(), seule);
     assert!(!bilan.avertissements.join(" | ").contains("TESS presets"));
+}
+
+#[test]
+fn un_export_se_reimporte_avec_toutes_ses_entrees_meme_anciennes_suite_t17() {
+    let (src, id) = depart();
+    let s = SettingsRepo::with_backend(src.clone());
+    // En base : une entrée en Cf (U+200B) et une au nom trop long, que les
+    // règles d'entrée d'aujourd'hui refuseraient, plus un doublon.
+    let mut l = liste_soiree();
+    let mut cf = l.presets[1].clone();
+    cf.id = "cf".into();
+    cf.name = "Soi\u{200B}rée".into();
+    let mut long = l.presets[1].clone();
+    long.id = "long".into();
+    long.name = "x".repeat(crate::tess::prereglages::NOM_MAX + 1);
+    l.presets.push(cf);
+    l.presets.push(long);
+    l.presets.push(l.presets[1].clone());
+    s.set("tess_presets", &serde_json::to_string(&l).unwrap())
+        .unwrap();
+    s.set(&format!("zone_{id}_tess_active_preset"), "cf")
+        .unwrap();
+    let fichier = exporter(&src, false).unwrap();
+
+    let dst = base();
+    let (_plan, bilan) = importer(&dst, &fichier);
+    let d = SettingsRepo::with_backend(dst.clone());
+    // Toutes les entrées sont là, dans l'ordre, sans avertissement.
+    assert_eq!(crate::tess::prereglages::lire(&d).unwrap(), l);
+    let dit = bilan.avertissements.join(" | ");
+    assert!(!dit.contains("TESS"), "{dit}");
+    // Le marqueur suit la zone (son préréglage existe).
+    let arrivee = bilan.zones_creees[0];
+    assert_eq!(
+        d.get(&format!("zone_{arrivee}_tess_active_preset"))
+            .unwrap()
+            .as_deref(),
+        Some("cf")
+    );
+}
+
+#[test]
+fn un_marqueur_vers_un_prereglage_absent_est_ecarte_a_l_import_suite_t17() {
+    let (src, id) = depart();
+    let s = SettingsRepo::with_backend(src.clone());
+    crate::tess::prereglages::ecrire(&s, &liste_soiree()).unwrap();
+    s.set(&format!("zone_{id}_tess_active_preset"), "disparu")
+        .unwrap();
+    let fichier = exporter(&src, false).unwrap();
+    let dst = base();
+    let (_plan, bilan) = importer(&dst, &fichier);
+    let d = SettingsRepo::with_backend(dst.clone());
+    let arrivee = bilan.zones_creees[0];
+    assert_eq!(
+        d.get(&format!("zone_{arrivee}_tess_active_preset"))
+            .unwrap(),
+        None
+    );
+    let dit = bilan.avertissements.join(" | ");
+    assert!(
+        dit.contains("active TESS preset \"disparu\" does not exist"),
+        "{dit}"
+    );
+    // Contre-épreuve : vers un préréglage présent, il est gardé.
+    let (src, id) = depart();
+    let s = SettingsRepo::with_backend(src.clone());
+    crate::tess::prereglages::ecrire(&s, &liste_soiree()).unwrap();
+    s.set(
+        &format!("zone_{id}_tess_active_preset"),
+        "evening-listening",
+    )
+    .unwrap();
+    let dst = base();
+    let (_plan, bilan) = importer(&dst, &exporter(&src, false).unwrap());
+    let d = SettingsRepo::with_backend(dst.clone());
+    let arrivee = bilan.zones_creees[0];
+    assert_eq!(
+        d.get(&format!("zone_{arrivee}_tess_active_preset"))
+            .unwrap()
+            .as_deref(),
+        Some("evening-listening")
+    );
 }

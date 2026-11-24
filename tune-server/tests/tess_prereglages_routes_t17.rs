@@ -1031,3 +1031,23 @@ async fn attendre_que_la_liste_soit_tenue() {
     }
     panic!("la liste n'a jamais été tenue");
 }
+
+#[tokio::test]
+async fn un_marqueur_ni_ecrit_ni_efface_refuse_le_chargement_sans_rien_changer_suite_t17() {
+    let b = Banc::nouveau(true).await;
+    b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
+        .await;
+    b.enregistrer("Headphones").await;
+    b.put_chaine(json!({"version": 1, "plugins": [parametrique()]}))
+        .await;
+    b.enregistrer("Studio").await;
+    let avant = b.settings().get(&cle_chaine_zone(b.zone)).unwrap();
+    bloquer_le_marqueur(&b, MARQUEURS, true, true);
+    let (s, v) = b.appliquer("headphones").await;
+    assert_eq!(s, StatusCode::SERVICE_UNAVAILABLE, "{v}");
+    assert_eq!(v["error"], json!("storage_error"));
+    // Rien n'a bougé : la chaîne, et le marqueur qui la décrit toujours.
+    assert_eq!(b.settings().get(&cle_chaine_zone(b.zone)).unwrap(), avant);
+    assert_eq!(b.chaine().plugins[0].id, "equalizer-parametric");
+    assert_eq!(b.get_zone().await["active_preset"], json!("studio"));
+}

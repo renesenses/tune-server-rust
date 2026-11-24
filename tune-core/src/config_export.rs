@@ -151,6 +151,8 @@ pub const GABARIT_OMBRE_TESS: &str = "zone_{id}_tess_chain_sync";
 /// Le profil de pièce d'une zone : importé comme MESURÉ (TESS D1), zone
 /// remappée, comme la restauration Premium ([`crate::config_backup`]).
 pub const GABARIT_PROFIL_DE_PIECE: &str = "room_profile_{id}";
+/// TESS T17 : le préréglage « ACTIVE » d'une zone (id d'un préréglage global).
+pub const GABARIT_PREREGLAGE_ACTIF: &str = "zone_{id}_tess_active_preset";
 
 /// La chaîne exportée est celle que le serveur LIT pour la zone
 /// ([`crate::tess::migration::lire_zone`], neutre vis-à-vis du droit) : la
@@ -678,6 +680,18 @@ pub fn planifier(backend: &Arc<dyn DbBackend>, fichier: &Fichier) -> Result<Plan
         .collect();
     let mut avertissements = Vec::new();
 
+    // TESS T17 : les préréglages qui existeront après l'import (ceux du
+    // fichier s'il en porte une liste lisible, sinon ceux de la machine).
+    // Un marqueur « ACTIVE » de zone qui n'en désigne aucun est écarté.
+    let prereglages_apres: HashSet<String> = fichier
+        .settings
+        .iter()
+        .find(|(cle, _)| cle == crate::tess::prereglages::CLE_PREREGLAGES)
+        .and_then(|(_, v)| crate::tess::prereglages::lire_texte_tolerant(&texte_json(v)).ok())
+        .or_else(|| crate::tess::prereglages::lire(&settings).ok())
+        .map(|l| l.presets.into_iter().map(|p| p.id).collect())
+        .unwrap_or_default();
+
     // ── Zones ──
     let mut zones: Vec<ZonePlanifiee> = Vec::new();
     if !fichier.zones.is_empty() {
@@ -764,6 +778,17 @@ pub fn planifier(backend: &Arc<dyn DbBackend>, fichier: &Fichier) -> Result<Plan
             // pièce sont mis de côté, puis réécrits par le serveur à
             // l'application ; l'ombre ne s'importe jamais.
             let (chaine, piece) = extraire_tess(&mut donnees, &nom, &mut avertissements);
+            if let Some(r) = donnees.get_mut("settings").and_then(Value::as_object_mut)
+                && let Some(v) = r.get(GABARIT_PREREGLAGE_ACTIF)
+            {
+                let id = texte_json(v);
+                if !id.is_empty() && !prereglages_apres.contains(&id) {
+                    r.remove(GABARIT_PREREGLAGE_ACTIF);
+                    avertissements.push(format!(
+                        "zone '{nom}': active TESS preset {id:?} does not exist after import; skipped"
+                    ));
+                }
+            }
             let zone = &donnees;
             if let Some(id) = existante
                 && !cibles_vues.insert(id)
@@ -897,12 +922,14 @@ pub fn planifier(backend: &Arc<dyn DbBackend>, fichier: &Fichier) -> Result<Plan
         if fichier.format_version >= 2 && cle == "room_profile_index" {
             continue;
         }
-        // TESS T17 : la liste des préréglages part comme tout réglage global,
-        // mais une liste qui ne se relit pas (ou incohérente) n'écrase pas
+        // TESS T17 : la liste des préréglages part comme tout réglage global.
+        // Relue avec la MÊME tolérance que la base (aucune entrée écartée,
+        // même un nom que les règles d'entrée refuseraient aujourd'hui) ;
+        // seule une liste qui ne se relit pas du tout (JSON) n'écrase pas
         // celle de la machine. Les droits se vérifient au chargement : un
         // préréglage Premium importé n'ouvre rien.
         if cle == crate::tess::prereglages::CLE_PREREGLAGES
-            && let Err(e) = crate::tess::prereglages::lire_texte(&texte_json(brute))
+            && let Err(e) = crate::tess::prereglages::lire_texte_tolerant(&texte_json(brute))
         {
             avertissements.push(format!(
                 "TESS presets are not readable ({e}); the presets of this server are kept"
