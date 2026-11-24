@@ -5071,6 +5071,10 @@ pub fn write_metadata(path: &Path, update: &MetadataUpdate) -> Result<(), String
         );
     }
 
+    // #9340 — un fichier ou un volume en lecture seule est refusé avec un
+    // motif qui le dit, avant toute lecture.
+    tag_writer::verifier_inscriptible(path)?;
+
     let mut tagged = lofty::read_from_path(path).map_err(|e| format!("read: {e}"))?;
     let tag = tagged.primary_tag_mut().ok_or("no primary tag")?;
 

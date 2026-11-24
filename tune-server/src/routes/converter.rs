@@ -443,9 +443,7 @@ async fn start_job(
         Some(demande) => (resoudre_la_destination(&state, admin, demande).await?, true),
     };
 
-    tokio::fs::create_dir_all(&output_dir)
-        .await
-        .map_err(|e| AppError::internal(format!("failed to create output dir: {e}")))?;
+    preparer_le_dossier_de_sortie(&output_dir, destination_serveur).await?;
 
     // Le dossier EXISTE désormais : on revoit sa cible. La vérification a déjà
     // eu lieu AVANT la création (c'est là qu'elle compte — `create_dir_all`
@@ -547,6 +545,63 @@ async fn start_job(
         })),
     )
         .into_response())
+}
+
+/// #9340 — code stable du refus d'une destination où le serveur ne peut pas
+/// écrire (volume monté en lecture seule : disque NTFS sous macOS, partage en
+/// lecture seule ; ou droits refusés au service).
+pub(crate) const CODE_DESTINATION_LECTURE_SEULE: &str = "destination_lecture_seule";
+
+fn refus_destination_lecture_seule(
+    dossier: &std::path::Path,
+    e: &std::io::Error,
+) -> Option<AppError> {
+    let volume = e.kind() == std::io::ErrorKind::ReadOnlyFilesystem;
+    if !volume && e.kind() != std::io::ErrorKind::PermissionDenied {
+        return None;
+    }
+    let quoi = if volume {
+        "est sur un volume en lecture seule"
+    } else {
+        "est en lecture seule pour le serveur"
+    };
+    warn!(destination = %dossier.display(), error = %e, "convertisseur_destination_lecture_seule");
+    Some(AppError {
+        status: StatusCode::CONFLICT,
+        message: format!(
+            "La destination {} {quoi} : Tune ne peut pas y écrire ({e}).",
+            dossier.display()
+        ),
+        code: Some(CODE_DESTINATION_LECTURE_SEULE.into()),
+    })
+}
+
+/// #9340 — crée le dossier de sortie et, pour une destination sur le serveur,
+/// vérifie AVANT de lancer le travail qu'on peut y écrire : `create_dir_all`
+/// réussit sur un dossier qui existe déjà, même sur un volume en lecture
+/// seule, et chaque piste échouait ensuite une à une. Un refus « lecture
+/// seule » rend un 409 `destination_lecture_seule`, plus le 500 `internal_error`.
+async fn preparer_le_dossier_de_sortie(
+    dossier: &std::path::Path,
+    destination_serveur: bool,
+) -> Result<(), AppError> {
+    if let Err(e) = tokio::fs::create_dir_all(dossier).await {
+        return Err(refus_destination_lecture_seule(dossier, &e)
+            .unwrap_or_else(|| AppError::io("failed to create output dir", dossier, &e)));
+    }
+    if destination_serveur {
+        let sonde = dossier.join(format!(".tune-sonde-{}", uuid::Uuid::new_v4()));
+        match tokio::fs::write(&sonde, b"").await {
+            Ok(()) => {
+                let _ = tokio::fs::remove_file(&sonde).await;
+            }
+            Err(e) => {
+                return Err(refus_destination_lecture_seule(dossier, &e)
+                    .unwrap_or_else(|| AppError::io("output dir not writable", dossier, &e)));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Les deux gardes du mode « dossier de travail » (#2944), dans l'ordre, AVANT
@@ -2126,6 +2181,60 @@ fn build_zip(dir: &Path) -> Result<Vec<u8>, String> {
 
 #[cfg(test)]
 mod tests {
+    /// #9340 — une destination sur le serveur où l'on ne peut pas écrire est
+    /// refusée AVANT le travail, en 409 `destination_lecture_seule`, avec
+    /// « lecture seule » dans le message ; un dossier inscriptible passe.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn destination_en_lecture_seule_refusee_avant_le_travail_9340() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("converti");
+        std::fs::create_dir_all(&dest).unwrap();
+        // Contre-épreuve : inscriptible, rien ne change.
+        if let Err(e) = super::preparer_le_dossier_de_sortie(&dest, true).await {
+            panic!("un dossier inscriptible est accepté : {}", e.message);
+        }
+        assert_eq!(
+            std::fs::read_dir(&dest).unwrap().count(),
+            0,
+            "la sonde est retirée"
+        );
+
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::write(dest.join(".x"), b"").is_ok() {
+            // root : les droits ne s'appliquent pas, rien à prouver.
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let r = super::preparer_le_dossier_de_sortie(&dest, true).await;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let e = r.expect_err("🔴 #9340 — destination en lecture seule acceptée");
+        assert_eq!(e.status, StatusCode::CONFLICT);
+        assert_eq!(
+            e.code.as_deref(),
+            Some(super::CODE_DESTINATION_LECTURE_SEULE)
+        );
+        assert!(e.message.contains("lecture seule"), "{}", e.message);
+        assert!(
+            e.message.contains("converti"),
+            "le chemin est nommé : {}",
+            e.message
+        );
+
+        // Le refus d'un volume monté en lecture seule (EROFS) dit « volume ».
+        let erofs = std::io::Error::from(std::io::ErrorKind::ReadOnlyFilesystem);
+        let e = super::refus_destination_lecture_seule(&dest, &erofs).unwrap();
+        assert!(
+            e.message.contains("volume en lecture seule"),
+            "{}",
+            e.message
+        );
+        // Une autre erreur n'est pas un refus « lecture seule ».
+        let autre = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(super::refus_destination_lecture_seule(&dest, &autre).is_none());
+    }
+
     use super::*;
 
     #[test]
