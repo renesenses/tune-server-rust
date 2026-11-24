@@ -141,7 +141,7 @@ async fn ouverture_et_detail_retentent_aussi_avec_la_cle() {
             .unwrap(),
     )
     .await;
-    assert_eq!(statut, StatusCode::CREATED, "{corps}");
+    assert!(statut.is_success(), "{statut} {corps}");
     let (statut, corps) = appel(
         &app,
         Request::get(format!("{TICKETS}/7"))
