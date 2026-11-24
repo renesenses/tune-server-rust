@@ -49,6 +49,7 @@ class GardeCatalogue(unittest.TestCase):
             self.assertTrue(any("+ajout intermediaire" in t for t in textes.values()))
         self.assertEqual(garde.texte_du_fichier("repère".encode("utf-16")), "repère")
 
+    @patch.dict(os.environ, {"GITHUB_EVENT_PATH": ""})
     def test_fichiers_suivis_depuis_un_sous_dossier(self):
         cle = b"cle-de-test"
         profil = hmac.digest(cle,b"exemplealpha","sha256").hex()
