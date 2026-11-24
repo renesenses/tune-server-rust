@@ -876,15 +876,16 @@ async fn ancien_udn_au_registre_a_notre_adresse_rend_409() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn ancien_udn_disparu_du_registre_reconnu_par_ses_url_rend_409() {
-    // L'ancien UDN n'est plus au registre ; ses pistes ont été servies par
-    // NOTRE route de lecture : c'est nous, le retrait par serveur est refusé.
+async fn autre_udn_absent_du_registre_en_boucle_locale_ni_409_ni_desactivation() {
+    // Un AUTRE serveur, absent du registre, dont les pistes portent une URL
+    // `127.0.0.1:<notre port>` (un autre Tune qui publie sa boucle locale) :
+    // ce n'est pas une preuve que c'est nous. Ni 409, ni désactivation.
     let port = AppState::new(":memory:", 0, Default::default())
         .unwrap()
         .config
         .port;
     let b = banc_de(
-        Some(ANCIEN_UDN),
+        Some(AUTRE_TUNE),
         "Wonderwall",
         Some("Oasis"),
         Some("Morning Glory"),
@@ -892,7 +893,31 @@ async fn ancien_udn_disparu_du_registre_reconnu_par_ses_url_rend_409() {
         Some(notre_url(port, 100)),
         false,
     );
-    let (statut, corps) = supprimer_par_serveur(&b, ANCIEN_UDN).await;
-    assert_eq!(statut, StatusCode::CONFLICT, "{corps}");
-    assert_eq!(favori_200(&b), 1, "le favori reste");
+    // `run_one`, par « Synchroniser » : la source n'est pas refusée.
+    exec(
+        &b.etat,
+        "UPDATE upnp_library_sources SET state_json = REPLACE(state_json, '\"this_server\"', '\"ready\"')",
+        &[],
+    );
+    let (statut, corps) = appeler(
+        &b.app,
+        "POST",
+        "/api/v1/network/library-sources",
+        Some(json!({ "key": "soi", "action": "sync" })),
+    )
+    .await;
+    assert_eq!(statut, StatusCode::OK, "{corps}");
+    let mut vue = Value::Null;
+    for _ in 0..100 {
+        vue = source(&b.app, "soi").await;
+        if !matches!(vue["status"].as_str(), Some("pending") | Some("running")) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_ne!(vue["status"], json!("this_server"), "{vue}");
+    assert_eq!(vue["enabled"], json!(true), "pas de désactivation : {vue}");
+    // L'ancien retrait par serveur n'est pas refusé en 409.
+    let (statut, corps) = supprimer_par_serveur(&b, AUTRE_TUNE).await;
+    assert_ne!(statut, StatusCode::CONFLICT, "{corps}");
 }

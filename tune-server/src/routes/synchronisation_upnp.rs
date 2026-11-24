@@ -705,12 +705,9 @@ pub(crate) async fn source_vise_ce_serveur(state: &AppState, udn: &str) -> bool 
             s.port.and_then(|p| u16::try_from(p).ok()).unwrap_or(0),
             &s.location,
         ),
-        // L'UDN a disparu du registre (ancien UDN) : l'UDN seul, puis les URL
-        // de lecture des pistes déjà indexées sous lui.
-        None => {
-            crate::discovery_setup::est_ce_serveur(state, udn, "", 0, "")
-                || super::retrait_upnp::pistes_servies_par_ce_tune(state, udn)
-        }
+        // UDN absent du registre : l'UDN seul. Un ancien UDN de CE Tune qui a
+        // disparu du registre n'est donc pas reconnu (limite connue, rc15).
+        None => crate::discovery_setup::est_ce_serveur(state, udn, "", 0, ""),
     }
 }
 

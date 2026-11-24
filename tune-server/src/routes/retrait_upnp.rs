@@ -381,37 +381,6 @@ impl NotreAdresse {
     }
 }
 
-/// Fil du forum 3028 — les pistes `upnp` de `udn` ont-elles été servies par
-/// CE Tune ? C'est le dernier recours quand l'UDN a disparu du registre
-/// (ancien UDN, base du registre purgée) : leur URL de lecture vise notre
-/// hôte, notre port et notre route `/library/tracks/<id>/audio`. Quelques
-/// lignes suffisent ; une requête, bornée.
-pub fn pistes_servies_par_ce_tune(state: &AppState, udn: &str) -> bool {
-    let nous = NotreAdresse {
-        adresses: crate::discovery_setup::nos_adresses(state.config.advertised_ip.as_deref()),
-        port: state.config.port,
-        autres: Vec::new(),
-        source_est_ce_tune: false,
-    };
-    let p = prefixe(udn);
-    let pp: [&dyn ToSqlValue; 1] = [&p];
-    let urls = state.backend.query_many(
-        &format!(
-            "SELECT m.value FROM track_metadata m WHERE m.key = 'upnp_res_url' \
-             AND CAST(m.track_id AS TEXT) IN (SELECT CAST(t.id AS TEXT) FROM tracks t WHERE {}) \
-             LIMIT 20",
-            borne("t", &p)
-        ),
-        &pp,
-    );
-    urls.unwrap_or_default().iter().any(|r| {
-        r.first()
-            .and_then(|v| v.as_str())
-            .and_then(|u| reqwest::Url::parse(u.trim()).ok())
-            .is_some_and(|u| id_d_une_url_de_tune(&u).is_some() && nous.designe_ce_serveur(&u))
-    })
-}
-
 /// L'identifiant de piste que porte une URL de lecture d'un Tune
 /// (`…/api/v1/library/tracks/<id>/audio`), quel que soit l'hôte.
 fn id_d_une_url_de_tune(url: &reqwest::Url) -> Option<i64> {
