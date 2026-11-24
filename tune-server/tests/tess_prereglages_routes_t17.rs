@@ -20,7 +20,8 @@ use tune_core::tess::migration::lire_zone;
 use tune_core::tess::{ChaineTess, cle_chaine_zone};
 use tune_server::routes::zones::tess::verrou_des_put;
 use tune_server::routes::zones::tess_prereglages::{
-    appliquer_a_la_lecture, cles_en_attente, sortie_locale, verrou_de_la_liste,
+    appliquer_a_la_lecture, cles_en_attente, rafraichissements_demandes, sortie_locale,
+    verrou_de_la_liste,
 };
 
 struct Banc {
@@ -672,4 +673,113 @@ async fn un_put_identique_sur_un_compte_gratuit_garde_l_actif_suite_t17() {
     autre["plugins"][0]["enabled"] = json!(false);
     b.put_chaine(autre).await;
     assert_eq!(b.get_zone().await["active_preset"], Value::Null);
+}
+
+// ── Retouches de relecture (T17) ────────────────────────────────────
+
+#[tokio::test]
+async fn une_suppression_pendant_un_chargement_ne_laisse_pas_de_marqueur_orphelin_suite_t17() {
+    let b = Banc::nouveau(true).await;
+    b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
+        .await;
+    b.enregistrer("Headphones").await;
+    b.put_chaine(json!({"version": 1, "plugins": []})).await;
+    assert_eq!(b.get_zone().await["active_preset"], Value::Null);
+    // Un PUT tient la zone : le chargement attend après avoir lu la liste.
+    let verrou = verrou_des_put(b.zone);
+    let garde = verrou.lock().await;
+    let (app1, app2) = (b.app.clone(), b.app.clone());
+    let uri = format!("/api/v1/zones/{}/tess/presets/headphones/apply", b.zone);
+    let charger = tokio::spawn(async move {
+        app1.oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    let supprimer = tokio::spawn(async move {
+        app2.oneshot(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri("/api/v1/tess/presets/headphones")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    drop(garde);
+    assert_eq!(charger.await.unwrap(), StatusCode::OK);
+    assert_eq!(supprimer.await.unwrap(), StatusCode::NO_CONTENT);
+    // Le préréglage n'existe plus : aucune zone ne doit le marquer.
+    assert!(!ids(&b.liste().await).contains(&"headphones".to_owned()));
+    assert_eq!(b.get_zone().await["active_preset"], Value::Null);
+}
+
+#[tokio::test]
+async fn passer_en_immediat_rafraichit_aussi_une_zone_reseau_suite_t17() {
+    let b = Banc::avec_sortie(true, "dlna", "dlna:salon", 70).await;
+    mode(&b, "at_next_playback").await;
+    b.put_chaine(json!({"version": 1, "plugins": [crossfeed()]}))
+        .await;
+    assert!(!cles_en_attente(b.zone).is_empty());
+    // Contre-épreuve : au démarrage d'une lecture, une zone réseau n'est pas
+    // rafraîchie (le flux vient d'être fabriqué avec les clés).
+    let avant = rafraichissements_demandes(b.zone);
+    appliquer_a_la_lecture(&b.state, b.zone).await;
+    assert_eq!(rafraichissements_demandes(b.zone), avant);
+    // Le passage en immédiat, lui, rafraîchit la sortie réseau.
+    b.put_chaine(json!({"version": 1, "plugins": []})).await;
+    assert!(!cles_en_attente(b.zone).is_empty());
+    mode(&b, "immediately").await;
+    assert!(cles_en_attente(b.zone).is_empty());
+    assert_eq!(rafraichissements_demandes(b.zone), avant + 1);
+}
+
+#[tokio::test]
+async fn au_dela_de_deux_cents_l_enregistrement_est_refuse_suite_t17() {
+    let b = Banc::nouveau(true).await;
+    let mut l = tune_core::tess::PreReglages::default();
+    for i in 1..tune_core::tess::prereglages::PREREGLAGES_MAX {
+        l.presets.push(tune_core::tess::PreReglage {
+            id: format!("p{i}"),
+            name: format!("P{i}"),
+            builtin: false,
+            chain: ChaineTess::default(),
+        });
+    }
+    tune_core::tess::prereglages::ecrire(&b.settings(), &l).unwrap();
+    let (s, v) = b.enregistrer("Un de trop").await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["error"], json!("too_many_presets"));
+    // Contre-épreuve : une place libérée, l'enregistrement passe.
+    b.brut(Method::DELETE, "/api/v1/tess/presets/p1", None)
+        .await;
+    let (s, v) = b.enregistrer("Un de trop").await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+}
+
+#[tokio::test]
+async fn une_entree_stockee_trop_longue_ne_fait_pas_tomber_les_routes_suite_t17() {
+    let b = Banc::nouveau(true).await;
+    let corps = json!({"apply_mode": "immediately", "presets": [
+        {"id": "pure", "name": "Pure — no processing", "builtin": true,
+         "chain": {"version": 1, "bypass_all": true}},
+        {"id": "long", "name": "x".repeat(81), "chain": {"version": 1}},
+        {"id": "casque", "name": "Casque", "chain": {"version": 1}}
+    ]});
+    b.settings()
+        .set("tess_presets", &corps.to_string())
+        .unwrap();
+    assert_eq!(ids(&b.liste().await), vec!["pure", "casque"]);
+    let (s, _) = b.appliquer("casque").await;
+    assert_eq!(s, StatusCode::OK);
 }

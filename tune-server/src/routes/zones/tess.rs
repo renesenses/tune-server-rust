@@ -659,7 +659,11 @@ pub async fn put_zone_tess(
     };
     // T17 : la chaîne a changé à la main ; le préréglage chargé n'est plus
     // « ACTIVE » s'il ne la décrit plus.
-    super::tess_prereglages::oublier_le_prereglage_s_il_differe(&state, id, &lecture.chaine);
+    if let Err(r) =
+        super::tess_prereglages::oublier_le_prereglage_s_il_differe(&state, id, &lecture.chaine)
+    {
+        return r;
+    }
     let mode = super::tess_prereglages::appliquer_selon_le_mode(&state, &zone, cles.clone()).await;
     info!(zone_id = id, cles = ?cles, mode = ?mode, "tess_chaine_ecrite");
     Json(reponse_de_zone(&state, &zone, lecture, premium, catalogue).await).into_response()

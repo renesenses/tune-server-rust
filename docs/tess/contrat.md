@@ -382,9 +382,14 @@ ordre et tous leurs réglages.
   Chaîne vide et `bypass_all`. Il peut être supprimé, pas modifié.
 - **Charger un préréglage remplace la chaîne de la zone.** W4 propose
   d'enregistrer la chaîne courante avant.
-- **`verifier` refuse** : un id invalide ou en double, un nom vide, un nom de
-  plus de 80 caractères ou avec un caractère de contrôle (même règle que la
-  route, donc aussi à l'import), un Pure modifié.
+- **`verifier` refuse** : plus de 200 préréglages, un id invalide ou en
+  double, un nom vide, un nom de plus de 80 caractères ou avec un caractère
+  de contrôle ou de format invisible (catégorie Unicode Cf : U+200B,
+  U+200E/F, U+202A-202E, U+2066-2069, U+FEFF…), un Pure modifié. Même règle
+  que la route, donc aussi à l'import (liste refusée en entier).
+- **Lecture de la base** : une liste lisible mais incohérente (écrite par une
+  version plus lâche) n'est pas refusée en bloc : chaque entrée fautive est
+  écartée avec un avertissement, les routes continuent de servir le reste.
 - **Droits** : ils sont vérifiés au **chargement**. Un préréglage Premium reste
   enregistré sur un compte redevenu gratuit.
 
@@ -419,13 +424,19 @@ ordre et tous leurs réglages.
   `plugin_unavailable`…). Un refus garde la forme `refusal`.
 - Erreurs propres aux préréglages : `{ "error", "message", "preset_id" }`
   (`preset_not_found` en 404, `invalid_name`, `invalid_body`,
-  `invalid_apply_mode` en 400).
+  `invalid_apply_mode` en 400, `too_many_presets` en 409 au-delà de 200,
+  `storage_error` en 500 si le marqueur « ACTIVE » ne s'écrit pas).
+- **Marqueur « ACTIVE »** : posé sous le verrou des `PUT` de la zone ; au
+  chargement, le verrou de la liste est tenu jusqu'à sa pose (une suppression
+  concurrente ne laisse jamais de marqueur orphelin). Un échec d'écriture ou
+  d'effacement renvoie une erreur, jamais un succès.
 - **Préréglage actif et `PUT`** : un `PUT /zones/{id}/tess` dont la chaîne
   ENREGISTRÉE (lue sans les droits, donc jamais la vue convertie P2 d'un
   compte gratuit) ne correspond plus au préréglage actif (comparée sans les
   champs du serveur) efface `active_preset` ; renvoyée telle quelle, il reste.
 - Passer en `immediately` sert aussitôt ce qui attendait la prochaine lecture
-  et vide la file. Le démarrage de lecture lit la file sous le verrou des
+  et vide la file, sur TOUTES les sorties : une zone réseau qui joue voit le
+  changement arriver (relance du flux à la position, comme le `PUT`). Le démarrage de lecture lit la file sous le verrou des
   `PUT` de la zone ; « locale » se lit dans `output_type` (absent = locale).
 - **Mode d'application**, suivi par le `PUT` comme par le chargement :
   - `immediately` : la sortie vivante est rafraîchie tout de suite (à chaud en
