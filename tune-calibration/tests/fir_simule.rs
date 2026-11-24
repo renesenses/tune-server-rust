@@ -191,7 +191,9 @@ fn le_fir_mesure_tient_aussi_dans_la_piece_reverberante() {
     }
     // 0,88 dB mesuré : la queue diffuse ne tient pas la marge de 0,5 dB du
     // salon sec ; elle tient 1 dB, sous le critère du plan.
-    assert!(e < 1.0 && e < TOLERANCE_DB, "écart {e:.2} dB");
+    const MARGE_REVERBERANTE_DB: f64 = 1.0;
+    const { assert!(MARGE_REVERBERANTE_DB < TOLERANCE_DB) };
+    assert!(e < MARGE_REVERBERANTE_DB, "écart {e:.2} dB");
     assert!(e_sans > TOLERANCE_DB);
 }
 
