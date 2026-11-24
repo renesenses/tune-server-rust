@@ -102,15 +102,15 @@ fn la_meme_zone_navigateur_recoit_du_wav_chez_soi_et_du_flac_par_le_relais() {
     assert_eq!(format_servi(&orch, zone), "wav");
 }
 
-/// Une télécommande en 5G qui lit l'état de la zone (ou la commande) ne dit
-/// rien de l'endroit où joue son lecteur.
+/// Une télécommande en 5G qui lit l'état de la zone ou règle son volume ne
+/// dit rien de l'endroit où joue son lecteur. (Une commande relayée qui
+/// PRÉPARE une piste, elle, compte : `commande_relayee_qui_prepare`.)
 #[test]
 fn une_telecommande_relayee_ne_met_pas_la_zone_a_distance() {
     let orch = orchestrateur();
     let zone = zone_navigateur(&orch);
     for (m, c) in [
         ("GET", format!("/api/v1/zones/{zone}/status")),
-        ("POST", format!("/api/v1/zones/{zone}/play")),
         ("POST", format!("/api/v1/zones/{zone}/volume")),
         ("GET", format!("/api/v1/zones/{zone}/browser-playing")),
     ] {
@@ -179,6 +179,36 @@ fn une_zone_reseau_n_est_pas_concernee() {
         ),
         None
     );
+}
+
+#[test]
+fn commandes_relayees_qui_preparent_une_piste() {
+    use super::flux_a_distance_9174::commande_relayee_qui_prepare;
+    for suite in ["play", "next", "previous", "queue/jump", "browser-next"] {
+        assert_eq!(
+            commande_relayee_qui_prepare("POST", &format!("/api/v1/zones/7/{suite}"), true),
+            Some(7),
+            "{suite}"
+        );
+        assert_eq!(
+            commande_relayee_qui_prepare("POST", &format!("/7/{suite}"), true),
+            Some(7),
+            "{suite}, vu sous /zones"
+        );
+        // Locale : une télécommande du salon, rien.
+        assert_eq!(
+            commande_relayee_qui_prepare("POST", &format!("/api/v1/zones/7/{suite}"), false),
+            None
+        );
+    }
+    for (m, c) in [
+        ("GET", "/api/v1/zones/7/play"),
+        ("POST", "/api/v1/zones/7/volume"),
+        ("POST", "/api/v1/zones/7/browser-playing"),
+        ("POST", "/api/v1/zones/7/queue/add"),
+    ] {
+        assert_eq!(commande_relayee_qui_prepare(m, c, true), None, "{m} {c}");
+    }
 }
 
 #[test]

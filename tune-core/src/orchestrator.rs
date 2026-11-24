@@ -2150,6 +2150,10 @@ mod resolve_stream;
 pub mod flux_a_distance_9174;
 #[cfg(test)]
 mod flux_a_distance_9174_tests;
+/// #9174 — la première piste d'une zone tirée à distance part en FLAC ;
+/// index du remux et du ré-encodage sur une piste longue.
+#[cfg(test)]
+mod premiere_piste_a_distance_9174_tests;
 // #7148 — la sentinelle de streaming : résolution et décodage réels, sans son.
 pub mod sentinelle_streaming;
 // #6130 — quitter une radio sur une sortie DLNA : Stop, puis attendre le renderer.

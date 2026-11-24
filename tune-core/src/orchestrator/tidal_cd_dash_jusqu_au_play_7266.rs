@@ -270,7 +270,7 @@ pub(super) fn decouper(flac: &[u8]) -> PisteDash {
 // ── Faux TIDAL et faux CDN ────────────────────────────────────────────────
 
 #[derive(Default)]
-struct JournalTidal {
+pub(super) struct JournalTidal {
     manifeste: Option<Instant>,
     init: Option<Instant>,
     dernier_segment: Option<Instant>,
@@ -301,7 +301,7 @@ pub(super) fn mpd(base: &str, codec: &str, piste: &PisteDash) -> String {
 
 /// Le faux TIDAL et son CDN. `codec` est celui que le MPD annonce, et que
 /// `formats` reprend (`FLAC` ou `AACLC`).
-async fn faux_tidal(
+pub(super) async fn faux_tidal(
     piste: Arc<PisteDash>,
     codec: &'static str,
 ) -> (String, Arc<Mutex<JournalTidal>>) {
