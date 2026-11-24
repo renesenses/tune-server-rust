@@ -122,7 +122,12 @@ fn multipart(champs: &[(&str, &str)], nom: &str, octets: &[u8]) -> (String, Vec<
     (format!("multipart/form-data; boundary={limite}"), corps)
 }
 
-async fn poster_multipart(state: &AppState, chemin: &str, ct: String, corps: Vec<u8>) -> StatusCode {
+async fn poster_multipart(
+    state: &AppState,
+    chemin: &str,
+    ct: String,
+    corps: Vec<u8>,
+) -> StatusCode {
     let pair: SocketAddr = CETTE_MACHINE.parse().unwrap();
     tune_server::routes::router(state.clone())
         .layer(MockConnectInfo(pair))
@@ -282,7 +287,9 @@ async fn le_code_est_dans_le_fichier_journal_et_nulle_part_ailleurs() {
             let st = poster_multipart(&state, route, ct, corps).await;
             assert!(st.is_success(), "{route} {nom} : {st}");
             let recu = recu.lock().await;
-            let dernier = recu.last().unwrap_or_else(|| panic!("{route} {nom} : rien reçu"));
+            let dernier = recu
+                .last()
+                .unwrap_or_else(|| panic!("{route} {nom} : rien reçu"));
             assert!(
                 dernier.contains(&format!("filename=\"{nom}\"")),
                 "{route} : la pièce {nom} doit partir"
@@ -305,7 +312,11 @@ async fn le_code_est_dans_le_fichier_journal_et_nulle_part_ailleurs() {
         let (ct, corps) = multipart(champs, "illisible.log", &illisible);
         let st = poster_multipart(&state, route, ct, corps).await;
         assert_eq!(st, StatusCode::BAD_REQUEST, "{route} : pièce illisible");
-        assert_eq!(recu.lock().await.len(), avant, "{route} : rien ne doit partir");
+        assert_eq!(
+            recu.lock().await.len(),
+            avant,
+            "{route} : rien ne doit partir"
+        );
     }
 
     // 4. La porte commune de tout ce qui part vers le site (ticket, rapport,

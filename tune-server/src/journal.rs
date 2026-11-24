@@ -447,7 +447,12 @@ mod tests {
     fn un_journal_existant_perd_les_droits_des_autres_seulement() {
         use std::os::unix::fs::PermissionsExt;
         let d = dossier("journal-0640");
-        for (avant, apres) in [(0o644, 0o640), (0o666, 0o660), (0o640, 0o640), (0o600, 0o600)] {
+        for (avant, apres) in [
+            (0o644, 0o640),
+            (0o666, 0o660),
+            (0o640, 0o640),
+            (0o600, 0o600),
+        ] {
             let chemin = d.path().join(format!("tune-server-{avant:o}.log"));
             std::fs::write(&chemin, b"ancienne ligne\n").expect("fichier existant");
             std::fs::set_permissions(&chemin, std::fs::Permissions::from_mode(avant))

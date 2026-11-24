@@ -774,10 +774,22 @@ pub struct PieceIllisible;
 
 /// Le texte d'une pièce jointe : UTF-16 (marque d'ordre `FF FE` / `FE FF`, ou
 /// forte densité d'octets nuls — ce que PowerShell 5.1 écrit avec `>`), sinon
-/// UTF-8, les octets invalides remplacés. Un UTF-16 mal formé, ou un texte qui
-/// garde des caractères nuls entre ses lettres (UTF-32, binaire), est refusé.
+/// UTF-8, les octets invalides remplacés. Les octets nuls de FIN de fichier
+/// (journal tronqué par une coupure) ne comptent pas.
+///
+/// Refusé : un UTF-16 mal formé ; un texte qui garde des caractères nuls entre
+/// ses lettres (UTF-32, binaire) ; un fichier lu en UTF-16 dont les octets
+/// bruts portent la ligne du code alors que le texte décodé ne la porte plus
+/// (fichier mixte UTF-8 puis UTF-16).
 fn texte_de_la_piece(octets: &[u8]) -> Result<String, PieceIllisible> {
+    // Sans les nuls de fin, arrondi à un nombre pair d'octets (le dernier
+    // `X\0` d'un UTF-16LE).
+    let sans_nuls_de_fin = |corps: &[u8]| {
+        let utile = corps.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1);
+        corps.len().min(utile + utile % 2)
+    };
     let utf16 = |petit_boutiste: bool, corps: &[u8]| {
+        let corps = &corps[..sans_nuls_de_fin(corps)];
         if corps.len() % 2 != 0 {
             return Err(PieceIllisible);
         }
@@ -792,21 +804,29 @@ fn texte_de_la_piece(octets: &[u8]) -> Result<String, PieceIllisible> {
             .collect::<Result<String, _>>()
             .map_err(|_| PieceIllisible)
     };
-    let texte = match octets {
-        [0xFF, 0xFE, reste @ ..] => utf16(true, reste)?,
-        [0xFE, 0xFF, reste @ ..] => utf16(false, reste)?,
+    let (texte, lu_en_utf16) = match octets {
+        [0xFF, 0xFE, reste @ ..] => (utf16(true, reste)?, true),
+        [0xFE, 0xFF, reste @ ..] => (utf16(false, reste)?, true),
         _ => {
-            let nuls = octets.iter().filter(|b| **b == 0).count();
-            if octets.len() >= 2 && nuls * 4 >= octets.len() {
+            let utile = &octets[..sans_nuls_de_fin(octets)];
+            let nuls = utile.iter().filter(|b| **b == 0).count();
+            if utile.len() >= 2 && nuls * 4 >= utile.len() {
                 // Les octets nuls d'un texte latin en UTF-16LE sont aux
                 // positions impaires, en UTF-16BE aux positions paires.
-                let impairs = octets.iter().skip(1).step_by(2).filter(|b| **b == 0).count();
-                utf16(impairs * 2 >= nuls, octets)?
+                let impairs = utile.iter().skip(1).step_by(2).filter(|b| **b == 0).count();
+                (utf16(impairs * 2 >= nuls, utile)?, true)
             } else {
-                String::from_utf8_lossy(octets).into_owned()
+                let fin = octets.iter().rposition(|b| *b != 0).map_or(0, |i| i + 1);
+                (String::from_utf8_lossy(&octets[..fin]).into_owned(), false)
             }
         }
     };
+    if lu_en_utf16 && !porte_un_code_d_activation(&texte) {
+        let brut = String::from_utf8_lossy(octets).replace('\0', "");
+        if porte_un_code_d_activation(&brut) {
+            return Err(PieceIllisible);
+        }
+    }
     let nuls = texte.chars().filter(|c| *c == '\0').count();
     if nuls > 0 && nuls * 4 >= texte.chars().count() {
         return Err(PieceIllisible);
@@ -863,7 +883,11 @@ mod tests {
     fn utf16(texte: &str, petit_boutiste: bool, marque: bool) -> Vec<u8> {
         let mut octets = Vec::new();
         if marque {
-            octets.extend_from_slice(if petit_boutiste { &[0xFF, 0xFE] } else { &[0xFE, 0xFF] });
+            octets.extend_from_slice(if petit_boutiste {
+                &[0xFF, 0xFE]
+            } else {
+                &[0xFE, 0xFF]
+            });
         }
         for u in texte.encode_utf16() {
             octets.extend_from_slice(&if petit_boutiste {
@@ -879,11 +903,18 @@ mod tests {
     #[test]
     fn une_piece_utf16_est_lue_et_nettoyee() {
         for (le, marque) in [(true, true), (false, true), (true, false), (false, false)] {
-            let piece = piece_texte_nettoyee("journal.log", utf16(&journal_avec_code(), le, marque))
-                .unwrap_or_else(|e| panic!("le={le} marque={marque} : {e:?}"));
+            let piece =
+                piece_texte_nettoyee("journal.log", utf16(&journal_avec_code(), le, marque))
+                    .unwrap_or_else(|e| panic!("le={le} marque={marque} : {e:?}"));
             let texte = String::from_utf8(piece).unwrap();
-            assert!(!texte.contains("K7QXR2MZPA"), "le={le} marque={marque} : {texte}");
-            assert!(texte.contains("INFO avant") && texte.contains("INFO apres"), "{texte}");
+            assert!(
+                !texte.contains("K7QXR2MZPA"),
+                "le={le} marque={marque} : {texte}"
+            );
+            assert!(
+                texte.contains("INFO avant") && texte.contains("INFO apres"),
+                "{texte}"
+            );
         }
     }
 
@@ -893,9 +924,15 @@ mod tests {
         let mut mal_forme = vec![0xFF, 0xFE];
         mal_forme.extend_from_slice(&0xD800u16.to_le_bytes());
         mal_forme.extend_from_slice(&utf16("abc", true, false));
-        assert_eq!(piece_texte_nettoyee("a.txt", mal_forme), Err(PieceIllisible));
+        assert_eq!(
+            piece_texte_nettoyee("a.txt", mal_forme),
+            Err(PieceIllisible)
+        );
         // Longueur impaire après la marque.
-        assert_eq!(piece_texte_nettoyee("a.log", vec![0xFF, 0xFE, b'a']), Err(PieceIllisible));
+        assert_eq!(
+            piece_texte_nettoyee("a.log", vec![0xFF, 0xFE, b'a']),
+            Err(PieceIllisible)
+        );
         // UTF-32LE : des caractères nuls resteraient entre les lettres.
         let mut utf32 = vec![0xFF, 0xFE, 0x00, 0x00];
         for c in journal_avec_code().chars() {
@@ -903,7 +940,53 @@ mod tests {
         }
         assert_eq!(piece_texte_nettoyee("a.log", utf32), Err(PieceIllisible));
         // Une image ne se lit pas : elle part telle quelle.
-        assert_eq!(piece_texte_nettoyee("a.png", vec![0, 0, 0]), Ok(vec![0, 0, 0]));
+        assert_eq!(
+            piece_texte_nettoyee("a.png", vec![0, 0, 0]),
+            Ok(vec![0, 0, 0])
+        );
+    }
+
+    /// UTF-8 de longueur paire qui porte le code, puis un bloc UTF-16LE au
+    /// moins aussi long : lu en UTF-16, le code deviendrait illisible pour le
+    /// nettoyage. Refusé.
+    #[test]
+    fn un_fichier_mixte_utf8_puis_utf16_est_refuse() {
+        let mut debut = journal_avec_code().into_bytes();
+        if debut.len() % 2 != 0 {
+            debut.push(b' ');
+        }
+        let suite = "INFO suite en UTF-16 ".repeat(4);
+        let mut octets = debut.clone();
+        octets.extend_from_slice(&utf16(&suite, true, false));
+        assert!(octets.len() >= 2 * debut.len());
+        assert_eq!(
+            piece_texte_nettoyee("mixte.log", octets),
+            Err(PieceIllisible)
+        );
+    }
+
+    /// Un journal tronqué par une coupure de courant finit par des octets
+    /// nuls : il reste un texte à nettoyer, pas une pièce refusée.
+    #[test]
+    fn des_nuls_en_fin_de_fichier_ne_font_pas_refuser_la_piece() {
+        let mut utf8 = journal_avec_code().into_bytes();
+        utf8.extend(std::iter::repeat_n(0u8, 4096));
+        let mut utf16le = utf16(&journal_avec_code(), true, true);
+        utf16le.extend(std::iter::repeat_n(0u8, 4095));
+        let mut utf16le_sans_marque = utf16(&journal_avec_code(), true, false);
+        utf16le_sans_marque.extend(std::iter::repeat_n(0u8, 4096));
+        for (cas, octets) in [
+            ("utf8", utf8),
+            ("utf16le", utf16le),
+            ("utf16le sans marque", utf16le_sans_marque),
+        ] {
+            let piece = piece_texte_nettoyee("coupure.log", octets)
+                .unwrap_or_else(|e| panic!("{cas} : {e:?}"));
+            let texte = String::from_utf8(piece).unwrap();
+            assert!(!texte.contains("K7QXR2MZPA"), "{cas} : {texte}");
+            assert!(texte.contains("INFO apres"), "{cas} : {texte}");
+            assert!(!texte.contains('\0'), "{cas}");
+        }
     }
 
     #[test]
