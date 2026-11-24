@@ -2201,7 +2201,12 @@ impl PlaybackOrchestrator {
         // En navigateur, la sortie transcodée doit être du WAV : un FLAC
         // ré-encodé à la volée n'a pas de seektable et cale le <audio> sur les
         // Range (#1168) — même règle que le bras streaming.
-        let browser_needs_wav = browser_needs_wav || (is_browser_output && eq_forces_transcode);
+        // #9174 (fil 2970) — le rééchantillonnage d'une zone plafonnée est un
+        // transcodage comme un autre : en FLAC progressif, il partait sans
+        // `Content-Length` ni `Range`, et CoreMedia le refusait (-12939) dès
+        // que l'app plafonnait « Ce téléphone » à 48 kHz pour le relais.
+        let browser_needs_wav =
+            browser_needs_wav || (is_browser_output && (eq_forces_transcode || needs_downsample));
 
         // LAT-F1 (phase 1) : sur une zone RÉSEAU à traitement actif, la cible
         // par défaut est le FLAC ré-encodé — donc le fichier ENTIER décodé,
