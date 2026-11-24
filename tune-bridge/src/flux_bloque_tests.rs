@@ -30,8 +30,13 @@ const POUSSE: usize = 64 * 1024 * 1024;
 const MORCEAU: usize = 64 * 1024;
 
 async fn pont(plafond: usize) -> (std::net::SocketAddr, Arc<RelayState>) {
+    pont_regle(plafond, 5).await
+}
+
+async fn pont_regle(plafond: usize, flux_max: usize) -> (std::net::SocketAddr, Arc<RelayState>) {
     let mut state = RelayState::new();
     state.plafond_par_flux = plafond;
+    state.max_streams_per_server = flux_max;
     let state = Arc::new(state);
     let app = Router::new()
         .route(
@@ -223,5 +228,56 @@ async fn un_lecteur_qui_ne_lit_plus_ne_bloque_ni_l_api_ni_le_heartbeat() {
         state.servers.contains_key("srv"),
         "la session doit rester ouverte"
     );
+    assert_eq!(
+        state.budget_flux.pris(),
+        0,
+        "la memoire du flux coupe est rendue, alors que le lecteur tient encore sa reponse"
+    );
     lecteur.abort();
+}
+
+/// La memoire du pont est bornee aussi par le nombre de flux en vol :
+/// `max_streams_per_server` s'applique (il etait declare, jamais lu).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn au_dela_de_max_streams_per_server_le_flux_est_refuse() {
+    let (adresse, _state) = pont_regle(4 * 1024 * 1024, 1).await;
+    let (mut sink, mut source) = faux_serveur(adresse).await.split();
+    let (en_tete_tx, en_tete_rx) = tokio::sync::oneshot::channel::<u16>();
+    let premier = tokio::spawn(async move {
+        let r = reqwest::get(format!("http://{adresse}/stream/relay/srv/a?token={JETON}"))
+            .await
+            .unwrap();
+        let _ = en_tete_tx.send(r.status().as_u16());
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        drop(r);
+    });
+    let demande = message_du_pont(&mut source, "relay.stream_request").await;
+    let debut = serde_json::json!({
+        "type": "relay.stream_start",
+        "id": demande["id"],
+        "status": 200,
+        "headers": {"content-type": "audio/flac"},
+    });
+    sink.send(Message::Text(debut.to_string().into()))
+        .await
+        .unwrap();
+    // L'en-tete du premier est rendu : son puits existe.
+    assert_eq!(
+        tokio::time::timeout(PATIENCE, en_tete_rx)
+            .await
+            .unwrap()
+            .unwrap(),
+        200
+    );
+
+    // Le second est refuse tout de suite, sans rien demander au serveur.
+    let second = tokio::time::timeout(
+        PATIENCE,
+        reqwest::get(format!("http://{adresse}/stream/relay/srv/b?token={JETON}")),
+    )
+    .await
+    .expect("le second flux attend le serveur au lieu d'etre refuse")
+    .unwrap();
+    assert_eq!(second.status().as_u16(), 503);
+    premier.abort();
 }

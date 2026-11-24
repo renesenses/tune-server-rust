@@ -34,12 +34,18 @@ pub struct RelayState {
     /// Octets qu'un flux peut garder en attente sur le pont avant d'etre
     /// coupe (diagnostic CarPlay 5G du 24/11). Voir [`file_de_flux`].
     pub plafond_par_flux: usize,
+    /// Memoire commune a tous les flux en attente. Voir [`BudgetDesFlux`].
+    pub budget_flux: Arc<BudgetDesFlux>,
 }
 
-/// Plafond par defaut d'un flux en attente : 64 Mio, de quoi tenir une piste
-/// FLAC 16/44,1 entiere quand le lecteur cesse de lire (AVPlayer remplit son
-/// tampon puis se tait), alors que le serveur pousse a son debit montant.
-pub const PLAFOND_PAR_FLUX: usize = 64 * 1024 * 1024;
+/// Plafond par defaut d'un flux en attente : 32 Mio, l'essentiel d'une piste
+/// FLAC 16/44,1 quand le lecteur cesse de lire (AVPlayer remplit son tampon
+/// puis se tait), alors que le serveur pousse a son debit montant.
+pub const PLAFOND_PAR_FLUX: usize = 32 * 1024 * 1024;
+
+/// Budget commun par defaut de tous les flux en attente : 512 Mio
+/// (`TUNE_BRIDGE_BUDGET_FLUX_MIO`).
+pub const BUDGET_DES_FLUX: usize = 512 * 1024 * 1024;
 
 impl RelayState {
     pub fn new() -> Self {
@@ -54,6 +60,7 @@ impl RelayState {
             max_clients_per_server: 10,
             max_streams_per_server: 5,
             plafond_par_flux: PLAFOND_PAR_FLUX,
+            budget_flux: BudgetDesFlux::depuis_environnement(),
         }
     }
 
@@ -282,36 +289,117 @@ pub enum CorpsRelaye {
 /// session, les corps se fermaient avant leur `Content-Length`, et iOS
 /// affichait une « erreur TLS ».
 ///
-/// Desormais le depot ne s'attend jamais : il est compte en octets, et un flux
-/// qui depasse son plafond est coupe, LUI SEUL ([`RefusDeFlux::Plein`]). Le
-/// protocole n'a pas (encore) de pause par flux a demander au serveur.
-pub fn file_de_flux(plafond: usize) -> (EnvoiDeFlux, ReceptionDeFlux) {
-    let (tx, rx) = mpsc::unbounded_channel();
-    let partage = Arc::new(EtatDeFile::default());
+/// Desormais le depot ne s'attend jamais. Il est compte en octets, contre le
+/// plafond du flux ET contre le budget commun a tous les flux du pont
+/// ([`BudgetDesFlux`]). Un depot qui depasserait l'un ou l'autre coupe CE flux
+/// ([`RefusDeFlux::Plein`]) : sa file est videe sur-le-champ, ses octets
+/// rendus au budget, et son corps se termine par une ERREUR — jamais par une
+/// fin propre qu'un lecteur prendrait pour la fin de la piste. Le protocole
+/// n'a pas (encore) de pause par flux a demander au serveur, qui n'est pas
+/// prevenu de la coupure.
+pub fn file_de_flux(plafond: usize, budget: &Arc<BudgetDesFlux>) -> (EnvoiDeFlux, ReceptionDeFlux) {
+    let partage = Arc::new(FileDeFlux {
+        etat: std::sync::Mutex::new(EtatDeFile::default()),
+        reveil: tokio::sync::Notify::new(),
+        budget: budget.clone(),
+        plafond,
+    });
     (
         EnvoiDeFlux {
-            tx,
             partage: partage.clone(),
-            plafond,
         },
-        ReceptionDeFlux { rx, partage },
+        ReceptionDeFlux { partage },
     )
+}
+
+/// Le budget memoire commun a tous les flux en attente sur le pont.
+pub struct BudgetDesFlux {
+    limite: usize,
+    pris: std::sync::atomic::AtomicUsize,
+}
+
+impl BudgetDesFlux {
+    pub fn nouveau(limite: usize) -> Arc<Self> {
+        Arc::new(Self {
+            limite,
+            pris: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// `TUNE_BRIDGE_BUDGET_FLUX_MIO` (Mio), [`BUDGET_DES_FLUX`] sinon.
+    pub fn depuis_environnement() -> Arc<Self> {
+        let limite = std::env::var("TUNE_BRIDGE_BUDGET_FLUX_MIO")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&m| m > 0)
+            .map_or(BUDGET_DES_FLUX, |m| m * 1024 * 1024);
+        Self::nouveau(limite)
+    }
+
+    /// Octets pris par les flux en attente.
+    pub fn pris(&self) -> usize {
+        self.pris.load(Ordering::Acquire)
+    }
+
+    fn prendre(&self, n: usize) -> bool {
+        let mut pris = self.pris.load(Ordering::Acquire);
+        loop {
+            let Some(total) = pris.checked_add(n).filter(|&t| t <= self.limite) else {
+                return false;
+            };
+            match self
+                .pris
+                .compare_exchange_weak(pris, total, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return true,
+                Err(actuel) => pris = actuel,
+            }
+        }
+    }
+
+    fn rendre(&self, n: usize) {
+        self.pris.fetch_sub(n, Ordering::AcqRel);
+    }
+}
+
+struct FileDeFlux {
+    etat: std::sync::Mutex<EtatDeFile>,
+    /// Un seul lecteur attend : `notify_one` garde le reveil s'il arrive
+    /// avant l'attente.
+    reveil: tokio::sync::Notify,
+    budget: Arc<BudgetDesFlux>,
+    plafond: usize,
 }
 
 #[derive(Default)]
 struct EtatDeFile {
-    /// Octets deposes, pas encore rendus au corps HTTP.
-    en_attente: std::sync::atomic::AtomicUsize,
-    /// Flux coupe pour depassement : le corps se termine tout de suite et
-    /// libere ce qu'il retenait.
-    coupe: std::sync::atomic::AtomicBool,
+    morceaux: std::collections::VecDeque<Vec<u8>>,
+    /// Octets de `morceaux`, pris sur le budget.
+    octets: usize,
+    /// Coupe pour depassement : le corps se termine par une erreur.
+    coupe: bool,
+    /// Le pont a lache le flux (fin ou retrait du puits).
+    envoi_ferme: bool,
+    /// Le corps HTTP est tombe (lecteur parti).
+    reception_fermee: bool,
+}
+
+impl FileDeFlux {
+    fn etat(&self) -> std::sync::MutexGuard<'_, EtatDeFile> {
+        self.etat.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Vide la file et rend ses octets au budget.
+    fn vider(&self, etat: &mut EtatDeFile) {
+        etat.morceaux.clear();
+        self.budget.rendre(etat.octets);
+        etat.octets = 0;
+    }
 }
 
 /// Le cote du pont qui depose les morceaux : jamais d'attente.
 pub struct EnvoiDeFlux {
-    tx: mpsc::UnboundedSender<Vec<u8>>,
-    partage: Arc<EtatDeFile>,
-    plafond: usize,
+    partage: Arc<FileDeFlux>,
 }
 
 /// Pourquoi un morceau n'a pas ete depose.
@@ -319,50 +407,99 @@ pub struct EnvoiDeFlux {
 pub enum RefusDeFlux {
     /// Le lecteur est parti.
     Ferme,
-    /// Le lecteur ne lit plus : le flux est coupe.
+    /// Le lecteur ne lit plus (plafond du flux ou budget commun) : le flux
+    /// est coupe.
     Plein,
 }
 
+/// Le corps d'un flux coupe pour depassement.
+#[derive(Debug, PartialEq, Eq)]
+pub struct FluxCoupe;
+
+impl std::fmt::Display for FluxCoupe {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("flux coupe par le pont : le lecteur ne lisait plus")
+    }
+}
+
+impl std::error::Error for FluxCoupe {}
+
 impl EnvoiDeFlux {
     /// Depose un morceau sans attendre. Un morceau plus gros que le plafond
-    /// passe encore si la file est vide.
+    /// du flux passe encore si la file est vide (jamais au-dela du budget).
     pub fn deposer(&self, morceau: Vec<u8>) -> Result<(), RefusDeFlux> {
+        let f = &self.partage;
         let n = morceau.len();
-        let avant = self.partage.en_attente.fetch_add(n, Ordering::AcqRel);
-        if avant > 0 && avant + n > self.plafond {
-            self.partage.en_attente.fetch_sub(n, Ordering::AcqRel);
-            self.partage.coupe.store(true, Ordering::Release);
+        let mut etat = f.etat();
+        if etat.reception_fermee {
+            return Err(RefusDeFlux::Ferme);
+        }
+        if etat.coupe {
             return Err(RefusDeFlux::Plein);
         }
-        self.tx.send(morceau).map_err(|_| {
-            self.partage.en_attente.fetch_sub(n, Ordering::AcqRel);
-            RefusDeFlux::Ferme
-        })
+        let au_plafond = etat.octets > 0 && etat.octets + n > f.plafond;
+        if au_plafond || !f.budget.prendre(n) {
+            etat.coupe = true;
+            f.vider(&mut etat);
+            drop(etat);
+            f.reveil.notify_one();
+            return Err(RefusDeFlux::Plein);
+        }
+        etat.octets += n;
+        etat.morceaux.push_back(morceau);
+        drop(etat);
+        f.reveil.notify_one();
+        Ok(())
     }
 
     /// Octets en attente (journal, tests).
     pub fn en_attente(&self) -> usize {
-        self.partage.en_attente.load(Ordering::Acquire)
+        self.partage.etat().octets
+    }
+}
+
+impl Drop for EnvoiDeFlux {
+    fn drop(&mut self) {
+        self.partage.etat().envoi_ferme = true;
+        self.partage.reveil.notify_one();
     }
 }
 
 /// Le cote du corps HTTP.
 pub struct ReceptionDeFlux {
-    rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    partage: Arc<EtatDeFile>,
+    partage: Arc<FileDeFlux>,
 }
 
 impl ReceptionDeFlux {
-    /// Le morceau suivant ; `None` a la fin du flux, ou des qu'il est coupe.
-    pub async fn recv(&mut self) -> Option<Vec<u8>> {
-        if self.partage.coupe.load(Ordering::Acquire) {
-            return None;
+    /// Le morceau suivant ; `None` a la fin du flux, `Err` s'il a ete coupe.
+    pub async fn recv(&mut self) -> Option<Result<Vec<u8>, FluxCoupe>> {
+        let f = &self.partage;
+        loop {
+            {
+                let mut etat = f.etat();
+                if etat.coupe {
+                    return Some(Err(FluxCoupe));
+                }
+                if let Some(m) = etat.morceaux.pop_front() {
+                    etat.octets -= m.len();
+                    f.budget.rendre(m.len());
+                    return Some(Ok(m));
+                }
+                if etat.envoi_ferme {
+                    return None;
+                }
+            }
+            f.reveil.notified().await;
         }
-        let morceau = self.rx.recv().await?;
-        self.partage
-            .en_attente
-            .fetch_sub(morceau.len(), Ordering::AcqRel);
-        Some(morceau)
+    }
+}
+
+impl Drop for ReceptionDeFlux {
+    fn drop(&mut self) {
+        let f = &self.partage;
+        let mut etat = f.etat();
+        etat.reception_fermee = true;
+        f.vider(&mut etat);
     }
 }
 
@@ -397,6 +534,7 @@ mod tests {
             max_clients_per_server: 10,
             max_streams_per_server: 5,
             plafond_par_flux: PLAFOND_PAR_FLUX,
+            budget_flux: BudgetDesFlux::nouveau(BUDGET_DES_FLUX),
         }
     }
 

@@ -470,7 +470,7 @@ async fn ouvrir_flux(
         return;
     }
 
-    let (envoi, reception) = crate::state::file_de_flux(state.plafond_par_flux);
+    let (envoi, reception) = crate::state::file_de_flux(state.plafond_par_flux, &state.budget_flux);
     let fin_propre = Arc::new(std::sync::atomic::AtomicBool::new(false));
     flux.lock().await.insert(
         debut.id.clone(),
@@ -688,6 +688,11 @@ mod relais_de_flux_tests {
         tokio::time::timeout(PATIENCE, morceaux.recv())
             .await
             .expect("aucun morceau n'est arrive : le corps HTTP reste muet")
+            .map(|m| m.expect("flux coupe inattendu"))
+    }
+
+    fn budget(octets: usize) -> Arc<crate::state::BudgetDesFlux> {
+        crate::state::BudgetDesFlux::nouveau(octets)
     }
 
     fn debut(id: &str, status: u16, taille: Option<u64>) -> String {
@@ -849,9 +854,14 @@ mod relais_de_flux_tests {
             "l'autre flux reste ouvert"
         );
         assert_eq!(
-            morceau_attendu(&mut a).await,
-            None,
-            "le corps coupe se termine tout de suite et libere sa file"
+            state.budget_flux.pris(),
+            0,
+            "la file coupee est videe a la coupure, sans attendre que le corps soit lu"
+        );
+        assert_eq!(
+            tokio::time::timeout(PATIENCE, a.recv()).await.unwrap(),
+            Some(Err(crate::state::FluxCoupe)),
+            "le corps coupe se termine par une erreur, pas par une fin propre"
         );
 
         handle_server_message(&state, "srv", "BINARY:req-b:ZkxhQw==").await;
@@ -860,26 +870,80 @@ mod relais_de_flux_tests {
 
     #[test]
     fn la_file_dun_flux_compte_ses_octets() {
-        let (envoi, reception) = crate::state::file_de_flux(8);
+        let commun = budget(1024);
+        let (envoi, reception) = crate::state::file_de_flux(8, &commun);
         assert_eq!(
             envoi.deposer(vec![0; 20]),
             Ok(()),
             "file vide : un gros morceau passe"
         );
         assert_eq!(envoi.en_attente(), 20);
+        assert_eq!(commun.pris(), 20);
         assert_eq!(
             envoi.deposer(vec![0; 1]),
             Err(crate::state::RefusDeFlux::Plein)
         );
-        assert_eq!(envoi.en_attente(), 20);
+        assert_eq!(envoi.en_attente(), 0, "coupe : file videe");
+        assert_eq!(commun.pris(), 0, "coupe : octets rendus au budget");
         drop(reception);
-        let (envoi, reception) = crate::state::file_de_flux(8);
+
+        let (envoi, reception) = crate::state::file_de_flux(8, &commun);
+        envoi.deposer(vec![0; 4]).unwrap();
         drop(reception);
+        assert_eq!(commun.pris(), 0, "lecteur parti : octets rendus");
         assert_eq!(
             envoi.deposer(vec![0; 1]),
             Err(crate::state::RefusDeFlux::Ferme)
         );
-        assert_eq!(envoi.en_attente(), 0);
+        assert_eq!(commun.pris(), 0);
+    }
+
+    /// Le budget commun borne la memoire de TOUS les flux : celui qui le
+    /// depasserait est coupe, les autres gardent leur file.
+    #[test]
+    fn le_budget_commun_borne_tous_les_flux() {
+        let commun = budget(10);
+        let (a, _ra) = crate::state::file_de_flux(8, &commun);
+        let (b, mut rb) = crate::state::file_de_flux(8, &commun);
+        assert_eq!(a.deposer(vec![1; 6]), Ok(()));
+        assert_eq!(
+            b.deposer(vec![2; 6]),
+            Err(crate::state::RefusDeFlux::Plein),
+            "6 + 6 > 10 : le second flux est coupe"
+        );
+        assert_eq!(commun.pris(), 6);
+        assert_eq!(a.en_attente(), 6, "le premier flux garde sa file");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        assert_eq!(rt.block_on(rb.recv()), Some(Err(crate::state::FluxCoupe)));
+    }
+
+    /// Un corps HTTP de flux coupe se termine par une ERREUR : sans
+    /// `Content-Length`, une fin propre ferait prendre la piste tronquee pour
+    /// une fin naturelle.
+    #[tokio::test]
+    async fn le_corps_http_dun_flux_coupe_finit_en_erreur() {
+        let (envoi, reception) = crate::state::file_de_flux(4, &budget(1024));
+        envoi.deposer(b"fLaC".to_vec()).unwrap();
+        assert_eq!(
+            envoi.deposer(b"fLaC".to_vec()),
+            Err(crate::state::RefusDeFlux::Plein)
+        );
+        let reponse = crate::stream_proxy::reponse_relayee(PendingResponse {
+            status: 200,
+            headers: serde_json::Map::new(),
+            body: CorpsRelaye::Morceaux(
+                reception,
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ),
+        });
+        assert!(
+            axum::body::to_bytes(reponse.into_body(), usize::MAX)
+                .await
+                .is_err(),
+            "le corps coupe doit finir en erreur"
+        );
     }
 
     /// Une reponse d'API reste ce qu'elle etait : un corps entier.
@@ -913,7 +977,7 @@ mod relais_de_flux_tests {
     /// Le corps HTTP rend les morceaux dans l'ordre, et se termine avec eux.
     #[tokio::test]
     async fn le_corps_http_rend_les_morceaux_dans_lordre() {
-        let (envoi, reception) = crate::state::file_de_flux(1024);
+        let (envoi, reception) = crate::state::file_de_flux(1024, &budget(1024));
         envoi.deposer(b"fLaC".to_vec()).unwrap();
         envoi.deposer(vec![0, 0, 0, 0x22]).unwrap();
         drop(envoi);

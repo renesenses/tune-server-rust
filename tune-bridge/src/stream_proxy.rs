@@ -46,6 +46,17 @@ pub async fn proxy_stream(
         state.sessions.audio(s);
     }
 
+    // Memoire du pont bornee (diagnostic CarPlay 5G) : au plus
+    // `max_streams_per_server` flux en vol par serveur.
+    if conn.flux.lock().await.len() >= state.max_streams_per_server {
+        warn!(server_id = %server_id, "trop de flux en vol pour ce serveur");
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(header::RETRY_AFTER, HeaderValue::from_static("2"))],
+        )
+            .into_response();
+    }
+
     let request_id = uuid::Uuid::new_v4().to_string();
     let range = headers
         .get("range")
@@ -192,9 +203,10 @@ pub fn reponse_relayee_comptee(resp: PendingResponse, comptage: Option<Comptage>
         }
         (CorpsRelaye::Morceaux(reception, _), None) => {
             let morceaux = futures_util::stream::unfold(reception, |mut rx| async move {
+                // Flux coupe par le pont : une erreur, jamais une fin propre.
                 rx.recv()
                     .await
-                    .map(|morceau| (Ok::<Vec<u8>, std::io::Error>(morceau), rx))
+                    .map(|morceau| (morceau.map_err(std::io::Error::other), rx))
             });
             Body::from_stream(morceaux)
         }
@@ -212,9 +224,15 @@ pub fn reponse_relayee_comptee(resp: PendingResponse, comptage: Option<Comptage>
                 (reception, session),
                 |(mut rx, mut session)| async move {
                     match rx.recv().await {
-                        Some(morceau) => {
+                        Some(Ok(morceau)) => {
                             session.morceau_rendu(morceau.len());
                             Some((Ok::<Vec<u8>, std::io::Error>(morceau), (rx, session)))
+                        }
+                        // Flux coupe par le pont (diagnostic CarPlay 5G) : le
+                        // corps finit en ERREUR, pas en fin propre ; la
+                        // session lit `fin_propre` faux a sa chute.
+                        Some(Err(coupe)) => {
+                            Some((Err(std::io::Error::other(coupe)), (rx, session)))
                         }
                         None => {
                             // Le canal est ferme : la session se clot ici, et
