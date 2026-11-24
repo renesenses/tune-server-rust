@@ -374,21 +374,57 @@ fn erreur_d_ecriture(e: impl std::fmt::Display) -> axum::response::Response {
         .into_response()
 }
 
+/// Les réglages que lit et écrit l'import : le dépôt des réglages, ou un faux
+/// qui refuse l'écriture dans les témoins.
+trait ReglagesImport {
+    fn lire(&self, cle: &str) -> Result<Option<String>, String>;
+    fn ecrire(&self, cle: &str, valeur: &str) -> Result<(), String>;
+    fn effacer(&self, cle: &str) -> Result<(), String>;
+}
+
+impl ReglagesImport for SettingsRepo {
+    fn lire(&self, cle: &str) -> Result<Option<String>, String> {
+        self.get(cle)
+    }
+    fn ecrire(&self, cle: &str, valeur: &str) -> Result<(), String> {
+        self.set(cle, valeur)
+    }
+    fn effacer(&self, cle: &str) -> Result<(), String> {
+        self.delete(cle)
+    }
+}
+
+/// Le nom d'une COPIE DE CÔTÉ (un fichier en place, écarté le temps d'un
+/// import) : distinct des dépôts provisoires `depot_zone_*.tmp`, que le
+/// balayage du démarrage efface. Une copie qui n'a pas pu être remise reste
+/// dans `ir/`, intacte, pour une reprise à la main.
+fn chemin_de_cote(ir_dir: &std::path::Path, zone_id: i64) -> std::path::PathBuf {
+    let provisoire = chemin_provisoire(ir_dir, zone_id);
+    let nom = provisoire
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .replacen("depot_zone_", "cote_zone_", 1)
+        .replace(".tmp", ".bak");
+    ir_dir.join(nom)
+}
+
 /// Retour arrière d'un import qui échoue après la mise en place : les
-/// nouveaux fichiers sont retirés, les fichiers mis de côté remis. Une remise
-/// qui échoue est SIGNALÉE (journal et réponse) et sa copie de côté n'est pas
-/// effacée : elle reste dans `ir/` pour une reprise à la main.
+/// nouveaux fichiers sont retirés, les fichiers mis de côté remis, les
+/// provisoires effacés. Tout ce qui n'a pas pu être remis (fichier ou
+/// réglage) est SIGNALÉ (journal, et `restore_incomplete` dans la réponse) ;
+/// une copie de côté non remise n'est jamais effacée.
 fn remettre_en_place(
     zone_id: i64,
     en_place: &[std::path::PathBuf],
     de_cote: &[(std::path::PathBuf, std::path::PathBuf)],
     poses: &[(std::path::PathBuf, std::path::PathBuf)],
+    mut non_remis: Vec<String>,
     cause: impl std::fmt::Display,
 ) -> axum::response::Response {
     for f in en_place {
         std::fs::remove_file(f).ok();
     }
-    let mut non_remis = Vec::new();
     for (cote, final_) in de_cote {
         if let Err(e) = std::fs::rename(cote, final_) {
             tracing::error!(
@@ -402,10 +438,7 @@ fn remettre_en_place(
         }
     }
     for (p, _) in poses {
-        // Une copie de côté qui n'a pas pu être remise n'est jamais effacée.
-        if !de_cote.iter().any(|(c, _)| c == p) {
-            std::fs::remove_file(p).ok();
-        }
+        std::fs::remove_file(p).ok();
     }
     let mut corps = json!({"error": format!("write IR: {cause}")});
     if !non_remis.is_empty() {
@@ -417,18 +450,21 @@ fn remettre_en_place(
 /// L'import entier, BLOQUANT (décompression, décodage, fichiers, réglages),
 /// sous le verrou global d'import et celui de la zone.
 ///
-/// Ordre : (1) nouveaux fichiers écrits en provisoire ; (2) les fichiers en
-/// place de même nom mis de côté, puis les nouveaux renommés à leur place —
-/// au moindre échec, tout est remis comme avant ; (3) les RÉGLAGES écrits ;
-/// (4) seulement alors, l'ancien jeu qui ne sert plus et les copies de côté
-/// retirés. Un arrêt brutal ne laisse que des `depot_zone_*.tmp`, balayés au
-/// démarrage.
+/// Ordre : (0) les réglages d'avant lus (une lecture qui ÉCHOUE arrête tout
+/// avant le moindre fichier) ; (1) nouveaux fichiers écrits en provisoire ;
+/// (2) les fichiers en place de même nom mis de côté (`cote_zone_*.bak`),
+/// puis les nouveaux renommés à leur place — au moindre échec, tout est
+/// remis comme avant ; (3) les RÉGLAGES écrits — au moindre échec, les
+/// réglages d'avant et les fichiers sont remis ; (4) seulement alors,
+/// l'ancien jeu qui ne sert plus et les copies de côté retirés. Un arrêt
+/// brutal ne laisse que des `depot_zone_*.tmp`, balayés au démarrage, et
+/// d'éventuelles copies de côté, jamais balayées.
 fn importer_bloquant(
     corps: &[u8],
     nom: Option<String>,
     ir_dir: &std::path::Path,
     zone_id: i64,
-    settings: &SettingsRepo,
+    settings: &dyn ReglagesImport,
 ) -> Result<JeuPose, axum::response::Response> {
     use tune_core::audio::import_ri;
     let nom_lu = nom.clone().unwrap_or_else(|| "filtre.wav".into());
@@ -439,39 +475,36 @@ fn importer_bloquant(
     let principal = jeu
         .indice_principal()
         .ok_or_else(|| refus_d_import("no_filter", "no impulse response in the upload"))?;
-    std::fs::create_dir_all(ir_dir).ok();
-    let mut anciens =
-        tune_core::audio::convolver::JeuDeZone::lire_supplementaires(settings, zone_id);
-    if let Some(p) = settings
-        .get(&format!("ir_path_{zone_id}"))
-        .ok()
-        .flatten()
-        .filter(|p| !p.is_empty())
-    {
+    let cle_principal = format!("ir_path_{zone_id}");
+    let cle_jeu = format!(
+        "{}{zone_id}",
+        tune_core::audio::convolver::par_cadence::CLE_JEU
+    );
+    let cle_nom = format!("{CLE_NOM_DU_JEU}{zone_id}");
+    // (0) Les réglages d'avant. Une lecture qui échoue n'est pas une clé
+    // absente : rien n'est touché.
+    let mut reglages_avant: Vec<(String, Option<String>)> = Vec::new();
+    for cle in [&cle_principal, &cle_jeu, &cle_nom] {
+        let valeur = settings.lire(cle).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("settings read: {e}")})),
+            )
+                .into_response()
+        })?;
+        reglages_avant.push((cle.clone(), valeur));
+    }
+    let mut anciens: Vec<String> = reglages_avant[1]
+        .1
+        .as_deref()
+        .and_then(|v| serde_json::from_str::<Vec<String>>(v).ok())
+        .unwrap_or_default();
+    if let Some(p) = reglages_avant[0].1.clone().filter(|p| !p.is_empty()) {
         anciens.push(p);
     }
-    // Les réglages d'avant, pour les rétablir si l'écriture échoue.
-    let reglages_avant: Vec<(String, Option<String>)> = [
-        format!("ir_path_{zone_id}"),
-        format!(
-            "{}{zone_id}",
-            tune_core::audio::convolver::par_cadence::CLE_JEU
-        ),
-        format!("{CLE_NOM_DU_JEU}{zone_id}"),
-    ]
-    .into_iter()
-    .map(|c| {
-        let v = settings.get(&c).ok().flatten();
-        (c, v)
-    })
-    .collect();
+    std::fs::create_dir_all(ir_dir).ok();
     // (1) Provisoires.
     let mut poses: Vec<(std::path::PathBuf, std::path::PathBuf)> = Vec::new();
-    let nettoyer = |poses: &[(std::path::PathBuf, std::path::PathBuf)]| {
-        for (p, _) in poses {
-            std::fs::remove_file(p).ok();
-        }
-    };
     for (i, r) in jeu.reponses.iter().enumerate() {
         let provisoire = chemin_provisoire(ir_dir, zone_id);
         let final_ = if i == principal {
@@ -485,7 +518,9 @@ fn importer_bloquant(
             r.sample_rate,
         ) {
             std::fs::remove_file(&provisoire).ok();
-            nettoyer(&poses);
+            for (p, _) in &poses {
+                std::fs::remove_file(p).ok();
+            }
             return Err(erreur_d_ecriture(e));
         }
         poses.push((provisoire, final_));
@@ -496,7 +531,7 @@ fn importer_bloquant(
     let mut echec = None;
     for (provisoire, final_) in &poses {
         if final_.exists() {
-            let cote = chemin_provisoire(ir_dir, zone_id);
+            let cote = chemin_de_cote(ir_dir, zone_id);
             if let Err(e) = std::fs::rename(final_, &cote) {
                 echec = Some(e);
                 break;
@@ -510,7 +545,14 @@ fn importer_bloquant(
         en_place.push(final_.clone());
     }
     if let Some(e) = echec {
-        return Err(remettre_en_place(zone_id, &en_place, &de_cote, &poses, e));
+        return Err(remettre_en_place(
+            zone_id,
+            &en_place,
+            &de_cote,
+            &poses,
+            Vec::new(),
+            e,
+        ));
     }
     let chemins: Vec<String> = poses
         .iter()
@@ -524,52 +566,40 @@ fn importer_bloquant(
         .map(|(_, c)| c.clone())
         .collect();
     // (3) Réglages : un échec fait échouer l'import et remet l'ancien jeu.
-    let cle_jeu = format!(
-        "{}{zone_id}",
-        tune_core::audio::convolver::par_cadence::CLE_JEU
-    );
     let ecrits = settings
-        .set(&format!("ir_path_{zone_id}"), &chemin_principal)
-        .map_err(|e| e.to_string())
+        .ecrire(&cle_principal, &chemin_principal)
         .and_then(|_| {
             if supplementaires.is_empty() {
-                settings
-                    .delete(&cle_jeu)
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
+                settings.effacer(&cle_jeu)
             } else {
-                settings
-                    .set(
-                        &cle_jeu,
-                        &serde_json::to_string(&supplementaires).unwrap_or_default(),
-                    )
-                    .map(|_| ())
-                    .map_err(|e| e.to_string())
+                settings.ecrire(
+                    &cle_jeu,
+                    &serde_json::to_string(&supplementaires).unwrap_or_default(),
+                )
             }
         })
         .and_then(|_| match &nom {
-            Some(n) => settings
-                .set(&format!("{CLE_NOM_DU_JEU}{zone_id}"), n)
-                .map(|_| ())
-                .map_err(|e| e.to_string()),
-            None => settings
-                .delete(&format!("{CLE_NOM_DU_JEU}{zone_id}"))
-                .map(|_| ())
-                .map_err(|e| e.to_string()),
+            Some(n) => settings.ecrire(&cle_nom, n),
+            None => settings.effacer(&cle_nom),
         });
     if let Err(e) = ecrits {
-        // Les réglages d'avant sont rétablis autant que possible.
+        let mut non_remis = Vec::new();
         for (cle, valeur) in &reglages_avant {
-            match valeur {
-                Some(v) => settings.set(cle, v).ok(),
-                None => settings.delete(cle).ok(),
+            let remis = match valeur {
+                Some(v) => settings.ecrire(cle, v),
+                None => settings.effacer(cle),
             };
+            if let Err(e2) = remis {
+                tracing::error!(zone_id, cle, error = %e2, "convolver_import_reglage_non_remis");
+                non_remis.push(format!("setting {cle}"));
+            }
         }
         return Err(remettre_en_place(
             zone_id,
             &en_place,
             &de_cote,
             &poses,
+            non_remis,
             format!("settings: {e}"),
         ));
     }
@@ -1335,4 +1365,191 @@ async fn ir_status_handler(
         "set_name": set_name,
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod import_t09a_tests {
+    //! TESS T09a — retour arrière de l'import : réglages refusés, remise en
+    //! place incomplète, lecture des réglages en échec, copies de côté
+    //! épargnées par le balayage du démarrage.
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    /// Des réglages en mémoire qui peuvent refuser la lecture ou l'écriture.
+    #[derive(Default)]
+    struct FauxReglages {
+        valeurs: Mutex<HashMap<String, String>>,
+        refuser_lecture: bool,
+        refuser_ecriture: bool,
+    }
+
+    impl ReglagesImport for FauxReglages {
+        fn lire(&self, cle: &str) -> Result<Option<String>, String> {
+            if self.refuser_lecture {
+                return Err("base indisponible".into());
+            }
+            Ok(self.valeurs.lock().unwrap().get(cle).cloned())
+        }
+        fn ecrire(&self, cle: &str, valeur: &str) -> Result<(), String> {
+            if self.refuser_ecriture {
+                return Err("écriture refusée".into());
+            }
+            self.valeurs
+                .lock()
+                .unwrap()
+                .insert(cle.into(), valeur.into());
+            Ok(())
+        }
+        fn effacer(&self, cle: &str) -> Result<(), String> {
+            if self.refuser_ecriture {
+                return Err("écriture refusée".into());
+            }
+            self.valeurs.lock().unwrap().remove(cle);
+            Ok(())
+        }
+    }
+
+    /// Un `.wav` mono flottant 32 bits à 48 kHz.
+    fn wav() -> Vec<u8> {
+        let data: Vec<u8> = [0.5f32, 0.25, 0.125]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let mut w = Vec::new();
+        w.extend_from_slice(b"RIFF");
+        w.extend_from_slice(&(36 + data.len() as u32).to_le_bytes());
+        w.extend_from_slice(b"WAVEfmt ");
+        w.extend_from_slice(&16u32.to_le_bytes());
+        w.extend_from_slice(&3u16.to_le_bytes());
+        w.extend_from_slice(&1u16.to_le_bytes());
+        w.extend_from_slice(&48_000u32.to_le_bytes());
+        w.extend_from_slice(&(48_000u32 * 4).to_le_bytes());
+        w.extend_from_slice(&4u16.to_le_bytes());
+        w.extend_from_slice(&32u16.to_le_bytes());
+        w.extend_from_slice(b"data");
+        w.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        w.extend_from_slice(&data);
+        w
+    }
+
+    async fn corps(r: axum::response::Response) -> (StatusCode, serde_json::Value) {
+        let status = r.status();
+        let octets = axum::body::to_bytes(r.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        (
+            status,
+            serde_json::from_slice(&octets).unwrap_or(json!(null)),
+        )
+    }
+
+    fn fichiers(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn le_balayage_du_demarrage_epargne_les_copies_de_cote() {
+        let d = tune_core::test_scratch::scratch_dir("t09a-balayage");
+        let depot = chemin_provisoire(d.path(), 7);
+        let cote = chemin_de_cote(d.path(), 7);
+        std::fs::write(&depot, b"provisoire").unwrap();
+        std::fs::write(&cote, b"ancien filtre").unwrap();
+        balayer_les_depots_provisoires(d.path());
+        assert!(!depot.exists(), "le dépôt provisoire est balayé");
+        assert!(cote.exists(), "la copie de côté survit au balayage");
+        assert_eq!(std::fs::read(&cote).unwrap(), b"ancien filtre");
+    }
+
+    #[tokio::test]
+    async fn un_echec_d_ecriture_des_reglages_remet_l_ancien_jeu() {
+        let d = tune_core::test_scratch::scratch_dir("t09a-reglages-refuses");
+        let ancien = d.path().join("zone_7.wav");
+        std::fs::write(&ancien, b"ANCIEN").unwrap();
+        let reglages = FauxReglages {
+            refuser_ecriture: true,
+            ..Default::default()
+        };
+        reglages
+            .valeurs
+            .lock()
+            .unwrap()
+            .insert("ir_path_7".into(), ancien.to_str().unwrap().into());
+        let r = importer_bloquant(&wav(), Some("f.wav".into()), d.path(), 7, &reglages)
+            .err()
+            .expect("l'import échoue");
+        let (status, v) = corps(r).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{v}");
+        // L'ancien fichier est remis, rien d'autre ne traîne.
+        assert_eq!(std::fs::read(&ancien).unwrap(), b"ANCIEN");
+        assert_eq!(fichiers(d.path()), ["zone_7.wav"]);
+        // Les réglages n'ont pas bougé ; la remise d'un réglage refusée est
+        // SIGNALÉE (`restore_incomplete`), pas avalée.
+        assert_eq!(
+            reglages
+                .valeurs
+                .lock()
+                .unwrap()
+                .get("ir_path_7")
+                .map(String::as_str),
+            ancien.to_str()
+        );
+        let non_remis = v["restore_incomplete"]
+            .as_array()
+            .expect("restore_incomplete");
+        assert!(!non_remis.is_empty(), "{v}");
+        // Contre-épreuve : les mêmes réglages acceptés, l'import passe.
+        let reglages = FauxReglages::default();
+        assert!(importer_bloquant(&wav(), Some("f.wav".into()), d.path(), 7, &reglages).is_ok());
+        assert_ne!(std::fs::read(&ancien).unwrap(), b"ANCIEN");
+    }
+
+    #[tokio::test]
+    async fn une_remise_en_place_ratee_est_signalee_et_la_copie_gardee() {
+        let d = tune_core::test_scratch::scratch_dir("t09a-remise-ratee");
+        let cote = chemin_de_cote(d.path(), 7);
+        std::fs::write(&cote, b"ancien filtre").unwrap();
+        // La destination est dans un dossier qui n'existe pas : le renommage
+        // de remise échoue.
+        let introuvable = d.path().join("absent").join("zone_7.wav");
+        let r = remettre_en_place(
+            7,
+            &[],
+            &[(cote.clone(), introuvable)],
+            &[],
+            Vec::new(),
+            "essai",
+        );
+        let (status, v) = corps(r).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        let non_remis = v["restore_incomplete"]
+            .as_array()
+            .expect("restore_incomplete");
+        assert_eq!(non_remis.len(), 1, "{v}");
+        assert!(cote.exists(), "la copie de côté n'est pas effacée");
+    }
+
+    #[tokio::test]
+    async fn une_lecture_des_reglages_en_echec_ne_touche_a_rien() {
+        let d = tune_core::test_scratch::scratch_dir("t09a-lecture-refusee");
+        let reglages = FauxReglages {
+            refuser_lecture: true,
+            ..Default::default()
+        };
+        let r = importer_bloquant(&wav(), None, d.path(), 7, &reglages)
+            .err()
+            .expect("l'import échoue");
+        let (status, _) = corps(r).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            !d.path().exists() || fichiers(d.path()).is_empty(),
+            "aucun fichier écrit"
+        );
+    }
 }
