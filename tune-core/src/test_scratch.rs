@@ -443,3 +443,67 @@ mod tests {
         std::fs::remove_dir_all(&chemin).unwrap();
     }
 }
+
+/// Donne à une fixture exécutable son nom dans le répertoire privé du test.
+/// Le fichier que le noyau exécute est en lecture seule pendant le banc.
+#[cfg(all(test, unix))]
+pub(crate) fn lier_executable(destination: &std::path::Path, fixture: &str) {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/executables")
+        .join(fixture);
+    std::os::unix::fs::symlink(source, destination).expect("lier la fixture exécutable");
+}
+
+#[cfg(test)]
+mod garde_executables {
+    use regex::Regex;
+    use std::path::Path;
+
+    #[test]
+    fn les_tests_ne_fabriquent_pas_un_executable_pendant_les_lancements() {
+        let racine = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let ecriture = Regex::new(r"fs::write\(\s*&?(\w+)\s*,").unwrap();
+        let mode = Regex::new(r"fs::set_permissions\(\s*&?(\w+)\s*,\s*(?:std::fs::|fs::)?Permissions::from_mode\(0o7[0-7]{2}\)").unwrap();
+        let fonction = Regex::new(r"(?m)^\s*(?:pub(?:\(crate\))?\s+)?(?:async\s+)?fn\s+").unwrap();
+        let mut violations = Vec::new();
+        for dossier in ["src", "tests"] {
+            for entree in walkdir::WalkDir::new(racine.join(dossier)) {
+                let entree = entree.unwrap();
+                let chemin = entree.path();
+                if chemin.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let contenu = std::fs::read_to_string(chemin).unwrap();
+                let fichier_de_test = dossier == "tests"
+                    || chemin
+                        .file_stem()
+                        .unwrap()
+                        .to_string_lossy()
+                        .contains("test");
+                for droit in mode.captures_iter(&contenu) {
+                    let position = droit.get(0).unwrap().start();
+                    let avant = &contenu[..position];
+                    // Les helpers privés peuvent précéder le premier #[test] dans un module de tests.
+                    if !fichier_de_test
+                        && !avant.contains("#[cfg(test)]")
+                        && !avant.contains("#[cfg(all(test,")
+                        && !avant.contains("#[test]")
+                    {
+                        continue;
+                    }
+                    let debut = fonction.find_iter(avant).last().map_or(0, |m| m.end());
+                    if ecriture
+                        .captures_iter(&avant[debut..])
+                        .any(|e| e[1] == droit[1])
+                    {
+                        violations.push(format!("{}:{}", chemin.display(), avant.lines().count()));
+                    }
+                }
+            }
+        }
+        assert!(
+            violations.is_empty(),
+            "Utiliser une fixture exécutable : {violations:?}"
+        );
+    }
+}

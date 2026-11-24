@@ -100,18 +100,8 @@ async fn service_ouvrable(
 
 /// Un faux yt-dlp : une URL, ses en-têtes, le format, servable tout de suite.
 fn faux_ytdlp(dossier: &std::path::Path) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
     let binaire = dossier.join("yt-dlp");
-    std::fs::write(
-        &binaire,
-        "#!/bin/sh\n\
-         echo 'http://127.0.0.1:9/flux'\n\
-         echo '{\"User-Agent\": \"Mozilla/5.0\"}'\n\
-         echo 'tune-format=251,opus,128.93'\n\
-         echo 'tune-disponible=NA'\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&binaire, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_scratch::lier_executable(&binaire, "yt-dlp-inactif.sh");
     binaire
 }
 

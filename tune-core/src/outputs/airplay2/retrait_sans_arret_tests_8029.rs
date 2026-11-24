@@ -6,7 +6,6 @@
 //! détruit la sortie sans l'arrêter — ce que fait un retrait du registre.
 
 use super::*;
-use std::os::unix::fs::PermissionsExt;
 
 /// Le processus `pid` est-il encore vivant ? Un zombie (tué, pas encore
 /// récolté) compte pour mort.
@@ -27,8 +26,7 @@ fn vivant(pid: u32) -> bool {
 async fn le_demon_meurt_avec_la_sortie_retiree_sans_arret_8029() {
     let dir = tempfile::tempdir().unwrap();
     let script = dir.path().join("faux-airplay-daemon");
-    std::fs::write(&script, "#!/bin/sh\nexec sleep 300\n").unwrap();
-    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    crate::test_scratch::lier_executable(&script, "airplay-attente.sh");
 
     let sortie = Airplay2Output::new(
         "Enceinte 8029".into(),

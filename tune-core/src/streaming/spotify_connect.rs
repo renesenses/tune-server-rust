@@ -1640,11 +1640,9 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn poser(dossier: &Path, texte: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
+    fn poser(dossier: &Path, fixture: &str) -> PathBuf {
         let bin = dossier.join("librespot");
-        std::fs::write(&bin, texte).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        crate::test_scratch::lier_executable(&bin, fixture);
         bin
     }
 
@@ -1655,7 +1653,7 @@ mod tests {
     fn binaire_6018_trouve_hors_du_path() {
         let vide = tempfile::tempdir().unwrap();
         let brew = tempfile::tempdir().unwrap();
-        let bin = poser(brew.path(), "#!/bin/sh\n");
+        let bin = poser(brew.path(), "shell-vide.sh");
         let path = std::ffi::OsString::from(vide.path());
         let systeme = |chemin: &PathBuf| {
             Some(BinaireLibrespot {
@@ -1692,11 +1690,8 @@ mod tests {
     fn binaire_6933_le_librespot_fourni_passe_avant_un_tiers_du_path() {
         let tune = tempfile::tempdir().unwrap();
         let usr_local = tempfile::tempdir().unwrap();
-        let fourni = poser(tune.path(), "\x7fELF faux binaire fourni");
-        let tiers = poser(
-            usr_local.path(),
-            "#!/bin/sh\nexec librespot-real --username \"VOTRE_EMAIL_SPOTIFY\" \"$@\"\n",
-        );
+        let fourni = poser(tune.path(), "en-tete-elf");
+        let tiers = poser(usr_local.path(), "librespot-tiers.sh");
         let path = std::ffi::OsString::from(usr_local.path());
         let retenu = chercher_librespot(
             None,
@@ -1749,7 +1744,7 @@ mod tests {
             None,
             "aucun librespot : rien"
         );
-        let place = poser(tune.path(), "");
+        let place = poser(tune.path(), "vide");
         assert_eq!(
             chercher_librespot(Some(&place), Some(tune.path()), Some(&path), &[]),
             None,
@@ -1762,7 +1757,7 @@ mod tests {
     #[tokio::test]
     async fn binaire_6933_version_lue_sans_executer_un_script() {
         let d = tempfile::tempdir().unwrap();
-        let script = poser(d.path(), "#!/bin/sh\necho librespot 9.9.9\n");
+        let script = poser(d.path(), "librespot-version.sh");
         assert_eq!(version_de_librespot(&script).await, None);
         // `/bin/echo` n'est pas un script : sa première ligne est relue
         // (« --version » en BSD, la version de coreutils en GNU).
@@ -1776,10 +1771,7 @@ mod tests {
     async fn nom_2778_le_nom_choisi_atteint_librespot() {
         let dossier = tempfile::tempdir().unwrap();
         // Un faux librespot qui relève ses arguments et reste en vie.
-        let bin = poser(
-            dossier.path(),
-            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$(dirname \"$0\")/args\"\nexec sleep 30\n",
-        );
+        let bin = poser(dossier.path(), "librespot-arguments.sh");
         let args = dossier.path().join("args");
         let recepteur = SpotifyConnectManager::avec_binaire(
             NOM_PAR_DEFAUT.into(),
