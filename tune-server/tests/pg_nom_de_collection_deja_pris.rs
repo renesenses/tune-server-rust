@@ -25,11 +25,22 @@ use tune_server::state::AppState;
 /// bancs PostgreSQL, on ne vide que nos lignes.
 const MARQUE: &str = "nompris2111";
 
+/// #9057 — les deux épreuves de ce fichier tournent en parallèle sur la MÊME
+/// base. `AppState::new` y rejoue les scripts de démarrage
+/// (`CREATE OR REPLACE FUNCTION`, déclencheurs de `066_upnp_catalog_revision`) :
+/// deux démarrages simultanés se heurtent dans le catalogue de PostgreSQL
+/// (« pg upnp revision: tuple concurrently updated », ou, sur une base neuve,
+/// « duplicate key » dans la migration 5). Les ouvertures passent donc une à
+/// une ; le reste des épreuves garde son parallélisme (chacune ses lignes,
+/// marquées).
+static OUVERTURE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn etat_postgres(url: &str) -> AppState {
     let config = tune_server::config::TuneConfig {
         database_url: Some(url.to_string()),
         ..Default::default()
     };
+    let _une_a_une = OUVERTURE.lock().unwrap_or_else(|e| e.into_inner());
     AppState::new("", 0, config).expect("AppState sur PostgreSQL")
 }
 
