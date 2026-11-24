@@ -409,20 +409,24 @@ fn l_ordre_de_la_chaine_tess_est_celui_de_la_sortie_locale() {
     assert_ne!(sortie_a, sortie_b, "l'ordre doit changer la sortie");
 
     // Oracle : les moteurs appelés directement, dans l'ordre demandé, par
-    // blocs de 512 trames comme la chaîne.
+    // blocs de 512 trames comme la chaîne, en f64 (T06, T09b : les deux
+    // moteurs sont en f64 natif, aucun arrondi entre eux).
     let (mut eq, mut conv) = (egaliseur(), convolveur());
-    let mut attendu: Vec<f32> = Vec::new();
+    let mut attendu: Vec<f64> = Vec::new();
     for morceau in source.chunks(512 * 6) {
-        let mut f = crate::outputs::local::pcm_bytes_to_f32(morceau, 24);
-        conv.process_interleaved(&mut f);
-        eq.process_interleaved(&mut f);
+        let mut f = crate::outputs::local::pcm_bytes_to_f64(morceau, 24);
+        conv.process_interleaved_f64(&mut f);
+        let _ = eq.process_interleaved_f64(&mut f);
         attendu.extend_from_slice(&f);
     }
     // La queue du convolveur passe par ce qui le suit : l'égaliseur.
-    let mut queue = conv.flush();
-    eq.process_interleaved(&mut queue);
+    let mut queue = conv.flush_f64();
+    let _ = eq.process_interleaved_f64(&mut queue);
     attendu.extend_from_slice(&queue);
-    assert_eq!(bits_f32(&frontiere_f32(&sortie_b)), bits_f32(&attendu));
+    assert_eq!(
+        bits_f32(&frontiere_f32(&sortie_b)),
+        bits_f32(&frontiere_f32(&attendu))
+    );
 }
 
 /// « Bypass all » et PURE : aucun étage n'agit, le PCM ressort à l'octet ;
@@ -772,11 +776,15 @@ fn mono_et_multicanal_rendent_les_bits_d_avant() {
         let source = octets(&signal, 24);
         let trame = 3 * usize::from(canaux);
         for bloc in source.chunks(777 * trame) {
-            assert_eq!(
-                bits_f32(&n.bloc_nouveau(bloc, 24, canaux)),
-                bits_f32(&a.bloc_ancien(bloc, 24, canaux)),
-                "{canaux} voies"
+            // T06 + T09b : égaliseur puis convolution sans arrondi f32 entre
+            // eux ; seul l'arrondi final diffère de l'ancien chemin, sous 2^-21.
+            let (x, y) = (
+                n.bloc_nouveau(bloc, 24, canaux),
+                a.bloc_ancien(bloc, 24, canaux),
             );
+            assert_eq!(x.len(), y.len(), "{canaux} voies");
+            let e = ecart_f32(&x, &y);
+            assert!(e <= ECART_T06, "{canaux} voies : écart {e:e} (> 2^-21)");
         }
     }
 }
