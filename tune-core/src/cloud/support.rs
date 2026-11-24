@@ -44,6 +44,7 @@ pub type SupportResult = Result<Value, (u16, Value)>;
 /// « ne fonctionnait pas » pour eux. mozaiklabs accepte les deux (voir
 /// `PremiumApiAuth`) ; pour la clé il résout/crée le compte par l'e-mail de la
 /// licence.
+#[derive(Clone)]
 pub enum SupportAuth {
     /// Token OAuth premium (login SSO dans Tune).
     Bearer(String),
@@ -140,6 +141,7 @@ pub async fn create_ticket(
 /// Une pièce jointe reçue du client web, prête à être relayée à mozaiklabs
 /// telle quelle (le serveur Tune ne la stocke pas — il ne fait que la
 /// transmettre dans le multipart sortant).
+#[derive(Clone)]
 pub struct AttachmentUpload {
     /// Nom de fichier d'origine (ex. `capture.png`).
     pub file_name: String,

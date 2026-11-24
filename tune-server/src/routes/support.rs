@@ -89,8 +89,12 @@ async fn list(
         Err(resp) => return resp,
     };
     let base = base_url(&state);
+    let (client, base) = (&state.http_client, base.as_deref());
     finish(
-        support::list_tickets(&state.http_client, &auth, base.as_deref()).await,
+        avec_repli(&auth, |a| async move {
+            support::list_tickets(client, &a, base).await
+        })
+        .await,
         &headers,
     )
 }
@@ -140,7 +144,7 @@ fn est_multipart(req: &Request) -> bool {
 /// Chemin JSON historique — ticket sans pièce jointe.
 async fn create_json(
     state: AppState,
-    auth: support::SupportAuth,
+    auth: Vec<support::SupportAuth>,
     req: Request,
     headers: HeaderMap,
 ) -> Response {
@@ -149,20 +153,19 @@ async fn create_json(
         Err(rej) => return rej.into_response(),
     };
     let base = base_url(&state);
+    let (client, base) = (&state.http_client, base.as_deref());
+    let ticket = &support::NewTicket {
+        subject: payload.subject,
+        body: payload.body,
+        category: payload.category,
+        zone: payload.zone,
+        system: payload.system,
+        logs: payload.logs,
+    };
     finish(
-        support::create_ticket(
-            &state.http_client,
-            &auth,
-            &support::NewTicket {
-                subject: payload.subject,
-                body: payload.body,
-                category: payload.category,
-                zone: payload.zone,
-                system: payload.system,
-                logs: payload.logs,
-            },
-            base.as_deref(),
-        )
+        avec_repli(&auth, |a| async move {
+            support::create_ticket(client, &a, ticket, base).await
+        })
         .await,
         &headers,
     )
@@ -173,7 +176,7 @@ async fn create_json(
 /// le multipart tel quel avec la clé de licence / le token premium.
 async fn create_multipart(
     state: AppState,
-    auth: support::SupportAuth,
+    auth: Vec<support::SupportAuth>,
     req: Request,
     headers: HeaderMap,
 ) -> Response {
@@ -195,14 +198,18 @@ async fn create_multipart(
     }
 
     let base = base_url(&state);
+    let (client, base, relais) = (&state.http_client, base.as_deref(), &relais);
     finish(
-        support::create_ticket_multipart(
-            &state.http_client,
-            &auth,
-            relais.fields,
-            relais.files,
-            base.as_deref(),
-        )
+        avec_repli(&auth, |a| async move {
+            support::create_ticket_multipart(
+                client,
+                &a,
+                relais.fields.clone(),
+                relais.files.clone(),
+                base,
+            )
+            .await
+        })
         .await,
         &headers,
     )
@@ -371,8 +378,12 @@ async fn detail(
         Err(resp) => return resp,
     };
     let base = base_url(&state);
+    let (client, base) = (&state.http_client, base.as_deref());
     finish(
-        support::get_ticket(&state.http_client, &auth, id, base.as_deref()).await,
+        avec_repli(&auth, |a| async move {
+            support::get_ticket(client, &a, id, base).await
+        })
+        .await,
         &headers,
     )
 }
@@ -422,7 +433,7 @@ async fn reply(
 /// clients déployés connaissent : il ne bouge pas.
 async fn reply_json(
     state: AppState,
-    auth: support::SupportAuth,
+    auth: Vec<support::SupportAuth>,
     id: i64,
     req: Request,
     headers: HeaderMap,
@@ -432,14 +443,11 @@ async fn reply_json(
         Err(rej) => return rej.into_response(),
     };
     let base = base_url(&state);
+    let (client, base, corps) = (&state.http_client, base.as_deref(), &payload.body);
     finish(
-        support::reply(
-            &state.http_client,
-            &auth,
-            id,
-            &payload.body,
-            base.as_deref(),
-        )
+        avec_repli(&auth, |a| async move {
+            support::reply(client, &a, id, corps, base).await
+        })
         .await,
         &headers,
     )
@@ -450,7 +458,7 @@ async fn reply_json(
 /// c'est la même règle Laravel de l'autre côté.
 async fn reply_multipart(
     state: AppState,
-    auth: support::SupportAuth,
+    auth: Vec<support::SupportAuth>,
     id: i64,
     req: Request,
     headers: HeaderMap,
@@ -472,15 +480,19 @@ async fn reply_multipart(
     }
 
     let base = base_url(&state);
+    let (client, base, relais) = (&state.http_client, base.as_deref(), &relais);
     finish(
-        support::reply_multipart(
-            &state.http_client,
-            &auth,
-            id,
-            relais.fields,
-            relais.files,
-            base.as_deref(),
-        )
+        avec_repli(&auth, |a| async move {
+            support::reply_multipart(
+                client,
+                &a,
+                id,
+                relais.fields.clone(),
+                relais.files.clone(),
+                base,
+            )
+            .await
+        })
         .await,
         &headers,
     )
@@ -499,8 +511,12 @@ async fn mark_read(
         Err(resp) => return resp,
     };
     let base = base_url(&state);
+    let (client, base) = (&state.http_client, base.as_deref());
     finish(
-        support::mark_read(&state.http_client, &auth, id, base.as_deref()).await,
+        avec_repli(&auth, |a| async move {
+            support::mark_read(client, &a, id, base).await
+        })
+        .await,
         &headers,
     )
 }
@@ -555,12 +571,14 @@ pub(crate) fn identifiants_mozaiklabs(settings: &SettingsRepo) -> Vec<support::S
     identifiants
 }
 
-/// Résout l'auth vers mozaiklabs : token OAuth premium (SSO) en priorité, sinon
-/// la clé de licence. 412 seulement si NI l'un NI l'autre n'est disponible.
-fn auth(state: &AppState) -> Result<support::SupportAuth, Response> {
+/// Les identifiants à présenter à mozaiklabs, dans l'ordre : token OAuth
+/// premium (SSO), puis la clé de licence. 412 seulement si NI l'un NI l'autre
+/// n'est disponible.
+fn auth(state: &AppState) -> Result<Vec<support::SupportAuth>, Response> {
     let settings = SettingsRepo::with_backend(state.backend.clone());
-    if let Some(premier) = identifiants_mozaiklabs(&settings).into_iter().next() {
-        return Ok(premier);
+    let identifiants = identifiants_mozaiklabs(&settings);
+    if !identifiants.is_empty() {
+        return Ok(identifiants);
     }
 
     Err((
@@ -572,6 +590,44 @@ fn auth(state: &AppState) -> Result<support::SupportAuth, Response> {
         )),
     )
         .into_response())
+}
+
+/// Le site refuse-t-il l'identité présentée parce que son compte n'est pas
+/// Premium (`403 premium_required`) ?
+fn refus_premium(resultat: &support::SupportResult) -> bool {
+    matches!(
+        resultat,
+        Err((403, corps)) if corps.get("error").and_then(Value::as_str) == Some("premium_required")
+    )
+}
+
+/// #9485 (fil 3049) — appelle le site avec chaque identifiant, dans l'ordre,
+/// tant qu'il répond `403 premium_required` : la session SSO ouverte dans Tune
+/// peut être celle d'un compte sans licence, alors que la clé de licence du
+/// serveur est Premium. Même règle que l'installation depuis le catalogue de
+/// greffons. Tout autre résultat (succès, autre refus, panne) est rendu tel
+/// quel, et le dernier refus Premium aussi quand plus rien ne reste à essayer.
+async fn avec_repli<F, Fut>(identifiants: &[support::SupportAuth], mut appel: F) -> support::SupportResult
+where
+    F: FnMut(support::SupportAuth) -> Fut,
+    Fut: std::future::Future<Output = support::SupportResult>,
+{
+    let mut restants = identifiants.iter().cloned().peekable();
+    loop {
+        let Some(identifiant) = restants.next() else {
+            // `auth()` ne rend jamais une liste vide.
+            return Err((
+                412,
+                json!({"error": "not_connected"}),
+            ));
+        };
+        let resultat = appel(identifiant).await;
+        if restants.peek().is_some() && refus_premium(&resultat) {
+            tracing::info!("support_premium_refuse_par_la_session_repli_sur_la_licence");
+            continue;
+        }
+        return resultat;
+    }
 }
 
 /// Remplace le texte d'un 429 par un message localisé et exploitable.
