@@ -1556,6 +1556,12 @@ path = "tests/tess_migration_routes_t02.rs"
 name = "tess_api_routes_t08"
 path = "tests/tess_api_routes_t08.rs"
 
+# TESS T09a — import d'un jeu de convolution (.zip de RI, .cfg Convolver),
+# archive piégée refusée sans toucher au jeu en place.
+[[test]]
+name = "import_convolution_t09a"
+path = "tests/import_convolution_t09a.rs"
+
 # TESS T17 — préréglages de chaîne globaux et mode d'application.
 [[test]]
 name = "tess_prereglages_routes_t17"
