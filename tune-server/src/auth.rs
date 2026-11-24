@@ -386,23 +386,6 @@ fn porte_un_jeton_valide(request: &Request, settings: &SettingsRepo) -> bool {
     extract_token_from_request(request).is_some_and(|tok| valider_jeton(&tok, settings).is_some())
 }
 
-/// Le jeton de la requête (en-tête ou cookie `tune_session`) est-il accepté
-/// par le contrôle qui suit l'exemption DIDL ? Mêmes règles que ce contrôle :
-/// clé d'API égale au réglage, ou JWT vérifié avec `jwt_secret`.
-fn porte_un_jeton_valide(request: &Request, settings: &SettingsRepo) -> bool {
-    match extract_token_from_request(request) {
-        Some(tok) if tok.starts_with("ApiKey:") => {
-            let stored = settings.get("api_key").ok().flatten().unwrap_or_default();
-            !stored.is_empty() && tok[7..] == stored
-        }
-        Some(tok) => match settings.get("jwt_secret").ok().flatten() {
-            Some(secret) if !secret.is_empty() => verify_jwt(&tok, &secret).is_ok(),
-            _ => false,
-        },
-        None => false,
-    }
-}
-
 /// Marqueur posé sur la requête quand elle est entrée par l'exemption DIDL
 /// (#3933) : sans jeton, depuis le LAN, sur une ressource que le serveur média
 /// publie. Le relais de pochettes (`proxy_artwork`) le lit pour exiger une URL
