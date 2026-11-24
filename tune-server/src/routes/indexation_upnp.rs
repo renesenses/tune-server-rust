@@ -631,6 +631,13 @@ pub(super) async fn indexer(state: &AppState, id: &str, demande: DemandeIndexati
         }));
     };
     drop(serveurs);
+    // Fil du forum 3028 — Tune ne s'indexe pas lui-même : ses albums sont déjà
+    // dans la bibliothèque, en `local`. Le refus vaut pour le geste ponctuel
+    // comme pour la synchronisation d'une source déjà abonnée (`run_one`), qui
+    // passe la source en `unavailable` au lieu de recopier la bibliothèque.
+    if est_ce_serveur(state, &ms) {
+        return Json(refus_ce_serveur(&ms.id));
+    }
 
     let conteneur = demande.conteneur.clone().unwrap_or_else(|| "0".into());
     // #4154 — l'ordre de priorité, et il n'y en a qu'un : ce que la REQUÊTE
@@ -729,6 +736,25 @@ pub(super) async fn indexer(state: &AppState, id: &str, demande: DemandeIndexati
         // Ne jamais faire semblant : ce que cette passe NE fait pas.
         "reserves": reserves(&bilan),
     }))
+}
+
+/// Fil du forum 3028 — ce serveur multimédia est-il ce Tune ?
+pub(super) fn est_ce_serveur(
+    state: &AppState,
+    ms: &tune_core::discovery::ssdp::MediaServerInfo,
+) -> bool {
+    crate::discovery_setup::est_ce_serveur(state, &ms.id, &ms.host, ms.port, &ms.location)
+}
+
+/// Le refus d'indexer ce Tune dans sa propre bibliothèque.
+pub(super) fn refus_ce_serveur(id: &str) -> Value {
+    json!({
+        "indexe": false,
+        "code": "this_server",
+        "raison": crate::message_api::texte("api.upnp.thisServer", &[]),
+        "detail": crate::message_api::texte("api.upnp.thisServerDetail", &[("id", id.to_string())]),
+        "message_key": "api.upnp.thisServerDetail",
+    })
 }
 
 /// Ce que la passe ne fait pas, dit dans sa propre réponse.

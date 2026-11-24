@@ -795,20 +795,84 @@ fn est_notre_propre_serveur_multimedia(
     nos_adresses: &[String],
     notre_udn: Option<&str>,
 ) -> bool {
+    annonce_de_notre_serveur_multimedia(
+        &ms.id,
+        &ms.host,
+        ms.port,
+        &ms.location,
+        port_api,
+        nos_adresses,
+        notre_udn,
+    )
+}
+
+/// La règle de [`est_notre_propre_serveur_multimedia`] sur les seuls champs
+/// d'une annonce : le registre durable (`media_servers` en base) les porte
+/// sans `MediaServerInfo`.
+fn annonce_de_notre_serveur_multimedia(
+    udn_annonce: &str,
+    hote: &str,
+    port: u16,
+    location: &str,
+    port_api: u16,
+    nos_adresses: &[String],
+    notre_udn: Option<&str>,
+) -> bool {
     if let Some(udn) = notre_udn
         && !udn.is_empty()
-        && ms.id == udn
+        && udn_annonce == udn
     {
         return true;
     }
-    if ms.port != port_api {
+    if port != port_api {
         return false;
     }
     let notre_mount = format!("{}/description.xml", tune_core::upnp_server::MOUNT_PATH);
-    if !ms.location.ends_with(&notre_mount) {
+    if !location.ends_with(&notre_mount) {
         return false;
     }
-    !ms.host.is_empty() && nos_adresses.iter().any(|a| a == &ms.host)
+    !hote.is_empty() && nos_adresses.iter().any(|a| a == hote)
+}
+
+/// Fil du forum 3028 — ce serveur multimédia est-il CE Tune ?
+///
+/// Tune reste dans sa propre liste de serveurs (#3786 : on y parcourt ses
+/// dossiers), mais l'indexer dans sa propre bibliothèque recopie chaque album
+/// local en album `upnp` : la bibliothèque montre alors deux fois les mêmes
+/// albums, une fois en « Local », une fois sous le nom que Tune s'annonce
+/// (le nom de la machine — `…fritz.box` derrière une Fritz!Box).
+///
+/// Deux identités, prises toutes deux :
+/// - l'UDN, celui de l'état UPnP (persisté en `upnp_udn`, donc stable d'un
+///   démarrage à l'autre) ET celui de l'annonce en cours ;
+/// - à défaut d'UDN reconnu, l'adresse : une adresse de l'une de NOS
+///   interfaces (toutes, pas seulement l'élue — Wi-Fi et Ethernet d'un Mac),
+///   ou l'adresse annoncée, avec notre port d'API et notre chemin de montage.
+///   C'est ce qui couvre un UDN régénéré (base remise à zéro) dont l'ancienne
+///   annonce traîne encore.
+pub(crate) fn est_ce_serveur(
+    state: &AppState,
+    udn_annonce: &str,
+    hote: &str,
+    port: u16,
+    location: &str,
+) -> bool {
+    let adresses = nos_adresses(state.config.advertised_ip.as_deref());
+    let udn_de_l_etat = state.upnp.as_ref().map(|u| u.uuid.clone());
+    let udn_annonce_en_cours = tune_core::upnp_server::media_server_advert().map(|a| a.uuid);
+    [udn_de_l_etat, udn_annonce_en_cours, None]
+        .iter()
+        .any(|notre_udn| {
+            annonce_de_notre_serveur_multimedia(
+                udn_annonce,
+                hote,
+                port,
+                location,
+                state.config.port,
+                &adresses,
+                notre_udn.as_deref(),
+            )
+        })
 }
 
 /// Nos adresses, du point de vue d'une annonce reçue : l'IP du réseau local et

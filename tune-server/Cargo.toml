@@ -1325,6 +1325,11 @@ path = "tests/web_response_contracts.rs"
 name = "indexation_upnp_2219"
 path = "tests/indexation_upnp_2219.rs"
 
+# Fil du forum 3028 : Tune ne s'indexe pas lui-même (UDN et adresses locales).
+[[test]]
+name = "auto_indexation_upnp_3028"
+path = "tests/auto_indexation_upnp_3028.rs"
+
 [[test]]
 name = "refus_oaat_upnp_2219"
 path = "tests/refus_oaat_upnp_2219.rs"
