@@ -163,9 +163,12 @@ async fn silence_pendant(passe: Passe, visee: Visee) -> (Duration, usize) {
 }
 
 async fn exiger_un_executeur_vivant(nom: &str, passe: Passe, visee: Visee) {
-    // L'état des campagnes est global au processus : un témoin voisin peut
-    // en rouvrir une entre la remise au repos et le comptage, qui est alors
-    // sauté. On rejoue, au plus trois fois ; jamais un vert sans lecture.
+    // L'état des campagnes est global au processus : un témoin voisin
+    // pouvait en rouvrir une entre la remise au repos et le comptage, qui
+    // était alors sauté (#9057, sous charge, malgré trois essais). Tous les
+    // témoins qui ouvrent une campagne prennent désormais ce verrou. Les
+    // trois essais restent : jamais un vert sans lecture.
+    let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
     for _ in 0..3 {
         let (silence, ralenties) = silence_pendant(passe, visee).await;
         if ralenties == 0 {

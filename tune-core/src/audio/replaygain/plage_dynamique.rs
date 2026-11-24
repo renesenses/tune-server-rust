@@ -465,6 +465,7 @@ mod tests {
     /// cascade n'aurait atteinte qu'après tout le reste — et le relevé le dit.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn le_passage_a_la_demande_mesure_et_rend_compte() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let f = tmp.path().join("plage.wav");
         wav_de_plage_connue(&f);
@@ -503,6 +504,7 @@ mod tests {
     /// le passage reprend seul quand la zone s'arrête.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn un_second_demarrage_est_refuse_pendant_le_passage() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let f = tmp.path().join("plage.wav");
         wav_de_plage_connue(&f);
@@ -575,6 +577,7 @@ mod tests {
     /// exactement l'inverse.
     #[tokio::test]
     async fn replaygain_coupe_le_passage_a_la_demande_mesure_quand_meme() {
+        let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
         let tmp = tempfile::TempDir::new().unwrap();
         let f = tmp.path().join("plage.wav");
         wav_de_plage_connue(&f);

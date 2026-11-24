@@ -329,6 +329,7 @@ fn racine_de_la_fixture() -> String {
 /// test : l'exclusion levée, la même passe la décode.
 #[tokio::test]
 async fn la_passe_replaygain_ne_decode_jamais_une_racine_exclue() {
+    let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
     let (db, backend) = base();
     SettingsRepo::with_backend(backend.clone())
         .set(replaygain::MODE_KEY, "track")
@@ -366,6 +367,7 @@ async fn la_passe_replaygain_ne_decode_jamais_une_racine_exclue() {
 /// travaillent alors sans témoin) — c'est le cas où ils décoderaient seuls.
 #[tokio::test]
 async fn les_rattrapages_ne_decodent_jamais_une_racine_exclue() {
+    let _campagnes = crate::taches_de_fond::avancement::campagnes_des_essais().await;
     let (db, backend) = base();
     piste(&db, 42, fixture());
     regler(
