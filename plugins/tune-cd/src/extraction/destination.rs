@@ -115,6 +115,18 @@ fn refus(motif: &'static str, message: impl Into<String>) -> Refus {
 /// pas exister encore : c'est son plus proche parent existant qui est
 /// vérifié.
 pub fn verifier(demande: &str, emplacements: &[String]) -> Result<PathBuf, Refus> {
+    verifier_avec(demande, emplacements, attributs_de, cfg!(windows))
+}
+
+/// [`verifier`], les attributs de fichier Windows lus par `attributs` et les
+/// règles propres à Windows appliquées si `windows` (injectables : ni
+/// l'attribut caché ni ces règles ne s'exercent hors de Windows).
+fn verifier_avec(
+    demande: &str,
+    emplacements: &[String],
+    attributs: impl Fn(&Path) -> Option<u32>,
+    windows: bool,
+) -> Result<PathBuf, Refus> {
     let brut = demande.trim();
     if brut.is_empty() {
         return Err(refus("destination_vide", "La destination est vide."));
@@ -134,10 +146,19 @@ pub fn verifier(demande: &str, emplacements: &[String]) -> Result<PathBuf, Refus
     }
     // Sur le texte, pas sur `components()` : celui-ci efface les « . »
     // intermédiaires sans le dire.
-    if brut.split(['/', '\\']).any(|seg| seg == "." || seg == "..") {
+    if brut
+        .split(['/', '\\'])
+        .any(|seg| seg == "." || seg == ".." || (windows && segment_vide_sous_windows(seg)))
+    {
         return Err(refus(
             "destination_invalide",
             "La destination ne peut pas contenir « . » ni « .. ».",
+        ));
+    }
+    if windows && brut.split(['/', '\\']).any(nom_reserve_windows) {
+        return Err(refus(
+            "destination_invalide",
+            "La destination contient un nom réservé par Windows (CON, NUL, COM1…).",
         ));
     }
     let Some(racine) = emplacements
@@ -171,6 +192,33 @@ pub fn verifier(demande: &str, emplacements: &[String]) -> Result<PathBuf, Refus
             "hors_bibliotheque",
             "La destination sort de la bibliothèque par un lien symbolique.",
         ));
+    }
+    // Fil 3036 — sous Windows, pas de « : » sous l'emplacement : un flux NTFS
+    // (`duplicates::$INDEX_ALLOCATION`) crée le vrai dossier `duplicates`.
+    // Ailleurs, « : » est un caractère de nom valide.
+    // Les noms que Tune crée (`nom_sur`) le remplacent déjà par « _ ».
+    if chemin
+        .strip_prefix(racine)
+        .is_ok_and(|r| deux_points_interdit(&r.to_string_lossy(), windows))
+    {
+        return Err(refus(
+            "destination_invalide",
+            "La destination ne peut pas contenir « : » sous l'emplacement.",
+        ));
+    }
+    // Fil 3036 — ni un dossier masqué (caché, système, propre à Tune), ni ce
+    // qu'il contient : sur le chemin DEMANDÉ (y compris la partie à créer),
+    // sur le chemin RÉSOLU (un lien vers `.tune` n'y mène pas), et par
+    // l'attribut caché de Windows des dossiers existants.
+    if chemin
+        .strip_prefix(racine)
+        .is_ok_and(|r| composants_masques(r, windows))
+        || existant_reel
+            .strip_prefix(&racine_reelle)
+            .is_ok_and(|r| composants_masques(r, windows))
+        || cache_par_attribut(&existant_reel, &racine_reelle, &attributs)
+    {
+        return Err(refus_masque());
     }
     if existant == chemin && !existant_reel.is_dir() {
         return Err(refus(
@@ -227,24 +275,9 @@ pub fn sous_dossiers(
                 .collect(),
         });
     };
+    // `verifier` refuse aussi les dossiers masqués, demandés directement
+    // ou atteints par un lien.
     let chemin = verifier(demande, emplacements)?;
-    // Un dossier masqué (caché, système, propre à Tune) ne s'ouvre pas non
-    // plus quand on le demande directement.
-    if let Some(racine) = emplacements
-        .iter()
-        .map(|e| PathBuf::from(tune_core::scanner::walker::normalize_path(e)))
-        .filter(|r| chemin.starts_with(r))
-        .max_by_key(|r| r.components().count())
-        && let Ok(reste) = chemin.strip_prefix(&racine)
-        && reste
-            .components()
-            .any(|c| nom_masque(&c.as_os_str().to_string_lossy(), None))
-    {
-        return Err(refus(
-            "dossier_masque",
-            "Ce dossier est caché ou réservé : choisissez-en un autre.",
-        ));
-    }
     if !chemin.is_dir() {
         return Err(refus(
             "dossier_introuvable",
@@ -263,6 +296,8 @@ pub fn sous_dossiers(
     // du chemin demandé, re-pointé entre la vérification et la lecture, ne
     // mène plus ailleurs (TOCTOU). Les chemins rendus restent exprimés sous
     // le chemin demandé, celui que `verifier` reconnaît.
+    #[cfg(test)]
+    tests_course::avant_canonique(&chemin);
     let reel = canonique_dans(&chemin, emplacements)?;
     #[cfg(test)]
     tests_course::apres_verification(&chemin);
@@ -279,7 +314,7 @@ pub fn sous_dossiers(
         let Some(nom) = entree.file_name().to_str().map(str::to_string) else {
             continue;
         };
-        if nom_masque(&nom, attributs_windows(&entree)) {
+        if nom_masque(&nom, attributs_windows(&entree), cfg!(windows)) {
             continue;
         }
         let lien = traite_comme_lien(&entree.file_type());
@@ -318,25 +353,83 @@ fn traite_comme_lien(t: &std::io::Result<std::fs::FileType>) -> bool {
 /// La forme canonique de `chemin`, refusée si elle sort de l'emplacement
 /// qui le contient (même règle que [`verifier`], rejouée au moment de lire).
 fn canonique_dans(chemin: &Path, emplacements: &[String]) -> Result<PathBuf, Refus> {
+    canonique_dans_avec(chemin, emplacements, attributs_de)
+}
+
+/// [`canonique_dans`], les attributs Windows lus par `attributs` (témoins).
+fn canonique_dans_avec(
+    chemin: &Path,
+    emplacements: &[String],
+    attributs: impl Fn(&Path) -> Option<u32>,
+) -> Result<PathBuf, Refus> {
     let reel = std::fs::canonicalize(chemin).map_err(|e| {
         refus(
             "destination_invalide",
             format!("La destination est inaccessible : {e}"),
         )
     })?;
-    let dedans = emplacements
+    let Some(racine_reelle) = emplacements
         .iter()
         .map(|e| PathBuf::from(tune_core::scanner::walker::normalize_path(e)))
         .filter(|r| chemin.starts_with(r))
         .filter_map(|r| std::fs::canonicalize(r).ok())
-        .any(|r| reel.starts_with(r));
-    if !dedans {
+        .find(|r| reel.starts_with(r))
+    else {
         return Err(refus(
             "hors_bibliotheque",
             "La destination sort de la bibliothèque par un lien symbolique.",
         ));
+    };
+    // La cible résolue AU MOMENT DE LIRE : un lien re-pointé vers `.tune`
+    // après `verifier` est refusé ici.
+    if reel
+        .strip_prefix(&racine_reelle)
+        .is_ok_and(|r| composants_masques(r, cfg!(windows)))
+        || cache_par_attribut(&reel, &racine_reelle, &attributs)
+    {
+        return Err(refus_masque());
     }
     Ok(reel)
+}
+
+fn refus_masque() -> Refus {
+    refus(
+        "dossier_masque",
+        "Ce dossier est caché ou réservé à Tune : choisissez-en un autre.",
+    )
+}
+
+/// Un des composants de `reste` (relatif à un emplacement) est-il masqué ?
+fn composants_masques(reste: &Path, windows: bool) -> bool {
+    reste
+        .components()
+        .any(|c| nom_masque(&c.as_os_str().to_string_lossy(), None, windows))
+}
+
+/// `reel`, ou l'un de ses parents sous `racine_reelle` (exclue), porte-t-il
+/// l'attribut caché de Windows ?
+fn cache_par_attribut(
+    reel: &Path,
+    racine_reelle: &Path,
+    attributs: impl Fn(&Path) -> Option<u32>,
+) -> bool {
+    reel.ancestors()
+        .take_while(|a| *a != racine_reelle && a.starts_with(racine_reelle))
+        .any(|a| attributs(a).is_some_and(|x| x & ATTRIBUT_CACHE != 0))
+}
+
+/// Les attributs de fichier Windows de `chemin` (`None` ailleurs).
+fn attributs_de(chemin: &Path) -> Option<u32> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        std::fs::metadata(chemin).ok().map(|m| m.file_attributes())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = chemin;
+        None
+    }
 }
 
 /// Les attributs de fichier Windows d'une entrée (`None` ailleurs).
@@ -355,16 +448,58 @@ fn attributs_windows(entree: &std::fs::DirEntry) -> Option<u32> {
 
 /// `lost+found` : le dossier de récupération d'ext2/3/4, jamais de la musique.
 const DOSSIERS_DE_RECUPERATION: &[&str] = &["lost+found"];
+/// Le dossier de travail de Tune, nommé même s'il quittait `SKIP_DIRS`.
+const DOSSIER_DE_TUNE: &str = ".tune";
+
+/// Un « : » est-il interdit dans `texte` ? Sous Windows seulement : il y
+/// ouvre un flux NTFS (`duplicates::$INDEX_ALLOCATION` crée le vrai dossier
+/// `duplicates`). Sous Linux et macOS, c'est un caractère de nom valide
+/// (`Live: 1991`).
+fn deux_points_interdit(texte: &str, windows: bool) -> bool {
+    windows && texte.contains(':')
+}
+
+/// Un segment que Windows réduit à « . » ou à « .. » en retirant ses points
+/// et espaces finals (`.. `, `...`, `. `).
+fn segment_vide_sous_windows(seg: &str) -> bool {
+    !seg.is_empty() && seg.trim_end_matches(['.', ' ']).is_empty()
+}
+
+/// Un nom réservé par Windows (`NUL`, `CON`, `COM1`…), extension comprise
+/// (`nul.txt`) : même règle que [`nom_sur`].
+fn nom_reserve_windows(seg: &str) -> bool {
+    let racine = seg
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .to_ascii_uppercase();
+    RESERVES.contains(&racine.as_str())
+}
 /// `FILE_ATTRIBUTE_HIDDEN`.
 const ATTRIBUT_CACHE: u32 = 0x2;
 
-/// Un nom de dossier à ne pas proposer. `attributs` : les attributs de
-/// fichier Windows, s'ils sont connus.
-fn nom_masque(nom: &str, attributs: Option<u32>) -> bool {
-    nom.starts_with('.')
-        || tune_core::scanner::dossier_systeme_ignore(nom)
-        || tune_core::scanner::walker::SKIP_DIRS.contains(&nom)
-        || DOSSIERS_DE_RECUPERATION.contains(&nom)
+/// Un nom de dossier à ne pas proposer ni accepter : AU MOINS ce que le scan
+/// ignore (`SKIP_DIRS`, dossiers système), plus `lost+found`, `.tune` et,
+/// sous Windows, un nom à deux-points (flux NTFS) ou l'attribut caché. Un
+/// dossier qui commence simplement par un point (`.38 Special`) est parcouru
+/// par le scan : il reste choisissable.
+///
+/// Le point et l'espace finals sont retirés d'abord (Windows les retire en
+/// créant le dossier : `duplicates.` deviendrait `duplicates`) ; les noms
+/// propres à Tune se comparent sans la casse (montages CIFS, systèmes
+/// insensibles à la casse). `attributs` : les attributs de fichier Windows,
+/// s'ils sont connus.
+fn nom_masque(nom: &str, attributs: Option<u32>, windows: bool) -> bool {
+    if deux_points_interdit(nom, windows) {
+        return true;
+    }
+    let nom = nom.trim_end_matches(['.', ' ']);
+    let meme = |n: &&str| n.eq_ignore_ascii_case(nom);
+    tune_core::scanner::dossier_systeme_ignore(nom)
+        || tune_core::scanner::walker::SKIP_DIRS.iter().any(meme)
+        || DOSSIERS_DE_RECUPERATION.iter().any(meme)
+        || DOSSIER_DE_TUNE.eq_ignore_ascii_case(nom)
         || attributs.is_some_and(|a| a & ATTRIBUT_CACHE != 0)
 }
 
@@ -376,15 +511,22 @@ pub(crate) mod tests_course {
     use std::sync::Mutex;
 
     type Action = Box<dyn FnOnce() + Send>;
-    static ACTIONS: Mutex<Vec<(PathBuf, Action)>> = Mutex::new(Vec::new());
+    type File = Mutex<Vec<(PathBuf, Action)>>;
+    static ACTIONS: File = Mutex::new(Vec::new());
+    static AVANT_CANONIQUE: File = Mutex::new(Vec::new());
 
     pub fn programmer(chemin: PathBuf, action: Action) {
         ACTIONS.lock().unwrap().push((chemin, action));
     }
 
-    pub fn apres_verification(chemin: &Path) {
+    /// Une action jouée entre `verifier` et la forme canonique.
+    pub fn programmer_avant_canonique(chemin: PathBuf, action: Action) {
+        AVANT_CANONIQUE.lock().unwrap().push((chemin, action));
+    }
+
+    fn jouer(file: &File, chemin: &Path) {
         let action = {
-            let mut a = ACTIONS.lock().unwrap();
+            let mut a = file.lock().unwrap();
             a.iter()
                 .position(|(c, _)| c == chemin)
                 .map(|i| a.remove(i).1)
@@ -392,6 +534,14 @@ pub(crate) mod tests_course {
         if let Some(action) = action {
             action();
         }
+    }
+
+    pub fn apres_verification(chemin: &Path) {
+        jouer(&ACTIONS, chemin);
+    }
+
+    pub fn avant_canonique(chemin: &Path) {
+        jouer(&AVANT_CANONIQUE, chemin);
     }
 }
 
@@ -693,15 +843,251 @@ mod tests {
         let racine = bib.path().to_string_lossy().to_string();
         let places = [racine.clone()];
         let l = sous_dossiers(Some(&racine), &places).unwrap();
-        assert_eq!(noms(&l), ["Bon"]);
-        for d in [".cache", ".cache/dedans", "lost+found", "duplicates"] {
+        // `.cache` : le scan le parcourt, il reste proposé (voir
+        // `un_dossier_qui_commence_par_un_point_est_accepte`).
+        assert_eq!(noms(&l), [".cache", "Bon"]);
+        for d in [".tune", ".tune/dedans", "lost+found", "duplicates"] {
             let r = sous_dossiers(Some(&format!("{racine}/{d}")), &places).unwrap_err();
             assert_eq!(r.motif, "dossier_masque", "{d}");
         }
         // L'attribut caché de Windows (FILE_ATTRIBUTE_HIDDEN = 0x2).
-        assert!(nom_masque("Musique", Some(0x2)));
-        assert!(!nom_masque("Musique", Some(0x10)));
-        assert!(!nom_masque("Musique", None));
+        assert!(nom_masque("Musique", Some(0x2), false));
+        assert!(!nom_masque("Musique", Some(0x10), false));
+        assert!(!nom_masque("Musique", None, false));
+    }
+
+    // ─── Dossiers masqués par lien, par réglage, par attribut (fil 3036) ──
+
+    /// Point 1 — un lien vers un dossier masqué ne s'ouvre pas, n'est pas
+    /// proposé, et un lien re-pointé vers un dossier masqué entre la
+    /// vérification et la lecture est refusé à la forme canonique.
+    #[cfg(unix)]
+    #[test]
+    fn un_lien_vers_un_dossier_masque_est_refuse() {
+        let bib = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(bib.path().join(".tune/interne")).unwrap();
+        std::fs::create_dir_all(bib.path().join("A/sous")).unwrap();
+        std::fs::create_dir(bib.path().join("Bon")).unwrap();
+        let racine = bib.path().to_string_lossy().to_string();
+        let places = [racine.clone()];
+        let lien = bib.path().join("lien");
+        std::os::unix::fs::symlink(bib.path().join(".tune"), &lien).unwrap();
+
+        let r = sous_dossiers(Some(&lien.to_string_lossy()), &places).unwrap_err();
+        assert_eq!(r.motif, "dossier_masque");
+        let l = sous_dossiers(Some(&racine), &places).unwrap();
+        assert_eq!(
+            noms(&l),
+            ["A", "Bon"],
+            "le lien vers .tune n'est pas proposé"
+        );
+
+        // Course : `bascule` mène à A au moment de `verifier`, puis à .tune.
+        let bascule = bib.path().join("bascule");
+        std::os::unix::fs::symlink(bib.path().join("A"), &bascule).unwrap();
+        let (b2, cible) = (bascule.clone(), bib.path().join(".tune"));
+        tests_course::programmer_avant_canonique(
+            bascule.clone(),
+            Box::new(move || {
+                std::fs::remove_file(&b2).unwrap();
+                std::os::unix::fs::symlink(&cible, &b2).unwrap();
+            }),
+        );
+        let r = sous_dossiers(Some(&bascule.to_string_lossy()), &places).unwrap_err();
+        assert_eq!(r.motif, "dossier_masque");
+    }
+
+    /// Point 2 — le refus vit dans `verifier` : la destination du réglage et
+    /// du lancement ne peut viser ni `.tune`, ni `duplicates`, ni un dossier
+    /// caché, même à créer, même par un lien.
+    #[cfg(unix)]
+    #[test]
+    fn verifier_refuse_les_dossiers_masques() {
+        let bib = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(bib.path().join("duplicates")).unwrap();
+        std::fs::create_dir_all(bib.path().join(".tune")).unwrap();
+        std::os::unix::fs::symlink(bib.path().join("duplicates"), bib.path().join("lien")).unwrap();
+        let racine = bib.path().to_string_lossy().to_string();
+        let places = [racine.clone()];
+        for d in [
+            ".tune",
+            "duplicates",
+            "duplicates/x",
+            ".tune/neuf",
+            "lost+found",
+            "lien",
+            "lien/x",
+        ] {
+            let r = verifier(&format!("{racine}/{d}"), &places).unwrap_err();
+            assert_eq!(r.motif, "dossier_masque", "{d}");
+        }
+        assert!(verifier(&format!("{racine}/Bon/neuf"), &places).is_ok());
+        assert!(verifier(&racine, &places).is_ok(), "l'emplacement lui-même");
+    }
+
+    /// Point 3 — l'attribut caché de Windows refuse aussi un dossier demandé
+    /// directement (et ce qu'il contient), pas seulement à l'affichage.
+    #[cfg(unix)]
+    #[test]
+    fn l_attribut_cache_de_windows_refuse_un_dossier_demande() {
+        let bib = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(bib.path().join("Cache/dedans")).unwrap();
+        std::fs::create_dir_all(bib.path().join("Visible")).unwrap();
+        let racine = bib.path().to_string_lossy().to_string();
+        let places = [racine.clone()];
+        let cache = std::fs::canonicalize(bib.path().join("Cache")).unwrap();
+        let attributs = |p: &Path| (p == cache).then_some(ATTRIBUT_CACHE);
+        for d in ["Cache", "Cache/dedans", "Cache/neuf"] {
+            let r = verifier_avec(&format!("{racine}/{d}"), &places, attributs, false).unwrap_err();
+            assert_eq!(r.motif, "dossier_masque", "{d}");
+        }
+        assert!(verifier_avec(&format!("{racine}/Visible"), &places, attributs, false).is_ok());
+    }
+
+    // ─── Au moins ce que le scan ignore (fil 3036, relecture) ────────────
+
+    /// Deux-points : refusé sous Windows (flux NTFS :
+    /// `duplicates::$INDEX_ALLOCATION` crée le vrai dossier `duplicates`),
+    /// accepté ailleurs, où c'est un caractère de nom (`Live: 1991` reste
+    /// proposé, ouvert et choisi). Segments que Windows réduit à « . » ou
+    /// « .. » : refusés sous Windows.
+    #[cfg(unix)]
+    #[test]
+    fn un_deux_points_ou_un_segment_vide_sous_windows_est_refuse() {
+        // Sous Windows : la règle, injectée.
+        for d in ["duplicates::$INDEX_ALLOCATION", "A:b/x", "Live: 1991"] {
+            assert!(deux_points_interdit(d, true), "Windows : « {d} »");
+        }
+        assert!(!deux_points_interdit("Live 1991", true));
+        // Ailleurs (ce système) : accepté.
+        for d in ["duplicates::$INDEX_ALLOCATION", "Live: 1991"] {
+            assert!(!deux_points_interdit(d, false), "Unix : « {d} »");
+        }
+        let bib = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(bib.path().join("Live: 1991/Face A")).unwrap();
+        std::fs::create_dir(bib.path().join("Bon")).unwrap();
+        let racine = bib.path().to_string_lossy().to_string();
+        let places = [racine.clone()];
+        let live = format!("{racine}/Live: 1991");
+        assert!(!nom_masque("Live: 1991", None, false));
+        assert!(verifier(&live, &places).is_ok());
+        assert!(verifier(&format!("{live}/Neuf"), &places).is_ok());
+        let l = sous_dossiers(Some(&racine), &places).unwrap();
+        assert_eq!(noms(&l), ["Bon", "Live: 1991"]);
+        assert_eq!(
+            noms(&sous_dossiers(Some(&live), &places).unwrap()),
+            ["Face A"]
+        );
+
+        for seg in [".. ", "...", ". ", "..  .", " . "] {
+            assert!(segment_vide_sous_windows(seg), "« {seg} »");
+        }
+        for seg in ["", "..x", ".38 Special", "a.", "Vol. 2"] {
+            assert!(!segment_vide_sous_windows(seg), "« {seg} »");
+        }
+    }
+
+    /// Point 1 — un point ou une espace final (que Windows retire en créant
+    /// le dossier) ne contourne pas le masque ; la casse non plus (montages
+    /// CIFS, systèmes insensibles à la casse).
+    #[cfg(unix)]
+    #[test]
+    fn un_point_ou_une_espace_final_ne_contourne_pas_le_masque() {
+        let bib = tempfile::tempdir().unwrap();
+        let racine = bib.path().to_string_lossy().to_string();
+        let places = [racine.clone()];
+        for d in [
+            "duplicates.",
+            "duplicates ",
+            "duplicates. .",
+            ".tune.",
+            "$Recycle.Bin.",
+            "lost+found ",
+            "Duplicates",
+            ".TUNE",
+            "Lost+Found",
+        ] {
+            let r = verifier(&format!("{racine}/{d}/x"), &places).unwrap_err();
+            assert_eq!(r.motif, "dossier_masque", "« {d} »");
+        }
+        std::fs::create_dir(bib.path().join("duplicates.")).unwrap();
+        std::fs::create_dir(bib.path().join("Bon")).unwrap();
+        let l = sous_dossiers(Some(&racine), &places).unwrap();
+        assert_eq!(noms(&l), ["Bon"]);
+    }
+
+    /// Point 2 — un dossier qui commence par un point, que le scan parcourt,
+    /// reste choisissable : `.38 Special` est accepté, listé et ouvert.
+    #[cfg(unix)]
+    #[test]
+    fn un_dossier_qui_commence_par_un_point_est_accepte() {
+        let bib = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(bib.path().join(".38 Special/Live")).unwrap();
+        let racine = bib.path().to_string_lossy().to_string();
+        let places = [racine.clone()];
+        let special = format!("{racine}/.38 Special");
+        assert!(verifier(&special, &places).is_ok());
+        assert!(verifier(&format!("{special}/Neuf"), &places).is_ok());
+        assert_eq!(
+            noms(&sous_dossiers(Some(&racine), &places).unwrap()),
+            [".38 Special"]
+        );
+        assert_eq!(
+            noms(&sous_dossiers(Some(&special), &places).unwrap()),
+            ["Live"]
+        );
+    }
+
+    /// Point 3 — `canonique_dans` refuse l'attribut caché de Windows de la
+    /// cible résolue (attributs injectés).
+    #[cfg(unix)]
+    #[test]
+    fn canonique_dans_refuse_l_attribut_cache_injecte() {
+        let bib = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(bib.path().join("Cache/dedans")).unwrap();
+        std::fs::create_dir_all(bib.path().join("Visible")).unwrap();
+        let racine = bib.path().to_string_lossy().to_string();
+        let places = [racine.clone()];
+        let cache = std::fs::canonicalize(bib.path().join("Cache")).unwrap();
+        let attributs = |p: &Path| (p == cache).then_some(ATTRIBUT_CACHE);
+        for d in ["Cache", "Cache/dedans"] {
+            let r = canonique_dans_avec(&bib.path().join(d), &places, attributs).unwrap_err();
+            assert_eq!(r.motif, "dossier_masque", "{d}");
+        }
+        assert!(canonique_dans_avec(&bib.path().join("Visible"), &places, attributs).is_ok());
+    }
+
+    /// Le branchement Windows de `verifier`, exercé par injection : retirer
+    /// le refus des segments réduits, des noms réservés ou du « : » (dans
+    /// `verifier` ou dans `nom_masque`) fait rougir ce témoin.
+    #[cfg(unix)]
+    #[test]
+    fn le_branchement_windows_de_verifier_est_exerce() {
+        let bib = tempfile::tempdir().unwrap();
+        std::fs::create_dir(bib.path().join("A")).unwrap();
+        let racine = bib.path().to_string_lossy().to_string();
+        let places = [racine.clone()];
+        let sans = |_: &Path| None;
+        let cas = [
+            "duplicates::$INDEX_ALLOCATION",
+            "A/.. /x",
+            "A/.../x",
+            "A/. /x",
+            "NUL/x",
+            "A/nul.txt",
+            "A/COM1",
+        ];
+        for d in cas {
+            let r = verifier_avec(&format!("{racine}/{d}"), &places, sans, true).unwrap_err();
+            assert_eq!(r.motif, "destination_invalide", "Windows : « {d} »");
+            assert!(
+                verifier_avec(&format!("{racine}/{d}"), &places, sans, false).is_ok(),
+                "ailleurs : « {d} »"
+            );
+        }
+        assert!(verifier_avec(&format!("{racine}/A/Console"), &places, sans, true).is_ok());
+        assert!(nom_masque("a:b", None, true));
+        assert!(!nom_masque("a:b", None, false));
     }
 
     #[cfg(unix)]
