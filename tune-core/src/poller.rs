@@ -893,6 +893,15 @@ impl PositionPoller {
                 zone.as_ref().map(|z| z.name.as_str()).unwrap_or("?")
             )
         };
+        // Diagnostic rc14 (#8963) : à l'abandon, le téléphone parlait-il
+        // encore au serveur par le pont, et quel flux le pont a-t-il demandé
+        // en dernier ? Voir `cloud::activite_du_relais`.
+        let flux_en_cours = zone_state
+            .now_playing
+            .as_ref()
+            .and_then(|np| np.stream_id.as_deref())
+            .map(crate::cloud::activite_du_relais::identifiant_court);
+        let derniere_demande = crate::cloud::activite_du_relais::derniere_demande_de_flux_relayee();
         warn!(
             zone_id,
             navigateur,
@@ -901,6 +910,12 @@ impl PositionPoller {
                 .as_ref()
                 .map(|np| np.title.as_str())
                 .unwrap_or(""),
+            flux = ?flux_en_cours,
+            octets_servis = ?octets_servis,
+            depuis_requete_relayee_ms =
+                ?crate::cloud::activite_du_relais::depuis_la_derniere_requete_relayee_ms(),
+            depuis_demande_de_flux_relayee_ms = ?derniere_demande.as_ref().map(|(ms, _)| *ms),
+            dernier_flux_demande_par_le_pont = ?derniere_demande.map(|(_, id)| id),
             "lecture_sans_destination_abandonnee"
         );
         if let Some(ref bus) = self.event_bus {
@@ -1163,6 +1178,10 @@ mod source_en_erreur_9315_tests;
 /// puis l'arrêt avec bandeau.
 mod demarrage_fige_5522;
 
+/// #9043 — barre de progression « collée à la fin » dès le départ d'une
+/// piste : diagnostic, une ligne par piste.
+mod barre_au_bout_9043;
+
 /// #5522 — le banc : vrai sondeur, sortie factice figée à 0.
 #[cfg(test)]
 mod demarrage_fige_5522_tests;
@@ -1414,6 +1433,10 @@ mod bascule_des_niveaux_tests {
 #[cfg(test)]
 mod repli_logo_station_tests;
 
+/// #8452 — Cover+ au site d'appel : le sondeur radio affiche la pochette
+/// retrouvée, et le logo quand la station coupe Cover+.
+#[cfg(test)]
+mod cover_plus_8452_tests;
 /// #7051 — une station jouée depuis l'annuaire, hors de « Mes radios », garde
 /// son logo quand le premier titre du flux arrive (Radio Bergeijk, fil 2443).
 #[cfg(test)]

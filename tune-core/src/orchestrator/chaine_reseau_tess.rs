@@ -25,10 +25,12 @@
 //! - **Étages fixes en `f64` natif** : le ReplayGain (point d'insertion du
 //!   headroom de T07, AVANT l'exécuteur) et la compensation (#5071, APRÈS,
 //!   juste avant la quantification) sont de simples gains, appliqués en `f64`.
-//! - **Adaptateurs provisoires `f32` ↔ `f64`** pour l'égaliseur, le convolveur
-//!   et le crossfeed, comme sur la sortie locale (T03) : leurs moteurs ont des
-//!   entrées `f32`. T05, T06, T09b et T14 les remplacent par des étages `f64`.
-//!   Aucune AUTRE conversion `f32` ni entière n'existe entre deux étages.
+//! - **Moteurs de référence en `f64` natif (T06)** : l'égaliseur et le
+//!   crossfeed reçoivent le tampon `f64` de l'exécuteur tel quel. Seul le
+//!   convolveur garde un adaptateur provisoire `f32` ↔ `f64` (T09b le porte) ;
+//!   un natif tiers `F32` est converti à SA frontière (T05). Aucune AUTRE
+//!   conversion `f32` ni entière n'existe entre deux étages
+//!   (`crate::tess::sonde_f32` le vérifie en test).
 //! - **Bit-perfect** : sans étage actif, le porteur ne touche pas un octet
 //!   ([`StreamingDsp::is_active`]) ; avec des étages qui rendent des mots
 //!   exacts, la quantification les rend à l'identité, sans dither (règle de
@@ -39,11 +41,12 @@
 //! - **Compensation, piste entière** : la piste ENTIÈRE est un seul bloc
 //!   (#5071) — le gain est borné par la crête de la piste traitée. La sortie de
 //!   la chaîne est donc gardée jusqu'à la fin de la piste ([`Stockage`]) : en
-//!   `f32` quand chaque échantillon y est EXACT (c'est le cas tant qu'un
-//!   adaptateur `f32` est le dernier étage, ce qui est toujours vrai quand la
-//!   compensation existe : elle exige un égaliseur ou un crossfeed), en `f64`
-//!   sinon. Aucune précision n'est jamais perdue, et la mémoire reste celle
-//!   d'avant (le convolveur faisait déjà une copie `f32` de la piste).
+//!   `f32` quand chaque échantillon y est EXACT (dernier étage actif = le
+//!   convolveur `f32`), en `f64` sinon. Aucune précision n'est jamais perdue.
+//!   Depuis T06, l'égaliseur et le crossfeed rendent des `f64` : une piste
+//!   compensée est alors gardée en `f64`, place réservée d'emblée, jusqu'à
+//!   [`SEUIL_STOCKAGE_F64`] échantillons ; au-delà, en `f32` (garde-fou
+//!   mémoire pour les longues pistes en haute résolution).
 
 use std::cell::RefCell;
 
@@ -141,6 +144,8 @@ thread_local! {
 /// Fait passer `tampon` par un moteur `f32` : un seul appel par tranche,
 /// converti dans le tampon du fil.
 fn par_tranches_f32(tampon: &mut [f64], canaux: usize, mut moteur: impl FnMut(&mut [f32])) {
+    #[cfg(test)]
+    crate::tess::sonde_f32::noter();
     let pas = pas_de_tranche(canaux);
     for morceau in tampon.chunks_mut(pas) {
         TAMPON_F32.with(|cellule| {
@@ -175,7 +180,8 @@ fn pas_de_tranche(canaux: usize) -> usize {
     ((TRANCHE / canaux) * canaux).max(canaux)
 }
 
-/// Adaptateur provisoire de l'égaliseur (`f32`) : à porter en `f64` par T06.
+/// L'égaliseur (graphique, paramétrique, casque AutoEQ et OPRA), en `f64`
+/// natif depuis TESS T06 : aucun aller-retour par `f32`.
 struct AdaptateurEgaliseur<'a> {
     moteur: &'a mut Option<EqProcessor>,
     canaux: usize,
@@ -191,14 +197,11 @@ impl EtageTess for AdaptateurEgaliseur<'_> {
     }
     fn traiter_sur_place(&mut self, t: &mut [f64], trames: usize) -> Result<(), ErreurEtage> {
         verifier_tampon(t.len(), trames, self.canaux as u16)?;
-        // Un égaliseur coupé qui a fini son fondu ne fait rien (#5215) : pas
-        // de passage par le `f32` pour rien.
+        // Un égaliseur coupé qui a fini son fondu ne fait rien (#5215).
         if let Some(p) = self.moteur.as_mut()
             && !p.est_neutre_au_repos()
         {
-            par_tranches_f32(&mut t[..trames * self.canaux], self.canaux, |f| {
-                p.process_interleaved(f);
-            });
+            p.process_interleaved_f64(&mut t[..trames * self.canaux]);
         }
         Ok(())
     }
@@ -268,8 +271,9 @@ impl EtageTess for AdaptateurConvolution<'_> {
     fn definir_bypass(&mut self, _: bool) {}
 }
 
-/// Adaptateur provisoire du crossfeed et des natifs tiers (`f32`), stéréo
-/// seulement : à porter en `f64` par T05/T14.
+/// Le crossfeed (v1 intégré, en `f64` natif depuis TESS T06) et les natifs
+/// tiers (convertis à LEUR frontière s'ils sont des paquets `F32`, T05),
+/// stéréo seulement.
 struct AdaptateurCrossfeed<'a> {
     moteur: &'a mut Option<CrossfeedProcessor>,
     /// Le porteur dit-il traiter de la stéréo ? (`StreamingDsp::channels`,
@@ -292,7 +296,7 @@ impl EtageTess for AdaptateurCrossfeed<'_> {
             return Ok(());
         }
         if let Some(c) = self.moteur.as_mut() {
-            par_tranches_f32(&mut t[..trames * 2], 2, |f| c.process_interleaved(f));
+            c.process_interleaved_f64(&mut t[..trames * 2]);
         }
         Ok(())
     }
@@ -302,23 +306,60 @@ impl EtageTess for AdaptateurCrossfeed<'_> {
     fn definir_bypass(&mut self, _: bool) {}
 }
 
+/// Au-delà de ce nombre d'échantillons (32 Mi, 256 Mo en `f64`), une piste
+/// gardée pour la compensation l'est en `f32` : garde-fou mémoire (relecture
+/// de #9414). Une piste de 10 min en 192 kHz stéréo (230 M échantillons)
+/// prendrait 1,8 Go en `f64`, plus que la mémoire d'un Pi de 2 Go ; en `f32`,
+/// réservée d'emblée, 920 Mo. En deçà (≈ 6 min à 44,1 kHz stéréo, 1 min 27 s
+/// à 192 kHz), la piste garde ses 64 bits : la compensation reste UNE
+/// quantification de la référence `f64` (#5071, T04).
+pub(super) const SEUIL_STOCKAGE_F64: usize = 32 << 20;
+
 /// La sortie de la chaîne gardée jusqu'à la fin de l'appel, quand la
 /// compensation doit voir la crête de TOUT le bloc avant d'appliquer son
-/// gain. En `f32` tant que chaque échantillon y est exact, en `f64` dès qu'un
-/// seul ne l'est plus : jamais aucune perte.
+/// gain.
+///
+/// - Sous [`SEUIL_STOCKAGE_F64`] : en `f32` tant que chaque échantillon y est
+///   exact (dernier étage : le convolveur `f32`), en `f64` dès qu'un seul ne
+///   l'est plus — aucune perte.
+/// - Au-delà : en `f32`, arrondi au plus proche (erreur relative ≤ 2⁻²⁴, sous
+///   le dither TPDF de la quantification finale à 16 bits, de l'ordre d'un
+///   demi-LSB à 24 bits en pleine échelle) : la mémoire prime.
+///
+/// La place est RÉSERVÉE d'après la longueur connue de l'appel (la piste
+/// entière est dans le tampon) : ni réallocation, ni capacité doublée.
 enum Stockage {
-    F32(Vec<f32>),
+    F32 {
+        v: Vec<f32>,
+        arrondi_permis: bool,
+        total: usize,
+    },
     F64(Vec<f64>),
 }
 
 impl Stockage {
+    /// Un stockage pour `total` échantillons attendus.
+    fn pour(total: usize, seuil_f64: usize) -> Self {
+        Self::F32 {
+            v: Vec::with_capacity(total),
+            arrondi_permis: total > seuil_f64,
+            total,
+        }
+    }
+
     fn ajouter(&mut self, y: &[f64]) {
-        if let Self::F32(v) = self {
-            if y.iter().all(|&x| f64::from(x as f32) == x) {
+        if let Self::F32 {
+            v,
+            arrondi_permis,
+            total,
+        } = self
+        {
+            if *arrondi_permis || y.iter().all(|&x| f64::from(x as f32) == x) {
                 v.extend(y.iter().map(|&x| x as f32));
                 return;
             }
-            let large: Vec<f64> = v.iter().map(|&x| f64::from(x)).collect();
+            let mut large: Vec<f64> = Vec::with_capacity((*total).max(v.len() + y.len()));
+            large.extend(v.iter().map(|&x| f64::from(x)));
             *self = Self::F64(large);
         }
         if let Self::F64(v) = self {
@@ -328,14 +369,14 @@ impl Stockage {
 
     fn len(&self) -> usize {
         match self {
-            Self::F32(v) => v.len(),
+            Self::F32 { v, .. } => v.len(),
             Self::F64(v) => v.len(),
         }
     }
 
     fn crete(&self) -> f64 {
         match self {
-            Self::F32(v) => v.iter().fold(0.0_f64, |m, &x| m.max(f64::from(x).abs())),
+            Self::F32 { v, .. } => v.iter().fold(0.0_f64, |m, &x| m.max(f64::from(x).abs())),
             Self::F64(v) => v.iter().fold(0.0_f64, |m, &x| m.max(x.abs())),
         }
     }
@@ -343,7 +384,7 @@ impl Stockage {
     /// Copie `[debut, debut + n)` en `f64` dans `sortie`.
     fn lire(&self, debut: usize, sortie: &mut [f64]) {
         match self {
-            Self::F32(v) => {
+            Self::F32 { v, .. } => {
                 for (d, s) in sortie.iter_mut().zip(&v[debut..]) {
                     *d = f64::from(*s);
                 }
@@ -578,7 +619,7 @@ impl StreamingDsp {
         let facteur = replaygain.filter(|f| (f - 1.0).abs() >= 1e-9);
         let mut compteur_rg = CompteurDEcretage::default();
         let mut puits = if compensation.is_some() {
-            Puits::Garde(Stockage::F32(Vec::new()))
+            Puits::Garde(Stockage::pour(echantillons, SEUIL_STOCKAGE_F64))
         } else {
             Puits::Direct { ecrits: 0 }
         };

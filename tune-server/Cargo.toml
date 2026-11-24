@@ -300,6 +300,19 @@ path = "tests/pont_administration.rs"
 name = "relais_routes_relayables"
 path = "tests/relais_routes_relayables.rs"
 
+# #9174 — la provenance du lecteur d'une zone navigateur (relais ou local).
+# `autotests = false` plus haut : sans cette cible, jamais compilé.
+[[test]]
+name = "relais_format_compresse_9174"
+path = "tests/relais_format_compresse_9174.rs"
+
+# Garde de la couche d'authentification (routes privilégiées, profil
+# `default`, premier lancement). `autotests = false` plus haut : sans cette
+# cible, jamais compilé.
+[[test]]
+name = "auth_security"
+path = "tests/auth_security.rs"
+
 # #3326 — le mode de transition (un `client/hello` en clair). `autotests =
 # false` plus haut : sans cette cible, le fichier ne serait JAMAIS compilé, et
 # la contre-épreuve qui garde le chemin chiffré ne serait exécutée par personne.
@@ -1325,6 +1338,11 @@ path = "tests/web_response_contracts.rs"
 name = "indexation_upnp_2219"
 path = "tests/indexation_upnp_2219.rs"
 
+# Fil du forum 3028 : Tune ne s'indexe pas lui-même (UDN et adresses locales).
+[[test]]
+name = "auto_indexation_upnp_3028"
+path = "tests/auto_indexation_upnp_3028.rs"
+
 [[test]]
 name = "refus_oaat_upnp_2219"
 path = "tests/refus_oaat_upnp_2219.rs"
@@ -1543,6 +1561,11 @@ path = "tests/tess_api_routes_t08.rs"
 [[test]]
 name = "import_convolution_t09a"
 path = "tests/import_convolution_t09a.rs"
+
+# TESS T17 — préréglages de chaîne globaux et mode d'application.
+[[test]]
+name = "tess_prereglages_routes_t17"
+path = "tests/tess_prereglages_routes_t17.rs"
 
 # #4602 — le scan complet rend les mêmes comptes à chaque passe, sur SQLite
 # et sur PostgreSQL (`TUNE_TEST_PG_URL`). `autotests = false` plus haut : sans

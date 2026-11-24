@@ -44,6 +44,17 @@ async fn banc() -> Banc {
                 )
             }),
         )
+        // Fil 2972 — le clic sonde l'hébergeur : l'épisode à extension
+        // connue doit exister (un 404 le dirait indisponible).
+        .route(
+            "/media/ep.mp3",
+            get(|| async {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "audio/mpeg")],
+                    vec![0u8; 64],
+                )
+            }),
+        )
         .route(
             "/media/inconnu",
             get(|| async {

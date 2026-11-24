@@ -945,7 +945,9 @@
         "sdk/tune-plugin-native/tests/f64.rs::un_greffon_f32_signe_et_installe_tourne_inchange_par_la_conversion_a_sa_frontiere",
         "sdk/tune-plugin-native/tests/f64.rs::un_greffon_qui_demande_audio_f64_recoit_bien_du_f64",
         "sdk/tune-plugin-native/tests/f64.rs::contre_epreuve_un_greffon_qui_declare_f64_sans_l_implementer_est_refuse_au_chargement",
-        "sdk/tune-plugin-native/tests/native.rs::reference_f32_plugins_run_unchanged_behind_the_f64_boundary"
+        "sdk/tune-plugin-native/tests/native.rs::reference_plugins_run_behind_the_f64_boundary",
+        "sdk/tune-plugin-equalizer/tests/banc_f64_t06.rs::le_greffon_sdk_traite_le_f64_tel_quel",
+        "sdk/tune-plugin-crossfeed/tests/banc_f64_t06.rs::le_greffon_sdk_traite_le_f64_tel_quel"
       ],
       "implementation": "implemented",
       "implementation_files": [
@@ -954,7 +956,7 @@
         "sdk/tune-plugin-native/src/lib.rs",
         "sdk/tune-plugin-testkit/src/lib.rs"
       ],
-      "qualification_note": "Production acceptance pending: the Tune pipeline still feeds f32 to native stages until the TESS executor (T03/T14) calls process_f64."
+      "qualification_note": "Production acceptance pending. TESS T06: the reference equalizer and crossfeed request audio-f64, and the TESS executors (local and network) call process_f64 for their native providers and third-party stages."
     }
   ]
 }

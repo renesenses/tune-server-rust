@@ -40,9 +40,8 @@ impl DspFactory for Equalizer {
         max_frames: usize,
         settings: &Settings,
     ) -> Result<Box<dyn Processor>, Error> {
-        if format.encoding() == SampleEncoding::F64 {
-            return Err(Error::UnsupportedFormat);
-        }
+        // TESS T06 — `F64` accepté (le manifeste demande `audio-f64`) : la
+        // cascade reçoit les échantillons de l'hôte tels quels.
         let count = max_frames
             .checked_mul(usize::from(format.channels()))
             .and_then(|n| n.checked_mul(4))
@@ -103,7 +102,7 @@ impl Processor for Instance {
                 }
                 stats
             }
-            SamplesMut::F64(_) => return Err(Error::UnsupportedFormat),
+            SamplesMut::F64(samples) => self.engine.process_interleaved_f64(samples),
         };
         let clipping = self.engine.ecretage();
         Ok(ProcessReport {

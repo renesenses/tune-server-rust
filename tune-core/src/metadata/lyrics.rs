@@ -229,8 +229,6 @@ pub fn write_sidecar_lrc(
     audio_path: &str,
     lrc: &str,
 ) -> Result<std::path::PathBuf, SidecarWriteError> {
-    use std::io::Write;
-
     if !has_lrc_timestamps(lrc) {
         return Err(SidecarWriteError::NotLrc);
     }
@@ -250,28 +248,139 @@ pub fn write_sidecar_lrc(
     }
     let target = sidecar_lrc_write_path(audio_path).ok_or(SidecarWriteError::BadPath)?;
 
-    // `create_new` : c'est le noyau qui refuse si le fichier apparaît
-    // entre-temps. Un `exists()` peut mentir une milliseconde plus tard ;
-    // cette garantie-là, non.
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&target)
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::AlreadyExists => SidecarWriteError::AlreadyExists(target.clone()),
-            _ => SidecarWriteError::Io(e.to_string()),
-        })?;
-
     let body = if lrc.ends_with('\n') {
         lrc.to_string()
     } else {
         format!("{lrc}\n")
     };
-    file.write_all(body.as_bytes())
-        .and_then(|()| file.flush())
-        .map_err(|e| SidecarWriteError::Io(e.to_string()))?;
-
+    publier_sans_ecraser(&target, body.as_bytes(), PublicationLrc::Atomique)?;
     Ok(target)
+}
+
+/// Comment [`publier_sans_ecraser`] pose le fichier final. Seuls les tests
+/// forcent le repli : en production, il n'intervient que si la voie atomique
+/// échoue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicationLrc {
+    /// Renommage sans écrasement (`renameat2(RENAME_NOREPLACE)` sous Linux,
+    /// `renamex_np(RENAME_EXCL)` sous macOS), sinon lien physique, puis repli.
+    Atomique,
+    /// Repli seul : pour les systèmes de fichiers sans liens physiques.
+    #[cfg(test)]
+    RepliSeul,
+}
+
+/// Pose `contenu` à l'emplacement `cible` **sans jamais montrer un fichier
+/// vide ni partiel, et sans jamais écraser** un fichier existant (#9076).
+///
+/// Le contenu est d'abord écrit et synchronisé dans un temporaire caché du
+/// **même dossier** (même système de fichiers : le renommage reste
+/// atomique). Il est ensuite publié par un renommage qui refuse d'écraser,
+/// ou par un lien physique (`link` échoue si la cible existe).
+///
+/// Repli pour exFAT et certains partages SMB, qui n'ont ni l'un ni l'autre :
+/// une réservation `create_new` de la cible (c'est encore le noyau qui
+/// refuse d'écraser), puis le renommage du temporaire déjà complet par-dessus
+/// cette réservation. Le fichier ne passe plus jamais par un état partiel ;
+/// il ne reste vide que le temps d'un seul appel système, au lieu de toute
+/// l'écriture.
+///
+/// Le temporaire est supprimé dans tous les cas d'échec (il est détruit quand
+/// `NamedTempFile` sort de portée).
+fn publier_sans_ecraser(
+    cible: &std::path::Path,
+    contenu: &[u8],
+    mode: PublicationLrc,
+) -> Result<(), SidecarWriteError> {
+    use std::io::Write;
+
+    let io = |e: std::io::Error| SidecarWriteError::Io(e.to_string());
+    let dossier = cible
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let mut tmp = tempfile::Builder::new()
+        .prefix(".tune-lrc-")
+        .suffix(".tmp")
+        .tempfile_in(dossier)
+        .map_err(io)?;
+    tmp.write_all(contenu)
+        .and_then(|()| tmp.flush())
+        .map_err(io)?;
+    donner_le_mode_public(tmp.as_file(), cible);
+    tmp.as_file().sync_all().map_err(io)?;
+
+    let tmp = match mode {
+        PublicationLrc::Atomique => match tmp.persist_noclobber(cible) {
+            Ok(_) => return Ok(()),
+            Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                // `e.file` est détruit ici : le temporaire disparaît.
+                return Err(SidecarWriteError::AlreadyExists(cible.to_path_buf()));
+            }
+            Err(e) => {
+                tracing::debug!(
+                    cible = %cible.display(),
+                    erreur = %e.error,
+                    "lrc_publication_atomique_indisponible_repli"
+                );
+                e.file
+            }
+        },
+        #[cfg(test)]
+        PublicationLrc::RepliSeul => tmp,
+    };
+
+    // Repli : réserver la cible (refus du noyau si elle existe), puis lui
+    // substituer le temporaire complet.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(cible)
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => {
+                SidecarWriteError::AlreadyExists(cible.to_path_buf())
+            }
+            _ => io(e),
+        })?;
+    if let Err(e) = tmp.persist(cible) {
+        // Ne pas laisser la réservation vide derrière nous : elle bloquerait
+        // toute écriture future (`AlreadyExists`).
+        if std::fs::metadata(cible)
+            .map(|m| m.len() == 0)
+            .unwrap_or(false)
+        {
+            let _ = std::fs::remove_file(cible);
+        }
+        return Err(io(e.error));
+    }
+    Ok(())
+}
+
+/// Mode du `.lrc` publié : celui d'un fichier ordinaire (0644), comme
+/// l'ancien `create_new`. `tempfile` crée son temporaire en 0600, et le
+/// renommage garderait ce mode : le `.lrc` deviendrait illisible depuis un
+/// partage Samba, un NAS ou pour un autre utilisateur (relecture rc14).
+#[cfg(unix)]
+const MODE_DU_LRC: u32 = 0o644;
+
+/// Pose [`MODE_DU_LRC`] sur le temporaire **avant** sa publication : le
+/// fichier final naît lisible, sans fenêtre en 0600. Un système de fichiers
+/// qui refuse `chmod` (exFAT, certains SMB) n'empêche pas l'écriture : il
+/// impose de toute façon son propre mode.
+fn donner_le_mode_public(fichier: &std::fs::File, cible: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = fichier.set_permissions(std::fs::Permissions::from_mode(MODE_DU_LRC)) {
+            tracing::debug!(
+                cible = %cible.display(),
+                erreur = %e,
+                "lrc_mode_public_refuse_par_le_systeme_de_fichiers"
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (fichier, cible);
 }
 
 #[cfg(test)]
@@ -547,6 +656,140 @@ mod tests {
             find_sidecar_lrc(audio.to_str().unwrap()).as_deref(),
             Some(lrc)
         );
+    }
+
+    // -- Écriture atomique (#9076) -----------------------------------------
+
+    /// Fichiers du dossier autres que ceux qu'on y a posés : aucun temporaire
+    /// ne doit traîner après une écriture, réussie ou refusée.
+    fn temporaires_restants(dir: &std::path::Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".tune-lrc-"))
+            .collect()
+    }
+
+    /// Contre-épreuve de #9076 : un témoin lit le `.lrc` en boucle pendant
+    /// l'écriture. Dès que le fichier existe, il doit être complet : jamais
+    /// vide, jamais tronqué. Avec l'ancien `create_new` + `write_all`, le
+    /// témoin voyait le fichier vide puis partiel pendant toute l'écriture.
+    #[test]
+    fn un_lecteur_concurrent_ne_voit_jamais_de_lrc_vide_ni_partiel() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // Un gros corps, pour que l'écriture dure assez longtemps.
+        let mut lrc = String::new();
+        for i in 0..200_000 {
+            lrc.push_str(&format!(
+                "[{:02}:{:02}.00] ligne {i} des paroles\n",
+                (i / 60) % 100,
+                i % 60
+            ));
+        }
+        let attendu = lrc.len() as u64;
+
+        for _ in 0..5 {
+            let dir = tempfile::TempDir::new().unwrap();
+            let audio = faux_morceau(&dir, "Song.flac");
+            let cible = dir.path().join("Song.lrc");
+
+            let fini = Arc::new(AtomicBool::new(false));
+            let temoin = {
+                let fini = Arc::clone(&fini);
+                let cible = cible.clone();
+                std::thread::spawn(move || {
+                    let mut vus_incomplets = Vec::new();
+                    loop {
+                        let termine = fini.load(Ordering::SeqCst);
+                        if let Ok(m) = std::fs::metadata(&cible)
+                            && m.len() != attendu
+                        {
+                            vus_incomplets.push(m.len());
+                        }
+                        if termine {
+                            return vus_incomplets;
+                        }
+                    }
+                })
+            };
+            // Laisser le témoin démarrer avant l'écriture.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            write_sidecar_lrc(&audio, &lrc).unwrap();
+            fini.store(true, Ordering::SeqCst);
+            let vus = temoin.join().unwrap();
+            assert!(
+                vus.is_empty(),
+                "le témoin a vu un `.lrc` incomplet ({} fois, tailles {:?}…) au lieu de {attendu} octets",
+                vus.len(),
+                &vus[..vus.len().min(5)]
+            );
+            assert_eq!(std::fs::read_to_string(&cible).unwrap(), lrc);
+            assert!(temporaires_restants(dir.path()).is_empty());
+        }
+    }
+
+    #[test]
+    fn aucun_temporaire_ne_reste_apres_un_refus_d_ecraser() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cible = dir.path().join("Song.lrc");
+        std::fs::write(&cible, "[00:09.00] celui de l'utilisateur").unwrap();
+
+        // Directement sur la publication : `write_sidecar_lrc` refuserait
+        // avant, par `sidecar_lrc_path`. Ici on simule la cible apparue
+        // entre-temps.
+        for mode in [PublicationLrc::Atomique, PublicationLrc::RepliSeul] {
+            let err = publier_sans_ecraser(&cible, b"[00:01.00] le notre\n", mode).unwrap_err();
+            assert!(
+                matches!(err, SidecarWriteError::AlreadyExists(_)),
+                "{mode:?}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&cible).unwrap(),
+                "[00:09.00] celui de l'utilisateur",
+                "{mode:?} : le fichier de l'utilisateur est intact"
+            );
+            assert!(temporaires_restants(dir.path()).is_empty(), "{mode:?}");
+        }
+    }
+
+    /// Le repli des systèmes de fichiers sans liens physiques (exFAT, SMB)
+    /// pose lui aussi le contenu complet, sans temporaire derrière lui.
+    #[test]
+    fn le_repli_sans_liens_physiques_pose_le_contenu_complet() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let cible = dir.path().join("Song.lrc");
+        publier_sans_ecraser(&cible, b"[00:01.00] repli\n", PublicationLrc::RepliSeul).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&cible).unwrap(),
+            "[00:01.00] repli\n"
+        );
+        assert!(temporaires_restants(dir.path()).is_empty());
+    }
+
+    /// Le `.lrc` publié est lisible par tous (0644), sur les deux voies :
+    /// le temporaire de `tempfile` naît en 0600 et le renommage garderait
+    /// ce mode (relecture rc14 de #9347).
+    #[cfg(unix)]
+    #[test]
+    fn le_lrc_publie_est_lisible_par_tous_sur_les_deux_voies() {
+        use std::os::unix::fs::PermissionsExt;
+        for mode in [PublicationLrc::Atomique, PublicationLrc::RepliSeul] {
+            let dir = tempfile::TempDir::new().unwrap();
+            let cible = dir.path().join("Song.lrc");
+            publier_sans_ecraser(&cible, b"[00:01.00] mode\n", mode).unwrap();
+            let droits = std::fs::metadata(&cible).unwrap().permissions().mode() & 0o777;
+            assert_eq!(droits, 0o644, "{mode:?} : mode {droits:o}");
+        }
+        // Et par l'entrée publique, à côté d'un vrai fichier audio.
+        let dir = tempfile::TempDir::new().unwrap();
+        let audio = dir.path().join("Song.flac");
+        std::fs::write(&audio, b"fLaC").unwrap();
+        let cible = write_sidecar_lrc(audio.to_str().unwrap(), "[00:01.00] mode").unwrap();
+        let droits = std::fs::metadata(&cible).unwrap().permissions().mode() & 0o777;
+        assert_eq!(droits, 0o644, "write_sidecar_lrc : mode {droits:o}");
     }
 
     /// Et le garde-fou tient : un fichier audio qu'aucune graphie ne trouve

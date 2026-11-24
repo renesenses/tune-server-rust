@@ -356,6 +356,37 @@ impl CrossfeedProcessor {
             }
         }
     }
+    /// TESS T06 — [`Self::process_interleaved`] sur le tampon stéréo **`f64`**
+    /// de l'exécuteur TESS. Le crossfeed intégré (v1, gratuit) calcule en
+    /// `f64` de bout en bout ; un greffon natif — crossfeed signé ou natif
+    /// tiers — reçoit le `f64` tel quel s'il demande `audio-f64`, sinon il est
+    /// converti à SA frontière (T05, `Stage::process_f64`), jamais entre deux
+    /// étages intégrés.
+    pub fn process_interleaved_f64(&mut self, samples: &mut [f64]) {
+        match &mut self.engine {
+            CrossfeedEngine::Bundled(p) => p.process_interleaved_f64(samples),
+            CrossfeedEngine::Native(p) => {
+                if let Err(error) = p.process_f64(samples) {
+                    tracing::error!(%error,"native_crossfeed_processing_failed");
+                }
+            }
+            CrossfeedEngine::Unavailable | CrossfeedEngine::Aucun => {}
+        }
+        for etage in &mut self.tiers {
+            if let Err(error) = etage.stage.process_f64(samples) {
+                tracing::error!(plugin = %etage.id, %error, "native_third_party_processing_failed");
+            }
+        }
+    }
+
+    /// TESS T14 — diagnostic : `(identifiant, traite le F64 lui-même)` par
+    /// étage tiers (F64 négocié avec le greffon, T05).
+    pub fn etages_tiers_en_f64(&self) -> Vec<(String, bool)> {
+        self.tiers
+            .iter()
+            .map(|t| (t.id.clone(), t.stage.processes_f64_natively()))
+            .collect()
+    }
     pub fn process_pcm(&mut self, pcm: &mut [u8], bit_depth: u16, channels: u16) {
         if channels != 2 {
             return;
@@ -701,10 +732,11 @@ pub fn crossfeed_status(
         }
     } else {
         // Ni locale, ni réseau : OAAT, navigateur, sorties PULL, zone sans
-        // périphérique résolu. Elles ne sont PAS couvertes par ce correctif —
-        // certaines traversent probablement le relais (OAAT transcode en WAV
-        // par session), mais ce n'est pas mesuré, et annoncer « disponible »
-        // sans preuve est exactement le défaut de #2742 pris à l'envers.
+        // périphérique résolu. La réponse prudente par défaut ; les sorties
+        // dont le chemin est MESURÉ la lèvent ensuite : OAAT
+        // ([`avec_toute_la_chaine`], TESS T12a) et le navigateur
+        // ([`avec_le_flux_traite`], #9178). Annoncer « disponible » sans
+        // preuve serait le défaut de #2742 pris à l'envers.
         Some(CrossfeedConstraint::NonLocalOutput)
     };
     // Un motif n'est pas forcément un verrou (#2742, 23/09) : sous
@@ -754,6 +786,46 @@ pub fn avec_le_flux_traite(sortie: CrossfeedStatus, porte_le_flux_traite: bool) 
         unavailable: false,
         reason: Some(reason),
         detail: Some(reason.detail()),
+    }
+}
+
+/// TESS T12a — la sortie reçoit-elle TOUT ce qu'elle joue par le flux que
+/// Tune traite (crossfeed et greffons natifs tiers compris) ? OAAT seulement,
+/// reconnue comme dans [`sortie_porte_le_flux_traite`].
+///
+/// Mesuré sur un faux récepteur OAAT (`orchestrator::tess_t12a_oaat_tests`) :
+/// toute piste de la bibliothèque part en WAV progressif (`oaat_needs_wav`)
+/// par le relais qui porte la chaîne de la zone, et la lecture directe du
+/// fichier n'est plus permise qu'à une zone sans étage actif (#9176,
+/// `orchestrator::transport::oaat_peut_lire_le_fichier`). Les flux des services
+/// passent par `load_streaming_dsp`, comme partout. Il ne reste hors chaîne
+/// que le DSD natif, comme sur une sortie locale.
+pub fn sortie_porte_toute_la_chaine(
+    output_type: Option<&str>,
+    output_device_id: Option<&str>,
+) -> bool {
+    output_device_id.is_some_and(|d| d.starts_with("oaat:") || d.starts_with("oaat-group:"))
+        || output_type == Some("oaat")
+}
+
+/// TESS T12a — sur une sortie qui porte toute la chaîne
+/// ([`sortie_porte_toute_la_chaine`]), le refus « non mesuré »
+/// (`NonLocalOutput`) est levé : le réglage est honoré tel quel, sans motif,
+/// comme sur une sortie locale. Tout autre statut passe inchangé (PURE garde
+/// la priorité, les droits viennent après : [`avec_les_droits`]).
+pub fn avec_toute_la_chaine(
+    sortie: CrossfeedStatus,
+    porte_toute_la_chaine: bool,
+) -> CrossfeedStatus {
+    if !porte_toute_la_chaine || sortie.reason != Some(CrossfeedConstraint::NonLocalOutput) {
+        return sortie;
+    }
+    CrossfeedStatus {
+        requested: sortie.requested,
+        effective: sortie.requested,
+        unavailable: false,
+        reason: None,
+        detail: None,
     }
 }
 
@@ -1431,9 +1503,7 @@ mod tests {
                 && CHAINE_RESEAU.contains(
                     "let mut etages: [&mut dyn EtageTess; 3] = [&mut a_eq, &mut a_conv, &mut a_cf];"
                 )
-                && CHAINE_RESEAU.contains(
-                    "par_tranches_f32(&mut t[..trames * 2], 2, |f| c.process_interleaved(f));"
-                ),
+                && CHAINE_RESEAU.contains("c.process_interleaved_f64(&mut t[..trames * 2]);"),
             "`StreamingDsp::process` n'applique plus le crossfeed : il est \
              chargé, transporté, et jeté sans être exécuté"
         );

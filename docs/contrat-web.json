@@ -1263,7 +1263,7 @@
       "champs_optionnels": []
     },
     {
-      "route": "/library/albums/{}/reidentify{}",
+      "route": "/library/albums/{}/reidentify",
       "methode": "POST",
       "type": "ReidentifyResult",
       "liste": false,
@@ -1621,7 +1621,7 @@
       ]
     },
     {
-      "route": "/library/artists/{}/missing-albums{}",
+      "route": "/library/artists/{}/missing-albums",
       "methode": "GET",
       "type": "ReponseManquants",
       "liste": false,
@@ -1854,6 +1854,16 @@
       "champs_optionnels": []
     },
     {
+      "route": "/library/duplicates",
+      "methode": "GET",
+      "type": "(en ligne)",
+      "liste": false,
+      "champs_obligatoires": [],
+      "champs_optionnels": [
+        "paires"
+      ]
+    },
+    {
       "route": "/library/duplicates/resolve-album",
       "methode": "POST",
       "type": "(en ligne)",
@@ -1863,16 +1873,6 @@
         "plan"
       ],
       "champs_optionnels": []
-    },
-    {
-      "route": "/library/duplicates{}",
-      "methode": "GET",
-      "type": "(en ligne)",
-      "liste": false,
-      "champs_obligatoires": [],
-      "champs_optionnels": [
-        "paires"
-      ]
     },
     {
       "route": "/library/enrich-all",
@@ -3287,7 +3287,7 @@
       "champs_optionnels": []
     },
     {
-      "route": "/profiles/{}/favorites/facets{}",
+      "route": "/profiles/{}/favorites/facets",
       "methode": "GET",
       "type": "FacetFavorite",
       "liste": true,
@@ -3301,7 +3301,7 @@
       ]
     },
     {
-      "route": "/profiles/{}/favorites/streaming{}",
+      "route": "/profiles/{}/favorites/streaming",
       "methode": "GET",
       "type": "StreamingFavorite",
       "liste": true,
@@ -3984,7 +3984,7 @@
       ]
     },
     {
-      "route": "/streaming/{}/artists/{}/albums{}",
+      "route": "/streaming/{}/artists/{}/albums",
       "methode": "GET",
       "type": "Album",
       "liste": true,
@@ -4157,7 +4157,6 @@
         "name",
         "track_count",
         "duration_ms",
-        "absent",
         "source"
       ],
       "champs_optionnels": [
@@ -4178,7 +4177,6 @@
         "name",
         "track_count",
         "duration_ms",
-        "absent",
         "source"
       ],
       "champs_optionnels": [
@@ -4190,7 +4188,7 @@
       ]
     },
     {
-      "route": "/streaming/{}/featured-playlists/by-tag{}",
+      "route": "/streaming/{}/featured-playlists/by-tag",
       "methode": "GET",
       "type": "PlaylistTagGroup",
       "liste": true,
@@ -4254,6 +4252,20 @@
       ]
     },
     {
+      "route": "/streaming/{}/genres",
+      "methode": "GET",
+      "type": "StreamingGenre",
+      "liste": true,
+      "champs_obligatoires": [
+        "id",
+        "name",
+        "has_children"
+      ],
+      "champs_optionnels": [
+        "image_url"
+      ]
+    },
+    {
       "route": "/streaming/{}/genres/{}/albums",
       "methode": "GET",
       "type": "Album",
@@ -4305,20 +4317,6 @@
         "genre_filter"
       ],
       "champs_optionnels": []
-    },
-    {
-      "route": "/streaming/{}/genres{}",
-      "methode": "GET",
-      "type": "StreamingGenre",
-      "liste": true,
-      "champs_obligatoires": [
-        "id",
-        "name",
-        "has_children"
-      ],
-      "champs_optionnels": [
-        "image_url"
-      ]
     },
     {
       "route": "/streaming/{}/labels/{}",
@@ -4399,7 +4397,6 @@
         "name",
         "track_count",
         "duration_ms",
-        "absent",
         "source"
       ],
       "champs_optionnels": [
@@ -4855,6 +4852,21 @@
       "champs_optionnels": []
     },
     {
+      "route": "/system/browse-dirs",
+      "methode": "GET",
+      "type": "ListeDossiersServeur",
+      "liste": false,
+      "champs_obligatoires": [
+        "dirs",
+        "parent",
+        "current"
+      ],
+      "champs_optionnels": [
+        "drives",
+        "error"
+      ]
+    },
+    {
       "route": "/system/browse-dirs/estimate",
       "methode": "GET",
       "type": "EstimationDossier",
@@ -4866,21 +4878,6 @@
         "folders",
         "complete",
         "drive_root",
-        "error"
-      ]
-    },
-    {
-      "route": "/system/browse-dirs{}",
-      "methode": "GET",
-      "type": "ListeDossiersServeur",
-      "liste": false,
-      "champs_obligatoires": [
-        "dirs",
-        "parent",
-        "current"
-      ],
-      "champs_optionnels": [
-        "drives",
         "error"
       ]
     },
@@ -7314,7 +7311,7 @@
       "raison": "type non structurel"
     },
     {
-      "route": "/profiles/{}/favorites{}",
+      "route": "/profiles/{}/favorites",
       "type": "Array<{ item_type: string; item_id: number; created_at?: string | null }>",
       "raison": "type non structurel"
     },
@@ -7429,12 +7426,12 @@
       "raison": "type non structurel"
     },
     {
-      "route": "/party/vote/reset{}",
+      "route": "/party/vote/reset",
       "type": "any",
       "raison": "type non structurel"
     },
     {
-      "route": "/party/queue{}",
+      "route": "/party/queue",
       "type": "any[]",
       "raison": "type non structurel"
     },
