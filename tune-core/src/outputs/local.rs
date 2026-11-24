@@ -2047,9 +2047,29 @@ impl LocalOutput {
         let mut a_liberer: [Option<Box<super::super::audio::convolver::Convolver>>; 2] =
             [None, None];
         let mut remplace = None;
+        let mut refuse = None;
+        let joue = fondu > 0;
+        // Le moteur de retard d'une pose en lecture est bâti AVANT le verrou
+        // (allocation et FFT hors du verrou de la boucle de lecture) ; libéré
+        // après s'il ne sert pas.
+        let mut retard = match (&nouveau, joue) {
+            (Some(n), true) => Some(super::super::audio::convolver::Convolver::retard_seul(
+                n.channels(),
+                n.block_size(),
+            )),
+            _ => None,
+        };
         {
             let mut actif = self.convolver.lock().unwrap();
-            let joue = fondu > 0;
+            // Le droit est relu SOUS le verrou : un retrait du Premium
+            // concurrent (`set_convolution_autorisee`) n'est jamais ignoré.
+            let nouveau = match nouveau {
+                Some(n) if !self.convolution_autorisee.load(Ordering::Relaxed) => {
+                    refuse = Some(n);
+                    None
+                }
+                n => n,
+            };
             match nouveau {
                 Some(n) if joue && actif.is_some() => {
                     let resultat = match actif.as_mut() {
@@ -2072,19 +2092,23 @@ impl LocalOutput {
                 // rejoué —, puis le vrai filtre lui succède par réchauffe et
                 // fondu. Radio comprise : rien n'attend une jonction.
                 Some(n) if joue => {
-                    let mut retard = super::super::audio::convolver::Convolver::retard_seul(
-                        n.channels(),
-                        n.block_size(),
-                    );
-                    match retard.remplacer_en_fondu_en_rendant(n, fondu) {
-                        Ok(r) => a_liberer = r,
-                        Err(n) => retard = n,
-                    }
-                    remplace = actif.replace(retard);
+                    let pose = match retard.take() {
+                        Some(mut r) => match r.remplacer_en_fondu_en_rendant(n, fondu) {
+                            Ok(rendus) => {
+                                a_liberer = rendus;
+                                r
+                            }
+                            Err(n) => n,
+                        },
+                        None => n,
+                    };
+                    remplace = actif.replace(pose);
                 }
                 n => remplace = std::mem::replace(&mut *actif, n),
             }
         }
+        drop(retard);
+        drop(refuse);
         drop(remplace);
         drop(a_liberer);
     }

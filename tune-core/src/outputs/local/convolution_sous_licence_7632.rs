@@ -208,3 +208,29 @@ fn le_droit_retire_en_lecture_eteint_la_convolution_sans_clic_7632() {
     .unwrap();
     assert!(!bati);
 }
+
+/// Relecture de #9452 — le droit est relu SOUS le verrou au moment de poser
+/// le moteur : un jeu posé alors que le droit vient d'être retiré ne
+/// convolue pas, et le jeu reste mémorisé.
+#[test]
+fn un_jeu_pose_sans_le_droit_ne_pose_aucun_moteur_t09b() {
+    let ri = ri_quart();
+    let s = LocalOutput::new("DAC test".to_string());
+    s.declare_current_format_for_test(TAUX, 2);
+    s.set_convolution_autorisee(true);
+    s.set_convolver_ir(&ri.as_str()).unwrap();
+    assert!(
+        s.convolver.lock().unwrap().is_some(),
+        "avec le droit, un moteur"
+    );
+    s.set_convolution_autorisee(false);
+    s.set_convolver_ir(&ri.as_str()).unwrap();
+    assert!(s.has_convolver(), "le jeu reste mémorisé");
+    let garde = s.convolver.lock().unwrap();
+    if let Some(m) = garde.as_ref() {
+        assert!(
+            !m.bascule_en_cours(),
+            "aucun nouveau filtre ne prend la main sans le droit"
+        );
+    }
+}
