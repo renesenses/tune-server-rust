@@ -17,9 +17,37 @@ spec.loader.exec_module(garde)
 
 class GardeCatalogue(unittest.TestCase):
     def test_secret_absent(self):
-        with patch.object(garde, "CLE", b""), contextlib.redirect_stderr(io.StringIO()) as erreurs:
+        with patch.dict(os.environ, {"CI": ""}), patch.object(garde, "CLE", b""), contextlib.redirect_stderr(io.StringIO()) as erreurs:
             self.assertEqual(garde.main(), 0)
             self.assertIn("::warning::", erreurs.getvalue())
+
+    def test_secret_absent_en_ci(self):
+        with patch.dict(os.environ, {"CI": "true"}), patch.object(garde, "CLE", b""), contextlib.redirect_stderr(io.StringIO()) as erreurs:
+            self.assertNotEqual(garde.main(), 0)
+            self.assertIn("CATALOGUE_HMAC_KEY", erreurs.getvalue())
+
+    def test_historique_et_metadonnees(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            racine = Path(tmp)
+            def git(*args):
+                return subprocess.check_output(["git", "-C", tmp, "-c", "user.name=Test",
+                    "-c", "user.email=test@example.invalid", *args], text=True).strip()
+            git("init", "-q")
+            git("commit", "-q", "--allow-empty", "-m", "base")
+            base = git("rev-parse", "HEAD")
+            (racine / "note").write_text("ajout intermediaire")
+            git("add", "note")
+            git("commit", "-q", "-m", "message intermediaire")
+            git("rm", "-q", "note")
+            git("commit", "-q", "-m", "retrait")
+            pr = {"base": {"sha": base}, "head": {"sha": git("rev-parse", "HEAD")},
+                  "title": "titre temoin", "body": "corps temoin"}
+            textes = dict(garde.textes_de_revision(racine, {"pull_request": pr}))
+            self.assertEqual(textes["PR/title"], pr["title"])
+            self.assertEqual(textes["PR/body"], pr["body"])
+            self.assertTrue(any("message intermediaire" in t for t in textes.values()))
+            self.assertTrue(any("+ajout intermediaire" in t for t in textes.values()))
+        self.assertEqual(garde.texte_du_fichier("repère".encode("utf-16")), "repère")
 
     def test_fichiers_suivis_depuis_un_sous_dossier(self):
         cle = b"cle-de-test"
@@ -51,7 +79,8 @@ class GardeCatalogue(unittest.TestCase):
                         source.write_text(contenu, encoding="utf-8")
                         self.assertEqual(garde.main(), 1)
                         self.assertIn(source.name, erreurs.getvalue())
-                        self.assertRegex(erreurs.getvalue().lower(), r"\(exemple(?:alpha|gamma|beta)\)")
+                        self.assertNotIn("exemple", erreurs.getvalue().casefold())
+                        self.assertRegex(erreurs.getvalue(), r"HMAC [0-9a-f]{12}")
             finally:
                 os.chdir(precedent)
 

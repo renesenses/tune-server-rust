@@ -1,6 +1,7 @@
 """Contrôle du vocabulaire du catalogue dans les fichiers suivis par Git."""
 from functools import lru_cache
 import hmac
+import json
 import os
 from pathlib import Path
 import re
@@ -141,8 +142,66 @@ def infractions(texte):
                 yield texte.count("\n", 0, jeton.start()) + 1, jeton.group()
 
 
+def texte_du_fichier(contenu):
+    if contenu.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return contenu.decode("utf-16", errors="replace")
+    return contenu.decode("utf-8", errors="replace")
+
+
+def textes_de_revision(racine, evenement):
+    pr = evenement.get("pull_request", {})
+    for champ in ("title", "body"):
+        if pr.get(champ):
+            yield "PR/" + champ, pr[champ]
+    base = pr.get("base", {}).get("sha") or evenement.get("before")
+    tete = pr.get("head", {}).get("sha") or evenement.get("after") or os.environ.get("GITHUB_SHA")
+    if not tete:
+        return
+    if not re.fullmatch(r"[0-9a-f]{40}", tete):
+        raise ValueError("Révision de tête invalide")
+    revisions = [tete]
+    if base and base != "0" * 40:
+        if not re.fullmatch(r"[0-9a-f]{40}", base):
+            raise ValueError("Révision de base invalide")
+        revisions = [base + ".." + tete]
+    else:
+        branche = evenement.get("repository", {}).get("default_branch")
+        if not branche:
+            raise ValueError("Branche de référence absente")
+        ref = "refs/remotes/origin/" + branche
+        subprocess.run(["git", "check-ref-format", ref], check=True)
+        ancetre = subprocess.check_output(["git", "-C", racine, "merge-base", ref, tete], text=True).strip()
+        revisions = [ancetre + ".." + tete] if ancetre != tete else ["-1", tete]
+    commits = subprocess.check_output(["git", "-C", racine, "rev-list", *revisions]).splitlines()
+    for identifiant in commits:
+        sha = identifiant.decode("ascii")
+        for nom, options in (("message", ["--format=%B", "--no-patch"]),
+                             ("diff", ["--format=", "--patch", "--root", "--diff-merges=first-parent"])):
+            contenu = subprocess.check_output(["git", "-C", racine, "show", "--no-ext-diff",
+                "--no-textconv", *options, sha, "--"])
+            yield f"{sha[:12]}/{nom}", texte_du_fichier(contenu)
+
+
+def signaler(nom, texte):
+    problemes = sorted({(ligne, empreinte(mot)[:12]) for ligne, mot in infractions(texte)})
+    if not problemes:
+        return False
+    # Un chemin issu de la contribution peut aussi contenir un identifiant ou des contrôles.
+    for jeton in JETON.findall(nom.casefold()):
+        if any(empreinte(jeton[i:j]) in PROFILS | AXES
+               for i in range(len(jeton)) for j in range(i + 1, len(jeton) + 1)):
+            nom = "chemin-" + empreinte(nom)[:12]
+            break
+    for ligne, signature in problemes:
+        print(f"{ascii(nom)}:{ligne} — HMAC {signature}", file=sys.stderr)
+    return True
+
+
 def main():
     if not CLE:
+        if os.environ.get("CI"):
+            print("::error::Contrôle du catalogue impossible, secret CATALOGUE_HMAC_KEY absent.", file=sys.stderr)
+            return 2
         print("::warning::Garde du catalogue désactivée, secret CATALOGUE_HMAC_KEY absent.", file=sys.stderr)
         return 0
     racine = Path(os.fsdecode(subprocess.check_output(
@@ -153,9 +212,11 @@ def main():
     for nom in fichiers.split(b"\0")[:-1]:
         chemin = racine / os.fsdecode(nom)
         contenu = os.fsencode(os.readlink(chemin)) if chemin.is_symlink() else chemin.read_bytes()
-        for ligne, mot in sorted(set(infractions(contenu.decode("utf-8", errors="replace")))):
-            print(f"{os.fsdecode(nom)}:{ligne} — référence au catalogue privé ({mot})", file=sys.stderr)
-            problemes = True
+        problemes |= signaler(os.fsdecode(nom), texte_du_fichier(contenu))
+    if chemin_evenement := os.environ.get("GITHUB_EVENT_PATH"):
+        evenement = json.loads(Path(chemin_evenement).read_text(encoding="utf-8"))
+        for nom, texte in textes_de_revision(racine, evenement):
+            problemes |= signaler(nom, texte)
     return int(problemes)
 
 
