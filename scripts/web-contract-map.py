@@ -364,18 +364,111 @@ def suffixe_requete_conditionnel(expression: str) -> bool:
             and all(not b or b.startswith("?") for b in branches))
 
 
-# Le début de la fonction de l'appel : la constante doit y être déclarée.
-# Une méthode d'objet (`a(d) {`) et une fonction fléchée à corps (`=> {`)
-# bornent aussi : sans cela, la méthode `b()` lisait la constante de sa
-# voisine `a()` (relecture de #9435). Les mots-clés de contrôle (`if (…) {`,
-# `for`, `while`, `switch`, `catch`) ouvrent un bloc, pas une fonction.
-DEBUT_DE_FONCTION = re.compile(
-    r"^[ \t]*(?:export\s|(?:async\s+)?function[\s*]"
-    r"|(?:async\s+)?(?!(?:if|for|while|switch|catch|with|return|function)\b)"
-    r"[A-Za-z_$][\w$]*\s*\([^()\n]*\)\s*(?::[^{\n]*)?\{[ \t]*$)"
-    r"|=>[ \t]*\{[ \t]*$",
-    re.M,
-)
+# Signe significatif après lequel un `/` ouvre une expression régulière.
+AVANT_UNE_REGEXP = set("(,=:[!&|?{};+-*%<>~^")
+
+
+def bloc_ferme_avant(texte: str, debut: int, fin: int) -> bool | None:
+    """Le bloc qui contient `debut` se ferme-t-il avant `fin` ?
+
+    C'est la PORTÉE d'un `const`/`let` : la déclaration en `debut` n'est
+    visible en `fin` que si son bloc `{…}` n'est pas refermé entre les deux.
+    On ne cherche plus le début de la fonction par un motif de ligne : la
+    relecture de #9435 en a trouvé douze formes ratées (`b: function () {`,
+    `static`, `get`, `*b()`, paramètres sur plusieurs lignes, type de retour
+    `Promise<{…}> {`…), et un rappel `=> {` au milieu du corps coupait la
+    fonction en deux. Les accolades comptées ici sont celles du CODE :
+    chaînes, gabarits (`${…}` compris), commentaires et expressions
+    régulières sont sautés.
+
+    Rend None quand la lecture n'est pas sûre (chaîne ouverte sur une fin de
+    ligne, texte tronqué) : l'appelant garde alors la notation `{}`.
+    """
+    i, profondeur, gabarits, avant = debut, 0, [], ""
+    while i < fin:
+        car = texte[i]
+        if car in "'\"":
+            j = i + 1
+            while j < fin and texte[j] != car:
+                if texte[j] == "\n":
+                    return None
+                j += 2 if texte[j] == "\\" else 1
+            if j >= fin:
+                return None
+            i, avant = j + 1, "a"
+            continue
+        if car == "`" or (car == "}" and gabarits and gabarits[-1] == profondeur):
+            if car == "}":
+                gabarits.pop()
+            j = i + 1
+            while j < fin and texte[j] != "`" and not texte.startswith("${", j):
+                j += 2 if texte[j] == "\\" else 1
+            if j >= fin:
+                return None
+            if texte[j] == "`":
+                i, avant = j + 1, "a"
+            else:
+                gabarits.append(profondeur)
+                i, avant = j + 2, "("
+            continue
+        if texte.startswith("//", i):
+            j = texte.find("\n", i, fin)
+            if j < 0:
+                return None
+            i = j + 1
+            continue
+        if texte.startswith("/*", i):
+            j = texte.find("*/", i + 2, fin)
+            if j < 0:
+                return None
+            i = j + 2
+            continue
+        if car == "/" and (avant == "" or avant in AVANT_UNE_REGEXP):
+            j, classe = i + 1, False
+            while j < fin and (classe or texte[j] != "/"):
+                if texte[j] == "\n":
+                    return None
+                if texte[j] == "\\":
+                    j += 1
+                elif texte[j] == "[":
+                    classe = True
+                elif texte[j] == "]":
+                    classe = False
+                j += 1
+            if j >= fin:
+                return None
+            i, avant = j + 1, "a"
+            continue
+        if car == "{":
+            profondeur += 1
+        elif car == "}":
+            profondeur -= 1
+            if profondeur < 0:
+                return True
+        if not car.isspace():
+            avant = "a" if (car.isalnum() or car in "_$") else car
+        i += 1
+    return False
+
+
+def reaffectee(nom: str, texte: str) -> bool:
+    """`nom` est-il réaffecté dans `texte` ? (lecture prudente : un doute = oui)
+
+    Formes refusées : `q = …`, `q += …` et les autres opérateurs composés,
+    `q++`, `q--`, `++q`, `--q`, la déstructuration `[q] = …`, `[a, q] = …`,
+    `({ q } = o)`, `({ x: q } = o)`, et `for (q of …)` / `for (q in …)`.
+    `==`, `===`, `=>` et les simples lectures ne comptent pas.
+    """
+    n = r"(?<![\w$.])" + re.escape(nom) + r"(?![\w$])"
+    formes = [
+        n + r"\s*(?:\+|-|\*|/|%|\*\*|<<|>>>?|&|\||\^|&&|\|\||\?\?)?=(?![=>])",
+        n + r"\s*(?:\+\+|--)",
+        r"(?:\+\+|--)\s*" + n,
+        r"[\[{][^;\[\]{}()]*" + n + r"[^;\[\]{}()=]*[\]}]\s*=(?![=>])",
+        r"\bfor\s*\(\s*(?:let\s+|const\s+|var\s+)?" + n + r"\s+(?:of|in)\b",
+    ]
+    return any(re.search(f, texte) for f in formes)
+
 
 # `const suite = dossier ? `?${…}` : '';` — une constante locale d'une ligne.
 MOTIF_CONSTANTE_LOCALE = r"\b(?:const|let)\s+{nom}\s*=\s*(?P<expr>[^\n]*?);[ \t]*(?://[^\n]*)?$"
@@ -390,31 +483,33 @@ def sans_suffixe_de_requete_local(route: str, avant: str) -> str:
     pas, et le contrat de `/library/artists/{}/tracks` disparaissait (#9362).
 
     On ne devine toujours pas la valeur d'une variable : on lit sa DÉCLARATION,
-    dans la fonction de l'appel (`avant`, borné à la déclaration exportée qui
-    le précède), et on ne la retire que si `suffixe_requete_conditionnel` la
-    reconnaît. Une constante qui peut changer le chemin, ou introuvable, garde
+    celle dont la portée couvre l'appel (`bloc_ferme_avant`), et on ne la
+    retire que si `suffixe_requete_conditionnel` la reconnaît, sans aucune
+    réaffectation entre les deux (`reaffectee`). Une constante qui peut changer le chemin, ou introuvable, garde
     la notation historique `{}`.
     """
     m = re.search(r"\$\{\s*(?P<nom>[A-Za-z_$][\w$]*)\s*\}$", route)
     if m is None or m.start() == 0 or route[m.start() - 1] == "/":
         return route
-    bornes = list(DEBUT_DE_FONCTION.finditer(avant))
-    fonction = avant[bornes[-1].start():] if bornes else avant
     motif = re.compile(MOTIF_CONSTANTE_LOCALE.format(nom=re.escape(m.group("nom"))), re.M)
-    declarations = list(motif.finditer(fonction))
-    if len(declarations) != 1:
-        return route  # absente, ou redéclarée : rien de sûr à lire
-    # Une RÉAFFECTATION (`q += '/extra'`, `q = '/x'`, `q++`) peut faire du
-    # suffixe un segment de chemin : on refuse dès qu'il y en a une hors de la
-    # déclaration (relecture de #9435). `==`, `===` et `=>` n'affectent rien.
-    affectation = re.compile(
-        r"(?<![\w$.])" + re.escape(m.group("nom"))
-        + r"\s*(?:(?:\+|-|\*|/|%|\*\*|<<|>>>?|&|\||\^|&&|\|\||\?\?)?=(?![=>])|\+\+|--)"
-    )
-    for a in affectation.finditer(fonction):
-        if not declarations[0].start() <= a.start() < declarations[0].end():
-            return route
-    if not suffixe_requete_conditionnel(declarations[0].group("expr")):
+    # La déclaration qui LIE le nom à l'appel est la plus proche dont le bloc
+    # est encore ouvert : deux portées ouvertes s'emboîtent, la plus récente
+    # est l'intérieure et masque l'autre.
+    liante = None
+    for declaration in reversed(list(motif.finditer(avant))):
+        ferme = bloc_ferme_avant(avant, declaration.start(), len(avant))
+        if ferme is None:
+            return route  # lecture incertaine : rien de sûr à retirer
+        if not ferme:
+            liante = declaration
+            break
+    if liante is None:
+        return route  # introuvable dans la portée de l'appel
+    # Une RÉAFFECTATION entre la déclaration et l'appel peut faire du suffixe
+    # un segment de chemin (relecture de #9435) : on garde alors `{}`.
+    if reaffectee(m.group("nom"), avant[liante.end():]):
+        return route
+    if not suffixe_requete_conditionnel(liante.group("expr")):
         return route
     return route[:m.start()]
 

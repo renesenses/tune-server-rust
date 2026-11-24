@@ -336,5 +336,103 @@ class SuffixeDeRequeteLocal(UrlsContrat):
         )
 
 
+# Suite de la relecture de #9435 : la PORTÉE de la constante, pas une liste
+# de débuts de fonction. Chaque cas ci-dessous est une forme que le motif de
+# ligne ne reconnaissait pas.
+DECL_A = "const suite = d ? `?d=${d}` : '';"
+APPEL_B = "return fetchJSON<Track[]>(`${BASE}/radios${suite}`);"
+
+
+class PorteeDeLaConstante(UrlsContrat):
+    def voisine(self, tete_b):
+        return (
+            "export const api = {\n"
+            "  a: function (d?: string) {\n"
+            f"    {DECL_A}\n"
+            "    return suite;\n"
+            "  },\n"
+            f"  {tete_b}\n"
+            f"    {APPEL_B}\n"
+            "  },\n"
+            "};"
+        )
+
+    def test_contre_temoin_methodes_voisines_sous_toutes_leurs_formes(self):
+        for tete in [
+            "b: function () {",
+            "b: async function () {",
+            "b: function* () {",
+            "static b() {",
+            "get b() {",
+            "*b() {",
+            "async *b() {",
+            "b(x = f(1), y = (2)) {",
+            "b(\n      x: number,\n      y: string,\n    ) {",
+            "b(): Promise<{ id: number; title: string }> {",
+            "b(): { id: number } {",
+            "b: (x: number) => {",
+            "b: async () =>\n    {",
+        ]:
+            with self.subTest(tete=tete):
+                self.exige(self.voisine(tete), "/radios{}")
+
+    def test_temoin_un_rappel_flechee_ne_borne_pas_la_fonction(self):
+        # `=> {` d'un rappel au milieu du corps : la constante d'avant reste
+        # dans la portée de l'appel qui suit.
+        self.exige(
+            f"""export function f(d?: string) {{
+              {DECL_A}
+              [1].forEach((x) => {{
+                console.log(x);
+              }});
+              {APPEL_B}
+            }}""",
+            "/radios",
+        )
+
+    def test_contre_temoin_constante_d_un_rappel_ferme(self):
+        self.exige(
+            f"""export function f(d?: string) {{
+              [1].forEach((x) => {{
+                {DECL_A}
+              }});
+              {APPEL_B}
+            }}""",
+            "/radios{}",
+        )
+
+    def test_contre_temoin_reaffectations_prefixees_et_destructurees(self):
+        for reaffectation in [
+            "++suite;",
+            "--suite;",
+            "[suite] = ['/x'];",
+            "[a, suite] = ['', '/x'];",
+            "({ suite } = o);",
+            "({ x: suite } = o);",
+            "for (suite of ['/x']) {}",
+        ]:
+            with self.subTest(reaffectation=reaffectation):
+                self.exige(
+                    f"""export function f(d?: string, o?: any) {{
+                      let suite = d ? `?d=${{d}}` : '';
+                      {reaffectation}
+                      {APPEL_B}
+                    }}""",
+                    "/radios{}",
+                )
+
+    def test_temoin_lectures_qui_ne_reaffectent_pas(self):
+        self.exige(
+            f"""export function f(d?: string) {{
+              {DECL_A}
+              const copie = [suite, 1];
+              const objet = {{ suite }};
+              if (suite === '' || f2(suite, 2) || -suite) log(suite);
+              {APPEL_B}
+            }}""",
+            "/radios",
+        )
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
