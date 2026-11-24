@@ -1694,6 +1694,35 @@ pub(crate) struct ChiffresDeFinDeScan<'a> {
     /// de celle qui a perdu son FLAC, alors que c'est toute la différence
     /// entre un album récupérable et un album fantôme.
     pub(crate) cue: &'a tune_core::scanner::cue_album::InventaireCue,
+    /// Les ISO SACD compressés en DST écartés par le parcours (fil 3047) :
+    /// chemins complets, plafonnés à
+    /// [`tune_core::scanner::walker::PLAFOND_ISOS_SACD_DST`].
+    pub(crate) isos_sacd_dst: &'a [String],
+    /// Leur nombre EXACT, plafond ou pas.
+    pub(crate) isos_sacd_dst_total: usize,
+}
+
+/// Les ISO SACD en DST écartés par le scan (fil 3047), tels que les rend le
+/// fichier de `/scan/report` sous la clé `sacd_dst`.
+///
+/// Une seule construction pour les deux scans (manuel et automatique) : ils
+/// écrivent le MÊME fichier, et une forme recopiée à la main divergerait
+/// (#2012).
+///
+/// - `count` : le nombre exact d'albums (une image = un disque) ;
+/// - `paths` : leurs chemins complets, TOUS jusqu'au plafond ;
+/// - `truncated` : vrai si `paths` est plus court que `count` ;
+/// - `reason` / `message` : l'obstacle nommé, avec son contournement
+///   ([`tune_core::scanner::obstacle::isos_sacd_dst`]), `null` sans ISO DST.
+pub(crate) fn rapport_isos_sacd_dst(total: usize, chemins: &[String]) -> Value {
+    let obstacle = tune_core::scanner::obstacle::isos_sacd_dst(total);
+    json!({
+        "count": total,
+        "paths": chemins,
+        "truncated": chemins.len() < total,
+        "reason": obstacle.as_ref().map(|(motif, _)| *motif),
+        "message": obstacle.map(|(_, message)| message),
+    })
 }
 
 impl ChiffresDeFinDeScan<'_> {
@@ -1756,6 +1785,10 @@ impl ChiffresDeFinDeScan<'_> {
             // Les pistes dont le DR vient d'un `foo_dr.txt` voisin (#4186).
             // Un compteur : chez les trois consommateurs, comme les autres.
             "dr_from_sidecar_file": self.scan_stats.dr_from_sidecar,
+            // Les ISO SACD en DST écartés (fil 3047). Un COMPTEUR : il part
+            // chez les trois consommateurs ; la liste nominative et le
+            // message, par le seul fichier (`sacd_dst`).
+            "sacd_dst_unsupported": self.isos_sacd_dst_total,
         })
     }
 
@@ -1805,6 +1838,9 @@ impl ChiffresDeFinDeScan<'_> {
         // LESQUELLES, pas seulement combien (#1763). Même règle que ci-dessus :
         // ce sont des chemins de l'utilisateur, ils sortent par le fichier.
         rapport["cue_sheets_skipped_paths"] = json!(self.cue.chemins_ecartes);
+        // TOUS les ISO SACD en DST écartés, et le message qui dit quoi faire
+        // (fil 3047). Des chemins de l'utilisateur : par le fichier seulement.
+        rapport["sacd_dst"] = rapport_isos_sacd_dst(self.isos_sacd_dst_total, self.isos_sacd_dst);
         // Dire que la liste est un échantillon, plutôt que de laisser croire
         // qu'elle est complète : une liste muette de 500 entrées face à
         // 40 000 fichiers écartés se lit comme un rapport faux.
@@ -2170,6 +2206,9 @@ async fn spawn_library_scan_avec_lecteur_par(
         let mut skipped_by_ext = list_result.skipped_by_ext;
         let mut skipped_reasons = list_result.skipped_reasons;
         let mut skipped_unsupported_paths = list_result.skipped_paths;
+        // Les ISO SACD en DST écartés (fil 3047) : leur liste dédiée.
+        let isos_sacd_dst = list_result.isos_sacd_dst;
+        let isos_sacd_dst_total = list_result.isos_sacd_dst_total;
         // Les feuilles CUE, relues APRÈS le parcours (#1763). Le parcours les
         // a comptées comme des fichiers non lus et n'en a retenu que les
         // dossiers — les ouvrir pendant le parcours ajouterait une lecture
@@ -3770,6 +3809,8 @@ async fn spawn_library_scan_avec_lecteur_par(
             skipped_no_metadata_paths: &skipped_no_metadata_paths,
             skipped_duplicate_paths: &skipped_duplicate_paths,
             cue: &inventaire_cue,
+            isos_sacd_dst: &isos_sacd_dst,
+            isos_sacd_dst_total,
         };
         let mut rapport_scan = chiffres.rapport();
         if scan_cancel_requested() {
@@ -5466,7 +5507,61 @@ mod rapport_de_fin_de_scan {
             skipped_no_metadata_paths: sans_metadonnees,
             skipped_duplicate_paths: doublons,
             cue,
+            isos_sacd_dst: sept_isos_dst(),
+            isos_sacd_dst_total: 7,
         }
+    }
+
+    /// Fil 3047 — sept ISO SACD en DST, chemins complets.
+    fn sept_isos_dst() -> &'static [String] {
+        Box::leak(
+            (1..=7)
+                .map(|i| format!("/Volumes/musique/SACD/Disque DST {i}.iso"))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+        )
+    }
+
+    /// Fil 3047 — le rapport de `/scan/report` nomme les SEPT ISO DST, pas
+    /// les cinq premiers, avec leur nombre et le message qui dit quoi faire.
+    #[test]
+    fn le_rapport_liste_tous_les_isos_sacd_dst_et_le_message() {
+        let stats = stats_de_scan();
+        let c = chiffres(&stats);
+        let r = c.rapport_du_fichier();
+        let dst = &r["sacd_dst"];
+        assert_eq!(dst["count"], serde_json::json!(7));
+        assert_eq!(dst["paths"], serde_json::json!(sept_isos_dst()));
+        assert_eq!(dst["truncated"], serde_json::json!(false));
+        assert_eq!(
+            dst["reason"],
+            serde_json::json!(tune_core::scanner::obstacle::MOTIF_ISOS_SACD_DST)
+        );
+        let message = dst["message"].as_str().expect("un message");
+        assert!(message.starts_with("7 albums SACD"), "{message}");
+        assert!(message.contains("pour l'instant"), "{message}");
+        assert!(message.contains("sacd_extract"), "{message}");
+        assert!(message.contains("DSF"), "{message}");
+        // Le compteur, lui, part chez les trois consommateurs.
+        assert_eq!(c.rapport()["sacd_dst_unsupported"], serde_json::json!(7));
+        // Les chemins, jamais sur le bus d'événements.
+        assert!(c.rapport().get("sacd_dst").is_none());
+    }
+
+    /// Fil 3047 — une liste plafonnée le DIT, et sans ISO DST le rapport ne
+    /// porte aucun message.
+    #[test]
+    fn la_liste_des_isos_dst_dit_quand_elle_est_tronquee() {
+        let deux = ["/a.iso".to_string(), "/b.iso".to_string()];
+        let r = super::rapport_isos_sacd_dst(2_500, &deux);
+        assert_eq!(r["count"], serde_json::json!(2_500));
+        assert_eq!(r["truncated"], serde_json::json!(true));
+        assert!(r["message"].as_str().unwrap().starts_with("2500 albums"));
+
+        let vide = super::rapport_isos_sacd_dst(0, &[]);
+        assert_eq!(vide["count"], serde_json::json!(0));
+        assert_eq!(vide["truncated"], serde_json::json!(false));
+        assert!(vide["message"].is_null() && vide["reason"].is_null());
     }
 
     fn stats_de_scan() -> tune_core::scanner::walker::ScanStats {
@@ -5533,6 +5628,9 @@ mod rapport_de_fin_de_scan {
             // `serde_json`, pas celui où on les a écrites.
             vec![
                 "cue_sheets_skipped_paths",
+                // Les ISO SACD en DST (fil 3047) : le compteur part chez les
+                // trois, la liste nominative et le message par le seul fichier.
+                "sacd_dst",
                 "skipped_duplicate_paths",
                 // Les fichiers de 0 octet (#2060) : le COMPTEUR part chez les
                 // trois, la liste nominative par le seul fichier.
@@ -5711,7 +5809,7 @@ mod rapport_de_fin_de_scan {
         /// Sous leur forme littérale de clé JSON. Chercher le mot nu
         /// attraperait le nom de la variable Rust et passerait sans qu'aucune
         /// clé ne soit publiée.
-        const CLES: [&str; 9] = [
+        const CLES: [&str; 11] = [
             "\"skipped_unsupported_paths\"",
             "\"skipped_no_metadata_paths\"",
             "\"skipped_duplicate_paths\"",
@@ -5731,6 +5829,10 @@ mod rapport_de_fin_de_scan {
             // Les DR lus dans un `foo_dr.txt` voisin (#4186) : un compteur,
             // même clé des deux côtés.
             "\"dr_from_sidecar_file\"",
+            // Les ISO SACD en DST (fil 3047) : le compteur et l'objet, mêmes
+            // clés des deux côtés.
+            "\"sacd_dst_unsupported\"",
+            "\"sacd_dst\"",
         ];
 
         for fichier in ["src/routes/system/scan.rs", "src/auto_scan.rs"] {

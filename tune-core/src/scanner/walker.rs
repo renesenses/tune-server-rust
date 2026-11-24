@@ -575,6 +575,17 @@ pub struct ScannedFile {
 /// l'échantillon nominatif, jamais le décompte.
 pub const PLAFOND_CHEMINS_ECARTES: usize = 500;
 
+/// Combien de chemins la liste DÉDIÉE des ISO SACD en DST retient au plus
+/// (fil 3047).
+///
+/// Ces images ne se perdent pas dans la liste commune : un disque SACD est un
+/// album entier, et c'est la liste que le testeur recopie pour savoir quels
+/// disques convertir. Elle ne partage donc pas le plafond de
+/// [`PLAFOND_CHEMINS_ECARTES`], qu'un dossier de `.cue` ou de `.wma` épuise
+/// avant le premier ISO. Le total, lui, est toujours exact
+/// ([`ListAudioResult::isos_sacd_dst_total`]).
+pub const PLAFOND_ISOS_SACD_DST: usize = 2_000;
+
 /// Ajoute un chemin écarté tant que la liste n'a pas atteint son plafond.
 ///
 /// Une seule définition pour les six endroits qui écartent un fichier — deux
@@ -1134,6 +1145,17 @@ pub struct ListAudioResult {
     /// album s'écrit après le parcours, par
     /// [`super::cue_bibliotheque::ecrire_les_iso_sacd`], comme les albums CUE.
     pub isos_sacd_natifs: Vec<crate::audio::sacd::IsoSacdLu>,
+    /// Les ISO SACD compressés en DST que ni la lecture native ni
+    /// `sacd_extract` n'ont pu rendre (fil 3047), chemins complets, dans
+    /// l'ordre du parcours, plafonnés à [`PLAFOND_ISOS_SACD_DST`].
+    ///
+    /// Le journal n'en nommait que cinq par dossier, et la liste commune
+    /// `skipped_paths` les noie au milieu des autres formats sous un plafond
+    /// partagé : l'utilisateur ne pouvait pas savoir LESQUELS de ses disques
+    /// manquaient.
+    pub isos_sacd_dst: Vec<String>,
+    /// Le nombre EXACT de ces ISO, plafond ou pas.
+    pub isos_sacd_dst_total: usize,
 }
 
 impl ListAudioResult {
@@ -1499,6 +1521,8 @@ pub fn list_audio_files_avec_arret(
     // d'un scan à l'autre, et l'ordre d'un `HashSet` ne l'est pas.
     let mut dossiers_cue: std::collections::BTreeSet<PathBuf> = std::collections::BTreeSet::new();
     let mut isos_sacd_natifs: Vec<crate::audio::sacd::IsoSacdLu> = Vec::new();
+    let mut isos_sacd_dst: Vec<String> = Vec::new();
+    let mut isos_sacd_dst_total: usize = 0;
     let mut missing_dirs = Vec::new();
     let mut missing_dir_reasons: Vec<String> = Vec::new();
     let mut error_dirs: Vec<String> = Vec::new();
@@ -1822,6 +1846,17 @@ pub fn list_audio_files_avec_arret(
                                             )
                                         };
                                         *skipped_by_ext.entry(cle.to_string()).or_insert(0) += 1;
+                                        // Fil 3047 — la liste DÉDIÉE des
+                                        // disques DST : chemins complets,
+                                        // plafond à part, total exact. C'est
+                                        // elle que le rapport de scan et
+                                        // l'écran rendent en entier.
+                                        if est_dst {
+                                            isos_sacd_dst_total += 1;
+                                            if isos_sacd_dst.len() < PLAFOND_ISOS_SACD_DST {
+                                                isos_sacd_dst.push(path.display().to_string());
+                                            }
+                                        }
                                         // Le motif technique exact accompagne
                                         // le CHEMIN — « sacd_extract not
                                         // found » et « sacd_extract failed »
@@ -1965,6 +2000,17 @@ pub fn list_audio_files_avec_arret(
         walk_errors = error_dirs.len(),
         "audio_files_listed"
     );
+    // Fil 3047 — une ligne de synthèse pour les disques DST : le TOTAL et
+    // le message rendu à l'écran. Les lignes par fichier s'arrêtent à
+    // `MAX_ISO_WARN` par dossier ; la liste complète est dans le rapport.
+    if let Some((motif, message)) = super::obstacle::isos_sacd_dst(isos_sacd_dst_total) {
+        warn!(
+            total = isos_sacd_dst_total,
+            nommes = isos_sacd_dst.len(),
+            motif,
+            "{message}"
+        );
+    }
     // Journalisé ici, une seule ligne par scan, et seulement quand il y a
     // quelque chose à dire : c'est la trace qui manquait pour répondre « vos
     // fichiers .mpc ne sont pas lus » au lieu de chercher un bug de scanner.
@@ -2000,6 +2046,8 @@ pub fn list_audio_files_avec_arret(
         skipped_paths,
         dossiers_avec_feuille_cue: dossiers_cue.into_iter().collect(),
         isos_sacd_natifs,
+        isos_sacd_dst,
+        isos_sacd_dst_total,
     })
 }
 
@@ -3743,6 +3791,47 @@ mod tests {
             !ecartes.contains("temoin.flac"),
             "un fichier LU ne doit jamais apparaître comme écarté\n{ecartes}"
         );
+    }
+
+    /// Fil 3047 — TOUS les ISO SACD en DST sont nommés, pas les cinq premiers.
+    ///
+    /// Sept disques DST dans un même dossier : le journal n'en citait que cinq
+    /// (`MAX_ISO_WARN`), et la liste commune les mêlait aux autres formats
+    /// sous un plafond partagé. La liste dédiée doit en porter SEPT, chemins
+    /// complets, avec le total exact.
+    #[test]
+    fn sept_isos_sacd_dst_donnent_une_liste_complete_de_sept() {
+        use crate::audio::sacd::fabrique::{ImageFabriquee, ecrire};
+        // Sous `target/`, jamais sous `/tmp` (voir les tests voisins).
+        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/tune_walker_sept_isos_dst_3047");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        let mut dst = ImageFabriquee::deux_pistes();
+        dst.stereo_dst = true;
+        let attendus: Vec<String> = (1..=7)
+            .map(|i| {
+                let chemin = base.join(format!("Disque DST {i}.iso"));
+                ecrire(&chemin, &dst);
+                chemin.display().to_string()
+            })
+            .collect();
+
+        let result = list_audio_files(&[base.to_string_lossy().to_string()]);
+        let _ = std::fs::remove_dir_all(&base);
+
+        assert_eq!(result.isos_sacd_dst_total, 7, "le total doit être exact");
+        let mut liste = result.isos_sacd_dst.clone();
+        liste.sort();
+        assert_eq!(
+            liste, attendus,
+            "les SEPT chemins complets, pas les cinq premiers"
+        );
+        // Le message du rapport : le nombre et le contournement.
+        let (_, message) = crate::scanner::obstacle::isos_sacd_dst(result.isos_sacd_dst_total)
+            .expect("sept ISO DST, un message");
+        assert!(message.starts_with("7 albums SACD"), "{message}");
+        assert!(message.contains("sacd_extract") && message.contains("DSF"));
     }
 
     /// #5297 — une image SACD en DSD brut n'est plus soumise à `sacd_extract` :

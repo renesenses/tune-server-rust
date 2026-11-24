@@ -299,6 +299,47 @@ fn obstacle_par_code(chemin: &str, e: &std::io::Error) -> Option<(&'static str, 
     Some(nomme)
 }
 
+/// Motif machine des ISO SACD compressés en DST écartés par le scan (fil 3047).
+pub const MOTIF_ISOS_SACD_DST: &str = "iso_sacd_dst_non_pris_en_charge";
+
+/// Nommer les ISO SACD compressés en DST que le scan a dû écarter (fil 3047).
+///
+/// Même forme que les autres obstacles : un motif machine stable, et une
+/// phrase pour l'utilisateur. La phrase dit COMBIEN d'albums manquent, POURQUOI
+/// (la compression DST, pas un fichier abîmé), et QUE FAIRE dès aujourd'hui.
+///
+/// 🔴 Elle ne promet AUCUNE date de prise en charge native : rien n'est
+/// décidé, et une promesse écrite dans un rapport de scan se relit des mois
+/// plus tard comme un engagement tenu ou non.
+///
+/// Rend `None` quand il n'y a rien à dire : un rapport sans ISO DST ne doit
+/// pas porter une phrase sur les SACD.
+pub fn isos_sacd_dst(total: usize) -> Option<(&'static str, String)> {
+    if total == 0 {
+        return None;
+    }
+    let albums = if total == 1 {
+        "1 album SACD compressé en DST (DSD compressé) n'est pas pris en charge \
+         pour l'instant"
+            .to_string()
+    } else {
+        format!(
+            "{total} albums SACD compressés en DST (DSD compressé) ne sont pas \
+             pris en charge pour l'instant"
+        )
+    };
+    Some((
+        MOTIF_ISOS_SACD_DST,
+        format!(
+            "{albums} : Tune lit nativement les ISO SACD en DSD brut, mais pas \
+             ceux dont l'audio est compressé en DST. Pour les écouter dès \
+             maintenant, installez vous-même l'outil sacd_extract sur la \
+             machine qui exécute Tune puis relancez un scan, ou convertissez \
+             ces images en fichiers DSF."
+        ),
+    ))
+}
+
 #[cfg(not(any(unix, windows)))]
 fn obstacle_par_code(_chemin: &str, _e: &std::io::Error) -> Option<(&'static str, String)> {
     None
@@ -452,6 +493,39 @@ mod tests {
         assert_ne!(phrase(libc::ENODEV), phrase(libc::ENOTCONN));
         assert_ne!(phrase(libc::ENODEV), phrase(libc::ENOENT));
         assert_ne!(phrase(libc::EACCES), phrase(libc::ENOENT));
+    }
+
+    /// Fil 3047 — les ISO SACD en DST : le nombre, la cause, les deux
+    /// contournements, et AUCUNE date promise.
+    #[test]
+    fn les_isos_sacd_dst_sont_nommes_avec_leur_contournement() {
+        assert!(
+            super::isos_sacd_dst(0).is_none(),
+            "rien à dire, rien de dit"
+        );
+
+        let (motif, rendu) = super::isos_sacd_dst(7).expect("7 ISO DST");
+        assert_eq!(motif, super::MOTIF_ISOS_SACD_DST);
+        assert!(
+            motif.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+            "motif non machine : {motif:?}"
+        );
+        assert!(rendu.starts_with("7 albums SACD"), "{rendu:?}");
+        assert!(rendu.contains("DST"), "{rendu:?}");
+        assert!(rendu.contains("pour l'instant"), "{rendu:?}");
+        assert!(rendu.contains("sacd_extract"), "{rendu:?}");
+        assert!(rendu.contains("DSF"), "{rendu:?}");
+        let bas = rendu.to_lowercase();
+        for promesse in ["prochaine version", "bientôt", "rc1", "v1.", "2026", "2027"] {
+            assert!(
+                !bas.contains(promesse),
+                "aucune date ne doit être promise (« {promesse} ») : {rendu:?}"
+            );
+        }
+
+        let (_, un) = super::isos_sacd_dst(1).expect("1 ISO DST");
+        assert!(un.starts_with("1 album SACD"), "{un:?}");
+        assert!(un.contains("n'est pas pris en charge"), "{un:?}");
     }
 
     /// Le suffixe `(os error N)` que colle `Display` est du bruit : il est
