@@ -444,7 +444,8 @@ pub fn schema_json() -> Value {
         }
     });
     schema["$defs"]["delivery"] = delivery;
-    schema["$defs"]["zone_response"]["properties"]["delivery"] = json!({ "$ref": "#/$defs/delivery" });
+    schema["$defs"]["zone_response"]["properties"]["delivery"] =
+        json!({ "$ref": "#/$defs/delivery" });
     schema
 }
 
