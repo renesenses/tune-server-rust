@@ -1,0 +1,102 @@
+[
+  {
+    "relecteur": "Codex, relecture du 24 novembre 2026",
+    "source": "contenu",
+    "fichier": "README.md",
+    "ligne": 8,
+    "occurrence": 1,
+    "sha256_ligne": "ca1a60eb94254a101170bde5203c61b903b663fb1c63052e0c3fd40dbb57f7a0",
+    "hmac": "6cff2d1108127223c370a5c3668261cfe95cd9486acf2ec0a2ff89e33c808165",
+    "justification": "Présentation de la bibliothèque musicale regroupée dans une seule IHM."
+  },
+  {
+    "relecteur": "Codex, relecture du 24 novembre 2026",
+    "source": "contenu",
+    "fichier": "README.md",
+    "ligne": 8,
+    "occurrence": 2,
+    "sha256_ligne": "ca1a60eb94254a101170bde5203c61b903b663fb1c63052e0c3fd40dbb57f7a0",
+    "hmac": "794e80a5d906e1c14c774d540c1eebaba585eb252351b235d8bf53ba4a8f35b2",
+    "justification": "Lecteurs réseau destinataires du flux bit-perfect dans la présentation du serveur."
+  },
+  {
+    "relecteur": "Codex, relecture du 24 novembre 2026",
+    "source": "contenu",
+    "fichier": "README.md",
+    "ligne": 71,
+    "occurrence": 1,
+    "sha256_ligne": "ecade628805c2553a15bded96efa87cd975164be2e4932298c2cfe38010d570f",
+    "hmac": "794e80a5d906e1c14c774d540c1eebaba585eb252351b235d8bf53ba4a8f35b2",
+    "justification": "Option Docker donnant accès à la carte son dans la commande de démarrage."
+  },
+  {
+    "relecteur": "Codex, relecture du 24 novembre 2026",
+    "source": "contenu",
+    "fichier": "README.md",
+    "ligne": 89,
+    "occurrence": 1,
+    "sha256_ligne": "5158b3ca2a186053ab4e8f5e89910d14648a361375ee7ab2ae568081b732d5ea",
+    "hmac": "794e80a5d906e1c14c774d540c1eebaba585eb252351b235d8bf53ba4a8f35b2",
+    "justification": "Explication de l’option Docker qui expose /dev/snd au conteneur."
+  },
+  {
+    "relecteur": "Codex, relecture du 24 novembre 2026",
+    "source": "contenu",
+    "fichier": "README.md",
+    "ligne": 90,
+    "occurrence": 1,
+    "sha256_ligne": "f405d29ee691a4073d38db084a04f7fed53e5a977abcc9c6b6428d2a9e0b7a40",
+    "hmac": "794e80a5d906e1c14c774d540c1eebaba585eb252351b235d8bf53ba4a8f35b2",
+    "justification": "Suite de la phrase sur les sorties audio de l’hôte accessibles au DAC USB."
+  },
+  {
+    "relecteur": "Codex, relecture du 24 novembre 2026",
+    "source": "contenu",
+    "fichier": "README.md",
+    "ligne": 97,
+    "occurrence": 1,
+    "sha256_ligne": "829a012673063755899bdf02c1b468538184411904773beaf26a01c12b3449db",
+    "hmac": "794e80a5d906e1c14c774d540c1eebaba585eb252351b235d8bf53ba4a8f35b2",
+    "justification": "Option Docker qui expose le lecteur optique /dev/sr0."
+  },
+  {
+    "relecteur": "Codex, relecture du 24 novembre 2026",
+    "source": "contenu",
+    "fichier": "README.md",
+    "ligne": 97,
+    "occurrence": 2,
+    "sha256_ligne": "829a012673063755899bdf02c1b468538184411904773beaf26a01c12b3449db",
+    "hmac": "794e80a5d906e1c14c774d540c1eebaba585eb252351b235d8bf53ba4a8f35b2",
+    "justification": "Nom du champ Docker Compose qui associe le lecteur optique au conteneur."
+  },
+  {
+    "relecteur": "Codex, relecture du 24 novembre 2026",
+    "source": "contenu",
+    "fichier": "README.md",
+    "ligne": 132,
+    "occurrence": 1,
+    "sha256_ligne": "ecade628805c2553a15bded96efa87cd975164be2e4932298c2cfe38010d570f",
+    "hmac": "794e80a5d906e1c14c774d540c1eebaba585eb252351b235d8bf53ba4a8f35b2",
+    "justification": "Option Docker donnant accès au son dans le second exemple de lancement."
+  },
+  {
+    "relecteur": "Codex, relecture du 24 novembre 2026",
+    "source": "contenu",
+    "fichier": "Cargo.lock",
+    "ligne": 7822,
+    "occurrence": 1,
+    "sha256_ligne": "26c6c910a118e34efa3b6b748be83b566114530a7efecc3a03ae654456773226",
+    "hmac": "6cff2d1108127223c370a5c3668261cfe95cd9486acf2ec0a2ff89e33c808165",
+    "justification": "Dépendance Windows référencée par le verrou Cargo."
+  },
+  {
+    "relecteur": "Codex, relecture du 24 novembre 2026",
+    "source": "contenu",
+    "fichier": "Cargo.lock",
+    "ligne": 7851,
+    "occurrence": 1,
+    "sha256_ligne": "c1f02cc4348a697294f4ef7a3ee37030a6f8c9f7b4e4a53946b06bd99bdf4df7",
+    "hmac": "6cff2d1108127223c370a5c3668261cfe95cd9486acf2ec0a2ff89e33c808165",
+    "justification": "Nom du paquet de liaison Windows dans le verrou Cargo."
+  }
+]

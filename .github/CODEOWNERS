@@ -4,3 +4,6 @@
 /.github/workflows/ @renesenses
 /.github/CODEOWNERS @renesenses
 /scripts/determiner-profil-ci.sh @renesenses
+/scripts/catalogue/ @renesenses
+/scripts/verifier-catalogue.py @renesenses
+/scripts/test-verifier-catalogue.py @renesenses
