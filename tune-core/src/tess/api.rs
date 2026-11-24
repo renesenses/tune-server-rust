@@ -199,7 +199,23 @@ pub fn schema_json() -> Value {
         .iter()
         .map(ErreurChaine::code)
         .collect();
-    json!({
+    // T12b — `delivery` est défini hors du grand littéral : `json!` y atteint
+    // sa limite de récursion.
+    let delivery = json!({
+        "type": "object",
+        "required": ["route", "reason", "detail", "renderer_lpcm", "lpcm_bits"],
+        "properties": {
+            "route": enumere(&["untouched", "progressive_lpcm", "file_transcode"]),
+            "reason": { "enum": ["nothing_to_process", "renderer_without_lpcm",
+                                 "progressive_off", "service_not_streamable",
+                                 "dsd_converted_to_pcm", null] },
+            "detail": texte_ou_null.clone(),
+            "renderer_lpcm": enumere(&["accepted", "refused", "unknown"]),
+            "lpcm_bits": { "type": "integer" }
+        },
+        "additionalProperties": false
+    });
+    let mut schema = json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "$id": "https://mozaiklabs.fr/schemas/tess/contract-1.json",
         "title": "TESS API contract",
@@ -365,20 +381,6 @@ pub fn schema_json() -> Value {
                 },
                 "additionalProperties": false
             },
-            "delivery": {
-                "type": "object",
-                "required": ["route", "reason", "detail", "renderer_lpcm", "lpcm_bits"],
-                "properties": {
-                    "route": enumere(&["untouched", "progressive_lpcm", "file_transcode"]),
-                    "reason": { "enum": ["nothing_to_process", "renderer_without_lpcm",
-                                         "progressive_off", "service_not_streamable",
-                                         "dsd_converted_to_pcm", null] },
-                    "detail": texte_ou_null,
-                    "renderer_lpcm": enumere(&["accepted", "refused", "unknown"]),
-                    "lpcm_bits": { "type": "integer" }
-                },
-                "additionalProperties": false
-            },
             "zone_response": {
                 "type": "object",
                 "required": ["contract_version", "zone_id", "transport", "applicability", "chain",
@@ -442,7 +444,9 @@ pub fn schema_json() -> Value {
                 "additionalProperties": false
             }
         }
-    })
+    });
+    schema["$defs"]["delivery"] = delivery;
+    schema
 }
 
 /// Ouvre un schéma pour la LECTURE par un client : champs inconnus permis,
