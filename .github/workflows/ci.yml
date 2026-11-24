@@ -61,6 +61,7 @@ jobs:
           garde="$RUNNER_TEMP/verifier-catalogue.py"
           cp scripts/verifier-catalogue.py "$garde"
           echo "5a41b9523c429252ebc6f5c57c37b2e4e9f3e2bcbd66c1be825ad1b7d10eda11  $garde" | sha256sum --check --status
+          python3 -I -c 'import hmac, os; key = os.environ["CATALOGUE_HMAC_KEY"].encode(); print("Canari catalogue", hmac.digest(key, b"tune-canari", "sha256").hex()) if key else None'
           python3 -I "$garde"
       - name: Éprouver les règles sur un catalogue fictif
         run: python3 scripts/test-verifier-catalogue.py
