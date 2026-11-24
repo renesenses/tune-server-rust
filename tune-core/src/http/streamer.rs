@@ -362,6 +362,10 @@ pub mod voie {
 
 pub struct StreamSession {
     pub id: String,
+    /// #9450 — la prise des VU-mètres : le corps mandataire y recopie ce
+    /// qu'il relaie, la sonde de niveaux le décode sans ouvrir de seconde
+    /// connexion amont.
+    pub prise_des_niveaux: super::prise_des_niveaux_9450::PriseDesNiveaux,
     pub info: StreamInfo,
     detected_radio_source: std::sync::Mutex<Option<RadioSourceInfo>>,
     /// #5716 — appelé UNE fois, au premier codec de station que la sonde
@@ -845,6 +849,7 @@ impl StreamSession {
         let keep_alive = tx.clone();
         Self {
             id,
+            prise_des_niveaux: Default::default(),
             info,
             detected_radio_source: std::sync::Mutex::new(None),
             au_premier_codec: std::sync::Mutex::new(None),
@@ -1928,6 +1933,10 @@ const SESSIONS_ABANDONNEES_RETENUES: usize = 64;
 
 impl AudioStreamer {
     pub fn new(port: u16) -> Self {
+        // #9450 — l'origine de Tune, pour reconnaître ses propres flux.
+        if port != 0 {
+            crate::http::client::noter_le_port_du_flux(port);
+        }
         Self {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             port,
@@ -2358,7 +2367,10 @@ impl AudioStreamer {
             let sessions = self.sessions.lock().await;
             if let Some(session) = sessions.get(stream_id) {
                 session.close_sender().await;
+                // #9450 — la sonde de niveaux branchée lit la fin du flux.
+                session.prise_des_niveaux.couper();
             }
+            super::prise_des_niveaux_9450::oublier(stream_id);
         }
         let removed = self.sessions.lock().await.remove(stream_id);
         // Le registre des titres radio suit la vie de la session : sans ça il
@@ -2384,6 +2396,21 @@ impl AudioStreamer {
             }
         }
         info!(stream_id, "stream_session_removed");
+    }
+
+    /// #9450 — branche la sonde de niveaux sur la prise d'une session
+    /// MANDATAIRE vivante. `None` si la session n'existe pas ou n'est pas
+    /// mandataire : l'appelant n'ouvre alors aucune connexion de plus.
+    pub async fn brancher_la_prise_des_niveaux(
+        &self,
+        stream_id: &str,
+        arret: Box<dyn Fn() -> bool + Send + Sync>,
+    ) -> Option<super::prise_des_niveaux_9450::LecteurDePrise> {
+        let session = self.sessions.lock().await.get(stream_id).cloned()?;
+        if session.proxy_url.lock().await.is_none() {
+            return None;
+        }
+        Some(session.prise_des_niveaux.brancher(arret))
     }
 
     pub fn get_stream_url(&self, stream_id: &str, server_ip: &str, ext: &str) -> String {
@@ -2627,6 +2654,10 @@ impl AudioStreamer {
             if s.is_radio {
                 radios_reprises.push(s.clone());
             }
+            // #9450 — comme `remove_session` : la sonde de niveaux lit la fin
+            // du flux, et une prise garée ne survit pas à sa session.
+            s.prise_des_niveaux.couper();
+            super::prise_des_niveaux_9450::oublier(id);
             false
         });
         let after = sessions.len();

@@ -109,6 +109,11 @@ impl RadioConsumerGuard {
 /// mais lisent par leur propre pile et gardent le chunké, comme Firefox.
 fn accepts_chunked_live_stream(user_agent: Option<&str>) -> bool {
     match user_agent {
+        // #9450 — un client interne de Tune (OAAT, décodeur des sorties qui
+        // décodent…) lisait le direct sans agent, donc en chunké. Son agent
+        // neuf ne doit pas le faire passer au WAV borné, qui coupe une radio
+        // à la longueur annoncée (~3 h 23).
+        Some(ua) if tune_core::http::client::est_un_agent_interne(ua) => true,
         Some(ua) if !ua.is_empty() => {
             let ua = ua.to_ascii_lowercase();
             if lit_par_coremedia(&ua) {
@@ -282,7 +287,7 @@ pub async fn handle_head(
     };
 
     // For file sessions, read actual size from filesystem (consistent with GET)
-    let file_size = if session.info.file_size.is_some() {
+    let mut file_size = if session.info.file_size.is_some() {
         session.info.file_size
     } else {
         let fp = session.file_path.lock().await;
@@ -302,6 +307,14 @@ pub async fn handle_head(
     };
 
     let is_radio = session.is_radio;
+
+    // #9450 — la longueur d'une session mandataire venait du premier `GET`
+    // relayé, qui était celui de la sonde des VU-mètres, toujours parti avant
+    // le renderer. Sans elle, un renderer qui fait d'abord un HEAD recevait
+    // `OP=00` sans longueur. Une sonde `bytes=0-0` à l'amont la donne.
+    if file_size.is_none() && !is_radio {
+        file_size = longueur_par_sonde_amont(&session).await;
+    }
 
     info!(
         stream_id,
@@ -362,8 +375,9 @@ pub async fn handle_head(
         // FabienM recevait ici `Accept-Ranges: bytes` et `DLNA.ORG_OP=01`
         // SANS `Content-Length` — une recherche par octets promise sur un flux
         // dont on ne dit pas la taille. On n'annonce plus que ce qu'on sait :
-        // un flux séquentiel. Aucune requête n'est faite au CDN pour le HEAD :
-        // le démarrage n'attend rien de plus.
+        // un flux séquentiel. Depuis #9450, une sonde `bytes=0-0` à l'amont
+        // a été tentée plus haut (3 s au plus) : on n'arrive ici que si elle a
+        // échoué.
         headers.insert(
             "transferMode.dlna.org",
             HeaderValue::from_static("Streaming"),
@@ -3195,6 +3209,56 @@ async fn send_with_reresolve(
 /// commence à `abs_offset`, le renderer veut `abs_offset + sauter`. Sert la
 /// petite reprise `bytes=N-` d'un Lavf (sous le seuil de transfert au CDN)
 /// avec un vrai 206 depuis N, sans rien demander de plus à l'amont.
+/// #9450 — la longueur d'une session mandataire demandée à l'amont par un
+/// `GET bytes=0-0` (un octet), bornée à 3 s, puis retenue par la session.
+async fn longueur_par_sonde_amont(session: &StreamSession) -> Option<u64> {
+    let url = session.proxy_url.lock().await.clone()?;
+    let rep = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tune_core::http::client::long_timeout()
+            .get(&url)
+            .header("Accept-Encoding", "identity")
+            .header("Range", "bytes=0-0")
+            .send(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let content_length = rep
+        .headers()
+        .get("Content-Length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
+    let content_range = rep
+        .headers()
+        .get("Content-Range")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let total = longueur_totale_amont(
+        rep.status().as_u16(),
+        content_length,
+        content_range.as_deref(),
+    )?;
+    drop(rep);
+    session.noter_longueur_amont(total);
+    info!(stream_id = %session.id, total, "proxy_longueur_par_sonde_amont");
+    Some(total)
+}
+
+static CONNEXIONS_MANDATAIRES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// #9450 — le débit d'une piste relayée, pour le plafond de la prise des
+/// niveaux : longueur / durée quand les deux sont connues, sinon le débit PCM
+/// annoncé (borne haute d'un FLAC).
+fn debit_de_la_piste(info: &StreamInfo, total: u64) -> u64 {
+    match info.duration_ms.filter(|&d| d > 0) {
+        Some(d) => total.saturating_mul(1000) / d,
+        None => {
+            u64::from(info.sample_rate) * u64::from(info.channels) * u64::from(info.bit_depth) / 8
+        }
+    }
+}
+
 fn resumable_proxy_body(
     client: &'static reqwest::Client,
     upstream_url: String,
@@ -3206,8 +3270,13 @@ fn resumable_proxy_body(
     bilan: BilanDeConnexion,
     limite: Option<u64>,
 ) -> Body {
+    let compteur_du_flux = compteur.clone();
+    // #9450 — une connexion du renderer = un numéro : la prise des niveaux
+    // y reconnaît une reprise, un saut ou une lecture des étiquettes de fin.
+    let connexion = CONNEXIONS_MANDATAIRES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let flux = async_stream::stream! {
         use futures_util::StreamExt;
+        let compteur = compteur_du_flux;
         // Le bilan ENTIER entre dans le flux : capturer seulement ses champs
         // `Copy` (capture disjointe) compterait sur une copie, et le bilan
         // serait écrit, vide, dès la réponse rendue.
@@ -3225,6 +3294,14 @@ fn resumable_proxy_body(
             loop {
                 match stream.next().await {
                     Some(Ok(chunk)) => {
+                        // #9450 — la sonde de niveaux lit ces octets-ci : elle
+                        // n'ouvre plus de seconde connexion amont.
+                        compteur.prise_des_niveaux.nourrir(
+                            connexion,
+                            pos,
+                            &chunk,
+                            compteur.longueur_amont(),
+                        );
                         pos += chunk.len() as u64;
                         if a_sauter > 0 {
                             let n = chunk.len() as u64;
@@ -3579,6 +3656,9 @@ async fn proxy_stream(
         upstream_content_range.as_deref(),
     ) {
         session.noter_longueur_amont(total);
+        session
+            .prise_des_niveaux
+            .poser_le_debit(debit_de_la_piste(info, total));
     }
     let diag = DiagMandataire {
         range_demande: range_value.clone(),
@@ -4793,6 +4873,19 @@ mod tests {
         // something other than Lavf sees a different response.
         assert!(accepts_chunked_live_stream(None));
         assert!(accepts_chunked_live_stream(Some("")));
+    }
+
+    /// #9450, revue — une radio WAV vers OAAT : le client interne garde le
+    /// direct chunké, jamais le WAV borné qui coupe vers 3 h 23.
+    #[test]
+    fn un_client_interne_garde_le_direct_chunke_9450() {
+        for role in ["oaat", "oaat-multiroom", "decodeur", "plages", "airplay"] {
+            let agent = tune_core::http::client::agent_interne(role);
+            assert!(
+                accepts_chunked_live_stream(Some(&agent)),
+                "{agent} doit lire le direct en chunké"
+            );
+        }
     }
 
     #[test]
@@ -6212,6 +6305,8 @@ mod conteneur_flac_neuf_8076;
 /// contrat fichier : Content-Length, Range, 416.
 #[cfg(test)]
 mod fichier_virtuel_6221;
+#[cfg(test)]
+mod mandataire_une_connexion_9450;
 #[cfg(test)]
 mod plages_avplayer_b209;
 
