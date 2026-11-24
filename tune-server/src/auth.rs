@@ -969,46 +969,308 @@ impl FromRequestParts<AppState> for AdminOuCetteMachine {
         if appel_depuis_cette_machine(parts, state).await {
             return Ok(AdminOuCetteMachine);
         }
-        let appelant = adresse_de_l_appelant(parts, state)
-            .await
-            .map(|ip| ip.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
-        let relaye = crate::garde_du_relais::requete_relayee(&parts.headers);
-        let relais_port_80 = !crate::routes::appliance::bouclage_fiable();
-        let mandataire = derriere_un_mandataire(&parts.headers);
-        tracing::warn!(
-            chemin = %parts.uri.path(),
-            %appelant,
-            relaye,
-            relais_port_80,
-            mandataire,
-            "action_machine_refusee_hors_de_cette_machine_sans_authentification"
-        );
-        // Le refus dit ce que le serveur a vu : l'exploitant comprend tout de
-        // suite pourquoi « depuis cette machine » n'a pas été reconnu.
-        let (motif, message) = if relais_port_80 {
-            (
-                "port80_relay",
-                "This appliance relays port 80 to the server from 127.0.0.1, so a local \
-                 call cannot be told apart from the network: enable authentication and \
-                 sign in as an administrator (or rebuild the Tune OS image).",
-            )
-        } else {
-            (
-                "not_local",
-                "This action requires authentication to be enabled, or a call from this \
-                 machine (localhost).",
-            )
-        };
-        Err((
-            StatusCode::FORBIDDEN,
-            Json(json!({
+        Err(refus_action_reservee(parts, state, Refus::HorsDeCetteMachine).await)
+    }
+}
+
+/// Pourquoi une action réservée a été refusée : choisit la phrase rendue.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Refus {
+    /// Ni administrateur, ni appel de cette machine.
+    HorsDeCetteMachine,
+    /// Installation d'une mise à jour sans authentification, appel venu
+    /// d'ailleurs que du réseau local (accès à distance, mandataire, VPN).
+    HorsDuReseauLocal,
+    /// Liaison du compte mozaiklabs.fr sans authentification, appel venu
+    /// d'ailleurs que du réseau local.
+    CompteHorsDuReseauLocal,
+}
+
+/// L'action que nomme le refus, d'après le chemin appelé : la clé de son
+/// libellé dans `i18n_server.json` (`api.machine.action.<clé>`).
+pub fn action_du_chemin(chemin: &str) -> &'static str {
+    let c = chemin.to_ascii_lowercase();
+    if c.contains("/cloud/sso") {
+        "account"
+    } else if c.contains("/update/channel") {
+        "updateChannel"
+    } else if c.contains("/update") {
+        "update"
+    } else if c.contains("/reboot") || c.contains("/restart") {
+        "restart"
+    } else if c.contains("/shutdown") {
+        "shutdown"
+    } else if c.contains("backup") || c.contains("restore") {
+        "backup"
+    } else if c.contains("/support") {
+        "support"
+    } else if c.contains("/cloud") {
+        "remote"
+    } else if c.contains("plugin") {
+        "extensions"
+    } else {
+        "other"
+    }
+}
+
+/// Le refus d'une action réservée : une phrase lisible, dans la langue de
+/// l'interface (`Accept-Language`, repli anglais), qui dit QUELLE action,
+/// POURQUOI, et COMMENT faire. Le client web affiche `message` tel quel.
+async fn refus_action_reservee(
+    parts: &mut Parts,
+    state: &AppState,
+    refus: Refus,
+) -> (StatusCode, Json<Value>) {
+    let appelant = adresse_de_l_appelant(parts, state)
+        .await
+        .map(|ip| ip.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+    let relaye = crate::garde_du_relais::requete_relayee(&parts.headers);
+    let relais_port_80 = !crate::routes::appliance::bouclage_fiable();
+    let mandataire = derriere_un_mandataire(&parts.headers);
+    let chemin = parts
+        .extensions
+        .get::<axum::extract::OriginalUri>()
+        .map(|o| o.0.path().to_string())
+        .unwrap_or_else(|| parts.uri.path().to_string());
+    tracing::warn!(
+        chemin = %chemin,
+        %appelant,
+        relaye,
+        relais_port_80,
+        mandataire,
+        hors_du_reseau_local = refus != Refus::HorsDeCetteMachine,
+        "action_machine_refusee_hors_de_cette_machine_sans_authentification"
+    );
+    // Le refus dit ce que le serveur a vu : l'exploitant comprend tout de
+    // suite pourquoi « depuis cette machine » n'a pas été reconnu.
+    let (motif, cle) = match refus {
+        Refus::HorsDuReseauLocal => ("not_local_network", "api.machine.reservedOutsideLan"),
+        Refus::CompteHorsDuReseauLocal => {
+            ("not_local_network", "api.machine.reservedOutsideLanAccount")
+        }
+        Refus::HorsDeCetteMachine if relais_port_80 => {
+            ("port80_relay", "api.machine.reservedPort80Relay")
+        }
+        Refus::HorsDeCetteMachine => ("not_local", "api.machine.reservedNotLocal"),
+    };
+    let lang = crate::i18n::lang_from_header(&parts.headers);
+    let action_cle = action_du_chemin(&chemin);
+    let action = crate::i18n::t(&lang, &format!("api.machine.action.{action_cle}"));
+    (
+        StatusCode::FORBIDDEN,
+        Json(crate::message_api::avec_message_en(
+            json!({
                 "error": "auth_required",
+                "code": "auth_required",
                 "reason": motif,
-                "message": message,
+                "action": action_cle,
                 "caller": appelant,
                 "relayed": relaye,
-            })),
+            }),
+            &lang,
+            cle,
+            &[("action", action)],
+        )),
+    )
+}
+
+/// Adresse du RÉSEAU LOCAL : privée IPv4 (RFC 1918), lien local IPv4
+/// (169.254/16), unique locale IPv6 (fc00::/7), lien local IPv6 (fe80::/10),
+/// et leurs formes IPv4 d'une socket à double pile. PAS le partage
+/// d'adresses 100.64/10 (CGNAT, Tailscale) : c'est un accès à distance.
+pub fn adresse_du_reseau_local(ip: std::net::IpAddr) -> bool {
+    let v4_local = |v4: std::net::Ipv4Addr| v4.is_private() || v4.is_link_local();
+    match ip {
+        std::net::IpAddr::V4(v4) => v4_local(v4),
+        std::net::IpAddr::V6(v6) => {
+            let premier = v6.segments()[0];
+            (premier & 0xfe00) == 0xfc00
+                || (premier & 0xffc0) == 0xfe80
+                || v6.to_ipv4_mapped().is_some_and(v4_local)
+        }
+    }
+}
+
+/// L'appel vient-il du RÉSEAU LOCAL ? Mêmes critères que la garde d'hôte et
+/// d'origine (`garde_origine`), et jamais :
+///
+/// - une requête rejouée par le relais cloud ou l'écoute directe ;
+/// - une requête passée par un mandataire inverse (en-têtes, HTTP/1.0, ou
+///   mandataire déclaré par `TUNE_ALLOWED_ORIGINS` / `TUNE_ALLOWED_HOSTS`) ;
+/// - une adresse hors réseau local (Internet, CGNAT/Tailscale).
+///
+/// Le bouclage n'est accepté ici que sur une appliance Tune OS dont le relais
+/// du port 80 rouvre depuis 127.0.0.1 les connexions du réseau local
+/// (`appliance::bouclage_fiable` faux) : c'est exactement ce qu'il relaie.
+/// Ailleurs, le bouclage relève de [`appel_depuis_cette_machine`].
+async fn appel_depuis_le_reseau_local(parts: &mut Parts, state: &AppState) -> bool {
+    if crate::garde_du_relais::requete_relayee(&parts.headers) {
+        return false;
+    }
+    if parts.version == axum::http::Version::HTTP_10 {
+        return false;
+    }
+    if derriere_un_mandataire(&parts.headers) {
+        return false;
+    }
+    if !crate::garde_origine::hote_de_la_requete_accepte(&parts.headers) {
+        return false;
+    }
+    if !matches!(
+        crate::garde_origine::juger(&parts.method, &parts.headers),
+        crate::garde_origine::Verdict::Acceptee
+    ) {
+        return false;
+    }
+    let Some(ip) = adresse_de_l_appelant(parts, state).await else {
+        return false;
+    };
+    if adresse_de_cette_machine(ip) {
+        return !crate::routes::appliance::bouclage_fiable();
+    }
+    adresse_du_reseau_local(ip)
+}
+
+/// Garde de la SEULE installation d'une mise à jour officielle
+/// (`POST /system/update/install`).
+///
+/// - Authentification active : l'administrateur, comme [`AdminOuCetteMachine`].
+/// - Authentification coupée : un appel de cette machine, ou du RÉSEAU LOCAL
+///   ([`appel_depuis_le_reseau_local`]), à condition que la vérification de
+///   signature des mises à jour soit armée (clé minisign embarquée). La route
+///   ne prend aucune URL ni aucune version de l'appelant : elle installe la
+///   release officielle choisie par le vérificateur, après contrôle de la
+///   signature de `SHA256SUMS`.
+///
+/// Les autres actions de machine (redémarrer, éteindre, extensions, accès à
+/// distance, sauvegardes, canal de mise à jour) restent sous
+/// [`AdminOuCetteMachine`].
+pub struct AdminOuReseauLocalPourLaMiseAJour;
+
+impl FromRequestParts<AppState> for AdminOuReseauLocalPourLaMiseAJour {
+    type Rejection = (StatusCode, Json<Value>);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if authentification_active(state) {
+            return <RequireAdmin as FromRequestParts<AppState>>::from_request_parts(parts, state)
+                .await
+                .map(|_| Self);
+        }
+        if appel_depuis_cette_machine(parts, state).await {
+            return Ok(Self);
+        }
+        if crate::routes::system::update::mise_a_jour_signee_exigee()
+            && appel_depuis_le_reseau_local(parts, state).await
+        {
+            tracing::info!("mise_a_jour_acceptee_depuis_le_reseau_local_sans_authentification");
+            return Ok(Self);
+        }
+        Err(refus_action_reservee(parts, state, Refus::HorsDuReseauLocal).await)
+    }
+}
+
+/// Garde de la LIAISON du compte mozaiklabs.fr du serveur
+/// (`GET /cloud/sso/authorize` et son retour `GET /cloud/sso/callback`), même
+/// règle que la mise à jour ([`AdminOuReseauLocalPourLaMiseAJour`]). La
+/// DÉLIAISON reste sous [`AdminOuCetteMachine`] (décision du 23/11) :
+///
+/// - authentification active : l'administrateur (un compte standard relie son
+///   propre profil, voir `routes::cloud::liaison_autorisee`) ;
+/// - authentification coupée : cette machine, ou le RÉSEAU LOCAL
+///   ([`appel_depuis_le_reseau_local`]) ; jamais le relais distant, un
+///   mandataire inverse ni une adresse hors réseau local.
+///
+/// Décision du 23/11 (option C) : depuis le réseau local, la liaison relie un
+/// serveur sans compte, ou reconnecte le MÊME compte ; remplacer le compte
+/// relié par un autre reste à cette machine ou à l'administrateur. Le compte
+/// n'est connu qu'après l'échange du code : la garde dit seulement par où
+/// l'appel est passé (`par_le_reseau_local`), et `routes::cloud` juge au
+/// retour, juste avant d'enregistrer la session ([`refus_compte_deja_relie`]).
+///
+/// La ronde OAuth garde ses propres verrous (PKCE, `state` à usage unique,
+/// `redirect_uri` mémorisée).
+pub struct AdminOuReseauLocalPourLeCompte {
+    /// Vrai quand seul le réseau local a ouvert la garde (ni administrateur,
+    /// ni cette machine).
+    pub par_le_reseau_local: bool,
+}
+
+impl FromRequestParts<AppState> for AdminOuReseauLocalPourLeCompte {
+    type Rejection = (StatusCode, Json<Value>);
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let admin_ou_machine = Self {
+            par_le_reseau_local: false,
+        };
+        if authentification_active(state) {
+            return <RequireAdmin as FromRequestParts<AppState>>::from_request_parts(parts, state)
+                .await
+                .map(|_| admin_ou_machine);
+        }
+        if appel_depuis_cette_machine(parts, state).await {
+            return Ok(admin_ou_machine);
+        }
+        if appel_depuis_le_reseau_local(parts, state).await {
+            tracing::info!("compte_accepte_depuis_le_reseau_local_sans_authentification");
+            return Ok(Self {
+                par_le_reseau_local: true,
+            });
+        }
+        Err(refus_action_reservee(parts, state, Refus::CompteHorsDuReseauLocal).await)
+    }
+}
+
+/// Refus de LIER depuis le réseau local, sans authentification, un AUTRE
+/// compte mozaiklabs.fr que celui déjà relié au serveur (décision du 23/11) :
+/// le remplacer reste à cette machine ou à l'administrateur. Motif `account_already_linked`,
+/// phrase `api.machine.accountAlreadyLinked` dans la langue de l'interface.
+pub fn refus_compte_deja_relie(entetes: &axum::http::HeaderMap) -> (StatusCode, Json<Value>) {
+    tracing::warn!("liaison_du_compte_refusee_depuis_le_reseau_local_compte_deja_relie");
+    let lang = crate::i18n::lang_from_header(entetes);
+    (
+        StatusCode::FORBIDDEN,
+        Json(crate::message_api::avec_message_en(
+            json!({
+                "error": "auth_required",
+                "code": "auth_required",
+                "reason": "account_already_linked",
+                "action": "account",
+            }),
+            &lang,
+            "api.machine.accountAlreadyLinked",
+            &[],
+        )),
+    )
+}
+
+/// Extracteur infaillible, même règle que [`AdminOuReseauLocalPourLeCompte`]
+/// sans rejet ni trace : `GET /cloud/sso/status` montre le compte relié
+/// (nom, courriel, photo) à qui peut le relier. Sans authentification, un
+/// appareil du réseau local voit donc le compte du serveur, et le menu du
+/// compte (photo de profil comprise) fonctionne ; le relais distant et les
+/// mandataires n'en voient toujours que « relié ».
+#[derive(Debug, Clone, Copy)]
+pub struct ReliePourLeCompteDuReseauLocal(pub bool);
+
+impl FromRequestParts<AppState> for ReliePourLeCompteDuReseauLocal {
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        if admin_ou_cette_machine(parts, state).await {
+            return Ok(Self(true));
+        }
+        Ok(Self(
+            !authentification_active(state) && appel_depuis_le_reseau_local(parts, state).await,
         ))
     }
 }

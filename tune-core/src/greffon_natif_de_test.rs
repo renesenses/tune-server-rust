@@ -92,6 +92,22 @@ impl Processor for Gain {
 tune_plugin_abi::export_dsp!(crate::Plugin, include_str!("../manifest.json"));
 "#;
 
+/// Les capacités du manifeste de test : le traitement audio, et le F64
+/// (`audio-f64`, TESS T05) pour un identifiant qui finit par `-f64` (T14).
+fn capacites(id: &str) -> serde_json::Value {
+    let mut c = vec![serde_json::json!(
+        {"id": "audio-process", "version": {"major": 0, "minor": 1}, "required": true}
+    )];
+    if id.ends_with("-f64") {
+        c.push(serde_json::json!({
+            "id": tune_plugin_sdk::manifest::AUDIO_F64,
+            "version": {"major": 0, "minor": 1},
+            "required": false
+        }));
+    }
+    serde_json::Value::Array(c)
+}
+
 /// Construit, dans `dossier`, une bibliothèque native du greffon de test (le
 /// même gain) par identifiant de `ids`, et rend leurs chemins dans le même
 /// ordre. #7616 : l'identifiant est le seul paramètre, pour poser sur une zone
@@ -144,9 +160,7 @@ pub fn construire_les_bibliotheques_de_test(
                     "config_version": 1,
                     "entitlement": format!("plugin.{id}"),
                     "distribution": "source",
-                    "capabilities": [
-                        {"id": "audio-process", "version": {"major": 0, "minor": 1}, "required": true}
-                    ]
+                    "capabilities": capacites(id)
                 })
                 .to_string(),
             )

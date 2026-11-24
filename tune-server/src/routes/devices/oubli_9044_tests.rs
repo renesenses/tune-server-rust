@@ -75,12 +75,10 @@ fn verdict_ne_casse_jamais_une_zone_en_lecture_ni_celle_d_un_appareil_present() 
             zone: "Zone 7".into()
         })
     );
+    // rc14 : sans accord, la zone visible RESTE (plus de 409 zone_liee).
     assert_eq!(
         verdict(std::slice::from_ref(&visible), &rien, false, false),
-        Err(Refus::ZoneLiee {
-            zone_id: 7,
-            zone: "Zone 7".into()
-        })
+        Ok(vec![])
     );
     assert_eq!(
         verdict(std::slice::from_ref(&visible), &rien, false, true),
@@ -113,8 +111,8 @@ fn les_garde_fous_de_la_decouverte_ne_sont_ni_supprimes_ni_bloquants() {
     assert_eq!(verdict(&zs, &joue_reflet, false, false), Ok(vec![12, 13]));
     // Un appareil dont il ne reste que des garde-fous n'est pas listé.
     let personne: HashSet<String> = HashSet::new();
-    assert!(absents(&zs[..3], &personne).is_empty());
-    let liste = absents(&zs, &personne);
+    assert!(absents(&zs[..3], &personne, &[], &[]).is_empty());
+    let liste = absents(&zs, &personne, &[], &[]);
     assert_eq!(liste.len(), 1);
     assert_eq!(liste[0]["zones"].as_array().unwrap().len(), 2);
 }
@@ -168,7 +166,7 @@ async fn oublier_un_appareil_absent_nomme_sa_zone_puis_la_supprime_et_il_revient
         .create("Ampli du salon", Some("dlna"), Some(PARTI))
         .unwrap();
 
-    // Listé parmi les absents, avec sa zone, SANS durée (pas de date de départ).
+    // Listé parmi les absents, avec sa zone ; départ pas encore daté.
     let items = liste(&state).await;
     let ligne = items
         .iter()
@@ -178,21 +176,8 @@ async fn oublier_un_appareil_absent_nomme_sa_zone_puis_la_supprime_et_il_revient
         ligne["zones"],
         json!([{"zone_id": zid, "zone_name": "Ampli du salon", "zone_hidden": false}])
     );
-    assert!(ligne.get("absent_for_s").is_none() && ligne.get("last_seen_at").is_none());
-
-    // Sans accord : 409 qui nomme la zone ; rien n'est touché.
-    let (s, refus) = oublier_route(&state, PARTI, false).await;
-    assert_eq!(s, StatusCode::CONFLICT);
-    assert_eq!(refus["code"], "zone_liee");
-    assert_eq!(refus["zone_name"], "Ampli du salon");
-    assert!(
-        refus["message"]
-            .as_str()
-            .unwrap()
-            .contains("Ampli du salon"),
-        "{refus}"
-    );
-    assert!(repo.get(zid).unwrap().is_some());
+    assert_eq!(ligne["absent_since"], Value::Null);
+    assert_eq!(ligne["forgotten"], false);
 
     // Avec l'accord : la ligne part, et la réponse la NOMME.
     let (s, bilan) = oublier_route(&state, PARTI, true).await;

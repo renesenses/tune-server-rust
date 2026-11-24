@@ -283,11 +283,16 @@ struct TraitementsDeZone {
     egaliseur: bool,
     correction_de_piece: bool,
     replaygain: bool,
+    /// TESS T12c — l'étage casque (crossfeed, greffons natifs tiers) d'une
+    /// zone AirPlay ou Devialet AIR ([`super::regles::sortie_tess_qui_tire_le_flux`]).
+    /// Faux partout ailleurs : sur une zone réseau, le crossfeed a ses
+    /// propres règles (#2742, `crossfeed_bibliotheque_reseau`).
+    etage_casque: bool,
 }
 
 impl TraitementsDeZone {
     fn un_au_moins(self) -> bool {
-        self.egaliseur || self.correction_de_piece || self.replaygain
+        self.egaliseur || self.correction_de_piece || self.replaygain || self.etage_casque
     }
 
     fn noms(self) -> Vec<&'static str> {
@@ -295,6 +300,7 @@ impl TraitementsDeZone {
             (self.egaliseur, "egaliseur"),
             (self.correction_de_piece, "correction_de_piece"),
             (self.replaygain, "replaygain"),
+            (self.etage_casque, "etage_casque"),
         ]
         .into_iter()
         .filter_map(|(vrai, nom)| vrai.then_some(nom))
@@ -371,6 +377,20 @@ async fn preparer_dsf_depuis_iso(
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+/// #9184 — la fenêtre du décodage-pour-niveaux d'un passthrough DSD, sur
+/// l'horloge du fichier : `(début, fin)`. Une tranche d'ISO SACD servie en
+/// DSF virtuel se mesure de son début à sa fin dans l'image ; tout autre
+/// passthrough sert un fichier entier, mesuré de 0 au bout.
+pub(super) fn fenetre_des_niveaux_du_passthrough(
+    dsf_depuis_iso: bool,
+    tranche_cue: Option<TrancheCue>,
+) -> (u64, Option<u64>) {
+    match tranche_cue.filter(|_| dsf_depuis_iso) {
+        Some(t) => (t.debut_ms, t.duree_ms.map(|d| t.debut_ms + d)),
+        None => (0, None),
+    }
 }
 
 /// #5975 — la durée qui fixe la longueur annoncée d'une conversion.
@@ -2166,6 +2186,13 @@ impl PlaybackOrchestrator {
                 // passthrough. Enabling it is an explicit choice of processing;
                 // PURE zones are excluded upstream.
                 replaygain: self.zone_replaygain_changes_audio(req.zone_id, req.piste_rg()),
+                // TESS T12c — AirPlay et Devialet AIR : Tune fabrique le flux,
+                // la chaîne entière s'y applique. Le crossfeed et les greffons
+                // natifs tiers y forcent donc le flux traité comme l'égaliseur ;
+                // le relais progressif (`load_streaming_dsp`) les porte déjà.
+                etage_casque: super::regles::sortie_tess_qui_tire_le_flux(
+                    zone_output_type.as_deref(),
+                ) && self.zone_has_active_crossfeed(req.zone_id),
             }
         } else {
             TraitementsDeZone::default()
@@ -5148,20 +5175,18 @@ impl PlaybackOrchestrator {
                     file = %file_path,
                     "dsd_passthrough_niveaux_sonde"
                 );
-                // #9184 — une tranche d'ISO se mesure depuis son début dans
-                // l'image, pas depuis le début du disque.
-                let debut_dans_le_fichier = if dsf_depuis_iso.is_some() {
-                    tranche_cue.map_or(0, |t| t.debut_ms)
-                } else {
-                    0
-                };
-                spawn_local_file_levels_decode_depuis(
+                // #9184 — une tranche d'ISO se mesure de son début à sa fin
+                // dans l'image, ni depuis le début du disque, ni au-delà.
+                let (debut_dans_le_fichier, fin_dans_le_fichier) =
+                    fenetre_des_niveaux_du_passthrough(dsf_depuis_iso.is_some(), tranche_cue);
+                spawn_local_file_levels_decode_tranche(
                     bus.clone(),
                     self.playback.clone(),
                     req.zone_id,
                     play_seq,
                     file_path.clone(),
                     debut_dans_le_fichier,
+                    fin_dans_le_fichier,
                     0,
                 );
             }

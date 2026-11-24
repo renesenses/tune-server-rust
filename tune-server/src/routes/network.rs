@@ -610,6 +610,16 @@ async fn list_media_servers(State(state): State<AppState>) -> Json<Value> {
                 "last_seen_at": s.last_seen_at,
                 // L'INTENTION, distincte du constat (`network_mounts`, #1916).
                 "active": s.active,
+                // Fil du forum 3028 — champ AJOUTÉ : ce serveur est CE Tune.
+                // Il reste parcourable, mais `indexer` et `library-source` le
+                // refusent ; l'écran peut retirer le geste d'ajout.
+                "this_server": crate::discovery_setup::est_ce_serveur(
+                    &state,
+                    &s.udn,
+                    s.host.as_deref().unwrap_or_default(),
+                    s.port.and_then(|p| u16::try_from(p).ok()).unwrap_or(0),
+                    &s.location,
+                ),
             })
         })
         .collect();
