@@ -171,60 +171,27 @@ pub fn lire_texte(texte: &str) -> Result<PreReglages, String> {
 
 /// La liste enregistrée sur ce serveur. Absente : la liste par défaut.
 /// Illisible (JSON) : une erreur (jamais une liste vide qui écraserait
-/// l'ancienne). Lisible mais incohérente (écrite par une version aux règles
-/// plus lâches) : les entrées fautives sont ÉCARTÉES avec un avertissement,
-/// pour qu'une seule entrée ne fasse pas tomber toutes les routes.
+/// l'ancienne). Lisible : TOUTES les entrées sont rendues, même celles que
+/// les règles d'entrée refuseraient aujourd'hui (nom trop long, doublon,
+/// au-delà du plafond…). La validation se fait à l'ENTRÉE (enregistrement,
+/// renommage, import), jamais à la lecture : aucune écriture ultérieure ne
+/// supprime en silence le préréglage d'un utilisateur.
 pub fn lire(settings: &crate::db::settings_repo::SettingsRepo) -> Result<PreReglages, String> {
-    let texte = match settings.get(CLE_PREREGLAGES)? {
-        None => return Ok(PreReglages::default()),
-        Some(t) if t.trim().is_empty() => return Ok(PreReglages::default()),
-        Some(t) => t,
-    };
-    let mut l: PreReglages = serde_json::from_str(&texte).map_err(|e| e.to_string())?;
-    for avis in l.assainir() {
-        tracing::warn!(avis = %avis, "tess_prereglage_ecarte");
-    }
-    Ok(l)
-}
-
-impl PreReglages {
-    /// Écarte les entrées qui ne passent pas [`Self::verifier`] (id invalide
-    /// ou en double, nom invalide, Pure modifié, au-delà du plafond) et rend
-    /// un avertissement par entrée écartée. Ensuite `verifier` passe.
-    pub fn assainir(&mut self) -> Vec<String> {
-        let mut avis = Vec::new();
-        let mut gardes: Vec<PreReglage> = Vec::new();
-        for p in std::mem::take(&mut self.presets) {
-            let motif = if !id_valide(&p.id) {
-                Some("invalid id")
-            } else if gardes.iter().any(|q| q.id == p.id) {
-                Some("duplicate id")
-            } else if nom_valide(&p.name).is_none() {
-                Some("invalid name")
-            } else if p.id == ID_PREREGLAGE_PURE && p.chain != PreReglage::pure().chain {
-                Some("Pure preset modified")
-            } else if gardes.len() >= PREREGLAGES_MAX {
-                Some("over the preset limit")
-            } else {
-                None
-            };
-            match motif {
-                Some(m) => avis.push(format!("TESS preset {:?} skipped: {m}", p.id)),
-                None => gardes.push(p),
-            }
-        }
-        self.presets = gardes;
-        avis
+    match settings.get(CLE_PREREGLAGES)? {
+        None => Ok(PreReglages::default()),
+        Some(t) if t.trim().is_empty() => Ok(PreReglages::default()),
+        Some(t) => serde_json::from_str(&t).map_err(|e| e.to_string()),
     }
 }
 
-/// Écrit la liste, après [`PreReglages::verifier`]. Une valeur de mode
-/// inconnue est enregistrée comme `at_next_playback` (ce qu'elle vaut).
+/// Écrit la liste TELLE QUELLE, sans la revalider : la liste lue est
+/// réécrite avec ses entrées anciennes, et chaque route valide ce qu'elle
+/// AJOUTE ou change. Une valeur de mode inconnue est enregistrée comme
+/// `at_next_playback` (ce qu'elle vaut).
 pub fn ecrire(
     settings: &crate::db::settings_repo::SettingsRepo,
     liste: &PreReglages,
 ) -> Result<(), String> {
-    liste.verifier().map_err(|e| e.to_string())?;
     let mut liste = liste.clone();
     if liste.apply_mode == ModeApplication::Unknown {
         liste.apply_mode = ModeApplication::AtNextPlayback;
@@ -249,7 +216,7 @@ pub fn caractere_de_format(c: char) -> bool {
     matches!(c,
         '\u{00AD}' | '\u{0600}'..='\u{0605}' | '\u{061C}' | '\u{06DD}' | '\u{070F}'
         | '\u{0890}'..='\u{0891}' | '\u{08E2}' | '\u{180E}'
-        | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}'
+        | '\u{200B}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}'
         | '\u{2060}'..='\u{2064}' | '\u{2066}'..='\u{206F}' | '\u{FEFF}'
         | '\u{FFF9}'..='\u{FFFB}' | '\u{110BD}' | '\u{110CD}'
         | '\u{13430}'..='\u{1343F}' | '\u{1BCA0}'..='\u{1BCA3}'
@@ -461,29 +428,25 @@ mod tests {
     }
 
     #[test]
-    fn une_liste_incoherente_n_est_ni_ecrite_ni_lue_t17() {
+    fn une_liste_incoherente_est_lue_sans_perte_et_refusee_a_l_import_t17() {
         let s = reglages();
         let mut l = PreReglages::default();
         l.presets.push(soiree());
         l.presets.push(soiree());
-        assert!(ecrire(&s, &l).is_err());
-        // Rien n'a été écrit : la liste par défaut reste.
-        assert_eq!(lire(&s).unwrap(), PreReglages::default());
         // Une base (ou un fichier) illisible est une erreur, jamais une
         // liste vide qui écraserait l'ancienne.
         s.set(CLE_PREREGLAGES, "{pas du json").unwrap();
         assert!(lire(&s).is_err());
-        // Lisible mais incohérente (base écrite par une version plus lâche) :
-        // le doublon est écarté, le reste se lit (aucune route ne tombe).
+        // Lisible mais incohérente (écrite par une version plus lâche) : rien
+        // n'est perdu, ni à la lecture ni à la réécriture.
         s.set(CLE_PREREGLAGES, &serde_json::to_string(&l).unwrap())
             .unwrap();
-        l.presets.pop();
+        assert_eq!(lire(&s).unwrap(), l);
+        ecrire(&s, &lire(&s).unwrap()).unwrap();
         assert_eq!(lire(&s).unwrap(), l);
         // Contre-épreuve : l'import (lecture stricte) refuse le doublon.
-        let mut double = l.clone();
-        double.presets.push(soiree());
         assert!(
-            lire_texte(&serde_json::to_string(&double).unwrap())
+            lire_texte(&serde_json::to_string(&l).unwrap())
                 .unwrap_err()
                 .contains("deux fois")
         );
@@ -576,45 +539,44 @@ mod tests {
             let nom = format!("Soi{c}rée");
             assert_eq!(nom_valide(&nom), None, "U+{:04X}", c as u32);
         }
-        // Contre-épreuves : accents, idéogrammes, emoji passent.
-        for nom in ["Café crème", "耳机", "Écoute 🎧"] {
+        // Contre-épreuves : accents, idéogrammes, emoji passent, ainsi que
+        // ZWNJ (U+200C, persan) et ZWJ (U+200D, emoji composés).
+        for nom in [
+            "Café crème",
+            "耳机",
+            "Écoute 🎧",
+            "می\u{200C}خواهم",
+            "👨\u{200D}👩\u{200D}👧",
+        ] {
             assert!(nom_valide(nom).is_some(), "{nom}");
         }
     }
 
     #[test]
-    fn une_entree_stockee_fautive_est_ecartee_sans_faire_tomber_la_liste_suite_t17() {
+    fn une_entree_stockee_invalide_survit_a_la_lecture_et_a_la_reecriture_suite_t17() {
         let s = reglages();
         let mut l = PreReglages::default();
         l.presets.push(soiree());
         let mut long = soiree();
         long.id = "trop-long".into();
         long.name = "x".repeat(NOM_MAX + 1);
-        l.presets.push(long);
+        l.presets.push(long.clone());
         s.set(CLE_PREREGLAGES, &serde_json::to_string(&l).unwrap())
             .unwrap();
-        let lue = lire(&s).unwrap();
-        assert_eq!(
-            lue.presets
-                .iter()
-                .map(|p| p.id.as_str())
-                .collect::<Vec<_>>(),
-            vec![ID_PREREGLAGE_PURE, "evening-listening"]
-        );
-        lue.verifier().unwrap();
-        // L'avertissement nomme l'entrée écartée.
-        let mut l2 = l.clone();
-        assert_eq!(
-            l2.assainir(),
-            vec!["TESS preset \"trop-long\" skipped: invalid name".to_owned()]
-        );
-        // Contre-épreuve : sans l'entrée fautive, rien n'est écarté.
-        l.presets.pop();
-        assert!(l.clone().assainir().is_empty());
+        let mut lue = lire(&s).unwrap();
+        assert_eq!(lue, l);
+        // Une écriture ultérieure (ajout d'un autre préréglage) la garde.
+        let mut autre = soiree();
+        autre.id = "autre".into();
+        lue.presets.push(autre);
+        ecrire(&s, &lue).unwrap();
+        assert!(lire(&s).unwrap().presets.contains(&long));
+        // L'import, lui, refuse la liste (règle d'entrée).
+        assert!(lire_texte(&serde_json::to_string(&l).unwrap()).is_err());
     }
 
     #[test]
-    fn deux_cents_preregages_au_plus_suite_t17() {
+    fn deux_cents_preregages_au_plus_a_l_import_suite_t17() {
         let mut l = PreReglages::default();
         for i in 1..PREREGLAGES_MAX {
             let mut p = soiree();
@@ -630,10 +592,11 @@ mod tests {
             l.verifier(),
             Err(ErreurPreReglage::TropNombreux(PREREGLAGES_MAX + 1))
         );
-        // L'import refuse ; la base, elle, garde les 200 premiers.
+        // L'import refuse ; une base qui en a déjà plus les garde tous.
         assert!(lire_texte(&serde_json::to_string(&l).unwrap()).is_err());
-        let avis = l.assainir();
-        assert_eq!(l.presets.len(), PREREGLAGES_MAX);
-        assert_eq!(avis.len(), 1, "{avis:?}");
+        let s = reglages();
+        s.set(CLE_PREREGLAGES, &serde_json::to_string(&l).unwrap())
+            .unwrap();
+        assert_eq!(lire(&s).unwrap().presets.len(), PREREGLAGES_MAX + 1);
     }
 }

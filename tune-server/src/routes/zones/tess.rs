@@ -659,14 +659,15 @@ pub async fn put_zone_tess(
     };
     // T17 : la chaîne a changé à la main ; le préréglage chargé n'est plus
     // « ACTIVE » s'il ne la décrit plus.
-    if let Err(r) =
-        super::tess_prereglages::oublier_le_prereglage_s_il_differe(&state, id, &lecture.chaine)
-    {
-        return r;
-    }
+    // Un marqueur qui ne s'efface pas n'empêche jamais la chaîne écrite
+    // d'atteindre la sortie : avertissement, pas d'erreur.
+    let avertissement =
+        super::tess_prereglages::oublier_le_prereglage_s_il_differe(&state, id, &lecture.chaine);
     let mode = super::tess_prereglages::appliquer_selon_le_mode(&state, &zone, cles.clone()).await;
     info!(zone_id = id, cles = ?cles, mode = ?mode, "tess_chaine_ecrite");
-    Json(reponse_de_zone(&state, &zone, lecture, premium, catalogue).await).into_response()
+    let mut reponse = reponse_de_zone(&state, &zone, lecture, premium, catalogue).await;
+    reponse.warnings.extend(avertissement);
+    Json(reponse).into_response()
 }
 
 #[cfg(test)]

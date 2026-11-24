@@ -387,9 +387,11 @@ ordre et tous leurs réglages.
   de contrôle ou de format invisible (catégorie Unicode Cf : U+200B,
   U+200E/F, U+202A-202E, U+2066-2069, U+FEFF…), un Pure modifié. Même règle
   que la route, donc aussi à l'import (liste refusée en entier).
-- **Lecture de la base** : une liste lisible mais incohérente (écrite par une
-  version plus lâche) n'est pas refusée en bloc : chaque entrée fautive est
-  écartée avec un avertissement, les routes continuent de servir le reste.
+- **Validation à l'entrée seulement** (enregistrement, renommage, import).
+  La lecture de la base est tolérante et ne perd JAMAIS une entrée : une
+  liste écrite par une version plus lâche (nom trop long, doublon, plus de
+  200…) est rendue telle quelle et réécrite telle quelle par les routes.
+  ZWNJ (U+200C) et ZWJ (U+200D) sont permis (persan, emoji composés).
 - **Droits** : ils sont vérifiés au **chargement**. Un préréglage Premium reste
   enregistré sur un compte redevenu gratuit.
 
@@ -424,24 +426,33 @@ ordre et tous leurs réglages.
   `plugin_unavailable`…). Un refus garde la forme `refusal`.
 - Erreurs propres aux préréglages : `{ "error", "message", "preset_id" }`
   (`preset_not_found` en 404, `invalid_name`, `invalid_body`,
-  `invalid_apply_mode` en 400, `too_many_presets` en 409 au-delà de 200,
-  `storage_error` en 500 si le marqueur « ACTIVE » ne s'écrit pas).
+  `invalid_apply_mode` en 400, `too_many_presets` en 409 au-delà de 200).
 - **Marqueur « ACTIVE »** : posé sous le verrou des `PUT` de la zone ; au
   chargement, le verrou de la liste est tenu jusqu'à sa pose (une suppression
-  concurrente ne laisse jamais de marqueur orphelin). Un échec d'écriture ou
-  d'effacement renvoie une erreur, jamais un succès.
+  concurrente ne laisse jamais de marqueur orphelin). À l'enregistrement, la
+  chaîne de la zone est lue sous ce même verrou. Un échec d'écriture du
+  marqueur n'annule rien : la chaîne écrite atteint la sortie selon le mode,
+  le préréglage enregistré reste créé, l'ancien marqueur est effacé au mieux
+  (aucun marqueur plutôt qu'un faux), et la réponse est un succès avec
+  `warnings: ["active_preset_not_stored"]` (aussi dans `zone_response` d'un
+  `PUT`, champ facultatif).
 - **Préréglage actif et `PUT`** : un `PUT /zones/{id}/tess` dont la chaîne
   ENREGISTRÉE (lue sans les droits, donc jamais la vue convertie P2 d'un
   compte gratuit) ne correspond plus au préréglage actif (comparée sans les
   champs du serveur) efface `active_preset` ; renvoyée telle quelle, il reste.
 - Passer en `immediately` sert aussitôt ce qui attendait la prochaine lecture
-  et vide la file, sur TOUTES les sorties : une zone réseau qui joue voit le
-  changement arriver (relance du flux à la position, comme le `PUT`). Le démarrage de lecture lit la file sous le verrou des
+  et vide la file, sur TOUTES les sorties, par le même rafraîchissement que
+  le `PUT` (voir ci-dessous ce qu'il produit sur une zone réseau). Le
+  démarrage de lecture lit la file sous le verrou des
   `PUT` de la zone ; « locale » se lit dans `output_type` (absent = locale).
 - **Mode d'application**, suivi par le `PUT` comme par le chargement :
-  - `immediately` : la sortie vivante est rafraîchie tout de suite (à chaud en
-    local ; relance du flux réseau à la position, #8422 : anti-rebond,
-    plancher et verrou de relance, donc une seule relance par rafale) ;
+  - `immediately` : la sortie vivante est rafraîchie tout de suite par les
+    chemins des anciennes routes. En local : à chaud. Sur une zone réseau qui
+    joue : SEUL l'égaliseur relance le flux à la position (#8422 :
+    anti-rebond, plancher et verrou de relance, donc une seule relance par
+    rafale) ; le crossfeed réseau prend effet à la piste suivante ; mono,
+    réaffectation, suréchantillonnage et convolution n'agissent qu'en local
+    (le prochain flux réseau les porte) ;
   - `at_next_playback` (ou valeur inconnue) : les anciennes clés sont écrites
     (le prochain flux réseau part avec), la sortie vivante n'est pas touchée ;
     ce qui reste à rafraîchir sur une sortie locale l'est au prochain
