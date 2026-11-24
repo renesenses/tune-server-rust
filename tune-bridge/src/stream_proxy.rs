@@ -18,8 +18,10 @@ pub async fn proxy_stream(
     headers: HeaderMap,
 ) -> Response {
     let debut = Instant::now();
-    let conn = match state.servers.get(&server_id) {
-        Some(c) => c,
+    // Les `Arc` sont clones puis le garde de la DashMap est relache tout de
+    // suite : aucun verrou n'est attendu pendant que l'entree est tenue.
+    let (pending, ws_tx, compteurs) = match state.servers.get(&server_id) {
+        Some(c) => (c.pending.clone(), c.ws_tx.clone(), c.trafic.clone()),
         None => {
             state.trafic.erreur(Erreur::ServeurAbsent);
             return StatusCode::NOT_FOUND.into_response();
@@ -46,16 +48,19 @@ pub async fn proxy_stream(
         state.sessions.audio(s);
     }
 
-    // Memoire du pont bornee (diagnostic CarPlay 5G) : au plus
-    // `max_streams_per_server` flux en vol par serveur.
-    if conn.flux.lock().await.len() >= state.max_streams_per_server {
+    // Memoire du pont bornee (diagnostic CarPlay 5G, relecture du 24/11) :
+    // au plus `max_streams_per_server` flux par serveur, en comptant les
+    // requetes en attente de `stream_start` ET les corps vivants qui tiennent
+    // des octets. Controle et prise d'un coup ; la place est rendue a la fin
+    // du corps (lu, coupe, inactif ou tombe).
+    let Some(place) = state.reserver_place(&server_id) else {
         warn!(server_id = %server_id, "trop de flux en vol pour ce serveur");
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             [(header::RETRY_AFTER, HeaderValue::from_static("2"))],
         )
             .into_response();
-    }
+    };
 
     let request_id = uuid::Uuid::new_v4().to_string();
     let range = headers
@@ -65,15 +70,14 @@ pub async fn proxy_stream(
     let stream_req = message_de_flux(&request_id, &stream_path, &headers);
 
     let (tx, rx) = oneshot::channel::<PendingResponse>();
-    conn.pending
+    pending
         .lock()
         .await
         .insert(request_id.clone(), Attente::nouvelle(tx, Categorie::Audio));
 
     let message = stream_req.to_string();
-    let compteurs = conn.trafic.clone();
-    if conn.ws_tx.send(message.clone()).await.is_err() {
-        conn.pending.lock().await.remove(&request_id);
+    if ws_tx.send(message.clone()).await.is_err() {
+        pending.lock().await.remove(&request_id);
         state.trafic.erreur(Erreur::ServeurAbsent);
         return StatusCode::BAD_GATEWAY.into_response();
     }
@@ -81,33 +85,34 @@ pub async fn proxy_stream(
         .trafic
         .sortie(&compteurs, Categorie::Audio, message.len());
 
-    drop(conn);
-
     // Wait for the relay.stream_start response with headers/status
     match tokio::time::timeout(Duration::from_secs(30), rx).await {
-        Ok(Ok(resp)) => crate::sessions::habiller(
-            reponse_relayee_comptee(
-                resp,
-                Some(Comptage {
-                    trafic: state.trafic.clone(),
-                    serveur: compteurs,
-                    categorie: Categorie::Audio,
-                    cle: stream_path,
-                    range,
-                    debut,
-                }),
-            ),
-            &acces,
-        ),
+        Ok(Ok(resp)) => {
+            if let CorpsRelaye::Morceaux(reception, _) = &resp.body {
+                reception.attacher(place);
+            }
+            crate::sessions::habiller(
+                reponse_relayee_comptee(
+                    resp,
+                    Some(Comptage {
+                        trafic: state.trafic.clone(),
+                        serveur: compteurs,
+                        categorie: Categorie::Audio,
+                        cle: stream_path,
+                        range,
+                        debut,
+                    }),
+                ),
+                &acces,
+            )
+        }
         Ok(Err(_)) => {
             state.trafic.erreur(Erreur::CanalRompu);
             warn!(request_id = %request_id, "stream response channel dropped");
             StatusCode::BAD_GATEWAY.into_response()
         }
         Err(_) => {
-            if let Some(conn) = state.servers.get(&server_id) {
-                conn.pending.lock().await.remove(&request_id);
-            }
+            pending.lock().await.remove(&request_id);
             state.trafic.erreur(Erreur::Delai);
             warn!(request_id = %request_id, "stream request timeout");
             StatusCode::GATEWAY_TIMEOUT.into_response()

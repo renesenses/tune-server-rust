@@ -36,6 +36,25 @@ pub struct RelayState {
     pub plafond_par_flux: usize,
     /// Memoire commune a tous les flux en attente. Voir [`BudgetDesFlux`].
     pub budget_flux: Arc<BudgetDesFlux>,
+    /// Memoire propre a chaque serveur (en plus du budget commun).
+    pub plafond_par_serveur: usize,
+    /// Un corps dont les octets en attente ne sont pas lus depuis ce delai
+    /// est coupe et ses octets rendus (`TUNE_BRIDGE_INACTIVITE_FLUX_S`).
+    pub delai_inactivite: std::time::Duration,
+    /// Places et budget des flux, par serveur. Voir [`QuotaServeur`].
+    pub quotas: DashMap<String, Arc<QuotaServeur>>,
+}
+
+/// Delai d'inactivite par defaut d'un corps de flux non lu.
+pub const DELAI_INACTIVITE_FLUX: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// `TUNE_BRIDGE_INACTIVITE_FLUX_S` (secondes), [`DELAI_INACTIVITE_FLUX`] sinon.
+pub fn delai_inactivite_depuis_environnement() -> std::time::Duration {
+    std::env::var("TUNE_BRIDGE_INACTIVITE_FLUX_S")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .map_or(DELAI_INACTIVITE_FLUX, std::time::Duration::from_secs)
 }
 
 /// Plafond par defaut d'un flux en attente : 32 Mio, l'essentiel d'une piste
@@ -61,6 +80,9 @@ impl RelayState {
             max_streams_per_server: 5,
             plafond_par_flux: PLAFOND_PAR_FLUX,
             budget_flux: BudgetDesFlux::depuis_environnement(),
+            plafond_par_serveur: 5 * PLAFOND_PAR_FLUX,
+            delai_inactivite: delai_inactivite_depuis_environnement(),
+            quotas: DashMap::new(),
         }
     }
 
@@ -297,11 +319,20 @@ pub enum CorpsRelaye {
 /// fin propre qu'un lecteur prendrait pour la fin de la piste. Le protocole
 /// n'a pas (encore) de pause par flux a demander au serveur, qui n'est pas
 /// prevenu de la coupure.
-pub fn file_de_flux(plafond: usize, budget: &Arc<BudgetDesFlux>) -> (EnvoiDeFlux, ReceptionDeFlux) {
+///
+/// Garde-fous (relecture du 24/11) : chaque depot est aussi compte contre le
+/// budget de SON serveur ([`QuotaServeur`]), et une file dont les octets ne
+/// sont pas lus pendant [`RelayState::delai_inactivite`] est coupee et rendue
+/// ([`surveiller_inactivite`]) : quelques lecteurs en pause ne peuvent pas
+/// couper les ecoutes de tous les autres.
+pub fn file_de_flux(
+    plafond: usize,
+    budgets: &[Arc<BudgetDesFlux>],
+) -> (EnvoiDeFlux, ReceptionDeFlux) {
     let partage = Arc::new(FileDeFlux {
         etat: std::sync::Mutex::new(EtatDeFile::default()),
         reveil: tokio::sync::Notify::new(),
-        budget: budget.clone(),
+        budgets: budgets.to_vec(),
         plafond,
     });
     (
@@ -310,6 +341,26 @@ pub fn file_de_flux(plafond: usize, budget: &Arc<BudgetDesFlux>) -> (EnvoiDeFlux
         },
         ReceptionDeFlux { partage },
     )
+}
+
+/// Coupe la file de `reception` si des octets y attendent, non lus, depuis
+/// `delai` : le corps se termine en erreur, les octets et la place du flux
+/// sont rendus — meme si hyper n'interroge plus ce corps (lecteur en pause).
+pub fn surveiller_inactivite(reception: &ReceptionDeFlux, delai: std::time::Duration) {
+    let faible = Arc::downgrade(&reception.partage);
+    let pas = (delai / 4).clamp(
+        std::time::Duration::from_millis(10),
+        std::time::Duration::from_secs(5),
+    );
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(pas).await;
+            let Some(f) = faible.upgrade() else { return };
+            if f.expirer_si_inactive(delai) {
+                return;
+            }
+        }
+    });
 }
 
 /// Le budget memoire commun a tous les flux en attente sur le pont.
@@ -362,21 +413,90 @@ impl BudgetDesFlux {
     }
 }
 
+/// Les flux d'un serveur : places (requetes en attente de `stream_start` ET
+/// corps vivants qui tiennent des octets) et budget memoire propre.
+pub struct QuotaServeur {
+    places: std::sync::atomic::AtomicUsize,
+    pub budget: Arc<BudgetDesFlux>,
+}
+
+impl QuotaServeur {
+    /// Places prises (tests, journal).
+    pub fn places(&self) -> usize {
+        self.places.load(Ordering::Acquire)
+    }
+}
+
+/// Une place de flux d'un serveur, rendue a sa chute.
+pub struct Place {
+    quota: Arc<QuotaServeur>,
+}
+
+impl Drop for Place {
+    fn drop(&mut self) {
+        self.quota.places.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl RelayState {
+    /// Le quota d'un serveur, cree a la premiere demande.
+    pub fn quota(&self, server_id: &str) -> Arc<QuotaServeur> {
+        if let Some(q) = self.quotas.get(server_id) {
+            return q.clone();
+        }
+        self.quotas
+            .entry(server_id.to_string())
+            .or_insert_with(|| {
+                Arc::new(QuotaServeur {
+                    places: std::sync::atomic::AtomicUsize::new(0),
+                    budget: BudgetDesFlux::nouveau(self.plafond_par_serveur),
+                })
+            })
+            .clone()
+    }
+
+    /// Reserve une place de flux, d'un coup (controle et prise atomiques).
+    /// `None` : `max_streams_per_server` deja atteint.
+    pub fn reserver_place(&self, server_id: &str) -> Option<Place> {
+        let quota = self.quota(server_id);
+        let mut prises = quota.places.load(Ordering::Acquire);
+        loop {
+            if prises >= self.max_streams_per_server {
+                return None;
+            }
+            match quota.places.compare_exchange_weak(
+                prises,
+                prises + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return Some(Place { quota }),
+                Err(actuelles) => prises = actuelles,
+            }
+        }
+    }
+}
+
 struct FileDeFlux {
     etat: std::sync::Mutex<EtatDeFile>,
     /// Un seul lecteur attend : `notify_one` garde le reveil s'il arrive
     /// avant l'attente.
     reveil: tokio::sync::Notify,
-    budget: Arc<BudgetDesFlux>,
+    /// Budget commun du pont, puis celui du serveur.
+    budgets: Vec<Arc<BudgetDesFlux>>,
     plafond: usize,
 }
 
 #[derive(Default)]
 struct EtatDeFile {
     morceaux: std::collections::VecDeque<Vec<u8>>,
-    /// Octets de `morceaux`, pris sur le budget.
+    /// Octets de `morceaux`, pris sur les budgets.
     octets: usize,
-    /// Coupe pour depassement : le corps se termine par une erreur.
+    /// Depuis quand le plus ancien octet en attente n'a pas ete lu.
+    attente_depuis: Option<Instant>,
+    /// La place du flux chez son serveur, rendue quand plus rien n'est tenu.
+    place: Option<Place>,
+    /// Coupe (depassement ou inactivite) : le corps se termine en erreur.
     coupe: bool,
     /// Le pont a lache le flux (fin ou retrait du puits).
     envoi_ferme: bool,
@@ -384,16 +504,62 @@ struct EtatDeFile {
     reception_fermee: bool,
 }
 
+impl EtatDeFile {
+    /// Plus rien a rendre au lecteur : la place se libere.
+    fn fini(&self) -> bool {
+        self.coupe || self.reception_fermee || (self.envoi_ferme && self.morceaux.is_empty())
+    }
+}
+
 impl FileDeFlux {
     fn etat(&self) -> std::sync::MutexGuard<'_, EtatDeFile> {
         self.etat.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// Vide la file et rend ses octets au budget.
+    fn prendre(&self, n: usize) -> bool {
+        for (i, b) in self.budgets.iter().enumerate() {
+            if !b.prendre(n) {
+                self.budgets[..i].iter().for_each(|pris| pris.rendre(n));
+                return false;
+            }
+        }
+        true
+    }
+
+    fn rendre(&self, n: usize) {
+        self.budgets.iter().for_each(|b| b.rendre(n));
+    }
+
+    /// Vide la file, rend ses octets et sa place.
     fn vider(&self, etat: &mut EtatDeFile) {
         etat.morceaux.clear();
-        self.budget.rendre(etat.octets);
+        self.rendre(etat.octets);
         etat.octets = 0;
+        etat.attente_depuis = None;
+        etat.place = None;
+    }
+
+    fn couper(&self, etat: &mut EtatDeFile) {
+        etat.coupe = true;
+        self.vider(etat);
+        self.reveil.notify_one();
+    }
+
+    /// `true` : la surveillance peut s'arreter (fini, ou coupe a l'instant).
+    fn expirer_si_inactive(&self, delai: std::time::Duration) -> bool {
+        let mut etat = self.etat();
+        if etat.fini() {
+            etat.place = None;
+            return true;
+        }
+        match etat.attente_depuis {
+            Some(depuis) if depuis.elapsed() >= delai => {
+                tracing::warn!("corps de flux non lu depuis {delai:?} : flux coupe");
+                self.couper(&mut etat);
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -407,12 +573,12 @@ pub struct EnvoiDeFlux {
 pub enum RefusDeFlux {
     /// Le lecteur est parti.
     Ferme,
-    /// Le lecteur ne lit plus (plafond du flux ou budget commun) : le flux
-    /// est coupe.
+    /// Le lecteur ne lit plus (plafond du flux, budget du serveur ou budget
+    /// commun, inactivite) : le flux est coupe.
     Plein,
 }
 
-/// Le corps d'un flux coupe pour depassement.
+/// Le corps d'un flux coupe par le pont.
 #[derive(Debug, PartialEq, Eq)]
 pub struct FluxCoupe;
 
@@ -426,7 +592,7 @@ impl std::error::Error for FluxCoupe {}
 
 impl EnvoiDeFlux {
     /// Depose un morceau sans attendre. Un morceau plus gros que le plafond
-    /// du flux passe encore si la file est vide (jamais au-dela du budget).
+    /// du flux passe encore si la file est vide (jamais au-dela des budgets).
     pub fn deposer(&self, morceau: Vec<u8>) -> Result<(), RefusDeFlux> {
         let f = &self.partage;
         let n = morceau.len();
@@ -438,15 +604,13 @@ impl EnvoiDeFlux {
             return Err(RefusDeFlux::Plein);
         }
         let au_plafond = etat.octets > 0 && etat.octets + n > f.plafond;
-        if au_plafond || !f.budget.prendre(n) {
-            etat.coupe = true;
-            f.vider(&mut etat);
-            drop(etat);
-            f.reveil.notify_one();
+        if au_plafond || !f.prendre(n) {
+            f.couper(&mut etat);
             return Err(RefusDeFlux::Plein);
         }
         etat.octets += n;
         etat.morceaux.push_back(morceau);
+        etat.attente_depuis.get_or_insert_with(Instant::now);
         drop(etat);
         f.reveil.notify_one();
         Ok(())
@@ -460,7 +624,12 @@ impl EnvoiDeFlux {
 
 impl Drop for EnvoiDeFlux {
     fn drop(&mut self) {
-        self.partage.etat().envoi_ferme = true;
+        let mut etat = self.partage.etat();
+        etat.envoi_ferme = true;
+        if etat.fini() {
+            etat.place = None;
+        }
+        drop(etat);
         self.partage.reveil.notify_one();
     }
 }
@@ -471,6 +640,16 @@ pub struct ReceptionDeFlux {
 }
 
 impl ReceptionDeFlux {
+    /// Rattache la place du flux a ce corps : elle reste prise tant qu'il
+    /// tient des octets ou en attend, et se rend a sa fin, sa coupure ou sa
+    /// chute.
+    pub fn attacher(&self, place: Place) {
+        let mut etat = self.partage.etat();
+        if !etat.fini() {
+            etat.place = Some(place);
+        }
+    }
+
     /// Le morceau suivant ; `None` a la fin du flux, `Err` s'il a ete coupe.
     pub async fn recv(&mut self) -> Option<Result<Vec<u8>, FluxCoupe>> {
         let f = &self.partage;
@@ -482,10 +661,19 @@ impl ReceptionDeFlux {
                 }
                 if let Some(m) = etat.morceaux.pop_front() {
                     etat.octets -= m.len();
-                    f.budget.rendre(m.len());
+                    f.rendre(m.len());
+                    etat.attente_depuis = if etat.morceaux.is_empty() {
+                        None
+                    } else {
+                        Some(Instant::now())
+                    };
+                    if etat.fini() {
+                        etat.place = None;
+                    }
                     return Some(Ok(m));
                 }
                 if etat.envoi_ferme {
+                    etat.place = None;
                     return None;
                 }
             }
@@ -535,6 +723,9 @@ mod tests {
             max_streams_per_server: 5,
             plafond_par_flux: PLAFOND_PAR_FLUX,
             budget_flux: BudgetDesFlux::nouveau(BUDGET_DES_FLUX),
+            plafond_par_serveur: 5 * PLAFOND_PAR_FLUX,
+            delai_inactivite: DELAI_INACTIVITE_FLUX,
+            quotas: DashMap::new(),
         }
     }
 

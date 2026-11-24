@@ -34,9 +34,21 @@ async fn pont(plafond: usize) -> (std::net::SocketAddr, Arc<RelayState>) {
 }
 
 async fn pont_regle(plafond: usize, flux_max: usize) -> (std::net::SocketAddr, Arc<RelayState>) {
+    pont_avec(plafond, flux_max, Duration::from_secs(60)).await
+}
+
+async fn pont_avec(
+    plafond: usize,
+    flux_max: usize,
+    inactivite: Duration,
+) -> (std::net::SocketAddr, Arc<RelayState>) {
     let mut state = RelayState::new();
     state.plafond_par_flux = plafond;
     state.max_streams_per_server = flux_max;
+    // vert-seul-debut
+    state.delai_inactivite = inactivite;
+    // vert-seul-fin
+    let _ = inactivite;
     let state = Arc::new(state);
     let app = Router::new()
         .route(
@@ -146,6 +158,8 @@ async fn un_lecteur_qui_ne_lit_plus_ne_bloque_ni_l_api_ni_le_heartbeat() {
 
     // 2. Le serveur pousse la piste, puis son pong, puis la reponse d'API.
     let (api_tx, api_rx) = tokio::sync::oneshot::channel::<String>();
+    // Le lecteur a ses en-tetes avant que la piste deborde, comme AVPlayer.
+    let (lu_tx, lu_rx) = tokio::sync::oneshot::channel::<()>();
     let flux_serveur = flux.clone();
     let _serveur = tokio::spawn(async move {
         let mut sink = sink;
@@ -158,6 +172,9 @@ async fn un_lecteur_qui_ne_lit_plus_ne_bloque_ni_l_api_ni_le_heartbeat() {
         sink.send(Message::Text(debut.to_string().into()))
             .await
             .unwrap();
+        if lu_rx.await.is_err() {
+            return;
+        }
         let octets = vec![0x5Au8; MORCEAU];
         for seq in 0..(POUSSE / MORCEAU) as u64 {
             if sink
@@ -187,6 +204,7 @@ async fn un_lecteur_qui_ne_lit_plus_ne_bloque_ni_l_api_ni_le_heartbeat() {
             .unwrap(),
         200
     );
+    let _ = lu_tx.send(());
 
     // 3. Une requete d'API concurrente, pendant que le flux n'est plus lu.
     let api = tokio::spawn(async move {
@@ -236,48 +254,223 @@ async fn un_lecteur_qui_ne_lit_plus_ne_bloque_ni_l_api_ni_le_heartbeat() {
     lecteur.abort();
 }
 
-/// La memoire du pont est bornee aussi par le nombre de flux en vol :
-/// `max_streams_per_server` s'applique (il etait declare, jamais lu).
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn au_dela_de_max_streams_per_server_le_flux_est_refuse() {
-    let (adresse, _state) = pont_regle(4 * 1024 * 1024, 1).await;
+fn texte(v: serde_json::Value) -> Message {
+    Message::Text(v.to_string().into())
+}
+
+fn debut(id: &str) -> Message {
+    texte(serde_json::json!({
+        "type": "relay.stream_start",
+        "id": id,
+        "status": 200,
+        "headers": {"content-type": "audio/flac"},
+    }))
+}
+
+fn fin(id: &str) -> Message {
+    texte(serde_json::json!({"type": "relay.stream_end", "id": id}))
+}
+
+/// Un lecteur qui ouvre un flux, rend son statut, puis ne lit plus rien.
+fn lecteur_en_pause(
+    adresse: std::net::SocketAddr,
+    chemin: &str,
+) -> (
+    tokio::task::JoinHandle<()>,
+    tokio::sync::oneshot::Receiver<u16>,
+) {
+    let (tx, rx) = tokio::sync::oneshot::channel::<u16>();
+    let url = format!("http://{adresse}/stream/relay/srv/{chemin}?token={JETON}");
+    let tache = tokio::spawn(async move {
+        let r = reqwest::get(url).await.unwrap();
+        let _ = tx.send(r.status().as_u16());
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        drop(r);
+    });
+    (tache, rx)
+}
+
+async fn obtenir(adresse: std::net::SocketAddr, chemin: &str) -> reqwest::Response {
+    tokio::time::timeout(
+        PATIENCE,
+        reqwest::get(format!(
+            "http://{adresse}/stream/relay/srv/{chemin}?token={JETON}"
+        )),
+    )
+    .await
+    .expect("la requete attend le serveur au lieu d'etre refusee")
+    .unwrap()
+}
+
+/// 24 Mio sur le flux `id` : plus que les tampons TCP n'absorbent, moins que
+/// le plafond du flux — la file en garde une part tant que personne ne lit.
+async fn pousser(sink: &mut futures_util::stream::SplitSink<Ws, Message>, id: &str) {
+    let octets = vec![0x5Au8; MORCEAU];
+    for seq in 0..(24 * 1024 * 1024 / MORCEAU) as u64 {
+        sink.send(binaire(id, seq, &octets)).await.unwrap();
+    }
+}
+
+/// Au-dela de `max_streams_per_server`, le flux est refuse par un 503 avec
+/// `Retry-After` — y compris quand la place est prise par une requete qui
+/// attend encore son `stream_start` — puis un nouvel essai passe une fois la
+/// place rendue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn un_flux_refuse_en_503_passe_au_nouvel_essai_une_fois_la_place_rendue() {
+    let (adresse, _state) = pont_regle(32 * 1024 * 1024, 1).await;
     let (mut sink, mut source) = faux_serveur(adresse).await.split();
-    let (en_tete_tx, en_tete_rx) = tokio::sync::oneshot::channel::<u16>();
     let premier = tokio::spawn(async move {
         let r = reqwest::get(format!("http://{adresse}/stream/relay/srv/a?token={JETON}"))
             .await
             .unwrap();
-        let _ = en_tete_tx.send(r.status().as_u16());
-        tokio::time::sleep(Duration::from_secs(30)).await;
-        drop(r);
+        r.bytes().await.unwrap().len()
     });
     let demande = message_du_pont(&mut source, "relay.stream_request").await;
-    let debut = serde_json::json!({
-        "type": "relay.stream_start",
-        "id": demande["id"],
-        "status": 200,
-        "headers": {"content-type": "audio/flac"},
-    });
-    sink.send(Message::Text(debut.to_string().into()))
-        .await
-        .unwrap();
-    // L'en-tete du premier est rendu : son puits existe.
+    let id = demande["id"].as_str().unwrap().to_string();
+
+    // Le premier attend encore son `stream_start` : sa place est prise.
+    let refus = obtenir(adresse, "b").await;
+    assert_eq!(refus.status().as_u16(), 503);
     assert_eq!(
-        tokio::time::timeout(PATIENCE, en_tete_rx)
+        refus
+            .headers()
+            .get("retry-after")
+            .and_then(|v| v.to_str().ok()),
+        Some("2")
+    );
+
+    // Le premier flux se joue jusqu'au bout et son lecteur le lit.
+    sink.send(debut(&id)).await.unwrap();
+    sink.send(binaire(&id, 0, b"fLaC")).await.unwrap();
+    sink.send(fin(&id)).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(PATIENCE, premier)
+            .await
+            .unwrap()
+            .unwrap(),
+        4
+    );
+
+    // La place est rendue : le nouvel essai part au serveur et passe.
+    let second = tokio::spawn(async move { obtenir(adresse, "b").await.status().as_u16() });
+    let demande = message_du_pont(&mut source, "relay.stream_request").await;
+    let id = demande["id"].as_str().unwrap().to_string();
+    sink.send(debut(&id)).await.unwrap();
+    sink.send(fin(&id)).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(PATIENCE, second)
             .await
             .unwrap()
             .unwrap(),
         200
     );
+}
 
-    // Le second est refuse tout de suite, sans rien demander au serveur.
-    let second = tokio::time::timeout(
-        PATIENCE,
-        reqwest::get(format!("http://{adresse}/stream/relay/srv/b?token={JETON}")),
-    )
-    .await
-    .expect("le second flux attend le serveur au lieu d'etre refuse")
-    .unwrap();
-    assert_eq!(second.status().as_u16(), 503);
-    premier.abort();
+/// Un lecteur en pause APRES `relay.stream_end` tient encore des octets du
+/// pont : il compte toujours dans la limite de son serveur.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn un_lecteur_en_pause_apres_la_fin_du_flux_compte_encore() {
+    let (adresse, _state) = pont_regle(32 * 1024 * 1024, 1).await;
+    let (mut sink, mut source) = faux_serveur(adresse).await.split();
+    let (lecteur, en_tete) = lecteur_en_pause(adresse, "a");
+    let demande = message_du_pont(&mut source, "relay.stream_request").await;
+    let id = demande["id"].as_str().unwrap().to_string();
+    sink.send(debut(&id)).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(PATIENCE, en_tete)
+            .await
+            .unwrap()
+            .unwrap(),
+        200
+    );
+    pousser(&mut sink, &id).await;
+    sink.send(fin(&id)).await.unwrap();
+    // Le pont a lu la fin (le puits est retire)…
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // …mais le lecteur n'a pas tout lu : sa place reste prise.
+    assert_eq!(obtenir(adresse, "b").await.status().as_u16(), 503);
+    lecteur.abort();
+}
+
+/// Un corps que personne ne lit est coupe au bout du delai d'inactivite :
+/// ses octets reviennent au budget et sa place a son serveur.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn le_delai_dinactivite_rend_le_budget_et_la_place() {
+    let (adresse, state) = pont_avec(32 * 1024 * 1024, 1, Duration::from_secs(1)).await;
+    let (mut sink, mut source) = faux_serveur(adresse).await.split();
+    let (lecteur, en_tete) = lecteur_en_pause(adresse, "a");
+    let demande = message_du_pont(&mut source, "relay.stream_request").await;
+    let id = demande["id"].as_str().unwrap().to_string();
+    sink.send(debut(&id)).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(PATIENCE, en_tete)
+            .await
+            .unwrap()
+            .unwrap(),
+        200
+    );
+    pousser(&mut sink, &id).await;
+    sink.send(fin(&id)).await.unwrap();
+
+    let echeance = tokio::time::Instant::now() + PATIENCE;
+    while state.budget_flux.pris() > 0 {
+        assert!(
+            tokio::time::Instant::now() < echeance,
+            "le corps non lu garde ses octets : le delai d'inactivite ne les rend pas"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // vert-seul-debut
+    assert_eq!(state.quota("srv").places(), 0, "la place est rendue");
+    // vert-seul-fin
+    lecteur.abort();
+}
+
+/// Des requetes simultanees ne depassent pas la limite : controle et prise
+/// de place sont atomiques, et une requete qui attend son `stream_start`
+/// compte deja.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn des_requetes_simultanees_ne_depassent_pas_la_limite() {
+    let (adresse, _state) = pont_regle(32 * 1024 * 1024, 2).await;
+    let (_sink, mut source) = faux_serveur(adresse).await.split();
+    let (statuts_tx, mut statuts) = tokio::sync::mpsc::unbounded_channel::<u16>();
+    let mut taches = Vec::new();
+    for i in 0..6 {
+        let tx = statuts_tx.clone();
+        taches.push(tokio::spawn(async move {
+            let r = reqwest::get(format!(
+                "http://{adresse}/stream/relay/srv/p{i}?token={JETON}"
+            ))
+            .await
+            .unwrap();
+            let _ = tx.send(r.status().as_u16());
+        }));
+    }
+
+    // Ce que le serveur recoit pendant une seconde : deux demandes au plus.
+    let mut demandes = 0;
+    let fenetre = tokio::time::Instant::now() + Duration::from_secs(1);
+    while let Ok(Some(Ok(m))) = tokio::time::timeout_at(fenetre, source.next()).await {
+        if let Message::Text(t) = m
+            && serde_json::from_str::<serde_json::Value>(&t).unwrap()["type"]
+                == "relay.stream_request"
+        {
+            demandes += 1;
+        }
+    }
+    assert!(
+        demandes <= 2,
+        "{demandes} flux demandes au serveur pour une limite de 2"
+    );
+
+    // Les quatre autres sont refusees tout de suite.
+    for _ in 0..4 {
+        let statut = tokio::time::timeout(PATIENCE, statuts.recv())
+            .await
+            .expect("une requete au-dela de la limite attend au lieu d'etre refusee")
+            .unwrap();
+        assert_eq!(statut, 503);
+    }
+    taches.iter().for_each(|t| t.abort());
 }

@@ -470,7 +470,16 @@ async fn ouvrir_flux(
         return;
     }
 
-    let (envoi, reception) = crate::state::file_de_flux(state.plafond_par_flux, &state.budget_flux);
+    let (envoi, reception) = crate::state::file_de_flux(
+        state.plafond_par_flux,
+        &[
+            state.budget_flux.clone(),
+            state.quota(server_id).budget.clone(),
+        ],
+    );
+    // Un corps dont les octets ne sont pas lus est coupe et rendu au bout
+    // de `delai_inactivite`, meme si hyper ne l'interroge plus.
+    crate::state::surveiller_inactivite(&reception, state.delai_inactivite);
     let fin_propre = Arc::new(std::sync::atomic::AtomicBool::new(false));
     flux.lock().await.insert(
         debut.id.clone(),
@@ -871,7 +880,7 @@ mod relais_de_flux_tests {
     #[test]
     fn la_file_dun_flux_compte_ses_octets() {
         let commun = budget(1024);
-        let (envoi, reception) = crate::state::file_de_flux(8, &commun);
+        let (envoi, reception) = crate::state::file_de_flux(8, std::slice::from_ref(&commun));
         assert_eq!(
             envoi.deposer(vec![0; 20]),
             Ok(()),
@@ -887,7 +896,7 @@ mod relais_de_flux_tests {
         assert_eq!(commun.pris(), 0, "coupe : octets rendus au budget");
         drop(reception);
 
-        let (envoi, reception) = crate::state::file_de_flux(8, &commun);
+        let (envoi, reception) = crate::state::file_de_flux(8, std::slice::from_ref(&commun));
         envoi.deposer(vec![0; 4]).unwrap();
         drop(reception);
         assert_eq!(commun.pris(), 0, "lecteur parti : octets rendus");
@@ -898,13 +907,38 @@ mod relais_de_flux_tests {
         assert_eq!(commun.pris(), 0);
     }
 
+    /// Le budget d'un serveur borne ses flux, en plus du budget commun.
+    #[tokio::test]
+    async fn le_budget_du_serveur_borne_ses_flux() {
+        let mut state = relais();
+        state.plafond_par_serveur = 10;
+        let _serveur = serveur_enregistre(&state).await;
+        let attente_a = attente_deposee(&state, "req-a").await;
+        let attente_b = attente_deposee(&state, "req-b").await;
+        handle_server_message(&state, "srv", &debut("req-a", 200, None)).await;
+        handle_server_message(&state, "srv", &debut("req-b", 200, None)).await;
+        let _a = reponse_attendue(attente_a).await;
+        let _b = reponse_attendue(attente_b).await;
+        handle_server_message(&state, "srv", "BINARY:req-a:ZkxhQw==").await;
+        handle_server_message(&state, "srv", "BINARY:req-a:ZkxhQw==").await;
+        handle_server_message(&state, "srv", "BINARY:req-b:ZkxhQw==").await;
+        let puits = state.servers.get("srv").unwrap().flux.clone();
+        assert!(puits.lock().await.contains_key("req-a"));
+        assert!(
+            !puits.lock().await.contains_key("req-b"),
+            "8 + 4 > 10 : le flux qui depasse le budget du serveur est coupe"
+        );
+        assert_eq!(state.quota("srv").budget.pris(), 8);
+        assert_eq!(state.budget_flux.pris(), 8);
+    }
+
     /// Le budget commun borne la memoire de TOUS les flux : celui qui le
     /// depasserait est coupe, les autres gardent leur file.
     #[test]
     fn le_budget_commun_borne_tous_les_flux() {
         let commun = budget(10);
-        let (a, _ra) = crate::state::file_de_flux(8, &commun);
-        let (b, mut rb) = crate::state::file_de_flux(8, &commun);
+        let (a, _ra) = crate::state::file_de_flux(8, std::slice::from_ref(&commun));
+        let (b, mut rb) = crate::state::file_de_flux(8, std::slice::from_ref(&commun));
         assert_eq!(a.deposer(vec![1; 6]), Ok(()));
         assert_eq!(
             b.deposer(vec![2; 6]),
@@ -924,7 +958,7 @@ mod relais_de_flux_tests {
     /// une fin naturelle.
     #[tokio::test]
     async fn le_corps_http_dun_flux_coupe_finit_en_erreur() {
-        let (envoi, reception) = crate::state::file_de_flux(4, &budget(1024));
+        let (envoi, reception) = crate::state::file_de_flux(4, &[budget(1024)]);
         envoi.deposer(b"fLaC".to_vec()).unwrap();
         assert_eq!(
             envoi.deposer(b"fLaC".to_vec()),
@@ -977,7 +1011,7 @@ mod relais_de_flux_tests {
     /// Le corps HTTP rend les morceaux dans l'ordre, et se termine avec eux.
     #[tokio::test]
     async fn le_corps_http_rend_les_morceaux_dans_lordre() {
-        let (envoi, reception) = crate::state::file_de_flux(1024, &budget(1024));
+        let (envoi, reception) = crate::state::file_de_flux(1024, &[budget(1024)]);
         envoi.deposer(b"fLaC".to_vec()).unwrap();
         envoi.deposer(vec![0, 0, 0, 0x22]).unwrap();
         drop(envoi);
