@@ -5267,6 +5267,18 @@ async fn previous(
             .lock()
             .unwrap()
             .insert(zone_id, std::time::Instant::now());
+        // Fil 2757 — « revenir au début » donné sur la meneuse vaut pour ses
+        // suiveuses, comme un `seek` (#7759) : c'en est un, à 0. Le relais
+        // n'écoute pas l'événement `seek`, et la suiveuse, déjà sur la même
+        // piste, n'a aucune raison de bouger seule.
+        let demande = state.deplacements_de_groupe.nouvelle_demande(zone_id);
+        let s = state.clone();
+        tokio::spawn(async move {
+            crate::routes::zones::relais_de_groupe_6155::deplacer_les_suiveuses(
+                &s, zone_id, 0, demande,
+            )
+            .await;
+        });
         return Json(json!({ "status": "restarted" })).into_response();
     }
 
