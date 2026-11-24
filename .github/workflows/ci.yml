@@ -50,7 +50,7 @@ jobs:
           90f924445eccaf638af56c2d37cf7006e1d8650abdc82cae1e7f41bf0781579d  verifier-catalogue.py
           75c83cc88101b4b96c482459b6373ddcfad1d2f743e082ce95100e25faf210fc  catalogue/confusables.json
           cdb4e32ce2ef86d3da1c1a66c47f8f5dd5a4934df07b4f734e716ec81b19355c  catalogue/occurrences-relues.json
-          e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  catalogue/canari.sha256
+          c1e6cdf487b07aee99ecc3afa7296c2fb9eeee6eede512b8fe41987e85fe0197  catalogue/canari.sha256
           EMPREINTES
           )
           python3 -I "$dossier/verifier-catalogue.py"
