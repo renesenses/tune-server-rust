@@ -1834,6 +1834,10 @@ pub use signal_path::*;
 // TESS T16 — le bloc `tess` du chemin du signal (maquette A4).
 mod chemin_tess_t16;
 pub use chemin_tess_t16::avec_le_chemin_tess;
+// rc14 (rc13.91) — la raison d'un suréchantillonnage refusé, dans TESS.
+pub(crate) mod refus_surechantillonnage_tess;
+#[cfg(test)]
+mod refus_surechantillonnage_tess_tests;
 
 mod ecriture;
 pub use ecriture::*;

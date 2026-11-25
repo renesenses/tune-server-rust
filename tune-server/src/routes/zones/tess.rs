@@ -426,6 +426,16 @@ pub(super) async fn reponse_de_zone(
         lecteur.as_ref(),
     );
     preciser_les_paquets_a_installer(&mut reponse, &settings);
+
+    // rc14 (rc13.91) — la sortie locale a refusé de suréchantillonner la
+    // piste en cours : l'étape ne se dit plus active, et dit pourquoi.
+    super::refus_surechantillonnage_tess::avec_le_refus_du_surechantillonneur(
+        reponse.signal_path.iter_mut(),
+        super::refus_surechantillonnage_tess::refus_de_la_sortie_locale(
+            zone.output_type.as_deref(),
+            &etat,
+        ),
+    );
     reponse
 }
 

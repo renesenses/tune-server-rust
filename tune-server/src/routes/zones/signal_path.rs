@@ -1914,6 +1914,8 @@ fn texte_du_refus_surechantillonnage(raison: &str) -> &'static str {
         "premium_required" => "upsampling_premium_required",
         "machine_test_missing" => "upsampling_machine_test_missing",
         "rates_not_measured" => "upsampling_rates_not_measured",
+        // rc14 — WASAPI partagé : le mélangeur n'est pas un multiple de la source.
+        "shared_mixer_rate_not_a_multiple" => "upsampling_shared_mixer_rate",
         "no_candidate_rate_accepted_by_device" => "upsampling_device_rates",
         "machine_test_rejects_accepted_rates" => "upsampling_machine_rates",
         "settings_caps_exclude_admitted_rates" => "upsampling_settings_caps",
@@ -1928,6 +1930,17 @@ fn texte_du_refus_surechantillonnage(raison: &str) -> &'static str {
         "output_rate_open_failed" | "filter_initialization_failed" => "upsampling_opening_failed",
         _ => "upsampling_not_applied",
     }
+}
+
+/// rc14 (rc13.91) — la raison, en clair et dans la langue de la requête,
+/// pour laquelle la sortie locale n'a pas suréchantillonné la piste. Sert à
+/// la page du greffon (`GET /upsampler/zones/{id}`), qui ne voyait que les
+/// refus de réglage (licence, PURE…) et jamais ceux du périphérique.
+pub(crate) fn description_du_refus_surechantillonnage(raison: &str) -> &'static str {
+    ts(
+        super::textes_signal::langue_courante(),
+        texte_du_refus_surechantillonnage(raison),
+    )
 }
 
 /// #6946 — pose la raison du plafond de librespot sur l'étape Source et la

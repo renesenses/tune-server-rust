@@ -577,6 +577,60 @@ pub(super) fn cadence_pour_le_surechantillonneur(
     }
 }
 
+/// rc14 (rc13.91, Windows) — [`cadence_pour_le_surechantillonneur`] quand
+/// l'hôte connaît la cadence de son MÉLANGEUR partagé.
+///
+/// Sur WASAPI partagé, la liste de cadences n'est jamais une mesure (cpal ne
+/// teste rien, [`super::resolution::sample_rate_evidence`]) : le greffon y
+/// était refusé à CHAQUE ouverture (`rates_not_measured`), quel que soit le
+/// DAC — aucun geste ne pouvait le débloquer. Or un fait, lui, est mesuré :
+/// la cadence par défaut du périphérique (`GetMixFormat`), celle du mélangeur
+/// de Windows, à laquelle le DAC tourne réellement en mode partagé. Ouvrir à
+/// une autre cadence ne recadence pas le DAC : Windows reconvertit
+/// (`AUTOCONVERTPCM`). La seule cible honnête est donc la cadence du
+/// mélangeur, quand elle est un multiple entier de la source et que la
+/// machine et les réglages l'admettent.
+///
+/// `cadence_du_melangeur` : `Some` seulement pour un hôte dont la cadence par
+/// défaut EST celle du mélangeur (WASAPI). Liste mesurée, ou aucune cadence
+/// de mélangeur : la règle d'avant, inchangée.
+pub(super) fn cadence_pour_le_surechantillonneur_selon_l_hote(
+    choix: &crate::audio::surechantillonnage::ChoixSurechantillonnage,
+    evidence: super::resolution::SampleRateEvidence,
+    cadence_du_melangeur: Option<u32>,
+    strict_bitperfect: bool,
+    source_sr: u32,
+    accepte: impl Fn(u32) -> bool,
+) -> Result<u32, RefusDeCadenceDuGreffon> {
+    let melangeur = cadence_du_melangeur
+        .filter(|&m| m != 0)
+        .filter(|_| !evidence.is_measured());
+    let Some(melangeur) = melangeur else {
+        return cadence_pour_le_surechantillonneur(
+            choix,
+            evidence,
+            strict_bitperfect,
+            source_sr,
+            accepte,
+        );
+    };
+    cadence_pour_le_surechantillonneur(
+        choix,
+        super::resolution::SampleRateEvidence::Measured,
+        strict_bitperfect,
+        source_sr,
+        |r| r == melangeur,
+    )
+    .map_err(|refus| match refus {
+        RefusDeCadenceDuGreffon::AucuneCandidateAcceptee { .. } => {
+            RefusDeCadenceDuGreffon::CadenceDuMelangeurInadaptee {
+                cadence_du_melangeur: melangeur,
+            }
+        }
+        autre => autre,
+    })
+}
+
 /// #9165 — la part de [`cadence_pour_le_surechantillonneur`] qui se juge
 /// SANS périphérique, par la même fonction : bit-perfect strict, source déjà
 /// au plus haut des cadences candidates, verdict de la machine, plafonds des
@@ -608,6 +662,10 @@ pub(super) enum RefusDeCadenceDuGreffon {
     BitPerfectStrict,
     /// La liste de cadences du périphérique est supposée, pas mesurée.
     CadencesNonMesurees,
+    /// rc14 — mode partagé (WASAPI) : le DAC tourne à la cadence du
+    /// mélangeur du système, qui n'est pas un multiple entier (supérieur) de
+    /// la source. Le geste : régler le format par défaut du périphérique.
+    CadenceDuMelangeurInadaptee { cadence_du_melangeur: u32 },
     /// Cadence source inconnue (0).
     SourceInconnue,
     /// Aucun multiple entier de la source n'est accepté par l'énumération
@@ -627,6 +685,7 @@ impl RefusDeCadenceDuGreffon {
         match self {
             Self::BitPerfectStrict => "strict_bitperfect",
             Self::CadencesNonMesurees => "rates_not_measured",
+            Self::CadenceDuMelangeurInadaptee { .. } => "shared_mixer_rate_not_a_multiple",
             Self::SourceInconnue => "source_rate_unknown",
             Self::AucuneCandidateAcceptee { .. } => "no_candidate_rate_accepted_by_device",
             Self::RefuseesParLaMachine { .. } => "machine_test_rejects_accepted_rates",
@@ -797,9 +856,12 @@ impl<'a> BackendCpal<'a> {
             // à cette cadence, c'est lui qui la porte (rubato ne tourne pas).
             let pour_le_greffon = surechantillonnage
                 .and_then(|choix| {
-                    cadence_pour_le_surechantillonneur(
+                    cadence_pour_le_surechantillonneur_selon_l_hote(
                         choix,
                         rate_evidence,
+                        // rc14 — WASAPI partagé : la cadence par défaut est
+                        // celle du mélangeur, le seul fait mesuré.
+                        default_sr.filter(|_| host_id_name.eq_ignore_ascii_case("wasapi")),
                         demande.strict_bitperfect,
                         sample_rate,
                         |r| {
@@ -1521,10 +1583,62 @@ mod refus_de_cadence_du_greffon_8149_tests {
         );
     }
 
+    /// rc14 (rc13.91) — Xavier, Windows, WASAPI partagé : le greffon était
+    /// refusé à chaque ouverture (`rates_not_measured`), quel que soit le
+    /// DAC. La cadence du mélangeur (`GetMixFormat`) est un fait mesuré : un
+    /// mélangeur réglé à 176,4 kHz porte une source à 44,1 kHz.
+    #[test]
+    fn wasapi_partage_suit_la_cadence_du_melangeur_rc14() {
+        use super::cadence_pour_le_surechantillonneur_selon_l_hote as selon_l_hote;
+        let non_mesuree = SampleRateEvidence::Unverified;
+        // 176,4 kHz se juge sur le couple de référence 44,1 → 352,8 kHz.
+        let c = choix(true, None);
+        // L'énumération WASAPI dit « oui » à tout : seule la cadence du
+        // mélangeur compte, jamais 352,8 kHz que Windows reconvertirait.
+        assert_eq!(
+            selon_l_hote(&c, non_mesuree, Some(176_400), false, 44_100, |_| true),
+            Ok(176_400)
+        );
+        // Mélangeur à la cadence de la source (cas de Xavier) : refus qui
+        // nomme le geste, plus « cadences non mesurées ».
+        assert_eq!(
+            selon_l_hote(&c, non_mesuree, Some(44_100), false, 44_100, |_| true),
+            Err(RefusDeCadenceDuGreffon::CadenceDuMelangeurInadaptee {
+                cadence_du_melangeur: 44_100
+            })
+        );
+        // 48 kHz n'est pas un multiple de 44,1 kHz.
+        assert_eq!(
+            selon_l_hote(&c, non_mesuree, Some(48_000), false, 44_100, |_| true),
+            Err(RefusDeCadenceDuGreffon::CadenceDuMelangeurInadaptee {
+                cadence_du_melangeur: 48_000
+            })
+        );
+        // Le bit-perfect strict garde la priorité.
+        assert_eq!(
+            selon_l_hote(&c, non_mesuree, Some(176_400), true, 44_100, |_| true),
+            Err(RefusDeCadenceDuGreffon::BitPerfectStrict)
+        );
+        // Témoins : sans cadence de mélangeur, la règle d'avant ; liste
+        // mesurée, le mélangeur est ignoré (352,8 kHz reste possible).
+        assert_eq!(
+            selon_l_hote(&c, non_mesuree, None, false, 44_100, |_| true),
+            Err(RefusDeCadenceDuGreffon::CadencesNonMesurees)
+        );
+        assert_eq!(
+            selon_l_hote(&c, MESUREE, Some(176_400), false, 44_100, |_| true),
+            Ok(352_800)
+        );
+    }
+
     #[test]
     fn les_codes_sont_distincts_8149() {
         let codes = [
             RefusDeCadenceDuGreffon::BitPerfectStrict.code(),
+            RefusDeCadenceDuGreffon::CadenceDuMelangeurInadaptee {
+                cadence_du_melangeur: 0,
+            }
+            .code(),
             RefusDeCadenceDuGreffon::CadencesNonMesurees.code(),
             RefusDeCadenceDuGreffon::SourceInconnue.code(),
             RefusDeCadenceDuGreffon::AucuneCandidateAcceptee { candidates: vec![] }.code(),
