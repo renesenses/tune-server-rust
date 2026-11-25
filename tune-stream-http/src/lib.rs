@@ -3350,6 +3350,8 @@ fn resumable_proxy_body(
         let mut a_sauter = sauter;
         let mut reprises = ReprisesRapprochees::default();
         let mut resumes: u32 = 0;
+        // Reprises de toute la connexion, progression ou non (journaux).
+        let mut reprises_totales: u32 = 0;
         // Début de la connexion amont courante : de quoi mesurer sa progression.
         let mut pos_connexion = pos;
         let mut debut_connexion = std::time::Instant::now();
@@ -3384,7 +3386,7 @@ fn resumable_proxy_body(
                         yield Ok::<_, std::io::Error>(chunk);
                     }
                     Some(Err(e)) => {
-                        warn!(error = %e, pos, resumes, "proxy_chunk_error");
+                        warn!(error = %e, pos, resumes, reprises_totales, "proxy_chunk_error");
                         clean_eof = false;
                         break;
                     }
@@ -3397,11 +3399,12 @@ fn resumable_proxy_body(
             }
             let Some(n) = reprises.incident(pos - pos_connexion, debut_connexion.elapsed())
             else {
-                warn!(pos, "proxy_resume_giveup");
+                warn!(pos, resumes, reprises_totales, "proxy_resume_giveup");
                 bilan.fin = "amont_abandonne";
                 break;
             };
             resumes = n;
+            reprises_totales += 1;
             // Backoff before reconnecting: the CDN just dropped us.
             tokio::time::sleep(std::time::Duration::from_millis(
                 200u64 * u64::from(resumes),
@@ -3413,10 +3416,32 @@ fn resumable_proxy_body(
             // byte-exact — so a mid-track URL expiry no longer stops playback.
             match send_with_reresolve(client, url.clone(), Some(pos), &reresolve).await {
                 Ok((r, fresh_url)) if r.status() == reqwest::StatusCode::PARTIAL_CONTENT => {
+                    // Le 206 doit reprendre EXACTEMENT à `pos`. Un amont qui
+                    // rend toujours la même tranche ferait passer ces octets
+                    // rejoués pour une progression : la reprise bouclerait.
+                    // `Content-Range` absent ou illisible : même arrêt, comme
+                    // `proxy_206_tranche_exacte` qui n'accepte pas non plus
+                    // un 206 sans début.
+                    let debut_amont = r
+                        .headers()
+                        .get(reqwest::header::CONTENT_RANGE)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(debut_de_tranche_amont);
+                    if debut_amont != Some(pos) {
+                        warn!(
+                            pos,
+                            debut_amont = ?debut_amont,
+                            resumes,
+                            reprises_totales,
+                            "proxy_resume_mauvais_debut — le 206 ne reprend pas à l'octet attendu"
+                        );
+                        bilan.fin = "amont_mauvais_statut";
+                        break;
+                    }
                     if fresh_url != url {
                         url = fresh_url;
                     }
-                    info!(pos, resumes, "proxy_resume_reconnect_206");
+                    info!(pos, resumes, reprises_totales, "proxy_resume_reconnect_206");
                     resp = r;
                     pos_connexion = pos;
                     debut_connexion = std::time::Instant::now();
@@ -7812,6 +7837,7 @@ mod lecture_disque_lente_6478 {
         segment: usize,
         coupures: usize,
         ignore_range: bool,
+        meme_debut: bool,
     ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -7839,8 +7865,14 @@ mod lecture_disque_lente_6478 {
                             .and_then(|d| d.trim().parse::<usize>().ok())
                             .unwrap_or(0)
                     };
+                    // Amont bogué : répond 206 « depuis 0 » quoi qu'on demande.
+                    let (debut, a_range) = if meme_debut && debut > 0 {
+                        (0, true)
+                    } else {
+                        (debut, debut > 0)
+                    };
                     let reste = total - debut;
-                    let entete = if debut > 0 {
+                    let entete = if a_range {
                         format!(
                             "HTTP/1.1 206 Partial Content\r\nContent-Type: audio/mpeg\r\n\
                              Content-Range: bytes {debut}-{}/{total}\r\nContent-Length: {reste}\r\n\r\n",
@@ -7910,7 +7942,7 @@ mod lecture_disque_lente_6478 {
     async fn huit_coupures_avec_progression_le_flux_va_jusqu_au_bout() {
         let segment = 1_500_000;
         let total = 9 * segment;
-        let (url, connexions) = amont_qui_coupe(total, segment, 8, false).await;
+        let (url, connexions) = amont_qui_coupe(total, segment, 8, false, false).await;
         let recu = lire_le_mandataire(&url).await;
         assert_eq!(recu.len(), total);
         assert!(recu.iter().enumerate().all(|(i, &o)| o == (i % 251) as u8));
@@ -7921,10 +7953,22 @@ mod lecture_disque_lente_6478 {
     /// connexion + cinq reprises), flux tronqué.
     #[tokio::test]
     async fn six_coupures_sans_progression_abandonnent_comme_avant() {
-        let (url, connexions) = amont_qui_coupe(1_000_000, 100, 100, false).await;
+        let (url, connexions) = amont_qui_coupe(1_000_000, 100, 100, false, false).await;
         let recu = lire_le_mandataire(&url).await;
         assert_eq!(recu.len(), 6 * 100);
         assert_eq!(connexions.load(std::sync::atomic::Ordering::SeqCst), 6);
+    }
+
+    /// Amont bogué : chaque reprise rend un 206 qui recommence à 0. Les octets
+    /// rejoués ne sont pas une progression : arrêt immédiat, sans rejeu.
+    #[tokio::test]
+    async fn un_206_qui_ne_reprend_pas_a_pos_arrete_le_flux_sans_rejeu() {
+        let segment = 1_500_000;
+        let (url, connexions) = amont_qui_coupe(10 * segment, segment, 100, false, true).await;
+        let recu = lire_le_mandataire(&url).await;
+        assert_eq!(recu.len(), segment);
+        assert!(recu.iter().enumerate().all(|(i, &o)| o == (i % 251) as u8));
+        assert_eq!(connexions.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     /// Direct : l'amont ignore le `Range` et rend un 200. La reprise est
@@ -7933,7 +7977,7 @@ mod lecture_disque_lente_6478 {
     #[tokio::test]
     async fn un_direct_qui_ignore_le_range_n_est_pas_rejoue() {
         let segment = 1_500_000;
-        let (url, connexions) = amont_qui_coupe(10 * segment, segment, 100, true).await;
+        let (url, connexions) = amont_qui_coupe(10 * segment, segment, 100, true, false).await;
         let recu = lire_le_mandataire(&url).await;
         assert_eq!(recu.len(), segment);
         assert_eq!(connexions.load(std::sync::atomic::Ordering::SeqCst), 2);
