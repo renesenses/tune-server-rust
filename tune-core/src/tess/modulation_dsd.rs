@@ -60,7 +60,8 @@
 //! [`annoncer_la_suivante`]), de même famille et de même cadence, l'état du
 //! modulateur et du suréchantillonneur passe d'une piste à l'autre au moment
 //! où la suivante commence vraiment à moduler ([`attendre_le_relais`]) : ni
-//! silence de clôture, ni marche. Chaque piste émet un nombre PAIR de trames DoP (la
+//! silence de clôture, ni marche. Sans clic en DoP seulement : en natif, la
+//! sortie rouvre son bras à chaque piste. Chaque piste émet un nombre PAIR de trames DoP (la
 //! trame impaire attend la piste suivante) : toute piste commence par 0x05.
 //! Une piste sans suite perd ce qui restait dans le filtre (≈ 1 ms) et au plus
 //! une trame DoP (≈ 6 µs).
@@ -587,6 +588,8 @@ struct Relais {
     plan: PlanModulation,
     etat: EtatDuRelais,
     ouvert: Instant,
+    /// Dernier bloc envoyé par le producteur de cette session.
+    avance: Instant,
 }
 
 #[derive(Default)]
@@ -610,24 +613,87 @@ fn relais() -> &'static (Mutex<TableDesRelais>, std::sync::Condvar) {
 /// les 30 dernières secondes de la piste).
 const ANNONCE_VALABLE: Duration = Duration::from_secs(90);
 
-/// Relais gardés au plus (les plus anciens terminés sont retirés).
-const RELAIS_MAX: usize = 8;
+/// Relais gardés au plus PAR ZONE, quel que soit leur état (la piste en
+/// cours, la suivante, et de quoi absorber une re-préparation) : au-delà, le
+/// plus ancien de la zone est retiré — terminés d'abord. Un producteur
+/// bloqué ne fait plus croître la table ; s'il dépose un jour, son état est
+/// perdu, et sa suivante éventuelle part neuve.
+pub const RELAIS_PAR_ZONE: usize = 4;
+
+/// Relais gardés au plus, toutes zones.
+pub const RELAIS_MAX: usize = 64;
+
+/// Un relais plus vieux que ceci est orphelin (piste de 30 min au plus
+/// entre son ouverture et la reprise de son état) : retiré.
+const RELAIS_PERIME: Duration = Duration::from_secs(1_800);
+
+/// Plafond absolu d'une attente (une piste en pause très longue).
+const ATTENTE_MAX: Duration = Duration::from_secs(1_800);
+
+fn plus_ancien(r: &TableDesRelais, zone: Option<i64>) -> Option<String> {
+    r.par_session
+        .iter()
+        .filter(|(_, x)| zone.is_none_or(|z| x.zone_id == z))
+        .min_by_key(|(_, x)| (matches!(x.etat, EtatDuRelais::EnCours), x.ouvert))
+        .map(|(k, _)| k.clone())
+}
+
+fn purger(r: &mut TableDesRelais, zone_id: i64) {
+    r.par_session
+        .retain(|_, x| x.ouvert.elapsed() < RELAIS_PERIME);
+    r.annonces
+        .retain(|_, (_, _, t)| t.elapsed() < ANNONCE_VALABLE);
+    while r
+        .par_session
+        .values()
+        .filter(|x| x.zone_id == zone_id)
+        .count()
+        > RELAIS_PAR_ZONE
+    {
+        match plus_ancien(r, Some(zone_id)) {
+            Some(k) => {
+                r.par_session.remove(&k);
+            }
+            None => break,
+        }
+    }
+    while r.par_session.len() > RELAIS_MAX {
+        match plus_ancien(r, None) {
+            Some(k) => {
+                r.par_session.remove(&k);
+            }
+            None => break,
+        }
+    }
+}
+
+/// Relais tenus pour une zone (témoins).
+pub fn relais_de_la_zone(zone_id: i64) -> usize {
+    relais()
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .par_session
+        .values()
+        .filter(|x| x.zone_id == zone_id)
+        .count()
+}
+
+/// Nombre de relais tenus (témoins).
+pub fn relais_tenus() -> usize {
+    relais()
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .par_session
+        .len()
+}
 
 /// Le producteur de `session` (zone, plan) démarre : son état pourra passer
 /// à la piste qui lui sera EXPLICITEMENT liée.
 pub fn ouvrir_le_relais(zone_id: i64, session: &str, plan: PlanModulation) {
-    let (m, _) = relais();
+    let (m, c) = relais();
     let mut r = m.lock().unwrap_or_else(|e| e.into_inner());
-    if r.par_session.len() >= RELAIS_MAX
-        && let Some(vieux) = r
-            .par_session
-            .iter()
-            .filter(|(_, x)| !matches!(x.etat, EtatDuRelais::EnCours))
-            .min_by_key(|(_, x)| x.ouvert)
-            .map(|(k, _)| k.clone())
-    {
-        r.par_session.remove(&vieux);
-    }
     r.par_session.insert(
         session.to_owned(),
         Relais {
@@ -635,8 +701,21 @@ pub fn ouvrir_le_relais(zone_id: i64, session: &str, plan: PlanModulation) {
             plan,
             etat: EtatDuRelais::EnCours,
             ouvert: Instant::now(),
+            avance: Instant::now(),
         },
     );
+    purger(&mut r, zone_id);
+    // Un relais évincé libère qui l'attendait.
+    c.notify_all();
+}
+
+/// Le producteur de `session` vient d'envoyer un bloc : il avance.
+pub fn signaler_l_avance(session: &str) {
+    let (m, _) = relais();
+    let mut r = m.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(x) = r.par_session.get_mut(session) {
+        x.avance = Instant::now();
+    }
 }
 
 /// Fin NORMALE de la piste de `session` : son état attend la suivante liée.
@@ -649,7 +728,8 @@ pub fn deposer_au_relais(session: &str, producteur: ProducteurDsd) {
     c.notify_all();
 }
 
-/// Piste interrompue (session fermée, erreur) : rien ne continue.
+/// Piste interrompue (session fermée, erreur, borne annoncée atteinte) :
+/// rien ne continue.
 pub fn abandonner_le_relais(session: &str) {
     let (m, c) = relais();
     let mut r = m.lock().unwrap_or_else(|e| e.into_inner());
@@ -689,23 +769,39 @@ pub fn prendre_le_lien(
     .then_some(session)
 }
 
-/// BLOQUANT, sur le fil du producteur, avant son premier bloc : l'état
-/// déposé par la session liée, dès qu'il l'est. `None` si elle est
-/// abandonnée, si `annule()` (la session de la suivante a été fermée), ou
-/// après `delai`.
+/// [`attendre_le_relais_lue`], la suivante étant réputée lue dès le départ :
+/// l'attente cède après `delai` sans avance de la précédente.
 pub fn attendre_le_relais(
     session: &str,
     plan: PlanModulation,
     delai: Duration,
     annule: &dyn Fn() -> bool,
 ) -> Option<ProducteurDsd> {
+    attendre_le_relais_lue(session, plan, delai, annule, &|| true)
+}
+
+/// BLOQUANT, sur le fil du producteur de la suivante, avant son premier
+/// bloc : l'état déposé par la session liée, dès qu'il l'est (une seule
+/// reprise : l'état est retiré). `None` aussitôt si la précédente est
+/// abandonnée ou évincée, ou si `annule()` (session de la suivante fermée) ;
+/// `None` aussi quand la suivante est RÉELLEMENT lue (`lue()`) alors que la
+/// précédente n'a plus avancé depuis `delai` (producteur bloqué : la suivante
+/// ne se tait pas plus de `delai`). Tant que la précédente avance (elle joue
+/// sa fin) ou que la suivante n'est pas lue (pré-armement), l'attente dure.
+pub fn attendre_le_relais_lue(
+    session: &str,
+    plan: PlanModulation,
+    delai: Duration,
+    annule: &dyn Fn() -> bool,
+    lue: &dyn Fn() -> bool,
+) -> Option<ProducteurDsd> {
     let (m, c) = relais();
     let debut = Instant::now();
     let mut r = m.lock().unwrap_or_else(|e| e.into_inner());
     loop {
-        match r.par_session.get(session).map(|x| &x.etat) {
-            None | Some(EtatDuRelais::Abandonne) => return None,
-            Some(EtatDuRelais::Depose(_)) => {
+        let avance = match r.par_session.get(session).map(|x| (&x.etat, x.avance)) {
+            None | Some((EtatDuRelais::Abandonne, _)) => return None,
+            Some((EtatDuRelais::Depose(_), _)) => {
                 let x = r.par_session.get_mut(session)?;
                 let EtatDuRelais::Depose(p) =
                     std::mem::replace(&mut x.etat, EtatDuRelais::Abandonne)
@@ -714,13 +810,16 @@ pub fn attendre_le_relais(
                 };
                 return (*p).continuer(plan);
             }
-            Some(EtatDuRelais::EnCours) => {}
-        }
-        if annule() || debut.elapsed() >= delai {
+            Some((EtatDuRelais::EnCours, avance)) => avance,
+        };
+        if annule()
+            || debut.elapsed() >= ATTENTE_MAX
+            || (avance.elapsed() >= delai && debut.elapsed() >= delai && lue())
+        {
             return None;
         }
         r = c
-            .wait_timeout(r, Duration::from_millis(200))
+            .wait_timeout(r, Duration::from_millis(50))
             .unwrap_or_else(|e| e.into_inner())
             .0;
     }
@@ -728,11 +827,13 @@ pub fn attendre_le_relais(
 
 // ── Volume publié ───────────────────────────────────────────────────
 
-/// Le volume de la zone, publié au changement (`PlaybackManager`) et lu sans
-/// verrou par le producteur à chaque bloc.
+/// Le volume de la zone et ce qui le règle (sourdine, trim, verrou PURE),
+/// publiés au changement et lus sans verrou par le producteur à chaque bloc.
 pub struct VolumePublie {
     volume: std::sync::atomic::AtomicU64,
     muet: AtomicBool,
+    trim_db: std::sync::atomic::AtomicU64,
+    verrou_pure: AtomicBool,
 }
 
 impl VolumePublie {
@@ -742,6 +843,32 @@ impl VolumePublie {
     pub fn muet(&self) -> bool {
         self.muet.load(Ordering::Relaxed)
     }
+    pub fn trim_db(&self) -> f64 {
+        f64::from_bits(self.trim_db.load(Ordering::Relaxed))
+    }
+    pub fn verrou_pure(&self) -> bool {
+        self.verrou_pure.load(Ordering::Relaxed)
+    }
+
+    /// Le gain linéaire à appliquer juste avant le modulateur : consigne
+    /// (1,0 sous verrou PURE), sourdine, trim négatif.
+    pub fn gain(&self) -> f64 {
+        if self.muet() {
+            return 0.0;
+        }
+        let volume = if self.verrou_pure() {
+            1.0
+        } else {
+            self.volume()
+        };
+        let trim_db = self.trim_db();
+        let trim = if trim_db < 0.0 {
+            10f64.powf(trim_db / 20.0)
+        } else {
+            1.0
+        };
+        (volume.clamp(0.0, 1.0) * trim).clamp(0.0, 1.0)
+    }
 }
 
 fn volumes() -> &'static Mutex<HashMap<i64, std::sync::Arc<VolumePublie>>> {
@@ -749,7 +876,7 @@ fn volumes() -> &'static Mutex<HashMap<i64, std::sync::Arc<VolumePublie>>> {
     V.get_or_init(Default::default)
 }
 
-/// Le volume publié d'une zone (créé à 0 dB, non muet).
+/// Le volume publié d'une zone (créé à 0 dB, non muet, sans trim ni verrou).
 pub fn volume_de_la_zone(zone_id: i64) -> std::sync::Arc<VolumePublie> {
     volumes()
         .lock()
@@ -759,16 +886,76 @@ pub fn volume_de_la_zone(zone_id: i64) -> std::sync::Arc<VolumePublie> {
             std::sync::Arc::new(VolumePublie {
                 volume: std::sync::atomic::AtomicU64::new(1.0f64.to_bits()),
                 muet: AtomicBool::new(false),
+                trim_db: std::sync::atomic::AtomicU64::new(0.0f64.to_bits()),
+                verrou_pure: AtomicBool::new(false),
             })
         })
         .clone()
 }
 
-/// Publie le volume et la sourdine de la zone (appelé à chaque changement).
+/// Publie le volume et la sourdine de la zone. Appelé SOUS le verrou des
+/// zones du `PlaybackManager`, à chaque changement : jamais une valeur lue
+/// avant une sourdine n'écrase la sourdine.
 pub fn publier_volume(zone_id: i64, volume: f64, muet: bool) {
     let v = volume_de_la_zone(zone_id);
     v.volume.store(volume.to_bits(), Ordering::Relaxed);
     v.muet.store(muet, Ordering::Relaxed);
+}
+
+/// Publie le trim et le verrou PURE de la zone.
+pub fn publier_reglages_de_volume(zone_id: i64, trim_db: f64, verrou_pure: bool) {
+    let v = volume_de_la_zone(zone_id);
+    v.trim_db.store(trim_db.to_bits(), Ordering::Relaxed);
+    v.verrou_pure.store(verrou_pure, Ordering::Relaxed);
+}
+
+/// Relit et publie le trim et le verrou PURE d'une zone depuis la base.
+pub fn rafraichir_reglages_de_volume(
+    db: &std::sync::Arc<dyn crate::db::backend::DbBackend>,
+    zone_id: i64,
+) {
+    let trim = crate::orchestrator::gain_trim_db_enregistre(db, zone_id);
+    let verrou = crate::audio::audiophile::effective_volume(db, zone_id, 0.0) >= 1.0;
+    publier_reglages_de_volume(zone_id, trim, verrou);
+}
+
+/// Appelé par `SettingsRepo` après CHAQUE écriture ou effacement : une clé
+/// qui règle le volume d'une zone (trim, PURE et son verrou, verrou global)
+/// est republiée pour les zones dont le volume est suivi. Tous les chemins
+/// qui changent ces réglages passent par là.
+pub fn reglage_ecrit(db: &std::sync::Arc<dyn crate::db::backend::DbBackend>, cle: &str) {
+    let zones: Vec<i64> = if cle == crate::audio::audiophile::SETTING_LOCK_VOLUME {
+        volumes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .copied()
+            .collect()
+    } else {
+        let Some(reste) = cle.strip_prefix("zone_") else {
+            return;
+        };
+        let Some((id, suffixe)) = reste.split_once('_') else {
+            return;
+        };
+        if !matches!(suffixe, "gain_trim_db" | "audiophile") {
+            return;
+        }
+        let Ok(id) = id.parse::<i64>() else {
+            return;
+        };
+        if !volumes()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&id)
+        {
+            return;
+        }
+        vec![id]
+    };
+    for zone_id in zones {
+        rafraichir_reglages_de_volume(db, zone_id);
+    }
 }
 
 // ── Producteurs actifs ──────────────────────────────────────────────

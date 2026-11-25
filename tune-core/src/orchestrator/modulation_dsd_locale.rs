@@ -145,40 +145,6 @@ fn replier_en_mono(x: &mut [f64]) {
     }
 }
 
-/// Le volume de la zone tel que la sortie locale l'appliquerait (consigne
-/// linéaire, verrou Pure, sourdine, trim), pour le modulateur.
-fn gain_de_volume(volume: f64, muet: bool, trim_db: f64) -> f64 {
-    if muet {
-        return 0.0;
-    }
-    let trim = if trim_db < 0.0 {
-        10f64.powf(trim_db / 20.0)
-    } else {
-        1.0
-    };
-    (volume.clamp(0.0, 1.0) * trim).clamp(0.0, 1.0)
-}
-
-/// Ce dont le fil du producteur a besoin pour suivre le volume de la zone,
-/// sans verrou ni base à chaque bloc : le volume et la sourdine publiés au
-/// changement (valeur atomique), le trim et le verrou Pure lus une fois.
-struct SuiviDuVolume {
-    publie: Arc<modulation::VolumePublie>,
-    trim_db: f64,
-    verrou_pure: bool,
-}
-
-impl SuiviDuVolume {
-    fn gain(&self) -> f64 {
-        let volume = if self.verrou_pure {
-            1.0
-        } else {
-            self.publie.volume()
-        };
-        gain_de_volume(volume, self.publie.muet(), self.trim_db)
-    }
-}
-
 /// Le lien d'enchaînement d'une piste : la session de la piste précédente,
 /// dont le producteur déposera son état.
 struct Enchainement {
@@ -186,17 +152,30 @@ struct Enchainement {
     plan: PlanModulation,
 }
 
-/// Délai d'attente maximal de l'état de la piste précédente : elle est
-/// pré-armée ~30 s avant la fin, et son producteur finit ~2,5 s avant.
-const ATTENTE_DU_RELAIS: Duration = Duration::from_secs(60);
+/// Une fois la suivante RÉELLEMENT lue par la sortie, elle n'attend pas plus
+/// longtemps une précédente qui n'avance plus.
+const ATTENTE_DU_RELAIS: Duration = Duration::from_millis(1_500);
+
+/// Octets de données qu'annonce un en-tête WAV (`None` : longueur inconnue,
+/// ou flux DSD brut sans longueur).
+fn longueur_annoncee(entete: &[u8]) -> Option<u64> {
+    if entete.len() < 44 || &entete[..4] != b"RIFF" {
+        return None;
+    }
+    let n = u32::from_le_bytes(entete[40..44].try_into().ok()?);
+    (n != 0 && n != u32::MAX).then_some(u64::from(n))
+}
 
 /// Le fil du producteur : en-tête, état de la piste précédente s'il y a un
 /// lien (attendu ICI, au premier bloc réel), décodage en entiers 32 bits
-/// (mono dupliqué en stéréo), greffons de la zone, `f64`, volume de la zone,
-/// modulateur, porteur. Rend le producteur à la FIN NORMALE de la piste (pour
-/// la suivante), et dit si l'état précédent a été repris.
+/// (mono dupliqué en stéréo), greffons de la zone, `f64`, volume de la zone
+/// (publié, lu sans verrou), modulateur, porteur. Rend le producteur à la
+/// FIN NORMALE de la piste (pour la suivante). Ne dépasse JAMAIS la longueur
+/// annoncée par l'en-tête : au-delà, la sortie ne lit plus, et l'envoi
+/// resterait bloqué — le producteur s'arrête et abandonne son relais.
 #[allow(clippy::too_many_arguments)]
 fn produire_le_flux_dsd(
+    session: String,
     fichier: String,
     seek_s: f64,
     duree_s: Option<f64>,
@@ -206,7 +185,7 @@ fn produire_le_flux_dsd(
     au_repris: &dyn Fn(),
     mut dsp: StreamingDsp,
     mono: bool,
-    volume: SuiviDuVolume,
+    volume: Arc<modulation::VolumePublie>,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
     data_ready: Arc<tokio::sync::Notify>,
     rt: tokio::runtime::Handle,
@@ -214,19 +193,43 @@ fn produire_le_flux_dsd(
     let _actif = modulation::ProducteurActif::tenir();
     let plan = neuf.plan();
     let delai = crate::http::streamer::SESSION_IDLE_TIMEOUT;
-    let envoyer = |bloc: Vec<u8>| -> Result<(), String> {
+    let envoyer_brut = |bloc: Vec<u8>| -> Result<(), String> {
         match rt.block_on(tokio::time::timeout(delai, tx.send(bloc))) {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {
+                modulation::signaler_l_avance(&session);
+                Ok(())
+            }
             Ok(Err(_)) => Err("session fermée".into()),
             Err(_) => Err("délai d'envoi dépassé".into()),
         }
     };
-    envoyer(neuf.entete(Some(duree_servie_ms)))?;
+    let entete = neuf.entete(Some(duree_servie_ms));
+    let restants = std::cell::Cell::new(longueur_annoncee(&entete));
+    let envoyer = |mut bloc: Vec<u8>| -> Result<(), String> {
+        if let Some(r) = restants.get() {
+            if r == 0 {
+                return Err("longueur annoncée atteinte".into());
+            }
+            if bloc.len() as u64 > r {
+                bloc.truncate(r as usize);
+            }
+            restants.set(Some(r - bloc.len() as u64));
+        }
+        envoyer_brut(bloc)
+    };
+    envoyer_brut(entete)?;
     data_ready.notify_one();
     // Enchaînement : l'état de la piste précédente, au moment où celle-ci
-    // commence vraiment à moduler — pas à sa résolution, 30 s plus tôt.
+    // commence vraiment à moduler — pas à sa résolution, 30 s plus tôt. La
+    // suivante est « lue » quand la sortie a consommé son en-tête.
     let repris = enchainement.and_then(|e| {
-        modulation::attendre_le_relais(&e.precedente, e.plan, ATTENTE_DU_RELAIS, &|| tx.is_closed())
+        modulation::attendre_le_relais_lue(
+            &e.precedente,
+            e.plan,
+            ATTENTE_DU_RELAIS,
+            &|| tx.is_closed(),
+            &|| tx.capacity() == tx.max_capacity(),
+        )
     });
     let gain_fixe = neuf.gain_fixe();
     let mut producteur = match repris {
@@ -501,16 +504,31 @@ impl PlaybackOrchestrator {
     }
 
     /// La relance : la piste repart à sa position, et la décision la fait
-    /// passer en PCM (`carrier_rate_not_supported`) au lieu du silence.
-    pub async fn relancer_apres_rupture_dsd(&self, zone_id: i64) {
+    /// passer en PCM (`carrier_rate_not_supported`) au lieu du silence. Si la
+    /// relance échoue, le traitement NORMAL d'une panne de sortie reprend :
+    /// erreur visible (`zone.playback_error`, fatale, avec le constat de la
+    /// sortie) et arrêt de la zone — jamais une « lecture » muette.
+    pub async fn relancer_apres_rupture_dsd(&self, zone_id: i64, constat: String) {
         let etat = self.playback.get_state(zone_id).await;
         let position = super::dsp::position_a_reprendre(&etat);
         warn!(zone_id, position, "tess_dsd_porteur_refuse_relance_en_pcm");
-        if let Err(e) =
+        let resultat =
             Box::pin(self.replay_zone_at_position(zone_id, position, "tess_dsd_porteur_refuse"))
-                .await
-        {
-            warn!(zone_id, error = %e, "tess_dsd_relance_apres_rupture_refusee");
+                .await;
+        if let Err(e) = resultat {
+            warn!(zone_id, error = %e, constat = %constat, "tess_dsd_relance_apres_rupture_refusee");
+            if let Some(bus) = &self.event_bus {
+                bus.emit(
+                    "zone.playback_error",
+                    serde_json::json!({ "zone_id": zone_id, "error": constat, "fatal": true }),
+                );
+            }
+            let device_id = ZoneRepo::with_backend(self.db.clone())
+                .get(zone_id)
+                .ok()
+                .flatten()
+                .and_then(|z| z.output_device_id);
+            Box::pin(self.stop(zone_id, device_id.as_deref())).await;
         }
     }
 
@@ -735,13 +753,12 @@ impl PlaybackOrchestrator {
             .await;
         neuf.definir_gain_fixe(10f64.powf((headroom_db + preampli_db) / 20.0));
         // Le volume : publié tel qu'il est maintenant, puis suivi sans verrou.
-        let etat = self.playback.get_state(zone_id).await;
-        modulation::publier_volume(zone_id, etat.volume, etat.muted);
-        let volume = SuiviDuVolume {
-            publie: modulation::volume_de_la_zone(zone_id),
-            trim_db: super::regles::gain_trim_db_enregistre(&self.db, zone_id),
-            verrou_pure: crate::audio::audiophile::effective_volume(&self.db, zone_id, 0.0) >= 1.0,
-        };
+        // Publiés sous le verrou des zones (une sourdine concurrente n'est
+        // jamais écrasée) ; trim et verrou PURE relus, puis tenus à jour par
+        // chaque écriture de leurs réglages (`SettingsRepo`).
+        self.playback.publier_le_volume_dsd(zone_id).await;
+        modulation::rafraichir_reglages_de_volume(&self.db, zone_id);
+        let volume = modulation::volume_de_la_zone(zone_id);
         let (seek_s, duree_s, duree_servie_ms) =
             fenetre_de_decodage(tranche, req.seek_ms, track.duration_ms.max(0) as u64);
         let (format, mime, ext, profondeur) = match plan.transport {
@@ -831,6 +848,7 @@ impl PlaybackOrchestrator {
                 modulation::noter(zone_id, cle.clone(), EtatModulation::EnService(e));
             };
             match produire_le_flux_dsd(
+                session.clone(),
                 fichier,
                 seek_s,
                 duree_s,

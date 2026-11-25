@@ -562,3 +562,292 @@ fn depart_en_sourdine_sans_bouffee_a_0_db() {
     let d = densite(&suite[suite.len() / 2..], 0);
     assert!((d - 0.5).abs() < 0.01, "{d}");
 }
+
+// ── Relecture v3 ────────────────────────────────────────────────────
+
+/// Densité max (en valeur absolue) sur des fenêtres de `octets_fenetre`.
+fn densite_max(octets: &[u8], octets_fenetre: usize) -> f64 {
+    octets
+        .chunks(octets_fenetre)
+        .filter(|c| c.len() == octets_fenetre)
+        .map(|c| densite(c, 0).abs())
+        .fold(0.0, f64::max)
+}
+
+/// v3 D1 : seek au milieu d'un passage FORT, zone en sourdine. Le seek
+/// construit un producteur neuf (`lien` = None quand seek_ms > 0) et lui
+/// applique `fixer_volume` avant le premier bloc. Aucune fenêtre de 0,5 ms
+/// ne doit porter de signal. Contre-épreuve : avec la rampe seule, la
+/// première fenêtre est forte.
+#[test]
+fn relecture_v3_seek_dans_un_passage_fort_en_sourdine() {
+    for transport in [TransportModulation::Native, TransportModulation::Dop] {
+        let pl = plan(transport, TauxDsd::Dsd64, 44_100);
+        // 50 Hz pleine échelle, pris au milieu (phase ≈ crête).
+        let fort: Vec<f64> = sinus(44_100, 50.0, 1.0, 44_100)[2 * 220..2 * (220 + 441)].to_vec();
+        let mut p = ProducteurDsd::new(pl).unwrap();
+        p.definir_gain_fixe(10f64.powf(-3.0 / 20.0));
+        p.fixer_volume(0.0);
+        let mut s = Vec::new();
+        p.moduler(&fort, &mut s).unwrap();
+        let train = if transport == TransportModulation::Dop {
+            dsd_du_dop(&s)
+        } else {
+            s
+        };
+        // 0,5 ms à DSD64 = 1411 bits/voie ≈ 176 octets/voie, 2 voies.
+        let d = densite_max(&train, 352);
+        assert!(
+            d < 0.12,
+            "{transport:?} : sourdine, fenêtre la plus forte {d}"
+        );
+
+        let mut r = ProducteurDsd::new(pl).unwrap();
+        r.definir_gain_fixe(10f64.powf(-3.0 / 20.0));
+        r.definir_volume(0.0);
+        let mut s2 = Vec::new();
+        r.moduler(&fort, &mut s2).unwrap();
+        let train2 = if transport == TransportModulation::Dop {
+            dsd_du_dop(&s2)
+        } else {
+            s2
+        };
+        let d2 = densite_max(&train2, 352);
+        assert!(
+            d2 > 0.2,
+            "{transport:?} : contre-épreuve, rampe depuis 0 dB : {d2}"
+        );
+    }
+}
+
+/// v3 D2 : la piste en cours ne dépose JAMAIS (panne, blocage) : la
+/// suivante rend la main au délai, sans état.
+#[test]
+fn relecture_v3_attente_bornee_si_la_precedente_ne_depose_jamais() {
+    let zone = 9_430_901;
+    let pl = plan(TransportModulation::Dop, TauxDsd::Dsd64, 44_100);
+    ouvrir_le_relais(zone, "v3-a", pl);
+    annoncer_la_suivante(zone, 2, "v3-a");
+    let lien = prendre_le_lien(zone, Some(2), pl).unwrap();
+    let t = std::time::Instant::now();
+    let r = attendre_le_relais(&lien, pl, Duration::from_millis(300), &|| false);
+    assert!(r.is_none());
+    assert!(
+        t.elapsed() < Duration::from_millis(700),
+        "{:?}",
+        t.elapsed()
+    );
+}
+
+/// v3 D2 : abandon (stop, seek, relance de la piste en cours) pendant
+/// l'attente : la suivante repart aussitôt, sans état.
+#[test]
+fn relecture_v3_abandon_pendant_l_attente() {
+    let zone = 9_430_902;
+    let pl = plan(TransportModulation::Dop, TauxDsd::Dsd64, 44_100);
+    ouvrir_le_relais(zone, "v3-b", pl);
+    annoncer_la_suivante(zone, 2, "v3-b");
+    let lien = prendre_le_lien(zone, Some(2), pl).unwrap();
+    let h = std::thread::spawn(move || {
+        let t = std::time::Instant::now();
+        let r = attendre_le_relais(&lien, pl, Duration::from_secs(20), &|| false);
+        (r.is_none(), t.elapsed())
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    abandonner_le_relais("v3-b");
+    let (aucun, duree) = h.join().unwrap();
+    assert!(aucun);
+    assert!(duree < Duration::from_secs(2), "{duree:?}");
+}
+
+/// v3 D2 : la session de la suivante est fermée (suivante retirée de la
+/// file, re-préparation) : `annule` est vu en ≤ 200 ms.
+#[test]
+fn relecture_v3_annulation_de_la_suivante() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let zone = 9_430_903;
+    let pl = plan(TransportModulation::Dop, TauxDsd::Dsd64, 44_100);
+    ouvrir_le_relais(zone, "v3-c", pl);
+    annoncer_la_suivante(zone, 2, "v3-c");
+    let lien = prendre_le_lien(zone, Some(2), pl).unwrap();
+    let ferme = std::sync::Arc::new(AtomicBool::new(false));
+    let f2 = ferme.clone();
+    let h = std::thread::spawn(move || {
+        let t = std::time::Instant::now();
+        let r = attendre_le_relais(&lien, pl, Duration::from_secs(20), &|| {
+            f2.load(Ordering::SeqCst)
+        });
+        (r.is_none(), t.elapsed())
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    ferme.store(true, Ordering::SeqCst);
+    let (aucun, duree) = h.join().unwrap();
+    assert!(aucun);
+    assert!(duree < Duration::from_secs(1), "{duree:?}");
+    // L'état déposé ensuite par la piste en cours ne passe à personne
+    // (aucune autre annonce).
+    deposer_au_relais("v3-c", ProducteurDsd::new(pl).unwrap());
+    assert!(prendre_le_lien(zone, Some(2), pl).is_none());
+}
+
+/// v3 D2 : la suivante a expiré (pause longue de la piste en cours) ; la
+/// précédente dépose ENSUITE. Une re-préparation de la même suivante (même
+/// piste, même session précédente) reprend-elle l'état ? (Lien légitime.)
+/// Et une piste jouée à la main sans annonce ne le prend pas.
+#[test]
+fn relecture_v3_depot_apres_expiration() {
+    let zone = 9_430_904;
+    let pl = plan(TransportModulation::Dop, TauxDsd::Dsd64, 44_100);
+    ouvrir_le_relais(zone, "v3-d", pl);
+    annoncer_la_suivante(zone, 2, "v3-d");
+    let lien = prendre_le_lien(zone, Some(2), pl).unwrap();
+    assert!(attendre_le_relais(&lien, pl, Duration::from_millis(50), &|| false).is_none());
+    deposer_au_relais("v3-d", ProducteurDsd::new(pl).unwrap());
+    // Piste jouée à la main (pas d'annonce) : rien.
+    assert!(prendre_le_lien(zone, Some(2), pl).is_none());
+}
+
+/// v3 D2 : deux attentes liées à la MÊME précédente (pré-armement refait
+/// alors que l'ancienne session n'est pas encore fermée) : une seule reprend
+/// l'état, l'autre repart neuve — jamais deux reprises du même état.
+#[test]
+fn relecture_v3_deux_attentes_une_seule_reprise() {
+    let zone = 9_430_905;
+    let pl = plan(TransportModulation::Dop, TauxDsd::Dsd64, 44_100);
+    ouvrir_le_relais(zone, "v3-e", pl);
+    annoncer_la_suivante(zone, 2, "v3-e");
+    let l1 = prendre_le_lien(zone, Some(2), pl).unwrap();
+    annoncer_la_suivante(zone, 2, "v3-e");
+    let l2 = prendre_le_lien(zone, Some(2), pl).unwrap();
+    let h1 = std::thread::spawn(move || {
+        attendre_le_relais(&l1, pl, Duration::from_secs(5), &|| false).is_some()
+    });
+    let h2 = std::thread::spawn(move || {
+        attendre_le_relais(&l2, pl, Duration::from_secs(5), &|| false).is_some()
+    });
+    std::thread::sleep(Duration::from_millis(100));
+    deposer_au_relais("v3-e", ProducteurDsd::new(pl).unwrap());
+    let (a, b) = (h1.join().unwrap(), h2.join().unwrap());
+    assert!(a ^ b, "une seule reprise : {a} {b}");
+}
+
+/// v3 : relais tous EnCours (producteurs bloqués) : la table croît sans
+/// borne (aucune éviction possible).
+#[test]
+fn relecture_v3_table_des_relais_bornee() {
+    let pl = plan(TransportModulation::Dop, TauxDsd::Dsd64, 44_100);
+    for i in 0..20 {
+        ouvrir_le_relais(9_430_906, &format!("v3-f-{i}"), pl);
+    }
+    // Bornée, même quand tous les producteurs sont bloqués (EnCours).
+    assert!(relais_de_la_zone(9_430_906) <= RELAIS_PAR_ZONE);
+    assert!(relais_tenus() <= RELAIS_MAX);
+}
+
+/// v3 point 1 : PURE verrouillé (volume tenu à 100 %), déverrouillé EN COURS
+/// de piste par une écriture du réglage, puis volume baissé : la baisse
+/// s'applique avant le modulateur, sans relire la base à chaque bloc.
+#[test]
+fn pure_deverrouille_en_cours_de_piste_puis_volume_baisse() {
+    let db = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+    db.init_schema().unwrap();
+    crate::db::migrations::run_migrations(&db).unwrap();
+    let db: std::sync::Arc<dyn crate::db::backend::DbBackend> = std::sync::Arc::new(db);
+    let zone = 9_430_950;
+    let reglages = crate::db::settings_repo::SettingsRepo::with_backend(db.clone());
+    reglages
+        .set(
+            &format!("zone_{zone}_audiophile"),
+            r#"{"enabled":true,"lock_volume":true}"#,
+        )
+        .unwrap();
+    publier_volume(zone, 1.0, false);
+    rafraichir_reglages_de_volume(&db, zone);
+    let v = volume_de_la_zone(zone);
+    assert!(v.verrou_pure());
+    let mut p =
+        ProducteurDsd::new(plan(TransportModulation::Native, TauxDsd::Dsd64, 44_100)).unwrap();
+    p.fixer_volume(v.gain());
+    let mut s = Vec::new();
+    // Sous verrou : une consigne à 50 % reste à 0 dB.
+    publier_volume(zone, 0.5, false);
+    p.definir_volume(v.gain());
+    p.moduler(&vec![1.0; 2 * 4_410], &mut s).unwrap();
+    assert!((densite(&s[s.len() / 2..], 0) - 0.5).abs() < 0.01);
+    // Déverrouillé en cours de piste (écriture du réglage, n'importe quel
+    // chemin) : le volume baissé s'applique au bloc suivant.
+    reglages
+        .set(&format!("zone_{zone}_audiophile"), r#"{"enabled":false}"#)
+        .unwrap();
+    assert!(!v.verrou_pure());
+    p.definir_volume(v.gain());
+    s.clear();
+    p.moduler(&vec![1.0; 2 * 4_410], &mut s).unwrap();
+    let d = densite(&s[s.len() / 2..], 0);
+    assert!((d - 0.25).abs() < 0.01, "{d}");
+    // Le trim aussi : −6,02 dB.
+    reglages
+        .set(&format!("zone_{zone}_gain_trim_db"), "-6.0206")
+        .unwrap();
+    p.definir_volume(v.gain());
+    s.clear();
+    p.moduler(&vec![1.0; 2 * 4_410], &mut s).unwrap();
+    let d = densite(&s[s.len() / 2..], 0);
+    assert!((d - 0.125).abs() < 0.01, "{d}");
+}
+
+/// v3 point 2 : la précédente AVANCE (elle joue sa fin) : la suivante,
+/// même lue, attend son dépôt ; la précédente s'arrête d'avancer
+/// (bloquée) : la suivante, lue, cède en ~`delai`.
+#[test]
+fn l_attente_suit_l_avance_de_la_precedente() {
+    let zone = 9_430_960;
+    let pl = plan(TransportModulation::Dop, TauxDsd::Dsd64, 44_100);
+    ouvrir_le_relais(zone, "v3-g", pl);
+    let fin = std::sync::Arc::new(AtomicBool::new(false));
+    let f2 = fin.clone();
+    // La précédente avance pendant 600 ms, puis dépose.
+    let joue = std::thread::spawn(move || {
+        for _ in 0..12 {
+            std::thread::sleep(Duration::from_millis(50));
+            signaler_l_avance("v3-g");
+        }
+        deposer_au_relais("v3-g", ProducteurDsd::new(pl).unwrap());
+        f2.store(true, Ordering::SeqCst);
+    });
+    let t = Instant::now();
+    let r = attendre_le_relais_lue("v3-g", pl, Duration::from_millis(200), &|| false, &|| true);
+    joue.join().unwrap();
+    assert!(
+        r.is_some(),
+        "attendue tant que la précédente avance ({:?})",
+        t.elapsed()
+    );
+    assert!(fin.load(Ordering::SeqCst));
+    // Bloquée : plus aucune avance ; la suivante, lue, cède.
+    ouvrir_le_relais(zone, "v3-h", pl);
+    let t = Instant::now();
+    let r = attendre_le_relais_lue("v3-h", pl, Duration::from_millis(200), &|| false, &|| true);
+    assert!(r.is_none());
+    assert!(
+        t.elapsed() < Duration::from_millis(600),
+        "{:?}",
+        t.elapsed()
+    );
+    // Pas encore lue (pré-armement) : elle attend malgré l'inactivité.
+    ouvrir_le_relais(zone, "v3-i", pl);
+    let lue = std::sync::Arc::new(AtomicBool::new(false));
+    let l2 = lue.clone();
+    let h = std::thread::spawn(move || {
+        attendre_le_relais_lue("v3-i", pl, Duration::from_millis(100), &|| false, &|| {
+            l2.load(Ordering::SeqCst)
+        })
+        .is_some()
+    });
+    std::thread::sleep(Duration::from_millis(400));
+    deposer_au_relais("v3-i", ProducteurDsd::new(pl).unwrap());
+    assert!(
+        h.join().unwrap(),
+        "pré-armée et non lue : elle attend le dépôt"
+    );
+}

@@ -2047,6 +2047,19 @@ impl PlaybackManager {
         });
     }
 
+    /// rc14 — publie le volume et la sourdine de la zone pour la
+    /// modulation DSD de TESS, SOUS le verrou des zones : une sourdine posée
+    /// en même temps ne peut pas être écrasée par une valeur lue avant elle.
+    pub async fn publier_le_volume_dsd(&self, zone_id: i64) {
+        let zones = self.zones.lock().await;
+        let (volume, muet) = zones
+            .get(&zone_id)
+            .map_or((ZoneState::default().volume, false), |s| {
+                (s.volume, s.muted)
+            });
+        crate::tess::modulation_dsd::publier_volume(zone_id, volume, muet);
+    }
+
     pub async fn set_volume(&self, zone_id: i64, volume: f64) {
         let mut zones = self.zones.lock().await;
         let state = zones.entry(zone_id).or_insert_with(|| ZoneState {

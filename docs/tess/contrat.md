@@ -580,7 +580,9 @@ en tâche de fond, en cache) :
   (piste, saut, relance) pose le niveau AVANT son premier échantillon :
   jamais une milliseconde à 0 dB, même en sourdine. En cours de lecture, le
   volume publié au changement (valeur atomique) est relu à chaque bloc et
-  suit une rampe de 10 ms. Il répond avec le retard de ce qui est déjà
+  suit une rampe de 10 ms. Le trim et le verrou PURE sont publiés de même
+  à chaque écriture de leurs réglages : quitter PURE en cours de piste rend
+  la main au volume. Il répond avec le retard de ce qui est déjà
   modulé en aval : la session (≈ 0,4 s) plus l'anneau de la sortie locale
   (≈ 2 s), soit **2 à 2,5 s**. Une baisse de volume ou la sourdine ne
   relancent rien. La protection `dsd_volume_protection` (#8813) reste celle
@@ -602,8 +604,16 @@ en tâche de fond, en cache) :
   gapless (lien explicite avec la session qui joue), de même famille et de
   même cadence, reprend l'état du modulateur AU MOMENT où elle module son
   premier bloc (elle attend que la piste en cours le dépose) : ni silence ni
-  clôture. Aucune autre piste ne reprend jamais un état. Chaque piste émet
-  un nombre pair de trames DoP.
+  clôture. L'attente dure tant que la piste en cours avance ; une fois la
+  suivante réellement lue par la sortie, elle ne dépasse pas 1,5 s sans
+  avance (producteur bloqué), puis la suivante part d'un modulateur neuf.
+  Aucune autre piste ne reprend jamais un état. Chaque piste émet un nombre
+  pair de trames DoP. **Sans clic en DoP seulement** : en DSD natif, la
+  sortie rouvre son bras à chaque piste, l'état du modulateur passe mais la
+  jonction n'est pas garantie sans clic.
+- **Longueur annoncée** : le producteur ne dépasse jamais la longueur de
+  données que son en-tête WAV annonce (la sortie ne lirait plus) ; il
+  s'arrête et abandonne son relais plutôt que de rester bloqué.
 
 Sur le chemin résolu, une cible acceptée ajoute à l'étape `dsd_modulator`
 `order`, `rate_hz`, `transport`, `dop_rate_hz` et `zero_dbfs_modulation`
