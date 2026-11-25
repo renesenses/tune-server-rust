@@ -10525,6 +10525,51 @@ async fn plafond_de_zone_3973_strict_refuse_au_lieu_de_plafonner() {
     );
 }
 
+/// #9174 (option 1, fil 2970) — une zone NAVIGATEUR plafonnée (l'app pose
+/// `max_sample_rate = 48000` sur « Ce téléphone » quand elle lit par le relais)
+/// recevait un FLAC 192 kHz rééchantillonné en FLAC progressif : ni
+/// `Content-Length` ni `Range`, et CoreMedia le refuse (-12939). Plus aucune
+/// lecture hi-res à distance. Le rééchantillonnage d'une zone navigateur doit
+/// partir en WAV borné, comme l'égaliseur (`is_browser_output &&
+/// eq_forces_transcode`, #1168).
+#[tokio::test]
+async fn zone_navigateur_plafonnee_recoit_un_wav_borne_9174() {
+    let orch = test_orchestrator();
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+    let zone_id = zones.create("Ce téléphone", Some("browser"), None).unwrap();
+    zones.update_max_sample_rate(zone_id, Some(48_000)).unwrap();
+    piste_192k_3973(&orch);
+    let req = requete_locale_3234(zone_id, 1);
+
+    let f = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(f.out_sr, 48_000, "le plafond de la zone est appliqué");
+    assert_eq!(
+        f.out_ext, "wav",
+        "zone navigateur plafonnée : un FLAC rééchantillonné à la volée n'a ni \
+         Content-Length ni Range, CoreMedia le refuse ; il faut du WAV borné"
+    );
+    assert!(
+        f.info.wav_content_length().is_some(),
+        "le flux doit annoncer sa longueur (Content-Length) : {:?}",
+        f.info.duration_ms
+    );
+}
+
+/// La même zone navigateur SANS plafond garde son FLAC local tel quel : le
+/// correctif ne touche que le rééchantillonnage.
+#[tokio::test]
+async fn zone_navigateur_sans_plafond_garde_le_flac_9174() {
+    let orch = test_orchestrator();
+    let zones = ZoneRepo::with_backend(orch.db.clone());
+    let zone_id = zones.create("Ce téléphone", Some("browser"), None).unwrap();
+    piste_192k_3973(&orch);
+    let req = requete_locale_3234(zone_id, 1);
+
+    let f = orch.format_de_sortie_pour_test(&req).await.unwrap();
+    assert_eq!(f.out_sr, 192_000);
+    assert_eq!(f.out_ext, "flac");
+}
+
 /// Site « plafond de zone », bras DoP (`anticiper_le_dop`) : un DSD64 servi en
 /// DoP demande 176,4 kHz ; zone locale plafonnée à 88,2 kHz. Par défaut le DoP
 /// est abandonné pour du PCM plafonné ; en strict, refus nommé.
