@@ -248,6 +248,7 @@ Enregistrée sous `zone_{id}_tess_chain` (T02), échangée par
 | `must_be_last_plugin` | 409 | greffon `last_plugin` suivi d'un autre (même décoché) |
 | `mutually_exclusive` | 409 | deux membres cochés d'un groupe en politique `refuse` (le défaut) |
 | `premium_required` | **402** | greffon Premium **coché**, ou upsampling demandé, sans Premium, **`bypass_all` compris** (la chaîne garde ses maillons et les anciennes clés les reçoivent) |
+| `dsd_not_supported_by_output` | 409 | rc14 — upsampling vers une cible DSD **modifiée** que la sortie **locale** de la zone ne prend pas (après le contrôle du droit : un compte Free reçoit le 402). Corps : `reason` (motif précis, voir § 7) et `dsd_capabilities`. Rien n'est écrit : le suréchantillonnage en place n'est pas éteint. Les sorties réseau ne sont pas concernées. |
 
 Ce qui dépend du flux ou de l'installation n'est **pas** refusé au `PUT`
 (canaux, paquet désinstallé, droit perdu ensuite). La résolution l'éteint
@@ -329,6 +330,7 @@ chaîne. C'est le comportement de #7632.
 | `volume_not_software` | volume réglé par l'appareil, ou volume fixe |
 | `nothing_to_quantize` | rien ne modifie les échantillons ; le détail dit « Bit-perfect » |
 | `not_in_service` | T16 : résolu effectif, mais l'étage ne tourne pas (exécuteur ou sonde de la sortie) |
+| `dsd_not_supported_by_output` | rc14 : vers le DSD, la sortie locale ne prend pas la cible, ou la piste est repartie en PCM ; `detail` = motif précis (`dsd_mode_not_enabled`, `software_volume_active`…). Sur `upsampling` et sur l'étape `dsd_modulator`, publiée éteinte. |
 
 ### Badge (A4)
 
@@ -529,6 +531,48 @@ Hors TESS, avec un motif affiché :
 Le serveur y ajoute (T08, champs facultatifs) la forme des autres refus de
 l'API : `error` (= `code`), `message` (= `detail`) et, sur un 402,
 `upgrade_url`.
+
+### `dsd_capabilities` (rc14, `tess::modulation_dsd`)
+
+Facultatif dans `zone_response` (absent d'un serveur antérieur : « inconnu »).
+Ce que la sortie de la zone fait de chaque cible DSD, **sans sonder le
+pilote** (capacité native déjà connue, réponses DoP retenues) :
+
+```json
+{
+  "dsd_mode": "dop", "output_local": true, "modulator_order": 7,
+  "volume_protection": true,
+  "targets": [
+    { "rate": "dsd64", "rate_hz": 2822400, "accepted": true, "transport": "dop",
+      "dop_rate_hz": 176400, "reason": null, "native_reason": null,
+      "family_48k": { "rate_hz": 3072000, "accepted": true, "transport": "dop",
+                      "dop_rate_hz": 192000, "reason": null, "native_reason": null } },
+    …
+  ]
+}
+```
+
+- `accepted`/`transport`/`reason` à plat : famille 44,1 kHz (celle que
+  l'écran grise) ; `family_48k` : une piste 48/96/192 kHz y est modulée.
+- `transport` : `native` (ASIO `DsdU8`, ALSA `DSD_U32`, zone « natif » dont le
+  pilote déclare la cadence) ou `dop` ; `native_reason` dit pourquoi une zone
+  « natif » part en DoP.
+- `reason` : `output_not_local`, `dsd_mode_not_enabled` (zone `auto`/`pcm` :
+  jamais de DoP vers un DAC non déclaré), `rate_above_zone_max`,
+  `dop_refused_by_output`, `machine_too_slow` (marge ×2 de temps réel par
+  paire de voies, mesurée une fois). À la lecture seulement :
+  `source_rate_not_modulable`, `channels_not_supported`,
+  `software_volume_active` (protection du niveau DSD, #8813),
+  `modulator_failed`.
+- `volume_protection` : le volume logiciel ne s'applique pas en DSD ; une
+  zone qui demande une atténuation (volume < 100 %, sourdine, trim) joue en
+  PCM tant que la protection est active. ReplayGain et préampli de
+  l'égaliseur sont appliqués dans le flux, avant le modulateur.
+
+Sur le chemin résolu, une cible acceptée ajoute à l'étape `dsd_modulator`
+`order`, `rate_hz`, `transport` et `dop_rate_hz` ; le chemin du signal (T16)
+de la piste qui joue y ajoute `carrier_rate_hz`, `source_rate_hz` et
+`channels`.
 
 ### Routes (T08, `tune-server/src/routes/zones/tess.rs`)
 

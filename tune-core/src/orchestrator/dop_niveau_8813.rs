@@ -89,6 +89,13 @@ impl PlaybackOrchestrator {
         let Some(device_id) = zone.output_device_id else {
             return false;
         };
+        // rc14 — un flux modulé vers le DSD par TESS (DoP OU natif) : le
+        // volume ne s'y applique pas non plus. Sa règle est la sienne (le
+        // ReplayGain et le préampli sont déjà dans le flux) ; une atténuation
+        // demandée relance la piste, qui repart en PCM.
+        if self.modulation_dsd_en_service(zone_id).await {
+            return self.attenuation_logicielle_en_dsd(zone_id).await;
+        }
         let etat = self.playback.get_state(zone_id).await;
         let Some(np) = etat.now_playing else {
             return false;

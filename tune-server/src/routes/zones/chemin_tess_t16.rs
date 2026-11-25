@@ -36,6 +36,7 @@ use tune_core::playback::ZoneState;
 use tune_core::tess::chemin::{EnService, GreffonsEnService, chemin_du_signal};
 use tune_core::tess::greffon::Origine;
 use tune_core::tess::migration::{lecture_dsd, lire_zone};
+use tune_core::tess::modulation_dsd::EtatModulation;
 use tune_core::tess::{
     ContexteExecution, ControleVolume, LectureDsd, SourceFlux, TauxDsd, TransportZone, VolumeZone,
     catalogue_de_reference,
@@ -97,7 +98,24 @@ pub(crate) fn en_service_d_apres_le_chemin(sp: &Value, volume_logiciel: bool) ->
         upsampling,
         volume_logiciel,
         latences: Vec::new(),
+        modulation_dsd: None,
     }
+}
+
+/// rc14 — la modulation DSD de la piste qui joue (sortie locale), retenue par
+/// l'orchestrateur à sa décision. En service, les greffons de la zone passent
+/// DANS le flux (la sortie, qui reçoit un porteur DSD, n'en applique aucun) :
+/// la sonde de la sortie ne les voit donc pas, c'est ce constat qui fait foi.
+pub(crate) fn avec_la_modulation_dsd(en_service: &mut EnService, etat: Option<EtatModulation>) {
+    if let Some(EtatModulation::EnService(m)) = &etat {
+        en_service.greffons = GreffonsEnService::Sonde {
+            actif: m.plugins_in_stream,
+            // La réaffectation des canaux n'est pas portée par le flux modulé.
+            hors_service: vec![tune_core::tess::migration::ID_REAFFECTATION.to_owned()],
+        };
+        en_service.upsampling = true;
+    }
+    en_service.modulation_dsd = etat;
 }
 
 fn taux_dsd(sample_rate: u32) -> TauxDsd {
@@ -241,7 +259,14 @@ pub(crate) fn chemin_tess_de_la_zone(
         }),
     };
     let resolution = lecture.chaine.resoudre(&catalogue, &ctx);
-    let en_service = en_service_d_apres_le_chemin(sp, volume_logiciel);
+    let mut en_service = en_service_d_apres_le_chemin(sp, volume_logiciel);
+    avec_la_modulation_dsd(
+        &mut en_service,
+        tune_core::tess::modulation_dsd::etat_pour(
+            zid,
+            ps.now_playing.as_ref().and_then(|np| np.track_id),
+        ),
+    );
     let intact = sp.get("bit_perfect").and_then(Value::as_bool);
     let chemin = chemin_du_signal(
         &lecture.chaine,
