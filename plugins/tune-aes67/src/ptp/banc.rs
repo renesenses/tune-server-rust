@@ -299,9 +299,11 @@ impl MaitreSimule {
                                     },
                                     &[0u8; 10],
                                 );
+                                // Avec cet émetteur logiciel, la remise au noyau borne
+                                // le départ. Le fil peut être suspendu après send_to :
+                                // dater alors le Sync le placerait après sa réception.
+                                let t1 = horloge.maintenant_ns();
                                 if ev.send_to(&sync, d_ev).is_ok() {
-                                    // Horodatage logiciel, comme le suiveur.
-                                    let t1 = horloge.maintenant_ns();
                                     let suivi = message(
                                         &Entete {
                                             type_msg: FOLLOW_UP,
