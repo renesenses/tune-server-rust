@@ -191,34 +191,39 @@ async fn tous_les_flux_refuses_rendent_l_erreur_apres_les_avoir_tous_essayes() {
     }
 }
 
-/// Un échec qui n'est PAS un refus du diffuseur (404 sur la liste HLS) garde
-/// le comportement d'avant : l'erreur est rendue, le flux suivant n'est
-/// jamais ouvert. La reconnexion d'une coupure réseau reste sur le même flux.
+/// #9488 — un échec qui n'est PAS un refus du diffuseur (404 sur la liste
+/// HLS) fait lui aussi passer au flux suivant de la fiche : avant le fil 3056,
+/// l'erreur était rendue et le flux suivant jamais ouvert.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn un_echec_qui_n_est_pas_un_refus_ne_passe_pas_au_flux_suivant() {
+async fn un_echec_qui_n_est_pas_un_refus_passe_aussi_au_flux_suivant() {
     let (base, demandes) = station(vec![
         ("/mort/master.m3u8", Reponse::Introuvable404),
         ("/ww/live.mp3", Reponse::Mp3),
     ]);
     let session = session_radio().await;
-    let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
     let data_ready = Arc::new(tokio::sync::Notify::new());
     let premier = format!("{base}/mort/master.m3u8");
     let replis = vec![format!("{base}/ww/live.mp3")];
+    let attente = data_ready.clone();
     let decodeur = tokio::task::spawn_blocking(move || {
         decode_radio_stream_to_pcm_avec_profondeur(
             premier, replis, tx, data_ready, session, None, None, false, None, false,
         )
     });
-    let verdict = tokio::time::timeout(Duration::from_secs(20), decodeur)
+    tokio::time::timeout(Duration::from_secs(10), attente.notified())
+        .await
+        .expect("le flux suivant doit jouer");
+    let _ = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await;
+    drop(rx);
+    let verdict = tokio::time::timeout(Duration::from_secs(15), decodeur)
         .await
         .expect("le décodeur doit rendre la main")
         .expect("pas de panique");
-    let e = verdict.expect_err("un 404 reste un échec rendu");
-    assert!(!e.starts_with(RADIO_HLS_INTERDIT), "{e}");
-    assert_eq!(
-        demandes_de(&demandes, "/ww/live.mp3"),
-        0,
-        "le flux suivant ne doit pas être ouvert"
+    assert_eq!(verdict, Ok(()));
+    assert_eq!(demandes_de(&demandes, "/mort/master.m3u8"), 1);
+    assert!(
+        demandes_de(&demandes, "/ww/live.mp3") >= 1,
+        "le flux suivant doit être ouvert"
     );
 }

@@ -1,3 +1,4 @@
+use super::radio_autres_flux_9488::{AnnonceDeRepli, RepliRadio};
 use super::*;
 
 /// A public `play()` for the track ALREADY playing on a zone that arrives within
@@ -311,6 +312,13 @@ struct EtatRadio {
     // en vol qui a coupé l'égaliseur, une reconnexion ne doit pas remonter
     // l'ancien.
     eq_de_depart_pose: bool,
+    // #9488 — il reste un autre flux de la station à essayer : un flux qui
+    // se termine avant le premier PCM passe alors au suivant au lieu de se
+    // reconnecter au même.
+    autre_flux_disponible: bool,
+    // #9488 — le repli en cours, dit UNE fois au premier PCM du flux de repli.
+    repli: Option<RepliRadio>,
+    annonce: Option<AnnonceDeRepli>,
 }
 
 /// Les canaux et le contexte du décodeur, relevés une fois par
@@ -430,6 +438,9 @@ pub(super) fn decode_radio_stream_to_pcm(
 /// sans que l'auditeur ait à choisir ; l'erreur n'est rendue que si tous ont
 /// été refusés. Une coupure réseau, une page web ou un HLS illisible gardent
 /// le comportement d'avant : reconnexion sur le même flux, ou échec dit.
+///
+/// #9488 — élargi à tout échec du flux AVANT le premier PCM (erreur HTTP,
+/// connexion refusée, flux vide…), voir `radio_autres_flux_9488`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn decode_radio_stream_to_pcm_avec_profondeur(
     url: String,
@@ -455,9 +466,13 @@ pub(super) fn decode_radio_stream_to_pcm_avec_profondeur(
         en_vol,
         sortie_locale,
         None,
+        None,
     )
 }
 
+/// #9488 — `annonce` : appelée UNE fois, quand un autre flux de la station
+/// sert son premier PCM après l'échec du flux lancé. `None` : rien n'est dit
+/// (le journal garde la trace).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn decode_radio_stream_to_pcm_avec_cadence(
     url: String,
@@ -471,6 +486,7 @@ pub(super) fn decode_radio_stream_to_pcm_avec_cadence(
     en_vol: Option<std::sync::Arc<super::eq_en_vol::EqEnVol>>,
     sortie_locale: bool,
     frequence_fixe: Option<u32>,
+    annonce: Option<AnnonceDeRepli>,
 ) -> Result<(), String> {
     // #6357 — le HLS ne s'arrête plus ici (#2307 le refusait avant le
     // moindre octet de réseau) : `sonder_la_station` le reconnaît et passe
@@ -488,6 +504,9 @@ pub(super) fn decode_radio_stream_to_pcm_avec_cadence(
         expected_format: None,
         radio_eq: None,
         eq_de_depart_pose: false,
+        autre_flux_disponible: !replis.is_empty(),
+        repli: None,
+        annonce,
     };
     let canaux = CanauxRadio {
         tx: &tx,
@@ -503,30 +522,48 @@ pub(super) fn decode_radio_stream_to_pcm_avec_cadence(
     };
 
     let mut url = url;
-    let mut replis = replis.into_iter();
+    let mut replis = replis.into_iter().peekable();
     'reconnect: loop {
         match une_connexion(&mut etat, &url, &canaux) {
             SuiteRadio::Reconnecter => continue 'reconnect,
-            // #8110 — le diffuseur refuse CE flux avant le moindre PCM : le
+            // #8110 puis #9488 — CE flux échoue avant le moindre PCM (refus
+            // du diffuseur, erreur HTTP, connexion refusée, flux vide…) : le
             // suivant de la fiche, s'il y en a un, comme une première
             // connexion (la relance bornée repart de zéro, c'est une autre
-            // adresse). Un refus en cours d'écoute garde le comportement
-            // d'avant : le WAV est déjà annoncé au format du premier flux, et
-            // un repli d'un autre format finirait en arrêt muet.
+            // adresse). Chaque flux n'est essayé qu'une fois ; le dernier
+            // échec est rendu quand tous l'ont été. Un échec en cours
+            // d'écoute garde le comportement d'avant : le WAV est déjà
+            // annoncé au format du premier flux, et un repli d'un autre
+            // format finirait en arrêt muet.
             SuiteRadio::Rendre(Err(e))
                 if !etat.first_chunk_sent
-                    && super::radio_replis_8110::flux_refuse_par_le_diffuseur(&e) =>
+                    && super::radio_autres_flux_9488::echec_qui_justifie_un_autre_flux(&e) =>
             {
                 match replis.next() {
                     Some(suivant) => {
                         tracing::warn!(
-                            refuse = %crate::confidentialite::masquer_url(&url),
-                            suivant = %suivant,
+                            en_echec = %crate::confidentialite::masquer_url(&url),
+                            suivant = %crate::confidentialite::masquer_url(&suivant),
+                            refus_du_diffuseur =
+                                super::radio_replis_8110::flux_refuse_par_le_diffuseur(&e),
                             error = %e,
-                            "radio_flux_refuse_repli_8110"
+                            "radio_flux_indisponible_repli_9488"
                         );
+                        match etat.repli.as_mut() {
+                            // L'avis nomme le flux LANCÉ, pas un repli
+                            // intermédiaire qui a échoué à son tour.
+                            Some(r) => {
+                                r.debit_joue =
+                                    super::radio_autres_flux_9488::debit_retenu(&suivant);
+                                r.url_jouee = suivant.clone();
+                            }
+                            None => {
+                                etat.repli = Some(RepliRadio::nouveau(&url, &suivant, &e));
+                            }
+                        }
                         url = suivant;
                         etat.reconnects = 0;
+                        etat.autre_flux_disponible = replis.peek().is_some();
                         continue 'reconnect;
                     }
                     None => return Err(e),
@@ -573,6 +610,16 @@ fn une_connexion(etat: &mut EtatRadio, url: &str, canaux: &CanauxRadio<'_>) -> S
             }
             SuitePaquet::ConsommateurParti => return SuiteRadio::Rendre(Ok(())),
         }
+    }
+
+    // #9488 — le flux s'est terminé avant le premier PCM et la station en a
+    // un autre : c'est un flux vide, on passe au suivant plutôt que de s'y
+    // reconnecter trente fois.
+    if !etat.first_chunk_sent && etat.autre_flux_disponible && !canaux.tx.is_closed() {
+        return SuiteRadio::Rendre(Err(format!(
+            "{}: le flux s'est terminé avant le premier son",
+            super::radio_autres_flux_9488::RADIO_FLUX_VIDE
+        )));
     }
 
     reprendre_apres_coupure(etat, url, canaux, connected_at)
@@ -1284,6 +1331,16 @@ fn decoder_un_paquet(
         if !etat.first_chunk_sent {
             etat.first_chunk_sent = true;
             canaux.data_ready.notify_one();
+            // #9488 — un autre flux de la station joue : le dire, une fois.
+            if let Some(repli) = etat.repli.take() {
+                tracing::info!(
+                    joue = %crate::confidentialite::masquer_url(&repli.url_jouee),
+                    "radio_repli_de_flux_joue_9488"
+                );
+                if let Some(annonce) = etat.annonce.take() {
+                    annonce(&repli);
+                }
+            }
         }
     }
 
@@ -1353,6 +1410,10 @@ mod radio_cause_8008_tests;
 #[cfg(test)]
 #[path = "radio_repli_8110_tests.rs"]
 mod radio_repli_8110_tests;
+
+#[cfg(test)]
+#[path = "radio_autres_flux_9488_tests.rs"]
+mod radio_autres_flux_9488_tests;
 
 #[cfg(test)]
 #[path = "radio_journal_sans_identifiants_tests.rs"]

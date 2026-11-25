@@ -59,6 +59,9 @@ async fn preparer_contre_la_station(
             expected_format: None,
             radio_eq: None,
             eq_de_depart_pose: false,
+            autre_flux_disponible: false,
+            repli: None,
+            annonce: None,
         };
         let rt = tokio::runtime::Handle::current();
         let canaux = CanauxRadio {
@@ -243,6 +246,9 @@ async fn radio_5716_la_sonde_retient_le_codec_de_la_station() {
                 expected_format: None,
                 radio_eq: None,
                 eq_de_depart_pose: false,
+                autre_flux_disponible: false,
+                repli: None,
+                annonce: None,
             };
             let rt = tokio::runtime::Handle::current();
             let canaux = CanauxRadio {

@@ -11,8 +11,9 @@
 //! [`crate::poller::logo_de_lancement`]), la liste ORDONNÉE des autres flux
 //! autorisés de la fiche, du meilleur au moins bon ; le décodeur
 //! (`decode_radio_stream_to_pcm_avec_profondeur`) la relève au départ et, sur
-//! un refus du diffuseur SEULEMENT, passe au flux suivant. Une coupure réseau
-//! ou une station morte gardent la reconnexion sur le même flux.
+//! un refus du diffuseur, passe au flux suivant. #9488 a élargi ce passage à
+//! tout échec du flux avant le premier PCM (voir `radio_autres_flux_9488`) ;
+//! une coupure en cours d'écoute garde la reconnexion sur le même flux.
 //!
 //! `PlayRequest` n'a pas gagné de champ : plus de soixante-dix constructions
 //! sans `..Default::default()` auraient bougé pour une seule lecture radio.
@@ -91,9 +92,8 @@ pub(crate) fn replis_retenus(url_flux: Option<&str>) -> Vec<String> {
 }
 
 /// Le diffuseur a REFUSÉ ce flux (403, 451 sur une liste ou un segment HLS,
-/// `radio_flux_interdit`) : le seul échec qui justifie d'essayer le flux
-/// suivant de la fiche. Tout autre échec — réseau, page web, HLS illisible —
-/// garde le comportement d'avant.
+/// `radio_flux_interdit`). Depuis #9488 ce n'est plus le seul échec qui fait
+/// essayer le flux suivant : il ne sert plus qu'à le dire au journal.
 pub(crate) fn flux_refuse_par_le_diffuseur(erreur: &str) -> bool {
     erreur.starts_with(super::RADIO_HLS_INTERDIT)
 }

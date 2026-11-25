@@ -1243,6 +1243,12 @@ impl PlaybackOrchestrator {
         // #8110 — les autres flux autorisés de la fiche, retenus par la route :
         // le décodeur y passe si le diffuseur refuse celui-ci.
         let radio_replis = super::radio_replis_8110::replis_retenus(req.source_id.as_deref());
+        // #9488 — l'avis « flux X indisponible, lecture du flux Y ».
+        let radio_annonce = Some(super::radio_autres_flux_9488::annonce_sur_le_bus(
+            self.event_bus.clone(),
+            req.zone_id,
+            title.clone(),
+        ));
         tokio::spawn(async move {
             // Download + decode in a blocking thread since symphonia and
             // reqwest::blocking are both synchronous.
@@ -1263,6 +1269,7 @@ impl PlaybackOrchestrator {
                     en_vol,
                     is_local_output,
                     frequence_fixe,
+                    radio_annonce,
                 )
             })
             .await;
@@ -2514,6 +2521,12 @@ impl PlaybackOrchestrator {
             let refus_source_id = req.source_id.clone();
             // #8110 — même repli que le chemin local/OAAT.
             let radio_replis = super::radio_replis_8110::replis_retenus(req.source_id.as_deref());
+            // #9488 — même avis que le chemin local/OAAT.
+            let radio_annonce = Some(super::radio_autres_flux_9488::annonce_sur_le_bus(
+                self.event_bus.clone(),
+                req.zone_id,
+                title.clone(),
+            ));
             tokio::spawn(async move {
                 let result = tokio::task::spawn_blocking(move || {
                     decode_radio_stream_to_pcm_avec_cadence(
@@ -2528,6 +2541,7 @@ impl PlaybackOrchestrator {
                         Some(en_vol),
                         false,
                         frequence_fixe,
+                        radio_annonce,
                     )
                 })
                 .await;
