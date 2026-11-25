@@ -45,9 +45,10 @@ Conteneurs LXC sous Proxmox
 ---------------------------
 
 Si Tune échoue au démarrage avec 226/NAMESPACE, le conteneur peut
-interdire la création d'un espace de noms de montage. Au démarrage et
-lors de systemctl daemon-reload, le paquet détecte LXC et teste cette
-opération. Si elle est refusée, Tune désactive ProtectSystem et PrivateTmp
+interdire la création d'un espace de noms de montage ou certains montages
+à l'intérieur de celui-ci. Au démarrage et lors de systemctl daemon-reload,
+le paquet détecte LXC et essaie, dans un espace privé, le remontage de /usr
+en lecture seule et un montage privé de /tmp. Si une opération est refusée, Tune désactive ProtectSystem et PrivateTmp
 pour son seul service. NoNewPrivileges et les limites de capacités restent
 actifs. La surcharge est temporaire et consultable avec
 systemctl cat tune-server.service.

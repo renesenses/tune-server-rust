@@ -20,7 +20,14 @@ class Installation(unittest.TestCase):
             for nom in ("getent", "adduser", "addgroup", "install", "chown"):
                 commande(nom, "exit 0")
             commande("systemd-detect-virt", 'test "$1" = --container; echo "$VIRT"; exit "$DETECT"')
-            commande("unshare", 'test "$*" = "--mount --propagation slave /bin/true"; exit "$MOUNT"')
+            commande("unshare", """test "$1" = --mount
+test "$2" = --propagation
+test "$3" = private || test "$3" = slave
+test "$MOUNT" = 0 || exit 1
+shift 3
+exec "$@"
+""")
+            commande("mount", 'test "$*" != "$REFUS"')
             commande("systemctl", """echo "$*" >> "$LOG"
 if [ "$1" = daemon-reload ]; then
     rm -rf "$OUT"
@@ -33,16 +40,18 @@ fi""")
             log = racine / "log"
             env = dict(os.environ, PATH=tmp + ":" + os.environ["PATH"], OUT=str(sortie),
                        GENERATEUR=str(DEB / "tune-lxc-generator"), LOG=str(log))
-            for virt, detect, montage, attendu, version in [
-                ("lxc", 0, 1, True, ""), ("lxc", 0, 1, True, "1"),
-                ("none", 1, 1, False, "1"), ("docker", 0, 1, False, "1"),
-                ("lxc-libvirt", 0, 1, True, "1"), ("lxc", 0, 0, False, "1"),
+            for virt, detect, montage, refus, attendu, version in [
+                ("lxc", 0, 1, "", True, ""), ("lxc", 0, 1, "", True, "1"),
+                ("none", 1, 1, "", False, "1"), ("docker", 0, 1, "", False, "1"),
+                ("lxc-libvirt", 0, 1, "", True, "1"), ("lxc", 0, 0, "", False, "1"),
+                ("lxc", 0, 0, "-n -o remount,bind,ro /usr", True, "1"),
+                ("lxc", 0, 0, "-n --bind /tmp /tmp", True, "1"),
             ]:
-                with self.subTest(virt=virt, montage=montage):
+                with self.subTest(virt=virt, montage=montage, refus=refus):
                     log.write_text("")
                     subprocess.run(["sh", "-s", "configure", version], input=postinst,
                                    text=True, check=True, stdout=subprocess.DEVNULL,
-                                   env=dict(env, VIRT=virt, DETECT=str(detect), MOUNT=str(montage)))
+                                   env=dict(env, VIRT=virt, DETECT=str(detect), MOUNT=str(montage), REFUS=refus))
                     self.assertEqual(log.read_text().splitlines(),
                                      ["daemon-reload", "enable tune-server.service",
                                       ("try-restart" if version else "start") + " tune-server.service"])

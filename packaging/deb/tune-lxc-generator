@@ -5,7 +5,14 @@ set -eu
 type=$(systemd-detect-virt --container 2>/dev/null) || exit 0
 case "$type" in lxc|lxc-libvirt) ;; *) exit 0 ;; esac
 command -v unshare >/dev/null 2>&1 || exit 0
-if unshare --mount --propagation slave /bin/true 2>/dev/null; then
+command -v mount >/dev/null 2>&1 || exit 0
+# Certains profils autorisent le nouvel espace, mais refusent le montage
+# privé ou la remise en lecture seule qui déclenche le 226/NAMESPACE.
+if unshare --mount --propagation private sh -ec '
+    mount -n --bind /usr /usr
+    mount -n -o remount,bind,ro /usr
+    mount -n --bind /tmp /tmp
+' 2>/dev/null; then
     exit 0
 fi
 
