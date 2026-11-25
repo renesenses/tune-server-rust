@@ -514,3 +514,42 @@ async fn pg_8676_deplacer_la_racine() {
     verifier(&db, base);
     nettoyer(db.as_ref(), base);
 }
+
+/// Un préfixe est un DOSSIER : le chemin complet d'un fichier de la base
+/// (piste, exemplaire, support CUE, image) est refusé, l'aperçu le dit et
+/// ne propose rien. Un dossier, lui, reste admis — y compris celui d'un
+/// album (`albums.folder_path`) ou une racine préférée.
+#[test]
+fn sqlite_un_prefixe_qui_designe_un_fichier_est_refuse_8676() {
+    let base = crate::db::sqlite::SqliteDb::open_in_memory().unwrap();
+    base.init_schema().unwrap();
+    crate::db::migrations::run_migrations(&base).unwrap();
+    let db: Arc<dyn DbBackend> = Arc::new(base);
+    poser(db.as_ref(), 1);
+    let partout = |_: &str| true;
+    for fichier in [
+        format!("{A}/Artiste/Album/00.flac"),
+        format!("{A}/Artiste/Album/image.flac"),
+        format!("{A}/Copie/00.flac"),
+        format!("{A}/Artiste/Album/cover.jpg"),
+        format!("{A}/Artiste/artist.jpg"),
+    ] {
+        let pr = p(&fichier, "/data/ailleurs-8676/x.bin");
+        assert!(
+            prefixe_designe_un_fichier(db.as_ref(), &pr).unwrap(),
+            "{fichier}"
+        );
+        let a = apercu(db.as_ref(), &pr, ECHANTILLON_MAX, &partout).unwrap();
+        assert_eq!(a.refusal, Some(Refus::InvalidPrefix), "{fichier}");
+        assert!(!a.can_apply, "{fichier}");
+    }
+    for dossier in [A.to_string(), format!("{A}/Artiste/Album")] {
+        let pr = p(&dossier, B);
+        assert!(
+            !prefixe_designe_un_fichier(db.as_ref(), &pr).unwrap(),
+            "{dossier}"
+        );
+        let a = apercu(db.as_ref(), &pr, ECHANTILLON_MAX, &partout).unwrap();
+        assert_eq!(a.refusal, None, "{dossier}");
+    }
+}

@@ -1,4 +1,4 @@
-//! rc14 — relier le compte mozaiklabs.fr depuis le réseau local, sans
+//! rc13.2 — relier le compte mozaiklabs.fr depuis le réseau local, sans
 //! authentification, même règle que la mise à jour en rc13.1
 //! (`auth::AdminOuReseauLocalPourLaMiseAJour`).
 //!

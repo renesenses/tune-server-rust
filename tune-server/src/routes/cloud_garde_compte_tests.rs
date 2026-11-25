@@ -4,7 +4,7 @@
 //! en extension `ConnectInfo` comme le fait le service de production.
 //!
 //! - authentification coupée, appel du réseau local → 403 `not_local` (licence,
-//!   déliaison) ; la LIAISON du compte, elle, s'ouvre au réseau local en rc14
+//!   déliaison) ; la LIAISON du compte, elle, s'ouvre au réseau local en rc13.2
 //!   (voir `compte_reseau_local_tests.rs`) ;
 //! - authentification coupée, appel de cette machine → accepté ;
 //! - authentification active, administrateur → accepté (même du réseau) ;
@@ -129,7 +129,7 @@ async fn reseau_local_sans_authentification_refuse_not_local() {
     assert_eq!(ls.license_key.as_deref(), Some(CLE));
 }
 
-/// rc14 — sans authentification, le réseau local relie le compte (même règle
+/// rc13.2 — sans authentification, le réseau local relie le compte (même règle
 /// que la mise à jour en rc13.1). Une attente lancée depuis la machine ne se
 /// consomme toujours qu'avec SON `state` : un retour au `state` faux, même du
 /// réseau local, est refusé par le contrôle du `state` et ne relie rien.
@@ -932,7 +932,7 @@ async fn les_comptes_lies_ne_sortent_pas_vers_un_autre_appareil() {
     // Authentification coupée.
     assert_eq!(comptes_lus(&b.state, LAN, None).await, (false, Some(false)));
     assert_eq!(comptes_lus(&b.state, ICI, None).await, (true, Some(true)));
-    // Statut du SSO : rc14, le réseau local relie le compte, il le voit donc
+    // Statut du SSO : rc13.2, le réseau local relie le compte, il le voit donc
     // (menu du compte, photo de profil). Les réglages et l'export ci-dessus ne
     // le livrent toujours pas ; le relais et les mandataires n'en voient que
     // « relié » (voir `compte_reseau_local_tests.rs`).

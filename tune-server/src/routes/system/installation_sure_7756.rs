@@ -429,7 +429,25 @@ pub(super) fn copier_le_dossier(
             copier(&entree.path(), &vers)?;
         }
     }
-    std::fs::File::open(dst)?.sync_all()
+    synchro_toleree(
+        std::fs::File::open(dst).and_then(|d| d.sync_all()),
+        cfg!(windows),
+    )
+}
+
+/// Fil 3014 — la synchronisation d'un dossier copié, telle que Windows la
+/// permet. `File::open` sur un DOSSIER y échoue toujours en
+/// ERROR_ACCESS_DENIED (« Accès refusé. (os error 5) ») : Rust l'ouvre sans
+/// `FILE_FLAG_BACKUP_SEMANTICS`. Propagée, cette erreur faisait échouer CHAQUE
+/// mise à jour Windows depuis la rc13, à la pose de `plugins.new\party`
+/// (#8955), alors que les fichiers étaient copiés et synchronisés un par un.
+/// Sous Windows, ce refus-là est donc ignoré (NTFS journalise les entrées de
+/// dossier) ; ailleurs, toute erreur reste une erreur.
+pub(super) fn synchro_toleree(resultat: io::Result<()>, windows: bool) -> io::Result<()> {
+    match resultat {
+        Err(e) if windows && e.kind() == io::ErrorKind::PermissionDenied => Ok(()),
+        autre => autre,
+    }
 }
 
 /// Fichiers de la racine de `web/` sans lesquels l'interface ne s'affiche

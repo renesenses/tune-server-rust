@@ -577,6 +577,13 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Compiler l'installeur NSIS de livraison (#8861)
+        shell: pwsh
+        run: |
+          choco install nsis -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "Installation de NSIS en échec" }
+          python scripts/verifier-installeur-windows.py --makensis "${env:ProgramFiles(x86)}\NSIS\makensis.exe"
+          if ($LASTEXITCODE -ne 0) { throw "Compilation de l'installeur NSIS en échec" }
       - uses: actions-rust-lang/setup-rust-toolchain@v1
         with:
           target: x86_64-pc-windows-msvc
@@ -589,6 +596,14 @@ jobs:
           # remplacer ce cache de confiance.
           key: x86_64-pc-windows-msvc
           save-if: false
+      - name: Tester les cadences exclusives sans périphérique (#8671)
+        shell: pwsh
+        run: |
+          $banc = Join-Path $env:RUNNER_TEMP "cadences-exclusives-8671.exe"
+          rustc --edition 2024 --test scripts/banc-cadences-windows-8671.rs -o $banc
+          if ($LASTEXITCODE -ne 0) { throw "Compilation du banc de cadences impossible" }
+          & $banc --nocapture --test-threads=1
+          if ($LASTEXITCODE -ne 0) { throw "Échec des témoins de cadences exclusives" }
       - name: Windows livré sans ASIO
         # plugin-catalog: {"features":"all","base":["oaat","cloud-relay","postgres","plugins-wasm"]}
         run: cargo check --package tune-server --target x86_64-pc-windows-msvc --no-default-features --features oaat,cloud-relay,postgres,plugins-wasm,dj,karaoke,bandcamp,concerts,pont-roon,cd,circle,entree-audio,calibration,assistant-ia,collection-physique,aes67,mon-theme
@@ -1041,6 +1056,9 @@ jobs:
       # L'audit de la racine ne couvre donc pas ses dépendances (#6503).
       - name: Auditer le verrou du moissonneur Roon
         run: cargo audit --file tools/moissonneur-roon/Cargo.lock --deny warnings
+      # Même raison pour « Débloquer Tune », lui aussi hors workspace.
+      - name: Auditer le verrou de Débloquer Tune
+        run: cargo audit --file tools/debloquer-tune/Cargo.lock --deny warnings
 
   ffi:
     name: FFI mobile (compilation)
