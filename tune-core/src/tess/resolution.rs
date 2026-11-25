@@ -752,7 +752,8 @@ impl ChaineTess {
             if let (Some(n), Some(SourceFlux::Pcm { sample_rate_hz, .. })) = (canaux, ctx.source) {
                 let trames = reglages.latence_trames(n, sample_rate_hz);
                 e.latency_frames = Some(u32::try_from(trames).unwrap_or(u32::MAX));
-                params["delays_samples"] = json!(reglages.retards_en_echantillons(n, sample_rate_hz));
+                params["delays_samples"] =
+                    json!(reglages.retards_en_echantillons(n, sample_rate_hz));
             }
             e.params = Some(params);
         }
@@ -1405,8 +1406,14 @@ mod tests {
             .iter()
             .filter_map(|e| e.plugin_id.as_deref())
             .collect();
-        assert_eq!(ordre, vec!["equalizer-graphic", "crossfeed", "speaker-setup"]);
-        let i = codes(&r).iter().position(|c| *c == CodeEtape::Upsampling).unwrap();
+        assert_eq!(
+            ordre,
+            vec!["equalizer-graphic", "crossfeed", "speaker-setup"]
+        );
+        let i = codes(&r)
+            .iter()
+            .position(|c| *c == CodeEtape::Upsampling)
+            .unwrap();
         assert_eq!(r.etapes[i - 1].plugin_id.as_deref(), Some("speaker-setup"));
         let e = greffon(&r, "speaker-setup");
         assert!(e.effective, "{e:?}");

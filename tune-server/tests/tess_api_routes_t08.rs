@@ -1426,7 +1426,11 @@ async fn le_reglage_des_enceintes_par_l_api_rc14() {
             { "id": "speaker-setup", "enabled": true, "settings": reglages.clone() }
         ] }))
         .await;
-    assert_eq!(s, StatusCode::OK, "compte gratuit, après la réaffectation : {v}");
+    assert_eq!(
+        s,
+        StatusCode::OK,
+        "compte gratuit, après la réaffectation : {v}"
+    );
     conforme_au_schema("zone_response", &v).unwrap_or_else(|e| panic!("{e} : {v}"));
     let cle: Value = serde_json::from_str(
         &b.settings()

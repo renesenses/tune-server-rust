@@ -978,7 +978,11 @@ pub(super) fn zone_enceintes_step_lang(
         .map(|d| format!("{d:.2}"))
         .collect::<Vec<_>>()
         .join(" / ");
-    Some(fs(lang, "speaker_setup", &[&liste, &format!("{latence:.2}")]))
+    Some(fs(
+        lang,
+        "speaker_setup",
+        &[&liste, &format!("{latence:.2}")],
+    ))
 }
 
 /// #6044 — la zone réaffecte-t-elle les canaux de la piste en cours, et si
@@ -3925,8 +3929,7 @@ fn relever_les_traitements_lang(
     // vraie transformation — elle réécrit chaque échantillon — donc elle porte
     // une étape et fait tomber le verdict bit-perfect, comme le ReplayGain.
     let mono_downmix_step = zone_mono_downmix_step_lang(lang, &backend, zid, output_type);
-    let enceintes_step =
-        zone_enceintes_step_lang(lang, &backend, zid, output_type, np.channels);
+    let enceintes_step = zone_enceintes_step_lang(lang, &backend, zid, output_type, np.channels);
 
     // #5071 — la compensation de niveau d'une zone RÉSEAU multiplie chaque
     // échantillon du flux : une étape, et le verdict en tient compte.

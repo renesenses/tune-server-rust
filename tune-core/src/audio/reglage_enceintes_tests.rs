@@ -54,7 +54,10 @@ fn le_delai_est_exact_en_echantillons_a_44_1_96_et_192_khz() {
     }
     // Un écart qui ne tombe pas juste est ARRONDI au plus proche, jamais
     // interpolé : 100 cm à 44,1 kHz = 128,57 → 129.
-    let r = reglages(vec![voie(400.0, 0.0, false), voie(300.0, 0.0, false)], false);
+    let r = reglages(
+        vec![voie(400.0, 0.0, false), voie(300.0, 0.0, false)],
+        false,
+    );
     assert_eq!(r.retards_en_echantillons(2, 44_100), vec![0, 129]);
     let ms = r.retards_ms(2);
     assert_eq!(ms[0], 0.0);
@@ -66,11 +69,17 @@ fn reglages_neutres_le_flux_reste_bit_perfect() {
     let original = bruit(4_096 * 2, 7);
     for r in [
         ReglagesEnceintes::default(),
-        reglages(vec![voie(250.0, 0.0, false), voie(250.0, 0.0, false)], false),
+        reglages(
+            vec![voie(250.0, 0.0, false), voie(250.0, 0.0, false)],
+            false,
+        ),
         // Deux inversions s'annulent : aucune inversion nette.
         reglages(vec![voie(300.0, 0.0, true), voie(300.0, 0.0, true)], true),
         // Le même gain partout est repris par la réserve : facteur 1.
-        reglages(vec![voie(300.0, 4.0, false), voie(300.0, 4.0, false)], false),
+        reglages(
+            vec![voie(300.0, 4.0, false), voie(300.0, 4.0, false)],
+            false,
+        ),
     ] {
         assert!(r.est_neutre(2), "{r:?}");
         let mut p = ProcesseurEnceintes::new(r.clone());
@@ -112,7 +121,10 @@ fn un_delai_seul_deplace_les_echantillons_sans_les_alterer() {
 #[test]
 fn gain_par_voie_avec_reserve_pour_le_positif() {
     // −6 dB sur la voie 1 : la voie 0 reste EXACTE, la voie 1 descend.
-    let r = reglages(vec![voie(300.0, 0.0, false), voie(300.0, -6.0, false)], false);
+    let r = reglages(
+        vec![voie(300.0, 0.0, false), voie(300.0, -6.0, false)],
+        false,
+    );
     assert_eq!(r.reserve_db(2), 0.0);
     let f = r.facteurs(2);
     assert_eq!(f[0], 1.0);
@@ -127,7 +139,10 @@ fn gain_par_voie_avec_reserve_pour_le_positif() {
     // +6 dB sur la voie 0 : la réserve (−6 dB) la ramène à 0 dB ; la voie 1,
     // à 0 dB demandé, sort à −6 dB. L'écart demandé est tenu, et aucune voie
     // ne dépasse l'entrée : pas d'écrêtage possible.
-    let r = reglages(vec![voie(300.0, 6.0, false), voie(300.0, 0.0, false)], false);
+    let r = reglages(
+        vec![voie(300.0, 6.0, false), voie(300.0, 0.0, false)],
+        false,
+    );
     assert_eq!(r.reserve_db(2), -6.0);
     let f = r.facteurs(2);
     assert_eq!(f[0], 1.0);
@@ -186,7 +201,10 @@ fn le_nombre_de_voies_qui_arrivent_est_libre() {
     // 1 voie : rien à aligner.
     assert!(six.est_neutre(1));
     // Plus de voies que de réglages : les voies en trop sont neutres.
-    let deux = reglages(vec![voie(100.0, 0.0, false), voie(443.0, 0.0, false)], false);
+    let deux = reglages(
+        vec![voie(100.0, 0.0, false), voie(443.0, 0.0, false)],
+        false,
+    );
     assert_eq!(
         deux.retards_en_echantillons(6, 44_100),
         vec![441, 0, 0, 0, 0, 0]
@@ -261,7 +279,9 @@ fn un_changement_a_chaud_passe_par_un_fondu_sans_clic() {
                 false,
             ));
         }
-        let mut t: Vec<f64> = (0..512).flat_map(|i| [sinus(n + i), sinus(n + i)]).collect();
+        let mut t: Vec<f64> = (0..512)
+            .flat_map(|i| [sinus(n + i), sinus(n + i)])
+            .collect();
         p.traiter(&mut t, 2, cadence);
         n += 512;
         sortie.extend(t);
@@ -304,7 +324,11 @@ fn les_reglages_sont_lus_et_bornes() {
     });
     let r = ReglagesEnceintes::lire(&ok).unwrap();
     assert_eq!(r.channels.len(), 2);
-    assert!(ReglagesEnceintes::lire(&Value::Null).unwrap().est_neutre_partout());
+    assert!(
+        ReglagesEnceintes::lire(&Value::Null)
+            .unwrap()
+            .est_neutre_partout()
+    );
     // Valeurs par défaut d'une voie incomplète.
     let r = ReglagesEnceintes::lire(&json!({ "channels": [{}] })).unwrap();
     assert_eq!(r.channels[0], VoieEnceinte::default());

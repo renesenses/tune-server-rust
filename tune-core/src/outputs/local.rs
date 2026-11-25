@@ -608,12 +608,12 @@ mod sortie_double_locale;
 // #3208 — la période demandée au pilote, et la garde de préchargement qui s'en
 // déduit. `cpal::BufferSize` n'est plus écrit à la main nulle part ailleurs
 // dans ce fichier ni dans ses modules.
-mod periode;
-/// #6044 — la réaffectation des canaux (greffon `channel-remap`).
-mod reaffectation;
 /// rc14 — le réglage des enceintes (greffon TESS `speaker-setup`) de chaque
 /// sortie : délai, gain et phase par voie, juste avant le suréchantillonneur.
 pub(crate) mod enceintes_de_sortie;
+mod periode;
+/// #6044 — la réaffectation des canaux (greffon `channel-remap`).
+mod reaffectation;
 
 /// #6057 — la disposition des canaux DÉCLARÉE par le fichier de la piste,
 /// posée par l'orchestrateur ; `None` quand le fichier ne dit rien ou dit

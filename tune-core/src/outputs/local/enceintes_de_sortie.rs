@@ -57,7 +57,10 @@ pub(crate) fn poser(cle: &AtomicBool, reglages: Option<ReglagesEnceintes>) {
         }
         (None, Some(r)) if !r.est_neutre_partout() => {
             if let Ok(mut t) = table().write() {
-                t.insert(adresse(cle), Arc::new(Mutex::new(ProcesseurEnceintes::new(r))));
+                t.insert(
+                    adresse(cle),
+                    Arc::new(Mutex::new(ProcesseurEnceintes::new(r))),
+                );
                 POSES.store(t.len(), Ordering::Release);
             }
         }
@@ -217,7 +220,11 @@ mod tests {
         assert!(!traite.bit_perfect);
         for n in 0..200 {
             assert_eq!(traite.samples[n * 2], brut.samples[n * 2], "gauche {n}");
-            let attendu = if n < 129 { 0 } else { brut.samples[(n - 129) * 2 + 1] };
+            let attendu = if n < 129 {
+                0
+            } else {
+                brut.samples[(n - 129) * 2 + 1]
+            };
             assert_eq!(traite.samples[n * 2 + 1], attendu, "droite {n}");
         }
         // PURE : de nouveau bit-perfect.

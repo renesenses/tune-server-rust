@@ -2727,8 +2727,11 @@ fn le_reglage_des_enceintes_s_ecrit_et_se_relit_rc14() {
 
     // Placé après la réaffectation à la relecture des anciennes clés.
     let (_db2, s2) = base();
-    s2.set(&cle.replace("41", "42"), &json!({"enabled": true}).to_string())
-        .unwrap();
+    s2.set(
+        &cle.replace("41", "42"),
+        &json!({"enabled": true}).to_string(),
+    )
+    .unwrap();
     s2.set(
         "zone_42_channel_remap",
         &json!({"enabled": true}).to_string(),

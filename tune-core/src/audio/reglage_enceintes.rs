@@ -226,8 +226,7 @@ impl ReglagesEnceintes {
                     // (cm / 100) / 343 × cadence = cm × cadence / 34 300 :
                     // un seul quotient, exact quand il tombe juste.
                     let ecart_cm = (m - v.distance_cm).max(0.0);
-                    (ecart_cm * f64::from(cadence) / (VITESSE_DU_SON_M_S * 100.0)).round()
-                        as usize
+                    (ecart_cm * f64::from(cadence) / (VITESSE_DU_SON_M_S * 100.0)).round() as usize
                 }
                 _ => 0,
             })
@@ -272,11 +271,9 @@ impl ReglagesEnceintes {
     /// Ces réglages laissent-ils intactes les `canaux` voies qui arrivent ?
     pub fn est_neutre(&self, canaux: usize) -> bool {
         self.facteurs(canaux).iter().all(|f| *f == 1.0)
-            && self.distance_max(canaux).is_none_or(|m| {
-                self.voies(canaux)
-                    .flatten()
-                    .all(|v| v.distance_cm == m)
-            })
+            && self
+                .distance_max(canaux)
+                .is_none_or(|m| self.voies(canaux).flatten().all(|v| v.distance_cm == m))
     }
 
     /// Neutres quel que soit le nombre de voies (1 à [`VOIES_MAX`]) ?
@@ -421,7 +418,9 @@ impl ProcesseurEnceintes {
         }
         let ancien = std::mem::replace(&mut self.actuel, nouveaux);
         self.precedent = Some(ancien);
-        self.rampe_totale = ((RAMPE_MS / 1000.0) * f64::from(self.cadence)).round().max(1.0) as usize;
+        self.rampe_totale = ((RAMPE_MS / 1000.0) * f64::from(self.cadence))
+            .round()
+            .max(1.0) as usize;
         self.rampe_restante = self.rampe_totale;
     }
 
@@ -448,8 +447,8 @@ impl ProcesseurEnceintes {
         self.actuel = Parametres::de(&self.reglages, canaux, cadence);
         self.precedent = None;
         self.rampe_restante = 0;
-        let max = (DISTANCE_MAX_CM * f64::from(cadence) / (VITESSE_DU_SON_M_S * 100.0)).ceil()
-            as usize;
+        let max =
+            (DISTANCE_MAX_CM * f64::from(cadence) / (VITESSE_DU_SON_M_S * 100.0)).ceil() as usize;
         self.longueur = max + 1;
         self.anneau.clear();
         self.anneau.resize(self.longueur * canaux, 0.0);
