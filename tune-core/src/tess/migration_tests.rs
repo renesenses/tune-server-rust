@@ -2922,13 +2922,6 @@ fn appliquer_un_profil_remplace_une_ancienne_correction_devenue_parametrique() {
             "avant_tess" => Some(cle_sauvegarde_eq(z)),
             _ => None,
         };
-        if let Some(cle) = cle {
-            s.set(
-                &cle,
-                &serde_json::to_string(&profil(true, r1.clone())).unwrap(),
-            )
-            .unwrap();
-        }
         poser_la_piece(&s, z, "Calibration xyz", None);
         // `poser_la_piece` écrit `eq_profile` comme l'ancienne route : on
         // remet la clé que la chaîne porte, seul le profil de pièce compte.
@@ -2942,6 +2935,15 @@ fn appliquer_un_profil_remplace_une_ancienne_correction_devenue_parametrique() {
             o["eq_profile"].as_deref().unwrap(),
         )
         .unwrap();
+        // Posée après la remise en place (une écriture qui retire la
+        // correction de pièce efface la trace).
+        if let Some(cle) = cle {
+            s.set(
+                &cle,
+                &serde_json::to_string(&profil(true, r1.clone())).unwrap(),
+            )
+            .unwrap();
+        }
 
         let pose = poser_la_correction_de_piece(&s, z, &r2).unwrap();
         let l = lire_zone(&s, z, true).unwrap();

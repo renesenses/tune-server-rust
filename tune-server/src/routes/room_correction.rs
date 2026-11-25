@@ -285,8 +285,7 @@ async fn apply_profile_handler(
                     // l'ordre des étages de la sortie locale suit, et un
                     // préréglage TESS qui ne décrit plus la chaîne n'est plus
                     // marqué « ACTIVE » (T17).
-                    if p
-                        .bilan
+                    if p.bilan
                         .cles_modifiees
                         .contains(&tune_core::tess::egaliseurs_en_serie::cle_ordre_tess(id))
                     {
