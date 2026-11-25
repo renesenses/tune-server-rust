@@ -7308,14 +7308,14 @@ async fn get_eq(State(state): State<AppState>, Path(zone_id): Path<i64>) -> Json
     // que le moteur applique (tous les égaliseurs cochés), pas le seul
     // principal que cette route expose.
     let premium = state.license.is_premium().await;
-    let enabled = match tune_core::tess::egaliseurs_en_serie::egaliseurs_de_zone(
-        &settings, zone_id, premium,
-    ) {
-        Some(serie) => serie.is_some_and(|p| {
-            !p.bands.is_empty() || p.effective_gains() != (0.0, 0.0, 0.0)
-        }),
-        None => profile.enabled && !bands.is_empty(),
-    };
+    let enabled =
+        match tune_core::tess::egaliseurs_en_serie::egaliseurs_de_zone(&settings, zone_id, premium)
+        {
+            Some(serie) => {
+                serie.is_some_and(|p| !p.bands.is_empty() || p.effective_gains() != (0.0, 0.0, 0.0))
+            }
+            None => profile.enabled && !bands.is_empty(),
+        };
     Json(json!({
         "zone_id": zone_id,
         "enabled": enabled,

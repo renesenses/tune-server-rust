@@ -1239,11 +1239,8 @@ async fn une_zone_normalisee_par_l_exclusivite_retrouve_ses_egaliseurs_rc14() {
             .unwrap()
             .clone();
         assert_eq!(p["enabled"], json!(premium), "premium={premium} : {p}");
-        let moteur = tune_core::tess::egaliseurs_en_serie::profil_du_moteur(
-            &b.settings(),
-            b.zone,
-            premium,
-        );
+        let moteur =
+            tune_core::tess::egaliseurs_en_serie::profil_du_moteur(&b.settings(), b.zone, premium);
         let bandes = moteur.map_or(0, |p| p.bands.len());
         assert_eq!(bandes, if premium { 2 } else { 0 }, "premium={premium}");
         if premium {
@@ -1256,7 +1253,10 @@ async fn une_zone_normalisee_par_l_exclusivite_retrouve_ses_egaliseurs_rc14() {
                 .iter()
                 .find(|m| m.id == "equalizer-parametric")
                 .unwrap();
-            assert!(m.enabled && m.settings.get("replaced_in_group").is_none(), "{m:?}");
+            assert!(
+                m.enabled && m.settings.get("replaced_in_group").is_none(),
+                "{m:?}"
+            );
         }
     }
 }
